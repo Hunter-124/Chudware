@@ -120,7 +120,7 @@ def selected_backend(platform: str | None = None) -> str:
 
 
 def headless_backend(platform: str | None = None) -> str:
-    """Backend for Parts Library fetch/download.
+    """Backend for Parts Library fetch, interaction, and download.
 
     Only stock Playwright and Patchright opt the headless seam away from CEF.
     Camoufox remains an import-guarded residual experiment.
@@ -130,7 +130,12 @@ def headless_backend(platform: str | None = None) -> str:
 
 
 def headless_client(*, profile: str = "", platform: str | None = None) -> Any:
-    """Return a client exposing CEF-compatible ``fetch``/``download`` methods."""
+    """Return the selected headless client.
+
+    CEF and Playwright-compatible clients support fetch, interaction, and
+    download. Callers must report a missing capability rather than silently
+    switching the user's selected backend.
+    """
     if headless_backend(platform) in ("playwright", "patchright"):
         from . import pw_client
         return pw_client.client(profile)

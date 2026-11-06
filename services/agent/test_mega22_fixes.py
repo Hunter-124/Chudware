@@ -18,90 +18,6 @@ Grounded in mega-21 a1 fingerprints:
 from __future__ import annotations
 
 import json
-from pathlib import Path
-
-import pytest
-
-
-_MEGA21_LEDGER = (
-    Path(__file__).resolve().parents[2] / "reports/runs/mega-21/ledger.json"
-)
-_MEGA21_AC5 = (
-    Path(__file__).resolve().parents[2]
-    / "reports/runs/mega-21/criterion_AC5.json"
-)
-_MEGA21_AC4 = (
-    Path(__file__).resolve().parents[2]
-    / "reports/runs/mega-21/criterion_AC4.json"
-)
-_MEGA21_AC1 = (
-    Path(__file__).resolve().parents[2]
-    / "reports/runs/mega-21/criterion_AC1.json"
-)
-
-
-def _load_json(path: Path) -> dict:
-    if not path.is_file():
-        pytest.skip(f"fixture missing: {path}")
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-# ---------------------------------------------------------------------------
-# Fixtures — mega-21 fingerprints
-# ---------------------------------------------------------------------------
-
-
-def test_mega21_ac5_fingerprint_device_count_one_undriven():
-    """P22 fixture: resolved 3V3, V=0.0, device_count=1."""
-    ac5 = _load_json(_MEGA21_AC5)
-    assert ac5.get("result") == "FAIL"
-    ev = ac5.get("evidence") or {}
-    assert ev.get("resolved_net") == "3V3"
-    assert ev.get("device_count") == 1
-    op = ev.get("op") or {}
-    assert float(op.get("V(3V3)", 1e9)) == 0.0
-    warns = " ".join(ev.get("warnings") or [])
-    assert "no sim model" in warns.lower() or "skipped" in warns.lower()
-
-
-def test_mega21_ac4_fingerprint_drc_clearance_no_optimize():
-    """Q22 fixture: DRC errors=31, no optimize_traces in forced chain."""
-    ac4 = _load_json(_MEGA21_AC4)
-    assert ac4.get("result") == "FAIL"
-    ev = ac4.get("evidence") or {}
-    drc = ev.get("drc") or ev.get("ecad_run_drc") or {}
-    assert int(drc.get("errors") or 0) == 31
-    assert drc.get("doc_id") == "6f30f5cdb225"
-    # Ledger: board → drc with no optimize between.
-    led = _load_json(_MEGA21_LEDGER)
-    events = led.get("events") or []
-    tools = []
-    for evn in events:
-        pl = evn.get("payload") if isinstance(evn, dict) else {}
-        if not isinstance(pl, dict):
-            continue
-        if pl.get("event") == "tool_call" and pl.get("ok") and pl.get("tool"):
-            tools.append(pl["tool"])
-    assert "board_from_schematic" in tools
-    assert "ecad_run_drc" in tools
-    assert "ecad_optimize_traces" not in tools
-    # Order: board before DRC, no optimize in between the forced pair.
-    bi = tools.index("board_from_schematic")
-    di = tools.index("ecad_run_drc")
-    assert bi < di
-    assert "ecad_optimize_traces" not in tools[bi:di + 1]
-
-
-def test_mega21_ac1_fingerprint_bad_side_top_face():
-    """R22 fixture: measure_between soft-zero from 'top face' side query."""
-    ac1 = _load_json(_MEGA21_AC1)
-    assert ac1.get("result") == "FAIL"
-    detail = str(ac1.get("detail") or "")
-    assert "measure_between" in detail
-    # Findings carry the bad side error.
-    findings = (ac1.get("evidence") or {}).get("findings") or []
-    blob = json.dumps(findings).lower()
-    assert "top face" in blob or "bad" in blob and "side" in blob
 
 
 # ---------------------------------------------------------------------------
@@ -233,15 +149,15 @@ def test_ensure_driven_rail_places_source_and_load_on_3v3():
         dispatched.append((tool, a))
         if tool == "ecad_place_symbol":
             lib = str(a.get("libid") or "")
-            if "Device:V" in lib or lib.endswith(":V"):
+            if lib == "Simulation_SPICE:VDC":
                 return {
                     "ok": True, "ref": a.get("ref") or "V1", "libid": lib,
-                    "value": a.get("value") or "DC 3.3",
+                    "value": a.get("value") or "3.3",
                     "pins": [
-                        {"number": "+", "name": "+", "type": "power_out",
-                         "xy": [40, 5], "net": "N$V"},
-                        {"number": "-", "name": "-", "type": "power_out",
+                        {"number": "2", "name": "", "type": "passive",
                          "xy": [40, -5], "net": "N$G"},
+                        {"number": "1", "name": "", "type": "passive",
+                         "xy": [40, 5], "net": "N$V"},
                     ],
                 }
             return {
@@ -288,19 +204,18 @@ def test_ensure_driven_rail_places_source_and_load_on_3v3():
     # V source placed.
     assert any(
         c.get("tool") == "ecad_place_symbol"
-        and (
-            "Device:V" in str((c.get("args") or {}).get("libid") or "")
-            or "V_source" in str((c.get("args") or {}).get("libid") or "")
-            or "Simulation_SPICE" in str((c.get("args") or {}).get("libid") or "")
-        )
+        and (c.get("args") or {}).get("libid") == "Simulation_SPICE:VDC"
         for c in new_calls if c.get("ok")
     ), dispatched
     # Source on rail after wires.
-    assert _ecad_source_on_rail(new_calls, "3V3") or any(
-        c.get("tool") == "ecad_wire"
-        and str((c.get("args") or {}).get("from_ref") or "").startswith("V")
-        for c in new_calls if c.get("ok")
-    ), (dispatched, new_calls[-6:])
+    assert _ecad_source_on_rail(new_calls, "3V3"), (dispatched, new_calls[-6:])
+    source_wires = [
+        c["args"] for c in new_calls
+        if c.get("ok") and c.get("forced") and c.get("tool") == "ecad_wire"
+        and (c.get("args") or {}).get("from_ref") == "V1"
+    ]
+    assert any(a.get("from_pin") == "1" and a.get("net") == "3V3" for a in source_wires)
+    assert any(a.get("from_pin") == "2" and a.get("net") == "GND" for a in source_wires)
     # Load on rail.
     assert _ecad_load_on_rail(new_calls, "3V3") or any(
         c.get("tool") == "ecad_wire"
@@ -353,12 +268,12 @@ def test_force_cascade_completes_driven_topology_before_sim():
         dispatched.append((tool, a))
         if tool == "ecad_place_symbol":
             lib = str(a.get("libid") or "")
-            if "Device:V" in lib:
+            if lib == "Simulation_SPICE:VDC":
                 return {
-                    "ok": True, "ref": "V1", "libid": lib, "value": "DC 3.3",
+                    "ok": True, "ref": "V1", "libid": lib, "value": "3.3",
                     "pins": [
-                        {"number": "+", "xy": [40, 5]},
-                        {"number": "-", "xy": [40, -5]},
+                        {"number": "1", "name": "", "xy": [40, 5]},
+                        {"number": "2", "name": "", "xy": [40, -5]},
                     ],
                 }
             return {
@@ -415,7 +330,7 @@ def test_force_cascade_completes_driven_topology_before_sim():
     assert "ecad_simulate" in tools, (tools, dispatched)
     # Source+load topology completed.
     assert _ecad_source_on_rail(new_calls, "3V3") or any(
-        "Device:V" in str((c.get("args") or {}).get("libid") or "")
+        (c.get("args") or {}).get("libid") == "Simulation_SPICE:VDC"
         for c in new_calls
     )
     assert _ecad_load_on_rail(new_calls, "3V3") or any(
@@ -580,12 +495,12 @@ def test_cascade_board_optimize_drc_order_mega21_shape():
             return {"ok": True, "errors": 0}
         if tool == "ecad_place_symbol":
             lib = str(a.get("libid") or "")
-            if "Device:V" in lib:
+            if lib == "Simulation_SPICE:VDC":
                 return {
-                    "ok": True, "ref": "V1", "libid": lib, "value": "DC 3.3",
+                    "ok": True, "ref": "V1", "libid": lib, "value": "3.3",
                     "pins": [
-                        {"number": "+", "xy": [40, 5]},
-                        {"number": "-", "xy": [40, -5]},
+                        {"number": "1", "name": "", "xy": [40, 5]},
+                        {"number": "2", "name": "", "xy": [40, -5]},
                     ],
                 }
             return {"ok": True, "ref": "R9", "libid": lib}
@@ -689,176 +604,3 @@ def test_reoptimize_once_then_honest_drc_residual():
     need2 = _ecad_chain_need(after_retry, allow)
     # Should advance past optimize (ERC or None), not loop forever.
     assert need2 != "ecad_optimize_traces", need2
-
-
-# ---------------------------------------------------------------------------
-# mega-22 rebind — mech land + ECAD terminal force on starve
-# ---------------------------------------------------------------------------
-
-
-def test_airframe_ops_positioned_not_buried():
-    """Rebind: bay/wing/fins carry at/ offsets (not origin-only boxes)."""
-    from services.agent.agent_turn import _airframe_build_ops
-
-    ops = _airframe_build_ops()
-    by_name = {
-        (op.get("feature") or {}).get("name"): (op.get("feature") or {})
-        for op in ops
-    }
-    assert "at" in (by_name["payload_bay"].get("params") or {})
-    assert "at" in (by_name["wing"].get("params") or {})
-    assert "at" in (by_name["fin_1"].get("params") or {})
-    # Body not centered-default buried: centered False.
-    assert (by_name["body_tube"].get("params") or {}).get("centered") is False
-
-
-def test_mech_force_retry_body_only_on_batch_reject():
-    """When full batch rejects, force retries simpler ops and can land."""
-    from services.agent import agent_turn as at
-
-    at._MECH_FORCE_ONCE.clear()
-    calls_disp = []
-
-    def _dispatch(tool, args):
-        calls_disp.append((tool, args))
-        if tool == "new_part":
-            return {"ok": True, "doc_id": "doc-x"}
-        if tool == "add_features":
-            n = len((args or {}).get("ops") or [])
-            if n >= 6:
-                return {
-                    "ok": False,
-                    "rolled_back": True,
-                    "error": "batch rejected — no features were kept",
-                    "failed_features": [
-                        {"id": "f5", "error": "box boss added no material"},
-                    ],
-                }
-            return {"ok": True, "doc_id": "doc-x", "n_ops": n}
-        return {"ok": True}
-
-    led = type("L", (), {"run_id": "rebind-mech", "events": [], "append": lambda *a, **k: None})()
-    # minimal ledger interface
-    class _Led:
-        run_id = "rebind-mech"
-        events = []
-        def append(self, *a, **k):
-            pass
-    out = at._mech_force_build_chain(
-        _Led(),
-        dispatch=_dispatch,
-        run_id="rebind-mech",
-    )
-    assert out.get("ok") is True, out
-    assert out.get("forced") is True
-    # Saw a retry with fewer ops.
-    af_ns = [
-        len((a or {}).get("ops") or [])
-        for t, a in calls_disp if t == "add_features"
-    ]
-    assert any(n < 6 for n in af_ns), af_ns
-
-
-def test_mech_soft_refusal_does_not_hard_block_semantics():
-    """Force attempted + failed → soft_refusal so loop can keep ECAD path."""
-    from services.agent import agent_turn as at
-
-    at._MECH_FORCE_ONCE.clear()
-
-    def _dispatch(tool, args):
-        if tool == "new_part":
-            return {"ok": True, "doc_id": "doc-y"}
-        if tool == "add_features":
-            return {"ok": False, "rolled_back": True, "error": "still bad"}
-        return {"ok": True}
-
-    class _Led:
-        run_id = "soft-mech"
-        events = []
-    gate = at.mech_deliver_gate(
-        _Led(), dispatch=_dispatch, run_id="soft-mech", force=True,
-    )
-    assert gate.get("allow_deliver") is False
-    assert gate.get("soft_refusal") is True
-    assert gate.get("forced") is True
-    assert "mech" in (gate.get("refusal") or "").lower()
-
-
-def test_ecad_product_gate_forces_chain_when_starved():
-    """P22/Q22: empty ledger → terminal force schematic…board…opt…drc…sim."""
-    from services.agent.agent_turn import ecad_product_gate
-
-    order = []
-
-    def _dispatch(tool, args):
-        order.append(tool)
-        a = dict(args or {})
-        if tool == "ecad_new_schematic":
-            return {"ok": True, "doc_id": "sch1"}
-        if tool == "ecad_place_symbol":
-            lib = str(a.get("libid") or "")
-            ref = a.get("ref") or ("V1" if "Device:V" in lib else "R1" if "Device:R" in lib else "U1")
-            pins = [
-                {"number": "1", "name": "VDDA", "type": "power_in", "xy": [10, 10]},
-                {"number": "2", "name": "VSS", "type": "power_in", "xy": [10, 0]},
-            ]
-            if "Device:V" in lib:
-                pins = [
-                    {"number": "+", "xy": [40, 5]},
-                    {"number": "-", "xy": [40, -5]},
-                ]
-            if "Device:R" in lib:
-                pins = [
-                    {"number": "1", "xy": [20, 20]},
-                    {"number": "2", "xy": [30, 20]},
-                ]
-            return {"ok": True, "ref": ref, "libid": lib, "pins": pins,
-                    "doc_id": "sch1"}
-        if tool == "ecad_add_power":
-            return {"ok": True, "net": a.get("net") or "GND", "net_size": 1,
-                    "net_members": ["U1.1"], "doc_id": "sch1"}
-        if tool == "ecad_wire":
-            return {
-                "ok": True, "net": a.get("net") or "3V3", "net_size": 2,
-                "net_members": [
-                    f"{a.get('from_ref')}.{a.get('from_pin')}",
-                    f"{a.get('to_ref')}.{a.get('to_pin')}",
-                ],
-            }
-        if tool == "board_from_schematic":
-            return {
-                "ok": True, "doc_id": "brd1", "board_doc_id": "brd1",
-                "sch_doc_id": "sch1",
-            }
-        if tool == "ecad_optimize_traces":
-            assert a.get("doc_id") == "brd1", a
-            return {"ok": True, "doc_id": "brd1", "corners_rounded": 3}
-        if tool == "ecad_run_drc":
-            assert a.get("doc_id") == "brd1", a
-            return {"ok": True, "errors": 0, "doc_id": "brd1"}
-        if tool == "ecad_run_erc":
-            return {"ok": True, "errors": 0}
-        if tool == "ecad_simulate":
-            return {
-                "ok": True, "device_count": 2, "nodes": ["3V3", "GND"],
-                "op": {"V(3V3)": 3.3}, "resolved_net": "3V3",
-            }
-        return {"ok": True}
-
-    class _Led:
-        run_id = "ecad-starve"
-        events = []
-
-    out = ecad_product_gate(_Led(), dispatch=_dispatch, reason="test_starve")
-    assert out.get("forced") is True
-    assert out.get("ok") is True, (out, order)
-    # Order includes board before optimize before drc (Q22).
-    assert "board_from_schematic" in order
-    assert "ecad_optimize_traces" in order
-    assert "ecad_run_drc" in order
-    assert order.index("board_from_schematic") < order.index("ecad_optimize_traces")
-    assert order.index("ecad_optimize_traces") < order.index("ecad_run_drc")
-    # P22: simulate executed after driven prep.
-    assert "ecad_simulate" in order
-
-

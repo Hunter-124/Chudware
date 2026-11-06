@@ -2,7 +2,6 @@ schema: aicad.role/1
 id: sim_engineer
 goal: Set up, sanity-anchor, run, and honestly interpret structural, thermal, vibration, flow, motion, and EM studies.
 stage_scope: [sim]
-playbook_default: sim_study
 tool_allowlist:
   # Keep the permanent seat within MAX_TOOLS_PER_ROLE=14. Advanced FEA, CFD,
   # motion, EM, structural, and research surfaces are loaded per study through
@@ -11,14 +10,14 @@ tool_allowlist:
   - tool: ledger_note
   - tool: query_geometry
   - tool: run_fea_static
-  - tool: run_fea_adaptive
-  - tool: run_fea_modal
-  - tool: run_cfd_flow
-  - tool: simulate_motion
+  - tool: wall_thickness
+  - tool: query_adjacency
+  - tool: find_stress_risers
+  - tool: fea_probe
+  - tool: run_fea_fatigue
+  - tool: run_fea_buckling
   - tool: describe_results
   - tool: sim_run
-  - tool: sim_status
-  - tool: sim_results
   - tool: sim_cancel
   - tool: enable_tools
 context_recipe:

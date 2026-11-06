@@ -1,27 +1,8 @@
-// EcadMirror — a read-only, in-process mirror of one open ECAD document, built from the JSON the
-// worker returns for `ecad_tree` / `ecad_apply_ops` (shape: {revision, kind, tree, compile}; see
-// engine/ecad/session.py::tree and contracts/ecad/ecad_rpc.md §1). It is the ECAD analogue of
-// core::DocMirror — but where DocMirror keeps the raw doc JSON and lets the FeatureManager walk it,
-// EcadMirror PARSES the schematic / board document into flat typed vectors with WORLD coordinates
-// already computed, so the canvas can draw without re-deriving the rotate/mirror math every frame.
-//
-// The world-coordinate transforms (pinWorld / padWorld / localToWorld) are a faithful port of
-// engine/ecad/schema.py (pin_world / pad_world / local_to_world): mirror, then rotate CCW by the
-// placement angle, then translate. Keeping the math identical guarantees the canvas places pins/pads
-// exactly where the engine's netlist/DRC believe they are.
-//
-// Coordinates here are ECAD-world millimetres, +x right, +y UP (math convention). The CANVAS (not
-// this mirror) flips +y for screen — same split the Python contract documents. This mirror never
-// touches ImGui or the renderer; it depends only on nlohmann::json so it stays trivially testable.
-//
-// Assumptions about host APIs (could not build-verify):
-//   * nlohmann::json is available as <nlohmann/json.hpp> (confirmed: worker_client.h / app_state.h).
-//   * WorkerClient::call(method, params, result, err, ...) is the RPC entry (confirmed in
-//     worker_client.h). EcadMirror itself does NOT call the worker — the panel owns RPC and feeds
-//     parsed JSON in via loadFromTree(); see ECAD_UI_INTEGRATION.md §(e) for the call pattern.
+// Read-only mirror of the ECAD tree and compile response. Geometry is flattened into typed
+// world-coordinate vectors so the KiCad project preview can draw it without redoing transforms.
+// Coordinates are millimetres with +y up; the canvas converts them to screen coordinates.
 #pragma once
 
-#include <array>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -188,7 +169,7 @@ struct EcadPad {
     float w = 0.0f, h = 0.0f;  // size [w,h] mm
     float roundrectRatio = 0.0f;
     std::string type = "smd";  // smd|tht|np_tht|connector
-    std::vector<std::string> layers;  // copper/tech layer ids this pad is on
+    std::vector<std::string> layers;  // concrete copper/tech ids; KiCad layer sets expanded
     bool hasDrill = false;
     float drillDia = 0.0f;     // through-hole drill diameter (mm)
     std::string net;           // net name or ""
@@ -320,8 +301,7 @@ public:
     const std::vector<EcadSheetSymbol>& sheetSymbols() const { return sheetSymbols_; }
     const EcadTitleBlock&               titleBlock()   const { return titleBlock_; }
 
-    // Document edit grid in mm (schema `units.grid`, default 2.54). Every placement and
-    // move MUST snap to this, not to a hard-coded constant.
+    // Display grid in mm (schema `units.grid`, default 2.54).
     float grid() const { return grid_; }
 
     // The sheet the canvas is currently showing. Entities carry a `sheet` id and MUST be
@@ -344,9 +324,6 @@ public:
     const std::vector<EcadVia>&       vias()        const { return vias_; }
     const std::vector<EcadZone>&      zones()       const { return zones_; }
     const std::vector<EcadOutlineSeg>& outline()    const { return outline_; }
-    // Authored board content, including graphics that are not yet drawn by the canvas.
-    // Stackup/rule defaults alone do not make the automatic starter a design.
-    bool hasBoardContent() const { return isPcb() && hasBoardContent_; }
     const std::vector<EcadLayer>&     layers()       const { return layers_; }
 
     // Tracks filtered to one copper layer (the canvas draws layer-by-layer back-to-front so the top
@@ -358,16 +335,9 @@ public:
     bool layerVisible(const std::string& layerId) const;
     void setLayerVisible(const std::string& layerId, bool vis);
 
-    // Per-net visibility (mutated by the panel's Nets eye toggles; the canvas hides that net's
-    // tracks + ratsnest). Defaults to visible; unknown/empty net names are treated as visible.
+    // Per-net visibility for the preview. Defaults to visible; unknown/empty names are visible.
     bool netVisible(const std::string& net) const;
     void setNetVisible(const std::string& net, bool vis);
-
-    // Per-layer color override (RGB 0..1; panel-owned). When no override is set for a layer id,
-    // callers fall back to the copperIndex-derived default (layerSwatch / copperColor). Returns
-    // true and fills out[3] when an override exists; false otherwise.
-    bool layerColor(const std::string& layerId, float out[3]) const;
-    void setLayerColor(const std::string& layerId, float r, float g, float b);
 
     // ---- compile accessors (both kinds) ----
     const std::vector<EcadAirwire>&   ratsnest()  const { return ratsnest_; }
@@ -421,11 +391,9 @@ private:
     std::vector<EcadVia>        vias_;
     std::vector<EcadZone>       zones_;
     std::vector<EcadOutlineSeg> outline_;
-    bool hasBoardContent_ = false;
     std::vector<EcadLayer>      layers_;
     std::unordered_map<std::string, bool> layerVis_;  // id -> visible (panel-owned)
     std::unordered_map<std::string, bool> netVis_;    // net name -> visible (panel-owned)
-    std::unordered_map<std::string, std::array<float, 3>> layerColor_;  // id -> RGB override (panel-owned)
 
     // compile
     std::vector<EcadAirwire>   ratsnest_;

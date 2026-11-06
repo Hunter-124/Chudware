@@ -1,15 +1,15 @@
 # Press fit context pack
-# Source: services/research/data/iso286.json (shaft deviations k/n/p/r/s tabulated,
-#         ISO 286-1:2010 Table 9); fits.py _shaft_es_um(); fit_recommendations.json
+# Source: services/research/fits.py (_shaft_deviation_um and _HOLE_ROWS),
+#         ISO 286-1:2010 Tables 4–5; iso286.json IT grades; fit_recommendations.json
 
 ## Callout format
 - Designation: `H7/p6` (light press) | `H7/r6` (medium) | `H7/s6` (heavy)
 - Drawing note: "PRESS FIT H7/p6" with interference range in notes block
 
 ## Interference ranges on Ø20 (from fit_calc, ISO 286-2:2010)
-- H7/k6: transition  −0.006..+0.021 mm (may be clearance or press)
-- H7/p6: light press  0.017..0.042 mm interference
-- H7/s6: medium press 0.035..0.060 mm interference
+- H7/k6: transition clearance −0.015..+0.019 mm (may be clearance or press)
+- H7/p6: light press 0.001..0.035 mm interference
+- H7/s6: press 0.014..0.048 mm interference
 
 ## Assembly considerations
 - Loctite 638 (retaining compound) allows h6 shaft for disassembly

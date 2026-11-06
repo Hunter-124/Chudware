@@ -101,7 +101,7 @@ TEST_CASE("suggest_doc_ops prefers sketch_ family for sketch_create") {
 // 10000 - lev*100, which for a short query ranks short UNRELATED names, and
 // suggest_doc_ops force-emitted the first candidate even at a non-positive score.
 // Noise is worse than silence: the model cannot recover from a wrong hint.
-// Keep in lockstep with services/mcp/op_registry.py (this C++ copy is the LIVE path).
+// The C++ registry is the only copy; there is no Python twin to keep in lockstep.
 TEST_CASE("an unrelated op gets no suggestions instead of noise") {
     for (const char* q : {"cut", "pocket", "zzzzz", "make_it_hollow"}) {
         auto sug = chudware::doc::suggest_doc_ops(q, 5);

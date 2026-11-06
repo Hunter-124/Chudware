@@ -6,7 +6,7 @@ Same design contract as ``ecad_tools`` / ``piping_tools``: JSON-string results w
 session state so the verify tool can run with no arguments.
 
 Tools:
-  ecad_thermal_handoff   board -> fused FEA solid (engine.ecad.threed.board_to_fea_step)
+  ecad_thermal_handoff   board -> fused FEA solid (services.ecad.threed.board_to_fea_step)
                          with layer-homogenized FR4+Cu material -> per-component heat
                          sources from boardphys power metadata (+ optional PDN I2R trace
                          heating) -> environment-preset convection BCs -> core thermal
@@ -34,7 +34,7 @@ import math
 import os
 from typing import Any, Optional, Union
 
-from services.mcp import simhandoff as sh
+from services.mcp import _envelopes, simhandoff as sh
 from services.mcp.cad_common import coerce_json_or_repr, require_mapping
 
 # Environment presets: film coefficient (W/m^2-K) + default ambient (C).
@@ -65,7 +65,7 @@ _THERMAL: dict = {
 
 
 def _dumps(payload: dict) -> str:
-    return json.dumps(payload, indent=2)
+    return _envelopes.dumps(payload)
 
 
 def _err(
@@ -79,15 +79,9 @@ def _err_d(
 ) -> dict:
     """Dict-shaped error envelope (thermal_handoff_impl returns dicts; the MCP tool
     and the GUI worker endpoint each serialize/relay as their transport needs)."""
-    out: dict = {
-        "ok": False,
-        "error": reason,
-        "warnings": [],
-        "hint": hint or reason,
-        "next_actions": next_actions or [],
-    }
-    out.update(extra)
-    return out
+    extra.setdefault("warnings", [])
+    extra.setdefault("next_actions", next_actions or [])
+    return _envelopes.error_payload(reason, hint=hint, **extra)
 
 
 # --------------------------------------------------------------------------- pure helpers
@@ -675,13 +669,13 @@ def thermal_handoff_impl(
     out_path: str = "",
     find_pdn=None,
 ) -> dict:
-    """Board doc (chudware ECAD board JSON) -> solved thermal FEA study dict."""
+    """In-memory board from a KiCad session -> solved thermal FEA study dict."""
     warnings: list = []
     if not isinstance(board_doc, dict) or not board_doc:
         return _err_d(
             "no board document supplied",
-            hint="thermal handoff needs a routed board's document JSON.",
-            next_actions=["ecad_new_pcb('myboard')", "ecad_make_board(...)"],
+            hint="thermal handoff needs a routed board document.",
+            next_actions=["ecad_open(path='board.kicad_pcb')"],
         )
 
     if isinstance(transient, str) and transient.strip():
@@ -1076,7 +1070,7 @@ def thermal_handoff_impl(
                 "board",
                 "step",
                 path=built["step_path"],
-                derived_by="engine.ecad.threed.board_to_fea_step",
+                derived_by="services.ecad.threed.board_to_fea_step",
                 meta={"fused_single_solid": True},
             )
         ],
@@ -1385,23 +1379,45 @@ def register_ecad_thermal_tools(mcp) -> None:
 
     # Same module identity the rest of the server uses (see piping_tools note on the
     # double-import/_PERIODIC_TIMER hazard).
-    from services.mcp.ecad_tools import _get_pcb, _default_out_dir
+    from services.mcp.ecad_tools import _ECAD, _get_pcb, _default_out_dir
     from services.mcp.ecad_common import OpError
 
-    def _find_pdn_block(board_name: str, step_path: str) -> Optional[dict]:
-        """Locate the aicad.boardphys/1 pdn block written by ecad_run_pdn: sidecar next
-        to a prior ecad_to_3d STEP, the pdn-only sidecar, or next to our FEA STEP."""
+    def _find_pdn_block(board_name: str, step_path: str, board_path: str,
+                        board_id: str, mapped_path: str) -> Optional[dict]:
+        """Locate this session's STEP sidecar, then the bound board's and legacy caches."""
         out_dir = str(_default_out_dir(board_name))
-        candidates = [
+        candidates = []
+        if mapped_path:
+            candidates.append(mapped_path)
+        if board_path:
+            candidates.append(os.path.splitext(board_path)[0] + ".step.boardphys.json")
+        candidates.extend([
             os.path.join(out_dir, "board.step.boardphys.json"),
             os.path.join(out_dir, "pdn.boardphys.json"),
             step_path + ".boardphys.json",
-        ]
+        ])
+        seen = set()
         for path in candidates:
+            canonical = os.path.realpath(path)
+            if canonical in seen:
+                continue
+            seen.add(canonical)
             try:
                 if os.path.isfile(path):
                     with open(path, encoding="utf-8") as fh:
                         phys = json.load(fh)
+                    if not isinstance(phys, dict) or phys.get("schema") != "aicad.boardphys/1":
+                        continue
+                    board = phys.get("board")
+                    if not isinstance(board, dict):
+                        continue
+                    source_path = board.get("source_path")
+                    if source_path is not None and source_path != "":
+                        if (not isinstance(source_path, str) or not board_path
+                                or os.path.realpath(source_path) != os.path.realpath(board_path)):
+                            continue
+                    elif not board_id or board.get("id") != board_id:
+                        continue
                     if isinstance(phys.get("pdn"), dict):
                         return phys["pdn"]
             except Exception:  # noqa: BLE001
@@ -1422,9 +1438,11 @@ def register_ecad_thermal_tools(mcp) -> None:
     ) -> str:
         """One call from the active routed board to a solved thermal FEA study.
 
+        Pass an open board doc_id or .kicad_pcb path in doc_id; omit it for the current board.
+
         Pipeline (zero manual BC setup):
         1. Builds the FEA-ready solid — board substrate + simplified component bodies
-           fused into ONE solid (engine.ecad.threed.board_to_fea_step) with the
+           fused into ONE solid (services.ecad.threed.board_to_fea_step) with the
            FR4+copper stackup HOMOGENIZED to one effective material (in-plane
            rule-of-mixtures k; every assumption listed in the result).
         2. Applies one heat source PER component from its boardphys power metadata
@@ -1432,7 +1450,8 @@ def register_ecad_thermal_tools(mcp) -> None:
            power data get NO heat source and are listed in coverage.unpowered_refs
            (honesty rule — never invented watts).
         3. include_trace_heating=True adds the PDN I2R map (ecad_run_pdn) as distributed
-           flux cells — copper trace/via heating visibly moves hotspots.
+           flux cells. It prefers the session's exported STEP sidecar, then the bound
+           board's default STEP sidecar and prior cache; mismatched boards are ignored.
         4. Convection from the environment preset: 'still_air' (h=10), 'forced_air'
            (h=50), 'cold_plate' (board bottom held at t_amb + still air on top), or
            custom h_w_m2k/t_amb_c. Applied to the board top (outside component
@@ -1454,8 +1473,9 @@ def register_ecad_thermal_tools(mcp) -> None:
         except OpError as e:
             return _err(
                 e.message,
-                hint="thermal handoff needs an open routed board.",
-                next_actions=["ecad_new_pcb('myboard')", "ecad_make_board(...)"],
+                hint="thermal handoff needs an open board or a KiCad board path.",
+                next_actions=["ecad_open(path='board.kicad_pcb')"],
+                code=e.code, detail=e.detail,
             )
         board_doc = session.doc
         out_path = path or str(
@@ -1472,7 +1492,9 @@ def register_ecad_thermal_tools(mcp) -> None:
             mesh_fineness=mesh_fineness,
             dry_run=dry_run,
             out_path=out_path,
-            find_pdn=_find_pdn_block,
+            find_pdn=lambda board_name, step_path: _find_pdn_block(
+                board_name, step_path, session.path or "", board_doc.get("id") or "",
+                (_ECAD.get("boardphys_paths") or {}).get(session.doc_id, "")),
         )
         _THERMAL["last_handoff"] = (
             result if result.get("ok") and result.get("solved") else None
@@ -2035,6 +2057,8 @@ def register_ecad_airflow_tools(mcp) -> None:
         """Hand the active board's thermal problem to OpenFOAM conjugate heat transfer
         (CHT) — the check for when convection PRESETS aren't enough (enclosures, fans).
 
+        Pass an open board doc_id or .kicad_pcb path in doc_id; omit it for the current board.
+
         Pipeline:
         1. Reuses the thermal-handoff FEA geometry (board_to_fea_step) for footprints/powers,
            then exports the board slab + every POWERED component as separate watertight
@@ -2095,8 +2119,9 @@ def register_ecad_airflow_tools(mcp) -> None:
         except OpError as e:
             return _err(
                 e.message,
-                hint="airflow handoff needs an open routed board.",
-                next_actions=["ecad_new_pcb('myboard')", "ecad_make_board(...)"],
+                hint="airflow handoff needs an open board or a KiCad board path.",
+                next_actions=["ecad_open(path='board.kicad_pcb')"],
+                code=e.code, detail=e.detail,
             )
         board_doc = session.doc
 

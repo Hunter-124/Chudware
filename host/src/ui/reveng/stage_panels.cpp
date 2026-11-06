@@ -21,12 +21,14 @@
 #include <nlohmann/json.hpp>
 
 #include "core/app_state.h"
+#include "render/mesh_reference.h"
 #include "ui_theme.h"
 #include "../metrics.h"
 #include "../file_dialog.h"   // saveFileDialog for the export-bundle destination
 
 #include "reveng_internal.h"
 #include "reveng_widgets.h"   // RE-40 shared visual kit
+#include "reveng_measure.h"
 #include "img_tex.h"          // loadTexFromFile / freeTexture for the photo previews
 
 namespace ui {
@@ -53,9 +55,8 @@ const char* const kScaleMethodHelp[3]   = {
     "Pick two pixels on one photo whose real separation you can measure with calipers, and type "
     "that distance. Only valid when both points lie in the same plane and roughly face the "
     "camera — perspective on a slanted feature will bias the whole model.",
-    "Type one dimension you already trust (a caliper reading, a datasheet value). Everything "
-    "else scales from it, so pick a feature that is long, flat-on to the camera, and easy to "
-    "measure — a short or foreshortened one multiplies its own error into every other number.",
+    "Measure the same feature in reconstruction units and on the physical part in millimetres. "
+    "Scale is the physical length divided by the reconstruction-space length.",
 };
 
 const char* const kPaperLabels[2]     = { "A4", "US Letter" };
@@ -141,11 +142,8 @@ const char* tierForKnownSource(int idx) {
 
 // The honesty tier the session's current scale earns.
 const char* tierForScale(const ScaleState& sc) {
-    if (!sc.mirrored || !(sc.mmPerUnit > 0.0)) return "approximate";
-    if (!sc.confirmed)                         return "low";
-    if (sc.residualPct < 1.0)                  return "high";
-    if (sc.residualPct < 3.0)                  return "medium";
-    return "low";
+    return scaleConfidenceTier(sc.mirrored, sc.mmPerUnit, sc.confirmed,
+                               sc.hasResidual, sc.residualPct);
 }
 
 // ---- capability mirror ----------------------------------------------------------------------------
@@ -170,7 +168,7 @@ std::string meshBackendBlock() {
     if (!s.caps.loaded)              return {};
     if (s.caps.dense)                return {};
     return "This session has no mesh and the dense/mesh backend is not provisioned — " +
-           capHint("openmvs", "set OPENMVS_BIN to your OpenMVS build (see reveng_status())") +
+           capHint("openmvs", "use Install missing tools in the Session panel (or set OPENMVS_BIN)") +
            ", then run Reconstruct.";
 }
 
@@ -274,6 +272,11 @@ struct ScaleLocal {
     std::string failReason;        // raw contract `reason` from the last reveng_set_scale failure
     std::string failHint;
     double      probeUnits = 10.0; // plausibility probe, in reconstruction units
+    double      knownReconLength = 0.0; // same feature measured in the unscaled reconstruction
+    int         knownPointA = -1, knownPointB = -1;
+    uint64_t    knownPointsRevision = 0;
+    int         knownSplatA = -1, knownSplatB = -1;
+    uint64_t    knownSplatRevision = 0;
 
     void sync(const std::string& s) {
         if (s == sid) return;
@@ -283,6 +286,11 @@ struct ScaleLocal {
         failReason.clear();
         failHint.clear();
         probeUnits = 10.0;
+        knownReconLength = 0.0;
+        knownPointA = knownPointB = -1;
+        knownPointsRevision = 0;
+        knownSplatA = knownSplatB = -1;
+        knownSplatRevision = 0;
     }
 };
 ScaleLocal& SL() { static ScaleLocal v; return v; }
@@ -338,12 +346,18 @@ struct DeliverLocal {
     TexSlot     matTex;
     std::string attachPath;   // geometry_ref returned by reveng_attach_result
     std::string exportPath;   // path returned by export_reveng_bundle
+    bool        insertPending = false;
+    bool        insertApproximate = false;
+    std::string insertErr, insertOk, insertSession, insertDoc;
 
     void sync(const std::string& s) {
         if (s == sid) return;
         sid = s;
         attachPath.clear();
         exportPath.clear();
+        insertApproximate = false;
+        insertErr.clear();
+        insertOk.clear();
     }
 };
 DeliverLocal& DL() { static DeliverLocal v; return v; }
@@ -412,6 +426,7 @@ static void kickSetScale(AppState& st) {
     } else {
         params["feature"]  = std::string(sc.featureBuf);
         params["value_mm"] = sc.knownValueMm;
+        params["recon_length"] = SL().knownReconLength;
         params["source"]   = kKnownSourceIds[std::clamp(sc.knownSource, 0, 3)];
     }
 
@@ -437,10 +452,13 @@ static void kickSetScale(AppState& st) {
         SL().failHint.clear();
         if (r.result.contains("scale") && r.result["scale"].is_object()) {
             const auto& sj = r.result["scale"];
-            sc2.mirrored    = true;
-            sc2.curMethod   = sj.value("method", std::string());
-            sc2.mmPerUnit   = sj.value("mm_per_unit", 0.0);
-            sc2.residualPct = sj.value("residual_pct", 0.0);
+            sc2.mirrored = sj.contains("mm_per_unit") && sj["mm_per_unit"].is_number();
+            sc2.curMethod = sj.contains("method") && sj["method"].is_string()
+                ? sj["method"].get<std::string>() : std::string();
+            sc2.mmPerUnit = sc2.mirrored ? sj["mm_per_unit"].get<double>() : 0.0;
+            sc2.hasResidual = sj.contains("residual_pct") && sj["residual_pct"].is_number();
+            sc2.residualPct = sc2.hasResidual ? sj["residual_pct"].get<double>() : 0.0;
+            sc2.hasResidual = sc2.hasResidual && std::isfinite(sc2.residualPct) && sc2.residualPct >= 0.0;
             sc2.confirmed   = sj.value("confirmed", false);
         }
         sc2.okMsg = sc2.confirmed
@@ -457,6 +475,7 @@ void kickPrintScaleMat(AppState& st) {
     d.matPending = true;
     d.matErr.clear();
     d.matPath.clear();
+    d.matPreviewPath.clear();
     nlohmann::json args = nlohmann::json::object();
     args["size"] = (d.matSize == 1) ? "Letter" : "A4";
     st.rpc.call("reveng_print_scale_mat", args, [&st](const core::RpcResult& r) {
@@ -469,6 +488,7 @@ void kickPrintScaleMat(AppState& st) {
         }
         d2.matErr.clear();
         d2.matPath = r.result.value("path", std::string());
+        d2.matPreviewPath = r.result.value("preview_path", std::string());
         st.toast(ui::ToastLevel::Success,
                  d2.matPath.empty() ? std::string("Scale mat printed")
                                     : ("Scale mat written: " + d2.matPath));
@@ -479,7 +499,7 @@ void kickPrintScaleMat(AppState& st) {
 // Shared verbatim by the Scale stage (method = ArUco) and the Deliver stage.
 static void drawScaleMatCard(AppState& st, TexSlot& tex, const char* cardId) {
     DeliverState& d = S().deliver;
-    tex.sync(d.matPath);
+    tex.sync(d.matPreviewPath);
 
     if (!kit::CardBegin(cardId, "ArUco scale mat", "measure")) { kit::CardEnd(); return; }
 
@@ -696,7 +716,7 @@ static void drawTwoPointCard() {
     kit::CardEnd();
 }
 
-static void drawKnownDimCard() {
+static void drawKnownDimCard(AppState& st) {
     ScaleState& sc = S().scale;
 
     if (!kit::CardBegin("re_scale_known", "Known dimension", "smart_dim")) {
@@ -705,14 +725,155 @@ static void drawKnownDimCard() {
     }
 
     kit::FieldLabel("Feature", "Name the feature this dimension belongs to, e.g. "
-                               "output_shaft.dia. It is recorded in the provenance chain.");
+                               "output_shaft.dia. It is kept in the session's build record.");
     ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
     ImGui::InputTextWithHint("##re_kd_feat", "output_shaft.dia",
                              sc.featureBuf, sizeof(sc.featureBuf));
+    RevEngState& session = S();
+    ScaleLocal& local = SL();
+    if (local.knownPointsRevision != session.sparsePreviewRevision) {
+        if (local.knownPointA >= 0) local.knownReconLength = 0.0;
+        local.knownPointA = local.knownPointB = -1;
+        local.knownPointsRevision = session.sparsePreviewRevision;
+    }
+    if (local.knownSplatRevision != session.splatPreviewRevision) {
+        if (local.knownSplatA >= 0) local.knownReconLength = 0.0;
+        local.knownSplatA = local.knownSplatB = -1;
+        local.knownSplatRevision = session.splatPreviewRevision;
+    }
+    if (!session.splatPreviewCurrent && local.knownSplatA >= 0) {
+        local.knownSplatA = local.knownSplatB = -1;
+        local.knownReconLength = 0.0;
+        session.splatPickMarks.setCloud({});
+    }
+    if (!session.sparsePoints.empty() &&
+        session.sparseNativePoints.size() == session.sparsePoints.size()) {
+        kit::FieldLabel("Choose two sparse points", "Click the two reconstructed points on the "
+                        "same feature. Sparse points are approximate observations, not exact edges.");
+        const ImRect rect = kit::Viewport3DPreview("##re_kd_sparse",
+            ImVec2(ImGui::GetContentRegionAvail().x, M::reThumbLg()), kit::PreviewSlot::SparseCloud);
+        const ImVec2 after = ImGui::GetCursorScreenPos();
+        ImGui::SetCursorScreenPos(rect.Min);
+        ImGui::InvisibleButton("##re_kd_pick", rect.GetSize());
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+            const auto cam = sparsePreviewCamera((int)rect.GetWidth(), (int)rect.GetHeight());
+            const ImVec2 mouse = ImGui::GetIO().MousePos;
+            const int picked = pickSparsePoint(session.sparsePoints, cam.mvp,
+                rect.Min.x, rect.Min.y, rect.GetWidth(), rect.GetHeight(),
+                mouse.x, mouse.y, M::U(2.0f));
+            if (picked >= 0) {
+                local.knownSplatA = local.knownSplatB = -1;
+                session.splatPickMarks.setCloud({});
+                if (local.knownPointA < 0 || local.knownPointB >= 0) {
+                    local.knownPointA = picked;
+                    local.knownPointB = -1;
+                    local.knownReconLength = 0.0;
+                } else if (picked != local.knownPointA) {
+                    local.knownPointB = picked;
+                    const auto& a = session.sparseNativePoints[(size_t)local.knownPointA];
+                    const auto& b = session.sparseNativePoints[(size_t)local.knownPointB];
+                    local.knownReconLength = reconstructionDistance(a, b);
+                }
+                auto highlighted = session.sparsePoints;
+                for (int idx : {local.knownPointA, local.knownPointB})
+                    if (idx >= 0) {
+                        auto& p = highlighted[(size_t)idx];
+                        p.r = uint8_t(std::clamp(ui::palette.selectionHighlight[0], 0.0f, 1.0f) * 255.0f);
+                        p.g = uint8_t(std::clamp(ui::palette.selectionHighlight[1], 0.0f, 1.0f) * 255.0f);
+                        p.b = uint8_t(std::clamp(ui::palette.selectionHighlight[2], 0.0f, 1.0f) * 255.0f);
+                    }
+                session.rePoints.setCloud(highlighted);
+            }
+        }
+        ImGui::SetCursorScreenPos(after);
+        if (local.knownPointA >= 0 && local.knownPointB < 0)
+            kit::InlineStatus("First point selected. Select a different second point.", Level::Neutral);
+        else if (local.knownPointB >= 0)
+            kit::KeyValueRow("Measured sparse span",
+                             (fmtNum(local.knownReconLength) + " reconstruction units").c_str());
+        dimWrapped("Sparse points can be noisy or miss the actual edge; check critical dimensions "
+                   "against a physical measurement.");
+    } else if (session.splatPreviewCurrent && session.splat.hasSplats() &&
+               session.splatDisplayedTransform.valid) {
+        kit::FieldLabel("Choose two Gaussian centers", "Orient the splat in Reconstruct first, "
+                        "then click two points on the same feature. Gaussian centers only approximate the surface.");
+        const ImRect rect = kit::Viewport3DPreview("##re_kd_splat",
+            ImVec2(ImGui::GetContentRegionAvail().x, M::reThumbLg()), kit::PreviewSlot::Splat);
+        const ImVec2 after = ImGui::GetCursorScreenPos();
+        ImGui::SetCursorScreenPos(rect.Min);
+        ImGui::InvisibleButton("##re_kd_splat_pick", rect.GetSize());
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+            const auto cam = gaussianPreviewCamera((int)rect.GetWidth(), (int)rect.GetHeight());
+            const ImVec2 mouse = ImGui::GetIO().MousePos;
+            const auto& gaussians = session.splat.cloud().gaussians;
+            const int picked = pickSplatPoint(gaussians, cam.mvp, rect.Min.x, rect.Min.y,
+                rect.GetWidth(), rect.GetHeight(), mouse.x, mouse.y, M::U(2.0f));
+            if (picked >= 0) {
+                local.knownPointA = local.knownPointB = -1;
+                if (local.knownSplatA < 0 || local.knownSplatB >= 0) {
+                    local.knownSplatA = picked;
+                    local.knownSplatB = -1;
+                    local.knownReconLength = 0.0;
+                } else if (picked != local.knownSplatA) {
+                    local.knownSplatB = picked;
+                    const auto& transform = session.splatDisplayedTransform;
+                    const auto native = [&](const Vec3& p) -> std::array<double, 3> {
+                        return transform.metric
+                            ? inverseSimilarity(p, transform.mmPerUnit, transform.rotation, transform.translation)
+                            : std::array<double, 3>{double(p.x), double(p.y), double(p.z)};
+                    };
+                    local.knownReconLength = reconstructionDistance(
+                        native(gaussians[(size_t)local.knownSplatA].pos),
+                        native(gaussians[(size_t)local.knownSplatB].pos));
+                }
+                std::vector<render::SparsePoint> marks;
+                const auto color = [](int component) {
+                    return uint8_t(std::clamp(ui::palette.selectionHighlight[component], 0.0f, 1.0f) * 255.0f);
+                };
+                for (int idx : {local.knownSplatA, local.knownSplatB})
+                    if (idx >= 0) {
+                        const Vec3& p = gaussians[(size_t)idx].pos;
+                        marks.push_back({p.x, p.y, p.z, color(0), color(1), color(2)});
+                    }
+                session.splatPickMarks.setPointSize(8.0f);
+                session.splatPickMarks.setWidthScale(1.0f);
+                session.splatPickMarks.setCloud(marks);
+            }
+        }
+        ImGui::SetCursorScreenPos(after);
+        if (local.knownSplatA >= 0 && local.knownSplatB < 0)
+            kit::InlineStatus("First center selected. Select a different second center.", Level::Neutral);
+        else if (local.knownSplatB >= 0)
+            kit::KeyValueRow("Measured center span",
+                             (fmtNum(local.knownReconLength) + " reconstruction units").c_str());
+        dimWrapped("Gaussian centers are only an approximate surface; independently verify "
+                   "all fit-critical dimensions.");
+    } else if (session.splatPreviewCurrent && !session.splatDisplayedTransform.valid) {
+        kit::InlineStatus("The splat transform is unavailable; enter a reconstruction-space distance instead.",
+                          Level::Warn);
+    } else if (session.splatLoaded && !session.splatPreviewCurrent) {
+        kit::InlineStatus("Waiting for the current splat preview; enter a reconstruction distance "
+                          "or retry the preview before picking.", Level::Warn);
+    } else if (!session.sparsePoints.empty()) {
+        kit::InlineStatus("The sparse preview's reconstruction transform is unavailable; enter a "
+                          "reconstruction-space distance instead.", Level::Warn);
+    }
 
-    kit::FieldLabel("Value", "The real, physical size of that feature in millimetres.");
-    ImGui::InputDouble("##re_kd_val", &sc.knownValueMm, 0.0, 0.0, "%.4g mm");
-    if (sc.knownValueMm <= 0.0) sc.knownValueMm = 0.001;
+
+    kit::FieldLabel("Reconstruction distance", "Use the span measured above or enter the same "
+                    "feature's length in unscaled reconstruction units.");
+    if (ImGui::InputDouble("##re_kd_recon", &local.knownReconLength, 0.0, 0.0, "%.6g")) {
+        local.knownPointA = local.knownPointB = -1;
+        local.knownSplatA = local.knownSplatB = -1;
+        session.splatPickMarks.setCloud({});
+        session.rePoints.setCloud(session.sparsePoints);
+    }
+    kit::FieldLabel("Real length (mm)", "The physical size of the same feature in millimetres.");
+    ImGui::InputDouble("##re_kd_val", &sc.knownValueMm, 0.0, 0.0, "%.4g");
+    if (SL().knownReconLength > 0.0 && std::isfinite(SL().knownReconLength) &&
+        sc.knownValueMm > 0.0 && std::isfinite(sc.knownValueMm))
+        kit::KeyValueRow("Scale", (fmtNum(sc.knownValueMm / SL().knownReconLength) +
+                                   " mm / reconstruction unit").c_str());
 
     kit::FieldLabel("Source", "Where the number came from. This drives the honesty tier that "
                               "rides along with every dimension derived from it.");
@@ -732,6 +893,35 @@ static void drawKnownDimCard() {
             "Guessed. contracts/reveng.md \xc2\xa7""0 forbids silent guessing on fit-critical "
             "dimensions: everything scaled from this number is reference-only and MUST be "
             "confirmed with calipers before anything is cut, printed or ordered.", Level::Error);
+    }
+    if (sc.mirrored && !sc.confirmed && sc.mmPerUnit > 0.0) {
+        kit::GapControl();
+        kit::InlineStatus("Confirm only after checking the measured span and its real length.",
+                          Level::Warn);
+        if (kit::SecondaryButton("Confirm recorded scale", st.workerStarted && !sc.pending,
+                                 "Wait for the current scale request to finish.")) {
+            const std::string sid = selectedSessionId();
+            sc.pending = true;
+            sc.err.clear();
+            sc.okMsg.clear();
+            st.rpc.call("reveng_confirm_scale", {{"session_id", sid}}, [sid](const core::RpcResult& r) {
+                if (selectedSessionId() != sid) return;
+                ScaleState& current = S().scale;
+                current.pending = false;
+                std::string reason, hint;
+                if (!rpcUnwrap(r, "reveng_confirm_scale", current.err, reason, hint)) {
+                    SL().failReason = reason;
+                    SL().failHint = hint;
+                    return;
+                }
+                SL().failReason.clear();
+                SL().failHint.clear();
+                current.confirmed = r.result.contains("scale") && r.result["scale"].is_object() &&
+                                    r.result["scale"].value("confirmed", false);
+                current.okMsg = current.confirmed ? "Recorded scale confirmed." : "Scale was not confirmed.";
+                S().lastDetailT = -100.0;
+            }, core::kLongEngineCallTimeoutMs);
+        }
     }
     kit::CardEnd();
 }
@@ -770,10 +960,10 @@ static void drawScaleResultCard() {
                    "Multiply any length measured in the reconstruction by this to get "
                    "millimetres.");
     ImGui::SameLine(0, M::reCtlGap());
-    kit::ValueChip("residual", kit::fmtPct(sc.residualPct / 100.0, 2).c_str(),
-                   levelForResidual(sc.residualPct),
-                   "Solver fit error. Under 1 % is good, 1-3 % is usable with care, above 3 % "
-                   "means the solve did not agree with itself — re-shoot or re-pick.");
+    kit::ValueChip("residual",
+                   sc.hasResidual ? kit::fmtPct(sc.residualPct / 100.0, 2).c_str() : "unknown",
+                   sc.hasResidual ? levelForResidual(sc.residualPct) : Level::Warn,
+                   sc.hasResidual ? "Solver fit error." : "This scale method did not report a residual.");
     ImGui::SameLine(0, M::reCtlGap());
     kit::HonestyTag(tierForScale(sc), "Tier of every dimension derived through this scale.");
 
@@ -872,7 +1062,7 @@ void drawScalePanel(AppState& st) {
     } else if (sc.method == 1) {
         drawTwoPointCard();
     } else {
-        drawKnownDimCard();
+        drawKnownDimCard(st);
     }
     kit::GapCards();
 
@@ -904,8 +1094,10 @@ void drawScalePanel(AppState& st) {
         } else if (sc.method == 2) {
             if (sc.featureBuf[0] == '\0')
                 blocked = "Name the feature this dimension belongs to.";
-            else if (!(sc.knownValueMm > 0.0))
-                blocked = "Enter a positive value in millimetres.";
+            else if (!(sc.knownValueMm > 0.0) || !std::isfinite(sc.knownValueMm))
+                blocked = "Enter a finite positive real length in millimetres.";
+            else if (!(SL().knownReconLength > 0.0) || !std::isfinite(SL().knownReconLength))
+                blocked = "Enter the measured reconstruction-space length of the same feature.";
         }
 
         if (kit::PrimaryButton(sc.pending ? "Applying\xe2\x80\xa6" : "Apply scale",
@@ -1714,6 +1906,70 @@ void drawModelPanel(AppState& st) {
 // Deliver stage
 // =================================================================================================
 
+static void kickInsertReference(AppState& st, bool approximate) {
+    DeliverLocal& local = DL();
+    const std::string sid = selectedSessionId();
+    if (local.insertPending || sid.empty() || !st.isActiveMirrorDoc()) return;
+    const std::string doc = st.docMirror.docId();
+    local.insertPending = true;
+    local.insertSession = sid;
+    local.insertDoc = doc;
+    local.insertErr.clear();
+    local.insertOk.clear();
+    st.rpc.call("reveng_attach_reference",
+                {{"session_id", sid}, {"doc_id", doc}, {"name", selectedSessionName()},
+                 {"approximate", approximate}},
+                [&st, sid, doc](const core::RpcResult& r) {
+        DeliverLocal& current = DL();
+        if (current.insertSession == sid && current.insertDoc == doc)
+            current.insertPending = false;
+        std::string error;
+        if (!rpcOk(r, "reveng_attach_reference", error) || r.result.contains("code")) {
+            if (error.empty()) error = r.result.value("message", std::string("Reference insertion failed"));
+            if (selectedSessionId() == sid) current.insertErr = error;
+            st.toast(ui::ToastLevel::Error, error);
+            return;
+        }
+        ui::meshReferenceMutationCompleted(st, doc, r.result.value("revision", 0));
+        if (selectedSessionId() == sid)
+            current.insertOk = "Inserted as a reference in the selected part.";
+        st.toast(ui::ToastLevel::Success, "Scan reference inserted");
+    });
+}
+
+static void drawInsertReferenceCard(AppState& st) {
+    DeliverLocal& local = DL();
+    const bool part = st.isActiveMirrorDoc() && st.activeTab >= 0 &&
+        st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Part;
+    const bool confirmed = S().scale.mirrored && S().scale.confirmed;
+    if (!kit::CardBegin("re_deliver_reference", "Insert into active part", "part")) {
+        kit::CardEnd();
+        return;
+    }
+    dimWrapped("Embed the reconstructed surface as a translucent, non-solid reference. "
+               "It will be saved in the part and will not contribute to mass or booleans.");
+    if (!confirmed) {
+        kit::GapControl();
+        kit::InlineStatus("Scale is unconfirmed. Dimensions from this scan are not reliable.",
+                          Level::Warn);
+        ImGui::Checkbox("Insert as approximate reference", &local.insertApproximate);
+    }
+    const char* blocked = nullptr;
+    if (local.insertPending) blocked = "Insertion is already running.";
+    else if (!st.workerStarted) blocked = "The worker is not ready.";
+    else if (!part) blocked = "Select an open part first.";
+    else if (S().artifactMeshPath.empty()) blocked = "Reconstruct a surface mesh first.";
+    else if (!confirmed && !local.insertApproximate)
+        blocked = "Confirm the scale or explicitly accept an approximate reference.";
+    kit::GapControl();
+    if (kit::PrimaryButton(local.insertPending ? "Inserting..." :
+                           "Insert as reference into active part", blocked == nullptr, blocked))
+        kickInsertReference(st, !confirmed && local.insertApproximate);
+    kit::InlineStatus(local.insertOk.c_str(), Level::Ok);
+    kit::InlineStatus(local.insertErr.c_str(), Level::Error);
+    kit::CardEnd();
+}
+
 static void kickAttachResult(AppState& st) {
     RevEngState& s = S();
     DeliverState& d = s.deliver;
@@ -1792,13 +2048,7 @@ static const char* deliveredTier() {
 }
 
 static const char* sourceLaneLabel(SourceMode mode) {
-    switch (mode) {
-        case SourceMode::Scan:        return "Scan (photos / video)";
-        case SourceMode::Datasheet:   return "Datasheet";
-        case SourceMode::Web:         return "Web / part number";
-        case SourceMode::FromLibrary: return "Parts library seed";
-    }
-    return "unknown";
+    return mode == SourceMode::Scan ? "Scan (photos / video)" : "From reference";
 }
 
 static void drawDeliverHeroCard() {
@@ -1940,7 +2190,7 @@ static void drawExportCard(AppState& st) {
     kit::StatusChip(stateLabel, stateLevel);
 
     dimWrapped("Zips the whole session — photos, sparse model, mesh, fits, the scale solve and "
-               "the provenance chain — so the numbers can be audited or handed to someone else.");
+               "the build record — so the numbers can be audited or handed to someone else.");
 
     kit::FieldLabel("Destination", "Where the .zip is written.");
     const float browseW = M::reBtnW();
@@ -1980,12 +2230,12 @@ static void drawExportCard(AppState& st) {
 }
 
 // Everything an engineer needs to defend these numbers six months from now.
-static void drawProvenanceCard() {
+static void drawBuildRecordCard() {
     RevEngState& s = S();
     const ScaleState& sc = s.scale;
     const ModelState& m = s.model;
 
-    if (!kit::CardBegin("re_deliver_prov", "Provenance", "history")) {
+    if (!kit::CardBegin("re_deliver_prov", "Build record", "history")) {
         kit::CardEnd();
         return;
     }
@@ -1994,8 +2244,8 @@ static void drawProvenanceCard() {
     kit::CardHeaderRight(chipWidth(tier));
     kit::HonestyTag(tier);
 
-    dimWrapped("How this part was derived, end to end. Copy it into the design record — a "
-               "dimension without a provenance chain is a guess with extra steps.");
+    dimWrapped("How this part was made, end to end. Copy it into the design record so every "
+               "dimension can be traced back to where it came from.");
     kit::GapControl();
 
     const int imageCount = (s.selected >= 0 && s.selected < (int)s.sessions.size())
@@ -2007,7 +2257,7 @@ static void drawProvenanceCard() {
             ? std::string("not set")
             : (sc.curMethod.empty() ? std::string("(unknown)") : sc.curMethod) +
                   "  \xc2\xb7  " + fmtNum(sc.mmPerUnit) + " mm/unit  \xc2\xb7  residual " +
-                  kit::fmtPct(sc.residualPct / 100.0, 2);
+                  (sc.hasResidual ? kit::fmtPct(sc.residualPct / 100.0, 2) : std::string("unknown"));
 
     std::string reconVal;
     if (!s.artifactSplatPath.empty()) reconVal = "splat + ";
@@ -2021,11 +2271,12 @@ static void drawProvenanceCard() {
         : (m.descDocId.empty() ? std::string("not built") : std::string("built, not scored"));
 
     kit::KeyValueRow("Session", selectedSessionId().c_str());
-    kit::KeyValueRow("Source lane", sourceLaneLabel(s.sourceMode));
+    kit::KeyValueRow("Intake", sourceLaneLabel(s.sourceMode));
     kit::KeyValueRow("Images", fmtNum((double)imageCount, "%.0f").c_str());
     kit::KeyValueRow("Scale", scaleVal.c_str(),
-                     (sc.mirrored && sc.mmPerUnit > 0.0) ? levelForResidual(sc.residualPct)
-                                                         : Level::Error);
+                     (sc.mirrored && sc.mmPerUnit > 0.0)
+                         ? (sc.hasResidual ? levelForResidual(sc.residualPct) : Level::Warn)
+                         : Level::Error);
     kit::KeyValueRow("Scale confirmed", sc.confirmed ? "yes" : "no",
                      sc.confirmed ? Level::Ok : Level::Error);
     kit::KeyValueRow("Reconstruction", reconVal.c_str(),
@@ -2042,12 +2293,12 @@ static void drawProvenanceCard() {
         kit::KeyValueRow("Mesh fallback", "yes — not editable parametric", Level::Warn);
 
     kit::GapControl();
-    if (kit::SecondaryButton("Copy provenance")) {
+    if (kit::SecondaryButton("Copy build record")) {
         std::string txt;
-        txt += "Reverse-engineering provenance\n";
+        txt += "Reverse-engineering build record\n";
         txt += "  session:        " + selectedSessionId() + "\n";
         txt += "  name:           " + selectedSessionName() + "\n";
-        txt += "  source lane:    " + std::string(sourceLaneLabel(s.sourceMode)) + "\n";
+        txt += "  intake:         " + std::string(sourceLaneLabel(s.sourceMode)) + "\n";
         txt += "  images:         " + fmtNum((double)imageCount, "%.0f") + "\n";
         txt += "  scale:          " + scaleVal + "\n";
         txt += "  scale confirmed:" + std::string(sc.confirmed ? " yes" : " no") + "\n";
@@ -2079,13 +2330,15 @@ void drawDeliverPanel(AppState& st) {
 
     drawDeliverHeroCard();
     kit::GapCards();
+    drawInsertReferenceCard(st);
+    kit::GapCards();
     drawAttachCard(st);
     kit::GapCards();
     drawExportCard(st);
     kit::GapCards();
     drawScaleMatCard(st, DL().matTex, "re_deliver_mat");
     kit::GapCards();
-    drawProvenanceCard();
+    drawBuildRecordCard();
 }
 
 }  // namespace reveng

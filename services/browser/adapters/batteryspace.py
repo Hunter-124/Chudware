@@ -20,9 +20,10 @@ the login markers are dropped (challenge markers stay for a real bot wall).
 from __future__ import annotations
 
 import re
+from html import unescape
 
-from . import register
-from ._retail import RetailAdapter, _strip_tags
+from . import abs_url, register
+from ._retail import RetailAdapter, _price, _strip_tags, card_blocks, card_image
 
 SITE = "batteryspace"
 BASE_URL = "https://www.batteryspace.com"
@@ -42,11 +43,8 @@ LICENSE_NOTE = (
 _LOGIN_WALL_MARKERS = ()
 _CHALLENGE_MARKERS = ("Access Denied", "Reference #", "Pardon Our Interruption")
 
-# One AmeriCommerce search-result card: the `product-list-options` block wraps an
-# `<h5><a href="…">Title</a>` (product URL + name). The price lives in a sibling
-# `product-list-cost-value` span; the SKU/product id in a `product-list-text`
-# "Product ID: N" line. Slice each card up to the next `product-list-options` so a
-# later card's price/id never leaks onto an earlier one.
+# The product image precedes the options; rating and cart button images are not
+# product previews, even though they occur in the same product-list-item.
 _CARD_RE = re.compile(
     r'<div class="product-list-options">\s*'
     r'<h5>\s*<a\b[^>]*\bhref="(?P<href>[^"]+)"[^>]*>\s*(?P<title>.*?)\s*</a>',
@@ -55,10 +53,21 @@ _PRICE_RE = re.compile(
     r'<span class="product-list-cost-value">\s*(?P<price>[^<]+?)\s*</span>',
     re.IGNORECASE | re.DOTALL)
 _PID_RE = re.compile(r'Product ID:\s*(?P<pid>\d+)', re.IGNORECASE)
+_IMAGE_RE = re.compile(
+    r'<img\b(?=[^>]*\bclass=["\'][^"\']*\bproduct-list-img\b[^"\']*["\'])[^>]*>',
+    re.IGNORECASE)
+_PRICE_RANGE_RE = re.compile(
+    r'From\s+(\$[\d,]+(?:\.\d+)?)\s+to\s+(\$[\d,]+(?:\.\d+)?)', re.IGNORECASE)
 
 
 class BatterySpaceAdapter(RetailAdapter):
     key = SITE
+    currency = "USD"
+    hosts = ("www.batteryspace.com", "batteryspace.com")
+    result_kinds = ("product",)
+    cad_acquisition = False
+    login_required = False
+    api = False
     base_url = BASE_URL
     search_url_tmpl = SEARCH_URL_TMPL
     license_note = LICENSE_NOTE
@@ -66,30 +75,46 @@ class BatterySpaceAdapter(RetailAdapter):
     challenge_markers = _CHALLENGE_MARKERS
 
     def parse_search(self, content: str) -> list[dict]:
-        """BatterySpace ships no JSON-LD on its AmeriCommerce SRP; parse the
-        server-rendered ``product-list-item`` cards directly."""
+        """Read the AmeriCommerce product cards and their own imagery."""
         hits: list[dict] = []
         seen: set[str] = set()
-        cards = list(_CARD_RE.finditer(content))
-        for i, m in enumerate(cards):
-            href = m.group("href")
-            url = href if href.startswith("http") else BASE_URL + href
-            if url in seen:
+        for block in card_blocks(content, "div", "product-list-item"):
+            match = _CARD_RE.search(block)
+            if not match:
+                continue
+            url = abs_url(BASE_URL, unescape(match.group("href")))
+            title = unescape(_strip_tags(match.group("title")))
+            if not url or not title or url in seen:
                 continue
             seen.add(url)
-            end = cards[i + 1].start() if i + 1 < len(cards) else len(content)
+            image = _IMAGE_RE.search(block)
             hit = {
-                "ok": True,
-                "title": _strip_tags(m.group("title")),
-                "url": url,
-                "site": SITE,
+                "ok": True, "title": title, "url": url, "site": SITE,
+                "thumbnail": card_image(image.group(0), BASE_URL) if image else None,
             }
-            price_m = _PRICE_RE.search(content, m.end(), end)
-            if price_m:
-                hit["price"] = _strip_tags(price_m.group("price"))
-            pid_m = _PID_RE.search(content, m.end(), end)
-            if pid_m:
-                hit["sku"] = pid_m.group("pid")
+            price = _PRICE_RE.search(block)
+            if price:
+                value = unescape(_strip_tags(price.group("price")))
+                price_range = _PRICE_RANGE_RE.fullmatch(value)
+                if price_range:
+                    # The low end is not the price of an unspecified variant.
+                    hit["price_range"] = {"min": _price(price_range.group(1)),
+                                          "max": _price(price_range.group(2)), "currency": "USD"}
+                    hit["currency"] = "USD"
+                else:
+                    hit["price"] = value
+                hit["price_display"] = value
+            pid = _PID_RE.search(block)
+            if pid:
+                hit["sku"] = pid.group("pid")
+            qty = card_blocks(block, "div", "product-list-qty")
+            if qty:
+                value = unescape(_strip_tags(qty[0]))
+                count = re.search(r"([\d,]+)\s+(?:items?\s+)?in stock\b", value, re.I)
+                if count:
+                    hit["stock"] = count.group(1)
+                elif re.search(r"\bout of stock\b", value, re.I):
+                    hit["stock"] = 0
             hits.append(hit)
         return hits
 

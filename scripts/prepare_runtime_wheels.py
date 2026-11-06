@@ -9,7 +9,7 @@ requires that chosen document's digest via --review-sha256. This digest selects
 reviewed bytes; it is not a signature or proof of reviewer authority.
 
 Output is a new atomic bundle containing RUNTIME_WHEELS.lock, wheelhouse/,
-REVIEWED_RUNTIME.json, CHUDCODE_ARTIFACT.lock and declarations/. No environment
+REVIEWED_RUNTIME.json, OMP_ARTIFACT.lock and declarations/. No environment
 is created or modified and no network, package resolver or build backend runs.
 Use the separately authenticated target base Python with -I -S for this tool.
 """
@@ -102,7 +102,7 @@ def _review(path: Path, digest: str, context: dict) -> tuple[dict, bytes]:
         raise WheelhouseError("reviewed manifest differs from the externally supplied digest")
     manifest = _document(raw)
     _keys(manifest, {"schema", "approval", "requirements_sha256", "additional_requirements_sha256",
-                     "native_lock_sha256", "chudcode_source", "target"}, "review manifest")
+                     "native_lock_sha256", "omp_source", "target"}, "review manifest")
     if manifest["schema"] != REVIEW_SCHEMA:
         raise WheelhouseError("input is not an operator review manifest")
     approval = manifest["approval"]
@@ -117,8 +117,8 @@ def _review(path: Path, digest: str, context: dict) -> tuple[dict, bytes]:
     if (not isinstance(additional, list) or any(not _sha(value) for value in additional)
             or len(set(additional)) != len(additional)):
         raise WheelhouseError("invalid/duplicate reviewed additional declaration digests")
-    source = manifest["chudcode_source"]
-    _keys(source, {"repository", "repository_commit"}, "reviewed Chudcode source")
+    source = manifest["omp_source"]
+    _keys(source, {"repository", "repository_commit"}, "reviewed OMP source")
     _source_identity({"kind": "vcs", **source}, True, source)
     target = manifest["target"]
     _keys(target, {"environment", "tags", "wheels"}, "reviewed target")
@@ -143,7 +143,7 @@ def _review(path: Path, digest: str, context: dict) -> tuple[dict, bytes]:
             raise WheelhouseError("duplicate reviewed wheel identity")
         names.add(name)
         filenames.add(filename.casefold())
-        _source_identity(entry["source"], name == "chudcode-rpc", source)
+        _source_identity(entry["source"], name == "omp-rpc", source)
     return manifest, raw
 
 
@@ -151,7 +151,7 @@ def runtime_lock(manifest: dict) -> dict:
     wheels = [{key: entry[key] for key in WHEEL_FIELDS} for entry in manifest["target"]["wheels"]]
     wheels.sort(key=lambda entry: entry["filename"])
     return {"schema": "chudware-runtime-wheels-v1", "requirements_sha256": manifest["requirements_sha256"],
-            "chudcode_source": manifest["chudcode_source"],
+            "omp_source": manifest["omp_source"],
             "targets": {target_key(manifest["target"]["environment"]): {"wheels": wheels}}}
 
 
@@ -164,10 +164,10 @@ def _declaration_inputs(manifest: dict, requirements: Path, additional: list[Pat
     if [hashlib.sha256(value).hexdigest() for value in extras] != manifest["additional_requirements_sha256"]:
         raise WheelhouseError("complete ordered release/gate declarations changed or omitted since operator review")
     if hashlib.sha256(native_bytes).hexdigest() != manifest["native_lock_sha256"]:
-        raise WheelhouseError("native Chudcode lock changed since operator review")
+        raise WheelhouseError("native OMP lock changed since operator review")
     native_document = _document(native_bytes)
-    if manifest["chudcode_source"] != {key: native_document.get(key) for key in manifest["chudcode_source"]}:
-        raise WheelhouseError("reviewed chudcode-rpc source differs from native Chudcode commit")
+    if manifest["omp_source"] != {key: native_document.get(key) for key in manifest["omp_source"]}:
+        raise WheelhouseError("reviewed omp-rpc source differs from native OMP commit")
     return root, extras, native_bytes
 
 
@@ -219,7 +219,7 @@ def _write(path: Path, value: bytes) -> None:
 def prepare(args) -> dict:
     context = target_context(args.target_context)
     manifest, raw = _review(args.manifest, args.review_sha256, context)
-    root, extras, native = _declaration_inputs(manifest, args.requirements, args.additional_requirements, args.chudcode_lock)
+    root, extras, native = _declaration_inputs(manifest, args.requirements, args.additional_requirements, args.omp_lock)
     wheel_directory = local_path(args.wheel_directory)
     expected = {entry["filename"] for entry in manifest["target"]["wheels"]}
     supplied = {path.name for path in wheel_directory.iterdir() if path.name.lower().endswith(".whl")}
@@ -232,7 +232,7 @@ def prepare(args) -> dict:
     try:
         _write(temporary / "REVIEWED_RUNTIME.json", raw)
         _write(temporary / "RUNTIME_WHEELS.lock", canonical(runtime_lock(manifest)))
-        _write(temporary / "CHUDCODE_ARTIFACT.lock", native)
+        _write(temporary / "OMP_ARTIFACT.lock", native)
         declarations = temporary / "declarations"
         declarations.mkdir()
         _write(declarations / "requirements.txt", root)
@@ -244,7 +244,7 @@ def prepare(args) -> dict:
         wheels = temporary / "wheelhouse"
         wheels.mkdir()
         with verified_wheelhouse(wheel_directory, declarations / "requirements.txt", temporary / "RUNTIME_WHEELS.lock",
-                                 temporary / "CHUDCODE_ARTIFACT.lock", context["environment"], set(context["tags"]),
+                                 temporary / "OMP_ARTIFACT.lock", context["environment"], set(context["tags"]),
                                  additional_requirements=additional) as identity:
             # Publish only authenticated snapshot bytes, never reread candidates.
             snapshot = identity["requirements"].parent
@@ -277,12 +277,12 @@ def candidate(args) -> dict:
                        "sha256": _digest(path), "source": None})
         if len(wheels) > 4096:
             raise WheelhouseError("too many candidate wheels")
-    native = _json(args.chudcode_lock)
+    native = _json(args.omp_lock)
     manifest = {"schema": REVIEW_SCHEMA, "approval": {"decision": "pending", "reference": None},
                 "requirements_sha256": _digest(args.requirements),
                 "additional_requirements_sha256": [_digest(path) for path in args.additional_requirements],
-                "native_lock_sha256": _digest(args.chudcode_lock),
-                "chudcode_source": {key: native.get(key) for key in ("repository", "repository_commit")},
+                "native_lock_sha256": _digest(args.omp_lock),
+                "omp_source": {key: native.get(key) for key in ("repository", "repository_commit")},
                 "target": {**context, "wheels": wheels}}
     output = _output(args.output)
     descriptor, name = tempfile.mkstemp(prefix=".runtime-review-", dir=output.parent)
@@ -307,7 +307,7 @@ def validate_installed(args) -> dict:
     additional = [bundle / "declarations" / f"additional-{index:03d}.txt"
                   for index in range(len(manifest["additional_requirements_sha256"]))]
     requirements = bundle / "declarations/requirements.txt"
-    native = bundle / "CHUDCODE_ARTIFACT.lock"
+    native = bundle / "OMP_ARTIFACT.lock"
     _declaration_inputs(manifest, requirements, additional, native)
     lock = bundle / "RUNTIME_WHEELS.lock"
     if _bytes(lock) != canonical(runtime_lock(manifest)):
@@ -331,7 +331,7 @@ def main(argv=None) -> int:
         entry.add_argument("--requirements", type=Path, default=REPO / "requirements.txt")
         entry.add_argument("--additional-requirements", type=Path, action="append", default=[],
                            help="repeat for every explicitly reviewed release/gate declarations file, in review order")
-        entry.add_argument("--chudcode-lock", type=Path, default=REPO / "vendor/chudcode/CHUDCODE_ARTIFACT.lock")
+        entry.add_argument("--omp-lock", type=Path, default=REPO / "vendor/omp/OMP_ARTIFACT.lock")
         entry.add_argument("--target-context", type=Path, help="explicit exact cross-target context; defaults to this trusted base")
         if command == "prepare":
             entry.add_argument("--manifest", type=Path, required=True)

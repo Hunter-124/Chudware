@@ -47,7 +47,8 @@ class PipingFittingsAdapter:
         for rec in self.iter_records():
             title = (rec.get("title") or "").lower()
             designation = (rec.get("designation") or "").lower()
-            if norm in title or norm in designation:
+            if (norm in title or norm in designation
+                    or any(norm in alias.lower() for alias in rec["aliases"])):
                 results.append(rec)
         return results
 
@@ -123,7 +124,8 @@ def _make_record(row: dict) -> dict | None:
         designation = f"NPS {nps}"
 
     standard = _FITTING_STANDARDS.get(ftype, "ASME B16")
-    title = f"{standard} {ftype.replace('_', ' ').title()} {designation} piping fitting"
+    family = f"{standard} {ftype.replace('_', ' ').title()}"
+    title = f"{family} {designation}"
 
     params: dict = {"nominal_size": designation, "standard": standard}
     # Carry native columns verbatim (skip None values)
@@ -135,6 +137,8 @@ def _make_record(row: dict) -> dict | None:
         "part_id":      f"fitting:{catalog_id}",
         "domain":       "fitting",
         "title":        title,
+        "family":       family,
+        "aliases":      [f"{title} piping fitting", "piping fitting"],
         "standard":     standard,
         "designation":  designation,
         "params":       params,

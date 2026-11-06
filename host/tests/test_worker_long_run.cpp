@@ -7,7 +7,7 @@
 //
 // Regression under test (live, 2026-09-27): the GUI's agent job thread held
 // WorkerClient::callMtx_ for the whole multi-hour agent_admin_turn. A worker-routed call on the
-// single-FIFO st.rpc lane (subscription_*, chudcode_*, plm_* …) blocked on that mutex, and every
+// single-FIFO st.rpc lane (subscription_*, omp_*, plm_* …) blocked on that mutex, and every
 // later st.rpc call — the tab switch's doc_activate — waited behind it for the rest of the turn:
 // clicking a tab showed "Loading" forever.
 //
@@ -16,7 +16,6 @@
 //     behind it on AsyncRpc both complete
 //   ✓ two online turns on one client overlap on different hostd connections, and their
 //     Stop/steer/answer calls reach hostd by run_id without fetching worker_control_info
-//   ✓ native agent runs still serialize: the second reaches hostd only after the first returns
 //   ✓ the agent connection pool admits eight calls, queues the ninth, and releases leases
 //   ✓ a native sim_run_topology with timeoutMs=-1 stays pending across solver silence far
 //     longer than the transport's 200 ms abort-poll slice (mesh/assembly/factorization emit
@@ -67,6 +66,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <poll.h>
 #include <sys/wait.h>
 
 #include <algorithm>
@@ -136,7 +136,7 @@ public:
         ::unlink(path_.c_str());
     }
 
-    // Block online turns and native agent runs until releaseTurns(); re-arm per test.
+    // Block online turns until releaseTurns(); re-arm per test.
     void holdTurns() {
         std::lock_guard<std::mutex> lk(mtx_);
         releaseTurns_ = false;
@@ -160,17 +160,6 @@ public:
     int maxConcurrentTurns() {
         std::lock_guard<std::mutex> lk(mtx_);
         return maxConcurrent_;
-    }
-    bool waitNativeAgentsStarted(int n, int timeoutMs) {
-        return waitCount(nativeAgentsStarted_, n, timeoutMs);
-    }
-    int nativeAgentsStarted() {
-        std::lock_guard<std::mutex> lk(mtx_);
-        return nativeAgentsStarted_;
-    }
-    int maxConcurrentNativeAgents() {
-        std::lock_guard<std::mutex> lk(mtx_);
-        return maxConcurrentNativeAgents_;
     }
     int controlInfoRequests() {
         std::lock_guard<std::mutex> lk(mtx_);
@@ -243,6 +232,27 @@ public:
     void refuseHellos(bool refuse) {
         std::lock_guard<std::mutex> lk(mtx_);
         refuseHellos_ = refuse;
+    }
+    void holdHellos(bool hold) {
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            holdHellos_ = hold;
+        }
+        cv_.notify_all();
+    }
+    bool waitHellosStarted(int n, int timeoutMs) {
+        return waitCount(hellosStarted_, n, timeoutMs);
+    }
+    void holdDrain(bool hold) {
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            holdDrain_ = hold;
+        }
+        cv_.notify_all();
+    }
+    int drainsStarted() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return drainsStarted_;
     }
 
 private:
@@ -326,8 +336,19 @@ private:
     // nullopt = hang up without replying.
     std::optional<json> handle(int fd, int clientId, const std::string& method,
                                const json& params) {
-        if (method == "hello")
-            return json{{"state", "ready"}, {"client_id", clientId}};
+        if (method == "hello") {
+            std::lock_guard<std::mutex> lock(mtx_);
+            json reply{{"state", "ready"}, {"client_id", clientId}};
+            if (holdDrain_) reply["git_rev"] = "old-test-build";
+            return reply;
+        }
+        if (method == "daemon_drain") {
+            std::unique_lock<std::mutex> lock(mtx_);
+            ++drainsStarted_;
+            cv_.notify_all();
+            cv_.wait(lock, [&] { return stopping_ || !holdDrain_; });
+            return json{{"ok", true}};
+        }
         if (method == "worker_control_info") {
             bump(controlInfoRequests_);
             return json{{"transport", "unix"},
@@ -346,16 +367,6 @@ private:
             --activeTurns_;
             activeRunIds_.erase(std::find(activeRunIds_.begin(), activeRunIds_.end(), runId));
             return json{{"ok", true}, {"text", "done"}, {"client_id", clientId}};
-        }
-        if (method == "agent_run" || method == "agent_run_v2") {
-            std::unique_lock<std::mutex> lk(mtx_);
-            ++nativeAgentsStarted_;
-            ++activeNativeAgents_;
-            maxConcurrentNativeAgents_ = std::max(maxConcurrentNativeAgents_, activeNativeAgents_);
-            cv_.notify_all();
-            cv_.wait(lk, [&] { return releaseTurns_ || stopping_; });
-            --activeNativeAgents_;
-            return json{{"ok", true}, {"text", "done"}};
         }
         if (method == "agent_cancel" || method == "agent_steer" || method == "agent_answer") {
             std::lock_guard<std::mutex> lk(mtx_);
@@ -454,6 +465,12 @@ private:
                 json params = req.value("params", json::object());
                 if (!params.is_object()) params = json::object();
                 const std::string method = req.value("method", std::string());
+                if (method == "hello") {
+                    std::unique_lock<std::mutex> lk(mtx_);
+                    ++hellosStarted_;
+                    cv_.notify_all();
+                    cv_.wait(lk, [&] { return stopping_ || !holdHellos_; });
+                }
                 bool refuse = false;
                 {
                     std::lock_guard<std::mutex> lk(mtx_);
@@ -502,6 +519,10 @@ private:
     std::vector<std::thread> connThreads_;
     bool stopping_ = false;
     bool refuseHellos_ = false;
+    bool holdHellos_ = false;
+    int hellosStarted_ = 0;
+    bool holdDrain_ = false;
+    int drainsStarted_ = 0;
     bool releaseTurns_ = true;
     bool releaseSims_ = true;
     bool releaseMetadata_ = true;
@@ -512,9 +533,6 @@ private:
     int activeTurns_ = 0;
     int maxConcurrent_ = 0;
     std::vector<std::string> activeRunIds_;
-    int nativeAgentsStarted_ = 0;
-    int activeNativeAgents_ = 0;
-    int maxConcurrentNativeAgents_ = 0;
     int controlInfoRequests_ = 0;
     int simsStarted_ = 0;
     int activeSims_ = 0;
@@ -615,32 +633,6 @@ static void onlineTurnsOverlap(FakeHostd& hostd) {
     CHECK(ok[0] && ok[1]);
     CHECK(results[0].value("client_id", 0) != results[1].value("client_id", 0));
     CHECK(hostd.turnsStarted() == before + 2);
-}
-
-// Offline native agents keep their existing per-client serialization.
-static void nativeAgentsNeverOverlap(FakeHostd& hostd) {
-    WorkerClient w;
-    hostd.holdTurns();
-    const int before = hostd.nativeAgentsStarted();
-    bool ok[2] = {false, false};
-    auto runAgent = [&](int index) {
-        json r;
-        std::string e;
-        ok[index] = w.call("agent_run_v2",
-                           json{{"request", "build it"}, {"doc_id", "doc-cpp00000002"}},
-                           r, e, 60000);
-    };
-    std::thread first(runAgent, 0);
-    CHECK(hostd.waitNativeAgentsStarted(before + 1, 5000));
-    std::thread second(runAgent, 1);
-    CHECK(!hostd.waitNativeAgentsStarted(before + 2, 500));
-    CHECK(hostd.maxConcurrentNativeAgents() == 1);
-    hostd.releaseTurns();
-    first.join();
-    second.join();
-    CHECK(ok[0] && ok[1]);
-    CHECK(hostd.nativeAgentsStarted() == before + 2);
-    CHECK(hostd.maxConcurrentNativeAgents() == 1);
 }
 
 // The pool is bounded even when hostd accepts more concurrent turns.
@@ -969,6 +961,28 @@ static void backgroundQueriesDoNotBlockPrimary(FakeHostd& hostd) {
     CHECK(connectProbe(c, false, "gui"));
     const int primaryId = probeClientId(c.serverInfo());
     CHECK(primaryId != 0);
+    // Only the actual document-free OMP queries may use the side connection.
+    // Unknown/retired names, state changes and any document-scoped call must keep
+    // the primary connection identity.
+    bool exactPolicy = false;
+    std::thread policy([&] {
+        exactPolicy =
+            c.usesBackgroundConnection("omp_provider_list", json::object()) &&
+            c.usesBackgroundConnection("omp_auth_state", json::object()) &&
+            c.usesBackgroundConnection("omp_logout_accounts", json{{"providerId", "openai"}}) &&
+            c.usesBackgroundConnection("omp_models_list", json::object()) &&
+            c.usesBackgroundConnection("omp_session_stats", json::object()) &&
+            // The browser OAuth flow is one minutes-long call: it must not hold the primary socket.
+            c.usesBackgroundConnection("omp_login", json{{"providerId", "anthropic"}}) &&
+            !c.usesBackgroundConnection("omp_stt_status", json::object()) &&
+            !c.usesBackgroundConnection("omp_provider_list", json{{"doc_id", "doc"}}) &&
+            !c.usesBackgroundConnection("omp_set_key", json::object()) &&
+            !c.usesBackgroundConnection("omp_apply_compaction_policy", json::object()) &&
+            !c.usesBackgroundConnection("omp_unregistered", json::object()) &&
+            !c.usesBackgroundConnection("chudcode_provider_list", json::object());
+    });
+    policy.join();
+    CHECK(exactPolicy);
     hostd.holdMetadata();
     const int before = hostd.metadataStarted();
     std::atomic<bool> slowDone{false};
@@ -1339,6 +1353,35 @@ static void drainRefusalKeepsDaemonMode(FakeHostd& hostd) {
     CHECK(!probe.connected());
     CHECK(probe.drainEvents().empty());  // the daemon.draining push is not queued
 
+    hostd.holdHellos(true);
+    engine::GuiConnection connection(nullptr);
+    CHECK(hostd.waitHellosStarted(2, 5000));  // probe above, then asynchronous GUI hello
+    CHECK(engine::connectionPending());
+    CHECK(engine::daemonMode());  // intended backend, not a premature inproc verdict
+    CHECK(engine::client() == nullptr);
+    CHECK(!engine::available());
+    CHECK(!engine::daemonUnavailable());
+    CHECK(engine::daemonRefusal().is_null());
+    CHECK(engine::maintainConnection() == engine::DaemonConnState::Unreachable);
+    const auto pendingCallAt = Clock::now();
+    json pendingResult;
+    std::string pendingError;
+    CHECK(!engine::call("doc_new", json::object(), pendingResult, pendingError, 5000));
+    CHECK(pendingResult.value("code", std::string()) == "engine_starting");
+    CHECK(!engine::ensureLoaded(pendingError));
+    CHECK(pendingError.find("starting") != std::string::npos);
+    WorkerClient earlyGui;
+    earlyGui.markStarted();
+    // WorkerClient reports structured method failures as a successful round trip.
+    CHECK(earlyGui.call("doc_new", json::object(), pendingResult, pendingError, 5000));
+    CHECK(pendingResult.value("code", std::string()) == "engine_starting");
+    CHECK(pendingError.find("starting") != std::string::npos);
+    CHECK(Clock::now() - pendingCallAt < std::chrono::milliseconds(150));
+    hostd.holdHellos(false);
+    const auto initializedBy = Clock::now() + std::chrono::seconds(5);
+    while (engine::connectionPending() && Clock::now() < initializedBy)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK(!engine::connectionPending());
     CHECK(engine::daemonMode());
     CHECK(!engine::daemonUnavailable());
     CHECK(engine::daemonRefusal().value("reason", std::string()) == "stale_binary");
@@ -1363,7 +1406,95 @@ static void drainRefusalKeepsDaemonMode(FakeHostd& hostd) {
     }
     CHECK(connected);
     CHECK(engine::daemonRefusal().is_null());
+    CHECK(!engine::client()->usesBackgroundConnection("subscription_accounts", json::object()));
     CHECK(engine::call("doc_list", json::object(), r, ce, 5000));
+}
+
+static void guiShutdownCancelsHello(FakeHostd& hostd) {
+    hostd.holdHellos(true);
+    engine::GuiConnection connection(nullptr);
+    CHECK(hostd.waitHellosStarted(1, 5000));
+    const auto started = Clock::now();
+    connection.shutdown();
+    CHECK(Clock::now() - started < std::chrono::milliseconds(500));
+    CHECK(!engine::connectionPending());
+    hostd.holdHellos(false);
+}
+
+static void cancelledSpawnBudget(const std::string& missingSocket) {
+    const std::string previous = std::getenv("CHUDWARE_HOSTD_SOCKET");
+    ::setenv("CHUDWARE_HOSTD_SOCKET", missingSocket.c_str(), 1);
+    EngineClient client;
+    std::atomic<bool> cancelled{false};
+    EngineClient::Options opts;
+    opts.hostdBin = "/bin/true";  // starts successfully but never binds a daemon socket
+    opts.cancelled = &cancelled;
+    opts.spawnBudgetMs = 15000;
+    bool ok = true;
+    std::string err;
+    std::thread connect([&] { ok = client.connectOrSpawn(opts, err); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const auto stopped = Clock::now();
+    cancelled.store(true, std::memory_order_release);
+    client.abortPending();
+    connect.join();
+    CHECK(!ok && err == "aborted");
+    CHECK(Clock::now() - stopped < std::chrono::milliseconds(500));
+    ::setenv("CHUDWARE_HOSTD_SOCKET", previous.c_str(), 1);
+}
+
+static void cancelledVersionProbe(const std::string& executable) {
+    const std::string previousBin = std::getenv("CHUDWARE_HOSTD_BIN");
+    ::setenv("CHUDWARE_HOSTD_BIN", executable.c_str(), 1);
+    int ack[2];
+    CHECK(::pipe(ack) == 0);
+    ::setenv("CHUDWARE_TEST_VERSION_FD", std::to_string(ack[1]).c_str(), 1);
+    EngineClient client;
+    std::atomic<bool> cancelled{false};
+    EngineClient::Options opts;
+    opts.hostdBin = executable;
+    opts.cancelled = &cancelled;
+    bool ok = true;
+    std::string err;
+    std::thread connect([&] { ok = client.connectOrSpawn(opts, err); });
+    pollfd ready{ack[0], POLLIN, 0};
+    CHECK(::poll(&ready, 1, 5000) > 0);
+    const auto stopped = Clock::now();
+    cancelled.store(true, std::memory_order_release);
+    client.abortPending();
+    connect.join();
+    CHECK(!ok && err == "aborted");
+    CHECK(Clock::now() - stopped < std::chrono::milliseconds(500));
+    ::unsetenv("CHUDWARE_TEST_VERSION_FD");
+    ::setenv("CHUDWARE_HOSTD_BIN", previousBin.c_str(), 1);
+    ::close(ack[0]);
+    ::close(ack[1]);
+}
+
+static void staleVersionKeepsLiveClients(FakeHostd& hostd) {
+    EngineClient gui;
+    EngineClient::Options guiOpts;
+    guiOpts.clientKind = "gui";
+    guiOpts.allowSpawn = false;
+    std::string err;
+    CHECK(gui.connectOrSpawn(guiOpts, err));
+    json doc;
+    CHECK(gui.call("doc_new", json::object(), doc, err, 5000));
+    CHECK(doc.value("doc_id", std::string()) == "doc-cpp00000003");
+
+    // The fake advertises an old build and would record/block any hard drain.
+    hostd.holdDrain(true);
+    EngineClient newcomer;
+    EngineClient::Options opts;
+    opts.hostdBin = "/bin/true";
+    CHECK(newcomer.connectOrSpawn(opts, err));
+    CHECK(hostd.drainsStarted() == 0);
+    CHECK(gui.connected() && newcomer.connected());
+    CHECK(gui.call("doc_activate", json::object(), doc, err, 5000));
+    CHECK(doc.value("revision", 0) == 1);
+    newcomer.disconnect();
+    gui.disconnect();
+    hostd.holdDrain(false);
 }
 
 // The local-pipe regression executes this test binary as its private worker, using
@@ -1514,6 +1645,14 @@ static void localPrivateFailuresPreserveEndpoint(const std::filesystem::path& di
 }
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--version") == 0) {
+        if (const char* fd = std::getenv("CHUDWARE_TEST_VERSION_FD")) {
+            (void)::write(std::atoi(fd), "v", 1);
+            for (;;) ::pause();  // the cancellable probe must terminate/reap only this child
+        }
+        std::printf("chudware-hostd test-build\n");
+        return 0;
+    }
     if (argc == 3 && std::strcmp(argv[1], "--module") == 0 &&
         std::strcmp(argv[2], "worker") == 0)
         return privateControlWorker();
@@ -1546,6 +1685,23 @@ int main(int argc, char** argv) {
               WEXITSTATUS(status) == 0);
     }
     {
+        const std::string startupSocket = (dir / "hostd-startup-cancel.sock").string();
+        std::fflush(stdout);
+        const pid_t child = ::fork();  // isolated call_once state, before parent threads
+        if (child == 0) {
+            ::setenv("CHUDWARE_HOSTD_SOCKET", startupSocket.c_str(), 1);
+            {
+                FakeHostd hostd(startupSocket);
+                guiShutdownCancelsHello(hostd);
+            }
+            std::fflush(stdout);
+            ::_exit(g_failures ? 1 : 0);
+        }
+        int status = 0;
+        CHECK(child > 0 && ::waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+              WEXITSTATUS(status) == 0);
+    }
+    {
         const std::string drainSock = (dir / "hostd-drain.sock").string();
         std::fflush(stdout);
         const pid_t child = ::fork();  // before any thread exists in this process
@@ -1565,6 +1721,9 @@ int main(int argc, char** argv) {
 
     {
         FakeHostd hostd(sock);
+        cancelledSpawnBudget((dir / "hostd-never-binds.sock").string());
+        cancelledVersionProbe(fs::canonical(argv[0]).string());
+        staleVersionKeepsLiveClients(hostd);
         uncorrelatedProtocolErrorsRetireConnection();
         backgroundQueriesDoNotBlockPrimary(hostd);
         backgroundQueryEofIsIsolated();
@@ -1572,7 +1731,6 @@ int main(int argc, char** argv) {
         backgroundProtocolRefusalIsIsolated();
         disconnectWakesAllBackgroundQueries(hostd);
         onlineTurnsOverlap(hostd);
-        nativeAgentsNeverOverlap(hostd);
         agentConnectionPoolIsBounded(hostd);
         silentTopologySolveStaysPending(hostd);
         unboundedWaitEndsOnEof();

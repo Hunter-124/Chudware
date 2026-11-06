@@ -29,7 +29,8 @@ void ensurePromptsDir() {}
 // ---- IPC discovery / spawn (browser never forks hostd) --------------------
 namespace chudware_ipc {
 
-bool spawnDetached(const std::string& /*exe*/, const std::string& /*arg*/, std::string& err) {
+bool spawnDetached(const std::string& /*exe*/, const std::string& /*arg*/, std::string& err,
+                   const std::atomic<bool>* /*cancelled*/) {
     err = "WASM: spawnDetached not available (gateway-hosted daemon)";
     return false;
 }

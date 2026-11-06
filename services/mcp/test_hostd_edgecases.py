@@ -129,8 +129,10 @@ def test_stale_binary_self_drain(scratch_daemon, monkeypatch, tmp_path):
     scratch_daemon.append(pid)
     assert a.call("daemon_status").get("draining") is False
 
-    time.sleep(1.2)     # let the first stale-check tick record the mtime baseline
-    os.utime(hostd_copy)  # "a new build landed at this path"
+    # The baseline is captured before accepting clients, so an immediate
+    # replacement cannot slip between startup and the first periodic check.
+    old = hostd_copy.stat().st_mtime_ns
+    os.utime(hostd_copy, ns=(old + 2_000_000_000, old + 2_000_000_000))
 
     deadline = time.monotonic() + 10.0  # CHUDWARE_HOSTD_STALECHECK_S=1 -> well within
     st: dict = {}
@@ -168,9 +170,123 @@ def test_stale_binary_self_drain(scratch_daemon, monkeypatch, tmp_path):
     assert status["drain_reason"] == "stale_binary"
     assert status["drain"]["active_clients"] >= 1
 
+    # Merely claiming to be an operator does not grant model access, nor can
+    # a second hello turn that narrowly admitted socket into an MCP client.
+    control = DaemonClient()
+    control._hello = lambda: control._call_raw(
+        "hello", {"client": "control", "pid": os.getpid(), "proto": 1}
+    )
+    control.connect(spawn=False)
+    assert control.call("daemon_status")["draining"] is True
+    assert control.call("doc_new", {"name": "forbidden"})["code"] == "control_only"
+    assert control.call("hello", {"client": "mcp"})["code"] == "control_only"
+    assert control.call("doc_new", {"name": "still-forbidden"})["code"] == "control_only"
+    control.close()
+
     # The exit happens once the working client leaves.
     a.close()
     assert _wait_pid_gone(pid), "self-drained daemon must exit once idle"
+
+
+_GUI_CLIENT = (
+    "def gui_client(kind='gui'):\n"
+    "    c = DaemonClient()\n"
+    "    raw = c._call_raw\n"
+    "    c._call_raw = lambda method, params: raw(\n"
+    "        method, {**params, 'client': kind} if method == 'hello' else params)\n"
+    "    return c\n"
+)
+
+
+def _gui_client(kind: str = "gui") -> DaemonClient:
+    """A DaemonClient whose hello declares a desktop GUI kind (refusals still raise)."""
+    scope = {"DaemonClient": DaemonClient}
+    exec(_GUI_CLIENT, scope)
+    return scope["gui_client"](kind)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="SO_PEERPIDFD peer proof")
+def test_stale_drain_admits_open_gui_side_connections(scratch_daemon, monkeypatch, tmp_path):
+    """An open GUI answers agent questions, steers and stops over short-lived side
+    connections. A soft stale-binary drain must admit those from the GUI process that
+    already holds a connection, while an independent GUI process stays refused."""
+    hostd_copy = tmp_path / "chudware-hostd"
+    shutil.copy2(HOSTD, hostd_copy)
+    monkeypatch.setenv("CHUDWARE_HOSTD_BIN", str(hostd_copy))
+    monkeypatch.setenv("CHUDWARE_HOSTD_GUI_EXIT_GRACE_S", "1")
+
+    gui = _gui_client()
+    gui.connect()
+    pid = _pid(gui)
+    scratch_daemon.append(pid)
+    old = hostd_copy.stat().st_mtime_ns
+    os.utime(hostd_copy, ns=(old + 2_000_000_000, old + 2_000_000_000))
+    deadline = time.monotonic() + 10.0
+    while not gui.call("daemon_status").get("draining"):
+        assert time.monotonic() < deadline, "self-drain never fired"
+        time.sleep(0.3)
+
+    for kind in ("gui", "gui-background"):
+        side = _gui_client(kind)
+        side.connect(spawn=False, budget_s=3.0)
+        assert side.call("ping").get("ok") is True, kind
+        side.close()
+
+    # Same process, but not a GUI connection: no continuity without agent ownership.
+    with pytest.raises(DaemonDraining):
+        DaemonClient().connect(spawn=False, budget_s=3.0)
+
+    independent = subprocess.run(
+        [sys.executable, "-c",
+         "import sys\n"
+         "from services.mcp.daemon_bridge import DaemonClient, DaemonDraining\n"
+         + _GUI_CLIENT +
+         "try:\n"
+         "    gui_client().connect(spawn=False, budget_s=3.0)\n"
+         "except DaemonDraining as e:\n"
+         "    sys.exit(0 if e.detail['reason'] == 'stale_binary' else 3)\n"
+         "sys.exit(2)\n"],
+        env=dict(os.environ), cwd=Path(__file__).resolve().parents[2],
+        capture_output=True, text=True, timeout=30)
+    assert independent.returncode == 0, independent.stdout + independent.stderr
+
+    # The drain still completes once the GUI process leaves.
+    gui.close()
+    assert _wait_pid_gone(pid), "self-drained daemon must exit once the GUI leaves"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX supervised-child liveness")
+def test_soft_drain_waits_for_supervised_child_without_clients(scratch_daemon, monkeypatch, tmp_path):
+    hostd_copy = tmp_path / "chudware-hostd"
+    shutil.copy2(HOSTD, hostd_copy)
+    monkeypatch.setenv("CHUDWARE_HOSTD_BIN", str(hostd_copy))
+    monkeypatch.setenv("CHUDWARE_HOSTD_GUI_EXIT_GRACE_S", "1")
+    client = DaemonClient()
+    client.connect()
+    pid = _pid(client)
+    scratch_daemon.append(pid)
+    release = tmp_path / "release-supervised-child"
+    child = client.call("agent_spawn", {
+        "argv": [sys.executable, "-c",
+                 "import pathlib,sys,time; p=pathlib.Path(sys.argv[1]); "
+                 "exec('while not p.exists():\\n time.sleep(0.05)')", str(release)],
+        "env": {}, "mission_id": "soft-drain-child",
+    })
+    assert not child.get("_is_error"), child
+    time.sleep(1.2)
+    old = hostd_copy.stat().st_mtime_ns
+    os.utime(hostd_copy, ns=(old + 2_000_000_000, old + 2_000_000_000))
+    deadline = time.monotonic() + 10
+    while not client.call("daemon_status")["draining"]:
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+    client.close()
+    time.sleep(2)
+    assert daemon_bridge._pid_alive(pid), "soft drain killed a live supervised child"
+    assert daemon_bridge._pid_alive(child["pid"])
+    release.touch()
+    assert _wait_pid_gone(pid), "daemon did not exit after its child finished"
+
 
 
 # --------------------------------------------------- (c) engine load failure
@@ -212,24 +328,23 @@ def test_engine_load_failure_clients_get_engine_failed(scratch_daemon, monkeypat
     assert _wait_pid_gone(pid), "engine-failed daemon must still exit cleanly"
 
 
-# ------------------------------------------- client-side version drain-replace
+# ----------------------------------------- non-destructive client version check
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="wrapper-script trick is POSIX-only")
-def test_client_drain_replace_on_stale_build(scratch_daemon, monkeypatch, tmp_path):
-    """A client whose on-disk hostd reports a DIFFERENT build id than the
-    running daemon must drain it, wait for exit, and respawn/reconnect."""
-    # Daemon A runs the real binary.
+def test_client_stale_version_does_not_stop_live_gui(scratch_daemon, monkeypatch, tmp_path):
+    """A mismatched on-disk version must not hard-stop a GUI's unsaved work."""
     monkeypatch.setenv("CHUDWARE_HOSTD_BIN", str(HOSTD))
-    a = DaemonClient()
-    a.connect()
-    pid_a = _pid(a)
-    scratch_daemon.append(pid_a)
-    assert a._stale_retry_done is False, "matched build must never trigger a drain"
-    a.close()
+    gui = DaemonClient()
+    gui._hello = lambda: gui._call_raw(
+        "hello", {"client": "gui", "pid": os.getpid(), "proto": 1}
+    )
+    gui.connect()
+    pid = _pid(gui)
+    scratch_daemon.append(pid)
+    doc = gui.call("doc_new", {"name": "unsaved-version-check"})["doc_id"]
+    assert gui.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})["revision"] == 1
 
-    # Client B resolves a wrapper whose --version lies ("a newer build landed");
-    # everything else execs the real hostd, so the respawn serves for real.
     wrapper = tmp_path / "chudware-hostd"
     wrapper.write_text(
         "#!/bin/sh\n"
@@ -238,16 +353,18 @@ def test_client_drain_replace_on_stale_build(scratch_daemon, monkeypatch, tmp_pa
     )
     wrapper.chmod(0o755)
     monkeypatch.setenv("CHUDWARE_HOSTD_BIN", str(wrapper))
-
-    b = DaemonClient()
-    b.connect()  # -> stale detected -> drain A -> wait exit -> respawn -> reconnect
-    assert b._stale_retry_done is True
-    pid_b = _pid(b)
-    scratch_daemon.append(pid_b)
-    assert pid_b != pid_a, "client must land on a freshly spawned daemon"
-    assert not daemon_bridge._pid_alive(pid_a), "the stale daemon must be gone"
-    assert b.call("ping").get("ok") is True
-    b.close()
+    newcomer = DaemonClient()
+    try:
+        newcomer.connect()
+        assert _pid(newcomer) == pid
+        assert gui.call("daemon_status")["draining"] is False
+        tree = gui.call("doc_tree", {"doc_id": doc})
+        assert not tree.get("_is_error"), tree
+        assert "b1" in json.dumps(tree)
+        assert daemon_bridge._pid_alive(pid)
+    finally:
+        newcomer.close()
+        gui.close()
 
 
 # ------------------------------------------------------ (d) huge payloads

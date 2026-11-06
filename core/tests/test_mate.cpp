@@ -282,6 +282,86 @@ TEST_CASE("fixed-only mate diagnostics retain authored poses with zero DOF") {
     CHECK(out["transforms"]["b"].get<std::vector<double>>() == authored);
 }
 
+TEST_CASE("a rank-gaining mate cannot report ok while unsatisfied") {
+    json input;
+    input["components"] = json::array({
+        {{"id", "ground"}, {"transform", ident16()}, {"fixed", true}},
+        {{"id", "moving"}, {"transform", ident16()}},
+    });
+    input["mates"] = json::array({
+        {{"id", "seat"}, {"type", "coincident"}, {"align", "aligned"},
+         {"refs", {{{"component", "ground"}}, {{"component", "moving"}}}}},
+    });
+    input["resolved_geometry"] = json::array({
+        geom_entry("seat", 0, "plane", {0, 0, 0}, {0, 0, 1}, {0, 0, 1}, 0.0),
+        geom_entry("seat", 1, "plane", {0, 0, 0}, {0, 0, 1}, {0, 0, 1}, 0.0),
+    });
+    input["max_iter"] = 0;
+    input["time_budget_ms"] = 0.0;
+    const json out = solve_mates_json(input);
+    CHECK_FALSE(out["converged"].get<bool>());
+    CHECK(out["dof"].get<int>() == 3);
+    REQUIRE(out["mate_status"].size() == 1);
+    CHECK(out["mate_status"][0]["status"] == "unsatisfied");
+    CHECK(out["mate_status"][0]["reason"].get<std::string>().find("tolerance") != std::string::npos);
+    CHECK(out["residuals"][0]["max_abs"].get<double>() > out["tolerance"].get<double>());
+
+    // Even fixed-only mates must be checked rather than being silently marked ok.
+    input["components"][1]["fixed"] = true;
+    const json fixed = solve_mates_json(input);
+    CHECK_FALSE(fixed["converged"].get<bool>());
+    CHECK(fixed["mate_status"][0]["status"] == "unsatisfied");
+    CHECK(fixed["residuals"][0]["max_abs"].get<double>() > fixed["tolerance"].get<double>());
+}
+
+TEST_CASE("plane mate rank survives a flip delete and return to the aligned branch") {
+    const json components = json::array({
+        {{"id", "ground"}, {"transform", ident16()}, {"fixed", true}},
+        {{"id", "moving"}, {"transform", ident16()}},
+    });
+    const json refs = json::array({{{"component", "ground"}}, {{"component", "moving"}}});
+    json mates = json::array({{{"id", "seat"}, {"type", "coincident"},
+                                {"align", "anti"}, {"refs", refs}}});
+    ResolvedGeometry geom;
+    MateGeom top, bottom, front;
+    top.kind = bottom.kind = front.kind = "plane";
+    top.normal = Vector3d(0, 0, 1);
+    bottom.normal = Vector3d(0, 0, -1);
+    front.normal = Vector3d(0, -1, 0);
+    geom[{"seat", 0}] = top;
+    geom[{"seat", 1}] = bottom;
+    geom[{"front", 0}] = front;
+    geom[{"front", 1}] = front;
+
+    const auto flipped = solve_mates(components, mates, geom);
+    REQUIRE(flipped.converged);
+    CHECK(flipped.dof == 3);
+    const auto deleted = solve_mates(components, json::array(), geom, flipped.params);
+    REQUIRE(deleted.converged);
+    CHECK(deleted.dof == 6);
+    mates[0]["align"] = "aligned";
+    const auto seated = solve_mates(components, mates, geom, deleted.params);
+    REQUIRE(seated.converged);
+    CHECK(seated.dof == 3);
+    mates.push_back({{"id", "front"}, {"type", "parallel"}, {"align", "aligned"},
+                     {"refs", refs}});
+    const auto constrained = solve_mates(components, mates, geom, seated.params);
+    REQUIRE(constrained.converged);
+    CHECK(constrained.dof == 2);
+    CHECK(constrained.mate_status[1].status == "ok");
+
+    // The exact singular chart seen after a whole-turn history represents the
+    // same upright pose. It must have the same physical rank as the upright seed.
+    WarmMap full_turn{{"moving", {Vector3d::Zero(), Vector3d(2.0 * M_PI, 0, 0)}}};
+    const auto upright = solve_mates(components, mates, geom);
+    const auto turned = solve_mates(components, mates, geom, full_turn);
+    REQUIRE(upright.converged);
+    REQUIRE(turned.converged);
+    CHECK(upright.dof == 2);
+    CHECK(turned.dof == upright.dof);
+    CHECK(turned.mate_status[1].status == "ok");
+}
+
 // A FIXED component's pose is authored, never solved — so a stale warm-start entry
 // (the previous solve's params, which include every fixed component) must not override
 // the transform the document carries. Before this, re-posing the anchor was silently
@@ -383,9 +463,19 @@ TEST_CASE("one unsatisfiable mate cannot move a different chain") {
     CHECK(out["dof"].get<int>() == 2);  // the two axle spins remain free
     REQUIRE(out["mate_status"].size() == 5);
     for (const auto& s : out["mate_status"]) {
-        const std::string expected = s["mate_id"].get<std::string>() == "b_wrong_bore"
-            ? "conflicting" : "ok";
+        const std::string id = s["mate_id"].get<std::string>();
+        // The contradictory bores share the least-squares error. Although the
+        // first bore adds rank, its 2.5 mm residual is not a satisfied mate.
+        const std::string expected = id == "b_wrong_bore" ? "conflicting"
+            : id == "b_bore" ? "unsatisfied" : "ok";
         CHECK(s["status"].get<std::string>() == expected);
+        if (id == "b_bore" || id == "b_wrong_bore") {
+            CHECK(s["reason"].get<std::string>().find("tolerance") != std::string::npos);
+            const auto it = std::find_if(out["residuals"].begin(), out["residuals"].end(),
+                [&](const json& r) { return r["mate_id"] == id; });
+            REQUIRE(it != out["residuals"].end());
+            CHECK((*it)["max_abs"].get<double>() > out["tolerance"].get<double>());
+        }
     }
 
     // The satisfiable chain SEATS: hub_a takes up its own 0.46 mm of authored error and
@@ -1215,6 +1305,52 @@ TEST_CASE("a driven body carries an offset locked child without redefining its a
     }
 }
 
+TEST_CASE("rigid-chain DOF uses the same rank as accepted mates across model scales") {
+    for (double scale : {0.1, 1.0, 10.0}) {
+        INFO("scale=" << scale);
+        json components = json::array({
+            {{"id", "ground"}, {"fixed", true}, {"transform", ident16()}}});
+        json mates = json::array();
+        ResolvedGeometry geometry;
+        auto add_lock = [&](const std::string& id, const std::string& a,
+                            const std::string& b) {
+            mates.push_back({{"id", id}, {"type", "lock"},
+                {"refs", {{{"component", a}}, {{"component", b}}}}});
+            geometry[{id, 0}] = mgeom("plane", {0, 0, 0}, {1, 0, 0}, {0, 0, 1});
+            geometry[{id, 1}] = geometry.at({id, 0});
+        };
+        for (int i = 1; i <= 3; ++i) {
+            const std::string id = "child" + std::to_string(i);
+            components.push_back({{"id", id}, {"fixed", false},
+                {"transform", xform(Vector3d(1277, -535, 193) * (scale * i),
+                    i % 2 ? Vector3d(M_PI, 0, 0) : Vector3d(0.3, -0.5, 0.2))}});
+            add_lock("lock" + std::to_string(i),
+                     i == 1 ? "ground" : "child" + std::to_string(i - 1), id);
+        }
+        int expected_dof = 0;
+        SUBCASE("rigid chain") {}
+        SUBCASE("unrelated floating component keeps six freedoms") {
+            components.push_back({{"id", "free"}, {"fixed", false},
+                                  {"transform", ident16()}});
+            expected_dof = 6;
+        }
+        SUBCASE("redundant closure does not double-count constraints") {
+            add_lock("closure", "ground", "child3");
+        }
+        const auto solved = solve_mates(components, mates, geometry);
+        REQUIRE(solved.converged);
+        CHECK(solved.max_residual <= solved.tolerance);
+        CHECK_FALSE(solved.over_defined);
+        CHECK(solved.dof == expected_dof);
+        for (const auto& component : components) {
+            const auto want = component.at("transform").get<std::vector<double>>();
+            const auto& got = solved.transforms.at(component.at("id").get<std::string>());
+            for (std::size_t j = 0; j < want.size(); ++j)
+                CHECK(got[j] == doctest::Approx(want[j]).epsilon(1e-10));
+        }
+    }
+}
+
 TEST_CASE("coaxial mates reject the reverse branch without restraining slide or spin") {
     const Vector3d pin(9, -4, 6), axis(0, 0, 1);
     const json components = json::array({
@@ -1298,5 +1434,136 @@ TEST_CASE("a concentric slider follows the moving reference axis through a drive
         CHECK((slider.first - rotation * Vector3d(0, 300, 0)).norm() < 1e-7);
         CHECK((rodrigues(slider.second).col(1) - rotation.col(1)).norm() < 1e-9);
         warm = solved.params;
+    }
+}
+
+namespace {
+
+const ComponentFreeMotion& motion_of(const MateSolveResult& solved, const std::string& id) {
+    for (const auto& m : solved.free_motion)
+        if (m.component == id) return m;
+    FAIL("no free_motion entry for " << id);
+    return solved.free_motion.front();
+}
+
+}  // namespace
+
+TEST_CASE("a pin in a hole keeps one rotation and one translation, both about the hole axis") {
+    // Concentric mate only: the pin may spin about and slide along the bore axis. The bore
+    // axis is offset from the world origin, so the reported rotation point is not trivial.
+    const Vector3d bore(9, -4, 6), axis(0, 0, 1);
+    const json components = json::array({
+        {{"id", "housing"}, {"fixed", true}, {"transform", ident16()}},
+        {{"id", "pin"}, {"fixed", false}, {"transform", xform({3, 2, 1}, {0.2, -0.1, 0.3})}}});
+    const json mates = json::array({{{"id", "bore"}, {"type", "concentric"},
+        {"align", "aligned"}, {"refs", {{{"component", "housing"}}, {{"component", "pin"}}}}}});
+    ResolvedGeometry geometry;
+    geometry[{"bore", 0}] = mgeom("axis", bore, {1, 0, 0}, axis);
+    geometry[{"bore", 1}] = geometry.at({"bore", 0});
+
+    const auto solved = solve_mates(components, mates, geometry, std::nullopt, std::nullopt,
+                                    1e-10, 120, std::nullopt, /*free_motion=*/true);
+    REQUIRE(solved.converged);
+    REQUIRE(solved.dof == 2);
+    REQUIRE(solved.free_motion.size() == 2);
+
+    const auto& housing = motion_of(solved, "housing");
+    CHECK(housing.grounded);
+    CHECK(housing.free_dof == 0);
+    CHECK(housing.kind == "grounded");
+
+    const auto& pin = motion_of(solved, "pin");
+    CHECK_FALSE(pin.grounded);
+    CHECK(pin.mated);
+    CHECK(pin.free_dof == 2);
+    CHECK(pin.kind == "cylindrical");
+    REQUIRE(pin.translations.size() == 1);
+    CHECK(std::abs(std::abs(pin.translations[0].dot(axis)) - 1.0) < 1e-9);
+    REQUIRE(pin.rotations.size() == 1);
+    CHECK(std::abs(std::abs(pin.rotations[0].axis.dot(axis)) - 1.0) < 1e-9);
+    CHECK(pin.rotations[0].pitch_mm_per_rad == 0.0);
+    // Nearest point of the rotation line to the world origin is the bore line's foot.
+    CHECK(std::abs(pin.rotations[0].point.x() - bore.x()) < 1e-8);
+    CHECK(std::abs(pin.rotations[0].point.y() - bore.y()) < 1e-8);
+    CHECK(std::abs(pin.rotations[0].point.z()) < 1e-8);
+
+    // Here only the pin moves, so its projection equals the global DOF.
+    int summed = 0;
+    for (const auto& m : solved.free_motion) summed += m.free_dof;
+    CHECK(summed == solved.dof);
+    REQUIRE(solved.groups.size() == 1);
+    CHECK(solved.groups[0].grounded);
+    CHECK(solved.groups[0].dof == 2);
+    CHECK(solved.groups[0].relative_dof == 2);
+    CHECK(solved.groups[0].mates == std::vector<std::string>{"bore"});
+
+    // Without the flag nothing extra is computed.
+    const auto plain = solve_mates(components, mates, geometry);
+    CHECK(plain.free_motion.empty());
+    CHECK(plain.groups.empty());
+}
+
+TEST_CASE("free motion tells locked, floating and ungrounded-group components apart") {
+    json components = json::array({
+        {{"id", "ground"}, {"fixed", true}, {"transform", ident16()}},
+        {{"id", "bracket"}, {"fixed", false}, {"transform", xform({10, 0, 0}, {0, 0, 0})}},
+        {{"id", "loose"}, {"fixed", false}, {"transform", xform({50, 20, 0}, {0, 0, 0})}},
+        {{"id", "pair_a"}, {"fixed", false}, {"transform", xform({-40, 0, 0}, {0, 0, 0})}},
+        {{"id", "pair_b"}, {"fixed", false}, {"transform", xform({-60, 0, 0}, {0, 0, 0})}}});
+    json mates = json::array({
+        {{"id", "weld"}, {"type", "lock"},
+         {"refs", {{{"component", "ground"}}, {{"component", "bracket"}}}}},
+        {{"id", "pair_weld"}, {"type", "lock"},
+         {"refs", {{{"component", "pair_a"}}, {{"component", "pair_b"}}}}}});
+    ResolvedGeometry geometry;
+    for (const char* id : {"weld", "pair_weld"}) {
+        geometry[{id, 0}] = mgeom("plane", {0, 0, 0}, {1, 0, 0}, {0, 0, 1});
+        geometry[{id, 1}] = geometry.at({id, 0});
+    }
+    const auto solved = solve_mates(components, mates, geometry, std::nullopt, std::nullopt,
+                                    1e-10, 120, std::nullopt, /*free_motion=*/true);
+    REQUIRE(solved.converged);
+    // bracket is locked to ground, `loose` has no mate, the pair floats as one rigid body.
+    CHECK(solved.dof == 12);
+
+    const auto& bracket = motion_of(solved, "bracket");
+    CHECK(bracket.kind == "fixed");
+    CHECK(bracket.free_dof == 0);
+    CHECK(bracket.mated);
+
+    const auto& loose = motion_of(solved, "loose");
+    CHECK_FALSE(loose.mated);
+    CHECK_FALSE(loose.grounded);
+    CHECK(loose.kind == "free");
+    CHECK(loose.free_dof == 6);
+    CHECK(loose.translations.size() == 3);
+    CHECK(loose.rotations.size() == 3);
+
+    for (const char* id : {"pair_a", "pair_b"}) {
+        const auto& m = motion_of(solved, id);
+        CHECK(m.mated);
+        CHECK(m.free_dof == 6);  // the rigid pair can still move through space as a whole
+    }
+    // With every translation free, a rotation axis is reported through the component's own
+    // origin: pair_a sits at x = -40, so its spin about Z is the line x = -40, y = 0.
+    const auto& pair_a = motion_of(solved, "pair_a");
+    bool z_spin_about_own_origin = false;
+    for (const auto& r : pair_a.rotations)
+        if (std::abs(std::abs(r.axis.z()) - 1.0) < 1e-6 &&
+            std::abs(r.point.x() + 40.0) < 1e-6 && std::abs(r.point.y()) < 1e-6 &&
+            r.pitch_mm_per_rad == 0.0)
+            z_spin_about_own_origin = true;
+    CHECK(z_spin_about_own_origin);
+
+    REQUIRE(solved.groups.size() == 2);
+    for (const auto& g : solved.groups) {
+        if (g.grounded) {
+            CHECK(g.dof == 0);
+            CHECK(g.relative_dof == 0);
+        } else {
+            CHECK((g.components == std::vector<std::string>{"pair_a", "pair_b"}));
+            CHECK(g.dof == 6);
+            CHECK(g.relative_dof == 0);
+        }
     }
 }

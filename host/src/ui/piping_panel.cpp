@@ -15,6 +15,7 @@
 
 #include "imgui.h"
 
+#include "../app_commands.h"
 #include "../core/app_state.h"
 #include "../core/sim_client.h"
 #include "../ui_theme.h"
@@ -2873,7 +2874,14 @@ void PipingPanel::drawFooter(AppState& st) {
     const char* label = "Run";
     std::string blocker;
     switch (form_) {
-        case Form::Network: label = network_.is_object() ? "Route pipe" : "New network"; break;
+        case Form::Network:
+            label = network_.is_object() ? "Route pipe" : "New network";
+            if (!network_.is_object()) {
+                const auto availability = commandAvailability("sim_piping_new", commandContext(st));
+                if (!availability.visible || !availability.enabled)
+                    blocker = availability.reason ? availability.reason : "New network is unavailable.";
+            }
+            break;
         case Form::Route:
             label = routeMode_ == 0 ? (tool_ == Tool::DrawRun ? "Stop drawing" : "Start drawing") : "Route pipe";
             if (routeMode_ != 0) blocker = routeBlocker();
@@ -2945,8 +2953,8 @@ void PipingPanel::drawFooter(AppState& st) {
                 case Form::Network:
                     if (network_.is_object())
                         enterForm(st, Form::Route);
-                    else
-                        newNetwork(st);
+                    else if (st.ribbonDispatch)
+                        st.ribbonDispatch("sim_piping_new");
                     break;
                 case Form::Route:
                     if (routeMode_ == 0) setTool(st, tool_ == Tool::DrawRun ? Tool::None : Tool::DrawRun);

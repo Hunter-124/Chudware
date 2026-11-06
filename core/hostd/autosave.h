@@ -1,62 +1,4 @@
-// Daemon-side autosave + crash recovery (Phase 3) — THE one autosave scheduler
-// (the design ported from services/mcp/cad_tools.py, whose per-process
-// threading.Timer chains this replaces in daemon mode).
-//
-// One std::thread + condition_variable loop. Each tick (CHUDWARE_AUTOSAVE_INTERVAL_S,
-// default 60 s, 0 disables): engine doc_list -> every DIRTY doc whose revision
-// changed since its last autosave is doc_save'd (geometry cache embedded) into
-//   <stateDir>/hostd_autosave/<instance-key>/<session-id>/<doc_id>.step+
-// where session-id = zero-padded daemon start ms + pid (lexically sortable).
-// The instance-key level is a deliberate addition over the plan's path: scratch
-// test daemons must never recover (or sweep) the real daemon's sessions.
-//
-// RECOVERY IS CRASH-ONLY (doc-lifecycle overhaul). The rule: a CLEAN exit
-// discards, a CRASH is recoverable — and the app signals which by whether it
-// explicitly discarded before going away.
-//
-//  * Explicit discard — an app closing a tab, or quitting cleanly (it discards
-//    every unsaved doc it leaves behind), calls doc_discard. That closes the doc
-//    AND purges its autosave artifacts (onDocClosed) — a deliberately-dropped
-//    part never resurfaces.
-//
-//  * doc-GC RETIRE — a doc whose every client vanished WITHOUT discarding it
-//    (an app/agent crash) is doc_save'd into the ORPHAN tier (<baseDir>/orphaned/,
-//    {stem}.step+ + {stem}.json meta) and then closed to free memory. A clean doc
-//    already safe in a real user file is just closed. This is the long-lived
-//    disk recovery store (CHUDWARE_ORPHAN_KEEP entries).
-//
-//  * CRASH tier — a prior session dir that still exists means that daemon itself
-//    died hard (clean shutdown removes its session dir). Its autosaves are NOT
-//    auto-opened (that silently resurrected zombie parts) — each is registered
-//    into the same orphan tier.
-//
-//  Everything in the orphan tier waits for a DELIBERATE recovery_list ->
-//  recovery_open (the GUI "Recover unsaved parts?" prompt, or the recover_parts
-//  MCP tool); nothing auto-loads. recovery_open mints a fresh id and records
-//  {old_id: new_id} (noteRecoveredRemap) so hello can rebind a reconnecting
-//  client. This keeps closed / cleanly-quit parts from flooding back while still
-//  catching genuine crashes.
-//
-//  EMPTY DOCS ARE NEVER RECOVERED (2026-07-16): a part/assembly with no features
-//  (and for assemblies, no components/mates) is discarded at every boundary —
-//  autosave skip, retireDoc no-op, crash-tier register skip, recovery_list purge.
-//  Fresh AI-minted blank parts used to fill the Recover? prompt with dozens of
-//  empty "AI part" tabs; those are garbage, not user work.
-//
-//  INTERNAL DOCS ARE NEVER RECOVERED (2026-07-30): a doc minted {"internal":true}
-//  (DocRegistry::isInternal — the agent preflight advisor's shadow clone) is a
-//  throwaway, not user work. It is skipped at the same boundaries as an empty doc:
-//  autosave skip, retireDoc refusal, and doc-GC PURGES rather than retires it. A
-//  clone whose owning worker died mid-run used to be retired to the orphan tier and
-//  then accepted from the "Recover?" prompt, giving the user a tab strip of
-//  `AI: <part>_pf`, `_pf2`, `_pf3` shadow copies of their real part.
-//
-//  PRISTINE IMPORTS ARE NEVER RECOVERED (2026-09-24): a doc whose engine doc_list row
-//  carries a non-empty `reproducible_from` (every feature an unmodified import) whose
-//  source files all still exist is skipped by autosave and by retireDoc, so doc-GC just
-//  closes it. An agent's body-roster probe import used to become a recovery row once
-//  the terminal save sweep (services/mcp/cad_common.py) stopped writing it to the
-//  project; re-importing the source rebuilds it exactly.
+// Daemon-side durable snapshots and recovery of non-discarded work.
 #pragma once
 
 #include <atomic>
@@ -64,8 +6,10 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
+#include <utility>
 
 #include <nlohmann/json.hpp>
 
@@ -73,62 +17,46 @@ namespace hostd {
 
 class Autosave {
 public:
-    // baseDir: <stateDir>/hostd_autosave/<instance-key>. engineState: the
-    // server's loader flag (0=loading 1=ready 2=failed) — recovery and ticks
-    // wait for ready.
-    void start(const std::string& baseDir, const std::atomic<int>* engineState);
+    bool start(const std::string& baseDir, const std::atomic<int>* engineState);
+    void stop(bool keepForRecovery);
 
-    // Stop the loop (join) and DISCARD: remove this session's dir so the next start does NOT
-    // crash-recover a cleanly shut down session. Clean shutdown is not a crash — unsaved work
-    // is dropped (the GUI's quit warning is the front-line guard), recovery is reserved for
-    // crashes, and a surviving session dir IS the crash signal.
-    void stop();
-
-    // {old_doc_id: new_doc_id} from crash recovery; empty until recoveryDone().
     nlohmann::json idRemap();
-    bool recoveryDone() const { return recoveryDone_; }
+    bool recoveryDone() const { return recoveryDone_.load(); }
+    void waitForRecovery();
+    bool recoveryAvailable() const;
 
-    // ---- orphan tier -----------------------------------------------------
-    // {"entries":[{"id","doc_id","name","path","mtime_ms"}]} newest first.
-    nlohmann::json recoveryList();
+    // Recovery entries contain the original bound path, never the private artifact path.
+    nlohmann::json recoveryList(const std::string& scope = {});
     int orphanCount();
-    // Look up the orphan file for entry `id`; "" when unknown. Does not delete —
-    // the caller removes via discardOrphan() only after a successful doc_open.
-    std::string orphanPath(const std::string& id);
-    // The stored meta for orphan entry `id` ({doc_id,name,retired_ms,from_crash});
-    // empty object when unknown. Lets recovery_open recover the ORIGINAL doc_id.
-    nlohmann::json orphanMeta(const std::string& id);
-    // Delete orphan `id` (or all when id==""). Returns how many were removed.
+    // Pin the selected artifact through open; consume it only after a
+    // replacement snapshot, save, or retirement has durably covered it.
+    bool recoverOrphan(const std::string& id,
+                       const std::function<bool(const std::string&, const nlohmann::json&)>& open);
     int discardOrphans(const std::string& id);
-    // Record a crash-recovery rebind so hello can hand a reconnecting client the
-    // {old_id: new_id} map (recovery_open mints a fresh id for each restored doc).
     void noteRecoveredRemap(const std::string& oldId, const std::string& newId);
-
-    // Explicit doc_close: delete the doc's session autosave, and when the doc
-    // was crash-recovered also its source file + id_remap entry.
+    void rememberRecoveredSource(const std::string& docId, const nlohmann::json& meta,
+                                 const std::string& orphanId, long revision, long metadataRevision);
+    bool snapshotNow(const std::string& docId);
     void onDocClosed(const std::string& docId);
+    void onDocSaved(const std::string& docId, long savedRevision, long metadataRevision);
 
-    // doc-GC of an ABANDONED doc (an app/agent vanished without discarding it —
-    // i.e. a crash): doc_save `docId` into the orphan tier + drop its session
-    // autosave, so the work is recoverable long-term while the live doc is closed
-    // to free memory. `name` is stored for the recovery prompt. False on save fail.
-    bool retireDoc(const std::string& docId, const std::string& name);
+    // Persist a captured revision without dropping the session snapshot. The
+    // caller checks the returned revisions under the registry lock before close.
+    bool retireDoc(const std::string& docId, const std::string& name,
+                   long& revision, long& metadataRevision);
 
-    // True when `path` is one of OUR artifacts (session autosave / orphan file):
-    // a doc whose path points in here is NOT "safe in a user file", so GC still
-    // retires it rather than trusting the on-disk copy.
     bool isAutosavePath(const std::string& path) const {
         return !baseDir_.empty() && path.rfind(baseDir_, 0) == 0;
     }
-
-    // Predicate answering "is this doc an INTERNAL throwaway?" (DocRegistry::isInternal).
-    // Installed by Server::setAutosave; unset means "nothing is internal", so a unit test
-    // or a future embedder that never wires it keeps the old behaviour. An internal doc is
-    // the agent preflight advisor's shadow clone: it is NOT user work, so it is never
-    // autosaved and never retired to the orphan tier. Called from the autosave thread and
-    // the accept loop WITHOUT any Autosave lock held — the registry takes its own mutex.
     void setInternalFilter(std::function<bool(const std::string&)> fn) {
         isInternal_ = std::move(fn);
+    }
+    void setRegistryAnnotator(std::function<void(nlohmann::json&)> fn) {
+        annotate_ = std::move(fn);
+    }
+    void setCaptureGuard(
+        std::function<void(const std::string&, const std::function<void()>&)> fn) {
+        captureGuard_ = std::move(fn);
     }
     bool isInternalDoc(const std::string& docId) const {
         return isInternal_ && isInternal_(docId);
@@ -137,33 +65,60 @@ public:
 private:
     void loop();
     void recoverPriorSession();
-    void saveDirtyDocs();
-    void sweepOrphans();  // keep the newest CHUDWARE_ORPHAN_KEEP (default 20)
+    bool migrateSession(const std::string& dir);
+    void autoRestoreOrphans();
+    bool saveDirtyDocs(bool force = false);
+    bool docRow(const std::string& id, nlohmann::json& row);
+    bool capture(const nlohmann::json& row, const std::string& directory,
+                 long& revision, long& metadataRevision, std::string& published);
+    bool captureGuarded(const nlohmann::json& row, const std::string& directory,
+                        long& revision, long& metadataRevision, std::string& published);
+    bool snapshotDoc(const nlohmann::json& row);
+    void discardSessionSnapshot(const std::string& id);
+    void supersedeOrphanLocked(const std::string& id);
+    void snapshotFailure(const std::string& id, long revision, long metadataRevision,
+                         const std::string& message);
 
     std::string baseDir_;
     std::string sessionDir_;
     std::string orphanDir_;
-    std::string recoverDir_;  // crash-tier source session ("" when none)
     const std::atomic<int>* engineState_ = nullptr;
     double intervalS_ = 60.0;
-    // Set once by Server::setAutosave BEFORE the loop starts, then only read —
-    // no synchronisation needed for the member itself.
     std::function<bool(const std::string&)> isInternal_;
+    std::function<void(nlohmann::json&)> annotate_;
+    std::function<void(const std::string&, const std::function<void()>&)> captureGuard_;
 
     std::thread thread_;
     std::mutex mtx_;
     std::condition_variable cv_;
     std::atomic<bool> stopping_{false};
     std::atomic<bool> recoveryDone_{false};
+    std::atomic<bool> recoveryIncomplete_{false};
+    std::atomic<bool> recoveryFailureLogged_{false};
+    std::atomic<bool> scanFailureLogged_{false};
+    std::mutex migrationMtx_;
 
     std::mutex remapMtx_;
     nlohmann::json idRemap_ = nlohmann::json::object();
-    // doc_id -> revision at last save. Written by the autosave thread
-    // (saveDirtyDocs) and erased from server-dispatch / accept-loop threads
-    // (onDocClosed) — guarded by revMtx_ against concurrent map ops.
+    // Protected together so saves/close invalidate in-flight snapshot publication.
     std::mutex revMtx_;
-    std::map<std::string, long> lastSavedRev_;
-    std::mutex orphanMtx_;  // serializes orphan dir mutations
+    std::map<std::string, std::pair<long, long>> lastSavedRev_;
+    std::map<std::string, std::string> lastSavedPath_;
+    std::map<std::string, std::pair<long, long>> savedCutoff_;
+    std::map<std::string, std::pair<long, long>> failedRev_;
+    std::map<std::string, unsigned long long> snapshotEpoch_;
+    struct RecoveredSource {
+        nlohmann::json meta;
+        std::string orphanId;
+        long revision = -1;
+        long metadataRevision = -1;
+    };
+    std::map<std::string, RecoveredSource> recoveredSource_;
+    std::atomic<unsigned long long> snapshotSerial_{0};
+    std::mutex recoveryTxnMtx_;  // serializes list/open/discard with migration
+    std::mutex orphanMtx_;
+    std::set<std::string> recoveryPins_;
+    std::set<std::string> supersededPins_;
 };
 
 }  // namespace hostd

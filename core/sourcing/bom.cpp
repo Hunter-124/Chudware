@@ -369,10 +369,21 @@ json bom_rollup_lines(const json& asm_tree, const Seams& seams) {
             const int qty = as_qty(comp.value("quantity", json()));
             const json mpn = component_mpn(comp);
             const json supplier = component_supplier(comp);
+            json catalog_id;
+            const json catalog = comp.value("catalog_metadata", json());
+            if (catalog.is_object()) {
+                const json record = catalog.value("part_record", json());
+                if (record.is_object()) {
+                    const json id = record.value("part_id", json());
+                    if (id.is_string() && !id.get_ref<const std::string&>().empty())
+                        catalog_id = id;
+                }
+            }
             const json rec = seams.vendor_lookup ? seams.vendor_lookup(comp) : json();
             // Python truthiness: an empty dict from vendor_lookup is falsy.
             const bool rec_truthy = rec.is_object() && !rec.empty();
-            const bool is_bought = !mpn.is_null() || !supplier.is_null() || rec_truthy;
+            const bool is_bought = !catalog_id.is_null() || !mpn.is_null() ||
+                                   !supplier.is_null() || rec_truthy;
 
             if (is_bought) {
                 json part_number = mpn;
@@ -380,12 +391,15 @@ json bom_rollup_lines(const json& asm_tree, const Seams& seams) {
                     part_number = rec.value("part_number", json());
                 json sup = supplier;
                 if (sup.is_null() && rec.is_object()) sup = rec.value("supplier", json());
-                const json part_ref = vendor_key(sup, part_number);
-                const std::string gkey =
-                    "bought:" + (!part_ref.is_null() ? part_ref.get<std::string>()
-                                : !mpn.is_null()    ? as_string(mpn)
+                const json part_ref = catalog_id.is_null() ? vendor_key(sup, part_number) : catalog_id;
+                // Catalog IDs identify a family/size, not necessarily the configured length.
+                // Keep distinct source files separate instead of merging different variants.
+                const std::string gkey = !catalog_id.is_null()
+                    ? "catalog:" + catalog_id.get<std::string>() + ":" + source_path
+                    : "bought:" + (!part_ref.is_null() ? part_ref.get<std::string>()
+                                : !mpn.is_null() ? as_string(mpn)
                                 : !source_path.empty() ? source_path
-                                                     : component_description(comp));
+                                                       : component_description(comp));
                 const auto it = groups.find(gkey);
                 if (it != groups.end()) {
                     lines[it->second]["quantity"] =

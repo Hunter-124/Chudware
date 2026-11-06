@@ -2,11 +2,9 @@
 // new/apply_ops/undo/redo/tree/close, revision counter, bounded JSON-snapshot
 // undo/redo, stale-revision guard) over the ecad ops vocabulary.
 //
-// The ops-response shape mirrors the Python session: {revision, id_map, kind,
-// tree, compile [, warnings]}; ecad_new adds "doc_id"; ecad_tree returns
-// {revision, kind, tree, compile}. The `compile` field is live: schematics get
-// netlist + ERC; boards get zone-fill refresh (interactive resolution), DRC,
-// and ratsnest (session.cpp::compile_field).
+// Ops responses carry {revision, id_map, kind, tree, compile [, warnings]}.
+// A tree read reports the bound path, dirty state, external changes, and KiCad
+// lock state; it reloads a clean externally changed document when possible.
 #pragma once
 
 #include <string>
@@ -20,8 +18,12 @@ namespace chudware::ecad {
 
 bool dirty_document_count(std::uint64_t& count);  // nonblocking, false = unknown
 
-// ecad_new {kind: "sch"|"pcb", name?} -> ops-response + "doc_id".
-nlohmann::json ecad_new(const std::string& kind, const std::string& name);
+// New KiCad session; a nonempty path immediately creates and binds the file.
+nlohmann::json ecad_new(const std::string& kind, const std::string& name,
+                        const std::string& path = {});
+nlohmann::json ecad_new_project(const std::string& dir, const std::string& name);
+nlohmann::json ecad_open_project(const std::string& path);
+nlohmann::json ecad_reload(const std::string& doc_id, bool discard);
 
 // ecad_apply_ops. base_revision < 0 skips the optimistic-concurrency guard;
 // a mismatch throws OpError("stale_revision").
@@ -30,7 +32,7 @@ nlohmann::json ecad_apply_ops(const std::string& doc_id, long base_revision,
 
 nlohmann::json ecad_undo(const std::string& doc_id);     // bumps revision +1
 nlohmann::json ecad_redo(const std::string& doc_id);     // bumps revision +1
-nlohmann::json ecad_tree(const std::string& doc_id);     // no rebuild, no rev bump
+nlohmann::json ecad_tree(const std::string& doc_id);     // clean external changes reload
 nlohmann::json ecad_rebuild(const std::string& doc_id);  // recompute, no rev bump
 bool ecad_close(const std::string& doc_id);
 
@@ -61,22 +63,12 @@ nlohmann::json ecad_resolve_pick(const std::string& doc_id, const nlohmann::json
 // normal session (undoable, netlist-compiled, ERC-checked) — not an abstract dict.
 nlohmann::json ecad_design(const std::string& request, const std::string& name);
 
-// ecad_save {doc_id, path?} -> {"path", "format":"ecad+", "source_path"?}. Writes the
-// open session's document as a .ecad+ ZIP container. Uses the session's NATIVE path
-// when `path` is empty; throws OpError("io_error") if neither is available.
-// FOREIGN-SOURCE SAFETY: a session opened from a .kicad_sch/.kicad_pcb keeps that file
-// in `source_path` and never uses it as the native save target — a pathless Save writes
-// the sibling "<stem>.ecad+" instead, so imported KiCad bytes can never be overwritten
-// with a ZIP container. Use ecad_export(kind="kicad") to write KiCad text back out.
-nlohmann::json ecad_save(const std::string& doc_id, const std::string& path);
+// Save to the bound KiCad file, or bind to an explicit KiCad path. Recovery
+// snapshots have a separate path and do not change the binding or dirty state.
+nlohmann::json ecad_save(const std::string& doc_id, const std::string& path,
+                         const nlohmann::json& recovery = nullptr);
 
-// ecad_open {path} -> ops-response + "doc_id" + "warnings". Opens a .ecad+ container
-// (engine/ecad/rpc.py::_ecad_open + formats.open), registers a session around the
-// parsed document, rebuilds (compile), and returns the full response. Dispatches by
-// extension like the Python rpc: .kicad_sch / .kicad_pcb route to the KiCad S-expr
-// importers (ecad/kicad.cpp, port of engine/ecad/formats.py import_kicad_*); any
-// import failure raises the same OpError("io_error", "import_kicad_* failed for
-// '<path>': <exc>") envelope the oracle raises.
+// Open KiCad directly or migrate a legacy document into an unbound session.
 nlohmann::json ecad_open(const std::string& path);
 
 // ecad_update_from_sch {board_doc_id, sch_doc_id, prune?, place_origin?,
@@ -104,19 +96,7 @@ nlohmann::json ecad_dfm(const std::string& doc_id, const nlohmann::json& rules);
 // Stateless variant: run DFM over an inline board doc (parity harness path).
 nlohmann::json ecad_dfm_board(const nlohmann::json& board, const nlohmann::json& rules);
 
-// ecad_export {kind, board|doc_id, path?, opts?} -> exported files.
-//   pcb kinds: "gerber" | "drill" | "cpl" | "bom"
-//   sch kinds: "netlist" | "bom" | "spice" | "kicad" | "svg" | "pdf"
-// Returns {"files": {<logical-key>: <file-text>}, "paths": [<written path>, ...]}.
-// `files` keeps the in-memory text so a remote/MCP caller can write it itself; when
-// `path` is given the files are ALSO written here: a directory path (or one that does
-// not look like a file) receives one conventionally-named file per key, a file path
-// receives the single output directly. The logical key is the gerber layer_id
-// ("F.Cu", ...), "pth"/"npth" for drill, "bom"/"cpl"/"netlist"/"spice"/"kicad" for the
-// single-file outputs, or "<sheet-id>" for the per-sheet svg pages. A stateless `board`
-// (parity-harness path) takes precedence over `doc_id`. Throws OpError("invalid_op")
-// when the kind does not match the document kind, or for an unknown kind. PCB file
-// CONTENT stays byte-identical to engine/ecad/fab/*.
+// Export a session through kicad-cli. See kicad_cli.h for result fields.
 nlohmann::json ecad_export(const nlohmann::json& params);
 
 // ecad_impedance {mode, ...geom} -> the impedance.cpp calculator result.
@@ -170,6 +150,13 @@ nlohmann::json ecad_simulate(const std::string& doc_id, const nlohmann::json& st
 // libchudware's OCCT-linked ecad_to_3d doc-id form, which lives outside chudware_ecad).
 // Throws OpError("unknown_doc") if no such session is open.
 nlohmann::json ecad_session_doc(const std::string& doc_id);
+
+// Coherent snapshot for KiCad checks/exports: {path, kind, dirty, revision, doc?}.
+nlohmann::json session_file_info(const std::string& doc_id, bool include_doc = true);
+
+// Overlay board rules/classes onto a private KiCad project copy.
+nlohmann::json kicad_project_settings(const nlohmann::json& project,
+                                     const nlohmann::json& board);
 
 // CRASH RECOVERY (P0 deadlock fix — mirrors force_release_doc_lock in doc/session.h).
 // Drop an orphaned ECAD session-store g_mtx lock left held by THIS thread after a

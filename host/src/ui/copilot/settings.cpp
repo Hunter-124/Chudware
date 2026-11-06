@@ -1,18 +1,16 @@
-// Copilot AI settings: the shared AI settings sections
-// (provider/model/auth, generation, privacy, manage-models — ui::drawAiSettingsSection, called
-// once per section by the Settings modal's Providers tab), the searchable model dropdown, model
-// availability probing, and provider-usability gating (providerUsable / cloud+moonshot key
-// presence).
+// Copilot AI settings, model discovery, and the shared authenticated picker policy.
 
 #include "copilot_internal.h"
 
 #include "../web_capabilities.h"    // ui::webGapReason — subscription sign-in is not a web path
-#include "../chudcode_descriptors.h" // ui::parseChudcode* — Chudcode worker payload parsing
+#include "../omp_descriptors.h" // ui::parseOmp* — Omp worker payload parsing
+#include "../settings_modal.h"       // SettingsRoute deep links
 #ifdef __EMSCRIPTEN__
 #include "core/jobs.h"
 #endif
 #include "../provider_usage.h"     // shared subscription status cache and single-flight poller
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 
@@ -65,7 +63,7 @@ bool anyProbeInFlight() {
 // "gemini" | "anthropic" and answers {"ok":false,"error":"unknown provider"} for anything else,
 // so the slots with no branch return nullptr and are NEVER probed: Cursor and Kimi Code are
 // subscription-proxied with no list endpoint here, and ZenMux is bridge-routed (its catalog
-// arrives via refreshBridgeModelCatalog / chudcode_models_list). Probing them would only paint a
+// arrives via refreshBridgeModelCatalog / omp_models_list). Probing them would only paint a
 // bogus "unknown provider" into providerModels and make the provider look broken.
 const char* listModelsWireProvider(int provider) {
     switch (provider) {
@@ -194,7 +192,7 @@ void refreshModelAvailability(AppState& st, bool force) {
 
     Settings& s = st.settings;
     // (1) The ACTIVE provider when it is a cloud one. Cloud lists are LIVE (the backend asks the
-    // provider's /v1/models, through the Chudcode service when the credential is an
+    // provider's /v1/models, through the Omp service when the credential is an
     // OAuth/subscription token), which makes a brand-new release appear with no code change.
     // Send that provider's OWN credential, and its base_url only where one is meaningful: the
     // cloud-compat slot's URL picks the service (OpenRouter / DashScope / DeepSeek / Moonshot),
@@ -243,10 +241,6 @@ static char* providerKeyBuf(Settings& s, int provider) {
     }
 }
 
-// Availability helpers (defined with the model-dropdown section below; forward-declared so the
-// provider/model section inside drawAiSettingsSection can call them).
-// providerUsable is public (copilot.h) — used by Settings role/Eng.Firm pickers too.
-bool providerUsable(AppState& st, int provider);  // def below; also declared in copilot.h
 static bool localModelLoaded(const ProviderModels& pm, const std::string& id);
 
 // WASM-safe JSON accessors: present-but-null / wrong-type fields must not throw
@@ -310,17 +304,23 @@ static void parseProbeRows(int provider, const nlohmann::json& result, ProviderM
 // they keep their own flat `models` + loaded-vs-downloaded path.
 std::vector<ModelInfo> providerPickerModels(AppState& st, int provider) {
     std::vector<ModelInfo> out;
+    // Policy-hidden generations (ui::isLegacyGenerationModel) are never offered; the caller
+    // still shows a saved hidden selection as its trailing "(custom)" entry.
     if (provider >= 0 && provider < ui::PROV_COUNT && ui::providerIsCloud(provider)) {
         const ProviderModels& pm = st.providerModels[provider];
-        if (pm.checked && pm.ok && !pm.rows.empty()) return pm.rows;
+        if (pm.checked && pm.ok && !pm.rows.empty()) {
+            for (const auto& m : pm.rows)
+                if (!ui::isLegacyGenerationModel(m.id)) out.push_back(m);
+            return out;
+        }
     }
     for (const auto& m : ui::builtinModels())
-        if (m.provider == provider) out.push_back(m);
+        if (m.provider == provider && !ui::isLegacyGenerationModel(m.id)) out.push_back(m);
     return out;
 }
 
 // Every provider card routes its credential copy through here. The AI tab never holds
-// credentials: Settings -> Providers validates a key and the Chudcode auth store persists it, so
+// credentials: Settings -> Providers stores keys through the OMP auth store, so
 // this is the pointer to that tab. The browser build has no provider credential path; it says so.
 static void drawValidatedCredentialHint(AppState& st, const char* detail) {
     if (const char* why = ui::webGapReason("account_signin")) {
@@ -328,7 +328,7 @@ static void drawValidatedCredentialHint(AppState& st, const char* detail) {
         return;
     }
     dimText(detail);
-    if (ImGui::SmallButton("Manage validated credentials##provider_credentials")) {
+    if (ImGui::SmallButton("Manage credentials##provider_credentials")) {
         st.openSettings = true;
         st.openSettingsTab = 3;
     }
@@ -336,8 +336,8 @@ static void drawValidatedCredentialHint(AppState& st, const char* detail) {
 
 // Free AI (FreeLLMAPI, github.com/tashfeenahmed/freellmapi) provider card — reused from BOTH
 // the classic Settings -> AI provider picker and the live Settings -> Providers tab. Endpoint
-// and model controls remain here; credentials never do. All keys are validated and stored by
-// the Chudcode auth flow in Settings -> Providers.
+// and model controls remain here; credentials never do. Keys are stored by
+// the OMP auth flow in Settings -> Providers.
 // Returns true when a non-credential field changed (caller saves).
 bool drawFreeAiProviderCard(AppState& st) {
     Settings& s = st.settings;
@@ -370,11 +370,12 @@ bool drawFreeAiProviderCard(AppState& st) {
                 std::strncpy(s.model, "auto", sizeof(s.model) - 1);
             s.vision = true;
             saveSettings(s);
+            flushConfigWrites();
             refreshModelAvailability(st, true);
         }
     }
     drawValidatedCredentialHint(
-        st, "Free AI credentials are added under Settings \xe2\x86\x92 Providers, where the router validates them before AuthStorage persists them.");
+        st, "Free AI credentials are managed under Settings \xe2\x86\x92 Providers.");
     if (active) {
         if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision)) changed = true;
         const ProviderModels& flapm = st.providerModels[ui::PROV_FREELLMAPI];
@@ -394,7 +395,7 @@ bool drawFreeAiProviderCard(AppState& st) {
     dimText("One-liner (Docker) sets up ~/freellmapi and starts the router. A native desktop "
             "tray app (macOS/Windows) is also available from Releases. Either way, open the "
             "dashboard afterward, add your free provider keys under Keys, then add the unified "
-            "key through Settings \xe2\x86\x92 Providers so it is validated before storage.");
+            "key through Settings \xe2\x86\x92 Providers.");
     static const std::string kInstallCmd = "curl -fsSL https://freellmapi.co/install.sh | bash";
     if (ImGui::SmallButton("Copy install command##fla"))
         ImGui::SetClipboardText(kInstallCmd.c_str());
@@ -427,44 +428,6 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
     bool changed = false;
     refreshModelAvailability(st, false);
 
-    // Explicit provider switches choose the newest non-dated flagship in the live catalog.
-    // A model already saved by the user is never migrated behind their back.
-    auto newest = [](const char* provider, const char* family, const char* fallback) {
-        std::string selected;
-        int bestMajor = -1, bestMinor = -1;
-        const size_t stemLen = std::strlen(family);
-        for (const auto& row : ui::bridgeModelCatalog()) {
-            if (row.provider != provider || row.deprecated ||
-                row.id.compare(0, stemLen, family) != 0) continue;
-            const char* pos = row.id.c_str() + stemLen;
-            if (!std::isdigit(static_cast<unsigned char>(*pos))) continue;
-            char* end = nullptr;
-            const long major = std::strtol(pos, &end, 10);
-            long minor = 0;
-            if ((*end == '-' || *end == '.') &&
-                std::isdigit(static_cast<unsigned char>(end[1]))) {
-                pos = end + 1;
-                minor = std::strtol(pos, &end, 10);
-            }
-            // Exclude dated/specialized IDs; the canonical alias is stable across refreshes.
-            if (std::strcmp(family, "gpt-") == 0) {
-                if (std::strcmp(end, "-sol") != 0) continue;
-            } else if (std::strcmp(family, "gemini-") == 0) {
-                if (std::strcmp(end, "-pro-preview") != 0 &&
-                    std::strcmp(end, "-pro") != 0) continue;
-            } else if (*end != '\0') continue;
-            if (major > 100 || minor > 100) continue;
-            if (major > bestMajor || (major == bestMajor && minor > bestMinor)) {
-                selected = row.id; bestMajor = static_cast<int>(major);
-                bestMinor = static_cast<int>(minor);
-            }
-        }
-        return selected.empty() ? std::string(fallback) : selected;
-    };
-    auto selectModel = [&](const std::string& model) {
-        std::strncpy(s.model, model.c_str(), sizeof(s.model) - 1);
-        s.model[sizeof(s.model) - 1] = '\0';
-    };
     auto drawProviderModel = [&]() {
     // ---- provider ----
     ImGui::TextUnformatted("Provider");
@@ -475,14 +438,8 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
     if (ImGui::Combo("##provider", &s.provider, provs, ui::PROV_COUNT) &&
         s.provider != prevProvider) {
         changed = true;
-        // Set sensible per-provider defaults on switch.
-        if (s.provider == ui::PROV_GEMINI)
-            selectModel(newest("google", "gemini-", "gemini-3.1-pro-preview"));
-        else if (s.provider == ui::PROV_ANTHROPIC)
-            selectModel(newest("anthropic", "claude-opus-", "claude-opus-5-5"));
-        else if (s.provider == ui::PROV_OPENAI)
-            selectModel(newest("openai", "gpt-", "gpt-4o"));
-        else if (s.provider == ui::PROV_LOCAL) {
+        // Local endpoint defaults are retained; online models are selected by exact catalog identity.
+        if (s.provider == ui::PROV_LOCAL) {
             std::strncpy(s.baseUrl, "http://localhost:1234/v1", sizeof(s.baseUrl) - 1);
             if (std::strstr(s.model, ".gguf") || std::strstr(s.model, "gemini") ||
                 std::strstr(s.model, "claude"))
@@ -494,26 +451,6 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
                 std::strncpy(s.model, "%APPDATA%\\Chudware\\models\\model.gguf",
                              sizeof(s.model) - 1);
             s.vision = false;
-        } else if (s.provider == ui::PROV_CLOUDCOMPAT) {
-            // OpenRouter is the paid-model hub going forward — default the cloud slot to it.
-            const auto& cp = ui::cloudPresets();
-            if (!cp.empty()) {
-                std::strncpy(s.model, cp[0].id.c_str(), sizeof(s.model) - 1);
-                std::strncpy(s.baseUrl, cp[0].baseUrl.c_str(), sizeof(s.baseUrl) - 1);
-                s.vision = cp[0].vision;
-            }
-        } else if (s.provider == ui::PROV_XAI) {
-            std::strncpy(s.model, "grok-4.5", sizeof(s.model) - 1);
-            s.vision = true;
-        } else if (s.provider == ui::PROV_CURSOR) {
-            std::strncpy(s.model, "composer-2.5", sizeof(s.model) - 1);
-            s.vision = true;
-        } else if (s.provider == ui::PROV_KIMISUB) {
-            std::strncpy(s.model, "k3", sizeof(s.model) - 1);
-            s.vision = true;
-        } else if (s.provider == ui::PROV_ZENMUX) {
-            std::strncpy(s.model, "x-ai/grok-4.5-free", sizeof(s.model) - 1);
-            s.vision = true;
         } else if (s.provider == ui::PROV_FREELLMAPI) {
             if (!s.baseUrl[0] || std::strstr(s.baseUrl, "1234") || std::strstr(s.baseUrl, "moonshot") ||
                 std::strstr(s.baseUrl, "dashscope") || std::strstr(s.baseUrl, "deepseek") ||
@@ -697,7 +634,7 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
     ImGui::Dummy(ImVec2(0, 6 * S));
     if (s.provider == ui::PROV_CLOUDCOMPAT) {
         // Cloud OpenAI-compatible endpoint. Credentials are intentionally absent from this AI
-        // tab: Settings -> Providers validates them before the Chudcode auth store persists them.
+        // tab: Settings -> Providers stores them through the OMP auth store.
         const char* svc = ui::cloudServiceKey(s.baseUrl);
         const bool isOR = (std::strcmp(svc, "openrouter") == 0);
         const bool isMS = (std::strcmp(svc, "moonshot") == 0);
@@ -713,7 +650,7 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
         drawValidatedCredentialHint(
             st, bridgeAuth
                     ? "This service uses the agent credential store. Add or replace its credential under Settings \xe2\x86\x92 Providers."
-                    : "API keys are no longer pasted into the AI tab. Add one under Settings \xe2\x86\x92 Providers; it is saved only after the provider validates it.");
+                    : "API keys are managed under Settings \xe2\x86\x92 Providers.");
     } else if (s.provider == ui::PROV_FREELLMAPI) {
         if (drawFreeAiProviderCard(st)) changed = true;
     } else if (s.provider == ui::PROV_XAI && ui::webGapReason("account_signin")) {
@@ -853,7 +790,7 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
         }
 
         drawValidatedCredentialHint(
-            st, "Use the system-browser xAI sign-in above, or add an xAI API key under Settings \xe2\x86\x92 Providers. Keys are saved only after xAI validates them.");
+            st, "Use the system-browser xAI sign-in above, or add an xAI API key under Settings \xe2\x86\x92 Providers.");
         if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision)) changed = true;
     } else if (s.provider == ui::PROV_CURSOR || s.provider == ui::PROV_KIMISUB) {
         // Subscription-only providers: no API key field — the credential is an OAuth grant.
@@ -873,7 +810,7 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
         }
         if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision)) changed = true;
     } else if (s.provider == ui::PROV_ZENMUX) {
-        // Chudcode-service provider — the credential lives in the service's own auth store,
+        // Omp-service provider — the credential lives in the service's own auth store,
         // wired up via Settings → Providers sign-in (drawOmpProviderManager), not config.json.
         dimText("ZenMux (agent service). Sign in under Settings \xe2\x86\x92 Providers; no API "
                 "key field here — the service resolves the credential from its own auth store.");
@@ -883,7 +820,7 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
         if (ImGui::Checkbox("Model supports vision (send screenshots)", &s.vision)) changed = true;
     } else if (cloud) {
         drawValidatedCredentialHint(
-            st, "API keys are managed under Settings \xe2\x86\x92 Providers and persisted only after provider validation.");
+            st, "API keys are managed under Settings \xe2\x86\x92 Providers.");
     } else {
         ImGui::TextUnformatted("Base URL");
         ImGui::SetNextItemWidth(-1);
@@ -909,6 +846,20 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
     };
 
     auto drawGeneration = [&]() {
+    if (!s.offlineMode) {
+        const ui::BridgeModelMeta* meta = s.composerFollowRoles ? nullptr :
+            ui::bridgeModelMeta(s.ompProvider, s.model);
+        ui::kit::FieldGroup group("ai_generation", "Model capabilities");
+        const std::string context = meta && meta->contextWindow > 0
+            ? std::to_string(meta->contextWindow) : "unknown";
+        const std::string output = meta && meta->maxTokens > 0
+            ? std::to_string(meta->maxTokens) : "unknown";
+        ui::kit::fieldReadout("ctx_readout", "Context window", context.c_str());
+        ui::kit::fieldReadout("output_readout", "Max response tokens", output.c_str());
+        ui::kit::fieldReadout("effort_readout", "Thinking",
+                              "Set per model in the composer or model assignments");
+        return;
+    }
     // kit fields own the label column, the stacked layout on narrow panes and the "Auto"
     // placeholder: a raw InputInt read "0" for the automatic setting, which looked like a
     // zero-token cap / zero-token window.
@@ -987,9 +938,14 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
     // Two sections, two calls: the Settings Providers tab wraps each in its own glass card and
     // owns the header, so this switch deliberately has no "draw everything" case.
     switch (section) {
-    case AiSettingsSection::ProviderModel:
+    case AiSettingsSection::ProviderModel: {
+        const int previousProvider = s.provider;
+        const std::string previousModel = s.model;
         drawProviderModel();
+        if (s.provider != previousProvider || previousModel != s.model)
+            s.composerFollowRoles = false;
         break;
+    }
     case AiSettingsSection::Generation:
         drawGeneration();
         break;
@@ -998,32 +954,55 @@ bool drawAiSettingsSection(AppState& st, bool busy, AiSettingsSection section) {
 }
 
 // Quick-settings helpers + overlay body (Copilot gear). Full providers/roles/prompts live in Settings.
+//
+// Max nesting depth and the subagent tool-call budget are drawn every frame by TWO surfaces
+// (Quick settings and Settings → AI → Harness). Each used to keep its own load-once static, so a
+// change in one showed in the other only after a restart. They now share ONE process-wide cache
+// per knob: the saver refreshes it, and it is re-read from config.json every few seconds so an
+// external writer shows up too. GUI thread only.
+namespace {
+struct SharedAgentInt {
+    int value = 0;
+    bool valid = false;
+    std::chrono::steady_clock::time_point at{};
+    bool fresh() const {
+        return valid && std::chrono::steady_clock::now() - at < std::chrono::seconds(3);
+    }
+    void set(int v) {
+        value = v;
+        valid = true;
+        at = std::chrono::steady_clock::now();
+    }
+};
+SharedAgentInt g_maxSubagentDepth;
+SharedAgentInt g_subagentToolCallBudget;
+}  // namespace
+
 int loadMaxSubagentDepth() {
+    if (g_maxSubagentDepth.fresh()) return g_maxSubagentDepth.value;
     // agent.max_subagent_depth — nesting levels of subagent-spawning-subagent
     // (not concurrency). Root chat = depth 0. Default 2, GUI clamp 0-4.
     // Enforced by AgentCoord (delegation.py / mission_dispatch.py).
     int depth = 2;
     try {
-        std::ifstream in(configPath());
-        if (in) {
-            nlohmann::json j;
-            in >> j;
-            if (j.is_object()) {
-                auto agent = j.value("agent", nlohmann::json::object());
-                if (agent.is_object() && agent.contains("max_subagent_depth") &&
-                    agent["max_subagent_depth"].is_number_integer()) {
-                    depth = agent["max_subagent_depth"].get<int>();
-                }
+        const nlohmann::json j = readConfigJson();
+        if (j.is_object()) {
+            auto agent = j.value("agent", nlohmann::json::object());
+            if (agent.is_object() && agent.contains("max_subagent_depth") &&
+                agent["max_subagent_depth"].is_number_integer()) {
+                depth = agent["max_subagent_depth"].get<int>();
             }
         }
     } catch (...) {}
     if (depth < 0) depth = 0;
     if (depth > 4) depth = 4;
+    g_maxSubagentDepth.set(depth);
     return depth;
 }
 void saveMaxSubagentDepth(int depth) {
     if (depth < 0) depth = 0;
     if (depth > 4) depth = 4;
+    g_maxSubagentDepth.set(depth);  // the other surface sees it on its very next frame
     updateConfigJson([&](nlohmann::json& j) {
         if (!j.contains("agent") || !j["agent"].is_object())
             j["agent"] = nlohmann::json::object();
@@ -1032,31 +1011,30 @@ void saveMaxSubagentDepth(int depth) {
 }
 
 int loadSubagentToolCallBudget() {
+    if (g_subagentToolCallBudget.fresh()) return g_subagentToolCallBudget.value;
     // agent.subagent_tool_call_budget is a soft convergence warning for delegated subagents.
     // Default 0 lets the harness derive today's 4-16 call range from each token grant; the
     // 0-64 GUI range preserves automatic behavior while leaving deliberate manual headroom.
     int budget = 0;
     try {
-        std::ifstream in(configPath());
-        if (in) {
-            nlohmann::json j;
-            in >> j;
-            if (j.is_object()) {
-                auto agent = j.value("agent", nlohmann::json::object());
-                if (agent.is_object() && agent.contains("subagent_tool_call_budget") &&
-                    agent["subagent_tool_call_budget"].is_number_integer()) {
-                    budget = agent["subagent_tool_call_budget"].get<int>();
-                }
+        const nlohmann::json j = readConfigJson();
+        if (j.is_object()) {
+            auto agent = j.value("agent", nlohmann::json::object());
+            if (agent.is_object() && agent.contains("subagent_tool_call_budget") &&
+                agent["subagent_tool_call_budget"].is_number_integer()) {
+                budget = agent["subagent_tool_call_budget"].get<int>();
             }
         }
     } catch (...) {}
     if (budget < 0) budget = 0;
     if (budget > 64) budget = 64;
+    g_subagentToolCallBudget.set(budget);
     return budget;
 }
 void saveSubagentToolCallBudget(int budget) {
     if (budget < 0) budget = 0;
     if (budget > 64) budget = 64;
+    g_subagentToolCallBudget.set(budget);
     updateConfigJson([&](nlohmann::json& j) {
         if (!j.contains("agent") || !j["agent"].is_object())
             j["agent"] = nlohmann::json::object();
@@ -1196,27 +1174,35 @@ void drawAISettingsBody(AppState& st, bool busy) {
     ui::kit::cardEnd();
     ui::kit::gapRow();
 
+    // ---- Model sizes ---- Same state and pickers as Settings → AI → Models.
+    if (ui::kit::cardBegin("q_card_sizes", "Model sizes", "ai_panel")) {
+        ui::drawQuickModelSizes(st, labelCol,
+                                ImGui::ColorConvertFloat4ToU32(surf.textSecondary));
+    }
+    ui::kit::cardEnd();
+    ui::kit::gapRow();
+
     // ---- Limits + memory ----
     if (ui::kit::cardBegin("q_card_limits", "Limits & memory", "settings")) {
-        static int s_maxDepth = -1;
-        if (s_maxDepth < 0) s_maxDepth = loadMaxSubagentDepth();
         static const char* kDepthLabels[] = {"0", "1", "2", "3", "4"};
-        int depth = std::max(0, std::min(4, s_maxDepth));
+        // The shared cache (see loadMaxSubagentDepth) — also read by Settings → AI → Harness.
+        int depth = std::max(0, std::min(4, loadMaxSubagentDepth()));
         if (segRow("##q_depth", "Max nesting",
                    "Max subagent nesting: how many levels deep a subagent may spawn its own "
                    "subagents (0 = no subagents).",
                    kDepthLabels, 5, &depth)) {
-            s_maxDepth = depth;
             saveMaxSubagentDepth(depth);
         }
 
-        static const char* kMemoryBackends[] = {"off", "sharpshooter", "mnemo"};
-        static const char* kMemoryLabels[] = {"Off", "Decisions", "Full recall"};
-        int cur = 1;
-        for (int i = 0; i < 3; ++i)
+        static const char* kMemoryBackends[] = {"off", "sharpshooter", "mnemopi", "local", "hindsight"};
+        static const char* kMemoryLabels[] = {"Off", "Decisions", "Full recall", "Local", "Hindsight"};
+        int cur = -1;
+        for (int i = 0; i < 5; ++i)
             if (s.memoryBackend == kMemoryBackends[i]) cur = i;
-        if (segRow("##q_memory", "Project memory", "Project memory, kept per folder.",
-                   kMemoryLabels, 3, &cur)) {
+        if (cur < 0) {
+            dimText(("Unknown memory backend: " + s.memoryBackend).c_str());
+        } else if (segRow("##q_memory", "Project memory", "Project memory, kept per folder.",
+                          kMemoryLabels, 5, &cur)) {
             s.memoryBackend = kMemoryBackends[cur];
             s.memoryEnabled = cur != 0;
             changed = true;
@@ -1237,11 +1223,11 @@ void drawAISettingsBody(AppState& st, bool busy) {
                 st.showAISettingsOverlay = false;
             }
         };
-        deepLink("AI##q_open_ai", 2);
+        deepLink("AI##q_open_ai", SettingsAI);
         ImGui::SameLine(0.0f, gap);
-        deepLink("Providers##q_open_prov", 3);
+        deepLink("Providers##q_open_prov", SettingsProviders);
         ImGui::SameLine(0.0f, gap);
-        deepLink("Prompts##q_open_prompts", 2);   // AI tab (Prompts absorbed)
+        deepLink("Prompts##q_open_prompts", SettingsAiPrompts);
     }
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
     cpMenuHint("Opens the full Settings window.");
@@ -1280,135 +1266,39 @@ static bool localModelLoaded(const ProviderModels& pm, const std::string& id) {
     return std::find(pm.loaded.begin(), pm.loaded.end(), id) != pm.loaded.end();
 }
 
-// Has the user hidden this model from the chat picker (Settings → Providers model list)?
-static bool modelHidden(AppState& st, const std::string& id) {
-    return st.settings.hiddenModels.count(id) != 0;
-}
 
-// File-static cache of subscription_status "connected" flags so the model picker can show
-// signed-in providers (xAI / Claude / Cursor / Codex / Kimi) without requiring an API key.
-namespace {
-struct SubConnectedCache {
-    bool xai = false;
-    bool claude = false;
-    bool cursor = false;
-    bool codex = false;
-    bool kimi = false;
-};
-static SubConnectedCache s_subConn;
 
-static void pollSubConnected(AppState& st) {
-    // The browser build has no provider sign-in path; the shared engine's subscription state
-    // belongs to the operator, so the web client never polls it.
-    if (ui::webBuild()) return;
-    ui::providerUsagePollStatus(st, 2.0, false);
-    const auto& login = ui::providerUsageLogin();
-    auto connected = [&login](const char* key) {
-        const auto it = login.find(key);
-        return it != login.end() && it->second.connected;
-    };
-    s_subConn.xai    = connected("xai")    || s_subConn.xai;
-    s_subConn.claude = connected("claude") || s_subConn.claude;
-    s_subConn.cursor = connected("cursor") || s_subConn.cursor;
-    s_subConn.codex  = connected("codex")  || s_subConn.codex;
-    s_subConn.kimi   = connected("kimi")   || s_subConn.kimi;
-}
-}  // namespace
-
-// Does this provider have credentials / a reachable endpoint / a signed-in subscription,
-// so its models can be selected? Public (copilot.h) so Settings role pickers share it.
-bool providerUsable(AppState& st, int provider) {
-    pollSubConnected(st);
-    // A SUCCESSFUL live probe is proof of a working credential — and for a subscription/OAuth
-    // user it is the ONLY proof, because their token lives in the Chudcode auth store rather than
-    // in a local key buffer or subscription_auth. agent_list_models reports ok=true in exactly
-    // that case (see the anthropic branch in libchudware.cpp); keying availability off the local
-    // key alone is what hid Anthropic from those users. Limited to providers whose list endpoint
-    // REQUIRES auth — OpenRouter/DashScope serve /models publicly, so a cloud-compat probe would
-    // prove nothing, and local/llama.cpp already resolve through providerModels below.
-    switch (provider) {
-        case ui::PROV_ANTHROPIC:
-        case ui::PROV_OPENAI:
-        case ui::PROV_GEMINI:
-        case ui::PROV_XAI:
-            if (st.providerModels[provider].ok) return true;
-            break;
-        default: break;
-    }
-    switch (provider) {
-        case ui::PROV_GEMINI:
-            return st.settings.geminiKey[0] != 0;
-        case ui::PROV_ANTHROPIC:
-            return st.settings.anthropicKey[0] != 0 || s_subConn.claude;
-        case ui::PROV_OPENAI:
-            return st.settings.openaiKey[0] != 0 || s_subConn.codex;
-        case ui::PROV_CLOUDCOMPAT:
-            return st.settings.cloudKey[0] != 0 || st.settings.moonshotKey[0] != 0;
-        case ui::PROV_XAI:
-            return st.settings.xaiKey[0] != 0 || s_subConn.xai;
-        case ui::PROV_LOCAL:       return st.providerModels[ui::PROV_LOCAL].ok;
-        case ui::PROV_LLAMACPP:    return st.providerModels[ui::PROV_LLAMACPP].ok;
-        case ui::PROV_CURSOR:
-            return s_subConn.cursor || st.signedInBridgeProviders.count("cursor") != 0;
-        case ui::PROV_KIMISUB:     return s_subConn.kimi;
-        // ZenMux — Chudcode-service credential lives in the service's auth store (Settings → Providers),
-        // not a locally-polled subscription/key flag this file can cheaply check. Always offered;
-        // an unsigned-in bridge surfaces a normal auth error from the backend on send, same class
-        // as any other unconfigured provider.
-        case ui::PROV_ZENMUX:      return true;
-    }
-    return false;
-}
-
-// Both gate picker rows on "is there a credential for this cloud slot at all".
-bool cloudCompatKeyPresent(AppState& st) {
-    pollSubConnected(st);
-    return st.settings.cloudKey[0] != 0;
-}
-
-bool moonshotKeyPresent(AppState& st) {
-    pollSubConnected(st);
-    return st.settings.moonshotKey[0] != 0;
-}
-
-// ============================ Chudcode model catalog + session cost (S-UI-PROV) ===
-// Chudcode's catalog (capabilities + $/Mtok cost) via `chudcode_models_list`,
-// and the per-session cost strip via `chudcode_session_stats`. The worker
+// ============================ Omp model catalog + session cost (S-UI-PROV) ===
+// Omp's catalog (capabilities + $/Mtok cost) via `omp_models_list`,
+// and the per-session cost strip via `omp_session_stats`. The worker
 // re-discovers models in the background; poll briefly until the fresh service is ready.
-// Both degrade permanently on unknown_method and keep the last good data on soft failures.
+// Soft failures retain the last confirmed data and retry. Stale disk metadata is not availability,
+// with ONE exception: while a running agent turn holds hostd's service lane, nothing can be read
+// live (hostd refuses every other agent-lane call), so the previous session's confirmed catalog
+// and provider list stand in and are labelled as such.
 
 namespace {
 
 std::vector<ui::BridgeModelMeta> s_bridgeModels;
-bool s_bridgeCatalogAvailable = true;  // false after unknown_method — stop polling, no sublabels
+std::vector<ui::BridgeModelMeta> s_scenarioModels;
+bool s_scenarioCatalog = false;
+bool s_bridgeCatalogAvailable = true;  // false after an unknown-method response
 bool s_bridgeCatalogInFlight = false;
 bool s_bridgeCatalogRefreshing = false;
+bool s_bridgeCatalogError = false;
+bool s_bridgeCatalogLive = false;
+// The last answer was "a running agent turn holds the service lane": a wait, not a failure.
+bool s_bridgeCatalogDeferred = false;
+// s_bridgeModels is the previous session's saved catalog, not yet replaced by a live read.
+bool s_bridgeCatalogFromDisk = false;
+bool s_providerListInFlight = false;
+bool s_providerListError = false;
+bool s_providerListLoaded = false;
+bool s_providerListDeferred = false;
+// st.signedInBridgeProviders / dead-credential notes came from the previous session's saved
+// provider list, not yet replaced by a live read.
+bool s_providerListFromDisk = false;
 double s_bridgeCatalogLastFetch = -1e9;
-
-// True when the RPC is permanently absent (unknown method / older core) — mirrors
-// usageIsAbsent in composer.cpp.
-bool bridgeRpcAbsent(const core::RpcResult& r) {
-    if (!r.ok) {
-        const std::string& e = r.err;
-        if (e.find("unknown") != std::string::npos || e.find("not found") != std::string::npos ||
-            e.find("not_found") != std::string::npos || e.find("method") != std::string::npos)
-            return true;
-        return false;
-    }
-    if (!r.result.is_object()) return false;
-    if (r.result.contains("code")) {
-        const std::string c = jsonOptStr(r.result, "code");
-        if (c == "unknown_method" || c == "method_not_found" || c == "not_implemented")
-            return true;
-    }
-    if (!r.result.value("ok", true)) {
-        const std::string reason = r.result.value("reason", std::string());
-        if (reason == "unknown_method" || reason == "method_not_found" ||
-            reason == "not_implemented")
-            return true;
-    }
-    return false;
-}
 
 // "$3" / "$1.5" / "$18.75", trimmed to meaningful digits.
 std::string fmtUsd(double v) {
@@ -1482,26 +1372,20 @@ void inferReleaseDate(const std::string& id, const std::string& name, std::strin
 // Conservative, substring-based heuristic flagging clearly-superseded/legacy model ids
 // (case-insensitive). Deliberately narrow — false negatives (an old model left unflagged) are
 // fine, false positives (a current flagship hidden) are not. Update this list as families age
-// out; never flag a current flagship by broad prefix match.
+// out; never flag a current flagship by broad prefix match. Claude / OpenAI GPT generations are
+// NOT handled here: ui::isLegacyGenerationModel removes them from every list outright.
 bool isDeprecatedModelId(const std::string& id) {
     static const char* kLegacySubstrings[] = {
-        "gpt-3.5", "gpt-4-0314", "gpt-4-0613", "gpt-4-32k", "text-davinci", "davinci",
-        "babbage", "ada-", "claude-1", "claude-2", "claude-instant", "claude-3-opus",
+        "text-davinci", "davinci", "babbage", "ada-",
         "gemini-1.0", "gemini-pro-vision", "palm", "deprecated",
     };
     const std::string lo = toLowerCopy(id);
     for (const char* sub : kLegacySubstrings)
         if (lo.find(sub) != std::string::npos) return true;
-    // claude-3-sonnet / claude-3-haiku are flagged, but claude-3-5-sonnet / claude-3-5-haiku
-    // (current generation) are NOT: the "-5-" between "claude-3" and "sonnet"/"haiku" means
-    // "claude-3-sonnet"/"claude-3-haiku" is never a substring of those newer ids, so a plain
-    // substring check is already exact here.
-    if (lo.find("claude-3-sonnet") != std::string::npos) return true;
-    if (lo.find("claude-3-haiku") != std::string::npos) return true;
     return false;
 }
 
-// One catalog payload (`chudcode_models_list` "models") -> sorted rows. Shared by the live fetch
+// One catalog payload (`omp_models_list` "models") -> sorted rows. Shared by the live fetch
 // and the on-disk copy below so both produce byte-identical metadata.
 std::vector<ui::BridgeModelMeta> parseBridgeCatalogRows(const nlohmann::json& models) {
     std::vector<ui::BridgeModelMeta> rows;
@@ -1513,11 +1397,19 @@ std::vector<ui::BridgeModelMeta> parseBridgeCatalogRows(const nlohmann::json& mo
         if (b.id.empty()) continue;
         b.name = m.value("name", b.id);
         b.provider = m.value("provider", std::string());
+        b.visionKnown = m.contains("vision") && m["vision"].is_boolean();
         b.vision = m.value("vision", false);
-        b.tools = m.value("supportsTools", false);
+        b.toolsKnown = (m.contains("toolCall") && m["toolCall"].is_boolean()) ||
+                       (m.contains("supportsTools") && m["supportsTools"].is_boolean());
+        b.tools = m.contains("toolCall") && m["toolCall"].is_boolean()
+            ? m["toolCall"].get<bool>() : m.value("supportsTools", false);
+        b.reasoningKnown = m.contains("reasoning") && m["reasoning"].is_boolean();
         b.reasoning = m.value("reasoning", false);
-        const auto ef = m.find("reasoningEfforts");
-        if (ef != m.end() && ef->is_array())
+        if (m.contains("kind") && m["kind"].is_string()) b.kind = m["kind"].get<std::string>();
+        auto ef = m.find("thinking_levels");
+        if (ef == m.end()) ef = m.find("reasoningEfforts");
+        b.reasoningEffortsKnown = ef != m.end() && ef->is_array();
+        if (b.reasoningEffortsKnown)
             for (const auto& e : *ef)
                 if (e.is_string()) b.reasoningEfforts.push_back(e.get<std::string>());
         if (m.contains("contextWindow") && m["contextWindow"].is_number())
@@ -1592,53 +1484,116 @@ void ensureBridgeCatalogSeeded() {
     if (!j.is_object()) return;
     const auto it = j.find("models");
     if (it != j.end()) s_bridgeModels = parseBridgeCatalogRows(*it);
+    s_bridgeCatalogFromDisk = !s_bridgeModels.empty();
 }
+
+// The provider list as last confirmed by a successful omp_provider_list, kept beside the catalog
+// cache. Written only from a complete live read, so it never persists an "unknown" availability.
+std::string providerListCachePath() { return appdataAppDir() + "/provider_list_cache.json"; }
 
 }  // namespace
 
+std::string savedProviderListJson() {
+    std::ifstream f(providerListCachePath(), std::ios::binary);
+    if (!f) return {};
+    const nlohmann::json j = nlohmann::json::parse(f, nullptr, /*allow_exceptions=*/false);
+    if (!j.is_object()) return {};
+    const auto it = j.find("providers");
+    return it != j.end() && it->is_array() && !it->empty() ? it->dump() : std::string();
+}
+
+void saveProviderListJson(const std::string& providersJson) {
+    // Both pollers (the picker and Settings -> Providers) report here every few seconds; only a
+    // changed list touches the disk.
+    static std::string s_lastWritten;
+    if (providersJson == s_lastWritten) return;
+    const nlohmann::json providers = nlohmann::json::parse(providersJson, nullptr, false);
+    if (!providers.is_array() || providers.empty()) return;
+    const std::string path = providerListCachePath();
+    const std::string tmp  = path + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) return;
+        f << nlohmann::json{{"providers", providers}}.dump();
+        if (!f) return;
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) std::filesystem::remove(tmp, ec);
+    else s_lastWritten = providersJson;
+}
+
 void refreshBridgeModelCatalog(AppState& st, bool force) {
-    ensureBridgeCatalogSeeded();   // before any clear below, so a stale seed can never resurface
-    if (!s_bridgeCatalogAvailable || s_bridgeCatalogInFlight) return;
+    if (s_scenarioCatalog) return;
+    ensureBridgeCatalogSeeded();
+    if (s_bridgeCatalogInFlight) return;
     const double now = ImGui::GetTime();
     const bool followupReady = startupCatalogFollowupReady(st);
     if (!force && (!st.workerStarted || st.workerBootPending || !st.startupPhase.empty()))
         return;
     if (!force && s_bridgeCatalogLastFetch > -1e9 && !followupReady) return;
-    // During Chudcode's background discovery, follow up promptly rather than waiting
-    // five minutes after showing the old list. Steady-state polling stays at five minutes.
-    if (!force && (now - s_bridgeCatalogLastFetch) < (s_bridgeCatalogRefreshing ? 5.0 : 300.0))
+    // The catalog lists only providers that are signed in, so a sign-in, key or logout (made
+    // here, in onboarding, or from the CLI) makes the cached catalog stale for exactly that
+    // provider: the list says it is usable while the catalog has none of its models. Re-read at
+    // the retry cadence when the signed-in set differs from the one the last read was made for,
+    // not in five minutes.
+    static std::set<std::string> s_readForProviders;
+    const bool signedInChanged = st.signedInBridgeProviders != s_readForProviders;
+    // Retry transient failures promptly; an absent method is retried less often in case the
+    // worker becomes available later. A run holding the service lane answers at once, so waiting
+    // for it polls at the retry cadence too. Successful steady-state polling stays at five minutes.
+    const double interval = !s_bridgeCatalogAvailable ? 60.0 :
+                            (s_bridgeCatalogRefreshing || s_bridgeCatalogError ||
+                             s_bridgeCatalogDeferred || signedInChanged ? 5.0 : 300.0);
+    if (!force && (now - s_bridgeCatalogLastFetch) < interval)
         return;
+    s_readForProviders = st.signedInBridgeProviders;
     s_bridgeCatalogLastFetch = now;
     s_bridgeCatalogInFlight = true;
-    st.rpc.call("chudcode_models_list", nlohmann::json::object(),
+    st.rpc.call("omp_models_list", nlohmann::json::object(),
                 [](const core::RpcResult& r) {
         s_bridgeCatalogInFlight = false;
         s_bridgeCatalogLastFetch = ImGui::GetTime();
-        if (r.ok && r.result.is_object() && r.result.value("ok", true))
-            s_bridgeCatalogRefreshing = r.result.value("refreshing", false);
-        if (bridgeRpcAbsent(r)) {
-            s_bridgeCatalogAvailable = false;
-            s_bridgeCatalogRefreshing = false;
-            s_bridgeModels.clear();
-            return;
-        }
-        if (!r.ok || !r.result.is_object() || !r.result.value("ok", true)) return;  // soft fail
-        const auto it = r.result.find("models");
-        if (it == r.result.end() || !it->is_array()) return;
+        // A running agent turn holds hostd's agent lane and every other call on it is refused at
+        // once. That is a wait, not a failed read: no error state, the last data stays, and the
+        // poll above retries until the turn ends.
+        s_bridgeCatalogDeferred = core::workerLaneBusy(r);
+        if (s_bridgeCatalogDeferred) return;
+        const bool success = r.ok && r.result.is_object() &&
+                             (!r.result.contains("ok") || jsonOptBool(r.result, "ok"));
+        const auto it = success ? r.result.find("models") : r.result.end();
+        const bool valid = success && it != r.result.end() && it->is_array();
+        const bool refreshFailed = success && r.result.contains("refreshError") &&
+            r.result["refreshError"].is_string() &&
+            !r.result["refreshError"].get<std::string>().empty();
+        s_bridgeCatalogError = !valid || refreshFailed;
+        s_bridgeCatalogRefreshing = valid && !refreshFailed &&
+                                    jsonOptBool(r.result, "refreshing");
+        s_bridgeCatalogAvailable = !core::workerMethodAbsent(r);
+        if (s_bridgeCatalogError) return;  // retain the last confirmed snapshot, not a disk seed
+        s_bridgeCatalogLive = true;
+        s_bridgeCatalogFromDisk = false;
         s_bridgeModels = parseBridgeCatalogRows(*it);
         if (!s_bridgeModels.empty()) saveBridgeCatalogCache(*it);
     }, 15000);
 }
 
+void setModelSettingsScenarioCatalog(AppState& st, std::vector<BridgeModelMeta> models) {
+    const char* scenario = std::getenv("CHUDWARE_SHOT");
+    if (!st.shot || !scenario || std::strcmp(scenario, "model_settings") != 0) return;
+    s_scenarioModels = std::move(models);
+    s_scenarioCatalog = true;
+}
+
 const std::vector<ui::BridgeModelMeta>& bridgeModelCatalog() {
+    if (s_scenarioCatalog) return s_scenarioModels;
     ensureBridgeCatalogSeeded();
     return s_bridgeModels;
 }
 
 const ui::BridgeModelMeta* bridgeModelMeta(const std::string& providerId,
                                                const std::string& modelId) {
-    ensureBridgeCatalogSeeded();
-    for (const auto& m : s_bridgeModels) {
+    for (const auto& m : bridgeModelCatalog()) {
         if (m.id != modelId) continue;
         if (providerId.empty() || m.provider == providerId) return &m;
     }
@@ -1647,7 +1602,7 @@ const ui::BridgeModelMeta* bridgeModelMeta(const std::string& providerId,
 
 const ui::BridgeModelMeta* bridgeModelMetaForCad(int cadProvider, const std::string& modelId,
                                                      const char* cloudBaseUrl) {
-    // CAD ProviderIndex -> Chudcode catalog provider id (the service-routed subset; local endpoints
+    // CAD ProviderIndex -> Omp catalog provider id (the service-routed subset; local endpoints
     // have no catalog rows and simply get no sublabel).
     std::string prov;
     switch (cadProvider) {
@@ -1681,7 +1636,7 @@ bool bridgeProviderIsLocalFree(const std::string& providerId) {
 }
 
 std::string bridgeModelSublabel(const ui::BridgeModelMeta& m) {
-    // "ctx 200k \xc2\xb7 $3/$15 \xc2\xb7 tools vision" — Chudcode model-browser row format.
+    // "ctx 200k \xc2\xb7 $3/$15 \xc2\xb7 tools vision" — Omp model-browser row format.
     std::string out;
     if (m.contextWindow > 0) {
         char buf[24];
@@ -1766,7 +1721,7 @@ void drawSessionCostStrip(AppState& st) {
     if (!s_costAvailable) return;
     const float sc = ui::uiScale;
 
-    // The Chudcode host owns the session's accounting: chudcode_session_stats prices the
+    // The Omp host owns the session's accounting: omp_session_stats prices the
     // session it actually ran, so the UI no longer rebuilds token events and re-sends them
     // to a bridge calculator. Refire on a conversation switch or when a turn completes
     // (turn-count + local token fingerprint), plus a 30s TTL while the strip is visible.
@@ -1795,17 +1750,17 @@ void drawSessionCostStrip(AppState& st) {
         s_costFingerprint = fp;
         s_costLastFetch = now;
         s_costInFlight = true;
-        st.rpc.call("chudcode_session_stats", nlohmann::json{{"session_id", sess}},
+        st.rpc.call("omp_session_stats", nlohmann::json{{"session_id", sess}},
                     [sess](const core::RpcResult& r) {
             s_costInFlight = false;
-            if (bridgeRpcAbsent(r)) {
+            if (core::workerMethodAbsent(r)) {
                 s_costAvailable = false;
                 s_costHasData = false;
                 return;
             }
             if (s_costSession != sess) return;   // conversation switched mid-flight
-            ui::ChudcodeSessionStats stats;
-            if (!r.ok || !ui::parseChudcodeSessionStats(r.result, stats))
+            ui::OmpSessionStats stats;
+            if (!r.ok || !ui::parseOmpSessionStats(r.result, stats))
                 return;   // soft fail — keep the last good data
             s_costUsd = stats.usd;
             s_costHasUsd = stats.hasCost;
@@ -1945,26 +1900,36 @@ void drawSessionCostStrip(AppState& st) {
 // (the same local endpoint backs both PROV_LOCAL and PROV_LLAMACPP), and two rows sharing an
 // id string would trip ImGui's "conflicting ID" assert.
 static bool modelRow(AppState& st, int provider, const std::string& id, const std::string& label,
-                     bool usable, int uid) {
+                     bool usable, int uid, const char* routeBaseUrl = nullptr,
+                     const std::string& wireProvider = {}) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const float rowH = ImGui::GetFrameHeight();
     const float fh = ImGui::GetFontSize();
     const float gut = fh + 8 * sc;
-    bool current = (st.settings.provider == provider &&
-                    std::strcmp(st.settings.model, id.c_str()) == 0);
+    bool current = !st.settings.composerFollowRoles &&
+                   std::strcmp(st.settings.model, id.c_str()) == 0 &&
+                   (wireProvider.empty() ? st.settings.provider == provider
+                                         : st.settings.ompProvider == wireProvider);
     ImGui::PushID(uid);
     bool clicked = ImGui::Selectable("##mrow", current,
                                      usable ? 0 : ImGuiSelectableFlags_Disabled, ImVec2(0, rowH));
     // The caller applies the pick AFTER this returns, so the glyphs below would otherwise
     // paint from pre-click state: the row you just clicked drew unchecked for a frame.
     if (clicked && usable) current = true;
-    // Chudcode catalog sublabel (ctx / cost / capabilities) for service-routed providers.
-    const ui::BridgeModelMeta* meta = bridgeModelMetaForCad(provider, id, st.settings.baseUrl);
+    {
+        ImGuiContext& g = *GImGui;
+        IMGUI_TEST_ENGINE_ITEM_INFO(ImGui::GetItemID(), label.c_str(), g.LastItemData.StatusFlags |
+            ImGuiItemStatusFlags_Checkable | (current ? ImGuiItemStatusFlags_Checked : 0));
+    }
+    // Omp catalog sublabel (ctx / cost / capabilities) for service-routed providers.
+    const ui::BridgeModelMeta* meta = wireProvider.empty()
+        ? bridgeModelMetaForCad(provider, id, routeBaseUrl ? routeBaseUrl : st.settings.baseUrl)
+        : bridgeModelMeta(wireProvider, id);
     const std::string sublabel = meta ? bridgeModelSublabel(*meta) : std::string();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
         // Full model name + provider for the composer overlay picker; cost detail (cache
-        // pricing, max output) rides the tooltip per the Chudcode model-browser convention.
+        // pricing, max output) rides the tooltip per the Omp model-browser convention.
         if (meta) {
             const std::string detail = bridgeModelCostDetail(*meta);
             if (!detail.empty())
@@ -1992,14 +1957,14 @@ static bool modelRow(AppState& st, int provider, const std::string& id, const st
                 label.c_str());
     float lw = ImGui::CalcTextSize(label.c_str()).x;
     dl->AddText(ImVec2(mn.x + gut + lw + 8 * sc, midY - fh * 0.5f),
-                ui::Palette::toU32(pal.textDim), providerShort(provider));
+                ui::Palette::toU32(pal.textDim), wireProvider.empty() ? providerShort(provider) : wireProvider.c_str());
     if (!usable) {
         const char* hint = "Add key";
         float hw = ImGui::CalcTextSize(hint).x;
         dl->AddText(ImVec2(mx.x - hw - 8 * sc, midY - fh * 0.5f),
                     ui::Palette::toU32(pal.accent), hint);
     } else if (!sublabel.empty()) {
-        // Right-aligned dim "ctx 200k \xc2\xb7 $3/$15 \xc2\xb7 tools vision" (Chudcode model row).
+        // Right-aligned dim "ctx 200k \xc2\xb7 $3/$15 \xc2\xb7 tools vision" (Omp model row).
         const float sw = ImGui::CalcTextSize(sublabel.c_str()).x;
         if (mn.x + gut + lw + 8 * sc + 60.0f * sc < mx.x - sw - 8 * sc)
             dl->AddText(ImVec2(mx.x - sw - 8 * sc, midY - fh * 0.5f),
@@ -2019,48 +1984,132 @@ struct DeadCredProvider {
     std::string cause;
 };
 std::vector<DeadCredProvider> s_deadCredProviders;
+
+// One omp_provider_list `providers` array -> the picker's signed-in set and dead-credential
+// notes. The live reply and the previous session's saved list both go through here, so they
+// produce the same state.
+void applyProviderList(AppState& st, const nlohmann::json& providers) {
+    std::set<std::string> live;
+    std::vector<DeadCredProvider> dead;
+    for (const auto& p : providers) {
+        ui::OmpProviderDesc d;
+        if (!ui::parseOmpProviderDesc(p, d)) continue;
+        // Unknown availability retains a previous confirmation but cannot create one.
+        if (ui::ompProviderAvailableAfterRefresh(d, st.signedInBridgeProviders.count(d.id))) {
+            live.insert(d.id);
+        } else if (d.state == "error") {
+            std::string cause = d.error;
+            if (cause.empty()) cause = "credential disabled";
+            dead.push_back({d.label, std::move(cause)});
+        }
+    }
+    s_deadCredProviders = std::move(dead);
+    st.signedInBridgeProviders = std::move(live);
+}
+
+// Cold start: the previous session's confirmed provider list stands in until a live read lands.
+// It is only ever USED while a running agent turn holds the service lane (bridgePickerModelUsable).
+void ensureProviderListSeeded(AppState& st) {
+    static bool s_seeded = false;
+    if (s_seeded) return;
+    s_seeded = true;
+    if (s_providerListLoaded || !st.signedInBridgeProviders.empty()) return;
+    const nlohmann::json saved = nlohmann::json::parse(savedProviderListJson(), nullptr, false);
+    if (!saved.is_array()) return;
+    applyProviderList(st, saved);
+    s_providerListFromDisk = !st.signedInBridgeProviders.empty() || !s_deadCredProviders.empty();
+}
 }  // namespace
 
-// Poll chudcode_provider_list so the composer knows which providers are signed in WITHOUT the
+// Poll omp_provider_list so the composer knows which providers are signed in WITHOUT the
 // user having opened Settings -> Providers. Fills st.signedInBridgeProviders (same set the
 // Providers panel writes) so the dropdown mirrors the Providers tab. TTL'd; degrades silently.
-static void refreshSignedInProviders(AppState& st, bool force) {
+void refreshSignedInProviders(AppState& st, bool force) {
     // Browser credentials belong to the gateway account, never a shared SDK auth store.
     if (ui::webBuild()) return;
+    ensureProviderListSeeded(st);
     static double s_lastPoll = -1e9;
-    static bool s_inFlight = false;
-    if (s_inFlight) return;
+    if (s_providerListInFlight) return;
     const double now = ImGui::GetTime();
     if (!force && (now - s_lastPoll) < 5.0) return;
     s_lastPoll = now;
-    s_inFlight = true;
-    st.rpc.call("chudcode_provider_list", nlohmann::json::object(),
+    s_providerListInFlight = true;
+    st.rpc.call("omp_provider_list", nlohmann::json::object(),
                 [&st](const core::RpcResult& r) {
-        s_inFlight = false;
-        if (!r.ok || !r.result.is_object() || !r.result.value("ok", true)) return;
-        const auto it = r.result.find("providers");
-        if (it == r.result.end() || !it->is_array()) return;
-        std::set<std::string> live;
-        std::vector<DeadCredProvider> dead;
-        for (const auto& p : *it) {
-            ui::ChudcodeProviderDesc d;
-            if (!ui::parseChudcodeProviderDesc(p, d)) continue;
-            // WHITELIST, not "anything but signed_out" (chudcodeProviderUsable): a provider
-            // that still holds a working credential alongside a revoked one reports
-            // key_set/oauth_connected — only those mean "requests can succeed". Treating
-            // `error` as signed-in would advertise a provider whose every call fails.
-            if (ui::chudcodeProviderUsable(d.state)) {
-                live.insert(d.id);
-            } else if (d.state == "error") {
-                std::string cause = d.error;
-                if (cause.empty()) cause = "credential disabled";
-                dead.push_back({d.label, std::move(cause)});
-            }
+        s_providerListInFlight = false;
+        // A running agent turn holds hostd's agent lane and every other call on it is refused at
+        // once. That is a wait, not a failed read: no error state, what is shown stays, and the
+        // 5 s poll asks again until the turn ends.
+        s_providerListDeferred = core::workerLaneBusy(r);
+        if (s_providerListDeferred) return;
+        if (!r.ok || !r.result.is_object() ||
+            (r.result.contains("ok") && !jsonOptBool(r.result, "ok"))) {
+            s_providerListError = true;
+            return;
         }
-        s_deadCredProviders = std::move(dead);
-        st.signedInBridgeProviders = std::move(live);
+        const auto it = r.result.find("providers");
+        if (it == r.result.end() || !it->is_array()) {
+            s_providerListError = true;
+            return;
+        }
+        s_providerListError = r.result.contains("refreshError") &&
+            r.result["refreshError"].is_string() &&
+            !r.result["refreshError"].get<std::string>().empty();
+        s_providerListLoaded = true;
+        s_providerListFromDisk = false;
+        applyProviderList(st, *it);
+        // Only a complete read is worth keeping for the next launch.
+        if (!s_providerListError) saveProviderListJson(it->dump());
     }, 15000);
 }
+
+bool bridgePickerModelUsable(const AppState& st, const BridgeModelMeta& m) {
+    // Claude < 5.1 / GPT < 6 are never offered, whatever the user's per-model show toggles say.
+    // A saved selection of one still displays: pickers render the current value separately.
+    if (ui::isLegacyGenerationModel(m.id)) return false;
+    // Availability needs a live confirmation of the catalog AND the provider list. The one
+    // exception: while a running agent turn holds the service lane nothing can be read live, so
+    // the previous session's saved copies — confirmed when they were saved — stand in.
+    const bool catalogConfirmed =
+        s_bridgeCatalogLive || (s_bridgeCatalogDeferred && s_bridgeCatalogFromDisk);
+    const bool providersConfirmed =
+        s_providerListLoaded || (s_providerListDeferred && s_providerListFromDisk);
+    if (!s_scenarioCatalog && (!catalogConfirmed || !providersConfirmed)) return false;
+    const std::string identity = m.provider + "/" + m.id;
+    if (ui::webBuild() || st.signedInBridgeProviders.count(m.provider) == 0 ||
+        st.settings.hiddenModels.count(identity) ||
+        (st.settings.hiddenModels.count(m.id) &&
+         !st.settings.shownLegacyHiddenModels.count(identity))) return false;
+    return st.settings.disabledProviders.count(m.provider) == 0;
+}
+
+bool pickerLocalModelUsable(const AppState& st, int provider, const std::string& id) {
+    if (provider != ui::PROV_LOCAL && provider != ui::PROV_LLAMACPP) return false;
+    const ProviderModels& pm = st.providerModels[provider];
+    return pm.ok && localModelLoaded(pm, id) &&
+           !st.settings.disabledProviders.count("local") &&
+           !st.settings.hiddenModels.count(id);
+}
+
+// True while the catalog or the provider list has no live answer ONLY because a running agent
+// turn holds the service lane. Not an error: what is saved from the last session (if anything)
+// is shown, and everything refreshes when the turn ends.
+bool modelPickerDeferred() {
+    return !s_scenarioCatalog && !ui::webBuild() &&
+           ((s_bridgeCatalogDeferred && !s_bridgeCatalogLive) ||
+            (s_providerListDeferred && !s_providerListLoaded));
+}
+
+bool modelPickerLoading() {
+    if (modelPickerDeferred()) return false;   // waiting on a run, not on a read
+    return (!s_scenarioCatalog &&
+            (s_bridgeCatalogInFlight || s_bridgeCatalogRefreshing ||
+             (s_bridgeCatalogAvailable && s_bridgeCatalogLastFetch < 0.0))) ||
+           s_providerListInFlight ||
+           (!ui::webBuild() && !s_providerListLoaded && !s_providerListError);
+}
+
+bool modelPickerError() { return s_bridgeCatalogError || s_providerListError; }
 
 // The model dropdown body (hosted in a popup): a search box with a compact glass gear on the
 // same row (opens Settings), the usable models with a checkmark on the current one, and a muted
@@ -2071,7 +2120,7 @@ void drawModelDropdown(AppState& st, bool busy) {
     const float sc = ui::uiScale;
     static char s_modelSearch[64] = "";
     refreshModelAvailability(st, false);
-    refreshBridgeModelCatalog(st, false);  // Chudcode catalog sublabels (ctx/cost/capability chips)
+    refreshBridgeModelCatalog(st, false);  // Omp catalog sublabels (ctx/cost/capability chips)
     refreshSignedInProviders(st, false);  // mirror Settings->Providers signed-in set into the picker
 
     if (ImGui::IsWindowAppearing()) { s_modelSearch[0] = 0; ImGui::SetKeyboardFocusHere(); }
@@ -2137,111 +2186,55 @@ void drawModelDropdown(AppState& st, bool busy) {
     int uid = 0;       // monotonic per-row id seed — keeps ImGui ids unique across sections
     int shown = 0;     // visible rows after availability + search filtering
     ImGui::BeginChild("##modellist", ImVec2(0, 240 * sc), ImGuiChildFlags_None);
+    if (matchq("Follow model assignments", "Settings", "assignments")) {
+        if (ImGui::Selectable("Follow model assignments", st.settings.composerFollowRoles)) {
+            st.settings.composerFollowRoles = true;
+            saveSettings(st.settings);
+            ImGui::CloseCurrentPopup();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Use the configured chat assignment (Large in Simple mode).\n"
+                              "Default follows the model last selected here.");
+        ImGui::Separator();
+    }
 
     auto catOff = [&](const std::string& key) {
         return st.settings.disabledProviders.count(key) != 0;
     };
 
-    // Composer models = the user's SELECTED (checked = NOT hidden) catalog models for SIGNED-IN
-    // providers, sourced from the Settings -> Providers catalog (ui::bridgeModelCatalog()). Each
-    // catalog provider id maps to a composer slot + base_url. Every online send runs through
-    // Chudcode (agent_admin_turn), so a provider needs no native transport here — only a slot
-    // whose wire name Chudcode recognises. Unknown catalog providers map to slot -1 and are
-    // excluded so they can't cause provider_error.
-    struct Route { int slot; const char* baseUrl; };
-    auto routeFor = [](const std::string& p) -> Route {
-        if (p == "anthropic") return {ui::PROV_ANTHROPIC, ""};
-        if (p == "openai") return {ui::PROV_OPENAI, ""};
-        if (p == "google" || p == "gemini") return {ui::PROV_GEMINI, ""};
-        if (p == "xai") return {ui::PROV_XAI, "https://api.x.ai/v1"};
-        if (p == "kimi-code") return {ui::PROV_KIMISUB, ""};
-        if (p == "zenmux") return {ui::PROV_ZENMUX, ""};
-        if (p == "cursor") return {ui::PROV_CURSOR, ""};
-        if (p == "moonshot") return {ui::PROV_CLOUDCOMPAT, "https://api.moonshot.ai/v1"};
-        if (p == "openrouter") return {ui::PROV_CLOUDCOMPAT, "https://openrouter.ai/api/v1"};
-        if (p == "deepseek") return {ui::PROV_CLOUDCOMPAT, "https://api.deepseek.com/v1"};
-        if (p == "alibaba" || p == "alibaba-coding-plan")
-            return {ui::PROV_CLOUDCOMPAT, "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"};
-        // Bridge-only catalog providers: no native C++ transport and no dedicated ProviderIndex,
-        // so they ride the SHARED cloud slot. The URL here is a DISCRIMINATOR, not an endpoint —
-        // ui::cloudServiceKey() maps it back to the hosted provider id pinned by
-        // agentProviderOverride; Chudcode supplies the real endpoint and credential.
-        if (p == "amazon-bedrock")
-            return {ui::PROV_CLOUDCOMPAT, "https://bedrock-runtime.amazonaws.com"};
-        if (p == "azure") return {ui::PROV_CLOUDCOMPAT, "https://api.openai.azure.com"};
-        if (p == "google-antigravity") return {ui::PROV_CLOUDCOMPAT, "https://antigravity.google"};
-        if (p == "aimlapi") return {ui::PROV_CLOUDCOMPAT, "https://api.aimlapi.com/v1"};
-        if (p == "openai-codex") return {ui::PROV_CLOUDCOMPAT, "https://chatgpt.com/backend-api/codex"};
-        return {-1, ""};  // unrouted catalog provider: no composer slot -> excluded
-    };
-
     const auto& catalog = ui::bridgeModelCatalog();
     if (!catalog.empty()) {
         for (const auto& m : catalog) {
-            Route r = routeFor(m.provider);
-            if (r.slot < 0) continue;                                        // no composer slot
-            // Signed-in providers only. The browser build has no provider credential path, so
-            // it never lists online catalog models.
-            if (ui::webBuild() || st.signedInBridgeProviders.count(m.provider) == 0) continue;
-            std::string catk = (r.slot == ui::PROV_CLOUDCOMPAT) ? ui::cloudServiceKey(r.baseUrl)
-                                                                : ui::providerCatKey(r.slot);
-            if (catOff(catk)) continue;                                      // provider bulk-disabled
-            if (m.deprecated) continue;
-            if (modelHidden(st, m.id)) continue;                             // unchecked in Providers
-            if (!matchq(m.name, providerShort(r.slot), m.id)) continue;
+            if (!bridgePickerModelUsable(st, m)) continue;
+            if (!matchq(m.name, m.provider, m.id)) continue;
             ++shown;
-            if (modelRow(st, r.slot, m.id, m.name, true, uid++)) {
-                st.settings.provider = r.slot;
+            if (modelRow(st, ui::PROV_OPENAI, m.id, m.name, true, uid++, nullptr, m.provider)) {
+                st.settings.provider = ui::PROV_OPENAI; // Legacy offline/cloud classification only.
+                st.settings.ompProvider = m.provider;
                 std::strncpy(st.settings.model, m.id.c_str(), sizeof(st.settings.model) - 1);
-                if (r.baseUrl[0])
-                    std::strncpy(st.settings.baseUrl, r.baseUrl, sizeof(st.settings.baseUrl) - 1);
-                else
-                    st.settings.baseUrl[0] = 0;  // native/bridge-routed: leave base_url empty/default
+                st.settings.model[sizeof(st.settings.model) - 1] = 0;
                 st.settings.vision = m.vision;
                 picked = true;
             }
         }
-    } else {
-        // Bridge down / older core (empty catalog): fall back to the per-provider list so the
-        // picker still works. Walk the builtin catalog only for its provider ORDER — the first
-        // row of each provider block emits that provider's whole list via providerPickerModels,
-        // which prefers the LIVE agent_list_models rows (newest first) over the static ones.
-        // Gated on provider category + usable credential + search, as before.
-        std::set<int> emittedProv;
-        for (const auto& b : ui::builtinModels()) {
-            if (!emittedProv.insert(b.provider).second) continue;
-            if (catOff(ui::providerCatKey(b.provider))) continue;
-            if (!providerUsable(st, b.provider)) continue;
-            for (const auto& m : ui::providerPickerModels(st, b.provider)) {
-                if (!matchq(m.label, providerShort(m.provider), m.id)) continue;
-                if (modelHidden(st, m.id)) continue;
-                ++shown;
-                if (modelRow(st, m.provider, m.id, m.label, true, uid++)) {
-                    st.settings.provider = m.provider;
-                    std::strncpy(st.settings.model, m.id.c_str(), sizeof(st.settings.model) - 1);
-                    picked = true;
-                }
-            }
-        }
     }
-    // Live-discovered local models (when a local endpoint is up). The probe assigns the same
-    // model list to PROV_LOCAL and PROV_LLAMACPP (one endpoint family), so dedup by id to avoid
-    // listing each model twice. Skip models that are downloaded but not loaded, and any the user
-    // hid.
+    // The legacy endpoint probe has no OMP provider identity, so keep its rows out of
+    // online selections. Both offline slots share one probe, so deduplicate by id.
     std::set<std::string> seenLocal;
     for (int lp : {ui::PROV_LOCAL, ui::PROV_LLAMACPP}) {
-        if (catOff("local")) break;
+        if (!st.settings.offlineMode || catOff("local")) break;
         const ProviderModels& pm = st.providerModels[lp];
         if (!pm.ok) continue;
         for (const auto& id : pm.models) {
-            if (!seenLocal.insert(id).second) continue;     // already shown for the sibling provider
-            if (!localModelLoaded(pm, id)) continue;        // downloaded but not loaded into memory
-            if (modelHidden(st, id)) continue;
+            if (!pickerLocalModelUsable(st, lp, id)) continue;
+            if (!seenLocal.insert(id).second) continue;
             if (!matchq(id, providerShort(lp), id)) continue;
             ++shown;
             if (modelRow(st, lp, id, id, true, uid++)) {
                 st.settings.provider = lp;
                 std::strncpy(st.settings.model, id.c_str(), sizeof(st.settings.model) - 1);
+                if (!st.settings.ompProvider.empty()) st.settings.apiKey[0] = 0;
+                st.settings.ompProvider.clear();
                 // This pick may be switching AWAY from a cloud provider whose base_url is remote.
                 // Point base_url back at the local endpoint so the run hits LM Studio, not the cloud
                 // (a local model id sent to the cloud 403s). Preserve an already-loopback base_url so
@@ -2256,20 +2249,38 @@ void drawModelDropdown(AppState& st, bool busy) {
             }
         }
     }
-    const bool modelsLoading = s_bridgeCatalogInFlight || st.modelProbeInFlight.load() ||
-        (s_bridgeCatalogAvailable && s_bridgeCatalogLastFetch < 0.0);
+    const bool modelsLoading = modelPickerLoading() || st.modelProbeInFlight.load();
+    const bool modelsDeferred = modelPickerDeferred();
     if (shown == 0) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDisabled));
-        ImGui::TextWrapped(modelsLoading ? "Loading models\xe2\x80\xa6" : q.empty()
-            ? "No models available — sign in to a subscription (ZenMux / xAI / Claude / Cursor), "
-              "add an API key, or start a local model server (gear below)."
-            : "No models match your search.");
+        ImGui::TextWrapped(modelsDeferred ? "Models appear when the current run finishes." :
+            modelsLoading ? "Loading models\xe2\x80\xa6" :
+            modelPickerError() ? "Model availability could not be confirmed. Retry discovery." :
+            q.empty() ? "No models available. Check your enabled providers or start a local model server."
+                      : "No models match your search.");
         ImGui::PopStyleColor();
+    } else if (modelsDeferred) {
+        // What is listed was confirmed in the previous session; a running turn keeps the live
+        // read waiting. Say so rather than presenting it as current.
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDisabled));
+        ImGui::TextWrapped("Showing models from your last session. They refresh when the current run finishes.");
+        ImGui::PopStyleColor();
+    }
+    if (modelPickerError()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.statusWarn));
+        ImGui::TextWrapped("Could not refresh all provider information. Showing last confirmed models when available.");
+        ImGui::PopStyleColor();
+        if (ImGui::SmallButton("Retry model discovery")) {
+            refreshBridgeModelCatalog(st, true);
+            refreshSignedInProviders(st, true);
+            refreshModelAvailability(st, true);
+        }
     }
     ImGui::EndChild();
 
     // No providers signed in yet -> nothing routable; point the user at Settings to add models.
-    if (st.signedInBridgeProviders.empty() && !modelsLoading) {
+    if (st.signedInBridgeProviders.empty() && !modelsLoading && !modelsDeferred &&
+        !modelPickerError()) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.textDim));
         ImGui::TextUnformatted("Sign in to a provider in Settings -> Providers to add models.");
         ImGui::PopStyleColor();
@@ -2292,11 +2303,12 @@ void drawModelDropdown(AppState& st, bool busy) {
         ImGui::PopStyleColor();
     }
 
-    // Footer: per-session cost strip (chudcode_session_stats; hidden while the service is absent).
+    // Footer: per-session cost strip (omp_session_stats; hidden while the service is absent).
     ImGui::Dummy(ImVec2(0, 2 * sc));
     drawSessionCostStrip(st);
 
     if (picked) {
+        st.settings.composerFollowRoles = false;
         // Persist the descriptor immediately so the next `agent_admin_turn` has matching endpoint
         // details; composer also pins provider/model/effort in that request. This keeps config.json
         // and the picker aligned instead of letting a stale saved cloud endpoint outlive a new local

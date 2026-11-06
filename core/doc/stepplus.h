@@ -37,18 +37,20 @@ struct StepPlusDoc {
     // A skipped cache is a cache miss the caller reports; it never fails the open.
     std::map<std::string, std::string> skipped;
 };
+struct NativeFileStamp;
 
 // Write `doc` to `path` as a .step+ container. `extra` carries unknown entries to
 // preserve verbatim (forward-compat). Atomic: private exclusive staging, then replacement.
-// Returns the final path. Throws OpError("io_error", ...) on any failure. Optional
-// caches (cache.aicm, cache.ckpt) that do not fit the archive budget left by every
-// other entry are not written; their names are appended to `dropped` when given.
+// Returns the final path. Throws OpError("io_error", ...) on any failure. A display
+// cache that does not fit is reported in `dropped`; solved checkpoints are reserved
+// before it. `published_stamp` identifies the stage actually published.
 std::string stepplus_save(const nlohmann::json& doc, const std::string& path,
                           const std::map<std::string, std::string>& extra,
-                          std::vector<std::string>* dropped = nullptr);
-// Expanded bytes stepplus_save(doc, ..., extra) leaves for the optional caches once
-// every other entry of `extra` (and document/meta/thumbnail) is reserved. The writer
-// admits cache.aicm first, then cache.ckpt, against this same remainder.
+                          std::vector<std::string>* dropped = nullptr,
+                          NativeFileStamp* published_stamp = nullptr,
+                          const NativeFileStamp* expected_stamp = nullptr);
+// Expanded bytes stepplus_save(doc, ..., extra) leaves for the optional display cache
+// once every other entry of `extra` (and document/meta/thumbnail) is reserved.
 std::size_t stepplus_optional_cache_budget(const nlohmann::json& doc,
                                            const std::map<std::string, std::string>& extra);
 
@@ -110,14 +112,17 @@ bool stepplus_cache_verified(const nlohmann::json& doc,
                             bool component_only = false);
 
 // --- build-state write-back (contracts/stepplus.md §17) -------------------------------
-// Identity of a container file on disk: size + modification time (nanoseconds since the
-// filesystem clock epoch). `valid` is false when the path is not a regular file.
+// Identity of a container file on disk, including modification time in Unix nanoseconds.
+// `valid` is false when the path is not a regular file.
 struct NativeFileStamp {
     std::uintmax_t size = 0;
     long long mtime_ns = 0;
+    std::uint64_t ino = 0;
+    std::uint64_t device = 0;
     bool valid = false;
     bool operator==(const NativeFileStamp& o) const {
-        return valid && o.valid && size == o.size && mtime_ns == o.mtime_ns;
+        return valid && o.valid && size == o.size && mtime_ns == o.mtime_ns &&
+               ino == o.ino && device == o.device;
     }
 };
 NativeFileStamp stepplus_file_stamp(const std::string& path);
@@ -127,6 +132,7 @@ struct BuildStateWriteback {
     std::string reason;                 // why nothing was written (empty when written)
     std::vector<std::string> entries;   // build-state members now in the file
     std::vector<std::string> dropped;   // optional caches left out by the archive budget
+    NativeFileStamp stamp;              // identity of the published file
 };
 // Replace ONLY the derived build-state members (cache.json/.aicm/.brep/.ckpt and
 // geometry.step) of the .step+ at `path` with `entries`. Every other member —

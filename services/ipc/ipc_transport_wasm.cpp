@@ -35,6 +35,8 @@
 #include <emscripten/websocket.h>
 
 namespace chudware_ipc {
+long IpcConn::peerPid() const { return -1; }
+
 
 // Heap-shared connection state. Callbacks hold a raw pointer to this; IpcConn
 // holds a shared_ptr so the state outlives any moved-from IpcConn shell.
@@ -174,6 +176,8 @@ bool IpcConn::eof() const {
     return ws_->eof.load(std::memory_order_acquire);
 }
 
+bool IpcConn::peerDisconnected() const { return !valid() || eof(); }
+
 void IpcConn::close() {
     if (!ws_) return;
     destroySocket(*ws_);
@@ -286,7 +290,8 @@ void IpcListener::close(bool /*unlink_path*/) {
 
 // ----------------------------------------------------------------- connectTo
 
-IpcConn connectTo(const std::string& /*path*/, std::string& err) {
+IpcConn connectTo(const std::string& /*path*/, std::string& err,
+                  const std::atomic<bool>* cancelled) {
     if (!emscripten_websocket_is_supported()) {
         err = "WebSocket not supported in this browser";
         return IpcConn();
@@ -326,6 +331,10 @@ IpcConn connectTo(const std::string& /*path*/, std::string& err) {
         // onopen/onmessage (pinned here) never run. Sleep yields and pumps callbacks.
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
         for (;;) {
+            if (cancelled && cancelled->load(std::memory_order_acquire)) {
+                err = "aborted";
+                break;
+            }
             {
                 std::lock_guard<std::mutex> lk(st->mu);
                 if (st->open) break;

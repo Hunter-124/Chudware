@@ -2,15 +2,14 @@
   "schema": "aicad.copilot_modes/1",
   "contract": "contracts/copilot_modes.md",
   "consumers": [
-    "services/agent/copilot_mode_tools.py (Python: MCP/DAG agent_turn.run_turn gating)",
-    "core/agent/copilot_modes.cpp (C++: in-app run.cpp mode gating)"
+    "services/agent/copilot_mode_tools.py (Python: MCP/DAG agent_turn.run_turn gating)"
   ],
   "notes": [
-    "Canonical per-mode tool allowlists for the Agent|Plan|Swarm|Edit|Ask copilot modes. The .md is the prose contract (mode semantics); this file is the machine-readable data BOTH runtimes load at runtime.",
-    "Runtime resolution: C++ core/agent/copilot_modes.cpp honors CHUDWARE_COPILOT_MODES_JSON (explicit file) then CHUDWARE_CONTRACTS_DIR/<name> then the repo-relative contracts/copilot_modes.json (same CWD convention as core/agent/roles.cpp's services/agent/prompts fallback). Python services/agent/copilot_mode_tools.py honors CHUDWARE_COPILOT_MODES_JSON then <repo>/contracts/copilot_modes.json via Path(__file__).parents[2].",
+    "Canonical per-mode tool allowlists for the Agent|Plan|Swarm|Edit|Ask copilot modes. The .md is the prose contract (mode semantics); this file is the machine-readable data the runtime loads.",
+    "Runtime resolution: Python services/agent/copilot_mode_tools.py honors CHUDWARE_COPILOT_MODES_JSON then <repo>/contracts/copilot_modes.json via Path(__file__).parents[2].",
     "mode_tools has no services/agent/swarm entry: those modes are unrestricted at the mode layer (unrestricted_modes) and a concrete list cannot express 'full catalog'.",
     "mutating_tools is the deny set applied to open-ended role cards in plan mode AND to ask mode; edit_denied is the extra deny set for edit mode; shared_default_tools is the floor UNIONed onto every restricted mode AFTER denylists (shared wins: new_part/close_part/import_part stay available in plan/ask/edit).",
-    "Parity is enforced by core/tests/test_copilot_modes.cpp (doctest) and services/agent/test_copilot_modes_parity.py (pytest) over the same mode x tool verdict matrix.",
+    "Parity is enforced by services/agent/test_copilot_modes_parity.py (pytest) over the mode x tool verdict matrix.",
     "agent_default_tools is the always-on MAIN-agent loadout UNIONed onto the advertised list AND the dispatch policy for the unrestricted modes (services/agent/swarm) even when a role card narrows the list — file handling and web research stay available without burning context on rare CAD packs. Shell remains available only through explicit role/category enablement. subagent_default_tools is the file-handling floor UNIONed onto every DAG-node/subagent role loadout. Neither floor applies to ask/plan/edit (those keep their read-only fs floor via shared_default_tools). Rare families stay behind enable_tools/list_tool_categories."
   ],
   "default_mode": "agent",
@@ -190,8 +189,6 @@
       "coordinate_claim",
       "coordinate_progress",
       "coordinate_release",
-      "corporate_channel_read",
-      "corporate_chart",
       "dag_plan",
       "dag_status",
       "delegate",
@@ -344,6 +341,7 @@
     "new_assembly",
     "new_part",
     "solve_mates",
+    "scad_convert",
     "run_topology_optimization",
     "sketch_fully_define",
     "publish_print_media"
@@ -351,8 +349,6 @@
   "edit_denied": [
     "relocate_native_files",
     "close_part",
-    "corporate_activate",
-    "corporate_spawn_worker",
     "dag_replan",
     "dag_run",
     "import_artifact",
@@ -368,13 +364,6 @@
     "coordinate_claim",
     "coordinate_progress",
     "coordinate_release",
-    "corporate_activate",
-    "corporate_channel_post",
-    "corporate_channel_read",
-    "corporate_chart",
-    "corporate_hold_meeting",
-    "corporate_record_completion",
-    "corporate_spawn_worker",
     "dag_plan",
     "dag_status",
     "delegate",

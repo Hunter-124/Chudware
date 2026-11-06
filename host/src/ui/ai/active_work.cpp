@@ -10,6 +10,7 @@
 //            the parse failure. Textures are keyed by docId and re-rendered only when the
 //            source key (revision + AICM path) changes; closed docs free theirs, LRU caps the rest.
 #include "active_work.h"
+#include "active_work_feed.h"
 
 #include <algorithm>
 #include <chrono>
@@ -23,6 +24,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string_view>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -90,34 +92,12 @@ constexpr size_t kMaxEdits = 256;     // per-doc revision log entries kept
 
 // ---------------------------------------------------------------- tool-call ticker feed
 
-// One observed agent operation (from agent.tool_call). `target` is the human-readable
-// "what it acts on" string the orchestrator emits (doc id / part name / path fragment).
-struct AwOp {
-    std::string       tool;
-    std::string       target;
-    bool              ok = true;
-    int               latencyMs = -1;
-    long long         seq = 0;
-    Clock::time_point at{};
-};
-
-struct AwStore {
-    std::string      runId;
-    std::string      projectDir;  // resolved from the owning conversation's run slot
-    std::deque<AwOp> ops;         // current run ticker, newest at back (cap kMaxOps)
-    long long        seqCtr = 0;
-};
 AwStore s_aw;
-constexpr size_t kMaxOps = 96;   // ring cap — plenty for a run, bounded memory
 
 // run_id -> steady time its run_started event was drained (the only start stamp that exists:
 // JobState carries no start time). Bounded: cleared wholesale past a generous cap.
 std::unordered_map<std::string, Clock::time_point> s_runStart;
 
-std::string awStr(const nlohmann::json& d, const char* k) {
-    auto it = d.find(k);
-    return (it != d.end() && it->is_string()) ? it->get<std::string>() : std::string();
-}
 
 // Best-effort op→doc attribution: the op target names the doc by id, tree title, saved
 // filename, or display title. Substring match, case-sensitive (doc ids are exact).
@@ -632,31 +612,16 @@ void openDocTab(AppState& st, int idx) {
 
 }  // namespace
 
-void activeWorkFeedEvent(const std::string& kind, const nlohmann::json& data) {
+void activeWorkFeedEvent(const std::string& conversationId, const std::string& kind,
+                         const nlohmann::json& data) {
     if (!data.is_object()) return;
+    s_aw.feed(kind, data, conversationId);
     if (kind == "run_started" || kind == "dag.run.started") {
-        s_aw.ops.clear();
-        s_aw.projectDir.clear();
-        s_aw.runId = awStr(data, "run_id");
-        if (!s_aw.runId.empty()) {
+        const std::string runId = awStr(data, "run_id");
+        if (!runId.empty()) {
             if (s_runStart.size() > 512) s_runStart.clear();
-            s_runStart.emplace(s_aw.runId, Clock::now());
+            s_runStart.emplace(runId, Clock::now());
         }
-        return;
-    }
-    if (kind == "agent.tool_call") {
-        if (s_aw.runId.empty() || awStr(data, "run_id") != s_aw.runId) return;
-        AwOp op;
-        op.tool      = awStr(data, "tool_name");
-        if (op.tool.empty()) op.tool = "tool";
-        op.target    = awStr(data, "target");
-        op.ok        = data.value("ok", true);
-        auto lat     = data.find("latency_ms");
-        op.latencyMs = (lat != data.end() && lat->is_number()) ? lat->get<int>() : -1;
-        op.seq       = s_aw.seqCtr++;
-        op.at        = Clock::now();
-        s_aw.ops.push_back(std::move(op));
-        while (s_aw.ops.size() > kMaxOps) s_aw.ops.pop_front();
     }
     // doc.* daemon events reach docTabs via engine_events.cpp — the view re-derives liveness
     // from st.docTabs every frame, so no extra feed is needed for open/close/changed.
@@ -674,8 +639,6 @@ void activeWorkPump(AppState& st) {
 
 void activeWorkReset() {
     s_aw.ops.clear();
-    s_aw.runId.clear();
-    s_aw.projectDir.clear();
     s_aw.seqCtr = 0;
 }
 
@@ -707,20 +670,14 @@ void drawActiveWorkView(AppState& st) {
     const AdaptiveSurface& surf =
         adaptivePanel(panelId("ai_active_work_glass"), paneRect, GlassGroup::Global);
 
-    // ---- resolve the op feed's project (run slot -> owning conversation) ----------------
-    if (!s_aw.runId.empty() && s_aw.projectDir.empty()) {
-        for (const auto& conv : st.conversations) {
-            const auto slot = st.runs.find(conv.id);
-            if (slot == st.runs.end() || !slot->second) continue;
-            std::lock_guard<std::mutex> lock(slot->second->mtx);
-            if (slot->second->runId == s_aw.runId) {
-                s_aw.projectDir = conv.projectDir;
-                break;
-            }
-        }
+    // Attribute each retained operation to its conversation's project, even when
+    // several conversations contribute interleaved events to this shared view.
+    std::vector<std::string_view> projectConversations;
+    if (!s_aw.ops.empty()) {
+        for (const auto& conv : st.conversations)
+            if (!conv.projectDir.empty() && convProjectKey(conv.projectDir) == projectKey)
+                projectConversations.emplace_back(conv.id);
     }
-    const bool opsInProject = !s_aw.projectDir.empty() &&
-                              convProjectKey(s_aw.projectDir) == projectKey;
     const RunWindow run = projectRunWindow(st, projectKey);
     const std::optional<Clock::time_point> since =
         run.known ? std::optional<Clock::time_point>(run.since) : std::nullopt;
@@ -758,8 +715,10 @@ void drawActiveWorkView(AppState& st) {
         }
         // Attribute only operations naming a visible project document. Unattributed events
         // have no project provenance and must never leak another run into this project.
-        if (opsInProject) {
+        if (!projectConversations.empty()) {
             for (const auto& op : s_aw.ops) {
+                if (std::find(projectConversations.begin(), projectConversations.end(),
+                              op.conversationId) == projectConversations.end()) continue;
                 bool hit = false;
                 for (auto& c : all) {
                     if (!opHitsDoc(op, st.docTabs[(size_t)c.idx])) continue;
@@ -972,9 +931,9 @@ void drawActiveWorkView(AppState& st) {
             // Status line.
             y += lineH;
             ImGui::SetCursorScreenPos(ImVec2(textX, y));
-            const char* status = t.aiPulse     ? "agent editing…"
+            const char* status = t.dirty       ? "unsaved"
+                               : t.aiPulse     ? "agent editing…"
                                : t.agentDone   ? "agent done"
-                               : t.dirty       ? "unsaved"
                                : t.aiHandoff   ? "agent mirror"
                                                : "open";
             ImGui::PushStyleColor(ImGuiCol_Text,

@@ -384,7 +384,7 @@ def test_multi_domain_request_teaches_exact_schema_keys():
         {
             "role": "orchestrator",
             "task_class": "multi_feature_part",
-            "request": "Plan the rocket mission DAG.",
+            "request": "Plan the robot arm mission DAG.",
         },
         {
             "role_id": "orchestrator",
@@ -400,14 +400,3 @@ def test_multi_domain_request_teaches_exact_schema_keys():
     # Example envelope from the enriched scaffold.
     assert "single integrated solid" in req or "serial dependency" in req or '"reason"' in req
     assert "non-empty" in req.lower() or "MUST" in req
-
-
-def test_role_cards_teach_typed_refusal_schema():
-    from services.agent.roles import load_role
-
-    for rid in ("layout_engineer", "orchestrator"):
-        card = load_role(rid)
-        prompt = card.system_prompt or ""
-        assert "domains_considered" in prompt, rid
-        assert "why_flat" in prompt, rid
-        assert "reason" in prompt, rid

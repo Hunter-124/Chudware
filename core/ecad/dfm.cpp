@@ -214,12 +214,7 @@ PadCopper pad_copper(const json& fp, const json& pad) {
 }
 
 bool pad_has_mask_opening(const json& pad, const std::string& side) {
-    std::string mask_layer = (side == "top") ? "F.Mask" : "B.Mask";
-    if (pad.contains("layers") && pad["layers"].is_array()) {
-        for (const auto& l : pad["layers"])
-            if (l.is_string() && l.get<std::string>() == mask_layer) return true;
-    }
-    return false;
+    return schema::pad_has_layer(pad, side == "top" ? "F.Mask" : "B.Mask");
 }
 
 bool point_in_polygon(double px, double py, const std::vector<Point>& poly) {
@@ -580,11 +575,7 @@ void check_mask_sliver(const json& board, const json& rules, json& out) {
             std::string mask_layer = (side == "top") ? "F.Mask" : "B.Mask";
             if (!fp.contains("pads") || !fp["pads"].is_array()) continue;
             for (const auto& pad : fp["pads"]) {
-                bool has_mask = false;
-                if (pad.contains("layers") && pad["layers"].is_array())
-                    for (const auto& l : pad["layers"])
-                        if (l.is_string() && l.get<std::string>() == mask_layer) has_mask = true;
-                if (!has_mask) continue;
+                if (!schema::pad_has_layer(pad, mask_layer)) continue;
                 MaskEntry me;
                 me.pc = pad_copper(fp, pad);
                 me.cu_layer = cu_layer;

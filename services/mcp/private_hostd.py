@@ -96,8 +96,10 @@ def spawn_private_daemon(tmp: Path) -> tuple[subprocess.Popen, str, str] | None:
     if len(os.fsencode(sock)) > _SUN_PATH_MAX:
         last_failure = f"private socket path exceeds AF_UNIX limit: {sock}"
         return None
+    # The engine resolves its isolated fillet/shape-build helper beside the loaded
+    # binary (core/util/process_isolation.cpp), so the copied payload needs it too.
     for f in os.listdir(hostd.parent):
-        if f.endswith(".so") or ".so." in f:
+        if f.endswith(".so") or ".so." in f or f.startswith("chudware-shape-build-worker"):
             shutil.copy2(hostd.parent / f, tmp)
     exe = tmp / "chudware-hostd"
     shutil.copy2(hostd, exe)

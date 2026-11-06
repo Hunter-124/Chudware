@@ -32,30 +32,41 @@ DESTRUCTIVE_OPS: frozenset[str] = frozenset({
     # boolean / material removal
     "boolean", "boolean_cut", "cut", "subtract", "cut_extrude", "cut_revolve",
     "extrude_cut", "revolve_cut",
-    # delete / remove
-    "delete", "delete_feature", "remove", "remove_feature", "suppress_feature",
+    # delete / remove / hide (set_suppressed is the engine op; the rest are spellings models use)
+    "delete", "delete_feature", "remove", "remove_feature", "set_suppressed",
+    "suppress_feature", "unsuppress_feature", "simplify_history",
     # replace / rewrite that drops geometry
     "replace", "replace_feature", "edit_feature",
     # shell / material thin-out
     "shell",
+    # features that cut material, and the rollback bar that hides every later feature
+    "hole", "thread", "set_rollback",
     # pattern over existing geometry (can cascade destroy)
     "pattern", "linear_pattern", "circular_pattern", "pattern_linear",
     "pattern_circular", "mirror",
 })
 
-# Top-level tool names that always count as destructive regardless of args.
+# Top-level tool names that always count as destructive regardless of args. Deleting a
+# feature is an op (it travels through add_features and is classified by is_destructive_tool
+# via DESTRUCTIVE_OPS), not a tool of its own.
 DESTRUCTIVE_TOOLS: frozenset[str] = frozenset({
-    "delete_feature", "remove_feature", "doc_delete_feature",
-    "delete_part", "close_part",  # close can drop unsaved work — treat as destructive
+    "close_part",  # close can drop unsaved work — treat as destructive
 })
 
-# Tools that mutate geometry (battery-before-done only when one of these succeeded).
+# Tools that change a document's model, so a battery taken before them no longer describes it
+# (battery-before-done only when one of these succeeded). Every name must be a registered
+# tool: test_guardrails checks the set against the live registry.
 MUTATING_TOOLS: frozenset[str] = frozenset({
-    "add_features", "doc_apply_ops", "edit_feature", "new_part", "new_assembly",
-    "asm_add_component", "asm_mate", "solve_mates", "part_place", "set_material",
-    "delete_feature", "remove_feature", "regen_resolve",
-    "sketch3d_add", "sketch3d_edit", "convert_face_to_sketch",
-    "sketch_fully_define",
+    "add_features", "new_part", "new_assembly", "import_part",
+    "make_standard_part", "asm_add_component", "asm_mate", "solve_mates", "part_place",
+    "set_material", "heal_body", "regen_resolve", "scad_convert", "simplify_part",
+    "convert_face_to_sketch", "project_into_sketch", "sketch_fully_define",
+    "sketch_auto_constrain", "apply_ascii_edits",
+    "sketch3d_new", "sketch3d_add_curves", "sketch3d_add_constraints", "sketch3d_clear",
+    "sketch3d_ref_vertex", "sketch3d_path_from_points", "sketch3d_pipe",
+    "sketch3d_as_sweep_guide",
+    "set_config_override", "set_config_suppression", "activate_configuration",
+    "add_configuration", "piping_edit",
 }) | DESTRUCTIVE_TOOLS
 
 # Datum names the KERNEL resolves without a feature existing. Mirrors
@@ -120,6 +131,13 @@ MSG_REFS = (
     "HARD guardrail: dangling feature/face refs — cannot apply. "
     "Missing: {missing}. Fix the refs (no waiver for kernel integrity)."
 )
+MSG_TREE_UNAVAILABLE = (
+    "HARD guardrail: the document state could not be read ({reason}), so {what} cannot be "
+    "verified. Retry once the engine is reachable. If you must hand off without that "
+    'evidence, emit terminal handoff JSON {{"done":true,"handoff":{{"waivers":[{{"check":'
+    '"{check}","reason":"<non-empty reason>"}}]}}}}. The waiver is a handoff field, not a '
+    "tool call."
+)
 
 # Kill-switch config key (WI-12). Default true.
 _CFG_AUTO_CHECKPOINT = "hard_guardrails"
@@ -180,6 +198,8 @@ def is_destructive_tool(tool: str, args: dict | None = None) -> bool:
     if tool in DESTRUCTIVE_TOOLS:
         return True
     args = args or {}
+    if tool == "simplify_part":
+        return args.get("apply") is True
     if tool not in ("add_features", "doc_apply_ops"):
         # Other tools: treat as destructive only if name itself is listed.
         return False
@@ -198,7 +218,7 @@ def is_destructive_tool(tool: str, args: dict | None = None) -> bool:
             return True
         # Extrude/revolve with mode=cut
         params = feat.get("params") if isinstance(feat.get("params"), dict) else {}
-        mode = str(params.get("mode") or op.get("mode") or "").lower()
+        mode = str(params.get("mode") or feat.get("mode") or op.get("mode") or "").lower()
         if mode in ("cut", "remove", "subtract"):
             return True
         # Pattern that references an existing feature (pattern-over-existing)
@@ -210,7 +230,7 @@ def is_destructive_tool(tool: str, args: dict | None = None) -> bool:
 
 def is_mutating_tool(tool: str) -> bool:
     """True when a successful call of *tool* obligates battery-before-done."""
-    return tool in MUTATING_TOOLS
+    return tool == "doc_apply_ops" or tool in MUTATING_TOOLS
 
 
 # ---------------------------------------------------------------------------
@@ -397,10 +417,6 @@ def battery_evidence(ledger: Any, calls: list[dict] | None = None) -> Optional[d
         if kind == "battery_result":
             if _battery_result_ok(p):
                 return {"source": "battery_result", "result": p}
-        if kind == "criterion_result":
-            if (p.get("check_tool") or "") == "verify_battery" and \
-                    (p.get("result") or "").upper() == "PASS":
-                return {"source": "criterion_result", "result": p}
         # agent_turn / tool_call
         tool = ""
         res: Any = None
@@ -434,9 +450,9 @@ def _sketch_quality_problem(result: dict) -> Optional[str]:
             or isinstance(dof, (int, float)) and dof > 0
             or result.get("conflicting") or result.get("converged") is False):
         problems.append("sketch solver reports unresolved degrees of freedom or conflicts")
-    closure = result.get("closure") or {}
-    if (closure.get("closed_chains_ok") is False or closure.get("open_endpoints")
-            or result.get("open_endpoints")):
+    from services.verify.battery import sketch_has_unjoined_profile  # noqa: PLC0415
+
+    if sketch_has_unjoined_profile(result):
         problems.append("profile has open endpoints")
     for finding in result.get("findings") or []:
         if not isinstance(finding, dict):
@@ -449,39 +465,48 @@ def _sketch_quality_problem(result: dict) -> Optional[str]:
     return "; ".join(dict.fromkeys(problems)) or None
 
 
+def _sketch3d_quality_problem(result: dict) -> Optional[str]:
+    """Treat observed 3D sketch solver failures like 2D quality failures."""
+    problems = [_sketch_quality_problem(result)]
+    if result.get("skipped_constraints"):
+        problems.append("sketch3d constraints were skipped")
+    return "; ".join(p for p in problems if p) or None
+
+
+
+
 def _battery_result_ok(res: Any) -> bool:
     """Interpret a verify_battery return as PASS.
 
-    Battery returns {scores, findings, ...}. PASS when no failing findings and
-    not explicitly ok:false. String JSON is accepted. Truncated ledger strings
-    that still look like success also pass (best-effort).
+    PASS needs the tool's own verdict: ``verdict == "pass"`` with a non-empty
+    ``coverage.ran`` (the checks that actually ran and scored). A battery that ran nothing
+    (``no_checks_ran``), a fractional score (verdict ``fail``) or any ok:false finding is not a
+    pass. Bare words and unparsable strings are not evidence.
     """
-    if res is None:
-        return False
     if isinstance(res, str):
         s = res.strip()
-        if not s:
+        if not s.startswith("{"):
             return False
-        if s.startswith("{") or s.startswith("["):
-            try:
-                import json as _json  # noqa: PLC0415
-                res = _json.loads(s)
-            except Exception:  # noqa: BLE001
-                return False
-        else:
-            low = s.casefold()
-            return low in {"ok", "pass", "passed", "all checks passed"}
+        try:
+            import json as _json  # noqa: PLC0415
+            res = _json.loads(s)
+        except Exception:  # noqa: BLE001
+            return False
     if not isinstance(res, dict) or not res:
         return False
     if res.get("ok") is False:
+        return False
+    if str(res.get("verdict") or "").strip().lower() != "pass":
+        return False
+    coverage = res.get("coverage")
+    ran = coverage.get("ran") if isinstance(coverage, dict) else None
+    if not isinstance(ran, list) or not ran:
         return False
     sketch_result = (res.get("check_results") or {}).get("check_sketch")
     if isinstance(sketch_result, dict) and not sketch_result.get("skipped"):
         if _sketch_quality_problem(sketch_result) or sketch_result.get("failures"):
             return False
     if res.get("pinned_only") is True or res.get("fully_defined") is False:
-        return False
-    if not any(key in res for key in ("ok", "scores", "findings", "checks")):
         return False
     findings = res.get("findings")
     if isinstance(findings, list):
@@ -493,13 +518,12 @@ def _battery_result_ok(res: Any) -> bool:
             if str(f.get("severity") or "").lower() in ("fail", "error", "blocker"):
                 return False
     scores = res.get("scores")
-    if isinstance(scores, dict) and scores:
-        # Any zero score is a fail (binary checks).
-        if any(float(v) <= 0.0 for v in scores.values() if v is not None):
-            # Still allow if findings empty and ok explicitly true
-            if res.get("ok") is True and not findings:
-                return True
-            if findings:
+    if isinstance(scores, dict):
+        for value in scores.values():
+            try:
+                if float(value) < 1.0:
+                    return False
+            except (TypeError, ValueError):
                 return False
     return True
 
@@ -587,58 +611,82 @@ def _interference_result_clean(res: Any) -> bool:
 
 
 def _battery_covers_interference(res: Any) -> bool:
+    """True when a battery result scored check_interference clean (a binary 1.0)."""
+    if isinstance(res, str):
+        if not res.strip().startswith("{"):
+            return False
+        try:
+            import json as _json  # noqa: PLC0415
+            res = _json.loads(res)
+        except Exception:  # noqa: BLE001
+            return False
     if not isinstance(res, dict):
-        if isinstance(res, str) and "check_interference" in res:
-            return "fail" not in res.lower() or '"check_interference": 1' in res
         return False
     scores = res.get("scores") or {}
-    if "check_interference" in scores:
-        try:
-            return float(scores["check_interference"]) > 0
-        except (TypeError, ValueError):
-            return False
-    findings = res.get("findings") or []
-    for f in findings:
-        if isinstance(f, dict) and f.get("check") == "check_interference" and f.get("ok") is False:
-            return False
-    # Battery ran without that check → does not cover
-    return "check_interference" in (res.get("scores") or {})
+    if not isinstance(scores, dict) or "check_interference" not in scores:
+        return False  # the battery ran without that check, so it does not cover it
+    try:
+        return float(scores["check_interference"]) >= 1.0
+    except (TypeError, ValueError):
+        return False
 
 
 # ---------------------------------------------------------------------------
 # Doc inspection helpers (orphan sketches / assembly kind)
 # ---------------------------------------------------------------------------
 
+class DocTreeUnavailable(RuntimeError):
+    """The document tree could not be read, so a done-gate check cannot be decided."""
+
+
 def _doc_tree(doc_id: str | None,
-              tree_provider: Callable[[str], dict] | None = None) -> dict:
+              tree_provider: Callable[[str], dict] | None = None,
+              *, strict: bool = False) -> dict:
+    """The document tree; ``{}`` when there is no document to read.
+
+    In strict mode, an unreadable or missing tree raises DocTreeUnavailable.
+    """
     if not doc_id:
         return {}
-    if tree_provider is not None:
-        try:
-            return tree_provider(doc_id) or {}
-        except Exception:  # noqa: BLE001
-            return {}
     try:
-        from services.mcp import core_bridge as cb  # noqa: PLC0415
-        resp = cb.call("doc_tree", {"doc_id": doc_id}) or {}
-        return resp.get("tree") or resp or {}
-    except Exception:  # noqa: BLE001
+        if tree_provider is not None:
+            resp = tree_provider(doc_id)
+        else:
+            from services.mcp import core_bridge as cb  # noqa: PLC0415
+            resp = cb.call("doc_tree", {"doc_id": doc_id})
+        if not isinstance(resp, dict) or resp.get("ok") is False or resp.get("_is_error"):
+            raise RuntimeError(str(resp.get("error") if isinstance(resp, dict) else
+                                   "doc_tree returned no object"))
+        tree = resp.get("tree", resp if tree_provider is not None else None)
+        if not isinstance(tree, dict):
+            raise RuntimeError("doc_tree returned no tree")
+        return tree
+    except Exception as exc:  # noqa: BLE001
+        if strict:
+            raise DocTreeUnavailable(f"{type(exc).__name__}: {exc}") from exc
         return {}
+
+
+#: A feature's own identity is not a reference to another feature.
+_OWN_IDENTITY_KEYS: frozenset[str] = frozenset({"id", "name", "type", "folder"})
 
 
 def list_orphan_sketches(doc_id: str | None,
                          tree_provider: Callable[[str], dict] | None = None,
-                         tree: dict | None = None) -> list[str]:
-    """Return sketch feature ids that are not consumed by a later feature.
+                         tree: dict | None = None,
+                         *, strict: bool = False) -> list[str]:
+    """Return sketch feature ids that no other feature consumes.
 
-    A sketch is consumed when another feature's refs mention its id/name.
+    A sketch is consumed when another feature's refs/params name its id or name EXACTLY. A
+    substring match read "f1" as consumed by a feature that names "f10", so orphan
+    detection stopped working past nine features.
     """
-    t = tree if tree is not None else _doc_tree(doc_id, tree_provider)
+    t = tree if tree is not None else _doc_tree(doc_id, tree_provider, strict=strict)
     features = t.get("features") if isinstance(t, dict) else None
     if not isinstance(features, list):
         return []
     sketches: list[dict] = []
-    consumers_text = []
+    consumed: set[str] = set()
     for f in features:
         if not isinstance(f, dict):
             continue
@@ -646,9 +694,7 @@ def list_orphan_sketches(doc_id: str | None,
         if ftype in ("sketch", "sketch3d"):
             sketches.append(f)
         else:
-            # Collect all stringified refs from non-sketch features
-            consumers_text.append(_flatten_refs(f))
-    blob = "\n".join(consumers_text)
+            consumed |= _ref_tokens({k: v for k, v in f.items() if k not in _OWN_IDENTITY_KEYS})
     orphans: list[str] = []
     for s in sketches:
         sid = str(s.get("id") or "")
@@ -658,64 +704,79 @@ def list_orphan_sketches(doc_id: str | None,
         # Explicitly deleted / suppressed sketches are not orphans
         if s.get("suppressed") or s.get("deleted"):
             continue
-        used = (sid and sid in blob) or (name and name in blob)
+        used = (sid and sid in consumed) or (name and name in consumed)
         if not used:
             orphans.append(sid or name)
     return orphans
 
 
-def _flatten_refs(obj: Any) -> str:
-    """Flatten feature dict to a string for cheap id/name membership checks."""
-    parts: list[str] = []
+def _ref_tokens(obj: Any) -> set[str]:
+    """Every string in a feature's refs/params, for EXACT id/name membership checks."""
+    out: set[str] = set()
 
     def walk(x: Any) -> None:
         if isinstance(x, dict):
-            for k, v in x.items():
-                if k in ("id", "name", "feature", "sketch", "profile", "profile_sketch",
-                         "path", "guide") and isinstance(v, (str, int)):
-                    parts.append(str(v))
-                else:
-                    walk(v)
-        elif isinstance(x, list):
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, (list, tuple)):
             for i in x:
                 walk(i)
-        elif isinstance(x, (str, int)):
-            parts.append(str(x))
+        elif isinstance(x, str):
+            out.add(x)
 
     walk(obj)
-    return " ".join(parts)
+    return out
+
+
+def _engine_body_count(doc_id: str) -> int | None:
+    """Solid bodies in the document, from the engine's world-body roster."""
+    from services.mcp import core_bridge as cb  # noqa: PLC0415
+    bodies = (cb.call("asm_world_bodies", {"doc_id": doc_id, "explode": False}) or {}
+              ).get("bodies")
+    if not isinstance(bodies, list):
+        return None
+    # A compiled body may be a compound of several independent physical solids.
+    return sum(max(1, len(row.get("source_ordinals") or []))
+               if isinstance(row, dict) else 1 for row in bodies)
 
 
 def is_assembly_or_multibody(doc_id: str | None,
                             tree_provider: Callable[[str], dict] | None = None,
                             tree: dict | None = None,
-                            handoff: dict | None = None) -> bool:
-    """True when the active doc is an assembly or multi-body part."""
+                            handoff: dict | None = None,
+                            *, strict: bool = False,
+                            bodies_provider: Callable[[str], int | None] | None = None,
+                            ) -> bool:
+    """True when the active doc is an assembly or a part with more than one solid body.
+
+    The tree carries a ``schema`` ("aicad.asm/1" for an assembly) but no body list or kind
+    (core/doc/session.cpp blank_part / blank_assembly), so a part's body count comes from the
+    engine's world-body roster. ``strict`` makes an unreadable document raise
+    ``DocTreeUnavailable`` instead of reading as "not an assembly".
+    """
     if isinstance(handoff, dict):
         kind = str(handoff.get("doc_kind") or handoff.get("kind") or "").lower()
         if kind in ("assembly", "asm", "multi_body", "multibody"):
             return True
         if handoff.get("is_assembly") is True:
             return True
-    t = tree if tree is not None else _doc_tree(doc_id, tree_provider)
-    if not isinstance(t, dict):
+    t = tree if tree is not None else _doc_tree(doc_id, tree_provider, strict=strict)
+    if not isinstance(t, dict) or not t:
         return False
-    kind = str(t.get("kind") or t.get("doc_kind") or t.get("type") or "").lower()
-    if kind in ("assembly", "asm"):
+    if t.get("schema") == "aicad.asm/1":
         return True
-    bodies = t.get("bodies") or t.get("body_ids") or []
-    if isinstance(bodies, list) and len(bodies) > 1:
-        return True
-    comps = t.get("components") or t.get("instances") or []
-    if isinstance(comps, list) and len(comps) > 1:
-        return True
-    body_count = t.get("body_count")
+    if not doc_id:
+        return False
     try:
-        if body_count is not None and int(body_count) > 1:
-            return True
-    except (TypeError, ValueError):
-        pass
-    return False
+        count = (bodies_provider(doc_id) if bodies_provider is not None
+                 else _engine_body_count(doc_id))
+    except Exception as exc:  # noqa: BLE001
+        if strict:
+            raise DocTreeUnavailable(f"{type(exc).__name__}: {exc}") from exc
+        return False
+    if count is None and strict:
+        raise DocTreeUnavailable("world-body roster is unavailable")
+    return count is not None and count > 1
 
 
 def resolve_active_doc_id(handoff: dict | None = None,
@@ -799,6 +860,10 @@ def check_refs_resolve_ids(ops: list[dict], known_ids: set[str],
     known_names = known_names or set()
     missing: list[str] = []
     declared: set[str] = set()
+    # Use the CAD normalizer's exact SID grammar and supported slots; a SID is
+    # not a feature ID and must be checked against the selected live document.
+    from services.mcp.cad_doc_tools import _bare_sid, _norm_datum, _SID_REF_SLOTS
+
 
     def _resolves(ref: str) -> bool:
         # A reserved datum resolves in the KERNEL without any feature existing,
@@ -806,6 +871,13 @@ def check_refs_resolve_ids(ops: list[dict], known_ids: set[str],
         # is a category error, and a waiver-less one.
         return (ref in known_ids or ref in known_names or ref in declared
                 or ref in RESERVED_DATUMS)
+
+    def _resolves_ref(ref: str) -> bool:
+        # The documented plane/axis spellings (XY, XZ, YZ, front, z, ...) are rewritten to
+        # the reserved tokens by add_features BEFORE the engine sees them, but this guard
+        # sees the raw args: refs.plane:"XY" is documented and must not be hard-blocked.
+        # (A destructive op's target id keeps the strict _resolves.)
+        return _resolves(ref) or _norm_datum(ref) in RESERVED_DATUMS
 
     # Sketch-scoped ops (sketch_add_constraint / sketch_set_dim / sketch_trim / …)
     # name SKETCH ENTITY handles in `refs` — "e2", "e1.p1", "c4". Those live in a
@@ -826,28 +898,30 @@ def check_refs_resolve_ids(ops: list[dict], known_ids: set[str],
         # Also scan top-level refs on the op
         top_refs = op.get("refs") if isinstance(op.get("refs"), dict) else {}
         sketch_scoped = _is_sketch_scoped(op)
-        for ref_map in (refs, top_refs):
-            for _key, ref_val in ref_map.items():
-                candidates: list[Any] = []
-                if isinstance(ref_val, dict):
-                    candidates.append(ref_val.get("id") or ref_val.get("feature"))
-                elif isinstance(ref_val, str):
-                    candidates.append(ref_val)
-                elif isinstance(ref_val, list):
-                    for item in ref_val:
-                        if isinstance(item, dict):
-                            candidates.append(item.get("id") or item.get("feature"))
-                        elif isinstance(item, str):
-                            candidates.append(item)
-                for ref_id in candidates:
+        kind = str(op.get("op") or op.get("kind") or "").lower()
+        for ref_map, topology_refs in (
+            (refs, kind in ("", "add", "add_feature", "create", "create_feature",
+                            "insert_feature", "edit_feature")),
+            (top_refs, kind == "edit_feature" or
+             (kind in ("", "add_feature") and not feat)),
+        ):
+            for slot, ref_val in ref_map.items():
+                members = ref_val if isinstance(ref_val, list) else [ref_val]
+                for member in members:
+                    ref_id = (member.get("id") or member.get("feature")
+                              if isinstance(member, dict) else member)
                     if not ref_id or not isinstance(ref_id, str):
                         continue
                     if ref_id.startswith("$"):
                         continue  # pending id map in same batch
                     if sketch_scoped and _SKETCH_HANDLE_RE.match(ref_id):
                         continue  # a sketch entity/constraint handle, not a feature id
+                    if (topology_refs and slot in _SID_REF_SLOTS
+                            and isinstance(member, str) and _bare_sid(member)):
+                        # {"id": ...} remains a feature reference.
+                        continue
                     # Plain-English geometry queries are not stable ids
-                    if _resolves(ref_id):
+                    if _resolves_ref(ref_id):
                         continue
                     # Heuristic: words like "top"/"face" are query predicates, not ids
                     if _looks_like_geom_query(ref_id):
@@ -867,7 +941,8 @@ def check_refs_resolve_ids(ops: list[dict], known_ids: set[str],
             # only for geometry-SELECTOR args, never a destructive op's target.
             is_destructive_target = kind in ("edit_feature", "delete_feature",
                                              "remove_feature", "delete", "remove",
-                                             "suppress_feature")
+                                             "set_suppressed", "suppress_feature",
+                                             "unsuppress_feature")
             if not is_destructive_target and _looks_like_geom_query(rid):
                 continue
             if is_destructive_target or id_key != "id":
@@ -993,11 +1068,11 @@ def take_auto_checkpoint(doc_id: str | None,
                          ledger: Any = None,
                          actor: str = "guardrails",
                          checkpoint_fn: Callable[..., Any] | None = None,
-                         vault_bound: bool = False,
                          ) -> tuple[bool, str]:
     """Silent checkpoint. Returns (ok, reason). Failure blocks the destructive call.
 
-    Prefers doc_checkpoint; uses plm_checkpoint when *vault_bound* is True.
+    Snapshots through the engine's doc_checkpoint. A call that names no document has nothing
+    to snapshot: it proceeds UNPROTECTED and the ledger records a waiver, never a pass.
     *checkpoint_fn* is injectable for tests: ``(doc_id, trigger_tool) -> result``.
     """
     if checkpoint_fn is not None:
@@ -1026,40 +1101,15 @@ def take_auto_checkpoint(doc_id: str | None,
             return False, reason
 
     if not doc_id:
-        # No doc to checkpoint — pass (nothing to protect) but still log.
-        emit_auto_checkpoint(ledger, trigger_tool, actor=actor,
-                             extra={"doc_id": None, "via": "skipped_no_doc"})
-        emit_hard_guardrail(ledger, "auto_checkpoint", "passed",
-                            reason="no doc_id; nothing to checkpoint",
+        # No document to snapshot: the call proceeds UNPROTECTED. Say so (a waiver); a pass
+        # would claim a checkpoint protected it.
+        emit_hard_guardrail(ledger, "auto_checkpoint", "waived",
+                            reason=f"no doc_id on the {trigger_tool} call; the document "
+                                   "was NOT checkpointed",
                             actor=actor)
         return True, "no_doc"
 
     try:
-        if vault_bound:
-            try:
-                from services.mcp import core_bridge as cb  # noqa: PLC0415
-                # Prefer plm when vault is bound; fall back to doc_checkpoint.
-                try:
-                    # plm_checkpoint is an MCP tool; use engine doc_checkpoint as
-                    # the always-available cheap path, then optional plm.
-                    ck = cb.call("doc_checkpoint", {"doc_id": doc_id})
-                    if isinstance(ck, dict) and ck.get("_is_error"):
-                        raise RuntimeError(ck.get("error") or "doc_checkpoint error")
-                    emit_auto_checkpoint(ledger, trigger_tool, actor=actor,
-                                         extra={"doc_id": doc_id, "via": "doc_checkpoint",
-                                                "vault_bound": True})
-                    emit_hard_guardrail(ledger, "auto_checkpoint", "passed",
-                                        reason=f"checkpoint before {trigger_tool}",
-                                        actor=actor)
-                    return True, "ok"
-                except Exception:
-                    raise
-            except Exception as exc:
-                reason = str(exc)
-                emit_hard_guardrail(ledger, "auto_checkpoint", "blocked",
-                                    reason=reason, actor=actor)
-                return False, reason
-
         from services.mcp import core_bridge as cb  # noqa: PLC0415
         ck = cb.call("doc_checkpoint", {"doc_id": doc_id})
         if isinstance(ck, dict) and (ck.get("_is_error") or ck.get("ok") is False):
@@ -1119,7 +1169,6 @@ def checkpoint_verdict(tool: str, args: dict | None, *,
                        actor: str = "guardrails",
                        cfg: dict | None = None,
                        checkpoint_fn: Callable[..., Any] | None = None,
-                       vault_bound: bool = False,
                        ) -> Optional[GuardVerdict]:
     """Shared checkpoint attempt, failure memo, and bounded escape policy.
 
@@ -1140,7 +1189,7 @@ def checkpoint_verdict(tool: str, args: dict | None, *,
         doc_id = str(args["doc_id"])
     ok, reason = take_auto_checkpoint(
         doc_id, tool, ledger=ledger, actor=actor,
-        checkpoint_fn=checkpoint_fn, vault_bound=vault_bound,
+        checkpoint_fn=checkpoint_fn,
     )
     key = doc_id or ""
     if ok:
@@ -1184,14 +1233,13 @@ def pre_dispatch_checkpoint(tool: str, args: dict | None, *,
                             actor: str = "guardrails",
                             cfg: dict | None = None,
                             checkpoint_fn: Callable[..., Any] | None = None,
-                            vault_bound: bool = False,
                             ) -> Optional[GuardVerdict]:
     """WI-12 destructive classifier followed by the shared checkpoint verdict."""
     if not is_destructive_tool(tool, args):
         return None
     return checkpoint_verdict(
         tool, args, ledger=ledger, actor=actor, cfg=cfg,
-        checkpoint_fn=checkpoint_fn, vault_bound=vault_bound,
+        checkpoint_fn=checkpoint_fn,
     )
 
 
@@ -1228,7 +1276,6 @@ def pre_dispatch(tool: str, args: dict | None, *,
                  actor: str = "guardrails",
                  cfg: dict | None = None,
                  checkpoint_fn: Callable[..., Any] | None = None,
-                 vault_bound: bool = False,
                  tree_provider: Callable[[str], dict] | None = None,
                  known: tuple[set[str], set[str]] | None = None,
                  ) -> Optional[GuardVerdict]:
@@ -1238,7 +1285,7 @@ def pre_dispatch(tool: str, args: dict | None, *,
     if v is not None:
         return v
     v = pre_dispatch_checkpoint(tool, args, ledger=ledger, actor=actor, cfg=cfg,
-                                checkpoint_fn=checkpoint_fn, vault_bound=vault_bound)
+                                checkpoint_fn=checkpoint_fn)
     if v is not None:
         return v
     return None
@@ -1292,6 +1339,18 @@ def check_verify_battery_before_done(
                         message=MSG_VERIFY_BATTERY)
 
 
+def _tree_unavailable(name: str, exc: DocTreeUnavailable, what: str, check: str,
+                      waiver: Optional[dict], ledger: Any, actor: str) -> GuardVerdict:
+    """Fail closed: a done-gate that cannot read the document must not read as a pass."""
+    if waiver is not None:
+        reason = waiver["reason"]
+        emit_hard_guardrail(ledger, name, "waived", reason=reason, actor=actor)
+        return GuardVerdict(ok=True, name=name, outcome="waived", reason=reason)
+    msg = MSG_TREE_UNAVAILABLE.format(reason=exc, what=what, check=check)
+    emit_hard_guardrail(ledger, name, "blocked", reason=msg, actor=actor)
+    return GuardVerdict(ok=False, name=name, outcome="blocked", reason=msg, message=msg)
+
+
 def check_interference_before_done(
     handoff: dict | None,
     *,
@@ -1305,19 +1364,22 @@ def check_interference_before_done(
 ) -> GuardVerdict:
     """WI-13: check_interference before assembly/multi-body done."""
     name = "check_interference"
-    is_asm = force_assembly if force_assembly is not None else is_assembly_or_multibody(
-        doc_id, tree_provider=tree_provider, tree=tree, handoff=handoff,
-    )
+    # also accept interference / assembly_interference aliases
+    waiver = (find_waiver(handoff, "check_interference")
+              or find_waiver(handoff, "interference"))
+    try:
+        is_asm = force_assembly if force_assembly is not None else is_assembly_or_multibody(
+            doc_id, tree_provider=tree_provider, tree=tree, handoff=handoff, strict=True,
+        )
+    except DocTreeUnavailable as exc:
+        return _tree_unavailable(name, exc, "whether this is an assembly that needs a clash "
+                                 "check", "check_interference", waiver, ledger, actor)
     if not is_asm:
         emit_hard_guardrail(ledger, name, "passed",
                             reason="not assembly/multi-body", actor=actor)
         return GuardVerdict(ok=True, name=name, outcome="passed",
                             reason="not assembly")
 
-    waiver = find_waiver(handoff, "check_interference")
-    if waiver is None:
-        # also accept interference / assembly_interference aliases
-        waiver = find_waiver(handoff, "interference")
     if waiver is not None:
         reason = waiver["reason"]
         emit_hard_guardrail(ledger, name, "waived", reason=reason, actor=actor)
@@ -1350,8 +1412,15 @@ def check_no_orphan_sketch_at_done(
 ) -> GuardVerdict:
     """WI-14: every sketch must be consumed or deleted (or waived per-id)."""
     name = "orphan_sketch"
+    waived_map = find_orphan_waivers(handoff)
     if orphan_ids is None:
-        orphan_ids = list_orphan_sketches(doc_id, tree_provider=tree_provider, tree=tree)
+        try:
+            orphan_ids = list_orphan_sketches(doc_id, tree_provider=tree_provider, tree=tree,
+                                              strict=True)
+        except DocTreeUnavailable as exc:
+            blanket = waived_map.get("*")
+            return _tree_unavailable(name, exc, "which sketches are orphaned", "orphan_sketch",
+                                     {"reason": blanket} if blanket else None, ledger, actor)
 
     if not orphan_ids:
         emit_hard_guardrail(ledger, name, "passed",
@@ -1359,7 +1428,6 @@ def check_no_orphan_sketch_at_done(
         return GuardVerdict(ok=True, name=name, outcome="passed",
                             reason="no orphans")
 
-    waived_map = find_orphan_waivers(handoff)
     remaining = []
     for sid in orphan_ids:
         if "*" in waived_map or sid in waived_map:
@@ -1377,6 +1445,18 @@ def check_no_orphan_sketch_at_done(
     return GuardVerdict(ok=False, name=name, outcome="blocked",
                         reason=msg, message=msg)
 
+
+#: Tools whose results carry a sketch's quality; verify_battery's check_sketch rows count too.
+_SKETCH_CHECK_TOOLS: frozenset[str] = frozenset(
+    {"check_sketch", "sketch_health", "check_sketch3d", "verify_battery"})
+
+
+def _call_succeeded(call: dict) -> bool:
+    result = call.get("result")
+    return call.get("ok", True) is not False and not (
+        isinstance(result, dict) and result.get("ok") is False)
+
+
 def check_sketch_quality_before_done(
     handoff: dict | None,
     *,
@@ -1387,22 +1467,37 @@ def check_sketch_quality_before_done(
     tree: dict | None = None,
     actor: str = "guardrails",
 ) -> GuardVerdict:
-    """Do not discard observed failures; no new check is required for unseen sketches."""
-    latest: dict[tuple[str, str], Optional[str]] = {}
+    """Do not discard observed failures; no new check is required for unseen sketches.
+
+    Each check is stamped with the document revision it read: the count of successful
+    document-editing calls before it. A passing check followed by edits is stale.
+    """
+    import json  # noqa: PLC0415
+
+    edits: dict[str, int] = {}  # doc id -> successful edits so far ("" = document not named)
+    latest: dict[tuple[str, str], tuple[Optional[str], int, Any, bool]] = {}
+
+    def revision_of(did: str) -> int:
+        return (edits.get(did, 0) + edits.get("", 0)) if did else sum(edits.values())
+
     for call in _tool_call_events(ledger) + (calls or []):
         tool = call.get("tool") or call.get("name")
-        if tool not in ("check_sketch", "sketch_health", "verify_battery"):
-            continue
+        args = call.get("args") if isinstance(call.get("args"), dict) else {}
         result = call.get("result")
+        if is_mutating_tool(str(tool or "")) and _call_succeeded(call):
+            edited = str(args.get("doc_id") or (
+                result.get("doc_id") if isinstance(result, dict) else "") or "")
+            edits[edited] = edits.get(edited, 0) + 1
+            continue
+        if tool not in _SKETCH_CHECK_TOOLS:
+            continue
         if isinstance(result, str):
-            import json  # noqa: PLC0415
             try:
                 result = json.loads(result)
             except (ValueError, TypeError):
                 continue
         if not isinstance(result, dict):
             continue
-        args = call.get("args") or {}
         if tool == "verify_battery":
             result = (result.get("check_results") or {}).get("check_sketch")
             if not isinstance(result, dict) or result.get("skipped"):
@@ -1410,6 +1505,8 @@ def check_sketch_quality_before_done(
             rows = result.get("sketches") or [result]
         else:
             rows = [result]
+        problem_of = (_sketch3d_quality_problem if tool == "check_sketch3d"
+                      else _sketch_quality_problem)
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -1417,24 +1514,52 @@ def check_sketch_quality_before_done(
                       or doc_id or "")
             if doc_id and did and doc_id != did:
                 continue
-            sketch = str(row.get("sketch") or args.get("sketch") or "")
+            sketch = str(row.get("sketch") or args.get("sketch") or args.get("sketch3d_id")
+                         or "")
             if not sketch:
                 continue
             if not any(key in row for key in
                        ("fully_defined", "pinned_only", "status", "dof", "closure", "findings")):
                 continue
-            latest[(did, sketch)] = _sketch_quality_problem(row)
-    if tree is None and any(latest.values()):
+            problem = problem_of(row)
+            key = (did, sketch)
+            latest[key] = (problem, revision_of(did), row.get("revision"),
+                           row.get("revision_stale") is True)
+
+    verdicts: dict[tuple[str, str], Optional[str]] = {}
+    current_revisions: dict[str, Any] = {}
+    for key, (problem, revision, checked_revision, stale) in latest.items():
+        if problem:
+            verdicts[key] = problem
+            continue
+        did = key[0]
+        if checked_revision is not None and did not in current_revisions:
+            try:
+                if tree_provider is not None:
+                    current = tree_provider(did)
+                else:
+                    from services.mcp import core_bridge as cb  # noqa: PLC0415
+                    current = cb.call("doc_tree", {"doc_id": did})
+                current_revisions[did] = current.get("revision")
+            except Exception:  # noqa: BLE001
+                current_revisions[did] = None
+        if (stale or revision < revision_of(did)
+                or (checked_revision is not None
+                    and current_revisions.get(did) != checked_revision)):
+            verdicts[key] = "sketch check predates later document edits or its revision is unavailable; recheck the sketch"
+        else:
+            verdicts[key] = None
+    if tree is None and any(verdicts.values()):
         tree = _doc_tree(doc_id, tree_provider)
     if tree is not None and isinstance(tree.get("features"), list):
         active = {str(f.get("id")) for f in tree["features"] if isinstance(f, dict)
                   and not f.get("deleted") and not f.get("suppressed")}
-        latest = {key: problem for key, problem in latest.items() if key[1] in active}
+        verdicts = {key: problem for key, problem in verdicts.items() if key[1] in active}
     remaining: dict[str, str] = {}
     waiver_reasons: list[str] = []
     blanket = next((w for w in _waivers_from_handoff(handoff)
                     if w["check"].lower() == "sketch_quality" and w["reason"].strip()), None)
-    for (_, sketch), problem in latest.items():
+    for (_, sketch), problem in verdicts.items():
         if not problem:
             continue
         waiver = find_waiver(handoff, f"sketch_quality:{sketch}") or blanket
@@ -1454,6 +1579,50 @@ def check_sketch_quality_before_done(
     )
     emit_hard_guardrail(ledger, name, "blocked", reason=message, actor=actor)
     return GuardVerdict(ok=False, name=name, outcome="blocked", reason=message, message=message)
+
+
+def check_rollback_before_done(
+    handoff: dict | None, *, doc_id: str | None = None,
+    tree_provider: Callable[[str], dict] | None = None,
+    tree: dict | None = None, ledger: Any = None,
+    actor: str = "guardrails",
+) -> GuardVerdict:
+    """Require a visible disclosure if a handoff intentionally remains partial."""
+    name = "active_rollback"
+    try:
+        t = tree if tree is not None else _doc_tree(doc_id, tree_provider, strict=True)
+    except DocTreeUnavailable as exc:
+        return _tree_unavailable(name, exc, "whether the history is rolled back",
+                                 "active_rollback", find_waiver(handoff, name), ledger, actor)
+    features = t.get("features") if isinstance(t, dict) else None
+    after = t.get("rollback_after") if isinstance(t, dict) else None
+    hidden = []
+    past_bar = after == "start"
+    if isinstance(after, str) and isinstance(features, list):
+        for feature in features:
+            if not isinstance(feature, dict):
+                continue
+            fid = str(feature.get("id") or "")
+            if past_bar and fid:
+                hidden.append(fid)
+            if fid == after:
+                past_bar = True
+    if not hidden:
+        return GuardVerdict(ok=True, name=name, outcome="passed", reason="no hidden history")
+    summary = " ".join(str((handoff or {}).get(k) or "") for k in ("summary", "response"))
+    disclosed = ("rollback" in summary.lower() or "rolled back" in summary.lower())
+    disclosed = disclosed and all(
+        re.search(r"(?<![A-Za-z0-9_])" + re.escape(fid) + r"(?![A-Za-z0-9_])", summary)
+        for fid in hidden)
+    message = (
+        f"WARNING: history is rolled back after {after}; unbuilt features: {', '.join(hidden)}. "
+        "Repair them and set_rollback after:null before calling the model complete. "
+        "If intentionally handing off an incomplete model, explicitly say it is rolled back "
+        "and list every unbuilt feature ID in the handoff summary."
+    )
+    outcome = "waived" if disclosed else "blocked"
+    emit_hard_guardrail(ledger, name, outcome, reason=message, actor=actor)
+    return GuardVerdict(ok=disclosed, name=name, outcome=outcome, reason=message, message=message)
 
 
 
@@ -1476,6 +1645,13 @@ def check_done(
     skip = skip or set()
     if doc_id is None:
         doc_id = resolve_active_doc_id(handoff, calls, ledger=ledger)
+    if "active_rollback" not in skip:
+        v = check_rollback_before_done(
+            handoff, doc_id=doc_id, tree_provider=tree_provider, tree=tree,
+            ledger=ledger, actor=actor,
+        )
+        if not v.ok:
+            return v
 
     if "verify_battery" not in skip:
         v = check_verify_battery_before_done(

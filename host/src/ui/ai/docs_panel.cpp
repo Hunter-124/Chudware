@@ -291,11 +291,8 @@ void collectArtifacts(const AppState& st, const std::string& projectDir,
                 std::istringstream iss(blob);
                 std::string line;
                 while (std::getline(iss, line)) {
-                    if (line.empty()) continue;
-                    const size_t tab = line.find('\t');
                     DocEntry e;
-                    e.kind = tab == std::string::npos ? "file" : line.substr(0, tab);
-                    e.path = tab == std::string::npos ? line : line.substr(tab + 1);
+                    if (!artifactLine(line, &e.kind, &e.path)) continue;
                     e.tool = a.title.empty() ? a.stage : a.title;
                     if (e.path.empty() ||
                         !agentDocInProject(e.path, conv.projectDir, projectDir) ||

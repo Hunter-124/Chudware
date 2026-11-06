@@ -12,7 +12,7 @@ This revision supersedes every earlier amendment.
 - PrusaSlicer fork remains an out-of-process AGPL sidecar with exact corresponding-source artifacts.
 
 ## Acceptance criteria
-1. `scripts/gate.sh` green. SKIPs only for documented absent prerequisites: OCCT, runtime venv, emsdk, `CHUDWARE_SLICER_BIN`, or an optional twin binary.
+1. `scripts/gate.sh` is the authoritative full gate. Skipped or unexercised stages are not evidence of a pass.
 2. Every device reports explicit truth levels: `plan`, `generate`, `post`, `parse`, `simulate`, `monitor`, `transport`, `execute`, `safety_integration`. `assumed` disables actions exactly like absent and names the missing level.
 3. No verdict word without its complete check set. Verdict is computed, revision/artifact bound, flips unknown on edits, and Live mode reads the frozen approval binding rather than editable planning state.
 4. Sole external freshness shape is `FreshValue<T>{v,state,t_mono_ns,seq,age_ms,ttl_ms,src,why,last_ok?}`. `v` is null unless `state==ok`; last-good is display-only. Sequence gaps force unknown. Twin remains tick-domain internally; publisher stamps the external envelope.
@@ -31,4 +31,4 @@ This revision supersedes every earlier amendment.
 17. No GPL/AGPL/non-commercial code, weights, or datasets are linked or copied into the permissively licensed core. Fast gate rejects in-process libslic3r/CuraEngine coupling. Every distributed slicer sidecar has matching source, hashes, build scripts, notices, and a live source URL.
 18. Emulator progression is capability-gated: hardware-free E0-E3 in normal gates; pilot E6 before `execute` is advertised. No capability level may exceed the highest emulator/hardware stage actually passed.
 19. Tier-0 registers, guard source tables, prerequisite/corroborating/artifact-dependent columns, invalidation events, and durable schemas are contract-tested as policy boundaries.
-20. Major waves record their change summary and update the relevant developer documentation in the same green commit.
+20. Update the as-built map and relevant developer documentation when manufacturing behavior or contracts change.

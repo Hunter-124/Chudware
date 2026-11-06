@@ -121,10 +121,10 @@ def test_stepper_motor_covers_nema_frames_and_step_angles():
     nema17 = [rec for rec in records if rec["params"]["nema_size"] == 17]
     assert any(rec["params"]["body_square_mm"] == pytest.approx(42.3) for rec in nema17)
     assert any(rec["params"]["shaft_dia_mm"] == pytest.approx(5.0) for rec in nema17)
-    # Search text carries the synonyms users actually type.
-    titles = " ".join(rec["title"].lower() for rec in nema17)
+    search_text = " ".join(" ".join(rec["aliases"]).lower() for rec in nema17)
     for token in ("nema17", "nema 17", "17hs", "stepper motor"):
-        assert token in titles
+        assert token in search_text
+    assert all("bipolar" not in rec["title"].lower() for rec in nema17)
 
 
 def test_belts_pulleys_covers_profiles_and_geometry():
@@ -138,9 +138,10 @@ def test_belts_pulleys_covers_profiles_and_geometry():
     for rec in belts:
         p = rec["params"]
         assert p["length_mm"] == pytest.approx(p["teeth"] * p["pitch_mm"])
-    titles = " ".join(rec["title"].lower() for rec in records)
+    search_text = " ".join(" ".join(rec["aliases"]).lower() for rec in records)
     for token in ("gt2", "idler pulley", "toothed belt", "timing pulley"):
-        assert token in titles
+        assert token in search_text
+    assert all("idler pulley" not in rec["title"].lower() for rec in records)
 
 
 def test_shaft_couplings_covers_couplers_and_collars():

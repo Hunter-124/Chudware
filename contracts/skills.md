@@ -1,7 +1,9 @@
-# Contract: Copilot Skills — v1
+# Contract: Copilot Skills — v2
 
 Append-only. Maintainer-owned. Producer: `services/agent/worker_rpc.py`.
 Consumers: agent loop (context injection), chat slash-commands, AI-settings skills editor, MCP.
+Revision v2 corrects the builtin inventory and the online compaction owner; the skill
+discovery and session semantics are unchanged.
 
 Skills are folders of instructions + resources the copilot (and humans) can invoke,
 modeled on Anthropic Agent Skills / omp.sh progressive disclosure:
@@ -19,16 +21,17 @@ metadata always in context (~100 tokens/skill), full body injected on activation
 - Worker RPCs: `skills_list {} -> {ok, skills:[{name, description, source, inject, triggers}]}`,
   `skills_get {name} -> {ok, body, files:[..]}`, `skills_save {name, body} -> {ok}` (user dir only),
   `skills_delete {name}` (user dir only).
-- Builtin set (v1): edit-part, edit-assembly, edit-sketch, edit-feature, simulate,
-  assess-model-state, source-parts, ecad-board, skill-creator,
-  make-drawing, cam-job, sheet-metal, reverse-engineer, plm-workflow.
+- Builtin inventory (v2): edit-part, edit-assembly, edit-sketch, edit-feature, simulate,
+  assess-model-state, source-parts, ecad-board, skill-creator, make-drawing, cam-job,
+  sheet-metal, reverse-engineer, plm-workflow, surface-modeling, weldment-frame,
+  design-for-manufacturability, assembly-merge, piping-design, hydraulic-design, civil-design.
+  Discovery scans builtin directories rather than using this inventory as a registry.
 - Grounding rule: every builtin skill teaches verify-before-done (describe/measure/check_* after
   mutations) and single-source-of-truth sequencing (model the mating part FIRST, reference its
   dims — never parallel-guess mating interfaces).
-- Builtin domain extensions: surface-modeling, weldment-frame, design-for-manufacturability.
 
 ## Current runtime clarification (supersedes compaction claim above)
 
 The Python skill registry injects an automatic skill once per session. An explicit
 `services.agent.skills.reset_session()` permits reinjection; there is no Python
-compaction callback. Online context compaction is owned by Chudcode.
+compaction callback. Online context compaction is owned by OMP.

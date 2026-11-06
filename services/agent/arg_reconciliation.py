@@ -66,6 +66,8 @@ _RESULT_CAP_SPELLINGS: dict[str, str] = {
 # an honest refusal into a silently wrong call, which is strictly worse.
 TOOL_ARG_SYNONYMS: dict[str, dict[str, str]] = {
     "export_part": {"type": "fmt"},
+    "close_part": {"save": "discard"},
+    "check_interference": {"components": "members"},
     # research_web_search(query, provider, max_results) — services/mcp/research_tools.py.
     "research_web_search": _RESULT_CAP_SPELLINGS,
     # design_recipe(query, max_results) — services/agent/design_recipe.py, services/mcp/server.py.
@@ -360,11 +362,14 @@ def annotation_admits(ann: str, value: Any) -> bool:
     return False
 
 
-def bind_value(target: str, ann: str, value: Any) -> Any:
+def bind_value(target: str, ann: str, value: Any, *, tool: str = "",
+               supplied: str = "") -> Any:
     """Return the value that should actually be bound to *target*.
 
     JSON-document parameters accept decoded model output.
     """
+    if tool == "close_part" and norm_arg(supplied) == "save" and target == "discard":
+        return not value if isinstance(value, bool) else value
     if isinstance(value, (list, dict)) and str(target).endswith("_json"):
         a = str(ann or "").lower()
         if ("str" in a or "string" in a) and "dict" not in a and "list" not in a:
@@ -594,11 +599,4 @@ def unknown_arg_payload(tool: str, params: Sequence[str], required: Sequence[str
         # invitation to rename the argument and keep the millimetre value.
         payload["quantity_mismatch"] = mismatch
         payload["error"] += "".join(f" NOTE: {m['note']}" for m in mismatch)
-    try:
-        from services.agent.tool_hints import hint_for  # noqa: PLC0415
-        extra = hint_for(tool)
-        if extra:
-            payload["tool_hint"] = extra
-    except Exception:  # noqa: BLE001
-        pass
     return payload

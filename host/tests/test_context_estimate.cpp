@@ -204,6 +204,57 @@ static void test_message_count_is_the_entry_count() {
     CHECK_EQ_INT(e.tokens, 137 * (3 + 3 + kOverhead));
 }
 
+static void test_compaction_context_is_routed_only_to_its_owner() {
+    struct Conversation { std::string id; int lastContextTokens; };
+    int visible = 311800;
+    std::vector<Conversation> conversations = {{"viewed", 0}, {"parked", 220000}};
+    const int estimate = ui::storedContextEstimate(68100);
+    CHECK_EQ_INT(estimate, -68102);
+    ui::storeConversationContext(visible, conversations, false, "parked", estimate);
+    CHECK_EQ_INT(visible, 311800);
+    CHECK_EQ_INT(conversations[1].lastContextTokens, estimate);
+    ui::storeConversationContext(visible, conversations, false, "missing", -1);
+    CHECK_EQ_INT(visible, 311800);
+    CHECK_EQ_INT(conversations[1].lastContextTokens, estimate);
+    ui::storeConversationContext(visible, conversations, true, "viewed", -1);
+    CHECK_EQ_INT(visible, -1);
+    CHECK_EQ_INT(conversations[1].lastContextTokens, estimate);
+    ui::storeConversationContext(visible, conversations, true, "viewed", 42000);
+    CHECK_EQ_INT(visible, 42000);
+    CHECK_EQ_INT(ui::storedContextEstimate(0), -2);
+    CHECK_EQ_INT(ui::storedContextEstimate(INT_MAX), -INT_MAX);
+    CHECK_EQ_INT(ui::storedContextMeasurement(0), INT_MIN);
+    CHECK_EQ_INT(ui::storedContextMeasurement(42000), 42000);
+}
+
+static void test_background_context_and_window_stay_with_their_conversation() {
+    struct Conversation {
+        std::string id;
+        int lastContextTokens = 0;
+        int lastContextWindow = 0;
+        std::string lastContextWindowSource;
+    };
+    int visibleTokens = 90000;
+    int visibleWindow = 200000;
+    std::string visibleSource = "catalog";
+    std::vector<Conversation> conversations = {{"viewed"}, {"parked"}};
+    ui::storeConversationWindow(visibleWindow, visibleSource, conversations, false,
+                                "parked", 1000000, "probe");
+    ui::storeConversationContextPeak(visibleTokens, conversations, false, "parked", 120000);
+    ui::storeConversationContextPeak(visibleTokens, conversations, false, "parked", 100000);
+    CHECK_EQ_INT(visibleWindow, 200000);
+    CHECK(visibleSource == "catalog");
+    CHECK_EQ_INT(visibleTokens, 90000);
+    CHECK_EQ_INT(conversations[1].lastContextWindow, 1000000);
+    CHECK(conversations[1].lastContextWindowSource == "probe");
+    CHECK_EQ_INT(conversations[1].lastContextTokens, 120000);
+    ui::storeConversationWindow(visibleWindow, visibleSource, conversations, true,
+                                "viewed", 64000, "user");
+    CHECK_EQ_INT(visibleWindow, 64000);
+    CHECK(visibleSource == "user");
+    CHECK_EQ_INT(conversations[1].lastContextWindow, 1000000);
+}
+
 int main() {
     test_empty_text_is_zero();
     test_ascii_scaling();
@@ -216,6 +267,8 @@ int main() {
     test_single_message_cap_clamps_and_flags();
     test_saturates_instead_of_overflowing();
     test_message_count_is_the_entry_count();
+    test_compaction_context_is_routed_only_to_its_owner();
+    test_background_context_and_window_stay_with_their_conversation();
     if (g_failures) {
         std::printf("test_context_estimate: %d failure(s)\n", g_failures);
         return 1;

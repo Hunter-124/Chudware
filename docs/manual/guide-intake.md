@@ -15,9 +15,10 @@ ISO 286 FIT CALCULATOR — call fit_calc BEFORE setting any bore or shaft diamet
                                   "dowel pin" → recommended ISO 286 classes + rationale.
                                   Call recommend_fit FIRST, then fit_calc with the class it gives.
   suggest_dimension_scheme(doc, sketch, process)
-                                  ordered dimension plan for a sketch: which dims to drive,
-                                  default IT-grade tolerances by process, bolt-pattern datum rules,
-                                  and needs_user_confirm flags for function-critical dims.
+                                  solver-aware plan with ISO 286 table-based IT tolerances for
+                                  known nominals. Specify the process; review and apply relation
+                                  rows first, then re-plan before adding dimensions. Hole
+                                  compensation applies only to explicitly tagged holes.
                                   CNC/lathe → IT7, FDM → IT12, sheet/laser → IT10.
 
 WHEN the design must incorporate a real part you have NO model/datasheet for:
@@ -37,5 +38,12 @@ WHEN the design must incorporate a real part you have NO model/datasheet for:
   7. fit_report() to review modeled-vs-measured + clearances before export; dfm_check() for wall/
      draft vs the process minimums; make_fit_coupon(key) to print a tiny test of one interface
      first. All of this persists in the .step+ (reopens in-app intact).
+  Printed parts: while modelling, run wall_thickness() for the process-minimum RED heat map
+  AND dfm_check(). Fix every red region at its named face/feature or explicitly justify it
+  before export/slicing; re-run after edits. See cad_guide('printing') and ('evaluate').
+  DFM evaluates available feature sizes and reports unsupported evidence as not_evaluated,
+  not a pass. Open concave fillet patches are not complete holes; split cylindrical bore
+  faces can represent one hole. A simple custom bore is not a thread: specify actual thread
+  style/designation and manufacturing strategy where applicable.
 ```
 

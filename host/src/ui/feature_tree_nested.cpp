@@ -3,35 +3,89 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <filesystem>
 #include <map>
+#include <mutex>
+#include <thread>
 #include <system_error>
 
 #include "miniz.h"
+#include "anim.h"
+#include "../core/doc_mirror.h"
 
 namespace ui {
 namespace {
 
 namespace fs = std::filesystem;
 
-struct CacheSlot {
-    fs::file_time_type mtime{};
-    std::uintmax_t size = 0;
-    bool statOk = false;
-    NestedDocument doc;
+using Clock = std::chrono::steady_clock;
+
+struct CanonicalPaths {
+    std::mutex mutex;
+    std::map<std::string, std::string> paths;
 };
 
-std::map<std::string, CacheSlot>& cache() {
-    static std::map<std::string, CacheSlot> slots;
-    return slots;
+CanonicalPaths& canonicalPaths() {
+    static CanonicalPaths paths;
+    return paths;
 }
 
-std::string normalizePath(const std::string& path) {
-    if (path.empty()) return {};
-    std::error_code ec;
-    fs::path p = fs::weakly_canonical(fs::path(path), ec);
-    if (ec) p = fs::path(path).lexically_normal();
-    return p.string();
+// Preserve the nested history's existing profile/sketch selectors while deriving them off-thread.
+void scanNestedSketchRefs(const nlohmann::json& node, const std::string& key,
+                          const std::unordered_set<std::string>& sketchIds,
+                          std::unordered_set<std::string>& seen) {
+    if (node.is_object()) {
+        const auto kind = node.find("kind"), sketch = node.find("sketch");
+        if (kind != node.end() && kind->is_string() &&
+            kind->get_ref<const std::string&>() == "region" &&
+            sketch != node.end() && sketch->is_string() &&
+            sketchIds.count(sketch->get_ref<const std::string&>()))
+            seen.insert(sketch->get_ref<const std::string&>());
+        for (auto it = node.begin(); it != node.end(); ++it)
+            scanNestedSketchRefs(it.value(), it.key(), sketchIds, seen);
+    } else if (node.is_array()) {
+        for (const auto& item : node) scanNestedSketchRefs(item, key, sketchIds, seen);
+    } else if (node.is_string() && (key == "profile" || key.find("sketch") != std::string::npos)) {
+        const auto& value = node.get_ref<const std::string&>();
+        if (sketchIds.count(value)) seen.insert(value);
+    }
+}
+
+void deriveFeatures(NestedDocument& document) {
+    std::unordered_set<std::string> sketchIds;
+    for (size_t i = 0; i < document.features.size(); ++i) {
+        const auto& feature = document.features[i];
+        document.featureById.emplace(feature.id, i);
+        if (!feature.folder.empty())
+            document.folderIds.try_emplace(feature.folder, "##cfld_" + feature.folder);
+        if (feature.type == "sketch") sketchIds.insert(feature.id);
+        if (feature.type == "plane" || feature.type == "datum_plane" ||
+            feature.type == "axis" || feature.type == "point" || feature.folder == "Reference")
+            document.references.push_back(i);
+    }
+    std::unordered_map<std::string, int> counts;
+    std::unordered_map<std::string, std::string> consumer;
+    for (const auto& feature : document.features) {
+        if (feature.type == "sketch") continue;
+        const auto refs = feature.raw.find("refs");
+        if (refs == feature.raw.end()) continue;
+        std::unordered_set<std::string> seen;
+        scanNestedSketchRefs(*refs, {}, sketchIds, seen);
+        for (const auto& sketch : seen) {
+            ++counts[sketch];
+            consumer[sketch] = feature.id;
+        }
+    }
+    for (const auto& item : consumer) {
+        if (counts[item.first] != 1) continue;
+        auto feature = document.featureById.find(item.first);
+        if (feature == document.featureById.end()) continue;
+        document.childrenOf[item.second].push_back(feature->second);
+        document.nestedSketches.insert(item.first);
+    }
 }
 
 bool readZipEntry(const std::string& zipPath, const char* entry, std::string& out) {
@@ -58,34 +112,10 @@ std::string jsonString(const nlohmann::json& object, const char* key) {
     return it != object.end() && it->is_string() ? it->get<std::string>() : std::string();
 }
 
-NestedDocument parseDocument(const std::string& absPath) {
+NestedDocument parseTree(const std::string& absPath, const nlohmann::json& tree) {
     NestedDocument result;
     result.path = absPath;
     result.fileName = fs::path(absPath).filename().string();
-
-    std::string documentJson;
-    if (!readZipEntry(absPath, "document.json", documentJson)) {
-        std::string ext = fs::path(absPath).extension().string();
-        std::transform(ext.begin(), ext.end(), ext.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (ext == ".step+" || ext == ".asmstep") {
-            result.state = NestedDocumentState::Unreadable;
-            result.error = "Native component has no readable document.json";
-        } else {
-            result.state = NestedDocumentState::External;
-            result.error = "Imported geometry has no editable feature history";
-        }
-        return result;
-    }
-
-    nlohmann::json tree;
-    try {
-        tree = nlohmann::json::parse(documentJson);
-    } catch (const std::exception& e) {
-        result.state = NestedDocumentState::Unreadable;
-        result.error = std::string("Invalid component document: ") + e.what();
-        return result;
-    }
     if (!tree.is_object()) {
         result.state = NestedDocumentState::Unreadable;
         result.error = "Component document root is not an object";
@@ -108,6 +138,7 @@ NestedDocument parseDocument(const std::string& absPath) {
             if (!feature.is_object()) continue;
             NestedFeature nested;
             nested.id = jsonString(feature, "id");
+            nested.popupId = "##nested_feature_" + nested.id;
             nested.name = jsonString(feature, "name");
             nested.type = jsonString(feature, "type");
             nested.folder = jsonString(feature, "folder");
@@ -137,60 +168,250 @@ NestedDocument parseDocument(const std::string& absPath) {
             if (!nested.sourcePath.empty()) {
                 fs::path sourcePath(nested.sourcePath);
                 if (!sourcePath.is_absolute()) sourcePath = base / sourcePath;
-                nested.sourceAbsPath = normalizePath(sourcePath.string());
+                nested.sourceAbsPath = featureTreeCanonicalPath(sourcePath.string());
             }
             result.components.push_back(std::move(nested));
         }
     }
+    deriveFeatures(result);
     return result;
+}
+
+NestedDocument parseDocument(const std::string& absPath) {
+    std::string documentJson;
+    if (!readZipEntry(absPath, "document.json", documentJson)) {
+        NestedDocument result;
+        result.path = absPath;
+        result.fileName = fs::path(absPath).filename().string();
+        std::string ext = fs::path(absPath).extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (ext == ".step+" || ext == ".asmstep") {
+            result.state = NestedDocumentState::Unreadable;
+            result.error = "Native component has no readable document.json";
+        } else {
+            result.state = NestedDocumentState::External;
+            result.error = "Imported geometry has no editable feature history";
+        }
+        return result;
+    }
+    try {
+        return parseTree(absPath, nlohmann::json::parse(documentJson));
+    } catch (const std::exception& e) {
+        NestedDocument result;
+        result.path = absPath;
+        result.fileName = fs::path(absPath).filename().string();
+        result.state = NestedDocumentState::Unreadable;
+        result.error = std::string("Invalid component document: ") + e.what();
+        return result;
+    }
+}
+
+struct CacheSlot {
+    std::string path;
+    fs::file_time_type mtime{};
+    std::uintmax_t size = 0;
+    bool statOk = false;
+    bool checked = false;
+    bool pending = false;
+    uint64_t version = 0;
+    uint64_t used = 0;
+    Clock::time_point nextCheck{};
+    std::shared_ptr<const NestedDocument> doc;
+};
+
+class DocumentCache {
+public:
+    DocumentCache() {
+        // The canonical memo must outlive the worker during static teardown.
+        (void)canonicalPaths();
+        worker_ = std::thread([this] { run(); });
+    }
+    ~DocumentCache() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        ready_.notify_one();
+        worker_.join();
+    }
+
+    std::shared_ptr<const NestedDocument> get(const std::string& path) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = slots_.find(path);
+        if (it == slots_.end()) {
+            if (slots_.size() >= 1024) {
+                auto oldest = slots_.end();
+                for (auto candidate = slots_.begin(); candidate != slots_.end(); ++candidate)
+                    if (!candidate->second->pending &&
+                        (oldest == slots_.end() || candidate->second->used < oldest->second->used))
+                        oldest = candidate;
+                if (oldest != slots_.end()) slots_.erase(oldest);
+                else return loadingDocument();
+            }
+            auto slot = std::make_shared<CacheSlot>();
+            slot->path = path;
+            auto document = std::make_shared<NestedDocument>();
+            document->state = NestedDocumentState::Loading;
+            document->path = path;
+            document->fileName = fs::path(path).filename().string();
+            document->error = "Loading feature history...";
+            slot->doc = std::move(document);
+            it = slots_.emplace(path, std::move(slot)).first;
+        }
+        auto& slot = *it->second;
+        slot.used = ++used_;
+        if (!slot.pending && Clock::now() >= slot.nextCheck) {
+            slot.pending = true;
+            jobs_.push_back(it->second);
+            ready_.notify_one();
+        }
+        return slot.doc;
+    }
+
+    void invalidate(const std::string& path) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& item : slots_) {
+            if (!path.empty() && item.first != path) continue;
+            ++item.second->version;
+            item.second->checked = false;
+            item.second->nextCheck = {};
+        }
+    }
+
+private:
+    static std::shared_ptr<const NestedDocument> loadingDocument() {
+        static const auto document = [] {
+            auto value = std::make_shared<NestedDocument>();
+            value->state = NestedDocumentState::Loading;
+            value->error = "Loading feature history...";
+            return value;
+        }();
+        return document;
+    }
+
+    void run() {
+        for (;;) {
+            std::shared_ptr<CacheSlot> slot;
+            uint64_t version;
+            bool checked, wasStatOk;
+            fs::file_time_type oldMtime;
+            std::uintmax_t oldSize;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                ready_.wait(lock, [this] { return stopping_ || !jobs_.empty(); });
+                if (stopping_) return;
+                slot = std::move(jobs_.front());
+                jobs_.pop_front();
+                version = slot->version;
+                checked = slot->checked;
+                wasStatOk = slot->statOk;
+                oldMtime = slot->mtime;
+                oldSize = slot->size;
+            }
+            std::error_code ec;
+            const auto mtime = fs::last_write_time(slot->path, ec);
+            const bool statOk = !ec;
+            std::uintmax_t size = statOk ? fs::file_size(slot->path, ec) : 0;
+            if (ec) size = 0;
+            std::shared_ptr<const NestedDocument> document;
+            if (!checked || statOk != wasStatOk ||
+                (statOk && (mtime != oldMtime || size != oldSize))) {
+                try {
+                    if (statOk) {
+                        document = std::make_shared<NestedDocument>(parseDocument(slot->path));
+                    } else {
+                        auto missing = std::make_shared<NestedDocument>();
+                        missing->path = slot->path;
+                        missing->fileName = fs::path(slot->path).filename().string();
+                        missing->error = "Component file is missing or unavailable";
+                        document = std::move(missing);
+                    }
+                } catch (const std::exception& error) {
+                    auto unreadable = std::make_shared<NestedDocument>();
+                    unreadable->state = NestedDocumentState::Unreadable;
+                    unreadable->path = slot->path;
+                    unreadable->error = error.what();
+                    document = std::move(unreadable);
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                slot->pending = false;
+                if (slot->version == version) {
+                    slot->checked = true;
+                    slot->statOk = statOk;
+                    slot->mtime = mtime;
+                    slot->size = size;
+                    slot->nextCheck = Clock::now() + std::chrono::seconds(1);
+                    if (document) slot->doc = std::move(document);
+                }
+            }
+            ui::anim::wakeLoop();
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable ready_;
+    std::map<std::string, std::shared_ptr<CacheSlot>> slots_;
+    std::deque<std::shared_ptr<CacheSlot>> jobs_;
+    uint64_t used_ = 0;
+    bool stopping_ = false;
+    std::thread worker_;
+};
+
+DocumentCache& cache() {
+    static DocumentCache documents;
+    return documents;
 }
 
 }  // namespace
 
-const NestedDocument& featureTreeNestedDocument(const std::string& inputPath) {
-    static const NestedDocument empty;
-    const std::string absPath = normalizePath(inputPath);
-    if (absPath.empty()) return empty;
-
+std::string featureTreeCanonicalPath(const std::string& path) {
+    if (path.empty()) return {};
+    auto& memo = canonicalPaths();
+    {
+        std::lock_guard<std::mutex> lock(memo.mutex);
+        const auto it = memo.paths.find(path);
+        if (it != memo.paths.end()) return it->second;
+    }
     std::error_code ec;
-    const fs::file_time_type mtime = fs::last_write_time(absPath, ec);
-    const bool statOk = !ec;
-    std::uintmax_t size = 0;
-    if (statOk) {
-        size = fs::file_size(absPath, ec);
-        if (ec) size = 0;
-    }
+    fs::path normalized = fs::weakly_canonical(fs::path(path), ec);
+    if (ec) normalized = fs::path(path).lexically_normal();
+    std::lock_guard<std::mutex> lock(memo.mutex);
+    if (memo.paths.size() >= 4096) memo.paths.clear();
+    const std::string canonical = normalized.string();
+    memo.paths.try_emplace(canonical, canonical);
+    return memo.paths.try_emplace(path, canonical).first->second;
+}
 
-    auto& slots = cache();
-    auto it = slots.find(absPath);
-    if (it != slots.end() && it->second.statOk == statOk &&
-        (!statOk || (it->second.mtime == mtime && it->second.size == size)))
-        return it->second.doc;
+std::shared_ptr<const NestedDocument> featureTreeNestedDocument(const std::string& inputPath) {
+    static const auto empty = std::make_shared<const NestedDocument>();
+    if (inputPath.empty()) return empty;
+    return cache().get(featureTreeCanonicalPath(inputPath));
+}
 
-    CacheSlot slot;
-    slot.statOk = statOk;
-    slot.mtime = mtime;
-    slot.size = size;
-    if (!statOk) {
-        slot.doc.state = NestedDocumentState::Missing;
-        slot.doc.path = absPath;
-        slot.doc.fileName = fs::path(absPath).filename().string();
-        slot.doc.error = "Component file is missing or unavailable";
-    } else {
-        slot.doc = parseDocument(absPath);
+std::shared_ptr<const NestedDocument> featureTreeNestedDocument(
+    const std::string& inputPath, const core::DocMirrorSnapshot& snapshot) {
+    if (!snapshot.valid()) return featureTreeNestedDocument(inputPath);
+    struct LiveEntry {
+        std::weak_ptr<const core::DocMirrorPayload> payload;
+        std::shared_ptr<const NestedDocument> document;
+    };
+    static std::map<std::string, LiveEntry> live;
+    const std::string path = featureTreeCanonicalPath(inputPath);
+    if (live.size() >= 256 && !live.count(path)) live.erase(live.begin());
+    auto& entry = live[path];
+    if (entry.payload.lock() != snapshot.payload) {
+        entry.payload = snapshot.payload;
+        entry.document = std::make_shared<NestedDocument>(parseTree(path, snapshot.tree()));
     }
-    return slots.insert_or_assign(absPath, std::move(slot)).first->second.doc;
+    return entry.document;
 }
 
 void invalidateFeatureTreeNestedDocument(const std::string& absPath) {
-    auto& slots = cache();
-    if (absPath.empty()) {
-        slots.clear();
-        return;
-    }
-    const std::string key = normalizePath(absPath);
-    if (key.empty()) return;
-    slots.erase(key);
+    cache().invalidate(featureTreeCanonicalPath(absPath));
+    ui::anim::wakeLoop();
 }
 
 }  // namespace ui

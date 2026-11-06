@@ -32,6 +32,21 @@ def _skip_if_no_bridge(exc: Exception):
         pytest.skip(f"engine bridge unavailable: {exc}")
     raise
 
+def _finish_sim(out):
+    """Resolve an automatically backgrounded solve before checking its physics."""
+    if not out.get("job_id"):
+        return out
+    bind_tool = _dispatch()
+    job_id = out["job_id"]
+    status = json.loads(bind_tool("wait_job")(job_id=job_id, timeout_s=600))
+    if status.get("still_running"):
+        cancelled = json.loads(bind_tool("sim_cancel")(job_id=job_id))
+        assert cancelled.get("ok"), cancelled
+        pytest.fail(f"simulation job did not finish: {status}")
+    assert status.get("status") in ("done", "completed"), status
+    return json.loads(bind_tool("sim_results")(job_id=job_id))
+
+
 
 @pytest.fixture(scope="module")
 def block_doc():
@@ -61,9 +76,9 @@ def test_run_fea_static_accepts_stringified_fixtures_and_loads(block_doc):
     character. A JSON-encoded fixtures/loads pair must now solve normally."""
     bind_tool = _dispatch()
     run_fea_static = bind_tool("run_fea_static")
-    out = json.loads(run_fea_static(
+    out = _finish_sim(json.loads(run_fea_static(
         fixtures='["bottom"]', loads='[{"face": "top", "pressure": 0.5}]',
-        material="steel", doc_id=block_doc))
+        material="steel", doc_id=block_doc)))
     assert out.get("ok") is True, out
     assert "summary" in out and out["summary"].get("min_fos") is not None
 
@@ -108,8 +123,8 @@ def test_run_fea_buckling_accepts_stringified_load(block_doc):
 def test_run_fea_modal_accepts_stringified_fixtures(block_doc):
     bind_tool = _dispatch()
     run_fea_modal = bind_tool("run_fea_modal")
-    out = json.loads(run_fea_modal(fixtures='["bottom"]', material="steel",
-                                   n_modes=3, doc_id=block_doc))
+    out = _finish_sim(json.loads(run_fea_modal(fixtures='["bottom"]', material="steel",
+                                               n_modes=3, doc_id=block_doc)))
     assert out.get("ok") is True, out
     assert "freqs_hz" in out
 

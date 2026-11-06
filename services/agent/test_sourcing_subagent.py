@@ -126,9 +126,6 @@ def env(tmp_path, monkeypatch):
     # with a live provider. Force the legacy no-assignment path instead.
     monkeypatch.setattr("services.agent.config.load_config", lambda *a, **k: {})
     monkeypatch.setattr(
-        "services.agent.role_models.resolve_for_node", lambda *a, **k: None
-    )
-    monkeypatch.setattr(
         "services.agent.role_models.resolve_role_model", lambda *a, **k: None
     )
     # Deterministic parts backends — no hub/index.
@@ -217,7 +214,7 @@ class TestSourcingSubagent:
 
         # Parent sees the executed sub-agent's handoff.
         assert node["executed"] is True
-        assert node["ok"] is True and node["subagent_status"] == "done"
+        assert node["ok"] is True and node["subagent_status"] == "done", node
         recs = node["handoff"]["outputs"]["recommendations"]
         assert recs[0]["part_id"] == "bearing:ISO 15:6001"
         assert recs[0]["artifact_plan"]["how"] == "part_place"

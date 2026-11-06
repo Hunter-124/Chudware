@@ -33,7 +33,9 @@ struct CacheRecomputeScope {
     ~CacheRecomputeScope() { recomputing_cache = previous; }
 };
 struct Configuration { std::mutex mutex; std::string root; std::string state; bool configured = false; };
-inline Configuration& configuration() { static Configuration value; return value; }
+// Defined out of line so C++17 and C++20 callers share one initialization owner.
+// Their standard-library constructors can differ in constant-initialization support.
+Configuration& configuration();
 inline void configure(const std::string& root, const std::string& state) {
     auto& value = configuration();
     std::lock_guard<std::mutex> lock(value.mutex);

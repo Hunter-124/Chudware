@@ -12,6 +12,9 @@ triggers:
 
 ## Sequence
 
+If unavailable, call `enable_tools(tools=["add_features", "query_geometry", "describe_part", "render_part"])`.
+The `weld_*` names below are feature types supplied to `add_features`, not standalone tools.
+
 1. Sketch the member centerlines as open line or arc segments; those segments become the members.
 2. Add `weld_member` with a real stock profile, dimensions, justification, roll angle, and `miter`, `butt`, or `cope` joint intent.
 3. Pass `refs.sketch` as the bare sketch id, not a region selector.

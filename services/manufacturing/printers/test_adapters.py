@@ -9,6 +9,7 @@ import ssl
 import pytest
 
 from fixtures.mfg.printers import VirtualPrinter
+from services.manufacturing.print_safety import UnsafePrintFile
 from services.manufacturing.printers import (
     Artifact,
     AuthConfig,
@@ -335,6 +336,52 @@ def test_prusalink_uses_only_capability_probed_routes() -> None:
         assert by_field(adapter.snapshot())["job_state"]["v"] == "running"
         adapter.cancel()
         assert by_field(adapter.snapshot())["job_state"]["v"] == "aborted"
+
+
+@pytest.mark.parametrize(
+    ("data", "name"),
+    [
+        (b"G28\n", "firmware.bin"),
+        (b"\x00\xff\x01\x02", "print.gcode"),
+        (b"G28\nM997\n", "print.gcode"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("kind", "adapter_type"),
+    [("moonraker", MoonrakerAdapter), ("octoprint", OctoPrintAdapter), ("prusalink", PrusaLinkAdapter)],
+)
+def test_upload_rejects_firmware_before_network_write(kind, adapter_type, data, name) -> None:
+    with VirtualPrinter(kind) as server:
+        if kind == "prusalink":
+            server.prusa_storage_endpoint = True
+            server.prusa_job_endpoint = True
+        adapter = adapter_type(config(server))
+        adapter.probe()
+        requests = len(server.requests)
+        with pytest.raises(UnsafePrintFile):
+            adapter.upload(Artifact(data, original_name=name))
+        assert len(server.requests) == requests
+
+
+@pytest.mark.parametrize(
+    ("kind", "adapter_type", "remote_path"),
+    [
+        ("moonraker", MoonrakerAdapter, "firmware.bin"),
+        ("octoprint", OctoPrintAdapter, "firmware.bin"),
+        ("prusalink", PrusaLinkAdapter, "/api/v1/files/usb/firmware%2Ebin"),
+    ],
+)
+def test_start_rejects_remote_firmware_before_network_write(kind, adapter_type, remote_path) -> None:
+    with VirtualPrinter(kind) as server:
+        if kind == "prusalink":
+            server.prusa_storage_endpoint = True
+            server.prusa_job_endpoint = True
+        adapter = adapter_type(config(server))
+        adapter.probe()
+        requests = len(server.requests)
+        with pytest.raises(UnsafePrintFile):
+            adapter.start({"remote_path": remote_path}, authorization_token="authz")
+        assert len(server.requests) == requests
 
 
 def test_octoprint_rejects_vendor_supplied_path_traversal() -> None:

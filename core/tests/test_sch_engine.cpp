@@ -1,5 +1,5 @@
-// Schematic engine contract tests — the connectivity, ERC, library, export and
-// save-safety behaviors that the 2026-08 schematic overhaul fixed. Each case pins a
+// Schematic engine contract tests — connectivity, ERC, library and save safety
+// behaviors that the 2026-08 schematic overhaul fixed. Each case pins a
 // SPECIFIC defect that shipped before it:
 //
 //   * connectivity was keyed on a bare point, so two sheets with coincident geometry
@@ -12,28 +12,29 @@
 //   * an NC pin wired to a stub was not reported;
 //   * `sch_add_symbol` fabricated a 2-pin body for every libid (no native symbol library);
 //   * `sch_import_kicad` was a registered no-op;
-//   * a schematic could export nothing at all;
 //   * a pathless Save over an imported .kicad_sch replaced it with ZIP bytes.
 //
 // Pure JSON, OCCT-free; links chudware_ecad only.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
-#include "ecad/container.h"
 #include "ecad/erc.h"
 #include "ecad/kicad.h"
+#include "ecad/kicad_cli.h"
 #include "ecad/netlist.h"
 #include "ecad/ops.h"
 #include "ecad/schema.h"
-#include "ecad/schexport.h"
-#include "ecad/schplot.h"
 #include "ecad/session.h"
 #include "ecad/symlib.h"
+#include "sim/netlist.h"
 
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <set>
 #include <iterator>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <doctest/doctest.h>
 #include <nlohmann/json.hpp>
@@ -91,7 +92,7 @@ std::string net_of(const json& netlist, const std::string& sym, const std::strin
 TEST_CASE("board sync refuses conflicting schematic refs without mutating the board") {
     const json board_created = ecad_new("pcb", "Ref guard");
     const std::string board_id = board_created["doc_id"].get<std::string>();
-    const fs::path path = fs::temp_directory_path() / "chudware_ecad_ref_guard.ecad+";
+    const fs::path path = fs::temp_directory_path() / (board_id + "-conflicting-refs.json");
     for (bool different_library : {true, false}) {
         json doc = schema::new_schematic("Conflicting refs");
         doc["lib_cache"]["Device:R"] = res_def();
@@ -107,7 +108,7 @@ TEST_CASE("board sync refuses conflicting schematic refs without mutating the bo
                                            {"angle", 0}, {"mirror", "none"}, {"unit", 1}});
         const std::string rule = different_library ? "duplicate_ref" : "unit_ref_conflict";
         REQUIRE(has_rule(run_erc(doc, build_netlist(doc)), rule));
-        ecad_container_save(doc, path.string(), {});
+        { std::ofstream out(path); out << doc.dump(); }
         const json opened = ecad_open(path.string());
         const std::string sch_id = opened["doc_id"].get<std::string>();
         try {
@@ -369,6 +370,31 @@ TEST_CASE("a plain GND port does not satisfy power_not_driven") {
     CHECK((has_rule(v, "power_not_driven") || has_rule(v, "power_flag_needed")));
 }
 
+TEST_CASE("PWR_FLAG drives only its physical net and never shorts supplies") {
+    json doc = schema::new_schematic("Separate supplies");
+    doc["lib_cache"]["Device:R"] = res_def();
+    for (int i = 0; i < 2; ++i)
+        doc["symbols"].push_back(json{{"id", "s" + std::to_string(i + 1)},
+                                      {"libid", "Device:R"}, {"ref", "R" + std::to_string(i + 1)},
+                                      {"value", "1k"}, {"sheet", "sh1"},
+                                      {"pos", json::array({25.4 * i, 0.0})},
+                                      {"angle", 0}, {"mirror", "none"}, {"unit", 1}});
+    doc["power"] = json::array({
+        {{"id", "p1"}, {"sheet", "sh1"}, {"net", "PWR_FLAG"}, {"symbol", "PWR_FLAG"},
+         {"pos", {-2.54, 0.0}}},
+        {{"id", "p2"}, {"sheet", "sh1"}, {"net", "PWR_FLAG"}, {"symbol", "power:PWR_FLAG"},
+         {"pos", {22.86, 0.0}}},
+        {{"id", "p3"}, {"sheet", "sh1"}, {"net", "VCC"}, {"symbol", "VCC"},
+         {"pos", {-2.54, 0.0}}},
+        {{"id", "p4"}, {"sheet", "sh1"}, {"net", "GND"}, {"symbol", "GND"},
+         {"pos", {22.86, 0.0}}}});
+    const json nl = build_netlist(doc);
+    CHECK(net_of(nl, "s1", "1") == "VCC");
+    CHECK(net_of(nl, "s2", "1") == "GND");
+    CHECK(nl["net_info"]["VCC"]["has_power_source"] == true);
+    CHECK(nl["net_info"]["GND"]["has_power_source"] == true);
+}
+
 TEST_CASE("a no-connect flag on a wired pin is an error") {
     json doc = schema::new_schematic("NC");
     doc["lib_cache"]["Device:R"] = res_def();
@@ -411,9 +437,13 @@ TEST_CASE("the native symbol library resolves real parts") {
     REQUIRE(flag["pins"].size() == 1);
     CHECK(flag["pins"][0].value("type", std::string()) == "power_out");
 
-    const json ne555 = symlib::resolve_symbol("Timer:NE555");
+    const json ne555 = symlib::resolve_symbol("Timer:NE555D");
     REQUIRE(ne555.is_object());
     CHECK(ne555["pins"].size() == 8);
+    const json ne555p = symlib::resolve_symbol("Timer:NE555P");
+    REQUIRE(ne555p.is_object());
+    CHECK(ne555p["pins"].size() == 8);
+    CHECK(ne555p.value("default_footprint", std::string()) == "Package_DIP:DIP-8_W7.62mm");
 
     CHECK(symlib::resolve_symbol("Nope:DoesNotExist").is_null());
     CHECK(symlib::symbol_libids().size() > 40);
@@ -424,10 +454,10 @@ TEST_CASE("the native symbol library resolves real parts") {
 
 TEST_CASE("sch_add_symbol resolves from the library instead of fabricating") {
     const json doc = build(json::array({json{{"op", "sch_add_symbol"},
-                                             {"libid", "Timer:NE555"},
+                                             {"libid", "Timer:NE555D"},
                                              {"pos", json::array({0.0, 0.0})}}}));
     REQUIRE(doc["symbols"].size() == 1);
-    const json def = doc["lib_cache"]["Timer:NE555"];
+    const json def = doc["lib_cache"]["Timer:NE555D"];
     REQUIRE(def.is_object());
     CHECK(def["pins"].size() == 8);
     CHECK(def.value("generated", false) == false);
@@ -500,137 +530,10 @@ TEST_CASE("every schematic entity can be created, edited and deleted") {
     ecad_close(id);
 }
 
-// -------------------------------------------------------------------- exports
-
-TEST_CASE("a schematic exports every deliverable kind") {
-    json created = ecad_new("sch", "Exports");
-    const std::string id = created.value("doc_id", std::string());
-    ecad_apply_ops(id, created.value("revision", 0L),
-                   json::array({json{{"op", "sch_add_symbol"},
-                                     {"libid", "Device:R"},
-                                     {"pos", json::array({0.0, 0.0})},
-                                     {"ref", "R1"},
-                                     {"value", "10k"}},
-                                json{{"op", "sch_add_symbol"},
-                                     {"libid", "Device:R"},
-                                     {"pos", json::array({25.4, 0.0})},
-                                     {"ref", "R2"},
-                                     {"value", "10k"}}}));
-
-    const fs::path dir = fs::temp_directory_path() / "chudware_sch_export_test";
-    fs::remove_all(dir);
-
-    for (const char* kind : {"netlist", "bom", "spice", "kicad", "svg", "pdf"}) {
-        const json res =
-            ecad_export(json{{"doc_id", id}, {"kind", kind}, {"path", dir.string()}});
-        INFO("kind=", kind);
-        REQUIRE(res.contains("files"));
-        CHECK(!res["files"].empty());
-        // `paths` is the honesty contract: it lists what was ACTUALLY written.
-        REQUIRE(res.contains("paths"));
-        REQUIRE(!res["paths"].empty());
-        for (const auto& p : res["paths"]) {
-            const fs::path written = p.get<std::string>();
-            CHECK(fs::exists(written));
-            CHECK(fs::file_size(written) > 0);
-        }
-    }
-
-    // Content spot-checks: the BOM groups the two identical resistors, and the PDF is real.
-    const json bom = ecad_export(json{{"doc_id", id}, {"kind", "bom"}});
-    const std::string csv = bom["files"]["bom"].get<std::string>();
-    CHECK(csv.find("R1,R2") != std::string::npos);
-
-    const json pdf = ecad_export(json{{"doc_id", id}, {"kind", "pdf"}});
-    CHECK(pdf["files"]["pdf"].get<std::string>().rfind("%PDF", 0) == 0);
-
-    const json svg = ecad_export(json{{"doc_id", id}, {"kind", "svg"}});
-    CHECK(svg["files"].begin().value().get<std::string>().find("<svg") != std::string::npos);
-
-    // A pcb-only kind must still be refused on a schematic.
-    CHECK_THROWS_AS(ecad_export(json{{"doc_id", id}, {"kind", "gerber"}}), OpError);
-    // …and an unknown kind is an error, not a silent empty success.
-    CHECK_THROWS_AS(ecad_export(json{{"doc_id", id}, {"kind", "nonsense"}}), OpError);
-
-    fs::remove_all(dir);
-    ecad_close(id);
-}
-
-TEST_CASE("ecad_export without a path writes nothing and says so") {
-    json created = ecad_new("sch", "NoPath");
-    const std::string id = created.value("doc_id", std::string());
-    const json res = ecad_export(json{{"doc_id", id}, {"kind", "netlist"}});
-    CHECK(!res["files"].empty());
-    CHECK(res["paths"].empty());  // the GUI reports from this, never from "no error"
-    ecad_close(id);
-}
-
-TEST_CASE("SVG sheet identifiers cannot escape the selected export directory") {
-    const fs::path root = fs::temp_directory_path() / "chudware_svg_leaf_security";
-    fs::remove_all(root);
-    const fs::path alice = root / "alice";
-    const fs::path marker = root / "bob" / "proof.svg";
-    fs::create_directories(alice / "Schematic-x");
-    fs::create_directories(marker.parent_path());
-    { std::ofstream out(marker); out << "sibling marker"; }
-    auto marker_text = [&]() {
-        std::ifstream in(marker, std::ios::binary);
-        return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-    };
-    const json doc{{"schema", "aicad.sch/1"}, {"name", "Schematic"}};
-    for (const std::string sheet : {"x/../../bob/proof", "..", ".", "../proof",
-                                    "x\\..\\..\\bob\\proof", "C:proof"}) {
-        CHECK_THROWS_AS(ecad_export(json{{"doc", doc}, {"kind", "svg"}, {"path", alice.string()},
-                                         {"opts", {{"sheet", sheet}}}}), OpError);
-        CHECK(marker_text() == "sibling marker");
-    }
-    json hostile_doc = doc;
-    hostile_doc["sheets"] = json::array({json{{"id", "x/../../bob/proof"}}});
-    CHECK_THROWS_AS(ecad_export(json{{"doc", hostile_doc}, {"kind", "svg"},
-                                     {"path", alice.string()}}), OpError);
-    CHECK(marker_text() == "sibling marker");
-
-    const json exported = ecad_export(json{{"doc", doc}, {"kind", "svg"},
-                                          {"path", alice.string()}, {"opts", {{"sheet", "sh1"}}}});
-    REQUIRE(exported["paths"].size() == 1);
-    const fs::path output = exported["paths"][0].get<std::string>();
-    CHECK(fs::canonical(output.parent_path()) == fs::canonical(alice));
-    std::ifstream in(output);
-    const std::string text{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
-    in.close();
-    CHECK(text.find("<svg") != std::string::npos);
-    CHECK(marker_text() == "sibling marker");
-    fs::remove_all(root);
-}
-
-TEST_CASE("SVG export never follows an existing output symlink") {
-    const fs::path root = fs::temp_directory_path() / "chudware_svg_nofollow_security";
-    fs::remove_all(root);
-    fs::create_directories(root / "alice");
-    fs::create_directories(root / "bob");
-    const fs::path marker = root / "bob" / "proof.svg";
-    { std::ofstream out(marker); out << "sibling marker"; }
-    const fs::path output = root / "alice" / "Schematic-sh1.svg";
-    std::error_code ec;
-    fs::create_symlink(marker, output, ec);
-    if (!ec) {
-        const json doc{{"schema", "aicad.sch/1"}, {"name", "Schematic"}};
-        CHECK_THROWS_AS(ecad_export(json{{"doc", doc}, {"kind", "svg"},
-                                         {"path", (root / "alice").string()}}), OpError);
-        CHECK_THROWS_AS(ecad_export(json{{"doc", doc}, {"kind", "svg"},
-                                         {"path", output.string()}}), OpError);
-        std::ifstream in(marker);
-        const std::string text{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
-        CHECK(text == "sibling marker");
-    } else {
-        INFO("Platform does not permit creating a fixture symlink: ", ec.message());
-    }
-    fs::remove_all(root);
-}
 
 // --------------------------------------------------------------- save safety
 
-TEST_CASE("saving an imported KiCad schematic never overwrites the source") {
+TEST_CASE("saving an imported KiCad schematic writes KiCad to its bound source") {
     const char* kMinimal = R"KICAD(
 (kicad_sch (version 20221018) (generator test)
   (lib_symbols
@@ -658,27 +561,21 @@ TEST_CASE("saving an imported KiCad schematic never overwrites the source") {
         std::ofstream fh(src);
         fh << kMinimal;
     }
-    const auto original_size = fs::file_size(src);
 
     const json opened = ecad_open(src.string());
     const std::string id = opened.value("doc_id", std::string());
     REQUIRE(!id.empty());
-    // The import warns that Save targets a native sibling.
-    CHECK(!opened["warnings"].empty());
-
-    // A PATHLESS save must write the sibling .ecad+, not the source.
+    CHECK(opened.value("path", std::string()) == src.string());
+    CHECK(opened["warnings"].empty());
     const json saved = ecad_save(id, "");
-    const fs::path out = saved.value("path", std::string());
-    CHECK(out != src);
-    CHECK(out.extension() == ".ecad+");
-    CHECK(fs::exists(out));
-    CHECK(saved.value("source_path", std::string()) == src.string());
-    // The KiCad file is byte-for-byte untouched.
-    CHECK(fs::file_size(src) == original_size);
-
-    // An EXPLICIT attempt to write over the source is refused, not obeyed.
-    CHECK_THROWS_AS(ecad_save(id, src.string()), OpError);
-    CHECK(fs::file_size(src) == original_size);
+    CHECK(saved.value("path", std::string()) == src.string());
+    CHECK(saved.value("format", std::string()) == "kicad");
+    std::ifstream fh(src, std::ios::binary);
+    const std::string bytes{std::istreambuf_iterator<char>(fh), std::istreambuf_iterator<char>()};
+    CHECK(bytes.find("(kicad_sch") != std::string::npos);
+    const json reopened = ecad_open(src.string());
+    CHECK(reopened["tree"]["symbols"].size() == 1);
+    ecad_close(reopened["doc_id"].get<std::string>());
 
     ecad_close(id);
     fs::remove_all(dir);
@@ -706,6 +603,82 @@ TEST_CASE("ecad_design compiles a recipe into a real, connected schematic") {
     CHECK(found_multi_pin_net);
 
     ecad_close(id);
+}
+
+TEST_CASE("all design recipes use numbered real KiCad pins and export simulatable circuits") {
+    const std::vector<std::pair<std::string, std::string>> cases = {
+        {"a 5V to 3.3V voltage divider", "voltage_divider"},
+        {"an RC low-pass filter", "rc_lowpass"},
+        {"an inverting op-amp amplifier", "inverting_amp"},
+        {"a 5V LED driver", "led_driver"},
+        {"a 555 astable oscillator", "rc_555_astable"},
+    };
+    const bool have_kicad = ecad_kicad_status().value("found", false);
+    for (const auto& [request, expected] : cases) {
+        INFO("recipe: " << expected);
+        const json result = ecad_design(request, expected);
+        REQUIRE(result["recipe_used"] == expected);
+        const std::string id = result["doc_id"].get<std::string>();
+        const json doc = ecad_session_doc(id);
+        const json netlist = build_netlist(doc);
+        std::map<std::string, std::string> ids_by_ref;
+        for (const auto& symbol : doc["symbols"]) {
+            ids_by_ref[symbol["ref"].get<std::string>()] = symbol["id"].get<std::string>();
+            CHECK_FALSE(doc["lib_cache"][symbol["libid"].get<std::string>()].value("generated", false));
+        }
+        std::set<std::string> resolved_nets;
+        for (auto net = result["design"]["nets"].begin(); net != result["design"]["nets"].end(); ++net) {
+            std::string resolved;
+            for (const auto& member : net.value()) {
+                const auto ref = member["ref"].get<std::string>();
+                const auto number = member["pin"].get<std::string>();
+                REQUIRE(ids_by_ref.count(ref) == 1);
+                const auto actual = net_of(netlist, ids_by_ref.at(ref), number);
+                INFO("net " << net.key() << " member " << ref << "." << number);
+                CHECK_FALSE(actual.empty());
+                if (resolved.empty()) resolved = actual;
+                CHECK(actual == resolved);
+            }
+            CHECK(resolved_nets.insert(resolved).second);
+        }
+        const json circuit = chudware::sim::netlist_to_spice_circuit(netlist, json::object());
+        INFO("native simulation warnings: " << circuit["warnings"].dump());
+        CHECK(circuit["warnings"].empty());
+        CHECK_FALSE(circuit["circuit"]["devices"].empty());
+        if (expected == "voltage_divider" || expected == "inverting_amp" || expected == "led_driver") {
+            const json expect = result["design"]["study"]["expect"];
+            const std::string probe = expect["probe"].get<std::string>();
+            const json study{{"analyses", json::array({json{{"type", "op"}}})},
+                             {"probes", json::array({probe})}};
+            const json simulation = ecad_simulate(id, study, json::object());
+            INFO("native operating point: " << simulation.dump());
+            REQUIRE(simulation["converged"].get<bool>());
+            REQUIRE(simulation["results"]["op"][probe].is_number());
+            CHECK(simulation["results"]["op"][probe].get<double>() ==
+                  doctest::Approx(expect["value"].get<double>()).epsilon(0.05));
+        }
+        if (have_kicad) {
+            const fs::path dir = fs::temp_directory_path() / ("chudware-recipe-" + id);
+            const fs::path file = dir / (expected + ".kicad_sch");
+            fs::create_directories(dir);
+            ecad_save(id, file.string());
+            const json check = ecad_kicad_check(id);
+            INFO("KiCad ERC: " << check.dump());
+            CHECK(check["counts"]["error"] == 0);
+            const json exported = ecad_export(json{{"doc_id", id}, {"kind", "spice"}});
+            REQUIRE(exported["files"].size() == 1);
+            const std::string spice = exported["files"][0]["content"].get<std::string>();
+            CHECK(spice.find("V1 ") != std::string::npos);
+            if (expected == "inverting_amp") CHECK(spice.find("kicad_builtin_opamp") != std::string::npos);
+            if (expected == "led_driver") CHECK(spice.find(".model __D1 D") != std::string::npos);
+            if (expected == "rc_555_astable") {
+                CHECK(spice.find(".subckt NE555") != std::string::npos);
+                CHECK(spice.find("XU1 ") != std::string::npos);
+            }
+            fs::remove_all(dir);
+        }
+        ecad_close(id);
+    }
 }
 
 // -------------------------------------------------------------- resolve_pick
@@ -758,6 +731,12 @@ TEST_CASE("describe reports honestly and covers every entity kind") {
         CHECK(d["counts"].contains(k));
     REQUIRE(d.contains("erc"));
     CHECK(d["erc"].value("available", false) == true);
+    REQUIRE(d["erc"]["top"].is_array());
+    bool saw_nullable_net = false;
+    for (const auto& violation : d["erc"]["top"])
+        if (violation.contains("net") && violation["net"].is_null())
+            saw_nullable_net = true;
+    CHECK(saw_nullable_net);
 
     ecad_close(id);
 }
@@ -766,13 +745,23 @@ TEST_CASE("ECAD lifecycle dirty count follows edit save undo redo and close") {
     std::uint64_t before = 0, count = 0;
     REQUIRE(dirty_document_count(before));
     const auto id = ecad_new("sch", "Activity").at("doc_id").get<std::string>();
-    const auto path = fs::temp_directory_path() / (id + "-activity.ecad+");
+    const auto path = fs::temp_directory_path() / (id + "-activity.kicad_sch");
     struct RemoveFile {
         fs::path path;
-        ~RemoveFile() { std::error_code ec; fs::remove(path, ec); }
+        ~RemoveFile() {
+            std::error_code ec;
+            fs::remove(path, ec);
+            auto project = path; project.replace_extension(".kicad_pro");
+            fs::remove(project, ec);
+        }
     } remove{path};
     ecad_apply_ops(id, -1, json::array());
-    REQUIRE(dirty_document_count(count)); CHECK(count == before + 1);
+    REQUIRE(dirty_document_count(count)); CHECK(count == before);
+    ecad_apply_ops(id, -1, json::array({json{{"op", "sch_add_symbol"},
+                                              {"libid", "Device:R"},
+                                              {"pos", json::array({0.0, 0.0})},
+                                              {"ref", "R1"}}}));
+    count = 0; REQUIRE(dirty_document_count(count)); CHECK(count == before + 1);
     ecad_save(id, path.string());
     count = 0; REQUIRE(dirty_document_count(count)); CHECK(count == before);
     ecad_undo(id);

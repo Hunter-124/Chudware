@@ -187,6 +187,12 @@ def register_pack_tools() -> dict:
 
 
 # ---------------------------------------------------------------------------- fixtures
+@pytest.fixture(scope="module", autouse=True)
+def _isolated_project(tmp_path_factory):
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("CHUDWARE_PROJECT_DIR", str(tmp_path_factory.mktemp("ecad-packs")))
+        yield
+
 
 @pytest.fixture(scope="module")
 def tools() -> dict:

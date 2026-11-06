@@ -1,13 +1,8 @@
 """CAD kinematic-evidence MCP tools: sweep_envelope, steering_turning_radius,
 motion_fea_handoff_sweep.
 
-Every tool here is a COMPOSITION over the primitives that already exist —
-``simulate_motion`` and ``motion_fea_handoff`` (services/mcp/cad_asm_tools.py) — resolved
-out of the shared FastMCP registry at call time, so their validation, dialect handling and
-dispatch guard run exactly once and are never re-implemented here. What this module adds is
-the mechanism-level arithmetic a rover/linkage claim needs: a swept ENVELOPE (and optionally
-the swept SOLID), a KINEMATIC/Ackermann TURNING RADIUS, and a batched motion→FEA sweep
-across several mechanism positions.
+These tools compose the plain assembly motion and handoff functions, adding sampled
+envelopes, kinematic turning radii and batched motion-to-FEA evidence.
 
 Two ways to MOVE the mechanism, and both end in the same trajectory shape:
 
@@ -23,11 +18,15 @@ from __future__ import annotations
 from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
 from typing import Optional
 from typing import Union
-import json
 import math
 import os
+import tempfile
 
-from .cad_asm_tools import _solve_report
+from .cad_asm_tools import (
+    _HandoffRefused, _MOTION_MAX_STEPS, _dynamics_duration, _mesh_fineness,
+    _solve_report, component_source_file, handoff_frame, handoff_setup,
+    open_component_part, run_motion_sweep,
+)
 from .cad_common import (
     _doc,
     _dumps,
@@ -39,7 +38,6 @@ from .cad_common import (
     _tmp,
     cb,
     coerce_json_or_repr,
-    note_touched_doc,
     require_list,
 )
 
@@ -222,8 +220,8 @@ def _clash_row(hit: dict) -> dict:
     """
     keep = ("a", "b", "component_a", "component_b",
             "volume", "volume_mm3", "overlap_volume_mm3", "distance",
-            "distance_status", "distance_lower_bound_mm",
-            "overlap_bbox", "kind")
+            "distance_status", "distance_lower_bound_mm", "warning",
+            "clearance_status", "clearance_tolerance_mm", "overlap_bbox", "kind")
     return {k: hit[k] for k in keep if k in hit}
 # ----------------------------------------------------------------- steer drive
 # Module level, not nested in the registration closure: the steer pose driver is
@@ -274,27 +272,18 @@ def _finite16(m, label: str) -> list:
     return out
 
 
-def _clone_detached(doc_id: str, tool: str) -> str:
-    """A DETACHED copy of `doc_id`, opened from the document's own file.
-
-    The steer drive AUTHORS component poses (`asm_edit_component` + `fixed`), which is
-    a real mutation — so it lands on a clone: the caller's document keeps its
-    revision, dirty flag, undo history and mate ownership. `detach_path=True` leaves
-    the clone unbound to the file, so nothing here can overwrite the source.
-    """
-    row = next((r for r in (cb.call("doc_list", {}) or {}).get("docs", [])
-                if isinstance(r, dict) and r.get("doc_id") == doc_id), {})
-    path = row.get("path")
-    if not path or not os.path.exists(str(path)):
-        raise ValueError(
-            f"{tool}(steer=...) drives a DETACHED CLONE of the assembly so your live "
-            "document is never re-posed, and a clone can only be opened from a file. "
-            f"Document {doc_id} has no saved file — call save_part(path=...) (or "
-            "save_assembly) first, then steer it.")
-    clone = (cb.call("doc_open", {"path": str(path), "detach_path": True})
-             or {}).get("doc_id")
-    if not clone:
-        raise ValueError(f"doc_open({path}) returned no doc_id; cannot steer a clone.")
+def _clone_detached(doc_id: str, kind: str) -> str:
+    """Clone the current live revision without changing the source document."""
+    fd, path = tempfile.mkstemp(prefix="chudware_motion_", suffix=".step+")
+    os.close(fd)
+    try:
+        cb.call("doc_save", {"doc_id": doc_id, "path": path, "preserve_path": True})
+        clone = (cb.call("doc_open", {"path": path, "detach_path": True,
+                                      "internal": True}) or {}).get("doc_id")
+        if not clone:
+            raise ValueError(f"{kind}: snapshot open returned no doc_id")
+    finally:
+        os.unlink(path)
     return clone
 
 
@@ -314,14 +303,13 @@ def _comp_transforms(doc_id: str) -> dict:
     return out
 
 
-def _axis_from_mate(doc_id: str, mate_id: str, cid: str, xf: dict) -> dict:
-    """The WORLD axis a mate resolves to, for the steered component `cid`.
+def _axis_from_mate(doc_id: str, mate_id: str, cid: str, xf: dict,
+                    mate_axes: dict) -> dict:
+    """Return the solved WORLD axis of the mate, not its rounded pick fingerprint.
 
-    A concentric/coincident kingpin mate stores each ref as the geometry query that
-    matched it, and a cylindrical/circular match carries its own `axis` + `centroid`
-    in the component's LOCAL frame — the measured kingpin axis, already in the
-    document. Prefer the ref that belongs to `cid`; otherwise take the other side's
-    (a satisfied concentric mate puts both on the same world line) and say so.
+    The engine resolves each reference against the component geometry and supplies
+    its full-precision local axis. A trimmed cylinder's centroid need not even lie
+    on that axis; rounding the selector also exceeds the solver's tolerance.
     """
     tr = cb.call("doc_tree", {"doc_id": doc_id}).get("tree") or {}
     mates = [m for m in (tr.get("mates") or []) if isinstance(m, dict)]
@@ -331,24 +319,24 @@ def _axis_from_mate(doc_id: str, mate_id: str, cid: str, xf: dict) -> dict:
         raise ValueError(f"steer mate_id '{mate_id}' is not a mate of this assembly. "
                          f"Mates: {known}")
     refs = [r for r in (mate.get("refs") or []) if isinstance(r, dict)]
-    axial = [r for r in refs
-             if isinstance((r.get("selector") or {}).get("axis"), list)
-             and isinstance((r.get("selector") or {}).get("centroid"), list)]
+    if mate.get("suppressed"):
+        raise ValueError(f"steer mate_id '{mate_id}' is suppressed.")
+    if not any(r.get("component") == cid for r in refs):
+        raise ValueError(f"steer mate_id '{mate_id}' does not reference component '{cid}'.")
+    axial = mate_axes.get(mate_id) or []
     if not axial:
         raise ValueError(
             f"steer mate_id '{mate_id}' ({mate.get('type')}) resolves no AXIS: neither "
-            "reference is a cylindrical face or circular edge, so there is no kingpin "
-            "line to rotate about. Pass axis={'point':[x,y,z],'dir':[x,y,z]} (e.g. from "
-            "fit_cylinder_axis on the kingpin bore).")
+            "reference resolved to an axis. Pass axis={'point':[x,y,z],'dir':[x,y,z]} "
+            "(e.g. from fit_cylinder_axis on the kingpin bore).")
     ref = next((r for r in axial if r.get("component") == cid), axial[0])
     owner = str(ref.get("component") or "")
     m = xf.get(owner)
     if m is None:
         raise ValueError(f"steer mate_id '{mate_id}': its reference component "
                          f"'{owner}' is not placed in this assembly.")
-    sel = ref["selector"]
-    pt = _xform_point(m, [float(v) for v in sel["centroid"]])
-    d = [float(v) for v in sel["axis"]]
+    pt = _xform_point(m, [float(v) for v in ref["point"]])
+    d = [float(v) for v in ref["direction"]]
     dw = [m[0] * d[0] + m[1] * d[1] + m[2] * d[2],
           m[4] * d[0] + m[5] * d[1] + m[6] * d[2],
           m[8] * d[0] + m[9] * d[1] + m[10] * d[2]]
@@ -382,7 +370,7 @@ def _axis_literal(raw, label: str) -> dict:
     return {"point": p, "dir": d, "source": "explicit axis"}
 
 
-def _steer_drives(doc_id: str, spec, label: str, xf: dict) -> list:
+def _steer_drives(doc_id: str, spec, label: str, xf: dict, mate_axes: dict) -> list:
     """A `steer`/`rear_steer` spec -> [{component,name,angle_deg,axis,wheel}].
 
     Refuses instead of guessing: an unknown key, a components/angles length mismatch,
@@ -448,7 +436,7 @@ def _steer_drives(doc_id: str, spec, label: str, xf: dict) -> list:
             mids = raw_mate if isinstance(raw_mate, list) else [raw_mate] * n
             if len(mids) != n:
                 raise ValueError(f"{label}: {len(mids)} mate_ids for {n} components.")
-            axes.append(_axis_from_mate(doc_id, str(mids[i]), cid, xf))
+            axes.append(_axis_from_mate(doc_id, str(mids[i]), cid, xf, mate_axes))
             continue
         a = coerce_json_or_repr(raw_axis)
         if isinstance(a, list):
@@ -484,7 +472,8 @@ def _steer_drives(doc_id: str, spec, label: str, xf: dict) -> list:
 
 
 def steer_pose_sweep(doc_id: str, steer, rear_steer, steps: int,
-                     check_interference: bool, tool: str) -> dict:
+                     check_interference: bool, tool: str,
+                     min_clearance_mm: float = 0.0) -> dict:
     """Drive named components about their kingpin axes; return a simulate_motion-shaped
     result so every consumer downstream is identical to the dimensional-mate path.
 
@@ -501,18 +490,34 @@ def steer_pose_sweep(doc_id: str, steer, rear_steer, steps: int,
     trajectory: the film and a turning-radius study must pose the same clone the same
     way, so there is one steer driver and no second interpretation of the spec.
     """
+    min_clearance_mm = float(min_clearance_mm)
+    if not math.isfinite(min_clearance_mm) or min_clearance_mm < 0:
+        raise ValueError(f"{tool}: min_clearance_mm must be finite and non-negative.")
+    if steps < 2 or steps > _MOTION_MAX_STEPS:
+        raise ValueError(f"{tool}: steps must be between 2 and {_MOTION_MAX_STEPS}.")
+    check_interference = bool(check_interference or min_clearance_mm > 0)
     clone = _clone_detached(doc_id, tool)
     try:
-        reference_bodies = cb.call("asm_world_bodies", {"doc_id": clone}).get("bodies") or []
+        need_mate_axes = False
+        for spec in (steer, rear_steer):
+            parsed = coerce_json_or_repr(spec)
+            if isinstance(parsed, dict) and any(
+                    parsed.get(k) is not None for k in ("mate_ids", "mate_id", "mates", "mate")):
+                need_mate_axes = True
+                break
+        reference = cb.call("asm_world_bodies", {"doc_id": clone,
+                                                  "include_mate_axes": need_mate_axes})
+        reference_bodies = reference.get("bodies") or []
+        mate_axes = reference.get("mate_axes") or {}
         base = _comp_transforms(clone)
         names = {}
         for c in _components(clone):
             names[str(c.get("id"))] = c.get("name") or str(c.get("id"))
-        drives = _steer_drives(clone, steer, "steer", base)
+        drives = _steer_drives(clone, steer, "steer", base, mate_axes)
         for dr in drives:
             dr["axle"] = "front"
         if rear_steer is not None:
-            rear = _steer_drives(clone, rear_steer, "rear_steer", base)
+            rear = _steer_drives(clone, rear_steer, "rear_steer", base, mate_axes)
             for dr in rear:
                 dr["axle"] = "rear"
             drives += rear
@@ -586,7 +591,7 @@ def steer_pose_sweep(doc_id: str, steer, rear_steer, steps: int,
                 try:
                     ir = cb.call("eval_interference",
                                  {"doc_id": clone, "include_coincident": False,
-                                  "min_clearance_mm": 0.0,
+                                  "min_clearance_mm": min_clearance_mm,
                                   "clearance_mode": "threshold"}) or {}
                 except Exception as exc:  # noqa: BLE001 — retain the valid pose
                     if getattr(exc, "code", None) == "engine_connection_lost":
@@ -600,6 +605,16 @@ def steer_pose_sweep(doc_id: str, steer, rear_steer, steps: int,
                                        code="engine_connection_lost", detail=ir.get("detail"))
                 hits = [_clash_row(h) for h in (ir.get("interferences") or [])
                         if isinstance(h, dict)]
+                clearances = [c for c in (ir.get("clearances") or [])
+                              if isinstance(c, dict)]
+                hits.extend(_clash_row(c) for c in clearances
+                            if c.get("clearance_status") == "below"
+                            or c.get("warning") == "below min clearance")
+                uncertain = [{**c, "reason": "clearance_within_tolerance"}
+                             for c in clearances
+                             if c.get("clearance_status") == "within_tolerance"]
+                if uncertain:
+                    ir = {**ir, "pair_failures": (ir.get("pair_failures") or []) + uncertain}
                 checked, total = ir.get("pairs_checked"), ir.get("pairs_total")
                 complete = (
                     ir.get("complete") is True
@@ -652,6 +667,7 @@ def steer_pose_sweep(doc_id: str, steer, rear_steer, steps: int,
             "pose_check": {"ok": all(f["pose_check"]["ok"] for f in trajectory),
                            "frames": [{"i": f["i"], **f["pose_check"]} for f in trajectory]},
             "interference": {"checked": bool(check_interference),
+                             "min_clearance_mm": min_clearance_mm,
                              "complete": interference_complete,
                              "frames_checked": frames_checked,
                              "pair_failures": pair_failures,
@@ -683,69 +699,6 @@ def steer_pose_sweep(doc_id: str, steer, rear_steer, steps: int,
 def register_cad_motion_tools(mcp: FastMCP) -> None:
     """CAD kinematic-evidence MCP tools: sweep_envelope, steering_turning_radius, motion_fea_handoff_sweep."""
 
-    def _tool(name: str):
-        """The sibling MCP tool's registered callable (guard wrapper included).
-
-        Resolved lazily: this module registers alongside cad_asm_tools on the SAME
-        FastMCP instance, and registration order must not become a load-order rule.
-        """
-        entries = getattr(getattr(mcp, "_tool_manager", None), "_tools", None) or {}
-        entry = entries.get(name)
-        fn = getattr(entry, "fn", None)
-        if fn is None:
-            raise ValueError(
-                f"{name} is not registered on this server; the motion tools compose it "
-                "and cannot substitute their own copy.")
-        return fn
-
-    def _call_tool(name: str, **kwargs) -> dict:
-        """Call a sibling tool and decode its JSON reply (tools return text)."""
-        raw = _tool(name)(**kwargs)
-        if isinstance(raw, (dict, list)):
-            return raw if isinstance(raw, dict) else {"ok": True, "result": raw}
-        try:
-            out = json.loads(raw)
-        except Exception as exc:  # noqa: BLE001
-            raise ValueError(f"{name} returned a non-JSON reply: {raw!r:.200}") from exc
-        if not isinstance(out, dict):
-            raise ValueError(f"{name} returned {type(out).__name__}, expected an object")
-        return out
-
-    # ------------------------------------------------------------------ geometry helpers
-
-    _LOCAL_BBOX: dict = {}
-
-    def _local_bbox(source_path: str) -> dict:
-        """{min,max} of a component's own part file, in its LOCAL frame (cached per path)."""
-        hit = _LOCAL_BBOX.get(source_path)
-        if hit is not None:
-            return hit
-        part_doc = cb.call("doc_open", {"path": source_path}).get("doc_id")
-        if not part_doc:
-            raise ValueError(f"component source '{source_path}' could not be opened")
-        bb = cb.call("doc_bbox", {"doc_id": part_doc}) or {}
-        lo, hi = bb.get("min"), bb.get("max")
-        if not (isinstance(lo, list) and isinstance(hi, list) and
-                len(lo) == 3 and len(hi) == 3):
-            raise ValueError(f"component source '{source_path}' has no bounding box "
-                             "(it builds no solid)")
-        hit = {"min": [float(v) for v in lo], "max": [float(v) for v in hi],
-               "doc_id": part_doc}
-        _LOCAL_BBOX[source_path] = hit
-        return hit
-
-    def _source_path(comp: dict, asm_doc: str) -> str:
-        path = ((comp.get("source") or {}).get("path")) or ""
-        if not path:
-            raise ValueError(f"component '{comp.get('id')}' has no source part file; "
-                             "its geometry cannot be swept")
-        if not os.path.isabs(path):
-            asm_path = next((row.get("path") for row in
-                             (cb.call("doc_list", {}) or {}).get("docs", [])
-                             if isinstance(row, dict) and row.get("doc_id") == asm_doc), None)
-            if asm_path:
-                path = os.path.join(os.path.dirname(asm_path), path)
-        return os.path.abspath(path)
 
     def _corners(bbox: dict) -> list:
         lo, hi = bbox["min"], bbox["max"]
@@ -792,11 +745,13 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
         return out
 
     def _sweep(doc_id: str, mate_id, start, stop, steps: int,
-               dynamics: Optional[dict] = None, check_interference: bool = False) -> dict:
-        """One simulate_motion run through the registered tool (its validation, its dialect)."""
-        out = _call_tool("simulate_motion", mate_id=mate_id, start=start, stop=stop,
-                         steps=int(steps), check_interference=bool(check_interference),
-                         dynamics=dynamics, doc_id=doc_id)
+               dynamics: Optional[dict] = None, check_interference: bool = False,
+               min_clearance_mm: float = 0.0) -> dict:
+        """Run the shared motion implementation without persisting a study."""
+        out = run_motion_sweep(doc_id, mate_id=mate_id, start=start, stop=stop,
+                               steps=int(steps), check_interference=bool(check_interference),
+                               min_clearance_mm=min_clearance_mm, dynamics=dynamics,
+                               persist_study=False)
         # Preserve evidence (including failed pose_check) through every caller.
         if out.get("ok") and not (out.get("trajectory") or []):
             raise ValueError("motion sweep returned no trajectory")
@@ -845,13 +800,12 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
         the `boolean` feature `op:"fuse"` (contracts/feature_params.md "Multi-body").
         """
         step_file = _tmp(".step")
-        src_doc = _local_bbox(source_path)["doc_id"]
-        cb.call("doc_export_step", {"doc_id": src_doc, "path": step_file})
+        with open_component_part(source_path) as src_doc:
+            cb.call("doc_export_step", {"doc_id": src_doc, "path": step_file})
         body_name = f"{name}_sweep"
         doc = cb.call("doc_new", {"kind": "part", "name": body_name}).get("doc_id")
         if not doc:
             raise ValueError("doc_new returned no doc_id for the swept-volume part")
-        note_touched_doc(doc)
 
         ops = [{"op": "add_feature", "feature": {
             "type": "import", "name": f"{name}_src",
@@ -905,14 +859,14 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
                        stop: Optional[float] = None, steps: int = 24,
                        components: Optional[list] = None, fuse: bool = False,
                        steer: Optional[dict] = None, rear_steer: Optional[dict] = None,
-                       doc_id: Optional[str] = None) -> str:
+                       doc_id: Optional[str] = None,
+                       min_clearance_mm: Optional[float] = None) -> str:
         """SWEPT ENVELOPE of a moving mechanism — the volume its parts need to be given.
 
-        Drives the mechanism and, at every sample, moves the eight corners of each
-        component's initial WORLD-shape bounding box by its relative solved motion.
-        The zero-motion envelope therefore agrees with list_world_bodies, regardless
-        of pre-existing placement or free wheel spin. Returns the union envelope and
-        per-step, per-component boxes for clearance claims.
+        At each sample, moves the eight corners of each component's initial world AABB
+        by its relative solved motion. The result conservatively bounds geometry at
+        sampled poses only, not the continuous path between samples. The reported
+        overshoot bound is a per-axis distance bound, not a volume-error estimate.
 
         TWO WAYS TO DRIVE IT:
           * `mate_id` + [start, stop] — one dimensional (angle/distance) mate, swept with
@@ -925,9 +879,8 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
               steer={"components":["upright_FL","upright_FR"],
                      "axis":{"point":[x,y,z],"dir":[x,y,z]},   # or "mate_id":"m7"
                      "angle_deg":30}                            # or "angles_deg":[30,26.4]
-            `rear_steer` takes the same shape for a 4WS rear axle. `steps` samples scale
-            the angles from 0 (straight ahead) to full lock, so the envelope covers the
-            whole steering range, not just the extreme.
+            `rear_steer` takes the same shape for a 4WS rear axle. Samples scale the
+            angles from 0 to full lock; intermediate motion is not bounded.
 
         components : component ids or names to sweep (default: every non-suppressed
                      component). Source part files are needed only for fuse=True.
@@ -937,13 +890,16 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
                      carries that document's id, volume_mm3 and bbox. Costs one boolean per
                      step — keep `steps` modest (<= ~24) when fusing. Default False (bbox
                      envelope only, no geometry written).
+        min_clearance_mm: when supplied, check all assembly pairs at every sample for
+                     overlaps and, if positive, distances below this threshold. Even
+                     a complete check says nothing about motion between samples.
 
         Returns {ok, doc_id, mate_id, driver, components, envelope:{min,max,size,center},
                  per_component:{id:{min,max,size,center}}, per_step:[{i,value,
                  components:{id:{min,max,size}}}], swept_solids:[{component, doc_id,
                  body_name, volume_mm3, bbox}] (fuse only), warnings}. The envelope is
-        AXIS-ALIGNED in world coordinates. On a steer sweep `driver.type` is "steer" and
-        `driver.axes` echoes the kingpin axis each component was rotated about.
+        AXIS-ALIGNED in world coordinates. Fused solids are also unions of sampled
+        poses, not continuous swept volumes. On a steer sweep `driver.type` is "steer".
         `pose_check` verifies t=p-Rp, the requested rotation and world-aligned
         coordinate invariants for driven hubs AND their single-anchor carried
         mate islands (including wheels). Failed checks return ok=false instead of
@@ -956,6 +912,12 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
             rear_steer = _normalize_optional_slot(rear_steer)
             comps = _resolve_components(d, _normalize_optional_slot(components))
             steps = int(steps)
+            if steps > _MOTION_MAX_STEPS:
+                raise ValueError(f"sweep_envelope: steps exceeds {_MOTION_MAX_STEPS}.")
+            check_clearance = min_clearance_mm is not None
+            clearance = float(min_clearance_mm) if check_clearance else 0.0
+            if not math.isfinite(clearance) or clearance < 0:
+                raise ValueError("sweep_envelope: min_clearance_mm must be finite and non-negative.")
             if steps < 2:
                 raise ValueError("sweep_envelope: `steps` must be >= 2.")
             if fuse and steps > 64:
@@ -971,11 +933,13 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
                     raise ValueError(
                         "sweep_envelope: `steer` and the mate sweep (mate_id/start/stop) "
                         "are two different drives — pass one or the other.")
-                out = steer_pose_sweep(d, steer, rear_steer, steps, False, "sweep_envelope")
+                out = steer_pose_sweep(d, steer, rear_steer, steps, check_clearance,
+                                       "sweep_envelope", clearance)
                 if not out.get("ok"):
                     return _dumps(out)
             else:
-                out = _sweep(d, mate_id, start, stop, steps)
+                out = _sweep(d, mate_id, start, stop, steps,
+                             check_interference=check_clearance, min_clearance_mm=clearance)
             if not out.get("ok"):
                 return _dumps(out)
             reference = _reference_corners(out)
@@ -1013,9 +977,13 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
             if not all_points:
                 raise ValueError("sweep_envelope: no requested component was placed in any "
                                  "sweep frame; check the component ids")
+            incomplete = [c["id"] for c in comps
+                          if len(poses[c["id"]]) != len(trajectory)]
+            if incomplete:
+                warnings.append(f"components missing from one or more samples: {incomplete}")
 
             result = {
-                "ok": True,
+                "ok": not incomplete,
                 "doc_id": d,
                 "mate_id": out.get("mate_id"),
                 "driver": out.get("driver"),
@@ -1026,7 +994,20 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
                                   for cid, pts in per_component_points.items() if pts},
                 "per_step": per_step,
                 "warnings": warnings,
+                "envelope_method": "conservative_sampled_world_aabb",
+                "overshoot_bound_mm": {
+                    cid: max(math.dist(a, b) for a in corners for b in corners)
+                    for cid, corners in reference.items()
+                },
+                "overshoot_bound_description": (
+                    "Per component, each sampled box face can exceed the corresponding "
+                    "true geometry extent by at most the reference world-AABB diagonal. "
+                    "This does not bound unsampled motion or volume error."),
+                "interference": out.get("interference"),
             }
+            if incomplete:
+                result["error"] = "sampled envelope is incomplete for requested components"
+                return _dumps(result)
             if fuse:
                 solids = []
                 for c in comps:
@@ -1034,7 +1015,7 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
                     if not poses.get(cid):
                         continue
                     built = _build_swept_solid(c.get("name") or cid,
-                                               _source_path(c, d), poses[cid])
+                                               component_source_file(c, d), poses[cid])
                     built["component"] = cid
                     solids.append(built)
                     if not built.get("ok"):
@@ -1074,7 +1055,8 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
                                 steer: Optional[dict] = None,
                                 rear_steer: Optional[dict] = None,
                                 check_interference: bool = False,
-                                doc_id: Optional[str] = None) -> str:
+                                doc_id: Optional[str] = None,
+                                min_clearance_mm: float = 0.0) -> str:
         """TURNING RADIUS of a steered vehicle, from its own solved geometry.
 
         Poses the steering, reads every wheel's YAW (heading of its local +X about world
@@ -1139,6 +1121,8 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
         check_interference : evaluate solid overlap at every sampled angle and report the
                   FIRST one that clashes (`first_interference_deg`) — the steering-lock
                   limit the geometry actually imposes.
+        min_clearance_mm : positive values also check near pairs below this distance;
+                  supplying a positive threshold enables checking automatically.
 
         Returns {ok, doc_id, mate_id, driver, wheelbase_mm, track_mm, derived_from,
                  steered_components, turning_radius_mm/_m/_ft (the tightest sampled),
@@ -1163,6 +1147,12 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
             steer = _normalize_optional_slot(steer)
             rear_steer = _normalize_optional_slot(rear_steer)
             steps = int(steps)
+            min_clearance_mm = float(min_clearance_mm)
+            if not math.isfinite(min_clearance_mm) or min_clearance_mm < 0:
+                raise ValueError("steering_turning_radius: min_clearance_mm must be finite and non-negative.")
+            check_interference = bool(check_interference or min_clearance_mm > 0)
+            if steps > _MOTION_MAX_STEPS:
+                raise ValueError(f"steering_turning_radius: steps exceeds {_MOTION_MAX_STEPS}.")
             if steps < 2:
                 raise ValueError("steering_turning_radius: `steps` must be >= 2.")
             if steer is None and rear_steer is not None:
@@ -1181,12 +1171,13 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
                         "`steer_mate_id`/start/stop sweeps a dimensional mate — pass one "
                         "or the other, not both.")
                 out = steer_pose_sweep(d, steer, rear_steer, steps, check_interference,
-                                   "steering_turning_radius")
+                                       "steering_turning_radius", min_clearance_mm)
                 if not out.get("ok"):
                     return _dumps(out)
             else:
                 out = _sweep(d, steer_mate_id, start, stop, steps,
-                             check_interference=check_interference)
+                             check_interference=check_interference,
+                             min_clearance_mm=min_clearance_mm)
             if not out.get("ok"):
                 return _dumps(out)
             trajectory = out.get("trajectory") or []
@@ -1630,6 +1621,8 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
             if steps < 3:
                 raise ValueError("motion_fea_handoff_sweep: `steps` must be >= 3 "
                                  "(inverse dynamics needs acceleration).")
+            if steps > _MOTION_MAX_STEPS:
+                raise ValueError(f"motion_fea_handoff_sweep: steps exceeds {_MOTION_MAX_STEPS}.")
             if stop is None:
                 raise ValueError("motion_fea_handoff_sweep: `stop` is required.")
             stop = float(stop)
@@ -1644,9 +1637,8 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
             dyn = coerce_json_or_repr({} if dynamics is None else dynamics)
             if not isinstance(dyn, dict):
                 raise ValueError("motion_fea_handoff_sweep: dynamics must be an object.")
-            duration_s = float(dyn.get("duration_s", 1.0) or 1.0)
-            if not math.isfinite(duration_s) or duration_s <= 0.0:
-                raise ValueError("motion_fea_handoff_sweep: dynamics.duration_s must be > 0.")
+            duration_s = _dynamics_duration(dyn, "motion_fea_handoff_sweep")
+            mesh_fineness = _mesh_fineness(mesh_fineness, "motion_fea_handoff_sweep")
 
             samples = [start + (stop - start) * i / (steps - 1) for i in range(steps)]
             if positions is None:
@@ -1654,6 +1646,8 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
             else:
                 wanted = [float(p) for p in require_list(
                     positions, "positions", "a list of driver values (deg or mm)")]
+                if not all(math.isfinite(p) for p in wanted):
+                    raise ValueError("motion_fea_handoff_sweep: positions must be finite.")
                 if not wanted:
                     raise ValueError("motion_fea_handoff_sweep: `positions` is empty.")
                 lo, hi = min(start, stop), max(start, stop)
@@ -1663,24 +1657,27 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
                         f"motion_fea_handoff_sweep: positions {outside} lie outside the "
                         f"sweep [{lo:g}, {hi:g}].")
 
-            def _run() -> dict:
+            def _run_frames(ctx) -> dict:
                 rows = []
                 warnings: list = []
                 for want in wanted:
-                    # `motion_fea_handoff` picks its frame by TIME; the sweep's time map is
-                    # linear in the driver value, so a position is an exact time.
+                    # Select the nearest sampled driver value and its dynamics frame.
                     idx = min(range(steps), key=lambda i: abs(samples[i] - want))
                     t_s = duration_s * idx / (steps - 1)
                     row = {"position_requested": want, "position": samples[idx],
                            "t_s": t_s}
                     try:
-                        out = _call_tool(
-                            "motion_fea_handoff", component=component, fixtures=fixtures,
-                            mate_id=mate_id, start=start, stop=stop, steps=steps, at=t_s,
-                            dynamics=dyn, material=material, mesh_fineness=mesh_fineness,
-                            doc_id=d, fixture_mate_id=fixture_mate_id,
-                            body_load_face=body_load_face)
+                        frame = next((f for f in ctx.frames if f.get("i") == idx), None)
+                        if frame is None:
+                            raise ValueError(f"dynamics frame {idx} is unavailable")
+                        out = handoff_frame(
+                            ctx, frame, at=t_s, body_load_face=body_load_face,
+                            material=material, mesh_fineness=mesh_fineness, dry_run=False)
+                    except _HandoffRefused as exc:
+                        out = exc.payload
                     except Exception as exc:  # noqa: BLE001 — one bad pose must not lose the batch
+                        if getattr(exc, "code", None) == "engine_connection_lost":
+                            raise
                         row.update({"ok": False, "error": str(exc)})
                         rows.append(row)
                         continue
@@ -1725,6 +1722,7 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
                     "doc_id": d,
                     "component": component,
                     "mate_id": mate_id,
+                    "density_sources": ctx.density_sources,
                     "driver": {"start": start, "stop": stop, "steps": steps,
                                "duration_s": duration_s},
                     "positions": rows,
@@ -1741,6 +1739,16 @@ def register_cad_motion_tools(mcp: FastMCP) -> None:
                     result["summary"] = f"no position solved ({len(rows)} attempted)"
                     result["error"] = "every requested position failed its handoff"
                 return result
+
+            def _run() -> dict:
+                try:
+                    with handoff_setup(
+                            d, component, fixtures, mate_id=mate_id, start=start, stop=stop,
+                            steps=steps, dynamics=dyn, material=material,
+                            fixture_mate_id=fixture_mate_id) as ctx:
+                        return _run_frames(ctx)
+                except _HandoffRefused as exc:
+                    return exc.payload
 
             if background:
                 jid = _start_job("motion_fea_sweep", _run)

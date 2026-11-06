@@ -17,6 +17,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <BRepAdaptor_Surface.hxx>
@@ -25,6 +26,8 @@
 #include <GeomAbs_SurfaceType.hxx>
 #include <Standard_Failure.hxx>
 #include <TopExp_Explorer.hxx>
+#include <TopExp.hxx>
+#include <TopTools_IndexedMapOfShape.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Face.hxx>
 #include <gp_Cylinder.hxx>
@@ -33,8 +36,11 @@
 #include "doc/assembly.h"  // compile_assembly / placed_world_shape (multi-body / asm sourcing)
 #include "doc/document.h"
 #include "doc/drawing.h"
+#include "doc/picks.h"
+#include "doc/selectors.h"
 #include "doc/session.h"  // OpError
 #include "doc/stepplus.h"
+#include "util/expr.h"
 
 using nlohmann::json;
 
@@ -163,6 +169,7 @@ struct DrawingSession {
     mutable std::string shapes_key;
     mutable std::vector<TopoDS_Shape> shapes_cache;
     mutable std::map<std::string, json> projection_cache;
+    mutable json source_owners;  // owner map for the cached compiled source topology
 };
 
 std::mutex g_mtx;
@@ -199,6 +206,107 @@ std::string new_drawing_id() {
     std::snprintf(buf, sizeof(buf), "dwg-cpp%08llx", n);
     return std::string(buf);
 }
+
+// Drawing sessions are outside the document registry, so their source links must
+// be registered explicitly. A provisional link is installed before fetching the
+// source and removed on any failed creation.
+class DrawingDependency {
+public:
+    explicit DrawingDependency(std::string id) : id_(std::move(id)) {}
+    ~DrawingDependency() {
+        if (active_) {
+            try { doc_dep_unregister(id_, "drawing"); } catch (...) {}
+        }
+    }
+    void register_source(const std::string& source_id, long revision) {
+        if (source_id.empty()) return;
+        active_ = true;
+        doc_dep_register(source_id, id_, "drawing", revision);
+    }
+    void reset() {
+        if (active_) {
+            doc_dep_unregister(id_, "drawing");
+            active_ = false;
+        }
+    }
+    void release() { active_ = false; }
+    DrawingDependency(const DrawingDependency&) = delete;
+    DrawingDependency& operator=(const DrawingDependency&) = delete;
+
+private:
+    std::string id_;
+    bool active_ = false;
+};
+
+// Keep a separate link alive across the gap between releasing DrawingLock and
+// publishing the embedded source. A concurrent close or source replacement can
+// remove the drawing's link, but cannot release this in-flight save's link.
+class DrawingSourceSave {
+public:
+    explicit DrawingSourceSave(const std::string& drawing_id)
+        : dependency_(drawing_id + ":save:" + new_drawing_id()) {}
+    ~DrawingSourceSave() {
+        if (persisted_) {
+            try {
+                doc_mark_history_published(source_id_);
+            } catch (...) {
+                // If publication itself fails, retain the link rather than permit
+                // cleanup of IDs already written to the archive.
+                dependency_.release();
+            }
+        }
+    }
+    void protect(const std::string& source_id, long revision) {
+        source_id_ = source_id;
+        dependency_.register_source(source_id_, revision);
+    }
+    void source_written() { persisted_ = !source_id_.empty(); }
+    void publish() {
+        if (persisted_) {
+            doc_mark_history_published(source_id_);
+            persisted_ = false;
+        }
+    }
+
+private:
+    DrawingDependency dependency_;
+    std::string source_id_;
+    bool persisted_ = false;
+};
+
+class DrawingOnFailure {
+public:
+    explicit DrawingOnFailure(const std::string& id) : id_(id) {}
+    ~DrawingOnFailure() {
+        if (active_) {
+            try { drawing_close(id_); } catch (...) {}
+        }
+    }
+    void release() { active_ = false; }
+    DrawingOnFailure(const DrawingOnFailure&) = delete;
+    DrawingOnFailure& operator=(const DrawingOnFailure&) = delete;
+
+private:
+    const std::string& id_;
+    bool active_ = true;
+};
+
+class EmbeddedSourceOnFailure {
+public:
+    EmbeddedSourceOnFailure(const std::string& id, bool active) : id_(id), active_(active) {}
+    ~EmbeddedSourceOnFailure() {
+        if (active_) {
+            try { doc_close(id_); } catch (...) {}
+        }
+    }
+    void release() { active_ = false; }
+    EmbeddedSourceOnFailure(const EmbeddedSourceOnFailure&) = delete;
+    EmbeddedSourceOnFailure& operator=(const EmbeddedSourceOnFailure&) = delete;
+
+private:
+    const std::string& id_;
+    bool active_;
+};
 
 DrawingSession& require_session(const std::string& doc_id) {
     auto it = g_drawings.find(doc_id);
@@ -262,6 +370,7 @@ std::vector<TopoDS_Shape> source_shapes(const DrawingSession& s,
     // Assembly source: resolve + mate-solve its components and return every world-placed
     // body so all of them superimpose in each view (one combined projection per orientation).
     if (tree.is_object() && tree.value("schema", std::string()) == "aicad.asm/1") {
+        s.source_owners = json::object();
         try {
             AssemblyResult ares = compile_assembly(tree, component_base);
             out.reserve(ares.bodies.size());
@@ -277,6 +386,19 @@ std::vector<TopoDS_Shape> source_shapes(const DrawingSession& s,
                 TopoDS_Shape world = placed_world_shape(b);
                 if (world.IsNull()) continue;
                 out.push_back(world);
+                if (!b.component_id.empty()) {
+                    const int body = static_cast<int>(out.size());
+                    json& owner = s.source_owners["component:" + b.component_id];
+                    if (!owner.contains("edges")) owner["edges"] = json::array();
+                    if (!owner.contains("faces")) owner["faces"] = json::array();
+                    TopTools_IndexedMapOfShape edges;
+                    TopExp::MapShapes(world, TopAbs_EDGE, edges);
+                    for (int edge = 1; edge <= edges.Extent(); ++edge)
+                        owner["edges"].push_back(json::array({body, edge}));
+                    int face = 0;
+                    for (TopExp_Explorer exp(world, TopAbs_FACE); exp.More(); exp.Next())
+                        owner["faces"].push_back(json::array({body, ++face}));
+                }
                 if (components) {
                     const std::string seed = b.component_id.substr(0, b.component_id.find('#'));
                     components->push_back({b.component_id, b.name, sources[seed], world});
@@ -285,7 +407,15 @@ std::vector<TopoDS_Shape> source_shapes(const DrawingSession& s,
         } catch (...) { /* unresolved source projects as an empty view */ }
     } else {
         CompileResult res = compile_document(tree, env.is_null() ? json::object() : env);
-        out = res.shapes;
+        if (!res.ok) {
+            json failed = json::array();
+            for (const auto& status : res.statuses)
+                if (!status.ok) failed.push_back({{"id", status.id}, {"error", status.error}});
+            throw OpError("rebuild_failed", "drawing source history did not rebuild",
+                          {{"reason", "feature_failed"}, {"failed_features", std::move(failed)}});
+        }
+        out = std::move(res.shapes);
+        s.source_owners = res.owner_map;
     }
     if (key != s.shapes_key) {
         s.shapes_key = key;
@@ -799,7 +929,8 @@ std::string compose_disp(const json& ann, const std::string& units) {
             const std::string TIMES = "\xC3\x97";      // U+00D7
             const std::string DEG = "\xC2\xB0";        // U+00B0
             double d = value;  // pilot/minor diameter (model mm)
-            double D = ann.value("cbore_dia", 0.0);
+            double D = (ht == "countersink" || ht == "csk")
+                           ? ann.value("csk_dia", 0.0) : ann.value("cbore_dia", 0.0);
             double h = ann.value("cbore_depth", 0.0);
             double ang = ann.value("csk_angle", 0.0);
             double depth = ann.value("depth", 0.0);
@@ -851,6 +982,10 @@ std::string compose_disp(const json& ann, const std::string& units) {
 
     std::string body = sym + core;
     if (ips && !angular) body += " in";
+    if (kind == "hole_callout" && ann.value("hole_type", std::string()) == "simple") {
+        double depth = ann.value("depth", 0.0);
+        if (depth > 1e-9) body += " \xE2\x86\xA7 " + fmt_len(depth, ips, prec);
+    }
     body = pre + body + suf;
     if (count > 1) body = std::to_string(count) + "\xC3\x97 " + body;  // U+00D7 multiply
     if (tt == "basic" && !angular) body = "[" + body + "]";
@@ -859,23 +994,6 @@ std::string compose_disp(const json& ann, const std::string& units) {
 
 double round6(double v) { return std::round(v * 1e6) / 1e6; }
 
-// Parse a metric standard size string (e.g. "M4", "M10", "M3.5") to its nominal diameter
-// in model mm. Accepts "M<digits>" and "M<digits>.<digits>" (ISO 261 / DIN 13 nominal).
-// Returns 0.0 for anything that does not parse as a valid metric size (unrecognised strings,
-// imperial strings, or sizes below 1 mm that are likely noise). Used as a last-resort fallback
-// in the hole callout path so an M-standard hole never prints a literal "DIA 0" / "⌀0".
-double parse_metric_standard_diameter(const std::string& std_str) {
-    if (std_str.empty()) return 0.0;
-    const char* p = std_str.c_str();
-    // Accept leading 'M' or 'm' only.
-    if (*p != 'M' && *p != 'm') return 0.0;
-    ++p;
-    // Parse digits (and optional single decimal point) for the nominal size.
-    char* end = nullptr;
-    double d = std::strtod(p, &end);
-    if (end == p || d < 1.0) return 0.0;  // must be at least 1 mm to be credible
-    return d;
-}
 
 // The arc in geom["arcs"] whose ring lies nearest `point` (drawing.py::_nearest_arc).
 // `min_r` skips degenerate near-zero-radius projected circles: a chamfered / counterbored /
@@ -898,7 +1016,12 @@ const json* nearest_arc(const json& geom, const json& point, int want_closed /*-
         double r = arc.value("radius", 0.0);
         if (r < min_r) continue;  // skip degenerate / spurious near-zero-radius circles
         double d = std::fabs(std::hypot(px - cx, py - cy) - r);
-        if (!best || d < best_d) { best_d = d; best = &arc; }
+        if (!best || d < best_d - 1e-9 ||
+            (std::fabs(d - best_d) <= 1e-9 && arc.value("layer", std::string()) == "visible" &&
+             best->value("layer", std::string()) != "visible")) {
+            best_d = d;
+            best = &arc;
+        }
     }
     return best;
 }
@@ -929,6 +1052,436 @@ json line_intersection(const json& a, const json& b, const json& c, const json& 
     if (std::fabs(den) < 1e-12) return json(nullptr);
     double t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / den;
     return json::array({x1 + t * (x2 - x1), y1 + t * (y2 - y1)});
+}
+
+// Dimensions remember the source feature and geometric selector, not a transient SID or a
+// TopExp ordinal alone. A deleted owner or an ambiguous selector is deliberately left stale.
+std::string drawing_topology_owner(const DrawingSession& s, const char* kind, int body, int index) {
+    if (!s.source_owners.is_object()) return {};
+    for (auto it = s.source_owners.begin(); it != s.source_owners.end(); ++it) {
+        const json& entries = it.value().value(kind, json::array());
+        for (const json& entry : entries)
+            if (entry.is_array() && entry.size() == 2 && entry[0] == body && entry[1] == index)
+                return it.key();
+    }
+    return {};
+}
+std::string drawing_edge_owner(const DrawingSession& s, int body, int edge) {
+    return drawing_topology_owner(s, "edges", body, edge);
+}
+
+
+json drawing_edge_anchor(const DrawingSession& s, const std::vector<TopoDS_Shape>& shapes,
+                         const json& src) {
+    if (!src.is_object() || src.value("kind", std::string()) != "edge") return nullptr;
+    const int body = src.value("body", 0), edge = src.value("edge_id", 0);
+    if (body < 1 || body > static_cast<int>(shapes.size()) || edge < 1) return nullptr;
+    const std::string owner = drawing_edge_owner(s, body, edge);
+    if (owner.empty()) return nullptr;
+    json selector = make_pick_selector(shapes[body - 1], "edge", edge, owner);
+    if (!selector.is_object()) return nullptr;
+    return json{{"body", body}, {"selector", selector}, {"provenance", src}};
+}
+json drawing_face_anchor(const DrawingSession& s, const std::vector<TopoDS_Shape>& shapes,
+                         const std::string& sid) {
+    json found;
+    for (std::size_t body = 0; body < shapes.size(); ++body) {
+        for (TopoInfo info : describe_faces(shapes[body])) {
+            if (selector_sid(info) != sid || !info.surf || *info.surf != "plane") continue;
+            const std::string owner = drawing_topology_owner(s, "faces",
+                                                             static_cast<int>(body) + 1, info.index + 1);
+            if (owner.empty() || !found.is_null()) return nullptr;
+            info.owner = owner;
+            found = json{{"body", body + 1}, {"selector", make_selector(info)}};
+        }
+    }
+    return found;
+}
+
+bool resolve_drawing_face(const DrawingSession& s, const std::vector<TopoDS_Shape>& shapes,
+                          const json& anchor, TopoInfo& result_info) {
+    if (!anchor.is_object() || !anchor.contains("selector") || !anchor["selector"].is_object())
+        return false;
+    const int body = anchor.value("body", 0);
+    const json& selector = anchor["selector"];
+    const std::string owner = selector.value("owner_feature", std::string());
+    if (owner.empty() || body < 1 || body > static_cast<int>(shapes.size())) return false;
+    std::vector<TopoInfo> candidates;
+    for (TopoInfo info : describe_faces(shapes[body - 1])) {
+        if (!info.surf || *info.surf != "plane" ||
+            drawing_topology_owner(s, "faces", body, info.index + 1) != owner) continue;
+        info.owner = owner;
+        candidates.push_back(std::move(info));
+    }
+    const ResolveResult match = resolve(selector, candidates, bbox_diag(shapes[body - 1]));
+    if (!match.index) return false;
+    for (const auto& candidate : candidates)
+        if (candidate.index == *match.index) { result_info = candidate; return true; }
+    return false;
+}
+
+
+// Use only straight, visible model edges for sheet-point picks. Free-floating points and
+// ambiguous projected geometry remain explicit unassociated dimensions.
+json drawing_point_anchor(const DrawingSession& s, const std::vector<TopoDS_Shape>& shapes,
+                          const json& geom, const json& point,
+                          const std::string& source_sid = {}) {
+    if (!is_xy(point) || !geom.contains("visible") || !geom.contains("visible_src")) return nullptr;
+    const json& lines = geom["visible"];
+    const json& sources = geom["visible_src"];
+    if (!lines.is_array() || !sources.is_array()) return nullptr;
+    const double px = point[0].get<double>(), py = point[1].get<double>();
+    double best = 0.05;
+    json anchor;
+    for (std::size_t i = 0; i < lines.size() && i < sources.size(); ++i) {
+        if (!source_sid.empty() &&
+            (!sources[i].is_object() || sources[i].value("sid", std::string()) != source_sid))
+            continue;
+        const json& line = lines[i];
+        if (!line.is_array() || line.size() != 2 || !is_xy(line[0]) || !is_xy(line[1])) continue;
+        const double x = line[0][0].get<double>(), y = line[0][1].get<double>();
+        const double dx = line[1][0].get<double>() - x, dy = line[1][1].get<double>() - y;
+        const double length2 = dx * dx + dy * dy;
+        if (length2 < 1e-12) continue;
+        const double t = std::clamp(((px - x) * dx + (py - y) * dy) / length2, 0.0, 1.0);
+        const double distance = std::hypot(px - x - t * dx, py - y - t * dy);
+        if (distance > best) continue;
+        json candidate = drawing_edge_anchor(s, shapes, sources[i]);
+        if (candidate.is_null()) continue;
+        if (!anchor.is_null() && std::fabs(distance - best) < 1e-7 &&
+            candidate["provenance"] != anchor["provenance"]) return nullptr;
+        best = distance;
+        candidate["fraction"] = t;
+        candidate["line_vector"] = json::array({dx, dy});
+        anchor = std::move(candidate);
+    }
+    return anchor;
+}
+
+bool resolve_drawing_edge(const DrawingSession& s, const std::vector<TopoDS_Shape>& shapes,
+                          const json& anchor, int& body_id, int& edge_id) {
+    if (!anchor.is_object() || !anchor.contains("selector") ||
+        !anchor["selector"].is_object()) return false;
+    const json& selector = anchor["selector"];
+    const std::string owner = selector.value("owner_feature", std::string());
+    body_id = anchor.value("body", 0);
+    if (owner.empty() || body_id < 1 || body_id > static_cast<int>(shapes.size())) return false;
+    TopTools_IndexedMapOfShape edges;
+    TopExp::MapShapes(shapes[body_id - 1], TopAbs_EDGE, edges);
+    std::vector<TopoInfo> candidates;
+    for (int i = 1; i <= edges.Extent(); ++i) {
+        if (drawing_edge_owner(s, body_id, i) != owner) continue;
+        TopoInfo info = edge_info(TopoDS::Edge(edges(i)), i - 1);
+        info.owner = owner;
+        if (selector.contains("surf") && selector["surf"].is_string() &&
+            (!info.surf || *info.surf != selector["surf"].get<std::string>())) continue;
+        candidates.push_back(std::move(info));
+    }
+    const ResolveResult result = resolve(selector, candidates, bbox_diag(shapes[body_id - 1]));
+    if (result.index) {
+        edge_id = *result.index + 1;
+        return true;
+    }
+    // A changed radius changes circumference but not a circular edge's centre.
+    // Accept that case only when exactly one edge of the original owner retains the
+    // recorded centre; never fall back to an arbitrary same-kind edge.
+    if (!selector.contains("centroid") || !selector["centroid"].is_array() ||
+        selector["centroid"].size() != 3) return false;
+    const auto& center = selector["centroid"];
+    const Eigen::Vector3d old_center(center[0].get<double>(), center[1].get<double>(),
+                                     center[2].get<double>());
+    int match = -1;
+    for (const auto& candidate : candidates)
+        if ((candidate.centroid - old_center).norm() < 1e-4) {
+            if (match != -1) return false;
+            match = candidate.index;
+        }
+    if (match < 0) return false;
+    edge_id = match + 1;
+    return true;
+}
+
+const json* drawing_anchor_line(const json& geom, int body, int edge) {
+    if (!geom.contains("visible") || !geom.contains("visible_src")) return nullptr;
+    const json& lines = geom["visible"];
+    const json& sources = geom["visible_src"];
+    if (!lines.is_array() || !sources.is_array()) return nullptr;
+    const json* found = nullptr;
+    for (std::size_t i = 0; i < lines.size() && i < sources.size(); ++i) {
+        const json& src = sources[i];
+        if (!src.is_object() || src.value("kind", std::string()) != "edge" ||
+            src.value("body", 0) != body || src.value("edge_id", 0) != edge) continue;
+        if (!lines[i].is_array() || lines[i].size() != 2 ||
+            !is_xy(lines[i][0]) || !is_xy(lines[i][1]) || found) return nullptr;
+        found = &lines[i];
+    }
+    return found;
+}
+
+bool resolve_drawing_point(const DrawingSession& s, const std::vector<TopoDS_Shape>& shapes,
+                           const json& geom, const json& anchor, json& point) {
+    int body = 0, edge = 0;
+    if (!resolve_drawing_edge(s, shapes, anchor, body, edge)) return false;
+    const json* line = drawing_anchor_line(geom, body, edge);
+    if (!line) return false;
+    if (!is_xy(anchor.value("line_vector", json()))) return false;
+    const double dx = (*line)[1][0].get<double>() - (*line)[0][0].get<double>();
+    const double dy = (*line)[1][1].get<double>() - (*line)[0][1].get<double>();
+    // Projectors can reverse a polyline's endpoints. Without a stable endpoint
+    // correspondence, retaining its old interpolation fraction would guess.
+    if (dx * anchor["line_vector"][0].get<double>() +
+        dy * anchor["line_vector"][1].get<double>() <= 1e-10) return false;
+    const double t = anchor.value("fraction", 0.0);
+    point = json::array({(*line)[0][0].get<double>() * (1.0 - t) + (*line)[1][0].get<double>() * t,
+                         (*line)[0][1].get<double>() * (1.0 - t) + (*line)[1][1].get<double>() * t});
+    return true;
+}
+
+void move_annotation_label(json& ann, const json& before, const json& after) {
+    if (!is_xy(before) || !is_xy(after) || !is_xy(ann.value("pos", json()))) return;
+    ann["pos"] = json::array({ann["pos"][0].get<double>() + after[0].get<double>() - before[0].get<double>(),
+                              ann["pos"][1].get<double>() + after[1].get<double>() - before[1].get<double>()});
+}
+
+json drawing_chamfer_values(const DrawingSession& s, const std::string& feature);
+std::string compose_chamfer(const json& ann, const std::string& units);
+
+void refresh_drawing_annotation(const DrawingSession& s, const std::vector<TopoDS_Shape>& shapes,
+                                const json& geom, json& ann, const std::string& units) {
+    const std::string kind = ann.value("kind", ann.value("type", std::string()));
+    const bool linear = kind == "linear_dim" || kind == "aligned_dim";
+    const bool angular = kind == "angular_dim";
+    const bool radial = kind == "radial_dim" || kind == "diameter_dim";
+    if (kind == "chamfer") {
+        const json values = drawing_chamfer_values(s, ann.value("feature_ref", std::string()));
+        json point;
+        if (!ann.contains("model_anchors") || !ann["model_anchors"].contains("a") ||
+            !resolve_drawing_point(s, shapes, geom, ann["model_anchors"]["a"], point)) {
+            ann["stale"] = true;
+            ann["stale_reason"] = "chamfer model edge cannot be re-resolved";
+            return;
+        }
+        move_annotation_label(ann, ann.value("a", json()), point);
+        ann["a"] = point;
+        ann["length"] = values["length"];
+        ann["angle"] = values["angle"];
+        ann["overridden"] = !ann.value("text_override", std::string()).empty();
+        if (!ann["overridden"].get<bool>()) ann["text"] = compose_chamfer(ann, units);
+        ann["stale"] = false;
+        ann.erase("stale_reason");
+        return;
+    }
+    if (!linear && !angular && !radial) return;
+    ann["overridden"] = !ann.value("text_override", std::string()).empty();
+    if (!ann.contains("model_anchors") || !ann["model_anchors"].is_object()) {
+        ann["stale"] = true;
+        ann["stale_reason"] = "dimension has no resolvable model anchors";
+        return;
+    }
+    const json& anchors = ann["model_anchors"];
+    double value = 0.0;
+    const double scale = geom.value("scale", 1.0);
+    if (!(scale > 0.0)) { ann["stale"] = true; return; }
+    if (radial) {
+        int body = 0, edge = 0;
+        bool found = false;
+        if (anchors.contains("arc") && resolve_drawing_edge(s, shapes, anchors["arc"], body, edge)) {
+            for (const json& arc : geom.value("arcs", json::array())) {
+                const json src = arc.value("src", json());
+                if (!src.is_object() || src.value("body", 0) != body ||
+                    src.value("edge_id", 0) != edge || !is_xy(arc.value("center", json()))) continue;
+                if (found) { found = false; break; }
+                const json previous_center = ann.value("center", json());
+                const json previous_a = ann.value("a", json());
+                const double previous_radius = ann.value("radius", 0.0);
+                const double radius = arc.value("radius", 0.0);
+                if (is_xy(previous_center) && is_xy(previous_a) && previous_radius > 1e-9) {
+                    const double ratio = radius / previous_radius;
+                    ann["a"] = json::array({
+                        arc["center"][0].get<double>() +
+                            (previous_a[0].get<double>() - previous_center[0].get<double>()) * ratio,
+                        arc["center"][1].get<double>() +
+                            (previous_a[1].get<double>() - previous_center[1].get<double>()) * ratio});
+                }
+                move_annotation_label(ann, previous_center, arc["center"]);
+                found = true;
+                ann["center"] = arc["center"];
+                ann["b"] = arc["center"];
+                ann["radius"] = arc.value("radius", 0.0);
+                ann["model_radius"] = arc.value("radius", 0.0) / scale;
+                value = ann["model_radius"].get<double>() * (kind == "diameter_dim" ? 2.0 : 1.0);
+            }
+        }
+        if (!found) { ann["stale"] = true; ann["stale_reason"] = "model arc cannot be re-resolved"; return; }
+    } else {
+        json a, b, c, d;
+        bool ok = anchors.contains("a") && anchors.contains("b") &&
+                  resolve_drawing_point(s, shapes, geom, anchors["a"], a) &&
+                  resolve_drawing_point(s, shapes, geom, anchors["b"], b);
+        if (angular)
+            ok = ok && anchors.contains("c") && anchors.contains("d") &&
+                 resolve_drawing_point(s, shapes, geom, anchors["c"], c) &&
+                 resolve_drawing_point(s, shapes, geom, anchors["d"], d);
+        if (!ok) { ann["stale"] = true; ann["stale_reason"] = "model point cannot be re-resolved"; return; }
+        if (is_xy(ann.value("a", json())) && is_xy(ann.value("b", json()))) {
+            const json old_mid = json::array({
+                (ann["a"][0].get<double>() + ann["b"][0].get<double>()) * 0.5,
+                (ann["a"][1].get<double>() + ann["b"][1].get<double>()) * 0.5});
+            const json new_mid = json::array({
+                (a[0].get<double>() + b[0].get<double>()) * 0.5,
+                (a[1].get<double>() + b[1].get<double>()) * 0.5});
+            move_annotation_label(ann, old_mid, new_mid);
+        }
+        ann["a"] = a;
+        ann["b"] = b;
+        if (angular) {
+            value = angle_between_lines(a, b, c, d);
+            ann["line2"] = json::array({c, d});
+            ann["vertex"] = line_intersection(a, b, c, d);
+        } else {
+            const double dx = b[0].get<double>() - a[0].get<double>();
+            const double dy = b[1].get<double>() - a[1].get<double>();
+            value = (kind == "linear_dim" ? std::max(std::fabs(dx), std::fabs(dy))
+                                          : std::hypot(dx, dy)) / scale;
+        }
+    }
+    if (ann.contains("model_faces")) {
+        const json& faces = ann["model_faces"];
+        TopoInfo first, second;
+        if (!faces.is_array() || faces.size() != 2 ||
+            !resolve_drawing_face(s, shapes, faces[0], first) ||
+            !resolve_drawing_face(s, shapes, faces[1], second) ||
+            !first.axis || !second.axis ||
+            std::fabs(first.axis->normalized().dot(second.axis->normalized())) < 1.0 - 1e-6) {
+            ann["stale"] = true;
+            ann["stale_reason"] = "model faces cannot be re-resolved as parallel planes";
+            return;
+        }
+        const double model_distance = std::fabs((second.centroid - first.centroid)
+                                                    .dot(first.axis->normalized()));
+        if (std::fabs(value - model_distance) > 1e-4) {
+            ann["stale"] = true;
+            ann["stale_reason"] = "view no longer measures the model face distance";
+            return;
+        }
+        value = model_distance;
+    }
+    ann["value"] = round6(value);
+    if (!ann["overridden"].get<bool>()) ann["text"] = compose_disp(ann, units);
+    ann["stale"] = false;
+    ann.erase("stale_reason");
+}
+
+std::string drawing_shared_line_sid(const json& geom, const json& a, const json& b) {
+    if (!is_xy(a) || !is_xy(b) || !geom.contains("visible") || !geom.contains("visible_src") ||
+        !geom["visible"].is_array() || !geom["visible_src"].is_array()) return {};
+    const json& lines = geom["visible"];
+    const json& sources = geom["visible_src"];
+    json chosen;
+    for (std::size_t i = 0; i < lines.size() && i < sources.size(); ++i) {
+        const json& line = lines[i];
+        const json& src = sources[i];
+        if (!line.is_array() || line.size() != 2 || !is_xy(line[0]) || !is_xy(line[1]) ||
+            !src.is_object() || !src.contains("sid") || !src["sid"].is_string()) continue;
+        const double x = line[0][0].get<double>(), y = line[0][1].get<double>();
+        const double dx = line[1][0].get<double>() - x, dy = line[1][1].get<double>() - y;
+        const double len2 = dx * dx + dy * dy;
+        if (len2 < 1e-12) continue;
+        const auto on_segment = [&](const json& p) {
+            const double px = p[0].get<double>() - x, py = p[1].get<double>() - y;
+            const double t = std::clamp((px * dx + py * dy) / len2, 0.0, 1.0);
+            return std::hypot(px - t * dx, py - t * dy) <= 0.05;
+        };
+        if (!on_segment(a) || !on_segment(b)) continue;
+        if (!chosen.is_null() && chosen != src) return {};
+        chosen = src;
+    }
+    return chosen.is_object() ? chosen.value("sid", std::string()) : std::string();
+}
+
+
+void attach_drawing_anchors(DrawingSession& s, const json& view, json& ann,
+                            const json& refs = json()) {
+    const std::string kind = ann.value("kind", ann.value("type", std::string()));
+    const bool linear = kind == "linear_dim" || kind == "aligned_dim";
+    const bool angular = kind == "angular_dim";
+    const bool radial = kind == "radial_dim" || kind == "diameter_dim";
+    if (!linear && !angular && !radial) return;
+    const auto shapes = source_shapes(s);
+    const auto topology = index_source_topology(shapes);
+    const json geom = project_one(s, view, shapes, &topology);
+    json anchors = json::object();
+    if (radial) {
+        const json* arc = nullptr;
+        if (ann.value("auto", false) && is_xy(ann.value("center", json())) &&
+            geom.contains("arcs") && geom["arcs"].is_array()) {
+            for (const json& candidate : geom["arcs"]) {
+                if (!is_xy(candidate.value("center", json()))) continue;
+                const double dx = candidate["center"][0].get<double>() - ann["center"][0].get<double>();
+                const double dy = candidate["center"][1].get<double>() - ann["center"][1].get<double>();
+                if (std::hypot(dx, dy) < 1e-4 &&
+                    std::fabs(candidate.value("radius", 0.0) - ann.value("radius", 0.0)) < 1e-4) {
+                    if (!arc || (candidate.value("layer", std::string()) == "visible" &&
+                                 arc->value("layer", std::string()) != "visible"))
+                        arc = &candidate;
+                }
+            }
+        } else {
+            arc = nearest_arc(geom, ann["a"], kind == "diameter_dim" ? 1 : -1);
+        }
+        if (arc && arc->contains("src")) {
+            bool ambiguous = false;
+            for (const json& candidate : geom["arcs"]) {
+                if (&candidate == arc || !candidate.contains("src") ||
+                    candidate["src"] == (*arc)["src"] ||
+                    candidate.value("layer", std::string()) != arc->value("layer", std::string()) ||
+                    !is_xy(candidate.value("center", json()))) continue;
+                if (std::hypot(candidate["center"][0].get<double>() - (*arc)["center"][0].get<double>(),
+                               candidate["center"][1].get<double>() - (*arc)["center"][1].get<double>()) < 1e-4 &&
+                    std::fabs(candidate.value("radius", 0.0) - arc->value("radius", 0.0)) < 1e-4) {
+                    ambiguous = true;
+                    break;
+                }
+            }
+            anchors["arc"] = ambiguous ? json(nullptr) : drawing_edge_anchor(s, shapes, (*arc)["src"]);
+        }
+    } else {
+        const auto sid = [&](const char* key) {
+            return refs.is_object() ? refs.value(key, std::string()) : std::string();
+        };
+        std::string a_sid = sid("a"), b_sid = sid("b");
+        if (a_sid.empty() && b_sid.empty())
+            a_sid = b_sid = drawing_shared_line_sid(geom, ann["a"], ann["b"]);
+        anchors["a"] = drawing_point_anchor(s, shapes, geom, ann["a"], a_sid);
+        anchors["b"] = drawing_point_anchor(s, shapes, geom, ann["b"], b_sid);
+        if (angular && ann.contains("line2") && ann["line2"].is_array() && ann["line2"].size() == 2) {
+            std::string c_sid = sid("c"), d_sid = sid("d");
+            if (c_sid.empty() && d_sid.empty())
+                c_sid = d_sid = drawing_shared_line_sid(geom, ann["line2"][0], ann["line2"][1]);
+            anchors["c"] = drawing_point_anchor(s, shapes, geom, ann["line2"][0], c_sid);
+            anchors["d"] = drawing_point_anchor(s, shapes, geom, ann["line2"][1], d_sid);
+        }
+    }
+    bool complete = !anchors.empty();
+    for (const json& anchor : anchors) if (anchor.is_null()) complete = false;
+    if (complete) ann["model_anchors"] = std::move(anchors);
+    ann["stale"] = !complete;
+    if (!complete) ann["stale_reason"] = "dimension has no resolvable model anchors";
+    ann["overridden"] = !ann.value("text_override", std::string()).empty();
+    if (refs.is_object() && refs.contains("faces")) {
+        const json& faces = refs["faces"];
+        if (!linear || !faces.is_array() || faces.size() != 2 ||
+            !faces[0].is_string() || !faces[1].is_string())
+            throw OpError("invalid_op", "face distance requires two planar face SIDs");
+        const json first = drawing_face_anchor(s, shapes, faces[0].get<std::string>());
+        const json second = drawing_face_anchor(s, shapes, faces[1].get<std::string>());
+        if (first.is_null() || second.is_null() || !complete)
+            throw OpError("invalid_op", "face distance needs unique, visible model anchors");
+        ann["model_faces"] = json::array({first, second});
+        refresh_drawing_annotation(s, shapes, geom, ann, doc_units(s.doc));
+        if (ann.value("stale", true))
+            throw OpError("invalid_op", ann.value("stale_reason", std::string("invalid face distance")));
+    }
 }
 
 json live_source_tree(const DrawingSession& s) {
@@ -1013,6 +1566,55 @@ std::string compose_chamfer(const json& ann, const std::string& units) {
            ann.value("suffix", std::string());
 }
 
+
+// Resolve authored chamfer dimensions against the same equation environment used by the model.
+json drawing_chamfer_values(const DrawingSession& s, const std::string& feature) {
+    if (feature.empty())
+        throw OpError("invalid_op", "chamfer dimension requires a chamfer feature id or name");
+    const json tree = live_source_tree(s);
+    const json features = tree.value("features", json::array());
+    json hit;
+    for (const json& f : features) {
+        if (!f.is_object()) continue;
+        if (f.value("id", std::string()) == feature) { hit = f; break; }
+        if (f.value("name", std::string()) == feature) {
+            if (!hit.is_null())
+                throw OpError("invalid_op", "chamfer feature name is ambiguous; use its id");
+            hit = f;
+        }
+    }
+    if (hit.is_null() || hit.value("type", std::string()) != "chamfer" ||
+        hit.value("suppressed", false))
+        throw OpError("invalid_op", "chamfer feature is missing, suppressed, or not a chamfer");
+    const json p = hit.value("params", json::object());
+    const std::string subtype = p.value("type", std::string("symmetric"));
+    if (subtype != "symmetric" && subtype != "distance_angle")
+        throw OpError("invalid_op", "a length/angle callout requires a symmetric or distance-angle chamfer");
+    json env = s.source_env;
+    if (!s.source_ref_id.empty()) {
+        const json live = doc_live_source(s.source_ref_id);
+        if (live.is_object()) env = live.value("env", json::object());
+    }
+    std::map<std::string, double> variables;
+    if (env.is_object())
+        for (auto it = env.begin(); it != env.end(); ++it)
+            if (it.value().is_number()) variables[it.key()] = it.value().get<double>();
+    auto number = [&](const char* key) {
+        const json v = p.value(key, json());
+        if (v.is_string()) return chudware::util::evaluate(v.get<std::string>(), variables);
+        if (v.is_object() && v.value("expr", json()).is_string() &&
+            !v["expr"].get<std::string>().empty())
+            return chudware::util::evaluate(v["expr"].get<std::string>(), variables);
+        return scalar_number(v);
+    };
+    double length = number("distance");
+    if (!(length > 0)) length = number("length");
+    const double angle = subtype == "distance_angle" ? number("angle") : 45.0;
+    if (!(length > 0) || !(angle > 0 && angle < 90))
+        throw OpError("invalid_op", "chamfer feature has no valid length and angle");
+    return json{{"feature_ref", hit.value("id", std::string())},
+                {"length", length}, {"angle", angle}};
+}
 
 void collect_hole_features(const json& node, json& rows) {
     if (node.is_array()) {
@@ -1301,8 +1903,15 @@ json drawing_get_locked_unsafe(const std::string& doc_id,
                 cached_view["annotations"] =
                     stored_view->value("annotations", json::array());
                 for (json& annotation : cached_view["annotations"])
-                    if (annotation.is_object())
+                    if (annotation.is_object()) {
+                        const std::string kind = annotation.value("kind", annotation.value("type", std::string()));
+                        if (kind == "linear_dim" || kind == "aligned_dim" || kind == "radial_dim" ||
+                            kind == "diameter_dim" || kind == "angular_dim" || kind == "chamfer") {
+                            annotation["stale"] = true;
+                            annotation["stale_reason"] = "source model is unavailable";
+                        }
                         annotation["draw"] = compile_annotation(annotation, units);
+                    }
             }
         }
         return frozen;
@@ -1333,7 +1942,14 @@ json drawing_get_locked_unsafe(const std::string& doc_id,
             for (json& g : views_out) {
                 if (g.contains("annotations") && g["annotations"].is_array())
                     for (json& an : g["annotations"])
-                        if (an.is_object()) an["draw"] = compile_annotation(an, units);
+                        if (an.is_object()) {
+                            try { refresh_drawing_annotation(s, shapes, g, an, units); }
+                            catch (const std::exception& e) {
+                                an["stale"] = true;
+                                an["stale_reason"] = e.what();
+                            }
+                            an["draw"] = compile_annotation(an, units);
+                        }
                 g["draw"] = compile_view_decorations(g);
                 if (g.contains("section_faces") && g["section_faces"].is_array()) {
                     json hatch = json::array();
@@ -1404,6 +2020,9 @@ json drawing_get_locked_unsafe(const std::string& doc_id,
 json drawing_new(const json& source_doc, const json& env, const std::string& name,
                  const std::string& source_doc_id) {
     DrawingLock lk;
+    const std::string doc_id = new_drawing_id();
+    DrawingDependency dependency(doc_id);
+    dependency.register_source(source_doc_id, -1);
     // LIVE source: snapshot the open session's current tree+env now (for the name + a
     // fallback if it later closes) and remember the id for the associative re-pull.
     json src = source_doc;
@@ -1415,6 +2034,10 @@ json drawing_new(const json& source_doc, const json& env, const std::string& nam
             src = live["tree"];
             src_env = live.value("env", json::object());
             src_rev = live.value("revision", 0L);
+            dependency.register_source(source_doc_id, src_rev);
+        } else {
+            // The source may already have closed; no live consumer exists.
+            dependency.reset();
         }
     }
     std::string src_name;
@@ -1422,7 +2045,6 @@ json drawing_new(const json& source_doc, const json& env, const std::string& nam
         src_name = src["name"].get<std::string>();
     if (src_name.empty()) src_name = "Part";
     std::string nm = name.empty() ? (src_name + " - Drawing") : name;
-    std::string doc_id = new_drawing_id();
     DrawingSession s;
     s.doc_id = doc_id;
     s.source_ref_id = source_doc_id;
@@ -1434,24 +2056,38 @@ json drawing_new(const json& source_doc, const json& env, const std::string& nam
     s.doc["units"]["system"] = doc_units(src);
     s.revision = 0;
     s.source_revision = src_rev;
-    g_drawings[doc_id] = std::move(s);
-    DrawingSession& cur = g_drawings[doc_id];
-    return json{{"doc_id", cur.doc_id}, {"drawing", cur.doc}};
+    json response = {{"doc_id", s.doc_id}, {"drawing", s.doc}};
+    g_drawings.emplace(doc_id, std::move(s));
+    dependency.release();
+    return response;
 }
 
 json drawing_set_source(const std::string& doc_id, const json& source_doc, const json& env) {
-    DrawingLock lk;
-    DrawingSession& s = require_session(doc_id);
-    // An explicit inline source replaces any live ref (the caller now owns the tree).
-    s.source_ref_id.clear();
-    s.source_doc = source_doc;
-    s.source_env = env.is_null() ? json::object() : env;
-    s.source_missing = false;
-    s.source_state = "live";
-    s.cached_views = json();
-    s.component_views.clear();
-    s.source_revision += 1;
-    return json{{"doc_id", doc_id}, {"revision", s.revision}, {"source_revision", s.source_revision}};
+    std::string owned_source;
+    json response;
+    {
+        DrawingLock lk;
+        DrawingSession& s = require_session(doc_id);
+        if (s.owns_source) owned_source = s.source_ref_id;
+        // An explicit inline source replaces any live ref (the caller now owns the tree).
+        s.source_doc = source_doc;
+        s.source_env = env.is_null() ? json::object() : env;
+        s.doc["source"] = doc_id;
+        s.source_ref_id.clear();
+        s.owns_source = false;
+        s.source_missing = false;
+        s.source_state = "live";
+        s.cached_views = json();
+        s.component_views.clear();
+        s.source_revision += 1;
+        doc_dep_unregister(doc_id, "drawing");
+        response = {{"doc_id", doc_id}, {"revision", s.revision},
+                    {"source_revision", s.source_revision}};
+    }
+    if (!owned_source.empty()) {
+        try { (void)doc_close(owned_source); } catch (const std::exception&) {}
+    }
+    return response;
 }
 json drawing_add_sheet(const std::string& doc_id, const std::string& size,
                        const std::string& name) {
@@ -1519,9 +2155,9 @@ json drawing_add_view(const std::string& doc_id, const std::string& type,
                                      : json::array({0.0, 0.0})},
         {"show_hidden", show_hidden.is_boolean() ? show_hidden.get<bool>() : true},
     };
+    auto shapes = source_shapes(s);
     sheet["views"].push_back(view);
     s.revision += 1;
-    auto shapes = source_shapes(s);
     const auto topology = index_source_topology(shapes);
     json geom = project_one(s, view, shapes, &topology);
     return json{{"view_id", view["id"]}, {"revision", s.revision}, {"view", geom}};
@@ -1619,9 +2255,9 @@ json drawing_add_section(const std::string& doc_id, const std::string& parent_vi
         if (opts.contains("hatch_styles") && opts["hatch_styles"].is_array())
             view["hatch_styles"] = opts["hatch_styles"];
     }
+    auto shapes = source_shapes(s);
     sheet["views"].push_back(view);
     s.revision += 1;
-    auto shapes = source_shapes(s);
     const auto topology = index_source_topology(shapes);
     json geom = project_one(s, view, shapes, &topology);
     return json{{"view_id", view["id"]}, {"revision", s.revision}, {"view", geom}};
@@ -1663,9 +2299,9 @@ json drawing_add_detail(const std::string& doc_id, const std::string& parent_vie
                          : json::array({p_pos[0] + 150.0, p_pos[1]})},
         {"show_hidden", show_hidden.is_boolean() ? show_hidden.get<bool>() : false},
     };
+    auto shapes = source_shapes(s);
     sheet["views"].push_back(view);
     s.revision += 1;
-    auto shapes = source_shapes(s);
     const auto topology = index_source_topology(shapes);
     json geom = project_one(s, view, shapes, &topology);
     return json{{"view_id", view["id"]}, {"revision", s.revision}, {"view", geom}};
@@ -1785,14 +2421,21 @@ json drawing_set_view(const std::string& doc_id, const std::string& view_id, con
     json* view = find_view(s.doc, view_id);
     if (!view)
         throw OpError("invalid_op", "no view '" + view_id + "'", {{"reason", "unknown view"}});
+    auto shapes = source_shapes(s);
     apply_view_transform(s, view_id, view, scale, position, orientation, show_hidden);
     s.revision += 1;
-    auto shapes = source_shapes(s);
     const auto topology = index_source_topology(shapes);
     json geom = project_one(s, *view, shapes, &topology);
     if (geom.contains("annotations") && geom["annotations"].is_array())
         for (json& ann : geom["annotations"])
-            if (ann.is_object()) ann["draw"] = compile_annotation(ann, doc_units(s.doc));
+            if (ann.is_object()) {
+                try { refresh_drawing_annotation(s, shapes, geom, ann, doc_units(s.doc)); }
+                catch (const std::exception& e) {
+                    ann["stale"] = true;
+                    ann["stale_reason"] = e.what();
+                }
+                ann["draw"] = compile_annotation(ann, doc_units(s.doc));
+            }
     return json{{"view_id", view_id}, {"revision", s.revision}, {"view", geom}};
 }
 
@@ -1876,7 +2519,7 @@ json build_ext_annotation(DrawingSession& s, const json& view, const std::string
 
 json drawing_add_dim(const std::string& doc_id, const std::string& view_id, const std::string& type,
                      const json& a, const json& b_in, const json& c, const json& d, const json& pos,
-                     const json& text) {
+                     const json& text, const json& source_refs) {
     static const std::set<std::string> kAnn = {"linear_dim", "aligned_dim", "note"};
     static const std::set<std::string> kExt = {"radial_dim", "diameter_dim", "angular_dim",
                                                "center_mark", "center_line"};
@@ -1900,6 +2543,7 @@ json drawing_add_dim(const std::string& doc_id, const std::string& view_id, cons
         json ann = build_ext_annotation(s, *view, type, a, b_in, c, d, pos, text, units, scale);
         if (text.is_string() && !text.get<std::string>().empty())
             ann["text_override"] = text;
+        attach_drawing_anchors(s, *view, ann, source_refs);
         (*view)["annotations"].push_back(ann);
         s.revision += 1;
         return json{{"annotation", ann}, {"drawing", drawing_get_locked_unsafe(doc_id)}};
@@ -1947,6 +2591,7 @@ json drawing_add_dim(const std::string& doc_id, const std::string& view_id, cons
     };
     if (text.is_string() && !text.get<std::string>().empty())
         ann["text_override"] = text;
+    attach_drawing_anchors(s, *view, ann, source_refs);
     (*view)["annotations"].push_back(ann);
     s.revision += 1;
     return json{{"annotation", ann}, {"drawing", drawing_get_locked_unsafe(doc_id)}};
@@ -1971,14 +2616,34 @@ json drawing_add_chamfer_dimension(const std::string& doc_id,
                 {"kind", "chamfer"},
                 {"a", json::array({a[0].get<double>(), a[1].get<double>()})},
                 {"pos", json::array({pos[0].get<double>(), pos[1].get<double>()})}};
-    if (spec.contains("length")) ann["length"] = spec["length"];
-    else if (spec.contains("distance")) ann["length"] = spec["distance"];
-    else
-        throw OpError("invalid_op", "chamfer dimension needs length",
-                      {{"reason", "missing length"}});
-    if (spec.contains("angle")) ann["angle"] = spec["angle"];
-    else if (spec.contains("angle_deg")) ann["angle"] = spec["angle_deg"];
-    else ann["angle"] = 45.0;
+    const auto shapes = source_shapes(s);
+    const auto topology = index_source_topology(shapes);
+    const json geom = project_one(s, *view, shapes, &topology);
+    json anchor = drawing_point_anchor(s, shapes, geom, a,
+                                       spec.value("edge_sid", std::string()));
+    if (anchor.is_null())
+        throw OpError("invalid_op", "chamfer anchor must identify one visible model edge");
+    std::string feature = spec.value("feature_ref", std::string());
+    if (feature.empty()) feature = anchor["selector"].value("owner_feature", std::string());
+    const json model = drawing_chamfer_values(s, feature);
+    for (const auto& pair : {std::pair<const char*, const char*>{"length", "length"},
+                             {"distance", "length"}, {"angle", "angle"}, {"angle_deg", "angle"}}) {
+        if (spec.contains(pair.first) &&
+            (!spec[pair.first].is_number() ||
+             std::fabs(spec[pair.first].get<double>() - model[pair.second].get<double>()) > 1e-6))
+            throw OpError("invalid_op", std::string("chamfer ") + pair.first +
+                          " disagrees with the model feature");
+    }
+    if (anchor["selector"].value("owner_feature", std::string()) !=
+        model["feature_ref"].get<std::string>())
+        throw OpError("invalid_op", "chamfer anchor must lie on a visible edge of the selected feature");
+    ann["feature_ref"] = model["feature_ref"];
+    ann["length"] = model["length"];
+    ann["angle"] = model["angle"];
+    ann["model_anchors"] = {{"a", anchor}};
+    ann["stale"] = false;
+    ann["overridden"] = spec.contains("text") && spec["text"].is_string() &&
+                         !spec["text"].get<std::string>().empty();
     for (const char* key : {"count", "precision", "prefix", "suffix"})
         if (spec.contains(key)) ann[key] = spec[key];
     if (spec.contains("text") && spec["text"].is_string() &&
@@ -2314,15 +2979,19 @@ void drawings_source_closed(const std::string& source_doc_id, const json& source
                             const json& source_env, long source_revision) {
     DrawingLock lk;
     for (auto& [id, s] : g_drawings) {
-        if (s.source_ref_id != source_doc_id || s.source_missing) continue;
+        if (s.source_ref_id != source_doc_id) continue;
+        doc_dep_unregister(id, "drawing");
         s.source_doc = source_doc;
         s.source_env = source_env;
         s.source_revision = source_revision;
+        // Registration can observe the source already removed while this callback
+        // is waiting for DrawingLock. Still capture and project its final tree.
+        s.source_missing = false;
         // The registry no longer exposes the source. Project its final captured tree
         // once, then freeze it as the existing stale-view path does for a missing file.
         try {
             s.cached_views = drawing_get_locked_unsafe(id);
-        } catch (const std::exception&) {
+        } catch (...) {
             // Even an unprojectable final tree must be identified as stale, not silently
             // served from the drawing's creation-time snapshot.
             s.cached_views = json::object();
@@ -2343,6 +3012,16 @@ json register_restored_drawing(const json& drawing_doc, const std::string& sourc
                           " document",
                       {{"reason", "bad schema"}});
     const std::string doc_id = new_drawing_id();
+    DrawingDependency dependency(doc_id);
+    dependency.register_source(source_doc_id, -1);
+    json live;
+    if (!source_doc_id.empty()) {
+        live = doc_live_source(source_doc_id);
+        if (live.is_object() && live.contains("tree"))
+            dependency.register_source(source_doc_id, live.value("revision", 0L));
+        else
+            dependency.reset();
+    }
     DrawingSession s;
     s.doc_id = doc_id;
     s.source_ref_id = source_doc_id;  // re-point the live source to the reopened part
@@ -2361,16 +3040,22 @@ json register_restored_drawing(const json& drawing_doc, const std::string& sourc
             if (!sheet.contains("name") || !sheet["name"].is_string())
                 sheet["name"] = sheet.value("id", std::string("Sheet"));
         }
-    s.source_doc = json::object();    // no inline snapshot — re-pull live from the source
-    s.source_env = json::object();
+    s.source_doc = live.is_object() && live.contains("tree") ? live["tree"] : json::object();
+    s.source_env = live.is_object() ? live.value("env", json::object()) : json::object();
     s.revision = 0;
-    s.source_revision = 0;
+    s.source_revision = live.is_object() ? live.value("revision", 0L) : 0;
+    if (!source_doc_id.empty() && !(live.is_object() && live.contains("tree"))) {
+        s.source_state = "closed";
+        s.source_missing = true;
+    }
     s.saved_revision = s.revision;
     s.saved_source_revision = s.source_revision;
-    g_drawings[doc_id] = std::move(s);
-    return json{{"doc_id", doc_id},
-                {"name", g_drawings[doc_id].doc.value("name", std::string("Drawing"))},
-                {"source_doc_id", source_doc_id}};
+    json response = {{"doc_id", doc_id},
+                     {"name", s.doc.value("name", std::string("Drawing"))},
+                     {"source_doc_id", source_doc_id}};
+    g_drawings.emplace(doc_id, std::move(s));
+    dependency.release();
+    return response;
 }
 
 json drawing_save_standalone(const std::string& drawing_id, const std::string& path) {
@@ -2378,57 +3063,82 @@ json drawing_save_standalone(const std::string& drawing_id, const std::string& p
         throw OpError("io_error", "drawing_save_standalone: path is required",
                       {{"reason", "missing path"}});
 
-    DrawingLock lk;
-    DrawingSession& s = require_session(drawing_id);
-    std::map<std::string, std::string> extra = s.standalone_extra;
+    // Declared outside the drawing-lock scope so publication (including on
+    // exception after the archive write) never holds the drawing lock.
+    DrawingSourceSave publication(drawing_id);
+    json response;
+    {
+        DrawingLock lk;
+        DrawingSession& s = require_session(drawing_id);
+        std::map<std::string, std::string> extra = s.standalone_extra;
+        json source, source_env, source_ref;
+        bool staged_source = false;
+        bool archive_written = false;
 
-    if (!s.source_missing) {
-        json source = s.source_doc;
-        json live;
-        if (!s.source_ref_id.empty()) {
-            live = doc_live_source(s.source_ref_id);
-            if (live.is_object() && live.contains("tree")) source = live["tree"];
-        }
-        const std::string schema =
-            source.is_object() ? source.value("schema", std::string()) : std::string();
-        if (schema != "aicad.part/1" && schema != "aicad.asm/1")
-            throw OpError("invalid_op",
-                          "drawing_save_standalone: drawing has no serializable part/assembly source",
-                          {{"drawing_id", drawing_id}, {"source_schema", schema}});
-
-        json source_ref = {{"kind", "embedded"}, {"source_doc_schema", schema}};
-        if (live.is_object() && live.contains("path") && live["path"].is_string()) {
-            const std::string source_path = live["path"].get<std::string>();
-            if (!source_path.empty()) {
-                namespace fs = std::filesystem;
-                std::error_code ec;
-                fs::path rel = fs::relative(fs::path(source_path),
-                                            fs::path(path).parent_path(), ec);
-                source_ref["step_plus_rel_path"] =
-                    (!ec && !rel.empty()) ? rel.generic_string() : source_path;
+        if (!s.source_missing) {
+            source = s.source_doc;
+            json live;
+            if (!s.source_ref_id.empty()) {
+                publication.protect(s.source_ref_id, s.source_revision);
+                live = doc_live_source(s.source_ref_id);
+                if (live.is_object() && live.contains("tree")) source = live["tree"];
             }
-        }
-        s.doc["source"] = std::move(source_ref);
-        s.source_doc = source;
-        s.source_env = live.is_object() ? live.value("env", json::object()) : s.source_env;
-        extra["source/document.json"] = editable_document_json(source);
-    } else {
-        extra.erase("source/document.json");
-    }
+            const std::string schema =
+                source.is_object() ? source.value("schema", std::string()) : std::string();
+            if (schema != "aicad.part/1" && schema != "aicad.asm/1")
+                throw OpError("invalid_op",
+                              "drawing_save_standalone: drawing has no serializable part/assembly source",
+                              {{"drawing_id", drawing_id}, {"source_schema", schema}});
 
-    // Cache the complete assembled sheets, not just the stored view definitions. It is
-    // display-only and explicitly marked stale if the source cannot be restored later.
-    extra["cache/views.json"] = drawing_get_locked_unsafe(drawing_id).dump(2);
-    const std::string written =
-        editable_container_save(s.doc, path, extra, "aicad.draw+/1", "drawing", ".draw+");
-    s.standalone_path = written;
-    s.standalone_extra = std::move(extra);
-    s.saved_revision = s.revision;
-    s.saved_source_revision = s.source_revision;
-    return json{{"drawing_id", drawing_id},
-                {"doc_id", drawing_id},
-                {"path", written},
-                {"source_state", s.source_state}};
+            source_ref = {{"kind", "embedded"}, {"source_doc_schema", schema}};
+            if (live.is_object() && live.contains("path") && live["path"].is_string()) {
+                const std::string source_path = live["path"].get<std::string>();
+                if (!source_path.empty()) {
+                    namespace fs = std::filesystem;
+                    std::error_code ec;
+                    fs::path rel = fs::relative(fs::path(source_path),
+                                                fs::path(path).parent_path(), ec);
+                    source_ref["step_plus_rel_path"] =
+                        (!ec && !rel.empty()) ? rel.generic_string() : source_path;
+                }
+            }
+            source_env = live.is_object() ? live.value("env", json::object()) : s.source_env;
+            extra["source/document.json"] = editable_document_json(source);
+            // Stage the captured tree for projection. Restore the prior drawing
+            // state if serialization or the archive write fails.
+            s.doc.at("source").swap(source_ref);
+            s.source_doc.swap(source);
+            s.source_env.swap(source_env);
+            staged_source = true;
+        } else {
+            extra.erase("source/document.json");
+        }
+
+        try {
+            // Cache the complete assembled sheets, not just the stored view definitions.
+            extra["cache/views.json"] = drawing_get_locked_unsafe(drawing_id).dump(2);
+            const std::string written =
+                editable_container_save(s.doc, path, extra, "aicad.draw+/1", "drawing", ".draw+");
+            archive_written = true;
+            if (!s.source_missing) publication.source_written();
+            s.standalone_path = written;
+            s.standalone_extra = std::move(extra);
+            s.saved_revision = s.revision;
+            s.saved_source_revision = s.source_revision;
+            response = {{"drawing_id", drawing_id}, {"doc_id", drawing_id},
+                        {"path", written}, {"source_state", s.source_state},
+                        {"saved_revision", s.saved_revision}};
+        } catch (...) {
+            if (staged_source && !archive_written) {
+                s.doc.at("source").swap(source_ref);
+                s.source_doc.swap(source);
+                s.source_env.swap(source_env);
+            }
+            throw;
+        }
+    }
+    publication.publish();
+    return response;
 }
 
 json drawing_open_standalone(const std::string& path) {
@@ -2484,33 +3194,44 @@ json drawing_open_standalone(const std::string& path) {
             }
         }
     }
+    EmbeddedSourceOnFailure embedded_source(source_doc_id, source_state == "embedded_opened");
 
     json restored = register_restored_drawing(loaded.doc, source_doc_id);
     const std::string drawing_id = restored.value("doc_id", std::string());
+    DrawingOnFailure drawing_cleanup(drawing_id);
     {
         DrawingLock lk;
         DrawingSession& s = require_session(drawing_id);
         s.standalone_path = path;
         s.standalone_extra = std::move(loaded.extra);
-        s.source_state = source_state;
-        s.source_missing = source_doc_id.empty();
+        // A source can close after lookup or registration; do not resurrect it.
+        if (s.source_state != "closed") {
+            s.source_state = source_state;
+            s.source_missing = source_doc_id.empty();
+        }
+        source_state = s.source_state;
         auto cached = s.standalone_extra.find("cache/views.json");
-        if (cached != s.standalone_extra.end()) {
+        // Do not replace a final source-close projection with an older file cache.
+        if (cached != s.standalone_extra.end() &&
+            (s.source_state != "closed" || !s.cached_views.is_object() || s.cached_views.empty())) {
             try {
                 s.cached_views = json::parse(cached->second);
             } catch (const std::exception&) {
                 s.cached_views = json::object();
             }
         }
-        s.owns_source = source_state == "embedded_opened";
+        s.owns_source = source_state == "embedded_opened" && !s.source_missing;
     }
-    return json{{"drawing_id", drawing_id},
-                {"doc_id", drawing_id},
-                {"name", restored.value("name", std::string("Drawing"))},
-                {"source_doc_id", source_doc_id.empty() ? json(nullptr)
-                                                         : json(source_doc_id)},
-                {"source_state", source_state},
-                {"path", path}};
+    json response = {{"drawing_id", drawing_id},
+                     {"doc_id", drawing_id},
+                     {"name", restored.value("name", std::string("Drawing"))},
+                     {"source_doc_id", source_doc_id.empty() ? json(nullptr)
+                                                              : json(source_doc_id)},
+                     {"source_state", source_state},
+                     {"path", path}};
+    drawing_cleanup.release();
+    embedded_source.release();
+    return response;
 }
 
 // ----------------------------------------------------------- detailing (W17 overhaul)
@@ -2566,33 +3287,52 @@ json drawing_set_annotation(const std::string& doc_id, const std::string& view_i
         throw OpError("invalid_op", "no annotation '" + ann_id + "' on view '" + view_id + "'",
                       {{"reason", "unknown annotation"}});
 
-    if (patch.is_object())
-        for (auto it = patch.begin(); it != patch.end(); ++it) {
-            const std::string& k = it.key();
-            const json& v = it.value();
-            if (k == "tol_type" && v.is_string()) (*ann)["tol_type"] = v;
-            else if (k == "prefix" && v.is_string()) (*ann)["prefix"] = v;
-            else if (k == "suffix" && v.is_string()) (*ann)["suffix"] = v;
-            else if (k == "critical" && v.is_boolean()) (*ann)["critical"] = v;
-            else if ((k == "tol_upper" || k == "tol_lower" || k == "value") && v.is_number())
-                (*ann)[k] = v.get<double>();
-            else if (k == "precision" && v.is_number_integer()) (*ann)["precision"] = v.get<int>();
-            else if (k == "count" && v.is_number_integer()) (*ann)["count"] = v.get<int>();
-            else if (k == "pos" && is_xy(v))
-                (*ann)["pos"] = json::array({v[0].get<double>(), v[1].get<double>()});
-            else if (k == "text") (*ann)["text_override"] = v.is_string() ? v : json("");
-        }
+    if (!patch.is_object() || patch.empty())
+        throw OpError("invalid_op", "annotation patch must be a nonempty object",
+                      {{"reason", "invalid annotation patch"}});
+    // Validate the entire patch before changing the annotation. In particular null is not
+    // a numeric clear: silently ignoring it while applying other fields is not atomic.
+    for (auto it = patch.begin(); it != patch.end(); ++it) {
+        const std::string& k = it.key();
+        const json& v = it.value();
+        const bool valid =
+            ((k == "tol_type" || k == "prefix" || k == "suffix" || k == "text") &&
+             v.is_string()) ||
+            (k == "critical" && v.is_boolean()) ||
+            ((k == "tol_upper" || k == "tol_lower" || k == "value") && v.is_number()) ||
+            ((k == "precision" || k == "count") && v.is_number_integer()) ||
+            (k == "pos" && is_xy(v));
+        if (!valid)
+            throw OpError("invalid_op", "invalid annotation patch field '" + k +
+                          "' or value; null clearing is unsupported",
+                          {{"reason", "invalid annotation patch"}, {"field", k}});
+    }
+
+    json updated = *ann;
+    json fields_set = json::array();
+    for (auto it = patch.begin(); it != patch.end(); ++it) {
+        const std::string& k = it.key();
+        const json& v = it.value();
+        if (k == "text") updated["text_override"] = v;
+        else updated[k] = v;
+        fields_set.push_back(k);
+    }
 
     std::string units = doc_units(s.doc);
-    std::string ov = ann->value("text_override", std::string());
-    std::string type = ann->value("type", std::string());
-    std::string kind = ann->value("kind", std::string());
-    if (is_numeric_dim(type, kind))
-        (*ann)["text"] = ov.empty() ? compose_disp(*ann, units) : ov;
-    else if (!ov.empty())
-        (*ann)["text"] = ov;
+    std::string ov = updated.value("text_override", std::string());
+    std::string type = updated.value("type", std::string());
+    std::string kind = updated.value("kind", std::string());
+    if (is_numeric_dim(type, kind) || kind == "chamfer") {
+        updated["overridden"] = !ov.empty();
+        updated["text"] = !ov.empty() ? ov :
+            (kind == "chamfer" ? compose_chamfer(updated, units) : compose_disp(updated, units));
+    } else if (patch.contains("text")) {
+        updated["text"] = ov;
+    }
+    *ann = std::move(updated);
     s.revision += 1;
-    return json{{"annotation", *ann}, {"drawing", drawing_get_locked_unsafe(doc_id)}};
+    return json{{"annotation", *ann}, {"fields_set", fields_set},
+                {"drawing", drawing_get_locked_unsafe(doc_id)}};
 }
 
 json drawing_add_callout(const std::string& doc_id, const std::string& view_id,
@@ -2626,32 +3366,13 @@ json drawing_add_callout(const std::string& doc_id, const std::string& view_id,
         double cx = (*arc)["center"][0].get<double>(), cy = (*arc)["center"][1].get<double>();
         double r_sheet = arc->value("radius", 0.0);
         double r_model = r_sheet / scale;
-        // D-B2 fallback chain: if the measured bore is still degenerate (no real circle resolved,
-        // e.g. an odd projection of a complex hole), try these fallbacks in order rather than
-        // emitting "⌀0":
-        //   1. Explicit `diameter` opt (model mm) — works for holes where the caller passes it.
-        //   2. `standard` opt (e.g. "M4", "M6") — parse the metric nominal diameter; handles M-
-        //      standard mounting holes in thin ears where the bore rim is too thin to project.
-        //   3. Suppress the callout entirely (return without adding an annotation) — "no callout"
-        //      is ALWAYS better than a literal "⌀0" on a finished drawing.
-        if (r_model <= 1e-6) {
-            if (o.contains("diameter") && o["diameter"].is_number() &&
-                o["diameter"].get<double>() > 0.0) {
-                r_model = o["diameter"].get<double>() / 2.0;
-                r_sheet = r_model * scale;
-            } else if (o.contains("standard") && o["standard"].is_string()) {
-                double std_dia = parse_metric_standard_diameter(o["standard"].get<std::string>());
-                if (std_dia > 0.0) {
-                    r_model = std_dia / 2.0;
-                    r_sheet = r_model * scale;
-                }
-            }
-            // If the diameter is STILL not positive after all fallbacks, suppress this callout —
-            // never print "⌀0" on a drawing.
-            if (r_model <= 1e-6)
-                return json{{"suppressed", true},
-                            {"reason", "could not resolve a positive hole diameter"}};
-        }
+        if (r_model <= 1e-6)
+            return json{{"suppressed", true}, {"reason", "could not measure a positive hole diameter"}};
+        if (o.contains("diameter") &&
+            (!o["diameter"].is_number() ||
+             std::fabs(o["diameter"].get<double>() - 2.0 * r_model) > 1e-4))
+            throw OpError("invalid_op", "hole callout diameter disagrees with the projected model circle",
+                          {{"measured_diameter", 2.0 * r_model}, {"requested_diameter", o["diameter"]}});
         // Count same-diameter holes in this view -> "n× ⌀d" (SW hole-callout convention).
         // Dedupe by center so a through hole (whose top + bottom rims project to the SAME
         // circle) counts once, while a real pattern of N holes counts N.
@@ -2667,6 +3388,11 @@ json drawing_add_callout(const std::string& doc_id, const std::string& view_id,
                 if (!dup) hole_centers.push_back({hx, hy});
             }
         int count = (int)hole_centers.size();
+        if (o.contains("count")) {
+            if (!o["count"].is_number_integer() || o["count"].get<int>() < 1)
+                throw OpError("invalid_op", "hole callout count must be a positive integer");
+            count = o["count"].get<int>();
+        }
         json pos = is_xy(o.value("pos", json(nullptr)))
                        ? json::array({o["pos"][0].get<double>(), o["pos"][1].get<double>()})
                        : json::array({cx + r_sheet + 14.0, cy + r_sheet + 14.0});
@@ -2684,8 +3410,10 @@ json drawing_add_callout(const std::string& doc_id, const std::string& view_id,
         // (D4). Absent -> a plain "N× ⌀d" callout as before.
         if (o.contains("hole_type") && o["hole_type"].is_string())
             ann["hole_type"] = o["hole_type"];
+        if (o.contains("feature_ref") && o["feature_ref"].is_string())
+            ann["feature_ref"] = o["feature_ref"];
         if (o.contains("thread") && o["thread"].is_string()) ann["thread"] = o["thread"];
-        for (const char* k : {"cbore_dia", "cbore_depth", "csk_angle", "depth"})
+        for (const char* k : {"cbore_dia", "cbore_depth", "csk_dia", "csk_angle", "depth"})
             if (o.contains(k) && o[k].is_number()) ann[k] = o[k].get<double>();
         ann["text"] = compose_disp(ann, units);
         (*view)["annotations"].push_back(ann);
@@ -3294,6 +4022,9 @@ json drawing_model_items(const std::string& doc_id, const std::string& view_id) 
     auto shapes = source_shapes(s);
     json geom = project_one(s, *view, shapes);
     const int added = add_model_items(*view, geom, units, nullptr, nullptr);
+    for (json& ann : (*view)["annotations"])
+        if (ann.is_object() && ann.value("auto", false) && !ann.contains("model_anchors"))
+            attach_drawing_anchors(s, *view, ann);
     s.revision += 1;
     json out = drawing_get_locked_unsafe(doc_id);
     out["added"] = added;
@@ -3625,6 +4356,9 @@ int auto_dimension_locked(DrawingSession& s, const std::string& doc_id, const st
             if (g == geom_by_id.end()) continue;
             added += add_model_items(v, g->second, units, &ledger, assembly ? nullptr : &axes,
                                      assembly);
+            for (json& ann : v["annotations"])
+                if (ann.is_object() && ann.value("auto", false) && !ann.contains("model_anchors"))
+                    attach_drawing_anchors(s, v, ann);
         }
     s.revision += 1;
     return added;
@@ -3728,6 +4462,10 @@ json drawing_make(const std::string& source_doc_id, const json& spec) {
     if (doc_id.empty())
         throw OpError("invalid_op", "drawing_make: could not create drawing",
                       {{"reason", "no doc_id"}});
+    DrawingOnFailure drawing_cleanup(doc_id);
+    json warnings = json::array();
+    int sections_added = 0;
+    int auto_dimensions_added = 0;
 
     if (s.contains("sheet") && s["sheet"].is_string())
         try { drawing_set_sheet(doc_id, "s1", s["sheet"].get<std::string>()); }
@@ -3845,12 +4583,15 @@ json drawing_make(const std::string& source_doc_id, const json& spec) {
         };
         bool any = false;
         for (const auto& sec : s["sections"]) {
-            if (!sec.is_object()) continue;
+            if (!sec.is_object()) { warnings.push_back("section request is not an object"); continue; }
             std::string parent = sec.value("parent", std::string("front"));
             std::string axis = sec.value("axis", std::string("vertical"));
             json bbox;
             std::string vid;
-            if (!find_parent(parent, bbox, vid)) continue;
+            if (!find_parent(parent, bbox, vid)) {
+                warnings.push_back("section parent '" + parent + "' has no projected geometry");
+                continue;
+            }
             double x0 = bbox[0].get<double>(), y0 = bbox[1].get<double>();
             double x1 = bbox[2].get<double>(), y1 = bbox[3].get<double>();
             double cx = (x0 + x1) / 2.0, cy = (y0 + y1) / 2.0;
@@ -3861,11 +4602,22 @@ json drawing_make(const std::string& source_doc_id, const json& spec) {
             json opts = {{"mode", sec.value("mode", std::string("full"))},
                          {"reverse", sec.value("reverse", false)}};
             try {
-                drawing_add_section(doc_id, vid, json(nullptr), cut,
-                                    sec.contains("label") ? sec["label"] : json(nullptr),
-                                    json(nullptr), json(nullptr), "s1", json(false), opts);
-                any = true;
-            } catch (const OpError&) { /* skip a section that fails to cut */ }
+                const json created_section = drawing_add_section(
+                    doc_id, vid, json(nullptr), cut,
+                    sec.contains("label") ? sec["label"] : json(nullptr),
+                    json(nullptr), json(nullptr), "s1", json(false), opts);
+                const json section_view = created_section.value("view", json::object());
+                const json error = section_view.value("error", json());
+                if (error.is_string() && !error.get<std::string>().empty()) {
+                    drawing_remove_view(doc_id, created_section.value("view_id", std::string()));
+                    warnings.push_back("section projection failed: " + error.get<std::string>());
+                } else {
+                    ++sections_added;
+                    any = true;
+                }
+            } catch (const OpError& error) {
+                warnings.push_back(std::string("section failed: ") + error.what());
+            }
         }
         if (any) arrange();
     }
@@ -3875,7 +4627,19 @@ json drawing_make(const std::string& source_doc_id, const json& spec) {
     if (model_items) {
         DrawingLock lk;
         DrawingSession& ds = require_session(doc_id);
-        try { auto_dimension_locked(ds, doc_id, "s1", general_arrangement); } catch (const OpError&) {}
+        try {
+            auto_dimensions_added = auto_dimension_locked(ds, doc_id, "s1", general_arrangement);
+            if (auto_dimensions_added == 0)
+                warnings.push_back("auto-dimensioning created no dimensions");
+        } catch (const OpError& error) {
+            // A failed pass can have already placed annotations on earlier views.
+            auto_dimensions_added = 0;
+            for (const json& sheet : ds.doc.value("sheets", json::array()))
+                for (const json& view : sheet.value("views", json::array()))
+                    for (const json& ann : view.value("annotations", json::array()))
+                        if (ann.is_object() && ann.value("auto", false)) ++auto_dimensions_added;
+            warnings.push_back(std::string("auto-dimensioning failed: ") + error.what());
+        }
     }
     if (assembly)
         try { drawing_auto_balloon(doc_id); } catch (const OpError&) {}
@@ -3951,7 +4715,11 @@ json drawing_make(const std::string& source_doc_id, const json& spec) {
         title.erase("scale");
     try { drawing_set_titleblock(doc_id, "s1", title); } catch (const OpError&) {}
 
-    return json{{"doc_id", doc_id}, {"drawing", drawing_get(doc_id)}};
+    json response = {{"doc_id", doc_id}, {"drawing", drawing_get(doc_id)},
+                     {"auto_dimensions_added", auto_dimensions_added},
+                     {"sections_added", sections_added}, {"warnings", warnings}};
+    drawing_cleanup.release();
+    return response;
 }
 
 bool drawing_close(const std::string& doc_id) {
@@ -3962,6 +4730,7 @@ bool drawing_close(const std::string& doc_id) {
         if (it == g_drawings.end()) return false;
         if (it->second.owns_source) owned_source = it->second.source_ref_id;
         g_drawings.erase(it);
+        doc_dep_unregister(doc_id, "drawing");
     }
     if (!owned_source.empty()) {
         try {

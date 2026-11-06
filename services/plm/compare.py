@@ -2,9 +2,9 @@
 
 Orchestrates — never re-specifies — the two existing engines (contract §9):
 
-* **Semantic**: ``doc_diff`` (services/mcp/doc_diff_tools.py) on the two stored
-  canonical ``document.json`` blobs, plus the deterministic plain-language
-  change list from :mod:`summarize`.
+* **Semantic**: ``doc_diff`` (services/mcp/doc_diff_tools.py) on stored
+  canonical ``document.json`` blobs or native-imported KiCad snapshots, plus
+  the deterministic plain-language change list from :mod:`summarize`.
 * **Visual**: rendered images of the geometry DIFFERENCE between the two
   revisions — a git-diff for a 3D model. Parts/assemblies go through the core's
   ``doc_render_diff`` RPC (added green / removed red / unchanged grey, one shared
@@ -16,8 +16,8 @@ Orchestrates — never re-specifies — the two existing engines (contract §9):
 
 The visual half is BEST-EFFORT: when the engine library is not available
 (e.g. a test box without ``libchudware``), it degrades to a structured
-``{degraded: true, reason: …}`` block and the semantic half still answers —
-compare never hard-fails on a machine without the core (ease-of-use §8).
+``{degraded: true, reason: …}`` block. Once loaded, semantic comparison does
+not need the engine; importing KiCad file snapshots does.
 
 Engine doc-load contract (docs/… engine-doc-load-verify-contract):
 ``doc_new`` (kind+name only — NEVER the tree), then one ``doc_apply_ops``
@@ -55,14 +55,15 @@ def semantic_compare(doc_a: dict[str, Any], doc_b: dict[str, Any]) -> dict[str, 
 
 
 def is_generic_item(vault: Any, item_id: str) -> bool:
-    """True when *item_id* is a non-container (generic) item — a doc/code/link
-    item that has no ``document.json`` to semantic-diff."""
+    """True when *item_id* is a generic item rather than a CAD document."""
     from services.plm import doctypes
 
     m = vault.manifest()
     from services.plm import manifest as manifest_mod
 
     it = manifest_mod.find_item(m, item_id)
+    if it and doctypes.is_kicad_file(it.get("path", "")):
+        return False
     dt = (it or {}).get("doc_type")
     return bool(dt and dt in doctypes.GENERIC_DOC_TYPES)
 
@@ -190,11 +191,51 @@ def docs_at(vault: Any, commit_a: str, commit_b: str,
         tree_b = vault._bind.read_tree(commit_b)
     except KeyError:
         raise VaultError("not_found", "one of those points in history could not be found")
-    path = snapshot.item_prefix(item_id) + "document.json"
-    raw_a, raw_b = tree_a.get(path), tree_b.get(path)
-    if raw_a is None or raw_b is None:
+    return (_document_at(tree_a, item_id), _document_at(tree_b, item_id))
+
+
+def _document_at(tree: dict[str, bytes], item_id: str) -> dict[str, Any]:
+    """Read a container document or import a byte-exact KiCad file snapshot."""
+    from services.plm import doctypes
+    from services.plm.vault import VaultError
+
+    prefix = snapshot.item_prefix(item_id)
+    raw = tree.get(prefix + "document.json")
+    if raw is not None:
+        return json.loads(raw.decode("utf-8"))
+    files = [(path, content) for path, content in tree.items()
+             if path.startswith(prefix + "file/") and doctypes.is_kicad_file(path)]
+    if len(files) != 1:
         raise VaultError("invalid_item", "that item is not present at one of those points")
-    return json.loads(raw_a.decode("utf-8")), json.loads(raw_b.decode("utf-8"))
+    path, raw = files[0]
+    return _import_kicad_snapshot(Path(path).name, raw)
+
+
+def _import_kicad_snapshot(name: str, raw: bytes) -> dict[str, Any]:
+    """Import a historical file in an isolated temporary native session."""
+    import tempfile
+
+    from services.mcp import core_bridge as cb
+    from services.plm import ecad_diff
+    from services.plm.vault import VaultError
+
+    with tempfile.TemporaryDirectory(prefix="chudware_plm_kicad_") as directory:
+        path = Path(directory) / name
+        path.write_bytes(raw)
+        doc_id = None
+        try:
+            opened = cb.call("ecad_open", {"path": str(path)})
+            doc_id = opened.get("doc_id")
+            doc = opened.get("tree")
+            if not doc_id or not isinstance(doc, dict) or not ecad_diff.is_ecad_schema(doc):
+                raise ValueError("the native importer did not return an ECAD document")
+            return doc
+        except Exception as exc:
+            raise VaultError(getattr(exc, "code", "") or "ecad_import_failed",
+                             f"could not import KiCad snapshot {name}: {exc}") from exc
+        finally:
+            if doc_id:
+                cb.call("ecad_close", {"doc_id": doc_id})
 
 
 # ---------------------------------------------------------------------------
@@ -269,8 +310,7 @@ def visual_compare(doc_a: dict[str, Any], doc_b: dict[str, Any],
     except OSError as e:
         return {"degraded": True, "reason": "out_dir_unwritable", "hint": f"{e}"}
 
-    # ECAD boards/schematics diff with no engine at all — the stored canonical
-    # documents carry the whole layout, so this path works on any machine.
+    # Once imported, ECAD documents can be rendered without another engine call.
     from services.plm import ecad_diff
 
     if ecad_diff.is_ecad_schema(doc_a) or ecad_diff.is_ecad_schema(doc_b):
@@ -340,7 +380,7 @@ def _existing(path: Any) -> bool:
 
 def _ecad_visual(doc_a: dict[str, Any], doc_b: dict[str, Any],
                  out: Path) -> dict[str, Any]:
-    """Board-layout diff of two canonical ECAD documents (no engine needed)."""
+    """Board-layout or schematic diff of two imported ECAD documents."""
     vd = _visual_diff_mod()
     if vd is None:
         return {"degraded": True, "reason": "visual_diff_unavailable",

@@ -87,7 +87,7 @@ def test_status_probe_marks_login_page_expired_and_clears_verification(profile_s
 @pytest.mark.parametrize(
     ("fetch_result", "classification"),
     [
-        ({"ok": False, "reason": "browser_fetch_failed"}, "logged_in"),
+        ({"ok": False, "reason": "transport_failed"}, "logged_in"),
         ({"ok": True, "content": "challenge", "final_url": "https://vendor.example/"},
          "challenge"),
         ({"ok": True, "content": "ambiguous", "final_url": "https://vendor.example/"},

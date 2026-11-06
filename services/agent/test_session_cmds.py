@@ -1,6 +1,6 @@
-"""Focused Chudcode session-command and explicit-offline coverage.
+"""Focused Omp session-command and explicit-offline coverage.
 
-No live network: Chudcode hosts and role turns are faked, and local compaction
+No live network: Omp hosts and role turns are faked, and local compaction
 engines are isolated from optional dependency landing order.
 """
 
@@ -90,15 +90,15 @@ def _history() -> list[dict]:
 
 class TestHandoffDocument(unittest.TestCase):
     def test_online_handoff_uses_live_session_and_does_not_mutate(self) -> None:
-        from services.agent import chudcode_host
+        from services.agent import omp_host
         from services.agent import session_cmds as sc
 
         msgs = _history()
         before = copy.deepcopy(msgs)
-        host = _FakeChudcodeHost()
+        host = _FakeOmpHost()
         host.result = {"ok": True, "document": _SAMPLE_HANDOFF}
         with patch.object(
-            chudcode_host, "get_default_chudcode_host", return_value=host
+            omp_host, "get_default_omp_host", return_value=host
         ):
             doc = sc.handoff_document(
                 msgs, focus="RPC shapes", session_id="conversation-7"
@@ -144,10 +144,37 @@ class TestHandoffDocument(unittest.TestCase):
             with self.assertRaises(sc.SessionCommandUnavailable):
                 sc.handoff_document(_history())
 
+    def test_not_live_session_writes_handoff_from_transcript(self) -> None:
+        from services.agent import omp_host
+        from services.agent import session_cmds as sc
+
+        host = _FakeOmpHost()
+        host.result = {"ok": False, "reason": "session_not_live"}
+        with patch.object(sc, "_offline_enabled", return_value=False), patch.object(
+            omp_host, "get_default_omp_host", return_value=host
+        ), patch.object(sc, "_run_one_shot_role", return_value=_SAMPLE_HANDOFF) as run:
+            doc = sc.handoff_document(_history(), focus="fillets", session_id="conversation-7")
+        self.assertIn("## Goal", doc)
+        kwargs = run.call_args.kwargs
+        self.assertEqual(kwargs["session_id"], "conversation-7")
+        self.assertFalse(kwargs["standalone"])
+        # Online role turns refuse text history; the transcript rides in the request.
+        self.assertEqual(kwargs["messages"], [])
+        self.assertIn("Build the bracket", kwargs["request"])
+        self.assertIn("Additional focus: fillets", kwargs["request"])
+
+        host.result = {"ok": False, "reason": "session_busy"}
+        with patch.object(sc, "_offline_enabled", return_value=False), patch.object(
+            omp_host, "get_default_omp_host", return_value=host
+        ), patch.object(sc, "_run_one_shot_role") as run:
+            with self.assertRaises(sc.SessionCommandUnavailable):
+                sc.handoff_document(_history(), session_id="conversation-7")
+        run.assert_not_called()
+
 
 class TestBtwAnswer(unittest.TestCase):
     def test_bounded_one_shot_role_turn_and_no_history_mutation(self) -> None:
-        from services.agent import chudcode_roles
+        from services.agent import omp_roles
         from services.agent import session_cmds as sc
 
         msgs = _history()
@@ -162,7 +189,7 @@ class TestBtwAnswer(unittest.TestCase):
                 "result": "The mounting holes should be M5.",
             }
 
-        with patch.object(chudcode_roles, "run_role_turn", side_effect=fake_turn):
+        with patch.object(omp_roles, "run_role_turn", side_effect=fake_turn):
             answer = sc.btw_answer(
                 msgs,
                 "What hole size?",
@@ -189,7 +216,7 @@ class TestBtwAnswer(unittest.TestCase):
         self.assertEqual(call["history"], _history())
 
     def test_explicit_offline_btw_marks_role_turn_offline(self) -> None:
-        from services.agent import chudcode_roles
+        from services.agent import omp_roles
         from services.agent import session_cmds as sc
 
         provider = _MockProvider("offline answer")
@@ -203,7 +230,7 @@ class TestBtwAnswer(unittest.TestCase):
                 "result": {"handoff": {"summary": "offline answer"}},
             }
 
-        with patch.object(chudcode_roles, "run_role_turn", side_effect=fake_turn):
+        with patch.object(omp_roles, "run_role_turn", side_effect=fake_turn):
             answer = sc.btw_answer(
                 _history(),
                 "status?",
@@ -220,7 +247,7 @@ class TestBtwAnswer(unittest.TestCase):
         self.assertEqual(sc.btw_answer(_history(), "  "), "")
 
 
-class _FakeChudcodeHost:
+class _FakeOmpHost:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, dict]] = []
         self.result: dict = {"ok": True, "compacted": True}
@@ -237,21 +264,47 @@ class TestCompactShakeDelegation(unittest.TestCase):
         from services.agent import session_cmds as sc
 
         msgs = _history()
-        out = sc.compact_session(msgs, strategy="off")
+        out = sc.compact_session(msgs, strategy="off", standalone=True)
         self.assertEqual(out["kept_messages"], msgs)
         self.assertIsNot(out["kept_messages"], msgs)
 
-    def test_online_compact_uses_live_chudcode_once(self) -> None:
-        from services.agent import chudcode_host
+    def test_offline_does_not_substitute_snapcompact(self) -> None:
         from services.agent import session_cmds as sc
 
-        host = _FakeChudcodeHost()
+        messages = _history()
+        before = copy.deepcopy(messages)
+        for strategy in ("auto", "summary", "unknown"):
+            with self.subTest(strategy=strategy):
+                with self.assertRaisesRegex(sc.SessionCommandUnavailable, "offline"):
+                    sc.compact_session(messages, strategy=strategy, standalone=True)
+                self.assertEqual(messages, before)
+
+    def test_offline_shake_returns_the_transformed_messages(self) -> None:
+        from services.agent import session_cmds as sc
+
+        transformed = [{"role": "user", "content": "reduced"}]
+        fake = types.ModuleType("services.agent.compaction")
+        fake.shake_messages = lambda messages, **kwargs: {
+            "messages": transformed,
+            "saved_tokens": 42,
+        }
+        with patch.dict(sys.modules, {"services.agent.compaction": fake}):
+            out = sc.compact_session(_history(), strategy="shake", standalone=True)
+        self.assertEqual(out["messages"], transformed)
+        self.assertEqual(out["kept_messages"], transformed)
+        self.assertEqual(out["saved_tokens"], 42)
+
+    def test_online_compaction_is_refused_without_touching_host_or_transcript(self) -> None:
+        from services.agent import omp_host
+        from services.agent import session_cmds as sc
+
+        host = _FakeOmpHost()
         messages = _history()
         before = copy.deepcopy(messages)
         with (
             patch.object(
-                chudcode_host,
-                "get_default_chudcode_host",
+                omp_host,
+                "get_default_omp_host",
                 return_value=host,
                 create=True,
             ),
@@ -261,59 +314,23 @@ class TestCompactShakeDelegation(unittest.TestCase):
                 side_effect=AssertionError("online compact invoked local compaction"),
             ),
         ):
-            out = sc.compact_session(
-                messages,
-                strategy="snapcompact",
-                session_id="session-7",
-                instructions="preserve CAD decisions",
-            )
+            # Online conversations compact through the agent_admin_turn compaction run.
+            with self.assertRaisesRegex(
+                sc.SessionCommandUnavailable, "unavailable for online agent sessions"
+            ):
+                sc.compact_session(messages, strategy="summary")
 
-        self.assertEqual(out, {"ok": True, "compacted": True})
-        self.assertEqual(
-            host.calls,
-            [
-                (
-                    "session-7",
-                    "compact",
-                    {"customInstructions": "preserve CAD decisions"},
-                )
-            ],
-        )
+        self.assertEqual(host.calls, [])
         self.assertEqual(messages, before)
 
-    def test_online_compact_without_live_session_is_honest(self) -> None:
+    def test_compaction_and_retry_toggles_use_omp(self) -> None:
+        from services.agent import omp_host
         from services.agent import session_cmds as sc
 
-        with self.assertRaisesRegex(
-            sc.SessionCommandUnavailable, "requires a live agent session_id"
-        ):
-            sc.compact_session(_history(), strategy="summary")
-
-    def test_online_compact_propagates_unavailable_result(self) -> None:
-        from services.agent import chudcode_host
-        from services.agent import session_cmds as sc
-
-        host = _FakeChudcodeHost()
-        host.result = {"ok": False, "reason": "session not live"}
+        host = _FakeOmpHost()
         with patch.object(
-            chudcode_host,
-            "get_default_chudcode_host",
-            return_value=host,
-            create=True,
-        ):
-            with self.assertRaisesRegex(
-                sc.SessionCommandUnavailable, "session not live"
-            ):
-                sc.compact_session(_history(), strategy="summary", session_id="closed")
-
-    def test_compaction_and_retry_toggles_use_chudcode(self) -> None:
-        from services.agent import chudcode_host
-        from services.agent import session_cmds as sc
-
-        host = _FakeChudcodeHost()
-        with patch.object(
-            chudcode_host,
-            "get_default_chudcode_host",
+            omp_host,
+            "get_default_omp_host",
             return_value=host,
             create=True,
         ):
@@ -395,7 +412,7 @@ class TestSessionRpc(unittest.TestCase):
     def test_rpc_handoff_and_btw_shapes(self) -> None:
         from services.agent import worker_rpc as rpc
 
-        # Worker RPC forwards the live Chudcode identity and explicit-local bit.
+        # Worker RPC forwards the live Omp identity and explicit-local bit.
         with patch.object(
             rpc._cmds(),
             "handoff_document",
@@ -454,7 +471,7 @@ if __name__ == "__main__":
 
 def test_cell_btw_carries_parent_scope_and_readonly_mode(monkeypatch):
     import hashlib
-    from services.agent import chudcode_host, chudcode_roles, request_context as tenancy
+    from services.agent import omp_host, omp_roles, request_context as tenancy
     from services.agent import session_cmds
 
     actor = "btw-owner"
@@ -477,8 +494,8 @@ def test_cell_btw_carries_parent_scope_and_readonly_mode(monkeypatch):
         seen.append(kwargs)
         return {"success": True, "result": "side answer"}
 
-    monkeypatch.setattr(chudcode_host, "get_default_chudcode_host", lambda: ScopedHost())
-    monkeypatch.setattr(chudcode_roles, "run_role_turn", role)
+    monkeypatch.setattr(omp_host, "get_default_omp_host", lambda: ScopedHost())
+    monkeypatch.setattr(omp_roles, "run_role_turn", role)
     with tenancy.bind_context(ctx):
         assert session_cmds.btw_answer([], "question", session_id="parent") == "side answer"
     assert seen[0]["options"]["workspace_dir"] == "/work"

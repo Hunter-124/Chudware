@@ -194,11 +194,14 @@ class _Watchdog(threading.Thread):
         super().__init__(name="simsuite-resguard", daemon=True)
         self.budget = budget
         self.interval = interval
+        self._stopped = threading.Event()
+
+    def stop(self) -> None:
+        self._stopped.set()
 
     def run(self) -> None:
         import _thread
-        while True:
-            time.sleep(self.interval)
+        while not self._stopped.wait(self.interval):
             rss = _rss_tree()
             if not rss:
                 return  # platform gives us nothing to measure
@@ -280,3 +283,16 @@ def install() -> Budget:
         f"[resguard] budget: {budget.mem_bytes / _GB:.1f} GB RAM "
         f"(of {budget.total_bytes / _GB:.0f} GB), {budget.workers} solver threads\n")
     return budget
+
+
+def stop_watchdog() -> None:
+    """Stop enforcing the tree budget in this process; thread caps and RLIMIT stay armed.
+
+    For an orchestrator whose child processes each install their own guard. pytest-xdist's
+    controller owns every worker, so its tree is the sum of all of them: held to the
+    single-process budget, a healthy parallel run was aborted at 5.7 GB. Each worker
+    still guards its own tree.
+    """
+    wd = _state["watchdog"]
+    if wd is not None:
+        wd.stop()

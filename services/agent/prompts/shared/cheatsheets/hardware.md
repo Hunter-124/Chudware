@@ -130,8 +130,16 @@ Common lengths 6,8,10,12,15,20,25,30,35,40 mm. PCB standoff default M2.5 or M3, 
   2× nominal Ø2.2 holes ~28.1 apart. Overall height through output ~30.3.
 - **MG90S**: 22.8×12.4×28.4 body, 32.1 flange span; flange underside 18.5 above base, ~2.5 thick;
   2× nominal Ø2.2 holes ~28.0 apart. Overall height through output ~32.5.
-- **MG996R / MG995 standard**: ~40.9×20×37 body, 54 flange span; flange underside ~26.8 above base,
-  2× nominal Ø3.2 holes ~49.5 apart. Overall height ~42.9.
+- **MG996R / MG995 standard**: nominal MG996R body 40.9×20×37, flange span 54, flange underside
+  26.8 above base and approximately 2.5 thick; four open-ended grommet slots (estimated Ø4.8
+  round end, 3.2 opening) on 49.5 longitudinal and approximately 10 transverse pitch.
+  Approximate 25T Ø5.9 output, central M3 tap bore, stepped cover/gear housing and low cable
+  exit are modeled; horn, cable, and optional rubber grommets/eyelets are not. The existing
+  model's overall height is 42.9 with output datum at z=40; TowerPro's drawing instead gives
+  42.7 overall while its product text gives 42.9. Slot, boss and detailed dimensions are
+  estimates, not toleranced specifications; measure the physical unit before making a
+  close-fitting bracket. Genuine and counterfeit units can differ; a vendor quotes an M4
+  horn screw instead of M3, so check the actual retaining thread before selecting a screw.
 - **DS3218 standard**: 40×20×40.5 overall. Mounting-hole and boss dimensions vary; check your actual
   supplier's drawing before machining a bracket. Use `make_standard_part(family="hobby_servo", size="MG90S")`
   for editable nominal geometry and its off-center `datum.output_axis`. TowerPro's A–F drawings:

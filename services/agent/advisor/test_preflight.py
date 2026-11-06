@@ -52,13 +52,19 @@ def test_parameter_dimensions(params, expected):
 
 
 @pytest.mark.parametrize("feature", [
-    {"type": "fillet", "params": {"radius": -1}},
     {"type": "chamfer", "params": {"thickness": 0}},
     {"type": "hole", "params": {"depth": 0}},
 ])
 def test_local_dimension_refusal_does_not_require_live_measurement(feature):
     checks = preflight._check_params_sane([{"op": "add_feature", "feature": feature}])
     assert checks[0]["result"] == "fail"
+
+
+@pytest.mark.parametrize("radius", [-1, 0, {"value": -2, "expr": None}])
+def test_fillet_radius_is_never_flagged_because_the_engine_clamps_it(radius):
+    checks = preflight._check_params_sane([
+        {"op": "add_feature", "feature": {"type": "fillet", "params": {"radius": radius}}}])
+    assert checks[0]["result"] == "pass"
 
 
 @pytest.mark.parametrize("response, expected", [

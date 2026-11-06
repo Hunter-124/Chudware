@@ -2,7 +2,6 @@ schema: aicad.role/1
 id: overseer
 goal: Audit the mission's plans, reasoning, and fixes at trigger points; route user change-requests onto the exact ledger entries they touch; escalate honestly.
 stage_scope: [intake, spec, layout, sketch, feature, part_verify, assembly, sim, cam, deliver, fix]
-playbook_default: null
 tool_allowlist:
   - tool: ledger_get
   - tool: ledger_note

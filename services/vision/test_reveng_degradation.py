@@ -253,3 +253,29 @@ def test_openmvs_banner_mentions_agpl():
     assert agpl_banners, (
         "Expected at least one banner mentioning AGPL when OpenMVS is absent"
     )
+
+
+def test_openmvs_discovery_matches_backend_for_path_and_override(tmp_path, monkeypatch):
+    from services.vision.dense_backends import _openmvs_bins
+
+    directory = tmp_path / "openmvs"
+    directory.mkdir()
+    names = ("InterfaceCOLMAP", "DensifyPointCloud", "ReconstructMesh", "RefineMesh", "TextureMesh")
+    for name in names:
+        executable = directory / name
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+    monkeypatch.delenv("OPENMVS_BIN", raising=False)
+    monkeypatch.setenv("PATH", str(directory))
+    assert rp._artifact_available("openmvs")
+    assert not _openmvs_bins(check=True)[1]
+    monkeypatch.setenv("OPENMVS_BIN", str(directory))
+    monkeypatch.setenv("PATH", "")
+    assert rp._artifact_available("openmvs")
+    assert not _openmvs_bins(check=True)[1]
+    (directory / "TextureMesh").unlink()
+    assert not rp._artifact_available("openmvs")
+    assert _openmvs_bins(check=True)[1] == ["TextureMesh"]
+    monkeypatch.setenv("PATH", str(directory))
+    monkeypatch.setenv("OPENMVS_BIN", str(tmp_path / "wrong"))
+    assert not rp._artifact_available("openmvs")

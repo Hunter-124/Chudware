@@ -681,13 +681,15 @@ def _run_requirement_verify(
         return _escalate("req_id_not_found",
                          f"Verify node {node_name!r}: requirement {req_id!r} not found in doc.")
 
-    # Collect supported verifiers (those in battery.CHECKS)
+    # Collect supported verifiers (those in battery.CHECKS). An "info" check (measure_part,
+    # measure_between) takes a reading with no pass criterion, so it cannot verify a requirement.
     _UNSUPPORTED_IN_BATTERY = {"confirm_dimensions", "dfm_check", "fit_report"}
     supported: list[dict] = []
     unsupported: list[str] = []
     for vr in req_obj.verify_by:
         name = vr.verifier
-        if name in _UNSUPPORTED_IN_BATTERY or name not in _BATTERY_CHECKS:
+        if (name in _UNSUPPORTED_IN_BATTERY or name not in _BATTERY_CHECKS
+                or _BATTERY_CHECKS[name][4] == "info"):
             unsupported.append(name)
         else:
             supported.append({"verifier": name, "args": vr.args})

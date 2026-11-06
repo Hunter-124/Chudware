@@ -127,7 +127,9 @@ void save_box_part(const fs::path& path) {
             {"params", {{"length", 10.0}, {"width", 10.0}, {"height", 10.0}}}
         }}}
     }), false);
-    doc_save(id, path.string());
+    const json saved = doc_save(id, path.string());
+    REQUIRE_MESSAGE(!saved.contains("code"), saved.dump());
+    REQUIRE(doc_close(id));
 }
 
 std::pair<std::string, json> insert_native_source(const fs::path& path) {
@@ -270,45 +272,88 @@ TEST_CASE("doc_save omits geometry.step when the document has no successful rebu
     fs::remove(out);
 }
 
-TEST_CASE("partial native child reports its failed feature without dropping surviving geometry") {
+TEST_CASE("failed native child is diagnosed but never exported as complete geometry") {
     using namespace chudware::doc;
     const fs::path part = tmp("partial_child.step+");
+    const fs::path complete = tmp("partial_child_good_sibling.step+");
     const fs::path nested = tmp("partial_nested.step+");
+    const fs::path output = tmp("partial_export.step");
+    fs::remove(output);
     save_box_part(part);
+    save_box_part(complete);
     json child = stepplus_open(part.string()).doc;
     child["features"].push_back({{"id", "broken_child_feature"}, {"type", "unsupported_feature"},
                                  {"params", json::object()}, {"refs", json::object()}});
     // No solved cache: rebuild the actual authored feature tree, not its old good snapshot.
     stepplus_save(child, part.string(), {});
 
-    const auto [id, response] = insert_native_source(part);
-    REQUIRE(response["rebuild"]["components"].size() == 1);
+    const auto [id, initial] = insert_native_source(part);
+    const std::string failed_id = initial["id_map"]["$0"].get<std::string>();
+    const json response = doc_apply_ops(id, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", complete.string()}}}, {"fixed", true}}
+    }), false);
+    const std::string good_id = response["id_map"]["$0"].get<std::string>();
+    REQUIRE(response["rebuild"]["components"].size() == 2);
     CHECK(response["rebuild"]["components"][0]["ok"] == false);
+    CHECK(response["rebuild"]["components"][1]["ok"] == true);
     CHECK(response["rebuild"]["converged"] == false);
     const std::string error = response["rebuild"]["components"][0]["error"].get<std::string>();
     CHECK(error.find("broken_child_feature") != std::string::npos);
     const json report = doc_eval_model_integrity(id, json::object());
     CHECK(report["complete"] == false);
     REQUIRE(report["solids"].size() == 1);
+    CHECK(report["solids"][0]["component_id"] == good_id);
+    CHECK(report["solids"][0]["volume_mm3"].get<double>() == doctest::Approx(1000.0));
+    CHECK(report["assembly"]["components"][0]["id"] == failed_id);
     CHECK(report["assembly"]["components"][0]["status"] == "failed");
     CHECK_FALSE(report["source_failures"].empty());
 
-    // The same partial geometry and diagnostic must survive another assembly boundary.
+    // The good sibling must not make an incomplete assembly exportable.
+    CHECK_THROWS_AS(doc_export_file(id, output.string(), "step", 0.0, 0.0, false, false), OpError);
+    CHECK_FALSE(fs::exists(output));
+    CHECK_THROWS_AS(doc_export_step(id, output.string()), OpError);
+    CHECK_FALSE(fs::exists(output));
+    CHECK_THROWS_AS(doc_export_estimate(id, 0.05, 0.35, false), OpError);
+
+    // Saving the authored assembly remains possible for repair, but it must not
+    // include a partial geometry.step or become a complete source when nested.
     doc_save(id, nested.string());
+    CHECK(geometry_step_of(nested).empty());
     const auto [outer_id, outer_response] = insert_native_source(nested);
+    REQUIRE(outer_response["rebuild"]["components"].size() == 1);
     CHECK(outer_response["rebuild"]["components"][0]["ok"] == false);
     CHECK(outer_response["rebuild"]["components"][0]["error"].get<std::string>().find(
               "broken_child_feature") != std::string::npos);
     const json outer_report = doc_eval_model_integrity(outer_id, json::object());
     CHECK(outer_report["complete"] == false);
-    CHECK(outer_report["solids"].size() == 1);
-    fs::remove(part); fs::remove(nested);
+    REQUIRE(outer_report["solids"].size() == 1);
+    CHECK(outer_report["solids"][0]["volume_mm3"].get<double>() == doctest::Approx(1000.0));
+    CHECK_THROWS_AS(doc_export_file(outer_id, output.string(), "step", 0.0, 0.0, false, false),
+                    OpError);
+    CHECK_FALSE(fs::exists(output));
+
+    const std::string target = doc_new("part", "partial_import_target").at("doc_id");
+    doc_apply_ops(target, -1, json::array({
+        {{"op", "add_feature"}, {"feature", {
+            {"type", "box"}, {"params", {{"length", 10.0}, {"width", 10.0}, {"height", 10.0}}}
+        }}}
+    }), false);
+    const json before = doc_tree(target);
+    CHECK_THROWS_AS(doc_import_file(nested.string(), target, false, ""), OpError);
+    CHECK(doc_tree(target) == before);
+    CHECK(doc_eval_mass(target, 0)["volume_mm3"].get<double>() == doctest::Approx(1000.0));
+    doc_close(target);
+    doc_close(outer_id);
+    doc_close(id);
+    fs::remove(part); fs::remove(complete); fs::remove(nested); fs::remove(output);
 }
 
 TEST_CASE("nested unresolved mate preserves provisional bodies and prevents clean parent rebuild") {
     using namespace chudware::doc;
     const fs::path part = tmp("unsolved_child_part.step+");
     const fs::path nested = tmp("unsolved_child_assembly.step+");
+    const fs::path output = tmp("unsolved_child_export.step");
+    fs::remove(output);
     save_box_part(part);
     const auto [child_id, child_response] = insert_native_source(part);
     REQUIRE(child_response["rebuild"]["converged"] == true);
@@ -334,6 +379,10 @@ TEST_CASE("nested unresolved mate preserves provisional bodies and prevents clea
     CHECK(report["complete"] == false);
     CHECK(report["solids"].size() == 1);
     CHECK_FALSE(report["source_failures"].empty());
+    CHECK_THROWS_AS(doc_export_file(id, output.string(), "step", 0.0, 0.0, false, false), OpError);
+    CHECK_FALSE(fs::exists(output));
+    doc_close(id);
+    doc_close(child_id);
     fs::remove(part); fs::remove(nested);
 }
 
@@ -345,10 +394,22 @@ TEST_CASE("fully rebuilt nested native source remains complete and exports uncha
     save_box_part(part);
     const auto [child_id, child_response] = insert_native_source(part);
     REQUIRE(child_response["rebuild"]["converged"] == true);
+    const std::string child_component = child_response["id_map"]["$0"].get<std::string>();
+    const json child_moved = doc_apply_ops(child_id, -1, json::array({
+        {{"op", "asm_edit_component"}, {"id", child_component}, {"fixed", true},
+         {"transform", {1,0,0,30, 0,1,0,4, 0,0,1,5, 0,0,0,1}}}
+    }), false);
+    REQUIRE(child_moved["rebuild"]["converged"] == true);
     doc_save(child_id, nested.string());
     const auto [id, response] = insert_native_source(nested);
     CHECK(response["rebuild"]["converged"] == true);
     CHECK(response["rebuild"]["components"][0]["ok"] == true);
+    const std::string component = response["id_map"]["$0"].get<std::string>();
+    const json moved = doc_apply_ops(id, -1, json::array({
+        {{"op", "asm_edit_component"}, {"id", component}, {"fixed", true},
+         {"transform", {1,0,0,7, 0,1,0,12, 0,0,1,3, 0,0,0,1}}}
+    }), false);
+    REQUIRE(moved["rebuild"]["converged"] == true);
     const json report = doc_eval_model_integrity(id, json::object());
     CHECK(report["complete"] == true);
     CHECK(report["source_failures"].empty());
@@ -359,6 +420,15 @@ TEST_CASE("fully rebuilt nested native source remains complete and exports uncha
     std::vector<TopoDS_Shape> solids;
     for (const auto& body : import_bodies(output.string(), "step")) solids.push_back(body.second);
     CHECK(total_volume(solids) == doctest::Approx(1000.0).epsilon(0.001));
+    REQUIRE(solids.size() == 1);
+    GProp_GProps properties;
+    BRepGProp::VolumeProperties(solids[0], properties);
+    const gp_Pnt centroid = properties.CentreOfMass();
+    CHECK(centroid.X() == doctest::Approx(37.0));
+    CHECK(centroid.Y() == doctest::Approx(16.0));
+    CHECK(centroid.Z() == doctest::Approx(8.0));
+    doc_close(id);
+    doc_close(child_id);
     fs::remove(part); fs::remove(nested); fs::remove(output);
 }
 

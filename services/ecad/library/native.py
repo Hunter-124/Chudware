@@ -9,10 +9,9 @@ Provides a ``Library`` class and module-level singleton functions
 works out of the box for Python ECAD service callers.
 
 Resolution order (first match wins):
-  1. Starter lib (always available)
-  2. Native dirs (JSON files; configured via ``add_native_dir``)
-  3. KiCad lib paths (configured via ``add_kicad_path``)
-  4. Returns None
+  1. Configured project and agent-generated native JSON libraries
+  2. Installed KiCad and native core libraries
+  3. Python starter and explicitly configured KiCad library paths
 
 Native dir layout::
   <dir>/symbols/<libid-encoded>.sym.json
@@ -30,6 +29,24 @@ import re
 from typing import Any
 
 from .starter import SYMBOLS, FOOTPRINTS, get_symbol, get_footprint
+
+def _core_library(method: str, query: str, *, resolve: bool = False,
+                  strict: bool = False) -> list[dict]:
+    """Query the native catalog lazily so standalone Python catalogs still work."""
+    try:
+        from services.mcp.ecad_common import _ECAD, _rpc
+        params = {"query": query, "limit": 100, "resolve": resolve}
+        doc_id = (_ECAD.get("current_sch") if method == "ecad_symbols" else
+                  _ECAD.get("current_pcb") or _ECAD.get("current_sch"))
+        if doc_id:
+            params["doc_id"] = doc_id
+        result = _rpc(method, params)
+        field = "symbols" if method == "ecad_symbols" else "footprints"
+        return [row for row in result.get(field, []) if isinstance(row, dict)]
+    except Exception:  # noqa: BLE001 — standalone catalogs can operate without the core
+        if strict:
+            raise
+        return []
 
 
 def _libid_to_filename(libid: str, ext: str) -> str:
@@ -53,9 +70,11 @@ class Library:
         self._fp_cache: dict[str, dict | None] = {}
 
     def add_native_dir(self, directory: str) -> None:
-        """Add a native library directory to the search path."""
-        if directory not in self._native_dirs:
-            self._native_dirs.append(directory)
+        """Add a native library directory, making the latest registration authoritative."""
+        if directory in self._native_dirs:
+            self._native_dirs.remove(directory)
+        self._native_dirs.append(directory)
+        self.clear_cache()
 
     def add_kicad_sym_path(self, path: str) -> None:
         """Add a .kicad_sym file path for symbol resolution."""
@@ -71,10 +90,36 @@ class Library:
         self._sym_cache.clear()
         self._fp_cache.clear()
 
+    def _native_definition(self, ident: str, subdir: str, extension: str) -> dict | None:
+        filename = _libid_to_filename(ident, extension)
+        for directory in reversed(self._native_dirs):
+            path = os.path.join(directory, subdir, filename)
+            if os.path.isfile(path):
+                try:
+                    with open(path, encoding="utf-8") as stream:
+                        result = json.load(stream)
+                    if isinstance(result, dict):
+                        return result
+                except (OSError, ValueError):
+                    continue
+        return None
+
+    def custom_symbol(self, libid: str) -> dict | None:
+        return self._native_definition(libid, "symbols", ".sym.json")
+
+    def custom_footprint(self, fpid: str) -> dict | None:
+        return self._native_definition(fpid, "footprints", ".fp.json")
+
     # ─── symbol resolution ───────────────────────────────────────────────────
 
     def resolve(self, libid: str) -> dict | None:
         """Resolve a symbol by libid. Returns a SymbolDef dict or None."""
+        custom = self.custom_symbol(libid)
+        if custom is not None:
+            return custom
+        for hit in _core_library("ecad_symbols", libid, resolve=True):
+            if hit.get("libid") == libid and isinstance(hit.get("definition"), dict):
+                return hit["definition"]
         if libid in self._sym_cache:
             return self._sym_cache[libid]
 
@@ -88,16 +133,6 @@ class Library:
         if sym is not None:
             return sym
 
-        # 2. native dirs
-        fname = _libid_to_filename(libid, ".sym.json")
-        for d in self._native_dirs:
-            sym_path = os.path.join(d, "symbols", fname)
-            if os.path.isfile(sym_path):
-                try:
-                    with open(sym_path, encoding="utf-8") as fh:
-                        return json.load(fh)
-                except Exception:
-                    pass
 
         # 3. KiCad .kicad_sym files
         lib_part = libid.split(":")[0] if ":" in libid else ""
@@ -120,6 +155,12 @@ class Library:
 
     def resolve_footprint(self, fpid: str) -> dict | None:
         """Resolve a footprint by fpid. Returns a footprint dict or None."""
+        custom = self.custom_footprint(fpid)
+        if custom is not None:
+            return custom
+        for hit in _core_library("ecad_footprints", fpid, resolve=True):
+            if hit.get("fpid") == fpid and isinstance(hit.get("definition"), dict):
+                return hit["definition"]
         if fpid in self._fp_cache:
             return self._fp_cache[fpid]
 
@@ -133,16 +174,6 @@ class Library:
         if fp is not None:
             return fp
 
-        # 2. native dirs
-        fname = _libid_to_filename(fpid, ".fp.json")
-        for d in self._native_dirs:
-            fp_path = os.path.join(d, "footprints", fname)
-            if os.path.isfile(fp_path):
-                try:
-                    with open(fp_path, encoding="utf-8") as fh:
-                        return json.load(fh)
-                except Exception:
-                    pass
 
         # 3. KiCad .pretty dirs
         lib_part = fpid.split(":")[0] if ":" in fpid else ""
@@ -165,7 +196,7 @@ class Library:
 
     # ─── search ─────────────────────────────────────────────────────────────
 
-    def search(self, query: str) -> list[dict]:
+    def search(self, query: str, *, strict: bool = False) -> list[dict]:
         """Search symbols and footprints by keyword/name.
 
         Returns a list of hit dicts with keys: kind, libid/fpid, name,
@@ -173,12 +204,64 @@ class Library:
         """
         q = query.lower().strip()
         hits: list[dict] = []
+        shadowed: set[tuple[str, str]] = set()
+        # Project/generated definitions shadow installed libraries with the same id.
+        for directory in self._native_dirs:
+            for subdir, ext, kind, key in (("symbols", ".sym.json", "symbol", "libid"),
+                                            ("footprints", ".fp.json", "footprint", "fpid")):
+                source = os.path.join(directory, subdir)
+                if not os.path.isdir(source):
+                    continue
+                for filename in os.listdir(source):
+                    if not filename.endswith(ext):
+                        continue
+                    ident = _filename_to_libid(filename, ext)
+                    shadowed.add((kind, ident))
+                    if any(hit.get(key) == ident for hit in hits):
+                        continue
+                    definition = self._native_definition(ident, subdir, ext) or {}
+                    name = definition.get("name") or ident.split(":")[-1]
+                    description = definition.get("description") or ""
+                    keywords = definition.get("keywords") or ""
+                    if isinstance(keywords, list):
+                        keywords = " ".join(str(word) for word in keywords)
+                    score = _score(q, ident, name, description, str(keywords))
+                    if score > 0:
+                        hits.append({"kind": kind, key: ident, "name": name,
+                                     "description": description, "score": score})
+        for method, kind, key in (("ecad_symbols", "symbol", "libid"),
+                                  ("ecad_footprints", "footprint", "fpid")):
+            rows = _core_library(method, query, strict=strict)
+            # A single-word search such as "voltage" should find source symbols
+            # even when broad matches fill the native catalog's bounded result.
+            if method == "ecad_symbols" and len(q.split()) == 1 and q:
+                rows += _core_library(method, f"{query} source", strict=strict)
+            for item in rows:
+                ident = item.get(key)
+                if not isinstance(ident, str) or not ident or (kind, ident) in shadowed:
+                    continue
+                if any(hit.get(key) == ident for hit in hits):
+                    continue
+                name = ident.split(":")[-1]
+                description = item.get("description", "")
+                keywords = item.get("keywords") or ""
+                if isinstance(keywords, list):
+                    keywords = " ".join(str(word) for word in keywords)
+                score = _score(q, ident, name, description, str(keywords))
+                if description.lower().startswith(q + " source"):
+                    score += 4
+                hits.append({"kind": kind, key: ident, "name": name,
+                             "description": description, "score": max(1, score),
+                             "pin_count": item.get("pin_count"),
+                             "pad_count": item.get("pad_count"),
+                             "footprint": item.get("footprint") or item.get("default_footprint", "")})
 
         for libid, sdef in SYMBOLS.items():
             score = _score(q, libid, sdef.get("name", ""),
                            sdef.get("description", ""),
                            sdef.get("keywords", ""))
-            if score > 0:
+            if (score > 0 and ("symbol", libid) not in shadowed and
+                    not any(h.get("libid") == libid for h in hits)):
                 hits.append({
                     "kind": "symbol",
                     "libid": libid,
@@ -190,7 +273,8 @@ class Library:
         for fpid, fp in FOOTPRINTS.items():
             score = _score(q, fpid, fpid.split(":")[-1],
                            fp.get("description", ""), "")
-            if score > 0:
+            if (score > 0 and ("footprint", fpid) not in shadowed and
+                    not any(h.get("fpid") == fpid for h in hits)):
                 hits.append({
                     "kind": "footprint",
                     "fpid": fpid,
@@ -199,20 +283,6 @@ class Library:
                     "score": score,
                 })
 
-        # also scan native dirs
-        for d in self._native_dirs:
-            sym_dir = os.path.join(d, "symbols")
-            if os.path.isdir(sym_dir):
-                for fname in os.listdir(sym_dir):
-                    if fname.endswith(".sym.json"):
-                        libid = _filename_to_libid(fname, ".sym.json")
-                        if any(h.get("libid") == libid for h in hits):
-                            continue
-                        score = _score(q, libid, libid.split(":")[-1], "", "")
-                        if score > 0:
-                            hits.append({"kind": "symbol", "libid": libid,
-                                         "name": libid.split(":")[-1],
-                                         "description": "", "score": score})
 
         hits.sort(key=lambda h: -h["score"])
         return hits[:50]  # cap at 50
@@ -266,9 +336,9 @@ def resolve_footprint(fpid: str) -> dict | None:
     return _default.resolve_footprint(fpid)
 
 
-def search(query: str) -> list[dict]:
+def search(query: str, *, strict: bool = False) -> list[dict]:
     """Search the default library for symbols and footprints."""
-    return _default.search(query)
+    return _default.search(query, strict=strict)
 
 
 def get_default_library() -> Library:

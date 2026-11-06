@@ -110,7 +110,7 @@ def _resolve_fn(tool: str) -> Callable[..., Any] | None:
     for module_key in ("files", "shell", "plm", "gsl", "parts", "ledger", "preflight",
                        "regen", "buildgraph", "intake", "designreview", "req", "cost",
                        "structural", "dimscheme", "workspace", "firmware", "em", "antenna",
-                       "mission", "org", "sourcing", "dag", "advisor", "camaudit",
+                       "mission", "sourcing", "dag", "advisor", "camaudit",
                        "spec", "sketch3d", "tasklist"):
         fn = _resolve_extra(module_key, tool)
         if fn is not None:
@@ -170,8 +170,7 @@ def _resolve_extra(module_key: str, fn_name: str) -> Callable[..., Any] | None:
                 from services.mcp.regen_tools import register_regen_tools
                 register_regen_tools(mcp)
             elif module_key == "buildgraph":
-                # buildgraph_plan/buildgraph_status — the orchestrator /
-                # department_manager / overseer build-order surface.
+                # buildgraph_plan/buildgraph_status — orchestrator and overseer.
                 from services.agent.buildgraph.mcp_tools import register_buildgraph_tools
                 register_buildgraph_tools(mcp)
             elif module_key == "designreview":
@@ -233,12 +232,6 @@ def _resolve_extra(module_key: str, fn_name: str) -> Callable[..., Any] | None:
                 # resolved" and no rephrasing could recover it.
                 from services.mcp.mission_tools import register_mission_tools
                 register_mission_tools(mcp)
-            elif module_key == "org":
-                # department_manager.yaml advertises channel_send/request_resolve/
-                # council_convene (aicad.org/1 §18). org_tools implements them but
-                # nothing ever registered the module.
-                from services.mcp.org_tools import register_org_tools
-                register_org_tools(mcp)
             elif module_key == "sourcing":
                 # sourcing_specialist.yaml advertises bom_price/bom_rollup.
                 from services.mcp.sourcing_tools import register_sourcing_tools
@@ -760,7 +753,7 @@ def _eval_bay_vs_board(rule: str, result: dict) -> tuple[str, str]:
       * bay_length/width/height (or bay_*) and board_* counterparts
       * bay_volume / board_volume (or volume_mm3 vs board_volume_mm3)
       * volume_mm3 alone when the rule embeds ``volume_mm3 in [lo,hi]``
-      * volume_mm3 alone vs default FC board envelope floor (payload-bay intent)
+      * volume_mm3 alone vs default board envelope floor
     """
     if not isinstance(result, dict):
         return NOT_CHECKED, "bay/board rule needs object tool output"
@@ -810,23 +803,23 @@ def _eval_bay_vs_board(rule: str, result: dict) -> tuple[str, str]:
             return PASS, f"bay_volume={bay_v} >= board_volume={board_v}"
         return FAIL, f"bay_volume={bay_v} < board_volume={board_v}"
 
-    # measure_part often returns only mass.volume_mm3 for the whole part. A
-    # payload-bay airframe body large enough to house a typical FC board
-    # (≈50×40×2 mm ≈ 4e3 mm³) is accepted as bay-envelope evidence; tiny
-    # volumes FAIL the fit intent. Upper bound keeps absurd volumes honest.
+    # measure_part often returns only mass.volume_mm3 for the whole part.
+    # A part large enough to house a typical board (≈50×40×2 mm ≈ 4e3 mm³)
+    # is accepted as bay-envelope evidence; tiny volumes FAIL the fit intent.
+    # Upper bound keeps absurd volumes honest.
     if bay_v is not None:
-        board_floor = 5_000.0   # mm³ — conservative FC board envelope
+        board_floor = 5_000.0   # mm³ — conservative board envelope
         bay_ceiling = 5_000_000.0
         if bay_v + 1e-9 < board_floor:
             return FAIL, (
                 f"volume_mm3={bay_v} < default board envelope floor {board_floor} "
-                "(bay too small for FC board)"
+                "(bay too small for board)"
             )
         if bay_v > bay_ceiling:
             return FAIL, f"volume_mm3={bay_v} exceeds bay ceiling {bay_ceiling}"
         return PASS, (
             f"volume_mm3={bay_v} >= default board envelope floor {board_floor} "
-            "(payload-bay volume proxy)"
+            "(bay volume proxy)"
         )
 
     if any("bay" in k or "board" in k for k in nums):
@@ -1422,14 +1415,14 @@ def _battery_per_check_diagnosis(
     zero_l = {z.lower() for z in zero_checks}
     if "is_manifold" in zero_l or "eval_check" in zero_l:
         hints.append(
-            "CRITICAL solid integrity failed — ensure closed manifold solid "
-            "(no open shells / zero-thickness sheets); revolve/extrude closed "
-            "profiles with wall≥1.5 mm."
+            "CRITICAL solid integrity failed — ensure a closed manifold solid "
+            "(no open shells / zero-thickness sheets); use closed profiles and "
+            "dimensions appropriate to the design."
         )
     if "measure_part" in zero_l:
         hints.append(
-            "measure_part zero — geometry may be empty/degenerate; build "
-            "payload bay ≥56×86×20 mm and body tube OD≈60 wall≥1.5."
+            "measure_part zero — geometry may be empty or degenerate; inspect "
+            "the part and build the geometry required by the design."
         )
     if "check_sketch" in zero_l:
         msg = ""
@@ -1448,19 +1441,19 @@ def _battery_per_check_diagnosis(
             )
     if "dim_coverage" in zero_l:
         hints.append(
-            "dim_coverage zero (often no open drawing) — optional for airframe "
-            "solid PASS; add make_drawing only if drawing deliverable required."
+            "dim_coverage zero (often no open drawing) — add make_drawing if "
+            "a drawing is required; assess solid geometry separately."
         )
     if any("ecad_" in z or z == "ecad_run_erc" for z in zero_l):
         hints.append(
-            "ECAD-on-CAD checks zero (wrong doc class for airframe part) — "
-            "expected when battery runs on mechanical doc; do not treat as "
-            "airframe geometry FAIL. Keep mechanical doc_id for AC1."
+            "ECAD-on-CAD checks zero (wrong document class) — expected when "
+            "battery runs on a mechanical document; assess mechanical geometry "
+            "separately and use the mechanical doc_id for AC1."
         )
     if "measure_between" in zero_l:
         hints.append(
-            "measure_between arg miss — not a hollow-solid signal; geometry "
-            "volume/manifold scores are the airframe product signal."
+            "measure_between arg miss — not a hollow-solid signal; inspect "
+            "geometry volume/manifold scores separately."
         )
     # Thin-wall / shell heuristic labels when scores exist under those names.
     for key in ("wall_thickness", "thin_wall", "shell", "volume"):

@@ -5,13 +5,10 @@
 > applied by `services/agent/config.py::get_provider`. Its existence does not prove
 > that every outbound path traverses it, nor that a regex scrub makes cloud submission
 > of controlled data safe. Online agent turns follow
-> [Chudcode integration](../dev/chudcode-integration.md), not a
-> second Python provider loop. Audit the actual transport and data boundary before
-> relying on this design for restricted-data handling; the limitations and v2 proposals
-> below remain part of the record, not shipped assurances.
+> [OMP integration](../dev/omp-integration.md). Audit the actual transport and
+> data boundary before relying on this design for restricted-data handling.
 
-ITAR-class users need frontier cloud models without leaking controlled technical
-data. This document is the v1 design for `compliance_mode` and the outbound
+This document describes the design for `compliance_mode` and the outbound
 redaction pipeline in `services/agent/redaction.py`.
 
 ## Threat model
@@ -92,14 +89,3 @@ First-class role (`ai_roles.redaction` / `role_models.resolve_role_model`).
 **Must** resolve to a loopback provider; cloud assignment is refused (hard).
 If unresolved or non-loopback, v1 runs deterministic-only.
 
-## v2 items
-
-- True **image redaction** (OCR + geometry-aware dim burn-in strip, or local VLM
-  describe-then-scrub) instead of hard block.
-- Trained **span classifier** (replace/augment regex + LLM flagger) on GSL
-  corpora + synthetic ITAR-like prompts; grammar-constrained span JSON.
-- Per-provider data-policy notes in Settings GUI.
-- Optional persistent encrypted mapping for multi-process workers (still
-  never uploaded).
-- Drawing-title-block / BOM column aware scrubbers.
-- Audit ledger: counts of scrubbed spans per turn (no originals at `meta`).

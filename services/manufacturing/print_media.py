@@ -53,6 +53,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+from .print_safety import UnsafePrintFile, validate_print_filename, validate_print_line
+
 try:  # POSIX (Linux/macOS): the drive lock is an flock on the mount root directory itself.
     import fcntl
 except ImportError:  # Windows: msvcrt byte-range lock on a hidden root file (token-excluded)
@@ -68,6 +70,7 @@ SCHEMA_SOURCE_JOB = "chudware.print_job/1"
 SCHEMA_INVENTORY_TOKEN = "chudware.print_media_inventory/1"
 
 PRINTABLE_SUFFIXES = frozenset({".gcode", ".gco", ".g", ".bgcode"})
+FIRMWARE_SUFFIXES = frozenset({".bin", ".hex", ".elf", ".uf2", ".dfu"})
 PRINT_DIR = "PRINT"
 META_DIR = "CHUDWARE"
 STAGING_DIR = ".chudware_staging"
@@ -128,6 +131,11 @@ def _now() -> str:
 
 def _is_printable(name: str) -> bool:
     return os.path.splitext(name)[1].lower() in PRINTABLE_SUFFIXES
+
+
+def _is_firmware(name: str) -> bool:
+    # Windows/FAT consumers can discard trailing dots and spaces from a filename.
+    return os.path.splitext(name.rstrip(" ."))[1].lower() in FIRMWARE_SUFFIXES
 
 
 def _open_nofollow(path: Path) -> int:
@@ -475,15 +483,24 @@ def _validate_jobs(jobs: Any) -> list[dict]:
                 f"({', '.join(sorted(PRINTABLE_SUFFIXES))})", part_id=part_id)
             continue
         try:
+            validate_print_filename(gcode_path.name)
+        except UnsafePrintFile as exc:
+            bad("unsafe_print_file", str(exc), part_id=part_id)
+            continue
+        try:
             if not gcode_path.is_file():
                 raise FileNotFoundError(str(gcode_path))
             with open(gcode_path, "rb") as stream:
                 digest = hashlib.sha256()
                 size = 0
-                while chunk := stream.read(_CHUNK):
+                for line_number, chunk in enumerate(stream, 1):
                     digest.update(chunk)
                     size += len(chunk)
+                    validate_print_line(chunk.decode("utf-8-sig"), line_number)
             actual = digest.hexdigest()
+        except (UnsafePrintFile, UnicodeDecodeError) as exc:
+            bad("unsafe_print_file", f"{gcode_path}: {exc}", part_id=part_id)
+            continue
         except OSError as exc:
             bad("gcode_unreadable", f"{gcode_path}: {exc}", part_id=part_id)
             continue
@@ -827,6 +844,8 @@ def _validate_journal(obj: Any) -> None:
             raise ValueError(exc.message) from None
         if prefix is not None and not normalized.startswith(prefix):
             raise ValueError(f"journal path {value!r} is outside {prefix}")
+        if _is_firmware(normalized.rsplit("/", 1)[-1]):
+            raise ValueError(f"journal path {value!r} resembles a firmware image")
     for key in ("retire", "place", "metadata", "relocate", "delete_archives"):
         items = obj.get(key, [])
         if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
@@ -1033,6 +1052,17 @@ def _inventory(rootp: Path) -> dict:
 
     unmanaged = [public_row(r) for r in printable if r["status"] == "unmanaged"]
     warnings: list[dict] = []
+    firmware = [r["path"] for r in records if r["type"] != "dir"
+                and "/" not in r["path"]
+                and _is_firmware(r["path"])]
+    if firmware:
+        warnings.append({
+            "code": "firmware_files_present",
+            "message": "possible firmware images are at the media root; some printers "
+                       "flash these automatically at boot. Do not insert this media into "
+                       "a printer until these files have been reviewed and moved off it. "
+                       "Print publishing does not remove or authorize firmware images",
+            "paths": firmware})
     if journal_summary is not None:
         warnings.append({
             "code": "interrupted_publish",
@@ -1115,7 +1145,7 @@ def _inventory(rootp: Path) -> dict:
         "interrupted_publish": journal_summary,
         "staging_leftovers": scan["staging"],
         "reconciled": not (unmanaged or modified or missing or superseded or duplicate_groups
-                           or journal_summary or invalid),
+                           or journal_summary or invalid or firmware),
         "warnings": warnings,
         "_records": records,
         "_projects": projects,
@@ -1457,6 +1487,7 @@ def _recover(rootp: Path, journal_info: dict) -> dict:
     for item in journal.get("retire", []) + journal.get("delete_archives", []):
         paths.extend((item["path"], item["held"]))
     paths.extend(item["path"] for item in journal.get("place", []))
+    paths.extend(item["staged"] for item in journal.get("place", []) if "staged" in item)
     paths.extend(item["path"] for item in journal.get("metadata", []))
     for item in journal.get("relocate", []):
         paths.extend((item["path"], item["dest"]))
@@ -1585,6 +1616,11 @@ def _publish(root: Any, project: Any, jobs: Any, expected_inventory: Any, media_
                            "again, review it, and publish with the new token. Nothing was changed",
                            inventory_token=before["inventory_token"],
                            warnings=before["warnings"])
+        firmware_warning = next((w for w in before["warnings"]
+                                 if w["code"] == "firmware_files_present"), None)
+        if firmware_warning is not None:
+            raise _Refusal("firmware_files_present", firmware_warning["message"],
+                           paths=firmware_warning["paths"], warnings=before["warnings"])
         recovered = None
         if before["_journal"] is not None:
             recovered = _recover(rootp, before["_journal"])

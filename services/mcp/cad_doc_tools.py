@@ -17,6 +17,7 @@ import time
 import zipfile
 from pathlib import Path
 from uuid import uuid4
+from .tool_registry import result_contract
 
 from .cad_common import (
     _CUR,
@@ -25,9 +26,6 @@ from .cad_common import (
     _JOBS,
     _JOB_LOCK,
     _DURABLE_JOB_PREFIX,
-    _LAST_DELIVER_REV,
-    _LAST_VOLUME,
-    _TOUCHED_DOCS,
     _SID_RE,
     _autosave,
     _default_deliverable_path,
@@ -39,9 +37,12 @@ from .cad_common import (
     _dumps,
     _err,
     _face_hist,
+    _part_has_mesh_references,
     _pick_best_doc,
     _publish_current,
-    _project_save,
+    _note_session_saved,
+    persist_result,
+    forget_touched_doc,
     _resolve_alias,
     _resumable_docs,
     _resolve_appearance,
@@ -58,11 +59,11 @@ from .cad_common import (
     _version_series_base,
     _write_diff,
     is_geom_query,
+    claim_process_doc,
     normalize_geom_query,
-    note_discarded_doc,
     note_harness_saved_path,
-    note_touched_doc,
     placement_warnings,
+    rollback_hidden_features,
     pose_to_transform16,
     cb,
     recover_autosaved,
@@ -109,11 +110,11 @@ _PLANE_ALIASES = {
     "right_plane": "plane.right", "side": "plane.right",
 }
 _AXIS_DATUM_ALIASES = {
-    "x": "axis.x", "+x": "axis.x", "-x": "axis.x", "xaxis": "axis.x", "x_axis": "axis.x",
+    "x": "axis.x", "+x": "axis.x", "xaxis": "axis.x", "x_axis": "axis.x",
     "axis_x": "axis.x", "axis.x": "axis.x",
-    "y": "axis.y", "+y": "axis.y", "-y": "axis.y", "yaxis": "axis.y", "y_axis": "axis.y",
+    "y": "axis.y", "+y": "axis.y", "yaxis": "axis.y", "y_axis": "axis.y",
     "axis_y": "axis.y", "axis.y": "axis.y",
-    "z": "axis.z", "+z": "axis.z", "-z": "axis.z", "zaxis": "axis.z", "z_axis": "axis.z",
+    "z": "axis.z", "+z": "axis.z", "zaxis": "axis.z", "z_axis": "axis.z",
     "axis_z": "axis.z", "axis.z": "axis.z",
 }
 _DATUM_WORDS = {**_PLANE_ALIASES, **_AXIS_DATUM_ALIASES}
@@ -121,7 +122,8 @@ _CID_RE = re.compile(r"^c\d+$")
 _EID_RE = re.compile(r"^e\d+$")
 _FID_RE = re.compile(r"^f\d+$")
 _BATCH_REF_RE = re.compile(r"^\$\d+$")
-_DIM_CTYPES = frozenset({"distance", "length", "angle", "radius", "diameter", "arc_length"})
+_DIM_CTYPES = frozenset({"distance", "signed_distance", "length", "angle", "radius", "diameter",
+                         "arc_length", "rotate_point"})
 
 
 def _xy(v: Any) -> Any:
@@ -392,7 +394,14 @@ def _normalize_arc_entity(ne: dict, label: str, sink: set) -> None:
     for k in _RADIUS_KEYS + _DIAMETER_KEYS:
         if k != "radius":
             ne.pop(k, None)
-    ne.setdefault("ccw", True)
+    if "ccw" not in ne:
+        # Centre + two endpoints are consistent with BOTH the arc and its complement, and
+        # the engine has no default for the direction. A guess here builds the other arc.
+        raise ValueError(
+            f"{label}: an arc from {list(s_pt)} to {list(e_pt)} about center="
+            f"{[center[0], center[1]]} needs its direction — ccw:true (counter-clockwise "
+            f"from start to end) or ccw:false (clockwise), or a third point on the arc "
+            f"(mid=[x,y]) — the two arcs between the endpoints are complements of each other.")
     sink.add("arc_endpoints")
 
 
@@ -601,9 +610,9 @@ _CONSTRAINT_REF_LISTS = ("refs", "entities", "handles", "elements", "items", "ta
 _CONSTRAINT_ARITY = {
     "coincident": 2, "parallel": 2, "perpendicular": 2, "tangent": 2, "collinear": 2,
     "equal": 2, "concentric": 2, "coradial": 2, "midpoint": 2, "point_on": 2, "angle": 2,
-    "symmetric": 3, "horizontal": 1, "vertical": 1, "fix": 1, "length": 1,
-    "radius": 1, "diameter": 1, "distance": 2, "arc_length": 1,
-    "intersection": 3, "smooth": 2, "equal_curve_length": 2,
+    "symmetric": 3, "rotate_point": 3, "horizontal": 1, "vertical": 1, "fix": 1, "length": 1,
+    "radius": 1, "diameter": 1, "distance": 2, "signed_distance": 2, "arc_length": 1,
+    "intersection": 3, "equal_offset": 4, "smooth": 2, "equal_curve_length": 2,
 }
 
 #: What a model calls the axis a `distance` dimension projects onto. The engine takes only
@@ -717,6 +726,10 @@ def _constraint_dialect_keys(c: dict) -> bool:
     if any(k in c for k in _DRIVEN_TRUE_KEYS[1:]) or any(k in c for k in _DRIVING_KEYS):
         return True
     if not isinstance(c.get("refs"), list):
+        return True
+    if (ctype in ("distance", "signed_distance", "equal_offset")
+            and isinstance(c.get("axis"), str)
+            and _DIM_AXIS_WORDS.get(c["axis"].strip().lower(), c["axis"]) != c["axis"]):
         return True
     if ctype in _DIM_CTYPES and not _is_dim_object(c.get("value")):
         return True
@@ -919,14 +932,14 @@ def _normalize_one_constraint(c: dict, remap, etypes: Optional[dict], label: str
         nc["type"] = ctype
         rewrites.add(f'"{raw_type}" on {base_type or "2 refs"} -> {ctype}')
 
-    # ---- value --------------------------------------------------------------
+    # ---- axis and value -----------------------------------------------------
+    if ctype in ("distance", "signed_distance", "equal_offset") and isinstance(nc.get("axis"), str):
+        ax = _DIM_AXIS_WORDS.get(nc["axis"].strip().lower())
+        if ax and ax != nc["axis"]:
+            rewrites.add(f'axis:"{nc["axis"]}" -> "{ax}"')
+            nc["axis"] = ax
     if ctype in _DIM_CTYPES:
-        angular = ctype == "angle"
-        if ctype == "distance" and isinstance(nc.get("axis"), str):
-            ax = _DIM_AXIS_WORDS.get(nc["axis"].strip().lower())
-            if ax and ax != nc["axis"]:
-                rewrites.add(f'axis:"{nc["axis"]}" -> "{ax}"')
-                nc["axis"] = ax
+        angular = ctype in ("angle", "rotate_point")
         num = _dim_number(nc.get("value"), angular)
         if num is None:
             for key in _DIM_VALUE_KEYS[1:]:
@@ -1426,7 +1439,11 @@ def _normalize_sketch_feature(feat: dict, notes: Optional[list] = None) -> dict:
             if etype == "arc":
                 _normalize_arc_entity(ne, _feat_label(feat, "sketch"), used_shorthand)
                 if "ccw" not in ne:
-                    ne["ccw"] = True
+                    raise ValueError(
+                        f"{_feat_label(feat, 'sketch')}: arc {ne.get('id', '')} needs "
+                        f"ccw:true (counter-clockwise from start to end) or ccw:false "
+                        f"(clockwise) — the engine has no default direction, and start/end "
+                        f"alone describe the arc and its complement.")
             if etype in ("circle", "arc") and "radius" not in ne:
                 flat_r, was_diam = _flat_radius(ne)
                 if flat_r is not None:
@@ -1971,8 +1988,8 @@ def _normalize_sketch_edit_ops(ops: Any, notes: Optional[list] = None) -> Any:
                 op = _normalize_sketch_edit_op(op, sink)
         except ValueError:
             raise   # a teachable rejection — see _normalize_sketch_ops
-        except Exception:  # noqa: BLE001 — never let normalization break a valid call
-            pass
+        except Exception as exc:  # noqa: BLE001 — a bug here must not break a valid call
+            sink.append(_normalization_failed_note(op, exc))
         out.append(op)
     return out
 
@@ -1990,8 +2007,8 @@ def _normalize_sketch_edit_ops(ops: Any, notes: Optional[list] = None) -> Any:
 # any unrecognised feature key, so the dialect is rewritten into the canonical
 # keys HERE, before the call — and every dialect key this understands must be
 # FULLY CONSUMED (popped, never left beside the rewritten form), because a
-# leftover key is now a rejected batch. Conservative: primitives only, and only a
-# feature that actually shows a dialect key; canonical ops pass through untouched.
+# leftover key is now a rejected batch. Conservative: primitives only; canonical ops
+# pass through untouched, including native solid mode words.
 _PRIMITIVE_TYPES = frozenset({"box", "cylinder", "sphere", "cone", "torus"})
 #: Aliases for the canonical placement point `at`. `center`/`centre` are listed
 #: separately because they are the ONE spelling whose meaning depends on `centered`:
@@ -2040,6 +2057,7 @@ _BOOLEAN_INTERSECT = frozenset({"intersect", "intersection"})
 _BOOLEAN_VALUES = ('union|add|join|fuse|merge|weld -> mode:"boss"; '
                    'cut|subtract|difference|remove -> mode:"cut"; '
                    'new|none|new_body -> merge:false (a separate body)')
+_NATIVE_SOLID_MODES = frozenset({"new", "add", "boss", "cut"})
 _MISSING = object()
 
 
@@ -2051,25 +2069,40 @@ def _norm_axis_value(v: Any) -> Any:
             return s
     return v
 
+def _norm_primitive_mode(v: Any) -> Any:
+    """Use the known boolean words in a primitive mode without changing native modes."""
+    if not isinstance(v, str):
+        return v
+    word = v.strip().lower()
+    if word in _NATIVE_SOLID_MODES:
+        return word
+    if word in _BOOLEAN_NEW_BODY:
+        return "new"
+    return _BOOLEAN_MODES.get(word, v)
+
 
 def _primitive_needs_norm(feat: dict, params: dict) -> bool:
-    """True when a primitive carries a dialect key (or an un-canonical axis word)."""
+    """True when a primitive carries a dialect key, mode alias, or un-canonical axis."""
     for k in _PRIM_DIALECT_KEYS:
         if k in feat or k in params:
             return True
     for src in (feat.get("axis"), params.get("axis")):
         if isinstance(src, str) and src.strip().lower() != src:
             return True
+    # The engine hoists feature-level options only if params lacks that key.
+    mode = params.get("mode", feat.get("mode", _MISSING))
+    if _norm_primitive_mode(mode) != mode:
+        return True
     return False
 
 
-def _normalize_primitive_feature(feat: dict) -> dict:
+def _normalize_primitive_feature(feat: dict, notes: Optional[list] = None) -> dict:
     """Rewrite a dialect primitive add_feature into the canonical placement shape.
 
-    placement/position/direction/boolean -> at / axis / mode / merge. Pure: the
-    caller's feature (and its params) are never mutated. When a dialect key and its
-    canonical target disagree the CANONICAL key wins and the dialect key is dropped
-    (the model asked for the same thing twice; honour the documented spelling).
+    placement/position/direction/boolean -> at / axis / mode / merge. A known
+    mode synonym is mapped to the native mode, without changing merge. Pure:
+    the caller's feature (and its params) are never mutated. When a dialect key
+    and its canonical target disagree the canonical key wins.
     """
     out = dict(feat)
     params = feat.get("params")
@@ -2086,6 +2119,19 @@ def _normalize_primitive_feature(feat: dict) -> dict:
         out.pop(key, None)
         new_params.pop(key, None)
         return v
+
+    # A mode word should describe the mode itself, not set merge:false: merge:true
+    # cannot override mode:"new", whereas merge:false overrides any valid mode.
+    # Only normalize the effective entry (params wins over the feature level).
+    holder = new_params if "mode" in new_params else out
+    mode = holder.get("mode", _MISSING)
+    canonical_mode = _norm_primitive_mode(mode)
+    if canonical_mode != mode:
+        holder["mode"] = canonical_mode
+        if notes is not None:
+            key = "params.mode" if holder is new_params else "mode"
+            notes.append(f'{_feat_label(feat, str(feat.get("type") or ""))}: '
+                         f'read {key}={mode!r} as mode={canonical_mode!r}')
 
     at_val: Any = _MISSING
     axis_val: Any = _MISSING
@@ -2607,7 +2653,7 @@ def _normalize_feature_ops(ops: Any, notes: Optional[list] = None) -> Any:
                 params = feat.get("params") if isinstance(feat.get("params"), dict) else {}
                 new = feat
                 if ftype in _PRIMITIVE_TYPES and _primitive_needs_norm(feat, params):
-                    new = _normalize_primitive_feature(feat)
+                    new = _normalize_primitive_feature(feat, sink)
                 new = _normalize_feature_dims(new, ftype, sink)
                 # Last: the requirements the engine enforces and the model forgets
                 # (hole style/end/face, boolean op, extrude/revolve mode + profile ref,
@@ -2625,22 +2671,57 @@ def _normalize_feature_ops(ops: Any, notes: Optional[list] = None) -> Any:
                     op = {**op, "params": conv}
         except ValueError:
             raise  # an unsupported request (boolean:"intersect") — tell the model
-        except Exception:  # noqa: BLE001 — never let normalization break a valid call
-            pass
+        except Exception as exc:  # noqa: BLE001 — a bug here must not break a valid call
+            sink.append(_normalization_failed_note(op, exc))
         out.append(op)
     return out
 
 
-def _interpreted_notes(notes: list) -> list:
-    """De-duplicate and cap the echo list (a 20-hole batch must not bury the response)."""
-    seen: list = []
+class _Assumption(str):
+    """A note about a rewrite or fill-in that can CHANGE the geometry the model asked for.
+
+    Appended to the same `notes` list as every other interpretation note, then split out
+    by `_split_notes`: assumptions are reported under their own uncapped `assumptions`
+    key, never folded into the capped `interpreted` list where a long batch would hide
+    them behind a "+N more" tail.
+    """
+
+
+def _normalization_failed_note(op: Any, exc: Exception) -> "_Assumption":
+    """The note for an op whose dialect normalization crashed: it goes to the engine
+    exactly as the model wrote it, and the model is told so."""
+    what = op.get("op") if isinstance(op, dict) else None
+    return _Assumption(
+        f"{what or 'an op'}: the dialect normalizer failed on it ({type(exc).__name__}: "
+        f"{exc}) so it was sent to the engine EXACTLY as written — none of the usual "
+        f"spelling repairs were applied; if the engine rejects it, fix the spelling "
+        f"against cad_guide(topic=\"add_features\")")
+
+
+def _split_notes(notes: list) -> tuple[list, list]:
+    """-> (interpreted, assumptions), each de-duplicated in first-seen order.
+
+    `interpreted` is capped so a large batch does not bury the reply; geometry-changing
+    assumptions are reported separately without a cap.
+    """
+    interpreted: list = []
+    assumptions: list = []
     for n in notes:
-        if n not in seen:
-            seen.append(n)
-    if len(seen) > _MAX_INTERPRETED_NOTES:
-        extra = len(seen) - _MAX_INTERPRETED_NOTES
-        seen = seen[:_MAX_INTERPRETED_NOTES] + [f"(+{extra} more of the same kind)"]
-    return seen
+        bucket = assumptions if isinstance(n, _Assumption) else interpreted
+        if n not in bucket:
+            bucket.append(str(n))
+    if len(interpreted) > _MAX_INTERPRETED_NOTES:
+        extra = len(interpreted) - _MAX_INTERPRETED_NOTES
+        interpreted = interpreted[:_MAX_INTERPRETED_NOTES] + [f"(+{extra} more notes omitted)"]
+    return interpreted, assumptions
+
+
+def _attach_notes(obj: dict, interpreted: Optional[list], assumptions: Optional[list]) -> None:
+    """Put the two note lists on a reply (never overwriting what the reply already says)."""
+    if interpreted:
+        obj.setdefault("interpreted", interpreted)
+    if assumptions:
+        obj.setdefault("assumptions", assumptions)
 
 
 # ---------------------------------------------------------------------------
@@ -2725,8 +2806,7 @@ def _pattern_kind(feat: dict, params: dict) -> Optional[str]:
     # `*_pattern` feature type is safe the day it lands.
     if tword in _PATTERN_NAMED_NON_PATTERN_TYPES:
         return None
-    vocab, live = _feature_type_vocab()
-    if live and tword in vocab:
+    if tword in _feature_type_vocab():
         return None
     if tword in _PATTERN_KIND_WORDS:
         return _PATTERN_KIND_WORDS[tword]
@@ -2892,7 +2972,8 @@ def _repair_merged_boolean_operands(ops: Any, doc_id: str, notes: list) -> Any:
         "separated " + ", ".join(f["id"] for f in fixes) + " into its own body with "
         'merge:false before the boolean — a primitive built with the default mode:"boss" '
         "fuses into the running solid, so a boolean naming it has no second operand left")
-    return fixes + list(ops)
+    shifts = {f"${i}": f"${i + len(fixes)}" for i in range(len(ops))}
+    return fixes + [_shift_batch_placeholders(op, shifts) for op in ops]
 
 
 # ------------------------------------------------------------------ assembly re-pose
@@ -2960,26 +3041,27 @@ _MATE_REF_QUERY_KEYS = ("query", "sid")
 
 
 def _normalize_asm_mate_ops(ops: Any, doc_id: Optional[str], notes: list) -> Any:
-    """Wrap a flat asm_add_mate into `mate`; resolve {component, query|sid} refs."""
+    """Wrap flat add-mates and resolve add/edit {component, query|sid} refs."""
     if not isinstance(ops, list):
         return ops
     out: list = []
     changed = False
     comps: Optional[dict] = None
     for index, op in enumerate(ops):
-        if not isinstance(op, dict) or _slug(op.get("op")) != "asm_add_mate":
+        if not isinstance(op, dict) or _slug(op.get("op")) not in ("asm_add_mate", "asm_edit_mate"):
             out.append(op)
             continue
         fixed = dict(op)
-        if "mate" not in fixed:
+        adding = _slug(op.get("op")) == "asm_add_mate"
+        if adding and "mate" not in fixed:
             body = {k: v for k, v in fixed.items() if k != "op"}
             if body:
                 fixed = {"op": fixed["op"], "mate": body}
                 notes.append(
                     f"asm_add_mate ${index}: put {sorted(body)} into the `mate` object. "
                     "The op reads only op.mate.")
-        mate = fixed.get("mate")
-        if isinstance(mate, dict) and _is_num(mate.get("value")):
+        mate = fixed.get("mate") if adding else fixed
+        if adding and isinstance(mate, dict) and _is_num(mate.get("value")):
             # asm_mate's `value` is a number; the stored mate value is a dimension object.
             mate = {**mate, "value": {"value": float(mate["value"]), "expr": None}}
             fixed["mate"] = mate
@@ -3001,7 +3083,7 @@ def _normalize_asm_mate_ops(ops: Any, doc_id: Optional[str], notes: list) -> Any
                 ref = refs[j]
                 if ref["component"] not in comps:
                     continue  # a same-batch "$N" component: the engine names it
-                resolved = resolve_mate_ref(doc_id, comps, f"asm_add_mate ${index} refs[{j}]",
+                resolved = resolve_mate_ref(doc_id, comps, f"{op['op']} ${index} refs[{j}]",
                                             ref)
                 if "error" in resolved:
                     raise ValueError(resolved["error"] + (
@@ -3009,9 +3091,12 @@ def _normalize_asm_mate_ops(ops: Any, doc_id: Optional[str], notes: list) -> Any
                         if resolved.get("candidates") else ""))
                 new_refs[j] = resolved["ref"]
             if new_refs != refs:
-                fixed["mate"] = {**mate, "refs": new_refs}
+                if adding:
+                    fixed["mate"] = {**mate, "refs": new_refs}
+                else:
+                    fixed["refs"] = new_refs
                 notes.append(
-                    f"asm_add_mate ${index}: resolved the ref query against each component's "
+                    f"{op['op']} ${index}: resolved the ref query against each component's "
                     "source part, as asm_mate does.")
         if fixed != op:
             changed = True
@@ -3053,28 +3138,86 @@ def _asm_repose_refusal(ops: Any, doc_id: str) -> Optional[dict]:
         if getattr(exc, "code", None) == "engine_connection_lost":
             raise
         return None
-    comps = {c.get("id"): c for c in (tree.get("components") or []) if isinstance(c, dict)}
-    mated: dict = {}
-    for m in tree.get("mates") or []:
-        if not isinstance(m, dict) or m.get("suppressed"):
+    # Project only the fields that affect ownership, in native operation order.
+    # IDs for newly inserted objects are minted by the engine, not supplied by the
+    # payload; use private placeholders and leave unknown IDs to native validation.
+    comps = [dict(c) for c in (tree.get("components") or []) if isinstance(c, dict)]
+    mates = [dict(m) for m in (tree.get("mates") or []) if isinstance(m, dict)]
+    for index, op in enumerate(ops):
+        if not isinstance(op, dict):
             continue
-        for ref in m.get("refs") or []:
+        kind = _slug(op.get("op"))
+        cid = op.get("id")
+        if kind == "asm_insert_component":
+            comps.append({"id": None, "fixed": op.get("fixed", not comps),
+                          "suppressed": False})
+        elif kind in ("asm_edit_component", "set_suppressed", "asm_delete_component"):
+            comp = next((c for c in comps if isinstance(cid, str) and cid
+                         and c.get("id") == cid), None)
+            if comp is None:
+                return None  # Let native report unknown IDs, including unresolved $N.
+            if kind == "asm_delete_component":
+                referencing = [m for m in mates if isinstance(m.get("refs"), list) and any(
+                    isinstance(r, dict) and r.get("component") == cid
+                    for r in m["refs"])]
+                if referencing and not op.get("cascade", False):
+                    return None  # Preserve native's dependency_exists refusal.
+                comps.remove(comp)
+                mates = [m for m in mates if m not in referencing]
+                if comps and not any(c.get("fixed", False) for c in comps):
+                    comps[0]["fixed"] = True  # Native re-anchors after deletion.
+            elif kind == "set_suppressed":
+                value = op.get("value", False)
+                if not isinstance(value, bool):
+                    return None
+                comp["suppressed"] = value
+            else:
+                for field in ("fixed", "suppressed"):
+                    if op.get(field) is not None:
+                        if not isinstance(op[field], bool):
+                            return None
+                        comp[field] = op[field]
+        elif kind == "asm_add_mate":
+            mate = op.get("mate")
+            if not isinstance(mate, dict):
+                return None
+            mates.append({**mate, "id": None, "_batch_index": index})
+        elif kind in ("asm_edit_mate", "asm_delete_mate"):
+            mate = next((m for m in mates if isinstance(cid, str) and cid
+                         and m.get("id") == cid), None)
+            if mate is None:
+                return None
+            if kind == "asm_delete_mate":
+                mates.remove(mate)
+            elif op.get("suppressed") is not None:
+                if not isinstance(op["suppressed"], bool):
+                    return None
+                mate["suppressed"] = op["suppressed"]
+    mated: dict = {}
+    for mate in mates:
+        if mate.get("suppressed"):
+            continue
+        refs = mate.get("refs")
+        if not isinstance(refs, list):
+            continue
+        label = mate.get("id") or f"new mate at op {mate.get('_batch_index')}"
+        # Native component_is_mated uses only the first two mate refs.
+        for ref in refs[:2]:
             if isinstance(ref, dict) and isinstance(ref.get("component"), str):
-                mated.setdefault(ref["component"], []).append(m.get("id"))
-    # An op that grounds the component in the SAME breath is not blocked: a fixed frame's
-    # pose is authored, never solved (mate.cpp keeps t0/w0 for a fixed frame).
-    grounding = {op.get("id") for op in ops
-                 if isinstance(op, dict) and _slug(op.get("op")) == "asm_edit_component"
-                 and op.get("fixed") is True}
-    blocked = {cid: [m for m in mated[cid] if m]
-               for cid in edits
-               if cid in mated and cid not in grounding
-               and not (comps.get(cid) or {}).get("fixed", False)}
+                labels = mated.setdefault(ref["component"], [])
+                if label not in labels:
+                    labels.append(label)
+    by_id = {c.get("id"): c for c in comps if isinstance(c.get("id"), str)}
+    blocked = {cid: mated[cid] for cid in edits
+               if cid in mated and cid in by_id
+               and not by_id[cid].get("fixed", False)
+               and not by_id[cid].get("suppressed", False)}
     if not blocked:
         return None
     named = ", ".join(f"{cid} (mated by {', '.join(ms) or 'a mate'})"
                       for cid, ms in sorted(blocked.items()))
-    first_mate = next((ms[0] for ms in blocked.values() if ms), "m1")
+    first_mate = next((m.get("id") for m in mates if m.get("id")
+                       and any(m["id"] in ms for ms in blocked.values())), "<mate_id>")
     return {
         "ok": False,
         "reason": "component_is_mated",
@@ -3093,9 +3236,9 @@ def _asm_repose_refusal(ops: Any, doc_id: str) -> Optional[dict]:
             '"value":{"value":<mm|deg>}}]) then solve_mates(); '
             f'(2) explore a range without mutating the doc — simulate_motion(mate="{first_mate}", '
             "start=…, stop=…) returns a pose per step; "
-            "(3) really want a free pose? take the mate out of the network first "
-            f'(add_features(ops=[{{"op":"asm_edit_mate","id":"{first_mate}","suppressed":true}}]) '
-            f'or {{"op":"asm_delete_mate","id":"{first_mate}"}}) and send the transform after; '
+            "(3) really want a free pose? suppress or delete every mate of the component "
+            f'({{"op":"asm_edit_mate","id":"{first_mate}","suppressed":true}} '
+            f'or {{"op":"asm_delete_mate","id":"{first_mate}"}}) before or in the same batch; '
             'or ground the component in the same batch with "fixed": true, which makes its '
             "transform authoritative."),
     }
@@ -3143,22 +3286,47 @@ def _normalize_pattern_ops(ops: Any, notes: list) -> Any:
     return out if changed else ops
 
 
+#: True synonyms only: every word names the SAME feature type the engine would build, with
+#: the same dimensions. A word that could mean a different solid (ring, circle, tube, pipe,
+#: boss, prism, rectangle, taper, blend) is deliberately absent — see _AMBIGUOUS_TYPE_WORDS.
 _FEATURE_TYPE_ALIASES = {
     "cube": "box", "cuboid": "box", "rect_prism": "box", "rectangular_prism": "box",
-    "block": "box", "rectangle": "box", "prism": "box", "plate": "box", "slab": "box",
-    "circle": "cylinder", "disc": "cylinder", "disk": "cylinder", "cylindrical": "cylinder",
-    "rod": "cylinder", "shaft": "cylinder", "tube": "cylinder", "pipe": "cylinder",
-    "round_bar": "cylinder", "boss": "cylinder",
+    "block": "box", "plate": "box", "slab": "box",
+    "disc": "cylinder", "disk": "cylinder", "cylindrical": "cylinder",
+    "rod": "cylinder", "shaft": "cylinder", "round_bar": "cylinder",
     "ball": "sphere", "spherical": "sphere",
-    "conical": "cone", "frustum": "cone", "taper": "cone",
-    "toroid": "torus", "ring": "torus", "donut": "torus",
+    "conical": "cone", "frustum": "cone",
+    "toroid": "torus", "donut": "torus",
     "bore": "hole", "drill": "hole", "counterbore": "hole", "countersink": "hole",
     "cbore": "hole", "csink": "hole", "tapped_hole": "hole", "clearance_hole": "hole",
     "pocket": "extrude", "profile": "sketch", "sketch2d": "sketch", "sketch_2d": "sketch",
-    "round": "fillet", "blend": "fillet", "bevel": "chamfer", "hollow": "shell",
+    "round": "fillet", "bevel": "chamfer", "hollow": "shell",
     "pattern": "linear_pattern", "array": "linear_pattern",
     "polar_pattern": "circular_pattern", "revolved_pattern": "circular_pattern",
     "engrave": "text", "emboss": "text", "extrusion": "extrude", "revolution": "revolve",
+}
+#: Words a model uses as a feature type that each name SEVERAL different things. Mapping
+#: one silently (ring -> torus, tube -> solid cylinder) built a different solid than the one
+#: asked for, so they are refused with the choice spelled out.
+_AMBIGUOUS_TYPE_WORDS = {
+    "ring": 'a ring is a torus (type "torus": major_r + minor_r) or a flat washer/annulus '
+            "(a sketch of two concentric circles, extruded)",
+    "circle": '"circle" is a 2D sketch entity, not a solid: build a cylinder (radius + '
+              "height), or a sketch containing a circle entity and extrude it",
+    "tube": 'a tube is hollow: extrude a sketch of two concentric circles, or build a '
+            'cylinder and cut a concentric cylinder (mode:"cut") for the bore',
+    "pipe": 'a pipe is hollow: extrude a sketch of two concentric circles, or build a '
+            'cylinder and cut a concentric cylinder (mode:"cut") for the bore',
+    "boss": '"boss" is a mode, not a shape: build the shape you want (cylinder, box, '
+            'extrude…) with mode:"boss"',
+    "prism": 'a prism needs its base polygon: use a "box" for a rectangular one, or a '
+             'sketch of the polygon + extrude (e.g. type "hexagonal_prism")',
+    "rectangle": '"rectangle" is a 2D sketch entity, not a solid: use a "box" (length, '
+                 "width, height), or a sketch containing a rectangle and extrude it",
+    "taper": '"taper" is a draft or a cone: use type "cone" (r1, r2, height) for a tapered '
+             'solid, or a "draft" feature to taper existing faces',
+    "blend": '"blend" could be a fillet or a loft: use type "fillet" for a rounded edge, '
+             'or "loft" to blend between sections',
 }
 # An alias that also implies a boolean MODE ("a pocket" is an extrude that removes material).
 _TYPE_ALIAS_MODE = {"pocket": "cut"}
@@ -3180,44 +3348,18 @@ _BOOLEAN_AS_TYPE = frozenset({
 _TYPE_NOISE_SUFFIXES = ("_3d", "3d", "_solid", "_feature", "_prim", "_primitive", "_shape")
 
 
-def _feature_type_vocab() -> tuple[frozenset, bool]:
-    """(the engine's feature types, is-it-live?).
-
-    Sourced from `doc_list_ops` via op_vocab — the same single source the docstring's OP
-    VOCABULARY block quotes — with op_registry's COMMON_FEATURE_TYPES as the offline
-    fallback. The flag matters: the fallback is a SUBSET, so an unknown type may only be
-    REJECTED here when the list came from the live engine.
-    """
-    types: list = []
-    try:
-        from services.mcp import op_vocab as _ov  # noqa: PLC0415
-        types = [str(t) for t in _ov.feature_types() if t]
-    except Exception:  # noqa: BLE001
-        types = []
-    fallback: list = []
-    try:
-        from services.mcp.op_registry import COMMON_FEATURE_TYPES  # noqa: PLC0415
-        fallback = list(COMMON_FEATURE_TYPES)
-    except Exception:  # noqa: BLE001
-        fallback = []
-    live = bool(types) and set(types) != set(fallback)
-    return frozenset(types or fallback), live
+def _feature_type_vocab() -> frozenset:
+    """The engine's feature types, straight from `doc_list_ops` via op_vocab — the single
+    source. Raises op_vocab.OpVocabUnavailable (a clear message, not a stale list) when the
+    engine cannot be reached."""
+    from services.mcp import op_vocab as _ov  # noqa: PLC0415
+    return frozenset(str(t) for t in _ov.feature_types() if t)
 
 
 def _doc_op_vocab() -> frozenset:
-    """The engine's op names (doc_list_ops, op_registry fallback)."""
-    try:
-        from services.mcp import op_vocab as _ov  # noqa: PLC0415
-        ops = [str(o) for o in _ov.doc_ops() if o]
-        if ops:
-            return frozenset(ops)
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        from services.mcp.op_registry import DOC_OP_KINDS  # noqa: PLC0415
-        return frozenset(DOC_OP_KINDS)
-    except Exception:  # noqa: BLE001
-        return frozenset()
+    """The engine's op names, straight from `doc_list_ops` via op_vocab."""
+    from services.mcp import op_vocab as _ov  # noqa: PLC0415
+    return frozenset(str(o) for o in _ov.doc_ops() if o)
 
 
 def _slug(word: Any) -> str:
@@ -3262,7 +3404,7 @@ def _feature_type_error(raw: Any, vocab: frozenset) -> str:
             f'"params":{{…}}}}}}. Feature types: ' + ", ".join(known) + ".")
 
 
-def _retype_feature(feat: dict, vocab: frozenset, live: bool, notes: list) -> dict:
+def _retype_feature(feat: dict, vocab: frozenset, notes: list) -> dict:
     """Map a natural type word onto an engine feature type. Identity when already canonical."""
     raw = feat.get("type")
     if isinstance(raw, str) and raw.strip() in vocab:
@@ -3296,9 +3438,10 @@ def _retype_feature(feat: dict, vocab: frozenset, live: bool, notes: list) -> di
 
     ftype = _canon_feature_type(base, vocab)
     if ftype is None:
-        if live:
-            raise ValueError(_feature_type_error(raw, vocab))
-        return feat  # offline vocabulary is a subset — let the engine be the authority
+        if base in _AMBIGUOUS_TYPE_WORDS:
+            raise ValueError(f'add_feature: type "{raw}" is ambiguous — '
+                             f"{_AMBIGUOUS_TYPE_WORDS[base]}.")
+        raise ValueError(_feature_type_error(raw, vocab))
 
     out = dict(feat)
     out["type"] = ftype
@@ -3314,8 +3457,6 @@ def _retype_feature(feat: dict, vocab: frozenset, live: bool, notes: list) -> di
         extra += f' (style "{style}")'
     if params or isinstance(out.get("params"), dict):
         out["params"] = params
-    if word in ("tube", "pipe"):
-        extra += " — a hollow tube also needs a concentric mode:\"cut\" cylinder for its bore"
     notes.append(f'{_feat_label(feat, ftype)}: interpreted type "{raw}" as "{ftype}"{extra}')
     return out
 
@@ -3326,12 +3467,12 @@ def _normalize_feature_types(ops: Any, notes: list) -> Any:
     a sketch spelled "profile" used to slip past the sketch normalizer entirely."""
     if not isinstance(ops, list):
         return ops
-    vocab, live = _feature_type_vocab()
+    vocab = _feature_type_vocab()
     out = []
     for op in ops:
         if (isinstance(op, dict) and op.get("op") == "add_feature"
                 and isinstance(op.get("feature"), dict)):
-            new = _retype_feature(op["feature"], vocab, live, notes)
+            new = _retype_feature(op["feature"], vocab, notes)
             op = op if new is op["feature"] else {**op, "feature": new}
         out.append(op)
     return out
@@ -3504,38 +3645,37 @@ def _rewrite_param_edit(el: dict, index: int, notes: list) -> dict:
     notes.append(
         f'interpreted op:"{el.get("op")}" as {{"op":"edit_feature","id":"{fid}",'
         f'"params":{{…}}}} — changing a feature parameter is edit_feature')
-    order = {k: el[k] for k in _OP_ORDER_KEYS if k in el}
-    return {"op": "edit_feature", "id": fid, "params": params, **order}
+    order = [k for k in _OP_ORDER_KEYS if k in el]
+    if order:
+        raise ValueError(
+            f'ops[{index}]: op:"{el.get("op")}" carries {order}, which place a feature in the '
+            f"history and cannot ride an edit. Edit the parameter in one op and move the "
+            f'feature with {{"op":"reorder_feature","id":"{fid}","before":"f3"}}.')
+    return {"op": "edit_feature", "id": fid, "params": params}
 
 
-#: What op_edit_feature (core/doc/session.cpp) reads beside the target id; the engine drops
-#: any other op-level key without a word. before/after ride along from op rewrites, and a
-#: `type` copied out of a {"feature":{…}} wrapper only restates what the feature is.
-_EDIT_FEATURE_OP_KEYS = frozenset({"op", "id", "params", "refs", "name", "type",
-                                   "before", "after"})
+#: What op_edit_feature (core/doc/session.cpp) reads beside the target id. The engine
+#: refuses any other op-level key (naming the stray key and where it belongs), and refuses
+#: before/after on an edit (use reorder_feature). A `type` copied out of a {"feature":{…}}
+#: wrapper is accepted when it only restates what the feature is.
+_EDIT_FEATURE_OP_KEYS = frozenset({"op", "id", "params", "refs", "name", "type"})
 #: add_feature's feature-envelope placement keys. The engine stores them IN params, so an
-#: edit that sets one beside "params" means that param.
+#: edit that sets one beside "params" means that param. The engine refuses them beside
+#: params, so this hoist is the only thing that converts them.
 _EDIT_FEATURE_PARAM_KEYS = ("at", "at_offset", "axis", "axis_dir", "centered", "mode", "merge")
 
 
 def _hoist_edit_feature_keys(op: dict, index: int, notes: list) -> dict:
-    """Move edit_feature's op-level placement keys into ``params``; refuse any other stray key.
+    """Move edit_feature's op-level placement keys into ``params``.
 
     Live c219: ``{"op":"edit_feature","id":"f8","at":[…],"params":{"height":…}}`` applied
     the height and silently dropped the move (preflight_ops passed it too); the sub-agent
-    only noticed from a face count and spent three calls finding out why.
+    only noticed from a face count and spent three calls finding out why. Any OTHER stray
+    op-level key is refused by the engine itself.
     """
-    stray = [k for k in op if k not in _EDIT_FEATURE_OP_KEYS]
+    stray = [k for k in op if k in _EDIT_FEATURE_PARAM_KEYS and k not in _EDIT_FEATURE_OP_KEYS]
     if not stray:
         return op
-    unknown = [k for k in stray if k not in _EDIT_FEATURE_PARAM_KEYS]
-    if unknown:
-        hint = (' To suppress a feature use {"op":"set_suppressed","id":…,"value":true}.'
-                if "suppressed" in unknown else "")
-        raise ValueError(
-            f"ops[{index}] edit_feature: unknown key(s) {unknown} beside \"params\" — "
-            f"edit_feature applies only params, refs and name, so they would be ignored. "
-            f'Put parameter changes inside "params".{hint}')
     params = op.get("params")
     params = dict(params) if isinstance(params, dict) else {}
     for key in stray:
@@ -3553,13 +3693,18 @@ def _hoist_edit_feature_keys(op: dict, index: int, notes: list) -> dict:
 
 
 
-def _normalize_op_elements(ops: list, notes: list) -> list:
+def _normalize_op_elements(ops: list, notes: list, index_map: Optional[dict] = None) -> list:
     """Give every batch element a valid `op`. Raises ValueError with a teaching message
     for an element that names neither an op nor a feature type."""
-    ftypes, _live = _feature_type_vocab()
+    ftypes = _feature_type_vocab()
     docops = _doc_op_vocab()
     out: list = []
+    if any(isinstance(op, dict) and op.get("op") == "edit_feature"
+           and "suppressed" in op for op in ops):
+        _validate_batch_placeholders(ops, check_producers=False)
+    shifts: dict = {}
     for i, el in enumerate(ops):
+        shifts[f"${i}"] = f"${len(out)}"
         if not isinstance(el, dict):
             pair = (' A ["<name>", "<value>"] pair is not an op: the op name and its data '
                     "live in ONE object, keyed."
@@ -3623,9 +3768,36 @@ def _normalize_op_elements(ops: list, notes: list) -> list:
                 continue
             if kind in docops or kind == "new_part":
                 normalized = _normalize_op_target(el, kind, notes)
-                if kind == "edit_feature":
+                if kind == "sketch_fully_define" and "sketch" not in normalized and "id" in normalized:
+                    normalized = dict(normalized)
+                    normalized["sketch"] = normalized.pop("id")
+                    notes.append('sketch_fully_define: interpreted "id" as "sketch"')
+                if kind in ("asm_edit_component", "asm_insert_component") and "transform" in normalized:
+                    transform = normalized["transform"]
+                    if (isinstance(transform, (list, tuple)) and len(transform) == 4
+                            and all(isinstance(row, (list, tuple)) and len(row) == 4
+                                    and all(_is_num(value) for value in row) for row in transform)):
+                        normalized = dict(normalized)
+                        normalized["transform"] = [float(value) for row in transform for value in row]
+                        notes.append(f"ops[{i}] {kind}: flattened 4x4 transform row-major")
+                    elif not (isinstance(transform, (list, tuple)) and len(transform) == 16
+                              and all(_is_num(value) for value in transform)):
+                        raise ValueError(f"ops[{i}] {kind}: transform must be 16 numbers "
+                                         "or four rows of four numbers (row-major)")
+                if kind == "edit_feature" and "suppressed" in normalized:
+                    value = normalized["suppressed"]
+                    if type(value) is not bool:
+                        raise ValueError(f"ops[{i}] edit_feature: suppressed must be a boolean")
+                    normalized = {k: v for k, v in normalized.items() if k != "suppressed"}
                     normalized = _hoist_edit_feature_keys(normalized, i, notes)
-                out.append(normalized)
+                    if any(k not in ("op", "id") for k in normalized):
+                        out.append(normalized)
+                    out.append({"op": "set_suppressed", "id": normalized.get("id"), "value": value})
+                    notes.append(f"ops[{i}] edit_feature: interpreted suppressed as set_suppressed")
+                else:
+                    if kind == "edit_feature":
+                        normalized = _hoist_edit_feature_keys(normalized, i, notes)
+                    out.append(normalized)
                 continue
             ftype = _canon_feature_type(kind, ftypes)
             if ftype:
@@ -3638,7 +3810,7 @@ def _normalize_op_elements(ops: list, notes: list) -> list:
                     f'interpreted op:"{kind}" as {{"op":"add_feature","feature":'
                     f'{{"type":"{ftype}",…}}}} — a feature type is not an op name')
                 continue
-            out.append(el)  # a genuinely unknown op: the engine names it (enrich_unknown_op)
+            out.append(el)  # a genuinely unknown op: the engine names it, with closest matches
             continue
         if isinstance(el.get("feature"), dict):
             out.append({"op": "add_feature", **el})
@@ -3654,7 +3826,10 @@ def _normalize_op_elements(ops: list, notes: list) -> list:
             f'ops[{i}] has no "op". An ops element is either {{"op":"<name>", …}} from the op '
             f'vocabulary or a bare feature {{"type":"<feature type>","name":…,"params":{{…}}}} '
             f"(read as add_feature). Got keys: {sorted(el)}.")
-    return out
+    if index_map is not None:
+        index_map.update(shifts)
+    return (_shift_batch_placeholders(out, shifts)
+            if any(old != new for old, new in shifts.items()) else out)
 
 
 def _normalize_op_target(op: dict, kind: str, notes: list) -> dict:
@@ -3975,8 +4150,14 @@ def _append_sketch_auto_define(ops: list, *, auto_define: bool = True,
             pending.pop(op.get("sketch"), None)
     flush()
     if additions and notes is not None:
-        notes.append(f"appended sketch_fully_define for {additions} sketch-authoring run(s) "
-                     "in this same revision; auto_define:false opts out")
+        notes.append(_Assumption(
+            f"appended sketch_fully_define for {additions} sketch-authoring run(s) in this same "
+            "revision: it adds relations, then dimensions MEASURED from your rough coordinates "
+            "(rounded to clean increments, e.g. 39.98 -> 40; sketch_definitions[i].rounded says "
+            "how many and by how much) and tags every constraint it mints auto:true — confirm or "
+            "retune the critical ones with sketch_set_dim. Override: add your own "
+            "sketch_fully_define op with round:false for exact measured values, or pass "
+            "auto_define:false to leave the sketch un-defined"))
     if index_map is not None:
         index_map.update(shifts)
     return _shift_batch_placeholders(out, shifts)
@@ -4167,9 +4348,11 @@ _HOLE_STYLE_KEYS = ("style", "hole_style", "hole_type")
 _HOLE_END_KEYS = ("end", "end_condition", "termination", "depth_type", "end_type")
 _HOLE_DIR_KEYS = ("direction", "dir", "normal", "drill_direction")
 _HOLE_AT_KEYS = ("origin", "position", "location", "at", "center", "centre")
-# The face word a drill axis names. The SIGN is deliberately dropped: a bore along Z is
-# entered from the top face in every real part, and the note says so.
-_AXIS_FACE_WORD = ("right", "back", "top")
+# World side words, one per signed axis — the engine's own `side` vocabulary (picks.cpp:
+# top=+Z bottom=-Z right=+X left=-X back=+Y front=-Y). Keyed (axis index, sign) of the
+# face's OUTWARD normal.
+_SIDE_OF_OUTWARD_NORMAL = {(0, 1): "right", (0, -1): "left", (1, 1): "back",
+                           (1, -1): "front", (2, 1): "top", (2, -1): "bottom"}
 
 
 def _vec3(v: Any) -> Optional[list]:
@@ -4190,15 +4373,31 @@ def _vec3_list(v: Any) -> Optional[list]:
     return None
 
 
-def _face_word_for_axis(v: Any) -> Optional[str]:
+def _hole_entry_side(key: str, v: Any, label: str) -> str:
+    """The `side` word of the face a hole's drill direction enters through. SIGNED.
+
+    `normal` is the entry face's outward normal ([0,0,1] = the top face). `direction`,
+    `dir` and `drill_direction` are the way the drill TRAVELS, so the bore enters through
+    the face whose outward normal points the other way ([0,0,-1], drilling down, enters
+    the top face; [0,0,1] enters through the bottom). The old reading dropped the sign
+    and drilled through the top whichever way the model pointed. A vector that is not
+    exactly along ±X/±Y/±Z, or an unsigned axis word, names no single face: refused.
+    """
     vec = _vec3(v)
-    if vec is None:
-        if isinstance(v, str):
-            w = _slug(v).lstrip("+-")
-            return {"x": "right", "y": "back", "z": "top"}.get(w)
-        return None
-    dom = max(range(3), key=lambda i: abs(vec[i]))
-    return _AXIS_FACE_WORD[dom] if abs(vec[dom]) > 0 else None
+    if vec is None and isinstance(v, str):
+        m = re.fullmatch(r"\s*([+-])\s*([xyz])\s*", v.lower())
+        if m:
+            vec = [0.0, 0.0, 0.0]
+            vec["xyz".index(m.group(2))] = 1.0 if m.group(1) == "+" else -1.0
+    nonzero = [i for i, c in enumerate(vec) if c != 0] if vec is not None else []
+    if len(nonzero) != 1:
+        raise ValueError(
+            f'hole "{label}": params.{key} {_compact(v)} does not name one entry face — a '
+            f"drill direction must be a signed axis ([0,0,-1] or \"-z\": ±X/±Y/±Z, nothing "
+            f"oblique, no bare axis word without a sign). Name the face directly instead: "
+            f'refs.face={{"of":"face","side":"top"}} (top|bottom|left|right|front|back).')
+    axis, sign = nonzero[0], (1 if vec[nonzero[0]] > 0 else -1)
+    return _SIDE_OF_OUTWARD_NORMAL[(axis, sign if key == "normal" else -sign)]
 
 
 def _normalize_hole_feature(feat: dict, notes: list) -> dict:
@@ -4294,11 +4493,9 @@ def _normalize_hole_feature(feat: dict, notes: list) -> dict:
                 f'end:"through_all" (drill straight through) or end:"blind" with a numeric '
                 f"params.depth.")
     if end is None:
-        depth_now = peek("depth")
-        end = "blind" if (_is_num(depth_now) or _is_dim_object(depth_now)) else "through_all"
-        changed = True
-        notes.append(f'{label}: params.end is required for a hole — defaulted to "{end}"'
-                     + (" (a depth was given)" if end == "blind" else " (no depth was given)"))
+        raise ValueError(
+            f'hole "{label}": params.end is required. Use end:"through_all" to drill '
+            f'straight through, or end:"blind" with a numeric params.depth (mm).')
     if end == "blind" and not (_is_num(peek("depth")) or _is_dim_object(peek("depth"))):
         raise ValueError(
             f'hole "{label}": end:"blind" needs a numeric params.depth (mm). Give the depth, '
@@ -4308,21 +4505,30 @@ def _normalize_hole_feature(feat: dict, notes: list) -> dict:
     params["end"] = end
 
     # A drill DIRECTION names the entry face: that is a rewrite of what the model wrote, so
-    # it belongs here. Supplying a face nobody named is a different decision — see
-    # _supply_missing_refs, which add_features runs on its own.
+    # it belongs here. A hole with no face at all is REFUSED, not given the top face — see
+    # _require_hole_face.
     refs = dict(out.get("refs") or {})
     side = None
+    side_key = None
     for k in _HOLE_DIR_KEYS:
         v = consume(k)
         if v is not _MISSING and v is not None and side is None:
-            side = _face_word_for_axis(v)
+            side = _hole_entry_side(k, v, label)
+            side_key = (k, v)
             changed = True
-    if side and not refs.get("face") and not refs.get("positions_sketch"):
+    if side and refs.get("face"):
+        notes.append(f'{label}: params.{side_key[0]} {_compact(side_key[1])} was not used — '
+                     f"the entry face is already named by refs.face")
+    elif side:
         refs["face"] = {"of": "face", "side": side}
         changed = True
-        notes.append(f'{label}: interpreted the drill direction as the {side} face '
-                     f'(refs.face={{"of":"face","side":"{side}"}}) — a bore is entered '
-                     f"through a named planar face, not along a world vector")
+        how = ("is the entry face's outward normal" if side_key[0] == "normal"
+               else "is the direction the drill travels, so it enters through the face "
+                    "whose outward normal points the other way")
+        notes.append(_Assumption(
+            f'{label}: read params.{side_key[0]} {_compact(side_key[1])} — {how} — as the '
+            f'{side} face (refs.face={{"of":"face","side":"{side}"}}). To drill through '
+            f"another face, name it in refs.face"))
 
     # A WORLD [x,y,z] (or a list of them) where the placement belongs. It is NOT a face-local
     # [u,v]: positions are measured from the face's outer-boundary centroid along u = world
@@ -4473,6 +4679,33 @@ def _drop_empty_ref_slots(ops: Any, notes: list) -> Any:
           "a shell with no removed faces is a closed hollow, not an error")
     return out
 
+def _normalize_closed_shell_flag(ops: Any, notes: list) -> Any:
+    """Translate shell_all:true to the engine's closed-shell representation."""
+    if not isinstance(ops, list):
+        return ops
+    out, changed = [], False
+    for op in ops:
+        feat = op.get("feature") if isinstance(op, dict) else None
+        params = feat.get("params") if isinstance(feat, dict) else None
+        if (not isinstance(feat, dict) or _slug(feat.get("type")) != "shell"
+                or not isinstance(params, dict) or "shell_all" not in params):
+            out.append(op)
+            continue
+        if params["shell_all"] is not True:
+            raise ValueError("shell: params.shell_all must be true for a closed shell; "
+                             "omit it and specify refs.remove for an open shell")
+        refs = feat.get("refs")
+        if isinstance(refs, dict) and any(
+                key in refs and not _is_empty_slot(refs[key])
+                for key in ("remove", "faces", "open_faces", "open", "remove_faces")):
+            raise ValueError("shell: params.shell_all:true conflicts with removed faces")
+        new_params = {key: value for key, value in params.items() if key != "shell_all"}
+        out.append({**op, "feature": {**feat, "params": new_params}})
+        notes.append("shell: interpreted params.shell_all:true as a closed shell "
+                     "with no removed faces")
+        changed = True
+    return out if changed else ops
+
 
 #: A primitive carrying its own boolean intent. Live run 2026-07-28:
 #: {"type":"cylinder",…,"refs":{"boolean":"subtract","target":"f2"}} — the model wants the
@@ -4510,9 +4743,9 @@ def _normalize_inline_boolean(ops: Any, notes: list) -> Any:
         if mode is None:
             out.append(op)
             continue
-        # The companion `target` names the body being cut. A mode:"cut" primitive already
-        # cuts every body it intersects and these types have no target slot, so keeping it
-        # would only re-raise "unknown ref slot".
+        # The companion `target` names the body being cut. These types have no target slot
+        # (keeping it would only re-raise "unknown ref slot"), and a mode:"cut" feature
+        # subtracts from the single most recent body — see the note below.
         target = next((refs.pop(k) for k in ("target", "into", "target_body")
                        if k in refs), None)
         params.setdefault("mode", mode)
@@ -4524,11 +4757,23 @@ def _normalize_inline_boolean(ops: Any, notes: list) -> Any:
         hits.append((_feat_label(feat, "feature"), mode, target))
         out.append({**op, "feature": nf})
     for label, mode, target in hits:
-        notes.append(
-            f'{label}: read the boolean word as params.mode="{mode}" — a primitive '
-            f"removes material itself, so this is one feature, not a primitive plus a "
-            f"boolean" + (f'; dropped target "{target}" (a cut applies to every body it '
-                          f"intersects)" if target else ""))
+        note = (f'{label}: read the boolean word as params.mode="{mode}" — a primitive '
+                f"removes material itself, so this is one feature, not a primitive plus a "
+                f"boolean")
+        if target:
+            # What the engine really does (document.cpp solid_targets): a cut applies to the
+            # most recent body only, never "every body it intersects", and merge:false
+            # turns a cut into a NEW body that removes nothing. So the dropped target can
+            # change which body is cut — an assumption, not a spelling repair.
+            effect = ('a cut applies only to the most recent body; merge:false instead '
+                      'creates a new body without cutting' if mode == "cut" else
+                      'a boss merges with touching bodies, not a named target')
+            notes.append(_Assumption(
+                note + f'; dropped target "{target}": {effect}. To address a specific body, '
+                       f'build the tool with merge:false and use a boolean with '
+                       f'a:"{target}" and b:<tool id>.'))
+        else:
+            notes.append(note)
     return ops if not hits else out
 
 
@@ -4564,7 +4809,7 @@ def _unmerge_boolean_operands(ops: Any, notes: list) -> Any:
     hits = []
     out = list(ops)
     for i in sorted(wanted):
-        feat = out[i].get("feature") if isinstance(out[i], dict) else None
+        feat = out[i].get("feature") if i < len(out) and isinstance(out[i], dict) else None
         if not isinstance(feat, dict) or _slug(feat.get("type")) == "boolean":
             continue
         params = dict(feat.get("params")) if isinstance(feat.get("params"), dict) else {}
@@ -4575,10 +4820,10 @@ def _unmerge_boolean_operands(ops: Any, notes: list) -> Any:
         hits.append(_feat_label(feat, f"op {i}"))
     if not hits:
         return ops
-    notes.append(
+    notes.append(_Assumption(
         "set merge:false on " + ", ".join(hits) + " — a body this batch hands to a "
         "boolean has to stay a separate solid, or it is absorbed on creation and the "
-        "boolean's operand no longer exists")
+        "boolean's operand no longer exists"))
     return out
 
 
@@ -4617,6 +4862,22 @@ def _expand_compound_boolean_ops(ops: Any, notes: list) -> Any:
     return out
 
 
+def _boolean_operand_pair(label: str, where: str, items: list) -> list:
+    """The two operand names of a boolean given as a list. Refuses more than two: the
+    engine's boolean combines exactly params.a with params.b, so a third operand would be
+    dropped without a word — a wrong solid reported ok. Chaining is the caller's call."""
+    names = [_operand_name(x) for x in items]
+    if len(names) > 2:
+        shown = ", ".join(str(n) for n in names)
+        raise ValueError(
+            f'boolean "{label}": {where} lists {len(names)} operands ({shown}) but a boolean '
+            f"combines exactly TWO bodies (params.a and params.b); the extra operands would be "
+            f"dropped. Chain them: boolean(a={names[0]}, b={names[1]}) first, then a second "
+            f'boolean whose a is that result ("$<index>" in the same batch) and whose b is '
+            f"{names[2]}, and so on. Build each input body with merge:false.")
+    return names
+
+
 def _normalize_boolean_feature(feat: dict, notes: list) -> dict:
     """params.operation:"union" + targets:[a,b] -> params.op:"fuse" + params.a/b."""
     out, params, peek, consume = _split_two_levels(feat)
@@ -4652,13 +4913,21 @@ def _normalize_boolean_feature(feat: dict, notes: list) -> dict:
         for k in _BOOLEAN_OPERAND_KEYS:
             v = peek(k)
             if isinstance(v, list) and len(v) >= 2:
-                operands = [_operand_name(x) for x in v[:2]]
+                operands = _boolean_operand_pair(label, k, v)
                 consume(k)
                 break
         if not operands:
             tv = (out.get("refs") or {}).get("targets")
             if isinstance(tv, list) and len(tv) >= 2:
-                operands = [_operand_name(x) for x in tv[:2]]
+                operands = _boolean_operand_pair(label, "refs.targets", tv)
+                refs_in = dict(out["refs"])
+                if refs_in.get("tools"):
+                    raise ValueError(
+                        f'boolean "{label}": refs.targets already contains two operands; '
+                        'remove refs.tools or chain another boolean.')
+                refs_in["targets"] = [tv[0]]
+                refs_in["tools"] = [tv[1]]
+                out["refs"] = refs_in
         pair_note = None
         if not operands:
             # The pair may sit in `refs` instead of `params`: a live 2026-07-28 batch sent
@@ -4838,8 +5107,8 @@ def _normalize_profile_feature(feat: dict, ftype: str, notes: list) -> dict:
         params["mode"] = "cut" if out.get("mode") == "cut" else "boss"
         out.pop("mode", None)
         changed = True
-        notes.append(f'{label}: params.mode is required for a {ftype} — defaulted to '
-                     f'"{params["mode"]}" (boss adds material, cut removes it)')
+        notes.append(_Assumption(f'{label}: params.mode is required for a {ftype} — defaulted to '
+                                 f'"{params["mode"]}" (boss adds material, cut removes it)'))
 
     # A revolve with no angle means a FULL revolution — the single most common revolve
     # intent (a bucket, a knob, a shaft); omitting it used to bounce the whole batch on
@@ -4847,8 +5116,8 @@ def _normalize_profile_feature(feat: dict, ftype: str, notes: list) -> dict:
     if ftype == "revolve" and params.get("angle") is None:
         params["angle"] = 360
         changed = True
-        notes.append(f'{label}: params.angle is required for a revolve — defaulted to 360 '
-                     f'(a full revolution; pass angle=180 etc. for a partial one)')
+        notes.append(_Assumption(f'{label}: params.angle is required for a revolve — defaulted to 360 '
+                                 f'(a full revolution; pass angle=180 etc. for a partial one)'))
 
     if not changed:
         return feat
@@ -4932,7 +5201,8 @@ def _inline_sketch_feature(src: dict, name: str, plane: str) -> Optional[dict]:
             "params": {"entities": ents, "constraints": []}}
 
 
-def _split_inline_profile_sketches(ops: Any, notes: list) -> Any:
+def _split_inline_profile_sketches(ops: Any, notes: list,
+                                   index_map: Optional[dict] = None) -> Any:
     """Lift an inline profile into its own sketch op AHEAD of the feature consuming it."""
     if not isinstance(ops, list):
         return ops
@@ -4999,6 +5269,8 @@ def _split_inline_profile_sketches(ops: Any, notes: list) -> Any:
         shift[f"${i}"] = f"${len(out) + len(made)}"
         out.extend(made)
         out.append(op)
+    if index_map is not None:
+        index_map.update(shift)
     if not changed:
         return ops
     if any(k != v for k, v in shift.items()):
@@ -5078,46 +5350,78 @@ def _repair_datum_selector(v: Any) -> Optional[dict]:
             return out
     return None
 
-#: Direction-ish datum ref slots — the only members of _DATUM_REF_SLOTS where an arbitrary
-#: [x,y,z] vector unambiguously names a reserved axis (nearest cardinal). "plane"/"base"/
-#: "path" need a PLANE or a point/curve, not a direction, so a vector there stays untouched.
+#: Direction-ish datum ref slots — the only members of _DATUM_REF_SLOTS where a [x,y,z]
+#: vector names an axis. "plane"/"base"/"path" need a PLANE or a point/curve, not a
+#: direction, so a vector there stays untouched.
 _AXIS_DIRECTION_SLOTS = frozenset({"axis", "dir1", "dir2", "pull"})
+#: Where a model writes the direction / through-point inside a wrapper object. These are
+#: the engine's own keys for an explicit axis (document.cpp axis_from_explicit reads
+#: `axis` plus `centroid`/`point`/`origin`), plus the plain-English spellings of the
+#: direction. `centroid` is a POINT key, never a direction: the old pseudo-selector shape
+#: {"centroid":[0,0,1]} carries no direction at all.
+_AXIS_VECTOR_KEYS = ("direction", "dir", "vector", "axis")
+_AXIS_POINT_KEYS = ("origin", "point", "centroid")
+#: Assembly component patterns resolve their axis/direction through a reserved datum word
+#: only (assembly.cpp world_axis_from_ref): no sign, no oblique vector, no through-point.
+_DATUM_ONLY_AXIS_TYPES = frozenset({"asm_linear_pattern", "asm_circular_pattern"})
 
 
-def _axis_vector_to_datum(v: Any) -> Optional[str]:
-    """A bare/mis-wrapped direction vector for an axis-ish ref slot -> the nearest cardinal
-    reserved axis ("axis.x"/"axis.y"/"axis.z").
+def _vec3_of(c: Any) -> Optional[list]:
+    if isinstance(c, (list, tuple)) and len(c) == 3 and all(_is_num(x) for x in c):
+        return [float(x) for x in c]
+    return None
 
-    An axis/dir ref slot only ever accepts a reserved datum token or a real selector object
-    — the engine has no "arbitrary 3D direction" selector kind, so [0,0,1] dies with
-    "selector must be an object" (it is a JSON array) and a pseudo-selector like
-    {"centroid":[0,0,1]} dies one rung later with "refs.axis.kind: not in […]" /
-    "refs.axis.centroid: must be [x,y,z]" (a real region/face selector, wrong shape). Every
-    observed case is a model naming X/Y/Z the way it would to a human — snap to the
-    dominant component. None when the value carries no recognizable vector at all.
+
+def _axis_vector_to_ref(v: Any, ftype: str, slot: str) -> Union[str, dict, None]:
+    """A bare/mis-wrapped direction for an axis-ish ref slot -> what the engine accepts.
+
+    The engine has no "arbitrary 3D direction" selector kind: a bare [0,0,1] dies with
+    "selector must be an object" and a wrapper like {"origin":[…],"direction":[…]} dies on
+    "refs.axis.kind: absent". What it DOES accept is a reserved datum ("axis.x") — positive,
+    through the world origin — or the explicit form {"axis":[x,y,z],"point":[x,y,z]}
+    (document.cpp axis_from_explicit), which carries any sign, any direction and any
+    through-point. So: an exactly-cardinal, positive vector through the origin becomes the
+    datum; EVERYTHING else is passed on in the explicit form with its numbers intact. The
+    old snap-to-nearest-cardinal turned a diagonal pattern direction into X and a revolve
+    about {origin:[30,0,0]} into a revolve about world Z, both ok:true.
+
+    None when the value carries no usable vector (left for the engine's own error) or is
+    already the canonical explicit form. Raises a teaching ValueError for assembly
+    patterns, whose engine side takes a reserved datum word only.
     """
-    vec: Optional[list] = None
-    if isinstance(v, (list, tuple)) and len(v) == 3 and all(_is_num(x) for x in v):
-        vec = [float(x) for x in v]
-    elif isinstance(v, dict):
+    vec: Optional[list] = _vec3_of(v)
+    point: Optional[list] = None
+    if vec is None and isinstance(v, dict):
         if all(_is_num(v.get(k)) for k in ("x", "y", "z")):
             vec = [float(v["x"]), float(v["y"]), float(v["z"])]
         else:
-            # The wrappers a model actually writes around a direction. `centroid` is the
-            # pseudo-selector shape; the rest are the plain-English ones — live
-            # 2026-08-04 a revolve arrived with refs.axis={"origin":[…],"direction":[0,0,1]}
-            # and died on «refs.axis.kind: absent not in [...]», which says nothing about
-            # the direction it did supply. `origin` is IGNORED on purpose: a reserved axis
-            # passes through the world origin, so honouring an offset would be a lie.
-            for key in ("centroid", "direction", "dir", "vector", "axis"):
-                c = v.get(key)
-                if isinstance(c, (list, tuple)) and len(c) == 3 and all(_is_num(x) for x in c):
-                    vec = [float(x) for x in c]
+            for key in _AXIS_VECTOR_KEYS:
+                vec = _vec3_of(v.get(key))
+                if vec is not None:
                     break
+        for key in _AXIS_POINT_KEYS:
+            if key in v and v[key] is not None:
+                point = _vec3_of(v[key])
+                if point is None:
+                    raise ValueError(f"refs.{slot}.{key}: expected a numeric [x,y,z] point")
+                break
     if vec is None or not any(vec):
         return None
-    dominant = max(range(3), key=lambda i: abs(vec[i]))
-    return ("axis.x", "axis.y", "axis.z")[dominant]
+    at_origin = point is None or not any(point)
+    nonzero = [i for i, c in enumerate(vec) if c != 0]
+    cardinal_positive = len(nonzero) == 1 and vec[nonzero[0]] > 0
+    if cardinal_positive and at_origin:
+        return ("axis.x", "axis.y", "axis.z")[nonzero[0]]
+    if ftype in _DATUM_ONLY_AXIS_TYPES:
+        raise ValueError(
+            f"{ftype}: refs.{slot} {_compact(v)} cannot be honoured — an assembly pattern "
+            f"takes a reserved axis word only (axis.x / axis.y / axis.z, positive, through "
+            f"the assembly origin). Pass one of those, or pattern the component with "
+            f"asm_add_component(at=…, rotate=…, angle=…) per instance.")
+    ref: dict = {"axis": vec}
+    if not at_origin:
+        ref["point"] = point
+    return None if ref == v else ref
 
 
 #: A ref-slot synonym valid ONLY because the feature type has exactly one ref slot that
@@ -5181,14 +5485,19 @@ def _normalize_feature_refs(feat: dict, ftype: str, notes: list) -> dict:
                              f"selector names its datum under `feature`")
                 continue
             if slot in _AXIS_DIRECTION_SLOTS:
-                axis_datum = _axis_vector_to_datum(v)
-                if axis_datum is not None:
-                    out_refs[slot] = axis_datum
+                axis_ref = _axis_vector_to_ref(v, ftype, slot)
+                if axis_ref is not None:
+                    out_refs[slot] = axis_ref
                     changed = True
+                    if isinstance(axis_ref, str):
+                        how = f'the reserved datum "{axis_ref}"'
+                    else:
+                        how = f"the explicit axis {_compact(axis_ref)} (numbers kept exactly)"
                     notes.append(
-                        f"{label}: read refs.{slot} {_compact(v)} as the reserved datum "
-                        f'"{axis_datum}" — a direction slot takes a reserved axis token '
-                        f"(axis.x/axis.y/axis.z) or a real selector, never a bare vector")
+                        f"{label}: read refs.{slot} {_compact(v)} as {how} — a direction slot "
+                        f"takes a reserved axis token (axis.x/axis.y/axis.z, positive, through "
+                        f"the origin), a real selector, or {{\"axis\":[x,y,z],\"point\":[x,y,z]}}, "
+                        f"never a bare vector")
             continue
         # Prose the model uses to NAME geometry ("the vertical edges", "the top face"),
         # and the {"query": …} wrapper it puts around it. Both are dialect for a geometry
@@ -5402,9 +5711,15 @@ def _normalize_extrude_params(feat: dict, ftype: str, notes: list) -> dict:
         consume(k)
         changed = True
         if peek("mid_plane") is _MISSING:
-            params["mid_plane"] = bool(v)
-            notes.append(f'{label}: interpreted {k}={v!r} as params.mid_plane — the run is '
-                         f"split evenly either side of the sketch plane")
+            flag = _as_bool(v)
+            if flag is None:
+                raise ValueError(
+                    f"{label}: {k}={_compact(v)} is not a true/false flag — use "
+                    f"params.mid_plane:true to split the run evenly either side of the "
+                    f'sketch plane, or end:"mid_plane"')
+            params["mid_plane"] = flag
+            notes.append(f'{label}: interpreted {k}={v!r} as params.mid_plane={flag} — the '
+                         f"run is split evenly either side of the sketch plane")
 
     end_v = peek("end")
     if isinstance(end_v, str) and _slug(end_v) in _EXTRUDE_END_WORDS:
@@ -5497,27 +5812,25 @@ _REFS_ONLY_SLOTS = frozenset({
 
 #: The word a model reaches for when it names a 3D feature's ONE defining size, mapped to
 #: the key the engine actually reads (verified against the literals each compiler branch in
-#: core/doc/document.cpp consumes — rib 4424, chamfer 4562, shell 5623, draft 5764, thread
-#: 7038, mirror 5049, sweep 4380 — so no alias here shadows a key that already means
-#: something else on that type).
-#:
-#: Measured live 2026-07-30 on a fresh engine, one alias per call. Two of these were the
-#: worst possible failure, a build that reports ok and ignores the number it was given:
-#:   rib     params.width=8 built the 3 mm DEFAULT rib (7650.0 mm^3); thickness=8 builds
-#:           8400.0. The model asked for an 8 mm rib and silently got a 3 mm one.
-#:   thread  params.depth=10 threaded the WHOLE 30 mm face (1251.619 mm^3); length=10
-#:           gives 1418.832. The model asked for a 10 mm thread run and got a full one.
+#: core/doc/document.cpp consumes — so no alias here shadows a key that already means
+#: something else on that type). Only GENUINE synonyms live here: a word that names the same
+#: quantity under another spelling (shell wall -> thickness, chamfer size -> length). A word
+#: that could be a DIFFERENT quantity is not an alias — the engine now refuses an unknown
+#: param key with the type's real key list (doc_list_ops `params`), so the model picks:
+#:   rib `width` (the rib's extent, not its wall thickness), thread `depth` (the radial
+#:   thread depth, not the axial run length), sheet-metal `gauge` (a gauge NUMBER such as 14,
+#:   not millimetres).
 #: The rest were clean rejections for a value the model DID supply — «params.thickness:
 #: required for shell», «params.length: required for chamfer», «params.angle: required for
 #: draft», «refs.plane: required for mirror», «refs.path: required for sweep».
 _TYPE_PARAM_ALIASES: dict = {
     "shell": {"thickness": ("wall_thickness", "wall", "wall_t", "t")},
-    "rib": {"thickness": ("width", "rib_thickness", "wall_thickness", "wall", "t")},
+    "rib": {"thickness": ("rib_thickness", "wall_thickness", "wall", "t")},
     # chamfer's second leg is `length2`; d1/d2 are how a model spells an ASYMMETRIC one.
     "chamfer": {"length": ("size", "d", "d1", "width", "amount", "leg", "setback"),
                 "length2": ("d2",)},
     "draft": {"angle": ("draft_angle", "taper", "taper_angle", "degrees", "deg")},
-    "thread": {"length": ("depth", "thread_length", "run", "engagement"),
+    "thread": {"length": ("thread_length", "run", "engagement"),
                "size": ("thread_size", "designation"),
                "major_dia": ("diameter", "major_diameter", "nominal_diameter",
                              "nominal_dia")},
@@ -5525,23 +5838,12 @@ _TYPE_PARAM_ALIASES: dict = {
     # pass) can carry them into `refs`, which is where the engine reads them.
     "mirror": {"plane": ("about", "across", "mirror_plane", "symmetry_plane")},
     "sweep": {"path": ("spine", "trajectory", "rail", "along", "sweep_path")},
-    # SHEET METAL. core/doc/document.cpp reads sm_base_flange 5885-5889 (thickness /
-    # k_factor / default_bend_radius) and the shared bend branch 5966-6088 (length /
-    # angle / radius / k_factor / offset / hem_type); validate.cpp 223-227 requires NO
-    # params on any sm_* type, so every one of these is read with contains()/value() and
-    # an unrecognised spelling is silently swallowed. Measured live 2026-07-30 on a fresh
-    # engine — an 80x40x2 base + two 90 deg 25 mm flanges + sm_flat_pattern, reading the
-    # unfolded blank's X extent (analytic target 134.106 mm for r=6, k=0.20, L=25):
-    #   length   height / flange_length / wall_length -> 124.106; the flange fell back to
-    #            the 20 mm DEFAULT. The model asked for a 25 mm wall and got a 20 mm one,
-    #            10 mm short on the blank, reported ok.
-    #   radius   bend_radius / inner_radius -> 129.540; the bend used the default radius
-    #            (= thickness) instead of the 6 mm the model specified.
-    #   k_factor kfactor / k -> 135.677; the bend allowance used k=0.45, not 0.20.
-    # Every one of those is a silent wrong blank — the part looks built and the flat
-    # pattern is simply the wrong size, which is exactly what gets cut.
+    # SHEET METAL. core/doc/document.cpp reads sm_base_flange (thickness / k_factor /
+    # default_bend_radius) and the shared bend branch (length / angle / radius / k_factor /
+    # offset / hem_type). Spellings of the same quantity are renamed here; a gauge number is
+    # NOT a thickness and is refused in _normalize_type_param_aliases.
     "sm_base_flange": {
-        "thickness": ("sheet_thickness", "material_thickness", "gauge", "wall_thickness", "t"),
+        "thickness": ("sheet_thickness", "material_thickness", "wall_thickness", "t"),
         "default_bend_radius": ("bend_radius", "radius", "inner_radius", "default_radius",
                                 "bend_r"),
         "k_factor": ("kfactor", "k", "k_fac", "bend_k"),
@@ -5588,6 +5890,12 @@ def _normalize_type_param_aliases(ops: Any, notes: list) -> Any:
             out.append(op)
             continue
         new, params, peek, consume = _split_two_levels(feat)
+        if ftype == "sm_base_flange" and peek("gauge") not in (_MISSING, None):
+            raise ValueError(
+                f'{_feat_label(feat, ftype)}: params.gauge {_compact(peek("gauge"))} is a '
+                f"sheet GAUGE number (14 ga is about 1.9 mm steel, a different thickness for "
+                f"every material), not a length. sm_base_flange reads params.thickness in "
+                f"millimetres: look the gauge up for your material and pass that number.")
         hit = False
         for canon, aliases in table.items():
             if peek(canon) is not _MISSING:
@@ -5602,7 +5910,7 @@ def _normalize_type_param_aliases(ops: Any, notes: list) -> Any:
                 notes.append(
                     f"{_feat_label(feat, ftype)}: read params.{alias} as params.{canon} — "
                     f"a {ftype} names that {'selection' if canon in _REFS_ONLY_SLOTS else 'value'}"
-                    f" `{canon}`, and an unread key is silently ignored, not rejected")
+                    f" `{canon}`")
                 break
         if not hit:
             out.append(op)
@@ -5881,7 +6189,8 @@ def _walk_sid_refs(ops: Any):
     """Yield (refs dict, slot, index-or-None, sid) for every sid sitting in a ref slot."""
     for op in ops if isinstance(ops, list) else ():
         feat = op.get("feature") if isinstance(op, dict) else None
-        refs = feat.get("refs") if isinstance(feat, dict) else None
+        refs = (op.get("refs") if isinstance(op, dict) and op.get("op") == "edit_feature"
+                else feat.get("refs") if isinstance(feat, dict) else None)
         if not isinstance(refs, dict):
             continue
         for slot, v in refs.items():
@@ -6059,7 +6368,7 @@ def _geometry_inventory_line(doc_id: str, kind: str) -> Optional[str]:
 def _enrich_ref_resolution_error(result: Any, doc_id: Optional[str], ops: Any) -> Any:
     """Append a real geometry inventory to a ref-RESOLUTION failure (dict form).
 
-    Mirrors op_vocab.enrich_unknown_op_error's shape (mega-8 F7): detect a thin kernel
+    Detect a thin kernel
     error, and only when it names a genuine resolution failure (never a syntax one — the
     C++ validator already teaches that), attach what the document ACTUALLY has so the
     model can act instead of guessing again. Live root cause: a fillet on "the vertical
@@ -6132,7 +6441,8 @@ def _resolve_sid_refs(ops: Any, doc_id: str, notes: list) -> Any:
     out = []
     for op in ops:
         feat = op.get("feature") if isinstance(op, dict) else None
-        refs = feat.get("refs") if isinstance(feat, dict) else None
+        editing = isinstance(op, dict) and op.get("op") == "edit_feature"
+        refs = op.get("refs") if editing else feat.get("refs") if isinstance(feat, dict) else None
         if not isinstance(refs, dict):
             out.append(op)
             continue
@@ -6152,7 +6462,10 @@ def _resolve_sid_refs(ops: Any, doc_id: str, notes: list) -> Any:
         if not touched:
             out.append(op)
             continue
-        out.append({**op, "feature": {**feat, "refs": new_refs}})
+        if editing:
+            out.append({**op, "refs": new_refs})
+        else:
+            out.append({**op, "feature": {**feat, "refs": new_refs}})
     if resolved:
         shown = ", ".join(sorted(resolved))
         notes.append(
@@ -6215,36 +6528,30 @@ def _check_cylinder_height(feat: dict, ftype: str, notes: list) -> dict:
     raise ValueError(msg)
 
 
-def _supply_missing_refs(ops: Any, notes: list) -> Any:
-    """Supply a REF the engine cannot infer and the model did not name.
+def _require_hole_face(ops: Any) -> Any:
+    """Refuse a hole that names no entry face.
 
-    Deliberately separate from the dialect passes above: those rewrite what the model
-    wrote, this one adds something it never said. Today that is a hole's entry face — a
-    solid has six of them, the compiler refuses to pick ("hole: 'face' selector is
-    required (the planar face to drill into)"), and the top face is what a person means by
-    an undecorated bore. Echoed, so the model can name another face next turn.
+    A solid has six faces, the compiler refuses to pick one ("hole: 'face' selector is
+    required (the planar face to drill into)"), and quietly drilling the top face put the
+    bore on the wrong side of any part the model pictured from below. The model has to
+    say which face; the error names the way to do it.
     """
     if not isinstance(ops, list):
         return ops
-    out = []
     for op in ops:
         feat = op.get("feature") if isinstance(op, dict) else None
         if not (isinstance(feat, dict) and op.get("op") == "add_feature"
                 and str(feat.get("type") or "").strip().lower() == "hole"):
-            out.append(op)
             continue
         refs = feat.get("refs") if isinstance(feat.get("refs"), dict) else {}
-        if refs.get("face") or refs.get("positions_sketch"):
-            out.append(op)
+        if refs.get("face"):
             continue
-        out.append({**op, "feature": {**feat,
-                                      "refs": {**refs,
-                                               "face": {"of": "face", "side": "top"}}}})
-        notes.append(
-            f'{_feat_label(feat, "hole")}: no refs.face given — drilling the TOP face '
-            f'(refs.face={{"of":"face","side":"top"}}); a bore has to be entered through a '
-            f"named planar face, so name another one to drill elsewhere")
-    return out
+        raise ValueError(
+            f'hole "{_feat_label(feat, "hole")}": no entry face — a bore is drilled into one '
+            f'named planar face. Add refs.face={{"of":"face","side":"top"}} '
+            f"(top|bottom|left|right|front|back, or a face sid from query_geometry), or a "
+            f"drill direction params.direction=[0,0,-1] (the way the drill travels).")
+    return ops
 
 
 def _normalize_feature_schema(feat: dict, ftype: str, notes: list) -> dict:
@@ -6444,20 +6751,8 @@ def _resolve_batch_name_refs(ops: Any, notes: list) -> Any:
                        '"$N" position in THIS batch, never a display name')
     return out
 
-def _validate_batch_placeholders(ops: Any) -> None:
-    """Reject an out-of-range, self- or forward-referential "$N" with the real roster.
-
-    "$N" is a ZERO-BASED index into THIS batch's op list, but 1-based is the natural
-    reading and nothing corrected it. Live run 2026-07-30 (a Lexus-F keychain): the model
-    wrote profile:"$2" and profile:"$4" meaning the 2nd and 4th ops, and the whole batch
-    died on «f5 (Keyring hole): profile '$2' -> '$2' not found; f7 (F emboss): profile
-    '$4' -> '$4' not found» — a message that names no range, no base, and does not
-    mention that $2 WAS the very feature doing the referencing. Two features and a turn
-    lost to an off-by-one nobody told the model about.
-
-    Runs AFTER every insert/expand/renumber pass, so the indices it checks are the ones
-    the engine will see.
-    """
+def _validate_batch_placeholders(ops: Any, *, check_producers: bool = True) -> None:
+    """Validate the final zero-based batch roster, including sketch producer types."""
     if not isinstance(ops, list) or not ops:
         return
 
@@ -6477,14 +6772,12 @@ def _validate_batch_placeholders(ops: Any) -> None:
     last = len(ops) - 1
     roster = ", ".join(_slot(i) for i in range(len(ops)))
 
-    def _walk(v: Any, i: int) -> None:
+    def _walk(v: Any, i: int, *, sketch_slot: bool = False) -> None:
         if isinstance(v, str):
             s = v.strip()
             if not _BATCH_REF_RE.match(s):
                 return
             k = int(s[1:])
-            # Order matters: an out-of-range index is ALSO > i, so it must be tested
-            # first or its (more useful) message is unreachable.
             if k > last:
                 why = (f"is out of range — this batch has {len(ops)} op(s), so its "
                        f'placeholders are "$0".."${last}"')
@@ -6495,25 +6788,44 @@ def _validate_batch_placeholders(ops: Any) -> None:
                 why = (f"names op {k}, which this batch creates LATER — a ref can only "
                        f"name a feature built EARLIER in the same batch")
             else:
-                return
+                producer = ops[k] if isinstance(ops[k], dict) else {}
+                producer_op = str(producer.get("op") or "")
+                feature = producer.get("feature") or {}
+                if check_producers and sketch_slot and not (
+                        producer_op == "add_feature" and isinstance(feature, dict)
+                        and _slug(feature.get("type")) == "sketch"):
+                    why = (f"names {_slot(k)}, not an earlier sketch feature; "
+                           "this sketch/profile slot requires an add_feature sketch")
+                elif check_producers and ("delete" in producer_op or "remove" in producer_op):
+                    why = f"names {_slot(k)}, a deletion that does not produce a reference"
+                else:
+                    return
             who = _name(i) or f"op {i}"
             raise ValueError(
                 f'{who}: "{s}" {why}. "$N" is a ZERO-BASED index into THIS batch: '
                 f"{roster}. To name a feature an EARLIER CALL built, use its f<N> id.")
-        if isinstance(v, list):
+        elif isinstance(v, list):
             for x in v:
-                _walk(x, i)
+                _walk(x, i, sketch_slot=sketch_slot)
         elif isinstance(v, dict):
-            for x in v.values():
-                _walk(x, i)
+            for key, x in v.items():
+                _walk(x, i, sketch_slot=sketch_slot or key == "sketch")
 
     for i, el in enumerate(ops):
         if not isinstance(el, dict):
             continue
-        # Only REF slots carry placeholders; a `name` never does.
         feat = el.get("feature") if isinstance(el.get("feature"), dict) else {}
+        # Top-level `sketch` is used by every sketch-edit op, including generated
+        # sketch_fully_define ops. A profile/section is also a sketch producer.
+        _walk(el.get("sketch"), i, sketch_slot=True)
         for holder in (el.get("refs"), feat.get("refs"), feat.get("params"), el.get("params")):
-            _walk(holder, i)
+            if isinstance(holder, dict):
+                for key, value in holder.items():
+                    _walk(value, i, sketch_slot=key in ("sketch", "profile", "sections"))
+            else:
+                _walk(holder, i)
+        for key in ("id", "before"):
+            _walk(el.get(key), i)
 
 
 def _resolve_doc_name_refs(ops: Any, doc_id: str, notes: list) -> Any:
@@ -6738,7 +7050,7 @@ _ADD_FEATURES_ACCEPTS = (
     'doc_id="doc-…" (an open part\'s NAME also resolves) and background=true. The batch may '
     "also arrive as feature=/features=/op=/operations=/actions=/ops_json=, as one op dict, "
     "as a JSON string, or as ONE feature spread over top-level kwargs "
-    "(type=…, name=…, params={…}). Call cad_guide() for the op vocabulary."
+    '(type=…, name=…, params={…}). Call cad_guide(topic="ops") for the op vocabulary.'
 )
 
 
@@ -6790,7 +7102,7 @@ def _batch_from_flat_kwargs(kw: dict, notes: list) -> Optional[list]:
     nor a feature type (the caller then reports the leftovers).
     """
     docops = _doc_op_vocab()
-    ftypes, _live = _feature_type_vocab()
+    ftypes = _feature_type_vocab()
 
     op_key = op_word = None
     for k in ("op", "operation", "action", "kind"):
@@ -7005,6 +7317,32 @@ def _native_file_reply(result: dict, output_path: Optional[str] = None) -> str:
             preview.append(failure)
     summary["failures_preview"] = preview
     summary["failures_omitted"] = max(0, len(failures) - len(preview))
+    availability = result.get("direct_reference_availability")
+    if isinstance(availability, dict):
+        summary["direct_reference_availability"] = availability
+        missing_preview = []
+        for file in files:
+            if not isinstance(file, dict) or file.get("status") != "written":
+                continue
+            for ref in file.get("dependency_rewrites", []):
+                if (not isinstance(ref, dict) or not ref.get("required", True)
+                        or ref.get("destination_exists") is not False):
+                    continue
+                if len(missing_preview) == 5:
+                    break
+                missing_preview.append({
+                    "file": str(file.get("destination", ""))[:256],
+                    "json_pointer": str(ref.get("json_pointer", ""))[:256],
+                    "source_exists": ref.get("exists"),
+                    "destination": str(ref.get("destination_resolved_path", ""))[:256],
+                })
+            if len(missing_preview) == 5:
+                break
+        summary["missing_direct_references_preview"] = missing_preview
+        summary["missing_direct_references_omitted"] = max(
+            0, availability.get("missing_count", 0) - len(missing_preview))
+        if result.get("direct_reference_warning"):
+            summary["direct_reference_warning"] = result["direct_reference_warning"]
     if output_path and report_error is None:
         summary.update(output_path=output_path, report_written=True)
     else:
@@ -7183,6 +7521,188 @@ _SUMMARY_LIST_MAX = 64
 _SUMMARY_LIST_KEEP = 16
 
 
+def _non_body_edit_context(ops: list, tree: dict, id_map: dict) -> Optional[dict]:
+    """Describe sketch/mate-only edits and the sketches' actual current consumers."""
+    features = tree.get("features")
+    features = features if isinstance(features, list) else None
+    by_id = {f.get("id"): f for f in features or [] if isinstance(f, dict)}
+    operations = []
+    sketch_ids = []
+    for i, op in enumerate(ops):
+        if not isinstance(op, dict):
+            return None
+        kind = str(op.get("op") or "")
+        feature = op.get("feature")
+        sid = op.get("sketch")
+        sid = id_map.get(sid, sid) if isinstance(sid, str) else None
+        if kind == "add_feature" and isinstance(feature, dict):
+            ftype = _slug(feature.get("type"))
+            if ftype not in ("sketch", "sketch3d"):
+                return None
+            kind = f"add_{ftype}"
+            sid = id_map.get(f"${i}")
+        elif kind == "edit_feature":
+            target = op.get("id")
+            target = id_map.get(target, target) if isinstance(target, str) else None
+            if _slug((by_id.get(target) or {}).get("type")) not in ("sketch", "sketch3d"):
+                return None
+            sid = target
+        elif not (kind.startswith("sketch_") or kind.startswith("asm_") and "mate" in kind):
+            return None
+        if kind not in operations:
+            operations.append(kind)
+        if isinstance(sid, str) and not sid.startswith("$") and sid not in sketch_ids:
+            sketch_ids.append(sid)
+    if not operations:
+        return None
+    context: dict = {"operations": operations}
+    if sketch_ids and features is not None:
+        from services.mcp.ascii2d import sketch_feeds_feature, sketch_profile_usage
+        context["sketches"] = [
+            {"id": sid, "feeds_feature": sketch_feeds_feature(features, sid),
+             "usage": sketch_profile_usage(features, sid)} for sid in sketch_ids]
+    return context
+
+
+def _warning_changes(before: Optional[dict], features: list) -> dict:
+    current = [{"id": f.get("id"), "warning": f["warning"]}
+               for f in features if f.get("warning")]
+    statuses = (before.get("rebuild") or {}).get("feature_status") if before else None
+    if not isinstance(statuses, list):
+        return {"warnings_unclassified": current} if current else {}
+    previous = {(f.get("id"), str(f.get("warning"))) for f in statuses
+                if isinstance(f, dict) and f.get("warning")}
+    old = [f for f in current if (f["id"], str(f["warning"])) in previous]
+    new = [f for f in current if (f["id"], str(f["warning"])) not in previous]
+    return {key: value for key, value in
+            (("new_warnings", new), ("preexisting_warnings", old)) if value}
+
+
+def _physical_solid_count(world_bodies: Any) -> Optional[int]:
+    """Count actual solids, including multiple solids in one compiled shape entry."""
+    if not isinstance(world_bodies, dict) or not isinstance(world_bodies.get("bodies"), list):
+        return None
+    rows = world_bodies["bodies"]
+    if any(not isinstance(row, dict) or not isinstance(row.get("source_ordinals"), list)
+           for row in rows):
+        return None
+    return sum(len(row["source_ordinals"]) for row in rows)
+
+
+def _engine_reply_failure(reply: Any) -> Optional[dict]:
+    """The engine's refusal of an edit, or None when it accepted the edit.
+
+    The engine reports a rejected edit IN-BAND instead of raising: ``rejected_tree`` (an
+    atomic compile rejection — the document is unchanged), ``rebuild.ok: false``,
+    ``geometry_state: "incomplete"``, or ``rebuild.feature_status`` rows with ``ok: false``.
+    ``error`` carries the engine's own per-feature reasons verbatim; ``applied`` says whether
+    the document kept the edit.
+    """
+    if not isinstance(reply, dict):
+        return {"ok": False, "applied": None, "revision": None,
+                "error": "the engine returned no reply, so the edit cannot be confirmed"}
+    rebuild = reply.get("rebuild") if isinstance(reply.get("rebuild"), dict) else {}
+    rows = rebuild.get("feature_status")
+    failed = ([row for row in rows if isinstance(row, dict) and row.get("ok") is False]
+              if isinstance(rows, list) else [])
+    rejected = reply.get("rejected_tree") is not None
+    if not (rejected or failed or reply.get("ok") is False or rebuild.get("ok") is False
+            or reply.get("geometry_state") == "incomplete"):
+        return None
+    reasons = [f"{row.get('id') or '?'}: {str(row.get('error') or '').strip() or 'no reason reported'}"
+               for row in failed]
+    why = ("; ".join(reasons) or str(reply.get("error") or "").strip()
+           or "no per-feature reason reported")
+    head = ("the engine rejected the edit and left the document unchanged" if rejected
+            else "the edit left the rebuild failing")
+    return {"ok": False,
+            "applied": not rejected and reply.get("ok") is not False,
+            "revision": reply.get("revision"),
+            "error": f"{head} — {why}"}
+
+
+def _prepare_add_features_ops(ops: list, doc_id: str, auto_define: bool,
+                              notes: list) -> tuple[list, dict]:
+    """Prepare an existing document's batch, without applying any operations."""
+    # Expansion precedes vocabulary normalization; references are resolved only
+    # after the feature and sketch dialects have been normalized.
+    ops = _expand_face_pockets(ops, notes)
+    ops = _expand_prisms(ops, notes)
+    ops = _expand_compound_boolean_ops(ops, notes)
+    normalized_indices: dict = {}
+    ops = _normalize_op_elements(ops, notes, normalized_indices)
+    ops = _hoist_feature_sibling_keys(ops, notes)
+    ops = _normalize_asm_component_pose(ops, notes)
+    ops = _normalize_asm_mate_ops(ops, doc_id, notes)
+    ops = _normalize_pattern_ops(ops, notes)
+    ops = _normalize_feature_types(ops, notes)
+    ops = _normalize_type_param_aliases(ops, notes)
+    ops = _migrate_ref_slots(ops, notes)
+    ops = _normalize_closed_shell_flag(ops, notes)
+    ops = _drop_empty_ref_slots(ops, notes)
+    ops = _normalize_inline_boolean(ops, notes)
+    ops = _unwrap_enum_dims(ops, notes)
+    inline_indices: dict = {}
+    ops = _split_inline_profile_sketches(ops, notes, inline_indices)
+    ops = _normalize_sketch_ops(ops, notes, doc_id)
+    ops = _normalize_sketch_edit_ops(ops, notes)
+    ops = _normalize_feature_ops(ops, notes)
+    ops = _require_hole_face(ops)
+    ops = _resolve_sid_refs(ops, doc_id, notes)
+    ops = _resolve_batch_name_refs(ops, notes)
+    ops = _resolve_relative_profile_refs(ops, notes)
+    ops = _resolve_doc_name_refs(ops, doc_id, notes)
+    # Catch invalid indices before insertion can turn them into references to generated ops.
+    _validate_batch_placeholders(ops, check_producers=False)
+    ops = _unmerge_boolean_operands(ops, notes)
+    original_count = len(ops)
+    ops = _repair_merged_boolean_operands(ops, doc_id, notes)
+    repair_count = len(ops) - original_count
+    index_map: dict = {}
+    ops = _append_sketch_auto_define(
+        ops, auto_define=auto_define, doc_id=doc_id, notes=notes, index_map=index_map)
+    if repair_count:
+        index_map = {f"${i}": index_map[f"${i + repair_count}"]
+                     for i in range(original_count)}
+    if any(authored != normalized for authored, normalized in normalized_indices.items()):
+        index_map = {authored: index_map[inline_indices[normalized]]
+                     for authored, normalized in normalized_indices.items()}
+    _validate_batch_placeholders(ops)
+    return ops, index_map
+
+
+def _model_history_feedback(response: dict) -> Optional[dict]:
+    """Compact native history diagnostics already returned with a feature batch."""
+    rebuild = response.get("rebuild") or {}
+    doc_status = rebuild.get("doc_status") or {}
+    report = response.get("model_history") or doc_status.get("model_history")
+    if not isinstance(report, dict):
+        return None
+    findings = report.get("findings")
+    findings = findings if isinstance(findings, list) else []
+    lines = []
+    for finding in findings[:8]:
+        if not isinstance(finding, dict):
+            continue
+        severity = finding.get("severity") or "advisory"
+        code = finding.get("code") or "model_history"
+        ids = finding.get("feature_ids") or []
+        target = f" [{', '.join(str(fid) for fid in ids)}]" if ids else ""
+        line = f"{severity} {code}{target}: {finding.get('message') or ''}"
+        if finding.get("suggestion"):
+            line += f" — {finding['suggestion']}"
+        lines.append(line)
+    return {
+        "summary": report.get("summary"),
+        "complete": report.get("complete"),
+        "findings": lines,
+        "finding_count": len(findings),
+        "omitted_findings": max(0, len(findings) - 8),
+        "limitations": report.get("limitations") or [],
+        "next": "check_model_history() returns all findings and eligible fixes.",
+    }
+
+
 def register_cad_doc_tools(mcp: FastMCP) -> None:
     """CAD document-lifecycle MCP tools (split out of cad_tools.py): new_part, add_features, get_part, undo/redo, save/close/recover, configurations, material, engine_profile, cad_guide."""
 
@@ -7190,13 +7710,20 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
     # ---------------------------------------------------------------- knowledge
 
     @mcp.tool()
-    def cad_guide(topic: str = "overview") -> str:
-        """Return the engine's modeling/simulation knowledge so you can drive it well. CALL FIRST.
+    @result_contract("Normally returns guidance text; structured refusals remain failures.")
+    def cad_guide(topic: str = "") -> str:
+        """Get modeling or simulation guidance by topic.
 
-        This is the same closed op vocabulary + worked examples the in-app agent's modeler is
-        taught. topic="overview" (default) gives the workflow + full op cheatsheet (primitives,
-        sketch+extrude/revolve/loft/sweep, fillet/chamfer/shell/draft, holes, bolt_circle,
-        patterns/mirror, edits) and the plain-English geometry-query predicates. Other topics:
+        Omit topic or pass an empty string for a compact topic index. Choose a
+        feature name such as "hole", "fillet", or "sketch" for focused parameters.
+        "overview", "ops" and "features" return the large operation compendium;
+        "add_features" returns the complete mutation reference. The result is text;
+        embedded Eval's details.xdev.inner is already decoded, not JSON to parse.
+        Hyphens and underscores are interchangeable in topics (edit-part = edit_part).
+        "feature_history" covers insertion, reorder and rollback with exact op shapes.
+        "sketch_fully_define", "sketch_add_constraint", "sketch_set_dim", "check_sketch"
+        and "sketch_health" resolve to the existing 2D sketch guide.
+        Other topics:
         "assembly" (new_assembly/asm_add_component/asm_mate/solve_mates — put saved parts
         together with mates so they actually fit; seating patterns + validation loop),
         "simulation" (FEA/CFD how-to), "motion" (simulate_motion — drive a mate to animate an
@@ -7239,17 +7766,12 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         return cad_guide_text(topic)
 
     @mcp.tool()
+    @result_contract("Normally returns guidance text; structured refusals remain failures.")
     def cad_skill(name: str, path: str | None = None) -> str:
-        """Load one CAD skill pack — the full procedure behind a name in the [SKILLS] catalog.
+        """Load a named CAD skill's procedure; path selects a resource within the pack.
 
-        The catalog in your system prompt lists every pack by name and one-line
-        description; this returns the body: the numbered procedure, its failure modes
-        and its exact tool-call sequences (e.g. name="assembly-merge" for merging
-        independently-sourced CAD, name="simulate" for the FEA/CFD release-evidence
-        path). Pass path="<file>" for a resource file inside a pack's directory.
-        This is the ONLY way to fetch a Chudware skill: a skill:// URL is not a
-        Chudware path and resolves against an unrelated registry. An unknown name
-        returns the list of real names instead of an error.
+        Use cad_skill, not skill://, for Chudware skills. An unknown name returns
+        the available names.
         """
         # Lazy import: the skills catalog is agent-side and services/mcp must stay
         # importable without it (packaged MCP-only builds).
@@ -7290,23 +7812,45 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                         breakdown also rides along on "stop"/"report" under "phases".
           "reset_phases"  clear the phase registry (call before a measured run).
 
-        top/min_samples/write_folded/write_speedscope tune the sampling report.
+        top/min_samples tune the sampling report. write_folded/write_speedscope (stop/report
+        only) name output files: relative paths resolve under the project root, absolute
+        paths are allowed, credential/key locations are refused.
+
+        DISABLED unless the MCP server environment sets CHUDWARE_ENGINE_PROFILE=1: starting
+        a sampler inside the shared engine process and writing files are diagnostics, not
+        part of normal modeling. Every action is refused while it is unset.
         """
         try:
+            if (os.environ.get("CHUDWARE_ENGINE_PROFILE") or "").strip().lower() not in (
+                    "1", "true", "yes", "on"):
+                return _err(ValueError(
+                    "engine_profile is disabled: it samples the shared engine process and "
+                    "can write files. Set CHUDWARE_ENGINE_PROFILE=1 in the MCP server "
+                    "environment to enable it."))
             a = (action or "status").strip().lower()
+            outputs = {}
+            for key, raw in (("write_folded", write_folded), ("write_speedscope", write_speedscope)):
+                if not raw:
+                    continue
+                if a not in ("stop", "report"):
+                    raise ValueError(f"{key} only applies to action='stop' or 'report', "
+                                     f"not {a!r}")
+                from .tool_registry import RISK_WRITE, is_risk_denied
+                if is_risk_denied(RISK_WRITE):
+                    raise ValueError(f"{key} is denied by the active write-risk policy")
+                outputs[key] = _sanitize_output_path(raw)
+            report_args = {"top": top, "min_samples": min_samples,
+                           "write_folded": outputs.get("write_folded"),
+                           "write_speedscope": outputs.get("write_speedscope")}
             if a == "start":
                 p = {"mode": mode}
                 if hz and hz > 0:
                     p["hz"] = int(hz)
                 return _dumps(cb.call("prof_start", p))
             if a == "stop":
-                return _dumps(cb.call("prof_stop", {"top": top, "min_samples": min_samples,
-                                                    "write_folded": write_folded or None,
-                                                    "write_speedscope": write_speedscope or None}))
+                return _dumps(cb.call("prof_stop", report_args))
             if a == "report":
-                return _dumps(cb.call("prof_report", {"top": top, "min_samples": min_samples,
-                                                      "write_folded": write_folded or None,
-                                                      "write_speedscope": write_speedscope or None}))
+                return _dumps(cb.call("prof_report", report_args))
             if a == "status":
                 return _dumps(cb.call("prof_status", {}))
             if a == "contention":
@@ -7352,27 +7896,11 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         silently is what produced twelve "boss added no material (it is buried inside the
         body)" failures, so the count always travels."""
         did = entry["doc_id"]
+        # Path-stem/version resumes may only have read doc_list, and a cached
+        # volume can skip every later engine call. Claim the selected doc now.
+        cb.lease_document(did)
         _CUR["doc_id"] = did
-        note_touched_doc(did)
-        # Never seed a FAKE baseline. `setdefault` alone only protected a baseline this
-        # process had already built, and neither doc_new(resume_if_open=True) nor doc_list
-        # reports a `volume` key — so every resume from a process that had not itself built
-        # the part seeded 0.0. Measured live 2026-07-30: a resumed 48000 mm^3 box, then cut
-        # by 282.3 mm^3, reported "volume 0.0->47717.7 mm^3 (+47717.7)" — sign inverted,
-        # magnitude 169x off, on the exact op the model was meant to verify. Read the real
-        # volume from the engine; if that fails leave the baseline ABSENT so _write_diff
-        # degrades to the honest "volume now X" branch instead of inventing a delta.
-        if did not in _LAST_VOLUME:
-            vol = entry.get("volume")
-            if not isinstance(vol, (int, float)):
-                try:
-                    vol = (cb.call("eval_mass", {"doc_id": did}) or {}).get("volume_mm3")
-                except Exception:  # noqa: BLE001
-                    vol = None
-            if not isinstance(vol, (int, float)) and entry.get("feature_count") == 0:
-                vol = 0.0  # an empty part's baseline really is zero
-            if isinstance(vol, (int, float)):
-                _LAST_VOLUME[did] = float(vol)
+        claim_process_doc(did)
         built = entry.get("feature_count")
         carries = (f"; it ALREADY CARRIES {built} feature(s) — build on them "
                    f"(get_part first), or call new_part(fresh=True) for a "
@@ -7467,7 +7995,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
     def _discard_unbuilt_orphans(name: str, keep: str) -> list:
         """Close leftover EMPTY documents in the "name", "name2", "name3", ... series.
 
-        A worker SIGKILLed on the 5-minute run timeout (core/agent/run.cpp:782) never gets
+        A worker SIGKILLed on the 5-minute run timeout never gets
         to close the document it minted, and the machine-wide daemon keeps it open: the
         GUI's read-only mirror attach clears hostd's orphan deadline, so its GC never
         reaps it either. The user's retry then meets a stale empty tab — or three (live
@@ -7511,7 +8039,6 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             except Exception:  # noqa: BLE001 — doc_busy et al: leave it open
                 continue
             _unpublish(did)
-            _LAST_VOLUME.pop(did, None)
             closed.append(did)
         return closed
 
@@ -7538,13 +8065,13 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             `doc_id=` to a modeling tool to work in a specific one. The decision is made
             INSIDE doc_new (resume_if_open), under the engine's mint lock — two callers
             racing on the same name get one document, not two.
-          * NO name match, but the name is the NEXT VERSION of an open part — "holster_v4"
-            when "holster" or "holster_v3" is open and built -> resume THAT part; the reply
+          * NO name match, but the name is the NEXT VERSION of an open part — "bracket_v4"
+            when "bracket" or "bracket_v3" is open and built -> resume THAT part; the reply
             carries `resumed_by="version_series"`. A version bump is a REVISION of one
             design, and revisions live in this product's version history (plm_timeline /
             plm_rollback), never in extra documents: keep using the name the reply hands
-            back and edit the part in place. (Live 2026-08-05: one holster request left
-            NINE tabs — ruger_lcp_iwb_holster_v3 through _v11 — nine .step+ files in the
+            back and edit the part in place. (Live 2026-08-05: one bracket request left
+            NINE tabs — bracket_v3 through _v11 — nine .step+ files in the
             user's project folder, nine separate PLM items, and nine rows in the next
             launch's "Recover unsaved parts?" prompt.) An explicit token is required:
             "_v4"/"-rev2"/" gen3" are versions; a trailing bare number is not, because
@@ -7629,11 +8156,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                                     f"of the same name ({', '.join(dropped)})")
                 return _dumps(out)
             _CUR["doc_id"] = did
-            note_touched_doc(did)
-            # Seed the write-diff baseline: an empty part has zero volume, so the FIRST
-            # add_features reports a real volume delta ("0.0 -> X (+X)") instead of degrading
-            # to the volume-only "volume now X" branch of _write_diff.
-            _LAST_VOLUME[did] = 0.0
+            claim_process_doc(did)
             # doc_new UNIQUIFIES a colliding name. Returning the requested name would be a
             # lie the caller then repeats in every later name-based lookup, so report what
             # the document is actually called.
@@ -7656,9 +8179,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                                if out.get("note") else collision_note)
             # Land the (still empty) part in the user's project folder immediately so it
             # exists as a real, openable file; add_features refreshes it as geometry grows.
-            saved = _project_save(did, actual)
-            if saved:
-                out["saved_path"] = saved
+            persist_result(did, out, actual)
             return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -7666,221 +8187,216 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
+    @result_contract("Preview makes no edits; a running job is acceptance, not completion.")
+    def simplify_part(doc_id: Optional[str] = None,
+                      apply: Annotated[bool, Field(strict=True)] = False,
+                      refine: Annotated[bool, Field(strict=True)] = False) -> str:
+        """Preview or apply conservative, editable part-history simplifications.
+
+        Default apply=False returns the native history report, its revision, and the exact
+        proposed ops without modifying the part. Only candidates selected by the native
+        analysis are included; other findings and limitations need manual review.
+        apply=True obtains a fresh report and applies its eligible candidates in one
+        undoable batch, guarded by that report's base revision. Concurrent edits cause a
+        stale_revision error rather than a silent retry. No empty batch is submitted.
+
+        refine=True also proposes an editable refine feature on the current body; it is
+        not an import or a repair. The history preview does not test that operation:
+        native compilation checks topology and geometry when applied and may refuse it.
+        Adding the feature does not itself imply any faces or edges changed. A slow
+        apply can return status="running" and job_id; inspect get_job/wait_job for the
+        final result, and do not submit the batch a second time.
+        """
+        try:
+            if type(apply) is not bool or type(refine) is not bool:
+                raise ValueError("simplify_part: apply and refine must be true or false.")
+            d = _doc(doc_id)
+            report = cb.call("eval_model_history", {"doc_id": d})
+            if report.get("ok") is not True:
+                return _dumps({**report, "applied": False})
+            revision = report.get("revision")
+            fixes = report.get("safe_fixes")
+            if type(revision) is not int or revision < 0 or not isinstance(fixes, list):
+                return _dumps({
+                    "ok": False, "doc_id": d, "applied": False,
+                    "error": "Native history report lacks a valid revision or safe-fix list.",
+                    "model_history": report,
+                })
+
+            # Combine only native-selected feature ids into the native cleanup op.
+            ids, seen = [], set()
+            for fix in fixes:
+                feature_ids = fix.get("feature_ids") if isinstance(fix, dict) else None
+                if (not isinstance(feature_ids, list) or not feature_ids
+                        or any(not isinstance(fid, str) or not fid for fid in feature_ids)):
+                    return _dumps({
+                        "ok": False, "doc_id": d, "applied": False,
+                        "error": "Native history report has an invalid safe-fix candidate.",
+                        "model_history": report,
+                    })
+                for fid in feature_ids:
+                    if fid not in seen:
+                        seen.add(fid)
+                        ids.append(fid)
+            ops = ([{"op": "simplify_history", "features": ids}] if ids else [])
+            if refine:
+                ops.append({"op": "add_feature", "feature": {
+                    "type": "refine", "name": "Refine", "params": {}}})
+            blockers = list(report.get("blocked_fixes") or [])
+            if report.get("complete") is not True:
+                blockers.append("Native history analysis is incomplete; no batch can be applied.")
+            if not ops:
+                blockers.append("Native analysis found no eligible automatic history fixes.")
+            preview = {
+                "ok": True, "doc_id": d, "revision": revision, "base_revision": revision,
+                "status": "preview", "applied": False, "proposed_ops": ops,
+                "model_history": report, "blockers": blockers,
+                "limitations": report.get("limitations") or [],
+            }
+            if refine:
+                preview["refine_note"] = (
+                    "Refine has not been attempted; native compilation will validate it on apply.")
+            if not apply:
+                return _dumps(preview)
+            preview.pop("proposed_ops", None)
+            if report.get("complete") is not True:
+                preview.update(ok=False, status="incomplete",
+                               error="Cannot apply an incomplete native history analysis.")
+                return _dumps(preview)
+            if not ops:
+                preview["status"] = "no_changes"
+                return _dumps(preview)
+
+            def _apply_simplification() -> dict:
+                result = cb.call("doc_apply_ops", {
+                    "doc_id": d, "base_revision": revision, "ops": ops})
+                preview.pop("refine_note", None)
+                rebuild = result.get("rebuild") or {}
+                current_history = result.get("model_history")
+                doc_status = rebuild.get("doc_status")
+                if isinstance(doc_status, dict):
+                    nested_history = doc_status.pop("model_history", None)
+                    if not isinstance(current_history, dict):
+                        current_history = nested_history
+                if isinstance(current_history, dict):
+                    preview["model_history"] = current_history
+                else:
+                    preview.pop("model_history", None)
+                statuses = rebuild.get("feature_status") or []
+                failed = [row for row in statuses
+                          if isinstance(row, dict) and row.get("ok") is False]
+                if result.get("ok") is False or "rejected_tree" in result or failed:
+                    reasons = [f"{row.get('id') or '?'}: {row.get('error') or 'compile failed'}"
+                               for row in failed]
+                    result_revision = result.get("revision")
+                    changed = (False if "rejected_tree" in result else
+                               result_revision > revision if type(result_revision) is int else None)
+                    return {
+                        **preview, "ok": False,
+                        "status": "rejected" if changed is False else "failed",
+                        "applied": changed,
+                        "error": (result.get("error") or
+                                  ("Native batch rejected: " + "; ".join(reasons)
+                                   if reasons else "Native batch reported a failure.")),
+                        "failed_features": failed, "rebuild": rebuild,
+                        **{key: result[key] for key in ("code", "reason", "detail") if key in result},
+                    }
+                new_revision = result.get("revision")
+                if type(new_revision) is not int or new_revision < revision:
+                    return {
+                        **preview, "ok": False, "status": "unknown", "applied": None,
+                        "error": "Native batch returned no valid resulting revision.",
+                    }
+                if new_revision == revision:
+                    return {**preview, "status": "no_changes"}
+                out = {
+                    **preview, "revision": new_revision, "status": "applied", "applied": True,
+                    "applied_ops": ops, "id_map": result.get("id_map") or {},
+                    "rebuild": rebuild,
+                }
+                # This is a committed edit, even when it only changes datum/history state.
+                _publish_current(d)
+                _autosave(d)
+                persist_result(d, out)
+                return out
+
+            result = _solve_sync_or_handoff("simplify_part", _apply_simplification)
+            if result.get("status") == "running":
+                result.update(doc_id=d, base_revision=revision, applied=None)
+            return _dumps(result)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+
+    @mcp.tool()
+    @result_contract("Running with job_id means acceptance, not completion; inspect the job result.")
     def add_features(ops: Optional[list] = None, doc_id: Optional[str] = None,
                      background: bool = False, auto_define: bool = True,
                      **extra: Annotated[Any, Field(default=None)]) -> str:
-        """Apply a list of document ops to build/edit the part (the core modeling tool).
+        """Apply an atomic list of document ops to build or edit a part.
 
-        `ops` is a JSON array of ops from the CLOSED vocabulary (see OP VOCABULARY below
-        and cad_guide()) — e.g.
-          [{"op":"add_feature","feature":{"type":"box","name":"Block",
-              "params":{"length":{"value":40,"expr":null},"width":{"value":30,"expr":null},
-                        "height":{"value":20,"expr":null}}}},
-           {"op":"add_feature","feature":{"type":"fillet","name":"Round",
-              "params":{"radius":{"value":3,"expr":null}},"refs":{"edges":{"of":"edge"}}}}]
-        Geometry is addressed in plain words via `refs` (e.g. {"face":{"of":"face",
-        "side":"top"}}). Ops in one call may reference an earlier op in the SAME array as
-        "$<index>" (0-based); existing tree features by id ("f1").
+        Use ops=[{"op":"add_feature","feature":{"type":"box","name":"Block",
+        "params":{"length":40,"width":30,"height":20}}}] or edit_feature with an id
+        and changed params/refs. Selectors belong in feature.refs, beside params.
+        Reference earlier operations in this batch as "$<index>" (zero-based), or
+        existing features by ID. Dimensions accept numbers, unit strings and expressions.
+        Normalizations are reported in interpreted; validation failures reject the
+        entire batch. Inspect error and any regen_diagnosis before retrying.
+        If the batch's own features build but an existing later feature fails,
+        the edit is kept with auto_rollback.after, broken and hidden_features in
+        the reply. Those later features remain in the tree, unbuilt. Repair them
+        and apply set_rollback after:null; repeat if another feature fails. A
+        feature authored by this batch that fails or was not compiled in the
+        attempted rebuild rejects the whole batch. On an already-broken tree,
+        a partial repair is kept when it builds at least one formerly failed
+        feature without introducing new failures; an earlier unresolved failure
+        can leave that repaired feature behind the bar. Mixed batches with
+        global/destructive operations are rejected on failure.
+        auto_rollback.after is "start" when the bar is before every feature.
 
-        ARGUMENT SHAPES — the canonical call is `ops=[…]`; these are accepted too, and every
-        rewrite comes back in `interpreted` (prefer the canonical spelling once you know it):
-          ops={"op":…}           a single op dict — read as a one-element batch
-          ops="[{…}]"            the array as a JSON string (real JSON only: Python repr
-                                 with single quotes/tuples is a teaching error, not a guess)
-          feature= features= op= operations= actions= ops_json=
-                                 the batch under another name. Two DIFFERENT batches in one
-                                 call is an error — send exactly one.
-          ops=[{"type":"box",…}] bare feature dicts with no "op" — read as add_feature
-          {"op":"box",…}         a feature TYPE used as the op name — read as add_feature
-          type=… name=… params={…} diameter=… (no ops at all)
-                                 ONE feature spread over top-level kwargs; unrecognised
-                                 kwargs become that feature's params
-          name= identifier= part= part_name=   with NO type= in the call: the DOCUMENT to
-                                 build into (an open part's name resolves to its doc_id).
-                                 Supplying both a differing doc_id and one of these is an
-                                 error. A feature's name always goes in feature.name.
-          purpose= basis= rationale= note= …   design intent is ACCEPTED and ignored (it is
-                                 not a modeling parameter) — record reasoning with
-                                 ledger_note(), not here.
+        For primitive add_feature ops, params.mode is "new" (independent body),
+        "add"/"boss" (fuse touching bodies), or "cut" (subtract from the most recent
+        body). "new_body" is accepted as "new". merge:false overrides any valid
+        mode; merge:true does not override "new". Unknown modes are rejected even
+        with merge:false.
 
-        DIMENSIONS — write a size in whichever of these is most natural; all are accepted:
-          40                     a bare number, in DOCUMENT UNITS (millimetres)
-          "40"                   the same number as a string
-          {"value":40,"expr":null}   the canonical dim object (what get_part hands back)
-          "40mm" "2.5cm" "1in" '2.5"' "1ft" "5 ft 6 in" "0.5m" "20thou"
-                                 a number plus a unit — converted to mm for you, and the
-                                 conversion is echoed back in the response's `interpreted`
-          {"value":2,"unit":"in"}    the same thing with the unit in its own field
-          "width/2"              an EXPRESSION, evaluated by the engine against the part's
-                                 equations/globals (also {"value":0,"expr":"width/2"}).
-                                 Anything that isn't purely <number><unit> is left alone and
-                                 handed to the expression evaluator, so a real formula is
-                                 never mangled — but a unit inside a formula ("2*10mm") is
-                                 NOT understood: do the arithmetic or use one unit literal.
-        DIMENSION SHORTHAND (rewritten for you, and reported in `interpreted` — prefer the
-        canonical spelling once you know it):
-          "diameter" (or dia/d) on cylinder/sphere -> radius, HALVED. On a cone d1/d2 -> r1/r2;
-            on a torus major_diameter/minor_diameter -> major_r/minor_r.
-            NOT on hole / bolt_circle: those take a REAL "diameter" param and are never halved.
-          "size":[l,w,h] on a box -> length/width/height; "size":40 -> a 40 cube.
-        These forms work on any add_feature params and on edit_feature params (the unit
-        conversion; the per-type diameter alias needs the feature type, so it is add-only).
-        A JSON-encoded {"value":N,"expr":null} dimension from a tree readback is decoded
-        before evaluation too; literal text fields and ordinary expressions stay text.
-        Every rewrite this tool performs comes back as `interpreted`:[…] beside the result.
+        Face/edge SIDs in refs are checked against the current document before a batch
+        and may change after a mutation. Refresh selections with query_geometry or
+        describe_part between sequential edits; never guess a replacement for a stale
+        SID. A "$N" refers to an earlier feature operation, not an edge generated by
+        it. If a later step needs that new edge's SID, split the steps into calls and
+        re-query. Alternatively use a geometry query that selects the intended edge
+        from the target body at that feature.
 
-        SCHEMA DEFAULTS the engine requires and you may omit (all echoed in `interpreted`):
-          hole      params.style defaults to "simple" — the vocabulary is simple|tap|cbore|
-                    csink, and counterbore/c-bore/countersink/csk/tapped are mapped onto it.
-                    params.end defaults to "blind" when a numeric depth is present and
-                    "through_all" otherwise; through/thru are mapped onto "through_all".
-                    refs.face defaults to {"of":"face","side":"top"} (a bore has to be
-                    entered SOMEWHERE) — a direction vector picks the face instead. World
-                    [x,y,z] point(s) under origin/position/at (or [x,y,z] positions) become
-                    params.world_points — points on each bore AXIS, which the engine projects
-                    along refs.face's normal onto that face (refused when the axis misses
-                    it); positions=[[u,v]] stay FACE-LOCAL.
-          bolt_circle  a world [x,y,z] ring centre under center/at/origin becomes
-                    params.world_center (same projection rule); omitted = face centre.
-          sketch    missing/noncanonical entity ids become e<N>; canonical ids are retained,
-                    with constraint handles remapped. Missing construction defaults to false.
-                    Creation AND edit_feature replacements use the same entity/constraint
-                    dialect normalizer; omitted edit fields keep their current values.
-                    params.constraints defaults to [] on creation only. refs.plane accepts
-                    XY/XZ/YZ/top/front/right -> plane.top/plane.front/plane.right.
-                    NEW sketches and sketch_add_entity batches finish with sketch_fully_define
-                    in this SAME atomic ops batch (one revision). Author relations/dimensions
-                    first; it defines remaining DOF without blanket fix pins. Pass call-level
-                    auto_define=False, op.auto_define:false, or feature.params.auto_define:false
-                    to opt out (the feature option persists for later entity batches).
-                    A fix on a rectangle/polygon/polyline pins every expanded segment;
-                    other relations on a whole expanded shape are ambiguous and refuse.
-                    reorder_feature accepts same-batch "$N" in both id and before.
-          boolean   params.op accepts union/add/join -> "fuse", subtract/difference -> "cut",
-                    intersect -> "common"; targets/bodies/operands become params.a and .b.
-          extrude / revolve / loft / sweep
-                    params.mode defaults to "boss"; params.sketch:"<name>" becomes
-                    refs.profile=[{"kind":"region","sketch":…}]; revolve's params.axis:"Z"
-                    becomes refs.axis:"axis.z", and a revolve with no angle defaults to
-                    a full 360° revolution.
-          transform moves its body by default; only copy:true duplicates. body names a
-                    live body-owner feature id on a part, or a component id on an assembly.
-                    Missing/consumed refs refuse, never target another body. rotate accepts
-                    [x,y,z] plus angle or {"axis":[x,y,z],"angle":degrees}. Assembly motion
-                    composes in world space with placement; mate-owned poses refuse.
-          set_suppressed targets feature ids on parts and component ids on assemblies;
-                    value:true suppresses, value:false restores. Wrong-kind ids refuse.
-          any       feature TYPE synonyms are mapped (cube/cuboid/block -> box, cylindrical/
-                    rod/tube -> cylinder, ball -> sphere, cut_<shape> -> <shape> with
-                    mode:"cut", pocket -> extrude with mode:"cut"); an unknown type is
-                    rejected with the closest real types named. A ref that names a feature
-                    CREATED IN THIS SAME BATCH by its display name resolves to its "$N".
-                    at/axis/origin take a plain [x,y,z] — a {"value":[…]} wrapper around a
-                    coordinate is unwrapped, and at:"center" becomes [0,0,0].
+        Completed responses include revision, body_count (physical solids),
+        logical_member_count (compiled shape entries), volume_mm3 (the exact B-rep volume
+        when volume_basis is "brep_exact"; changes.bbox_mm and the volume delta use the
+        same exact basis) and feature status. `interpreted` lists spelling repairs;
+        `assumptions` lists anything read into the batch that can change what is built —
+        check it before moving on. An engine warning about an unevaluable global equation
+        arrives as equation_errors.
+        Native model-history diagnostics are included as compact compiler-style feedback;
+        call check_model_history for the complete findings and eligible fixes.
+        Successful fillet rows include features[].data.fillet with requested and effective
+        radii in mm and selected/covered edge counts. A bounded correction may adjust
+        the radii only if a valid result covers every selected edge; inspect the effective
+        values instead of assuming the request was used. A rejected part batch is atomic;
+        its candidate rows are diagnostics, not the live geometry.
+        See cad_guide(topic="fillet") for supported modes, selectors and failure limits.
+        Heavy operations may return status="running" with job_id: this is acceptance,
+        not a completed result. Use get_job or wait_job and inspect its nested result.
+        background=True requests immediate handoff; open docs are autosaved beforehand.
+        Sketch mutations return sketch_readbacks: read them before further sketch edits.
+        VERIFY AT MILESTONES: do not render after every mutation. Measure/inspect once the
+        features that realize a requirement are in (render when visual judgment is needed),
+        and run verify_battery before delivery.
 
-        OP VOCABULARY (closed — do NOT invent names):
-          ops (field op=…): add_feature, edit_feature, delete_feature, reorder_feature,
-            set_suppressed, set_folder, rename, set_units, set_material, set_appearance,
-            set_rollback, eq_set, eq_delete, sketch_add_entity, sketch_add_constraint,
-            sketch_edit_entity, sketch_delete_entity, sketch_delete_constraint, sketch_set_dim,
-            sketch_toggle_construction, sketch_convert, sketch_break_external_ref, sketch_trim,
-            sketch_extend, sketch_offset, sketch_fillet, sketch_chamfer, sketch_mirror_entities,
-            sketch_fully_define,
-            sketch_pattern_entities, sketch_move, sketch_rotate, asm_insert_component,
-            asm_edit_component, asm_delete_component, asm_add_mate, asm_edit_mate,
-            asm_delete_mate, asm_set_explode, copy_feature, paste_feature,
-            paste_feature_as_derived, sketch_paste_entities
-          feature types (ONLY under op=add_feature): box, cylinder, sphere, cone, torus,
-            sketch, extrude, revolve, loft, sweep, helix, fillet, chamfer, shell, draft,
-            hole, bolt_circle, linear_pattern, circular_pattern, mirror, transform, boolean,
-            rib, split, thread, text, import, script, plane, axis, point, csys, sketch3d, …
-          WRONG: {"op":"box",…} / {"op":"sketch",…} / {"op":"extrude",…} / {"op":"cylinder",…}
-          RIGHT: {"op":"add_feature","feature":{"type":"box"|"cylinder"|"sketch"|…, …}}
-          rename relabels ONE FEATURE and needs its id: {"op":"rename","id":"f1","name":"Base"}.
-            No op renames the part/document: name it at creation (new_part(name="…")) and
-            name its file with save_part(path="<name>.step+").
-          sketch_edit_entity changes the fields of ONE entity. Put the id and the changed fields
-            in "entity": {"op":"sketch_edit_entity","sketch":"f1","entity":{"id":"e1","p2":[60,0]}}.
-            The type cannot change. An unknown id, an empty patch or a wrong field is refused.
-          A leading {"op":"new_part","name":…} (or bare {"type":"new_part",…}) is also
-            accepted as a convenience: it mints the document and the rest of the batch
-            builds into it, so you can create-and-build in one call. Everywhere else
-            new_part is the standalone tool, not an op.
-          Live list: engine doc_list_ops (sourced from core/doc/op_registry — single source).
-          Call cad_guide() for worked examples and full param shapes.
-
-        RE-POSING AN ASSEMBLY COMPONENT — asm_edit_component moves a component ONLY while
-        nothing else owns its pose. It carries `transform` (row-major 4x4; at/rotate/angle
-        are accepted here and converted for you), `name`, `fixed`, `suppressed`, `hidden`.
-          * MATED component (not `fixed`, referenced by a live mate): its pose belongs to
-            the mate solver, and the rebuild overwrites any transform you write. This call
-            REFUSES with {"ok":false,"reason":"component_is_mated"} instead of reporting a
-            move that did not happen. Move it by driving the mate —
-            {"op":"asm_edit_mate","id":"m1","value":{"value":<mm|deg>}} then solve_mates()
-            — or explore poses with simulate_motion (never mutates the doc). To pose it
-            freely, suppress/delete the mate first, or set "fixed":true in the same batch.
-          * ALREADY-PLACED component: the engine seeds each solve from the previous one, so
-            a fresh transform can be discarded even with no mates; this call reads the pose
-            back and returns {"ok":false,"reason":"transform_not_applied"} when that
-            happens. Place components at insert time (asm_add_component at/rotate) or move
-            them through mates.
-
-        PRIMITIVE PLACEMENT + ORIENTATION (box/cylinder/sphere/cone/torus) — feature-level
-        keys beside "type"/"name"/"params", all optional. An unrecognised key is REJECTED,
-        never silently ignored, so use exactly these spellings:
-          "at":[x,y,z]           where its CENTRE goes (default: centred on the origin) — so
-                                 two coaxial cylinders of height h stack at "at" z = 0 and
-                                 z = h, not 0 and h/2. Also spelled "center"/"centre", which
-                                 mean the same thing and are rejected outright next to
-                                 "centered":false (then "at" is the BASE, not the centre).
-                                 May instead be a geometry query — "at":{"of":"face",
-                                 "side":"top"} places it at that face's centroid.
-          "at_offset":[dx,dy,dz] world-axis nudge added on top of "at".
-          "axis":[x,y,z] | "+x"|"-x"|"+y"|"-y"|"+z"|"-z"   which way it POINTS: the primitive's
-                                 natural local +Z is rotated onto "axis" (default "+z" = up).
-                                 This is how you get a sideways cylinder/cone/box without a
-                                 sketch — "centered":false then measures along the ROTATED axis.
-          "centered":false       put the base/corner at "at" instead of the centre (box corner,
-                                 cylinder/cone base); sphere/torus are always centred.
-          "mode":"boss"|"cut"    fuse into (default) or subtract from the current body.
-          "merge":false          start a SEPARATE new body instead of combining.
-          An off-origin sideways boss, end to end:
-          {"op":"add_feature","feature":{"type":"cylinder","name":"DrainSpout",
-              "params":{"radius":{"value":25,"expr":null},"height":{"value":60,"expr":null}},
-              "at":[200,0,40],"axis":[1,0,0],"centered":false,"mode":"boss"}}
-          WRONG: "placement":{"origin":[…],"direction":[…]} / "boolean":"union"
-          RIGHT: "at":[…], "axis":[…], "mode":"boss"
-          Selectors live in the feature's OWN "refs" — a SIBLING of "params", never inside it:
-          WRONG: "params":{"refs":{"profile":[…]},"depth":{…}}   (reaches no slot at all)
-          RIGHT: "refs":{"profile":[…]}, "params":{"depth":{…}}
-          A datum slot takes a bare reserved name: "plane.top"|"plane.front"|"plane.right",
-          "axis.x"|"axis.y"|"axis.z", "origin" — no wrapper object, no centroid.
-
-        Returns revision, body_count, volume_mm3, and per-feature status (ok / error / warning)
-        so you can immediately tell a dropped cut, a failed reference, or a stray extra body.
-        VERIFY LOOP (after every mutation): call render_part() or render_views() to SEE the
-        result, then measure_part()/query_geometry()/inspect_feature(target) on the changed
-        region, and before declaring done run verify_battery(doc_id). On a validation error
-        the whole batch is rejected — read `error`, fix the ops, call again. A rebuild-failure
-        response may also carry `regen_diagnosis`: an IP-18 fix-preview card (diagnosis +
-        editable fix_ops + verifier verdict) — record your verdict with regen_resolve(card, action).
-
-        SKETCH MUTATIONS: any batch that includes sketch_add_entity / sketch_add_constraint /
-        sketch_set_dim / sketch_fillet / … auto-appends one readback per touched sketch under
-        `sketch_readbacks[]`: `ascii_ruled` (the ruled ASCII picture, the only copy), `summary`
-        (closure / dof / ordered schedule), `grid` + `index` (the cell<->world contract
-        apply_ascii_edits resolves cell addresses against) and `findings`. READ that readback
-        before the next sketch edit. Before declaring a sketch done, call
-        render_sketch_ascii(sketch) + sketch_health(sketch) (or check_sketch) and require dof 0.
-
-        HEAVY OPS: a costly op (a global fillet/chamfer/shell/boolean on a many-edged body) is
-        run on a worker thread and AUTO-HANDED-OFF to the background if it overruns the call
-        budget, so it can never block past the MCP transport timeout (which would otherwise drop
-        the whole session). If that happens you get {job_id, status:"running"} — poll get_job().
-        All open docs are autosaved BEFORE the op, so nothing is lost even on a hard timeout.
-        Pass background=True to hand off immediately for an op you already know is heavy.
+        Use cad_guide(topic="<feature>") for focused parameters and selectors;
+        cad_guide(topic="ops") for the operation vocabulary, and
+        cad_guide(topic="add_features") for the complete mutation reference.
         """
         interpreted: list = []
+        assumptions: Optional[list] = None  # None until _split_notes runs on `interpreted`
         try:
             # FastMCP's schema builder turns a var-keyword parameter into a real (optional,
             # Annotated) field named after it, so a FastMCP call arrives carrying
@@ -7946,7 +8462,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 if series is not None:
                     created = series["doc_id"]
                     _CUR["doc_id"] = created
-                    note_touched_doc(created)
+                    claim_process_doc(created)
                     interpreted.append(
                         f'"{head_name}" is the next VERSION of the open part '
                         f'"{series.get("name")}" (doc_id={created}, '
@@ -7963,17 +8479,14 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                                         "name": head_mint_name, **_doc_new_scope()})
                 created = r.get("doc_id")
                 _CUR["doc_id"] = created
-                note_touched_doc(created)
+                claim_process_doc(created)
                 if r.get("reused"):
-                    # NEVER seed a fake 0.0 baseline on a part that already carries
-                    # geometry — the next write-diff would report "0.0 -> X" instead of
-                    # the true delta (same hazard _resumed_reply documents).
+                    # A resumed part can already contain geometry; do not seed a fake zero.
                     interpreted.append(
                         f'resumed the open part "{r.get("name") or head_name}" '
                         f'(doc_id={created}, {r.get("feature_count")} feature(s)) for this '
                         f"batch instead of minting a duplicate document")
                 else:
-                    _LAST_VOLUME[created] = 0.0
                     if head_mint_name != head_name:
                         mint_requested_name = head_name
                         mint_actual_name = r.get("name") or head_mint_name
@@ -7992,97 +8505,15 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                         f'calling it "{mint_actual_name}" from now on; send its build ops '
                         f"in the next call")
                 return _dumps(out)
-            # A flat face-pocket spec ({"op":"pocket","face":"top","shape":"rect",…}) is
-            # two features, so it expands BEFORE the op-element pass aliases it onto a
-            # bare, profile-less extrude.
-            ops = _expand_face_pockets(ops, interpreted)
-            # …and an extruded-polygon compound, before the vocabulary check rejects it.
-            ops = _expand_prisms(ops, interpreted)
-            # …and an invented `boolean_<word>` op, which is a whole boolean feature.
-            ops = _expand_compound_boolean_ops(ops, interpreted)
-            # Give every element an `op` (a bare feature dict is the single most common
-            # rejection in the field) and map every feature TYPE onto the engine vocabulary
-            # FIRST — the sketch/primitive passes below branch on the canonical type, so a
-            # sketch spelled "profile" used to slip past the sketch normalizer entirely.
-            ops = _normalize_op_elements(ops, interpreted)
-            # A feature's real data may sit BESIDE params/refs at its own top level —
-            # mirror the engine's own hoist (session.cpp:960-991) so every pass after this
-            # one, including the pattern/ref-slot passes right below, sees it in params.
-            ops = _hoist_feature_sibling_keys(ops, interpreted)
-            # asm_edit_component reads ONLY a 16-value `transform`, so the at/rotate pose
-            # dialect (asm_add_component's own signature) has to become that matrix here or
-            # the op applies "ok" and moves nothing.
-            ops = _normalize_asm_component_pose(ops, interpreted)
-            # asm_add_mate reads only op.mate with refs [{component, selector}]; resolve
-            # asm_mate's {component, query|sid} operand the same way asm_mate does.
-            ops = _normalize_asm_mate_ops(ops, d, interpreted)
-            # A pattern decides its own type from params.mode, so it must run BEFORE the
-            # alias table maps the generic word "pattern" onto linear_pattern regardless.
-            ops = _normalize_pattern_ops(ops, interpreted)
-            ops = _normalize_feature_types(ops, interpreted)
-            # The type is canonical only now, and the alias table is keyed by it. Runs
-            # BEFORE the ref migration so a renamed SELECTOR slot (mirror's `about` ->
-            # `plane`, sweep's `spine` -> `path`) still gets carried into refs below.
-            ops = _normalize_type_param_aliases(ops, interpreted)
-            # Geometry selectors written into `params` belong in `refs` — the
-            # model had the right edges, just the wrong bag. Runs before the
-            # sketch/primitive passes so they see the canonical layout.
-            ops = _migrate_ref_slots(ops, interpreted)
-            # An emptied selector slot ("none", []) means NO selection, which is an absent
-            # slot — and a boolean word on a primitive is params.mode, not a second feature.
-            ops = _drop_empty_ref_slots(ops, interpreted)
-            ops = _normalize_inline_boolean(ops, interpreted)
-            # An enum wrapped as a dimension ({"mode":{"value":"blind"}}) is
-            # rejected as non-numeric — unwrap before the dim passes run.
-            ops = _unwrap_enum_dims(ops, interpreted)
-            # A profile written INLINE on the feature that consumes it is two features —
-            # split it here, ahead of the sketch pass that normalizes the one we mint.
-            ops = _split_inline_profile_sketches(ops, interpreted)
-            # Model-robustness: accept the natural/flat sketch shape LLMs emit
-            # (L1 ids, start/end, dimensions[], top-level plane) by normalizing it
-            # to the engine's canonical schema before validation.
-            ops = _normalize_sketch_ops(ops, interpreted, d)
-            # …and the 2D EDITING ops beside it (trim/extend/offset/fillet/chamfer/
-            # mirror/pattern/move/rotate), whose key names session.cpp reads verbatim and
-            # whose ignored flags silently destroyed or stacked geometry.
-            ops = _normalize_sketch_edit_ops(ops, interpreted)
-            # Same, for the primitive placement/orientation dialect models emit
-            # (placement:{origin,direction}, boolean:"union") — rewritten to the
-            # canonical at/axis/mode/merge keys the engine actually accepts — for the
-            # dimension dialect ("25mm", diameter, box size), and for the schema
-            # requirements models forget (hole style/end/face, boolean op, extrude mode).
-            ops = _normalize_feature_ops(ops, interpreted)
-            # Supply the one ref the engine cannot infer (a hole's entry face).
-            ops = _supply_missing_refs(ops, interpreted)
-            # A bare face/edge sid in a ref slot -> the selector object the engine wants,
-            # verified against THIS document (one doc_query, only when a sid is present).
-            ops = _resolve_sid_refs(ops, d, interpreted)
-            # Finally, a ref that names a feature THIS batch creates -> its "$N" placeholder.
-            ops = _resolve_batch_name_refs(ops, interpreted)
-            # …and "the sketch I just made", which no name table can carry.
-            ops = _resolve_relative_profile_refs(ops, interpreted)
-            # …and a name an EARLIER call created, which no batch-local table can carry.
-            ops = _resolve_doc_name_refs(ops, d, interpreted)
-            # Indices are final here (every insert/expand/renumber pass has run), so a
-            # surviving "$N" can be range-checked against the batch the engine will see.
-            _validate_batch_placeholders(ops)
-            # LAST: operands are canonical only now, and this reads them.
-            ops = _unmerge_boolean_operands(ops, interpreted)
-            # …and the same problem for operands built by an EARLIER batch, which
-            # merge:false on a new feature cannot reach — that needs an edit_feature.
-            ops = _repair_merged_boolean_operands(ops, d, interpreted)
-            auto_define_indices: dict = {}
-            ops = _append_sketch_auto_define(
-                ops, auto_define=auto_define, doc_id=d, notes=interpreted,
-                index_map=auto_define_indices)
-            interpreted = _interpreted_notes(interpreted)
+            ops, auto_define_indices = _prepare_add_features_ops(
+                ops, d, auto_define, interpreted)
+            interpreted, assumptions = _split_notes(interpreted)
             # A transform edit on a component the mate solver owns is a guaranteed no-op
             # (the rebuild re-solves and writes the solved pose back). Refuse before
             # mutating anything, and name the ways to actually move it.
             _repose_refusal = _asm_repose_refusal(ops, d)
             if _repose_refusal is not None:
-                if interpreted:
-                    _repose_refusal["interpreted"] = interpreted
+                _attach_notes(_repose_refusal, interpreted, assumptions)
                 return _dumps(_repose_refusal)
 
             def _apply() -> dict:
@@ -8095,9 +8526,22 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                         raise
                     ckpt = None
 
-                # GSL Stage 1a — snapshot the PRE-op topology for the write-diff (W2).
-                before_hist = _face_hist(d)
-                before_vol = _LAST_VOLUME.get(d)
+                # The process-local volume cache is not revision-qualified: another writer,
+                # undo or configuration change can make it stale. Read the current compiled
+                # display snapshot instead, and compare revisions after the mutation.
+                before = None
+                try:
+                    before = cb.call("doc_activate", {"doc_id": d})
+                    if not isinstance(before, dict) or before.get("geometry_state") in (
+                            "last_good", "incomplete"):
+                        before = None
+                except Exception as exc:  # noqa: BLE001
+                    if getattr(exc, "code", None) == "engine_connection_lost":
+                        raise
+                before_exact = (before or {}).get("exact")
+                before_count = (before_exact or {}).get("face_count") if isinstance(before_exact, dict) else None
+                before_hist = ({"total": before_count} if isinstance(before_count, int)
+                               else _face_hist(d))
 
                 # Auto-preflight: dry-run on shadow clone before mutating.
                 # Freedom rule: fail verdict never blocks — we proceed regardless;
@@ -8136,13 +8580,16 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 feats = []
                 for status in fs:
                     feature = {"id": status.get("id"), "ok": status.get("ok"),
-                               "error": status.get("error"), "warning": status.get("warning")}
+                               "error": status.get("error"), "warning": status.get("warning"),
+                               "data": status.get("data"),
+                               "rolled_back": bool(status.get("rolled_back", False))}
                     meta = feature_meta.get(status.get("id"))
                     if meta:
                         feature.update(meta)
                     feats.append(feature)
                 bodies = (r.get("tess") or {}).get("bodies", [])
-                ok = all(s.get("ok") for s in fs) if fs else True
+                ok = (r.get("ok") is not False and "rejected_tree" not in r
+                      and (all(s.get("ok") for s in fs) if fs else True))
 
                 # READBACK: the engine reports an asm_edit_component pose as applied even
                 # when the mate-solve warm start (Session::asm_warm) overwrote it on the
@@ -8180,28 +8627,20 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
 
                 if not ok:
                     # PART compile rejection is atomic; other failures need a guarded rollback.
-                    reverted = bool(r.get("rejected_tree"))
+                    reverted = "rejected_tree" in r
                     if not reverted:
                         reverted = cb.revert_own_batch(d, ckpt, r.get("revision"))
-                    fail = [{"id": s.get("id"), "error": s.get("error")} for s in fs
-                            if not s.get("ok")]
+                    fail = [feature for feature in feats if not feature.get("ok")]
                     _publish_current(d)  # mirror the rolled-back (or current) state to the app
                     # The agent card renders `error` TRUNCATED (~160 chars) and never
                     # reads `failed_features`, so a constant "batch rejected" told the
                     # model nothing and it resent the identical ops. Carry the engine's
                     # actual per-feature reasons — named by feature — in `error` itself.
-                    fnames = {}
-                    idmap = r.get("id_map") or {}
-                    for i, o in enumerate(ops):
-                        f = o.get("feature") if isinstance(o, dict) else None
-                        fid = idmap.get("$" + str(i))
-                        if isinstance(f, dict) and f.get("name") and isinstance(fid, str) and fid:
-                            fnames[fid] = str(f["name"])
                     parts = []
                     for f in fail:
                         fid = str(f.get("id") or "?")
                         why = str(f.get("error") or "").strip() or "no reason reported"
-                        nm = fnames.get(f.get("id"))
+                        nm = f.get("name")
                         parts.append(f"{fid} ({nm}): {why}" if nm else f"{fid}: {why}")
                     head = ("batch rejected, nothing was kept" if reverted
                             else "batch failed; failed features were left in the tree")
@@ -8209,14 +8648,14 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                         "ok": False,
                         "doc_id": d,
                         "rolled_back": reverted,
-                        "error": (head + " — " + "; ".join(parts)) if parts else head,
+                        "error": ((head + " — " + "; ".join(parts)) if parts
+                                  else (r.get("error") or head)),
                         "failed_features": fail,
                         "features": feats,
                     }
-                    if interpreted:
-                        # The batch failed, so the rewrite is now a SUSPECT: say what we
-                        # read the ops as before the model re-sends the same spelling.
-                        fail_result["interpreted"] = interpreted
+                    # The batch failed, so the rewrite is now a SUSPECT: say what we read
+                    # the ops as before the model re-sends the same spelling.
+                    _attach_notes(fail_result, interpreted, assumptions)
                     if mint_requested_name is not None:
                         fail_result["requested_name"] = mint_requested_name
                         fail_result["note"] = (
@@ -8240,6 +8679,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                                 {"revision": r.get("revision", 0), "tree": failed_tree,
                                  "owner_map": r.get("owner_map") or {},
                                  "rebuild": {"feature_status": fs}},
+                                reference_document=({"revision": r.get("revision"), "tree": r["tree"]}
+                                                    if isinstance(r.get("tree"), dict) else None),
                                 engine_error=engine_err)
                             if diag.get("ok"):
                                 card = dict(diag["card"])
@@ -8253,17 +8694,40 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                         pass
                     return fail_result
 
+                # The engine reports the exact B-rep volume and bbox (reply.exact) beside the
+                # display-tessellation `volume`; prefer the exact figures and say which basis
+                # a number has.
+                exact_after = r.get("exact") if isinstance(r.get("exact"), dict) else None
+                exact_vol_after = (exact_after or {}).get("volume_mm3")
+                use_exact = isinstance(exact_vol_after, (int, float))
+                vol_after = exact_vol_after if use_exact else r.get("volume")
                 out = {
                     "ok": ok,
                     "doc_id": d,
                     "revision": r.get("revision"),
-                    "body_count": len(bodies),
-                    "volume_mm3": r.get("volume"),
+                    "body_count": None,
+                    "logical_member_count": len(bodies),
+                    "volume_mm3": vol_after,
+                    "volume_basis": (("brep_exact" if use_exact
+                                      else "approximate_display_tessellation")
+                                     if isinstance(vol_after, (int, float)) else "unavailable"),
                     "features": feats,
                     "id_map": _authored_batch_id_map(r.get("id_map") or {}, auto_define_indices),
                 }
-                if interpreted:
-                    out["interpreted"] = interpreted
+                if use_exact:
+                    out["bbox"] = exact_after.get("bbox")
+                    out["bbox_basis"] = "brep_exact"
+                if r.get("equation_errors"):
+                    out["equation_errors"] = r["equation_errors"]
+                if isinstance(r.get("warnings"), list) and r["warnings"]:
+                    out["engine_warnings"] = r["warnings"]
+                if r.get("auto_rollback"):
+                    out["auto_rollback"] = r["auto_rollback"]
+                    out["warning"] = r.get("warning")
+                history_feedback = _model_history_feedback(r)
+                if history_feedback is not None:
+                    out["model_history"] = history_feedback
+                _attach_notes(out, interpreted, assumptions)
                 if mint_requested_name is not None:
                     out["requested_name"] = mint_requested_name
                     out["note"] = (
@@ -8271,39 +8735,82 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                         f'revisions are tracked in PLM (plm_checkpoint / plm_timeline); '
                         f'this document was minted as "{mint_actual_name}", so keep '
                         f'calling it "{mint_actual_name}" from now on')
-                # GSL Stage 1a — SEMANTIC write-confirmation (W2): say what the op actually did
-                # ("added 2 faces (+2 cylinder); 2 new bore/hole(s); volume 24000→23435") or warn
-                # "no geometry change" so the model isn't left diffing a bare volume number.
-                # The engine's per-feature warnings and the part's overall size travel with it:
-                # a warning sitting alone in features[] among a column of nulls is not something
-                # a model acts on, and without a bbox "is the part the right size" costs a
-                # separate measure_part call the agent demonstrably never made.
-                vol_after = r.get("volume")
+                # Only compare a pre-edit snapshot from the immediately preceding revision.
+                # All writers increment the revision; unrelated writes invalidate the baseline.
+                rev_before = before.get("revision") if before else None
+                rev_after = r.get("revision")
+                baseline_current = (isinstance(rev_before, int)
+                                    and isinstance(rev_after, int)
+                                    and rev_after == rev_before + 1)
+                if use_exact:
+                    exact_before = (before or {}).get("exact")
+                    before_vol = ((exact_before or {}).get("volume_mm3")
+                                  if baseline_current and isinstance(exact_before, dict)
+                                  else None)
+                else:
+                    before_vol = before.get("volume") if baseline_current else None
+                warning_changes = _warning_changes(before if baseline_current else None, feats)
                 if ok:
+                    bbox_after = None
+                    after_hist = {}
+                    physical_count = None
+                    exact_bbox = (exact_after or {}).get("bbox")
+                    if isinstance(exact_bbox, dict):
+                        bbox_after = exact_bbox
+                    else:
+                        try:
+                            bbox_after = cb.call("doc_bbox", {"doc_id": d})
+                        except Exception as exc:  # noqa: BLE001
+                            if getattr(exc, "code", None) == "engine_connection_lost":
+                                raise
+                    face_count = (exact_after or {}).get("face_count")
+                    after_hist = ({"total": face_count} if isinstance(face_count, int)
+                                  else _face_hist(d))
+                    physical_count = (exact_after or {}).get("solid_count")
+                    if not isinstance(physical_count, int):
+                        try:
+                            physical_count = _physical_solid_count(
+                                cb.call("asm_world_bodies", {"doc_id": d}))
+                        except Exception as exc:  # noqa: BLE001
+                            if getattr(exc, "code", None) == "engine_connection_lost":
+                                raise
                     try:
-                        bbox_after = cb.call("doc_bbox", {"doc_id": d})
+                        # These RPCs have no revision of their own. Do not attach snapshots
+                        # from a later writer to this mutation's response.
+                        observed_rev = (cb.call("doc_tree", {"doc_id": d}) or {}).get("revision")
                     except Exception as exc:  # noqa: BLE001
                         if getattr(exc, "code", None) == "engine_connection_lost":
                             raise
-                        bbox_after = None
+                        observed_rev = None
+                    if not isinstance(rev_after, int) or observed_rev != rev_after:
+                        bbox_after, after_hist, physical_count = None, {}, None
+                    out["body_count"] = physical_count
+                    out["body_count_basis"] = "physical_solids"
                     try:
                         out["changes"] = _write_diff(
-                            before_hist, _face_hist(d), before_vol, vol_after,
-                            warnings=[f["warning"] for f in feats if f.get("warning")],
-                            bbox=bbox_after)
+                            before_hist if baseline_current else {}, after_hist,
+                            before_vol, vol_after,
+                            warnings=[f["warning"] for f in warning_changes.get("new_warnings", [])],
+                            bbox=bbox_after, exact=use_exact,
+                            edit_context=_non_body_edit_context(ops, tree, r.get("id_map") or {}))
+                        out["changes"].update(warning_changes)
+                        if use_exact and baseline_current and isinstance(exact_before, dict):
+                            before_box = exact_before.get("bbox")
+                            after_box = exact_after.get("bbox")
+                            if isinstance(before_box, dict) and isinstance(after_box, dict):
+                                sizes_before, sizes_after = before_box.get("size"), after_box.get("size")
+                                if (isinstance(sizes_before, list) and len(sizes_before) == 3
+                                        and isinstance(sizes_after, list) and len(sizes_after) == 3):
+                                    out["changes"]["bbox_size_delta_mm"] = [
+                                        b - a for a, b in zip(sizes_before, sizes_after)]
                     except Exception as exc:  # noqa: BLE001
                         if getattr(exc, "code", None) == "engine_connection_lost":
                             raise
                         out["changes"] = {
-                            "summary": "geometry changed but write-diff unavailable",
-                            "faces_delta": None,
+                            "summary": "body geometry comparison unavailable",
+                            "faces_delta": None, **warning_changes,
                         }
-                    if isinstance(vol_after, (int, float)):
-                        _LAST_VOLUME[d] = vol_after
-                    # B3 — best-effort AUTO-WARNING: if this batch added feature(s), check the
-                    # new batch against the rest of the tree for boss/cut overlap or a swallowed
-                    # boss (features filter keeps this bounded to new-batch x existing pairs, not
-                    # a full-tree scan). Never fails the batch — degrades to no warning.
+                    # Check batch-local feature-tool intersections, not material removal.
                     added_ids = [fid for i, op in enumerate(ops)
                                  if isinstance(op, dict) and op.get("op") == "add_feature"
                                  for fid in [(r.get("id_map") or {}).get(f"${i}")] if fid]
@@ -8317,20 +8824,29 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                             # ownership from every upstream feature: box→chamfer and
                             # sketch→cut→chamfer are normal examples.  Only the terminal added
                             # feature can still be an honest batch-local dead/no-op warning;
-                            # genuine swallowed/cut failures remain visible through `pairs`.
+                            # `pairs` describe intersections of feature tools.
                             dead_all = list(ov.get("dead_features") or [])
                             terminal_added_id = added_ids[-1]
                             dead = [fid for fid in dead_all if fid == terminal_added_id]
-                            if pairs or dead:
+                            if pairs or dead or ov.get("complete") is False:
                                 summary = ov.get("summary")
                                 if isinstance(summary, str) and len(dead) != len(dead_all):
-                                    old = f"; {len(dead_all)} dead feature(s)"
-                                    new = (f"; {len(dead)} dead feature(s)" if dead else "")
+                                    old = (f"; {len(dead_all)} feature(s) without surviving "
+                                           "owned faces")
+                                    new = (f"; {len(dead)} feature(s) without surviving owned faces"
+                                           if dead else "")
                                     summary = summary.replace(old, new, 1)
                                 out["overlap_warnings"] = {
                                     "summary": summary,
                                     "pairs": pairs,
                                     "dead_features": dead,
+                                    "basis": ov.get("basis") or "unknown",
+                                    "note": ov.get("note") or (
+                                        "The engine did not identify the overlap volume basis; "
+                                        "do not treat these values as measured material removal."),
+                                    "complete": ov.get("complete"),
+                                    "unavailable_features": ov.get("unavailable_features") or [],
+                                    "failed_pairs": ov.get("failed_pairs") or [],
                                 }
                         except Exception as exc:  # noqa: BLE001
                             if getattr(exc, "code", None) == "engine_connection_lost":
@@ -8355,19 +8871,15 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                         except Exception as exc:  # noqa: BLE001
                             if getattr(exc, "code", None) == "engine_connection_lost":
                                 raise
-                # Push the updated part to the desktop app's viewport (if it's open) so the user
-                # watches it build. Best-effort; only when something actually got built.
-                if ok and bodies:
-                    pub = _publish_current(d)
-                    if pub:
-                        out["shown_in_app"] = True
-                    _autosave(d)  # persist so a server restart can recover this doc
+                # Refresh a previously presented legacy handoff; persistence is independent.
+                if ok:
+                    if bodies or r.get("auto_rollback"):
+                        _publish_current(d)
+                    _autosave(d)  # sketch-only batches persist too, so recover_parts finds them
                 # Refresh the deliverable .step+ in the user's project folder so the file on
                 # disk tracks the latest revision (no-op unless the workspace is configured).
                 if ok:
-                    saved = _project_save(d)
-                    if saved:
-                        out["saved_path"] = saved
+                    persist_result(d, out)
                 # Attach preflight advisory items and log override event.
                 if _pf_result:
                     adv_items = _pf_result.get("advisory_items") or []
@@ -8403,54 +8915,97 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                             fid = id_map.get(f"${i}")
                             if isinstance(fid, str) and fid not in sids:
                                 sids.append(fid)
-                        if sids:
-                            readbacks = []
-                            for sid in sids[:4]:
-                                rb = live_sketch_readback(d, sid)
-                                if rb:
-                                    readbacks.append(rb)
-                            if readbacks:
-                                out["sketch_readbacks"] = readbacks
-                                # Say each thing ONCE. Live 2026-07-30: this block also
-                                # set out["ascii_readback"] = readbacks[0] (a full 7.6k
-                                # clone of the object already in sketch_readbacks),
-                                # out["ascii"] + out["ascii_block"] (two more copies of
-                                # the same drawing) and out["sketch_summary"] (a second
-                                # copy of the 3k summary) — 13k of a 25.9k reply was
-                                # duplicate bytes. The readback lives at exactly one
-                                # path now, and the hint names it.
-                                out["readback_hint"] = (
-                                    "sketch_readbacks[i] carries the ruled ASCII picture "
+                        readback_cap = 4
+                        readbacks = [live_sketch_readback(d, sid) for sid in sids[:readback_cap]]
+                        if sids[readback_cap:]:
+                            # Never a silent cap: name the sketches that got no readback.
+                            out["sketch_readbacks_omitted"] = len(sids) - readback_cap
+                            out["sketch_readbacks_omitted_ids"] = sids[readback_cap:]
+                        good = [rb for rb in readbacks if rb.get("ok")]
+                        if readbacks:
+                            out["sketch_readbacks"] = readbacks
+                            # Say each thing ONCE. Live 2026-07-30: this block also
+                            # set out["ascii_readback"] = readbacks[0] (a full 7.6k
+                            # clone of the object already in sketch_readbacks),
+                            # out["ascii"] + out["ascii_block"] (two more copies of
+                            # the same drawing) and out["sketch_summary"] (a second
+                            # copy of the 3k summary) — 13k of a 25.9k reply was
+                            # duplicate bytes. The readback lives at exactly one
+                            # path now, and the hint names it.
+                            hint = ("sketch_readbacks[i] carries the ruled ASCII picture "
                                     "(ascii_ruled), the constraint summary, grid/index for "
                                     "cell-addressed edits, and findings. "
-                                    + str(readbacks[0].get("hint") or ""))
-                            by_sketch = {rb["sketch_id"]: rb for rb in readbacks}
-                            definitions = []
-                            for index, op in enumerate(ops):
-                                if op.get("op") != "sketch_fully_define":
-                                    continue
-                                sid = id_map.get(op.get("sketch"), op.get("sketch"))
-                                feature = next((row for row in tree.get("features") or []
-                                                if row.get("id") == sid), {})
-                                constraints = (feature.get("params") or {}).get("constraints") or []
-                                added = sketch_define_additions(id_map, index, constraints)
-                                rb = by_sketch.get(sid)
-                                health = rb if rb is not None else cb.call(
-                                    "sketch_health", {"doc_id": d, "sketch": sid})
-                                definition = {"sketch": sid, **added, "dof": health.get("dof")}
-                                definitions.append(definition)
-                                if rb is not None:
-                                    rb.setdefault("definition", []).append(definition)
-                            if definitions:
-                                out["sketch_definitions"] = definitions
+                                    + (str(good[0].get("hint") or "") if good else ""))
+                            failed_ids = [rb.get("sketch_id") for rb in readbacks
+                                          if not rb.get("ok")]
+                            if failed_ids:
+                                hint += (f" READBACK FAILED for {failed_ids} (ok:false entries "
+                                         "carry the error) — call check_sketch/sketch_health "
+                                         "on them before trusting their state.")
+                            if "sketch_readbacks_omitted_ids" in out:
+                                hint += (f" NO readback for {out['sketch_readbacks_omitted_ids']} "
+                                         "(cap of 4 per batch) — call check_sketch on them.")
+                            out["readback_hint"] = hint
+                        by_sketch = {rb["sketch_id"]: rb for rb in good}
+                        # op_reports[].index is the ENGINE batch position (after auto-define
+                        # ops were appended); map it back to the caller's op index.
+                        authored_of = {int(final[1:]): int(authored[1:])
+                                       for authored, final in auto_define_indices.items()
+                                       if isinstance(authored, str) and isinstance(final, str)
+                                       and authored[1:].isdigit() and final[1:].isdigit()}
+                        reports = {row["index"]: row for row in r.get("op_reports") or []
+                                   if isinstance(row, dict) and isinstance(row.get("index"), int)}
+                        definitions = []
+                        for index, op in enumerate(ops):
+                            if not isinstance(op, dict) or op.get("op") != "sketch_fully_define":
+                                continue
+                            sid = id_map.get(op.get("sketch"), op.get("sketch"))
+                            feature = next((row for row in tree.get("features") or []
+                                            if row.get("id") == sid), {})
+                            constraints = (feature.get("params") or {}).get("constraints") or []
+                            added = sketch_define_additions(id_map, index, constraints)
+                            rb = by_sketch.get(sid)
+                            health = rb
+                            health_error = None
+                            if health is None:
+                                try:
+                                    health = cb.call("sketch_health", {"doc_id": d, "sketch": sid})
+                                except Exception as exc:  # noqa: BLE001
+                                    if getattr(exc, "code", None) == "engine_connection_lost":
+                                        raise
+                                    health, health_error = {}, str(exc) or type(exc).__name__
+                            report = reports.get(index, {})
+                            definition = {"sketch": sid, **added, "dof": health.get("dof"),
+                                          **{key: report[key] for key in
+                                             ("relations_added", "dimensions_added", "dof_before",
+                                              "dof_after", "notes", "rounded")
+                                             if key in report}}
+                            if index in authored_of:
+                                definition["op_index"] = authored_of[index]
+                            else:
+                                definition["auto_appended"] = True
+                            if health_error:
+                                definition["health_error"] = health_error
+                            definitions.append(definition)
+                            if rb is not None:
+                                rb.setdefault("definition", []).append(definition)
+                        if definitions:
+                            out["sketch_definitions"] = definitions
+                        # Everything else the engine reported about sketch ops: delete
+                        # reports (dropped_constraints) and normalisation notes.
+                        others = [{**row, "index": authored_of.get(row["index"], row["index"])}
+                                  for row in reports.values() if row.get("op") != "sketch_fully_define"]
+                        if others:
+                            out["sketch_op_reports"] = others
                     except Exception as exc:  # noqa: BLE001
                         if getattr(exc, "code", None) == "engine_connection_lost":
                             raise
-                        pass
+                        out["sketch_readbacks_error"] = (
+                            f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__)
                 return out
 
             if background:
-                jid = _start_job("add_features", _apply)
+                jid = _start_job("add_features", _apply, doc_id=d)
                 out = {"ok": True, "doc_id": d, "job_id": jid, "status": "running",
                        "created_doc": created,
                        "note": f"applying {len(ops)} op(s) in the background — "
@@ -8467,10 +9022,9 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # Run on a worker thread with auto-handoff: a fast batch returns inline exactly as
             # before; a heavy one that overruns the budget keeps running and returns a job_id so
             # the transport call returns in time and the session survives.
-            raw = _solve_sync_or_handoff("add_features", _apply)
+            raw = _solve_sync_or_handoff("add_features", _apply, doc_id=d)
             if isinstance(raw, dict) and raw.get("code") == "engine_connection_lost":
-                if interpreted:
-                    raw["interpreted"] = interpreted
+                _attach_notes(raw, interpreted, assumptions)
                 return _dumps(raw)
             if created and isinstance(raw, dict):
                 raw["created_doc"] = created
@@ -8490,16 +9044,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # {"ok":false,"error":…}, so the outer `except` never sees a rejected batch. Echo
             # the rewrites here too: a validation rejection is exactly when the model needs to
             # know how its arguments were read before it re-sends the same spelling.
-            if (isinstance(raw, dict) and not raw.get("ok") and interpreted
-                    and "interpreted" not in raw):
-                raw["interpreted"] = interpreted
-            # mega-8 F7: enrich thin unknown-op errors with closest + cad_guide
-            # (C++ path sometimes returns only "unknown op 'cylinder'").
-            try:
-                from services.mcp import op_vocab as _ov  # noqa: PLC0415
-                raw = _ov.enrich_unknown_op_error(raw)
-            except Exception:  # noqa: BLE001
-                pass
+            if isinstance(raw, dict) and not raw.get("ok"):
+                _attach_notes(raw, interpreted, assumptions)
             # A ref that never RESOLVED (no such edge/face, a query matching zero/many, a
             # prose phrase the normalizer declined to guess at) is exactly when the model
             # is flying blind: attach a real, capped inventory of what the document
@@ -8515,12 +9061,15 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # were read: an interpretation it did not expect is the first thing to check
             # before it re-sends the identical spelling.
             raw_err = _err(e)
-            notes = _interpreted_notes(interpreted)
-            if not notes:
+            if assumptions is None:  # the failure came before the notes were split
+                notes, assumed = _split_notes(interpreted)
+            else:
+                notes, assumed = interpreted, assumptions
+            if not notes and not assumed:
                 return raw_err
             try:
                 obj = json.loads(raw_err)
-                obj["interpreted"] = notes
+                _attach_notes(obj, notes, assumed)
                 return _dumps(obj)
             except Exception:  # noqa: BLE001
                 return raw_err
@@ -8528,27 +9077,49 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
-    def get_part(doc_id: Optional[str] = None, summary: bool = False) -> str:
-        """Return the feature tree (features, parameters, ids) + revision for editing.
+    @result_contract("Features are at tree.features; summary is lossy, including omitted refs.")
+    def get_part(doc_id: Optional[str] = None, summary: bool = False,
+                 feature_ids: Optional[list[str]] = None, limit: int = 100,
+                 cursor: int = 0) -> str:
+        """Return a part's revision and feature tree at tree.features.
 
-        Both forms share one layout: {ok, doc_id, revision, tree:{features:[...]}}, the same
-        `tree` every engine read returns, so result["tree"]["features"] is the feature list
-        whichever form you asked for.
+        summary=True elides large geometry and strings and truncates long lists
+        (reported in truncated_lists); never use summary parameters for edits.
+        The default returns complete data and owner_map for round-trip editing.
+        feature_ids selects complete matching records in document order, omitting
+        other tree sections and owner_map; unknown IDs fail and [] selects none.
+        Summary remains lossy with feature_ids. Both forms retain rollback_after
+        when active, indicating later features are not built.
 
-        summary=True returns a LIGHTWEIGHT tree — feature id/name/type/suppressed + parameters,
-        with heavy embedded geometry (the import features' base64 BREP blobs) and any oversized
-        string value ELIDED, plus summary:true and feature_count. Use it on big
-        assemblies/imported parts where the full tree blows the tool token limit (a 600k-char
-        part lists in a few KB). Every value keeps its type. A list with more than 64 items
-        keeps only its first 16 items. Its feature then gets
-        truncated_lists:{"params.entities": {"kept": 16, "total": 312}}, keyed by the path
-        in the feature. Do not send a summary params value back in an edit. Read the full
-        form for complete lists. The full (default) form carries the complete tree verbatim
-        for round-trip editing, plus owner_map (feature id -> owned faces/edges).
+        Page using limit (1..500), zero-based cursor and next_cursor. Pages are
+        not snapshots; restart if revision changes.
         """
         try:
+            if type(limit) is not int or not 1 <= limit <= 500 or type(cursor) is not int or cursor < 0:
+                raise ValueError("limit must be an integer from 1 to 500 and cursor a nonnegative integer")
             d = _doc(doc_id)
+            cb.lease_document(d)
             r = cb.call("doc_tree", {"doc_id": d})
+            source_tree = r.get("tree") or {}
+            rollback = ({"rollback_after": source_tree["rollback_after"]}
+                        if source_tree.get("rollback_after") is not None else {})
+            if feature_ids is not None:
+                requested = set(feature_ids)
+                feats = (r.get("tree") or {}).get("features") or []
+                present = {f.get("id") for f in feats if isinstance(f, dict)}
+                missing = list(dict.fromkeys(fid for fid in feature_ids if fid not in present))
+                if missing:
+                    return _dumps({"ok": False, "doc_id": d, "revision": r.get("revision"),
+                                   "error": "Unknown feature IDs", "missing_feature_ids": missing})
+                selected = [f for f in feats if isinstance(f, dict) and f.get("id") in requested]
+                r = {"revision": r.get("revision"), "tree": {"features": selected, **rollback}}
+            tree = r.get("tree") or {}
+            features = tree.get("features") or []
+            total = len(features)
+            page = features[cursor:cursor + limit]
+            page_info = {"total": total, "cursor": cursor, "limit": limit,
+                         "next_cursor": cursor + len(page) if cursor + len(page) < total else None}
+            r = {**r, "tree": {**tree, "features": page}, "feature_page": page_info}
             if not summary:
                 return _dumps({"ok": True, "doc_id": d, **r})
 
@@ -8593,8 +9164,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # (2026-10-10: summary reads taught `["features"]`, then a full read raised
             # KeyError; c237 hit the reverse with `["tree"]`).
             return _dumps({"ok": True, "doc_id": d, "revision": r.get("revision"),
-                           "summary": True, "feature_count": len(out_feats),
-                           "tree": {"features": out_feats}})
+                           "summary": True, "feature_count": total, "feature_page": page_info,
+                           "tree": {"features": out_feats, **rollback}})
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -8679,12 +9250,20 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             ops = []
             if material_key:
                 identity = {"op": "set_material", "key": material_key}
+                if unsupported_identity:
+                    # No registry row: the engine stores such a key verbatim only when told it
+                    # is an identity record, and rejects unknown keys otherwise.
+                    identity["identity_only"] = True
                 if body is not None:
                     identity["id"] = targets[0]
                 ops.append(identity)
             ops.extend({"op": "set_appearance", "id": key, **ap,
                         **({"faces": faces} if faces is not None else {})} for key in targets)
             r = cb.call("doc_apply_ops", {"doc_id": d, "ops": ops})
+            failure = _engine_reply_failure(r)
+            if failure:
+                return _dumps({**failure, "doc_id": d, "bodies": targets,
+                               "material_key": material_key})
             out = {"ok": True, "doc_id": d, "bodies": targets,
                    "appearance": ap, "material_key": material_key,
                    "engineering_material_set": bool(material_key),
@@ -8707,90 +9286,66 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
 
 
 
-    @mcp.tool()
-    def undo(doc_id: Optional[str] = None) -> str:
-        """Undo the last edit on the current part.
+    if os.environ.get("CHUDWARE_UNDO_AGENTS") == "1":
+        # The switch the daemon itself reads (core/hostd/doc_registry.cpp, preCall): without
+        # it the daemon denies doc_undo/doc_redo to mcp/agent clients, so a registered tool
+        # could only ever fail. Read at registration time, like the daemon's own env.
+        @mcp.tool()
+        def undo(doc_id: Optional[str] = None) -> str:
+            """Undo the last edit on the current part.
 
-        Multi-user note: from mcp/agent connections the daemon UNCONDITIONALLY denies
-        this (code ``undo_denied``) — there is no agent-side way around it, and
-        retrying will fail identically. The refusal below is caught and expanded into
-        full recovery guidance; the callable tools are ``add_features(ops=[{"op":
-        "delete_feature"|"edit_feature", ...}])`` to remove/alter a feature you just
-        added, or ``plm_timeline()`` / ``plm_rollback(to="-1")`` to roll the whole
-        document back. ``doc_checkpoint``/``doc_revert`` are engine-internal RPCs with
-        no tool binding — do not try to call them.
-        Set env ``CHUDWARE_UNDO_AGENTS=1`` only as a deliberate kill-switch.
+            Registered only because CHUDWARE_UNDO_AGENTS=1 is set (the same switch the daemon
+            reads); by default the daemon denies undo to mcp/agent connections (``undo_denied``)
+            and this tool is not offered. Without it: add_features(ops=[{"op":
+            "delete_feature"|"edit_feature", ...}]) removes/alters a feature you just added,
+            and plm_timeline() / plm_rollback(to="-1") roll the whole document back.
 
-        VERIFY LOOP: after undo, call render_part()/render_views() (and inspect_feature on the
-        affected region) to confirm the rolled-back state, then verify_battery before done.
-        """
-        try:
-            d = _doc(doc_id)
-            r = cb.call("doc_undo", {"doc_id": d})
-            _publish_current(d)
-            return _dumps(r)
-        except Exception as e:  # noqa: BLE001
-            return _err(e)
+            After undo, confirm the rolled-back state with get_part / measure_part.
+            """
+            try:
+                d = _doc(doc_id)
+                r = cb.call("doc_undo", {"doc_id": d})
+                _publish_current(d)
+                return _dumps(r)
+            except Exception as e:  # noqa: BLE001
+                return _err(e)
 
+        @mcp.tool()
+        def redo(doc_id: Optional[str] = None) -> str:
+            """Redo the last undone edit on the current part.
 
+            Registered only because CHUDWARE_UNDO_AGENTS=1 is set (the same switch the daemon
+            reads); by default the daemon denies redo to mcp/agent connections (``undo_denied``)
+            and this tool is not offered. See undo for the alternatives.
 
-    @mcp.tool()
-    def redo(doc_id: Optional[str] = None) -> str:
-        """Redo the last undone edit on the current part.
-
-        Multi-user note: from mcp/agent connections the daemon UNCONDITIONALLY denies
-        this (code ``undo_denied``) — there is no agent-side way around it, and
-        retrying will fail identically. The refusal below is caught and expanded into
-        full recovery guidance; the callable tools are ``add_features(ops=[{"op":
-        "delete_feature"|"edit_feature", ...}])`` to remove/alter a feature you just
-        added, or ``plm_timeline()`` / ``plm_rollback(to="-1")`` to roll the whole
-        document back. ``doc_checkpoint``/``doc_revert`` are engine-internal RPCs with
-        no tool binding — do not try to call them.
-        Set env ``CHUDWARE_UNDO_AGENTS=1`` only as a deliberate kill-switch.
-
-        VERIFY LOOP: after redo, call render_part()/render_views() to SEE the restored state
-        and verify_battery before declaring done.
-        """
-        try:
-            d = _doc(doc_id)
-            r = cb.call("doc_redo", {"doc_id": d})
-            _publish_current(d)
-            return _dumps(r)
-        except Exception as e:  # noqa: BLE001
-            return _err(e)
+            After redo, confirm the restored state with get_part / measure_part.
+            """
+            try:
+                d = _doc(doc_id)
+                r = cb.call("doc_redo", {"doc_id": d})
+                _publish_current(d)
+                return _dumps(r)
+            except Exception as e:  # noqa: BLE001
+                return _err(e)
 
 
 
     @mcp.tool()
     def show_in_app(doc_id: Optional[str] = None) -> str:
-        """Make sure the OPEN Chudware desktop app can show the part to the user.
+        """Request presentation of an open document without changing the user's focus.
 
-        Daemon mode (the default): the app shares the engine's documents live — every open
-        part is mirrored in its own tab and redrawn after each change, so there is nothing to
-        push. The reply is {ok, doc_id, name, revision, live: true}. It does not switch the
-        user's active tab: the app reveals an agent part's tab by itself, waits while the user
-        is mid-edit, and keeps a tab the user closed closed.
-        Legacy in-process engine (CHUDWARE_ENGINE_DAEMON=0): writes the part to the handoff
-        folder the app loads — shown whenever the app next opens if it is not running now.
+        In daemon mode the shared document remains live. In legacy in-process mode
+        a handoff copy is published and refreshed after later edits. A successful
+        request does not imply that an app is connected or that a dismissed tab reopened.
         """
         try:
             d = _doc(doc_id)
             if cb.active_daemon_mode():
-                # The GUI mirrors daemon docs from hostd's doc.opened/doc.changed events and
-                # ignores handoff files, so _publish_current deliberately does nothing here;
-                # reporting that as "could not publish" failed a doc the user could see (c247).
-                entry = next((e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
-                              if isinstance(e, dict) and e.get("doc_id") == d), None)
-                if entry is None:
-                    return _dumps({"ok": False, "doc_id": d,
-                                   "error": f"{d} is not open in the shared engine"})
-                return _dumps({"ok": True, "doc_id": d, "name": entry.get("name"),
-                               "revision": entry.get("revision"), "live": True,
-                               "note": "The desktop app mirrors this document live; "
-                                       "no publish is needed."})
-            pub = _publish_current(d)
+                return _dumps(cb.call("doc_present", {"doc_id": d}))
+            pub = _publish_current(d, _present=True)
             if not pub:
-                return _dumps({"ok": False, "error": "could not publish (no geometry yet?)"})
+                return _dumps({"ok": False, "doc_id": d,
+                               "error": "could not publish (no geometry or handoff failed)"})
             return _dumps({"ok": True, "doc_id": d, **pub})
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -8798,10 +9353,18 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
-    def list_parts() -> str:
-        """List all open part/drawing documents in this engine session."""
+    def list_parts(limit: int = 100, cursor: int = 0) -> str:
+        """List open documents in pages; cursor is a zero-based offset and limit is 1..500."""
         try:
-            return _dumps(cb.call("doc_list", {}))
+            if type(limit) is not int or not 1 <= limit <= 500 or type(cursor) is not int or cursor < 0:
+                raise ValueError("limit must be an integer from 1 to 500 and cursor a nonnegative integer")
+            result = cb.call("doc_list", {})
+            docs = result.get("docs") or []
+            page = docs[cursor:cursor + limit]
+            cb.lease_documents(page)
+            return _dumps({**result, "docs": page, "total": len(docs), "cursor": cursor,
+                           "limit": limit, "next_cursor": (
+                               cursor + len(page) if cursor + len(page) < len(docs) else None)})
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -8811,55 +9374,51 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
     def close_part(doc_id: Optional[str] = None, discard: bool = False) -> str:
         """Close a part document and free it. Clears the current part if it was current.
 
-        SAVE DISCIPLINE: docs you (the AI) create are AI-owned. The desktop app never warns
-        the user about YOUR unsaved docs — so YOU are responsible for saving deliverables
-        before closing. If the doc has unsaved changes this returns {"ok": false,
-        "code": "unsaved_changes"} WITHOUT closing; call save_part(path=...) to deliver it,
-        or close_part(discard=True) to intentionally drop scratch work.
-
-        If another client (e.g. the user, who adopted this doc by editing it) is still
-        editing, the daemon degrades the close to a detach and returns {"detached": true} —
-        your live view drops but their doc lives on.
+        Agent changes are saved automatically when possible. A document with outstanding
+        human edits is not automatically saved or destroyed. discard=True releases this
+        exact document; other clients keep it, and dirty work may be retained for recovery.
         """
         try:
             d = _doc(doc_id)
             if not discard:
-                # "Undelivered work" = mutated since the last save_part/export_part. Revision is
-                # the reliable signal (the engine `dirty` flag is cleared by the MCP autosave's
-                # doc_save to a temp path, so it would false-negative here).
-                name = d
-                for e in cb.call("doc_list", {}).get("docs", []):
-                    if isinstance(e, dict) and e.get("doc_id") == d:
-                        name = e.get("name") or d
-                        break
-                rev = _doc_revision(d)
-                delivered = _LAST_DELIVER_REV.get(d)
-                if rev is not None and rev > 0 and delivered != rev:
-                    return _dumps({
-                        "ok": False, "code": "unsaved_changes", "doc_id": d, "dirty": True,
-                        "message": f"{name} has unsaved changes — call save_part(path=...) "
-                                   f"to deliver it, or close_part(discard=True) to drop it",
-                    })
-            r = cb.call("doc_close", {"doc_id": d})
+                rows = (cb.call("doc_list", {}) or {}).get("docs", [])
+                entry = next((e for e in rows if isinstance(e, dict)
+                              and e.get("doc_id") == d), None)
+                if entry is None:
+                    return _dumps({"ok": False, "code": "document_not_found", "doc_id": d})
+                rev, saved_rev = entry.get("revision"), entry.get("saved_revision")
+                unsaved = bool(entry.get("dirty") or entry.get("human_dirty") or (
+                    type(rev) is int and type(saved_rev) is int and rev > saved_rev))
+                if unsaved:
+                    result = {"ok": True, "doc_id": d}
+                    persist_result(d, result)
+                    if result.get("persist_error"):
+                        return _dumps({"ok": False, "code": "unsaved_changes", "doc_id": d,
+                                       "dirty": True, "persist_error": result["persist_error"]})
+                    current = next((e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
+                                    if isinstance(e, dict) and e.get("doc_id") == d), {})
+                    if not current:
+                        return _dumps({"ok": False, "code": "document_not_found", "doc_id": d})
+                    rev, saved_rev = current.get("revision"), current.get("saved_revision")
+                    if (current.get("dirty") or current.get("human_dirty") or
+                            (type(rev) is int and type(saved_rev) is int and rev > saved_rev)):
+                        return _dumps({"ok": False, "code": "unsaved_changes", "doc_id": d,
+                                       "dirty": True, "message": "Document changed during save."})
+            method = "doc_discard" if discard and cb.active_daemon_mode() else "doc_close"
+            r = cb.call(method, {"doc_id": d})
+            if r.get("ok") is False:
+                return _dumps({**r, "doc_id": d})
             # A completed close (including daemon detach while another client keeps the
             # document alive) ends this process's ownership. Drop every per-doc cache now;
             # the unsaved-changes refusal above returns before reaching this point.
-            _LAST_VOLUME.pop(d, None)
             _PROCESS_DOCS.discard(d)
-            if d in _TOUCHED_DOCS:
-                _TOUCHED_DOCS.remove(d)
+            forget_touched_doc(d)
             if r.get("detached"):
-                # Another client (or this agent run itself) keeps it alive: our view
-                # detached, the doc lives on. An explicit discard must survive that — the
-                # terminal save sweep would otherwise write the dropped state back over its
-                # file (live 2026-09-24: a stale Wheel End overwrote the rebuilt one).
-                if discard:
-                    note_discarded_doc(d)
                 _unpublish(d)
                 if _CUR["doc_id"] == d:
                     _CUR["doc_id"] = None
-                _LAST_DELIVER_REV.pop(d, None)
                 return _dumps({"ok": True, "detached": True, "doc_id": d,
+                               **({"discarded": r.get("discarded", False)} if discard else {}),
                                "note": r.get("note")})
             _unpublish(d)  # drop its mirror tab in the app
             if _CUR["doc_id"] == d:
@@ -8869,8 +9428,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # old_id -> d alias could later misroute an agent's call to a REUSED d.
             for k in [k for k in _DOC_ALIASES if k == d or _resolve_alias(k) == d]:
                 _DOC_ALIASES.pop(k, None)
-            _LAST_DELIVER_REV.pop(d, None)
-            return _dumps({"ok": True, "closed": r.get("closed", True), "doc_id": d})
+            return _dumps({"ok": True, "closed": r.get("closed", True), "doc_id": d,
+                           **({"discarded": r.get("discarded", True)} if discard else {})})
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -8944,8 +9503,11 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
 
         I/O failures can leave honest partial copies; inspect failures before retrying.
         The full native outcome is saved to a unique .result-<id>.json beside the plan;
-        reply contains counts, bounded failures and output_path. A report-write failure
-        preserves native_ok/counts and must NOT be treated as proof nothing was copied.
+        reply contains counts, bounded failures and missing required direct-reference
+        previews and output_path. Existence is checked after this batch, not promised for
+        later mappings; it does not establish transitive closure. Optional embedded and
+        documentary provenance is not required. A report-write failure preserves
+        native_ok/counts and must NOT be treated as proof nothing was copied.
         """
         try:
             source = _native_file_path(plan_path, "plan_path")
@@ -9008,13 +9570,16 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         and any associated 2D drawings — all in one file the desktop app opens fully editable. Use
         this to deliver a part the user will keep working on. (export_part writes flat interchange
         or mesh files: a plain STEP/STL has geometry only, no feature history or studies.)
+        A drawing_doc_id is not a part: save it separately with
+        export_part(fmt="draw+", doc_id=drawing_doc_id, path=...), or save its open
+        source part with save_part to preserve the associated drawing in the .step+.
 
-        path : where to write. With a configured project, omitting it saves an established
-               native file in place;
-               a detached native import retains that behavior after authored design edits,
-               but study-only scratch receives an unused project filename. Other new docs
-               use CHUDWARE_PROJECT_SAVE_DIR and the document name; only external/headless
-               clients without a project folder fall back to a temp .step+.
+
+        path : where to write. Omitting it saves an established native file in place;
+               a detached native import receives an unused project filename, even after
+               authored edits. Other new docs use CHUDWARE_PROJECT_SAVE_DIR and the
+               document name; without a project or bound native file, an explicit
+               save falls back to a temp .step+.
                A ".step+" extension is added when absent; another CAD extension is REPLACED,
                so save_part("bracket.step") writes "bracket.step+", never
                "bracket.step.step+". Returns the written path and bytes, plus a note when
@@ -9036,26 +9601,43 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         asserted via asm_add_component(at=/rotate=) have not been re-validated since the last
         mutation. Run check_interference plus measure_between / list_world_bodies against the
         expected envelope, then save again.
+        Saving with an active rollback bar succeeds but reports `rollback.after`,
+        `rollback.hidden_features`, and a loud warning listing the unbuilt suffix.
+        Restore the full history before presenting it as complete.
 
-        Save every deliverable BEFORE your session ends: the user is never warned about your
-        unsaved docs, so anything you don't save (and don't close_part(discard=True)) is only
-        recoverable from a fallback crash-recovery tier — not a delivery mechanism.
-        Empty documents (no bodies AND no studies) are refused without writing;
-        allow_empty=True explicitly saves one. A document whose only content is
-        engineering studies (hydraulic_circuit, piping_network, vessel, duct_system, …)
-        is not empty: it saves without allow_empty.
+        Agent edits are automatically persisted to their native file or project destination.
+        The system reports persistence errors and does not silently save unsaved human edits.
+        Empty documents (no bodies, studies or mesh references) are refused without
+        writing; allow_empty=True explicitly saves one. A document containing only
+        studies, mesh references, or an unbuilt rollback suffix is not empty.
         A file the user has open in a tab is refused too (`path_open_in_user_tab`, naming the
         open doc_id): edit that document in place so the user sees the change live, then save
         it — never rebuild it in a second document and save that over its file.
         """
         try:
             d = _doc(doc_id)
+            if isinstance(d, str) and d.startswith("dwg-"):
+                drawing = cb.call("drawing_get", {"doc_id": d})
+                source = drawing.get("source_doc_id") or drawing.get("source")
+                return _dumps({
+                    "ok": False, "code": "drawing_requires_export",
+                    "reason": "drawing_requires_export", "doc_id": d,
+                    "source_doc_id": source,
+                    "error": ("save_part saves a part or assembly as .step+, not a drawing. "
+                              "No file was written."),
+                    "hint": (f'For a standalone drawing use export_part(fmt="draw+", '
+                             f'doc_id="{d}", path=...). To embed an associated drawing, '
+                             "save its open source part with save_part instead."),
+                })
             if not allow_empty and not cb.call(
                     "asm_world_bodies", {"doc_id": d, "explode": False}).get("bodies") \
-                    and not (cb.call("sim_study_list", {"doc_id": d}) or {}).get("studies"):
-                return _dumps({"ok": False, "reason": "no_bodies_empty_document",
-                               "doc_id": d,
-                               "content": "Save refused: document has 0 bodies and no studies."})
+                    and not (cb.call("sim_study_list", {"doc_id": d}) or {}).get("studies") \
+                    and not _part_has_mesh_references(d):
+                tree = (cb.call("doc_tree", {"doc_id": d}) or {}).get("tree")
+                if not rollback_hidden_features(tree):
+                    return _dumps({"ok": False, "reason": "no_bodies_empty_document",
+                                   "doc_id": d,
+                                   "content": "Save refused: document has no bodies, studies or mesh references."})
             # K3: canonicalise the caller-supplied path so any '..' traversal sequences are
             # fully resolved before we pass them to the engine.  This means the caller sees
             # exactly where the file will be written (no hidden navigation).
@@ -9099,15 +9681,15 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                         f"in place (add_features / asm_* with doc_id={holder.get('doc_id')}) so "
                         "the user sees them live, then save_part(doc_id="
                         f"{holder.get('doc_id')}); or save this document under a new name.")})
-            r = cb.call("doc_save", {"doc_id": d, "path": out})
+            r = cb.call("doc_save", {"doc_id": d, "path": out,
+                                      "if_no_human_dirty": True})
+            if r.get("ok") is False:
+                return _dumps({**r, "ok": False, "doc_id": d, "path": out})
             written = r.get("path", out)
             ok = os.path.exists(written)
             retired = None
             if ok:
-                # Delivered: record the revision so close_part won't warn until further edits.
-                rev = _doc_revision(d)
-                if rev is not None:
-                    _LAST_DELIVER_REV[d] = rev
+                _note_session_saved(d, written)
                 if path:
                     # An explicit destination supersedes a copy the harness placed itself —
                     # only the file THIS doc lived in until now (doc ids are reused across
@@ -9116,8 +9698,8 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                 elif prior_path != written:
                     note_harness_saved_path(d, written)
             res = {"ok": ok, "format": "step+", "native": True, "doc_id": d,
-                   "path": written,
-                   "bytes": (os.path.getsize(written) if ok else 0)}
+                   "path": written, "saved_revision": r.get("saved_revision"),
+                   "cache": r.get("cache"), "bytes": (os.path.getsize(written) if ok else 0)}
             if retired:
                 res["removed_stale_copy"] = retired
             if note:
@@ -9125,6 +9707,10 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             # Non-blocking placement provenance (assembly-merge discipline): a
             # transform-placed component nobody re-checked is how a merge ships off-frame.
             warnings = placement_warnings(d)
+            if r.get("rollback"):
+                res["rollback"] = r["rollback"]
+                res["warning"] = r["warning"]
+                warnings = [r["warning"], *warnings]
             if warnings:
                 res["warnings"] = warnings
             return _dumps(res)
@@ -9133,10 +9719,13 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
+    @result_contract("Job completion does not imply operation success; inspect the nested result.")
     def get_job(job_id: str) -> str:
         """Poll a background job started by run_cfd_flow/run_fea_*(background=True).
 
         Returns {status: "running"|"done"|"error"}; when done, the solve `result` is included.
+        "done" means execution finished, not that it succeeded: a result with ok:false
+        also sets this reply's ok:false and exposes its error, code, reason and detail.
         Polling a long solve this way never trips the per-call transport timeout that would
         otherwise drop the whole session.
         For durable simulation jobs, progress.probe contains the live fill counters.
@@ -9172,6 +9761,13 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             out["progress"] = progress
         if snap["status"] == "done":
             out["result"] = snap["result"]
+            result = snap["result"]
+            if isinstance(result, dict) and result.get("ok") is False:
+                out["ok"] = False
+                out["error"] = (result.get("error") or result.get("message")
+                                or result.get("reason") or "background operation failed")
+                out.update({key: result[key] for key in ("code", "reason", "detail")
+                            if key in result})
         elif snap["status"] == "error":
             out["ok"] = False
             out["error"] = snap["error"]
@@ -9181,6 +9777,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
+    @result_contract("Job completion does not imply operation success; inspect the nested result.")
     def wait_job(job_id: str, timeout_s: float = 120.0, poll_s: float = 2.0,
                  cancel=None, wake=None) -> str:
         """Block until a background job (get_job id) finishes or timeout_s passes — use instead of sleep/poll loops.
@@ -9248,8 +9845,7 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         daemon retired (unclosed docs from ended sessions — they were saved and closed instead of
         lingering forever; nothing reopens them except this call or the GUI's recovery prompt).
         Each entry returns its fresh `doc_id` plus the saved `name` and `original_doc_id` so you
-        can re-map old handles. Stale autosaves (older than CHUDWARE_AUTOSAVE_MAX_AGE_DAYS,
-        default 7) are pruned automatically.
+        can re-map old handles. Unconsumed snapshots are retained regardless of age.
 
         limit: at most this many docs are reopened, NEWEST FIRST (0 = the default bound,
         CHUDWARE_RECOVER_MAX_DOCS, 8). Recovery is BOUNDED because a big autosave pile made
@@ -9308,6 +9904,11 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         try:
             d = _doc(doc_id)
             r = cb.call("config_add", {"doc_id": d, "name": name, "copy_from": copy_from})
+            failure = _engine_reply_failure(r)
+            if failure:
+                if failure["applied"]:
+                    _publish_current(d)
+                return _dumps({**failure, "doc_id": d, "config": name})
             _publish_current(d)
             return _dumps({"ok": True, "doc_id": d, "added": name,
                            "active": (r.get("tree") or {}).get("active_configuration"),
@@ -9323,17 +9924,42 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         """Switch the active configuration. The part rebuilds to that variant's parameters.
 
         After this, measure_part / render_part / export_part reflect the chosen variant. Returns
-        the new active configuration name and the rebuilt body count/volume so you can confirm the
-        switch took (e.g. a suppressed feature drops a body, an override changes the volume).
+        the new active configuration name, the rebuilt body_count (physical solids, the same
+        basis as add_features; logical_member_count is the compiled-member count) and
+        volume_mm3 with its volume_basis, so you can confirm the switch took (e.g. a suppressed
+        feature drops a body, an override changes the volume). If the engine rejects the
+        rebuild the result is ok:false with the engine's per-feature reasons.
         """
         try:
             d = _doc(doc_id)
             r = cb.call("config_activate", {"doc_id": d, "name": name})
-            bodies = (r.get("tess") or {}).get("bodies", [])
+            failure = _engine_reply_failure(r)
+            if failure:
+                if failure["applied"]:
+                    _publish_current(d)
+                return _dumps({**failure, "doc_id": d, "config": name})
             _publish_current(d)
             _autosave(d)
+            physical_count = None
+            try:
+                physical_count = _physical_solid_count(
+                    cb.call("asm_world_bodies", {"doc_id": d}))
+            except Exception as exc:  # noqa: BLE001
+                if getattr(exc, "code", None) == "engine_connection_lost":
+                    raise
+            exact = r.get("exact") if isinstance(r.get("exact"), dict) else {}
+            if isinstance(exact.get("volume_mm3"), (int, float)):
+                volume, basis = exact["volume_mm3"], exact.get("basis") or "brep_exact"
+            elif isinstance(r.get("volume"), (int, float)):
+                volume, basis = r["volume"], "approximate_display_tessellation"
+            else:
+                volume, basis = None, "unavailable"
             return _dumps({"ok": True, "doc_id": d, "active": name,
-                           "body_count": len(bodies),
+                           "body_count": physical_count,
+                           "body_count_basis": ("physical_solids" if physical_count is not None
+                                                else "unavailable"),
+                           "logical_member_count": len((r.get("tess") or {}).get("bodies", [])),
+                           "volume_mm3": volume, "volume_basis": basis,
                            "revision": r.get("revision")})
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -9354,15 +9980,25 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
                      translate:[x,y,z] on a `transform` feature (so one assembly file can hold a
                      Default and a STOWED config that differ only in a placement vector).
         clear      : pass True (and omit value) to REMOVE the override so the config falls back to
-                     the base value.
+                     the base value. Exactly one of value / clear=True is required.
         The base/Default config and other configurations are untouched. Activate the configuration
-        (or it may already be active) and measure_part to see the effect.
+        (or it may already be active) and measure_part to see the effect. If the override
+        breaks the build the engine rejects it: the result is ok:false with the engine's
+        per-feature reasons and the document keeps its previous overrides.
         """
         try:
+            if clear and value is not None:
+                return _err(ValueError(
+                    "set_config_override: pass value=… to set the override OR clear=true to "
+                    "remove it, not both"))
+            if not clear and value is None:
+                return _err(ValueError(
+                    "set_config_override: pass value=… to set the override, or clear=true "
+                    "to remove it"))
             d = _doc(doc_id)
             params: dict = {"doc_id": d, "name": config, "feature_id": feature_id,
                             "param": param}
-            if clear or value is None:
+            if clear:
                 params["clear"] = True
             elif isinstance(value, (list, tuple)):
                 # Vector/array param (e.g. transform.translate): the engine reads it as a raw
@@ -9372,16 +10008,22 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
             else:
                 # Scalar params are {value, expr} objects in the engine; wrap a bare number.
                 params["value"] = {"value": float(value), "expr": None}
-            cb.call("config_set_override", params)
+            r = cb.call("config_set_override", params)
+            failure = _engine_reply_failure(r)
+            if failure:
+                if failure["applied"]:
+                    _publish_current(d)
+                return _dumps({**failure, "doc_id": d, "config": config,
+                               "feature_id": feature_id, "param": param})
             _publish_current(d)
             _autosave(d)
             echoed = None
-            if not (clear or value is None):
+            if not clear:
                 echoed = (params["value"] if isinstance(value, (list, tuple)) else float(value))
             return _dumps({"ok": True, "doc_id": d, "config": config,
                            "feature_id": feature_id, "param": param,
                            "value": echoed,
-                           "cleared": bool(clear or value is None)})
+                           "cleared": bool(clear)})
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -9400,9 +10042,15 @@ def register_cad_doc_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
-            cb.call("config_set_suppression", {"doc_id": d, "name": config,
-                                               "feature_id": feature_id,
-                                               "suppressed": bool(suppressed)})
+            r = cb.call("config_set_suppression", {"doc_id": d, "name": config,
+                                                   "feature_id": feature_id,
+                                                   "suppressed": bool(suppressed)})
+            failure = _engine_reply_failure(r)
+            if failure:
+                if failure["applied"]:
+                    _publish_current(d)
+                return _dumps({**failure, "doc_id": d, "config": config,
+                               "feature_id": feature_id})
             _publish_current(d)
             _autosave(d)
             return _dumps({"ok": True, "doc_id": d, "config": config,

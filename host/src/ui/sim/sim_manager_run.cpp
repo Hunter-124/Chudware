@@ -118,7 +118,7 @@ bool nativeSourceCurrent(const AppState &st, const std::string &docId,
   for (const auto &tab : st.docTabs)
     if (tab.docId == docId)
       return !tab.meshCacheInvalidated && tab.session &&
-             topology::geometryKey(tab.session->cachedMirror.tree) == geometryKey;
+             topology::geometryKey(tab.session->cachedMirror.tree()) == geometryKey;
   return false;
 }
 
@@ -284,7 +284,8 @@ std::string SimManager::runBlockerFor(AppState &st, const Study &s) const {
     return "Open a part or assembly.";
   if (!hasSimulationGeometry(st))
     return "Model a solid body to simulate.";
-  if (s.type == StudyType::Motion && !activeDocIsAssembly(st))
+  if (s.type == StudyType::Motion &&
+      activeMechanicalDocumentKind(st) != CommandDocKind::Assembly)
     return "Open an assembly to run Motion.";
   if (s.type == StudyType::Motion && !motionJointsReady(s, st.docMirror.tree(), why))
     return why;
@@ -305,12 +306,12 @@ std::string SimManager::runBlockerFor(AppState &st, const Study &s) const {
   if (s.type != StudyType::Motion && s.type != StudyType::Contact && !st.simClient)
     return "Start the simulation backend.";
   if ((isFlowFamily(s.type) && s.flowSolver == 1) || s.type == StudyType::Thermal) {
-    const nlohmann::json flowCaps =
-        st.simClient ? st.simClient->caps() : nlohmann::json::object();
-    if (!flowCaps.is_object() || !flowCaps.value("openfoam", false))
+    if (!thermalCfdCapabilityKnown_)
+      return "Checking flow solver availability\xe2\x80\xa6";
+    if (!thermalCfdCapabilityAvailable_)
       return s.type == StudyType::Thermal
-                 ? "Thermal CFD needs OpenFOAM, which is not installed."
-                 : "Choose Fast (LBM): OpenFOAM is not installed.";
+                 ? "Use Thermal FEA: Thermal CFD is unavailable with this backend."
+                 : "Choose Fast (LBM): OpenFOAM is unavailable with this backend.";
   }
   if (s.type == StudyType::Contact || s.type == StudyType::FreqResponse) {
     if (capsStatus_ == 0)
@@ -1284,11 +1285,11 @@ void SimManager::tick(AppState &st) {
     Study &ts = studies_[sel_];
     syncTopologyViews(ts);
     refreshTopologyRunsView(st, ts);
-    const double now = ImGui::GetTime();
-    if (topoSetupKeyStudy_ != ts.id || now - topoSetupKeyTime_ > 0.5) {
+    if (topoSetupKeyStudy_ != ts.id ||
+        topoSetupKeyGeneration_ != parameterSourceGeneration_) {
       topoSetupKeyNow_ = topology::setupKey(studyToJson(ts));
       topoSetupKeyStudy_ = ts.id;
-      topoSetupKeyTime_ = now;
+      topoSetupKeyGeneration_ = parameterSourceGeneration_;
     }
     // Entering Results shows the selected (else latest) run's overlay once, silently when
     // that run has no usable overlay (the panel says why).

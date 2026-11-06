@@ -15,19 +15,24 @@ namespace ui::cef {
 
 void rpc_start_url(
     AppState& st, const std::string& site,
-    std::function<void(bool, const std::string&, const std::string&, const std::string&)> cb) {
+    std::function<void(bool, const std::string&, const std::string&,
+                       const std::vector<std::string>&, const std::string&)> cb) {
     nlohmann::json p;
     p["site"] = site;
     st.rpc.call("browser_start_url", p, [cb = std::move(cb)](const core::RpcResult& r) {
-        if (!r.ok) { cb(false, "", "", r.err); return; }
+        if (!r.ok) { cb(false, "", "", {}, r.err); return; }
         if (!r.result.is_object() || !r.result.value("ok", false)) {
             const std::string reason =
                 r.result.is_object() ? r.result.value("reason", std::string()) : std::string();
-            cb(false, "", "", reason);
+            cb(false, "", "", {}, reason);
             return;
         }
+        std::vector<std::string> domains;
+        if (r.result.contains("cookie_domains") && r.result["cookie_domains"].is_array())
+            for (const auto& domain : r.result["cookie_domains"])
+                if (domain.is_string()) domains.push_back(domain.get<std::string>());
         cb(true, r.result.value("url", std::string()),
-                 r.result.value("cache_dir", std::string()), "");
+                 r.result.value("cache_dir", std::string()), domains, "");
     });
 }
 

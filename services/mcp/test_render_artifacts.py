@@ -41,13 +41,10 @@ def cache(tmp_path, monkeypatch) -> Path:
     contract conftest relies on for ``paths.CONFIG``), so rebinding it here is sufficient
     and nothing lands in the user's real cache.
 
-    The opportunistic once-per-process prune is also pinned SHUT here, so a render path
-    minted by one test cannot silently reap another test's fixture files (which would make
-    the prune assertions order-dependent). ``test_render_output_path_prunes_once`` opens it
-    back up deliberately.
+    Suppress scheduled pruning in the shared fixture; the scheduling test enables it.
     """
     monkeypatch.setattr(paths, "CACHE", tmp_path / "cache")
-    monkeypatch.setattr(cad_common, "_RENDER_PRUNE_DONE", True)
+    monkeypatch.setattr(cad_common, "_CACHE_PRUNED_AT", {"renders": time.monotonic()})
     return tmp_path / "cache"
 
 
@@ -116,10 +113,9 @@ def test_prune_render_cache_drops_stale_keeps_fresh(cache):
     assert not day.exists()
 
 
-def test_render_output_path_prunes_once(cache, monkeypatch):
-    """The cache cannot grow without bound: minting a render path prunes, but only once
-    per process (no rglob of the whole cache on every single render)."""
-    monkeypatch.setattr(cad_common, "_RENDER_PRUNE_DONE", False)
+def test_render_output_path_prunes_periodically(cache, monkeypatch):
+    """Prune on the first render and again after the interval, not on every render."""
+    cad_common._CACHE_PRUNED_AT.clear()
     day = cache / "renders" / "2026-01-01"
     day.mkdir(parents=True)
     stale = day / "old-render.png"
@@ -130,13 +126,16 @@ def test_render_output_path_prunes_once(cache, monkeypatch):
     first = Path(cad_common.render_output_path("first", ".png"))
     assert not stale.exists()
     assert first.parent.is_dir()  # first render must not target a day dir pruned moments earlier
-    assert cad_common._RENDER_PRUNE_DONE is True
+    assert "renders" in cad_common._CACHE_PRUNED_AT
 
     stale.parent.mkdir(parents=True, exist_ok=True)
     stale.write_bytes(b"old again")
     os.utime(stale, (old, old))
     cad_common.render_output_path("second", ".png")
-    assert stale.exists()  # flag latched — no second sweep
+    assert stale.exists()
+    cad_common._CACHE_PRUNED_AT["renders"] -= cad_common._CACHE_PRUNE_INTERVAL_S
+    cad_common.render_output_path("third", ".png")
+    assert not stale.exists()
 
 
 
@@ -216,6 +215,40 @@ def test_render_destination_rejects_symlink_escape_and_final_suffix(tmp_path, mo
         cad_render_tools._render_save_target(str(project / "secret.png"))
     assert cad_render_tools._render_save_target(str(project / "good")) == str(
         project / "good.png")
+
+
+def test_render_destination_isolated_between_bound_roots(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from services.agent.request_context import bind_roots
+
+    ambient = tmp_path / "ambient"
+    roots = [tmp_path / "first", tmp_path / "second"]
+    for path in [ambient, *roots]:
+        path.mkdir()
+    for key in ("CHUDWARE_PROJECT_SAVE_DIR", "CHUDWARE_PROJECT_DIR", "CHUDWARE_FS_ROOT"):
+        monkeypatch.setenv(key, str(ambient))
+    monkeypatch.delenv("CHUDWARE_RENDER_SAVE_ANYWHERE", raising=False)
+    for root in roots:
+        (root / "escape").symlink_to(ambient, target_is_directory=True)
+    barrier = Barrier(2)
+
+    def check(root, other):
+        with bind_roots(str(root)):
+            barrier.wait(timeout=10)
+            assert cad_render_tools._render_save_target("figure.png") == str(root / "figure.png")
+            for path in (ambient / "figure.png", other / "figure.png",
+                         root / ".." / "ambient" / "figure.png",
+                         root / "escape" / "figure.png"):
+                with pytest.raises(ValueError, match="outside"):
+                    cad_render_tools._render_save_target(str(path))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(check, roots[0], roots[1]),
+                   pool.submit(check, roots[1], roots[0])]
+        for future in futures:
+            future.result()
 
 
 def test_render_policy_only_blocks_explicit_saves(tmp_path, monkeypatch):

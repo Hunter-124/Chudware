@@ -18,66 +18,14 @@ compensation refuse by name. No family claims process physics, monitoring, trans
 execution, or safety integration; only levels backed by the implemented offline path are
 declared pending gateway-stamped procedural evidence.
 
-Gateway rules are cited by **stable rule id** only, never by gateway section number: the register that
-resolves every id used below is **Appendix A.1**, and `test_mfg_contracts.cpp` plus every cut test key on
-those ids. Review closure for **B10**, **B15**, **C9** and **C10** is recorded in **Appendix A**.
+Gateway rules are cited by stable rule id; Appendix A.1 records the rules used by this design.
 
 ---
 
-## 1. Measured baseline: what exists today, and why it is not three processes
-
-All three "processes" are currently **one code path with one scalar**.
-
-| Fact | Evidence |
-|---|---|
-| `MachineKind::{Laser,Plasma,Waterjet}` exist | `core/cam/model.h:105-115` |
-| The *only* process field on `Machine` is `double kerf` | `core/cam/model.h:132-133` |
-| `ToolType::{LaserHead,PlasmaTorch,WaterjetHead}` exist but `Tool` carries mill geometry only — `flutes`, `flute_length`, `holder_diameter = 32`, `shoulder_length` | `core/cam/model.h:150`, `core/cam/model.h:155-181` |
-| One `OpType::Cut2D` for all three | `core/cam/model.h:237` |
-| One shared parameter block: `passes`, `pierce_delay`, `pierce_height`, `cut_height`, `kerf_override`, `power`, `feed_rate` — with `power` documented as "0..1 laser power / **amperage scale**" | `core/cam/model.h:314-321` |
-| One generator `gen_cut2d` for all three; `pb.set_spindle(0)`; `op.power` is **never read** by the generator | `core/cam/op_cut.cpp:43-175`, `:69` |
-| Kerf comp keeps only `offs.front().outer` — island holes of a kerf-comped region are **silently dropped** | `core/cam/op_cut.cpp:89-96` |
-| Open paths get **no** kerf comp and **no** lead-in/out | `core/cam/op_cut.cpp:84`, `:152-166` |
-| `Move` has no process channel at all; `spindle_rpm` is the only power-shaped field | `core/cam/model.h:349-360` |
-| `MoveKind` has no process on/off, no setpoint, no wait-for-condition, no probe | `core/cam/model.h:338-347` |
-| The post's whole notion of a cutting head is `bool head = kind==Laser\|\|Plasma\|\|Waterjet` | `core/cam/post.cpp:401-402` |
-| Power is emitted as an **S word rendered through the RPM formatter**: `"S" << fmt_num(op->power * c.power_max, g.c.rpm)` | `core/cam/post.cpp:460` |
-| Beam gating is inferred from move kind: on at first `Plunge` (with S) or at any `Lead`/`Cut` (**without any S at all**), off at `Rapid`/`Retract` | `core/cam/post.cpp:454-470` |
-| Only the `marlin` preset sets `laser_mode` / `torch_on` / `torch_off` / `power_max`; the other seven are `base_mill(...)` | `core/cam/post.cpp:120-131`, `:73-148` |
-| Consequence: a Laser setup posted with `grbl`/`fanuc`/`haas`/… still takes the `head` branch and emits `c.torch_on`/`c.torch_off` defaults. `blk("")` returns immediately, so an empty default makes beam gating **vanish silently** | `core/cam/post.cpp:454-482`, `:207-208`; defaults live in `post.h`, outside read scope → `[INFERENCE]` on which of "silent no-op" vs "bare M3/M5 with no power" occurs |
-| `post_dialects_json` advertises `"laser": c.laser_mode` (true only for marlin) yet nothing prevents posting a laser job with a mill dialect | `core/cam/post.cpp:169-175` |
-| Unknown dialect id silently degrades to GRBL | `core/cam/post.cpp:158-162` |
-| Footer suppresses `spindle_off` only for `Laser`; plasma and waterjet get an `M5` | `core/cam/post.cpp:487` |
-| Simulation for a head machine is the **mill Z-dexel**: removal disc = `tool->effective_radius()`, field lowered to tip Z | `core/cam/stock_sim.cpp:325-326`, `:352-354` |
-| But `cut_z = heights.top + cut_height` is **at or above the stock top** (`core/cam/op_cut.cpp:64`), so `zt < field.raw(i,j)` is essentially never true → `removed_volume_mm3 ≈ 0`, `machined_fraction ≈ 0`, `warnings` empty, `ok:true`. Kerf is never the removal width; a `LaserHead` would remove a 6 mm disc if any Z were below top (`model.h:159` default `diameter = 6.0`) | `core/cam/stock_sim.cpp:446-479` |
-| Holder/shank collision for a torch uses `holder_diameter = 32` / `shoulder_length` mill defaults | `core/cam/stock_sim.cpp:331-334`, `:364-388` |
-| Only `Lathe` + cylinder gets a dedicated non-dexel model; heads get nothing | `core/cam/stock_sim.cpp:192-245` |
-| MCP accepts `machine="laser"\|"plasma"\|"waterjet"` and merges a **mill-only** profile (travel/rapids/rpm/feed/accel) | `services/mcp/cam_tools.py:481-485`, `:524-551` |
-| MCP accepts `cam_add_tool(type="laser_head"\|"plasma_torch"\|"waterjet_head")` with mill-shaped args only — `diameter/flutes/corner_radius/tip_angle/thread_pitch`; there is no power, gas, pressure, orifice, or consumable parameter anywhere | `services/mcp/cam_tools.py:458-478` |
-| `cam_add_operation` merges `params` verbatim (`op.update(params)`), so `power`/`pierce_delay` arrive untyped and unvalidated | `services/mcp/cam_tools.py:635-636` |
-| `cam_simulate` docstring promises removal volume + gouge + holder checks for **any** setup | `services/mcp/cam_tools.py:744-750` |
-| `cam_post`'s only release guard is the motion-line count; a laser job posted to `fanuc` counts motion lines and reports success | `services/mcp/cam_tools.py:782-801` |
-| `feeds_speeds` tool vocabulary is `endmill_flat\|endmill_ball\|drill\|tap\|face_mill`; `cam_check_feeds_envelope` speaks only `rpm`/`feed` | `services/mcp/cam_tools.py:904-910`, `:937-975` |
-
-Corroborating manufacturing-breadth research: laser is `NOW`
-(vector + post + parser/emulator, hardware streaming labeled unsupported); plasma is
-`NEXT` with an explicitly richer state machine (arc-ok, arc voltage, ohmic/float probe,
-THC, breakaway, consumables — "not laser with another icon"); waterjet is `LATER` with
-**weak open-emulator evidence** and process-specific pressure/abrasive/taper behavior.
-Its abstraction rule #4 is exactly the rule this design enforces: *do not overload
-spindle RPM as universal power*.
-
-**Verdict on the baseline:** three regulated, physically unrelated processes share one
-enum, one scalar, one generator, one S-word, and a removal model that reports
-`machined_fraction ≈ 0` as success. That is a false-green chain and it is what this
-design removes.
-
----
 
 ## 2. Separation principle
 
-Three axes are split, and they are split *independently* — this is the part the current
-code conflates:
+Three axes are split independently:
 
 1. **Geometry planning** (shared, honest to share): 2D vector contours, kerf
    compensation, lead placement, pierce placement, tabs, cut ordering. Lives once in
@@ -125,13 +73,8 @@ Channels are typed and unit-bearing, never interchangeable:
 
 ### 3.2 Existing files — append-only edits at named seams
 
-`TurningArchitecture` edits the same four C++ files. The seams below are disjoint from its
-lathe/CSS/diameter seams by line region and by branch **with exactly one exception this document
-previously denied**: the `core/cam/post.cpp` footer line `:487` is genuinely shared, so the earlier flat
-claim that these seams are "**disjoint**" from turning's was false as written. That line is owned
-**exclusively by `cam.turn`** for this wave and cutting edits it not at all; the binding ownership
-statement is **Appendix A.2**, recorded identically in
-`17_turning.md` (Appendix A.2). Every other seam below is disjoint exactly as stated.
+The shared CAM post must stop mill and lathe spindles and turn off a cutting head before
+rapid or retract motion and at the end of a head toolpath.
 
 **`core/cam/model.h`** — appends only. No field reordered, renamed, retyped, or removed
 (ABI + `.cam+` + C-ABI JSON are append-only, per DoD §16 and `model.h:14-16`).
@@ -168,8 +111,6 @@ if (is_cut_head(setup.machine.kind)) {
 }
 ```
 
-This converts today's measured false green (`ok:true`, `machined_fraction ≈ 0`, empty
-warnings) into an honest refusal. It is the highest-value single line in this design.
 
 **`core/cam/op_cut.cpp`** — `gen_cut2d` (`:43-175`) becomes a thin dispatcher: resolve
 machine kind → `gen_cut_laser` / `gen_cut_plasma` / `gen_cut_waterjet`; refuse when the
@@ -555,9 +496,9 @@ that table; `cam.cut` is not one of them, and this paragraph exists so that comp
 silently. The consequences of a gap are total, not cosmetic: per `MFG-KIND-MUST-BE-REGISTERED` an append
 of any unlisted kind is refused `mfg_unregistered_result_kind` and this domain's durable surface does
 nothing, and per `MFG-CAPABILITY-DURABLE-KIND` advertising any level above `unsupported` without the
-registered capability kind is refused `mfg_capability_requires_durable_kind` outright. Registration is the
-append-only, maintainer-owned contract edit in **wave 1** (§12 step 1) and is a hard predecessor of every
-later cut slice. Each row carries both `MFG-KIND-TWO-COLUMNS` columns, its `derived_from[]`, and its
+registered capability kind is refused `mfg_capability_requires_durable_kind` outright.
+Registration must precede use of each kind. Each row carries both `MFG-KIND-TWO-COLUMNS`
+columns, its `derived_from[]`, and its
 `supersede_with_parent` declaration with the one-line reason `MFG-SUPERSESSION-DECLARED` requires —
 `true` for `cam.cut.procedural_fact` (`MFG-PFACT-FOLLOWS-PARENT`), **false** for `cam.cut.capability`
 (`MFG-CAPABILITY-NO-INHERIT`).
@@ -591,22 +532,16 @@ Registration idiom, matching the gateway: `view(mcp, "manufacture")` in
 `plan_cut_job`, `post_cut_program`, `verify_cut_program`, `emulate_cut_program`,
 `replay_plasma_signals`, `cut_capability_report`.
 
-Guards, written in the same measured-defect style the existing file already uses
-(`cam_tools.py:152-168`, `:263-284`, `:612-627`, `:784-797`) — each one exists because the
-current code has the exact failure it prevents:
+Proposed guards:
 
 1. Unknown process id → **reject**, name the vocabulary. Never default to laser.
 2. `power` on a plasma or waterjet op → **reject**, name `current_a` / `pressure_mpa` and
-   their units. (Today `model.h:320` literally calls one field "laser power / amperage
-   scale".)
+   their units.
 3. `rpm`, `spindle_rpm`, `spindle_dir`, `css`, or a bare `S` value on any cut op →
-   **reject**, name the process's channel and unit. (Today `post.cpp:460` renders power
-   through the RPM formatter.)
+   **reject**, name the process's channel and unit.
 4. Cut op on a non-head machine, or a process profile disagreeing with the machine kind →
    **reject** (Tier-0, at the action entry point).
-5. Head setup + mill dialect, or unknown dialect → **reject** with the qualified dialect
-   list. (Today: `post.cpp:158-162` degrades to GRBL and the `head` branch emits empty
-   torch words.)
+5. Head setup + mill dialect, or unknown dialect → **reject** with the qualified dialect list.
 6. `resolve_cut_recipe` miss → **reject** naming the missing key; never interpolate.
 7. Any `inferred` provenance in the power/feed/pierce set → surfaced in the response and
    fails Stage-2 check S2-5 unless a durable named waiver exists.
@@ -687,8 +622,7 @@ qualification buys auditability, never admissibility.
 - ordering: islands before outers, then bounded 2-opt traverse minimization;
 - move stream: `ProcessOn{LaserPowerFraction}` → `Cut/Arc` (+ `ProcessSet` at classified
   corners when `corner_power_scale != 1`) → `ProcessOff` before every traverse. `Plunge`
-  is used only for genuine standoff/focus changes and never doubles as the beam gate
-  (today the post infers the gate from `Plunge`, `post.cpp:457-465`).
+  is used only for genuine standoff/focus changes and never doubles as the beam gate.
 
 **Post** (`post_cut.cpp`): four laser dialects, each declaring a `PowerBinding`.
 
@@ -748,8 +682,7 @@ Rules that make this honest:
   exceeded `ttl_ms` transitions to `Fault{SignalUnknownOrStale}` — **fails closed**
   (DoD hard rule: missing/stale/unknown telemetry fails closed). It never assumes arc-ok.
 - `ThcMode` and `PlasmaProbeMode` have **no silent default**. Tier-0 refuses a plan whose
-  THC mode or probe mode is unset. (Contrast today's single `pierce_height` scalar,
-  `model.h:317`.)
+  THC mode or probe mode is unset.
 - Breakaway and arc-ok are **hardware interlocks**. This state machine *models* them to
   author programs and to explain recorded runs. `PlasmaReplayReport::protective_function`
   is `false` by construction and asserted by a contract test. A state-machine "stop" is
@@ -787,9 +720,8 @@ Explicitly **not** delivered, and stated in every response's fidelity manifest:
 
 ## 7. Simulation fidelity
 
-The mill Z-dexel is structurally wrong for a kerf-through cut (`stock_sim.cpp:1-3`,
-`:325-326`, `:352-354`), and today it silently reports success with ~0 mm³ removed. The
-replacement is a **2D severance topology** model, with its limits declared in-band.
+The mill Z-dexel is not a kerf-through cut model. The proposed **2D severance topology**
+model declares its limits in-band.
 
 `cut_sim.cpp` computes, per setup:
 - the kerf swath as a Clipper2 boolean against the sheet outline;
@@ -823,20 +755,15 @@ gate.
 
 ## 8. Tests
 
-Every test below defends an observable contract and fails on a plausible bug — most of
-them fail on the bug that is in the tree *today*. C++ tests go in the existing `core/cam`
-unit-test target alongside the other CAM tests (`[INFERENCE]` — the test directory was
-outside read scope); Python tests alongside the existing MCP tool tests.
+The following proposed tests exercise the listed behavioral and safety contracts.
 
 **Power-channel integrity**
 1. `power_channel_never_spindle` — for all three processes, every generated `Move` has
    `spindle_rpm == 0` and every `ProcessSetpoint` carries the right channel + unit.
    *Fails on:* any regression to S-word power.
 2. `post_missing_power_binding_fails` — laser op + `fanuc` → `ok:false` naming the missing
-   binding. *Fails today:* the `head` branch emits torch defaults or nothing
-   (`post.cpp:454-482`).
+   binding.
 3. `post_unknown_dialect_fails_closed` — `post_dialect_or_error("nope")` errors.
-   *Fails today:* silent GRBL (`post.cpp:158-162`).
 4. `plasma_rejects_legacy_power_fraction` — legacy `power:0.5` on a Plasma setup → refusal
    naming `current_a` in amps.
 5. `laser_legacy_power_migrates_with_provenance` — same value on a Laser setup migrates
@@ -844,9 +771,7 @@ outside read scope); Python tests alongside the existing MCP tool tests.
 
 **Planning geometry**
 6. `kerf_offset_preserves_islands` — a region with 3 holes yields 4 kerf-comped loops.
-   *Fails today:* `offs.front().outer` drops the islands (`op_cut.cpp:89-96`).
 7. `open_path_gets_kerf_and_leads` — an open cut receives side comp and lead-out.
-   *Fails today:* `op_cut.cpp:152-166`.
 8. `tabs_prevent_dropped_part` — `tab_count > 0` clears `dropped_parts_untabbed`.
 9. `cut_ordering_islands_before_outer`.
 
@@ -872,7 +797,7 @@ outside read scope); Python tests alongside the existing MCP tool tests.
 
 **Simulation**
 20. `dexel_sim_refuses_cut_head` — `simulate_setup` on a Laser setup returns `ok:false`
-    with the pointer. *Fails today:* `ok:true`, `machined_fraction ≈ 0`, no warnings.
+    with the pointer.
 21. `cut_sim_detects_dropped_part` and `cut_sim_detects_torch_over_opening`.
 22. `emulator_replay_is_deterministic` — identical ticks → byte-identical report.
 23. `e2_is_absent_from_the_gate` — assert `gate.sh` never invokes `scripts/qualify_cut_e2.sh`
@@ -1100,46 +1025,12 @@ code and hardware own authorization.
 
 ---
 
-## 12. Wave order
 
-1. `core/cam/cut/process.*` + `recipe.*` + `model.h` appends + the `stock_sim.cpp`
-   refusal guard + the append-only `result_kind` rows (both policy columns, `derived_from[]`,
-   `supersede_with_parent` with its declared reason, permitted subject namespaces) in the
-   durable-result-kind contract table (§5.2) — all nine kinds, including the
-   `MFG-CAPABILITY-DURABLE-KIND`-mandated `cam.cut.capability`, registered before any cut
-   append or capability advertisement (§5.2 "W1.1 registration") + tests 1-5, 20, 24-27, 29,
-   30, 31, 34, 37, 38.
-   *(This alone deletes the false green.)*
-2. `vector_plan.*` + `op_laser.cpp` + `post_cut.cpp` laser dialects + `parse_gcode.*` +
-   `emulator.*` E0/E1 + tests 6-12, 22, 33 + the laser smoke.
-3. `plasma_state.*` + `op_plasma.cpp` + `linuxcnc_plasma` + fixtures + tests 13, 15-19 +
-   the two plasma replay smokes.
-4. `op_waterjet.cpp` + `linuxcnc_waterjet` + `cut_sim.*` + tests 14, 21 + the waterjet
-   smoke.
-5. `services/manufacturing/cut/**` including `tier0.py` registered through the gateway
-   `journal_client.py` + the three `cam_tools.py` guard edits + tests 23, 28, 32, 35, 36 +
-   the MCP guard tests.
-6. `host/src/ui/manufacture/cut_process_panel.*` + the single `host/src/ui/cam/**` seam.
-7. As-built map (`docs/manufacturing/README.md`) and developer-doc updates in the same green commit
-   (DoD §20).
+## Appendix A — Gateway rule references
 
----
+### A.1 Gateway rule-id register
 
-## Appendix A — Review closure (B10, B15, C9, C10)
-
-Closes the architecture plan review findings assigned to this document. No product scope changes:
-every cutting deliverable, non-goal,
-capability claim and fidelity disclaimer above stands exactly as accepted.
-
-### A.1 Gateway rule-id register (replaces every gateway section-number cross-reference — closes C10)
-
-C10 found that this document cited the most load-bearing gateway rule — the `procedural_fact` flip scope,
-which is what stops a level being flipped to `verified` by an offline check — as **§24.4**, which is in
-fact the robot kind table; and cited the read-only transport split as **§24.1**, which is the two-column
-rule. Renumbering would only move the hazard, since the gateway's contract tests are specified by
-section. So this document now cites **stable rule ids** only; `test_mfg_contracts.cpp` and cut tests
-26-38 key on these ids, never on a section number. Each row restates an already-accepted gateway
-obligation verbatim in substance — nothing here is new scope.
+Cutting consumes the following gateway rules:
 
 | rule id | obligation (accepted gateway text, restated) | previously cited here as |
 |---|---|---|
@@ -1152,7 +1043,7 @@ obligation verbatim in substance — nothing here is new scope.
 | `MFG-PFACT-FLIP-SCOPE` | A `procedural_fact` row may flip only `plan \| generate \| post \| parse \| simulate`; `monitor \| transport \| execute \| safety_integration` require fresh `probed` evidence plus the emulator-stage ceiling and can never be flipped by `procedural_fact`, `simulated`, `declared`, `advisory` or `assumed`. | **§24.4 — wrong** (§5.2, §6.1, test 32) |
 | `MFG-PFACT-FOLLOWS-PARENT` | Every kind whose id ends in `procedural_fact` MUST declare `supersede_with_parent:true`; registration without it is refused `mfg_procedural_fact_must_follow_parent`. | §24.7 (§5.2, test 34) |
 | `MFG-SUPERSESSION-DECLARED` | Supersession of a derived-artifact row is the owning domain's choice, valid only when declared in its kind table with a one-line reason. | §24.9 (§5.2, test 37) |
-| `MFG-CAPABILITY-DURABLE-KIND` | Any domain whose `CapabilityReport` can reach a UI MUST register a `<domain>.capability` durable kind; advertising any level above `unsupported` without one is refused `mfg_capability_requires_durable_kind`. | §24.11 (§5.2, §12, test 38) |
+| `MFG-CAPABILITY-DURABLE-KIND` | Any domain whose `CapabilityReport` can reach a UI MUST register a `<domain>.capability` durable kind; advertising any level above `unsupported` without one is refused `mfg_capability_requires_durable_kind`. | §24.11 (§5.2, test 38) |
 | `MFG-CAPABILITY-NO-INHERIT` | `*capability` kinds MUST NOT set `supersede_with_parent`; a capability row re-derives from its own evidence, and its `derived_from[]` is the evidence rows it cites. | §24.7 converse / §24.11 (§5.2) |
 | `MFG-SUBJECT-NS-DECLARED` | A domain declares its permitted subject namespaces at registration; an append outside that set is refused `mfg_subject_namespace_not_permitted`. `dev:` belongs to the gateway device lane and `src:` to the monitor lane. | §24.8 (§5.2, test 35) |
 | `MFG-GUARD-ACCEPTS-DECLARED` | Every Stage-2 guard declares `accepts{subject_ns, admission}` and `gates::evaluate` refuses out-of-set evidence **by name**, recorded in the gate report rather than skipped. | §24.8 (§9.3, test 36) |
@@ -1165,47 +1056,3 @@ obligation verbatim in substance — nothing here is new scope.
 Cutting cites no other gateway rule. Where the text above names a DoD criterion (DoD §2, §3, §5, §6, §7,
 §8, §9, §10, §14, §16, §19, §20) that is the authoritative document itself, not a gateway section, and
 stays as written.
-
-### A.2 Shared-line ownership — `core/cam/post.cpp:487` (closes B15)
-
-**Wave ownership of the shared `core/cam/post.cpp` footer line (`:487`).** For this wave the footer line
-`core/cam/post.cpp:487` — today `if (!g.lathe && !(kind==Laser)) g.blk(spindle_off)` — is owned
-**exclusively by `TurningArchitecture`** (domain `cam.turn`). Turning *deletes* the line's `!g.lathe`
-condition so a lathe program finally stops its spindle (defect D-T5), while cutting only *adjusts* the
-same line's laser condition, whose job its head branch moves into the `post_cut.cpp` call: the deletion
-subsumes the adjustment, so one owner lands both effects and the joint edit both documents feared does not
-exist. `CuttingProcessArchitecture` (domain `cam.cut`) makes **no** edit to `:487`. It consumes the
-resulting footer behaviour — `spindle_off` reached by every mill and lathe setup, and the process-off word
-for a cut head emitted by `post_cut.cpp` instead of by an inline condition on this line — and asserts it
-from the cut side by golden NC (`fixtures/mfg/cut/programs/laser_grbl_expected.nc`, whose footer must
-match what the `post_cut.cpp` call emits rather than what the deleted inline condition used to emit),
-while turning asserts it by `turn_post_emits_spindle_off_in_lathe_footer` in
-`core/tests/test_cam_turn.cpp`. Every other region of the file keeps the owner both documents already
-agreed: `cam.cut` owns the head branch (`post.cpp:401-402`, `:454-470`, `:482`), the GRBL-degradation
-seam (`:158-162`) and the power-through-RPM render it deletes (`:460`); `cam.turn` owns the lathe/CSS
-region (`:403-410`) and the diameter-mode formatting (`:229-232`, `:252-254`). `post_dialects_json`
-(`:169-175`) stays the shared **append** point both documents already declared — cutting adds `process`
-and `power_bindings`, turning adds the per-dialect turning capability row — and this reconciliation does
-not change its ownership. This paragraph is the wave ownership record for the line, recorded identically
-in `17_turning.md` and
-`18_cutting.md`; it supersedes turning's earlier "that one line
-needs a joint edit" note and cutting's earlier claim that its `post.cpp` seams are **disjoint** from
-turning's, which was false as written for `:487`.
-
-### A.3 Closure table
-
-| finding | required correction (review) | how this document closes it | where |
-|---|---|---|---|
-| **B10** (P0) — the W1.1 durable-result-kind table must be total over every domain that appends, or the append is refused `mfg_unregistered_result_kind` and the capability registration `mfg_capability_requires_durable_kind` | Extend the accepted W1.1 set; W1.1 is not green until the table is total. `cam.cut`'s nine kinds plus `cam.cut.capability` were already accepted, so cutting is not one of the four missing domains | Registration is now stated explicitly rather than implied: all nine kinds — `cam.cut.{recipe,plan,post,parse,sim,emulate,procedural_fact,capability}` and `cam.plasma.replay` — are named as the accepted W1.1 set with `cam.cut.capability` identified as this domain's `MFG-CAPABILITY-DURABLE-KIND` kind (`supersede_with_parent:false` per `MFG-CAPABILITY-NO-INHERIT`) and `{art:, job:, res:}` as its `MFG-SUBJECT-NS-DECLARED` set, registered in wave 1 as a hard predecessor of every later cut slice | §5.2 "W1.1 registration"; §12 step 1 |
-| **B15** (P1) — `post.cpp:487` requires a joint edit by two owners, and this document's "disjoint" claim is false as written | Assign the footer line to exactly one owner for the wave (turning, since it deletes a condition cut only adjusts), have cut consume the result, record it in the wave ownership table, and reconcile the false "disjoint" claim | The false claim is **withdrawn in place** in §3.2 and the line removed from cutting's `post.cpp` edit set in §3.2's post bullet; cutting makes no edit to `:487` and consumes the resulting footer behaviour, pinned from the cut side by `fixtures/mfg/cut/programs/laser_grbl_expected.nc`. Ownership is recorded in A.2, identical to the turning document | §3.2; A.2 |
-| **C9** (P3) — turning's fixtures diverge from the ratified `fixtures/mfg/**` root | `fixtures/mfg/turn/**` | No change required here: cutting's fixtures were already rooted at `fixtures/mfg/cut/**` and remain so, which is what made turning's divergence visible. Recorded so the compliance cannot be silently reverted, and so the cross-document footer golden cited in A.2 keeps a stable path | §3.5 (unchanged) |
-| **C10** (P3) — cross-reference drift on the two most load-bearing §24 rules (cutting cited the `procedural_fact` flip scope as §24.4 and the read-only transport split as §24.1; both point at unrelated rules) | Normalize cross-references and have the contract tests key on stable rule ids rather than section numbers | Every gateway section-number citation replaced by a stable rule id from the A.1 register, which restates the obligation in place so a later gateway renumbering cannot invalidate it; the wrong citations are corrected to `MFG-PFACT-FLIP-SCOPE`, `MFG-READ-TRANSPORT-SPLIT`, `MFG-CLOSURE-GATEWAY-OWNED` and `MFG-TIER0-ONE-REGISTER` | A.1; §3.3; §4.4; §5.2; §6.1; §8 tests 30-38; §9.1; §9.3; §11 |
-
-Unchanged by this appendix, and asserted here so the closure cannot be read as scope drift: all domains
-stay in scope; the shared MCP family remains `manufacture`, off by default (`MFG-FAMILY-OFF-BY-DEFAULT`);
-wire names remain `mfg_*`/`mfg.*`; cutting adds **zero** new normal-gate SKIPs (`CHUDWARE_GRBL_SIM_BIN`
-stays outside `gate.sh` behind `scripts/qualify_cut_e2.sh`); the sole freshness schema remains
-`FreshValue<T>` (`MFG-FRESHVALUE-ONE-DEFINITION`); the gateway journal owns all durable `seq` and all
-invalidation closure (`MFG-SEQ-SOLE-SOURCE`, `MFG-CLOSURE-GATEWAY-OWNED`); and cutting — a domain with a
-UI capability truth table — registers the durable capability kind `cam.cut.capability`
-(`MFG-CAPABILITY-DURABLE-KIND`).

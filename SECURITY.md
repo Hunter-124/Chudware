@@ -23,7 +23,8 @@ unless you ask to remain anonymous.
 ## Supported versions
 
 Security fixes are made on the default branch and shipped in the next release. Only the
-latest published release is supported; the in-app updater installs it.
+latest published release is supported. The optional in-app updater offers verified stable
+(non-prerelease) updates when available; its default channel does not offer prereleases.
 
 ## Scope
 

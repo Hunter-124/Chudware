@@ -24,6 +24,17 @@ def test_every_native_worker_delegated_and_lifecycle_method_is_classified(policy
     assert {"hello", "attach_doc", "edit_hold", "agent_spawn", "doc_snapshot",
             "principal_revoke", "mfg_device_claim", "fw_emulate_renode",
             "hydraulic_simulate", "material_get", "agent_admin_turn"} <= methods
+    assert policy["doc_reload"] == {"cell": "allow", "right": "write", "scope": "workspace"}
+
+
+@pytest.mark.parametrize(("method", "right"), [
+    ("parts_download_select", "write"),
+    ("reveng_find_models", "run"),
+    ("reveng_use_model", "write"),
+])
+def test_parts_reference_actions_are_actor_scoped_and_not_viewer_accessible(policy, method, right):
+    assert policy[method] == {"cell": "allow", "right": right, "scope": "actor"}
+    assert method in cell_methods.NON_READ_EXACT
 
 
 @pytest.mark.parametrize("method", [
@@ -48,6 +59,10 @@ def test_unknown_methods_have_no_prefix_or_wildcard_entry(policy):
     for method in ("agent_invented", "sim_invented", "doc_render_invented", "invented"):
         assert policy.get(method) is None
     assert not ({"*", "agent_*", "sim_*", "doc_*"} & policy.keys())
+
+def test_retired_runtime_methods_have_no_cell_admission(policy):
+    assert not any(name.startswith("chudcode_") for name in policy)
+    assert "omp_validate_key" not in policy
 
 
 @pytest.mark.parametrize("value", [None, [], {}, True, "policy"])
@@ -126,6 +141,7 @@ def test_viewer_cannot_mutate_or_execute(policy, method):
     "doc_tree", "doc_query", "doc_bbox", "doc_activate", "doc_rebuild",
     "doc_open",
     "doc_render_png", "doc_dry_run_ops", "ecad_tree", "drawing_get",
+    "ecad_footprints", "ecad_kicad_check", "ecad_kicad_libraries", "ecad_kicad_status",
     "eval_mass", "sim_study_list", "piping_route", "piping_edit", "material_get",
 ])
 def test_genuine_cad_reads_remain_viewer_accessible(policy, method):
@@ -143,8 +159,8 @@ def test_viewer_file_open_does_not_grant_import_or_document_mutation(policy):
 @pytest.mark.parametrize("method", [
     "agent_admin_turn", "agent_cancel", "agent_steer", "agent_answer",
     "agent_handles_new",
-    "chudcode_branch_session", "chudcode_close_session", "chudcode_set_key",
-    "chudcode_session_stats", "memory_recall", "memory_remember", "dag_status",
+    "omp_branch_session", "omp_close_session", "omp_set_key", "omp_logout_accounts",
+    "omp_session_stats", "memory_recall", "memory_remember", "dag_status",
     "subagent_transcript", "reveng_start_session", "sim_cancel",
 ])
 def test_private_methods_are_actor_scoped(policy, method):
@@ -154,7 +170,7 @@ def test_private_methods_are_actor_scoped(policy, method):
 
 @pytest.mark.parametrize("method", [
     "agent_cancel", "sim_cancel", "dag_abort", "subagent_terminate",
-    "agent_steer", "agent_answer", "chudcode_close_session",
+    "agent_steer", "agent_answer", "omp_close_session", "omp_apply_compaction_policy",
 ])
 def test_control_policy_never_grants_workspace_wide_actor_access(policy, method):
     assert policy[method]["scope"] == "actor"

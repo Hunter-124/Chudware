@@ -12,12 +12,15 @@
 // occupies no vertical space when no document is open (returns 0).
 #pragma once
 
+#include <functional>
+#include <string>
+
 struct AppState;
 
 namespace ui {
 
-// Height the document-tab strip wants to occupy inside the central view window. It remains visible
-// without fake tabs so the New Document button stays reachable.
+// Height the document-tab strip wants to occupy inside the central view window. Outside the
+// workspace home it stays visible without fake tabs so the New Document button stays reachable.
 float docTabStripHeight(const AppState& state);
 
 // Draw the document tab strip at the current cursor inside the central view window, spanning
@@ -28,30 +31,34 @@ float docTabStripHeight(const AppState& state);
 float drawDocTabs(AppState& state, float availW);
 
 // Wave 2 (GUI rework): request the "+" New-Document chooser popup open on the next strip draw. The
-// chooser offers New Part / New Assembly / New Drawing / New Schematic / New PCB. Used by app.cpp's
-// Ctrl+N key hook (the "+" button opens it directly). No-op if the strip isn't drawn (no document).
+// chooser offers New Part / New Assembly / New Drawing / New KiCad Project. Used by app.cpp's
+// Ctrl+N key hook (the "+" button opens it directly). Consumed even while the home hides the strip.
 void openNewDocChooser();
 
 // Create a document directly from menus/toolbars without drawing the old document strip.
-// kind: 0=Part, 1=Assembly, 2=Drawing, 3=Schematic, 4=PCB.
+// kind: 0=Part, 1=Assembly, 2=Drawing, 3=KiCad project.
 void createNewDoc(AppState& state, int kind);
 
 // Outcome of saving a single tab (for the close/quit/Save/Save-All flows).
 enum class TabSaveResult {
+    Pending,    // completion will be delivered on the UI thread
     Saved,      // written to disk this call
     Nothing,    // nothing needed saving (clean, or not a savable kind)
     Cancelled,  // user cancelled the Save-As dialog — abort any pending close/quit
     Failed,     // a save was attempted and failed (error toasted) — abort any pending close/quit
 };
 
-// Save one document tab to disk, dispatching by kind:
-//   Part/Assembly → DocMirror .step+ (re-saves to its path, or Save-As when never saved / forceDialog)
-//   Schematic/PCB → ecad_save .ecad+ (to its path, or Save-As when never saved / forceDialog)
-//   Drawing       → standalone .draw+ when available, otherwise saves its source part's .step+.
-//                   A dirty embedded drawing without an open source fails rather than closing.
-// Clears the saved tab's dirty marker (and, for a part, every drawing embedded in it). Records the
-// path in Recent. NOTE: CAD/Drawing saves switch the active document as a side effect (DocMirror must
-// point at the doc being saved); callers that must preserve the active tab restore it afterward.
-TabSaveResult saveDocTab(AppState& state, int idx, bool forceDialog);
+// Completion runs once, immediately for synchronous outcomes or later for pending RPCs.
+using TabSaveDone = std::function<void(TabSaveResult)>;
+
+// Save by the selected tab's stable identity without changing the active document.
+TabSaveResult saveDocTab(AppState& state, int idx, bool forceDialog,
+                         TabSaveDone done = {});
+
+// Save a specific CAD document to an established destination. Automatic saves must
+// not silently persist outstanding human edits; hostd enforces that condition.
+TabSaveResult saveCadDocument(AppState& state, const std::string& docId,
+                              const std::string& path, bool automatic,
+                              TabSaveDone done = {});
 
 }  // namespace ui

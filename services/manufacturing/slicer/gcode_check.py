@@ -21,6 +21,8 @@ from pathlib import Path
 import numpy as np
 from scipy import ndimage
 
+from ..print_safety import UnsafePrintFile, validate_print_filename, validate_print_line
+
 _WORD = re.compile(r'([A-Za-z])\s*([-+]?(?:\d*\.\d+|\d+\.?\d*)(?:[eE][-+]?\d+)?)')
 _EXCLUDED = ('Skirt', 'Brim', 'Wipe tower', 'Custom')
 _FLOATING_CLASSES = {
@@ -124,6 +126,7 @@ def parse_gcode(path, *, track_objects: bool = False) -> GcodeModel:
     ``track_objects`` additionally attributes extrusion to the slicer's object labels
     (``; printing object <name> id:N copy M``; without labels, a layer Z that drops back
     starts a new object) and keeps every motion segment, for the sequential-print check."""
+    validate_print_filename(Path(path).name)
     model = GcodeModel()
     buffers: dict[float, array] = {}
     heights: dict[float, float] = {}
@@ -155,8 +158,9 @@ def parse_gcode(path, *, track_objects: bool = False) -> GcodeModel:
     moves = array('f') if track_objects else None
     move_count = 0
     untracked_roles = tuple(_EXCLUDED)
-    with Path(path).open('r', encoding='utf-8', errors='replace') as stream:
-        for raw in stream:
+    with Path(path).open('r', encoding='utf-8-sig') as stream:
+        for line_number, raw in enumerate(stream, 1):
+            validate_print_line(raw, line_number)
             line = raw.strip()
             if not line:
                 continue
@@ -727,6 +731,9 @@ def verify_gcode(path, *, bed_polygon=None, max_height_mm=None, material=None, n
         model = parse_gcode(path, track_objects=_tail_flag(path, 'complete_objects'))
         if model.config.get('complete_objects') == '1' and model.moves is None:
             model = parse_gcode(path, track_objects=True)
+    except (UnsafePrintFile, UnicodeDecodeError) as exc:
+        return dict(ok=False, status='fail',
+                    checks=[_row('unsafe_print_file', 'fail', str(exc))], stats={})
     except _AnalysisRefused as exc:
         return _refusal(exc)
     checks = []

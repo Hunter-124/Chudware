@@ -16,6 +16,7 @@ from pathlib import Path as _Path
 from typing import Any, Optional
 import sqlite3 as _sqlite3
 import tempfile as _tempfile
+import hashlib as _hashlib
 
 from services.agent import request_context as _rc
 
@@ -181,7 +182,11 @@ def _session_path(session_id: str, *, create: bool = False) -> _Path:
     return path
 
 
-def _list_sessions() -> list[dict]:
+def _list_sessions(project_dir: Optional[str] = None) -> list[dict]:
+    # An explicit folder wins; else the bound agent project root; else no filter. An empty
+    # string is "unknown", never realpath("") (which would silently mean the worker's cwd).
+    root = None if _rc.in_cell() else (project_dir or _rc.root_value("CHUDWARE_PROJECT_DIR"))
+    target = _os.path.normcase(_os.path.realpath(root)) if root else None
     base = _reveng_dir()
     if not base.is_dir():
         return []
@@ -191,7 +196,9 @@ def _list_sessions() -> list[dict]:
             manifest = _json.loads(path.read_text())
             _require_record_owner(manifest)
             session = _load_session(manifest["session_id"])
-            if session is not None:
+            if (session is not None and
+                    (target is None or (session.get("project_dir") and
+                     _os.path.normcase(_os.path.realpath(session["project_dir"])) == target))):
                 sessions.append(session)
         except (OSError, ValueError, KeyError, TypeError):
             continue
@@ -211,10 +218,11 @@ def _now_iso() -> str:
     return datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _make_session(session_id: str, name: str, part_ref: Optional[str]) -> dict:
+def _make_session(session_id: str, name: str, part_ref: Optional[str],
+                  project_dir: Optional[str] = None) -> dict:
     _validate_handle(session_id)
     now = _now_iso()
-    return {
+    session = {
         "schema": "aicad.reveng_session/1",
         "session_id": session_id,
         "_owner": _rc.owner_key(),
@@ -223,6 +231,7 @@ def _make_session(session_id: str, name: str, part_ref: Optional[str]) -> dict:
         "updated_at": now,
         "status": "capturing",
         "part_ref": part_ref,
+        "lane": "scan",
         "stages": {
             "capture": "idle",
             "scale": "pending",
@@ -251,6 +260,10 @@ def _make_session(session_id: str, name: str, part_ref: Optional[str]) -> dict:
         },
         "provenance": [],
     }
+    if not _rc.in_cell():
+        root = project_dir or _rc.root_value("CHUDWARE_PROJECT_DIR")
+        session["project_dir"] = _os.path.realpath(root) if root else None
+    return session
 
 
 def _load_session(session_id: str, *, merge_gaussian: bool = True) -> Optional[dict]:
@@ -260,15 +273,44 @@ def _load_session(session_id: str, *, merge_gaussian: bool = True) -> Optional[d
         if not isinstance(session, dict) or session.get("session_id") != session_id:
             raise KeyError("not_found")
         _require_record_owner(session)
+        # Bundle manifests carry portable session-relative mesh paths.
+        artifacts = session.get("artifacts")
+        if isinstance(artifacts, dict):
+            root = p.parent.resolve()
+            for key in ("mesh_path", "raw_mesh_path"):
+                value = artifacts.get(key)
+                if isinstance(value, str) and value and not _Path(value).is_absolute():
+                    resolved = (root / value).resolve()
+                    if not resolved.is_relative_to(root):
+                        raise KeyError("not_found")
+                    artifacts[key] = str(resolved)
         from services.reveng.gaussian_jobs import status as splat_status
         gaussian = splat_status(session_id) if merge_gaussian else {}
         if gaussian.get("run_id"):
             session["gaussian"] = gaussian
             artifacts = session.setdefault("artifacts", {})
-            for key in ("splat_path", "sparse_dir"):
-                value = gaussian.get(key)
-                if value:
-                    artifacts[key] = str(_Path(value).resolve())
+            # Persisted artifacts (including imported or calibrated splats) take
+            # precedence over the supervisor's native-gauge preview.
+            dataset = session.get("sfm_dataset") or {}
+            same_gauge = bool(dataset.get("dataset_dir")
+                              and dataset.get("dataset_dir") == gaussian.get("dataset_dir"))
+            legacy_preview = (not dataset and not session.get("recon_transform")
+                              and not session.get("imported_splat") and not artifacts.get("mesh_path"))
+            if (not artifacts.get("splat_path") and gaussian.get("splat_path")
+                    and (same_gauge or legacy_preview)):
+                artifacts["splat_path"] = str(_Path(gaussian["splat_path"]).resolve())
+            if (artifacts.get("splat_transform_applied") and session.get("recon_transform")
+                    and artifacts.get("raw_splat_path") == gaussian.get("splat_path")
+                    and gaussian.get("view_camera")):
+                import numpy as np
+                from services.vision.recon_transform import ReconTransform
+                transform = ReconTransform.from_json(session["recon_transform"])
+                camera = dict(gaussian["view_camera"])
+                camera["eye"] = transform.apply(np.asarray(camera["eye"])).tolist()
+                for key in ("forward", "up"):
+                    camera[key] = (np.asarray(transform.rotation) @ np.asarray(camera[key])).tolist()
+                camera["focus_distance"] *= transform.mm_per_unit
+                gaussian["view_camera"] = camera
         return session
     except (OSError, ValueError, KeyError, TypeError):
         if _rc.in_cell():
@@ -285,19 +327,290 @@ def _save_session(session: dict) -> None:
     from services.reveng.gaussian_jobs import _atomic, _read
     stored = dict(session)
     gaussian = stored.pop("gaussian", None)
-    if isinstance(gaussian, dict) and gaussian.get("run_id"):
-        # Projection is read-only. A later capture save must not bake Gaussian
-        # sparse coordinates into the CAD mission's own artifact namespace.
-        previous = _read(_session_json_path(sid)).get("artifacts") or {}
+    if isinstance(gaussian, dict) and gaussian.get("splat_path"):
         artifacts = dict(stored.get("artifacts") or {})
-        for key in ("splat_path", "sparse_dir"):
-            if gaussian.get(key) and artifacts.get(key) == gaussian[key]:
-                if key in previous:
-                    artifacts[key] = previous[key]
-                else:
-                    artifacts.pop(key, None)
-        stored["artifacts"] = artifacts
+        projected = str(_Path(gaussian["splat_path"]).resolve())
+        if artifacts.get("splat_path") == projected:
+            previous = _read(_session_json_path(sid)).get("artifacts") or {}
+            if "splat_path" in previous:
+                artifacts["splat_path"] = previous["splat_path"]
+            else:
+                artifacts.pop("splat_path", None)
+            stored["artifacts"] = artifacts
     _atomic(_session_json_path(sid), stored)
+
+
+def _find_reference_models(query: str, *, limit: int = 8) -> dict:
+    try:
+        return _find_reference_models_impl(query, limit=limit)
+    except Exception as exc:
+        return {"ok": False, "reason": "model_search_failed", "hint": str(exc)}
+
+
+def _find_reference_models_impl(query: str, *, limit: int = 8) -> dict:
+    """Find available reference CAD without claiming uncertain matches are exact."""
+    import re
+    from urllib.parse import urlparse, unquote
+
+    query = str(query or "").strip()
+    if not query:
+        return {"ok": False, "reason": "query_required", "hint": "Provide a product name, part number, or model URL."}
+    parsed = urlparse(query)
+    if parsed.scheme in ("http", "https") and parsed.hostname:
+        return {
+            "ok": True, "query": query,
+            "candidates": [{"title": unquote(_Path(parsed.path).name) or query,
+                            "site": (parsed.hostname.split(".")[-2]
+                                     if parsed.hostname.endswith(".com") else parsed.hostname), "url": query,
+                            "confidence": "exact", "attach": False}],
+            "standard_part": None, "coverage": {"sites_searched": 0, "raw_hits": 1},
+            "hint": "Use the URL to acquire this reference model.",
+        }
+
+    from services.parts.model_matcher import match_model
+    mpn = query if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9\-./]{2,30}", query) and any(
+        c.isdigit() for c in query) else ""
+    # Pull the whole fan-out: match_model orders a tier by part_id, so its own cut would keep an
+    # arbitrary alphabetical slice of the (usually all-"weak") title matches.
+    result = match_model({"title": query, "mpn": mpn}, limit=50)
+    if not result.get("ok"):
+        return result
+    candidates = []
+    standard_part = None
+    for match in result.get("matches", []):
+        plan = match.get("artifact_plan") or {}
+        if match.get("site") == "standard_hardware":
+            standard_part = {"title": match.get("title"), "family": plan.get("family"),
+                             "size": plan.get("size"), "plan": plan}
+            continue
+        part_id = str(match.get("part_id") or "")
+        url = part_id.split("::", 1)[1] if part_id.startswith("catalog:") and "::" in part_id else ""
+        parsed_url = urlparse(url)
+        if parsed_url.scheme not in ("http", "https") or not parsed_url.hostname:
+            continue
+        candidates.append({"title": match.get("title"), "site": match.get("site"),
+                           "url": url, "confidence": match.get("confidence"),
+                           "attach": bool(match.get("attach"))})
+    # Within a confidence tier, prefer titles that are mostly the query ("Servo MG996R") over
+    # titles that merely mention it ("Robotic gripper for MG996R servo ...").
+    tier_rank = {"exact": 0, "strong": 1}
+    wanted = set(re.findall(r"[a-z0-9]+", query.lower()))
+
+    def _relevance(candidate: dict) -> tuple:
+        words = re.findall(r"[a-z0-9]+", str(candidate.get("title") or "").lower())
+        shared = len(wanted & set(words))
+        return (tier_rank.get(candidate.get("confidence"), 2),
+                -(shared / len(words)) if words else 0.0, -shared)
+
+    candidates = sorted(candidates, key=_relevance)[:max(1, int(limit or 8))]
+    coverage = result.get("coverage") or {"sites_searched": 0, "raw_hits": 0}
+    if candidates:
+        hint = "Confirm the model identity before using it."
+    elif standard_part:
+        hint = "Use the standard part plan to create the matching model."
+    elif not coverage.get("sites_searched"):
+        hint = ("No CAD-model site was reachable (the browser stack is unavailable; only public "
+                "Printables is searched without it). Paste a model URL or drop a downloaded CAD file.")
+    else:
+        hint = "No existing model found — build one from a datasheet or specs."
+    return {"ok": True, "query": query, "candidates": candidates,
+            "standard_part": standard_part, "coverage": coverage, "hint": hint}
+
+
+def _has_reference_match(result: dict) -> bool:
+    """True when building our own model would likely duplicate one that already exists.
+
+    Community CAD sites carry no part-number field, so a GrabCAD "Servo MG996R" is only a
+    title ("weak") match; it still counts when its title contains every word of the query.
+    """
+    import re
+    wanted = set(re.findall(r"[a-z0-9]+", str(result.get("query") or "").lower()))
+
+    def covers(candidate: dict) -> bool:
+        title = set(re.findall(r"[a-z0-9]+", str(candidate.get("title") or "").lower()))
+        return bool(wanted) and wanted <= title
+
+    return bool(result.get("standard_part") or any(
+        candidate.get("confidence") in ("exact", "strong") or covers(candidate)
+        for candidate in result.get("candidates", [])))
+
+
+def _store_reference_search(session: dict, result: dict) -> None:
+    reference = session.setdefault("reference", {})
+    reference.update({key: result.get(key) for key in
+                      ("query", "candidates", "standard_part", "coverage", "hint")})
+    reference["status"] = "done"
+    reference.pop("error", None)
+    reference["searched_at"] = _now_iso()
+    _save_session(session)
+
+
+def _start_reference_search(session: dict, query: str, limit: int) -> None:
+    """Run the CAD-library fan-out off the request thread; the result lands in the session.
+
+    The fan-out renders ~20 vendor pages through the single-request CEF daemon (roughly a
+    minute and a half cold), and worker stdio dispatch is serialized, so a blocking call would
+    stall every other GUI request. ``reference.status`` is ``searching`` until the thread stores
+    ``done`` (with the results) or ``failed`` (with ``error``); a newer search for a different
+    query supersedes an older one, whose late result is dropped.
+    """
+    import contextvars
+
+    sid = session["session_id"]
+    reference = session.setdefault("reference", {})
+    reference.update(query=query, status="searching", started_at=_now_iso())
+    reference.pop("error", None)
+    _save_session(session)
+
+    def run() -> None:
+        result = _find_reference_models(query, limit=limit)
+        try:
+            with _REFERENCE_SEARCH_LOCK:
+                current = _load_session(sid)
+                if current is None or (current.get("reference") or {}).get("query") != query:
+                    return
+                if result.get("ok"):
+                    _store_reference_search(current, result)
+                else:
+                    current["reference"].update(
+                        status="failed",
+                        error=" — ".join(str(v) for v in (result.get("reason"), result.get("hint"))
+                                         if v))
+                    _save_session(current)
+        except Exception:  # noqa: BLE001 — a daemon thread has no caller to report to
+            import logging
+            logging.getLogger(__name__).exception("reference model search for %s failed", sid)
+
+    context = contextvars.copy_context()   # carries the caller's owner / project binding
+    _threading.Thread(target=context.run, args=(run,), name=f"reveng-find-{sid}",
+                      daemon=True).start()
+
+
+_REFERENCE_SEARCH_LOCK = _threading.Lock()
+
+
+def _invalidate_downstream(session: dict) -> None:
+    """Detach current derived state without deleting already published snapshots."""
+    artifacts = session.setdefault("artifacts", {})
+    for key in ("fits_path", "step_path", "cadquery_path", "mesh_materialization"):
+        artifacts.pop(key, None)
+    artifacts["doc_id"] = None
+    session.pop("result", None)
+    for stage in ("model", "review", "deliver"):
+        session.setdefault("stages", {})[stage] = "idle"
+
+def _reset_transform_artifacts(session: dict) -> None:
+    """Restore native previews without discarding the current cleaned surface."""
+    artifacts = session.setdefault("artifacts", {})
+    raw_splat = artifacts.get("raw_splat_path")
+    if artifacts.get("splat_transform_applied") and not raw_splat:
+        raise ValueError("cannot recalibrate transformed splat without its native artifact")
+    mesh = artifacts.get("mesh_path")
+    raw = artifacts.get("raw_mesh_path")
+    if mesh and artifacts.get("mesh_transform_applied"):
+        old = session.get("recon_transform")
+        materialized = artifacts.get("mesh_materialization") or {}
+        can_reuse_raw = bool(
+            raw and _Path(raw).is_file() and old
+            and materialized.get("recon_transform") == old
+            and materialized.get("source_sha256") == _file_sha256(str(raw))
+            and materialized.get("mesh_sha256") == _file_sha256(str(mesh))
+        )
+        if not can_reuse_raw:
+            if not old:
+                raise ValueError("cannot recalibrate transformed mesh without its previous transform")
+            import numpy as np
+            from services.vision.mesh_cleanup import apply_transform_to_mesh
+            from services.vision.recon_transform import ReconTransform
+            previous = ReconTransform.from_json(old)
+            inverse_rotation = np.asarray(previous.rotation).T
+            inverse = ReconTransform(
+                1.0 / previous.mm_per_unit, inverse_rotation.tolist(),
+                (-inverse_rotation @ np.asarray(previous.translation_mm)
+                 / previous.mm_per_unit).tolist(), source="inverse_reconstruction")
+            target = _session_path(session["session_id"]) / "mesh" / f"native-{_secrets.token_hex(8)}.ply"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = target.with_name(".pending-" + target.name)
+            try:
+                result = apply_transform_to_mesh(str(mesh), inverse.to_json(), str(temporary))
+                if not result.get("ok"):
+                    raise ValueError("could not restore native measurement mesh: "
+                                     + str(result.get("reason") or result))
+                _os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
+            raw = str(target)
+            artifacts["raw_mesh_path"] = raw
+        artifacts.update(mesh_path=raw, mesh_units="reconstruction", mesh_transform_applied=False)
+    if raw_splat:
+        artifacts.update(splat_path=raw_splat, splat_units="reconstruction",
+                         splat_transform_applied=False)
+    artifacts.pop("mesh_materialization", None)
+
+
+def _file_sha256(path: str) -> str:
+    digest = _hashlib.sha256()
+    with _Path(path).open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _fit_provenance(session: dict) -> dict:
+    """Bind fits to actual mesh bytes and the complete reconstruction transform."""
+    artifacts = session.get("artifacts") or {}
+    mesh = artifacts.get("mesh_path")
+    if not mesh:
+        raise ValueError("no measurement mesh")
+    raw = artifacts.get("raw_mesh_path") or mesh
+    mesh_hash = _file_sha256(str(mesh))
+    return {
+        "mesh_path": str(mesh),
+        "mesh_sha256": mesh_hash,
+        "raw_mesh_sha256": mesh_hash if raw == mesh else _file_sha256(str(raw)),
+        "mesh_transform_applied": bool(artifacts.get("mesh_transform_applied")),
+        "recon_transform": session.get("recon_transform"),
+    }
+
+
+def _load_current_fits(session: dict) -> Optional[dict]:
+    """Load explicitly attached fits only when their geometry and calibration match."""
+    artifacts = session.get("artifacts") or {}
+    path = artifacts.get("fits_path")
+    if not path:
+        return None
+    try:
+        path = _Path(path)
+        root = _session_path(session["session_id"])
+        if not path.is_absolute():
+            path = root / path
+        if _rc.in_cell() and not path.resolve().is_relative_to(root.resolve()):
+            return None
+        fits = _json.loads(path.read_text())
+        if not isinstance(fits, dict):
+            return None
+        provenance = fits.get("provenance")
+        if not isinstance(provenance, dict):
+            return None
+        current = _fit_provenance(session)
+        if (provenance.get("recon_transform") != current["recon_transform"]
+                or provenance.get("raw_mesh_sha256") != current["raw_mesh_sha256"]):
+            return None
+        if (provenance.get("mesh_sha256") == current["mesh_sha256"]
+                and provenance.get("mesh_transform_applied") == current["mesh_transform_applied"]):
+            return fits
+        # Applying the identical similarity to the same source mesh is not a
+        # replacement. Verify both source and output bytes before reusing fits.
+        materialized = artifacts.get("mesh_materialization") or {}
+        if (not provenance.get("mesh_transform_applied")
+                and current["mesh_transform_applied"]
+                and materialized.get("source_sha256") == provenance.get("mesh_sha256")
+                and materialized.get("mesh_sha256") == current["mesh_sha256"]
+                and materialized.get("recon_transform") == current["recon_transform"]):
+            return fits
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    return None
 
 
 def _session_summary(s: dict) -> dict:
@@ -308,6 +621,8 @@ def _session_summary(s: dict) -> dict:
         "created_at": s["created_at"],
         "updated_at": s["updated_at"],
         "part_ref": s.get("part_ref"),
+        "project_dir": s.get("project_dir"),
+        "lane": s.get("lane", "scan"),
         "images": len(_session_image_paths(s["session_id"])),
     }
     gaussian = s.get("gaussian")
@@ -542,6 +857,105 @@ def _session_image_paths(session_id: str) -> list[str]:
                 paths.append(str(p.resolve()))
     return paths
 
+def _source_signature(paths: list[str]) -> list[dict]:
+    """Identify the exact input set whose arbitrary SfM gauge is being reused."""
+    rows = []
+    for name in paths:
+        path = _Path(name).resolve()
+        stat = path.stat()
+        rows.append({"path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
+    return rows
+
+
+def _dataset_matches(dataset: dict, paths: list[str]) -> bool:
+    try:
+        return (dataset.get("source_signature") == _source_signature(paths)
+                and _Path(dataset["dataset_dir"]).is_dir()
+                and _Path(dataset["sparse_dir"]).is_dir()
+                and _Path(dataset["images_dir"]).is_dir())
+    except (OSError, KeyError, TypeError):
+        return False
+
+def _splat_sparse_dir(session: dict, splat_path: str) -> Optional[str]:
+    """Only pair camera poses with a splat known to share their SfM gauge."""
+    if session.get("imported_splat"):
+        return None
+    dataset = session.get("sfm_dataset") or {}
+    dataset_dir = dataset.get("dataset_dir")
+    artifacts = session.get("artifacts") or {}
+    if not dataset_dir or not splat_path or not artifacts.get("raw_splat_path"):
+        return None
+    if _Path(splat_path).resolve() != _Path(artifacts["raw_splat_path"]).resolve():
+        return None
+    gaussian = session.get("gaussian") or {}
+    supervised_match = (
+        gaussian.get("dataset_dir") == dataset_dir
+        and gaussian.get("splat_path")
+        and _Path(gaussian["splat_path"]).resolve() == _Path(splat_path).resolve()
+    )
+    if artifacts.get("splat_dataset_dir") != dataset_dir and not supervised_match:
+        return None
+    if not _dataset_matches(dataset, _session_image_paths(session["session_id"])):
+        return None
+    return str(dataset["sparse_dir"])
+
+
+def _materialize_metric_splat(session: dict) -> None:
+    """Publish a transformed PLY from the immutable native cloud, never twice."""
+    transform = session.get("recon_transform")
+    artifacts = session.setdefault("artifacts", {})
+    raw = artifacts.get("raw_splat_path") or artifacts.get("splat_path")
+    if not transform or not raw or not _Path(raw).is_file():
+        return
+    from services.formats.splat_io import load_splat, save_splat, transform_gaussian
+    from services.vision.recon_transform import ReconTransform
+    target = _session_path(session["session_id"]) / "splat" / f"metric-{_secrets.token_hex(8)}.ply"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    cloud = transform_gaussian(load_splat(raw), ReconTransform.from_json(transform))
+    fd, temporary = _tempfile.mkstemp(prefix=".metric-", dir=target.parent)
+    _os.close(fd)
+    try:
+        save_splat(cloud, temporary, "ply")
+        _os.replace(temporary, target)
+    finally:
+        _Path(temporary).unlink(missing_ok=True)
+    artifacts.update(raw_splat_path=str(_Path(raw).resolve()), splat_path=str(target),
+                     splat_units="mm", splat_transform_applied=True)
+
+
+def _metric_mesh(session: dict) -> tuple[Optional[str], Optional[dict]]:
+    """Materialize an already confirmed transform once for CAD and deviation."""
+    artifacts = session.get("artifacts") or {}
+    path = artifacts.get("mesh_path")
+    if not path:
+        return None, {"ok": False, "reason": "no_mesh"}
+    if artifacts.get("mesh_transform_applied"):
+        return path, None
+    transform = session.get("recon_transform")
+    if not transform or not transform.get("confirmed"):
+        return None, {"ok": False, "reason": "scale_unconfirmed",
+                      "hint": "Confirm a reconstruction scale before building or measuring a CAD part."}
+    source_sha256 = _file_sha256(str(path))
+    from services.vision.mesh_cleanup import apply_transform_to_mesh
+    target = _session_path(session["session_id"]) / "mesh" / f"metric-{_secrets.token_hex(8)}.ply"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(".pending-" + target.name)
+    try:
+        result = apply_transform_to_mesh(path, transform, str(temporary))
+        if not result.get("ok"):
+            return None, result
+        _os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    artifacts.update(raw_mesh_path=artifacts.get("raw_mesh_path") or path,
+                     mesh_path=str(target), mesh_units="mm", mesh_transform_applied=True,
+                     mesh_materialization={"source_sha256": source_sha256,
+                                           "mesh_sha256": _file_sha256(str(target)),
+                                           "recon_transform": transform})
+    session["artifacts"] = artifacts
+    _save_session(session)
+    return str(target), None
+
 
 def _registration_ratio(sparse_result: dict, n_images: int) -> float:
     """Fraction of images registered by sparse SfM (0..1)."""
@@ -617,6 +1031,8 @@ def _make_pipeline_agent_fn(
     session_id: str,
     *,
     strategy: str = "deterministic",
+    quality: str = "normal",
+    backend: Optional[str] = None,
     progress: Optional[Any] = None,
 ):
     """Return a deterministic node ``agent_fn`` that runs the RE pipeline stages.
@@ -686,14 +1102,55 @@ def _make_pipeline_agent_fn(
                 return False, "no_images", {
                     "detail": "session has no images/ or frames/ for reconstruction",
                 }
-            session_dir = str(_session_path(session_id))
-            image_dir = str(_session_path(session_id) / "images")
-            # Prefer images/ when present; otherwise point at frames/.
-            if not (_session_path(session_id) / "images").is_dir() or not any(
-                _session_path(session_id).joinpath("images").iterdir()
-                if (_session_path(session_id) / "images").is_dir() else []
-            ):
-                image_dir = str(_session_path(session_id) / "frames")
+            root = _session_path(session_id)
+            session_dir = str(root)
+            s = _load_session(session_id, merge_gaussian=False) or _make_session(session_id, session_id, None)
+            dataset = s.get("sfm_dataset") or {}
+            if _dataset_matches(dataset, images):
+                return True, "reused shared sparse dataset", {
+                    "sparse": {"ok": True, "registered": dataset.get("registered", 0),
+                               "backend": "shared_dataset"},
+                    "sparse_dir": dataset["sparse_dir"], "used_ffwd": False,
+                    "dataset_dir": dataset["dataset_dir"], "reused": True,
+                }
+            if (dataset or s.get("recon_transform") or (s.get("scale") or {}).get("mm_per_unit")
+                    or (s.get("artifacts") or {}).get("mesh_path")
+                    or (s.get("artifacts") or {}).get("doc_id")):
+                # A new solve has an unrelated gauge; no old scale or geometry is valid.
+                _invalidate_downstream(s)
+                s.pop("recon_transform", None)
+                s.pop("axis_alignment", None)
+                s.pop("sfm_dataset", None)
+                s["scale"] = {"method": None, "mm_per_unit": None,
+                              "residual_pct": None, "confirmed": False}
+                for key in ("sparse_dir", "mesh_path", "raw_mesh_path", "mesh_units",
+                            "mesh_transform_applied", "splat_path", "raw_splat_path",
+                            "splat_units", "splat_transform_applied", "splat_dataset_dir",
+                            "mesh_materialization"):
+                    s.setdefault("artifacts", {}).pop(key, None)
+                s.setdefault("provenance", []).append({
+                    "step": "invalidate_sfm_gauge", "reason": "capture inputs changed",
+                    "ts": _now_iso(),
+                })
+                _save_session(s)
+            work_base = root / "sfm"
+            work_base.mkdir(parents=True, exist_ok=True)
+            work = _Path(_tempfile.mkdtemp(prefix="solve-", dir=work_base))
+            input_dir = work / "input_images"
+            input_dir.mkdir()
+            source_map = {}
+            signature = _source_signature(images)
+            for index, source in enumerate(images):
+                src = _Path(source)
+                name = f"{index:06d}_{src.name}"
+                _shutil.copy2(src, input_dir / name)
+                source_map[name] = str(src.resolve())
+            if signature != _source_signature(images):
+                return False, "capture_changed", {"detail": "input images changed during snapshot"}
+            image_dir = str(input_dir)
+            solve_dir = str(work / "solve")
+            _Path(solve_dir).mkdir()
+            staged_images = [str(input_dir / name) for name in source_map]
 
             sparse_result: dict = {"ok": False, "reason": "sparse_not_attempted"}
             used_ffwd = False
@@ -701,6 +1158,7 @@ def _make_pipeline_agent_fn(
             # Primary sparse: COLMAP / pycolmap
             try:
                 from services.vision.colmap_pipeline import run_sparse  # noqa: PLC0415
+                from services.vision.frames import clip_camera_groups  # noqa: PLC0415
             except Exception as exc:  # noqa: BLE001
                 run_sparse = None  # type: ignore[assignment]
                 sparse_result = {
@@ -710,7 +1168,9 @@ def _make_pipeline_agent_fn(
                 }
             if run_sparse is not None:
                 try:
-                    sparse_result = run_sparse(image_dir, session_dir) or {
+                    sparse_result = run_sparse(
+                        image_dir, solve_dir, single_camera=False,
+                        camera_groups=clip_camera_groups(source_map)) or {
                         "ok": False, "reason": "run_sparse returned empty",
                     }
                 except Exception as exc:  # noqa: BLE001
@@ -727,12 +1187,21 @@ def _make_pipeline_agent_fn(
             if weak:
                 try:
                     from services.vision.ffwd_sfm import run_ffwd_sfm  # noqa: PLC0415
-                    ffwd = run_ffwd_sfm(images, session_dir) or {
+                    from services.vision.colmap_pipeline import read_model
+                    ffwd_root = work / "ffwd"
+                    ffwd = run_ffwd_sfm(staged_images, str(ffwd_root)) or {
                         "ok": False, "reason": "run_ffwd_sfm returned empty",
                     }
                     if ffwd.get("ok"):
-                        sparse_result = ffwd
-                        used_ffwd = True
+                        candidate = ffwd.get("sparse_dir") or str(ffwd_root / "sparse")
+                        _, _, points = read_model(candidate)
+                        if points:
+                            ffwd["sparse_dir"] = candidate
+                            sparse_result = ffwd
+                            used_ffwd = True
+                        elif not sparse_result.get("ok"):
+                            sparse_result = {"ok": False, "reason": "ffwd_has_no_sparse_points",
+                                             "hint": "Feed-forward poses alone cannot train or reconstruct a surface."}
                     elif not sparse_result.get("ok"):
                         sparse_result = ffwd
                 except Exception as exc:  # noqa: BLE001
@@ -750,18 +1219,27 @@ def _make_pipeline_agent_fn(
                     sparse_result,
                 )
 
-            sparse_dir = (
-                sparse_result.get("sparse_dir")
-                or str(_Path(session_dir) / "sparse")
-            )
-            s = _load_session(session_id, merge_gaussian=False) or _make_session(session_id, session_id, None)
-            s.setdefault("artifacts", {})
-            s["artifacts"]["sparse_dir"] = sparse_dir
+            sparse_dir = sparse_result.get("sparse_dir") or str(_Path(solve_dir) / "sparse")
+            try:
+                from services.vision.colmap_pipeline import prepare_dataset
+                dataset = prepare_dataset(sparse_dir, image_dir, str(work / "dataset"),
+                                          source_image_map=source_map) or {}
+            except Exception as exc:
+                return False, "dataset_preparation_failed", {"detail": str(exc)}
+            if not dataset.get("ok"):
+                return False, dataset.get("reason") or "dataset_preparation_failed", dataset
+            dataset["source_signature"] = signature
+            dataset["source_images"] = images
+            s = _load_session(session_id, merge_gaussian=False) or s
+            s["sfm_dataset"] = dataset
+            s.setdefault("artifacts", {})["sparse_dir"] = dataset["sparse_dir"]
             s["stages"]["reconstruct"] = "running"
             _save_session(s)
             return True, "sparse model registered", {
                 "sparse": sparse_result,
-                "sparse_dir": sparse_dir,
+                "sparse_dir": dataset["sparse_dir"],
+                "dataset_dir": dataset["dataset_dir"],
+                "submitted": len(images), "registration_ratio": _registration_ratio(sparse_result, len(images)),
                 "used_ffwd": used_ffwd,
             }
 
@@ -773,140 +1251,123 @@ def _make_pipeline_agent_fn(
             require_confirmed_scale: bool,
             provenance_step: str,
         ) -> tuple[bool, str, dict]:
-            """Dense MVS + mesh cleanup. Returns ``(ok, reason, payload)``.
-
-            ``require_confirmed_scale`` decides which scales may touch the geometry.
-            On the gated template path the scale-confirm gate is immediately upstream,
-            so only a scale a human actually confirmed is applied — that gate is the
-            product's guarantee that the delivered millimetres were validated.  The
-            ungated ``n_reconstruct`` compatibility path has no such gate, so it keeps
-            the historical rule (apply any solved ratio).  Neither path ever invents a
-            factor: with nothing usable the mesh stays in reconstruction units and
-            ``artifacts.mesh_units`` says exactly that.
-            """
+            """Build visual splats and a surface from the same immutable SfM gauge."""
             session_dir = str(_session_path(session_id))
-            s = _load_session(session_id, merge_gaussian=False) or _make_session(session_id, session_id, None)
-            if not sparse_dir:
-                sparse_dir = (s.get("artifacts") or {}).get("sparse_dir")
-            if not sparse_dir:
-                return False, "no_sparse", {
-                    "detail": "dense reconstruction consumes the COLMAP sparse model",
-                    "hint": "run the n_sparse node (reveng_reconstruct) first",
-                }
+            s = _load_session(session_id, merge_gaussian=False) or {}
+            dataset = s.get("sfm_dataset") or {}
+            dataset_dir = dataset.get("dataset_dir")
+            if not dataset_dir or not _dataset_matches(dataset, _session_image_paths(session_id)):
+                return False, "no_shared_dataset", {
+                    "hint": "Run sparse reconstruction for the current capture set first."}
+            sparse_dir = dataset["sparse_dir"]
+            notes = []
+            mesh_path = None
+            approximate = False
+            splat_path = (s.get("artifacts") or {}).get("raw_splat_path")
+            if splat_path and not _splat_sparse_dir(_load_session(session_id) or s, splat_path):
+                # Existing clouds without matching provenance belong to another gauge.
+                splat_path = None
 
-            # CAD reconstruction requires an actual mesh. Brush belongs exclusively
-            # to gaussian_jobs; a Gaussian PLY is never a mesh reconstruction.
-            mesh_path: Optional[str] = None
-            dense_notes: list = []
-
-            if _os.environ.get("OPENMVS_BIN"):
-                _progress("dense", 45, "dense MVS (OpenMVS) started")
+            if backend not in ("brush", "splat"):
+                _progress("dense", 45, "Dense MVS (OpenMVS) started")
                 try:
-                    from services.vision.dense_backends import run_openmvs  # noqa: PLC0415
-                    omvs = run_openmvs(sparse_dir, session_dir) or {}
+                    from services.vision.dense_backends import run_openmvs
+                    omvs = run_openmvs(
+                        dataset_dir, session_dir,
+                        working_resolution={"draft": 2, "normal": 1, "high": 0}[quality],
+                        texture_size={"draft": 1024, "normal": 2048, "high": 4096}[quality]) or {}
                     if omvs.get("ok") and omvs.get("mesh_path"):
                         mesh_path = omvs["mesh_path"]
-                        dense_notes.append("openmvs")
-                        _progress("dense", 55, "dense MVS complete", mesh_path)
+                        notes.append("openmvs")
                     else:
-                        dense_notes.append(
-                            f"openmvs:{omvs.get('reason') or 'failed'}"
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    dense_notes.append(f"openmvs_import:{exc}")
-
-            if not mesh_path:
-                # Sparse-only is not a full reconstruct success for the mesh path,
-                # but if sparse ok we still report honest partial.
-                s = _load_session(session_id, merge_gaussian=False) or s
-                s.setdefault("artifacts", {})
-                s["artifacts"]["sparse_dir"] = sparse_dir
-                _save_session(s)
-                return False, "no_mesh", {
-                    "sparse": sparse_result,
-                    "dense_notes": dense_notes,
-                    "used_ffwd": used_ffwd,
-                    "hint": "Configure OPENMVS_BIN for CAD mesh reconstruction; "
-                            "use reveng_start_splat for the separate Gaussian workflow.",
-                }
-
-            # Mesh cleanup when we have a mesh.
-            #
-            # session.scale.mm_per_unit is a RATIO (multiply reconstruction-space lengths
-            # by it to get mm) — exactly what cleanup_mesh's mm_per_unit means. When no
-            # usable scale is on the session, leave the mesh in reconstruction units
-            # rather than inventing a factor, and say so on the session.
-            cleaned = mesh_path
-            mesh_unscaled = True
-            if mesh_path:
-                _progress("mesh", 62, "mesh cleanup started", mesh_path)
+                        notes.append("openmvs:" + str(omvs.get("reason") or "failed"))
+                except Exception as exc:
+                    notes.append(f"openmvs:{exc}")
+            if not splat_path or not _Path(splat_path).is_file():
+                _progress("splat", 50, "Training Gaussian splat from shared cameras")
                 try:
-                    from services.vision.mesh_cleanup import cleanup_mesh  # noqa: PLC0415
-                    out_clean = str(
-                        _Path(session_dir) / "mesh" / "cleaned.ply"
-                    )
-                    _Path(out_clean).parent.mkdir(parents=True, exist_ok=True)
-                    mm_per_unit = None
-                    scale_block = (_load_session(session_id, merge_gaussian=False) or {}).get("scale") or {}
-                    try:
-                        raw_scale = scale_block.get("mm_per_unit")
-                        if raw_scale is not None:
-                            mm_per_unit = float(raw_scale)
-                    except (TypeError, ValueError):
-                        mm_per_unit = None
-                    if mm_per_unit and mm_per_unit > 0.0 and require_confirmed_scale \
-                            and not scale_block.get("confirmed"):
-                        dense_notes.append(
-                            "cleanup:unconfirmed — a scale of "
-                            f"{mm_per_unit} mm/unit is solved but the scale-confirm gate "
-                            "has not approved it; mesh stays in reconstruction units"
-                        )
-                        mm_per_unit = None
-                    if not mm_per_unit or mm_per_unit <= 0.0:
-                        mm_per_unit = None
-                        dense_notes.append(
-                            "cleanup:unscaled — session.scale.mm_per_unit is unset; mesh stays "
-                            "in reconstruction units until reveng_set_scale() solves the scale"
-                        )
-                    cl = cleanup_mesh(mesh_path, out_clean, mm_per_unit=mm_per_unit) or {}
-                    if cl.get("ok") and cl.get("mesh_path"):
-                        cleaned = cl["mesh_path"]
-                        mesh_unscaled = not bool(cl.get("scale_applied"))
+                    from services.vision.gaussian_pipeline import train_splat_from_dataset
+                    from services.reveng.gaussian_jobs import gpu_slot
+                    with gpu_slot(_session_path(session_id)):
+                        trained = train_splat_from_dataset(
+                            dataset_dir, str(_Path(session_dir) / "splat" / ("training-" + _secrets.token_hex(4))),
+                            iterations={"draft": 500, "normal": 2000, "high": 7000}[quality])
+                    if trained.get("ok") and trained.get("splat_path"):
+                        splat_path = trained["splat_path"]
                     else:
-                        dense_notes.append(
-                            f"cleanup:{cl.get('reason') or 'skipped'}"
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    dense_notes.append(f"cleanup_import:{exc}")
+                        notes.append("splat:" + str(trained.get("reason") or "failed"))
+                except Exception as exc:
+                    notes.append(f"splat:{exc}")
+            if splat_path:
+                artifacts = s.setdefault("artifacts", {})
+                artifacts.update(raw_splat_path=splat_path, splat_path=splat_path,
+                                 splat_units="reconstruction", splat_transform_applied=False,
+                                 splat_dataset_dir=dataset_dir)
+                try:
+                    _materialize_metric_splat(s)
+                except Exception as exc:
+                    notes.append(f"splat_transform:{exc}")
+                _save_session(s)
 
-            mesh_units = "reconstruction" if mesh_unscaled else "mm"
+            if not mesh_path and backend != "openmvs" and splat_path:
+                _progress("mesh", 58, "Extracting approximate surface from Gaussian centers")
+                try:
+                    from services.formats.splat_io import load_splat, splat_to_mesh
+                    out = _Path(session_dir) / "mesh" / f"splat-approx-{_secrets.token_hex(8)}.ply"
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    converted = splat_to_mesh(load_splat(splat_path), str(out),
+                                              method="auto", sparse_dir=sparse_dir) or {}
+                    if converted.get("ok") and converted.get("mesh_path"):
+                        mesh_path = converted["mesh_path"]
+                        approximate = True
+                        notes.append("splat_to_mesh:approximate")
+                    else:
+                        notes.append("splat_to_mesh:" + str(converted.get("reason") or "failed"))
+                except Exception as exc:
+                    notes.append(f"splat_to_mesh:{exc}")
+            if not mesh_path:
+                return False, "no_mesh", {"sparse": sparse_result, "dense_notes": notes,
+                    "used_ffwd": used_ffwd, "hint": "Install OpenMVS or Brush and Open3D; "
+                    "a Gaussian PLY is not itself a measurement surface."}
+
+            cleaned = mesh_path
+            transform_applied = False
+            transform_json = s.get("recon_transform")
+            transform = None
+            if transform_json and (not require_confirmed_scale or transform_json.get("confirmed")):
+                from services.vision.recon_transform import ReconTransform
+                transform = ReconTransform.from_json(transform_json)
+            _progress("mesh", 62, "Cleaning measurement surface", mesh_path)
+            try:
+                from services.vision.mesh_cleanup import cleanup_mesh
+                out_clean = str(_Path(session_dir) / "mesh" / f"cleaned-{_secrets.token_hex(8)}.ply")
+                _Path(out_clean).parent.mkdir(parents=True, exist_ok=True)
+                cleaned_result = cleanup_mesh(mesh_path, out_clean, recon_transform=transform) or {}
+                if cleaned_result.get("ok") and cleaned_result.get("mesh_path"):
+                    cleaned = cleaned_result["mesh_path"]
+                    transform_applied = bool(transform and cleaned_result.get("scale_applied"))
+                else:
+                    notes.append("cleanup:" + str(cleaned_result.get("reason") or "failed"))
+            except Exception as exc:
+                notes.append(f"cleanup:{exc}")
+            mesh_units = "mm" if transform_applied else "reconstruction"
             s = _load_session(session_id, merge_gaussian=False) or s
-            s.setdefault("artifacts", {})
-            s["artifacts"]["sparse_dir"] = sparse_dir
-            if cleaned:
-                s["artifacts"]["mesh_path"] = cleaned
-                # Honest units tag: consumers (fit / parametric / GUI) must not read a
-                # reconstruction-unit mesh as millimetres.
-                s["artifacts"]["mesh_units"] = mesh_units
+            _invalidate_downstream(s)
+            s.setdefault("artifacts", {}).pop("mesh_materialization", None)
+            s.setdefault("artifacts", {}).update(
+                sparse_dir=sparse_dir, raw_mesh_path=mesh_path, mesh_path=cleaned,
+                mesh_units=mesh_units, mesh_transform_applied=transform_applied)
+            s.setdefault("honesty", {})["approximate"] = approximate
             s["stages"]["reconstruct"] = "done"
-            s["provenance"].append({
-                "step": provenance_step,
-                "sparse_backend": sparse_result.get("backend"),
-                "used_ffwd": used_ffwd,
-                "dense": dense_notes,
-                "mesh_units": mesh_units,
-                "ts": _now_iso(),
-            })
+            s["provenance"].append({"step": provenance_step, "sparse_backend": sparse_result.get("backend"),
+                                    "used_ffwd": used_ffwd, "dense": notes, "mesh_units": mesh_units,
+                                    "approximate": approximate, "ts": _now_iso()})
             _save_session(s)
             _progress("mesh", 64, f"mesh ready ({mesh_units})", cleaned)
             return True, "reconstruction complete", {
-                "sparse": sparse_result,
-                "mesh_path": cleaned,
-                "mesh_units": mesh_units,
-                "splat_path": None,
-                "used_ffwd": used_ffwd,
-                "dense_notes": dense_notes,
-            }
+                "sparse": sparse_result, "mesh_path": cleaned, "mesh_units": mesh_units,
+                "splat_path": (s.get("artifacts") or {}).get("splat_path"),
+                "approximate": approximate, "used_ffwd": used_ffwd, "dense_notes": notes}
 
         # ── n_sparse: SfM only, then solve scale off the fresh sparse model ──
         if node_id == "n_sparse":
@@ -952,7 +1413,11 @@ def _make_pipeline_agent_fn(
                             "units (artifacts.mesh_units='reconstruction'); run "
                             "reveng_set_scale() and re-run to get millimetres",
                 })
+            if s.get("recon_transform") and not s["recon_transform"].get("confirmed"):
+                _invalidate_downstream(s)
             scale["confirmed"] = True
+            if s.get("recon_transform"):
+                s["recon_transform"]["confirmed"] = True
             s.setdefault("stages", {})["scale"] = "done"
             s.setdefault("provenance", []).append({
                 "step": "n_scale_gate",
@@ -1023,7 +1488,11 @@ def _make_pipeline_agent_fn(
                     {"hint": f"segment_fit import failed: {exc}"},
                 )
             try:
-                fits = segment_fit(mesh_path, session_id=session_id) or {}
+                fit_provenance = _fit_provenance(s)
+                fits = segment_fit(mesh_path, session_id=session_id,
+                                   recon_transform=s.get("recon_transform"),
+                                   transform_applied=bool((s.get("artifacts") or {}).get("mesh_transform_applied")),
+                                   approximate=False) or {}
             except Exception as exc:  # noqa: BLE001
                 return _Result(False, f"segment_fit error: {exc}")
             if not fits.get("ok"):
@@ -1032,12 +1501,31 @@ def _make_pipeline_agent_fn(
                     fits.get("reason") or "backend_not_provisioned: segment_fit",
                     fits,
                 )
+            latest = _load_session(session_id, merge_gaussian=False)
+            try:
+                unchanged = latest is not None and _fit_provenance(latest) == fit_provenance
+            except (OSError, ValueError):
+                unchanged = False
+            if not unchanged:
+                if latest is not None and _load_current_fits(latest) is None:
+                    _invalidate_downstream(latest)
+                    _save_session(latest)
+                return _Result(False, "fit_input_changed", {
+                    "ok": False, "reason": "fit_input_changed",
+                    "hint": "The mesh or calibration changed during fitting; fit again."})
+            s = latest
+            _invalidate_downstream(s)
+            fits["provenance"] = fit_provenance
+            fits["surface_approximate"] = bool((s.get("honesty") or {}).get("approximate"))
+            fits["approximate"] = bool(fits.get("approximate") or fits["surface_approximate"])
             # Persist aicad.reveng_fits/1 for n_parametric / GUI
             fits_path = _session_path(session_id) / "fits.json"
             try:
                 fits_path.write_text(_json.dumps(fits, indent=2))
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                _save_session(s)
+                return _Result(False, "fits_persistence_error", {
+                    "ok": False, "reason": "fits_persistence_error", "hint": str(exc)})
             s.setdefault("artifacts", {})
             s["artifacts"]["fits_path"] = str(fits_path)
             s["stages"]["model"] = "fitting"
@@ -1061,30 +1549,16 @@ def _make_pipeline_agent_fn(
                     "no_mesh",
                     {"detail": "parametric build needs a cleaned mesh_path"},
                 )
+            mesh_path, metric_error = _metric_mesh(s)
+            if metric_error:
+                return _Result(False, metric_error.get("reason", "metric_mesh_failed"), metric_error)
 
-            # Load fits hints if present
-            hints = None
-            fits_path = (s.get("artifacts") or {}).get("fits_path")
-            if fits_path and _Path(fits_path).is_file():
-                try:
-                    hints = _json.loads(_Path(fits_path).read_text())
-                except Exception:  # noqa: BLE001
-                    hints = None
-            if hints is None:
-                alt = _session_path(session_id) / "fits.json"
-                if alt.is_file():
-                    try:
-                        hints = _json.loads(alt.read_text())
-                    except Exception:  # noqa: BLE001
-                        hints = None
+            # Never resurrect a detached or stale fits.json from disk.
+            hints = _load_current_fits(s)
 
+            # The mesh is already in metric coordinates; CAD-Recode computes its own
+            # normalization and inverse, not the reconstruction similarity transform.
             scale_transform = None
-            sc = s.get("scale") or {}
-            if sc.get("mm_per_unit") is not None:
-                scale_transform = {
-                    "scale": sc.get("mm_per_unit"),
-                    "method": sc.get("method"),
-                }
 
             if strat == "ml":
                 try:
@@ -1121,18 +1595,42 @@ def _make_pipeline_agent_fn(
                         ml.get("error") or "ml parametric failed",
                         ml,
                     )
-                # Prefer step import into a doc when step_path present
+                # A generated STEP or source text is not itself an editable rebuild.
                 doc_id = ml.get("doc_id")
                 step_path = ml.get("step_path")
+                re_res = None
                 if not doc_id and step_path and _Path(str(step_path)).is_file():
                     re_res = _call_reverse_engineer(
-                        str(step_path),
-                        name=s.get("name"),
-                        hints=hints if isinstance(hints, dict) else None,
-                    )
-                    if re_res.get("ok") and re_res.get("doc_id"):
+                        str(step_path), name=s.get("name"),
+                        hints=hints if isinstance(hints, dict) else None)
+                    if (re_res.get("ok") and re_res.get("doc_id")
+                            and re_res.get("features")):
                         doc_id = re_res["doc_id"]
                         ml = {**ml, "reverse_engineer": re_res}
+                elif doc_id:
+                    try:
+                        from services.mcp import core_bridge as cb
+                        bodies = cb.call("asm_world_bodies", {"doc_id": doc_id, "explode": False}).get("bodies")
+                        tree = cb.call("doc_tree", {"doc_id": doc_id}).get("tree") or {}
+                        if not bodies or not tree.get("features"):
+                            doc_id = None
+                    except Exception as exc:
+                        ml.update(ok=False, reason="build_verification_failed", hint=str(exc))
+                        from .reveng_build_tools import _persist_build_result
+                        _persist_build_result(session_id, strategy="ml", state="failed",
+                                              payload=ml, reason=ml["reason"])
+                        return _Result(False, ml["reason"], ml)
+                if not doc_id:
+                    detail = re_res if isinstance(re_res, dict) else {}
+                    reason = detail.get("reason") or detail.get("error") or "no_features_rebuilt"
+                    ml = {**ml, "ok": False, "reason": reason, "match_pct": None,
+                          "summary": detail.get("summary") or "no features rebuilt",
+                          "recognition": detail.get("recognition"), "reverse_engineer": detail}
+                    from .reveng_build_tools import _persist_build_result
+                    _persist_build_result(session_id, strategy="ml", state="failed",
+                                          payload=ml, reason=reason)
+                    return _Result(False, reason, ml)
+                ml["doc_id"] = doc_id
                 s = _load_session(session_id, merge_gaussian=False) or s
                 s.setdefault("artifacts", {})
                 if doc_id:
@@ -1146,19 +1644,17 @@ def _make_pipeline_agent_fn(
                         s["artifacts"]["cadquery_path"] = str(cq_path)
                     except Exception:  # noqa: BLE001
                         pass
-                s["stages"]["model"] = "done" if doc_id or step_path else "failed"
+                s["stages"]["model"] = "done"
                 s["provenance"].append({
                     "step": "n_parametric",
                     "strategy": "ml",
+                    "surface_approximate": bool((s.get("honesty") or {}).get("approximate")),
                     "ts": _now_iso(),
                 })
                 _save_session(s)
-                if not (doc_id or step_path or ml.get("cadquery_src")):
-                    return _Result(
-                        False,
-                        ml.get("error") or "ml parametric produced no artifact",
-                        ml,
-                    )
+                ml["surface_approximate"] = bool((s.get("honesty") or {}).get("approximate"))
+                from .reveng_build_tools import _persist_build_result
+                _persist_build_result(session_id, strategy="ml", state="built", payload=ml)
                 return _Result(True, "ml parametric complete", ml)
 
             # Default: deterministic reverse_engineer with fit hints
@@ -1167,14 +1663,18 @@ def _make_pipeline_agent_fn(
                 name=s.get("name"),
                 hints=hints if isinstance(hints, dict) else None,
             )
-            if not re_res.get("ok"):
-                return _Result(
-                    False,
-                    re_res.get("error")
-                    or re_res.get("reason")
-                    or "reverse_engineer failed",
-                    re_res,
-                )
+            if isinstance(re_res.get("features"), list) and not re_res["features"]:
+                re_res.update(ok=False, reason="no_features_rebuilt", match_pct=None)
+                re_res.setdefault("summary", "no features rebuilt — see recognition.unclaimed")
+            if not re_res.get("ok") or not re_res.get("doc_id"):
+                reason = (re_res.get("reason") or re_res.get("error")
+                          or "no_features_rebuilt")
+                re_res["ok"] = False
+                re_res["reason"] = reason
+                from .reveng_build_tools import _persist_build_result
+                _persist_build_result(session_id, strategy="deterministic", state="failed",
+                                      payload=re_res, reason=reason)
+                return _Result(False, reason, re_res)
             doc_id = re_res.get("doc_id")
             s = _load_session(session_id, merge_gaussian=False) or s
             s.setdefault("artifacts", {})
@@ -1185,9 +1685,13 @@ def _make_pipeline_agent_fn(
                 "step": "n_parametric",
                 "strategy": "deterministic",
                 "match_pct": re_res.get("match_pct"),
+                "surface_approximate": bool((s.get("honesty") or {}).get("approximate")),
                 "ts": _now_iso(),
             })
             _save_session(s)
+            re_res["surface_approximate"] = bool((s.get("honesty") or {}).get("approximate"))
+            from .reveng_build_tools import _persist_build_result
+            _persist_build_result(session_id, strategy="deterministic", state="built", payload=re_res)
             return _Result(True, "parametric complete", re_res)
 
         if node_id in ("n_ingest", "n_mpn_fastpath", "n_datasheet_read"):
@@ -1465,6 +1969,8 @@ def _launch_reveng_mission(
     *,
     autonomy_default: str = "auto",
     strategy: str = "deterministic",
+    quality: str = "normal",
+    backend: Optional[str] = None,
     background: bool = False,
 ) -> dict:
     """Load a frozen template, start it via the executor, translate progress.
@@ -1503,6 +2009,8 @@ def _launch_reveng_mission(
         "session_id": session_id,
         "template": template_name,
         "strategy": strategy,
+        "quality": quality,
+        "backend": backend,
         "autonomy_default": autonomy_default,
         "stage_map": {k: list(v) for k, v in (stage_map or {}).items()},
         "status": "running",
@@ -1518,13 +2026,14 @@ def _launch_reveng_mission(
     emit = make_reveng_emit(run_id, session_id, stage_map)
     progress = make_reveng_stage_emitter(run_id, session_id)
     agent_fn = _make_pipeline_agent_fn(
-        session_id, strategy=strategy, progress=progress,
+        session_id, strategy=strategy, quality=quality, backend=backend, progress=progress,
     )
 
     def _invoke() -> dict:
         return executor.run(
             graph,
-            initial_state={"inputs": {"session_id": session_id, "strategy": strategy}},
+            initial_state={"inputs": {"session_id": session_id, "strategy": strategy,
+                                      "quality": quality, "backend": backend}},
             run_id=run_id,
             runs_dir=_reveng_runs_dir(),
             emit=emit,
@@ -1557,6 +2066,8 @@ def _launch_reveng_mission(
         "session_id": session_id,
         "template": template_name,
         "strategy": strategy,
+        "quality": quality,
+        "backend": backend,
     }
 
 
@@ -1644,6 +2155,8 @@ def _resume_reveng_mission(
     agent_fn = _make_pipeline_agent_fn(
         session_id,
         strategy=strategy,
+        quality=rec.get("quality") or "normal",
+        backend=rec.get("backend"),
         progress=make_reveng_stage_emitter(run_id, session_id),
     )
 

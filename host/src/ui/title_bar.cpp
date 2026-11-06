@@ -27,12 +27,14 @@
 #include "icons.h"             // ui::getIcon (raster workspace-tab tiles)
 #include "metrics.h"           // ui::metrics::stroke / titleFramePad tokens
 #include "doc_tabs.h"          // ui::openNewDocChooser (File > New)
+#include "scad_editor.h"
 #include "file_dialog.h"       // ui::openFolderDialog (File > Open Project Folder)
 #include "firmware/fw_workspace.h"  // ui::firmwareTabVisible
 #include "feature_tree.h"      // ui::featureTreeActivePath (Save vs. Save As gating)
 #include "property_manager.h"  // PropertyManager::active() (used in View sub-menu)
 #include "plm/plm_hub.h"       // ui::plmProjectName (active-project status control)
 #include "tesseract.h"         // ui::drawTesseract (vector brand mark in the title bar)
+#include "anim.h"
 #include "widgets/kit.h"       // ui::kit::elide (active-project label capping)
 
 #include <filesystem>      // Recent-files menu labels
@@ -538,14 +540,18 @@ struct FilMenuDrawer {
     void draw() const {
         if (ImGui::BeginMenu("New")) {
             if (ImGui::MenuItem("Part", "Ctrl+N")) ui::createNewDoc(st, 0);
+            if (ImGui::MenuItem("OpenSCAD")) {
+                const std::string previous = st.docMirror.docId();
+                ui::createNewDoc(st, 0);
+                if (st.docMirror.docId() != previous) ui::openNewScadEditor(st);
+            }
             if (ImGui::MenuItem("Assembly"))       ui::createNewDoc(st, 1);
             const bool canDraw = st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
                 (st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Part ||
                  st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Assembly);
             if (ImGui::MenuItem("Drawing", nullptr, false, canDraw)) ui::createNewDoc(st, 2);
             ImGui::Separator();
-            if (ImGui::MenuItem("Schematic"))      ui::createNewDoc(st, 3);
-            if (ImGui::MenuItem("PCB"))            ui::createNewDoc(st, 4);
+            if (ImGui::MenuItem("KiCad Project"))  ui::createNewDoc(st, 3);
             ImGui::EndMenu();
         }
         if (ImGui::MenuItem("Open...", "Ctrl+O")) st.requestOpenDialog = true;
@@ -570,6 +576,7 @@ struct FilMenuDrawer {
             if (ImGui::MenuItem("IGES (.iges)...")) st.requestExportFormat = "iges";
             if (ImGui::MenuItem("BREP (.brep)...")) st.requestExportFormat = "brep";
             if (ImGui::MenuItem("ACIS SAT (.sat)...")) st.requestExportFormat = "sat";
+            if (ImGui::MenuItem("OpenSCAD source (.scad)...")) st.requestExportFormat = "scad";
             ImGui::Separator();
             if (ImGui::MenuItem("STL (.stl)..."))   openMeshExport("stl");
             if (ImGui::MenuItem("OBJ (.obj)..."))   openMeshExport("obj");
@@ -582,6 +589,8 @@ struct FilMenuDrawer {
             if (ImGui::MenuItem("DWG (.dwg)..."))   openMeshExport("dwg");
             ImGui::EndMenu();
         }
+        if (ImGui::MenuItem("Convert native to OpenSCAD...", nullptr, false, canExport3d))
+            ui::openScadConversion(st);
         ImGui::Separator();
         if (ImGui::BeginMenu("Recent Files", !st.recentFiles.empty())) {
             for (const std::string& rp : st.recentFiles) {
@@ -600,7 +609,12 @@ struct FilMenuDrawer {
         ImGui::Separator();
         // ---- Formerly View menu: panel show/hide, theme toggle, layout reset ----
         if (ImGui::BeginMenu("View")) {
-            ImGui::MenuItem("Ribbon", nullptr, &st.showRibbon);
+            // Ribbon / FeatureManager / AI Panel / Viewport are persisted HERE (the user's own
+            // toggle), not by a per-frame mirror: other code forces them on or off on purpose.
+            if (ImGui::MenuItem("Ribbon", nullptr, &st.showRibbon)) {
+                st.settings.panelRibbon = st.showRibbon;
+                saveSettings(st.settings);
+            }
             ImGui::Separator();
             auto leftPaneEntry = [&](const char* label, int tab, bool enabled = true) {
                 const bool activeEntry = st.showFeatureTree && st.leftPaneTab == tab;
@@ -611,6 +625,8 @@ struct FilMenuDrawer {
                         st.showFeatureTree = true;
                         st.leftPaneTab = tab;
                     }
+                    st.settings.panelFeatureTree = st.showFeatureTree;
+                    saveSettings(st.settings);
                 }
             };
             leftPaneEntry("FeatureManager",     AppState::LP_FeatureManager);
@@ -625,8 +641,14 @@ struct FilMenuDrawer {
             ImGui::MenuItem("Design Table",     nullptr, &st.showDesignTablePanel);
             ImGui::MenuItem("Cut List",         nullptr, &st.showCutListPanel);
             ImGui::MenuItem("Equations",        nullptr, &st.showEquations);
-            ImGui::MenuItem("AI Panel",         nullptr, &st.showAIPanel);
-            ImGui::MenuItem("Viewport",         nullptr, &st.showViewport);
+            if (ImGui::MenuItem("AI Panel", nullptr, &st.showAIPanel)) {
+                st.settings.panelAI = st.showAIPanel;
+                saveSettings(st.settings);
+            }
+            if (ImGui::MenuItem("Viewport", nullptr, &st.showViewport)) {
+                st.settings.panelViewport = st.showViewport;
+                saveSettings(st.settings);
+            }
             ImGui::Separator();
             bool isLight = (ui::activeTheme == ui::Theme::Light);
             if (ImGui::MenuItem("Light theme", nullptr, isLight)) {
@@ -648,6 +670,7 @@ struct FilMenuDrawer {
         // ---- Formerly Help menu essentials ----
         if (ImGui::MenuItem("AI Help")) {
             st.showAIPanel = true;
+            st.settings.panelAI = true;
             st.aiInteraction = (int)CopilotMode::Ask;
             st.settings.copilotMode = (int)CopilotMode::Ask;
             saveSettings(st.settings);
@@ -656,7 +679,7 @@ struct FilMenuDrawer {
         ImGui::Separator();
         // Repair/install runtime
         if (ImGui::MenuItem("Repair / install runtime", nullptr, false,
-                            !st.setupRunning.load() && !st.anyRunActive()))
+                            !st.workerBootPending && !st.setupRunning.load() && !st.anyRunActive()))
             st.startSetup(true);
         ImGui::Separator();
         if (ImGui::MenuItem("Quit", "Alt+F4")) glfwSetWindowShouldClose(win, 1);
@@ -725,6 +748,7 @@ void drawTitleBar(AppState& st, bool maximized, float& barHOut) {
                 ImDrawList* dl = ImGui::GetWindowDrawList();
                 const ImVec2 markMin(winX + 12.0f * s,
                                      ImGui::GetWindowPos().y + ImFloor((barH - markSz) * 0.5f));
+                ui::anim::requestFramesAt(30.0f);
                 ui::drawTesseract(dl, ImVec2(markMin.x + markSz * 0.5f, markMin.y + markSz * 0.5f),
                                   markSz, ImGui::GetTime(),
                                   ui::tesseractAnimFromInt(st.settings.brandAnim),

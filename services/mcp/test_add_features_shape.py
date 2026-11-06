@@ -192,7 +192,36 @@ def test_bare_feature_dicts_in_ops_get_an_op_once_per_batch():
          {"type": "hole", "name": "H", "params": {"diameter": 3}}], notes)
     assert [o["op"] for o in ops] == ["add_feature", "add_feature"]
     assert ops[0]["feature"]["name"] == "Plate"
-    assert len(M._interpreted_notes(notes)) == 1  # one note for the whole batch
+    assert len(M._split_notes(notes)[0]) == 1  # one note for the whole batch
+
+
+def test_assumptions_are_split_out_uncapped_and_the_capped_tail_is_true():
+    notes = [f"spelling repair {i}" for i in range(20)]
+    notes += [M._Assumption(f"read thing {i} as a face") for i in range(12)]
+    interpreted, assumptions = M._split_notes(notes)
+    assert len(assumptions) == 12                    # never capped, never in `interpreted`
+    assert all(a.startswith("read thing") for a in assumptions)
+    assert len(interpreted) == M._MAX_INTERPRETED_NOTES + 1
+    assert "12 more notes omitted" in interpreted[-1]
+    assert not any(isinstance(n, M._Assumption) for n in interpreted)
+
+
+def test_a_note_list_without_assumptions_has_no_assumptions_key():
+    reply: dict = {}
+    M._attach_notes(reply, *M._split_notes(["one repair"]))
+    assert reply == {"interpreted": ["one repair"]}
+
+
+def test_a_failed_normalizer_is_disclosed_and_the_op_passes_through_as_written(monkeypatch):
+    def boom(op, notes):
+        raise RuntimeError("bug in the normalizer")
+    monkeypatch.setattr(M, "_normalize_sketch_edit_op", boom)
+    op = {"op": "sketch_trim", "sketch": "f1", "entity": "e1", "point": [1, 2]}
+    notes: list = []
+    assert M._normalize_sketch_edit_ops([op], notes) == [op]
+    assert len(notes) == 1 and isinstance(notes[0], M._Assumption)
+    assert "sent to the engine EXACTLY as written" in notes[0]
+    assert "RuntimeError" in notes[0]
 
 
 def test_an_element_with_neither_op_nor_type_teaches_both_shapes():
@@ -254,6 +283,66 @@ def test_conflicting_suppression_spellings_are_rejected(payload):
         M._normalize_op_elements([payload], [])
 
 
+def test_fully_define_accepts_id_as_sketch_without_overriding_explicit_sketch():
+    notes = []
+    ops = M._normalize_op_elements([
+        {"op": "sketch_fully_define", "id": "f28", "anchor": "origin"},
+        {"op": "sketch_fully_define", "id": "f29", "sketch": "f30"},
+    ], notes)
+    assert ops[0] == {"op": "sketch_fully_define", "sketch": "f28", "anchor": "origin"}
+    assert ops[1]["sketch"] == "f30"
+    assert notes
+
+
+def test_edit_feature_suppression_preserves_edits_and_batch_placeholders():
+    notes, indices = [], {}
+    ops = M._normalize_op_elements([
+        {"op": "add_feature", "feature": {"type": "box"}},
+        {"op": "edit_feature", "id": "$0", "params": {"height": 2},
+         "refs": {"profile": "f3"}, "name": "Changed", "suppressed": True},
+        {"op": "add_feature", "feature": {"type": "box"}},
+        {"op": "edit_feature", "id": "$2", "suppressed": False},
+    ], notes, indices)
+    assert ops[1] == {"op": "edit_feature", "id": "$0", "params": {"height": 2},
+                      "refs": {"profile": "f3"}, "name": "Changed"}
+    assert ops[2] == {"op": "set_suppressed", "id": "$0", "value": True}
+    assert ops[4] == {"op": "set_suppressed", "id": "$3", "value": False}
+    assert indices == {"$0": "$0", "$1": "$1", "$2": "$3", "$3": "$4"}
+    assert notes
+
+
+@pytest.mark.parametrize("value", [None, 1, "true"])
+def test_edit_feature_rejects_non_boolean_suppression(value):
+    with pytest.raises(ValueError, match=r"ops\[0\].*boolean"):
+        M._normalize_op_elements([{"op": "edit_feature", "id": "f1", "suppressed": value}], [])
+
+
+def test_edit_feature_suppression_leaves_other_stray_keys_for_the_engine():
+    """Python no longer second-guesses op-level keys: the engine refuses a stray one, so
+    the suppression rewrite must pass it through untouched rather than swallow it."""
+    ops = M._normalize_op_elements([{"op": "edit_feature", "id": "f1",
+                                     "suppressed": True, "radius": 3}], [])
+    assert ops[0] == {"op": "edit_feature", "id": "f1", "radius": 3}
+    assert ops[1] == {"op": "set_suppressed", "id": "f1", "value": True}
+
+
+@pytest.mark.parametrize("kind", ["asm_edit_component", "asm_insert_component"])
+def test_component_transform_matrix_is_flattened(kind):
+    notes = []
+    matrix = [[1, 0, 0, 5], [0, 1, 0, 6], [0, 0, 1, 7], [0, 0, 0, 1]]
+    ops = M._normalize_op_elements([{"op": kind, "transform": matrix}], notes)
+    assert ops[0]["transform"] == [1, 0, 0, 5, 0, 1, 0, 6, 0, 0, 1, 7, 0, 0, 0, 1]
+    assert notes
+
+
+@pytest.mark.parametrize("kind", ["asm_edit_component", "asm_insert_component"])
+@pytest.mark.parametrize("transform", [[[1, 0], [0, 1]], [1] * 15, [[1] * 4] * 3 + [[1, 2, 3, True]], "bad"])
+def test_component_transform_malformed_is_rejected_per_op(kind, transform):
+    with pytest.raises(ValueError, match=r"ops\[1\].*transform"):
+        M._normalize_op_elements([{"op": "set_units"}, {"op": kind, "transform": transform}], [])
+
+
+
 # --------------------------------------------------------------------- feature types
 
 def test_feature_type_aliases_map_onto_the_engine_vocabulary():
@@ -261,22 +350,32 @@ def test_feature_type_aliases_map_onto_the_engine_vocabulary():
     for word, want in (("cube", "box"), ("cuboid", "box"), ("cylindrical", "cylinder"),
                        ("ball", "sphere"), ("box3D", "box")):
         notes: list = []
-        out = M._retype_feature({"type": word, "name": "X"}, vocab, True, notes)
+        out = M._retype_feature({"type": word, "name": "X"}, vocab, notes)
         assert out["type"] == want, word
         assert notes
+
+
+@pytest.mark.parametrize("word", ["ring", "circle", "tube", "pipe", "boss", "prism",
+                                  "rectangle", "taper", "blend"])
+def test_a_word_that_names_several_solids_is_refused_not_mapped(word):
+    """ring -> torus and tube -> solid cylinder built a DIFFERENT solid than the one asked
+    for. These words are no longer aliases; the error spells out the choices."""
+    vocab = frozenset({"box", "cylinder", "torus", "cone", "fillet", "loft", "extrude"})
+    with pytest.raises(ValueError, match=f'"{word}" is ambiguous'):
+        M._retype_feature({"type": word, "name": "X"}, vocab, [])
 
 
 def test_cut_prefixed_type_becomes_the_shape_with_cut_mode():
     notes: list = []
     out = M._retype_feature({"type": "cut_cylinder", "name": "Bore"},
-                            frozenset({"cylinder"}), True, notes)
+                            frozenset({"cylinder"}), notes)
     assert out["type"] == "cylinder" and out["mode"] == "cut"
     assert 'mode:"cut"' in " ".join(notes)
 
 
 def test_a_boolean_word_used_as_a_type_points_at_mode_cut():
     with pytest.raises(ValueError) as ei:
-        M._retype_feature({"type": "subtract"}, frozenset({"box"}), True, [])
+        M._retype_feature({"type": "subtract"}, frozenset({"box"}), [])
     msg = str(ei.value)
     assert "boolean OPERATION, not a feature type" in msg and 'mode:"cut"' in msg
 
@@ -289,28 +388,35 @@ def test_unknown_type_error_lists_closest_matches_first():
     assert "cylinder" in msg.split("Feature types:")[0]
 
 
-def test_an_offline_vocabulary_never_rejects_an_unknown_type():
-    # The fallback list is a SUBSET of the engine's, so only a LIVE vocabulary may reject.
-    feat = {"type": "weld_gusset", "name": "G"}
-    assert M._retype_feature(feat, frozenset({"box"}), False, []) is feat
+def test_an_unknown_type_is_rejected_against_the_engine_vocabulary():
+    with pytest.raises(ValueError, match="is not a feature type"):
+        M._retype_feature({"type": "gizmo", "name": "G"}, frozenset({"box"}), [])
 
 
 # --------------------------------------------------------------------- hole schema
 
-def test_hole_style_and_end_are_defaulted_and_echoed():
+def test_hole_style_is_defaulted_and_echoed():
     notes: list = []
     out = M._normalize_hole_feature(
-        {"type": "hole", "name": "Bore", "params": {"diameter": 8}}, notes)
+        {"type": "hole", "name": "Bore", "params": {"diameter": 8, "end": "through_all"}},
+        notes)
     assert out["params"]["style"] == "simple"
     assert out["params"]["end"] == "through_all"
-    text = " ".join(notes)
-    assert "params.style is required" in text and "params.end is required" in text
+    assert "params.style is required" in " ".join(notes)
 
 
-def test_hole_with_a_depth_defaults_to_a_blind_end():
-    out = M._normalize_hole_feature(
-        {"type": "hole", "name": "B", "params": {"diameter": 5, "depth": 10}}, [])
-    assert out["params"]["end"] == "blind"
+def test_a_hole_with_neither_end_nor_depth_is_refused_not_made_through():
+    """The engine has no default end condition, and a through hole where a blind one was
+    meant destroys the part — so the model has to say which."""
+    with pytest.raises(ValueError, match=r'params\.end is required.*through_all.*blind'):
+        M._normalize_hole_feature(
+            {"type": "hole", "name": "Bore", "params": {"diameter": 8}}, [])
+
+
+def test_hole_with_depth_but_no_end_is_refused():
+    with pytest.raises(ValueError, match=r"params\.end is required"):
+        M._normalize_hole_feature(
+            {"type": "hole", "name": "B", "params": {"diameter": 5, "depth": 10}}, [])
 
 
 @pytest.mark.parametrize("word,want", [("counterbore", "cbore"), ("c-bore", "cbore"),
@@ -323,22 +429,23 @@ def test_hole_style_synonyms_map_to_the_engine_enum(word, want):
     assert out["params"]["style"] == want
 
 
-def test_a_hole_with_no_face_ref_is_given_the_top_face():
-    notes: list = []
-    ops = M._supply_missing_refs([{"op": "add_feature", "feature": {
-        "type": "hole", "name": "Bore",
-        "params": {"diameter": 8, "style": "simple", "end": "through_all"}}}], notes)
-    assert ops[0]["feature"]["refs"]["face"] == {"of": "face", "side": "top"}
-    assert any("no refs.face given" in n for n in notes)
+def test_a_hole_with_no_face_ref_is_refused_not_given_the_top_face():
+    with pytest.raises(ValueError, match=r'no entry face.*refs\.face'):
+        M._require_hole_face([{"op": "add_feature", "feature": {
+            "type": "hole", "name": "Bore",
+            "params": {"diameter": 8, "style": "simple", "end": "through_all"}}}])
 
 
-def test_supplying_a_face_never_overrides_one_the_model_named():
-    op = {"op": "add_feature", "feature": {
+def test_hole_requires_face_even_with_a_positions_sketch():
+    named = {"op": "add_feature", "feature": {
         "type": "hole", "name": "Bore", "params": {"diameter": 8},
         "refs": {"face": {"of": "face", "side": "bottom"}}}}
-    notes: list = []
-    assert M._supply_missing_refs([op], notes) == [op]
-    assert notes == []
+    sketched = {"op": "add_feature", "feature": {
+        "type": "hole", "name": "Bore", "params": {"diameter": 8},
+        "refs": {"positions_sketch": "f1"}}}
+    assert M._require_hole_face([named]) == [named]
+    with pytest.raises(ValueError, match="no entry face"):
+        M._require_hole_face([sketched])
 
 
 def test_an_end_condition_written_into_the_depth_slot_is_moved():
@@ -350,14 +457,32 @@ def test_an_end_condition_written_into_the_depth_slot_is_moved():
     assert any("end condition, not a distance" in n for n in notes)
 
 
-def test_a_hole_direction_picks_the_entry_face():
+@pytest.mark.parametrize("key,vec,side", [
+    ("direction", [0, 0, -1], "top"),      # drill travels down -> enters the top face
+    ("direction", [0, 0, 1], "bottom"),    # drill travels up -> enters the bottom face
+    ("drill_direction", [1, 0, 0], "left"),
+    ("dir", [0, -1, 0], "back"),
+    ("normal", [0, 0, 1], "top"),          # `normal` IS the entry face's outward normal
+    ("normal", [-1, 0, 0], "left"),
+    ("direction", "-z", "top"),
+])
+def test_a_signed_hole_direction_picks_the_entry_face_and_is_an_assumption(key, vec, side):
+    notes: list = []
     out = M._normalize_hole_feature(
         {"type": "hole", "name": "B",
-         "params": {"diameter": 5, "style": "simple", "end": "through_all",
-                    "direction": [1, 0, 0]}}, [])
-    assert out["params"]["end"] == "through_all"
-    assert out["refs"]["face"] == {"of": "face", "side": "right"}
-    assert "direction" not in out["params"]
+         "params": {"diameter": 5, "style": "simple", "end": "through_all", key: vec}}, notes)
+    assert out["refs"]["face"] == {"of": "face", "side": side}
+    assert key not in out["params"]
+    assert any(isinstance(n, M._Assumption) for n in notes)
+
+
+@pytest.mark.parametrize("vec", [[1, 1, 0], [0, 0, 0], "z", [0.3, 0, 1]])
+def test_an_unsigned_or_oblique_hole_direction_is_refused_not_snapped(vec):
+    with pytest.raises(ValueError, match="does not name one entry face"):
+        M._normalize_hole_feature(
+            {"type": "hole", "name": "B",
+             "params": {"diameter": 5, "style": "simple", "end": "through_all",
+                        "direction": vec}}, [])
 
 
 def test_a_blind_hole_without_a_depth_teaches_the_fix():
@@ -509,9 +634,13 @@ class TestSketchEntityShorthand:
 
     def test_arc_gets_the_same_center_radius_shorthand(self):
         ents, notes = self._norm([{"type": "arc", "cx": 1, "cy": 2, "r": 3,
-                                   "start": 0, "end": 90}])
+                                   "start": 0, "end": 90, "ccw": False}])
         assert ents[0]["center"] == [1, 2] and ents[0]["radius"] == 3
-        assert ents[0]["ccw"] is True
+        assert ents[0]["ccw"] is False
+
+    def test_an_arc_with_no_direction_is_refused_not_made_counter_clockwise(self):
+        with pytest.raises(ValueError, match=r"needs\s+ccw:true"):
+            self._norm([{"type": "arc", "cx": 1, "cy": 2, "r": 3, "start": 0, "end": 90}])
 
     def test_ellipse_center_shorthand_leaves_rx_ry_alone(self):
         ents, _ = self._norm([{"type": "ellipse", "cx": 1, "cy": 1, "rx": 4, "ry": 2,
@@ -721,6 +850,191 @@ def test_live_new_body_preserves_touching_and_overlapping_bodies(policy):
 
 
 @enginetest
+@pytest.mark.parametrize(("mode", "where"), [
+    ("new", "params"), ("new_body", "params"), (" NEW_BODY ", "feature"),
+])
+def test_live_primitive_new_mode_aliases_keep_contained_bodies(mode, where):
+    from services.agent.agent_turn import _bind_tool
+
+    add = _bind_tool("add_features")
+    doc = _cb.call("doc_new", {"name": "primitive_mode_new"})["doc_id"]
+    try:
+        base = json.loads(add(doc_id=doc, ops=[{"op": "add_feature", "feature": {
+            "type": "box", "name": "Stock",
+            "params": {"length": 10, "width": 10, "height": 10}}}]))
+        assert base["ok"], base
+
+        features = [
+            {"type": "cylinder", "name": "Pin",
+             "params": {"radius": 2, "height": 4, "merge": True}},
+            {"type": "sphere", "name": "Ball",
+             "params": {"radius": 2, "merge": True}},
+        ]
+        for feature in features:
+            (feature["params"] if where == "params" else feature)["mode"] = mode
+        ops = [{"op": "add_feature", "feature": feature} for feature in features]
+        authored = json.loads(json.dumps(ops))
+        result = json.loads(add(doc_id=doc, ops=ops))
+        assert result["ok"] and result["body_count"] == 3, result
+        assert _cb.call("eval_mass", {"doc_id": doc, "body": 1})["volume_mm3"] == \
+            pytest.approx(1000)
+        assert ops == authored
+
+        tree = _cb.call("doc_tree", {"doc_id": doc})["tree"]
+        stored = {feature["name"]: feature["params"] for feature in tree["features"]}
+        for name in ("Pin", "Ball"):
+            assert stored[name]["mode"] == "new" and stored[name]["merge"] is True, stored
+    finally:
+        _cb.call("doc_close", {"doc_id": doc})
+
+
+@enginetest
+@pytest.mark.parametrize(("key", "word", "stored_mode"), [
+    ("mode", "add", "add"), ("mode", "union", "boss"), ("mode", "subtract", "cut"),
+])
+def test_live_primitive_modes_preserve_add_and_cut_semantics(key, word, stored_mode):
+    from services.agent.agent_turn import _bind_tool
+
+    add = _bind_tool("add_features")
+    doc = _cb.call("doc_new", {"name": "primitive_mode_boolean"})["doc_id"]
+    try:
+        result = json.loads(add(doc_id=doc, ops=[
+            {"op": "add_feature", "feature": {
+                "type": "box", "name": "Stock",
+                "params": {"length": 10, "width": 10, "height": 10}}},
+            {"op": "add_feature", "feature": {
+                "type": "cylinder", "name": "Tool", "at": [4, 0, 0],
+                "params": {"radius": 3, "height": 8, key: word}}},
+        ]))
+        assert result["ok"] and result["body_count"] == 1, result
+        if stored_mode == "cut":
+            assert 0 < result["volume_mm3"] < 1000, result
+        else:
+            assert result["volume_mm3"] > 1000, result
+        tree = _cb.call("doc_tree", {"doc_id": doc})["tree"]
+        tool = next(feature for feature in tree["features"] if feature["name"] == "Tool")
+        assert tool["params"]["mode"] == stored_mode, tool
+    finally:
+        _cb.call("doc_close", {"doc_id": doc})
+
+
+
+
+@enginetest
+@pytest.mark.parametrize(("mode", "boolean", "stored_mode", "merge"), [
+    ("new_body", "union", "new", None),
+    ("cut", "new_body", "cut", False),
+])
+def test_live_primitive_mode_and_boolean_keep_their_distinct_policies(
+        mode, boolean, stored_mode, merge):
+    from services.agent.agent_turn import _bind_tool
+
+    add = _bind_tool("add_features")
+    doc = _cb.call("doc_new", {"name": "primitive_mode_and_boolean"})["doc_id"]
+    try:
+        result = json.loads(add(doc_id=doc, ops=[
+            {"op": "add_feature", "feature": {
+                "type": "box", "name": "Stock",
+                "params": {"length": 10, "width": 10, "height": 10}}},
+            {"op": "add_feature", "feature": {
+                "type": "sphere", "name": "Ball",
+                "params": {"radius": 2, "mode": mode, "boolean": boolean}}},
+        ]))
+        assert result["ok"] and result["body_count"] == 2, result
+        assert _cb.call("eval_mass", {"doc_id": doc, "body": 1})["volume_mm3"] == \
+            pytest.approx(1000)
+        tree = _cb.call("doc_tree", {"doc_id": doc})["tree"]
+        ball = next(feature for feature in tree["features"] if feature["name"] == "Ball")
+        assert ball["params"]["mode"] == stored_mode, ball
+        assert ball["params"].get("merge") is merge and "boolean" not in ball["params"], ball
+    finally:
+        _cb.call("doc_close", {"doc_id": doc})
+
+
+@enginetest
+def test_live_merge_false_overrides_a_valid_primitive_mode():
+    from services.agent.agent_turn import _bind_tool
+
+    add = _bind_tool("add_features")
+    mode = "subtract"
+    doc = _cb.call("doc_new", {"name": "primitive_mode_merge_false"})["doc_id"]
+    try:
+        result = json.loads(add(doc_id=doc, ops=[
+            {"op": "add_feature", "feature": {
+                "type": "box", "name": "Stock",
+                "params": {"length": 10, "width": 10, "height": 10}}},
+            {"op": "add_feature", "feature": {
+                "type": "sphere", "name": "Ball",
+                "params": {"radius": 2, "mode": mode, "merge": False}}},
+        ]))
+        assert result["ok"] and result["body_count"] == 2, result
+        assert _cb.call("eval_mass", {"doc_id": doc, "body": 1})["volume_mm3"] == \
+            pytest.approx(1000)
+        tree = _cb.call("doc_tree", {"doc_id": doc})["tree"]
+        ball = next(feature for feature in tree["features"] if feature["name"] == "Ball")
+        assert ball["params"]["mode"] == ("cut" if mode == "subtract" else mode), ball
+        assert ball["params"]["merge"] is False, ball
+    finally:
+        _cb.call("doc_close", {"doc_id": doc})
+
+
+@enginetest
+@pytest.mark.parametrize(("feature_mode", "params_mode", "bodies", "stored_mode"), [
+    ("cut", "new_body", 2, "new"),
+    ("new_body", "cut", 1, "cut"),
+])
+def test_live_primitive_mode_uses_params_over_feature_level(
+        feature_mode, params_mode, bodies, stored_mode):
+    from services.agent.agent_turn import _bind_tool
+
+    add = _bind_tool("add_features")
+    doc = _cb.call("doc_new", {"name": "primitive_mode_precedence"})["doc_id"]
+    try:
+        result = json.loads(add(doc_id=doc, ops=[
+            {"op": "add_feature", "feature": {
+                "type": "box", "name": "Stock",
+                "params": {"length": 10, "width": 10, "height": 10}}},
+            {"op": "add_feature", "feature": {
+                "type": "sphere", "name": "Ball", "mode": feature_mode,
+                "params": {"radius": 2, "mode": params_mode, "merge": True}}},
+        ]))
+        assert result["ok"] and result["body_count"] == bodies, result
+        assert (result["volume_mm3"] > 1000) == (stored_mode == "new"), result
+        tree = _cb.call("doc_tree", {"doc_id": doc})["tree"]
+        ball = next(feature for feature in tree["features"] if feature["name"] == "Ball")
+        assert ball["params"]["mode"] == stored_mode, ball
+    finally:
+        _cb.call("doc_close", {"doc_id": doc})
+
+
+@enginetest
+def test_live_unknown_primitive_mode_refuses_and_rolls_back_the_whole_batch():
+    from services.agent.agent_turn import _bind_tool
+
+    add = _bind_tool("add_features")
+    doc = _cb.call("doc_new", {"name": "primitive_unknown_mode"})["doc_id"]
+    try:
+        base = json.loads(add(doc_id=doc, ops=[{"op": "add_feature", "feature": {
+            "type": "box", "name": "Stock",
+            "params": {"length": 10, "width": 10, "height": 10}}}]))
+        assert base["ok"], base
+        before = _cb.call("doc_tree", {"doc_id": doc})
+        result = json.loads(add(doc_id=doc, ops=[
+            {"op": "add_feature", "feature": {
+                "type": "cylinder", "name": "Pin",
+                "params": {"radius": 2, "height": 4, "mode": "new_body"}}},
+            {"op": "add_feature", "feature": {
+                "type": "sphere", "name": "Bad",
+                "params": {"radius": 2, "mode": "new_body_typo", "merge": False}}},
+        ]))
+        assert result["ok"] is False and result.get("rolled_back") is True, result
+        assert "new_body_typo" in result["error"]
+        assert _cb.call("doc_tree", {"doc_id": doc}) == before
+    finally:
+        _cb.call("doc_close", {"doc_id": doc})
+
+
+@enginetest
 def test_live_canonical_call_reports_no_interpretation(live):
     add_features, doc = live
     r = json.loads(add_features(doc_id=doc, ops=[{"op": "add_feature", "feature": {
@@ -790,21 +1104,60 @@ def test_live_field_batch_bare_new_part_ab_sketch_revolve_builds():
         {"type": "revolve", "name": "Bucket", "profile": "profile", "axis": "Z"}]))
     assert r["ok"], r
     assert r["changes"]["volume_delta_mm3"] > 0
-    notes = " ".join(r["interpreted"])
-    assert "new_part" in notes and "angle" in notes
+    assert "new_part" in " ".join(r["interpreted"])
+    assert "angle" in " ".join(r["assumptions"])
 
 
 @enginetest
-def test_live_hole_without_style_end_or_face_builds(live):
+def test_live_hole_with_a_signed_direction_and_no_style_builds(live):
     add_features, doc = live
     r = json.loads(add_features(doc_id=doc, ops=[{"op": "add_feature", "feature": {
         "type": "hole", "name": "LiveBore",
         "params": {"diameter": 12.0, "depth": "through", "origin": [0, 0, 0],
-                   "direction": [0, 0, 1]}}}]))
+                   "direction": [0, 0, -1]}}}]))
     assert r["ok"], r
     assert r["changes"]["volume_delta_mm3"] < 0        # it really removed material
-    text = " ".join(r["interpreted"])
-    assert "params.style is required" in text and "drill direction as the top face" in text
+    assert "params.style is required" in " ".join(r["interpreted"])
+    # the direction -> entry-face reading changes what is built, so it is an assumption
+    assert any("as the top face" in a for a in r["assumptions"]), r
+
+
+@enginetest
+def test_live_hole_with_no_face_is_refused_with_a_teaching_error(live):
+    add_features, doc = live
+    r = json.loads(add_features(doc_id=doc, ops=[{"op": "add_feature", "feature": {
+        "type": "hole", "name": "NoFace",
+        "params": {"diameter": 12.0, "end": "through_all"}}}]))
+    assert r["ok"] is False
+    assert "no entry face" in r["error"]
+
+
+@enginetest
+def test_live_boolean_does_not_discard_third_operand(live):
+    add_features, doc = live
+    result = json.loads(add_features(doc_id=doc, ops=[{"op": "add_feature", "feature": {
+        "type": "boolean", "params": {"op": "cut", "operands": ["f1", "f2", "f3"]}}}]))
+    assert result["ok"] is False
+    assert "exactly TWO" in result["error"]
+
+
+@enginetest
+def test_live_unknown_rib_parameter_is_refused(live):
+    add_features, doc = live
+    result = json.loads(add_features(doc_id=doc, ops=[{"op": "add_feature", "feature": {
+        "type": "rib", "params": {"invented_rib_parameter": 8},
+        "refs": {"profile": ["f1"]}}}]))
+    assert result["ok"] is False
+    assert "invented_rib_parameter" in result["error"]
+
+
+@enginetest
+def test_live_edit_feature_does_not_drop_stray_op_keys(live):
+    add_features, doc = live
+    result = json.loads(add_features(doc_id=doc, ops=[
+        {"op": "edit_feature", "id": "f1", "radius": 3}]))
+    assert result["ok"] is False
+    assert "radius" in result["error"]
 
 
 @enginetest
@@ -878,6 +1231,23 @@ def test_extrude_param_name_dialect_maps_onto_the_keys_the_compiler_reads():
     assert "distance" not in out["params"] and "symmetric" not in out["params"]
     text = " ".join(notes)
     assert "params.depth" in text and "params.mid_plane" in text
+
+
+@pytest.mark.parametrize("word,flag", [("false", False), ("no", False), (0, False),
+                                        ("true", True), (1, True)])
+def test_a_serialised_symmetric_flag_is_read_by_its_meaning(word, flag):
+    """bool("false") is True: the string "false" used to turn the extrude symmetric."""
+    out = M._normalize_extrude_params(
+        {"type": "extrude", "name": "E", "params": {"depth": 4, "centered": word}},
+        "extrude", [])
+    assert out["params"]["mid_plane"] is flag
+
+
+def test_a_symmetric_flag_that_is_not_a_flag_is_refused():
+    with pytest.raises(ValueError, match="not a true/false flag"):
+        M._normalize_extrude_params(
+            {"type": "extrude", "name": "E", "params": {"depth": 4, "symmetric": {"a": 1}}},
+            "extrude", [])
 
 
 def test_a_thin_feature_thickness_is_not_stolen_as_the_extrude_depth():
@@ -1140,6 +1510,25 @@ def test_a_boolean_with_only_a_target_still_teaches_the_two_operands():
         M._normalize_boolean_feature(
             {"type": "boolean", "name": "B", "kind": "union", "target": "body"}, [])
     assert "needs its two operands" in str(ei.value)
+
+
+@pytest.mark.parametrize("key", ["operands", "targets", "bodies"])
+def test_a_boolean_with_more_than_two_operands_is_refused_not_truncated(key):
+    """v[:2] kept the first two operands and dropped the rest while the note said a boolean
+    "fuses exactly two bodies"; the engine combines params.a with params.b only."""
+    with pytest.raises(ValueError) as ei:
+        M._normalize_boolean_feature(
+            {"type": "boolean", "name": "B", "params": {"op": "fuse", key: ["f1", "f2", "f3"]}},
+            [])
+    msg = str(ei.value)
+    assert "3 operands" in msg and "exactly TWO" in msg and "f3" in msg
+
+
+def test_a_boolean_ref_list_with_more_than_two_targets_is_refused():
+    with pytest.raises(ValueError, match="exactly TWO"):
+        M._normalize_boolean_feature(
+            {"type": "boolean", "name": "B", "params": {"op": "cut"},
+             "refs": {"targets": ["f1", "f2", "f3"]}}, [])
 
 
 def test_an_unknown_boolean_kind_is_still_a_teaching_error():
@@ -1782,42 +2171,16 @@ class TestFlatFacePocket:
         assert M._expand_face_pockets(ops, []) is ops
 
 
-class TestUnknownOpSuggestions:
-    """op:"cut" reported «closest: eq_set, rename, set_units, eq_delete, set_folder» (live
-    copilot run, 2026-07-28) — five unrelated ops, because the levenshtein fallback scored
-    every short name. A misleading suggestion list is worse than none."""
-
-    def test_an_unrelated_query_suggests_nothing(self):
-        from services.mcp.op_registry import suggest_doc_ops
-        for q in ("cut", "pocket", "zzzzz"):
-            assert suggest_doc_ops(q) == [], q
-
-    def test_a_genuine_typo_still_suggests(self):
-        from services.mcp.op_registry import suggest_doc_ops
-        assert suggest_doc_ops("add_featur")[0] == "add_feature"
-        assert suggest_doc_ops("set_materal")[0] == "set_material"
-        assert suggest_doc_ops("renmae") == ["rename"]
-        assert suggest_doc_ops("delete_fature") == ["delete_feature"]
-        assert "eq_set" in suggest_doc_ops("eq_st")
-
-    def test_a_feature_type_still_pins_add_feature(self):
-        from services.mcp.op_registry import suggest_doc_ops
-        assert suggest_doc_ops("box") == ["add_feature"]
-
-    def test_the_unknown_op_message_teaches_the_shape_instead_of_noise(self):
-        from services.mcp.op_registry import unknown_doc_op_message
-        msg = unknown_doc_op_message(1, "cut")
-        # No suggestion list at all — the vocabulary names still appear, but only inside
-        # the teaching sentence, never as "closest: …" near misses to go chase.
-        assert "closest" not in msg
-        assert 'params.mode:"cut"' in msg
-        assert '"op":"add_feature"' in msg
-
-    def test_a_feature_type_op_keeps_its_own_teaching_branch(self):
-        from services.mcp.op_registry import unknown_doc_op_message
-        msg = unknown_doc_op_message(0, "box")
-        assert '"type":"box"' in msg
-        assert "closest: add_feature" in msg
+@enginetest
+def test_live_an_invented_op_is_named_by_the_engine_not_a_python_copy(live):
+    """op:"cut" once reported «closest: eq_set, rename, set_units…» — five unrelated ops. The
+    suggestion text now comes only from the engine registry (core/doc/op_registry.cpp,
+    covered by test_op_registry.cpp); the Python layer just passes the op through."""
+    add_features, doc = live
+    r = json.loads(add_features(doc_id=doc, ops=[{"op": "zzzzz_invented"}]))
+    assert r["ok"] is False
+    assert "unknown op 'zzzzz_invented'" in r["error"]
+    assert "cad_guide" in r["error"]
 
 
 @enginetest
@@ -2192,18 +2555,24 @@ def test_live_kimi_keychain_hex_batch_builds(profile_ref):
     tree = json.loads(_bind_tool("get_part")(doc_id=doc))
     hexes = next(f for f in tree["tree"]["features"] if f.get("name") == "HexPattern")
     ents = hexes["params"]["entities"]
-    assert len(ents) == 18, ents          # 3 hexagons x 6 line segments
-    xs = [p[0] for e in ents for p in (e["p1"], e["p2"])]
+    sides = [e for e in ents if not e.get("construction")]
+    guides = [e for e in ents if e.get("construction")]
+    assert len(sides) == 18 and all(e["type"] == "line" for e in sides), ents
+    assert len(guides) == 3 and all(e["type"] == "circle" for e in guides), ents
+    for guide, expected in zip(guides, _HEXES):
+        assert guide["center"] == pytest.approx([expected["center"]["x"], expected["center"]["y"]])
+        assert guide["radius"] == pytest.approx(expected["radius"])
+    xs = [p[0] for e in sides for p in (e["p1"], e["p2"])]
     # Centers honoured: the lattice spans the plate, it is not collapsed on the origin.
     assert min(xs) > 5 and max(xs) > 25, (min(xs), max(xs))
 
 
-# ------------------------------------------------------------------ live IWB holster (2026-08-04)
+# ------------------------------------------------------------------ profile dialect regression
 # Ledger: ~/.local/share/Chudware/cache/runs/run-135571474839343/events.jsonl. The model's
 # VERBATIM sketch op used three coherent dialect spellings together: a singular `profile`
 # entity-list alias, `kind` plus `from`/`to` lines, and a bulge-defined arc.
-_HOLSTER_OUTLINE_OPS = [{"op": "add_feature", "feature": {
-    "type": "sketch", "name": "HolsterOutline", "plane": "XY", "params": {"profile": [
+_ENCLOSURE_OUTLINE_OPS = [{"op": "add_feature", "feature": {
+    "type": "sketch", "name": "EnclosureOutline", "plane": "XY", "params": {"profile": [
         {"kind": "line", "from": [-6, 0], "to": [132, 0]},
         {"kind": "line", "from": [132, 0], "to": [132, 58]},
         {"kind": "line", "from": [132, 58], "to": [72, 58]},
@@ -2214,8 +2583,8 @@ _HOLSTER_OUTLINE_OPS = [{"op": "add_feature", "feature": {
     ]}}}]
 
 
-def test_live_holster_profile_from_to_and_bulge_normalize_without_losing_a_segment():
-    feat = M._normalize_sketch_ops(_HOLSTER_OUTLINE_OPS, [])[0]["feature"]
+def test_profile_from_to_and_bulge_normalize_without_losing_a_segment():
+    feat = M._normalize_sketch_ops(_ENCLOSURE_OUTLINE_OPS, [])[0]["feature"]
     ents = feat["params"]["entities"]
     assert [e["type"] for e in ents] == [
         "line", "line", "line", "line", "arc", "line", "line"]
@@ -2581,6 +2950,36 @@ def test_a_real_selector_is_never_dropped_as_empty():
     assert out[0]["feature"]["refs"] == {"remove": [{"of": "face", "side": "top"}]}
 
 
+@pytest.mark.parametrize("refs", [{}, {"faces": "none"}, {"remove": []}])
+def test_shell_all_true_is_a_closed_shell(refs):
+    ops = [{"op": "add_feature", "feature": {
+        "type": "shell", "params": {"thickness": 2.5, "shell_all": True}, "refs": refs}}]
+    notes = []
+    out = M._normalize_closed_shell_flag(ops, notes)
+    assert out[0]["feature"]["params"] == {"thickness": 2.5}
+    assert out[0]["feature"]["refs"] == refs
+    assert "closed shell" in notes[0]
+    assert ops[0]["feature"]["params"]["shell_all"] is True
+
+
+@pytest.mark.parametrize("flag,refs", [
+    (False, {}), ("true", {}),
+    (True, {"remove": [{"of": "face", "side": "top"}]}),
+    (True, {"faces": [{"of": "face", "side": "top"}]}),
+])
+def test_shell_all_refuses_ambiguous_or_conflicting_input(flag, refs):
+    ops = [{"op": "add_feature", "feature": {
+        "type": "shell", "params": {"thickness": 2.5, "shell_all": flag}, "refs": refs}}]
+    with pytest.raises(ValueError, match="shell_all"):
+        M._normalize_closed_shell_flag(ops, [])
+
+
+def test_shell_without_shell_all_is_not_rewritten():
+    ops = [{"op": "add_feature", "feature": {
+        "type": "shell", "params": {"thickness": 2.5}}}]
+    assert M._normalize_closed_shell_flag(ops, []) is ops
+
+
 def test_boolean_subtract_op_becomes_a_boolean_feature():
     """«unknown op 'boolean_subtract'» — the name was invented but it carried the
     operation AND both operands, which is a complete boolean."""
@@ -2666,6 +3065,19 @@ def test_an_explicit_mode_is_not_overridden_by_a_boolean_word():
     assert out[0]["feature"]["params"]["mode"] == "boss"
 
 
+def test_a_dropped_cut_target_is_an_assumption_that_states_the_real_cut_rule():
+    """The old note claimed a cut applies to every body it intersects. The engine cuts the
+    most recent body only, so dropping a named target can change which body is cut."""
+    notes: list = []
+    M._normalize_inline_boolean([{"op": "add_feature", "feature": {
+        "type": "cylinder", "name": "Bore", "params": {"radius": 5, "height": 90},
+        "refs": {"boolean": "subtract", "target": "f2"}}}], notes)
+    dropped = [n for n in notes if '"f2"' in n]
+    assert dropped and all(isinstance(n, M._Assumption) for n in dropped)
+    text = " ".join(dropped)
+    assert "only to the most recent body" in text and "merge:false" in text
+
+
 @enginetest
 @pytest.mark.parametrize("case", ["faces_none", "remove_empty", "boolean_subtract_op",
                                   "refs_base_tool", "stringified_feature"])
@@ -2702,6 +3114,8 @@ def test_the_live_run_97813015264134_batches_build(case):
     # (274625 mm3) — proof the shell/cut actually happened rather than being dropped.
     assert r["body_count"] == 1
     assert r["volume_mm3"] < 274625.0 * 0.995, r["volume_mm3"]
+    if case in ("faces_none", "remove_empty"):
+        assert r["volume_mm3"] == pytest.approx(65**3 - 60**3, rel=1e-3)
 
 # --------------------------------------------------------------- stringified feature dicts
 
@@ -2933,7 +3347,7 @@ class TestBatchPlaceholderValidation:
 
     def test_a_valid_backward_reference_passes(self):
         M._validate_batch_placeholders(_ops3("$1"))          # no raise
-        M._validate_batch_placeholders(_ops3(["$0", "$1"]))  # nested in a list
+        M._validate_batch_placeholders(_ops3(["$1", "$1"]))  # nested in a list
 
     def test_placeholders_nested_in_a_selector_object_are_checked(self):
         """The live payload's real shape is refs.profile=[{"kind":"region","sketch":"$N"}]
@@ -2951,6 +3365,79 @@ class TestBatchPlaceholderValidation:
     def test_an_empty_or_non_list_batch_is_ignored(self):
         M._validate_batch_placeholders([])
         M._validate_batch_placeholders(None)
+
+
+@enginetest
+def test_dogfood_batch_reference_producer_types():
+    """A rejected bad producer leaves the entire transaction, including deletions, untouched."""
+    from services.agent.agent_turn import _bind_tool
+
+    add = _bind_tool("add_features")
+    doc = _cb.call("doc_new", {"name": f"batch-producers-{uuid.uuid4().hex}"})["doc_id"]
+    valid_doc = None
+    try:
+        seed = json.loads(add(doc_id=doc, ops=[_CANON_BOX]))
+        assert seed["ok"], seed
+        original = seed["id_map"]["$0"]
+        before = _cb.call("doc_tree", {"doc_id": doc})
+        bad_batches = [
+            ([{"op": "delete_feature", "id": original},
+              {"op": "sketch_add_entity", "sketch": "$0",
+               "entity": {"type": "line", "p1": [0, 0], "p2": [1, 0]}}],
+             "$0=(delete_feature)"),
+            ([{"type": "box", "name": "NotSketch",
+               "params": {"length": 10, "width": 10, "height": 10}},
+              {"op": "sketch_fully_define", "sketch": "$0"}],
+             "$0=NotSketch (box)"),
+            ([{"type": "box", "name": "NotSketch",
+               "params": {"length": 10, "width": 10, "height": 10}},
+              {"type": "extrude", "name": "BadProfile", "refs": {"profile": "$0"},
+               "params": {"depth": 2}}],
+             "$0=NotSketch (box)"),
+        ]
+        for ops, expected_roster in bad_batches:
+            result = json.loads(add(doc_id=doc, ops=ops, auto_define=False))
+            assert result["ok"] is False, result
+            assert expected_roster in result["error"], result
+            assert "sketch" in result["error"].lower(), result
+            after = _cb.call("doc_tree", {"doc_id": doc})
+            assert after["revision"] == before["revision"]
+            assert after["tree"] == before["tree"]
+
+        shifted = json.loads(add(doc_id=doc, ops=[
+            {"type": "sketch", "name": "Good", "refs": {"plane": "plane.top"},
+             "params": {"entities": []}},
+            {"type": "box", "name": "NotSketch",
+             "params": {"length": 10, "width": 10, "height": 10}},
+            {"op": "sketch_add_entity", "sketch": "$1",
+             "entity": {"type": "line", "p1": [0, 0], "p2": [1, 0]}},
+        ]))
+        assert shifted["ok"] is False, shifted
+        assert "$1=(sketch_fully_define)" in shifted["error"], shifted
+        assert "$2=NotSketch (box)" in shifted["error"], shifted
+        assert _cb.call("doc_tree", {"doc_id": doc})["revision"] == before["revision"]
+
+        # The prism expands to sketch+extrude and auto-definition inserts further ops.
+        # The authored "$1" must still resolve to the next authored sketch, not a box
+        # or one of the generated operations.
+        valid_doc = _cb.call("doc_new", {"name": f"batch-expanded-{uuid.uuid4().hex}"})["doc_id"]
+        valid = json.loads(add(doc_id=valid_doc, ops=[
+            {"op": "add_feature", "feature": {"type": "polygon_extrude", "name": "Hex",
+             "params": {"sides": 6, "radius": 3, "height": 2}}},
+            {"type": "sketch", "name": "Profile", "refs": {"plane": "plane.top"},
+             "params": {"entities": [{"type": "circle", "center": [15, 0], "radius": 2}]}},
+            {"type": "extrude", "name": "Boss", "refs": {"profile": "$1"},
+             "params": {"depth": 2, "merge": False}},
+        ]))
+        assert valid["ok"], valid
+        tree = _cb.call("doc_tree", {"doc_id": valid_doc})["tree"]
+        sketch = next(f for f in tree["features"] if f.get("name") == "Profile")
+        boss = next(f for f in tree["features"] if f.get("name") == "Boss")
+        assert sketch["id"] in json.dumps(boss["refs"])
+    finally:
+        if valid_doc:
+            _cb.call("doc_close", {"doc_id": valid_doc})
+        _cb.call("doc_close", {"doc_id": doc})
 
 
 def test_flat_fillet_edges_reach_refs_not_params():
@@ -3136,53 +3623,80 @@ def test_a_plane_slot_keeps_its_datum_reading():
     assert feat["refs"]["plane"] == "plane.top"
 
 
+def _axis_of(ftype, slot, value, **extra):
+    refs = {slot: value, **({"profile": [{"kind": "region", "sketch": "f1"}]}
+                            if ftype == "revolve" else {"features": ["f1"]})}
+    feat = M._normalize_feature_refs(
+        {"type": ftype, "name": "F", "refs": refs, "params": {"angle": 360, **extra}},
+        ftype, [])
+    return feat["refs"][slot]
+
+
 @pytest.mark.parametrize("axis_value,expected", [
     ([0, 0, 1], "axis.z"),
-    ([0, 0, -1], "axis.z"),
     ([1, 0, 0], "axis.x"),
     ([0, 1, 0], "axis.y"),
-    ([0.02, 0.01, 5.0], "axis.z"),  # dominant component wins over near-zero noise
+    ([0, 0, 5], "axis.z"),            # magnitude is irrelevant, only the direction
+    ({"direction": [0, 0, 1]}, "axis.z"),
+    ({"origin": [0, 0, 0], "direction": [0, 0, 1]}, "axis.z"),
+    ({"vector": [0, 0, 1]}, "axis.z"),
+    ({"kind": "axis", "axis": [0, 0, 1]}, "axis.z"),
 ])
-def test_bare_axis_vector_snaps_to_the_nearest_cardinal_datum(axis_value, expected):
-    """Live ladder: «refs.axis: selector must be an object» (a bare [x,y,z] list) — the
-    engine has no arbitrary-direction selector kind, only a reserved datum or a real
-    selector object."""
+def test_an_exactly_cardinal_positive_axis_through_the_origin_becomes_the_datum(
+        axis_value, expected):
+    assert _axis_of("circular_pattern", "axis", axis_value) == expected
+
+
+@pytest.mark.parametrize("axis_value,expected", [
+    ([0, 0, -1], {"axis": [0.0, 0.0, -1.0]}),                 # the SIGN is kept
+    ([-1, 0, 0], {"axis": [-1.0, 0.0, 0.0]}),
+    ([0.02, 0.01, 5.0], {"axis": [0.02, 0.01, 5.0]}),         # never snapped to Z
+    ([1, 1, 0], {"axis": [1.0, 1.0, 0.0]}),
+    ({"direction": [0, 0, 1], "origin": [30, 0, 0]},
+     {"axis": [0.0, 0.0, 1.0], "point": [30.0, 0.0, 0.0]}),   # a through-point is kept
+])
+def test_any_other_axis_is_sent_in_the_engines_explicit_form(axis_value, expected):
+    """Snapping to the nearest cardinal turned a diagonal pattern direction into X and a
+    revolve about {origin:[30,0,0]} into a revolve about world Z — both reported ok."""
+    assert _axis_of("revolve", "axis", axis_value) == expected
+
+
+def test_a_revolve_axis_offset_from_the_origin_is_never_a_datum():
+    ref = _axis_of("revolve", "axis", {"origin": [30, 0, 0], "direction": [0, 0, 1]})
+    assert ref == {"axis": [0.0, 0.0, 1.0], "point": [30.0, 0.0, 0.0]}
+
+
+@pytest.mark.parametrize("slot,ftype", [("dir1", "linear_pattern"), ("dir2", "linear_pattern"),
+                                        ("pull", "draft")])
+def test_a_direction_slot_keeps_diagonal_and_point(slot, ftype):
+    ref = M._normalize_feature_refs(
+        {"type": ftype, "name": "F",
+         "refs": {slot: {"direction": [1, 1, 0], "origin": [5, 5, 5]}},
+         "params": {"count1": 3, "spacing1": 10}}, ftype, [])["refs"][slot]
+    assert ref == {"axis": [1.0, 1.0, 0.0], "point": [5.0, 5.0, 5.0]}
+
+
+def test_a_pseudo_selector_with_only_a_centroid_names_no_direction():
+    """`centroid` is a through-point, not a direction: the old snap read it as one."""
+    feat = {"type": "circular_pattern", "name": "P",
+            "refs": {"axis": {"kind": "region", "centroid": [0, 0, -5]}, "features": ["f1"]},
+            "params": {"count": 6, "angle": 360}}
+    assert M._normalize_feature_refs(feat, "circular_pattern", []) is feat
+
+
+def test_an_assembly_pattern_axis_takes_a_positive_datum_only():
+    assert _axis_of("asm_circular_pattern", "axis", [0, 0, 1]) == "axis.z"
+    with pytest.raises(ValueError, match="reserved axis word only"):
+        _axis_of("asm_circular_pattern", "axis", [0, 0, -1])
+
+
+def test_the_axis_note_names_the_form_it_chose():
     notes: list = []
-    feat = M._normalize_feature_refs(
-        {"type": "circular_pattern", "name": "P",
-         "refs": {"axis": axis_value, "features": ["f1"]},
-         "params": {"count": 6, "angle": 360}}, "circular_pattern", notes)
-    assert feat["refs"]["axis"] == expected
-    assert notes
-
-
-def test_malformed_vector_selector_for_axis_also_snaps():
-    """Live ladder rung 2: «refs.axis.kind: not in […]» / «refs.axis.centroid: must be
-    [x,y,z]» — a pseudo-selector wrapping the same direction, one shape further along."""
-    feat = M._normalize_feature_refs(
-        {"type": "circular_pattern", "name": "P",
-         "refs": {"axis": {"kind": "region", "centroid": [0, 0, -5]}, "features": ["f1"]},
-         "params": {"count": 6, "angle": 360}}, "circular_pattern", [])
-    assert feat["refs"]["axis"] == "axis.z"
-
-
-@pytest.mark.parametrize("wrapper", [
-    {"origin": [0, 0, 0], "direction": [0, 0, 1]},
-    {"direction": [0, 0, 1]},
-    {"vector": [0, 0, 1]},
-    {"kind": "axis", "axis": [0, 0, 1]},
-])
-def test_a_direction_wrapper_for_axis_also_snaps(wrapper):
-    """Live 2026-08-04: a revolve arrived with refs.axis={"origin":…,"direction":[0,0,1]}
-    and died on «refs.axis.kind: absent not in […]», which says nothing about the
-    direction it DID supply. `origin` is ignored on purpose — a reserved axis passes
-    through the world origin, so honouring an offset would be a lie."""
-    feat = M._normalize_feature_refs(
+    M._normalize_feature_refs(
         {"type": "revolve", "name": "R",
-         "refs": {"profile": [{"kind": "region", "sketch": "f1"}], "axis": dict(wrapper)},
-         "params": {"angle": 360}}, "revolve", [])
-    assert feat["refs"]["axis"] == "axis.z", feat
-
+         "refs": {"profile": [{"kind": "region", "sketch": "f1"}], "axis": [0, 0, -1]},
+         "params": {"angle": 360}}, "revolve", notes)
+    assert any("explicit axis" in n and "numbers kept exactly" in n for n in notes), notes
 
 def test_an_origin_with_no_direction_is_left_for_the_engine():
     feat = {"type": "revolve", "name": "R",
@@ -3275,14 +3789,10 @@ def test_sketch_plane_is_not_stolen_by_the_ref_migration():
 
 
 @pytest.mark.parametrize("ftype,alias,canon,extra", [
-    # rib: params.width=8 built the 3 mm DEFAULT rib (7650.0 mm^3) and reported ok;
-    # thickness=8 builds 8400.0. Silently wrong, measured live.
-    ("rib", "width", "thickness", {}),
+    # Genuine synonyms only. rib `width`, thread `depth` and sheet-metal `gauge` are NOT
+    # here: each could be a different quantity, so the engine's own unknown-key refusal
+    # (with the type's real key list) picks the intent instead of a guess.
     ("rib", "rib_thickness", "thickness", {}),
-    # thread: params.depth=10 threaded the WHOLE 30 mm cylindrical face (1251.619 mm^3);
-    # length=10 gives 1418.832. Silently wrong, measured live.
-    ("thread", "depth", "length", {"size": "M8"}),
-    # The rest were clean rejections for a value the model DID supply.
     ("shell", "wall_thickness", "thickness", {}),
     ("shell", "wall", "thickness", {}),
     ("chamfer", "size", "length", {}),
@@ -3297,7 +3807,7 @@ def test_sketch_plane_is_not_stolen_by_the_ref_migration():
     # wall (blank 124.106 mm instead of 134.106), `bend_radius` used the default radius
     # (129.540), `kfactor`/`k` used k=0.45 (135.677). All silently, all reported ok.
     ("sm_base_flange", "sheet_thickness", "thickness", {}),
-    ("sm_base_flange", "gauge", "thickness", {}),
+    # (sm_base_flange `gauge` is refused outright — see the gauge test below.)
     ("sm_base_flange", "bend_radius", "default_bend_radius", {"thickness": 2}),
     ("sm_base_flange", "kfactor", "k_factor", {"thickness": 2}),
     ("sm_edge_flange", "height", "length", {}),
@@ -3319,9 +3829,25 @@ def test_type_param_alias_reaches_the_key_the_engine_reads(ftype, alias, canon, 
 
 
 def test_type_param_alias_never_overrides_an_explicit_canonical_key():
-    feat = {"type": "rib", "name": "R", "params": {"thickness": 3, "width": 8}}
+    feat = {"type": "rib", "name": "R", "params": {"thickness": 3, "rib_thickness": 8}}
     ops = M._normalize_type_param_aliases([{"op": "add_feature", "feature": feat}], [])
     assert ops[0]["feature"]["params"]["thickness"] == 3
+
+
+@pytest.mark.parametrize("ftype,word", [("rib", "width"), ("thread", "depth")])
+def test_a_word_that_could_be_another_quantity_is_not_renamed(ftype, word):
+    """rib `width` is the rib's extent and thread `depth` the radial depth — renaming them to
+    thickness / length built a plausible wrong feature. They reach the engine unchanged and
+    its unknown-key refusal names the real keys."""
+    ops = [{"op": "add_feature", "feature": {
+        "type": ftype, "name": "F", "params": {word: 8, "size": "M8"}}}]
+    assert M._normalize_type_param_aliases(ops, []) is ops
+
+
+def test_a_sheet_gauge_is_refused_not_read_as_millimetres():
+    with pytest.raises(ValueError, match=r"gauge.*not a length.*thickness in\s+millimetres"):
+        M._normalize_type_param_aliases([{"op": "add_feature", "feature": {
+            "type": "sm_base_flange", "name": "F", "params": {"gauge": 14}}}], [])
 
 
 def test_type_param_alias_leaves_an_unlisted_type_alone():
@@ -4010,7 +4536,7 @@ def test_an_explicit_pcd_wins_over_a_spare_spelling():
 
 
 # ------------------------------------------------------------------ arc dialects
-# Live run probe-holster-3 (k3-256k, 2026-08-03) lost FOUR consecutive add_features
+# A recorded run lost FOUR consecutive add_features
 # calls to the arc entity alone: the canonical form is centre + radius + start/end
 # ANGLES, and the model reached in turn for endpoint+centre, `arc3` with a mid point,
 # and start_angle/end_angle. Each of those fully determines one arc, so each builds.
@@ -4055,7 +4581,7 @@ def test_three_point_arc_expands_with_the_traversal_direction():
 
 def test_arc_start_angle_end_angle_spelling():
     out = _arc({"type": "arc", "center": [60, 55], "radius": 16,
-                "start_angle": 0, "end_angle": 180})
+                "start_angle": 0, "end_angle": 180, "ccw": True})
     assert out["start"] == 0.0 and out["end"] == 180.0
     assert "start_angle" not in out and "end_angle" not in out
 
@@ -4076,6 +4602,8 @@ def test_canonical_arc_is_left_alone():
       "radius": 99}, "disagrees with the endpoints"),
     ({"type": "arc", "start": [1, 0], "end": [0, 1], "center": [0, 0],
       "sweep": "widdershins"}, "neither clockwise nor counter-clockwise"),
+    ({"type": "arc", "start": [1, 0], "end": [0, 1], "center": [0, 0]},
+     "complements of each other"),
 ])
 def test_an_underspecified_or_contradictory_arc_is_taught_not_guessed(entity, message):
     """Tolerance is never guessing: each rejection names the values it received."""
@@ -4085,7 +4613,7 @@ def test_an_underspecified_or_contradictory_arc_is_taught_not_guessed(entity, me
 
 
 def test_edit_feature_target_nested_in_a_feature_wrapper_is_hoisted():
-    """Live probe-holster-7: preflight_ops accepted the flat spelling, then the same
+    """Preflight_ops accepted the flat spelling, then the same
     edit written with an add_feature-style `feature` wrapper died on
     «edit_feature: no feature ''» with the id sitting inside the wrapper."""
     notes: list = []
@@ -4124,16 +4652,18 @@ def test_edit_feature_placement_beside_params_moves_the_feature():
     assert any("moved" in n and "params" in n for n in notes), notes
 
 
-@pytest.mark.parametrize(("op", "needle"), [
-    ({"op": "edit_feature", "id": "f8", "suppressed": True}, "set_suppressed"),
-    ({"op": "edit_feature", "id": "f8", "radius": 3}, "inside \"params\""),
-    ({"op": "edit_feature", "id": "f8", "at": [0, 0, 1], "params": {"at": [0, 0, 2]}},
-     "both beside and inside"),
-])
-def test_edit_feature_never_drops_a_key_it_cannot_apply(op, needle):
-    with pytest.raises(ValueError, match="edit_feature") as err:
-        M._normalize_op_elements([op], [])
-    assert needle in str(err.value)
+def test_edit_feature_never_drops_a_placement_key_given_twice():
+    with pytest.raises(ValueError, match="both beside and inside"):
+        M._normalize_op_elements(
+            [{"op": "edit_feature", "id": "f8", "at": [0, 0, 1], "params": {"at": [0, 0, 2]}}],
+            [])
+
+
+def test_a_param_edit_op_cannot_carry_a_history_position():
+    with pytest.raises(ValueError, match="reorder_feature"):
+        M._normalize_op_elements(
+            [{"op": "set_param", "feature": "f1", "param": "radius", "value": 3,
+              "before": "f3"}], [])
 
 
 # ------------------------------------------------------- asm_edit_component re-pose
@@ -4213,6 +4743,125 @@ def test_grounding_the_component_in_the_same_batch_is_not_refused(monkeypatch):
     _asm_tree(monkeypatch, fixed=True, mates=_MATE_M1)
     assert M._asm_repose_refusal(
         [{"op": "asm_edit_component", "id": "k2", "transform": _T111}], "doc-x") is None
+
+
+@pytest.mark.parametrize("mate_change", [
+    {"op": "asm_delete_mate", "id": "m1"},
+    {"op": "asm_edit_mate", "id": "m1", "suppressed": True},
+])
+@pytest.mark.parametrize("change_first", [True, False])
+def test_final_removed_mate_allows_repose_in_same_batch(monkeypatch, mate_change, change_first):
+    _asm_tree(monkeypatch, fixed=False, mates=_MATE_M1)
+    move = {"op": "asm_edit_component", "id": "k2", "transform": _T111}
+    ops = [mate_change, move] if change_first else [move, mate_change]
+    assert M._asm_repose_refusal(ops, "doc-x") is None
+
+
+@pytest.mark.parametrize("mate_change", [
+    [{"op": "asm_delete_mate", "id": "m1"}],
+    [{"op": "asm_edit_mate", "id": "m1", "suppressed": True}],
+])
+def test_other_live_mate_still_owns_pose(monkeypatch, mate_change):
+    m2 = {**_MATE_M1[0], "id": "m2"}
+    _asm_tree(monkeypatch, fixed=False, mates=[*_MATE_M1, m2])
+    result = M._asm_repose_refusal(
+        mate_change + [{"op": "asm_edit_component", "id": "k2", "transform": _T111}],
+        "doc-x")
+    assert result["components"] == {"k2": ["m2"]}
+
+
+def test_same_batch_mate_addition_and_reenable_own_pose(monkeypatch):
+    move = {"op": "asm_edit_component", "id": "k2", "transform": _T111}
+    _asm_tree(monkeypatch, fixed=False, mates=[])
+    added = M._asm_repose_refusal(
+        [move, {"op": "asm_add_mate", "mate": _MATE_M1[0]}], "doc-x")
+    assert added["components"] == {"k2": ["new mate at op 1"]}
+    _asm_tree(monkeypatch, fixed=False, mates=[{**_MATE_M1[0], "suppressed": True}])
+    enabled = M._asm_repose_refusal(
+        [{"op": "asm_edit_mate", "id": "m1", "suppressed": False}, move], "doc-x")
+    assert enabled["components"] == {"k2": ["m1"]}
+    _asm_tree(monkeypatch, fixed=False, mates=_MATE_M1)
+    replaced = M._asm_repose_refusal([
+        {"op": "asm_delete_mate", "id": "m1"},
+        {"op": "asm_add_mate", "mate": _MATE_M1[0]}, move], "doc-x")
+    assert replaced["components"] == {"k2": ["new mate at op 1"]}
+
+
+def test_mate_edits_follow_native_fields_and_final_suppression(monkeypatch):
+    _asm_tree(monkeypatch, fixed=False, mates=_MATE_M1)
+    move = {"op": "asm_edit_component", "id": "k2", "transform": _T111}
+    edits = [
+        {"op": "asm_edit_mate", "id": "m1", "suppressed": True},
+        {"op": "asm_edit_mate", "id": "m1", "suppressed": False,
+         "refs": [{"component": "k1"}]},
+    ]
+    assert M._asm_repose_refusal([move, *edits], "doc-x")["components"] == {"k2": ["m1"]}
+    assert M._asm_repose_refusal([move, *edits, edits[0]], "doc-x") is None
+
+
+def test_component_suppression_and_native_first_two_refs(monkeypatch):
+    _asm_tree(monkeypatch, fixed=False, mates=_MATE_M1)
+    move = {"op": "asm_edit_component", "id": "k2", "transform": _T111}
+    assert M._asm_repose_refusal([
+        {"op": "set_suppressed", "id": "k2", "value": True}, move], "doc-x") is None
+    assert M._asm_repose_refusal([
+        {"op": "set_suppressed", "id": "k2", "value": True}, move,
+        {"op": "set_suppressed", "id": "k2", "value": False}], "doc-x")["components"] == {
+            "k2": ["m1"]}
+    third = {"id": "m1", "refs": [{"component": "k1"}, {"component": "k1"},
+                                   {"component": "k2"}]}
+    _asm_tree(monkeypatch, fixed=False, mates=[third])
+    assert M._asm_repose_refusal([move], "doc-x") is None
+
+
+@pytest.mark.parametrize("initial_fixed,changes,blocked", [
+    (True, [{"fixed": False}], True),
+    (False, [{"fixed": True}, {"fixed": False}], True),
+    (False, [{"fixed": True}, {"name": "renamed"}], False),
+    (True, [{"fixed": False}, {"fixed": True}], False),
+    (False, [{"suppressed": True}], False),
+    (False, [{"suppressed": True}, {"suppressed": False}], True),
+])
+def test_final_component_state_controls_repose(monkeypatch, initial_fixed, changes, blocked):
+    _asm_tree(monkeypatch, fixed=initial_fixed, mates=_MATE_M1)
+    ops = [{"op": "asm_edit_component", "id": "k2", "transform": _T111}]
+    ops.extend({"op": "asm_edit_component", "id": "k2", **change} for change in changes)
+    result = M._asm_repose_refusal(ops, "doc-x")
+    assert (result is not None) is blocked
+    if blocked:
+        assert result["components"] == {"k2": ["m1"]}
+
+
+def test_batch_projection_does_not_mutate_tree_and_defers_native_errors(monkeypatch):
+    mates = [{**_MATE_M1[0]}]
+    tree = {"components": [{"id": "k1", "fixed": True}, {"id": "k2", "fixed": False}],
+            "mates": mates}
+    before = json.loads(json.dumps(tree))
+    monkeypatch.setattr(M.cb, "call", lambda *_a, **_k: {"tree": tree})
+    move = {"op": "asm_edit_component", "id": "k2", "transform": _T111}
+    assert M._asm_repose_refusal(
+        [{"op": "asm_edit_mate", "id": "m1", "suppressed": True}, move], "doc-x") is None
+    assert tree == before
+    # Neither a dependency failure nor an unresolved generated-ID placeholder is
+    # converted into a misleading component_is_mated refusal.
+    assert M._asm_repose_refusal(
+        [move, {"op": "asm_delete_component", "id": "k1"}], "doc-x") is None
+    assert M._asm_repose_refusal([
+        move, {"op": "asm_add_mate", "mate": _MATE_M1[0]},
+        {"op": "asm_delete_mate", "id": "$1"}], "doc-x") is None
+    assert tree == before
+
+
+def test_component_delete_cascade_and_reanchor_affect_final_ownership(monkeypatch):
+    tree = {"components": [{"id": "k1", "fixed": True}, {"id": "k2", "fixed": False},
+                           {"id": "k3", "fixed": False}],
+            "mates": [{"id": "m1", "refs": [{"component": "k2"}, {"component": "k3"}]}]}
+    monkeypatch.setattr(M.cb, "call", lambda *_a, **_k: {"tree": tree})
+    move = {"op": "asm_edit_component", "id": "k2", "transform": _T111}
+    assert M._asm_repose_refusal(
+        [move, {"op": "asm_delete_component", "id": "k1"}], "doc-x") is None
+    assert M._asm_repose_refusal(
+        [move, {"op": "asm_delete_component", "id": "k3", "cascade": True}], "doc-x") is None
 
 
 def test_a_non_pose_component_edit_costs_no_probe_and_is_never_refused(monkeypatch):
@@ -4353,6 +5002,31 @@ def test_assembly_transform_and_suppression_use_component_ids(transform_part, tm
         M.cb.call("doc_close", {"doc_id": assembly})
 
 
+def test_asm_edit_mate_normalizes_query_and_sid_without_changing_other_fields(monkeypatch):
+    from services.mcp import cad_asm_tools
+
+    calls = []
+    monkeypatch.setattr(M.cb, "call", lambda method, params: {
+        "tree": {"components": [{"id": "k1"}, {"id": "k2"}]}})
+    def resolve(doc, comps, tag, ref):
+        calls.append((doc, tag, ref))
+        return {"ref": {"component": ref["component"], "selector": {"resolved": True}}}
+    monkeypatch.setattr(cad_asm_tools, "resolve_mate_ref", resolve)
+    ops = [{"op": "asm_edit_mate", "id": "m1", "suppressed": False,
+            "refs": [{"component": "k1", "query": {"of": "face", "side": "top"}},
+                     {"component": "k2", "sid": "F123"},
+                     {"component": "k1", "selector": {"existing": True}}]}]
+    notes = []
+    result = M._normalize_asm_mate_ops(ops, "assembly", notes)
+    assert result[0]["id"] == "m1" and result[0]["suppressed"] is False
+    assert result[0]["refs"] == [
+        {"component": "k1", "selector": {"resolved": True}},
+        {"component": "k2", "selector": {"resolved": True}},
+        {"component": "k1", "selector": {"existing": True}}]
+    assert len(calls) == 2 and all("asm_edit_mate" in c[1] for c in calls)
+    assert "query" in ops[0]["refs"][0] and "sid" in ops[0]["refs"][1]
+    assert notes
+
 @pytest.mark.parametrize("shape", ["flat_op", "query_refs"])
 def test_asm_add_mate_accepts_the_live_flat_and_query_shapes(transform_part, tmp_path, shape):
     """Live 2026-10-10 (six-axis arm): {op, type, align, refs} failed "requires a 'mate'
@@ -4383,6 +5057,17 @@ def test_asm_add_mate_accepts_the_live_flat_and_query_shapes(transform_part, tmp
         assert [r["component"] for r in mates[0]["refs"]] == ids, mates
         assert all(r["selector"].get("centroid") == pytest.approx(centroid)
                    for r in mates[0]["refs"]), mates
+        bottom = M.cb.call("doc_query", {"doc_id": doc,
+                                        "query": {"of": "face", "side": "bottom"}})
+        bottom_centroid = bottom["matches"][0]["centroid"]
+        replacement = {"of": "face", "surf": "plane", "near": bottom_centroid, "count": 1}
+        edited = _transform_apply(assembly, {"op": "asm_edit_mate", "id": mates[0]["id"],
+                                             "refs": [{"component": cid, "query": replacement}
+                                                      for cid in ids]})
+        assert edited["ok"], edited
+        mate_after = M.cb.call("doc_tree", {"doc_id": assembly})["tree"]["mates"][0]
+        assert all(ref["selector"].get("centroid") == pytest.approx(bottom_centroid)
+                   for ref in mate_after["refs"])
     finally:
         M.cb.call("doc_close", {"doc_id": assembly})
 
@@ -4527,11 +5212,42 @@ def test_sketch_convert_accepts_stringified_sid_only_ref_and_keeps_a_closed_prof
         result = json.loads(add(doc_id=doc, ops=[
             {"type": "sketch", "refs": {"plane": "plane.top"},
              "params": {"entities": [], "constraints": [], "offset": 10}},
-            {"op": "sketch_convert", "sketch": "$0", "fix": True,
+            {"op": "sketch_convert", "sketch": "$0", "fix": True, "construction": False,
              "refs": [json.dumps({"kind": "face", "selector": {"sid": sid}})]},
             {"type": "extrude", "refs": {"profile": "$0"},
              "params": {"depth": 2, "merge": False}}]))
         assert result["ok"], result
         assert result["body_count"] == 2 and result["volume_mm3"] == pytest.approx(1200)
+    finally:
+        _cb.call("doc_close", {"doc_id": doc})
+
+
+@enginetest
+def test_background_add_features_returns_native_history_diagnostics(monkeypatch):
+    from services.agent.agent_turn import _bind_tool
+
+    monkeypatch.delenv("CHUDWARE_PROJECT_SAVE_DIR", raising=False)
+    add, wait = _bind_tool("add_features"), _bind_tool("wait_job")
+    doc = _cb.call("doc_new", {"name": "background_history_feedback"})["doc_id"]
+    try:
+        accepted = json.loads(add(doc_id=doc, auto_define=False, background=True, ops=[
+            {"op": "add_feature", "feature": {"type": "box", "name": "Block",
+             "params": {"length": 10, "width": 10, "height": 10}}},
+            {"op": "add_feature", "feature": {"type": "plane", "name": "Unused",
+             "params": {"method": "point_normal", "origin": [0, 0, 5], "normal": [0, 0, 1]}}},
+        ]))
+        assert accepted["status"] == "running" and accepted["job_id"]
+        job = json.loads(wait(job_id=accepted["job_id"], timeout_s=120, poll_s=0.5))
+        assert job["status"] == "done", job
+        built = job["result"]
+        assert built["ok"], built
+        datum = built["id_map"]["$1"]
+        native = _cb.call("eval_model_history", {"doc_id": doc})
+        assert any(row["code"] == "unused_datum" and datum in row["feature_ids"]
+                   for row in native["findings"])
+        feedback = built["model_history"]
+        assert feedback["complete"] is True
+        assert feedback["finding_count"] == len(native["findings"])
+        assert any("unused_datum" in line and datum in line for line in feedback["findings"])
     finally:
         _cb.call("doc_close", {"doc_id": doc})

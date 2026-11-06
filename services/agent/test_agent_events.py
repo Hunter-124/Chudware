@@ -162,11 +162,11 @@ def test_spawn_event_links_parent_and_child():
 
 
 def test_advisor_event():
-    k, p = ae.advisor_event("doc1", "council", "approved: build order sound",
+    k, p = ae.advisor_event("doc1", "design_review", "approved: build order sound",
                             actor="design_thinker")
     assert k == "agent.advisor"
     assert _has_linkage(p)
-    assert p["advisor_kind"] == "council"
+    assert p["advisor_kind"] == "design_review"
     assert "kind" not in p                     # reserved envelope key not shadowed
     assert p["verdict_summary"] == "approved: build order sound"
 

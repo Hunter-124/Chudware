@@ -22,6 +22,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace chudware::solver {
@@ -48,6 +49,15 @@ struct Result {
 struct Analysis {
     int dof = 0;
     std::vector<std::string> redundant_tags;
+    // Dependent residual rows in a relation that still contributes rank:
+    // (constraint tag, rank/DOF lost on whole-relation removal).
+    std::vector<std::pair<std::string, int>> partial_tags;
+    // Exact (non-interactive) analysis only. For each constraint tag with a dependent row
+    // (redundant or conflicting): the tags of the independent rows whose linear combination
+    // reproduces it — the fundamental circuit of that row against the independent basis,
+    // i.e. the minimal set of constraints that duplicate or contradict it. The tag itself is
+    // excluded; order follows registration order.
+    std::vector<std::pair<std::string, std::vector<std::string>>> dependency_partners;
     std::vector<std::string> conflicting_tags;
     bool well_posed = true;
     int rank = 0;

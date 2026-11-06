@@ -9,6 +9,8 @@ triggers:
 
 # Piping design
 
+If not already available, call `enable_tools(tools=["piping_fluid", "new_part", "save_part", "struct_check", "get_job", "add_features", "ask_user"])` and wait for it to succeed before using them; mode and role restrictions still apply.
+
 Depth and exact signatures: `cad_guide('piping')`, `cad_guide('industrial')`.
 Units everywhere: mm geometry, kPa **gauge** pressure, °C temperature, m³/h boundary
 demands, m³/s for `run_pipe_flow`/`duct_size` airflow, m/s velocity. `piping_fluid` alone
@@ -84,7 +86,7 @@ values.
 
 ## 3. Solve (1-D first)
 
-1. Run `piping_solve(doc, boundary, fluid, doc_id, network)`. At least one node must fix
+1. Run `piping_solve(doc=doc, boundary=boundary, fluid=fluid, doc_id=doc_id, network=network)`. At least one node must fix
    pressure or head. Address the first boundary as `{run, end}`, then read
    `node_menu`.
 2. `piping_report()` gives the per-segment K-factor and dP table.
@@ -95,8 +97,8 @@ values.
 
 ## 4. Code check and BOM
 
-1. Run `piping_spec_check(piping, design_pressure_kpa, design_temp_c, ...,
-   doc_id, network)` (ASME B31.3 eq. 3a, B16.5 flange rating, support span).
+1. Run `piping_spec_check(design_pressure_kpa=design_pressure_kpa, piping=piping,
+   design_temp_c=design_temp_c, doc_id=doc_id, network=network)` (ASME B31.3 eq. 3a, B16.5 flange rating, support span).
 2. `all_pass:false` blocks delivery. Raise the schedule, change the material, or raise
    the flange class, then re-check.
 3. Cite per run: `t_required_mm`, `t_nominal_mm`, `mawp_kpa`, `utilization`,

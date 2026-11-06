@@ -1,38 +1,37 @@
-# AGPL NOTICE: OpenMVS is AGPL-3.0. It MUST be invoked via subprocess only.
-# Never import or link against OpenMVS libraries. See contracts/reveng.md §0.1
-# and CONTRIBUTING.md license guardrails. RE-26 owns the license_debt.md entry.
+# AGPL NOTICE: OpenMVS is AGPL-3.0. Chudware (MIT) fetches the pinned upstream release
+# on demand (scripts/provision_reveng.py) but only ever runs it as a subprocess; never
+# import or link against OpenMVS libraries. See contracts/reveng.md §0.1.
 #
 # Brush (3DGS trainer) is Apache-2.0 — subprocess only for consistency and isolation.
 """Dense reconstruction and mesh export backends for the RE pipeline.
 
 Two backends, both subprocess-only:
 
-  OpenMVS  — DensifyPointCloud → ReconstructMesh → RefineMesh → TextureMesh
-             Triggered by OPENMVS_BIN env var (path to the OpenMVS bin directory
-             containing DensifyPointCloud, ReconstructMesh, etc.).
-             Input:  COLMAP sparse model dir (from RE-09 colmap_pipeline.py)
-             Output: dense/ and mesh/ under the session root.
+  OpenMVS  — InterfaceCOLMAP → DensifyPointCloud → ReconstructMesh →
+             RefineMesh → TextureMesh, from OPENMVS_BIN, PATH, or the managed install.
+             Input: shared undistorted COLMAP dataset root with images/ and sparse/.
+             Output: isolated dense/ and mesh/ under the session root's dense/.
 
   Brush    — trains 3D Gaussians using pinned Brush v0.3.0 (no mesh export).
              Managed install or explicit BRUSH_BIN executable.
              Input:  standalone undistorted COLMAP dataset with model + images.
              Output: immutable, validated Gaussian PLY exports under splat/.
 
-When the required binary env/path is absent, both functions return the degradation
-envelope  {"ok": false, "reason": "backend_not_provisioned", ...}  — never a traceback.
+When OpenMVS is unavailable the result names the approximate splat_to_mesh
+fallback; Brush reports backend_not_provisioned when its executable is absent.
 """
 from __future__ import annotations
 
 import os
-import subprocess
 import shutil
 import signal
+import subprocess
 import tempfile
 import time
 from pathlib import Path
-
-from .reveng_provision import brush_executable
 from typing import Optional
+
+from .reveng_provision import OPENMVS_TOOLS, brush_executable, openmvs_install_dir
 
 
 # ---------------------------------------------------------------------------
@@ -64,110 +63,102 @@ def _run(cmd: list[str], *, cwd: Optional[str] = None) -> tuple[bool, str]:
 # OpenMVS backend
 # ---------------------------------------------------------------------------
 
+def _openmvs_unavailable(missing=None):
+    return {"ok": False, "reason": "dense_backend_unavailable", "backend": "openmvs",
+            "fallback": "splat_to_mesh",
+            "fallback_function": "services.formats.splat_io.splat_to_mesh",
+            "hint": "Call reveng_install_tools (or use Install missing tools in the Reverse Engineering panel) to install OpenMVS, or set OPENMVS_BIN / add its tools to PATH."
+                    + (f" Missing: {', '.join(missing)}." if missing else "")}
+
+
+def _openmvs_bins(*, check):
+    """An explicit OPENMVS_BIN is authoritative; otherwise PATH, then the managed install."""
+    directory = os.environ.get("OPENMVS_BIN", "")
+    managed = "" if directory else str(openmvs_install_dir())
+    bins, missing = {}, []
+    for name in OPENMVS_TOOLS:
+        candidate = os.path.join(directory, name) if directory else name
+        resolved = shutil.which(candidate) or (shutil.which(os.path.join(managed, name)) if managed else None)
+        if resolved:
+            bins[name] = resolved
+        elif not check and directory:
+            bins[name] = candidate
+        else:
+            missing.append(name)
+    return bins, missing
+
+
 def run_openmvs(
-    sparse_dir: str,
+    dataset_dir: str,
     session_dir: str,
     *,
     working_resolution: int = 0,
     texture_size: int = 4096,
 ) -> dict:
-    """Run the OpenMVS dense pipeline on a COLMAP sparse model.
+    """Run user-installed OpenMVS on the shared, undistorted COLMAP dataset.
 
-    Args:
-        sparse_dir:   Path to the COLMAP sparse model directory (contains cameras.bin
-                      / images.bin / points3D.bin, as produced by RE-09
-                      colmap_pipeline.py).
-        session_dir:  Session root.  Outputs go to <session_dir>/dense/ and
-                      <session_dir>/mesh/.
-        working_resolution: Passed as --working-resolution to DensifyPointCloud
-                      (0 = full, positive = cap in megapixels).
-        texture_size: Max texture atlas size for TextureMesh.
-
-    Returns:
-        On success:  {"ok": True, "mesh_path": <str>, "backend": "openmvs"}
-        On failure:  {"ok": False, "reason": ..., "hint": ..., "backend": "openmvs"}
+    ``dataset_dir`` contains ``images/`` and ``sparse/``.  The result remains
+    in the dataset's native gauge; metric placement belongs to ReconTransform.
+    ``working_resolution`` is the number of image downsampling levels.
     """
-    bin_dir = os.environ.get("OPENMVS_BIN", "")
-    if not bin_dir:
-        return {**_not_provisioned("set OPENMVS_BIN to the OpenMVS bin directory"), "backend": "openmvs"}
+    _bins, missing = _openmvs_bins(check=True)
+    if missing:
+        return _openmvs_unavailable(missing)
+    dataset = Path(dataset_dir).expanduser().resolve()
 
-    dense_dir = os.path.join(session_dir, "dense")
-    mesh_dir = os.path.join(session_dir, "mesh")
-    os.makedirs(dense_dir, exist_ok=True)
-    os.makedirs(mesh_dir, exist_ok=True)
+    def complete(model):
+        return any(all((model / (name + ext)).is_file()
+                       for name in ("cameras", "images", "points3D"))
+                   for ext in (".bin", ".txt"))
 
-    # Intermediate file paths
-    dense_mvs = os.path.join(dense_dir, "dense.mvs")
-    dense_ply = os.path.join(dense_dir, "dense_dense.ply")
-    mesh_mvs = os.path.join(dense_dir, "mesh.mvs")
-    refined_mvs = os.path.join(dense_dir, "mesh_refine.mvs")
-    textured_obj = os.path.join(mesh_dir, "mesh_texture.obj")
-
-    def _bin(name: str) -> str:
-        return os.path.join(bin_dir, name)
-
-    # Step 1: DensifyPointCloud
-    # InterfaceCOLMAP first converts the COLMAP sparse model to .mvs
-    interface_cmd = [
-        _bin("InterfaceCOLMAP"),
-        "--input-path", sparse_dir,
-        "--output-file", dense_mvs,
-    ]
-    ok, err = _run(interface_cmd)
-    if not ok:
-        return {"ok": False, "reason": f"InterfaceCOLMAP failed: {err}", "hint": "check OPENMVS_BIN and sparse_dir", "backend": "openmvs"}
-
-    densify_cmd = [
-        _bin("DensifyPointCloud"),
-        "--input-file", dense_mvs,
-        "--output-file", dense_ply,
-        "--working-folder", dense_dir,
-        "--working-resolution", str(working_resolution),
-    ]
-    ok, err = _run(densify_cmd)
-    if not ok:
-        return {"ok": False, "reason": f"DensifyPointCloud failed: {err}", "hint": "check OpenMVS GPU/CPU requirements", "backend": "openmvs"}
-
-    # Step 2: ReconstructMesh
-    reconstruct_cmd = [
-        _bin("ReconstructMesh"),
-        "--input-file", dense_ply,
-        "--output-file", mesh_mvs,
-        "--working-folder", dense_dir,
-    ]
-    ok, err = _run(reconstruct_cmd)
-    if not ok:
-        return {"ok": False, "reason": f"ReconstructMesh failed: {err}", "hint": "check input dense point cloud", "backend": "openmvs"}
-
-    # Step 3: RefineMesh
-    refine_cmd = [
-        _bin("RefineMesh"),
-        "--input-file", mesh_mvs,
-        "--output-file", refined_mvs,
-        "--working-folder", dense_dir,
-    ]
-    ok, err = _run(refine_cmd)
-    if not ok:
-        return {"ok": False, "reason": f"RefineMesh failed: {err}", "hint": "check mesh quality from ReconstructMesh", "backend": "openmvs"}
-
-    # Step 4: TextureMesh
-    texture_cmd = [
-        _bin("TextureMesh"),
-        "--input-file", refined_mvs,
-        "--output-file", textured_obj,
-        "--working-folder", dense_dir,
-        "--export-type", "obj",
-        "--texture-size-multiple", str(texture_size),
-    ]
-    ok, err = _run(texture_cmd)
-    if not ok:
-        return {"ok": False, "reason": f"TextureMesh failed: {err}", "hint": "check mesh and images", "backend": "openmvs"}
-
-    return {"ok": True, "mesh_path": textured_obj, "backend": "openmvs"}
+    sparse = dataset / "sparse"
+    model = sparse if complete(sparse) else sparse / "0"
+    if not (dataset / "images").is_dir() or not complete(model):
+        return {"ok": False, "reason": "invalid_dataset", "backend": "openmvs",
+                "hint": "OpenMVS needs the shared undistorted dataset root with images/ and sparse/ model files."}
+    # Keep every attempt in its own directory: a failed refresh must never
+    # publish a prior run's scene or mesh as its new output.
+    parent = Path(session_dir).expanduser().resolve() / "dense"
+    parent.mkdir(parents=True, exist_ok=True)
+    run_root = Path(tempfile.mkdtemp(prefix="openmvs-", dir=parent))
+    dense_dir, mesh_dir = run_root / "dense", run_root / "mesh"
+    dense_dir.mkdir()
+    mesh_dir.mkdir()
+    if model != sparse:
+        # InterfaceCOLMAP requires files directly in sparse/. Keep a durable
+        # view of sparse/0 and images/ for its scene's later image references.
+        view = run_root / "dataset"
+        view.mkdir()
+        for source, target in ((model, view / "sparse"), (dataset / "images", view / "images")):
+            try:
+                target.symlink_to(source, target_is_directory=True)
+            except OSError:
+                shutil.copytree(source, target)
+        dataset = view
+    result = openmvs_commands(str(dataset), str(run_root), working_resolution=working_resolution,
+                              texture_size=texture_size)
+    if not result["ok"]:
+        return result
+    commands = result["commands"]
+    for command in commands:
+        ok, err = _run(command)
+        if not ok:
+            return {"ok": False, "reason": "openmvs_failed", "backend": "openmvs",
+                    "hint": f"{Path(command[0]).name} failed: {err}"}
+        expected = Path(command[command.index("--output-file") + 1])
+        if not expected.is_file() or expected.stat().st_size == 0:
+            return {"ok": False, "reason": "openmvs_output_missing", "backend": "openmvs",
+                    "hint": f"{Path(command[0]).name} did not produce {expected}."}
+    mesh_path = mesh_dir / "mesh_texture.obj"
+    if not mesh_path.is_file() or mesh_path.stat().st_size == 0:
+        return {"ok": False, "reason": "openmvs_output_missing", "backend": "openmvs",
+                "hint": f"TextureMesh did not produce {mesh_path}."}
+    return {"ok": True, "mesh_path": str(mesh_path), "backend": "openmvs",
+            "units": "reconstruction"}
 
 
 def openmvs_commands(
-    sparse_dir: str,
+    dataset_dir: str,
     session_dir: str,
     *,
     working_resolution: int = 0,
@@ -179,34 +170,32 @@ def openmvs_commands(
 
     Returns:
         {"ok": True, "commands": [list-of-args, ...], "backend": "openmvs"}
-        {"ok": False, "reason": "backend_not_provisioned", ...} when OPENMVS_BIN unset.
+        {"ok": False, "reason": "dense_backend_unavailable", ...} if absent.
     """
-    bin_dir = os.environ.get("OPENMVS_BIN", "")
-    if not bin_dir:
-        return {**_not_provisioned("set OPENMVS_BIN to the OpenMVS bin directory"), "backend": "openmvs"}
+    bins, missing = _openmvs_bins(check=False)
+    if missing:
+        return _openmvs_unavailable(missing)
 
     dense_dir = os.path.join(session_dir, "dense")
     mesh_dir = os.path.join(session_dir, "mesh")
+    scene_mvs = os.path.join(dense_dir, "scene.mvs")
     dense_mvs = os.path.join(dense_dir, "dense.mvs")
-    dense_ply = os.path.join(dense_dir, "dense_dense.ply")
     mesh_mvs = os.path.join(dense_dir, "mesh.mvs")
     refined_mvs = os.path.join(dense_dir, "mesh_refine.mvs")
-    textured_obj = os.path.join(mesh_dir, "mesh_texture.obj")
-
-    def _bin(name: str) -> str:
-        return os.path.join(bin_dir, name)
+    textured_mvs = os.path.join(mesh_dir, "mesh_texture.mvs")
 
     commands = [
-        [_bin("InterfaceCOLMAP"), "--input-path", sparse_dir, "--output-file", dense_mvs],
-        [_bin("DensifyPointCloud"), "--input-file", dense_mvs, "--output-file", dense_ply,
-         "--working-folder", dense_dir, "--working-resolution", str(working_resolution)],
-        [_bin("ReconstructMesh"), "--input-file", dense_ply, "--output-file", mesh_mvs,
+        [bins["InterfaceCOLMAP"], "--input-file", dataset_dir, "--output-file", scene_mvs],
+        [bins["DensifyPointCloud"], "--input-file", scene_mvs, "--output-file", dense_mvs,
+         "--working-folder", dense_dir, "--resolution-level", str(working_resolution),
+         "--normalize-coordinates", "0", "--tower-mode", "0"],
+        [bins["ReconstructMesh"], "--input-file", dense_mvs, "--output-file", mesh_mvs,
          "--working-folder", dense_dir],
-        [_bin("RefineMesh"), "--input-file", mesh_mvs, "--output-file", refined_mvs,
+        [bins["RefineMesh"], "--input-file", mesh_mvs, "--output-file", refined_mvs,
          "--working-folder", dense_dir],
-        [_bin("TextureMesh"), "--input-file", refined_mvs, "--output-file", textured_obj,
+        [bins["TextureMesh"], "--input-file", refined_mvs, "--output-file", textured_mvs,
          "--working-folder", dense_dir, "--export-type", "obj",
-         "--texture-size-multiple", str(texture_size)],
+         "--max-texture-size", str(texture_size)],
     ]
     return {"ok": True, "commands": commands, "backend": "openmvs"}
 
@@ -246,7 +235,7 @@ def run_brush(
         return failure("mesh_export_unsupported", "Brush exports Gaussians, not meshes; use the separate OpenMVS action.")
     executable = brush_executable()
     if not executable:
-        return {**base, **_not_provisioned("Run python scripts/provision_reveng.py or set BRUSH_BIN to an executable.")}
+        return {**base, **_not_provisioned("Call reveng_install_tools (or use Install missing tools in the Reverse Engineering panel), or set BRUSH_BIN to an executable.")}
     if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 1:
         return failure("invalid_iterations", "max_steps must be a positive integer.")
     every = min(max_steps, 100) if export_every is None else export_every
@@ -316,15 +305,18 @@ def run_brush(
         ]
         seen = set()
 
+        def iteration_of(path):
+            try:
+                return int(path.stem.removeprefix("export_"))
+            except ValueError:
+                return None
+
         def publish():
             nonlocal latest
             candidates = []
             for path in exports.glob("export_*.ply"):
-                try:
-                    iteration = int(path.stem.removeprefix("export_"))
-                except ValueError:
-                    continue
-                if iteration not in seen:
+                iteration = iteration_of(path)
+                if iteration is not None and iteration not in seen:
                     candidates.append((iteration, path))
             # Only the newest completed snapshot is useful to an interactive UI.
             for iteration, path in sorted(candidates, reverse=True):
@@ -351,6 +343,17 @@ def run_brush(
                 latest = {"splat_path": str(target), "iteration": iteration,
                           "total_iterations": max_steps, "bounds": info["bounds"],
                           "max_splats": max_splats}
+                # Raw exports are staging copies and older previews are superseded; a
+                # long pass would otherwise keep hundreds of full-size PLYs. The previous
+                # snapshot stays for a reader that is still loading it.
+                for stale in exports.glob("export_*.ply"):
+                    stale_iteration = iteration_of(stale)
+                    if stale_iteration is not None and stale_iteration <= iteration:
+                        stale.unlink(missing_ok=True)
+                snapshots = sorted((p for p in published.glob("export_*.ply")
+                                    if iteration_of(p) is not None), key=iteration_of)
+                for old in snapshots[:-2]:
+                    old.unlink(missing_ok=True)
                 if progress:
                     progress("training", min(99, iteration * 100 // max_steps),
                              f"Brush exported iteration {iteration}/{max_steps}", dict(latest))

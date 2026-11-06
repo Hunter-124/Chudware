@@ -3,7 +3,7 @@
 Composites vendor (tubes/sheets) with an open storefront, live prices and spec
 PDFs: ``acquire`` uses the default machining/spec-table param extraction plus
 datasheet discovery, and copies only a small price/stock-spec record with
-provenance. Challenge pages degrade to ``login_required`` — never solved.
+provenance. Challenges are reported as blocked or captcha, never solved.
 
 Live-verified 2026-07-10: the storefront runs on Salesforce Commerce Cloud
 (Demandware), so search is ``/on/demandware.store/Sites-RWC-Site/default/Search-Show?q=``
@@ -15,9 +15,10 @@ adapter overrides :meth:`parse_search` to read that markup directly.
 from __future__ import annotations
 
 import re
+from html import unescape
 
-from . import register
-from ._retail import RetailAdapter, _strip_tags
+from . import abs_url, register
+from ._retail import RetailAdapter, _strip_tags, card_blocks, card_image
 
 SITE = "rockwest"
 BASE_URL = "https://www.rockwestcomposites.com"
@@ -45,10 +46,20 @@ _CARD_RE = re.compile(
     re.IGNORECASE | re.DOTALL)
 _SKU_RE = re.compile(
     r'<span class="productSkuNumber">.*?P/N:\s*(?P<sku>[^\s<]+)', re.IGNORECASE | re.DOTALL)
+_SALES_RE = re.compile(
+    r'<span\b(?=[^>]*\bclass=["\'][^"\']*\bsales\b[^"\']*["\'])'
+    r'(?=[^>]*\bdata-price-formatted=["\'](?P<price>[^"\']+)["\'])[^>]*>',
+    re.IGNORECASE)
+_AVAILABLE_RE = re.compile(r'\bAvailable\s+Now\s*:\s*([\d,]+)', re.IGNORECASE)
 
 
 class RockWestAdapter(RetailAdapter):
     key = SITE
+    hosts = ("www.rockwestcomposites.com", "rockwestcomposites.com")
+    result_kinds = ("product",)
+    cad_acquisition = False
+    login_required = False
+    api = False
     base_url = BASE_URL
     search_url_tmpl = SEARCH_URL_TMPL
     license_note = LICENSE_NOTE
@@ -56,29 +67,40 @@ class RockWestAdapter(RetailAdapter):
     challenge_markers = _CHALLENGE_MARKERS
 
     def parse_search(self, content: str) -> list[dict]:
-        """Rock West ships no JSON-LD on its Demandware SRP; parse the server
-        -rendered ``product-tile`` cards directly. The SKU span follows the
-        ``pdp-link`` block, so slice each card up to the next ``pdp-link`` to keep a
-        card's P/N from leaking onto the previous tile."""
+        """Read each Demandware product tile without borrowing adjacent data."""
         hits: list[dict] = []
         seen: set[str] = set()
-        cards = list(_CARD_RE.finditer(content))
-        for i, m in enumerate(cards):
-            href = m.group("href")
-            url = href if href.startswith("http") else BASE_URL + href
-            if url in seen:
+        blocks = card_blocks(content, "div", "product-tile")
+        scoped = bool(blocks)
+        if not scoped:
+            # Historical saved snippets have PDP links and SKUs but no tile wrapper.
+            cards = list(_CARD_RE.finditer(content))
+            blocks = [content[m.start():cards[i + 1].start() if i + 1 < len(cards) else len(content)]
+                      for i, m in enumerate(cards)]
+        for block in blocks:
+            match = _CARD_RE.search(block)
+            if not match:
+                continue
+            url = abs_url(BASE_URL, unescape(match.group("href")))
+            title = unescape(_strip_tags(match.group("title")))
+            if not url or not title or url in seen:
                 continue
             seen.add(url)
-            end = cards[i + 1].start() if i + 1 < len(cards) else len(content)
-            sku_m = _SKU_RE.search(content, m.end(), end)
-            hit = {
-                "ok": True,
-                "title": _strip_tags(m.group("title")),
-                "url": url,
-                "site": SITE,
-            }
-            if sku_m:
-                hit["sku"] = sku_m.group("sku").strip()
+            hit = {"ok": True, "title": title, "url": url, "site": SITE}
+            sku = _SKU_RE.search(block)
+            if sku:
+                hit["sku"] = unescape(sku.group("sku").strip())
+            if scoped:
+                media = card_blocks(block, "div", "image-container")
+                hit["thumbnail"] = card_image(media[0], BASE_URL) if media else None
+                price = _SALES_RE.search(block)
+                if price:
+                    hit.update(price=unescape(price.group("price")), currency="USD")
+                availability = card_blocks(block, "span", "availabilityProduct")
+                if availability:
+                    stock = _AVAILABLE_RE.search(_strip_tags(availability[0]))
+                    if stock:
+                        hit["stock"] = stock.group(1)
             hits.append(hit)
         return hits
 

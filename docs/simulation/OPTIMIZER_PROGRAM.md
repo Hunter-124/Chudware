@@ -1,7 +1,5 @@
 # Simulation Optimizer Program
 
-**Program baseline:** 2026-08-24
-
 This program defines how learned simulation optimizers may be admitted into Chudware. The
 per-family track registry, its source-hash validator, and the training corpora were
 research tooling and are not part of the public tree; the rules, gates and current
@@ -47,22 +45,24 @@ The PolyMesh learned mesh advisor is the only trained candidate. Its registered 
 
 Every other family is **gated**. No model, corpus, or performance claim is inferred from the presence of a shipped numerical solver.
 
-## Dated family gates
+## Family-specific admission criteria
 
-Dates below are evidence-freeze and decision-review dates, not promises to ship a model. Missing evidence on the review date is a measured no-go. Cost improvements are measured against the source-hashed deterministic baseline on identical hardware and cases; accuracy and safety are evaluated on complete held-out groups.
+Cost improvements are measured against the source-hashed deterministic baseline on identical
+hardware and cases; accuracy and safety are evaluated on complete held-out groups. Decision
+metrics and thresholds must be registered before observing the evaluation results.
 
-| Family / registry track | Evidence freeze | Decision review | Measurable go gate (all clauses required) | Current decision |
-|---|---:|---:|---|---|
-| Static/adaptive FEA — `polymesh_mesh_advisor` | 2026-09-23 | 2026-09-30 | At least 55% wins among non-tied paired held-out-family cases; lower macro regret than default with paired one-sided $p \le 0.05$; failure pick rate no more than 2 percentage points above default; at least 90% of measured failures caught; 100% refusal of non-tet Chudware actions and over-budget actions; no loss of estimator/convergence vetoes. | **No-go:** trained candidate only; current default comparison is a non-result and the measured missed-failure rate is 17.4%. |
-| Modal — `modal_optimizer` | 2026-10-23 | 2026-10-30 | P95 relative error across the first ten requested physical modes $\le 2\%$; 100% requested-mode retention; 100% rigid-body/non-positive-mode veto coverage; median solve cost at least 20% below baseline with no tail-error regression. | **Gated:** no registered corpus or artifact. |
-| Thermal — `thermal_optimizer` | 2026-11-06 | 2026-11-13 | P95 temperature-functional error $\le 3\%$ on steady and transient held-out families; energy imbalance $\le 1\%$ on every accepted case; 100% non-finite/non-converged veto coverage; median cell-step cost at least 20% below baseline. | **Gated:** no registered corpus or artifact. |
-| Fatigue — `fatigue_optimizer` | 2026-11-20 | 2026-11-27 | P95 life error $\le 0.15$ log10 cycles; 100% rejection of unconverged source stress, unproven S-N data, static overload, and raw singular peak-stress labels; median upstream solve cost at least 20% below baseline without worse conservative life error. | **Gated:** no licensed, provenance-complete life corpus. |
-| Buckling — `buckling_optimizer` | 2026-12-04 | 2026-12-11 | P95 critical-load-factor error $\le 5\%$; 100% rejection of absent prestress, non-positive modes, and unsupported nonlinear/contact regimes; median solve cost at least 20% below baseline; no missed lowest physical mode. | **Gated:** no independently converged buckling corpus. |
-| Contact — `contact_optimizer` | 2027-01-08 | 2027-01-15 | At least 95% of held-out topology cases converge with force-balance error $\le 2\%$ and registered penetration tolerance satisfied; 100% ambiguous-pair, negative-stiffness, and non-convergence veto coverage; median nonlinear iterations at least 20% below baseline. | **Gated:** no nonlinear contact corpus or tolerance evidence. |
-| Frequency response — `frequency_response_optimizer` | 2027-01-22 | 2027-01-29 | P95 normalized response-curve area error $\le 3\%$; every reference resonance represented with peak-frequency error $\le 2\%$; at least 25% fewer sampled frequencies than baseline; 100% incomplete-basis and unresolved-resonance veto coverage. | **Gated:** no response-curve corpus or artifact. |
-| LBM CFD — `lbm_cfd_optimizer` | 2027-02-05 | 2027-02-12 | P95 drag or pressure-drop error $\le 5\%$ across held-out geometries and registered Reynolds regimes; mass imbalance $\le 1\%$ on every accepted run; zero false passes for Mach/relaxation instability; median cell-steps at least 20% below baseline; CPU/CUDA decisions pass parity bounds. | **Gated:** no grid-converged conservation corpus. |
-| OpenFOAM CFD — `openfoam_cfd_optimizer` | 2027-02-19 | 2027-02-26 | P95 registered flow-functional error $\le 5\%$; mass imbalance $\le 1\%$ and residual gate met on every accepted run; 100% version/case/boundary provenance; median wall cost at least 20% below the version-pinned baseline without selecting an unevidenced turbulence model. | **Gated:** no version-pinned optimizer corpus. |
-| Motion — `motion_optimizer` | 2027-03-05 | 2027-03-12 | P95 normalized pose and joint-reaction error $\le 3\%$ on held-out physical assemblies; mate residual $\le 10^{-6}$ and force/moment balance pass on every accepted frame; 100% interference, missing-inertia, and trajectory-discontinuity veto coverage; at least 20% fewer evaluated frames at equal path accuracy. | **Gated:** no assembly-scale optimizer corpus. |
+| Family | Required go gate |
+|---|---|
+| Static/adaptive FEA | At least 55% wins among non-tied paired held-out-family cases; lower macro regret than default with paired one-sided $p \le 0.05$; failure pick rate no more than 2 percentage points above default; at least 90% of measured failures caught; 100% refusal of non-tet Chudware actions and over-budget actions; no loss of estimator/convergence vetoes. |
+| Modal | P95 relative error across the first ten requested physical modes $\le 2\%$; 100% requested-mode retention; 100% rigid-body/non-positive-mode veto coverage; median solve cost at least 20% below baseline with no tail-error regression. |
+| Thermal | P95 temperature-functional error $\le 3\%$ on steady and transient held-out families; energy imbalance $\le 1\%$ on every accepted case; 100% non-finite/non-converged veto coverage; median cell-step cost at least 20% below baseline. |
+| Fatigue | P95 life error $\le 0.15$ log10 cycles; 100% rejection of unconverged source stress, unproven S-N data, static overload, and raw singular peak-stress labels; median upstream solve cost at least 20% below baseline without worse conservative life error. |
+| Buckling | P95 critical-load-factor error $\le 5\%$; 100% rejection of absent prestress, non-positive modes, and unsupported nonlinear/contact regimes; median solve cost at least 20% below baseline; no missed lowest physical mode. |
+| Contact | At least 95% of held-out topology cases converge with force-balance error $\le 2\%$ and registered penetration tolerance satisfied; 100% ambiguous-pair, negative-stiffness, and non-convergence veto coverage; median nonlinear iterations at least 20% below baseline. |
+| Frequency response | P95 normalized response-curve area error $\le 3\%$; every reference resonance represented with peak-frequency error $\le 2\%$; at least 25% fewer sampled frequencies than baseline; 100% incomplete-basis and unresolved-resonance veto coverage. |
+| LBM CFD | P95 drag or pressure-drop error $\le 5\%$ across held-out geometries and registered Reynolds regimes; mass imbalance $\le 1\%$ on every accepted run; zero false passes for Mach/relaxation instability; median cell-steps at least 20% below baseline; CPU/CUDA decisions pass parity bounds. |
+| OpenFOAM CFD | P95 registered flow-functional error $\le 5\%$; mass imbalance $\le 1\%$ and residual gate met on every accepted run; 100% version/case/boundary provenance; median wall cost at least 20% below the version-pinned baseline without selecting an unevidenced turbulence model. |
+| Motion | P95 normalized pose and joint-reaction error $\le 3\%$ on held-out physical assemblies; mate residual $\le 10^{-6}$ and force/moment balance pass on every accepted frame; 100% interference, missing-inertia, and trajectory-discontinuity veto coverage; at least 20% fewer evaluated frames at equal path accuracy. |
 
 ## Evidence package required at each review
 

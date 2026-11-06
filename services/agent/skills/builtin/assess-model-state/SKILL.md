@@ -12,6 +12,8 @@ triggers:
 
 Read-only pass. Prefer this before large edits and always before "done".
 
+If not already available, call `enable_tools(tools=["list_parts", "describe_part", "describe_sketch", "describe_assembly", "measure_part", "query_geometry", "check_interference"])` and wait for it to succeed before using them; mode and role restrictions still apply.
+
 ## Sequence
 
 1. Scope: `list_parts()` — which docs are open? Pick the target `doc_id`.
@@ -24,7 +26,7 @@ Read-only pass. Prefer this before large edits and always before "done".
    - `check_feature_overlap(doc_id)` on parts
    - `check_interference(doc_id)` on multi-body/assembly
    - `interface_check(doc_id)` for alignment (patterns, coaxiality, flush faces)
-5. Full gate: `verify_battery(doc_id)` — narrate PASS/WARN/FAIL per check.
+5. Full gate: `verify_battery(doc_id=doc_id)` — narrate PASS/WARN/FAIL per check.
 6. Summarize: what is healthy, what blocks shipping, what to fix next (ordered).
 
 ## Rules

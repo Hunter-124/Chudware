@@ -3,7 +3,7 @@ name: make-drawing
 description: Produce 2D drawings with correct view order, measured dimensions, GD&T, title block, and export.
 inject: auto
 triggers:
-  keywords: [2D drawing, engineering drawing, dimensioned drawing, GD&T, title block, section view, detail view, drawing sheet]
+  keywords: [2D drawing, engineering drawing, dimensioned drawing, save drawing, native drawing, GD&T, title block, section view, detail view, drawing sheet]
   tools: [make_drawing, add_dimension, add_drawing_view, export_drawing]
   phases: [drawing]
 ---
@@ -21,10 +21,11 @@ How to produce a manufacturing 2D drawing from a part in Chudware. Views first, 
    - Projected orthographic views next
    - Section views (`add_section_view`) for hidden interiors
    - Detail views (`add_detail_view`) for tight features
-4. **Dimension from truth** — `add_dimension(view_id, a, b?, dtype=...)` anchors to model SIDs/feature names or measured sheet-mm points from the drawing view. Confirm sizes against geometry queries; never substitute a guessed `text` override for a measured dimension.
+4. **Dimension from truth** — `add_dimension(view_id, a, b?, dtype=...)` anchors to model SIDs/feature names or measured sheet-mm points from the drawing view. For `add_hole_callout`, use `a=[x,y]` sheet mm at or near the projected circle or centre, not a model SID. Confirm sizes against geometry queries; never substitute a guessed `text` override for a measured dimension.
 5. **Callouts** — GD&T via `add_gdt`; surface finish via `add_surface_finish`. Apply only where the design intent needs control (mates, seals, bearing seats).
-6. **Title block** — `set_titleblock` with title (the part's NAME — never `part_number`, that cell is the identifier a shop orders from), revision, material, finish, scale, and author/date as known. There is no units field: units are a document property (mm by default), so `units=` is refused.
-7. **Export / handoff** — `export_drawing` (or an explicit user-facing summary of sheet contents) before declaring done.
+6. **Title block** — `set_titleblock` with title (the part's NAME — never `part_number`, that cell is the identifier a shop orders from), revision, material, finish, and author/date as known. Set geometric `scale` on `make_drawing`/`arrange_drawing`, not just printed scale text. Units are a document property (mm by default), so `units=` is refused.
+7. **Review / handoff** — `review_drawing` after edits. A requested non-release draft may be exported via `export_drawing` without a release audit; label it a draft. For release, `audit_drawing` against real manufacturing requirements, pairing `view_id` with `annotation_id`; an empty spec is refused. Release only with `verdict="release_ready"` and no `missing_critical`.
+8. **Native persistence** — save the standalone drawing with `export_part(fmt="draw+", doc_id=<drawing_id>, path="sheet.draw+")`; `save_part` takes the open source part/assembly, not a drawing id, and embeds its associated drawings in `.step+`.
 
 ## Rules
 

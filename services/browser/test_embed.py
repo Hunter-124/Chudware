@@ -213,7 +213,8 @@ def test_browser_fetch_profile_busy(tmp_profiles):
     assert lock.acquire(blocking=False)
     try:
         res = session.browser_fetch("https://x.test/p", site, _cef=object())
-        assert res["ok"] is False and res["reason"] == "profile_busy"
+        assert res["ok"] is False and res["reason"] == "policy_refused"
+        assert "embedded browser" in res["hint"]
     finally:
         lock.release()
 
@@ -226,7 +227,8 @@ def test_browser_download_profile_busy(tmp_profiles, tmp_path):
     try:
         res = session.browser_download("https://x.test/f.step", site, tmp_path / "f.step",
                                        _cef=object())
-        assert res["ok"] is False and res["reason"] == "profile_busy"
+        assert res["ok"] is False and res["reason"] == "policy_refused"
+        assert "embedded browser" in res["hint"]
     finally:
         lock.release()
 
@@ -407,6 +409,26 @@ def test_start_url_for_site_login_url_fallback_base_url():
     assert embed.start_url_for_site("grabcad") == "https://grabcad.com/login"
     assert embed.start_url_for_site("amazon") == "https://www.amazon.com/ap/signin"
     assert embed.start_url_for_site("no-such-site") is None
+
+def test_browser_start_url_returns_vendor_cookie_domains(monkeypatch, tmp_profiles):
+    from types import SimpleNamespace
+    from services.browser import adapters
+    from services.parts.embed_rpc import _browser_start_url
+
+    monkeypatch.setattr(embed, "start_url_for_site",
+                        lambda _site: "https://passport.jlcpcb.com/login")
+    monkeypatch.setattr(adapters, "get_adapter",
+                        lambda _site: SimpleNamespace(hosts=("www.jlcpcb.com", "jlcpcb.com",
+                                                            "shop.example.co.uk")))
+    result = _browser_start_url({"site": "jlcpcb"}, lambda *_: None)
+    assert result["ok"]
+    assert result["cookie_domains"] == ["jlcpcb.com", "shop.example.co.uk"]
+    assert "co.uk" not in result["cookie_domains"]
+
+    monkeypatch.setattr(embed, "start_url_for_site",
+                        lambda _site: "https://auth.other.example/login")
+    result = _browser_start_url({"site": "jlcpcb"}, lambda *_: None)
+    assert result["cookie_domains"][-1] == "auth.other.example"
 
 
 def test_classify_login_state_auth_url_never_logged_in():

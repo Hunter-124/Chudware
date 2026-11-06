@@ -96,7 +96,8 @@ def test_serialized_health_findings_in_ledger_are_retained():
     {"ok": True, "findings": [{"severity": "error", "message": "open profile"}]},
 ])
 def test_battery_pass_evidence_cannot_override_explicit_bad_sketch_quality(quality):
-    result = {"ok": True, "scores": {"check_sketch": 1.0}, "findings": [],
+    result = {"ok": True, "verdict": "pass", "coverage": {"ran": ["check_sketch"]},
+              "scores": {"check_sketch": 1.0}, "findings": [],
               "check_results": {"check_sketch": quality}}
     assert guardrails._battery_result_ok(result) is False
 
@@ -105,6 +106,77 @@ def test_advisory_dimension_findings_are_not_an_unjustified_new_hard_gate():
     call = _call("f7", findings=[{"kind": "no_driving_dimensions", "severity": "warning",
                                  "message": "Consider critical dimensions"}])
     assert _done([call]).ok is True
+
+
+@pytest.mark.parametrize("usage,accepted", [
+    ("open_path", True), ("unknown", True),
+    ("closed_profile", False), ("mixed", False), ("", False),
+])
+def test_open_endpoints_are_valid_only_for_open_or_unused_paths(usage, accepted):
+    closure = {"closed_chains_ok": False, "open_endpoints": ["e1.end"]}
+    if usage:
+        closure["usage"] = usage
+    assert _done([_call("f7", closure=closure)]).ok is accepted
+
+
+def test_sketch_pass_before_later_edit_is_stale_until_rechecked():
+    calls = [_call("f7", pinned_only=True), _call("f7"),
+             {"tool": "add_features", "ok": True, "args": {"doc_id": "d1"},
+              "result": {"ok": True}}]
+    verdict = _done(calls)
+    assert not verdict.ok and verdict.name == "sketch_quality"
+    assert "f7" in verdict.message and "recheck" in verdict.message
+    calls.append(_call("f7"))
+    assert _done(calls).ok
+
+
+def test_other_document_edit_does_not_stale_sketch_pass():
+    calls = [_call("f7"), {"tool": "add_features", "ok": True,
+                            "args": {"doc_id": "other"}, "result": {"ok": True}}]
+    assert _done(calls).ok
+
+
+@pytest.mark.parametrize("current_revision,stale,expected", [
+    (3, False, True),
+    (4, False, False),
+    (3, True, False),
+    (None, False, False),
+])
+def test_sketch_pass_must_match_current_document_revision(current_revision, stale, expected):
+    calls = [_call("f7", revision=3, revision_stale=stale)]
+    tree = {"revision": current_revision,
+            "features": [{"id": "f7", "type": "sketch"}]}
+    verdict = guardrails.check_sketch_quality_before_done(
+        {}, calls=calls, doc_id="d1", tree_provider=lambda doc: tree)
+    assert verdict.ok is expected
+    if not expected:
+        assert verdict.name == "sketch_quality" and "recheck" in verdict.message
+
+
+@pytest.mark.parametrize("changes", [
+    {"status": "under", "dof": 2, "fully_defined": False},
+    {"status": "over", "conflicting": ["c1"]},
+    {"converged": False},
+    {"skipped_constraints": ["c2"]},
+])
+def test_3d_sketch_solver_failures_block_done_until_rechecked(changes):
+    calls = [_call("f7", tool="check_sketch3d", **changes)]
+    verdict = _done(calls)
+    assert not verdict.ok and verdict.name == "sketch_quality"
+    assert "f7" in verdict.message
+    calls.append(_call("f7", tool="check_sketch3d"))
+    assert _done(calls).ok
+
+
+def test_clean_3d_sketch_check_becomes_stale_after_edit():
+    calls = [_call("f7", tool="check_sketch3d"),
+             {"tool": "add_features", "ok": True, "args": {"doc_id": "d1"},
+              "result": {"ok": True}}]
+    verdict = _done(calls)
+    assert not verdict.ok and "recheck" in verdict.message
+    calls.append(_call("f7", tool="check_sketch3d"))
+    assert _done(calls).ok
+
 
 
 def test_individual_fix_with_driving_dimensions_remains_advisory():

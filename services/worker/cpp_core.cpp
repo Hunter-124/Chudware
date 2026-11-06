@@ -74,8 +74,8 @@ std::string exe_dir() {
 bool CppCore::ensureLoaded(std::string& err) {
     std::lock_guard<std::mutex> lk(mtx_);
     if (tried_) {
-        if (!loaded_) err = "libchudware.dll not available (prior load failed)";
-        return loaded_;
+        if (!available()) err = "libchudware.dll not available (prior load failed)";
+        return available();
     }
     tried_ = true;
 
@@ -174,14 +174,15 @@ if (auto bid = reinterpret_cast<const char* (*)(void)>(dlsym(h, "chudware_build_
 // Optional streaming export (older engines predate it): resolved best-effort, no-op if absent.
 set_event_sink_ = reinterpret_cast<void (*)(void (*)(const char*, void*), void*)>(
     dlsym(h, "chudware_set_event_sink"));
-set_doc_publish_sink_ = reinterpret_cast<
-    void (*)(void (*)(const char*, const char*, const char*, void*), void*)>(
-    dlsym(h, "chudware_set_doc_publish_sink"));
+set_request_cancel_ = reinterpret_cast<void (*)(int (*)(void*), void*)>(
+    dlsym(h, "chudware_set_request_cancel"));
 set_cache_refresh_sink_ = reinterpret_cast<
     void (*)(void (*)(const char*, const char*, void*), void*)>(
     dlsym(h, "chudware_set_cache_refresh_sink"));
 activity_ = reinterpret_cast<int (*)(std::uint64_t*)>(dlsym(h, "chudware_activity"));
-loaded_ = true;
+drain_background_tasks_ = reinterpret_cast<int (*)(void)>(
+    dlsym(h, "chudware_drain_background_tasks"));
+loaded_.store(true, std::memory_order_release);
 // One-shot startup diagnostic: which lib actually serves in-proc agent runs.
 std::fprintf(stderr,
              "[cpp_core] loaded libchudware abi=%s build_id=%s path=%s\n",
@@ -299,15 +300,16 @@ return true;
     // Optional streaming export (older engines predate it): resolved best-effort.
     set_event_sink_ = reinterpret_cast<void (*)(void (*)(const char*, void*), void*)>(
         GetProcAddress(h, "chudware_set_event_sink"));
-    set_doc_publish_sink_ = reinterpret_cast<
-        void (*)(void (*)(const char*, const char*, const char*, void*), void*)>(
-        GetProcAddress(h, "chudware_set_doc_publish_sink"));
+    set_request_cancel_ = reinterpret_cast<void (*)(int (*)(void*), void*)>(
+        GetProcAddress(h, "chudware_set_request_cancel"));
     set_cache_refresh_sink_ = reinterpret_cast<
         void (*)(void (*)(const char*, const char*, void*), void*)>(
         GetProcAddress(h, "chudware_set_cache_refresh_sink"));
     activity_ = reinterpret_cast<int (*)(std::uint64_t*)>(
         GetProcAddress(h, "chudware_activity"));
-    loaded_ = true;
+    drain_background_tasks_ = reinterpret_cast<int (*)(void)>(
+        GetProcAddress(h, "chudware_drain_background_tasks"));
+    loaded_.store(true, std::memory_order_release);
     return true;
 #endif
 }
@@ -346,22 +348,14 @@ void CppCore::setEventSink(void (*cb)(const char* event_json, void* ud), void* u
     if (set_event_sink_) set_event_sink_(cb, ud);
 }
 
+void CppCore::setRequestCancel(int (*check)(void*), void* user) {
+    std::string e;
+    if (ensureLoaded(e) && set_request_cancel_) set_request_cancel_(check, user);
+}
+
 bool CppCore::hasEventSink() {
     std::string e;
     return ensureLoaded(e) && set_event_sink_ != nullptr;
-}
-
-void CppCore::setDocPublishSink(
-    void (*cb)(const char* method, const char* params_json, const char* result_json, void* ud),
-    void* ud) {
-    std::string e;
-    if (!ensureLoaded(e)) return;
-    if (set_doc_publish_sink_) set_doc_publish_sink_(cb, ud);
-}
-
-bool CppCore::hasDocPublishSink() {
-    std::string e;
-    return ensureLoaded(e) && set_doc_publish_sink_ != nullptr;
 }
 
 bool CppCore::setCacheRefreshSink(
@@ -376,7 +370,12 @@ bool CppCore::activity(std::uint64_t counts[3]) {
     counts[0] = counts[1] = counts[2] = 0;
     // Census must neither initiate engine loading nor manufacture a zero for an
     // older engine. hostd publishes engineState only after ensureLoaded returns.
-    return loaded_ && activity_ && activity_(counts) == 0;
+    return available() && activity_ && activity_(counts) == 0;
+}
+
+bool CppCore::drainBackgroundTasks() {
+    // Do not load an otherwise unused engine during shutdown.
+    return !available() || (drain_background_tasks_ && drain_background_tasks_() == 0);
 }
 
 

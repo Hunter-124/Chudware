@@ -58,11 +58,15 @@ CHUDWARE_API int chudware_call(const char* method, const char* params_json, char
 // Release a string previously returned by chudware_call's out_json.
 CHUDWARE_API void chudware_free(char* s);
 
-// Live event streaming (transparency). Register a THREAD-LOCAL callback the core invokes with
-// each agent-run event's JSON (null-terminated UTF-8) synchronously as it is emitted, so a host
-// can surface the run live instead of only the batched result["events"]. The string is owned by
-// the core and valid only for the duration of the call — copy it if you keep it. Pass cb=NULL to
-// clear. `ud` is passed back verbatim. Set on the SAME thread that will call chudware_call.
+// Optional thread-local request cancellation probe, set and cleared on the calling
+// thread. Cancellation is honored only until the first document lock is acquired.
+CHUDWARE_API void chudware_set_request_cancel(int (*check)(void*), void* user);
+
+// Live simulation progress streaming (transparency). Register a THREAD-LOCAL callback the core
+// invokes with each sim.progress event's JSON (null-terminated UTF-8) synchronously as it is
+// emitted, so a host can surface a solve live. The string is owned by the core and valid only
+// for the duration of the call — copy it if you keep it. Pass cb=NULL to clear. `ud` is passed
+// back verbatim. Set on the SAME thread that will call chudware_call.
 CHUDWARE_API void chudware_set_event_sink(void (*cb)(const char* event_json, void* ud), void* ud);
 
 // A monotonically-increasing ABI version string (e.g. "1"). Lets the host detect
@@ -75,15 +79,6 @@ CHUDWARE_API const char* chudware_abi_version(void);
 // Drives the version drain-replace staleness check (see docs/reference/HOSTD.md).
 CHUDWARE_API const char* chudware_build_id(void);
 
-
-// Live document publication for doc_new/doc_apply_ops calls made synchronously inside an opaque
-// agent RPC. Like chudware_set_event_sink, this callback is THREAD-LOCAL and valid only for the
-// surrounding chudware_call. JSON strings are borrowed for the callback duration. Pass cb=NULL
-// to clear. Optional for hosts: older hosts simply retain end-of-run document synchronization.
-CHUDWARE_API void chudware_set_doc_publish_sink(
-    void (*cb)(const char* method, const char* params_json, const char* result_json, void* ud),
-    void* ud);
-
 // Process-wide asynchronous cache verification publication, outside document locks.
 CHUDWARE_API void chudware_set_cache_refresh_sink(
     void (*cb)(const char* doc_id, const char* response_json, void* ud), void* ud);
@@ -92,6 +87,10 @@ CHUDWARE_API void chudware_set_cache_refresh_sink(
 // copies. Counts are lower bounds; nonzero return means incomplete (never idle).
 // counts[0..2] = cache verification, profiler, dirty documents.
 CHUDWARE_API int chudware_activity(uint64_t counts[3]);
+
+// Stop dispatching document work before calling; joins background document work
+// and descendants before C++ or OCCT static teardown. Returns nonzero on error.
+CHUDWARE_API int chudware_drain_background_tasks(void);
 
 #ifdef __cplusplus
 }  // extern "C"

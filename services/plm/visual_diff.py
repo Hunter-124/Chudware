@@ -222,11 +222,10 @@ def _drawing_strokes(get: Any) -> list:
 # documents, not guessed:
 #   * board outline  — ``outline.shapes[]`` of ``{type:"line", p1, p2}`` /
 #     ``{type:"arc", center, radius, a0, a1}`` (degrees) / ``{type:"circle",
-#     center, radius}``  (core/geom/ecad_3d.cpp:100-127 outline_segments)
+#     center, radius}``
 #   * tracks         — ``p1``, ``p2``, ``width``, ``layer``, ``kind``
 #                      (services/ecad/drc.py:285-294 _track_shape)
 #   * footprints     — ``pos``, ``angle``, ``side``, ``ref``, ``pads[]``
-#                      (core/geom/ecad_3d.cpp:479-517)
 #   * pads           — ``pos`` (footprint-local), ``size``, ``shape``, ``angle``
 #                      placed by services/ecad/schema.py:186 pad_world
 #   * vias           — ``at``, ``diameter``  (services/ecad/drc.py:297-302)
@@ -261,6 +260,140 @@ def _rect_pts(cx: float, cy: float, hx: float, hy: float, angle_deg: float) -> l
     return [[cx + x * ca - y * sa, cy + x * sa + y * ca] for x, y in corners]
 
 
+def _arc_through(p1, mid, p2) -> list:
+    """Tessellate a KiCad three-point arc, following the sweep through mid."""
+    x1, y1 = p1
+    xm, ym = mid
+    x2, y2 = p2
+    d = 2 * (x1 * (ym - y2) + xm * (y2 - y1) + x2 * (y1 - ym))
+    if abs(d) < 1e-12:
+        return [p1, mid, p2]
+    q1, qm, q2 = x1*x1 + y1*y1, xm*xm + ym*ym, x2*x2 + y2*y2
+    cx = (q1 * (ym - y2) + qm * (y2 - y1) + q2 * (y1 - ym)) / d
+    cy = (q1 * (x2 - xm) + qm * (x1 - x2) + q2 * (xm - x1)) / d
+    start = math.atan2(y1 - cy, x1 - cx)
+    middle = (math.atan2(ym - cy, xm - cx) - start) % (2 * math.pi)
+    sweep = (math.atan2(y2 - cy, x2 - cx) - start) % (2 * math.pi)
+    if middle > sweep:
+        sweep -= 2 * math.pi
+    return _arc_pts(cx, cy, math.hypot(x1 - cx, y1 - cy), start, start + sweep)
+
+
+def _graphic_points(shape: dict) -> list:
+    kind = str(shape.get("kind") or shape.get("type") or "")
+    points = _pts(shape.get("pts"))
+    p1 = _xy(shape.get("p1") or shape.get("kicad_start"))
+    mid = _xy(shape.get("mid") or shape.get("kicad_mid"))
+    p2 = _xy(shape.get("p2") or shape.get("kicad_end"))
+    if kind == "arc" and p1 and mid and p2:
+        return _arc_through(p1, mid, p2)
+    if kind in ("rect", "rectangle"):
+        if len(points) >= 2:
+            p1, p2 = points[:2]
+        if p1 and p2:
+            return [p1, (p2[0], p1[1]), p2, (p1[0], p2[1]), p1]
+    if kind in ("circle", "arc"):
+        center = _xy(shape.get("center")) or (points[0] if points else None)
+        radius = _num(shape.get("radius"))
+        if center and radius > 0:
+            if kind == "circle":
+                return _circle_pts(*center, radius, 48)
+            return _arc_pts(*center, radius, math.radians(_num(shape.get("a0"))),
+                            math.radians(_num(shape.get("a1"), 360.0)))
+    if len(points) >= 2:
+        return list(points)
+    return [p1, p2] if p1 and p2 else []
+
+
+def _schematic_strokes(doc: dict) -> list:
+    strokes: list = []
+    for section in ("wires", "buses"):
+        for entity in doc.get(section) or []:
+            if isinstance(entity, dict):
+                _add(strokes, section, _pts(entity.get("pts")))
+    for entry in doc.get("bus_entries") or []:
+        if isinstance(entry, dict):
+            pos, size = _xy(entry.get("pos")), _xy(entry.get("size"))
+            if pos and size:
+                _add(strokes, "bus_entry", _pts([pos, (pos[0] + size[0], pos[1] + size[1])]))
+
+    cache = doc.get("lib_cache") or {}
+    for section in ("symbols", "power"):
+        for symbol in doc.get(section) or []:
+            if not isinstance(symbol, dict):
+                continue
+            pos = _xy(symbol.get("pos"))
+            if not pos:
+                continue
+            angle = math.radians(_num(symbol.get("angle")))
+            ca, sa = math.cos(angle), math.sin(angle)
+            mirror = symbol.get("mirror")
+
+            def world(point):
+                x, y = point
+                if mirror == "x":
+                    x = -x
+                elif mirror == "y":
+                    y = -y
+                return (pos[0] + x * ca - y * sa, pos[1] + x * sa + y * ca)
+
+            definition = cache.get(symbol.get("libid"), {}) if isinstance(cache, dict) else {}
+            if not isinstance(definition, dict):
+                definition = {}
+            before = len(strokes)
+            for graphic in definition.get("graphics") or []:
+                if isinstance(graphic, dict):
+                    if (graphic.get("kind") or graphic.get("type")) == "text":
+                        text_pos = _xy(graphic.get("pos"))
+                        text = str(graphic.get("text") or "")
+                        if text_pos and text:
+                            _add(strokes, "text", _pts([world(text_pos)]), text)
+                        continue
+                    points = _graphic_points(graphic)
+                    if points:
+                        _add(strokes, "symbol", _pts([world(p) for p in points]))
+            for pin in definition.get("pins") or []:
+                if not isinstance(pin, dict) or pin.get("unit", 1) not in (0, symbol.get("unit", 1)):
+                    continue
+                start = _xy(pin.get("pos"))
+                if start:
+                    a = math.radians(_num(pin.get("angle")))
+                    length = _num(pin.get("length"), 2.54)
+                    end = (start[0] + length * math.cos(a), start[1] + length * math.sin(a))
+                    _add(strokes, "pin", _pts([world(start), world(end)]))
+            if len(strokes) == before:
+                # An unresolved library symbol is shown as a placement marker.
+                _add(strokes, "symbol", _pts(_rect_pts(*pos, 1.0, 1.0, _num(symbol.get("angle")))))
+            for offset, key in ((1.5, "ref"), (-1.5, "value")):
+                text = str(symbol.get(key) or "")
+                if text:
+                    _add(strokes, "text", _pts([(pos[0], pos[1] + offset)]), text)
+
+    for section in ("labels", "texts"):
+        for entity in doc.get(section) or []:
+            if isinstance(entity, dict):
+                pos, text = _xy(entity.get("pos")), str(entity.get("text") or "")
+                if pos and text:
+                    _add(strokes, "text", _pts([pos]), text)
+    for section in ("junctions", "no_connect"):
+        for entity in doc.get(section) or []:
+            if isinstance(entity, dict):
+                pos = _xy(entity.get("pos"))
+                if pos:
+                    _add(strokes, section, _pts(_circle_pts(*pos, 0.3, 12)))
+    for graphic in doc.get("graphics") or []:
+        if isinstance(graphic, dict):
+            _add(strokes, "graphic", _pts(_graphic_points(graphic)))
+    for sheet in doc.get("sheet_symbols") or []:
+        if isinstance(sheet, dict):
+            pos, size = _xy(sheet.get("pos")), _xy(sheet.get("size"))
+            if pos and size:
+                _add(strokes, "sheet", _pts([pos, (pos[0] + size[0], pos[1]),
+                                              (pos[0] + size[0], pos[1] - size[1]),
+                                              (pos[0], pos[1] - size[1]), pos]))
+    return strokes
+
+
 def _pad_world(fp: dict, pad: dict) -> tuple[float, float] | None:
     """Place a footprint-local pad position into board coordinates, reusing
     ``services.ecad.schema.pad_world`` when both placements are present."""
@@ -282,27 +415,14 @@ def _ecad_strokes(doc: Any) -> list:
     strokes: list = []
     if not isinstance(doc, dict):
         return strokes
+    if str(doc.get("schema", "")).split("/", 1)[0] == "aicad.sch":
+        return _schematic_strokes(doc)
 
     outline = doc.get("outline")
     for sh in (outline.get("shapes") if isinstance(outline, dict) else None) or []:
         if not isinstance(sh, dict):
             continue
-        stype = str(sh.get("type") or "line")
-        if stype == "line":
-            p1, p2 = _xy(sh.get("p1")), _xy(sh.get("p2"))
-            if p1 and p2:
-                _add(strokes, "outline", _pts([list(p1), list(p2)]))
-        elif stype in ("arc", "circle"):
-            c, r = _xy(sh.get("center")), _num(sh.get("radius"))
-            if not c or r <= 0:
-                continue
-            if stype == "circle":
-                _add(strokes, "outline", _pts(_circle_pts(c[0], c[1], r, 48)))
-            else:
-                a0 = math.radians(_num(sh.get("a0"), 0.0))
-                a1 = math.radians(_num(sh.get("a1"), 360.0))
-                _add(strokes, "outline",
-                     _pts([list(p) for p in _arc_pts(c[0], c[1], r, a0, a1)]))
+        _add(strokes, "outline", _pts(_graphic_points(sh)))
 
     for t in doc.get("tracks") or []:
         if not isinstance(t, dict):
@@ -314,6 +434,10 @@ def _ecad_strokes(doc: Any) -> list:
             if not (p1 and p2):
                 continue
             pts = _pts([list(p1), list(p2)])
+        if t.get("kind") == "arc":
+            mid = _xy(t.get("mid"))
+            if len(pts) >= 2 and mid:
+                pts = _pts(_arc_through(pts[0], mid, pts[-1]))
         _add(strokes, "track", pts, extra)
 
     for v in doc.get("vias") or []:
@@ -471,8 +595,8 @@ def drawing_diff_image(get_a: dict, get_b: dict, out_path: str,
 
 def ecad_diff_image(doc_a: dict, doc_b: dict, out_path: str,
                     size: tuple[int, int] = (900, 640)) -> dict | None:
-    """Board-layout diff (outline + tracks + vias + footprint placements + pads) of
-    two canonical ECAD documents, rendered into ONE image.
+    """Board-layout or schematic diff of two imported ECAD documents, rendered
+    into ONE image.
 
     Position is part of a stroke's identity, so a *moved* track, pad or footprint
     renders as red (where it was) + green (where it is) rather than as an opaque

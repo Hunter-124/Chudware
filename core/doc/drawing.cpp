@@ -16,6 +16,8 @@
 #include <BRepMesh_IncrementalMesh.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepTools.hxx>
+#include <BRepTools_WireExplorer.hxx>
+#include <BRep_Tool.hxx>
 #include <GCPnts_TangentialDeflection.hxx>
 #include <GProp_GProps.hxx>
 #include <GeomAbs_CurveType.hxx>
@@ -712,18 +714,135 @@ TopoDS_Shape section_cut(const TopoDS_Shape& raw, Vec3 normal, Vec3 point, const
     return cut.Shape();
 }
 
-// Cut-plane face outer-wire polygons projected to (screen_x, screen_y). Mirrors
-// _section_face_polygons.
+using SectionPoint = std::array<double, 2>;
+using SectionPolygon = std::vector<SectionPoint>;
+
+// Traverse the oriented edges in their wire order. Curve parameter order alone does not
+// follow a reversed edge, and TopExp_Explorer does not promise connected edge order.
+SectionPolygon section_wire_polygon(const TopoDS_Wire& wire, const TopoDS_Face& face,
+                                    Vec3 sx, Vec3 sy, double scale,
+                                    std::array<double, 2> position) {
+    SectionPolygon poly;
+    const double tolerance = 1e-6 * std::max(1.0, std::fabs(scale));
+    auto same = [&](const SectionPoint& a, const SectionPoint& b) {
+        return std::hypot(a[0] - b[0], a[1] - b[1]) <= tolerance;
+    };
+    std::size_t edge_count = 0;
+    for (BRepTools_WireExplorer exp(wire, face); exp.More(); exp.Next()) {
+        const TopoDS_Edge& edge = exp.Current();
+        if (BRep_Tool::Degenerated(edge)) continue;
+        ++edge_count;
+        BRepAdaptor_Curve ad(edge);
+        const bool reversed = edge.Orientation() == TopAbs_REVERSED;
+        auto append = [&](const gp_Pnt& q, bool first) {
+            Vec3 v = {q.X(), q.Y(), q.Z()};
+            SectionPoint p = {dot(v, sx) * scale + position[0],
+                              dot(v, sy) * scale + position[1]};
+            if (first && !poly.empty() && !same(poly.back(), p))
+                throw std::runtime_error("section wire edges are not connected");
+            if (poly.empty() || !same(poly.back(), p)) poly.push_back(p);
+        };
+        if (ad.GetType() == GeomAbs_Line) {
+            append(ad.Value(reversed ? ad.LastParameter() : ad.FirstParameter()), true);
+            append(ad.Value(reversed ? ad.FirstParameter() : ad.LastParameter()), false);
+        } else {
+            try {
+                const double s = std::max(std::fabs(scale), 1e-6);
+                GCPnts_TangentialDeflection disc(ad, 0.3, 0.05 / s);
+                if (disc.NbPoints() < 2)
+                    throw std::runtime_error("not enough curve samples");
+                for (int k = 1; k <= disc.NbPoints(); ++k)
+                    append(disc.Value(reversed ? disc.NbPoints() + 1 - k : k), k == 1);
+            } catch (...) {
+                throw std::runtime_error("section curved wire sampling failed");
+            }
+        }
+    }
+    std::size_t expected_edges = 0;
+    for (TopExp_Explorer exp(wire, TopAbs_EDGE); exp.More(); exp.Next())
+        if (!BRep_Tool::Degenerated(TopoDS::Edge(exp.Current()))) ++expected_edges;
+    if (edge_count != expected_edges)
+        throw std::runtime_error("section wire traversal omitted edges");
+    if (poly.size() < 4 || !same(poly.front(), poly.back()))
+        throw std::runtime_error("section wire is not a closed polygon");
+    poly.pop_back();  // cyclic vertices; closed explicitly after holes are joined
+    return poly;
+}
+
+double section_polygon_area(const SectionPolygon& poly) {
+    double twice_area = 0.0;
+    const SectionPoint origin = poly.front();
+    for (std::size_t i = 0; i < poly.size(); ++i) {
+        const auto& a = poly[i];
+        const auto& b = poly[(i + 1) % poly.size()];
+        twice_area += (a[0] - origin[0]) * (b[1] - origin[1]) -
+                      (b[0] - origin[0]) * (a[1] - origin[1]);
+    }
+    return twice_area;
+}
+
+// section_faces is a public list of polygons. Encode a face with holes as a single
+// closed polygon by traversing a zero-width bridge to each oppositely wound inner
+// wire and back. Both even-odd and nonzero winding leave the holes empty. A ray
+// from each hole's rightmost vertex connects to the nearest already joined contour;
+// visiting holes right-to-left prevents the ray crossing an unjoined hole.
+SectionPolygon section_polygon_with_holes(SectionPolygon outer,
+                                          std::vector<SectionPolygon> holes) {
+    auto rightmost = [](const SectionPolygon& ring) {
+        return std::max_element(ring.begin(), ring.end(), [](const auto& a, const auto& b) {
+            return a[0] < b[0] || (a[0] == b[0] && a[1] > b[1]);
+        });
+    };
+    std::sort(holes.begin(), holes.end(), [&](const auto& a, const auto& b) {
+        return (*rightmost(a))[0] > (*rightmost(b))[0];
+    });
+    const double outer_area = section_polygon_area(outer);
+    for (SectionPolygon& hole : holes) {
+        if ((section_polygon_area(hole) > 0.0) == (outer_area > 0.0))
+            std::reverse(hole.begin(), hole.end());
+        const std::size_t h = static_cast<std::size_t>(rightmost(hole) - hole.begin());
+        const SectionPoint hp = hole[h];
+        std::size_t edge = outer.size();
+        double nearest_x = 0.0;
+        for (std::size_t i = 0; i < outer.size(); ++i) {
+            const SectionPoint& a = outer[i];
+            const SectionPoint& b = outer[(i + 1) % outer.size()];
+            if (!((a[1] <= hp[1] && hp[1] < b[1]) ||
+                  (b[1] <= hp[1] && hp[1] < a[1])))
+                continue;
+            const double x = a[0] + (hp[1] - a[1]) * (b[0] - a[0]) / (b[1] - a[1]);
+            if (x > hp[0] && (edge == outer.size() || x < nearest_x)) {
+                edge = i;
+                nearest_x = x;
+            }
+        }
+        if (edge == outer.size())
+            throw std::runtime_error("section hole cannot be joined to its outer wire");
+        const SectionPoint bridge = {nearest_x, hp[1]};
+        SectionPolygon joined;
+        joined.reserve(outer.size() + hole.size() + 3);
+        joined.insert(joined.end(), outer.begin(), outer.begin() + edge + 1);
+        joined.push_back(bridge);
+        for (std::size_t k = 0; k <= hole.size(); ++k)
+            joined.push_back(hole[(h + k) % hole.size()]);
+        joined.push_back(bridge);
+        joined.insert(joined.end(), outer.begin() + edge + 1, outer.end());
+        outer = std::move(joined);
+    }
+    outer.push_back(outer.front());
+    return outer;
+}
+
+// Project each real cut-plane face, retaining all of its ordered boundary wires.
 void section_face_polygons(const TopoDS_Shape& cut_shape, Vec3 normal, Vec3 point,
                            Vec3 sx, Vec3 sy, double scale,
                            std::array<double, 2> position,
                            std::vector<std::vector<std::array<double, 2>>>& polys) {
     Vec3 n = normalize(normal);
-    double px = position[0], py = position[1];
     TopTools_IndexedMapOfShape fmap;
     TopExp::MapShapes(cut_shape, TopAbs_FACE, fmap);
     for (int i = 1; i <= fmap.Extent(); ++i) {
-        TopoDS_Face f = TopoDS::Face(fmap.FindKey(i));
+        TopoDS_Face f = TopoDS::Face(fmap.FindKey(i).Oriented(TopAbs_FORWARD));
         BRepAdaptor_Surface surf(f);
         if (surf.GetType() != GeomAbs_Plane) continue;
         GProp_GProps g;
@@ -735,36 +854,16 @@ void section_face_polygons(const TopoDS_Shape& cut_shape, Vec3 normal, Vec3 poin
         Vec3 cp = {cvec[0] - point[0], cvec[1] - point[1], cvec[2] - point[2]};
         if (std::fabs(dot(cp, n)) > 1e-6) continue;
         if (std::fabs(std::fabs(dot(fnv, n)) - 1.0) > 1e-6) continue;
-        TopoDS_Wire ow;
-        try {
-            ow = BRepTools::OuterWire(f);
-        } catch (...) {
-            continue;
+        const TopoDS_Wire outer = BRepTools::OuterWire(f);
+        if (outer.IsNull()) throw std::runtime_error("section face has no outer wire");
+        SectionPolygon poly = section_wire_polygon(outer, f, sx, sy, scale, position);
+        std::vector<SectionPolygon> holes;
+        for (TopExp_Explorer exp(f, TopAbs_WIRE); exp.More(); exp.Next()) {
+            const TopoDS_Wire wire = TopoDS::Wire(exp.Current());
+            if (!wire.IsSame(outer))
+                holes.push_back(section_wire_polygon(wire, f, sx, sy, scale, position));
         }
-        std::vector<std::array<double, 2>> poly;
-        for (TopExp_Explorer exp(ow, TopAbs_EDGE); exp.More(); exp.Next()) {
-            TopoDS_Edge e = TopoDS::Edge(exp.Current());
-            BRepAdaptor_Curve ad(e);
-            std::vector<gp_Pnt> pts3;
-            if (ad.GetType() == GeomAbs_Line) {
-                pts3.push_back(ad.Value(ad.FirstParameter()));
-                pts3.push_back(ad.Value(ad.LastParameter()));
-            } else {
-                try {
-                    double s = scale > 1e-6 ? scale : 1e-6;
-                    GCPnts_TangentialDeflection disc(ad, 0.05 / s, 0.3);
-                    for (int k = 1; k <= disc.NbPoints(); ++k) pts3.push_back(disc.Value(k));
-                } catch (...) {
-                    pts3.push_back(ad.Value(ad.FirstParameter()));
-                    pts3.push_back(ad.Value(ad.LastParameter()));
-                }
-            }
-            for (const gp_Pnt& q : pts3) {
-                Vec3 v = {q.X(), q.Y(), q.Z()};
-                poly.push_back({dot(v, sx) * scale + px, dot(v, sy) * scale + py});
-            }
-        }
-        if (poly.size() >= 3) polys.push_back(std::move(poly));
+        polys.push_back(section_polygon_with_holes(std::move(poly), std::move(holes)));
     }
 }
 

@@ -61,7 +61,7 @@ def _assert_ids(graded: dict, expect: dict[str, str], *, label: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# C12 undo / checkpoint recovery
+# C12 checkpoint restore recovery
 # ---------------------------------------------------------------------------
 
 def test_c12_seed1_all_acs_pass():
@@ -116,10 +116,10 @@ def test_c12_ac_graders_cover_recovery_tools_and_seq():
     ch = mod.CHALLENGE
     events = [
         {"seq": 1, "kind": "tool_call", "payload": {
-            "tool": "plm_checkpoint", "node": "n_build_DL1", "args": {"name": "pre"},
+            "tool": "plm_checkpoint", "node": "n_build_DL1", "args": {"message": "pre"},
             "hypothesis": "checkpoint before risk"}},
         {"seq": 2, "kind": "tool_call", "payload": {
-            "tool": "plm_restore", "node": "n_build_DL1", "args": {"rev": 1},
+            "tool": "plm_restore", "node": "n_build_DL1", "args": {"commit": "checkpoint_commit"},
             "hypothesis": "restore checkpoint"}},
         {"seq": 3, "kind": "decision", "payload": {
             "id": "recovery", "text": "restore from plm checkpoint after bad feature",
@@ -131,6 +131,16 @@ def test_c12_ac_graders_cover_recovery_tools_and_seq():
     ]
     graded = _grade(ch, {"events": events}, seed=1)
     _assert_all_pass(graded, label="C12 plm_restore path")
+
+
+def test_c12_checkpoint_alone_is_not_recovery():
+    mod = _load("c12_undo_recovery")
+    ledger = {"events": [
+        {"seq": 1, "kind": "tool_call", "payload": {"tool": "plm_checkpoint"}},
+        {"seq": 2, "kind": "tool_call", "payload": {"tool": "add_features"}},
+    ]}
+    assert mod._grade_recovery_tool(ledger, {})[0] == "FAIL"
+    assert mod._grade_post_recovery_progress(ledger, {})[0] == "FAIL"
 
 
 # ---------------------------------------------------------------------------

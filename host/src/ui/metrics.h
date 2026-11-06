@@ -156,6 +156,9 @@ inline float reProgressH()    { return px(8.0f); }    // stage progress bar thic
 // the default WindowPadding) and a grid card mixed an 8-px pad, a 6-px text margin and a centred
 // title, so nothing in the workspace shared a left edge.
 inline float partsPadX()      { return px(12.0f); }
+inline float partsRowPreview() { return px(52.0f); }
+inline float partsGridPreview() { return px(132.0f); }
+inline float partsDetailWidth() { return px(300.0f); }
 
 // ---- CAM / Manufacture workspace (ui/cam/) ----------------------------------------------------
 // The Manufacture tab was the last workspace still sizing itself from raw pixel literals, so its

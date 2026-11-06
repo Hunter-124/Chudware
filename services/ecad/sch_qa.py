@@ -217,9 +217,10 @@ def _pin_lead_points(sdef: dict, unit: int) -> set:
 
 def _graphic_points(g: dict) -> list:
     """Local points a symbol graphic spans (a circle contributes its bbox corners)."""
-    t = str(g.get("type") or "")
+    t = str(g.get("type") or g.get("kind") or "")
     if t == "circle":
-        c = g.get("center") or [0.0, 0.0]
+        points = g.get("pts") or []
+        c = g.get("center") or (points[0] if points else [0.0, 0.0])
         r = abs(float(g.get("radius", 0.0) or 0.0))
         cx, cy = float(c[0]), float(c[1])
         return [(cx - r, cy - r), (cx + r, cy + r)]
@@ -246,12 +247,12 @@ def body_local_rect(sdef: dict, unit: int = 1) -> Optional[tuple[float, float, f
     leads = _pin_lead_points(sdef, unit)
     pts: list = []
     for g in sdef.get("graphics", []) or []:
-        if not isinstance(g, dict):
+        if not isinstance(g, dict) or g.get("unit", 0) not in (0, unit):
             continue
         gpts = _graphic_points(g)
         if not gpts:
             continue
-        if str(g.get("type") or "") == "line" and len(gpts) == 2:
+        if str(g.get("type") or g.get("kind") or "") == "line" and len(gpts) == 2:
             if any((round(x, 4), round(y, 4)) in leads for x, y in gpts):
                 continue  # a pin lead stub, not the body
         pts.extend(gpts)

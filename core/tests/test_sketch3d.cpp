@@ -8,6 +8,7 @@
 
 #include <cmath>
 #include <string>
+#include <utility>
 #include <vector>
 
 using chudware::sketch3d::drag3;
@@ -431,18 +432,18 @@ TEST_CASE("3D coradial aligns both the center and radius") {
 TEST_CASE("3D on_plane uses the engine datum convention and constrains whole curves") {
     json entities, c;
     SUBCASE("front is XZ") {
-        entities = {point("e1", 1, 2, 3)};
+        entities = json::array({point("e1", 1, 2, 3)});
         c = plane_rel("on_plane", {"e1"}, "front");
     }
     SUBCASE("top is XY") {
-        entities = {line("e1", 1, 2, 3, 4, 5, 6)};
+        entities = json::array({line("e1", 1, 2, 3, 4, 5, 6)});
         c = plane_rel("on_plane", {"e1"}, "top");
     }
     SUBCASE("right is YZ") {
-        entities = {arc3("e1", {1, 0, 0}, {2, 5, 5}, {1, 10, 0})};
+        entities = json::array({arc3("e1", {1, 0, 0}, {2, 5, 5}, {1, 10, 0})});
         c = plane_rel("on_plane", {"e1"}, "right");
     }
-    json sk{{"entities", entities}, {"constraints", {c}}};
+    json sk{{"entities", std::move(entities)}, {"constraints", json::array({c})}};
     auto sol = solve_sketch3d(sk, json::object());
     REQUIRE(sol.converged);
     CHECK(sol.skipped.empty());
@@ -536,4 +537,31 @@ TEST_CASE("3D unsupported relations and bad planes report skipped ids and reason
     CHECK(sol.skipped[2].first == "c3");
     for (const auto& skipped : sol.skipped) CHECK_FALSE(skipped.second.empty());
     CHECK(sol.dof == 9);
+}
+
+TEST_CASE("nonconvergence_reason names the conflicting constraints, their values and partners") {
+    json sk;
+    sk["entities"] = json::array({point("e1", 0, 0, 0), point("e2", 10, 0, 0)});
+    sk["constraints"] = json::array({rel("c1", "fix", {"e1"}), rel("c2", "fix", {"e2"}),
+                                     dim("c3", "distance", {"e1.p", "e2.p"}, 50.0)});
+    auto sol = solve_sketch3d(sk, json::object());
+    REQUIRE(!sol.converged);
+    const std::string msg = chudware::sketch3d::nonconvergence_reason(sk, sol);
+    MESSAGE(msg);
+    CHECK(msg.find("sketch3d did not converge") != std::string::npos);
+    CHECK(msg.find("Conflicting constraints: c3 (distance 50) conflicts with") != std::string::npos);
+    CHECK(msg.find("c1 (fix)") != std::string::npos);
+    CHECK(msg.find("c2 (fix)") != std::string::npos);
+}
+
+TEST_CASE("nonconvergence_reason lists skipped constraints alongside the conflict") {
+    json sk;
+    sk["entities"] = json::array({point("e1", 0, 0, 0), point("e2", 10, 0, 0)});
+    sk["constraints"] = json::array({rel("c1", "fix", {"e1"}), rel("c2", "fix", {"e2"}),
+                                     dim("c3", "distance", {"e1.p", "e2.p"}, 50.0),
+                                     rel("c4", "midpoint", {"e9.p", "e2"})});
+    auto sol = solve_sketch3d(sk, json::object());
+    REQUIRE(!sol.converged);
+    const std::string msg = chudware::sketch3d::nonconvergence_reason(sk, sol);
+    CHECK(msg.find("Skipped (unusable, not solved): c4 (") != std::string::npos);
 }

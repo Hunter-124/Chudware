@@ -125,3 +125,18 @@ between the geometric nearest unconnected pads of each net).
   tht pad has drill.
 - Net binding to schematic is advisory in the doc but enforced by the **board compile** (which
   re-derives expected nets from the linked netlist and flags mismatches as warnings, never rejects).
+
+## KiCad round trip — contract revision v2
+
+The in-memory schema identifier remains `aicad.pcb/1`; KiCad project files, not this
+JSON representation, are the persisted authority. Imported objects retain `uuid` and
+`kicad_extra` (unmodelled child S-expression nodes as parsed JSON), including raw
+footprint library bodies. The root `kicad` object retains `version`, `generator`,
+`generator_version`, `uuid` and `extra` (unmodelled top-level nodes). Copies drop their
+UUID; newly created objects receive RFC-4122 v4 UUIDs on write, stored back in the
+session for stable subsequent saves. The KiCad 10 writer converts +y-up document
+coordinates to KiCad +y-down and resolves absent footprint bodies from installed libraries,
+then native definitions. Unedited KiCad content must round-trip losslessly.
+The writer emits KiCad board version `20260206`, generator `chudware` and
+generator version `10.0`. KiCad CLI load and import/write/import fidelity are
+the acceptance oracles; repeated writes are byte-stable.

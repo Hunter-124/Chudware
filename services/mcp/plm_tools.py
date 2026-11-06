@@ -25,7 +25,6 @@ if §7 is read strictly.
 from __future__ import annotations
 
 import json
-import os
 from functools import wraps
 from pathlib import Path
 from typing import Any
@@ -33,7 +32,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from ._envelopes import compact_err as _err, sorted_ok as _ok
-from .cad_common import require_mapping
+from .cad_common import require_mapping, resolve_agent_path
 
 # A live general-lane replay ended with bare plm_checkpoint(), after earlier bare
 # plm_open() and file-as-path plm_item_add() calls. ``path`` means the project root
@@ -41,24 +40,12 @@ from .cad_common import require_mapping
 # instead of making each model guess it.
 
 def _resolve_project_path(path: str = "") -> tuple[str | None, str | None]:
-    """Resolve an omitted vault path from the active agent project context."""
-    if str(path).strip():
-        return str(path), None
-    from services.agent.project_context import resolve_project_root
-
-    for key in ("CHUDWARE_PROJECT_DIR", "CHUDWARE_FS_ROOT"):
-        start = os.environ.get(key, "").strip()
-        if not start:
-            continue
-        root = resolve_project_root(start)
-        if root.is_dir():
-            return str(root), None
-    return None, _err(
-        "project_root_unavailable",
-        "path was omitted and no project root could be resolved; pass "
-        "path='<project-root>' or set CHUDWARE_PROJECT_DIR/CHUDWARE_FS_ROOT so "
-        "services.agent.project_context.resolve_project_root() can resolve it",
-    )
+    """Resolve vault paths against the exact request-scoped workspace."""
+    try:
+        return resolve_agent_path(path or ".", "path"), None
+    except ValueError as exc:
+        return None, _err(
+            "invalid_project" if path else "project_root_unavailable", str(exc))
 
 
 def _with_project_path(fn: Any) -> Any:
@@ -216,12 +203,11 @@ def register_plm_tools(mcp: FastMCP) -> None:
     @_with_project_path
     def plm_item_add(path: str = "", file_path: str = "", folder_path: str = "",
                      doc_type: str = "", part_number: str = "") -> str:
-        """Track a non-design file or folder as a versioned item — a
+        """Track a file or folder as a versioned item — for example a
         specification, report, datasheet, spreadsheet, image, simulation folder
-        or source tree. Design documents (.step+/.ecad+) are tracked
-        automatically when saved; this is for everything else. ``doc_type`` is
-        auto-detected when omitted and can be changed later. Returns
-        ``{ok, item}``."""
+        or source tree. Native .step+ and KiCad design files are tracked
+        automatically when saved. ``doc_type`` is auto-detected when omitted and can be
+        changed later. Returns ``{ok, item}``."""
         try:
             Vault, VaultError = _vault_module()
         except ImportError:
@@ -436,7 +422,8 @@ def register_plm_tools(mcp: FastMCP) -> None:
           TOP on one shared camera so the frames register), plus
           ``match_pct`` / ``added_volume_mm3`` / ``removed_volume_mm3``.
         * drawings and ECAD boards/schematics: ``diff_2d``, a vector overlay of
-          both sheets/layouts with per-stroke ``counts``. ECAD needs no engine.
+          both sheets/layouts with per-stroke ``counts``. KiCad snapshots are
+          imported by the native engine before rendering.
         * ``diff_pixel``: registered pixel diff of the two plain renders — the
           universal fallback.
         * ``image_a`` / ``image_b`` / ``side_by_side``: the two plain renders.

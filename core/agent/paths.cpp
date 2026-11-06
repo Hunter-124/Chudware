@@ -100,8 +100,6 @@ fs::path appdata_root() {
 #endif
 }
 
-fs::path paths_root() { return appdata_root(); }
-fs::path paths_cache() { return appdata_root() / "cache"; }
 fs::path paths_config() { return appdata_root() / "config.json"; }
 
 }  // namespace agent

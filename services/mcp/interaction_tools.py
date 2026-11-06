@@ -95,50 +95,20 @@ def register_interaction_tools(mcp: FastMCP) -> None:
                        run_id: Optional[str] = None, doc_id: Optional[str] = None,
                        revision: Optional[int] = None, blocking: bool = True,
                        **extra: Annotated[Any, Field(default=None)]) -> str:
-        """Ask the human a typed batch of <=4 questions and return machine-readable answers.
+        """Ask up to four typed questions and return answers keyed by question id.
 
-        THE ONE interaction seam (contracts/interaction.md). Accepts whatever shape you
-        actually have: `questions="Which material?"` (a plain string is ONE text
-        question), `questions=["Q1?", "Q2?"]` (a list of strings), a single question
-        dict, or the full batch `questions=[{...}, ...]`. A dict's `prompt` may also
-        arrive as `question`/`text`/`ask`/`label`/`message`/`content` — any of those is
-        auto-mapped to `prompt`, and a missing `id` is auto-numbered (`q1`, `q2`, ...).
-        `questions` may also be passed as `question=`/`prompt=`.
+        questions accepts a string, question dict, or list of either. A question
+        needs a nonempty prompt; ids default to q1, q2, etc. kind defaults to text
+        or is inferred from the payload. Kinds and suggested value types:
+        text: string; choice: option value (or list with multi=true); dimension:
+        {"value": number, "unit": string}; approval: bool; file_request:
+        {"paths": [...]}; geometry_select: null or selection from targets.
+        Choice uses options; geometry_select uses targets. required defaults false.
+        Supply a meaningful typed suggested value when possible, and ask only
+        decisions that affect the work.
 
-        Per question, REQUIRED: `prompt` (str, non-empty) — this is the only field that
-        cannot be defaulted; a batch where every item ends up with no prompt text is
-        rejected. OPTIONAL, each with an honest default when omitted:
-          id          "q1", "q2", ... in call order
-          kind        "text" (see kind vocabulary below; inferred from the payload
-                      shape when there's a strong signal — e.g. `options` present -> choice)
-          suggested   kind-typed default answer (text="", approval=False,
-                      file_request={"paths": []}, geometry_select=null/{}, choice=first
-                      option, dimension={"value": 0.0, "unit": "mm"} and forces required)
-          required    false
-
-        `kind` is one of:
-          text            free-form string.                    suggested: str
-          choice          pick from `options` (`multi=true` for multi-select).
-                                                                 suggested: value (or [values])
-          dimension       a number with a unit.                 suggested: {"value": float, "unit": str}
-          approval        yes/no gate.                          suggested: bool
-          file_request    ask for file path(s).                 suggested: {"paths": [...]}
-          geometry_select pick face/edge/vertex/feature/body/component/point via
-                          `targets=[...]`; suggested may be null/{} — never invent an sid.
-
-        Prefer NOT asking when a sensible default exists — set `required:false` + a real
-        typed `suggested` and only surface decisions that change the build. Design
-        decisions use kind=choice with `options`. Geometry the model cannot see uses
-        kind=geometry_select with `targets=[...]`.
-
-        Worked example (copy this shape):
-          ask_user(questions=[{"id": "material", "kind": "choice",
-                               "prompt": "What material?", "suggested": "PLA",
-                               "options": ["PLA", "PETG", "aluminium 6061"]}])
-
-        On an MCP client the questions surface as elicitations. Answers persist to the
-        run/doc record and replay on resume — a resumed agent never re-asks. Returns
-        `{id: {value, canonical?, source, at}}`.
+        Questions appear as MCP elicitations. Answers persist to the run/doc
+        record and replay on resume. Returns {id: {value, canonical?, source, at}}.
         """
         from services.agent import interaction as core
         try:

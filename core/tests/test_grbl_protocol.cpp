@@ -52,6 +52,14 @@ TEST_CASE("finite double parsing is exact and independent of the process locale"
   CHECK_FALSE(parseFiniteDouble("12.5junk", value));
   CHECK_FALSE(parseFiniteDouble("+12.5", value));
   CHECK_FALSE(parseFiniteDouble("12,5", value));
+
+  const std::string_view fields = "12.5e2,9";
+  REQUIRE(parseFiniteDouble(fields.substr(0, 4), value));
+  CHECK(value == doctest::Approx(12.5));
+  std::size_t consumed = 0;
+  REQUIRE(parseFiniteDoublePrefix(fields, value, consumed));
+  CHECK(value == doctest::Approx(1250.0));
+  CHECK(consumed == 6);
 }
 
 std::vector<std::string> readLines(std::string_view relative_path) {

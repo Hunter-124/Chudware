@@ -65,6 +65,11 @@ def reveng_tmp(tmp_path, monkeypatch):
     d = tmp_path / "reveng"
     d.mkdir()
     monkeypatch.setenv("CHUDWARE_REVENG_DIR", str(d))
+    import services.mcp.reveng_build_tools as rb
+    monkeypatch.setattr(rb, "_find_reference_models", lambda query, **kwargs: {
+        "ok": True, "query": query, "candidates": [], "standard_part": None,
+        "coverage": {"sites_searched": 0, "raw_hits": 0},
+    })
     return d
 
 

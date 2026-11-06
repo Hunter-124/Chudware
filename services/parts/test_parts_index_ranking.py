@@ -249,3 +249,32 @@ class TestAliasesAreSearchable:
     def test_din_alias_finds_the_iso_standard(self):
         ids = [r["part_id"] for r in self.index.search("DIN 912 M3", limit=3)]
         assert ids[0] == "shcs-m3", ids
+
+
+def test_reference_identifier_is_searchable_without_becoming_an_alias():
+    index = PartsIndex()
+    reference = _rec("library:example:plate", "library", "Inspection plate")
+    reference["references"] = [
+        {"identifier": "EXAMPLE-REF-4827", "edition": "C", "kind": "identifier"}
+    ]
+    unrelated = _rec("library:example:block", "library", "Inspection block")
+    index.rebuild([reference, unrelated])
+    found = index.search("EXAMPLE-REF-4827", limit=2)
+    assert found[0]["part_id"] == reference["part_id"]
+    assert index.get(reference["part_id"]) == reference
+    assert "aliases" not in reference
+
+
+def test_alternate_dash_designation_beats_numeric_matches_before_limit():
+    index = PartsIndex()
+    neighbor = _rec("seal:011", "seal", "AS568-011 O-Ring", designation="AS568-011",
+                    incidental="2-014")
+    neighbor["aliases"] = ["o-ring seal 2-011 -011"]
+    exact = _rec("seal:014", "seal", "AS568-014 O-Ring", designation="AS568-014")
+    exact["aliases"] = ["o-ring seal 2-014 -014"]
+    substring = _rec("seal:1014", "seal", "Other O-Ring", designation="12-014",
+                     incidental="2-014")
+    substring["aliases"] = ["o-ring seal 12-014"]
+    index.rebuild([neighbor, substring, exact])
+    assert index.search("o-ring 2-014", limit=1)[0]["part_id"] == "seal:014"
+    assert "2-014" not in exact["title"]

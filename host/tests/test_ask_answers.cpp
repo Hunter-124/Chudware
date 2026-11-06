@@ -7,7 +7,8 @@
 //   - the RAW answer per kind matches the `answer` control action contract
 //   - required questions without an answer (or a malformed dimension) block Submit
 //   - agent.answer folds into the batch; a user resolution is never downgraded to cancelled
-//   - the session-file round trip keeps questions + answers; an open batch restores Expired
+//   - the session-file round trip keeps questions + answers; an open batch restores pending
+//     with the user's draft, and its answers can be handed on as a chat message
 
 #include "ui/copilot/ask_answers.h"
 
@@ -176,11 +177,34 @@ static void testAnswerEventsAndPersistence() {
     CHECK(back.questions[2].family == "length");
     CHECK(back.answers["finish"] == "anodized");
 
-    // A batch still open when saved restores Expired with a reason.
+    // Open when the app closed: it asks again, holding the user's edits rather than the
+    // suggested defaults. A submit whose outcome never arrived is pending again.
     AskBatch open = askBatchFromEvent(questionEvent());
+    open.status = AskStatus::Submitting;
+    open.error = "Couldn't deliver your answers (daemon refused). Try again.";
+    open.questions[0].choice = -1;                  // cleared the suggested finish
+    open.questions[1].checked = {0, 1};             // chamfers only, no Other
+    open.questions[1].otherOn = false;
+    askBufSet(open.questions[2].textBuf, "12,5");   // mid-edit: not a number yet
+    open.questions[2].unit = "mm";
+    open.questions[3].approval = 0;
     const AskBatch reopened = askBatchFromJson(askBatchToJson(open));
-    CHECK(reopened.status == AskStatus::Expired);
-    CHECK(!reopened.error.empty());
+    CHECK(reopened.status == AskStatus::Pending);
+    CHECK(reopened.error.empty());
+    CHECK(reopened.questions[0].choice == -1);
+    CHECK(askAnswerValue(reopened.questions[1]) == json::parse(R"(["chamfers"])"));
+    CHECK(askBufStr(reopened.questions[2].textBuf) == "12,5");
+    CHECK(reopened.questions[2].unit == "mm");
+    CHECK(reopened.questions[3].approval == 0);
+    CHECK(askDraft(reopened) == askDraft(open));
+
+    // With no run left to answer, the answers become the conversation's next message.
+    AskBatch handed = reopened;
+    handed.answers = json::parse(R"({"finish": "anodized", "ok": false})");
+    const std::string msg = askAnswersMessage(handed);
+    CHECK(msg.find("- Which finish?: Anodized") != std::string::npos);
+    CHECK(msg.find("- Bore?: (use your suggested default)") != std::string::npos);
+    CHECK(msg.find("- Proceed?: Declined") != std::string::npos);
 }
 
 int main() {

@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 
 namespace render {
 
@@ -106,6 +107,18 @@ unsigned int linkProgram(const char* vs, const char* fs) {
 
 }  // namespace
 
+Overlays::Overlays() {
+    ensureCommonProgram();
+    glGenVertexArrays(1, &vao_);
+    glGenBuffers(1, &vbo_);
+    glBindVertexArray(vao_);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo_);
+    glBufferData(GL_ARRAY_BUFFER, 3 * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glBindVertexArray(0);
+}
+
 Overlays::~Overlays() {
     destroy();
     if (prog_) glDeleteProgram(prog_);
@@ -114,29 +127,25 @@ Overlays::~Overlays() {
     if (vbo_) glDeleteBuffers(1, &vbo_);
     if (segVao_) glDeleteVertexArrays(1, &segVao_);
     if (segVbo_) glDeleteBuffers(1, &segVbo_);
-    if (triVao_) glDeleteVertexArrays(1, &triVao_);
-    if (triVbo_) glDeleteBuffers(1, &triVbo_);
     if (camMarkerVao_) glDeleteVertexArrays(1, &camMarkerVao_);
     if (camMarkerVbo_) glDeleteBuffers(1, &camMarkerVbo_);
 }
 
 void Overlays::destroy() {
     clearSimulationBuffers();
-    for (auto& kv : faces_) {
-        if (kv.second.vao) glDeleteVertexArrays(1, &kv.second.vao);
-        // kv.second.vbo is shared (owned by bodyVbos_) — do NOT delete it here.
-        if (kv.second.ebo) glDeleteBuffers(1, &kv.second.ebo);
+    clearGeometryBuffers();
+    for (auto& body : bodies_) {
+        if (body.vao) glDeleteVertexArrays(1, &body.vao);
+        if (body.vbo) glDeleteBuffers(1, &body.vbo);
+        if (body.ebo) glDeleteBuffers(1, &body.ebo);
     }
+    bodies_.clear();
+    bodyIndices_.clear();
     faces_.clear();
-    for (unsigned int vbo : bodyVbos_)
-        if (vbo) glDeleteBuffers(1, &vbo);
-    bodyVbos_.clear();
-    for (auto& kv : edges_) {
-        if (kv.second.vao) glDeleteVertexArrays(1, &kv.second.vao);
-        if (kv.second.vbo) glDeleteBuffers(1, &kv.second.vbo);
-    }
     edges_.clear();
     verts_.clear();
+    faceBatchCounts_.clear();
+    faceBatchOffsets_.clear();
 }
 
 void Overlays::setColors(const float hover[4], const float selection[4], const float feature[4]) {
@@ -173,75 +182,110 @@ void Overlays::ensureCommonProgram() {
         uClipN_     = glGetUniformLocation(prog_, "uClipN");
         uClipOff_   = glGetUniformLocation(prog_, "uClipOff");
     }
+    if (!litProg_) {
+        litProg_ = linkProgram(kLitVert, kLitFrag);
+        uLitMVP_ = glGetUniformLocation(litProg_, "uMVP");
+        uLitColor_ = glGetUniformLocation(litProg_, "uColor");
+        uLitHasColor_ = glGetUniformLocation(litProg_, "uHasColor");
+        uLitViewDir_ = glGetUniformLocation(litProg_, "uViewDir");
+        uLitClipCount_ = glGetUniformLocation(litProg_, "uClipCount");
+        uLitClipN_ = glGetUniformLocation(litProg_, "uClipN");
+        uLitClipOff_ = glGetUniformLocation(litProg_, "uClipOff");
+    }
 }
 
 bool Overlays::setDoc(const DocMesh& doc, std::string& err) {
-    ensureCommonProgram();
     int linked = 0;
     glGetProgramiv(prog_, GL_LINK_STATUS, &linked);
     if (!linked) { err = "overlays program link failed"; return false; }
+    glGetProgramiv(litProg_, GL_LINK_STATUS, &linked);
+    if (!linked) { err = "overlays lit program link failed"; return false; }
 
-    if (!vao_) {
-        glGenVertexArrays(1, &vao_);
-        glGenBuffers(1, &vbo_);
+    destroy();
+    size_t faceCount = 0, edgeCount = 0, vertCount = 0;
+    for (const auto& b : doc.bodies) {
+        faceCount += b.faces.size();
+        edgeCount += b.edges.size();
+        vertCount += b.brep_verts.size();
     }
-
-    destroy();  // drop per-body buffers only (prog_ and the scratch vao_/vbo_ are kept)
+    bodies_.reserve(doc.bodies.size());
+    bodyIndices_.reserve(doc.bodies.size());
+    faces_.reserve(faceCount);
+    edges_.reserve(edgeCount);
+    verts_.reserve(vertCount);
+    faceBatchCounts_.reserve(faceCount);
+    faceBatchOffsets_.reserve(faceCount);
 
     for (const auto& b : doc.bodies) {
         if (b.pos.empty()) continue;
-        // One shared position VBO per body — every face range of this body references it via its
-        // own VAO+EBO, instead of re-uploading the whole vertex array once per face.
-        unsigned int posVbo = 0;
-        glGenBuffers(1, &posVbo);
-        glBindBuffer(GL_ARRAY_BUFFER, posVbo);
-        glBufferData(GL_ARRAY_BUFFER, b.pos.size() * sizeof(float), b.pos.data(), GL_STATIC_DRAW);
-        bodyVbos_.push_back(posVbo);
+        const size_t bodyIndex = bodies_.size();
+        bodies_.emplace_back();
+        BodyBuf& body = bodies_.back();
+        bodyIndices_[b.body_id] = bodyIndex;
+        body.faceCounts.reserve(b.faces.size());
+        body.faceOffsets.reserve(b.faces.size());
+
+        // Parsed documents already carry the flattened edge lines from the loader thread.
+        // Keep the same flattening for CPU-created documents without derived data.
+        std::vector<float> fallbackLines;
+        if (!doc.derivedReady) {
+            size_t lineFloats = 0;
+            for (const auto& es : b.edges)
+                if (es.pt_count >= 2) lineFloats += (size_t)(es.pt_count - 1) * 6;
+            fallbackLines.reserve(lineFloats);
+            for (const auto& es : b.edges) {
+                for (uint32_t i = 0; i + 1 < es.pt_count; ++i) {
+                    const float* a = &b.edge_pts[(size_t)(es.first_pt + i) * 3];
+                    const float* c = a + 3;
+                    fallbackLines.insert(fallbackLines.end(), {a[0], a[1], a[2],
+                                                               c[0], c[1], c[2]});
+                }
+            }
+        }
+        const auto& lines = doc.derivedReady ? b.edgeLines : fallbackLines;
+        glGenVertexArrays(1, &body.vao);
+        glGenBuffers(1, &body.vbo);
+        glGenBuffers(1, &body.ebo);
+        glBindVertexArray(body.vao);
+        glBindBuffer(GL_ARRAY_BUFFER, body.vbo);
+        glBufferData(GL_ARRAY_BUFFER, (b.pos.size() + lines.size()) * sizeof(float),
+                     nullptr, GL_STATIC_DRAW);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, b.pos.size() * sizeof(float), b.pos.data());
+        if (!lines.empty())
+            glBufferSubData(GL_ARRAY_BUFFER, b.pos.size() * sizeof(float),
+                            lines.size() * sizeof(float), lines.data());
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, body.ebo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, b.idx.size() * sizeof(uint32_t), b.idx.data(),
+                     GL_STATIC_DRAW);
+        glBindVertexArray(0);
+
         for (const auto& fr : b.faces) {
             if (fr.tri_count == 0) continue;
-            FaceBuf fb;
-            fb.vbo = posVbo;  // shared (non-owning)
-            glGenVertexArrays(1, &fb.vao);
-            glGenBuffers(1, &fb.ebo);
-            glBindVertexArray(fb.vao);
-            glBindBuffer(GL_ARRAY_BUFFER, fb.vbo);
-            glEnableVertexAttribArray(0);
-            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
-            const uint32_t* base = b.idx.data() + (size_t)fr.first_tri * 3;
-            int count = (int)fr.tri_count * 3;
-            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, fb.ebo);
-            glBufferData(GL_ELEMENT_ARRAY_BUFFER, (size_t)count * sizeof(uint32_t), base,
-                         GL_STATIC_DRAW);
-            glBindVertexArray(0);
-            fb.idxCount = count;
-            faces_[key(b.body_id, fr.face_id)] = fb;
+            const size_t firstIndex = (size_t)fr.first_tri * 3;
+            const int count = (int)fr.tri_count * 3;
+            faces_[key(b.body_id, fr.face_id)] = FaceBuf{bodyIndex, firstIndex, count};
+            const uintptr_t offset = (uintptr_t)firstIndex * sizeof(uint32_t);
+            if (!body.faceCounts.empty() &&
+                body.faceCounts.back() <= std::numeric_limits<int>::max() - count &&
+                (uintptr_t)body.faceOffsets.back() +
+                    (size_t)body.faceCounts.back() * sizeof(uint32_t) == offset) {
+                body.faceCounts.back() += count;
+            } else {
+                body.faceCounts.push_back(count);
+                body.faceOffsets.push_back(reinterpret_cast<const void*>(offset));
+            }
         }
+        int firstVertex = (int)(b.pos.size() / 3);
         for (const auto& es : b.edges) {
             if (es.pt_count < 2) continue;
-            std::vector<float> lines;
-            lines.reserve((size_t)(es.pt_count - 1) * 6);
-            for (uint32_t i = 0; i + 1 < es.pt_count; ++i) {
-                const float* a = &b.edge_pts[(size_t)(es.first_pt + i) * 3];
-                const float* c = &b.edge_pts[(size_t)(es.first_pt + i + 1) * 3];
-                lines.insert(lines.end(), {a[0], a[1], a[2], c[0], c[1], c[2]});
-            }
-            EdgeBuf eb;
-            glGenVertexArrays(1, &eb.vao);
-            glGenBuffers(1, &eb.vbo);
-            glBindVertexArray(eb.vao);
-            glBindBuffer(GL_ARRAY_BUFFER, eb.vbo);
-            glBufferData(GL_ARRAY_BUFFER, lines.size() * sizeof(float), lines.data(),
-                         GL_STATIC_DRAW);
-            glEnableVertexAttribArray(0);
-            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
-            glBindVertexArray(0);
-            eb.vertCount = (int)lines.size() / 3;
-            edges_[key(b.body_id, es.edge_id)] = eb;
+            const int count = (int)(es.pt_count - 1) * 2;
+            edges_[key(b.body_id, es.edge_id)] = EdgeBuf{bodyIndex, firstVertex, count};
+            firstVertex += count;
         }
-        for (const auto& v : b.brep_verts) {
-            verts_[key(b.body_id, v.vertex_id)] =
-                std::array<float, 3>{v.xyz[0], v.xyz[1], v.xyz[2]};
-        }
+        for (const auto& v : b.brep_verts)
+            verts_[key(b.body_id, v.vertex_id)] = {v.xyz[0], v.xyz[1], v.xyz[2]};
     }
     return true;
 }
@@ -259,6 +303,43 @@ bool Overlays::findVert(uint32_t body, uint32_t vert_id, float out[3]) const {
     if (it == verts_.end()) return false;
     out[0] = it->second[0]; out[1] = it->second[1]; out[2] = it->second[2];
     return true;
+}
+
+void Overlays::appendFaceRange(const FaceBuf& face) {
+    const uintptr_t offset = (uintptr_t)face.firstIndex * sizeof(uint32_t);
+    if (!faceBatchCounts_.empty() &&
+        faceBatchCounts_.back() <= std::numeric_limits<int>::max() - face.idxCount &&
+        (uintptr_t)faceBatchOffsets_.back() +
+            (size_t)faceBatchCounts_.back() * sizeof(uint32_t) == offset) {
+        faceBatchCounts_.back() += face.idxCount;
+        return;
+    }
+    if (faceBatchCounts_.size() >= faces_.size()) flushFaceRanges(face.body);
+    faceBatchCounts_.push_back(face.idxCount);
+    faceBatchOffsets_.push_back(reinterpret_cast<const void*>(offset));
+}
+
+void Overlays::drawFaceRanges(const BodyBuf& body, const std::vector<int>& counts,
+                              const std::vector<const void*>& offsets) {
+    if (counts.empty()) return;
+    glBindVertexArray(body.vao);
+#if defined(__EMSCRIPTEN__) || defined(CHUDWARE_GLES3)
+    for (size_t i = 0; i < counts.size(); ++i)
+        glDrawElements(GL_TRIANGLES, counts[i], GL_UNSIGNED_INT, offsets[i]);
+#else
+    if (counts.size() == 1)
+        glDrawElements(GL_TRIANGLES, counts[0], GL_UNSIGNED_INT, offsets[0]);
+    else
+        glMultiDrawElements(GL_TRIANGLES, counts.data(), GL_UNSIGNED_INT, offsets.data(),
+                            (int)counts.size());
+#endif
+}
+
+void Overlays::flushFaceRanges(size_t body) {
+    if (faceBatchCounts_.empty()) return;
+    drawFaceRanges(bodies_[body], faceBatchCounts_, faceBatchOffsets_);
+    faceBatchCounts_.clear();
+    faceBatchOffsets_.clear();
 }
 
 // Bind the flat-color program + the per-frame camera / section-clip uniforms shared by every
@@ -283,10 +364,11 @@ void Overlays::drawHit(const Renderer::CameraXform& cam, const PickHit& h, const
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glEnable(GL_POLYGON_OFFSET_FILL);
-        glPolygonOffset(-1.0f, -1.0f);
+        glPolygonOffset(0.0f, -1.0f);
         glUniform4fv(uColor_, 1, rgba);
-        glBindVertexArray(fb->vao);
-        glDrawElements(GL_TRIANGLES, fb->idxCount, GL_UNSIGNED_INT, 0);
+        glBindVertexArray(bodies_[fb->body].vao);
+        glDrawElements(GL_TRIANGLES, fb->idxCount, GL_UNSIGNED_INT,
+                       reinterpret_cast<const void*>((uintptr_t)fb->firstIndex * sizeof(uint32_t)));
         glDisable(GL_POLYGON_OFFSET_FILL);
         glDisable(GL_BLEND);
     } else if (h.kind == PickKind::Edge) {
@@ -294,23 +376,18 @@ void Overlays::drawHit(const Renderer::CameraXform& cam, const PickHit& h, const
         if (!eb) return;
         float opaque[4] = {rgba[0], rgba[1], rgba[2], 1.0f};
         glUniform4fv(uColor_, 1, opaque);
-        glDepthRange(0.0, 0.999);  // bias over the shaded surface
         glLineWidth(3.5f * widthScale_);
-        glBindVertexArray(eb->vao);
-        glDrawArrays(GL_LINES, 0, eb->vertCount);
-        glDepthRange(0.0, 1.0);
+        glBindVertexArray(bodies_[eb->body].vao);
+        glDrawArrays(GL_LINES, eb->firstVertex, eb->vertCount);
     } else if (h.kind == PickKind::Vertex) {
         float xyz[3];
         if (!findVert(h.body_id, h.topo_id, xyz)) return;
         glBindVertexArray(vao_);
         glBindBuffer(GL_ARRAY_BUFFER, vbo_);
-        glBufferData(GL_ARRAY_BUFFER, 3 * sizeof(float), xyz, GL_DYNAMIC_DRAW);
-        glEnableVertexAttribArray(0);
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, 3 * sizeof(float), xyz);
 #ifndef CHUDWARE_GLES3
         glEnable(GL_PROGRAM_POINT_SIZE);
 #endif
-        glDepthRange(0.0, 0.997);
         // Contrast rim first (a larger dark point behind), then the highlight dot on top — the
         // bare 9px point downsampled to ~3px used to be the weakest highlight kind.
         float rim[4] = {0.06f, 0.07f, 0.09f, 1.0f};
@@ -325,7 +402,6 @@ void Overlays::drawHit(const Renderer::CameraXform& cam, const PickHit& h, const
         glPointSize(9.0f * widthScale_);
 #endif
         glDrawArrays(GL_POINTS, 0, 1);
-        glDepthRange(0.0, 1.0);
     }
 }
 
@@ -347,12 +423,17 @@ void Overlays::drawFaceWash(const Renderer::CameraXform& cam,
     glEnable(GL_POLYGON_OFFSET_FILL);
     glPolygonOffset(-1.0f, -1.0f);
     glUniform4fv(uColor_, 1, rgba);
+    size_t body = 0;
     for (uint64_t k : faceKeys) {
         const FaceBuf* fb = findFace((uint32_t)(k >> 32), (uint32_t)(k & 0xFFFFFFFFu));
         if (!fb) continue;  // stale key after rebuild — skip silently
-        glBindVertexArray(fb->vao);
-        glDrawElements(GL_TRIANGLES, fb->idxCount, GL_UNSIGNED_INT, 0);
+        // Keep caller order: only consecutive ranges of the same body are batched, so coplanar
+        // translucent washes retain the same blending and depth ordering as individual draws.
+        if (!faceBatchCounts_.empty() && body != fb->body) flushFaceRanges(body);
+        body = fb->body;
+        appendFaceRange(*fb);
     }
+    flushFaceRanges(body);
     glDisable(GL_POLYGON_OFFSET_FILL);
     glDisable(GL_BLEND);
     glBindVertexArray(0);
@@ -361,7 +442,9 @@ void Overlays::drawFaceWash(const Renderer::CameraXform& cam,
 // Wash every face of one body with an explicit RGBA (interference-view body tint). Same GL state
 // as drawFaceWash but keyed on the body high-word so callers needn't enumerate face ids.
 void Overlays::drawBodyWash(const Renderer::CameraXform& cam, uint32_t bodyId, const float rgba[4]) {
-    if (faces_.empty() || !prog_) return;
+    auto it = bodyIndices_.find(bodyId);
+    if (it == bodyIndices_.end() || !prog_) return;
+    const BodyBuf& body = bodies_[it->second];
     bindCommon(cam);
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
@@ -370,11 +453,7 @@ void Overlays::drawBodyWash(const Renderer::CameraXform& cam, uint32_t bodyId, c
     glEnable(GL_POLYGON_OFFSET_FILL);
     glPolygonOffset(-1.0f, -1.0f);
     glUniform4fv(uColor_, 1, rgba);
-    for (const auto& kv : faces_) {
-        if ((uint32_t)(kv.first >> 32) != bodyId) continue;
-        glBindVertexArray(kv.second.vao);
-        glDrawElements(GL_TRIANGLES, kv.second.idxCount, GL_UNSIGNED_INT, 0);
-    }
+    drawFaceRanges(body, body.faceCounts, body.faceOffsets);
     glDisable(GL_POLYGON_OFFSET_FILL);
     glDisable(GL_BLEND);
     glBindVertexArray(0);
@@ -402,6 +481,96 @@ void Overlays::drawSegments(const Renderer::CameraXform& cam, const std::vector<
     glBindVertexArray(0);
 }
 
+bool Overlays::updateSourceStamp(SourceStamp& stamp, const std::vector<float>& values) {
+    uint64_t sample = 1469598103934665603ull ^ (uint64_t)values.size();
+    const size_t samples = std::min<size_t>(16, values.size());
+    for (size_t i = 0; i < samples; ++i) {
+        const size_t index = samples == 1 ? 0 : i * (values.size() - 1) / (samples - 1);
+        uint32_t bits = 0;
+        std::memcpy(&bits, &values[index], sizeof(bits));
+        sample = (sample ^ bits) * 1099511628211ull;
+    }
+    // Temporary preview vectors can reuse an address and size while changing an unsampled float.
+    // A vectorized byte comparison keeps that case exact without the old serial full-payload hash.
+    const bool unchanged = stamp.size == values.size() && stamp.sample == sample &&
+                           stamp.snapshot.size() == values.size() &&
+                           (values.empty() || std::memcmp(stamp.snapshot.data(), values.data(),
+                                                         values.size() * sizeof(float)) == 0);
+    stamp.data = values.data();
+    stamp.size = values.size();
+    stamp.sample = sample;
+    if (!unchanged) stamp.snapshot = values;
+    return unchanged;
+}
+
+Overlays::GeometryBuf& Overlays::prepareGeometryBuffer(const std::vector<float>& xyz,
+                                                       unsigned int primitive) {
+    GeometryBuf* slot = nullptr;
+    for (auto& buf : geometryBufs_) {
+        if (buf.source == &xyz && buf.primitive == primitive) {
+            slot = &buf;
+            break;
+        }
+    }
+    if (!slot) {
+        slot = &*std::min_element(geometryBufs_.begin(), geometryBufs_.end(),
+                                 [](const GeometryBuf& a, const GeometryBuf& b) {
+                                     return a.lastUse < b.lastUse;
+                                 });
+    }
+    const uint64_t generation = camFrameActive_ ? camGeneration_ : 0;
+    bool changed = slot->source != &xyz || slot->primitive != primitive ||
+                   slot->generation != generation;
+    if (camFrameActive_) {
+        changed = changed || slot->content.data != xyz.data() || slot->content.size != xyz.size();
+        slot->content.data = xyz.data();
+        slot->content.size = xyz.size();
+        slot->content.snapshot = {};
+    } else {
+        const bool unchanged = updateSourceStamp(slot->content, xyz);
+        changed = changed || !unchanged;
+    }
+    if (!slot->vao) glGenVertexArrays(1, &slot->vao);
+    if (!slot->vbo) glGenBuffers(1, &slot->vbo);
+    if (changed) {
+        glBindVertexArray(slot->vao);
+        glBindBuffer(GL_ARRAY_BUFFER, slot->vbo);
+        glBufferData(GL_ARRAY_BUFFER, xyz.size() * sizeof(float), xyz.data(), GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+        glBindVertexArray(0);
+        slot->source = &xyz;
+        slot->primitive = primitive;
+        slot->generation = generation;
+    }
+    if (++geometryUse_ == 0) {
+        geometryUse_ = 1;
+        for (auto& buf : geometryBufs_) buf.lastUse = 0;
+    }
+    slot->lastUse = geometryUse_;
+    return *slot;
+}
+
+void Overlays::clearGeometryBuffers() {
+    for (auto& buf : geometryBufs_) {
+        if (buf.vao) glDeleteVertexArrays(1, &buf.vao);
+        if (buf.vbo) glDeleteBuffers(1, &buf.vbo);
+        buf = GeometryBuf{};
+    }
+    geometryUse_ = 0;
+    camGeneration_ = 0;
+    camFrameActive_ = false;
+}
+
+void Overlays::beginCamFrame(uint64_t generation) {
+    camGeneration_ = generation;
+    camFrameActive_ = generation != 0;
+}
+
+void Overlays::endCamFrame() {
+    camFrameActive_ = false;
+}
+
 void Overlays::beginSimulationFrame(uint64_t generation, uint64_t documentScope) {
     // Simulation scenes are valid before setDoc has ever been called (empty new part).
     ensureCommonProgram();
@@ -424,27 +593,12 @@ Overlays::SimulationBuf* Overlays::prepareSimulationBuffer(
     uint64_t sourceRevision) {
     if (!simulationFrameActive_ || xyz.empty() || !prog_) return nullptr;
 
-    // On-demand setup previews are regenerated into temporary vectors, so pointer identity is not
-    // meaningful. Fingerprint their float payload; cached SimManager sources pass their generation
-    // and avoid this scan (important for large streamline/slice batches).
-    if (sourceRevision == 0) {
-        sourceRevision = 1469598103934665603ull;
-        for (float value : xyz) {
-            uint32_t bits = 0;
-            std::memcpy(&bits, &value, sizeof(bits));
-            sourceRevision ^= bits;
-            sourceRevision *= 1099511628211ull;
-        }
-        sourceRevision ^= (uint64_t)xyz.size();
-        sourceRevision *= 1099511628211ull;
-        if (sourceRevision == 0) sourceRevision = 1;
-    }
-
     SimulationBuf& buf = simulationBufs_[batchKey];
+    const bool contentChanged = sourceRevision == 0 && !updateSourceStamp(buf.positions, xyz);
     const int vertCount = (int)(xyz.size() / 3);
     const bool needsUpload = !buf.vao || !buf.vbo || buf.lit || buf.primitive != primitive ||
                              buf.vertCount != vertCount ||
-                             buf.sourceRevision != sourceRevision;
+                             buf.sourceRevision != sourceRevision || contentChanged;
     if (!buf.vao) glGenVertexArrays(1, &buf.vao);
     if (!buf.vbo) glGenBuffers(1, &buf.vbo);
     if (needsUpload) {
@@ -512,41 +666,19 @@ void Overlays::drawSimulationLitTriangles(
     uint64_t sourceRevision) {
     if (!simulationFrameActive_ || xyz.size() < 9 || xyz.size() % 9 != 0 ||
         nrm.size() != xyz.size() || (rgb && rgb->size() != xyz.size())) return;
-    if (!litProg_) {
-        litProg_ = linkProgram(kLitVert, kLitFrag);
-        uLitMVP_ = glGetUniformLocation(litProg_, "uMVP");
-        uLitColor_ = glGetUniformLocation(litProg_, "uColor");
-        uLitHasColor_ = glGetUniformLocation(litProg_, "uHasColor");
-        uLitViewDir_ = glGetUniformLocation(litProg_, "uViewDir");
-        uLitClipCount_ = glGetUniformLocation(litProg_, "uClipCount");
-        uLitClipN_ = glGetUniformLocation(litProg_, "uClipN");
-        uLitClipOff_ = glGetUniformLocation(litProg_, "uClipOff");
-    }
-    // Scene producers supply revisions. Keep the zero-revision convention safe for other
-    // callers by including every vertex attribute in the fallback fingerprint.
-    if (sourceRevision == 0) {
-        sourceRevision = 1469598103934665603ull;
-        auto fingerprint = [&](const std::vector<float>& values) {
-            for (float value : values) {
-                uint32_t bits = 0;
-                std::memcpy(&bits, &value, sizeof(bits));
-                sourceRevision ^= bits;
-                sourceRevision *= 1099511628211ull;
-            }
-            sourceRevision ^= (uint64_t)values.size();
-            sourceRevision *= 1099511628211ull;
-        };
-        fingerprint(xyz);
-        fingerprint(nrm);
-        if (rgb) fingerprint(*rgb);
-        if (sourceRevision == 0) sourceRevision = 1;
-    }
     SimulationBuf& buf = simulationBufs_[batchKey];
+    bool contentChanged = false;
+    if (sourceRevision == 0) {
+        const bool positionsMatch = updateSourceStamp(buf.positions, xyz);
+        const bool normalsMatch = updateSourceStamp(buf.normals, nrm);
+        const bool colorsMatch = !rgb || updateSourceStamp(buf.colors, *rgb);
+        contentChanged = !positionsMatch || !normalsMatch || !colorsMatch;
+    }
     const int vertCount = (int)(xyz.size() / 3);
     const bool hasColor = rgb != nullptr;
     const bool needsUpload = !buf.vao || !buf.vbo || !buf.nrmVbo || !buf.lit ||
                              buf.vertCount != vertCount || buf.hasColor != hasColor ||
-                             buf.sourceRevision != sourceRevision;
+                             buf.sourceRevision != sourceRevision || contentChanged;
     if (!buf.vao) glGenVertexArrays(1, &buf.vao);
     if (!buf.vbo) glGenBuffers(1, &buf.vbo);
     if (!buf.nrmVbo) glGenBuffers(1, &buf.nrmVbo);
@@ -582,8 +714,7 @@ void Overlays::drawSimulationLitTriangles(
         glUniform3fv(uLitClipN_, clipCount_, clipNormals_[0]);
         glUniform1fv(uLitClipOff_, clipCount_, clipOffsets_);
     }
-    const bool culling = glIsEnabled(GL_CULL_FACE) == GL_TRUE;
-    glDisable(GL_CULL_FACE);
+    // Renderer::beginOverlay establishes two-sided drawing for all overlay batches.
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
     if (rgba[3] >= 1.0f) {
@@ -599,7 +730,6 @@ void Overlays::drawSimulationLitTriangles(
     glBindVertexArray(0);
     glDepthMask(GL_TRUE);
     glDisable(GL_BLEND);
-    if (culling) glEnable(GL_CULL_FACE);
 }
 
 void Overlays::endSimulationFrame() {
@@ -648,21 +778,14 @@ void Overlays::drawCamSegments(const Renderer::CameraXform& cam,
                              endTimes.begin());
     }
 
-    if (!segVao_) {
-        glGenVertexArrays(1, &segVao_);
-        glGenBuffers(1, &segVbo_);
-    }
+    GeometryBuf& buf = prepareGeometryBuffer(xyz, GL_LINES);
     bindCommon(cam);
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDepthMask(GL_FALSE);
-    glBindVertexArray(segVao_);
-    glBindBuffer(GL_ARRAY_BUFFER, segVbo_);
-    glBufferData(GL_ARRAY_BUFFER, segmentCount * 6 * sizeof(float), xyz.data(), GL_DYNAMIC_DRAW);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glBindVertexArray(buf.vao);
 
     const size_t pending = segmentCount - completed;
     const float pendingGlow[4] = {rgba[0], rgba[1], rgba[2], rgba[3] * 0.10f};
@@ -789,21 +912,16 @@ void Overlays::drawCamToolMarker(const Renderer::CameraXform& cam, const float p
 void Overlays::drawTriangles(const Renderer::CameraXform& cam, const std::vector<float>& xyz,
                              const float rgba[4], bool overSurface) {
     if (xyz.size() < 9 || !prog_) return;
-    if (!triVao_) { glGenVertexArrays(1, &triVao_); glGenBuffers(1, &triVbo_); }
+    GeometryBuf& buf = prepareGeometryBuffer(xyz, GL_TRIANGLES);
     bindCommon(cam);
     glUniform4fv(uColor_, 1, rgba);
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    // Glyph cones/quads are viewed from either side; face culling is never enabled anywhere in the
-    // host (GL default off, ImGui restores it), so no glDisable(GL_CULL_FACE) is needed here.
+    // Renderer::beginOverlay establishes two-sided drawing for glyph cones and quads.
     if (overSurface) glDepthRange(0.0, 0.999);
-    glBindVertexArray(triVao_);
-    glBindBuffer(GL_ARRAY_BUFFER, triVbo_);
-    glBufferData(GL_ARRAY_BUFFER, xyz.size() * sizeof(float), xyz.data(), GL_DYNAMIC_DRAW);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+    glBindVertexArray(buf.vao);
     glDrawArrays(GL_TRIANGLES, 0, (int)(xyz.size() / 3));
     if (overSurface) glDepthRange(0.0, 1.0);
     glDisable(GL_BLEND);
@@ -816,16 +934,42 @@ void Overlays::draw(const Renderer::CameraXform& cam, const PickHit& hover,
     bindCommon(cam);
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
+    // Selection washes are visual only: a translucent mate reference must not write depth
+    // and hide the hover highlight of a component that can be picked through it.
+    glDepthMask(GL_FALSE);
 
     // Selection first (persistent), hover on top (transient). A hover over an UNselected item shows
     // the lighter hover wash; a hover over an already-SELECTED item shows the darker selected+hover
     // wash so "what's selected" stays readable. Applies uniformly to faces, edges and vertices.
-    for (const auto& h : sel) drawHit(cam, h, selCol_);
+    for (size_t i = 0; i < sel.size();) {
+        if (sel[i].kind != PickKind::Face) {
+            drawHit(cam, sel[i++], selCol_);
+            continue;
+        }
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glEnable(GL_POLYGON_OFFSET_FILL);
+        glPolygonOffset(0.0f, -1.0f);
+        glUniform4fv(uColor_, 1, selCol_);
+        size_t body = 0;
+        do {
+            const PickHit& h = sel[i++];
+            if (const FaceBuf* face = findFace(h.body_id, h.topo_id)) {
+                if (!faceBatchCounts_.empty() && body != face->body) flushFaceRanges(body);
+                body = face->body;
+                appendFaceRange(*face);
+            }
+        } while (i < sel.size() && sel[i].kind == PickKind::Face);
+        flushFaceRanges(body);
+        glDisable(GL_POLYGON_OFFSET_FILL);
+        glDisable(GL_BLEND);
+    }
     if (hover.valid()) {
         bool hoverSelected = false;
         for (const auto& h : sel) { if (h == hover) { hoverSelected = true; break; } }
         drawHit(cam, hover, hoverSelected ? selHoverCol_ : hoverCol_);
     }
+    glDepthMask(GL_TRUE);
 
     glBindVertexArray(0);
 }
@@ -835,8 +979,6 @@ void Overlays::beginScreenClip(const Renderer::CameraXform& cam, float u0, float
     if (screenClipActive_ || cam.ssWidth <= 0 || cam.ssHeight <= 0) return;
     u0 = std::clamp(u0, 0.0f, 1.0f); u1 = std::clamp(u1, u0, 1.0f);
     v0 = std::clamp(v0, 0.0f, 1.0f); v1 = std::clamp(v1, v0, 1.0f);
-    screenClipPrevEnabled_ = glIsEnabled(GL_SCISSOR_TEST) == GL_TRUE;
-    glGetIntegerv(GL_SCISSOR_BOX, screenClipPrevBox_);
     // GL scissor origin is bottom-left; the image-space v runs down.
     const int x0 = (int)std::floor(u0 * (float)cam.ssWidth);
     const int x1 = (int)std::ceil(u1 * (float)cam.ssWidth);
@@ -849,9 +991,7 @@ void Overlays::beginScreenClip(const Renderer::CameraXform& cam, float u0, float
 
 void Overlays::endScreenClip() {
     if (!screenClipActive_) return;
-    glScissor(screenClipPrevBox_[0], screenClipPrevBox_[1], screenClipPrevBox_[2],
-              screenClipPrevBox_[3]);
-    if (!screenClipPrevEnabled_) glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_SCISSOR_TEST);
     screenClipActive_ = false;
 }
 

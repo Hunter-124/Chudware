@@ -25,10 +25,10 @@ def analyze_printability(mesh: PrintMesh, params: PrintParams, build_dir=(0, 0, 
     direction /= np.linalg.norm(direction)
     rows = []
     for name in names:
-        if params.process not in ("fdm", "sla", "sls"):
+        if params.process not in ("fdm", "sla", "sls", "mjf"):
             result = row(name, "not_applicable", f"DFAM check is not applicable to process {params.process}.")
-        elif params.process == "sls" and name in ("overhang", "support", "bridges"):
-            result = row(name, "not_applicable", "SLS powder supports the part; no overhang/bridge support check applies.")
+        elif params.process in ("sls", "mjf") and name in ("overhang", "support", "bridges", "bed_adhesion"):
+            result = row(name, "not_applicable", "Powder supports the part; FDM bed adhesion and support checks do not apply.")
         elif params.process == "sla" and name == "bridges":
             result = row(name, "not_applicable", "SLA does not use the FDM bridging assumption; ceilings need supports.")
         else:
@@ -39,6 +39,6 @@ def analyze_printability(mesh: PrintMesh, params: PrintParams, build_dir=(0, 0, 
               "warn" if "warn" in statuses else "pass")
     support_volume = support_data(ctx)["volume"] if params.process in ("fdm", "sla") else 0.
     return rounded({"build_dir": direction, "yaw_deg": float(yaw_deg), "rotation": geom.rotation,
-                    "status": status, "checks": rows, "estimate": estimate(ctx, support_volume),
+                    "status": status, "checks": rows, "estimate": estimate(ctx, support_volume) if params.process == "fdm" else None,
                     "frame": {"height_mm": float(geom.bounds[1, 2]),
                               "footprint_mm": geom.bounds[1, :2]-geom.bounds[0, :2]}})

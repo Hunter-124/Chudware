@@ -6,84 +6,13 @@ Grounded in mega-22 a2 primary:
               Singular matrix from V- shorted to rail; also need case/format
               robust net→vector resolution (v(3v3)/V(3V3)/aliases).
 
-  T23 / AC1 — measure_between issued geometrically valid query but score 0.0
-              (feature id 'f1' / free-text treated as side words). Scorer must
-              treat successful finite distance (incl. 0.0 coincident) as real.
+  T23 / AC1 — measure_between must retain finite distance readings, including
+              0.0 coincidence, without claiming an unqualified verification pass.
 """
 from __future__ import annotations
 
 import json
 import math
-from pathlib import Path
-
-import pytest
-
-
-_ROOT = Path(__file__).resolve().parents[2]
-_MEGA22_A2 = _ROOT / "reports/runs/mega-22/attempt-2-primary-graded-live7"
-_MEGA22_AC5 = _MEGA22_A2 / "criterion_AC5.json"
-_MEGA22_AC1 = _MEGA22_A2 / "criterion_AC1.json"
-_MEGA22_BATTERY = _MEGA22_A2 / "battery_result.json"
-# Root-level copies may be the primary after archive.
-_MEGA22_AC5_ROOT = _ROOT / "reports/runs/mega-22/criterion_AC5.json"
-_MEGA22_BATTERY_ROOT = _ROOT / "reports/runs/mega-22/battery_result.json"
-
-
-def _load_json(path: Path) -> dict:
-    if not path.is_file():
-        pytest.skip(f"fixture missing: {path}")
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _ac5_fixture() -> dict:
-    for p in (_MEGA22_AC5, _MEGA22_AC5_ROOT):
-        if p.is_file():
-            return _load_json(p)
-    pytest.skip("mega-22 AC5 fixture missing")
-
-
-def _battery_fixture() -> dict:
-    for p in (_MEGA22_BATTERY, _MEGA22_BATTERY_ROOT):
-        if p.is_file():
-            return _load_json(p)
-    pytest.skip("mega-22 battery fixture missing")
-
-
-# ---------------------------------------------------------------------------
-# Fixtures — mega-22 a2 fingerprints
-# ---------------------------------------------------------------------------
-
-
-def test_mega22_a2_ac5_fingerprint_null_v_driven():
-    """S23 fixture: device_count=2, V(3V3)=null, singular matrix."""
-    ac5 = _ac5_fixture()
-    assert ac5.get("result") == "FAIL"
-    ev = ac5.get("evidence") or {}
-    assert int(ev.get("device_count") or 0) == 2
-    op = ev.get("op") or {}
-    assert "V(3V3)" in op or "v(3v3)" in {k.lower() for k in op}
-    # Value is null / non-finite.
-    val = op.get("V(3V3)", op.get("v(3v3)"))
-    assert val is None or (
-        isinstance(val, float) and not math.isfinite(val)
-    )
-    log = " ".join(ev.get("sim_log") or []).lower()
-    assert "singular" in log or not ev.get("converged")
-
-
-def test_mega22_a2_ac1_fingerprint_soft_zero_measure_between():
-    """T23 fixture: measure_between score 0 from bad side 'f1'."""
-    ac1 = _load_json(_MEGA22_AC1) if _MEGA22_AC1.is_file() else None
-    bat = _battery_fixture()
-    scores = (bat.get("evidence") or {}).get("scores") or {}
-    if ac1:
-        scores = (ac1.get("evidence") or {}).get("scores") or scores
-    assert float(scores.get("measure_between", 1.0)) == 0.0
-    findings = (bat.get("evidence") or {}).get("findings") or []
-    if ac1:
-        findings = (ac1.get("evidence") or {}).get("findings") or findings
-    blob = json.dumps(findings).lower()
-    assert "f1" in blob or "bad" in blob and "side" in blob
 
 
 # ---------------------------------------------------------------------------
@@ -145,8 +74,8 @@ def test_ac5_grader_on_mega22_a2_null_payload():
     """Grader still honest-FAIL on a2 null (not NOT-CHECKED); band intact."""
     from services.agent.reviewer_exec import FAIL, evaluate_pass_rule
 
-    ac5 = _ac5_fixture()
-    payload = dict(ac5.get("evidence") or {})
+    payload = {"ok": True, "device_count": 2, "resolved_net": "3V3",
+               "nodes": ["3V3", "GND"], "op": {"V(3V3)": None}}
     v, d = evaluate_pass_rule("V(3V3) in [3.135, 3.465]", payload)
     assert v == FAIL, (v, d)
     assert "null" in d.lower() or "not finite" in d.lower() or "3v3" in d.lower()
@@ -183,14 +112,14 @@ def test_ensure_driven_wires_v_minus_to_gnd():
         },
         {
             "tool": "ecad_place_symbol", "ok": True,
-            "args": {"libid": "Simulation_SPICE:V_source", "ref": "V1",
-                     "value": "DC 3.3"},
+            "args": {"libid": "Simulation_SPICE:VDC", "ref": "V1",
+                     "value": "3.3"},
             "result": {
                 "ok": True, "ref": "V1",
-                "libid": "Simulation_SPICE:V_source",
+                "libid": "Simulation_SPICE:VDC",
                 "pins": [
-                    {"number": "+", "name": "+", "net": "3V3"},
-                    {"number": "-", "name": "-", "net": "3V3"},  # a2 short
+                    {"number": "2", "name": "", "net": "3V3"},  # a2 short
+                    {"number": "1", "name": "", "net": "3V3"},
                 ],
             },
         },
@@ -207,11 +136,11 @@ def test_ensure_driven_wires_v_minus_to_gnd():
         },
         {
             "tool": "ecad_wire", "ok": True,
-            "args": {"from_ref": "V1", "from_pin": "+",
+            "args": {"from_ref": "V1", "from_pin": "1",
                      "to_ref": "R1", "to_pin": "1", "net": "3V3"},
             "result": {
                 "ok": True, "net": "3V3",
-                "net_members": ["V1.+", "R1.1"],
+                "net_members": ["V1.1", "R1.1"],
             },
         },
         {
@@ -270,10 +199,9 @@ def test_ensure_driven_wires_v_minus_to_gnd():
         f"expected V-/load → GND wire on call_rec; dispatched={dispatched} "
         f"new_calls={[c for c in new_calls if c.get('forced')]}"
     )
-    # Prefer explicit V- pin on a GND net wire.
+    # The return must use physical pin 2, irrespective of pin-list order.
     assert any(
-        str(a.get("from_ref", "")).upper().startswith("V")
-        or str(a.get("to_ref", "")).upper().startswith("V")
+        a.get("from_ref") == "V1" and a.get("from_pin") == "2"
         for a in gnd_wires
     ), gnd_wires
     # Dispatch path must not TypeError on net= (stripped).
@@ -285,25 +213,96 @@ def test_ensure_driven_wires_v_minus_to_gnd():
     assert isinstance(new_calls, list)
 
 
-def test_has_sim_source_recognizes_simulation_spice_v():
-    from services.agent.agent_turn import _ecad_has_sim_source
+def test_has_sim_source_recognizes_kicad_voltage_symbols():
+    from services.agent.agent_turn import (
+        _ecad_find_ref, _ecad_has_sim_source, _ecad_place_is_passive,
+        _ecad_source_on_rail,
+    )
 
-    calls = [{
-        "tool": "ecad_place_symbol", "ok": True,
-        "args": {"libid": "Simulation_SPICE:V_source", "ref": "Vrail"},
-        "result": {"ok": True, "ref": "Vrail",
-                   "libid": "Simulation_SPICE:V_source"},
-    }]
-    assert _ecad_has_sim_source(calls) is True
+    for libid, value in (
+        ("Simulation_SPICE:VDC", "3.3"),
+        ("Simulation_SPICE:VSIN", "VSIN"),
+        ("Simulation_SPICE:VPULSE", "VPULSE"),
+    ):
+        call = {
+            "tool": "ecad_place_symbol", "ok": True,
+            "args": {"libid": libid, "ref": "X1", "value": value},
+            "result": {
+                "ok": True, "ref": "X1", "libid": libid,
+                "pins": [
+                    {"number": "2", "name": "", "net": "3V3"},
+                    {"number": "1", "name": "", "net": "N$1"},
+                ],
+            },
+        }
+        assert _ecad_has_sim_source([call]), libid
+        assert _ecad_place_is_passive(call), libid
+        assert _ecad_find_ref([call], "V") == "X1"
+        assert _ecad_source_on_rail([call], "N$1"), libid
+        assert not _ecad_source_on_rail([call], "3V3"), libid
+
+
+def test_source_on_rail_uses_positive_wire_terminal():
+    from services.agent.agent_turn import _ecad_source_on_rail
+
+    wire = {
+        "tool": "ecad_wire", "ok": True,
+        "args": {"from_ref": "R1", "from_pin": "1", "to_ref": "V1", "to_pin": "2"},
+        "result": {"net": "3V3"},
+    }
+    assert not _ecad_source_on_rail([wire], "3V3")
+    wire["args"]["to_pin"] = "1"
+    assert _ecad_source_on_rail([wire], "3V3")
+
+
+def test_driven_rail_grounds_pin_two_when_place_omits_pins():
+    from services.agent.agent_turn import _ecad_ensure_driven_rail
+
+    calls = [
+        {
+            "tool": "ecad_place_symbol", "ok": True,
+            "args": {"libid": "Simulation_SPICE:VDC", "ref": "V1"},
+            "result": {"ref": "V1", "libid": "Simulation_SPICE:VDC", "net": "3V3"},
+        },
+        {
+            "tool": "ecad_place_symbol", "ok": True,
+            "args": {"libid": "Device:R", "ref": "R1"},
+            "result": {"ref": "R1", "libid": "Device:R", "net": "3V3"},
+        },
+        {
+            "tool": "ecad_place_symbol", "ok": True,
+            "args": {"libid": "MCU:X", "ref": "U1"},
+            "result": {"ref": "U1", "pins": [{"number": "1", "name": "GND"}]},
+        },
+        {
+            "tool": "ecad_add_power", "ok": True,
+            "args": {"net": "GND"},
+            "result": {"net": "GND", "net_members": ["U1.1"]},
+        },
+    ]
+    new_calls, _, _, _ = _ecad_ensure_driven_rail(
+        calls=calls, allow={"ecad_wire"}, dispatch=lambda _tool, _args: {"ok": True},
+        ledger=None, actor="test", messages=[], tool_calls_made=0, budget=10,
+        reason="numbered_return", steps=0, max_steps=10,
+    )
+    wires = [
+        c["args"] for c in new_calls
+        if c.get("forced") and c.get("tool") == "ecad_wire"
+    ]
+    assert any(
+        a.get("from_ref") == "V1" and a.get("from_pin") == "2"
+        and a.get("net") == "GND"
+        for a in wires
+    ), wires
 
 
 # ---------------------------------------------------------------------------
-# T23 — measure_between real nonzero-scored measurement
+# T23 — measure_between informational measurement
 # ---------------------------------------------------------------------------
 
 
 def test_measure_between_score_finite_distance():
-    """Successful finite distance → score 1.0 (not silent zero)."""
+    """A finite reading has no pass criterion."""
     from services.verify.battery import _extract_score
 
     score, findings = _extract_score(
@@ -311,11 +310,11 @@ def test_measure_between_score_finite_distance():
         "scalar",
         json.dumps({"ok": True, "distance": 500.0, "summary": "distance 500 mm"}),
     )
-    assert score == 1.0, (score, findings)
+    assert score is None, (score, findings)
 
 
 def test_measure_between_score_zero_distance_is_honest_coincidence():
-    """0.0 distance with valid refs = coincidence finding, score 1.0."""
+    """0.0 distance with valid refs is an informational coincidence."""
     from services.verify.battery import _extract_score
 
     score, findings = _extract_score(
@@ -323,7 +322,7 @@ def test_measure_between_score_zero_distance_is_honest_coincidence():
         "scalar",
         json.dumps({"ok": True, "distance": 0.0, "summary": "distance 0 mm"}),
     )
-    assert score == 1.0, (score, findings)
+    assert score is None, (score, findings)
     blob = json.dumps(findings).lower()
     assert "coincident" in blob or "0.0" in blob
 

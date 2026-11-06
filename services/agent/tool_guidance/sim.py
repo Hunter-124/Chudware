@@ -35,6 +35,25 @@ def fea_timeout_s(legs: int = 1) -> int:
 _FEA_TIMEOUT_S = fea_timeout_s()
 
 ENTRIES: dict[str, dict[str, Any]] = {
+    "find_stress_risers": {
+        "prompt_note": (
+            "Inspect concave corners, small blends, ligaments and thin sections along the load "
+            "path. Read the measurement basis, assumptions and incompleteness; proposed changes "
+            "are not strength certification. Dry-run each suggested fix before applying it."
+        ),
+    },
+    "fea_probe": {
+        "prompt_note": (
+            "Probe the saved result field at a location or face. Keep fixture-ring exclusions "
+            "and mesh resolution in mind; a sharp re-entrant edge may be singular."
+        ),
+    },
+    "eval_curvature": {
+        "prompt_note": "Read-only sampled curvature field; use its reported units and bounds.",
+    },
+    "eval_geometry_analysis": {
+        "prompt_note": "Read-only geometry-health findings; paged results are not a full census until all pages are read.",
+    },
     "topology_capabilities": {
         "prompt_note": (
             "Read-only. Call FIRST to learn supported topology methods, physics, constraints, "

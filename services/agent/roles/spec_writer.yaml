@@ -2,7 +2,6 @@ schema: aicad.role/1
 id: spec_writer
 goal: Turn one deliverable into a complete engineering spec — envelope, interfaces, material, process, manufacturing callouts, functional dimensions with computed fits, and an executable verification plan.
 stage_scope: [spec]
-playbook_default: null
 tool_allowlist:
   # Core ledger + research (mechanical specs still need these).
   - tool: ledger_get

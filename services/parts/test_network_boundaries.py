@@ -35,6 +35,10 @@ def test_cell_credentials_and_session_import_refuse_before_shared_sinks(monkeypa
 
 def test_artifact_path_confined_before_native_import(monkeypatch, tmp_path):
     from services.mcp import core_bridge
+    from services.browser import cad_validate
+    validated = []
+    monkeypatch.setattr(cad_validate, "validate_cad",
+                        lambda path, **_kwargs: validated.append(path) or {"ok": True})
     imported = []
     monkeypatch.setattr(core_bridge, "call", lambda method, params: imported.append(params) or {"ok": True})
     with cell():
@@ -43,23 +47,32 @@ def test_artifact_path_confined_before_native_import(monkeypatch, tmp_path):
     assert denied["ok"] is False and "cell_refused" in denied["reason"]
     assert allowed["ok"] is True
     assert imported == [{"path": "/work/part.step", "as_solid": False}]
+    assert validated == ["/work/part.step"]
 
 
-def test_thumbnail_does_not_proxy_successful_nonimage_or_invalid_image(monkeypatch):
-    monkeypatch.setattr(safe_http, "get", lambda url, **_: safe_http.Response(200, {}, url, b"isolated-marker"))
-    assert gui_rpc._fetch_image_bytes("https://public.fixture/marker", "catalog:fixture::p") is None
-    monkeypatch.setattr(safe_http, "get", lambda url, **_: safe_http.Response(200, {}, url, b"\x89PNG\r\n\x1a\ninvalid"))
-    assert gui_rpc._fetch_image_bytes("https://public.fixture/marker", "catalog:fixture::p") is None
+def test_thumbnail_does_not_proxy_successful_nonimage_or_invalid_image(monkeypatch, tmp_path):
+    from services.parts import thumbs
+    monkeypatch.setattr(thumbs, "_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(thumbs, "_network_allowed", lambda: True)
+    monkeypatch.setattr(thumbs, "_record_for_part", lambda _: None)
+    for number, body in enumerate((b"isolated-marker", b"\x89PNG\r\n\x1a\ninvalid")):
+        monkeypatch.setattr(safe_http, "get", lambda url, **_: safe_http.Response(200, {}, url, body))
+        result = thumbs.resolve_previews([{"item_id": f"catalog:fixture::{number}",
+                                           "image_url": "https://public.fixture/marker"}])[0]
+        assert not result["ok"] and result["data"] is None
 
 
 @pytest.mark.parametrize("body", [b"isolated-marker", b"\x89PNG\r\n\x1a\ninvalid",
                                   b"x" * (4 * 1024 * 1024 + 1)])
-def test_old_thumbnail_cache_cannot_proxy_invalid_or_oversized_body(monkeypatch, tmp_path, body):
-    image = tmp_path / "fixture.img"
+def test_thumbnail_cache_cannot_proxy_invalid_or_oversized_body(monkeypatch, tmp_path, body):
+    from services.parts import thumbs
+    monkeypatch.setattr(thumbs, "_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(thumbs, "_record_for_part", lambda _: None)
+    item = {"item_id": "catalog:fixture::p", "image_url": "https://public.fixture/part.png"}
+    image, _ = thumbs._cache_paths(item["item_id"], item["image_url"], "product")
     image.write_bytes(body)
-    monkeypatch.setattr(gui_rpc, "_thumb_cache_paths",
-                        lambda _: (image, tmp_path / "fixture.miss"))
-    assert gui_rpc._thumb_cached("catalog:fixture::p") is None
+    result = thumbs.resolve_previews([item], allow_network=False)[0]
+    assert not result["ok"] and result["data"] is None
     assert not image.exists()
 
 
@@ -75,18 +88,18 @@ def test_pdf_private_target_refused_without_request(monkeypatch):
 def test_cell_rendering_and_download_refuse_before_profile_access(monkeypatch, tmp_path):
     monkeypatch.setattr(session.profiles, "ensure_profile", lambda *_: pytest.fail("browser profile touched"))
     with cell():
-        assert session.browser_fetch("https://public.fixture/", "fixture")["reason"] == "cell_refused"
-        assert session.browser_download("https://public.fixture/a.step", "fixture", tmp_path / "a.step")["reason"] == "cell_refused"
+        assert session.browser_fetch("https://public.fixture/", "fixture")["reason"] == "policy_refused"
+        assert session.browser_download("https://public.fixture/a.step", "fixture", tmp_path / "a.step")["reason"] == "policy_refused"
 
 
 _HREF_DOWNLOAD_ADAPTERS = [
     ("anaheimautomation", ".step"), ("boschrexroth", ".step"),
     ("componentsearchengine", ".step"), ("content3d", ".step"),
-    ("gbstandards", ".pdf"), ("grabcad", ".step"), ("hiwin", ".step"),
+    ("gbstandards", ".pdf"), ("hiwin", ".step"),
     ("hydraforce", ".step"), ("igus", ".step"), ("lcsc", ".pdf"),
     ("maxon", ".step"), ("misumi", ".step"), ("orientalmotor", ".step"),
     ("parker", ".step"), ("snapeda", ".step"), ("thk", ".step"),
-    ("thomson", ".step"), ("traceparts", ".step"), ("ultralibrarian", ".step"),
+    ("thomson", ".step"), ("ultralibrarian", ".step"),
     ("grainger", ".pdf"),  # Real RetailAdapter consumer, not the shared helper alone.
 ]
 
@@ -100,9 +113,14 @@ def adapter_download_root(monkeypatch, tmp_path):
 
 def _acquire_catalog_link(monkeypatch, module_name, href):
     module = importlib.import_module("services.browser.adapters." + module_name)
+    configured_sku = "PSFJ6-100" if module_name == "misumi" else None
+    part = f'<span class="part-number">{configured_sku}</span>' if configured_sku else ""
     monkeypatch.setattr(session, "browser_fetch", lambda *_: {
-        "ok": True, "content": f'<a href="{href}">Datasheet CAD download</a>'})
-    return module.ADAPTER.acquire({"url": module.BASE_URL + "/fixture"})
+        "ok": True, "content": part + f'<a href="{href}">Datasheet CAD download</a>'})
+    result = {"url": module.BASE_URL + "/fixture"}
+    if configured_sku:
+        result["sku"] = configured_sku
+    return module.ADAPTER.acquire(result)
 
 
 @pytest.mark.parametrize("module_name, extension", _HREF_DOWNLOAD_ADAPTERS)
@@ -117,7 +135,8 @@ def test_catalog_adapters_refuse_unsafe_leaf_before_download(
                         lambda *_: pytest.fail("unsafe filename reached download sink"))
     out = _acquire_catalog_link(
         monkeypatch, module_name, "https://catalog.fixture/files/" + stem + extension)
-    assert out["ok"] is False and out["reason"] == "unsafe_filename"
+    assert out["ok"] is False and out["reason"] == "policy_refused"
+    assert out.get("original_reason", out.get("detail")) == "unsafe_filename"
     assert not list(adapter_download_root.rglob("*.*"))
 
 
@@ -125,23 +144,31 @@ def test_catalog_adapters_refuse_unsafe_leaf_before_download(
 def test_catalog_query_and_fragment_never_control_destination(
         monkeypatch, adapter_download_root, module_name, extension):
     seen = []
+    payload = (b"%PDF-1.7\nfixture\n%%EOF\n" if extension == ".pdf" else
+               b"ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n")
     name = "轴 bracket" + extension
     href = ("https://catalog.fixture/files/%E8%BD%B4%20bracket" + extension
             + r"?signature=a%2Fb&next=/..\..\evil.zip#C:\escape")
 
     def download(url, site, dest):
         expected = adapter_download_root / site / name
-        assert dest == expected
-        dest.write_bytes(b"isolated CAD fixture")
+        assert (dest == expected or
+                (dest.parent == expected.parent and dest.name.startswith(".") and dest.suffix == extension) or
+                (dest.parent.parent == expected.parent and dest.parent.name.startswith(".cad-")
+                 and dest.name == expected.name))
+        dest.write_bytes(payload)
         seen.append(dest)
         return {"ok": True, "dest": str(dest), "session_profile_used": site}
 
     monkeypatch.setattr(session, "browser_download", download)
     out = _acquire_catalog_link(monkeypatch, module_name, href)
     assert out["ok"] is True
-    assert Path(out["artifact_path"]) == seen[0]
-    assert seen[0].read_bytes() == b"isolated CAD fixture"
-    assert list(adapter_download_root.rglob("*" + extension)) == seen
+    assert len(seen) == 1
+    adapter = importlib.import_module("services.browser.adapters." + module_name).ADAPTER
+    expected = adapter_download_root / adapter.key / name
+    assert Path(out["artifact_path"]) == expected
+    assert expected.read_bytes() == payload
+    assert list(adapter_download_root.rglob("*" + extension)) == [expected]
 
 
 @pytest.mark.parametrize("module_name, extension", _HREF_DOWNLOAD_ADAPTERS)
@@ -157,7 +184,8 @@ def test_catalog_adapters_refuse_existing_symlink_escape(
                         lambda *_: pytest.fail("symlink escape reached download sink"))
     out = _acquire_catalog_link(
         monkeypatch, module_name, "https://catalog.fixture/files/part" + extension)
-    assert out["ok"] is False and out["reason"] == "unsafe_filename"
+    assert out["ok"] is False and out["reason"] == "policy_refused"
+    assert out.get("original_reason", out.get("detail")) == "unsafe_filename"
     assert outside.read_bytes() == b"must remain unchanged"
 
 
@@ -181,7 +209,8 @@ def test_mcmaster_refuses_unsafe_product_filepath(
     monkeypatch.setattr(session, "browser_download",
                         lambda *_: pytest.fail("unsafe McMaster filename downloaded"))
     out = _acquire_mcmaster_file(monkeypatch, file_path)
-    assert out["ok"] is False and out["reason"] == "unsafe_filename"
+    assert out["ok"] is False and out["reason"] == "policy_refused"
+    assert out["original_reason"] == "unsafe_filename"
     assert not list(adapter_download_root.rglob("*.*"))
 
 
@@ -191,13 +220,13 @@ def test_mcmaster_product_filepath_preserves_unicode_and_extension(
 
     def download(url, site, dest):
         assert dest == expected
-        dest.write_bytes(b"isolated STEP fixture")
+        dest.write_bytes(b"ISO-10303-21;\nHEADER;\nENDSEC;\nEND-ISO-10303-21;")
         return {"ok": True, "dest": str(dest), "session_profile_used": site}
 
     monkeypatch.setattr(session, "browser_download", download)
     out = _acquire_mcmaster_file(monkeypatch, "/CadFiles/轴 bracket.STEP")
     assert out["ok"] is True and Path(out["artifact_path"]) == expected
-    assert expected.read_bytes() == b"isolated STEP fixture"
+    assert expected.read_bytes() == b"ISO-10303-21;\nHEADER;\nENDSEC;\nEND-ISO-10303-21;"
 
 
 @pytest.mark.parametrize("leaf", [
@@ -208,33 +237,39 @@ def test_freecadlibrary_refuses_unsafe_raw_destination(
     from services.browser.adapters import freecadlibrary
     monkeypatch.setattr(session, "browser_download",
                         lambda *_: pytest.fail("unsafe FreeCAD filename downloaded"))
-    out = freecadlibrary.ADAPTER.acquire(
-        {"raw_url": "https://raw.githubusercontent.com/FreeCAD/FreeCAD-library/main/" + leaf})
-    assert out["ok"] is False and out["reason"] == "unsafe_filename"
+    out = freecadlibrary.ADAPTER.acquire({"raw_url": freecadlibrary.RAW_BASE + "/" + leaf})
+    assert out["ok"] is False and out["reason"] == "policy_refused"
+    assert out["original_reason"] == "unsafe_filename"
 
 
 def test_freecadlibrary_raw_query_never_controls_destination(
         monkeypatch, adapter_download_root):
     from services.browser.adapters import freecadlibrary
-    expected = adapter_download_root / "freecadlibrary" / "轴 bracket.stp"
+    raw_url = freecadlibrary.RAW_BASE + "/%E8%BD%B4%20bracket.stp"
+    identity = hashlib.sha256(raw_url.encode()).hexdigest()[:16]
+    expected = adapter_download_root / "freecadlibrary" / (identity + "-轴 bracket.stp")
+    payload = b"ISO-10303-21;\nHEADER;\nENDSEC;\nEND-ISO-10303-21;\n"
 
     def download(url, site, dest):
-        assert dest == expected
-        dest.write_bytes(b"isolated STEP fixture")
+        assert dest.parent == expected.parent
+        assert dest.name.startswith(".cad-") and dest.suffix == ".stp"
+        dest.write_bytes(payload)
         return {"ok": True, "dest": str(dest), "session_profile_used": site}
 
     monkeypatch.setattr(session, "browser_download", download)
     out = freecadlibrary.ADAPTER.acquire({
-        "raw_url": "https://raw.githubusercontent.com/FreeCAD/FreeCAD-library/main/"
-                   "%E8%BD%B4%20bracket.stp?next=/..\\..\\evil.zip#C:\\escape"})
+        "raw_url": raw_url + "?next=/..\\..\\evil.zip#C:\\escape"})
+    plain = freecadlibrary.ADAPTER.acquire({"raw_url": raw_url})
     assert out["ok"] is True and Path(out["artifact_path"]) == expected
-    assert out["title"] == expected.name
-    assert expected.read_bytes() == b"isolated STEP fixture"
+    assert plain["ok"] is True and Path(plain["artifact_path"]) == expected
+    assert out["title"] == "轴 bracket.stp"
+    assert expected.read_bytes() == payload
 
 
 def _acquire_printables_file(monkeypatch, *, file_id="7", name="轴 bracket.STEP",
                              direct="https://files.printables.com/download?signature=a%2Fb"):
     from services.browser.adapters import printables
+    monkeypatch.setattr(printables, "_paced", lambda _op, _url, request: (request(), None))
     monkeypatch.setattr(printables, "_query", lambda *_: {"data": {"print": {
         "name": "Fixture", "stls": [{"id": file_id, "name": name, "fileSize": 24}]}}})
     monkeypatch.setattr(printables, "_download_link", lambda *_: {"data": {
@@ -254,7 +289,8 @@ def test_printables_catalog_names_ids_and_url_share_destination_boundary(
     monkeypatch.setattr(printables, "download_public_cad",
                         lambda *_: pytest.fail("unsafe Printables destination downloaded"))
     out = _acquire_printables_file(monkeypatch, **selection)
-    assert out["ok"] is False and out["reason"] == "unsafe_filename"
+    assert out["ok"] is False and out["reason"] == "policy_refused"
+    assert out["original_reason"] == "unsafe_filename"
     assert not list(adapter_download_root.rglob("*.*"))
 
 
@@ -264,15 +300,15 @@ def test_printables_catalog_selection_preserves_unicode_and_cad_extension(
     expected = adapter_download_root / "printables" / "42-7-轴 bracket.STEP"
 
     def download(url, dest):
-        assert dest == expected
-        dest.write_bytes(b"isolated STEP fixture")
+        assert dest.parent == expected.parent and dest.suffix == expected.suffix
+        dest.write_bytes(b"ISO-10303-21;\nHEADER;\nENDSEC;\nEND-ISO-10303-21;")
         return {"ok": True, "dest": str(dest)}
 
     monkeypatch.setattr(printables, "download_public_cad", download)
     out = _acquire_printables_file(
         monkeypatch, direct=r"https://files.printables.com/download?next=/..\..\evil.zip#C:\escape")
     assert out["ok"] is True and Path(out["artifact_path"]) == expected
-    assert expected.read_bytes() == b"isolated STEP fixture"
+    assert expected.read_bytes() == b"ISO-10303-21;\nHEADER;\nENDSEC;\nEND-ISO-10303-21;"
 
 
 @pytest.mark.parametrize("leaf", [

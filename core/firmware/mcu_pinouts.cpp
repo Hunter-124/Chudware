@@ -3,11 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
-#include <fstream>
 #include <regex>
-#include <sstream>
-
-#include "ecad/container.h"
 #include "ecad/schema.h"
 #include "ecad/session.h"
 
@@ -134,20 +130,17 @@ nlohmann::json resolve_board_doc(const std::string& ref) {
         if (doc.is_object()) return doc;
     } catch (...) {
     }
-    // 2) file path (.ecad+ container or plain JSON document).
+    // Use the same KiCad/legacy importer and binding rules as every ECAD open.
     try {
         std::error_code ec;
-        if (std::filesystem::exists(ref, ec)) {
-            if (ref.size() >= 6 && ref.compare(ref.size() - 6, 6, ".ecad+") == 0) {
-                auto opened = chudware::ecad::ecad_container_open(ref);
-                if (opened.doc.is_object()) return opened.doc;
-            } else {
-                std::ifstream in(ref);
-                std::stringstream ss;
-                ss << in.rdbuf();
-                nlohmann::json doc = nlohmann::json::parse(ss.str(), nullptr, false);
-                if (doc.is_object()) return doc;
-            }
+        if (std::filesystem::exists(std::filesystem::u8path(ref), ec)) {
+            const auto opened = chudware::ecad::ecad_open(ref);
+            const std::string id = opened.value("doc_id", std::string());
+            struct CloseSession {
+                std::string id;
+                ~CloseSession() { if (!id.empty()) chudware::ecad::ecad_close(id); }
+            } close{id};
+            if (opened.contains("tree") && opened["tree"].is_object()) return opened["tree"];
         }
     } catch (...) {
     }

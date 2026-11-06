@@ -95,7 +95,7 @@ def test_ac1_grades_from_battery_payload_not_not_checked(monkeypatch):
             "id": "DL1",
             "acceptance_criteria": [{
                 "id": "AC1",
-                "text": "airframe geometry coherent (verify_battery PASS)",
+                "text": "enclosure geometry coherent (verify_battery PASS)",
                 "check": {"tool": "verify_battery", "pass_rule": "PASS"},
             }],
         }],
@@ -194,7 +194,7 @@ def test_resolve_prefers_geometry_bearing_doc_over_empty_spawn():
                     "ok": True,
                     "result": json.dumps({
                         "ok": True, "doc_id": "doc-cpp00000001",
-                        "name": "rocket_plane_airframe",
+                        "name": "chassis_frame",
                     }),
                 },
             },
@@ -222,7 +222,7 @@ def test_resolve_prefers_geometry_bearing_doc_over_empty_spawn():
                     "result": json.dumps({
                         "ok": True,
                         "doc_id": "doc-cpp00000003",
-                        "name": "DL1_rocket_plane_airframe",
+                        "name": "DL1_chassis_frame",
                     }),
                 },
             },
@@ -330,7 +330,7 @@ def test_typed_refusal_flat_multi_domain_gate_e2e():
         {
             "role": "orchestrator",
             "task_class": "multi_feature_part",
-            "request": "Plan rocket airframe + avionics integration as one flat node.",
+            "request": "Plan vehicle chassis and controller integration as one flat node.",
         },
         {
             "role_id": "orchestrator",
@@ -350,7 +350,7 @@ def test_typed_refusal_flat_multi_domain_gate_e2e():
             "role": "orchestrator",
             "task_class": "assembly",
             "depth": 0,
-            "request": "Integrate airframe + FC board without spawning.",
+            "request": "Integrate enclosure and control board without spawning.",
         },
     }
     pack = {

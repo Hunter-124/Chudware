@@ -55,7 +55,7 @@ class TurnOutcome:
     usage: dict | None = None           # None = unknown (never coerced to zero)
     persistence: dict | None = None
     finalization_errors: list = field(default_factory=list)
-    chudcode_session_file: str | None = None
+    omp_session_file: str | None = None
     started_at: float | None = None
     ended_at: float | None = None
 
@@ -98,7 +98,7 @@ def decode_turn(capture: dict | None, *, driver_returncode: int | None = None,
         persistence=resp.get("persistence") if isinstance(resp.get("persistence"), dict)
         else None,
         finalization_errors=list(resp.get("finalization_errors") or []),
-        chudcode_session_file=turn.get("chudcode_session_file"),
+        omp_session_file=turn.get("omp_session_file"),
         started_at=capture.get("started_at"),
         ended_at=capture.get("ended_at"),
     )
@@ -119,7 +119,7 @@ def decode_turn(capture: dict | None, *, driver_returncode: int | None = None,
         else:
             out.status, out.reason = Status.FAIL, f"turn not ok: {reason}"
     elif verdict == "not_terminal" or not out.terminal:
-        out.status, out.reason = Status.ERROR, "turn ended without a terminal agent_end"
+        out.status, out.reason = Status.ERROR, "turn ended without session settlement"
     elif out.cancelled or verdict == "cancelled":
         out.status, out.reason = Status.ERROR, f"turn cancelled (stop_reason={stop})"
     elif verdict == "run_failed":
@@ -135,9 +135,9 @@ def decode_turn(capture: dict | None, *, driver_returncode: int | None = None,
 
 
 def session_usage(sessions_dir: Path) -> dict | None:
-    """Token usage and price summed over every assistant message of the trial's Chudcode
+    """Token usage and price summed over every assistant message of the trial's OMP
     session files (main + subagents). None when no message carries usage (unknown, never
-    zero). ``cost_usd`` is Chudcode's per-message price estimate at the model's API rate;
+    zero). ``cost_usd`` is the per-message price estimate at the model's API rate;
     subscription billing differs, and a message without a price leaves it None."""
     totals = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "total_tokens": 0}
     cost: float | None = 0.0

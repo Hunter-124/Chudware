@@ -202,6 +202,14 @@ def test_rpc_reads_and_mutations_share_the_absent_not_found_envelope(private_sta
                                         "reason": "not_found", "code": "not_found"}
 
 
+def test_cell_not_found_tool_envelopes_remain_minimal(private_state):
+    with context.bind_context(_actor("alice")):
+        result = worker_rpc._envelope({"ok": False, "error": "not_found",
+                                       "hint": "do not expose detail"}, "any_method")
+        assert result == {"ok": False, "error": "not_found", "reason": "not_found",
+                          "code": "not_found"}
+
+
 def test_mission_thread_rebinds_actor_and_explicit_roots(private_state, monkeypatch):
     completed = threading.Event()
     observed = {}
@@ -318,7 +326,41 @@ def test_export_and_scan_import_refuse_foreign_absent_and_malformed_before_mutat
                       for path in alice_root.rglob("*") if path.is_file()}
 
 
-def test_owned_export_reads_back_only_owned_session_and_imported_mesh(private_state):
+def test_owned_session_rejects_paths_outside_cell_workspace_before_mutation(private_state):
+    scan = private_state / "outside.ply"
+    scan.write_bytes(b"outside scan")
+    destination = private_state / "outside.zip"
+    destination.write_bytes(b"do not replace")
+    missing = private_state / "not-created" / "bundle.zip"
+    with context.bind_context(_actor("alice")):
+        _, root = _session("owned")
+        for method, params in (
+            ("import_scan_mesh", {"path": str(scan)}),
+            ("export_reveng_bundle", {"dest": str(destination)}),
+            ("export_reveng_bundle", {"dest": str(missing)}),
+        ):
+            supplied = {"session_id": "owned", **params}
+            result = worker_rpc.REVENG_WORKER_METHODS[method](supplied, lambda _: None)
+            direct = json.loads(worker_rpc._tool_fn(method)(**supplied))
+            assert result["ok"] is False and result["error"] == "cell_refused"
+            assert direct == {"ok": False, "error": "cell_refused", "code": "cell_refused"}
+        assert not (root / "mesh").exists()
+    assert destination.read_bytes() == b"do not replace"
+    assert not missing.parent.exists()
+
+
+def test_owned_export_reads_back_only_owned_session_and_imported_mesh(private_state, monkeypatch):
+    # This in-process fixture has no /work mount. Emulate a confined workspace
+    # without weakening the production cell_path boundary.
+    workspace = private_state.resolve()
+
+    def fixture_cell_path(path, *, private=False):
+        resolved = Path(path).resolve()
+        if resolved != workspace and workspace not in resolved.parents:
+            raise ValueError("cell_refused")
+        return resolved
+
+    monkeypatch.setattr(context, "cell_path", fixture_cell_path)
     scans = {}
     for actor in ("alice", "bob"):
         scan = private_state / f"{actor}.ply"
@@ -341,6 +383,9 @@ def test_owned_export_reads_back_only_owned_session_and_imported_mesh(private_st
         session = json.loads(archive.read("session.json"))
         assert session["session_id"] == "alice-owned"
         assert session["_owner"] == ["team:org/team", "alice"]
+        assert session["artifacts"]["mesh_path"] == "mesh/alice.ply"
+        assert session["artifacts"]["raw_mesh_path"] == "mesh/alice.ply"
+        assert archive.read(session["artifacts"]["mesh_path"]) == scans["alice"]
         assert archive.read("mesh/alice.ply") == scans["alice"]
         assert all(b"bob-private-mesh" not in archive.read(name)
                    for name in archive.namelist())
@@ -374,3 +419,151 @@ def test_desktop_bundle_export_keeps_user_selected_destinations(
         assert archive.testzip() is None
         assert archive.read("human-selected.txt") == b"desktop archive content"
         assert json.loads(archive.read("session.json"))["_owner"] is None
+
+
+def test_worker_publishes_owned_session_artifact_references(private_state, monkeypatch):
+    with context.bind_context(_actor("alice")):
+        session, root = _session("owned")
+        splat = root / "splat" / "cloud.ply"
+        splat.parent.mkdir()
+        splat.write_bytes(b"ply\nowned Gaussian")
+        mesh = root / "mesh.ply"
+        mesh.write_bytes(b"ply\nmesh")
+        sparse = root / "sparse"
+        sparse.mkdir()
+        (sparse / "points3D.bin").write_bytes(b"sparse points")
+        session["artifacts"].update(splat_path=str(splat), mesh_path=str(mesh),
+                                    sparse_dir=str(sparse))
+        common._save_session(session)
+        response = worker_rpc.REVENG_WORKER_METHODS["get_reveng_session"](
+            {"session_id": "owned"}, lambda _: None)
+        assert response["ok"], response
+        refs = response["artifact_refs"]
+        assert refs["splat"]["kind"] == "gaussian_ply"
+        assert refs["splat"]["size"] == splat.stat().st_size
+        assert refs["mesh"]["kind"] == "mesh_ply"
+        assert refs["sparse_points"]["kind"] == "sparse_points"
+        assert len(refs["splat"]["id"]) == 64
+        assert str(root) not in json.dumps(refs)
+        grant = json.loads((common._reveng_dir() / "artifact_refs" /
+                            refs["splat"]["id"]).read_text())
+        assert grant["path"] == splat.relative_to(common._reveng_dir()).as_posix()
+        repeat = worker_rpc.REVENG_WORKER_METHODS["get_reveng_session"](
+            {"session_id": "owned"}, lambda _: None)
+        assert repeat["artifact_refs"]["splat"]["id"] == refs["splat"]["id"]
+
+        preview = root / "preview" / "surface.stl"
+        preview.parent.mkdir()
+        preview.write_bytes(b"binary STL")
+        monkeypatch.setattr(worker_rpc, "_tool_fn",
+                            lambda _method: lambda session_id: {
+                                "ok": True, "mesh_preview_path": str(preview)})
+        result = worker_rpc.REVENG_WORKER_METHODS["reveng_sparse_preview"](
+            {"session_id": "owned"}, lambda _: None)
+        assert result["artifact_refs"]["mesh_preview"]["kind"] == "binary_stl"
+        assert result["artifact_refs"]["mesh_preview"]["size"] == preview.stat().st_size
+
+        other = private_state / "not-session.ply"
+        other.write_bytes(b"private")
+        assert worker_rpc._artifact_ref("owned", str(other), "gaussian_ply") is None
+
+    with context.bind_context(_actor("bob")):
+        with pytest.raises(KeyError, match="not_found"):
+            worker_rpc._artifact_ref("owned", str(splat), "gaussian_ply")
+
+
+def test_cell_sparse_preview_is_bounded_and_transports_artifact(private_state, monkeypatch):
+    from services.mcp import reveng_session_tools
+
+    class Capture:
+        def tool(self, *args, **kwargs):
+            def register(fn):
+                if fn.__name__ == "reveng_sparse_preview":
+                    self.preview = fn
+                return fn
+            return register
+
+    capture = Capture()
+    reveng_session_tools.register_reveng_session_tools(capture)
+    monkeypatch.setattr(worker_rpc, "_tool_fn", lambda _method: capture.preview)
+    with context.bind_context(_actor("alice")):
+        session, root = _session("owned")
+        sparse = root / "sparse"
+        sparse.mkdir()
+        (sparse / "cameras.txt").write_text("1 PINHOLE 100 80 50 50 50 40\n")
+        (sparse / "images.txt").write_text("1 1 0 0 0 0 0 0 1 frame.jpg\n\n")
+        points_path = sparse / "points3D.txt"
+        points_path.write_text("".join(
+            f"{i + 1} {i + 1} 2 3 255 128 0 0.1\n" for i in range(5001)))
+        session["artifacts"]["sparse_dir"] = str(sparse)
+        common._save_session(session)
+        response = worker_rpc.REVENG_WORKER_METHODS["reveng_sparse_preview"](
+            {"session_id": "owned"}, lambda _: None)
+        assert response["ok"]
+        assert response["total_points"] == 5001
+        assert len(response["points"]) == 5000
+        assert all(len(point) == 6 for point in response["points"])
+        assert "points_native" not in response
+        assert response["units"] == "reconstruction"
+        assert response["artifact_refs"]["sparse_points"]["kind"] == "sparse_points"
+        assert response["artifact_refs"]["sparse_points"]["size"] == points_path.stat().st_size
+
+
+@pytest.mark.parametrize("has_old_dataset", [False, True])
+def test_shared_dataset_gauge_change_invalidates_current_model_not_snapshots(
+        private_state, has_old_dataset):
+    with context.bind_context(_actor("alice")):
+        session, root = _session("owned")
+        images = root / "images"
+        images.mkdir()
+        source = images / "frame.jpg"
+        source.write_bytes(b"frame")
+        dataset = root / "new_dataset"
+        sparse = dataset / "sparse"
+        undistorted = dataset / "images"
+        sparse.mkdir(parents=True)
+        undistorted.mkdir()
+        batch = root / "batch.json"
+        batch.write_text(json.dumps({"frame.jpg": str(source)}))
+        snapshot = root / "published.step"
+        snapshot.write_bytes(b"published part")
+        if has_old_dataset:
+            session["sfm_dataset"] = {"dataset_dir": str(root / "old_dataset")}
+        session["artifacts"].update(mesh_path="old-mesh", raw_mesh_path="old-raw",
+                                    fits_path="old-fits", doc_id="old-doc",
+                                    step_path="old-step", cadquery_path="old-script")
+        session["result"] = {"state": "built"}
+        session["stages"].update(model="done", review="done", deliver="done")
+        common._save_session(session)
+        gaussian_jobs._persist_shared_output(root, {"session_id": "owned"}, {
+            "dataset_dir": str(dataset), "sparse_dir": str(sparse),
+            "images_dir": str(undistorted), "batch_image_map_path": str(batch),
+        }, None)
+        updated = common._load_session("owned", merge_gaussian=False)
+        assert updated["sfm_dataset"]["dataset_dir"] == str(dataset)
+        assert updated["artifacts"]["sparse_dir"] == str(sparse)
+        assert updated["artifacts"]["doc_id"] is None
+        assert all(key not in updated["artifacts"] for key in
+                   ("mesh_path", "raw_mesh_path", "fits_path", "step_path", "cadquery_path"))
+        assert "result" not in updated
+        assert all(updated["stages"][stage] == "idle" for stage in
+                   ("model", "review", "deliver"))
+        assert updated["stages"]["scale"] == "pending"
+        assert snapshot.read_bytes() == b"published part"
+
+
+def test_cell_splat_conversion_receives_session_handle_not_workspace_path(private_state, monkeypatch):
+    with context.bind_context(_actor("alice")):
+        _session("owned")
+        received = {}
+
+        def convert(path, out_format, out_path):
+            received.update(path=path, out_format=out_format, out_path=out_path)
+            return {"ok": True, "path": out_path}
+
+        monkeypatch.setattr(worker_rpc, "_tool_fn", lambda _method: convert)
+        result = worker_rpc.REVENG_WORKER_METHODS["reveng_convert_splat"](
+            {"session_id": "owned", "out_format": "splat", "out_path": "/work/out.splat"},
+            lambda _: None)
+        assert result["ok"]
+        assert received == {"path": "owned", "out_format": "splat", "out_path": "/work/out.splat"}

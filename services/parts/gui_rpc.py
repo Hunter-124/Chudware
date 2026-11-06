@@ -23,8 +23,6 @@ import threading
 import time
 import urllib.parse
 import tempfile
-import zipfile
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeout, as_completed
 from pathlib import Path
 from typing import Any, Callable
 from contextvars import copy_context
@@ -158,29 +156,24 @@ def _site_domain(site: str) -> str:
 
 def _first_price(rec: dict) -> tuple[float, str]:
     """Best-effort unit price from sourcing rows, then params."""
-    for row in rec.get("sourcing") or []:
-        if isinstance(row, dict):
-            p = row.get("price") or row.get("unit_price") or row.get("price_usd")
+    for row in [*(rec.get("sourcing") or []), rec.get("params") or {}]:
+        if not isinstance(row, dict):
+            continue
+        for key in ("price", "unit_price", "price_usd"):
             try:
-                if p is not None and float(p) > 0:
-                    return float(p), str(row.get("currency", "USD"))
+                value = row.get(key)
+                if value is not None and float(value) > 0:
+                    currency = "USD" if key == "price_usd" else str(row.get("currency") or "").upper()
+                    return float(value), currency
             except (TypeError, ValueError):
                 continue
-    params = rec.get("params") or {}
-    for k in ("price_usd", "price", "unit_price"):
-        try:
-            v = params.get(k)
-            if v is not None and float(v) > 0:
-                return float(v), "USD"
-        except (TypeError, ValueError):
-            continue
-    return 0.0, "USD"
+    return 0.0, ""
 
 
 def _params_summary(params: dict, limit: int = 6) -> str:
     bits: list[str] = []
     for k, v in params.items():
-        if isinstance(v, (str, int, float)) and str(v):
+        if k != "description" and isinstance(v, (str, int, float)) and str(v):
             bits.append(f"{k}={v}")
         if len(bits) >= limit:
             break
@@ -194,13 +187,12 @@ def _vendor_of(rec: dict) -> str:
         site = pid[len("catalog:"):].split("::", 1)[0]
         return _site_label(site)
     params = rec.get("params") or {}
-    for k in ("vendor", "manufacturer", "supplier"):
-        v = params.get(k)
-        if v:
+    for v in [params.get("vendor"), params.get("supplier"),
+              *(row.get("vendor") for row in rec.get("sourcing") or []
+                if isinstance(row, dict))]:
+        if v and str(v).lower() != "library":
             return str(v)
-    if rec.get("source") == "live":
-        return "Vendor API"
-    return "Library"
+    return ""
 
 
 def _material_of(rec: dict) -> str:
@@ -217,12 +209,14 @@ def _record_to_item(rec: dict) -> dict:
     params = rec.get("params") or {}
     gref = rec.get("geometry_ref") or {}
     desc = _params_summary(params)
+    description = rec.get("description") or params.get("description")
+    if description:
+        desc = f"{description}  {desc}".strip()
     if rec.get("standard"):
         desc = f"{rec['standard']}  {desc}".strip()
     title = str(rec.get("title") or "")
     if gref.get("kind") == "core_family" and gref.get("family") == "hobby_servo":
-        # The catalog's descriptive sentence puts the actual model at the END;
-        # in a narrow card every servo otherwise looks identical.
+        # Normalize older servo records that carry a descriptive sentence as title.
         desc = f"{title}  {desc}".strip()
         title = f"Hobby Servo {rec.get('designation') or gref.get('size') or ''}".strip()
     length = (rec.get("insert_params") or {}).get("length_mm")
@@ -240,6 +234,24 @@ def _record_to_item(rec: dict) -> dict:
         part_number = f"{rec.get('designation')}×{length:g}"
     if params.get("model_file"):
         part_number = str(params["model_file"])
+    designation = str(rec.get("designation") or "")
+    family = str(rec.get("family") or "")
+    if not family and gref.get("kind") == "core_family" and designation:
+        suffix = " " + designation
+        if title.endswith(suffix):
+            family = title[:-len(suffix)]
+    stock = params.get("stock")
+    if stock is None:
+        stock = next((row.get("stock") for row in rec.get("sourcing") or []
+                      if isinstance(row, dict) and row.get("stock") is not None), None)
+    try:
+        stock = int(stock) if stock is not None else -1
+    except (TypeError, ValueError, OverflowError):
+        stock = -1
+    formats = params.get("model_formats") or []
+    if not isinstance(formats, list):
+        formats = []
+    image_url = str(params.get("image_url") or params.get("thumbnail") or "")
     return {
         "id":          rec.get("part_id", ""),
         "name":        title,
@@ -248,14 +260,30 @@ def _record_to_item(rec: dict) -> dict:
         "description": desc,
         "unit":        "ea",
         "price_usd":   price if currency == "USD" else 0.0,
+        "price":       price,
+        "currency":    currency,
+        "family":      family,
+        "designation": designation,
+        "kind":        "" if rec.get("domain") == "library" else str(params.get("kind") or ""),
+        "thumbnail_url": image_url,
+        "mpn":         str(params.get("mpn") or ""),
+        "manufacturer": str(params.get("manufacturer") or ""),
+        "stock":       stock,
+        "model_formats": [str(fmt) for fmt in formats],
         "material":    _material_of(rec),
         "domain":      rec.get("domain", ""),
         "standard":    rec.get("standard") or "",
         "source":      rec.get("source", "local") or "local",
-        "downloaded":  bool(gref.get("kind") == "import_file"),
-        "placeable":   gref.get("kind") is not None,
+        "downloaded":  bool(gref.get("kind") == "import_file" and
+                            Path(str(gref.get("path") or "")).is_file()),
+        "downloadable": bool(rec.get("artifact") and
+                             not (gref.get("kind") == "import_file" and
+                                  Path(str(gref.get("path") or "")).is_file())),
+        "placeable":   bool(gref.get("kind") and
+                            (gref.get("kind") != "import_file" or
+                             Path(str(gref.get("path") or "")).is_file())),
         "datasheet":   str(params.get("datasheet_url", "") or params.get("datasheet", "")),
-        "image_url":   str(params.get("image_url", "") or params.get("thumbnail", "")),
+        "image_url":   image_url,
         "license":     rec.get("license", ""),
         "file_name":   str(params.get("model_file") or ""),
         "insert_params": rec.get("insert_params") or {},
@@ -310,55 +338,9 @@ def _parts_taxonomy(params: dict, _emit: Callable) -> dict:
 _COMMUNITY_SITES = ("printables", "makerworld")
 
 
-def _search_score(rec: dict, query: str) -> int:
-    """Score visible identity matches, rather than hidden FTS synonyms."""
-    terms = re.findall(r"[a-z0-9]+", query.lower())
-    if not terms:
-        return 0
-    name = str(rec.get("title") or "").lower()
-    designation = str(rec.get("designation") or "").lower()
-    text = f"{name} {designation}"
-    matched = sum(bool(re.search(rf"(?<![a-z0-9]){re.escape(t)}(?![a-z0-9])", text))
-                  for t in terms)
-    if query.lower().strip() == designation:
-        return 100
-    if not matched:
-        return 0
-    identity_match = any(re.search(
-        rf"(?<![a-z0-9]){re.escape(t)}(?![a-z0-9])", designation) for t in terms)
-    score = min(95, round(70 * matched / len(terms)) +
-                (15 if query.lower().strip() in name else 0) +
-                (20 if identity_match else 0))
-    if rec.get("domain") == "catalog" and rec.get("source") == "live":
-        # Community search APIs also return brackets, lubricant adapters and
-        # other accessories. Prefer the actual requested component when it is
-        # present; an explicitly requested "servo horn" is not an accessory.
-        accessory = {"adapter", "adaptor", "lubricant", "grease", "mount",
-                     "mounts", "holder", "housing", "bracket", "kit", "clip",
-                     "arm", "arms", "horn", "pulley", "finger", "claw", "cover",
-                     "support", "gear", "gears", "pan", "tilt", "turret", "turet",
-                     "base", "tool", "pusher", "helper", "removal", "applicator"}
-        title_words = set(re.findall(r"[a-z0-9]+", name))
-        filename = str((rec.get("params") or {}).get("model_file") or "").lower()
-        file_words = set(re.findall(r"[a-z0-9]+", filename))
-        unexpected_accessory = bool((accessory & (title_words | file_words)) - set(terms))
-        if unexpected_accessory:
-            score = max(0, score - 20)
-        model_codes = [term for term in terms
-                       if len(term) >= 4 and any(char.isdigit() for char in term)]
-        if filename and model_codes:
-            if not any(code in filename for code in model_codes):
-                score = max(0, score - 25)
-            elif not unexpected_accessory:
-                score = min(95, score + 15)
-                suffix = Path(filename).suffix
-                score = min(99, score + (4 if suffix in {".step", ".stp", ".iges", ".igs"}
-                                         else 2 if suffix == ".3mf" else 0))
-        if (model_codes and
-                re.search(r"\b(?:mg90s|sg90|mg995|mg996r|ds3218)\b", query.lower()) and
-                not ({"servo", "motor"} & title_words)):
-            score = max(0, score - 20)
-    return score
+from .search_relevance import (descriptive_relevant as _descriptive_relevant,
+                               live_relevant as _live_relevant, score_record as _search_score)
+from .taxonomy import sites_for_query as _routed_sites
 
 
 def _family_size_options(records: list[dict]) -> None:
@@ -380,20 +362,6 @@ def _family_size_options(records: list[dict]) -> None:
         break
 
 
-def _routed_sites(query: str) -> list[str]:
-    """Compact reference and supplier fan-out for unfiltered searches."""
-    q = query.lower()
-    if "servo" in q or re.search(r"\b(?:mg90s|sg90|mg995|mg996r|ds3218)\b", q):
-        return ["printables", "makerworld", "servocity", "pololu"]
-    if "bearing" in q or "lm8uu" in q:
-        return ["printables", "makerworld", "mcmaster", "misumi"]
-    if "socket" in q or re.search(r"\bm\d+(?:x\d+)?\b", q):
-        return ["printables", "makerworld", "mcmaster", "fastenal"]
-    if "extrusion" in q:
-        return ["printables", "makerworld", "eightytwenty", "misumi"]
-    if "nema" in q or "pulley" in q:
-        return ["printables", "makerworld", "pololu", "servocity"]
-    return ["printables", "makerworld"]
 
 
 def _cef_unavailable() -> bool:
@@ -449,10 +417,13 @@ def _printables_file_names(hits: list[dict]) -> dict[str, str]:
 
 def _community_records(site: str, query: str) -> list[dict]:
     from services.browser.adapters import get_adapter
+    from services.browser.adapters.parts_provider import BrowserCatalogAdapter
     adapter = get_adapter(site)
     if adapter is None:
-        return []
+        return [{"ok": False, "site": site, "reason": "unavailable",
+                 "hint": "No search adapter is registered for this site."}]
     records = []
+    provider = BrowserCatalogAdapter(adapter)
     hits = adapter.search(query)
     try:
         filenames = _printables_file_names(hits) if site == "printables" else {}
@@ -464,15 +435,39 @@ def _community_records(site: str, query: str) -> list[dict]:
             continue
         if not hit.get("url") or not hit.get("title"):
             continue
-        records.append({
-            "part_id": f"catalog:{site}::{hit['url']}", "title": hit["title"],
-            "designation": "", "domain": "catalog", "source": "live",
-            "params": {"site": site, "url": hit["url"],
-                       "thumbnail": hit.get("thumbnail", ""),
-                       "model_file": filenames.get(hit["url"], "")},
-            "license": hit.get("license") or "License not specified",
-        })
+        rec = provider.record_from_hit(hit)
+        if filenames.get(hit["url"]):
+            rec["params"]["model_file"] = filenames[hit["url"]]
+        records.append(rec)
     return records
+
+
+def _category_terms(node: dict) -> list[list[str]]:
+    """Use this category's own hints and descendants, not broad ancestor hints."""
+    terms = []
+    for phrase in node.get("query_terms") or []:
+        words = re.findall(r"[a-z0-9]+", str(phrase).lower())
+        if words:
+            terms.append(words)
+    for child in node.get("children") or []:
+        if isinstance(child, dict):
+            terms.extend(_category_terms(child))
+    return terms
+
+
+def _matches_category(rec: dict, rt: dict) -> bool:
+    terms = rt.get("category_terms") or []
+    if not terms:
+        return True
+    if rt["category_id"] == "fasteners" and rec.get("domain") == "fastener":
+        return True
+    params = rec.get("params") or {}
+    text = " ".join([str(rec.get("title") or ""), str(rec.get("family") or ""),
+                     str((rec.get("geometry_ref") or {}).get("family") or ""),
+                     *(str(alias) for alias in rec.get("aliases") or []),
+                     *(str(value) for value in params.values())]).lower()
+    words = set(re.findall(r"[a-z0-9]+", text))
+    return any(all(word in words or word + "s" in words for word in phrase) for phrase in terms)
 
 
 def _compute_routing(p: dict) -> dict:
@@ -488,16 +483,19 @@ def _compute_routing(p: dict) -> dict:
     route_sites: list[str] = []
     query_terms: list[str] = []
     facet_defs: list[dict] = []
+    category_terms: list[list[str]] = []
 
     if category_id:
-        # V2 taxonomy routing — unknown ids degrade to an unrouted search.
         from . import taxonomy as _tax
-        if _tax.get_node(category_id) is not None:
-            routing = _tax.route(category_id)
-            domain = routing["domains"] or None
-            route_sites = routing["sites"]
-            query_terms = routing["query_terms"]
-            facet_defs = _tax.effective_facets(category_id)
+        node = _tax.get_node(category_id)
+        if node is None:
+            raise ValueError(f"Unknown category: {category_id}")
+        category_terms = _category_terms(node)
+        routing = _tax.route(category_id)
+        domain = routing["domains"] or None
+        route_sites = routing["sites"]
+        query_terms = routing["query_terms"]
+        facet_defs = _tax.effective_facets(category_id)
     elif category.startswith("catalog:"):
         # Legacy flat-category vocabulary (kept working verbatim).
         domain, site = "catalog", category.split(":", 1)[1]
@@ -506,27 +504,34 @@ def _compute_routing(p: dict) -> dict:
 
     if site:
         route_sites = [site]
-    elif query and not route_sites and not category_id and not category:
+    elif query and not category_id:
         route_sites = _routed_sites(query)
-    elif query and len(route_sites) > 1 and domain != "ecad":
-        route_sites = list(dict.fromkeys([*_COMMUNITY_SITES, *route_sites]))
+        if not category and not p.get("doc_id"):
+            from .taxonomy import infer_category, route
+            inferred = infer_category(query)
+            if inferred:
+                domain = route(inferred)["domains"] or None
+    elif query and route_sites and domain != "catalog":
+        from .taxonomy import prioritize_sites
+        route_sites = prioritize_sites(route_sites)
 
-    vendor_query = " ".join([query] + [t for t in query_terms if t]).strip()
+    # Category hints are alternatives for browsing an empty category, not terms
+    # to append to an already precise designation search.
+    vendor_query = query or " ".join(t for t in query_terms if t).strip()
     return {"query": query, "category_id": category_id, "domain": domain, "site": site,
             "route_sites": route_sites, "facet_defs": facet_defs,
-            "vendor_query": vendor_query}
+            "category_terms": category_terms, "vendor_query": vendor_query}
 
 
 def _split_notices(records: list[dict]) -> tuple[list[dict], list[dict]]:
-    """Separate real records from login_required/unavailable stubs (no part_id or
-    title). Stubs become actionable per-site notices instead of blank rows."""
+    """Separate real records from structured failures and incomplete notice stubs."""
     notices: list[dict] = []
     seen_notice: set = set()
     clean: list[dict] = []
     for r in records:
         pid = str(r.get("part_id", "") or "")
         title = str(r.get("title", "") or "").strip()
-        if pid and title:
+        if r.get("ok") is not False and pid and title:
             clean.append(r)
             continue
         n_site = str(r.get("site", "") or "")
@@ -595,14 +600,19 @@ def _index_status() -> dict:
         from services.parts import _get_hub
         fn = getattr(_get_hub(), "index_status", None)
         if fn is None:
-            return out
-        st = fn()
+            st = {}
+        else:
+            st = fn()
         if isinstance(st, dict):
-            for k in ("building", "built", "count", "source", "age_s"):
+            for k in ("building", "built", "count", "source", "age_s",
+                      "diagnostics", "native_ecad_available"):
                 if k in st:
                     out[k] = st[k]
-    except Exception:  # noqa: BLE001 — status is advisory, never fatal
-        return dict(_INDEX_STATUS_FALLBACK)
+    except Exception as exc:  # noqa: BLE001 — status is advisory, never fatal
+        out["diagnostics"] = [{"provider": "parts_hub", "operation": "status",
+                               "error": f"{type(exc).__name__}: {exc}"}]
+    from services.parts.worker_rpc import REGISTRATION_DIAGNOSTICS
+    out["diagnostics"] = [*out.get("diagnostics", []), *REGISTRATION_DIAGNOSTICS]
     return out
 
 
@@ -613,6 +623,25 @@ def _parts_index_status(params: dict, _emit: Callable) -> dict:
     the FTS index warms."""
     return {"ok": True, **_index_status()}
 
+
+# Bounds expensive filtering/sorting while making truncation visible to callers.
+_SEARCH_CANDIDATE_CAP = 20000
+
+
+def _sort_items(items: list[dict], sort: Any, *, query: str, combined: bool) -> None:
+    mode = {"0": "relevance", "1": "price_asc", "2": "price_desc", "3": "name"}.get(
+        str(sort), str(sort or "relevance").lower())
+    if mode == "name":
+        items.sort(key=lambda item: (item["name"].casefold(), item["id"]))
+    elif mode in ("price_asc", "price_desc"):
+        sign = 1 if mode == "price_asc" else -1
+        items.sort(key=lambda item: (item["price_usd"] <= 0,
+                                     sign * item["price_usd"], item["id"]))
+    elif combined:
+        items.sort(key=lambda item: (
+            -item["score"], not (item["source"] == "local" and item["placeable"])))
+    elif query:
+        items.sort(key=lambda item: -item["score"])
 
 
 def _parts_search(params: dict, _emit: Callable) -> dict:
@@ -625,11 +654,18 @@ def _parts_search(params: dict, _emit: Callable) -> dict:
         from services.parts import search as _search
         p = params or {}
         limit = max(1, min(int(p.get("limit", 50)), 200))
-        want_live = bool(p.get("live", False)) and str(p.get("source", "")).lower() != "local"
-        rt = _compute_routing(p)
+        offset = max(0, int(p.get("offset", 0)))
+        want_live = (bool(p.get("live", False)) and p.get("include_live", True)
+                     and str(p.get("source", "")).lower() != "local")
+        try:
+            rt = _compute_routing(p)
+        except ValueError as exc:
+            return {"ok": False, "reason": "unknown_category", "hint": str(exc)}
 
-        records = _search(rt["query"], domain=rt["domain"], limit=limit,
-                          include_live=False)
+        records = _search(rt["query"], domain=rt["domain"],
+                          limit=_SEARCH_CANDIDATE_CAP + 1, include_live=False)
+        total_exact = len(records) <= _SEARCH_CANDIDATE_CAP
+        records = records[:_SEARCH_CANDIDATE_CAP]
         if rt["site"]:
             prefix = f"catalog:{rt['site']}::"
             records = [r for r in records if str(r.get("part_id", "")).startswith(prefix)]
@@ -651,6 +687,8 @@ def _parts_search(params: dict, _emit: Callable) -> dict:
         tooth_variants = [re.compile(rf"(?<![a-z0-9]){t}(?![a-z0-9])")
                           for t in terms if re.fullmatch(r"\d+t", t)]
         for rec in records:
+            if not p.get("facets") and not _descriptive_relevant(rec, rt["query"]):
+                continue
             score = _search_score(rec, rt["query"])
             title = f"{rec.get('title') or ''} {rec.get('designation') or ''}".lower()
             identity = str(rec.get("designation") or rec.get("title") or "").lower()
@@ -686,8 +724,8 @@ def _parts_search(params: dict, _emit: Callable) -> dict:
                     else:
                         records.extend(_search(rt["vendor_query"], domain="catalog",
                                                limit=limit, sites=[site]))
-                except Exception:  # one optional vendor must not sink local results
-                    continue
+                except Exception as exc:  # one optional vendor must not sink local results
+                    records.append({"site": site, "reason": "internal_error", "hint": str(exc)})
             if cef_off and any(s != "printables" for s in rt["route_sites"]):
                 records.append({"ok": False, "site": "browser",
                                 "reason": "cef_unavailable",
@@ -695,19 +733,41 @@ def _parts_search(params: dict, _emit: Callable) -> dict:
 
         records, notices = _split_notices(records)
         if want_live:
+            records = [r for r in records if r.get("source") != "live"
+                       or _live_relevant(r, rt["query"])]
+        if rt["category_id"]:
+            records = [rec for rec in records if _matches_category(rec, rt)]
+        if want_live:
             for rec in records:
                 if rec.get("source") == "live" or "score" not in rec:
                     rec["score"] = _search_score(rec, rt["query"])
         items = _filter_items(records, p, rt["facet_defs"])
-        if want_live:
-            items.sort(key=lambda item: (
-                not (item["source"] == "local" and item["placeable"]), -item["score"]))
-        has_live = any(i["source"] == "live" for i in items)
+        _sort_items(items, p.get("sort"), query=rt["query"], combined=want_live)
         idx = _index_status()
-        return {"ok": True, "count": len(items), "has_live": has_live,
-                "results": items, "notices": notices,
+        diagnostics = list(idx.get("diagnostics") or [])
+        native_deferred = (not rt["query"] and not rt["domain"] and
+                           bool(idx.get("native_ecad_available")) and
+                           str(p.get("source", "")).lower() != "live")
+        if native_deferred:
+            notices.append({"site": "KiCad", "reason": "native_browse_deferred",
+                            "hint": "Select Electronics or search to include the installed KiCad catalog."})
+            diagnostics.append({"provider": "ecad_kicad", "operation": "browse",
+                                "reason": "native_browse_deferred",
+                                "hint": "Select Electronics or search to include the installed KiCad catalog."})
+        # External limits and failed provider searches/builds make the count incomplete.
+        total_exact = (total_exact and not want_live and not native_deferred and not any(
+            diagnostic.get("operation") in ("enumeration", "search")
+            for diagnostic in diagnostics if isinstance(diagnostic, dict)))
+        total = len(items)
+        page = items[offset:offset + limit]
+        has_live = any(i["source"] == "live" for i in page)
+        return {"ok": True, "count": len(page), "total": total,
+                "total_exact": total_exact, "offset": offset,
+                "has_more": offset + len(page) < total,
+                "has_live": has_live, "results": page, "notices": notices,
                 "index_building": bool(idx.get("building", False)),
-                "index_count": int(idx.get("count", -1))}
+                "index_count": int(idx.get("count", -1)),
+                "diagnostics": diagnostics}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"parts_search failed: {exc}"}
 
@@ -722,12 +782,6 @@ def _parts_search(params: dict, _emit: Callable) -> dict:
 _live_jobs: dict[str, dict] = {}
 _live_lock = threading.Lock()
 _live_threads: dict[threading.Thread, tuple[str, str] | None] = {}
-_thumb_futures: dict[Any, tuple[str, str] | None] = {}
-
-
-def _thumbnail_finished(future) -> None:
-    with _live_lock:
-        _thumb_futures.pop(future, None)
 
 
 def worker_activity() -> dict:
@@ -741,10 +795,8 @@ def worker_activity() -> dict:
         live = sum(stored_owner == owner for stored_owner in _live_threads.values())
         reserved = sum(not job["done"] and job.get("_owner") == owner
                        for job in _live_jobs.values())
-        for future in list(_thumb_futures):
-            if future.done():
-                _thumb_futures.pop(future)
-        thumbnails = sum(stored_owner == owner for stored_owner in _thumb_futures.values())
+    from services.parts.thumbs import active_future_count
+    thumbnails = active_future_count(owner)
     with registry_lock(_login_lock):
         login = sum(t.is_alive() or t.ident is None for t in _login_threads.values())
     with registry_lock(_health_lock):
@@ -753,21 +805,16 @@ def worker_activity() -> dict:
     return {"by_kind": {"parts_search": reserved, "parts_search_threads": live,
                         "vendor_login": login, "vendor_health": health,
                         "parts_thumbnails": thumbnails}}
-_LIVE_JOB_CAP = 8  # keep the most-recent N jobs; drop stale tokens
-# Six simultaneous CEF navigations regularly miss the native 10 s navigation
-# deadline on ordinary supplier pages. Three completed every probe in the live
-# vendor sweep and prevents rapid searches from creating an unbounded fetch fanout.
-_LIVE_FETCH_CONCURRENCY = 3
-_live_fetch_slots = threading.BoundedSemaphore(_LIVE_FETCH_CONCURRENCY)
+_LIVE_JOB_CAP = 8  # retain at most this many tokens per client
+# Shared with the hub so concurrent GUI and agent searches obey the same cap.
+from .hub import _LIVE_FETCH_CONCURRENCY, _live_fetch_slots, _live_slot_held
 
 # ---- live vendor result cache -----------------------------------------------------
 #
 # A live fan-out is seconds per vendor. Re-running the same query 30s later used to
 # re-scrape everything, so the pane felt broken on a back-and-forth browse. This is a
 # bounded on-disk cache of the RAW record list each vendor returned, keyed on
-# (site, vendor_query, limit) — deliberately NOT on the GUI post-filters, so changing
-# price/material/vendor/source filters on the same query is still a cache hit and the
-# filters are re-applied fresh on every read.
+# (site, query, limit, owner and profile state), not on the GUI filters.
 #
 # Every operation here is exception-proof: any sqlite/FS/JSON problem degrades to
 # "no cache" (scrape as before), never to a failed search.
@@ -831,9 +878,25 @@ def _vendor_cache_conn() -> Any:
 
 
 def _vendor_cache_key(site: str, query: str, limit: int) -> str:
-    version = "files-v2" if site == "printables" else "1"
-    return hashlib.blake2b(f"{version}\n{site}\n{query}\n{limit}".encode("utf-8"),
-                           digest_size=16).hexdigest()
+    # Observe identity/login and cookie-file metadata, never cookie contents.
+    state: list[str] = [repr(owner_key())]
+    try:
+        from services.browser import profiles
+        profile = profiles._profile_storage(site, create=False)
+        state.append(str(profile))
+        cookies = (profile / "Default" / "Cookies",
+                   profile / "Default" / "Network" / "Cookies", profile / "Cookies")
+        for path in (Path(str(profile) + ".json"), Path(str(profile) + ".cookies.json"),
+                     *cookies, *(Path(str(path) + "-wal") for path in cookies)):
+            try:
+                stat = path.stat()
+                state.append(f"{stat.st_mtime_ns}:{stat.st_size}")
+            except OSError:
+                state.append("-")
+    except Exception:  # optional browser integration
+        state.append("profile-unavailable")
+    key = f"v3\n{site}\n{query}\n{limit}\n" + "\n".join(state)
+    return hashlib.blake2b(key.encode("utf-8"), digest_size=16).hexdigest()
 
 
 def _vendor_cache_get(site: str, query: str, limit: int) -> list[dict] | None:
@@ -872,11 +935,10 @@ def _vendor_cache_put(site: str, query: str, limit: int, records: list[dict]) ->
     """Store the raw records a vendor returned. Silent no-op on any failure."""
     if not _vendor_cache_enabled():
         return
-    # The one-site hub returns failure/timeout/login notices in-band. Caching one
-    # would turn a transient busy/challenge/HTTP failure into a 15-minute false
-    # result. Empty clean searches are cacheable; every non-empty row must be a
-    # usable PartRecord.
-    if any(not isinstance(r, dict)
+    # Some adapters cannot distinguish a clean empty result from parse failure.
+    # Cache only non-empty lists consisting entirely of usable records.
+    if not records or any(not isinstance(r, dict)
+           or r.get("ok") is False or r.get("reason")
            or not r.get("part_id")
            or not str(r.get("title") or "").strip()
            for r in records):
@@ -970,79 +1032,88 @@ def vendor_cache_purge(site: str | None = None) -> int:
 
 
 def _run_live_site_inner(site: str, rt: dict, limit: int, p: dict, job: dict) -> None:
-    from services.parts import search as _search
-    # Probe before taking a scarce CEF slot. Warm results and their status/cancel
-    # bookkeeping must never queue behind unrelated vendor navigations.
-    cached = _vendor_cache_get(site, rt["vendor_query"], limit)
-    with _live_lock:
-        if job.get("cancelled"):
-            return  # superseded/evicted before this site even started — skip the scrape
-        v = job.get("vendors", {}).get(site)
-        if v is not None:
-            v["status"] = "done" if cached is not None else "loading"
     site_status = "done"
-    if cached is not None:
-        recs = cached
-    elif site == "printables":
-        try:
+    try:
+        from services.parts import search as _search
+        cached = _vendor_cache_get(site, rt["vendor_query"], limit)
+        with _live_lock:
+            if job.get("cancelled"):
+                site_status = "cancelled"
+                return
+            vendor = job.get("vendors", {}).get(site)
+            if vendor is not None:
+                vendor["status"] = "done" if cached is not None else "loading"
+        if cached is not None:
+            recs = cached
+        elif site == "printables":
             recs = _community_records(site, rt["vendor_query"])
-        except Exception:  # public API failure must not strand this live job
-            recs = []
+        else:
+            with _live_fetch_slots:
+                with _live_lock:
+                    cancelled = job.get("cancelled")
+                if cancelled:
+                    site_status = "cancelled"
+                    return
+                token = _live_slot_held.set(True)
+                try:
+                    if site in _COMMUNITY_SITES:
+                        recs = _community_records(site, rt["vendor_query"])
+                    else:
+                        recs = _search(rt["vendor_query"], domain="catalog", limit=limit, sites=[site])
+                finally:
+                    _live_slot_held.reset(token)
+        with _live_lock:
+            if job.get("cancelled"):
+                site_status = "cancelled"
+                return
+        prefix = f"catalog:{site}::"
+        recs = [r for r in recs if str(r.get("part_id", "")).startswith(prefix)
+                or r.get("ok") is False or r.get("reason")]
+        for rec in recs:
+            if not rec.get("site") and not rec.get("part_id"):
+                rec["site"] = site
+        clean, notices = _split_notices(recs)
+        clean = [rec for rec in clean
+                 if _live_relevant(rec, rt.get("query") or rt["vendor_query"])]
+        for rec in clean:
+            rec["score"] = _search_score(rec, rt.get("query") or rt["vendor_query"])
+        if rt.get("category_id"):
+            clean = [rec for rec in clean if _matches_category(rec, rt)]
+        if notices:
             site_status = "error"
-        if site_status == "done":
+        items = _filter_items(clean, p, rt["facet_defs"])
+        if cached is None and not notices:
             _vendor_cache_put(site, rt["vendor_query"], limit, recs)
-    else:
-        _live_fetch_slots.acquire()
-        if job.get("cancelled"):
-            _live_fetch_slots.release()
-            return
-        try:
-            if site in _COMMUNITY_SITES:
-                recs = _community_records(site, rt["vendor_query"])
-            else:
-                recs = _search(rt["vendor_query"], domain="catalog", limit=limit, sites=[site])
-        except Exception:  # one vendor failing must not sink the others
-            recs = []
-            site_status = "error"
-        finally:
-            _live_fetch_slots.release()
-        if site_status == "done":
-            _vendor_cache_put(site, rt["vendor_query"], limit, recs)
-    with _live_lock:
-        if job.get("cancelled"):
-            return  # cancelled while the scrape was in flight — don't bother parsing
-    prefix = f"catalog:{site}::"
-    recs = [r for r in recs if str(r.get("part_id", "")).startswith(prefix)
-            or r.get("ok") is False]
-    for rec in recs:
-        if rec.get("ok") is False and not rec.get("site"):
-            rec["site"] = site
-    clean, notices = _split_notices(recs)
-    for rec in clean:
-        rec["score"] = _search_score(rec, rt.get("query") or rt["vendor_query"])
-    if notices:
+        with _live_lock:
+            if job.get("cancelled"):
+                site_status = "cancelled"
+                return
+            for item in items:
+                if item["id"] not in job["seen_ids"]:
+                    job["seen_ids"].add(item["id"])
+                    job["results"].append(item)
+            for notice in notices:
+                key = (notice["site"], notice["reason"])
+                if key not in job["seen_notices"]:
+                    job["seen_notices"].add(key)
+                    job["notices"].append(notice)
+    except Exception as exc:  # noqa: BLE001 — report this site's failure and finish the job
         site_status = "error"
-    items = _filter_items(clean, p, rt["facet_defs"])
-    with _live_lock:
-        if job.get("cancelled"):
-            return
-        seen = job["seen_ids"]
-        for it in items:
-            if it["id"] in seen:
-                continue
-            seen.add(it["id"])
-            job["results"].append(it)
-        for nt in notices:
-            key = (nt["site"], nt["reason"])
-            if key not in job["seen_notices"]:
-                job["seen_notices"].add(key)
-                job["notices"].append(nt)
-        job["pending"] -= 1
-        if job["pending"] <= 0:
-            job["done"] = True
-        v = job.get("vendors", {}).get(site)
-        if v is not None:
-            v["status"] = site_status
+        with _live_lock:
+            if not job.get("cancelled"):
+                key = (site, "internal_error")
+                if key not in job["seen_notices"]:
+                    job["seen_notices"].add(key)
+                    job["notices"].append({"site": site, "reason": "internal_error",
+                                           "hint": f"{type(exc).__name__}: {exc}"})
+    finally:
+        with _live_lock:
+            job["pending"] -= 1
+            if job["pending"] <= 0:
+                job["done"] = True
+            vendor = job.get("vendors", {}).get(site)
+            if vendor is not None:
+                vendor["status"] = site_status
 
 
 def _run_live_site(site: str, rt: dict, limit: int, p: dict, job: dict) -> None:
@@ -1058,8 +1129,11 @@ def _parts_search_live_start(params: dict, _emit: Callable) -> dict:
         import uuid
         p = params or {}
         limit = max(1, min(int(p.get("limit", 50)), 200))
-        rt = _compute_routing(p)
-        requested = list(dict.fromkeys(rt["route_sites"]))
+        try:
+            rt = _compute_routing(p)
+        except ValueError as exc:
+            return {"ok": False, "reason": "unknown_category", "hint": str(exc)}
+        requested = list(dict.fromkeys(rt["route_sites"])) if p.get("include_live", True) else []
         cef_off = bool(requested) and _cef_unavailable()
         sites = [s for s in requested if not cef_off or s == "printables"]
         skipped = [s for s in requested if s not in sites]
@@ -1068,26 +1142,26 @@ def _parts_search_live_start(params: dict, _emit: Callable) -> dict:
                        "status": "queued"} for s in sites}
         job = {"results": [], "notices": [], "seen_ids": set(), "seen_notices": set(),
                "pending": len(sites), "done": not sites, "cancelled": False,
-               "vendors": vendors, "_owner": owner_key()}
+               "vendors": vendors, "_owner": owner_key(),
+               "_client": (owner_key(), str(p["client"])) if p.get("client") else None}
         if skipped:
             job["notices"].append({
                 "site": "browser", "reason": "cef_unavailable",
                 "hint": f"Browser vendors unavailable in this CEF-off build ({len(skipped)} skipped); public CAD search remains available.",
             })
         with _live_lock:
-            # A new search supersedes anything still running. The RPC carries no
-            # client/session identity, so cancel EVERY older live job: their workers
-            # bail out instead of scraping vendors nobody will look at, and marking
-            # them done makes the GUI's next poll drain-and-drop the stale token.
+            # Supersede only this client's searches; the default is the legacy global client.
             for old in _live_jobs.values():
-                if not old.get("done"):
+                if old.get("_client") == job["_client"] and not old.get("done"):
                     old["cancelled"] = True
                     old["done"] = True
             _live_jobs[token] = job
-            # Evict oldest tokens beyond the cap (dicts preserve insertion order).
-            while len(_live_jobs) > _LIVE_JOB_CAP:
-                evicted = _live_jobs.pop(next(iter(_live_jobs)))
-                evicted["cancelled"] = True  # stop its workers, not just the token
+            # Bound retained tokens per client without interrupting other clients.
+            own_tokens = [key for key, value in _live_jobs.items()
+                          if value.get("_client") == job["_client"]]
+            for key in own_tokens[:-_LIVE_JOB_CAP]:
+                evicted = _live_jobs.pop(key)
+                evicted["cancelled"] = True
         for s in sites:
             context = copy_context()
             thread = threading.Thread(target=context.run,
@@ -1100,11 +1174,15 @@ def _parts_search_live_start(params: dict, _emit: Callable) -> dict:
                 _live_threads[thread] = job["_owner"]
             try:
                 thread.start()
-            except BaseException:
+            except Exception as exc:  # noqa: BLE001 — other sites can still finish
                 with _live_lock:
                     _live_threads.pop(thread, None)
-                    job["done"] = True  # Failed starts release only the reservation.
-                raise
+                    job["pending"] -= 1
+                    vendors[s]["status"] = "error"
+                    job["notices"].append({"site": s, "reason": "internal_error",
+                                           "hint": f"Failed to start search: {exc}"})
+                    if job["pending"] <= 0:
+                        job["done"] = True
         return {"ok": True, "token": token, "sites": sites,
                 "vendors": list(vendors.values()), "notices": list(job["notices"]),
                 "done": job["done"]}
@@ -1146,9 +1224,13 @@ def _parts_download(params: dict, _emit: Callable) -> dict:
         part_id = str((params or {}).get("item_id", "")).strip()
         if not part_id:
             return {"ok": False, "reason": "item_id required"}
-        if not part_id.startswith("catalog:"):
-            return {"ok": True, "downloaded": True,
-                    "note": "local library part — nothing to download; use Insert to place it"}
+        if not (part_id.startswith("catalog:") and "::" in part_id):
+            from services.parts.parts_library import acquire_part
+            record = acquire_part(part_id, offline=not (params or {}).get("include_live", True))
+            kind = (record.get("geometry_ref") or {}).get("kind")
+            return {"ok": True, "downloaded": kind == "import_file", "part": record}
+        if not (params or {}).get("include_live", True):
+            return {"ok": False, "reason": "Live catalog downloads are unavailable offline."}
         rest = part_id[len("catalog:"):]
         if "::" not in rest:
             return {"ok": False, "reason": f"malformed catalog part_id: {part_id!r}"}
@@ -1161,6 +1243,19 @@ def _parts_download(params: dict, _emit: Callable) -> dict:
         return {"ok": False, "reason": f"parts_download failed: {exc}"}
 
 
+def _parts_download_select(params: dict, _emit: Callable) -> dict:
+    """Retry an ambiguous archive acquisition using a verified queue selection."""
+    try:
+        from services.browser.queue import ensure_worker_started, select_member
+        p = params or {}
+        result = select_member(p.get("job_id"), p.get("member"), p.get("format"))
+        if result.get("ok"):
+            ensure_worker_started()
+        return result
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": "internal_error", "hint": str(exc)}
+
+
 def _parts_queue_status(params: dict, _emit: Callable) -> dict:
     try:
         from services.browser.queue import queue_status
@@ -1170,55 +1265,62 @@ def _parts_queue_status(params: dict, _emit: Callable) -> dict:
 
 
 def _parts_import_artifact(params: dict, _emit: Callable) -> dict:
-    """Import a downloaded STEP/IGES or mesh; unpack CAD from ZIP bundles."""
+    """Validate the selected CAD artifact before importing it into the core."""
     try:
         from services.mcp import core_bridge as cb
-        path = str((params or {}).get("artifact_path", "")).strip()
+        from services.browser.cad_validate import extract_cad, validate_cad
+        p = params or {}
+        path = str(p.get("artifact_path", "")).strip()
         if not path:
             return {"ok": False, "reason": "artifact_path required"}
         from services.agent.request_context import cell_path
         path = str(cell_path(path))
         suffix = Path(path).suffix.lower()
-        supported = {".step", ".stp", ".iges", ".igs", ".stl", ".3mf", ".obj"}
+        member = p.get("member") or None
+        requested_format = p.get("format") or None
+        if member is not None and not isinstance(member, str):
+            return {"ok": False, "reason": "invalid_cad", "hint": "Invalid archive member."}
+        if requested_format is not None and not isinstance(requested_format, str):
+            return {"ok": False, "reason": "invalid_cad", "hint": "Invalid CAD format."}
+        if requested_format:
+            requested_format = requested_format.strip().lower().lstrip(".")
+            if requested_format == "zip":
+                requested_format = None
+
+        def import_checked(checked: dict, cad_path: str) -> dict:
+            if not checked.get("ok"):
+                return {"ok": False, "reason": "invalid_cad",
+                        "hint": str(checked.get("reason") or "CAD validation failed"),
+                        "candidates": checked.get("candidates", [])}
+            fmt = str(checked.get("format") or Path(cad_path).suffix.lower().lstrip("."))
+            if fmt not in {"step", "stp", "iges", "igs", "stl", "3mf", "obj"}:
+                return {"ok": False, "reason": "unsupported_import_format",
+                        "hint": f"The downloaded {fmt or 'unknown'} format cannot be imported natively.",
+                        "artifact_path": path, "format": fmt}
+            return cb.call("part_import_file", {"path": cad_path,
+                           "as_solid": fmt in {"stl", "3mf", "obj"}})
+
         if suffix == ".zip":
-            with zipfile.ZipFile(path) as archive:
-                candidates = [entry for entry in archive.infolist()
-                              if not entry.is_dir() and Path(entry.filename).suffix.lower() in supported
-                              and 0 < entry.file_size <= 200 * 1024 * 1024]
-                rank = {".step": 0, ".stp": 0, ".iges": 1, ".igs": 1,
-                        ".3mf": 2, ".stl": 3, ".obj": 4}
-                candidates.sort(key=lambda e: (rank[Path(e.filename).suffix.lower()], e.filename))
-                if not candidates:
-                    return {"ok": False, "reason": "No importable CAD model in this ZIP bundle."}
-                selected = candidates[0]
-                with tempfile.TemporaryDirectory(prefix="chudware-part-") as directory:
-                    extracted = Path(directory) / ("model" + Path(selected.filename).suffix.lower())
-                    with archive.open(selected) as source, extracted.open("wb") as dest:
-                        import shutil
-                        shutil.copyfileobj(source, dest)
-                    return cb.call("part_import_file", {"path": str(extracted),
-                              "as_solid": extracted.suffix in {".stl", ".3mf", ".obj"}})
-        if suffix not in supported:
-            return {"ok": False, "reason": f"Unsupported CAD artifact format: {suffix or '(none)'}"}
-        return cb.call("part_import_file", {"path": path,
-                      "as_solid": suffix in {".stl", ".3mf", ".obj"}})
+            with tempfile.TemporaryDirectory(prefix="chudware-part-") as directory:
+                checked = extract_cad(path, requested_format=requested_format,
+                                      requested_member=member, dest_dir=directory)
+                return import_checked(checked, str(checked.get("artifact_path") or ""))
+        # A member on an already extracted file is provenance, not another selection.
+        checked = validate_cad(path, requested_format=requested_format)
+        return import_checked(checked, path)
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"parts_import_artifact failed: {exc}"}
 
 
 def _parts_insert_into_doc(params: dict, _emit: Callable) -> dict:
     try:
-        from services.mcp import core_bridge as cb  # place.place ported to core
-        from services.parts import get as _hub_get
+        from services.parts.worker_rpc import _part_place
         part_id = str((params or {}).get("item_id", "")).strip()
         if not part_id:
             return {"ok": False, "reason": "item_id required"}
-        record = _hub_get(part_id)
-        if record is None:
-            return {"ok": False, "reason": f"unknown part_id: {part_id}"}
-        return cb.call("part_place", {"part_id": part_id, "record": record,
-                                      "doc": (params or {}).get("doc") or None,
-                                      "params": (params or {}).get("params") or None})
+        placement = dict(params or {})
+        placement["part_id"] = part_id
+        return _part_place(placement, _emit)
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"parts_insert_into_doc failed: {exc}"}
 
@@ -1246,7 +1348,8 @@ def _parts_prepare_for_assembly(params: dict, emit: Callable) -> dict:
         return {"ok": False, "reason": f"Could not create project folder: {exc}"}
 
     placed = _parts_insert_into_doc({"item_id": (params or {}).get("item_id"),
-                                     "params": (params or {}).get("params")}, emit)
+                                     "params": (params or {}).get("params"),
+                                     "include_live": (params or {}).get("include_live", True)}, emit)
     if not placed.get("ok"):
         return placed
     doc_id = placed.get("doc_id")
@@ -1536,578 +1639,41 @@ def _vendors_health_status(params: dict, _emit: Callable) -> dict:
 
 # ---- thumbnails ---------------------------------------------------------------------
 
-def _thumb_cache_dir():
-    from services import paths
-    d = paths.ROOT / "parts_thumbs"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-# ---- thumbnail tuning knobs / disk cache ---------------------------------------------
-#
-# Every knob is read PER CALL (never memoised into a module global) so a worker can be
-# retuned from the environment without a restart.
-
-_THUMB_MAX_BATCH = 32            # entries honoured by one parts_thumbnails call
-_THUMB_DIR_MAX_ENTRIES = 20000   # cache-dir bound before the .miss sweep kicks in
-_THUMB_TRIM_EVERY_S = 600.0      # at most one sweep per 10 minutes
-_THUMB_MISS_SUFFIX = ".miss"
-_THUMB_MISS_REASON = "no preview available (cached)"
-
-# THE RENDER PATH IS NOT THREAD-SAFE. `_render_local_part_png` drives the native core as a
-# FOUR-CALL sequence around one doc_id (parts_make → doc_apply_ops → doc_render_png →
-# doc_close). In daemon mode (the default) services/mcp/daemon_bridge.py serialises each
-# INDIVIDUAL rpc behind DaemonClient._lock — one outstanding request per connection — so
-# running renders 8-wide buys nothing and merely interleaves four-call sequences on one
-# socket. Worse, in the legacy in-process mode (CHUDWARE_ENGINE_DAEMON=0, and the STICKY
-# fallback core_bridge drops into for the rest of the session whenever hostd is
-# unreachable) core_bridge.call() invokes `dll.chudware_call` with NO lock at all — the
-# `_lock` there guards only the one-time DLL load — so concurrent renders would race OCCT
-# inside this process. Renders therefore run strictly one at a time behind this lock;
-# network fetches, which touch nothing shared, stay fully parallel.
-_THUMB_RENDER_LOCK = threading.Lock()
-
-_thumb_trim_lock = threading.Lock()
-_thumb_last_trim = 0.0
-
-
-def _thumb_env_num(name: str, default: float, lo: float, hi: float) -> float:
-    """A positive numeric env knob clamped to [lo, hi]. Unset/garbage/<=0 → default."""
-    try:
-        val = float(str(os.environ.get(name, "")).strip())
-    except (TypeError, ValueError):
-        return default
-    if val <= 0:
-        return default
-    return max(lo, min(hi, val))
-
-
-def _thumb_workers() -> int:
-    """Fan-out width for a batch. CHUDWARE_THUMB_WORKERS, default 8, clamped 1..16."""
-    return int(_thumb_env_num("CHUDWARE_THUMB_WORKERS", 8.0, 1.0, 16.0))
-
-
-def _thumb_batch_budget_s() -> float:
-    """Wall budget for one parts_thumbnails call. CHUDWARE_THUMB_BATCH_BUDGET_S, default 20 s."""
-    return _thumb_env_num("CHUDWARE_THUMB_BATCH_BUDGET_S", 20.0, 0.05, 300.0)
-
-
-def _thumb_fetch_timeout_s() -> float:
-    """urllib timeout for one image GET. CHUDWARE_THUMB_FETCH_TIMEOUT_S, default 4.0 s."""
-    return _thumb_env_num("CHUDWARE_THUMB_FETCH_TIMEOUT_S", 4.0, 0.05, 60.0)
-
-
-def _thumb_miss_ttl_s() -> float:
-    """How long a negative marker suppresses a retry. CHUDWARE_THUMB_MISS_TTL_S, default 24 h."""
-    return _thumb_env_num("CHUDWARE_THUMB_MISS_TTL_S", 86400.0, 1.0, 365.0 * 86400.0)
-
-
-def _thumb_cache_paths(part_id: str):
-    """(image, miss-marker) paths for a part id. The sha1 key is shared with
-    gen_standard_thumbs.py's cache warmer — never change it without wiping the dir."""
-    h = hashlib.sha1(part_id.encode()).hexdigest()
-    d = _thumb_cache_dir()
-    return d / (h + ".img"), d / (h + _THUMB_MISS_SUFFIX)
-
-
-def _thumb_cached(part_id: str) -> dict | None:
-    """Return a verified positive raster hit, a fresh negative marker, or a miss.
-    Old caches may contain arbitrary successful HTTP bodies; they are not trusted."""
-    try:
-        img, miss = _thumb_cache_paths(part_id)
-    except Exception:  # noqa: BLE001 — unwritable cache dir → behave as a miss
-        return None
-    try:
-        if img.exists():
-            with img.open("rb") as source:
-                data = source.read(4 * 1024 * 1024 + 1)
-            if len(data) <= 4 * 1024 * 1024 and _decodable_image(data):
-                return {"ok": True, "image_b64": base64.b64encode(data).decode()}
-            img.unlink(missing_ok=True)
-    except Exception:  # noqa: BLE001 — truncated / racing write → re-produce below
-        pass
-    try:
-        if (time.time() - miss.stat().st_mtime) < _thumb_miss_ttl_s():
-            return {"ok": False, "reason": _THUMB_MISS_REASON}
-        miss.unlink(missing_ok=True)   # expired — let the part be tried again
-    except (FileNotFoundError, NotADirectoryError):
-        pass
-    except Exception:  # noqa: BLE001 — a cache problem must never fail a thumbnail
-        pass
-    return None
-
-
-def _thumb_store(img_path, data: bytes) -> None:
-    """Publish a fresh image and clear any stale negative marker. Best-effort: a full or
-    read-only cache dir costs a re-fetch next time, never this call's result."""
-    try:
-        img_path.write_bytes(data)
-    except Exception:  # noqa: BLE001
-        return
-    try:
-        img_path.with_suffix(_THUMB_MISS_SUFFIX).unlink(missing_ok=True)
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def _thumb_mark_miss(miss_path) -> None:
-    """Touch the zero-byte negative marker. Without it a part with nothing to show
-    re-runs its 2-4 s render (or a doomed CDN fetch) on every single worker restart."""
-    try:
-        miss_path.touch(exist_ok=True)
-        os.utime(miss_path, None)
-    except Exception:  # noqa: BLE001
-        return
-    _thumb_trim_cache_dir()
-
-
-def _thumb_trim_cache_dir() -> None:
-    """Bound the cache dir: past _THUMB_DIR_MAX_ENTRIES entries drop the oldest 20% of
-    `.miss` markers — never a real image (those are expensive renders), and at most one
-    sweep per 10 minutes so a batch of misses cannot turn into a batch of scans."""
-    global _thumb_last_trim
-    now = time.monotonic()
-    with _thumb_trim_lock:
-        if _thumb_last_trim and (now - _thumb_last_trim) < _THUMB_TRIM_EVERY_S:
-            return
-        _thumb_last_trim = now
-
-    def _mtime(p) -> float:
-        try:
-            return p.stat().st_mtime
-        except OSError:   # vanished mid-sweep — sort it to the front, unlink is tolerant
-            return 0.0
-
-    try:
-        entries = list(_thumb_cache_dir().iterdir())
-        if len(entries) <= _THUMB_DIR_MAX_ENTRIES:
-            return
-        misses = [p for p in entries if p.name.endswith(_THUMB_MISS_SUFFIX)]
-        misses.sort(key=_mtime)
-        for p in misses[: max(1, len(misses) // 5)]:
-            p.unlink(missing_ok=True)
-    except Exception:  # noqa: BLE001 — a failed sweep must never fail a thumbnail
-        pass
-
-
-_BROWSER_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-               "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-
-
-_IMAGE_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a")
-
-
-def _looks_like_image(body: bytes) -> bool:
-    """True if these bytes open with a decodable raster magic. Used to salvage an image
-    that arrived attached to an HTTP ERROR status — see :func:`_http_image_get`."""
-    if not body:
-        return False
-    if body.startswith(_IMAGE_MAGIC):
-        return True
-    return body[:4] == b"RIFF" and body[8:12] == b"WEBP"
-
-
-def _decodable_image(body: bytes) -> bool:
-    if not _looks_like_image(body):
-        return False
-    try:
-        import io
-        from PIL import Image
-        with Image.open(io.BytesIO(body)) as image:
-            if image.width * image.height > 16_000_000:
-                return False
-            image.verify()
-        with Image.open(io.BytesIO(body)) as image:
-            image.load()
-        return True
-    except Exception:
-        return False
-
-
-def _http_image_get(url: str, headers: dict) -> tuple[bytes | None, int]:
-    """One bounded HTTP GET for an image → ``(bytes|None, http_status)``; status 0 means
-    the request never produced a response (DNS/TCP/TLS/timeout).
-
-    Successful and error responses alike require a verified, bounded raster image.
-    Some favicon providers return useful images with 404; those remain supported.
-    """
-    from services.net.safe_http import get
-    try:
-        response = get(url, headers=headers, max_bytes=4 * 1024 * 1024,
-                       idle_timeout=_thumb_fetch_timeout_s())
-        body = response.content
-        return (body if _decodable_image(body) else None), response.status_code
-    except Exception:  # noqa: BLE001 — never bypass policy with a browser retry
-        return None, 0
-
-
-def _gstatic_favicon_url(image_url: str) -> str:
-    """The gstatic faviconV2 equivalent of a Google **s2** favicon url, or ``""`` when
-    ``image_url`` is not one.
-
-    Measured: for domains s2 has no icon for it 404s with its generic globe, while
-    faviconV2 sometimes still serves the vendor's REAL icon at 200 (traceparts.com →
-    a 1075-byte JPEG). Worth exactly one extra request before settling for the globe."""
-    import urllib.parse
-
-    try:
-        pu = urllib.parse.urlparse(image_url)
-    except ValueError:
-        return ""
-    host = (pu.hostname or "").lower()
-    if not (host == "google.com" or host.endswith(".google.com")):
-        return ""
-    if not pu.path.startswith("/s2/favicons"):
-        return ""
-    q = urllib.parse.parse_qs(pu.query)
-    domain = (q.get("domain") or [""])[0].strip()
-    if not domain:
-        domain = urllib.parse.urlparse((q.get("url") or [""])[0].strip()).hostname or ""
-    if not domain:
-        return ""
-    size = (q.get("sz") or [""])[0].strip() or "64"
-    return ("https://t3.gstatic.com/faviconV2?client=SOCIAL&type=FAVICON"
-            "&fallback_opts=TYPE,SIZE,URL"
-            f"&url=https://{urllib.parse.quote(domain, safe='')}&size={size}")
-
-
-def _fetch_image_bytes(image_url: str, part_id: str) -> bytes | None:
-    """Fetch a product image or vendor favicon, defeating the common hotlink guard by
-    sending a browser User-Agent and a same-origin Referer derived from the part's product
-    URL (part_id = ``catalog:<site>::<product_url>``). Many vendor CDNs 403 a bare request
-    but serve the byte stream once a plausible Referer is present.
-
-    Three ordered attempts, at most two of them HTTP:
-      1. ``image_url`` itself. A 200 body wins outright; a 4xx/5xx body wins too **if it
-         is an image** (Google's s2 favicons 404 with a valid globe PNG — see
-         :func:`_http_image_get`).
-      2. For an s2 favicon url that 404'd, ONE retry against gstatic's faviconV2, which
-         measurably still has the real icon for some of those domains. A 200 there beats
-         the globe; otherwise the globe stands, because any icon beats a lettered tile.
-      Browser retries are intentionally excluded: their connections do not implement
-      the pinned public-destination policy.
-    """
-    import urllib.parse
-
-    referer = ""
-    if "::" in part_id:
-        prod_url = part_id.split("::", 1)[1]
-        if prod_url.startswith(("http://", "https://")):
-            referer = prod_url
-    if not referer:
-        pu = urllib.parse.urlparse(image_url)
-        if pu.scheme and pu.netloc:
-            referer = f"{pu.scheme}://{pu.netloc}/"
-
-    headers = {"User-Agent": _BROWSER_UA,
-               "Accept": "image/avif,image/webp,image/png,image/*,*/*;q=0.8"}
-    if referer:
-        headers["Referer"] = referer
-
-    data, status = _http_image_get(image_url, headers)
-    if data and status == 200:
-        return data
-    if status == 404:
-        alt_url = _gstatic_favicon_url(image_url)
-        if alt_url:   # exactly one alternate attempt — never a provider loop
-            alt_data, alt_status = _http_image_get(alt_url, headers)
-            if alt_data and alt_status == 200:
-                return alt_data          # the vendor's REAL icon
-            data = data or alt_data      # both generic: keep whichever globe we got
-    if data:
-        return data   # an image body that came with an error status — still an image
-    return None
-
-
-def _family_material(family: str) -> tuple[list[float], float, float]:
-    """(base color, metallic, roughness) for a realistic look. Most mechanical hardware is
-    steel; a few families read better as brass. (The thumbnail rasterizer currently shades on
-    base color only — metallic/roughness are stored for when it gains PBR.)"""
-    fam = family.lower()
-    if "brass" in fam or "bronze" in fam:
-        return ([0.80, 0.62, 0.28], 0.9, 0.35)
-    return ([0.66, 0.67, 0.69], 0.9, 0.38)   # steel grey
-
-
-def _fastener_thread_op(family: str, size: str) -> dict | None:
-    """A `thread` op for a threaded fastener family, else None. External for screws/bolts/studs/
-    rod (threads the shank = the smallest-radius cylinder, since heads are larger Ø), internal for
-    nuts (threads the sole bore cylinder). cut_thread degrades to the plain cylinder on any failure,
-    so a mis-resolved face never breaks the thumbnail."""
-    fam = family.lower()
-    external = fam in ("shcs", "bhcs", "fhcs", "hex_bolt", "socket_set_screw", "threaded_rod") \
-        or any(k in fam for k in ("screw", "bolt", "stud", "rod"))
-    internal = fam == "hex_nut" or "nut" in fam
-    if not (external or internal):
-        return None
-    face: dict = {"of": "face", "surf": "cylindrical"}
-    if not internal:
-        face["pick"] = "inner"   # smallest-radius cylinder = the shank (heads are larger Ø)
-    # add_feature keeps only type/params/refs (normalize_feature flattens both to top level for the
-    # thread handler): scalar options under params, the face selector under refs.target_face.
-    return {"op": "add_feature", "feature": {
-        "type": "thread",
-        "params": {"size": size, "mode": "cut",
-                   "style": "internal" if internal else "external"},
-        "refs": {"target_face": face},
-    }}
-
-
-def _resolve_core_family(part_id: str) -> tuple[str, str] | None:
-    """(family, size) for a parametric ``core_family`` part, else None. Fast path parses a
-    ``mech_family:<family>:<size>`` id directly; every OTHER local id (``fastener:ISO 4762:M8``,
-    ``bearing:…``, …) is resolved via its PartRecord's ``geometry_ref`` — those catalog parts carry
-    ``geometry_ref.kind == "core_family"`` with the same {family,size}, so they render identically.
-    This is why bolt/nut thumbnails must NOT be gated on the ``mech_family:`` prefix alone."""
-    if part_id.startswith("mech_family:"):
-        # family keys never contain a colon, so split on the FIRST colon (as CoreFamiliesAdapter).
-        sub = part_id[len("mech_family:"):].split(":", 1)
-        if len(sub) == 2 and sub[0] and sub[1]:
-            return sub[0], sub[1]
-        return None
-    if part_id.startswith(("catalog:", "vendorlogo:")):
-        return None   # live vendor product / a logo — not a local parametric part
-    try:
-        from services import parts as parts_hub  # noqa: PLC0415
-        rec = parts_hub.get(part_id)
-    except Exception:  # noqa: BLE001 — unknown / non-local id
-        return None
-    if not isinstance(rec, dict):
-        return None
-    gref = rec.get("geometry_ref") or {}
-    if gref.get("kind") != "core_family":
-        return None
-    fam, sz = gref.get("family"), gref.get("size")
-    return (str(fam), str(sz)) if fam and sz else None
-
-
-def _render_local_part_png(part_id: str, tmp_png) -> bytes | None:
-    """Render a standard parametric (``core_family``) library part's actual 3D CAD model to a PNG,
-    via the native core: ``parts_make`` (instantiate the family+size — the "template part") →
-    material + threads → ``doc_render_png`` (clean) → ``doc_close``. Returns the PNG bytes, or None
-    if the part isn't a core_family part / the core is unavailable / the render failed (caller falls
-    back to the 2D domain glyph). Uses the RAW core RPCs, never the ``make_standard_part`` MCP
-    wrapper — that wrapper publishes/autosaves and would clobber the user's live doc."""
-    fam_sz = _resolve_core_family(part_id)
-    if fam_sz is None:
-        return None
-    family, size = fam_sz
-    try:
-        import pathlib as _pathlib  # noqa: PLC0415
-        # MUST be the PACKAGE module (`services.mcp.core_bridge`), never a bare
-        # `import core_bridge` off a sys.path hack: a bare import gives the module an empty
-        # __package__, so core_bridge.call()'s own `from .daemon_bridge import DaemonError`
-        # (core_bridge.py:377, taken whenever daemon mode is on — the DEFAULT) raises
-        # "attempted relative import with no known parent package". That ImportError was
-        # swallowed by the render's broad `except` below and every uncached part fell back
-        # to the flat glyph — the "thumbnails only load for some parts" bug. Same defect the
-        # placer had (see test_x3_browser_catalog.py's regression guard).
-        from services.mcp import core_bridge as cb  # noqa: PLC0415
-    except Exception:  # noqa: BLE001 — core bridge unavailable → glyph fallback
-        return None
-    doc_id = ""
-    try:
-        r = cb.call("parts_make", {"family": family, "size": size})
-        if not isinstance(r, dict) or not r.get("ok"):
-            return None
-        doc_id = str(r.get("doc_id") or "")
-        if not doc_id:
-            return None
-        # Make the (cached) thumbnail look like the real part: a realistic material, and — for
-        # threaded fasteners — real modeled threads via the built-in thread tool. Best-effort and
-        # scoped to THIS render doc; placement is unchanged. A failure renders the plain part.
-        color, metal, rough = _family_material(family)
-        ops: list[dict] = [{"op": "set_appearance", "id": "b1",
-                            "color": color, "metallic": metal, "roughness": rough}]
-        thread_op = _fastener_thread_op(family, size)
-        if thread_op is not None:
-            ops.append(thread_op)
-        try:
-            cb.call("doc_apply_ops", {"doc_id": doc_id, "ops": ops})
-        except Exception:  # noqa: BLE001 — material/thread best-effort; render the plain part
-            pass
-        # annotate=False → clean product shot (no face labels / triad / orientation tint).
-        rr = cb.call("doc_render_png",
-                     {"doc_id": doc_id, "out_path": str(tmp_png), "annotate": False})
-        if not isinstance(rr, dict) or not rr.get("ok"):
-            return None
-        p = _pathlib.Path(str(tmp_png))
-        data = p.read_bytes() if p.exists() else None
-        try:
-            p.unlink(missing_ok=True)
-        except Exception:  # noqa: BLE001
-            pass
-        return data or None
-    except Exception:  # noqa: BLE001 — render failed → glyph fallback
-        return None
-    finally:
-        if doc_id:
-            try:
-                cb.call("doc_close", {"doc_id": doc_id})
-            except Exception:  # noqa: BLE001
-                pass
-
-
-def _thumb_produce(part_id: str, image_url: str, deadline: float | None = None) -> dict:
-    """The CACHE-MISS half of one preview: vendor image first, else a render of the part's
-    own 3D model. Writes the positive cache entry on success and the negative marker on a
-    definitive failure. ``deadline`` is a ``time.monotonic()`` stamp bounding how long this
-    may block for the serialised render slot; None blocks (the singular RPC's behaviour).
-
-    Callers must have consulted :func:`_thumb_cached` first."""
-    img_path, miss_path = _thumb_cache_paths(part_id)
-    if image_url.startswith(("http://", "https://")):
-        data = _fetch_image_bytes(image_url, part_id)
-        if data:
-            _thumb_store(img_path, data)
-            return {"ok": True, "image_b64": base64.b64encode(data).decode()}
-    # No usable vendor image → render the 3D model of any local parametric (core_family)
-    # part: mech_family:/fastener:/bearing:/… all resolve through _render_local_part_png.
-    # Resolve the family FIRST so that only a genuine render pays for the global render
-    # lock — a catalog: id resolves to None in microseconds and must never queue behind
-    # someone else's 3 s engine round-trip.
-    try:
-        renderable = _resolve_core_family(part_id) is not None
-    except Exception:  # noqa: BLE001 — unknown id → not a render, just answer below
-        renderable = False
-    if renderable:
-        wait = -1.0 if deadline is None else max(0.0, deadline - time.monotonic())
-        if not _THUMB_RENDER_LOCK.acquire(timeout=wait):
-            # Out of budget waiting our turn. NOT cached as a miss: this is a scheduling
-            # answer, not a statement about the part.
-            return {"ok": False, "reason": "timeout"}
-        try:
-            data = _render_local_part_png(part_id, str(img_path) + ".png")
-        finally:
-            _THUMB_RENDER_LOCK.release()
-    else:
-        # Still routed through the renderer: it answers None immediately for a
-        # non-core_family id, and ONE call site keeps the two branches honest.
-        data = _render_local_part_png(part_id, str(img_path) + ".png")
-    if data:
-        _thumb_store(img_path, data)
-        return {"ok": True, "image_b64": base64.b64encode(data).decode()}
-    _thumb_mark_miss(miss_path)
-    return {"ok": False, "reason": "no preview available"}
-
-
-def _thumb_resolve_one(part_id: str, image_url: str, deadline: float | None = None) -> dict:
-    """THE single-entry preview implementation, shared by ``parts_thumbnail`` (singular)
-    and ``parts_thumbnails`` (batch) so the two can never drift: disk cache — positive
-    image or fresh negative marker — and only then the produce path."""
-    if not part_id:
-        return {"ok": False, "reason": "item_id required"}
-    hit = _thumb_cached(part_id)
-    if hit is not None:
-        return hit
-    return _thumb_produce(part_id, image_url, deadline)
-
-
-def _parts_thumbnail(params: dict, _emit: Callable) -> dict:
-    """Best-effort PNG/JPEG preview for a part, base64-encoded, cached on disk.
-
-    Sources: (a) disk cache, (b) a rendered 3D CAD-model screenshot for standard
-    ``mech_family`` library parts (parts_make → doc_render_png, cached by part_id),
-    (c) a vendor image_url passed by the GUI. The GUI falls back to a domain glyph
-    when this returns ok:false.
-
-    Kept as the GUI's fallback for workers that predate ``parts_thumbnails``; it is a thin
-    wrapper over :func:`_thumb_resolve_one`, which the batch method also uses.
-    """
-    try:
-        p = params or {}
-        return _thumb_resolve_one(str(p.get("item_id", "")).strip(),
-                                  str(p.get("image_url", "")).strip())
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "reason": f"parts_thumbnail failed: {exc}"}
+def _parts_thumbnail(params: dict, emit: Callable) -> dict:
+    """Return one preview using the same resolver and encoding as the batch RPC."""
+    result = _parts_thumbnails({"items": [params or {}]}, emit)
+    if not result.get("ok"):
+        return result
+    return result["images"][0]
 
 
 def _parts_thumbnails(params: dict, _emit: Callable) -> dict:
-    """BATCH previews — ``{"items":[{item_id,image_url},…]}`` → ``{"ok":true, "images":
-    [{item_id, ok, image_b64, reason},…]}``, exactly one entry per input, in input order.
+    """Resolve ordered part previews; vendor footer icons use a separate path."""
+    from services.parts.thumbs import batch_budget_s, resolve_previews, resolve_vendor_logos
 
-    Why it exists: the GUI used to issue one ``parts_thumbnail`` per card down a single
-    FIFO dispatch thread, so a grid of thirty uncached products fetched thirty images
-    strictly one after another and the page filled in over half a minute. Here the genuine
-    misses fan out across a per-call pool, and every disk-cache hit is answered
-    synchronously before the pool is even built — a warm grid comes back in milliseconds
-    having created no threads at all.
-
-    The envelope stays ok:true whenever the CALL worked; a per-item failure is reported in
-    that item's own ok/reason so one dead CDN cannot blank the whole page.
-    """
     try:
-        raw = (params or {}).get("items") or []
+        raw = (params or {}).get("items", [])
         if not isinstance(raw, list):
             return {"ok": False, "reason": "items must be a list"}
-        # Excess is IGNORED rather than rejected: a GUI that over-asks should still get its
-        # first screenful instead of an error card on every tile.
-        reqs: list[tuple[str, str]] = []
-        for ent in raw[:_THUMB_MAX_BATCH]:
-            if isinstance(ent, dict):
-                reqs.append((str(ent.get("item_id", "")).strip(),
-                             str(ent.get("image_url", "")).strip()))
-            else:
-                reqs.append(("", ""))   # keep the 1:1 index mapping the GUI relies on
-        results: list[dict | None] = [None] * len(reqs)
-
-        # Pass 1 — the free answers. A disk hit (image, or a fresh negative marker) costs
-        # two stat()s, so a batch that is 90% cached must not spend a millisecond of it
-        # waiting behind a pool slot occupied by a slow CDN.
-        pending: list[int] = []
-        for i, (pid, _url) in enumerate(reqs):
-            if not pid:
-                results[i] = {"ok": False, "reason": "item_id required"}
+        parts, logos = [], []
+        for index, item in enumerate(raw):
+            entry = item if isinstance(item, dict) else {}
+            item_id = str(entry.get("item_id") or "").strip()
+            (logos if item_id.startswith("vendorlogo:") else parts).append((index, entry))
+        deadline = time.monotonic() + batch_budget_s()
+        results = [None] * len(raw)
+        for entries, resolver in ((parts, resolve_previews), (logos, resolve_vendor_logos)):
+            if not entries:
                 continue
-            hit = _thumb_cached(pid)
-            if hit is not None:
-                results[i] = hit
-            else:
-                pending.append(i)
-
-        # Pass 2 — the genuine misses, fanned out. The pool is created PER CALL and shut
-        # down in the finally: no module-level pool outliving the worker, and no unbounded
-        # thread creation (width is clamped 1..16 and never exceeds the miss count).
-        if pending:
-            budget = _thumb_batch_budget_s()
-            deadline = time.monotonic() + budget
-            ex = ThreadPoolExecutor(max_workers=max(1, min(_thumb_workers(), len(pending))),
-                                    thread_name_prefix="parts-thumb")
-            try:
-                futs = {}
-                for i in pending:
-                    context = copy_context()
-                    future = ex.submit(context.run, _thumb_produce,
-                                       reqs[i][0], reqs[i][1], deadline)
-                    with _live_lock:
-                        _thumb_futures[future] = owner_key()
-                    future.add_done_callback(_thumbnail_finished)
-                    futs[future] = i
-                try:
-                    for fut in as_completed(futs, timeout=budget):
-                        i = futs[fut]
-                        try:
-                            results[i] = fut.result()
-                        except Exception as exc:  # noqa: BLE001 — one bad item, not a bad call
-                            results[i] = {"ok": False, "reason": f"thumbnail failed: {exc}"}
-                except _FutureTimeout:
-                    pass   # anything still None below is reported as reason:"timeout"
-            finally:
-                # wait=False + cancel_futures: queued work is dropped and anything still
-                # running is ABANDONED rather than joined, so this call can never outlast
-                # its wall budget. A straggler is harmless — it is itself bounded (a short
-                # urllib timeout, then the CEF download), it only writes into the disk
-                # cache, and the next request for that id is then a hit.
-                ex.shutdown(wait=False, cancel_futures=True)
-
-        images: list[dict] = []
-        for i, (pid, _url) in enumerate(reqs):
-            r = results[i] or {"ok": False, "reason": "timeout"}
-            images.append({"item_id": pid,
-                           "ok": bool(r.get("ok")),
-                           "image_b64": str(r.get("image_b64") or ""),
-                           "reason": str(r.get("reason") or "")})
-        return {"ok": True, "images": images}
+            images = resolver([item for _, item in entries],
+                              budget_s=max(0.0, deadline - time.monotonic()))
+            for (index, _), image in zip(entries, images):
+                results[index] = {"item_id": image["item_id"], "ok": image["ok"],
+                                  "image_b64": base64.b64encode(image["data"]).decode("ascii")
+                                  if image["data"] is not None else "",
+                                  "mime": image["mime"], "provenance": image["provenance"],
+                                  "reason": image["reason"]}
+        return {"ok": True, "images": results}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"parts_thumbnails failed: {exc}"}
 
@@ -2159,6 +1725,7 @@ GUI_WORKER_METHODS: dict[str, Callable] = {
     "vendors_health_check":  _vendors_health_check,
     "vendors_health_status": _vendors_health_status,
     "parts_download":        _parts_download,
+    "parts_download_select": _parts_download_select,
     "parts_queue_status":    _parts_queue_status,
     "parts_insert_into_doc": _parts_insert_into_doc,
     "parts_prepare_for_assembly": _parts_prepare_for_assembly,

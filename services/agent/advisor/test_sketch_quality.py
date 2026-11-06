@@ -59,6 +59,16 @@ def test_default_adapter_checks_real_feature_ids_and_later_open_profile(monkeypa
     assert findings[0].severity == "blocker"
 
 
+@pytest.mark.parametrize("usage", ["open_path", "unknown"])
+def test_open_path_or_unknown_usage_does_not_block(usage):
+    def rpc(method, **params):
+        if method == "doc_tree":
+            return {"tree": {"features": [_sketch("f1")]}}
+        return _health(closure={"closed_chains_ok": False, "open_endpoints": ["e1.end"],
+                                "usage": usage})
+    assert adapters._check_sketch("d1", rpc, stages.CHECK_OPEN_PROFILE) == []
+
+
 def test_adapter_keeps_design_intent_and_real_free_variables():
     features = [_sketch("f1"), _sketch("f7", pinned=True), _sketch("f9")]
     features[2]["params"]["constraints"] = []

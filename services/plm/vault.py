@@ -304,7 +304,7 @@ class Vault:
         """Open a project folder, silently creating the vault if absent.
 
         Zero-config: no prompt, no setup, no visible files beyond ``.aicadvault/``.
-        On first open, existing container files in the folder are registered.
+        On first open, existing versioned design files in the folder are registered.
         """
         pdir = Path(project_dir)
         if not pdir.is_dir():
@@ -1233,7 +1233,7 @@ class Vault:
     # -- internals ---------------------------------------------------------
 
     def _seed_initial_project(self) -> None:
-        """On first open, register existing containers and cut the seed entry."""
+        """On first open, register existing design files and cut the seed entry."""
         m = manifest.new_manifest(self.project_dir.name, _now_iso())
         containers = self._project_containers()
         if not containers:
@@ -1250,14 +1250,12 @@ class Vault:
         self._bind.commit_tree(files, emeta)
 
     def _project_containers(self) -> list[Path]:
-        """Every versioned container file under the project root, path-sorted.
+        """Every automatically versioned design file under the project root, path-sorted.
 
         Dot-prefixed directories (``.aicadvault``, ``.git``, ``.plm``, …) are
         pruned at walk time — the same policy as :func:`_tree_working_stamp`.
-        The old ``rglob('*')`` enumerated *and stat'ed* every object in the
-        vault's own store before throwing the results away, on every save.
-        The result set is unchanged: dot-prefixed names, at any depth, never
-        qualified.
+        KiCad boards and schematics are discovered alongside design containers
+        and stored as ordinary file snapshots.
         """
         out: list[Path] = []
         for dirpath, dirnames, filenames in os.walk(self.project_dir):
@@ -1265,7 +1263,8 @@ class Vault:
             for fn in filenames:
                 if fn.startswith("."):
                     continue
-                if not any(fn.endswith(s) for s in _CONTAINER_SUFFIXES):
+                if not (any(fn.endswith(s) for s in _CONTAINER_SUFFIXES)
+                        or doctypes.is_kicad_file(fn)):
                     continue
                 rel = (Path(dirpath) / fn).relative_to(self.project_dir).as_posix()
                 generic_snapshot.contained_path(self.project_dir, rel)
@@ -1309,7 +1308,7 @@ class Vault:
         head = self._bind.head_commit()
         head_tree = self._bind.read_tree(head) if head else {}
         try:
-            container_paths = {
+            design_paths = {
                 path.relative_to(self.project_dir).as_posix(): path
                 for path in self._project_containers()
             }
@@ -1318,6 +1317,15 @@ class Vault:
                 "snapshot_failed",
                 f"could not scan tracked project items: {exc}",
             ) from exc
+        # KiCad files are the authoritative source, kept byte-for-byte by the
+        # existing single-file snapshot path, not exploded as ZIP containers.
+        container_paths = {}
+        for rel, path in design_paths.items():
+            if doctypes.is_kicad_file(rel):
+                if manifest.find_item_by_path(m, rel) is None:
+                    manifest.register_item(m, kind="ecad", path=rel, doc_type="kicad")
+            else:
+                container_paths[rel] = path
         # Discovery is best-effort for new files, but manifest-owned containers
         # are read by their exact path so permission/stat failures cannot make
         # them disappear from a replacement tree.
@@ -1727,6 +1735,10 @@ class Vault:
         for path in self._project_containers():
             rel = path.relative_to(self.project_dir).as_posix()
             if rel in registered:
+                continue
+            if doctypes.is_kicad_file(rel):
+                if (not kind or kind == "ecad") and (not doc_type or doc_type == "kicad"):
+                    untracked.append({"path": rel, "change": "U"})
                 continue
             stamp = _container_stamp(path)
             key = f"{root_key}\x00{rel}"

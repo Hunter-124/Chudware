@@ -2,7 +2,7 @@
 
 Monkeypatches vision backends (research_ingest seam pattern) to prove:
 
-  1. Sparse registration falls back when weak; only OpenMVS produces the CAD mesh.
+  1. Weak sparse registration attempts feed-forward; shared SfM feeds the dense and splat paths.
   2. n_fit calls segment_fit(mesh_path, session_id=…) and persists fits.json.
   3. Deterministic parametric reconstruction publishes its document to the session.
   4. Unavailable backends degrade honestly without synthetic success.
@@ -53,6 +53,13 @@ def session_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     s = rt._make_session(sid, "pipeline test", None)
     s["artifacts"]["images"] = 3
     s["artifacts"]["mesh_path"] = str(mesh)
+    s["artifacts"]["mesh_units"] = "mm"
+    s["artifacts"]["mesh_transform_applied"] = True
+    from services.vision.recon_transform import ReconTransform
+    transform = ReconTransform.identity()
+    transform.confirmed = True
+    s["recon_transform"] = transform.to_json()
+    s["scale"].update(method="known_dim", mm_per_unit=1.0, confirmed=True)
     s["stages"]["capture"] = "done"
     rt._save_session(s)
     return sid, root, mesh
@@ -87,6 +94,17 @@ def _install_backend(
         sparse_dir.mkdir(parents=True, exist_ok=True)
         return {"ok": True, "backend": "vggt", "n_images": len(image_paths),
                 "sparse_dir": str(sparse_dir)}
+
+    def prepare_dataset(sparse_dir, image_dir, dataset_dir, *, source_image_map=None):
+        root = Path(dataset_dir)
+        (root / "sparse").mkdir(parents=True)
+        (root / "images").mkdir()
+        return {"ok": True, "dataset_dir": str(root), "sparse_dir": str(root / "sparse"),
+                "images_dir": str(root / "images"), "image_name_map": source_image_map,
+                "registered": registered}
+
+    def train_splat_from_dataset(dataset_dir, out_dir, **kw):
+        return {"ok": False, "reason": "brush_unavailable"}
 
     def run_openmvs(sparse_dir, session_dir, **kw):
         calls["openmvs"].append({"sparse_dir": sparse_dir, "session_dir": session_dir})
@@ -133,10 +151,14 @@ def _install_backend(
     def reverse_engineer(source, *, name=None, hints=None):
         calls["re"].append({"source": source, "name": name, "hints": hints})
         return {"ok": True, "doc_id": "doc_rebuilt_1", "ref_doc_id": "doc_ref_1",
-                "match_pct": 92.5, "features": [], "rejected": [], "candidates": [], "notes": []}
+                "match_pct": 92.5, "features": [{"id": "feature1", "type": "extrude"}],
+                "rejected": [], "candidates": [], "notes": []}
 
     for target, fn in (
         ("services.vision.colmap_pipeline.run_sparse", run_sparse),
+        ("services.vision.colmap_pipeline.prepare_dataset", prepare_dataset),
+        ("services.vision.colmap_pipeline.read_model", lambda path: ({}, {}, {1: object()})),
+        ("services.vision.gaussian_pipeline.train_splat_from_dataset", train_splat_from_dataset),
         ("services.vision.ffwd_sfm.run_ffwd_sfm", run_ffwd_sfm),
         ("services.vision.dense_backends.run_openmvs", run_openmvs),
         ("services.vision.mesh_cleanup.cleanup_mesh", cleanup_mesh),
@@ -176,9 +198,12 @@ class TestReconstructNode:
         assert not calls["ffwd"]
 
         s2 = rt._load_session(sid)
-        assert s2["artifacts"]["mesh_path"] == str(root / "mesh" / "cleaned.ply")
+        assert s2["artifacts"]["mesh_path"] == calls["cleanup"][0]["out_path"]
+        assert Path(s2["artifacts"]["mesh_path"]).parent == root / "mesh"
+        assert Path(s2["artifacts"]["mesh_path"]).name.startswith("cleaned-")
         assert Path(s2["artifacts"]["mesh_path"]).is_file()
-        assert s2["artifacts"]["sparse_dir"] == str(root / "sparse")
+        assert s2["artifacts"]["sparse_dir"] == s2["sfm_dataset"]["sparse_dir"]
+        assert calls["openmvs"][0]["sparse_dir"] == s2["sfm_dataset"]["dataset_dir"]
         assert s2["stages"]["reconstruct"] == "done"
 
     def test_weak_registration_falls_back_to_ffwd(self, session_env, monkeypatch):
@@ -211,9 +236,9 @@ class TestReconstructNode:
         assert res.result["reason"] == "backend_not_provisioned"
         assert calls["ffwd"]
         assert not calls["openmvs"]
-        assert rt._load_session(sid)["artifacts"]["mesh_path"] is None
+        assert not rt._load_session(sid)["artifacts"].get("mesh_path")
 
-    def test_splat_capability_cannot_complete_cad_mesh_reconstruction(self, session_env, monkeypatch):
+    def test_splat_without_training_or_openmvs_cannot_produce_mesh(self, session_env, monkeypatch):
         sid, root, _mesh = session_env
         session = rt._load_session(sid)
         session["artifacts"]["mesh_path"] = None
@@ -229,11 +254,11 @@ class TestReconstructNode:
 
         assert result.success is False
         persisted = rt._load_session(sid)
-        assert persisted["artifacts"]["sparse_dir"] == str(root / "sparse")
-        assert persisted["artifacts"]["mesh_path"] is None
+        assert persisted["artifacts"]["sparse_dir"] == persisted["sfm_dataset"]["sparse_dir"]
+        assert not persisted["artifacts"].get("mesh_path")
         assert persisted["stages"]["reconstruct"] != "done"
         assert not calls["cleanup"]
-        assert "splat" not in progress
+        assert "splat" in progress
 
 
 class TestFitNode:
@@ -276,8 +301,9 @@ class TestParametricNode:
                       "params_mm": {"radius": 8, "height": 12,
                                     "axis": [0, 0, 1], "origin": [0, 0, 0]}}],
         }
-        (root / "fits.json").write_text(json.dumps(fits))
         s = rt._load_session(sid)
+        fits["provenance"] = rc._fit_provenance(s)
+        (root / "fits.json").write_text(json.dumps(fits))
         s["artifacts"]["fits_path"] = str(root / "fits.json")
         rt._save_session(s)
 
@@ -287,6 +313,40 @@ class TestParametricNode:
 
         s2 = rt._load_session(sid)
         assert s2["artifacts"]["doc_id"] == "doc_rebuilt_1"
+
+
+    def test_empty_mission_rebuild_persists_failure(self, session_env, monkeypatch):
+        sid, _, _ = session_env
+        session = rt._load_session(sid)
+        session["artifacts"]["doc_id"] = "previous"
+        session["result"] = {"state": "built", "match_pct": 99.0, "scored": True}
+        rt._save_session(session)
+        monkeypatch.setattr(rc, "_call_reverse_engineer", lambda *args, **kwargs: {
+            "ok": False, "reason": "no_features_rebuilt", "doc_id": None,
+            "summary": "nothing rebuilt", "recognition": {"unclaimed_count": 42},
+            "match_pct": None, "features": []})
+        result = rt._make_pipeline_agent_fn(sid)("", {"node_id": "n_parametric"})
+        assert not result.success and result.result["reason"] == "no_features_rebuilt"
+        saved = rt._load_session(sid)
+        assert saved["result"]["state"] == "failed"
+        assert not saved["result"]["scored"] and saved["result"]["match_pct"] is None
+        assert saved["result"]["summary"] == "nothing rebuilt"
+        assert not saved["artifacts"].get("doc_id")
+
+
+    def test_ml_step_with_empty_rebuild_is_not_built(self, session_env, monkeypatch):
+        sid, _, _ = session_env
+        _install_backend(monkeypatch)
+        monkeypatch.setattr(rc, "_call_reverse_engineer", lambda *args, **kwargs: {
+            "ok": False, "reason": "no_features_rebuilt", "features": [],
+            "summary": "nothing rebuilt", "recognition": {"unclaimed_count": 7}})
+        result = rt._make_pipeline_agent_fn(sid, strategy="ml")("", {"node_id": "n_parametric"})
+        assert not result.success and result.result["reason"] == "no_features_rebuilt"
+        assert result.result["recognition"]["unclaimed_count"] == 7
+        saved = rt._load_session(sid)
+        assert saved["result"]["state"] == "failed" and not saved["result"]["scored"]
+        assert not saved["artifacts"].get("doc_id")
+        assert not saved["artifacts"].get("step_path")
 
 
     def test_unavailable_ml_does_not_publish_a_document(self, session_env, monkeypatch):

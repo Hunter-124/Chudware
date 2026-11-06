@@ -17,6 +17,7 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
@@ -98,6 +99,11 @@ public:
     // Which exclusive result window is open ("measure","check",...; empty = none). Mass and
     // Section use independent flags (massOpen_/sectionOpen_) so they can coexist.
     const std::string& openWindowKind() const { return openWindow_; }
+    const nlohmann::json& analysisResult() const { return result_; }
+    const std::string& analysisError() const {
+        return errorText_.empty() ? thicknessProfileError_ : errorText_;
+    }
+    bool analysisPending() const { return pending_ || thicknessProfilePending_ || historyRefreshPending_; }
 
     // Viewport overlay batches (world-space). Consumed by viewport_panel after sim overlays.
     // Composes measure segs + mass COM/axis segs so both can coexist.
@@ -122,6 +128,7 @@ public:
 
 private:
     void runEval(AppState& st, const std::string& method, const nlohmann::json& extra);
+    void refreshModelHistoryDocument(AppState& st, const std::string& docId, int minimumRevision);
     void runMassEval(AppState& st, const nlohmann::json& extra);
     void runFieldEval(AppState& st, const std::string& method, const nlohmann::json& extra,
                       const std::string& legendTitle, const std::string& units);
@@ -148,11 +155,17 @@ private:
     void runGeometryAnalysis(AppState& st);
     void drawGeometryAnalysis(AppState& st);
     void drawCheck(AppState& st);
+    void drawModelHistory(AppState& st);
+    void drawModelHistoryFooter(AppState& st);
+    std::string modelHistoryBlocker(const AppState& st, bool refine) const;
+    void applyModelHistory(AppState& st, bool refine);
     void drawInterference(AppState& st);
     void drawSymmetry(AppState& st);
     void drawZebra(AppState& st);
     void drawFieldTool(AppState& st, const std::string& kind);   // draft / thickness / curvature
     void runFieldTool(AppState& st, const std::string& kind);    // the footer's Update action
+    void loadThicknessProcesses(AppState& st);
+    void loadThicknessProfile(AppState& st, bool runWhenReady);
     void drawExclusiveFooter(AppState& st, const std::string& kind);
 
     // Exclusive tools (measure/check/interference/draft/thickness/curvature/zebra/symmetry).
@@ -165,6 +178,16 @@ private:
     int  gen_ = 0;
     std::string evalDocId_;
     int evalDocRevision_ = -1;
+    bool historyMutationPending_ = false;
+    bool historyRefreshPending_ = false;
+    bool historyRefreshFailed_ = false;
+    uint64_t historyRefreshGeneration_ = 0;
+    std::string historyRefreshDocId_;
+    int historyRefreshMinimumRevision_ = -1;
+    bool historyStaleRejection_ = false;
+    std::string historyNotice_;
+    bool historyNoticeIsError_ = false;
+    int historyNoticeRevision_ = -1;
 
     // Independent Mass Properties window + its own result slot (survives exclusive tools).
     bool massOpen_ = false;
@@ -233,7 +256,13 @@ private:
     int   draftPull_ = 2;           // 0=X 1=Y 2=Z 3=-Z
     float draftAngleDeg_ = 1.0f;
     int   curvatureKind_ = 0;       // 0=mean 1=gaussian 2=max 3=min
-    float thicknessRes_ = 0.5f;     // optional resolution hint (mm)
+    float thicknessRes_ = 0.5f;     // surface measurement spacing (mm)
+    float thicknessMinWall_ = 1.0f;
+    std::vector<std::string> thicknessProcesses_;
+    int thicknessProcess_ = 0;
+    int thicknessProfileGen_ = 0;
+    bool thicknessProfilePending_ = false;
+    std::string thicknessProfileError_;
 
     // Interference member subset; inventory comes only from an unfiltered result.
     std::vector<std::string> interferencePartNames_;

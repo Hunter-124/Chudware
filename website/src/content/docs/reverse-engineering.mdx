@@ -6,15 +6,15 @@ order: 95
 ---
 ## Choose the session from the evidence
 
-Open the Reverse Eng workspace and start a session. Use **Add Photos**, **Add Video**, or **Webcam** for a physical part; import an existing scan mesh when a structured-light or laser scan already exists. Use **Datasheet** for a catalog document, or **From Library** when the part already has a library identity.
+Open the Reverse Eng workspace and start a session; the rail lists the sessions of the current working folder. Pick the intake: **Scan** for a physical part (**Add Photos**, **Add Video**, **Webcam**, or an existing scan mesh), or **From reference** for a part number, product name, URL, datasheet, or library part.
 
-The scan lane records **Source → Scale → Reconstruct → Model → Review → Deliver**. Datasheet and researched catalog lanes skip Scale and Reconstruct because their dimensions come from documents rather than image geometry. A library record follows the lane supported by its available evidence.
+From reference first searches CAD libraries such as GrabCAD, TraceParts, Printables, 3D ContentCentral, and McMaster for an existing model; **Use this model** downloads it into the project's `reference/` folder and opens it. Only when nothing fits do you build a model from specs and datasheets. The scan lane records **Source → Scale → Reconstruct → Model → Review → Deliver**; the reference lane skips Scale and Reconstruct because its dimensions come from documents rather than image geometry.
 
 ## Capture enough of the part
 
 For photos or video, keep autofocus and exposure fixed, cover the full orbit at more than one elevation, and retain overlap between adjacent views. Read the coverage report before committing to the full reconstruction: it states whether coverage was measured from camera poses or estimated from image count, and flags frames whose blur was measured.
 
-Before starting reconstruction, check the workspace capability panel. Sparse, dense, splat, and single-photo paths depend on services that may not be present in every installation; the panel reports what is available instead of hiding a missing backend behind a failed job.
+Before starting reconstruction, check the Summary column. When a sparse, dense, or splat backend is missing it lists the missing tool and the setting that installs it, instead of hiding a missing backend behind a failed job.
 
 ## Establish and confirm scale
 
@@ -34,8 +34,8 @@ Read each dimension's source and honesty tier. Photo-derived values are labeled 
 
 Inspect geometric deviation between the rebuilt result and the reference. Return to the model for the worst regions, adjust the responsible features, and compare again. Keep any unexplained region or mesh fallback visible in the handoff.
 
-## Deliver with provenance
+## Deliver with its build record
 
-The session provenance timeline records source ingestion, scale, reconstruction, primitive fitting, model build, and attachment; the dimension ledger preserves confirmed review values. Use **Add to Parts** to connect the reviewed geometry to its Parts identity. Use **Export** to write the complete session bundle, including its manifest and accumulated artifacts, so the final geometry does not leave its evidence behind.
+The session's build record captures source ingestion, scale, reconstruction, primitive fitting, model build, and attachment; the dimension ledger preserves confirmed review values. Use **Add to Parts** to connect the reviewed geometry to its Parts identity. Use **Export** to write the complete session bundle, including its manifest and accumulated artifacts, so the final geometry does not leave its evidence behind.
 
 For the capability overview and its limits, see [Reverse engineering](/product/reverse-engineering/). For revision history and project artifacts, continue to [PLM and revisions](/docs/plm/).

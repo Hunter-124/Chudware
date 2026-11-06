@@ -1,37 +1,13 @@
-"""services/browser/adapters/mouser.py — Mouser Electronics source adapter (Parts Library V2).
+"""Mouser's official Search API, with a public JSON-LD website fallback.
 
-Mouser (mouser.com) is a broadline electronics distributor with datasheets,
-price/stock, and ECAD/3D models (via SnapMagic/Ultra Librarian follows). The
-parts taxonomy routes ``electronics.thermal`` (and, more broadly, electronics
-sourcing) to this adapter, so it must exist as a registered adapter — the
-``test_every_routed_site_is_a_registered_adapter`` guard fails otherwise.
-
-LIVE-VERIFIED 2026-07-11 (CEF headless, ``settle_ms=10000``):
-
-* The real catalog keyword search — ``/c/?q=heatsink`` — is Akamai bot-walled.
-  An anonymous headless fetch returns HTTP 200 with
-  ``<title>Access to this page has been denied.</title>`` +
-  ``<h1>Access Denied</h1>`` and an ``m-captcha`` div ("we believe you are using
-  automation tools to browse the website"). This is the same Akamai edge layer
-  the retail wave hits (lowes/tractorsupply), so the sanctioned, honest behavior
-  is to degrade to ``login_required`` — NEVER solve or bypass the challenge, and
-  never silently parse the block shell to an empty result list ("no hits parsed").
-* The alternate ``/ProductSearch/Refine?Keyword=...`` endpoint returns a ~190 KB
-  JS chrome shell (mini-cart table headers, no server-rendered product rows —
-  results are loaded via XHR after the page's JS runs), so it yields no parseable
-  hits from a static fetch either.
-
-This adapter therefore reuses the shared :class:`~._retail.RetailAdapter` flow:
-fetch → challenge/login-wall degradation (to ``login_required``) → JSON-LD parse
-for the day the catalog is reachable under the user's own session. ``acquire``
-inherits the datasheet-only behavior (JSON-LD price/stock + the manufacturer
-datasheet PDF); no CAD/model-download path is attempted here (out of scope —
-the SnapMagic/Ultra Librarian ECAD follow is a separate pipeline).
+The anonymous website has returned an Akamai Access Denied wall; it is not a
+customer sign-in page. Datasheets are documents, not CAD models.
 """
 from __future__ import annotations
 
-from . import register
-from ._retail import RetailAdapter, parse_jsonld_products
+from . import fail, register
+from . import _vendor_api
+from ._retail import RetailAdapter
 
 SITE = "mouser"
 BASE_URL = "https://www.mouser.com"
@@ -49,11 +25,9 @@ LICENSE_NOTE = (
     "See contracts/license_debt.md."
 )
 
-# Mouser has individual customer accounts (a real login exists), so a sign-in wall
-# degrades to login_required — same as the challenge wall below.
-_LOGIN_WALL_MARKERS = ("Sign In", "Log In", 'id="signInName"')
-# Live-verified 2026-07-11: Akamai "Access Denied" block shell served with HTTP 200
-# for anonymous headless catalog fetches. Treated exactly like a login wall.
+# Actual login forms only; a navigation link is not a sign-in wall.
+_LOGIN_WALL_MARKERS = ('id="signInName"', 'class="login-form"')
+# The Akamai Access Denied shell is a block, not a login request.
 _CHALLENGE_MARKERS = (
     "Access to this page has been denied",
     "Access Denied",
@@ -63,24 +37,34 @@ _CHALLENGE_MARKERS = (
 
 class MouserAdapter(RetailAdapter):
     key = SITE
+    hosts = ("mouser.com",)
+    result_kinds = ("product",)
+    cad_acquisition = False
+    login_required = False
+    api = True
     base_url = BASE_URL
     search_url_tmpl = SEARCH_URL_TMPL
     license_note = LICENSE_NOTE
     login_wall_markers = _LOGIN_WALL_MARKERS
     challenge_markers = _CHALLENGE_MARKERS
 
-    def parse_search(self, content: str) -> list[dict]:
-        """Parse Mouser catalog results from JSON-LD ``Product`` records.
+    def search(self, query: str) -> list[dict]:
+        creds = _vendor_api.credentials("mouser")
+        if creds:
+            return _vendor_api.search(SITE, query, creds)
+        return super().search(query)
 
-        Mouser (when reachable under the user's own session) ships JSON-LD for
-        SEO — the same stable, sanctioned machine-readable layer the retail base
-        parses. A speculative CSS-class regex is deliberately avoided (the
-        digikey_web "no hits parsed" lesson). An empty list is honest: no
-        products found, not a fabricated hit. The Akamai challenge is caught in
-        :meth:`RetailAdapter.search` before this is ever reached.
-        """
-        return [self._hit_from_product(p) for p in parse_jsonld_products(content)
-                if p.get("title") and p.get("url")]
+    def acquire(self, result: dict) -> dict:
+        if result.get("kind") not in (None, "product"):
+            return fail(SITE, "acquire", "unsupported", "Select a specific product first.",
+                        url=result.get("url"))
+        if result.get("datasheet_url") or result.get("datasheet"):
+            return _vendor_api.acquire_datasheet(SITE, result, LICENSE_NOTE)
+        outcome = super().acquire(result)
+        if outcome.get("ok") and not outcome.get("artifact_path"):
+            return fail(SITE, "acquire", "unsupported", "No product datasheet was found.",
+                        url=result.get("url"))
+        return outcome
 
 
 ADAPTER = register(MouserAdapter())

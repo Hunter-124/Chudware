@@ -76,6 +76,10 @@ namespace {
 
 constexpr const char* kContainer = "aicad.step+/1";
 constexpr const char* kAppVersion = "Chudware/M1";
+// Serialize the final stamp check and rename against every in-process native
+// save. Archive construction stays outside this short publication section.
+std::mutex g_native_publish_mtx;
+
 // Conservative pre-allocation limits for remotely supplied archives. Metadata is checked
 // for every entry before any payload buffer is allocated.
 constexpr mz_uint kMaxArchiveEntries = 4096;
@@ -236,11 +240,15 @@ std::string sign_manifest(const json& manifest) {
                 {"mac", provenance_mac(manifest)}}.dump();
 }
 
-// Caches the writer admits only into the archive budget left after every essential and
-// forward-compatible payload (mesh first, then build checkpoints, in name order). Both
-// are large binary blobs written STORED.
+// Display meshes may be omitted under archive pressure. Solved checkpoints are
+// reserved first, so a display cache never displaces the state needed to reopen.
 bool is_optional_cache(const std::string& name) {
-    return name == "cache.aicm" || name == "cache.ckpt";
+    return name == "cache.aicm";
+}
+
+bool is_recovery_brep(const std::string& name) {
+    return name.rfind("recovery/assembly_sources/", 0) == 0 &&
+           name.size() >= 5 && name.compare(name.size() - 5, 5, ".brep") == 0;
 }
 
 // Keep the writer file open through publication; paths never reopen a reserved
@@ -278,6 +286,30 @@ struct NativeStage {
         }
     }
 };
+
+static bool sync_stage(NativeStage& stage) {
+    if (std::fflush(stage.stream) != 0) return false;
+#if defined(_WIN32)
+    return FlushFileBuffers(reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(stage.stream)))) != 0;
+#else
+    return ::fsync(::fileno(stage.stream)) == 0;
+#endif
+}
+
+static bool sync_parent_directory(const std::filesystem::path& path) {
+#if defined(_WIN32)
+    // Windows flushes the file handle before publication; directory handles do
+    // not generally support FlushFileBuffers.
+    (void)path;
+    return true;
+#else
+    const auto parent = path.has_parent_path() ? path.parent_path() : std::filesystem::path(".");
+    const int fd = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return false;
+    const bool ok = ::fsync(fd) == 0;
+    return ::close(fd) == 0 && ok;
+#endif
+}
 
 // miniz's CFILE reader never owns its FILE*. Close both layers before replacing
 // a source archive: a CRT read handle otherwise denies deletion on Windows.
@@ -488,7 +520,9 @@ static std::string editable_container_save_impl(const json& doc, const std::stri
                                     const std::string& format_name,
                                     const json* preserved_meta = nullptr,
                                     bool exclusive = false,
-                                    std::vector<std::string>* dropped = nullptr) {
+                                    std::vector<std::string>* dropped = nullptr,
+                                    NativeFileStamp* published_stamp = nullptr,
+                                    const NativeFileStamp* expected_stamp = nullptr) {
     const bool owns_geometry_step = container.rfind("aicad.step+/", 0) == 0;
     namespace fs = std::filesystem;
     fs::path out_path = fs::u8path(path);
@@ -565,6 +599,29 @@ static std::string editable_container_save_impl(const json& doc, const std::stri
     std::string thumb;
     auto th = extra.find("thumbnail.png");
     thumb = (th != extra.end()) ? th->second : (preserved_meta ? std::string() : placeholder_png());
+    // A reference is an essential authored member, not an optional cache.
+    // Never produce a file whose required members already exceed the reader's
+    // expanded-size limits; in particular, do not strand a large scan beside
+    // a build cache that the next open can no longer admit.
+    if (owns_geometry_step) {
+        mz_uint64 required = 2048;
+        auto reserve = [&](std::size_t size, bool large_cache) {
+            if ((!large_cache && size > kMaxEntryExpandedBytes) ||
+                size > kMaxArchiveExpandedBytes - required)
+                io_error("doc_save: required document and build-state payloads exceed archive limits");
+            required += size;
+        };
+        reserve(document.size(), false);
+        reserve(meta_json.size(), false);
+        reserve(thumb.size(), false);
+        for (const auto& [name, data] : extra) {
+            if (is_known_entry(name, owns_geometry_step) || is_optional_cache(name) ||
+                name == "cache.provenance") continue;
+            reserve(data.size(), (is_geometry_cache(name) || is_recovery_brep(name)) &&
+                                 data.size() > kMaxEntryExpandedBytes);
+        }
+    }
+
 
     // Essential/forward-compatible payloads have priority over the optional caches
     // (cache.aicm, cache.ckpt). Reserve their expanded bytes before deciding whether each
@@ -637,7 +694,12 @@ static std::string editable_container_save_impl(const json& doc, const std::stri
         // deflate). A geometry cache above the reader's per-entry limit for COMPRESSED
         // entries is STORED too, so the reader admits it against the aggregate budget
         // instead of skipping it.
-        const bool stored = preserved_meta || is_optional_cache(name) ||
+        // Mesh-reference members already contain bounded zlib-compressed payloads.
+        // Store the wrapper verbatim, avoiding double compression and preserving the
+        // archive reader's ratio checks even for highly compressible meshes.
+        const bool stored = preserved_meta || is_optional_cache(name) || name == "cache.ckpt" ||
+                            is_recovery_brep(name) ||
+                            (owns_geometry_step && name.rfind("mesh_references/", 0) == 0) ||
                             (owns_geometry_step && is_geometry_cache(name) &&
                              data.size() > kMaxEntryExpandedBytes) ||
                             (name.rfind("studies/", 0) == 0 && name.find("/results.") != std::string::npos);
@@ -656,9 +718,19 @@ static std::string editable_container_save_impl(const json& doc, const std::stri
         mz_zip_writer_end(&zip);
         io_error("doc_save: cannot finalize archive");
     }
-    mz_zip_writer_end(&zip);
+    if (!mz_zip_writer_end(&zip)) io_error("doc_save: cannot close archive writer");
 
-    if (std::fflush(stage.stream) != 0) io_error("doc_save: cannot flush archive");
+    if (!sync_stage(stage)) io_error("doc_save: cannot flush and sync archive");
+    const NativeFileStamp stage_stamp = stepplus_file_stamp(native_policy::path_utf8(tmp_path));
+    if (!stage_stamp.valid) io_error("doc_save: cannot stat staged archive");
+    std::lock_guard<std::mutex> publish(g_native_publish_mtx);
+    if (expected_stamp) {
+        const NativeFileStamp actual = stepplus_file_stamp(native_policy::path_utf8(out_path));
+        std::error_code ec;
+        const bool missing = !fs::exists(out_path, ec) && !ec;
+        if (expected_stamp->valid ? !(actual == *expected_stamp) : (!missing || actual.valid))
+            throw OpError("disk_changed", "doc_save: destination changed during publication");
+    }
 #if defined(_WIN32)
     const auto destination = fs::absolute(out_path).make_preferred().native();
     const auto bytes = destination.size() * sizeof(wchar_t);
@@ -683,6 +755,21 @@ static std::string editable_container_save_impl(const json& doc, const std::stri
         : ::renameat(stage.directory_fd, "container.tmp", AT_FDCWD, out_path.c_str());
     if (result != 0) io_error("doc_save: cannot publish archive");
 #endif
+    if (!sync_parent_directory(out_path)) io_error("doc_save: cannot sync destination directory");
+    if (published_stamp) *published_stamp = stage_stamp;
+    if (std::fclose(stage.stream) != 0) {
+        stage.stream = nullptr;
+#if defined(_WIN32)
+        stage.descriptor = -1;
+        stage.handle = INVALID_HANDLE_VALUE;
+#endif
+        io_error("doc_save: cannot close archive");
+    }
+    stage.stream = nullptr;
+#if defined(_WIN32)
+    stage.descriptor = -1;
+    stage.handle = INVALID_HANDLE_VALUE;
+#endif
     return native_policy::path_utf8(out_path);
 }
 
@@ -695,11 +782,12 @@ std::string editable_container_save(const json& doc, const std::string& path,
 
 std::string stepplus_save(const json& doc, const std::string& path,
                           const std::map<std::string, std::string>& extra,
-                          std::vector<std::string>* dropped) {
+                          std::vector<std::string>* dropped, NativeFileStamp* published_stamp,
+                          const NativeFileStamp* expected_stamp) {
     const std::string schema = doc.value("schema", std::string());
     const std::string kind = (schema == "aicad.asm/1") ? "assembly" : "part";
     return editable_container_save_impl(doc, path, extra, kContainer, kind, ".step+",
-                                        nullptr, false, dropped);
+                                        nullptr, false, dropped, published_stamp, expected_stamp);
 }
 
 std::size_t stepplus_optional_cache_budget(const json& doc,
@@ -770,7 +858,9 @@ static StepPlusDoc editable_container_open_impl(const std::string& path,
         if (owns_geometry_step && mode != NativeReadMode::Relocate &&
             std::strcmp(st.m_filename, "geometry.step") == 0)
             continue;
-        if (st.m_uncomp_size > kMaxEntryExpandedBytes) {
+        const bool recovery_brep = owns_geometry_step && is_recovery_brep(st.m_filename) &&
+                                   st.m_method == 0 && st.m_comp_size == st.m_uncomp_size;
+        if (st.m_uncomp_size > (recovery_brep ? kMaxArchiveExpandedBytes : kMaxEntryExpandedBytes)) {
             mz_zip_reader_end(&zip);
             archive_limit_error("per-entry expanded byte limit", format_name);
         }
@@ -1365,8 +1455,8 @@ json native_file_operations(const json& params) {
                     sources.count(native_fold(destination)) ||
                     !mapped_destinations.insert(native_fold(destination)).second)
                     native_invalid("path_map contains same-file, source overwrite, or colliding targets");
-                // A mapping may name a copy in a later batch. Closure is reported
-                // by inspection, not guessed or enforced by loading dependencies.
+                // Mappings may name copies in a later batch; only actual
+                // destination availability after this batch is reported.
             }
             // Inspect all source trees first: unsupported references or misspelled
             // component IDs must not leave an avoidable half-relocated batch.
@@ -1462,6 +1552,36 @@ json native_file_operations(const json& params) {
                 }
                 result["files"].push_back(std::move(row));
             }
+            // Sample after all writes, not while processing each entry: a later
+            // entry may have published a referenced target in this same batch.
+            // These are direct references in written documents, not a closure walk.
+            std::size_t checked = 0, missing = 0, unknown = 0;
+            for (auto& row : result["files"]) {
+                if (row.value("status", std::string()) != "written" ||
+                    !row.contains("dependency_rewrites")) continue;
+                for (auto& rewrite : row["dependency_rewrites"]) {
+                    std::error_code ec;
+                    const bool exists = fs::exists(
+                        fs::u8path(rewrite["destination_resolved_path"].get<std::string>()), ec);
+                    if (ec) {
+                        rewrite["destination_exists"] = nullptr;
+                        rewrite["destination_check_error"] = ec.message();
+                    } else {
+                        rewrite["destination_exists"] = exists;
+                    }
+                    if (!rewrite.value("required", true)) continue;
+                    ++checked;
+                    if (ec) ++unknown;
+                    else if (!exists) ++missing;
+                }
+            }
+            result["direct_reference_availability"] = {
+                {"required_count", checked}, {"missing_count", missing}, {"unknown_count", unknown},
+                {"scope", "direct_references_in_written_files"}};
+            if (missing || unknown)
+                result["direct_reference_warning"] =
+                    "Some required direct references in written files are missing or could not be checked. "
+                    "Inspect their destinations; this does not assess transitive project closure.";
         } else native_invalid("action must be inspect or relocate");
     } catch (const std::exception& error) {
         failure(error);
@@ -1647,7 +1767,18 @@ std::string stepplus_cache_engine_key() {
     // sampled BSpline run), composite rectangle/polygon entities carry relations, and the
     // 2D solver applies the extended relation set (and no longer applies wrong-type
     // residuals), so converted geometry and solved sketch coordinates can differ.
-    static constexpr const char* kCacheSchema = "chudware-geomcache/17";
+    // /18 rollback compiles only the active prefix; older caches could contain the
+    // full history's geometry despite a rollback_after marker.
+    // /19 cached assembly tessellation reapplies a nested source's local placement;
+    // older display snapshots can place a one-body subassembly at the origin.
+    // /20 requires a verified fillet on every selected edge and persists its
+    // effective dimensions; older snapshots may contain partial or no-op blends.
+    // /21 requires real cut/raised Thread geometry; older snapshots can certify a
+    // successful unthreaded fallback or a silently shortened threaded run.
+    // The new refine feature has no prior successful compiled topology to invalidate:
+    // failed/unknown features cannot produce a solved display cache. Its safety inputs
+    // are keyed at the refine checkpoint itself, leaving old documents' warm caches valid.
+    static constexpr const char* kCacheSchema = "chudware-geomcache/21";
 #ifdef OCC_VERSION_COMPLETE
     return std::string(kCacheSchema) + ";occt=" OCC_VERSION_COMPLETE;
 #else
@@ -1657,17 +1788,37 @@ std::string stepplus_cache_engine_key() {
 
 // --- build-state write-back (contracts/stepplus.md §17) -----------------------------
 NativeFileStamp stepplus_file_stamp(const std::string& path) {
-    namespace fs = std::filesystem;
-    const auto native_path = fs::u8path(path);
-    std::error_code ec;
-    if (!fs::is_regular_file(native_path, ec) || ec) return {};
+    const auto native_path = std::filesystem::u8path(path);
     NativeFileStamp stamp;
-    stamp.size = fs::file_size(native_path, ec);
-    if (ec) return {};
-    const fs::file_time_type modified = fs::last_write_time(native_path, ec);
-    if (ec) return {};
-    stamp.mtime_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                         modified.time_since_epoch()).count();
+#if defined(_WIN32)
+    HANDLE h = CreateFileW(native_path.c_str(), FILE_READ_ATTRIBUTES,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return {};
+    BY_HANDLE_FILE_INFORMATION info{};
+    const bool ok = GetFileInformationByHandle(h, &info) != 0;
+    CloseHandle(h);
+    if (!ok || (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) return {};
+    stamp.size = (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+    const auto ticks = (static_cast<std::uint64_t>(info.ftLastWriteTime.dwHighDateTime) << 32) |
+                       info.ftLastWriteTime.dwLowDateTime;
+    stamp.mtime_ns = static_cast<long long>(ticks - 116444736000000000ULL) * 100;
+    stamp.ino = (static_cast<std::uint64_t>(info.nFileIndexHigh) << 32) | info.nFileIndexLow;
+    stamp.device = info.dwVolumeSerialNumber;
+#else
+    struct stat info{};
+    if (::stat(native_path.c_str(), &info) != 0 || !S_ISREG(info.st_mode)) return {};
+    stamp.size = static_cast<std::uintmax_t>(info.st_size);
+#if defined(__APPLE__)
+    stamp.mtime_ns = static_cast<long long>(info.st_mtimespec.tv_sec) * 1000000000LL +
+                     info.st_mtimespec.tv_nsec;
+#else
+    stamp.mtime_ns = static_cast<long long>(info.st_mtim.tv_sec) * 1000000000LL +
+                     info.st_mtim.tv_nsec;
+#endif
+    stamp.ino = static_cast<std::uint64_t>(info.st_ino);
+    stamp.device = static_cast<std::uint64_t>(info.st_dev);
+#endif
     stamp.valid = true;
     return stamp;
 }
@@ -1711,6 +1862,29 @@ BuildStateWriteback stepplus_write_build_state(const std::string& path,
         } catch (const std::exception&) {
             return refuse("not_a_container");
         }
+    }
+
+    // Replacement removes every old build-state member. A prefix checkpoint or
+    // malformed/unsolved header alone must never destroy the last complete solve.
+    const auto header_entry = entries.find("cache.json");
+    if (header_entry == entries.end()) return refuse("incomplete_build_state");
+    try {
+        const json header = json::parse(header_entry->second);
+        if (!header.is_object() || !header.value("solved", false) ||
+            header.value("engine", std::string()) != stepplus_cache_engine_key() ||
+            header.value("doc_hash", std::string()) != doc_hash ||
+            !header.contains("response") || !header["response"].is_object())
+            return refuse("incomplete_build_state");
+        const json& rebuild = header["response"].at("rebuild");
+        const json& statuses = rebuild.at("feature_status");
+        if (!statuses.is_array() || !rebuild.value("ok", true) ||
+            !rebuild.value("converged", true))
+            return refuse("incomplete_build_state");
+        for (const auto& status : statuses)
+            if (!status.is_object() || !status.at("ok").get<bool>())
+                return refuse("incomplete_build_state");
+    } catch (const std::exception&) {
+        return refuse("incomplete_build_state");
     }
 
     // The reader admits the optional caches (cache.aicm, then cache.ckpt) only into the
@@ -1796,7 +1970,7 @@ BuildStateWriteback stepplus_write_build_state(const std::string& path,
         }
         // Same storage rules as stepplus_save: optional caches and oversized geometry
         // caches STORED, the rest deflated.
-        const bool stored = is_optional_cache(name) ||
+        const bool stored = is_optional_cache(name) || name == "cache.ckpt" ||
                             (is_geometry_cache(name) && data.size() > kMaxEntryExpandedBytes);
         if (!add(name, data, stored)) return abandon("io_error: cannot add entry '" + name + "'");
         if (is_geometry_cache(name)) manifest["members"][name] = util::sha256_hex(data);
@@ -1810,12 +1984,17 @@ BuildStateWriteback stepplus_write_build_state(const std::string& path,
         out.entries.push_back("cache.provenance");
     }
     if (!mz_zip_writer_finalize_archive(&dst)) return abandon("io_error: cannot finalize archive");
-    mz_zip_writer_end(&dst);
+    const bool ended = mz_zip_writer_end(&dst) != 0;
     dst_open = false;
-    if (std::fflush(stage.stream) != 0) return abandon("io_error: staging flush failed");
+    if (!ended) return abandon("io_error: cannot close archive writer");
+    if (!sync_stage(stage)) return abandon("io_error: staging flush or sync failed");
+    const NativeFileStamp stage_stamp = stepplus_file_stamp(native_policy::path_utf8(tmp));
+    if (!stage_stamp.valid) return abandon("io_error: cannot stat staged build state");
     reader.close();
 
-    // A save that landed while the copy was written wins; the build state is dropped.
+    // Pair the final check and rename with ordinary native save publication:
+    // a save that wins this lock cannot be overwritten by a stale build state.
+    std::lock_guard<std::mutex> publish(g_native_publish_mtx);
     if (!(stepplus_file_stamp(path) == expected)) return abandon("file_changed");
 #if defined(_WIN32)
     const auto destination = fs::absolute(target).make_preferred().native();
@@ -1838,6 +2017,21 @@ BuildStateWriteback stepplus_write_build_state(const std::string& path,
     if (::renameat(stage.directory_fd, "container.tmp", AT_FDCWD, target.c_str()) != 0)
         return abandon("io_error: cannot publish build state");
 #endif
+    if (!sync_parent_directory(target)) return refuse("io_error: destination directory sync failed");
+    if (std::fclose(stage.stream) != 0) {
+        stage.stream = nullptr;
+#if defined(_WIN32)
+        stage.descriptor = -1;
+        stage.handle = INVALID_HANDLE_VALUE;
+#endif
+        return refuse("io_error: staging close failed");
+    }
+    stage.stream = nullptr;
+#if defined(_WIN32)
+    stage.descriptor = -1;
+    stage.handle = INVALID_HANDLE_VALUE;
+#endif
+    out.stamp = stage_stamp;
     out.written = true;
     return out;
 }

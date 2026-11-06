@@ -6,11 +6,15 @@ moved them to z=48.8969, where the float32 step is 3.8e-6 mm, so the written STL
 them into two zero-area triangles. PrusaSlicer deleted those facets on load
 (``degenerate_facets="2" facets_removed="2"`` in its 3MF) and slice_part still reported
 print_ready. The fixture below rebuilds that exact pair on a closed box with the wrist's
-bounding box. No engine or slicer needed.
+bounding box. File-input tests also exercise workspace selection and response contracts.
+No engine or slicer needed.
 """
 from __future__ import annotations
 
+import hashlib
 import io
+import json
+import os
 import zipfile
 from pathlib import Path
 
@@ -87,6 +91,25 @@ def test_the_origin_centred_pose_is_written_exactly(wrist_pose, tmp_path):
     out = tmp_path / "wrist.oriented.stl"
     pt._write_slicer_stl(out, "wrist", "origin-centred", model, posed, triangles)
     assert _raw_stl_topology(out) == (10, 0)
+
+
+@pytest.mark.parametrize("alias", ["symlink", "hardlink"])
+def test_slicer_input_cannot_overwrite_a_firmware_image_through_an_alias(
+        wrist_pose, tmp_path, alias):
+    from services.manufacturing.print_safety import UnsafePrintFile
+
+    firmware = tmp_path / "firmware.bin"
+    firmware.write_bytes(b"original firmware image")
+    out = tmp_path / "wrist.oriented.stl"
+    if alias == "symlink":
+        out.symlink_to(firmware)
+    else:
+        out.hardlink_to(firmware)
+    model, posed, triangles = wrist_pose
+    with pytest.raises(UnsafePrintFile):
+        pt._write_slicer_stl(out, "wrist", "origin-centred", model, posed, triangles)
+    assert firmware.read_bytes() == b"original firmware image"
+    assert out.read_bytes() == b"original firmware image"
 
 
 @pytest.mark.parametrize("build_dir", [[1, 0, 0], [-1, 0, 0], [0, -1, 0], [0, 0, 1],
@@ -210,3 +233,212 @@ def test_a_missing_or_malformed_repair_record_is_unavailable_not_clean(tmp_path,
     record = pt._slicer_mesh_repairs(target, volumes=2 if case == "volume_count" else 1)
     assert record["available"] is False and record["reason"], record
     assert "counts" not in record
+
+
+@pytest.fixture
+def print_tools(monkeypatch):
+    class ToolCollector:
+        def __init__(self):
+            self.tools = {}
+
+        def tool(self):
+            def register(fn):
+                self.tools[fn.__name__] = fn
+                return fn
+            return register
+
+    # Orientation analysis of a mesh does not need a live engine profile.
+    monkeypatch.setattr(pt, "dfm_profile_params", lambda *_: {})
+    collector = ToolCollector()
+    pt.register_print_tools(collector)
+    return collector.tools
+
+
+_SAFE_GCODE = (
+    "G90\nM83\nG28\nM190 S60\nM109 S220\n"
+    ";LAYER_CHANGE\n;Z:0.2\n;HEIGHT:0.2\n;TYPE:Perimeter\n;WIDTH:0.45\n"
+    "G1 Z0.2\nG1 X10 Y10\nG1 X30 Y10 E1\nG1 Y10.4 E0.1\nG1 X10 Y10.4 E1\n"
+    "M104 S0\nM140 S0\n"
+    "; nozzle_diameter = 0.4\n; bed_shape = 0x0,100x0,100x100,0x100\n"
+    "; max_print_height = 100\n; filament_type = PLA\n; use_relative_e_distances = 1\n"
+)
+
+
+def test_verify_gcode_resolves_request_workspace_and_preserves_validation(
+        print_tools, tmp_path, monkeypatch):
+    from services.agent.request_context import bind_roots
+
+    project, worker = tmp_path / "project", tmp_path / "worker"
+    for root in (project, worker):
+        (root / "print").mkdir(parents=True)
+    (project / "print/job.gcode").write_text(_SAFE_GCODE)
+    (worker / "print/job.gcode").write_text("M997\n")
+    (project / "print/unsafe.gcode").write_text("M997\n")
+    (project / "print/firmware.bin").write_text(_SAFE_GCODE)
+    monkeypatch.chdir(worker)
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(worker))
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(worker))
+
+    with bind_roots(str(project)):
+        good = json.loads(print_tools["verify_gcode"](path="print/job.gcode"))
+        absolute = json.loads(print_tools["verify_gcode"](path=str(worker / "print/job.gcode")))
+        unsafe = json.loads(print_tools["verify_gcode"](path="print/unsafe.gcode"))
+        firmware = json.loads(print_tools["verify_gcode"](path="print/firmware.bin"))
+
+    assert good["ok"] is True, good
+    assert good["path"] == str(project / "print/job.gcode")
+    assert isinstance(good["checks"], list) and isinstance(good["stats"], dict)
+    assert all({"check", "status", "ok", "note", "metrics", "limits", "regions", "fix"}
+               <= row.keys() for row in good["checks"])
+    for result in (absolute, unsafe, firmware):
+        assert result["ok"] is False and result["status"] == "fail", result
+        assert result["checks"][0]["check"] == "unsafe_print_file"
+        assert result["checks"][0]["status"] == "fail"
+        assert "FAILED" in result["content"]
+    assert absolute["path"] == str(worker / "print/job.gcode")
+
+
+def test_print_input_paths_use_fs_root_or_refuse_missing_workspace(
+        print_tools, tmp_path, monkeypatch):
+    project, worker = tmp_path / "project", tmp_path / "worker"
+    project.mkdir()
+    worker.mkdir()
+    (project / "job.gcode").write_text(_SAFE_GCODE)
+    (worker / "job.gcode").write_text("M997\n")
+    monkeypatch.chdir(worker)
+    monkeypatch.delenv("CHUDWARE_PROJECT_DIR", raising=False)
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(project))
+    fallback = json.loads(print_tools["verify_gcode"](path="job.gcode"))
+    assert fallback["ok"] is True and fallback["path"] == str(project / "job.gcode"), fallback
+
+    monkeypatch.delenv("CHUDWARE_FS_ROOT", raising=False)
+    for tool, args in (
+        ("verify_gcode", {"path": "job.gcode"}),
+        ("optimize_print_orientation", {"path": "mesh.stl"}),
+        ("print_media_inventory", {"root": "."}),
+        ("publish_print_media", {"root": ".", "project": "test", "jobs": [],
+                                 "expected_inventory": "0" * 64, "media_idle": True}),
+    ):
+        refused = json.loads(print_tools[tool](**args))
+        assert refused["ok"] is False and "no project root" in refused["error"], refused
+    absolute = json.loads(print_tools["verify_gcode"](path=str(project / "job.gcode")))
+    assert absolute["ok"] is True, absolute
+
+
+def test_optimize_orientation_reads_selected_mesh_not_server_cwd(
+        print_tools, tmp_path, monkeypatch):
+    import trimesh
+    from services.agent.request_context import bind_roots
+
+    project, worker = tmp_path / "project", tmp_path / "worker"
+    project.mkdir()
+    worker.mkdir()
+    trimesh.creation.box(extents=(8, 9, 4)).export(project / "mesh.stl")
+    trimesh.creation.box(extents=(40, 40, 40)).export(worker / "mesh.stl")
+    monkeypatch.chdir(worker)
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(worker))
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(worker))
+
+    with bind_roots(str(project)):
+        result = json.loads(print_tools["optimize_print_orientation"](path="mesh.stl"))
+        absolute = json.loads(print_tools["optimize_print_orientation"](
+            path=str(worker / "mesh.stl")))
+    assert result["ok"] and absolute["ok"], (result, absolute)
+    assert result["source"]["path"] == str(project / "mesh.stl")
+    assert result["ranked"][0]["metrics"]["part_volume_mm3"] == pytest.approx(8 * 9 * 4)
+    assert absolute["source"]["path"] == str(worker / "mesh.stl")
+    assert absolute["ranked"][0]["metrics"]["part_volume_mm3"] == pytest.approx(40 ** 3)
+
+
+def test_print_media_workspace_paths_preserve_manifest_and_media_safety(
+        print_tools, tmp_path, monkeypatch):
+    from services.agent.request_context import bind_roots
+
+    project, worker = tmp_path / "project", tmp_path / "worker"
+    for root in (project, worker):
+        (root / "print").mkdir(parents=True)
+        (root / "media").mkdir()
+    body = _SAFE_GCODE.encode()
+    stored_body = body + b"; second part\n"
+    (project / "print/moved.gcode").write_bytes(body)
+    (project / "print/stored.gcode").write_bytes(stored_body)
+    (project / "print/unsafe.gcode").write_text("M997\n")
+    manifest = {
+        "schema": "chudware.print_job/1", "part": "moved", "print_ready": True,
+        "gcode": "old.gcode", "gcode_sha256": hashlib.sha256(body).hexdigest(),
+    }
+    (project / "print/moved.print.json").write_text(json.dumps(manifest))
+    (project / "print/stored.print.json").write_text(json.dumps({
+        **manifest, "part": "stored", "gcode": "stored.gcode",
+        "gcode_sha256": hashlib.sha256(stored_body).hexdigest(),
+    }))
+    (project / "print/unsafe.print.json").write_text(json.dumps({
+        **manifest, "gcode": "unsafe.gcode", "print_ready": False,
+        "gcode_sha256": hashlib.sha256(b"M997\n").hexdigest(),
+    }))
+    # The wrong directory contains equally named source and media paths.
+    (worker / "print/moved.print.json").write_text("{}")
+    (worker / "print/moved.gcode").write_text("M997\n")
+    monkeypatch.chdir(worker)
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(worker))
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(worker))
+
+    with bind_roots(str(project)):
+        inventory = json.loads(print_tools["print_media_inventory"](root="media"))
+        assert inventory["ok"], inventory
+        rejected = json.loads(print_tools["publish_print_media"](
+            root="media", project="test",
+            jobs=[{"part_id": "unsafe", "manifest_path": "print/unsafe.print.json",
+                   "user_override": "print it anyway"}],
+            expected_inventory=inventory["inventory_token"], media_idle=True))
+        assert rejected["ok"] is False and rejected["error"] == "jobs_invalid", rejected
+        assert rejected["job_errors"][0]["error"] == "unsafe_print_file"
+        assert not list((project / "media").iterdir())
+        published = json.loads(print_tools["publish_print_media"](
+            root="media", project="test",
+            jobs=[{"part_id": "moved", "manifest_path": "print/moved.print.json",
+                   "gcode_path": "print/moved.gcode"},
+                  {"part_id": "stored", "manifest_path": "print/stored.print.json"}],
+            expected_inventory=inventory["inventory_token"], media_idle=True))
+        absolute = json.loads(print_tools["print_media_inventory"](root=str(worker / "media")))
+    assert published["ok"] and published["root"] == str(project / "media"), published
+    assert (project / "media/moved.gcode").read_bytes() == body
+    assert (project / "media/stored.gcode").read_bytes() == stored_body
+    assert absolute["ok"] and absolute["total"] == 0, absolute
+    assert not list((worker / "media").iterdir())
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks may need privileges")
+def test_relative_media_root_does_not_bypass_symlink_refusal(
+        print_tools, tmp_path):
+    from services.agent.request_context import bind_roots
+
+    project, drive = tmp_path / "project", tmp_path / "drive"
+    project.mkdir()
+    drive.mkdir()
+    (project / "media").symlink_to(drive, target_is_directory=True)
+    with bind_roots(str(project)):
+        result = json.loads(print_tools["print_media_inventory"](root="media"))
+    assert result["ok"] is False and result["error"] == "root_symlink", result
+
+
+def test_absolute_print_media_inputs_work_without_workspace(print_tools, tmp_path, monkeypatch):
+    monkeypatch.delenv("CHUDWARE_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("CHUDWARE_FS_ROOT", raising=False)
+    drive = tmp_path / "drive"
+    drive.mkdir()
+    gcode = tmp_path / "job.gcode"
+    body = _SAFE_GCODE.encode()
+    gcode.write_bytes(body)
+    manifest = tmp_path / "job.print.json"
+    manifest.write_text(json.dumps({
+        "schema": "chudware.print_job/1", "part": "job", "print_ready": True,
+        "gcode": "old.gcode", "gcode_sha256": hashlib.sha256(body).hexdigest(),
+    }))
+    inventory = json.loads(print_tools["print_media_inventory"](root=str(drive)))
+    result = json.loads(print_tools["publish_print_media"](
+        root=str(drive), project="test",
+        jobs=[{"part_id": "job", "manifest_path": str(manifest), "gcode_path": str(gcode)}],
+        expected_inventory=inventory["inventory_token"], media_idle=True))
+    assert result["ok"], result
+    assert (drive / "job.gcode").read_bytes() == body

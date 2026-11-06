@@ -26,8 +26,6 @@ public:
     void open() {
         m_active = true;
         m_hoverZone = -1;
-        m_hoverDwell = 0.0f;
-        m_previewReady = false;
     }
     // Open AND animate the camera to frame the whole box with the model centered (zoom-to-fit +
     // recenter, orientation kept). Preferred entry point — keeps the box from opening off-screen.
@@ -38,13 +36,6 @@ private:
 
     bool m_active = false;
     int  m_hoverZone = -1;   // index into the per-frame zone table, or -1
-
-    // C27-D: hover-preview thumbnail state. The panel shows the model from the hovered zone's
-    // candidate orientation once the hover has been steady for a short dwell (so sweeping the
-    // cursor across the box doesn't thrash the offscreen render). update() owns these; draw() reads.
-    float m_hoverYaw = 0.0f, m_hoverPitch = 0.0f;  // target orientation of the hovered zone
-    float m_hoverDwell = 0.0f;                      // seconds the current zone has been hovered
-    bool  m_previewReady = false;                   // dwell satisfied -> draw the preview panel
 };
 
 }  // namespace ui

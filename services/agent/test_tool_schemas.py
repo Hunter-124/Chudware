@@ -1,7 +1,7 @@
 """Tests for tool_schemas.py — trimmed schema rendering for the §9.1 tools slot.
 
 DoD coverage: turn prompts carry trimmed schemas for exactly the allowed tools;
-token cost is MEASURED (same 4-chars/token stick as tiers.TurnAssembler) and
+token cost is MEASURED (same 4-chars/token stick as tiers._count_tokens) and
 budget overflow omits tools honestly instead of blowing the slot."""
 from __future__ import annotations
 
@@ -176,23 +176,6 @@ class TestRenderToolsBlock:
             assert meta["unresolved"] == [], (pseudo, meta)
             assert f"{pseudo}(" in text
             assert "schema unavailable" not in text
-
-    def test_coordinate_claim_advertises_only_callable_release_name(self):
-        from services.agent.mission_dispatch import MissionDispatch
-
-        text, _ = render_tools_block(
-            ["coordinate_claim"],
-            resolver=lambda name: (
-                MissionDispatch.coordinate_claim
-                if name == "coordinate_claim"
-                else None
-            ),
-            budget_tokens=2000,
-            trim=False,
-            include_category_menu=False,
-        )
-        assert "coordinate_release" in text
-        assert "release_claim" not in text
 
     def test_multiline_paragraph_cannot_break_block_indent(self):
         def _multi() -> dict:

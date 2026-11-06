@@ -8,6 +8,7 @@
 #include <unordered_map>
 
 #include "ui_theme.h"
+#include "anim.h"
 
 #include <cctype>
 #include <filesystem>
@@ -184,7 +185,12 @@ const std::unordered_map<std::string, std::string>& domainTable() {
     return t;
 }
 
-struct LogoTex { unsigned int tex = 0; int w = 0, h = 0; bool fetching = false; };
+struct LogoTex {
+    unsigned int tex = 0;
+    int w = 0, h = 0;
+    bool fetching = false;
+    double nextFileCheck = 0.0;
+};
 std::unordered_map<std::string, LogoTex> g_logoTex;  // GL thread only
 std::set<std::string> g_logoReq;                     // ids drawn since last tick (GL thread)
 int g_logoEnabled = -1;                              // -1 unknown, 0 off, 1 on
@@ -221,14 +227,11 @@ std::string logoAlternateUrl(const std::string& domain) {
 bool logoEnabled() {
     if (g_logoEnabled >= 0) return g_logoEnabled != 0;
     g_logoEnabled = 1;  // default on (user opted in)
-    std::ifstream f(configPath());
-    if (f) {
-        try {
-            nlohmann::json j; f >> j;
-            if (j.contains("agent") && j["agent"].contains("provider_logos"))
-                g_logoEnabled = j["agent"]["provider_logos"].get<bool>() ? 1 : 0;
-        } catch (...) {}
-    }
+    try {
+        const nlohmann::json j = readConfigJson();
+        if (j.contains("agent") && j["agent"].contains("provider_logos"))
+            g_logoEnabled = j["agent"]["provider_logos"].get<bool>() ? 1 : 0;
+    } catch (...) {}
     return g_logoEnabled != 0;
 }
 
@@ -330,14 +333,20 @@ void providerLogosTick(AppState& st) {
     (void)st;   // fetches are direct HTTP on a detached thread; no RPC through AppState now
     if (!logoEnabled()) { g_logoReq.clear(); return; }
     int budget = 3;  // fetch kicks per frame (throttle a first-open burst)
+    static int decodeFrame = -1;
+    const int frame = ImGui::GetFrameCount();
+    const double now = ImGui::GetTime();
     for (const std::string& id : g_logoReq) {
         auto dit = domainTable().find(id);
         if (dit == domainTable().end()) continue;   // no known domain -> badge only
         LogoTex& lt = g_logoTex[id];
         if (lt.tex) continue;                        // already uploaded
+        if (now < lt.nextFileCheck) continue;
         const std::string path = logoCachePath(id);
         std::error_code ec;
         if (std::filesystem::is_regular_file(path, ec)) {
+            if (decodeFrame == frame) continue;
+            decodeFrame = frame;  // budget attempts too, including corrupt cached images
             int w = 0, h = 0, n = 0;
             unsigned char* px = stbi_load(path.c_str(), &w, &h, &n, 4);
             if (px && w > 0 && h > 0) {
@@ -353,9 +362,14 @@ void providerLogosTick(AppState& st) {
                 lt.tex = tex; lt.w = w; lt.h = h;
             }
             if (px) stbi_image_free(px);
-            else std::filesystem::remove(path, ec);  // corrupt -> drop, refetch next session
+            if (!lt.tex) {
+                std::filesystem::remove(path, ec);
+                lt.nextFileCheck = now + 5.0;
+            }
             continue;
         }
+        // Missing/offline logos do not stat the cache path on every draw.
+        lt.nextFileCheck = now + 2.0;
         if (!lt.fetching && budget > 0) {
             lt.fetching = true; --budget;
             const std::string domain = dit->second;
@@ -389,6 +403,7 @@ void providerLogosTick(AppState& st) {
                 { std::ofstream o(tmp, std::ios::binary | std::ios::trunc);
                   if (!o) return; o.write(bytes.data(), (std::streamsize)bytes.size()); }
                 std::filesystem::rename(tmp, path, ec2);
+                if (!ec2) ui::anim::wakeLoop();
             }).detach();
 #endif
         }

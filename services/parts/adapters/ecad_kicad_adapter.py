@@ -1,26 +1,14 @@
-"""CatalogProvider adapter for KiCad symbol/footprint libraries.
+"""Parts catalog adapter for native KiCad libraries and local generated parts.
 
-Indexable domain adapter (domain="ecad") that enumerates:
-  1. The clean-room starter symbol + footprint library (engine/ecad/library/starter).
-  2. User .kicad_sym libraries listed in CHUDWARE_KICAD_SYM_PATH (colon-separated
-     paths, same env var as ecad_find_part in ecad_tools.py).
-
-Wraps engine.ecad.library.search (the ecad_find_part surface) for runtime
-.search() calls, and directly enumerates starter.SYMBOLS / starter.FOOTPRINTS
-plus any user-lib files for iter_records() (index build).
-
-This adapter covers the LOCAL, deterministic set only: user libs beyond
-CHUDWARE_KICAD_SYM_PATH are not searched.
-
-geometry_ref.kind = "symbol_footprint" (symbols) per contracts/parts.md §2.
-
-Provenance / license: starter library = clean-room (Chudware proprietary).
-User libs: license = "user-supplied".
+The native bridge searches the installed and project KiCad libraries on demand.
+The small Python starter/user catalog remains indexed for offline discovery;
+generated parts are read live so they cannot outlive their source in the index.
 """
 from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Iterator
 
 log = logging.getLogger(__name__)
@@ -29,12 +17,7 @@ _ENV_VAR = "CHUDWARE_KICAD_SYM_PATH"
 
 
 class EcadKicadAdapter:
-    """CatalogProvider for KiCad symbols/footprints (indexable, domain='ecad').
-
-    Enumerates starter + user libs for FTS index build. .search() delegates to
-    engine.ecad.library.search for ranked results; falls back to iter_records()
-    substring scan when the library module is unavailable.
-    """
+    """Search KiCad through the native bridge, plus the local Python libraries."""
 
     domain: str = "ecad"
     provider_id: str = "ecad_kicad"
@@ -45,91 +28,69 @@ class EcadKicadAdapter:
 
     def search(self, query: str, *,
                domain: str | None = None,
-               filters: dict | None = None) -> list[dict]:
-        """Delegate to engine.ecad.library.search (ecad_find_part surface)."""
+               filters: dict | None = None,
+               limit: int = 20) -> list[dict]:
         if domain and domain != "ecad":
             return []
-        norm = query.strip().lower()
-        if not norm:
-            return list(self.iter_records())
-        # Try the library search first
-        hits = _lib_search(query)
-        if hits:
-            return [_hit_to_record(h) for h in hits if h]
-        # Fallback: iterate index
-        results = []
-        for rec in self.iter_records():
-            title = (rec.get("title") or "").lower()
-            designation = (rec.get("designation") or "").lower()
-            if norm in title or norm in designation:
+        limit = max(1, int(limit))
+        norm = str(query or "").strip().lower()
+        results = _native_search(query, limit, doc_id=str((filters or {}).get("doc_id") or ""))
+        seen = {rec["part_id"] for rec in results}
+        # Python-only generated/user libraries still work. Native KiCad rows win
+        # collisions, since their geometry and pin numbering are authoritative.
+        if len(results) >= limit:
+            return results[:limit]
+        from itertools import chain
+        for rec in chain(self.iter_records(), _load_native_dirs()):
+            text = " ".join([str(rec.get("title") or ""), str(rec.get("designation") or ""),
+                             str((rec.get("params") or {}).get("description") or "")]).lower()
+            if (not norm or all(term in text for term in norm.split())) and rec["part_id"] not in seen:
+                seen.add(rec["part_id"])
                 results.append(rec)
-        return results
+            if len(results) >= limit:
+                break
+        return results[:limit]
 
-    def get(self, part_id: str) -> dict | None:
-        # A model-written id is canonicalised EXACTLY or not at all
-        # (services/ecad/library/partid.resolve): only spelling noise — a missing or
-        # doubled 'ecad:' domain prefix, case, whitespace — is forgiven. A near miss
-        # (ecad:Device:R_0603) is NEVER mapped onto a different record; it stays a
-        # refusal whose hint names the real ids instead.
-        want = str(part_id or "")
-        remap: list[dict] | None = None
-        remap_note = ""
-        try:
-            from services.ecad.library.partid import resolve as _resolve_ecad_id
-            from services.ecad.library.partid import resolved_pins as _resolved_ecad_pins
-            hit = _resolve_ecad_id(part_id)
-            if hit:
-                want = hit["part_id"]
-                # A pin PERMUTATION row (Device:Q_NPN_BCE, Conn_02x03_Counter_Clockwise:
-                # the same device, numbered differently) resolves onto the record we really
-                # have, whose pins carry OUR numbers. Carrying the translation on the record
-                # is the whole point: a caller that read "pin 2 = C" off its own KiCad id
-                # must wire pin 3 of this symbol, and an id rewrite that stayed silent about
-                # the renumbering would move every such wire onto the wrong leg.
-                if hit.get("pin_remap"):
-                    remap = _resolved_ecad_pins(part_id)
-                    remap_note = str(hit.get("note") or "")
-        except Exception as exc:  # noqa: BLE001
-            log.debug("EcadKicadAdapter: part-id resolver unavailable: %s", exc)
-        if not want.startswith("ecad:"):
+    def get(self, part_id: str, *, doc_id: str = "") -> dict | None:
+        from services.ecad.library.partid import strip_domain
+
+        raw = str(part_id or "").strip()
+        libid = strip_domain(raw)
+        # A bare KiCad libid has exactly one ':'; do not treat unrelated parts
+        # domains as library nicknames.
+        if libid.count(":") != 1:
             return None
+        native = _native_search(libid, 200, doc_id=doc_id)
+        exact = [rec for rec in native if rec["designation"] == libid]
+        if not exact:
+            folded = [rec for rec in native
+                      if rec["designation"].casefold() == libid.casefold()]
+            # Case normalization is safe only when it selects one actual ID.
+            if len({rec["designation"] for rec in folded}) == 1:
+                exact = folded
+        if exact:
+            return exact[0]
 
-        def _out(rec: dict) -> dict:
-            """The record, plus the pin translation when the id carried a permutation."""
-            if not remap:
-                return rec
-            rec = dict(rec)
-            rec["pin_remap"] = [dict(p) for p in remap]
-            rec["pin_remap_note"] = (
-                remap_note + ". Wire by native_number: "
-                + ", ".join(f"your pin {p['number']} ({p['name']}) = pin "
-                            f"{p['native_number']}" for p in remap))
-            return rec
-
-        for rec in self.iter_records():
-            if rec.get("part_id") == want:
-                return _out(rec)
-        # Generated parts (ecad_make_part -> resolution tier 2) are served HERE and
-        # deliberately NOT from iter_records(): iter_records feeds the FTS index, which is
-        # snapshotted to <app data>/cache/parts_index.sqlite and revalidated against a
-        # fingerprint of static data files only (hub._fingerprint_sources). A tier that
-        # changes at runtime — and whose dir may be a tmpdir — would be baked into that
-        # cache and outlive the parts themselves. Live lookup keeps part_get/part_place
-        # able to fetch a part the agent just made, with nothing cached.
-        for rec in _load_native_dirs():
-            if rec.get("part_id") == want:
-                return _out(rec)
-        return None
+        # Local generated/user records are not cached with the KiCad library.
+        # Match spelling only; never substitute a different symbol or pinout.
+        from itertools import chain
+        local = list(chain(self.iter_records(), _load_native_dirs()))
+        exact = [rec for rec in local if rec["designation"] == libid]
+        if not exact:
+            folded = [rec for rec in local
+                      if rec["designation"].casefold() == libid.casefold()]
+            if len({rec["designation"] for rec in folded}) == 1:
+                exact = folded
+        return exact[0] if exact else None
 
     def count(self) -> int:
         return sum(1 for _ in self.iter_records())
 
     def iter_records(self) -> Iterator[dict]:
-        """Enumerate starter symbols, starter footprints, then user-lib symbols.
+        """Enumerate the compact local catalog for the persistent FTS index.
 
-        INDEXED content only — see ``get`` for why the generated native tier is excluded.
-        Keyword search still reaches it: ``search`` delegates to
-        ``services.ecad.library.search``, which scans the native dirs itself.
+        Installed/project KiCad libraries and generated parts are queried live,
+        not snapshotted into an index shared across projects.
         """
         # Starter symbols
         starter_syms, starter_fps = _load_starter()
@@ -142,7 +103,7 @@ class EcadKicadAdapter:
                                     provenance="Chudware clean-room starter footprint library")
         # User-supplied .kicad_sym libraries
         sym_path = os.environ.get(_ENV_VAR, "")
-        for lib_path in (p.strip() for p in sym_path.split(":") if p.strip()):
+        for lib_path in (p.strip() for p in sym_path.split(os.pathsep) if p.strip()):
             yield from _load_user_sym_lib(lib_path)
 
 
@@ -160,14 +121,59 @@ def _load_starter() -> tuple[dict, dict]:
         return {}, {}
 
 
-def _lib_search(query: str) -> list[dict]:
-    """Delegate to engine.ecad.library.search; return [] on failure."""
-    try:
-        from services.ecad.library import search as _search
-        return _search(query) or []
-    except Exception as exc:  # noqa: BLE001
-        log.debug("EcadKicadAdapter: lib_search unavailable: %s", exc)
-        return []
+def _native_search(query: str, limit: int, *, doc_id: str = "") -> list[dict]:
+    """Search native symbols and footprints using their actual RPC envelopes."""
+    from itertools import zip_longest
+    from services.mcp import core_bridge
+
+    results: list[dict] = []
+    groups: list[list[dict]] = []
+    for method, key, kind, id_key in (
+            ("ecad_symbols", "symbols", "symbol", "libid"),
+            ("ecad_footprints", "footprints", "footprint", "fpid")):
+        try:
+            params = {"query": str(query or ""), "limit": limit}
+            if doc_id:
+                params["doc_id"] = doc_id
+            response = core_bridge.call(method, params)
+            rows = response.get(key) if isinstance(response, dict) else None
+            if response.get("ok") is False or not isinstance(rows, list):
+                raise ValueError(f"invalid {method} response")
+        except Exception as exc:  # noqa: BLE001 — local catalog remains usable
+            if doc_id:
+                # Do not silently substitute a global/starter library for the
+                # project the caller explicitly selected.
+                raise
+            log.debug("EcadKicadAdapter: %s unavailable: %s", method, exc)
+            continue
+        group = []
+        for row in rows:
+            if isinstance(row, dict) and isinstance(row.get(id_key), str) and row[id_key]:
+                group.append(_hit_to_record({**row, "kind": kind}))
+        groups.append(group)
+    # Both catalogs are independently ranked; neither may hide the other.
+    seen: dict[str, int] = {}
+    for pair in zip_longest(*groups):
+        for rec in pair:
+            if not rec:
+                continue
+            part_id = rec["part_id"]
+            if part_id not in seen:
+                seen[part_id] = len(results)
+                results.append(rec)
+                continue
+            index = seen[part_id]
+            existing = results[index]
+            # A KiCad symbol and footprint can have the same Library:Name.
+            # Keep one stable ID, but preserve both exact geometries so the
+            # receiving document determines which one is placed.
+            if existing["params"]["kind"] != rec["params"]["kind"]:
+                symbol, footprint = ((existing, rec) if existing["params"]["kind"] == "symbol"
+                                     else (rec, existing))
+                symbol["geometry_ref"]["board_footprint"] = footprint["geometry_ref"]["footprint"]
+                symbol["params"]["pad_count"] = footprint["params"]["pad_count"]
+                results[index] = symbol
+    return results
 
 
 def _load_native_dirs() -> Iterator[dict]:
@@ -234,24 +240,33 @@ def _load_user_sym_lib(path: str) -> Iterator[dict]:
         log.debug("EcadKicadAdapter: could not load user lib %r: %s", path, exc)
 
 
+def _kicad_label(name: str) -> str:
+    name = name.replace("_", " ")
+    name = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", name)
+    name = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", name)
+    return re.sub(r"(?<=\d)(?=mm\b)", " ", name, flags=re.IGNORECASE)
+
+
 def _symbol_record(libid: str, sdef: dict, *, license_: str, provenance: str) -> dict:
     name = sdef.get("name") or libid.split(":")[-1]
     desc = sdef.get("description") or sdef.get("datasheet") or ""
     pins = sdef.get("pins") or []
-    title = f"{name} KiCad symbol ({len(pins)} pins)" + (f" — {desc}" if desc else "")
-    footprint = sdef.get("footprint") or ""
+    pin_count = sdef.get("pin_count", len(pins))
+    title = f"{name} KiCad symbol ({pin_count} pins)"
+    footprint = sdef.get("footprint") or sdef.get("default_footprint") or ""
     return {
         "part_id":      f"ecad:{libid}",
         "domain":       "ecad",
         "title":        title,
+        "family":       _kicad_label(libid.split(":", 1)[0]) if ":" in libid else "",
         "standard":     None,
         "designation":  libid,
         "params":       {
             "nominal_size":      libid,
             "standard":          None,
             "kind":              "symbol",
-            "pin_count":         len(pins),
-            "reference_prefix":  sdef.get("reference_prefix", ""),
+            "pin_count":         pin_count,
+            "reference_prefix":  sdef.get("reference_prefix") or sdef.get("prefix", ""),
             "default_value":     sdef.get("value", ""),
             "footprint":         footprint,
             "description":       desc,
@@ -268,21 +283,26 @@ def _symbol_record(libid: str, sdef: dict, *, license_: str, provenance: str) ->
     }
 
 
+def _footprint_title(fpid: str) -> str:
+    return f"{_kicad_label(fpid.rsplit(':', 1)[-1])} (footprint)"
+
+
 def _footprint_record(fpid: str, fpdef: dict, *, license_: str, provenance: str) -> dict:
     desc = fpdef.get("description") or ""
-    title = f"{fpid} KiCad footprint" + (f" — {desc}" if desc else "")
+    title = _footprint_title(fpid)
     pads = fpdef.get("pads") or []
     return {
         "part_id":      f"ecad:{fpid}",
         "domain":       "ecad",
         "title":        title,
+        "family":       _kicad_label(fpid.split(":", 1)[0]) if ":" in fpid else "",
         "standard":     None,
         "designation":  fpid,
         "params":       {
             "nominal_size": fpid,
             "standard":     None,
             "kind":         "footprint",
-            "pad_count":    len(pads),
+            "pad_count":    fpdef.get("pad_count", len(pads)),
             "description":  desc,
         },
         "geometry_ref": {
@@ -298,60 +318,10 @@ def _footprint_record(fpid: str, fpdef: dict, *, license_: str, provenance: str)
 
 
 def _hit_to_record(hit: dict) -> dict:
-    """Convert an engine.ecad.library.search hit to a PartRecord."""
-    kind = hit.get("kind", "symbol")
-    if kind == "symbol":
-        libid = hit.get("libid", "")
-        name = hit.get("name", libid.split(":")[-1] if ":" in libid else libid)
-        desc = hit.get("description", "")
-        pin_count = hit.get("pin_count", 0)
-        title = f"{name} KiCad symbol ({pin_count} pins)" + (f" — {desc}" if desc else "")
-        return {
-            "part_id":      f"ecad:{libid}",
-            "domain":       "ecad",
-            "title":        title,
-            "standard":     None,
-            "designation":  libid,
-            "params":       {
-                "nominal_size":     libid,
-                "standard":         None,
-                "kind":             "symbol",
-                "pin_count":        pin_count,
-                "description":      desc,
-            },
-            "geometry_ref": {
-                "kind":      "symbol_footprint",
-                "library":   libid.split(":")[0] if ":" in libid else "",
-                "libid":     libid,
-                "footprint": hit.get("footprint", ""),
-            },
-            "sourcing":     [],
-            "provenance":   "engine.ecad.library search (starter + user libs)",
-            "license":      "user-supplied",
-        }
-    else:
-        fpid = hit.get("fpid", "")
-        desc = hit.get("description", "")
-        title = f"{fpid} KiCad footprint" + (f" — {desc}" if desc else "")
-        return {
-            "part_id":      f"ecad:{fpid}",
-            "domain":       "ecad",
-            "title":        title,
-            "standard":     None,
-            "designation":  fpid,
-            "params":       {
-                "nominal_size": fpid,
-                "standard":     None,
-                "kind":         "footprint",
-                "description":  desc,
-            },
-            "geometry_ref": {
-                "kind":      "symbol_footprint",
-                "library":   fpid.split(":")[0] if ":" in fpid else "",
-                "libid":     None,
-                "footprint": fpid,
-            },
-            "sourcing":     [],
-            "provenance":   "engine.ecad.library search (starter + user libs)",
-            "license":      "user-supplied",
-        }
+    """Convert a native catalog hit without inventing pins, pads or licensing."""
+    provenance = "Native KiCad library search; consult the source library for its license"
+    if hit.get("kind") == "symbol":
+        return _symbol_record(hit["libid"], hit, license_="user-supplied",
+                              provenance=provenance)
+    return _footprint_record(hit["fpid"], hit, license_="user-supplied",
+                             provenance=provenance)

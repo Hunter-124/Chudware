@@ -185,10 +185,9 @@ def test_misumi_search_parses_result_cards(adapter_mods, monkeypatch):
     assert hits[0]["url"] == (
         "https://us.misumi-ec.com/vona2/mech/M0100000000/M0101000000/threaded-linear-shafts/")
     assert hits[0]["site"] == "misumi"
-    assert hits[0]["part_number"] == "M0101000000_threaded-linear-shafts"
+    assert hits[0]["series_id"] == "M0101000000_threaded-linear-shafts"
     assert hits[0]["kind"] == "series"
-    # empty sku on the real results page → no invented value emitted
-    assert "sku" not in hits[0]
+    assert hits[0]["sku"] is None
 
 
 def test_misumi_search_login_wall_surfaces_ask_user(adapter_mods, monkeypatch):
@@ -206,10 +205,10 @@ def test_misumi_search_login_wall_surfaces_ask_user(adapter_mods, monkeypatch):
 def test_misumi_search_propagates_fetch_failure(adapter_mods, monkeypatch):
     _adapters_pkg, session, misumi, _lcsc, _digikey_web, _snapeda, _content3d = adapter_mods
     monkeypatch.setattr(session, "browser_fetch",
-                        lambda url, site: {"ok": False, "reason": "no_profile", "hint": "x"})
+                        lambda url, site: {"ok": False, "reason": "transport_failed", "hint": "x"})
 
     hits = misumi.ADAPTER.search("shaft")
-    assert hits == [{"ok": False, "reason": "no_profile", "hint": "x"}]
+    assert hits[0]["reason"] == "transport_failed" and hits[0]["site"] == "misumi"
 
 
 def test_misumi_acquire_downloads_and_returns_provenance(adapter_mods, monkeypatch):
@@ -220,13 +219,13 @@ def test_misumi_acquire_downloads_and_returns_provenance(adapter_mods, monkeypat
 
     def fake_download(url, site, dest):
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(b"STEP-FILE-BYTES")
+        dest.write_bytes(b"ISO-10303-21;\nHEADER;\nENDSEC;\nEND-ISO-10303-21;")
         return {"ok": True, "dest": str(dest), "session_profile_used": "misumi"}
 
     monkeypatch.setattr(session, "browser_fetch", fake_fetch)
     monkeypatch.setattr(session, "browser_download", fake_download)
 
-    result = misumi.ADAPTER.acquire({"title": "Linear Shaft",
+    result = misumi.ADAPTER.acquire({"title": "Linear Shaft", "sku": "PSFJ6-100",
                                      "url": "https://us.misumi-ec.com/vona2/detail/110302634310/"})
 
     assert result["ok"] is True
@@ -234,8 +233,9 @@ def test_misumi_acquire_downloads_and_returns_provenance(adapter_mods, monkeypat
     assert result["session_profile_used"] == "misumi"
     assert "license_note" in result and result["license_note"]
     assert result["artifact_path"].endswith("PSFJ6-100.step")
-    assert result["part_number"] == "PSFJ6-100"
-    assert result["price"] == "$4.56"
+    assert result["sku"] == "PSFJ6-100"
+    assert (result["price"], result["currency"]) == (4.56, "USD")
+    assert (result["artifact_kind"], result["format"]) == ("cad", "step")
 
 
 def test_misumi_acquire_login_wall(adapter_mods, monkeypatch):
@@ -243,7 +243,8 @@ def test_misumi_acquire_login_wall(adapter_mods, monkeypatch):
     monkeypatch.setattr(session, "browser_fetch",
                         lambda url, site: {"ok": True, "content": MISUMI_LOGIN_WALL_HTML})
 
-    result = misumi.ADAPTER.acquire({"url": "https://us.misumi-ec.com/vona2/detail/x/"})
+    result = misumi.ADAPTER.acquire({"url": "https://us.misumi-ec.com/vona2/detail/x/",
+                                     "sku": "PSFJ6-100"})
     assert result["ok"] is False
     assert result["reason"] == "login_required"
 
@@ -251,18 +252,20 @@ def test_misumi_acquire_login_wall(adapter_mods, monkeypatch):
 def test_misumi_acquire_no_download_link(adapter_mods, monkeypatch):
     _adapters_pkg, session, misumi, _lcsc, _digikey_web, _snapeda, _content3d = adapter_mods
     monkeypatch.setattr(session, "browser_fetch",
-                        lambda url, site: {"ok": True, "content": "<html>nothing here</html>"})
+                        lambda url, site: {"ok": True,
+                                           "content": '<span class="part-number">PSFJ6-100</span>'})
 
-    result = misumi.ADAPTER.acquire({"url": "https://us.misumi-ec.com/vona2/detail/x/"})
+    result = misumi.ADAPTER.acquire({"url": "https://us.misumi-ec.com/vona2/detail/x/",
+                                     "sku": "PSFJ6-100"})
     assert result["ok"] is False
-    assert result["reason"] == "no_download_link"
+    assert result["reason"] == "unsupported"
 
 
 def test_misumi_acquire_rejects_missing_url(adapter_mods):
     _adapters_pkg, _session, misumi, _lcsc, _digikey_web, _snapeda, _content3d = adapter_mods
     result = misumi.ADAPTER.acquire({"title": "no url here"})
     assert result["ok"] is False
-    assert result["reason"] == "bad_result"
+    assert result["reason"] == "unsupported"
 
 
 # --- LCSC -----------------------------------------------------------------------
@@ -279,8 +282,8 @@ def test_lcsc_search_parses_result_cards(adapter_mods, monkeypatch):
     # URL is derived from the LCSC code (no anchor href in the SSR table).
     assert hits[0]["url"] == "https://www.lcsc.com/product-detail/C8734.html"
     assert hits[0]["site"] == "lcsc"
-    assert hits[0]["lcsc"] == "C8734"
-    # Price/stock are not associated from the fragile results table; acquire() reads them.
+    assert hits[0]["sku"] == "C8734"
+    assert hits[0]["kind"] == "product"
     assert hits[0]["price"] is None
     assert hits[0]["stock"] is None
 
@@ -303,7 +306,7 @@ def test_lcsc_search_propagates_fetch_failure(adapter_mods, monkeypatch):
                         lambda url, site: {"ok": False, "reason": "no_profile", "hint": "x"})
 
     hits = lcsc.ADAPTER.search("stm32")
-    assert hits == [{"ok": False, "reason": "no_profile", "hint": "x"}]
+    assert hits[0]["reason"] == "no_profile" and hits[0]["site"] == "lcsc"
 
 
 def test_lcsc_acquire_returns_structured_record_with_datasheet(adapter_mods, monkeypatch):
@@ -311,7 +314,7 @@ def test_lcsc_acquire_returns_structured_record_with_datasheet(adapter_mods, mon
 
     def fake_download(url, site, dest):
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(b"PDF-BYTES")
+        dest.write_bytes(b"%PDF-1.7\n%%EOF")
         return {"ok": True, "dest": str(dest), "session_profile_used": "lcsc"}
 
     monkeypatch.setattr(session, "browser_fetch",
@@ -323,15 +326,15 @@ def test_lcsc_acquire_returns_structured_record_with_datasheet(adapter_mods, mon
 
     assert result["ok"] is True
     assert "license_note" in result and result["license_note"]
-    assert result["lcsc"] == "C8734"
-    assert result["price"] == "$2.10"
-    assert result["stock"] == "12,000"
+    assert result["sku"] == "C8734"
+    assert (result["price"], result["currency"], result["stock"]) == (2.10, "USD", 12000)
+    assert (result["artifact_kind"], result["format"]) == ("document", "pdf")
     assert result["datasheet_url"] == "https://www.lcsc.com/datasheet/STM32F103C8T6.pdf?v=2"
     assert result["artifact_path"].endswith("STM32F103C8T6.pdf")
 
 
-def test_lcsc_acquire_datasheet_download_failure_degrades_to_record(adapter_mods, monkeypatch):
-    """A failed datasheet download must not fail the structured record."""
+def test_lcsc_acquire_datasheet_download_failure_is_reported(adapter_mods, monkeypatch):
+    """A failed download is not a successful acquisition."""
     _adapters_pkg, session, _misumi, lcsc, _digikey_web, _snapeda, _content3d = adapter_mods
     monkeypatch.setattr(session, "browser_fetch",
                         lambda url, site: {"ok": True, "content": LCSC_DETAIL_HTML})
@@ -341,9 +344,9 @@ def test_lcsc_acquire_datasheet_download_failure_degrades_to_record(adapter_mods
     result = lcsc.ADAPTER.acquire(
         {"url": "https://www.lcsc.com/product-detail/STM32F103C8T6_C8734.html"})
 
-    assert result["ok"] is True
+    assert result["ok"] is False
+    assert result["reason"] == "no_profile"
     assert result.get("artifact_path") is None
-    assert result["lcsc"] == "C8734"
 
 
 def test_lcsc_acquire_login_wall(adapter_mods, monkeypatch):
@@ -360,13 +363,14 @@ def test_lcsc_acquire_rejects_missing_url(adapter_mods):
     _adapters_pkg, _session, _misumi, lcsc, _digikey_web, _snapeda, _content3d = adapter_mods
     result = lcsc.ADAPTER.acquire({"title": "no url here"})
     assert result["ok"] is False
-    assert result["reason"] == "bad_result"
+    assert result["reason"] == "not_found"
 
 
 # --- DigiKey (website fallback) ---------------------------------------------------
 
 def test_digikey_search_parses_result_cards(adapter_mods, monkeypatch):
     _adapters_pkg, session, _misumi, _lcsc, digikey_web, _snapeda, _content3d = adapter_mods
+    monkeypatch.setattr(digikey_web._vendor_api, "credentials", lambda _: None)
     monkeypatch.setattr(session, "browser_fetch",
                         lambda url, site: {"ok": True, "content": DIGIKEY_SEARCH_HTML})
 
@@ -384,6 +388,7 @@ def test_digikey_search_parses_result_cards(adapter_mods, monkeypatch):
 
 def test_digikey_search_login_wall_surfaces_ask_user(adapter_mods, monkeypatch):
     _adapters_pkg, session, _misumi, _lcsc, digikey_web, _snapeda, _content3d = adapter_mods
+    monkeypatch.setattr(digikey_web._vendor_api, "credentials", lambda _: None)
     monkeypatch.setattr(session, "browser_fetch",
                         lambda url, site: {"ok": True, "content": DIGIKEY_LOGIN_WALL_HTML})
 
@@ -396,29 +401,32 @@ def test_digikey_search_login_wall_surfaces_ask_user(adapter_mods, monkeypatch):
 
 def test_digikey_search_propagates_fetch_failure(adapter_mods, monkeypatch):
     _adapters_pkg, session, _misumi, _lcsc, digikey_web, _snapeda, _content3d = adapter_mods
+    monkeypatch.setattr(digikey_web._vendor_api, "credentials", lambda _: None)
     monkeypatch.setattr(session, "browser_fetch",
                         lambda url, site: {"ok": False, "reason": "no_profile", "hint": "x"})
 
     hits = digikey_web.ADAPTER.search("stm32")
-    assert hits == [{"ok": False, "reason": "no_profile", "hint": "x"}]
+    assert hits[0]["reason"] == "no_profile" and hits[0]["site"] == "digikey"
 
 
-def test_digikey_acquire_returns_structured_record_with_links(adapter_mods, monkeypatch):
+def test_digikey_acquire_returns_datasheet_document(adapter_mods, monkeypatch):
+    from services.net import safe_http
     _adapters_pkg, session, _misumi, _lcsc, digikey_web, _snapeda, _content3d = adapter_mods
     monkeypatch.setattr(session, "browser_fetch",
                         lambda url, site: {"ok": True, "content": DIGIKEY_DETAIL_HTML})
 
+    def download(url, destination, **kwargs):
+        destination.write_bytes(b"%PDF-1.4\nfixture")
+        return safe_http.Response(200, {}, url)
+
+    monkeypatch.setattr(safe_http, "download", download)
     result = digikey_web.ADAPTER.acquire(
         {"url": "https://www.digikey.com/en/products/detail/stmicroelectronics/STM32F103C8T6/1646338"})
-
     assert result["ok"] is True
-    assert "license_note" in result and result["license_note"]
-    assert result.get("artifact_path") is None
-    assert result["digikey_pn"] == "497-6063-ND"
-    assert result["price"] == "$3.75"
-    assert result["stock"] == "8,200"
+    assert result["license_note"]
+    assert result["artifact_path"].endswith(".pdf")
+    assert result["artifact_kind"] == "document" and result["format"] == "pdf"
     assert result["datasheet_url"] == "https://www.st.com/resource/en/datasheet/stm32f103c8.pdf"
-    assert result["ecad_url"].startswith("https://www.snapeda.com/parts/STM32F103C8T6")
 
 
 def test_digikey_acquire_login_wall(adapter_mods, monkeypatch):
@@ -435,7 +443,7 @@ def test_digikey_acquire_rejects_missing_url(adapter_mods):
     _adapters_pkg, _session, _misumi, _lcsc, digikey_web, _snapeda, _content3d = adapter_mods
     result = digikey_web.ADAPTER.acquire({"title": "no url here"})
     assert result["ok"] is False
-    assert result["reason"] == "bad_result"
+    assert result["reason"] == "not_found"
 
 
 # --- SnapEDA --------------------------------------------------------------------
@@ -473,7 +481,11 @@ def test_snapeda_search_propagates_fetch_failure(adapter_mods, monkeypatch):
                         lambda url, site: {"ok": False, "reason": "no_profile", "hint": "x"})
 
     hits = snapeda.ADAPTER.search("stm32")
-    assert hits == [{"ok": False, "reason": "no_profile", "hint": "x"}]
+    assert len(hits) == 1
+    assert hits[0]["reason"] == "no_profile"
+    assert hits[0]["hint"] == "x"
+    assert hits[0]["site"] == "snapeda"
+    assert hits[0]["op"] == "search"
 
 
 def test_snapeda_acquire_downloads_and_returns_provenance(adapter_mods, monkeypatch):
@@ -484,7 +496,9 @@ def test_snapeda_acquire_downloads_and_returns_provenance(adapter_mods, monkeypa
 
     def fake_download(url, site, dest):
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(b"ZIP-BYTES")
+        from zipfile import ZipFile
+        with ZipFile(dest, "w") as archive:
+            archive.writestr("STM32.kicad_sym", "(kicad_symbol_lib)")
         return {"ok": True, "dest": str(dest), "session_profile_used": "snapeda"}
 
     monkeypatch.setattr(session, "browser_fetch", fake_fetch)
@@ -498,6 +512,8 @@ def test_snapeda_acquire_downloads_and_returns_provenance(adapter_mods, monkeypa
     assert result["session_profile_used"] == "snapeda"
     assert "license_note" in result and result["license_note"]
     assert result["artifact_path"].endswith("STM32F103C8T6-kicad.zip")
+    assert result["artifact_kind"] == "ecad"
+    assert result["format"] == "zip"
     assert result["manufacturer"] == "STMicroelectronics"
 
 
@@ -518,14 +534,14 @@ def test_snapeda_acquire_no_download_link(adapter_mods, monkeypatch):
 
     result = snapeda.ADAPTER.acquire({"url": "https://www.snapeda.com/parts/x/y/view-part/"})
     assert result["ok"] is False
-    assert result["reason"] == "no_download_link"
+    assert result["reason"] == "not_found"
 
 
 def test_snapeda_acquire_rejects_missing_url(adapter_mods):
     _adapters_pkg, _session, _misumi, _lcsc, _digikey_web, snapeda, _content3d = adapter_mods
     result = snapeda.ADAPTER.acquire({"title": "no url here"})
     assert result["ok"] is False
-    assert result["reason"] == "bad_result"
+    assert result["reason"] == "not_found"
 
 
 # --- 3D ContentCentral ------------------------------------------------------------
@@ -573,7 +589,7 @@ def test_content3d_acquire_downloads_and_returns_provenance(adapter_mods, monkey
 
     def fake_download(url, site, dest):
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(b"STEP-FILE-BYTES")
+        dest.write_bytes(b"ISO-10303-21;\nHEADER;\nENDSEC;\nEND-ISO-10303-21;\n")
         return {"ok": True, "dest": str(dest), "session_profile_used": "3dcontentcentral"}
 
     monkeypatch.setattr(session, "browser_fetch", fake_fetch)
@@ -587,6 +603,7 @@ def test_content3d_acquire_downloads_and_returns_provenance(adapter_mods, monkey
     assert result["session_profile_used"] == "3dcontentcentral"
     assert "license_note" in result and result["license_note"]
     assert result["artifact_path"].endswith("608zz.step")
+    assert result["artifact_kind"] == "cad" and result["format"] == "step"
     assert result["supplier"] == "SKF"
 
 
@@ -609,11 +626,11 @@ def test_content3d_acquire_no_download_link(adapter_mods, monkeypatch):
     result = content3d.ADAPTER.acquire(
         {"url": "https://www.3dcontentcentral.com/parts/supplier/x"})
     assert result["ok"] is False
-    assert result["reason"] == "no_download_link"
+    assert result["reason"] == "unsupported"
 
 
 def test_content3d_acquire_rejects_missing_url(adapter_mods):
     _adapters_pkg, _session, _misumi, _lcsc, _digikey_web, _snapeda, content3d = adapter_mods
     result = content3d.ADAPTER.acquire({"title": "no url here"})
     assert result["ok"] is False
-    assert result["reason"] == "bad_result"
+    assert result["reason"] == "unsupported"

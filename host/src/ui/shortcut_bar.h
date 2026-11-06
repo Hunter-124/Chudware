@@ -3,20 +3,22 @@
 // Press 'S' while the viewport is hovered (and no text input is active) →
 // a small floating toolbar appears at the mouse position with context-aware commands.
 // Model mode: sketch_new, extrude_boss, extrude_cut, revolve_boss, fillet, chamfer.
-// Sketch mode: sk_line, sk_circle, sk_rect_corner, sk_arc_3pt, smart_dim, sketch_exit.
+// 2D and 3D sketches each have their own tools.
 #include "imgui.h"
 
 struct AppState;
 
 namespace ui {
 
+enum class ShortcutContext { Model, Sketch2d, Sketch3d };
+
 class ShortcutBar {
 public:
     // Call every frame while viewport is hovered.
-    // inSketch: true while a sketch is being edited.
+    // context: model, 2D sketch, or 3D sketch.
     // vr0/vr1: viewport image rect in screen coords (for clamping).
-    void update(AppState& st, bool imgHovered, bool inSketch, ImVec2 vr0, ImVec2 vr1);
-    void draw(AppState& st, bool inSketch);
+    void update(AppState& st, bool imgHovered, ShortcutContext context, ImVec2 vr0, ImVec2 vr1);
+    void draw(AppState& st, ShortcutContext context);
 
     bool visible() const { return m_visible; }
 

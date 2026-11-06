@@ -11,30 +11,20 @@ dispatch reuses them directly.
 
 Exposes these tools over the federated parts hub:
 
-- ``part_search(query, domain?, limit?)`` — FTS5-ranked search across all indexed providers.
-  Domain filter covers to section | fitting | hydraulic | ecad.
-  Domain "catalog" — GrabCAD/TraceParts results via the user's own
-  authenticated browser session (services/browser/adapters, contracts/parts.md §6.3's
-  reserved "paid catalog provider" seam, browser-session mechanism instead).
-  Live vendor results (ecad_vendor, browser catalog adapters) carry source:"live" in each
-  PartRecord and are returned as a fallback when the local index has no hits.
-- ``part_get(part_id)`` — retrieve a single PartRecord by its stable part_id. For a
-  "catalog" part_id this is also what triggers the actual browser download;
-  search() only returns lightweight not-yet-downloaded stubs.
+- ``part_search(query, domain?, limit?)`` searches indexed and live providers.
+  Browser discovery may run anonymously and reports login, challenge, transport
+  and other failures as notices. Live records carry source:"live".
+- ``part_get(part_id)`` retrieves a PartRecord by stable id; ``acquire=True``
+  explicitly fetches geometry or documents. Search does not download models.
 - ``part_place(part_id, doc?, params?)`` — insert a standard part into a doc,
-  routing geometry_ref to the correct domain path.  Always returns editable doc-schema
-  ops (R1 parity).  Every domain: core_family/generate_model/import_file → new mech part
-  doc; symbol_footprint → sch_add_symbol; section_profile → structural element;
-  fitting_id → piping fitting; fmu_component → hydraulic component.
+  routing geometry_ref to the correct editable domain path. Mechanical recipes
+  create part documents; symbol_footprint applies a schematic symbol or PCB
+  footprint op; section_profile, fitting_id and fmu_component insert into their
+  respective structural, piping and hydraulic documents.
 
-The hub is lazy-initialized on the first call; subsequent calls reuse the in-memory FTS index.
-No network, no keys, no core dependency for the fastener/bearing adapter (they run on the
-bundled clean-room YAML tables). The core-families adapter degrades gracefully when libchudware
-is absent. All adapters degrade gracefully (empty results, not tracebacks) when their
-backing data or credentials are absent — CI-safe. The browser catalog providers degrade
-the SAME way: no saved browser login profile for a site = that provider contributes zero
-results, silently — existing part_search/part_place behavior when no profile exists is
-unchanged.
+The hub initializes lazily and reuses its in-memory FTS index. Local providers
+need neither network access nor credentials; browser adapters use the user's
+session when needed and surface failures rather than silently claiming success.
 
 Source attribution: each PartRecord's ``source`` field is "live" for live vendor results and
 absent (local) for index results. ``part_search`` also reports ``has_live`` in the response
@@ -52,7 +42,6 @@ import re
 import shutil
 import sys
 import time
-import zipfile
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
@@ -69,7 +58,8 @@ if str(_REPO) not in sys.path:
 
 
 from services.mcp import result_serving as _rs
-from services.mcp.tool_registry import model_selectors
+from services.mcp._envelopes import reason_err
+from services.mcp.tool_registry import model_selectors, result_contract
 from .cad_common import coerce_json_or_repr
 
 def _ok(payload) -> str:
@@ -78,7 +68,7 @@ def _ok(payload) -> str:
 
 
 def _err(reason: str, hint: str = "") -> str:
-    return json.dumps({"ok": False, "reason": str(reason), "hint": str(hint)}, ensure_ascii=False)
+    return json.dumps(reason_err(str(reason), str(hint)), ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +116,7 @@ def _parse_json_dict(raw, what: str) -> tuple[dict | None, str | None]:
 # var-keyword parameter (_signature_spec then reports var_kw=True and passes the
 # call through untouched) and normalizes in-body. Two rules, no exceptions:
 #   * every rewrite is ECHOED back as `interpreted` (house convention — see
-#     services/mcp/cad_doc_tools.py::_interpreted_notes) so the model learns the
+#     services/mcp/cad_doc_tools.py::_split_notes) so the model learns the
 #     canonical spelling instead of leaning on the alias forever;
 #   * genuinely ambiguous input is a teaching error naming the accepted forms,
 #     never a silent guess.
@@ -221,27 +211,12 @@ def _unknown_args_error(tool: str, leftover: dict, params, examples: str) -> dic
 
 
 def _part_id_hint(part_id: str = "") -> str:
-    """Teach the id VOCABULARY — 'check it with part_get' teaches nothing."""
-    # LIVE gap (2026-07-29 sweep): 4 of the 6 measured ECAD failures were an invented
-    # KiCad-shaped id ('ecad:RF_Module:ESP32-WROOM-32'). Telling the model to "discover
-    # one with part_search" costs a whole round trip for candidate ids this hint can
-    # compute on the spot, so the ECAD resolver names real ones first. It is
-    # import-guarded and returns "" for anything that is not an ECAD id or on any
-    # failure, so the wording below is never lost and this path cannot raise.
-    ecad = ""
-    try:
-        from services.ecad.library.partid import hint as _ecad_id_hint
-        ecad = _ecad_id_hint(part_id)
-    except Exception:  # noqa: BLE001
-        ecad = ""
-    return ((ecad + " " if ecad else "")
-            + ("" if not part_id else f"{part_id!r} matched no record. ")
-            + "part ids are '<domain>:<catalog_id>' — 'fastener:ISO4762:M8', "
-              "'bearing:ISO 15:6205', 'mech_family:shcs:M5', 'ecad:Device:R', "
-              "'section:AISC:W8x31'. Discover one with part_search(query='...') "
-              "— or describe the part: part_search(part_type='bushing', "
-              "bore_mm=20, fit='sliding') — or part_source(need='...'). "
-              "Never invent an id.")
+    """Give discovery paths without suggesting a substitute for an unknown ID."""
+    return (("" if not part_id else f"{part_id!r} matched no record. ")
+            + "Part IDs are '<domain>:<catalog_id>', for example "
+              "'fastener:ISO4762:M8' or 'ecad:Device:R'. Discover an exact "
+              "KiCad symbol or footprint with part_search(query='...', domain='ecad'), "
+              "ecad_symbols, or ecad_find_footprint. Use part_source for sourced parts.")
 
 
 def _place_id_hint(part_id: str = "") -> str:
@@ -259,11 +234,10 @@ _PLACE_PARAMS_HINT = (
     'part_place(part_id="ecad:Device:R", location={"x": 10, "y": 20}).')
 
 _PLACE_DOC_HINT = (
-    'doc is the DOCUMENT ITSELF (a dict, or json.dumps(doc)) — never a doc id. '
-    'Mechanical parts need no doc at all: part_place("fastener:ISO4762:M8") '
-    'creates the document. ECAD/structural/piping/hydraulic placements need the '
-    'open doc: part_place("ecad:Device:R", doc=sch_doc, '
-    'params={"pos": {"x": 10, "y": 20}}).')
+    'For ECAD, pass the open schematic or board session as doc_id="..." '
+    '(or doc="..."); the placement is saved to its KiCad file. Mechanical '
+    'parts create their own document. Structural/piping/hydraulic placements '
+    'take a document object as doc (or doc=json.dumps(doc)).')
 
 # geometry_ref kinds that CREATE their own document (core/parts/place.cpp::route
 # plus the parametric_* families place_parametric_impl builds below).
@@ -334,7 +308,7 @@ def _descriptive_terms(leftover: dict) -> str:
 
 
 _SEARCH_PARAMS = ("query", "domain", "limit", "category_id", "facets",
-                  "price_max", "vendors", "in_stock", "detail")
+                  "price_max", "vendors", "in_stock", "detail", "include_live", "doc_id")
 
 _SEARCH_ALIASES = {
     "description": "query", "text": "query", "q": "query", "search": "query",
@@ -449,7 +423,7 @@ _VENDOR_REGISTER_ALIASES = {
 
 _VENDOR_SOURCE_KEYS = (
     "site", "title", "sku", "source_url", "price", "license_note",
-    "session_profile_used",
+    "session_profile_used", "artifact_kind", "format", "member", "archive_path", "cad_validated",
 )
 
 _SCRAPED_PRICE_RE = re.compile(
@@ -534,6 +508,8 @@ _PLACE_ALIASES = {
     "id": "part_id", "part": "part_id", "partnumber": "part_id",
     "record": "part_id", "partrecord": "part_id", "component": "part_id",
     "docid": "doc", "document": "doc", "targetdoc": "doc", "sheet": "doc",
+    "documentid": "doc", "targetdocid": "doc", "targetdocument": "doc",
+    "targetdocumentid": "doc", "assemblyid": "doc",
     "schematic": "doc", "board": "doc", "into": "doc",
     "parameters": "params", "options": "params", "overrides": "params",
     "placement": "params", "settings": "params", "props": "params",
@@ -550,20 +526,22 @@ _PLACE_PARAM_KEYS = {
 }
 
 _CAD_EXT = {".step": "step", ".stp": "step", ".iges": "iges", ".igs": "iges",
-            ".stl": "stl", ".3mf": "3mf", ".obj": "obj", ".zip": "zip"}
-_CAD_RANK = {"step": 0, "iges": 1, "3mf": 2, "stl": 3, "obj": 4, "zip": 5}
+            ".stl": "stl", ".3mf": "3mf", ".obj": "obj", ".fcstd": "fcstd", ".zip": "zip"}
+_CAD_RANK = {"step": 0, "iges": 1, "3mf": 2, "stl": 3, "obj": 4, "fcstd": 5, "zip": 6}
 _CAD_MAX = 200 * 1024 * 1024
-_CAD_HOSTS = {"grabcad.com": "grabcad", "traceparts.com": "traceparts",
-              "3dcontentcentral.com": "content3d", "printables.com": "printables",
-              "makerworld.com": "makerworld"}
+_CAD_SELECTION_FIELDS = frozenset({"url", "filename", "file_name", "download_url", "file_id", "instance_id",
+                                   "profile_id", "member", "archive_member"})
 
 
 def _cad_fail(reason: str, detail: str, candidates: list[str] | None = None) -> dict:
-    if reason not in {"login_required", "no_cad_link", "unsupported_format", "too_large",
-                      "browser_unavailable"} and (
-            not reason.startswith("http_") or not reason[5:].isdigit()):
-        reason = "no_cad_link"
     return {"ok": False, "reason": reason, "detail": detail, "candidates": candidates or []}
+
+
+def _cad_ambiguous(url: str, candidates: list[str], detail: str, *,
+                   selection_field: str = "archive_member") -> dict:
+    from services.browser.adapters import model_selection_question
+    return {**_cad_fail("unsupported_format", detail, candidates), "selection_field": selection_field,
+            "ask_user": model_selection_question(_cad_site(url), url, candidates)}
 
 
 def _cad_format(url: str) -> str | None:
@@ -572,13 +550,19 @@ def _cad_format(url: str) -> str | None:
 
 def _cad_site(url: str) -> str:
     parsed = urlparse(url)
-    if parsed.hostname in {"github.com", "www.github.com"} and (
-            parsed.path.startswith("/FreeCAD/FreeCAD-library/")):
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    if host == "github.com" and parsed.path.startswith("/FreeCAD/FreeCAD-library/"):
         return "freecadlibrary"
-    host = (parsed.hostname or "").lower()
-    for domain, site in _CAD_HOSTS.items():
-        if host == domain or host.endswith("." + domain):
-            return site
+    if host != "github.com":
+        from services.browser.adapters import all_adapters
+        best = ("", "")
+        for adapter in all_adapters():
+            for domain in adapter.hosts:
+                domain = domain.lower().removeprefix("www.")
+                if (host == domain or host.endswith("." + domain)) and len(domain) > len(best[0]):
+                    best = (domain, adapter.key)
+        if best[1]:
+            return best[1]
     return host or "web"
 
 
@@ -616,78 +600,115 @@ def _cad_project() -> Path:
     for key in ("CHUDWARE_PROJECT_DIR", "CHUDWARE_FS_ROOT"):
         start = os.environ.get(key, "").strip()
         if start:
-            root = resolve_project_root(start).resolve()
+            root = Path(start).resolve()
             if root.is_dir():
                 return root
     return resolve_project_root(Path.cwd()).resolve()
 
 
-def _cad_unpack(archive_path: Path, folder: Path, url: str) -> tuple[Path | None, dict | None]:
+def _cad_unpack(archive_path: Path, folder: Path, url: str, *, requested_format: str | None = None,
+                requested_member: str | None = None) -> tuple[Path | None, dict | None]:
+    from services.browser.cad_validate import extract_cad
+    extracted = extract_cad(archive_path, dest_dir=folder, requested_format=requested_format,
+                            requested_member=requested_member)
+    if not extracted.get("ok") or not extracted.get("member"):
+        candidates = extracted.get("candidates")
+        if candidates:
+            return None, _cad_ambiguous(url, candidates, extracted["reason"])
+        return None, _cad_fail("unsupported_format", extracted.get("reason") or
+                               "ZIP contains no supported CAD file.", [url])
+    temporary = Path(extracted["artifact_path"])
+    member = Path(extracted["member"])
+    dest = folder / (_cad_slug(member.stem) + member.suffix.lower())
     try:
-        with zipfile.ZipFile(archive_path) as archive:
-            members = [entry for entry in archive.infolist()
-                       if not entry.is_dir() and _cad_format(entry.filename) not in {None, "zip"}]
-            members.sort(key=lambda entry: (_CAD_RANK[_cad_format(entry.filename)], entry.filename))
-            if not members:
-                return None, _cad_fail("unsupported_format", "ZIP contains no supported CAD file.", [url])
-            member = members[0]
-            if member.file_size > _CAD_MAX:
-                return None, _cad_fail("too_large", "Archived CAD exceeds 200 MB.", [url])
-            dest = folder / (_cad_slug(Path(member.filename).stem) + Path(member.filename).suffix.lower())
-            with archive.open(member) as source, dest.open("wb") as target:
-                shutil.copyfileobj(source, target)
-            if dest.stat().st_size > _CAD_MAX:
-                dest.unlink()
-                return None, _cad_fail("too_large", "Archived CAD exceeds 200 MB.", [url])
-            return dest, None
-    except (OSError, ValueError, zipfile.BadZipFile, RuntimeError) as exc:
-        return None, _cad_fail("unsupported_format", f"Could not read ZIP at {url}: {exc}", [url])
+        temporary.replace(dest)
+        return dest, None
+    except OSError as exc:
+        temporary.unlink(missing_ok=True)
+        return None, _cad_fail("transport_failed", f"Could not save CAD from {url}: {exc}", [url])
 
 
-def _cad_download(url: str, folder: Path) -> tuple[Path | None, dict | None]:
+def _cad_download(url: str, folder: Path, *, requested_format: str | None = None,
+                  requested_member: str | None = None) -> tuple[Path | None, dict | None]:
+    import tempfile
     from services.browser.adapters import download_public_cad
+    from services.browser.cad_validate import validate_cad
+
     kind = _cad_format(url)
     if not kind:
         return None, _cad_fail("unsupported_format", f"No supported CAD extension at {url}.")
     filename = _cad_slug(Path(unquote(urlparse(url).path)).stem) + "." + kind
     dest = folder / filename
-    staging = folder / (filename + ".download")
+    staging = None
     try:
-        outcome = download_public_cad(url, staging, max_bytes=_CAD_MAX)
+        with tempfile.NamedTemporaryFile(dir=folder, prefix=".cad-fetch-", suffix="." + kind,
+                                         delete=False) as temp:
+            staging = Path(temp.name)
+        options = {}
+        if requested_format:
+            options["requested_format"] = requested_format
+        if requested_member:
+            options["requested_member"] = requested_member
+        outcome = download_public_cad(url, staging, max_bytes=_CAD_MAX, **options)
         if not outcome.get("ok"):
-            code = outcome.get("status")
-            reason = f"http_{code}" if isinstance(code, int) and code >= 400 else (
-                "login_required" if outcome.get("reason") in {"bot_walled", "challenge_page"} else
-                outcome.get("reason") or "no_cad_link")
-            detail = outcome.get("detail") or outcome.get("hint") or f"Download failed at {url}."
-            if reason == "login_required":
-                detail += f" Download it at {url} and drop the CAD file in your project."
-            return None, _cad_fail(reason, detail, [url])
-        if not staging.is_file():
+            error = {**outcome, "detail": outcome.get("detail") or outcome.get("hint") or
+                     f"Download failed at {url}.", "candidates": outcome.get("candidates") or [url]}
+            if outcome.get("candidates"):
+                from services.browser.adapters import model_selection_question
+                error["ask_user"] = model_selection_question(_cad_site(url), url, outcome["candidates"])
+            return None, error
+        if not staging.is_file() or staging.stat().st_size == 0:
             return None, _cad_fail("no_cad_link", f"No file downloaded from {url}.", [url])
         if staging.stat().st_size > _CAD_MAX:
             return None, _cad_fail("too_large", "CAD download exceeds 200 MB.", [url])
-        with staging.open("rb") as stream:
-            prefix = stream.read(256).lstrip().lower()
-        if prefix.startswith((b"<!doctype html", b"<html", b"{", b"[")) or (
-                kind in {"zip", "3mf"} and not zipfile.is_zipfile(staging)):
-            return None, _cad_fail("unsupported_format",
-                                   f"{url} returned HTML or non-CAD content, not a {kind} file.", [url])
+        checked = validate_cad(staging, requested_format=requested_format, requested_member=requested_member)
+        if not checked["ok"]:
+            if checked.get("candidates"):
+                return None, _cad_ambiguous(url, checked["candidates"], checked["reason"])
+            return None, _cad_fail("unsupported_format", checked["reason"], [url])
         if kind == "zip":
-            return _cad_unpack(staging, folder, url)
-        else:
-            staging.replace(dest)
+            return _cad_unpack(staging, folder, url, requested_format=requested_format,
+                               requested_member=requested_member)
+        staging.replace(dest)
         return dest, None
-    except (OSError, ValueError, zipfile.BadZipFile, RuntimeError) as exc:
-        return None, _cad_fail("unsupported_format", f"Could not read CAD file at {url}: {exc}", [url])
+    except (OSError, ValueError, RuntimeError) as exc:
+        return None, _cad_fail("transport_failed", f"Could not save CAD file at {url}: {exc}", [url])
     finally:
-        staging.unlink(missing_ok=True)
+        if staging is not None:
+            staging.unlink(missing_ok=True)
 
 
 def fetch_cad_model_impl(url: str, name: str | None = None,
-                         import_part: bool = True, *, importer=None) -> dict:
-    """Acquire a CAD file from a direct HTTPS URL or a model page into this project."""
+                         import_part: bool = True, *, importer=None,
+                         project_root: Path | None = None, requested_format: str | None = None,
+                         requested_member: str | None = None, selection_field: str | None = None,
+                         selection: str | None = None, selectors: dict | None = None) -> dict:
+    """Acquire a CAD file from a direct HTTPS URL or a model page into this project.
+
+    ``project_root`` pins the destination folder exactly (an RE session's working folder);
+    otherwise the bound/ambient project root is resolved, climbing to its outermost marker.
+    """
     from services.browser import adapters
+    if selectors is not None and not isinstance(selectors, dict):
+        return _cad_fail("unsupported_format", "selectors must be an object.", [url])
+    choices = dict(selectors or {})
+    if selection_field or selection:
+        if selection_field not in _CAD_SELECTION_FIELDS or not isinstance(selection, str) or not selection:
+            return _cad_fail("unsupported_format", "Supply a valid selection_field and selection.", [url])
+        if selection_field in choices and choices[selection_field] != selection:
+            return _cad_fail("unsupported_format", "Conflicting model selections.", [url])
+        choices[selection_field] = selection
+    if any(key not in _CAD_SELECTION_FIELDS or not isinstance(value, str) or not value
+           for key, value in choices.items()):
+        return _cad_fail("unsupported_format", "Invalid model selector.", [url])
+    selected_url = choices.pop("url", None)
+    if selected_url:
+        url = selected_url
+    members = {choices.pop(key) for key in ("member", "archive_member") if key in choices}
+    if len(members) > 1 or (members and requested_member and requested_member not in members):
+        return _cad_fail("unsupported_format", "Conflicting archive-member selections.", [url])
+    if members:
+        requested_member = members.pop()
 
     parsed = urlparse(url.strip())
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
@@ -696,27 +717,34 @@ def fetch_cad_model_impl(url: str, name: str | None = None,
     source_url = url
     license_note = None
     artifact: Path | None = None
+    artifact_kind = None
     download_url = url if _cad_format(url) else None
+    if download_url and choices:
+        return _cad_fail("unsupported_format", "That selector requires a vendor model page.", [url])
     if not download_url:
-        adapter = adapters.get_adapter(site) if site in {
-            "grabcad", "traceparts", "content3d", "freecadlibrary", "printables", "makerworld"
-        } else None
+        adapter = adapters.get_adapter(site)
         if adapter:
-            acquired = adapter.acquire({"url": url, "title": name or ""})
+            hit = {"url": url, "title": name or ""}
+            if requested_format:
+                hit.update(format=requested_format, requested_format=requested_format)
+            if requested_member:
+                hit.update(member=requested_member, archive_member=requested_member)
+            hit.update(choices)
+            acquired = adapter.acquire(hit)
             if not acquired.get("ok"):
-                reason = acquired.get("reason") or "no_cad_link"
-                if site in {"grabcad", "makerworld"} and reason in {
-                        "no_download_link", "bot_walled", "challenge_page",
-                        "browser_fetch_failed", "browser_download_failed"}:
-                    reason = "login_required"
                 detail = acquired.get("detail") or acquired.get("hint") or f"No CAD download at {url}."
-                if reason == "login_required":
-                    detail += f" Download it at {url} and drop the CAD file in your project."
-                return _cad_fail(reason, detail, acquired.get("candidates") or [url])
+                prior = {**({"url": selected_url} if selected_url else {}), **choices,
+                         **({"archive_member": requested_member} if requested_member else {})}
+                return {**acquired, "detail": detail, "candidates": acquired.get("candidates") or [url],
+                        **({"selectors": prior} if prior else {}),
+                        **({"requested_format": requested_format} if requested_format else {})}
             artifact = Path(str(acquired.get("artifact_path") or ""))
+            artifact_kind = acquired.get("artifact_kind")
             license_note = acquired.get("license_note")
             download_url = acquired.get("raw_url") or acquired.get("download_url") or url
         else:
+            if choices:
+                return _cad_fail("unsupported_format", "That selector requires a registered vendor adapter.", [url])
             # Unknown sites use only the pinned public HTTPS path, never browser
             # rendering with unrestricted scripts, subresources, or shared profiles.
             from services.research.fetch_page import _http_get
@@ -734,41 +762,72 @@ def fetch_cad_model_impl(url: str, name: str | None = None,
                     "unrecognized sites is not supported. Download the CAD file manually "
                     "from that page and drop it in your project, or provide a direct public HTTPS CAD URL.",
                     [final_url])
+            if requested_format:
+                desired = {"stp": "step", "igs": "iges"}.get(requested_format.lower(), requested_format.lower())
+                exact = [link for link in links if _cad_format(link) == desired]
+                links = exact or [link for link in links if _cad_format(link) == "zip"]
+                if not links:
+                    return _cad_fail("unsupported_format", "The requested CAD format is unavailable.", [final_url])
+            stems = {Path(unquote(urlparse(link).path)).stem.casefold() for link in links}
+            if len(stems) > 1:
+                return _cad_ambiguous(final_url, links, "The page lists different models; select one.",
+                                      selection_field="url")
             download_url = links[0]
             site = _cad_site(download_url) if _cad_site(download_url) != "web" else site
     label = name or (Path(unquote(parsed.path)).stem if _cad_format(url)
                      else Path(unquote(parsed.path)).name)
-    root = _cad_project()
+    root = Path(project_root).resolve() if project_root else _cad_project()
     folder = root / "reference" / _cad_slug(label)
     if not folder.resolve().is_relative_to(root):
         return _cad_fail("unsupported_format", "Reference directory points outside the project.")
     folder.mkdir(parents=True, exist_ok=True)
     if artifact is not None:
+        import tempfile
+        from services.browser.cad_validate import validate_cad
+        if artifact_kind not in (None, "cad"):
+            return _cad_fail("unsupported_format", f"Adapter returned {artifact_kind}, not CAD, from {url}.", [url])
         if not artifact.is_file() or not _cad_format(str(artifact)):
             return _cad_fail("unsupported_format", f"Adapter returned no CAD file for {url}.", [url])
         if artifact.stat().st_size > _CAD_MAX:
             return _cad_fail("too_large", "CAD download exceeds 200 MB.", [url])
-        dest = folder / (_cad_slug(artifact.stem) + artifact.suffix.lower())
-        shutil.copyfile(artifact, dest)
-        with dest.open("rb") as stream:
-            prefix = stream.read(256).lstrip().lower()
-        if prefix.startswith((b"<!doctype html", b"<html", b"{", b"[")) or (
-                _cad_format(str(dest)) in {"zip", "3mf"} and not zipfile.is_zipfile(dest)):
-            dest.unlink()
-            return _cad_fail("unsupported_format", f"Adapter returned HTML, not CAD, from {url}.", [url])
-        if _cad_format(str(dest)) == "zip":
-            path, error = _cad_unpack(dest, folder, url)
-            dest.unlink()
+        archive_member = requested_member if _cad_format(str(artifact)) == "zip" else None
+        checked = validate_cad(artifact, requested_format=requested_format, requested_member=archive_member)
+        if not checked["ok"]:
+            if checked.get("candidates"):
+                return _cad_ambiguous(url, checked["candidates"], checked["reason"])
+            return _cad_fail("unsupported_format", checked["reason"], [url])
+        if _cad_format(str(artifact)) == "zip":
+            path, error = _cad_unpack(artifact, folder, url, requested_format=requested_format,
+                                      requested_member=archive_member)
         else:
-            path, error = dest, None
+            dest = folder / (_cad_slug(artifact.stem) + artifact.suffix.lower())
+            staging = None
+            try:
+                with tempfile.NamedTemporaryFile(dir=folder, prefix=".cad-copy-",
+                                                 suffix=artifact.suffix, delete=False) as temp:
+                    staging = Path(temp.name)
+                shutil.copyfile(artifact, staging)
+                copied = validate_cad(staging, requested_format=requested_format)
+                if not copied["ok"]:
+                    return _cad_fail("unsupported_format", copied["reason"], [url])
+                staging.replace(dest)
+                path, error = dest, None
+            finally:
+                if staging is not None:
+                    staging.unlink(missing_ok=True)
     else:
-        path, error = _cad_download(download_url, folder)
+        path, error = _cad_download(download_url, folder, requested_format=requested_format,
+                                    requested_member=requested_member)
     if error:
         return error
     with path.open("rb") as stream:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
     provenance = {"site": site, "url": source_url, "retrieved_at": datetime.now(timezone.utc).isoformat(),
                   "sha256": digest}
+    if requested_format:
+        provenance["requested_format"] = requested_format
+    if requested_member:
+        provenance["member"] = requested_member
     if license_note:
         provenance["license"] = license_note
     path.with_name(path.name + ".provenance.json").write_text(
@@ -776,6 +835,9 @@ def fetch_cad_model_impl(url: str, name: str | None = None,
     result = {"ok": True, "artifact_path": str(path), "format": _cad_format(str(path)),
               "source_url": source_url, "provenance": provenance}
     if import_part:
+        if result["format"] == "fcstd":
+            return {**result, "ok": False, "reason": "unsupported_format",
+                    "detail": "FreeCAD documents are downloadable but cannot currently be imported natively."}
         if importer is None:
             return _cad_fail("unsupported_format", "CAD importer is unavailable.", [str(path)])
         imported = importer(str(path), {"source_url": source_url, "site": site,
@@ -848,7 +910,8 @@ def taxonomy_browse(node_id: str = "", depth: int = 2,
 def search_parts_v2(query: str = "", domain: str = "", limit: int = 20,
                     category_id: str = "", facets=None, price_max: float = 0.0,
                     vendors: str = "", in_stock: bool = False,
-                    detail: str = "summary", **kwargs) -> dict:
+                    detail: str = "summary", include_live: bool = True,
+                    doc_id: str = "", **kwargs) -> dict:
     """V2 faceted, taxonomy-routed part search. Backward-compatible envelope
     (ok/count/has_live/results) plus facet_summary + applied.
 
@@ -868,7 +931,8 @@ def search_parts_v2(query: str = "", domain: str = "", limit: int = 20,
     supplied = {"query": query, "domain": domain, "limit": limit,
                 "category_id": category_id, "facets": facets,
                 "price_max": price_max, "vendors": vendors,
-                "in_stock": in_stock, "detail": detail}
+                "in_stock": in_stock, "detail": detail, "include_live": include_live,
+                "doc_id": doc_id}
     used = [k for k, v in supplied.items()
             if k not in ("limit", "detail") and v not in (None, "", 0, 0.0, False)]
     mapped, leftover = _absorb(kwargs, _SEARCH_PARAMS, _SEARCH_ALIASES, notes, used)
@@ -877,7 +941,8 @@ def search_parts_v2(query: str = "", domain: str = "", limit: int = 20,
     domain, category_id = supplied["domain"], supplied["category_id"]
     facets, vendors, detail = supplied["facets"], supplied["vendors"], supplied["detail"]
     limit, price_max = supplied["limit"], supplied["price_max"]
-    in_stock = supplied["in_stock"]
+    in_stock, include_live = supplied["in_stock"], supplied["include_live"]
+    doc_id = str(supplied["doc_id"] or "").strip()
 
     if leftover:
         terms = _descriptive_terms(leftover)
@@ -892,17 +957,6 @@ def search_parts_v2(query: str = "", domain: str = "", limit: int = 20,
                 f"category_id=... plus facets={{...}} keyed by ITS facet keys.")
         else:
             notes.append(f"ignored empty argument(s) {keys}")
-    if not query and not str(category_id or "").strip() \
-            and not str(domain or "").strip() and not facets:
-        return {"ok": False,
-                "reason": "part_search has nothing to search for — no query, no "
-                          "descriptive arguments, no category_id, no domain.",
-                "hint": "Pass free text: part_search(query='M8 socket head cap "
-                        "screw'). Or DESCRIBE the part and the attributes are "
-                        "folded into the query for you: "
-                        "part_search(part_type='bushing', fit='sliding', "
-                        "bore_mm=20). Browse categories with parts_taxonomy().",
-                "interpreted": _interpreted_notes(notes)}
 
     facets_q, err = _parse_json_dict(facets, "facets")
     if err:
@@ -912,6 +966,18 @@ def search_parts_v2(query: str = "", domain: str = "", limit: int = 20,
                         'keys parts_taxonomy(node_id) lists for your category_id '
                         '— a key no record carries matches nothing.',
                 "interpreted": _interpreted_notes(notes)}
+    if not query and not str(category_id or "").strip() \
+            and not str(domain or "").strip() and not facets_q:
+        return {"ok": False,
+                "reason": "part_search has nothing to search for — no query, no "
+                          "descriptive arguments, no category_id, no domain or facets.",
+                "hint": "Pass free text: part_search(query='M8 socket head cap "
+                        "screw'). Or DESCRIBE the part and the attributes are "
+                        "folded into the query for you: "
+                        "part_search(part_type='bushing', fit='sliding', "
+                        "bore_mm=20). Browse categories with parts_taxonomy().",
+                "interpreted": _interpreted_notes(notes)}
+
     try:
         from services.parts import search as _search
     except Exception as exc:  # noqa: BLE001
@@ -920,40 +986,40 @@ def search_parts_v2(query: str = "", domain: str = "", limit: int = 20,
     try:
         limit = max(1, min(int(limit or 20), 200))
         category_id = str(category_id or "").strip()
-        dom: str | list[str] | None = (domain or "").strip() or None
-        route_sites: list[str] = []
-        query_terms: list[str] = []
-        facet_defs: list[dict] = []
-        if category_id:
-            # Taxonomy routing — mirrors services/parts/gui_rpc._parts_search.
-            from services.parts import taxonomy as _tax
-            if _tax.get_node(category_id) is not None:
-                routing = _tax.route(category_id)
-                dom = routing["domains"] or dom
-                route_sites = routing["sites"]
-                query_terms = routing["query_terms"]
-                facet_defs = _tax.effective_facets(category_id)
+        from services.parts.gui_rpc import _compute_routing
+        from services.parts.search_relevance import descriptive_relevant, live_relevant, score_record
+        try:
+            routing = _compute_routing({"query": query, "category_id": category_id,
+                                        "category": str(domain or "").strip(), "doc_id": doc_id})
+        except ValueError:
+            return {"ok": False, "reason": "unknown_category",
+                    "hint": f"Unknown category {category_id!r}; browse parts_taxonomy()."}
+        dom = routing["domain"] or (domain or "").strip() or None
+        route_sites = routing["route_sites"]
+        facet_defs = routing["facet_defs"]
 
-        records = list(_search(query, domain=dom, limit=limit,
-                               sites=route_sites or None))
-
-        if category_id and route_sites:
-            # Category-routed live catalog merge, restricted to the node's sites.
-            vendor_query = " ".join([query] + [t for t in query_terms if t]).strip()
+        # Filters are applied below; ask the hub for a bounded candidate pool first.
+        pool_limit = min(1000, max(200, limit * 5)) if (
+            facets_q or price_max or vendors or in_stock) else limit
+        # One local lookup and one concurrent catalog fan-out share a single wall
+        # budget. In particular, a category search must not fan out twice.
+        search_options = {"domain": dom, "limit": pool_limit, "include_live": False}
+        if doc_id:
+            search_options["filters"] = {"doc_id": doc_id}
+        records = list(_search(query, **search_options))
+        if include_live and route_sites:
             try:
-                # Restrict the live fan-out to the category's fitting vendors so a
-                # query never fetches from a vendor that can't stock it (no
-                # McMaster for microcontrollers). The prefix filter below stays as
-                # a belt-and-braces guard. Inherits the hub's live wall budget.
-                cat_records = _search(vendor_query, domain="catalog", limit=limit,
-                                      sites=route_sites)
-            except Exception:  # noqa: BLE001 — live layer optional
-                cat_records = []
+                cat_records = _search(routing["vendor_query"], domain="catalog", limit=pool_limit,
+                                      sites=route_sites, force_live=True)
+            except Exception as exc:  # noqa: BLE001 — retain an actionable notice
+                cat_records = [{"site": "", "reason": "transport_failed", "hint": str(exc)}]
             prefixes = tuple(f"catalog:{s}::" for s in route_sites)
             seen_ids = {str(r.get("part_id", "")) for r in records}
             for rec in cat_records:
                 pid = str(rec.get("part_id", ""))
-                if pid.startswith(prefixes) and pid not in seen_ids:
+                if not pid or not str(rec.get("title") or "").strip():
+                    records.append(rec)
+                elif pid.startswith(prefixes) and pid not in seen_ids:
                     seen_ids.add(pid)
                     records.append(rec)
         # Drop non-record stubs (login_required pass-throughs) into notices.
@@ -970,11 +1036,38 @@ def search_parts_v2(query: str = "", domain: str = "", limit: int = 20,
             if not n_site and pid.startswith("catalog:"):
                 n_site = pid[len("catalog:"):].split("::", 1)[0]
             n_reason = str(r.get("reason", "") or "unavailable")
-            if (n_site, n_reason) not in seen_notice:
-                seen_notice.add((n_site, n_reason))
-                notices.append({"site": n_site, "reason": n_reason,
-                                "hint": str(r.get("hint", "") or "")})
-        records = clean
+            notice_key = (n_site, n_reason, str(r.get("hint") or ""),
+                          str(r.get("ask_user") or ""), str(r.get("retry_after_s") or ""),
+                          str(r.get("url") or ""))
+            if notice_key not in seen_notice:
+                seen_notice.add(notice_key)
+                notice = {"site": n_site, "reason": n_reason,
+                          "hint": str(r.get("hint", "") or "")}
+                for key in ("ask_user", "retry_after_s", "op", "url", "status"):
+                    if r.get(key) is not None:
+                        notice[key] = r[key]
+                notices.append(notice)
+        timed_out = [notice for notice in notices if notice["reason"] == "timeout"]
+        if timed_out:
+            notices = [notice for notice in notices if notice["reason"] != "timeout"]
+            site_details = []
+            for notice in timed_out:
+                site_info = {key: value for key, value in notice.items()
+                             if key not in ("reason", "hint")}
+                hint = notice.get("hint", "")
+                if hint and not (hint.startswith("live vendor '") and "budget" in hint):
+                    site_info["hint"] = hint
+                site_details.append(site_info)
+            notices.append({"site": "", "reason": "timeout",
+                            "hint": f"{len(timed_out)} live source(s) exceeded the search budget.",
+                            "sites": site_details})
+        records = [r for r in clean if (
+            live_relevant(r, query) if r.get("source") == "live"
+            else descriptive_relevant(r, query))]
+        for rec in records:
+            rec["score"] = score_record(rec, query)
+        if query:
+            records.sort(key=lambda rec: -rec["score"])
 
         if facets_q:
             # Facet post-filter with param-key alias tolerance (taxonomy keys like
@@ -1007,6 +1100,9 @@ def search_parts_v2(query: str = "", domain: str = "", limit: int = 20,
                 return bool(rows) and all(int(row["stock"]) == 0 for row in rows)
             records = [r for r in records if not _known_out_of_stock(r)]
 
+        records = [{"index": i, **{k: v for k, v in r.items() if k != "index"}}
+                   for i, r in enumerate(records[:limit])]
+
         # facet_summary: top value counts per facet key over THIS result set.
         summary_keys = [f.get("key") for f in facet_defs if f.get("key")] or \
             sorted(facets_q.keys())
@@ -1033,7 +1129,7 @@ def search_parts_v2(query: str = "", domain: str = "", limit: int = 20,
             "applied": {"query": query, "domain": dom, "category_id": category_id,
                         "facets": facets_q, "price_max": price_max,
                         "vendors": wanted_vendors, "in_stock": bool(in_stock),
-                        "sites": route_sites},
+                        "sites": route_sites, "doc_id": doc_id},
         }
         if notes:
             payload["interpreted"] = _interpreted_notes(notes)
@@ -1599,6 +1695,115 @@ def place_parametric_impl(part_id: str, record: dict, params: dict | None = None
             "editable": True, "detail": detail, "reason": None, "hint": None}
 
 
+def _place_ecad_part(record: dict, doc: dict | None, doc_id: str, params: dict) -> dict:
+    """Place a library symbol/footprint through the ECAD op engine."""
+    from .ecad_common import (EcadSession, OpError, _apply, _attach_lib_defs, _rpc,
+                              _ECAD_OPERATION_LOCK, ecad_session)
+
+    temp_id = ""
+    try:
+        if doc_id:
+            session = ecad_session.get_session(doc_id)
+            source = session.doc
+        elif isinstance(doc, dict):
+            source = doc
+            session = None
+        else:
+            return {"ok": False, "reason": "An ECAD document is required.",
+                    "hint": _PLACE_DOC_HINT}
+
+        schema = source.get("schema")
+        gref = record.get("geometry_ref") or {}
+        if schema == "aicad.sch/1":
+            ident = gref.get("libid")
+            if not ident:
+                return {"ok": False, "reason": "A footprint cannot be placed on a schematic.",
+                        "hint": "Choose a symbol for a schematic or open a PCB for the footprint."}
+            op = {"op": "sch_add_symbol", "libid": ident}
+            footprint = params.get("footprint", gref.get("footprint"))
+            if footprint:
+                op["footprint"] = footprint
+            for key in ("ref", "value", "unit", "sheet", "mirror", "fields",
+                        "datasheet", "in_bom", "on_board", "dnp", "sim_params"):
+                if key in params:
+                    op[key] = params[key]
+        elif schema == "aicad.pcb/1":
+            ident = (params.get("footprint") or gref.get("board_footprint")
+                     or gref.get("footprint"))
+            if not ident:
+                return {"ok": False, "reason": "This symbol has no assigned footprint.",
+                        "hint": "Search for a footprint or pass params={'footprint': '<fpid>'}."}
+            op = {"op": "pcb_add_footprint", "fpid": ident}
+            for key in ("ref", "value", "side", "linked_symbol"):
+                if key in params:
+                    op[key] = params[key]
+        else:
+            return {"ok": False, "reason": "Expected a schematic or PCB document.",
+                    "hint": _PLACE_DOC_HINT}
+
+        pos = params.get("pos", [0, 0])
+        if isinstance(pos, dict):
+            pos = [pos.get("x", 0), pos.get("y", 0)]
+        if not isinstance(pos, (list, tuple)) or len(pos) != 2:
+            raise ValueError("ECAD position must be [x, y] or {'x': x, 'y': y}")
+        op["pos"] = [float(pos[0]), float(pos[1])]
+        op["angle"] = float(params.get("rotation", params.get("angle", 0)))
+        if not all(math.isfinite(n) for n in (*op["pos"], op["angle"])):
+            raise ValueError("ECAD position and rotation must be finite numbers")
+
+        if session is not None:
+            # The shared session helper preflights locks and saves the bound
+            # KiCad file after the accepted op batch.
+            with _ECAD_OPERATION_LOCK:
+                ecad_session.bind_unbound(session)
+                response = _apply(session, [op])
+                updated = session.doc
+                result_doc_id = session.doc_id
+        else:
+            # Preserve the existing inline-document interface without claiming
+            # that its detached result was saved into a project.
+            kind = "sch" if schema == "aicad.sch/1" else "pcb"
+            created = _rpc("ecad_new", {"kind": kind})
+            temp_id = str(created["doc_id"])
+            swapped = _rpc("ecad_swap_doc", {"doc_id": temp_id, "doc": source,
+                                             "base_revision": -1})
+            session = EcadSession(temp_id, swapped.get("tree") or source,
+                                  revision=swapped.get("revision", 0))
+            response = _rpc("ecad_apply_ops", {
+                "doc_id": temp_id, "base_revision": session.revision,
+                "ops": _attach_lib_defs(session, [op]),
+            })
+            updated = response.get("tree")
+            if not isinstance(updated, dict):
+                raise ValueError("ECAD placement returned no document tree")
+            result_doc_id = source.get("id")
+
+        entity_id = (response.get("id_map") or {}).get("$0")
+        collection = "symbols" if schema == "aicad.sch/1" else "footprints"
+        entity = next((item for item in updated.get(collection, [])
+                       if item.get("id") == entity_id), None)
+        if not entity:
+            raise ValueError("ECAD placement returned no placed entity")
+        detail = {"libid" if schema == "aicad.sch/1" else "fpid": ident,
+                  "ref": entity.get("ref"), "pos": entity.get("pos")}
+        return {"ok": True, "domain": "symbol_footprint", "doc_id": result_doc_id,
+                "entity_id": entity_id, "editable": True, "detail": detail,
+                "doc": updated, "revision": response.get("revision"),
+                "path": session.path if doc_id else None,
+                "saved": bool(doc_id and session.path),
+                "warnings": response.get("warnings") or [], "reason": None, "hint": None}
+    except (OpError, ValueError, TypeError, KeyError) as exc:
+        return {"ok": False, "domain": "symbol_footprint", "editable": False,
+                "reason": str(exc), "code": getattr(exc, "code", "invalid_placement"),
+                "detail": getattr(exc, "detail", {}), "hint": _PLACE_DOC_HINT}
+    finally:
+        if temp_id:
+            try:
+                _rpc("ecad_close", {"doc_id": temp_id})
+            except OpError:
+                pass
+
+
 def register_parts_tools(mcp: FastMCP) -> None:
     """Register part_search, part_get, and part_place MCP tools (append-only).
 
@@ -1612,8 +1817,8 @@ def register_parts_tools(mcp: FastMCP) -> None:
     def part_search(query: str = "", domain: str = "", limit: int = 20,
                     category_id: str = "", facets: str = "",
                     price_max: float = 0.0, vendors: str = "",
-                    in_stock: bool = False, detail: str = "summary",
-                    **kwargs: _VarKw) -> str:
+                    in_stock: bool = False, detail: str = "summary", include_live: bool = True,
+                    doc_id: str = "", previews: bool = True, **kwargs: _VarKw) -> Any:
         """Search the unified standard-parts library (all domains federated), with
         V2 taxonomy routing + faceted filtering.
 
@@ -1621,6 +1826,10 @@ def register_parts_tools(mcp: FastMCP) -> None:
         ``{part_id, title, domain, vendor, price, designation, score}`` plus
         ``facet_summary`` / ``applied``. Full PartRecords stay behind
         ``part_get(part_id)`` or ``detail='full'``.
+        A preview sheet labels up to 16 rows by their JSON index. CAD renders and
+        product photos are distinguished; missing previews are explicit. Use the
+        sheet to choose candidates, then confirm identity and dimensions with
+        part_get before acquiring or placing anything.
 
         Ranking: exact designation match first (e.g. "M3"), then standard prefix,
         then FTS score. Cross-domain: "M3" surfaces fasteners AND ecad footprints.
@@ -1639,6 +1848,9 @@ def register_parts_tools(mcp: FastMCP) -> None:
         vendors     : CSV vendor filter, e.g. "mcmaster,grainger"
         in_stock    : drop records with KNOWN zero stock (unknown stock passes)
         detail      : 'summary' (default, compact rows) | 'full' (full PartRecords)
+        include_live: false searches local catalogs without vendor requests
+        doc_id      : optional ECAD session ID, for its KiCad project libraries
+        previews    : false skips preview resolution and the image sheet
 
         DESCRIBE-THE-PART DIALECT: you do not have to phrase a query yourself.
         `description` / `text` / `q` / `search` / `name` / `keywords` are read as
@@ -1661,16 +1873,37 @@ def register_parts_tools(mcp: FastMCP) -> None:
         """
         out = search_parts_v2(query, domain=domain, limit=limit,
                               category_id=category_id, facets=facets,
-                              price_max=price_max, vendors=vendors,
-                              in_stock=in_stock, detail=detail, **kwargs)
-        # Token-budget wrap for the MCP string path (dict path stays projected).
-        if out.get("ok"):
-            opts = _rs.ServeOpts(
-                detail=detail or "summary",
-                budget_tokens=1500 if (detail or "summary").strip().lower() != "full" else None,
-            )
-            return _rs.serve(out, opts)
-        return _rs.dumps(out)
+                              price_max=price_max, vendors=vendors, doc_id=doc_id,
+                              in_stock=in_stock, detail=detail, include_live=include_live, **kwargs)
+        if not out.get("ok"):
+            return _rs.dumps(out)
+        # Decide the model-visible rows before resolving or composing previews.
+        opts = _rs.ServeOpts(
+            detail=detail or "summary",
+            budget_tokens=1300 if (detail or "summary").strip().lower() != "full" else None,
+        )
+        body = json.loads(_rs.serve(out, opts))
+        body["notices"] = out.get("notices", [])
+        try:
+            from services.parts.contact_sheet import present_search
+            body, png = present_search(body, previews=previews, allow_network=bool(include_live))
+        except Exception as exc:  # noqa: BLE001 — preview failure never fails search
+            rows = body.get("results") or []
+            for row in rows:
+                row["preview"] = {"provenance": "", "reason": "preview_unavailable"}
+            body["preview_sheet"] = {"pictured": [], "omitted": [r["index"] for r in rows],
+                                     "reason": f"composition_failed: {exc}"}
+            png = None
+        meta = body["meta"]
+        meta["omitted_keys"] = [key for key in meta["omitted_keys"] if key != "notices"]
+        meta["tokens"] = _rs.count_tokens(body)
+        meta["truncated"] = bool(meta["omitted_keys"]) or (
+            opts.budget_tokens is not None and meta["tokens"] > opts.budget_tokens)
+        text = _rs.dumps(body)
+        if png is None:
+            return text
+        from mcp.server.fastmcp import Image
+        return [Image(data=png, format="png"), text]
 
     @mcp.tool()
     @model_selectors("node_id")
@@ -1934,7 +2167,8 @@ def register_parts_tools(mcp: FastMCP) -> None:
         return json.dumps(out, ensure_ascii=False)
 
     @mcp.tool()
-    def part_get(part_id: str = "", **kwargs: _VarKw) -> str:
+    def part_get(part_id: str = "", include_live: bool = True, acquire: bool = False,
+                 doc_id: str = "", **kwargs: _VarKw) -> str:
         """Retrieve a single PartRecord by its stable part_id (aicad.parts/1).
 
         part_id is in the form "<domain>:<catalog_id>", e.g.:
@@ -1944,6 +2178,10 @@ def register_parts_tools(mcp: FastMCP) -> None:
 
         Returns the PartRecord dict on success, or {"ok": false, "reason": ...} when
         the part_id is unknown.
+
+        Set include_live=False for offline lookup; acquire=True verifies or fetches
+        geometry explicitly. In a cell use part_acquire for acquisition.
+        doc_id selects the open KiCad project's libraries for ECAD lookup.
 
         Accepts `id` / `part` / `part_number` as spellings of `part_id`.
         """
@@ -1961,21 +2199,24 @@ def register_parts_tools(mcp: FastMCP) -> None:
             return _err("part_get needs a part_id — none was given.",
                         _part_id_hint())
         try:
+            from services.agent.request_context import in_cell
+            if acquire and in_cell():
+                return _err("Use part_acquire to acquire geometry in a cell.")
             from services.parts import get as _get
-            rec = _get(part_id)
+            rec = None
+            if doc_id:
+                from services.parts.adapters.ecad_kicad_adapter import EcadKicadAdapter
+                rec = EcadKicadAdapter().get(part_id, doc_id=str(doc_id))
+            if rec is None:
+                rec = _get(part_id, include_live=include_live, acquire=acquire)
             if rec is None:
                 return _err(f"part_id not found: {part_id!r}",
                             _part_id_hint(part_id))
-            # A provider may canonicalise the id (the ECAD resolver maps a KiCad
-            # standard-library spelling onto the record we really have). Say so — an
-            # id rewrite the caller cannot see is an id rewrite it cannot learn from.
+            if rec.get("ok") is False:
+                return json.dumps(rec, ensure_ascii=False)
+            # Report spelling normalization to the caller.
             if str(rec.get("part_id") or "") not in ("", str(part_id)):
                 notes.append(f"read part_id {part_id!r} as {rec['part_id']!r}")
-            # An ECAD id may also carry a PIN PERMUTATION (Device:Q_NPN_BCE is our Q_NPN
-            # renumbered). The record says so; repeat it in `interpreted` because a
-            # renumbering the caller skims past is a wire on the wrong leg.
-            if rec.get("pin_remap_note"):
-                notes.append(str(rec["pin_remap_note"]))
             out = {"ok": True, "part": rec}
             if notes:
                 out["interpreted"] = _interpreted_notes(notes)
@@ -1985,22 +2226,51 @@ def register_parts_tools(mcp: FastMCP) -> None:
                         "Check that services/parts is importable.")
 
     @mcp.tool()
-    def part_place(part_id: str = "", doc="", params="",
-                   **kwargs: _VarKw) -> str:
+    def part_library_ingest(manifest_path: str, artifact_root: str = "",
+                            mirrors: list[str] | None = None,
+                            replace_namespace: bool = False) -> str:
+        """Register a local manifest; explicitly authorize namespace replacement if needed."""
+        from services.parts.worker_rpc import _part_library_ingest
+        return json.dumps(_part_library_ingest(
+            {"manifest_path": manifest_path, "artifact_root": artifact_root,
+             "mirrors": mirrors, "replace_namespace": replace_namespace},
+            lambda *_: None), ensure_ascii=False)
+
+    @mcp.tool()
+    def part_library_sync(url: str, expected_sha256: str,
+                          mirrors: list[str] | None = None,
+                          replace_namespace: bool = False) -> str:
+        """Sync a digest-pinned manifest; explicitly authorize namespace replacement if needed."""
+        from services.parts.worker_rpc import _part_library_sync
+        return json.dumps(_part_library_sync(
+            {"url": url, "expected_sha256": expected_sha256, "mirrors": mirrors,
+             "replace_namespace": replace_namespace},
+            lambda *_: None), ensure_ascii=False)
+
+    @mcp.tool()
+    @result_contract("Returns {ok, part}; verified geometry is at part.geometry_ref.")
+    def part_acquire(part_id: str, offline: bool = False) -> str:
+        """Verify cached geometry or explicitly acquire it from a configured mirror."""
+        from services.parts.worker_rpc import _part_acquire
+        return json.dumps(_part_acquire({"part_id": part_id, "offline": offline},
+                                        lambda *_: None), ensure_ascii=False)
+
+    @mcp.tool()
+    def part_place(part_id: str = "", doc="", params="", include_live: bool = True,
+                   doc_id: str = "", **kwargs: _VarKw) -> str:
         """Place a standard part into a document — universal insertion across all domains.
 
-        Looks up the PartRecord for ``part_id``, reads its geometry_ref.kind, and routes
-        to the correct domain insertion path.  ALWAYS returns an editable document-schema
-        op — never an opaque solid body.  Standard-before-custom: prefer part_search +
-        part_place over add_features for standard hardware.
+        Looks up the PartRecord for ``part_id`` and routes its geometry_ref.kind
+        to the correct editable domain insertion path. Standard-before-custom:
+        prefer part_search + part_place for standard hardware.
 
         part_id : stable part id, e.g. "fastener:ISO4762:M8", "ecad:Device:R",
                   "bearing:ISO 15:6205", "section:AISC:W8x31", "fitting:elbow:NPS1",
                   "hydraulic:pump:gear-1cc"
-        doc     : the document that receives the placement — a real dict OR a JSON
-                  string (json.dumps(doc)). NEVER a doc id: the document ITSELF.
-                  Leave it out for mechanical parts (core_family / generate_model /
-                  import_file), which create their own new document.
+        doc     : receiving document object (or JSON string); an ECAD session ID
+                  is also accepted. Inline documents return a detached updated doc.
+        doc_id  : open schematic/PCB session ID for a saved KiCad placement.
+                  Mechanical parts create their own new document.
         params  : domain-specific placement overrides — a real dict OR a JSON
                   object string:
                   - mech:        {"length_mm": 25}
@@ -2014,6 +2284,8 @@ def register_parts_tools(mcp: FastMCP) -> None:
                   orientation/rotation/angle  -> params["rotation"],
                   size/dimensions             -> params["size"];
                   any other keyword goes into params under its own name.
+        include_live: false requires locally available, verified geometry and never
+                      queries live providers or downloads missing artifacts.
 
         Returns a PlacementResult dict:
           {ok, domain, doc_id, entity_id, editable: true, detail: {...}}
@@ -2022,9 +2294,13 @@ def register_parts_tools(mcp: FastMCP) -> None:
         Workflow:
           1. part_search("M8 socket head") → pick part_id "fastener:ISO4762:M8"
           2. part_place("fastener:ISO4762:M8") → creates editable mech part doc_id
-          3. For ECAD: part_place("ecad:Device:R", doc=json.dumps(sch_doc), params='{"pos":...}')
+          3. For ECAD: part_place("ecad:Device:R", doc_id=sch_id, params={"pos": [10, 20]})
         """
         notes: list[str] = []
+        if doc_id:
+            if doc not in (None, "", {}):
+                return _err("Pass either doc or doc_id, not both.", _PLACE_DOC_HINT)
+            doc = str(doc_id)
         place_params = ("part_id", "doc", "params")
         given = [k for k, v in (("part_id", part_id), ("doc", doc),
                                 ("params", params)) if v not in (None, "", {})]
@@ -2041,6 +2317,12 @@ def register_parts_tools(mcp: FastMCP) -> None:
         if isinstance(params, dict) and params:
             notes.append("read params as a dict (a JSON string is also accepted)")
         params_dict = dict(params_dict or {})
+        target_keys = {"docid", "documentid", "targetdoc", "targetdocid",
+                       "targetdocument", "targetdocumentid", "assemblyid"}
+        if any(_norm_key(key) in target_keys for key in params_dict) or any(
+                _norm_key(key) in target_keys for key in leftover):
+            return _err("Existing target document aliases are unsupported by part_place.",
+                        _PLACE_DOC_HINT)
 
         # Flat placement intent (location=..., size=...) folds into params.
         for name, value in leftover.items():
@@ -2092,31 +2374,41 @@ def register_parts_tools(mcp: FastMCP) -> None:
         if not part_id:
             return _err("part_place needs a part_id — none was given.",
                         _place_id_hint())
-        record = _hub_get(part_id)
+        try:
+            record = None
+            if doc_id_only:
+                from services.parts.adapters.ecad_kicad_adapter import EcadKicadAdapter
+                record = EcadKicadAdapter().get(part_id, doc_id=doc_id_only)
+            if record is None:
+                record = _hub_get(part_id, include_live=include_live, acquire=True)
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"part_place failed: {exc}", _place_id_hint(part_id))
         if record is None:
             return _err(f"unknown part_id: {part_id!r} — the parts library has no "
                         f"record with that id.", _place_id_hint(part_id))
-        # A provider may have canonicalised the id (the ECAD resolver maps a KiCad
-        # standard-library spelling onto the record we really have). Place under the
-        # record's OWN id so the dispatcher and the reply agree, and say so.
+        # A provider may canonicalise spelling; use and report the exact record ID.
         canonical = str(record.get("part_id") or "")
         if canonical and canonical != part_id:
             notes.append(f"read part_id {part_id!r} as {canonical!r}")
             part_id = canonical
 
+        kind = str((record.get("geometry_ref") or {}).get("kind", ""))
+        if kind == "symbol_footprint":
+            try:
+                result = _place_ecad_part(record, doc_dict, doc_id_only, params_dict)
+            except Exception as exc:  # noqa: BLE001
+                result = {"ok": False, "reason": f"part_place failed: {exc}",
+                          "code": getattr(exc, "code", "placement_failed"),
+                          "hint": _PLACE_DOC_HINT}
+            if notes:
+                result["interpreted"] = _interpreted_notes(notes)
+            return json.dumps(result, ensure_ascii=False)
         if doc_id_only:
-            kind = str(((record or {}).get("geometry_ref") or {}).get("kind", ""))
-            if kind in _MECH_KINDS:
-                notes.append(
-                    f"ignored doc={doc_id_only!r}: {part_id!r} is a {kind} part "
-                    f"and part_place CREATES its document — `doc` only applies to "
-                    f"ecad/structural/piping/hydraulic placements, where it must "
-                    f"be the document OBJECT, not its id")
-            else:
-                return _err(
-                    f"doc={doc_id_only!r} looks like a document ID, but part_place "
-                    f"needs the document ITSELF ({part_id!r} places into a "
-                    f"{kind or 'domain'} document).", _PLACE_DOC_HINT)
+            return _err("Existing target document IDs are unsupported for this part domain.",
+                        _PLACE_DOC_HINT)
+        if doc_dict and kind.startswith("parametric_"):
+            return _err("Existing target documents are not supported for mechanical part placement.",
+                        _PLACE_DOC_HINT)
 
         # Parametric catalog families the engine has no route for (stepper motors,
         # timing pulleys, shaft collars/couplers, heatsinks) are built here from the
@@ -2128,6 +2420,8 @@ def register_parts_tools(mcp: FastMCP) -> None:
                 parametric["interpreted"] = _interpreted_notes(notes)
             return json.dumps(parametric, ensure_ascii=False)
         try:
+            from services.parts.placement import placement_record
+            record = placement_record(record)
             result = cb.call("part_place", {"part_id": part_id, "record": record,
                                             "doc": doc_dict,
                                             "params": params_dict or None})
@@ -2254,7 +2548,9 @@ def register_parts_tools(mcp: FastMCP) -> None:
                         status: "active"|"expired"|"unknown"}]}
           refresh -> the existing browser_login result
                        {ok, site, last_login_ts, challenge_detected}
-          delete  -> {ok: true, site, deleted: bool}
+          delete  -> {ok: true, site, deleted: bool,
+                      shared_cef_cookies_removed: false, gui_cookies_removed: false, hint}
+        Deleting a profile does not sign out shared CEF or GUI browser cookies.
         Every failure is {ok: false, reason, hint}. ``refresh`` opens the same
         headed login window as vendor_login and can block for up to 300 seconds.
         ``delete`` refuses with reason=profile_busy while that profile is open.
@@ -2336,7 +2632,10 @@ def register_parts_tools(mcp: FastMCP) -> None:
                         deleted = _profiles.delete_profile(site)
                     finally:
                         lock.release()
-                    out = {"ok": True, "site": site, "deleted": bool(deleted)}
+                    out = {"ok": True, "site": site, "deleted": bool(deleted),
+                           "shared_cef_cookies_removed": False, "gui_cookies_removed": False,
+                           "hint": "Profile deletion removes Playwright data, metadata and cached pages. "
+                                   "Shared CEF and GUI cookies may remain; this does not sign out those sessions."}
             if notes:
                 out["interpreted"] = _interpreted_notes(notes)
             return json.dumps(out, ensure_ascii=False)
@@ -2355,23 +2654,30 @@ def register_parts_tools(mcp: FastMCP) -> None:
         pass  # graceful degradation: queue tools still work, just won't run jobs
 
     @mcp.tool()
-    def scrape_enqueue(site: str = "", query: str = "",
-                       **kwargs: _VarKw) -> str:
+    def scrape_enqueue(site: str = "", query: str = "", preset: Optional[dict] = None,
+                       member: str = "", format: str = "", job_id: str = "", **kwargs: _VarKw) -> str:
         """Enqueue a vendor search + CAD-model download in the background queue.
 
         The job runs asynchronously: the function returns immediately with a job id.
         Use scrape_queue_status() to poll progress.
 
-        site  : adapter key, e.g. "mcmaster", "grabcad".  Must be logged in first
-                (vendor_login).
+        site  : adapter key, e.g. "mcmaster", "grabcad"; some sources require
+                login or API credentials while others allow anonymous access.
         query : free-text search string, e.g. "6205 bearing", "M8 socket head".
+        preset: an exact result/hit from a prior job; use it to retry an ambiguous
+                acquisition without re-searching. Pass the selected ZIP member
+                and/or format using member/format, or include source-specific
+                selectors such as file_id/download_url in preset.
+        For a job whose error asks for a model choice, call scrape_enqueue with
+        job_id=<that job's id> and member=<the chosen option value>. The original
+        hit and choice are validated against the owned job before retrying.
 
         Returns {ok, id, status} or {ok: false, reason: ...}.
 
         The job lifecycle:
           pending → running (search + acquire in progress)
-          → done (artifact_path set: local file path to the downloaded CAD file)
-          → error (error message set; check vendor login status)
+          → done (artifact_path and classified artifact_kind/format in spec_data)
+          → error (structured failure in error; inspect its reason and hint)
         """
         notes: list[str] = []
         given = [k for k, v in (("site", site), ("query", query)) if v]
@@ -2387,30 +2693,55 @@ def register_parts_tools(mcp: FastMCP) -> None:
                     f"folded descriptive argument(s) "
                     f"{', '.join(sorted(leftover))} into the search text: "
                     f"query={query!r}")
+        if job_id:
+            if not member:
+                return _err("scrape_enqueue needs a selected member with job_id.")
+            if site or query or preset is not None:
+                return _err("scrape_enqueue job selection cannot also specify site, query or preset.")
+            try:
+                from services.browser.queue import select_member as _select_member
+                return json.dumps(_select_member(job_id, member, format or None), ensure_ascii=False)
+            except Exception as exc:  # noqa: BLE001
+                from services.browser.adapters import fail
+                return json.dumps(fail("", "select_member", "internal_error", str(exc)), ensure_ascii=False)
         if not site or not query:
             missing = " and ".join(n for n, v in (("site", site), ("query", query))
                                    if not v)
             return _err(f"scrape_enqueue needs {missing}.",
-                        "site is a vendor adapter key you are logged into "
-                        "(vendor_status() lists them, vendor_login(site) signs "
-                        "in); query is free text. Example: "
-                        "scrape_enqueue(site='mcmaster', query='6205 bearing').")
+                        "site is an adapter key (vendor_status() lists them); use vendor_login "
+                        "only for sources that require browser sign-in. Query is free text.")
+        if preset is not None and not isinstance(preset, dict):
+            return _err("scrape_enqueue preset must be a result object.")
+        if (member or format) and preset is None:
+            return _err("scrape_enqueue needs a preset for member or format selection.",
+                        "Pass the original result object as preset.")
+        if preset is not None:
+            preset = dict(preset)
+            if preset.get("site") and preset["site"] != site:
+                return _err("scrape_enqueue preset belongs to a different source.")
+            if member:
+                preset.update(member=member, archive_member=member)
+            if format:
+                preset.update(format=format, requested_format=format)
         try:
             from services.browser.queue import enqueue as _enqueue
-            out = _enqueue(site, query)
+            out = _enqueue(site, query, preset=preset) if preset is not None else _enqueue(site, query)
             if notes and isinstance(out, dict):
                 out = dict(out)
                 out["interpreted"] = _interpreted_notes(notes)
             return json.dumps(out, ensure_ascii=False)
         except Exception as exc:  # noqa: BLE001
-            return _err(f"scrape_enqueue failed: {exc}")
+            from services.browser.adapters import fail
+            return json.dumps(fail(site, "enqueue", "internal_error", str(exc)), ensure_ascii=False)
 
     @mcp.tool()
     def scrape_queue_status(**kwargs: _VarKw) -> str:
         """Return the current state of all scrape/download queue jobs.
 
         Returns {ok, jobs: [{id, site, query, status, artifact_path, error,
-                              created_ts, started_ts, finished_ts, spec_data}]}.
+                  search_hits, acquire_errors, created_ts, started_ts, finished_ts, spec_data}]}.
+        Error and notice entries retain structured site, operation, reason, status,
+        retry information and any user question.
 
         status values: pending | running | done | error | cancelled.
         artifact_path is set (local filesystem path) when status == "done".
@@ -2422,7 +2753,8 @@ def register_parts_tools(mcp: FastMCP) -> None:
             from services.browser.queue import queue_status as _status
             return json.dumps(_status(), ensure_ascii=False)
         except Exception as exc:  # noqa: BLE001
-            return _err(f"scrape_queue_status failed: {exc}")
+            from services.browser.adapters import fail
+            return json.dumps(fail("", "queue_status", "internal_error", str(exc)), ensure_ascii=False)
 
     @mcp.tool()
     def import_artifact(artifact_path: str = "", source: Optional[dict] = None,
@@ -2468,6 +2800,22 @@ def register_parts_tools(mcp: FastMCP) -> None:
                         "The file may have been cleaned up.")
         if source_data is None:
             source_data = _queue_source_for_artifact(path)
+        from services.browser.cad_validate import extract_cad
+        if source_data and (source_data.get("artifact_kind") in {"document", "ecad", "archive"} or
+                            source_data.get("cad_validated") is False):
+            return _err("unsupported_format", "This artifact is not validated importable CAD geometry.")
+        requested_format = (source_data or {}).get("format")
+        if requested_format == "zip":
+            requested_format = None
+        requested_member = (source_data or {}).get("member") if path.lower().endswith(".zip") else None
+        checked = extract_cad(path, requested_format=requested_format, requested_member=requested_member)
+        if not checked.get("ok"):
+            return _err("unsupported_format", checked.get("reason") or "Artifact is not valid CAD.")
+        if checked["format"] == "fcstd":
+            if checked.get("archive_path"):
+                Path(checked["artifact_path"]).unlink(missing_ok=True)
+            return _err("unsupported_format", "FreeCAD documents cannot currently be imported natively.")
+        path = checked["artifact_path"]
         try:
             # _place_import_file was ported to core/parts.
             from . import core_bridge as cb
@@ -2516,23 +2864,34 @@ def register_parts_tools(mcp: FastMCP) -> None:
         return imported
 
     @mcp.tool()
-    def fetch_cad_model(url: str, name: str | None = None,
-                        import_part: bool = True) -> str:
+    def fetch_cad_model(url: str, name: str | None = None, import_part: bool = True,
+                        format: str | None = None, member: str | None = None,
+                        selection_field: str | None = None, selection: str | None = None,
+                        selectors: Optional[dict] = None) -> str:
         """Download CAD geometry from an HTTPS file URL or model page into this project.
 
         Direct STEP/STP/IGES/IGS/STL/3MF/OBJ/ZIP links and public Printables
         files download over HTTPS without a browser. They land in this project's
         reference/<name> with a source/license/time/SHA-256 JSON sidecar. For
-        other pages, try static CAD links before rendering with the configured
-        browser. STEP takes precedence over STL. By default import through
-        import_artifact and return doc_id plus bbox_mm; set import_part=False
-        to fetch only. Returns {ok, artifact_path, format, source_url,
-        provenance}; refusals return {ok:false, reason, detail, candidates}.
-        Login-required results tell the user where to download and drop the
-        file. Without a renderer, dynamic pages return browser_unavailable.
+        recognized vendor pages use their registered adapter; unrecognized pages
+        use static public links only. For the same model STEP is preferred over
+        mesh formats; different model names require an explicit selection.
+        To resolve an ambiguous ZIP choose a candidate with member=<name>; use
+        format='step'/'iges'/'stl'/... to request a specific format.
+        For an adapter's model-choice question, retry with its selection_field
+        and the selected option value as selection (or provide a selected URL directly).
+        For multi-stage choices, carry forward selectors from the previous error
+        and add the next selected field/value.
+        By default import through import_artifact and return doc_id plus bbox_mm;
+        set import_part=False to fetch only. Returns {ok, artifact_path, format,
+        source_url, provenance}; refusals include reason, candidates and, when
+        a model choice is needed, ask_user. FreeCAD documents can be downloaded
+        but cannot currently be imported natively.
         """
         return json.dumps(fetch_cad_model_impl(
-            url, name, import_part, importer=_import_cad_reference), ensure_ascii=False)
+            url, name, import_part, importer=_import_cad_reference,
+            requested_format=format, requested_member=member,
+            selection_field=selection_field, selection=selection, selectors=selectors), ensure_ascii=False)
 
     @mcp.tool()
     def vendor_part_register(supplier: str = "", part_number: str = "",

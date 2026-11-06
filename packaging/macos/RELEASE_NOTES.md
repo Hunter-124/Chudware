@@ -6,6 +6,9 @@ This macOS build does not include Chudware's embedded CEF browser. Browser-based
 
 On macOS, the Parts Library fetches vendor pages through Playwright instead of Chudware's CEF daemon. Vendors that fingerprint browser automation can refuse those requests. When that happens, Chudware returns "blocked by the vendor" instead of hanging; the local catalog and vendors that tolerate Playwright continue to work. This is a known platform difference, not a bug. Linux and Windows Parts Library fetching is unaffected.
 
+For electronics, install KiCad 10 separately as a recommended companion. Chudware
+does not bundle KiCad; its editors and command-line tools run as separate processes.
+
 If a vendor blocks a search on macOS, use the local catalog or run the vendor search from Chudware on a Linux or Windows machine if you have one.
 
 Troubleshooting and current vendor-access guidance: <https://chudware.com/docs/troubleshooting/#macos-parts-library-vendor-access>

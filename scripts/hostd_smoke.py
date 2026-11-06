@@ -7,6 +7,8 @@ Covers the daemon lifecycle contract from the hostd plan:
      ONE daemon serves both (same daemon_pid)
   3. --stop drains a running daemon
   4. kill -9 leaves a stale socket; the next connect-or-spawn recovers
+  5. a turn whose requester disconnected (GUI crash) is stopped by its conversation's next
+     turn instead of blocking it forever
 
 Usage: scripts/hostd_smoke.py [path/to/chudware-hostd]
 Defaults to core/build-occt-linux/bin/chudware-hostd, then core/build-linux.
@@ -132,6 +134,93 @@ def wait_gone(pid: int, timeout_s: float) -> bool:
     return False
 
 
+# Stand-in services worker for case 5: agent_admin_turn blocks like an unanswered ask_user
+# until its run is cancelled over the worker control lane.
+FAKE_TURN_WORKER = r'''
+import json, os, secrets, socket, sys, threading
+TOKEN, ENDPOINT = secrets.token_hex(32), os.path.join(os.getcwd(), "control.sock")
+cond, cancelled = threading.Condition(), set()
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n"); sys.stdout.flush()
+def control():
+    srv = socket.socket(socket.AF_UNIX); srv.bind(ENDPOINT); srv.listen(8)
+    while True:
+        conn, _ = srv.accept(); data = b""
+        while not data.endswith(b"\n"):
+            chunk = conn.recv(65536)
+            if not chunk: break
+            data += chunk
+        req = json.loads(data); ok = req.get("token") == TOKEN
+        run = req.get("params", {}).get("run_id")
+        if ok and req.get("action") == "cancel":
+            with cond: cancelled.add(run); cond.notify_all()
+        conn.sendall((json.dumps({"ok": ok, "result": {"ok": True, "run_id": run}}) + "\n").encode())
+        conn.close()
+threading.Thread(target=control, daemon=True).start()
+for line in sys.stdin:
+    req = json.loads(line); rid, method = req.get("id"), req.get("method")
+    params = req.get("params") or {}; result = {}
+    if method == "shutdown": break
+    if method == "worker_control_info":
+        result = {"transport": "unix", "endpoint": ENDPOINT, "token": TOKEN}
+    elif method == "agent_admin_turn":
+        run = params["run_id"]
+        emit({"id": rid, "event": "agent.event", "data": {"kind": "run_started", "run_id": run}})
+        if not params.get("finish"):
+            with cond: cond.wait_for(lambda: run in cancelled)
+        result = {"ok": True, "run_id": run, "cancelled": run in cancelled}
+    emit({"id": rid, "ok": True, "result": result})
+'''
+
+
+def orphaned_turn_superseded(hostd: str) -> tuple[bool, str]:
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="hsmk-", dir="/tmp") as repo:
+        os.makedirs(os.path.join(repo, "services"))
+        with open(os.path.join(repo, "services", "worker_main.py"), "w") as fh:
+            fh.write(FAKE_TURN_WORKER)
+        saved = {k: os.environ.get(k) for k in ("CHUDWARE_REPO", "CHUDWARE_PYTHON")}
+        key = "smoke-" + uuid.uuid4().hex[:8]
+        os.environ.update(CHUDWARE_REPO=repo, CHUDWARE_PYTHON=sys.executable,
+                          CHUDWARE_INSTANCE_KEY=key)
+        try:
+            crashed = Client(hostd, key)
+            crashed.call("hello", {"client": "gui", "pid": os.getpid(), "proto": 1})
+            for _ in range(240):
+                if crashed.call("daemon_status")["result"]["state"] != "loading":
+                    break
+                time.sleep(0.5)
+            pid = crashed.call("daemon_status")["result"]["pid"]
+            crashed.f.write(json.dumps({"id": 1, "method": "agent_admin_turn", "params": {
+                "run_id": "run-old", "session_id": "c1", "request": "hi"}}) + "\n")
+            crashed.f.flush()
+            started = json.loads(crashed.f.readline())
+            if started.get("data", {}).get("kind") != "run_started":
+                return False, f"old turn did not start: {started}"
+            crashed.close()  # the GUI crashes while the turn waits on its question
+            time.sleep(0.3)
+            reopened = Client(hostd, key)
+            reopened.call("hello", {"client": "gui", "pid": os.getpid(), "proto": 1})
+            reopened.sock.settimeout(15)
+            try:
+                reply = reopened.call("agent_admin_turn", {
+                    "run_id": "run-new", "session_id": "c1", "request": "continue",
+                    "finish": True})
+            except OSError:
+                reply = None
+            reopened.close()
+            os.kill(pid, signal.SIGTERM)
+            wait_gone(pid, 15.0)
+            ok = bool(reply) and reply.get("result", {}).get("run_id") == "run-new"
+            return ok, str(reply)[:120]
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
 def main() -> int:
     hostd = find_hostd()
     fails = []
@@ -209,6 +298,10 @@ def main() -> int:
     check("stale-socket recovery", pid2 != pid and wait_gone(pid, 1.0), f"{pid}->{pid2}")
     c2.close()
     wait_gone(pid2, 15.0)
+
+    # --- 5. orphaned turn superseded ----------------------------------------
+    ok, detail = orphaned_turn_superseded(hostd)
+    check("orphaned turn superseded by next turn", ok, detail)
 
     if env_linger is None:
         os.environ.pop("CHUDWARE_HOSTD_LINGER_SECS", None)

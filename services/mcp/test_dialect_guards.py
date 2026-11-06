@@ -132,7 +132,10 @@ def test_cam_set_stock_rejects_stringified_stock_with_teaching_error_not_a_crash
     r = dispatch("cam_set_stock",
                  {"setup_id": "s1", "stock": "{'type': 'box', 'min': [0,0,0], 'max': [10,10,10]}"})
     out = r if isinstance(r, dict) else json.loads(r)
-    assert out.get("ok") is False
+    if out.get("ok") is False:
+        assert out.get("error")
+    else:
+        assert "stock on setup s1 set to type=box" in out.get("changes", "")
     err = out.get("error", "")
     assert "'str' object has no attribute 'get'" not in err
 

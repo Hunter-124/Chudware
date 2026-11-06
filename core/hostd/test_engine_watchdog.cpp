@@ -1,5 +1,5 @@
 // Unit test for the engine-call watchdog policy (engine_watchdog.h): which hostd calls the
-// short and long wall-clock ceilings may end, and that agent/chudcode turns are never capped.
+// short and long wall-clock ceilings may end, and that agent/OMP turns are never capped.
 // Registered as ctest `engine_watchdog`; doctest checks stay active in Release (NDEBUG).
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
@@ -41,11 +41,10 @@ TEST_CASE("modeling calls get only the long ceiling") {
     }
 }
 
-TEST_CASE("agent and chudcode turns have no wall-clock cap") {
+TEST_CASE("agent and OMP turns have no wall-clock cap") {
     // A turn streams progress for hours; its worker transport, not this watchdog,
     // owns silence/absolute limits.
-    for (const char* method : {"agent_run", "agent_admin_turn", "agent_step",
-                               "chudcode_export_session"}) {
+    for (const char* method : {"agent_admin_turn", "agent_step", "omp_export_session"}) {
         CAPTURE(method);
         CHECK_FALSE(overdue(method, kLongCeiling + 1));
         CHECK_FALSE(overdue(method, 4 * kLongCeiling));

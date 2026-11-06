@@ -413,8 +413,28 @@ def unbind_mutation_guard() -> None:
     _active_agent_id = None
 
 
+def _bound_guard() -> tuple[Optional["LeaseRegistry"], Optional[str]]:
+    """The (registry, agent_id) bound to the current context, ``(None, None)`` when unbound."""
+    if request_context.in_cell():
+        return _cell_guard.get() or (None, None)
+    return _active_registry, _active_agent_id
+
+
+def write_guard_active() -> bool:
+    """Whether a workspace write guard is bound to the current context.
+
+    The dispatch guard asks first so that, with no workspace run, it neither resolves the
+    call's document nor consults a registry.
+    """
+    reg, agent = _bound_guard()
+    return reg is not None and agent is not None
+
+
 def check_write_lease(doc_id: str, tool_name: str) -> Optional[dict]:
     """Check write-lease for a mutating tool call against the active registry.
+
+    *doc_id* must be the canonical id the registry keys on (the dispatch guard resolves
+    names, aliases and omitted ids before calling).
 
     Returns None (proceed) if:
       - No registry is bound (workspace guard disabled — safe default).
@@ -425,18 +445,21 @@ def check_write_lease(doc_id: str, tool_name: str) -> Optional[dict]:
     This function is called from the _guard() seam in tool_registry.py for
     tools that carry a doc_id argument.
     """
-    reg, agent = (_cell_guard.get() or (None, None)) if request_context.in_cell() else (_active_registry, _active_agent_id)
+    reg, agent = _bound_guard()
     if reg is None or agent is None:
         return None  # guard disabled — allow
     owner = reg.write_owner(doc_id)
     if owner is None or owner == agent:
         return None  # no one holds write, or we hold it — allow
+    reason = (
+        f"doc {doc_id!r} write lease is held by {owner!r}; "
+        f"agent {agent!r} is not permitted to mutate it."
+    )
     return {
         "ok": False,
-        "reason": (
-            f"doc {doc_id!r} write lease is held by {owner!r}; "
-            f"agent {agent!r} is not permitted to mutate it."
-        ),
+        "error": reason,
+        "code": "write_lease_held",
+        "reason": reason,
         "hint": (
             f"Call workspace_status(run_id=...) to see the current ownership map. "
             f"The write holder ({owner!r}) must release the lease or the harness must "

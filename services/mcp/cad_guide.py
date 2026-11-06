@@ -5,6 +5,7 @@ through the cad_tools facade."""
 from pathlib import Path
 from .cad_common import cb  # noqa: F401
 import os
+from inspect import cleandoc
 
 
 # --------------------------------------------------------------------- the guide text
@@ -46,7 +47,12 @@ run_fea_static(fixtures, loads, material) — linear static stress.
   material : "steel" | "aluminum" | "titanium" | "stainless" | "brass" | "abs" | "pla"
              (or an explicit dict with E_mpa / nu / density_g_cm3 / yield_mpa).
   Returns max von-Mises stress (MPa), max displacement (mm), and the min factor of safety
-  (yield / max stress). FoS > 1 means it holds; design to a target margin.
+  (yield / max stress). FoS above one is a result for the modeled load case and
+  material under the solver's assumptions; assess the required margin, convergence
+  and other failure modes before claiming adequacy.
+  Static/contact mesh fill-guard refusal: use a smaller mesh_size_mm and, if necessary,
+  lower min_size_mm (MCP sizes are millimetres; CLI -h values are metres). A retry may
+  still be under-resolved; examine mesh quality and perform convergence checks.
 
 run_fea_modal(fixtures, material, n_modes) — natural frequencies (Hz) of the held part.
 
@@ -55,6 +61,10 @@ run_fea_fatigue(fixtures, loads, material, load_type, theory) — high-cycle FAT
   soderberg/asme/morrow) + Marin endurance correction + Shigley S-N line to report cycles-
   to-failure and a factor of safety. load_type "reversed"|"zero_based"|"ratio" sets the
   cyclic spectrum. regime="infinite" ⇒ runout (>1e6 cycles). Same FEA backend as run_fea_static.
+  Supply explicit kf >= 1. A kf above 1 requires stress_basis="nominal": only use it
+  when the local notch is not already resolved in the FEA field. For a resolved notch,
+  explicitly use kf=1 to avoid double-counting. Do not treat a global fatigue peak as
+  a verified value at a particular hot spot.
 
 run_fea_thermal(hot_faces, cold_faces, material) — steady heat conduction on the real
   part tet mesh using the engine. Temperature faces carry {face, temperature °C}.
@@ -154,6 +164,15 @@ Heavy solves: run_cfd_flow / run_fea_* accept background=True (run_cfd_accurate 
 background) → return a job_id immediately; poll get_job(job_id) for the result. This keeps a long
 solve from tripping the transport timeout (which would otherwise drop the session). After a
 restart, recover_parts() reloads auto-saved docs.
+get_job/wait_job status="done" means execution finished, NOT success. A completed
+result with ok:false also sets the polling reply's ok:false; error/code/reason/detail
+are exposed at the top level and the complete result remains under result.
+add_features can also hand off automatically with status="running", auto_backgrounded:true
+and job_id. That reply is acceptance, not completed geometry. The edit-part checked
+helper joins it and checks the completed result; without the helper, wait for the job
+and inspect its result before reading features, changes or id_map.
+Load _truncated.full_result before counting all features/frames
+or asserting that a requested collision/clearance pair is absent.
 
 CROSS-SIM HANDOFF (aicad.simhandoff/1 — contracts/sim_handoff.md):
   When one physics domain feeds another (1D piping → 3D CFD, hydraulic → piping /
@@ -493,6 +512,9 @@ MOTION / KINEMATICS GUIDE — make an assembly MOVE, and check it clears as it g
 Load cad_skill(name="simulate") before mechanism work. simulate_motion drives one or more
 synchronized angle/distance mates and re-solves the graph at each computed sample. It returns
 body world poses plus per-frame overlap/clearance findings, not continuous-path proof.
+Long trajectories may return trajectory_digest instead of trajectory; its frame rows
+summarize every sample, with worst frames and per-component motion. Use detail="full"
+when all frame poses are needed; steps are capped at 200 and overlarge replies are refused.
 
 EVIDENCE / COST FIRST
   * Guard ok:false before indexing trajectory: refusals/timeouts need not contain it. Never
@@ -512,9 +534,10 @@ EVIDENCE / COST FIRST
 
 SCOPE: kinematics by default — position (and, by sampling, velocity). Pass dynamics={...} (even
 {}) to ALSO run RIGID-BODY INVERSE DYNAMICS on the same sweep: mass/inertia from each component's
-geometry x density (densities/masses overridable per component), gravity, applied forces/torques,
-simple viscous damping, and per-mate JOINT REACTION forces/moments solved through the mate
-constraint jacobian (per-frame min-norm least squares; V&V'd against analytic pendulum +
+geometry and applied material (or explicit densities/masses, then default_density_g_cm3).
+Missing density is refused rather than guessed. Inspect dynamics.bodies[].density_source.
+It includes gravity, applied forces/torques, viscous damping, and JOINT REACTION wrenches
+solved through the mate constraint jacobian (per-frame min-norm least squares; V&V'd against analytic pendulum +
 slider-crank reactions). The result gains a `dynamics` block with per-frame reactions,
 per_joint_worst and worst_case. Contact dynamics is still out of scope.
 
@@ -549,12 +572,13 @@ HOW TO USE
      Known hits survive incomplete checks. The loop playback copy is not another check.
      interference.first_collision_step / first_collision_value and detail describe ONLY
      the first colliding sample. Live poses/mates/history never change: it solves a snapshot.
-  4. The user WATCHES it as the document's Motion study: every successful sweep is saved into
-     the open assembly (result `motion_study.view`; Features > Assembly > Motion Study opens it).
+  4. To record a Motion study in the open assembly, use persist_study=true
+     (result `motion_study.view`); the default is read-only. A motion_study_error
+     reports a failed save. Sweep envelope, turning-radius and film
+     helpers do not persist a study.
      A rendered .mp4/.gif is a file, not a study — a film of another assembly file is not a
-     study of the open one. Asked to show/animate the OPEN assembly, run simulate_motion on it
-     (re-sweeping the same joints replaces its study, never duplicates it); do not only point
-     at old films.
+     study of the open one. To make the OPEN assembly's study available for playback, run
+     simulate_motion with persist_study=true (re-sweeping the same joints replaces its study).
 
 TIPS
   * More `steps` = smoother playback and safer against a re-solve flipping a tight mechanism to a
@@ -592,6 +616,8 @@ TRUE-ASSEMBLY WORKFLOW
   3. asm_add_component(path, fixed=True) grounds the base (first defaults fixed);
      add other saved parts as they arrive. `at` gives only a starting pose for
      the solver, never a substitute for mates on moving/fixed interfaces.
+     A caller-typed relative path is selected-workspace relative, not relative
+     to the assembly file or worker cwd. With no workspace, use an absolute path.
   4. asm_mate(mate_type, a, b, ...)                 constrain pairs of faces/edges:
        a/b = {"component": "k1", "query": {"of":"face","side":"top"}}
        The query is the SAME plain-word geometry query as query_geometry, resolved against
@@ -600,9 +626,21 @@ TRUE-ASSEMBLY WORKFLOW
        A face/edge sid tag read off describe_part, query_geometry or a render tile
        ("F2bb10f") also works: "query": "F2bb10f", "query": {"sid": "F2bb10f"}, or
        {"component": "k1", "sid": "F2bb10f"} — part-frame or assembly-frame sids alike.
-       mate types: coincident | parallel | perpendicular | tangent | concentric |
-                   distance | angle | lock   (distance mm / angle deg take value=)
-       align="aligned"|"anti" flips which way normals/axes point.
+       mate types: coincident, parallel, perpendicular, tangent, concentric, lock;
+       distance (mm) and angle (degrees) require value. gear requires value={"ratio":r};
+       screw requires {"pitch":mm/revolution}; rack_pinion accepts {"pitch_radius":mm}.
+       distance_limit and angle_limit require {"min":...,"max":...}; hinge accepts
+       optional limits and an axis/axis_point virtual pin. slot, profile_center and
+       cam_follower use two operands. width needs extra=[second jaw plane], symmetric
+       needs extra=[symmetry plane]; angle and hinge also accept extra references.
+       Alignment is type-specific: planar coincident with align="aligned" requires
+       opposite outward normals; planar parallel with "aligned" requires the same
+       direction. For planar distance, normal · (point_b − point_a) = sign × value:
+       sign is +1 for "aligned", −1 for "anti"; normal is the first planar reference's
+       normal, or the second if the first is not planar. Example: a left-face normal −X
+       with b displaced +30 mm requires value=30 and align="anti". Inspect returned
+       reference directions and signed-distance branch; queries and candidates are in
+       source-part coordinates, while solved placements are in the assembly frame.
      SEATING PATTERNS (what a person clicks in SolidWorks):
        bolt in hole      concentric (shank ↔ bore) + coincident (head seat ↔ plate face)
        motor on bracket  concentric (pilot boss ↔ pilot bore) + coincident (flange ↔ plate)
@@ -614,9 +652,26 @@ TRUE-ASSEMBLY WORKFLOW
        concentric+coincident seats a pin and its axial position; fixed servo
        pockets and horn-to-link interfaces use coincident/concentric/lock.
   5. asm_mate solves after each add (solve=True default) — or call solve_mates() explicitly.
+     Read the new mate's satisfaction status, residual/tolerance, total and omitted
+     counts; rank/DOF alone does not prove satisfaction. An unresolved changed source
+     reference reports source-frame candidates as suggestions, not automatic remaps;
+     inspect and explicitly choose, never guess. Physical body_count counts solids while
+     logical_member_count counts compiled members.
   6. VALIDATE: describe_assembly() (world bboxes + solve status), check_interference()
      (clashes + tightest clearances; min_clearance_mm flags too-tight fits), interface_check
      (do hole patterns/axes actually line up), measure_between (spot dimensions).
+     check_interference members= (also components=) accepts component IDs or member names.
+     describe_assembly ok reports narration success; inspect fit and warnings for completeness.
+     interface_check separates differing hole diameters from positional error; pass fastener
+     for nominal clearance (not grommet/head fit). Contact is unverified without a planar
+     mate or explicit contact_faces=[{"component":"k1","sid":"F..."}, ...] (world face SIDs).
+     Read clearance_status and clearance_tolerance_mm: within_tolerance is uncertain, not a
+     definite pass or violation (the current uncertainty band is ±0.000001 mm).
+     Additional checks include assembly_dof, mate_fit_check, fastener_check,
+     tool_access_check, disassembly_check and bom_consistency_check. They do not
+     replace interference or interface checks: inspect each result's scope,
+     assumptions and not_evaluated findings. Missing evidence, unchecked paths,
+     and unmodeled conditions are not passes.
   7. Drive EACH joint over its range with simulate_motion(mate_id, start, stop)
      and swept interference, not hand-rolled kinematics or throwaway pose
      assemblies. save_part(path) the mated assembly .step+; simulate_motion
@@ -634,8 +689,25 @@ BEST PRACTICE (structure)
 
 GOTCHAS
   * asm_* ops REQUIRE an assembly doc (new_assembly) — they are rejected on a part doc.
-  * Components reference their source FILES: keep the .step+ files where the assembly can
-    find them (same directory is safest) and re-save parts before re-solving the assembly.
+  * Component/mate edit and delete ops require `id` as a nonempty string, e.g.
+    {"op":"asm_delete_component","id":component["id"]}, not the whole returned object.
+    Missing or wrong-type ids return invalid_op with the failing operation index;
+    the whole batch stays unchanged.
+  * Components reference source FILES, but an open path-backed source supplies its current
+    committed geometry: edits, undo/redo and revert update direct and nested assemblies
+    immediately without saving or a manual solve. Agent edits persist automatically
+    unless human edits are pending; discarding a human draft restores saved geometry.
+    Collision checks, measurements, rendering and activation also refresh disk-only
+    descendants, including one below an unchanged child assembly. Stored relative sources
+    remain assembly-file relative, distinct from workspace-relative asm_add_component paths.
+  * A transform cannot override a live mate on a floating component. The guard uses the
+    FINAL batch state: delete/suppress every such mate and transform in one atomic batch,
+    or ground the component with fixed:true. Remaining, new or re-enabled mates still own
+    the pose; drive their values instead. Grounding followed by ungrounding is not a bypass.
+  * residual_dof uses the same accepted constraint rank as mate classification, so an
+    offset rigid lock chain does not gain fictitious freedom from model scale.
+    Mechanism dof additionally includes explicit angle drives. Neither number proves
+    convergence: check converged, residual/tolerance and unresolved mate reasons separately.
   * An unconstrained component has 6 DOF: a single concentric leaves it free to slide+spin —
     add the seating coincident (and an anti-spin mate) before trusting positions.
   * Set the FIRST component fixed (default) so the solve has a ground.
@@ -649,6 +721,8 @@ WORKFLOW
   2. add_features([ ...ops... ])            build with standard features (vocabulary below).
                                             Returns per-feature status + body count + volume
                                             so you can see a dropped cut or a stray body.
+                                            A raw running reply is a job handoff: wait_job(job_id),
+                                            then inspect result. The checked helper joins auto-backgrounded jobs.
                                             A `sketch` feature should carry geometric RELATIONS
                                             (coincident/horizontal/parallel/tangent/...) + DRIVING
                                             DIMENSIONS, not loose geometry; check_sketch("s1")
@@ -663,6 +737,9 @@ WORKFLOW
                                             A suppressed run (trivial batch, CHUDWARE_PREFLIGHT=0,
                                             or a preflight error) returns verdict "skipped" with
                                             the reason in skipped/skipped_detail.
+                                            It uses the SAME normalization and sketch
+                                            auto-definition as add_features. Pass the same
+                                            auto_define=False to both when leaving sketches free.
                                             An invalid fillet/chamfer solid is rejected even if
                                             OCCT reports construction success. Atomic failure keeps
                                             the prior live tree/revision; regen_diagnosis uses the
@@ -678,7 +755,21 @@ WORKFLOW
                                             dimmed; a SECTION tile with ghosted outline when it
                                             is internal). render_part(view="right" |
                                             {"azimuth":30,"elevation":20} | "auto") = one
-                                            single shot instead. render_views() = the planner's
+                                            single shot instead ("auto" = the planner's best
+                                            camera); a view name that is not a view is an
+                                            ERROR listing the valid ones. distance=0 or null
+                                            auto-fits; target="k9" selects an assembly component.
+                                            target= and emphasize= are aliases: pass ONE.
+                                            Plain rendering is read-risk; passing save_path or
+                                            display_quality makes the call write-risk. The
+                                            file-writing inspect_native_files is write-risk.
+                                            Error replies include error and code (optional
+                                            hint/detail). engine="private" warns that the
+                                            engine does not share documents with the app.
+                                            section="top"|{"plane","offset"}|{"origin",
+                                            "normal"} (+ "flip") cuts every shot on THAT plane
+                                            (render_part, inspect_part, contact_sheet).
+                                            render_views() = the planner's
                                             7-view set (views=[...] for a fixed drawing set);
                                             contact_sheet() = the 4-view grid or named views.
                                             inspect_feature(target): planner close-ups +
@@ -686,44 +777,88 @@ WORKFLOW
                                             excerpt; inspect_part(target) one framed close-up;
                                             look_around(target) N planner angles. Numbers
                                             first — do not render after every mutation.
-  4. measure_part() / query_geometry(q)     check mass/bbox, or explore faces/edges.
+  4. measure_part() / query_geometry(q)     volume_mm3 is also top-level; mass properties
+                                            including mass_g remain under result["mass"].
+                                            inspect_section reports the whole plane;
+                                            target_center is refused, not a crop.
+                                            owner=feature ID/name restricts raw engine ownership
+                                            before geometric predicates (boolean-regenerated faces
+                                            can be included). Page with offset/page_size; count is
+                                            a selection cap. ambiguous_sids identifies shared SIDs.
      set_material("aluminum" | {color,...})  store a named engineering material + matching
                                             appearance (explicit colour dicts are visual-only).
   5. run_fea_static(...) / run_cfd_flow(...) prove it (see cad_guide("simulation")).
-  6. save_part()                            save the NATIVE .step+ — the editable feature tree
-                                            PLUS its simulation studies + any drawings, in one
-                                            file the desktop app reopens fully editable. This is
-                                            Chudware's native format; save to it to hand the user a
-                                            part they can keep working on (not a flattened mesh).
-  7. export_part(fmt) / make_drawing()      hand off a NON-native interchange/mesh file
-                                            (STEP/IGES/BREP exact, STL/OBJ/3MF mesh) or a
-                                            dimensioned 2D drawing.
+  6. Native .step+ persistence              Agent edits persist automatically unless human
+                                            edits are pending. save_part(path=...) chooses
+                                            an explicit editable destination when needed.
+  7. export_part(fmt) / make_drawing()      hand off an interchange/mesh file or drawing.
+     export_part(fmt="draw+", doc_id=<drawing_id>, path="sheet.draw+") saves a standalone
+     native drawing; save_part instead takes its open source part/assembly.
 
-Address geometry in PLAIN WORDS (no coordinates, no face numbers): "the top face", "all
-edges", "the vertical edges", "the largest round face". The engine resolves the words to
-topology. cad_guide("review") explains how to read the annotated render. The full op
-vocabulary, with worked examples, follows.
+Prefer structured geometry queries: {"of":"face","side":"top"} for the top face,
+{"of":"edge","parallel":"z"} for vertical edges. Simple side words and recognized
+tokens are accepted, but free prose does not preserve arbitrary conditions or
+coordinates. Inspect matches with query_geometry before editing; use explicit
+near/count/pick predicates when needed. cad_guide("review") explains the annotated render.
 
-DOC OWNERSHIP & SAVE DISCIPLINE
-  Docs you mint (new_part/new_assembly/import) are AI-OWNED. The user sees them live in a
-  mirror tab while you work; when you finish (detach/close/disconnect) the app AUTO-CLOSES
-  that live view unless the user is actively viewing or has adopted it by editing. So the
-  responsibility to preserve work is YOURS, not the user's:
-    * save_part(path=...) every DELIVERABLE before you finish — this is the hand-off.
-    * close_part(discard=True) for SCRATCH docs you don't want kept.
-  An unsaved AI doc that's just abandoned is retired to a crash-recovery tier — a safety
-  net, NOT a delivery mechanism, and never surfaced to the user as a warning. If the user
-  edits your doc they ADOPT it (it becomes theirs); you keep co-editing the same live doc.
-  Explicit save_part/export_part relative paths (e.g. "parts/redesign/base.step+") use
-  the selected workspace: CHUDWARE_PROJECT_DIR, then CHUDWARE_FS_ROOT, independent of
+ASYNCHRONOUS SHARED WORK
+  Agents may edit the same or different documents without exclusive custody.
+  Explicit delegation settings govern the depth cap. Without a setting, an explicit
+  request to use subagents can enable delegation for the turn.
+  Pass doc_id explicitly in delegated/shared work; each embedded agent otherwise
+  has its own current part. A bare call never adopts another agent's AI document.
+  list_parts() plus an explicit doc_id joins existing work without changing the
+  human's viewport. Closed handles refuse rather than redirecting to another part.
+  Live turns retain opened, attached or read documents between tool calls. If a
+  doc_not_found gives an exact import_part(path=..., resume=True), use that saved
+  file; otherwise check recover_parts(all=True) before reopening an older file.
+  The engine serializes atomic edit batches in arrival order. A later valid edit
+  to the same feature wins; this is not a semantic merge. Read current geometry
+  before dependent edits, share feature ids and interfaces, and verify the combined
+  part after writers finish. Coordination-board claims are optional work notices,
+  never permission or a reason to wait for release. Save the final native revision.
+
+EMBEDDED PYTHON EVAL
+  Await CAD calls and check ok:false before reading success-only keys. Tool replies
+  have different shapes: inspect the returned object rather than assuming fields from
+  another tool. Forwarding helpers use a positional-only selector:
+    async def cad(tool_name, /, **args):
+  This leaves name= (and even tool_name=) available inside **args for the CAD tool.
+  The edit-part skill includes the complete checked transport helper. Its
+  details.xdev.inner is already decoded: structured results are objects or arrays,
+  while cad_guide and cad_skill results are plain text. Do not JSON-decode strings.
+  The helper joins auto_backgrounded jobs and loads structured _truncated.full_result
+  and spilled text JSON before checking ok or using fields. Recover the saved reply,
+  not a second execution.
+  Prefer summary/feature-filtered get_part reads; print only needed fields.
+  Inspect diagnostic findings even when a completed validation reports ok:false.
+  Reading or writing an inactive CAD xd:// device enables it for the conversation,
+  subject to tool policy. Discover names with list_tool_categories. If explicitly using
+  enable_tools, wait for it to succeed before using that device in another call.
+
+PRESENTATION & SAVE DISCIPLINE
+  New/imported AI documents stay out of the viewport while you work. Saving, building,
+  or finishing does not open a tab. Call show_in_app(doc_id) explicitly for a product
+  or artifact you choose to present; it does not save or take editing custody.
+  Documents the user opens themselves remain live and keep receiving your edits.
+  Presentation preserves the user's selection and does not reopen a dismissed tab.
+  Agent edits persist automatically unless human edits are pending; never ask the user
+  to save AI work. AI recovery is automatic when the backing file is unchanged; conflicts
+  are retained for agent recovery. External file rewrites refresh open documents unless
+  human edits require conflict resolution. Use save_part for an explicit destination;
+  close_part(discard=True), also close_part(save=False), discards scratch docs.
+  Sharing edits or presenting a document never requires exclusive ownership.
+  Relative import_part/save_part/export_part paths (e.g. "parts/redesign/base.step+") use
+  the selected workspace: request-scoped CHUDWARE_PROJECT_DIR, then CHUDWARE_FS_ROOT, independent of
   worker cwd or continuation. A selected nested workspace is not widened to a parent
   project/repository. Without a valid project root, pass an absolute path. Absolute
   and "~" destinations may be outside the workspace, but credential/key locations
   are refused after resolving symlinks. Pathless saves keep an existing native file
   in place, otherwise use CHUDWARE_PROJECT_SAVE_DIR (temp only with no project).
   Native STL export refuses collapsed facets or a source-solid mesh that is not closed
-  and consistently oriented in the serialized output. It does not heal geometry or
-  weld nearby points. Keep the native error and inspect the source/export conditions
+  and consistently oriented in the serialized output. validation_stages separates passed
+  facet checks from the explicitly skipped B-rep round-trip; it is not mesh reimport proof.
+  It does not heal geometry or weld nearby points. Inspect the source/export conditions
   rather than deleting triangles or claiming an unchecked mesh is print-ready.
 
 PRIMITIVE PLACEMENT & ORIENTATION (box / cylinder / sphere / cone / torus)
@@ -738,8 +873,11 @@ PRIMITIVE PLACEMENT & ORIENTATION (box / cylinder / sphere / cone / torus)
                a SIDEWAYS cylinder/cone/box without falling back to sketch+extrude.
     centered   false = the natural base/corner sits at `at` (box corner, cylinder/cone base
                centre) instead of the centroid. Default true.
-    mode       "boss" fuse into the running body (default) | "cut" subtract it.
-    merge      false = start a NEW body instead of fusing into the current one.
+    mode       "new" starts a body | "add"/"boss" fuses (default) | "cut" subtracts.
+               Primitive params.mode also accepts the existing boolean aliases:
+               new_body/newbody/none -> new; union/join/fuse/merge/weld -> boss;
+               subtract/difference/remove -> cut. Prefer canonical modes.
+    merge      false = start a NEW body instead of fusing; overrides a valid mode.
   Transform order: build centred -> rotate local +Z onto `axis` about the origin -> apply the
   `centered:false` base offset ALONG THE ROTATED AXIS -> translate by `at` -> add `at_offset`.
 
@@ -770,7 +908,7 @@ PRIMITIVE PLACEMENT & ORIENTATION (box / cylinder / sphere / cone / torus)
   intersects the body — a boss that adds no material is REJECTED, not silently ignored.
 
 GEOMETRY QUERY GRAMMAR (query_geometry, refs.*, at:{...}, FEA fixtures/loads, asm_mate)
-  A query is a STRUCTURED OBJECT (or a bare side word like "top"/"+z"), never a sentence:
+  Prefer a STRUCTURED OBJECT; a bare side word like "top"/"+z" also works:
     of             "face" | "edge".  OPTIONAL — defaults to "face".
     side           top | bottom | left | right | front | back, or "+z"/"-x"/... — which way
                    it faces. With pick "largest"/"smallest": the largest face facing that way.
@@ -780,7 +918,7 @@ GEOMETRY QUERY GRAMMAR (query_geometry, refs.*, at:{...}, FEA fixtures/loads, as
     perpendicular  same value forms — keep only geometry perpendicular to that direction.
                    NOTE a face's direction is its NORMAL, an edge's is the way it RUNS. So a
                    VERTICAL WALL FACE is perpendicular:"z" (its normal is horizontal) while a
-                   VERTICAL EDGE is parallel:"z". "Vertical"/"horizontal" are not query words.
+                   VERTICAL EDGE is parallel:"z".
     pick           largest | smallest | longest | shortest | inner | outer — narrow a
                    multi-match to the one you mean (also "index":[i]).
     near           [x,y,z] (+ "count") — the face/edge nearest a point ON it (or at its
@@ -792,13 +930,42 @@ GEOMETRY QUERY GRAMMAR (query_geometry, refs.*, at:{...}, FEA fixtures/loads, as
     {"of":"face","surf":"round","pick":"outer"}               the outer cylindrical wall
     {"of":"edge","surf":"line","parallel":"z"}                the vertical straight edges
     {"of":"face","surf":"flat","perpendicular":"z"}           the upright flat wall faces
-  A FREE-TEXT SENTENCE IS NOT A QUERY. "the outer cylindrical wall face at bottom near
-  x=200,y=0" is not parseable geometry — EXPLORE first with describe_part() /
-  query_geometry({"of":"face"}) / hover(sid) to see what the part actually has, then SELECT
-  with a structured query built from the keys above.
+  Token phrases can express simple side/surface/orientation/pick predicates, but are
+  not arbitrary natural-language queries. For "the outer cylindrical wall near x=200",
+  state near:[200,y,z] explicitly in the query; prose coordinates do not narrow it.
+  EXPLORE first with describe_part() / query_geometry({"of":"face"}) / hover(sid),
+  then SELECT with a structured query built from the keys above.
 
 ================================================================================
 """
+
+
+def _engine_vocabulary_block() -> str:
+    """The engine's own op / feature-type / per-type param-key lists (doc_list_ops), the
+    single source: nothing here is copied by hand, so it cannot drift from what add_features
+    and doc_apply_ops actually accept."""
+    from . import op_vocab  # noqa: PLC0415
+    try:
+        ops = op_vocab.doc_ops()
+        types = op_vocab.feature_types()
+        params = op_vocab.feature_params()
+    except op_vocab.OpVocabUnavailable as exc:
+        return ("\n\nENGINE VOCABULARY (live): unavailable — " + str(exc) +
+                ". The op / feature-type / param-key lists come only from the engine.")
+    lines = ["", "", "ENGINE VOCABULARY (live from the engine's doc_list_ops)",
+             "ops (field op=…): " + ", ".join(ops),
+             "feature types (ONLY under op=add_feature): " + ", ".join(types),
+             "PARAM KEYS each feature type reads — any other params key is refused with this "
+             "list (a ref slot name is also accepted in params):"]
+    for ftype in types:
+        if ftype in params:
+            lines.append(f"  {ftype}: " + (", ".join(params[ftype]) or "(no params)"))
+    open_types = [t for t in types if t not in params]
+    if open_types:
+        lines.append("types with open-ended params (unknown keys are not refused): "
+                     + ", ".join(open_types))
+    return "\n".join(lines) + "\n"
+
 
 
 _GSL_GUIDE = """\
@@ -810,25 +977,49 @@ On a complex/imported part, do NOT page through query_geometry's whole face list
                          narrative (which face each feature sits on / touches), any detected
                          symmetry/instanced PATTERN (e.g. "6-fold rotational about +Z" with the
                          6 blade faces collapsed to one line), the bores/holes and flat faces by
-                         side, and a stable `sid` for every addressable face/edge. Token cost
-                         scales with the number of DISTINCT roles, not the raw face count.
+                         side, and a revision-scoped `sid` for every addressable face/edge.
+                         Token cost scales with DISTINCT roles, not the raw face count.
   describe_sketch(id)    a sketch's plane placement, entity roster (line/circle/arc + dims),
                          constraint roster with driving-dimension values, closed-region count/
                          area, and the DOF (fully/under/over-defined) verdict — the sketch
                          equivalent of describe_part, for reviewing layout before you extrude it.
   sketch_health(id)      the narrated constraint read: WHICH free variables remain (dof in plain
                          words), open chain endpoints, per-entity under/full/over, redundant/
-                         conflicting with removal hints, and an ORDERED schedule (relations first,
-                         then driving dims). Draw roughly -> relations -> critical dimensions ->
-                         sketch_fully_define -> check_sketch: dof 0 and not pinned_only.
+                         conflicting rows with conflicts_with partner ids and removal hints, and
+                         `hints` (suggestions, not a plan: relations first, then driving dims).
+                         Author geometry + relations + critical dims in the
+                         SAME add_features call as the sketch; auto-definition follows explicit
+                         intent. Prefer symmetric about axes/centerlines, equal, midpoint and
+                         point_on axis over coordinates. Dimension functional sizes/spacings,
+                         not every edge; use eq_set expressions/globals across features.
+                         A stored dimension literal next to an expression is not its evaluated
+                         value; inspect the labelled evaluated value or its unavailability.
+                         Open rib/sweep paths are intentional; revolve may close to its axis.
+                         Do not delete a partially dependent relation wholesale.
+                         suggest_dimension_scheme uses solver free variables and suggests
+                         relations before dimensions. Editability findings (repeated values, mirrored
+                         offsets, zero location dims) are advisory, not completion blockers.
+                         Finish sketch_fully_define -> check_sketch: dof 0 and not pinned_only.
+  sketch_probe(sketch, add_constraint=None, set_dim=None, delete_constraint=None)
+                         dry-run ONE change on a copy (never mutates the sketch): returns
+                         dof_before/dof_after/dof_delta, converged, conflicting, redundant,
+                         skipped, conflicts_with, would_over_define. Probe before adding a
+                         driving dimension.
   sketch_auto_constrain(id)  stitch near-touching endpoints coincident (apply=True, default) or
                          just propose them (apply=False); each add is rollback-safe (skips any that
                          would conflict) and it reports which chains closed. Runs automatically after
                          edits when doc meta sketch.auto_coincident is on (default).
   sketch_fully_define(id) infer residual editable relations/dimensions (never blanket fix).
-                         relations=True, dimensions=True, anchor="origin"|"none", entities=[ids]
-                         optionally limit it. add_features runs this in the same revision after
-                         NEW sketches / sketch_add_entity batches; auto_define:false opts out.
+                         relations=True, dimensions=True, anchor="origin"|"none", entities=[ids],
+                         round=False keeps exact measured values (default snaps to clean increments).
+                         add_features runs this in the same revision after NEW sketches /
+                         sketch_add_entity batches; auto_define:false opts out.
+                         In add_features ops, use sketch=<feature id>; id is also accepted.
+                         Generated constraints are tagged auto:true: driving for solve/DOF,
+                         but superseded by explicit relations/dimensions added later. Add your
+                         intent dimensions without deleting auto ones first. Editing an auto
+                         dimension's value/expression promotes it to explicit; moving its label
+                         does not. Read authored_dimensions vs auto_dimensions.
   describe_scene(views)  the TEXT equivalent of render_part/contact_sheet for a model with no
                          vision: per requested view (default front/right/top/iso), which faces
                          face the camera (by sid/surf/side/dims) plus the part bbox — computed
@@ -840,15 +1031,28 @@ On a complex/imported part, do NOT page through query_geometry's whole face list
                          view="auto" is the shot planner's single best MEASURED camera (every
                          candidate is measured in the engine); for an internal target that is
                          a SECTION through it, cut face hatched and the removed half ghosted.
+                         section= (render_part / inspect_part / contact_sheet) is YOUR cut
+                         instead: "top"/"front"/"right" (XY/XZ/YZ), {"plane":name,"offset":mm}
+                         or {"origin":[x,y,z],"normal":[nx,ny,nz]}, optional "flip":true. The
+                         +normal half is removed (ghost outline), the cut face hatched; a datum
+                         plane passes through the WORLD ORIGIN unless offset moves it, so for a
+                         feature away from the origin give origin+normal through it. The
+                         caption names the plane and its area ON THAT SAME PLANE; a bad plane,
+                         or section with inspect_part's cutaway=, is an error. Any "Section
+                         numbers" in a caption describe the plane the image shows.
   inspect_feature(target) planner close-ups (hero + complementary alternates, a section for
                          anything internal) + whole-part CONTEXT with the target highlighted,
                          plus describe_part excerpt + dims. Use when the grid is ambiguous.
   render_views(views?)   the planner's 7 complementary views (or a custom view list, e.g. the
-                         6-ortho+iso drawing set); optional target= frames every tile on the
-                         feature, and the caption names what each view shows.
-  look_around(target)    N close-ups of one target tiled: the planner's complementary set by
-                         default (ranked=False for an even orbit), each labelled with how much
-                         of the target it shows.
+                         6-ortho+iso drawing set). target= frames every tile on a feature,
+                         sid/query, or world point [x,y,z] / {"point":[x,y,z],"radius":mm}.
+                         A point gets a crosshair, not a selected face; highlight= separately
+                         selects geometry. The caption names what each view shows.
+  look_around(target)    N close-ups of one target tiled (n_views 1-8; more is an ERROR, not a
+                         clamp): the planner's complementary set by default (ranked=False for an
+                         even orbit), each labelled with how much of the target it shows. Tiles
+                         that fail to render are reported in the caption ("N of M ... failed")
+                         for every multi-tile render tool; the call errors only if all fail.
   Every emphasis render paints the target's EXACT visible faces (shading kept so curvature
                          still reads), desaturates the rest, and reports measured coverage —
                          a camera that cannot see the target SAYS so instead of showing a blank.
@@ -857,19 +1061,22 @@ On a complex/imported part, do NOT page through query_geometry's whole face list
   query_adjacency()      the face-adjacency graph: which faces touch, and whether each shared
                          edge is a CONVEX outside-corner or a CONCAVE inside/pocket edge. This is
                          how you reason about "the edge between the top and front face".
+                         Faces carry sid; edges carry between_sids. Pages use offset/page_size
+                         and next_offset; the graph covers the last body. doc_face_edges(body_id,
+                         topo_id) pages the body-local edge IDs bordering a queried face.
 
 Every query_geometry/describe_part match now also carries: `side` (top/bottom/left/right/front/
 back), `normal` (SIGNED outward dir — unlike the unsigned `axis`), `concavity` (bore vs boss),
 `radius`, `axis_point` (cylinder/cone: a point ON the axis — `centroid` is off-axis on a fillet),
 torus faces (sweep bends) `major_radius`/`minor_radius`/`torus_axis`/`torus_center` (bend
-radius, tube radius, bend axis, bend centre — their `radius`/`axis` stay null), and a stable
-`sid`. add_features returns a `changes` write-diff ("added 1 cylinder; 1
-new bore; volume -3927; part bbox 60x40x20 mm") so you can confirm an op did what you meant
-instead of guessing: `changes.bbox_mm` is the whole part's size (check it against what you were
-asked for rather than spending a measure_part call), a volume move too small to be real material
-says so instead of printing a delta, and anything the kernel objected to arrives as an
-"ENGINE WARNING:" prefix on the summary. Best-effort `overlap_warnings` also travels when the
-batch introduced a boss/cut overlap (see check_feature_overlap for the dedicated tool).
+radius, tube radius, bend axis, bend centre — their `radius`/`axis` stay null), and a
+revision-scoped `sid`. Requery after geometry changes; a stale SID is never retargeted.
+add_features returns `changes` readback, but volume and its delta are approximate display
+statistics, and no delta is reported without a revision-correct baseline. bore_faces_delta
+counts cylindrical bore faces, not physical holes. body_count counts physical solids;
+logical_member_count counts compiled entries. `changes.bbox_mm` is the whole part's size.
+Separate newly introduced warnings from old ones. `overlap_warnings` describes raw
+pre-boolean tool intersections, not measured material removal; inspect geometry/history.
 """
 
 _INTAKE_GUIDE = """\
@@ -887,10 +1094,12 @@ ISO 286 FIT CALCULATOR — call fit_calc BEFORE setting any bore or shaft diamet
                                   "dowel pin" → recommended ISO 286 classes + rationale.
                                   Call recommend_fit FIRST, then fit_calc with the class it gives.
   suggest_dimension_scheme(doc, sketch, process)
-                                  ordered dimension plan for a sketch: which dims to drive,
-                                  default IT-grade tolerances by process, bolt-pattern datum rules,
-                                  and needs_user_confirm flags for function-critical dims.
+                                  solver-aware plan: review and apply relation rows first,
+                                  then re-plan before adding critical sizes. Requires process;
+                                  ISO 286 IT tolerances apply only where a nominal is known.
                                   CNC/lathe → IT7, FDM → IT12, sheet/laser → IT10.
+  mfg_plan_check: a DfM row is not_evaluated unless at least one supplied helper input
+    was compared against a process minimum; resolved facts alone are not a pass.
 
 WHEN the design must incorporate a real part you have NO model/datasheet for:
   1. LOOK IT UP FIRST — list_standard_parts / make_standard_part. Only a real miss triggers photos.
@@ -909,6 +1118,20 @@ WHEN the design must incorporate a real part you have NO model/datasheet for:
   7. fit_report() to review modeled-vs-measured + clearances before export; dfm_check() for wall/
      draft vs the process minimums; make_fit_coupon(key) to print a tiny test of one interface
      first. All of this persists in the .step+ (reopens in-app intact).
+  Printed parts: while modelling, run wall_thickness() for the process-minimum RED heat map
+  AND dfm_check(). Fix every red region at its named face/feature or explicitly justify it
+  before export/slicing; re-run after edits. See cad_guide('printing') and ('evaluate').
+  dfm_check(verify_fixes=False) retains findings but skips detached-clone verification
+  and omits proposed operations; the default True returns only verified operations.
+  For FDM call dfm_reinforce(doc_id?, process?, target_wall_mm?, limit?, cursor?) to
+  preview controlling feature/sketch edits. Each verified proposal is rebuilt and
+  remeasured on an internal clone, with before/after thickness and side effects.
+  No edit is applied automatically; review fit, geometry and loading before applying.
+  For molding specify pull_dir=[x,y,z] to evaluate release in the intended direction.
+  DFM evaluates available feature sizes and reports unsupported evidence as not_evaluated,
+  not a pass. Open concave fillet patches are not complete holes; split cylindrical bore
+  faces can represent one hole. A simple custom bore is not a thread: specify actual thread
+  style/designation and manufacturing strategy where applicable.
 """
 
 _CAM_GUIDE = """\
@@ -999,6 +1222,12 @@ EDITING
     angle, force a standard scale, change paper) and moves dimensions and cuts with their views.
   - Dimensions, tolerances (symmetric / deviation / limit / basic), GD&T frames, datums, surface
     finish, weld symbols, notes, balloons, tables: see the agent cheatsheet below.
+  - For angular_dim use four sheet points a,b and c,d, or two visible straight edge SIDs
+    in a,b. Linear/aligned dimensions accept one visible straight edge SID, or two parallel
+    planar face SIDs in a view where their true separation can be measured.
+    set_titleblock accepts sheet_id; omitted, it updates the active sheet.
+  - make_drawing reports auto_dimensions_added, sections_added and warnings; inspect counts.
+    For ordinate axis="both", positions is {"x":[...], "y":[...]}, one position per point.
 
 DELIVERABLES (export_drawing)
   - PDF: vector, true paper size, ISO line weights, filled arrows, searchable Helvetica text.
@@ -1007,17 +1236,718 @@ DELIVERABLES (export_drawing)
   - DWG (AutoCAD R2000, written natively): the same layers/colors/text, DASHED/CENTER
     linetypes and aligned text.
   - SVG: editable paths and real text. PNG review raster via review_drawing.
-  - Drawings save inside the part's .step+ and reopen associatively; a standalone .draw+ embeds
-    its source.
+  - A non-release draft may be exported after review without audit; identify it as a draft.
+    For release, audit_drawing against real manufacturing requirements; empty specs refuse.
+    It also derives bore and feature-dimension requirements from the live model, audits every
+    sheet, and reports stale dimensions or numeric text overrides that disagree with measurement.
+    Assembly component feature schemes and equation-driven feature nominals that were not
+    evaluated remain missing critical requirements; do not treat those audits as releases.
+    Pair view_id with annotation_id, since IDs can repeat between views.
+  - Set geometric scale with make_drawing/arrange_drawing, not only printed title text.
+    review_drawing and audit_drawing report scale disagreements.
+  - add_hole_callout takes a=[x,y] sheet mm near a projected circle or its centre;
+    thread, depth, and counterbore/countersink details require a matching Hole feature_ref.
+  - add_chamfer_dimension accepts a chamfer edge SID or sheet anchor, with optional feature_ref;
+    symmetric and distance-angle sizes come from the model; other chamfer types are refused.
+    Dimension planners require live authored geometry and never substitute fixture data.
+    Dimensions whose anchors cannot be re-resolved are stale and must be reattached.
+    To clear displayed tolerance use tol_type="none"; null patches refuse.
+  - Relative export_drawing paths use the selected project root; absolute paths are accepted,
+    except credential/key destinations, including companions.
+  - Drawings save inside the open source part's .step+ via save_part. For a standalone native
+    .draw+ embedding its source, use export_part(fmt="draw+", doc_id=<drawing_id>,
+    path="sheet.draw+"); save_part does not accept drawing ids.
 """
 
 
-def cad_guide_text(topic: str = "overview") -> str:
-    topic = (topic or "overview").strip().lower()
+_ADD_FEATURES_GUIDE = """Apply a list of document ops to build/edit the part (the core modeling tool).
+
+        `ops` is a JSON array of ops from the CLOSED vocabulary (see OP VOCABULARY below
+        and cad_guide(topic="ops")) — e.g.
+          [{"op":"add_feature","feature":{"type":"box","name":"Block",
+              "params":{"length":{"value":40,"expr":null},"width":{"value":30,"expr":null},
+                        "height":{"value":20,"expr":null}}}},
+           {"op":"add_feature","feature":{"type":"fillet","name":"Round",
+              "params":{"radius":{"value":3,"expr":null}},"refs":{"edges":{"of":"edge"}}}}]
+        Geometry is addressed via structured `refs` selectors (e.g.
+        {"face":{"of":"face","side":"top"}}), not free-text descriptions. Ops in one
+        call may reference an earlier op in the SAME array as "$<index>" (0-based);
+        existing tree features by id ("f1").
+        Face/edge SIDs name the PRE-BATCH current topology, not permanent feature handles.
+        After a completed geometry edit, refresh query_geometry/describe_part before the
+        next SID-dependent call. "$N" names an operation/feature, not a newly built edge.
+        Split the calls and requery when a later feature needs a newly generated SID;
+        use a suitable geometry query instead when it can express the intended selection.
+        BLIND CUTS follow the sketch normal first; params.flip:true reverses it. The
+        engine tries the other direction only for simple blind cuts without an explicit
+        direction or flip when the first removes no material, not when it intersects the
+        wrong side. Inspect the resulting geometry.
+        Open rib and sweep paths need not close; a revolve may auto-close to its axis.
+        sketch_fillet's radius is driving; conflicts reject the whole batch atomically.
+        Radii clamp to the valid corner range (op_reports requested_radius / applied_radius).
+        An out-of-range expression is retained inside min(max((expr),1e-6),upper);
+        expression_clamp_min/max and bounds_basis report the operation-time corner snapshot.
+        Later source-geometry changes can invalidate its frozen upper bound.
+
+
+        FILLETS: `params.type` supports "constant" (`radius`) and "variable" (`radius`
+        and `radius2`). Both explicit types require `refs.edges`; a structured query such
+        as {"of":"edge","parallel":"z"} can select edges for either type. The variable
+        endpoint law follows the contour spine. Multi-edge contours are supported when
+        shared-vertex radius constraints agree; unequal radii on one closed edge,
+        contradictory shared-vertex radii, and variable contact joins are unsupported.
+        Positive unequal requested endpoints separated by at most kernel precision (about
+        1e-7 mm) receive an OCCT radius-resolution refusal rather than being silently
+        averaged; nonpositive requests can enter correction, but unequal effective endpoints
+        must be separated by more than that precision. The no-type
+        legacy form can also use eligible edges filtered by `dir` or all eligible edges;
+        use cad_guide("fillet") for its mode rules.
+        Positive requests passing input/topology checks are tried unchanged first. If that
+        build fails, or a finite requested radius is nonpositive, a bounded search can adjust
+        radii, but only a fully validated blend covering every selected edge is accepted.
+        Variable endpoints are refined in deterministic order, not as a global optimum.
+        A timeout stops the search without becoming a radius bound; a previously fully
+        validated all-edge candidate can still be returned. Invalid or dangling selectors,
+        zero matches, nonfinite radii, unsupported topology, crashes, and failure to find a
+        valid all-edge blend are explicit errors.
+
+        ARGUMENT SHAPES — the canonical call is `ops=[…]`; these are accepted too, and every
+        rewrite comes back in `interpreted` (prefer the canonical spelling once you know it):
+          ops={"op":…}           a single op dict — read as a one-element batch
+          ops="[{…}]"            the array as a JSON string (real JSON only: Python repr
+                                 with single quotes/tuples is a teaching error, not a guess)
+          feature= features= op= operations= actions= ops_json=
+                                 the batch under another name. Two DIFFERENT batches in one
+                                 call is an error — send exactly one.
+          ops=[{"type":"box",…}] bare feature dicts with no "op" — read as add_feature
+          {"op":"box",…}         a feature TYPE used as the op name — read as add_feature
+          type=… name=… params={…} diameter=… (no ops at all)
+                                 ONE feature spread over top-level kwargs; unrecognised
+                                 kwargs become that feature's params
+          name= identifier= part= part_name=   with NO type= in the call: the DOCUMENT to
+                                 build into (an open part's name resolves to its doc_id).
+                                 Supplying both a differing doc_id and one of these is an
+                                 error. A feature's name always goes in feature.name.
+          purpose= basis= rationale= note= …   design intent is ACCEPTED and ignored (it is
+                                 not a modeling parameter) — record reasoning with
+                                 ledger_note(), not here.
+
+        DIMENSIONS — write a size in whichever of these is most natural; all are accepted:
+          40                     a bare number, in DOCUMENT UNITS (millimetres)
+          "40"                   the same number as a string
+          {"value":40,"expr":null}   the canonical dim object (what get_part hands back)
+          "40mm" "2.5cm" "1in" '2.5"' "1ft" "5 ft 6 in" "0.5m" "20thou"
+                                 a number plus a unit — converted to mm for you, and the
+                                 conversion is echoed back in the response's `interpreted`
+          {"value":2,"unit":"in"}    the same thing with the unit in its own field
+          "width/2"              an EXPRESSION, evaluated by the engine against the part's
+                                 equations/globals (also {"value":0,"expr":"width/2"}).
+                                 Anything that isn't purely <number><unit> is left alone and
+                                 handed to the expression evaluator, so a real formula is
+                                 never mangled — but a unit inside a formula ("2*10mm") is
+                                 NOT understood: do the arithmetic or use one unit literal.
+        DIMENSION SHORTHAND (rewritten for you, and reported in `interpreted` — prefer the
+        canonical spelling once you know it):
+          "diameter" (or dia/d) on cylinder/sphere -> radius, HALVED. On a cone d1/d2 -> r1/r2;
+            on a torus major_diameter/minor_diameter -> major_r/minor_r.
+            NOT on hole / bolt_circle: those take a REAL "diameter" param and are never halved.
+          "size":[l,w,h] on a box -> length/width/height; "size":40 -> a 40 cube.
+        These forms work on any add_feature params and on edit_feature params (the unit
+        conversion; the per-type diameter alias needs the feature type, so it is add-only).
+        A JSON-encoded {"value":N,"expr":null} dimension from a tree readback is decoded
+        before evaluation too; literal text fields and ordinary expressions stay text.
+        Spelling repairs are reported in `interpreted`:[…] beside the result.
+        A rewrite or fill-in that can change WHAT IS BUILT (a drill direction read as an entry
+        face, a dropped boolean target, a normalizer that failed and sent the op as written)
+        is listed separately and uncapped under `assumptions` — read it before moving on.
+
+        SCHEMA DEFAULTS the tool supplies are reported in `interpreted` or `assumptions`:
+          hole      params.style defaults to "simple" — the vocabulary is simple|tap|cbore|
+                    csink, and counterbore/c-bore/countersink/csk/tapped are mapped onto it.
+                    params.end is REQUIRED and has no default: pass "through_all" or "blind"
+                    (through/thru are mapped onto "through_all"); a depth alone does not
+                    select an end condition and is refused.
+                    The entry face is REQUIRED: refs.face. A signed
+                    drill direction names it — direction/dir/drill_direction is the way the
+                    drill TRAVELS ([0,0,-1] enters the top face), `normal` is the face's
+                    outward normal ([0,0,1] is the top face); anything oblique or unsigned is
+                    refused, never snapped. World
+                    [x,y,z] point(s) under origin/position/at (or [x,y,z] positions) become
+                    params.world_points — points on each bore AXIS, which the engine projects
+                    along refs.face's normal onto that face (refused when the axis misses
+                    it); positions=[[u,v]] stay FACE-LOCAL.
+          bolt_circle  a world [x,y,z] ring centre under center/at/origin becomes
+                    params.world_center (same projection rule); omitted = face centre.
+          sketch    missing/noncanonical entity ids become e<N>; canonical ids are retained,
+                    with constraint handles remapped. Missing construction defaults to false.
+                    Creation AND edit_feature replacements use the same entity/constraint
+                    dialect normalizer; omitted edit fields keep their current values.
+                    params.constraints defaults to [] on creation only. refs.plane accepts
+                    XY/XZ/YZ/top/front/right -> plane.top/plane.front/plane.right.
+                    NEW sketches and sketch_add_entity batches finish with sketch_fully_define
+                    in this SAME atomic ops batch (one revision). Author relations/dimensions
+                    first; it defines remaining DOF without blanket fix pins. These constraints
+                    are soft (auto:true), still driving but superseded by later explicit
+                    relations/dimensions: add intent without deleting auto ones first. Editing
+                    an auto dimension's value/expr promotes it to explicit. Pass call-level
+                    auto_define=False, op.auto_define:false, or feature.params.auto_define:false
+                    to opt out (the feature option persists for later entity batches).
+                    A fix on a rectangle/polygon/polyline pins every expanded segment;
+                    other relations on a whole expanded shape are ambiguous and refuse.
+                    reorder_feature accepts same-batch "$N" in both id and before.
+          boolean   params.op accepts union/add/join -> "fuse", subtract/difference -> "cut",
+                    intersect -> "common"; targets/bodies/operands become params.a and .b.
+          primitives (box/cylinder/sphere/cone/torus)
+                    mode is new|add|boss|cut; new_body/newbody/none normalize to new.
+                    Native add is preserved; other union aliases normalize to boss and
+                    subtract aliases to cut. merge:false overrides a valid mode.
+          extrude / revolve / loft / sweep
+                    params.mode defaults to "boss"; params.sketch:"<name>" becomes
+                    refs.profile=[{"kind":"region","sketch":…}]; revolve's params.axis:"Z"
+                    becomes refs.axis:"axis.z", and a revolve with no angle defaults to
+                    a full 360° revolution.
+          thread    refs.target_face selects a cylindrical face; supply size or both
+                    major_dia and pitch, and omit length for the full run. `turns` caps
+                    swept turns (default 24, including end extensions). Insufficient cap
+                    or failed real cut/raised geometry rejects the operation, never silently
+                    shortens it or switches to cosmetic. Explicit cosmetic changes no
+                    geometry; preview/draft is provisional. See cad_guide("thread").
+          transform moves its body by default; only copy:true duplicates. body names a
+                    live body-owner feature id on a part, or a component id on an assembly.
+                    Missing/consumed refs refuse, never target another body. rotate accepts
+                    [x,y,z] plus angle or {"axis":[x,y,z],"angle":degrees}. Assembly motion
+                    composes in world space with placement; mate-owned poses refuse.
+          set_suppressed targets feature ids on parts and component ids on assemblies;
+                    value:true suppresses, value:false restores. Wrong-kind ids refuse.
+          any       feature TYPE synonyms are mapped (cube/cuboid/block -> box, cylindrical/
+                    rod/shaft -> cylinder, ball -> sphere, cut_<shape> -> <shape> with
+                    mode:"cut", pocket -> extrude with mode:"cut"); a word that could mean
+                    several different solids (ring, circle, tube, pipe, boss, prism, rectangle)
+                    is refused with the choices spelled out, and an unknown type is
+                    rejected with the closest real types named. A ref that names a feature
+                    CREATED IN THIS SAME BATCH by its display name resolves to its "$N".
+                    at/axis/origin take a plain [x,y,z] — a {"value":[…]} wrapper around a
+                    coordinate is unwrapped, and at:"center" becomes [0,0,0]. A direction
+                    slot (refs.axis/dir1/dir2/pull) given a bare vector keeps its exact
+                    numbers: a positive cardinal vector becomes axis.x/y/z, anything else
+                    (negative, diagonal, or through a point) is sent as
+                    {"axis":[x,y,z],"point":[x,y,z]}. A boolean combines exactly TWO bodies;
+                    chain further operands as separate booleans. An arc needs ccw:true|false
+                    (or a third point): start/end alone describe the arc and its complement.
+
+        OP VOCABULARY (closed — do NOT invent names): the live op list, the feature types and
+        the exact param keys each feature type reads come from the engine —
+        cad_guide(topic="ops") prints them (engine doc_list_ops `ops`, `feature_types`,
+        `params`); an unknown param key on a type with a closed key list is refused with
+        that list. Feature types are ONLY valid under op=add_feature.
+          WRONG: {"op":"box",…} / {"op":"sketch",…} / {"op":"extrude",…} / {"op":"cylinder",…}
+          RIGHT: {"op":"add_feature","feature":{"type":"box"|"cylinder"|"sketch"|…, …}}
+          rename relabels ONE FEATURE and needs its id: {"op":"rename","id":"f1","name":"Base"}.
+            No op renames the part/document: name it at creation (new_part(name="…")) and
+            name its file with save_part(path="<name>.step+").
+          sketch_edit_entity changes the fields of ONE entity. Put the id and the changed fields
+            in "entity": {"op":"sketch_edit_entity","sketch":"f1","entity":{"id":"e1","p2":[60,0]}}.
+            The type cannot change. An unknown id, an empty patch or a wrong field is refused.
+          A leading {"op":"new_part","name":…} (or bare {"type":"new_part",…}) is also
+            accepted as a convenience: it mints the document and the rest of the batch
+            builds into it, so you can create-and-build in one call. Everywhere else
+            new_part is the standalone tool, not an op.
+          Live list: engine doc_list_ops (sourced from core/doc/op_registry — single source).
+          Call cad_guide(topic="ops") or a feature topic for worked examples and param shapes.
+        In an edit_feature op, suppressed=true/false alongside params, refs or name also
+        applies set_suppressed; other edits are retained.
+
+
+        RE-POSING AN ASSEMBLY COMPONENT — asm_edit_component moves a component ONLY while
+        nothing else owns its pose. It carries `transform` (16 row-major numbers or four
+        rows of four numbers; also accepted by asm_insert_component; at/rotate/angle
+        are accepted here and converted for you), `name`, `fixed`, `suppressed`, `hidden`.
+          * MATED component (not `fixed`, referenced by a live mate): its pose belongs to
+            the mate solver, and the rebuild overwrites any transform you write. This call
+            REFUSES with {"ok":false,"reason":"component_is_mated"} instead of reporting a
+            move that did not happen. Move it by driving the mate —
+            {"op":"asm_edit_mate","id":"m1","value":{"value":<mm|deg>}} then solve_mates()
+            — or explore poses with simulate_motion (never mutates the doc). To pose it
+            freely, suppress/delete the mate first, or set "fixed":true in the same batch.
+          * To replace mate operands, use add_features with
+            {"op":"asm_edit_mate","id":"m1","refs":[{"component":"k1","query":{"of":"face","side":"top"}},{"component":"k2","sid":"F2bb10f"}]}.
+            As with asm_mate and asm_add_mate, each query or sid resolves to one face/edge
+            on that component's source part; existing engine selectors remain valid.
+          * ALREADY-PLACED component: the engine seeds each solve from the previous one, so
+            a fresh transform can be discarded even with no mates; this call reads the pose
+            back and returns {"ok":false,"reason":"transform_not_applied"} when that
+            happens. Place components at insert time (asm_add_component at/rotate) or move
+            them through mates.
+
+        PRIMITIVE PLACEMENT + ORIENTATION (box/cylinder/sphere/cone/torus) — feature-level
+        keys beside "type"/"name"/"params", all optional. An unrecognised key is REJECTED,
+        never silently ignored, so use exactly these spellings:
+          "at":[x,y,z]           where its CENTRE goes (default: centred on the origin) — so
+                                 two coaxial cylinders of height h stack at "at" z = 0 and
+                                 z = h, not 0 and h/2. Also spelled "center"/"centre", which
+                                 mean the same thing and are rejected outright next to
+                                 "centered":false (then "at" is the BASE, not the centre).
+                                 May instead be a geometry query — "at":{"of":"face",
+                                 "side":"top"} places it at that face's centroid.
+          "at_offset":[dx,dy,dz] world-axis nudge added on top of "at".
+          "axis":[x,y,z] | "+x"|"-x"|"+y"|"-y"|"+z"|"-z"   which way it POINTS: the primitive's
+                                 natural local +Z is rotated onto "axis" (default "+z" = up).
+                                 This is how you get a sideways cylinder/cone/box without a
+                                 sketch — "centered":false then measures along the ROTATED axis.
+          "centered":false       put the base/corner at "at" instead of the centre (box corner,
+                                 cylinder/cone base); sphere/torus are always centred.
+          "mode":"boss"|"cut"    fuse into (default) or subtract from the current body.
+          "merge":false          start a SEPARATE new body instead of combining.
+          An off-origin sideways boss, end to end:
+          {"op":"add_feature","feature":{"type":"cylinder","name":"DrainSpout",
+              "params":{"radius":{"value":25,"expr":null},"height":{"value":60,"expr":null}},
+              "at":[200,0,40],"axis":[1,0,0],"centered":false,"mode":"boss"}}
+          WRONG: "placement":{"origin":[…],"direction":[…]} / "boolean":"union"
+          RIGHT: "at":[…], "axis":[…], "mode":"boss"
+          Selectors live in the feature's OWN "refs" — a SIBLING of "params", never inside it:
+          WRONG: "params":{"refs":{"profile":[…]},"depth":{…}}   (reaches no slot at all)
+          RIGHT: "refs":{"profile":[…]}, "params":{"depth":{…}}
+          A datum slot takes a bare reserved name: "plane.top"|"plane.front"|"plane.right",
+          "axis.x"|"axis.y"|"axis.z", "origin" — no wrapper object, no centroid.
+
+        Returns revision, body_count, logical_member_count, volume_mm3, and per-feature status.
+        body_count counts physical solids; logical_member_count counts compiled entries.
+        Display volume and deltas are approximate, and a delta is omitted without a
+        revision-correct baseline. bore_faces_delta counts faces, not physical holes.
+        Overlap volumes are pre-boolean tool intersections, not measured material removed.
+        For a successful fillet inspect `features[i].data.fillet` in the completed
+        result: `requested` and `effective` contain radius/radius2 in canonical mm
+        (radius2 is null for constant); `adjustment` is none/lower/upper/both;
+        `selected_edges`, `covered_edges`, `tolerance_mm` and `probes` expose coverage
+        and search. Corrected literal dimensions are saved in the accepted tree;
+        expressions stay authored and may have derived `feature.data.fillet_effective`.
+        A rejected part batch is atomic; its candidate statuses do not describe the live
+        geometry. Do not infer effective radii from warning text.
+        VERIFY LOOP: inspect each mutation's result and measure affected geometry with
+        measure_part()/query_geometry()/inspect_feature(target). Render when visual judgment
+        or a warning warrants it, and review the finished artifact as needed. Before
+        declaring done run verify_battery(doc_id=doc_id). On a validation error
+        the whole batch is rejected — read `error`, fix the ops, call again. A rebuild-failure
+        response may also carry `regen_diagnosis`: an IP-18 fix-preview card (diagnosis +
+        editable fix_ops + verifier verdict) — record your verdict with regen_resolve(card, action).
+
+        SKETCH MUTATIONS: any batch that includes sketch_add_entity / sketch_add_constraint /
+        sketch_set_dim / sketch_fillet / … auto-appends one readback per touched sketch under
+        `sketch_readbacks[]`: `ascii_ruled` (the ruled ASCII picture, the only copy), `summary`
+        (closure / dof / hints), `grid` + `index` (the cell<->world contract
+        apply_ascii_edits resolves cell addresses against) and `findings`. READ that readback
+        before the next sketch edit. Auto-definition results arrive in `sketch_definitions[]`
+        (notes, dof_before/dof_after, rounded) and parametric/delete ops in `op_reports[]`.
+        Relations first, then only critical dimensions (never `fix` your own profile);
+        sketch_probe a driving dimension before adding it; compare authored_dimensions with
+        auto_dimensions. Before declaring a sketch done, call
+        render_sketch_ascii(sketch) + sketch_health(sketch) (or check_sketch) and require dof 0.
+        Full sketch reference (ops table, rounding rule, face-sketch frame): cad_guide('sketch').
+
+        HEAVY OPS: a costly op (a global fillet/chamfer/shell/boolean on a many-edged body) is
+        run on a worker thread and AUTO-HANDED-OFF to the background if it overruns the call
+        budget, so it can never block past the MCP transport timeout (which would otherwise drop
+        the whole session). If that happens you get {job_id, status:"running"} — poll get_job().
+        Recovery snapshots protect eligible work independently of the operation.
+        Pass background=True to hand off immediately for an op you already know is heavy.
+        Aborting an in-flight CAD call abandons its hostd connection and queued work;
+        an already-running native operation may still finish. Inspect document state before
+        retrying. A kernel reset does not reset CAD documents.
+        """
+
+
+_EVAL_HELPER_GUIDE = r"""
+## Awaited CAD calls and recovery
+
+CAD calls from eval must be awaited and checked before success-only keys.
+One checked helper handles both structured CAD results and plain-text guides.
+The bridge already decodes JSON objects/arrays; do not decode returned strings again.
+
+```python
+async def cad(tool_name, /, **args):
+    import json
+    r = await tool.write({"path": "xd://" + tool_name, "content": json.dumps(args)})
+    if r.get("hasError"): raise RuntimeError(r.get("text", r))
+    v = r["details"]["xdev"]["inner"]
+    while True:
+        if isinstance(v, dict) and "_truncated" in v:
+            path = v["_truncated"].get("full_result")
+            if not path:
+                raise RuntimeError(f"Incomplete result; narrow the read: {v['_truncated']}")
+            with open(path, encoding="utf-8") as full:
+                v = json.load(full)
+        if isinstance(v, str) and "\n\n[TRUNCATED: " in v:
+            notice = v.rsplit("\n\n[TRUNCATED: ", 1)[1]
+            if "full_result=" not in notice:
+                raise RuntimeError(notice)
+            path, _ = json.JSONDecoder().raw_decode(notice.split("full_result=", 1)[1])
+            with open(path, encoding="utf-8") as full:
+                v = json.load(full)
+        if isinstance(v, dict) and v.get("ok") is False: raise RuntimeError(v)
+        return v
+```
+
+Keep the tool selector positional-only so CAD arguments such as `name=`
+cannot collide with the helper's parameters.
+Structured `ok:false` is a normal tool reply, not a transport exception;
+the helper raises its real error/reason/status instead of indexing absent
+trajectory or other success-only keys. `ok:true` findings still need
+clear/status. An `auto_backgrounded` or explicit `background=True` receipt is
+returned to the caller: issue `wait_job` as a standalone tool call, handle a
+user wake or running status without treating it as completion, and inspect the
+eventual result including failures and spilled results.
+`cad_guide`/`cad_skill` return plain text through the same helper; structured tools
+return objects or arrays. `await cad("cad_guide", topic="edit-part")` is valid.
+The helper loads both structured `_truncated.full_result` JSON and spilled text
+from the notice's `full_result` path before using the result. A spill is not a
+failed CAD operation. If the file is unavailable, narrow the read rather than
+rerunning a mutation. A spilled guide's JSON file decodes to a string, not an object.
+Prefer summary/feature-filtered reads and print only the fields needed.
+For diagnostic tools, inspect a failed report's checks instead of assuming a
+failed validation means the tool did not run. Use the raw decoded result when
+you need to examine `ok:false` findings; never label those findings a pass.
+Print the existing result variable before rerunning slow work. For costly edits,
+call `add_features(background=True)` and print its `job_id` immediately; use
+`wait_job` as a direct tool call, not inside Eval. Do not chain multiple slow
+mutations into one cell: its deadline covers the whole cell.
+An Eval timeout or `CancelledError` does not prove the CAD operation stopped or
+rolled back. Recover the known job or inspect the document revision and feature
+state before deciding what remains; never change arguments to launch a duplicate.
+An explicit tool reply with status="still_running"/in_flight=true means the same
+inputs join existing work. A kernel reset loses variables and helper definitions:
+reload the helper only when state was lost, then use `list_parts` and explicit
+`doc_id` to recover documents. Resetting Python does not reset CAD.
+If reporting code fails after mutations, inspect current state and recorded
+replies; never rerun already-successful mutations to recreate the report.
+If a completed job reports `ok:false`, read its failed feature and geometry reason.
+Fix the offending dimensions, attachment, selector or feature order; do not retry
+an unchanged rejected batch or treat it as a transport problem.
+"""
+
+
+def cad_guide_text(topic: str = "") -> str:
+    topic = (topic or "").strip().lower().replace("-", "_")
+    if topic == "eval_helper":
+        return _EVAL_HELPER_GUIDE.strip()
+    if topic in ("stress_risers", "stress_concentration"):
+        return cleandoc("""\
+            STRESS RISERS — locate, reinforce, and verify
+
+            Use find_stress_risers with the actual load direction if known. Review sharp
+            re-entrant edges, blend radii, measured wall regions and hole ligaments along
+            the load path; check completeness, assumptions, basis, and confidence.
+            Geometric screening cannot certify strength. A successful dry-run verifies
+            only that a proposed editable feature builds; inspect any clamped radius and
+            rerun geometry and the relevant load cases after applying it.
+
+            Kt is the elastic local peak divided by the nominal stress specified for the
+            particular chart; do not transfer it to an unrelated geometry or loading.
+            Use research_eng_calc('stress_concentration', ...) only inside its cited
+            validity ranges. Kf is a fatigue notch factor, not Kt or a factor of safety.
+            A resolved fillet's FE peak already contains the geometric concentration:
+            use that peak directly rather than multiplying it by Kt or Kf again.
+            Notch-sensitivity relief is optional and requires user-supplied evidence.
+
+            Sharp re-entrant corners can be elastic stress singularities, for which no
+            finite Kt applies: fillet the corner first and rerun. Probe a physically
+            meaningful location and compare the same local region across meshes. Check
+            ideal fixtures and loads as other possible singularities.
+
+            Reinforce load paths with thicker sections and smooth transitions where
+            space, interfaces, and function allow. Additive parts can use organic blends
+            and webs, subject to build orientation and anisotropy. For machining, balance
+            generous inside radii against cutter access, removal volume, clearances and
+            justified machine time. Re-evaluate manufacturability and structural results.
+            """)
+    if topic in ("sketch2d", "2d_sketch", "edit_sketch", "sketch_fully_define",
+                 "sketch_add_constraint", "sketch_set_dim", "check_sketch", "sketch_health",
+                 "sketch_probe"):
+        topic = "sketch"
+    if not topic:
+        avail = sorted(p.stem for p in (_prompts_dir() / "shared" / "cheatsheets").glob("*.md"))
+        return (
+            "CAD GUIDE TOPICS — choose cad_guide(topic=...) for focused guidance.\n"
+            "Modeling: edit_part, feature_history (insertion, reorder, rollback), model_history, "
+            "add_features (complete mutation reference), assembly, sketch, sketch3d, rib, split, "
+            "eq_set, sm_relief, scad, regen, overview or ops (full operation compendium).\n"
+            "Review and simulation: review, gsl, evaluate, verify, simulation, stress_risers, motion.\n"
+            "Engineering: intake, cam, ecad, harness, parts, reverse, reveng, video_to_part, scan_reference, splats, drawings, civil, piping, "
+            "industrial, hydraulic, firmware, structural, mechanical, tolerance_stackup, "
+            "code_compliance, design_review.\n"
+            "Workflow: eval_helper, narration, deliverables, requirements, dag, interaction, sourcing, "
+            "cost, spec, doc_diff, plm.\n"
+            "Feature cheatsheets: " + ", ".join(avail) + "."
+        )
+    if topic == "scan_reference":
+        return (
+            "SCAN REFERENCE — embed the measured surface in an existing part without making "
+            "a solid or adding a feature. After reconstruction and scale confirmation, call "
+            "reveng_attach_reference(session_id, doc_id); unconfirmed scale requires "
+            "approximate=True and is labeled approximate. For a PLY/STL/OBJ file use "
+            "add_mesh_reference(doc_id, path, transform=...), where transform specifies "
+            "mm_per_unit, rotation and translation_mm; omitted transform assumes mm and identity. "
+            "list_mesh_references(doc_id) reports ids and bounds; "
+            "update_mesh_reference(doc_id, id, visible=False) hides it, and visible=True shows it. "
+            "Update placement, opacity, color or name as needed; remove_mesh_reference deletes it. "
+            "Create constrained editable features against the scan, then use "
+            "measure_mesh_reference(doc_id, id) for sampled surface deviation from scan to "
+            "part, in mm; world compares placements, icp explicitly aligns. Sampling, scan "
+            "coverage and calibration uncertainty limit accuracy. References are embedded, "
+            "not solids, and do not participate in mass, booleans or export."
+        )
+    if topic == "add_features":
+        return cleandoc(_ADD_FEATURES_GUIDE)
+    if topic == "rib":
+        return (
+            "RIB — build a thin supported web from an OPEN sketch contour.\n"
+            "Create a sketch on a side face or datum plane, draw and constrain an open "
+            "line/arc/spline bridging the existing body; refs.profile names that sketch. "
+            "For example, add_features(ops=[{\"op\":\"add_feature\",\"feature\":{"
+            "\"type\":\"rib\",\"name\":\"Web\",\"params\":{\"thickness\":"
+            "{\"value\":2,\"expr\":null}},\"refs\":{\"profile\":[{\"kind\":\"region\","
+            "\"sketch\":\"<sketch_id>\",\"centroid\":[0,0],\"hint_index\":0}]}}}]). "
+            "The engine considers both drop directions against actual support and refuses "
+            "ambiguous, detached, unbounded or ineffective webs; inspect the resulting "
+            "connected solid and envelope."
+        )
+    if topic == "split":
+        return (
+            "SPLIT — add_feature type='split' with refs.tool='plane.right' (or a planar "
+            "face selector). params.keep='both' retains both pieces; 'above' or 'below' "
+            "keeps the respective side of the tool plane normal. For example, "
+            "add_features(ops=[{\"op\":\"add_feature\",\"feature\":{\"type\":\"split\","
+            "\"name\":\"Halves\",\"params\":{\"keep\":\"both\"},"
+            "\"refs\":{\"tool\":\"plane.right\"}}}]). Inspect resulting bodies."
+        )
+    if topic in ("eq_set", "eq_delete", "equation", "equations", "globals"):
+        return (
+            "EQUATIONS — add_features(ops=[{\"op\":\"eq_set\",\"name\":\"Width\","
+            "\"expr\":\"40\"}]) creates or updates a document global and revalidates "
+            "dependents. Reference it in dimension objects, e.g. "
+            "{\"value\":0,\"expr\":\"Width/2\"}; the stored literal is not the evaluated "
+            "result. Expressions support degree-based sin/cos/tan and real globals. "
+            "{\"op\":\"eq_delete\",\"name\":\"Width\"} refuses while it is in use."
+        )
+    if topic in ("sm_relief", "sheet_metal_relief"):
+        return _read_prompt("shared/cheatsheets/sheetmetal.md")
+    if topic in ("model_history", "check_model_history", "simplify_part", "refine"):
+        return cleandoc("""\
+            MODEL HISTORY — intent, diagnosis and conservative cleanup
+
+            Model for human editing, not the fewest features at all costs. Edit the original
+            feature instead of adding corrective patches. Use a semantic hole feature with
+            params.style="csink" rather than a cylinder cut plus cone cut; share sizing where
+            appropriate. For multiple cuts on the same angle, use a shared angled datum and
+            direct cuts rather than duplicate transformed tool solids. Define critical
+            dimensions and geometric relations, without overdimensioning every coordinate.
+            Build structural additions and cuts before dress-ups where dependencies permit;
+            reordering an existing tree is advisory and must be assessed, not automatic.
+
+            check_model_history(doc_id=None) reads the native report: revision, findings,
+            evidence, safe_fixes and limitations. Native rebuilds also carry automatic
+            model_history warnings; add_features can surface concise findings. A complete
+            report covers the stated history rules, not geometric or engineering certification.
+            Inspect findings and blockers; equal volume or face ownership does not prove
+            geometry equivalence or that a feature is unused.
+
+            simplify_part(doc_id=None, apply=False, refine=False) previews native eligible
+            cleanup without mutation: model_history contains the report, proposed_ops and
+            base_revision describe the proposal, blockers and limitations explain refusals,
+            and status="preview", applied=False identify the preview. simplify_part(doc_id=...,
+            apply=True, refine=False) obtains a fresh preview and explicitly applies eligible
+            cleanup against that revision in one undoable batch; stale or invalid edits are
+            refused. A running reply with job_id is not completion: wait_job(job_id) and
+            inspect the result. No eligible changes means no empty mutation. Automatic deletion
+            is limited to demonstrably unreferenced
+            datums and eligible literal zero in-place transforms, subject to dependency and
+            external-reference restrictions. Sketches, patterns, copies, suppressed,
+            configuration-driven or rolled-back features, cosmetic threads, and features
+            merely overlapping or swallowed are not automatically deleted. Saved/public
+            documents may be blocked when external references cannot be ruled out.
+
+            simplify_part(doc_id=..., apply=False, refine=True) previews opt-in refinement;
+            use apply=True to append the editable refine feature with the cleanup in one
+            batch. Refine unifies same-domain faces and edges on copied topology, validates
+            geometry and preserves material; ambiguous referenced topology or finishes and
+            geometry changes are refused. It is not heal and never flattens the feature tree
+            into an import or BREP. Boolean unification already occurs automatically where
+            supported; not every artifact or unnecessary feature can be optimized.
+            """)
+    if topic in ("scad", "openscad", "scad_status", "scad_inspect", "scad_convert"):
+        return (
+            "OPENSCAD — source-parametric modeling\n\n"
+            "scad_status() reports the actual externally installed OpenSCAD renderer and "
+            "required isolation; no unsandboxed fallback. scad_inspect(params) discovers "
+            "typed controls without rendering. Import .scad with import_part, or edit the "
+            "same scad feature via add_features/edit_feature; source supports real OpenSCAD "
+            "modules, include/use, loops and operations, not a simulated subset. Explicit "
+            "portable dependencies are stored in files as relative path/data_b64 pairs.\n"
+            "parameter_schema kinds are length, number, integer, angle, boolean and string; "
+            "length overrides are canonical mm, angles degrees. mm_per_source_unit is a "
+            "finite positive factor (default 1); unannotated literals are numbers, not "
+            "assumed lengths. Code-owned expressions remain code-owned.\n"
+            "Save .step+ to retain source, sidecars, controls and solved cache. SCAD export "
+            "writes source plus sidecars; browser export can package them as ZIP. Rendering "
+            "produces faceted geometry, not recovered native feature history.\n"
+            "scad_convert(direction='to_code'|'to_native', doc_id=..., base_revision=..., "
+            "mm_per_source_unit=...) is revision-guarded and atomic. Only supported managed "
+            "native projections (primitives, explicit booleans, rigid transforms with "
+            "supported options) can restore their original graph; inspect blockers. Changed "
+            "source or incompatible metadata is refused, never restored as stale history. "
+            "A failed conversion or rebuild leaves the prior revision intact. Arbitrary "
+            "SCAD cannot recover native history. See contracts/doc_ops.md and the formats "
+            "reference for prerequisites and portability."
+        )
     if topic in ("overview", "features", "ops", "geometry", "vocabulary", "vocab"):
-        return _OVERVIEW_HEADER + _read_prompt("shared/ops_cheatsheet.md")
+        return _OVERVIEW_HEADER + _read_prompt("shared/ops_cheatsheet.md") + _engine_vocabulary_block()
+    if topic in ("feature_history", "insert_feature", "insertion", "reorder_feature",
+                 "reorder", "set_rollback", "rollback"):
+        return (
+            "FEATURE HISTORY — INSERT, REORDER, ROLLBACK\n\n"
+            "Use get_part(doc_id=..., summary=True) to inspect tree.features and their IDs. "
+            "Pass the actual doc_id and feature IDs in these add_features examples:\n"
+            "Insert before f3: add_features(doc_id=doc_id, ops=[{'op':'add_feature', "
+            "'before':'f3', 'feature':{'type':'box', 'params':"
+            "{'length':10, 'width':10, 'height':10, 'at':[0,0,20]}}}]). Replace the example "
+            "dimensions and placement with the intended geometry. The 'before' belongs on "
+            "the op, not inside feature. Use an existing ID from the tree: an anchor that "
+            "names no other feature is refused. To insert after a feature, use 'after' "
+            "with that feature's ID ('before' and 'after' together are refused). Without an "
+            "active rollback bar, omitting both appends. With a bar, omitting both inserts "
+            "immediately after the bar and advances the bar to the new feature; an explicit "
+            "'before'/'after' takes precedence. edit_feature takes neither: move an existing "
+            "feature with reorder_feature.\n"
+            "Move f4 before f3: add_features(doc_id=doc_id, ops=[{'op':'reorder_feature', "
+            "'id':'f4', 'before':'f3'}]); use before=None to move to the end. Reordering "
+            "is dependency-validated; preserve references and inspect the result.\n"
+            "When the batch's own added, edited, reordered or suppressed features build but a "
+            "pre-existing downstream feature fails, the edit is kept and the bar moves just "
+            "before the first failure. The ok:true reply has auto_rollback.after, "
+            "auto_rollback.broken (id/name/type/error), auto_rollback.hidden_features and a "
+            "warning. The unbuilt suffix stays intact, not deleted or suppressed. A feature "
+            "authored in the batch that fails or was not compiled in the attempted rebuild "
+            "rejects it atomically; mixed batches with global/destructive operations also "
+            "reject on failure. A partial repair of an already-broken tree is kept when it "
+            "builds a previously failed feature and introduces no new failures; an earlier "
+            "unresolved failure may leave the repaired feature hidden behind the bar.\n"
+            "Repair listed features with edit_feature/refs, then set_rollback after=None. "
+            "If another existing downstream feature still fails, the bar stops again. "
+            "Do not present an active rollback as a complete model: save_part warns and lists "
+            "the hidden features. If intentionally handing off an incomplete model, disclose "
+            "the rollback and every hidden feature ID in the handoff summary.\n"
+            "Roll back after f2: add_features(doc_id=doc_id, ops=[{'op':'set_rollback', "
+            "'after':'f2'}]). The prefix through f2 compiles; later features are rolled back. "
+            "Use after='start' to roll before every feature; an auto-rollback can return "
+            "'start' if the first feature remains broken during a partial repair. "
+            "Restore the whole history with {'op':'set_rollback', 'after':None}. "
+            "Inspect tree.rollback_after (retained in summary/selected reads) and the "
+            "mutation reply's features[].rolled_back: rolled-back features exist but were "
+            "not compiled, even when ok=true. For complete mutation details use "
+            "cad_guide('add_features')."
+        )
+    if topic == "edit_part":
+        return (
+            "EDIT AN EXISTING PART\n\n"
+            "Find the requested native file in the selected workspace; list_parts() identifies "
+            "open documents. import_part(path) attaches to the live document or binds "
+            "the native file, preserving feature IDs and history. Use copy=True for an "
+            "independent document. Use the returned doc_id explicitly.\n"
+            "Live turns retain opened, attached or read documents between tool calls. "
+            "A doc_not_found may provide an exact import_part(path=..., resume=True) for a "
+            "verified saved file; otherwise check recover_parts(all=True) before reopening "
+            "a possibly older file.\n"
+            "get_part(doc_id=..., summary=True) orients; both summary and full forms put "
+            "features in result['tree']['features']. Use get_part(doc_id=..., feature_ids=['fN']) "
+            "for complete selected features; summary is lossy. Page features with limit and "
+            "cursor, following feature_page.next_cursor; restart if revision changes. list_parts "
+            "uses the same parameters and next_cursor. The edit-part helper loads "
+            "_truncated.full_result JSON automatically before checking ok or using values. "
+            "A spill is not a failed operation; never repeat a mutation to recover its reply.\n"
+            "Apply minimal patches with add_features(ops=[{'op':'edit_feature','id':'fN',"
+            "'params':{...}}], doc_id=...); use refs for intended reference changes. Preserve "
+            "untouched dimensions and relations; list-valued replacements must retain entries "
+            "that should remain. Requery topology after geometry changes before targeting it.\n"
+            "A successful edit may report auto_rollback when an older downstream feature "
+            "breaks: repair the listed features and roll to end before delivering.\n"
+            "For insertion, reorder and rollback examples, use cad_guide('feature_history').\n"
+            "A raw status='running' add_features reply with job_id is acceptance, not final "
+            "geometry. The edit-part helper joins auto_backgrounded jobs; otherwise wait_job "
+            "and inspect the completed result and ok. Done means finished, not necessarily "
+            "successful. Recover recorded replies or current state after reporting errors; "
+            "never replay successful mutations.\n"
+            "Aborting a CAD call abandons its hostd connection and queued work, but an "
+            "already-running native operation may still finish. Inspect document state "
+            "before retrying; a kernel reset does not reset CAD documents.\n"
+            "Verify the change and present only finished artifacts you choose to show. "
+            "Agent edits persist automatically unless human edits are pending; never ask "
+            "the user to save AI work. AI recovery is automatic when the backing file is "
+            "unchanged; conflicts remain for agent recovery. External file rewrites refresh "
+            "open documents unless human edits need conflict resolution. Relative "
+            "paths use the selected workspace, not the worker cwd.\n"
+            "The shared checked helper returns the already-decoded details.xdev.inner: "
+            "cad_guide and cad_skill produce plain text, while structured tool results "
+            "are objects or arrays. Do not JSON-decode returned strings. For diagnostic "
+            "ok:false reports, inspect the findings without declaring them a pass."
+        )
     if topic in ("review", "render", "vision"):
         return _read_prompt("reviewer.md") or "(reviewer guide unavailable)"
+    if topic in ("harness", "wiring_harness", "wire_harness"):
+        return (
+            "WIRING HARNESS — connectivity, routing, checks and deliverables\n\n"
+            "Use the harness category for harness_new, harness_add_connector, "
+            "harness_add_wire, harness_connect, harness_from_netlist, harness_route, "
+            "harness_check, harness_build_geometry, harness_report, harness_formboard, "
+            "harness_get and harness_edit. Electrical tools: harness_electrical_check, "
+            "harness_bus_check, harness_cable_model and harness_to_bus_links.\n"
+            "The aicad.harness/1 study stores connectors, wires and routed segments. "
+            "Coordinates and lengths are world mm; connector frame.origin is the wire "
+            "exit and exit_dir points into free space. Supply real pin assignments, "
+            "wire and connector data, placements, clearances and keepouts; review any "
+            "netlist inferences. Each wire is one conductor and pin pair: twisted pairs "
+            "need separate records with a matching group and explicit cable construction "
+            "geometry for bus analysis. Supply the cable datasheet bend radius before "
+            "routing or checking. Add a clamp by splitting an interior routed segment with "
+            "harness_edit(action='add_clamp', segment_id=..., distance_mm=...) or point=.... "
+            "Inspect connectivity, bend and clearance findings, then electrical and bus "
+            "assumptions and results. Bus links represent "
+            "series sections of one signal path. Missing evidence is unknown, not a pass "
+            "or certification. For firmware simulation, harness_to_bus_links(doc_id, "
+            "templates, harness_id) converts complete endpoint and topology templates "
+            "into bus_links; place the returned links in fw_sim_run scenario.bus_links. "
+            "Native firmware simulation is authoritative; this handoff is not the "
+            "harness_bus_check analysis format. Repair failures and recheck after edits. Routed wire length "
+            "excludes service-loop and strip "
+            "allowances; review the report before using cut lengths. Build geometry and "
+            "formboard as required. Formboard drawing-sheet integration is unsupported. "
+            "Use cad_skill('harness') for the workflow."
+        )
+    if topic in ("ecad", "electronics", "kicad", "pcb", "schematic",
+                 "ecad_open", "ecad_kicad_status", "ecad_find_footprint"):
+        return (
+            "ECAD / KICAD WORKFLOW\n"
+            "KiCad project, schematic and board files are the documents of record. "
+            "Humans edit them in KiCad; agent ecad_* operations save accepted edits "
+            "to their bound KiCad files. Open an existing project or file with "
+            "ecad_open(path), or create a project-backed document with "
+            "ecad_new_schematic or ecad_new_pcb. Use ecad_kicad_status() to inspect "
+            "the installation and ecad_find_footprint(query='', limit=30) to find "
+            "installed footprints. Respect KiCad locks and external-change conflicts.\n"
+            "describe_board, render_board_ascii, render_schematic_ascii, "
+            "apply_ascii_edits, ecad_thermal_handoff, ecad_airflow_handoff and "
+            "ecad_vibe_check accept a KiCad file path as doc_id as well as a "
+            "bound session id; accepted ASCII edits persist to the file.\n"
+            "board_from_schematic and ecad_make_board create the sibling KiCad "
+            "board by default; if it exists, open it with ecad_open and use "
+            "ecad_update_from_sch. pcb_name or pcb_path selects a separate "
+            "board without overwriting an existing file.\n"
+            "ecad_run_erc and ecad_run_drc use KiCad's authoritative checks; "
+            "ecad_export, ecad_bom, ecad_plot, netlist file export and ecad_to_3d "
+            "use kicad-cli for outputs. Chudware retains circuit and bus simulation, "
+            "autorouting, placement, AI design and engineering analyses. "
+            "ecad_simulate defaults to netlist_source='native'; select "
+            "netlist_source='kicad' for KiCad-exported SPICE models and includes "
+            "with ngspice, without MNA fallback. Inspect the reported source and backend."
+        )
     if topic in ("simulation", "sim", "fea", "cfd"):
         return _SIM_GUIDE
     if topic in ("motion", "kinematics", "kinematic", "mechanism", "simulate_motion",
@@ -1031,7 +1961,7 @@ def cad_guide_text(topic: str = "overview") -> str:
         return _INTAKE_GUIDE
     if topic in ("gsl", "describe", "outline", "digest", "adjacency"):
         return _GSL_GUIDE
-    if topic in ("cam", "machining", "toolpath", "toolpaths", "gcode", "g-code", "mill", "nc"):
+    if topic in ("cam", "machining", "toolpath", "toolpaths", "gcode", "g_code", "mill", "nc"):
         return _CAM_GUIDE
     if topic in ("narration", "narrate", "describe_toolpaths", "describe_results",
                  "describe_assembly", "describe_board", "describe_project",
@@ -1051,9 +1981,11 @@ def cad_guide_text(topic: str = "overview") -> str:
             "    Use INSTEAD of dumping run_fea_static / run_fea_modal JSON.\n"
             "    Returns a graceful 'no results attached' message when no study exists.\n\n"
             "  describe_assembly([doc_id])\n"
+            "    ok indicates narration success; incomplete fit is reported in warnings and fit.\n"
             "    Queries pre-solve world-frame bounding boxes and origins, runs a live mate\n"
             "    solve, then eval_interference with clearance_mode='threshold',\n"
-            "    min_clearance_mm=0 and include_coincident=False. Exact clash volumes remain;\n"
+            "    min_clearance_mm=0 and include_coincident=False. Clash volumes are exact\n"
+            "    except fallback-marked fuzzy boolean results, which are approximate;\n"
             "    clearance bounds are not measured gaps. No minimum measured gap is reported.\n"
             "    Returns raw fit completeness, checked/total pairs and failures; incomplete\n"
             "    or no-pair reports cannot qualify collision-free. Use INSTEAD of raw JSON.\n"
@@ -1078,13 +2010,14 @@ def cad_guide_text(topic: str = "overview") -> str:
         # Imported on demand: only this topic needs the deliverables package.
         from services.deliverables import DELIVERABLES_GUIDE  # noqa: PLC0415
         return DELIVERABLES_GUIDE
-    if topic in ("parts", "standard_parts", "standard-parts", "library", "catalog",
+    if topic in ("parts", "standard_parts", "library", "catalog",
                  "part_search", "part_get", "part_place", "hardware", "bom_parts",
-                 "parts_taxonomy", "taxonomy", "facets", "faceted_search"):
+                 "part_library_ingest", "part_library_sync", "part_acquire",
+                 "parts_taxonomy", "taxonomy", "facets", "faceted_search", "fetch_cad_model"):
         return (
             "STANDARD-PARTS LIBRARY — search → get → place (aicad.parts/1)\n\n"
             "BIAS: always prefer standard parts over custom geometry for hardware.\n"
-            "Standard parts are editable, sourced, and BOM-ready out of the box.\n\n"
+            "Inspect provenance, references and geometry quality before relying on dimensions.\n\n"
             "REFERENCE ACQUISITION ORDER:\n"
             "  1. part_search / make_standard_part for catalog and standard parts\n"
             "     (servos, steppers, bearings, fasteners, extrusions); part_get\n"
@@ -1092,13 +2025,22 @@ def cad_guide_text(topic: str = "overview") -> str:
             "  2. match_model / part_source for a discrete product's CAD.\n"
             "  3. fetch_cad_model(url) for a specific model page or STEP/IGES file\n"
             "     found by web search; import_artifact if not auto-imported.\n"
+            "     For ambiguity, present its ask_user choice through ask_user, not\n"
+            "     a silent selection. Retry with format and/or member for an archive;\n"
+            "     for an adapter choice pass selection_field and selection. Carry\n"
+            "     prior selectors forward for multi-stage choices.\n"
             "  4. Web search only for specs/datasheets absent from the library.\n"
             "     Then COMMIT to cited dimensions with clearance and build; never\n"
             "     loop on research. For an MG90S six-axis arm, search MG90S first,\n"
             "     use its reference envelope/mount dimensions, and build brackets.\n\n"
             "WORKFLOW:\n"
-            "  1. part_search(query, domain?, limit?)\n"
-            "       Search the federated catalog.  Returns ranked PartRecord list.\n"
+            "  1. part_search(query, domain?, limit?, doc_id?)\n"
+            "       Search the federated catalog. Ranked JSON rows have indices;\n"
+            "       preview sheet labels match those indices. Previews distinguish\n"
+            "       CAD renders, product photos, and unavailable images. Use them to\n"
+            "       select candidates, not prove dimensions or identity; confirm both\n"
+            "       with part_get before acquiring. previews=False skips the sheet.\n"
+            "       For ECAD, doc_id selects the KiCad project library context.\n"
             "       Examples:\n"
             "         part_search('M8 socket head')         → fastener records\n"
             "         part_search('6205')                   → ISO 6205 bearing\n"
@@ -1108,23 +2050,24 @@ def cad_guide_text(topic: str = "overview") -> str:
             "         part_search('pump', domain='hydraulic')→ ISO 1219 pump\n"
             "       Domains: fastener | bearing | mech_family | section | fitting |\n"
             "                hydraulic | ecad\n\n"
-            "  2. part_get(part_id)\n"
-            "       Fetch the full PartRecord for a stable part_id:\n"
+            "  2. part_get(part_id, doc_id?)\n"
+            "       Fetch the full PartRecord for a stable part_id; ECAD doc_id\n"
+            "       selects the KiCad project library context:\n"
             "         part_get('fastener:ISO4762:M8')       → M8 SHCS record\n"
             "         part_get('bearing:ISO 15:6205')       → 6205 bearing record\n"
             "       Inspect params + geometry_ref to confirm dimensions before placing.\n\n"
             "  3. part_place(part_id, doc?, params?)\n"
-            "       Insert the part — always editable, never an opaque solid.\n\n"
+            "       Route the selected record to its domain; mechanical placement creates a detached native document.\n\n"
             "       Mechanical (fastener / bearing / mech_family):\n"
             "         part_place('fastener:ISO4762:M8')\n"
             "         part_place('fastener:ISO4762:M8', params='{\"length_mm\": 25}')\n"
             "         → Creates a new editable part doc_id.  Use make_standard_part\n"
             "           equivalently if you already know family/size.\n\n"
-            "       ECAD (schematic symbol):\n"
-            "         part_place('ecad:Device:R',\n"
-            "                    doc=json.dumps(sch_doc),\n"
+            "       ECAD (schematic symbol or board footprint):\n"
+            "         part_place('ecad:Device:R', doc_id=sch_doc_id,\n"
             "                    params='{\"pos\":{\"x\":10,\"y\":20},\"value\":\"1k\"}')\n"
-            "         → Appends sch_add_symbol op; symbol appears in doc['symbols'].\n\n"
+            "         → Applies the symbol operation to the live ECAD session and saves\n"
+            "           its bound KiCad file. doc=doc_id also selects the session.\n\n"
             "       Structural section:\n"
             "         part_place('section:AISC:W8x31',\n"
             "                    doc=json.dumps(struct_doc),\n"
@@ -1146,9 +2089,23 @@ def cad_guide_text(topic: str = "overview") -> str:
             "  standard-hardware queries, and same-designation results carry a related_ids\n"
             "  field pointing to the sibling.  Prefer the top-ranked result; both are\n"
             "  placeable and editable.\n\n"
-            "EDITABILITY GUARANTEE:\n"
-            "  part_place always returns {'editable': true}.  A placed part that isn't\n"
-            "  editable is a bug — report it and use part_get to inspect geometry_ref.\n\n"
+            "  SHCS sockets are editable nominal-key-width hex recesses at the standard's\n"
+            "  minimum full-hex depth. Threads, broach points and corner radii are not\n"
+            "  modeled; dimensions, tolerances, material and mechanical properties are not\n"
+            "  certified. Inspect part_place.detail.geometry_quality and omissions.\n\n"
+            "PORTABLE LIBRARIES:\n"
+            "  part_library_ingest(manifest_path, artifact_root?, mirrors?, replace_namespace=False)\n"
+            "  registers a local aicad.parts-library/1 manifest; part_library_sync(url,\n"
+            "  expected_sha256, mirrors?, replace_namespace=False) explicitly fetches a pinned\n"
+            "  HTTPS manifest. A namespace belongs to its approved source; changing source\n"
+            "  requires explicit replace_namespace=True authorization. part_acquire(part_id,\n"
+            "  offline=False) verifies cached bytes or explicitly fetches a size- and digest-\n"
+            "  pinned artifact. offline=True never fetches and fails for missing/corrupt bytes.\n"
+            "  Search/get with include_live=False stay offline; in a cell use part_acquire,\n"
+            "  not part_get(acquire=True). Placement preserves selected provenance as a\n"
+            "  detached native copy; save it under the project for cell-local references.\n"
+            "  Metadata rights do not grant artifact redistribution. See contracts/parts.md\n"
+            "  for publishing, rights and evidence; an optional static mirror is sufficient.\n\n"
             "TAXONOMY BROWSE + FACETED SEARCH (Parts Library V2):\n"
             "  parts_taxonomy()                       → root categories (fasteners,\n"
             "      bearings_motion, structural_stock, drivetrain, tools, electronics,\n"
@@ -1171,8 +2128,9 @@ def cad_guide_text(topic: str = "overview") -> str:
             "NEED-DRIVEN SOURCING: part_source extracts taxonomy facets and ranks\n"
             "  candidates with artifact plans; see cad_guide('sourcing').\n\n"
             "SOURCING:\n"
-            "  Each PartRecord carries a sourcing[] list of VendorPart dicts (aicad.sourcing/1).\n"
-            "  Use bom_rollup after placing multiple parts to get a costed BOM.\n"
+            "  Catalog-backed assembly components are bought and retain their saved\n"
+            "  catalog part_id as part_ref. Supplier, MPN and price remain unknown unless\n"
+            "  separately available; see cad_guide('sourcing').\n"
         )
     if topic in ("reverse", "re", "recognize", "recon"):
         # Lazy import: recon_tools imports the cad_tools facade, which re-exports this module.
@@ -1184,23 +2142,29 @@ def cad_guide_text(topic: str = "overview") -> str:
             "REQUIREMENTS (aicad.req/1) — design-brief CRUD + markdown projection\n\n"
             "Schema: contracts/requirements.md  |  Engine: services/requirements/\n\n"
             "WORKFLOW:\n"
-            "  req_create(title, body)              Create a new requirements doc; returns req_id.\n"
-            "  req_update(req_id, needs?, reqs?)    Add/edit individual need or requirement rows.\n"
-            "  req_status(req_id)                   Current fulfilment table (met/partial/open).\n"
-            "  req_report(req_id)                   Full markdown projection for sharing —\n"
-            "                                       battery-populated evidence is listed\n"
-            "                                       separately from hand-entered evidence.\n"
-            "  req_verify_by_id(requirement_id,     AUTO-VERIFY one requirement: runs its\n"
-            "      doc_id?, req_path?)              verify_by verifiers via the battery and\n"
-            "                                       writes status flip + evidence back into\n"
-            "                                       the doc (no manual req_update needed).\n\n"
+            "  req_create(title=title, doc_id=doc_id)\n"
+            "    Create a requirements doc; returns req_id. Use req_path instead of doc_id\n"
+            "    for a .req.json file; the same choice applies to update, report and status.\n"
+            "  req_update(req_id=None, doc_id=None, req_path=None, action='add_requirement',\n"
+            "      need_text=None, need_source='chat', need_id=None, kind=None, text=None,\n"
+            "      quantity=None, verify_by=None, requirement_id=None)\n"
+            "    Add or edit needs and requirements using the appropriate action and fields.\n"
+            "  req_report(doc_id=doc_id, format='markdown')\n"
+            "    Inspect the requirements and evidence; use format='json' for the full document.\n"
+            "  req_status(requirement_id=requirement_id, new_status='verified',\n"
+            "      evidence=evidence, doc_id=doc_id)\n"
+            "    Record an evidenced status transition; user-confirmed and waived are user-only.\n"
+            "  req_verify_by_id(requirement_id=requirement_id, doc_id=doc_id,\n"
+            "      req_path=None, req_doc_id=None)\n"
+            "    Run one requirement's supported verify_by verifiers and write status and\n"
+            "    evidence back; inspect the response for unsupported verifiers. doc_id is the\n"
+            "    geometry document; req_path or req_doc_id selects a separate requirements doc.\n\n"
             "AUTOMATIC PROOF LOOP: a DAG verify node with inputs\n"
             "  {check_type: 'requirement', req_id: 'R1', req_path|req_doc_id, doc_id}\n"
             "runs the requirement's named verify_by verifier and auto-flips its status\n"
             "with a source='battery' evidence ref — closing idea → requirement → proof.\n\n"
-            "BIAS: capture requirements BEFORE modeling — req_create at project start, then\n"
-            "reference req_id in every verify_battery call so the battery knows what to check.\n"
-            "A requirement without a verifier is aspirational; wire them up.\n\n"
+            "BIAS: capture requirements BEFORE modeling — req_create at project start.\n"
+            "Wire each requirement to a verifier and use req_verify_by_id to check it.\n\n"
             "LAYOUT-FIRST — MANDATORY before any modeling:\n"
             "  layout_plan(doc_id,\n"
             "              envelope_x_mm, envelope_y_mm, envelope_z_mm,\n"
@@ -1228,10 +2192,11 @@ def cad_guide_text(topic: str = "overview") -> str:
             "FULL LOOP:\n"
             "  1. layout_plan(doc_id, ...)           capture before modeling\n"
             "  2. add_features(...)                  model to the plan\n"
-            "  3. measure_between(...) / req_status(requirement_id, 'verified', evidence=[...])\n"
+            "  3. measure_between(...) / req_status(requirement_id=requirement_id,\n"
+            "       new_status='verified', evidence=evidence, doc_id=doc_id)\n"
             "                                        record evidence as each dim is confirmed\n"
             "  4. design_review(doc_id, ['layout_coverage'])  gate before done\n"
-            "  5. verify_battery(doc_id)             final battery\n"
+            "  5. verify_battery(doc_id=doc_id)       final battery\n"
         )
     if topic in ("dag", "dag_plan", "dag_run", "dag_status", "dag_approve", "dag_abort",
                  "dag_replan", "orchestrate", "mission", "project_run", "workflow"):
@@ -1253,30 +2218,39 @@ def cad_guide_text(topic: str = "overview") -> str:
             "BIAS: use DAG for any mission with 3+ sequential tool calls that could fail\n"
             "  independently — it checkpoints progress and resumes after transient errors."
         )
-    if topic in ("verify", "verify_battery", "battery", "check", "done", "sign-off"):
+    if topic in ("verify", "verify_battery", "battery", "check", "done", "sign_off"):
         return (
             "VERIFY BATTERY — deterministic done-check before calling a design finished\n\n"
-            "Tools: verify_battery(doc_id, checks?) / check_metadata()\n\n"
+            "Tools: verify_battery(checks=None, doc_id=None, ...) / check_metadata()\n\n"
             "MANDATORY before declaring done:\n"
-            "  verify_battery(doc_id)   Runs the full battery: feature overlap, interference,\n"
-            "                           wall thickness, draft angles, DFM, and any req_id-linked\n"
-            "                           requirement checks.  Returns a verdict card per\n"
-            "                           contracts/narration.md — PASS/WARN/FAIL per check.\n"
-            "  check_metadata()         Confirms doc has title, material, and process set.\n\n"
-            "ALSO: check_feature_overlap() and check_interference() run individual checks.\n\n"
-            "REQUIREMENT AUTO-VERIFICATION (aicad.req/1): req_verify_by_id(requirement_id,\n"
-            "  doc_id?, req_path?) runs a requirement's named verify_by verifiers through\n"
+            "  verify_battery(doc_id=doc_id) Runs the default subsecond checks, including feature\n"
+            "                           attachment and solid health; only returned scores\n"
+            "                           are covered; inspect verdict and coverage.ran.\n"
+            "                           measure_part and measure_between are informational,\n"
+            "                           not pass/fail checks. Thickness and DFM are not default.\n"
+            "  check_metadata()         Lists available check names, costs and platforms.\n"
+            "  Request extra checks explicitly: check_feature_overlap, check_interference,\n"
+            "  wall_thickness, draft_analysis, dfm_check, and any requirement verifiers.\n\n"
+            "PRINTED PARTS: while modelling, run wall_thickness() for the process-minimum RED\n"
+            "  heat map AND dfm_check. Fix each red region at its named face/feature or\n"
+            "  explicitly justify it before export/slicing; re-run after geometry changes.\n"
+            "  The battery does not replace this loop (cad_guide('printing')).\n\n"
+            "REQUIREMENT AUTO-VERIFICATION (aicad.req/1): req_verify_by_id(\n"
+            "  requirement_id=requirement_id, doc_id=doc_id, req_path=None, req_doc_id=None)\n"
+            "  runs supported named verify_by verifiers; inspect unsupported verifiers. It uses\n"
             "  the battery and writes the verified/failed status + evidence ref back into\n"
             "  the requirements doc automatically.  DAG verify nodes do the same with\n"
             "  inputs {check_type: 'requirement', req_id, req_path|req_doc_id, doc_id}.\n\n"
             "BIAS: never report 'done' to a user until verify_battery returns no FAILs.\n"
             "  A WARN is a judgment call — narrate it; don't silently ignore it.\n"
-            "  Wire req_id into the battery call so requirement fulfilment is checked too."
+            "  Use req_verify_by_id for requirement-specific fulfilment checks."
         )
     if topic in ("interaction", "elicitation", "ask_user", "clarify", "questions"):
         return (
             "INTERACTION / ELICITATION — the single ask_user seam (contracts/interaction.md)\n\n"
             "Tool: ask_user(questions, scope?)\n\n"
+            "  Pass questions as a native array of objects. JSON-encoded arrays/objects\n"
+            "  are also decoded; an ordinary string becomes one free-text question.\n\n"
             "  DO NOT ask by default. Prefer a typed suggested default + required:false, or\n"
             "  skip the tool and record an assumption. Ask only when the answer changes the\n"
             "  build (fit-critical dim, process branch, design option, which feature to edit).\n\n"
@@ -1320,6 +2294,9 @@ def cad_guide_text(topic: str = "overview") -> str:
             "  specs, score, rationale, artifact_plan}; see contracts/sourcing.md.\n"
             "  Narrow via part_search(query, category_id, facets, price_max,\n"
             "  vendors, in_stock), inspect facet_summary, then part_get(part_id).\n"
+            "  The part_search preview sheet labels match JSON row indices; use\n"
+            "  the previews to select candidates, then confirm identity and\n"
+            "  dimensions with part_get before acquiring.\n"
             "  Follow artifact_plan.how for real geometry: part_place for local\n"
             "  geometry_ref; scrape_import via scrape_enqueue(site, query),\n"
             "  scrape_queue_status(), import_artifact(artifact_path) for vendor\n"
@@ -1329,16 +2306,25 @@ def cad_guide_text(topic: str = "overview") -> str:
             "  A specific CAD URL goes to fetch_cad_model(url); match_model's\n"
             "  reverse_engineer fallback requires human confirmation before starting\n"
             "  reverse_engineer_product(part_id|url).\n"
+            "  If a queue error includes ask_user, present the choice via ask_user.\n"
+            "  Retry scrape_enqueue(job_id=..., member=..., format=...) with the\n"
+            "  chosen value; format is optional. Alternatively pass the original hit\n"
+            "  as preset with site, query and member/format; source-specific choices\n"
+            "  such as file_id or download_url can be included in preset. Do not mix\n"
+            "  job_id with site, query or preset. For fetch_cad_model ambiguity use\n"
+            "  format/member or selection_field/selection, retaining prior selectors.\n"
             "CUTTING TOOLS: an end mill / drill from the library goes\n"
             "       into the CAM job via cam_tool_import(part_id, number=0) — it maps\n"
             "       the vendor record (tool_diameter_mm→diameter, flutes, coating) into\n"
             "       the tool library with provenance and suggests conservative\n"
             "       stepover/stepdown.  Feeds/speeds ALWAYS come from the CuttingDB\n"
             "       (feeds_speeds / cam_check_feeds_envelope), never the vendor row.\n"
-            "BOM + COST: bom_rollup(doc_path) rolls the tree into a flat BOM\n"
-            "       (PartRecord sourcing[] rows merge in automatically); bom_price\n"
-            "       resolves live prices via approved providers (Nexar, DigiKey,\n"
-            "       Mouser); request_quote(doc_path, vendor, qty) for PO decisions;\n"
+            "BOM + COST: bom_rollup(doc_path) rolls the tree into a flat BOM.\n"
+            "       Catalog-backed assembly components are bought and retain their saved\n"
+            "       catalog part_id as part_ref; supplier, MPN and price remain unknown\n"
+            "       unless separately available. bom_price resolves live prices via approved\n"
+            "       providers (Nexar, DigiKey, Mouser); request_quote(doc_path, vendor, qty)\n"
+            "       for PO decisions;\n"
             "       cam_cost_estimate for made-part cost seeds.\n\n"
             "VENDOR LOGIN ETIQUETTE:\n"
             "  vendors_health(sites?) runs a canary search per adapter and reports\n"
@@ -1428,7 +2414,8 @@ def cad_guide_text(topic: str = "overview") -> str:
             "     the corridor, lower clearance_mm, change grid_mm), start_inside_obstacle /\n"
             "     end_inside_obstacle (move the point to the nozzle face or ignore that body).\n"
             "  2. piping_fluid(name, T=<K>, P=<Pa>)  Resolve fluid properties (sourced values).\n"
-            "  3. piping_solve(doc, boundary, fluid=None, pumps=None, doc_id=None, network=None)\n"
+            "  3. piping_solve(doc=None, boundary=None, fluid=None, pumps=None,\n"
+            "       network_type='liquid', source_handoff=None, doc_id=None, network=None)\n"
             "     1-D steady solve: flows + pressure map. boundary entries name a node AND\n"
             "     carry one condition, e.g.\n"
             "       {'run':'r1','end':'start','pressure':400}   (kPa gauge — fixes it)\n"
@@ -1669,6 +2656,10 @@ def cad_guide_text(topic: str = "overview") -> str:
             "                                       trace artifact (trace_path) of pin+UART\n"
             "                                       events; QEMU pin events need the project's\n"
             "                                       chudware_trace.h CHUDWARE_GPIO_TRACE macro.\n"
+            "  HARNESS HANDOFF: harness_to_bus_links(doc_id, templates, harness_id) uses\n"
+            "    complete firmware link templates with explicit endpoints and topology to\n"
+            "    derive bus_links from routed wiring. Put returned bus_links into the\n"
+            "    fw_sim_run scenario.bus_links; native firmware simulation is authoritative.\n"
             "  fw_verify_board(board_doc_ref, ...)  Firmware<->board co-verification\n"
             "                                       BEFORE fab: static checks (every PIN_<NET>\n"
             "                                       exists on the MCU/net, strap/reset pins\n"
@@ -1761,11 +2752,9 @@ def cad_guide_text(topic: str = "overview") -> str:
     if topic in ("regen", "regen_diagnose", "rebuild", "repair", "fix_ops"):
         return (
             "REGEN DIAGNOSIS — on a rebuild failure, diagnose + propose editable fix-ops\n\n"
-            "Tool: regen_diagnose(document_json, reference_json?)\n\n"
-            "  regen_diagnose(document_json)         Diagnose a doc that failed to rebuild.\n"
-            "                                        Returns a verdict card: root cause,\n"
-            "                                        proposed fix-ops as an accept/edit/reject\n"
-            "                                        card, and a correction trace.\n\n"
+            "Tool: regen_diagnose(doc_id=...) or regen_diagnose(document_json=...)\n\n"
+            "  Supply reference_json with a known-good revision for a geometry comparison.\n"
+            "  A fixture scan or rebuild without a reference is unverified, not a pass.\n"
             "WHEN TO USE: call after add_features returns any feature with ok=false, or when\n"
             "  close_part / export_part / run_fea_* fail with a regen error.\n"
             "WORKFLOW: add_features → check feature ok flags → if any false, regen_diagnose\n"
@@ -1838,8 +2827,10 @@ def cad_guide_text(topic: str = "overview") -> str:
             "  (nothing overlaps) but are still wrong — bolt holes that don't register, mating\n"
             "  bores that aren't coaxial, contact faces that aren't flush, a fastener that can't\n"
             "  pass the stack. Run it while laying out a multi-component assembly so the fit is\n"
-            "  right the first time; pass fastener='M6' to also check pass-through. Every finding\n"
-            "  names the components, the feature, the numeric error, and a fix direction.\n\n"
+            "  right the first time; pass fastener='M6' to check nominal pass-through. Differing\n"
+            "  bore diameters are not misalignment; clearance does not prove grommet/head fit.\n"
+            "  Contact is unverified unless planar mate references resolve or contact_faces gives\n"
+            "  two {component, sid} world face references. Findings give errors and fixes.\n\n"
             "RELATIONSHIP TO verify_battery: design_review is geometry-focused (what's wrong\n"
             "  with the shape); verify_battery is requirement-focused (does it meet the spec).\n"
             "  Run both before declaring done."
@@ -1877,6 +2868,10 @@ def cad_guide_text(topic: str = "overview") -> str:
             "  plm_item_set / plm_where_used    item identity + consumers\n"
             "  plm_timeline / plm_rollback      AI-VC per-doc silent checkpoints\n"
             "  plm_add_remote / plm_sync / plm_lock / plm_unlock\n\n"
+            "  Vault-backed tools default path to the exact selected session workspace.\n"
+            "  Explicit relative paths resolve beneath it; absolute paths override it.\n"
+            "  A selected nested folder never widens to an ancestor vault, and missing\n"
+            "  or invalid workspace context is refused rather than using worker cwd.\n\n"
             "CAD GRAPH (cad_graph_* — services/mcp/graph_tools.py):\n"
             "  cad_graph(query_kind, node_id='', src='', dst='', project_dir='')\n"
             "    query_kind: get | blast | path | tree\n"
@@ -1974,15 +2969,21 @@ def cad_guide_text(topic: str = "overview") -> str:
             "      source vertex stops resolving (never breaks the sketch).\n\n"
             "\u2500\u2500 CONSTRAIN + CHECK (mirror of the 2D sketch loop) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
             "  sketch3d_add_constraints(id, constraints)   append + narrated solve results\n"
-            "      v1 types: coincident, fix, distance (pt-pt / pt-line), length, parallel,\n"
+            "      types: coincident, fix, distance (pt-pt / pt-line), length, parallel,\n"
             "      perpendicular, angle, along_axis (axis:'x'|'y'|'z' or dir:[x,y,z]),\n"
-            "      point_on (line/arc). Handles: 'e3.p1'/'e3.p2' ends (also eq_curve3d\n"
-            "      endpoints), 'e3.pm' arc mid, 'e3.p0'..'e3.pN' spline pts, 'x1' external\n"
-            "      ref point. value: number or {value, expr}; driven:true = reference dim.\n"
-            "      (tangent/symmetric/equal/midpoint are v2 \u2014 rejected.)\n"
+            "      point_on (line/arc/spline), tangent, equal, collinear, concentric,\n"
+            "      coradial, midpoint (point + line/arc), on_plane, parallel_plane,\n"
+            "      normal_plane and symmetric. Handles: 'e3.p1'/'e3.p2' ends (also\n"
+            "      eq_curve3d endpoints), 'e3.pm' arc mid, 'e3.p0'..'e3.pN' spline pts,\n"
+            "      'x1' external ref point. value: number or {value, expr}; driven:true\n"
+            "      = reference dim. Plane relations accept a named plane or origin/normal.\n"
             "  check_sketch3d(id)     narrated health: status full/under/over, dof,\n"
             "      conflicting/redundant ids, free variables in plain words\n"
             "      ('e2: p2 x/y/z loose'), wires [{closed, n_edges}]. Aim for dof 0.\n"
+            "      skipped_constraints [{id,reason}] and nonconvergence_reason (conflicts name their\n"
+            "      partners, conflicts_with {id:[ids]}) mean NOT fully defined even at dof 0.\n"
+            "      revision is included only when the document revision is stable across the read;\n"
+            "      revision_stale:true means changed or unavailable: re-check before relying on it.\n"
             "  sketch3d_preview(id)   no-vision TEXT describe: entities w/ solved coords +\n"
             "      per-entity status, wire refs, length, bbox, health verdict.\n"
             "  sketch3d_get(id) / sketch3d_list() / sketch3d_clear(id)  read / roster / empty.\n\n"
@@ -2036,7 +3037,75 @@ def cad_guide_text(topic: str = "overview") -> str:
             "  \u2022 A sketch3d never produces a body/face \u2014 path/guide material only (no 3D\n"
             "    'profile' extrude in v1). Loft guides do not consume sketch3d yet.\n"
             "  \u2022 Closed 3D wires are valid sweep paths (close=True on path_from_points).\n"
+            "  \u2022 add_features batch ops (atomic appends; ids minted by the engine, returned in id_map\n"
+            "    as $<i>, $<i>#1, …): sketch3d_add_entities {sketch, entities:[raw entities]},\n"
+            "    sketch3d_add_constraints {sketch, constraints:[…]} (c<N> ids),\n"
+            "    sketch3d_add_external_ref {sketch, ref:{source:{kind:'vertex',selector}}} (x<N>\n"
+            "    point handle). The sketch3d_add_curves / _add_constraints / _ref_vertex tools send these.\n"
         )
+    if topic in ("video_to_part", "splats"):
+        return (
+            "VIDEO / GAUSSIAN SPLAT TO PART\n"
+            "Start a session, then search for an existing CAD model with "
+            "reveng_find_models(session_id, query, limit=8) before research or building. "
+            "Inspect candidate suitability and provenance; select a suitable model with "
+            "reveng_use_model(session_id, url=...) or reveng_use_model(session_id, path=...). "
+            "If none is suitable, continue with research or reconstruction.\n"
+            "reveng_start_session -> reveng_add_video(session_id, path) extracts MP4/MOV/WebM/MKV "
+            "frames asynchronously (poll get_reveng_session; wait=True for a short clip). "
+            "reveng_add_images may add stills; all submitted images share one SfM solve. "
+            "For Gaussian acquisition, reveng_start_splat(session_id, live=True) starts "
+            "bounded training snapshots without waiting for CAD scale or a mesh; read "
+            "reveng_splat_status(session_id), then reveng_finish_splat(session_id) for the "
+            "full-quality pass. Object mode requires explicit crop_bounds in reconstruction "
+            "units; interrupted training restarts, not resumes. reveng_reconstruct can also "
+            "produce sparse poses, a visual Brush splat and an OpenMVS measurement mesh on "
+            "the same dataset. Splat-to-mesh extraction is approximate, not a precision "
+            "surface; Brush does not export meshes.\n"
+            "reveng_set_scale(method='known_dim', params={value_mm, recon_length, source}) "
+            "uses value_mm/recon_length, or point_a and point_b in reconstruction coordinates. "
+            "The physical dimension and reconstruction span must be identifiable endpoints "
+            "of the SAME feature; do not use a PCA extent as a guessed measurement. "
+            "For two_point click the shared dataset's undistorted image, never the raw source; "
+            "pass image_space='undistorted'. "
+            "get_reveng_session's session.sfm_dataset names the paired undistorted sparse_dir "
+            "and images_dir plus registered, points3D, mean_reprojection_error_px and cameras; "
+            "analyse that pair, never the raw sfm/solve-* model with dataset images. "
+            "Confirm scale before dimension-critical fitting with reveng_resolve_gate, or "
+            "reveng_confirm_scale when no mission gate exists; reveng_sparse_preview returns "
+            "at most 5000 points in the confirmed metric frame, otherwise the native frame, "
+            "plus camera frusta and a sparse artifact path. Coverage uses a 25-degree angular "
+            "threshold and reports nearest errors per slot. Before final fitting/rebuild, "
+            "reveng_align_axes(session_id, method='planes'|'pca'|'manual') aligns the "
+            "reconstruction to world axes. Planes can use provisional fitted planes and "
+            "falls back to PCA; manual accepts an absolute proper 3x3 rotation. These axes "
+            "are suggestions, not verified manufacturing datums; refit after alignment. "
+            "reveng_fit_primitives reports residuals and uncertainty, not a guarantee of "
+            "feature accuracy. reveng_build_parametric creates editable features "
+            "(approximate surfaces require strategy='override_approximate'); inspect the "
+            "result's features and actual bodies. An empty rebuild returns ok:false, "
+            "reason='no_features_rebuilt', match_pct=null, not a scored editable model. "
+            "recognition.unclaimed contains at most 100 examples; unclaimed_count and "
+            "unclaimed_path identify the full evidence. get_reveng_deviation can compare "
+            "a reference mesh or B-rep in world coordinates or with explicit alignment='icp'. "
+            "compare_parts(alignment='icp') adds a sampled aligned surface deviation while its "
+            "boolean volume result remains in world coordinates. Independently measure critical "
+            "features, particularly on approximate surfaces.\n"
+            "reveng_import_splat(path, session_id?) imports Gaussian PLY, .splat, .spz or .ksplat; "
+            "reveng_convert_splat(path, out_format, out_path?) writes formats with reported losses. "
+            "reveng_splat_to_mesh first prunes the splat to its subject (adaptive opacity cut, "
+            "camera-orbit region, dominant floor plane, k-NN floaters; remove_floor=false for a flat "
+            "subject) and returns points_path (colored point cloud) and pruned_splat_path with the "
+            "per-stage prune report; a fixed min_opacity such as 0.5 discards nearly all of a Brush "
+            "splat. It then defaults to opacity-median Gaussian depth TSDF fusion only "
+            "when undistorted COLMAP training poses are proven to share the raw splat gauge; "
+            "otherwise it falls back to Poisson with fallback_reason. method='poisson' "
+            "explicitly selects the legacy method. Both are approximate, cannot recover unseen "
+            "surfaces and may have floaters or view-dependent errors; independently measure "
+            "critical geometry and confirm scale. Imported clouds begin in an uncalibrated gauge "
+            "and must not be paired with unrelated cameras or inherit another scan's scale."
+        )
+
     # RE-40: Reverse Engineering GUI workspace walkthrough (cad_guide('reveng')).
     # Distinct from cad_guide('reverse'), which is the engine-level STEP/mesh import + recognizer
     # path. This branch owns the ONE thing no cheatsheet covers — the tab's actual layout — and
@@ -2048,6 +3117,10 @@ def cad_guide_text(topic: str = "overview") -> str:
             "Doc lanes (Datasheet / Web / From Library) run Source → Model → Review → Deliver.\n\n"
             "START: 'Reverse Eng' title-bar tab. New Session from the ribbon, or pick one in the\n"
             "session rail.\n\n"
+            "Before research or building, call reveng_find_models(session_id, query, limit=8).\n"
+            "Inspect candidate suitability and provenance; use reveng_use_model(session_id,\n"
+            "url=...) or reveng_use_model(session_id, path=...) for a suitable model. Otherwise\n"
+            "continue to research or reconstruction, and independently check critical dimensions.\n\n"
             "LAYOUT (three columns; both side columns collapse to a header strip + chevron)\n"
             "  LEFT   Session rail — one rich card per session: thumbnail of the first photo, a\n"
             "         status chip (new/capturing/reconstructing/modeling/done/error), image count,\n"
@@ -2068,7 +3141,8 @@ def cad_guide_text(topic: str = "overview") -> str:
             "                        single_photo, webcam, gpu — plus per-backend provisioning\n"
             "                        (colmap, openmvs, brush, triposr, vggt, docling) and the\n"
             "                        fix-it banners naming the env var that repairs each miss\n"
-            "                        (COLMAP_BIN, OPENMVS_BIN, ...).\n"
+            "                        (COLMAP_BIN, OPENMVS_BIN, ...). Missing Brush / OpenMVS install\n"
+            "                        from the app (reveng_install_tools; automatic on first use).\n"
             "         • Provenance   the session's provenance records, newest first.\n\n"
             "SOURCE LANE (Source stage) — pick one:\n"
             "  Scan        photos / video / webcam → Scale → Reconstruct → Model\n"
@@ -2086,17 +3160,16 @@ def cad_guide_text(topic: str = "overview") -> str:
             "  (an unrated frame gets NO badge), filter + count summary, per-frame cull/reveal.\n\n"
             "SCALE (Scan lane only): ArUco Mat / Two Points / Known Dim.\n"
             "  The mat card previews the generated ArUco sheet inline and warns to print at 100 %\n"
-            "  actual size. Two-point picks two pixels on a chosen photo. 'Scale of record' shows\n"
-            "  the one number every downstream dimension is multiplied by. Scale must be CONFIRMED\n"
-            "  before any dimension is trustworthy; ArUco needs a sparse model first, so running\n"
-            "  Reconstruct before Scale is the normal order in the Scan lane.\n\n"
+            "  actual size. Two-point picks two pixels on a chosen photo. Known Dim pairs the\n"
+            "  physical length with its measured reconstruction-space length; their ratio is the\n"
+            "  scale of record. Scale must be CONFIRMED before dimensions are trustworthy.\n\n"
             "RECONSTRUCT (Scan lane only): Sparse → Dense → Mesh (COLMAP + OpenMVS), shown as a\n"
             "  live sub-step track driven by the worker's progress events.\n"
             "  CAPABILITY PRE-FLIGHT gates the Run button and always names its reason: no worker,\n"
             "  no sparse backend (COLMAP/VGGT both absent → hard block with the COLMAP_BIN fix),\n"
             "  no session selected, no images, or a run already in flight. Non-blocking warnings\n"
-            "  cover a missing OpenMVS (sparse cloud only, no dense mesh) and an unprobed backend\n"
-            "  set. The result renders inline in the 3D preview slot (splat when available,\n"
+            "  cover missing OpenMVS; with Brush and Open3D the fallback surface is explicitly\n"
+            "  approximate. The result renders inline in the 3D preview slot (splat when available,\n"
             "  otherwise the sparse cloud or the mesh).\n"
             "  MCP tool: reveng_reconstruct(session_id, quality)\n\n"
             "MODEL: Fit Primitives → parametric build → Mesh Body fallback.\n"
@@ -2135,7 +3208,7 @@ def cad_guide_text(topic: str = "overview") -> str:
             return walkthrough + "\n" + sheet
         return walkthrough
     if topic in ("evaluate", "measure", "measurement", "interference", "fitment",
-                 "eval", "check_interference"):
+                 "eval", "check_interference", "wall_thickness", "thickness"):
         return (
             "EVALUATE / MEASURE — colour-coded measurement + interference fitment\n\n"
             "measure(targets=[...], doc_id?, view='auto', annotate=True)\n"
@@ -2147,21 +3220,48 @@ def cad_guide_text(topic: str = "overview") -> str:
             "  structured {kind,value,unit,color} per element; 2+ refs also report\n"
             "  the between distance/angle. Prefer this when you want the same\n"
             "  colour-coded highlight view the Evaluate ribbon shows.\n\n"
+            "WALL THICKNESS — while modelling printed parts, run wall_thickness() AND dfm_check.\n"
+            "  wall_thickness(doc_id?, min_wall_mm?, resolution?, image=True) returns an\n"
+            "  inscribed-sphere heat map: process-minimum RED, thick BLUE, unmeasured GREY.\n"
+            "  min_wall_mm defaults to the bound process/FDM profile (currently 1.0 mm);\n"
+            "  resolution is optional sample spacing in mm; image=False returns JSON.\n"
+            "  Read measurement_basis.spacing_mm/budget_limited and thin_regions with\n"
+            "  their face/feature references. Null means unmeasured/no opposing wall found,\n"
+            "  not evidence of safety. Fix every red region at its named face/feature or\n"
+            "  explicitly justify it before export/slicing; re-run after geometry changes.\n"
+            "  Inspect DFM too; default verify_battery does not run thickness or DFM.\n\n"
             "INTERFERENCE / FITMENT LOOP\n"
             "  1. check_interference(doc_id?)  — pairwise clash/clearance over bodies\n"
             "     (assemblies: world-placed components). Response includes\n"
             "     ok (the check completed), clear (the verdict: no interference),\n"
             "     interferences[{a,b,volume,overlap_volume_mm3,overlap_bbox,overlap_mesh}],\n"
             "     clearances[{a,b,distance}], contacts, parts[{name,bbox,volume}].\n"
+            "     A pair with method=fallback_fuzzy_* has approximate=true and reports\n"
+            "     fuzzy_tolerance_mm: its overlap classification/volume are approximate.\n"
+            "     fallback_extrema_disjoint marks positive-distance evidence for a\n"
+            "     constituent after Boolean failures; it can coexist with fuzzy fallback.\n"
             "     A clash returns ok=true, clear=false; ok=false means incomplete.\n"
+            "     clearance_status and clearance_tolerance_mm distinguish below, above and\n"
+            "     within_tolerance; ±0.000001 mm is uncertain, not a definite pass/violation.\n"
             "  2. Subset: engine eval_interference accepts optional members:[name,...]\n"
             "     to pairwise-check only selected components (absent/empty = all).\n"
             "  3. Read overlap_volume_mm3 + overlap_bbox (world mm) → fix fitment\n"
             "     (edit mates / geometry / offsets) → re-check until clear=true.\n"
-            "  4. Intra-part feature collisions (boss swallowed by cut, etc.):\n"
-            "     check_feature_overlap — not the body-level interference tool.\n\n"
+            "  4. check_feature_overlap compares pre-boolean tools within one part; pairs'\n"
+            "     volume_mm3 is not material added or removed. Legacy boss_swallowed is\n"
+            "     tool inclusion, not proof of lost material; dead_features only means no\n"
+            "     surviving owned faces. Read complete/unavailable_features/failed_pairs;\n"
+            "     inspect actual geometry and history before inferring material loss.\n\n"
+            "MEASUREMENT CONTRACTS: measure_part density is g/cm³, positive and at most 25;\n"
+            "  heed warnings when default density is used. body_id selects one body; inertia\n"
+            "  is about its centre of mass. measure_between requires exactly one match per\n"
+            "  target; axis_distance measures distance between axes, not surface clearance.\n"
+            "  check_symmetry accepts custom planes and body selection. inspect_section covers\n"
+            "  the whole plane and rejects target_center. draft_analysis reports threshold-only\n"
+            "  results; do not infer an angle field from it.\n\n"
             "Related: measure_between (text-only single/pair probe), measure_part\n"
-            "(mass props), inspect_feature (emphasis close-up + dims), verify_battery.\n"
+            "(mass props in result['mass'], including volume_mm3 and mass_g),\n"
+            "inspect_feature (emphasis close-up + dims), verify_battery.\n"
         )
 
     if topic in ("drawings", "drawing_standards", "2d", "engineering_drawing",
@@ -2173,12 +3273,4 @@ def cad_guide_text(topic: str = "overview") -> str:
     sheet = _read_prompt(f"shared/cheatsheets/{topic}.md")
     if sheet:
         return sheet
-    avail = sorted(p.stem for p in (_prompts_dir() / "shared" / "cheatsheets").glob("*.md")) \
-        if (_prompts_dir() / "shared" / "cheatsheets").is_dir() else []
-    return (f"No guide for {topic!r}. Topics: overview, simulation, motion, review, intake, gsl, "
-            f"cam, narration, parts, reverse, reveng, deliverables, requirements, dag, verify, "
-            f"interaction, sourcing, cost, spec, piping, industrial, hydraulic, firmware, structural, "
-            f"drawings, "
-            f"mechanical, "
-            f"regen, code_compliance, design_review, doc_diff, plm, tolerance_stackup, "
-            f"evaluate, measure, sketch3d; or a feature cheatsheet: {avail}")
+    return f"No guide for {topic[:80]!r}. Call cad_guide() for the available topic index."

@@ -46,6 +46,9 @@ constexpr WebGap kWebGaps[] = {
     {"account_signin",
      "Provider sign-in and API keys are unavailable in the web app: the shared engine "
      "cannot hold provider credentials per user. Use the desktop app for online AI."},
+    {"ecad_kicad_open_sch", "Opening KiCad requires the desktop app."},
+    {"ecad_kicad_open_pcb", "Opening KiCad requires the desktop app."},
+    {"ecad_kicad_open_project", "Opening KiCad requires the desktop app."},
 };
 
 bool allowedExternalHttpUrl(const std::string& url) {

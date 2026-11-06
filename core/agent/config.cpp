@@ -4,15 +4,15 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
-#include <cstring>
 #include <cstdlib>
+#include <exception>
 #include <fstream>
 #include <sstream>
+#include <utility>
 #include <vector>
 
 #include "agent/paths.h"
 #include "agent/auth.h"  // in-process subscription token refresh
-#include "agent/state.h"  // kContextTokenCap (the lean input-cap ceiling for big windows)
 
 namespace chudware {
 namespace agent {
@@ -22,19 +22,6 @@ const char* kDefaultLocalBaseUrl = "http://localhost:1234/v1";
 const char* kOfflineSetting = "offline_mode";
 
 namespace {
-// Per-provider default context window (total tokens) when the user has not set one. Cloud
-// models are large; a LOCAL/unknown server is assumed 8192 — a common LM Studio / Ollama
-// default — so input+output budgeting never overruns a small window by accident.
-int default_context_window(const std::string& name) {
-    if (name == "anthropic" || name == "anthropic-sub") return 200000;
-    if (name == "gemini") return 1048576;
-    if (name == "openai" || name == "xai" || name == "xai-sub") return 128000;
-    if (name == "freellmapi") return 128000;  // FreeLLMAPI aggregates many free-tier models;
-                                              // 128k is a safe generic default (user overridable)
-    if (name == "moonshot") return 1048576;  // Kimi K3 1M window (kimi-k3-256k caps via cfg)
-    return 8192;  // local / unknown — conservative
-}
-
 // Read the ACTIVE account's access_token from config.subscription_auth[provider_id].
 // Token REFRESH lives in agent/auth.cpp: resolve_provider refreshes a stale
 // credential in-process via auth::ensure_fresh_for_run and reloads the store before
@@ -272,17 +259,6 @@ bool local_only_enabled(const json& cfg) {
     return offline_enabled(cfg) || compliance_mode(cfg) == "local_only";
 }
 
-std::string consent_tier(const json& cfg) {
-    // Hard override: offline/ITAR mode always forces consent off.
-    if (offline_enabled(cfg)) return "off";
-    if (!cfg.is_object() || !cfg.contains("telemetry_consent")) return "off";
-    const json& v = cfg["telemetry_consent"];
-    if (!v.is_string()) return "off";
-    const std::string s = v.get<std::string>();
-    if (s == "meta" || s == "full") return s;
-    return "off";  // unknown / explicit "off" / anything else
-}
-
 bool host_is_loopback(const std::string& base_url) {
     if (base_url.empty()) return false;
     return in_loopback(urlparse_hostname(base_url));
@@ -391,6 +367,13 @@ json resolve_provider(const std::optional<std::string>& name_arg, json cfg,
                 "': true): the managed llama.cpp endpoint '" + base_url +
                 "' is not loopback, so it is refused before probing the server.");
     }
+    // Subscription aliases not recognized by the native transport must not reach
+    // token refresh before the unknown-provider error in offline mode.
+    const bool subscription_name = auth::is_subscription_name(name);
+    if (offline && subscription_name)
+        return refusal("The provider '" + name +
+                       "' cannot be used while offline mode is enabled. Use a local model "
+                       "server or turn offline mode off in Settings.");
 
     // Refresh a stale subscription OAuth token IN-PROCESS (ported from the
     // Python subscription_ensure_fresh RPC) and re-read the store so the
@@ -398,7 +381,7 @@ json resolve_provider(const std::optional<std::string>& name_arg, json cfg,
     // offline refusals (no network in offline mode) and no-ops for non-subscription
     // names, fresh tokens, and absent credentials. A hard auth failure surfaces as
     // a refusal — the same provider_auth gate jobs.cpp used to apply via RPC.
-    if (auth::is_subscription_name(name)) {
+    if (subscription_name) {
         std::string auth_err = auth::ensure_fresh_for_run(name, cfg);
         if (!auth_err.empty()) return refusal(auth_err);
     }
@@ -480,9 +463,7 @@ json resolve_provider(const std::optional<std::string>& name_arg, json cfg,
             if (!key.empty()) oauth = true;
         }
         if (key.empty())
-            return refusal(
-                "Claude is not configured for native local execution. Use "
-                "agent_admin_turn (agent service) for online providers.");
+            return refusal("Claude is not configured. Sign in or add an Anthropic API key in Settings.");
         // Global cfg.model may be a Grok id when the active provider is xAI — never send
         // a non-Claude model id to the Anthropic Messages API.
         std::string model = py_or(cfg_str(cfg, "model"), "claude-opus-5-5");
@@ -517,7 +498,7 @@ json resolve_provider(const std::optional<std::string>& name_arg, json cfg,
         std::optional<std::string> base = oai_cfg("base_url");
         desc = json{
             {"name", "openai"},
-            {"model", py_or(cfg_str(cfg, "model"), "gpt-4o")},
+            {"model", py_or(cfg_str(cfg, "model"), "gpt-6-sol")},
             {"base_url", base ? json(*base) : json(nullptr)},
             {"supports_vision", oai_vision},
             {"api_key", py_or(cfg_str(cfg, "api_key"),
@@ -628,26 +609,6 @@ json resolve_provider(const std::optional<std::string>& name_arg, json cfg,
     if (auto eff = cfg_str(cfg, "reasoning_effort"); eff && !eff->empty())
         desc["reasoning_effort"] = *eff;
 
-    // Optional per-call output-token override (config "max_output_tokens"). 0/absent = the
-    // per-provider automatic default in call_budget_for. Raising it is the fix when a reasoning
-    // model burns its whole output budget thinking and returns no/truncated JSON ("no JSON ops").
-    if (cfg.contains("max_output_tokens") && cfg["max_output_tokens"].is_number_integer()) {
-        int mt = cfg["max_output_tokens"].get<int>();
-        if (mt > 0) desc["max_tokens"] = mt;
-    }
-
-    // Context window (config "context_window") — the model's total token window that input +
-    // output must fit within. 0/absent = the per-provider default (cloud large; local/unknown
-    // 8192). fit_call_budget() derives the input cap + output reservation from this so a small
-    // local window is never overrun (which would corrupt the prompt and break the chain).
-    {
-        int cw = 0;
-        if (cfg.contains("context_window") && cfg["context_window"].is_number_integer())
-            cw = cfg["context_window"].get<int>();
-        desc["context_window"] =
-            cw > 0 ? cw : default_context_window(desc.value("name", std::string()));
-    }
-
     desc["offline_safe"] = provider_offline_safe(desc);
     // WS3 compliance_mode: thread the normalized mode (and, in redact mode, any configured
     // redaction-role assignment) into the descriptor so providers.cpp::complete() can gate
@@ -662,251 +623,6 @@ json resolve_provider(const std::optional<std::string>& name_arg, json cfg,
         if (desc["offline_safe"].get<bool>() == false) desc["supports_vision"] = false;
     }
     return desc;
-}
-
-json resolve_review_provider(const json& cfg, const json& env) {
-    if (!cfg.is_object() || !cfg.contains("experimental") || !cfg["experimental"].is_object())
-        return json(nullptr);
-    const json& ex = cfg["experimental"];
-    if (!ex.contains("vision_review") || !ex["vision_review"].is_object()) return json(nullptr);
-    const json& vr = ex["vision_review"];
-    bool enabled = vr.contains("enabled") && vr["enabled"].is_boolean() && vr["enabled"].get<bool>();
-    if (!enabled) return json(nullptr);
-
-    // The review judge is an OpenAI-compatible vision endpoint: either LOCAL (the Seek-CAD use
-    // case: a self-hosted Qwen2.5-VL) or a cloud vision model. Synthesize the minimal cfg
-    // resolve_provider expects and reuse ALL of its offline-safety logic — so an offline run
-    // still refuses a non-loopback review endpoint.
-    std::string base_url = vr.contains("base_url") && vr["base_url"].is_string() &&
-                                   !vr["base_url"].get<std::string>().empty()
-                               ? vr["base_url"].get<std::string>()
-                               : std::string(kDefaultLocalBaseUrl);
-    std::string model = vr.contains("model") && vr["model"].is_string() &&
-                                !vr["model"].get<std::string>().empty()
-                            ? vr["model"].get<std::string>()
-                            : std::string("qwen2.5-vl-7b-instruct");
-    std::string api_key = vr.contains("api_key") && vr["api_key"].is_string()
-                              ? vr["api_key"].get<std::string>()
-                              : std::string();
-
-    // Classify the endpoint. A recognised cloud service routes through its OWN provider name so
-    // the native branch applies (Moonshot: wire-id alias normalization + the kimi-k3 reasoning
-    // ladder), and its credential is looked up in that service's `keys.*` slot when the vision
-    // row carries none of its own. Without this, a Moonshot vision endpoint was resolved as
-    // generic "openai" and handed the literal "lm-studio" placeholder below — a guaranteed HTTP
-    // 401 that surfaced as stop_reason=provider_auth.
-    const std::string b = lower(base_url);
-    auto has = [&](const char* needle) { return b.find(needle) != std::string::npos; };
-    const bool loopback = host_is_loopback(base_url);
-    std::string name = "openai";
-    const char* key_slot = nullptr;
-    if (has("moonshot.ai")) {
-        name = "moonshot";
-        key_slot = "moonshot";
-    } else if (!loopback) {
-        // OpenRouter / DashScope / DeepSeek / any other OpenAI-compatible cloud endpoint: the
-        // generic descriptor keyed by base_url is correct, but the credential still comes from
-        // the shared cloud slot when the vision row has none.
-        key_slot = has("openrouter.ai") ? "openrouter" : "cloud_compat";
-    }
-    if (api_key.empty() && key_slot && cfg.contains("keys") && cfg["keys"].is_object() &&
-        cfg["keys"].contains(key_slot) && cfg["keys"][key_slot].is_string())
-        api_key = cfg["keys"][key_slot].get<std::string>();
-    if (api_key.empty()) {
-        if (!loopback)
-            // A remote endpoint with no resolvable credential can only 401. Refuse here so
-            // apply_experimental SKIPS the split and review falls back to the main provider,
-            // instead of killing the run with an opaque provider_auth.
-            return json{{"error", "vision review endpoint '" + base_url +
-                                      "' has no API key (Settings -> AI -> Roles -> Vision & "
-                                      "spatial routing, or the matching provider key)"}};
-        api_key = "lm-studio";  // loopback servers ignore it but require the header
-    }
-
-    json sub = json{
-        {"provider", name},
-        {"model", model},
-        {"api_key", api_key},
-        {"offline_mode", offline_enabled(cfg)},  // inherit the ambient ITAR guard
-        {"openai", {{"base_url", base_url}, {"vision", true}}},
-    };
-    return resolve_provider(name, sub, env);
-}
-
-json apply_experimental(json resolved_main, const json& cfg, const json& env) {
-    if (!cfg.is_object() || !cfg.contains("experimental") || !cfg["experimental"].is_object())
-        return resolved_main;
-    const json& ex = cfg["experimental"];
-
-    // A separate vision review/fix judge. On an offline refusal (cloud endpoint while offline) we
-    // SKIP it silently: review then falls back to the main provider, which already passed the
-    // offline guard, so the run stays ITAR-safe rather than failing.
-    json rp = resolve_review_provider(cfg, env);
-    if (rp.is_object() && !rp.contains("error")) resolved_main["review_provider"] = rp;
-
-    if (ex.contains("cad_sequence_mode") && ex["cad_sequence_mode"].is_boolean() &&
-        ex["cad_sequence_mode"].get<bool>())
-        resolved_main["cad_sequence_mode"] = true;
-    return resolved_main;
-}
-
-int context_window_for(const json& provider_cfg) {
-    if (provider_cfg.contains("context_window") &&
-        provider_cfg["context_window"].is_number_integer()) {
-        int cw = provider_cfg["context_window"].get<int>();
-        if (cw > 0) return cw;
-    }
-    return default_context_window(provider_cfg.value("name", std::string()));
-}
-
-CallBudget fit_call_budget(const json& provider_cfg, int desired_output) {
-    const int window = context_window_for(provider_cfg);
-    const int margin = 768;      // role markers + JSON scaffolding + tokenizer slop
-    const int min_input = 1024;  // always leave room for the request + the current step
-    int out = desired_output > 0 ? desired_output : 4096;
-    // The output reservation must not swallow the whole window — keep min_input for the prompt.
-    int out_ceiling = window - min_input - margin;
-    if (out_ceiling < 1024) out_ceiling = 1024;  // pathologically tiny window: still attempt
-    if (out > out_ceiling) out = out_ceiling;
-    int input_cap = window - out - margin;
-    if (input_cap < min_input) input_cap = min_input;
-    if (input_cap > kContextTokenCap) input_cap = kContextTokenCap;  // big windows: keep prompts lean
-    return CallBudget{input_cap, out};
-}
-
-namespace {
-
-// Split "provider/model" or "provider:model" (first separator only). Empty model ok.
-bool split_provider_model(const std::string& target, std::string& provider, std::string& model) {
-    size_t slash = target.find('/');
-    size_t colon = target.find(':');
-    size_t sep = std::string::npos;
-    if (slash != std::string::npos && colon != std::string::npos)
-        sep = std::min(slash, colon);
-    else if (slash != std::string::npos)
-        sep = slash;
-    else if (colon != std::string::npos)
-        sep = colon;
-    if (sep == std::string::npos || sep == 0) return false;
-    provider = target.substr(0, sep);
-    model = (sep + 1 < target.size()) ? target.substr(sep + 1) : std::string();
-    // Drop a trailing thinking suffix like ":high" when the provider used '/'
-    // (e.g. openai/gpt-4.1-mini:low) — keep model as-is for simple cases.
-    return !provider.empty();
-}
-
-// Parse one eng_firm.models entry object → EngFirmModelEntry. Wrong types → empty fields.
-EngFirmModelEntry parse_eng_firm_entry(const json& j) {
-    EngFirmModelEntry e;
-    if (!j.is_object()) return e;
-    if (j.contains("provider") && j["provider"].is_string())
-        e.provider = j["provider"].get<std::string>();
-    if (j.contains("model") && j["model"].is_string()) e.model = j["model"].get<std::string>();
-    if (j.contains("thinking") && j["thinking"].is_string())
-        e.thinking = j["thinking"].get<std::string>();
-    return e;
-}
-
-}  // namespace
-
-EngFirmModels load_eng_firm_models(const json& cfg_in) {
-    EngFirmModels out;
-    try {
-        json cfg = cfg_in.is_null() ? load_config() : cfg_in;
-        if (!cfg.is_object() || !cfg.contains("eng_firm") || !cfg["eng_firm"].is_object())
-            return out;
-        const json& ef = cfg["eng_firm"];
-        if (!ef.contains("models") || !ef["models"].is_object()) return out;
-        const json& m = ef["models"];
-        if (m.contains("mission_planner")) out.mission_planner = parse_eng_firm_entry(m["mission_planner"]);
-        if (m.contains("advisor")) out.advisor = parse_eng_firm_entry(m["advisor"]);
-        if (m.contains("lead")) out.lead = parse_eng_firm_entry(m["lead"]);
-        if (m.contains("subcontractor"))
-            out.subcontractor = parse_eng_firm_entry(m["subcontractor"]);
-        if (m.contains("disciplines") && m["disciplines"].is_object()) {
-            for (auto it = m["disciplines"].begin(); it != m["disciplines"].end(); ++it) {
-                if (!it.key().empty())
-                    out.disciplines[lower(it.key())] = parse_eng_firm_entry(it.value());
-            }
-        }
-    } catch (...) {
-        // never throw across the config seam
-    }
-    return out;
-}
-
-json resolve_eng_firm_provider(const EngFirmModelEntry& e, const json& cfg, const json& env) {
-    try {
-        if (e.empty()) return json(nullptr);
-
-        std::string prov = e.provider;
-        std::string model = e.model;
-        // Strip whitespace on provider.
-        {
-            size_t a = prov.find_first_not_of(" \t\r\n");
-            size_t b = prov.find_last_not_of(" \t\r\n");
-            if (a == std::string::npos)
-                prov.clear();
-            else
-                prov = prov.substr(a, b - a + 1);
-        }
-
-        // If provider is empty but model looks like "provider/model", split it.
-        // Also honor "provider/model" when provider field itself carries the slash form.
-        std::string split_p, split_m;
-        if (!prov.empty() && split_provider_model(prov, split_p, split_m)) {
-            if (!split_p.empty() && split_p[0] == '@') split_p = split_p.substr(1);
-            prov = split_p;
-            if (model.empty() && !split_m.empty()) model = split_m;
-        }
-
-        if (prov.empty()) return json(nullptr);
-
-        json desc = resolve_provider(prov, cfg, env);
-        if (!desc.is_object() || desc.contains("error")) return json(nullptr);
-
-        if (!model.empty()) {
-            // Drop trailing thinking selector if present (openai/gpt-4.1-mini:low).
-            static const char* kThink[] = {":minimal", ":low", ":medium", ":high", ":xhigh",
-                                           ":max"};
-            for (const char* suf : kThink) {
-                const size_t n = std::strlen(suf);
-                if (model.size() >= n && lower(model.substr(model.size() - n)) == suf) {
-                    model = model.substr(0, model.size() - n);
-                    break;
-                }
-            }
-            if (!model.empty()) desc["model"] = model;
-        }
-
-        // thinking → reasoning_effort (same descriptor field other knobs use).
-        if (!e.thinking.empty()) {
-            std::string th = e.thinking;
-            size_t a = th.find_first_not_of(" \t\r\n");
-            size_t b = th.find_last_not_of(" \t\r\n");
-            if (a != std::string::npos) {
-                th = th.substr(a, b - a + 1);
-                if (!th.empty()) desc["reasoning_effort"] = th;
-            }
-        }
-        return desc;
-    } catch (...) {
-        return json(nullptr);
-    }
-}
-
-std::string eng_firm_discipline_key(Discipline d) {
-    switch (d) {
-        case Discipline::Mechanical: return "mechanical";
-        case Discipline::Electrical: return "electrical";
-        case Discipline::Structural: return "structural";
-        case Discipline::Thermal: return "thermal";
-        case Discipline::Manufacturing: return "manufacturing";
-        case Discipline::Drafting: return "drafting";
-        case Discipline::Sourcing: return "sourcing";
-        case Discipline::Generalist: return "generalist";
-    }
-    return "generalist";
 }
 
 }  // namespace agent

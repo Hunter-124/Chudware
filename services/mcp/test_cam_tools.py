@@ -640,6 +640,117 @@ def test_cam_extract_rejects_unknown_kind_before_exporting_anything(monkeypatch)
     assert seen == ["export_file", "cam_extract"], seen
 
 
+def test_cam_simulate_forwards_extracted_mesh_and_gouge_evidence(monkeypatch):
+    from services.mcp import cam_tools as ct
+    from mcp.server.fastmcp import FastMCP
+
+    mesh = {"verts": [0, 0, 0, 1, 0, 0, 0, 1, 0], "tris": [0, 1, 2]}
+    calls = []
+
+    def call(method, params):
+        calls.append((method, params))
+        if method == "export_file":
+            assert params["doc_id"] == "part"
+            return {}
+        if method == "cam_extract":
+            assert params["kind"] == "mesh"
+            assert params["path"] == calls[0][1]["path"]
+            return {"mesh": mesh}
+        assert method == "cam_simulate"
+        assert params["part_mesh"] == mesh
+        assert params["setup_id"] == "setup"
+        return {"results": [{"gouge_evaluated": True, "gouges": 2,
+                             "max_gouge_mm": 1.5, "gouge_hits": [{"op_id": "op"}]}]}
+
+    monkeypatch.setattr(ct.cb, "call", call)
+    monkeypatch.setitem(ct._CUR, "doc_id", "part")
+    monkeypatch.setitem(ct._CAM, "doc_id", "job")
+    mcp = FastMCP("test-cam-sim-mesh")
+    ct.register_cam_tools(mcp)
+    row = _call_tool(mcp, "cam_simulate", {"setup_id": "setup"})["results"][0]
+    assert row["gouge_evaluated"] is True
+    assert row["gouges"] == 2 and row["max_gouge_mm"] == 1.5
+    assert row["gouge_hits"] == [{"op_id": "op"}]
+    assert [method for method, _ in calls] == ["export_file", "cam_extract", "cam_simulate"]
+
+
+@pytest.mark.parametrize("failure", ["no_part", "extract_error", "empty_mesh", "disabled",
+                                    "old_engine", "no_overlap"])
+def test_cam_simulate_unavailable_gouge_is_not_zero(monkeypatch, failure):
+    from services.mcp import cam_tools as ct
+    from mcp.server.fastmcp import FastMCP
+
+    calls = []
+
+    def call(method, params):
+        calls.append(method)
+        if method == "export_file":
+            return {}
+        if method == "cam_extract":
+            if failure == "extract_error":
+                return {"error": "cannot extract"}
+            if failure == "empty_mesh":
+                return {"mesh": {"verts": [], "tris": []}}
+            return {"mesh": {"verts": [0, 0, 0], "tris": [0, 0, 0]}}
+        assert method == "cam_simulate"
+        assert ("part_mesh" in params) == (failure in ("old_engine", "no_overlap"))
+        row = {"ok": True, "gouges": 0, "max_gouge_mm": 0, "removed_volume_mm3": 42}
+        if failure == "no_overlap":
+            row.update(gouge_evaluated=False, gouge_reason="no shared grid cells")
+        return {"results": [row]}
+
+    monkeypatch.setattr(ct.cb, "call", call)
+    monkeypatch.setitem(ct._CUR, "doc_id", None if failure == "no_part" else "part")
+    monkeypatch.setitem(ct._CAM, "doc_id", "job")
+    mcp = FastMCP("test-cam-sim-unavailable")
+    ct.register_cam_tools(mcp)
+    row = _call_tool(mcp, "cam_simulate", {"check_gouge": failure != "disabled"})["results"][0]
+    assert row["gouge_evaluated"] is False and row["gouge_reason"]
+    assert row["gouges"] is None and row["max_gouge_mm"] is None
+    assert row["removed_volume_mm3"] == 42
+    if failure in ("disabled", "no_part"):
+        assert calls == ["cam_simulate"]
+
+
+@pytest.mark.skipif(not cb.available(), reason="native engine unavailable")
+def test_cam_simulate_detects_real_part_gouge(monkeypatch):
+    from services.mcp import cam_tools as ct
+    from mcp.server.fastmcp import FastMCP
+
+    part = cb.call("doc_new", {"kind": "part", "name": "CAM comparison", "internal": True})["doc_id"]
+    job = None
+    try:
+        dim = lambda v: {"value": v, "expr": None}
+        cb.call("doc_apply_ops", {"doc_id": part, "base_revision": -1, "ops": [
+            {"op": "add_feature", "feature": {"type": "box", "name": "Box",
+             "params": {"length": dim(20), "width": dim(20), "height": dim(10), "centered": True}}}
+        ]})
+        job = cb.call("cam_new", {"name": "CAM comparison"})["doc_id"]
+        setup = cb.call("cam_apply_ops", {"doc_id": job, "base_revision": -1, "ops": [
+            {"op": "add_tool", "tool": {"number": 1, "type": "endmill_flat", "diameter": 6}},
+            {"op": "add_setup", "ref": "S", "setup": {"name": "S", "machine": {"kind": "mill3"},
+             "stock": {"type": "box", "min": [-10, -10, -5], "max": [10, 10, 10]}}}
+        ]})["id_map"]["S"]
+        cb.call("cam_apply_ops", {"doc_id": job, "base_revision": -1, "ops": [
+            {"op": "add_operation", "setup_id": setup, "operation": {
+                "type": "pocket2d", "tool_number": 1, "stepdown": 2, "stepover": 3,
+                "heights": {"top": 10, "bottom": 0},
+                "geometry": {"regions": [{"outer": [[-8, -8], [8, -8], [8, 8], [-8, 8]]}]}}}
+        ]})
+        monkeypatch.setitem(ct._CUR, "doc_id", part)
+        monkeypatch.setitem(ct._CAM, "doc_id", job)
+        mcp = FastMCP("test-cam-real-gouge")
+        ct.register_cam_tools(mcp)
+        row = _call_tool(mcp, "cam_simulate", {"resolution": 1.0})["results"][0]
+        assert row["gouge_evaluated"] is True
+        assert row["gouges"] > 0 and row["max_gouge_mm"] > 0
+        assert row["gouge_hits"]
+    finally:
+        if job:
+            cb.call("cam_close", {"doc_id": job})
+        cb.call("doc_close", {"doc_id": part})
+
+
 def test_cam_add_setup_changes_field(monkeypatch):
     from services.mcp import cam_tools as ct
     from mcp.server.fastmcp import FastMCP

@@ -6,15 +6,10 @@
 // ---------------
 // Two problems this header solves, and neither is cosmetic:
 //
-// 1. THE APP DOES NOT RENDER CONTINUOUSLY. app.cpp's frame loop idles on
-//    glfwWaitEventsTimeout(0.05) — a 20 Hz floor — unless something declares itself busy.
-//    Before this header the ONLY way to raise that floor was AppState::animActive, which
-//    belongs to the 3D CAD viewport's camera tween (ui/camera_anim.*) and is cleared on
-//    document-tab switches. Every other animation in the program (the PLM graph's blast
-//    pulse, the tesseract spinner, hover washes) therefore ran at whatever cadence stray
-//    mouse events happened to produce — smooth while the cursor moved, a 20 Hz stutter the
-//    instant it stopped. requestFrames() is the general fix: any painter that needs the next
-//    frame soon says so, every frame, for as long as it is moving.
+// 1. THE APP DOES NOT RENDER CONTINUOUSLY. The frame loop sleeps for events when idle.
+//    Interactive tweens requestFrames() while moving; decorative motion requests a bounded
+//    cadence with requestFramesAt(). Background results wakeLoop() without forcing continuous
+//    redraw. Requests last only as long as the painter keeps drawing.
 //
 // 2. EVERY SITE HAND-ROLLED ITS OWN CURVE. Durations and smoothsteps were scattered as bare
 //    literals (0.35f here, 0.25f there, a raw t*t*(3-2t) inlined in four files), so nothing in
@@ -27,10 +22,9 @@
 //   and 144 Hz.
 // * All ease functions take and return normalized t in [0,1] and are clamped at both ends, so
 //   passing an out-of-range t is safe and saturates rather than exploding.
-// * toward()/pulse()/phase() call requestFrames() for you: if you use them, you get smooth
-//   frames automatically, and the request stops the moment the value settles or the caller
-//   stops drawing. Nothing has to be un-registered.
-// * GUI thread only. No locking; the state tables are plain file-statics.
+// * toward()/stagger() request interactive frames until settled; pulse()/phase() request
+//   ambient frames at 30 Hz. Nothing has to be un-registered when a painter stops drawing.
+// * GUI thread only except wakeLoop(), which is safe from any thread.
 
 #include "imgui.h"
 
@@ -70,9 +64,22 @@ float easeSpring(float t);
 // (because its tab closed) automatically stops requesting.
 void requestFrames();
 
-// Consumed once per frame by app.cpp's idle-throttle block: reads the flag and clears it. No
-// other caller should invoke this; framesRequested() is for the loop, not for panels.
+// Ambient motion: guarantee a frame within 1/hz seconds without pinning the loop to vsync.
+// Renew while visible, just like requestFrames(); the earliest requested deadline wins.
+void requestFramesAt(float hz);
+
+// Thread-safe result/event notification. Safe before GUI startup and during/after teardown.
+void wakeLoop();
+
+// GLFW cursor lifecycle enables waking only while the GUI window is alive. GUI thread only;
+// disabling synchronizes with outstanding wakeLoop() calls before GLFW is torn down.
+void setLoopWakeEnabled(bool enabled);
+
+// Frame-loop hooks only. Consume redraw declarations before waiting, then beginFrame() after
+// events have been processed. Early input wakes preserve an outstanding ambient deadline.
 bool consumeFrameRequest();
+double consumeAmbientWait(double maxWaitSeconds = 0.05);
+void beginFrame();
 
 // Frame delta in seconds, clamped to [0, 0.05]. Use this instead of raw ImGui DeltaTime so a
 // stall (debugger breakpoint, blocking RPC, window drag) cannot teleport an animation to its end
@@ -97,8 +104,8 @@ float toward(ImGuiID id, float target, float seconds = kBase);
 // whether to draw an expanded body at all). Returns `fallback` for an id never passed to toward().
 float peek(ImGuiID id, float fallback = 0.0f);
 
-// Drop a tween's state. Only needed when an id is genuinely retired (a closed document, a
-// destroyed row) and you want the next appearance to animate in from scratch rather than resume.
+// Drop a tween's state early. Untouched entries are also retired after 600 frames, so closed
+// document/message/row IDs do not accumulate for the lifetime of the process.
 void forget(ImGuiID id);
 
 // ---- ambient phases ---------------------------------------------------------------------------
@@ -106,9 +113,8 @@ void forget(ImGuiID id);
 // recently-changed markers and live indicators. phase() returns a monotonic 0..1 sawtooth that
 // wraps every `periodSec` — the driver for marching-ants dashes and flow lines.
 //
-// BOTH request frames on every call, because ambient motion by definition never settles. Only
-// call them while the animated thing is actually on screen; guarding on visibility is how the app
-// gets to idle at 20 Hz when nothing is moving.
+// BOTH request ambient frames at 30 Hz. Call only while the animated thing is on screen;
+// guarding on visibility is how the app returns to idle when nothing is moving.
 float pulse(float periodSec = kBreathe);
 float phase(float periodSec = kMarch);
 

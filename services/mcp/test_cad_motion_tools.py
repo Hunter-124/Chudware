@@ -19,6 +19,8 @@ import math
 import os
 import sys
 from pathlib import Path
+from contextlib import contextmanager
+from types import SimpleNamespace
 
 _REPO_ROOT = str(Path(__file__).resolve().parents[2])
 if _REPO_ROOT not in sys.path:
@@ -28,8 +30,191 @@ import pytest
 
 from services.mcp import core_bridge as cb
 from services.mcp.cad_motion_tools import (
-    _axis_rotation16, _mat_mul16, _pose_check, _turn_center_2d, steer_pose_sweep,
+    _axis_from_mate, _axis_rotation16, _comp_transforms, _mat_mul16, _pose_check,
+    _turn_center_2d, steer_pose_sweep,
 )
+
+def test_clone_snapshots_live_document_without_rebinding(monkeypatch):
+    from services.mcp.cad_motion_tools import _clone_detached
+    calls = []
+    def call(method, params):
+        calls.append((method, dict(params)))
+        if method == "doc_save":
+            assert params["doc_id"] == "unsaved-live"
+            assert params["preserve_path"] is True
+            Path(params["path"]).write_bytes(b"live-revision")
+            return {"revision": 9, "path": params["path"]}
+        if method == "doc_open":
+            assert Path(params["path"]).read_bytes() == b"live-revision"
+            assert params["detach_path"] is True
+            return {"doc_id": "clone"}
+        raise AssertionError(method)
+    monkeypatch.setattr(cb, "call", call)
+    assert _clone_detached("unsaved-live", "motion") == "clone"
+    assert [method for method, _ in calls] == ["doc_save", "doc_open"]
+    assert not Path(calls[0][1]["path"]).exists()
+
+@pytest.fixture
+def motion_tools():
+    from services.mcp.cad_motion_tools import register_cad_motion_tools
+
+    class Capture:
+        def __init__(self):
+            self.tools = {}
+
+        def tool(self):
+            def register(fn):
+                self.tools[fn.__name__] = fn
+                return fn
+            return register
+
+    capture = Capture()
+    register_cad_motion_tools(capture)
+    return capture.tools
+
+
+def test_envelope_uses_nonpersisting_motion_and_reports_sampled_bounds(monkeypatch, motion_tools):
+    from services.mcp import cad_motion_tools as motion
+
+    ident = list(motion._IDENT16)
+    calls = []
+    monkeypatch.setattr(motion, "_doc", lambda doc: doc)
+    monkeypatch.setattr(motion, "_resolve_components", lambda doc, wanted: [{"id": "c1"}])
+
+    def sweep(doc, **kwargs):
+        calls.append(kwargs)
+        return {"ok": True, "pose_check": {"ok": True}, "mate_id": "m1",
+                "reference_transforms": {"c1": ident},
+                "reference_bodies": [{"component": "c1",
+                                      "bbox": {"min": [0, 0, 0], "max": [3, 4, 0]}}],
+                "trajectory": [{"i": i, "value": i,
+                                "bodies": [{"component": "c1", "transform": ident}]}
+                               for i in range(2)],
+                "interference": {"checked": True, "complete": True}}
+
+    monkeypatch.setattr(motion, "run_motion_sweep", sweep)
+    out = json.loads(motion_tools["sweep_envelope"](
+        doc_id="asm", mate_id="m1", start=0, stop=1, steps=2, min_clearance_mm=2))
+    assert out["ok"], out
+    assert calls[0]["persist_study"] is False
+    assert calls[0]["check_interference"] is True
+    assert calls[0]["min_clearance_mm"] == 2
+    assert out["envelope_method"] == "conservative_sampled_world_aabb"
+    assert out["overshoot_bound_mm"]["c1"] == pytest.approx(5)
+    assert out["interference"]["complete"] is True
+
+def test_fused_envelope_exports_current_source_each_time(monkeypatch, motion_tools):
+    from services.mcp import cad_motion_tools as motion
+
+    ident = list(motion._IDENT16)
+    events = []
+    monkeypatch.setattr(motion, "_doc", lambda doc: doc)
+    monkeypatch.setattr(motion, "_resolve_components",
+                        lambda doc, wanted: [{"id": "c1", "name": "arm"}])
+    monkeypatch.setattr(motion, "component_source_file", lambda comp, doc: "/part.step+")
+    monkeypatch.setattr(motion, "_tmp", lambda suffix: "/tmp/motion-test.step")
+    monkeypatch.setattr(motion, "_publish_current", lambda doc: None)
+    monkeypatch.setattr(motion, "run_motion_sweep", lambda *args, **kwargs: {
+        "ok": True, "pose_check": {"ok": True}, "reference_transforms": {"c1": ident},
+        "reference_bodies": [{"component": "c1",
+                              "bbox": {"min": [0, 0, 0], "max": [1, 1, 1]}}],
+        "trajectory": [{"i": i, "bodies": [{"component": "c1", "transform": ident}]}
+                       for i in range(2)]})
+
+    @contextmanager
+    def source(path):
+        doc = f"source-revision-{sum(e[0] == 'open' for e in events)}"
+        events.append(("open", path))
+        try:
+            yield doc
+        finally:
+            events.append(("close", doc))
+
+    def call(method, args):
+        if method == "doc_export_step":
+            events.append(("export", args["doc_id"]))
+            return {}
+        if method == "doc_new":
+            return {"doc_id": "swept"}
+        if method == "doc_apply_ops":
+            return {"rebuild": {"feature_status": []}}
+        if method == "eval_mass":
+            return {"volume_mm3": 1, "body_count": 1}
+        if method == "doc_bbox":
+            return {"min": [0, 0, 0], "max": [1, 1, 1], "size": [1, 1, 1]}
+        raise AssertionError(method)
+
+    monkeypatch.setattr(motion, "open_component_part", source)
+    monkeypatch.setattr(motion.cb, "call", call)
+    for _ in range(2):
+        out = json.loads(motion_tools["sweep_envelope"](
+            doc_id="asm", mate_id="m", start=0, stop=1, steps=2, fuse=True))
+        assert out["ok"], out
+    assert [e[1] for e in events if e[0] == "export"] == [
+        "source-revision-0", "source-revision-1"]
+    assert [e[0] for e in events] == ["open", "export", "close"] * 2
+
+
+def test_fea_sweep_preserves_setup_refusal(monkeypatch, motion_tools):
+    from services.mcp import cad_motion_tools as motion
+
+    monkeypatch.setattr(motion, "_doc", lambda doc: doc)
+    monkeypatch.setattr(motion, "_solve_sync_or_handoff", lambda kind, fn: fn())
+
+    @contextmanager
+    def refused(*args, **kwargs):
+        raise motion._HandoffRefused({"ok": False, "error": "unbalanced",
+                                      "setup_diagnostics": {"mate": "m1"}})
+        yield
+
+    monkeypatch.setattr(motion, "handoff_setup", refused)
+    out = json.loads(motion_tools["motion_fea_handoff_sweep"](
+        component="arm", fixtures=["bottom"], doc_id="asm", mate_id="m1",
+        start=0, stop=10, steps=3))
+    assert out["error"] == "unbalanced"
+    assert out["setup_diagnostics"] == {"mate": "m1"}
+
+
+def test_fea_sweep_shares_setup_and_rejects_zero_duration(monkeypatch, motion_tools):
+    from services.mcp import cad_motion_tools as motion
+
+    calls = []
+    monkeypatch.setattr(motion, "_doc", lambda doc: doc)
+    monkeypatch.setattr(motion, "_solve_sync_or_handoff", lambda kind, fn: fn())
+
+    @contextmanager
+    def setup(doc, component, fixtures, **kwargs):
+        calls.append(("setup", kwargs))
+        try:
+            yield SimpleNamespace(frames=[{"i": i, "t_s": i} for i in range(3)],
+                                  density_sources={"c1": {"source": "component_material",
+                                                          "density_g_cm3": 2.7}})
+        finally:
+            calls.append(("closed",))
+
+    def frame(ctx, selected, **kwargs):
+        calls.append(("frame", selected["i"], kwargs))
+        return {"ok": True, "frame": selected, "fea": {"ok": True, "summary": {
+            "max_von_mises_mpa": 10 + selected["i"], "min_fos": 2}}}
+
+    monkeypatch.setattr(motion, "handoff_setup", setup)
+    monkeypatch.setattr(motion, "handoff_frame", frame)
+    tool = motion_tools["motion_fea_handoff_sweep"]
+    args = dict(component="arm", fixtures=["bottom"], doc_id="asm",
+                mate_id="m1", start=0, stop=10, steps=3)
+    refused = json.loads(tool(**args, dynamics={"duration_s": 0}))
+    assert not refused["ok"]
+    assert "duration_s" in refused["error"]
+    assert calls == []
+    out = json.loads(tool(**args, positions=[0.1, 9.9], dynamics={"duration_s": 2}))
+    assert out["ok"], out
+    assert out["density_sources"]["c1"] == {"source": "component_material",
+                                            "density_g_cm3": 2.7}
+    assert [r["position"] for r in out["positions"]] == [0, 10]
+    assert [c[0] for c in calls] == ["setup", "frame", "frame", "closed"]
+    assert [c[1] for c in calls if c[0] == "frame"] == [0, 2]
+    assert all(c[2]["dry_run"] is False for c in calls if c[0] == "frame")
+    assert out["worst"]["position"] == 10
 
 # The test vehicle, in mm. Wheels are Ø600 x 200 discs whose kingpin bore runs vertically
 # through the wheel centre, so the closed-form Ackermann geometry is exactly the one the
@@ -300,11 +485,59 @@ def test_the_kingpin_axis_can_come_from_the_concentric_mate(rover):
                   "mate_ids": [rover["mates"]["FL"], rover["mates"]["FR"]],
                   "angle_deg": 30}})
     assert by_mate["ok"], by_mate
-    # Compare the consumer's geometry, not an arbitrary point along the axis.
-    # Mate selectors carry OCCT surface centroids rounded to 1e-6 mm, then
-    # transported through solved placements; their coordinates are not exact datums.
+    for tag, axis in zip(("FL", "FR"), by_mate["driver"]["axes"]):
+        assert axis["point"][:2] == pytest.approx(STATIONS[tag], abs=1e-8)
+        assert axis["dir"] == pytest.approx([0, 0, 1], abs=1e-10)
     assert by_mate["turning_radius_mm"] == pytest.approx(
         by_axis["turning_radius_mm"], rel=1e-6)
+
+    wrong_mate = _call("steering_turning_radius", {
+        "doc_id": rover["doc_id"], "steps": 3,
+        "steer": {"components": ["wheel_FL"], "mate_id": rover["mates"]["RL"],
+                  "angle_deg": 30}})
+    assert not wrong_mate["ok"] and "does not reference" in wrong_mate["error"], wrong_mate
+
+    # A half-cylinder has an off-axis centroid, and its offset is deliberately
+    # not representable by the selector's 1e-6 mm rounding.
+    x, y = 0.123456789, -0.234567891
+    part = _part("tm_trimmed_pin", [
+        cb.feat("cylinder", "Pin", {"radius": cb.dim(10), "height": cb.dim(30),
+                                    "at": [x, y, 0]}),
+        cb.feat("box", "Trim", {"length": cb.dim(12), "width": cb.dim(30),
+                                "height": cb.dim(40), "centered": False,
+                                "at": [x, y - 15, -20], "mode": "cut"}),
+    ], Path(rover["path"]).parent)
+    asm = _call("new_assembly", {"name": "tm_precise_axis"})["doc_id"]
+    try:
+        pose = {"at": [100, 50, -4], "rotate": [1, 0, 0], "angle": 37}
+        fixed = _call("asm_add_component", {"doc_id": asm, "path": part, "fixed": True, **pose})
+        moving = _call("asm_add_component", {"doc_id": asm, "path": part, "fixed": False, **pose})
+        assert fixed["ok"] and moving["ok"], (fixed, moving)
+        mate = _call("asm_mate", {"doc_id": asm, "mate_type": "concentric",
+                                  "a": {"component": fixed["component"],
+                                        "query": {"of": "face", "surf": "cylinder"}},
+                                  "b": {"component": moving["component"],
+                                        "query": {"of": "face", "surf": "cylinder"}}})
+        assert mate["ok"] and mate["converged"], mate
+        tree = cb.call("doc_tree", {"doc_id": asm})["tree"]
+        selector = next(m for m in tree["mates"] if m["id"] == mate["mate"])["refs"][1]["selector"]
+        assert abs(selector["centroid"][0] - x) > 1
+        assert "mate_axes" not in cb.call("asm_world_bodies", {"doc_id": asm})
+        measured = cb.call("asm_world_bodies", {"doc_id": asm, "include_mate_axes": True})
+        local = next(r for r in measured["mate_axes"][mate["mate"]]
+                     if r["component"] == moving["component"])
+        assert local["point"][:2] == pytest.approx([x, y], abs=1e-10)
+        axis = _axis_from_mate(asm, mate["mate"], moving["component"],
+                               _comp_transforms(asm), measured["mate_axes"])
+        sine, cosine = math.sin(math.radians(37)), math.cos(math.radians(37))
+        assert axis["dir"] == pytest.approx([0, -sine, cosine], abs=1e-10)
+        delta = [axis["point"][0] - (100 + x),
+                 axis["point"][1] - (50 + y * cosine),
+                 axis["point"][2] - (-4 + y * sine)]
+        assert delta[0] == pytest.approx(0, abs=1e-10)
+        assert delta[1] * cosine + delta[2] * sine == pytest.approx(0, abs=1e-10)
+    finally:
+        cb.call("doc_close", {"doc_id": asm})
 
 
 def test_check_interference_names_the_first_steer_angle_that_clashes(rover):
@@ -347,6 +580,43 @@ def test_check_interference_names_the_first_steer_angle_that_clashes(rover):
     assert rover["ids"]["FL"][1] in (pair["component_a"], pair["component_b"])
     assert pair["overlap_volume_mm3"] > 0
     assert locked["trajectory"][-1]["collision_detail"][0] == pair
+
+
+@pytest.mark.parametrize("status", ["below", "within_tolerance"])
+def test_steer_clearance_hits_and_uncertainty_are_reported(rover, monkeypatch, status):
+    original = cb.call
+    seen = []
+
+    def check(op, args=None, **kwargs):
+        if op != "eval_interference":
+            return original(op, args, **kwargs)
+        seen.append(args["min_clearance_mm"])
+        report = original(op, args, **kwargs)
+        report.setdefault("clearances", []).append({
+            "component_a": "near-a", "component_b": "near-b", "distance": 1.0,
+            "distance_status": "exact", "clearance_status": status,
+            "warning": ("below min clearance" if status == "below"
+                        else "within min clearance tolerance")})
+        return report
+
+    monkeypatch.setattr(cb, "call", check)
+    out = _call("steering_turning_radius", {
+        "doc_id": rover["doc_id"], "steps": 2, "min_clearance_mm": 2.0,
+        "steer": {"components": ["wheel_FL", "wheel_FR"],
+                  "axis": _axis("FL", "FR"), "angle_deg": 20}})
+    assert seen == [2.0, 2.0]
+    assert out["interference"]["checked"] is True
+    if status == "below":
+        assert out["ok"], out
+        hit = next(h for h in out["trajectory"][0]["collision_detail"]
+                   if h.get("component_a") == "near-a")
+        assert hit["distance"] == 1.0
+        assert hit["warning"] == "below min clearance"
+    else:
+        assert not out["ok"]
+        assert not out["interference"]["complete"]
+        assert any(f.get("reason") == "clearance_within_tolerance"
+                   for f in out["interference"]["pair_failures"])
 
 
 @pytest.mark.parametrize("failure,failed_step", [
@@ -744,7 +1014,7 @@ def test_multi_driver_motion_carries_joint_frame_and_reuses_checked_start(motion
     before = cb.call("doc_tree", {"doc_id": doc})["tree"]
     # Descendant first deliberately: declaration order is not kinematic dependency order.
     out = _call("simulate_motion", {
-        "doc_id": doc, "steps": 3, "loop": True, "check_interference": True,
+        "doc_id": doc, "steps": 3, "loop": True, "check_interference": True, "persist_study": True,
         "drivers": [{"mate_id": mates["roll"], "start": 15, "stop": 75},
                     {"mate_id": mates["steer"], "start": 0, "stop": 30}],
     })

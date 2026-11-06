@@ -39,6 +39,7 @@ from ..baseline import Baseline, pending_frontier
 from ..corpus.regen_corpus import load_good, load_labels
 from ..metrics import mean, pass_rate, roc_auc, residual as residual_metric
 from ..schema import BenchResult, ExampleScore
+from services.agent.regen_verify import make_live_verifier, verify_live
 
 VALID_SELECTOR_KINDS = {"face", "edge", "vertex", "body", "datum", "region", "plane"}
 _PARAM_FLOOR_DEFAULT = 1.0
@@ -185,142 +186,27 @@ def _intent_preserved(document: dict, intent_dims: dict) -> bool:
 
 
 
-# ---- live-core binary verifier (guarded) ------------------------------------
-# The AUTHORITATIVE verifier: apply candidate fix -> rebuild passes AND
-# compare_parts ≈100% vs the known-good part on unaffected bodies. A fix that rebuilds but
-# altered geometry scores 0. Load via doc_new + canonical doc ops, remapping authored feature ids
-# to the engine's newly minted ids; failure surfaces as a raised CoreError (schema) OR
-# a feature_status entry with ok=false (geometry); compare = eval_compare -> match_pct.
-
-LIVE_MATCH_THRESHOLD = 99.5  # match_pct >= this == "unaffected bodies compare ≈100%"
-
-
-def _core_err(e) -> str:
-    detail = getattr(e, "detail", None)
-    if isinstance(detail, dict) and detail.get("reason"):
-        return f"{type(e).__name__}: {e} ({detail['reason']})"[:200]
-    return f"{type(e).__name__}: {e}"[:200]
-
-
-
-def _document_ops(tree: dict) -> list[dict]:
-    """Replay source geometry, not compiled/readback fields hoisted as feature params."""
-    if tree.get("schema", "aicad.part/1") != "aicad.part/1":
-        raise ValueError("regen verifier requires a part document")
-    if tree.get("rollback_after"):
-        raise ValueError("regen verifier cannot replay an active rollback bar with doc ops")
-    ops = []
-    if tree.get("units"):
-        ops.append({"op": "set_units", "system": tree["units"]["system"]})
-    if tree.get("material"):
-        ops.append({"op": "set_material", "key": tree["material"]["key"]})
-    ops.extend({"op": "eq_set", "name": g["name"], "expr": g["expr"]}
-               for g in tree.get("equations", {}).get("globals", []))
-    features = tree.get("features", [])
-    mapping = {f["id"]: f"${len(ops) + i}" for i, f in enumerate(features)}
-
-    def remap(value):
-        if isinstance(value, str):
-            return mapping.get(value, value)
-        if isinstance(value, list):
-            return [remap(v) for v in value]
-        if isinstance(value, dict):
-            return {k: remap(v) for k, v in value.items()}
-        return value
-
-    for feature in features:
-        envelope = {k: copy.deepcopy(feature[k])
-                    for k in ("type", "name", "suppressed", "params", "refs", "folder")
-                    if k in feature}
-        for key in ("params", "refs"):
-            if key in envelope:
-                envelope[key] = remap(envelope[key])
-        ops.append({"op": "add_feature", "feature": envelope})
-    return ops
-
-
-def _make_live_verifier():
-    """Return (opener, compare_fn) bound to the C++ core, or (None, None) when it can't be
-    located/loaded — never a hardcoded path (resolution is core_bridge's, via
-    $CHUDWARE_LIBCHUDWARE / $CHUDWARE_DIST / build dirs).
-
-        opener(document) -> {"doc_id": str|None, "rebuilt": bool, "error": str|None}
-        compare_fn(a, b) -> match_pct float|None   (100 == identical; None == degraded)
-    """
-    try:
-        from services.mcp import core_bridge as cb  # Core-only path.
-    except Exception:
-        return None, None
-    if not cb.available():
-        return None, None
-
-    def close(doc_id: str) -> None:
-        cb.call("doc_close", {"doc_id": doc_id})
-
-    def opener(document: dict) -> dict:
-        tree = document.get("tree", document)
-        doc_id = None
-        try:
-            ops = _document_ops(tree)
-            doc_id = cb.call("doc_new", {"kind": "part", "name": tree.get("name", "regen_doc"),
-                                         "internal": True})["doc_id"]
-            resp = cb.call("doc_apply_ops", {"doc_id": doc_id, "ops": ops, "with_tess": False})
-            authored = iter(tree.get("features", []))
-            source_ids = {}
-            for index, op in enumerate(ops):
-                if op["op"] == "add_feature":
-                    feature = next(authored)
-                    minted = (resp.get("id_map") or {}).get(f"${index}")
-                    if minted:
-                        source_ids[minted] = feature["id"]
-            fs = (resp.get("rebuild", {}) or {}).get("feature_status") or resp.get("feature_status") or []
-            bad = [f'{source_ids.get(s.get("id"), s.get("id"))}: {s.get("error")}'
-                   for s in fs if not s.get("ok", True)]
-            if bad:
-                close(doc_id)
-                return {"doc_id": None, "rebuilt": False, "error": "; ".join(bad)}
-            return {"doc_id": doc_id, "rebuilt": True, "error": None}
-        except Exception as e:
-            if doc_id:
-                close(doc_id)
-            return {"doc_id": None, "rebuilt": False, "error": _core_err(e)}
-
-    opener.close = close
-
-    def compare_fn(a: str, b: str):
-        try:
-            r = cb.call("eval_compare", {"doc_a": a, "doc_b": b})
-        except Exception:
-            return None
-        return None if r.get("degraded") else r.get("match_pct")
-
-    return opener, compare_fn
+# ---- live-core binary verifier ------------------------------------------------
+# The AUTHORITATIVE verifier lives in services.agent.regen_verify (shared with the
+# regen_diagnose tool): apply candidate fix -> rebuild passes AND compare_parts ≈100% vs the
+# known-good part on unaffected bodies. A fix that rebuilds but altered geometry scores 0.
 
 
 # ---- shared binary verifier -------------------------------------------------
-
-def _verification_error(detail: dict, why: str):
-    """The live verifier itself could not judge the fix: a grader/infra ERROR, scored as
-    not-fixed. It never falls back to the structural fixture checks — those would credit a
-    repair whose rebuild nobody observed."""
-    detail["verdict"] = "error"
-    detail["live_error"] = why[:200]
-    return 0.0, False, detail
-
 
 def verify_fix(fixed: dict, claimed: bool, intent_dims: dict, *,
                good_document: Optional[dict] = None, opener=None, compare_fn=None):
     """Score one candidate fix. Returns (score{0.0|1.0}, passed, detail).
 
     Live mode (opener + compare_fn + good_document present): binary — pass iff the fix rebuilds
-    AND compare_parts vs the known-good part >= LIVE_MATCH_THRESHOLD. If the live verifier
-    itself fails (an opener/compare exception, the known-good reference not rebuilding, or a
-    degraded compare), the example is ``detail["verdict"] == "error"`` and NOT fixed; the
-    structural fields stay in ``detail`` as diagnostics only. Fixture mode (offline, no live
-    verifier configured): structural — pass iff the strategy CLAIMED a fix, the anomaly is
-    cleared, and no intent dimension drifted. Both are strictly binary (no partial credit): the
-    driver note is explicit that a fix altering unaffected geometry scores 0 even if the
-    rebuild passes.
+    AND compare_parts vs the known-good part >= LIVE_MATCH_THRESHOLD
+    (services.agent.regen_verify.verify_live). If the live verifier itself fails (an
+    opener/compare exception, the known-good reference not rebuilding, or a degraded compare),
+    the example is ``detail["verdict"] == "error"`` and NOT fixed; the structural fields stay
+    in ``detail`` as diagnostics only. Fixture mode (offline, no live verifier configured):
+    structural — pass iff the strategy CLAIMED a fix, the anomaly is cleared, and no intent
+    dimension drifted. Both are strictly binary (no partial credit): the driver note is
+    explicit that a fix altering unaffected geometry scores 0 even if the rebuild passes.
     """
     intent_ok = _intent_preserved(fixed, intent_dims)
     anomaly_gone = not _has_anomaly(fixed)
@@ -328,45 +214,8 @@ def verify_fix(fixed: dict, claimed: bool, intent_dims: dict, *,
                               "intent_preserved": intent_ok, "mode": "fixture"}
 
     if opener is not None and compare_fn is not None and good_document is not None:
-        detail["mode"] = "live"
-        opened = []
-        try:
-            try:
-                res = opener(fixed)
-                if res.get("doc_id"):
-                    opened.append(res["doc_id"])
-            except Exception as e:  # noqa: BLE001
-                return _verification_error(detail, f"opener(fix) {type(e).__name__}: {e}")
-            detail["rebuilt"] = bool(res.get("rebuilt"))
-            if res.get("error"):
-                detail["rebuild_error"] = str(res["error"])[:200]
-            if not (claimed and res.get("rebuilt") and res.get("doc_id")):
-                detail["verdict"] = "fail"
-                return 0.0, False, detail
-            try:
-                good_res = opener(good_document)
-                if good_res.get("doc_id"):
-                    opened.append(good_res["doc_id"])
-            except Exception as e:  # noqa: BLE001
-                return _verification_error(detail, f"opener(known-good) {type(e).__name__}: {e}")
-            if not (good_res.get("rebuilt") and good_res.get("doc_id")):
-                return _verification_error(
-                    detail, f"known-good reference did not rebuild: {good_res.get('error')}")
-            try:
-                match = compare_fn(res["doc_id"], good_res["doc_id"])
-            except Exception as e:  # noqa: BLE001
-                return _verification_error(detail, f"compare {type(e).__name__}: {e}")
-            detail["match_pct"] = match
-            if match is None:
-                return _verification_error(detail, "eval_compare degraded (no match_pct)")
-            passed = bool(match >= LIVE_MATCH_THRESHOLD)
-            detail["verdict"] = "pass" if passed else "fail"
-            return (1.0 if passed else 0.0), passed, detail
-        finally:
-            closer = getattr(opener, "close", None)
-            if closer:
-                for doc_id in opened:
-                    closer(doc_id)
+        return verify_live(fixed, claimed, good_document, opener=opener,
+                           compare_fn=compare_fn, detail=detail)
 
     passed = bool(claimed and anomaly_gone and intent_ok)
     detail["verdict"] = "pass" if passed else "fail"
@@ -428,7 +277,7 @@ def run(corpus_dir: str, dataset_hash: str, *, split: str = "all", limit: Option
     # offline deterministic run stays reproducibly in fixture mode. Degrades to fixture with a
     # recorded reason when the core can't be located.
     if opener is None and compare_fn is None and (live or frontier.available):
-        opener, compare_fn = _make_live_verifier()
+        opener, compare_fn = make_live_verifier()
 
     examples = [score_example(corpus_dir, lab, opener=opener, compare_fn=compare_fn,
                               frontier_fn=frontier_fn) for lab in labels]

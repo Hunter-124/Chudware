@@ -4,11 +4,12 @@
 // (host/cmake/cef.cmake; design: docs/design/cef_webview.md); other builds use
 // NullWebView and never see this header.
 //
-// GL-thread-only public API; CEF's OnPaint delivers BGRA buffers on a CEF
-// thread, which we copy under a mutex and upload to the GL texture on the GL
-// thread in draw().
+// GL-thread-only public API; OnPaint stages changed BGRA pixels under a mutex.
+// draw() uploads changed regions on the GL thread without holding that mutex.
 #pragma once
 
+#include <utility>
+#include <vector>
 #include "ui/widgets/web_view_backend.h"
 
 namespace ui {
@@ -17,6 +18,13 @@ class CefWebView final : public IWebViewBackend {
 public:
     // True when the CEF runtime initialised for this process (see cef_app).
     static bool processReady();
+
+    // Once after all panels draw: hide/throttle browsers absent from this frame.
+    static void finishFrame();
+    // Re-export existing panel cookies for already signed-in vendor login URLs.
+    static void restoreVendorSessions(
+        AppState& st,
+        const std::vector<std::pair<std::string, std::vector<std::string>>>& sites);
 
     CefWebView();
     ~CefWebView() override;

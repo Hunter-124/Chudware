@@ -272,6 +272,9 @@ std::pair<std::array<double, 3>, std::array<double, 3>> element_endpoints(
 // ---------------------------------------------------------------- materials
 
 MaterialProps material_properties(const std::string& material) {
+    // Existing family defaults retain their historical structural values.
+    // Catalog alloy values below use the nominal E and nu in materials/registry.json;
+    // G is the isotropic elastic shear modulus.
     static const std::pair<const char*, MaterialProps> kMaterials[] = {
         {"cedar", {12000.0, 750.0, 0.30}},
         {"df", {11000.0, 690.0, 0.30}},
@@ -281,15 +284,39 @@ MaterialProps material_properties(const std::string& material) {
         {"aluminum", {69000.0, 26000.0, 0.33}},
     };
     const std::string key = lower(strip(material));
+    if (key == "6061-t6" || key == "6061" || key == "aluminum_6061_t6" ||
+        key == "alu_6061" || key == "aluminium 6061-t6" ||
+        key == "aluminum 6061-t6" || key == "aluminium" || key == "al" ||
+        key == "alu") return kMaterials[5].second;
+    const auto isotropic = [](double E, double nu) {
+        return MaterialProps{E, E / (2.0 * (1.0 + nu)), nu};
+    };
+    if (key == "7075-t6" || key == "aluminum_7075_t6" || key == "alu_7075_t6")
+        return isotropic(71700.0, 0.33);
+    if (key == "1018" || key == "steel_1018" || key == "aisi 1018")
+        return isotropic(200000.0, 0.29);
+    if (key == "304" || key == "stainless_304")
+        return isotropic(193000.0, 0.29);
+    if (key == "360-brass" || key == "brass_c360" || key == "c360" || key == "brass")
+        return isotropic(97000.0, 0.34);
+    if (key == "acrylic" || key == "acrylic_pmma")
+        return isotropic(3200.0, 0.37);
+    if (key == "polycarbonate")
+        return isotropic(2300.0, 0.37);
     for (const auto& [fam, props] : kMaterials) {
-        if (key == fam || starts_with(key, fam)) return props;
+        if (key == fam) return props;
     }
-    for (const char* w : {"douglas", "fir", "lumber", "wood"}) {
-        if (starts_with(key, w)) return kMaterials[1].second;
+    if (key == "steel_a36" || key == "steel_a992") return kMaterials[3].second;
+    for (const char* w : {"cedar", "df", "spf", "douglas", "fir", "lumber", "wood"}) {
+        if (starts_with(key, w)) {
+            if (starts_with(key, "cedar")) return kMaterials[0].second;
+            if (starts_with(key, "spf")) return kMaterials[2].second;
+            return kMaterials[1].second;
+        }
     }
-    if (starts_with(key, "alu")) return {69000.0, 26000.0, 0.33};
+    if (starts_with(key, "concrete_")) return kMaterials[4].second;
     throw std::invalid_argument("unsupported structural material '" + material +
-                                "'; provide a known steel, wood, concrete, or aluminum key");
+                                "'; no structural elastic properties are available");
 }
 
 // ---------------------------------------------------------------- sections
@@ -304,11 +331,18 @@ const std::pair<const char*, std::array<double, 4>> kNamedIShapes[] = {
     {"W310X165", {310.0, 165.0, 7.5, 11.8}},
 };
 
-std::vector<double> dims_of(const std::string& key) {
-    static const std::regex re(R"(\d+(?:\.\d+)?)");
+std::vector<double> dims_of(const std::string& text) {
+    static const std::regex sequence(
+        R"(\s*(?:\d+(?:\.\d*)?|\.\d+)(?:E[+-]?\d+)?(?:\s*X\s*(?:\d+(?:\.\d*)?|\.\d+)(?:E[+-]?\d+)?)*\s*)");
+    static const std::regex number(R"((?:\d+(?:\.\d*)?|\.\d+)(?:E[+-]?\d+)?)");
+    if (!std::regex_match(text, sequence)) return {};
     std::vector<double> out;
-    for (std::sregex_iterator it(key.begin(), key.end(), re), end; it != end; ++it) {
-        out.push_back(std::stod(it->str()));
+    try {
+        for (std::sregex_iterator it(text.begin(), text.end(), number), end; it != end; ++it) {
+            out.push_back(std::stod(it->str()));
+        }
+    } catch (const std::out_of_range&) {
+        throw std::invalid_argument("section dimensions are outside the representable range");
     }
     return out;
 }
@@ -363,6 +397,24 @@ std::array<double, 6> circular_hollow_props(double od, double t,
     const double A = pi * (od * od - id * id) / 4.0;
     const double I = pi * (od * od * od * od - id * id * id * id) / 64.0;
     return {A, I, I, 2.0 * I, I / (od / 2.0), I / (od / 2.0)};
+}
+
+std::array<double, 6> circular_solid_props(double diameter) {
+    constexpr double pi = 3.14159265358979323846;
+    const double d2 = diameter * diameter;
+    const double I = pi * d2 * d2 / 64.0;
+    return {pi * d2 / 4.0, I, I, 2.0 * I, 2.0 * I / diameter, 2.0 * I / diameter};
+}
+
+std::array<double, 6> hex_solid_props(double flats) {
+    // Flats parallel to local z: height is flats, width is 2*flats/sqrt(3).
+    constexpr double root3 = 1.73205080756887729353;
+    const double d2 = flats * flats;
+    const double A = root3 * d2 / 2.0;
+    const double I = 5.0 * root3 * d2 * d2 / 144.0;
+    // Saint-Venant torsion approximation for a regular hexagon, not the polar moment.
+    const double J = 0.133 * A * d2;
+    return {A, I, I, J, 2.0 * I / flats, root3 * I / flats};
 }
 
 std::array<double, 6> i_props(double h, double b, double tw, double tf,
@@ -434,40 +486,53 @@ SectionProps section_properties(const std::string& section_name, const std::stri
         }
     }
 
-    const auto d = dims_of(key);
-    require_dims(d, section_name);
-    if (!have && starts_with(key, "I")) {
-        if (d.size() != 4) {
-            throw std::invalid_argument("I-section '" + section_name +
-                                        "' requires HxBxTWxTF dimensions");
-        }
-        p = i_props(d[0], d[1], d[2], d[3], section_name);
-        have = true;
-    } else if (!have && (starts_with(key, "RHS") || starts_with(key, "HSS"))) {
-        if (d.size() != 3) {
-            throw std::invalid_argument("hollow section '" + section_name +
-                                        "' requires WxHxT dimensions");
-        }
-        p = hollow_rect_props(d[0], d[1], d[2], section_name);
-        have = true;
-    } else if (!have && (starts_with(key, "CHS") || starts_with(key, "PIPE"))) {
-        if (d.size() != 2) {
-            throw std::invalid_argument("circular section '" + section_name +
-                                        "' requires ODxT dimensions");
-        }
-        p = circular_hollow_props(d[0], d[1], section_name);
-        have = true;
-    } else if (!have && starts_with(key, "W")) {
-        throw std::invalid_argument("unknown steel section '" + section_name + "'");
-    } else if (!have && d.size() == 2) {
-        p = rect_props(d[0], d[1]);
-        have = true;
-    } else if (!have && d.size() == 3) {
-        p = hollow_rect_props(d[0], d[1], d[2], section_name);
-        have = true;
-    }
     if (!have) {
-        throw std::invalid_argument("unsupported structural section '" + section_name + "'");
+        std::string body = key;
+        enum class Shape { generic, i, hollow_rect, hollow_circle, round, hex, rect };
+        Shape shape = Shape::generic;
+        size_t required = 0;
+        if (starts_with(key, "ROUND")) {
+            shape = Shape::round; body = key.substr(5); required = 1;
+        } else if (starts_with(key, "HEX")) {
+            shape = Shape::hex; body = key.substr(3); required = 1;
+        } else if (starts_with(key, "RECT")) {
+            shape = Shape::rect; body = key.substr(4); required = 2;
+        } else if (starts_with(key, "RHS") || starts_with(key, "HSS")) {
+            shape = Shape::hollow_rect; body = key.substr(3); required = 3;
+        } else if (starts_with(key, "CHS")) {
+            shape = Shape::hollow_circle; body = key.substr(3); required = 2;
+        } else if (starts_with(key, "PIPE")) {
+            shape = Shape::hollow_circle; body = key.substr(4); required = 2;
+        } else if (starts_with(key, "I")) {
+            shape = Shape::i; body = key.substr(1); required = 4;
+        } else if (starts_with(key, "W")) {
+            throw std::invalid_argument("unknown steel section '" + section_name + "'");
+        }
+        const auto d = dims_of(body);
+        if ((required && d.size() != required) ||
+            (!required && d.size() != 2 && d.size() != 3)) {
+            throw std::invalid_argument("section '" + section_name +
+                                        "' requires valid dimensional section values in mm");
+        }
+        require_dims(d, section_name);
+        switch (shape) {
+            case Shape::round: p = circular_solid_props(d[0]); break;
+            case Shape::hex: p = hex_solid_props(d[0]); break;
+            case Shape::rect: p = rect_props(d[0], d[1]); break;
+            case Shape::hollow_circle: p = circular_hollow_props(d[0], d[1], section_name); break;
+            case Shape::hollow_rect: p = hollow_rect_props(d[0], d[1], d[2], section_name); break;
+            case Shape::i: p = i_props(d[0], d[1], d[2], d[3], section_name); break;
+            case Shape::generic:
+                p = d.size() == 2 ? rect_props(d[0], d[1])
+                                  : hollow_rect_props(d[0], d[1], d[2], section_name);
+                break;
+        }
+        for (double value : p) {
+            if (!std::isfinite(value) || value <= 0.0) {
+                throw std::invalid_argument("section '" + section_name +
+                                            "' has non-finite or non-positive properties");
+            }
+        }
     }
     return {mp.E, mp.G, mp.nu, p[0], p[1], p[2], p[3], p[4], p[5]};
 }

@@ -1,15 +1,8 @@
 # Deterministic Engineering Twin — Final Design (DoD v4)
 
-Owner: `TwinArchitecture` / `TwinDesignRecovery`. Design-only: this document specifies the twin;
-it records no implementation change by itself.
-
-Everything below is bound to `00_decisions.md` and `01_definition_of_done.md`, and to the rulings
-already accepted across the design corpus (Gateway owns the controller vocabulary; UX owns the sole
-external `FreshValue<T>`; Gateway owns durable `seq`; Metrology owns offsets).
-
-Grounding: `core/cam/stock_sim.h`, `core/cam/stock_sim.cpp`, `core/mate/mate.h`,
-`core/firmware/sim_sensor_bridge.cpp`, `core/CMakeLists.txt` target wiring, the twin-reuse audit
-and the controller-ecosystem research. Line references are to those files as read on 2026-08-08.
+Design proposal. See the [as-built map](README.md#as-built-map) for the implemented subset.
+The gateway defines the controller vocabulary and durable `seq`; the external freshness
+shape is `FreshValue<T>`, and metrology defines offset proposals.
 
 ---
 
@@ -1005,7 +998,7 @@ be flipped by a procedural fact, by simulated, declared, advisory or assumed evi
 number of passing E0-E3 runs. `test_twin_contracts.cpp`
 attempts each of the four forbidden flips and asserts refusal.
 
-Guard audit (DoD v4 §22, and the "does a value failing this guard already fail Stage 1?" test):
+Guard liveness (DoD criteria 8 and 19, including whether a failure is already rejected at Stage 1):
 
 All three surviving guards declare `accepts{subject_ns: [art:, job:], admission: [procedural_fact]}`.
 No twin guard accepts `dev:` or `src:` subjects, and none accepts `probed`, `simulated`, `declared`,
@@ -1023,7 +1016,7 @@ equality requirement; a twin guard can therefore never stand in for one that doe
 | `twin_trace_hash_matches` | **Kept** | Can pass (clean replay) and can fail (seeded divergence fixture). |
 | `twin_no_unsupported_geometry_event` | **Kept** | Can pass and can fail (fixture program that trips `UnsupportedGeometry`). |
 
-Absent by design, documented per DoD v4 §22: the twin owns **no** Stage-1 admission guard and **no**
+Absent by design, per DoD criterion 8: the twin owns **no** Stage-1 admission guard and **no**
 approval-path gate, because it produces no probed evidence and holds no approval. Its three surviving
 checks are producer-side qualifications of a procedural fact, and `test_twin_contracts.cpp` drives
 each of them to both pass and fail.
@@ -1253,21 +1246,6 @@ stable; export to a `firmware::build_sensor_scenario` scenario succeeds and is o
 
 ---
 
-## 13. Wave order
-
-| Wave | Content | Exit criterion |
-|---|---|---|
-| **T1** | `clock.h`, `entity.h`, `state.h/.cpp`, `profile.h/.cpp`, `fidelity.h/.cpp`, hashing; `test_twin_clock`, `test_twin_fidelity` | Units, ordering, hashing and the declaration table are locked before any physics exists. |
-| **T2** | `core/cam/stock_step.{h,cpp}` extraction + `stock_sim.cpp` delegation | `test_cam` unchanged; coordinated with `TurningArchitecture`. |
-| **T3** | `machine3`, `grbl_emu`, `twin.cpp` reset/step/submit against the Gateway parser; `test_twin_grbl`, `test_twin_motion`; **E0, E1** | The emulator's bytes are accepted by the real Gateway parser; no twin-local parse exists. |
-| **T4** | `bodies`, `collide`, probe phase, stock integration; `test_twin_stock`, `test_twin_collide`; **E2** | Typed episodes, halting, and the `simulate_setup` equivalence test. |
-| **T5** | `faults`, `record` (snapshot/restore/trace/verify); `test_twin_faults`, `test_twin_replay`; **E3** | D2/D7/D10/D11/D12 all green with golden fixtures. |
-| **T6** | `vsensor`, `vcamera`, `twin_rpc`, `twin_cli`, `contracts/manufacturing_twin.md`, `test_twin_camera`, `test_twin_contracts`, `services/manufacturing/twin/**`, `train.h/.cpp`, `test_twin_env`, `docs/TWIN.md` | Contract tests treat every policy boundary in §9.3 as a test; as-built map and developer docs updated in the same green commit. |
-
-T1 and T2 are independent and may run concurrently. T3 depends on the Gateway having landed
-`core/device/grbl_protocol.h`; until then T3's parser calls are compiled against the header the
-Gateway owns and T3 cannot be declared done. Nothing in T4-T6 may land before its own tests.
-
 ---
 
 ## 14. Non-goals
@@ -1318,26 +1296,9 @@ collision-free and not a safety function without making its own test unfireable.
 
 ---
 
-## 15. Review closure (architecture plan review)
+## Gateway rule references
 
-Every row below is a reconciliation of statements already inside the accepted corpus. No product scope
-changed: the twin's ownership, fidelity table, RPC/event surface, E0-E3 set, wave order and non-goals
-are unchanged.
-
-| Finding | Required correction | Applied where | What changed |
-|---|---|---|---|
-| **C5** — §11 and §14 contradict each other on the twin-binary SKIP | §14 adopts §11's wording (exclusion with an asserting test); if a DoD-1 SKIP is retained, name it pre-existing and point it at the owning gate step | §11 gate posture, §14 *Interfaces* | The "asks for exactly one documented SKIP" clause is **deleted**. Both sections now read **zero** new normal-gate SKIPs; the optional `twin_cli` is handled by exclusion behind `scripts/qualify_twin_export.sh`, which `gate.sh` never invokes. `test_twin_contracts.cpp` asserts the twin's `gate.sh` block emits no SKIP and carries no `CHUDWARE_TWIN_BIN` conditional. The DoD-1 allowance is explicitly declined rather than consumed, so no gate step owns a twin SKIP. |
-| **C6** — the prohibited-word grep can never pass against twin's own corpus | Whole claim phrases with word boundaries, multiword claims verbatim, scope to UI/capability/contract surfaces, enumerate allowed exceptions | §7, §11 (`test_twin_fidelity.cpp` row), §14 *Truthfulness*, §1.2 table header | Bare `safe` is **removed** from the list (it is a substring of `safety`, `safety_integration`, `safety_confirmed`, `unsafe` and "full-suite safe"); the list is now ten claim phrases matched `\b…\b`, with `safe to run` / `provably safe` naming the actual claims. Scope narrowed to UI strings, capability text, fidelity basis/known-error strings, refusal and `HaltCause` text, and `contracts/manufacturing_twin.md`; design prose is out of scope so §14's negative statements stay legal. Exceptions enumerated (`safety*`, `unsafe`, "full-suite safe", any listed phrase under explicit negation) and the test carries a positive fixture per phrase plus a negative fixture per exception. §1.2's "Why it is safe" header renamed to "Why the seam is contained" so no claim-shaped header survives at all. |
-| **C8** — capability rows are `FreshValue`-wrapped by three domains and forbidden by a fourth | One ruling: a durable authored row is journaled **and** published wrapped, `ttl_ms:null` and `state:"ok"` for rows that do not decay | §9.2 *Freshness, publication, and admission boundary*; §9.5; §1.3; §1.4; §14 *Interfaces* | The twin still **constructs** no `FreshValue<T>` and stays tick-only internally (`{tick, dt_ns, …}`, no wall time, no `t_mono_ns`/`age_ms`/`ttl_ms`/`seq`/`src`/`admission`). Added the missing half: every durable twin row a UI may paint (`twin_run`, `twin_trace_verification`, `twin_procedural_fact`, `twin_capability`) is journaled through `mfg_event_append` **and** published wrapped by the **Gateway republisher at the process boundary** with `ttl_ms: null`, `state:"ok"` while current, journal-assigned `seq`, `src:"simulated"`. State changes by lineage, never by age — no twin row reads `stale` because time passed. Wrapping publishes and never gates: `src:"simulated"` remains Stage-1-inadmissible wrapped or not, and `procedural_fact` stays the only route to a gate. One shape, one builder, one place. |
-| **Late durable-kind rules** — every domain whose `CapabilityReport` reaches a UI must register a `<domain>.capability` kind, `epoch_invariant`, `supersede_with_parent:false`, `derived_from` = cited evidence, enforced at registration, with a falsify-drops-the-level test | §9.2 kind table + surrounding prose; §9.5; `test_twin_contracts.cpp` row in §11 | Confirmed registered and now cited by stable rule id rather than gateway section number: the twin registers **four** kinds — `twin_run`, `twin_trace_verification`, `twin_procedural_fact`, `twin_capability` — each declaring **both** an epoch policy and runtime triggers. `twin_capability` is `epoch_invariant` with `supersede_with_parent` explicitly **`false`** (`MFG-CAP-NO-PARENT-INHERIT`), `derived_from` = the `twin_procedural_fact` rows for E0-E3 bound to this `twin_build_fp`/`fidelity_id` plus the `twin_trace_verification` rows under them. Advertising `simulate` above `unsupported` without it is refused `mfg_capability_requires_durable_kind`; `twin_procedural_fact` omitting `supersede_with_parent` is refused `mfg_procedural_fact_must_follow_parent`; an unlisted kind is refused `mfg_unregistered_result_kind` with no fallback. Falsifying any single cited evidence row appends a fresh capability row **and** drops `simulate` to `unsupported` with the missing level named. |
-
-**Cross-reference hygiene (C10 applied locally).** The two gateway section citations this document
-carried (`§24.7`, `§24.11`) are replaced by the stable rule ids below. Each id is a handle for a rule
-whose binding text is quoted at the point of use, so a renumbering of the gateway document cannot turn
-a citation into a wrong assertion, and `test_twin_contracts.cpp` keys on ids rather than section
-numbers. If the Gateway registry spells an id differently, only the spelling changes — the quoted rule
-is the obligation.
-
+The twin consumes the following gateway rules:
 | Rule id | Rule as the twin relies on it |
 |---|---|
 | `MFG-FRESHVALUE-SOLE-SHAPE` | UX's `FreshValue<T>` is the sole external/UI/event freshness shape; no second definition exists repo-wide. |
@@ -1355,12 +1316,3 @@ is the obligation.
 | `MFG-SUBJECT-NS-DECLARED` | A domain declares its permitted subject namespaces at registration; an append naming an undeclared namespace is refused `mfg_subject_namespace_not_permitted`. |
 | `MFG-ZERO-NEW-SKIP` | The batch adds zero new `gate.sh` SKIPs; an unavailable optional dependency is handled by exclusion from `gate.sh` plus a capability pinned at `assumed` with the missing level named — never by a SKIP. |
 
-**Re-verified, no change needed.** The review's remaining twin-touching statements were audited against
-this document and found already compliant, and are listed so a later edit cannot regress them: single
-invalidation event name plus `class` (C3 — `mfg.twin.invalidated`, name-splitting explicitly not
-implemented); `procedural_fact` as the twin's only admission route and its flip bound to `simulate`
-(B1, `MFG-PF-FLIP-SCOPE`); no twin-local `seq` (B8, `MFG-SEQ-SINGLE-WRITER`); `CapabilityTruth`
-composed verbatim with `probed` never used as a truth value (B7); registration through
-`view(mcp, "manufacture")` with the family off by default (B12); no-device-path levels reported
-`unsupported` **with a why**, never `not_applicable` and never `assumed` (C7's shape, which the twin
-already uses); and fixtures under `fixtures/mfg/twin/**` (C9's ratified root).

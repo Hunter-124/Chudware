@@ -66,7 +66,7 @@ __all__ = [
 #                      qwen3-4b's GBNF path is BROKEN (thinking-mode vs grammar
 #                      deadlock; bench GBNF success 0.0) so it uses prompted-JSON
 #                      + roles.validate_handoff (bench JSON first-pass 1.00).
-#                      gemma3-4b-qat follows schema_to_gbnf grammars at 100%.
+#                      gemma3-4b-qat follows GBNF grammars at 100%.
 #   capability_profile Optional "A"|"B"|"C" override (harness-tiers-spec §0.1).
 #                      When set, wins over the tier's capability_profile for
 #                      resolve_capability(tier, model_id). Default: unset →
@@ -395,14 +395,13 @@ def get_model_path(model_id: str) -> Path | None:
 def structured_output_for(model_id: str, default: str = "gbnf") -> str:
     """Return how *model_id* must produce structured handoffs on the local runtime.
 
-    ``"gbnf"`` — pass a ``roles.schema_to_gbnf`` grammar to llama-server;
+    ``"gbnf"`` — pass a GBNF grammar to llama-server;
     ``"prompted_json"`` — prompt for JSON and validate via
     ``roles.validate_handoff`` (retry on failure).
 
-    This is the ONE lookup the turn path uses to honour the benchmark finding that
-    a tier's ``structured_output: gbnf`` setting must be downgraded per-model
-    when the model's grammar path is broken (qwen3-4b). Unknown models fall back
-    to *default* (the tier's own setting).
+    This is the lookup for the benchmark finding that structured-output handling
+    must be downgraded per-model when the model's grammar path is broken
+    (qwen3-4b). Unknown models fall back to *default*.
     """
     entry = _REGISTRY.get(model_id)
     if entry is None:

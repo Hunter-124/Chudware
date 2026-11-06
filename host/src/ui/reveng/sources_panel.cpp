@@ -1,13 +1,13 @@
 // sources_panel.cpp — the Sources stage of the Reverse Engineering wizard (RE-40 rebuild).
 //
-// This is the stage an engineer spends most of their time in: it is where a physical part on the
-// bench becomes pixels the pipeline can reconstruct. Four lanes, chosen by the source-mode control
-// in the workspace shell:
+// This is where a part enters the pipeline. Two intake lanes, chosen by the selector in the
+// workspace shell:
 //
-//   Scan        — webcam console, file picker, video ingest and phone capture, plus the gallery.
-//   Datasheet   — PDF/image spec sheet -> reveng_ingest_datasheet -> straight to Model.
-//   Web+Part#   — part number / URL / query -> reveng_research_source -> straight to Model.
-//   FromLibrary — seeded externally by the Parts Library; shows the routed mode read-only.
+//   Scan           — webcam console, file picker, video ingest and phone capture, plus the gallery.
+//   From reference — part number / name / URL. FIRST an existing CAD model is searched for
+//                    (reveng_find_models over GrabCAD, TraceParts, Printables, ...) and adopted with
+//                    reveng_use_model; only when nothing fits is one built from documents
+//                    (reveng_research_source / reveng_ingest_datasheet), which costs real work.
 //
 // Everything is drawn with ui::reveng::kit so all six stages read as one wizard, and every card
 // that depends on a worker backend consults RevEngState::caps and disables with a REASON rather
@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <filesystem>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -39,6 +40,8 @@
 #include "img_tex.h"                 // datasheet / QR previews -> GL textures
 #include "../file_dialog.h"          // openFileDialog
 #include "ui/parts/parts_widgets.h"  // b64decode for QR data URLs
+#include "ui/web_capabilities.h"     // openExternalHttpUrl — "View page" on a model candidate
+#include "ui/widgets/kit.h"          // ui::kit::elide
 
 namespace ui {
 namespace reveng {
@@ -57,6 +60,8 @@ enum class AddSlot { Photos, Drop };
 struct SourcesUi {
     // Scan-lane capture method. Deep-linked by the three ribbon buttons via S().sourceFocus.
     int  captureTab = 0;              // 0 = Webcam, 1 = Photos, 2 = Video, 3 = Phone
+    bool captureOpen = true;          // capture card expanded; starts shut for a session that already has images
+    std::string settledSid;           // session whose open/closed default was already chosen
     bool focusPulse = false;          // one-shot: scroll the capture card into view
     uint64_t sessionGeneration = 0;
     bool webcamVisible = false;
@@ -70,8 +75,9 @@ struct SourcesUi {
     std::string dropMsg;
     kit::Level  dropLvl = kit::Level::Neutral;
 
-    // The video path belongs to the asynchronous Gaussian job, not an extraction run token.
-    std::string addVideoPath;
+    bool        addVideoPending = false;
+    std::string addVideoMsg;
+    kit::Level  addVideoLvl = kit::Level::Neutral;
 
     // Datasheet lane detail (the shared store only keeps path / err / pending).
     int                      dsTables = 0;
@@ -86,7 +92,6 @@ struct SourcesUi {
     std::vector<std::string> webMpns;
     std::vector<std::string> webSources;
     std::vector<std::pair<std::string, std::string>> webDims;   // label -> formatted value
-    std::string              webDatasheetDir;
     bool                     webRan = false;
 
     // Phone capture live poll.
@@ -244,24 +249,142 @@ void kickAddImages(AppState& st, const std::string& sid,
 }
 
 // ---------------------------------------------------------------------------------------------
-// reveng_research_source (Web lane)
+// Reference lane, step 1: find an existing CAD model (reveng_find_models / reveng_use_model)
+// ---------------------------------------------------------------------------------------------
+
+// Fill `r` from a reveng_find_models result or a mirrored session.reference — same shape.
+void readReferenceSearch(const nlohmann::json& j, ReferenceState& r) {
+    r.candidates.clear();
+    r.standardPart.clear();
+    r.sitesSearched = 0;
+    if (j.contains("candidates") && j["candidates"].is_array()) {
+        r.searched = true;
+        for (const auto& c : j["candidates"]) {
+            if (!c.is_object()) continue;
+            ModelCandidate m;
+            m.url = c.value("url", std::string());
+            if (m.url.empty()) continue;
+            m.title = c.contains("title") && c["title"].is_string() ? c["title"].get<std::string>() : m.url;
+            m.site = c.contains("site") && c["site"].is_string() ? c["site"].get<std::string>() : std::string();
+            m.confidence = c.contains("confidence") && c["confidence"].is_string()
+                               ? c["confidence"].get<std::string>() : std::string("weak");
+            r.candidates.push_back(std::move(m));
+        }
+    }
+    if (j.contains("standard_part") && j["standard_part"].is_object()) {
+        const auto& sp = j["standard_part"];
+        r.standardPart = sp.contains("title") && sp["title"].is_string()
+                             ? sp["title"].get<std::string>() : std::string("standard hardware");
+    }
+    if (j.contains("coverage") && j["coverage"].is_object())
+        r.sitesSearched = j["coverage"].value("sites_searched", 0);
+}
+
+void kickFindModels(AppState& st) {
+    RevEngState& s = S();
+    ReferenceState& r = s.ref;
+    const std::string sid = activeSessionId();
+    // A running search blocks only a repeat of the same query; a new query supersedes it.
+    if ((r.searchPending && r.searchQuery == r.queryBuf) || sid.empty() || r.queryBuf[0] == '\0')
+        return;
+    r.searchPending = true;
+    r.searchQuery = r.queryBuf;
+    r.searchErr.clear();
+    r.useErr.clear();
+
+    nlohmann::json params = {{"session_id", sid}, {"query", r.searchQuery}};
+    const uint64_t generation = webcamCaptureSessionGeneration();
+    st.rpc.call("reveng_find_models", params, [sid, generation](const core::RpcResult& res) {
+        if (generation != webcamCaptureSessionGeneration() || sid != activeSessionId()) return;
+        RevEngState& s2 = S();
+        ReferenceState& r2 = s2.ref;
+        if (!res.ok || !res.result.is_object() || !res.result.value("ok", false)) {
+            r2.searchPending = false;
+            const std::string reason = res.ok && res.result.is_object()
+                ? res.result.value("reason", std::string("Model search failed."))
+                : (res.err.empty() ? std::string("Worker unreachable.") : res.err);
+            const std::string hint =
+                res.ok && res.result.is_object() ? res.result.value("hint", std::string()) : "";
+            r2.searchErr = hint.empty() ? reason : reason + " \xe2\x80\x94 " + hint;
+            return;
+        }
+        if (res.result.value("pending", false)) {
+            s2.lastDetailT = -100.0;   // the result arrives through session.reference
+            return;
+        }
+        r2.searchPending = false;
+        readReferenceSearch(res.result, r2);
+        r2.searched = true;
+        r2.hint = res.result.value("hint", std::string());
+    });
+}
+
+// Acquire `url` (download into <project>/reference/) or adopt a local CAD `path`, record it as
+// the session's model, and open it — the user asked for exactly this model.
+void kickUseModel(AppState& st, const std::string& url, const std::string& path) {
+    RevEngState& s = S();
+    ReferenceState& r = s.ref;
+    const std::string sid = activeSessionId();
+    if (!r.usePendingKey.empty() || sid.empty() || (url.empty() && path.empty())) return;
+    r.usePendingKey = url.empty() ? path : url;
+    r.useErr.clear();
+
+    nlohmann::json params = {{"session_id", sid}};
+    if (!url.empty()) params["url"] = url;
+    else              params["path"] = path;
+    const uint64_t generation = webcamCaptureSessionGeneration();
+    const bool fromUrl = !url.empty();
+    st.rpc.call("reveng_use_model", params, [&st, sid, generation, fromUrl](const core::RpcResult& res) {
+        if (generation != webcamCaptureSessionGeneration() || sid != activeSessionId()) return;
+        RevEngState& s2 = S();
+        ReferenceState& r2 = s2.ref;
+        r2.usePendingKey.clear();
+        if (!res.ok || !res.result.is_object() || !res.result.value("ok", false)) {
+            if (!res.ok || !res.result.is_object()) {
+                r2.useErr = res.err.empty() ? "Worker unreachable." : res.err;
+                return;
+            }
+            // Many libraries (GrabCAD, MakerWorld, ...) need the user's own login to download;
+            // the way through is the page itself, then the drop zone / Browse below.
+            const std::string detail = res.result.value("detail", std::string());
+            const std::string hint = res.result.value("hint", std::string());
+            r2.useErr = !detail.empty() ? detail
+                      : res.result.value("reason", std::string("Could not get the model.")) +
+                            (hint.empty() ? "" : " \xe2\x80\x94 " + hint);
+            if (fromUrl && r2.useErr.find("ownload it") == std::string::npos)
+                r2.useErr += "  Download it from the page (View page), then drop the file below "
+                             "or use Browse.";
+            return;
+        }
+        r2.modelPath = res.result.value("path", std::string());
+        const auto src = res.result.find("source_url");
+        r2.modelSource = src != res.result.end() && src->is_string() ? src->get<std::string>()
+                                                                     : std::string("local file");
+        s2.lastDetailT = -100.0;   // stepper badges + status follow the new manifest
+        s2.lastListT = -100.0;
+        if (!r2.modelPath.empty()) st.requestOpenPath = r2.modelPath;
+    }, core::kLongEngineCallTimeoutMs);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Reference lane, step 2 (fallback): reveng_research_source
 // ---------------------------------------------------------------------------------------------
 
 void kickResearch(AppState& st) {
     RevEngState& s = S();
-    if (s.researchPending || s.researchQuery.empty()) return;
+    const std::string query = s.ref.queryBuf;
+    if (s.researchPending || query.empty()) return;
     s.researchPending = true;
     s.researchErr.clear();
     s.researchResult.clear();
     g_ui.webMpns.clear();
     g_ui.webSources.clear();
     g_ui.webDims.clear();
-    g_ui.webDatasheetDir.clear();
 
     nlohmann::json params = nlohmann::json::object();
     const std::string sid = activeSessionId();
     if (!sid.empty()) params["session_id"] = sid;
-    params["query"] = s.researchQuery;
+    params["query"] = query;
 
     const uint64_t generation = webcamCaptureSessionGeneration();
     st.rpc.call("reveng_research_source", params, [sid, generation](const core::RpcResult& r) {
@@ -288,7 +411,6 @@ void kickResearch(AppState& st) {
 
         if (r.result.contains("summary") && r.result["summary"].is_string())
             s2.researchResult = r.result["summary"].get<std::string>();
-        g_ui.webDatasheetDir = r.result.value("datasheet_dir", std::string());
 
         if (r.result.contains("candidate_mpns") && r.result["candidate_mpns"].is_array()) {
             for (const auto& m : r.result["candidate_mpns"])
@@ -659,35 +781,72 @@ void drawPhotosTab(AppState& st, const std::string& sid) {
 }
 
 void drawVideoTab(AppState& st, const std::string& sid) {
-    kit::SectionHeader("Train a Gaussian splat from video");
+    RevEngState& s = S();
+    kit::SectionHeader("Video capture");
     ImGui::TextWrapped(
-        "Move slowly with overlapping views of a stationary scene or object. The local job "
-        "extracts sharp frames, solves cameras, then trains a visible 3D Gaussian splat. "
-        "Use the Gaussian panel below for environment/object mode, quality and cropping. "
-        "Photos remain in this session for the separate mesh/CAD reconstruction workflow.");
+        "Move slowly with overlapping views of a stationary object. Choose whether to extract "
+        "frames into the session or train a Gaussian splat from the clip.");
     kit::GapControl();
 
-    const auto& gaussian = S().gaussian;
+    const auto& gaussian = s.gaussian;
     const bool idle = !gaussian.pending &&
         (gaussian.status.empty() || gaussian.status == "done" || gaussian.status == "failed" ||
          gaussian.status == "cancelled" || gaussian.status == "interrupted");
-    const bool canAdd = st.workerStarted && !sid.empty() && idle;
-    const char* why = sid.empty() ? "Create or select a session first."
-        : !st.workerStarted ? "The worker is not connected." : "A Gaussian job is already active.";
-    if (kit::PrimaryButton("Choose video and train splat...", canAdd, canAdd ? nullptr : why,
-                           ImVec2(0, mx::reBtnH()))) {
+    const bool canChoose = !g_ui.addVideoPending;
+    if (kit::SecondaryButton("Choose video...", canChoose,
+                             "Wait for frame extraction to finish.")) {
         const std::string path = ui::openFileDialog(
             "Video (*.mp4 *.mov *.avi *.mkv *.webm)\0*.mp4;*.mov;*.avi;*.mkv;*.webm\0"
             "All files (*.*)\0*.*\0");
         if (!path.empty()) {
-            g_ui.addVideoPath = path;
-            startGaussian(st, sid, false, path);
+            s.sourceVideoPath = path;
+            g_ui.addVideoMsg.clear();
         }
     }
-    if (!g_ui.addVideoPath.empty()) {
+    if (!s.sourceVideoPath.empty()) {
         kit::GapControl();
-        kit::KeyValueRow("clip", g_ui.addVideoPath.c_str());
+        kit::KeyValueRow("clip", s.sourceVideoPath.c_str());
     }
+    const bool canRun = st.workerStarted && !sid.empty() && !s.sourceVideoPath.empty() &&
+                        idle && !g_ui.addVideoPending && !s.recon.active && !s.recon.kickPending;
+    const char* why = !st.workerStarted ? "The worker is not connected."
+                    : sid.empty() ? "Create or select a session first."
+                    : s.sourceVideoPath.empty() ? "Choose a video first."
+                    : "Wait for the active reconstruction or extraction to finish.";
+    if (kit::PrimaryButton("Extract frames", canRun, canRun ? nullptr : why,
+                           ImVec2(0, mx::reBtnH()))) {
+        const std::string path = s.sourceVideoPath;
+        const uint64_t generation = webcamCaptureSessionGeneration();
+        g_ui.addVideoPending = true;
+        g_ui.addVideoMsg = "Extracting frames...";
+        g_ui.addVideoLvl = kit::Level::Busy;
+        st.rpc.call("reveng_add_video", {{"session_id", sid}, {"path", path}},
+                    [sid, generation](const core::RpcResult& r) {
+            if (generation != webcamCaptureSessionGeneration() || sid != activeSessionId()) return;
+            g_ui.addVideoPending = false;
+            if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) {
+                g_ui.addVideoLvl = kit::Level::Error;
+                g_ui.addVideoMsg = r.ok && r.result.is_object()
+                    ? r.result.value("reason", std::string("Frame extraction failed."))
+                    : (r.err.empty() ? std::string("Frame extraction failed.") : r.err);
+                return;
+            }
+            const int count = r.result.value("added", 0);
+            g_ui.addVideoMsg = "Added " + std::to_string(count) + " frames to this session.";
+            g_ui.addVideoLvl = count ? kit::Level::Ok : kit::Level::Warn;
+            S().lastDetailT = -100.0;
+            S().lastListT = -100.0;
+        }, core::kLongEngineCallTimeoutMs);
+    }
+#ifdef __EMSCRIPTEN__
+    kit::SecondaryButton("Train splat", false,
+                         "Splat training requires a GPU, which the browser server sandbox does not expose.");
+#else
+    if (kit::SecondaryButton("Train splat", canRun, canRun ? nullptr : why))
+        startGaussian(st, sid, false, s.sourceVideoPath);
+#endif
+    if (g_ui.addVideoPending) kit::ProgressBar(-1.0f, "extracting", kit::Level::Busy);
+    kit::InlineStatus(g_ui.addVideoMsg.c_str(), g_ui.addVideoLvl);
 }
 
 void drawPhoneTab(AppState& st, const std::string& sid) {
@@ -771,7 +930,11 @@ void drawScanEntry(AppState& st) {
     const std::string sid = activeSessionId();
 
     // ---- capture-method card ----
-    if (kit::CardBegin("re_src_capture", "Capture an environment or object")) {
+    const bool hasRefs = !sid.empty() && S().selected >= 0 &&
+                         S().selected < (int)S().sessions.size() &&
+                         (S().sessions[(size_t)S().selected].images > 0 || !S().galleryImages.empty());
+    if (kit::CardBegin("re_src_capture", hasRefs ? "Add more images or video" : "Capture an environment or object",
+                       nullptr, true, &g_ui.captureOpen)) {
         const char* head = sid.empty() ? "no session" : "session ready";
         kit::CardHeaderRight(chipWidth(head));
         kit::StatusChip(head, sid.empty() ? kit::Level::Error : kit::Level::Ok,
@@ -830,245 +993,282 @@ void drawScanEntry(AppState& st) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Datasheet lane
+// From-reference lane: existing model first, documents second
 // ---------------------------------------------------------------------------------------------
 
-void drawDatasheetEntry(AppState& st) {
+// Path of a file dragged out of the in-app Explorer onto the item drawn just before this call.
+std::string acceptDroppedFile() {
+    std::string path;
+    if (ImGui::BeginDragDropTarget()) {
+        if (const ImGuiPayload* pl = ImGui::AcceptDragDropPayload("FILES")) {
+            const char* data = static_cast<const char*>(pl->Data);
+            if (data && pl->DataSize > 0)
+                path.assign(data, std::find(data, data + pl->DataSize, '\0'));
+        }
+        ImGui::EndDragDropTarget();
+    }
+    return path;
+}
+
+// A bordered drop target with a one-line caption. Returns a dropped path, or "".
+std::string dropZone(const char* id, const char* caption) {
+    const ImVec2 zone(ImGui::GetContentRegionAvail().x, ImGui::GetFrameHeight() * 2.0f);
+    ImGui::BeginChild(id, zone, ImGuiChildFlags_Border, ImGuiWindowFlags_NoScrollbar);
+    {
+        const ImVec2 avail = ImGui::GetContentRegionAvail();
+        const std::string text = ui::kit::elide(caption, avail.x);
+        const ImVec2 ts = ImGui::CalcTextSize(text.c_str());
+        ImGui::SetCursorPos(ImVec2(std::max(0.0f, (avail.x - ts.x) * 0.5f) + ImGui::GetCursorPosX(),
+                                   std::max(0.0f, (avail.y - ts.y) * 0.5f) + ImGui::GetCursorPosY()));
+        ImGui::TextDisabled("%s", text.c_str());
+    }
+    ImGui::EndChild();
+    return acceptDroppedFile();   // must follow the child so the target region IS the zone
+}
+
+kit::Level confidenceLevel(const std::string& c) {
+    return c == "exact" ? kit::Level::Ok : c == "strong" ? kit::Level::Warn : kit::Level::Neutral;
+}
+
+const char* confidenceLabel(const std::string& c) {
+    return c == "exact" ? "part number match" : c == "strong" ? "likely match" : "similar";
+}
+
+void drawModelCandidates(AppState& st, ReferenceState& r) {
+    const bool busy = !r.usePendingKey.empty();
+    for (int i = 0; i < (int)r.candidates.size(); ++i) {
+        const ModelCandidate& m = r.candidates[(size_t)i];
+        ImGui::PushID(i);
+        if (i > 0) kit::Rule();
+        const float rightX = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
+        const std::string title = ui::kit::elide(m.title.c_str(), ImGui::GetContentRegionAvail().x);
+        ImGui::TextUnformatted(title.c_str());
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s\n%s", m.title.c_str(), m.url.c_str());
+        if (!m.site.empty()) {
+            kit::StatusChip(m.site.c_str(), kit::Level::Neutral);
+            ImGui::SameLine(0.0f, mx::reCtlGap());
+        }
+        kit::StatusChip(confidenceLabel(m.confidence), confidenceLevel(m.confidence),
+                        m.confidence == "exact"
+                            ? "The model's part number equals the one you searched for."
+                            : "Matched on brand / name only \xe2\x80\x94 check it is the same part.");
+        // Actions share the chip row, right-aligned, while they fit; a narrow card wraps them.
+        const bool thisOne = r.usePendingKey == m.url;
+        const char* useLabel = thisOne ? "Downloading\xe2\x80\xa6###use" : "Use this model###use";
+        const float pad = ImGui::GetStyle().FramePadding.x * 2.0f;
+        const float actionsW = ImGui::CalcTextSize("View page").x + pad + mx::reCtlGap() +
+                               ImGui::CalcTextSize(useLabel, nullptr, true).x + pad;
+        const float chipsEnd = ImGui::GetItemRectMax().x;
+        if (chipsEnd + mx::reCtlGap() + actionsW <= rightX)
+            ImGui::SameLine(0.0f, rightX - actionsW - chipsEnd);
+        else
+            kit::GapControl();
+        if (kit::SecondaryButton("View page", true, nullptr))
+            ui::openExternalHttpUrl(m.url);
+        ImGui::SameLine(0.0f, mx::reCtlGap());
+        if (kit::PrimaryButton(useLabel, !busy, "A model is already being downloaded."))
+            kickUseModel(st, m.url, {});
+        ImGui::PopID();
+    }
+}
+
+void drawFindModelCard(AppState& st) {
     RevEngState& s = S();
-    const char* doclingHint = nullptr;
-    const bool docling = capPresent("docling", &doclingHint);
-    const std::string blockReason =
-        doclingHint ? std::string(doclingHint)
-                    : std::string("The datasheet reader backend is not provisioned on the worker "
-                                  "(pip install docling, or pdfplumber for text-only tables).");
+    ReferenceState& r = s.ref;
+    if (!kit::CardBegin("re_src_find", "Find an existing CAD model", "vendor_globe")) {
+        kit::CardEnd();
+        return;
+    }
+    ImGui::TextWrapped("Searches GrabCAD, TraceParts, Printables, 3D ContentCentral, McMaster and "
+                       "other CAD libraries before anything is modelled. Paste a model page or "
+                       "file URL to use it directly.");
+    kit::GapControl();
 
-    if (kit::CardBegin("re_src_datasheet", "Datasheet / spec sheet")) {
-        const char* head = docling ? "reader ready" : "reader missing";
-        kit::CardHeaderRight(chipWidth(head));
-        kit::StatusChip(head, docling ? kit::Level::Ok : kit::Level::Error,
-                        docling ? "reveng_status() reports the datasheet reader is provisioned."
-                                : blockReason.c_str());
+    const float btnW = mx::reBtnW();
+    ImGui::SetNextItemWidth(std::max(btnW, ImGui::GetContentRegionAvail().x - btnW -
+                                               ImGui::GetStyle().ItemSpacing.x));
+    const bool enter = ImGui::InputTextWithHint("##re_ref_query",
+                                                "Part number, product name or model URL",
+                                                r.queryBuf, sizeof(r.queryBuf),
+                                                ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SameLine();
+    const bool sameAsRunning = r.searchPending && r.searchQuery == r.queryBuf;
+    const bool canSearch = !sameAsRunning && r.queryBuf[0] != '\0';
+    const bool clicked = kit::PrimaryButton(sameAsRunning ? "\xe2\x80\xa6###re_ref_find"
+                                                          : "Search###re_ref_find",
+                                            canSearch,
+                                            sameAsRunning ? "This search is already running."
+                                                          : "Type a part number, name or URL.",
+                                            ImVec2(btnW, 0.0f));
+    if ((enter || clicked) && canSearch) kickFindModels(st);
 
-        ImGui::TextWrapped(
-            "Drop a PDF or an image of a spec sheet below. The reader extracts the dimension "
-            "tables and routes them straight to Model \xe2\x80\x94 Scale and Reconstruct are "
-            "skipped, because a printed dimension is already a measurement.");
-        kit::GapControl();
-        kit::HonestyTag("medium",
-                        "Datasheet dimensions are as good as the document: nominal values, often "
-                        "without tolerances. Fit-critical features still need confirmation "
-                        "against the real part.");
+    if (r.searchPending)
+        kit::ProgressBar(-1.0f, "searching CAD libraries \xe2\x80\x94 this can take a minute or two",
+                         kit::Level::Busy);
+    kit::InlineStatus(r.searchErr.c_str(), kit::Level::Error);
+
+    if (!r.modelPath.empty()) {
         kit::GapSection();
+        const std::string file = std::filesystem::path(r.modelPath).filename().string();
+        kit::InlineStatus(("Using " + file).c_str(), kit::Level::Ok);
+        if (kit::SecondaryButton("Open model")) st.requestOpenPath = r.modelPath;
+    }
 
-        if (!docling) {
-            kit::BlockedState("Datasheet reader not provisioned", blockReason.c_str(),
-                              "Install the backend on the worker, then reopen this tab. You can "
-                              "use the Scan lane in the meantime.");
-            kit::CardEnd();
-            return;
+    if (r.searched && !r.searchPending) {
+        kit::GapSection();
+        if (!r.standardPart.empty()) {
+            kit::InlineStatus(("Standard hardware: " + r.standardPart +
+                               " \xe2\x80\x94 insert it from the Parts Library.").c_str(),
+                              kit::Level::Ok);
+            if (kit::SecondaryButton("Open Parts Library"))
+                st.activeWorkspace = AppState::Workspace::PartsLibrary;
+            kit::GapControl();
         }
+        if (!r.candidates.empty()) {
+            char head[64];
+            std::snprintf(head, sizeof(head), "%d model%s found", (int)r.candidates.size(),
+                          r.candidates.size() == 1 ? "" : "s");
+            kit::SectionHeader(head);
+            drawModelCandidates(st, r);
+        } else if (r.standardPart.empty()) {
+            kit::InlineStatus(r.hint.empty() ? "No existing model found \xe2\x80\x94 build one "
+                                               "from documents below."
+                                             : r.hint.c_str(),
+                              kit::Level::Warn);
+        }
+    }
+    kit::InlineStatus(r.useErr.c_str(), kit::Level::Error);
 
-        // ---- drop zone ---- (reThumbMd is the nearest token to a comfortable drop target; a
-        // dedicated reDropZoneH() would be the honest name for it)
-        const ImVec2 zone(ImGui::GetContentRegionAvail().x, mx::reThumbMd());
-        ImGui::BeginChild("##re_ds_drop", zone, ImGuiChildFlags_Border);
-        {
-            const ImVec2 avail = ImGui::GetContentRegionAvail();
-            ImGui::Dummy(ImVec2(0.0f, avail.y * 0.25f));
-            const char* hint = s.datasheetPath.empty() ? "Drop a PDF or image here"
-                                                       : s.datasheetPath.c_str();
-            const ImVec2 ts = ImGui::CalcTextSize(hint);
-            float cx = (avail.x - ts.x) * 0.5f;
-            if (cx < mx::reCardPadX()) cx = mx::reCardPadX();
-            ImGui::SetCursorPosX(cx);
-            if (s.datasheetPath.empty()) ImGui::TextDisabled("%s", hint);
-            else                         ImGui::TextUnformatted(hint);
-        }
-        ImGui::EndChild();
-        // Must follow the drop-zone child immediately so the target region IS the drop zone.
-        if (ImGui::BeginDragDropTarget()) {
-            if (const ImGuiPayload* pl = ImGui::AcceptDragDropPayload("FILES")) {
-                const char* data = static_cast<const char*>(pl->Data);
-                if (data && pl->DataSize > 0) {
-                    const std::string path(data, std::find(data, data + pl->DataSize, '\0'));
-                    kickDatasheetIngest(st, path);
-                }
-            }
-            ImGui::EndDragDropTarget();
-        }
+    kit::GapSection();
+    const std::string dropped =
+        dropZone("##re_ref_drop", "Already downloaded one? Drop a STEP / IGES / STL file here");
+    if (!dropped.empty()) kickUseModel(st, {}, dropped);
+    kit::GapControl();
+    if (kit::SecondaryButton("Browse\xe2\x80\xa6###re_ref_browse", r.usePendingKey.empty(),
+                             "A model is already being added.")) {
+        const std::string path = ui::openFileDialog(
+            "CAD model (*.step *.stp *.iges *.igs *.stl *.3mf *.obj)\0"
+            "*.step;*.stp;*.iges;*.igs;*.stl;*.3mf;*.obj\0All files (*.*)\0*.*\0");
+        if (!path.empty()) kickUseModel(st, {}, path);
+    }
+    kit::CardEnd();
+}
 
+// Building our own model costs research and modelling work, so it sits below the search and says
+// so when the search already found a usable model.
+void drawBuildFromDocsCard(AppState& st) {
+    RevEngState& s = S();
+    const ReferenceState& r = s.ref;
+    if (!kit::CardBegin("re_src_docs", "No usable model? Build one from documents", "file_doc")) {
+        kit::CardEnd();
+        return;
+    }
+    if (!r.modelPath.empty())
+        kit::InlineStatus("This session already uses an existing model \xe2\x80\x94 building one is "
+                          "unnecessary.", kit::Level::Neutral);
+    else if (!r.candidates.empty())
+        kit::InlineStatus("Models were found above \xe2\x80\x94 check them before building one.",
+                          kit::Level::Neutral);
+    else if (!r.searched)
+        kit::InlineStatus("Search for an existing model first; this builds one from specs and "
+                          "datasheets instead.", kit::Level::Neutral);
+    kit::GapControl();
+
+    // ---- web specs: same query box as the model search ----
+    kit::SectionHeader("Look up specs online");
+    const bool canResearch = !s.researchPending && r.queryBuf[0] != '\0';
+    if (kit::SecondaryButton(s.researchPending ? "Researching\xe2\x80\xa6###re_research"
+                                               : "Research specs###re_research",
+                             canResearch,
+                             s.researchPending ? "Research is already running."
+                                               : "Type a part number or name above first."))
+        kickResearch(st);
+    kit::InlineStatus(s.researchErr.c_str(), kit::Level::Error);
+
+    // ---- datasheet ----
+    kit::GapSection();
+    kit::SectionHeader("Datasheet or drawing");
+    const char* doclingHint = nullptr;
+    if (!capPresent("docling", &doclingHint)) {
+        kit::InlineStatus(doclingHint ? doclingHint
+                                      : "The datasheet reader is not installed (pip install "
+                                        "docling, or pdfplumber for text-only tables).",
+                          kit::Level::Warn);
+    } else {
+        const std::string dropped = dropZone(
+            "##re_ds_drop", s.datasheetPath.empty() ? "Drop a PDF or image here"
+                                                    : s.datasheetPath.c_str());
+        if (!dropped.empty()) kickDatasheetIngest(st, dropped);
         kit::GapControl();
-        if (kit::SecondaryButton("Browse\xe2\x80\xa6", !s.datasheetPending,
-                                 s.datasheetPending ? "An ingest is already running." : nullptr)) {
+        if (kit::SecondaryButton("Browse\xe2\x80\xa6###re_ds_browse", !s.datasheetPending,
+                                 "A datasheet is already being read.")) {
             const std::string path = ui::openFileDialog(
                 "Spec sheet (*.pdf *.png *.jpg *.jpeg)\0*.pdf;*.png;*.jpg;*.jpeg\0"
                 "All files (*.*)\0*.*\0");
             if (!path.empty()) kickDatasheetIngest(st, path);
         }
-
         if (s.datasheetPending) kit::ProgressBar(-1.0f, "reading the document", kit::Level::Busy);
         kit::InlineStatus(s.datasheetErr.c_str(), kit::Level::Error);
     }
     kit::CardEnd();
+}
+
+// What research and the datasheet reader actually produced. Only drawn once one of them ran.
+void drawDocsResultCard() {
+    const RevEngState& s = S();
+    const bool research = g_ui.webRan || !s.researchResult.empty();
+    const bool datasheet = !s.datasheetPath.empty() && !s.datasheetPending;
+    if (!research && !datasheet) return;
 
     kit::GapCards();
-
-    // ---- what was actually read ----
-    if (kit::CardBegin("re_src_ds_result", "What was read")) {
-        if (s.datasheetPath.empty()) {
-            kit::EmptyState(nullptr, "Nothing ingested yet",
-                            "Drop a spec sheet above and its extracted page crops and dimension "
-                            "tables appear here.");
-        } else {
-            ensureDatasheetPreview();
-            const float w = std::min(mx::rePreviewMaxW(), ImGui::GetContentRegionAvail().x);
-            const float h = w * 9.0f / 16.0f;
-            kit::HeroPreview("re_ds_hero", g_ui.dsTex, g_ui.dsTexW, g_ui.dsTexH, ImVec2(w, h),
-                             g_ui.dsCrops.empty() ? "source document"
-                                                  : "extracted page crop",
-                             "No page image \xe2\x80\x94 PDFs render a crop only once the reader "
-                             "has run");
+    if (!kit::CardBegin("re_src_docs_result", "What was found", "results")) {
+        kit::CardEnd();
+        return;
+    }
+    if (research) {
+        if (!s.researchResult.empty()) ImGui::TextWrapped("%s", s.researchResult.c_str());
+        if (!g_ui.webDims.empty()) {
+            kit::GapSection();
+            kit::SectionHeader("Catalogue dimensions");
+            for (const auto& d : g_ui.webDims)
+                kit::KeyValueRow(d.first.c_str(), d.second.c_str(), kit::Level::Warn);
             kit::GapControl();
-
-            char nb[24];
-            std::snprintf(nb, sizeof(nb), "%d", g_ui.dsTables);
-            kit::ValueChip("tables", nb, g_ui.dsTables > 0 ? kit::Level::Ok : kit::Level::Warn,
-                           "Dimension tables the reader recovered from the document.");
-            ImGui::SameLine(0.0f, mx::reCtlGap());
-            std::snprintf(nb, sizeof(nb), "%d", (int)g_ui.dsCrops.size());
-            kit::ValueChip("page crops", nb,
-                           g_ui.dsCrops.empty() ? kit::Level::Neutral : kit::Level::Ok);
-
-            if (!g_ui.dsMpns.empty()) {
-                kit::GapSection();
-                kit::SectionHeader("Candidate part numbers");
-                for (const std::string& m : g_ui.dsMpns) kit::KeyValueRow("MPN", m.c_str());
-            }
-            if (!g_ui.dsCrops.empty()) {
-                kit::GapSection();
-                kit::SectionHeader("Page crops");
-                for (size_t i = 0; i < g_ui.dsCrops.size(); ++i) {
-                    char key[24];
-                    std::snprintf(key, sizeof(key), "crop %d", (int)i + 1);
-                    kit::KeyValueRow(key, g_ui.dsCrops[i].c_str());
-                }
-            }
+            kit::HonestyTag("low", "Catalogue values, not measured off your part.");
+        }
+        if (!g_ui.webMpns.empty()) {
+            kit::GapSection();
+            kit::SectionHeader("Part numbers");
+            for (const std::string& m : g_ui.webMpns) kit::KeyValueRow("MPN", m.c_str());
+        }
+        if (!g_ui.webSources.empty()) {
+            kit::GapSection();
+            kit::SectionHeader("Sources");
+            for (const std::string& src : g_ui.webSources) ImGui::TextWrapped("%s", src.c_str());
         }
     }
-    kit::CardEnd();
-}
-
-// ---------------------------------------------------------------------------------------------
-// Web / Part# lane
-// ---------------------------------------------------------------------------------------------
-
-void drawWebEntry(AppState& st) {
-    RevEngState& s = S();
-
-    if (kit::CardBegin("re_src_web", "Web / part number")) {
-        ImGui::TextWrapped(
-            "Enter a manufacturer part number, a vendor URL, or a plain search query. The "
-            "researcher pulls specs, datasheets and images into the session and routes straight "
-            "to Model \xe2\x80\x94 Scale and Reconstruct are skipped, because nothing here was "
-            "measured off your bench.");
+    if (datasheet) {
+        if (research) kit::GapSection();
+        ensureDatasheetPreview();
+        const float w = std::min(mx::rePreviewMaxW(), ImGui::GetContentRegionAvail().x);
+        kit::HeroPreview("re_ds_hero", g_ui.dsTex, g_ui.dsTexW, g_ui.dsTexH,
+                         ImVec2(w, w * 9.0f / 16.0f),
+                         g_ui.dsCrops.empty() ? "datasheet" : "extracted page",
+                         "No page image \xe2\x80\x94 PDFs show a crop once the reader has run");
         kit::GapControl();
-        kit::HonestyTag("low",
-                        "Web-sourced dimensions describe the catalogue part, not the part in your "
-                        "hand. Anything fit-critical must be confirmed with calipers before you "
-                        "cut metal.");
-        kit::GapSection();
-
-        kit::FieldLabel("Query", "Part number, vendor URL, or free text, e.g. "
-                                 "\"SKF 6204-2RS bearing specifications\".");
-        ImGui::SetNextItemWidth(mx::reFieldW() * 3.0f);
-        const bool enter = ImGui::InputText("##re_research_q", s.researchQueryBuf,
-                                            sizeof(s.researchQueryBuf),
-                                            ImGuiInputTextFlags_EnterReturnsTrue);
-        ImGui::SameLine(0.0f, mx::reCtlGap());
-        const bool canSearch = !s.researchPending && s.researchQueryBuf[0] != '\0';
-        const bool clicked = kit::PrimaryButton(
-            "Search", canSearch,
-            s.researchPending ? "A search is already running." : "Type something to search for.",
-            ImVec2(mx::reBtnW(), 0));
-        if ((enter || clicked) && canSearch) {
-            s.researchQuery = s.researchQueryBuf;
-            kickResearch(st);
-        }
-
-        if (s.researchPending) kit::ProgressBar(-1.0f, "searching", kit::Level::Busy);
-        kit::InlineStatus(s.researchErr.c_str(), kit::Level::Error);
-    }
-    kit::CardEnd();
-
-    kit::GapCards();
-
-    if (kit::CardBegin("re_src_web_result", "Research result")) {
-        if (!g_ui.webRan && s.researchResult.empty()) {
-            kit::EmptyState(nullptr, "Nothing searched yet",
-                            "Candidate part numbers, catalogue dimensions and the sources they "
-                            "came from will be listed here, each tagged with its provenance.");
-        } else {
-            if (!s.researchResult.empty()) {
-                ImGui::TextWrapped("%s", s.researchResult.c_str());
-                kit::GapControl();
-            }
-            if (!g_ui.webDatasheetDir.empty())
-                kit::KeyValueRow("datasheet dir", g_ui.webDatasheetDir.c_str());
-
-            if (!g_ui.webMpns.empty()) {
-                kit::GapSection();
-                kit::SectionHeader("Candidate part numbers");
-                for (const std::string& m : g_ui.webMpns) kit::KeyValueRow("MPN", m.c_str());
-            }
-            if (!g_ui.webDims.empty()) {
-                kit::GapSection();
-                kit::SectionHeader("Catalogue dimensions");
-                for (const auto& d : g_ui.webDims)
-                    kit::KeyValueRow(d.first.c_str(), d.second.c_str(), kit::Level::Warn);
-                kit::GapControl();
-                kit::HonestyTag("low", "catalogue values, not measured off your part");
-            }
-            if (!g_ui.webSources.empty()) {
-                kit::GapSection();
-                kit::SectionHeader("Sources");
-                for (size_t i = 0; i < g_ui.webSources.size(); ++i) {
-                    char key[24];
-                    std::snprintf(key, sizeof(key), "source %d", (int)i + 1);
-                    kit::KeyValueRow(key, g_ui.webSources[i].c_str());
-                }
-            }
-            if (g_ui.webMpns.empty() && g_ui.webDims.empty() && g_ui.webSources.empty() &&
-                s.researchErr.empty()) {
-                kit::GapControl();
-                kit::InlineStatus("The search completed but returned no structured data. Try a "
-                                  "manufacturer part number, or use the Datasheet lane with a PDF.",
-                                  kit::Level::Warn);
-            }
-        }
+        char nb[24];
+        std::snprintf(nb, sizeof(nb), "%d", g_ui.dsTables);
+        kit::ValueChip("tables", nb, g_ui.dsTables > 0 ? kit::Level::Ok : kit::Level::Warn,
+                       "Dimension tables read from the document.");
+        for (const std::string& m : g_ui.dsMpns) kit::KeyValueRow("MPN", m.c_str());
     }
     kit::CardEnd();
 }
 
-// ---------------------------------------------------------------------------------------------
-// From-Library lane
-// ---------------------------------------------------------------------------------------------
-
-void drawFromLibraryEntry() {
-    RevEngState& s = S();
-    if (kit::CardBegin("re_src_library", "Seeded from the Parts Library")) {
-        ImGui::TextWrapped(
-            "This session was created from a Parts Library record. The pipeline routes itself: "
-            "the Scan lane if the record ships photos, otherwise the Datasheet or Web lane from "
-            "its documents and specs.");
-        kit::GapSection();
-        if (kit::EmptyState(nullptr, "Waiting for the library seed",
-                            "Nothing has arrived from the Parts Library yet. If you would rather "
-                            "capture the part yourself, switch to the Scan lane.",
-                            "Switch to Scan")) {
-            s.sourceMode = SourceMode::Scan;
-        }
-    }
-    kit::CardEnd();
+void drawReferenceEntry(AppState& st) {
+    drawFindModelCard(st);
+    kit::GapCards();
+    drawBuildFromDocsCard(st);
+    drawDocsResultCard();
 }
 
 }  // namespace
@@ -1097,18 +1297,67 @@ void drawSourcesPanel(AppState& st) {
             default: break;
         }
         g_ui.focusPulse = true;
+        g_ui.captureOpen = true;
         s.sourceFocus = SourceFocus::None;
     }
+    // A session that already holds images (usually one phone video) opens with the capture card
+    // shut and never auto-starts the webcam: the user is reviewing, not capturing. Chosen once per
+    // session, so a later expand/collapse sticks.
+    {
+        const std::string sid = activeSessionId();
+        if (!sid.empty() && g_ui.settledSid != sid && s.selected >= 0 &&
+            s.selected < (int)s.sessions.size()) {
+            g_ui.settledSid = sid;
+            if (s.sessions[(size_t)s.selected].images > 0) {
+                g_ui.captureOpen = false;
+                if (g_ui.captureTab == 0) g_ui.captureTab = 2;
+            }
+        }
+    }
     // Capture is owned by the visible webcam console, never by a hidden source lane.
-    const bool showWebcam = s.sourceMode == SourceMode::Scan && g_ui.captureTab == 0;
+    const bool showWebcam = s.sourceMode == SourceMode::Scan && g_ui.captureTab == 0 &&
+                            g_ui.captureOpen;
     if (g_ui.webcamVisible && !showWebcam) webcamCaptureShutdown();
     g_ui.webcamVisible = showWebcam;
 
-    switch (s.sourceMode) {
-        case SourceMode::Scan:        drawScanEntry(st);        break;
-        case SourceMode::Datasheet:   drawDatasheetEntry(st);   break;
-        case SourceMode::Web:         drawWebEntry(st);         break;
-        case SourceMode::FromLibrary: drawFromLibraryEntry();   break;
+    if (s.sourceMode == SourceMode::Scan) drawScanEntry(st);
+    else                                  drawReferenceEntry(st);
+}
+
+void mirrorReference(const nlohmann::json& reference) {
+    ReferenceState& r = S().ref;
+    if (!reference.is_object()) return;
+    auto text = [&](const char* key) {
+        const auto it = reference.find(key);
+        return it != reference.end() && it->is_string() ? it->get<std::string>() : std::string();
+    };
+    const std::string query = text("query");
+    const std::string status = text("status");   // empty for a search that ran synchronously
+    if (r.queryBuf[0] == '\0' && !query.empty())
+        std::snprintf(r.queryBuf, sizeof(r.queryBuf), "%s", query.c_str());
+
+    if (reference.contains("model") && reference["model"].is_object()) {
+        const auto& m = reference["model"];
+        r.modelPath = m.contains("path") && m["path"].is_string() ? m["path"].get<std::string>() : "";
+        r.modelSource = m.contains("source_url") && m["source_url"].is_string()
+                            ? m["source_url"].get<std::string>() : std::string("local file");
+    }
+
+    if (status == "searching") {
+        // Ours, or one started before this tab was opened (or by an agent): show it running.
+        r.searchPending = true;
+        r.searchQuery = query;
+        return;
+    }
+    if (r.searchPending && query != r.searchQuery) return;   // manifest predates our search
+    r.searchPending = false;
+    if (status == "failed") {
+        r.searchErr = text("error").empty() ? std::string("Model search failed.") : text("error");
+        return;
+    }
+    if (reference.contains("candidates")) {
+        readReferenceSearch(reference, r);
+        r.hint = text("hint");
     }
 }
 

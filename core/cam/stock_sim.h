@@ -35,6 +35,22 @@ struct SimResult {
     double rapid_time_s = 0;
     int gouges = 0;                    // # cells cut below part - gouge_tol
     double max_gouge_mm = 0;
+    // Gouge evidence. `gouge_evaluated` is true only when a part height-field was
+    // compared against the final dexel field; `gouges == 0` means nothing unless it
+    // is true. `gouge_reason` says why it was not evaluated.
+    bool gouge_evaluated = false;
+    std::string gouge_reason;
+    long gouge_cells_compared = 0;     // cells where both stock field and part surface exist
+    // Per-toolpath aggregate of cells cut below the part (deepest first, bounded).
+    // `x,y,z` is the deepest cell: z = tool-tip Z left in the stock, part_z = part surface Z.
+    struct GougeHit {
+        std::string op_id;
+        int tool_number = 0;
+        int cells = 0;
+        double max_depth_mm = 0;
+        double x = 0, y = 0, z = 0, part_z = 0;
+    };
+    std::vector<GougeHit> gouge_hits;
     int rapid_collisions = 0;          // rapid moves intersecting remaining stock
     int holder_collisions = 0;         // cutting moves whose shank/holder body hits stock
     std::vector<std::string> warnings;

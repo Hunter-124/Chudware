@@ -28,7 +28,9 @@
 // increment (A4/A5, faces) can reuse it for face picks.
 #pragma once
 
+#include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -130,13 +132,30 @@ FacePicks resolve_face_picks(const TopoDS_Shape& shape, const nlohmann::json& se
 //            {"of":"face","surf":"round","pick":"outer"} -> the OUTER wall of a tube
 //            {"of":"face","pick":"largest"}          -> the biggest face(s)
 //            {"of":"edge","near":[20,0,5],"count":1} -> the edge nearest a point
+//   within        [[body,topo],...]  restrict the candidates to those elements, where each pair
+//                 is the (body ordinal, per-body 1-based TopExp index) join key every doc_query
+//                 match carries. Only doc_query resolves it (it owns the body numbering);
+//                 every other caller gets an error rather than a silently ignored key.
 struct QueryPicks {
     std::vector<TopoDS_Edge> edges;
     std::vector<TopoDS_Face> faces;
     nlohmann::json selectors = nlohmann::json::array();  // make_selector per match (introspection)
+    // sid -> how many elements of the queried kind in the WHOLE shape carry it, for every
+    // returned match whose sid is shared (>= 2). A sid is a 24-bit geometry hash, so identical
+    // assembly instances and the occasional collision share one; the caller must not bind it.
+    std::map<std::string, int> shared_sids;
     std::string error;  // non-empty => malformed query; no geometry touched
 };
-QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& query);
+// `admitted`, when non-null, is the set of 0-based unique-sub-shape indices (the `index` of
+// the whole-shape TopExp::MapShapes map) the query may consider — doc_query derives it from
+// `within`. A query that carries `within` without `admitted` is an error.
+QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& query,
+                              const std::set<int>* admitted = nullptr,
+                              bool collect_shared_sids = false);
+
+// Add read-only, world-space finite cylinder and annular-seat evidence to selected
+// face rows. Unsupported or ambiguous trim/topology is reported as unknown.
+void add_fastener_geometry(const TopoDS_Shape& shape, QueryPicks& picks);
 
 // True if `v` is a geometry-query object (a json object carrying "of", or kind=="query").
 // Feature compilers use this to branch a query payload vs an explicit pick selector.

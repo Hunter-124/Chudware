@@ -10,6 +10,7 @@ import os
 import shutil
 import signal
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -137,6 +138,104 @@ def test_core_bridge_daemon_mode_raises_coreerror(scratch_daemon, monkeypatch):
     scratch_daemon.append(daemon_bridge.client().call("daemon_status")["pid"])
     with pytest.raises(core_bridge.CoreError):
         core_bridge.call("definitely_not_a_method", {})
+
+
+def test_in_process_exit_drain_uses_only_a_loaded_engine(monkeypatch, capsys):
+    from services.mcp import core_bridge
+
+    monkeypatch.setattr(core_bridge, "_native_closing", False)
+    monkeypatch.setattr(core_bridge, "_load", lambda: pytest.fail("exit must not load an engine"))
+    monkeypatch.setattr(core_bridge, "_dll", None)
+    core_bridge._drain_in_process_tasks()
+    monkeypatch.setattr(core_bridge, "_dll", object())  # older engine without the export
+    core_bridge._drain_in_process_tasks()
+
+    class Drain:
+        calls = 0
+        status = 0
+
+        def __call__(self):
+            self.calls += 1
+            return self.status
+
+    class Engine:
+        chudware_drain_background_tasks = Drain()
+
+    engine = Engine()
+    monkeypatch.setattr(core_bridge, "_dll", engine)
+    core_bridge._drain_in_process_tasks()
+    assert engine.chudware_drain_background_tasks.calls == 1
+    assert engine.chudware_drain_background_tasks.argtypes == []
+    engine.chudware_drain_background_tasks.status = 1
+    core_bridge._drain_in_process_tasks()
+    assert "background task drain failed" in capsys.readouterr().err
+
+
+def test_in_process_exit_waits_for_active_call_and_closes_admission(monkeypatch):
+    from services.mcp import core_bridge
+
+    admitted, release, waiting, drained = (threading.Event() for _ in range(4))
+    errors = []
+
+    class ObservableCondition(threading.Condition):
+        def wait(self, timeout=None):
+            waiting.set()
+            return super().wait(timeout)
+
+    class Drain:
+        calls = 0
+
+        def __call__(self):
+            self.calls += 1
+            return 0
+
+    class Engine:
+        chudware_drain_background_tasks = Drain()
+
+    engine = Engine()
+    monkeypatch.setattr(core_bridge, "_native_lifecycle", ObservableCondition())
+    monkeypatch.setattr(core_bridge, "_native_calls", 0)
+    monkeypatch.setattr(core_bridge, "_native_closing", False)
+    monkeypatch.setattr(core_bridge, "_dll", engine)
+    monkeypatch.setattr(core_bridge, "_load", lambda: engine)
+
+    def call():
+        try:
+            with core_bridge._in_process_call():
+                admitted.set()
+                if not release.wait(5):
+                    errors.append("call was not released")
+        except Exception as exc:
+            errors.append(str(exc))
+
+    def close():
+        try:
+            core_bridge._drain_in_process_tasks()
+            drained.set()
+        except Exception as exc:
+            errors.append(str(exc))
+
+    caller = threading.Thread(target=call)
+    closer = threading.Thread(target=close)
+    caller.start()
+    try:
+        assert admitted.wait(5)
+        closer.start()
+        assert waiting.wait(5)
+        assert not drained.is_set()
+        with pytest.raises(core_bridge.CoreError, match="shutting down"):
+            with core_bridge._in_process_call():
+                pass
+    finally:
+        release.set()
+        caller.join(5)
+        if closer.ident is not None:
+            closer.join(5)
+    assert not caller.is_alive()
+    assert not closer.is_alive()
+    assert not errors
+    assert drained.is_set()
+    assert engine.chudware_drain_background_tasks.calls == 1
 
 
 def test_attach_only_fails_without_daemon(scratch_daemon):
@@ -567,6 +666,26 @@ def test_new_thread_connection_cannot_demote_established_worker_to_private_engin
     assert core_bridge.active_daemon_mode()
 
 
+def test_worker_exit_survives_daemon_thread_mid_call():
+    """Interpreter exit clears a hung daemon thread's locals while it still holds its
+    connection lock; releasing that thread-owned client must not deadlock exit."""
+    script = (
+        "import threading, time\n"
+        "from services.mcp import daemon_bridge\n"
+        "ready = threading.Event()\n"
+        "def call_in_flight():\n"
+        "    daemon_bridge.client()._lock.acquire()\n"
+        "    ready.set()\n"
+        "    time.sleep(600)\n"
+        "threading.Thread(target=call_in_flight, daemon=True).start()\n"
+        "ready.wait()\n"
+    )
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    env = {**os.environ, "PYTHONPATH": root}
+    done = subprocess.run([sys.executable, "-c", script], cwd=root, env=env, timeout=30)
+    assert done.returncode == 0
+
+
 def test_turn_connections_keep_documents_attached_between_fresh_tool_threads(scratch_daemon):
     """Finishing one host-call thread must not announce a still-running agent as gone."""
     pool = daemon_bridge.TurnConnections()
@@ -649,3 +768,87 @@ def test_turn_connections_close_does_not_interrupt_active_tool(scratch_daemon):
         assert not connection.connected()
     finally:
         pool.close()
+
+
+def test_cancelled_connect_does_not_demote(monkeypatch, tmp_path):
+    from services.mcp import core_bridge
+
+    monkeypatch.setenv("CHUDWARE_ENGINE_DAEMON", "1")
+    monkeypatch.setenv("CHUDWARE_HOSTD_SOCKET", str(tmp_path / "absent.sock"))
+    monkeypatch.setattr(core_bridge, "_DAEMON_FALLBACK_WARNED", False)
+    monkeypatch.setattr(daemon_bridge, "_group_session_established", threading.Event())
+    connection = DaemonClient()
+    connection.abort()
+    monkeypatch.setattr(daemon_bridge, "client", lambda: connection)
+    monkeypatch.setattr(core_bridge, "_load", lambda: pytest.fail("private engine loaded"))
+    with pytest.raises(core_bridge.CoreError) as error:
+        core_bridge._dispatch_call("doc_list")
+    assert error.value.code == "cancelled"
+    assert core_bridge.active_daemon_mode()
+    assert connection._spawn_fail_streak == 0
+
+
+def test_spawn_cooldown_does_not_demote(monkeypatch, tmp_path):
+    from services.mcp import core_bridge
+
+    monkeypatch.setenv("CHUDWARE_ENGINE_DAEMON", "1")
+    monkeypatch.setenv("CHUDWARE_HOSTD_SOCKET", str(tmp_path / "absent.sock"))
+    monkeypatch.setattr(core_bridge, "_DAEMON_FALLBACK_WARNED", False)
+    monkeypatch.setattr(daemon_bridge, "_group_session_established", threading.Event())
+    connection = DaemonClient()
+    connection._spawn_block_until = time.monotonic() + 60
+    connection._spawn_fail_streak = 1
+    monkeypatch.setattr(daemon_bridge, "client", lambda: connection)
+    monkeypatch.setattr(core_bridge, "_load", lambda: pytest.fail("private engine loaded"))
+    with pytest.raises(core_bridge.CoreError) as error:
+        core_bridge._dispatch_call("doc_list")
+    assert error.value.code == "hostd_unavailable"
+    assert core_bridge.active_daemon_mode()
+
+
+def test_agent_startup_failure_does_not_demote(monkeypatch):
+    from services.mcp import core_bridge
+
+    monkeypatch.setenv("CHUDWARE_ENGINE_DAEMON", "1")
+    monkeypatch.setattr(core_bridge, "_DAEMON_FALLBACK_WARNED", False)
+    monkeypatch.setattr(core_bridge, "_call_via_daemon",
+                        lambda *args: (_ for _ in ()).throw(DaemonError("unavailable")))
+    monkeypatch.setattr(core_bridge, "_load", lambda: pytest.fail("private engine loaded"))
+    token = core_bridge.CURRENT_AGENT.set(("run", "agent"))
+    try:
+        with pytest.raises(core_bridge.CoreError) as error:
+            core_bridge._dispatch_call("doc_list")
+        assert error.value.code == "hostd_unavailable"
+        assert core_bridge.active_daemon_mode()
+    finally:
+        core_bridge.CURRENT_AGENT.reset(token)
+
+
+def test_registered_tool_startup_failure_never_uses_private_engine(monkeypatch):
+    from services.mcp import core_bridge, tool_registry
+
+    monkeypatch.setenv("CHUDWARE_ENGINE_DAEMON", "1")
+    monkeypatch.setattr(core_bridge, "_DAEMON_FALLBACK_WARNED", False)
+    monkeypatch.setattr(core_bridge, "_call_via_daemon",
+                        lambda *args: (_ for _ in ()).throw(DaemonError("unavailable")))
+    monkeypatch.setattr(core_bridge, "_load", lambda: pytest.fail("private engine loaded"))
+
+    def tool():
+        return core_bridge._dispatch_call("doc_list")
+
+    guarded = tool_registry._guard(tool, "describe_part")
+    with pytest.raises(core_bridge.CoreError) as error:
+        guarded()
+    assert error.value.code == "hostd_unavailable"
+    assert core_bridge.active_daemon_mode()
+
+
+@pytest.mark.parametrize(("method", "mutates"), [
+    ("doc_tree", False), ("doc_face_edges", False), ("ecad_footprints", False),
+    ("sim_run_static", False), ("sim_study_list", False),
+    ("sim_study_add", True), ("doc_apply_ops", True), ("doc_save", False),
+])
+def test_document_classification(method, mutates):
+    from services.mcp import core_bridge
+
+    assert core_bridge._may_mutate_document(method, {"doc_id": "doc-1"}) is mutates

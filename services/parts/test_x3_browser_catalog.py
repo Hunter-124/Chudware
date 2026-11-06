@@ -109,7 +109,13 @@ def test_place_import_file_skips_cleanly_when_core_absent(tmp_path, monkeypatch)
     {ok: False} error envelope rather than raising."""
     from services.mcp import core_bridge as cb
     fake_step = tmp_path / "widget.step"
-    fake_step.write_text("ISO-10303-21;")
+    fake_step.write_text(
+        "ISO-10303-21;\nHEADER;\n"
+        "FILE_DESCRIPTION(('fixture'),'2;1');\n"
+        "FILE_NAME('widget.step','',(''),(''),'','','');\n"
+        "FILE_SCHEMA(('AUTOMOTIVE_DESIGN'));\nENDSEC;\n"
+        "DATA;\nENDSEC;\nEND-ISO-10303-21;\n"
+    )
 
     monkeypatch.setattr(cb, "available", lambda: False)
     assert not _core_available()

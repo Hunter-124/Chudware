@@ -206,14 +206,12 @@ def test_wi3_c_freeform_accepts_minimal_and_no_template_in_prompt():
     prompt = sc.plan_prompt_for(cap, "BASE")
     assert sc.RIGID_PLAN_MARKER not in prompt
     assert sc.STRUCTURED_PLAN_MARKER not in prompt
-    assert sc.playbook_enforcement_for(cap) == "off"
 
 
 def test_wi3_a_prompt_contains_rigid_marker():
     cap = profile_for_letter("A")
     prompt = sc.plan_prompt_for(cap)
     assert sc.RIGID_PLAN_MARKER in prompt
-    assert sc.playbook_enforcement_for(cap) == "step_locked"
 
 
 # ===========================================================================
@@ -455,7 +453,13 @@ def test_wi7_a_allows_after_calc():
     af = [c for c in res.result["calls"] if c["tool"] == "add_features"]
     assert af and af[0]["ok"] is True
 
-def test_wi7_c_never_rejects_missing_calc():
+def test_wi7_c_never_rejects_missing_calc(monkeypatch):
+    from services.agent import guardrails
+    # Hole creation is destructive and independently requires a checkpoint.
+    monkeypatch.setattr(guardrails, "take_auto_checkpoint",
+                        lambda *a, **kw: (True, "checkpoint saved"))
+    monkeypatch.setattr(guardrails, "_doc_tree", lambda *a, **kw: {"features": []})
+    monkeypatch.setattr(guardrails, "_engine_body_count", lambda doc_id: 1)
     ledger = ListLedger()
     cap = profile_for_letter("C")
     provider = ScriptedProvider([

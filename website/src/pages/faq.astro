@@ -27,7 +27,7 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
       <div class="co-faq-list">
         <details class="co-faq" open>
           <summary>What is Chudware?</summary>
-          <div class="co-faq-answer"><p>Dimension-driven parametric CAD with assemblies, drawings, CAM, simulation, PLM, reverse engineering, and a team of AI agents in one document. It is a desktop application for Windows, Linux, and macOS, released as open source under the MIT License.</p></div>
+          <div class="co-faq-answer"><p>MIT-licensed, dimension-driven parametric CAD for engineers, with assemblies, drawings, CAM, simulation, PLM, reverse engineering, and an optional desktop copilot. Desktop packaging targets Windows, Linux, and macOS; experimental browser self-hosting uses a native engine on your server. See <a href="/download/">setup choices and current availability</a>.</p></div>
         </details>
         <details class="co-faq">
           <summary>Who is it for?</summary>
@@ -55,15 +55,15 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
         </details>
         <details class="co-faq">
           <summary>Does Chudware cost anything?</summary>
-          <div class="co-faq-answer"><p>No. Chudware is free to download and use, with no account, license key, or feature limits. If you use the AI copilot, your AI provider's own charges apply to that usage.</p></div>
+          <div class="co-faq-answer"><p>There is no Chudware software fee or license key for desktop use, source builds, or self-hosting. Your hardware, hosting, and AI provider costs are separate. Optional paid, owner-operated hosting supports development; <a href="/contact/">ask about hosting</a> directly. It is not required to run Chudware.</p></div>
         </details>
         <details class="co-faq">
           <summary>How can I contribute?</summary>
-          <div class="co-faq-answer"><p>Report bugs and request features in <a href={`${REPO}/issues`}>GitHub issues</a>, and send changes as pull requests. Read the <a href={`${REPO}/blob/HEAD/CONTRIBUTING.md`}>contributing guide</a> before you start; it covers the development setup and what a change needs before review.</p></div>
+          <div class="co-faq-answer"><p>Report bugs in <a href={`${REPO}/issues`}>GitHub issues</a> and follow the <a href={`${REPO}/blob/HEAD/CONTRIBUTING.md`}>contributing guide</a> before sending a pull request. The MIT source repository is public; no access request is needed.</p></div>
         </details>
         <details class="co-faq">
           <summary>Can I build it from source?</summary>
-          <div class="co-faq-answer"><p>Yes. The <a href={`${REPO}#building-from-source`}>Building from source</a> section of the README lists the toolchain and dependencies — a CMake-based C++20 toolchain, OpenCASCADE, and Python for the engine services — and the build commands for each platform.</p></div>
+          <div class="co-faq-answer"><p>Yes. Clone the public MIT repository and follow the <a href={`${REPO}#building-from-source`}>repository README</a> for native C++20, CMake, OpenCASCADE, and Python service dependencies. Supported desktop SDK and native runtime dependencies are pinned release assets in the same repository; macOS ARM64's native runtime remains unpinned. The <a href="/docs/self-hosting/">browser self-hosting guide</a> uses Docker Compose from the repository root. Public desktop installers are not yet available.</p></div>
         </details>
       </div>
     </div>
@@ -75,15 +75,15 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
       <div class="co-faq-list">
         <details class="co-faq" open>
           <summary>Do I need an account?</summary>
-          <div class="co-faq-answer"><p>No. Chudware has no accounts and no sign-in. The only sign-in you might use is with an AI provider, in Settings → Providers, if you prefer that to an API key.</p></div>
+          <div class="co-faq-answer"><p>The software and public source need no Chudware account or license activation. Any remotely exposed browser instance needs authentication supplied by its operator. AI providers have their own accounts and credentials; optional hosted-service access is arranged separately.</p></div>
         </details>
         <details class="co-faq">
           <summary>Which operating systems have a desktop build?</summary>
-          <div class="co-faq-answer"><p>Windows, Linux, and macOS, all x86-64. On Apple silicon the Intel build runs through Rosetta 2. The <a href="/download/">download page</a> lists the file formats for each platform.</p></div>
+          <div class="co-faq-answer"><p>Packaging targets Windows and Linux x86-64 and macOS ARM64 (Apple silicon). These targets are not a promise of public installers: none is currently available. The <a href="/download/">setup page</a> links platform notes and source-based self-hosting.</p></div>
         </details>
         <details class="co-faq">
-          <summary>Where do I download it?</summary>
-          <div class="co-faq-answer"><p>From the project's <a href={`${REPO}/releases/latest`}>GitHub Releases</a>. GitHub shows a SHA-256 digest beside each release asset so you can verify the file. Once installed, the app checks GitHub for newer releases and verifies each update's Ed25519 signature before staging it.</p></div>
+          <summary>Where do I get it?</summary>
+          <div class="co-faq-answer"><p>Start at <a href="/download/">setup choices</a>, clone the <a href={REPO}>public source repository</a>, and follow the <a href="/docs/self-hosting/">self-hosting guide</a>. Public desktop installers are not yet available; runtime-only prereleases are not desktop installers. <a href="/contact/">Contact the project</a> about optional paid hosting.</p></div>
         </details>
       </div>
     </div>
@@ -103,7 +103,7 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
         </details>
         <details class="co-faq">
           <summary>Where are projects stored?</summary>
-          <div class="co-faq-answer"><p>On your machine. Chudware saves documents as local files, and nothing leaves your workstation unless you send project context to an AI provider you configured. Keep your own exports and backups of anything important.</p></div>
+          <div class="co-faq-answer"><p>Desktop documents are local files. In browser mode, the workspace and engine state are on the server, not just in browser storage; the server operator can access that data. A server you operate is self-hosting; optional owner-operated hosting uses the hosting operator's infrastructure. AI provider requests and vendor lookups can send data to external services. Keep your own exports and backups and read <a href="/legal/privacy/">privacy</a>.</p></div>
         </details>
         <details class="co-faq">
           <summary>Can I migrate existing work?</summary>
@@ -123,7 +123,7 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
         </details>
         <details class="co-faq">
           <summary>How do I connect an AI provider?</summary>
-          <div class="co-faq-answer"><p>Open Settings → Providers and sign in with a supported provider account or paste your own API key. Enter credentials only there — never in chat, a prompt, or a project note.</p></div>
+          <div class="co-faq-answer"><p>In a desktop build with its compatible copilot runtime configured, open Settings → Providers and connect a supported provider account or your own API key. Enter credentials only there — never in chat or project notes. Online Copilot is not available in the browser deployment; see <a href="/docs/ai-copilot/">AI setup and limits</a>.</p></div>
         </details>
         <details class="co-faq">
           <summary>Who pays for AI usage?</summary>
@@ -147,11 +147,11 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
       <div class="co-faq-list">
         <details class="co-faq" open>
           <summary>Where can I get help?</summary>
-          <div class="co-faq-answer"><p>Start with the <a href="/docs/">documentation</a> and the <a href="/docs/troubleshooting/">troubleshooting guide</a>. Report bugs and ask questions in <a href={`${REPO}/issues`}>GitHub issues</a>; include your OS, the Chudware version, the steps you took, and the exact error text.</p></div>
+          <div class="co-faq-answer"><p>Start with the <a href="/docs/">documentation</a> and <a href="/docs/troubleshooting/">troubleshooting</a>. Use <a href={`${REPO}/issues`}>GitHub issues</a> or <a href="/contact/">contact the project</a>. Include your OS, version, steps, and exact error text, but no credentials or confidential files.</p></div>
         </details>
         <details class="co-faq">
           <summary>How do I report a security vulnerability?</summary>
-          <div class="co-faq-answer"><p>Report it privately through <a href={`${REPO}/security/advisories/new`}>GitHub's private vulnerability reporting</a>, as described in the <a href={`${REPO}/security/policy`}>security policy</a>. Do not open a public issue for a vulnerability.</p></div>
+          <div class="co-faq-answer"><p>Email <a href="mailto:support@chudware.com?subject=Private%20security%20report">support@chudware.com</a> privately with the affected version, impact, and a minimal reproduction. Repository members can also use <a href={`${REPO}/security/advisories/new`}>GitHub's private vulnerability reporting</a> if available. Do not open a public issue for a vulnerability or send credentials.</p></div>
         </details>
       </div>
     </div>
@@ -161,7 +161,7 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
     <div class="wrap section-heading">
       <p class="eyebrow">Still deciding?</p>
       <h2>Try it on a real project.</h2>
-      <div class="actions"><a class="button" href="/download/">Download</a><a class="button button-secondary" href={REPO}>View on GitHub</a></div>
+      <div class="actions"><a class="button" href="/download/">See setup choices</a><a class="button button-secondary" href="/contact/">Ask about hosting</a></div>
     </div>
   </section>
 </BaseLayout>

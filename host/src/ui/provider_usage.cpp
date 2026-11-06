@@ -36,8 +36,8 @@ struct UsageState {
     bool   usageInFlight    = false;
     bool   statusInFlight   = false;
     bool   rpcMissing       = false;   // unknown_method → stop polling, degrade quietly
-    std::map<std::string, BridgeUsage> bridge;   // Chudcode service windows, by provider id
-    bool   bridgeRpcMissing = false;   // chudcode_auth_state absent → stop asking the service
+    std::map<std::string, BridgeUsage> bridge;   // Omp service windows, by provider id
+    bool   bridgeRpcMissing = false;   // omp_auth_state absent → stop asking the service
     std::string lastError;
 };
 UsageState g;
@@ -147,7 +147,7 @@ void mergeUsageRows(const nlohmann::json& rows) {
     }
 }
 
-// `chudcode_auth_state`'s `usage.windows[]` → the same UsageWindow rows the subscription path
+// `omp_auth_state`'s `usage.windows[]` → the same UsageWindow rows the subscription path
 // produces, so ONE renderer serves both sources. The service differs only in spelling:
 // camelCase keys, a "<provider>:<window>" id, and a numeric resetsAt.
 void parseBridgeWindows(const nlohmann::json& wins, std::vector<UsageWindow>& out) {
@@ -204,17 +204,15 @@ void providerUsagePollUsage(AppState& st, bool force) {
     st.rpc.call("subscription_usage", nlohmann::json::object(), [](const core::RpcResult& r) {
         g.usageInFlight = false;
         g.lastUsagePoll = ImGui::GetTime();
-        if (!r.ok) {
-            // unknown_method / worker down — keep the last usage; latch missing once so we stop
-            // hammering and consumers stay on their "unavailable" path.
-            const std::string& err = r.err;
-            if (err.find("unknown_method") != std::string::npos ||
-                err.find("unknown method") != std::string::npos ||
-                err.find("not found") != std::string::npos) {
-                g.rpcMissing = true;
-            }
+        // An absent method (an older worker) latches, so the polling stops and consumers stay
+        // on their "unavailable" path. Strict on purpose: a transport blip — hostd restarting,
+        // its binary briefly missing while a rebuild replaces it — must never switch the usage
+        // rings off for the rest of the session.
+        if (core::workerMethodAbsent(r)) {
+            g.rpcMissing = true;
             return;
         }
+        if (!r.ok) return;   // worker down / timed out: keep the last usage
         if (!r.result.is_object()) return;
         if (!jbool(r.result, "ok", true)) return;   // soft failure (429 / outage): keep prior
         if (const auto* rows = jarr(r.result, "rows")) mergeUsageRows(*rows);
@@ -231,22 +229,18 @@ void providerUsagePollBridge(AppState& st, const char* bridgeProviderId, bool fo
     if (slot.inFlight) return;
     slot.lastPoll = now;
     slot.inFlight = true;
-    st.rpc.call("chudcode_auth_state", nlohmann::json{{"providerId", id}},
+    st.rpc.call("omp_auth_state", nlohmann::json{{"providerId", id}},
                 [id](const core::RpcResult& r) {
         BridgeUsage& s = g.bridge[id];   // std::map: the slot taken above is still this one
         s.inFlight = false;
         s.lastPoll = ImGui::GetTime();
-        if (!r.ok) {
-            // Same latch as subscription_usage: an absent method stops the polling for good,
-            // a transport blip just keeps the windows we already have.
-            const std::string& err = r.err;
-            if (err.find("unknown_method") != std::string::npos ||
-                err.find("unknown method") != std::string::npos ||
-                err.find("not found") != std::string::npos) {
-                g.bridgeRpcMissing = true;
-            }
+        // Same strict latch as subscription_usage: only an absent method stops the polling for
+        // good; a transport blip just keeps the windows we already have.
+        if (core::workerMethodAbsent(r)) {
+            g.bridgeRpcMissing = true;
             return;
         }
+        if (!r.ok) return;
         if (!r.result.is_object()) return;
         if (!jbool(r.result, "ok", true)) return;   // signed out / upstream 429: keep prior
         const nlohmann::json usage = jobj(r.result, "usage");

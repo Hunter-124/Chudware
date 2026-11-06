@@ -11,13 +11,11 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
-#include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <map>
-#include <iomanip>
-#include <random>
 #include <regex>
 #include <set>
 #include <sstream>
@@ -69,18 +67,31 @@ std::vector<std::string> tokenize(const std::string& text) {
             ++i;
             continue;
         }
+        // KiCad embedded files use a vertical-bar-delimited data block. It can
+        // span lines and is one atom, not a sequence of whitespace tokens.
+        if (c == '|') {
+            account(c);
+            const std::size_t end = text.find('|', i + 1);
+            if (end == std::string::npos)
+                throw std::runtime_error("Unterminated KiCad data block");
+            out.push_back(text.substr(i, end - i + 1));
+            i = end + 1;
+            continue;
+        }
         if (c == '"') {
             account(c);
             // quoted string: "(?:[^"\\]|\\.)*"
             std::string tok(1, '"');
             std::size_t j = i + 1;
+            bool terminated = false;
             while (j < n) {
                 const char d = text[j];
                 tok += d;
                 if (d == '\\' && j + 1 < n) { tok += text[j + 1]; j += 2; continue; }
                 ++j;
-                if (d == '"') break;
+                if (d == '"') { terminated = true; break; }
             }
+            if (!terminated) throw std::runtime_error("Unterminated KiCad string");
             out.push_back(std::move(tok));
             i = j;
             continue;
@@ -224,22 +235,9 @@ double py_round(double v) {
 // Python round(x, 6) as used by the importers (scaling form, see erc.cpp::snap_xy).
 double round6(double x) { return py_round(x * 1e6) / 1e6 + 0.0; }
 
-std::string uuid4() {
-    static std::mt19937_64 rng(std::random_device{}());
-    unsigned char b[16];
-    for (unsigned char& byte : b) byte = static_cast<unsigned char>(rng() & 0xff);
-    b[6] = static_cast<unsigned char>((b[6] & 0x0f) | 0x40);  // version 4
-    b[8] = static_cast<unsigned char>((b[8] & 0x3f) | 0x80);  // variant 1
-    char buf[37];
-    std::snprintf(buf, sizeof(buf),
-                  "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                  b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11],
-                  b[12], b[13], b[14], b[15]);
-    return std::string(buf);
-}
 
 std::string read_text(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
+    std::ifstream f(std::filesystem::u8path(path), std::ios::binary);
     if (!f) throw std::runtime_error("No such file or directory: '" + path + "'");
     std::string text;
     char chunk[16384];
@@ -336,15 +334,14 @@ json parse_pin(const json& node, int unit) {
     double x = 0.0, y = 0.0, angle = 0.0;
     if (const json* at = find(node, "at"); at && at->size() >= 3) {
         x = f64((*at)[1]);
-        y = flip_y(f64((*at)[2]));
+        y = f64((*at)[2]);
         if (at->size() > 3) angle = f64((*at)[3]);
     }
     double length = 2.54;
     if (const json* len = find(node, "length"); len && len->size() > 1)
         length = f64((*len)[1]);
-    std::string pin_name = "~";
+    std::string pin_name;
     if (const json* nm = find(node, "name"); nm && nm->size() > 1) pin_name = jstr((*nm)[1]);
-    if (pin_name == "~") pin_name = "";
     std::string pin_number = "1";
     if (const json* num = find(node, "number"); num && num->size() > 1)
         pin_number = jstr((*num)[1]);
@@ -363,8 +360,16 @@ json parse_pin(const json& node, int unit) {
                                   {"shape", alt_shape}});
     }
 
+    // KiCad library pin positions are the electrical ends, in a +Y-up
+    // coordinate system. The native schema stores the body end and an
+    // outward-facing angle instead.
+    const double radians = angle * 3.14159265358979323846 / 180.0;
+    x += length * std::cos(radians);
+    y += length * std::sin(radians);
+    angle = std::fmod(angle + 180.0, 360.0);
+    if (angle < 0) angle += 360.0;
     return json{{"number", pin_number}, {"name", pin_name},
-                {"pos", json::array({x, y})}, {"angle", angle},
+                {"pos", json::array({round6(x), round6(y)})}, {"angle", angle},
                 {"length", length},        {"type", pin_type},
                 {"shape", pin_shape},      {"unit", unit},
                 {"alt", alternates}};
@@ -376,14 +381,14 @@ const std::set<std::string>& sym_graphic_tags() {
 }
 
 // kicad_sym.py::_parse_graphic — body graphic -> Graphic dict (best-effort).
-json parse_sym_graphic(const json& node) {
+json parse_sym_graphic(const json& node, bool sheet_coords = false) {
     const std::string t = tag(node);
     if (t == "rectangle") {
         const json* start = find(node, "start");
         const json* end = find(node, "end");
         if (start && end && start->size() >= 3 && end->size() >= 3) {
-            json p1 = json::array({f64((*start)[1]), flip_y(f64((*start)[2]))});
-            json p2 = json::array({f64((*end)[1]), flip_y(f64((*end)[2]))});
+            json p1 = json::array({f64((*start)[1]), f64((*start)[2])});
+            json p2 = json::array({f64((*end)[1]), f64((*end)[2])});
             return json{{"kind", "rect"}, {"pts", json::array({p1, p2})},
                         {"type", "rect"}, {"p1", p1}, {"p2", p2}};
         }
@@ -392,7 +397,7 @@ json parse_sym_graphic(const json& node) {
             json pts = json::array();
             for (const json* xy : findall(*pts_node, "xy"))
                 if (xy->size() >= 3)
-                    pts.push_back(json::array({f64((*xy)[1]), flip_y(f64((*xy)[2]))}));
+                    pts.push_back(json::array({f64((*xy)[1]), f64((*xy)[2])}));
             if (!pts.empty())
                 return json{{"kind", "polyline"}, {"pts", pts},
                             {"type", "polyline"}};
@@ -401,7 +406,7 @@ json parse_sym_graphic(const json& node) {
         const json* center = find(node, "center");
         const json* radius = find(node, "radius");
         if (center && radius && center->size() >= 3 && radius->size() >= 2) {
-            json c = json::array({f64((*center)[1]), flip_y(f64((*center)[2]))});
+            json c = json::array({f64((*center)[1]), f64((*center)[2])});
             return json{{"kind", "circle"}, {"pts", json::array({c})},
                         {"radius", f64((*radius)[1])}, {"type", "circle"},
                         {"center", c}};
@@ -412,9 +417,10 @@ json parse_sym_graphic(const json& node) {
         const json* end = find(node, "end");
         if (start && mid && end && start->size() >= 3 && mid->size() >= 3 &&
             end->size() >= 3) {
-            const double x1 = f64((*start)[1]), y1 = flip_y(f64((*start)[2]));
-            const double x2 = f64((*mid)[1]), y2 = flip_y(f64((*mid)[2]));
-            const double x3 = f64((*end)[1]), y3 = flip_y(f64((*end)[2]));
+            const double sign = sheet_coords ? -1.0 : 1.0;
+            const double x1 = f64((*start)[1]), y1 = sign * f64((*start)[2]);
+            const double x2 = f64((*mid)[1]), y2 = sign * f64((*mid)[2]);
+            const double x3 = f64((*end)[1]), y3 = sign * f64((*end)[2]);
             const double d = 2.0 * (x1 * (y2 - y3) + x2 * (y3 - y1) +
                                     x3 * (y1 - y2));
             json p1 = json::array({x1, y1});
@@ -443,7 +449,7 @@ json parse_sym_graphic(const json& node) {
     } else if (t == "text") {
         const std::string text_val = node.size() > 1 ? jstr(node[1]) : "";
         if (const json* at = find(node, "at"); at && at->size() >= 3) {
-            json p = json::array({f64((*at)[1]), flip_y(f64((*at)[2]))});
+            json p = json::array({f64((*at)[1]), f64((*at)[2])});
             double size = 1.27;
             if (const json* effects = find(node, "effects")) {
                 if (const json* font = find(*effects, "font")) {
@@ -656,22 +662,22 @@ json parse_pad(const json& node, int index) {
 }
 
 const std::set<std::string>& fp_graphic_tags() {
-    static const std::set<std::string> t{"fp_line", "fp_circle", "fp_arc", "fp_poly", "fp_text"};
+    static const std::set<std::string> t{"fp_line", "fp_rect", "fp_circle", "fp_arc", "fp_poly", "fp_text"};
     return t;
 }
 
 // kicad_mod.py::_parse_graphic — footprint graphic (best-effort).
-json parse_fp_graphic(const json& node) {
+json parse_fp_graphic_geometry(const json& node) {
     const std::string t = tag(node);
     std::string layer = "F.SilkS";
     if (const json* layer_node = find(node, "layer"); layer_node && layer_node->size() > 1)
         layer = jstr((*layer_node)[1]);
 
-    if (t == "fp_line") {
+    if (t == "fp_line" || t == "fp_rect") {
         const json* start = find(node, "start");
         const json* end = find(node, "end");
         if (start && end && start->size() >= 3 && end->size() >= 3)
-            return json{{"type", "line"},
+            return json{{"type", t == "fp_rect" ? "rect" : "line"},
                         {"p1", json::array({f64((*start)[1]), flip_y(f64((*start)[2]))})},
                         {"p2", json::array({f64((*end)[1]), flip_y(f64((*end)[2]))})},
                         {"layer", layer}};
@@ -719,6 +725,19 @@ json parse_fp_graphic(const json& node) {
     return json(nullptr);
 }
 
+json parse_fp_graphic(const json& node) {
+    json graphic = parse_fp_graphic_geometry(node);
+    if (graphic.is_null()) return graphic;
+    const json* width = find(node, "width");
+    if (const json* stroke = find(node, "stroke"))
+        if (const json* stroke_width = find(*stroke, "width")) width = stroke_width;
+    if (width && width->size() > 1 && (*width)[1].is_number())
+        graphic["width"] = (*width)[1];
+    if (const json* at = find(node, "at"); at && at->size() > 3 && (*at)[3].is_number())
+        graphic["angle"] = (*at)[3];
+    return graphic;
+}
+
 // kicad_mod.py::_parse_model — (model path (offset (xyz ...)) (scale ...) (rotate ...)).
 json parse_model(const json& node) {
     if (tag(node) != "model") return json(nullptr);
@@ -760,6 +779,7 @@ json parse_footprint(const json& tree, const std::string& fpid_override = "") {
     json pads = json::array();
     json graphics = json::array();
     json model_3d = json(nullptr);
+    const json* description = find(tree, "descr");
 
     for (std::size_t i = 1; i < tree.size(); ++i) {
         const json& child = tree[i];
@@ -782,7 +802,7 @@ json parse_footprint(const json& tree, const std::string& fpid_override = "") {
                 {"model_3d", model_3d.is_null() ? json(nullptr) : model_3d["path"]},
                 {"model_3d_transform", model_3d},
                 {"attr", attr},
-                {"description", ""}};
+                {"description", description && description->size() > 1 ? jstr((*description)[1]) : ""}};
 }
 
 // ---------------------------------------------------------------------------
@@ -814,12 +834,58 @@ std::string node_uuid(const json& node) {
     return uuid && uuid->size() > 1 ? jstr((*uuid)[1]) : "";
 }
 
+// Keep all original child nodes (and any positional atoms) in order, including
+// modeled children whose KiCad-only attributes must survive unrelated edits.
 void retain_uuid(json& object, const json& node) {
     const std::string uuid = node_uuid(node);
-    if (uuid.empty()) return;
-    if (!object.contains("fields") || !object["fields"].is_object())
-        object["fields"] = json::object();
-    object["fields"]["kicad_uuid"] = uuid;
+    if (!uuid.empty()) object["uuid"] = uuid;
+    object["kicad_tag"] = tag(node);
+    object["kicad_extra"] = json::array();
+    for (std::size_t i = 1; i < node.size(); ++i) object["kicad_extra"].push_back(node[i]);
+}
+
+json modeled_snapshot(const json& object) {
+    json snapshot = object;
+    snapshot.erase("uuid");
+    snapshot.erase("kicad_extra");
+    snapshot.erase("kicad_tag");
+    snapshot.erase("kicad_original");
+    return snapshot;
+}
+
+void snapshot_objects(json& value) {
+    if (value.is_array()) {
+        for (json& item : value) snapshot_objects(item);
+    } else if (value.is_object()) {
+        for (auto& [key, item] : value.items())
+            if (key != "kicad_extra" && key != "kicad_original")
+                snapshot_objects(item);
+        if (value.contains("kicad_extra"))
+            value["kicad_original"] = modeled_snapshot(value);
+    }
+}
+
+json root_metadata(const json& tree) {
+    json result{{"version", 0}, {"generator", ""}, {"generator_version", ""},
+                {"uuid", node_uuid(tree)}, {"extra", json::array()}};
+    for (const char* key : {"version", "generator", "generator_version"}) {
+        if (const json* node = find(tree, key); node && node->size() > 1)
+            result[key] = (*node)[1];
+    }
+    return result;
+}
+
+// KiCad 9 and earlier use "~" as the empty-name/field sentinel. KiCad 10
+// treats it as literal text, so normalize retained nodes before modeling them.
+void upgrade_schematic_sentinels(json& node, const std::string& parent = "") {
+    if (!node.is_array() || node.empty()) return;
+    const std::string kind = tag(node);
+    if (kind == "name" && parent == "pin" && node.size() > 1 && node[1] == "~")
+        node[1] = "";
+    else if (kind == "property" && node.size() > 2 && node[2] == "~")
+        node[2] = "";
+    for (std::size_t i = 1; i < node.size(); ++i)
+        if (node[i].is_array()) upgrade_schematic_sentinels(node[i], kind);
 }
 
 json node_points(const json& node) {
@@ -877,7 +943,7 @@ json parse_sch_graphic(const json& node) {
                        round6(f64((*center)[1])), round6(flip_y(f64((*center)[2])))})})},
                    {"radius", f64((*radius)[1])}};
     } else if (t == "arc") {
-        json parsed = parse_sym_graphic(node);
+        json parsed = parse_sym_graphic(node, true);
         if (parsed.is_null()) return parsed;
         out["kind"] = parsed.value("kind", std::string("arc"));
         out["pts"] = parsed.value("pts", json::array());
@@ -956,6 +1022,20 @@ json sexpr_parse(const std::string& text) {
     return tree;
 }
 
+json symbol_def(const json& node, const std::string& nickname) {
+    json copy = node;
+    if (copy.is_array() && copy.size() > 1 && copy[1].is_string()) {
+        const std::string name = copy[1].get<std::string>();
+        const auto colon = name.find(':');
+        if (colon != std::string::npos) copy[1] = name.substr(colon + 1);
+    }
+    return parse_symbol(copy, nickname);
+}
+
+json footprint_def(const json& node, const std::string& fpid) {
+    return parse_footprint(node, fpid);
+}
+
 // ---------------------------------------------------------------------------
 // formats.py::import_kicad_sch
 // ---------------------------------------------------------------------------
@@ -970,19 +1050,21 @@ json import_kicad_sch(const std::string& source) {
         src_name = path_stem(source);
     }
 
-    const json tree = sexpr_parse(text);
+    json tree = sexpr_parse(text);
     if (tag(tree) != "kicad_sch")
         throw std::runtime_error("Expected kicad_sch root, got '" + tag(tree) + "'");
+    if (const json* version = find(tree, "version"); version && version->size() > 1 &&
+        (*version)[1].is_number() && f64((*version)[1]) < 20260306)
+        upgrade_schematic_sentinels(tree);
 
     json doc = schema::new_schematic(src_name);
-    doc["id"] = uuid4();
     doc["bus_entries"] = json::array();
     doc["texts"] = json::array();
     doc["title_block"] = json{{"title", ""}, {"company", ""}, {"rev", ""},
                               {"date", ""}, {"comment1", ""}, {"comment2", ""},
                               {"comment3", ""}, {"comment4", ""}, {"paper", "A4"}};
-    const std::string root_uuid = node_uuid(tree);
-    if (!root_uuid.empty()) doc["fields"] = json{{"kicad_uuid", root_uuid}};
+    doc["kicad"] = root_metadata(tree);
+    doc["kicad"]["lib_symbols"] = json::object();
 
     json lib_cache = json::object();
     int sym_counter = 0, wire_counter = 0, junction_counter = 0, label_counter = 0,
@@ -998,6 +1080,7 @@ json import_kicad_sch(const std::string& source) {
             const json& child = (*lib_syms)[i];
             if (!child.is_array() || tag(child) != "symbol") continue;
             const std::string sym_name_raw = child.size() > 1 ? jstr(child[1]) : "";
+            if (!sym_name_raw.empty()) doc["kicad"]["lib_symbols"][sym_name_raw] = child;
             if (std::regex_search(sym_name_raw, kSubSymbolRe)) continue;
             const std::size_t colon = sym_name_raw.find(':');
             const std::string lib_nm =
@@ -1049,10 +1132,15 @@ json import_kicad_sch(const std::string& source) {
         "version", "generator", "generator_version", "uuid", "paper", "title_block",
         "lib_symbols", "bus_alias", "sheet_instances", "embedded_fonts"};
 
+    static const std::vector<std::string> object_lists{
+        "symbols", "power", "wires", "buses", "bus_entries", "junctions",
+        "no_connect", "labels", "texts", "graphics", "sheet_symbols"};
     for (std::size_t i = 1; i < tree.size(); ++i) {
         const json& child = tree[i];
         if (!child.is_array()) continue;
         const std::string ct = tag(child);
+        std::vector<std::size_t> before;
+        for (const auto& key : object_lists) before.push_back(doc[key].size());
 
         if (ct == "symbol") {
             std::string lib_id = "Device:Unknown";
@@ -1082,8 +1170,6 @@ json import_kicad_sch(const std::string& source) {
             json fields = json::object();
             for (const auto& [key, field_value] : props.items())
                 if (!kPromotedProps.count(key)) fields[key] = field_value;
-            const std::string uuid = node_uuid(child);
-            if (!uuid.empty()) fields["kicad_uuid"] = uuid;
 
             if (!lib_cache.contains(lib_id)) {
                 const std::size_t colon = lib_id.find(':');
@@ -1104,13 +1190,19 @@ json import_kicad_sch(const std::string& source) {
 
             const json pos = json::array({round6(x), round6(y)});
             if (starts_with(lib_id, "power:") || starts_with(ref, "#PWR")) {
-                std::string net_name = lib_id.find(':') != std::string::npos
-                                           ? lib_id.substr(lib_id.find(':') + 1)
-                                           : lib_id;
+                const std::string symbol = lib_id.find(':') != std::string::npos
+                                               ? lib_id.substr(lib_id.find(':') + 1)
+                                               : lib_id;
+                std::string net_name = symbol;
+                if (symbol == "PWR_FLAG" && props.contains("Chudware.PowerNet") &&
+                    props["Chudware.PowerNet"].is_string()) {
+                    net_name = props["Chudware.PowerNet"].get<std::string>();
+                    fields.erase("Chudware.PowerNet");
+                }
                 if (net_name.empty()) net_name = !value.empty() ? value : ref;
                 json object{{"id", "p" + std::to_string(++power_counter)},
                             {"sheet", sheet_id}, {"pos", pos}, {"net", net_name},
-                            {"symbol", net_name}, {"libid", lib_id}, {"ref", ref},
+                            {"symbol", symbol}, {"libid", lib_id}, {"ref", ref},
                             {"value", value}, {"footprint", footprint},
                             {"datasheet", datasheet}, {"angle", angle},
                             {"mirror", mirror}, {"unit", unit}, {"fields", fields},
@@ -1261,9 +1353,7 @@ json import_kicad_sch(const std::string& source) {
                 json pin_object{{"name", name},
                                 {"pos", json::array({round6(px), round6(py)})},
                                 {"shape", shape}, {"angle", pin_angle}};
-                const std::string pin_uuid = node_uuid(*pin);
-                if (!pin_uuid.empty())
-                    pin_object["fields"] = json{{"kicad_uuid", pin_uuid}};
+                retain_uuid(pin_object, *pin);
                 pins.push_back(pin_object);
                 ports.push_back(json{{"name", name}, {"type", shape},
                                      {"pos", pin_object["pos"]}});
@@ -1271,13 +1361,13 @@ json import_kicad_sch(const std::string& source) {
 
             json sheet_fields = json::object();
             for (const auto& [key, value] : props.items()) sheet_fields[key] = value;
-            const std::string uuid = node_uuid(child);
-            if (!uuid.empty()) sheet_fields["kicad_uuid"] = uuid;
             json sheet_object{{"id", child_id},
                               {"name", prop("Sheetname", "Sheet" + std::to_string(child_sheet_counter))},
                               {"parent", sheet_id}, {"size", size},
                               {"instances_of", prop("Sheetfile", "")},
                               {"ports", ports}, {"fields", sheet_fields}};
+            const std::string sheet_uuid = node_uuid(child);
+            if (!sheet_uuid.empty()) sheet_object["uuid"] = sheet_uuid;
             json symbol_object{{"id", "ss" + std::to_string(child_sheet_counter)},
                                {"sheet", sheet_id}, {"child", child_id},
                                {"pos", json::array({round6(x), round6(y)})},
@@ -1287,6 +1377,38 @@ json import_kicad_sch(const std::string& source) {
         } else if (!kMetadataNodes.count(ct)) {
             ++unsupported[ct.empty() ? "<malformed>" : ct];
         }
+        bool represented = false;
+        for (std::size_t k = 0; k < object_lists.size(); ++k) {
+            json& list = doc[object_lists[k]];
+            if (list.size() > before[k]) {
+                retain_uuid(list.back(), child);
+                if ((object_lists[k] == "symbols" || object_lists[k] == "power") &&
+                    list.back().contains("fields")) {
+                    json& fields = list.back()["fields"];
+                    if (fields.contains("Chudware.SimParams") &&
+                        fields["Chudware.SimParams"].is_string()) {
+                        json sim = json::parse(fields["Chudware.SimParams"].get<std::string>(),
+                                               nullptr, false);
+                        if (!sim.is_discarded()) {
+                            list.back()["sim_params"] = std::move(sim);
+                            fields.erase("Chudware.SimParams");
+                        }
+                    }
+                    if (fields.contains("Chudware.Fields") && fields["Chudware.Fields"].is_string()) {
+                        json values = json::parse(fields["Chudware.Fields"].get<std::string>(),
+                                                  nullptr, false);
+                        if (values.is_object()) {
+                            fields.erase("Chudware.Fields");
+                            for (const auto& [name, value] : values.items()) fields[name] = value;
+                        }
+                    }
+                }
+                represented = true;
+            }
+        }
+        if (!represented && ct != "version" && ct != "generator" &&
+            ct != "generator_version" && ct != "uuid" && ct != "lib_symbols")
+            doc["kicad"]["extra"].push_back(child);
     }
 
     for (json& bus : doc["buses"]) {
@@ -1319,294 +1441,10 @@ json import_kicad_sch(const std::string& source) {
         doc["warnings"].push_back("kicad_unsupported_node: " + kind + " (x" +
                                   std::to_string(count) + ")");
     doc["lib_cache"] = lib_cache;
+    for (const auto& key : object_lists) snapshot_objects(doc[key]);
     return doc;
 }
 
-namespace {
-
-std::string sexpr_quote(const std::string& value) {
-    std::string out = "\"";
-    for (char c : value) {
-        if (c == '\\') out += "\\\\";
-        else if (c == '"') out += "\\\"";
-        else if (c == '\n') out += "\\n";
-        else if (c == '\r') out += "\\r";
-        else if (c == '\t') out += "\\t";
-        else out += c;
-    }
-    out += '"';
-    return out;
-}
-
-std::string sexpr_number(double value) {
-    if (std::abs(value) < 5e-13) value = 0.0;
-    std::ostringstream out;
-    out << std::setprecision(12) << value;
-    return out.str();
-}
-
-std::uint64_t fnv1a(const std::string& value, std::uint64_t seed) {
-    std::uint64_t hash = seed;
-    for (unsigned char c : value) {
-        hash ^= c;
-        hash *= 1099511628211ULL;
-    }
-    return hash;
-}
-
-std::string stable_uuid(const std::string& key) {
-    std::uint64_t hi = fnv1a(key, 1469598103934665603ULL);
-    std::uint64_t lo = fnv1a(key, 1099511628211ULL);
-    unsigned char bytes[16];
-    for (int i = 0; i < 8; ++i) {
-        bytes[i] = static_cast<unsigned char>((hi >> (56 - 8 * i)) & 0xff);
-        bytes[8 + i] = static_cast<unsigned char>((lo >> (56 - 8 * i)) & 0xff);
-    }
-    bytes[6] = static_cast<unsigned char>((bytes[6] & 0x0f) | 0x40);
-    bytes[8] = static_cast<unsigned char>((bytes[8] & 0x3f) | 0x80);
-    char text[37];
-    std::snprintf(text, sizeof(text),
-                  "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                  bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
-                  bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
-                  bytes[12], bytes[13], bytes[14], bytes[15]);
-    return text;
-}
-
-std::string object_uuid(const json& object, const std::string& category) {
-    if (object.contains("fields") && object["fields"].is_object()) {
-        const json& fields = object["fields"];
-        if (fields.contains("kicad_uuid") && fields["kicad_uuid"].is_string() &&
-            !fields["kicad_uuid"].get<std::string>().empty())
-            return fields["kicad_uuid"].get<std::string>();
-    }
-    return stable_uuid(category + ":" + object.value("id", std::string()));
-}
-
-double xy_value(const json& value, std::size_t index) {
-    return value.is_array() && value.size() > index && value[index].is_number()
-               ? value[index].get<double>()
-               : 0.0;
-}
-
-std::string at_expr(const json& pos, double angle = 0.0) {
-    return "(at " + sexpr_number(xy_value(pos, 0)) + " " +
-           sexpr_number(-xy_value(pos, 1)) + " " + sexpr_number(angle) + ")";
-}
-
-std::vector<const json*> sorted_objects(const json& sch, const char* key,
-                                        const std::string& sheet = "") {
-    std::vector<const json*> out;
-    if (!sch.contains(key) || !sch[key].is_array()) return out;
-    for (const json& object : sch[key]) {
-        if (!object.is_object()) continue;
-        if (!sheet.empty() && object.value("sheet", std::string("sh1")) != sheet)
-            continue;
-        out.push_back(&object);
-    }
-    std::sort(out.begin(), out.end(), [](const json* a, const json* b) {
-        return a->value("id", std::string()) < b->value("id", std::string());
-    });
-    return out;
-}
-
-std::string pin_type_kicad(const std::string& value) {
-    if (value == "power_in") return "power_in";
-    if (value == "power_out") return "power_out";
-    if (pin_type_map().count(value)) return value;
-    return "passive";
-}
-
-void write_pts(std::ostringstream& out, const json& pts) {
-    out << "(pts";
-    if (pts.is_array()) {
-        for (const json& p : pts)
-            out << " (xy " << sexpr_number(xy_value(p, 0)) << " "
-                << sexpr_number(-xy_value(p, 1)) << ")";
-    }
-    out << ")";
-}
-
-void write_stroke_fill(std::ostringstream& out, const json& graphic) {
-    out << " (stroke (width "
-        << sexpr_number(graphic.value("width", 0.25))
-        << ") (type default)) (fill (type "
-        << (graphic.value("filled", false) ? "background" : "none") << "))";
-}
-
-void write_graphic_node(std::ostringstream& out, const json& graphic,
-                        const std::string& indent, bool with_uuid) {
-    const std::string kind =
-        graphic.value("kind", graphic.value("type", std::string()));
-    json pts = graphic.value("pts", json::array());
-    if (pts.empty() && graphic.contains("p1") && graphic.contains("p2"))
-        pts = json::array({graphic["p1"], graphic["p2"]});
-
-    out << indent;
-    if (kind == "rect" && pts.size() >= 2) {
-        out << "(rectangle (start " << sexpr_number(xy_value(pts[0], 0)) << " "
-            << sexpr_number(-xy_value(pts[0], 1)) << ") (end "
-            << sexpr_number(xy_value(pts[1], 0)) << " "
-            << sexpr_number(-xy_value(pts[1], 1)) << ")";
-    } else if (kind == "circle" && !pts.empty()) {
-        out << "(circle (center " << sexpr_number(xy_value(pts[0], 0)) << " "
-            << sexpr_number(-xy_value(pts[0], 1)) << ") (radius "
-            << sexpr_number(graphic.value("radius", 1.0)) << ")";
-    } else if (kind == "arc") {
-        json start, mid, end;
-        if (graphic.contains("kicad_start") && graphic.contains("kicad_mid") &&
-            graphic.contains("kicad_end")) {
-            start = graphic["kicad_start"];
-            mid = graphic["kicad_mid"];
-            end = graphic["kicad_end"];
-        } else if (!pts.empty()) {
-            const double cx = xy_value(pts[0], 0), cy = xy_value(pts[0], 1);
-            const double radius = graphic.value("radius", 1.0);
-            const double a0 = graphic.value("a0", 0.0);
-            const double a1 = graphic.value("a1", 90.0);
-            const double am = (a0 + a1) * 0.5;
-            const double deg = 3.14159265358979323846 / 180.0;
-            start = json::array({cx + radius * std::cos(a0 * deg),
-                                 cy + radius * std::sin(a0 * deg)});
-            mid = json::array({cx + radius * std::cos(am * deg),
-                               cy + radius * std::sin(am * deg)});
-            end = json::array({cx + radius * std::cos(a1 * deg),
-                               cy + radius * std::sin(a1 * deg)});
-        } else {
-            return;
-        }
-        out << "(arc (start " << sexpr_number(xy_value(start, 0)) << " "
-            << sexpr_number(-xy_value(start, 1)) << ") (mid "
-            << sexpr_number(xy_value(mid, 0)) << " "
-            << sexpr_number(-xy_value(mid, 1)) << ") (end "
-            << sexpr_number(xy_value(end, 0)) << " "
-            << sexpr_number(-xy_value(end, 1)) << ")";
-    } else if (kind == "text") {
-        const json pos = graphic.contains("pos")
-                             ? graphic["pos"]
-                             : (!pts.empty() ? pts[0] : json::array({0.0, 0.0}));
-        out << "(text " << sexpr_quote(graphic.value("text", std::string())) << " "
-            << at_expr(pos) << " (effects (font (size "
-            << sexpr_number(graphic.value("size", 1.27)) << " "
-            << sexpr_number(graphic.value("size", 1.27)) << "))))\n";
-        return;
-    } else {
-        if (pts.size() < 2) return;
-        out << "(polyline ";
-        write_pts(out, pts);
-    }
-    write_stroke_fill(out, graphic);
-    if (with_uuid)
-        out << " (uuid " << object_uuid(graphic, "graphic") << ")";
-    out << ")\n";
-}
-
-void write_property(std::ostringstream& out, const std::string& name,
-                    const std::string& value, const json& pos, double angle,
-                    const std::string& indent) {
-    out << indent << "(property " << sexpr_quote(name) << " " << sexpr_quote(value)
-        << " " << at_expr(pos, angle)
-        << " (effects (font (size 1.27 1.27))))\n";
-}
-
-std::string join_string_values(const json& values) {
-    if (values.is_string()) return values.get<std::string>();
-    if (!values.is_array()) return "";
-    std::string out;
-    for (const json& value : values) {
-        if (!value.is_string()) continue;
-        if (!out.empty()) out += ' ';
-        out += value.get<std::string>();
-    }
-    return out;
-}
-
-void write_lib_symbol(std::ostringstream& out, const std::string& libid,
-                      const json& definition) {
-    const std::size_t colon = libid.find(':');
-    const std::string name = definition.value(
-        "name", colon == std::string::npos ? libid : libid.substr(colon + 1));
-    const std::string prefix = definition.value(
-        "prefix", definition.value("reference_prefix", std::string("U")));
-    const std::string value = definition.value("value", name);
-    const std::string footprint = definition.value("default_footprint", std::string());
-    const std::string datasheet = definition.value("datasheet", std::string());
-
-    out << "    (symbol " << sexpr_quote(libid) << "\n";
-    if (definition.value("power", false)) out << "      (power)\n";
-    write_property(out, "Reference", prefix, json::array({0.0, 0.0}), 0.0, "      ");
-    write_property(out, "Value", value, json::array({0.0, -2.54}), 0.0, "      ");
-    write_property(out, "Footprint", footprint, json::array({0.0, 0.0}), 0.0, "      ");
-    write_property(out, "Datasheet", datasheet, json::array({0.0, 0.0}), 0.0, "      ");
-    if (definition.contains("description") && definition["description"].is_string() &&
-        !definition["description"].get<std::string>().empty())
-        write_property(out, "Description", definition["description"].get<std::string>(),
-                       json::array({0.0, 0.0}), 0.0, "      ");
-    const std::string keyword_text =
-        join_string_values(definition.value("keywords", json::array()));
-    if (!keyword_text.empty())
-        write_property(out, "ki_keywords", keyword_text,
-                       json::array({0.0, 0.0}), 0.0, "      ");
-    const std::string filter_text =
-        join_string_values(definition.value("footprint_filters", json::array()));
-    if (!filter_text.empty())
-        write_property(out, "ki_fp_filters", filter_text,
-                       json::array({0.0, 0.0}), 0.0, "      ");
-    if (definition.contains("fields") && definition["fields"].is_object()) {
-        std::vector<std::string> field_names;
-        for (const auto& [field_name, field_value] : definition["fields"].items())
-            if (field_value.is_string()) field_names.push_back(field_name);
-        std::sort(field_names.begin(), field_names.end());
-        for (const std::string& field_name : field_names)
-            write_property(out, field_name,
-                           definition["fields"][field_name].get<std::string>(),
-                           json::array({0.0, 0.0}), 0.0, "      ");
-    }
-
-    out << "      (symbol " << sexpr_quote(name + "_0_1") << "\n";
-    if (definition.contains("graphics") && definition["graphics"].is_array())
-        for (const json& graphic : definition["graphics"])
-            write_graphic_node(out, graphic, "        ", false);
-    out << "      )\n";
-
-    std::map<int, std::vector<const json*>> pins_by_unit;
-    if (definition.contains("pins") && definition["pins"].is_array())
-        for (const json& pin : definition["pins"])
-            pins_by_unit[pin.value("unit", 1)].push_back(&pin);
-    for (auto& [unit, pins] : pins_by_unit) {
-        std::sort(pins.begin(), pins.end(), [](const json* a, const json* b) {
-            return a->value("number", std::string()) < b->value("number", std::string());
-        });
-        out << "      (symbol " << sexpr_quote(name + "_" + std::to_string(unit) + "_1")
-            << "\n";
-        for (const json* pin : pins) {
-            out << "        (pin "
-                << pin_type_kicad(pin->value("type", std::string("passive"))) << " "
-                << pin->value("shape", std::string("line")) << " "
-                << at_expr(pin->value("pos", json::array({0.0, 0.0})),
-                           pin->value("angle", 0.0))
-                << " (length " << sexpr_number(pin->value("length", 2.54)) << ")";
-            if (pin->contains("alt") && (*pin)["alt"].is_array()) {
-                for (const json& alternate : (*pin)["alt"])
-                    out << " (alternate "
-                        << sexpr_quote(alternate.value("name", std::string())) << " "
-                        << pin_type_kicad(alternate.value("type", std::string("passive")))
-                        << " " << alternate.value("shape", std::string("line")) << ")";
-            }
-            out << " (name "
-                << sexpr_quote(pin->value("name", std::string()).empty()
-                                      ? "~"
-                                      : pin->value("name", std::string()))
-                << " (effects (font (size 1.27 1.27)))) (number "
-                << sexpr_quote(pin->value("number", std::string("1")))
-                << " (effects (font (size 1.27 1.27)))))\n";
-        }
-        out << "      )\n";
-    }
-    out << "    )\n";
-}
-
-}  // namespace
 
 nlohmann::json parse_kicad_sym_library(const std::string& text) {
     const json tree = sexpr_parse(text);
@@ -1646,255 +1484,6 @@ nlohmann::json parse_kicad_sym_library(const std::string& text) {
     return result;
 }
 
-std::string export_kicad_sch(const nlohmann::json& sch) {
-    if (!schema::is_schematic(sch))
-        throw std::runtime_error("Expected aicad.sch/1 document");
-
-    const json title = sch.contains("title_block") && sch["title_block"].is_object()
-                           ? sch["title_block"]
-                           : json::object();
-    const std::string root_uuid = object_uuid(sch, "schematic");
-    std::ostringstream out;
-    out << "(kicad_sch (version 20230121) (generator \"chudware\")\n"
-        << "  (uuid " << root_uuid << ")\n"
-        << "  (paper " << sexpr_quote(title.value("paper", std::string("A4"))) << ")\n"
-        << "  (title_block\n"
-        << "    (title " << sexpr_quote(title.value("title", std::string())) << ")\n"
-        << "    (date " << sexpr_quote(title.value("date", std::string())) << ")\n"
-        << "    (rev " << sexpr_quote(title.value("rev", std::string())) << ")\n"
-        << "    (company " << sexpr_quote(title.value("company", std::string())) << ")\n";
-    for (int i = 1; i <= 4; ++i)
-        out << "    (comment " << i << " "
-            << sexpr_quote(title.value("comment" + std::to_string(i), std::string()))
-            << ")\n";
-    out << "  )\n";
-
-    out << "  (lib_symbols\n";
-    if (sch.contains("lib_cache") && sch["lib_cache"].is_object()) {
-        std::vector<std::string> libids;
-        for (const auto& [libid, definition] : sch["lib_cache"].items())
-            if (definition.is_object()) libids.push_back(libid);
-        std::sort(libids.begin(), libids.end());
-        for (const std::string& libid : libids)
-            write_lib_symbol(out, libid, sch["lib_cache"][libid]);
-    }
-    out << "  )\n";
-
-    std::vector<std::string> sheet_ids;
-    if (sch.contains("sheets") && sch["sheets"].is_array())
-        for (const json& sheet : sch["sheets"])
-            if (sheet.is_object()) sheet_ids.push_back(sheet.value("id", std::string("sh1")));
-    if (sheet_ids.empty()) sheet_ids.push_back("sh1");
-    std::sort(sheet_ids.begin(), sheet_ids.end());
-    sheet_ids.erase(std::unique(sheet_ids.begin(), sheet_ids.end()), sheet_ids.end());
-
-    for (const std::string& sheet : sheet_ids) {
-        for (const json* wire : sorted_objects(sch, "wires", sheet)) {
-            out << "  (wire ";
-            write_pts(out, wire->value("pts", json::array()));
-            out << " (stroke (width 0) (type default)) (uuid "
-                << object_uuid(*wire, "wire") << "))\n";
-        }
-        for (const json* bus : sorted_objects(sch, "buses", sheet)) {
-            out << "  (bus ";
-            write_pts(out, bus->value("pts", json::array()));
-            out << " (stroke (width 0) (type default)) (uuid "
-                << object_uuid(*bus, "bus") << "))\n";
-        }
-        for (const json* entry : sorted_objects(sch, "bus_entries", sheet)) {
-            const json pos = entry->value("pos", json::array({0.0, 0.0}));
-            const json size = entry->value("size", json::array({2.54, -2.54}));
-            out << "  (bus_entry " << at_expr(pos) << " (size "
-                << sexpr_number(xy_value(size, 0)) << " "
-                << sexpr_number(-xy_value(size, 1))
-                << ") (stroke (width 0) (type default)) (uuid "
-                << object_uuid(*entry, "bus_entry") << "))\n";
-        }
-        for (const json* junction : sorted_objects(sch, "junctions", sheet))
-            out << "  (junction "
-                << at_expr(junction->value("pos", json::array({0.0, 0.0})))
-                << " (diameter 0) (color 0 0 0 0) (uuid "
-                << object_uuid(*junction, "junction") << "))\n";
-        for (const json* nc : sorted_objects(sch, "no_connect", sheet))
-            out << "  (no_connect "
-                << at_expr(nc->value("pos", json::array({0.0, 0.0})))
-                << " (uuid " << object_uuid(*nc, "no_connect") << "))\n";
-
-        for (const json* label : sorted_objects(sch, "labels", sheet)) {
-            const std::string scope = label->value("scope", std::string("local"));
-            const char* kind = scope == "global" ? "global_label"
-                               : scope == "hier" ? "hierarchical_label"
-                                                   : "label";
-            out << "  (" << kind << " "
-                << sexpr_quote(label->value("text", std::string())) << " "
-                << at_expr(label->value("pos", json::array({0.0, 0.0})),
-                           label->value("angle", 0.0));
-            if (scope != "local") out << " (shape input)";
-            out << " (effects (font (size 1.27 1.27))) (uuid "
-                << object_uuid(*label, "label") << "))\n";
-        }
-        for (const json* power : sorted_objects(sch, "power", sheet)) {
-            const json pos = power->value("pos", json::array({0.0, 0.0}));
-            if (power->contains("libid") && (*power)["libid"].is_string()) {
-                out << "  (symbol (lib_id "
-                    << sexpr_quote((*power)["libid"].get<std::string>()) << ") "
-                    << at_expr(pos, power->value("angle", 0.0))
-                    << " (unit " << power->value("unit", 1) << ")";
-                const std::string mirror = power->value("mirror", std::string("none"));
-                if (mirror == "x" || mirror == "y") out << " (mirror " << mirror << ")";
-                out << " (in_bom " << (power->value("in_bom", true) ? "yes" : "no")
-                    << ") (on_board " << (power->value("on_board", true) ? "yes" : "no")
-                    << ") (dnp " << (power->value("dnp", false) ? "yes" : "no")
-                    << ") (uuid " << object_uuid(*power, "power") << ")\n";
-                write_property(out, "Reference",
-                               power->value("ref", std::string("#PWR?")), pos,
-                               power->value("angle", 0.0), "    ");
-                write_property(out, "Value",
-                               power->value("value", power->value("net", std::string())),
-                               pos, power->value("angle", 0.0), "    ");
-                write_property(out, "Footprint",
-                               power->value("footprint", std::string()), pos,
-                               power->value("angle", 0.0), "    ");
-                write_property(out, "Datasheet",
-                               power->value("datasheet", std::string()), pos,
-                               power->value("angle", 0.0), "    ");
-                if (power->contains("fields") && (*power)["fields"].is_object()) {
-                    std::vector<std::string> names;
-                    for (const auto& [name, field_value] : (*power)["fields"].items())
-                        if (name != "kicad_uuid" && field_value.is_string())
-                            names.push_back(name);
-                    std::sort(names.begin(), names.end());
-                    for (const std::string& name : names)
-                        write_property(out, name,
-                                       (*power)["fields"][name].get<std::string>(),
-                                       pos, power->value("angle", 0.0), "    ");
-                }
-                out << "    (instances (project \"chudware\" (path \"/" << root_uuid
-                    << "\" (reference "
-                    << sexpr_quote(power->value("ref", std::string("#PWR?")))
-                    << ") (unit " << power->value("unit", 1) << "))))\n"
-                    << "  )\n";
-            } else {
-                out << "  (global_label "
-                    << sexpr_quote(power->value("net", std::string())) << " "
-                    << at_expr(pos)
-                    << " (shape power_in) (effects (font (size 1.27 1.27))) (uuid "
-                    << object_uuid(*power, "power") << "))\n";
-            }
-        }
-        for (const json* text_object : sorted_objects(sch, "texts", sheet)) {
-            const bool box = text_object->value("text_box", false);
-            out << "  (" << (box ? "text_box" : "text") << " "
-                << sexpr_quote(text_object->value("text", std::string()))
-                << " (exclude_from_sim no) "
-                << at_expr(text_object->value("pos", json::array({0.0, 0.0})),
-                           text_object->value("angle", 0.0));
-            if (box) {
-                const json size =
-                    text_object->value("box_size", json::array({25.4, 12.7}));
-                out << " (size " << sexpr_number(xy_value(size, 0)) << " "
-                    << sexpr_number(xy_value(size, 1)) << ")";
-            }
-            const double size = text_object->value("size", 1.27);
-            out << " (effects (font (size " << sexpr_number(size) << " "
-                << sexpr_number(size) << "))) (uuid "
-                << object_uuid(*text_object, "text") << "))\n";
-        }
-        for (const json* graphic : sorted_objects(sch, "graphics", sheet))
-            write_graphic_node(out, *graphic, "  ", true);
-
-        for (const json* symbol : sorted_objects(sch, "symbols", sheet)) {
-            const json pos = symbol->value("pos", json::array({0.0, 0.0}));
-            out << "  (symbol (lib_id "
-                << sexpr_quote(symbol->value("libid", std::string("Device:Unknown")))
-                << ") " << at_expr(pos, symbol->value("angle", 0.0))
-                << " (unit " << symbol->value("unit", 1) << ")";
-            const std::string mirror = symbol->value("mirror", std::string("none"));
-            if (mirror == "x" || mirror == "y") out << " (mirror " << mirror << ")";
-            out << " (in_bom " << (symbol->value("in_bom", true) ? "yes" : "no")
-                << ") (on_board " << (symbol->value("on_board", true) ? "yes" : "no")
-                << ") (dnp " << (symbol->value("dnp", false) ? "yes" : "no")
-                << ") (uuid " << object_uuid(*symbol, "symbol") << ")\n";
-            write_property(out, "Reference", symbol->value("ref", std::string("U?")),
-                           pos, symbol->value("angle", 0.0), "    ");
-            write_property(out, "Value", symbol->value("value", std::string()),
-                           pos, symbol->value("angle", 0.0), "    ");
-            write_property(out, "Footprint", symbol->value("footprint", std::string()),
-                           pos, symbol->value("angle", 0.0), "    ");
-            write_property(out, "Datasheet", symbol->value("datasheet", std::string()),
-                           pos, symbol->value("angle", 0.0), "    ");
-            if (symbol->contains("fields") && (*symbol)["fields"].is_object()) {
-                std::vector<std::string> names;
-                for (const auto& [name, value] : (*symbol)["fields"].items())
-                    if (name != "kicad_uuid" && value.is_string()) names.push_back(name);
-                std::sort(names.begin(), names.end());
-                for (const std::string& name : names)
-                    write_property(out, name, (*symbol)["fields"][name].get<std::string>(),
-                                   pos, symbol->value("angle", 0.0), "    ");
-            }
-            if (symbol->contains("alternate") && (*symbol)["alternate"].is_string())
-                out << "    (alternate "
-                    << sexpr_quote((*symbol)["alternate"].get<std::string>()) << ")\n";
-            if (symbol->contains("pin_alternates") &&
-                (*symbol)["pin_alternates"].is_object()) {
-                for (const auto& [number, alternate] : (*symbol)["pin_alternates"].items())
-                    if (alternate.is_string())
-                        out << "    (pin " << sexpr_quote(number) << " (alternate "
-                            << sexpr_quote(alternate.get<std::string>()) << "))\n";
-            }
-            out << "    (instances (project \"chudware\" (path \"/" << root_uuid
-                << "\" (reference "
-                << sexpr_quote(symbol->value("ref", std::string("U?")))
-                << ") (unit " << symbol->value("unit", 1) << "))))\n"
-                << "  )\n";
-        }
-    }
-
-    for (const json* sheet_symbol : sorted_objects(sch, "sheet_symbols")) {
-        const json pos = sheet_symbol->value("pos", json::array({0.0, 0.0}));
-        const json size = sheet_symbol->value("size", json::array({100.0, 75.0}));
-        const std::string child_id = sheet_symbol->value("child", std::string());
-        const json* child_sheet = nullptr;
-        if (sch.contains("sheets") && sch["sheets"].is_array())
-            for (const json& candidate : sch["sheets"])
-                if (candidate.value("id", std::string()) == child_id) {
-                    child_sheet = &candidate;
-                    break;
-                }
-        const std::string name =
-            child_sheet ? child_sheet->value("name", std::string("Sheet")) : "Sheet";
-        const std::string file =
-            child_sheet ? child_sheet->value("instances_of", name + ".kicad_sch")
-                        : name + ".kicad_sch";
-        const std::string uuid = object_uuid(*sheet_symbol, "sheet");
-        out << "  (sheet " << at_expr(pos) << " (size "
-            << sexpr_number(xy_value(size, 0)) << " "
-            << sexpr_number(xy_value(size, 1))
-            << ") (stroke (width 0) (type default)) (fill (color 0 0 0 0))"
-            << " (uuid " << uuid << ")\n";
-        write_property(out, "Sheetname", name, pos, 0.0, "    ");
-        write_property(out, "Sheetfile", file, pos, 0.0, "    ");
-        if (sheet_symbol->contains("pins") && (*sheet_symbol)["pins"].is_array()) {
-            int pin_index = 0;
-            for (const json& pin : (*sheet_symbol)["pins"]) {
-                out << "    (pin " << sexpr_quote(pin.value("name", std::string()))
-                    << " " << pin_type_kicad(pin.value("shape", std::string("passive")))
-                    << " " << at_expr(pin.value("pos", pos), pin.value("angle", 0.0))
-                    << " (effects (font (size 1.27 1.27))) (uuid "
-                    << object_uuid(pin, "sheet_pin:" + uuid + ":" +
-                                           std::to_string(++pin_index))
-                    << "))\n";
-            }
-        }
-        out << "    (instances (project \"chudware\" (path \"/" << root_uuid << "/"
-            << uuid << "\" (page \""
-            << (child_id.empty() ? "2" : child_id.substr(2)) << "\"))))\n"
-            << "  )\n";
-    }
-    out << "  (sheet_instances (path \"/\" (page \"1\")))\n"
-        << ")\n";
-    return out.str();
-}
 
 // ---------------------------------------------------------------------------
 // formats.py::import_kicad_pcb
@@ -1915,7 +1504,7 @@ json import_kicad_pcb(const std::string& source) {
         throw std::runtime_error("Expected kicad_pcb root, got '" + tag(tree) + "'");
 
     json doc = schema::new_board(src_name);
-    doc["id"] = uuid4();  // Python: str(uuid.uuid4())
+    doc["kicad"] = root_metadata(tree);
 
     // ---- 1. board thickness ----
     if (const json* general = find(tree, "general"))
@@ -1938,11 +1527,31 @@ json import_kicad_pcb(const std::string& source) {
             net_registry.push_back(json{{"name", net_name}, {"class", "default"}});
         }
     }
-    // GND is always present.
-    if (!seen_net_names.count("GND")) {
-        net_registry.insert(net_registry.begin(), json{{"name", "GND"}, {"class", "default"}});
-        seen_net_names.insert("GND");
+    // KiCad 10 stores net names directly on board items instead of requiring
+    // a numeric root-level net table. Register those names as well.
+    const auto register_named_net = [&](const json& item) {
+        const json* net = find(item, "net");
+        if (!net || net->size() < 2) return;
+        const json& name = net->size() >= 3 ? (*net)[2] : (*net)[1];
+        if (!name.is_string()) return;
+        if (net->size() == 2) doc["kicad"]["named_nets"] = true;
+        const std::string n = name.get<std::string>();
+        if (!n.empty() && seen_net_names.insert(n).second)
+            net_registry.push_back(json{{"name", n}, {"class", "default"}});
+    };
+    for (std::size_t i = 1; i < tree.size(); ++i) {
+        const json& item = tree[i];
+        const std::string kind = tag(item);
+        if (kind == "segment" || kind == "arc" || kind == "via" || kind == "zone")
+            register_named_net(item);
+        else if (kind == "footprint")
+            for (const json* pad : findall(item, "pad")) register_named_net(*pad);
     }
+    // Item traversal order can change when the writer groups board objects.
+    if (doc["kicad"].value("named_nets", false))
+        std::sort(net_registry.begin(), net_registry.end(), [](const json& a, const json& b) {
+            return a["name"].get<std::string>() < b["name"].get<std::string>();
+        });
     doc["nets"] = net_registry;
 
     // formats.py::_net_name — resolve a net number/name to a registered name (or null).
@@ -1975,17 +1584,46 @@ json import_kicad_pcb(const std::string& source) {
     if (n_cu < 2) n_cu = 2;
     if (n_cu > 1 && n_cu % 2 == 1) n_cu += 1;  // even layer counts (>= 2)
     doc["stackup"]["copper_layers"] = n_cu;
+    if (const json* setup = find(tree, "setup")) {
+        if (const json* stackup = find(*setup, "stackup")) {
+            json layers = json::array();
+            int dielectric_index = 0;
+            for (const json* node : findall(*stackup, "layer")) {
+                if (node->size() < 2) continue;
+                const std::string name = jstr((*node)[1]);
+                const json* type_node = find(*node, "type");
+                const std::string type = type_node && type_node->size() > 1 ? lower(jstr((*type_node)[1])) : "";
+                const bool copper = ends_with(name, ".Cu") || type == "copper";
+                const bool dielectric = starts_with(name, "dielectric ") || type == "core" || type == "prepreg";
+                if (!copper && !dielectric) continue;
+                json item{{"id", copper ? name : "diel" + std::to_string(++dielectric_index)},
+                          {"type", copper ? "copper" : (type.empty() ? "core" : type)}};
+                for (const auto& mapping : std::vector<std::pair<const char*, const char*>>{
+                         {"thickness", "thickness"}, {"epsilon_r", "er"}, {"material", "material"},
+                         {"loss_tangent", "loss_tangent"}})
+                    if (const json* value = find(*node, mapping.first); value && value->size() > 1)
+                        item[mapping.second] = (*value)[1];
+                layers.push_back(std::move(item));
+            }
+            if (!layers.empty()) doc["stackup"]["layers"] = std::move(layers);
+        }
+    }
+    doc["kicad"]["stackup_original"] = doc["stackup"];
 
     const std::vector<std::string> cu_ids = schema::copper_layer_ids(n_cu);
     const std::set<std::string> valid_cu(cu_ids.begin(), cu_ids.end());
 
     int fp_counter = 0, track_counter = 0, via_counter = 0, zone_counter = 0;
     json outline_shapes = json::array();
+    const std::vector<std::string> object_lists{"footprints", "tracks", "vias", "zones"};
 
     for (std::size_t i = 1; i < tree.size(); ++i) {
         const json& child = tree[i];
         if (!child.is_array()) continue;
         const std::string ct = tag(child);
+        std::vector<std::size_t> before;
+        for (const auto& key : object_lists) before.push_back(doc[key].size());
+        const std::size_t outline_before = outline_shapes.size();
 
         if (ct == "footprint") {
             ++fp_counter;
@@ -2026,19 +1664,15 @@ json import_kicad_pcb(const std::string& source) {
                 json pad = parse_pad(fp_child, pad_idx);
 
                 json pad_net = json(nullptr);
-                if (const json* net_node = find(fp_child, "net"); net_node && net_node->size() >= 3) {
-                    const std::string name_str = jstr((*net_node)[2]);
-                    if (!name_str.empty() && seen_net_names.count(name_str))
-                        pad_net = name_str;
-                    else if ((*net_node)[1].is_number())
-                        pad_net = net_name_of((*net_node)[1]);
-                }
+                if (const json* net_node = find(fp_child, "net"); net_node && net_node->size() >= 2)
+                    pad_net = net_name_of(net_node->size() >= 3 ? (*net_node)[2] : (*net_node)[1]);
                 pad["net"] = pad_net;
 
                 json remapped = json::array();
                 for (const json& lyr : pad["layers"])
                     remapped.push_back(map_layer(lyr.get<std::string>()));
                 pad["layers"] = remapped;
+                retain_uuid(pad, fp_child);
 
                 rebuilt_pads.push_back(std::move(pad));
             }
@@ -2056,6 +1690,22 @@ json import_kicad_pcb(const std::string& source) {
                      {"model_3d", fp_def["model_3d"]},
                      {"attr", fp_def.value("attr", std::string("smd"))},
                      {"linked_symbol", nullptr}});
+            for (const auto& mapping : std::vector<std::pair<std::string, std::string>>{
+                     {"Chudware.Engineering", "eng_overrides"}, {"Chudware.Fields", "fields"},
+                     {"Chudware.LibId", "libid"}, {"Chudware.OnBoard", "on_board"},
+                     {"Chudware.LinkedSymbol", "linked_symbol"}}) {
+                const auto property = fp_props.find(mapping.first);
+                if (property == fp_props.end()) continue;
+                json value = json::parse(property->second, nullptr, false);
+                if (!value.is_discarded()) doc["footprints"].back()[mapping.second] = std::move(value);
+            }
+            auto& graphics = doc["footprints"].back()["graphics"];
+            std::size_t graphic_index = 0;
+            for (const json& part : child) {
+                if (!part.is_array() || !fp_graphic_tags().count(tag(part))) continue;
+                if (parse_fp_graphic(part).is_null()) continue;
+                if (graphic_index < graphics.size()) retain_uuid(graphics[graphic_index++], part);
+            }
         } else if (ct == "segment") {
             const json* start = find(child, "start");
             const json* end = find(child, "end");
@@ -2159,6 +1809,17 @@ json import_kicad_pcb(const std::string& source) {
                     if (v == "through" || v == "blind" || v == "buried" || v == "micro")
                         via_type = v;
                 }
+                for (std::size_t k = 1; k < child.size(); ++k) {
+                    if (!child[k].is_string()) continue;
+                    const std::string kind = lower(child[k].get<std::string>());
+                    if (kind == "micro") via_type = "micro";
+                    else if (kind == "blind") {
+                        bool touches_outer = false;
+                        for (const auto& layer : via_layers)
+                            if (layer == "F.Cu" || layer == "B.Cu") touches_outer = true;
+                        via_type = touches_outer ? "blind" : "buried";
+                    }
+                }
 
                 ++via_counter;
                 doc["vias"].push_back(json{{"id", "v" + std::to_string(via_counter)},
@@ -2193,13 +1854,26 @@ json import_kicad_pcb(const std::string& source) {
                 if (const json* cl = find(*cp, "clearance"); cl && cl->size() > 1)
                     clearance = f64((*cl)[1]);
 
+            double min_width = 0.25, thermal_gap = 0.3, thermal_width = 0.3;
+            if (const json* width = find(child, "min_thickness"); width && width->size() > 1)
+                min_width = f64((*width)[1]);
             std::string fill_style = "solid";
-            if (const json* fill_node = find(child, "fill"))
-                for (std::size_t k = 1; k < fill_node->size(); ++k)
-                    if ((*fill_node)[k].is_array() && tag((*fill_node)[k]) == "hatch") {
-                        fill_style = "hatch";
-                        break;
-                    }
+            if (const json* fill_node = find(child, "fill")) {
+                if (const json* gap = find(*fill_node, "thermal_gap"); gap && gap->size() > 1)
+                    thermal_gap = f64((*gap)[1]);
+                if (const json* width = find(*fill_node, "thermal_bridge_width"); width && width->size() > 1)
+                    thermal_width = f64((*width)[1]);
+                if (find(*fill_node, "hatch")) fill_style = "hatch";
+                if (const json* mode = find(*fill_node, "mode"); mode && mode->size() > 1 &&
+                    jstr((*mode)[1]) == "hatch") fill_style = "hatch";
+            }
+            json filled = json::array();
+            for (const json* area : findall(child, "filled_polygon")) {
+                const json* area_layer = find(*area, "layer");
+                if (area_layer && area_layer->size() > 1 && jstr((*area_layer)[1]) != layer) continue;
+                json ring = node_points(*area);
+                if (ring.size() >= 3) filled.push_back(std::move(ring));
+            }
 
             ++zone_counter;
             doc["zones"].push_back(
@@ -2208,10 +1882,10 @@ json import_kicad_pcb(const std::string& source) {
                      {"layer", layer},
                      {"polygon", polygon},
                      {"clearance", clearance},
-                     {"min_width", 0.25},
+                     {"min_width", min_width},
                      {"fill", fill_style},
-                     {"thermal", {{"gap", 0.3}, {"spoke_width", 0.3}}},
-                     {"filled_polys", json::array()}});
+                     {"thermal", {{"gap", thermal_gap}, {"spoke_width", thermal_width}}},
+                     {"filled_polys", filled}});
         } else if (ct == "gr_line") {
             std::string layer = "Dwgs.User";
             if (const json* ln = find(child, "layer"); ln && ln->size() > 1)
@@ -2251,13 +1925,56 @@ json import_kicad_pcb(const std::string& source) {
                     outline_shapes.push_back(std::move(arc_shape));
                 }
             }
+        } else if (ct == "gr_rect" || ct == "gr_circle") {
+            const json* layer = find(child, "layer");
+            const json* start = find(child, ct == "gr_rect" ? "start" : "center");
+            const json* end = find(child, "end");
+            if (layer && layer->size() > 1 && jstr((*layer)[1]) == "Edge.Cuts" &&
+                start && end && start->size() >= 3 && end->size() >= 3) {
+                const json a = json::array({round6(f64((*start)[1])), round6(-f64((*start)[2]))});
+                const json b = json::array({round6(f64((*end)[1])), round6(-f64((*end)[2]))});
+                if (ct == "gr_rect") outline_shapes.push_back(json{{"type", "rect"}, {"p1", a}, {"p2", b}});
+                else outline_shapes.push_back(json{{"type", "circle"}, {"center", a},
+                    {"radius", std::hypot(f64((*end)[1]) - f64((*start)[1]),
+                                           f64((*end)[2]) - f64((*start)[2]))}});
+            }
         }
-        // Unknown nodes: skip silently.
+        bool represented = false;
+        for (std::size_t k = 0; k < object_lists.size(); ++k) {
+            json& list = doc[object_lists[k]];
+            if (list.size() > before[k]) {
+                retain_uuid(list.back(), child);
+                represented = true;
+            }
+        }
+        if (outline_shapes.size() > outline_before) {
+            retain_uuid(outline_shapes.back(), child);
+            represented = true;
+        }
+        if (!represented && (starts_with(ct, "gr_") || ct == "dimension" ||
+                             ct == "group" || ct == "target")) {
+            json object{{"id", "g" + std::to_string(doc["graphics"].size() + 1)},
+                        {"type", ct}};
+            retain_uuid(object, child);
+            doc["graphics"].push_back(std::move(object));
+            represented = true;
+        }
+        if (!represented && ct != "version" && ct != "generator" &&
+            ct != "generator_version" && ct != "uuid")
+            doc["kicad"]["extra"].push_back(child);
     }
 
-    if (!outline_shapes.empty())
-        doc["outline"] = json{{"shapes", outline_shapes},
-                              {"closed", outline_shapes.size() >= 3}};
+    if (!outline_shapes.empty()) {
+        bool closed = outline_shapes.size() >= 3;
+        if (outline_shapes.size() == 1) {
+            const std::string type = outline_shapes[0].value("type", std::string());
+            closed = type == "rect" || type == "circle";
+        }
+        doc["outline"] = json{{"shapes", outline_shapes}, {"closed", closed}};
+    }
+    for (const auto& key : object_lists) snapshot_objects(doc[key]);
+    snapshot_objects(doc["graphics"]);
+    snapshot_objects(doc["outline"]["shapes"]);
     return doc;
 }
 

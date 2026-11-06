@@ -29,6 +29,7 @@
 #include "fw_workspace.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
@@ -36,6 +37,10 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#ifndef __EMSCRIPTEN__
+#include <future>
+#include "ui/anim.h"
+#endif
 #include <sstream>
 #include <string>
 #include <vector>
@@ -549,14 +554,8 @@ static void applySimResult(FwState& s, const nlohmann::json& j) {
 // thread jammed behind startup calls), so an RPC-only probe hid the tab until the
 // user happened into the Electronics workspace. The project store is plain
 // <firmware_root>/<id>/project.json sidecars on LOCAL disk (same files the trace
-// viewer reads), so probe the disk directly: read-only, throttled, worker-independent.
-bool firmwareProjectsExistOnDisk() {
-    static double lastProbe = -1e9;
-    static bool cached = false;
-    const double now = ImGui::GetTime();
-    if (now - lastProbe < 5.0) return cached;
-    lastProbe = now;
-    cached = false;
+// viewer reads), so probe the disk on a background thread, worker-independent.
+static bool probeFirmwareProjects() {
     // Mirror engine.firmware.project.firmware_root(): CHUDWARE_FIRMWARE_DIR override,
     // else %APPDATA%/Chudware/firmware, else <tmp>/Chudware/firmware (Python
     // tempfile.gettempdir() honors TMPDIR/TEMP/TMP, then /tmp).
@@ -577,10 +576,37 @@ bool firmwareProjectsExistOnDisk() {
     if (!fs::is_directory(root, ec) || ec) return false;
     for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
         if (it->is_directory(ec) && !ec && fs::is_regular_file(it->path() / "project.json", ec)) {
-            cached = true;
-            break;
+            return true;
         }
     }
+    return false;
+}
+
+bool firmwareProjectsExistOnDisk() {
+    static double lastProbe = -1e9;
+    static bool cached = false;
+    const double now = ImGui::GetTime();
+#ifndef __EMSCRIPTEN__
+    static std::future<bool> pending;
+    if (pending.valid()) {
+        if (pending.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return cached;
+        try { cached = pending.get(); } catch (const std::exception&) {}
+        lastProbe = now;
+    }
+    if (now - lastProbe >= 5.0) {
+        lastProbe = now;
+        pending = std::async(std::launch::async, [] {
+            const bool exists = probeFirmwareProjects();
+            ui::anim::wakeLoop();
+            return exists;
+        });
+    }
+#else
+    if (now - lastProbe >= 5.0) {
+        cached = probeFirmwareProjects();
+        lastProbe = now;
+    }
+#endif
     return cached;
 }
 

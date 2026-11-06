@@ -13,17 +13,15 @@ Four layers, all persisted in the site's profile-metadata sidecar
 
 1. **Minimum inter-request delay** — at least ``min_interval`` seconds between
    two fetches of the same site (default 3s).
-2. **Published crawl-delay** — if the site's ``robots.txt`` publishes a
-   ``Crawl-delay``, we honour it when it is *longer* than our default. It is
-   consulted lazily — only once a site has a recorded ``last_fetch_ts``, since
-   that is the only branch whose result it can change — so a site's first fetch
-   of a run never blocks on a robots.txt round-trip. (We read only
-   ``Crawl-delay``; path ``Disallow`` rules are intentionally NOT enforced
-   here — that would silently disable adapters for the ``/search`` paths many
-   vendors list, and this layer is about pace, not access policy.)
-3. **Exponential backoff on 429/403** — when a site returns a rate-limit or
-   bot-wall status, its cooldown grows exponentially (``base * 2**(n-1)``,
-   capped) and resets on the next clean fetch. Prevents a polite retry from
+2. **Published crawl-delay** — user-initiated interactive fetches honour the
+   origin's ``robots.txt`` ``Crawl-delay`` when longer than our default.
+   Origins are cached independently and consulted lazily after the first
+   request. This is a pacing policy, not a crawler access-policy check:
+   ``Disallow`` is intentionally not enforced for these interactive requests.
+3. **Exponential backoff on 429/403/503** — when a site returns a rate-limit,
+   bot-wall, or unavailable status, its cooldown grows exponentially
+   (``base * 2**(n-1)``, capped), honours longer ``Retry-After`` values, and
+   resets on the next clean fetch. Prevents a polite retry from
    turning into a hammer against a site that is already pushing back.
 4. **Per-session request ceilings** — a per-site and a whole-process hard cap on
    requests per run, a backstop so an accidental loop (e.g. a bug calling
@@ -133,13 +131,15 @@ def session_counts() -> dict[str, object]:
 # 2. Published crawl-delay from robots.txt (delay only — never Disallow).
 # ---------------------------------------------------------------------------
 
-def _fetch_robots_crawl_delay(host: str) -> float | None:
-    """Read ``https://<host>/robots.txt`` and return the ``Crawl-delay`` that
-    applies to us (the ``*`` group), or ``None`` when none is published or the
-    file can't be read. Best-effort and short-timeout; never raises."""
+def _fetch_robots_crawl_delay(origin: str) -> float | None:
+    """Read an origin's robots.txt and return the ``*`` group's crawl-delay.
+
+    A bare host is interpreted as HTTPS. Failures are best-effort and bounded.
+    """
     try:
         from services.net.safe_http import get
-        response = get(f"https://{host}/robots.txt", schemes=("https",),
+        origin = origin if "://" in origin else f"https://{origin}"
+        response = get(f"{origin}/robots.txt", schemes=("http", "https"),
                        headers={"User-Agent": "Mozilla/5.0 (Chudware parts browser)"},
                        max_bytes=65536, idle_timeout=_ROBOTS_TIMEOUT_S)
         response.raise_for_status()
@@ -167,23 +167,36 @@ def _fetch_robots_crawl_delay(host: str) -> float | None:
 
 
 def crawl_delay(site: str, url: str | None) -> float | None:
-    """Published crawl-delay (seconds) for ``site``, cached in profile meta.
-
-    Re-reads ``robots.txt`` at most once per :data:`_ROBOTS_TTL_S`. ``url`` gives
-    the host to read from; when absent (or no host) we reuse any cached value.
-    ``None`` means "no crawl-delay published" (fall back to ``min_interval``)."""
+    """Return the requested origin's cached crawl-delay, refreshing after the TTL."""
+    if not url:
+        return None
+    try:
+        parsed = urlsplit(url)
+        host, port = parsed.hostname, parsed.port
+    except ValueError:
+        return None
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https") or not host:
+        return None
+    host = host.lower()
+    if ":" in host:
+        host = f"[{host}]"
+    default_port = 443 if scheme == "https" else 80
+    origin = f"{scheme}://{host}"
+    if port is not None and port != default_port:
+        origin += f":{port}"
     meta = profiles.load_meta(site)
-    fetched = meta.get("robots_fetched_ts")
-    if isinstance(fetched, (int, float)) and (time.time() - fetched) < _ROBOTS_TTL_S:
-        cached = meta.get("robots_crawl_delay")
-        return float(cached) if isinstance(cached, (int, float)) else None
-    host = urlsplit(url).hostname if url else None
-    if not host:
-        cached = meta.get("robots_crawl_delay")
-        return float(cached) if isinstance(cached, (int, float)) else None
-    delay = _fetch_robots_crawl_delay(host)
-    profiles.save_meta(site, robots_fetched_ts=time.time(),
-                       robots_crawl_delay=delay if delay is not None else 0.0)
+    origins = meta.get("robots_origins")
+    origins = dict(origins) if isinstance(origins, dict) else {}
+    cached = origins.get(origin)
+    if isinstance(cached, dict):
+        fetched = cached.get("fetched_ts")
+        if isinstance(fetched, (int, float)) and time.time() - fetched < _ROBOTS_TTL_S:
+            delay = cached.get("crawl_delay")
+            return float(delay) if isinstance(delay, (int, float)) else None
+    delay = _fetch_robots_crawl_delay(origin)
+    origins[origin] = {"fetched_ts": time.time(), "crawl_delay": delay}
+    profiles.save_meta(site, robots_origins=origins)
     return delay
 
 
@@ -256,19 +269,21 @@ def mark_hit(site: str) -> None:
     profiles.save_meta(site, last_fetch_ts=time.time())
 
 
-def note_result(site: str, status: int | None) -> None:
-    """Update backoff state from a fetch's HTTP status.
-
-    A 429/403/503 grows the site's cooldown exponentially (capped); any other
-    outcome clears it. Also stamps ``last_fetch_ts`` (subsumes :func:`mark_hit`).
-    """
+def note_result(site: str, status: int | None, *, retry_after_s: float | None = None) -> None:
+    """Record a request; only a successful response clears an existing cooldown."""
     now = time.time()
-    if status is not None and status in _BACKOFF_STATUSES:
-        fails = profiles.load_meta(site).get("rl_consecutive_fails")
+    if status in _BACKOFF_STATUSES:
+        meta = profiles.load_meta(site)
+        fails = meta.get("rl_consecutive_fails")
         fails = (fails if isinstance(fails, int) and fails > 0 else 0) + 1
-        cooldown = min(BACKOFF_BASE_S * (2 ** (fails - 1)), BACKOFF_MAX_S)
+        cooldown = min(BACKOFF_BASE_S * (2 ** min(fails - 1, 30)), BACKOFF_MAX_S)
+        if isinstance(retry_after_s, (int, float)) and retry_after_s > 0:
+            cooldown = max(cooldown, retry_after_s)
+        until = max(now + cooldown, meta.get("rl_cooldown_until") or 0.0)
         profiles.save_meta(site, last_fetch_ts=now, rl_consecutive_fails=fails,
-                           rl_cooldown_until=now + cooldown)
-    else:
+                           rl_cooldown_until=until)
+    elif status is not None and 200 <= status < 400:
         profiles.save_meta(site, last_fetch_ts=now, rl_consecutive_fails=0,
                            rl_cooldown_until=0.0)
+    else:
+        profiles.save_meta(site, last_fetch_ts=now)

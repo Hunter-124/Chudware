@@ -383,8 +383,8 @@ def test_actual_fastmcp_dag_run_and_native_schema_do_not_expose_session_authorit
     from types import SimpleNamespace
     from mcp.server.fastmcp import FastMCP
     from services.agent import request_context as tenancy
-    from services.agent.chudcode_tools import build_host_tools, dispatch_host_tool
-    from services.agent.test_chudcode_tools import _Policy
+    from services.agent.omp_tools import build_host_tools, dispatch_host_tool
+    from services.agent.test_omp_tools import _Policy
     from services.dag import executor, storage
     from services.dag.mcp_tools import register_dag_tools
     from services.dag.test_executor import _two_node_graph
@@ -407,7 +407,7 @@ def test_actual_fastmcp_dag_run_and_native_schema_do_not_expose_session_authorit
     def bind(parent=None):
         [binding] = [candidate for candidate in build_host_tools({
             "tool_entries": {"dag_run": {"fn": tool.fn, "input_schema": tool.parameters}},
-            "policy_registry": _Policy(), "chudcode_builtin_names": (), "mode": "agent",
+            "policy_registry": _Policy(), "omp_builtin_names": (), "mode": "agent",
             "session_id": parent,
         }) if candidate.name == "dag_run"]
         assert not {"session_id", "parent_session_id", "_parent_session_id"} & binding.input_schema["properties"].keys()
@@ -450,18 +450,18 @@ def test_actual_fastmcp_dag_run_and_native_schema_do_not_expose_session_authorit
 def test_dag_run_root_refusal_follows_session_authorization(monkeypatch, session_owner):
     import hashlib
     from types import SimpleNamespace
-    from services.agent import chudcode_host, request_context as tenancy
-    from services.agent.chudcode_tools import HostToolBinding, dispatch_host_tool
+    from services.agent import omp_host, request_context as tenancy
+    from services.agent.omp_tools import HostToolBinding, dispatch_host_tool
 
     ctx = {"cell": True, "workspace_key": "team:dag/scope", "actor_key": "alice",
            "actor_hex": hashlib.sha256(b"alice").hexdigest()[:32], "right": "editor", "epoch": 1}
-    host = chudcode_host.ChudcodeSessionHost()
-    monkeypatch.setattr(chudcode_host, "get_default_chudcode_host", lambda: host)
+    host = omp_host.OmpSessionHost()
+    monkeypatch.setattr(omp_host, "get_default_omp_host", lambda: host)
     if session_owner is not None:
         owner_ctx = {**ctx, "actor_key": session_owner,
                      "actor_hex": hashlib.sha256(session_owner.encode()).hexdigest()[:32]}
         with tenancy.bind_context(owner_ctx):
-            host._sessions[tenancy.scoped_key("parent")] = chudcode_host._Session(
+            host._sessions[tenancy.scoped_key("parent")] = omp_host._Session(
                 "parent", client=None, resume_file=None, workspace_dir=None,
             )
 

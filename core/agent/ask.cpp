@@ -41,7 +41,6 @@ std::string py_str(const ojson& v) {
     if (v.is_null()) return "None";
     if (v.is_number_integer()) return std::to_string(v.get<long long>());
     if (v.is_number_unsigned()) return std::to_string(v.get<unsigned long long>());
-    if (v.is_number_float()) return py_float_repr(v.get<double>());
     return v.dump();
 }
 

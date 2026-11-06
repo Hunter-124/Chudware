@@ -1,10 +1,10 @@
-"""Printable ArUco / AprilTag *scale mat* — the known-size fiducial the user lays beside a part.
+"""Printable ArUco / ChArUco *scale mats* — the known-size fiducial the user lays beside a part.
 
-Where :mod:`~services.vision.calib_sheet` renders a full ChArUco board for the pixel→mm homography,
-a **scale mat** is the simplest possible reference for the reverse-engineering (scan) pipeline:
-one or more single markers whose printed edge length is exactly ``marker_len_mm``. Dropped in the
-photo/video set, the markers get reconstructed alongside the part; :mod:`~services.vision.scale_solver`
-then reads their edge length in reconstruction units and recovers ``mm_per_unit`` (meyerls-style).
+The standard mat (:data:`MAT_BOARD`, printed by ``reveng_print_scale_mat``) is a full-page ChArUco
+board: every chessboard corner it resolves is triangulated against the reconstruction, and
+:func:`~services.vision.scale_solver.solve_scale_charuco` fits the board's known layout to them to
+recover ``mm_per_unit``. The legacy single-marker mat (:class:`MarkerSpec`, edge ``marker_len_mm``)
+is still solved by :func:`~services.vision.scale_solver.solve_scale_aruco` for mats already printed.
 
 The output is a **print-ready PDF** (``contracts/reveng.md`` §8.2 ``reveng_print_scale_mat``): the
 board/marker raster is rendered with OpenCV — reusing :mod:`~services.vision.calib_sheet` — then wrapped
@@ -135,34 +135,61 @@ def generate_scale_mat_pdf(spec: MarkerSpec = DEFAULT_MARKER, *, out_path: str,
     }
 
 
-def generate_charuco_mat_pdf(spec: BoardSpec = DEFAULT_BOARD, *, out_path: str,
-                             size: str = "A4", dpi: int = 300, margin_mm: float = 10.0) -> dict[str, Any]:
-    """Render a full ChArUco board as a print-ready PDF scale mat (reuses the board raster path).
+#: The printed scale mat: 7 × 10 squares of 25 mm (175 × 250 mm) fills Letter and A4 alike.
+#: Every chessboard corner is a scale observation, so one sheet spans ~300 mm of corners.
+MAT_BOARD = BoardSpec(squares_x=7, squares_y=10, square_len_mm=25.0, marker_len_mm=18.0)
 
-    Same physical invariant as :func:`~services.vision.calib_sheet.generate_charuco_sheet`: printed at
-    100 % the chessboard pitch is ``spec.square_len_mm``. Wrapping to PDF (vs. the calib-sheet PNG)
-    is what makes it a one-click printable in the reverse-engineering deliverables flow.
+
+def generate_charuco_mat_pdf(spec: BoardSpec = MAT_BOARD, *, out_path: str,
+                             size: str = "A4", dpi: int = 300) -> dict[str, Any]:
+    """Render a full ChArUco board as a print-ready PDF scale mat, plus a PNG preview.
+
+    The board raster is exactly ``spec.width_mm × spec.height_mm`` with no internal margin
+    (OpenCV shrinks a board to fit any ``marginSize``, which would change the printed pitch);
+    the page margin is the quiet zone. Printed at 100 % the chessboard pitch is
+    ``spec.square_len_mm``, and the caption states it so the print can be checked with a ruler.
     """
     if size not in PAGE_SIZES_MM:
         raise ValueError(f"unknown page size: {size!r} (expected one of {sorted(PAGE_SIZES_MM)})")
-    cv2 = require_cv2()
     page_mm = PAGE_SIZES_MM[size]
+    if spec.width_mm > page_mm[0] - 10 or spec.height_mm > page_mm[1] - 16:
+        raise ValueError(f"{spec.width_mm:g} x {spec.height_mm:g} mm board does not fit {size} with a quiet zone")
     px_per_mm = dpi / _MM_PER_INCH
     w_px = round(spec.width_mm * px_per_mm)
     h_px = round(spec.height_mm * px_per_mm)
-    margin_px = max(0, round(margin_mm * px_per_mm))
-    board_img = spec.cv_board().generateImage((w_px, h_px), marginSize=margin_px, borderBits=1)
-    board_pil = _cv_gray_to_pil(board_img)
-    page = _center_on_page(board_pil, page_mm, dpi)
+    board_img = spec.cv_board().generateImage((w_px, h_px), marginSize=0, borderBits=1)
+    page = _center_on_page(_cv_gray_to_pil(board_img), page_mm, dpi)
+    from PIL import ImageDraw, ImageFont
+    caption = (f"ChArUco {spec.squares_x}x{spec.squares_y} {spec.dict_name} - print at 100%: "
+               f"square = {spec.square_len_mm:g} mm, {spec.squares_y} squares = "
+               f"{spec.height_mm:g} mm")
+    font = ImageFont.load_default(size=max(10, round(2.6 * px_per_mm)))
+    bottom = (page.height + h_px) // 2
+    ImageDraw.Draw(page).text((page.width // 2, bottom + round(2 * px_per_mm)), caption,
+                              fill=0, font=font, anchor="mt")
     page.save(out_path, "PDF", resolution=float(dpi))
+    preview_path = out_path.rsplit(".", 1)[0] + ".png"
+    page.resize((page.width // 4, page.height // 4)).save(preview_path)
     return {
         "path": out_path,
+        "preview_path": preview_path,
         "kind": "charuco",
         "spec": spec.to_dict(),
         "size": size,
         "dpi": dpi,
         "page_mm": list(page_mm),
         "square_len_mm": spec.square_len_mm,
-        "print_note": "Print at 100% scale (no fit-to-page); keep the sheet flat and rigid, fully "
-                      "in view. The chessboard pitch is the scale reference.",
+        "print_note": "Print at 100% scale (no fit-to-page) and check one printed square against "
+                      f"{spec.square_len_mm:g} mm. Tape the sheet flat and keep it fully in view; "
+                      "the chessboard pitch is the scale reference.",
     }
+
+
+def generate_scale_mat(size: str, out_dir: str) -> dict[str, Any]:
+    """Write the standard :data:`MAT_BOARD` scale mat for ``size`` into ``out_dir``."""
+    import os
+
+    os.makedirs(out_dir, exist_ok=True)
+    spec = MAT_BOARD
+    name = f"charuco_{spec.squares_x}x{spec.squares_y}_{spec.square_len_mm:g}mm_{size}.pdf"
+    return generate_charuco_mat_pdf(spec, out_path=os.path.join(out_dir, name), size=size)

@@ -1,20 +1,14 @@
-"""import_part/export_part must hand the ENGINE absolute paths.
+"""CAD exchange paths stay anchored to the selected workspace.
 
-Live-run root cause (run-74799871076856): the worker chdir's to the project root, so a
-project-relative path passes the MCP process's ``os.path.isfile`` check — but the raw,
-still-relative path was then forwarded to the engine daemon, whose cwd differs, so
-``doc_open``/``import_file`` could not find the file (and a relative EXPORT destination
-silently lands in the daemon's cwd instead of the user's project). Explicit relative
-exports must use the selected workspace even when the worker cwd differs or a turn
-continues. Every engine path is absolute; ``imported_from`` keeps the supplied string.
+Real-engine cases distinguish identically named source files in the workspace and
+worker cwd. Other cases exercise destination guards and explicit resume behavior.
 
-No engine needed: ``cb.call`` is stubbed and its payloads recorded.
-
-Run:  python3 -m pytest services/mcp/test_cad_exchange_paths.py -q -p no:randomly
+Run: python3 -m pytest services/mcp/test_cad_exchange_paths.py -q
 """
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -26,10 +20,6 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from services.mcp import cad_exchange_tools as M  # noqa: E402
-
-# The exact relative path shape from the live run (spaces, &, nested project folders).
-_REL_STEPPLUS = "CAD & Design Geometry/Model Step files/CD-1102_MudBucket_OilRig.step+"
-
 
 class _StubMCP:
     """Minimal @mcp.tool() host that keeps the raw function."""
@@ -85,56 +75,46 @@ def exchange(monkeypatch, tmp_path):
     return mcp.tools, calls
 
 
-def test_import_part_relative_stepplus_goes_absolute(exchange, tmp_path, monkeypatch):
-    """(a) A cwd-relative .step+ opens via doc_open with an ABSOLUTE path payload."""
-    tools_fn, calls = exchange
-    part = tmp_path / _REL_STEPPLUS
-    part.parent.mkdir(parents=True)
-    part.write_bytes(b"PK\x03\x04 fake native container")
-    monkeypatch.chdir(tmp_path)
+@pytest.mark.parametrize("suffix", ["step+", "step"])
+def test_import_reads_selected_workspace_not_same_named_worker_file(
+        tmp_path, monkeypatch, suffix):
+    from services.agent.request_context import bind_roots
 
-    out = json.loads(tools_fn["import_part"](path=_REL_STEPPLUS))
+    project = tmp_path / "project"
+    worker = tmp_path / "worker"
+    project.mkdir()
+    worker.mkdir()
+    monkeypatch.chdir(worker)
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(worker))
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(worker))
+    monkeypatch.setattr(M, "_publish_current", lambda *a, **k: None)
+    filename = f"block.{suffix}"
+    for folder, length in ((project, 10), (worker, 30)):
+        doc = M.cb.call("doc_new", {"name": "PathBlock"})["doc_id"]
+        try:
+            M.cb.call("doc_apply_ops", {
+                "doc_id": doc, "ops": [M.cb.feat("box", "Block", {
+                    "length": M.cb.dim(length), "width": M.cb.dim(20),
+                    "height": M.cb.dim(3)})]})
+            method = "doc_save" if suffix == "step+" else "export_file"
+            M.cb.call(method, {"doc_id": doc, "path": str(folder / filename),
+                               **({"format": "step"} if suffix == "step" else {})})
+        finally:
+            M.cb.call("doc_close", {"doc_id": doc})
+    mcp = _StubMCP()
+    M.register_cad_exchange_tools(mcp)
 
-    assert out["ok"] is True, out
-    assert out["doc_id"] == "doc-opened"
-    doc_open = [p for m, p in calls if m == "doc_open"]
-    assert len(doc_open) == 1, calls
-    assert doc_open[0]["path"] == str(part)
-    assert os.path.isabs(doc_open[0]["path"])
-    # The run record keeps the caller's original string, not the resolved abs path.
-    assert out["imported_from"] == _REL_STEPPLUS
+    with bind_roots(str(project)):
+        result = json.loads(mcp.tools["import_part"](filename))
 
-def test_import_part_relative_drawplus_uses_drawing_open(exchange, tmp_path, monkeypatch):
-    tools_fn, calls = exchange
-    drawing = tmp_path / "x.draw+"
-    drawing.write_bytes(b"PK\x03\x04 fake drawing container")
-    monkeypatch.chdir(tmp_path)
-
-    out = json.loads(tools_fn["import_part"](path="x.draw+"))
-
-    assert out["ok"] is True, out
-    assert out["doc_id"] == out["drawing_id"] == "dwg-opened"
-    assert out["source_state"] == "embedded_opened"
-    opens = [p for m, p in calls if m == "drawing_open_standalone"]
-    assert opens == [{"path": str(drawing)}]
-    assert not [p for m, p in calls if m == "import_file"]
-
-
-def test_import_part_relative_interchange_goes_absolute(exchange, tmp_path, monkeypatch):
-    """(a) Same contract on the import_file branch (plain STEP, no `into`)."""
-    tools_fn, calls = exchange
-    part = tmp_path / "bracket.step"
-    part.write_text("ISO-10303-21;")
-    monkeypatch.chdir(tmp_path)
-
-    out = json.loads(tools_fn["import_part"](path="bracket.step"))
-
-    assert out["ok"] is True, out
-    imp = [p for m, p in calls if m == "import_file"]
-    assert len(imp) == 1, calls
-    assert imp[0]["path"] == str(part)
-    assert os.path.isabs(imp[0]["path"])
-    assert out["imported_from"] == "bracket.step"
+    assert result["ok"], result
+    imported = result["doc_id"]
+    try:
+        mass = M.cb.call("eval_mass", {"doc_id": imported})
+        assert mass["volume_mm3"] == pytest.approx(600)
+        assert result["imported_from"] == filename
+    finally:
+        M.cb.call("doc_close", {"doc_id": imported})
 
 
 def test_export_part_relative_destination_goes_absolute(exchange, tmp_path, monkeypatch):
@@ -162,6 +142,8 @@ def test_export_part_stepplus_alias_goes_absolute(exchange, tmp_path, monkeypatc
     worker = tmp_path / "continuation-worker"
     worker.mkdir()
     monkeypatch.chdir(worker)
+    recorded = []
+    monkeypatch.setattr(M, "_note_session_saved", lambda doc, path: recorded.append((doc, path)))
 
     out = json.loads(tools_fn["export_part"](fmt="step+", path="deliverable",
                                              doc_id="doc-live"))
@@ -170,9 +152,45 @@ def test_export_part_stepplus_alias_goes_absolute(exchange, tmp_path, monkeypatc
     saves = [p for m, p in calls if m == "doc_save"]
     assert len(saves) == 1, calls
     assert saves[0]["path"] == str(tmp_path / "deliverable.step+")
+    assert saves[0]["if_no_human_dirty"] is True
     assert out["ok"] is True, out
     assert Path(out["path"]).is_file()
+    assert recorded == [("doc-live", str(tmp_path / "deliverable.step+"))]
     assert list(worker.iterdir()) == []
+
+def test_native_export_reports_path_binding_conflict(exchange, monkeypatch, tmp_path):
+    tools, _ = exchange
+    original = M.cb.call
+    def guarded(method, params):
+        if method == "doc_save":
+            raise M.CoreError("path already bound", code="path_bound_to_other_doc",
+                              detail={"other_doc_id": "bound"})
+        return original(method, params)
+    monkeypatch.setattr(M.cb, "call", guarded)
+    out = json.loads(tools["export_part"](fmt="step+", path=str(tmp_path / "bound.step+"),
+                                          doc_id="doc-live"))
+    assert out["ok"] is False
+    assert out["code"] == "path_bound_to_other_doc"
+    assert out["detail"]["other_doc_id"] == "bound"
+    assert "bound document" in out["hint"]
+
+def test_native_export_does_not_report_existing_file_as_saved_on_dirty_refusal(
+        exchange, monkeypatch, tmp_path):
+    tools, _ = exchange
+    destination = tmp_path / "existing.step+"
+    destination.write_bytes(b"original")
+    original = M.cb.call
+    def guarded(method, params):
+        if method == "doc_save":
+            assert params["if_no_human_dirty"] is True
+            return {"ok": False, "code": "human_dirty"}
+        return original(method, params)
+    monkeypatch.setattr(M.cb, "call", guarded)
+    out = json.loads(tools["export_part"](fmt="step+", path=str(destination),
+                                          doc_id="doc-live"))
+    assert out["ok"] is False
+    assert out["code"] == "human_dirty"
+    assert destination.read_bytes() == b"original"
 
 
 def test_export_part_drawplus_uses_standalone_saver(exchange, tmp_path, monkeypatch):
@@ -225,7 +243,7 @@ def test_import_part_missing_relative_path_keeps_teaching_envelope(exchange, tmp
     assert str(tmp_path) in out["hint"]  # teaches the resolved location it checked
     assert calls == []  # isfile gate fired before any cb.call
 
-# Explicit resume reuses the resolved source path; ordinary imports remain independent.
+# The engine atomically reuses a bound document unless a copy was requested.
 
 
 @pytest.fixture()
@@ -246,6 +264,8 @@ def exchange_with_open_file(monkeypatch, tmp_path):
                  "feature_count": 4, "path": str(part)},
             ]}
         if method == "doc_open":
+            if params.get("reuse_open") and Path(params["path"]) == part:
+                return {"doc_id": "doc-already", "reused": True, "revision": 7}
             return {"doc_id": "doc-opened"}
         if method == "import_file":
             return {"doc_id": "doc-imported"}
@@ -253,6 +273,7 @@ def exchange_with_open_file(monkeypatch, tmp_path):
 
     monkeypatch.setattr(M.cb, "call", _fake_call)
     monkeypatch.setattr(M, "_publish_current", lambda *a, **k: None)
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(tmp_path))
     mcp = _StubMCP()
     M.register_cad_exchange_tools(mcp)
     return mcp.tools, calls, part
@@ -262,13 +283,13 @@ def test_import_part_resumes_an_already_open_file(exchange_with_open_file):
     """The whole duplicate-part class: no second document, and the caller is told why."""
     tools_fn, calls, part = exchange_with_open_file
 
-    out = json.loads(tools_fn["import_part"](path=str(part), resume=True))
+    out = json.loads(tools_fn["import_part"](path=str(part)))
 
     assert out["ok"] is True, out
     assert out["reused"] is True, out
     assert out["doc_id"] == "doc-already"
-    assert out["feature_count"] == 4
-    assert [m for m, _ in calls if m in ("doc_open", "import_file")] == []
+    assert [p for m, p in calls if m == "doc_open"] == [
+        {"path": str(part), "detach_path": False, "reuse_open": True}]
 
 
 def test_import_part_resume_survives_a_non_canonical_path(exchange_with_open_file,
@@ -281,7 +302,7 @@ def test_import_part_resume_survives_a_non_canonical_path(exchange_with_open_fil
 
     assert out.get("reused") is True, out
     assert out["doc_id"] == "doc-already"
-    assert [m for m, _ in calls if m in ("doc_open", "import_file")] == []
+    assert [p for m, p in calls if m == "doc_open"][0]["reuse_open"] is True
 
 
 def test_import_part_into_an_existing_part_still_imports(exchange_with_open_file):
@@ -305,8 +326,16 @@ def test_import_part_does_not_adopt_an_unrelated_open_doc(exchange_with_open_fil
     out = json.loads(tools_fn["import_part"](path=str(other)))
 
     assert out["ok"] is True, out
-    assert "reused" not in out
+    assert out["reused"] is False
     assert out["doc_id"] == "doc-opened"
+
+def test_import_native_copy_is_explicitly_detached(exchange_with_open_file):
+    tools, calls, part = exchange_with_open_file
+    out = json.loads(tools["import_part"](path=str(part), copy=True))
+    assert out["doc_id"] == "doc-opened"
+    assert not out["reused"]
+    assert [p for m, p in calls if m == "doc_open"] == [
+        {"path": str(part), "detach_path": True, "reuse_open": False}]
 
 def test_solidworks_without_com_falls_through_to_portable_native_import(
         exchange, tmp_path, monkeypatch):
@@ -348,6 +377,29 @@ def test_solidworks_without_com_falls_through_to_portable_native_import(
     assert out["component_names"] == ["Wheel"]
     assert "SolidWorks COM automation is unavailable" in out["feature_fallback_reason"]
     assert [method for method, _ in calls if method == "import_file"] == ["import_file"]
+
+def test_solidworks_sidecar_save_refusal_retains_component(exchange, tmp_path, monkeypatch):
+    from services.sw_import import sw_translate
+    tools, calls = exchange
+    source = tmp_path / "assembly.sldasm"
+    source.write_bytes(b"assembly")
+    monkeypatch.setattr(M.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(sw_translate, "resolve", lambda _: {
+        "name": "assembly", "blocking": [], "degraded": [], "is_assembly": True,
+        "components": [{"part_key": "piece.sldprt", "ops": []}]})
+    def call(method, params):
+        calls.append((method, dict(params)))
+        if method == "doc_new":
+            return {"doc_id": "component"}
+        if method == "doc_save":
+            return {"ok": False, "code": "human_dirty"}
+        return {}
+    monkeypatch.setattr(M.cb, "call", call)
+    result = json.loads(tools["import_part"](str(source)))
+    assert result["ok"] is False and result["code"] == "human_dirty"
+    assert result["doc_id"] == "component"
+    assert next(p for method, p in calls if method == "doc_save")["if_no_human_dirty"]
+    assert not any(method == "doc_close" for method, _ in calls)
 
 
 @pytest.mark.parametrize("fmt", ["step", "step+", "draw+"])
@@ -410,3 +462,78 @@ def test_export_refuses_symlinked_credential_destination(
     assert not [m for m, _p in calls if m in (
         "doc_save", "export_file", "drawing_save_standalone")]
     assert list(secrets.iterdir()) == []
+
+
+def test_import_without_workspace_does_not_read_worker_file(
+        exchange, tmp_path, monkeypatch):
+    tools, calls = exchange
+    monkeypatch.delenv("CHUDWARE_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("CHUDWARE_FS_ROOT", raising=False)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "block.step").write_text("ISO-10303-21;")
+
+    result = json.loads(tools["import_part"]("block.step"))
+
+    assert result["ok"] is False
+    assert calls == []
+
+
+def test_scad_inspection_converts_source_lengths_and_keeps_mm_overrides():
+    mcp = _StubMCP()
+    M.register_cad_exchange_tools(mcp)
+    params = {
+        "source": "width=2; count=3; flag=true; computed=width*2; cube(width);",
+        "files": [],
+        "parameters": {},
+        "parameter_schema": [
+            {"name": "width", "kind": "length"},
+            {"name": "count", "kind": "integer"},
+        ],
+        "mm_per_source_unit": 25.4,
+    }
+    inspected = json.loads(mcp.tools["scad_inspect"](params))
+    assert inspected["ok"], inspected
+    controls = {control["name"]: control for control in inspected["controls"]}
+    assert controls["width"]["value"] == pytest.approx(50.8)
+    assert controls["count"]["value"] == 3
+    assert controls["flag"]["value"] is True
+    assert "computed" not in controls
+
+    params["parameters"]["width"] = {"value": 12.7, "expr": None}
+    overridden = json.loads(mcp.tools["scad_inspect"](params))
+    assert overridden["ok"], overridden
+    width = next(control for control in overridden["controls"] if control["name"] == "width")
+    assert width["value"] == pytest.approx(12.7) and width["overridden"] is True
+    params["mm_per_source_unit"] = 0
+    assert json.loads(mcp.tools["scad_inspect"](params))["ok"] is False
+
+
+def test_scad_conversion_reports_real_blocker_and_preserves_native_geometry():
+    mcp = _StubMCP()
+    M.register_cad_exchange_tools(mcp)
+    created = M.cb.call("doc_new", {"kind": "part", "name": "SCAD projection blocker"})
+    doc = created["doc_id"]
+    try:
+        built = M.cb.call("doc_apply_ops", {
+            "doc_id": doc, "base_revision": created["revision"],
+            "ops": [M.cb.feat("torus", "Ring", {"major_r": 10, "minor_r": 2})]})
+        assert "rejected_tree" not in built, built
+        assert all(status["ok"] for status in built["rebuild"]["feature_status"]), built
+        fid = built["id_map"]["$0"]
+        before = M.cb.call("doc_tree", {"doc_id": doc})
+        mass = M.cb.call("eval_mass", {"doc_id": doc})
+        assert mass["volume_mm3"] == pytest.approx(2 * math.pi**2 * 10 * 2**2)
+
+        refused = json.loads(mcp.tools["scad_convert"](
+            "to_code", doc_id=doc, base_revision=built["revision"], mm_per_source_unit=25.4))
+        assert refused["ok"] is False, refused
+        blockers = refused["detail"]["report"]["blockers"]
+        assert any(blocker.get("id") == fid and blocker.get("type") == "torus"
+                   for blocker in blockers), refused
+        after = M.cb.call("doc_tree", {"doc_id": doc})
+        assert after["revision"] == before["revision"]
+        assert after["tree"] == before["tree"]
+        assert M.cb.call("eval_mass", {"doc_id": doc})["volume_mm3"] == pytest.approx(
+            mass["volume_mm3"])
+    finally:
+        M.cb.call("doc_close", {"doc_id": doc})

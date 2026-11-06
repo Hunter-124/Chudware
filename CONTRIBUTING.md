@@ -34,36 +34,115 @@ manufacturing, twin, and print layers require C++20. CUDA is an optional LBM bac
 (`CHUDWARE_WITH_CUDA`, default OFF). Windows specifics are in
 [docs/reference/BUILD_WINDOWS.md](docs/reference/BUILD_WINDOWS.md).
 
+For browser work, start with [web/README.md](web/README.md). The Compose path builds
+the browser bundle, native engine and non-AI Python workers without the optional
+online-agent SDK/runtime. Native provisioning uses the SHA-256-pinned SDK source
+archive and runtime assets pinned in `vendor/omp/OMP_ARTIFACT.lock`. The official
+[Oh My Pi source](https://github.com/can1357/oh-my-pi) is the upstream runtime;
+keep immutable source revision and hash requirements intact. See
+[runtime setup](README.md#optional-online-agent-setup) and the
+[integration boundary](docs/dev/omp-integration.md).
+
 Enable the repository's pre-commit hook once per clone:
 
 ```bash
 git config core.hooksPath scripts/hooks
 ```
 
-## Checks
+## Running tests
+
+Tests run in isolated containers to protect a live app's daemon, build trees, ports,
+data and CPU. Pytest, CTest, `scripts/test_lite.py` and `scripts/gate.sh` refuse
+developer-host execution (exit 3); GitHub Actions and Podman/Docker containers pass
+the guard. Listing suites and dry runs are allowed on the host.
+
+Verify a change with the suite(s) for the area you touched (`--suite <name>[,<name>]`),
+or let `scripts/testbox.py` select tests from your changes. Each suite stays under five
+minutes warm; a suite run over that prints a warning, and a suite that keeps tripping it
+warm gets split. Run the full gate (`scripts/testbox.py --gate`) only before a release or
+when tracking down breakage across areas.
+
+On a POSIX developer host, use `scripts/testbox.py` from the repository root. It
+builds a Fedora 44 Podman image and runs against a private working-tree snapshot,
+with separate cached build trees per slot:
 
 ```bash
-.venv-mcp/bin/python scripts/check.py                            # fast source and audit gate
-CHUDWARE_GATE_PYTHON=.venv-mcp/bin/python bash scripts/gate.sh   # full Linux gate
+scripts/testbox.py --list-suites
+scripts/testbox.py --suite agent
+scripts/testbox.py --suite geom,sketch --suite drawing
+scripts/testbox.py --dry-run
+scripts/testbox.py
+scripts/testbox.py --gate
 ```
 
-- `scripts/check.py` runs the deterministic source-level audits: GUI lint, ribbon command
-  routing, SolidWorks-parity evidence pointers, agent event kinds, the no-Python-engine
-  import ratchet, generated tool tables, advertised MCP tools, portable paths, and the
-  shared-UI manifest. It needs no native build, but some audits import the MCP tool
-  catalog, so run it with the service environment (`CHECK_PYTHON` selects another
-  interpreter).
-- `scripts/gate.sh` is the full Linux gate; its header comment is the authoritative stage
-  list. It runs `check.py`, the core build and ctest, the GUI build, a WASM build smoke when
-  emsdk is installed, the `chudware-hostd` lifecycle smoke and web-parity probe, the Python
-  suites, and headless screenshot smokes. Stages whose environment is missing (no OCCT, no
-  `xvfb-run`, no emsdk) report SKIP rather than failing; `CHUDWARE_GATE_STRICT=1` makes
-  them fatal, as CI does.
-- Targeted runs while iterating:
-  - C++ core: `ctest --test-dir core/build-linux` (gate tree) or
-    `ctest --test-dir build/<preset>/core` (preset tree).
-  - Python: `.venv-mcp/bin/python -X utf8 -m pytest services/agent -q` (any package dir).
-  - GUI: the headless screenshot harness, `CHUDWARE_SHOT=<scenario>` under `xvfb-run`.
+The default run selects tests from changes and has a 300-second budget; `--files`,
+`--since` and `--budget` refine it. Named suites cover core and host CTest tests
+and Python tests; selecting Python tests also builds the required app, hostd and
+shape worker runtimes. The suites are `geom`, `sketch`, `drawing`, `assembly`,
+`mesh_fea`, `sim`, `topopt`, `cam_mfg`, `ecad`, `formats`, `agent`, `parts`,
+`platform`, `render` (renderer, viewport, camera, tessellation, screenshots), `gui`
+(generic GUI shell, widgets, theme, icons) and `infra`. GUI tests live in the suite of
+their product area. For every new test, assign its CTest name or pytest path
+in `scripts/test_suites.json`: CMake rejects unassigned CTest tests and
+`scripts/check.py` rejects unowned pytest files.
+
+By default testbox chooses the first reachable SSH host with Podman and rsync from
+the space-separated `CHUDWARE_TESTBOX_HOSTS` environment variable, or, when unset,
+from `~/.config/chudware/testbox.json`:
+
+```json
+{"hosts": ["ssh-alias"]}
+```
+
+If none is available it uses local Podman. Everything testbox stores (slots, their
+build trees, a private Podman image store and a ccache shared by all slots, so a fresh
+slot reuses compiled objects) lives under `~/.cache/chudware-testbox`
+on the execution host; symlink that directory onto a larger disk if needed. Hosts with
+less than 30 GiB free there are skipped, and an explicit `--host` fails fast. Use
+`--host local` to force local execution or `--host <ssh-alias>` to select a remote
+host. Containers are capped at `nproc - 2` CPUs and run niced so the live app stays
+responsive; `--jobs N` lowers parallelism further. Run logs are copied to
+`.cache/testbox/<host>-<timestamp>/`. The runner
+requires POSIX facilities and does not run directly under native Windows Python;
+see the [Windows guide](docs/reference/BUILD_WINDOWS.md).
+
+`scripts/testbox.py --gate` runs the authoritative full Linux gate, including source
+audits, core tests by suite, GUI and runtime builds, Python suites and screenshot
+smokes. Missing toolchains cause SKIPs; CI enables strict mode to make them fatal.
+See the [CI workflow map](docs/reference/CI.md) for CI-specific coverage.
+
+For source-only audits without a native build, run `.venv-mcp/bin/python
+scripts/check.py` using the provisioned service environment; `CHECK_PYTHON` selects
+another interpreter. Real systemd quota/isolation tests need deliberately provisioned
+disposable quota roots and may skip without them; ordinary unit tests do not prove
+kernel sandbox coverage.
+
+Other checks:
+
+  - Browser client: `./build.sh wasm` builds and stages the bundle and runs the asset
+    parity check. It needs emsdk; the container build supplies its pinned toolchain.
+  - Container or gateway behavior: use a disposable Compose project/volumes, never a
+    running user's workspace. Exercise a real model operation and Python-backed
+    operation, save/reopen across restart, and workspace upload/download. `/healthz`
+    alone checks gateway liveness, not usable geometry.
+    The executable local deployment probe is:
+
+    ```bash
+    .venv-mcp/bin/python web/deploy/smoke.py http://127.0.0.1:8300
+    ```
+
+    It checks real browser assets/security, native geometry/save/reopen/mesh and a
+    general Python worker, creating/removing only its UUID-named smoke file. It does
+    not start a deployment. For persistence, run once with
+    `--keep --receipt /tmp/chudware-smoke.json` (choose a new receipt path), recreate
+    the scratch deployment without deleting volumes, then run with
+    `--resume /tmp/chudware-smoke.json` to reopen, verify and clean up. Do not point
+    this local unauthenticated probe at an authenticated public proxy.
+
+    For proxy changes, check
+    unauthenticated HTTP and WebSocket denial, authenticated access to every route,
+    same-origin enforcement, allowed hosts, and COOP/COEP headers. See the web guide's
+    [health and troubleshooting](web/README.md#health-logs-and-troubleshooting).
 
 Continuous integration runs the same checks on every pull request; see
 [docs/reference/CI.md](docs/reference/CI.md).

@@ -43,40 +43,61 @@ namespace {
     closeInheritedFds(3);
 
     const int kq = ::kqueue();
-    struct kevent ev[2];
-    EV_SET(&ev[0], (uintptr_t)parentPid, EVFILT_PROC, EV_ADD | EV_ENABLE, NOTE_EXIT, 0, nullptr);
-    EV_SET(&ev[1], (uintptr_t)child, EVFILT_PROC, EV_ADD | EV_ENABLE, NOTE_EXIT, 0, nullptr);
-    const bool watching = kq >= 0 && ::kevent(kq, ev, 2, nullptr, 0, nullptr) == 0;
-
-    // The ordering race PDEATHSIG exists to prevent: the parent may have died
-    // between fork() and EV_ADD, in which case no NOTE_EXIT will ever arrive
-    // and blocking here would strand the child forever. Registration failing
-    // with ESRCH says the same thing; so does being reparented away.
-    if (!watching || ::getppid() != (pid_t)parentPid) {
-        ::killpg(::getpgrp(), SIGKILL);  // takes the exec'd child, then us
+    auto kill_group = []() -> void {
+        ::killpg(::getpgrp(), SIGKILL);
         _exit(125);
+    };
+    struct kevent ev;
+    EV_SET(&ev, (uintptr_t)parentPid, EVFILT_PROC, EV_ADD | EV_ENABLE,
+           NOTE_EXIT, 0, nullptr);
+    int registered = -1;
+    if (kq >= 0) {
+        do {
+            registered = ::kevent(kq, &ev, 1, nullptr, 0, nullptr);
+        } while (registered < 0 && errno == EINTR);
     }
+    // Watch the parent independently: failure to watch a child which has
+    // ALREADY exited must not be mistaken for failure to guard its parent.
+    if (registered < 0 || ::getppid() != (pid_t)parentPid) kill_group();
 
+    EV_SET(&ev, (uintptr_t)child, EVFILT_PROC, EV_ADD | EV_ENABLE,
+           NOTE_EXIT, 0, nullptr);
+    do {
+        registered = ::kevent(kq, &ev, 1, nullptr, 0, nullptr);
+    } while (registered < 0 && errno == EINTR);
+    // proc_find cannot attach a NOTE_EXIT watch to an already-exited process.
+    // This is common for short callbacks: closing inherited fds above can take
+    // longer than the child's entire task. ESRCH alone is NOT a successful
+    // child exit; only waitpid below proves that and supplies its exact status.
+    bool exiting = registered < 0 && errno == ESRCH;
+    if (registered < 0 && !exiting) kill_group();
+
+    int st = 0;
+    const struct timespec exit_poll = {0, 10 * 1000 * 1000};
     for (;;) {
+        const pid_t got = ::waitpid(child, &st, WNOHANG);
+        if (got == child) break;
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            kill_group();
+        }
         struct kevent out;
-        const int n = ::kevent(kq, nullptr, 0, &out, 1, nullptr);
+        // NOTE_EXIT can precede waitpid's reapable state. During that narrow
+        // window (or an ESRCH registration), keep watching the parent instead
+        // of blocking in waitpid and abandoning parent-death containment.
+        const int n = ::kevent(kq, nullptr, 0, &out, 1,
+                               exiting ? &exit_poll : nullptr);
         if (n < 0) {
             if (errno == EINTR) continue;
-            break;  // unusable queue: fall through to a plain wait on the child
+            kill_group();
         }
         if (n == 0) continue;
-        if ((long)out.ident == parentPid) {
-            ::killpg(::getpgrp(), SIGKILL);
-            _exit(125);
-        }
-        if ((pid_t)out.ident == child) break;
+        if ((long)out.ident == parentPid) kill_group();
+        if ((pid_t)out.ident == child) exiting = true;
     }
 
-    // Transparent exit: the caller's waitpid() must observe exactly what it
-    // would have observed had it forked the exec'd child directly.
-    int st = 0;
-    while (::waitpid(child, &st, 0) < 0 && errno == EINTR) {
-    }
+    // Transparent exit: the caller's waitpid() observes the child's real
+    // status even when the child finished before its NOTE_EXIT registration.
     if (WIFSIGNALED(st)) {
         const int sig = WTERMSIG(st);
         ::signal(sig, SIG_DFL);

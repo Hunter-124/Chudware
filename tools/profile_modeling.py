@@ -40,7 +40,7 @@ sys.path.insert(0, str(_HERE.parent))               # for services.mcp.core_brid
 
 
 from services.mcp import core_bridge as cb  # noqa: E402
-from tools.perf_regression import _private_engine  # noqa: E402
+from tools.perf_regression import _open_part, _private_engine  # noqa: E402
 import flamegraph  # noqa: E402
 
 
@@ -97,11 +97,10 @@ def _workloads():
     }
 
 
-# A deliberately non-trivial part used by the INTERACTIVE workloads (pick / open).
-# Build once, then measure steady-state picks or saved-cache opens; neither workload
-# deliberately invalidates the compiled state.
+# The same non-trivial part as the open_warm benchmark, used for interactive
+# picks and persisted-cache opens; neither workload deliberately rebuilds it.
 def _heavy_build():
-    return [_box("Plate", 160, 160, 20), _bolt_circle(24, 120, 6), _fillet(2)]
+    return _open_part()
 
 
 # Interactive workloads don't rebuild a doc per iteration — they build ONCE then exercise an

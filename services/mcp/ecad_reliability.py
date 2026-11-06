@@ -497,9 +497,11 @@ def register_ecad_reliability_tools(mcp) -> None:
                         mesh_fineness: float = 0.35,
                         dry_run: bool = False,
                         path: str = "") -> str:
-        """Vibration reliability screen of the ACTIVE routed board — modal solve of the
+        """Vibration reliability screen of a routed KiCad board — modal solve of the
         mounted board+components solid, excitation-band resonance flagging, and a
         Steinberg deflection-based solder-joint risk screen. One call, zero manual BCs.
+
+        Pass an open board doc_id or .kicad_pcb path in doc_id; omit it for the current board.
 
         Pipeline:
         1. Reuses the thermal-handoff fused board+components FEA solid
@@ -601,8 +603,9 @@ def register_ecad_reliability_tools(mcp) -> None:
         try:
             session = _get_pcb(doc_id or None)
         except OpError as e:
-            return _err(e.message, hint="vibe check needs an open routed board.",
-                        next_actions=["ecad_new_pcb('myboard')", "ecad_make_board(...)"])
+            return _err(e.message, hint="vibe check needs an open board or a KiCad board path.",
+                        next_actions=["ecad_open(path='board.kicad_pcb')"],
+                        code=e.code, detail=e.detail)
         board_doc = session.doc
 
         # ── mount holes -> fixed BCs ─────────────────────────────────────────

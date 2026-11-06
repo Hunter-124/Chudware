@@ -2,7 +2,6 @@ schema: aicad.role/1
 id: fixer
 goal: Resolve one failure card per engagement - one candidate fix per attempt, predicted effect stated before, measured effect recorded after.
 stage_scope: [fix]
-playbook_default: null
 tool_allowlist:
   - tool: ledger_get
   - tool: ledger_note

@@ -1,37 +1,89 @@
 #pragma once
 
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 #include <TopoDS_Shape.hxx>
 
 namespace chudware::util {
 
+enum class ShapeBuildFailure { none, construction, crash, timed_out, unavailable };
+
 struct IsolatedShapeResult {
     bool ok = false;
     TopoDS_Shape shape;
+    ShapeBuildFailure failure = ShapeBuildFailure::unavailable;
 };
 
-// Run an OCCT shape-producing operation out of process on POSIX. The child serializes
-// the result; crashes and timeouts are reported as ordinary failure. Elsewhere this
-// executes in-process so callers remain portable.
-// `sidecar` (optional): a string the `build` lambda fills alongside its shape (e.g. the
-// op's face provenance, geom/op_history.h). In-process the lambda writes it directly;
-// across the fork the child ships it back with the shape and the parent restores it.
-// It is cleared first and left empty whenever the build fails.
+// Legacy blend callback isolation. Signals are crashes; null builds and caught
+// exceptions are construction failures. Fork and transport failures are unavailable.
+// A default-policy timeout retires this legacy mechanism and retries in process.
+// Strict callback requests (retry_after_timeout=false) are unavailable while
+// isolation is enabled: a callback cannot safely run after fork in a threaded host.
+// With explicit opt-out, on Windows, or inside an already bounded task, the callback
+// runs directly; its normal null result retains sidecar diagnostics for strict calls.
 IsolatedShapeResult isolate_shape_build(const std::function<TopoDS_Shape()>& build,
                                         std::chrono::milliseconds timeout,
-                                        std::string* sidecar = nullptr);
+                                        std::string* sidecar = nullptr,
+                                        bool retry_after_timeout = true);
 
 // Configured on (CHUDWARE_BLEND_ISOLATION != "0").
 bool shape_isolation_enabled();
 
-// Configured on AND not yet retired for this process. A fork timeout is treated as
-// "fork is unusable here" and permanently falls back in-process (see the .cpp), so
-// callers that need to know whether the NEXT build will actually be isolated — a test
-// injecting a fault, a diagnostic — must ask this, not just `shape_isolation_enabled`.
+// Configured on AND not yet retired for this process. A default-policy fork timeout
+// retires isolation and falls back in-process; callers needing to know whether the
+// NEXT build will be isolated must ask this, not just `shape_isolation_enabled`.
 bool shape_isolation_active();
+
+// Strict fillets use a fresh executable, never a callback in a post-fork copy
+// of a multithreaded host. Edge references are 1-based TopExp::MapShapes indices
+// with the selected orientation; serialization never modifies the source shape.
+struct ShapeWorkerEdge {
+    std::uint32_t index = 0;
+    std::uint32_t orientation = 0;
+};
+struct FilletWorkerParameters {
+    double radius = 0.0;
+    double radius2 = 0.0;
+    bool variable = false;
+    bool unequal_requested = false;
+    bool recording = false;
+    bool document_validation = false;
+    std::chrono::steady_clock::time_point deadline;
+};
+
+// One immutable serialized input and verified worker are reused for all probes
+// in one search. Linux executes the held verified inode; other POSIX platforms
+// execute the verified canonical path with its descriptor held.
+class ShapeBuildExecSession {
+public:
+    ShapeBuildExecSession(const TopoDS_Shape& input, const std::vector<ShapeWorkerEdge>& edges);
+    ~ShapeBuildExecSession();
+    ShapeBuildExecSession(const ShapeBuildExecSession&) = delete;
+    ShapeBuildExecSession& operator=(const ShapeBuildExecSession&) = delete;
+
+    IsolatedShapeResult run(const FilletWorkerParameters& parameters, std::string& sidecar);
+
+private:
+    std::string worker_path_;
+    int worker_fd_ = -1;
+    int input_fd_ = -1;
+};
+
+// Configured strict policy; unlike legacy blend isolation, a prior timeout never
+// retires it. False only on unsupported platforms, explicit opt-out, or within
+// an already bounded advisory child.
+bool strict_shape_isolation_enabled();
+
+// Called only by the dedicated executable after exec. The callback runs in that
+// fresh process and may safely construct/validate shapes using ordinary C++.
+using ShapeWorkerBuild = std::function<IsolatedShapeResult(
+    const TopoDS_Shape&, const std::vector<ShapeWorkerEdge>&,
+    const FilletWorkerParameters&, std::string&)>;
+int shape_build_worker_main(int argc, char** argv, const ShapeWorkerBuild& build);
 
 enum class IsolatedTaskStatus { completed, timed_out, unavailable, failed };
 

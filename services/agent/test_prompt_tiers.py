@@ -50,11 +50,15 @@ class TestSoftBlocks(unittest.TestCase):
         self.assertEqual(pt.soft_phrasing(""), pt.soft_phrasing("C"))
 
 
+def _system(card, capability):
+    return pt.assemble_system_for_capability(card.system_prompt, capability)
+
+
 class TestAssembleSystem(unittest.TestCase):
     def test_a_system_contains_calc_before_model(self):
         """WI-16 acceptance: A system text contains calc-before-model."""
         card = roles.load_role("feature_modeler")
-        system = roles.system_prompt_for_capability(card, "A")
+        system = _system(card, "A")
         self.assertIn("calculate-before-model", system)
         self.assertIn(pt.SOFT_BLOCK_MARKER, system)
         # Base role prose is still present.
@@ -63,28 +67,17 @@ class TestAssembleSystem(unittest.TestCase):
     def test_c_system_excludes_rigid_and_per_mutation(self):
         """WI-16 acceptance: C system has neither rigid checklist nor 'after every mutation'."""
         card = roles.load_role("feature_modeler")
-        system = roles.system_prompt_for_capability(card, "C")
+        system = _system(card, "C")
         self.assertIn(pt.SOFT_BLOCK_MARKER, system)
         self.assertIn("verify_battery", system)
         for snip in pt.C_FORBIDDEN_SNIPPETS:
             self.assertNotIn(snip, system, f"C system must not contain {snip!r}")
 
-    def test_assemble_context_capability_kwarg(self):
-        card = roles.load_role("sketcher")
-        ctx_a = roles.assemble_context(card, capability="A", ledger_render="§LEDGER§")
-        ctx_c = roles.assemble_context(card, capability="C", ledger_render="§LEDGER§")
-        self.assertIn("calculate-before-model", ctx_a)
-        self.assertNotIn("calculate-before-model", ctx_c)
-        self.assertIn("§LEDGER§", ctx_a)
-        self.assertIn("§LEDGER§", ctx_c)
-        # Soft block precedes ledger (§9.1 order still holds).
-        self.assertLess(ctx_a.index(pt.SOFT_BLOCK_MARKER), ctx_a.index("§LEDGER§"))
-
     def test_default_capability_is_c_freedom(self):
         """Default (None) must be C so frontier is never taxed by accident."""
         card = roles.load_role("feature_modeler")
-        default = roles.system_prompt_for_capability(card, None)
-        explicit_c = roles.system_prompt_for_capability(card, "C")
+        default = _system(card, None)
+        explicit_c = _system(card, "C")
         self.assertEqual(default, explicit_c)
         self.assertNotIn("after every mutation", default)
 
@@ -92,8 +85,8 @@ class TestAssembleSystem(unittest.TestCase):
         card = roles.load_role("geometry_designer")
         prof_a = profile_for_letter("A")
         prof_c = profile_for_letter("C")
-        sys_a = roles.system_prompt_for_capability(card, prof_a)
-        sys_c = roles.system_prompt_for_capability(card, prof_c)
+        sys_a = _system(card, prof_a)
+        sys_c = _system(card, prof_c)
         self.assertIn("calculate-before-model", sys_a)
         self.assertNotIn("calculate-before-model", sys_c)
 
@@ -102,22 +95,22 @@ class TestAssembleSystem(unittest.TestCase):
         card = roles.load_role("feature_modeler")
         cap = resolve_capability("local-24k")
         self.assertEqual(cap.letter, "A")
-        system = roles.system_prompt_for_capability(card, cap)
+        system = _system(card, cap)
         self.assertIn("calculate-before-model", system)
 
     def test_resolve_capability_frontier_is_c(self):
         card = roles.load_role("feature_modeler")
         cap = resolve_capability("frontier")
         self.assertEqual(cap.letter, "C")
-        system = roles.system_prompt_for_capability(card, cap)
+        system = _system(card, cap)
         self.assertNotIn("after every mutation", system)
         self.assertNotIn("calculate-before-model", system)
 
     def test_all_modeling_roles_a_vs_c(self):
         for role_id in _ROLES:
             card = roles.load_role(role_id)
-            a = roles.system_prompt_for_capability(card, "A")
-            c = roles.system_prompt_for_capability(card, "C")
+            a = _system(card, "A")
+            c = _system(card, "C")
             self.assertIn("calculate-before-model", a, role_id)
             self.assertNotIn("after every mutation", c, role_id)
             self.assertNotIn("calculate-before-model", c, role_id)

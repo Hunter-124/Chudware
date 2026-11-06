@@ -1,15 +1,12 @@
 # The Advisory Layer
 
-Status: adopted design record (2026-07-04, updated 2026-10-04). Frozen schemas live in
-[`contracts/advisor.md`](../../contracts/advisor.md). The advisory engine is called the
-*foreman* in code (`services/agent/advisor/`). The components below are implemented; the
-end-to-end benchmark (Appendix A) and the MCP-surface catch-up for the newest components
-remain open.
+Frozen schemas live in [`contracts/advisor.md`](../../contracts/advisor.md).
+The advisory engine is called the *foreman* in code (`services/agent/advisor/`).
 
-This document is design intent; component sections are not an as-built spec. Since
-2026-08-31, online model execution for the roles it routes runs inside the embedded
-Chudcode RPC runtime. Chudware keeps advisories, roles, councils and delegation
-governance; see [Chudcode integration](../dev/chudcode-integration.md).
+This document is design intent; component sections are not an as-built spec.
+Online model execution for the roles it routes now runs inside the official
+OMP RPC runtime. Chudware keeps advisories, roles and delegation
+governance; see [OMP integration](../dev/omp-integration.md).
 
 ## 0. Thesis
 
@@ -50,7 +47,7 @@ Design rules:
 
 | Existing | Where | Role in the advisory layer |
 |---|---|---|
-| Agent loop (plan→code→render→verify, 4-level compaction) | `core/agent/run.cpp` (the loop behind the `agent_run_v2`/`agent_mission_v1` RPCs dispatched in `core/api/libchudware.cpp`; it replaced the earlier Python agent loop) | Host for advisory injection (seam: message assembly before `provider.complete_ex`) |
+| Agent loop | OMP session host (`services/agent/omp_host.py`) driving `omp --mode rpc` | Host for advisory injection (seam: message assembly before the provider call) |
 | DAG orchestrator, autonomy dial, `dag_replan` | `services/dag/` | Host for role cards per node; escalation target |
 | Tool registry w/ risk classes + allow-lists | `services/mcp/tool_registry.py` | Enforcement of role-card tool scopes (already supports `CHUDWARE_TOOLS_ALLOW` / node `tools:`) |
 | GSL describers (`describe_part/sketch/scene/...`) | `services/mcp/gsl_tools.py` | State→text for ledger snapshots and role handoffs |
@@ -132,27 +129,14 @@ two-failures-then-replan anti-grind rule), and role-specific judgment sections.
 How they compose into a mission is specified in `docs/design/COPILOT_MISSION_PIPELINE.md`
 (phases, exit gates, context recipes, replan routing).
 
-Handoffs are structured JSON (grammar-constrained for local models), written into the
-ledger — the next role never needs the previous role's chat.
+Handoffs are structured JSON, validated against the card's `handoff_schema`, written
+into the ledger — the next role never needs the previous role's chat.
 
-### 2.4 Playbooks
+### 2.4 Playbooks (removed)
 
-Pre-defined multi-step thinking scaffolds per operation type
-(`services/agent/playbooks/*.yaml`): ordered steps with `goal`, `helper_tools`,
-`checklist`, `output` (schema fragment). Example, `sketch_profile` playbook:
-
-1. Identify functional surfaces & datums (output: named list)
-2. Draft entity list (helper: `describe_sketch` after each edit)
-3. Close the profile (helper: `sketch_health` — regions + gaps)
-4. Geometric constraints first (helper: auto-coincident already applied; advisor lists
-   remaining DOF)
-5. Driving dimensions, function-critical first (helper: `suggest_dimension_scheme`
-   with manufacturing method + material)
-6. Exit gate: fully constrained, closed, no conflicting tags.
-
-Small models execute playbooks step-by-step (one step per turn); frontier models get
-the playbook as a compact checklist and may batch steps. Enforcement level comes from
-the tier profile, not the playbook.
+The per-operation playbook files (`services/agent/playbooks/*.yaml`) and their loader
+were removed: nothing at runtime consumed them. Step-by-step guidance now lives in
+the role system prompts and capability scaffolds (`services/agent/scaffolds.py`).
 
 ### 2.5 Calculator & data registry
 
@@ -214,11 +198,11 @@ the card names; one candidate per attempt; report predicted vs measured effect")
 
 ### 2.9 Model tier profiles
 
-`services/agent/tiers.yaml`: per-tier dials — context budget split (ledger/advisory/
-playbook/history token allocations), playbook enforcement (step-locked | checklist |
-off), structured-output mode (GBNF grammar | JSON-mode | free), advisory verbosity,
-max tool-schema exposure (role allowlists trim the 150-tool surface to <20 per role —
-essential for small models), compaction aggressiveness. Ships with profiles:
+`services/agent/tiers.yaml`: per-tier dials — context budget split (system/ledger/
+state/advisory/tools/history token allocations), generation headroom, tool-schema
+trim (role allowlists trim the 150-tool surface to <20 per role — essential for small
+models) and the capability profile letter (A scaffold-hard | B soft gates | C freedom).
+Ships with profiles:
 `local-24k`, `local-48k`, `mid`, `frontier`. Bench harness runs the same mission
 across tiers.
 
@@ -284,12 +268,8 @@ build-graph nodes for modeling missions.
 
 ### 2.14 Multi-document agent workspace
 
-Parallel part building for assemblies: a **doc ownership registry** (agent leases a
-doc_id; mutations by non-owners are rejected with the owner named; leases expire on
-handoff/death), buildgraph fan-out spawning one modeling sub-agent per part doc, and
-a per-doc event stream so the GUI can render N live viewports at once — the user
-watches every agent's part evolve simultaneously. Assembly-level roles (fit engineer,
-reviewer) take read leases; the world/assembly doc has a single writer at a time.
+Parallel part building can distribute work across document features and assembly
+components. Edits to the same document are applied sequentially.
 
 ### 2.15 Transparency & control UI
 
@@ -323,14 +303,10 @@ input:
 - Feature-flagged against vault availability; codes to the
   [`contracts/plm.md`](../../contracts/plm.md) contract.
 
-### 2.17 Organization layer (contract §18–§21)
+### 2.17 Organization layer (contract §20–§21)
 
-Departments (per deliverable cluster, chaired by the authored department_manager
-role) with auto-created inter-department channels and an enforced
-interface_change discipline; worker requests with mandatory explicit resolution
-and concern-aging into overseer audits; seated COUNCILS (authored personas:
-manufacturing/tolerancing/fitment/simplicity) gating build strategy before
-geometry, with recorded dissents the advisory engine watches; trigger-based context
+The former department/channel/worker-request runtime, optional ORGANIZE phase,
+and seated COUNCILS (contract §18–§19) were removed. What stays: trigger-based context
 injection (keyword/tool/event → context packs + pre-run calcs); and the
 dimension DERIVATION TREE with linked-dimension eq_set binding and the
 deterministic mark_faulty impact walker. Deliberation dial is inverted: local
@@ -391,95 +367,3 @@ advisory engine + roles + build-order DAG ─→ mission pipeline (COPILOT_MISSI
    render-able as in-app hints (the existing overlay/PropertyManager). One engine,
    two audiences.
 
----
-
-# Appendix A — End-to-end advisory benchmark (2026-08-04)
-
-Measured, not projected. The results below came from a live-model benchmark harness
-(research tooling that is not part of the public tree) run against hosted frontier and
-long-context models.
-
-## What ran
-
-One frozen mission — *bearing mount bracket: 20 mm g6 sliding-fit bore, 4x M5
-clearance holes, aluminium, machined, survives a 500 N side load* — through both
-loops on two hosted model tiers:
-
-* **baseline** — one linear `general_agent` turn (`run_linear_role_turn`)
-* **advisory** — the orchestrator role over a compiled `aicad.dag/1` mission
-  graph with role nodes and the advisory engine on (`dag.executor.run`)
-
-Scoring is deterministic, no LLM judges: bore diameter through `fit_calc`
-(clearance fit on 20 g6), hole pattern by counting `concavity == "bore"` faces
-near Ø5.5 in `query_geometry`, `is_manifold` from the verifier battery, and
-`min_fos` from `run_fea_static` under the 500 N load.
-
-**Scope: one seed, not the planned three.** Each advisory leg runs the full DAG
-(intake → plan → spec → build → verify → deliver) at ~17–30 min, and the run was held
-under its model-usage budget. Seeds 2 and 3 were not run. The matrix is seed-major so
-the executed subset is a complete loop × tier block.
-
-## Comparison
-
-| loop | tier | ok | stop | tool calls | tool fails | score | tokens | wall s |
-|---|---|---|---|---|---|---|---|---|
-| baseline | claude-opus-5 | yes | confirmed | 23 | 3 | **1.00** | 700,916 | 236 |
-| advisory | claude-opus-5 | yes | done | 94 | 11 | **1.00** | 367,231 | 1001 |
-| baseline | k3-256k | yes | confirmed | 32 | 1 | **0.00** | 397,821 | 704 |
-| advisory | k3-256k | yes | done | 48 | 9 | **0.00** | 198,257 | 1778 |
-
-| loop | mean score | tool calls | tool failures | fail rate | tokens |
-|---|---|---|---|---|---|
-| advisory | 0.50 | 142 | 20 | 14.1% | 565,488 |
-| baseline | 0.50 | 55 | 4 | 7.3% | 1,098,737 |
-
-Per-criterion: both opus-5 legs passed all four checks (bore 20.021 mm measured,
-clearance fit; 4/4 Ø5.5 holes; manifold; FoS 15.0). Both k3-256k legs failed all
-four — no bore face of the right size ever reached the document.
-
-## What this does and does not show
-
-**It does not show the advisory loop winning on quality.** At n=1 per cell the
-outcome is decided by the TIER, not the loop: opus-5 satisfied the mission on
-both loops, k3-256k on neither. That is a real finding and it is not the one the
-layer's thesis predicted.
-
-**The token result is the interesting one.** The advisory loop used roughly HALF
-the tokens of the linear loop on both tiers (367k vs 701k on opus-5; 198k vs 398k
-on k3-256k) while making 2–4x MORE tool calls. Role-scoped context packs cost far
-less per turn than one linear conversation that re-sends a growing transcript on
-every iteration. If it holds across seeds, the advisory architecture's case is
-economic — more actions per token — rather than higher single-shot quality.
-
-**Do not read the failure rates as loop quality.** The advisory loop's higher
-rate (14.1% vs 7.3%) is dominated by mission-scoped tools its nodes are
-advertised but cannot resolve in a bench harness (`delegate`, `dag_status`,
-`buildgraph_status`). That is a harness-shaped artifact of
-how the bench drives the DAG, not evidence about the loop.
-
-## Measurement caveats found the hard way
-
-* **Scoring must be isolated per leg.** Every leg shares one engine, and the
-  engine restarts document numbering, so `doc-cpp00000001` is genuinely reissued.
-  A first pass that scored "the best open document" had every advisory leg
-  grading the BASELINE leg's finished bracket and reported 1.00 across the board.
-  The corrected scorer only considers documents that did not exist when the leg
-  started. The k3-256k 0.00 rows are what that contamination was hiding.
-* **Legs must hold a private daemon**, or a
-  concurrent pytest run shares the engine and destroys the leg's document
-  mid-run — observed, open-doc count climbing 2 → 15 under a leg.
-* **Doc-GC must be pinned off** (`CHUDWARE_DOC_GC=0`); hostd was logging
-  `doc-gc: retire doc_save(doc-cpp00000010) failed` against a live leg's own doc.
-* **Per-leg token totals are approximate for the DAG loop.** `get_turn_usage()`
-  is a process-global accumulator reset per turn, so a multi-node run can lose a
-  node's usage (one discarded leg reported 0 tokens across 72 calls).
-
-## Advisory triples
-
-Not delivered. `dag.node.done` carried an `advisory` block on **zero** nodes
-across all four legs (`advisories = 0` in every leg record), so there were no
-advisory-shown → action → check-outcome triples to log. The advisory engine is
-gated on `CHUDWARE_ADVISOR` (default on) AND on the node carrying a `doc_id`;
-`node_runner._run_advisory` no-ops without one. Establishing why no node
-qualified is prerequisite work for a next-action training dataset, and it is
-the first thing to investigate before running seeds 2 and 3.

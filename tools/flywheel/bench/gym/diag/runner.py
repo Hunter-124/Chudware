@@ -21,7 +21,7 @@ DIAG_DIR = REPORTS_DIR / "diag"
 
 
 def _completion_target_for_tier(tier: str):
-    """Resolve an offline provider or a Chudcode-backed completion adapter."""
+    """Resolve an offline provider or an OMP-backed completion adapter."""
     from tools.flywheel.bench.gym.runner import _completion_provider_for_tier
 
     return _completion_provider_for_tier(tier)
@@ -87,7 +87,7 @@ def run_diag(
     """Run diagnostic suites for each tier.
 
     ``provider_factory`` remains injectable for deterministic tests. The default
-    uses local providers only for explicit offline tiers and Chudcode otherwise.
+    uses local providers only for explicit offline tiers and OMP otherwise.
     """
     wanted = list(axes) if axes else list(DIAG_AXES)
     runners = {

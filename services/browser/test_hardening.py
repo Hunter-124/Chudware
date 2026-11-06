@@ -168,6 +168,19 @@ def test_classifier_ignores_magento_refresh_captcha_module():
     assert challenge.classify_challenge(html) is None
 
 
+def test_iframe_detection_checks_its_own_src():
+    html = ('<iframe src="https://www.googletagmanager.com/ns.html"></iframe>'
+            '<script>var captchaRefresh = "/captcha/refresh";</script>')
+    assert challenge.classify_challenge(html) is None
+    assert challenge.classify_challenge('<iframe src="/captcha/check"></iframe>') == "captcha"
+
+
+def test_aws_waf_active_challenge_not_passive_script():
+    script = '<script>window.AwsWafIntegration = {};</script>'
+    assert challenge.classify_challenge(script) is None
+    assert challenge.classify_challenge(script + '<div id="challenge-container"></div>') == "captcha"
+
+
 def test_classifier_still_flags_active_recaptcha_bframe():
     # An actual reCAPTCHA challenge popup (bframe) still aborts, even alongside the
     # invisible badge — the invisible-badge escape must not swallow a real challenge.
@@ -327,7 +340,7 @@ def test_fetch_skips_captcha_page(sess):
                                    _cef=cef, min_interval=0.0)
     assert result["ok"] is False
     # Detection is a data-quality signal: skip parsing, never ingest the markup.
-    assert result["reason"] == "challenge_page"
+    assert result["reason"] == "captcha"
     assert "content" not in result
     assert profiles.load_meta("amazon").get("last_used_ts") is None
 
@@ -340,7 +353,7 @@ def test_fetch_skips_2fa_page(sess):
     result = session.browser_fetch("https://grabcad.com/parts", "grabcad",
                                    _cef=cef, min_interval=0.0)
     assert result["ok"] is False
-    assert result["reason"] == "challenge_page"
+    assert result["reason"] == "blocked"
 
 
 def test_fetch_passes_ordinary_page(sess):
@@ -381,12 +394,40 @@ def test_login_ordinary_page_has_no_challenge(sess):
 
 # --- stealth: consistent, honest fingerprint (no "look at me, a robot" tells) ----
 
-def test_stealth_user_agent_is_desktop_chrome_no_headless():
+@pytest.mark.parametrize(
+    "system,machine,os_token,navigator_platform,client_platform,architecture,bitness",
+    [
+        ("Linux", "x86_64", "X11; Linux x86_64", "Linux x86_64", "Linux", "x86", "64"),
+        ("Linux", "aarch64", "X11; Linux x86_64", "Linux x86_64", "Linux", "arm", "64"),
+        ("Darwin", "x86_64", "Macintosh; Intel Mac OS X 10_15_7",
+         "MacIntel", "macOS", "x86", "64"),
+        ("Darwin", "arm64", "Macintosh; Intel Mac OS X 10_15_7",
+         "MacIntel", "macOS", "arm", "64"),
+        ("Windows", "AMD64", "Windows NT 10.0; Win64; x64",
+         "Win32", "Windows", "x86", "64"),
+        ("Windows", "ARM64", "Windows NT 10.0; Win64; x64",
+         "Win32", "Windows", "arm", "64"),
+        ("FreeBSD", "amd64", "X11; FreeBSD amd64",
+         "FreeBSD amd64", "FreeBSD", "x86", "64"),
+    ],
+)
+def test_stealth_user_agent_and_client_hints_follow_platform(
+        monkeypatch, system, machine, os_token, navigator_platform, client_platform,
+        architecture, bitness):
     from services.browser import stealth
+
+    monkeypatch.setattr(stealth.platform, "system", lambda: system)
+    monkeypatch.setattr(stealth.platform, "machine", lambda: machine)
     ua = stealth.user_agent("149.0.7827.55")
+    params = stealth.cdp_ua_override_params(ua, "149.0.7827.55")
+    assert f"({os_token})" in ua
     assert "Chrome/149.0.7827.55" in ua
-    assert "Headless" not in ua        # the whole point
-    assert "Linux x86_64" in ua        # OS stays honest
+    assert "Headless" not in ua
+    assert params["userAgent"] == ua
+    assert params["platform"] == navigator_platform
+    assert params["userAgentMetadata"]["platform"] == client_platform
+    assert params["userAgentMetadata"]["architecture"] == architecture
+    assert params["userAgentMetadata"]["bitness"] == bitness
 
 
 def test_stealth_launch_args_disable_automation_flag():
@@ -417,9 +458,20 @@ def test_stealth_cdp_override_scrubs_headless_from_client_hints():
     assert "Google Chrome" in names and "Chromium" in names
     # UA header and client-hint versions must agree (consistency > mimicry).
     assert all(b["version"] == "149" for b in brands if b["brand"] != "Not)A;Brand")
-    assert params["userAgentMetadata"]["platform"] == "Linux"
+    assert params["userAgentMetadata"]["fullVersion"] == "149.0.7827.55"
     # Unweighted — CDP appends the q itself; passing q here double-appends it.
     assert params["acceptLanguage"] == "en-US,en"
+
+
+def test_stealth_version_fallback_matches_client_hints():
+    from services.browser import stealth
+
+    ua = stealth.user_agent("")
+    metadata = stealth.cdp_ua_override_params(ua, "")["userAgentMetadata"]
+    assert f"Chrome/{stealth.FALLBACK_FULL_VERSION}" in ua
+    assert metadata["fullVersion"] == stealth.FALLBACK_FULL_VERSION
+    assert all(entry["version"] == stealth.FALLBACK_FULL_VERSION
+               for entry in metadata["fullVersionList"] if entry["brand"] != "Not)A;Brand")
 
 
 def test_stealth_version_detection_degrades_without_real_browser():

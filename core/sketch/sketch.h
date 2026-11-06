@@ -43,7 +43,12 @@ struct SketchSolution {
     std::map<std::string, std::string> statuses;  // id -> "under"|"full"|"over"
     int dof = 0;
     std::vector<std::string> redundant;    // constraint ids
+    std::vector<std::pair<std::string, int>> partial_dependencies;  // id, rank lost on removal
     std::vector<std::string> conflicting;  // constraint ids
+    // Exact (non-interactive) solves only: for each redundant/conflicting constraint id, the ids
+    // of the independent constraints it duplicates or contradicts (the minimal dependent set
+    // from the Jacobian row dependency; the constraint itself is excluded).
+    std::vector<std::pair<std::string, std::vector<std::string>>> dependency_partners;
     std::vector<std::pair<std::string, std::string>> skipped;  // constraint id, reason
     bool converged = false;
     Eigen::VectorXd x;  // solved variable vector (warm-start state)
@@ -87,8 +92,10 @@ bool adopt_solved_coordinates(nlohmann::json& sketch, const nlohmann::json& env)
 // Current solved measurement for a DIMENSIONAL constraint, in canonical units —
 // C++ port of sketch_solver.py's measure_constraint. distance -> mm (point-point
 // Euclidean / axis per-coordinate rim / point-line / line-line), angle -> degrees
-// in [0, 180), radius/diameter/arc_length -> mm. Non-dimensional relations and
-// unresolvable refs return nullopt. `entity_coords` is a solved-entity dict.
+// in [0, 180), rotate_point -> signed principal degrees, signed_distance -> signed mm,
+// radius/diameter/arc_length -> mm.
+// Non-dimensional relations, unresolvable refs and a rotate_point with a point at its pivot
+// return nullopt. `entity_coords` is a solved-entity dict.
 std::optional<double> measure_constraint(const nlohmann::json& constraint,
                                          const nlohmann::json& entity_coords);
 

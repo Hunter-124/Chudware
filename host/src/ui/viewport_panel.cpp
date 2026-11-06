@@ -19,11 +19,12 @@
 
 #include "viewport_panel.h"
 
+#include "asm_panels.h"    // exploded view: framing hold + explode lines
 #include "legend.h"
 #include "icons.h"
-#include "mouse_gestures.h"
 #include "shortcut_bar.h"
 #include "camera_anim.h"     // C25 W2-D: eased camera tween (presets / Normal-To / zoom-to-fit)
+#include "anim.h"
 #include "view_selector.h"   // C25 W2-E: SolidWorks-style glass-box view selector (Space)
 #include "section_tool.h"    // C25 W3-J: section-view tool (another agent owns impl)
 #include "cam/cam_panel.h"   // CAM: viewport toolpath backplot overlay
@@ -52,11 +53,11 @@
 #include "file_dialog.h"   // revealInFileManager (assembly component ctx "Open Part Location")
 #include "layout.h"        // ui::overlayColumnEdge — HUD dodges the pinned glass columns
 #include "metrics.h"       // ui::metrics::U — clear-region gutter
+#include "workspace_home.h" // empty-workspace home overlay (scrim + card)
 
 namespace ui {
 
-// C25: file-local gesture/shortcut state — consistent with how SketchMode is held externally.
-static MouseGestures s_gestures;
+// File-local shortcut state.
 static ShortcutBar   s_shortcutBar;
 static ViewSelector  s_viewSelector;   // C25 W2-E: glass-box view selector (Space)
 static SectionTool   s_sectionTool;    // C25 W3-J: section-view (impl owned by section_tool agent)
@@ -68,6 +69,37 @@ static ImVec2        s_clearMin(0.0f, 0.0f), s_clearMax(0.0f, 0.0f);
 // claim was renewed this or the previous frame.
 static render::PickHit s_uiHoverFace;
 static int             s_uiHoverFrame = -10;
+
+struct ViewportHash {
+    uint64_t value = 1469598103934665603ull;
+    template <typename T> void add(const T& v) {
+        const auto* bytes = reinterpret_cast<const unsigned char*>(&v);
+        for (size_t i = 0; i < sizeof(v); ++i) {
+            value ^= bytes[i];
+            value *= 1099511628211ull;
+        }
+    }
+    void text(const std::string& text) {
+        add(text.size());
+        for (unsigned char c : text) add(c);
+    }
+    void hit(const render::PickHit& hit) {
+        add(hit.body_id); add(hit.kind); add(hit.topo_id);
+    }
+};
+
+static uint64_t viewportSetHash(const std::unordered_set<std::string>& values) {
+    uint64_t sum = 0, bits = 0;
+    for (const auto& value : values) {
+        ViewportHash h;
+        h.text(value);
+        sum += h.value;
+        bits ^= h.value * 1099511628211ull;
+    }
+    ViewportHash h;
+    h.add(values.size()); h.add(sum); h.add(bits);
+    return h.value;
+}
 
 void claimViewportHoverFace(uint32_t bodyId, uint32_t faceId) {
     if (bodyId == 0 || faceId == 0) return;
@@ -387,7 +419,7 @@ static bool newDocTile(const char* id, const char* title, const char* desc,
 }
 
 // Task 02: non-intrusive "AI editing" badge painted over the 3D view while the in-app copilot
-// (agent_run_v2) is driving the document, so the user SEES that the AI — not they — is making the
+// (agent_admin_turn) is driving the document, so the user SEES that the AI — not they — is making the
 // edits that land live in the viewport. Driven off the same run lifecycle (agentV2Running /
 // agentV2Status) that feeds the Activity panel, so panel and viewport tell one story. Uses the
 // shared viewport-pill palette so it reads like the other 3D-view overlays. Top-center, gentle
@@ -599,9 +631,9 @@ void drawNewDocChooser(AppState& st) {
             if (newDocTile("##new_sim", "Simulation", "Stress, flow, electrical", 3, ImVec2(tileW, tileH))) {
                 s_newDocStage = NewDocStage::Simulation;
             } next();
-            if (newDocTile("##new_pcb", "PCB", "Board layout workspace", 4, ImVec2(tileW, tileH))) {
+            if (newDocTile("##new_pcb", "KiCad Project", "Schematic and PCB", 4, ImVec2(tileW, tileH))) {
                 st.showPcbTools = true; st.showRibbon = true; st.ribbonTab = AppState::RT_PCB;
-                ui::createNewDoc(st, 4); finish();
+                ui::createNewDoc(st, 3); finish();
             } next();
             // Open an existing document instead of creating one — routes through the normal deferred
             // open pump (native dialog + recent), and the untouched starter part is auto-discarded.
@@ -636,7 +668,6 @@ void drawNewDocChooser(AppState& st) {
                 st.showPcbTools = true; st.showRibbon = true; st.ribbonTab = AppState::RT_PCB;
                 ui::createNewDoc(st, 3);
                 st.ecadSimAnalysis = 0;
-                st.toast(ui::ToastLevel::Info, "Schematic created. Add sources, then run electrical simulation.");
                 finish();
             }
         }
@@ -699,6 +730,8 @@ struct PushPullDrag {
     uint32_t  bodyId     = 0;         // PickHit body (1-based) of the dragged face
     uint32_t  topoId     = 0;         // picked FACE topo_id (1-based)
     std::string checkpoint;           // doc_checkpoint id taken on press (for revert/cancel)
+    long revision = -1;               // last revision authored by this drag
+    bool cancelPending = false;
     ImVec2    pressPos    = {0, 0};    // screen pos at press (drag origin)
     float     nsx = 0, nsy = 0;       // unit screen-space direction of the face OUTWARD normal
     float     worldPerPx  = 1.0f;     // world(mm) per screen pixel at the face depth (this frame)
@@ -709,7 +742,7 @@ struct PushPullDrag {
     std::string param;                // e.g. "depth"
     double      newValue  = 0.0;
     bool        clamped   = false;
-    // Single-in-flight latest-wins (revert+push_pull pair on AsyncRpc FIFO).
+    // Single-in-flight latest-wins: guarded revert, checkpoint, then sample.
     uint64_t  gen         = 0;
     bool      inFlight    = false;
     bool      pending     = false;    // curDist changed while a sample was open
@@ -790,13 +823,15 @@ struct AsmDrag {
     std::string docId;                // assembly owning this drag's checkpoint
     std::string component;            // the component k-id being dragged
     std::string checkpoint;           // doc_checkpoint id taken on press (for the single-undo commit)
+    long revision = -1;               // last revision authored by this drag
+    bool cancelPending = false;
     ImVec2      pressPos = {0, 0};    // screen pos at press (drag origin)
     Vec3        startPos;             // component world origin at press (transform translation)
     Vec3        camR, camU;           // camera screen-right / screen-up (world) captured at press
     float       worldPerPx = 1.0f;    // world(mm) per screen pixel at the component depth (at press)
     ImVec2      lastSent = {1e30f, 1e30f};  // last cursor sample actually kicked (throttle)
     ImVec2      curPos   = {0, 0};    // latest mouse (for pending)
-    // Single-in-flight latest-wins (revert + doc_solve_mates pair).
+    // Single-in-flight latest-wins: guarded revert, checkpoint, then solve.
     uint64_t    gen      = 0;
     bool        inFlight = false;
     bool        pending  = false;
@@ -993,9 +1028,9 @@ static bool extrudeAxisHandle(AppState& st, const std::string& fid, bool flip, d
 }
 
 // Build the draggable-dimension list for the selected feature, reusing the PM-form field table to
-// learn which params are dims and their labels/units. Skips greyed/conditional-off and expr-bound
-// dims, and any dim whose value the engine table drives (omitWhenDisabled while disabled). Returns
-// at most ~4 candidates (the dims a user actually drives) so the overlay stays readable.
+// learn which params are dims and their labels/units. Skips hidden, conditional-off and expr-bound
+// dims, returning at most ~4 candidates (the dims a user actually drives) so the overlay stays
+// readable.
 static std::vector<DimCandidate> dimCandidates(AppState& st, const std::string& fid) {
     std::vector<DimCandidate> out;
     if (fid.empty() || !st.docMirror.hasDoc()) return out;
@@ -1495,32 +1530,11 @@ static void normalToSelectionOrNearestAxis(AppState& st, bool inSketch) {
 // runs inside the Viewport window after rendering, touching no tree-iteration state. This mirrors
 // feature_tree's applyTreeOpsNow: apply -> loadDocMesh(resp.aicm_path) repaints the body with its
 // new color on the next frame.
-static bool refuseViewportEdit(AppState& st, const std::string& docId) {
-    if (!st.docLockedByAgent(docId)) return false;
-    st.toast(ui::ToastLevel::Warn, st.agentLockReason(docId));
-    return true;
-}
-
-static void toastViewportEditKept(AppState& st, const std::string& docId) {
-    std::string part = docId;
-    for (const auto& tab : st.docTabs)
-        if (tab.docId == docId && !tab.title.empty()) { part = tab.title; break; }
-    st.toast(ui::ToastLevel::Warn,
-             "Agent started editing " + part + " — your edit was kept and closed.");
-}
-
-static bool viewportEditMenuItem(const char* label, const std::string& disabledReason) {
-    const bool clicked = ImGui::MenuItem(label, nullptr, false, disabledReason.empty());
-    if (!disabledReason.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-        ImGui::SetTooltip("%s", disabledReason.c_str());
-    return clicked;
-}
 
 static void applyAppearanceFromViewport(AppState& st, const std::string& docId,
                                         const std::string& bodyKey,
                                         const float* color /* nullptr = clear */,
                                         float metallic = 0.0f, float roughness = 0.5f) {
-    if (refuseViewportEdit(st, docId)) return;
     if (!st.docMirror.hasDoc() || !st.workerStarted || st.docMirror.docId() != docId) return;
     nlohmann::json op = {{"op", "set_appearance"}, {"id", bodyKey}};
     if (color) {
@@ -1846,19 +1860,34 @@ static bool ppHandleGeometry(AppState& st, const Renderer& renderer, const ImVec
     return true;
 }
 
-// Queue a latest-wins push-pull sample. The kick issues doc_revert then doc_push_pull
-// back-to-back on AsyncRpc FIFO so the checkpoint envelope stays paired without blocking GL.
+// Every preview restores the baseline with a revision CAS, then takes a fresh
+// checkpoint before applying the next sample.
 static void ppKickAsync(AppState& st);
+static void ppCancel(AppState& st);
 
-// Keep the last applied geometry when an agent takes over; never consume the checkpoint.
-static void ppAbandon(AppState& st) {
-    if (st.docLockedByAgent(s_pp.docId)) toastViewportEditKept(st, s_pp.docId);
-    s_pp.reset();  // invalidates queued completions as well as pending samples
+static bool viewportCheckpoint(AppState& st, std::string& checkpoint, long& revision) {
+    nlohmann::json result;
+    std::string err;
+    if (!st.docMirror.hasDoc() ||
+        !st.worker.call("doc_checkpoint", {{"doc_id", st.docMirror.docId()}}, result, err) ||
+        !result.is_object() || result.contains("code")) return false;
+    checkpoint = result.value("checkpoint", std::string());
+    revision = result.value("revision", -1L);
+    if (checkpoint.empty() || revision < 0) {
+        checkpoint.clear();
+        revision = -1;
+        return false;
+    }
+    return true;
+}
+
+static void ppAbandon(AppState&) {
+    s_pp.reset();
 }
 
 static void ppQueueSample(AppState& st, double cumulative, bool commit) {
     if (!st.docMirror.hasDoc()) return;
-    if (st.docLockedByAgent(s_pp.docId) || st.docMirror.docId() != s_pp.docId) {
+    if (st.docMirror.docId() != s_pp.docId) {
         ppAbandon(st);
         return;
     }
@@ -1874,100 +1903,133 @@ static void ppQueueSample(AppState& st, double cumulative, bool commit) {
 }
 
 static void ppKickAsync(AppState& st) {
-    if (st.docLockedByAgent(s_pp.docId) || st.docMirror.docId() != s_pp.docId) {
-        ppAbandon(st);
-        return;
-    }
-    if (s_pp.inFlight || !s_pp.pending) return;
-    if (!st.docMirror.hasDoc() || s_pp.checkpoint.empty()) return;
+    if (st.docMirror.docId() != s_pp.docId || !st.isActiveMirrorDoc()) { ppAbandon(st); return; }
+    if (s_pp.inFlight || !s_pp.pending || s_pp.checkpoint.empty() || s_pp.revision < 0) return;
     s_pp.pending = false;
     s_pp.inFlight = true;
     const uint64_t gen = ++s_pp.gen;
     const double dist = s_pp.curDist;
     const bool commit = s_pp.wantCommit;
-    if (commit) s_pp.wantCommit = false;
+    s_pp.wantCommit = false;
     const std::string docId = s_pp.docId;
-    const std::string cp = s_pp.checkpoint;
-    const int bodyId = (int)s_pp.bodyId;
-    const int topoId = (int)s_pp.topoId;
-
-    // Pair: revert then push_pull. Only the push_pull drain callback clears inFlight / re-kicks.
-    st.rpc.call("doc_revert",
-                nlohmann::json{{"doc_id", docId}, {"checkpoint", cp}},
-                [gen, docId, &st](const core::RpcResult& r) {
-                    if (gen != s_pp.gen) return;  // cancelled
-                    if (st.docLockedByAgent(docId) || st.docMirror.docId() != docId) {
-                        ppAbandon(st);
-                        return;
-                    }
-                    if (r.ok && r.result.is_object() && !r.result.contains("code"))
-                        st.docMirror.ingestOpsResponse(r.result);
-                    // Mesh refresh deferred to the push_pull result (same sample).
-                }, /*timeoutMs=*/60000);
-
-    nlohmann::json ppParams = {
-        {"doc_id", docId},
-        {"body_id", bodyId},
-        {"topo_id", topoId},
-        {"distance", dist},
-        {"commit", commit}
-    };
-    st.rpc.call("doc_push_pull", std::move(ppParams),
-                [gen, docId, dist, commit, &st](const core::RpcResult& r) {
+    const long baseRevision = s_pp.revision;
+    st.beginHumanMutation(docId);
+    st.rpc.call("doc_revert", {{"doc_id", docId}, {"checkpoint", s_pp.checkpoint},
+                               {"expect_revision", s_pp.revision}},
+        [gen, docId, dist, commit, baseRevision, &st](const core::RpcResult& rv) {
+            st.endHumanMutation(docId);
+            if (rv.ok && rv.result.is_object() && !rv.result.contains("code") &&
+                rv.result.value("revision", -1L) > baseRevision)
+                st.markHumanEdit(docId, rv.result.value("revision", -1));
+            if (gen != s_pp.gen || st.docMirror.docId() != docId) {
+                st.catchUpSupersededOps(docId, int(baseRevision));
+                if (gen == s_pp.gen) ppAbandon(st);
+                return;
+            }
+            if (!rv.ok || !rv.result.is_object() || rv.result.contains("code") ||
+                !rv.result.contains("revision")) {
+                if (st.isActiveMirrorDoc())
+                    st.toast(ui::ToastLevel::Warn, "Push-pull stopped because the part changed.");
+                ppAbandon(st);
+                return;
+            }
+            const long revision = rv.result.value("revision", -1L);
+            if (st.docMirror.revision() > revision) { ppAbandon(st); return; }
+            auto restored = st.docMirror.ingestOpsResponse(rv.result);
+            if (!st.isActiveMirrorDoc()) { ppAbandon(st); return; }
+            if (restored.ok && !restored.aicm_path.empty()) st.loadDocMeshAsync(restored.aicm_path);
+            if (s_pp.cancelPending) { ppAbandon(st); return; }
+            st.beginHumanMutation(docId);
+            st.rpc.call("doc_checkpoint", {{"doc_id", docId}},
+                [gen, docId, dist, commit, revision, &st](const core::RpcResult& cp) {
+                    st.endHumanMutation(docId);
                     if (gen != s_pp.gen) return;
-                    if (st.docLockedByAgent(docId) || st.docMirror.docId() != docId) {
+                    if (st.docMirror.docId() != docId || !st.isActiveMirrorDoc()) { ppAbandon(st); return; }
+                    if (!cp.ok || !cp.result.is_object() || cp.result.contains("code") ||
+                        cp.result.value("revision", -1L) != revision ||
+                        cp.result.value("checkpoint", std::string()).empty()) {
+                        st.toast(ui::ToastLevel::Warn, "Push-pull stopped because the part changed.");
                         ppAbandon(st);
                         return;
                     }
-                    s_pp.inFlight = false;
-                    if (!r.ok) {
-                        st.toast(ui::ToastLevel::Error, "Push-pull failed: " + r.err);
-                    } else {
-                        auto pr = st.docMirror.ingestPushPullResponse(r.result);
-                        if (!pr.ok) {
-                            st.toast(ui::ToastLevel::Error, "Push-pull failed: " + pr.error_message);
-                        } else if (!pr.draggable) {
-                            st.toast(ui::ToastLevel::Warn,
-                                     "This face can't be dragged — " + pr.reason);
-                        } else {
-                            if (!pr.ops.aicm_path.empty()) {
-                                std::string le; st.loadDocMesh(pr.ops.aicm_path, le);
+                    s_pp.checkpoint = cp.result.value("checkpoint", std::string());
+                    s_pp.revision = revision;
+                    if (s_pp.cancelPending) { ppAbandon(st); return; }
+                    st.beginHumanMutation(docId);
+                    st.rpc.call("doc_push_pull",
+                        {{"doc_id", docId}, {"body_id", s_pp.bodyId}, {"topo_id", s_pp.topoId},
+                         {"distance", dist}, {"commit", commit}, {"expect_revision", revision}},
+                        [gen, docId, dist, commit, revision, &st](const core::RpcResult& r) {
+                            st.endHumanMutation(docId);
+                            if (r.ok && r.result.is_object() && !r.result.contains("code") &&
+                                r.result.value("draggable", false) &&
+                                r.result.value("revision", -1L) > revision)
+                                st.markHumanEdit(docId, r.result.value("revision", -1));
+                            if (gen != s_pp.gen || st.docMirror.docId() != docId) {
+                                st.catchUpSupersededOps(docId, int(revision));
+                                if (gen == s_pp.gen) ppAbandon(st);
+                                return;
                             }
+                            s_pp.inFlight = false;
+                            if (!r.ok || !r.result.is_object() || r.result.contains("code")) {
+                                if (st.isActiveMirrorDoc())
+                                    st.toast(ui::ToastLevel::Warn, "Push-pull failed or the part changed.");
+                                ppAbandon(st);
+                                return;
+                            }
+                            const long appliedRevision = r.result.value("revision", -1L);
+                            if (appliedRevision < s_pp.revision ||
+                                appliedRevision > s_pp.revision + 1 ||
+                                st.docMirror.revision() > appliedRevision) {
+                                st.catchUpSupersededOps(docId, int(revision));
+                                ppAbandon(st);
+                                return;
+                            }
+                            auto pr = st.docMirror.ingestPushPullResponse(r.result);
+                            if (!st.isActiveMirrorDoc()) { ppAbandon(st); return; }
+                            if (!pr.ok || !pr.draggable) {
+                                st.toast(ui::ToastLevel::Warn, "This face can't be dragged — " + pr.reason);
+                                ppAbandon(st);
+                                return;
+                            }
+                            s_pp.revision = appliedRevision;
+                            if (pr.ops.ok && !pr.ops.aicm_path.empty()) st.loadDocMeshAsync(pr.ops.aicm_path);
                             s_pp.haveReadout = true;
                             s_pp.param = pr.param;
                             s_pp.newValue = pr.new_value;
                             s_pp.clamped = pr.clamped;
                             s_pp.lastApplied = dist;
-                        }
-                    }
-                    if (commit) {
-                        // Final sample of this drag — clear envelope (checkpoint already consumed).
-                        s_pp.active = false;
-                        s_pp.checkpoint.clear();
-                        s_pp.haveReadout = false;
-                        s_pp.pending = false;
-                        s_pp.wantCommit = false;
-                        return;
-                    }
-                    if (s_pp.pending || s_pp.wantCommit) ppKickAsync(st);
-                }, /*timeoutMs=*/60000);
+                            if (s_pp.cancelPending) { ppCancel(st); return; }
+                            if (commit) { ppAbandon(st); return; }
+                            if (s_pp.pending || s_pp.wantCommit) ppKickAsync(st);
+                        }, 60000);
+                }, 60000);
+        }, 60000);
 }
 
 // Cancel an in-flight push-pull drag: revert to the checkpoint and clear all drag state. Safe to
 // call when no drag is active (no-op). Leaves NO zombie checkpoint/flag behind.
 static void ppCancel(AppState& st) {
     if (!s_pp.active && s_pp.checkpoint.empty()) { s_pp.reset(); return; }
-    if (st.docLockedByAgent(s_pp.docId) || st.docMirror.docId() != s_pp.docId) {
+    if (st.docMirror.docId() != s_pp.docId) {
         ppAbandon(st);
         return;
     }
-    ++s_pp.gen;  // drop in-flight async completions
-    s_pp.inFlight = false;
-    s_pp.pending = false;
-    s_pp.wantCommit = false;
-    if (!s_pp.checkpoint.empty() && st.docMirror.hasDoc()) {
-        auto rv = st.docMirror.revert(st.worker, s_pp.checkpoint);
-        if (rv.ok && !rv.aicm_path.empty()) { std::string le; st.loadDocMesh(rv.aicm_path, le); }
+    if (s_pp.inFlight) {
+        s_pp.cancelPending = true;
+        s_pp.pending = s_pp.wantCommit = false;
+        return;
+    }
+    nlohmann::json res;
+    std::string err;
+    if (!s_pp.checkpoint.empty() && s_pp.revision >= 0 &&
+        st.worker.call("doc_revert", {{"doc_id", s_pp.docId}, {"checkpoint", s_pp.checkpoint},
+                                      {"expect_revision", s_pp.revision}}, res, err) &&
+        !res.contains("code")) {
+        auto rv = st.docMirror.ingestOpsResponse(res);
+        if (rv.ok && st.isActiveMirrorDoc() && !rv.aicm_path.empty()) st.loadDocMeshAsync(rv.aicm_path);
+    } else {
+        st.toast(ui::ToastLevel::Warn, "Push-pull cancel kept the current part.");
     }
     s_pp.reset();
 }
@@ -2074,17 +2136,17 @@ static void addComponentContextRef(AppState& st, const std::string& cid,
 }
 
 
-// Latest-wins async move-component (revert + doc_solve_mates pair on AsyncRpc FIFO).
+// Latest-wins async move-component with guarded checkpoint rebasing.
 static void asmDragKickAsync(AppState& st);
+static void asmDragCancel(AppState& st);
 
-static void asmDragAbandon(AppState& st) {
-    if (st.docLockedByAgent(s_asmDrag.docId)) toastViewportEditKept(st, s_asmDrag.docId);
+static void asmDragAbandon(AppState&) {
     s_asmDrag.reset();
 }
 
 static void asmDragQueue(AppState& st, const ImVec2& cur, bool commit) {
     if (!st.docMirror.hasDoc() || s_asmDrag.component.empty()) return;
-    if (st.docLockedByAgent(s_asmDrag.docId) || st.docMirror.docId() != s_asmDrag.docId) {
+    if (st.docMirror.docId() != s_asmDrag.docId) {
         asmDragAbandon(st);
         return;
     }
@@ -2100,99 +2162,133 @@ static void asmDragQueue(AppState& st, const ImVec2& cur, bool commit) {
 }
 
 static void asmDragKickAsync(AppState& st) {
-    if (st.docLockedByAgent(s_asmDrag.docId) || st.docMirror.docId() != s_asmDrag.docId) {
-        asmDragAbandon(st);
-        return;
-    }
-    if (s_asmDrag.inFlight || !s_asmDrag.pending) return;
-    if (!st.docMirror.hasDoc() || s_asmDrag.checkpoint.empty()) return;
+    if (st.docMirror.docId() != s_asmDrag.docId || !st.isActiveMirrorDoc()) { asmDragAbandon(st); return; }
+    if (s_asmDrag.inFlight || !s_asmDrag.pending || s_asmDrag.checkpoint.empty() ||
+        s_asmDrag.revision < 0) return;
     s_asmDrag.pending = false;
     s_asmDrag.inFlight = true;
     const uint64_t gen = ++s_asmDrag.gen;
     const ImVec2 cur = s_asmDrag.curPos;
     const bool commit = s_asmDrag.wantCommit;
-    if (commit) s_asmDrag.wantCommit = false;
+    s_asmDrag.wantCommit = false;
     const std::string docId = s_asmDrag.docId;
-    const std::string cp = s_asmDrag.checkpoint;
-    const std::string component = s_asmDrag.component;
-
-    float dx = cur.x - s_asmDrag.pressPos.x;
-    float dy = cur.y - s_asmDrag.pressPos.y;
-    float k = s_asmDrag.worldPerPx;
-    Vec3 target(
+    const long baseRevision = s_asmDrag.revision;
+    const float dx = cur.x - s_asmDrag.pressPos.x, dy = cur.y - s_asmDrag.pressPos.y;
+    const float k = s_asmDrag.worldPerPx;
+    const Vec3 target(
         s_asmDrag.startPos.x + (s_asmDrag.camR.x * dx - s_asmDrag.camU.x * dy) * k,
         s_asmDrag.startPos.y + (s_asmDrag.camR.y * dx - s_asmDrag.camU.y * dy) * k,
         s_asmDrag.startPos.z + (s_asmDrag.camR.z * dx - s_asmDrag.camU.z * dy) * k);
-
-    st.rpc.call("doc_revert",
-                nlohmann::json{{"doc_id", docId}, {"checkpoint", cp}},
-                [gen, docId, &st](const core::RpcResult& r) {
+    st.beginHumanMutation(docId);
+    st.rpc.call("doc_revert", {{"doc_id", docId}, {"checkpoint", s_asmDrag.checkpoint},
+                               {"expect_revision", s_asmDrag.revision}},
+        [gen, docId, cur, commit, target, baseRevision, &st](const core::RpcResult& rv) {
+            st.endHumanMutation(docId);
+            if (rv.ok && rv.result.is_object() && !rv.result.contains("code") &&
+                rv.result.value("revision", -1L) > baseRevision)
+                st.markHumanEdit(docId, rv.result.value("revision", -1));
+            if (gen != s_asmDrag.gen || st.docMirror.docId() != docId) {
+                st.catchUpSupersededOps(docId, int(baseRevision));
+                if (gen == s_asmDrag.gen) asmDragAbandon(st);
+                return;
+            }
+            if (!rv.ok || !rv.result.is_object() || rv.result.contains("code") ||
+                !rv.result.contains("revision")) {
+                if (st.isActiveMirrorDoc())
+                    st.toast(ui::ToastLevel::Warn, "Move component stopped because the assembly changed.");
+                asmDragAbandon(st);
+                return;
+            }
+            const long revision = rv.result.value("revision", -1L);
+            if (st.docMirror.revision() > revision) { asmDragAbandon(st); return; }
+            auto restored = st.docMirror.ingestOpsResponse(rv.result);
+            if (!st.isActiveMirrorDoc()) { asmDragAbandon(st); return; }
+            if (restored.ok && !restored.aicm_path.empty()) st.loadDocMeshAsync(restored.aicm_path);
+            if (s_asmDrag.cancelPending) { asmDragAbandon(st); return; }
+            st.beginHumanMutation(docId);
+            st.rpc.call("doc_checkpoint", {{"doc_id", docId}},
+                [gen, docId, cur, commit, target, revision, &st](const core::RpcResult& cp) {
+                    st.endHumanMutation(docId);
                     if (gen != s_asmDrag.gen) return;
-                    if (st.docLockedByAgent(docId) || st.docMirror.docId() != docId) {
+                    if (st.docMirror.docId() != docId || !st.isActiveMirrorDoc()) { asmDragAbandon(st); return; }
+                    if (!cp.ok || !cp.result.is_object() || cp.result.contains("code") ||
+                        cp.result.value("revision", -1L) != revision ||
+                        cp.result.value("checkpoint", std::string()).empty()) {
+                        st.toast(ui::ToastLevel::Warn, "Move component stopped because the assembly changed.");
                         asmDragAbandon(st);
                         return;
                     }
-                    if (r.ok && r.result.is_object() && !r.result.contains("code"))
-                        st.docMirror.ingestOpsResponse(r.result);
-                }, /*timeoutMs=*/60000);
-
-    nlohmann::json params = {
-        {"doc_id", docId},
-        {"drag", {{"component", component},
-                  {"target", {target.x, target.y, target.z}}}}};
-    st.rpc.call("doc_solve_mates", std::move(params),
-                [gen, docId, cur, commit, &st](const core::RpcResult& r) {
-                    if (gen != s_asmDrag.gen) return;
-                    if (st.docLockedByAgent(docId) || st.docMirror.docId() != docId) {
-                        asmDragAbandon(st);
-                        return;
-                    }
-                    s_asmDrag.inFlight = false;
-                    if (!r.ok) {
-                        st.toast(ui::ToastLevel::Error, "Move component failed: " + r.err);
-                    } else if (r.result.is_object() && r.result.contains("code")) {
-                        st.toast(ui::ToastLevel::Error,
-                                 "Move component: " + r.result.value("message", std::string()));
-                    } else {
-                        // Prefer ops-shaped ingest; fall back to resync for older envelopes.
-                        if (r.result.is_object() &&
-                            (r.result.contains("revision") || r.result.contains("tree"))) {
-                            st.docMirror.ingestOpsResponse(r.result);
-                        } else {
-                            st.docMirror.resync(st.worker);
-                        }
-                        std::string aicm;
-                        if (r.result.contains("tess") && r.result["tess"].is_object())
-                            aicm = r.result["tess"].value("aicm_path", std::string());
-                        if (!aicm.empty()) { std::string le; st.loadDocMesh(aicm, le); }
-                        s_asmDrag.lastSent = cur;
-                    }
-                    if (commit) {
-                        s_asmDrag.active = false;
-                        s_asmDrag.checkpoint.clear();
-                        s_asmDrag.pending = false;
-                        s_asmDrag.wantCommit = false;
-                        return;
-                    }
-                    if (s_asmDrag.pending || s_asmDrag.wantCommit) asmDragKickAsync(st);
-                }, /*timeoutMs=*/60000);
+                    s_asmDrag.checkpoint = cp.result.value("checkpoint", std::string());
+                    s_asmDrag.revision = revision;
+                    if (s_asmDrag.cancelPending) { asmDragAbandon(st); return; }
+                    st.beginHumanMutation(docId);
+                    st.rpc.call("doc_solve_mates",
+                        {{"doc_id", docId}, {"expect_revision", revision},
+                         {"drag", {{"component", s_asmDrag.component},
+                                   {"target", {target.x, target.y, target.z}}}}},
+                        [gen, docId, cur, commit, revision, &st](const core::RpcResult& r) {
+                            st.endHumanMutation(docId);
+                            if (r.ok && r.result.is_object() && !r.result.contains("code") &&
+                                r.result.value("revision", -1L) > revision &&
+                                (!r.result.contains("rejected_tree") || r.result["rejected_tree"].is_null()))
+                                st.markHumanEdit(docId, r.result.value("revision", -1));
+                            if (gen != s_asmDrag.gen || st.docMirror.docId() != docId) {
+                                st.catchUpSupersededOps(docId, int(revision));
+                                if (gen == s_asmDrag.gen) asmDragAbandon(st);
+                                return;
+                            }
+                            s_asmDrag.inFlight = false;
+                            if (!r.ok || !r.result.is_object() || r.result.contains("code")) {
+                                if (st.isActiveMirrorDoc())
+                                    st.toast(ui::ToastLevel::Warn, "Move component failed or the assembly changed.");
+                                asmDragAbandon(st);
+                                return;
+                            }
+                            const long appliedRevision = r.result.value("revision", -1L);
+                            if (appliedRevision < s_asmDrag.revision ||
+                                appliedRevision > s_asmDrag.revision + 1 ||
+                                st.docMirror.revision() > appliedRevision) {
+                                st.catchUpSupersededOps(docId, int(revision));
+                                asmDragAbandon(st);
+                                return;
+                            }
+                            s_asmDrag.revision = appliedRevision;
+                            auto result = st.docMirror.ingestOpsResponse(r.result);
+                            if (!st.isActiveMirrorDoc()) { asmDragAbandon(st); return; }
+                            if (result.ok && !result.aicm_path.empty()) st.loadDocMeshAsync(result.aicm_path);
+                            s_asmDrag.lastSent = cur;
+                            if (s_asmDrag.cancelPending) { asmDragCancel(st); return; }
+                            if (commit) { asmDragAbandon(st); return; }
+                            if (s_asmDrag.pending || s_asmDrag.wantCommit) asmDragKickAsync(st);
+                        }, 60000);
+                }, 60000);
+        }, 60000);
 }
 
 // Cancel an in-flight move-component drag: revert to the checkpoint and clear state. No-op when no
 // drag is active.
 static void asmDragCancel(AppState& st) {
     if (!s_asmDrag.active && s_asmDrag.checkpoint.empty()) { s_asmDrag.reset(); return; }
-    if (st.docLockedByAgent(s_asmDrag.docId) || st.docMirror.docId() != s_asmDrag.docId) {
+    if (st.docMirror.docId() != s_asmDrag.docId) {
         asmDragAbandon(st);
         return;
     }
-    ++s_asmDrag.gen;
-    s_asmDrag.inFlight = false;
-    s_asmDrag.pending = false;
-    s_asmDrag.wantCommit = false;
-    if (!s_asmDrag.checkpoint.empty() && st.docMirror.hasDoc()) {
-        auto rv = st.docMirror.revert(st.worker, s_asmDrag.checkpoint);
-        if (rv.ok && !rv.aicm_path.empty()) { std::string le; st.loadDocMesh(rv.aicm_path, le); }
+    if (s_asmDrag.inFlight) {
+        s_asmDrag.cancelPending = true;
+        s_asmDrag.pending = s_asmDrag.wantCommit = false;
+        return;
+    }
+    nlohmann::json res;
+    std::string err;
+    if (!s_asmDrag.checkpoint.empty() && s_asmDrag.revision >= 0 &&
+        st.worker.call("doc_revert", {{"doc_id", s_asmDrag.docId},
+                                      {"checkpoint", s_asmDrag.checkpoint},
+                                      {"expect_revision", s_asmDrag.revision}}, res, err) &&
+        !res.contains("code")) {
+        auto rv = st.docMirror.ingestOpsResponse(res);
+        if (rv.ok && st.isActiveMirrorDoc() && !rv.aicm_path.empty()) st.loadDocMeshAsync(rv.aicm_path);
+    } else {
+        st.toast(ui::ToastLevel::Warn, "Move cancel kept the current assembly.");
     }
     s_asmDrag.reset();
 }
@@ -2255,18 +2351,19 @@ static bool dimHandleGeometry(AppState& st, const Renderer& renderer, const ImVe
 void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
     // Check the session's document before any input, cancel, or outside-viewport commit path.
     if ((s_pp.active || !s_pp.checkpoint.empty()) &&
-        (st.docLockedByAgent(s_pp.docId) || st.docMirror.docId() != s_pp.docId))
+        st.docMirror.docId() != s_pp.docId)
         ppAbandon(st);
     if ((s_asmDrag.active || !s_asmDrag.checkpoint.empty()) &&
-        (st.docLockedByAgent(s_asmDrag.docId) || st.docMirror.docId() != s_asmDrag.docId))
+        st.docMirror.docId() != s_asmDrag.docId)
         asmDragAbandon(st);
     if (s_dim.active &&
-        (st.docLockedByAgent(s_dim.docId) || st.docMirror.docId() != s_dim.docId))
+        st.docMirror.docId() != s_dim.docId)
         s_dim.reset();  // PM owns keep-close; do not restore the old value or re-preview.
     // Valid only for an explicit pick demand serviced by this invocation.
     st.pickReady = false;
     if (!st.renderer) return;
     Renderer& renderer = *st.renderer;
+    renderer.setGpuTimersEnabled(st.showProfilerWindow);
     const bool sceneActive = st.activeWorkspace == AppState::Workspace::Simulate &&
                              ui::simscene::active(st);
     const bool sceneToolArmed = sceneActive && ui::simscene::toolArmed(st);
@@ -2522,7 +2619,10 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // view on every added entity. Geometry still updates live; the view stays normal-to-plane
         // at a stable zoom (no fit-to-view "bouncing"). Unfreezes on exit so the model reframes
         // normally again. Manual zoom/pan (st.zoom/st.pan) still work — only auto-framing is held.
-        renderer.setFramingFrozen(inSketch);
+        // The exploded view holds framing too: its baked mesh replaces the GPU-offset frame,
+        // and a re-fit to the exploded bounds would jump the camera mid-animation.
+        renderer.setFramingFrozen(inSketch ||
+                                  (st.asmPanels && st.asmPanels->explodeHoldsFraming(st)));
         // C37-C: reset zoom-area state on mode transitions (avoids cross-mode state leak).
         // Check at frame start: if sketch mode OR plane-pick activated, disarm zoom-area.
         if (inSketch || st.sketchPlanePickActive) {
@@ -2618,35 +2718,46 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // Shared hasSolidContent signal (same definition as AppState::applyDocDrivenVisibility):
         // a solid/3D-producing feature OR any assembly component => references auto-hide.
         // Sketches and pure reference datums alone do NOT hide planes/origin/axes.
-        bool hasSolidContent = false;
-        if (st.docMirror.hasDoc()) {
-            const auto& tree = st.docMirror.tree();
-            if (tree.is_object()) {
-                auto tci = tree.find("components");
-                if (tci != tree.end() && tci->is_array() && !tci->empty()) {
-                    hasSolidContent = true;
-                } else {
-                    auto tfi = tree.find("features");
-                    if (tfi != tree.end() && tfi->is_array()) {
-                        auto isRefOnly = [](const std::string& type) {
-                            return type == "sketch" || type == "sketch3d" ||
-                                   type == "plane" || type == "datum_plane" || type == "ref_plane" ||
-                                   type == "axis" || type == "datum_axis" || type == "ref_axis" ||
-                                   type == "point" || type == "datum_point" || type == "ref_point" ||
-                                   type == "csys" || type == "coordinate_system" || type == "ref_csys";
-                        };
-                        for (const auto& f : *tfi) {
-                            if (!f.is_object() || f.value("suppressed", false)) continue;
-                            const std::string type = f.value("type", std::string());
-                            if (!type.empty() && !isRefOnly(type)) {
-                                hasSolidContent = true;
-                                break;
+        static std::string s_solidDoc;
+        static int s_solidRevision = -2;
+        static bool s_hasSolidContent = false;
+        const auto& viewportDocId = st.docMirror.docId();
+        const int viewportRevision = st.docMirror.revision();
+        if (s_solidDoc != viewportDocId || s_solidRevision != viewportRevision) {
+            s_solidDoc = viewportDocId;
+            s_solidRevision = viewportRevision;
+            bool hasSolidContent = false;
+            if (st.docMirror.hasDoc()) {
+                const auto& tree = st.docMirror.tree();
+                if (tree.is_object()) {
+                    auto tci = tree.find("components");
+                    if (tci != tree.end() && tci->is_array() && !tci->empty()) {
+                        hasSolidContent = true;
+                    } else {
+                        auto tfi = tree.find("features");
+                        if (tfi != tree.end() && tfi->is_array()) {
+                            auto isRefOnly = [](const std::string& type) {
+                                return type == "sketch" || type == "sketch3d" ||
+                                       type == "plane" || type == "datum_plane" || type == "ref_plane" ||
+                                       type == "axis" || type == "datum_axis" || type == "ref_axis" ||
+                                       type == "point" || type == "datum_point" || type == "ref_point" ||
+                                       type == "csys" || type == "coordinate_system" || type == "ref_csys";
+                            };
+                            for (const auto& f : *tfi) {
+                                if (!f.is_object() || f.value("suppressed", false)) continue;
+                                const std::string type = f.value("type", std::string());
+                                if (!type.empty() && !isRefOnly(type)) {
+                                    hasSolidContent = true;
+                                    break;
+                                }
                             }
                         }
                     }
                 }
             }
+            s_hasSolidContent = hasSolidContent;
         }
+        const bool hasSolidContent = s_hasSolidContent;
 
         // Reference planes: hidden while sketching (the sketch grid owns the view), else user state.
         // Until the user takes control, each default plane stays visible until a downstream 3D
@@ -2681,6 +2792,10 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // Publish the effective visibility so plane hit-tests (drawPlanePicker / new-sketch pick /
         // hitTestOriginPlane) gate on what is actually DRAWN, not the raw showPlane toggle. Without
         // this, a force-shown plane renders but stays unclickable (issues #20/#21).
+        // Workspace home (workspace_home.h): the untouched starter's datums are not content —
+        // the viewport stays an empty studio behind the home card.
+        const bool homeScene = ui::workspaceHomeActive(st);
+        if (homeScene) effPlane[0] = effPlane[1] = effPlane[2] = false;
         for (int pv = 0; pv < 3; ++pv) st.planeVisEff[pv] = effPlane[pv];
 
         // Origin gizmo + axis auto-hide/force-show: one effective hidden-datums set per frame.
@@ -2700,7 +2815,25 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         const bool needEffDatums =
             !st.originUserToggled || !st.axesUserToggled || pmWantsAxis || sketchHideAxes ||
             !st.axisDatumIds.empty();
-        if (needEffDatums) {
+        auto datumPolicyKey = [&]() {
+            ViewportHash key;
+            key.text(viewportDocId); key.add(viewportRevision);
+            key.add(viewportSetHash(st.hiddenFeatures));
+            key.add(viewportSetHash(st.axesUserToggledIds));
+            key.add(st.originUserToggled); key.add(st.axesUserToggled);
+            key.add(pmWantsAxis); key.add(sketchHideAxes); key.add(hasSolidContent);
+            key.add(viewportSetHash(st.axisDatumIds));
+            for (const auto& datum : renderer.refDatums()) {
+                if (datum.kind == Renderer::RefDatum::Kind::Axis) key.text(datum.id);
+            }
+            return key.value;
+        };
+        static uint64_t s_datumPolicyKey = 0;
+        static bool s_haveDatumPolicy = false;
+        static std::unordered_set<std::string> s_effectiveDatums;
+        const uint64_t nextDatumPolicyKey = datumPolicyKey();
+        const bool rebuildDatumPolicy = !s_haveDatumPolicy || s_datumPolicyKey != nextDatumPolicyKey;
+        if (rebuildDatumPolicy && needEffDatums) {
             // Persist auto axis visibility into hiddenFeatures so FM eyes match the draw path.
             // Per-id sticky skips; defaults skip only when aggregate axesUserToggled.
             auto syncAxisHid = [&](const std::string& id) {
@@ -2756,12 +2889,34 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 for (const auto& rd : renderer.refDatums())
                     if (rd.kind == Renderer::RefDatum::Kind::Axis) effAxis(rd.id);
             }
-            renderer.setHiddenDatums(std::move(effDatums));
-        } else {
+            s_effectiveDatums = std::move(effDatums);
+        } else if (rebuildDatumPolicy) {
             // User took control of origin AND axes, no axis well, no datums: resync to
             // hiddenFeatures so a just-closed axis well doesn't leave force-shown axes drawn.
-            renderer.setHiddenDatums(st.hiddenFeatures);
+            s_effectiveDatums = st.hiddenFeatures;
             st.originVisEff = !st.hiddenFeatures.count("point.origin");
+        }
+        if (rebuildDatumPolicy) {
+            // Auto-hide may have updated hiddenFeatures; remember the post-sync key.
+            s_datumPolicyKey = datumPolicyKey();
+            s_haveDatumPolicy = true;
+        }
+        // A mirror refresh can repush raw hiddenFeatures even without a revision change.
+        if (homeScene) {
+            // Every loaded datum (origin, axes, points) hidden; rebuilt only when one is missing.
+            static std::unordered_set<std::string> s_homeHidden;
+            const auto& cur = renderer.hiddenDatums();
+            bool all = true;
+            for (const auto& d : renderer.refDatums())
+                if (!d.id.empty() && !cur.count(d.id)) { all = false; break; }
+            if (!all) {
+                s_homeHidden = s_effectiveDatums;
+                for (const auto& d : renderer.refDatums())
+                    if (!d.id.empty()) s_homeHidden.insert(d.id);
+                renderer.setHiddenDatums(s_homeHidden);
+            }
+        } else if (renderer.hiddenDatums() != s_effectiveDatums) {
+            renderer.setHiddenDatums(s_effectiveDatums);
         }
         // Planes force-hidden in sketch (grid owns the view). Axes follow the same auto-hide
         // policy as outside sketch: with solid content they stay hidden unless the user unhid
@@ -2823,18 +2978,32 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // keys to the renderer, which draws just those faces in a second translucent pass.
         bool pmPreviewing = st.propertyManager && st.propertyManager->active() &&
                             st.hasDocMesh && !inSketch && !docIsAssembly(st);
-        if (pmPreviewing && !st.propertyManager->targetId().empty()) {
-            std::vector<uint64_t> editKeys;
-            const auto& om = st.docMirror.ownerMap();
-            auto oit = om.find(st.propertyManager->targetId());
-            if (oit != om.end()) {
-                editKeys.reserve(oit->second.faces.size());
-                for (const auto& bf : oit->second.faces)
-                    editKeys.push_back(((uint64_t)bf.first << 32) | (uint64_t)bf.second);
+        static std::string s_previewDoc, s_previewTarget;
+        static int s_previewRevision = -2;
+        static uint64_t s_previewHidden = 0;
+        static const std::string s_emptyPreviewTarget;
+        const std::string& previewTarget =
+            pmPreviewing ? st.propertyManager->targetId() : s_emptyPreviewTarget;
+        const uint64_t previewHidden = viewportSetHash(st.hiddenFeatures);
+        if (s_previewDoc != viewportDocId || s_previewRevision != viewportRevision ||
+            s_previewTarget != previewTarget || s_previewHidden != previewHidden) {
+            s_previewDoc = viewportDocId;
+            s_previewRevision = viewportRevision;
+            s_previewTarget = previewTarget;
+            s_previewHidden = previewHidden;
+            if (!previewTarget.empty()) {
+                std::vector<uint64_t> editKeys;
+                const auto& om = st.docMirror.ownerMap();
+                auto oit = om.find(previewTarget);
+                if (oit != om.end()) {
+                    editKeys.reserve(oit->second.faces.size());
+                    for (const auto& bf : oit->second.faces)
+                        editKeys.push_back(((uint64_t)bf.first << 32) | (uint64_t)bf.second);
+                }
+                renderer.setPreviewIsolation(editKeys, 0.40f);
+            } else {
+                renderer.clearPreviewIsolation();
             }
-            renderer.setPreviewIsolation(editKeys, 0.40f);
-        } else {
-            renderer.clearPreviewIsolation();
         }
         // W2 full-bleed viewport: frame the part in the CLEAR region (clr0..clr1: between the pinned
         // columns, below the doc-tab band) via an asymmetric-frustum lens shift plus a zoom=1 fit
@@ -2900,11 +3069,63 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         if (clipDatumAxes)
             renderer.setDatumAxisClip((clr0.x - imgX0) / (float)vw, (clr0.y - imgY0) / (float)vh,
                                       (clr1.x - imgX0) / (float)vw, (clr1.y - imgY0) / (float)vh);
-        renderer.renderOrbit(st.yaw, st.pitch, st.zoom, st.pan);
-        if (clipDatumAxes) renderer.clearDatumAxisClip();
+        else renderer.clearDatumAxisClip();
+
+        // Picking and pick overlays use the uploaded (baked) geometry; while the exploded view
+        // slides bodies on the GPU they would hit/highlight the old positions, so hold them off.
+        const bool picking = st.hasDocMesh && st.idPass && st.overlays &&
+                             !renderer.hasBodyOffsets();
+        if (picking && st.evaluateDialogs) {
+            st.evaluateDialogs->prepareFrame(st);
+            renderer.setBodyAlpha(st.evaluateDialogs->requestedBodyAlpha());
+        }
+        const auto mateBodies = st.asmPanels && docIsAssembly(st)
+            ? st.asmPanels->matePickedBodies() : std::array<uint32_t, 3>{};
+        renderer.setMateGhostBodies(mateBodies);
+        if (st.idPass)
+            st.idPass->setPassThroughBodies(renderer.mateGhosting()
+                ? mateBodies : std::array<uint32_t, 3>{});
+        // Reuse is deliberately restricted to the fully enumerated Model overlay path. Other
+        // workspaces, PM previews, sketch tools, evaluate geometry, and drags redraw conservatively.
+        const bool evaluateInk = picking && st.evaluateDialogs &&
+            (!st.evaluateDialogs->overlaySegments().empty() ||
+             !st.evaluateDialogs->overlayHighlights().empty() ||
+             st.evaluateDialogs->interferenceView().active ||
+             st.evaluateDialogs->sectionDragActive());
+        const bool canReuseViewport = st.activeWorkspace == AppState::Workspace::Model &&
+            !inSketch && !inSketch3d && !st.sketchPlanePickActive &&
+            !(st.propertyManager && st.propertyManager->active()) &&
+            !s_pp.active && !s_dim.active && !s_asmDrag.active && s_sectionDragIdx < 0 &&
+            !sceneActive && !ui::camSimHudActive() && !evaluateInk && !st.animActive &&
+            !cameraAnimating() && !s_viewSelector.active();
+        ViewportHash viewportOverlayKey;
+        viewportOverlayKey.text(viewportDocId);
+        viewportOverlayKey.add(viewportRevision);
+        viewportOverlayKey.add(st.yaw); viewportOverlayKey.add(st.pitch);
+        viewportOverlayKey.add(st.zoom);
+        for (float p : st.pan) viewportOverlayKey.add(p);
+        viewportOverlayKey.add(picking); viewportOverlayKey.add(ui::uiScale);
+        viewportOverlayKey.add(reinterpret_cast<uintptr_t>(st.overlays));
+        if (picking) {
+            viewportOverlayKey.add(st.featureHighlightFaces.size());
+            for (uint64_t face : st.featureHighlightFaces) viewportOverlayKey.add(face);
+            viewportOverlayKey.add(st.selection.size());
+            for (const auto& selected : st.selection.items()) viewportOverlayKey.hit(selected.hit);
+            const bool uiHoverLive = s_uiHoverFrame >= ImGui::GetFrameCount() - 1;
+            viewportOverlayKey.hit(uiHoverLive ? s_uiHoverFace : st.hover);
+            // These palette roles are consumed by the two overlays in this restricted path.
+            for (float c : ui::palette.selectionHighlight) viewportOverlayKey.add(c);
+            for (float c : ui::palette.hoverHighlight) viewportOverlayKey.add(c);
+        }
+        static bool s_haveViewportFrame = false;
+        static uint64_t s_viewportEpoch = 0, s_viewportOverlayKey = 0;
+        const bool reusedViewport = canReuseViewport && s_haveViewportFrame &&
+            s_viewportEpoch == renderer.contentEpoch() &&
+            s_viewportOverlayKey == viewportOverlayKey.value && renderer.reuseLastFrame();
+        if (!reusedViewport) renderer.renderOrbit(st.yaw, st.pitch, st.zoom, st.pan);
 
         // ---- topology picking (C15): id pass + overlay highlights drawn over the shaded view ----
-        const bool picking = st.hasDocMesh && st.idPass && st.overlays;
+        // Picking remains independent of visual reuse.
         if (sceneToolArmed) {
             // A simulation line tool owns clicks/box gestures, never navigation drags.
             s_zoomAreaArmed = false;
@@ -2914,7 +3135,13 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // a no-op for an unchanged hover while frames woken by typing or other panels do no ID-pass
         // work at all. Re-sample section state here because a section interaction may change it
         // after the visual overlay was configured earlier in the frame.
-        auto ensurePickFresh = [&](bool facesOnly = false) {
+        auto navigating = [&]() {
+            return s_lmbDragActive || ImGui::IsMouseDown(ImGuiMouseButton_Middle) ||
+                ImGui::IsMouseDragging(ImGuiMouseButton_Right) || io.MouseWheel != 0.0f ||
+                st.animActive || cameraAnimating();
+        };
+        auto ensurePickFresh = [&](bool facesOnly = false, bool immediate = false) {
+            if (navigating() && !immediate) { st.pickReady = false; return; }
             float pickClipN[3][3] = {{1,0,0},{0,1,0},{0,0,1}};
             float pickClipOff[3] = {0,0,0};
             const int pickClipCount = renderer.sectionClip(pickClipN, pickClipOff);
@@ -2936,6 +3163,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // The scripted center-pick consumer runs after this panel, so satisfy that explicit
             // demand here. Normal mouse hover/picks refresh at their read sites below.
             if (picking && st.wantPick) ensurePickFresh();
+        }
+        if (st.overlays && !reusedViewport) {
             // Re-draw hover + selection highlights into the studio color FBO before it's sampled.
             renderer.beginOverlay();
             // C37-C item 4: draw feature-highlight faces first (underneath selection/hover) using
@@ -3130,6 +3359,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // completed prefix and pending suffix with GL ranges using the end-time array.
             if (picking && inManufacture) {
                 if (const ui::CamBackplot* bp = ui::camActiveBackplot()) {
+                    st.overlays->beginCamFrame(bp->generation);
                     const auto& vpal = ui::palette;
                     const bool progressing = ui::camSimHudActive();
                     const double playTime = progressing ? ui::camPlayT() : 0.0;
@@ -3155,6 +3385,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                             st.overlays->drawCamToolMarker(renderer.camera(), toolPosition,
                                                            vpal.camTool);
                     }
+                    st.overlays->endCamFrame();
                 }
                 if (const std::vector<float>* stock = ui::camStockBoxSegments())
                     st.overlays->drawSegments(renderer.camera(), *stock, ui::palette.camStock,
@@ -3162,7 +3393,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             }
             // Evaluate Measure / Mass Properties markers (distance lines, COM cross, I/J axes).
             if (picking && st.evaluateDialogs) {
-                st.evaluateDialogs->prepareFrame(st);
+                // prepareFrame ran before the scene signature and shaded pass.
                 const auto& es = st.evaluateDialogs->overlaySegments();
                 if (!es.empty()) {
                     const auto& pal = ui::palette;
@@ -3280,9 +3511,6 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                         st.overlays->drawSegments(renderer.camera(), arrow, pl.rgba, 2.4f, true);
                     }
                 }
-                // Whole-body translucency while mass markers / section / interference are active.
-                if (st.renderer)
-                    st.renderer->setBodyAlpha(st.evaluateDialogs->requestedBodyAlpha());
             }
             if (picking) {
                 std::vector<render::PickHit> selHits;
@@ -3303,6 +3531,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 const bool uiHoverLive = s_uiHoverFrame >= ImGui::GetFrameCount() - 1;
                 st.overlays->draw(renderer.camera(), uiHoverLive ? s_uiHoverFace : st.hover, selHits);
             }
+            if (st.asmPanels) st.asmPanels->drawExplodeLines(st);
             renderer.endOverlay();
         }
 
@@ -3315,26 +3544,31 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         ImVec2 vr1(vr0.x + (float)vw, vr0.y + (float)vh);  // == vr0 + (vw,vh) so it matches ppProject + the FBO exactly
         ImGui::GetBackgroundDrawList()->AddImage(
             (ImTextureID)(intptr_t)renderer.resolvedColorTexture(), vr0, vr1,
-            ImVec2(0, 1), ImVec2(1, 0));
+            ImVec2(0, renderer.resolvedUvMaxY()), ImVec2(renderer.resolvedUvMaxX(), 0));
         // ---- Liquid-glass v2 (H6a): publish the Kawase-blurred backdrop with THIS image's
         // screen rect so ui::glassPanel can project any panel rect into backdrop UVs. uv0=(0,1),
         // uv1=(1,0) above (GL bottom-left texture) is the same orientation ViewportBackdropInfo's
         // flipV=true assumes, so flipV=true here matches the AddImage call verbatim.
         renderer.setBackdropEnabled(true);   // frost from the studio bg even with no mesh
-        {
-            const auto bd = renderer.backdrop();
-            ui::ViewportBackdropInfo bdInfo;
-            bdInfo.textureId = bd.textureId;
-            bdInfo.uvMin = ImVec2(bd.uvMin[0], bd.uvMin[1]);
-            bdInfo.uvMax = ImVec2(bd.uvMax[0], bd.uvMax[1]);
-            bdInfo.screenMin = vr0;
-            bdInfo.screenMax = vr1;
-            bdInfo.flipV = true;
-            ui::setViewportBackdrop(bdInfo);
-            s_bdMin = vr0;
-            s_bdMax = vr1;
-            s_bdLive = bdInfo.valid();
-        }
+        const bool hadPendingLuma = renderer.backdropReadbackPending();
+        const auto bd = renderer.backdrop();  // reused frames still publish completed async luma
+        // Also repaint panels submitted before this poll when the final result is published.
+        if (hadPendingLuma || renderer.backdropReadbackPending())
+            ui::anim::requestFramesAt(30.0f);
+        ui::ViewportBackdropInfo bdInfo;
+        bdInfo.textureId = bd.textureId;
+        bdInfo.uvMin = ImVec2(bd.uvMin[0], bd.uvMin[1]);
+        bdInfo.uvMax = ImVec2(bd.uvMax[0], bd.uvMax[1]);
+        bdInfo.flipV = true;
+        bdInfo.screenMin = vr0;
+        bdInfo.screenMax = vr1;
+        ui::setViewportBackdrop(bdInfo);
+        s_bdMin = vr0;
+        s_bdMax = vr1;
+        s_bdLive = bdInfo.valid();
+        s_haveViewportFrame = canReuseViewport;
+        s_viewportEpoch = renderer.contentEpoch();
+        s_viewportOverlayKey = viewportOverlayKey.value;
         // (The dock-tab band that used to paint here was removed: drawDocTabs() paints one glass
         // band for the whole tab row; the 3D image now starts at the window TOP, so the strip's
         // glass projects live 3D instead of a dead panel fill.)
@@ -3364,6 +3598,28 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // real pointer state instead.
         const bool imgMouseOver = ImGui::IsItemHovered(ImGuiHoveredFlags_NoNavOverride);
 #endif
+        static bool s_rightPressInViewport = false;
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+            s_rightPressInViewport = imgHovered;
+        const bool viewportRightClick = s_rightPressInViewport && imgHovered && rightClickReleased();
+        if (ImGui::IsMouseReleased(ImGuiMouseButton_Right))
+            s_rightPressInViewport = false;
+        // Press-dependent tools (notably assembly dragging) run before ordinary hover. Refresh
+        // their press synchronously so a rapid cursor move + click cannot use an older PBO hit.
+        if (picking && imgHovered && !inSketch && !inSketch3d && !s_viewSelector.active() &&
+            !st.sketchPlanePickActive && !s_lmbDragActive &&
+            (ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
+             viewportRightClick)) {
+            const bool preferEdge = st.propertyManager && st.propertyManager->active() &&
+                st.propertyManager->activeWellPrefersEdge();
+            const bool vertices = !preferEdge || st.propertyManager->activeWellWantsVertex();
+            ensurePickFresh(false, true);
+            const auto previousHover = st.hover;
+            st.hover = st.idPass->pickFinalPreferEdge((int)(io.MousePos.x - vr0.x),
+                (int)(io.MousePos.y - vr0.y), vw, vh,
+                (int)((preferEdge ? 14.0f : 7.0f) * ui::uiScale), vertices);
+            if (st.hover != previousHover) ui::anim::requestFrames();
+        }
         // Capture the actual press face before hover can move into an overlay column. Left-drag
         // on geometry in Simulate copies a face; blank-space left-drag and MMB keep navigation.
         const bool simGestures = st.activeWorkspace == AppState::Workspace::Simulate &&
@@ -3380,7 +3636,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         if (simGestures && imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
             !io.KeyCtrl && !io.KeyShift && !io.KeyAlt && st.vpDragMode == 0) {
             s_simFaceDrag = {};
-            ensurePickFresh(true);
+            ensurePickFresh(true, true);
             const auto face = st.idPass->pickFinal(static_cast<int>(io.MousePos.x - vr0.x),
                 static_cast<int>(io.MousePos.y - vr0.y), vw, vh);
             if (face.valid() && face.kind == render::PickKind::Face) {
@@ -3418,7 +3674,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                         io.MousePos.y >= cr0.y && io.MousePos.y < cr1.y) {
                         // Setup tools consume the real triangle face at the exact drop pixel,
                         // not a coincident edge/vertex painted over it for ordinary selection.
-                        ensurePickFresh(true);
+                        ensurePickFresh(true, true);
                         const auto face = st.idPass->pickFinal(
                             static_cast<int>(io.MousePos.x - vr0.x),
                             static_cast<int>(io.MousePos.y - vr0.y), vw, vh);
@@ -3446,11 +3702,15 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // are still on the way, frost the wiped scene and center a brand mark + "Loading <tab>…"
         // so the click reads as registered. Painted before the HUD chrome so status pills (busy,
         // AI badge) stay on top of the scrim; self-clears when the mesh commit lands.
-        if (tabModelLoading(st)) drawTabLoadingOverlay(st, vr0, vr1, cr0, cr1);
+        // Workspace home (no document of the user's on screen): frost the bare starter scene and
+        // centre the home card; it supersedes the starter's own loading veil.
+        if (ui::workspaceHomeBlend(st) > 0.01f) ui::drawWorkspaceHomeOverlay(st, vr0, vr1, cr0, cr1);
+        else if (tabModelLoading(st)) drawTabLoadingOverlay(st, vr0, vr1, cr0, cr1);
         // Task 02: while the in-app copilot is driving the doc, paint an "AI editing" badge over the
         // view so the live edits are clearly attributed to the AI (not the user). Same run-lifecycle
         // signal as the Activity panel; non-intrusive top-center pill.
-        if (st.agentV2Running) drawAiActivityBadge(cr0, cr1, st.agentV2Status);
+        if (st.agentV2Running && st.anyEditingRunActive())
+            drawAiActivityBadge(cr0, cr1, st.agentV2Status);
         // Subtle quality readout while the adaptive ladder is holding a reduced step
         // (hidden at FULL or when adaptive is off — native default). Bottom-right, dim text.
         if (renderer.adaptiveQuality() && renderer.qualityStep() != Renderer::QualityStep::Full) {
@@ -3469,9 +3729,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // Simulate > Hydraulics (hook): the panel's Schematic | Plots | 3D toggle over the 3D view.
         if (st.activeWorkspace == AppState::Workspace::Simulate && st.simManager)
             st.simManager->drawViewportHud(st);
-        // C25 W2-D: camera navigation. All of it is suppressed while sketching (camera is
-        // plane-locked) except the wheel zoom, which stays usable. Any drag-navigation cancels an
-        // in-flight tween so the user takes over instantly.
+        // Camera navigation cancels an in-flight tween so the user takes over instantly.
         if (imgHovered && !inSketch && !inSketch3d) {
             // Pixels -> world units at the orbit target plane via the published camera seam
             // (Renderer::worldPerPixel / viewHalfHeight). Works for both ortho and perspective.
@@ -3557,7 +3815,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 }
                 // Esc or second click disarms.
                 if (ImGui::IsKeyPressed(ImGuiKey_Escape) ||
-                    ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+                    viewportRightClick) {
                     s_zoomAreaArmed = false;
                     s_zoomAreaDragging = false;
                 }
@@ -3608,8 +3866,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                             bool pressOnSel = st.hover.valid() && st.hover.body_id == h.body_id;
                             std::string cid = comp->value("id", std::string());
                             bool fixed = comp->value("fixed", false);
-                            if (pressOnSel && !cid.empty() &&
-                                !refuseViewportEdit(st, st.docMirror.docId())) {
+                            if (pressOnSel && !cid.empty()) {
                                 if (fixed) {
                                     st.toast(ui::ToastLevel::Warn,
                                              "This component is fixed — float it to move (right-click "
@@ -3617,14 +3874,16 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                                 } else {
                                     // Camera basis + px->mm scale at the component depth, captured for
                                     // the whole drag (R/U/worldPerPx already computed for this frame).
-                                    std::string cp = st.docMirror.hasDoc()
-                                                         ? st.docMirror.checkpoint(st.worker)
-                                                         : std::string();
+                                    std::string cp;
+                                    long revision = -1;
+                                    if (!viewportCheckpoint(st, cp, revision))
+                                        st.toast(ui::ToastLevel::Warn, "Couldn't start move component.");
                                     s_asmDrag.reset();
-                                    s_asmDrag.active     = true;
+                                    s_asmDrag.active     = !cp.empty() && revision >= 0;
                                     s_asmDrag.docId      = st.docMirror.docId();
                                     s_asmDrag.component  = cid;
                                     s_asmDrag.checkpoint = cp;
+                                    s_asmDrag.revision   = revision;
                                     s_asmDrag.pressPos   = io.MousePos;
                                     s_asmDrag.startPos    = asmComponentOrigin(st, comp, h.body_id);
                                     s_asmDrag.camR        = R;
@@ -3697,22 +3956,20 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                             float ddx = mp.x - t.x, ddy = mp.y - t.y;
                             return std::sqrt(ddx*ddx + ddy*ddy) <= hitR * 1.6f;
                         };
-                        if ((onAxis || nearTip(tipP) || nearTip(tipN)) &&
-                            !refuseViewportEdit(st, st.docMirror.docId())) {
+                        if (onAxis || nearTip(tipP) || nearTip(tipN)) {
                             // Validate draggability + take a checkpoint BEFORE mutating anything.
-                            std::string cp = st.docMirror.hasDoc()
-                                                 ? st.docMirror.checkpoint(st.worker) : std::string();
+                            std::string cp;
+                            long revision = -1;
+                            const bool haveCheckpoint = viewportCheckpoint(st, cp, revision);
                             auto probe = st.docMirror.pushPull(st.worker, bId, tId, 0.0, false);
                             if (!probe.ok) {
                                 st.toast(ui::ToastLevel::Error,
                                          "Push-pull failed: " + probe.error_message);
-                                if (!cp.empty() && !st.activeDocLockedByAgent())
-                                    st.docMirror.revert(st.worker, cp);
                             } else if (!probe.draggable) {
                                 st.toast(ui::ToastLevel::Warn,
                                          "This face can't be dragged — " + probe.reason);
-                                if (!cp.empty() && !st.activeDocLockedByAgent())
-                                    st.docMirror.revert(st.worker, cp);
+                            } else if (!haveCheckpoint) {
+                                st.toast(ui::ToastLevel::Warn, "Couldn't start push-pull.");
                             } else {
                                 // Begin the drag. The zero-distance probe left geometry unchanged.
                                 s_pp.reset();
@@ -3721,6 +3978,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                                 s_pp.bodyId     = bId;
                                 s_pp.topoId     = tId;
                                 s_pp.checkpoint = cp;
+                                s_pp.revision   = revision;
                                 s_pp.pressPos   = mp;
                                 s_pp.nsx = nsx; s_pp.nsy = nsy;
                                 s_pp.worldPerPx = wpp;
@@ -3798,7 +4056,6 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                             return std::sqrt(ddx*ddx + ddy*ddy) <= hitR * 1.6f;
                         };
                         if (!(onAxis || nearTip(tipP) || nearTip(tipN))) continue;
-                        if (refuseViewportEdit(st, st.docMirror.docId())) break;
                         // Grab this handle. The drag feeds the PM field — no doc op / checkpoint here;
                         // the PM owns the live preview and the single OK/Cancel commit.
                         s_dim.reset();
@@ -4031,14 +4288,12 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             if (st.vpDragMode == 1 && !s_zoomAreaArmed)
                 st.requestCursor(ui::CursorKind::Hand);
 
-            // Middle-button navigation (SolidWorks bindings):
-            //   MMB        = orbit / "spin the part around" (free 360, no pitch clamp)
-            //   Ctrl+MMB   = pan  / slide the view (translate)
-            //   Shift+MMB  = zoom (vertical, smooth exponential)
-            if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle) &&
+            // View navigation: MMB orbits, Ctrl+MMB or RMB pans, Shift+MMB zooms.
+            const bool rightPan = ImGui::IsMouseDragging(ImGuiMouseButton_Right);
+            if ((rightPan || ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) &&
                 (io.MouseDelta.x != 0 || io.MouseDelta.y != 0)) {
                 cancelCameraAnimation();
-                if (ctrl) {
+                if (rightPan || ctrl) {
                     applyPan(io.MouseDelta.x, io.MouseDelta.y);
                 } else if (shift) {
                     // Drag up = zoom in. exp keeps each pixel a constant multiplicative step.
@@ -4080,20 +4335,21 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         } else if (imgHovered && (inSketch || inSketch3d)) {
             // View navigation WHILE sketching (left-click stays for drawing entities):
             //   middle-drag        = orbit / "spin the part" (unlatches the normal-to lock; free 360)
-            //   Ctrl + middle-drag = pan / slide the view (translate)
+            //   Ctrl + middle-drag or right-drag = pan / slide the view (translate)
             //   Shift + middle-drag= zoom ; wheel = zoom
             // The sketch overlay reprojects from the live camera each frame, so a rotated view stays
             // correct (entity picking included).
             const bool ctrl = io.KeyCtrl, shift = io.KeyShift;
             // Deconflict: while a sketch entity/handle/group LMB drag is armed or live, ALL camera
-            // input yields — no MMB orbit/pan/zoom and no wheel zoom. The sketch overlay's own
+            // input yields — no MMB orbit/pan/zoom, RMB pan, or wheel zoom. The sketch overlay's own
             // edge auto-pan is the only thing allowed to move the view mid-drag.
             const bool skDrag = (inSketch && sketch != nullptr && sketch->entityDragActive()) ||
                                 (inSketch3d && sketch3d != nullptr && sketch3d->entityDragActive());
-            if (!skDrag && ImGui::IsMouseDragging(ImGuiMouseButton_Middle) &&
+            const bool rightPan = ImGui::IsMouseDragging(ImGuiMouseButton_Right);
+            if (!skDrag && (rightPan || ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) &&
                 (io.MouseDelta.x != 0 || io.MouseDelta.y != 0)) {
                 cancelCameraAnimation();
-                if (ctrl) {
+                if (rightPan || ctrl) {
                     // World-space pan via the published camera seam (ortho + perspective).
                     float worldPerPx = renderer.worldPerPixel(vh);
                     const auto& cam = renderer.camera();
@@ -4112,6 +4368,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 }
             }
             if (!skDrag && io.MouseWheel != 0) {
+                // A 3D sketch keeps preset/fit tweens active; manual zoom takes over.
+                cancelCameraAnimation();
                 st.zoom = std::clamp(st.zoom * std::pow(1.1f, io.MouseWheel),
                                      0.1f, renderer.maxSceneZoom());
             }
@@ -4170,7 +4428,8 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 ImGui::GetTopMostPopupModal() == nullptr;
             sceneViewport.navigating = s_lmbDragActive ||
                 ImGui::IsMouseDragging(ImGuiMouseButton_Left) ||
-                ImGui::IsMouseDragging(ImGuiMouseButton_Middle);
+                ImGui::IsMouseDragging(ImGuiMouseButton_Middle) ||
+                ImGui::IsMouseDragging(ImGuiMouseButton_Right);
             sceneConsumedClick = ui::simscene::handleViewport(
                 st, sceneViewport, ImGui::GetWindowDrawList());
         }
@@ -4192,7 +4451,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // side effects (the overlay below consumes the click). Placed above drawOverlay for same-frame
         // correctness (no one-frame hover lag).
         if (picking && st.sketchPlanePickActive && !s_viewSelector.active()) {
-            if (imgHovered && !s_lmbDragActive && st.idPass) {
+            if (imgHovered && !navigating() && st.idPass) {
                 int px = (int)(io.MousePos.x - vr0.x);
                 int py = (int)(io.MousePos.y - vr0.y);
                 ensurePickFresh();
@@ -4213,10 +4472,10 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // IdPass::render caches the complete draw key, so a stationary tool hover does not
             // re-render the model every frame.
             if (picking && imgHovered && !s_viewSelector.active() &&
-                !s_lmbDragActive && sketch->needsModelPicks())
+                !navigating() && sketch->needsModelPicks())
                 ensurePickFresh();
             sketch->drawOverlay(st, io, vr0, vr1, vw, vh,
-                                imgHovered && !s_viewSelector.active());
+                                imgHovered && !navigating() && !s_viewSelector.active());
         } else if (st.sketchPlanePickActive && sketch != nullptr) {
             // Plane-pick mode: sketcher draws the plane quads/hover/click, but no sketch is active.
             sketch->drawOverlay(st, io, vr0, vr1, vw, vh, imgHovered);
@@ -4422,7 +4681,10 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             // Instant3D: while a push-pull OR dimension drag owns the mouse, freeze hover and swallow
             // the click so the press that grabbed the handle doesn't also re-select / clear. (Both
             // are non-sketch features, so their guards are always false while in a sketch.)
-            if (imgHovered && !s_lmbDragActive && !originPickHot && !regionPickerHot && !planePickerHot &&
+            const bool pickingPress = ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
+                                      viewportRightClick;
+            if (imgHovered && (!navigating() || pickingPress) &&
+                !s_lmbDragActive && !originPickHot && !regionPickerHot && !planePickerHot &&
                 !axisPickerHot && !pointPickerHot && !curvePickerHot && !axisSelectHot &&
                 !datumSelectHot && !blendDeselectHot &&
                 !s_pp.active && !s_dim.active && s_sectionDragIdx < 0) {
@@ -4434,9 +4696,11 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 // In-sketch fallback picking always prefers edge/vertex the same way — sketch
                 // reference picking (Convert, snap targets) cares about edges/vertices far more
                 // than the coplanar face usually sitting right behind the sketch plane.
-                const bool preferEdge = inAnySketch ||
-                    (st.propertyManager && st.propertyManager->active() &&
-                     st.propertyManager->activeWellPrefersEdge());
+                const bool wellPrefersEdge = st.propertyManager && st.propertyManager->active() &&
+                    st.propertyManager->activeWellPrefersEdge();
+                const bool preferEdge = inAnySketch || wellPrefersEdge;
+                // An edge-only well rejects vertices: a corner must not steal a click on its edge.
+                const bool vertices = !wellPrefersEdge || st.propertyManager->activeWellWantsVertex();
                 // General viewport hover ALSO snaps to nearby edges/vertices (SolidWorks/Fusion pick
                 // feel): points and edges are tiny targets, so an exact single-pixel pick almost
                 // always lands on a face interior and thin geometry becomes unclickable. Use a modest
@@ -4444,11 +4708,25 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 // radius for the tools that explicitly hunt edges (Convert Entities, edge wells).
                 // pickFinalPreferEdge falls back to the exact-pixel face when nothing thin is in range.
                 const float snapRadius = preferEdge ? 14.0f : 7.0f;
-                ensurePickFresh();
-                st.hover = st.idPass->pickFinalPreferEdge(px, py, vw, vh,
-                                                          (int)(snapRadius * ui::uiScale));
+                ensurePickFresh(false, pickingPress);
+                const render::PickHit previousHover = st.hover;
+                const int radius = (int)(snapRadius * ui::uiScale);
+                const bool sameFramePick = inAnySketch ||
+                    ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
+                    viewportRightClick ||
+                    (sketch && sketch->needsModelPicks());
+                if (sameFramePick)
+                    st.hover = st.idPass->pickFinalPreferEdge(px, py, vw, vh, radius, vertices);
+                else
+                    st.hover = st.idPass->pickFinalPreferEdgeAsync(px, py, vw, vh, radius, vertices);
+                if (st.idPass->hoverPickPending()) ui::anim::requestFramesAt(60.0f);
+                // Highlights are drawn before this read; publish a changed hover next frame.
+                if (st.hover != previousHover) ui::anim::requestFrames();
             } else {
-                st.hover = render::PickHit{};
+                if (!navigating() && st.hover.valid()) {
+                    st.hover = render::PickHit{};
+                    ui::anim::requestFrames();
+                }
             }
 
             // Click = replace, Ctrl-click = toggle. Empty-space click clears.
@@ -4481,8 +4759,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 else if (s_dim.active) {
                     // Cancel the in-progress dim drag: restore the field to its press-time value
                     // (the PM re-previews) and end the drag. The PM itself stays open.
-                    if (st.propertyManager && !st.docLockedByAgent(s_dim.docId) &&
-                        st.docMirror.docId() == s_dim.docId) {
+                    if (st.propertyManager && st.docMirror.docId() == s_dim.docId) {
                         st.propertyManager->dragSetDim(s_dim.param, s_dim.oldValue);
                         if (s_dim.autoFlip)
                             st.propertyManager->dragSetCheck("flip", s_dim.flipAtPress);
@@ -4522,20 +4799,18 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
             st.clearSelection();
         }
 
-        // ---- C25: mouse gesture wheel (right-drag) + 'S' shortcut bar ----
-        // Gestures are suppressed while in sketch mode (camera is plane-locked; no view presets).
-        if (!inSketch) {
-            s_gestures.update(st, imgHovered, cr0, cr1);
-            s_gestures.draw(ImGui::GetWindowDrawList());
-        }
-        // Shortcut bar is context-aware: shows sketch tools when inSketch, model tools otherwise.
-        s_shortcutBar.update(st, imgHovered, inSketch, cr0, cr1);
-        s_shortcutBar.draw(st, inSketch);
+        // ---- 'S' shortcut bar ----
+        const auto shortcutContext = inSketch3d ? ShortcutContext::Sketch3d
+            : inSketch ? ShortcutContext::Sketch2d : ShortcutContext::Model;
+        s_shortcutBar.update(st, imgHovered, shortcutContext, cr0, cr1);
+        s_shortcutBar.draw(st, shortcutContext);
 
         // ---- C25 W3-J: viewport right-click context menu ----
-        // Opened by mouse_gestures when right button released without drag (kRmbContextMenuHook).
+        // Open on a right-click release that began over the viewport and never became a drag.
         // ITEM 11: RMB over a component with no prior LMB selection still resolves Open Part —
         // promote the live hover pick into the selection when the menu opens.
+        if (!inSketch && viewportRightClick)
+            st.wantContextMenu = true;
         if (st.wantContextMenu && !inSketch) {
             st.wantContextMenu = false;
             if (st.hover.valid() &&
@@ -4577,7 +4852,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 vpCompId = vpComp->value("id", std::string());
                 vpCompName = vpComp->value("name", std::string());
                 if (vpCompName.empty()) vpCompName = vpCompId;
-                vpCompHidden = vpComp->value("hidden", false);
+                vpCompHidden = st.componentHidden(vpCompId, vpComp->value("hidden", false));
                 std::string srcPath;
                 if (vpComp->contains("source") && (*vpComp)["source"].is_object())
                     srcPath = (*vpComp)["source"].value("path", std::string());
@@ -4616,7 +4891,6 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
 
         ui::pushContextMenuStyle();
         if (ImGui::BeginPopup("##vp_ctx")) {
-            const std::string vpEditReason = st.agentLockReason(st.docMirror.docId());
             // ---- ITEM 8: selection-dependent entries ----
             if (vpHasComp) {
                 ImGui::PushStyleColor(ImGuiCol_Text,
@@ -4634,47 +4908,17 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 }
                 if (haveOsFileManager() && ImGui::MenuItem("Open Part Location"))
                     revealInFileManager(vpCompAbsPath);
-                std::string modelEditReason = vpEditReason;
-                if (pathOk && modelEditReason.empty()) {
-                    namespace fs = std::filesystem;
-                    std::error_code ec;
-                    fs::path wanted = fs::weakly_canonical(vpCompAbsPath, ec);
-                    if (ec) wanted = fs::path(vpCompAbsPath).lexically_normal();
-                    for (const auto& tab : st.docTabs) {
-                        if (tab.path.empty() || !st.docLockedByAgent(tab.docId)) continue;
-                        std::error_code tabEc;
-                        fs::path have = fs::weakly_canonical(tab.path, tabEc);
-                        if (tabEc) have = fs::path(tab.path).lexically_normal();
-                        if (have == wanted) { modelEditReason = st.agentLockReason(tab.docId); break; }
-                    }
-                }
-                if (viewportEditMenuItem("Edit Model", modelEditReason) &&
-                    !refuseViewportEdit(st, st.docMirror.docId()))
+                if (ImGui::MenuItem("Edit Model"))
                     st.enterComponentEdit(vpCompId, vpCompAbsPath);
                 if (!pathOk) ImGui::EndDisabled();
-                if (viewportEditMenuItem("Edit Mates", vpEditReason))
+                if (ImGui::MenuItem("Edit Mates"))
                     st.requestEditComponentMates = vpCompId;
                 if (ImGui::MenuItem("Add to AI context")) addComponentContextRef(st, vpCompId, vpCompName);
                 if (vpHasTopoSel && (vpHasFace || vpHasEdge) &&
                     ImGui::MenuItem(vpHasFace ? "Add Face to AI context" : "Add Edge to AI context"))
                     addPickContextRef(st, st.selection.items().back().hit);
-                if (viewportEditMenuItem(vpCompHidden ? "Show Component" : "Hide Component",
-                                         vpEditReason)) {
-                    if (st.docMirror.hasDoc() && st.workerStarted &&
-                        !refuseViewportEdit(st, st.docMirror.docId())) {
-                        nlohmann::json op = {{"op", "asm_edit_component"},
-                                             {"id", vpCompId},
-                                             {"hidden", !vpCompHidden}};
-                        auto resp = st.docMirror.applyOps(st.worker,
-                                                          nlohmann::json::array({op}));
-                        if (resp.ok && !resp.aicm_path.empty()) {
-                            std::string lerr;
-                            st.loadDocMesh(resp.aicm_path, lerr);
-                            if (!lerr.empty()) st.addLog("[err] loadDocMesh: " + lerr);
-                        } else if (!resp.ok) {
-                            st.addLog("[err] asm_edit_component: " + resp.error_message);
-                        }
-                    }
+                if (ImGui::MenuItem(vpCompHidden ? "Show Component" : "Hide Component")) {
+                    st.setComponentHidden(vpCompId, !vpCompHidden);
                 }
                 ImGui::Separator();
             }
@@ -4734,14 +4978,14 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
                 if (ImGui::MenuItem("Clear Selection")) st.selection.clear();
                 // C26: recolor the selected body.
                 if (!vpBodyKey.empty()) {
-                    if (viewportEditMenuItem("Appearance...", vpEditReason)) {
+                    if (ImGui::MenuItem("Appearance...")) {
                         s_vpKey = vpBodyKey;
                         s_vpDocId = st.docMirror.docId();
                         s_vpColor[0] = 0.71f; s_vpColor[1] = 0.76f; s_vpColor[2] = 0.82f;
                         s_vpMetallic = 0.0f; s_vpRoughness = 0.5f;
                         s_openVpPicker = true;
                     }
-                    if (viewportEditMenuItem("Clear Appearance", vpEditReason))
+                    if (ImGui::MenuItem("Clear Appearance"))
                         applyAppearanceFromViewport(st, st.docMirror.docId(), vpBodyKey, nullptr);
                 }
                 ImGui::Separator();
@@ -4836,20 +5080,18 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         // Appearance ribbon "Appearance..." -> arm this picker for the whole model (body "b1").
         if (st.requestAppearanceEditor) {
             st.requestAppearanceEditor = false;
-            if (!refuseViewportEdit(st, st.docMirror.docId())) {
-                s_vpKey = "b1";
-                s_vpDocId = st.docMirror.docId();
-                s_vpColor[0] = 0.71f; s_vpColor[1] = 0.76f; s_vpColor[2] = 0.82f;
-                s_vpMetallic = 0.0f; s_vpRoughness = 0.5f;
-                s_openVpPicker = true;
-            }
+            s_vpKey = "b1";
+            s_vpDocId = st.docMirror.docId();
+            s_vpColor[0] = 0.71f; s_vpColor[1] = 0.76f; s_vpColor[2] = 0.82f;
+            s_vpMetallic = 0.0f; s_vpRoughness = 0.5f;
+            s_openVpPicker = true;
         }
         if (s_openVpPicker) { ImGui::OpenPopup("##appearance_vp"); s_openVpPicker = false; }
         const std::string appearanceDisabledReason = !ImGui::IsPopupOpen("##appearance_vp")
             ? std::string()
             : st.docMirror.docId() != s_vpDocId
                 ? "Switch back to the part that opened this appearance editor."
-                : st.agentLockReason(s_vpDocId);
+                : std::string();
         if (appearanceColorPicker("##appearance_vp", s_vpColor, &s_vpMetallic, &s_vpRoughness,
                                   appearanceDisabledReason.c_str())
             && !s_vpKey.empty())
@@ -5703,7 +5945,7 @@ void drawViewportPanel(AppState& st, ImGuiIO& io, bool busy) {
         //   +Y tip → Front  (yaw=0,   pitch=0)  — "look from the +Y side" = Front in this basis
         //   +Z tip → Top    (yaw=0,   pitch=89.5)
         // Hover: accentSoft circle behind the label. Tooltip: view name.
-        if (st.showTriad) {
+        if (st.showTriad && !ui::workspaceHomeActive(st)) {   // home: no scene to orient
             const float ts = ui::uiScale;
             // Glyph geometry (logical px): axis length, label-chip offset beyond the tip, and the
             // chip half-extent. `reach` is the screen radius the whole glyph (labels included)

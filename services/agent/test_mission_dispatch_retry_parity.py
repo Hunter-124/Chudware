@@ -73,7 +73,6 @@ def runtime(monkeypatch):
     from services.agent import role_models
 
     monkeypatch.setattr(config, "load_config", lambda *args, **kwargs: {})
-    monkeypatch.setattr(role_models, "resolve_for_node", lambda *args, **kwargs: None)
     monkeypatch.setattr(role_models, "resolve_role_model", lambda *args, **kwargs: None)
     monkeypatch.setattr(config, "get_subagent_tool_call_budget", lambda: 0)
 
@@ -101,8 +100,8 @@ def _completed_result(**overrides):
         "run_id": "run-cutover",
         "session_id": "cad-role-stable",
         "parent_id": "dg_cutover",
-        "chudcode_session_id": "rpc-child",
-        "chudcode_session_file": "/tmp/rpc-child.jsonl",
+        "omp_session_id": "rpc-child",
+        "omp_session_file": "/tmp/rpc-child.jsonl",
         "cancelled": False,
         "tokens_used": 3210,
         "provider_usage_recorded": True,
@@ -115,7 +114,7 @@ def _completed_result(**overrides):
 def test_online_delegate_uses_chudcode_with_scope_lineage_credits_and_events(
     runtime, monkeypatch
 ):
-    from services.agent import chudcode_roles
+    from services.agent import omp_roles
     from services.agent import config
 
     calls: list[dict[str, Any]] = []
@@ -127,7 +126,7 @@ def test_online_delegate_uses_chudcode_with_scope_lineage_credits_and_events(
         return _completed_result()
 
     provider_constructions: list[tuple] = []
-    monkeypatch.setattr(chudcode_roles, "run_role_turn", fake_turn)
+    monkeypatch.setattr(omp_roles, "run_role_turn", fake_turn)
     monkeypatch.setattr(
         config,
         "get_provider",
@@ -165,8 +164,47 @@ def test_online_delegate_uses_chudcode_with_scope_lineage_credits_and_events(
     assert events == [("agent.tool_call", {"tool": "measure_part"})]
 
 
+@pytest.mark.parametrize("field", ["thinking", "reasoning_effort", "effort"])
+def test_delegate_forwards_requested_effort_to_child(monkeypatch, field):
+    from services.agent import config, omp_roles, role_models
+
+    monkeypatch.setattr(config, "load_config", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        role_models, "resolve_role_model",
+        lambda *args, **kwargs: role_models.RoleModelAssignment(
+            "task", "ollama", "worker", "fixed",
+        ),
+    )
+    monkeypatch.setattr(config, "get_subagent_tool_call_budget", lambda: 0)
+    calls = []
+    monkeypatch.setattr(
+        omp_roles, "run_role_turn",
+        lambda *args, **kwargs: calls.append(kwargs) or _completed_result(),
+    )
+    out = _dispatch().delegate(
+        role="reviewer", brief="inspect", budget_tokens=8000, **{field: "high"},
+    )
+
+    assert out["ok"] is True
+    assert calls[0]["options"]["settings"]["reasoning_effort"] == "high"
+
+
+def test_delegate_accepts_pipeline_role_not_in_specialist_summary(runtime, monkeypatch):
+    from services.agent import omp_roles
+
+    calls = []
+    monkeypatch.setattr(
+        omp_roles, "run_role_turn",
+        lambda *args, **kwargs: calls.append(args) or _completed_result(),
+    )
+    tree = _Tree()
+    _dispatch(tree=tree).delegate(role="orchestrator", brief="plan", budget_tokens=8000)
+    assert tree.requests[0]["role"] == "orchestrator"
+    assert calls
+
+
 def test_delegate_session_identity_and_nested_parent_are_stable(runtime, monkeypatch):
-    from services.agent import chudcode_roles
+    from services.agent import omp_roles
 
     calls: list[dict[str, Any]] = []
 
@@ -174,7 +212,7 @@ def test_delegate_session_identity_and_nested_parent_are_stable(runtime, monkeyp
         calls.append({"request": request, "role": role, **kwargs})
         return _completed_result()
 
-    monkeypatch.setattr(chudcode_roles, "run_role_turn", fake_turn)
+    monkeypatch.setattr(omp_roles, "run_role_turn", fake_turn)
     tree = _Tree()
     dispatch = _dispatch(tree=tree)
     dispatch._current_node_id = "dg_parent"
@@ -191,7 +229,7 @@ def test_delegate_session_identity_and_nested_parent_are_stable(runtime, monkeyp
 def test_explicit_offline_delegate_passes_only_injected_safe_provider(
     runtime, monkeypatch
 ):
-    from services.agent import chudcode_roles
+    from services.agent import omp_roles
 
     safe_provider = object()
     calls: list[dict[str, Any]] = []
@@ -200,7 +238,7 @@ def test_explicit_offline_delegate_passes_only_injected_safe_provider(
         calls.append({"request": request, "role": role, **kwargs})
         return _completed_result(offline=True)
 
-    monkeypatch.setattr(chudcode_roles, "run_role_turn", fake_turn)
+    monkeypatch.setattr(omp_roles, "run_role_turn", fake_turn)
     out = _dispatch(options={"offline": True}, provider=safe_provider).delegate(
         role="reviewer", brief="offline audit", budget_tokens=6000
     )
@@ -214,10 +252,10 @@ def test_explicit_offline_delegate_passes_only_injected_safe_provider(
 
 
 def test_cancelled_delegate_fails_tree_and_leads_with_cause(runtime, monkeypatch):
-    from services.agent import chudcode_roles
+    from services.agent import omp_roles
 
     monkeypatch.setattr(
-        chudcode_roles,
+        omp_roles,
         "run_role_turn",
         lambda *args, **kwargs: _completed_result(
             success=False,
@@ -242,10 +280,10 @@ def test_cancelled_delegate_fails_tree_and_leads_with_cause(runtime, monkeypatch
 
 
 def test_provider_failure_shape_is_failure_first_and_auditable(runtime, monkeypatch):
-    from services.agent import chudcode_roles
+    from services.agent import omp_roles
 
     monkeypatch.setattr(
-        chudcode_roles,
+        omp_roles,
         "run_role_turn",
         lambda *args, **kwargs: _completed_result(
             success=False,
@@ -265,7 +303,7 @@ def test_provider_failure_shape_is_failure_first_and_auditable(runtime, monkeypa
 
 
 def test_recursion_policy_refusal_spends_no_credit(runtime, monkeypatch):
-    from services.agent import chudcode_roles
+    from services.agent import omp_roles
     from services.agent import role_models
 
     called: list[bool] = []
@@ -275,7 +313,7 @@ def test_recursion_policy_refusal_spends_no_credit(runtime, monkeypatch):
         lambda *args, **kwargs: {"ok": False, "reason": "max depth reached"},
     )
     monkeypatch.setattr(
-        chudcode_roles,
+        omp_roles,
         "run_role_turn",
         lambda *args, **kwargs: called.append(True),
     )
@@ -288,3 +326,145 @@ def test_recursion_policy_refusal_spends_no_credit(runtime, monkeypatch):
     assert out["reason"] == "spawn_depth_policy"
     assert called == []
     assert tree.transitions == []
+
+
+def test_dispatcher_forwards_advanced_worker_pin_as_explicit_child(monkeypatch):
+    from services.agent import omp_roles, config
+
+    cfg = {"assignment_mode": "advanced", "advanced_overrides": True, "ai_roles": {
+        "worker": {"provider": "ollama", "model": "worker-pin"},
+    }}
+    monkeypatch.setattr(config, "load_config", lambda *args, **kwargs: cfg)
+    calls = []
+    monkeypatch.setattr(omp_roles, "run_role_turn",
+                        lambda *args, **kwargs: calls.append(kwargs) or _completed_result())
+    dispatch = _dispatch()
+    dispatch._run_subagent_turn(_Node("general_agent").to_dict(), "build")
+    options = calls[0]["options"]
+    assert (options["provider"], options["model"]) == ("ollama", "worker-pin")
+    assert (options["settings"]["provider"], options["settings"]["model"]) == ("ollama", "worker-pin")
+
+def test_legacy_worker_fallback_survives_settings_migration_and_tier_reset(monkeypatch, tmp_path):
+    import json
+    from services.agent import config, omp_roles, role_models
+
+    path = tmp_path / "config.json"
+    monkeypatch.setattr("services.paths.CONFIG", path)
+    path.write_text(json.dumps({"assignment_mode": "advanced", "advanced_overrides": True, "ai_roles": {
+        "worker": {"provider": "ollama", "model": "worker-pin"},
+    }, "model_sizes": {"medium": {"provider": "ollama", "model": "tier-pin"}}}))
+    monkeypatch.setattr(config, "load_config", lambda *a, **k: config.read_config_uncached())
+    calls = []
+    monkeypatch.setattr(omp_roles, "run_role_turn",
+                        lambda *args, **kwargs: calls.append(kwargs) or _completed_result())
+    role_models.update_role_settings({"model_sizes": {"small": "default"}})
+    dispatch = _dispatch()
+    dispatch._run_subagent_turn(_Node("general_agent").to_dict(), "build")
+    assert calls[-1]["options"]["model"] == "worker-pin"
+    role_models.update_role_settings({"roles": {"task": {"mode": "tier"}}})
+    dispatch._run_subagent_turn(_Node("general_agent").to_dict(), "build")
+    assert calls[-1]["options"]["model"] == "tier-pin"
+
+
+def test_legacy_worker_fallback_is_disabled_while_overrides_are_off(monkeypatch, tmp_path):
+    import json
+    from services.agent import config, omp_roles, role_models
+
+    path = tmp_path / "config.json"
+    monkeypatch.setattr("services.paths.CONFIG", path)
+    path.write_text(json.dumps({"assignment_mode": "advanced", "ai_roles": {
+        "worker": {"provider": "ollama", "model": "worker-pin"},
+    }, "model_sizes": {"medium": {"provider": "ollama", "model": "tier-pin", "thinking": "low"}}}))
+    monkeypatch.setattr(config, "load_config", lambda *a, **k: config.read_config_uncached())
+    calls = []
+    monkeypatch.setattr(omp_roles, "run_role_turn",
+                        lambda *args, **kwargs: calls.append(kwargs) or _completed_result())
+    # The save persists the legacy bookkeeping, but the switch is missing = off.
+    role_models.update_role_settings({"model_sizes": {"small": "default"}})
+    cfg = config.read_config_uncached()
+    assert cfg["legacy_mission_worker_fallback"] is True and cfg["advanced_overrides"] is False
+    assert role_models.role_settings_view(cfg)["legacy_mission_worker_fallback"] is False
+    dispatch = _dispatch()
+    dispatch._run_subagent_turn(_Node("general_agent").to_dict(), "build")
+    options = calls[-1]["options"]
+    assert (options["provider"], options["model"]) == ("ollama", "tier-pin")
+    assert options["settings"]["reasoning_effort"] == "low"
+    role_models.update_role_settings({"advanced_overrides": True})
+    dispatch._run_subagent_turn(_Node("general_agent").to_dict(), "build")
+    assert calls[-1]["options"]["model"] == "worker-pin"
+    assert role_models.role_settings_view(config.read_config_uncached())["legacy_mission_worker_fallback"] is True
+
+
+def test_dispatcher_ignores_retained_role_override_while_overrides_are_off(monkeypatch, tmp_path):
+    import json
+    from services.agent import config, omp_roles, role_models
+
+    path = tmp_path / "config.json"
+    monkeypatch.setattr("services.paths.CONFIG", path)
+    path.write_text(json.dumps({"assignment_mode": "advanced", "advanced_overrides": False, "ai_roles": {
+        "task": {"provider": "ollama", "model": "task-pin", "thinking": "high"},
+    }, "model_sizes": {"medium": {"provider": "ollama", "model": "tier-pin"}}}))
+    monkeypatch.setattr(config, "load_config", lambda *a, **k: config.read_config_uncached())
+    calls = []
+    monkeypatch.setattr(omp_roles, "run_role_turn",
+                        lambda *args, **kwargs: calls.append(kwargs) or _completed_result())
+    dispatch = _dispatch()
+    dispatch._run_subagent_turn(_Node("general_agent").to_dict(), "build")
+    options = calls[-1]["options"]
+    assert options["model"] == "tier-pin"
+    assert "reasoning_effort" not in options["settings"]
+    role_models.update_role_settings({"advanced_overrides": True})
+    dispatch._run_subagent_turn(_Node("general_agent").to_dict(), "build")
+    options = calls[-1]["options"]
+    assert options["model"] == "task-pin"
+    assert options["settings"]["reasoning_effort"] == "high"
+
+
+def test_dispatcher_local_only_refusal_never_launches_fallback(monkeypatch):
+    from services.agent import omp_roles, config
+
+    cfg = {"assignment_mode": "simple", "copilot": {"location": "this_computer_only"},
+           "model_sizes": {"medium": {"provider": "anthropic", "model": "cloud"}}}
+    monkeypatch.setattr(config, "load_config", lambda *args, **kwargs: cfg)
+    calls = []
+    monkeypatch.setattr(omp_roles, "run_role_turn",
+                        lambda *args, **kwargs: calls.append(kwargs) or _completed_result())
+    dispatch = _dispatch()
+    result = dispatch._run_subagent_turn(_Node("general_agent").to_dict(), "build")
+    assert not calls
+    assert not result.get("success", result.get("ok", False))
+
+
+def test_model_assignment_reports_the_resolved_seat_without_an_invented_rank(monkeypatch):
+    from services.agent import config, omp_roles, role_models
+
+    cfg = {"assignment_mode": "simple", "model_sizes": {
+        "medium": {"mode": "fixed", "provider": "ollama", "model": "tier-pin", "thinking": "low"},
+    }}
+    monkeypatch.setattr(config, "load_config", lambda *args, **kwargs: cfg)
+    calls = []
+    monkeypatch.setattr(omp_roles, "run_role_turn",
+                        lambda *args, **kwargs: calls.append(kwargs) or _completed_result())
+
+    seat = role_models.resolve_role_model("task", cfg)
+    assert (seat.provider, seat.model, seat.mode) == ("ollama", "tier-pin", "fixed")
+    assert role_models.resolve_role_thinking("task", cfg) == "low"
+    assert "rank" not in seat.to_dict()
+
+    events: list[tuple[str, dict]] = []
+    dispatch = _dispatch(events=events)
+    node = _Node("general_agent").to_dict()
+    dispatch._run_subagent_turn(node, "build")
+
+    assert calls[-1]["options"]["settings"]["reasoning_effort"] == "low"
+    payloads = [payload for kind, payload in events if kind == "agent.model_assignment"]
+    assert len(payloads) == 1
+    event = payloads[0]
+    assert (event["picked_provider"], event["picked_model"], event["mode"]) == (
+        "ollama", "tier-pin", "fixed")
+    assert event["cost_tier"] == 0
+    notes = [row["payload"] for row in dispatch._ledger().rows
+             if row["kind"] == "note" and row["payload"].get("event") == "model_assignment"]
+    assert len(notes) == 1 and notes[0]["picked_model"] == "tier-pin"
+    for payload in (event, notes[0], node["role_model"]):
+        assert "rank" not in payload and "min_rank" not in payload

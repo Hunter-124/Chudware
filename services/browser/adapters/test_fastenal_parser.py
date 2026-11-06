@@ -56,14 +56,18 @@ def test_fastenal_search_parses_server_rendered_cards(fastenal_mod, monkeypatch)
         "Socket Head Cap Screw")
     assert first["url"] == "https://www.fastenal.com/product/details/924835414"
     assert first["sku"] == "924835414"
-    assert first["price"] == "$19.83"
+    assert first["price"] == 19.83
+    assert first["currency"] == "USD"
+    assert first["kind"] == "product"
+    assert first["thumbnail"] == "https://img4.fastenal.com/infp360pmm/derivates/2/001/243/159/0135931.jpg"
 
     # Alphanumeric SKUs are real on Fastenal — must parse too.
     second = hits[1]
     assert second["sku"] == "M42510040A20000"
     assert second["url"].endswith("/product/details/M42510040A20000")
     assert "Flat Head Socket Cap Screw" in second["title"]
-    assert second["price"] == "$0.19"
+    assert second["price"] == 0.19
+    assert second["thumbnail"] and second["thumbnail"] != first["thumbnail"]
 
 
 def test_fastenal_search_propagates_fetch_failure(fastenal_mod, monkeypatch):
@@ -72,4 +76,5 @@ def test_fastenal_search_propagates_fetch_failure(fastenal_mod, monkeypatch):
                         lambda url, s: {"ok": False, "reason": "no_profile", "hint": "x"})
 
     hits = fastenal.ADAPTER.search("m3 screw")
-    assert hits == [{"ok": False, "reason": "no_profile", "hint": "x"}]
+    assert hits[0]["reason"] == "no_profile"
+    assert hits[0]["site"] == "fastenal"

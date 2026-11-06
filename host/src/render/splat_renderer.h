@@ -49,6 +49,7 @@ public:
 
     bool hasSplats() const { return !cloud_.empty(); }
     size_t count() const { return cloud_.size(); }
+    const SplatCloud& cloud() const { return cloud_; }
     bool bounds(Vec3& min, Vec3& max) const;
     bool load(const std::string& path, std::string& err);
     void setCloud(SplatCloud cloud);

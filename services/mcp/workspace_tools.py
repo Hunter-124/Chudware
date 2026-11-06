@@ -93,6 +93,13 @@ def _turn_snapshot(ts: str) -> dict:
                   "again when the engine is available."),
         )
         return out
+    try:
+        cb.lease_documents(listed.get("docs") or [])
+    except Exception as exc:  # noqa: BLE001 — do not advertise unleased handles
+        out.update(ok=False, reason="document_lease_failed",
+                   error=f"Could not retain a listed document: {exc}",
+                   hint="Call workspace_status() again to obtain current document IDs.")
+        return out
     docs = []
     for row in listed.get("docs") or []:
         if isinstance(row, dict) and row.get("doc_id"):
@@ -113,18 +120,13 @@ def register_workspace_tools(mcp) -> None:
     @mcp.tool()
     @model_selectors("run_id")
     def workspace_status(run_id: str = "") -> dict:
-        """Return the workspace snapshot: project directory, open documents, owners.
+        """Return the project directory, open documents and workspace status.
 
-        Omit run_id in a chat turn. Then the snapshot shows the project directory
-        of the turn and every document open in the engine (scope "turn"). Each
-        document has a location: "project", "outside_project" or "unsaved".
-        If exactly one multi-doc session is registered, the snapshot shows that
-        session (scope "session"): document owners, status and latest render.
-
-        Give run_id only to select a registered multi-doc session. A chat turn
-        run id does not name a session. An unknown run_id returns ok=false with
-        the registered run ids and the call to use instead.
-        Risk: read (named in _READ_EXACT in tool_registry; no lease required).
+        Omit run_id for the turn snapshot, or the session snapshot when exactly
+        one multi-doc session is registered. Select a registered session by
+        run_id; a chat turn ID is not a session ID. Unknown or ambiguous sessions
+        return available IDs. Turn documents are marked project, outside_project
+        or unsaved; sessions include owners, status and latest render.
         """
         from services.agent import workspace as ws
 
@@ -190,7 +192,9 @@ def register_workspace_tools(mcp) -> None:
                     if cur:
                         out["current_doc_id"] = cur
                 return out
-        return {"ok": True, "scope": "session", **session.workspace_status()}
+        snapshot = session.workspace_status()
+        cb.lease_documents(snapshot.get("docs") or [])
+        return {"ok": True, "scope": "session", **snapshot}
 
     @mcp.tool()
     @model_selectors("run_id")

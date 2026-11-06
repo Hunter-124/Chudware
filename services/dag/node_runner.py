@@ -113,7 +113,7 @@ EmitFn = Optional[Callable[[str, dict[str, Any]], None]]
 
 
 # ---------------------------------------------------------------------------
-# Default Chudcode role-turn function
+# Default OMP role-turn function
 # ---------------------------------------------------------------------------
 
 
@@ -124,7 +124,7 @@ def make_default_agent_fn(
     delegation_tree=None,
     on_event=None,
 ) -> "Callable[[str, dict[str, Any]], Any]":
-    """Return the default Chudcode-backed DAG agent function with run state bound.
+    """Return the default OMP-backed DAG agent function with run state bound.
 
     The ledger, mission dispatcher, delegation tree, and event sink stay attached
     to every node so tool calls and handoffs retain their existing run lineage.
@@ -134,43 +134,19 @@ def make_default_agent_fn(
     When a ledger is bound and no dispatcher is supplied, this creates the same
     run-scoped mission tool surface used by nested roles.
     """
-    # Thread the mission's live delegation layer into the Chudcode host-tool
-    # dispatcher. Provider execution itself belongs to Chudcode.
+    # Thread the mission's live delegation layer into the OMP host-tool
+    # dispatcher. Provider execution itself belongs to OMP.
     if mission_dispatch is None and ledger is not None:
         try:
             from services.agent.mission_dispatch import MissionDispatch  # noqa: PLC0415
-            from services.agent.corporate import get_org_chart  # noqa: PLC0415
 
-            rid = getattr(ledger, "run_id", "") or ""
-            org = get_org_chart(rid, create=False) if rid else None
-            if org is not None:
-                if on_event is not None and org.on_event is None:
-                    org.on_event = on_event
             mission_dispatch = MissionDispatch(
-                run_id=rid,
+                run_id=getattr(ledger, "run_id", "") or "",
                 ledger=ledger,
                 delegation_tree=delegation_tree,
                 provider=None,
                 on_event=on_event,
-                org_chart=org,
             )
-            # Live-hire heads once a real dispatch+tree exists (gap 2).
-            if (
-                org is not None
-                and getattr(org, "active", False)
-                and delegation_tree is not None
-            ):
-                try:
-                    forming = [
-                        s
-                        for s in org.seats.values()
-                        if s.rank == "head"
-                        and (s.status == "forming" or not s.delegation_node)
-                    ]
-                    if forming:
-                        org.seat_heads(delegate_fn=mission_dispatch.delegate)
-                except Exception:  # noqa: BLE001
-                    pass
         except Exception:  # noqa: BLE001 — mission layer optional
             mission_dispatch = None
 
@@ -204,32 +180,20 @@ def _resolve_role_settings(
         or node_inputs.get("role")
         or "general_agent"
     )
-    harness_role = role_models.harness_role_for_mission_role(role)
-    task_class = context_pack.get("task_class") or node_inputs.get("task_class")
-    risk = context_pack.get("risk") or node_inputs.get("risk")
-    try:
-        depth = int(context_pack.get("depth") or node_inputs.get("depth") or 0)
-    except (TypeError, ValueError):
-        depth = 0
     try:
         cfg = dict(agent_config.load_config() or {})
-    except Exception:  # noqa: BLE001 — Chudcode still receives explicit settings
+    except Exception:  # noqa: BLE001 — OMP still receives explicit settings
         cfg = {}
+    harness_role = role_models.mission_role_key(role, cfg)
 
     existing = context_pack.get("role_model")
     row = dict(existing) if isinstance(existing, dict) else {}
     assignment = None
     if not (row.get("provider") and row.get("model")):
         try:
-            assignment = role_models.resolve_for_node(role, context_pack, cfg=cfg)
-            if assignment is None:
-                assignment = role_models.resolve_role_model(
-                    harness_role,
-                    cfg,
-                    task_class=str(task_class) if task_class else None,
-                    node_depth=depth,
-                    risk=str(risk) if risk else None,
-                )
+            assignment = role_models.resolve_role_model(harness_role, cfg)
+        except role_models.RoleModelError:
+            raise
         except Exception:  # noqa: BLE001 — use session/injected identifiers
             assignment = None
 
@@ -246,17 +210,15 @@ def _resolve_role_settings(
             row["provider"] = str(assignment.provider)
         if getattr(assignment, "model", None):
             row["model"] = str(assignment.model)
-    if not row.get("provider"):
-        row["provider"] = injected_provider or str(cfg.get("provider") or "")
-    if not row.get("model"):
-        row["model"] = injected_model or str(cfg.get("model") or "")
+    if (assignment and assignment.is_session_default) or row.get("mode") == "default":
+        row.pop("provider", None)
+        row.pop("model", None)
+    if not (assignment and assignment.is_session_default) and row.get("mode") != "default":
+        if not row.get("provider"):
+            row["provider"] = injected_provider or str(cfg.get("provider") or "")
+        if not row.get("model"):
+            row["model"] = injected_model or str(cfg.get("model") or "")
 
-    min_rank = role_models.min_rank_for_difficulty(
-        task_class=str(task_class) if task_class else None,
-        node_depth=depth,
-        risk=str(risk) if risk else None,
-    )
-    row["min_rank"] = min_rank
     if row.get("provider"):
         row["cost_tier"] = role_models.cost_tier_for(
             str(row["provider"]), str(row.get("model") or "")
@@ -266,19 +228,9 @@ def _resolve_role_settings(
         effort = getattr(injected, "reasoning_effort", None)
     if effort is None:
         try:
-            effort = role_models.resolve_role_thinking(
-                harness_role,
-                cfg,
-                task_class=str(task_class) if task_class else None,
-                node_depth=depth,
-                risk=str(risk) if risk else None,
-                min_rank=min_rank,
-                rank=getattr(assignment, "rank", None),
-            )
+            effort = role_models.resolve_role_thinking(harness_role, cfg)
         except Exception:  # noqa: BLE001
             effort = None
-    if context_pack.get("retry_cheap"):
-        effort = "low"
     if effort is None:
         effort = getattr(injected, "reasoning_effort", None) or cfg.get(
             "reasoning_effort"
@@ -317,13 +269,13 @@ def _default_agent_fn(
     mission_dispatch=None,
     provider=None,
 ) -> Any:
-    """Run one DAG node through the shared Chudcode role-turn service.
+    """Run one DAG node through the shared OMP role-turn service.
 
     A node is a persistent child lane keyed by its parent session/run and node
     identity.  Only an explicitly offline node may reuse the deterministic local
     provider loop; an injected legacy provider is ignored for online execution.
     """
-    from services.agent.chudcode_roles import run_role_turn  # noqa: PLC0415
+    from services.agent.omp_roles import run_role_turn  # noqa: PLC0415
     from services.agent.tool_budget import (  # noqa: PLC0415
         completion_cap_for_subagent,
     )
@@ -400,6 +352,10 @@ def _default_agent_fn(
         injected=provider,
         ledger=ledger,
     )
+    # These are dispatcher-resolved child identifiers, not inherited parent defaults.
+    for key in ("provider", "model"):
+        if options["settings"].get(key):
+            options[key] = options["settings"][key]
     if offline and provider is not None:
         options["offline_provider"] = provider
 
@@ -451,8 +407,8 @@ class _RoleTurnAgentResult:
             "run_id",
             "session_id",
             "parent_id",
-            "chudcode_session_id",
-            "chudcode_session_file",
+            "omp_session_id",
+            "omp_session_file",
             "usage",
             "cancelled",
             "offline",
@@ -547,7 +503,7 @@ def run(
     # discipline elsewhere in this pipeline.
     role_card = _resolve_role_card(node)
     if role_card is not None:
-        # Chudcode receives the role/tool scope in-band; never mutate the
+        # OMP receives the role/tool scope in-band; never mutate the
         # process-global registry around a concurrent node turn.
         context_pack = dict(context_pack)
         context_pack["role_id"] = role_card.id
@@ -592,7 +548,7 @@ def run(
     # Resolve agent callable.
     _agent_fn = agent_fn or _default_agent_fn
 
-    # Seed the Chudcode event sink + span context through the same callback used
+    # Seed the OMP event sink + span context through the same callback used
     # by DAG lifecycle events. A None sink is harmless.
     if emit is not None:
         context_pack = dict(context_pack)
@@ -743,7 +699,7 @@ def run(
     if adv_block:
         output_state["advisory"] = adv_block
 
-    # Every completed run-scoped node gets a one-shot Chudcode overseer audit.
+    # Every completed run-scoped node gets a one-shot OMP overseer audit.
     # The audit itself remains best-effort and cannot break node completion.
     if verdict == VERDICT_DONE:
         ov_out = _run_overseer_stage_exit(node, context_pack)
@@ -987,8 +943,8 @@ def _compact_agent_result(agent_result_dict: Any) -> Any:
         "run_id",
         "session_id",
         "parent_id",
-        "chudcode_session_id",
-        "chudcode_session_file",
+        "omp_session_id",
+        "omp_session_file",
     ):
         if k in agent_result_dict:
             out[k] = agent_result_dict[k]
@@ -1125,7 +1081,7 @@ def _run_advisory(node_type: str, doc_id: str | None, seq: int = 0) -> str:
 def _run_overseer_stage_exit(
     node: dict[str, Any], context_pack: dict[str, Any]
 ) -> dict | None:
-    """Run the one-shot Chudcode overseer audit for a completed node.
+    """Run the one-shot OMP overseer audit for a completed node.
 
     The run id is the persistence/checkpoint root; the node id becomes the audit
     lineage parent. A missing run id remains the only no-op case.
@@ -1250,7 +1206,6 @@ def _multi_domain_delegate_gate(
     # Explicit: if tags < 2 AND not a coordinating plan role, skip.
     plan_roles = {
         "orchestrator",
-        "department_manager",
         "layout_engineer",
         "planning",
     }

@@ -1,50 +1,41 @@
-THREAD — a ONE-OP helical thread cut on a cylindrical face. This is the easy way to
-thread a shaft or a bore: you do NOT build the helix + profile + sweep yourself (that
-manual chain is in helix.md). The `thread` feature does it all, with robustness built in.
+THREAD — one feature for a helical thread on a cylindrical face. Use refs.target_face
+for the shaft's outer cylinder or the bore wall, e.g. {"of":"face","surf":"cylindrical"}.
+Inspect matches first and narrow the selector when there are multiple cylinders.
 
-REQUIRED:
-  length      — the thread RUN in mm (how far the thread extends along the axis). Threads
-                start from the lower end of the target face and run `length` up the axis.
-  refs.target_face — the CYLINDRICAL face to thread. Address it in plain words:
-                {"of":"face","surf":"cylindrical"} (the round face). For external threads
-                this is the shaft's outer cylinder; for internal, the hole's bore.
+SIZE: give either params.size (ISO coarse e.g. "M8", metric fine e.g. "M8x1", or a
+supported Unified designation e.g. "1/4-20") OR both params.major_dia and params.pitch
+in mm. A string size takes precedence over custom dimensions; omit size for custom.
+In the GUI, Custom size chooses which fields are sent; it is not a substitute for the
+actual dimensions.
 
-SIZE (give ONE of these two):
-  size        — an ISO metric designation, e.g. "M8". Looks up the coarse pitch + major Ø
-                from the standard table (M1.6, M2, M2.5, M3, M4, M5, M6, M8, M10, M12, M14,
-                M16, M18, M20, M22, M24). This is the normal way.
-  major_dia + pitch — a CUSTOM thread: bare major diameter (mm) + pitch (mm per turn).
+RUN: omit length (or use a nonpositive value) to span from the start to the far end of
+the selected face. A positive length specifies the axial run in mm. By default the start
+is the lower face end; refs.from can select a start vertex, edge, face or datum, and
+params.flip:true reverses the run. The GUI's Full length control omits length when
+checked; when authoring ops, omit length rather than relying on full_length to override
+an explicit length. The real operation bounds the run to the body's axial extent.
 
 OPTIONAL params:
-  style       — "external" (default — a shaft, cuts a groove inward) or
-                "internal" (a bore/tapped hole, cuts outward into the wall).
-  starts      — number of thread starts (default 1). Multi-start multiplies the lead.
-  handedness  — "right" (default) or "left".
-  turns       — hard cap on swept turns (robustness; defaults to length/lead, max 30).
-  mode        — "cut" (default — REAL geometry, a helical V-groove) or
-                "cosmetic" (a lightweight representation; NO geometry change, always
-                succeeds with a warning. Use it for very fine/long threads, or when you
-                only need the callout, not the cut. Drawing-callout integration is a
-                follow-up — for now cosmetic just means "no geometry, don't fail").
+  style       "external" (default, shaft) or "internal" (bore).
+  starts      number of starts (default 1); lead = pitch × starts.
+  handedness  "right" (default) or "left".
+  form        "v" (default 60°), "acme", "trap", or "square".
+  mode        "cut" (default, real helical groove); "raised" (real fused ridge,
+              selected cylinder is the root diameter); or explicit "cosmetic"
+              (unchanged geometry with a warning, not a physical thread).
+  turns       optional positive cap on swept turns, default 24 when omitted or nonpositive.
+              The bounded run requires run/lead + 2 turns, including end extensions;
+              if that exceeds the cap, the operation is rejected, not shortened. Increase
+              the cap if appropriate rather than changing the requested thread.
 
-WHAT IT DOES (mode "cut"): looks up pitch + major Ø, derives the ISO pitch diameter
-(minor ≈ major − 1.0825·pitch), builds a helix on the target cylinder's axis at the pitch
-diameter, sweeps a SIMPLIFIED rounded ISO-60° thread profile along it, and BOOLEAN-CUTS
-the swept coil out of the body. External = a V-groove cut into the shaft; internal = cut
-into the bore wall.
+Real cut/raised geometry is constructed with a helical sweep and boolean. A failed real
+construction, invalid result, or insufficient turn cap is a visible rejected operation; it
+is not a successful plain-body thread. Do not silently change the requested length, pitch,
+or mode to cosmetic. Cosmetic is an intentional no-geometry choice, not a recovery from
+failure. params.preview:true (or draft:true) produces a provisional turned-band proxy,
+not a helical thread; omit it for the final operation and check the completed result.
 
-ROBUSTNESS (important — helical booleans are fragile in OCCT): the feature caps the turn
-count, uses a rounded (not razor-sharp) profile, and BRepCheck-validates the cut. If the
-real cut fails for ANY reason (OCCT throw, empty/invalid result), it DEGRADES GRACEFULLY:
-the body is left UNTHREADED (the plain cylinder) and a warning is reported — the part is
-NEVER broken. If you see "thread: real geometry failed … left the body unthreaded",
-reduce `length` or use a coarser pitch, or switch to mode:"cosmetic".
-
-TYPICAL USAGE — an M8 external thread on a Ø8 × 20 shaft:
-1. Build the shaft: cylinder radius 4, height 20 (a sketch+revolve or extrude also works).
-2. Thread it: type "thread", size "M8", length 18, target_face = the cylindrical face.
-
-Full op JSON (external M8):
+EXAMPLE — M8 external thread on a Ø8 × 20 shaft, 18 mm run:
 [
  {"op":"add_feature","feature":{"type":"cylinder","name":"Shaft",
   "params":{"radius":{"value":4,"expr":null},"height":{"value":20,"expr":null}}}},
@@ -52,21 +43,6 @@ Full op JSON (external M8):
   "params":{"size":"M8","length":{"value":18,"expr":null},"style":"external","mode":"cut"},
   "refs":{"target_face":{"of":"face","surf":"cylindrical"}}}}
 ]
-
-Internal (tapped hole) — first bore a hole, then thread the bore wall:
-[
- ... drill a Ø6.8 hole (the M8 tapping drill) into the part ...
- {"op":"add_feature","feature":{"type":"thread","name":"M8Tap",
-  "params":{"size":"M8","length":{"value":12,"expr":null},"style":"internal","mode":"cut"},
-  "refs":{"target_face":{"of":"face","surf":"cylindrical"}}}}
-]
-(For internal threads address the BORE's cylindrical face — if the part has several round
-faces, narrow the query, e.g. add "inner" or pick the smaller-radius round face.)
-
-COMMON MISTAKES:
-1. target_face must be CYLINDRICAL. A flat end-cap or a box face errors clearly. Use
-   {"of":"face","surf":"cylindrical"}.
-2. `length` is the thread RUN, not the part length — it can be shorter than the shaft.
-3. For a custom thread give BOTH major_dia AND pitch; for a standard one give just `size`.
-4. A failed cut is NOT an error — it warns and leaves the plain cylinder. That is by
-   design. To force success without geometry, use mode:"cosmetic".
+For a tapped bore, first make the appropriate tap-drill hole, select its cylindrical
+wall, and use style:"internal". For a custom thread omit size and supply positive
+major_dia and pitch. A planar target is not a valid real-thread face.

@@ -136,16 +136,16 @@ small analog schematic. Reply with EXACTLY ONE ```json block and nothing else.
 
 The json shape (every field required):
 {
-  "components": [ {"ref": "V1", "libid": "Simulation_SPICE:V_source", "value": "5"}, ... ],
-  "nets": { "NETNAME": [ {"ref": "V1", "pin": "+"}, {"ref": "R1", "pin": "1"} ], ... },
+  "components": [ {"ref": "V1", "libid": "Simulation_SPICE:VDC", "value": "5"}, ... ],
+  "nets": { "NETNAME": [ {"ref": "V1", "pin": "1"}, {"ref": "R1", "pin": "1"} ], ... },
   "study": { "analysis": "op", "params": {}, "expect": {"probe": "V(VMID)", "value": 2.5, "tol": 0.05} }
 }
 
 Rules you MUST follow:
 - Use ONLY libids from the CATALOG below (copy them exactly). Give every component a unique ref.
-- Reference pins by the NUMBER shown for that libid in the catalog (a resistor has "1"/"2"; the
-  voltage source has "+"/"-").
-- Every net lists the pins that connect to it BY NAME; use "GND" for ground and a rail name like
+- Reference pins by the NUMBER shown for that libid in the catalog (a resistor and the
+  voltage source both have "1"/"2").
+- Every net lists the pins that connect to it; use "GND" for ground and a rail name like
   "VCC" / "+5V" for supplies. Every component pin should appear in exactly one net.
 - The study.analysis is one of: "op" (DC point), "ac" (frequency), "tran" (transient). Put the
   single most telling result in study.expect (probe is "V(NET)", value is the number you expect,
@@ -200,9 +200,10 @@ def _catalog_lines() -> list[str]:
     from services.ecad.library.starter import SYMBOLS  # STAYS: no ecad_library RPC
 
     wanted = [
-        "Simulation_SPICE:V_source", "Simulation_SPICE:I_source",
+        "Simulation_SPICE:VDC", "Simulation_SPICE:VSIN", "Simulation_SPICE:VPULSE",
+        "Simulation_SPICE:I_source",
         "Device:R", "Device:C", "Device:L", "Device:D", "Device:LED",
-        "Amplifier_Operational:OPAMP_dual", "Timer:NE555",
+        "Simulation_SPICE:OPAMP", "Timer:NE555D",
         "power:GND", "power:VCC", "power:+5V",
     ]
     lines: list[str] = []
@@ -210,9 +211,9 @@ def _catalog_lines() -> list[str]:
         sdef = SYMBOLS.get(libid)
         if not sdef:
             continue
-        pins = ", ".join(f"{p['number']}={p['name']}" if p['name'] not in ("~", p['number'])
+        pins = ", ".join(f"{p['number']}={p['name']}" if p.get('name') not in ("", "~", p['number'], None)
                          else f"{p['number']}"
-                         for p in sdef.get("pins", []) if p.get("unit", 1) == 1)
+                         for p in sdef.get("pins", []) if p.get("unit", 1) in (0, 1))
         desc = sdef.get("description", "")
         lines.append(f"  {libid}  pins[{pins}]  - {desc}")
     return lines
@@ -392,9 +393,9 @@ _DEFAULT_FOOTPRINTS = {
     "Device:Q_PNP": "Package_TO_SOT_SMD:SOT-23",
     "Device:NMOS": "Package_TO_SOT_SMD:SOT-23",
     "Device:PMOS": "Package_TO_SOT_SMD:SOT-23",
-    "Amplifier_Operational:OPAMP_dual": "Package_SO:SOIC-8",
-    "Amplifier_Operational:LM358": "Package_SO:SOIC-8",
-    "Timer:NE555": "Package_DIP:DIP-8",
+    "Amplifier_Operational:LM358": "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm",
+    "Timer:NE555P": "Package_DIP:DIP-8_W7.62mm",
+    "Timer:NE555D": "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm",
     "Regulator_Linear:AMS1117-3.3": "Package_TO_SOT_SMD:SOT-223",
     "Regulator_Linear:7805": "Package_TO_SOT_THT:TO-220-3",
     "MCU:Generic_QFP48": "Package_QFP:LQFP-48_7x7mm_P0.5mm",
@@ -444,6 +445,10 @@ def build_design(session: ecad_session.EcadSession, design: dict) -> dict:
         fp = c.get("footprint") or _DEFAULT_FOOTPRINTS.get(c["libid"])
         if fp:
             op["footprint"] = fp  # board-ready: update-from-sch can place a real footprint
+        fields = dict(c.get("fields") or {})
+        fields.update({key: value for key, value in c.items() if key.startswith("Sim.")})
+        if fields:
+            op["fields"] = fields
         # Persist a source's AC magnitude ONTO the schematic symbol so the netlist
         # (and therefore any later ecad_simulate('ac'), not just this design's own
         # self-check) has a real small-signal stimulus — otherwise an AC sweep of a
@@ -477,6 +482,10 @@ def build_design(session: ecad_session.EcadSession, design: dict) -> dict:
             if anchor is not None:
                 conn_ops.append({"op": "sch_add_power", "net": net_name,
                                  "pos": [anchor[0], anchor[1]], "symbol": net_name})
+    directives = design.get("spice_directives")
+    if directives:
+        conn_ops.append({"op": "sch_add_text", "pos": [0.0, -90.0],
+                         "text": directives, "size": 1.0})
     if conn_ops:
         ecad_session.apply_ops(session, session.revision, conn_ops)
         ops_applied += len(conn_ops)
@@ -576,7 +585,8 @@ def _ac_mag_for(design: dict) -> tuple[str | None, float]:
     mag = float(params.get("ac_mag", 1.0))
     if src is None:
         for c in design.get("components", []):
-            if c.get("ac_mag") is not None or c.get("libid", "").endswith("V_source"):
+            if (c.get("ac_mag") is not None or
+                    c.get("libid", "").startswith("Simulation_SPICE:V")):
                 src = c.get("ref")
                 mag = float(c.get("ac_mag", mag))
                 break

@@ -37,8 +37,8 @@ finding is never an artifact of a narrow definition:
     config.DEFAULT_ROLE_TOOLS (uncapped — roles.py trims to MAX_TOOLS_PER_ROLE per role,
     but a tool trimmed out of one role's slot is still advertised by another).
 
-Bindability follows the note in CATEGORY_PACKS["delegate"]: the corporate_*/coordinate_*
-surface is NOT MCP-registered — those are MissionDispatch bound methods resolved through
+Bindability follows the note in CATEGORY_PACKS["delegate"]: the coordinate_* surface
+is NOT MCP-registered — those are MissionDispatch bound methods resolved through
 MissionDispatch.resolve, a layer agent_turn._bind_tool never consults. Reading them out of
 the ``_handlers`` dict literal is what keeps this gate from repeating the false-negative
 that once deleted them from the pack.
@@ -173,9 +173,9 @@ NON_TOOL_MENTIONS: dict[str, tuple[str, tuple[str, ...]]] = {
         "engine.worker RPC method named in a host-facing worker_rpc error hint",
         ("services/agent/worker_rpc.py",),
     ),
-    "chudcode_compact": (
+    "omp_compact": (
         "private services-worker RPC method named in a session-command routing hint; "
-        "Chudcode owns the model-callable compact command",
+        "OMP owns the model-callable compact command",
         ("services/agent/worker_rpc.py",),
     ),
     "subscription_accounts": (
@@ -376,9 +376,8 @@ def all_strings(path: str) -> list[tuple[str, int, str | None]]:
 
     Two kinds of prose are excluded because they are provably NOT advertisements:
 
-    * the MODULE docstring — internal authoring notes (org_tools.py's header explains
-      why the family exists; profile_tools.py's names the tools it registers). Nothing
-      renders it into a prompt.
+    * the MODULE docstring — internal authoring notes (profile_tools.py's names the
+      tools it registers). Nothing renders it into a prompt.
     * *owner* carries the tool name that owns a FUNCTION docstring, so a tool naming
       ITSELF in its own docstring is dropped by the caller. That mention is
       self-referential: if the tool is not advertised, its docstring is not rendered
@@ -406,7 +405,7 @@ def all_strings(path: str) -> list[tuple[str, int, str | None]]:
         if not (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
                 and isinstance(first.value.value, str)):
             continue
-        # `@mcp.tool(name="request_raise")` renames the tool; the decorator wins.
+        # `@mcp.tool(name="<tool>")` renames the tool; the decorator wins.
         tool_name = node.name
         for dec in node.decorator_list:
             if isinstance(dec, ast.Call):

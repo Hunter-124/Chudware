@@ -16,9 +16,8 @@ FEATURE TYPES (params shown with their defaults; required ref in []):
                    stiffens an edge / removes the sharp.
   sm_jog           params: length (20), offset (10), angle (<=90), radius, position, k_factor, flip
                    refs.edge. A Z-shaped two-bend step that offsets the wall by `offset`.
-  sm_flat_pattern  params/refs: none. REPLACES the running body with its developed flat blank
-                   (volume changes a few % — that IS the bend allowance, not an error). Export the
-                   folded part BEFORE this op if you want to keep both the part and the blank.
+  sm_flat_pattern  params/refs: none. REPLACES the running body with its developed flat blank.
+                   Save the folded part BEFORE this op if you want both folded and flat versions.
 
 INVOCATION (these features predate the cheatsheets — follow exactly):
   - One doc_apply_ops batch: refer to an earlier op as "$N" (its 0-based index). A SEPARATE batch
@@ -52,6 +51,19 @@ PHASE 2 — find the +X top-rim edge, then bend a 20mm wall up 90°. The top fac
  {"op":"add_feature","feature":{"type":"sm_edge_flange","name":"Wall","params":{"length":{"value":20,"expr":null},"angle":{"value":90,"expr":null}},"refs":{"edge":{"kind":"edge","centroid":[40,0,2],"axis":[0,1,0],"surf":"line","area_or_len":50,"hint_index":0}}}}
 ]
 (Append an sm_flat_pattern op {"op":"add_feature","feature":{"type":"sm_flat_pattern","name":"Flat","params":{}}} to unfold the blank.)
+
+RELIEF AND FLAT EXPORT
+  There is no dedicated sm_relief feature. Model a dimensioned relief with an editable
+  through-cut in the base or wall: create a closed relief sketch and extrude(mode:"cut",
+  end:"through_all"), or use a box with mode:"cut" as an editable rectangular notch.
+  Requery and inspect the cut and bends. Flat-pattern development refuses detected
+  partial-depth planar pockets rather than turning them into through-cuts; do not assume
+  every non-planar partial-depth cut across a bend is detected. Inspect the developed
+  result before manufacture.
+  Add sm_flat_pattern, then call export_flat_dxf(doc_id=..., path="blank.dxf", fmt="dxf")
+  or fmt="dwg"; OUTLINE, BEND and CUTS are separate layers. PDF is also supported without
+  layers. A missing flat pattern or a legacy display-only cache lacking flat metadata is
+  refused rather than silently rebuilt. Reopen the saved folded part to retain both states.
 
 3 common mistakes:
 1. sm_base_flange must come FIRST — every other sm_* op errors with "part is not sheet metal" until

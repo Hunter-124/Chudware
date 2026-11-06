@@ -3,16 +3,15 @@
 Only one guard lives here so far: the MCP tool catalog is a PROCESS-GLOBAL
 singleton (``services.mcp.tool_registry``), and several modules in this suite
 deliberately rebuild it — ``clear_catalog()`` for a controlled clean room, then
-``register_*_tools`` against a throwaway stub MCP (``test_org.py``,
-``test_roles.py``, ``test_tool_registry.py``). None of them restore it, so a
+``register_*_tools`` against a throwaway stub MCP (``test_roles.py``,
+``test_tool_registry.py``). A
 cleared or reshaped catalog leaks into every test that runs later.
 
 That leak is silent rather than loud: role tool loadouts are intersected with
 the live catalog, so a reshaped catalog reshapes an allow-set. Concretely,
-``test_router_dispatch.py::test_cleanup_request_runs_general_agent`` loses
-``plm_checkpoint`` from the general_agent loadout and the copilot's second tool
-call is denied — but only when it runs after ``test_org.py``. Restore the warm
-baseline at teardown so catalog contents are a suite invariant instead of a
+``test_router_dispatch.py::test_cleanup_request_runs_general_agent`` can lose
+``plm_checkpoint`` from the general_agent loadout after catalog mutations. Restore
+the warm baseline at teardown so catalog contents are a suite invariant instead of a
 function of alphabetical file ordering.
 """
 from __future__ import annotations

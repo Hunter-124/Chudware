@@ -8,7 +8,6 @@ goal: >
   when the ledger holds ≥1 feature event; the requirement-coverage checker
   additionally confirms full traceability.
 stage_scope: [decompose]
-playbook_default: null
 tool_allowlist:
   - tool: ledger_get
   - tool: ledger_note

@@ -265,6 +265,7 @@ SimResult simulate_setup(const Setup& setup, const ToolLibrary& tools,
         }
         res.cycle_time_s = total;
         res.stock_lineage_out = lineage_hash(st, toolpaths);
+        res.gouge_reason = "turning simulation is an axisymmetric radial profile; part-gouge is not modelled";
         return res;
     }
 
@@ -304,6 +305,11 @@ SimResult simulate_setup(const Setup& setup, const ToolLibrary& tools,
     HeightField part;
     bool has_part = !part_mesh.verts.empty();
     if (has_part) part = HeightField::from_mesh(part_mesh, res_mm, 0, bottom - 1e6);
+    // Which toolpath last lowered each cell (the one that set its final height), so a gouge
+    // can name the operation/tool. Only tracked when a part surface will be compared.
+    std::vector<int> cut_by;
+    if (has_part && opt.check_gouge) cut_by.assign((size_t)nx * ny, -1);
+    int tp_index = -1;
 
     // lower the field along every cutting move; flag rapids through stock
     int rapid_hits = 0;
@@ -341,6 +347,7 @@ SimResult simulate_setup(const Setup& setup, const ToolLibrary& tools,
     };
     int last_tool_frame = -999;
     for (const Toolpath& tp : toolpaths) {
+        ++tp_index;
         if (want_frames > 0 && tp.tool_number != last_tool_frame) {
             elapsed += setup.machine.tool_change_s;
             last_tool_frame = tp.tool_number;
@@ -375,7 +382,10 @@ SimResult simulate_setup(const Setup& setup, const ToolLibrary& tools,
                     if (d > r) continue;
                     double zt = a.z + (b.z - a.z) * t;  // tool tip Z at nearest pass
                     if (cutting) {
-                        if (zt < field.raw(i, j)) field.set_raw(i, j, zt);
+                        if (zt < field.raw(i, j)) {
+                            field.set_raw(i, j, zt);
+                            if (!cut_by.empty()) cut_by[(size_t)j * nx + i] = tp_index;
+                        }
                     } else if (rapid && opt.check_rapid) {
                         if (field.raw(i, j) > zt + 0.01) { ++rapid_hits; }
                     }
@@ -479,19 +489,52 @@ SimResult simulate_setup(const Setup& setup, const ToolLibrary& tools,
     if (holder_hits > 0) res.warnings.push_back("tool holder/shank collides with remaining stock");
 
     // gouge: remaining material below the part surface
-    if (has_part && opt.check_gouge) {
+    if (!has_part) {
+        res.gouge_reason = "no part mesh supplied";
+    } else if (!opt.check_gouge) {
+        res.gouge_reason = "check_gouge disabled";
+    } else {
         int gouges = 0;
         double maxg = 0;
+        long compared = 0;
+        struct Agg { int cells = 0; double depth = 0, x = 0, y = 0, z = 0, pz = 0; };
+        std::vector<Agg> agg(toolpaths.size());
         for (int j = 0; j < ny; ++j)
             for (int i = 0; i < nx; ++i) {
                 double x = flo.x + i * res_mm, y = flo.y + j * res_mm;
                 double pz = part.height_at(x, y);
                 if (pz < bottom - 1e5) continue;  // outside the part footprint
+                ++compared;
                 double fz = field.raw(i, j);
-                if (fz < pz - opt.gouge_tol) { ++gouges; maxg = std::max(maxg, pz - fz); }
+                if (fz < pz - opt.gouge_tol) {
+                    ++gouges; maxg = std::max(maxg, pz - fz);
+                    int by = cut_by[(size_t)j * nx + i];
+                    if (by >= 0) {
+                        Agg& a = agg[(size_t)by];
+                        ++a.cells;
+                        if (pz - fz > a.depth) { a.depth = pz - fz; a.x = x; a.y = y; a.z = fz; a.pz = pz; }
+                    }
+                }
             }
         res.gouges = gouges;
         res.max_gouge_mm = maxg;
+        res.gouge_cells_compared = compared;
+        res.gouge_evaluated = compared > 0;
+        if (compared == 0)
+            res.gouge_reason = "part surface and stock grid share no cells (part mesh outside the stock footprint / frame mismatch)";
+        for (size_t k = 0; k < agg.size(); ++k)
+            if (agg[k].cells > 0) {
+                SimResult::GougeHit h;
+                h.op_id = toolpaths[k].op_id; h.tool_number = toolpaths[k].tool_number;
+                h.cells = agg[k].cells; h.max_depth_mm = agg[k].depth;
+                h.x = agg[k].x; h.y = agg[k].y; h.z = agg[k].z; h.part_z = agg[k].pz;
+                res.gouge_hits.push_back(std::move(h));
+            }
+        std::sort(res.gouge_hits.begin(), res.gouge_hits.end(),
+                  [](const SimResult::GougeHit& a, const SimResult::GougeHit& b) {
+                      return a.max_depth_mm > b.max_depth_mm;
+                  });
+        if (res.gouge_hits.size() > 20) res.gouge_hits.resize(20);
         if (gouges > 0) res.warnings.push_back("toolpath gouges below the part surface");
     }
 
@@ -522,6 +565,16 @@ json SimResult::to_json(bool include_field) const {
            {"gouges", gouges}, {"max_gouge_mm", max_gouge_mm}, {"rapid_collisions", rapid_collisions},
            {"holder_collisions", holder_collisions}, {"warnings", warnings},
            {"stock_lineage_in", stock_lineage_in}, {"stock_lineage_out", stock_lineage_out}};
+    j["gouge_evaluated"] = gouge_evaluated;
+    j["gouge_reason"] = !gouge_evaluated && gouge_reason.empty()
+        ? (error.empty() ? "gouge comparison was not performed" : error) : gouge_reason;
+    j["gouge_cells_compared"] = gouge_cells_compared;
+    j["gouge_hits"] = json::array();
+    for (const auto& hit : gouge_hits) {
+        j["gouge_hits"].push_back(json{{"op_id", hit.op_id}, {"tool_number", hit.tool_number},
+            {"cells", hit.cells}, {"max_depth_mm", hit.max_depth_mm},
+            {"position_mm", json::array({hit.x, hit.y, hit.z})}, {"part_z_mm", hit.part_z}});
+    }
     if (include_field && remaining.nx() > 0) {
         json zs = json::array();
         for (int jj = 0; jj < remaining.ny(); ++jj)

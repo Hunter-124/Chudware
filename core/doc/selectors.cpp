@@ -429,11 +429,14 @@ std::optional<std::string> side_word(const std::optional<Eigen::Vector3d>& dir) 
     return v.y() > 0 ? "back" : "front";
 }
 
-// GSL Stage 1c (pragmatic W1) — a stable geometry-fingerprint id so the LLM can name a face/edge
-// once and refer back to it. It hashes the rounded shape + position (0.1 mm grid) + role, so two
-// IDENTICAL faces at different places get DIFFERENT ids (no collision), and the same face is the
-// same id across a rebuild that does not move it. (A downstream edit that MOVES the face yields a
-// new id — honest: a moved face is a new handle. The owner-scoped version is future work.)
+// GSL Stage 1c (pragmatic W1) — a geometry-fingerprint id so the LLM can name a face/edge
+// once and refer back to it within one revision. It hashes the rounded shape + position
+// (0.1 mm grid) + role (24 bits). An unchanged fingerprint retains its id; moving geometry
+// can change it. It is NOT a persistent identity and NOT guaranteed unique:
+// two faces whose fingerprints coincide (or a 24-bit hash collision) share one.
+// The format is persisted (face appearances, stored selectors,
+// drawing provenance), so it stays as is; resolve_geom_query reports every shared sid among
+// the matches it returns (QueryPicks::shared_sids) so a caller never binds one silently.
 std::string stable_sid(const TopoInfo& info) {
     auto q = [](double x) -> long long { return std::llround(x * 10.0); };  // 0.1 mm grid
     std::string k = info.kind + "|" + (info.surf ? *info.surf : std::string("null")) + "|" +
@@ -451,6 +454,8 @@ std::string stable_sid(const TopoInfo& info) {
 }
 
 }  // namespace
+
+std::string selector_sid(const TopoInfo& info) { return stable_sid(info); }
 
 nlohmann::json make_selector(const TopoInfo& info) {
     nlohmann::json sel;
@@ -609,8 +614,8 @@ std::string fmt4(double x) {
 
 }  // namespace
 
-ResolveResult resolve(const nlohmann::json& selector,
-                      const std::vector<TopoInfo>& candidates, double bbox_diag) {
+static ResolveResult resolve_impl(const nlohmann::json& selector,
+                                  const std::vector<TopoInfo>& candidates, double bbox_diag) {
     const double INF = std::numeric_limits<double>::infinity();
 
     // A slot value that is not a measured topology selector (a bare string, a predicate-only
@@ -644,13 +649,17 @@ ResolveResult resolve(const nlohmann::json& selector,
                              "name it with a geometry query ({\"of\":\"" + kind +
                              "\",\"side\":\"top\"}) or a query_geometry readback"};
 
-    // Owner-filtered set with fallback to all same-kind (only when owner is non-null).
+    // A missing owner cannot justify a normal-threshold cross-owner match. Describers
+    // without provenance also leave owners unknown; treat that case conservatively too.
     std::vector<const TopoInfo*> working;
+    bool owner_fallback = false;
     if (s_owner) {
         for (const TopoInfo* c : same_kind)
             if (c->owner == s_owner) working.push_back(c);
+        owner_fallback = working.empty();
     }
     if (working.empty()) working = same_kind;
+    const double accept_limit = owner_fallback ? kOwnerlessAccept : 0.35;
 
     // Step 2 — score, then sort by (score, hint_index) (the nearest-hint tiebreak).
     std::vector<std::pair<double, const TopoInfo*>> scored;
@@ -671,6 +680,11 @@ ResolveResult resolve(const nlohmann::json& selector,
 
     // Step 3 — accept/reject.
     double margin = second_score - best_score;
+    auto accept = [&](const TopoInfo* c, double score) {
+        ResolveResult r{c->index, score, second_score, std::nullopt};
+        r.owner_fallback = owner_fallback;
+        return r;
+    };
 
     // ── Exact-snapshot fast path (asm-fea F1) ────────────────────────────────────────
     // A selector minted from a live match (doc_query / resolve_pick carries the face's
@@ -697,14 +711,12 @@ ResolveResult resolve(const nlohmann::json& selector,
                 area_ok = std::fabs(m - sa) <=
                           1e-4 * std::max(std::max(std::fabs(sa), std::fabs(m)), 1.0);
             }
-            if (cdist <= 1e-3 && area_ok)
-                return ResolveResult{best_cand->index, best_score, second_score, std::nullopt};
+            if (cdist <= 1e-3 && area_ok && best_score < accept_limit)
+                return accept(best_cand, best_score);
         }
     }
 
-    if (best_score < 0.35 && margin > 0.05) {
-        return ResolveResult{best_cand->index, best_score, second_score, std::nullopt};
-    }
+    if (best_score < accept_limit && margin > 0.05) return accept(best_cand, best_score);
 
     // ── Signed-normal tie-break for opposite-facing parallel planes (Bug F5) ──────
     // The score's axis term is |s_ax · c_ax| — SIGN-AGNOSTIC — so two parallel planar
@@ -722,7 +734,7 @@ ResolveResult resolve(const nlohmann::json& selector,
     // contract / torture suite is preserved. A FEA fixture on a symmetric plate's
     // "bottom" now resolves instead of erroring.
     bool sel_has_axis = selector.contains("axis") && !selector.at("axis").is_null();
-    if (best_score < 0.35 && sel_has_axis && scored.size() > 1) {
+    if (best_score < accept_limit && sel_has_axis && scored.size() > 1) {
         const auto& sa = selector.at("axis");
         Eigen::Vector3d s_ax(sa.at(0).get<double>(), sa.at(1).get<double>(),
                              sa.at(2).get<double>());
@@ -762,7 +774,7 @@ ResolveResult resolve(const nlohmann::json& selector,
             // This inner safety gate ensures we never resolve a truly-ambiguous selector.
             if (pick && !axis_less && n_in_band >= 2 && best_align > 0.5 &&
                 best_align - second_align > 0.5) {
-                return ResolveResult{pick->index, best_score, second_score, std::nullopt};
+                return accept(pick, best_score);
             }
         }
     }
@@ -779,7 +791,7 @@ ResolveResult resolve(const nlohmann::json& selector,
     bool sel_has_area = selector.contains("area_or_len") &&
                         selector.at("area_or_len").is_number() &&
                         selector.at("area_or_len").get<double>() > 1e-9;
-    if (best_score < 0.35 && sel_has_area && scored.size() > 1) {
+    if (best_score < accept_limit && sel_has_area && scored.size() > 1) {
         const double sel_area = selector.at("area_or_len").get<double>();
         const TopoInfo* pick = nullptr;
         double best_rel = INF, second_rel = INF;
@@ -798,7 +810,7 @@ ResolveResult resolve(const nlohmann::json& selector,
         // apart) — so two equal-area faces never resolve here (they fall through to dangle).
         if (pick && !measure_less && n_in_band >= 2 && best_rel < 0.10 &&
             second_rel - best_rel > 0.10) {
-            return ResolveResult{pick->index, best_score, second_score, std::nullopt};
+            return accept(pick, best_score);
         }
     }
 
@@ -808,7 +820,7 @@ ResolveResult resolve(const nlohmann::json& selector,
     // larger face on the same plane. Its centroid and area moved, so the score dangles, yet
     // the plane, the signed outward normal and "at least as large" still name exactly one
     // face. Accept only a UNIQUE such candidate; two coplanar same-facing faces dangle.
-    if (kind == "face" && selector.value("surf", std::string()) == "plane" &&
+    if (!owner_fallback && kind == "face" && selector.value("surf", std::string()) == "plane" &&
         selector.contains("centroid") && selector.at("centroid").is_array() &&
         selector.at("centroid").size() == 3 && selector.contains("normal") &&
         selector.at("normal").is_array() && selector.at("normal").size() == 3) {
@@ -824,7 +836,7 @@ ResolveResult resolve(const nlohmann::json& selector,
             s_n.normalize();
             const TopoInfo* pick = nullptr;
             int n_match = 0;
-            for (const TopoInfo* c : same_kind) {
+            for (const TopoInfo* c : working) {
                 if (!c->surf || *c->surf != "plane" || !c->rep_dir) continue;
                 if (c->rep_dir->dot(s_n) < 1.0 - 1e-6) continue;
                 if (std::fabs((c->centroid - s_c).dot(s_n)) > plane_tol) continue;
@@ -832,19 +844,132 @@ ResolveResult resolve(const nlohmann::json& selector,
                 pick = c;
                 ++n_match;
             }
-            if (n_match == 1)
-                return ResolveResult{pick->index, best_score, second_score, std::nullopt};
+            if (n_match == 1) return accept(pick, best_score);
         }
     }
 
     // Dangling — explain why (match the Python reason strings).
     std::string reason;
-    if (best_score >= 0.35) {
-        reason = "best score " + fmt4(best_score) + " >= 0.35";
+    if (best_score >= accept_limit) {
+        reason = "best score " + fmt4(best_score) + " >= " + (owner_fallback ? "0.05" : "0.35");
+        if (owner_fallback)
+            reason += " — owner feature '" + *s_owner + "' has no matching candidate or owner "
+                      "provenance is unavailable; only a near-exact geometric match is permitted";
     } else {
         reason = "margin " + fmt4(margin) + " <= 0.05 (symmetric ambiguity)";
     }
-    return ResolveResult{std::nullopt, best_score, second_score, reason};
+    ResolveResult dangling{std::nullopt, best_score, second_score, reason};
+    dangling.owner_fallback = owner_fallback;
+    return dangling;
+}
+
+namespace {
+
+thread_local RebindScope* g_rebind_scope = nullptr;
+
+bool selector_centroid(const nlohmann::json& selector, Eigen::Vector3d& out) {
+    if (!selector.is_object()) return false;
+    const auto it = selector.find("centroid");
+    if (it == selector.end() || !it->is_array() || it->size() != 3) return false;
+    for (const auto& v : *it)
+        if (!v.is_number()) return false;
+    out = Eigen::Vector3d((*it)[0].get<double>(), (*it)[1].get<double>(), (*it)[2].get<double>());
+    return true;
+}
+
+}  // namespace
+
+RebindScope::RebindScope() : prev_(g_rebind_scope) { g_rebind_scope = this; }
+
+RebindScope::~RebindScope() { g_rebind_scope = prev_; }
+
+std::vector<RebindNote> RebindScope::take() {
+    std::vector<RebindNote> out;
+    out.swap(notes_);
+    return out;
+}
+
+void record_rebind(const nlohmann::json& selector, const TopoInfo& bound, double best_score,
+                   double second_score, bool owner_fallback) {
+    RebindScope* scope = g_rebind_scope;
+    if (!scope) return;
+    Eigen::Vector3d stored;
+    if (!selector_centroid(selector, stored)) return;
+    const double moved = (bound.centroid - stored).norm();
+    bool area_ok = true;  // no recorded measure -> the centroid alone decides
+    const auto mit = selector.find("area_or_len");
+    if (mit != selector.end() && mit->is_number() && bound.measure.has_value()) {
+        const double sa = mit->get<double>();
+        const double m = *bound.measure;
+        area_ok = std::fabs(m - sa) <= 1e-4 * std::max(std::max(std::fabs(sa), std::fabs(m)), 1.0);
+    }
+    if (moved <= 1e-3 && area_ok) return;  // reproduced the stored element — not a re-bind
+
+    RebindNote note;
+    note.kind = bound.kind;
+    const auto sit = selector.find("sid");
+    if (sit != selector.end() && sit->is_string()) {
+        note.ref = sit->get<std::string>();
+    } else {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "%s@[%.4g, %.4g, %.4g]", bound.kind.c_str(), stored.x(),
+                      stored.y(), stored.z());
+        note.ref = buf;
+    }
+    const auto oit = selector.find("owner_feature");
+    if (oit != selector.end() && oit->is_string()) note.owner = oit->get<std::string>();
+    note.best_score = best_score;
+    note.margin = second_score - best_score;
+    note.moved_mm = moved;
+    note.owner_fallback = owner_fallback;
+    // The same stored ref is resolved more than once per feature (validation, then build).
+    for (const RebindNote& have : scope->notes_)
+        if (have.ref == note.ref && have.kind == note.kind &&
+            std::fabs(have.moved_mm - note.moved_mm) < 1e-6)
+            return;
+    scope->notes_.push_back(std::move(note));
+}
+
+std::string format_rebind_notes(const std::vector<RebindNote>& notes) {
+    if (notes.empty()) return std::string();
+    constexpr std::size_t kShown = 4;
+    std::string out = std::to_string(notes.size()) +
+                      " reference(s) re-bound to changed geometry fingerprints: ";
+    for (std::size_t i = 0; i < notes.size() && i < kShown; ++i) {
+        const RebindNote& n = notes[i];
+        char buf[256];
+        if (std::isfinite(n.margin))
+            std::snprintf(buf, sizeof(buf), "%s %s moved %.3g mm (score %.3g, margin %.3g)",
+                          n.kind.c_str(), n.ref.c_str(), n.moved_mm, n.best_score, n.margin);
+        else
+            std::snprintf(buf, sizeof(buf), "%s %s moved %.3g mm (score %.3g, sole candidate)",
+                          n.kind.c_str(), n.ref.c_str(), n.moved_mm, n.best_score);
+        if (i) out += "; ";
+        out += buf;
+        if (n.owner_fallback && n.owner)
+            out += " — owner " + *n.owner + " was not confirmed among candidates";
+    }
+    if (notes.size() > kShown) out += "; (+" + std::to_string(notes.size() - kShown) + " more)";
+    out += ". Verify each still names the intended element.";
+    return out;
+}
+
+ResolveResult resolve(const nlohmann::json& selector, const std::vector<TopoInfo>& candidates,
+                      double bbox_diag) {
+    ResolveResult rr = resolve_impl(selector, candidates, bbox_diag);
+    if (!rr.index.has_value()) return rr;
+    Eigen::Vector3d stored;
+    const bool located = selector_centroid(selector, stored);
+    const auto kit = selector.find("kind");
+    const std::string kind = (kit != selector.end() && kit->is_string()) ? kit->get<std::string>()
+                                                                           : std::string();
+    for (const TopoInfo& c : candidates) {
+        if (c.index != *rr.index || c.kind != kind) continue;
+        if (located) rr.moved_mm = (c.centroid - stored).norm();
+        record_rebind(selector, c, rr.score, rr.second_score, rr.owner_fallback);
+        break;
+    }
+    return rr;
 }
 
 }  // namespace chudware::doc

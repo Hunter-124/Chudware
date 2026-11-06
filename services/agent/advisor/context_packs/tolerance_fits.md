@@ -15,7 +15,7 @@
 Values from fit_calc(); verify with `fit_calc(nominal, "H7/g6")`.
 
 ## IT grade reference (iso286.json it_grades)
-- IT6 ≈ 13 µm, IT7 ≈ 21 µm, IT8 ≈ 33 µm on Ø20 mm (closed-form formula)
+- IT6 = 13 µm, IT7 = 21 µm, IT8 = 33 µm on Ø20 mm (ISO 286-1 Table 1)
 
 ## Callout format
 - "Ø20 H7 (HOLE)" / "Ø20 g6 (SHAFT)" — always call out both sides

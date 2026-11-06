@@ -1,125 +1,239 @@
-"""services/browser/adapters/thk.py — THK source adapter.
+"""THK popfind site search and best-effort static CAD acquisition.
 
-THK (thk.com) makes linear motion guides, ball screws and actuators. Search
-is public; per-part CAD (STEP) downloads sit behind the user's own THK
-account. `acquire` lands the STEP model with provenance for part_search /
-part_place.
-
-NOTE: search() is verified against a saved real THK site-search page (the
-"popfind" widget renders result cards as <div class="_item"> with a
-<div class="_title"><a href=...> and a sibling <div class="_thumbnail">).
-The acquire() download markers remain a best-effort shape, not verified
-against a live logged-in THK session (the gated integration suite covers the real per-source
-integration tests behind an env flag).
+The search widget returns products as well as catalog and non-product pages.
+Its static CAD links are not verified against an authenticated live session.
 """
 from __future__ import annotations
 
+import html
+import os
 import re
+import tempfile
+from html.parser import HTMLParser
+from pathlib import Path
+from urllib.parse import urlsplit
 
+from services.browser.cad_validate import classify_artifact, validate_cad
+from services.browser.challenge import classify_challenge
 from .. import session as _session
-from . import download_path, is_login_wall, login_required, provenance_envelope, register
+from . import (abs_url, download_path, fail, is_login_wall, login_required,
+               make_hit, provenance_envelope, quote_query, register, source_failure)
+from ._retail import _price, _stock, card_image
 
 SITE = "thk"
 BASE_URL = "https://www.thk.com"
 SEARCH_URL_TMPL = BASE_URL + "/us/en/search/?q={query}"
 LICENSE_NOTE = (
-    "THK CAD models and datasheets are fetched under the user's own "
-    "authenticated THK session for their own engineering use and are not "
-    "redistributed. This adapter downloads only under the user's own "
-    "authenticated THK session. See contracts/license_debt.md."
+    "THK CAD models are fetched through the user's own browser session "
+    "for engineering use and are not redistributed. Some downloads may "
+    "require authorization. See contracts/license_debt.md."
 )
 
-_LOGIN_WALL_MARKERS = ('Log in to THK', 'id="loginForm"', 'class="login-form"',
-                       'Please sign in to download')
-# THK site search is served by the "popfind" widget: results live in
-# <div class="_item"> cards, each with a <div class="_title"><a href=...>Title</a>.
-# Hrefs are already absolute https URLs; the thumbnail sits in a sibling
-# <div class="_thumbnail"><a><img src=...>.
-_ITEM_SPLIT_RE = re.compile(r'<div class="_item"', re.IGNORECASE)
+_LOGIN_WALL_MARKERS = ('id="loginForm"', 'class="login-form"', 'Please sign in to download')
 _TITLE_RE = re.compile(
-    r'<div class="_title">\s*<a[^>]+href="(?P<href>https?://[^"]+)"[^>]*>(?P<title>.*?)</a>',
+    r'<div\b(?=[^>]*\bclass\s*=\s*["\'][^"\']*\b_title\b[^"\']*["\'])[^>]*>'
+    r'\s*<a\b[^>]*\bhref\s*=\s*["\'](?P<href>[^"\']+)["\'][^>]*>(?P<title>.*?)</a>',
     re.IGNORECASE | re.DOTALL)
-_THUMB_RE = re.compile(r'<div class="_thumbnail">.*?<img[^>]+src="(?P<src>[^"]+)"',
-                       re.IGNORECASE | re.DOTALL)
-_MFR_RE = re.compile(r'<span[^>]*class="[^"]*manufacturer[^"]*"[^>]*>(?P<mfr>[^<]+)</span>',
-                     re.IGNORECASE)
-# Best-effort: a product page's native CAD download link (STEP model or zip).
+_THUMB_RE = re.compile(
+    r'<div\b(?=[^>]*\bclass\s*=\s*["\'][^"\']*\b_thumbnail\b[^"\']*["\'])'
+    r'[^>]*>(?P<body>.*?)</div>', re.IGNORECASE | re.DOTALL)
 _DOWNLOAD_RE = re.compile(
-    r'href="(?P<href>[^"]+\.(?:step|stp|zip)(?:\?[^"]*)?)"', re.IGNORECASE)
+    r'\bhref\s*=\s*["\'](?P<href>[^"\']+\.(?:step|stp|iges|igs|stl|zip)'
+    r'(?:[?#][^"\']*)?)["\']', re.IGNORECASE)
+_MFR_RE = re.compile(r'<span[^>]*class=["\'][^"\']*manufacturer[^"\']*["\'][^>]*>'
+                     r'(?P<mfr>[^<]+)</span>', re.IGNORECASE)
 
 
-def _strip_tags(text: str) -> str:
-    return re.sub(r"<[^>]+>", "", text).strip()
+class _Cards(HTMLParser):
+    """Keep each popfind item bounded so footer data cannot leak into the last hit."""
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self.cards: list[str] = []
+        self.current: list[str] = []
+        self.depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        if not self.depth:
+            classes = dict(attrs).get("class") or ""
+            if tag != "div" or "_item" not in classes.split():
+                return
+        if tag == "div":
+            self.depth += 1
+        self.current.append(self.get_starttag_text())
+
+    def handle_startendtag(self, tag, attrs):
+        if self.depth:
+            self.current.append(self.get_starttag_text())
+
+    def handle_endtag(self, tag):
+        if not self.depth:
+            return
+        self.current.append(f"</{tag}>")
+        if tag == "div":
+            self.depth -= 1
+            if not self.depth:
+                self.cards.append("".join(self.current))
+                self.current = []
+
+    def handle_data(self, data):
+        if self.depth:
+            self.current.append(data)
+
+    def handle_entityref(self, name):
+        if self.depth:
+            self.current.append(f"&{name};")
+
+    def handle_charref(self, name):
+        if self.depth:
+            self.current.append(f"&#{name};")
+
+
+def _attribute(card: str, name: str) -> str | None:
+    match = re.search(r'\bdata-' + re.escape(name) + r'\s*=\s*["\']([^"\']+)["\']', card, re.I)
+    return html.unescape(match.group(1)).strip() or None if match else None
+
+
+def _part_number(card: str) -> str | None:
+    value = _attribute(card, "sku") or _attribute(card, "part-number")
+    if value:
+        return value
+    text = html.unescape(re.sub(r"<[^>]+>", " ", card))
+    match = re.search(r'\b(?:sku|part\s*(?:number|no\.?))\s*[:#]\s*'
+                      r'([a-z0-9][a-z0-9._/-]*)', text, re.I)
+    return match.group(1) if match else None
+
+
+def _kind(url: str, sku: str | None, mpn: str | None) -> str:
+    path = urlsplit(url).path.lower()
+    if path.endswith(".pdf"):
+        return "document"
+    if sku or mpn or "/product/" in path:
+        return "product"
+    if "/products/" not in path:
+        return "page"
+    parts = [part for part in path.split("/products/", 1)[1].split("/") if part]
+    if parts and parts[0] in {"search", "faq", "information", "tools"}:
+        return "page"
+    return "category" if len(parts) <= 1 else "series"
+
+
+def _wall(content: str, url: str, op: str) -> dict | None:
+    challenge = classify_challenge(content, url)
+    if challenge == "captcha":
+        return fail(SITE, op, "captcha", "THK returned a browser challenge.", url=url)
+    if challenge == "2fa" or is_login_wall(content, _LOGIN_WALL_MARKERS):
+        return source_failure(SITE, op, login_required(SITE, url), url=url)
+    if re.search(r'<(?:title|h1)[^>]*>\s*(?:access denied|request blocked)\b', content, re.I):
+        return fail(SITE, op, "blocked", "THK blocked the request.", url=url)
+    return None
 
 
 class ThkAdapter:
     key = SITE
+    result_kinds = ("product", "series", "category", "page", "document")
 
     def search(self, query: str) -> list[dict]:
-        url = SEARCH_URL_TMPL.format(query=query.replace(" ", "+"))
+        url = SEARCH_URL_TMPL.format(query=quote_query(query))
         result = _session.browser_fetch(url, SITE)
         if not result.get("ok"):
-            return [result]
-        content = result.get("content", "")
-        if is_login_wall(content, _LOGIN_WALL_MARKERS):
-            return [login_required(SITE, url)]
+            return [source_failure(SITE, "search", result, url=url)]
+        content = result.get("content") or ""
+        page_url = result.get("final_url") or url
+        wall = _wall(content, page_url, "search")
+        if wall:
+            return [wall]
+        parser = _Cards()
+        parser.feed(content)
+        cards = parser.cards
         hits = []
-        # THK search results are popfind "_item" cards; split on them and pull
-        # the title anchor (absolute href) + optional thumbnail from each card.
-        for card in _ITEM_SPLIT_RE.split(content)[1:]:
-            tm = _TITLE_RE.search(card)
-            if not tm:
+        for card in cards:
+            match = _TITLE_RE.search(card)
+            if not match:
                 continue
-            title = _strip_tags(tm.group("title"))
-            if not title:
+            title = html.unescape(re.sub(r"<[^>]+>", "", match.group("title"))).strip()
+            product_url = abs_url(page_url, html.unescape(match.group("href")))
+            if not title or not product_url:
                 continue
-            hit = {
-                "title": title,
-                "url": tm.group("href"),
-                "site": SITE,
-                "manufacturer": "THK",
-            }
+            sku = _part_number(card)
+            mpn = _attribute(card, "mpn")
             thumb = _THUMB_RE.search(card)
-            if thumb:
-                hit["thumbnail"] = thumb.group("src")
-            hits.append(hit)
-        return hits
+            hits.append(make_hit(
+                SITE, title=title, url=product_url, kind=_kind(product_url, sku, mpn),
+                sku=sku, mpn=mpn, manufacturer="THK",
+                price=_price(_attribute(card, "price")), currency=_attribute(card, "currency"),
+                stock=_stock(_attribute(card, "stock")), material=_attribute(card, "material"),
+                thumbnail=card_image(thumb.group("body"), page_url) if thumb else None,
+            ))
+        if hits:
+            return hits
+        if not cards and re.search(r'class\s*=\s*["\'][^"\']*\b_nohits\b', content, re.I):
+            return []
+        return [fail(SITE, "search", "parse_failed",
+                     "THK search results were not present in the rendered widget.", url=url)]
 
     def acquire(self, result: dict) -> dict:
-        url = result.get("url", "")
+        url = abs_url(BASE_URL, result.get("url"))
         if not url:
-            return {"ok": False, "reason": "bad_result", "hint": "result has no 'url'"}
-
+            return fail(SITE, "acquire", "not_found", "Result has no valid product URL.")
+        if result.get("kind") in {"series", "category", "page", "document"}:
+            return fail(SITE, "acquire", "unsupported",
+                        "Select a specific THK product configuration before downloading CAD.", url=url)
         page = _session.browser_fetch(url, SITE)
         if not page.get("ok"):
-            return page
-        content = page.get("content", "")
-        if is_login_wall(content, _LOGIN_WALL_MARKERS):
-            return login_required(SITE, url)
-
-        match = _DOWNLOAD_RE.search(content)
-        if not match:
-            return {"ok": False, "reason": "no_download_link",
-                    "hint": "could not find a STEP/native CAD download link on the product page"}
-        download_url = match.group("href")
-        if download_url.startswith("/"):
-            download_url = BASE_URL + download_url
-
-        dest, refusal = download_path(SITE, download_url, default="download.step")
+            return source_failure(SITE, "acquire", page, url=url)
+        content = page.get("content") or ""
+        page_url = page.get("final_url") or url
+        wall = _wall(content, page_url, "acquire")
+        if wall:
+            return wall
+        links = list(dict.fromkeys(
+            link for m in _DOWNLOAD_RE.finditer(content)
+            if (link := abs_url(page_url, html.unescape(m.group("href"))))
+        ))
+        raw_selected = result.get("download_url")
+        selected = abs_url(page_url, raw_selected)
+        if raw_selected and (not selected or selected not in links):
+            return fail(SITE, "acquire", "not_found", "The selected CAD link is not on this page.", url=url)
+        requested = (result.get("requested_format") or "").lower()
+        requested = {"stp": "step", "igs": "iges"}.get(requested, requested)
+        if not selected:
+            if len(links) != 1:
+                return fail(SITE, "acquire", "unsupported",
+                            "Choose a specific CAD link; the page does not provide "
+                            "one unambiguous link.", url=url)
+            selected = links[0]
+        suffix = Path(urlsplit(selected).path).suffix.lower().lstrip(".")
+        file_format = {"stp": "step", "igs": "iges"}.get(suffix, suffix)
+        if requested and file_format not in {requested, "zip"}:
+            return fail(SITE, "acquire", "unsupported", "The selected link is not the requested format.", url=url)
+        dest, refusal = download_path(SITE, selected, default="download.step")
         if refusal is not None:
-            return refusal
-        outcome = _session.browser_download(download_url, SITE, dest)
-        if not outcome.get("ok"):
-            return outcome
-
+            return source_failure(SITE, "acquire", refusal, url=selected)
+        try:
+            with tempfile.TemporaryDirectory(dir=dest.parent, prefix=".cad-") as directory:
+                staged = Path(directory) / dest.name
+                outcome = _session.browser_download(selected, SITE, staged)
+                if not outcome.get("ok"):
+                    return source_failure(SITE, "acquire", outcome, url=selected)
+                checked = validate_cad(staged, requested_format=requested or None)
+                archive = staged.suffix.lower() == ".zip"
+                classified = classify_artifact(staged, kind="archive") if archive else checked
+                if not classified["ok"] or (requested and not checked["ok"]):
+                    return fail(SITE, "acquire", "parse_failed",
+                                "Downloaded file is not valid requested CAD: " +
+                                (classified.get("reason") or checked.get("reason", "")), url=selected)
+                os.replace(staged, dest)
+        except OSError as exc:
+            return fail(SITE, "acquire", "transport_failed", str(exc), url=selected)
         mfr_match = _MFR_RE.search(content)
         return provenance_envelope(
-            source_url=url,
-            session_profile_used=outcome.get("session_profile_used", SITE),
-            license_note=LICENSE_NOTE,
-            artifact_path=outcome["dest"],
+            source_url=url, session_profile_used=outcome.get("session_profile_used", SITE),
+            license_note=LICENSE_NOTE, artifact_path=str(dest),
+            artifact_kind="archive" if archive else "cad",
+            format="zip" if archive else checked["format"],
             title=result.get("title", ""),
-            manufacturer=mfr_match.group("mfr").strip() if mfr_match else result.get("manufacturer"),
+            manufacturer=(html.unescape(mfr_match.group("mfr")).strip() if mfr_match
+                          else result.get("manufacturer") or "THK"),
         )
 
 

@@ -93,7 +93,9 @@ def _make_record(nema_no: int, body_mm: float, bolt_spacing_mm: float,
     return {
         "part_id":      part_id,
         "domain":       _DOMAIN,
-        "title":        f"{title} {text}",
+        "title":        f"NEMA {nema_no} Stepper Motor {body_mm:g}×{body_mm:g}×{length_mm} mm, {step_deg:g}°",
+        "family":       f"NEMA {nema_no} Stepper Motor",
+        "aliases":      [f"{title} {text}"],
         "standard":     f"NEMA{nema_no}",
         "designation":  designation,
         "params":       params,
@@ -135,7 +137,8 @@ class StepperMotorsAdapter:
         if not norm:
             return recs
         return [r for r in recs
-                if norm in r["title"].lower() or norm in r["designation"].lower()]
+                if norm in r["title"].lower() or norm in r["designation"].lower()
+                or any(norm in alias.lower() for alias in r["aliases"])]
 
     def get(self, part_id: str) -> dict | None:
         for rec in self.iter_records():

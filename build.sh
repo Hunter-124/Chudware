@@ -32,7 +32,7 @@
 #                          host/build-wasm/app/ (override with CHUDWARE_WEB_APP).
 #                          Requires emsdk (~/.emsdk). Linux-only (GNU sed / sha1sum).
 #    ./build.sh stage      Deploy libchudware, its optional lib3mf/advisor runtime,
-#                          chudware-hostd and (when built) the polymesh CLI from
+#                          chudware-hostd, its shape-build worker and (when built) polymesh from
 #                          core/build-occt-$PLATFORM_SUFFIX/bin (falls back to the slim
 #                          core/build-$PLATFORM_SUFFIX tree with a warning) into
 #                          services/dist/Chudware/ — the dist dir core_bridge/daemon_bridge
@@ -93,6 +93,7 @@ case "$(uname -s)" in
         ;;
 esac
 LIBCHUDWARE="libchudware.$SHLIB_EXT"
+SHAPE_BUILD_WORKER="chudware-shape-build-worker"
 HOST_BUILD="$ROOT/host/build-$PLATFORM_SUFFIX"
 CORE_OCCT_BUILD="$ROOT/core/build-occt-$PLATFORM_SUFFIX"
 CORE_SLIM_BUILD="$ROOT/core/build-$PLATFORM_SUFFIX"
@@ -261,7 +262,7 @@ build_core() {
         [ -f "$tree/build.ninja" ] || continue
         reconfigure_core_tree "$tree" || rc=$?
         echo "[build] core engine -> ${tree#"$ROOT"/}/bin/$LIBCHUDWARE (consumed tree)"
-        ninja -C "$tree" "bin/$LIBCHUDWARE" || rc=$?
+        cmake --build "$tree" --target "bin/$LIBCHUDWARE" || rc=$?
         # ...and the DAEMON from the same tree. chudware-hostd is a separate binary
         # carrying core/hostd/*, so a core-only build left it untouched: on 2026-07-30
         # a user hit duplicate "AI: sports_bike"/"sports_bike2" tabs against a hostd
@@ -276,7 +277,7 @@ build_core() {
         case "$tlist" in
             *"bin/chudware-hostd:"*)
                 echo "[build] core daemon -> ${tree#"$ROOT"/}/bin/chudware-hostd"
-                ninja -C "$tree" bin/chudware-hostd || rc=$?
+                cmake --build "$tree" --target bin/chudware-hostd || rc=$?
                 ;;
         esac
         # ...and the Polyhedral-FEA CLI (check|mesh|solve|diag|render), staged into the
@@ -285,7 +286,7 @@ build_core() {
         case "$tlist" in
             *"bin/polymesh:"*)
                 echo "[build] polymesh CLI -> ${tree#"$ROOT"/}/bin/polymesh"
-                ninja -C "$tree" bin/polymesh || rc=$?
+                cmake --build "$tree" --target bin/polymesh || rc=$?
                 ;;
         esac
         built=1
@@ -317,7 +318,7 @@ build_app()  {
                                        -DCMAKE_PREFIX_PATH="$BREW_PREFIX")
     cmake -S "$ROOT/host" -B "$HOST_BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
         ${extra[@]+"${extra[@]}"}
-    ninja -C "$HOST_BUILD" Chudware
+    cmake --build "$HOST_BUILD" --target Chudware
     # Host dlopens libchudware next to the executable (cpp_core resolve tier 3). Keep it
     # in sync with the OCCT engine so core fixes (e.g. extrude flip) actually reach the GUI.
     stage_libchudware_next_to_host
@@ -584,6 +585,16 @@ stage_libchudware_next_to_host() {
     fi
     local dst_dir="$HOST_BUILD/bin"
     if [ -d "$dst_dir" ]; then
+        local worker="$(dirname "$src")/$SHAPE_BUILD_WORKER"
+        if [ ! -s "$worker" ] || [ ! -x "$worker" ]; then
+            echo "[stage] ERROR: executable $SHAPE_BUILD_WORKER missing beside $src"
+            return 1
+        fi
+        local worker_tmp="$dst_dir/.$SHAPE_BUILD_WORKER.staging.$$"
+        cp "$worker" "$worker_tmp"
+        chmod 755 "$worker_tmp"
+        mv -f "$worker_tmp" "$dst_dir/$SHAPE_BUILD_WORKER"
+        echo "[stage] $SHAPE_BUILD_WORKER -> $dst_dir/"
         local tmp="$dst_dir/.$LIBCHUDWARE.staging.$$"
         cp "$src" "$tmp"
         mv -f "$tmp" "$dst_dir/$LIBCHUDWARE"
@@ -595,12 +606,11 @@ stage_libchudware_next_to_host() {
     fi
 }
 
-# Stage the engine + hostd daemon into services/dist/Chudware (the $CHUDWARE_DIST
-# dir that core_bridge's _lib_candidates and daemon_bridge's resolve_hostd_bin
-# try FIRST). Every file is deployed copy-to-temp + atomic `mv` in the target
-# dir — NEVER `cp` over a live in-use image (SIGBUS in the mmap'ed
-# process; see docs/reference/HOSTD.md "Installer integration" → Upgrades). The
-# running daemon notices the mtime flip and self-drains; MCP engines reload on respawn.
+# Stage the matched native runtime into services/dist/Chudware ($CHUDWARE_DIST when
+# explicitly selected). Resolvers may instead use an explicit or build-tree path.
+# Each file uses copy-to-temp + atomic rename, never overwriting a live mmap image.
+# A watching daemon can soft-drain after replacement; this does not migrate unsaved
+# documents or holds. Do not stage while preserving current sessions is required.
 stage_dist() {
     local src=""
     if [ -f "$CORE_OCCT_BUILD/bin/$LIBCHUDWARE" ]; then
@@ -648,12 +658,18 @@ stage_dist() {
             return 1
         fi
     done
+    if [ ! -s "$src/$SHAPE_BUILD_WORKER" ] || [ ! -x "$src/$SHAPE_BUILD_WORKER" ]; then
+        echo "[stage] ERROR: executable $SHAPE_BUILD_WORKER missing from $src"
+        echo "[stage]        refusing to stage an engine without its geometry worker"
+        return 1
+    fi
     # polymesh rides along when present: the MCP polymesh_cli lane resolves it beside
     # whichever chudware-hostd is served, and dist/ is first in that search order.
-    for f in "$LIBCHUDWARE" "lib3mf.$SHLIB_EXT" chudware-hostd polymesh; do
+    for f in "$SHAPE_BUILD_WORKER" "$LIBCHUDWARE" "lib3mf.$SHLIB_EXT" chudware-hostd polymesh; do
         [ -e "$src/$f" ] || continue
         tmp="$dst/.$f.staging.$$"
         cp "$src/$f" "$tmp"
+        if [ "$f" = "$SHAPE_BUILD_WORKER" ]; then chmod 755 "$tmp"; fi
         mv -f "$tmp" "$dst/$f"      # atomic rename: safe under a live engine
         staged=$((staged + 1))
         echo "[stage] $f -> $dst/"

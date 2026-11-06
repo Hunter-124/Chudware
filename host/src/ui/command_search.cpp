@@ -8,14 +8,17 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "imgui.h"
 
+#include "../app_commands.h"
 #include "../core/app_state.h"
 #include "../ui_theme.h"
 #include "icons.h"
 #include "ribbon_def.h"
+#include "widgets/kit.h"
 #include "settings_modal.h"
 
 namespace ui {
@@ -24,6 +27,7 @@ namespace {
 
 static char s_buf[256]      = {};
 static bool s_wantFocus     = false;
+static const char* s_unavailableCmd = nullptr;  // points into the static ribbon table
 
 // Case-insensitive substring search. Returns true when needle is empty (matches everything).
 static bool icontains(const char* hay, const char* needle) {
@@ -49,15 +53,17 @@ void drawCommandSearch(AppState& st) {
     if (st.showCommandSearch && !s_wasShown) {
         s_buf[0]    = '\0';
         s_wantFocus = true;
+        s_unavailableCmd = nullptr;
     }
     s_wasShown = st.showCommandSearch;
     if (!st.showCommandSearch) return;
+    const CommandContext context = commandContext(st);
 
     // ---- window geometry ----
     ImGuiViewport* vp   = ImGui::GetMainViewport();
     const float    sc   = ui::uiScale;
-    const float    popW = 560.0f * sc;
-    const float    popH = 460.0f * sc;
+    const float    popW = std::max(1.0f, std::min(560.0f * sc, vp->WorkSize.x));
+    const float    popH = std::max(1.0f, std::min(460.0f * sc, vp->WorkSize.y));
     // Position only on appear so the window is movable after that (ImGuiCond_Always would snap
     // it back to center every frame, defeating the movable requirement).
     ImGui::SetNextWindowSize(ImVec2(popW, popH), ImGuiCond_Appearing);
@@ -98,6 +104,7 @@ void drawCommandSearch(AppState& st) {
         ImGui::SetNextItemWidth(-1.0f);
         const bool entered = ImGui::InputText("##csq", s_buf, sizeof(s_buf),
                                                ImGuiInputTextFlags_EnterReturnsTrue);
+        if (ImGui::IsItemEdited()) s_unavailableCmd = nullptr;
         ImGui::PopStyleVar();
 
         if (ImGui::IsKeyPressed(ImGuiKey_Escape)) shouldClose = true;
@@ -114,7 +121,8 @@ void drawCommandSearch(AppState& st) {
 
         for (int i = 0; i < nCmds; ++i) {
             const RibbonCmd& c = cmds[i];
-            if (c.stretch || !ui::ribbonRowActive(i)) continue;  // superseded/retired rows
+            if (!ui::ribbonRowActive(i) || !commandAvailability(c.cmd_id, context).visible)
+                continue;  // superseded, retired, or context-inapplicable rows
             if (icontains(c.label, s_buf) || icontains(c.tab, s_buf) ||
                 icontains(c.group, s_buf))
                 ribIdx.push_back(i);
@@ -128,8 +136,14 @@ void drawCommandSearch(AppState& st) {
         // ---- Enter => activate first match ----
         if (entered && !shouldClose) {
             if (!ribIdx.empty()) {
-                if (st.ribbonDispatch) st.ribbonDispatch(cmds[ribIdx[0]].cmd_id);
-                shouldClose = true;
+                const CommandAvailability availability =
+                    commandAvailability(cmds[ribIdx[0]].cmd_id, context);
+                if (availability.enabled) {
+                    if (st.ribbonDispatch) st.ribbonDispatch(cmds[ribIdx[0]].cmd_id);
+                    shouldClose = true;
+                } else {
+                    s_unavailableCmd = cmds[ribIdx[0]].cmd_id;
+                }
             } else if (!setIdx.empty()) {
                 const SettingsEntry& e = kSettingsEntries[setIdx[0]];
                 st.openSettings        = true;
@@ -137,6 +151,27 @@ void drawCommandSearch(AppState& st) {
                 shouldClose            = true;
             }
         }
+        if (s_unavailableCmd) {
+            const CommandAvailability current = commandAvailability(s_unavailableCmd, context);
+            if (!current.visible || current.enabled) {
+                s_unavailableCmd = nullptr;
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    ImVec4(ui::palette.textDisabled[0], ui::palette.textDisabled[1],
+                           ui::palette.textDisabled[2], 1.0f));
+                const char* reason = current.reason ? current.reason
+                                                   : "Command unavailable in this context";
+                ImGui::TextWrapped("%s", reason);
+#ifdef IMGUI_ENABLE_TEST_ENGINE
+                {
+                    ImGuiContext& g = *GImGui;
+                    IMGUI_TEST_ENGINE_ITEM_INFO(0, reason, g.LastItemData.StatusFlags);
+                }
+#endif
+                ImGui::PopStyleColor();
+            }
+        }
+
 
         // ---- results scroll area ----
         ImGui::BeginChild("##csqlist", ImVec2(0.0f, 0.0f), ImGuiChildFlags_None);
@@ -162,6 +197,7 @@ void drawCommandSearch(AppState& st) {
             secLabel("Modeling Tools");
             for (int ri : ribIdx) {
                 const RibbonCmd& c  = cmds[ri];
+                const CommandAvailability availability = commandAvailability(c.cmd_id, context);
                 IconUV           ico = ui::getIcon(c.icon, 20);
                 ImGui::PushID(ri);
 
@@ -169,6 +205,11 @@ void drawCommandSearch(AppState& st) {
                 const float  avail = ImGui::GetContentRegionAvail().x;
                 const bool   hit   = ImGui::Selectable("##row", false, 0,
                                                         ImVec2(avail, rowH));
+                const bool explain = (ImGui::IsItemHovered() || ImGui::IsItemFocused()) &&
+                                     !availability.enabled;
+                if (explain)
+                    ImGui::SetTooltip("%s", availability.reason ? availability.reason
+                                                                : "Command unavailable in this context");
 
                 ImDrawList*  dl = ImGui::GetWindowDrawList();
                 const float  ty = pos.y + (rowH - ImGui::GetTextLineHeight()) * 0.5f;
@@ -178,18 +219,27 @@ void drawCommandSearch(AppState& st) {
                     dl->AddImage(ico.texId,
                                  ImVec2(pos.x + iconOff, iy),
                                  ImVec2(pos.x + iconOff + iconSz, iy + iconSz),
-                                 ico.uv0, ico.uv1);
+                                 ico.uv0, ico.uv1,
+                                 availability.enabled ? IM_COL32_WHITE : colDim);
                 }
-                dl->AddText(ImVec2(pos.x + lblOff, ty), colText, c.label);
-
-                char  dimstr[128];
+                char dimstr[128];
                 std::snprintf(dimstr, sizeof(dimstr), "%s / %s", c.tab, c.group);
-                float dw = ImGui::CalcTextSize(dimstr).x;
-                dl->AddText(ImVec2(pos.x + avail - dw - 8.0f * sc, ty), colDim, dimstr);
+                const float dimW = std::min(ImGui::CalcTextSize(dimstr).x, avail * 0.4f);
+                const float dimX = pos.x + avail - dimW - 8.0f * sc;
+                const std::string dim = ui::kit::elide(dimstr, dimW);
+                const std::string label = ui::kit::elide(c.label,
+                    std::max(0.0f, dimX - pos.x - lblOff - 8.0f * sc));
+                dl->AddText(ImVec2(pos.x + lblOff, ty),
+                            availability.enabled ? colText : colDim, label.c_str());
+                dl->AddText(ImVec2(dimX, ty), colDim, dim.c_str());
 
                 if (hit) {
-                    if (st.ribbonDispatch) st.ribbonDispatch(c.cmd_id);
-                    shouldClose = true;
+                    if (availability.enabled) {
+                        if (st.ribbonDispatch) st.ribbonDispatch(c.cmd_id);
+                        shouldClose = true;
+                    } else {
+                        s_unavailableCmd = c.cmd_id;
+                    }
                 }
                 ImGui::PopID();
             }
@@ -211,11 +261,14 @@ void drawCommandSearch(AppState& st) {
                 ImDrawList* dl = ImGui::GetWindowDrawList();
                 const float ty = pos.y + (rowH - ImGui::GetTextLineHeight()) * 0.5f;
 
-                // Settings rows: no icon; indent to match the label column of ribbon rows
-                dl->AddText(ImVec2(pos.x + lblOff, ty), colText, e.label);
-
-                float dw = ImGui::CalcTextSize(e.tab).x;
-                dl->AddText(ImVec2(pos.x + avail - dw - 8.0f * sc, ty), colDim, e.tab);
+                // Keep the label and page name in separate lanes on narrow windows.
+                const float dimW = std::min(ImGui::CalcTextSize(e.tab).x, avail * 0.4f);
+                const float dimX = pos.x + avail - dimW - 8.0f * sc;
+                const std::string dim = ui::kit::elide(e.tab, dimW);
+                const std::string label = ui::kit::elide(e.label,
+                    std::max(0.0f, dimX - pos.x - lblOff - 8.0f * sc));
+                dl->AddText(ImVec2(pos.x + lblOff, ty), colText, label.c_str());
+                dl->AddText(ImVec2(dimX, ty), colDim, dim.c_str());
 
                 if (hit) {
                     st.openSettings    = true;

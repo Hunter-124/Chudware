@@ -1,14 +1,18 @@
-"""Thin ctypes bridge from the MCP server to the Chudware C++ core (``libchudware``).
+"""Bridge from the MCP tool layer to the Chudware C++ engine (``libchudware``).
 
-This is the SAME engine the desktop app loads: the native core library
-(``libchudware.dll`` on Windows, ``libchudware.so`` on Linux, ``libchudware.dylib`` on macOS)
-exposes every modeling / simulation / drawing capability as a string-in/string-out JSON
-RPC (``chudware_call(method, params_json, &out_json)``; see ``core/api/libchudware.cpp``). The
-in-app agent drives it through the host; here we drive it from Python so an MCP client
-(Claude) can do the same — write parametric feature ops, render, run FEA/CFD, export.
+This is the SAME engine the desktop app runs. Every modeling / simulation / drawing
+capability is one string-in/string-out JSON RPC (``chudware_call(method, params_json,
+&out_json)``; see ``core/api/libchudware.cpp``). By default the RPC goes through the shared
+engine daemon (``daemon_bridge`` → ``chudware-hostd``): ONE engine for the GUI and every
+MCP process, so documents are shared live. ``CHUDWARE_ENGINE_DAEMON=0`` explicitly selects
+an in-process ``ctypes`` load of the same library instead.
 
-Loading mirrors the proven probe loaders (``tools/vocab_battery.py``,
-``tools/mesh_quality_verify.py``) and the host's own resolver (``cpp_core.cpp``): locate
+``call()`` is more than a forwarder. Around the RPC it attaches a document read-write
+before an authored change, lists the document before/after to detect that change, and keeps
+the touched-document / writer-lease / internal-document bookkeeping the tool layer and the
+end-of-run save sweep read. ``_dispatch_call`` is the bare transport (daemon, else in-process).
+
+In-process loading mirrors the host's own resolver (``cpp_core.cpp``): locate
 the library (``$CHUDWARE_LIBCHUDWARE`` explicit path → ``$CHUDWARE_DIST`` dir → the platform's
 known build/stage dirs), put its directory on the native dependency search path, point
 ``CHUDWARE_PROMPTS_DIR`` at the prompts, then ``CDLL`` the library and bind the C ABI.
@@ -18,10 +22,14 @@ Public surface:
     dim(value) -> dict               a parametric dimension literal {"value":v,"expr":None}
     feat(type, name, params, refs)   an add_feature op for doc_apply_ops
     dist_dir() -> str                the resolved dist/Chudware directory
+    private_engine_active() -> bool  hostd was unreachable and a standalone client fell back
+                                     to a private in-process engine (replies say so)
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from contextvars import ContextVar
+import atexit
 import ctypes
 import json
 import os
@@ -141,13 +149,46 @@ def _prompts_default() -> Path:
 
 _lock = threading.Lock()
 _dll: Optional[ctypes.CDLL] = None
+_native_lifecycle = threading.Condition()
+_native_calls = 0
+_native_closing = False
+
+
+def _drain_in_process_tasks() -> None:
+    # Never load an unused engine at exit. This hook is registered at import,
+    # before the server's later terminal-save hooks, so those saves run first.
+    global _native_closing
+    with _native_lifecycle:
+        _native_closing = True
+        while _native_calls:
+            _native_lifecycle.wait()
+    # _load may be running on the warm-up thread outside an RPC.
+    with _lock:
+        dll = _dll
+    if dll is None:
+        return
+    try:
+        drain = dll.chudware_drain_background_tasks
+    except AttributeError:
+        return  # older engines do not provide the lifecycle export
+    drain.argtypes = []
+    drain.restype = ctypes.c_int
+    if drain() != 0:
+        print("[core_bridge] engine background task drain failed", file=sys.stderr)
+
+
+atexit.register(_drain_in_process_tasks)
 
 
 def _load() -> ctypes.CDLL:
     global _dll
+    if _native_closing:
+        raise CoreError("in-process engine is shutting down")
     if _dll is not None:
         return _dll
     with _lock:
+        if _native_closing:
+            raise CoreError("in-process engine is shutting down")
         if _dll is not None:
             return _dll
         # Mode-divergence guard: a legacy in-process engine editing docs while a
@@ -200,6 +241,22 @@ def _load() -> ctypes.CDLL:
         return _dll
 
 
+@contextmanager
+def _in_process_call():
+    global _native_calls
+    with _native_lifecycle:
+        if _native_closing:
+            raise CoreError("in-process engine is shutting down")
+        _native_calls += 1
+    try:
+        yield _load()
+    finally:
+        with _native_lifecycle:
+            _native_calls -= 1
+            if not _native_calls:
+                _native_lifecycle.notify_all()
+
+
 def _warn_if_sim_missing(dll: ctypes.CDLL, lib_path: Path) -> None:
     """Warn when an OCCT/Polyhedral-FEA-disabled engine was selected."""
     try:
@@ -240,8 +297,11 @@ def available() -> bool:
 #     sharing, no per-process copy).
 #   CHUDWARE_ENGINE_DAEMON=0 -> explicit opt-out: legacy in-process ctypes load
 #     (kept at least one release as the safety net; removal is a named N+1 task).
-# Only initial startup failure before an engine session is established permits
-# legacy fallback. Lost replies and failed reconnects must never switch engines.
+# A direct, non-tool client (no agent turn, no hostd cell) whose first connection fails
+# outright may fall back to a private in-process engine; the demotion is sticky and every
+# reply then carries ``engine: "private"`` (see private_engine_notice). Agent tool calls and
+# cells never fall back: they get a CoreError. Cancellation, the spawn cooldown, a lost
+# reply and a failed reconnect never switch engines either.
 _DAEMON_FALLBACK_WARNED = False
 
 
@@ -268,6 +328,52 @@ def reset_daemon_fallback() -> None:
     _DAEMON_FALLBACK_WARNED = False
 
 
+def private_engine_active() -> bool:
+    """True when hostd was unreachable and this process now serves requests from a private
+    in-process engine. An explicit ``CHUDWARE_ENGINE_DAEMON=0`` is the user's choice, not
+    a degradation, and does not count."""
+    return _daemon_mode() and _DAEMON_FALLBACK_WARNED
+
+
+def private_engine_notice() -> Optional[dict]:
+    """Reply fields every tool reply must carry while :func:`private_engine_active`.
+
+    None on the healthy path. The shared reply writers (``_envelopes.dumps``) stamp these
+    onto dict payloads so the caller can see its edits are invisible to the app and to
+    other agents.
+    """
+    if not private_engine_active():
+        return None
+    return {
+        "engine": "private",
+        "engine_warning": (
+            "chudware-hostd was unreachable, so this reply came from a PRIVATE in-process "
+            "engine: its documents are not shared with the Chudware app or other agents. "
+            "Restart this MCP server once hostd is available."
+        ),
+    }
+
+_AGENT_TOOL_CALL: ContextVar[bool] = ContextVar("cad_agent_tool_call", default=False)
+
+
+@contextmanager
+def agent_tool_scope():
+    """Mark an MCP tool dispatch so a failed daemon connection cannot demote it."""
+    token = _AGENT_TOOL_CALL.set(True)
+    try:
+        yield
+    finally:
+        _AGENT_TOOL_CALL.reset(token)
+
+
+def _agent_call() -> bool:
+    """True for MCP tool dispatch, an agent turn, or a hostd cell."""
+    if _AGENT_TOOL_CALL.get() or CURRENT_AGENT.get() is not None:
+        return True
+    from .daemon_bridge import agent_turn_active
+    return agent_turn_active()
+
+
 # Foreign-edit piggyback (Phase 3): the daemon injects "_foreign_edits":[...]
 # into a result when another client advanced the doc since OUR last touch. We
 # strip it off the engine result here (tool code never expects the key) and
@@ -279,12 +385,40 @@ CURRENT_AGENT: ContextVar[object] = ContextVar("cad_current_agent", default=None
 _FOREIGN_EDITS_PENDING: dict[object, list] = {}
 _FOREIGN_EDITS_LOCK = threading.Lock()
 _BUSY_PREVIEW_BUDGET_S = 30.0
+_DOC_RESOLUTION_ROWS: ContextVar[dict] = ContextVar("cad_resolution_rows", default={})
+
+
+def remember_resolution_rows(rows: list) -> None:
+    """Reuse fresh non-busy rows from the current document resolution once."""
+    _DOC_RESOLUTION_ROWS.set({str(row["doc_id"]): row for row in rows
+                              if row.get("doc_id") and not row.get("busy")})
+
+
+def _take_resolution_row(doc_id: str):
+    rows = _DOC_RESOLUTION_ROWS.get()
+    _DOC_RESOLUTION_ROWS.set({})
+    return rows.get(str(doc_id))
 
 
 def consume_foreign_edits() -> list:
     """Drain only the calling agent's buffered foreign-edit records."""
     with _FOREIGN_EDITS_LOCK:
         return _FOREIGN_EDITS_PENDING.pop(CURRENT_AGENT.get(), [])
+
+
+def release_run_state(run_id, open_ids=None) -> None:
+    """Release completed run notifications and stale internal-document marks."""
+    from services.agent.request_context import owner_key
+    with _FOREIGN_EDITS_LOCK:
+        for key in list(_FOREIGN_EDITS_PENDING):
+            if isinstance(key, tuple) and key and key[0] == run_id:
+                _FOREIGN_EDITS_PENDING.pop(key, None)
+    if open_ids is not None:
+        owner = owner_key()
+        with _INTERNAL_DOCS_LOCK:
+            _INTERNAL_DOCS.difference_update(
+                entry for entry in tuple(_INTERNAL_DOCS)
+                if entry[0] == owner and entry[1] not in open_ids)
 
 
 def _call_via_daemon(method: str, params: Optional[dict]) -> dict:
@@ -325,7 +459,15 @@ def _call_via_daemon(method: str, params: Optional[dict]) -> dict:
             time.sleep(min(max(float(retry_ms) / 1000.0, 0.001), left))
             continue
         msg = result.get("message") or result.get("error") or json.dumps(result)[:400]
-        raise CoreError(msg, code=code, detail=result.get("detail"))
+        if code == "read_only":
+            msg = ("The document is attached read-only. Write access is requested "
+                   "automatically before editing; retry the operation, and if it "
+                   "still fails check your document permissions.")
+        detail = result.get("detail")
+        if code == "path_bound_to_other_doc":
+            detail = {**(detail if isinstance(detail, dict) else {}),
+                      "other_doc_id": result.get("other_doc_id")}
+        raise CoreError(msg, code=code, detail=detail)
 
 
 def revert_own_batch(doc_id, checkpoint: dict | None, applied_revision) -> bool:
@@ -348,7 +490,18 @@ def revert_own_batch(doc_id, checkpoint: dict | None, applied_revision) -> bool:
     return True
 
 
-def call(method: str, params: Optional[dict] = None) -> dict:
+def _hostd_unavailable(cause: str) -> CoreError:
+    """The error an agent tool call (or hostd cell) gets instead of a private engine."""
+    return CoreError(
+        f"The shared engine daemon (chudware-hostd) is unavailable: {cause}. An agent tool "
+        "call never falls back to a private in-process engine, because its documents would "
+        "be invisible to the Chudware app and to other agents. Start or restart Chudware "
+        "and retry.",
+        code="hostd_unavailable", detail={"cause": cause},
+    )
+
+
+def _dispatch_call(method: str, params: Optional[dict] = None) -> dict:
     """Invoke one C++ core RPC. Returns the parsed JSON result dict.
 
     Raises CoreError on a hard failure: a nonzero return code (generic ``{"error":...}`` or
@@ -357,47 +510,58 @@ def call(method: str, params: Optional[dict] = None) -> dict:
     returned as-is so the caller can surface it without an exception.
     """
     global _DAEMON_FALLBACK_WARNED
-    # STICKY fallback: once an initial startup failure demotes us to the in-process
-    # engine we stay there for the life of this process. Retrying the daemon
-    # per-call re-pays the full connect/spawn budget (~15 s) on EVERY engine
-    # call — measured 150x slowdown (2026-07-11 perf audit) — and
-    # switching back mid-session would strand doc_ids created in the in-process
-    # engine. Recovery = restart the server (the warning says so).
-    if _daemon_mode() and not _DAEMON_FALLBACK_WARNED:
-        from .daemon_bridge import DaemonDraining, DaemonError, DaemonSessionLost
-
-        try:
-            return _call_via_daemon(method, params)
-        except DaemonSessionLost as e:
-            raise CoreError(str(e), code=e.code, detail=e.detail) from e
-        except DaemonDraining as e:
-            # The shared daemon runs and refuses new clients while it drains. A private
-            # in-process engine would not share its documents, so never fall back here.
-            raise CoreError(str(e), code=e.code, detail=e.detail) from e
-        except DaemonError as e:
-            # Initial startup failure only: no operation reached this engine.
-            # Established-session loss and native RPC errors never trigger fallback.
-            _DAEMON_FALLBACK_WARNED = True
-            print(
-                f"[core_bridge] WARNING: hostd unavailable ({e}); falling back to "
-                "the legacy in-process engine for the REST OF THIS SESSION. Doc "
-                "sharing with the GUI is OFF; restart this server to retry hostd.",
-                file=sys.stderr,
+    # STICKY fallback (standalone clients only): once an initial startup failure demotes a
+    # standalone MCP process to the in-process engine it stays there for the life of the
+    # process. Retrying the daemon per-call re-pays the full connect/spawn budget (~15 s)
+    # on EVERY engine call — measured 150x slowdown (2026-07-11 perf audit) — and switching
+    # back mid-session would strand doc_ids created in the in-process engine. Recovery =
+    # restart the server (the warning says so). Replies carry engine:"private" meanwhile.
+    if _daemon_mode():
+        if not _DAEMON_FALLBACK_WARNED:
+            from .daemon_bridge import (
+                DaemonCancelled, DaemonDraining, DaemonError, DaemonSessionLost,
+                DaemonSpawnBlocked,
             )
-    dll = _load()
-    out = ctypes.c_char_p()
-    # NOTE: native stdout (OCCT statistics etc.) is kept off the MCP JSON-RPC channel by a
-    # PROCESS-WIDE redirect installed once at server startup (see server.py), NOT by toggling
-    # fd 1 here. A per-call toggle races the transport's response writer (FastMCP runs sync
-    # tools off-thread) and silently drops replies -> "request timed out".
-    rc = dll.chudware_call(
-        method.encode("utf-8"),
-        json.dumps(params or {}).encode("utf-8"),
-        ctypes.byref(out),
-    )
-    raw = out.value.decode("utf-8") if out.value else ""
-    if out.value:
-        dll.chudware_free(out)
+
+            try:
+                return _call_via_daemon(method, params)
+            except (DaemonSessionLost, DaemonDraining) as e:
+                # A lost session never switches engines, and a draining daemon refuses new
+                # clients while it runs: a private engine would not share its documents.
+                raise CoreError(str(e), code=e.code, detail=e.detail) from e
+            except DaemonCancelled as e:
+                # A Stop says nothing about whether hostd is up.
+                raise CoreError(str(e), code="cancelled") from e
+            except DaemonSpawnBlocked as e:
+                # Not fresh evidence: an earlier spawn failed and its cooldown still runs.
+                raise _hostd_unavailable(str(e)) from e
+            except DaemonError as e:
+                # Initial startup failure only: no operation reached this engine.
+                # Established-session loss and native RPC errors never trigger fallback,
+                # and an agent turn or hostd cell is never served by a private engine.
+                if _agent_call():
+                    raise _hostd_unavailable(str(e)) from e
+                _DAEMON_FALLBACK_WARNED = True
+                print(
+                    f"[core_bridge] WARNING: hostd unavailable ({e}); falling back to "
+                    "the legacy in-process engine for the REST OF THIS SESSION. Doc "
+                    "sharing with the GUI is OFF; restart this server to retry hostd.",
+                    file=sys.stderr,
+                )
+        elif _agent_call():
+            raise _hostd_unavailable("it was unreachable earlier in this process")
+    with _in_process_call() as dll:
+        out = ctypes.c_char_p()
+        # Native stdout stays off the MCP JSON-RPC channel via the
+        # process-wide redirect installed once at server startup.
+        rc = dll.chudware_call(
+            method.encode("utf-8"),
+            json.dumps(params or {}).encode("utf-8"),
+            ctypes.byref(out),
+        )
+        raw = out.value.decode("utf-8") if out.value else ""
+        if out.value:
+            dll.chudware_free(out)
     try:
         result = json.loads(raw) if raw else {}
     except json.JSONDecodeError:
@@ -410,6 +574,159 @@ def call(method: str, params: Optional[dict] = None) -> dict:
             raise CoreError(msg, code=str(result.get("code", "")), detail=result.get("detail"))
         raise CoreError(f"{method}: rc={rc} {raw[:400]}")
     return result if isinstance(result, dict) else {"result": result}
+
+
+# The document methods that only READ, copied from hostd's isDocumentReadOnlyMethod
+# (core/hostd/doc_registry.cpp: kExact / kPrefixes). hostd is the authority. The in-process
+# engine has no daemon to ask, so this copy must stay aligned with hostd.
+_HOSTD_READ_EXACT = frozenset({
+    "doc_list", "doc_tree", "doc_query", "doc_bbox", "doc_adjacency",
+    "doc_get_meta", "doc_validate", "doc_dry_run_ops", "doc_resolve_pick",
+    "doc_mesh_ref_list", "doc_mesh_ref_mesh", "doc_rebuild", "doc_activate",
+    "doc_dep_query", "doc_drawing_views", "doc_sketch_overview",
+    "doc_sketch_regions", "doc_compile_cpp", "doc_save", "doc_export_step",
+    "doc_clear_history", "doc_render_diff", "doc_view_metrics", "asm_world_bodies",
+    "asm_source_status", "asm_bom_components",
+    "config_list", "sim_study_list", "weld_cut_list", "sketch_health",
+    "sketch3d_health", "sketch_probe", "drawing_get", "drawing_bom",
+    "drawing_model_items", "drawing_render_png", "cam_describe", "cam_tree",
+    "cam_extract", "ecad_describe", "ecad_tree", "ecad_kicad_status",
+    "ecad_kicad_check", "ecad_footprints", "ecad_kicad_libraries", "ecad_symbols",
+    "piping_route", "piping_edit", "piping_fitting_k",
+    "harness_route", "harness_path_check",
+})
+_HOSTD_READ_PREFIXES = (
+    "doc_face_", "doc_render_", "describe_", "render_", "measure_", "query_",
+    "eval_", "sim_", "export", "mesh_", "aicm_", "prof_", "agent_",
+)
+# Document lifecycle calls. call() books each of them explicitly below, and none edits
+# authored content, so none counts as a mutation.
+_LIFECYCLE_METHODS = frozenset({
+    "attach_doc", "detach_doc", "doc_close", "doc_discard", "doc_open", "doc_reload",
+    "doc_checkpoint", "ecad_close", "ecad_save", "ecad_reload",
+})
+_INTERNAL_DOCS: set[tuple] = set()
+_INTERNAL_DOCS_LOCK = threading.Lock()
+
+
+def _may_mutate_document(method: str, params: dict) -> bool:
+    if not params.get("doc_id") or method in _LIFECYCLE_METHODS:
+        return False
+    if method.startswith("sim_study_"):
+        # hostd's `sim_` prefix is read-only, but a study write persists into the document.
+        return method != "sim_study_list"
+    return not (method in _HOSTD_READ_EXACT or method.startswith(_HOSTD_READ_PREFIXES))
+
+
+def _document_row(doc_id: str) -> dict | None:
+    try:
+        rows = _dispatch_call("doc_list", {}).get("docs") or []
+        return next((r for r in rows if isinstance(r, dict) and r.get("doc_id") == doc_id), None)
+    except Exception:  # noqa: BLE001 — a completed mutation must still be tracked
+        return None
+
+
+def _document_version(row: dict | None) -> tuple | None:
+    if row is not None and (row.get("revision") is not None or
+                            row.get("metadata_revision") is not None):
+        return (row.get("revision"), row.get("metadata_revision"))
+    return None
+
+
+def lease_document(doc_id: str) -> None:
+    """Hold a listed/read document on this turn's connection until the pool closes."""
+    if not doc_id or CURRENT_AGENT.get() is None or not active_daemon_mode():
+        return
+    from .daemon_bridge import client
+
+    connection = client()
+    writers = getattr(connection, "_mcp_writer_docs", set())
+    readers = getattr(connection, "_mcp_reader_docs", set())
+    if doc_id in writers or doc_id in readers:
+        return
+    reply = _dispatch_call("attach_doc", {"doc_id": doc_id, "mode": "ro"})
+    if reply.get("ok") is False:
+        raise CoreError(str(reply.get("message") or reply.get("error") or "attach failed"),
+                        code=str(reply.get("code") or "attach_failed"), detail=reply)
+    readers.add(doc_id)
+    connection._mcp_reader_docs = readers
+
+
+def lease_documents(rows: list) -> None:
+    for row in rows:
+        if isinstance(row, dict) and row.get("doc_id") and row.get("status") != "closed":
+            lease_document(str(row["doc_id"]))
+
+
+def call(method: str, params: Optional[dict] = None) -> dict:
+    """Dispatch an RPC and record successful authored document changes once."""
+    from services.agent.request_context import owner_key
+    owner = owner_key()
+    args = params or {}
+    doc_id = args.get("doc_id")
+    mutating = _may_mutate_document(method, args)
+    # Checkpoints require write access in hostd but do not themselves change the
+    # document revision or constitute an authored edit.
+    if (mutating or (method == "doc_checkpoint" and doc_id)) and active_daemon_mode():
+        from .daemon_bridge import client
+        connection = client()
+        readers = getattr(connection, "_mcp_reader_docs", set())
+        writers = getattr(connection, "_mcp_writer_docs", set())
+        # A reused/open document can have an untracked read-only attachment.
+        if doc_id in readers or (method == "doc_checkpoint" and doc_id not in writers):
+            reply = _dispatch_call("attach_doc", {"doc_id": doc_id, "mode": "rw"})
+            if reply.get("ok") is False or reply.get("mode") == "ro":
+                raise CoreError(
+                    "Could not obtain write access to the document automatically; "
+                    "retry the operation and check document permissions if it still fails.",
+                    code="read_only", detail=reply)
+            readers.discard(doc_id)
+            writers.add(doc_id)
+            connection._mcp_writer_docs = writers
+    before_row = (_take_resolution_row(doc_id) or _document_row(doc_id)) if mutating else None
+    before = _document_version(before_row)
+    result = _dispatch_call(method, params)
+    if result.get("ok") is False or "rejected_tree" in result:
+        return result
+    if (active_daemon_mode() and (mutating or
+            (method in ("doc_new", "doc_open") and not result.get("reused")))
+            and (doc_id or result.get("doc_id"))):
+        from .daemon_bridge import client
+        connection = client()
+        writers = getattr(connection, "_mcp_writer_docs", set())
+        writers.add(str(doc_id or result["doc_id"]))
+        connection._mcp_writer_docs = writers
+    if active_daemon_mode() and method in ("doc_close", "doc_discard", "detach_doc") and doc_id:
+        from .daemon_bridge import client
+        connection = client()
+        getattr(connection, "_mcp_writer_docs", set()).discard(doc_id)
+        getattr(connection, "_mcp_reader_docs", set()).discard(doc_id)
+    if method in ("doc_new", "doc_open") and result.get("doc_id"):
+        with _INTERNAL_DOCS_LOCK:
+            if args.get("internal"):
+                _INTERNAL_DOCS.add((owner, str(result["doc_id"])))
+            elif not result.get("reused"):
+                _INTERNAL_DOCS.discard((owner, str(result["doc_id"])))
+    if method in ("doc_close", "doc_discard") and doc_id and not result.get("detached"):
+        with _INTERNAL_DOCS_LOCK:
+            _INTERNAL_DOCS.discard((owner, str(doc_id)))
+        from .cad_common import forget_touched_doc
+        forget_touched_doc(str(doc_id))
+    if method == "doc_save" and doc_id and not args.get("preserve_path"):
+        from .cad_common import note_document_saved
+        note_document_saved(str(doc_id), result)
+    created = (method == "doc_new" and not result.get("reused") and
+               not args.get("internal") and result.get("doc_id"))
+    if created or mutating:
+        target = str(created or doc_id)
+        after_row = _document_row(target)
+        after = _document_version(after_row)
+        with _INTERNAL_DOCS_LOCK:
+            internal = (owner, target) in _INTERNAL_DOCS
+        if not internal and (created or before is None or after is None or before != after):
+            from .cad_common import note_touched_doc
+            note_touched_doc(target, row=after_row)
+    return result
 
 
 # ---------------------------------------------------------------- op builders

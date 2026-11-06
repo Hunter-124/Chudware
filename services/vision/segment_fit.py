@@ -9,6 +9,12 @@ profile polylines, and emits the frozen ``aicad.reveng_fits/1`` schema
 recon hints — it is what lets a downstream agent author a bore / boss / revolve
 / loft instead of guessing at a triangle soup.
 
+Metric fits require a confirmed reconstruction-to-mm similarity transform.
+``approximate=True`` explicitly permits unconfirmed or unknown scale, with the
+output marked accordingly; unknown-scale ``_mm`` values are reconstruction
+units. Residuals and conditional standard errors do not quantify unobserved
+geometry or systematic capture/calibration error.
+
 Pipeline
 --------
 1. Load the mesh and sample a dense oriented point cloud from its surface.
@@ -29,8 +35,8 @@ Pipeline
 5. Slice the mesh at ``n_sections`` evenly spaced stations along the dominant
    (or caller-supplied) axis and emit the closed profile polylines with areas.
 
-Surface sampling and every RANSAC here are seeded, so the same mesh yields the
-same numbers on every run.
+Surface sampling and RANSAC use a fixed seed where the selected backend supports
+it; older backend APIs that expose no seed may vary between runs.
 
 Fitter internals
 ----------------
@@ -62,7 +68,7 @@ Backends (imported lazily — none is a hard dependency)
 * **trimesh** (MIT) — mesh IO + surface sampling + cross-sections.
 * **pyransac3d** (MIT) — plane RANSAC and the no-normals cylinder fallback.
 * **scipy** (BSD) — optional sphere refine and k-NN normal estimation for point
-  clouds that arrive without normals.
+  clouds that arrive without normals; Open3D supplies a fallback normal estimator.
 
 A missing optional dependency never raises and never fabricates a fit: the
 affected fitter is skipped and the reason is recorded in the additive ``notes``
@@ -79,6 +85,8 @@ from collections import defaultdict
 from typing import Any, Optional
 
 import numpy as np
+
+from services.vision.recon_transform import ReconTransform
 
 # ---------------------------------------------------------------------------
 # Lazy backend detection. Imported at module load so tests can monkeypatch the
@@ -125,9 +133,9 @@ FITS_SCHEMA = "aicad.reveng_fits/1"
 
 #: Capability revision of the *producer*, stamped additively next to the frozen
 #: schema tag. 1 = planes + one cylinder. 2 = multi-cylinder / cone / sphere /
-#: feature roles / real cross-sections. Consumers that only read v1 keys keep
-#: working; the marker just tells a reader which fit kinds it may encounter.
-FITS_REVISION = 2
+#: feature roles / real cross-sections. 3 = calibration, unit state and per-fit
+#: uncertainty. Consumers that only read v1 keys keep working.
+FITS_REVISION = 3
 
 #: Fixed RANSAC seed — identical input must yield identical fits run to run.
 _RNG_SEED = 20260707
@@ -225,10 +233,19 @@ def _load_mesh(mesh_path: str) -> Optional[dict]:
         try:
             mesh = o3d.io.read_triangle_mesh(mesh_path)
         except Exception:  # noqa: BLE001
-            return None
-        verts = np.asarray(mesh.vertices, dtype=float)
+            mesh = None
+        verts = np.asarray(mesh.vertices, dtype=float) if mesh is not None else np.empty((0, 3))
         if len(verts) == 0:
-            return None
+            # Triangle readers often reject vertices-only PLYs.  Keep the same
+            # unoriented point-cloud path as the trimesh backend.
+            try:
+                cloud = o3d.io.read_point_cloud(mesh_path)
+                verts = np.asarray(cloud.points, dtype=float)
+            except Exception:  # noqa: BLE001
+                return None
+            if len(verts) == 0:
+                return None
+            return {"obj": cloud, "vertices": verts, "faces": None, "backend": "open3d"}
         tris = np.asarray(mesh.triangles, dtype=int)
         return {
             "obj": mesh,
@@ -247,6 +264,8 @@ def _sample_mesh(handle: dict, n_samples: int):
     seed fall back to their unseeded call rather than failing.
     """
     mesh = handle["obj"]
+    if handle["faces"] is None:
+        return handle["vertices"], None
     if handle["backend"] == "trimesh":
         try:
             try:
@@ -258,11 +277,13 @@ def _sample_mesh(handle: dict, n_samples: int):
         except Exception:  # noqa: BLE001
             return handle["vertices"], None
     try:
+        mesh.compute_triangle_normals()
         try:
-            pcd = mesh.sample_points_uniformly(number_of_points=n_samples, seed=_RNG_SEED)
+            pcd = mesh.sample_points_uniformly(
+                number_of_points=n_samples, use_triangle_normal=True, seed=_RNG_SEED)
         except TypeError:  # pragma: no cover - older open3d without ``seed``
-            pcd = mesh.sample_points_uniformly(number_of_points=n_samples)
-        pcd.estimate_normals()
+            pcd = mesh.sample_points_uniformly(
+                number_of_points=n_samples, use_triangle_normal=True)
         pts = np.asarray(pcd.points, dtype=float)
         normals = np.asarray(pcd.normals, dtype=float) if pcd.has_normals() else None
         return pts, normals
@@ -290,31 +311,40 @@ def _points_from_array(arr: Any) -> Optional[np.ndarray]:
         pts = np.asarray(arr, dtype=float)
     except Exception:  # noqa: BLE001
         return None
-    if pts.ndim != 2 or pts.shape[1] != 3 or pts.shape[0] < 3:
+    if pts.ndim != 2 or pts.shape[1] != 3 or pts.shape[0] < 3 or not np.isfinite(pts).all():
         return None
     return pts
 
 
 def _estimate_normals(pts: np.ndarray, k: int = 16) -> Optional[np.ndarray]:
-    """k-NN PCA surface normals for a bare point cloud (needs scipy's KD-tree).
+    """Estimate unoriented k-NN PCA normals via scipy or Open3D.
 
-    The result is *unoriented* — the sign of each normal is arbitrary — which is
-    enough for axis estimation (every axis estimator here is sign-invariant) but
-    not for the hole-vs-boss decision, so callers must keep them flagged.
-    Returns ``None`` when scipy is absent or the cloud is too small.
+    Signs are arbitrary: they can estimate axes but cannot decide hole vs boss.
     """
-    if not HAVE_SCIPY or len(pts) < k:
+    if len(pts) < 3:
         return None
-    try:
-        tree = _ScipyKDTree(pts)
-        _, idx = tree.query(pts, k=k)
-        nbr = pts[idx]
-        nbr = nbr - nbr.mean(axis=1, keepdims=True)
-        cov = np.einsum("nki,nkj->nij", nbr, nbr)
-        _, vecs = np.linalg.eigh(cov)
-    except Exception:  # noqa: BLE001
-        return None
-    return np.asarray(vecs[:, :, 0], dtype=float)
+    k = min(k, len(pts))
+    if HAVE_SCIPY:
+        try:
+            tree = _ScipyKDTree(pts)
+            _, idx = tree.query(pts, k=k)
+            nbr = pts[idx]
+            nbr = nbr - nbr.mean(axis=1, keepdims=True)
+            cov = np.einsum("nki,nkj->nij", nbr, nbr)
+            _, vecs = np.linalg.eigh(cov)
+            return np.asarray(vecs[:, :, 0], dtype=float)
+        except Exception:  # noqa: BLE001
+            pass
+    if HAVE_OPEN3D:
+        try:
+            cloud = o3d.geometry.PointCloud()
+            cloud.points = o3d.utility.Vector3dVector(pts)
+            cloud.estimate_normals(o3d.geometry.KDTreeSearchParamKNN(knn=k))
+            if cloud.has_normals():
+                return np.asarray(cloud.normals, dtype=float).copy()
+        except Exception:  # noqa: BLE001
+            pass
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1417,16 +1447,16 @@ def _extract_sections(
 
     raw = []
     note = None
-    if handle.get("backend") == "trimesh" and handle.get("obj") is not None:
-        raw = _sections_trimesh(handle["obj"], axis, e1, e2, stations)
-    elif handle.get("faces") is not None:
-        raw = _sections_manual(handle["vertices"], handle["faces"], axis, e1, e2, stations)
-    else:
+    if handle.get("faces") is None:
         note = _note(
             "sections",
             "no_faces",
             "mesh carries no triangles; cross-sections need a surface",
         )
+    elif handle.get("backend") == "trimesh" and handle.get("obj") is not None:
+        raw = _sections_trimesh(handle["obj"], axis, e1, e2, stations)
+    else:
+        raw = _sections_manual(handle["vertices"], handle["faces"], axis, e1, e2, stations)
 
     axis_out = [round(float(x), 6) for x in axis]
     frame = {
@@ -1560,6 +1590,9 @@ def segment_fit(
     min_inlier_frac: float = 0.02,
     n_sections: int = 12,
     section_axis: Any = None,
+    recon_transform: Optional[ReconTransform | dict] = None,
+    approximate: bool = False,
+    transform_applied: bool = False,
 ) -> dict:
     """Extract fitted primitives from a mesh, emitting ``aicad.reveng_fits/1``.
 
@@ -1591,6 +1624,16 @@ def segment_fit(
     section_axis:
         ``'x'`` / ``'y'`` / ``'z'`` or an explicit 3-vector. Defaults to the
         largest-extent principal axis of the cloud.
+    recon_transform:
+        Confirmed reconstruction-to-mm similarity transform (or its JSON record).
+        A missing or unconfirmed transform is refused unless ``approximate=True``.
+    approximate:
+        Explicitly permit unconfirmed scale and mark the result approximate; also
+        use for a known approximate surface even if its scale is confirmed. Without
+        a transform, nominal ``_mm`` values are reconstruction units, not millimetres.
+    transform_applied:
+        Set only when the input has already had this exact transform applied, to
+        preserve calibration provenance without transforming it a second time.
 
     Returns
     -------
@@ -1602,6 +1645,25 @@ def segment_fit(
     """
     if not _backend_available():
         return _envelope()
+
+    try:
+        if isinstance(recon_transform, dict):
+            recon_transform = ReconTransform.from_json(recon_transform)
+        if recon_transform is not None and not isinstance(recon_transform, ReconTransform):
+            raise ValueError("recon_transform must be a ReconTransform or its JSON record")
+    except (TypeError, ValueError, KeyError) as exc:
+        return {"ok": False, "reason": "invalid_recon_transform", "hint": str(exc)}
+    if (recon_transform is None or recon_transform.confirmed is not True) and not approximate:
+        return {
+            "ok": False,
+            "reason": "scale_unconfirmed",
+            "hint": "Calibrate and confirm metric scale with reveng_set_scale, then fit again; "
+                    "for exploratory, non-dimensional work explicitly pass approximate=True.",
+        }
+    if transform_applied and recon_transform is None:
+        return {"ok": False, "reason": "invalid_recon_transform",
+                "hint": "transform_applied requires the transform already applied to the input."}
+    is_approximate = approximate or recon_transform is None or recon_transform.confirmed is not True
 
     notes: list[dict] = []
     handle: Optional[dict] = None
@@ -1623,12 +1685,24 @@ def segment_fit(
             "hint": "pass mesh_path or points",
         }
 
-    if pts is None or len(pts) < 3:
+    if pts is None or len(pts) < 3 or not np.isfinite(pts).all():
         return {
             "ok": False,
             "reason": "mesh_unreadable",
             "hint": "ensure the mesh file exists and contains geometry",
         }
+
+    if recon_transform is not None and not transform_applied:
+        pts = recon_transform.apply(pts)
+        if normals is not None:
+            normals = normals @ np.asarray(recon_transform.rotation).T
+        if handle is not None:
+            handle["vertices"] = recon_transform.apply(handle["vertices"])
+            if handle["faces"] is not None and handle["backend"] == "trimesh":
+                matrix = np.eye(4)
+                matrix[:3, :3] = recon_transform.mm_per_unit * np.asarray(recon_transform.rotation)
+                matrix[:3, 3] = recon_transform.translation_mm
+                handle["obj"].apply_transform(matrix)
 
     if normals is None:
         normals = _estimate_normals(pts)
@@ -1637,7 +1711,7 @@ def segment_fit(
                 _note(
                     "normals",
                     "unavailable",
-                    "pip install scipy to estimate normals from a bare point cloud;"
+                    "install scipy or open3d to estimate normals from a bare point cloud;"
                     " without them cones are skipped and roles stay 'unknown'",
                 )
             )
@@ -1801,12 +1875,34 @@ def segment_fit(
     if section_note is not None:
         notes.append(section_note)
 
+    # A fit's inlier RMS is observable, not a guaranteed dimensional tolerance.
+    # The standard-error term assumes independent inliers; systematic capture
+    # and reconstruction errors remain unknown and can dominate it.
+    for fit in fits:
+        rms = fit["residual_mm"]
+        fit["uncertainty"] = {
+            "inlier_rms": rms,
+            "inlier_standard_error": round(rms / math.sqrt(fit["inliers"]), 6),
+            "dimension_uncertainty_mm": None,
+            "calibration_residual_mm": (
+                recon_transform.residual_mm if recon_transform is not None else None
+            ),
+            "units": "reconstruction_units" if recon_transform is None else "mm",
+            "note": "Inlier standard error assumes independent residuals; calibration "
+                    "residual is not a scale uncertainty. Systematic and unobserved "
+                    "geometry errors are not quantified.",
+        }
+
     return {
         "schema": FITS_SCHEMA,
         "fits_revision": FITS_REVISION,
         "ok": True,
         "session_id": session_id,
         "mesh_path": mesh_path or "",
+        "approximate": is_approximate,
+        "units": "reconstruction_units" if recon_transform is None else "mm",
+        "recon_transform": recon_transform.to_json() if recon_transform is not None else None,
+        "transform_applied_to_input": bool(transform_applied),
         "fits": fits,
         "sections": sections,
         "notes": notes,

@@ -35,7 +35,7 @@ Every preset configures the repository root (which adds `core/` as a subdirector
 | Tree | What lives there |
 |------|------------------|
 | `build/<preset>/bin/` | engine artifacts: `libchudware.dll`, `chudware-hostd.exe`, `polymesh.exe`, test executables |
-| `build/<preset>/core/` | the core's registered CTest suite — run `ctest` here, not on `build/<preset>` |
+| `build/<preset>/core/` | the core's registered CTest suite |
 | `host\build-windows` | host GUI tree used by `native-build.yml` |
 | `host\build-win` | host GUI tree used by `scripts/build_windows.ps1`, `release.yml` and `services/installer/build_release.py` (packaging reads `host\build-win\bin\chudware.exe`) |
 
@@ -53,7 +53,6 @@ call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliar
 cd /d <repo>
 cmake --preset windows-core
 cmake --build --preset windows-core
-ctest --test-dir build/windows-core/core --output-on-failure
 ```
 
 Windows portability notes baked into the build:
@@ -61,6 +60,10 @@ Windows portability notes baked into the build:
   (OCCT pulls in `<windows.h>`, whose macros otherwise clobber `std::min`/`std::max`; MSVC
   hides `M_PI` behind `_USE_MATH_DEFINES`). `chudware_cam` and `chudware_firmware` also export
   `_USE_MATH_DEFINES` to their consumers.
+- Avoid identifiers such as `near` and `far` in OCCT-facing code: the Windows SDK
+  defines them as macros even when `NOMINMAX` is set.
+- The JSON-heavy `doc/session.cpp` compiles with `/bigobj` on MSVC so native
+  document persistence does not exceed the normal COFF section count.
 - The core and host targets link `nlohmann_json` explicitly (no ambient system include on Windows).
 - `test_cam` uses `temp_directory_path()` instead of a hardcoded `/tmp`.
 
@@ -69,7 +72,6 @@ Windows portability notes baked into the build:
 ```bat
 cmake --preset windows-occt
 cmake --build --preset windows-occt
-ctest --test-dir build/windows-occt/core --output-on-failure
 ```
 
 The first configure downloads OCCT 7.9.3 (`core/cmake/ProvisionOCCT.cmake`) and the pinned
@@ -88,7 +90,6 @@ configure then prints `Polyhedral-FEA: LOCAL SOURCE <dir> @ <sha>` instead of
 ```bat
 cmake -S host -B host\build-win -G Ninja -DCMAKE_BUILD_TYPE=Release -DCHUDWARE_LTO=ON -DCHUDWARE_ENABLE_CEF=OFF
 cmake --build host\build-win
-ctest --test-dir host\build-win --output-on-failure
 ```
 
 `scripts/build_windows.ps1` runs the `windows-occt` core build and this Release/LTO host
@@ -117,6 +118,12 @@ qualification of an installed release.
 - **`/FI fix_math.h` quoting (fatal C1083).** Under the **Ninja + MSVC** generator a quoted
   force-include path leaks literal quote chars into the filename. `host/CMakeLists.txt` passes
   `/FI${path}` unquoted so Ninja quotes the whole `/FI<path>` token, which `cl` unwraps.
+- **Large scenario translation unit (fatal C1128).** The MSVC build applies `/bigobj`
+  specifically to `src/ui/scenarios.cpp`; its JSON-heavy real-UI scenarios exceed the
+  normal COFF section count.
+- **PropertyManager regression linkage.** `test_property_manager` consumes the shared
+  field-only implementation and `pm_forms.cpp`, not the entire desktop panel. MSVC's
+  `/OPT:REF` does not make unresolved GUI/worker references in that panel linkable.
 - **Engine resolution (developer builds).** With `CHUDWARE_DEVELOPER_BUILD`, `cpp_core`
   (`services/worker/cpp_core.cpp`) tries `CHUDWARE_LIBCHUDWARE`, then `libchudware.dll` beside
   the exe, then the repo-relative `build\windows-occt\bin\libchudware.dll` (and a few legacy
@@ -138,15 +145,14 @@ qualification of an installed release.
   than report success from an intact feature tree while photographing an empty viewport.
 - **glad** lives at `extern/glad` (vendored, compiled directly into the target).
 
-## 5. Python runtime + tests
+## 5. Python runtime and tests
 
 Development uses a plain virtual environment installed from `requirements.txt`:
 
 ```powershell
 py -3.13 -m venv .venv-mcp
-.venv-mcp\Scripts\python -m pip install -r requirements.txt
+.venv-mcp\Scripts\python -m pip install -r requirements.txt pytest
 $env:CHUDWARE_PYTHON = "$PWD\.venv-mcp\Scripts\python.exe"
-.venv-mcp\Scripts\python -X utf8 -m pytest services/agent -q --timeout=90
 ```
 
 `CHUDWARE_PYTHON` tells the build and staging scripts which interpreter hosts the
@@ -154,6 +160,11 @@ Python services. On POSIX the equivalent is `python3 -m venv .venv-mcp &&
 .venv-mcp/bin/python -m pip install -r requirements.txt`. Optional browser binaries and
 simulation tools keep their explicit provisioning commands; dependency setup never
 silently downloads or builds them.
+
+Native Windows Python cannot run `scripts/testbox.py` because it imports POSIX
+`fcntl`. Run isolated suites from a supported POSIX environment or host instead;
+see [Running tests](../../CONTRIBUTING.md#running-tests). Windows native build and
+test coverage also runs on GitHub Actions.
 
 ### Optional: offline wheelhouse mode
 
@@ -168,8 +179,7 @@ document, and after the operator reviews and approves it, `prepare` emits a bund
 hardening; the default developer flow above does not need it.
 
 The wheelhouse regression smoke uses synthetic wheel ZIPs, temporary venvs and a
-loopback-only fake index:
-`python -m pytest services/installer/test_wheelhouse.py scripts/test_mcp_runtime_audit.py -q`.
+loopback-only fake index; run the isolated `infra` suite from a supported POSIX host.
 
 Installed releases use compiled worker/MCP sidecars and do not provision Python; the build
 interpreter must import `packaging/requirements-release.txt` for those sidecars (see

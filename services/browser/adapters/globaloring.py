@@ -17,7 +17,7 @@ from __future__ import annotations
 import re
 
 from . import register
-from ._retail import RetailAdapter, _strip_tags
+from ._retail import RetailAdapter, _strip_tags, card_image
 
 SITE = "globaloring"
 BASE_URL = "https://www.globaloring.com"
@@ -46,6 +46,11 @@ _CARD_RE = re.compile(
 
 class GlobalORingAdapter(RetailAdapter):
     key = SITE
+    hosts = ("www.globaloring.com",)
+    result_kinds = ("product",)
+    cad_acquisition = False
+    login_required = False
+    api = False
     base_url = BASE_URL
     search_url_tmpl = SEARCH_URL_TMPL
     license_note = LICENSE_NOTE
@@ -55,16 +60,29 @@ class GlobalORingAdapter(RetailAdapter):
     def parse_search(self, content: str) -> list[dict]:
         hits: list[dict] = []
         seen: set[str] = set()
-        for m in _CARD_RE.finditer(content):
-            title = _strip_tags(m.group("title")).strip()
-            if not title:
+        for row in re.findall(r"<tr\b[^>]*>.*?</tr>", content, re.I | re.S):
+            m = next((match for match in _CARD_RE.finditer(row)
+                      if _strip_tags(match.group("title")).strip()), None)
+            if not m:
                 continue
+            title = _strip_tags(m.group("title")).strip()
             url = m.group("href")
             if url in seen:
                 continue
             seen.add(url)
+            stock = re.search(r"([\d,]+)\s+In Stock", _strip_tags(row), re.I)
+            price = re.search(r'data-price-column[^>]*>\s*\$\s*([\d,]+(?:\.\d+)?)', row, re.I)
+            description = re.search(r'<td\b[^>]*style="[^"]*font-size[^"]*"[^>]*>(.*?)</td>',
+                                    row, re.I | re.S)
+            lines = re.split(r"<br\s*/?>", description.group(1), flags=re.I) if description else []
+            material = _strip_tags(lines[1]).strip() if len(lines) > 1 else None
             hits.append({"ok": True, "title": title, "url": url, "site": SITE,
-                         "part_number": title})
+                         "sku": title, "part_number": title,
+                         "thumbnail": card_image(row, url),
+                         "stock": stock.group(1) if stock else None,
+                         "material": material or None,
+                         "price": price.group(1) if price else None,
+                         "currency": "USD" if price else None})
         return hits
 
 

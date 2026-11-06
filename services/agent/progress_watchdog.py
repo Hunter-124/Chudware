@@ -1,4 +1,4 @@
-"""Per-turn research stall detection over Chudcode RPC notifications."""
+"""Per-turn research stall detection over OMP RPC notifications."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 from urllib.parse import urlsplit
 
-from services.agent.chudcode_events import cad_result_payload
+from services.agent.omp_events import cad_result_payload
 from services.agent.online_turn import format_duration
 from services.mcp.tool_registry import RISK_READ, catalog, classify_risk
 
@@ -211,7 +211,7 @@ class ProgressWatchdog:
     def _observe_subagent(self, frame: Mapping[str, Any], host_tools: set[str]) -> str | None:
         """A task sub-agent's successful CAD mutation is the turn's progress.
 
-        Chudcode forwards a sub-agent's own events inside ``subagent_event``
+        OMP forwards a sub-agent's own events inside ``subagent_event``
         frames. Only its mutations count: its research is its own brief, and
         eight researching sub-agents must not read as the parent stalling.
         """

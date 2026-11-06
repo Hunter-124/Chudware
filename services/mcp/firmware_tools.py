@@ -24,19 +24,21 @@ from pathlib import Path
 from typing import Optional
 
 from . import core_bridge as cb
-
-
-def _dumps(payload) -> str:
-    return json.dumps(payload, indent=2)
+from ._envelopes import dumps as _dumps, error_payload
 
 
 def _err(reason: str, hint: str = "", **extra) -> dict:
     """Structured error envelope (mega-24: fw_sensor_scenario used _err without defining it)."""
-    out = {"ok": False, "error": str(reason), "code": str(reason)}
-    if hint:
-        out["hint"] = hint
-    out.update(extra)
-    return out
+    return error_payload(reason, code=str(reason), hint=hint, **extra)
+
+
+def _ecad_ref(ref: str) -> str:
+    """Resolve electronics file paths against the workspace; preserve open document IDs."""
+    suffix = Path(ref).suffix.lower() if ref else ""
+    if suffix in (".kicad_pcb", ".kicad_sch", ".json") or suffix.rstrip("+") == ".ecad":
+        from .cad_common import resolve_agent_path
+        return resolve_agent_path(ref, "electronics path")
+    return ref
 
 
 def _nonfinite_path(value, path: str = "$") -> str:
@@ -306,7 +308,7 @@ def register_firmware_tools(mcp) -> None:
                        board_doc_ref: str = "") -> str:
         """Create an embedded-firmware project (CMake + arm-none-eabi baseline) and return its id.
 
-        Pass ``board_doc_ref`` (an open ECAD board doc_id or a ``.ecad+``/``.json`` path) to link the
+        Pass ``board_doc_ref`` (an open ECAD board doc_id or a ``.kicad_pcb`` path) to link the
         firmware to a PCB: the MCU family is then auto-selected from the board's BOM when
         ``mcu_family`` is left empty, and a ``build/include/pinmap.h`` header of
         ``#define PIN_<NET> <n>`` is generated from the board's net names. Returns
@@ -321,7 +323,10 @@ def register_firmware_tools(mcp) -> None:
         if mcu_family:
             params["mcu_family"] = mcu_family
         if board_doc_ref:
-            params["board_doc_ref"] = board_doc_ref
+            try:
+                params["board_doc_ref"] = _ecad_ref(board_doc_ref)
+            except ValueError as exc:
+                return _dumps(_err("invalid_request", str(exc)))
         result = cb.call("fw_new_project", params)
         pid = (result or {}).get("project_id")
         if pid:
@@ -698,8 +703,9 @@ def register_firmware_tools(mcp) -> None:
         netlist — e.g. the firmware toggling a pin whose net is driven by a peripheral.
 
         Firmware pin references come from the project's sources (``project_id``);
-        ``pinmap.h`` itself is excluded. ``board_doc_ref``/``sch_doc_ref`` accept an open
-        ECAD doc_id or a ``.ecad+``/``.json`` path.
+        ``pinmap.h`` itself is excluded. ``board_doc_ref`` accepts an open PCB doc_id or
+        ``.kicad_pcb`` path; ``sch_doc_ref`` accepts an open schematic doc_id or
+        ``.kicad_sch`` path.
 
         Rule ids: fw_pin_unknown_net, fw_pin_not_on_mcu, fw_strap_repurposed,
         fw_direction_clash, fw_drive_input_only, fw_missing_decouple,
@@ -709,11 +715,14 @@ def register_firmware_tools(mcp) -> None:
         Advisory — findings never block; missing emulators degrade gracefully
         (``dynamic.reason``).
         """
-        p: dict = {"board_doc_ref": board_doc_ref}
+        try:
+            p: dict = {"board_doc_ref": _ecad_ref(board_doc_ref)}
+            if sch_doc_ref:
+                p["sch_doc_ref"] = _ecad_ref(sch_doc_ref)
+        except ValueError as exc:
+            return _dumps(_err("invalid_request", str(exc)))
         if project_id:
             p["project_id"] = project_id
-        if sch_doc_ref:
-            p["sch_doc_ref"] = sch_doc_ref
         if mcu_family:
             p["mcu_family"] = mcu_family
         if trace_path:
@@ -751,7 +760,7 @@ def register_firmware_tools(mcp) -> None:
         studies accept (duty-cycle heat loads), and the rails feed the system power
         budget without re-parsing raw traces.
 
-        ``board_doc_ref`` (an open ECAD doc_id or ``.ecad+``/``.json`` path) beats the
+        ``board_doc_ref`` (an open PCB doc_id or ``.kicad_pcb`` path) beats the
         project's linked board; with neither, the activity half still returns
         (``rails: []`` + coverage note). ``window_ms`` overrides the run window when the
         trace has no time-stamped events.
@@ -760,7 +769,10 @@ def register_firmware_tools(mcp) -> None:
         if project_id:
             p["project_id"] = project_id
         if board_doc_ref:
-            p["board_doc_ref"] = board_doc_ref
+            try:
+                p["board_doc_ref"] = _ecad_ref(board_doc_ref)
+            except ValueError as exc:
+                return _dumps(_err("invalid_request", str(exc)))
         if mcu_family:
             p["mcu_family"] = mcu_family
         if window_ms:

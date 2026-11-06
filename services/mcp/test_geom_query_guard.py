@@ -108,6 +108,15 @@ def test_a_readback_field_rides_along_with_a_real_predicate():
     assert out == q
 
 
+def test_fastener_evidence_is_readback_not_a_narrowing_predicate():
+    q = {"of": "face", "surf": "cylinder", "cylinder": {"radius": 2.0},
+         "bearing_annulus": None, "geometry_error": None}
+    out, _notes = normalize_geom_query(q, where="q")
+    assert out == q
+    with pytest.raises(ValueError, match="readback field"):
+        normalize_geom_query({"of": "face", "cylinder": {"radius": 2.0}}, where="q")
+
+
 def test_a_bare_domain_query_still_means_every_element():
     """{"of":"edge"} is the documented global-fillet selector; it must not be refused."""
     out, notes = normalize_geom_query({"of": "edge"}, where="q")
@@ -147,18 +156,43 @@ def test_a_bogus_sid_no_longer_fillets_the_whole_body(bored_cube):
     assert len(after.get("matches") or []) == len(before.get("matches") or [])
 
 
-@pytest.mark.parametrize("shape", ["kwarg", "dict", "string"])
+@pytest.mark.parametrize("shape", ["kwarg", "dict", "string", "kind_sid"])
 def test_query_geometry_answers_about_the_sid_it_handed_out(bored_cube, shape):
     """Live claude-opus-5: query_geometry(doc_id=…, sid="F1b1b80") answered
     "needs a geometry query". The tool puts a sid on every match and the docs tell the
     model to address that element by it, so asking about one has exactly one meaning."""
     sid = _bore_sid(bored_cube)
     kwargs = {"kwarg": {"sid": sid}, "dict": {"query": {"sid": sid}},
-              "string": {"query": sid}}[shape]
+              "string": {"query": sid}, "kind_sid": {"query": {"of": "face", "sid": sid}}}[shape]
     out = _call("query_geometry", doc_id=bored_cube, **kwargs)
     assert out.get("ok") is True, out
     assert out["count"] == 1 and out["matches"][0]["sid"] == sid, out
     assert out["matches"][0]["surf"] == "cylinder", out
+
+def test_sid_rejects_contradictory_kind_and_extra_predicates(bored_cube):
+    sid = _bore_sid(bored_cube)
+    for query in ({"of": "edge", "sid": sid}, {"of": "face", "sid": sid, "side": "top"}):
+        out = _call("query_geometry", doc_id=bored_cube, query=query)
+        assert out.get("ok") is False, out
+    out = _call("query_geometry", doc_id=bored_cube, sid=sid, of="edge")
+    assert out.get("ok") is False, out
+
+
+def test_fea_fill_guard_names_available_mesh_parameters(monkeypatch):
+    from services.mcp import cad_sim_tools as sim
+
+    native = ("geometry fill-stage guard failed at h=0.01 m: mesh/BRep volume relative "
+              "error exceeds hard limit; Reduce -h, or raise --max-elems/--max-dof")
+    monkeypatch.setattr(sim, "_build_static_study", lambda *a, **k: {"doc": "d", "study": {}})
+    monkeypatch.setattr(sim, "_autosave_all_open", lambda: None)
+    def fail(*args, **kwargs):
+        raise RuntimeError(native)
+    monkeypatch.setattr(sim, "_run_solve", fail)
+    out = _call("run_fea_static", fixtures=[], loads=[])
+    assert out["ok"] is False
+    assert native in out["error"]
+    assert "mesh_size_mm" in out["error"] and "min_size_mm" in out["error"]
+    assert "not MCP arguments" in out["error"] and "under-resolved" in out["error"]
 
 
 def test_query_geometry_names_a_stale_sid(bored_cube):
@@ -223,3 +257,24 @@ def test_a_stale_sid_in_a_ref_names_the_live_roster(rod):
     assert out.get("ok") is False, out
     assert "e000000" in str(out.get("error")), out
     assert "sids change" in str(out.get("error")), out
+
+
+def test_sid_from_before_a_mutation_is_not_retargeted(rod):
+    sid = _top_rim(rod)["sid"]
+    first = _call("add_features", doc_id=rod, ops=[
+        {"op": "add_feature", "feature": {
+            "type": "chamfer", "name": "FirstBreak", "params": {"distance": 1},
+            "refs": {"edges": [{"kind": "edge", "sid": sid}]}}}])
+    assert first.get("ok") is True, first
+    edges = _call("query_geometry", doc_id=rod, query={"of": "edge"})["matches"]
+    assert sid not in {edge["sid"] for edge in edges}, edges
+    before = _call("get_part", doc_id=rod)["tree"]
+
+    second = _call("add_features", doc_id=rod, ops=[
+        {"op": "add_feature", "feature": {
+            "type": "chamfer", "name": "SecondBreak", "params": {"distance": 1},
+            "refs": {"edges": [{"kind": "edge", "sid": sid,
+                                "centroid": [0, 0, 0]}]}}}])
+    assert second.get("ok") is False, second
+    assert sid in second.get("error", "") and "live edge sids" in second["error"].lower(), second
+    assert _call("get_part", doc_id=rod)["tree"] == before

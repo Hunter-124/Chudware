@@ -120,7 +120,7 @@ dulwich — CONTRIBUTING.md license guardrails apply) and surveyed prior art
 MyProject/                     # what the user sees: a normal folder
   Bracket.step+                # working files, exactly as today
   MainAssembly.step+
-  Controller.ecad+
+  Controller.kicad_pcb
   .aicadvault/                 # hidden: git repo (shadow tree, below)
 ```
 
@@ -136,8 +136,8 @@ items/<item_id>/geometry.step  # ONLY at releases (derived data; recomputable)
 items/<item_id>/summary.txt    # plain-language change summary (doc_diff + narration)
 ```
 
-Containers (`.step+`/`.ecad+` are ZIPs — git-hostile) are **exploded on
-check-in, re-assembled on restore**. Checkpoints store parametric JSON +
+Mechanical `.step+` containers (ZIPs — git-hostile) are **exploded on
+check-in, re-assembled on restore**. KiCad project files remain separate. Checkpoints store parametric JSON +
 thumbnail only (tiny); releases additionally freeze the geometry snapshot and
 BOM so a released rev is exact even if the rebuild engine evolves.
 

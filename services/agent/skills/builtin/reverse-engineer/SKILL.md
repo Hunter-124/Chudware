@@ -37,16 +37,28 @@ Lane B ends in geometry, so once a session produces a solid the Lane A tools app
    `list_reveng_sessions` / `get_reveng_session` resume one later.
 2. `reveng_print_scale_mat("A4")` → print the ArUco mat at 100% (never "fit to page"), tape it
    flat, stand the part ON it so markers and part appear in the same views.
-3. **Capture** with autofocus and exposure LOCKED: `reveng_add_images` (webcam or phone stills),
-   `reveng_add_video`, or `reveng_ingest_datasheet` for a catalog part — the fastest lane, no
-   photogrammetry. `import_scan_mesh` if you already own a structured-light/laser mesh.
+3. **Capture** with autofocus and exposure LOCKED: `reveng_add_images`, or `reveng_add_video`
+   for an orbit clip (frame extraction is asynchronous; poll the session run).
+   `reveng_ingest_datasheet` is a no-photogrammetry lane; `import_scan_mesh` accepts an existing
+   scan. Import Gaussian PLY, `.splat`, `.spz`, `.ksplat` with `reveng_import_splat` into a
+   clean session; `reveng_convert_splat` reports losses, `reveng_splat_to_mesh` is approximate.
    `get_reveng_coverage` reports missing orbit positions and blur; re-shoot before reconstructing.
-4. `reveng_reconstruct(session_id, quality)` — COLMAP sparse (feed-forward VGGT/MapAnything
-   fallback when under 60% of images register) → OpenMVS dense **or** Brush 3DGS splat → mesh
-   cleanup. `reveng_single_photo` is the approximate tier; see Rules.
+   If unavailable, load the continuation tools with
+   `enable_tools(tools=["reveng_gate_status", "reveng_resolve_gate", "reveng_confirm_scale"])`.
+4. `reveng_reconstruct(session_id, quality)` — one shared COLMAP dataset drives OpenMVS dense
+   mesh and the visual Brush Gaussian splat. Brush does not export a mesh. If OpenMVS is absent,
+   splat-center surface extraction is explicitly approximate. `reveng_single_photo` is also approximate.
+   Poll `reveng_gate_status(session_id=session_id)` for the paused scale and dimension gates.
+   After the human confirms each gate's evidence, call
+   `reveng_resolve_gate(session_id=session_id, decision="approve")` and follow the resumed
+   mission to its next gate or completion. The mission performs fitting and building itself;
+   the steps below also describe the corresponding manual workflow.
 5. `reveng_set_scale(session_id, "aruco_mat" | "two_point" | "known_dim", …)` — ArUco is
-   triangulated across the posed views. → **HUMAN SCALE-CONFIRM GATE**: a person accepts the
-   scale before anything proceeds. Every downstream dimension is this number times a shape.
+   triangulated across posed views. Known dimension needs the physical `value_mm` AND the
+   reconstruction-space `recon_length` (or 3D `point_a`/`point_b`); their ratio sets scale.
+   → **HUMAN SCALE-CONFIRM GATE** before dimension-critical work. If no mission is
+   active, after human confirmation use `reveng_confirm_scale(session_id=session_id)` instead;
+   never use it to resolve an active mission gate.
 6. `reveng_fit_primitives(session_id)` — RANSAC planes/cylinders/spheres/cones, cross-sections,
    and a hole-vs-boss role per cylinder. Read the roles before you build.
 7. `list_reveng_dims` → `confirm_dimensions([{key, value_mm}])`; `measure_from_photo` only where

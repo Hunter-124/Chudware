@@ -13,13 +13,15 @@
 
 #include <nlohmann/json.hpp>
 
-// pending    — waiting for the user (the card is interactive)
+// pending    — waiting for the user (the card is interactive); a batch saved open (the app
+//              closed or crashed mid-question) comes back pending with the user's draft
 // submitting — the `answer` control call is in flight
-// answered   — resolved by the card's Submit (agent.answer source "user")
+// answered   — resolved by the card's Submit (agent.answer source "user"), or sent to the agent
+//              as the conversation's next message when the run that asked is gone
 // reply      — resolved by a message typed in the composer (source "reply")
 // declined   — the user dismissed the card (source "declined")
 // cancelled  — the run stopped or the turn ended before an answer (source "cancelled")
-// expired    — the worker no longer knows the batch (its run ended / the app restarted)
+// expired    — the worker no longer knows the batch and the answers could not be handed on
 enum class AskStatus { Pending, Submitting, Answered, Reply, Declined, Cancelled, Expired };
 
 // One picked model entity for a geometry_select answer (contract §12 selection object).
@@ -68,6 +70,7 @@ struct AskBatch {
     std::string error;                   // last submit failure, or why the batch expired
     nlohmann::json answers = nlohmann::json::object();  // resolved answers {qid: RAW}
     std::string reply;                   // the composer reply that resolved it (status Reply)
+    nlohmann::json savedDraft;           // GUI-only: askDraft last flagged for persistence
 };
 
 // choice single: the "Other" row is selected.
@@ -107,8 +110,14 @@ bool askStatusOpen(AskStatus s);   // pending or submitting
 // resolution the user already made (answered/reply/declined) is never downgraded to cancelled.
 void applyAskAnswerEvent(AskBatch& b, const nlohmann::json& data);
 
-// Session-file form. Questions round-trip as their original contract objects; edit state is not
-// persisted. A batch restored still open is marked Expired: a restart drops every live run.
+// The form's in-progress answers as {qid: value}: each question's RAW answer, null when it has
+// none, or {text, unit} for a dimension whose typed text is not a number yet.
+nlohmann::json askDraft(const AskBatch& b);
+// The chat message that hands `b.answers` to the agent when the run that asked is gone.
+std::string askAnswersMessage(const AskBatch& b);
+
+// Session-file form. Questions round-trip as their original contract objects. An open batch
+// also saves its draft; restored, it is pending again with that draft in its form.
 nlohmann::json askBatchToJson(const AskBatch& b);
 AskBatch askBatchFromJson(const nlohmann::json& j);
 

@@ -1459,7 +1459,7 @@ class TestMaxSubagentDepth(unittest.TestCase):
 
 
 class TestCoordinationBoard(unittest.TestCase):
-    """Claim conflict detection, release frees, progress notes."""
+    """Shared work intents, isolated releases, and progress notes."""
 
     def setUp(self):
         from services.agent.coordination import (
@@ -1488,24 +1488,14 @@ class TestCoordinationBoard(unittest.TestCase):
         self.assertEqual(out["status"], "claimed")
         self.assertEqual(len(out["claims"]), 2)
 
-    def test_claim_conflict_detection(self):
-        self.board.register_claim("agent_a", ["doc_1"], "first claim")
-        out = self.board.register_claim(
-            "agent_b",
-            ["doc_1", "doc_2"],
-            "second claim",
+    def test_shared_and_distinct_work_both_register(self):
+        self.board.register_claim("agent_a", ["doc_1"], "bore")
+        out = self.board.register_claim("agent_b", ["doc_1", "doc_2"], "fillet")
+        self.assertTrue(out["ok"])
+        self.assertEqual(
+            {(c["agent_id"], c["resource"]) for c in self.board.board_snapshot()["claims"]},
+            {("agent_a", "doc_1"), ("agent_b", "doc_1"), ("agent_b", "doc_2")},
         )
-        self.assertFalse(out["ok"])
-        self.assertEqual(out["status"], "CONFLICT")
-        self.assertEqual(len(out["conflicts"]), 1)
-        self.assertEqual(out["conflicts"][0]["resource"], "doc_1")
-        self.assertEqual(out["conflicts"][0]["holder"], "agent_a")
-        self.assertEqual(out["conflicts"][0]["intent"], "first claim")
-        # Conflicting claim must NOT partially grant remaining resources.
-        snap = self.board.board_snapshot()
-        resources = {c["resource"] for c in snap["claims"]}
-        self.assertIn("doc_1", resources)
-        self.assertNotIn("doc_2", resources)
 
     def test_release_frees_for_other_agent(self):
         self.board.register_claim("agent_a", ["doc_1"], "hold")
@@ -1548,12 +1538,6 @@ class TestCoordinationBoard(unittest.TestCase):
         self.assertEqual(b2.board_snapshot()["claim_count"], 1)
         drop_board("r_shared")
 
-    def test_preamble_text_mentions_claims(self):
-        self.board.register_claim("agent_a", ["doc_z"], "editing")
-        text = self.board.preamble_text()
-        self.assertIn("doc_z", text)
-        self.assertIn("agent_a", text)
-        self.assertIn("coordinate_claim", text)
 
 
 if __name__ == "__main__":

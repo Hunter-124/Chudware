@@ -217,15 +217,7 @@ struct ThermalPad {
 };
 
 std::set<std::string> pad_layers_of(const json& pad, int n_cu) {
-    std::set<std::string> cu;
-    for (const auto& l : schema::copper_layer_ids(n_cu)) cu.insert(l);
-    std::string ptype = pad.value("type", std::string("smd"));
-    if (ptype == "tht" || ptype == "np_tht" || ptype == "connector") return cu;
-    std::set<std::string> out;
-    if (pad.contains("layers") && pad["layers"].is_array())
-        for (const auto& l : pad["layers"])
-            if (l.is_string() && cu.count(l.get<std::string>())) out.insert(l.get<std::string>());
-    return out;
+    return schema::pad_copper_layers(pad, n_cu);
 }
 
 std::vector<ThermalPad> thermal_pads(const json& board, const json& zone, const std::string& layer,

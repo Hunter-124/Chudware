@@ -1,15 +1,8 @@
 """services.plm.ecad_diff — semantic diff for canonical ECAD documents (PLM ext).
 
-``doc_diff`` (services/mcp/doc_diff_tools.py) only understands the part/asm
-feature-tree shape (``features``/``mates``), so comparing an ECAD item through
-``plm_compare`` used to fall through to empty change lists. :func:`ecad_diff`
-fills that gap for the ECAD document family (``aicad.pcb/1``, ``aicad.sch/1``,
-``aicad.ecad/1`` — contracts/ecad/{pcb,sch}_schema.md): an id-based diff over
-the same ordered/id-keyed sections branches.py's 3-way merge treats specially
-(``_LIST_KEYS_ECAD``, services/plm/branches.py:47-48) — here narrowed to the
-four sections a PLM change list actually surfaces per-entry: nets, components,
-footprints, tracks. This module is independent of branches.py (no merge
-internals imported); it only mirrors the same section names/id convention.
+KiCad files are imported by the native ECAD engine before reaching this module.
+The diff covers board and schematic entities as well as the original
+nets/components/footprints/tracks change-list sections.
 
 Output mirrors doc_diff's envelope style: three lists per section —
 ``<section>_added`` / ``<section>_removed`` / ``<section>_changed`` — each
@@ -29,13 +22,19 @@ from copy import deepcopy
 from typing import Any
 
 
-# The id-keyed ECAD sections this diff surfaces individually (the subset of
-# branches.py's _LIST_KEYS_ECAD a PLM change list calls out by name; vias/
-# zones/pads fold into their parent footprint/track entry's field diff).
-_SECTIONS = ("nets", "components", "footprints", "tracks")
+# Importers assign sequential internal ids on each open. KiCad UUIDs are the
+# stable identities across revisions; nets have names but no KiCad UUID.
+_SECTIONS = ("nets", "components", "footprints", "tracks", "vias", "zones", "outline",
+             "symbols", "wires", "junctions", "labels", "buses", "bus_entries",
+             "power", "no_connect", "texts", "graphics", "sheets", "sheet_symbols")
 
-_SINGULAR = {"nets": "net", "components": "component",
-            "footprints": "footprint", "tracks": "track"}
+_SINGULAR = {"nets": "net", "components": "component", "footprints": "footprint",
+             "tracks": "track", "vias": "via", "zones": "zone", "outline": "outline",
+             "symbols": "symbol",
+             "wires": "wire", "junctions": "junction", "labels": "label",
+             "buses": "bus", "bus_entries": "bus entry", "power": "power symbol",
+             "no_connect": "no-connect", "texts": "text", "graphics": "graphic",
+             "sheets": "sheet", "sheet_symbols": "sheet symbol"}
 
 # schema heads recognized as ECAD documents (mirrors
 # services/plm/branches.py:_list_keys_for_doc's aicad.pcb/aicad.sch/aicad.ecad group).
@@ -48,11 +47,24 @@ def is_ecad_schema(doc: dict[str, Any] | None) -> bool:
     return schema.split("/", 1)[0] in _ECAD_SCHEMA_HEADS
 
 
-def _by_id(items: Any) -> dict[str, dict]:
-    """Index a section's list by its 'id' field ({} for a missing/non-list section)."""
+def _by_id(section: str, items: Any) -> dict[str, dict]:
+    """Index by UUID, native id or net name; legacy outline shapes use position."""
     if not isinstance(items, list):
         return {}
-    return {item["id"]: item for item in items if isinstance(item, dict) and "id" in item}
+    indexed = {}
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        fields = item.get("fields")
+        legacy_uuid = fields.get("kicad_uuid") if isinstance(fields, dict) else None
+        key = item.get("uuid") or legacy_uuid or item.get("id")
+        if not key and section == "nets":
+            key = item.get("name")
+        if not key and section == "outline":
+            key = f"outline-{index + 1}"
+        if isinstance(key, str) and key:
+            indexed[key] = item
+    return indexed
 
 
 def _label(section: str, entity: dict, entity_id: str) -> str:
@@ -66,28 +78,40 @@ def _label(section: str, entity: dict, entity_id: str) -> str:
         if net:
             return f"{entity_id} ({net})"
         return entity_id
-    for key in ("ref", "name", "value"):
+    for key in ("ref", "name", "text", "value"):
         v = entity.get(key)
         if v:
             return str(v)
     return entity_id
 
 
+def _comparable(value: Any) -> Any:
+    """Ignore native import bookkeeping and regenerated ids beneath UUIDs."""
+    if isinstance(value, list):
+        return [_comparable(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    fields = value.get("fields")
+    has_uuid = value.get("uuid") or (isinstance(fields, dict) and fields.get("kicad_uuid"))
+    return {key: _comparable(item) for key, item in value.items()
+            if key != "kicad_original" and not (key == "id" and has_uuid)}
+
+
 def _field_changes(old: dict, new: dict) -> list[dict[str, Any]]:
     """Top-level field diffs between two same-id entities (skips ``id``)."""
     changes = []
     for k in sorted(set(old) | set(new)):
-        if k == "id":
+        if k in ("id", "kicad_original"):
             continue
         ov, nv = old.get(k), new.get(k)
-        if ov != nv:
+        if _comparable(ov) != _comparable(nv):
             changes.append({"field": k, "old": ov, "new": nv})
     return changes
 
 
 def _section_diff(section: str, old_list: Any, new_list: Any) -> dict[str, list]:
-    old = _by_id(old_list)
-    new = _by_id(new_list)
+    old = _by_id(section, old_list)
+    new = _by_id(section, new_list)
     singular = _SINGULAR[section]
 
     added = []
@@ -117,24 +141,22 @@ def _section_diff(section: str, old_list: Any, new_list: Any) -> dict[str, list]
 
 
 def ecad_diff(rev_a: dict[str, Any], rev_b: dict[str, Any]) -> dict[str, Any]:
-    """Compute an id-based semantic diff between two ECAD document dicts.
+    """Compute a stable-identity semantic diff between imported ECAD documents.
 
-    Inputs follow the canonical ECAD schemas (contracts/ecad/{pcb,sch}_schema.md).
-    Numeric values retain their full precision, as in persisted documents.
-
-    Returns a dict with three lists per section (nets/components/footprints/
-    tracks): ``<section>_added`` / ``<section>_removed`` / ``<section>_changed``.
-    Every entry carries its stable id and a short human summary; changed
-    entries additionally carry a ``changes`` list of ``{field, old, new}``.
-    A section absent from both documents (e.g. ``tracks`` on a schematic)
-    simply comes back with three empty lists.
+    Returns added/removed/changed lists for each board and schematic section.
+    Records carry a stable id and human summary; changed records also carry
+    ``{field, old, new}`` entries. Missing sections produce empty lists.
     """
     a = rev_a if isinstance(rev_a, dict) else {}
     b = rev_b if isinstance(rev_b, dict) else {}
 
     out: dict[str, Any] = {}
     for section in _SECTIONS:
-        out.update(_section_diff(section, a.get(section), b.get(section)))
+        old_section, new_section = a.get(section), b.get(section)
+        if section == "outline":
+            old_section = old_section.get("shapes") if isinstance(old_section, dict) else []
+            new_section = new_section.get("shapes") if isinstance(new_section, dict) else []
+        out.update(_section_diff(section, old_section, new_section))
     return deepcopy(out)
 
 

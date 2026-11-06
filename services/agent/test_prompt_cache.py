@@ -10,7 +10,6 @@ against the shared composition rather than merely checking internal consistency.
 from __future__ import annotations
 
 import json
-import re
 
 import pytest
 
@@ -33,14 +32,15 @@ class CapturingProvider:
 
     def __init__(self) -> None:
         self.systems: list[str] = []
+        self.messages: list[list[dict]] = []
 
     def complete(self, system, messages, **kw):  # noqa: ANN001, ANN003
         self.systems.append(system)
+        self.messages.append([dict(m) for m in messages])
         return '```json\n{"done": true, "handoff": {"summary": "stop"}}\n```'
 
 
-def _old_inline(system_prompt, tools_text, allow, *, catalog, project_root,
-                mem_blk=""):
+def _old_inline(system_prompt, tools_text, allow, *, catalog, project_root):
     """The composition exactly as ``run_turn`` wrote it inline before the
     refactor. Kept verbatim as the reference the join must reproduce."""
     system = (system_prompt or "") + "\n\n" + at._SYSTEM_BASE
@@ -51,8 +51,6 @@ def _old_inline(system_prompt, tools_text, allow, *, catalog, project_root,
         )
         system = system.rstrip() + "\n\n" + harness_context_block()
         system = system.rstrip() + "\n\n" + format_role_catalog_block()
-    if mem_blk:
-        system = system.rstrip() + "\n\n" + mem_blk
     from services.agent.project_context import project_context_block
     blk = project_context_block(project_root)
     if blk:
@@ -71,10 +69,9 @@ def _old_inline(system_prompt, tools_text, allow, *, catalog, project_root,
 def _old_linear_inline(role, capability, tier, dispatcher):
     """The composition exactly as ``run_linear_role_turn`` wrote it inline before
     the lane was routed through the cache, plus the skills catalog the lane now
-    appends so the online Chudcode turn can see its skill packs. Kept as the
+    appends so the online Omp turn can see its skill packs. Kept as the
     reference the routed path must reproduce byte for byte."""
     from services.agent import mission_dispatch as md
-    from services.agent import skills as _skills
     from services.agent.prompt_tiers import (
         assemble_system_for_capability,
         letter_from_capability,
@@ -92,10 +89,7 @@ def _old_linear_inline(role, capability, tier, dispatcher):
     except Exception:
         system_prompt = base_system_prompt
     allowed, system_prompt = md._apply_session_preferences(
-        role, allowed, system_prompt)
-    catalog = _skills.catalog_block()
-    if catalog:
-        system_prompt = system_prompt.rstrip() + "\n\n" + catalog
+        role, allowed, system_prompt, include_skills=True)
     tools_text = None
     try:
         tools_text, _meta = render_tools_block(
@@ -104,6 +98,24 @@ def _old_linear_inline(role, capability, tier, dispatcher):
     except Exception:
         tools_text = None
     return system_prompt, allowed, tools_text
+
+
+def test_preferences_follow_static_toolbox_and_skills(monkeypatch):
+    from services.agent import mission_dispatch as md, skills, tool_categories
+    from services.agent.preferences import resolve_turn_preferences
+
+    monkeypatch.setattr(md, "_role_base_prompt", lambda *a, **k: (["describe_part"], "ROLE"))
+    monkeypatch.setattr(tool_categories, "render_tool_menu", lambda loaded: "STATIC MENU")
+    monkeypatch.setattr(skills, "catalog_block", lambda: "STATIC SKILLS")
+    prefs = resolve_turn_preferences(
+        "", cfg={"copilot": {"work_style": "do_it"}}, task_kind="modelling",
+    )
+    system, _, witness = md._compose_role_prompt(
+        "general_agent", card=None, capability=None, preferences=prefs,
+    )
+    assert system.index("STATIC MENU") < system.index("STATIC SKILLS")
+    assert system.index("STATIC SKILLS") < system.index(prefs.prompt_guidance())
+    assert "STATIC SKILLS" not in witness
 
 
 @pytest.fixture
@@ -134,14 +146,13 @@ def linear_tools_memo():
 # --------------------------------------------------------------------------- join rules
 
 @pytest.mark.parametrize("catalog", [True, False])
-@pytest.mark.parametrize("mem", ["", "[MEMORY]\n- recalled"])
-def test_render_reproduces_the_live_join_byte_for_byte(catalog, mem):
+def test_render_reproduces_the_live_join_byte_for_byte(catalog):
     segs, _ = pc.static_segments(
         role_system=ROLE_SYS, tools_text=TOOLS, allowed=ALLOW,
         project_root=None, include_catalog=catalog, include_skills=False,
     )
-    assert pc.render_segments(segs, memory_block=mem) == _old_inline(
-        ROLE_SYS, TOOLS, ALLOW, catalog=catalog, project_root=None, mem_blk=mem)
+    assert pc.render_segments(segs) == _old_inline(
+        ROLE_SYS, TOOLS, ALLOW, catalog=catalog, project_root=None)
 
 
 def test_allowed_tools_fallback_uses_a_single_newline():
@@ -192,6 +203,10 @@ def test_static_composition_is_the_live_prompts_exact_prefix(monkeypatch):
     monkeypatch.setattr("services.agent.config.memory_enabled",
                         lambda *a, **k: False)
     root = "/nonexistent-project-root-for-test"
+    from services.agent import request_context
+    original_root_value = request_context.root_value
+    monkeypatch.setattr(request_context, "root_value", lambda key, default="": (
+        root if key == "CHUDWARE_PROJECT_DIR" else original_root_value(key, default)))
     prov = CapturingProvider()
     at.run_turn("say done", prov, name="general_agent",
                 system_prompt=ROLE_SYS, tools_text=TOOLS,
@@ -210,28 +225,87 @@ def test_static_composition_is_the_live_prompts_exact_prefix(monkeypatch):
     )
 
 
-def test_memory_block_lands_at_its_named_slot():
-    """The memory block goes directly after MEMORY_SLOT, not at the end."""
-    segs, _ = pc.static_segments(
-        role_system=ROLE_SYS, tools_text=TOOLS, allowed=ALLOW,
-        project_root=None, include_catalog=True, include_skills=False,
+def _stable_turn_kwargs():
+    return dict(
+        name="general_agent", system_prompt=ROLE_SYS, tools_text=TOOLS,
+        allowed_tools=ALLOW, max_tool_calls=1, run_id="one-conversation",
     )
-    idx = next(i for i, s in enumerate(segs) if s.label == pc.MEMORY_SLOT)
-    head = pc.render_segments(segs[:idx + 1])
-    out = pc.render_segments(segs, memory_block="[MEM]")
-    assert out.startswith(head.rstrip() + "\n\n[MEM]")
-    assert not out.endswith("[MEM]"), "memory must not be appended at the end"
 
 
-def test_memory_slot_exists_even_without_the_catalog_blocks():
-    """A non-first turn suppresses the catalog blocks. Without a placeholder
-    slot the memory block would be silently DROPPED rather than spliced."""
-    segs, _ = pc.static_segments(
-        role_system=ROLE_SYS, tools_text=TOOLS, allowed=ALLOW,
-        project_root=None, include_catalog=False, include_skills=False,
+def test_system_prompt_is_identical_across_turns_with_different_requests(monkeypatch):
+    """A prefix-caching local server only reuses its cache for an identical
+    prefix. Project-memory recall and request-triggered skill bodies are keyed on
+    the request, so they must ride at the tail of the user message — and the
+    catalog must not be sent on the first turn only — or every turn's system
+    prompt differs from the last."""
+    from services.agent import project_memory as pm
+
+    monkeypatch.setattr("services.agent.config.memory_enabled", lambda *a, **k: True)
+    monkeypatch.setattr(pm, "resolve_project_root", lambda *_a, **_k: "/nonexistent-root")
+    monkeypatch.setattr(
+        pm, "recall", lambda _root, request, **_k: [{"text": request, "tokens": 1}])
+    monkeypatch.setattr(
+        pm, "format_for_context", lambda hits: "[MEMORY]\n" + hits[0]["text"])
+
+    first, second = CapturingProvider(), CapturingProvider()
+    at.run_turn("make me a bracket 50mm long", first, **_stable_turn_kwargs())
+    at.run_turn("now make a 2D drawing of it", second, **_stable_turn_kwargs())
+
+    assert first.systems[0] == second.systems[0]
+    assert "[MEMORY]" not in first.systems[0]
+    # No history, so the request is the first message; trigger advisories the
+    # loop injects afterwards are separate messages.
+    tail = second.messages[0][0]["content"][0]["text"]
+    assert tail.startswith("now make a 2D drawing of it")
+    assert "[MEMORY]\nnow make a 2D drawing of it" in tail
+
+
+def test_system_prompt_ignores_the_per_turn_mode():
+    """Copilot mode is enforced at dispatch and announced at the user-message
+    tail; it must not rewrite the system prompt."""
+    agent, plan = CapturingProvider(), CapturingProvider()
+    at.run_turn("say done", agent, mode="agent", **_stable_turn_kwargs())
+    at.run_turn("say done", plan, mode="plan", **_stable_turn_kwargs())
+
+    assert agent.systems[0] == plan.systems[0]
+    assert "[turn mode: plan]" in plan.messages[0][0]["content"][0]["text"]
+    assert "[turn mode" not in agent.messages[0][0]["content"][0]["text"]
+
+
+def test_enabling_tools_mid_turn_appends_instead_of_rewriting_the_system_prompt():
+    """``enable_tools`` used to splice the re-rendered tools block into the
+    system prompt mid-turn, invalidating the whole provider cache. The new
+    schemas now arrive as one appended message and every earlier byte stays."""
+
+    class Scripted(CapturingProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.replies = [
+                '```json\n{"tool": "enable_tools", "args": {"tools": ["measure_part"]}}\n```',
+                '```json\n{"done": true, "handoff": {"summary": "stop"}}\n```',
+            ]
+
+        def complete(self, system, messages, **kw):  # noqa: ANN001, ANN003
+            super().complete(system, messages, **kw)
+            return self.replies.pop(0) if len(self.replies) > 1 else self.replies[0]
+
+    prov = Scripted()
+    at.run_turn(
+        "enable the measuring tool", prov, name="general_agent",
+        system_prompt=ROLE_SYS, tools_text=TOOLS,
+        allowed_tools=["enable_tools", "list_tool_categories"],
+        max_tool_calls=4, tool_dispatch=lambda t, a: {"ok": True},
     )
-    assert any(s.label == pc.MEMORY_SLOT for s in segs)
-    assert "[MEM]" in pc.render_segments(segs, memory_block="[MEM]")
+
+    assert len(prov.systems) >= 2
+    assert len(set(prov.systems)) == 1, "the system prompt changed mid-turn"
+    before, after = prov.messages[0], prov.messages[1]
+    assert after[:len(before)] == before, "an earlier message was rewritten"
+    appended = "\n".join(
+        m["content"] if isinstance(m["content"], str) else m["content"][0]["text"]
+        for m in after[len(before):]
+    )
+    assert "[tools enabled]" in appended and "measure_part" in appended
 
 
 def test_skills_block_is_opt_out_for_run_turn():
@@ -274,56 +348,6 @@ def test_linear_lane_prompt_is_byte_identical_to_the_inline_composition(
     assert routed[2] == reference[2], "the tools block drifted"
 
 
-@pytest.mark.parametrize("role", ["general_agent", "sim_engineer"])
-def test_the_online_role_prompt_carries_the_skills_catalog_and_its_fetch_verb(
-        isolated_cache, role):
-    """The ONLINE lane's only source of skill visibility.
-
-    ``worker_rpc._agent_admin_turn`` and ``chudcode_roles`` both compose their
-    system prompt with ``role_prompt`` and hand it straight to Chudcode, which
-    never consults ``services.agent.skills``. Before this block, a role card's "full procedure:
-    skill://assembly-merge" reached a model whose only ``skill://`` resolver was
-    Chudcode's own foreign registry — live mission-18d24905b774203f answered
-    "Unknown skill: assembly-merge" and fell back to the card's summary.
-    """
-    from services.agent import mission_dispatch as md
-
-    system_prompt, allowed = md.role_prompt(role)
-
-    assert "[SKILLS]" in system_prompt, "the online lane lost the skills catalog"
-    assert "assembly-merge" in system_prompt and "simulate" in system_prompt
-    assert 'cad_skill(name="<name>")' in system_prompt
-    # The catalog's own warning names the scheme; a POINTER (skill://<name>) is
-    # what sent the model to Chudcode's `read` builtin.
-    assert not re.search(r"skill://[a-z0-9]", system_prompt), (
-        "a skill:// pointer resolves against Chudcode's own registry, not CAD's")
-    assert "cad_skill" in allowed, "the catalog names a tool the lane cannot call"
-    if role == "general_agent":
-        # Acquisition policy reaches the actual composed Chudcode prompt once;
-        # repeating it in the role, global header, and skill catalog invites
-        # contradictory search-first behavior on a servo reference request.
-        assert system_prompt.count("REFERENCE ACQUISITION ORDER") == 1
-        assert system_prompt.index("part_search / make_standard_part") < system_prompt.index(
-            "match_model / part_source") < system_prompt.index("fetch_cad_model(url)")
-        assert system_prompt.index("fetch_cad_model(url)") < system_prompt.index(
-            "Web search only for specs/datasheets")
-        # The live MG90S turn sourced a servo, then deliberated for 25 minutes
-        # without saving a bracket. The composed prompt must move from a short
-        # project artifact to incremental saved parts and then assembly.
-        assert system_prompt.count("MULTI-PART MECHANISMS") == 1
-        assert system_prompt.index('fs_write(path="design/layout.md"') < system_prompt.index(
-            "new_part + add_features") < system_prompt.index(
-            "asm_add_component(fixed=True)") < system_prompt.index(
-            "simulate_motion")
-        assert 'value={"value": 0,' in system_prompt
-        assert '"axis_point":' in system_prompt
-        assert "mate EVERY joint" in system_prompt
-        # YAML's literal block preserves wrapping; the policy is a sentence,
-        # not a requirement on where the role card breaks its lines.
-        assert "Never use hand-rolled kinematics or throwaway pose assemblies" in (
-            " ".join(system_prompt.split()))
-        assert "few minutes deliberating without producing a file or a CAD change" in system_prompt
-
 
 def test_a_repeat_turn_reuses_the_tools_block_but_a_new_fingerprint_recomposes(
         isolated_cache, linear_tools_memo, tmp_path, monkeypatch):
@@ -362,13 +386,6 @@ def test_a_repeat_turn_reuses_the_tools_block_but_a_new_fingerprint_recomposes(
     first = _turn()
     assert first[2], "the tools slot must render on the first turn"
     after_first = len(rendered)
-    # The MG90S arm turn researched the web without ever loading the sourcing
-    # tools. Check the rendered frontier prompt, not just an allowlist: these
-    # schemas must be visible in the model's immediate CAD tool surface.
-    for name in ("part_search", "part_get", "part_source", "match_model",
-                 "make_standard_part", "list_standard_parts", "fetch_cad_model",
-                 "import_artifact"):
-        assert f"- {name}(" in first[2], name
     assert after_first >= 1
 
     second = _turn()

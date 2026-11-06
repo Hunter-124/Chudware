@@ -148,9 +148,7 @@ def _feature_count(resp: dict) -> int:
 
 
 def test_two_gui_users_interleave_and_stamp_user(scratch_daemon):
-    """A creates; B sees doc.opened. Interleaved applies fan out doc.changed
-    with user.id/display matching the writer. CAS loser gets stale_revision;
-    retry lands — final feature count equals total applied (no lost updates)."""
+    """Interleaved writes apply sequentially and events identify each GUI writer."""
     a = _gui("a@x", "Alice")
     scratch_daemon.append(_pid(a))
     b = _gui("b@x", "Bob")
@@ -160,7 +158,7 @@ def test_two_gui_users_interleave_and_stamp_user(scratch_daemon):
     opened = _wait_events(b, "doc.opened")
     assert any((e.get("data") or {}).get("doc_id") == doc for e in opened), opened
 
-    # Second writer attach (advisory-plus) so CAS injection is live.
+    # Second writer attaches without requiring a revision resync between writes.
     assert b.call("attach_doc", {"doc_id": doc, "mode": "rw"}).get("ok") is True
 
     # Drain any open noise so the next changed events are clean.
@@ -177,13 +175,7 @@ def test_two_gui_users_interleave_and_stamp_user(scratch_daemon):
     assert d.get("doc_id") == doc and d.get("revision") == 1
     assert _user_of(changed_b[-1]) == {"id": "a@x", "display": "Alice"}, changed_b[-1]
 
-    # --- B applies without resync → stale_revision (CAS) ---
-    r_b = b.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops("bob_stale")})
-    assert r_b.get("_is_error") is True, r_b
-    assert r_b.get("code") == "stale_revision", r_b
-
-    # CAS-retry: resync last-seen via doc_tree, then apply lands as rev 2.
-    b.call("doc_tree", {"doc_id": doc})
+    # B applies without resync; the daemon serializes the implicit batch.
     r_b2 = b.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops("bob1")})
     assert not r_b2.get("_is_error"), r_b2
     assert r_b2.get("revision") == 2
@@ -194,22 +186,21 @@ def test_two_gui_users_interleave_and_stamp_user(scratch_daemon):
     assert d2.get("doc_id") == doc and d2.get("revision") == 2
     assert _user_of(changed_a[-1]) == {"id": "b@x", "display": "Bob"}, changed_a[-1]
 
-    # --- Interleave more writes (each resyncs first so CAS stays happy) ---
-    a.call("doc_tree", {"doc_id": doc})
+    # --- Interleave more writes without explicit resync ---
     r_a2 = a.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops("alice2")})
     assert not r_a2.get("_is_error"), r_a2
     assert r_a2.get("revision") == 3
     ch_b2 = _wait_events(b, "doc.changed")
     assert ch_b2 and _user_of(ch_b2[-1]) == {"id": "a@x", "display": "Alice"}
 
-    b.call("doc_tree", {"doc_id": doc})
+    # B also writes without first fetching the new revision.
     r_b3 = b.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops("bob2")})
     assert not r_b3.get("_is_error"), r_b3
     assert r_b3.get("revision") == 4
     ch_a2 = _wait_events(a, "doc.changed")
     assert ch_a2 and _user_of(ch_a2[-1]) == {"id": "b@x", "display": "Bob"}
 
-    # Final: 4 successful applies (1 stale was not applied) — no lost updates.
+    # Final: 4 successful applies — no lost updates.
     tree = a.call("doc_tree", {"doc_id": doc})
     assert not tree.get("_is_error"), tree
     final_rev = int(tree.get("revision") or r_b3.get("revision") or 0)

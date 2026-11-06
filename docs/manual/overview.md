@@ -8,6 +8,8 @@ WORKFLOW
   2. add_features([ ...ops... ])            build with standard features (vocabulary below).
                                             Returns per-feature status + body count + volume
                                             so you can see a dropped cut or a stray body.
+                                            A raw running reply is a job handoff: wait_job(job_id),
+                                            then inspect result. The checked helper joins auto-backgrounded jobs.
                                             A `sketch` feature should carry geometric RELATIONS
                                             (coincident/horizontal/parallel/tangent/...) + DRIVING
                                             DIMENSIONS, not loose geometry; check_sketch("s1")
@@ -22,6 +24,9 @@ WORKFLOW
                                             A suppressed run (trivial batch, CHUDWARE_PREFLIGHT=0,
                                             or a preflight error) returns verdict "skipped" with
                                             the reason in skipped/skipped_detail.
+                                            It uses the SAME normalization and sketch
+                                            auto-definition as add_features. Pass the same
+                                            auto_define=False to both when leaving sketches free.
                                             An invalid fillet/chamfer solid is rejected even if
                                             OCCT reports construction success. Atomic failure keeps
                                             the prior live tree/revision; regen_diagnosis uses the
@@ -37,7 +42,9 @@ WORKFLOW
                                             dimmed; a SECTION tile with ghosted outline when it
                                             is internal). render_part(view="right" |
                                             {"azimuth":30,"elevation":20} | "auto") = one
-                                            single shot instead. render_views() = the planner's
+                                            single shot instead. distance=0 or null auto-fits;
+                                            target="k9" selects an assembly component.
+                                            render_views() = the planner's
                                             7-view set (views=[...] for a fixed drawing set);
                                             contact_sheet() = the 4-view grid or named views.
                                             inspect_feature(target): planner close-ups +
@@ -45,44 +52,84 @@ WORKFLOW
                                             excerpt; inspect_part(target) one framed close-up;
                                             look_around(target) N planner angles. Numbers
                                             first — do not render after every mutation.
-  4. measure_part() / query_geometry(q)     check mass/bbox, or explore faces/edges.
+  4. measure_part() / query_geometry(q)     volume_mm3 is also top-level; mass properties
+                                            including mass_g remain under result["mass"].
+                                            inspect_section reports the whole plane even when
+                                            given a visual target_center hint; explore faces/edges.
      set_material("aluminum" | {color,...})  store a named engineering material + matching
                                             appearance (explicit colour dicts are visual-only).
   5. run_fea_static(...) / run_cfd_flow(...) prove it (see cad_guide("simulation")).
-  6. save_part()                            save the NATIVE .step+ — the editable feature tree
-                                            PLUS its simulation studies + any drawings, in one
-                                            file the desktop app reopens fully editable. This is
-                                            Chudware's native format; save to it to hand the user a
-                                            part they can keep working on (not a flattened mesh).
-  7. export_part(fmt) / make_drawing()      hand off a NON-native interchange/mesh file
-                                            (STEP/IGES/BREP exact, STL/OBJ/3MF mesh) or a
-                                            dimensioned 2D drawing.
+  6. Native .step+ persistence              Agent edits persist automatically unless human
+                                            edits are pending. save_part(path=...) chooses
+                                            an explicit editable destination when needed.
+  7. export_part(fmt) / make_drawing()      hand off an interchange/mesh file or drawing.
+     export_part(fmt="draw+", doc_id=<drawing_id>, path="sheet.draw+") saves a standalone
+     native drawing; save_part instead takes its open source part/assembly.
 
-Address geometry in PLAIN WORDS (no coordinates, no face numbers): "the top face", "all
-edges", "the vertical edges", "the largest round face". The engine resolves the words to
-topology. cad_guide("review") explains how to read the annotated render. The full op
-vocabulary, with worked examples, follows.
+Prefer structured geometry queries: {"of":"face","side":"top"} for the top face,
+{"of":"edge","parallel":"z"} for vertical edges. Simple side words and recognized
+tokens are accepted, but free prose does not preserve arbitrary conditions or
+coordinates. Inspect matches with query_geometry before editing; use explicit
+near/count/pick predicates when needed. cad_guide("review") explains the annotated render.
 
-DOC OWNERSHIP & SAVE DISCIPLINE
-  Docs you mint (new_part/new_assembly/import) are AI-OWNED. The user sees them live in a
-  mirror tab while you work; when you finish (detach/close/disconnect) the app AUTO-CLOSES
-  that live view unless the user is actively viewing or has adopted it by editing. So the
-  responsibility to preserve work is YOURS, not the user's:
-    * save_part(path=...) every DELIVERABLE before you finish — this is the hand-off.
-    * close_part(discard=True) for SCRATCH docs you don't want kept.
-  An unsaved AI doc that's just abandoned is retired to a crash-recovery tier — a safety
-  net, NOT a delivery mechanism, and never surfaced to the user as a warning. If the user
-  edits your doc they ADOPT it (it becomes theirs); you keep co-editing the same live doc.
-  Explicit save_part/export_part relative paths (e.g. "parts/redesign/base.step+") use
-  the selected workspace: CHUDWARE_PROJECT_DIR, then CHUDWARE_FS_ROOT, independent of
+ASYNCHRONOUS SHARED WORK
+  Agents may edit the same or different documents without exclusive custody.
+  Explicit delegation settings govern the depth cap. Without a setting, an explicit
+  request to use subagents can enable delegation for the turn.
+  Pass doc_id explicitly in delegated/shared work; each embedded agent otherwise
+  has its own current part. A bare call never adopts another agent's AI document.
+  list_parts() plus an explicit doc_id joins existing work without changing the
+  human's viewport. Closed handles refuse rather than redirecting to another part.
+  Live turns retain opened, attached or read documents between tool calls. If a
+  doc_not_found gives an exact import_part(path=..., resume=True), use that saved
+  file; otherwise check recover_parts(all=True) before reopening an older file.
+  The engine serializes atomic edit batches in arrival order. A later valid edit
+  to the same feature wins; this is not a semantic merge. Read current geometry
+  before dependent edits, share feature ids and interfaces, and verify the combined
+  part after writers finish. Coordination-board claims are optional work notices,
+  never permission or a reason to wait for release. Save the final native revision.
+
+EMBEDDED PYTHON EVAL
+  Await CAD calls and check ok:false before reading success-only keys. Tool replies
+  have different shapes: inspect the returned object rather than assuming fields from
+  another tool. Forwarding helpers use a positional-only selector:
+    async def cad(tool_name, /, **args):
+  This leaves name= (and even tool_name=) available inside **args for the CAD tool.
+  The edit-part skill includes the complete checked transport helper. Its
+  details.xdev.inner is already decoded: structured results are objects or arrays,
+  while cad_guide and cad_skill results are plain text. Do not JSON-decode strings.
+  The helper joins auto_backgrounded jobs and loads structured _truncated.full_result
+  and spilled text JSON before checking ok or using fields. Recover the saved reply,
+  not a second execution.
+  Prefer summary/feature-filtered get_part reads; print only needed fields.
+  Inspect diagnostic findings even when a completed validation reports ok:false.
+  Reading or writing an inactive CAD xd:// device enables it for the conversation,
+  subject to tool policy. Discover names with list_tool_categories. If explicitly using
+  enable_tools, wait for it to succeed before using that device in another call.
+
+PRESENTATION & SAVE DISCIPLINE
+  New/imported AI documents stay out of the viewport while you work. Saving, building,
+  or finishing does not open a tab. Call show_in_app(doc_id) explicitly for a product
+  or artifact you choose to present; it does not save or take editing custody.
+  Documents the user opens themselves remain live and keep receiving your edits.
+  Presentation preserves the user's selection and does not reopen a dismissed tab.
+  Agent edits persist automatically unless human edits are pending; never ask the user
+  to save AI work. AI recovery is automatic when the backing file is unchanged; conflicts
+  are retained for agent recovery. External file rewrites refresh open documents unless
+  human edits require conflict resolution. Use save_part for an explicit destination;
+  close_part(discard=True), also close_part(save=False), discards scratch docs.
+  Sharing edits or presenting a document never requires exclusive ownership.
+  Relative import_part/save_part/export_part paths (e.g. "parts/redesign/base.step+") use
+  the selected workspace: request-scoped CHUDWARE_PROJECT_DIR, then CHUDWARE_FS_ROOT, independent of
   worker cwd or continuation. A selected nested workspace is not widened to a parent
   project/repository. Without a valid project root, pass an absolute path. Absolute
   and "~" destinations may be outside the workspace, but credential/key locations
   are refused after resolving symlinks. Pathless saves keep an existing native file
   in place, otherwise use CHUDWARE_PROJECT_SAVE_DIR (temp only with no project).
   Native STL export refuses collapsed facets or a source-solid mesh that is not closed
-  and consistently oriented in the serialized output. It does not heal geometry or
-  weld nearby points. Keep the native error and inspect the source/export conditions
+  and consistently oriented in the serialized output. validation_stages separates passed
+  facet checks from the explicitly skipped B-rep round-trip; it is not mesh reimport proof.
+  It does not heal geometry or weld nearby points. Inspect the source/export conditions
   rather than deleting triangles or claiming an unchecked mesh is print-ready.
 
 PRIMITIVE PLACEMENT & ORIENTATION (box / cylinder / sphere / cone / torus)
@@ -97,8 +144,11 @@ PRIMITIVE PLACEMENT & ORIENTATION (box / cylinder / sphere / cone / torus)
                a SIDEWAYS cylinder/cone/box without falling back to sketch+extrude.
     centered   false = the natural base/corner sits at `at` (box corner, cylinder/cone base
                centre) instead of the centroid. Default true.
-    mode       "boss" fuse into the running body (default) | "cut" subtract it.
-    merge      false = start a NEW body instead of fusing into the current one.
+    mode       "new" starts a body | "add"/"boss" fuses (default) | "cut" subtracts.
+               Primitive params.mode also accepts the existing boolean aliases:
+               new_body/newbody/none -> new; union/join/fuse/merge/weld -> boss;
+               subtract/difference/remove -> cut. Prefer canonical modes.
+    merge      false = start a NEW body instead of fusing; overrides a valid mode.
   Transform order: build centred -> rotate local +Z onto `axis` about the origin -> apply the
   `centered:false` base offset ALONG THE ROTATED AXIS -> translate by `at` -> add `at_offset`.
 
@@ -129,7 +179,7 @@ PRIMITIVE PLACEMENT & ORIENTATION (box / cylinder / sphere / cone / torus)
   intersects the body — a boss that adds no material is REJECTED, not silently ignored.
 
 GEOMETRY QUERY GRAMMAR (query_geometry, refs.*, at:{...}, FEA fixtures/loads, asm_mate)
-  A query is a STRUCTURED OBJECT (or a bare side word like "top"/"+z"), never a sentence:
+  Prefer a STRUCTURED OBJECT; a bare side word like "top"/"+z" also works:
     of             "face" | "edge".  OPTIONAL — defaults to "face".
     side           top | bottom | left | right | front | back, or "+z"/"-x"/... — which way
                    it faces. With pick "largest"/"smallest": the largest face facing that way.
@@ -139,7 +189,7 @@ GEOMETRY QUERY GRAMMAR (query_geometry, refs.*, at:{...}, FEA fixtures/loads, as
     perpendicular  same value forms — keep only geometry perpendicular to that direction.
                    NOTE a face's direction is its NORMAL, an edge's is the way it RUNS. So a
                    VERTICAL WALL FACE is perpendicular:"z" (its normal is horizontal) while a
-                   VERTICAL EDGE is parallel:"z". "Vertical"/"horizontal" are not query words.
+                   VERTICAL EDGE is parallel:"z".
     pick           largest | smallest | longest | shortest | inner | outer — narrow a
                    multi-match to the one you mean (also "index":[i]).
     near           [x,y,z] (+ "count") — the face/edge nearest a point ON it (or at its
@@ -151,10 +201,11 @@ GEOMETRY QUERY GRAMMAR (query_geometry, refs.*, at:{...}, FEA fixtures/loads, as
     {"of":"face","surf":"round","pick":"outer"}               the outer cylindrical wall
     {"of":"edge","surf":"line","parallel":"z"}                the vertical straight edges
     {"of":"face","surf":"flat","perpendicular":"z"}           the upright flat wall faces
-  A FREE-TEXT SENTENCE IS NOT A QUERY. "the outer cylindrical wall face at bottom near
-  x=200,y=0" is not parseable geometry — EXPLORE first with describe_part() /
-  query_geometry({"of":"face"}) / hover(sid) to see what the part actually has, then SELECT
-  with a structured query built from the keys above.
+  Token phrases can express simple side/surface/orientation/pick predicates, but are
+  not arbitrary natural-language queries. For "the outer cylindrical wall near x=200",
+  state near:[200,y,z] explicitly in the query; prose coordinates do not narrow it.
+  EXPLORE first with describe_part() / query_geometry({"of":"face"}) / hover(sid),
+  then SELECT with a structured query built from the keys above.
 
 ================================================================================
 DOC OPS CHEATSHEET. You emit a JSON array of document ops. Units mm / degrees.
@@ -195,13 +246,13 @@ approximate a curved or organic body with a stack of boxes.
   - A plain rectangular/cylindrical block            -> a primitive (box/cylinder) is fine.
 Use a raw `script` feature ONLY when no combination of the features below can express the geometry.
 
-READ THE RESULT — add_feature's response carries a `changes` summary ("added 2 faces
-(+2 cylinder); 2 new bore/hole(s); volume 24000→23435; part bbox 60x40x20 mm"), or
-"no geometry change", or "volume effectively UNCHANGED ... too small to be real material",
-or an "ENGINE WARNING:" prefix naming exactly what the kernel objected to. `changes.bbox_mm`
-is the whole part's overall size — check it against the size you were asked for instead of
-spending a measure_part call. Read all of this before building the next feature on the
-mutation instead of assuming the op did what you meant.
+READ THE RESULT — inspect `changes`, feature status and warnings before building on a mutation.
+Display-derived volume and its delta are approximate; a delta is omitted when no revision-correct
+baseline exists. `bore_faces_delta` counts cylindrical bore faces, not physical holes.
+`body_count` counts physical solids; `logical_member_count` counts compiled logical members.
+`changes.bbox_mm` is the whole part's overall size. Use measure_part for B-rep mass properties
+under `result["mass"]`, including `volume_mm3` and `mass_g`; verify critical geometry.
+Overlap warnings compare raw pre-boolean tools, not measured material removed or added.
 
 ----------------------------------------------------------------- ADD geometry (op "add_feature")
 
@@ -241,8 +292,10 @@ SKETCH + a 2D-profile feature — this is how you make anything that is not a ba
      {"id":"c2","type":"radius","refs":["e1"],"value":{"value":8,"expr":null}}.
      Use unique eN/cN ids. Symmetric profiles use a construction centerline or axis.v;
      dimension only independent half-sizes/spacing. Use real tangent arcs/lines for slots,
-     not faceted polylines/splines. Require check_sketch: closed, dof == 0, not pinned_only,
-     no conflicts/skipped constraints. Never blanket-fix authored profiles.
+     not faceted polylines/splines. Require check_sketch: dof == 0, not pinned_only,
+     no conflicts/skipped constraints. Close profiles for features that require regions, but
+     leave intentional rib and sweep paths open; revolve can auto-close a profile to its axis.
+     Never blanket-fix authored profiles or delete a partially dependent constraint wholesale.
      add_features defaults auto_define:true after explicit intent. Staged work opts out
      with call auto_define:false or auto_define:false on feature/params/authoring op.
      Then explicitly define before use; initial entity coordinates are not constraints.
@@ -250,6 +303,10 @@ SKETCH + a 2D-profile feature — this is how you make anything that is not a ba
      EXTRUDE  params {mode:"boss"|"cut", end:"blind"|"through_all", depth:<mm>},
               refs.profile = [{"kind":"region","sketch":"$<idx>"|"f<id>","centroid":[x,y],"hint_index":0}]
               (extrudes/cuts ALL the sketch's regions).
+              A blind cut starts along the sketch normal; set params.flip:true to reverse it.
+              For a simple blind cut with no explicit direction or flip, the engine tries
+              the opposite direction only when the first removes NO material. A wrong-side
+              cut that intersects material does not auto-correct. Inspect the result.
      REVOLVE  params {mode, angle:{value:360,...}}, refs.profile = [region],
               refs.axis = an axis datum {"kind":"datum","feature":"axis.x"|"axis.y"|"axis.z"}
               (or a sketch line edge). The profile must lie OUTSIDE / beside the axis (offset it).
@@ -263,13 +320,15 @@ needed), same vocabulary for faces AND edges. INSPECT before you ACT: when you c
 geometry with certainty, call query_geometry FIRST and build the pick from what it returns
 rather than guessing a filter. You never need a face number, an edge number, or a coordinate.
   fillet  params {radius} refs.edges = {"of":"edge", ...}
-          VARIABLE-RADIUS: add params.radius2 — a linear taper r→r2 along each edge (requires
-          explicit edge picks, not a direction filter). e.g. r=3, radius2=1 tapers each selected
-          edge from 3mm to 1mm.
+          VARIABLE-RADIUS: params {type:"variable", radius:r, radius2:r2} assigns the edge
+          START/END radii along OCCT's contour interpolation, not a guaranteed linear taper.
+          refs.edges accepts selectors or queries, including {"of":"edge","parallel":"z"}.
   chamfer params {length} refs.edges = {...}
           ASYMMETRIC: add params.length2 — leg d1=length on one incident face, d2=length2 on the
           other (requires explicit edge picks). e.g. length=2, length2=0.5.
   shell   {thickness} refs.remove = {"of":"face","side":"top"}   (omit remove = closed shell)
+          In add_features, shell_all:true also means a closed shell; it conflicts with selected
+          faces to remove. Omit the flag and provide refs.remove to make an open shell.
   draft   params {angle (deg)}, refs.neutral = a planar datum OR a face query (the parting/neutral
           plane — the hinge about which faces tilt), refs.faces = the faces to taper {"of":"face",...}
           Optional refs.pull = an axis datum (pull direction; defaults to neutral plane normal).
@@ -319,8 +378,8 @@ itself; use it as refs.path of a SWEEP to make a spring, coil, or thread.
    "refs":{"base":"plane.top"}}
 
 RIB — thin support web grown from an open sketch contour (type "rib"). The sketch must contain
-  an OPEN line/arc/spline that bridges the body. The engine drops the contour inward toward the
-  body centroid, thickens it by `thickness`, trims it to the body bbox, and fuses it.
+  an OPEN line/arc/spline that bridges the body. The engine considers both drop directions
+  against actual support; ambiguous, detached, unbounded or ineffective webs are refused.
   refs.profile = [region selector pointing at the open contour sketch]. Optional params.thickness
   (default 3mm). The sketch plane is typically a side face or datum plane; the rib web grows
   perpendicular to that plane.
@@ -378,6 +437,12 @@ for the common machining features; they take a face in plain words and need no p
           world_center?:[x,y,z]}. refs.face = a face query (defaults to the top face); the ring
           is centred on the face centre, or on world_center (a point on the ring's axis). e.g. 6×⌀5 on a 40mm circle:
           {"type":"bolt_circle","params":{"diameter":5,"count":6,"pcd":40},"refs":{"face":{"of":"face","side":"top"}}}
+  thread — real helical cut or raised ridge on refs.target_face (a cylindrical face). Use
+          size or both major_dia + pitch; omit length for the full run. `turns` caps swept
+          turns (default 24, including end extensions); insufficient cap or failed real
+          geometry rejects the operation, never silently shortens it or switches to cosmetic.
+          Explicit cosmetic makes no physical thread; preview/draft is provisional only.
+          Detail: cheatsheets/thread.
   rib    — a thin web from an open sketch profile. refs.profile = [region]. (See sheet if present.)
   standard_part — a catalog HARDWARE part expanded into normal editable tree features (same
           generators as parts_make). PREFER over hand-modeling stock hardware. params {family
@@ -393,8 +458,9 @@ its own detailed cheatsheet; the essentials to invoke them:
     [region], makes the flat base AND marks the part as sheet metal; then bend walls off its straight
     top-rim edges with sm_edge_flange {length,angle} / sm_hem {hem_type} / sm_jog {offset,angle}, each
     refs.edge = ONE straight edge on a thickness face — query_geometry({"of":"edge","surf":"line",
-    "near":[x,y,z],"count":1}) FIRST and pass the RESOLVED match back (this slot rejects a bare query);
-    sm_flat_pattern unfolds the developed blank. Detail: cheatsheets/sheetmetal.
+    "near":[x,y,z],"count":1}) FIRST and pass the RESOLVED match back (this slot rejects a bare query).
+    Model reliefs with editable through-cuts; add sm_flat_pattern before export_flat_dxf for
+    OUTLINE/BEND/CUTS layers. Detail: cad_guide("sheetmetal") and cad_guide("sm_relief").
   WELDMENTS (weld_*) — a frame of stock members. Sketch the centerline PATH, then weld_member
     {profile, +per-profile dims, joint:"miter"|"butt"|"cope"} -> ONE member body per path segment.
     profiles: square_tube/rect_tube/round_tube/angle_L/flat_bar/c_channel/i_beam/t_section. ! refs.sketch
@@ -508,7 +574,8 @@ sketch_convert      {"op":"sketch_convert","sketch":"f1","refs":[{"kind":"edge",
                     Then use e.g. coincident refs:["e1.p1","$<convert-index>.p"] for a vertex.
 
 sketch_fillet       {"op":"sketch_fillet","sketch":"f1","e1":"e1","e2":"e2","radius":2}
-                    Line-line corners only; trims lines, adds true arc and tangent relations.
+                    Line-line corners only; trims lines, adds a tangent arc with a driving
+                    radius. Conflicting requested radii reject atomically.
 sketch_trim         {"op":"sketch_trim","sketch":"f1","entity":"e3","point":[10,4],"keep_construction":true}
                     Remove the span under point; optionally retain it as construction.
 sketch_mirror_entities {"op":"sketch_mirror_entities","sketch":"f1","entities":["e1"],"line":"e9"}
@@ -540,8 +607,9 @@ B — a 60x40 plate 6mm thick with four 3mm corner holes (sketch circles + extru
  {"op":"add_feature","feature":{"type":"extrude","name":"Drill","params":{"mode":"cut","end":"through_all"},"refs":{"profile":"$1"}}}
 ]
 
-C — a vase as a SOLID OF REVOLUTION. The half-profile must be a CLOSED region: the curved outer
-wall (a spline) plus a straight line back down the Z axis to close it. Revolve 360 about Z:
+C — a vase as a SOLID OF REVOLUTION. This example explicitly closes the curved outer
+wall (a spline) with a straight line down the Z axis; a suitable open profile can also
+auto-close to the axis. Revolve 360 about Z:
 [
  {"op":"add_feature","feature":{"type":"sketch","name":"Profile","refs":{"plane":"plane.front"},"params":{"entities":[{"id":"e1","type":"spline","points":[[0,0],[15,0],[18,20],[10,45],[12,60],[0,60]]},{"id":"e2","type":"line","p1":[0,60],"p2":[0,0]}],"constraints":[{"id":"c1","type":"coincident","refs":["e1.start","e2.p2"]},{"id":"c2","type":"coincident","refs":["e1.end","e2.p1"]},{"id":"c3","type":"coincident","refs":["e2.p2","origin"]},{"id":"c4","type":"vertical","refs":["e2"]},{"id":"c5","type":"length","refs":["e2"],"value":{"value":60,"expr":null}}]}}},
  {"op":"sketch_fully_define","sketch":"$0"},

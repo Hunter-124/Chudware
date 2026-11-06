@@ -3,8 +3,8 @@
 CAD render tools return FastMCP ``Image`` objects, usually ``[Image(path=png), caption]``
 (:func:`services.mcp.cad_common._captioned_render`). FastMCP's own server turns those into
 MCP ``ImageContent`` for external clients, but CAD's agent adapters call the tool functions
-directly, so the object itself reaches them. Both adapters — Chudcode host tools
-(:mod:`services.agent.chudcode_tools`) and the in-process turn loop
+directly, so the object itself reaches them. Both adapters — OMP host tools
+(:mod:`services.agent.omp_tools`) and the in-process turn loop
 (:mod:`services.agent.agent_turn`) — use this one rule to (1) turn the object into a
 JSON-safe ``{"kind": "image", "path", "mime"}`` reference that run records, artifact events
 and the model text can all carry, and (2) load that reference as bytes a vision model
@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 #: Longest edge sent to a model. Claude downsamples anything larger to this edge before
-#: vision processing, and Chudcode's own image pipeline targets the same edge, so extra
+#: vision processing, and OMP's own image pipeline targets the same edge, so extra
 #: pixels cost transport bytes and add nothing the model can see.
 MAX_EDGE_PX = 1568
 #: Encoded bytes per image. Anthropic refuses an image whose base64 form exceeds 5 MB;
@@ -67,7 +67,7 @@ class ModelImage:
     reencoded: bool
 
     def block(self) -> dict[str, str]:
-        """Chudcode/MCP ``ImageContent``: ``{"type": "image", "mimeType", "data"}``."""
+        """OMP/MCP ``ImageContent``: ``{"type": "image", "mimeType", "data"}``."""
         return {
             "type": "image",
             "mimeType": self.mime,

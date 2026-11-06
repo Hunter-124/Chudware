@@ -76,6 +76,10 @@ def test_auto_orientation_finds_a_pose_that_needs_no_support(tmp_path):
     # leaves two 10 mm shelves and must not be the pick.
     assert result["orientation"]["build_dir"] != pytest.approx([0, 0, 1], abs=1e-6)
     assert result["settings"]["support_material"] == "0", result["settings"]
+    assert isinstance(result["printability"], dict)
+    assert isinstance(result["printability"]["issues"], list)
+    assert isinstance(result["gcode_check"], dict)
+    assert isinstance(result["gcode_check"]["issues"], list)
     assert result["gcode_check"]["status"] == "pass", result["gcode_check"]
     gcode = Path(result["gcode_path"])
     assert gcode.is_file() and gcode.stat().st_size > 0
@@ -92,6 +96,9 @@ def test_as_is_without_support_is_not_print_ready_and_says_why(tmp_path):
     assert result["print_ready"] is False, result
     issues = {row["check"]: row for row in result["gcode_check"]["issues"]}
     assert issues["floating_extrusion"]["status"] == "fail", result["gcode_check"]
+    assert result["gcode_check"]["status"] == "fail"
+    assert isinstance(result["printability"], dict)
+    assert isinstance(result["printability"]["issues"], list)
 
 
 def test_as_is_with_auto_support_enables_support_and_prints(tmp_path):
@@ -206,3 +213,53 @@ def test_a_plate_position_that_would_merge_vertices_is_refused_before_slicing(tm
     assert result["ok"] is False and result["reason"] == "slicer_mesh_precision_loss", result
     assert result["placement"] == "plate" and result["collapsed_triangles"] == 2
     assert not list(tmp_path.glob("*.gcode"))
+
+
+@pytest.mark.parametrize("plate", [False, True])
+def test_slice_part_resolves_relative_mesh_against_request_workspace(tmp_path, monkeypatch, plate):
+    import trimesh
+    from services.agent.request_context import bind_roots
+
+    project, worker = tmp_path / "project", tmp_path / "worker"
+    for root in (project, worker):
+        (root / "meshes").mkdir(parents=True)
+    trimesh.creation.box(extents=(12, 10, 3)).export(project / "meshes/block.stl")
+    trimesh.creation.box(extents=(30, 30, 30)).export(worker / "meshes/block.stl")
+    monkeypatch.chdir(worker)
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(worker))
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(worker))
+    target = ({"parts": [{"path": "meshes/block.stl"}]} if plate
+              else {"path": "meshes/block.stl"})
+
+    with bind_roots(str(project)):
+        result = _call("slice_part", **target, printer="ender 3", orientation="as_is",
+                       supports="off", output_dir=str(project / "output"), name="block")
+    assert result["ok"], result
+    manifest = json.loads(Path(result["manifest_path"]).read_text())
+    source = manifest["source"]["parts"][0]["source"] if plate else manifest["source"]
+    assert source["kind"] == "file" and source["path"] == str(project / "meshes/block.stl")
+    assert isinstance(result["printability"]["issues"], list)
+    assert isinstance(result["gcode_check"]["issues"], list)
+
+
+@pytest.mark.parametrize("artifact", [".gcode", ".3mf", ".print.json", ".slice"])
+@pytest.mark.parametrize("alias", ["symlink", "hardlink"])
+def test_slice_part_refuses_firmware_output_aliases_before_writing(tmp_path, artifact, alias):
+    import trimesh
+
+    mesh = tmp_path / "source.stl"
+    trimesh.creation.box(extents=(12, 12, 3)).export(mesh)
+    firmware = tmp_path / "firmware.bin"
+    firmware.write_bytes(b"original firmware image")
+    target = tmp_path / (".part.slice" if artifact == ".slice" else "part" + artifact)
+    if alias == "symlink":
+        target.symlink_to(firmware)
+    else:
+        target.hardlink_to(firmware)
+    before = {path.name for path in tmp_path.iterdir()}
+    result = _call("slice_part", path=str(mesh), printer="ender 3",
+                   output_dir=str(tmp_path), name="part", orientation="as_is")
+    assert result["ok"] is False
+    assert "link" in result["error"].lower()
+    assert firmware.read_bytes() == b"original firmware image"
+    assert {path.name for path in tmp_path.iterdir()} == before

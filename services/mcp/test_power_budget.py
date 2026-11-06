@@ -274,8 +274,9 @@ def test_verify_battery_power_budget_check():
 def test_verify_battery_power_budget_skips_without_source():
     from services.verify.battery import verify
     res = verify(doc_id=None, checks=["power_budget"])
-    assert res["scores"]["power_budget"] == 1.0
-    assert res["findings"] == []
+    assert res["scores"] == {}
+    assert res["skipped"] == ["power_budget"]
+    assert "no power_source" in res["findings"][0]["detail"]
 
 
 def test_mcp_tool_roundtrip(tmp_path):

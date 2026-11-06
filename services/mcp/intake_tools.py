@@ -403,8 +403,6 @@ _DFM_FEATURE_SIZE_KEYS = (
     "diameter", "dia", "width", "thickness", "wall_thickness", "rib_thickness",
     "radius", "fillet_radius", "chamfer", "size", "height", "length",
 )
-_MACHINING_PROCESSES = frozenset({"cnc_mill", "lathe"})
-_MACHINING_HOLE_ASPECT_WARNING = 5.0
 
 
 def _dfm_min_feature(features: list[dict], limit) -> dict:
@@ -417,13 +415,33 @@ def _dfm_min_feature(features: list[dict], limit) -> dict:
     candidates = []
     for feature in features:
         params = feature.get("params") or {}
-        for key in _DFM_FEATURE_SIZE_KEYS:
-            value = _dfm_number(params.get(key))
+        kind = str(feature.get("type") or "").strip().casefold()
+        feature_id = feature.get("id") or feature.get("name")
+        sizes = [(key, params.get(key)) for key in _DFM_FEATURE_SIZE_KEYS]
+        if kind == "extrude" and str(params.get("end") or "blind").casefold() == "blind":
+            sizes.append(("depth", params.get("depth")))
+        if kind == "sketch":
+            for index, entity in enumerate(params.get("entities") or []):
+                if not isinstance(entity, dict) or entity.get("construction"):
+                    continue
+                entity_kind = str(entity.get("type") or "").casefold()
+                keys = (("radius", "diameter") if entity_kind in ("circle", "arc")
+                        else ("width", "height") if entity_kind == "rectangle" else ())
+                sizes.extend((f"entities[{index}].{key}", entity.get(key)) for key in keys)
+                if entity_kind == "line":
+                    p1, p2 = entity.get("p1"), entity.get("p2")
+                    if (isinstance(p1, (list, tuple)) and isinstance(p2, (list, tuple))
+                            and len(p1) == len(p2) == 2):
+                        coords = [_dfm_number(v) for v in (*p1, *p2)]
+                        if all(v is not None for v in coords):
+                            sizes.append((f"entities[{index}].length",
+                                          _math.hypot(coords[2] - coords[0],
+                                                      coords[3] - coords[1])))
+        for key, raw in sizes:
+            value = _dfm_number(raw)
             if value is not None and value > 0:
-                candidates.append({
-                    "feature_id": feature.get("id") or feature.get("name"),
-                    "parameter": key, "value_mm": value,
-                })
+                candidates.append({"feature_id": feature_id, "parameter": key,
+                                   "value_mm": value})
     if not candidates:
         return {
             "check": "min_feature", "status": "not_evaluated", "ok": None,
@@ -434,58 +452,14 @@ def _dfm_min_feature(features: list[dict], limit) -> dict:
     passed = smallest["value_mm"] >= threshold
     return {
         "check": "min_feature", "status": "pass" if passed else "fail",
-        "ok": passed, "value_mm": round(smallest["value_mm"], 4),
+        "ok": passed, "value_mm": smallest["value_mm"],
         "limit_mm": threshold, "feature_id": smallest["feature_id"],
         "parameter": smallest["parameter"],
-        "note": f"smallest declared feature is {smallest['value_mm']:.3g}mm "
-                f"vs process minimum {threshold:g}mm",
+        "note": f"smallest evaluated authored size is {smallest['value_mm']!r}mm "
+                f"vs process minimum {threshold!r}mm; this is not a complete geometry check",
     }
 
 
-def _dfm_hole_aspect(features: list[dict], process: str) -> dict:
-    if process not in _MACHINING_PROCESSES:
-        return {
-            "check": "hole_depth_diameter", "status": "pass", "ok": True,
-            "note": "machining-only blind-hole aspect warning is not applicable",
-        }
-    holes = []
-    unevaluated = []
-    for feature in features:
-        if str(feature.get("type") or "").strip().casefold() != "hole":
-            continue
-        params = feature.get("params") or {}
-        diameter = _dfm_number(params.get("diameter", params.get("dia")))
-        depth = _dfm_number(params.get("depth"))
-        feature_id = feature.get("id") or feature.get("name")
-        if diameter is None or diameter <= 0 or depth is None or depth <= 0:
-            unevaluated.append(feature_id)
-            continue
-        ratio = depth / diameter
-        holes.append({
-            "feature_id": feature_id, "diameter_mm": diameter, "depth_mm": depth,
-            "ratio": round(ratio, 3), "warning": ratio > _MACHINING_HOLE_ASPECT_WARNING,
-        })
-    if unevaluated:
-        return {
-            "check": "hole_depth_diameter", "status": "not_evaluated", "ok": None,
-            "limit_ratio": _MACHINING_HOLE_ASPECT_WARNING, "holes": holes,
-            "error": "Machining hole(s) lack numeric diameter/depth for aspect evaluation: "
-                     + ", ".join(str(value) for value in unevaluated),
-        }
-    warnings = [hole for hole in holes if hole["warning"]]
-    if warnings:
-        return {
-            "check": "hole_depth_diameter", "status": "fail", "ok": False,
-            "severity": "warning", "limit_ratio": _MACHINING_HOLE_ASPECT_WARNING,
-            "holes": warnings,
-            "note": "hole depth/diameter exceeds the 5:1 machining review threshold; "
-                    "review drill reach, pecking, coolant and runout",
-        }
-    return {
-        "check": "hole_depth_diameter", "status": "pass", "ok": True,
-        "limit_ratio": _MACHINING_HOLE_ASPECT_WARNING, "holes": holes,
-        "note": "all evaluable blind machining holes are at or below 5:1 depth/diameter",
-    }
 
 
 def _dfm_strategy_word(value) -> Optional[str]:
@@ -507,7 +481,7 @@ def _dfm_thread_strategy(features: list[dict], process: str, profile_thread: dic
         kind = str(feature.get("type") or "").strip().casefold()
         params = feature.get("params") or {}
         designation = next((params.get(key) for key in
-                            ("thread", "standard", "tap", "thread_size")
+                            ("thread", "tap", "thread_size")
                             if params.get(key)), None)
         explicit = next((params.get(key) for key in
                          ("thread_strategy", "manufacturing_strategy",
@@ -516,6 +490,10 @@ def _dfm_thread_strategy(features: list[dict], process: str, profile_thread: dic
         strategy = _dfm_strategy_word(explicit)
         family = _dfm_strategy_word(params.get("family"))
         style = _dfm_strategy_word(params.get("style"))
+        if not designation and (kind == "thread" or (kind == "hole" and style == "tapped")):
+            standard = params.get("standard")
+            if str(standard or "").strip().casefold() not in ("", "custom"):
+                designation = standard
         if kind == "standard_part" and family == "heat_set_insert":
             strategy = "heat_set_insert"
             designation = designation or params.get("size")
@@ -523,7 +501,12 @@ def _dfm_thread_strategy(features: list[dict], process: str, profile_thread: dic
             strategy = strategy or "tapped"
         elif params.get("printed") is True:
             strategy = "printed"
-        is_thread = bool(designation or strategy or kind == "thread")
+        is_thread = bool(designation or kind == "thread" or
+                         (kind == "hole" and style == "tapped") or
+                         (kind == "standard_part" and family == "heat_set_insert") or
+                         (kind == "hole" and strategy in {
+                             "tapped", "thread_mill", "single_point", "heat_set_insert",
+                             "printed", "clinch_nut", "weld_nut", "molded"}))
         if not is_thread:
             continue
         row = {
@@ -596,8 +579,8 @@ def _dfm_build_direction(value: Optional[list[float]]) -> list[float]:
     return [x / magnitude for x in components]
 
 
-# Rows the DFAM battery adds to an FDM dfm_check (services/dfam). min_wall replaces the
-# engine vertex-sampled reading for FDM with an area-sampled, face-attributed one.
+# Rows the DFAM battery adds to an FDM dfm_check (services/dfam). min_wall uses the
+# native inscribed-sphere measurement at area-stratified, face-attributed samples.
 _DFAM_ROWS = ("min_wall", "overhang", "bridges", "support", "small_holes", "internal_voids",
               "bed_adhesion", "build_volume")
 
@@ -625,9 +608,9 @@ def _dfam_overhang_legacy(row: dict, build_dir: list[float], limit) -> dict:
 
 
 def _dfm_additive(doc_id: str, params: dict, build_dir: list[float], *,
-                  suggest_orientation: bool, printer: Optional[str], detail: bool,
+                  process: str, suggest_orientation: bool, printer: Optional[str], detail: bool,
                   wanted: Optional[set]) -> tuple[list[dict], dict]:
-    """DFAM rows for an FDM part plus extras {estimate, orientation, printer}.
+    """DFAM rows for an additive part plus extras {estimate, orientation, printer}.
 
     A geometry failure turns every requested DFAM row into not_evaluated carrying the
     original error — never a silent pass."""
@@ -650,7 +633,7 @@ def _dfm_additive(doc_id: str, params: dict, build_dir: list[float], *,
             resolved = catalog.resolve(best["name"])
             extras["printer"] = best["name"]
         mesh, _label, _source = pt.load_doc(doc_id)
-        print_params = pt.print_params(resolved=resolved, dfm=params)
+        print_params = pt.print_params(process=process, resolved=resolved, dfm=params)
         analysis = analyze_printability(mesh, print_params, build_dir,
                                         checks=names or None, detail=detail)
         rows = []
@@ -681,6 +664,8 @@ def _dfm_verdict(checks: list[dict]) -> tuple[str, Optional[bool]]:
 
 
 def register_intake_tools(mcp: FastMCP) -> None:
+    from services.mcp.dfm_fix_tools import register_dfm_fix_tools
+    register_dfm_fix_tools(mcp)
 
     # ----------------------------------------------------------------- manufacturing process
 
@@ -739,13 +724,16 @@ def register_intake_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def set_process(process: str = "fdm", material: Optional[str] = None,
-                   printer_overrides: Optional[dict] = None, doc_id: Optional[str] = None) -> str:
+                   printer_overrides: Optional[dict] = None, doc_id: Optional[str] = None,
+                   build_dir: Optional[list] = None, pull_dir: Optional[list] = None) -> str:
         """Bind the manufacturing ProcessProfile to the part (persisted in the .step+).
 
-        `process`: fdm|cnc_mill|sheet_metal|injection|lathe|laser. `printer_overrides`: per-printer
+        `process`: fdm|sla|sls|mjf|cnc_mill|sheet_metal|injection|cast|lathe|laser.
         {xy_comp, hole_comp} for FDM calibration. Returns the resolved profile (fit-clearance table,
         min wall, thread strategy, hole compensation) — the numbers every later fit-budgeted
         dimension uses. Call this once the process is known (or accept the FDM default).
+        Optional build_dir and pull_dir are finite nonzero model-frame vectors, saved with
+        the process profile for subsequent printing and molding checks respectively.
         """
         try:
             d = _doc(doc_id)
@@ -754,6 +742,10 @@ def register_intake_tools(mcp: FastMCP) -> None:
                                             "overrides": printer_overrides})
             if material:
                 prof.setdefault("material", {})["default"] = material
+            if build_dir is not None:
+                prof.setdefault("params", {})["build_dir"] = _dfm_build_direction(build_dir)
+            if pull_dir is not None:
+                prof.setdefault("params", {})["pull_dir"] = _dfm_build_direction(pull_dir)
             _set(d, _K_PROCESS, prof)
             return _dumps({"ok": True, "process": prof,
                            "process_block": _dfm("dfm_process_block_text", {"profile": prof})})
@@ -762,16 +754,21 @@ def register_intake_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def dfm_check(process: Optional[str] = None, doc_id: Optional[str] = None,
-                  build_dir: Optional[list] = None,
+                  build_dir: Optional[list] = None, pull_dir: Optional[list] = None,
                   suggest_orientation: bool = False, printer: Optional[str] = None,
-                  checks: Optional[list] = None, detail: bool = False) -> str:
+                  checks: Optional[list] = None, detail: bool = False,
+                  tool_diameter_mm: Optional[float] = None,
+                  target_wall_mm: Optional[float] = None,
+                  verify_fixes: bool = True) -> str:
         """Evaluate DfM as pass, fail, or not_evaluated against the ProcessProfile.
 
         Every process: wall thickness, declared minimum feature size, machining blind-hole
         depth/diameter, thread strategy, molding draft. FDM adds the deterministic
         printability battery, measured on the part at the build direction:
-          min_wall      area-sampled ray thickness per face (fail below the process minimum
-                        or the nozzle; warn when only one perimeter pair fits; thin skins)
+          min_wall      inscribed-sphere thickness at area-stratified face samples (fail
+                        below the process minimum or nozzle; warn for knife edges,
+                        fewer than two perimeters, or thin skins). Reports blocker spacing;
+                        unmeasured samples are not evidence of adequate thickness.
           overhang      downward faces steeper than the limit that are neither bed contact,
                         bridges nor small self-supporting horizontal holes (unsupported area,
                         worst faces, fixes such as bed-edge fillet -> 45° chamfer, teardrop)
@@ -793,24 +790,35 @@ def register_intake_tools(mcp: FastMCP) -> None:
         thread_strategy, draft); ``detail`` lists up to 50 regions per row instead of 5.
         ``dfm_pass`` is true only when every applicable check ran and passed (warn rows pass);
         evaluation gaps/errors are ``not_evaluated`` with ``dfm_pass:null`` and the error.
+        For molding, pass pull_dir=[x,y,z]; otherwise build_dir or +Z is assumed.
+        By default, proposed operations are verified on internal detached clones and the
+        source is not edited. Set ``verify_fixes=False`` to skip clone verification and
+        omit proposed operations, including FDM reinforcement, while retaining findings.
+        For FDM, use dfm_reinforce for paging and detailed side effects.
         """
         try:
-            direction = _dfm_build_direction(build_dir)
             d = _doc(doc_id)
             proc = _canon_process(process) or _process_id(d)
-            prof = _dfm("dfm_get_profile", {"process": proc})
+            bound = _get(d, _K_PROCESS)
+            prof = (bound if isinstance(bound, dict) and bound.get("process") == proc
+                    else _dfm("dfm_get_profile", {"process": proc}))
             params = prof.get("params", {})
+            stored_dir = params.get("pull_dir") if proc in ("injection", "cast") else params.get("build_dir")
+            supplied_dir = pull_dir if pull_dir is not None else build_dir
+            direction = _dfm_build_direction(supplied_dir if supplied_dir is not None else stored_dir)
+            direction_source = ("build_dir" if proc in ("injection", "cast") and pull_dir is None and build_dir is not None
+                                else "caller" if supplied_dir is not None else "profile" if stored_dir is not None else "default")
             wanted = ({str(name).strip() for name in checks if str(name).strip()}
                       if checks else None)
             rows = []
             extras: dict = {}
 
             minwall = _dfm_number(params.get("min_wall_mm"))
-            if proc == "fdm":
+            if proc in ("fdm", "sla", "sls", "mjf"):
                 rows, extras = _dfm_additive(
-                    d, params, direction, suggest_orientation=suggest_orientation,
+                    d, params, direction, process=proc, suggest_orientation=suggest_orientation,
                     printer=printer, detail=detail, wanted=wanted)
-            elif wanted is None or "min_wall" in wanted:
+            elif proc != "sheet_metal" and (wanted is None or "min_wall" in wanted):
                 try:
                     thickness = cb.call("eval_thickness", {"doc_id": d})
                     measured = _dfm_number((thickness or {}).get("min_thickness_mm"))
@@ -835,8 +843,7 @@ def register_intake_tools(mcp: FastMCP) -> None:
                         "check": "min_wall", "status": "not_evaluated", "ok": None,
                         "limit_mm": minwall, "error": str(exc),
                     })
-            tree_rows = [name for name in ("min_feature", "hole_depth_diameter",
-                                           "thread_strategy")
+            tree_rows = [name for name in ("min_feature", "thread_strategy")
                          if wanted is None or name in wanted]
             if tree_rows:
                 features = None
@@ -853,8 +860,6 @@ def register_intake_tools(mcp: FastMCP) -> None:
                         })
                     elif check_name == "min_feature":
                         rows.append(_dfm_min_feature(features, params.get("min_feature_mm")))
-                    elif check_name == "hole_depth_diameter":
-                        rows.append(_dfm_hole_aspect(features, proc))
                     else:
                         rows.append(_dfm_thread_strategy(
                             features, proc,
@@ -862,33 +867,31 @@ def register_intake_tools(mcp: FastMCP) -> None:
                             else {},
                         ))
 
-            draft = params.get("draft") if isinstance(params.get("draft"), dict) else {}
-            if draft.get("required") and (wanted is None or "draft" in wanted):
-                minimum_draft = _dfm_number(draft.get("min_deg"))
-                try:
-                    result = cb.call("eval_draft", {
-                        "doc_id": d, "pull": [0, 0, 1],
-                        "angle_deg": minimum_draft if minimum_draft is not None else 1.0,
-                    })
-                    below = result.get("n_faces_below_threshold")
-                    if not isinstance(below, int):
-                        rows.append({
-                            "check": "draft", "status": "not_evaluated", "ok": None,
-                            "limit_deg": minimum_draft,
-                            "error": "eval_draft returned no integer n_faces_below_threshold",
-                        })
-                    else:
-                        passed = below == 0
-                        rows.append({
-                            "check": "draft", "status": "pass" if passed else "fail",
-                            "faces_below": below, "limit_deg": minimum_draft, "ok": passed,
-                            "note": f"{proc} needs >= {minimum_draft:g}deg draft",
-                        })
-                except Exception as exc:  # noqa: BLE001
-                    rows.append({
-                        "check": "draft", "status": "not_evaluated", "ok": None,
-                        "limit_deg": minimum_draft, "error": str(exc),
-                    })
+            from services.mcp.dfm_common import DfmContext
+            from services.mcp.dfm_rows import collect
+            ctx = DfmContext(d, proc, prof, direction, direction_source, detail, wanted,
+                             {"printer": printer, "tool_diameter_mm": tool_diameter_mm,
+                              "target_wall_mm": target_wall_mm, "verify_fixes": verify_fixes})
+            rows.extend(collect(ctx))
+            if proc == "fdm" and verify_fixes:
+                wall = next((row for row in rows if row.get("check") == "min_wall"), None)
+                if wall and wall.get("status") in ("fail", "warn"):
+                    try:
+                        from services.mcp.dfm_fix_tools import reinforce
+                        wall["reinforcement"] = reinforce(d, process=proc, target_wall_mm=target_wall_mm, limit=5)
+                        wall["fix_ops"] = [fix for region in wall["reinforcement"].get("regions", [])
+                                           for fix in region.get("verified_fixes", [])]
+                    except Exception as exc:  # noqa: BLE001
+                        wall["reinforcement"] = {"ok": False, "error": str(exc),
+                                                 "note": "Reinforcement was not verified."}
+            for row in rows:
+                row.setdefault("basis", "authored feature parameters" if row.get("check") in
+                               ("min_feature", "thread_strategy") else "native geometry screening")
+                row.setdefault("confidence", "authored_params" if row.get("check") in
+                               ("min_feature", "thread_strategy") else "geometry_heuristic")
+                row.setdefault("assumptions", [])
+                row.setdefault("regions", [])
+                row.setdefault("fix_ops", [])
 
             status, dfm_pass = _dfm_verdict(rows)
             warnings = [row["check"] for row in rows if row.get("status") == "warn"]

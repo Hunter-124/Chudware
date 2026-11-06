@@ -14,58 +14,26 @@ Grounded in the mega-19 a2 live ledger:
 from __future__ import annotations
 
 import json
-from pathlib import Path
-
-import pytest
-
-
-_MEGA19_A2_LEDGER = (
-    Path(__file__).resolve().parents[2]
-    / "reports/runs/mega-19/attempt-2-primary-graded-wire-zero/ledger.json"
-)
 
 
 def _a2_ecad_calls() -> list[dict]:
-    """Reconstruct ECAD call records from mega-19 a2 ledger (live residual)."""
-    if not _MEGA19_A2_LEDGER.is_file():
-        pytest.skip(f"missing a2 ledger: {_MEGA19_A2_LEDGER}")
-    data = json.loads(_MEGA19_A2_LEDGER.read_text())
-    events = data.get("events") if isinstance(data, dict) else data
-    calls: list[dict] = []
-    for ev in events or []:
-        if not isinstance(ev, dict):
-            continue
-        pl = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
-        if pl.get("event") not in (None, "tool_call") and pl.get("tool") is None:
-            # force inject events carry args but no ok/result
-            if pl.get("event") == "ecad_chain_force_inject":
-                continue
-        tool = pl.get("tool")
-        if not tool:
-            continue
-        if not (
-            str(tool).startswith("ecad_")
-            or tool in ("board_from_schematic",)
-        ):
-            continue
-        if pl.get("event") and pl.get("event") not in ("tool_call",):
-            continue
-        rec = {
-            "tool": tool,
-            "ok": pl.get("ok"),
-            "args": pl.get("args") if isinstance(pl.get("args"), dict) else {},
-            "result": pl.get("result"),
-        }
-        if pl.get("forced"):
-            rec["forced"] = True
-        if pl.get("force_reason"):
-            rec["force_reason"] = pl.get("force_reason")
-        # Only keep successful product calls + denials that carry shape.
-        if rec["ok"] is True or (
-            rec["ok"] is False and tool in ("ecad_place_symbol",)
-        ):
-            calls.append(rec)
-    return calls
+    """Representative pre-wire calls with an orphan power symbol."""
+    return [
+        {"tool": "ecad_new_schematic", "ok": True,
+         "result": {"doc_id": "cd7516e36580"}},
+        {"tool": "ecad_place_symbol", "ok": True,
+         "args": {"libid": "MCU:Generic_QFP48", "ref": "U1"},
+         "result": {"ref": "U1", "pins": []}},
+        {"tool": "ecad_place_symbol", "ok": True,
+         "args": {"libid": "Device:R", "ref": "R1"},
+         "result": {"ref": "R1", "pins": [
+             {"number": "1", "name": "1", "type": "passive", "xy": [20, 20]},
+             {"number": "2", "name": "2", "type": "passive", "xy": [30, 20]},
+         ]}},
+        {"tool": "ecad_add_power", "ok": True,
+         "args": {"net": "GND", "x": 0, "y": 10},
+         "result": {"ok": True, "net": "GND"}},
+    ]
 
 
 def _a2_residual_pre_wire() -> list[dict]:
@@ -253,13 +221,13 @@ def test_a2_cascade_bonds_every_power_class_pin():
             }
         if tool == "ecad_place_symbol":
             lib = str(a.get("libid") or "")
-            if "Device:V" in lib:
+            if lib == "Simulation_SPICE:VDC":
                 return {
-                    "ok": True, "ref": "V1", "libid": lib, "value": "DC 3.3",
+                    "ok": True, "ref": "V1", "libid": lib, "value": "3.3",
                     "pins": [
-                        {"number": "+", "name": "+", "type": "power_out",
+                        {"number": "1", "name": "", "type": "passive",
                          "xy": [40, 5]},
-                        {"number": "-", "name": "-", "type": "power_out",
+                        {"number": "2", "name": "", "type": "passive",
                          "xy": [40, -5]},
                     ],
                 }
@@ -523,40 +491,6 @@ def test_a2_cascade_drc_args_carry_board_doc_id():
 # ---------------------------------------------------------------------------
 
 
-_MEGA19_A3_LEDGER = (
-    Path(__file__).resolve().parents[2] / "reports/runs/mega-19/ledger.json"
-)
-
-
-def _a3_ecad_calls() -> list[dict]:
-    """ECAD calls from mega-19 a3 primary ledger (root ledger.json)."""
-    if not _MEGA19_A3_LEDGER.is_file():
-        pytest.skip(f"missing a3 ledger: {_MEGA19_A3_LEDGER}")
-    data = json.loads(_MEGA19_A3_LEDGER.read_text())
-    events = data.get("events") if isinstance(data, dict) else data
-    calls: list[dict] = []
-    for ev in events or []:
-        pl = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
-        if pl.get("event") not in (None, "tool_call"):
-            continue
-        tool = pl.get("tool")
-        if not tool:
-            continue
-        if not (
-            str(tool).startswith("ecad_")
-            or tool in ("board_from_schematic",)
-        ):
-            continue
-        if pl.get("ok") is not True:
-            continue
-        calls.append({
-            "tool": tool,
-            "ok": True,
-            "args": pl.get("args") if isinstance(pl.get("args"), dict) else {},
-            "result": pl.get("result"),
-            **({"forced": True} if pl.get("forced") else {}),
-        })
-    return calls
 
 
 def test_a3_forced_wire_joins_rail_member_not_unbonded_power_in():
@@ -634,28 +568,3 @@ def test_a3_forced_wire_joins_rail_member_not_unbonded_power_in():
     assert ("U1", "3") not in ends, args
 
 
-def test_a3_ledger_wire_after_bonded_power_hits_rail_member():
-    """Replay a3 ledger calls: after bonded add_power, wire hits net_member."""
-    from services.agent.agent_turn import (
-        _ecad_forced_tool_args, _ecad_rail_member_pins,
-    )
-
-    calls = _a3_ecad_calls()
-    # Residual: stop before first wire.
-    residual = []
-    for c in calls:
-        if c.get("tool") == "ecad_wire":
-            break
-        residual.append(c)
-    members = _ecad_rail_member_pins(residual)
-    if not members:
-        # Ledger place result may be truncated; ensure synthetic member path
-        # still covered by test_a3_forced_wire_joins_rail_member_not_unbonded_power_in.
-        pytest.skip("a3 ledger residual has no net_members (truncated?)")
-    args = _ecad_forced_tool_args("ecad_wire", residual)
-    ends = {(args.get("from_ref"), str(args.get("from_pin"))),
-            (args.get("to_ref"), str(args.get("to_pin")))}
-    member_ends = {(m["ref"], str(m["pin"])) for m in members}
-    assert ends & member_ends, (args, members)
-    # Must not be pure unbonded power_in (a3 U1.3).
-    assert not (ends == {("U1", "3"), ("R1", "1")}), args

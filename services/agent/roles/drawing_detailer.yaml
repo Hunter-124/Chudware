@@ -2,7 +2,6 @@ schema: aicad.role/1
 id: drawing_detailer
 goal: Produce release-ready manufacturing drawing packages with complete spec coverage, controlled annotations, audited sheets, and export artifacts.
 stage_scope: [deliver]
-playbook_default: drawing_package
 tool_allowlist:
   # MAX_TOOLS_PER_ROLE=14. Lower-frequency drawing/measure tools remain
   # reachable through the always-visible enable_tools category floor.

@@ -1,7 +1,6 @@
 """mega-3 harness fixes — unit coverage.
 
-Defects (live mega-2-fc-rocket + MegaRun3 gap-2 probe):
-2. child_spawns=0: delegate missing from specify/plan/build tools_slot
+Defects (live mega-2 run + MegaRun3 gap-2 probe):
 3. xAI parallel read-timeout storm: unbounded concurrent complete_ex
 
 Defect 1 of that list, "phase gate vs DAG progress: specify_incomplete while
@@ -19,56 +18,17 @@ import time
 import pytest
 
 
-# ---------------------------------------------------------------------------
-# 2. Spawn tool on specify / plan / build roles
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "role_id",
-    [
-        "spec_writer",
-        "orchestrator",
-        "layout_engineer",
-        "feature_modeler",
-        "assembly_fit_engineer",
-        "department_manager",
-    ],
-)
-def test_delegate_on_specify_plan_build_tools_slot(role_id):
-    """GAP2: specify/plan/build roles must expose delegate on tools_slot."""
-    from services.agent.roles import load_role
-
-    card = load_role(role_id)
-    tools = card.concrete_tools
-    assert "delegate" in tools, f"{role_id} missing delegate: {tools}"
-    tokens = card.allow_tokens
-    assert "tool:delegate" in tokens or "delegate" in tokens or any(
-        t == "delegate" or t.endswith(":delegate") for t in tokens
-    ) or any(
-        getattr(ref, "tool", None) == "delegate" for ref in card.tool_allowlist
-    )
-
-
 def test_spawn_depth_policy_permits_depth_gt0_for_capability_c():
     """Capability C max_spawn_depth=8; depth 1..8 ok, 9 refused."""
     from services.agent import role_models as rm
 
     assert rm.max_spawn_depth_for_capability("C") == 8
     for d in range(0, 9):
-        pol = rm.check_spawn_depth_policy(d, letter="C", task_class="assembly")
+        pol = rm.check_spawn_depth_policy(d, letter="C")
         assert pol["ok"] is True, (d, pol)
     pol = rm.check_spawn_depth_policy(9, letter="C")
     assert pol["ok"] is False
     assert pol["max_spawn_depth"] == 8
-
-
-def test_spec_writer_prompt_has_decomposition_nudge():
-    from services.agent.roles import load_role
-
-    card = load_role("spec_writer")
-    assert "delegate" in card.system_prompt
-    assert "parallel" in card.system_prompt.lower() or "child" in card.system_prompt.lower()
 
 
 # ---------------------------------------------------------------------------

@@ -1,19 +1,17 @@
-"""services/browser/adapters/orientalmotor.py — orientalmotor source adapter.
+"""Oriental Motor product search and product-page CAD/datasheet downloads.
 
-Oriental Motor (orientalmotor.com) makes stepper motors, BLDC motors,
-gearmotors and drivers. Search and most STEP/native CAD downloads are open;
-`acquire` lands the STEP model with provenance for part_search / part_place.
-
-NOTE: the regexes/markers below are a v1 best-effort shape, not verified
-against a live orientalmotor session (the gated integration suite covers the real per-source
-integration tests behind an env flag).
+Search-card and download markup is best effort: the public site may block
+browser requests, and series pages require an explicit product selection.
 """
 from __future__ import annotations
 
+import html
 import re
 
 from .. import session as _session
-from . import download_path, is_login_wall, login_required, provenance_envelope, register
+from . import abs_url, fail, make_hit, quote_query, register, source_failure
+from ._retail import _price, _stock, card_image
+from .maxon import MotorAdapter, _card_fragments, _strip_tags
 
 SITE = "orientalmotor"
 BASE_URL = "https://www.orientalmotor.com"
@@ -24,83 +22,73 @@ LICENSE_NOTE = (
     "and are not redistributed. This adapter downloads only under the user's "
     "own authenticated Oriental Motor session. See contracts/license_debt.md."
 )
-
 _LOGIN_WALL_MARKERS = ('Log in to Oriental Motor', 'id="loginForm"', 'class="login-form"',
                        'Please sign in to download')
-# Best-effort: search result cards link to a product detail page.
 _RESULT_RE = re.compile(
-    r'<a[^>]+class="[^"]*product-title[^"]*"[^>]+href="(?P<href>/products/[^"?#]+)"[^>]*>'
-    r'(?P<title>.*?)</a>', re.IGNORECASE | re.DOTALL)
-_MFR_RE = re.compile(r'<span[^>]*class="[^"]*manufacturer[^"]*"[^>]*>(?P<mfr>[^<]+)</span>',
-                     re.IGNORECASE)
-# Best-effort: a product page's native CAD download link (STEP model or zip).
-_DOWNLOAD_RE = re.compile(
-    r'href="(?P<href>[^"]+\.(?:step|stp|zip)(?:\?[^"]*)?)"', re.IGNORECASE)
+    r'<a\b(?=[^>]*\bclass\s*=\s*["\'][^"\']*\bproduct-title\b)'
+    r'(?=[^>]*\bhref\s*=\s*["\'](?P<href>[^"\']+)["\'])[^>]*>(?P<title>.*?)</a\s*>',
+    re.IGNORECASE | re.DOTALL)
+_MFR_RE = re.compile(r'<span\b[^>]*class=["\'][^"\']*manufacturer[^"\']*["\'][^>]*>(?P<mfr>.*?)</span>',
+                     re.IGNORECASE | re.DOTALL)
+_SKU_RE = re.compile(r'\bdata-(?:product-)?sku\s*=\s*["\']([^"\']+)["\']', re.I)
+_MPN_RE = re.compile(r'\bdata-(?:product-)?mpn\s*=\s*["\']([^"\']+)["\']', re.I)
+_PRICE_RE = re.compile(r'\bdata-price(?:-amount)?\s*=\s*["\']([^"\']+)["\']', re.I)
+_PRICE_TEXT_RE = re.compile(r'<[^>]*class=["\'][^"\']*\bprice\b[^"\']*["\'][^>]*>(.*?)</[^>]+>',
+                            re.I | re.S)
+_CURRENCY_RE = re.compile(r'\bdata-(?:price-)?currency(?:-code)?\s*=\s*["\']([A-Z]{3})["\']', re.I)
+_STOCK_RE = re.compile(r'\bdata-stock-qty\s*=\s*["\']([^"\']+)["\']', re.I)
 
 
-def _strip_tags(text: str) -> str:
-    return re.sub(r"<[^>]+>", "", text).strip()
-
-
-class OrientalMotorAdapter:
+class OrientalMotorAdapter(MotorAdapter):
     key = SITE
+    license_note = LICENSE_NOTE
+    login_markers = _LOGIN_WALL_MARKERS
+    result_kinds = ("product", "series")
 
     def search(self, query: str) -> list[dict]:
-        url = SEARCH_URL_TMPL.format(query=query.replace(" ", "+"))
+        url = SEARCH_URL_TMPL.format(query=quote_query(query))
         result = _session.browser_fetch(url, SITE)
         if not result.get("ok"):
-            return [result]
-        content = result.get("content", "")
-        if is_login_wall(content, _LOGIN_WALL_MARKERS):
-            return [login_required(SITE, url)]
+            return [source_failure(SITE, "search", result, url=url)]
+        content = result.get("content") or ""
+        base = result.get("final_url") or url
+        wall = self._page_failure("search", base, content)
+        if wall:
+            return [wall]
+        cards = _card_fragments(content)
+        fragments = cards or [m.group(0) for m in _RESULT_RE.finditer(content)]
         hits = []
-        for m in _RESULT_RE.finditer(content):
-            card = m.group("title")
+        seen = set()
+        for card in fragments:
+            match = _RESULT_RE.search(card)
+            if not match:
+                continue
+            product_url = abs_url(base, html.unescape(match.group("href")))
+            title = _strip_tags(match.group("title"))
+            if not product_url or not title or product_url in seen:
+                continue
+            seen.add(product_url)
+            sku_match, mpn_match = _SKU_RE.search(card), _MPN_RE.search(card)
+            sku = html.unescape(sku_match.group(1)).strip() if sku_match else None
+            mpn = html.unescape(mpn_match.group(1)).strip() if mpn_match else None
+            kind = "series" if not (sku or mpn) and re.search(r"\bseries\b", title, re.I) else "product"
             mfr_match = _MFR_RE.search(card)
-            hits.append({
-                "title": _strip_tags(card),
-                "url": BASE_URL + m.group("href"),
-                "site": SITE,
-                "manufacturer": mfr_match.group("mfr").strip() if mfr_match else "Oriental Motor",
-            })
+            manufacturer = _strip_tags(mfr_match.group("mfr")) if mfr_match else "Oriental Motor"
+            amount = _PRICE_RE.search(card)
+            price_text = _PRICE_TEXT_RE.search(card)
+            raw_price = amount.group(1) if amount else (_strip_tags(price_text.group(1)) if price_text else None)
+            price = _price(raw_price)
+            curr = _CURRENCY_RE.search(card)
+            currency = curr.group(1).upper() if curr else ("USD" if price is not None and "$" in card else None)
+            stock = _STOCK_RE.search(card)
+            hits.append(make_hit(SITE, title=title, url=product_url, kind=kind, sku=sku, mpn=mpn,
+                                 manufacturer=manufacturer, price=price, currency=currency,
+                                 stock=_stock(stock.group(1)) if stock else None,
+                                 thumbnail=card_image(card, base)))
+        if not hits and not re.search(r"(?:no results|no products found|search returned no results|0 results)",
+                                      content, re.I):
+            return [fail(SITE, "search", "parse_failed", "No recognizable product cards were found.", url=url)]
         return hits
-
-    def acquire(self, result: dict) -> dict:
-        url = result.get("url", "")
-        if not url:
-            return {"ok": False, "reason": "bad_result", "hint": "result has no 'url'"}
-
-        page = _session.browser_fetch(url, SITE)
-        if not page.get("ok"):
-            return page
-        content = page.get("content", "")
-        if is_login_wall(content, _LOGIN_WALL_MARKERS):
-            return login_required(SITE, url)
-
-        match = _DOWNLOAD_RE.search(content)
-        if not match:
-            return {"ok": False, "reason": "no_download_link",
-                    "hint": "could not find a STEP/native CAD download link on the product page"}
-        download_url = match.group("href")
-        if download_url.startswith("/"):
-            download_url = BASE_URL + download_url
-
-        dest, refusal = download_path(SITE, download_url, default="download.step")
-        if refusal is not None:
-            return refusal
-        outcome = _session.browser_download(download_url, SITE, dest)
-        if not outcome.get("ok"):
-            return outcome
-
-        mfr_match = _MFR_RE.search(content)
-        return provenance_envelope(
-            source_url=url,
-            session_profile_used=outcome.get("session_profile_used", SITE),
-            license_note=LICENSE_NOTE,
-            artifact_path=outcome["dest"],
-            title=result.get("title", ""),
-            manufacturer=mfr_match.group("mfr").strip() if mfr_match else result.get("manufacturer"),
-        )
 
 
 ADAPTER = register(OrientalMotorAdapter())

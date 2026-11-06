@@ -1,0 +1,7 @@
+# Wiring harness design context pack
+
+- Define connector cavities, placements and actual conductor properties; each wire record is one conductor connecting one pin pair. A twisted pair needs distinct conductor records with a matching group and explicit cable construction geometry for bus analysis. Ribbon requires width and thickness; its circular routing envelope does not model orientation.
+- Use cable datasheet bend radii and measured bundle construction when available. Otherwise sourced estimates are assumptions, not cable-specific ratings or clearance guarantees; review their scope and override them when appropriate. Specify actual clearances, keepouts and termination/service-loop allowances.
+- Route and inspect connectivity, clearance, bend, power/signal segregation and shield-termination findings. Check electrical loads and bus characteristics against real cable and topology data; missing evidence is unknown, not a pass or certification.
+- `harness_bus_check` accepts selected saved wires or explicit analysis links representing series sections of one signal path. `harness_to_bus_links` instead converts explicit firmware link templates to firmware simulation bus_links. Review assumptions and paginated findings; recheck after changes.
+- Reports include connector pinout and from/to tables and distinguish routed length from cut length. Formboard output does not support drawing-sheet integration. See `cad_guide('harness')` and `cad_skill('harness')`.

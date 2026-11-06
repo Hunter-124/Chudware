@@ -39,11 +39,16 @@ struct PartsItem {
     std::string datasheet;
     std::string imageUrl;
     std::string license;
+    std::string currency, kind, mpn, manufacturer, family, designation;
+    std::vector<std::string> modelFormats;
     std::vector<std::string> sizes;  // available parametric sizes from the core catalog
     int         score      = 0;     // backend identity relevance (0–100)
     double      lengthMm   = 0.0;   // search-resolved standard screw length
     double      priceUsd   = 0.0;
+    double      price      = 0.0;
+    int         stock      = -1;
     bool        downloaded = false;
+    bool        downloadable = false;
     bool        placeable  = false;
 };
 
@@ -81,13 +86,22 @@ struct QueueJob {
     std::string query;
     std::string status;       // pending | running | done | error | cancelled
     std::string artifactPath;
+    std::string artifactKind;
+    std::string artifactFormat;
+    std::string artifactMember;
+    bool cadValidated = false;
     std::string error;
+    std::string askUser;
+    std::vector<std::string> candidates;
+    std::map<std::string, std::string> candidateLabels;
+    bool canSelect = false;
     bool importing = false;
 };
 
 struct Thumb {
     unsigned int tex = 0;
     int w = 0, h = 0;
+    std::string provenance;  // cad_render | product_image; empty for unknown
     double lastUse = 0.0;   // ImGui::GetTime() at the last draw lookup — LRU eviction key
 };
 
@@ -145,8 +159,21 @@ struct PartsState {
     std::string            searchErr;
     bool hasLive = false;
     std::vector<Notice> notices;   // per-site skip reasons from the last parts_search
+    int localLoaded = 0;
+    int localVisible = 0;
+    int localTotal = 0;
+    bool totalExact = false;
+    bool hasMore = false;
+    bool loadingMore = false;
+    std::string moreError;
+    std::string selectedId;
+    bool scrollToSelected = false;
+    std::set<std::string> visibleThumbs;
+    int shotSelectIndex = -1;
+    bool shotSelectApplied = false;
 
     // ---- streaming live vendor search (results paint as each vendor lands) ----
+    bool        liveStarting = false;
     bool        liveSearching = false;  // a live fan-out job is in flight
     bool        livePolling   = false;  // parts_search_live_poll in flight (single-flight)
     std::string liveToken;              // current job token; stale-poll guard
@@ -163,6 +190,9 @@ struct PartsState {
     int   sortMode     = 0;     // 0=Relevance 1=Lowest price 2=Highest price 3=Name
 
     bool gridView = false;
+
+    // ---- panes state (GuiPanes) ----
+
 
     // ---- taxonomy tree + facet filter values ----
     TaxNode taxonomyRoot;
@@ -217,12 +247,21 @@ struct PartsState {
     std::string insertNote;  // in-flight phase or last insert outcome, also shown as a toast
     bool insertError = false;
     bool   queueActive   = false;  // any pending/running job → keep polling
+    std::string queueError;  // most recent queue status transport error
+    struct ItemOperation {
+        std::string status, error, jobId;
+        bool busy = false;
+    };
+    std::map<std::string, ItemOperation> itemOperations;
+    std::string insertItemId;
     std::set<std::string> autoImportJobs;  // community downloads requested for immediate import
+    std::set<std::string> resolvedChoiceJobs;
 
     // ---- thumbnails ----
     std::map<std::string, Thumb> thumbs;      // part_id → GL texture; LRU-capped in storeThumb
     std::set<std::string>        thumbBusy;   // requests in flight
-    std::set<std::string> thumbFailed; // no image available — never retried this session
+    std::set<std::string> thumbFailed; // definitive misses or transient failures on cooldown
+    std::map<std::string, std::string> thumbErrors;
 
     // Set every frame by drawPartsLibraryWorkspace so widget TUs can reach the app fonts
     // (sectionHeader h2). Never dereferenced outside a frame.
@@ -239,11 +278,14 @@ void loadCategories(AppState& st);
 void loadTaxonomy(AppState& st);     // parts_taxonomy → S().taxonomyRoot (falls back to loadCategories)
 void loadVendors(AppState& st, bool force = false);
 void doSearch(AppState& st);
+void loadMoreParts(AppState& st);
 void startLiveSearch(AppState& st);
 void pollLiveSearch(AppState& st);
 void pollQueue(AppState& st);
 void queueDownload(AppState& st, const PartsItem& item);
 void importQueuedArtifact(AppState& st, const std::string& id, const std::string& artifactPath);
+void selectQueuedArtifact(AppState& st, const std::string& jobId, const std::string& member);
+void dismissQueuedChoice(const std::string& jobId);
 void insertItem(AppState& st, const PartsItem& item);
 void sendToReverseEngineering(AppState& st, const PartsItem& item);
 // RE-32: one-click "Generate 3D model" for metadata-only (no-model) parts.
@@ -262,6 +304,10 @@ void drawTaxonomyPane(AppState& st, float paneW);   // parts_taxonomy_pane.cpp (
 void drawFiltersBlock(AppState& st, float paneW);   // parts_filters.cpp (right pane + vendor strip)
 void drawResultsList(AppState& st);                 // parts_results.cpp
 void drawResultsGrid(AppState& st);                 // parts_results.cpp
+void drawPartDetails(AppState& st);
+void handlePartsSelectionKeys(AppState& st);
+int activeFilterCount();
+void clearPartFilters();
 
 // parts_vendors.cpp — compact vendor strip (footer of the filters pane), the floating
 // "Vendor Accounts" popup (sign-in list + API creds + download queue + health table), the

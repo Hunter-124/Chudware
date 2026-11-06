@@ -18,54 +18,7 @@ Grounded in mega-24 a3 fingerprints:
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from types import SimpleNamespace
-
-import pytest
-
-
-_ROOT = Path(__file__).resolve().parents[2]
-_MEGA24 = _ROOT / "reports/runs/mega-24"
-_MEGA24_AC4 = _MEGA24 / "criterion_AC4.json"
-_MEGA24_AC5 = _MEGA24 / "criterion_AC5.json"
-_MEGA24_LEDGER = _MEGA24 / "ledger.json"
-
-
-def _load_json(path: Path) -> dict:
-    if not path.is_file():
-        pytest.skip(f"fixture missing: {path}")
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-# ---------------------------------------------------------------------------
-# Live fingerprints (would have caught the thrash class)
-# ---------------------------------------------------------------------------
-
-
-def test_mega24_ac5_fingerprint_simulate_on_pcb_doc():
-    """Y25 fixture: AC5 failed because simulate targeted board not schematic."""
-    ac5 = _load_json(_MEGA24_AC5)
-    assert ac5.get("result") == "FAIL"
-    detail = str(ac5.get("detail") or "")
-    ev = ac5.get("evidence") or {}
-    blob = detail + " " + json.dumps(ev, default=str)
-    assert "pcb" in blob.lower() or "not a schematic" in blob.lower(), blob
-    assert "767f0f0fa678" in blob  # board id from mega-24 a3
-    # S23 readback still recorded preferred net — doc routing was the miss.
-    assert (ev.get("resolved_net") or "").upper() in ("3V3", "3.3V", "VCC")
-
-
-def test_mega24_ac4_fingerprint_clearance_residual():
-    """Z25 fixture: DRC clearance×6 at 0.1296 < 0.2mm on board."""
-    ac4 = _load_json(_MEGA24_AC4)
-    assert ac4.get("result") == "FAIL"
-    ev = ac4.get("evidence") or {}
-    drc = ev.get("drc") or ev.get("ecad_run_drc") or {}
-    assert int(drc.get("errors") or 0) >= 1
-    blob = json.dumps(drc, default=str).lower()
-    assert "clearance" in blob
-    assert "0.2" in blob or "0.20" in blob
-    assert drc.get("doc_id") == "767f0f0fa678"
 
 
 # ---------------------------------------------------------------------------
@@ -74,12 +27,18 @@ def test_mega24_ac4_fingerprint_clearance_residual():
 
 
 def _mega24_ledger_ns():
-    data = _load_json(_MEGA24_LEDGER)
-    return SimpleNamespace(events=data.get("events") or [], state=data.get("state"))
+    return SimpleNamespace(events=[
+        {"kind": "agent_turn", "payload": {"event": "tool_call",
+         "tool": "ecad_new_schematic", "ok": True,
+         "result": {"doc_id": "a6e440d0e2fc", "kind": "sch"}}},
+        {"kind": "agent_turn", "payload": {"event": "tool_call",
+         "tool": "board_from_schematic", "ok": True,
+         "result": {"doc_id": "767f0f0fa678", "kind": "pcb"}}},
+    ], state={})
 
 
 def test_y25_reviewer_simulate_resolves_schematic_not_board():
-    """Live mega-24 ledger: ecad_simulate must get sch a6e…, not board 767f…"""
+    """A schematic and board ledger must route simulation to the schematic."""
     from services.agent.reviewer_exec import _resolve_domain_doc_id
 
     ledger = _mega24_ledger_ns()
@@ -586,7 +545,7 @@ def test_b20_drc_still_targets_board():
 
 
 def test_s23_t23_contracts_still_hold():
-    """S23/T23 pass rules remain: in-band V, real measure scores."""
+    """S23 voltage grading and T23 informational measurement remain distinct."""
     from services.agent import reviewer_exec as re
     from services.verify import battery as bat
 
@@ -597,13 +556,13 @@ def test_s23_t23_contracts_still_hold():
     )
     assert v == "PASS", (v, detail)
 
-    # T23: measure_between finite 0.0 still scores 1.0.
+    # T23: a finite measurement is not an unqualified pass.
     score, _ = bat._extract_score(
         "measure_between",
         "scalar",
         json.dumps({"ok": True, "distance": 0.0, "unit": "mm"}),
     )
-    assert score == 1.0
+    assert score is None
 
 
 # ---------------------------------------------------------------------------

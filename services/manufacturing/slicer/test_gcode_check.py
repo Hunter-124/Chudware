@@ -40,6 +40,28 @@ def test_hostile_width_refuses_before_geometry(tmp_path, monkeypatch, width):
     assert result['checks'][0]['check'] == 'analysis_budget'
 
 
+@pytest.mark.parametrize("command", ["M997", "M500", "M502", "M28 firmware.bin",
+                                    "M993", "M994", "N12m0997*23", "SAVE_CONFIG"])
+def test_firmware_maintenance_is_not_print_ready(tmp_path, command):
+    checks, result = _verify(tmp_path, _START + _layer(.2) + command + "\n" + _END)
+    assert result["ok"] is False
+    assert checks["unsafe_print_file"]["status"] == "fail"
+    assert "not a print operation" in checks["unsafe_print_file"]["note"]
+
+
+@pytest.mark.parametrize("suffix,body", [
+    (".bin", b"G28\n"),
+    (".bgcode", b"GCDE\x00\x01\xfe\xff"),
+    (".gcode", b"\x00\x01\x02\xff"),
+])
+def test_binary_or_firmware_files_cannot_pass_gcode_verification(tmp_path, suffix, body):
+    path = tmp_path / ("firmware" + suffix)
+    path.write_bytes(body)
+    result = verify_gcode(path)
+    assert result["ok"] is False
+    assert result["checks"][0]["check"] == "unsafe_print_file"
+
+
 @pytest.mark.parametrize('floating', [False, True])
 def test_morphology_budget_refuses_before_kernel_allocation(tmp_path, monkeypatch, floating):
     monkeypatch.setattr(gcode_check, '_MAX_KERNEL_SAMPLES', 1)

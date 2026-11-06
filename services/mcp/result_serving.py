@@ -164,14 +164,13 @@ def err_envelope(
     next_actions: Optional[Sequence[str]] = None,
     **extra: Any,
 ) -> dict:
-    """Teaching error envelope: ``{ok:false, error, warnings, hint, next_actions, ...}``."""
-    out: dict[str, Any] = {
-        "ok": False,
-        "error": str(error),
-        "warnings": list(extra.pop("warnings", []) or []),
-        "hint": hint if hint else str(error),
-        "next_actions": list(next_actions) if next_actions is not None else [],
-    }
+    """Teaching error envelope with a machine-readable message and code."""
+    from ._envelopes import error_payload
+    out = error_payload(
+        error, code=str(extra.pop("code", "") or ""),
+        hint=hint, warnings=list(extra.pop("warnings", []) or []),
+        next_actions=list(next_actions) if next_actions is not None else [],
+    )
     for k, v in extra.items():
         if k in ("ok", "error"):
             continue
@@ -547,10 +546,6 @@ def project_ecad_status(payload: dict, opts: ServeOpts) -> dict:
     return out
 
 
-_PART_ROW_KEYS = (
-    "part_id", "title", "domain", "vendor", "price", "designation", "score",
-)
-
 
 def project_part_row(rec: Mapping[str, Any]) -> dict:
     """Project a full PartRecord to the compact search row."""
@@ -565,28 +560,34 @@ def project_part_row(rec: Mapping[str, Any]) -> dict:
     score = rec.get("score")
     if score is None:
         score = rec.get("_score")
-    return {
+    params = rec.get("params") if isinstance(rec.get("params"), Mapping) else {}
+    thumbnail = rec.get("thumbnail_url") or rec.get("thumbnail") or params.get("thumbnail")
+    row = {
+        **({"index": rec["index"]} if "index" in rec else {}),
         "part_id": rec.get("part_id"),
         "title": rec.get("title"),
         "domain": rec.get("domain"),
         "vendor": vendor if vendor else "",
         "price": price if price not in (None, 0, 0.0) else (price if price == 0 else None),
-        "designation": rec.get("designation") or "",
+        "designation": rec.get("designation") or params.get("sku") or params.get("mpn") or "",
         "score": score if score is not None else None,
     }
+    if thumbnail:
+        row["thumbnail_url"] = thumbnail
+    if "preview" in rec:
+        row["preview"] = rec["preview"]
+    return row
 
 
 def _row_vendor(rec: Mapping[str, Any]) -> str:
-    src = rec.get("source")
-    if isinstance(src, str) and src and src != "live":
-        pass
     pid = str(rec.get("part_id") or "")
     if pid.startswith("catalog:"):
         return pid[len("catalog:"):].split("::", 1)[0]
     for row in rec.get("sourcing") or []:
         if isinstance(row, Mapping) and row.get("vendor"):
             return str(row["vendor"])
-    return str(rec.get("brand") or rec.get("manufacturer") or "")
+    params = rec.get("params") if isinstance(rec.get("params"), Mapping) else {}
+    return str(rec.get("brand") or rec.get("manufacturer") or params.get("manufacturer") or "")
 
 
 def _row_price(rec: Mapping[str, Any]) -> Optional[float]:

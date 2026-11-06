@@ -26,16 +26,16 @@ void buildDefaultLayout(ImGuiID root, const ImVec2& size);
 
 namespace ui {
 
-// Left-pane tab indices match AppState::LeftPaneTab (LP_*) values 0..4.
-// Retired rail tab 5 redirects to Explorer; Graph's jump-only tab retains 6.
+// Left-pane tab indices match AppState::LeftPaneTab (LP_*) values.
+// Retired rail tab 5 redirects to Explorer.
 enum {
     kLeftPaneExplorer        = 0,
     kLeftPaneFeatureManager  = 1,
     kLeftPanePropertyManager = 2,
     kLeftPaneConfigurations  = 3,
     kLeftPaneSimulation      = 4,
+    kLeftPaneChanges         = 6,
 };
-constexpr int kLeftPaneGraph = 6;
 
 // ---- overlay band ------------------------------------------------------------------------------
 // The screen-space rect between the ribbon (bottom edge of the chrome) and the status bar — the

@@ -871,6 +871,7 @@ _PROJECT_DOC_TOOLS = frozenset({
     "remove_feature",
     "set_material",
     "regen_resolve",
+    "scad_convert",
 })
 
 

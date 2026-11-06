@@ -216,8 +216,8 @@ transform the SEED FEATURES' tool bodies and re-apply the same boolean per insta
 "geometry pattern" semantics: fast, robust, no per-instance re-solve.
 
 ### `linear_pattern`
-- params: `count1: int` (2, ≥1) · `spacing1: dim` (20) · `count2: int` (1) · `spacing2: dim` (20)
-  · `reverse1: bool` · `reverse2: bool`
+- params: `count1: int` (2, ≥1) · `spacing1: dim` (20) · `count2: int` (1) · `spacing2: dim` (20).
+  Use negative spacing or a negative direction to reverse a pattern.
 - refs: `dir1: sel(edge[line], datum-axis)` · `dir2: …?` · `features: [feature-id]` (≥1, must
   precede this feature)
 
@@ -554,6 +554,32 @@ committed until OK; Cancel restores via worker undo of the preview op).
 - errors (contained): no `body` ref and no current body; a rotation with a zero-length axis; an
   empty result shape.
 
+### `refine`
+- `refs.body` is an optional body feature id or body selector; `params.body` is also accepted.
+  Omit it to refine the current running body, including in a multibody part. There are no
+  other parameters. The current-body restriction on explicit targets prevents reordering
+  ordinal-based body material and appearance assignments.
+- This editable, undoable feature replaces and supersedes its input, like an in-place
+  `transform`. It unifies same-domain faces and edges on a topology copy without ShapeFix,
+  sewing, BREP replacement, or B-spline concatenation. A successful no-change refinement
+  retains the original shape and records a warning.
+- `feature_status[].data` reports `attempted`, `changed`, `candidate_changed`,
+  `before`/`after` face, edge and solid counts, validity, volume and bounds, the maximum
+  bounding-box difference and tolerance, and `material_difference_mm3` with independent
+  `removed`, `added` and `tolerance` values. `material_difference_checks` records each
+  directional algorithm's completion, errors, warnings and residual validity, including
+  available kernel diagnostics. In a refusal, available evidence and `refusal` remain on the
+  failed status; `changed` means a result was actually accepted.
+- Refuses invalid/non-solid inputs, incomplete or warning-bearing directional checks, invalid
+  residuals, material or bounds drift, changed solid count or analytic types, missing operation
+  history, and topology references or face finishes that cannot be shown to survive uniquely.
+  Face finishes use final surviving-body ordinals; downstream operations whose final finish
+  mapping cannot be established are refused rather than silently dropping a finish. Refine
+  also refuses a downstream explicit modifier targeting its superseded input (including a
+  no-change input); target the refine feature instead. Transform, heal and refine already
+  follow in-place supersession. The directional boolean checks are tolerance-based validation,
+  not an engineering certification of the part.
+
 ## Geometry repair (append-only, 2026-09-05)
 
 ### `heal`
@@ -704,3 +730,139 @@ offset, offset2, start, start_offset, suppressed, thin, thin_side, thin_thicknes
 names are also accepted. Whole-document validation does not apply this rule. Thus saved
 documents with legacy keys still open and accept edits. Depth is a magnitude (> 0). To
 reverse the direction, set `flip`.
+
+## Fillet parameters and correction v2 (append-only)
+
+This semantic version supersedes the native fillet retry and effective-radius
+claims in §`fillet` and its C30-A addition above. In particular, the historical
+“halve ×3, floor 0.2 mm” and `resolved.radius2` descriptions are not the native
+fillet contract. The separate legacy `run_model` script wrapper is not changed
+by this native-feature amendment. The supported fillet modes remain constant
+and variable; chamfer behavior is unchanged.
+
+- `params.type:"constant"` and `"variable"` require `refs.edges`: a nonempty
+  selector or edge query, or a list of selectors/queries. Variable requires
+  `params.radius2`. `radius` is the START radius and `radius2` the END radius
+  of each selected edge. The variable law follows the OCCT contour spine; no
+  stronger claim about its interior interpolation is made here. Explicit
+  variable mode retains endpoint intent for equal, close, zero or negative
+  finite requests rather than silently converting to constant. Topological edge
+  direction determines START/END; swapping the values reverses the endpoints.
+- Variable fillets can use multi-edge open or closed contours when their
+  per-vertex radius demands are compatible. Conflicting demands at a shared
+  contour vertex, unequal endpoint radii on a single closed edge, and requests
+  whose two endpoints are both positive, unequal and separated by at most OCCT
+  `Precision::Confusion()` fail explicitly rather than silently altering the
+  law. Correction of a nonpositive unequal request requires distinct effective
+  endpoints beyond that resolution, or fails. Variable contact joins are
+  unsupported even when the endpoints are equal.
+- An omitted subtype keeps the legacy explicit-selection or implicit whole-body/
+  `dir` selection path. On that path only, a picked nonzero `radius2` unequal
+  to `radius` selects the variable path, including negative and very close
+  unequal endpoints, subject to the precision refusal above. Absent, zero or
+  equal `radius2` is constant. `"full_round"` and
+  `"face"` remain unsupported.
+- Explicit queries and selectors resolve against the current body. Concrete
+  selectors use the existing unique-edge assignment; query results and mixed
+  query/selector unions are deduplicated by resolved edge. A dangling selector,
+  an empty query or selection, a seam, a degenerate, a foreign/unmappable edge, or
+  unsupported topology fails rather than silently dropping a requested edge.
+  Implicit selection enumerates the blendable edges, optionally filtered by
+  direction. A successful result covers **every** edge in that selection and
+  contains real blend geometry: neither a subset nor an unchanged sub-tolerance
+  pass-through is a successful fillet. Solid inputs still pass the full
+  closed-solid and dress-geometry validation gates.
+- Straight/circular shared-edge contact joins remain supported for constant
+  fillets, including the existing restrictions in
+  [doc_schema.md](doc_schema.md); variable contact joins fail explicitly.
+  The historical claim there that an oversize join necessarily fails is
+  superseded when a verified all-edge correction can be built.
+
+Positive finite requested radii are tried first without alteration; nonpositive
+endpoints enter the lower-correction search without a kernel build at that
+value. When the requested result cannot be accepted, bounded search can correct
+finite too-small (including zero/negative) or too-large requests to a verified
+feasible candidate, with no fixed 0.2 mm floor. Constant mode refines toward
+the requested radius from observed feasible candidates. Equal-endpoint
+variable requests are refined together and stay equal. Unequal-endpoint
+requests use a deterministic coordinate order: refine one endpoint toward its
+request with the other fixed, then refine the other, repeating in that order.
+This can preserve an endpoint at its request when feasible and does not collapse
+an unequal law to equal. Neither mode promises a global optimum; OCCT
+feasibility can be non-monotonic, so the returned
+candidate is verified and the reported `tolerance_mm` is search resolution,
+not proof of a mathematical global optimum. For an individual search the
+resolution is the maximum of twice OCCT `Precision::Confusion()`, twice the
+largest selected-edge tolerance, and `1e-5` times the longest body bounding-box
+extent, in mm; an unchanged fast path reports zero. A stabilized result reports
+the maximum resolution of its participating stages. If no valid
+all-edge candidate is found within the search budget, the feature fails rather
+than committing a partial result.
+
+Nonfinite active radii, invalid selections, unsupported topology, isolation
+failures, isolated child crashes and timeouts remain explicit failures. A
+candidate failing geometry validation is never accepted; no crash or timeout
+is evidence that a radius is too large. Each geometry search has at most 72
+probes and a 30-second elapsed budget checked between calls; an isolated probe
+is limited to the smaller of
+five seconds and the remaining budget. Windows and disabled/retired isolation
+run in-process, where an in-flight native call has no hard wall-clock deadline
+or crash containment. Transaction-level literal stabilization can invoke the
+geometry search more than once.
+
+On success the feature status reports requested and effective radii, correction
+direction, coverage, probes and resolution in `data.fillet` (including the
+uncorrected fast path). Literal corrections commit in the same transaction;
+expressions remain authored and any needed derived effective record is separate.
+See [worker_rpc.md](worker_rpc.md), [doc_schema.md](doc_schema.md) and
+[doc_ops.md](doc_ops.md) for the exact result and state contracts.
+
+## Fillet endpoint resolution v3 (append-only)
+
+This amendment supersedes C30-A's linear-law claim and v2's unspecified endpoint
+resolution details. All other v2 selection, correction and result rules remain.
+Native variable fillets constrain the radii at each selected edge's oriented
+START/END vertices. OCCT interpolates along its contour spine; the interior law
+is not guaranteed to be linear.
+
+Each variable candidate must have resolvable endpoints. The source bound at
+each endpoint includes `Precision::Confusion()` and the local selected-edge,
+endpoint-vertex and incident-face tolerances. After construction, the local
+generated-face, boundary-edge and boundary-vertex tolerances also contribute.
+Straight-edge boundaries are assigned to their nearer endpoint; curved or
+ambiguous boundaries conservatively contribute to both endpoints. Each
+candidate endpoint must strictly exceed its applicable bound.
+
+A below-resolution endpoint is eligible for the bounded lower-correction
+search, retaining a resolvable opposite endpoint when feasible. Positive unequal
+requests separated by at most `Precision::Confusion()` fail immediately only
+when both already exceed their source bounds; corrections must otherwise
+retain the unequal endpoint intent specified in v2. No unresolvable endpoint
+may be accepted merely because the result is closed or has generated faces.
+
+This certifies resolvability of the endpoint law, not independent metrology of
+the final trimmed radius. `tolerance_mm` remains the reported search resolution,
+not the per-endpoint bound or a radius-measurement accuracy claim.
+
+## Real Thread acceptance v4 (append-only)
+
+This amendment defines acceptance for the native `thread` feature; it does not
+change earlier frozen sections. The compiler is
+[`core/doc/document.cpp`](../core/doc/document.cpp) and real geometry is built by
+[`core/geom/thread.cpp`](../core/geom/thread.cpp).
+
+- `mode:"cut"` and raised modes MUST produce sound, actual material-changing
+  thread geometry over the complete requested axial run, or report a native
+  feature failure. An unchanged body, an incomplete run, a failed sweep or
+  boolean, or invalid resulting geometry MUST NOT be accepted as a successful
+  real thread, with or without a warning.
+- The supported `turns` parameter is a hard cap on swept turns, including end
+  extensions; the default cap is 24 when it is not positive. If the complete run
+  requires more than the cap, the feature MUST fail rather than shorten the run.
+- Explicit `mode:"cosmetic"` intentionally leaves the body unchanged and is
+  distinct from a failed real thread. Draft or preview geometry is provisional;
+  a proxy MUST NOT be presented or persisted as the successful final real
+  thread.
+
+See [stepplus.md §25](stepplus.md#25-real-thread-geometry-cache-epoch) for
+cache invalidation and failed-rebuild persistence.

@@ -776,6 +776,8 @@ def test_rollback_preflight_detects_external_modification(store, tmp_path):
     r0 = store.checkpoint("fp3", _part(4, wall=1.0), turn_id=1,
                           op_batch={"n": 1}, kind="prompt", msg_idx=1,
                           label="step one", doc_file=str(f))
+    ai_vc.set_session_context(session_id="fingerprint-test-3")
+    ai_vc.note_session_saved("fp3", str(f), session_id="fingerprint-test-3")
     store.checkpoint("fp3", _part(4, wall=2.0), turn_id=2,
                      op_batch={"n": 2}, kind="tool", msg_idx=2,
                      call={"turn": 2, "i": 0}, label="add_features",
@@ -785,7 +787,8 @@ def test_rollback_preflight_detects_external_modification(store, tmp_path):
                      label="step three", doc_file=str(f))
 
     # Unmodified file -> externally_modified is explicitly False.
-    pf = ai_vc.plm_rollback_check("fp3", r0["id"], store=store, chat_size=6)
+    pf = ai_vc.plm_rollback_check("fp3", r0["id"], store=store, chat_size=6,
+                                  session_id="fingerprint-test-3")
     assert pf["ok"]
     assert pf["checkpoint_id"] == r0["id"]
     assert pf["discarded_checkpoints"] == 2
@@ -794,10 +797,20 @@ def test_rollback_preflight_detects_external_modification(store, tmp_path):
     assert pf["geometry_rollback"] is True
     assert pf["file"]["provenance_known"] is True
     assert pf["file"]["externally_modified"] is False
+    f.write_bytes(b"v2-agent")
+    ai_vc.note_session_saved("fp3", str(f), session_id="fingerprint-test-3")
+    same_session = ai_vc.plm_rollback_check("fp3", r0["id"], store=store,
+                                            session_id="fingerprint-test-3")
+    assert same_session["file"]["changed_since_checkpoint"] is True
+    assert same_session["file"]["externally_modified"] is False
+    other = ai_vc.plm_rollback_check("fp3", r0["id"], store=store, session_id="another")
+    assert other["file"]["changed_since_checkpoint"] is True
+    assert other["file"]["externally_modified"] is None
 
     # External write -> hash mismatch -> True, and the path names the file.
     f.write_bytes(b"v2-tampered-elsewhere")
-    pf2 = ai_vc.plm_rollback_check("fp3", r0["id"], store=store, chat_size=6)
+    pf2 = ai_vc.plm_rollback_check("fp3", r0["id"], store=store, chat_size=6,
+                                   session_id="fingerprint-test-3")
     assert pf2["ok"]
     assert pf2["file"]["externally_modified"] is True
     assert pf2["file"]["path"] == str(f)
@@ -806,10 +819,29 @@ def test_rollback_preflight_detects_external_modification(store, tmp_path):
 
     # File deleted -> cannot verify: None, NOT a claim of unmodified.
     f.unlink()
-    pf3 = ai_vc.plm_rollback_check("fp3", r0["id"], store=store)
+    pf3 = ai_vc.plm_rollback_check("fp3", r0["id"], store=store,
+                                   session_id="fingerprint-test-3")
     assert pf3["ok"]
     assert pf3["file"]["externally_modified"] is None
     assert pf3["file"]["provenance_known"] is True  # hash was recorded
+
+def test_rollback_rpc_uses_explicit_save_session(store, tmp_path, monkeypatch):
+    from services.plm.worker_rpc import _plm_rollback_check
+
+    f = tmp_path / "session.step+"
+    f.write_bytes(b"checkpoint")
+    rec = store.checkpoint("session-doc", _part(4), turn_id=1, op_batch="checkpoint",
+                           doc_file=str(f))
+    f.write_bytes(b"agent save")
+    with ai_vc.bind_save_session("session-a"):
+        ai_vc.note_session_saved("session-doc", str(f))
+    monkeypatch.setattr(ai_vc, "resolve_store", lambda _: store)
+    params = {"doc_id": "session-doc", "to": rec["id"], "session_id": "session-a"}
+    same = _plm_rollback_check(params, lambda *_: None)
+    assert same["file"]["changed_since_checkpoint"] is True
+    assert same["file"]["externally_modified"] is False
+    params["session_id"] = "session-b"
+    assert _plm_rollback_check(params, lambda *_: None)["file"]["externally_modified"] is None
 
 
 def test_rollback_preflight_ignores_rewritten_build_state(store, tmp_path):
@@ -829,16 +861,20 @@ def test_rollback_preflight_ignores_rewritten_build_state(store, tmp_path):
     ai_vc.stamp_authored("fp6", "agent")
     r0 = store.checkpoint("fp6", _part(4), turn_id=1, op_batch={"n": 1},
                           kind="prompt", msg_idx=1, label="one", doc_file=str(f))
+    ai_vc.set_session_context(session_id="fingerprint-test-6")
+    ai_vc.note_session_saved("fp6", str(f), session_id="fingerprint-test-6")
     store.checkpoint("fp6", _part(4, wall=2.0), turn_id=2, op_batch={"n": 2},
                      kind="prompt", msg_idx=2, label="two", doc_file=str(f))
 
     write(b'{"features": []}', b"current-engine-build")
-    pf = ai_vc.plm_rollback_check("fp6", r0["id"], store=store)
+    pf = ai_vc.plm_rollback_check("fp6", r0["id"], store=store,
+                                  session_id="fingerprint-test-6")
     assert pf["file"]["recorded_sha256"] != pf["file"]["current_sha256"]
     assert pf["file"]["externally_modified"] is False
 
     write(b'{"features": [{"id": "f1"}]}', b"current-engine-build")
-    pf = ai_vc.plm_rollback_check("fp6", r0["id"], store=store)
+    pf = ai_vc.plm_rollback_check("fp6", r0["id"], store=store,
+                                  session_id="fingerprint-test-6")
     assert pf["file"]["externally_modified"] is True
 
 

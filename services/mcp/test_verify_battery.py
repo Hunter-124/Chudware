@@ -116,10 +116,20 @@ def test_req_join_partial():
     assert "R2" in r["unmet"]
 
 
-def test_req_join_empty():
-    from services.verify.battery import _gap_req_join
-    r = json.loads(_gap_req_join(requirements=[]))
-    assert r["ok"] is True
+@pytest.mark.parametrize("requirements,reason", [
+    ([], "no requirements"),
+    ([{"id": "R1", "status": "waived"}], "all requirements are waived"),
+])
+def test_req_join_without_scorable_requirements_skips(requirements, reason):
+    from services.verify.battery import _gap_req_join, verify
+
+    raw = json.loads(_gap_req_join(requirements=requirements))
+    assert raw["skipped"] is True
+    assert reason in raw["skip_reason"]
+    result = verify(doc_id="d1", checks=["req_join"], requirements=requirements)
+    assert result["scores"] == {}
+    assert result["skipped"] == ["req_join"]
+    assert reason in result["findings"][0]["detail"]
 
 
 def test_req_join_verified_without_evidence_is_inconsistent():
@@ -254,6 +264,89 @@ def test_verify_aliases_watertight_without_changing_success_shape(monkeypatch):
     assert result["findings"] == []
 
 
+
+@pytest.mark.parametrize("scores,info,skipped,verdict", [
+    ({"is_manifold": 1.0}, {"measure_part": {"volume_mm3": 42}}, ["check_sketch"], "pass"),
+    ({"is_manifold": 0.75}, {"measure_part": {"volume_mm3": 42}}, [], "fail"),
+    ({}, {"measure_between": {"distance": 0.0}}, [], "no_checks_ran"),
+    ({}, {}, ["check_sketch"], "no_checks_ran"),
+])
+def test_mcp_battery_verdict_reports_scored_info_and_skipped_coverage(
+        monkeypatch, scores, info, skipped, verdict):
+    from mcp.server.fastmcp import FastMCP
+    from services.mcp.verify_tools import register_verify_tools
+    from services.verify import battery
+
+    monkeypatch.setattr(battery, "verify", lambda **kwargs: {
+        "scores": scores, "informational": info, "skipped": skipped, "findings": []})
+    mcp = FastMCP("battery-coverage")
+    register_verify_tools(mcp)
+    result = json.loads(mcp._tool_manager._tools["verify_battery"].fn(
+        doc_id="d1", checks=["is_manifold"]))
+    assert result["verdict"] == verdict
+    assert result["coverage"] == {"doc_id": "d1", "ran": sorted(scores),
+                                  "informational": sorted(info), "skipped": sorted(skipped)}
+
+
+def test_measure_part_readout_is_informational_not_a_pass(monkeypatch):
+    from services.verify import battery
+
+    monkeypatch.setattr(battery, "_study_only_kinds", lambda doc_id: [])
+    monkeypatch.setattr(battery, "_get_fn", lambda module, name: lambda doc_id=None: json.dumps({
+        "ok": True, "mass": {"volume_mm3": 42, "mass_g": 3.5, "body_count": 1,
+                             "material": {"source": "applied"}}}))
+    result = battery.verify("d1", ["measure_part"])
+    assert result["scores"] == {}
+    assert result["informational"]["measure_part"] == {
+        "volume_mm3": 42, "mass_g": 3.5, "body_count": 1, "material_source": "applied"}
+    assert result["skipped"] == []
+
+
+def test_default_battery_does_not_dispatch_geometry_query(monkeypatch):
+    from services.verify import battery
+
+    monkeypatch.setattr(battery, "CHECKS", {
+        "query_geometry": ("cad", "query_geometry", "subsecond", "any", "info"),
+        "check_interference": ("cad", "check_interference", "subsecond", "any", "binary"),
+    })
+    monkeypatch.setattr(battery, "_study_only_kinds", lambda doc_id: [])
+    dispatched = []
+
+    def get_fn(module, name):
+        dispatched.append(name)
+        return lambda doc_id=None: json.dumps({"ok": True, "clear": True})
+
+    monkeypatch.setattr(battery, "_get_fn", get_fn)
+    result = battery.verify("d1", [])
+    assert dispatched == ["check_interference"]
+    assert result["scores"] == {"check_interference": 1.0}
+    assert "query_geometry" not in result["informational"]
+
+
+def test_explicit_geometry_query_is_forwarded_and_informational(monkeypatch):
+    from mcp.server.fastmcp import FastMCP
+    from services.mcp.verify_tools import register_verify_tools
+    from services.verify import battery
+
+    seen = []
+
+    def query_geometry(query, doc_id=None):
+        seen.append((doc_id, query))
+        return json.dumps({"ok": True, "matches": [{"sid": "Fabc123"}]})
+
+    monkeypatch.setattr(battery, "_study_only_kinds", lambda doc_id: [])
+    monkeypatch.setattr(battery, "_get_fn", lambda module, name: query_geometry)
+    mcp = FastMCP("battery-geometry-query")
+    register_verify_tools(mcp)
+    result = json.loads(mcp._tool_manager._tools["verify_battery"].fn(
+        checks=["query_geometry"], doc_id="d1", query={"of": "face"}))
+    assert seen == [("d1", {"of": "face"})]
+    assert result["verdict"] == "no_checks_ran"
+    assert result["coverage"]["ran"] == []
+    assert result["coverage"]["informational"] == ["query_geometry"]
+    assert result["informational"]["query_geometry"]["matches"] == [{"sid": "Fabc123"}]
+
+
 def test_extract_score_dfm_uses_dfm_pass_and_failed_checks():
     from services.verify.battery import _extract_score
 
@@ -326,7 +419,8 @@ def test_verify_runs_solid_checks_on_a_doc_with_solids_and_motion_studies(monkey
 
     result = bat.verify(doc_id="asm", checks=["eval_check", "is_manifold", "measure_part"])
     assert sorted(ran) == ["eval_check_direct", "is_manifold", "measure_part"]
-    assert result["scores"] == {"eval_check": 1.0, "is_manifold": 1.0, "measure_part": 1.0}
+    assert result["scores"] == {"eval_check": 1.0, "is_manifold": 1.0}
+    assert "measure_part" in result["informational"]
     assert result["skipped"] == []
 
 
@@ -427,7 +521,8 @@ def test_automatic_probe_keeps_body_provenance_for_repeated_sids(monkeypatch):
     calls = _measure_battery_engine(monkeypatch, faces)
     result = bat.verify("part", ["measure_between"])
 
-    assert result["scores"] == {"measure_between": 1.0}
+    assert result["scores"] == {}
+    assert result["informational"]["measure_between"]["distance"] == 10.0
     [refs] = calls
     assert {ref["sid"] for ref in refs} == {"Fabc123", "Fdef456"}
     assert len({ref["body_id"] for ref in refs}) == 1
@@ -442,7 +537,8 @@ def test_automatic_probe_accepts_globally_unique_world_readbacks(monkeypatch):
         _probe_face("Fdef456", 0, -1, component="instance-a"),
     ])
     result = bat.verify("part", ["measure_between"])
-    assert result["scores"] == {"measure_between": 1.0}
+    assert result["scores"] == {}
+    assert result["informational"]["measure_between"]["distance"] == 10.0
     assert calls == [[{"sid": "Fabc123"}, {"sid": "Fdef456"}]]
 
 
@@ -684,6 +780,38 @@ def test_extract_score_string_summary_is_not_treated_as_metrics():
     assert score == pytest.approx(1.0)   # bare-ok fallback, no crash
 
 
+@pytest.mark.parametrize("mass_material", [
+    {},
+    {"source": "default", "key": "steel"},
+    {"source": "document"},
+])
+def test_fea_skips_without_applied_material_instead_of_defaulting_to_steel(
+        monkeypatch, mass_material):
+    from services.mcp import core_bridge
+    from services.verify import battery
+
+    monkeypatch.setattr(core_bridge, "call", lambda method, args: {"material": mass_material})
+    monkeypatch.setattr(battery, "_study_only_kinds", lambda doc_id: [])
+    calls = []
+
+    def solve(doc_id=None, material=None):
+        calls.append(material)
+        return json.dumps({"ok": True, "min_fos": 3.0})
+
+    monkeypatch.setattr(battery, "_get_fn", lambda module, name: solve)
+    result = battery.verify("d1", ["run_fea_static"])
+    assert calls == []
+    assert result["scores"] == {}
+    assert result["skipped"] == ["run_fea_static"]
+    assert result["findings"][0]["reason"] == "material_unresolved"
+    assert "no applied material" in result["findings"][0]["detail"]
+
+    # An explicit material remains a deliberate, runnable choice.
+    result = battery.verify("d1", ["run_fea_static"], material="aluminum")
+    assert calls == ["aluminum"]
+    assert result["scores"] == {"run_fea_static": 1.0}
+
+
 # ── _gap_is_manifold issues-list fix ────────────────────────────────────────
 
 def test_gap_is_manifold_issues_free_edges_fails(monkeypatch):
@@ -910,7 +1038,8 @@ def test_adapt_measure_between_runs_with_derived_queries(monkeypatch):
     ])
     monkeypatch.setattr(bat, "_get_fn", lambda mk, fn: _fn)
     r = bat.verify("doc-mech", ["measure_between"])
-    assert r["scores"]["measure_between"] == 1.0
+    assert r["scores"] == {}
+    assert r["informational"]["measure_between"]["distance"] == 10.0
     assert {seen["a"]["sid"], seen["b"]["sid"]} == {"Fabc123", "Fdef456"}
     assert seen["a"] != seen["b"]
 

@@ -21,6 +21,7 @@
 #include "../vec_math.h"
 
 struct AppState;
+namespace core { struct OpsResponse; }
 
 namespace ui {
 
@@ -41,6 +42,7 @@ class Sketch3DMode {
 public:
     bool active() const { return active_; }
     const std::string& sketchId() const { return fid_; }
+    const std::string& documentId() const { return docId_; }
 
     // Enter an existing sketch3d feature (tree double-click / "Edit 3D Sketch").
     bool enterForFeature(AppState& st, const std::string& fid);
@@ -49,6 +51,9 @@ public:
     // keep=true commits (all edits are already applied doc ops — just leave the mode);
     // keep=false reverts to the entry checkpoint (and deletes a still-empty new sketch).
     void exitSketch(AppState& st, bool keep = true);
+
+    // Exercise the normal point-add path in the agent-lock GUI scenario only.
+    std::string scenarioAddPoint(AppState& st, const Vec3& point);
 
     // Ribbon dispatch ("sketch3d_new" from anywhere; everything else in-overlay). True = handled.
     bool onRibbonCommand(AppState& st, const std::string& cmdId);
@@ -73,15 +78,27 @@ public:
     // each frame by drawOverlay(); defaults true (safe) before the first call.
     bool inSketchEntityHot() const { return entityHoverHot_; }
 
+    bool hasSelectedEntities() const { return active_ && !selEnts_.empty(); }
+    bool hasFixableSelection() const {
+        if (!active_) return false;
+        if (!selEnts_.empty()) return true;
+        for (const auto& handle : selHandles_)
+            if (handle != "origin" && !isExternalHandle(handle)) return true;
+        return false;
+    }
 private:
     // ---- worker round-trips ----
     bool callSk3(AppState& st, const char* method, const nlohmann::json& extra,
                  nlohmann::json& result);
     void refreshHealth(AppState& st);                 // sketch3d_health -> ents_/dof_/status_
     void applyEntities(const nlohmann::json& res);    // parse entities[] + statuses{}
+    // Apply one session edit while tracking ownership of the cancel checkpoint.
+    core::OpsResponse applySketchOp(AppState& st, const nlohmann::json& op);
     // Persist a params patch (full entities and/or constraints arrays) via edit_feature.
     bool commitParams(AppState& st, const nlohmann::json* entities,
                       const nlohmann::json* constraints, const char* label);
+    bool requireCurrentParams(AppState& st, long sourceRevision, const char* label);
+    void discardLocalEdit(AppState& st);
     // Append one entity (+ extra constraints) to the persisted params; returns new entity id.
     std::string addEntity(AppState& st, nlohmann::json entity, nlohmann::json constraints);
     void addConstraint(AppState& st, nlohmann::json con, const char* label);
@@ -150,10 +167,12 @@ private:
     std::string fid_;
     std::string docId_;                 // guard: auto-exit if the active doc changes
     std::string cancelCheckpoint_;
+    long cancelRevision_ = -1;
 
     // cached persisted params (source of truth for edits; refreshed from the doc tree)
     nlohmann::json entJson_ = nlohmann::json::array();
     nlohmann::json conJson_ = nlohmann::json::array();
+    long paramsRevision_ = -1;         // document revision that supplied the cached arrays
     nlohmann::json externalRefs_ = nlohmann::json::array();
     void reloadParamsFromTree(AppState& st);
 
@@ -182,6 +201,7 @@ private:
     ImVec2 dragDownPos_{0, 0};
     int dragFrame_ = -1;
     nlohmann::json dragEntities_;       // last sketch3d_drag response entities (commit payload)
+    long dragRevision_ = -1;            // revision at handle press
     // Single-in-flight latest-wins sketch3d_drag
     int  dragGen_ = 0;
     bool dragInFlight_ = false;

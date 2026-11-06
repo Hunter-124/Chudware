@@ -118,8 +118,22 @@ WORKLOADS = {
     "pattern":   [_box("Plate", 140, 140, 20), _bolt(48, 110, 5)],
     "heavy_mix": [_box("Block", 100, 80, 40), _fillet(3), _bolt(16, 70, 6)],
 }
+# The interactive fixture rounds every physical outside edge and both rims of
+# every through-hole. Hole-cylinder seam lines are not edges that can be blended:
+# selecting all topology would explicitly request them and reject the fillet.
+def _open_part():
+    round_op = _fillet(2)
+    round_op["feature"]["refs"]["edges"] = [
+        {"of": "edge", "surf": "line", "perpendicular": "z"},
+        {"of": "edge", "surf": "line", "parallel": "z", "side": "+x"},
+        {"of": "edge", "surf": "line", "parallel": "z", "side": "-x"},
+        {"of": "edge", "surf": "circle"},
+    ]
+    return [_box("Plate", 160, 160, 20), _bolt(24, 120, 6), round_op]
+
+
 # Saved-cache fixture for open_warm, never compared with the legacy open_cold metric.
-OPEN_PART = [_box("Plate", 160, 160, 20), _bolt(24, 120, 6), _fillet(2)]
+OPEN_PART = _open_part()
 
 
 class MeasurementError(RuntimeError):

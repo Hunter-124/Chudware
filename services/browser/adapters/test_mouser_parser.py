@@ -8,9 +8,7 @@ been denied." block shell (``<h1>Access Denied</h1>`` + an ``m-captcha`` div,
 ``/ProductSearch/Refine`` endpoint returns only a JS chrome shell (results load
 via XHR), so neither path yields server-rendered product rows headless.
 
-The honest, sanctioned behavior (same as lowes/tractorsupply and futureelectronics)
-is to degrade to the ``login_required`` ask — never solve or bypass the wall, and
-never silently parse the block shell to an empty result list ("no hits parsed").
+The wall must be reported as blocked, never as login and never as empty results.
 
 ``MOUSER_ACCESS_DENIED_HTML`` below is a VERBATIM slice of the real block page
 returned on 2026-07-11, reproduced with the markers that trip the challenge
@@ -66,6 +64,7 @@ def mouser_mod(tmp_path, monkeypatch):
     importlib.reload(adapters_pkg)
     from services.browser.adapters import mouser
     importlib.reload(mouser)
+    monkeypatch.setattr(mouser._vendor_api, "credentials", lambda _: None)
     yield session, mouser
     monkeypatch.delenv("APPDATA", raising=False)
     importlib.reload(engine_paths)
@@ -76,9 +75,8 @@ def test_mouser_search_url_is_catalog_keyword_endpoint():
     assert mouser.SEARCH_URL_TMPL == "https://www.mouser.com/c/?q={query}"
 
 
-def test_real_bot_wall_degrades_to_login_required(mouser_mod, monkeypatch):
-    """The real Akamai block page must degrade to the login_required ask, never
-    parse to a silent empty list and never be bypassed."""
+def test_real_bot_wall_is_blocked(mouser_mod, monkeypatch):
+    """The Akamai denial is not a sign-in wall and must not be bypassed."""
     session, mouser = mouser_mod
     monkeypatch.setattr(
         session, "browser_fetch",
@@ -89,8 +87,8 @@ def test_real_bot_wall_degrades_to_login_required(mouser_mod, monkeypatch):
 
     assert len(hits) == 1
     assert hits[0]["ok"] is False
-    assert hits[0]["reason"] == "login_required"
-    assert hits[0]["ask_user"]["id"].startswith("browser_login")
+    assert hits[0]["reason"] == "blocked"
+    assert not hits[0].get("ask_user")
 
 
 def test_real_bot_wall_never_reaches_parse(mouser_mod, monkeypatch):
@@ -105,7 +103,7 @@ def test_real_bot_wall_never_reaches_parse(mouser_mod, monkeypatch):
 
     hits = mouser.ADAPTER.search("anything")
     # A silent empty list (or a fabricated product hit) would both fail here.
-    assert hits and hits[0].get("reason") == "login_required"
+    assert hits and hits[0].get("reason") == "blocked"
 
 
 def test_jsonld_products_parse_when_reachable(mouser_mod, monkeypatch):
@@ -117,6 +115,7 @@ def test_jsonld_products_parse_when_reachable(mouser_mod, monkeypatch):
         '<html><head><script type="application/ld+json">'
         '{"@type":"Product","name":"Heatsink 30x30x10mm",'
         '"url":"/ProductDetail/heatsink-30","sku":"532102B02500G",'
+        '"image":"//images.mouser.com/heatsink.jpg",'
         '"offers":{"@type":"Offer","price":"2.34","priceCurrency":"USD"}}'
         "</script></head><body>results</body></html>"
     )
@@ -131,4 +130,17 @@ def test_jsonld_products_parse_when_reachable(mouser_mod, monkeypatch):
     assert hits[0]["title"] == "Heatsink 30x30x10mm"
     assert hits[0]["url"] == "https://www.mouser.com/ProductDetail/heatsink-30"
     assert hits[0]["sku"] == "532102B02500G"
-    assert hits[0]["price"] == "2.34"
+    assert hits[0]["price"] == 2.34 and hits[0]["currency"] == "USD"
+    assert hits[0]["kind"] == "product"
+    assert hits[0]["thumbnail"] == "https://images.mouser.com/heatsink.jpg"
+
+
+def test_mouser_web_encodes_and_distinguishes_empty_from_unparseable(mouser_mod, monkeypatch):
+    session, mouser = mouser_mod
+    seen = []
+    monkeypatch.setattr(session, "browser_fetch", lambda url, site: (
+        seen.append(url) or {"ok": True, "content": "<html>No results</html>"}))
+    assert mouser.ADAPTER.search("C++ & A/B#1") == []
+    assert seen[0].endswith("?q=C%2B%2B+%26+A%2FB%231")
+    monkeypatch.setattr(session, "browser_fetch", lambda *_: {"ok": True, "content": "<html>shell</html>"})
+    assert mouser.ADAPTER.search("heatsink")[0]["reason"] == "parse_failed"

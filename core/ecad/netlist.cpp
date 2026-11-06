@@ -307,7 +307,8 @@ struct SheetPinRec {
 };
 
 struct PowerRec {
-    std::string id, net, symbol;
+    std::string net;
+    bool flag;
     Node node;
 };
 
@@ -544,10 +545,14 @@ json build_netlist(const json& sch) {
                                                              : json::array({0, 0}));
         uf.add(node);
         attach_to_segments(uf, node, wire_segments);
-        power_groups[net].push_back(node);
-        powers.push_back(PowerRec{id, net,
-                                  jstr(power->contains("symbol") ? (*power)["symbol"] : json("")),
-                                  node});
+        const std::string symbol = jstr(power->contains("symbol") ? (*power)["symbol"] : json(""));
+        const std::string libid = jstr(power->contains("libid") ? (*power)["libid"] : json(""));
+        const bool flag = symbol == "PWR_FLAG" || symbol == "power:PWR_FLAG" ||
+                          libid == "power:PWR_FLAG";
+        // A PWR_FLAG has an unnamed electrical pin: it marks only the wire it
+        // touches as driven and never acts as a global label.
+        if (!flag) power_groups[net].push_back(node);
+        powers.push_back(PowerRec{net, flag, node});
         scalar_objects[id] = node;
     }
     for (auto& kv : power_groups) {
@@ -718,7 +723,8 @@ json build_netlist(const json& sch) {
         if (current == names.end() || better_name(candidate, current->second)) names[root] = candidate;
     };
 
-    for (const PowerRec& power : powers) consider_name(power.node, power.net, power.node.sheet, 3, 0);
+    for (const PowerRec& power : powers)
+        if (!power.flag) consider_name(power.node, power.net, power.node.sheet, 3, 0);
     for (const LabelRec& label : labels)
         if (label.scope == "global") consider_name(label.node, label.name, label.sheet, 2, 0);
     for (const auto& kv : member_anchor_name)
@@ -818,7 +824,7 @@ json build_netlist(const json& sch) {
                                              "output", "power_out", "tri_state"};
     std::map<Node, bool> power_source_by_root;
     for (const PowerRec& power : powers)
-        if (power.symbol == "PWR_FLAG") power_source_by_root[root_of.at(power.node)] = true;
+        if (power.flag) power_source_by_root[root_of.at(power.node)] = true;
 
     std::size_t net_index = 1;
     for (const auto& class_entry : classes) {
@@ -925,6 +931,14 @@ json build_netlist(const json& sch) {
                         merged_pins[pin.first] = pin.second;
                 }
             }
+        }
+        if (sch.contains("lib_cache") && sch["lib_cache"].is_object() &&
+            sch["lib_cache"].contains(libid)) {
+            const json& def = sch["lib_cache"][libid];
+            if (def.is_object() && def.contains("fields") && def["fields"].is_object())
+                for (auto it = def["fields"].begin(); it != def["fields"].end(); ++it)
+                    if (it.key().rfind("Sim.", 0) == 0 && !fields.contains(it.key()))
+                        fields[it.key()] = it.value();
         }
         if (mismatch)
             warnings.push_back("multi_unit_mismatch: component " + ref +

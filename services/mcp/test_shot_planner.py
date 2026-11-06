@@ -358,19 +358,23 @@ def test_cross_drilled_whole_part_reveals_its_intersecting_passages():
     cb = ct.cb
     d = cb.call("doc_new", {"name": "PlannerCrossDrill", "resume_if_open": False})["doc_id"]
     try:
-        cb.call("doc_apply_ops", {"doc_id": d, "ops": [
+        built = cb.call("doc_apply_ops", {"doc_id": d, "ops": [
             cb.feat("box", "Block", {"length": cb.dim(70), "width": cb.dim(50),
                                      "height": cb.dim(40)}),
             cb.feat("hole", "CrossX", {"style": "simple", "end": "through_all",
-                                       "diameter": cb.dim(12), "at": [0, 0]},
+                                       "diameter": cb.dim(12), "positions": [[0, 0]]},
                     {"face": {"of": "face", "side": "right"}}),
             cb.feat("hole", "CrossY", {"style": "simple", "end": "through_all",
-                                       "diameter": cb.dim(10), "at": [0, 0]},
+                                       "diameter": cb.dim(10), "positions": [[0, 0]]},
                     {"face": {"of": "face", "side": "front"}})]})
+        assert all(s["ok"] for s in built["rebuild"]["feature_status"]), built
         plan = sp.plan_shots(d, k=4, mode="hand")
         passages = {i for i, f in enumerate(plan["metrics"]["faces"])
                     if f.get("surf_type") == 1}
         assert len(passages) >= 2
+        axes = [_unit(plan["metrics"]["faces"][i]["axis"]) for i in passages]
+        assert any(abs(float(np.dot(a, b))) < 1e-6
+                   for i, a in enumerate(axes) for b in axes[i + 1:])
         assert any(v["section"] and sum(
             int(row[0]) in passages and float(row[1]) > 4
             for row in plan["metrics"]["views"][v["metrics_index"]]["face_vis"]) >= 2
@@ -499,6 +503,31 @@ def test_the_default_render_is_one_lettered_grid_listing_the_faces_no_tile_sees(
     # The fake engine has no tessellation: every overlay is missing, and the caption says so.
     assert "OVERLAY FAILED" in caption and "tessellation unavailable" in caption
 
+
+@pytest.mark.parametrize("distance", [0, None])
+def test_zero_or_null_camera_distance_autofits(distance):
+    direction, options = ct_render._split_view({"azimuth": 270, "elevation": 5,
+                                                 "distance": distance})
+    assert direction == {"azimuth": 270, "elevation": 5}
+    assert options["distance"] is None
+    with pytest.raises(ValueError):
+        ct_render._split_view({"distance": -1})
+
+
+def test_assembly_component_target_uses_world_bounds_and_faces(monkeypatch):
+    box = {"min": [20, 0, 0], "max": [30, 5, 6]}
+    face = _face("Fcomponent", "top", (25, 2, 6), (0, 0, 1), 50)
+    def call(method, params):
+        if method == "asm_world_bodies":
+            return {"bodies": [{"component": "k9", "body_id": 2,
+                                "source_ordinals": [3], "bbox": box}]}
+        assert method == "doc_query" and params["query"]["body_id"] == 3
+        return {"matches": [face]}
+    monkeypatch.setattr(ct_render.cb, "call", call)
+    resolved, bounds, point = ct_render._render_target("doc-assembly", "k9", _BOX_BB)
+    assert resolved["kind"] == "component" and resolved["matches"] == [face]
+    assert bounds["min"] == (20, 0, 0) and bounds["max"] == (30, 5, 6)
+    assert point is None
 
 def test_an_explicit_view_is_still_one_single_shot(monkeypatch):
     calls = _install(monkeypatch, _box(), _BOX_BB)

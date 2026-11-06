@@ -8,6 +8,7 @@
 // GL-free and ImGui-free on purpose (unit-tested: host/tests/test_magic_keywords.cpp).
 #pragma once
 #include <cstddef>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -42,5 +43,12 @@ std::vector<KeywordRange> magicKeywordRanges(std::string_view utf8);
 // Gradient hue (degrees, [0, 360)) of keyword `keyword` at normalized position t in [0, 1]
 // across the word. t is clamped; an out-of-range keyword index returns 0.
 float hueAt(int keyword, float t);
+
+// Can `utf8` hold a non-prose region at all? (No backtick, '<' or tilde fence = all prose.)
+bool mayHoldNonProse(std::string_view utf8);
+// Length-preserving copy of `utf8` with every byte inside a fenced code block, inline code
+// span or HTML/XML section turned into a space (newlines kept). Shared with the composer's
+// spell check (spell_check.h), which must never flag code either.
+std::string maskNonProse(std::string_view utf8);
 
 }  // namespace ui::copilot

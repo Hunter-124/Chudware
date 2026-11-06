@@ -88,14 +88,16 @@ ENTRIES: dict[str, dict[str, Any]] = {
     "part_place": {
         "prompt_note": (
             "doc is the document dict (or its json.dumps), NEVER a doc id; omit "
-            "doc for mechanical parts — they create their own document."
+            "doc for mechanical parts — they create their own document. part_id "
+            "comes from part_search/part_get."
         ),
     },
     "part_search": {
         "prompt_note": (
             "First stop for catalog/standard hardware by designation or "
-            "category (e.g. MG90S, 608 bearing, M3 screw). Rows are compact "
-            "— part_get for the full record."
+            "category (e.g. MG90S, 608 bearing, M3 screw). Preview sheet labels "
+            "match JSON row indices; use previews to select candidates, then "
+            "confirm identity and dimensions with part_get before acquiring."
         ),
     },
     "part_source": {

@@ -4,21 +4,21 @@ Hydraulics vendor (cylinders/pumps/valves/reservoirs) with an open e-commerce
 storefront: this is a COMMERCE source (price/stock plus specs), not a CAD-model
 source. ``acquire`` uses the default machining/spec-table param extraction plus
 datasheet discovery, and copies only a small price/stock-spec record with
-provenance. Challenge pages degrade to ``login_required`` — never solved.
+provenance. Challenges are reported as blocked or captcha, never solved.
 
 Live-verified 2026-07-10: the storefront runs on BigCommerce (Stencil), so search
 is ``/search.php?search_query=`` (the old ``/search?q=`` guess 404'd) and results
 carry no JSON-LD — they are server-rendered ``<article class="card">`` tiles whose
-``<h4 class="card-title"><a>`` holds the product URL + title, ``data-product-id``
-the SKU and a ``price--withoutTax`` span the price. So this adapter overrides
-:meth:`parse_search` to read that markup directly.
+``<h4 class="card-title"><a>`` holds the product URL + title, the displayed
+``card-text--sku`` is the SKU, and a ``price--withoutTax`` span gives the price.
 """
 from __future__ import annotations
 
 import re
+from html import unescape
 
-from . import register
-from ._retail import RetailAdapter, _strip_tags
+from . import abs_url, register
+from ._retail import RetailAdapter, _strip_tags, card_blocks, card_image
 
 SITE = "baileyhydraulics"
 BASE_URL = "https://www.baileyhydraulics.com"
@@ -34,15 +34,20 @@ LICENSE_NOTE = (
 _LOGIN_WALL_MARKERS = ('id="login-email"',)
 _CHALLENGE_MARKERS = ("Access Denied", "Pardon Our Interruption")
 
-# BigCommerce Stencil search card (identical storefront platform to Surplus Center):
-# the `<h4 class="card-title">` anchor carries the absolute product URL + title, the
-# quick-view button the numeric `data-product-id` (SKU), and a `price--withoutTax`
-# span the price.
+# Product IDs on quick-view buttons are distinct from the displayed SKU.
 _CARD_RE = re.compile(
     r'<article\b[^>]*\bclass="card\b.*?'
     r'<h4 class="card-title">\s*<a href="(?P<href>[^"]+)"[^>]*>(?P<title>.*?)</a>',
     re.IGNORECASE | re.DOTALL)
-_PID_RE = re.compile(r'data-product-id="(?P<pid>\d+)"', re.IGNORECASE)
+_PID_RE = re.compile(
+    r'<a\b(?=[^>]*\bclass=["\'][^"\']*\bquickview\b[^"\']*["\'])'
+    r'(?=[^>]*\bdata-product-id=["\'](?P<pid>\d+)["\'])[^>]*>', re.IGNORECASE)
+_SKU_RE = re.compile(
+    r'<p\b[^>]*class=["\'][^"\']*\bcard-text--sku\b[^"\']*["\'][^>]*>'
+    r'\s*SKU:\s*(?P<sku>[^<]+)', re.IGNORECASE)
+_BRAND_RE = re.compile(
+    r'<p\b[^>]*class=["\'][^"\']*\bcard-text--brand\b[^"\']*["\'][^>]*>'
+    r'(?P<brand>.*?)</p>', re.IGNORECASE | re.DOTALL)
 _PRICE_RE = re.compile(
     r'<span[^>]*\bclass="price price--withoutTax[^"]*"[^>]*>\s*(?P<price>\$[\d,]+\.\d\d)',
     re.IGNORECASE)
@@ -50,6 +55,11 @@ _PRICE_RE = re.compile(
 
 class BaileyHydraulicsAdapter(RetailAdapter):
     key = SITE
+    hosts = ("www.baileyhydraulics.com", "baileyhydraulics.com")
+    result_kinds = ("product",)
+    cad_acquisition = False
+    login_required = False
+    api = False
     base_url = BASE_URL
     search_url_tmpl = SEARCH_URL_TMPL
     license_note = LICENSE_NOTE
@@ -57,26 +67,43 @@ class BaileyHydraulicsAdapter(RetailAdapter):
     challenge_markers = _CHALLENGE_MARKERS
 
     def parse_search(self, content: str) -> list[dict]:
-        """Parse BigCommerce ``card`` tiles (no JSON-LD on the SRP). Each card is
-        sliced up to the next ``<article`` so a neighbour's id/price can't leak."""
+        """Read each complete BigCommerce tile, not neighboring tiles."""
         hits: list[dict] = []
         seen: set[str] = set()
-        cards = list(_CARD_RE.finditer(content))
-        for i, m in enumerate(cards):
-            href = m.group("href")
-            url = href.split("?", 1)[0] if href.startswith("http") else BASE_URL + href
-            if url in seen:
+        for block in card_blocks(content, "article", "card"):
+            match = _CARD_RE.search(block)
+            if not match:
+                continue
+            url = abs_url(BASE_URL, unescape(match.group("href")).split("?", 1)[0])
+            title = unescape(_strip_tags(match.group("title")))
+            if not url or not title or url in seen:
                 continue
             seen.add(url)
-            end = cards[i + 1].start() if i + 1 < len(cards) else len(content)
-            block = content[m.start():end]
-            hit = {"ok": True, "title": _strip_tags(m.group("title")), "url": url, "site": SITE}
+            media = card_blocks(block, "div", "card-img-container")
+            hit = {
+                "ok": True, "title": title, "url": url, "site": SITE,
+                "thumbnail": card_image(media[0], BASE_URL) if media else None,
+            }
+            sku = _SKU_RE.search(block)
+            if sku:
+                hit["sku"] = unescape(sku.group("sku").strip())
             pid = _PID_RE.search(block)
             if pid:
-                hit["sku"] = pid.group("pid")
+                hit["product_id"] = pid.group("pid")
+            brand = _BRAND_RE.search(block)
+            if brand:
+                hit["brand"] = unescape(_strip_tags(brand.group("brand")))
             price = _PRICE_RE.search(block)
             if price:
-                hit["price"] = price.group("price")
+                hit.update(price=price.group("price"), currency="USD")
+            stock_blocks = card_blocks(block, "div", "card-stock")
+            if stock_blocks:
+                stock_text = unescape(_strip_tags(stock_blocks[0]))
+                stock = re.search(r"([\d,]+)\s+in stock\b", stock_text, re.I)
+                if stock:
+                    hit["stock"] = stock.group(1)
+                elif re.search(r"\bout of stock\b", stock_text, re.I):
+                    hit["stock"] = 0
             hits.append(hit)
         return hits
 

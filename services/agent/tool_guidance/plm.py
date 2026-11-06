@@ -34,9 +34,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "plm_release": {
         "prompt_note": (
-            "On reason='preflight_failed' read problems, fix them, or re-call "
-            "with confirm=true. Released items freeze — to edit again use "
-            "plm_item_set(start_new_rev=True)."
+            "On reason='preflight_failed' read problems (check plm_status and "
+            "plm_where_used), fix them, or re-call with confirm=true. Released items "
+            "freeze — to edit again use plm_item_set(start_new_rev=True)."
         ),
     },
     "plm_item_set": {
@@ -48,10 +48,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "plm_item_add": {
         "prompt_note": (
-            "Only for non-design files (specs, datasheets, sim folders): use "
-            "plm_item_add(path=<project root>, file_path=<file relative to it>) "
-            "or folder_path for a folder. .step+/.ecad+ design documents "
-            "auto-track on save; never add them by hand — call plm_checkpoint."
+            "Use plm_item_add(path=<project root>, file_path=<file relative to it>) "
+            "or folder_path for other files. Native .step+ and KiCad design files "
+            "auto-track on save; inspect plm_status rather than registering them "
+            "by hand. Call plm_checkpoint when finished."
         ),
     },
     "plm_link_repo": {

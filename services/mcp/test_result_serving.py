@@ -44,7 +44,7 @@ def test_ok_and_err_envelopes():
     assert ok["ok"] is True and ok["summary"] == "hi"
     assert ok["warnings"] == ["w"] and ok["hint"] == "h" and ok["next_actions"] == ["n"]
     err = rs.err_envelope("boom", hint="fix it", next_actions=["retry"], code=3)
-    assert err["ok"] is False and err["error"] == "boom" and err["code"] == 3
+    assert err["ok"] is False and err["error"] == "boom" and err["code"] == "3"
     assert err["hint"] == "fix it" and err["next_actions"] == ["retry"]
 
 

@@ -2,19 +2,17 @@
 
 80/20 Inc. (8020.net) is the T-slot aluminum extrusion maker ("The Industrial
 Erector Set") — profiles, brackets, and fasteners common in student-robotics
-and rover frames. It runs on Magento with an aggressive bot-protection layer:
-a plain headless visit to the catalog-search endpoint returns a challenge
-interstitial (live-probe 2026-07-08), so this adapter degrades honestly to that
-challenge state — it never tries to solve or bypass it. When the site serves a
-real product page (e.g. under the user's own signed-in session), the standard
-:class:`~._retail.RetailAdapter` JSON-LD/spec-table flow applies.
-
-For most T-slot needs MISUMI's extrusion catalog (see ``misumi.py``) is reachable
-without a challenge and is the recommended first stop; this adapter keeps 80/20
-itself on the radar and surfaces its bot-wall state truthfully rather than
-silently returning zero results.
+and rover frames. Anonymous search results use Magento product cards; a sign-in
+dialog may also be embedded in the search page without restricting the results.
+Challenges and genuine sign-in walls are reported, never bypassed.
 """
 from __future__ import annotations
+
+
+from services.browser import session
+from ._rendered_cards import first, parse
+from . import fail, source_failure, login_required, is_login_wall
+from ._retail import _challenge, _is_captcha, _standalone_login
 
 from . import register
 from ._retail import RetailAdapter
@@ -46,6 +44,42 @@ class EightyTwentyAdapter(RetailAdapter):
     license_note = LICENSE_NOTE
     login_wall_markers = _LOGIN_WALL_MARKERS
     challenge_markers = _CHALLENGE_MARKERS
+    currency = "USD"
+
+    def search(self, query: str) -> list[dict]:
+        url = self.search_url(query)
+        result = session.browser_fetch(url, self.key)
+        if not result.get("ok"):
+            return [source_failure(self.key, "search", result, url=url)]
+        content = result.get("content", "")
+        page_url = result.get("final_url") or url
+        if is_login_wall(content, self.challenge_markers) or _is_captcha(page_url, content):
+            return [_challenge(self.key, "search", page_url, content)]
+        if self._redirected_to_login(url, page_url) or is_login_wall(content, self.login_wall_markers):
+            return [source_failure(self.key, "search", login_required(self.key, page_url), url=page_url)]
+        hits = self.parse_search_page(content, page_url)
+        if hits:
+            return [self._normalize_hit(hit, page_url) for hit in hits]
+        if _standalone_login(content):
+            return [source_failure(self.key, "search", login_required(self.key, page_url), url=page_url)]
+        if self.is_no_results(content):
+            return []
+        return [fail(self.key, "search", "parse_failed", "No recognizable results on the page.", url=page_url)]
+
+    def parse_search(self, content: str) -> list[dict]:
+        hits = super().parse_search(content)
+        if hits:
+            return hits
+        for card in parse(content).find_all(lambda n: n.tag == "li" and n.has_class("product-item")):
+            link = first(card, lambda n: n.tag == "a" and n.has_class("product-item-link"))
+            image = first(card, lambda n: n.tag == "img" and n.has_class("product-image-photo"))
+            price_node = first(card, lambda n: n.attrs.get("data-price-amount") is not None)
+            if not link or not link.attrs.get("href") or not link.text():
+                continue
+            price = price_node.attrs.get("data-price-amount") if price_node else None
+            hits.append({"title": link.text(), "url": link.attrs["href"],
+                         "thumbnail": image.attrs.get("src") if image else None, "price": price})
+        return hits
 
 
 ADAPTER = register(EightyTwentyAdapter())

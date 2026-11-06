@@ -167,7 +167,7 @@ def test_daemon_refusal_reason_and_hint_pass_through_verbatim(monkeypatch) -> No
     mcp = _FakeMCP()
     mfg_tools.register_mfg_tools(reg.view(mcp, "manufacture"))
     result = mcp.tools["mfg_gate_report"](gate_report_ref="gate:7")
-    assert result is refusal
+    assert result == {**refusal, "error": refusal["reason"]}
     assert fake_client.calls == [("mfg_gate_report", {"gate_report_ref": "gate:7"})]
 
 

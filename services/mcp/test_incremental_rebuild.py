@@ -152,14 +152,21 @@ def test_failed_batch_rollback_then_clean_edit(part):
     """A rejected batch (feature errors -> engine restores pre-batch doc) must not
     poison the cache: the next good edit still compiles correct geometry."""
     did, fids = part
+    before = cb.call("doc_tree", {"doc_id": did})
     v0 = _mass(did)["volume_mm3"]
     r = _apply(did, [{"op": "add_feature",
-                      "feature": {"type": "fillet", "params": {"radius": 1e6},
-                                  "refs": {"edges": [{"of": "edge", "side": "+z"}]}}}])
-    assert not all(s["ok"] for s in _fs(r))  # rejected in-band
-    assert _mass(did)["volume_mm3"] == pytest.approx(v0, rel=1e-12)  # rolled back
+                      "feature": {"type": "fillet", "params": {"radius": 1},
+                                  "refs": {"edges": [
+                                      {"of": "edge", "side": "+z"},
+                                      {"kind": "edge", "centroid": [1000, 1000, 1000]},
+                                  ]}}}])
+    assert "rejected_tree" in r
+    assert any(not s["ok"] and s.get("error") for s in _fs(r))
+    assert cb.call("doc_tree", {"doc_id": did}) == before
+    assert _mass(did)["volume_mm3"] == pytest.approx(v0, rel=1e-12)
     r2 = _apply(did, [{"op": "edit_feature", "id": fids[-1], "params": {"distance": 2.5}}])
     assert all(s["ok"] for s in _fs(r2))
+    assert _mass(did)["volume_mm3"] < v0
 
 
 def test_suppress_unsuppress_roundtrip(part):
@@ -212,7 +219,9 @@ def test_dry_run_reuses_large_cached_source_without_replay():
 
 
 @pytest.mark.parametrize("outcome", ["success", "compile_failure", "structural_failure"])
-@pytest.mark.parametrize("budget_ms", [0, 10_000])
+# This checks isolation and cache correctness, not a ten-second performance SLA.
+# The separate timeout test below deliberately exercises the bounded deadline.
+@pytest.mark.parametrize("budget_ms", [0, 120_000])
 def test_dry_run_preserves_geometry_cache_and_undo(part, outcome, budget_ms):
     did, fids = part
     original = cb.call("doc_tree", {"doc_id": did})["tree"]
@@ -222,9 +231,13 @@ def test_dry_run_preserves_geometry_cache_and_undo(part, outcome, budget_ms):
     mass_before = _mass(did)
     candidate = [{"op": "edit_feature", "id": fids[0], "params": {"length": 45}}]
     if outcome == "compile_failure":
+        # One real edge and one dangling pick must reject the whole candidate.
         candidate.append({"op": "add_feature", "feature": {
-            "type": "fillet", "params": {"radius": 1e6},
-            "refs": {"edges": [{"of": "edge", "side": "+z"}]},
+            "type": "fillet", "params": {"radius": 1},
+            "refs": {"edges": [
+                {"of": "edge", "side": "+z"},
+                {"kind": "edge", "centroid": [1000, 1000, 1000]},
+            ]},
         }})
     elif outcome == "structural_failure":
         candidate.append({"op": "edit_feature", "id": "missing", "params": {"length": 1}})
@@ -237,7 +250,8 @@ def test_dry_run_preserves_geometry_cache_and_undo(part, outcome, budget_ms):
         return
     assert dry["ok"] is (outcome == "success")
     if outcome == "compile_failure":
-        assert any(not s["ok"] for s in _fs(dry))
+        assert "rebuild" in dry, dry
+        assert any(not s["ok"] for s in _fs(dry)), dry
     assert cb.call("doc_tree", {"doc_id": did}) == before
     # A scratch rebuild must not replace the source's compile index, even after
     # changing its first feature or rejecting a candidate after compilation.
@@ -293,22 +307,75 @@ def test_preflight_timeout_stops_rebuild_and_preserves_source(part, monkeypatch)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="bounded native preflight requires POSIX")
-@pytest.mark.parametrize("radius, expected", [(3, "pass"), (1e6, "fail")])
-def test_bounded_preflight_retains_real_geometry_verdict(part, monkeypatch, radius, expected):
+@pytest.mark.parametrize("case, expected", [
+    ("normal", "pass"), ("corrected", "warn"), ("dangling", "fail"),
+])
+def test_bounded_preflight_retains_real_geometry_verdict(part, monkeypatch, case, expected):
     from services.agent.advisor.preflight import run_preflight
 
     did, fids = part
     before = cb.call("doc_tree", {"doc_id": did})
     mass_before = _mass(did)
     monkeypatch.setenv("CHUDWARE_BLEND_ISOLATION", "0")
-    result = run_preflight(did, "add_features", [{
-        "op": "edit_feature", "id": fids[1], "params": {"radius": radius},
-    }])
+    if case == "dangling":
+        # A valid edge plus a dangling pick is not a request for a partial blend.
+        ops = [{"op": "add_feature", "feature": {
+            "type": "fillet", "params": {"radius": 1},
+            "refs": {"edges": [
+                {"of": "edge", "side": "+z"},
+                {"kind": "edge", "centroid": [1000, 1000, 1000]},
+            ]},
+        }}]
+    else:
+        ops = [{"op": "edit_feature", "id": fids[1],
+                "params": {"radius": 3 if case == "normal" else 1e6}}]
+
+    result = run_preflight(did, "add_features", ops)
     assert result["verdict"] == expected, result
     statuses = result["predicted"]["feature_status"]
-    assert all(status["ok"] for status in statuses) is (expected == "pass")
+    rebuild = next(check for check in result["checks"] if check["check"] == "rebuild_predict")
+    assert rebuild["result"] == expected
+    assert all(status["ok"] for status in statuses) is (case != "dangling")
+    if case == "dangling":
+        failed = next(status for status in statuses if not status["ok"])
+        assert failed["error"] and failed["id"] in rebuild["refs"]["features"]
+    elif case == "corrected":
+        adjusted = next(status for status in statuses if status["id"] == fids[1])
+        assert adjusted["ok"] and adjusted["warning"]
+        assert fids[1] in rebuild["refs"]["features"]
+        assert any(item["check"] == "rebuild_predict" and item["severity"] == "hint"
+                   for item in result["advisory_items"])
+
     assert cb.call("doc_tree", {"doc_id": did}) == before
     assert _mass(did) == mass_before
+
+    if case == "corrected":
+        # Preflight summarizes warnings; the underlying native dry run carries the
+        # structured correction and all-selected-edge coverage.
+        dry = cb.call("doc_dry_run_ops", {"doc_id": did, "ops": ops})
+        assert dry["ok"], dry
+        dry_status = next(s for s in _fs(dry) if s["id"] == fids[1])
+        report = dry_status["data"]["fillet"]
+        assert report["requested"]["radius"] == 1e6
+        assert report["adjustment"] == "upper"
+        assert 0 < report["effective"]["radius"] < report["requested"]["radius"]
+        assert report["selected_edges"] == report["covered_edges"] == 4
+        assert cb.call("doc_tree", {"doc_id": did}) == before
+        assert _mass(did) == mass_before
+
+        # Applying the very same request produces real geometry and persists its
+        # effective literal radius rather than the infeasible original.
+        applied = _apply(did, ops)
+        assert all(s["ok"] for s in _fs(applied)), applied
+        actual = next(s for s in _fs(applied) if s["id"] == fids[1])["data"]["fillet"]
+        assert actual["requested"]["radius"] == report["requested"]["radius"]
+        assert actual["effective"]["radius"] == pytest.approx(report["effective"]["radius"])
+        assert actual["selected_edges"] == actual["covered_edges"] == 4
+        saved = next(f for f in applied["tree"]["features"] if f["id"] == fids[1])
+        radius = saved["params"]["radius"]
+        assert (radius["value"] if isinstance(radius, dict) else radius) == pytest.approx(
+            actual["effective"]["radius"])
+        assert _mass(did)["volume_mm3"] < mass_before["volume_mm3"]
 
 
 def test_profiler_reports_cache_section():
@@ -326,14 +393,15 @@ def _multibody(n=6):
     did = cb.call("doc_new", {"name": "inc_multibody"})["doc_id"]
     ops = [{"op": "add_feature",
             "feature": {"type": "box", "params": {"length": 20, "width": 20,
-                                                  "height": 20, "cx": 0}}}]
+                                                  "height": 20, "at": [0, 0, 0]}}}]
     for i in range(1, n):
         ops.append({"op": "add_feature",
                     "feature": {"type": "box", "merge": False,
                                 "params": {"length": 20, "width": 20, "height": 20,
-                                           "cx": i * 40}}})
+                                           "at": [i * 40, 0, 0]}}})
     r = _apply(did, ops)
     assert all(s["ok"] for s in _fs(r)), _fs(r)
+    assert _mass(did)["volume_mm3"] == pytest.approx(n * 20**3)
     return did, [s["id"] for s in _fs(r)]
 
 
@@ -364,6 +432,7 @@ def test_body_cache_geometry_identical():
     _apply(did, [{"op": "edit_feature", "id": fids[3], "params": {"height": 30}}])
     tree = cb.call("doc_tree", {"doc_id": did})["tree"]
     v_inc = _mass(did)["volume_mm3"]
+    assert v_inc == pytest.approx(5 * 20**3 + 20 * 20 * 30)
     ref = cb.call("doc_new", {"name": "inc_multibody_ref"})["doc_id"]
     try:
         rr = _apply(ref, [{"op": "add_feature", "feature": f} for f in tree["features"]])

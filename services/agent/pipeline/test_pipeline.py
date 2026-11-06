@@ -223,7 +223,6 @@ def test_bounce_tracker_bounce_once_then_escalate():
 def test_phase_order_is_the_full_sequence():
     assert PHASE_ORDER[0] is Phase.INTAKE
     assert PHASE_ORDER[-1] is Phase.DELIVER
-    assert Phase.ORGANIZE in PHASE_ORDER
 
 
 def test_intake_gate_blocks_on_invalid_manifest():
@@ -238,7 +237,7 @@ def test_intake_gate_blocks_on_invalid_manifest():
 
 
 def test_phase_entry_requires_successful_exit_and_exact_adjacency():
-    machine = PhaseMachine(flags=PipelineFlags(org_layer=False))
+    machine = PhaseMachine()
     assert machine.enter(Phase.INTAKE).ok
     with pytest.raises(PhaseError):
         machine.enter(Phase.DELIVER)
@@ -357,34 +356,6 @@ def test_clarify_skipped_without_blocking_ambiguity():
     assert nxt2 is Phase.CLARIFY
 
 
-def test_organize_skipped_unless_flag_on():
-    # org_layer=True is the default. Explicit False skips ORGANIZE.
-    off = PhaseMachine(flags=PipelineFlags(org_layer=False))
-    assert off.next_phase(Phase.SPECIFY, {}) is Phase.PLAN  # ORGANIZE skipped
-    on = PhaseMachine(flags=PipelineFlags(org_layer=True))
-    assert on.next_phase(Phase.SPECIFY, {}) is Phase.ORGANIZE
-
-
-def test_organize_is_default_on():
-    """PipelineFlags() defaults to org_layer=True."""
-    flags = PipelineFlags()
-    assert flags.org_layer is True
-    m = PhaseMachine()
-    assert m.next_phase(Phase.SPECIFY, {}) is Phase.ORGANIZE
-
-
-def test_build_council_gate_flagged():
-    """PLAN gate requires council synthesis only when the council flag is on."""
-    off = PhaseMachine(flags=PipelineFlags(build_council=False))
-    assert off.run_gate(Phase.PLAN, {"plan_ratified": True}).passed
-    on = PhaseMachine(flags=PipelineFlags(build_council=True))
-    gate = on.run_gate(Phase.PLAN, {"plan_ratified": True,
-                                    "council_synthesis_recorded": False})
-    assert not gate.passed
-    assert on.run_gate(Phase.PLAN, {"plan_ratified": True,
-                                    "council_synthesis_recorded": True}).passed
-
-
 def test_correct_loop_reentry_is_legal():
     machine = PhaseMachine()
     machine.enter(Phase.VERIFY)
@@ -410,25 +381,20 @@ def test_correct_loop_reentry_is_legal():
 # ===========================================================================
 
 def test_design_pipeline_default_off_specify_advances_as_before():
-    """Flag off (default): SPECIFY → ORGANIZE/PLAN exactly as before — the four
-    design-pipeline phases are skipped. The load-bearing flag-off invariant."""
+    """With the design-pipeline flag off, SPECIFY advances directly to PLAN."""
     flags = PipelineFlags()
     assert flags.design_pipeline is False
-    # org on (default) → SPECIFY → ORGANIZE, DP phases skipped
-    assert PhaseMachine().next_phase(Phase.SPECIFY, {}) is Phase.ORGANIZE
-    # org off too → SPECIFY → PLAN, DP phases still skipped
-    off = PhaseMachine(flags=PipelineFlags(org_layer=False))
-    assert off.next_phase(Phase.SPECIFY, {}) is Phase.PLAN
+    assert PhaseMachine().next_phase(Phase.SPECIFY, {}) is Phase.PLAN
 
 
 def test_design_pipeline_flag_on_visits_four_stages():
-    """Flag on: SPECIFY → DECOMPOSE → GEOMETRY → LINKAGE → BUILDPATH → (ORGANIZE/PLAN)."""
-    m = PhaseMachine(flags=PipelineFlags(design_pipeline=True, org_layer=False))
+    """Flag on: SPECIFY → DECOMPOSE → GEOMETRY → LINKAGE → BUILDPATH → PLAN."""
+    m = PhaseMachine(flags=PipelineFlags(design_pipeline=True))
     assert m.next_phase(Phase.SPECIFY, {}) is Phase.DECOMPOSE
     assert m.next_phase(Phase.DECOMPOSE, {}) is Phase.GEOMETRY
     assert m.next_phase(Phase.GEOMETRY, {}) is Phase.LINKAGE
     assert m.next_phase(Phase.LINKAGE, {}) is Phase.BUILDPATH
-    assert m.next_phase(Phase.BUILDPATH, {}) is Phase.PLAN  # org off → PLAN
+    assert m.next_phase(Phase.BUILDPATH, {}) is Phase.PLAN
 
 
 def test_design_pipeline_exits_checkpoint_typed_ledger_story(tmp_path):
@@ -442,7 +408,7 @@ def test_design_pipeline_exits_checkpoint_typed_ledger_story(tmp_path):
     bridge = PLMBridge("run_dp14", vault=vault)
     machine = PhaseMachine(
         ledger=ledger,
-        flags=PipelineFlags(design_pipeline=True, org_layer=False),
+        flags=PipelineFlags(design_pipeline=True),
         checkpoint_bridge=bridge,
     )
     item_artifacts = {"item_bracket": "bg_bracket"}
@@ -807,9 +773,7 @@ def test_end_to_end_all_phases_mock(tmp_path):
 
     run_id = f"t_w19_e2e_{uuid.uuid4().hex[:8]}"
     ledger = Ledger.load(run_id, path=tmp_path / "ledger.json")
-    # Use org_layer=False for this focused 8-phase dry run (avoids needing a real
-    # org chart fixture here; the org-layer e2e is covered in test_org.py).
-    machine = PhaseMachine(ledger=ledger, flags=PipelineFlags(org_layer=False))
+    machine = PhaseMachine(ledger=ledger)
 
     manifest = _valid_manifest()
 
@@ -828,7 +792,7 @@ def test_end_to_end_all_phases_mock(tmp_path):
     machine.exit(Phase.SPECIFY, machine.run_gate(Phase.SPECIFY, {
         "spec_audited": True, "uncovered_criteria": []}))
 
-    # ORGANIZE skipped (org_layer=False in this test) → PLAN.
+    # SPECIFY advances directly to PLAN.
     assert machine.next_phase(Phase.SPECIFY, {}) is Phase.PLAN
 
     # Phase 3 PLAN — build graph valid + ratified.

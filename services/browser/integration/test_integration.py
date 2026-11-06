@@ -90,3 +90,73 @@ def test_live_search_exercises_real_site(key):
     # produced the contract's list-of-dict envelope.
     assert isinstance(out, list)
     assert all(isinstance(x, dict) for x in out)
+
+
+@pytest.mark.live
+@pytest.mark.skipif(os.environ.get("CHUDWARE_CEF_INTEGRATION_TESTS") != "1",
+                    reason="requires a CEF-enabled host (CHUDWARE_CEF_INTEGRATION_TESTS=1)")
+def test_cef_partial_load_does_not_leak_to_next_navigation(monkeypatch, tmp_path):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from tempfile import TemporaryDirectory
+    from threading import Event, Thread
+    from services.browser import cef_client
+
+    release = Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/slow":
+                release.wait(20)
+                try:
+                    self.send_response(200)
+                    self.end_headers()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
+            if self.path == "/redirect":
+                body = (b"<html><title>OLD</title><script>"
+                        b"setTimeout(()=>location.href='/second',100)</script></html>")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            body = (b"<html><title>LM358</title><script>history.replaceState({},'',"
+                    b"'/spa');</script><img src='/slow'></html>"
+                    if self.path == "/first" else b"<html><title>ATMEGA328P</title></html>")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    Thread(target=server.serve_forever, daemon=True).start()
+    with TemporaryDirectory(prefix="chud-cef-test-", dir="/tmp") as socket_dir:
+        monkeypatch.setenv("CHUDWARE_CEF_SOCKET", socket_dir + "/daemon.sock")
+        monkeypatch.setenv("CHUDWARE_CEF_CACHE_ROOT", str(tmp_path / "cef"))
+        client = cef_client.CefDaemon()
+        base = f"http://127.0.0.1:{server.server_port}"
+        try:
+            first = client.fetch(base + "/first", settle_ms=0)
+            assert first["ok"] and first["status"] == 200 and first["partial_load"]
+            assert "LM358" in first["html"]
+            assert "data-chudware-partial-ready" not in first["html"]
+            second = client.fetch(base + "/second", settle_ms=0)
+            assert second["ok"] and not second["partial_load"]
+            assert "ATMEGA328P" in second["html"] and "LM358" not in second["html"]
+            assert second["final_url"] == base + "/second"
+            redirected = client.fetch(base + "/redirect", settle_ms=1200)
+            assert redirected["ok"] and "ATMEGA328P" in redirected["html"]
+            assert redirected["final_url"] == base + "/second"
+        finally:
+            release.set()
+            server.shutdown()
+            try:
+                client._call("shutdown", {}, timeout_s=5)
+            except cef_client.CefDaemonError:
+                pass

@@ -9,9 +9,12 @@
 // (ribbonRowActive). To drop a row from view with no replacement, list it in kRetiredRows below.
 // Group order within a tab is declared in widgets/ribbon.cpp kTabGroupOrder, never by row order.
 #include "ribbon_def.h"
+#include "web_capabilities.h"
 #include <cstring>
 #include <initializer_list>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace ui {
@@ -199,6 +202,7 @@ static const RibbonCmd kCmds[] = {
     // --- Group: Check ---
     { "eval_check",        "Check",          "check",           "Evaluate", "Geometry Check",  true,  nullptr,          false, CommandCapability::Inspect },
     { "eval_geometry",     "Geometry Anlys.","geometry_analysis","Evaluate","Geometry Check",  false, nullptr,          false, CommandCapability::Inspect },
+    { "eval_model_history","Model History", "results",          "Evaluate", "Geometry Check",  true,  nullptr,          false, CommandCapability::Inspect },
     { "eval_interference", "Interference",   "interference_eval","Evaluate","Geometry Check",  true,  nullptr,          false, CommandCapability::Inspect },
 
     // =========================================================================
@@ -327,59 +331,33 @@ static const RibbonCmd kCmds[] = {
     { "weld_gusset",         "Gusset",          "weld_gusset",      "Weldments",   "Dress",       true,  nullptr,          false },
     { "weld_end_cap",        "End Cap",         "weld_end_cap",     "Weldments",   "Dress",       true,  nullptr,          false },
 
-    // =========================================================================
-    // Tab: PCB Design  (ECAD board layout: footprints, routing, DRC, outputs)
-    // NOTE: the old single "PCB" tab was split into two dedicated tabs — "PCB Design"
-    // (this one, board/layout tools) and "Schematic" (symbols/nets/ERC/analog sim, below).
-    // Both share the Electronics workspace. The shared entry commands (AI Design / Open /
-    // Save) live here on PCB Design to avoid duplicating a cmd_id across two tabs.
-    // =========================================================================
+    // Electronics is a KiCad project hub; editing is performed in KiCad.
+    { "ecad_ai_design",          "AI Design",        "ai_panel",       "PCB Design", "Project", true,  nullptr, false },
+    { "ecad_new_project",        "New Project",      "ecad_pcb",       "PCB Design", "Project", true,  nullptr, false },
+    { "ecad_open",               "Open",             "open",           "PCB Design", "Project", false, nullptr, false },
+    { "ecad_save",               "Save",             "save",           "PCB Design", "Project", false, nullptr, false },
+    { "ecad_kicad_open_project", "KiCad",            "open",           "PCB Design", "KiCad",   true,  nullptr, false },
+    { "ecad_kicad_open_pcb",     "PCB Editor",       "ecad_pcb",       "PCB Design", "KiCad",   true,  nullptr, false },
+    { "pcb_update_from_sch",     "Update Board",     "ecad_update",    "PCB Design", "Board",   true,  nullptr, false },
+    { "ecad_autoroute",          "Autoroute",        "ecad_autoroute", "PCB Design", "Board",   true,  nullptr, false },
+    { "ecad_fill_zones",         "Fill Zones",       "ecad_fill",      "PCB Design", "Board",   false, nullptr, false },
+    { "ecad_to_3d",              "Board to 3D",      "ecad_board3d",   "PCB Design", "Outputs", true,  nullptr, false },
+    { "ecad_export_fab",         "Fabrication",      "ecad_gerber",    "PCB Design", "Outputs", true,  nullptr, false, CommandCapability::Export },
+    { "ecad_export_step",        "STEP",             "save",           "PCB Design", "Outputs", false, nullptr, false, CommandCapability::Export },
+    { "ecad_export_bom",         "BOM",              "bom",            "PCB Design", "Outputs", false, nullptr, false, CommandCapability::Export },
+    { "ecad_run_drc",            "Run DRC",          "ecad_drc",       "PCB Design", "Checks",  true,  nullptr, false },
 
-    // --- Group: New ---
-    { "ecad_ai_design",     "AI Design",      "ai_panel",        "PCB Design", "New",        true,  nullptr, false },
-    { "ecad_new_pcb",       "PCB Layout",     "ecad_pcb",        "PCB Design", "New",        true,  nullptr, false },
-    { "ecad_open",          "Open",           "open",            "PCB Design", "New",        false, nullptr, false },
-    { "ecad_save",          "Save",           "save",            "PCB Design", "New",        false, nullptr, false },
-
-    // --- Group: Board ---
-    { "pcb_update_from_sch","Update Board",   "ecad_update",     "PCB Design", "Board",      true,  nullptr, false },
-    { "pcb_add_footprint",  "Footprint",      "ecad_footprint",  "PCB Design", "Board",      false, nullptr, false },
-    { "pcb_add_track",      "Route",          "ecad_route",      "PCB Design", "Board",      false, nullptr, false },
-    { "pcb_add_via",        "Via",            "ecad_via",        "PCB Design", "Board",      false, nullptr, false },
-    { "pcb_add_zone",       "Copper Zone",    "ecad_zone",       "PCB Design", "Board",      false, nullptr, false },
-    { "ecad_autoroute",     "Autoroute",      "ecad_autoroute",  "PCB Design", "Board",      true,  nullptr, false },
-    { "ecad_fill_zones",    "Fill Zones",     "ecad_fill",       "PCB Design", "Board",      false, nullptr, false },
-
-    // --- Group: Outputs ---
-    { "ecad_to_3d",         "Board to 3D",    "ecad_board3d",    "PCB Design", "Outputs",    true,  nullptr, false },
-    { "ecad_export_gerber", "Gerbers",        "ecad_gerber",     "PCB Design", "Outputs",    false, nullptr, false, CommandCapability::Export },
-    { "ecad_export_drill",  "Drill",          "ecad_drill",      "PCB Design", "Outputs",    false, nullptr, false, CommandCapability::Export },
-    { "ecad_export_bom",    "BOM",            "bom",             "PCB Design", "Outputs",    false, nullptr, false, CommandCapability::Export },
-
-    // --- Group: Checks --- (Run DRC promoted to a big primary button to the right of Outputs,
-    // sized like Board to 3D / PCB Layout; the old small Board-group entry + the manager toolbar
-    // icon were removed so there is one obvious DRC affordance.)
-    { "ecad_run_drc",       "Run DRC",        "ecad_drc",        "PCB Design", "Checks",     true,  nullptr, false },
-
-    // =========================================================================
-    // Tab: Schematic  (split from the old "PCB" tab — schematic capture + analog sim)
-    // Symbols, nets, power, ERC, and the native analog simulator. Backend hooks to
-    // port results into the Simulation tab land later; this just organizes the tools.
-    // =========================================================================
-
-    // --- Group: New ---
-    { "ecad_new_sch",       "New Schematic",  "sch_new",         "Schematic", "New",        true,  nullptr, false },
-
-    // --- Group: Schematic ---
-    { "sch_add_symbol",     "Place Symbol",   "sch_symbol",      "Schematic", "Schematic",  true,  nullptr, false },
-    { "sch_add_wire",       "Wire",           "sch_wire",        "Schematic", "Schematic",  false, nullptr, false },
-    { "sch_add_label",      "Net Label",      "sch_label",       "Schematic", "Schematic",  false, nullptr, false },
-    { "sch_add_power",      "Power Port",     "sch_power",       "Schematic", "Schematic",  false, nullptr, false },
-    { "sch_annotate",       "Annotate",       "ok_check",        "Schematic", "Schematic",  false, nullptr, false },
-    { "ecad_run_erc",       "Run ERC",        "sch_erc",         "Schematic", "Schematic",  false, nullptr, false },
-
-    // --- Group: Analyze (native analog simulator) ---
-    { "ecad_simulate",      "Simulate",       "sch_simulate",    "Schematic", "Analyze",    true,  nullptr, false },
+    { "ecad_kicad_open_sch",     "Schematic Editor", "sch_new",       "Schematic", "KiCad",   true,  nullptr, false },
+    { "ecad_run_erc",            "Run ERC",          "sch_erc",       "Schematic", "Checks",  true,  nullptr, false },
+    { "ecad_simulate",           "Simulate",         "sch_simulate",  "Schematic", "Analyze", true,  nullptr, false },
+    { "sch_export_netlist",      "Netlist",          "file_doc",      "Schematic", "Outputs", false, nullptr, false, CommandCapability::Export },
+    { "sch_export_pdf",          "PDF",              "file_doc",      "Schematic", "Outputs", false, nullptr, false, CommandCapability::Export },
+    { "ecad_export_bom",         "BOM",              "bom",           "Schematic", "Outputs", false, nullptr, false, CommandCapability::Export },
+    { "ecad_save",               "Save",             "save",          "Schematic", "Project", false, nullptr, false },
+    { "ecad_kicad_open_project", "KiCad",            "open",          "Schematic", "KiCad",   false, nullptr, false },
+    { "ecad_open",               "Open",             "open",          "Schematic", "Project", false, nullptr, false },
+    { "ecad_new_project",        "New Project",      "ecad_pcb",      "Schematic", "Project", false, nullptr, false },
+    { "ecad_ai_design",          "AI Design",        "ai_panel",      "Schematic", "Project", false, nullptr, false },
 
     // =========================================================================
     // Tab: Surfaces — open-surface (kind="surface") body features. cmd_id == the
@@ -659,11 +637,8 @@ static const RibbonCmd kCmds[] = {
     { "ref_point",         "Ref. Point",  "ref_point",       "Motion",  "Reference", false, nullptr, false },
     { "ref_csys",          "Coord. Sys.", "ref_csys",        "Motion",  "Reference", false, nullptr, false },
 
-    // --- Tab: EM (electromagnetics — backed by the em_* worker RPCs, parallel agent).
-    // SimManager gates every sim_em_* command on an em_status probe: when the solver backend is
-    // not installed the whole set renders disabled with an honest "EM solver not installed"
-    // tooltip (ui::setRibbonDisabledPrefix). Study-kind buttons per the spec: Eigenmode,
-    // Frequency Sweep (S-parameters), Time Domain; setup tools: ports / boundaries / freq range.
+    // --- Tab: EM (electromagnetics — backed by the em_* worker RPCs).
+    // The cached backend capability gates Run; analysis and setup remain editable.
     { "sim_em_eigen",      "Eigenmode",   "study_modal",     "EM",      "Study",     true,  nullptr, false },
     { "sim_em_sweep",      "Freq Sweep",  "study_flow",      "EM",      "Study",     true,  nullptr, false },
     { "sim_em_time",       "Time Domain", "study_static",    "EM",      "Study",     true,  nullptr, false },
@@ -712,25 +687,6 @@ static const RibbonCmd kCmds[] = {
     { "reveng_to_parts",     "Add to Parts",   "insert_component","Reverse Eng", "Deliver",     false, nullptr, false },
     { "reveng_print_mat",    "Print Scale Mat","file_doc",        "Reverse Eng", "Deliver",     false, nullptr, false },
 
-    // ECAD schematic editor expansion. Appended (rather than reordering the established rows)
-    // because RibbonCmd is an append-only command contract.
-    { "sch_add_bus",          "Bus",             "sch_wire",       "Schematic", "Schematic", false, nullptr,     false },
-    { "sch_add_no_connect",   "No Connect",      "ok_check",       "Schematic", "Schematic", false, nullptr,     false },
-    { "sch_add_junction",     "Junction",        "sch_label",      "Schematic", "Schematic", false, nullptr,     false },
-    { "sch_add_text",         "Text",            "file_doc",       "Schematic", "Schematic", false, nullptr,     false },
-
-    { "sch_sheet",            "Sheet",           "sch_new",        "Schematic", "Sheet",     true,  nullptr,     false },
-    { "sch_new_sheet",        "New Sheet",       "sch_new",        "Schematic", "Sheet",     false, "sch_sheet", false },
-    { "sch_sheet_properties", "Properties",      "settings",       "Schematic", "Sheet",     false, "sch_sheet", false },
-
-    { "sch_import_kicad",     "Import KiCad",    "open",           "Schematic", "Outputs",   false, nullptr,     false },
-    { "sch_export_netlist",   "Netlist",         "file_doc",       "Schematic", "Outputs",   false, nullptr,     false, CommandCapability::Export },
-    { "sch_export_bom",       "BOM",             "bom",            "Schematic", "Outputs",   false, nullptr,     false, CommandCapability::Export },
-    { "sch_export_spice",     "SPICE",           "sch_simulate",   "Schematic", "Outputs",   false, nullptr,     false, CommandCapability::Export },
-    { "sch_export_kicad",     "Export KiCad",    "save",           "Schematic", "Outputs",   false, nullptr,     false, CommandCapability::Export },
-    { "sch_export_svg",       "SVG",             "file_image",     "Schematic", "Outputs",   false, nullptr,     false, CommandCapability::Export },
-    { "sch_export_pdf",       "PDF",             "file_doc",       "Schematic", "Outputs",   false, nullptr,     false, CommandCapability::Export },
-    { "sch_plot",             "Plot / Print",    "file_doc",       "Schematic", "Outputs",   true,  nullptr,     false, CommandCapability::Export },
 
     // Motion study entry points (2026-09-28): the Motion tab only exists in the Simulate
     // workspace, so an assembly in Model had no visible way into its Motion study. Both rows
@@ -874,8 +830,7 @@ static const RibbonCmd kCmds[] = {
     { "sim_run",           "Run",          "run_study",      "Motion",     "Run",        true,  nullptr, false },
     { "sim_results",       "Results",      "results",        "Motion",     "Results",    true,  nullptr, false },
 
-    // --- Tab: EM (sim_em_* stay gated on the em_status probe via setRibbonDisabledPrefix). The
-    //     three analysis kinds sit beside New Study as small buttons; each opens its EM form. ---
+    // --- Tab: EM. The three analysis kinds open their forms even when Run is unavailable. ---
     SIM_NEW_STUDY_ROWS("EM", "study_em"),
     { "sim_em_eigen",      "Eigenmode",    "study_modal",    "EM",         "Study",      false, nullptr, false },
     { "sim_em_sweep",      "Freq Sweep",   "plots_view",     "EM",         "Study",      false, nullptr, false },
@@ -977,6 +932,9 @@ static const RibbonCmd kCmds[] = {
     // =========================================================================
     { "dwg_export_dwg",   "Export DWG",    "file_doc",      "View Layout", "Sheet", false, nullptr, false, CommandCapability::Export },
     { "dwg_arrange",      "Auto Arrange",  "view_cube",     "View Layout", "Sheet", false, nullptr, false },
+
+    // The same read-only study is available beside FEA without creating a second command path.
+    { "eval_thickness", "Wall Thickness", "thickness", "Static", "Study", true, nullptr, false, CommandCapability::Inspect },
 };
 // clang-format on
 #undef SIM_NEW_STUDY_ROWS
@@ -1025,9 +983,14 @@ bool ribbonRowActive(int index) {
 
 CommandCapability ribbonCommandCapability(const char* cmdId) {
     if (!cmdId || !*cmdId) return CommandCapability::Mutate;
-    for (const RibbonCmd& command : kCmds)
-        if (std::strcmp(command.cmd_id, cmdId) == 0) return command.capability;
-    return CommandCapability::Mutate;
+    static const auto capabilities = [] {
+        std::unordered_map<std::string_view, CommandCapability> result;
+        for (const RibbonCmd& command : kCmds)
+            result.emplace(command.cmd_id, command.capability);
+        return result;
+    }();
+    const auto it = capabilities.find(cmdId);
+    return it == capabilities.end() ? CommandCapability::Mutate : it->second;
 }
 
 // Rows that configure ONE study type (its Study-node options) on a tab shared with other types:
@@ -1045,6 +1008,12 @@ static const char* const kSelectedStudyCmds[] = {
     "sim_material", "sim_fixture", "sim_load_force", "sim_load_pressure",
     "sim_mesh",     "sim_run",     "sim_results",
 };
+static bool selectedStudyCommand(const char* cmdId) {
+    for (const char* id : kSelectedStudyCmds)
+        if (std::strcmp(id, cmdId) == 0) return true;
+    return false;
+}
+
 
 static bool cmdIs(const char* cmdId, std::initializer_list<const char*> ids) {
     for (const char* id : ids)
@@ -1061,12 +1030,9 @@ RibbonStudyGate ribbonStudyGate(const char* cmdId, const char* studyTypeKey, con
                        ? RibbonStudyGate::Enabled
                        : RibbonStudyGate::Hidden;
     if (!studyTypeKey) return RibbonStudyGate::Enabled;
-    bool selectedStudyCmd = false;
-    for (const char* id : kSelectedStudyCmds)
-        selectedStudyCmd = selectedStudyCmd || std::strcmp(id, cmdId) == 0;
-    if (!selectedStudyCmd) return RibbonStudyGate::Enabled;
+    if (!selectedStudyCommand(cmdId)) return RibbonStudyGate::Enabled;
 
-    const std::string key = studyTypeKey;
+    const std::string_view key = studyTypeKey;
     const char* why = nullptr;
     const bool loads = cmdIs(cmdId, {"sim_load_force", "sim_load_pressure"});
     if (key.empty()) {
@@ -1097,6 +1063,259 @@ RibbonStudyGate ribbonStudyGate(const char* cmdId, const char* studyTypeKey, con
     if (!why) return RibbonStudyGate::Enabled;
     if (reason) *reason = why;
     return RibbonStudyGate::Disabled;
+}
+
+static bool startsWith(std::string_view id, std::string_view prefix) {
+    return id.size() >= prefix.size() && id.compare(0, prefix.size(), prefix) == 0;
+}
+
+static CommandAvailability disabled(const char* reason) {
+    return {true, false, reason};
+}
+
+// The table is immutable, so resolve duplicated tab rows just once. An id is reserved only
+// if every occurrence is reserved; retired reserved commands must not become dispatchable.
+// -1 means no ribbon row, 0 supported, 1 reserved.
+static int commandReservation(std::string_view id) {
+    static const auto reserved = [] {
+        std::unordered_map<std::string_view, bool> result;
+        for (const auto& row : kCmds) {
+            const auto inserted = result.emplace(row.cmd_id, row.stretch);
+            if (!inserted.second) inserted.first->second &= row.stretch;
+        }
+        return result;
+    }();
+    const auto it = reserved.find(id);
+    return it == reserved.end() ? -1 : (it->second ? 1 : 0);
+}
+
+CommandAvailability commandAvailability(const char* cmdId, const CommandContext& c) {
+    if (!cmdId || !*cmdId) return {};
+    const std::string_view id(cmdId);
+    const int reservation = commandReservation(id);
+    if (reservation == 1) {
+        if (id == "sk_spline_surface")
+            return disabled("Splines cannot be sketched directly on curved faces yet.");
+        if (id == "sim_load_torque")
+            return disabled("The structural solver has no torque or moment load.");
+        return disabled("Not available in this version.");
+    }
+#ifdef __EMSCRIPTEN__
+    // webGapReason also describes connection-wide CAD readiness. It is a ribbon capability
+    // gate, not a blanket prohibition on internal, document-independent navigation.
+    if (reservation >= 0)
+        if (const char* reason = webGapReason(cmdId)) return disabled(reason);
+#endif
+
+    const char* studyReason = nullptr;
+    const RibbonStudyGate study = ribbonStudyGate(cmdId, c.selectedStudyType.c_str(), &studyReason);
+    if (study == RibbonStudyGate::Hidden) return {false, false, nullptr};
+    // Never infer that a study is absent from an uninitialized or stale list. A list being
+    // replaced can also invalidate an otherwise selected study before its action executes.
+    const bool listDependent = selectedStudyCommand(cmdId) || id == "sim_parameters" ||
+        cmdIs(cmdId, {"sim_modal_options", "sim_buckling_options", "sim_contact_options",
+                      "sim_freqresp_options", "sim_thermal_fea_options", "sim_load_heat",
+                      "sim_thermal_bc", "sim_fatigue_setup", "sim_motion_setup",
+                      "sim_fluid", "sim_flow_bc", "sim_flow_res",
+                      "sim_topology_setup", "sim_topology_boundaries", "sim_topology_preserve",
+                      "sim_topology_exclude", "sim_topology_manufacturing", "sim_topology_compare"});
+    if (listDependent) {
+        const bool activeMechanical = c.activeMechanicalReady && !c.activeDocId.empty() &&
+            (c.activeDocKind == CommandDocKind::Part || c.activeDocKind == CommandDocKind::Assembly);
+        if (!activeMechanical) return disabled("Open a part or assembly first.");
+        if (c.studyListPending) return disabled("Wait for the study list to finish loading.");
+        if (!c.studyFactsCurrent)
+            return disabled("Study list is not current. Open Simulation to refresh or retry.");
+    }
+    if (study == RibbonStudyGate::Disabled) return disabled(studyReason);
+    if (id == "sim_parameters" && c.selectedStudyType.empty())
+        return disabled("Create or select a study first.");
+
+    // Preserve the existing Simulation model freeze, while leaving library navigation and
+    // sketch finish/cancel available. These latter commands are the way out of a live edit.
+    if (c.inSimulation &&
+        !cmdIs(cmdId, {"asm_parts_library", "sketch_exit", "sketch_cancel",
+                       "sketch3d_exit", "sketch3d_cancel"})) {
+        const bool allowed = startsWith(id, "sim_") || startsWith(id, "eval_") ||
+            startsWith(id, "view_") || startsWith(id, "zoom") || startsWith(id, "cam_") ||
+            startsWith(id, "display_") || startsWith(id, "section") ||
+            startsWith(id, "rollback") || startsWith(id, "config_") ||
+            id == "toggle_units" || id == "make_drawing";
+        const bool modeling = startsWith(id, "sketch") || startsWith(id, "sk_") ||
+            startsWith(id, "sk3d_") || startsWith(id, "smart_dim") ||
+            startsWith(id, "extrude") || startsWith(id, "revolve") ||
+            startsWith(id, "fillet") || startsWith(id, "chamfer") ||
+            startsWith(id, "shell") || startsWith(id, "draft") || startsWith(id, "hole") ||
+            startsWith(id, "sweep") || startsWith(id, "loft") || startsWith(id, "boss") ||
+            startsWith(id, "cut") || startsWith(id, "pattern") || startsWith(id, "mirror") ||
+            startsWith(id, "rib") || startsWith(id, "dome") || startsWith(id, "wrap") ||
+            startsWith(id, "split") || startsWith(id, "combine") || startsWith(id, "scale") ||
+            startsWith(id, "move") || startsWith(id, "boolean") || startsWith(id, "helix") ||
+            startsWith(id, "ref_") || startsWith(id, "datum") || startsWith(id, "plane") ||
+            startsWith(id, "axis") || startsWith(id, "weld") || startsWith(id, "sm_") ||
+            startsWith(id, "asm_") || startsWith(id, "edit_") || id == "new_assembly";
+        if (modeling && !allowed)
+            return disabled("Leave Simulation to edit model geometry.");
+    }
+
+    const bool part = c.activeDocKind == CommandDocKind::Part && c.activeMechanicalReady &&
+                      !c.activeDocId.empty();
+    const bool assembly = c.activeDocKind == CommandDocKind::Assembly && c.activeMechanicalReady &&
+                          !c.activeDocId.empty();
+    if (id == "eval_model_history" && !part)
+        return disabled("Open a part to inspect its model history.");
+    if (id == "sketch_new" || id == "sketch3d_new") {
+        if (c.sketch2dActive || c.sketch3dActive)
+            return disabled("Finish or cancel the current sketch first.");
+        if (!part) return disabled("Open a part first.");
+    } else if (startsWith(id, "sk3d_") || id == "sketch3d_exit" || id == "sketch3d_cancel") {
+        if (!c.sketch3dActive) return disabled("Start a 3D sketch first.");
+        if (id == "sk3d_fix" && !c.sketch3dHasFixSelection)
+            return disabled("Select sketch entities or points first.");
+        if (id == "sk3d_delete" && !c.sketch3dHasSelection)
+            return disabled("Select sketch entities first.");
+    } else if (startsWith(id, "sk_") || id == "smart_dim" ||
+               id == "sketch_exit" || id == "sketch_cancel") {
+        const bool finish3d = id == "sketch_exit" && c.sketch3dActive;
+        if (!c.sketch2dActive && !finish3d) return disabled("Start a 2D sketch first.");
+        if (id == "sk_construction" && !c.sketch2dHasEntitySelection)
+            return disabled("Select sketch entities first.");
+        if (id == "sk_fix" && !c.sketch2dHasFixSelection)
+            return disabled("Select sketch entities or points first.");
+    }
+
+    if (startsWith(id, "dwg_")) {
+        if (c.activeDocKind != CommandDocKind::Drawing || c.activeDocId.empty())
+            return disabled("Open a drawing first.");
+        if (startsWith(id, "dwg_scale_") && !c.drawingViewSelected)
+            return disabled("Select a drawing view first.");
+    }
+    if ((cmdIs(cmdId, {"asm_insert", "asm_move", "asm_pattern", "asm_mate", "asm_explode",
+                       "asm_interference", "asm_bom", "sim_motion_study", "sim_new_motion"})) &&
+        !assembly)
+        return disabled("Open an assembly first.");
+    if (cmdIs(cmdId, {"sim_new_static", "sim_new_modal", "sim_new_flow", "sim_new_thermal",
+                      "sim_new_fatigue", "sim_new_thermal_fea", "sim_new_buckling",
+                      "sim_new_contact", "sim_new_freqresp", "sim_piping_new", "sim_hyd_new"}) &&
+        !part && !assembly)
+        return disabled("Open a part or assembly first.");
+
+    if (id == "sim_new_topology") {
+        if (!part) return disabled("Open a part for topology optimization.");
+        if (c.modelSolidKnown && !c.modelHasSolid)
+            return disabled("Model a solid design domain first.");
+        if (c.topologyCapabilityKnown && !c.topologyCapabilityAvailable)
+            return disabled("Topology solver capabilities are unavailable.");
+    }
+    // The picker itself remains browseable (and provides Retry), but each creation action
+    // waits for a current list and any preceding creation. Other metadata probes are unrelated.
+    if (cmdIs(cmdId, {"sim_new_static", "sim_new_modal", "sim_new_flow", "sim_new_thermal",
+                      "sim_new_fatigue", "sim_new_motion", "sim_new_thermal_fea",
+                      "sim_new_buckling", "sim_new_contact", "sim_new_freqresp",
+                      "sim_new_topology", "sim_motion_study", "sim_piping_new", "sim_hyd_new"})) {
+        if (c.studyListPending) return disabled("Wait for the study list to finish loading.");
+        if (c.simCreationPending) return disabled("Wait for the current study to finish being created.");
+        if (!c.studyFactsCurrent)
+            return disabled("Study list is not current. Open Simulation to refresh or retry.");
+    }
+    if (id == "sim_new_contact" && c.contactCapabilityKnown && !c.contactCapabilityAvailable)
+        return disabled("Install CalculiX to create a contact study.");
+    if (id == "sim_new_freqresp" && c.vibrationCapabilityKnown && !c.vibrationCapabilityAvailable)
+        return disabled("Install the vibration post-processing solver.");
+    if (id == "sim_new_thermal" && c.thermalCfdCapabilityKnown && !c.thermalCfdCapabilityAvailable)
+        return disabled("Thermal CFD is not supported by the current flow backend; use Thermal FEA.");
+    if (id == "sim_em_run") {
+        if (!c.emAnalysisOpen) return disabled("Open an EM analysis first.");
+        if (!c.emCapabilityKnown)
+            return disabled(c.emCapabilityProbeFailed
+                                ? "Could not determine EM solver capability; check the connection."
+                                : "Waiting for the EM solver capability check.");
+        if (!c.emCapabilityAvailable)
+            return disabled("Install an electromagnetics solver that supports this analysis.");
+    }
+
+    if (id == "sim_modal_options" && !c.hasModalStudy)
+        return disabled("Create a modal study first.");
+    if (cmdIs(cmdId, {"sim_thermal_fea_options", "sim_load_heat"}) && !c.hasThermalFeaStudy)
+        return disabled("Create a Thermal FEA study first.");
+    if (id == "sim_thermal_bc" && !c.hasThermalFeaStudy && !c.hasThermalStudy)
+        return disabled("Create a thermal study first.");
+    if (id == "sim_fatigue_setup" && !c.hasFatigueStudy)
+        return disabled("Create a fatigue study first.");
+    if (id == "sim_motion_setup" && !c.hasMotionStudy)
+        return disabled("Create a motion study first.");
+    if (cmdIs(cmdId, {"sim_fluid", "sim_flow_bc", "sim_flow_res"}) &&
+        !c.hasFlowStudy && !c.hasThermalStudy)
+        return disabled("Create a flow or thermal CFD study first.");
+    if (cmdIs(cmdId, {"sim_topology_setup", "sim_topology_boundaries", "sim_topology_preserve",
+                      "sim_topology_exclude", "sim_topology_manufacturing", "sim_topology_compare"}) &&
+        !c.hasTopologyStudy)
+        return disabled("Create a topology study first.");
+    if (c.selectedStudyType == "topology" && cmdIs(cmdId, {"sim_load_force", "sim_load_pressure"}) &&
+        c.topologyPhysics != "structural" && c.topologyPhysics != "buckling" &&
+        c.topologyPhysics != "thermomechanical")
+        return disabled(c.topologyPhysics.empty()
+                            ? "Choose the topology physics first."
+                            : "Use Heat / Flow boundaries for this physics.");
+
+    const bool ecadDoc = (c.activeDocKind == CommandDocKind::Schematic ||
+                          c.activeDocKind == CommandDocKind::PCB) && !c.activeDocId.empty();
+    if (id == "pcb_update_from_sch") {
+        if (!ecadDoc || !c.hasOpenSchematic || !c.hasOpenBoard)
+            return disabled("Open a schematic and board from the same project first.");
+    } else if (cmdIs(cmdId, {"ecad_run_erc", "ecad_simulate", "sch_export_netlist",
+                             "sch_export_pdf", "ecad_kicad_open_sch"})) {
+        if (c.activeDocKind != CommandDocKind::Schematic || c.activeDocId.empty())
+            return disabled("Open an active schematic first.");
+    } else if (cmdIs(cmdId, {"ecad_run_drc", "ecad_autoroute", "ecad_fill_zones",
+                             "ecad_to_3d", "ecad_export_fab", "ecad_export_step",
+                             "ecad_kicad_open_pcb"})) {
+        if (c.activeDocKind != CommandDocKind::PCB || c.activeDocId.empty())
+            return disabled("Open an active board first.");
+    } else if (cmdIs(cmdId, {"ecad_save", "ecad_save_as", "ecad_reload", "ecad_export_bom", "ecad_kicad_open_project"}) &&
+               !ecadDoc) {
+        return disabled("Open an active schematic or board first.");
+    }
+    if (id == "ecad_reload" && !c.ecadHasPath)
+        return disabled("Save or open a KiCad file first.");
+    if (id == "ecad_export_fab" && !c.ecadHasPath)
+        return disabled("Save the board in a KiCad project first.");
+    if (id == "ecad_kicad_open_project" && !c.ecadHasProject)
+        return disabled("Open or save a KiCad project first.");
+    if (cmdIs(cmdId, {"ecad_run_erc", "ecad_run_drc", "ecad_export_bom",
+                      "sch_export_netlist", "sch_export_pdf", "ecad_export_fab",
+                      "ecad_export_step", "ecad_to_3d", "ecad_kicad_open_sch",
+                      "ecad_kicad_open_pcb", "ecad_kicad_open_project"})) {
+        if (!c.kicadStatusKnown) return disabled("Checking KiCad installation.");
+        if (!c.kicadAvailable) return disabled("Install KiCad 10 to use this action.");
+    }
+    if ((id == "ecad_kicad_open_sch" && !c.kicadSchematicAvailable) ||
+        (id == "ecad_kicad_open_pcb" && !c.kicadPcbAvailable) ||
+        (id == "ecad_kicad_open_project" && !c.kicadProjectAvailable))
+        return disabled("The KiCad application for this action was not found.");
+
+    const bool camOperation = startsWith(id, "cam_op_");
+    const bool camOutput = cmdIs(cmdId, {"cam_generate", "cam_simulate", "cam_post"});
+    const bool camStock = id == "cam_set_stock";
+    const bool camExtract = id == "cam_extract";
+    const bool camFlavor = id == "cam_flavor";
+    const bool camMutation = camOperation || camOutput || camStock || camExtract || camFlavor ||
+                             id == "cam_new_job" || id == "cam_add_setup" || id == "cam_add_tool";
+    if (camMutation && c.camBusy) return disabled("Wait for the current CAM operation to finish.");
+    if ((camOutput || camFlavor) && !c.camHasJob) return disabled("Create a CAM job first.");
+    if ((camOperation || camStock) && !c.camHasSetup) return disabled("Add a setup first.");
+    if ((camExtract || camStock || camOperation) && !c.camHasSource &&
+        !(id == "cam_op_face" && c.camHasCachedExtract))
+        return disabled("Open the CAM source part first.");
+
+    if (id == "sm_flat_pattern" &&
+        (!part || (!c.sheetMetalHasBase && !c.sheetMetalBaseStatusUnknown) ||
+         (!c.sheetMetalHasBends && !c.sheetMetalBendStatusUnknown)))
+        return disabled("Add a base flange and bend first.");
+    if (id == "sm_export_flat_dxf" &&
+        (!part || (!c.sheetMetalHasValidFlat && !c.sheetMetalFlatStatusUnknown)))
+        return disabled("Create a flat pattern first.");
+    return {};
 }
 
 }  // namespace ui

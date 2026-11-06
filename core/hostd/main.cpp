@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <random>
 #include <string>
 #include <thread>
 
@@ -66,8 +67,15 @@
 #include "worker_bridge.h"
 
 static hostd::Server* g_server = nullptr;
+// Termination requested from outside the app (SIGTERM/SIGINT, Windows console close /
+// logoff / shutdown) rather than a user Quit. Unsaved docs then stay crash-recoverable:
+// a session teardown, OS shutdown or GPU-reset cleanup is not the user dropping their work.
+static std::atomic<bool> g_externalStop{false};
+// Tray Quit under systemd arrives as a SIGTERM too; it is still a deliberate quit.
+static std::atomic<bool> g_userQuit{false};
 
 static void trayQuitThunk(void*) {
+    g_userQuit.store(true);
     // When systemd supervises us (chudware-hostd.service Restart=always), a bare
     // process exit is respawned in ~2s — the tray "Quit hostd" bounce users hit.
     // systemctl --user stop is a manual stop and stays down.
@@ -176,6 +184,7 @@ static void trayStatusTick(hostd::Server* server) {
 // event; for CTRL_CLOSE/SHUTDOWN Windows still terminates us after a grace
 // period, which the final autosave fits inside.
 static BOOL WINAPI onConsoleCtrl(DWORD /*ctrlType*/) {
+    g_externalStop.store(true);
     if (g_server) g_server->stop();
     return TRUE;
 }
@@ -185,6 +194,7 @@ static long selfPid() { return (long)_getpid(); }
 #else
 
 static void onSignal(int) {
+    g_externalStop.store(true);
     if (g_server) g_server->stop();
 }
 
@@ -647,7 +657,13 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    hostd::Server server(std::move(listener), CHUDWARE_HOSTD_BUILD_ID);
+    std::random_device random;
+    const std::string daemonStartId =
+        std::to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count()) + "-" +
+        std::to_string(selfPid()) + "-" + std::to_string(random()) + "-" +
+        std::to_string(random());
+    hostd::Server server(std::move(listener), CHUDWARE_HOSTD_BUILD_ID, daemonStartId);
     if (cell) {
         std::string policy = "/opt/chudware/contracts/cell_methods.json";
 #ifdef CHUDWARE_DEVELOPER_BUILD
@@ -724,9 +740,14 @@ int main(int argc, char** argv) {
         loader.join();
         return 1;
     }
-    autosave.start(state + "/hostd_autosave/" + key,
-                   &server.status().engineState);
     server.setAutosave(&autosave);
+    if (!autosave.start(state + "/hostd_autosave/" + key, &server.status().engineState)) {
+        trayTickerStop.store(true);
+        if (trayTicker.joinable()) trayTicker.join();
+        hostd::trayStop();
+        loader.join();
+        return 1;
+    }
 
     int linger = 120;
     if (const char* l = std::getenv("CHUDWARE_HOSTD_LINGER_SECS"); l && *l)
@@ -744,13 +765,16 @@ int main(int argc, char** argv) {
     if (trayTicker.joinable()) trayTicker.join();
     hostd::trayStop();
 
-    // Clean shutdown (idle-exit, --stop drain, SIGTERM) discards this session's autosave dir;
-    // recovery is crash-only. A hard kill skips this and leaves the dir as the crash signal.
-    autosave.stop();
+    // Every exit preserves outstanding work; external termination is not a discard.
+    autosave.stop(/*keepForRecovery=*/g_externalStop.load() && !g_userQuit.load());
     loader.join();
     // Deterministically reap the directly-owned worker child on explicit drain/--stop
     // (or ordinary idle-exit), rather than relying on static-destructor order.
     hostd::WorkerBridge::shutdownIfCreated();
+    // Autosave may itself start verification. Join after its final snapshot and
+    // before the engine's function-local statics or OCCT registries are torn down.
+    if (!core::cpp_core().drainBackgroundTasks())
+        hostd::log().line("engine background task drain unavailable or failed");
     // Drain window: hand the sock path to SingleInstance BEFORE the
     // Server dtor closes the listen fd, so unlink happens only at flock release
     // (instance is destroyed after server, so order is: close fd → release flock

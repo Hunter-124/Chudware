@@ -20,6 +20,7 @@
 #include <emscripten.h>
 #endif
 
+#include "../../app_commands.h"
 #include "../../core/app_state.h"
 #include "../../ui_theme.h"
 #include "../../mesh.h"
@@ -219,6 +220,8 @@ void refreshDialects(AppState& st) {
 void loadTree(const nlohmann::json& r) {
     clearDownstreamArtifacts();
     g.mirror.loadTree(r);
+    const int setupCount = static_cast<int>(g.mirror.setups().size());
+    g.selSetup = setupCount ? std::clamp(g.selSetup, 0, setupCount - 1) : 0;
     syncPostIndex();
     resetOpBuffers();
 }
@@ -773,8 +776,30 @@ void drawSelectedSimEvidence() {
 
 }  // namespace
 
+void camPopulateCommandContext(const AppState& st, CommandContext& context) {
+    context.camHasJob = !g.docId.empty();
+    context.camHasSetup = context.camHasJob && !g.mirror.setups().empty();
+    context.camBusy = camBusy();
+    context.camHasCachedExtract = !g.lastExtract.empty();
+    if (!g.sourceDocId.empty()) {
+        context.camHasSource = std::any_of(st.docTabs.begin(), st.docTabs.end(), [](const auto& tab) {
+            return tab.kind == AppState::DocTab::TabKind::Part && tab.docId == g.sourceDocId;
+        });
+    } else if (st.activeTab >= 0 && st.activeTab < static_cast<int>(st.docTabs.size())) {
+        const auto& tab = st.docTabs[st.activeTab];
+        context.camHasSource = tab.kind == AppState::DocTab::TabKind::Part && !tab.docId.empty();
+    }
+}
+
 // ---- ribbon command handler ----
 void camHandleCommand(AppState& st, const std::string& cmd) {
+    if (!commandDispatchChecked(st, cmd.c_str())) {
+        const CommandAvailability availability = commandAvailability(cmd.c_str(), commandContext(st));
+        if (!availability.visible || !availability.enabled) {
+            g.status = availability.reason ? availability.reason : "Command unavailable.";
+            return;
+        }
+    }
     refreshDialects(st);
     if (cmd == "cam_show3d") {          // ribbon Output toggle: viewport backplot overlay
         g.backplot = !g.backplot;
@@ -1283,9 +1308,14 @@ void camDrawPostConfirm(AppState& /*st*/) {
 
 void drawCamOutputBody(AppState& st) {
     refreshDialects(st);
-    const bool busy = camBusy();
+    const CommandContext context = commandContext(st);
+    const CommandAvailability postAvailability = commandAvailability("cam_post", context);
+    const CommandAvailability flavorAvailability = commandAvailability("cam_flavor", context);
+    const bool busy = context.camBusy;
     ImGui::TextDisabled("Post flavor");
     ImGui::SetNextItemWidth(-FLT_MIN);
+    const bool flavorDisabled = !flavorAvailability.visible || !flavorAvailability.enabled;
+    if (flavorDisabled) ImGui::BeginDisabled();
     if (ImGui::BeginCombo("##cam_output_dialect", currentDialect().c_str())) {
         if (g.dialects.empty())
             ImGui::TextDisabled(g.dialectsInflight ? "loading..." : "unavailable");
@@ -1300,19 +1330,37 @@ void drawCamOutputBody(AppState& st) {
         }
         ImGui::EndCombo();
     }
+    if (flavorDisabled) {
+        ImGui::EndDisabled();
+        if (flavorAvailability.reason && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("%s", flavorAvailability.reason);
+    }
 
     const ImVec2 buttonSize(0.0f, ui::metrics::camBtnH());
-    if (busy || g.docId.empty()) ImGui::BeginDisabled();
-    if (ImGui::Button("Post", buttonSize)) doPost(st);
-    if (busy || g.docId.empty()) ImGui::EndDisabled();
+    if (!postAvailability.enabled) ImGui::BeginDisabled();
+    if (ImGui::Button("Post", buttonSize)) camHandleCommand(st, "cam_post");
+    if (!postAvailability.enabled) {
+        ImGui::EndDisabled();
+        if (postAvailability.reason && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("%s", postAvailability.reason);
+    }
     ImGui::SameLine(0.0f, ui::metrics::camBtnGap());
     if (g.gcode.empty()) ImGui::BeginDisabled();
     if (ImGui::Button("Download", buttonSize)) downloadGcode();
-    if (g.gcode.empty()) ImGui::EndDisabled();
+    if (g.gcode.empty()) {
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Post the job before downloading G-code.");
+    }
     ImGui::SameLine(0.0f, ui::metrics::camBtnGap());
     if (busy || g.gcode.empty()) ImGui::BeginDisabled();
     if (ImGui::Button("Audit", buttonSize)) doAudit(st);
-    if (busy || g.gcode.empty()) ImGui::EndDisabled();
+    if (busy || g.gcode.empty()) {
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("%s", busy ? "Wait for the current CAM operation to finish."
+                                         : "Post the job before auditing G-code.");
+    }
 
     if (!g.status.empty()) {
         ImGui::PushTextWrapPos();
@@ -1467,6 +1515,8 @@ void drawSelectedOperationInspector(AppState& st) {
     if (busy) ImGui::BeginDisabled();
     if (ImGui::Button("Autofill", ImVec2(buttonWidth, ui::metrics::camBtnH())))
         doFeedsAutofill(st);
+    if (busy && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Wait for the current CAM operation to finish.");
     ImGui::SameLine(0.0f, gap);
     if (ImGui::Button("Apply", ImVec2(buttonWidth, ui::metrics::camBtnH()))) {
         const nlohmann::json update = {
@@ -1496,6 +1546,8 @@ void drawSelectedOperationInspector(AppState& st) {
             g.status = "operation updated — regenerate required";
         }
     }
+    if (busy && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Wait for the current CAM operation to finish.");
     if (busy) ImGui::EndDisabled();
 }
 
@@ -1549,6 +1601,8 @@ void drawCamTreeBody(AppState& st) {
     if (ImGui::BeginPopup("##cam_flavor_popup")) {
         ImGui::TextDisabled("G-code flavor");
         ImGui::Separator();
+        const CommandAvailability flavor = commandAvailability("cam_flavor", commandContext(st));
+        if (!flavor.visible || !flavor.enabled) ImGui::BeginDisabled();
         if (g.dialects.empty())
             ImGui::TextDisabled(g.dialectsInflight ? "loading..." : "unavailable");
         for (int i = 0; i < (int)g.dialects.size(); ++i) {
@@ -1559,6 +1613,10 @@ void drawCamTreeBody(AppState& st) {
                             {"op", "set_post"}, {"post", g.dialects[i]}}}));
                 if (r.contains("revision")) g.status = "post flavor: " + g.dialects[i];
             }
+        }
+        if (!flavor.visible || !flavor.enabled) {
+            ImGui::EndDisabled();
+            if (flavor.reason) ImGui::TextDisabled("%s", flavor.reason);
         }
         ImGui::EndPopup();
     }
@@ -1775,13 +1833,19 @@ void drawCamTreeBody(AppState& st) {
                 }
                 ui::pushContextMenuStyle();
                 if (ImGui::BeginPopupContextItem("##cam_op_ctx")) {
-                    if (ImGui::MenuItem(o.suppressed ? "Unsuppress" : "Suppress"))
+                    const bool canMutate = !camBusy();
+                    if (ImGui::MenuItem(o.suppressed ? "Unsuppress" : "Suppress",
+                                        nullptr, false, canMutate))
                         pendingOps.push_back(nlohmann::json{
                             {"op", "update_operation"}, {"op_id", o.id},
                             {"operation", {{"suppressed", !o.suppressed}}}});
-                    if (ImGui::MenuItem("Delete"))
+                    if (!canMutate && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        ImGui::SetTooltip("Wait for the current CAM operation to finish.");
+                    if (ImGui::MenuItem("Delete", nullptr, false, canMutate))
                         pendingOps.push_back(nlohmann::json{
                             {"op", "remove_operation"}, {"op_id", o.id}});
+                    if (!canMutate && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        ImGui::SetTooltip("Wait for the current CAM operation to finish.");
                     ImGui::EndPopup();
                 }
                 ui::popContextMenuStyle();
@@ -1826,13 +1890,18 @@ void drawCamTreeBody(AppState& st) {
     // ---- footer: one full-width call to action, then the status line ----
     if (!g.docId.empty() && !g.mirror.setups().empty()) {
         ImGui::Dummy(ImVec2(0.0f, ui::metrics::camSectionGap()));
-        const bool busy = camBusy();
-        if (busy) ImGui::BeginDisabled();
-        if (ImGui::Button("Generate G-code", ImVec2(-FLT_MIN, ui::metrics::camBtnH())))
-            doPipeline(st);
-        if (busy) ImGui::EndDisabled();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Run the whole pipeline: generate toolpaths, simulate, then post");
+        const CommandAvailability generate = commandAvailability("cam_generate", commandContext(st));
+        if (!generate.enabled) ImGui::BeginDisabled();
+        if (ImGui::Button("Generate G-code", ImVec2(-FLT_MIN, ui::metrics::camBtnH()))) {
+            const CommandAvailability current = commandAvailability("cam_generate", commandContext(st));
+            if (current.enabled && current.visible) doPipeline(st);
+            else g.status = current.reason ? current.reason : "Command unavailable.";
+        }
+        if (!generate.enabled) ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("%s", generate.enabled
+                ? "Run the whole pipeline: generate toolpaths, simulate, then post"
+                : (generate.reason ? generate.reason : "Command unavailable."));
     }
     camRowCaption(ImGui::GetCursorPosX(), g.status, camBusy());
 

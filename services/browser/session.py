@@ -1,41 +1,32 @@
-"""services/browser/session.py — persistent per-site browser sessions.
+"""services/browser/session.py — authenticated vendor browser operations.
 
-Two entry points only; every source adapter calls these and never
-imports Playwright directly:
+``browser_login`` opens a headed Playwright profile for manual sign-in;
+``browser_fetch`` and ``browser_download`` use the selected headless backend;
+``browser_interact`` executes caller-supplied page scripts when supported.
+Playwright profiles are per-site, while CEF uses a shared global context fed
+by GUI cookie exports. Site metadata does not imply a separate CEF cookie jar.
 
-- :func:`browser_login` — opens a HEADED, persistent-profile Chromium window so
-  the user can sign into ``site`` in their own browser; the profile (cookies,
-  local storage, ...) is saved to disk under the app data dir
-  (:mod:`services.browser.profiles`) and is LOCAL ONLY — never synced, never
-  uploaded, never read by this module into logs or metadata.
-- :func:`browser_fetch` — loads a URL HEADLESS under the user's saved session,
-  rate-limited per site (:mod:`services.browser.ratelimit`). Linux and Windows
-  use our own CEF daemon; Darwin uses the Playwright fallback selected by
-  :mod:`.driver` because its host ships CEF off. Returns rendered HTML through
-  the same backend-independent envelope.
-- :func:`browser_download` — fetches a URL's raw bytes under the same
-  saved session through the selected headless backend. It has the same
-  rate-limiting and degradation posture as ``browser_fetch``.
-
-``browser_login`` still opens a headed Playwright window as a CLI/fallback path;
-the primary login surface is the interactive CEF panel in the GUI, and this
-headed fallback is retired once the panel is migrated onto the daemon (plan
-Phase 2b). The CEF daemon is lazily spawned and idle-exits, and all three
-functions degrade to the ``services.research`` §6 failure shape
-(``contracts/research_tools.md``) instead of raising.
+Headless operations return structured failures, apply per-site pacing and
+bounded transient retries, and never log cookie contents.
 
 Captcha/2FA: this module DETECTS these states (see :mod:`.challenge`) but
 never attempts to solve or bypass them. The rule is the same regardless — hand
 control back to the user: ``browser_login`` (headed) surfaces a clear "complete it
-yourself" message and keeps the window open; ``browser_fetch`` (headless) aborts
-with a "needs manual re-login" result rather than returning the challenge page or
-retrying.
+yourself" message and keeps the window open; headless operations return the
+detected challenge without retrying or mislabeling it as an expired login.
 """
 from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import errno
+import math
 import os
+import socket
+import ssl
+import tempfile
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -134,30 +125,186 @@ def _busy(site: str) -> dict:
 COOLDOWN_WAIT_BUDGET_S = _env_float("CHUDWARE_BROWSER_COOLDOWN_BUDGET_S", 20.0)
 
 
-def _cooldown_refusal(site: str, url: str, remaining_s: float, verb: str) -> dict:
-    """§6 degradation for a site whose 429/403 backoff cooldown outlasts this call.
+def _browser_fail(site: str, op: str, reason: str, hint: str, *, url: str,
+                  status: int | None = None, retry_after_s: float | None = None) -> dict:
+    """C1 failure envelope without importing the adapter registry."""
+    return {"ok": False, "site": site, "op": op, "reason": reason, "hint": hint,
+            "url": url, "status": status, "retry_after_s": retry_after_s,
+            "ask_user": None}
 
-    A cooldown is a POLICY decision, so it comes back as DATA with the remedy
-    attached rather than as a blocking sleep or a bare error string: the model can
-    only route around a wall it is told about. ``retry_after_s`` is machine-readable
-    so a harvest loop can bail out of this site and keep its partial results.
-    """
+
+def _cooldown_refusal(site: str, url: str, remaining_s: float, op: str) -> dict:
+    """Report a cooldown that exceeds this call's waiting budget."""
     mins = remaining_s / 60.0
     span = f"{remaining_s:.0f}s" if remaining_s < 90.0 else f"~{mins:.0f} min"
-    out = fail("cooldown_active",
-               f"{site} is rate-limiting us: it returned 429/403 and its backoff "
-               f"cooldown still has {span} to run (until "
-               f"{time.strftime('%H:%M:%SZ', time.gmtime(time.time() + remaining_s))}). "
-               f"Nothing was {verb} and WAITING INSIDE THIS CALL IS IMPOSSIBLE — the "
-               f"cooldown outlasts the tool's own time budget, so retrying {url} now, "
-               f"or with different arguments, is refused the same way. Proceed with "
-               f"other sources you can already reach (a different vendor, an already "
-               f"fetched page, the local library) and come back to {site} after the "
-               f"cooldown if you still need it.")
-    out["retry_after_s"] = round(remaining_s, 1)
+    out = _browser_fail(
+        site, op, "rate_limited",
+        f"{site} has a backoff cooldown with {span} remaining. "
+        f"WAITING INSIDE THIS CALL IS IMPOSSIBLE; use other sources and retry "
+        f"{url} after the cooldown.", url=url, retry_after_s=round(remaining_s, 1))
     out["policy_refusal"] = True
     out["executed"] = False
     return out
+
+
+def _retry_after(result: dict) -> float | None:
+    value = result.get("retry_after_s")
+    if value is None:
+        value = result.get("retry_after")
+    if value is None:
+        headers = result.get("headers")
+        if isinstance(headers, dict):
+            value = next((v for k, v in headers.items() if str(k).lower() == "retry-after"), None)
+    if value is None:
+        return None
+    try:
+        seconds = float(value)
+        return max(0.0, seconds) if math.isfinite(seconds) else None
+    except (ValueError, TypeError):
+        try:
+            instant = parsedate_to_datetime(str(value))
+            if instant.tzinfo is None:
+                instant = instant.replace(tzinfo=timezone.utc)
+            return max(0.0, (instant - datetime.now(timezone.utc)).total_seconds())
+        except (ValueError, TypeError, OverflowError):
+            return None
+
+
+def _response_failure(site: str, op: str, url: str, result: dict) -> dict | None:
+    raw_status = result.get("status")
+    status = raw_status if type(raw_status) is int and 100 <= raw_status <= 599 else None
+    final_url = result.get("final_url") or result.get("url") or url
+    retry_after = _retry_after(result)
+    kind = result.get("challenge_kind") or challenge.classify_challenge(result.get("html"), final_url)
+    reason = str(result.get("reason") or "")
+    if kind:
+        reason = "captcha" if kind == "captcha" else "blocked"
+        hint = f"{site} presented a {kind} challenge; complete it in the browser."
+    elif reason == "captcha":
+        hint = result.get("hint") or f"{site} presented a captcha challenge."
+    elif status == 429:
+        reason, hint = "rate_limited", f"{site} returned HTTP 429 for {url}."
+    elif reason == "blocked":
+        reason, hint = "blocked", result.get("hint") or f"{site} blocked access to {url}."
+    elif not result.get("ok") and reason in {
+            "login_required", "rate_limited", "policy_refused", "unsupported",
+            "parse_failed", "terms_required", "credentials_required", "internal_error"}:
+        hint = result.get("hint") or result.get("detail") or f"{site}: {op} of {url} was refused."
+    elif status == 403:
+        reason, hint = "blocked", f"{site} returned HTTP 403 for {url}."
+    elif status == 401:
+        reason, hint = "login_required", f"{site} requires authentication for {url}."
+    elif status in (404, 410):
+        reason, hint = "not_found", f"{site} returned HTTP {status} for {url}."
+    elif status is not None and status >= 400:
+        reason, hint = "transport_failed", f"{site} returned HTTP {status} for {url}."
+    elif not result.get("ok"):
+        if reason == "cell_refused":
+            reason = "policy_refused"
+        if reason not in {"blocked", "captcha", "login_required", "timeout", "transport_failed",
+                          "rate_limited", "not_found", "policy_refused", "unsupported",
+                          "parse_failed", "terms_required", "credentials_required", "internal_error"}:
+            reason = "transport_failed"
+        hint = result.get("hint") or result.get("detail") or f"{site}: {op} of {url} did not complete."
+    else:
+        return None
+    output = _browser_fail(site, op, reason, hint, url=final_url, status=status,
+                           retry_after_s=retry_after)
+    for key in ("ask_user", "detail", "candidates", "original_reason", "policy_refusal", "executed"):
+        if key in result:
+            output[key] = result[key]
+    return output
+
+
+def _exception_reason(exc: Exception) -> tuple[str, bool]:
+    """Distinguish transport outages from unexpected internal errors."""
+    from .cef_client import CefDaemonError
+    from services.net.safe_http import OutboundPolicyError, ResponseTooLarge
+
+    if isinstance(exc, (OutboundPolicyError, ResponseTooLarge)):
+        return "policy_refused", False
+
+    name = type(exc).__name__.lower()
+    message = str(exc)
+    timeout = (isinstance(exc, TimeoutError) or "timeout" in name
+               or "timeout" in str(getattr(exc, "reason", "")).lower()
+               or "timed out" in message.lower() or "net::ERR_TIMED_OUT" in message)
+    transient = (timeout or isinstance(exc, ConnectionError)
+                 or (isinstance(exc, OSError) and exc.errno in {
+                     errno.ENETDOWN, errno.ENETUNREACH, errno.EHOSTUNREACH, socket.EAI_AGAIN})
+                 or "net::ERR_CONNECTION_" in message)
+    if timeout:
+        return "timeout", True
+    if (transient or isinstance(exc, (CefDaemonError, ImportError, socket.gaierror, ssl.SSLError))
+            or type(exc).__module__.split(".", 1)[0] in ("playwright", "patchright")
+            or "not installed" in message.lower()):
+        return "transport_failed", transient
+    return "internal_error", False
+
+
+def _request(site: str, url: str, op: str, call: Callable[[], dict], *,
+             min_interval: float, retry: bool = True,
+             timing: dict[str, float] | None = None) -> tuple[dict | None, dict | None]:
+    """Bounded retries for idempotent, transient failures; never retry challenges."""
+    previous = None
+    for attempt in range(3 if retry else 1):
+        ceiling = ratelimit.reserve_request(site)
+        if ceiling is not None:
+            return None, _browser_fail(site, op, "policy_refused",
+                                       f"{site}: per-session request ceiling reached.",
+                                       url=url)
+        started = time.perf_counter()
+        waited = ratelimit.wait(site, min_interval=min_interval, url=url,
+                                max_wait_s=COOLDOWN_WAIT_BUDGET_S)
+        if timing is not None:
+            timing["rate_ms"] = timing.get("rate_ms", 0.0) + (time.perf_counter() - started) * 1000
+        if waited > COOLDOWN_WAIT_BUDGET_S:
+            if previous is not None:
+                previous["cooldown_remaining_s"] = waited
+                if previous.get("retry_after_s") is None:
+                    previous["retry_after_s"] = waited
+                return None, previous
+            return None, _cooldown_refusal(site, url, waited, op)
+        started = time.perf_counter()
+        transient_exception = False
+        try:
+            result = call()
+            if not isinstance(result, dict):
+                raise RuntimeError("browser backend returned an invalid response")
+            error = _response_failure(site, op, url, result)
+        except Exception as exc:  # noqa: BLE001 — backend launch/connect/protocol
+            reason, transient_exception = _exception_reason(exc)
+            error = _browser_fail(site, op, reason, str(exc) or f"{site}: {op} failed.", url=url)
+            result = {}
+        finally:
+            if timing is not None:
+                timing["backend_ms"] = timing.get("backend_ms", 0.0) + (time.perf_counter() - started) * 1000
+        status = result.get("status")
+        status = status if type(status) is int and 100 <= status <= 599 else None
+        if error and status is not None and 200 <= status < 400:
+            status = None
+        if not error and challenge.is_login_page(result.get("html"), result.get("final_url") or url):
+            status = None
+        ratelimit.note_result(site, status, retry_after_s=_retry_after(result))
+        if error is None:
+            return result, None
+        previous = error
+        transient = (transient_exception or error["reason"] == "timeout"
+                     or (error["reason"] == "transport_failed" and result.get("retryable") is True)
+                     or (status is not None and 500 <= status < 600
+                         and error["reason"] == "transport_failed"))
+        if not retry or not transient or attempt == 2:
+            return None, error
+        time.sleep(0.25 * (2 ** attempt))
+    return None, previous
+
+
+def _session_profile(site: str, cef: Any | None, *, public_only: bool = False) -> str:
+    """Describe the actual backend context, not the metadata-sidecar name."""
+    from . import driver
+    if not public_only and (cef is not None or driver.headless_backend() == "cef"):
+        return "cef_global"
+    return profiles.slug(site)
 
 
 def _apply_staged_cookies(context: Any, site: str) -> None:
@@ -416,6 +563,7 @@ def _finalize_login_cookies(site: str, profile_path: Path, *,
                                     name="browser-cookie-forward")
     except Exception:  # noqa: BLE001
         pass
+    profiles.invalidate_cache(site)
     meta = profiles.save_meta(site, **fields)
     return {"ok": True, "site": meta["site"], "profile_dir": str(profile_path),
             "last_login_ts": meta["last_login_ts"],
@@ -747,6 +895,7 @@ def _browser_login_locked(site: str, *, timeout: float, sync_playwright: Callabl
                                     name="browser-cookie-forward")
     except Exception:  # noqa: BLE001 — verification / carry is best-effort, never fatal
         pass
+    profiles.invalidate_cache(site)
     meta = profiles.save_meta(site, **fields)
     return {"ok": True, "site": meta["site"], "profile_dir": str(profile_path),
             "last_login_ts": meta["last_login_ts"],
@@ -772,14 +921,13 @@ def browser_fetch(url: str, site: str, *,
     successes are cached. Pass ``no_cache=True`` to skip lookup and store;
     ``CHUDWARE_PAGE_CACHE=0`` disables the cache process-wide.
 
-    Returns the §6 failure shape (never raises) when the selected backend is
-    unavailable or navigation fails. A missing profile is auto-created
-    (anonymous browsing of public catalogs is allowed; login-gated content
-    still degrades to login_required via adapters).
+    Returns a structured failure when the selected backend is unavailable or
+    navigation fails. A missing profile is created for anonymous public access.
     """
     from services.agent.request_context import in_cell
     if in_cell():
-        return fail("cell_refused", "Rendered browsing is unavailable in tenant cells.")
+        return _browser_fail(site, "fetch", "policy_refused",
+                             "Rendered browsing is unavailable in tenant cells.", url=url)
     started = time.perf_counter() if _TIMING else 0.0
     timing: dict[str, float] | None = {} if _TIMING else None
     if not no_cache:
@@ -801,7 +949,7 @@ def browser_fetch(url: str, site: str, *,
     if not acquired:
         if timing is not None:
             _log_timing(site, url, timing, started, "busy")
-        return _busy(site)
+        return _browser_fail(site, "fetch", "policy_refused", _busy(site)["hint"], url=url)
     try:
         return _browser_fetch_locked(url, site, render_settle=render_settle,
                                      min_interval=min_interval, cef=_cef,
@@ -816,83 +964,26 @@ def _browser_fetch_locked(url: str, site: str, *, render_settle: float,
                           min_interval: float, cef: Any | None = None,
                           no_cache: bool = False,
                           timing: dict[str, float] | None = None) -> dict:
-    ceiling = ratelimit.reserve_request(site)
-    if ceiling is not None:
-        return fail(ceiling, f"{site}: per-session request ceiling reached — this run has "
-                             f"already made the maximum allowed fetches (a runaway-loop guard). "
-                             f"Nothing was fetched.")
-    # Ceiling first (in-memory, and a tripped runaway guard must count before the
-    # fetch), then a BOUNDED wait: an armed 429/403 cooldown is reported, not slept.
-    t0 = time.perf_counter() if timing is not None else 0.0
-    waited = ratelimit.wait(site, min_interval=min_interval, url=url,
-                            max_wait_s=COOLDOWN_WAIT_BUDGET_S)
-    if timing is not None:
-        timing["rate_ms"] = (time.perf_counter() - t0) * 1000.0
-    if waited > COOLDOWN_WAIT_BUDGET_S:
-        return _cooldown_refusal(site, url, waited, "fetched")
-    status: int | None = None
-    content = ""
-    final_url = url
-    t_backend = time.perf_counter() if timing is not None else 0.0
-    try:
-        try:
-            from . import driver  # lazy: keep import cheap for non-browser callers
-            backend = cef or driver.headless_client(profile=site)
-            r = backend.fetch(url, settle_ms=int(render_settle * 1000))
-            status = r.get("status") or None
-            if not r.get("ok"):
-                if r.get("reason") == "bot_walled":
-                    return fail("bot_walled",
-                                f"{site}: the vendor blocked automated access to {url}")
-                return fail("browser_fetch_failed",
-                            f"{site}: headless fetch of {url} did not complete")
-            content = r.get("html", "")
-            final_url = r.get("final_url") or url
-        except Exception as exc:  # noqa: BLE001 — backend launch/connect/protocol
-            return fail("browser_fetch_failed", str(exc))
-    finally:
-        if timing is not None:
-            timing["backend_ms"] = (time.perf_counter() - t_backend) * 1000.0
-        # Drives inter-request spacing AND 429/403 exponential backoff off the
-        # real status (None on error/challenge → clears any backoff, keeps spacing).
-        ratelimit.note_result(site, status)
-
-    # A captcha/2FA interstitial is NOT real content. Headless has no human to hand
-    # off to, so abort — never return the challenge page as a success, never retry or
-    # attempt to solve it. The saved session has almost certainly expired; the caller
-    # surfaces this and the user re-logins headed.
-    # A challenge/interstitial page is not usable content — skip parsing it so its
-    # markup is never ingested as product data (data-quality signal, see
-    # :mod:`.challenge`). With the consistent fingerprint most false flags don't
-    # appear; a genuine one just yields no content for this URL.
-    t_parse = time.perf_counter() if timing is not None else 0.0
-    challenge_kind = challenge.classify_challenge(content, final_url)
-    if timing is not None:
-        timing["parse_ms"] = (time.perf_counter() - t_parse) * 1000.0
-    if challenge_kind:
-        return fail("challenge_page",
-                    f"{site} returned a {challenge_kind} page for {url} — no product "
-                    f"content to parse")
-
-    # An HTTP error page is not real content either — surface it distinctly so
-    # the health board can tell "bot-walled" (403/429 from Akamai/Cloudflare/PX)
-    # from "parser broke" (live-probe 2026-07-07: these used to come back ok:True
-    # and adapters reported a silent empty result).
-    if status is not None and status >= 400:
-        reason = "bot_walled" if status in (403, 429) else "http_error"
-        return fail(reason, f"{site} returned HTTP {status} for {url}; the site is "
-                            f"likely blocking automated access — a signed-in session "
-                            f"(browser_login('{site}')) usually helps")
-
-    profiles.save_meta(site, last_used_ts=time.time())
-    payload = {"ok": True, "url": url, "final_url": final_url, "status": status,
-               "content": content, "fetched_ts": now_ts(),
-               "session_profile_used": profiles.slug(site)}
-    # Only this branch is cacheable — every fail(...) above (busy / fetch failed /
-    # challenge / bot-walled / http_error) must be re-fetched next time.
+    from . import driver
     if not no_cache:
-        from . import page_cache  # lazy, as above
-        page_cache.put(url, site, payload)
+        from . import page_cache
+        cache_generation = page_cache.generation()
+
+    def fetch() -> dict:
+        backend = cef or driver.headless_client(profile=site)
+        return backend.fetch(url, settle_ms=int(render_settle * 1000))
+
+    result, error = _request(site, url, "fetch", fetch, min_interval=min_interval, timing=timing)
+    if error is not None:
+        return error
+    profiles.save_meta(site, last_used_ts=time.time())
+    payload = {"ok": True, "url": url, "final_url": result.get("final_url") or url,
+               "status": result.get("status") or None, "content": result.get("html", ""),
+               "fetched_ts": now_ts(), "session_profile_used": _session_profile(site, cef)}
+    if result.get("partial_load"):
+        payload["partial_load"] = True
+    if not no_cache:
+        page_cache.put(url, site, payload, expected_generation=cache_generation)
     return payload
 
 
@@ -903,56 +994,44 @@ def browser_interact(url: str, site: str, script: str, *,
                      min_interval: float = ratelimit.DEFAULT_MIN_INTERVAL_S,
                      _cef: Any | None = None) -> dict:
     """Load ``url`` HEADLESS under ``site``'s session, run ``script`` in the page,
-    and return the settled HTML once ``script`` publishes a result into a sentinel
-    DOM element (id ``sentinel``). Same posture as :func:`browser_fetch` (rate limit,
-    profile lock, §6 degradation) — the primitive for SPA configurators whose
-    download URL is generated client-side (an adapter runs page JS to fetch a
-    same-origin config endpoint / drive a control, then reads the sentinel out of the
-    returned ``content``)."""
+    and return the latest HTML after ``script`` publishes a result into a sentinel
+    DOM element (id ``sentinel``), or after the bounded wait. Same posture as
+    :func:`browser_fetch` (rate limit and profile lock); this primitive supports
+    SPA configurators whose download URL is generated client-side.
+    """
     from services.agent.request_context import in_cell
     if in_cell():
-        return fail("cell_refused", "Rendered browsing is unavailable in tenant cells.")
+        return _browser_fail(site, "interact", "policy_refused",
+                             "Rendered browsing is unavailable in tenant cells.", url=url)
     profiles.ensure_profile(site)
     lock = profiles.profile_lock(site)
     if not lock.acquire(blocking=False):
-        return _busy(site)
+        return _browser_fail(site, "interact", "policy_refused", _busy(site)["hint"], url=url)
     try:
-        ceiling = ratelimit.reserve_request(site)
-        if ceiling is not None:
-            return fail(ceiling, f"{site}: per-session request ceiling reached — this run "
-                                 f"has already made the maximum allowed fetches (a "
-                                 f"runaway-loop guard). Nothing was fetched.")
-        waited = ratelimit.wait(site, min_interval=min_interval, url=url,
-                                max_wait_s=COOLDOWN_WAIT_BUDGET_S)
-        if waited > COOLDOWN_WAIT_BUDGET_S:
-            return _cooldown_refusal(site, url, waited, "fetched")
-        status: int | None = None
-        content = ""
+        from . import driver
         try:
-            try:
-                from . import cef_client  # lazy import
-                r = (_cef or cef_client.client()).interact(
-                    url, script, sentinel=sentinel,
-                    settle_ms=int(settle * 1000), timeout_ms=int(timeout * 1000))
-                if not r.get("ok"):
-                    return fail("browser_interact_failed",
-                                f"{site}: CEF interact on {url} did not complete")
-                status = r.get("status") or None
-                content = r.get("html", "")
-            except Exception as exc:  # noqa: BLE001 — daemon spawn/connect/protocol
-                return fail("browser_interact_failed", str(exc))
-        finally:
-            ratelimit.note_result(site, status)
-
-        challenge_kind = challenge.classify_challenge(content, url)
-        if challenge_kind:
-            return fail("challenge_page",
-                        f"{site} returned a {challenge_kind} page for {url} — no usable "
-                        f"content")
+            backend = _cef or driver.headless_client(profile=site)
+        except Exception as exc:  # noqa: BLE001 — backend selection may fail
+            reason, _transient = _exception_reason(exc)
+            return _browser_fail(site, "interact", reason, str(exc), url=url)
+        interact = getattr(backend, "interact", None)
+        if not callable(interact):
+            return _browser_fail(site, "interact", "unsupported",
+                                 "The selected browser backend does not support interaction.", url=url)
+        result, error = _request(
+            site, url, "interact",
+            lambda: interact(url, script, sentinel=sentinel, settle_ms=int(settle * 1000),
+                             timeout_ms=int(timeout * 1000)),
+            min_interval=min_interval, retry=False)
+        if error is not None:
+            return error
         profiles.save_meta(site, last_used_ts=time.time())
-        return {"ok": True, "url": url, "status": status, "content": content,
-                "final_url": r.get("final_url", url), "fetched_ts": now_ts(),
-                "session_profile_used": profiles.slug(site)}
+        output = {"ok": True, "url": url, "status": result.get("status") or None,
+                  "content": result.get("html", ""), "final_url": result.get("final_url") or url,
+                  "fetched_ts": now_ts(), "session_profile_used": _session_profile(site, _cef)}
+        if result.get("script_error"):
+            output["script_error"] = result["script_error"]
+        return output
     finally:
         lock.release()
 
@@ -967,25 +1046,23 @@ def browser_download(url: str, site: str, dest: Path, *,
     HTTP. Tenant cells refuse profile-backed downloads and use public acquisition.
     A missing desktop profile is auto-created; gated files surface login_required.
 
-    A site whose 429/403 backoff cooldown is still armed is REFUSED immediately
-    (``reason: "cooldown_active"`` plus ``retry_after_s``) instead of being slept
-    through — see :data:`COOLDOWN_WAIT_BUDGET_S`. Callers that harvest many URLs
-    (``services.reveng.worker_rpc``) use that to bail out of the site and keep
-    their partial results.
+    An excessive cooldown returns ``rate_limited`` and ``retry_after_s`` instead
+    of sleeping past the caller's deadline.
     """
     from services.agent.request_context import in_cell
     if in_cell():
-        return fail("cell_refused", "Authenticated browser downloads are unavailable in tenant cells; "
-                    "use public acquisition.")
+        return _browser_fail(site, "download", "policy_refused",
+                             "Authenticated browser downloads are unavailable in tenant cells; "
+                             "use public acquisition.", url=url)
     from services.net.safe_http import safe_download_path
     try:
         safe_download_path(Path(dest).parent, url)
     except ValueError as exc:
-        return fail("unsafe_filename", str(exc))
+        return _browser_fail(site, "download", "policy_refused", str(exc), url=url)
     profiles.ensure_profile(site)
     lock = profiles.profile_lock(site)
     if not lock.acquire(blocking=False):
-        return _busy(site)
+        return _browser_fail(site, "download", "policy_refused", _busy(site)["hint"], url=url)
     try:
         return _browser_download_locked(url, site, dest, min_interval=min_interval, cef=_cef,
                                         public_only=public_only)
@@ -996,39 +1073,56 @@ def browser_download(url: str, site: str, dest: Path, *,
 def _browser_download_locked(url: str, site: str, dest: Path, *,
                              min_interval: float, cef: Any | None = None,
                              public_only: bool = False) -> dict:
-    ceiling = ratelimit.reserve_request(site)
-    if ceiling is not None:
-        return fail(ceiling, f"{site}: per-session request ceiling reached — this run has "
-                             f"already made the maximum allowed fetches (a runaway-loop guard). "
-                             f"Nothing was downloaded.")
-    waited = ratelimit.wait(site, min_interval=min_interval, url=url,
-                            max_wait_s=COOLDOWN_WAIT_BUDGET_S)
-    if waited > COOLDOWN_WAIT_BUDGET_S:
-        return _cooldown_refusal(site, url, waited, "downloaded")
-    status: int | None = None
-    dest.parent.mkdir(parents=True, exist_ok=True)
     try:
-        try:
-            from . import driver  # lazy import
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(prefix=".browser-download-", dir=dest.parent)
+        os.close(fd)
+    except OSError as exc:
+        return _browser_fail(site, "download", "transport_failed", str(exc), url=url)
+    staged = Path(name)
+    try:
+        def download() -> dict:
+            staged.unlink(missing_ok=True)
+            from . import driver
             if public_only:
                 from .pw_client import PlaywrightClient
                 backend = PlaywrightClient(profile=site, max_download_bytes=32 * 1024 * 1024)
             else:
                 backend = cef or driver.headless_client(profile=site)
-            r = backend.download(url, str(dest))
-            status = r.get("status") or None
-            if not r.get("ok"):
-                if r.get("reason") == "bot_walled":
-                    return fail("bot_walled",
-                                f"{site}: the vendor blocked automated access to {url}")
-                return fail("browser_download_failed",
-                            f"{site}: headless download of {url} failed or returned no body")
-        except Exception as exc:  # noqa: BLE001 — backend launch/connect/protocol
-            return fail("browser_download_failed", str(exc))
-    finally:
-        ratelimit.note_result(site, status)
+            result = backend.download(url, str(staged))
+            if isinstance(result, dict) and result.get("ok"):
+                if not staged.is_file() or staged.stat().st_size == 0:
+                    return {**result, "ok": False, "reason": "transport_failed",
+                            "hint": "The browser returned no download artifact."}
+                with staged.open("rb") as f:
+                    prefix = f.read(65536).lstrip()
+                if prefix.lower().startswith((b"<!doctype html", b"<html")):
+                    html = prefix.decode("utf-8", "replace")
+                    final_url = result.get("final_url") or url
+                    kind = challenge.classify_challenge(html, final_url)
+                    if kind:
+                        return {**result, "ok": False, "challenge_kind": kind}
+                    if challenge.is_login_page(html, final_url):
+                        return {**result, "ok": False, "reason": "login_required",
+                                "hint": "The download returned a sign-in page."}
+                    if challenge.is_error_page(html):
+                        return {**result, "ok": False, "reason": "transport_failed",
+                                "hint": "The download returned an error page."}
+            return result
 
-    nbytes = dest.stat().st_size if dest.exists() else 0
-    profiles.save_meta(site, last_used_ts=time.time())
-    return {"ok": True, "url": url, "status": status, "dest": str(dest), "bytes": nbytes,
-            "fetched_ts": now_ts(), "session_profile_used": profiles.slug(site)}
+        result, error = _request(site, url, "download", download, min_interval=min_interval)
+        if error is not None:
+            return error
+        try:
+            nbytes = staged.stat().st_size
+            os.replace(staged, dest)
+        except OSError as exc:
+            return _browser_fail(site, "download", "transport_failed", str(exc), url=url,
+                                 status=result.get("status") or None)
+        profiles.save_meta(site, last_used_ts=time.time())
+        return {"ok": True, "url": url, "final_url": result.get("final_url") or url,
+                "status": result.get("status") or None, "dest": str(dest), "bytes": nbytes,
+                "fetched_ts": now_ts(),
+                "session_profile_used": _session_profile(site, cef, public_only=public_only)}
+    finally:
+        staged.unlink(missing_ok=True)

@@ -4748,6 +4748,91 @@ static nlohmann::json fea_run_static_impl(
                                 "max_tresca_mpa", "max_abs_principal_mpa",
                                 "min_fos_tresca", "min_fos_rankine"})}}},
                 {"solver_notes", notes}};
+    // Bounded spatially separated nodal peaks, including the fixture ring. These are
+    // mesh-dependent samples, not independent stress-concentration classifications.
+    if (r.von_mises.size() == static_cast<size_t>(n_nodes) &&
+        points.size() == static_cast<size_t>(3 * n_nodes)) {
+        json spots = json::array();
+        std::vector<int> selected;
+        const double radius = std::max(0.0, mesh_quality.char_len_mm);
+        std::vector<double> finite_stresses;
+        finite_stresses.reserve(r.von_mises.size());
+        for (double value : r.von_mises)
+            if (std::isfinite(value) && value >= 0.0) finite_stresses.push_back(value);
+        double median = 0.0;
+        if (!finite_stresses.empty()) {
+            const size_t mid = finite_stresses.size() / 2;
+            std::nth_element(finite_stresses.begin(), finite_stresses.begin() + mid,
+                             finite_stresses.end());
+            median = finite_stresses[mid];
+            if (finite_stresses.size() % 2 == 0)
+                median = (median + *std::max_element(finite_stresses.begin(),
+                                                      finite_stresses.begin() + mid)) / 2.0;
+            out["median_von_mises_mpa"] = median;
+        }
+        for (int rank = 0; rank < 10; ++rank) {
+            int best = -1;
+            for (int i = 0; i < n_nodes; ++i) {
+                if (!std::isfinite(r.von_mises[i]) || r.von_mises[i] < 0.0) continue;
+                bool near = false;
+                for (int j : selected) {
+                    double d2 = 0.0;
+                    for (int c = 0; c < 3; ++c) {
+                        const double d = points[3 * i + c] - points[3 * j + c];
+                        d2 += d * d;
+                    }
+                    if (d2 <= radius * radius) { near = true; break; }
+                }
+                if (!near && (best < 0 || r.von_mises[i] > r.von_mises[best])) best = i;
+            }
+            if (best < 0) break;
+            selected.push_back(best);
+            json spot = {{"id", "node-" + std::to_string(best)}, {"node", best},
+                         {"location_mm", {points[3 * best], points[3 * best + 1],
+                                          points[3 * best + 2]}},
+                         {"von_mises_mpa", r.von_mises[best]}};
+            if (median > 0.0) spot["stress_to_median_ratio"] = r.von_mises[best] / median;
+            if (static_cast<size_t>(best) < r.factor_of_safety.size() &&
+                std::isfinite(r.factor_of_safety[best]))
+                spot["factor_of_safety"] = r.factor_of_safety[best];
+            if (static_cast<size_t>(best) < r.summary_node.size())
+                spot["included_in_summary"] = r.summary_node[best] != 0;
+            spots.push_back(std::move(spot));
+        }
+        out["hot_spots"] = std::move(spots);
+        out["hot_spot_cluster_radius_mm"] = radius;
+        if (r.factor_of_safety.size() == static_cast<size_t>(n_nodes)) {
+            selected.clear();
+            json low = json::array();
+            for (int rank = 0; rank < 10; ++rank) {
+                int best = -1;
+                for (int i = 0; i < n_nodes; ++i) {
+                    if (!std::isfinite(r.factor_of_safety[i]) || r.factor_of_safety[i] < 0.0 ||
+                        !std::isfinite(r.von_mises[i]))
+                        continue;
+                    bool near = false;
+                    for (int j : selected) {
+                        double d2 = 0.0;
+                        for (int c = 0; c < 3; ++c) {
+                            const double d = points[3 * i + c] - points[3 * j + c];
+                            d2 += d * d;
+                        }
+                        if (d2 <= radius * radius) { near = true; break; }
+                    }
+                    if (!near && (best < 0 || r.factor_of_safety[i] < r.factor_of_safety[best]))
+                        best = i;
+                }
+                if (best < 0) break;
+                selected.push_back(best);
+                low.push_back({{"id", "node-" + std::to_string(best)}, {"node", best},
+                               {"location_mm", {points[3 * best], points[3 * best + 1],
+                                                points[3 * best + 2]}},
+                               {"factor_of_safety", r.factor_of_safety[best]},
+                               {"von_mises_mpa", r.von_mises[best]}});
+            }
+            out["low_fos_regions"] = std::move(low);
+        }
+    }
     if (mesh_advisor) out["advisor"] = detail::mesh_advisor_json(*mesh_advisor);
     // Contact rides BESIDE summary/reactions/mesh_quality, like every other evidence
     // block: the equilibrium check and the contact resultants have to be read together.

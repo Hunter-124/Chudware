@@ -5,8 +5,8 @@ migration to the in-process CEF browser (2026-07-07): the GUI now renders and
 takes input in-process, so it no longer streams frames from a worker-side
 Chromium. What remains on this seam:
 
-- ``browser_start_url {site}`` → ``{ok, url, cache_dir}`` — resolve a vendor key
-  to its sign-in URL + local cookie cache dir (the CEF backend opens it directly).
+- ``browser_start_url {site}`` → ``{ok, url, cache_dir, cookie_domains}`` — resolve a
+  vendor key to its sign-in URL, local cookie cache dir, and trusted cookie domains.
 - ``login_wizard_start {sites?}`` / ``login_wizard_status {}`` /
   ``login_wizard_next {skip?}`` / ``login_wizard_stop {}`` — the multi-vendor
   sign-in state machine (site list + login-verified tracking).
@@ -44,11 +44,9 @@ def _wrap_exc(exc: Exception) -> dict:
 
 
 def _browser_start_url(params: dict, _emit: Callable) -> dict:
-    """Resolve a vendor key → its sign-in URL + the local per-site cookie cache
-    directory. Used by the in-process CEF backend (which has no worker embed) to
-    open a site's login page directly and keep its cookie jar in the SAME profile
-    dir the Playwright scraper uses, so a future cookie-interop pass can share
-    sessions. ``{ok, url, cache_dir}`` — degrades to ``{ok:false}`` structurally.
+    """Resolve a vendor's sign-in URL, local profile directory, and cookie domains.
+    Used by the in-process CEF backend to open the login and restore its cookies.
+    Returns ``{ok:false}`` on failure.
     """
     from services.agent.request_context import in_cell
     if in_cell():
@@ -62,7 +60,22 @@ def _browser_start_url(params: dict, _emit: Callable) -> dict:
         url = start_url_for_site(site)
         if not url:
             return _fail("no_url_for_site", site)
-        return {"ok": True, "url": url, "cache_dir": str(profiles.profile_dir(site))}
+        from urllib.parse import urlsplit
+        from services.browser.adapters import get_adapter
+        adapter = get_adapter(site)
+        # Adapter hosts are the trusted vendor domains. Strip only the conventional
+        # www prefix: guessing a registrable domain from the last two DNS labels
+        # would accidentally include unrelated sites under e.g. co.uk.
+        hosts = getattr(adapter, "hosts", ()) if adapter else ()
+        domains = list(dict.fromkeys(
+            host.lower().strip(".").removeprefix("www.")
+            for host in hosts if isinstance(host, str) and host.strip(".")))
+        login_host = (urlsplit(url).hostname or "").lower().strip(".")
+        if login_host and not any(login_host == d or login_host.endswith("." + d)
+                                  for d in domains):
+            domains.append(login_host.removeprefix("www."))
+        return {"ok": True, "url": url, "cache_dir": str(profiles.profile_dir(site)),
+                "cookie_domains": domains}
     except Exception as exc:  # noqa: BLE001
         return _wrap_exc(exc)
 

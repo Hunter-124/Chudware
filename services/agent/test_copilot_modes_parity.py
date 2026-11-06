@@ -1,13 +1,11 @@
-"""Parity test for the copilot mode tool-gating contract
+"""Contract test for the copilot mode tool-gating data
 (contracts/copilot_modes.json + .md).
 
-Encodes the IDENTICAL mode × tool verdict matrix as the C++ doctest
-core/tests/test_copilot_modes.cpp — both runtimes load the same contract JSON
-and must produce the same allow/deny verdicts. Any change to the contract data
-or rules must keep both tests green in the same commit.
+Encodes the mode × tool verdict matrix; any change to the contract data or rules
+must keep this green in the same commit.
 
 Also pins that the Python module's public sets are exactly the contract data
-(no private copy that could drift from what C++ reads).
+(no private copy that could drift from the contract).
 """
 from __future__ import annotations
 
@@ -27,7 +25,7 @@ def contract() -> dict:
         return json.load(fh)
 
 
-# THE parity matrix: same rows/columns/verdicts as test_copilot_modes.cpp.
+# THE parity matrix: mode × tool verdicts for the contract data.
 #                 tool                 agent plan swarm edit  ask
 _MATRIX = [
     ("describe_part",                   True, True, True, True, True),
@@ -40,10 +38,10 @@ _MATRIX = [
     ("save_part",                       True, True, True, True, True),
     ("add_features",                    True, False, True, True, False),
     ("edit_feature",                    True, False, True, True, False),
+    ("scad_convert",                    True, False, True, False, False),
     ("new_assembly",                    True, False, True, False, False),
     ("cam_generate",                    True, False, True, False, False),
     ("delegate",                        True, True, True, True, False),
-    ("corporate_activate",              True, False, True, False, False),
     ("run_fea_static",                  True, True, True, False, False),
     ("inspect_part",                    True, True, True, True, False),
     ("dag_run",                         True, False, True, False, False),
@@ -125,7 +123,7 @@ class TestRoleCardSemantics:
         out = cmt.apply_mode_tools("swarm", ["add_features"])
         assert "add_features" in out
         assert "delegate" in out
-        assert "corporate_activate" in out
+        assert "coordinate_board" in out
         for tool in ("fs_write", "fs_edit", "fs_list", "research_fetch_page"):
             assert tool in out, (tool, out)
         assert "run_shell" not in out
@@ -182,7 +180,6 @@ class TestRoleCardSemantics:
         assert cmt.is_tool_allowed("   ", "swarm") is False
 
     def test_delegate_gate_verdicts(self):
-        # Mirrors the handle_delegate mode gate in core/agent/run.cpp.
         assert cmt.is_tool_allowed("delegate", "") is True  # empty -> agent
         assert cmt.is_tool_allowed("delegate", "agent") is True
         assert cmt.is_tool_allowed("delegate", "plan") is True

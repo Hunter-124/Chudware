@@ -9,9 +9,9 @@
 
 class WorkerClient;
 struct JobState;
+struct AgentEvent;
 
-// Online launches call the long-lived services worker's `agent_admin_turn`. Explicit offline
-// launches alone retain the native core methods. Both paths stream orchestrator events
+// Launches call the long-lived services worker's `agent_admin_turn` and stream orchestrator events
 // (run_started / stage_started / agent_call / agent_output / stage_result / run_finished)
 // through job->events with kind prefixed "orch_" so the main-thread drain can route them to
 // the Agent Workflow DAG store + the conversation's inline activity timeline.
@@ -31,7 +31,6 @@ struct JobState;
 struct AgentJobRpcRoute {
     std::string method;
     nlohmann::json params = nlohmann::json::object();
-    bool online = true;
     bool cell = false;
     std::string error;
 };
@@ -61,19 +60,24 @@ std::string publishCellAgentRunHandle(JobState& job, const std::string& handle);
 // Client-side wait for a launched route (WorkerClient::call timeoutMs). An online turn with
 // an explicit positive `timeout` budget waits that budget plus slack; one without a budget
 // waits for its response (-1: ends on the terminal reply, Stop, worker/daemon loss or app
-// teardown, never on a wall clock). Explicit offline core runs keep their fixed bound.
+// teardown, never on a wall clock).
 int agentJobWaitMs(const AgentJobRpcRoute& route);
 nlohmann::json normalizeAgentAdminTurnResult(const nlohmann::json& result, bool mission);
+// Cell streams carry broadcasts for every run owned by the actor; accept only
+// this job's already-minted handle.
 void consumeAgentJobEvent(const std::shared_ptr<JobState>& job, const nlohmann::json& data,
-                          bool mission);
+                          bool mission, bool actorBroadcast = false);
+// Pop one event, concatenating only adjacent compatible assistant deltas.
+// Bounds each merge so a fast stream cannot monopolize the GUI drain.
+bool takeAgentEvent(JobState& job, AgentEvent& event);
+bool agentEventsPending(JobState& job);
 void launchAgentRunV2(WorkerClient& w, std::shared_ptr<JobState> job,
                       const std::string& convId, const std::string& docKey,
                       const std::string& request, const std::string& docId, bool cam = false,
                       const nlohmann::json& extra = nlohmann::json::object());
 
-// Mission launcher. Online missions use the same `agent_admin_turn` entry as normal runs, with
-// mode=swarm and corporate_force=true; explicit offline missions retain the native
-// `agent_mission_v1` path. Mission-specific verdict/task fields are still stashed onto
+// Mission launcher. Missions use the same `agent_admin_turn` entry as normal runs, with
+// mode=swarm. Mission-specific verdict/task fields are still stashed onto
 // JobState for the existing main-thread drain.
 void launchMissionRun(WorkerClient& w, std::shared_ptr<JobState> job,
                       const std::string& convId, const std::string& docKey,

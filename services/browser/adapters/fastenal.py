@@ -14,8 +14,8 @@ a ``<div class="card ... list-item-detail">`` card carrying a hidden field
 ``href="/product/details/<sku>"`` anchor, and — for anonymous fetches — an
 ``Online Price`` block (``<p>Online Price</p><p>...<span>$19.83</span>...``).
 Price WAS present for the anonymous fetch (all 12 cards had it), so we emit it;
-we do not synthesize it when a card lacks one. Challenge/login-wall pages
-degrade to ``login_required`` — never solved.
+we do not synthesize it when a card lacks one. Challenge pages are reported,
+never solved.
 """
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from typing import Any
 from urllib.parse import urljoin
 
 from . import register
-from ._retail import RetailAdapter, parse_jsonld_products
+from ._retail import RetailAdapter, card_image, parse_jsonld_products
 
 SITE = "fastenal"
 BASE_URL = "https://www.fastenal.com"
@@ -45,12 +45,14 @@ _CHALLENGE_MARKERS = ("Access Denied", "Reference #", "Request unsuccessful")
 _SKU_RE = re.compile(r'name="data-sku"\s+value="([^"]+)"')
 _TITLE_RE = re.compile(r'class="product-description-grid">([^<]+)</div>')
 _HREF_RE = re.compile(r'href="(/product/details/[^"]+)"')
+_MFR_RE = re.compile(r'Mfg\s*:\s*</span>\s*<span[^>]*>([^<]+)</span>', re.IGNORECASE)
 _PRICE_RE = re.compile(
     r'Online Price</p><p class="mb-0"><span[^>]*>(\$[\d.,]+)</span>')
 
 
 class FastenalAdapter(RetailAdapter):
     key = SITE
+    currency = "USD"
     base_url = BASE_URL
     search_url_tmpl = SEARCH_URL_TMPL
     license_note = LICENSE_NOTE
@@ -75,11 +77,17 @@ class FastenalAdapter(RetailAdapter):
 
     def _hits_from_cards(self, content: str) -> list[dict]:
         text = content or ""
-        boundaries = [(m.group(1), m.start()) for m in _SKU_RE.finditer(text)]
+        boundaries = list(re.finditer(
+            r'<div\b[^>]*class="[^"]*\blist-item-detail\b[^"]*"[^>]*>',
+            text, re.IGNORECASE))
         hits: list[dict] = []
-        for i, (sku, pos) in enumerate(boundaries):
-            end = boundaries[i + 1][1] if i + 1 < len(boundaries) else len(text)
-            seg = text[pos:end]
+        for i, boundary in enumerate(boundaries):
+            end = boundaries[i + 1].start() if i + 1 < len(boundaries) else len(text)
+            seg = text[boundary.start():end]
+            sku_match = _SKU_RE.search(seg)
+            if not sku_match:
+                continue
+            sku = sku_match.group(1)
             tm = _TITLE_RE.search(seg)
             hm = _HREF_RE.search(seg)
             if not tm or not hm:
@@ -90,7 +98,11 @@ class FastenalAdapter(RetailAdapter):
                 "url": urljoin(self.base_url, hm.group(1)),
                 "site": self.key,
                 "sku": sku,
+                "thumbnail": card_image(seg, self.base_url),
             }
+            manufacturer = _MFR_RE.search(seg)
+            if manufacturer:
+                hit["manufacturer"] = manufacturer.group(1).strip()
             pm = _PRICE_RE.search(seg)
             if pm:
                 hit["price"] = pm.group(1)

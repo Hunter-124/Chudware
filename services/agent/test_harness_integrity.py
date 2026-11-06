@@ -29,9 +29,7 @@ _ROLES_GLOB = os.path.join(os.path.dirname(__file__), "roles", "*.yaml")
 # Resolved by MissionDispatch.resolve() (run-scoped), not the global registry.
 _MISSION_SCOPED = set(MissionDispatch.TOOLS) | {
     "coordinate_claim", "coordinate_release", "coordinate_progress",
-    "coordinate_board", "corporate_channel_post", "corporate_channel_read",
-    "corporate_chart", "corporate_spawn_worker", "corporate_hold_meeting",
-    "corporate_record_completion", "corporate_activate",
+    "coordinate_board",
 }
 # Bound inside agent_turn itself rather than the MCP registry.
 _META_TOOLS = {"enable_tools", "list_tool_categories", "advise", "done"}
@@ -56,11 +54,11 @@ def test_every_role_card_tool_actually_resolves():
     resolution and flagged ``design_recipe`` as dead while every real call to it
     succeeded.
 
-    A glob over services/mcp/*_tools.py is not evidence either: org_tools.py
-    matched such a glob for months while nothing ever registered it, so
-    channel_send/request_resolve/council_convene were advertised to
-    department_manager and failed every call. Same for general_agent's own
-    mission_start, cam_programmer's cam_audit, and orchestrator's dag_run.
+    A glob over services/mcp/*_tools.py is not evidence either: a module can match
+    such a glob while nothing registers it, so its tools are advertised and fail
+    every call (the org tools did exactly that before they were deleted). Same for
+    general_agent's own mission_start, cam_programmer's cam_audit, and
+    orchestrator's dag_run.
     """
     dead: dict[str, list[str]] = {}
     for rid in _role_ids():
@@ -81,10 +79,6 @@ def test_every_role_card_tool_actually_resolves():
 
 @pytest.mark.parametrize("tool", [
     "mission_start",       # general_agent's own escalation path
-    "channel_send",        # department_manager, aicad.org/1 §18
-    "request_resolve",
-    "request_raise",       # org_tools registers all four together; workers raise this
-    "council_convene",
     "bom_price",           # sourcing_specialist
     "dag_run",             # orchestrator
     "dag_status",
@@ -294,14 +288,16 @@ def _failing_checkpoint(doc_id, trigger_tool):
     return {"ok": False, "error": "engine cannot snapshot this doc"}
 
 
-def _blocked(tool, doc="doc-wedged"):
-    return gr.pre_dispatch_checkpoint(
-        tool, {"doc_id": doc}, checkpoint_fn=_failing_checkpoint)
+def _blocked(tool, doc="doc-wedged", ops=None):
+    args = {"doc_id": doc}
+    if tool == "add_features":
+        args["ops"] = ops if ops is not None else [{"op": "delete_feature", "id": "f1"}]
+    return gr.pre_dispatch_checkpoint(tool, args, checkpoint_fn=_failing_checkpoint)
 
 
 def test_checkpoint_failure_blocks_the_first_destructive_attempt():
     gr.reset_checkpoint_failures()
-    v = _blocked("delete_feature")
+    v = _blocked("add_features")
     assert v is not None and not v.ok
     # ...and the message must say how to get unstuck.
     assert "UNPROTECTED" in v.message or "unprotected" in v.message
@@ -312,9 +308,10 @@ def test_repeat_attempt_proceeds_rather_than_locking_the_doc_forever():
     doc_checkpoint started failing, every destructive call on that doc was
     refused forever and the model held no tool that could repair it."""
     gr.reset_checkpoint_failures()
-    assert _blocked("delete_feature") is not None      # warned once
-    assert _blocked("delete_feature") is None          # then allowed through
-    assert _blocked("shell") is None                   # doc-wide, not per-tool
+    assert _blocked("add_features") is not None       # warned once
+    assert _blocked("add_features") is None           # then allowed through
+    assert _blocked("add_features", ops=[{"op": "add_feature",
+                                         "feature": {"type": "shell"}}]) is None
 
 
 def test_close_part_is_never_blocked_by_a_failed_checkpoint():
@@ -326,13 +323,14 @@ def test_close_part_is_never_blocked_by_a_failed_checkpoint():
 
 def test_successful_checkpoint_resets_the_failure_memo():
     gr.reset_checkpoint_failures()
-    assert _blocked("delete_feature") is not None
+    assert _blocked("add_features") is not None
     ok = gr.pre_dispatch_checkpoint(
-        "delete_feature", {"doc_id": "doc-wedged"},
+        "add_features", {"doc_id": "doc-wedged",
+                         "ops": [{"op": "delete_feature", "id": "f1"}]},
         checkpoint_fn=lambda d, t: {"ok": True})
     assert ok is None
     # Memo cleared → a later failure warns again instead of silently passing.
-    assert _blocked("delete_feature") is not None
+    assert _blocked("add_features") is not None
 
 
 def test_non_destructive_tools_are_untouched():
@@ -475,9 +473,9 @@ def test_failed_delegate_with_successful_child_calls_counts_as_partial_work():
 # ---------------------------------------------------------------------------
 
 def test_run_linear_role_turn_synthesises_a_missing_handoff(monkeypatch):
-    """Every online top-level run lands here via agent_admin_turn, but it
-    returned run_turn's raw result — so a turn that did real tool work without a
-    formal envelope reached the caller with no "handoff" key at all."""
+    """The explicit-offline entry returned run_turn's raw result — so a turn that
+    did real tool work without a formal envelope reached the caller with no
+    "handoff" key at all."""
     from services.agent import mission_dispatch as md
 
     class _Res:
@@ -506,7 +504,74 @@ def test_linear_turn_keeps_a_real_handoff_untouched(monkeypatch):
     out = md.run_linear_role_turn("x", "general_agent", provider=object())
     assert (out.get("result") or {}).get("handoff") is real
 
-def test_linear_turn_reports_save_failure_as_partial(monkeypatch):
+
+@pytest.mark.parametrize("custom_dispatch", [False, True])
+def test_anonymous_linear_turn_does_not_sweep_standalone_or_other_turns(
+        monkeypatch, custom_dispatch):
+    from services.agent import mission_dispatch as md
+    from services.mcp import cad_common, core_bridge
+
+    monkeypatch.setattr(cad_common, "_TOUCHED_DOCS", {})
+    monkeypatch.setattr(cad_common, "_PROCESS_DOCS", set())
+    cad_common.note_touched_doc("unrelated-standalone-doc")
+    standalone_scope = cad_common._touch_scope()
+    seen = []
+
+    class _Res:
+        success = True
+        stop_reason = "confirmed"
+        result = {"calls": []}
+
+    def fake_turn(*args, **kwargs):
+        seen.append(kwargs["run_id"])
+        assert core_bridge.CURRENT_AGENT.get()[0] == kwargs["run_id"]
+        return _Res()
+
+    def unexpected_engine_call(*args, **kwargs):
+        raise AssertionError("an unrelated document was swept")
+
+    monkeypatch.setattr(at, "run_turn", fake_turn)
+    monkeypatch.setattr(core_bridge, "call", unexpected_engine_call)
+    dispatch = (lambda tool, args: {"ok": True}) if custom_dispatch else None
+    first = md.run_linear_role_turn("first", "general_agent", provider=object(),
+                                    tool_dispatch=dispatch)
+    second = md.run_linear_role_turn("second", "general_agent", provider=object(),
+                                     tool_dispatch=dispatch)
+    assert first["success"] and second["success"]
+    assert len(seen) == 2 and all(seen) and seen[0] != seen[1]
+    assert "unrelated-standalone-doc" in cad_common._TOUCHED_DOCS[standalone_scope]
+
+
+def test_anonymous_linear_turn_still_reports_own_unsaved_work(monkeypatch):
+    from services.agent import mission_dispatch as md
+    from services.mcp import cad_common, core_bridge
+
+    monkeypatch.setattr(cad_common, "_TOUCHED_DOCS", {})
+    monkeypatch.setattr(cad_common, "_PROCESS_DOCS", set())
+    for key in ("CHUDWARE_PROJECT_SAVE_DIR", "CHUDWARE_PROJECT_DIR", "CHUDWARE_FS_ROOT"):
+        monkeypatch.delenv(key, raising=False)
+
+    class _Res:
+        success = True
+        stop_reason = "confirmed"
+        result = {"calls": [{"tool": "add_features", "ok": True}]}
+
+    def fake_turn(*args, **kwargs):
+        cad_common.note_touched_doc("own-doc")
+        return _Res()
+
+    monkeypatch.setattr(at, "run_turn", fake_turn)
+    monkeypatch.setattr(core_bridge, "call", lambda method, params=None: {
+        "docs": [{"doc_id": "own-doc", "name": "own", "dirty": True, "path": ""}]
+    } if method == "doc_list" else {})
+    out = md.run_linear_role_turn("build", "general_agent", provider=object(),
+                                  tool_dispatch=lambda tool, args: {"ok": True})
+    assert out["success"] is True
+    assert out["stop_reason"] == "confirmed"
+    assert "no_project_save_dir" in out["result"]["persistence_warning"]
+    assert "recover_parts(all=True)" in out["result"]["persistence_warning"]
+
+def test_linear_turn_reports_save_failure_as_warning(monkeypatch):
     from services.agent import mission_dispatch as md
     from services.mcp import cad_common
 
@@ -522,7 +587,7 @@ def test_linear_turn_reports_save_failure_as_partial(monkeypatch):
     monkeypatch.setattr(
         cad_common,
         "save_touched_docs",
-        lambda: {"saved": [], "errors": ["doc_save failed for d1"]},
+        lambda **kwargs: {"saved": [], "errors": ["doc_save failed for d1"]},
     )
     out = md.run_linear_role_turn(
         "build it",
@@ -530,10 +595,11 @@ def test_linear_turn_reports_save_failure_as_partial(monkeypatch):
         provider=object(),
         tool_dispatch=lambda tool, args: {"ok": True},
     )
-    assert out["success"] is False
-    assert out["stop_reason"] == "persistence_failed"
-    assert out["result"]["handoff"]["status"] == "partial"
-    assert "doc_save failed" in out["result"]["error_detail"]
+    assert out["success"] is True
+    assert out["stop_reason"] == "confirmed"
+    assert out["result"]["handoff"]["status"] == "done"
+    assert "doc_save failed" in out["result"]["persistence_warning"]
+    assert "recover_parts(all=True)" in out["result"]["handoff"]["summary"]
 
 
 # ---------------------------------------------------------------------------

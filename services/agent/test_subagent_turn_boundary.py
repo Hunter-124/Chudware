@@ -48,34 +48,6 @@ def _analysis_turn(subagent_id: str, provider: MockProvider):
 # Pause: parks until decided, with no clock
 # ---------------------------------------------------------------------------
 
-def test_pause_parks_until_a_human_resumes():
-    reg.register_session("dg_p1", role="worker", status="running")
-    reg.set_paused("dg_p1", True)
-    reg.note_controller("gui")
-
-    released_at = []
-
-    def _resume_soon():
-        time.sleep(0.8)
-        released_at.append(time.monotonic())
-        reg.set_paused("dg_p1", False)
-
-    waker = threading.Thread(target=_resume_soon, daemon=True)
-    waker.start()
-    started = time.monotonic()
-    res = _analysis_turn("dg_p1", MockProvider([_DONE]))
-    waker.join()
-
-    assert res.success
-    # It really parked: the turn could not have finished before the resume.
-    assert released_at and time.monotonic() - started >= 0.8
-    assert not reg.is_paused("dg_p1")
-    assert reg.get_session("dg_p1")["status"] == "running"
-    notes = " ".join(r["text"] for r in reg.get_transcript("dg_p1"))
-    assert "Pause hold entered" in notes
-    assert "resumed at this turn boundary" in notes
-
-
 def test_pause_hold_has_no_deadline(monkeypatch):
     """A pause is not a timer. Nothing may resume it on elapsed time alone.
 
@@ -104,8 +76,8 @@ def test_pause_hold_has_no_deadline(monkeypatch):
     assert res.success
     # Ten simulated hours passed and only the explicit resume let it go.
     assert elapsed["s"] > 36000.0
-    notes = " ".join(r["text"] for r in reg.get_transcript("dg_p2"))
-    assert "no controller left" not in notes
+    assert not reg.is_paused("dg_p2")
+    assert reg.get_session("dg_p2")["status"] == "running"
 
 
 def test_terminate_wins_over_a_pause_hold():

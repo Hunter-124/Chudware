@@ -82,6 +82,14 @@ def test_terminal_save_runs_the_sweep_and_returns_its_status(monkeypatch):
     assert out["reason"] == "stdio_eof"
 
 
+def test_terminal_save_surfaces_unverified_missing_documents(monkeypatch, capsys):
+    warning = {"doc_id": "d1", "reason": "missing_unverified"}
+    _fake_sweep(monkeypatch, {"saved": [], "errors": [], "warnings": [warning]})
+    S._run_terminal_save("stdio_eof")
+    assert S._SAVE_STATUS["warnings"] == [warning]
+    assert "d1" in capsys.readouterr().err
+
+
 def test_the_sweep_runs_ONCE_however_many_shutdown_paths_fire(monkeypatch):
     """A SIGTERM that then closes the pipes must not save twice.
 

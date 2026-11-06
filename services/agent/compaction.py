@@ -1,8 +1,8 @@
 """Deterministic local transcript compaction for offline/standalone consumers.
 
-Online Chudcode sessions own their own history compaction. This module retains
+Online OMP sessions own their own history compaction. This module retains
 text archival, mechanical shake elision, and archive reinjection only for
-callers that explicitly cannot use a live Chudcode session.
+callers that explicitly cannot use a live OMP session.
 
 Message shape is OpenAI-style role+content dicts (not ChatMsg {u,t}):
 
@@ -622,8 +622,8 @@ def snapcompact_archive(
 
     No LLM or online bridge call is made. The archive preserves bounded text
     edges, never cuts mid tool-result, and cumulatively folds
-    ``prior_archive["text"]``. Ordinary Chudcode sessions must use Chudcode's
-    ``compact`` session command instead of this function.
+    ``prior_archive["text"]``. Online OMP sessions use their selected runtime
+    compaction strategy rather than this offline text archive.
     """
     msgs = list(messages or [])
     if supersede_reads:

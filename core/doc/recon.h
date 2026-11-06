@@ -85,11 +85,11 @@ std::vector<ProjectedEntity> project_edges_to_plane(const std::vector<TopoDS_Edg
                                                     bool& any_approx);
 
 // Isolated crossings of a trimmed model edge with a sketch plane. Multiple crossings
-// choose the one nearest `near`, or the projected edge midpoint when it is absent.
+// choose the one nearest `preferred_point`, or the projected edge midpoint when it is absent.
 // A coplanar edge has no isolated pierce point and returns nullopt.
 std::optional<nlohmann::json> pierce_edge_to_plane(
     const TopoDS_Edge& edge, const chudware::geom::SketchPlane& plane,
-    const std::optional<Eigen::Vector2d>& near = std::nullopt);
+    const std::optional<Eigen::Vector2d>& preferred_point = std::nullopt);
 
 // Lift one solved sketch entity into world space, then project onto another plane.
 std::vector<ProjectedEntity> project_sketch_entity_to_plane(

@@ -2,6 +2,7 @@
 #include "legend.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -16,6 +17,7 @@
 #include "widgets/kit.h"   // kit::fmtValue / kit::unitText / kit::elide / kit::tooltip
 #include "../core/app_state.h"
 #include "../result_ramp.h"   // the renderer's LUT stops (single source)
+#include "../renderer.h"
 #include "../ui_theme.h"
 
 namespace ui {
@@ -28,9 +30,9 @@ namespace {
 float s_reserveW = 0.0f;
 int   s_reserveFrame = -1;
 
-ImU32 rampColor(float t) {
+ImU32 rampColor(float t, bool reversed) {
     float rgb[3];
-    result_ramp::sample(t, rgb);
+    result_ramp::sample(reversed ? 1.0f - t : t, rgb);
     return ImGui::ColorConvertFloat4ToU32(ImVec4(rgb[0], rgb[1], rgb[2], 1.0f));
 }
 
@@ -206,6 +208,44 @@ std::vector<Tick> buildTicks(double vmin, double vmax, float barH, float minGapP
     return ticks;
 }
 
+struct LegendCache {
+    double min = 0.0, max = 0.0;
+    float height = -1.0f, gap = 0.0f, fontSize = 0.0f, labelW = 0.0f;
+    ImFont* font = nullptr;
+    bool reversed = false;
+    std::vector<Tick> ticks;
+    struct Segment { float y0, y1; ImU32 top, bottom; };
+    std::array<Segment, 64> gradient;
+};
+
+const LegendCache& cachedLegend(int slot, double min, double max, float height, float gap,
+                                bool reversed) {
+    static std::array<LegendCache, 2> cache;
+    auto& entry = cache[slot];
+    if (entry.height != height || entry.min != min || entry.max != max || entry.gap != gap ||
+        entry.reversed != reversed || entry.font != ImGui::GetFont() ||
+        entry.fontSize != ImGui::GetFontSize()) {
+        entry.min = min;
+        entry.max = max;
+        entry.height = height;
+        entry.gap = gap;
+        entry.reversed = reversed;
+        entry.font = ImGui::GetFont();
+        entry.fontSize = ImGui::GetFontSize();
+        entry.ticks = buildTicks(min, max, height, gap);
+        entry.labelW = 0.0f;
+        for (const auto& tick : entry.ticks)
+            entry.labelW = std::max(entry.labelW, ImGui::CalcTextSize(tick.text.c_str()).x);
+        for (size_t i = 0; i < entry.gradient.size(); ++i) {
+            const float a = (float)i / entry.gradient.size();
+            const float b = (float)(i + 1) / entry.gradient.size();
+            entry.gradient[i] = {height * a, height * b, rampColor(1.0f - a, reversed),
+                                rampColor(1.0f - b, reversed)};
+        }
+    }
+    return entry;
+}
+
 }  // namespace
 
 float legendReserveWidth() {
@@ -245,16 +285,19 @@ void drawLegend(AppState& st, ImDrawList* dl, const ImVec2& r0, const ImVec2& r1
     // word-wrap that splits "Von Mises / stress (psi)".
     const std::string label = legendLabel(st.legendTitle);
     const std::string unitCanon = kit::unitText(st.legendUnits.c_str());
-    const double rawMin = st.legendMin, rawMax = st.legendMax;
+    const result_ramp::Display display = st.colormapOn && st.renderer
+        ? st.renderer->scalarDisplay() : result_ramp::Display{};
+    const double rawMin = display.fixedRange ? display.min * st.legendValueScale : st.legendMin;
+    const double rawMax = display.fixedRange ? display.max * st.legendValueScale : st.legendMax;
     const LegendScale scale = legendScale(rawMin, rawMax, unitCanon);
     const double vmin = rawMin / scale.div, vmax = rawMax / scale.div;
+    const bool reversed = display.reversed;
 
     // Bar height: preferred, clamped to the viewport rect once the title is known. Size the ticks
     // at the preferred height first (labels only widen with more ticks).
     const float minGap = lineH * 1.6f;
-    std::vector<Tick> ticks = buildTicks(vmin, vmax, barPref, minGap);
-    float labelW = 0.0f;
-    for (const Tick& t : ticks) labelW = std::max(labelW, ImGui::CalcTextSize(t.text.c_str()).x);
+    const LegendCache* cached = &cachedLegend(0, vmin, vmax, barPref, minGap, reversed);
+    const float labelW = cached->labelW;
 
     // Shrink-wrap the pill to the bar+labels; the title may widen it (up to 2x the body) so
     // ordinary field names ("Peak pressure", "Von Mises") stay whole, and the unit line always
@@ -278,7 +321,7 @@ void drawLegend(AppState& st, ImDrawList* dl, const ImVec2& r0, const ImVec2& r1
     const float chromeH = pad * 2.0f + titleH + titleGap + lineH;   // + half a label above/below
     const float barH = std::min(barPref, availH - chromeH);
     if (barH < lineH * 2.0f) return;
-    if (barH < barPref) ticks = buildTicks(vmin, vmax, barH, minGap);
+    if (barH < barPref) cached = &cachedLegend(1, vmin, vmax, barH, minGap, reversed);
     const float boxH = chromeH + barH;
 
     const ImVec2 b1(rightLimit, c1.y - margin);
@@ -306,22 +349,17 @@ void drawLegend(AppState& st, ImDrawList* dl, const ImVec2& r0, const ImVec2& r1
     // Colour bar (top = max, bottom = min), sampled from the renderer's LUT stops.
     const ImVec2 barTL(b0.x + pad, b0.y + pad + titleH + titleGap + lineH * 0.5f);
     const ImVec2 barBR(barTL.x + barW, barTL.y + barH);
-    const int segs = 64;
-    for (int i = 0; i < segs; ++i) {
-        const float t1 = 1.0f - (float)i / segs;   // top is max
-        const float t2 = 1.0f - (float)(i + 1) / segs;
-        const float y0 = barTL.y + barH * ((float)i / segs);
-        const float y1 = barTL.y + barH * ((float)(i + 1) / segs);
-        dl->AddRectFilledMultiColor(ImVec2(barTL.x, y0), ImVec2(barBR.x, y1),
-                                    rampColor(t1), rampColor(t1), rampColor(t2), rampColor(t2));
-    }
+    for (const auto& segment : cached->gradient)
+        dl->AddRectFilledMultiColor(ImVec2(barTL.x, barTL.y + segment.y0),
+                                    ImVec2(barBR.x, barTL.y + segment.y1),
+                                    segment.top, segment.top, segment.bottom, segment.bottom);
     dl->AddRect(barTL, barBR, ImGui::ColorConvertFloat4ToU32(surf.textTertiary));
 
     // Ticks: exact extremes + 1-2-5 interior values. Marks from the surface's secondary tone;
     // labels via glassText so they hold up when the pill sits over the extremes of the ramp.
     const ImU32 tick = ImGui::ColorConvertFloat4ToU32(surf.textSecondary);
     const float textH = ImGui::GetTextLineHeight();
-    for (const Tick& t : ticks) {
+    for (const Tick& t : cached->ticks) {
         const float y = barTL.y + barH * (1.0f - t.frac);
         dl->AddLine(ImVec2(barBR.x, y), ImVec2(barBR.x + tickL, y), tick,
                     ui::metrics::stroke(1.0f));

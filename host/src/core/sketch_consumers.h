@@ -31,16 +31,18 @@ inline void scanSketchRefs(const nlohmann::json& node, const std::string& key,
     if (node.is_object()) {
         auto kind = node.find("kind");
         auto sk = node.find("sketch");
-        if (kind != node.end() && kind->is_string() && kind->get<std::string>() == "region" &&
-            sk != node.end() && sk->is_string() && sketchIds.count(sk->get<std::string>()))
-            out.insert(sk->get<std::string>());
+        if (kind != node.end() && kind->is_string() &&
+            kind->get_ref<const std::string&>() == "region" &&
+            sk != node.end() && sk->is_string() &&
+            sketchIds.count(sk->get_ref<const std::string&>()))
+            out.insert(sk->get_ref<const std::string&>());
         for (auto it = node.begin(); it != node.end(); ++it)
             scanSketchRefs(it.value(), it.key(), sketchIds, out);
     } else if (node.is_array()) {
         // A list inherits its key: refs.profile = ["f11", "f12"].
         for (const auto& e : node) scanSketchRefs(e, key, sketchIds, out);
     } else if (node.is_string()) {
-        const std::string v = node.get<std::string>();
+        const std::string& v = node.get_ref<const std::string&>();
         if (keyConsumesSketch(key) && sketchIds.count(v)) out.insert(v);
     }
 }
@@ -55,7 +57,8 @@ inline std::unordered_set<std::string> consumedSketches(
     std::unordered_set<std::string> out;
     if (!feature.is_object()) return out;
     auto type = feature.find("type");
-    if (type != feature.end() && type->is_string() && type->get<std::string>() == "sketch")
+    if (type != feature.end() && type->is_string() &&
+        type->get_ref<const std::string&>() == "sketch")
         return out;  // a sketch is never a consumer
     auto refs = feature.find("refs");
     if (refs != feature.end()) detail::scanSketchRefs(*refs, std::string(), sketchIds, out);
@@ -70,9 +73,10 @@ inline std::unordered_set<std::string> sketchIdsOf(const nlohmann::json& feature
         if (!f.is_object()) continue;
         auto type = f.find("type");
         auto id = f.find("id");
-        if (type != f.end() && type->is_string() && type->get<std::string>() == "sketch" &&
+        if (type != f.end() && type->is_string() &&
+            type->get_ref<const std::string&>() == "sketch" &&
             id != f.end() && id->is_string())
-            ids.insert(id->get<std::string>());
+            ids.insert(id->get_ref<const std::string&>());
     }
     return ids;
 }

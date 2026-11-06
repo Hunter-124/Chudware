@@ -98,10 +98,6 @@ kit::Tone toneOf(int tone);
 // One Warn inline status per string in res["warnings"] (non-strings skipped).
 void warningsList(const nlohmann::json& res);
 
-// ---- document -----------------------------------------------------------------------------------
-// A study write landed in document `docId`: mark its tab dirty (and adopted, for an agent hand-off
-// tab) so the save prompt / title reflect it. No-op when no tab shows that doc.
-void markDocDirty(AppState& st, const std::string& docId);
 
 // ---- StudyRecordStore ---------------------------------------------------------------------------
 // The persisted-record + async-RPC core of a panel whose work saves into the document as

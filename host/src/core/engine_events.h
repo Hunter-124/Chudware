@@ -1,14 +1,13 @@
 // Phase 4 (shared engine host daemon): per-frame drain of hostd push events.
 //
-// Called from the app.cpp main loop right after st.rpc.drain(), only in daemon
-// mode (engine::daemonMode()). Translates daemon events into the SAME tab UX
-// the legacy pollAiCadHandoff gave mirror tabs:
-//   doc.opened       -> open a background mirror tab (first reveal takes focus,
-//                       later parts open in the background + aiPulse), attached
-//                       read-only (attach_doc mode=ro).
-//   doc.changed      -> foreign edit: refresh the active tab's mirror + mesh
-//                       from the event's aicm_path; background tabs just pulse
-//                       (their switch-in rebuild picks up the new revision).
+// Called from the app.cpp main loop right after st.rpc.drain(). In-process
+// cache refreshes use the same document-change routing as daemon pushes.
+// Only GUI-origin or explicitly presented documents are automatically mirrored.
+//   doc.presented    -> reveal an admitted background mirror without taking
+//                       focus from user content, attached read-only.
+//   doc.opened       -> reveal only GUI-origin documents.
+//   doc.changed      -> refresh the active mirror + mesh, or prewarm the
+//                       inactive tab's snapshot and mesh without selecting it.
 //   doc.closed       -> close the matching mirror tab, EXCEPT reason
 //                       "last_writer_detached" (fires every turn when the agent's
 //                       per-turn worker exits; the doc is still live) which keeps
@@ -24,14 +23,33 @@
 #include <functional>
 #include <string>
 #include <vector>
+#include <nlohmann/json.hpp>
 
 struct AppState;
 
 namespace core {
 
-// No-op unless engine::daemonMode(). Safe to call every frame (cheap try-lock
-// poll of the daemon socket).
+// Drain daemon events or in-process cache-refresh notifications.
 void engineEventsTick(AppState& st);
+// Unregister the process-wide in-process sink before GUI teardown.
+void shutdownEngineEvents();
+// Resolve a non-modal external-file conflict, discarding edits only on explicit reload.
+void reloadDiskConflict(AppState& st, const std::string& docId);
+void requireDocMesh(const std::string& docId, int revision);
+void meshCatchupStarted(const std::string& docId, int revision);
+void forgetDocMesh(const std::string& docId);
+// Mesh loader completion keeps failed or superseded revisions retryable.
+void meshCatchupFinished(const std::string& docId, int revision, bool success);
+
+// Suppress automatic read-only attaches while a deliberate file open upgrades
+// the same live document to the user's writable view.
+void beginUserDocOpen(AppState& st, const std::string& docId);
+void endUserDocOpen(AppState& st, const std::string& docId);
+
+// Queue a primary-connection detach/discard after removing its GUI tab. The
+// per-frame drain retries contention and completes closes before reattaching.
+void queueMirrorClose(AppState& st, const std::string& docId,
+                      const std::string& title, bool detachOnly);
 
 // Follow a reveng mission's live progress (contracts/reveng.md §4).
 //
@@ -49,15 +67,13 @@ void engineEventsTick(AppState& st);
 // per frame).
 void watchRevEngReconstruct(const std::string& runId);
 
-// Reveal read-only mirror tabs for docs the GUI itself just caused the daemon to
-// open (recovery_open). The daemon's doc.opened fanout deliberately EXCLUDES the
-// calling client — the RPC return value is how the caller learns what it opened —
-// so those docs would otherwise only surface on the next app launch (via the
-// bootstrap doc_list). Call this with the recovered doc_ids to mirror them in the
-// current session. Same tab semantics as an agent-minted doc: the first reveal
-// focuses, the rest open in the background with the aiPulse glow. No-op off
-// daemon mode.
-void mirrorRecoveredDocs(AppState& st, const std::vector<std::string>& docIds);
+// Reveal read-only mirrors for a deliberate recovery or reopen. recovery_open's
+// doc.opened fanout excludes its caller, so it passes the returned ids here.
+// Existing user content retains focus. No-op off daemon mode.
+void mirrorRecoveredDocs(AppState& st, const std::vector<std::string>& docIds,
+                         bool humanDirty = false, int revision = 0,
+                         const std::string& path = {}, bool diskConflict = false,
+                         const nlohmann::json& observedStamp = nullptr);
 
 // Populate a mirror tab's parked snapshot + mesh cache from the daemon's LOCK-FREE
 // doc_snapshot (hostd serves DocState::lastPush straight out of its registry — no engine

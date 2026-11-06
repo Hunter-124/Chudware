@@ -1,10 +1,10 @@
 # Python runtime dependencies of the Chudware services (worker, MCP server, agent tools).
 #
 # Development: scripts/provision_venv.sh creates .venv-mcp and installs this file from
-# PyPI (equivalently: `python -m pip install -r requirements.txt` in a fresh venv).
-# chudcode-rpc is not on PyPI; pip builds it from the public Chudcode repository at
-# the commit vendor/chudcode/CHUDCODE_ARTIFACT.lock pins (git must be installed).
-# Keep that commit and the one below identical.
+# PyPI plus the hash-pinned official OMP source archive below (equivalently:
+# `python -m pip install -r requirements.txt` in a fresh venv). omp-rpc is
+# built from its MIT source in that archive; no Git credentials or client are needed.
+# Keep its release version and commit aligned with vendor/omp/OMP_ARTIFACT.lock.
 #
 # Reviewed offline installs: services/installer/provision.py installs only the
 # hash-locked wheel set in vendor/python/RUNTIME_WHEELS.lock (prepared with
@@ -41,11 +41,9 @@ opencv-python-headless==5.0.0.93
 pycolmap==3.13.0; (sys_platform == "linux" and platform_machine == "x86_64") or sys_platform == "win32" or (sys_platform == "darwin" and platform_machine == "arm64")
 # interfaces
 mcp==1.28.1
-# Persistent online-agent embedding. The wheel owns protocol/process mechanics; the
-# separately signed payload supplies the adjacent compiled ``chud`` executable.
-# Without it every chudcode_* worker RPC refuses and Settings -> Providers reports a failed
-# service call rather than an empty provider set.
-chudcode-rpc @ git+https://github.com/Hunter-124/chudcode.git@2eaba2f4606984172f31f108459d9529d4ee5e38#subdirectory=python/chudcode-rpc  # MIT, 0.3.1 — typed RPC v2 client
+# The official Python client owns OMP protocol and subprocess mechanics. The
+# separately pinned release executable is staged alongside the application.
+omp-rpc @ https://codeload.github.com/can1357/oh-my-pi/tar.gz/413d278a87a69b453efabf8d1fedb9940385e8c6#sha256=56cddfedb6784a4fdd4e43070fee29bfc4c04351f378a32f9fca0c9a3c8596d4&subdirectory=sdk/python/omp-rpc  # MIT, 0.1.0
 # built-in agent provider adapters
 anthropic==0.107.1
 openai==2.41.0

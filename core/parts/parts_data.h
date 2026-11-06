@@ -1,6 +1,6 @@
 // core/parts/parts_data.h — internal catalog data tables (not part of the public API).
-// Dimensions in millimetres; imperial sizes pre-converted. Mirrors
-// services/agent/prompts/shared/cheatsheets/hardware.md.
+// Dimensions are in millimetres except AS568 source dimensions, which are
+// retained in thousandths of an inch until converted for geometry.
 #pragma once
 
 #include <string>
@@ -29,11 +29,38 @@ struct SaeRow {
     double d, pitch, shcs_d, shcs_h, hex_af, nut_t, wash_id, wash_od, wash_t;
 };
 
+// Nominal key width and minimum full-hex depth used for the modeled socket.
+struct SocketRow {
+    const char* size;
+    double key_width, depth;
+};
+const SocketRow* find_shcs_socket(const std::string& size);
+
 // Deep-groove ball bearing envelope.
 struct BearingRow {
     const char* size;  // bearing number, e.g. "608"
     double bore, od, width;
 };
+
+// SAE AS568B nominal dimensions from the adapter's dimensional table.
+// Integer thousandths of an inch preserve every published source digit.
+struct OringRow {
+    std::string size;  // canonical designation, e.g. "AS568-001"
+    int id_mils, cs_mils;
+};
+// Optional detail for standard-size servo housings. Zero means not modeled.
+// Insets apply to each side of the centered case; heights are measured up from
+// the case bottom or from the feature's supporting surface.
+struct HobbyServoDetail {
+    double slot_opening_w = 0.0, slot_row_pitch = 0.0;
+    double cap_h = 0.0, cap_inset = 0.0;
+    double bottom_h = 0.0, bottom_inset = 0.0;
+    double boss_top_d = 0.0, boss_lower_h = 0.0;
+    double gear_bump_d = 0.0, gear_bump_offset = 0.0, gear_bump_h = 0.0;
+    double cable_l = 0.0, cable_w = 0.0, cable_h = 0.0, cable_bottom_z = 0.0;
+    double spline_root_d = 0.0, retaining_bore_d = 0.0, retaining_bore_depth = 0.0;
+};
+
 // Nominal servo envelopes. z=0 at case bottom; tab bottom and all axial
 // dimensions are measured upwards. A dimension not printed on the cited
 // manufacturer's drawing is identified as a nominal fit dimension in notes.
@@ -46,6 +73,7 @@ struct HobbyServoRow {
     int spline_teeth;
     const char* source;
     const char* notes;
+    HobbyServoDetail detail{};
 };
 
 
@@ -54,6 +82,8 @@ const std::vector<SaeRow>& sae();
 const std::vector<BearingRow>& bearings();
 const std::vector<double>& dowel_diameters();
 const std::vector<HobbyServoRow>& hobby_servos();
+const std::vector<OringRow>& orings_as568();
+const OringRow* find_oring_as568(const std::string& size);
 const HobbyServoRow* find_hobby_servo(const std::string& size);
 
 // nullptr when not found.

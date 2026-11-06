@@ -18,12 +18,14 @@ packages=(
     python3 python3-pip python3.13 python3.13-devel
     # Core libraries
     opencascade-devel suitesparse-devel libcurl-devel gperftools-devel
+    # KiCad CLI for electronics checks and fabrication output
+    kicad
     # GLFW (X11 and Wayland backends), OpenGL, hostd tray
     libX11-devel libXrandr-devel libXinerama-devel libXcursor-devel libXi-devel libXext-devel
     libxkbcommon-devel wayland-devel wayland-protocols-devel mesa-libGL-devel mesa-libEGL-devel
     libappindicator-gtk3-devel
     # Archive and inspection tools used by fetch scripts and tests
-    tar xz bzip2 zstd zip unzip curl file which findutils hostname procps-ng
+    tar xz bzip2 zstd zip unzip curl file which findutils hostname procps-ng openssl
 )
 
 cef_runtime=(
@@ -34,7 +36,8 @@ cef_runtime=(
 for profile in "$@"; do
     case "${profile}" in
         gate)
-            packages+=("${cef_runtime[@]}" xorg-x11-server-Xvfb xorg-x11-xauth mesa-dri-drivers ngspice)
+            packages+=("${cef_runtime[@]}" xorg-x11-server-Xvfb xorg-x11-xauth mesa-dri-drivers
+                       ngspice rpm-build dpkg)
             ;;
         release)
             packages+=("${cef_runtime[@]}" xorg-x11-server-Xvfb xorg-x11-xauth mesa-dri-drivers

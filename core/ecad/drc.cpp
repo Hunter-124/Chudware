@@ -190,19 +190,9 @@ int n_cu_of(const json& board) {
 
 }  // namespace
 
-// Copper layers a pad sits on (drc.py::_pad_layers).
+// Copper layers a pad occupies, including KiCad wildcard layer sets.
 static std::set<std::string> pad_layers(const json& pad, int n_cu) {
-    std::set<std::string> cu;
-    for (const auto& l : schema::copper_layer_ids(n_cu)) cu.insert(l);
-    std::string ptype = pad.value("type", std::string("smd"));
-    if (ptype == "tht" || ptype == "np_tht" || ptype == "connector") return cu;
-    std::set<std::string> out;
-    if (pad.contains("layers") && pad["layers"].is_array()) {
-        for (const auto& l : pad["layers"]) {
-            if (l.is_string() && cu.count(l.get<std::string>())) out.insert(l.get<std::string>());
-        }
-    }
-    return out;
+    return schema::pad_copper_layers(pad, n_cu);
 }
 
 namespace {
@@ -723,6 +713,7 @@ json ratsnest(const json& board) {
     struct Terminal {
         std::string id;
         Point at;
+        std::set<std::string> layers;
     };
     std::map<std::string, std::vector<Terminal>> terminals;  // sorted by net name
     auto net_ok = [](const json& net) {
@@ -746,7 +737,7 @@ json ratsnest(const json& board) {
                     std::string pad_key = pad.value("id", std::string());
                     if (pad_key.empty()) pad_key = "pad" + std::to_string(pad_index);
                     terminals[net.get<std::string>()].push_back(
-                        {"pad:" + fp_key + ":" + pad_key, {wx, wy}});
+                        {"pad:" + fp_key + ":" + pad_key, {wx, wy}, pad_layers(pad, n_cu)});
                 }
                 ++pad_index;
             }
@@ -754,6 +745,7 @@ json ratsnest(const json& board) {
         }
     }
     if (board.contains("vias") && board["vias"].is_array()) {
+        const auto copper = schema::copper_layer_ids(n_cu);
         size_t via_index = 0;
         for (const auto& v : board["vias"]) {
             json net = v.contains("net") ? v["net"] : json(nullptr);
@@ -763,7 +755,21 @@ json ratsnest(const json& board) {
                     at = {getf(v["at"][0]), getf(v["at"][1])};
                 std::string via_key = v.value("id", std::string());
                 if (via_key.empty()) via_key = "via" + std::to_string(via_index);
-                terminals[net.get<std::string>()].push_back({"via:" + via_key, at});
+                std::set<std::string> layers;
+                if (!v.contains("layers") || !v["layers"].is_array() || v["layers"].empty() ||
+                    v.value("type", std::string("through")) == "through") {
+                    layers.insert(copper.begin(), copper.end());
+                } else {
+                    std::size_t first = copper.size(), last = 0;
+                    for (std::size_t i = 0; i < copper.size(); ++i)
+                        if (schema::pad_has_layer(v, copper[i])) {
+                            first = std::min(first, i);
+                            last = std::max(last, i);
+                        }
+                    if (first < copper.size())
+                        for (std::size_t i = first; i <= last; ++i) layers.insert(copper[i]);
+                }
+                terminals[net.get<std::string>()].push_back({"via:" + via_key, at, std::move(layers)});
             }
             ++via_index;
         }
@@ -774,7 +780,8 @@ json ratsnest(const json& board) {
 
     // Tracks grouped by net. An arc is electrically continuous between its declared
     // endpoints; its tessellation is needed for geometry, not for endpoint connectivity.
-    std::map<std::string, std::vector<std::pair<Point, Point>>> tracks_by_net;
+    struct TrackEdge { Point p1, p2; std::string layer; };
+    std::map<std::string, std::vector<TrackEdge>> tracks_by_net;
     if (board.contains("tracks") && board["tracks"].is_array()) {
         for (const auto& t : board["tracks"]) {
             const std::string kind = t.value("kind", std::string("segment"));
@@ -786,7 +793,7 @@ json ratsnest(const json& board) {
                 p1 = {getf(t["p1"][0]), getf(t["p1"][1])};
             if (t.contains("p2") && t["p2"].is_array())
                 p2 = {getf(t["p2"][0]), getf(t["p2"][1])};
-            tracks_by_net[net.get<std::string>()].push_back({p1, p2});
+            tracks_by_net[net.get<std::string>()].push_back({p1, p2, t.value("layer", std::string("F.Cu"))});
         }
     }
 
@@ -815,33 +822,40 @@ json ratsnest(const json& board) {
     };
 
     // endpoint key: round to 1e6 grid (matches Python _ep_key).
-    auto ep_key = [](const Point& q) {
+    auto ep_key = [](const Point& q, const std::string& layer) {
         double x = std::round(q.first * 1e6) / 1e6 + 0.0;
         double y = std::round(q.second * 1e6) / 1e6 + 0.0;
         char buf[128];
         std::snprintf(buf, sizeof(buf), "P:%.17g,%.17g", x, y);
-        return std::string(buf);
+        return std::string(buf) + "@" + layer;
     };
 
     for (auto& [net, terms] : terminals) {
         if (terms.size() < 2) continue;
         UF uf;
         for (const auto& r : terms) uf.add("T:" + r.id);
-        const auto& segs = tracks_by_net.count(net) ? tracks_by_net[net]
-                                                    : std::vector<std::pair<Point, Point>>();
-        for (const auto& seg : segs) uf.uni(ep_key(seg.first), ep_key(seg.second));
+        const auto found = tracks_by_net.find(net);
+        const std::vector<TrackEdge> empty;
+        const auto& segs = found == tracks_by_net.end() ? empty : found->second;
+        for (const auto& seg : segs)
+            uf.uni(ep_key(seg.p1, seg.layer), ep_key(seg.p2, seg.layer));
         for (const auto& r : terms) {
             for (const auto& seg : segs) {
-                if (dist(r.at, seg.first) <= kTouch || dist(r.at, seg.second) <= kTouch) {
-                    uf.uni("T:" + r.id, ep_key(seg.first));
-                    uf.uni("T:" + r.id, ep_key(seg.second));
+                if (r.layers.count(seg.layer) &&
+                    (dist(r.at, seg.p1) <= kTouch || dist(r.at, seg.p2) <= kTouch)) {
+                    uf.uni("T:" + r.id, ep_key(seg.p1, seg.layer));
+                    uf.uni("T:" + r.id, ep_key(seg.p2, seg.layer));
                 }
             }
         }
         for (size_t i = 0; i < terms.size(); ++i)
             for (size_t j = i + 1; j < terms.size(); ++j)
-                if (dist(terms[i].at, terms[j].at) <= kTouch)
-                    uf.uni("T:" + terms[i].id, "T:" + terms[j].id);
+                if (dist(terms[i].at, terms[j].at) <= kTouch) {
+                    bool common = false;
+                    for (const auto& layer : terms[i].layers)
+                        if (terms[j].layers.count(layer)) { common = true; break; }
+                    if (common) uf.uni("T:" + terms[i].id, "T:" + terms[j].id);
+                }
 
         // components of terminals keyed by UF root.
         std::map<std::string, std::vector<Terminal>> comp;

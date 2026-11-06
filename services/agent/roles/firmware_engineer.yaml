@@ -2,7 +2,6 @@ schema: aicad.role/1
 id: firmware_engineer
 goal: Produce a real firmware project + ELF (and honest sensor-loop sim) for an analysis/firmware deliverable via the fw_* tool path — not prose.
 stage_scope: [feature]
-playbook_default: null
 tool_allowlist:
   - tool: ledger_get
   - tool: ledger_note

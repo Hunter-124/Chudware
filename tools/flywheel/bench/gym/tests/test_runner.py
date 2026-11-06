@@ -30,20 +30,6 @@ from tools.flywheel.bench.gym import report as report_mod
 from tools.flywheel.bench.gym.taxonomy import TAXONOMY
 
 
-def test_probe_reports_chudcode_agent_fn_when_wired():
-    """The real-execution probe recognizes the Chudcode-backed DAG node runner."""
-    probe = execution_probe()
-    assert probe.real_agent_fn is True
-
-
-def test_default_agent_fn_uses_chudcode_without_provider_construction():
-    import inspect
-    from services.dag import node_runner
-
-    src = inspect.getsource(node_runner._default_agent_fn)
-    assert "run_role_turn" in src
-    assert "get_provider" not in src
-    assert "providers.anthropic" not in src
 
 
 def test_paid_gym_route_never_constructs_python_provider(monkeypatch):

@@ -25,6 +25,7 @@
 // grammar time, resolved later).
 #pragma once
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -33,17 +34,29 @@
 namespace chudware::doc {
 
 // Validate a document. Returns the list of structural error strings (empty == valid).
-// Dispatches on doc["schema"]; only "aicad.part/1" is supported.
-std::vector<std::string> validate_document(const nlohmann::json& doc);
+// Dispatches on doc["schema"]. GUI/import mutations may retain unknown legacy refs;
+// structural validation of known refs still applies.
+std::vector<std::string> validate_document(const nlohmann::json& doc,
+                                           bool reject_unknown_refs = true);
 
 // Keys of FEATURE_TYPES (add_feature.feature.type vocabulary). Sorted.
 // Owned here so MCP / op_registry / tests never hand-copy the list.
 std::vector<std::string> feature_type_names();
 
-// OP-PATH ONLY (add_feature / edit_feature). One error per key in `params` that the
+// Keys of MATE_TYPES (asm_add_mate.mate.type vocabulary). Sorted.
+std::vector<std::string> mate_type_names();
+
+// Per-type param vocabulary enforced for agent mutations: feature type -> sorted param
+// keys the compiler (and GUI / import / parts writers) legitimately send, including
+// "suppressed". Ref-slot names are NOT listed (they live under refs; they are also
+// tolerated inside params). Single source for unknown_feature_params and the
+// doc_list_ops reply's `params` field, so no surface hand-copies a key list.
+std::map<std::string, std::vector<std::string>> feature_param_keys();
+
+// AGENT OP-PATH ONLY (add_feature / edit_feature). One error per key in `params` that the
 // compiler does not read for a feature of `type`; each error names the key, a hint for
 // a known invented key ("reverse" -> "flip"), and the accepted params. Null values are
-// skipped (edit_feature deletes a key with null). Types without a known-key table
+// skipped (edit_feature deletes a key with null). Types absent from feature_param_keys()
 // return {}. Never call it from validate_document: saved documents can carry legacy
 // inert keys, and a whole-document check would block every later edit to them.
 std::vector<std::string> unknown_feature_params(const std::string& type,

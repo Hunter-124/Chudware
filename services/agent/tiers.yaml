@@ -4,14 +4,15 @@
 #
 # Four profiles: local-24k, local-48k, mid, frontier.
 # Budget slots must satisfy: sum(slot budgets) + generation_headroom ≤ context_tokens.
-# Slot assembly order follows §9.1: system → ledger → state → advisory → tools → history.
-#
+# Slot order follows §9.1: system → ledger → state → advisory → tools → history.
+# Read dials: context_tokens, generation_headroom, budgets.tools, tool_schema_trim,
+# capability_profile.
 
 schema: aicad.tier/1
 
 # Bundled local-model defaults per role shape, from the local-model throughput and
 # grammar benchmark (numbers copied, never re-derived):
-#   gbnf_worker: gemma3-4b-qat — 100% schema_to_gbnf grammar compliance,
+#   gbnf_worker: gemma3-4b-qat — 100% GBNF grammar compliance,
 #                smallest footprint (3086 MB), 332 tok/s aggregate @ N=8.
 #   fanout:      qwen3-4b — fastest single-stream (175 tok/s) and best parallel
 #                scaler (476 tok/s @ N=8), BUT its GBNF path is broken
@@ -35,9 +36,9 @@ local_models:
 #   openrouter:<model-id>  e.g. openrouter:anthropic/claude-opus-4
 #   openrouter:openai/gpt-4o
 #   xai:<model-id>         e.g. xai:grok-4.5  (or xai:grok-4-5)
-# Online provider/model selection is resolved by Chudcode. Explicit offline role
-# turns use only local tier/provider mappings. Context budgets reuse the frontier
-# profile (see tiers.profile_tier_for). These are NOT listed as static
+# Online provider/model selection is resolved by the OMP host. Explicit offline
+# role turns use only local tier/provider mappings. Context budgets reuse the
+# frontier profile (see tiers.profile_tier_for). These are NOT listed as static
 # profiles below — the model id is the tier parameter.
 
 profiles:
@@ -53,10 +54,6 @@ profiles:
       advisory:  600   # [ADVISORY] block (render_advisory budget)
       tools:    2500   # tool schema block (trimmed per role allowlist)
       history:  8000   # chat history (shrink-first slot)
-    playbook_enforcement: step_locked   # one step per turn, output validated
-    structured_output: gbnf             # llama.cpp GBNF grammar via schema_to_gbnf()
-    advisory_verbosity: full
-    max_tools_per_role: 14
     tool_schema_trim: true  # strip tool descriptions to first sentence
     capability_profile: A   # local: scaffold hard; force grounding + read-back
 
@@ -72,10 +69,6 @@ profiles:
       advisory:  800
       tools:    3500
       history: 16000
-    playbook_enforcement: step_locked
-    structured_output: gbnf
-    advisory_verbosity: full
-    max_tools_per_role: 14
     tool_schema_trim: true
     capability_profile: A   # local: scaffold hard
 
@@ -91,10 +84,6 @@ profiles:
       advisory: 1500
       tools:    6000
       history: 32000
-    playbook_enforcement: checklist     # full checklist injected; model may batch steps
-    structured_output: json_mode        # OpenAI response_format: json_object
-    advisory_verbosity: full
-    max_tools_per_role: 14
     tool_schema_trim: false
     capability_profile: B               # budget: full tools + soft gates
 
@@ -110,9 +99,5 @@ profiles:
       advisory: 2000
       tools:   10000
       history: 80000
-    playbook_enforcement: "off"         # frontier models get the playbook as compact checklist
-    structured_output: free             # no grammar constraint; validate_handoff post-parse
-    advisory_verbosity: compact
-    max_tools_per_role: 14
     tool_schema_trim: false
     capability_profile: C               # frontier: freedom; HARD floors only

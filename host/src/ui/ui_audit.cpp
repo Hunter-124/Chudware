@@ -120,6 +120,7 @@ json gObserved = json::array();
 json gObservedWindows = json::array();
 bool gObserve = false;
 bool gObserveShot = false;
+bool gObservedFrameReady = false;
 std::deque<PathQuery> gQueries;
 IdAudit ID;
 
@@ -141,6 +142,22 @@ json rectJson(const ImRect& r) {
 }
 
 const char* recLabel(const Rec& r) { return r.labelOff >= 0 ? F.labels.c_str() + r.labelOff : ""; }
+
+json observedRecord(const Rec& r) {
+    ImRect visible = r.rect;
+    visible.ClipWith(r.clip);
+    const bool shown = visible.GetWidth() > 0.0f && visible.GetHeight() > 0.0f;
+    return {{"id", r.id}, {"label", recLabel(r)},
+            {"native_label", r.nativeLabelOff < 0 ? recLabel(r) :
+                             F.labels.c_str() + r.nativeLabelOff},
+            {"window", r.win->Name}, {"visible", shown}, {"enabled", r.enabled},
+            {"text_only", r.id == 0}, {"rect", rectJson(shown ? visible : r.rect)},
+            {"full_rect", rectJson(r.rect)}, {"clip", rectJson(r.clip)},
+            {"openable", (r.status & ImGuiItemStatusFlags_Openable) != 0},
+            {"opened", (r.status & ImGuiItemStatusFlags_Opened) != 0},
+            {"checkable", (r.status & ImGuiItemStatusFlags_Checkable) != 0},
+            {"checked", (r.status & ImGuiItemStatusFlags_Checked) != 0}};
+}
 
 // The text ImGui displays for a label: everything before "##" (which also starts "###").
 std::string visiblePart(const std::string& s) {
@@ -545,6 +562,7 @@ void stepQuery(ImGuiContext& g) {
 // ---- context hooks ----
 
 void onNewFramePre(ImGuiContext* ctx, ImGuiContextHook*) {
+    gObservedFrameReady = false;
     F.clear();
     if (gObserve && !gObserveShot && !R.active) gObserve = false;
     F.recording = gObserve || R.active || (ID.on && !ID.finished);
@@ -589,19 +607,9 @@ void onEndFramePost(ImGuiContext* ctx, ImGuiContextHook*) {
             for (const Rec& r : F.recs) {
                 if (gObserved.size() >= 4096) break;
                 if (r.alt || r.win->Hidden || r.labelOff < 0) continue;
-                ImRect visible = r.rect;
-                visible.ClipWith(r.clip);
-                const bool shown = visible.GetWidth() > 0.0f && visible.GetHeight() > 0.0f;
-                gObserved.push_back({{"id", r.id}, {"label", recLabel(r)},
-                                     {"native_label", r.nativeLabelOff < 0 ? recLabel(r) :
-                                                      F.labels.c_str() + r.nativeLabelOff},
-                                     {"window", r.win->Name}, {"visible", shown}, {"enabled", r.enabled},
-                                     {"text_only", r.id == 0},
-                                     {"rect", rectJson(shown ? visible : r.rect)},
-                                     {"full_rect", rectJson(r.rect)}, {"clip", rectJson(r.clip)},
-                                     {"openable", (r.status & ImGuiItemStatusFlags_Openable) != 0},
-                                     {"opened", (r.status & ImGuiItemStatusFlags_Opened) != 0}});
+                gObserved.push_back(observedRecord(r));
             }
+            gObservedFrameReady = true;
         }
         recordConflicts();
         if (R.active) {
@@ -624,6 +632,7 @@ void onShutdown(ImGuiContext* ctx, ImGuiContextHook*) {
     gHookCtx = nullptr;
     gObserve = false;
     gObserveShot = false;
+    gObservedFrameReady = false;
     gObserved = json::array();
     gObservedWindows = json::array();
     if (idAuditFinish() > 0) {
@@ -674,11 +683,22 @@ const nlohmann::json& observedItems() {
     ImGuiContext* ctx = ImGui::GetCurrentContext();
     const char* shot = std::getenv("CHUDWARE_SHOT");
     const bool pointerShot = shot && (std::strcmp(shot, "siminteractive") == 0 ||
+                                      std::strcmp(shot, "uxquality") == 0 ||
+                                      std::strcmp(shot, "demoreview") == 0 ||
+                                      std::strcmp(shot, "scad_edit") == 0 ||
+                                      std::strcmp(shot, "parts_catalog") == 0 ||
+                                      std::strcmp(shot, "omp_gui") == 0 ||
                                       std::strcmp(shot, "simaudit") == 0 ||
                                       std::strcmp(shot, "pipedraw") == 0 ||
                                       std::strcmp(shot, "hydraulics3d") == 0 ||
                                       std::strcmp(shot, "chat_inline") == 0 ||
+                                      std::strcmp(shot, "compact_ui") == 0 ||
+                                      std::strcmp(shot, "composer_spell") == 0 ||
                                       std::strcmp(shot, "copilot_ui") == 0 ||
+                                      std::strcmp(shot, "copilot_showcase") == 0 ||
+                                      std::strcmp(shot, "settings_routes") == 0 ||
+                                      std::strcmp(shot, "model_settings") == 0 ||
+                                      std::strcmp(shot, "model_history") == 0 ||
                                       std::strcmp(shot, "dwgopen") == 0);
     if (ctx && (R.active || pointerShot)) {
         installHooks(ctx);
@@ -686,6 +706,17 @@ const nlohmann::json& observedItems() {
         gObserveShot = pointerShot;
     }
     return gObserved;
+}
+
+bool observedItemById(std::uint32_t id, const std::string& window, nlohmann::json& item) {
+    observedItems();
+    if (!id || !gObservedFrameReady || ImGui::GetCurrentContext() != gHookCtx) return false;
+    for (const Rec& r : F.recs) {
+        if (r.alt || r.id != id || r.win->Hidden || window != r.win->Name) continue;
+        item = observedRecord(r);
+        return true;
+    }
+    return false;
 }
 
 const nlohmann::json& observedWindows() {

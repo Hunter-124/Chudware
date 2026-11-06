@@ -9,12 +9,10 @@
 //                         normalization, text-join-vs-array message branch.
 //   llamacpp_provider   — == OpenAIProvider with a loopback base_url (the process-
 //                         management half stays a host concern, out of scope here).
-//   mock_provider       — MockProvider + RoleScriptedProvider (no network).
+//   mock_provider       — MockProvider (no network).
 //
-// The request BUILDERS are kept pure (no network) so they can be golden-tested
-// offline against the Python oracle (tools/cpp_agent_parity.py).
+// The request BUILDERS are kept pure (no network) so they can be unit-tested offline.
 #pragma once
-#include <atomic>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -46,7 +44,7 @@ struct BuiltRequest {
 };
 
 // --- anthropic_provider.py --------------------------------------------------
-extern const char* kAnthropicDefaultModel;  // "claude-opus-4-8"
+extern const char* kAnthropicDefaultModel;  // "claude-opus-5-5"
 // _block(part): text -> {type,text}; image -> {type,source:{type,media_type,data}}.
 json anthropic_block(const json& part);
 // Classify Claude model → "adaptive" | "budget_effort" | "budget" | "none"
@@ -67,7 +65,7 @@ struct ParsedReply {
 ParsedReply anthropic_parse_response(const json& resp);
 
 // --- openai_provider.py -----------------------------------------------------
-extern const char* kOpenAIDefaultModel;  // "gpt-4o"
+extern const char* kOpenAIDefaultModel;  // "gpt-6-sol"
 // _normalize_base_url: strip trailing "/"; append "/v1" if scheme+netloc and path in ("","/").
 // Returns the input unchanged when empty (mirrors the Python `if not base_url: return base_url`).
 std::string openai_normalize_base_url(const std::string& base_url);
@@ -132,24 +130,11 @@ private:
     size_t i_;
 };
 
-// RoleScriptedProvider: returns replies keyed by orchestrator role, sniffed from
-// the system prompt's opening line. role_of() is the public, static sniffer.
-class RoleScriptedProvider {
-public:
-    explicit RoleScriptedProvider(json by_role) : by_role_(std::move(by_role)) {}
-    static std::string role_of(const std::string& system);
-    std::string complete(const std::string& system);
-
-private:
-    json by_role_;  // {role: [reply, ...]}
-};
-
-// --- assist provider (ask.py / pm_assist.py single-call helper) -------------
-// Build a single-call completion fn from a mock descriptor for the in-app assists.
-// Supports {name:"mock", replies:[...]} (flat MockProvider, last repeats),
-// {name:"mock", by_role:{role:[...]}} (RoleScriptedProvider, routed on the system
-// prompt's ROLE: line), and {error:"..."} (signals a provider error via *err,
-// like the Python except branch). Any other descriptor routes through complete().
+// --- assist provider (ask / pm_assist single-call helper) -------------------
+// Build a single-call completion fn from a descriptor for the in-app assists.
+// Supports {name:"mock", replies:[...]} (flat MockProvider, last repeats) and
+// {error:"..."} (signals a provider error via *err, like the Python except branch).
+// Any other descriptor routes through complete().
 // The returned fn ignores `err` for the ask path; pm_assist reads it.
 #include <functional>
 using AssistCompleteFn =
@@ -209,21 +194,6 @@ struct CompleteResult {
     // callers must check is_null() before reading fields.
     json usage = nullptr;
 };
-// Optional live sink for per-provider-call debug events (kind "provider_call").
-// Set for the duration of a design/micro run so complete() can emit without
-// every call site knowing about RunEvents. Thread-local; nullptr = no emit.
-void set_provider_call_emitter(std::function<void(const json&)> emit);
-std::function<void(const json&)>& provider_call_emitter();
-// Optional live sink for incremental token deltas from a STREAMING completion.
-// emit(delta, kind) is called per chunk with kind "text" or "thinking". Set for the
-// duration of a run so the GUI can show continuous output; nullptr = no streaming
-// callback (the completion still streams over the wire, just not forwarded live).
-void set_provider_delta_emitter(std::function<void(const std::string&, const std::string&)> emit);
-std::function<void(const std::string&, const std::string&)>& provider_delta_emitter();
-// Thread the active run's cancel flag into complete()/HTTP for the duration of a call
-// (or whole run). complete() also re-checks between retry/tool-loop iterations.
-void set_provider_cancel_flag(const std::atomic<bool>* flag);
-const std::atomic<bool>* provider_cancel_flag();
 CompleteResult complete(const std::string& provider, const json& cfg, const std::string& system,
                         const json& messages, int max_tokens = 8000);
 

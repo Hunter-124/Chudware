@@ -660,6 +660,23 @@ def build_boardphys(board: dict, step_path: str, components: list, summary: _Sum
     }
 
 
+def boardphys_for_kicad_step(board: dict, step_path: str) -> dict:
+    """Build physics metadata for a KiCad STEP without inventing solid mappings.
+
+    KiCad owns the assembly and may omit models or use labels different from the
+    references. Until those labels are inspected, keep solid_label and body null.
+    """
+    components = [
+        _phys_record(fp, eng_metadata.eng_for_footprint(fp))
+        for fp in board.get("footprints", [])
+        if _is_on_board(fp)
+    ]
+    result = build_boardphys(board, step_path, components, _Summary())
+    result["generated_by"] = "services.ecad.threed.boardphys_for_kicad_step"
+    result["board"]["outline_area_mm2"] = None
+    return result
+
+
 # --------------------------------------------------------------------------- public API
 
 

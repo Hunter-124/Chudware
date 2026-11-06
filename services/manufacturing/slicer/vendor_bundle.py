@@ -14,6 +14,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..print_safety import atomic_print_output, validate_output_path
+
 _META = {"inherits", "renamed_from", "alias", "default_print_profile",
          "default_filament_profile", "default_sla_print_profile",
          "default_sla_material_profile", "bed_model", "bed_texture", "name",
@@ -303,8 +305,7 @@ class ProfileCatalog:
 
 def write_ini(config: dict[str, str], path: Path) -> None:
     """Write only configuration keys; do not unescape vendor G-code strings."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path = validate_output_path(path)
     rows = []
     for key, value in sorted(config.items()):
         if key in _META or key.startswith('compatible_'):
@@ -312,4 +313,5 @@ def write_ini(config: dict[str, str], path: Path) -> None:
         if not re.fullmatch('[a-zA-Z_][a-zA-Z_0-9]*', key) or '\n' in str(value) or '\r' in str(value):
             raise ValueError(f'Invalid INI key/value: {key}')
         rows.append(f'{key} = {value}\n')
-    path.write_text(''.join(rows), encoding='utf-8')
+    with atomic_print_output(path) as stream:
+        stream.write(''.join(rows).encode('utf-8'))

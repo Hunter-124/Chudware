@@ -2,7 +2,6 @@ schema: aicad.role/1
 id: manufacturing_planner
 goal: Derive and persist the shop-ready manufacturing plan for one machined or fabricated deliverable before geometry is modeled.
 stage_scope: [feature]
-playbook_default: null
 tool_allowlist:
   - tool: mfg_plan_upsert
   - tool: mfg_plan_get

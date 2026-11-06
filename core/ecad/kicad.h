@@ -2,8 +2,8 @@
 //
 // S-expressions are parsed into nlohmann::json trees (list -> array, bare
 // symbol/quoted string -> string, int -> integer, float -> double). Importers
-// produce aicad.sch/1 and aicad.pcb/1 documents. Schematic export targets
-// KiCad 7 syntax. KiCad uses +y-down; document coordinates use +y-up.
+// produce aicad.sch/1 and aicad.pcb/1 documents. KiCad uses +y-down;
+// document coordinates use +y-up.
 //
 // Errors: malformed input throws std::runtime_error. The session layer wraps
 // importer failures in its normal OpError envelope.
@@ -24,8 +24,15 @@ nlohmann::json sexpr_parse(const std::string& text);
 // document. Throws std::runtime_error on read/parse failure.
 nlohmann::json import_kicad_sch(const std::string& source);
 
-// Serialize a schematic document to KiCad 7 .kicad_sch S-expression text.
-std::string export_kicad_sch(const nlohmann::json& sch);
+// Assign missing KiCad v4 UUIDs in-place before saving. Writers never mutate
+// the document or invent identities.
+void assign_uuids(nlohmann::json& doc);
+std::string write_kicad_sch(const nlohmann::json& sch);
+std::string write_kicad_pcb(const nlohmann::json& board);
+
+// Convert a resolved library node into the native library representation.
+nlohmann::json symbol_def(const nlohmann::json& node, const std::string& nickname);
+nlohmann::json footprint_def(const nlohmann::json& node, const std::string& fpid);
 
 // Parse a .kicad_sym library. Unqualified symbol names remain unqualified
 // because the library nickname is not encoded in the file itself.

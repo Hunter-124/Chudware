@@ -1,0 +1,30 @@
+FROM fedora:44
+
+# Keep the system dependency layer independent of the Python requirements.
+COPY .github/scripts/install-fedora-deps.sh /tmp/install-fedora-deps.sh
+RUN bash /tmp/install-fedora-deps.sh gate && rm /tmp/install-fedora-deps.sh
+
+COPY requirements.txt /tmp/chudware-requirements.txt
+RUN python3.13 -m venv /opt/chudware-venv && \
+    /opt/chudware-venv/bin/python -m pip install --disable-pip-version-check \
+        -r /tmp/chudware-requirements.txt pytest==9.1.1 && \
+    rm /tmp/chudware-requirements.txt
+
+ENV PATH="/opt/chudware-venv/bin:${PATH}" \
+    CHUDWARE_GATE_PYTHON=/opt/chudware-venv/bin/python \
+    CHECK_PYTHON=/opt/chudware-venv/bin/python
+
+# Compiler cache shared by every slot on a machine (testbox mounts it at /ccache):
+# a fresh slot or a reconfigured tree reuses object files instead of recompiling.
+# pytest-xdist (with its only dependency, execnet) lets one pytest invocation spread
+# its files over the CPUs the box was granted; scripts/test_lite.py and gate.sh enable
+# it only when it is importable. Both live in this last layer, so adding or bumping
+# either reuses the cached dependency and venv layers.
+RUN dnf -y install ccache && dnf clean all && \
+    /opt/chudware-venv/bin/python -m pip install --disable-pip-version-check \
+        pytest-xdist==3.8.0 execnet==2.1.2
+ENV PATH="/usr/lib64/ccache:${PATH}" \
+    CCACHE_DIR=/ccache \
+    CCACHE_BASEDIR=/work \
+    CCACHE_COMPILERCHECK=content \
+    CCACHE_MAXSIZE=30G

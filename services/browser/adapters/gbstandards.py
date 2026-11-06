@@ -21,7 +21,7 @@ from __future__ import annotations
 import re
 
 from .. import session as _session
-from . import download_path, provenance_envelope, register
+from . import abs_url, download_path, fail, make_hit, provenance_envelope, quote_query, register, source_failure
 
 SITE = "gbstandards"
 BASE_URL = "http://openstd.samr.gov.cn/bzgk/gb"
@@ -47,8 +47,8 @@ _RESULT_RE = re.compile(
 _GBNO_RE = re.compile(r'(GB(?:/T|/Z)?\s*\d+(?:\.\d+)?(?:-\d+)?)', re.IGNORECASE)
 # Best-effort: a free full-text PDF link on the detail page.
 _PDF_RE = re.compile(r'href="(?P<href>[^"]+\.pdf(?:\?[^"]*)?)"', re.IGNORECASE)
-# Best-effort: markers that the standard is copyright-blocked (adapted / not free).
-_COPYRIGHT_MARKERS = ('采用国际标准', '版权', '不公开', 'copyright', 'not available')
+# Only explicit non-disclosure language establishes that full text is withheld.
+_COPYRIGHT_MARKERS = ('不公开', 'not publicly available')
 
 
 def _strip_tags(text: str) -> str:
@@ -57,60 +57,69 @@ def _strip_tags(text: str) -> str:
 
 class GbStandardsAdapter:
     key = SITE
+    hosts = ("openstd.samr.gov.cn",)
+    result_kinds = ("document",)
+    cad_acquisition = False
+    login_required = False
+    api = False
 
     def search(self, query: str) -> list[dict]:
-        url = SEARCH_URL_TMPL.format(query=query.replace(" ", "+"))
+        url = SEARCH_URL_TMPL.format(query=quote_query(query))
         result = _session.browser_fetch(url, SITE)
         if not result.get("ok"):
-            return [result]
+            return [source_failure(SITE, "search", result, url=url)]
         content = result.get("content", "")
+        if re.search(r"captcha|verify you are (?:a )?human", content, re.I):
+            return [fail(SITE, "search", "captcha", "The site returned a challenge.", url=url)]
+        if re.search(r"access denied|pardon our interruption", content, re.I):
+            return [fail(SITE, "search", "blocked", "The site blocked the request.", url=url)]
         hits = []
         for m in _RESULT_RE.finditer(content):
             number = _strip_tags(m.group("number"))
             name = _strip_tags(m.group("title"))
             title = f"{number} — {name}" if name else number
             gb_match = _GBNO_RE.search(number)
-            hits.append({
-                "title": title,
-                "url": DETAIL_URL_TMPL.format(hcno=m.group("hcno")),
-                "site": SITE,
-                "hcno": m.group("hcno"),
+            hits.append(make_hit(
+                SITE, title=title, url=DETAIL_URL_TMPL.format(hcno=m.group("hcno")),
+                kind="document", extra={"hcno": m.group("hcno"),
                 "gb_number": gb_match.group(1).strip() if gb_match else None,
-            })
+                "transport_warning": "Source uses unencrypted HTTP."}))
+        if not hits and not re.search(r"no results|0 results|没有找到|暂无数据", content, re.I):
+            return [fail(SITE, "search", "parse_failed", "No recognizable standards results.", url=url)]
         return hits
 
     def acquire(self, result: dict) -> dict:
         url = result.get("url", "")
         if not url:
-            return {"ok": False, "reason": "bad_result", "hint": "result has no 'url'"}
+            return fail(SITE, "acquire", "not_found", "result has no 'url'")
 
         page = _session.browser_fetch(url, SITE)
         if not page.get("ok"):
-            return page
+            return source_failure(SITE, "acquire", page, url=url)
         content = page.get("content", "")
+        if re.search(r"captcha|verify you are (?:a )?human", content, re.I):
+            return fail(SITE, "acquire", "captcha", "The site returned a challenge.", url=url)
+        if re.search(r"access denied|pardon our interruption", content, re.I):
+            return fail(SITE, "acquire", "blocked", "The site blocked the request.", url=url)
 
         pdf_match = _PDF_RE.search(content)
         if not pdf_match:
-            # No free PDF: most often an ISO/IEC-adapted standard that is
-            # copyright-held and not freely disclosed. Degrade honestly — there
-            # is no login to offer, so this is a plain ok:false, not login_required.
-            if any(mk in content for mk in _COPYRIGHT_MARKERS):
-                return {"ok": False, "reason": "copyright_blocked",
-                        "hint": "this standard appears to be adapted from an international "
-                                "standard and is copyright-held; no free full text is published"}
-            return {"ok": False, "reason": "no_download_link",
-                    "hint": "no free full-text PDF found on this standard's detail page"}
+            if any(marker in content.lower() for marker in _COPYRIGHT_MARKERS):
+                return fail(SITE, "acquire", "policy_refused",
+                            "The standard is not publicly available.", url=url)
+            return fail(SITE, "acquire", "not_found",
+                        "No free full-text PDF link found on the detail page.", url=url)
 
-        pdf_url = pdf_match.group("href")
-        if pdf_url.startswith("/"):
-            pdf_url = "http://openstd.samr.gov.cn" + pdf_url
+        pdf_url = abs_url(url, pdf_match.group("href"))
+        if not pdf_url:
+            return fail(SITE, "acquire", "parse_failed", "Invalid PDF URL.", url=url)
 
         dest, refusal = download_path(SITE, pdf_url, default="standard.pdf")
         if refusal is not None:
-            return refusal
+            return source_failure(SITE, "acquire", refusal, url=pdf_url)
         outcome = _session.browser_download(pdf_url, SITE, dest)
         if not outcome.get("ok"):
-            return outcome
+            return source_failure(SITE, "acquire", outcome, url=pdf_url)
 
         gb_match = _GBNO_RE.search(content)
         return provenance_envelope(
@@ -118,6 +127,9 @@ class GbStandardsAdapter:
             session_profile_used=outcome.get("session_profile_used", SITE),
             license_note=LICENSE_NOTE,
             artifact_path=outcome["dest"],
+            artifact_kind="document",
+            format="pdf",
+            transport_warning="Source uses unencrypted HTTP." if pdf_url.startswith("http://") else None,
             title=result.get("title", ""),
             gb_number=(gb_match.group(1).strip() if gb_match else result.get("gb_number")),
             hcno=result.get("hcno"),

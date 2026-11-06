@@ -120,6 +120,16 @@ void requestFraming() {
               secret, "answer", json::array({"q1"}), answerFrame, err),
           "answer params must be an object");
 
+    std::string policyFrame;
+    err.clear();
+    check(chudware::worker::detail::buildControlFrame(
+              secret, "apply_compaction_policy", json::object(), policyFrame, err),
+          "policy application uses the authenticated independent control channel");
+    check(json::parse(policyFrame) == json{{"token", secret},
+                                          {"action", "apply_compaction_policy"},
+                                          {"params", json::object()}},
+          "policy application carries no run-scoped arguments");
+
     std::string oversized;
     err.clear();
     check(!chudware::worker::detail::buildControlFrame(

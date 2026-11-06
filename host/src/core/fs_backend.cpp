@@ -2,13 +2,25 @@
 // See fs_backend.h for the contract.
 #include "fs_backend.h"
 
+#include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <chrono>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
+#include <memory>
+#include <mutex>
 #include <system_error>
 #include <stdexcept>
 #include <vector>
+#ifndef __EMSCRIPTEN__
+#include <sys/stat.h>
+#include <thread>
+#include "../ui/anim.h"
+#endif
 
 #include <nlohmann/json.hpp>
 
@@ -59,8 +71,55 @@ std::string pathJoin(const std::string& a, const std::string& b) {
 // ============================================================================
 #ifndef __EMSCRIPTEN__
 
+// directory_entry supplies cached type information on platforms which have it;
+// one native stat supplies size, mtime and the followed-symlink type together.
+FsStat desktopStat(const fs::path& path, std::string& err) {
+    FsStat value;
+#ifdef _WIN32
+    struct _stat64 info;
+    const int rc = _wstat64(path.c_str(), &info);
+#else
+    struct ::stat info;
+    const int rc = ::stat(path.c_str(), &info);
+#endif
+    if (rc != 0) {
+        if (errno != ENOENT && errno != ENOTDIR)
+            err = std::error_code(errno, std::generic_category()).message();
+        return value;
+    }
+    value.exists = true;
+#ifdef _WIN32
+    value.isDir = (info.st_mode & _S_IFMT) == _S_IFDIR;
+    value.isFile = (info.st_mode & _S_IFMT) == _S_IFREG;
+#else
+    value.isDir = S_ISDIR(info.st_mode);
+    value.isFile = S_ISREG(info.st_mode);
+#endif
+    if (value.isFile) value.size = static_cast<uint64_t>(info.st_size);
+    value.mtime = static_cast<int64_t>(info.st_mtime);
+    return value;
+}
+
+bool sameEntries(const std::vector<FsEntry>& a, const std::vector<FsEntry>& b) {
+    return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(),
+        [](const FsEntry& x, const FsEntry& y) {
+            return x.name == y.name && x.isDir == y.isDir &&
+                   x.size == y.size && x.mtime == y.mtime;
+        });
+}
+
 class DesktopFsBackend final : public FsBackend {
 public:
+    ~DesktopFsBackend() override {
+        {
+            std::lock_guard<std::mutex> lock(queueMutex_);
+            stopping_ = true;
+            queue_.clear();
+        }
+        queueReady_.notify_all();
+        for (auto& thread : threads_) if (thread.joinable()) thread.join();
+    }
+
     std::vector<FsEntry> list(const std::string& dir, std::string& err) override {
         err.clear();
         std::vector<FsEntry> out;
@@ -80,22 +139,18 @@ public:
             if (!name.empty() && name[0] == '.') continue;
             FsEntry e;
             e.name = name;
-            std::error_code e2;
-            e.isDir = fs::is_directory(c, e2);
-            if (!e.isDir) {
-                e.size = static_cast<uint64_t>(fs::file_size(c, e2));
-                if (e2) e.size = 0;
-            }
-            auto ft = fs::last_write_time(c, e2);
-            if (!e2) {
-                // Portable file_clock -> system_clock unix seconds.
-                using namespace std::chrono;
-                auto sctp = time_point_cast<system_clock::duration>(
-                    ft - fs::file_time_type::clock::now() + system_clock::now());
-                e.mtime = static_cast<int64_t>(system_clock::to_time_t(sctp));
-            }
+            // Use the iterator's cached type when available; follow symlinks via
+            // the same metadata read that supplies size and modification time.
+            std::error_code typeError;
+            e.isDir = fs::is_directory(it->symlink_status(typeError));
+            std::string metadataError;
+            const auto metadata = desktopStat(c, metadataError);
+            if (metadata.exists) e.isDir = metadata.isDir;
+            e.size = e.isDir ? 0 : metadata.size;
+            e.mtime = metadata.mtime;
             out.push_back(std::move(e));
         }
+        if (ec) err = ec.message();
         return out;
     }
 
@@ -135,25 +190,7 @@ public:
     FsStat stat(const std::string& path, std::string& err) override {
         err.clear();
         FsStat s;
-        std::error_code ec;
-        if (!fs::exists(path, ec) || ec) {
-            if (ec) err = ec.message();
-            return s;
-        }
-        s.exists = true;
-        s.isDir  = fs::is_directory(path, ec);
-        s.isFile = fs::is_regular_file(path, ec);
-        if (s.isFile) {
-            auto sz = fs::file_size(path, ec);
-            if (!ec) s.size = static_cast<uint64_t>(sz);
-        }
-        auto ft = fs::last_write_time(path, ec);
-        if (!ec) {
-            using namespace std::chrono;
-            auto sctp = time_point_cast<system_clock::duration>(
-                ft - fs::file_time_type::clock::now() + system_clock::now());
-            s.mtime = static_cast<int64_t>(system_clock::to_time_t(sctp));
-        }
+        s = desktopStat(fs::path(path), err);
         return s;
     }
 
@@ -185,6 +222,162 @@ public:
             return false;
         }
         return true;
+    }
+
+    const FsDirectorySnapshot& pollDirectory(const std::string& dir) override {
+        auto& cache = directories_[dir];
+        cache.visitedAt = browseNow();
+        if (cache.task && cache.task->ready.load(std::memory_order_acquire)) {
+            auto task = std::move(cache.task);
+            auto& next = task->directory;
+            auto& old = cache.snapshot;
+            if (next.state != FsReadState::Error && !sameEntries(old.entries, next.entries)) {
+                old.revision = ++revision_;
+                old.entries = std::move(next.entries);
+            }
+            old.state = next.state;
+            old.error = std::move(next.error);
+            old.pending = false;
+            cache.checkedAt = browseNow();
+        }
+        if (!cache.task && browseNow() - cache.checkedAt >= 2.0) {
+            cache.task = enqueue(dir, true);
+            cache.snapshot.pending = bool(cache.task);
+        }
+        return cache.snapshot;
+    }
+
+    FsStatSnapshot pollStat(const std::string& path) override {
+        auto& cache = stats_[path];
+        cache.visitedAt = browseNow();
+        if (cache.task && cache.task->ready.load(std::memory_order_acquire)) {
+            cache.snapshot = std::move(cache.task->stat);
+            cache.task.reset();
+            cache.checkedAt = browseNow();
+        }
+        if (!cache.task && browseNow() - cache.checkedAt >= 2.0)
+            cache.task = enqueue(path, false);
+        return cache.snapshot;
+    }
+
+    void invalidateBrowseCache(bool workspaceChanged = false) override {
+        for (auto& item : directories_) {
+            auto& cache = item.second;
+            if (cache.task) cache.task->cancelled = true;
+            cache.task.reset();
+            cache.checkedAt = -1e9;
+            cache.snapshot.pending = false;
+        }
+        for (auto& item : stats_) {
+            auto& cache = item.second;
+            if (cache.task) cache.task->cancelled = true;
+            cache.task.reset();
+            cache.checkedAt = -1e9;
+        }
+        if (workspaceChanged) {
+            directories_.clear();
+            stats_.clear();
+        }
+    }
+
+    void pruneBrowseCache() override {
+        prune(directories_);
+        prune(stats_);
+    }
+
+private:
+    struct ReadTask {
+        std::string path;
+        bool isDirectory = false;
+        std::atomic<bool> ready{false}, cancelled{false};
+        FsDirectorySnapshot directory;
+        FsStatSnapshot stat;
+    };
+    template<class Snapshot> struct Cache {
+        Snapshot snapshot;
+        double checkedAt = -1e9, visitedAt = -1e9;
+        std::shared_ptr<ReadTask> task;
+    };
+    std::map<std::string, Cache<FsDirectorySnapshot>> directories_;
+    std::map<std::string, Cache<FsStatSnapshot>> stats_;
+    uint64_t revision_ = 0;
+    std::mutex queueMutex_;
+    std::condition_variable queueReady_;
+    std::deque<std::shared_ptr<ReadTask>> queue_;
+    std::vector<std::thread> threads_;
+    bool stopping_ = false;
+
+    template<class Map> void prune(Map& cache) {
+        const double cutoff = browseNow() - 10.0;
+        for (auto it = cache.begin(); it != cache.end();) {
+            if (it->second.visitedAt < cutoff) {
+                if (it->second.task) it->second.task->cancelled = true;
+                it = cache.erase(it);
+            } else ++it;
+        }
+        if (cache.size() > 256) {
+            std::vector<typename Map::iterator> unused;
+            for (auto it = cache.begin(); it != cache.end(); ++it)
+                if (!it->second.task) unused.push_back(it);
+            std::sort(unused.begin(), unused.end(), [](const auto& a, const auto& b) {
+                return a->second.visitedAt < b->second.visitedAt;
+            });
+            // Keep queued reads until observed: evicting them on a wide BFS
+            // frontier would repeatedly discard the only completed answers.
+            for (auto it : unused) {
+                if (cache.size() <= 256) break;
+                cache.erase(it);
+            }
+        }
+    }
+
+    std::shared_ptr<ReadTask> enqueue(const std::string& path, bool directory) {
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        if (threads_.empty())
+            for (int i = 0; i < 2; ++i) threads_.emplace_back([this] { readLoop(); });
+        if (queue_.size() >= 64) return {};
+        auto task = std::make_shared<ReadTask>();
+        task->path = path;
+        task->isDirectory = directory;
+        queue_.push_back(task);
+        queueReady_.notify_one();
+        return task;
+    }
+
+    void readLoop() {
+        for (;;) {
+            std::shared_ptr<ReadTask> task;
+            {
+                std::unique_lock<std::mutex> lock(queueMutex_);
+                queueReady_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+                if (stopping_) return;
+                task = std::move(queue_.front());
+                queue_.pop_front();
+            }
+            if (task->cancelled) continue;
+            try {
+                if (task->isDirectory) {
+                    auto& result = task->directory;
+                    result.entries = list(task->path, result.error);
+                    result.state = result.error.empty() ? FsReadState::Ready : FsReadState::Error;
+                    if (!result.error.empty()) {
+                        std::string error;
+                        const auto info = stat(task->path, error);
+                        if (error.empty() && !info.exists) result.state = FsReadState::Missing;
+                    }
+                    std::sort(result.entries.begin(), result.entries.end(),
+                        [](const FsEntry& a, const FsEntry& b) { return a.name < b.name; });
+                } else {
+                    task->stat.value = stat(task->path, task->stat.error);
+                    task->stat.state = task->stat.error.empty() ? FsReadState::Ready : FsReadState::Error;
+                }
+            } catch (const std::exception& e) {
+                task->directory.state = task->stat.state = FsReadState::Error;
+                task->directory.error = task->stat.error = e.what();
+            }
+            task->ready.store(true, std::memory_order_release);
+            ui::anim::wakeLoop();
+        }
     }
 };
 
@@ -240,9 +433,16 @@ public:
         uint64_t epoch;
     };
 
-    void invalidateBrowseCache(bool /*workspaceChanged*/ = false) override {
+    void invalidateBrowseCache(bool workspaceChanged = false) override {
         ++browseEpoch_;
-        directories_.clear();
+        if (workspaceChanged) {
+            directories_.clear();
+        } else {
+            for (auto& item : directories_) {
+                item.second.checkedAt = -1e9;
+                item.second.snapshot.pending = false;
+            }
+        }
     }
 
     static void browseComplete(emscripten_fetch_t* fetch) {
@@ -778,8 +978,9 @@ FsStatSnapshot FsBackend::pollStat(const std::string& path) {
     return result;
 }
 
-void FsBackend::invalidateBrowseCache(bool /*workspaceChanged*/) {
-    browseCache_.clear();
+void FsBackend::invalidateBrowseCache(bool workspaceChanged) {
+    if (workspaceChanged) browseCache_.clear();
+    else for (auto& item : browseCache_) item.second.checkedAt = -1e9;
 }
 
 FsBackend& fsBackend() {
@@ -924,6 +1125,84 @@ void fsTriggerDownload(const std::string& path) {
     }, rel.c_str());
 #else
     (void)path;
+#endif
+}
+
+bool fsDownloadScadProject(const std::string& selectedPath, const std::string& resultJson,
+                           std::string& err) {
+#ifdef __EMSCRIPTEN__
+    std::string selected;
+    if (!workspaceRelativePath(selectedPath, selected, err) || selected.empty() ||
+        selected != selectedPath) {
+        err = "Invalid SCAD export destination";
+        return false;
+    }
+    try {
+        const auto result = nlohmann::json::parse(resultJson);
+        if (!result.is_object() || !result.contains("path") || !result["path"].is_string() ||
+            !result.contains("exported_files") || !result["exported_files"].is_array() ||
+            !result.contains("reused_files") || !result["reused_files"].is_array() ||
+            result["path"].get<std::string>() != "/work/" + selected) {
+            err = "Incomplete or invalid SCAD export manifest";
+            return false;
+        }
+        nlohmann::json body = {{"path", selected}, {"exported_files", nlohmann::json::array()},
+                               {"reused_files", nlohmann::json::array()}};
+        for (const char* key : {"exported_files", "reused_files"}) {
+            for (const auto& entry : result[key]) {
+                if (!entry.is_string()) {
+                    err = "Invalid SCAD export manifest";
+                    return false;
+                }
+                const auto absolute = entry.get<std::string>();
+                if (absolute.compare(0, 6, "/work/") != 0) {
+                    err = "SCAD export manifest contains a path outside the workspace";
+                    return false;
+                }
+                const auto relative = absolute.substr(6);
+                std::string canonical;
+                if (!workspaceRelativePath(relative, canonical, err) || canonical != relative ||
+                    canonical.empty()) {
+                    err = "Invalid SCAD export manifest path";
+                    return false;
+                }
+                body[key].push_back(relative);
+            }
+        }
+        const auto payload = body.dump();
+        EM_ASM({
+            const body = UTF8ToString($0);
+            const filename = UTF8ToString($1);
+            fetch('/workspace/scad-export', {
+                method: 'POST', credentials: 'same-origin',
+                headers: {'Content-Type': 'application/json'}, body
+            }).then(async response => {
+                if (!response.ok) {
+                    let detail = 'HTTP ' + response.status;
+                    try { detail = (await response.json()).detail || detail; } catch (_) {}
+                    throw new Error(detail);
+                }
+                const blob = await response.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                setTimeout(() => URL.revokeObjectURL(url), 60000);
+            }).catch(error => window.alert('SCAD download failed: ' + error.message));
+        }, payload.c_str(), (pathFilename(selected) + ".zip").c_str());
+        return true;
+    } catch (const std::exception&) {
+        err = "Invalid SCAD export manifest";
+        return false;
+    }
+#else
+    (void)selectedPath;
+    (void)resultJson;
+    err = "SCAD project download is only available in the web build";
+    return false;
 #endif
 }
 

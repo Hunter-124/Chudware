@@ -50,7 +50,7 @@ struct FsStatSnapshot {
 
 // Abstract FS. Thread affinity: call from the GL/UI thread. The command APIs below
 // await confirmed results (web uses ASYNCIFY). Rendering MUST use the poll APIs:
-// web polling starts asynchronous reads and returns immediately, without yielding.
+// polling starts asynchronous reads and returns immediately, without yielding.
 class FsBackend {
 public:
     virtual ~FsBackend() = default;
@@ -85,8 +85,12 @@ public:
         err.clear();
         return defaultRoot();
     }
-    // Workspace changes retire in-flight workspace reads.
+    // Ordinary invalidation retains complete snapshots while refreshing them;
+    // workspace changes discard snapshots. Both retire in-flight reads.
     virtual void invalidateBrowseCache(bool workspaceChanged = false);
+    // Explicit invalidation boundary after rendering: evict cold/collapsed browse
+    // data. Like invalidateBrowseCache, this retires snapshot references.
+    virtual void pruneBrowseCache() {}
 
     // ---- convenience (implemented in terms of the above where possible) ----
 
@@ -169,5 +173,8 @@ std::string fsUpload(const std::string& dir, const std::string& filename,
                      const uint8_t* data, size_t len, std::string& err);
 // Trigger a browser download of a server workspace path (GET /workspace/download).
 void fsTriggerDownload(const std::string& path);
+// Download a complete SCAD export using the native export result manifest.
+bool fsDownloadScadProject(const std::string& selectedPath, const std::string& resultJson,
+                           std::string& err);
 
 }  // namespace chudware

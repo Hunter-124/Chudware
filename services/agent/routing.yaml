@@ -52,7 +52,6 @@ assignments:
   feature_architect:      [cheap_local, strong]   # design-pipeline Stage 1
   geometry_designer:      [cheap_local, strong]   # design-pipeline Stage 2
   linkage_planner:        [cheap_local, strong]   # design-pipeline Stage 3
-  department_manager:     [strongest]
   # Additional roles (additive):
   layout_engineer:        [cheap_local, strong]
   sim_engineer:           [strong, cheap_local]
@@ -84,8 +83,8 @@ assignments:
 
 # Hierarchical delegation rails — no hard depth cap.
 # These are advisory soft limits; reaching them emits a warning ledger event
-# but the spawn still proceeds. The kill-switch (kill_delegation_tree tool or
-# DelegationTree.kill()) is the human-controlled hard stop.
+# but the spawn still proceeds. DelegationTree.kill() is the hard stop; no MCP tool or
+# UI control calls it today.
 delegation:
   soft_depth_limit: 8   # emit delegation_depth_warning at or beyond this depth
   max_agents: 64        # emit delegation_agent_limit_warning at or beyond this count

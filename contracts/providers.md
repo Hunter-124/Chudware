@@ -1,8 +1,8 @@
 # Contract: Providers & Session Layer — v1
 
-> The frozen NEUTRAL seam every agent surface shares. Three implementations conform to
-> it: the Python adapters (`services/agent/providers/`), the C++ port
-> (`core/agent/providers.{h,cpp}` + `core/agent/run.cpp`), and external MCP clients that
+> The frozen NEUTRAL seam every agent surface shares. Two implementations conform to
+> it: the Python adapters (`services/agent/providers/`) and the C++ provider/auth helpers
+> (`core/agent/providers.{h,cpp}`, used for connection tests and PropertyManager assist), and external MCP clients that
 > ride the user's own subscription. Adding a provider = one contract-conformant adapter.
 > Append-only: any change to a frozen section needs maintainer sign-off + a version bump
 > (see `contracts/README.md`). The **Prohibited auth** list below is binding and CI-tested.
@@ -64,22 +64,12 @@ Adapters extract it from their native shape: Anthropic `thinking` blocks; Gemini
 `thought: true`; OpenAI-compatible `reasoning_content`/`reasoning` (used as a `text` fallback
 only when `content` is empty). Callers treat `thinking` as advisory display, never as ops.
 
-## 3. Token budgets (frozen defaults)
+## 3. Token budgets
 
-`call_budget_for` (C++ `core/agent/run.cpp:48-63`) is the reference:
-
-| provider class | base `max_tokens` |
-|---|---|
-| local / unknown (llamacpp, local openai, mock) | 4096 |
-| cloud (anthropic, gemini, openai, openrouter) | 8192 |
-| `+ reasoning_effort in {high, max}` | + 4096 headroom |
-
+- Callers pass `max_tokens` explicitly (Python default 8000).
 - An explicit `provider_cfg.max_tokens` overrides (clamped to ≥ 512).
-- The output budget is separately clamped against the provider's context window by
-  `fit_call_budget` (C++ `core/agent/config.cpp`); context windows: anthropic 200000,
-  gemini 1048576, openai 128000, else 8192.
-- Python callers pass `max_tokens` explicitly (default 8000). The 4096/8192 split is the
-  C++ reference the Python side SHOULD converge on when it grows a budget resolver.
+- The output budget is clamped against the provider's context window by the caller's
+  budget resolver; there is no frozen per-provider-class default.
 
 ## 4. Auth kinds (frozen)
 
@@ -203,8 +193,8 @@ an OPTIONAL concrete-provider attribute, NOT a change to the frozen §2 `Provide
 
 A provider MAY expose `adapter: str | None` — the served LoRA-adapter identifier answering a
 given call (`None` = base model). It is opaque state carried into the `model.adapter` slot of
-the `ai_artifact` event (reserved in both the Python
-`services/agent/providers/logging_provider.py` and C++ `core/agent/run.cpp` emit paths), never
+the `ai_artifact` event (reserved in the Python
+`services/agent/providers/logging_provider.py` emit path), never
 a message-schema change. The neutral `complete_ex` signature is untouched. The `vllm` provider
 is offline-safe only on a loopback endpoint (§5), like `llamacpp`.
 
@@ -230,17 +220,19 @@ and new `subscription_usage {provider?} -> {ok, rows:[{provider, account_id, dis
 ## ai_roles thinking (additive)
 
 `config.json` key `ai_roles` role values may be:
-- `"auto"` — model auto-pick; thinking defaults to `auto`
+- `"default"` — follow the chat model; thinking defaults to `auto`
 - `{ "provider", "model", "thinking?" }` — fixed model; optional thinking
-- `{ "mode": "auto", "thinking?" }` — model auto with optional thinking
+- `{ "mode": "size", "size", "thinking?" }` — follow that size tier's assignment
+- `"auto"` / `{ "mode": "auto", "thinking?" }` — legacy ranked auto-pick: still stored, but no
+  longer resolved. Resolution raises `RoleModelError` until the role is reassigned.
 
 `thinking`: `auto` | `low` | `medium` | `high` (default `auto`).
 
 Semantics (services/agent/role_models.py):
 - Concrete level → that role's LLM calls use `reasoning_effort` at that level.
-- `auto` on **default** (main chat) → prompt classifier (`classify_task` + effort map) assigns per prompt.
-- `auto` on subagent roles (task/planning/advisor/plm/redaction/…) → dispatcher may pass optional `effort` on `delegate` / node; else complexity heuristics (rank/task_class/depth), default **medium**.
-- Absent config → Auto → prior behavior plus these assignment paths.
+- `auto` on root chat → the per-turn preferences classifier assigns the effort.
+- `auto` on subagent roles (task/planning/advisor/plm/redaction/…) → dispatcher may pass optional `effort` on `delegate` / node; with none, nothing is sent (runtime default).
+- Absent config → follow the chat model.
 
 RPCs `ai_roles_get` / `ai_roles_set` echo the full map including `thinking`.
 
@@ -280,3 +272,23 @@ Wire ids are the endpoint's real per-model ids — `k3` (1M ctx), `k3-256k`,
 - **Ownership:** Python-owns-refresh (C++ read-only) — same as `anthropic-sub` /
   `codex-sub` / `cursor-sub` / `xai-sub`. Credentials under `config.json`
   `subscription_auth["kimi-sub"]`. Never offline-safe (§5).
+
+## ai_roles overrides and size tiers (additive, 2026-11-04)
+
+Amends "ai_roles thinking" above; the shapes listed there are unchanged. `ai_roles` values
+may additionally be `{ "mode": "size", "size": "small|medium|large", "thinking?" }`
+(follow that size tier's current assignment). `thinking` accepts the full ladder
+`auto|off|minimal|low|medium|high|xhigh|max`. `config.json` `model_sizes[size]` entries also
+carry `thinking` (default `auto`).
+
+`ai_roles` overrides apply only while `config.json` `advanced_overrides` is `true` (missing
+= `false`); otherwise every non-restricted role dispatches through its tier and the stored
+entries are retained but ignored. A `default` (follow chat) entry for a non-restricted role is
+not an override. `redaction`, `private` and root `chat` are unaffected by the switch.
+
+Role thinking resolution (`services/agent/role_models.py`): an enabled override's own
+`thinking`; otherwise the tier's concrete `thinking` for a role dispatched through that tier
+(including a size-reference override without its own `thinking`); otherwise `auto`, where the
+dispatcher may pass `effort` and with none nothing is sent. Contract of record:
+`worker_rpc.md` "Model assignment settings: advanced overrides, size references, tier
+thinking".

@@ -672,7 +672,7 @@ int main(int argc, char** argv) {
     // (datasheet/CAD) through CEF's network stack with the profile's cookies.
     if (argc >= 4 && std::strcmp(argv[1], "--cef-download") == 0) {
         const bool ok = ui::cef::initialize() &&
-                        ui::cef::headless_download(argv[2], argv[3]);
+                        ui::cef::headless_download(argv[2], argv[3]).ok;
         std::fprintf(stderr, "[cef-download] %s -> %s\n", ok ? "OK" : "FAILED", argv[3]);
         ui::cef::shutdown_and_exit(ok ? 0 : 1);  // watchdog'd; does not return
     }

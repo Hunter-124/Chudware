@@ -42,7 +42,6 @@ Rules:
     {"method": "ecad_fill_zones",    "note": "ECAD, C++"},
     {"method": "ecad_simulate",      "note": "ECAD, C++"},
     {"method": "parts_catalog_list", "note": "parts catalog, C++-only"},
-    {"method": "get_prompts_v2",     "note": "agent prompt catalog, C++"},
     {"method": "config_list",        "note": "config, C++"},
     {"method": "sim_cancel",         "note": "sim cancel registry, C++"},
     {"method": "fw_new_project",     "note": "firmware scaffold, C++"},
@@ -98,7 +97,7 @@ Desktop/native dispatch, filesystem paths and session files are unaffected.
   IDBFS sessions directory or runtime JSONL path as a run/session identity. Handles
   are preserved byte-for-byte, bound to local chats, and persisted explicitly as
   `cell_session_id`; historical native runtime ids are not adopted as cell handles.
-  Resume, compaction, voice and recovery actions use this binding. Branch/rewind
+  Resume, compaction, voice and recovery actions use this binding. Branch
   commits replace it with the returned child handle.
 - Browser Stop is always per-job and exact-handle. Stop before mint records a
   pending cancellation; on mint completion that exact run is cancelled and its
@@ -124,3 +123,12 @@ Regression coverage: `host/tests/test_agent_job_routing.cpp` exercises workspace
 normalization and rejected boundaries, opaque mint/resume handles, malformed
 mint replies, per-job pending Stop and exact protocol/method admission. Parent
 verification includes native host tests and the WASM build.
+
+## KiCad integration — contract revision 2
+
+This supersedes the earlier `ecad_import_kicad` note: it is an MCP open operation,
+not a distinct worker RPC; `ecad_open` opens KiCad files and projects use
+`ecad_open_project`. Launching the KiCad project manager, schematic editor or PCB
+editor is desktop-only and hidden or disabled through `web_capabilities` on web.
+The `kicad-cli` checks and exports run where hostd runs, subject to the installed
+tool and the browser's existing RPC admission and filesystem boundaries.

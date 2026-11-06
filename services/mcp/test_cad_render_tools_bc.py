@@ -39,6 +39,63 @@ def block(tmp_path, monkeypatch):
         cc.cb.call("doc_close", {"doc_id": doc})
 
 
+@pytest.mark.parametrize("target", [
+    '{"point":[30,0,10],"radius":12}',
+    '[30,0,10]',
+])
+def test_render_views_accepts_json_encoded_point(block, target):
+    doc, _faces = block
+    tools = _Tools()
+    render.register_cad_render_tools(tools)
+    image, caption = tools.tools["render_views"](
+        doc_id=doc, target=target, views=["front"], annotate=False)
+    assert image.path and "point" in caption
+
+
+def test_structured_target_normalization_preserves_selector_strings():
+    assert render._normalize_target('{"of":"face","side":"top"}') == {"of": "face", "side": "top"}
+    assert render._normalize_target('["f1","f2"]') == ["f1", "f2"]
+    assert render._normalize_target('"f1"') == '"f1"'
+    assert render._normalize_target("top") == "top"
+
+
+def test_render_views_frames_world_point_and_marks_each_camera(block, monkeypatch):
+    import numpy as np
+    from PIL import Image
+
+    doc, _faces = block
+    point = [30, 0, 10]
+    rendered = []
+    original = render._render_view_png
+
+    def observe(*args, **kwargs):
+        result = original(*args, **kwargs)
+        rendered.append(result)
+        return result
+
+    monkeypatch.setattr(render, "_render_view_png", observe)
+    tools = _Tools()
+    render.register_cad_render_tools(tools)
+    image, _caption = tools.tools["render_views"](
+        doc_id=doc, target={"point": point, "radius": 12},
+        views=["front", "top"], annotate=False)
+    assert len(rendered) == 2
+    colour = np.asarray(cc._HIGHLIGHT_PALETTE[0][0])
+    for tile, frame, _result in rendered:
+        with Image.open(tile) as im:
+            pixels = np.asarray(im.convert("RGB"))
+        height, width = pixels.shape[:2]
+        projected = cc._screen_xyz([point], frame)[0]
+        assert abs(projected[0] - width / 2) < 1
+        assert abs(projected[1] - height / 2) < 1
+        x, y = int(round(projected[0])), int(round(projected[1]))
+        assert np.array_equal(pixels[y, x + 10], colour)
+    # The deliverable sheet retains both cameras' world-point evidence.
+    with Image.open(image.path) as im:
+        sheet = np.asarray(im.convert("RGB"))
+    assert np.count_nonzero(np.all(sheet == colour, axis=2)) >= 100
+
+
 @pytest.mark.parametrize("targeted", [False, True])
 @pytest.mark.parametrize("stored_as", ["query", "sid", "gui"])
 def test_persisted_fixed_and_loaded_faces_are_covered(block, monkeypatch, targeted, stored_as):

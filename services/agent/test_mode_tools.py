@@ -7,7 +7,7 @@ Covers work items C3/D/E/F (Python path) + shared-defaults / tool-categories:
   * resolve_categories expands packs with a cap
   * role_for_copilot_mode mapping
   * advisor_enabled default True (+ env override)
-  * mode_options_from_mapping couples swarm→corporate_force, plan→plan_only
+  * mode_options_from_mapping couples plan→plan_only
 No network, no engine.
 """
 from __future__ import annotations
@@ -56,7 +56,7 @@ class TestRoleForCopilotMode:
         assert rm.harness_role_for_mission_role("reviewer") == "vision"
         assert rm.harness_role_for_mission_role("advisor") == "advisor"
         assert rm.harness_role_for_mission_role("overseer") == "planning"
-        assert rm.harness_role_for_mission_role("feature_modeler") == "task"
+        assert rm.harness_role_for_mission_role("feature_modeler") == "model3d"
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +177,6 @@ class TestModeToolAllowlists:
         assert "describe_part" in tools
         # Mode card excludes new_part; shared floor re-adds it.
         assert "new_part" not in tools
-        assert "corporate_activate" not in tools
         out = cmt.apply_mode_tools("edit", None)
         assert out is not None
         assert "add_features" in out
@@ -188,7 +187,6 @@ class TestModeToolAllowlists:
         assert "save_part" in out
         assert "advise" in out
         assert "enable_tools" in out
-        assert "corporate_activate" not in out
 
     def test_agent_unrestricted(self):
         assert cmt.tools_for_mode("agent") is None
@@ -227,7 +225,7 @@ class TestModeToolAllowlists:
         out = cmt.apply_mode_tools("swarm", ["add_features"])
         assert "add_features" in out
         assert "delegate" in out
-        assert "corporate_activate" in out
+        assert "coordinate_board" in out
         for tool in ("fs_write", "fs_edit", "fs_list", "research_fetch_page"):
             assert tool in out, (tool, out)
         assert "run_shell" not in out
@@ -288,10 +286,10 @@ class TestModeToolAllowlists:
         assert cmt.is_tool_allowed("ecad_place_symbol", "plan") is False
 
     def test_print_media_inventory_is_read_only_and_publish_is_refused_read_only(self):
-        # The main chat advertises both; a user-picked Ask/Plan must keep the drive
-        # inventory but never publish (it writes and retires files on printer media).
-        core = list(tcat.MAIN_CHAT_CORE_TOOLS)
-        assert {"print_media_inventory", "publish_print_media"} <= set(core)
+        # These remain available on demand; mode policy still refuses publishing
+        # on read-only turns.
+        core = [*tcat.MAIN_CHAT_CORE_TOOLS, "print_media_inventory", "publish_print_media"]
+        assert "publish_print_media" not in tcat.MAIN_CHAT_CORE_TOOLS
         for mode in ("ask", "plan"):
             allowed = cmt.apply_mode_tools(mode, core)
             assert "print_media_inventory" in allowed, mode
@@ -377,13 +375,7 @@ class TestModeOptionsFromMapping:
         o = cmt.mode_options_from_mapping(None)
         assert o["mode"] == "agent"
         assert o["plan_only"] is False
-        assert o["corporate_force"] is False
         assert o["advisor"] is True
-
-    def test_swarm_forces_corporate(self):
-        o = cmt.mode_options_from_mapping({"mode": "swarm"})
-        assert o["mode"] == "swarm"
-        assert o["corporate_force"] is True
 
     def test_plan_sets_plan_only(self):
         o = cmt.mode_options_from_mapping({"mode": "plan"})
@@ -394,15 +386,13 @@ class TestModeOptionsFromMapping:
         o = cmt.mode_options_from_mapping({"mode": "agent", "plan_only": False})
         assert o["plan_only"] is False
 
-    def test_scope_and_approved_plan(self):
+    def test_approved_plan(self):
         o = cmt.mode_options_from_mapping({
             "mode": "edit",
-            "scope": {"doc_id": "d1", "feature_ids": ["f1"]},
             "approved_plan": "do the thing",
             "execute_as": "swarm",
             "advisor": False,
         })
-        assert o["scope"]["doc_id"] == "d1"
         assert o["approved_plan"] == "do the thing"
         assert o["execute_as"] == "swarm"
         assert o["advisor"] is False
@@ -447,12 +437,11 @@ class TestAdvisorEnabled:
 
 
 class TestMissionDispatchMode:
-    def test_mode_swarm_sets_corporate_force(self):
+    def test_mode_swarm_normalizes(self):
         from services.agent.mission_dispatch import MissionDispatch
 
         md = MissionDispatch(run_id="r_mode_test", mode="swarm")
         assert md.mode == "swarm"
-        assert md.corporate_force is True
 
     def test_mode_plan_sets_plan_only(self):
         from services.agent.mission_dispatch import MissionDispatch
@@ -466,32 +455,7 @@ class TestMissionDispatchMode:
 
         md = MissionDispatch(
             run_id="r_opts",
-            options={"mode": "edit", "advisor": False, "scope": {"doc_id": "x"}},
+            options={"mode": "edit", "advisor": False},
         )
         assert md.mode == "edit"
         assert md.advisor is False
-        assert md.options.get("scope", {}).get("doc_id") == "x"
-
-
-# ---------------------------------------------------------------------------
-# corporate force alias
-# ---------------------------------------------------------------------------
-
-
-class TestCorporateForceAlias:
-    def test_should_activate_alias(self):
-        from services.agent import corporate as corp
-
-        assert corp.should_activate_corporate is corp.should_use_corporate
-
-    def test_force_true_enables_without_config(self):
-        from services.agent.corporate import should_use_corporate
-
-        tasks = [
-            {"role": "feature_modeler", "task_class": "geometry"},
-            {"role": "cam_programmer", "task_class": "cam"},
-            {"role": "fea_analyst", "task_class": "sim"},
-        ]
-        # force=True should not require corporate_mode config on
-        assert should_use_corporate(tasks, cfg={"agent": {"corporate_mode": False}}, force=True) is True
-        assert should_use_corporate(tasks, cfg={"agent": {"corporate_mode": False}}, force=False) is False

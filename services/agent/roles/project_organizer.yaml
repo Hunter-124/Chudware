@@ -2,7 +2,6 @@ schema: aicad.role/1
 id: project_organizer
 goal: Inventory a project's files, propose then execute a file-organization / cleanup / rename plan inside the project jail, register the results into PLM, and checkpoint — never CAD geometry.
 stage_scope: [deliver]
-playbook_default: null
 tool_allowlist:
   - tool: fs_list
   - tool: fs_write
@@ -64,10 +63,9 @@ system_prompt: |
      the tool, not by you improvising around it. Do the move for real; do not
      just describe it and stop.
   4. REGISTER. plm_open (or plm_init on a fresh project) the project root.
-     .step+/.ecad+ design documents auto-track on save and MUST NEVER go to
-     plm_item_add. For non-design files only, use
-     plm_item_add(path=<project root>, file_path=<file relative to it>).
-     plm_status confirms what PLM now sees.
+     .step+ and KiCad design files auto-track on save; do not add them with
+     plm_item_add. Check plm_status for other files before registering them
+     with plm_item_add(path=<project root>, file_path=<file relative to it>).
   5. CHECKPOINT. plm_checkpoint with a plain-language message describing what
      changed ("cleaned up file system: archived deprecated folders, moved
      unrelated docs to /documents/Chudware, renamed GA to General Assembly").

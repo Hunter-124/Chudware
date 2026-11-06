@@ -6,10 +6,13 @@ plus datasheet/SDS PDF links. ``acquire`` therefore emits canonical machining
 params (:func:`~._retail.normalize_machining_params`) for cutting tools and
 downloads the first qualifying datasheet/SDS PDF alongside the record.
 
-Parse strategy: JSON-LD Products for search; spec table + JSON-LD on the
-product page. Challenge pages degrade to ``login_required`` — never solved.
+Parse strategy: JSON-LD or rendered product cards for search; spec table and
+JSON-LD on product pages. Challenges are reported, never solved.
 """
 from __future__ import annotations
+import re
+
+from ._rendered_cards import first, parse
 
 from . import register
 from ._retail import RetailAdapter
@@ -25,7 +28,7 @@ LICENSE_NOTE = (
     "user's own session for their own use. See contracts/license_debt.md."
 )
 
-_LOGIN_WALL_MARKERS = ("Sign In", 'id="signInEmail"', "Create Account to See Your Price")
+_LOGIN_WALL_MARKERS = ('id="signInEmail"', "Create Account to See Your Price")
 # "Whoops, we couldn't find that." is Grainger's edge/bot-block page (served with
 # HTTP 200 for the homepage and every search URL alike when traffic looks
 # non-residential/automated) — confirmed via a live probe 2026-07-07. Without this
@@ -42,6 +45,23 @@ class GraingerAdapter(RetailAdapter):
     license_note = LICENSE_NOTE
     login_wall_markers = _LOGIN_WALL_MARKERS
     challenge_markers = _CHALLENGE_MARKERS
+    currency = "USD"
+
+    def parse_search(self, content: str) -> list[dict]:
+        hits = super().parse_search(content)
+        if hits:
+            return hits
+        root = parse(content)
+        for card in root.find_all(lambda n: n.attrs.get("data-testid") == "product-detail-wrapper"):
+            link = first(card, lambda n: n.tag == "a" and n.attrs.get("data-testid") == "product-detail-title")
+            image = first(card, lambda n: n.tag == "img" and n.attrs.get("data-testid") == "scaled-image")
+            if not link or not link.attrs.get("href") or not link.text():
+                continue
+            price = re.search(r"\$\s*([\d,]+(?:\.\d{2})?)", card.text())
+            hits.append({"title": link.text(), "url": link.attrs["href"],
+                         "thumbnail": image.attrs.get("src") if image else None,
+                         "price": price.group(1) if price else None})
+        return hits
 
 
 ADAPTER = register(GraingerAdapter())

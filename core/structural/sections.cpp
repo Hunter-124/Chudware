@@ -35,7 +35,9 @@ std::string key_lower(const std::string& s) {
 }  // namespace
 
 std::optional<nlohmann::json> get_aisc_section(const std::string& name) {
-    const std::string key = key_upper(name);
+    std::string key = key_upper(name);
+    if (key.rfind("AISC360:", 0) == 0) key.erase(0, 8);
+    else if (key.rfind("AISC:", 0) == 0) key.erase(0, 5);
     for (const AiscShape& s : kAiscShapes) {
         if (key == s.name) {
             return nlohmann::json{
@@ -51,8 +53,9 @@ std::optional<nlohmann::json> get_aisc_section(const std::string& name) {
 std::optional<nlohmann::json> get_lumber_section(const std::string& nominal) {
     // The oracle table is keyed by lowercase nominal ("2x4"); it also accepts
     // an uppercase key if one exists in the table (none do today).
-    const std::string lower = key_lower(nominal);
-    const std::string upper = key_upper(nominal);
+    std::string lower = key_lower(nominal);
+    if (lower.rfind("nds:", 0) == 0) lower.erase(0, 4);
+    const std::string upper = key_upper(lower);
     for (const LumberShape& s : kLumberShapes) {
         if (lower == s.name || upper == s.name) {
             return nlohmann::json{

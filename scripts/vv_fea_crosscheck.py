@@ -1869,6 +1869,13 @@ def build_report(elapsed: float, figures: list[str]) -> str:
     A("")
     A("## Provenance")
     A("")
+    A("> **Provenance caveat.** The shared `-dirty` build label is not a unique binary "
+      "identity: different binaries can carry the same label. In the measurements "
+      "described in the corroborated findings, PLATE-HOLE Tier-1 tet10 stress rows "
+      "were rerun after the recovery fix, while the Tier-2 tet10 stress rows used "
+      "the earlier recovery. The associated `reruns` record distinguishes those "
+      "measurements.")
+    A("")
     A(_table(["item", "value"], [
         ["engine build id", f"`{eng.get('engine_build_id', 'n/a')}`"],
         ["solver", f"`{eng.get('solver', 'n/a')}`"],

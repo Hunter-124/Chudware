@@ -1,17 +1,22 @@
-"""role_models.py — per-role model assignment + auto ranking pick.
+"""role_models.py — per-role model assignment.
 
 Contract:
-  * config.json ``ai_roles`` maps role → ``{provider, model}`` | ``"auto"``
+  * config.json ``ai_roles`` maps role → ``{provider, model}`` | ``"default"``
     for: advisor | task | planning | vision | default | plm | redaction.
   * Each role entry MAY also carry ``thinking``: ``"auto"|"low"|"medium"|"high"``
     (default ``"auto"``). Concrete levels pin that role's LLM reasoning effort;
-    ``auto`` on default/main lets the prompt classifier assign effort, and on
-    subagent roles lets the dispatcher assign effort from task complexity.
-  * Rankings live in ``model_rankings.yaml`` (shipped) + measured leaderboard
-    + user overrides. Precedence: user > measured > shipped.
-  * ``resolve_role_model(role, cfg, ...)`` honours ``ai_roles``; ``"auto"`` picks
-    the cheapest enabled provider meeting a difficulty-derived rank threshold.
+    ``auto`` defers to the dispatcher's per-spawn effort, or to the runtime default.
+  * ``resolve_role_model(role, cfg)`` honours ``ai_roles``. A legacy stored
+    ``"auto"`` (ranked pick) is no longer resolved; it must be reassigned.
   * Redaction role HARD-refuses non-loopback providers.
+  * ``advanced_overrides`` (config.json, default off) gates per-role overrides: while off
+    every non-restricted role dispatches through its size tier (``ROLE_SIZES`` →
+    ``model_sizes``) and stored ``ai_roles`` overrides are retained but ignored. Root chat and
+    the restricted ``redaction``/``private`` seats are never gated.
+  * An override is ``fixed``/``auto`` or ``{mode: "size", size, thinking?}`` (follow that
+    tier's current assignment). Default (follow chat) is not an override for a tier role.
+  * Each ``model_sizes[size]`` carries ``thinking``; a concrete tier effort applies to every
+    role dispatched through that tier unless an enabled override sets its own thinking.
 
 This module is the resolution seam for node_runner / mission_dispatch /
 Settings RPCs. It does NOT construct Provider objects and does NOT own
@@ -19,32 +24,21 @@ Settings RPCs. It does NOT construct Provider objects and does NOT own
 """
 from __future__ import annotations
 
-import os
 import json
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 import re
-from functools import lru_cache
-import copy
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Mapping
 from urllib.parse import urlparse
-
-import yaml
 
 log = logging.getLogger(__name__)
 
-RANKINGS_SCHEMA = "aicad.model_rankings/1"
 AI_ROLES_KEY = "ai_roles"
-# User overrides for rankings, read from config. Distinct from ai_roles.
-USER_RANKINGS_KEY = "model_rankings"
 
-# Third assignment form, beside "auto" (ranked pick) and a fixed {provider, model}:
-# follow whatever model the chat composer is currently set to. Resolution yields an
-# assignment with EMPTY provider/model and mode == SESSION_DEFAULT; the caller keeps
-# its ambient provider rather than constructing one. This exists because "auto" ranks
-# across every enabled provider and will happily route a subagent to a provider the
-# user never picked (and whose key may be dead) while their chat sits on another.
+# Assignment form beside a fixed {provider, model}: follow whatever model the chat
+# composer is currently set to. Resolution yields an assignment with EMPTY
+# provider/model and mode == SESSION_DEFAULT; the caller keeps its ambient
+# provider rather than constructing one.
 SESSION_DEFAULT = "default"
 
 # Roles the Settings GUI / Contract expose. routing.yaml roles still resolve via
@@ -82,10 +76,44 @@ ROLE_MODEL_KEY_ALIASES: dict[str, str] = {
     "re_modeler": "reveng",
     "re_datasheet_reader": "reveng",
     "re_geometry_verifier": "reveng",
+    "general_agent": "task",
+    "geometry_designer": "model3d",
+    "sketcher": "sketch2d",
+    "spec_writer": "drawing",
+    "feature_architect": "planning",
+    "sourcing_specialist": "plm",
+    "assembly_fit_engineer": "model3d",
+    "fixer": "model3d",
+    "feature_modeler": "model3d",
+    "manufacturing_planner": "planning",
+    "project_organizer": "planning",
+    "reviewer": "vision",
+    "overseer": "planning",
+    "orchestrator": "planning",
+    "linkage_planner": "planning",
+    "intake_analyst": "default",
+    "design_thinker": "planning",
+    "clarifier": "task",
 }
 
+# Private seats are deliberately not mapped to cloud-capable size assignments.
+ROLE_SIZES: dict[str, str] = {
+    "chat": "large", "worker": "medium", "advisor": "large", "task": "medium",
+    "planning": "large", "vision": "large", "default": "large", "plm": "small",
+    "sketch2d": "medium", "model3d": "large", "memory": "small", "cam": "large",
+    "sim": "large", "ecad": "large", "drawing": "medium", "reveng": "large",
+}
+ROLE_SIZES.update({alias: ROLE_SIZES[target] for alias, target in ROLE_MODEL_KEY_ALIASES.items()})
+MODEL_SIZES = ("small", "medium", "large")
+ASSIGNMENT_MODE_KEY = "assignment_mode"
+MODEL_SIZES_KEY = "model_sizes"
+# Master switch for per-role overrides (config.json key, missing = off).
+ADVANCED_OVERRIDES_KEY = "advanced_overrides"
+# Seats that never dispatch through a size tier and are never gated by the switch above.
+RESTRICTED_ROLES = ("private", "redaction")
+
 # Per-role reasoning / thinking effort levels (Settings → AI → Model roles).
-THINKING_LEVELS = ("auto", "low", "medium", "high", "xhigh", "max")
+THINKING_LEVELS = ("auto", "off", "minimal", "low", "medium", "high", "xhigh", "max")
 DEFAULT_THINKING = "auto"
 CONCRETE_THINKING = frozenset(THINKING_LEVELS[1:])
 
@@ -98,32 +126,9 @@ def clamp_subagent_effort(level: Any) -> str | None:
     return ("medium" if value == "med" else value) or None
 
 
-def clamp_provider_effort(provider: Any) -> Any:
-    """Normalize a legacy effort spelling on a child provider, preserving its parent.
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
 
-    Richer rungs must reach the chosen model: the online RPC clamps against the
-    catalog after selection, rather than capping every sub-agent at high.
-    Return the original instance when no normalization is needed.
-    """
-    try:
-        raw = getattr(provider, "reasoning_effort", None)
-        clamped = clamp_subagent_effort(raw)
-        if clamped is None or clamped == raw:
-            return provider
-        rebound = copy.copy(provider)
-        setattr(rebound, "reasoning_effort", clamped)
-        return rebound
-    except Exception:  # noqa: BLE001 — provider selection must never raise here
-        return provider
-
-_RANKINGS_YAML = Path(__file__).resolve().parent / "model_rankings.yaml"
-_DEFAULT_LEADERBOARD = (
-    Path(__file__).resolve().parents[2] / "benchmarks" / "leaderboard" / "leaderboard.json"
-)
-
-_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"}
-
-# Cost preference for auto-pick: lower = preferred when ranks tie.
+# Provider cost class for assignment telemetry (lower = cheaper):
 # subscription / free / local beat metered API keys.
 _COST_CLASS: dict[str, int] = {
     "llamacpp": 0,
@@ -145,20 +150,6 @@ _COST_CLASS: dict[str, int] = {
     "mock": 0,
 }
 
-# TaskClass → base minimum rank threshold (1–5).
-_TASK_CLASS_MIN_RANK: dict[str, int] = {
-    "simple_part": 1,
-    "simple": 1,          # alias used by auto_pick smoke / leaf prompts
-    "leaf": 1,            # mega-7: VERIFY/DELIVER/INTAKE report nodes
-    "modification": 2,
-    "multi_feature_part": 3,
-    "enclosure": 3,
-    "assembly": 4,
-    "cam_program": 4,
-    "analysis": 4,
-    "unknown": 3,
-}
-
 # Max spawn depth defaults by capability letter (spawn-depth policy).
 _MAX_SPAWN_DEPTH_BY_LETTER: dict[str, int] = {
     "A": 2,
@@ -172,41 +163,18 @@ class RoleModelError(RuntimeError):
     """Raised when a role cannot be resolved (e.g. redaction non-loopback)."""
 
 
-@dataclass(frozen=True)
-class ModelRank:
-    """One ranked model entry after merge."""
-    model_id: str
-    rank: int                       # 1..5
-    source: str                     # shipped | user | measured
-    notes: str = ""
-    provider: str = ""              # optional preferred provider kind
-    pass_rate: float | None = None  # measured only
-    cycles: int = 0
-
-    def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {
-            "rank": int(self.rank),
-            "source": self.source,
-            "notes": self.notes,
-        }
-        if self.provider:
-            d["provider"] = self.provider
-        if self.pass_rate is not None:
-            d["pass_rate"] = self.pass_rate
-        if self.cycles:
-            d["cycles"] = self.cycles
-        return d
+class LocalOnlyRoleModelError(RoleModelError):
+    """A configured model violates the user's local-only policy."""
 
 
 @dataclass(frozen=True)
 class RoleModelAssignment:
-    """Resolved provider+model for one role (or auto pick, or session default)."""
+    """Resolved provider+model for one role (or session default)."""
     role: str
     provider: str
     model: str
-    mode: str                       # "fixed" | "auto" | "default"
-    rank: int | None = None
-    source: str = ""                # ranking source when auto
+    mode: str                       # "fixed" | "default"
+    source: str = ""                # config section the assignment came from
     reason: str = ""
 
     @property
@@ -224,170 +192,16 @@ class RoleModelAssignment:
             "provider": self.provider,
             "model": self.model,
             "mode": self.mode,
-            "rank": self.rank,
             "source": self.source,
             "reason": self.reason,
         }
 
 
-# ---------------------------------------------------------------------------
-# Rankings load / merge
-# ---------------------------------------------------------------------------
-
-
-def _clamp_rank(value: Any, default: int = 3) -> int:
-    try:
-        r = int(value)
-    except (TypeError, ValueError):
-        return default
-    return max(1, min(5, r))
-
-
-def _load_shipped_rankings(path: Path | None = None) -> dict[str, ModelRank]:
-    p = path or _RANKINGS_YAML
-    out: dict[str, ModelRank] = {}
-    if not p.exists():
-        return out
-    try:
-        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-    except Exception as exc:  # noqa: BLE001
-        log.warning("role_models: failed to parse %s: %s", p, exc)
-        return out
-    for raw in data.get("models") or []:
-        if not isinstance(raw, Mapping):
-            continue
-        mid = str(raw.get("id") or "").strip()
-        if not mid:
-            continue
-        out[mid] = ModelRank(
-            model_id=mid,
-            rank=_clamp_rank(raw.get("rank"), 3),
-            source=str(raw.get("source") or "shipped"),
-            notes=str(raw.get("notes") or ""),
-            provider=str(raw.get("provider") or ""),
-        )
-    return out
-
-@lru_cache(maxsize=1)
-def _family_rank_rules() -> tuple[tuple[re.Pattern[str], int, str], ...]:
-    """Shipped family rules complement exact user/measured/shipped model rankings."""
-    try:
-        data = yaml.safe_load(_RANKINGS_YAML.read_text(encoding="utf-8")) or {}
-        return tuple(
-            (re.compile(str(row["pattern"])), _clamp_rank(row["rank"]), str(row.get("provider") or ""))
-            for row in data.get("families", [])
-            if isinstance(row, Mapping) and row.get("pattern") and row.get("rank")
-        )
-    except (OSError, ValueError, yaml.YAMLError, re.error) as exc:
-        log.warning("role_models: failed to load family rankings: %s", exc)
-        return ()
-
-
-def _rank_for(model: str, ranks: Mapping[str, ModelRank]) -> ModelRank | None:
-    """Exact rows win; future canonical aliases inherit a family rank."""
-    bare = model.rsplit("/", 1)[-1]
-    exact = ranks.get(model) or (ranks.get(bare) if bare != model else None)
-    if exact is not None:
-        return exact
-    for pattern, rank, provider in _family_rank_rules():
-        if pattern.fullmatch(bare):
-            return ModelRank(model, rank, "shipped", "catalog family rank", provider)
-    return None
-
-
-def _measured_rank_from_pass_rate(pass_rate: float) -> int:
-    """Map leaderboard pass_rate → rank band (1–5).
-
-    Conservative: perfect pass → 5, zero → demote toward 1. Measured ranks
-    only apply when cycles >= 1 (caller checks).
-    """
-    pr = max(0.0, min(1.0, float(pass_rate)))
-    if pr >= 0.85:
-        return 5
-    if pr >= 0.65:
-        return 4
-    if pr >= 0.40:
-        return 3
-    if pr >= 0.15:
-        return 2
-    return 1
-
-
-# Frontier model id stems: measured C1 gym demotions must not collapse live
-# mission auto_pick to ollama (mega-13: grok-4.5 pass_rate=0 → rank 1 → all
-# BUILD nodes fell back to llama3.2). Keep a floor so subscription/API frontier
-# remains eligible for min_rank≥3/4 analysis/assembly work.
-# mega-14: floor raised 4→5. Evidence: mega-13 attempt-1 measured rank=1 wiped
-# all nodes to ollama; floor=4 still required harness user override rank=5 for
-# analysis min_rank paths that pick frontier only; residual "rank floor ≥5"
-# noted in mega-13 findings TOP residual #4. Rationale: frontier API ids must
-# remain rank 5 so min_rank=4/5 analysis nodes select xai-sub/grok-4.5 without
-# per-run user_rankings pins. Leaves (min_rank=1) still prefer ollama.
-# mega-16: openrouter paid deepseek/deepseek-chat-v3.1 is the live frontier when
-# xAI is spending-limit-blocked — floor it so analysis min_rank does not collapse
-# to ollama-all (axis Y).
-_FRONTIER_RANK_FLOOR_IDS = frozenset({
-    "grok-4.5", "grok-4-5",
-    "claude-opus-4-8", "claude-sonnet-5",
-    "gpt-6-sol", "gpt-5.6-sol", "gemini-2.5-pro",
-    "kimi-k3",
-    "deepseek/deepseek-chat-v3.1", "deepseek-chat-v3.1",
-    "deepseek/deepseek-chat-v3", "deepseek-chat-v3",
-})
-_FRONTIER_MEASURED_FLOOR = 5
-
-# Process-local provider unavailability (mega-16): spending-limit / tier-denied
-# marks xai-sub so auto_pick falls through instead of retry-looping SuperGrok.
-_UNAVAILABLE_PROVIDERS: set[str] = set()
-_UNAVAILABLE_PROVIDER_REASONS: dict[str, str] = {}
-
-
-def mark_provider_unavailable(provider: str, reason: str = "") -> None:
-    """Mark *provider* unavailable for the rest of this process (mega-16).
-
-    Used when xAI returns spending-limit / tier-denied so subsequent
-    ``auto_pick_model`` calls fall through to the next ranked enabled provider
-    instead of retry-looping SuperGrok on every hard node.
-    """
-    p = (provider or "").strip().lower()
-    if not p:
-        return
-    _UNAVAILABLE_PROVIDERS.add(p)
-    if reason:
-        _UNAVAILABLE_PROVIDER_REASONS[p] = str(reason)[:300]
-    # Spending-limit on either xai path blocks both classic and subscription.
-    if p in ("xai", "xai-sub"):
-        _UNAVAILABLE_PROVIDERS.add("xai")
-        _UNAVAILABLE_PROVIDERS.add("xai-sub")
-        if reason:
-            _UNAVAILABLE_PROVIDER_REASONS.setdefault("xai", str(reason)[:300])
-            _UNAVAILABLE_PROVIDER_REASONS.setdefault("xai-sub", str(reason)[:300])
-    log.info("role_models: provider %s marked unavailable (%s)", p, reason or "no reason")
-
-
-def clear_unavailable_providers() -> None:
-    """Test helper — clear process-local unavailable set."""
-    _UNAVAILABLE_PROVIDERS.clear()
-    _UNAVAILABLE_PROVIDER_REASONS.clear()
-
-
-def is_provider_unavailable(provider: str | None) -> bool:
-    """True when *provider* was marked unavailable this process."""
-    p = (provider or "").strip().lower()
-    return bool(p) and p in _UNAVAILABLE_PROVIDERS
-
-
-def unavailable_providers() -> dict[str, str]:
-    """Snapshot of unavailable providers → reason (for harness telemetry)."""
-    return {p: _UNAVAILABLE_PROVIDER_REASONS.get(p, "") for p in sorted(_UNAVAILABLE_PROVIDERS)}
-
-
 def is_provider_unavailable_error(exc: BaseException | str | None) -> bool:
     """True when *exc* is a spending-limit / tier-denied / credits-exhausted class.
 
-    mega-16: SuperGrok returns ``personal-team-blocked:spending-limit`` as
-    XaiTierDeniedError (HTTP 403). Treat as provider-unavailable for auto_pick
-    fall-through — do NOT retry-loop xai.
+    SuperGrok returns ``personal-team-blocked:spending-limit`` as
+    XaiTierDeniedError (HTTP 403); callers treat that as non-retryable.
     """
     if exc is None:
         return False
@@ -418,164 +232,6 @@ def is_provider_unavailable_error(exc: BaseException | str | None) -> bool:
     return False
 
 
-def _openrouter_key_present(cfg: Mapping[str, Any] | None) -> bool:
-    """True when an OpenRouter API key is configured (any supported location).
-
-    mega-16: keys are commonly stored under ``config.keys.openrouter`` (GUI
-    keys map) rather than ``openrouter.api_key`` — honour both so paid frontier
-    auto_pick works without a harness-only env pin.
-    """
-    cfg = cfg or {}
-    or_cfg = cfg.get("openrouter") or {}
-    if isinstance(or_cfg, Mapping) and or_cfg.get("api_key"):
-        return True
-    if cfg.get("openrouter_api_key"):
-        return True
-    if os.environ.get("OPENROUTER_API_KEY"):
-        return True
-    keys = cfg.get("keys") or {}
-    if isinstance(keys, Mapping) and keys.get("openrouter"):
-        return True
-    return False
-
-
-
-def _load_measured_rankings(
-    leaderboard_path: Path | None = None,
-) -> dict[str, ModelRank]:
-    p = leaderboard_path or _DEFAULT_LEADERBOARD
-    out: dict[str, ModelRank] = {}
-    if not p.exists():
-        return out
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except Exception as exc:  # noqa: BLE001
-        log.warning("role_models: failed to parse leaderboard %s: %s", p, exc)
-        return out
-    for entry in data.get("models") or []:
-        if not isinstance(entry, Mapping):
-            continue
-        mid = str(entry.get("id") or "").strip()
-        if not mid:
-            continue
-        try:
-            cycles = int(entry.get("cycles") or 0)
-        except (TypeError, ValueError):
-            cycles = 0
-        if cycles < 1:
-            continue
-        primary = entry.get("primary") or {}
-        try:
-            pass_rate = float(primary.get("pass_rate") or 0.0)
-        except (TypeError, ValueError):
-            pass_rate = 0.0
-        rank = _measured_rank_from_pass_rate(pass_rate)
-        out[mid] = ModelRank(
-            model_id=mid,
-            rank=rank,
-            source="measured",
-            notes=f"leaderboard pass_rate={pass_rate:.3f} cycles={cycles}",
-            provider=str(entry.get("provider") or ""),
-            pass_rate=pass_rate,
-            cycles=cycles,
-        )
-    return out
-
-
-def _load_user_rankings(cfg: Mapping[str, Any] | None) -> dict[str, ModelRank]:
-    if not cfg:
-        return {}
-    raw = cfg.get(USER_RANKINGS_KEY) or {}
-    if not isinstance(raw, Mapping):
-        return {}
-    out: dict[str, ModelRank] = {}
-    for mid, entry in raw.items():
-        mid_s = str(mid).strip()
-        if not mid_s:
-            continue
-        if isinstance(entry, Mapping):
-            out[mid_s] = ModelRank(
-                model_id=mid_s,
-                rank=_clamp_rank(entry.get("rank"), 3),
-                source="user",
-                notes=str(entry.get("notes") or "user override"),
-                provider=str(entry.get("provider") or ""),
-            )
-        else:
-            out[mid_s] = ModelRank(
-                model_id=mid_s,
-                rank=_clamp_rank(entry, 3),
-                source="user",
-                notes="user override",
-            )
-    return out
-
-
-def load_rankings(
-    cfg: Mapping[str, Any] | None = None,
-    *,
-    rankings_path: Path | None = None,
-    leaderboard_path: Path | None = None,
-    include_measured: bool = True,
-) -> dict[str, ModelRank]:
-    """Merge rankings with precedence user > measured > shipped.
-
-    Returns ``{model_id: ModelRank}``.
-    """
-    merged: dict[str, ModelRank] = dict(_load_shipped_rankings(rankings_path))
-    if include_measured:
-        for mid, mr in _load_measured_rankings(leaderboard_path).items():
-            base = merged.get(mid)
-            notes = mr.notes
-            rank = int(mr.rank)
-            # mega-13/14: do not let zero-pass gym rows demote frontier models
-            # below the frontier band (floor=5). analysis min_rank 4–5 must still
-            # select xai-sub/grok-4.5 without per-run user pins.
-            # mega-16: same floor for openrouter paid deepseek frontier.
-            mid_l = str(mid).strip().lower()
-            family_frontier = any(
-                rank_value == _FRONTIER_MEASURED_FLOOR and pattern.fullmatch(mid_l)
-                for pattern, rank_value, _provider in _family_rank_rules()
-            )
-            if (
-                family_frontier
-                or mid_l in _FRONTIER_RANK_FLOOR_IDS
-                or any(mid_l.startswith(stem) for stem in (
-                    "grok-4", "claude-sonnet-4", "claude-opus-4", "gpt-5",
-                    "gemini-2.5-pro", "deepseek/deepseek-chat", "deepseek-chat",
-                ))
-            ):
-                if rank < _FRONTIER_MEASURED_FLOOR:
-                    notes = (
-                        f"{notes}; frontier floor rank>={_FRONTIER_MEASURED_FLOOR} "
-                        f"(was measured {rank}; mega-14 auto_pick)"
-                    )
-                    rank = _FRONTIER_MEASURED_FLOOR
-            if base is not None and base.source == "shipped":
-                notes = f"{notes} (was shipped rank {base.rank})"
-            merged[mid] = ModelRank(
-                model_id=mid,
-                rank=rank,
-                source="measured",
-                notes=notes,
-                provider=mr.provider or (base.provider if base else ""),
-                pass_rate=mr.pass_rate,
-                cycles=mr.cycles,
-            )
-    for mid, mr in _load_user_rankings(cfg).items():
-        base = merged.get(mid)
-        merged[mid] = ModelRank(
-            model_id=mid,
-            rank=mr.rank,
-            source="user",
-            notes=mr.notes or "user override",
-            provider=mr.provider or (base.provider if base else ""),
-            pass_rate=base.pass_rate if base else None,
-            cycles=base.cycles if base else 0,
-        )
-    return merged
-
-
 # ---------------------------------------------------------------------------
 # ai_roles config helpers
 # ---------------------------------------------------------------------------
@@ -590,7 +246,7 @@ def _normalize_thinking(value: Any) -> str:
         return "medium"
     if s in THINKING_LEVELS:
         return s
-    return DEFAULT_THINKING
+    return s
 
 
 def _normalize_role_value(value: Any) -> str | dict[str, str]:
@@ -600,6 +256,8 @@ def _normalize_role_value(value: Any) -> str | dict[str, str]:
     the default and is omitted so legacy ``{provider, model}`` entries round-trip
     unchanged. When model is auto/default but thinking is concrete, return
     ``{mode: <mode>, thinking}`` so both knobs persist.
+    ``{mode: "size", size, thinking?}`` references a size tier and carries neither provider
+    nor model; an unknown size is unusable and degrades to Default.
     Legacy string ``"auto"`` / ``"provider/model"`` are accepted, as is the newer
     ``"default"`` (follow the chat composer's model).
     """
@@ -619,6 +277,14 @@ def _normalize_role_value(value: Any) -> str | dict[str, str]:
         model = str(value.get("model") or "").strip()
         # An explicit mode wins over the presence of stale provider/model keys, so
         # switching a role to Default in Settings does not silently stay pinned.
+        if mode == "size":
+            size = str(value.get("size") or "").strip().lower()
+            if size not in MODEL_SIZES:
+                return SESSION_DEFAULT
+            ref: dict[str, str] = {"mode": "size", "size": size}
+            if thinking != DEFAULT_THINKING:
+                ref["thinking"] = thinking
+            return ref
         if mode == SESSION_DEFAULT:
             if thinking == DEFAULT_THINKING:
                 return SESSION_DEFAULT
@@ -634,24 +300,348 @@ def _normalize_role_value(value: Any) -> str | dict[str, str]:
         return out
     return "auto"
 
+def get_assignment_mode(cfg: Mapping[str, Any] | None = None) -> str:
+    cfg = cfg or {}
+    mode = cfg.get(ASSIGNMENT_MODE_KEY)
+    if mode in ("simple", "advanced"):
+        return mode
+    roles = cfg.get(AI_ROLES_KEY)
+    if isinstance(roles, Mapping) and roles:
+        return "advanced"
+    return "simple"
+
+def advanced_overrides_enabled(cfg: Mapping[str, Any] | None = None) -> bool:
+    """Per-role overrides dispatch only while ``advanced_overrides`` is on (missing = off)."""
+    return (cfg or {}).get(ADVANCED_OVERRIDES_KEY) is True
+
+
+def _follows_chat(entry: Any) -> bool:
+    """True for a normalized ``ai_roles`` entry in Default mode (follow the chat model)."""
+    return entry == SESSION_DEFAULT or (isinstance(entry, Mapping) and entry.get("mode") == SESSION_DEFAULT)
+
+
+def _stored_role_names(cfg: Mapping[str, Any] | None = None) -> set[str]:
+    cfg = cfg or {}
+    stored = cfg.get("active_role_overrides")
+    if isinstance(stored, list):
+        return {str(role) for role in stored}
+    roles = cfg.get(AI_ROLES_KEY)
+    return set(roles) if get_assignment_mode(cfg) == "advanced" and isinstance(roles, Mapping) else set()
+
+
+def stored_role_overrides(cfg: Mapping[str, Any] | None = None) -> set[str]:
+    """Roles that retain a stored override, whether or not the switch currently applies it.
+
+    Default (follow chat) is not an override for a tier-dispatched role: such an entry, and the
+    legacy ``"default"`` string, resolve exactly like no entry. Root chat and the restricted
+    seats are read straight from ``ai_roles`` and keep their entries as stored.
+    """
+    roles = (cfg or {}).get(AI_ROLES_KEY)
+    roles = roles if isinstance(roles, Mapping) else {}
+    return {role for role in _stored_role_names(cfg)
+            if role == "chat" or role in RESTRICTED_ROLES
+            or not _follows_chat(_normalize_role_value(roles.get(role, SESSION_DEFAULT)))}
+
+
+def active_role_overrides(cfg: Mapping[str, Any] | None = None) -> set[str]:
+    """Roles whose stored override dispatch honours: the retained set while the switch is on."""
+    return stored_role_overrides(cfg) if advanced_overrides_enabled(cfg) else set()
+
+
+def legacy_mission_worker_fallback(cfg: Mapping[str, Any] | None = None) -> bool:
+    """Whether untouched mission seats still borrow the ``worker`` override.
+
+    Only ever true with overrides on: flag off is pure tier dispatch.
+    """
+    cfg = cfg or {}
+    if not advanced_overrides_enabled(cfg):
+        return False
+    stored = cfg.get("legacy_mission_worker_fallback")
+    if stored is None:
+        return (get_assignment_mode(cfg) == "advanced"
+                and "active_role_overrides" not in cfg
+                and "worker" in stored_role_overrides(cfg))
+    return bool(stored)
+
+
+def configured_role_key(role: str, cfg: Mapping[str, Any] | None = None) -> str:
+    """Keep an explicitly overridden specialist seat under its own key while overrides are on."""
+    role_s = (role or "default").strip().lower() or "default"
+    roles = (cfg or {}).get(AI_ROLES_KEY)
+    if role_s in active_role_overrides(cfg) and isinstance(roles, Mapping) and role_s in roles:
+        return role_s
+    return ROLE_MODEL_KEY_ALIASES.get(role_s, role_s)
+
+
+def _active_override(role: str, cfg: Mapping[str, Any] | None = None) -> str | dict[str, str] | None:
+    """Normalized override entry dispatch honours for a configured, non-restricted *role*."""
+    roles = (cfg or {}).get(AI_ROLES_KEY)
+    if role in active_role_overrides(cfg) and isinstance(roles, Mapping) and role in roles:
+        return _normalize_role_value(roles[role])
+    return None
+
+
+def _size_reference(entry: Any) -> str | None:
+    """The size tier a normalized override entry follows, or None."""
+    if isinstance(entry, Mapping) and entry.get("mode") == "size":
+        return str(entry.get("size") or "") or None
+    return None
+
+
+def _size_wire(value: Any, *, with_thinking: bool = False) -> dict[str, str]:
+    normalized = _normalize_role_value(value)
+    if isinstance(normalized, Mapping) and normalized.get("mode") == "size":
+        normalized = SESSION_DEFAULT  # a tier assignment cannot reference another size
+    if isinstance(normalized, Mapping):
+        mode = "fixed" if normalized.get("provider") and normalized.get("model") else str(normalized.get("mode") or "auto")
+        wire = {"mode": mode, "provider": str(normalized.get("provider") or ""),
+                "model": str(normalized.get("model") or "")}
+    else:
+        wire = {"mode": normalized, "provider": "", "model": ""}
+    if with_thinking:
+        wire["thinking"] = (_normalize_thinking(normalized.get("thinking"))
+                            if isinstance(normalized, Mapping) else DEFAULT_THINKING)
+    return wire
+
+
+def get_model_sizes(cfg: Mapping[str, Any] | None = None) -> dict[str, dict[str, str]]:
+    raw = (cfg or {}).get(MODEL_SIZES_KEY)
+    raw = raw if isinstance(raw, Mapping) else {}
+    return {size: _size_wire(raw.get(size, SESSION_DEFAULT), with_thinking=True) for size in MODEL_SIZES}
+
+
+def _chat_role_key(cfg: Mapping[str, Any] | None = None) -> str:
+    roles = (cfg or {}).get(AI_ROLES_KEY)
+    if get_assignment_mode(cfg) == "advanced" and (not isinstance(roles, Mapping) or "chat" not in roles):
+        return "default"
+    return "chat"
+
+
+def get_chat_assignment(cfg: Mapping[str, Any] | None = None) -> dict[str, str]:
+    """Effective root-chat assignment for display and online resolution."""
+    if "chat_assignment" in (cfg or {}):
+        return _size_wire(cfg["chat_assignment"])
+    if get_assignment_mode(cfg) == "simple":
+        large = get_model_sizes(cfg)["large"]
+        return {key: large[key] for key in ("mode", "provider", "model")}
+    return _size_wire(get_ai_roles(cfg)[_chat_role_key(cfg)])
+
+
+def role_settings_view(cfg: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    return {"roles": get_ai_roles(cfg), "known_roles": list(KNOWN_ROLES),
+            "assignment_mode": get_assignment_mode(cfg), "model_sizes": get_model_sizes(cfg),
+            "role_sizes": dict(ROLE_SIZES), "chat_assignment": get_chat_assignment(cfg),
+            ADVANCED_OVERRIDES_KEY: advanced_overrides_enabled(cfg),
+            # Retained overrides: stored state, whether or not the switch applies them.
+            "active_role_overrides": sorted(stored_role_overrides(cfg)),
+            "legacy_mission_worker_fallback": legacy_mission_worker_fallback(cfg),
+            "legacy_mission_worker_fallback_exclusions": sorted(
+                (cfg or {}).get("legacy_mission_worker_fallback_exclusions") or ())}
+
+
+def _validate_assignment(value: Any, *, allow_thinking: bool, allow_size: bool = False) -> None:
+    if isinstance(value, str):
+        if value in ("auto", SESSION_DEFAULT) or ("/" in value and all(value.split("/", 1))):
+            return
+        raise ValueError("assignment must be auto, default, or a provider/model")
+    if not isinstance(value, Mapping) or not value:
+        raise ValueError("assignment must be a non-empty mapping")
+    allowed = ({"mode", "provider", "model"} | ({"thinking"} if allow_thinking else set())
+               | ({"size"} if allow_size else set()))
+    if set(value) - allowed:
+        raise ValueError("unknown assignment field")
+    if any(not isinstance(v, str) for v in value.values()):
+        raise ValueError("assignment fields must be strings")
+    modes = ("auto", SESSION_DEFAULT, "fixed", "tier") + (("size",) if allow_size else ())
+    if "mode" in value and value["mode"] not in modes:
+        raise ValueError("invalid assignment mode")
+    if "thinking" in value and value["thinking"] not in THINKING_LEVELS:
+        raise ValueError("invalid thinking level")
+    if value.get("mode") == "size":
+        if value.get("size") not in MODEL_SIZES:
+            raise ValueError("size assignment requires size small, medium or large")
+    elif "size" in value:
+        raise ValueError("size is only valid with mode size")
+
+
+def _requests_tier(role: str, value: Any) -> bool:
+    """True when a role update clears the role's override so it dispatches through its tier.
+
+    ``tier`` always does; Default (follow chat) does too for every role except root chat and
+    the restricted seats, which keep their own Default semantics.
+    """
+    if isinstance(value, Mapping) and value.get("mode") == "tier":
+        return True
+    if role == "chat" or role in RESTRICTED_ROLES:
+        return False
+    return value == SESSION_DEFAULT or (isinstance(value, Mapping) and value.get("mode") == SESSION_DEFAULT)
+
+
+def update_role_settings(params: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate and persist all requested fields under one config lock."""
+    from services.agent import config as agent_config
+
+    keys = {"roles", "model_sizes", "assignment_mode", "chat_assignment", ADVANCED_OVERRIDES_KEY}
+    if not keys.intersection(params):
+        raise ValueError(
+            "roles, model_sizes, chat_assignment, assignment_mode or advanced_overrides required")
+    roles = params.get("roles")
+    sizes = params.get("model_sizes")
+    mode = params.get("assignment_mode")
+    chat = params.get("chat_assignment")
+    if "chat_assignment" in params:
+        _validate_assignment(chat, allow_thinking=False)
+        if _size_wire(chat)["mode"] == "fixed" and not all((_size_wire(chat)["provider"], _size_wire(chat)["model"])):
+            raise ValueError("chat_assignment requires both provider and model")
+    if "roles" in params and not isinstance(roles, Mapping):
+        raise ValueError("roles must be a mapping")
+    if "model_sizes" in params and not isinstance(sizes, Mapping):
+        raise ValueError("model_sizes must be a mapping")
+    if "assignment_mode" in params and mode not in ("simple", "advanced"):
+        raise ValueError("assignment_mode must be simple or advanced")
+    if ADVANCED_OVERRIDES_KEY in params and not isinstance(params[ADVANCED_OVERRIDES_KEY], bool):
+        raise ValueError("advanced_overrides must be a boolean")
+    for role, value in (roles or {}).items():
+        if not isinstance(role, str) or not role.strip():
+            raise ValueError("invalid role")
+        # Root chat is set through chat_assignment; the restricted seats stay on loopback models.
+        sizeless = role == "chat" or role in RESTRICTED_ROLES
+        if sizeless and isinstance(value, Mapping) and ("size" in value or value.get("mode") == "size"):
+            raise ValueError(f"{role} cannot follow a model size")
+        _validate_assignment(value, allow_thinking=True, allow_size=not sizeless)
+    for size, value in (sizes or {}).items():
+        if size not in MODEL_SIZES:
+            raise ValueError("unknown model size")
+        _validate_assignment(value, allow_thinking=True)
+
+    with agent_config.config_lock():
+        cfg = agent_config.read_config_uncached()
+        updates: dict[str, Any] = {}
+        # Snapshot the previously effective root selection before tier edits.
+        previous_chat = get_chat_assignment(cfg)
+        if ("chat_assignment" not in cfg and previous_chat["mode"] == SESSION_DEFAULT
+                and (cfg.get("provider") or cfg.get("model"))):
+            previous_chat = _size_wire({"provider": str(cfg.get("provider") or ""),
+                                        "model": str(cfg.get("model") or "")})
+        updates["chat_assignment"] = _size_wire(chat) if "chat_assignment" in params else previous_chat
+        # Retained overrides are stored state, independent of the switch: a save with
+        # overrides disabled must never drop them.
+        active = stored_role_overrides(cfg)
+        if "legacy_mission_worker_fallback" not in cfg:
+            updates["legacy_mission_worker_fallback"] = (
+                get_assignment_mode(cfg) == "advanced"
+                and "active_role_overrides" not in cfg and "worker" in active
+            )
+        fallback_exclusions = set(cfg.get("legacy_mission_worker_fallback_exclusions") or ())
+        updates["active_role_overrides"] = sorted(active)
+        updates[ADVANCED_OVERRIDES_KEY] = (params[ADVANCED_OVERRIDES_KEY]
+                                           if ADVANCED_OVERRIDES_KEY in params
+                                           else advanced_overrides_enabled(cfg))
+        if roles is not None:
+            current = dict(cfg.get(AI_ROLES_KEY) or {})
+            for role, value in roles.items():
+                if isinstance(value, Mapping) and value.get("mode") == "fixed":
+                    previous = current.get(role)
+                    previous = previous if isinstance(previous, Mapping) else {}
+                    if not (value.get("provider") or previous.get("provider")) or not (value.get("model") or previous.get("model")):
+                        raise ValueError(f"{role} requires both provider and model")
+            tier_roles = {role for role, value in roles.items() if _requests_tier(role, value)}
+            effective_roles = {role: value for role, value in roles.items() if role not in tier_roles}
+            for role in roles:
+                if role in tier_roles:
+                    fallback_exclusions.add(role)
+                else:
+                    fallback_exclusions.discard(role)
+            updates["legacy_mission_worker_fallback_exclusions"] = sorted(fallback_exclusions)
+            for role in roles:
+                if role in tier_roles:
+                    active.discard(role)
+                else:
+                    active.add(role)
+            _apply_role_updates(current, effective_roles)
+            for role in effective_roles:
+                entry = current[role]
+                if isinstance(entry, Mapping) and entry.get("mode") not in ("auto", SESSION_DEFAULT, "size"):
+                    if not entry.get("provider") or not entry.get("model"):
+                        raise ValueError(f"{role} requires both provider and model")
+                if role in RESTRICTED_ROLES:
+                    if entry == SESSION_DEFAULT or (isinstance(entry, Mapping) and entry.get("mode") == SESSION_DEFAULT):
+                        raise ValueError(f"{role} cannot follow the chat model; it requires a loopback provider")
+                    if isinstance(entry, Mapping) and entry.get("provider"):
+                        assert_redaction_loopback(entry["provider"], cfg=cfg)
+            updates[AI_ROLES_KEY] = current
+            updates["active_role_overrides"] = sorted(active)
+        if sizes is not None:
+            current_sizes = get_model_sizes(cfg)
+            for size, value in sizes.items():
+                if isinstance(value, Mapping):
+                    # Start from the stored tier so a model change keeps its thinking and a
+                    # thinking-only update keeps its model.
+                    merged = dict(current_sizes[size])
+                    merged.update(value)
+                    if value.get("mode") in ("auto", SESSION_DEFAULT):
+                        merged.update(provider="", model="")
+                    elif value.get("provider") or value.get("model"):
+                        merged["mode"] = "fixed"
+                    if merged["mode"] == "fixed" and (not merged["provider"] or not merged["model"]):
+                        raise ValueError(f"{size} requires both provider and model")
+                    current_sizes[size] = _size_wire(merged, with_thinking=True)
+                else:
+                    current_sizes[size] = {**_size_wire(value), "thinking": current_sizes[size]["thinking"]}
+            updates[MODEL_SIZES_KEY] = current_sizes
+        if mode is not None:
+            updates[ASSIGNMENT_MODE_KEY] = mode
+        agent_config.save_config(updates, replace=tuple(k for k in (AI_ROLES_KEY, MODEL_SIZES_KEY, "chat_assignment", "active_role_overrides") if k in updates))
+        cfg.update(updates)
+        return role_settings_view(cfg)
+
+
+def _entry_thinking(entry: Any) -> str:
+    return _normalize_thinking(entry.get("thinking")) if isinstance(entry, Mapping) else DEFAULT_THINKING
+
+
+def _tier_thinking(size: str, cfg: Mapping[str, Any] | None = None) -> str:
+    """Concrete effort configured on a size tier, else Auto."""
+    level = get_model_sizes(cfg)[size].get("thinking", DEFAULT_THINKING)
+    return level if level in CONCRETE_THINKING else DEFAULT_THINKING
+
 
 def get_role_thinking(
     role: str,
     cfg: Mapping[str, Any] | None = None,
 ) -> str:
-    """Return the configured thinking level for *role* (auto|low|medium|high).
+    """Return the configured thinking level for *role* (``auto`` or a concrete level).
+
+    * Root chat and the restricted seats read their stored ``ai_roles`` entry, ungated and
+      never from a tier.
+    * Every other role uses an enabled override's own thinking. A size-reference override
+      without its own thinking, and a role with no enabled override (switch off, Default or
+      absent entry), take the thinking of the tier it dispatches through. A fixed or auto
+      override without thinking stays ``auto`` (the dispatcher decides).
 
     Missing role / missing thinking → ``\"auto\"``. Never raises.
     """
     role_s = (role or "default").strip().lower() or "default"
     try:
         roles = get_ai_roles(cfg)
-        entry = roles.get(role_s)
-        if entry is None:
-            entry = roles.get("default", "auto")
-        if isinstance(entry, Mapping):
-            return _normalize_thinking(entry.get("thinking"))
-        return DEFAULT_THINKING
+        if role_s == "chat" or role_s in RESTRICTED_ROLES:
+            key = _chat_role_key(cfg) if role_s == "chat" else role_s
+            if key not in _stored_role_names(cfg):
+                return DEFAULT_THINKING
+            entry = roles.get(key)
+            if entry is None:
+                entry = roles.get("default", "auto")
+            return _entry_thinking(entry)
+        key = configured_role_key(role_s, cfg)
+        override = _active_override(key, cfg)
+        if override is None:
+            size = ROLE_SIZES.get(key, ROLE_SIZES["task"])
+        else:
+            own = _entry_thinking(override)
+            size = _size_reference(override)
+            if own != DEFAULT_THINKING or not size:
+                return own
+        return _tier_thinking(size, cfg)
     except Exception:  # noqa: BLE001
         return DEFAULT_THINKING
 
@@ -660,176 +650,31 @@ def resolve_role_thinking(
     role: str,
     cfg: Mapping[str, Any] | None = None,
     *,
-    request: str | None = None,
-    task_class: str | None = None,
-    node_depth: int = 0,
-    risk: str | None = None,
-    min_rank: int | None = None,
     dispatch_effort: str | None = None,
-    rank: int | None = None,
 ) -> str | None:
-    """Resolve concrete reasoning_effort for *role*, or None to leave unset.
+    """Keep explicit effort exactly; otherwise let the runtime choose its default.
 
-    Semantics:
-      * concrete low|medium|high on the role → that level.
-      * auto on default/main → classifier assigns from *request* / *task_class*
-        (prompt complexity). Falls back to medium when no signal.
-      * auto on subagent roles (task/planning/advisor/plm/redaction/…) → use
-        *dispatch_effort* when the dispatcher set one; else complexity heuristics
-        from task_class / rank / depth; default medium.
-      * Absent config → auto → same paths (current behavior extended, not broken).
-
-    Returns None only when intentionally leaving provider default (should be rare;
-    auto paths return a concrete level, defaulting to medium).
+    A concrete role/tier effort (``get_role_thinking``) wins; an Auto role defers to the
+    dispatcher's ``dispatch_effort``; with neither, ``None`` means pass nothing.
     """
-    if role in ("chat", "worker", "private"):
-        from services.agent.preferences import TASK_CLASS_KINDS, resolve_turn_preferences
-
-        return resolve_turn_preferences(request or "", cfg=cfg,
-            task_kind=TASK_CLASS_KINDS.get(task_class)).thinking
-    role_s = (role or "default").strip().lower() or "default"
-    level = get_role_thinking(role_s, cfg)
-    if level in CONCRETE_THINKING:
+    level = get_role_thinking(role, cfg)
+    if level != DEFAULT_THINKING:
         return level
-
-    # Auto path.
-    if role_s == "default":
-        return classify_prompt_thinking(
-            request or "",
-            task_class=task_class,
-        )
-
-    # Subagent / other roles: dispatcher override first.
-    if dispatch_effort is not None:
-        de = _normalize_thinking(dispatch_effort)
-        if de in CONCRETE_THINKING:
-            return de
-
-    return classify_subagent_thinking(
-        task_class=task_class,
-        node_depth=node_depth,
-        risk=risk,
-        min_rank=min_rank,
-        rank=rank,
-        brief=request,
-    )
-
-
-def classify_prompt_thinking(
-    request: str,
-    *,
-    task_class: str | None = None,
-) -> str:
-    """Assign thinking effort for the main/default chat role (Auto).
-
-    Extends the workflow_router task classifier with an effort field:
-    simple → low, multi-feature/mod → medium, assembly/cam/analysis → high.
-    """
-    cls = (task_class or "").strip().lower()
-    if not cls:
-        try:
-            from services.agent.pipeline.workflow_router import (  # noqa: PLC0415
-                classify_task,
-            )
-            cls = classify_task(request or "").value
-        except Exception:  # noqa: BLE001
-            cls = "unknown"
-    return _task_class_to_thinking(cls, request=request)
-
-
-def classify_subagent_thinking(
-    *,
-    task_class: str | None = None,
-    node_depth: int = 0,
-    risk: str | None = None,
-    min_rank: int | None = None,
-    rank: int | None = None,
-    brief: str | None = None,
-) -> str:
-    """Dispatcher-side effort for subagent roles when thinking is Auto.
-
-    Prefer explicit complexity signals; fall back to medium.
-    """
-    # Rank-based (matches existing mission_dispatch / node_runner heuristics).
-    try:
-        r = int(rank) if rank is not None else None
-    except (TypeError, ValueError):
-        r = None
-    try:
-        mr = int(min_rank) if min_rank is not None else None
-    except (TypeError, ValueError):
-        mr = None
-    eff_rank = r if r is not None else mr
-    if eff_rank is not None:
-        if eff_rank <= 2:
-            return "low"
-        if eff_rank <= 3:
-            return "medium"
-        return "high"
-
-    cls = (task_class or "").strip().lower()
-    if not cls and brief:
-        try:
-            from services.agent.pipeline.workflow_router import (  # noqa: PLC0415
-                classify_task,
-            )
-            cls = classify_task(brief).value
-        except Exception:  # noqa: BLE001
-            cls = ""
-    if cls:
-        return _task_class_to_thinking(cls, request=brief or "")
-
-    risk_s = (risk or "").strip().lower()
-    if risk_s in ("high", "critical"):
-        return "high"
-    if risk_s in ("low",):
-        return "low"
-
-    # Deeper spawns tend to be narrower — slightly lower effort.
-    try:
-        depth = int(node_depth or 0)
-    except (TypeError, ValueError):
-        depth = 0
-    if depth >= 3:
-        return "low"
-
-    return "medium"
-
-
-def _task_class_to_thinking(task_class: str, *, request: str = "") -> str:
-    """Map a TaskClass string to low|medium|high."""
-    cls = (task_class or "unknown").strip().lower()
-    if cls in ("simple_part", "simple", "leaf"):
-        return "low"
-    if cls in ("modification", "multi_feature_part", "unknown"):
-        # Unknown: peek at request length / complexity keywords.
-        if cls == "unknown" and request:
-            lo = request.lower()
-            if any(k in lo for k in (
-                "assembl", "fea", "cfd", "cam", "mission", "full design",
-                "optimize", "prove", "validate",
-            )):
-                return "high"
-            if len(request) < 80 and not any(
-                k in lo for k in ("and then", "then ", "also ", "with ")
-            ):
-                return "low"
-        return "medium"
-    if cls in ("enclosure",):
-        return "medium"
-    if cls in ("assembly", "cam_program", "analysis"):
-        return "high"
-    return "medium"
+    if dispatch_effort:
+        effort = _normalize_thinking(dispatch_effort)
+        if effort != DEFAULT_THINKING:
+            return effort
+    return None
 
 
 def get_ai_roles(cfg: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """Return the full ai_roles map (missing roles default to ``\"auto\"``)."""
+    """Return the full ai_roles map, with absent roles following the chat."""
     raw = (cfg or {}).get(AI_ROLES_KEY) or {}
     if not isinstance(raw, Mapping):
         raw = {}
     out: dict[str, Any] = {}
     for role in KNOWN_ROLES:
-        out[role] = _normalize_role_value(raw.get(role, "auto"))
+        out[role] = _normalize_role_value(raw.get(role, SESSION_DEFAULT))
     for k, v in raw.items():
         if k not in out:
             out[str(k)] = _normalize_role_value(v)
@@ -863,9 +708,16 @@ def _apply_role_updates(current: dict, roles_partial: Mapping[str, Any] | None) 
                 if mode_in in ("auto", SESSION_DEFAULT):
                     merged.pop("provider", None)
                     merged.pop("model", None)
+                    merged.pop("size", None)
                     merged["mode"] = mode_in
+                elif mode_in == "size":
+                    merged.pop("provider", None)
+                    merged.pop("model", None)
                 elif value.get("provider") or value.get("model"):
                     merged.pop("mode", None)
+                    merged.pop("size", None)
+                elif mode_in == "fixed":
+                    merged.pop("size", None)
                 current[role_s] = _normalize_role_value(merged)
                 continue
         current[role_s] = _normalize_role_value(value)
@@ -914,37 +766,6 @@ def set_ai_roles(
     return get_ai_roles(merged_cfg)
 
 
-# ---------------------------------------------------------------------------
-# Difficulty → min rank
-# ---------------------------------------------------------------------------
-
-
-def min_rank_for_difficulty(
-    *,
-    task_class: str | None = None,
-    node_depth: int = 0,
-    risk: str | None = None,
-) -> int:
-    """Compute minimum rank threshold from TaskClass + spawn depth + risk.
-
-    Deeper spawns require *decreasing* difficulty (lower min rank) so cheap
-    models handle leaf work. Risk bumps the floor.
-    """
-    tc = (task_class or "unknown").strip().lower()
-    base = _TASK_CLASS_MIN_RANK.get(tc, 3)
-
-    depth = max(0, int(node_depth or 0))
-    demoted = max(1, base - depth)
-
-    risk_s = (risk or "").strip().lower()
-    if risk_s in ("high", "critical", "destructive"):
-        demoted = min(5, demoted + 1)
-    elif risk_s in ("low", "none", "read_only", "ponder"):
-        demoted = max(1, demoted - 1)
-
-    return demoted
-
-
 def max_spawn_depth_for_capability(
     letter: str | None = None,
     *,
@@ -975,25 +796,18 @@ def check_spawn_depth_policy(
     *,
     letter: str | None = None,
     cfg: Mapping[str, Any] | None = None,
-    task_class: str | None = None,
-    parent_min_rank: int | None = None,
 ) -> dict[str, Any]:
     """Evaluate spawn-depth policy for a proposed child at *depth*.
 
-    Returns ``{ok, max_spawn_depth, depth, min_rank, reason}``. Deeper spawns
-    require decreasing difficulty (min_rank strictly below parent when parent
-    rank is known). ``ok`` is False only when depth exceeds max_spawn_depth.
+    Returns ``{ok, max_spawn_depth, depth, reason}``. ``ok`` is False only when
+    depth exceeds max_spawn_depth.
     """
     max_d = max_spawn_depth_for_capability(letter, cfg=cfg)
-    child_min = min_rank_for_difficulty(task_class=task_class, node_depth=depth)
-    if parent_min_rank is not None and depth > 0:
-        child_min = min(child_min, max(1, int(parent_min_rank) - 1))
     if depth > max_d:
         return {
             "ok": False,
             "max_spawn_depth": max_d,
             "depth": depth,
-            "min_rank": child_min,
             "reason": (
                 f"spawn depth {depth} exceeds max_spawn_depth {max_d} "
                 f"(capability {letter or 'default'})"
@@ -1003,7 +817,6 @@ def check_spawn_depth_policy(
         "ok": True,
         "max_spawn_depth": max_d,
         "depth": depth,
-        "min_rank": child_min,
         "reason": "within policy",
     }
 
@@ -1031,17 +844,19 @@ def provider_is_loopback(
 ) -> bool:
     """True if *provider* is a local loopback-only backend."""
     name = (provider or "").strip().lower()
-    if name in ("llamacpp", "llama.cpp", "llama-cpp", "lmstudio", "ollama", "vllm", "mock"):
+    if name == "mock":
+        return not base_url or host_is_loopback(base_url)
+    if name in ("llamacpp", "llama.cpp", "llama-cpp", "lmstudio", "ollama", "vllm"):
         if base_url:
             return host_is_loopback(base_url)
-        if cfg:
-            for key in ("llamacpp", "vllm", "openai", "lmstudio", "ollama"):
-                sub = cfg.get(key) or {}
-                if isinstance(sub, Mapping) and sub.get("base_url"):
-                    if name in (key, "llamacpp", "llama.cpp") or (
-                        name in ("lmstudio", "ollama") and key == "openai"
-                    ):
-                        return host_is_loopback(str(sub.get("base_url")))
+        key = "llamacpp" if name in ("llama.cpp", "llama-cpp") else name
+        sub = (cfg or {}).get(key) or {}
+        if isinstance(sub, Mapping) and sub.get("base_url"):
+            return host_is_loopback(str(sub["base_url"]))
+        if name in ("lmstudio", "ollama"):
+            sub = (cfg or {}).get("openai") or {}
+            if isinstance(sub, Mapping) and sub.get("base_url"):
+                return host_is_loopback(str(sub["base_url"]))
         return True
     if name in (
         "anthropic", "openai", "gemini", "openrouter", "xai",
@@ -1049,8 +864,6 @@ def provider_is_loopback(
         "claude-cli", "codex-cli",
     ):
         return False
-    if base_url:
-        return host_is_loopback(base_url)
     return False
 
 
@@ -1065,182 +878,16 @@ def assert_redaction_loopback(
         raise RoleModelError(
             f"redaction role HARD-refuses non-loopback provider {provider!r}. "
             f"Configure ai_roles.redaction to a local (llamacpp/lmstudio/ollama/vllm) "
-            f"model on 127.0.0.1/localhost, or set it to \"auto\" with only local "
-            f"providers enabled."
+            f"model on 127.0.0.1/localhost."
         )
-
-
-# ---------------------------------------------------------------------------
-# Enabled providers + auto pick
-# ---------------------------------------------------------------------------
-
-
-def _enabled_providers(cfg: Mapping[str, Any] | None) -> list[dict[str, str]]:
-    """Build the candidate provider+model list from config / defaults.
-
-    Each entry: ``{provider, model, base_url?}``.
-    Honours ``cfg["enabled_providers"]`` when present (list of
-    ``{provider, model}`` or provider name strings). Falls back to common
-    local + free + configured cloud models so auto mode works out of the box.
-    """
-    cfg = cfg or {}
-    out: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-
-    def _add(provider: str, model: str, base_url: str = "") -> None:
-        key = (provider.lower(), model)
-        if not provider or not model or key in seen:
-            return
-        seen.add(key)
-        entry = {"provider": provider.lower(), "model": model}
-        if base_url:
-            entry["base_url"] = base_url
-        out.append(entry)
-
-    explicit = cfg.get("enabled_providers")
-    if isinstance(explicit, list) and explicit:
-        for item in explicit:
-            if isinstance(item, str):
-                if "/" in item:
-                    p, _, m = item.partition("/")
-                    _add(p.strip(), m.strip())
-                continue
-            if isinstance(item, Mapping):
-                _add(
-                    str(item.get("provider") or ""),
-                    str(item.get("model") or ""),
-                    str(item.get("base_url") or ""),
-                )
-        # Drop keyless openrouter even from explicit lists (mega-6 401 wipe).
-        # Also drop process-local unavailable providers (mega-16 spending-limit).
-        if not _openrouter_key_present(cfg):
-            out[:] = [e for e in out if e.get("provider") != "openrouter"]
-        out[:] = [
-            e for e in out
-            if not is_provider_unavailable(str(e.get("provider") or ""))
-        ]
-        return out
-
-    if cfg.get("provider") and cfg.get("model"):
-        _add(str(cfg["provider"]), str(cfg["model"]))
-
-    lcfg = cfg.get("llamacpp") or {}
-    if isinstance(lcfg, Mapping) and (
-        lcfg.get("base_url") or lcfg.get("model") or lcfg.get("models")
-        or lcfg.get("host") or lcfg.get("port")
-    ):
-        base = str(lcfg.get("base_url") or "http://127.0.0.1:1234/v1")
-        for mid in (lcfg.get("models") or []):
-            _add("llamacpp", str(mid), base)
-        if lcfg.get("model"):
-            _add("llamacpp", str(lcfg["model"]), base)
-        for mid in ("qwen3-4b", "gemma3-4b-qat", "gemma4-e4b"):
-            _add("llamacpp", mid, base)
-
-    # Live local Ollama (OpenAI-compatible) — prefer when reachable / configured.
-    ocfg = cfg.get("ollama") or {}
-    if isinstance(ocfg, Mapping) or True:
-        obase = ""
-        if isinstance(ocfg, Mapping):
-            obase = str(ocfg.get("base_url") or "")
-            for mid in (ocfg.get("models") or []):
-                _add("ollama", str(mid), obase or "http://127.0.0.1:11434/v1")
-            if ocfg.get("model"):
-                _add(
-                    "ollama",
-                    str(ocfg["model"]),
-                    obase or "http://127.0.0.1:11434/v1",
-                )
-        # Default small local when Ollama is the common workstation backend.
-        _add("ollama", "llama3.2:latest", "http://127.0.0.1:11434/v1")
-
-    or_cfg = cfg.get("openrouter") or {}
-    # mega-6: only offer OpenRouter when a real key exists. Keyless free models
-    # auto-picked at min_rank≥3 and died as HTTP 401 provider_auth (19/19 nodes).
-    # mega-16: also honour config.keys.openrouter (GUI keys map).
-    has_or_key = _openrouter_key_present(cfg)
-    if has_or_key:
-        if isinstance(or_cfg, Mapping):
-            for mid in (or_cfg.get("models") or []):
-                _add("openrouter", str(mid))
-        # mega-16 paid frontier first (no :free — free pool is 429/day-capped).
-        for mid in (
-            "deepseek/deepseek-chat-v3.1",
-            "qwen/qwen3-coder-30b-a3b-instruct",
-        ):
-            _add("openrouter", mid)
-        # Free-tier OpenRouter candidates (auto_pick ranks them; cost class 1).
-        # mega-24: mistralai/mistral-small:free returns 404 "No endpoints found"
-        # — removed from candidates so leaves don't thrash on dead free ids.
-        for mid in (
-            "nvidia/nemotron-ultra:free",
-            "google/gemma-3-27b-it:free",
-        ):
-            _add("openrouter", mid)
-
-    # Legacy/native callers without Chudcode's live candidate list use its
-    # locally refreshed catalog snapshot, falling back only when offline.
-    def latest(provider: str, pattern: str, fallback: str) -> str:
-        from services.agent.model_catalog import models_dev_rows_for_provider
-        matches = (
-            (tuple(int(piece) for piece in re.findall(r"\d+", mid)), mid)
-            for mid in models_dev_rows_for_provider(provider)
-            if re.fullmatch(pattern, mid)
-        )
-        return max(matches, default=((), fallback))[1]
-
-    if cfg.get("api_key") or (cfg.get("anthropic") or {}).get("api_key"):
-        _add("anthropic", str((cfg.get("anthropic") or {}).get("model") or
-                              latest("anthropic", r"claude-sonnet-\d+(?:-\d+)?", "claude-sonnet-5-5")))
-    if (cfg.get("openai") or {}).get("api_key") or cfg.get("openai_api_key"):
-        _add("openai", str((cfg.get("openai") or {}).get("model") or
-                           latest("openai", r"gpt-\d+(?:\.\d+)?-sol", "gpt-4o")))
-    if (cfg.get("gemini") or {}).get("api_key") or cfg.get("gemini_api_key"):
-        _add("gemini", str((cfg.get("gemini") or {}).get("model") or
-                           latest("google", r"gemini-\d+(?:\.\d+)?-pro(?:-preview)?",
-                                  "gemini-3.1-pro-preview")))
-    if (cfg.get("xai") or {}).get("api_key") or cfg.get("xai_api_key"):
-        _add("xai", str((cfg.get("xai") or {}).get("model") or "grok-4.5"))
-    keys_map = cfg.get("keys") or {}
-    if (cfg.get("moonshot") or {}).get("api_key") or (
-        isinstance(keys_map, Mapping) and keys_map.get("moonshot")
-    ):
-        _add("moonshot", str((cfg.get("moonshot") or {}).get("model") or "kimi-k3"))
-
-    sub = cfg.get("subscription_auth") or {}
-    if isinstance(sub, Mapping):
-        if "xai-sub" in sub or "xai" in sub:
-            # API model id is dotted grok-4.5 (hyphen grok-4-5 → HTTP 400
-            # "Model not found" on attempt-2). Measured demotion is floored
-            # to rank>=4 in load_rankings so auto_pick still selects it.
-            _add("xai-sub", "grok-4.5")
-        if "anthropic-sub" in sub or "claude" in sub:
-            _add("anthropic-sub", "claude-sonnet-4")
-        if "codex-sub" in sub or "codex" in sub:
-            _add("codex-sub", "gpt-5")
-        if "kimi-sub" in sub or "kimi" in sub:
-            _add("kimi-sub", "k3")
-
-    # mega-16: drop process-local unavailable providers (spending-limit etc.)
-    out[:] = [
-        e for e in out
-        if not is_provider_unavailable(str(e.get("provider") or ""))
-    ]
-    return out
-
-
-def _cost_key(provider: str, model: str) -> tuple[int, int, str]:
-    """Sort key: lower cost class first, then stable id."""
-    p = (provider or "").lower()
-    cost = _COST_CLASS.get(p, 9)
-    if p == "openrouter" and (":free" in (model or "") or model.endswith(":free")):
-        cost = 1  # free tier beats subscription for leaf auto_pick
-    return (cost, 0, f"{p}/{model}")
 
 
 def cost_tier_for(provider: str, model: str = "") -> int:
     """Public cost class for assignment telemetry (lower = cheaper)."""
-    return int(_cost_key(provider, model)[0])
+    p = (provider or "").lower()
+    if p == "openrouter" and ":free" in (model or ""):
+        return 1  # free tier beats subscription
+    return _COST_CLASS.get(p, 9)
 
 
 # ---------------------------------------------------------------------------
@@ -1517,7 +1164,7 @@ def domain_tags_from_context(
             tags.append(t)
 
     # Role-level multi-domain PLAN cards.
-    if role in ("orchestrator", "department_manager", "layout_engineer"):
+    if role in ("orchestrator", "layout_engineer"):
         _add("plan")
     if role == "layout_engineer":
         _add("layout")
@@ -1603,7 +1250,7 @@ def is_multi_domain_plan_or_build(
         return False
 
     plan_roles = {
-        "orchestrator", "department_manager", "layout_engineer", "planning",
+        "orchestrator", "layout_engineer", "planning",
     }
     build_roles = {
         "feature_modeler", "assembly_fit_engineer", "geometry_designer",
@@ -1781,166 +1428,11 @@ def parse_leaf_envelope_text(text: str) -> tuple[dict[str, Any] | None, list[str
 
 
 
-def _vision_capability_tier(provider: str, model: str) -> int:
-    """Vision-preference sort tier for auto-pick.
-
-    0 = known vision-capable, 1 = unknown (catalog miss / error),
-    2 = known non-vision. Unknown is permissive: kept as fallback above
-    known-non-vision so we never hard-exclude unresolved models.
-    """
-    try:
-        from services.agent.model_catalog import lookup_model  # noqa: PLC0415
-
-        row = lookup_model(provider, model)
-    except Exception:  # noqa: BLE001
-        return 1
-    if not isinstance(row, Mapping) or "vision" not in row:
-        return 1
-    return 0 if bool(row.get("vision")) else 2
-
-
-def auto_pick_model(
-    *,
-    cfg: Mapping[str, Any] | None = None,
-    task_class: str | None = None,
-    node_depth: int = 0,
-    risk: str | None = None,
-    min_rank: int | None = None,
-    rankings: Mapping[str, ModelRank] | None = None,
-    enabled: Iterable[Mapping[str, str]] | None = None,
-    require_loopback: bool = False,
-    prefer_vision: bool = False,
-) -> RoleModelAssignment:
-    """Pick cheapest enabled provider+model meeting the rank threshold.
-
-    Prefer subscription/free/local over metered. Unknown models (no ranking
-    entry) are treated as rank 2 so they remain usable but don't outrank
-    measured/shipped frontier picks for hard tasks.
-
-    When *prefer_vision* is True (vision harness role auto-pick), candidates
-    are ordered vision-capable first, then unknown capability, then known
-    non-vision — each tier still uses the normal cost/rank ordering. If no
-    vision-capable model is enabled the pick falls through to the remaining
-    pool (never empty/crash solely for lack of vision).
-    """
-    cfg = cfg or {}
-    ranks = rankings if rankings is not None else load_rankings(cfg)
-    threshold = (
-        int(min_rank)
-        if min_rank is not None
-        else min_rank_for_difficulty(
-            task_class=task_class, node_depth=node_depth, risk=risk
-        )
-    )
-    threshold = max(1, min(5, threshold))
-
-    candidates_raw = list(enabled) if enabled is not None else _enabled_providers(cfg)
-    candidates: list[tuple[tuple[int, int, str], dict[str, str], ModelRank | None]] = []
-    for c in candidates_raw:
-        prov = str(c.get("provider") or "").strip().lower()
-        model = str(c.get("model") or "").strip()
-        if not prov or not model:
-            continue
-        # mega-16: skip providers marked unavailable (xai spending-limit etc.)
-        if is_provider_unavailable(prov):
-            continue
-        if require_loopback and not provider_is_loopback(
-            prov, base_url=c.get("base_url"), cfg=cfg
-        ):
-            continue
-        mr = _rank_for(model, ranks)
-        # Paid openrouter frontier ids get floor rank even if unranked.
-        model_rank = mr.rank if mr is not None else 2
-        mid_l = model.strip().lower()
-        if mid_l in _FRONTIER_RANK_FLOOR_IDS or any(
-            mid_l.startswith(stem) for stem in (
-                "deepseek/deepseek-chat", "deepseek-chat",
-            )
-        ):
-            model_rank = max(model_rank, _FRONTIER_MEASURED_FLOOR)
-        if model_rank < threshold:
-            continue
-        if prefer_vision:
-            sort_key = (
-                _vision_capability_tier(prov, model),
-                _cost_key(prov, model)[0],
-                -model_rank,
-                f"{prov}/{model}",
-            )
-        else:
-            sort_key = (
-                _cost_key(prov, model)[0],
-                -model_rank,
-                f"{prov}/{model}",
-            )
-        candidates.append((sort_key, dict(c), mr))
-
-    if not candidates:
-        fallback = [
-            c for c in candidates_raw
-            if c.get("provider") and c.get("model")
-            and not is_provider_unavailable(str(c.get("provider") or ""))
-            and (
-                not require_loopback
-                or provider_is_loopback(
-                    str(c["provider"]), base_url=c.get("base_url"), cfg=cfg
-                )
-            )
-        ]
-        if not fallback:
-            raise RoleModelError(
-                f"auto_pick_model: no enabled providers meet min_rank={threshold}"
-                + (" with loopback constraint" if require_loopback else "")
-            )
-        if prefer_vision:
-            fallback.sort(
-                key=lambda c: (
-                    _vision_capability_tier(str(c["provider"]), str(c["model"])),
-                    _cost_key(str(c["provider"]), str(c["model"])),
-                )
-            )
-        else:
-            fallback.sort(key=lambda c: _cost_key(str(c["provider"]), str(c["model"])))
-        pick = fallback[0]
-        mr = _rank_for(str(pick["model"]), ranks)
-        return RoleModelAssignment(
-            role="auto",
-            provider=str(pick["provider"]).lower(),
-            model=str(pick["model"]),
-            mode="auto",
-            rank=mr.rank if mr else None,
-            source=mr.source if mr else "fallback",
-            reason=(
-                f"no candidate met min_rank={threshold}; "
-                f"fell back to cheapest enabled"
-            ),
-        )
-
-    candidates.sort(key=lambda t: t[0])
-    _sk, pick, mr = candidates[0]
-    return RoleModelAssignment(
-        role="auto",
-        provider=str(pick["provider"]).lower(),
-        model=str(pick["model"]),
-        mode="auto",
-        rank=mr.rank if mr else None,
-        source=mr.source if mr else "unranked",
-        reason=(
-            f"min_rank={threshold} task_class={task_class or 'unknown'} "
-            f"depth={node_depth} risk={risk or 'none'}"
-        ),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Public resolve
-# ---------------------------------------------------------------------------
-
 # ---------------------------------------------------------------------------
 # Copilot mode → harness role (mode overhaul)
 # ---------------------------------------------------------------------------
 
-# agent→default, plan→planning, swarm→default (+ corporate seats),
+# agent→default, plan→planning, swarm→default,
 # edit→task, ask→default (read-only tools; no dedicated role card).
 _MODE_TO_HARNESS_ROLE: dict[str, str] = {
     "agent": "default",
@@ -1963,7 +1455,11 @@ def role_for_copilot_mode(mode: str | None) -> str:
 def harness_role_for_mission_role(role: str | None) -> str:
     """Map YAML/DAG mission roles to one canonical ``ai_roles`` seat."""
     role_s = (role or "").strip().lower()
-    if role_s in ("overseer", "orchestrator", "department_manager", "planning"):
+    if role_s in ROLE_MODEL_KEY_ALIASES:
+        return ROLE_MODEL_KEY_ALIASES[role_s]
+    if role_s in KNOWN_ROLES:
+        return role_s
+    if role_s in ("overseer", "orchestrator", "planning"):
         return "planning"
     if role_s == "reviewer":
         return "vision"
@@ -1974,183 +1470,72 @@ def harness_role_for_mission_role(role: str | None) -> str:
     return "task"
 
 
+def mission_role_key(role: str | None, cfg: Mapping[str, Any] | None = None) -> str:
+    role_s = (role or "").strip().lower()
+    roles = (cfg or {}).get(AI_ROLES_KEY)
+    if role_s in active_role_overrides(cfg) and isinstance(roles, Mapping) and role_s in roles:
+        return role_s
+    return harness_role_for_mission_role(role)
+
+
 
 def resolve_role_model(
     role: str,
     cfg: Mapping[str, Any] | None = None,
     *,
-    task_class: str | None = None,
-    node_depth: int = 0,
-    risk: str | None = None,
-    min_rank: int | None = None,
-    rankings: Mapping[str, ModelRank] | None = None,
-    enabled: Iterable[Mapping[str, str]] | None = None,
-    request: str = "",
     turn_preferences: Any | None = None,
 ) -> RoleModelAssignment:
     """Resolve provider+model for *role* honouring config.json ``ai_roles``.
 
-    * Fixed ``{provider, model}`` entries are returned as mode=fixed.
-    * ``\"default\"`` returns mode=default with EMPTY provider/model — the caller
-      keeps whatever model the chat composer is on (see :data:`SESSION_DEFAULT`).
-    * ``\"auto\"`` difficulty-aware picks from rankings.
-    * Redaction role: HARD refuse non-loopback (raises :class:`RoleModelError`).
-      ``\"default\"`` is downgraded to ``\"auto\"`` for redaction, because the chat
-      model is normally a cloud provider and this role may never leave loopback.
+    Fixed assignments preserve their exact identity; Default follows the chat. A size-reference
+    override resolves through that tier's current assignment. While ``advanced_overrides`` is
+    off every non-restricted role resolves through its size tier and stored overrides are ignored.
+    Legacy ranked Auto remains stored but must be reassigned explicitly.
+    Private and redaction roles require an explicit verified loopback model.
     """
-    if role in ("chat", "worker", "private"):
-        from services.agent.preferences import TASK_CLASS_KINDS, resolve_turn_preferences
-
-        if turn_preferences is None:
-            turn_preferences = resolve_turn_preferences(request, cfg=cfg,
-                task_kind=TASK_CLASS_KINDS.get(task_class))
-        if min_rank is not None:
-            from dataclasses import replace
-
-            turn_preferences = replace(turn_preferences,
-                min_rank=max(turn_preferences.min_rank, max(1, min(5, int(min_rank)))))
-        return _resolve_auto_seat(role, cfg, request=request, policy=turn_preferences,
-                                  rankings=rankings, enabled=enabled)
-    role_s = (role or "default").strip().lower() or "default"
-    role_s = ROLE_MODEL_KEY_ALIASES.get(role_s, role_s)
+    role = configured_role_key((role or "default").strip().lower() or "default", cfg)
     cfg = cfg or {}
-    roles = get_ai_roles(cfg)
-    entry = roles.get(role_s)
-    if entry is None:
-        entry = roles.get("default", "auto")
+    from services.agent.preferences import resolve_preferences
 
-    require_loopback = role_s == "redaction"
-    rank_table = rankings if rankings is not None else load_rankings(cfg)
-
-    entry_mode = (
-        str(entry.get("mode") or "").lower() if isinstance(entry, Mapping)
-        else str(entry or "").strip().lower()
-    )
-    if entry_mode == SESSION_DEFAULT:
-        if require_loopback:
-            entry = "auto"  # loopback rule outranks the session model
-        else:
-            return RoleModelAssignment(
-                role=role_s,
-                provider="",
-                model="",
-                mode=SESSION_DEFAULT,
-                rank=None,
-                source="ai_roles",
-                reason=f"default ai_roles.{role_s} (follows the chat model)",
-            )
-
-    if isinstance(entry, Mapping):
-        prov = str(entry.get("provider") or "").strip().lower()
-        model = str(entry.get("model") or "").strip()
-        if prov and model:
-            if require_loopback:
-                assert_redaction_loopback(prov, cfg=cfg)
-            mr = rank_table.get(model)
-            return RoleModelAssignment(
-                role=role_s,
-                provider=prov,
-                model=model,
-                mode="fixed",
-                rank=mr.rank if mr else None,
-                source="ai_roles",
-                reason=f"fixed ai_roles.{role_s}",
-            )
-        entry = "auto"
-
-    try:
-        pick = auto_pick_model(
-            cfg=cfg,
-            task_class=task_class,
-            node_depth=node_depth,
-            risk=risk,
-            min_rank=min_rank,
-            rankings=rank_table,
-            enabled=enabled,
-            require_loopback=require_loopback,
-            prefer_vision=(role_s == "vision"),
-        )
-    except RoleModelError:
-        if require_loopback:
-            raise RoleModelError(
-                "redaction role requires a loopback provider but none of the "
-                "enabled providers are local (llamacpp/lmstudio/ollama/vllm on "
-                "127.0.0.1). Configure a local model or set ai_roles.redaction "
-                "explicitly to a loopback provider+model."
-            )
-        raise
-
-    if require_loopback:
-        assert_redaction_loopback(pick.provider, cfg=cfg)
-
-    return RoleModelAssignment(
-        role=role_s,
-        provider=pick.provider,
-        model=pick.model,
-        mode="auto",
-        rank=pick.rank,
-        source=pick.source,
-        reason=pick.reason,
-    )
-
-
-def _resolve_auto_seat(role, cfg, *, request, policy, rankings, enabled):
-    """Three Auto seats; legacy per-role assignments remain independently readable."""
-    from services.agent.preferences import resolve_turn_preferences
-    from services.agent.config import load_config
-
-    cfg = load_config() if cfg is None else cfg
-    policy = policy or resolve_turn_preferences(request, cfg=cfg)
-    ranks = rankings if rankings is not None else load_rankings(cfg)
-    local_only = policy.local_only or role == "private"
-    entry = get_ai_roles(cfg)[role]
-    if isinstance(entry, Mapping) and entry.get("provider") and entry.get("model"):
-        provider, model = str(entry["provider"]), str(entry["model"])
-        if local_only and not _auto_local_provider(provider, cfg, entry.get("base_url")):
-            raise RoleModelError("This computer only requires a loopback model. Configure a local model in Accounts.")
-        return RoleModelAssignment(role, provider, model, "fixed",
-            rank=ranks[model].rank if model in ranks else None, source="ai_roles",
-            reason=f"Using your ai_roles.{role} model.")
-    if entry == SESSION_DEFAULT and not local_only:
-        return RoleModelAssignment(role, "", "", SESSION_DEFAULT, source="ai_roles",
-                                   reason="Using the current chat model.")
-    candidates = list(enabled) if enabled is not None else _enabled_providers(cfg)
-    disabled = set(cfg.get("disabled_providers") or ())
-    candidates = [c for c in candidates if c.get("authenticated", True) and c.get("provider") not in disabled
-                  and not is_provider_unavailable(c.get("provider"))
-                  and (not local_only or _auto_local_provider(c.get("provider", ""), cfg, c.get("base_url")))]
-    if not candidates:
-        raise RoleModelError("No available local model. Configure a loopback model in Accounts."
-                             if local_only else "No authenticated model is available. Sign in to a provider in Accounts.")
-    def rank(c):
-        row = _rank_for(str(c.get("model", "")), ranks)
-        return row.rank if row else 2
-    threshold = 1 if role == "worker" and policy.cheap_leaves else policy.min_rank
-    capable = [c for c in candidates if rank(c) >= threshold]
-    if policy.task_kind == "analysis" or policy.priority == "best_results":
-        strongest = max(map(rank, candidates))
-        capable = [c for c in candidates if rank(c) == strongest]
-    if not capable:
-        strongest = max(map(rank, candidates))
-        capable = [c for c in candidates if rank(c) == strongest]
-    def cost(c):
-        return _COST_CLASS.get(str(c["provider"]), 5)
-    def freshness(c):
-        model = str(c["model"])
-        match = re.search(r"(?:claude-(?:opus|sonnet)-|gpt-)(\d+)(?:[-.](\d+))?", model)
-        return (-int(match[1]), -int(match[2] or 0)) if match else (0, 0)
-    if policy.priority == "fastest":
-        capable.sort(key=lambda c: (rank(c), cost(c), freshness(c), str(c["model"])))
+    local_only = (turn_preferences.local_only if turn_preferences is not None
+                  else resolve_preferences(cfg).local_only)
+    restricted = role in RESTRICTED_ROLES
+    if role == "chat":
+        entry = get_chat_assignment(cfg)
+        source = "chat_assignment"
+    elif restricted:
+        entry = get_ai_roles(cfg).get(role, SESSION_DEFAULT)
+        source = "ai_roles"
     else:
-        capable.sort(key=lambda c: (cost(c), rank(c), freshness(c), str(c["model"])))
-    chosen = capable[0]
-    model, provider = str(chosen["model"]), str(chosen["provider"])
-    reason = f"Auto chose {model} for {policy.task_kind.replace('_', ' ')} ({policy.thinking} thinking)."
-    if rank(chosen) < threshold:
-        reason += " No available model meets the requested capability; using the strongest available."
-    row = _rank_for(model, ranks)
-    return RoleModelAssignment(role, provider, model, "auto", rank(chosen),
-                               row.source if row else "unranked", reason)
+        entry = _active_override(role, cfg)
+        source = "ai_roles"
+        size = _size_reference(entry) if entry is not None else ROLE_SIZES.get(role, ROLE_SIZES["task"])
+        if entry is None or size:
+            entry = get_model_sizes(cfg)[size]
+            source = "model_sizes"
+    mode = (str(entry.get("mode") or "").lower() if isinstance(entry, Mapping)
+            else str(entry or "").strip().lower())
+    if restricted and mode == "size":
+        raise RoleModelError(f"{role} requires an explicit loopback provider and model")
+    if mode == SESSION_DEFAULT:
+        if restricted:
+            raise RoleModelError(f"{role} requires an explicit loopback provider and model")
+        return RoleModelAssignment(role, "", "", SESSION_DEFAULT, source=source,
+                                   reason="Using the current chat model.")
+    if isinstance(entry, Mapping):
+        provider = str(entry.get("provider") or "").strip()
+        model = str(entry.get("model") or "").strip()
+        if provider and model and mode != "auto":
+            if restricted:
+                assert_redaction_loopback(provider, cfg=cfg)
+            elif local_only and not _auto_local_provider(provider, cfg):
+                raise LocalOnlyRoleModelError("This computer only requires a loopback model. Configure a local model in Accounts.")
+            return RoleModelAssignment(role, provider, model, "fixed", source=source,
+                                       reason=f"Using the configured {role} model.")
+    raise RoleModelError(
+        f"Previous ranked Auto selection for {role} needs a new assignment; "
+        "choose a model or follow the chat model."
+    )
 
 
 def _auto_local_provider(provider, cfg, base_url=None):
@@ -2166,45 +1551,3 @@ def _auto_local_provider(provider, cfg, base_url=None):
         url = cfg.get("base_url")
     return host_is_loopback(url) if url else name != "openai"
 
-
-def resolve_for_node(
-    role: str | None,
-    context: Mapping[str, Any] | None = None,
-    cfg: Mapping[str, Any] | None = None,
-) -> Optional[RoleModelAssignment]:
-    """Convenience for node_runner / mission_dispatch.
-
-    Returns None when ai_roles is unset entirely (caller keeps legacy path).
-    When ai_roles is present (even all-auto), resolves through this module.
-    """
-    if cfg is None:
-        try:
-            from services.agent import config as agent_config  # noqa: PLC0415
-            cfg = agent_config.load_config()
-        except Exception:  # noqa: BLE001
-            cfg = {}
-    has_ai_roles = isinstance((cfg or {}).get(AI_ROLES_KEY), Mapping)
-    role_s = (role or "default").strip().lower() or "default"
-    if not has_ai_roles and role_s not in ("redaction", "chat", "worker", "private"):
-        return None
-
-    ctx = context or {}
-    node_inputs = ctx.get("node_inputs") or {}
-    task_class = (
-        ctx.get("task_class")
-        or node_inputs.get("task_class")
-        or ctx.get("taskClass")
-    )
-    try:
-        depth = int(ctx.get("depth") or node_inputs.get("depth") or 0)
-    except (TypeError, ValueError):
-        depth = 0
-    risk = ctx.get("risk") or node_inputs.get("risk")
-    return resolve_role_model(
-        role_s,
-        cfg,
-        task_class=str(task_class) if task_class else None,
-        node_depth=depth,
-        risk=str(risk) if risk else None,
-        request=str(ctx.get("brief") or node_inputs.get("brief") or ctx.get("request") or ""),
-    )

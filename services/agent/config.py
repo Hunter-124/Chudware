@@ -6,7 +6,7 @@ CHUDWARE_PROVIDER=mock to guarantee no live model is called), while config.json 
 state. config.json shape:
     {
       "provider": "anthropic",          // or "openai" / "llamacpp"
-      "model": "claude-opus-4-8",
+      "model": "claude-opus-5-5",
       "api_key": "sk-ant-...",          // optional; else read from env
       "openai": {"base_url": "http://localhost:1234/v1"},
       "llamacpp": {"model_path": "%APPDATA%/Chudware/models/model.gguf"},
@@ -247,11 +247,14 @@ def workspace_dir(cfg: dict | None = None) -> "Path":
 # agent sees the parts before build detritus. Order = priority.
 _WORKSPACE_EXT_PRIORITY = (
     ".step+",
-    ".ecad+",
+    ".kicad_pro",
+    ".kicad_sch",
+    ".kicad_pcb",
     ".step",
     ".stp",
     ".dxf",
     ".dwg",
+    ".scad",
     ".stl",
     ".pdf",
     ".md",
@@ -367,75 +370,6 @@ def get_subagent_tool_call_budget(cfg: dict | None = None) -> int:
     except (TypeError, ValueError):
         return DEFAULT_SUBAGENT_TOOL_CALL_BUDGET
     return max(0, budget)
-
-
-# --------------------------------------------------------------------------- corporate org mode
-# GUI Settings → Agents writes ``agent.corporate_mode`` (bool) and
-# ``agent.corporate`` object. When on, complex missions organize as a company
-# (director + departments + heads + workers) instead of flat delegation.
-# See aicad.corporate/1.
-
-CORPORATE_MODE_KEY = "corporate_mode"
-CORPORATE_KEY = "corporate"
-DEFAULT_CORPORATE_MODE: bool = False
-DEFAULT_CORPORATE_MAX_DEPARTMENTS: int = 3
-DEFAULT_CORPORATE_TEAM_LEADS: bool = True
-DEFAULT_CORPORATE_MEETING_CADENCE: int = 5
-DEFAULT_CORPORATE_DIRECTOR_REVIEW: bool = True
-
-
-def corporate_mode_enabled(cfg: dict | None = None) -> bool:
-    """Return ``agent.corporate_mode`` (bool, default False).
-
-    Nested config shape written by the copilot Agents tab::
-
-        {"agent": {"corporate_mode": true, "corporate": {...}}}
-    """
-    c = cfg if cfg is not None else load_config()
-    if not isinstance(c, dict):
-        return DEFAULT_CORPORATE_MODE
-    agent = c.get(AGENT_CONFIG_KEY)
-    if not isinstance(agent, dict):
-        return DEFAULT_CORPORATE_MODE
-    return bool(agent.get(CORPORATE_MODE_KEY, DEFAULT_CORPORATE_MODE))
-
-
-def get_corporate_config(cfg: dict | None = None) -> dict:
-    """Return normalized ``agent.corporate`` settings.
-
-    Keys (with defaults):
-      max_departments (int, default 3, clamped ≥ 1)
-      team_leads (bool, default True)
-      meeting_cadence (int, default 5, clamped ≥ 1) — worker completions
-        between department-head meetings
-      director_review (bool, default True)
-    """
-    c = cfg if cfg is not None else load_config()
-    agent: dict = {}
-    if isinstance(c, dict):
-        raw_agent = c.get(AGENT_CONFIG_KEY)
-        if isinstance(raw_agent, dict):
-            agent = raw_agent
-    raw = agent.get(CORPORATE_KEY) if isinstance(agent.get(CORPORATE_KEY), dict) else {}
-
-    def _int(key: str, default: int, *, min_v: int = 1) -> int:
-        try:
-            v = int(raw.get(key, default))  # type: ignore[union-attr]
-        except (TypeError, ValueError):
-            v = default
-        return max(min_v, v)
-
-    def _bool(key: str, default: bool) -> bool:
-        if key not in raw:  # type: ignore[operator]
-            return default
-        return bool(raw.get(key))  # type: ignore[union-attr]
-
-    return {
-        "max_departments": _int("max_departments", DEFAULT_CORPORATE_MAX_DEPARTMENTS),
-        "team_leads": _bool("team_leads", DEFAULT_CORPORATE_TEAM_LEADS),
-        "meeting_cadence": _int("meeting_cadence", DEFAULT_CORPORATE_MEETING_CADENCE),
-        "director_review": _bool("director_review", DEFAULT_CORPORATE_DIRECTOR_REVIEW),
-    }
 
 
 # --------------------------------------------------------------------------- advisor (foreman)
@@ -622,7 +556,6 @@ DEFAULT_TOOL_FAMILIES = (
     "manufacture",
     "mission",
     "office",
-    "org",
     "parts",
     "plm",
     "recon",
@@ -707,7 +640,6 @@ YAML_ROLE_TO_HARNESS: dict[str, str] = {
     "general_agent": "default",
     "advisor": "advisor",
     "orchestrator": "planning",
-    "department_manager": "planning",
     "overseer": "planning",
     "project_organizer": "planning",
     "intake_analyst": "planning",
@@ -1114,9 +1046,9 @@ def is_tool_family_enabled(family: str, cfg: dict | None = None) -> bool:
     return bool(fams.get(family, True))
 
 
-#: Chudcode memory backends a CAD conversation may run with. Every one is scoped to the
+#: Omp memory backends a CAD conversation may run with. Every one is scoped to the
 #: project folder (the session cwd); "off" gives the conversation no memory at all.
-MEMORY_BACKENDS = ("off", "sharpshooter", "mnemo")
+MEMORY_BACKENDS = ("off", "local", "hindsight", "mnemopi", "sharpshooter")
 DEFAULT_MEMORY_BACKEND = "sharpshooter"
 
 
@@ -1130,8 +1062,15 @@ def memory_backend(cfg: dict | None = None) -> str:
     c = c if isinstance(c, dict) else {}
     agent = _agent_block(c)
     raw = c.get("memory_backend", agent.get("memory_backend"))
-    if isinstance(raw, str) and raw.strip().lower() in MEMORY_BACKENDS:
-        return raw.strip().lower()
+    if isinstance(raw, str) and raw.strip():
+        backend = raw.strip().lower()
+        if backend == "mnemo":
+            backend = "mnemopi"
+        if backend not in MEMORY_BACKENDS:
+            raise ValueError(f"Unsupported memory backend: {raw}")
+        return backend
+    if raw is not None and not isinstance(raw, str):
+        raise ValueError(f"Unsupported memory backend: {raw!r}")
     enabled = c.get("memory_enabled", agent.get("memory_enabled", DEFAULT_MEMORY_ENABLED))
     return DEFAULT_MEMORY_BACKEND if enabled else "off"
 
@@ -1156,7 +1095,7 @@ def get_memory_token_budget(cfg: dict | None = None) -> int:
 
 
 # --------------------------------------------------------------------------- memory learning
-# Storage and compaction authority are owned by Chudcode for online sessions.
+# Storage and compaction authority are owned by Omp for online sessions.
 # These switches only govern whether Chudware callers are allowed to write lessons.
 
 MEMORY_LEARN_KEY = "memory_learn"
@@ -1205,7 +1144,7 @@ def autolearn_min_tool_calls(cfg: dict | None = None) -> int:
 
 # --------------------------------------------------------------------------- compaction
 # agent.compaction_strategy is the user's compaction choice (Settings → AI → Compaction).
-# Online sessions hand it to Chudcode as `compaction.*` settings of the conversation
+# Online sessions hand it to Omp as `compaction.*` settings of the conversation
 # process (online_compaction_settings); explicit offline/standalone text compaction
 # reads the same keys.
 #
@@ -1222,11 +1161,11 @@ VALID_COMPACTION_STRATEGIES = frozenset({"auto", "off", "snapcompact", "shake", 
 DEFAULT_COMPACTION_SUPERSEDE_READS: bool = True
 DEFAULT_COMPACTION_DROP_USELESS: bool = True
 DEFAULT_COMPACTION_KEEP_RECENT_TOKENS: int = 20_000
-#: Chudcode `compaction.methodOrder` for each explicit strategy. One method each: the
+#: Omp `compaction.methodOrder` for each explicit strategy. One method each: the
 #: runtime walks the order and falls through to the next entry when a method is
 #: unusable or fails, so a longer list would silently run a strategy the user did not
 #: pick (a GPT session with the user's global [shake, remote, soft] ran shake under
-#: "Summary"). "summary" is Chudcode's `soft` method — an in-place, model-written
+#: "Summary"). "summary" is Omp's `soft` method — an in-place, model-written
 #: summary; `remote` (provider-native server compaction) is not a readable recap.
 ONLINE_COMPACTION_METHODS: dict[str, tuple[str, ...]] = {
     "snapcompact": ("snapcompact",),
@@ -1294,12 +1233,13 @@ def get_compaction_config(cfg: dict | None = None) -> dict:
 
 
 def online_compaction_settings(cfg: dict | None = None) -> tuple[str, dict]:
-    """Return ``(strategy, chudcode_settings)`` for an online conversation process.
+    """Return ``(strategy, omp_settings)`` for an online conversation process.
 
-    ``chudcode_settings`` holds Chudcode ``compaction.*`` sub-keys (``compaction.<key>``
+    ``omp_settings`` holds Omp ``compaction.*`` sub-keys (``compaction.<key>``
     in its config): the exposed read-pruning switches always, plus for an explicit
     strategy ``enabled`` and (unless ``off``) a one-method ``methodOrder``. ``auto``
-    leaves enablement and method order to the agent service's own configuration.
+    leaves enablement and method order to the agent service's own configuration,
+    minus the experimental ``snapcompact`` (the CAD extension's ``settings_set``).
     Raises :class:`ValueError` for an unrecognized ``agent.compaction_strategy``.
     """
     strategy = get_compaction_strategy(cfg)
@@ -1781,24 +1721,16 @@ def _resolve_provider(name: str | None, cfg: dict, role: str | None = None) -> P
 
     if name == "mock":
         # Deterministic mock provider for tests (no API key, no network). Scripted replies load
-        # from the JSON file named by CHUDWARE_MOCK_REPLIES (a list[str], or a {role: list[str]} map
-        # consumed by a role-sniffing provider) — keeps the subprocess worker test self-contained.
+        # from the JSON list[str] file named by CHUDWARE_MOCK_REPLIES.
         from .providers.mock_provider import MockProvider
 
         replies: list[str] = []
-        by_role: dict | None = None
         path = os.environ.get("CHUDWARE_MOCK_REPLIES")
         if path and os.path.exists(path):
             with open(path, encoding="utf-8") as fh:
                 data = json.load(fh)
-            if isinstance(data, dict):
-                by_role = data
-            elif isinstance(data, list):
+            if isinstance(data, list):
                 replies = data
-        if by_role is not None:
-            from .providers.mock_provider import RoleScriptedProvider
-
-            return RoleScriptedProvider(by_role)
         return MockProvider(replies or [""])
 
     if name == "anthropic":

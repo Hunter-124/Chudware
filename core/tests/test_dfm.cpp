@@ -26,7 +26,7 @@ int main(int argc, char** argv) {
 TEST_CASE("known processes + the section-5 profile numbers") {
     const auto kp = known_processes();
     CHECK(kp == std::vector<std::string>{"fdm", "cnc_mill", "lathe", "sheet_metal",
-                                         "laser", "injection"});
+                                         "laser", "injection", "cast", "sla", "sls", "mjf"});
 
     const json fdm = get_profile("fdm");
     CHECK(fdm["process"] == "fdm");
@@ -44,8 +44,45 @@ TEST_CASE("known processes + the section-5 profile numbers") {
 
     CHECK_THROWS_WITH_AS(get_profile("lost_wax"),
                          "Unknown process 'lost_wax'. Known processes: "
-                         "['fdm', 'cnc_mill', 'lathe', 'sheet_metal', 'laser', 'injection'].",
+                         "['fdm', 'cnc_mill', 'lathe', 'sheet_metal', 'laser', 'injection', 'cast', 'sla', 'sls', 'mjf'].",
                          DfmError);
+}
+
+TEST_CASE("new process profiles expose sourced rules without fabricated fit data") {
+    for (const auto& process : known_processes()) {
+        const json params = get_profile(process)["params"];
+        REQUIRE(params["rules"].is_object());
+        REQUIRE(params["rule_sources"].is_object());
+        for (auto it = params["rules"].begin(); it != params["rules"].end(); ++it) {
+            REQUIRE(params["rule_sources"].contains(it.key()));
+            REQUIRE(params["rule_sources"][it.key()].is_string());
+            CHECK_FALSE(params["rule_sources"][it.key()].get<std::string>().empty());
+        }
+    }
+    CHECK(get_profile("cast")["params"]["rules"]["wall_min_mm"] == 3.0);
+    CHECK(get_profile("sla")["params"]["rules"]["drain_hole_min_mm"] == 0.75);
+    CHECK(get_profile("sls")["params"]["rules"]["drain_hole_min_mm"] == 3.5);
+    CHECK(get_profile("mjf")["params"]["rules"]["min_wall_mm_unsupported"] == 0.5);
+    CHECK(get_profile("sheet_metal")["params"]["rules"]["min_thickness_mm"] == 0.609);
+    CHECK(get_profile("injection")["params"]["rules"]["rib_thickness_ratio_max"] == 0.6);
+    CHECK(get_profile("fdm")["params"]["rules"]["line_width_mm"] == 0.45);
+    CHECK(get_profile("cnc_mill")["params"]["rules"]["internal_corner_radius_tool_ratio_min"] == 1.0);
+    CHECK(get_profile("cnc_mill")["params"]["rules"]["internal_corner_radius_tool_ratio_recommended"] == 1.1);
+    CHECK(get_profile("cnc_mill")["params"]["rules"]["hole_max_depth_to_dia_standard"] == 5.0);
+    CHECK(get_profile("lathe")["params"]["rules"]["hole_max_depth_to_dia_standard"] == 5.0);
+    CHECK_FALSE(get_profile("cnc_mill")["params"]["rules"].contains("min_tool_diameter_mm"));
+    CHECK(get_profile("sla")["params"]["hole_comp_mm"].is_null());
+    CHECK_THROWS_AS(fit_clearance("sla", "slip"), DfmError);
+    const json overrides = {{"xy_comp", 0.1}};
+    CHECK(get_profile("sla", &overrides)["params"]["tolerance_band_mm"].is_null());
+}
+
+TEST_CASE("specific process cues win over generic printing and molding cues") {
+    CHECK(resolve_process(json("SLA 3d print a bracket"))["chosen"] == "sla");
+    CHECK(resolve_process(json("SLS printed enclosure"))["chosen"] == "sls");
+    CHECK(resolve_process(json("MJF printed enclosure"))["chosen"] == "mjf");
+    CHECK(resolve_process(json("sand cast a bracket"))["chosen"] == "cast");
+    CHECK_THROWS_AS(resolve_process(json("waterjet cut a bracket")), DfmError);
 }
 
 TEST_CASE("fit_clearance + modeled_dim (the fit brain)") {
@@ -122,14 +159,14 @@ TEST_CASE("dispatch: ownership + envelope") {
     CHECK_FALSE(call("not_ours", json::object(), result, err));
     CHECK(call("dfm_known_processes", json::object(), result, err));
     CHECK(result["ok"] == true);
-    CHECK(result["result"].size() == 6);
+    CHECK(result["result"].size() == 10);
     CHECK(call("dfm_fit_clearance", json::parse(R"({"process":"fdm","fit_class":"snug"})"),
                result, err));
     CHECK(result["ok"] == false);
     CHECK_FALSE(result.contains("code"));
 }
 
-TEST_CASE("golden parity: every oracle fixture deep-equals (tests/data/dfm.json)") {
+TEST_CASE("golden parity: legacy oracle fields (tests/data/dfm.json)") {
     std::ifstream f(std::string(CHUDWARE_TEST_DATA_DIR) + "/dfm.json");
     REQUIRE_MESSAGE(f.good(), "dfm.json golden not found at CHUDWARE_TEST_DATA_DIR");
     const json cases = json::parse(f);
@@ -138,6 +175,12 @@ TEST_CASE("golden parity: every oracle fixture deep-equals (tests/data/dfm.json)
         json result;
         std::string err;
         REQUIRE(call(c["method"].get<std::string>(), c["params"], result, err));
+        // The historical oracle predates the sourced rules extension. Its
+        // existing fields remain a useful independent parity baseline.
+        if (c["method"] == "dfm_get_profile" && result.value("ok", false)) {
+            result["result"]["params"].erase("rules");
+            result["result"]["params"].erase("rule_sources");
+        }
         CHECK_MESSAGE(result == c["result"],
                       "parity diff\n  got: " << result.dump() << "\n  oracle: "
                                               << c["result"].dump());

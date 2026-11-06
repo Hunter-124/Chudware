@@ -14,9 +14,11 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <future>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <set>
@@ -55,10 +57,33 @@
 #include "doc/stepplus.h"
 #include "doc/session.h"  // OpError
 #include "util/expr.h"
+#include "util/sha256.h"
 
 namespace chudware::doc {
 
 using nlohmann::json;
+
+namespace {
+thread_local std::shared_ptr<const AssemblyLiveSources> t_assembly_sources;
+}
+
+AssemblySourceScope::AssemblySourceScope() : previous_(t_assembly_sources) {
+    if (!t_assembly_sources) t_assembly_sources = assembly_live_sources();
+}
+AssemblySourceScope::AssemblySourceScope(std::shared_ptr<const AssemblyLiveSources> sources)
+    : previous_(t_assembly_sources) {
+    t_assembly_sources = std::move(sources);
+}
+AssemblySourceScope::~AssemblySourceScope() { t_assembly_sources = std::move(previous_); }
+std::shared_ptr<const AssemblyLiveSources> AssemblySourceScope::current() {
+    return t_assembly_sources;
+}
+
+static std::shared_ptr<const AssemblyLiveSource> current_assembly_source(const std::string& path) {
+    if (!t_assembly_sources) return assembly_live_source(path);
+    const auto found = t_assembly_sources->find(path);
+    return found == t_assembly_sources->end() ? nullptr : found->second;
+}
 
 namespace {
 
@@ -78,6 +103,14 @@ struct LoadedComponent {
     mutable std::vector<TopoInfo> verts;
     mutable std::vector<TopoDS_Shape> face_shapes;
     mutable std::vector<TopoDS_Shape> edge_shapes;
+    mutable std::vector<TopoDS_Shape> vertex_shapes;
+    json owner_map;                              // source part's persisted/live pick provenance
+    std::string source_path;
+    std::shared_ptr<const json> source_document;
+    std::vector<std::shared_ptr<const void>> descendant_pins;
+    mutable std::once_flag source_signature_once;
+    mutable std::string source_context_hash;
+    mutable std::vector<std::string> source_feature_hashes;
     std::vector<aicm::AppearanceRegion> appearance_regions;  // compound face IDs, not bodies
     std::vector<std::string> body_material_keys;  // per body; "" = no material assigned
     std::string error;                          // incomplete source; surviving geometry retained
@@ -98,15 +131,42 @@ std::map<std::string, LoadCacheEntry> g_load_cache;
 std::uint64_t g_load_cache_clock = 0;  // protected by g_cache_mtx
 constexpr std::size_t kComponentCacheLimit = 128;
 
+// Native document hashes preserve geometry identity across saves, but a file
+// rewrite can independently invalidate its persisted build state. Track the last
+// disk version actually loaded, and inspect changed versions once.
+struct ComponentDiskState {
+    std::string loaded_stamp;
+    std::string checked_stamp;
+    std::string checked_doc_hash;
+    bool checked_valid = false;
+};
+std::map<std::string, ComponentDiskState> g_component_disk_states;  // g_cache_mtx
+
+// The future owns one reference. Active assembly results retain the same load
+// so their unchanged components must not be evicted and reread on a rebuild.
+bool load_cache_removable(const LoadCacheEntry& entry) {
+    if (entry.body.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+        return false;
+    try { return entry.body.get().use_count() == 1; }
+    catch (...) { return true; }
+}
+
 // Caller holds g_cache_mtx. Keep pending single-flight loads until their
 // promises settle, even if a newer file stamp has replaced their path.
 void trim_load_cache(const std::string& path) {
-    std::uint64_t newest = 0;
-    for (const auto& item : g_load_cache)
-        if (item.second.path == path) newest = std::max(newest, item.second.inserted_at);
+    // Retain one previous source revision for identity-based mate recovery.
+    // Pending and live-result-pinned loads are exempt from the idle LRU limit.
+    std::uint64_t newest = 0, previous = 0;
+    for (const auto& item : g_load_cache) {
+        if (item.second.path != path) continue;
+        const auto age = item.second.inserted_at;
+        if (age > newest) { previous = newest; newest = age; }
+        else if (age > previous) previous = age;
+    }
     for (auto it = g_load_cache.begin(); it != g_load_cache.end();) {
         if (it->second.path == path && it->second.inserted_at != newest &&
-            it->second.body.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+            it->second.inserted_at != previous &&
+            load_cache_removable(it->second))
             it = g_load_cache.erase(it);
         else
             ++it;
@@ -114,13 +174,20 @@ void trim_load_cache(const std::string& path) {
     while (g_load_cache.size() > kComponentCacheLimit) {
         auto oldest = g_load_cache.end();
         for (auto it = g_load_cache.begin(); it != g_load_cache.end(); ++it) {
-            if (it->second.body.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
-                continue;
+            if (!load_cache_removable(it->second)) continue;
             if (oldest == g_load_cache.end() || it->second.last_used < oldest->second.last_used)
                 oldest = it;
         }
         if (oldest == g_load_cache.end()) break;
         g_load_cache.erase(oldest);
+    }
+    if (g_component_disk_states.size() > 2 * kComponentCacheLimit) {
+        for (auto it = g_component_disk_states.begin(); it != g_component_disk_states.end();) {
+            const bool retained = std::any_of(g_load_cache.begin(), g_load_cache.end(),
+                [&](const auto& cached) { return cached.second.path == it->first; });
+            if (retained) ++it;
+            else it = g_component_disk_states.erase(it);
+        }
     }
 }
 
@@ -213,7 +280,9 @@ void append_load_error(std::string& error, const std::string& detail) {
 std::vector<TopoDS_Shape> load_bodies(
     const std::string& abspath,
     std::vector<std::vector<aicm::AppearanceRegion>>& appearances,
-    std::vector<std::string>& material_keys, std::string& error, json& build_state) {
+    std::vector<std::string>& material_keys, std::string& error, json& build_state,
+    json& owner_map, const std::shared_ptr<const AssemblyLiveSource>& live,
+    std::vector<std::shared_ptr<const void>>& descendant_pins) {
     const std::string canonical = std::filesystem::weakly_canonical(abspath).string();
     if (std::find(loading_paths.begin(), loading_paths.end(), canonical) != loading_paths.end())
         throw OpError("import_failed", "cyclic component reference: " + canonical,
@@ -222,22 +291,34 @@ std::vector<TopoDS_Shape> load_bodies(
     struct PopPath { ~PopPath() { loading_paths.pop_back(); } } pop_path;
     const std::string low = lower(abspath);
     if (ends_with(low, ".step+") || ends_with(low, ".stepplus")) {
-        // Stamped before the read: a write-back of this compile must find the file unchanged.
-        const NativeFileStamp stamp = stepplus_file_stamp(abspath);
-        StepPlusDoc loaded = stepplus_open_component(abspath);  // throws on a bad file
-        if (loaded.doc.value("schema", std::string()) == "aicad.asm/1") {
+        // Live source snapshots are already compiled and must never write build
+        // state into the older file. Disk-only loads retain the existing fast path.
+        const NativeFileStamp stamp = live ? NativeFileStamp{} : stepplus_file_stamp(abspath);
+        StepPlusDoc loaded;
+        if (!live) loaded = stepplus_open_component(abspath);
+        const json& source_doc = live ? *live->document : loaded.doc;
+        if (source_doc.value("schema", std::string()) == "aicad.asm/1") {
             AssemblyResult ar = compile_assembly(
-                loaded.doc, std::filesystem::path(abspath).parent_path().string());
-            for (const AsmComponentStatus& st : ar.component_status)
+                source_doc, std::filesystem::path(abspath).parent_path().string());
+            descendant_pins = std::move(ar.component_cache_pins);
+            for (const AsmComponentStatus& st : ar.component_status) {
                 if (!st.ok)
                     append_load_error(error, "component '" + st.id + "' in '" + abspath +
                                                 "': " + st.error.value_or("no geometry"));
+                // A nested assembly has no separate cached body of its own here.
+                // Any descendant using an unverified body makes this body's
+                // derived geometry unverified, at every level of nesting.
+                if (st.build_state.is_object() &&
+                    st.build_state.value("cache_trust", std::string()) == "unverified")
+                    build_state = {{"cache_trust", "unverified"}};
+            }
             for (const FeatureStatus& st : ar.feature_status)
                 if (!st.ok)
                     append_load_error(error, "feature '" + st.id + "' in '" + abspath +
                                                 "': " + st.error);
             for (const AsmMateStatus& st : ar.mate_status)
-                if (st.status == "unresolved" || st.status == "conflicting") {
+                if (st.status == "unresolved" || st.status == "conflicting" ||
+                    st.status == "unsatisfied") {
                     std::string detail = "mate '" + st.id + "' in '" + abspath +
                                          "' is " + st.status;
                     if (!st.reason.empty()) detail += ": " + st.reason;
@@ -278,31 +359,49 @@ std::vector<TopoDS_Shape> load_bodies(
             material_keys.clear();
             uint32_t ordinal = 0;
             for (const auto& shape : bodies) {
-                material_keys.push_back(doc_body_material_key(loaded.doc, ordinal + 1));
+                material_keys.push_back(doc_body_material_key(source_doc, ordinal + 1));
                 TopTools_IndexedMapOfShape faces;
                 TopExp::MapShapes(shape, TopAbs_FACE, faces);
                 aicm::AppearanceRegion appearance;
                 appearance.first_face = 1;
                 appearance.face_count = static_cast<uint32_t>(faces.Extent());
-                apply_doc_appearance(loaded.doc, ++ordinal, appearance.color,
+                apply_doc_appearance(source_doc, ++ordinal, appearance.color,
                                      appearance.metallic, appearance.roughness);
                 aicm::AicmBody styled;
                 std::copy(appearance.color, appearance.color + 3, styled.color);
                 styled.metallic = appearance.metallic;
                 styled.roughness = appearance.roughness;
-                apply_doc_face_appearances(loaded.doc, ordinal, shape, styled);
+                apply_doc_face_appearances(source_doc, ordinal, shape, styled);
                 if (styled.appearance_regions.empty()) appearances.push_back({appearance});
                 else appearances.push_back(std::move(styled.appearance_regions));
             }
         };
+        if (live && live->part) {
+            if (live->unverified) build_state = {{"cache_trust", "unverified"}};
+            for (const FeatureStatus& st : live->part->statuses)
+                if (!st.ok)
+                    append_load_error(error, "feature '" + st.id + "' in '" + abspath +
+                                                "' failed to rebuild: " + st.error);
+            if (!live->part->ok)
+                throw OpError("import_failed", error.empty()
+                                  ? "component '" + abspath + "' failed to rebuild" : error,
+                              {{"path", abspath}, {"reason", "feature_failed"}});
+            if (live->part->shapes.empty())
+                throw OpError("import_failed", error.empty()
+                                  ? "component '" + abspath + "' produced no bodies" : error,
+                              {{"path", abspath}});
+            owner_map = live->part->owner_map;
+            resolve_appearances(live->part->shapes);
+            return live->part->shapes;
+        }
         // Solved-bodies fast path: a part saved after a fully-ok rebuild embeds its compiled
         // bodies as cache.brep (BREP + triangulation) with a `solved` flag in the cache.json
         // header. When the engine key + doc hash still match, those bodies ARE the exact
         // compile_document output — load them directly and skip the rebuild AND the re-mesh.
         // Any mismatch/corruption falls through to the full compile.
-        const bool self_contained = external_import_paths(loaded.doc).empty();
-        if (self_contained) {
-            const bool verified = stepplus_cache_verified(loaded.doc, loaded.extra, true);
+        const bool self_contained = external_import_paths(source_doc).empty();
+        if (!live && self_contained) {
+            const bool verified = stepplus_cache_verified(source_doc, loaded.extra, true);
             auto cj = loaded.extra.find("cache.json");
             auto cb = loaded.extra.find("cache.brep");
             if (cj != loaded.extra.end() && cb != loaded.extra.end() &&
@@ -311,10 +410,12 @@ std::vector<TopoDS_Shape> load_bodies(
                     json header = json::parse(cj->second);
                     if (header.value("engine", std::string()) == stepplus_cache_engine_key() &&
                         header.value("doc_hash", std::string()) ==
-                            stepplus_doc_hash(loaded.doc) &&
+                            stepplus_doc_hash(source_doc) &&
                         header.value("solved", false)) {
                         std::vector<TopoDS_Shape> bodies = brep_cache_decode(cb->second);
                         if (!bodies.empty()) {
+                            if (header.contains("response") && header["response"].is_object())
+                                owner_map = header["response"].value("owner_map", json::object());
                             build_state = {{"cache_trust", verified ? "verified" : "unverified"}};
                             resolve_appearances(bodies);
                             return bodies;
@@ -326,18 +427,23 @@ std::vector<TopoDS_Shape> load_bodies(
         // A self-contained part compiles like a part session and saves the build into its
         // file (stepplus.md §17): the saved state was stale, and every later load would pay
         // this rebuild again. Legacy file-backed imports never serve from saved state.
-        CompileResult r = self_contained
-            ? compile_component_with_build_state(abspath, loaded.doc, stamp, build_state)
-            : compile_document(loaded.doc, env_from_doc(loaded.doc), nullptr,
+        CompileResult r = !live && self_contained
+            ? compile_component_with_build_state(abspath, source_doc, stamp, build_state)
+            : compile_document(source_doc, env_from_doc(source_doc), nullptr,
                                ::geom::DisplayQuality::Fine, false);
         for (const FeatureStatus& st : r.statuses)
             if (!st.ok)
                 append_load_error(error, "feature '" + st.id + "' in '" + abspath +
                                             "' failed to rebuild: " + st.error);
+        if (!r.ok)
+            throw OpError("import_failed", error.empty()
+                              ? "component '" + abspath + "' failed to rebuild" : error,
+                          {{"path", abspath}, {"reason", "feature_failed"}});
         if (r.shapes.empty())
             throw OpError("import_failed", error.empty()
                               ? "component '" + abspath + "' produced no bodies" : error,
                           {{"path", abspath}});
+        owner_map = r.owner_map;
         resolve_appearances(r.shapes);
         return r.shapes;
     }
@@ -361,7 +467,9 @@ TopoDS_Shape compound_of(const std::vector<TopoDS_Shape>& bodies);  // defined b
 std::shared_ptr<const LoadedComponent> describe_component(
     std::vector<TopoDS_Shape> bodies,
     const std::vector<std::vector<aicm::AppearanceRegion>>& appearances,
-    std::vector<std::string> material_keys, std::string error, json build_state) {
+    std::vector<std::string> material_keys, std::string error, json build_state,
+    json owner_map, std::shared_ptr<const json> source_document, std::string source_path,
+    std::vector<std::shared_ptr<const void>> descendant_pins) {
     auto result = std::make_shared<LoadedComponent>();
     LoadedComponent& lc = *result;
     lc.bodies = std::move(bodies);
@@ -369,6 +477,10 @@ std::shared_ptr<const LoadedComponent> describe_component(
     lc.body_material_keys.resize(lc.bodies.size());
     lc.error = std::move(error);
     lc.build_state = std::move(build_state);
+    lc.owner_map = std::move(owner_map);
+    lc.source_document = std::move(source_document);
+    lc.source_path = std::move(source_path);
+    lc.descendant_pins = std::move(descendant_pins);
     lc.compound = compound_of(lc.bodies);
     // Use the tessellator's unique face map, not explorer counts: shared topology must
     // retain exactly the same IDs whether a component is styled, repeated or nested.
@@ -415,6 +527,30 @@ std::shared_ptr<const LoadedComponent> describe_component(
     return result;
 }
 
+// The pick owner map uses unique topology IDs, while the mate describers enumerate
+// with TopExp_Explorer. Join through the actual shape, never through ordinal order.
+void attach_component_owners(const LoadedComponent& lc, const TopoDS_Shape& body,
+                             std::size_t body_index, TopAbs_ShapeEnum type,
+                             std::vector<TopoInfo>& infos) {
+    if (!lc.owner_map.is_object()) return;
+    TopTools_IndexedMapOfShape unique;
+    TopExp::MapShapes(body, type, unique);
+    const char* key = type == TopAbs_FACE ? "faces" : "edges";
+    std::map<int, std::string> owners;
+    for (auto it = lc.owner_map.begin(); it != lc.owner_map.end(); ++it) {
+        const auto rows = it.value().find(key);
+        if (rows == it.value().end() || !rows->is_array()) continue;
+        for (const auto& row : *rows)
+            if (row.is_array() && row.size() == 2 && row[0].is_number_integer() &&
+                row[1].is_number_integer() && row[0].get<int>() == static_cast<int>(body_index + 1))
+                owners[row[1].get<int>()] = it.key();
+    }
+    std::size_t i = 0;
+    for (TopExp_Explorer ex(body, type); ex.More() && i < infos.size(); ex.Next(), ++i) {
+        const auto found = owners.find(unique.FindIndex(ex.Current()));
+        if (found != owners.end()) infos[i].owner = found->second;
+    }
+}
 // Analytic face/edge/vertex descriptions are expensive and have no display use.
 // Repeated components share this once-only work only when a mate actually needs it.
 void ensure_component_topology(const LoadedComponent& lc, const std::string& kind) {
@@ -424,8 +560,10 @@ void ensure_component_topology(const LoadedComponent& lc, const std::string& kin
         // call_once permits retry after an exception: discard partial descriptions.
         lc.faces.clear(); lc.face_shapes.clear();
         int index = 0;
-        for (const TopoDS_Shape& bo : lc.bodies) {
+        for (std::size_t bi = 0; bi < lc.bodies.size(); ++bi) {
+            const auto& bo = lc.bodies[bi];
             auto faces = describe_faces(bo);
+            attach_component_owners(lc, bo, bi, TopAbs_FACE, faces);
             for (auto& info : faces) { info.index = index; info.hint_index = index; ++index; }
             for (TopExp_Explorer ex(bo, TopAbs_FACE); ex.More(); ex.Next())
                 lc.face_shapes.push_back(ex.Current());
@@ -435,8 +573,10 @@ void ensure_component_topology(const LoadedComponent& lc, const std::string& kin
     if (kind == "edge") std::call_once(lc.edges_once, [&] {
         lc.edges.clear(); lc.edge_shapes.clear();
         int index = 0;
-        for (const TopoDS_Shape& bo : lc.bodies) {
+        for (std::size_t bi = 0; bi < lc.bodies.size(); ++bi) {
+            const auto& bo = lc.bodies[bi];
             auto edges = describe_edges(bo);
+            attach_component_owners(lc, bo, bi, TopAbs_EDGE, edges);
             for (auto& info : edges) { info.index = index; info.hint_index = index; ++index; }
             for (TopExp_Explorer ex(bo, TopAbs_EDGE); ex.More(); ex.Next())
                 lc.edge_shapes.push_back(ex.Current());
@@ -444,11 +584,13 @@ void ensure_component_topology(const LoadedComponent& lc, const std::string& kin
         }
     });
     if (kind == "vertex") std::call_once(lc.verts_once, [&] {
-        lc.verts.clear();
+        lc.verts.clear(); lc.vertex_shapes.clear();
         int index = 0;
         for (const TopoDS_Shape& bo : lc.bodies) {
             auto verts = describe_vertices(bo);
             for (auto& info : verts) { info.index = index; info.hint_index = index; ++index; }
+            for (TopExp_Explorer ex(bo, TopAbs_VERTEX); ex.More(); ex.Next())
+                lc.vertex_shapes.push_back(ex.Current());
             lc.verts.insert(lc.verts.end(), verts.begin(), verts.end());
         }
     });
@@ -484,11 +626,16 @@ std::shared_ptr<const json> component_document(const std::string& path) {
     if (component_file_stamp(path) == stamp) {
         std::lock_guard<std::mutex> lock(g_cache_mtx);
         cache[path] = {stamp, doc, ++clock};  // replaces the superseded stamp
-        if (cache.size() > kComponentCacheLimit) {
-            auto oldest = std::min_element(cache.begin(), cache.end(),
-                [](const auto& a, const auto& b) {
-                    return a.second.last_used < b.second.last_used;
-                });
+        while (cache.size() > kComponentCacheLimit) {
+            auto oldest = cache.end();
+            for (auto it = cache.begin(); it != cache.end(); ++it) {
+                // A live loaded component uses this parsed source for identity
+                // and topology. Keep it warm while that component is pinned.
+                if (it->second.doc.use_count() != 1) continue;
+                if (oldest == cache.end() || it->second.last_used < oldest->second.last_used)
+                    oldest = it;
+            }
+            if (oldest == cache.end()) break;
             cache.erase(oldest);
         }
     }
@@ -515,16 +662,118 @@ std::string component_document_hash(const std::string& path, const json& doc) {
     return hash;
 }
 
-std::string component_cache_key(const std::string& abspath) {
-    std::string key = abspath + ":" + component_file_stamp(abspath);
-    if (native_policy::recomputing_cache) key += ":verified-rebuild";
+// An unchanged document hash permits geometry reuse, but cannot prove that a
+// rewritten cache header/BREP/provenance is still usable. Only inspect versions
+// changed since a load (or first observed through a live snapshot); memoize the
+// verdict per stamp and never hold g_cache_mtx across archive I/O.
+std::string invalid_component_cache_stamp(const std::string& path, const std::string& doc_hash) {
+    const std::string stamp = component_file_stamp(path);
+    {
+        std::lock_guard<std::mutex> lock(g_cache_mtx);
+        auto it = g_component_disk_states.find(path);
+        if (it == g_component_disk_states.end() || it->second.loaded_stamp == stamp) return {};
+        if (it->second.checked_stamp == stamp && it->second.checked_doc_hash == doc_hash)
+            return it->second.checked_valid ? std::string() : stamp;
+    }
+    bool valid = false;
+    try {
+        const StepPlusDoc loaded = stepplus_open_component(path);
+        const bool same_doc = stepplus_doc_hash(loaded.doc) == doc_hash;
+        // Nested assemblies never consume their own cached BREP: their live/disk
+        // document and all descendants are compiled recursively.
+        if (same_doc && loaded.doc.value("schema", std::string()) == "aicad.asm/1") {
+            valid = true;
+        } else if (same_doc && loaded.extra.count("cache.brep")) {
+            const auto header = loaded.extra.find("cache.json");
+            if (header != loaded.extra.end()) {
+                const json cache = json::parse(header->second);
+                valid = cache.value("engine", std::string()) == stepplus_cache_engine_key() &&
+                        cache.value("doc_hash", std::string()) == doc_hash &&
+                        cache.value("solved", false) &&
+                        stepplus_cache_verified(loaded.doc, loaded.extra, true);
+            }
+        }
+    } catch (...) {
+        // A changed unreadable or untrusted build state must take the normal load path.
+    }
+    const std::string after = component_file_stamp(path);
+    if (after != stamp) return after;
+    {
+        std::lock_guard<std::mutex> lock(g_cache_mtx);
+        auto it = g_component_disk_states.find(path);
+        if (it != g_component_disk_states.end()) {
+            it->second.checked_stamp = stamp;
+            it->second.checked_doc_hash = doc_hash;
+            it->second.checked_valid = valid;
+            if (valid) it->second.loaded_stamp = stamp;
+        }
+    }
+    return valid ? std::string() : stamp;
+}
+
+void note_component_load(const std::string& path, const std::string& disk_stamp,
+                         bool live, bool unverified) {
+    std::lock_guard<std::mutex> lock(g_cache_mtx);
+    auto it = g_component_disk_states.try_emplace(path).first;
+    if (!live) {
+        // An unverified read cannot certify that an older cached body for the
+        // same authored document represents this disk version.
+        it->second.loaded_stamp = unverified ? std::string() : disk_stamp;
+        it->second.checked_stamp.clear();
+        it->second.checked_doc_hash.clear();
+        it->second.checked_valid = false;
+    }
+    // A live or unverified load has no trusted disk stamp. The next disk-only
+    // consumer validates its saved state before reusing an older geometry.
+}
+
+std::string component_cache_key(
+    const std::string& abspath, const std::shared_ptr<const AssemblyLiveSource>& live) {
     const std::string low = lower(abspath);
+    std::string key = abspath;
+    if (native_policy::recomputing_cache) key += ":verified-rebuild";
     if (ends_with(low, ".step+") || ends_with(low, ".stepplus")) {
-        const auto doc = component_document(abspath);
-        if (doc->value("schema", std::string()) == "aicad.asm/1" ||
-            !external_import_paths(*doc).empty())
-            key += ":" + asm_component_fingerprints(
-                *doc, std::filesystem::path(abspath).parent_path().string()).dump();
+        const auto doc = live ? live->document : component_document(abspath);
+        const std::string doc_hash = live ? live->doc_hash : component_document_hash(abspath, *doc);
+        key += ":doc:" + doc_hash;
+        if (live && live->unverified && live->part) key += ":unverified-live";
+        const bool is_assembly = doc->value("schema", std::string()) == "aicad.asm/1";
+        if (!live && !is_assembly) {
+            const std::string invalid = invalid_component_cache_stamp(abspath, doc_hash);
+            if (!invalid.empty()) key += ":invalid-cache:" + invalid;
+        }
+        if (is_assembly ||
+            !external_import_paths(*doc).empty()) {
+            json sources = asm_live_component_fingerprints(
+                *doc, std::filesystem::path(abspath).parent_path().string());
+            // A native document's hash is its identity across a save/build-state
+            // rewrite. Keep non-native file stamps and all descendant identities.
+            for (auto& row : sources) {
+                row.erase("live_unsaved");
+                if (row.contains("doc_hash")) {
+                    const auto full = (std::filesystem::path(abspath).parent_path() /
+                        std::filesystem::path(row.at("path").get<std::string>())).lexically_normal();
+                    const std::string child_path = std::filesystem::absolute(full).string();
+                    try {
+                        const std::string canonical = std::filesystem::weakly_canonical(child_path).string();
+                        const auto child_live = native_policy::recomputing_cache
+                                                    ? nullptr : current_assembly_source(canonical);
+                        if (!child_live) {
+                            const std::string invalid = invalid_component_cache_stamp(
+                                child_path, row.at("doc_hash").get<std::string>());
+                            if (!invalid.empty()) row["invalid_cache_stamp"] = invalid;
+                        }
+                    } catch (...) {
+                        row["invalid_cache_stamp"] = component_file_stamp(child_path);
+                    }
+                    row.erase("size");
+                    row.erase("mtime");
+                }
+            }
+            key += ":" + sources.dump();
+        }
+    } else {
+        key += ":" + component_file_stamp(abspath);
     }
     return key;
 }
@@ -543,7 +792,9 @@ std::shared_ptr<const LoadedComponent> load_component(const std::string& path,
     // relative children. Canonical identity is only for cycle detection.
     const std::string abspath = std::filesystem::absolute(
         resolve_source_path(path, base_dir)).string();
-    if (!std::filesystem::exists(abspath)) {
+    const std::string canonical = std::filesystem::weakly_canonical(abspath).string();
+    const auto live = native_policy::recomputing_cache ? nullptr : current_assembly_source(canonical);
+    if (!live && !std::filesystem::exists(abspath)) {
         std::string message = "component source file does not exist: " + abspath + ".";
         if (std::filesystem::path(path).is_relative())
             message += " The stored path '" + path + "' is relative to the base folder '" +
@@ -553,11 +804,10 @@ std::shared_ptr<const LoadedComponent> load_component(const std::string& path,
                       {{"path", path}, {"resolved", abspath},
                        {"base", base_dir.empty() ? json(nullptr) : json(base_dir)}});
     }
-    const std::string canonical = std::filesystem::weakly_canonical(abspath).string();
     if (std::find(loading_paths.begin(), loading_paths.end(), canonical) != loading_paths.end())
         throw OpError("import_failed", "cyclic component reference: " + canonical,
                       {{"path", canonical}});
-    const std::string key = component_cache_key(abspath);
+    const std::string key = component_cache_key(abspath, live);
     std::shared_future<std::shared_ptr<const LoadedComponent>> fut;
     std::shared_ptr<std::promise<std::shared_ptr<const LoadedComponent>>> mine;
     std::uint64_t mine_age = 0;
@@ -580,9 +830,23 @@ std::shared_ptr<const LoadedComponent> load_component(const std::string& path,
         std::vector<std::string> material_keys;
         std::string error;
         json build_state;
-        auto bodies = load_bodies(abspath, appearances, material_keys, error, build_state);
+        json owner_map;
+        std::vector<std::shared_ptr<const void>> descendant_pins;
+        const std::string low = lower(abspath);
+        const bool native = ends_with(low, ".step+") || ends_with(low, ".stepplus");
+        const std::string disk_stamp = native && !live ? component_file_stamp(abspath) : std::string();
+        const auto source_document = native ? (live ? live->document : component_document(abspath))
+                                            : std::shared_ptr<const json>{};
+        auto bodies = load_bodies(abspath, appearances, material_keys, error, build_state,
+                                  owner_map, live, descendant_pins);
+        if (native) {
+            const bool unverified = build_state.is_object() &&
+                build_state.value("cache_trust", std::string()) == "unverified";
+            note_component_load(abspath, disk_stamp, bool(live), unverified);
+        }
         return describe_component(std::move(bodies), appearances, std::move(material_keys),
-                                  std::move(error), std::move(build_state));
+                                  std::move(error), std::move(build_state), std::move(owner_map),
+                                  source_document, abspath, std::move(descendant_pins));
     };
     // A→B and B→A can be owned by different prefetch workers. An unfinished
     // recursive hit must load locally (the path stack reports the eventual cycle),
@@ -593,7 +857,16 @@ std::shared_ptr<const LoadedComponent> load_component(const std::string& path,
     if (mine) {
         try {
             auto lc = load();
-            const bool cacheable = lc->error.empty() && component_cache_key(abspath) == key;
+            const auto current = native_policy::recomputing_cache
+                                     ? nullptr : current_assembly_source(canonical);
+            // Unverified bodies may be displayed immediately, but cannot survive a
+            // verification rebuild in the shared cache: a corrected cache.brep can
+            // retain the same authored document hash and would otherwise keep the
+            // old body (or a nested assembly containing it) alive under this key.
+            const bool unverified = lc->build_state.is_object() &&
+                lc->build_state.value("cache_trust", std::string()) == "unverified";
+            const bool cacheable = lc->error.empty() && !unverified &&
+                                   component_cache_key(abspath, current) == key;
             mine->set_value(lc);
             std::lock_guard<std::mutex> lk(g_cache_mtx);
             if (!cacheable) {
@@ -627,22 +900,380 @@ double bbox_diag(const std::vector<TopoDS_Shape>& bodies) {
     return std::max(d, 1e-3);
 }
 
+// Portable typed JSON signature shared with the MCP mate author. Stream the
+// canonical bytes instead of copying an entire feature history per selector.
+void mate_digest_u64(chudware::util::Sha256& hash, std::uint64_t value) {
+    std::uint8_t bytes[8];
+    for (int i = 0; i < 8; ++i) bytes[i] = static_cast<std::uint8_t>(value >> (56 - 8 * i));
+    hash.update(bytes, sizeof(bytes));
+}
+
+void mate_digest_tag(chudware::util::Sha256& hash, char tag) {
+    hash.update(reinterpret_cast<const std::uint8_t*>(&tag), 1);
+}
+
+void mate_digest_string(chudware::util::Sha256& hash, const std::string& value) {
+    mate_digest_tag(hash, 's');
+    mate_digest_u64(hash, value.size());
+    hash.update(reinterpret_cast<const std::uint8_t*>(value.data()), value.size());
+}
+
+void mate_digest_value(chudware::util::Sha256& hash, const json& value) {
+    if (value.is_null()) { mate_digest_tag(hash, 'n'); return; }
+    if (value.is_boolean()) { mate_digest_tag(hash, value.get<bool>() ? 't' : 'f'); return; }
+    if (value.is_string()) { mate_digest_string(hash, value.get_ref<const std::string&>()); return; }
+    if (value.is_number_unsigned()) {
+        mate_digest_tag(hash, 'i');
+        mate_digest_u64(hash, value.get<std::uint64_t>());
+        return;
+    }
+    if (value.is_number_integer()) {
+        mate_digest_tag(hash, 'i');
+        mate_digest_u64(hash, static_cast<std::uint64_t>(value.get<std::int64_t>()));
+        return;
+    }
+    if (value.is_number_float()) {
+        mate_digest_tag(hash, 'd');
+        const double number = value.get<double>();
+        std::uint64_t bits;
+        std::memcpy(&bits, &number, sizeof(bits));
+        mate_digest_u64(hash, bits);
+        return;
+    }
+    if (value.is_array()) {
+        mate_digest_tag(hash, 'a');
+        mate_digest_u64(hash, value.size());
+        for (const auto& item : value) mate_digest_value(hash, item);
+        return;
+    }
+    mate_digest_tag(hash, 'o');
+    mate_digest_u64(hash, value.size());
+    for (auto it = value.begin(); it != value.end(); ++it) {
+        mate_digest_string(hash, it.key());
+        mate_digest_value(hash, it.value());
+    }
+}
+
+std::string mate_signature(const json& value) {
+    chudware::util::Sha256 hash;
+    mate_digest_value(hash, value);
+    return hash.finish_hex();
+}
+
+std::string mate_context_signature(const json& doc) {
+    chudware::util::Sha256 hash;
+    mate_digest_tag(hash, 'o');
+    mate_digest_u64(hash, doc.size() - doc.count("id") - doc.count("features"));
+    for (auto it = doc.begin(); it != doc.end(); ++it) {
+        if (it.key() == "id" || it.key() == "features") continue;
+        mate_digest_string(hash, it.key());
+        mate_digest_value(hash, it.value());
+    }
+    return hash.finish_hex();
+}
+
+bool mate_source_provenance(const json& selector, const LoadedComponent& lc) {
+    const auto state = selector.find("_mate_source_state");
+    // Older files have only the unchanged-fingerprint check below.
+    if (state == selector.end()) return true;
+    if (!state->is_object() || !lc.source_document ||
+        lc.source_document->value("schema", std::string()) != "aicad.part/1" ||
+        !state->contains("context") || !(*state)["context"].is_string() ||
+        !state->contains("features") || !(*state)["features"].is_array() ||
+        !lc.source_document->contains("features") ||
+        !(*lc.source_document)["features"].is_array()) return false;
+    std::call_once(lc.source_signature_once, [&] {
+        lc.source_context_hash = mate_context_signature(*lc.source_document);
+        for (const auto& feature : (*lc.source_document)["features"])
+            lc.source_feature_hashes.push_back(mate_signature(feature));
+    });
+    const json& prior = (*state)["features"];
+    const json& current = lc.source_document->at("features");
+    if (lc.source_context_hash != (*state)["context"].get<std::string>() ||
+        !current.is_array() || prior.size() > lc.source_feature_hashes.size()) return false;
+    for (std::size_t i = 0; i < prior.size(); ++i)
+        if (!prior[i].is_string() || prior[i].get<std::string>() != lc.source_feature_hashes[i])
+            return false;
+    // Only appended independent primitive bodies can be proven not to modify
+    // the old feature history. Anything else requires explicit re-selection.
+    for (std::size_t i = prior.size(); i < current.size(); ++i) {
+        const json& feature = current[i];
+        if (!feature.is_object()) return false;
+        const auto params = feature.find("params");
+        if (params == feature.end() || !params->is_object() ||
+            params->value("mode", std::string()) != "new") return false;
+        const std::string type = feature.value("type", std::string());
+        if (type != "box" && type != "cylinder" && type != "sphere" &&
+            type != "cone" && type != "torus") return false;
+    }
+    return true;
+}
+
+// A scored nearest face is not topology provenance. For mates accept only a
+// unique unchanged fingerprint, additionally requiring the feature owner when
+// both snapshots have one. Changed/split faces are candidates, not remaps.
+std::optional<int> unchanged_mate_ref(const json& selector,
+                                      const std::vector<TopoInfo>& infos,
+                                      const std::vector<TopoDS_Shape>& shapes,
+                                      std::string* failure = nullptr) {
+    if (!selector.contains("centroid") || !selector["centroid"].is_array() ||
+        selector["centroid"].size() != 3) {
+        if (failure) *failure = "stored fingerprint has no three-coordinate centroid";
+        return std::nullopt;
+    }
+    const auto& c = selector["centroid"];
+    if (!c[0].is_number() || !c[1].is_number() || !c[2].is_number()) {
+        if (failure) *failure = "stored fingerprint centroid contains a non-numeric coordinate";
+        return std::nullopt;
+    }
+    const Eigen::Vector3d centroid(c[0].get<double>(), c[1].get<double>(), c[2].get<double>());
+    const auto same_direction = [&](const char* key, const std::optional<Eigen::Vector3d>& dir,
+                                    bool signed_direction) {
+        const auto it = selector.find(key);
+        if (it == selector.end() || it->is_null()) return true;
+        if (!dir || !it->is_array() || it->size() != 3 ||
+            !(*it)[0].is_number() || !(*it)[1].is_number() || !(*it)[2].is_number())
+            return false;
+        Eigen::Vector3d v((*it)[0].get<double>(), (*it)[1].get<double>(), (*it)[2].get<double>());
+        if (v.norm() < 1e-12 || dir->norm() < 1e-12) return false;
+        const double dot = v.normalized().dot(dir->normalized());
+        return (signed_direction ? dot : std::abs(dot)) > 1.0 - 1e-8;
+    };
+    std::optional<int> match;
+    int best_stage = -1;
+    bool best_same_sid = false;
+    auto rejected = [&](const TopoInfo& info, int stage, const char* check) {
+        if (!failure) return;
+        const auto sid = selector.find("sid");
+        const bool same_sid = sid != selector.end() && sid->is_string() &&
+                              make_selector(info)["sid"] == *sid;
+        if (best_stage < 0 || (same_sid && !best_same_sid) ||
+            (same_sid == best_same_sid && stage > best_stage)) {
+            best_stage = stage;
+            best_same_sid = same_sid;
+            *failure = std::string(same_sid ? "candidate with stored SID failed " :
+                                             "fingerprint candidate failed ") + check;
+        }
+    };
+    for (std::size_t i = 0; i < infos.size(); ++i) {
+        const TopoInfo& info = infos[i];
+        if (selector.contains("surf") && selector["surf"].is_string() &&
+            (!info.surf || *info.surf != selector["surf"].get<std::string>())) {
+            rejected(info, 0, "surface type"); continue;
+        }
+        if (selector.contains("owner_feature") && selector["owner_feature"].is_string() &&
+            info.owner && *info.owner != selector["owner_feature"].get<std::string>()) {
+            rejected(info, 1, "owner feature"); continue;
+        }
+        if ((info.centroid - centroid).norm() > 2e-5) {
+            rejected(info, 2, "centroid"); continue;
+        }
+        if (selector.contains("area_or_len") && selector["area_or_len"].is_number()) {
+            const double saved = selector["area_or_len"].get<double>();
+            if (!info.measure || std::abs(saved - *info.measure) > 2e-6 + 1e-9 * std::abs(saved)) {
+                rejected(info, 3, "area or length"); continue;
+            }
+        }
+        if (selector.contains("radius") && selector["radius"].is_number() &&
+            (!info.radius || std::abs(selector["radius"].get<double>() - *info.radius) > 2e-6)) {
+            rejected(info, 4, "radius"); continue;
+        }
+        if (!same_direction("axis", info.axis, false)) {
+            rejected(info, 5, "axis"); continue;
+        }
+        if (!same_direction("normal", info.rep_dir, true)) {
+            rejected(info, 6, "normal"); continue;
+        }
+        if (match) {
+            // Edges and vertices can be visited once per incident face.
+            if (i < shapes.size() && static_cast<std::size_t>(*match) < shapes.size() &&
+                shapes[i].IsSame(shapes[*match])) continue;
+            if (failure) *failure = "fingerprint matches multiple distinct subshapes";
+            return std::nullopt;
+        }
+        match = static_cast<int>(i);
+    }
+    if (!match && failure && best_stage < 0) *failure = "component has no candidate subshapes";
+    return match;
+}
+
+// When a source history changed, a complete, exactly matching serialized
+// geometry fingerprint plus the same SID is sufficient correspondence. Owner
+// and enumeration hints are deliberately excluded: either can change on a
+// rebuild without changing the referenced subshape.
+std::optional<int> same_sid_mate_ref(const json& selector,
+                                     const std::vector<TopoInfo>& infos,
+                                     const std::vector<TopoDS_Shape>& shapes,
+                                     std::string& failure) {
+    const auto sid = selector.find("sid");
+    if (sid == selector.end() || !sid->is_string() || sid->get_ref<const std::string&>().empty()) {
+        failure = "stored selector has no SID for the unchanged-geometry check";
+        return std::nullopt;
+    }
+    static constexpr const char* fields[] = {
+        "kind", "surf", "centroid", "axis", "area_or_len", "normal",
+        "concavity", "radius", "axis_point"
+    };
+    static constexpr const char* torus_fields[] = {
+        "major_radius", "minor_radius", "torus_axis", "torus_center"
+    };
+    for (const char* field : fields) {
+        if (!selector.contains(field)) {
+            failure = std::string("stored geometric fingerprint is missing '") + field + "'";
+            return std::nullopt;
+        }
+    }
+    const auto& c = selector["centroid"];
+    if (!c.is_array() || c.size() != 3 || !c[0].is_number() ||
+        !c[1].is_number() || !c[2].is_number()) {
+        failure = "stored geometric fingerprint has an invalid 'centroid'";
+        return std::nullopt;
+    }
+    const Eigen::Vector3d centroid(c[0].get<double>(), c[1].get<double>(), c[2].get<double>());
+    auto mismatch = [&](const json& current) -> const char* {
+        for (const char* field : fields)
+            if (!current.contains(field) || current[field] != selector[field]) return field;
+        for (const char* field : torus_fields)
+            if (selector.contains(field) != current.contains(field) ||
+                (selector.contains(field) && selector[field] != current[field])) return field;
+        return nullptr;
+    };
+    std::optional<int> match;
+    for (std::size_t i = 0; i < infos.size(); ++i) {
+        // make_selector rounds each centroid coordinate to 1e-6.
+        if ((infos[i].centroid - centroid).norm() > 2e-6) continue;
+        const json current = make_selector(infos[i]);
+        if (current["sid"] != *sid || mismatch(current)) continue;
+        if (match) {
+            if (i < shapes.size() && static_cast<std::size_t>(*match) < shapes.size() &&
+                shapes[i].IsSame(shapes[*match])) continue;
+            failure = "the SID and geometric fingerprint match multiple distinct subshapes";
+            return std::nullopt;
+        }
+        match = static_cast<int>(i);
+    }
+    if (match) return match;
+
+    // Diagnose the actual stored SID, even if its centroid failed the fast
+    // prefilter. This is only needed on the unresolved path.
+    for (const TopoInfo& info : infos) {
+        const json current = make_selector(info);
+        if (current["sid"] != *sid) continue;
+        if (const char* field = mismatch(current)) {
+            failure = std::string("SID matches, but geometric fingerprint '") + field + "' differs";
+            return std::nullopt;
+        }
+    }
+    failure = "no current subshape has the stored SID '" + sid->get<std::string>() + "'";
+    return std::nullopt;
+}
+
+// An incremental rebuild may retain the very same OCCT subshape even when an
+// unrelated earlier feature changed. Compare against the verified prior source
+// snapshot rather than inferring identity from a nearest geometric score.
+bool mate_preserved_subshape(const json& selector, const LoadedComponent& lc,
+                             const TopoDS_Shape& current) {
+    using Future = std::shared_future<std::shared_ptr<const LoadedComponent>>;
+    std::vector<Future> prior;
+    {
+        std::lock_guard<std::mutex> lock(g_cache_mtx);
+        for (const auto& entry : g_load_cache)
+            if (entry.second.path == lc.source_path &&
+                entry.second.body.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+                prior.push_back(entry.second.body);
+    }
+    const std::string kind = selector.value("kind", std::string());
+    for (const auto& future : prior) {
+        std::shared_ptr<const LoadedComponent> old;
+        try { old = future.get(); } catch (...) { continue; }
+        if (!old || old.get() == &lc || !mate_source_provenance(selector, *old)) continue;
+        ensure_component_topology(*old, kind);
+        const auto* infos = kind == "face" ? &old->faces
+            : kind == "edge" ? &old->edges : kind == "vertex" ? &old->verts : nullptr;
+        const auto* shapes = kind == "face" ? &old->face_shapes
+            : kind == "edge" ? &old->edge_shapes : kind == "vertex" ? &old->vertex_shapes : nullptr;
+        if (!infos || !shapes) continue;
+        const auto match = unchanged_mate_ref(selector, *infos, *shapes);
+        if (match && current.IsSame((*shapes)[*match])) return true;
+    }
+    return false;
+}
+
+std::string mate_ref_candidates(const json& selector, const LoadedComponent& lc) {
+    const std::string kind = selector.value("kind", std::string());
+    ensure_component_topology(lc, kind);
+    const std::vector<TopoInfo>* infos = kind == "face" ? &lc.faces
+        : kind == "edge" ? &lc.edges : kind == "vertex" ? &lc.verts : nullptr;
+    const std::vector<TopoDS_Shape>* shapes = kind == "face" ? &lc.face_shapes
+        : kind == "edge" ? &lc.edge_shapes : kind == "vertex" ? &lc.vertex_shapes : nullptr;
+    if (!infos || !shapes) return {};
+    json candidates = json::array();
+    std::vector<std::size_t> unique;
+    for (std::size_t i = 0; i < infos->size(); ++i) {
+        const auto& info = (*infos)[i];
+        if (selector.contains("surf") && selector["surf"].is_string() &&
+            (!info.surf || *info.surf != selector["surf"].get<std::string>())) continue;
+        bool duplicate = false;
+        for (std::size_t j : unique)
+            if ((*shapes)[i].IsSame((*shapes)[j])) { duplicate = true; break; }
+        if (duplicate) continue;
+        unique.push_back(i);
+    }
+    if (selector.contains("centroid") && selector["centroid"].is_array() &&
+        selector["centroid"].size() == 3 &&
+        std::all_of(selector["centroid"].begin(), selector["centroid"].end(),
+                    [](const json& v) { return v.is_number(); })) {
+        const auto& c = selector["centroid"];
+        const Eigen::Vector3d saved(c[0].get<double>(), c[1].get<double>(), c[2].get<double>());
+        std::stable_sort(unique.begin(), unique.end(), [&](std::size_t a, std::size_t b) {
+            return ((*infos)[a].centroid - saved).squaredNorm() <
+                   ((*infos)[b].centroid - saved).squaredNorm();
+        });
+    }
+    for (std::size_t i = 0; i < std::min<std::size_t>(8, unique.size()); ++i)
+        candidates.push_back(make_selector((*infos)[unique[i]]));
+    return " Source-component local-frame candidates (not automatically remapped; " +
+           std::to_string(unique.size()) + " total, up to 8 shown): " + candidates.dump();
+}
+
 // Resolve a selector against a component's LOCAL geometry into a MateGeom (port of
 // assembly.py::_selector_to_mategeom). Returns false (out-param unset) on a dangle.
 bool selector_to_mategeom(const json& selector, const LoadedComponent& lc,
-                          chudware::mate::MateGeom& out) {
+                          chudware::mate::MateGeom& out, std::string& failure) {
+    auto fail = [&](const std::string& why) {
+        failure = why;
+        return false;
+    };
     const std::string kind = selector.value("kind", std::string());
     ensure_component_topology(lc, kind);
-    double diag = bbox_diag(lc.bodies);
+    const auto* infos = kind == "face" ? &lc.faces
+        : kind == "edge" ? &lc.edges : kind == "vertex" ? &lc.verts : nullptr;
+    const auto* shapes = kind == "face" ? &lc.face_shapes
+        : kind == "edge" ? &lc.edge_shapes : kind == "vertex" ? &lc.vertex_shapes : nullptr;
+    if (!infos || !shapes) return fail("selector kind is not face, edge, or vertex");
+    auto matched = unchanged_mate_ref(selector, *infos, *shapes);
+    if (!matched || !mate_source_provenance(selector, lc)) {
+        std::string sid_failure;
+        const auto exact = same_sid_mate_ref(selector, *infos, *shapes, sid_failure);
+        if (exact) {
+            matched = exact;
+        } else if (!matched || !mate_preserved_subshape(selector, lc, (*shapes)[*matched])) {
+            if (!matched) {
+                std::string fingerprint_failure;
+                unchanged_mate_ref(selector, *infos, *shapes, &fingerprint_failure);
+                return fail(fingerprint_failure + "; " + sid_failure);
+            }
+            return fail("source history provenance changed and the previous OCCT subshape "
+                        "was not preserved; " + sid_failure);
+        }
+    }
 
     if (kind == "face") {
-        ResolveResult rr = resolve(selector, lc.faces, diag);
-        if (!rr.index) return false;
-        const TopoInfo& info = lc.faces[*rr.index];
-        const TopoDS_Shape& fs = lc.face_shapes[*rr.index];
+        const TopoInfo& info = lc.faces[*matched];
+        const TopoDS_Shape& fs = lc.face_shapes[*matched];
         const std::string surf = info.surf ? *info.surf : std::string();
         if (surf == "plane") {
-            if (!info.axis) return false;
+            if (!info.axis) return fail("matched plane has no normal");
             out.kind = "plane";
             out.point = info.centroid;
             out.normal = *info.axis;
@@ -662,7 +1293,7 @@ bool selector_to_mategeom(const json& selector, const LoadedComponent& lc,
                     axis = cone.Axis();
                     radius = cone.RefRadius();
                 } else {
-                    return false;
+                    return fail("matched cylindrical/conical face has a different OCCT surface type");
                 }
                 const gp_Pnt& origin = axis.Location();
                 const gp_Dir& direction = axis.Direction();
@@ -675,22 +1306,25 @@ bool selector_to_mategeom(const json& selector, const LoadedComponent& lc,
                 out.direction = d;
                 out.radius = radius;
                 return true;
-            } catch (const Standard_Failure&) {
-                return false;
+            } catch (const Standard_Failure& e) {
+                return fail(std::string("failed to extract cylindrical/conical mate geometry: ") +
+                            (e.GetMessageString() ? e.GetMessageString() : "OCCT failure"));
             }
         }
         if (surf == "sphere") {
             try {
                 BRepAdaptor_Surface ad(TopoDS::Face(fs));
-                if (ad.GetType() != GeomAbs_Sphere) return false;
+                if (ad.GetType() != GeomAbs_Sphere)
+                    return fail("matched spherical face has a different OCCT surface type");
                 const gp_Sphere sphere = ad.Sphere();
                 const gp_Pnt& center = sphere.Location();
                 out.kind = "sphere";
                 out.point = Eigen::Vector3d(center.X(), center.Y(), center.Z());
                 out.radius = sphere.Radius();
                 return true;
-            } catch (const Standard_Failure&) {
-                return false;
+            } catch (const Standard_Failure& e) {
+                return fail(std::string("failed to extract spherical mate geometry: ") +
+                            (e.GetMessageString() ? e.GetMessageString() : "OCCT failure"));
             }
         }
         // other surfaces: a plane at the centroid with its best normal.
@@ -701,14 +1335,13 @@ bool selector_to_mategeom(const json& selector, const LoadedComponent& lc,
     }
 
     if (kind == "edge") {
-        ResolveResult rr = resolve(selector, lc.edges, diag);
-        if (!rr.index) return false;
-        const TopoInfo& info = lc.edges[*rr.index];
-        const TopoDS_Shape& es = lc.edge_shapes[*rr.index];
+        const TopoInfo& info = lc.edges[*matched];
+        const TopoDS_Shape& es = lc.edge_shapes[*matched];
         if (info.surf && *info.surf == "circle") {
             try {
                 BRepAdaptor_Curve ad(TopoDS::Edge(es));
-                if (ad.GetType() != GeomAbs_Circle) return false;
+                if (ad.GetType() != GeomAbs_Circle)
+                    return fail("matched circular edge has a different OCCT curve type");
                 const gp_Circ circle = ad.Circle();
                 const gp_Pnt& center = circle.Location();
                 const gp_Dir& direction = circle.Axis().Direction();
@@ -717,8 +1350,9 @@ bool selector_to_mategeom(const json& selector, const LoadedComponent& lc,
                 out.direction = Eigen::Vector3d(direction.X(), direction.Y(), direction.Z());
                 out.radius = circle.Radius();
                 return true;
-            } catch (const Standard_Failure&) {
-                return false;
+            } catch (const Standard_Failure& e) {
+                return fail(std::string("failed to extract circular mate geometry: ") +
+                            (e.GetMessageString() ? e.GetMessageString() : "OCCT failure"));
             }
         }
         out.kind = "axis";
@@ -729,14 +1363,12 @@ bool selector_to_mategeom(const json& selector, const LoadedComponent& lc,
     }
 
     if (kind == "vertex") {
-        ResolveResult rr = resolve(selector, lc.verts, diag);
-        if (!rr.index) return false;
-        const TopoInfo& info = lc.verts[*rr.index];
+        const TopoInfo& info = lc.verts[*matched];
         out.kind = "point";
         out.point = info.centroid;
         return true;
     }
-    return false;
+    return fail("selector kind is not face, edge, or vertex");
 }
 
 
@@ -979,10 +1611,10 @@ std::string dangling_ref_reason(const json& ref, int i, bool component_loaded) {
         return at + " on component '" + cid + "' has selector kind '" + kind +
                "'. A mate ref needs a face, edge or vertex selector";
     return at + " " + kind + (sid.empty() ? "" : " '" + sid + "'") +
-           " did not resolve on component '" + cid + "'. No " + kind +
-           " of that component matches the stored selector, or its surface type changed. "
-           "This occurs when the component geometry changed after the mate was made. "
-           "Make the mate again with asm_mate and {component, query}";
+           " did not resolve on component '" + cid +
+           "'. The stored reference changed or its correspondence is ambiguous. "
+           "Inspect the source-frame candidates and recreate it with asm_mate and the "
+           "intended {component, query}; candidates are not automatic substitutions.";
 }
 
 }  // namespace
@@ -990,6 +1622,7 @@ std::string dangling_ref_reason(const json& ref, int i, bool component_loaded) {
 AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
                                 const std::optional<chudware::mate::WarmMap>& warm,
                                 const std::optional<chudware::mate::Drag>& drag) {
+    AssemblySourceScope source_scope;
     AssemblyResult res;
 
     // non-suppressed components, in tree order
@@ -1039,8 +1672,13 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
             std::atomic<std::size_t> next{0};
             std::vector<std::thread> pool;
             pool.reserve(n_workers);
+            const bool recomputing_cache = native_policy::recomputing_cache;
+            const auto source_snapshots = AssemblySourceScope::current();
             for (std::size_t w = 0; w < n_workers; ++w)
                 pool.emplace_back([&]() {
+                    AssemblySourceScope source_scope(source_snapshots);
+                    std::optional<native_policy::CacheRecomputeScope> verification_scope;
+                    if (recomputing_cache) verification_scope.emplace();
                     for (std::size_t i = next.fetch_add(1); i < paths.size();
                          i = next.fetch_add(1)) {
                         try {
@@ -1092,6 +1730,8 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
         st.ms = 0.0;
         res.component_status.push_back(std::move(st));
     }
+    res.component_cache_pins.reserve(prefetched.size());
+    for (const auto& entry : prefetched) res.component_cache_pins.push_back(entry.second);
 
     // --- resolve mate refs to local-frame MateGeom ----------------------
     chudware::mate::ResolvedGeometry resolved_geometry;
@@ -1116,9 +1756,12 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
                 continue;
             }
             chudware::mate::MateGeom geom;
-            if (!selector_to_mategeom(sel_obj, *lit->second, geom)) {
+            std::string failure;
+            if (!selector_to_mategeom(sel_obj, *lit->second, geom, failure)) {
                 dangling[mid].push_back("refs[" + std::to_string(i) + "]");
-                dangling_why[mid].emplace_back(i, dangling_ref_reason(ref, i, true));
+                dangling_why[mid].emplace_back(i, dangling_ref_reason(ref, i, true) +
+                                                   " Failed check: " + failure + "." +
+                                                   mate_ref_candidates(sel_obj, *lit->second));
                 continue;
             }
             resolved_geometry[{mid, i}] = geom;
@@ -1197,15 +1840,10 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
         if (rit != mate_residual.end()) st.residual = rit->second;
         auto dit = dangling.find(m.mate_id);
         if (dit != dangling.end()) {
-            // The solver names refs[0]/refs[1] when it marks the mate unresolved. A dangling
-            // extra ref (index >= 2) is known only here, so name every ref the reason lacks.
-            // A solver reason for any other status no longer applies to an unresolved mate.
-            const bool solver_named_pair = m.status == "unresolved" && !m.reason.empty();
-            if (!solver_named_pair) st.reason.clear();
-            for (const auto& [index, why] : dangling_why[m.mate_id]) {
-                if (solver_named_pair && index < 2) continue;
-                st.reason += (st.reason.empty() ? "" : "; ") + why;
-            }
+            // Prefer source-frame candidate diagnostics over the solver's generic reason.
+            st.reason.clear();
+            for (const auto& entry : dangling_why[m.mate_id])
+                st.reason += (st.reason.empty() ? "" : "; ") + entry.second;
             st.status = "unresolved";
             st.dangling_refs = dit->second;
         }
@@ -1221,7 +1859,8 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
                     [](const FeatureStatus& st) { return st.ok; }) &&
         std::none_of(res.mate_status.begin(), res.mate_status.end(),
                      [](const AsmMateStatus& st) {
-                         return st.status == "unresolved" || st.status == "conflicting";
+                         return st.status == "unresolved" || st.status == "conflicting" ||
+                                st.status == "unsatisfied";
                      });
     res.max_residual = solve_res.residuals.empty() ? solve_res.max_residual
                                                    : solve_res.residuals.front().max_abs;
@@ -1232,11 +1871,17 @@ AssemblyResult compile_assembly(const json& doc, const std::string& base_dir,
     return res;
 }
 
-json asm_component_fingerprints(const json& doc, const std::string& base_dir) {
+static json component_fingerprints(const json& doc, const std::string& base_dir, bool use_live) {
     json fp = json::array();
     const auto root = base_dir.empty() ? std::filesystem::path()
         : std::filesystem::absolute(base_dir).lexically_normal();
     auto append_path = [&](const std::string& source_path) {
+        if (source_path.empty()) {
+            // Keep a row for a component without a file source; compilation will
+            // report the component failure while retaining other components' geometry.
+            fp.push_back({{"path", ""}, {"size", 0}, {"mtime", 0}});
+            return;
+        }
         const auto absolute = std::filesystem::absolute(source_path).lexically_normal();
         const auto local = root.empty() ? std::filesystem::path()
             : absolute.lexically_relative(root);
@@ -1272,8 +1917,13 @@ json asm_component_fingerprints(const json& doc, const std::string& base_dir) {
     // collapse, but distinct adjacent part files remain independent dependencies.
     std::set<std::pair<std::string, std::string>> visited;
     for (size_t i = 0; i < fp.size(); ++i) {
-        const std::string path = resolve_source_path(
-            fp[i].at("path").get<std::string>(), root.string());
+        if (fp[i].at("path") == "") continue;
+        // Rows are generated above from already validated, resolved paths, not
+        // document-authored references. Reconstruct their OS path without passing
+        // an absolute internal path back through the rooted reference policy.
+        const std::string path =
+            (root / std::filesystem::path(fp[i].at("path").get<std::string>()))
+                .lexically_normal().string();
         const std::string low = lower(path);
         if (!ends_with(low, ".step+") && !ends_with(low, ".stepplus")) continue;
         std::error_code ec;
@@ -1285,8 +1935,11 @@ json asm_component_fingerprints(const json& doc, const std::string& base_dir) {
             visited.emplace(identity, ec ? std::filesystem::path(path).parent_path().string()
                                          : parent.string()).second;
         try {
-            const auto child = component_document(identity);
-            fp[i]["doc_hash"] = component_document_hash(identity, *child);
+            const auto live = use_live && !native_policy::recomputing_cache
+                                  ? current_assembly_source(identity) : nullptr;
+            const auto child = live ? live->document : component_document(identity);
+            fp[i]["doc_hash"] = live ? live->doc_hash : component_document_hash(identity, *child);
+            if (live && live->unsaved) fp[i]["live_unsaved"] = true;
             if (first_visit)
                 append_components(*child, std::filesystem::path(path).parent_path().string());
         } catch (...) {
@@ -1297,27 +1950,46 @@ json asm_component_fingerprints(const json& doc, const std::string& base_dir) {
     return fp;
 }
 
+json asm_component_fingerprints(const json& doc, const std::string& base_dir) {
+    return component_fingerprints(doc, base_dir, false);
+}
+
+json asm_live_component_fingerprints(const json& doc, const std::string& base_dir) {
+    return component_fingerprints(doc, base_dir, true);
+}
+
+static bool fingerprints_match(const json& now, const json& fp) {
+    if (!fp.is_array() || now.size() != fp.size()) return false;
+    for (std::size_t i = 0; i < now.size(); ++i) {
+        const json& cur = now[i];
+        const json& saved = fp[i];
+        if (!saved.is_object() || cur.at("path") != saved.value("path", json())) return false;
+        const auto now_hash = cur.find("doc_hash");
+        const auto saved_hash = saved.find("doc_hash");
+        if (now_hash != cur.end() && saved_hash != saved.end()) {
+            if (*now_hash != *saved_hash) return false;
+            continue;
+        }
+        // Older disk fingerprints may lack hashes. They cannot certify a live
+        // unsaved source, even if the unchanged disk stamp happens to match.
+        if (cur.value("live_unsaved", false) || saved.value("live_unsaved", false)) return false;
+        if (cur.at("size") != saved.value("size", json()) ||
+            cur.at("mtime") != saved.value("mtime", json())) return false;
+    }
+    return true;
+}
+
 bool asm_fingerprints_match(const json& doc, const std::string& base_dir, const json& fp) {
     try {
-        if (!fp.is_array()) return false;
-        const json now = asm_component_fingerprints(doc, base_dir);
-        if (now.size() != fp.size()) return false;
-        for (std::size_t i = 0; i < now.size(); ++i) {
-            const json& cur = now[i];
-            const json& saved = fp[i];
-            if (!saved.is_object() || cur.at("path") != saved.value("path", json())) return false;
-            if (cur.at("size") == saved.value("size", json()) &&
-                cur.at("mtime") == saved.value("mtime", json()))
-                continue;
-            // A rewrite that kept the document — its build state refreshed after a rebuild
-            // (contracts/stepplus.md §17) — is the same source.
-            const auto now_hash = cur.find("doc_hash");
-            const auto saved_hash = saved.find("doc_hash");
-            if (now_hash != cur.end() && saved_hash != saved.end() && *now_hash == *saved_hash)
-                continue;
-            return false;
-        }
-        return true;
+        return fingerprints_match(asm_component_fingerprints(doc, base_dir), fp);
+    } catch (...) {
+        return false;
+    }
+}
+
+bool asm_live_fingerprints_match(const json& doc, const std::string& base_dir, const json& fp) {
+    try {
+        return fingerprints_match(asm_live_component_fingerprints(doc, base_dir), fp);
     } catch (...) {
         return false;
     }
@@ -1337,6 +2009,226 @@ std::map<std::string, Eigen::Vector3d> explode_offsets(const json& doc, double f
         Eigen::Vector3d unit = n > 1e-9 ? (vec / n) : vec;
         out[cid] = unit * dist * factor;
     }
+    return out;
+}
+
+namespace {
+// One component as the auto-explode planner sees it: world AABB of all its bodies, the
+// world insertion axes its axis-kind mate refs resolved to, and (lazily) per-face AABBs
+// used as its occupancy when it is a parent other components are pulled out of.
+struct ExplodeComp {
+    std::string id;
+    std::vector<TopoDS_Shape> world;  // placed (Moved, no copy) bodies
+    Eigen::Vector3d lo{0, 0, 0}, hi{0, 0, 0};
+    double volume = 0.0;
+    std::vector<Eigen::Vector3d> axes;
+    std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> faces;
+    bool faces_ready = false;
+    int parent = -1;
+    Eigen::Vector3d offset{0, 0, 0};
+};
+
+bool box_of(const TopoDS_Shape& shape, Eigen::Vector3d& lo, Eigen::Vector3d& hi) {
+    Bnd_Box box;
+    BRepBndLib::Add(shape, box, /*useTriangulation=*/true);
+    if (box.IsVoid()) return false;
+    double xa, ya, za, xb, yb, zb;
+    box.Get(xa, ya, za, xb, yb, zb);
+    lo = Eigen::Vector3d(xa, ya, za);
+    hi = Eigen::Vector3d(xb, yb, zb);
+    return true;
+}
+
+// Projected interval of an AABB onto unit direction d.
+std::pair<double, double> box_interval(const Eigen::Vector3d& lo, const Eigen::Vector3d& hi,
+                                       const Eigen::Vector3d& d) {
+    const Eigen::Vector3d c = 0.5 * (lo + hi), h = 0.5 * (hi - lo);
+    const double mid = c.dot(d), r = h.dot(d.cwiseAbs());
+    return {mid - r, mid + r};
+}
+
+double box_overlap_volume(const Eigen::Vector3d& alo, const Eigen::Vector3d& ahi,
+                          const Eigen::Vector3d& blo, const Eigen::Vector3d& bhi) {
+    double v = 1.0;
+    for (int k = 0; k < 3; ++k) {
+        const double e = std::min(ahi[k], bhi[k]) - std::max(alo[k], blo[k]);
+        if (e <= 0.0) return 0.0;
+        v *= e;
+    }
+    return v;
+}
+
+void ensure_faces(ExplodeComp& c) {
+    if (c.faces_ready) return;
+    c.faces_ready = true;
+    for (const TopoDS_Shape& shape : c.world)
+        for (TopExp_Explorer ex(shape, TopAbs_FACE); ex.More(); ex.Next()) {
+            Eigen::Vector3d lo, hi;
+            if (box_of(ex.Current(), lo, hi)) c.faces.emplace_back(lo, hi);
+        }
+    if (c.faces.empty()) c.faces.emplace_back(c.lo, c.hi);
+}
+
+// Distance `moving` must travel along unit u (moving.offset already applied by the caller
+// through `shift`) until no face box of `parent` lies in its swept footprint ahead of it.
+// Face boxes, not the parent's single AABB: a part under a long barrel is only blocked by
+// the faces actually above/below it, not by the stock at the other end of the gun.
+double clearance_along(ExplodeComp& parent, const ExplodeComp& moving,
+                       const Eigen::Vector3d& shift, const Eigen::Vector3d& u) {
+    ensure_faces(parent);
+    Eigen::Vector3d v = u.unitOrthogonal(), w = u.cross(v);
+    const Eigen::Vector3d mlo = moving.lo + shift, mhi = moving.hi + shift;
+    const auto mu = box_interval(mlo, mhi, u);
+    const auto mv = box_interval(mlo, mhi, v);
+    const auto mw = box_interval(mlo, mhi, w);
+    const double eps = 1e-6 * (1.0 + (mhi - mlo).norm());
+    double t = 0.0;
+    for (const auto& [flo, fhi] : parent.faces) {
+        const Eigen::Vector3d plo = flo + parent.offset, phi = fhi + parent.offset;
+        const auto fv = box_interval(plo, phi, v);
+        if (fv.second <= mv.first + eps || fv.first >= mv.second - eps) continue;
+        const auto fw = box_interval(plo, phi, w);
+        if (fw.second <= mw.first + eps || fw.first >= mw.second - eps) continue;
+        const auto fu = box_interval(plo, phi, u);
+        if (fu.second <= mu.first + eps) continue;  // behind the moving part
+        t = std::max(t, fu.second - mu.first);
+    }
+    return t;
+}
+}  // namespace
+
+std::map<std::string, Eigen::Vector3d> auto_explode_vectors(const AssemblyResult& r) {
+    std::vector<ExplodeComp> comps;
+    std::map<std::string, std::size_t> index;
+    for (const AsmBodyOut& body : r.bodies) {
+        if (body.shape_local.IsNull()) continue;
+        const TopoDS_Shape world = placed_world_shape(body);
+        Eigen::Vector3d lo, hi;
+        if (!box_of(world, lo, hi)) continue;
+        auto [it, added] = index.emplace(body.component_id, comps.size());
+        if (added) {
+            comps.emplace_back();
+            comps.back().id = body.component_id;
+            comps.back().lo = lo;
+            comps.back().hi = hi;
+        }
+        ExplodeComp& c = comps[it->second];
+        c.world.push_back(world);
+        c.lo = c.lo.cwiseMin(lo);
+        c.hi = c.hi.cwiseMax(hi);
+    }
+    std::map<std::string, Eigen::Vector3d> out;
+    if (comps.size() < 2) return out;
+
+    Eigen::Vector3d alo = comps[0].lo, ahi = comps[0].hi;
+    for (const ExplodeComp& c : comps) { alo = alo.cwiseMin(c.lo); ahi = ahi.cwiseMax(c.hi); }
+    const double L = std::max((ahi - alo).norm(), 1e-6);
+    const double tol = 1e-3 * L;
+    for (ExplodeComp& c : comps) {
+        const Eigen::Vector3d e = (c.hi - c.lo).cwiseMax(Eigen::Vector3d::Constant(tol));
+        c.volume = e.prod();
+    }
+
+    // World insertion axes from the resolved axis refs (local frame -> solved placement).
+    for (const auto& [mate_id, refs] : r.mate_geometry) {
+        (void)mate_id;
+        for (const AsmMateRefGeom& ref : refs) {
+            if (ref.geom.kind != "axis") continue;
+            const auto ci = index.find(ref.component);
+            const auto xf = r.transforms.find(ref.component);
+            if (ci == index.end() || xf == r.transforms.end() || xf->second.size() != 16) continue;
+            const auto& m = xf->second;
+            const Eigen::Vector3d d = ref.geom.direction;
+            Eigen::Vector3d wd(m[0] * d.x() + m[1] * d.y() + m[2] * d.z(),
+                               m[4] * d.x() + m[5] * d.y() + m[6] * d.z(),
+                               m[8] * d.x() + m[9] * d.y() + m[10] * d.z());
+            if (wd.norm() < 1e-9) continue;
+            wd.normalize();
+            // Snap near-world-aligned axes so stacked fasteners read as clean rails.
+            int k;
+            if (wd.cwiseAbs().maxCoeff(&k) > 0.985) wd = Eigen::Vector3d::Unit(k) * (wd[k] > 0 ? 1 : -1);
+            comps[ci->second].axes.push_back(wd);
+        }
+    }
+
+    // Biggest first: the anchor (largest) stays put; every other component is pulled out of
+    // the most specific bigger component it sits in and then rides along with that parent,
+    // so fasteners stay grouped with the bracket they hold instead of scattering.
+    std::vector<std::size_t> order(comps.size());
+    for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+        return comps[a].volume > comps[b].volume;
+    });
+    const std::size_t anchor = order[0];
+    const Eigen::Vector3d axis_dirs[6] = {Eigen::Vector3d::UnitZ(), -Eigen::Vector3d::UnitZ(),
+                                          Eigen::Vector3d::UnitY(), -Eigen::Vector3d::UnitY(),
+                                          Eigen::Vector3d::UnitX(), -Eigen::Vector3d::UnitX()};
+    for (std::size_t oi = 1; oi < order.size(); ++oi) {
+        ExplodeComp& c = comps[order[oi]];
+        const Eigen::Vector3d grow = Eigen::Vector3d::Constant(tol + 0.01 * (c.hi - c.lo).norm());
+        const Eigen::Vector3d clo = c.lo - grow, chi = c.hi + grow;
+        const double cvol = (chi - clo).prod();
+        double best = 0.0;
+        std::vector<std::pair<double, std::size_t>> overlaps;
+        for (std::size_t pj = 0; pj < oi; ++pj) {
+            const std::size_t j = order[pj];
+            const double f = box_overlap_volume(clo, chi, comps[j].lo, comps[j].hi) / cvol;
+            if (f <= 0.0) continue;
+            overlaps.emplace_back(f, j);
+            best = std::max(best, f);
+        }
+        std::size_t parent = anchor;
+        double parent_volume = std::numeric_limits<double>::max();
+        for (const auto& [f, j] : overlaps)
+            if (f >= 0.6 * best && comps[j].volume < parent_volume) {
+                parent = j;
+                parent_volume = comps[j].volume;
+            }
+        c.parent = static_cast<int>(parent);
+        ExplodeComp& p = comps[parent];
+        const double pdiag = (p.hi - p.lo).norm();
+        const Eigen::Vector3d rel = 0.5 * (c.lo + c.hi) - 0.5 * (p.lo + p.hi);
+
+        std::vector<Eigen::Vector3d> candidates;
+        if (!c.axes.empty()) {
+            candidates = {c.axes.front(), -c.axes.front()};
+        } else {
+            candidates.assign(std::begin(axis_dirs), std::end(axis_dirs));
+        }
+        Eigen::Vector3d u = candidates.front();
+        double travel = 0.0, score = std::numeric_limits<double>::max();
+        for (const Eigen::Vector3d& d : candidates) {
+            const double t = clearance_along(p, c, p.offset, d);
+            // Ties go to the side the part already sits on, so it leaves through the near face.
+            const double s = t - 0.25 * rel.dot(d);
+            if (s < score - 1e-9) { score = s; u = d; travel = t; }
+        }
+        const auto ext = box_interval(c.lo, c.hi, u);
+        const double gap = 0.5 * (ext.second - ext.first) + std::min(0.12 * pdiag, 0.06 * L);
+        travel += gap;
+
+        // Stack against already-placed siblings so parts leaving the same parent never land
+        // inside one another; push further out along u until the exploded boxes are clear.
+        const double spacing = 0.25 * gap;
+        for (int pass = 0; pass < static_cast<int>(oi) + 1; ++pass) {
+            bool moved = false;
+            const Eigen::Vector3d shift = p.offset + u * travel;
+            const Eigen::Vector3d mlo = c.lo + shift, mhi = c.hi + shift;
+            for (std::size_t pj = 1; pj < oi; ++pj) {
+                const ExplodeComp& s = comps[order[pj]];
+                if (s.parent != c.parent) continue;
+                const Eigen::Vector3d slo = s.lo + s.offset, shi = s.hi + s.offset;
+                if (box_overlap_volume(mlo, mhi, slo, shi) <= 0.0) continue;
+                const double need = box_interval(slo, shi, u).second -
+                                    box_interval(mlo, mhi, u).first + spacing;
+                if (need > 0.0) { travel += need; moved = true; break; }
+            }
+            if (!moved) break;
+        }
+        c.offset = p.offset + u * travel;
+    }
+    for (const ExplodeComp& c : comps)
+        if (c.offset.cwiseAbs().maxCoeff() > 1e-9) out[c.id] = c.offset;
     return out;
 }
 
@@ -1369,8 +2261,8 @@ TopoDS_Shape placed_world_shape(const AsmBodyOut& body,
 namespace {
 // A native part component compiled WITH owner attribution, for assembly pick resolution.
 // The normal component load path is geometry-only (and may come straight from cache.brep),
-// so it never carries owners; this is built lazily on the first pick and cached by the same
-// file-stamp key as the geometry.
+// so it never carries owners; compile the same live or disk document lazily on the
+// first pick, keyed by the same recursive source identity as the geometry.
 struct ComponentOwners {
     std::vector<TopoDS_Shape> shapes;
     std::vector<std::map<int, std::string>> faces, edges;
@@ -1382,7 +2274,9 @@ std::map<std::string, std::pair<std::uint64_t, std::shared_ptr<const ComponentOw
 std::uint64_t g_owner_clock = 0;  // protected by g_owner_mtx
 
 std::shared_ptr<const ComponentOwners> component_owners(const std::string& abspath) {
-    const std::string key = component_cache_key(abspath);
+    const std::string canonical = std::filesystem::weakly_canonical(abspath).string();
+    const auto live = native_policy::recomputing_cache ? nullptr : current_assembly_source(canonical);
+    const std::string key = component_cache_key(abspath, live);
     {
         std::lock_guard<std::mutex> lock(g_owner_mtx);
         auto it = g_owner_cache.find(key);
@@ -1391,7 +2285,7 @@ std::shared_ptr<const ComponentOwners> component_owners(const std::string& abspa
             return it->second.second;
         }
     }
-    const auto doc = component_document(abspath);
+    const auto doc = live ? live->document : component_document(abspath);
     if (doc->value("schema", std::string()) == "aicad.asm/1") return nullptr;
     CompileResult r = compile_document(*doc, env_from_doc(*doc), nullptr,
                                        ::geom::DisplayQuality::Fine, false, /*with_owners=*/true);

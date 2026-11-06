@@ -24,7 +24,7 @@ So Cycle 1 runs in MOCK mode: the agent_fn replays scripted per-role turns that 
 ledger events. This proves the harness + classifier + report end to end and is labeled
 as mock everywhere. Scripted turns do not react to a dial change, so any pass-rate
 DELTA from a dial adjustment is only meaningful for the deterministic, structural dials
-(council thresholds, trigger packs, tier budgets asserted at assembly) — those deltas
+(trigger packs, tier budgets asserted at assembly) — those deltas
 are real; model-behaviour deltas are documented as pending-provision.
 """
 from __future__ import annotations

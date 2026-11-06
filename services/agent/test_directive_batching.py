@@ -93,7 +93,10 @@ def test_single_directive_replies_are_unchanged():
 # ---------------------------------------------------------------------------
 
 
-def test_a_batch_runs_every_call_on_one_completion():
+def test_a_batch_runs_every_call_on_one_completion(monkeypatch):
+    from services.agent import guardrails
+    monkeypatch.setattr(guardrails, "_doc_tree", lambda *a, **kw: {"features": []})
+    monkeypatch.setattr(guardrails, "_engine_body_count", lambda doc_id: 1)
     seen = []
     p = _ScriptedProvider([
         _batch(_fence("new_part", name="holster"),
@@ -106,6 +109,10 @@ def test_a_batch_runs_every_call_on_one_completion():
     def dispatch(tool, args):
         # How many completions had been billed when this call went out.
         seen.append((tool, len(p.seen_messages)))
+        if tool == "verify_battery":
+            return {"ok": True, "verdict": "pass",
+                    "coverage": {"ran": ["is_manifold"]},
+                    "scores": {"is_manifold": 1.0}, "findings": []}
         return {"ok": True}
 
     res = at.run_turn("build me a holster", p, allowed_tools=_ALLOW,
@@ -207,7 +214,10 @@ def test_a_real_failure_still_drops_the_rest_of_the_batch():
     assert "[BATCH HALTED]" in told
 
 
-def test_a_finish_envelope_after_calls_still_finishes():
+def test_a_finish_envelope_after_calls_still_finishes(monkeypatch):
+    from services.agent import guardrails
+    monkeypatch.setattr(guardrails, "_doc_tree", lambda *a, **kw: {"features": []})
+    monkeypatch.setattr(guardrails, "_engine_body_count", lambda doc_id: 1)
     seen = []
     p = _ScriptedProvider([
         _batch(_fence("new_part", name="p"),
@@ -219,6 +229,10 @@ def test_a_finish_envelope_after_calls_still_finishes():
 
     def dispatch(tool, args):
         seen.append((tool, len(p.seen_messages)))
+        if tool == "verify_battery":
+            return {"ok": True, "verdict": "pass",
+                    "coverage": {"ran": ["is_manifold"]},
+                    "scores": {"is_manifold": 1.0}, "findings": []}
         return {"ok": True}
 
     res = at.run_turn("build a plate", p, allowed_tools=_ALLOW,

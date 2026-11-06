@@ -21,15 +21,19 @@ thing in a fresh subprocess so a bad-geometry OCCT crash cannot take down the ca
 from __future__ import annotations
 
 import contextlib
+import inspect
 import io
 import json
 import logging
+import math
 import os
 import re
 import subprocess
 import sys
 import traceback
 from dataclasses import asdict, dataclass, field, fields
+from decimal import Decimal
+from numbers import Real
 from pathlib import Path
 from typing import Any, Optional
 from services.agent.request_context import (
@@ -151,6 +155,221 @@ def _forgiving_primitive(real, aliases):
         return _real(*args, **kw)
     return make
 
+# Search resolution, not a claim about a global minimum or maximum. OCCT's
+# success set need not be monotone, so the reported bracket is local to probes.
+_FILLET_ABS_TOL = 1e-6
+_FILLET_REL_TOL = 1e-5
+_FILLET_SEED_STEPS = 20
+_FILLET_REFINE_STEPS = 40
+
+
+def _closed_fillet_solid(solid) -> bool:
+    """Check the closed B-rep, including the seam/degenerate exceptions."""
+    from OCP.BRep import BRep_Tool
+    from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE
+    from OCP.TopExp import TopExp
+    from OCP.TopoDS import TopoDS
+    from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
+
+    if solid.is_null or not solid.is_valid or not math.isfinite(solid.volume) or solid.volume <= 0:
+        return False
+    ancestors = TopTools_IndexedDataMapOfShapeListOfShape()
+    TopExp.MapShapesAndAncestors_s(solid.wrapped, TopAbs_EDGE, TopAbs_FACE, ancestors)
+    if not ancestors.Extent():
+        return False
+    for index in range(1, ancestors.Extent() + 1):
+        edge = TopoDS.Edge_s(ancestors.FindKey(index))
+        if BRep_Tool.Degenerated_s(edge):
+            continue
+        faces = list(ancestors.FindFromIndex(index))
+        if len(faces) == 2:
+            continue
+        if len(faces) == 1 and BRep_Tool.IsClosed_s(edge, TopoDS.Face_s(faces[0])):
+            continue
+        return False
+    return True
+
+
+def _fillet_3d(real, signature, args, kw):
+    """Apply a verified all-edge fillet without inserting search trials into a builder."""
+    from build123d import Edge, Mode, Part, Compound
+    from build123d.build_common import Builder, flatten_sequence, validate_inputs
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy
+    from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet
+    from OCP.Standard import Standard_Failure
+    from OCP.StdFail import StdFail_NotDone
+    from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE
+    from OCP.TopExp import TopExp
+    from OCP.TopoDS import TopoDS
+    from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape, TopTools_IndexedMapOfShape
+
+    # Bind before touching geometry so duplicate, missing and unknown arguments
+    # retain their normal Python API errors.
+    bound = signature.bind(*args, **kw)
+    radius = bound.arguments["radius"]
+    if not isinstance(radius, (Real, Decimal)):
+        return real(*args, **kw)
+    try:
+        requested = float(radius)
+    except OverflowError as exc:
+        raise ValueError("fillet radius is outside the kernel numeric range") from exc
+    if not math.isfinite(requested):
+        raise ValueError("fillet radius must be finite and within the kernel numeric range")
+    if requested == 0 and radius != 0:
+        raise ValueError("fillet radius is outside the kernel numeric range")
+
+    objects = bound.arguments["objects"]
+    if objects is None:
+        return real(*args, **kw)
+    # build123d also flattens filters and nested sequences. Materialize once,
+    # so a filter is not consumed during inspection and lost on application.
+    edges = flatten_sequence(objects)
+    bound.arguments["objects"] = edges
+    if not edges:
+        raise ValueError("fillet requires at least one selected edge")
+    context = Builder._get_context("fillet")
+    validate_inputs(context, "fillet", edges)
+    target = context._obj if context is not None else edges[0].topo_parent
+    if target is None or target._dim != 3 or not all(isinstance(e, Edge) for e in edges):
+        return real(*bound.args, **bound.kwargs)
+
+    solids = target.solids()
+    if not solids or not target.is_valid or not all(_closed_fillet_solid(s) for s in solids):
+        raise ValueError("fillet requires a valid closed solid")
+    ancestors = TopTools_IndexedDataMapOfShapeListOfShape()
+    TopExp.MapShapesAndAncestors_s(target.wrapped, TopAbs_EDGE, TopAbs_FACE, ancestors)
+    for edge in edges:
+        native = edge.wrapped
+        if native is None or not ancestors.Contains(native):
+            raise ValueError("fillet selection contains an edge outside the target")
+        faces = list(ancestors.FindFromKey(native))
+        if (BRep_Tool.Degenerated_s(native) or len(faces) != 2
+                or faces[0].IsSame(faces[1])
+                or any(BRep_Tool.IsClosed_s(native, TopoDS.Face_s(f)) for f in faces)):
+            raise ValueError("fillet selection has unsupported seam or non-manifold topology")
+
+    def build(candidate, detached):
+        # The successful requested fast path operates directly on the same target
+        # as build123d. Search probes instead use fresh topology and geometry
+        # copies, preserving both the builder and the original selected edges.
+        if detached:
+            copier = BRepBuilderAPI_Copy(target.wrapped, True, False)
+            shape = copier.Shape()
+            native_edges = [TopoDS.Edge_s(copier.ModifiedShape(e.wrapped)) for e in edges]
+        else:
+            shape = target.wrapped
+            native_edges = [e.wrapped for e in edges]
+        builder = BRepFilletAPI_MakeFillet(shape)
+        for edge in native_edges:
+            builder.Add(candidate, edge)
+            if builder.Contour(edge) <= 0:
+                raise ValueError("fillet selection has an unsupported edge without a contour")
+        try:
+            builder.Build()
+        except StdFail_NotDone:
+            return None
+        except Standard_Failure as exc:
+            raise RuntimeError(
+                "fillet kernel failure; radius feasibility could not be determined"
+            ) from exc
+        if not builder.IsDone():
+            return None
+        result = builder.Shape()
+        if result.IsNull() or result.IsSame(shape):
+            return None
+        result_faces = TopTools_IndexedMapOfShape()
+        TopExp.MapShapes_s(result, TopAbs_FACE, result_faces)
+        for edge in native_edges:
+            if not any(f.ShapeType() == TopAbs_FACE and result_faces.Contains(f)
+                       for f in builder.Generated(edge)):
+                return None
+        new_part = target._make_3d_result(result)
+        result_solids = new_part.solids()
+        if (not new_part.is_valid or len(result_solids) != len(solids)
+                or not all(_closed_fillet_solid(s) for s in result_solids)):
+            return None
+        return new_part
+
+    def apply(new_part):
+        # This is the same replacement and return wrapping used by build123d's
+        # 3D fillet. No successful trial is ever added to the live context.
+        if context is not None:
+            context._add_to_context(new_part, mode=Mode.REPLACE)
+        return Part(Compound([new_part]).wrapped)
+
+    if requested > 0:
+        exact = build(requested, detached=False)
+        if exact is not None:
+            return apply(exact)
+
+    size = target.bounding_box().size
+    scale = max(size.X, size.Y, size.Z)
+    if not math.isfinite(scale) or scale <= 0:
+        raise ValueError("fillet cannot determine a usable geometry scale")
+    seed = max(scale * 0.01, _FILLET_ABS_TOL * 4)
+    # Try a bounded geometric ladder in both directions. A successful witness
+    # is required before any failed construction can bracket a correction.
+    witness = None
+    for step in range(_FILLET_SEED_STEPS):
+        for candidate in ((seed,) if step == 0 else (seed * 2 ** step, seed / 2 ** step)):
+            if not math.isfinite(candidate) or candidate <= _FILLET_ABS_TOL * 0.25:
+                continue
+            if build(candidate, detached=True) is not None:
+                witness = candidate
+                break
+        if witness is not None:
+            break
+    if witness is None:
+        raise ValueError(
+            "fillet could not find a verified radius for every selected edge; "
+            "geometry or radius feasibility is unsupported or undetermined"
+        )
+
+    # Tighten a large upper bracket by expansion; never assume the failure means
+    # a mathematical radius limit. The other endpoint is an actual success.
+    if requested > witness:
+        good, bad = witness, requested
+        for _ in range(_FILLET_SEED_STEPS):
+            candidate = min(good * 2, bad)
+            if candidate >= bad or not math.isfinite(candidate):
+                break
+            if build(candidate, detached=True) is None:
+                bad = candidate
+                break
+            good = candidate
+        lower, upper, good_is_lower = good, bad, True
+    else:
+        # Zero is not a valid positive fillet radius; a failed positive request
+        # is otherwise the observed lower endpoint.
+        lower, upper, good_is_lower = max(requested, 0.0), witness, False
+    for _ in range(_FILLET_REFINE_STEPS):
+        tolerance = max(_FILLET_ABS_TOL, _FILLET_REL_TOL * max(abs(lower), abs(upper)))
+        if upper - lower <= tolerance:
+            break
+        candidate = lower + (upper - lower) / 2
+        if candidate <= lower or candidate >= upper:
+            break
+        valid = build(candidate, detached=True) is not None
+        if valid == good_is_lower:
+            lower = candidate
+        else:
+            upper = candidate
+    tolerance = max(_FILLET_ABS_TOL, _FILLET_REL_TOL * max(abs(lower), abs(upper)))
+    if upper - lower > tolerance:
+        raise ValueError("fillet search exhausted its bounded refinement without a reliable bracket")
+    effective = lower if good_is_lower else upper
+    actual = build(effective, detached=False)
+    if actual is None:
+        raise ValueError("fillet could not reproduce the verified radius on the original shape")
+    result = apply(actual)
+    print(f"[kernel] fillet radius: requested={requested:.17g}, effective={effective:.17g}; "
+          f"verified {len(edges)}/{len(edges)} selected edges; observed bracket "
+          f"[{lower:.17g}, {upper:.17g}] mm, resolution {upper - lower:.6g} mm "
+          f"(target max({_FILLET_ABS_TOL:g} mm, {_FILLET_REL_TOL:g} relative)); "
+          "local probes only, not a global radius limit.")
+    return result
+
 
 def _build123d_namespace() -> dict:
     import build123d as b3d
@@ -192,9 +411,9 @@ def _build123d_namespace() -> dict:
     # wrong - `chamfer(solid, edges=es, radius=r)` / `fillet(part, edges=es, length=r)` - which
     # crashes the whole script ("unexpected keyword argument 'edges'"). Wrap both so the edges
     # can arrive via edges=/objects= (dropping a spurious solid passed positionally) and the
-    # magnitude via either radius=/length=/size=, mapped to the canonical kwarg. Correct calls
-    # pass straight through untouched.
+    # magnitude via either radius=/length=/size=, mapped to the canonical kwarg.
     def _wrap_edge_op(real, mag_kw):
+        signature = inspect.signature(real) if mag_kw == "radius" else None
         def op(*args, _f=real, _mag=mag_kw, **kw):
             target = None
             for k in ("edges", "objects", "edge", "object", "targets", "edge_list"):
@@ -208,13 +427,13 @@ def _build123d_namespace() -> dict:
                     if k in kw:
                         kw[_mag] = kw.pop(k)
                         break
+            if _mag == "radius":
+                return _fillet_3d(_f, signature, args, kw)
             try:
                 return _f(*args, **kw)
             except Exception as first_err:  # noqa: BLE001
-                # The #1 fillet/chamfer failure is a magnitude too large for a thin wall —
-                # and a cosmetic feature should never kill an otherwise-good part. Retry at
-                # progressively smaller sizes, announcing any clamp on stdout (which is fed
-                # back to the model) so the downgrade is visible, never silent.
+                # Preserve the pre-existing chamfer retry behavior separately;
+                # fillet failures are handled by the verified all-edge path.
                 mag = kw.get(_mag)
                 if not isinstance(mag, (int, float)) or mag <= 0:
                     raise

@@ -6,6 +6,8 @@ import json
 import os
 import subprocess
 import sys
+import zipfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -147,10 +149,21 @@ def test_metadata_ping_failure_is_not_silenced(engine, monkeypatch):
         perf._engine_metadata()
 
 
+def _invalid_fillet_workload():
+    # A real edge plus an impossible circular edge on a box: the complete
+    # selection must fail, rather than silently blending the valid subset.
+    fillet = perf._fillet(2)
+    fillet["feature"]["refs"]["edges"] = [
+        {"of": "edge", "parallel": "z"},
+        {"of": "edge", "surf": "circle"},
+    ]
+    return [perf._box("Block", 80, 60, 40), fillet]
+
+
 @pytest.mark.parametrize("warmup,phase", [(0, "sample"), (1, "warmup")])
 def test_invalid_fillet_never_produces_a_timing_and_closes_its_document(engine, warmup, phase):
     before = engine.call("doc_list", {})["docs"]
-    ops = [perf._box("Block", 80, 60, 40), perf._fillet(-1)]
+    ops = _invalid_fillet_workload()
     with pytest.raises(perf.MeasurementError) as caught:
         perf._time_build(ops, iters=1, warmup=warmup)
     assert caught.value.detail["phase"] == phase
@@ -158,21 +171,76 @@ def test_invalid_fillet_never_produces_a_timing_and_closes_its_document(engine, 
     assert engine.call("doc_list", {})["docs"] == before
 
 
-def test_failed_measurements_are_reported_and_cannot_update_baseline(engine, monkeypatch, tmp_path):
-    call = engine.call
+def test_failed_sample_after_successful_warmup_has_no_measurement(engine):
+    before = engine.call("doc_list", {})["docs"]
+    workloads = iter(([perf._box("Block", 80, 60, 40)], _invalid_fillet_workload()))
+    with pytest.raises(perf.MeasurementError) as caught:
+        perf._time_iterations(lambda: perf._build_once(next(workloads)), iters=1, warmup=1)
+    assert caught.value.detail["phase"] == "sample"
+    assert caught.value.detail["completed_samples"] == []
+    assert len(caught.value.detail["completed_warmups"]) == 1
+    assert engine.call("doc_list", {})["docs"] == before
 
-    def namespace_call(method, params):
-        # Document-scoped wrappers need not repeat the native library's ABI.
-        return {"ok": True} if method == "ping" else call(method, params)
 
-    monkeypatch.setattr(engine, "call", namespace_call)
-    monkeypatch.setitem(perf.WORKLOADS, "fillet", [perf._box("Block", 80, 60, 40), perf._fillet(-1)])
+def test_open_workload_is_a_real_warm_cache_measurement(engine):
+    before = engine.call("doc_list", {})["docs"]
+    metric = perf._time_open(iters=1, warmup=1)
+    assert metric["status"] == "ok"
+    assert metric["n"] == 1
+    for sample in metric["warmups"] + metric["samples"]:
+        assert sample["cache"]["cache_hit"] is True
+        assert sample["cache"]["warm"] is True
+        assert sample["cache"]["features_executed"] == 0
+    assert engine.call("doc_list", {})["docs"] == before
+
+
+def test_lost_persisted_cache_cannot_be_a_warm_benchmark(engine, monkeypatch):
+    before = engine.call("doc_list", {})["docs"]
+    original = perf._rpc
+    observed = []
+
+    def lose_cache(method, params):
+        response = original(method, params)
+        if method == "doc_save":
+            path = Path(params["path"])
+            with zipfile.ZipFile(path) as source:
+                members = [(info, source.read(info)) for info in source.infolist()
+                           if not info.filename.startswith("cache.")]
+            replacement = path.with_suffix(".cold")
+            with zipfile.ZipFile(replacement, "w") as target:
+                for info, data in members:
+                    target.writestr(info, data)
+            os.replace(replacement, path)
+        elif method == "doc_open":
+            observed.append(response)
+        return response
+
+    monkeypatch.setattr(perf, "_rpc", lose_cache)
+    with pytest.raises(perf.MeasurementError) as caught:
+        perf._time_open(iters=1, warmup=1)
+    assert observed and observed[0]["cache_hit"] is False
+    assert caught.value.detail["phase"] == "warmup"
+    assert caught.value.detail["completed_samples"] == []
+    assert caught.value.detail["completed_warmups"] == []
+    assert engine.call("doc_list", {})["docs"] == before
+
+
+@pytest.mark.parametrize("existing_baseline", [False, True])
+def test_failed_measurements_are_reported_and_cannot_update_baseline(
+        engine, monkeypatch, tmp_path, existing_baseline):
+    monkeypatch.setitem(perf.WORKLOADS, "fillet", _invalid_fillet_workload())
     baseline, report = tmp_path / "baseline.json", tmp_path / "failed.json"
+    previous = b'{"sentinel":"do not overwrite"}\n'
+    if existing_baseline:
+        baseline.write_bytes(previous)
     before = engine.call("doc_list", {})["docs"]
     code = perf.main(["perf_regression.py", "--iters", "1", "--workload", "fillet",
                       "--update", "--baseline", str(baseline), "--json", str(report)])
     assert code == 3
-    assert not baseline.exists()
+    if existing_baseline:
+        assert baseline.read_bytes() == previous
+    else:
+        assert not baseline.exists()
     record = json.loads(report.read_text(encoding="utf-8"))
     assert record["status"] == "failed"
     assert record["engine"]["abi"] == engine._load().chudware_abi_version().decode("utf-8")

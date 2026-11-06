@@ -37,7 +37,8 @@ void rpc_session_import(
 // and `err` carries a reason; `url`/`cacheDir` are empty.
 void rpc_start_url(
     AppState& st, const std::string& site,
-    std::function<void(bool ok, const std::string& url,
-                       const std::string& cacheDir, const std::string& err)> cb);
+    std::function<void(bool ok, const std::string& url, const std::string& cacheDir,
+                       const std::vector<std::string>& cookieDomains,
+                       const std::string& err)> cb);
 
 }  // namespace ui::cef

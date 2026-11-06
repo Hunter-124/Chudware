@@ -59,6 +59,8 @@ public:
     // non-blocking poll. Returns false on timeout, EOF, or error — use eof()
     // to distinguish a dead peer from a timeout.
     bool readLine(std::string& line, int timeoutMs);
+    // Non-consuming hangup probe, safe while the owning thread dispatches.
+    bool peerDisconnected() const;
 
     // Write `line` + '\n' fully. Serialized by the CALLER (per-conn write mutex
     // lives in the protocol layer, where response writes and event pushes meet).
@@ -76,6 +78,10 @@ public:
     // the per-client threads — close() alone does NOT interrupt a thread already parked
     // in poll() on Linux, which hung ~Server to the systemd stop timeout (SIGABRT).
     void shutdown();
+    // Connecting process with OS-proven live generation, or -1 when unavailable.
+    // Never infer it from hello. Currently Linux SO_PEERPIDFD (kernel 6.5+);
+    // other transports fail closed rather than trusting a recyclable PID.
+    long peerPid() const;
 #if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
     int fd() const { return fd_; }
 #endif
@@ -163,7 +169,9 @@ private:
     std::string path_;
 };
 
-// Client-side connect. Returns an invalid conn (err filled) if nothing listens.
-IpcConn connectTo(const std::string& path, std::string& err);
+// Client-side connect. Returns an invalid conn (err filled) if nothing listens, the
+// listener never admits the connection within ~5 s, or *cancelled becomes true.
+IpcConn connectTo(const std::string& path, std::string& err,
+                  const std::atomic<bool>* cancelled = nullptr);
 
 }  // namespace chudware_ipc

@@ -43,8 +43,14 @@
 #include <TopoDS_Shape.hxx>
 
 #include "geom/tessellate.h"  // geom::DisplayQuality (display tessellation tier)
+#include "geom/sheetmetal.h"  // geom::BendRecord
+
+namespace geom { struct FilletValidationResult; }
 
 namespace chudware::doc {
+
+// Shared solid policy for document fillets and the isolated shape-build worker.
+::geom::FilletValidationResult validate_fillet_solid(const TopoDS_Shape& shape);
 
 // One feature's compile outcome, in tree order. `ok==false` carries a non-empty
 // `error` (mirrors compiler.py's per-feature status dicts).
@@ -53,16 +59,17 @@ struct FeatureStatus {
     std::string type;
     bool ok = false;
     std::string error;    // empty when ok
-    std::string warning;  // non-fatal note on an ok feature (e.g. fillet rounded a subset of edges)
+    std::string warning;  // non-fatal note on an ok feature (e.g. corrected fillet radii)
     double ms = 0.0;      // wall-clock this feature took to compile (rebuild profiling; 0 if untimed)
     // True when this feature's result was REUSED from the incremental-rebuild prefix cache
     // instead of recompiled (see CompileCache below). `ms` then reports the ORIGINAL compile
     // cost from the run that produced it, not this run's (near-zero) restore cost.
     bool reused = false;
-    // Structured per-feature RESULT record, surfaced as `feature_status[].data`. Null for
-    // every feature that has nothing measured to report; `heal` uses it to carry its
-    // before/after BRepCheck verdict + volumes, which is the evidence that makes a repair
-    // auditable instead of a claim.
+    // The feature lies after the rollback bar and was not compiled.
+    bool rolled_back = false;
+    // Structured per-feature RESULT record, surfaced as `feature_status[].data`.
+    // Fillets report requested/effective radii and all-edge coverage in `fillet`;
+    // heal reports before/after BRepCheck verdicts and volumes. Null otherwise.
     nlohmann::json data = nullptr;
 };
 
@@ -103,6 +110,11 @@ struct CompileResult {
     std::vector<uint8_t> aicm;            // serialized SURVIVING solid bodies (write_aicm)
     int body_count = 0;                   // surviving solids after the whole tree
     double volume = 0.0;                  // total solid volume of surviving bodies (mm^3)
+    // B-rep-exact solid volume / bbox / face + solid counts of `shapes`, memoized by the
+    // ops-response (session.cpp exact_geometry_stats). `volume` above is read off the display
+    // triangulation, which is not a basis a small edit's before/after delta can be measured on.
+    // Null until first asked; computed at most once per result, under the document lock.
+    mutable nlohmann::json exact_stats;
     std::vector<BodyInfo> bodies_info;    // per-surviving-body stats (surfacing parity gate)
     // Per-creating-feature topology map (host picking): {fid: {bodies:[ordinal...],
     // faces:[[ordinal,topo_id]...], edges:[...]}} with 1-based AICM body ordinal +
@@ -111,6 +123,8 @@ struct CompileResult {
     // split by a boss, merged by UnifySameDomain) keeps its earlier owner (geom/op_history.h).
     nlohmann::json owner_map;
     // The surviving solid shapes in AICM body order (shapes[i] <-> body ordinal i+1).
+    // Top-level mesh_references are independent display/measurement entities;
+    // they never enter this array, the body order, booleans, BOM, or exports.
     // Lets a caller describe a picked body's topology (doc_resolve_pick).
     std::vector<TopoDS_Shape> shapes;
     // Owner (solid id: a feature id, or "<fid>#k" for a split piece) per 1-based TopExp
@@ -133,6 +147,8 @@ struct CompileResult {
     // outline + holes are read back off the solid's broad face). Empty when the doc has
     // no flat pattern. Parity basis: engine/doc/compiler.py CompileResult.sheet_metal_flat.
     nlohmann::json sheet_metal_flat = nlohmann::json::object();
+    // Resolved bend construction records; not a current-topology certification.
+    std::vector<::geom::BendRecord> sheet_metal_bends;
     // Displayable reference geometry: datum axis/plane/point/csys features produce no body, so they
     // never reach the AICM. Each entry surfaces the resolved geometry so the host can DRAW them as
     // reference overlays (the host had no way to show a created datum before). Shapes:
@@ -147,10 +163,7 @@ struct CompileResult {
     // ("Default" for a config-less doc). Surfaced in the ops-response doc_status so
     // the host's config switcher knows which config the geometry matches.
     std::string active_configuration = "Default";
-    // Incremental-rebuild accounting (CompileCache): how many features were served from a
-    // cached prefix checkpoint vs actually executed this compile. reused+executed may be
-    // less than statuses.size() only never — they always sum to the feature count. 0/N on
-    // a cache-less compile. Surfaced in ops_response.rebuild.doc_status for tests/profiling.
+    // Incremental-rebuild accounting excludes rolled-back features.
     int features_reused = 0;
     int features_executed = 0;
     // Phase timing (ms): the feature loop (incl. restored-prefix bookkeeping), the
@@ -174,12 +187,14 @@ struct CompileResult {
 // belongs to ONE document session and must only be used under that session's lock (the
 // engine serialises all doc access through g_mtx today, so this holds by construction).
 //
-// How it works: every compile hashes a CHAIN over its inputs — h0 = fnv(env, active
-// config), h[i+1] = fnv(h[i], feature[i].json) — and checkpoints the loop-carried
-// compiler state after each executed feature. The next compile walks the new chain
-// against the cached one, restores the DEEPEST matching checkpoint, and executes only
-// the divergent suffix: editing feature k of N recompiles k..N, not 1..N. A fully
-// matching chain (plus unchanged appearances) returns the cached CompileResult outright.
+// How it works: every compile hashes a CHAIN over its inputs — the environment,
+// active configuration, and effective feature definitions — and checkpoints the
+// loop-carried compiler state after each feature. Derived fillet-effective records
+// are excluded; features depending on later definitions also hash that dependency.
+// The next compile restores the DEEPEST matching checkpoint. Supported independent
+// downstream sketch/plane/new-sweep features can also reuse their results when their
+// explicit inputs match; name-collision warnings are refreshed. Others execute.
+// A fully matching chain (plus unchanged appearances) returns the cached CompileResult.
 // Content-addressed, so undo/redo/config switches/failed-compile rollbacks can never be
 // served stale state — a mismatch is just a cache miss. Checkpoint shapes are refcounted
 // TopoDS handles shared with the live result, so memory cost is the intermediate
@@ -189,15 +204,15 @@ std::shared_ptr<CompileCache> make_compile_cache();
 // Copy the mutable cache index; frozen checkpoints/results remain shared just as
 // they do across incremental compiles. Caller holds the source session's lock.
 std::shared_ptr<CompileCache> copy_compile_cache(const CompileCache& source);
-// Global compile-cache counters for the profiler: {full_hits, features_reused,
-// features_executed, compiles} since engine start (process-wide, all docs).
+// Global compile-cache counters for the profiler: compiles, full_hits, features_reused,
+// features_executed, bodies_reused and bodies_tessellated, since engine start.
 nlohmann::json compile_cache_stats();
 
 // --- persisted build state (the `.step+` `cache.ckpt` entry; contracts/stepplus.md §4) ---
 // Serialize the per-feature checkpoints of `cache` that still match `doc`'s compile chain
 // (env + active config + `quality` + feature json), so a reopened document restores them
-// and its first edit executes only the divergent tail instead of the whole tree. Every
-// shape of every checkpoint is written into ONE BinTools set (sub-shape and geometry
+// and can reuse the matching prefix and eligible independent downstream features.
+// The shape of every checkpoint is written into ONE BinTools set (sub-shape and geometry
 // sharing survive the round trip, so TopExp ordinals and owner attribution are
 // unchanged); results/statuses/owner maps are pooled so shared slots are written once.
 // Only checkpoints after a run of successful features are kept (the prefix before the

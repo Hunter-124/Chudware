@@ -145,17 +145,6 @@ void warningsList(const json& res) {
         if (w.is_string()) kit::inlineStatus(w.get<std::string>().c_str(), kit::Tone::Warn);
 }
 
-// ---- document -----------------------------------------------------------------------------------
-
-void markDocDirty(AppState& st, const std::string& docId) {
-    for (auto& tab : st.docTabs) {
-        if (tab.docId != docId) continue;
-        tab.dirty = true;
-        tab.historyCleared = false;
-        if (tab.aiHandoff) tab.userAdopted = true;
-        return;
-    }
-}
 
 // ---- StudyRecordStore ---------------------------------------------------------------------------
 
@@ -240,8 +229,10 @@ void StudyRecordStore::saveRecord(AppState& st, Slot& slot, json record) {
         slot.synced = record.dump();
         upsertLocal(record);
         const std::string studyId = slot.id;
+        st.beginHumanMutation(docId);
         st.rpc.call("sim_study_edit", {{"doc_id", docId}, {"study_id", studyId}, {"study", record}},
                     [this, alive, &st, docId, studyId](const core::RpcResult& r) {
+                        st.endHumanMutation(docId);
                         if (alive.expired()) return;
                         if (!studyRpcOk(r)) {
                             st.addLog(cfg_.logTag + " could not save study " + studyId + ": " +
@@ -249,15 +240,17 @@ void StudyRecordStore::saveRecord(AppState& st, Slot& slot, json record) {
                             setStatus(cfg_.saveFailedStatus, 3);
                             return;
                         }
-                        markDocDirty(st, docId);
+                        st.markHumanEdit(docId, r.result.value("revision", 0));
                     },
                     15000);
         return;
     }
     slot.addPending = true;
     Slot* sp = &slot;
+    st.beginHumanMutation(docId);
     st.rpc.call("sim_study_add", {{"doc_id", docId}, {"study", record}},
                 [this, alive, &st, docId, sp, record](const core::RpcResult& r) {
+                    st.endHumanMutation(docId);
                     if (alive.expired()) return;
                     sp->addPending = false;
                     if (!studyRpcOk(r)) {
@@ -270,7 +263,7 @@ void StudyRecordStore::saveRecord(AppState& st, Slot& slot, json record) {
                     saved["id"] = sp->id;
                     sp->synced = saved.dump();
                     upsertLocal(saved);
-                    markDocDirty(st, docId);
+                    st.markHumanEdit(docId, r.result.value("revision", 0));
                     if (sp->resave) {
                         sp->resave = false;
                         json next = std::move(sp->pending);
@@ -290,8 +283,10 @@ void StudyRecordStore::deleteRecord(AppState& st, Slot& slot) {
                                   [&](const json& r) { return jstr(r, "id") == studyId; }),
                    records_.end());
     std::weak_ptr<int> alive = alive_;
+    st.beginHumanMutation(docId);
     st.rpc.call("sim_study_delete", {{"doc_id", docId}, {"study_id", studyId}},
                 [this, alive, &st, docId, studyId](const core::RpcResult& r) {
+                    st.endHumanMutation(docId);
                     if (alive.expired()) return;
                     if (!studyRpcOk(r)) {
                         st.addLog(cfg_.logTag + " could not delete study " + studyId + ": " +
@@ -299,7 +294,7 @@ void StudyRecordStore::deleteRecord(AppState& st, Slot& slot) {
                         setStatus(cfg_.deleteFailedStatus, 3);
                         return;
                     }
-                    markDocDirty(st, docId);
+                    st.markHumanEdit(docId, r.result.value("revision", 0));
                 },
                 15000);
 }

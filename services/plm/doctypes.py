@@ -34,11 +34,12 @@ from typing import Any
 # (resolved by the C++ hub's doc_type icon map); ``fields`` are the extra
 # metadata keys the Files page offers for that type (all optional, free-form).
 DOC_TYPES: dict[str, dict[str, Any]] = {
-    # --- CAD documents (container-backed; doc_type usually left implicit) ---
+    # --- CAD documents -----------------------------------------------------
     "part":        {"label": "Part",        "kind": "part",         "store": "container", "icon": "part"},
     "assembly":    {"label": "Assembly",    "kind": "assembly",     "store": "container", "icon": "assembly"},
     "drawing":     {"label": "Drawing",     "kind": "drawing",      "store": "container", "icon": "drawing"},
     "ecad":        {"label": "Electronics", "kind": "ecad",         "store": "container", "icon": "ecad"},
+    "kicad":       {"label": "Electronics", "kind": "ecad",         "store": "file",      "icon": "ecad"},
     "cam":         {"label": "Manufacturing","kind": "cam",         "store": "container", "icon": "cam"},
     # --- engineering documents (single files, stored verbatim) -------------
     "spec":        {"label": "Specification", "kind": "requirements", "store": "file", "icon": "spec",
@@ -68,9 +69,12 @@ CONTAINER_DOC_TYPES = frozenset(
     dt for dt, d in DOC_TYPES.items() if d["store"] == "container"
 )
 
+KICAD_SUFFIXES = (".kicad_pcb", ".kicad_sch")
+
 # extension → doc_type (single files). Detection is best-effort; the user can
 # always retag. Unknown extensions fall through to the generic ``document``.
 _EXT_DOC_TYPE = {
+    ".kicad_pcb": "kicad", ".kicad_sch": "kicad",
     ".md": "spec", ".rst": "spec",
     ".pdf": "report", ".docx": "report", ".doc": "report", ".odt": "report",
     ".rtf": "report", ".html": "report", ".htm": "report",
@@ -112,6 +116,11 @@ def kind_for(doc_type: str | None) -> str:
 def storage_form(doc_type: str | None) -> str:
     """``container`` | ``file`` | ``tree`` | ``link`` for *doc_type*."""
     return descriptor(doc_type).get("store", "file")
+
+
+def is_kicad_file(path: str) -> bool:
+    """Whether a file path names a KiCad board or schematic."""
+    return str(path).lower().endswith(KICAD_SUFFIXES)
 
 
 def detect_doc_type(path: str, head: bytes = b"") -> str:

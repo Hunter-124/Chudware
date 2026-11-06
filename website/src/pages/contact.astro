@@ -4,12 +4,12 @@ import '../styles/company.css';
 
 const REPO = 'https://github.com/Hunter-124/Chudware';
 ---
-<BaseLayout title="Contact" description="Contact the Chudware project: general questions, bug reports and feature requests on GitHub, contributions, and private security disclosure.">
+<BaseLayout title="Contact" description="Ask about Chudware setup or optional paid hosting, report bugs, contribute, or disclose a security issue privately.">
   <header class="page-hero">
     <div class="wrap">
       <p class="eyebrow">Contact</p>
       <h1>Send it to the right place.</h1>
-      <p class="lede">Bugs and feature requests belong in the public issue tracker, where others can find them. Do not include passwords, provider credentials, or confidential project files in an issue or an email.</p>
+      <p class="lede">Report a problem, ask about setup, or discuss optional paid, owner-operated hosting that supports the project. Source, issues, and contribution instructions are available in the public repository. Do not include passwords, provider credentials, or confidential project files in an issue or an email.</p>
     </div>
   </header>
 
@@ -23,25 +23,25 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
         <article class="co-route">
           <p class="eyebrow">Bug reports</p>
           <h3>Bugs and feature requests</h3>
-          <p>A failed workflow, a crash, a wrong result, or a capability you need. Search the existing issues first, then open a new one.</p>
+          <p>Search existing issues before reporting a crash, wrong result, or needed capability. You can also email support with a minimal non-confidential report.</p>
           <a class="co-route-address" href={`${REPO}/issues`}>github.com/Hunter-124/Chudware/issues</a>
         </article>
         <article class="co-route">
           <p class="eyebrow">Contributions</p>
           <h3>Code, docs, and fixes</h3>
-          <p>Send changes as pull requests. The contributing guide covers the development setup and what a change needs before review.</p>
+          <p>Send changes as pull requests to the public repository and follow the contributing guide. Email support to discuss a contribution.</p>
           <a class="co-route-address" href={`${REPO}/blob/HEAD/CONTRIBUTING.md`}>CONTRIBUTING.md</a>
         </article>
         <article class="co-route co-route-urgent">
           <p class="eyebrow">Security</p>
           <h3>Vulnerability disclosure</h3>
           <p>Report vulnerabilities privately, never in a public issue. Include what's affected, the impact, and steps to reproduce. There is no bug bounty.</p>
-          <a class="co-route-address" href={`${REPO}/security/policy`}>Security policy</a>
+          <a class="co-route-address" href="mailto:support@chudware.com?subject=Private%20security%20report">support@chudware.com</a>
         </article>
         <article class="co-route">
-          <p class="eyebrow">General</p>
-          <h3>Everything else</h3>
-          <p>Questions about the project that don't fit an issue or a pull request.</p>
+          <p class="eyebrow">Setup and hosting</p>
+          <h3>Run it yourself, or ask us to operate it</h3>
+          <p>Clone the public repository to run Chudware yourself, or ask about optional paid hosting that supports development. Hosting availability, terms, and data handling are arranged directly; there is no checkout or signup. Desktop and self-hosted software remain free under the MIT License.</p>
           <a class="co-route-address" href="mailto:support@chudware.com?subject=Chudware%20inquiry">support@chudware.com</a>
         </article>
       </div>
@@ -59,7 +59,7 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
           <li><a class="text-link" href="/faq/">FAQ</a><p>Product scope, licensing, platforms, files, and AI providers.</p></li>
           <li><a class="text-link" href="/docs/">Documentation</a><p>Installation and task guides for modeling, assemblies, CAM, PLM, reverse engineering, and the copilot.</p></li>
           <li><a class="text-link" href="/docs/troubleshooting/">Troubleshooting</a><p>Launch, graphics, modeling, and copilot problems.</p></li>
-          <li><a class="text-link" href="/download/">Download</a><p>Desktop builds for Windows, Linux, and macOS.</p></li>
+          <li><a class="text-link" href="/download/">Setup choices</a><p>Public source, desktop packaging notes, and experimental browser self-hosting.</p></li>
           <li><a class="text-link" href="/changelog/">Changelog</a><p>Published release and project updates.</p></li>
         </ul>
       </div>
@@ -75,9 +75,9 @@ const REPO = 'https://github.com/Hunter-124/Chudware';
   <section class="section cta-band">
     <div class="wrap section-heading">
       <p class="eyebrow">Evaluate first</p>
-      <h2>Try it before you write.</h2>
-      <p class="lede">Download the app or read the source — it may answer the question faster.</p>
-      <div class="actions"><a class="button" href="/download/">Download</a><a class="button button-secondary" href={REPO}>View on GitHub</a></div>
+      <h2>Choose the setup that fits your work.</h2>
+      <p class="lede">The guides explain free self-hosting and current desktop availability before you make a hosting inquiry.</p>
+      <div class="actions"><a class="button" href="/download/">See setup choices</a><a class="button button-secondary" href="/docs/self-hosting/">Self-hosting guide</a></div>
     </div>
   </section>
 </BaseLayout>

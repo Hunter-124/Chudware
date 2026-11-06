@@ -190,6 +190,12 @@ def test_document_events_and_mesh_paths_are_scoped_to_opened_documents(environme
         event = ws.receive_json()
         assert event["data"]["doc_id"] == "doc-1"
         assert event["data"]["aicm_path"] == ""
+        fake.inject(b'{"event":"doc.presented","data":{"doc_id":"new-workspace-doc","name":"visible","revision":2}}\n'
+                    b'{"event":"doc.changed","data":{"doc_id":"foreign"}}\n'
+                    b'{"event":"doc.changed","data":{"doc_id":"doc-1","revision":3}}\n')
+        assert ws.receive_json() == {"event": "doc.presented",
+                                     "data": {"doc_id": "new-workspace-doc", "name": "visible", "revision": 2}}
+        assert ws.receive_json() == {"event": "doc.changed", "data": {"doc_id": "doc-1", "revision": 3}}
 
 
 def test_foreign_actor_events_are_filtered(environment):

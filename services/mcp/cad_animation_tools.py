@@ -15,11 +15,11 @@ Three rules bind every kind:
    ``cad_common._render_view_png`` / ``_annotate_render`` — the same two calls render_part
    and contact_sheet use — so a film and a still of the same document cannot disagree about
    what the geometry looks like. Nothing here reimplements a rasterizer.
-2. **The caller's document is never mutated.** ``turntable`` only renders. ``explode`` and
-   ``motion`` need per-frame component poses, so they open a DETACHED CLONE of the
-   document's own file (``doc_open(path, detach_path=True)``) and move components on the
-   clone; the caller's doc keeps its geometry, revision, undo history and dirty flag. A doc
-   with no file is refused rather than quietly edited.
+2. **The caller's document is never mutated.** ``turntable`` only renders (or uses a
+   detached clone when display quality is requested). ``explode`` and ``motion`` need
+   per-frame component poses, so they open a detached clone of a private snapshot of the
+   current revision. The caller keeps its geometry, revision, undo history and dirty flag,
+   even if it has never been saved.
 3. **Every number on screen is measured.** The per-frame footer carries the engine build id,
    the polymesh commit, the document and the frame index; the caption carries bytes, frame
    count, fps, duration, sha256 and each kind's own measured quantities. A value the engine
@@ -48,6 +48,8 @@ import shutil
 import subprocess
 import tempfile
 import time
+from .cad_motion_tools import _clone_detached
+from .cad_asm_tools import run_motion_sweep
 
 from .cad_common import (
     _annotate_render,
@@ -501,26 +503,6 @@ def _doc_row(doc_id: str) -> dict:
     return {}
 
 
-def _clone_detached(doc_id: str, kind: str) -> str:
-    """A DETACHED copy of `doc_id`, opened from the document's own file.
-
-    This is what keeps `explode`/`motion` honest: the poses are applied to the clone, so
-    the caller's document is untouched — no ops, no revision bump, no dirty flag, no undo
-    entry. `detach_path=True` also leaves the clone unbound to the file, so nothing this
-    tool does can ever overwrite the source."""
-    row = _doc_row(doc_id)
-    path = row.get("path")
-    if not path or not os.path.exists(str(path)):
-        raise ValueError(
-            f"render_animation(kind={kind!r}) renders a DETACHED CLONE of the document so "
-            "your live doc is never modified, and a clone can only be opened from a file. "
-            f"Document {doc_id} has no saved file — call save_part(path=...) first, then "
-            "animate it.")
-    r = cb.call("doc_open", {"path": str(path), "detach_path": True})
-    clone = r.get("doc_id")
-    if not clone:
-        raise ValueError(f"doc_open({path}) returned no doc_id; cannot animate a clone.")
-    return clone
 
 
 def _components(doc_id: str) -> list:
@@ -957,9 +939,9 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                          view: Optional[Union[str, dict]] = None,
                          highlight: Optional[Union[str, dict, list]] = None,
                          display_quality: Optional[str] = None,
-                         factor: float = 1.0,
+                         factor: Optional[float] = None,
                          components: Optional[list] = None,
-                         reverse: bool = False,
+                         reverse: Optional[bool] = None,
                          mate_id: Optional[str] = None,
                          start: Optional[float] = None,
                          stop: Optional[float] = None,
@@ -967,9 +949,10 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                          steer: Optional[dict] = None,
                          rear_steer: Optional[dict] = None,
                          poses: Optional[list] = None,
-                         min_clearance_mm: float = 0.0,
+                         min_clearance_mm: Optional[float] = None,
+                         check_interference: Optional[bool] = None,
                          vtu_path: Optional[str] = None,
-                         field: str = "von_mises",
+                         field: Optional[str] = None,
                          warp_mm: Optional[float] = None,
                          title: Optional[str] = None,
                          subtitle: Optional[list] = None,
@@ -977,20 +960,21 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                          max_bytes: int = _GIF_MAX_BYTES,
                          frames_dir: Optional[str] = None,
                          footer_note: Optional[str] = None,
-                         dark: bool = True,
-                         annotate: bool = False,
+                         dark: Optional[bool] = None,
+                         annotate: Optional[bool] = None,
                          keyframes: int = 6) -> list:
         """Render a document as an ANIMATION (.gif or .mp4) — the artifact a review PLAYS.
 
         kind:
           "turntable" — a full 360 degree orbit of the document at the requested elevation.
-                        Read-only: nothing but doc_render_view is called.
+                        Read-only: renders a detached clone if display_quality is supplied.
           "explode"   — every non-grounded component translates radially outward from the
                         assembly centroid, ramping 0 -> `factor` x the component's own
                         distance from that centroid. Needs an ASSEMBLY (components); the
-                        poses are applied to a detached clone opened from the document's
-                        file, so your document is never touched. `reverse=True` plays the
-                        same move as an ASSEMBLE (parts fly in to their final transforms).
+                        poses are applied to a detached clone of the current revision, so
+                        your document is never touched. `components` selects component IDs
+                        or unambiguous names; unknown components are refused.
+                        `reverse=True` plays the same move as an ASSEMBLE.
           "motion"    — a SOLVED trajectory, filmed one frame per sample: the engine's own
                         poses, never a second interpolation. Each sample is held on screen
                         until the film is `frames` long, because a solve can refuse a very
@@ -1012,12 +996,14 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                                      "axis":{"point":[x,y,z],"dir":[0,0,1]},  # or mate_id
                                      "angle_deg":30}     # or "angles_deg":[30,26.4]
                             The caption reports `steer_range_deg` and each component's
-                            requested angle; solid overlap is checked at ZERO clearance at
-                            every sample (`min_clearance_mm` applies to the mate drive).
+                            requested angle. Both solved drives check interference by
+                            default; set `check_interference=False` to skip it, or set
+                            `min_clearance_mm` to the desired clearance threshold.
                           `poses` — a fully explicit frame list,
                             [{component: [16 numbers]}, ...], one object per frame, each
                             an ABSOLUTE row-major 4x4 for that component. The escape hatch
                             for a pose sequence you computed yourself; no solve is run.
+                            Explicit poses do not run interference checks.
           "fea"       — a solved .vtu: von Mises on the displacement-warped mesh over the
                         grey undeformed outline, warp ramping in. Pass `vtu_path` (from
                         run_fea_static(vtu_path=...)); no document is needed. A topology
@@ -1042,6 +1028,7 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                     drawn on every frame.
         annotate  : overlay B-rep edges + scale bar on every frame (slower per frame).
         display_quality : "draft"|"standard"|"fine" display tessellation for the frames.
+                    FEA films do not support highlight, annotate, dark or display_quality.
         title/subtitle/hold_s : a dark title card held for `hold_s` seconds at the head of
                     the film (2-3 s is a readable hold).
         frames_dir : optional directory the ordered PNG sequence (title card frames
@@ -1075,16 +1062,60 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
             if kind not in _KINDS:
                 raise ValueError(f"render_animation: kind must be one of {', '.join(_KINDS)}; "
                                  f"got {kind!r}.")
+            motion_args = (("mate_id", mate_id), ("steer", steer),
+                           ("rear_steer", rear_steer), ("poses", poses),
+                           ("start", start), ("stop", stop), ("steps", steps),
+                           ("min_clearance_mm", min_clearance_mm),
+                           ("check_interference", check_interference))
+            explode_args = (("factor", factor), ("components", components),
+                            ("reverse", reverse))
+            fea_args = (("vtu_path", vtu_path), ("field", field), ("warp_mm", warp_mm))
+            for applicable, args in (("motion", motion_args), ("explode", explode_args),
+                                     ("fea", fea_args)):
+                off_kind = [name for name, value in args if value is not None]
+                if kind != applicable and off_kind:
+                    raise ValueError(
+                        f"render_animation(kind={kind!r}): {', '.join(off_kind)} "
+                        f"belong to kind='{applicable}' — they would be silently ignored.")
             steer = _normalize_optional_slot(steer)
             rear_steer = _normalize_optional_slot(rear_steer)
             poses = _normalize_optional_slot(poses)
-            off_kind = [k for k, v in (("mate_id", mate_id), ("steer", steer),
-                                       ("rear_steer", rear_steer), ("poses", poses))
-                        if v is not None]
-            if kind != "motion" and off_kind:
-                raise ValueError(
-                    f"render_animation(kind={kind!r}): {', '.join(off_kind)} drive(s) "
-                    "belong to kind='motion' — they would be silently ignored here.")
+            if kind == "fea":
+                ignored = [name for name, value in
+                           (("doc_id", doc_id), ("highlight", highlight),
+                            ("annotate", annotate), ("dark", dark),
+                            ("display_quality", display_quality)) if value is not None]
+                if ignored:
+                    raise ValueError("render_animation(kind='fea'): " + ", ".join(ignored)
+                                     + " are not used by FEA films.")
+            if kind == "motion":
+                named = [name for name, value in (("mate_id", mate_id), ("steer", steer),
+                                                   ("poses", poses)) if value is not None]
+                if len(named) > 1:
+                    raise ValueError("render_animation(kind='motion'): " + ", ".join(named)
+                                     + " are different drives — pass exactly one.")
+                if steer is None and rear_steer is not None:
+                    raise ValueError("render_animation: rear_steer requires steer.")
+                ignored = []
+                if mate_id is None:
+                    ignored += [name for name, value in (("start", start), ("stop", stop))
+                                if value is not None]
+                if poses is not None:
+                    ignored += [name for name, value in
+                                (("steps", steps), ("check_interference", check_interference),
+                                 ("min_clearance_mm", min_clearance_mm)) if value is not None]
+                elif check_interference is False and min_clearance_mm is not None:
+                    ignored.append("min_clearance_mm")
+                if ignored:
+                    raise ValueError("render_animation(kind='motion'): " + ", ".join(ignored)
+                                     + " are not used by the selected drive/settings.")
+            factor = 1.0 if factor is None else factor
+            reverse = False if reverse is None else reverse
+            dark = True if dark is None else dark
+            annotate = False if annotate is None else annotate
+            field = "von_mises" if field is None else field
+            check_interference = True if check_interference is None else check_interference
+            min_clearance_mm = 0.0 if min_clearance_mm is None else min_clearance_mm
             if not save_path:
                 raise ValueError(
                     "render_animation needs save_path — a .gif or .mp4 path under your "
@@ -1144,16 +1175,17 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                 d = _doc(doc_id)
                 doc_name = _handoff_doc_name(d) or d
                 left = f"{left_prefix} | {doc_name}"
-                if display_quality:
+                if kind == "turntable" and display_quality:
+                    clone = _clone_detached(d, kind)
                     cb.call("doc_set_display_quality",
-                            {"doc_id": d, "quality": str(display_quality)})
-                render_doc = d
+                            {"doc_id": clone, "quality": str(display_quality)})
+                render_doc = clone or d
                 poses_per_frame: list = []
                 if kind == "turntable":
                     az0, el = _view_angles(view)
                     dirs = [_dir_from_angles(az0 + 360.0 * i / frames, el)
                             for i in range(frames)]
-                    bodies = _world_bodies(d)
+                    bodies = _world_bodies(render_doc)
                     _c, diag = _scene_bbox(bodies)
                     measured = {"bodies": len(bodies), "bbox_diag_mm": round(diag, 3),
                                 "elevation_deg": round(el, 3),
@@ -1181,15 +1213,28 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                         cid = b.get("component")
                         if cid in base and cid not in body_centre:
                             body_centre[cid] = _bbox_centre(b.get("bbox") or {})
-                    want = set(components or []) or {c["id"] for c in comps
-                                                     if not c.get("fixed")}
-                    if not want:
-                        want = {c["id"] for c in comps[1:]}
+                    if components is not None:
+                        requested = require_list(components, "components", "component IDs or names")
+                        want = set()
+                        for token in requested:
+                            matches = [c["id"] for c in comps if c["id"] == token]
+                            if not matches:
+                                matches = [c["id"] for c in comps if c.get("name") == token]
+                            if len(matches) != 1:
+                                raise ValueError(
+                                    f"render_animation(kind='explode'): component {token!r} "
+                                    + ("is ambiguous." if matches else "is not in the assembly."))
+                            want.add(matches[0])
+                    else:
+                        want = {c["id"] for c in comps if not c.get("fixed")}
+                        if not want:
+                            want = {c["id"] for c in comps[1:]}
                     offsets: dict = {}
                     for cid in sorted(want):
                         bc = body_centre.get(cid)
                         if bc is None:
-                            continue
+                            raise ValueError(f"render_animation(kind='explode'): component "
+                                             f"{cid!r} has no world body to move.")
                         vec = [bc[i] - centre[i] for i in range(3)]
                         n = math.sqrt(sum(v * v for v in vec))
                         if n < 1e-9:
@@ -1228,20 +1273,11 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                     # each sample costs a solve), while a watchable shot needs 2-4 s of
                     # frames. Render one frame per solved sample and hold each on screen
                     # for as long as `frames` asks.
-                    samples = max(2, int(steps)) if steps else frames
+                    samples = int(steps) if steps is not None else frames
+                    if samples < 2:
+                        raise ValueError("render_animation: steps must be at least 2.")
                     named = [k for k, v in (("mate_id", mate_id), ("steer", steer),
                                             ("poses", poses)) if v is not None]
-                    if len(named) > 1:
-                        raise ValueError(
-                            "render_animation(kind='motion'): " + ", ".join(named) +
-                            " are DIFFERENT drives — pass exactly one. mate_id sweeps a "
-                            "dimensional mate, steer rotates named components about a "
-                            "kingpin axis, poses is an explicit per-frame transform list.")
-                    if steer is None and rear_steer is not None:
-                        raise ValueError(
-                            "render_animation: `rear_steer` is the 4WS companion to "
-                            "`steer` — pass `steer` too (or drive the rear axle with "
-                            "`steer` alone).")
                     if not named:
                         raise ValueError(
                             "render_animation(kind='motion') needs a drive: mate_id (+ "
@@ -1314,15 +1350,19 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                             # The motion tools' own steer driver, on its own detached
                             # clone: the film and a turning-radius study cannot disagree.
                             sweep = steer_pose_sweep(d, steer, rear_steer, samples,
-                                                     True, "render_animation")
+                                                     bool(check_interference), "render_animation",
+                                                     min_clearance_mm=float(min_clearance_mm))
                             if not sweep.get("ok"):
                                 raise ValueError(
                                     "render_animation(kind='motion', steer=...): the mate "
                                     "network did not solve around the steered pose — "
                                     f"{sweep.get('error')}")
                         else:
-                            sweep = json.loads(_motion_tool(mate_id, start, stop, samples,
-                                                            min_clearance_mm, d))
+                            sweep = run_motion_sweep(
+                                d, mate_id=mate_id, start=start, stop=stop, steps=samples,
+                                check_interference=bool(check_interference),
+                                min_clearance_mm=float(min_clearance_mm), dynamics=None,
+                                persist_study=False)
                             if not sweep.get("ok"):
                                 raise ValueError(
                                     "render_animation(kind='motion'): simulate_motion "
@@ -1373,10 +1413,7 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                         if steer is not None:
                             lo = float(driver.get("start") or 0.0)
                             hi = float(driver.get("stop") or 0.0)
-                            # The steer drive checks solid overlap at zero clearance (it is
-                            # the same eval_interference call steering_turning_radius
-                            # makes); min_clearance_mm belongs to the mate sweep.
-                            measured["min_clearance_mm"] = 0.0
+                            measured["min_clearance_mm"] = float(min_clearance_mm)
                             measured["steer_range_deg"] = [round(lo, 4), round(hi, 4)]
                             measured["steer_components"] = driver.get("components")
                             measured["steer_angles_deg"] = driver.get("angles_deg")
@@ -1386,9 +1423,6 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
                                           + f" {lo:g}->{hi:g} {unit or 'deg'}")
                         else:
                             measured["min_clearance_mm"] = float(min_clearance_mm)
-                            if sweep.get("motion_study"):
-                                # The film's sweep is also the doc's live Motion study.
-                                measured["motion_study"] = sweep["motion_study"]
                             foot_right = (f"mate {sweep.get('mate_id')} "
                                           f"{traj[0].get('value')}->"
                                           f"{traj[-1].get('value')} {unit}")
@@ -1585,25 +1619,5 @@ def register_cad_animation_tools(mcp: FastMCP) -> None:
             if work and os.path.isdir(work):
                 shutil.rmtree(work, ignore_errors=True)
 
-    # simulate_motion lives in the "sim"-tagged assembly module; the animation calls it
-    # rather than re-deriving a trajectory, so a film and a motion study can never disagree.
-    def _motion_tool(mate_id, start, stop, steps, min_clearance_mm, doc):
-        from .cad_asm_tools import register_cad_asm_tools  # noqa: PLC0415
-
-        class _Capture:
-            def __init__(self):
-                self.tools: dict = {}
-
-            def tool(self, *_a, **_k):
-                def dec(fn):
-                    self.tools[fn.__name__] = fn
-                    return fn
-                return dec
-
-        cap = _Capture()
-        register_cad_asm_tools(cap)
-        return cap.tools["simulate_motion"](
-            mate_id=mate_id, start=start, stop=stop, steps=max(2, int(steps)),
-            check_interference=True, min_clearance_mm=float(min_clearance_mm), doc_id=doc)
 
     return None

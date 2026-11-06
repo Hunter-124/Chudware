@@ -134,6 +134,22 @@ void testTreeRevisionInvalidatesStaleToolpaths() {
     CHECK(mirror.backplot().arcT0.empty());
     CHECK(mirror.backplot().arcT.empty());
     CHECK(near(mirror.backplot().totalTime, 0.0));
+
+    mirror.loadToolpaths(oneCutToolpath());
+    const uint64_t firstGeneration = mirror.backplot().generation;
+    const float* firstData = mirror.backplot().cut.data();
+    const size_t firstSize = mirror.backplot().cut.size();
+    json changed = oneCutToolpath();
+    changed["toolpaths"][0]["moves"][1]["to"][0] = 2.0;
+    mirror.loadToolpaths(changed);
+    CHECK(mirror.backplot().cut.data() == firstData);
+    CHECK(mirror.backplot().cut.size() == firstSize);
+    CHECK(near(mirror.backplot().cut[3], 2.0));
+    CHECK(mirror.backplot().generation != firstGeneration);
+    const uint64_t rebuiltGeneration = mirror.backplot().generation;
+    mirror.clearToolpaths();
+    CHECK(mirror.backplot().empty());
+    CHECK(mirror.backplot().generation != rebuiltGeneration);
 }
 
 void testInterleavedClassesKeepGlobalTimesAndArcLength() {

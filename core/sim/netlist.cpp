@@ -20,6 +20,7 @@
 #include <map>
 #include <optional>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <stdexcept>
@@ -28,6 +29,33 @@
 namespace chudware::sim {
 
 using nlohmann::json;
+const char* ne555_spice_model() {
+    return
+        ".subckt NE555 gnd trig out rst cv thr dis vcc\n"
+        "Gva 0 vth vcc 0 0.3333m\n"
+        "Gvq 0 vth qn 0 0.3333m\n"
+        "Rvth vth 0 1k\n"
+        "Ecmp cmpr 0 vth thr 200\n"
+        "Rcmp cmpr q 10k\n"
+        "Dqh q vcc Dclamp\n"
+        "Dql 0 q Dclamp\n"
+        "Rq q 0 100k\n"
+        "Cq q 0 47n\n"
+        "Eqn qn 0 q 0 1\n"
+        "Eout outraw 0 q 0 1\n"
+        "Rout outraw out 10\n"
+        "Eqlowr qlowr 0 vcc q 1\n"
+        "Rqlow qlowr qlow 10k\n"
+        "Dqlowh qlow vcc Dclamp\n"
+        "Dqlowl 0 qlow Dclamp\n"
+        "Rqlowl qlow 0 100k\n"
+        "Gdis dis 0 qlow 0 0.3m\n"
+        "Rdis dis 0 1e9\n"
+        "Ddisl 0 dis Dclamp\n"
+        ".ends NE555\n"
+        ".model Dclamp D(IS=1e-9 N=1 RS=10)\n";
+}
+
 
 namespace {
 
@@ -732,31 +760,8 @@ const std::map<std::string, SubcktDef>& builtin_subckts() {
             "Eout outb 0 opi 0 1\n"
             "Rout outb out 10\n"
             ".ends OPAMP\n";
-        const char* NE555 =
-            ".subckt NE555 gnd trig out rst cv thr dis vcc\n"
-            "Gva 0 vth vcc 0 0.3333m\n"
-            "Gvq 0 vth qn 0 0.3333m\n"
-            "Rvth vth 0 1k\n"
-            "Ecmp cmpr 0 vth thr 200\n"
-            "Rcmp cmpr q 10k\n"
-            "Dqh q vcc Dclamp\n"
-            "Dql 0 q Dclamp\n"
-            "Rq q 0 100k\n"
-            "Cq q 0 47n\n"
-            "Eqn qn 0 q 0 1\n"
-            "Eout outraw 0 q 0 1\n"
-            "Rout outraw out 10\n"
-            "Eqlowr qlowr 0 vcc q 1\n"
-            "Rqlow qlowr qlow 10k\n"
-            "Dqlowh qlow vcc Dclamp\n"
-            "Dqlowl 0 qlow Dclamp\n"
-            "Rqlowl qlow 0 100k\n"
-            "Gdis dis 0 qlow 0 0.3m\n"
-            "Rdis dis 0 1e9\n"
-            "Ddisl 0 dis Dclamp\n"
-            ".ends NE555\n";
         std::map<std::string, SubcktDef> out;
-        for (const char* frag : {OPAMP, NE555}) {
+        for (const char* frag : {OPAMP, ne555_spice_model()}) {
             std::map<std::string, SubcktDef> defs;
             std::vector<std::string> tp;
             collect_subckts(preprocess(frag), defs, tp);
@@ -913,7 +918,7 @@ std::string model_to_kind(const std::string& model_name, const std::string& ref)
     static const std::map<std::string, std::string> kmap = {
         {"R", "R"}, {"C", "C"}, {"L", "L"}, {"V", "V"}, {"I", "I"}, {"D", "D"},
         {"NPN", "Q"}, {"PNP", "Q"}, {"NMOS", "M"}, {"PMOS", "M"},
-        {"OPAMP", "OPAMP"}, {"S", "S"},
+        {"OPAMP", "OPAMP"}, {"S", "S"}, {"SW", "S"},
     };
     auto it = kmap.find(upper(model_name));
     if (it != kmap.end()) return it->second;
@@ -924,19 +929,8 @@ std::string model_to_kind(const std::string& model_name, const std::string& ref)
 }
 
 // ---------------------------------------------------------------------------
-// Starter SYMBOL sim-library port  (engine/ecad/library/starter.py SYMBOLS[].sim)
-//
-// The Python oracle, when a component carries no inline "sim", falls back to the
-// starter symbol library: it reads SYMBOLS[libid]["sim"] for the SPICE model spec
-// and builds a pin-name->pin-number map from SYMBOLS[libid]["pins"] (used when a
-// sim.pin_order entry is a pin NAME rather than a number-keyed netlist pin).
-//
-// That table is reproduced here as a self-contained map so chudware_sim stays free of
-// any dependency on chudware_ecad (chudware_ecad already depends on chudware_sim — adding
-// the reverse edge would be a cycle). Only the two fields the resolver consumes are
-// ported: the `sim` dict and the pin name->number map. Every SYMBOLS entry that has
-// a `sim` field is covered (R/C/C_pol/L/D/LED/Zener/Q_NPN/Q_PNP/NMOS/PMOS/OPAMP_dual/
-// NE555/power-rails/V_source/I_source/Switch).
+// Simulation defaults stay independent of chudware_ecad, which depends on
+// chudware_sim. Pin names are available where an explicit model uses them.
 struct SymbolSim {
     json sim;                                       // SYMBOLS[libid]["sim"]
     std::vector<std::pair<std::string, std::string>> name_to_num;  // pin name -> number
@@ -951,9 +945,9 @@ const std::map<std::string, SymbolSim>& symbol_sim_table() {
         m["Device:C"]     = {json{{"model", "C"}, {"pin_order", rc_order}}, {{"~", "2"}}};
         m["Device:C_pol"] = {json{{"model", "C"}, {"pin_order", rc_order}}, {{"+", "1"}, {"-", "2"}}};
         m["Device:L"]     = {json{{"model", "L"}, {"pin_order", rc_order}}, {{"~", "2"}}};
-        // Diodes: pins numbered "K"/"A" (number == name), pin_order [A, K].
-        json d_order = json::array({"A", "K"});
-        m["Device:D"]     = {json{{"model", "D"}, {"pin_order", d_order}}, {{"K", "K"}, {"A", "A"}}};
+        // KiCad diode terminals are numbered 1=K and 2=A.
+        json d_order = json::array({"2", "1"});
+        m["Device:D"]     = {json{{"model", "D"}, {"pin_order", d_order}}, {{"K", "1"}, {"A", "2"}}};
         // An LED is NOT a silicon rectifier. Without its own junction parameters Device:LED
         // fell through to the default small-signal diode (IS=1e-14, N=1) and conducted at
         // ~0.74 V, so EVERY simulated LED circuit reported a physically impossible operating
@@ -964,8 +958,8 @@ const std::map<std::string, SymbolSim>& symbol_sim_table() {
         // below and takes precedence over spice.cpp's defaults (mp() reads device params first).
         m["Device:LED"]   = {json{{"model", "D"}, {"pin_order", d_order},
                                   {"params", json{{"IS", 2.3e-19}, {"N", 2.0}, {"RS", 2.0}}}},
-                             {{"K", "K"}, {"A", "A"}}};
-        m["Device:Zener"] = {json{{"model", "D"}, {"pin_order", d_order}}, {{"K", "K"}, {"A", "A"}}};
+                             {{"K", "1"}, {"A", "2"}}};
+        m["Device:D_Zener"] = {json{{"model", "D"}, {"pin_order", d_order}}, {{"K", "1"}, {"A", "2"}}};
         // BJTs use the solver's SPICE order [C, B, E].
         json q_order = json::array({"C", "B", "E"});
         m["Device:Q_NPN"] = {json{{"model", "NPN"}, {"pin_order", q_order}},
@@ -978,38 +972,173 @@ const std::map<std::string, SymbolSim>& symbol_sim_table() {
                             {{"G", "G"}, {"D", "D"}, {"S", "S"}}};
         m["Device:PMOS"] = {json{{"model", "PMOS"}, {"pin_order", fet_order}},
                             {{"G", "G"}, {"D", "D"}, {"S", "S"}}};
-        // The built-in OPAMP is an ideal three-terminal model. Supply pins stay on the
-        // multi-unit schematic symbol for package/ERC work, but are not solver terminals.
-        // Unit 1 is the default; the ECAD netlist seam also emits placed-unit name aliases.
-        m["Amplifier_Operational:OPAMP_dual"] = {
-            json{{"model", "OPAMP"},
-                 {"pin_order", json::array({"IN+", "IN-", "OUT"})}},
-            {{"IN-", "1"}, {"IN+", "2"}, {"OUT", "3"}}};
-        // NE555 SUBCKT: number-keyed pins 1..8 with NAMEd pin_order.
-        m["Timer:NE555"] = {
-            json{{"model", "SUBCKT"},
-                 {"subckt", "NE555"},
-                 {"pin_order", json::array({"GND", "TRIG", "OUT", "RST", "CV", "THR", "DIS", "VCC"})}},
-            {{"GND", "1"}, {"TRIG", "2"}, {"OUT", "3"}, {"RST", "4"},
-             {"CV", "5"}, {"THR", "6"}, {"DIS", "7"}, {"VCC", "8"}}};
+        // KiCad's built-in opamp has five pins; our ideal model ignores its supply pins.
+        m["Simulation_SPICE:OPAMP"] = {
+            json{{"model", "OPAMP"}, {"pin_order", json::array({"1", "2", "3", "4", "5"})}},
+            {}};
+        m["Timer:NE555D"] = {
+            json{{"model", "SUBCKT"}, {"subckt", "NE555"},
+                 {"pin_order", json::array({"1", "2", "3", "4", "5", "6", "7", "8"})}},
+            {}};
+        m["Timer:NE555P"] = m["Timer:NE555D"];
         // Power rails: single pin "1"; sim has only a model marker (skipped silently).
         m["power:GND"]  = {json{{"model", "GND"}},  {{"GND", "1"}}};
         m["power:VCC"]  = {json{{"model", "VCC"}},  {{"VCC", "1"}}};
+        m["power:VEE"]  = {json{{"model", "VEE"}},  {{"VEE", "1"}}};
         m["power:+5V"]  = {json{{"model", "+5V"}},  {{"+5V", "1"}}};
         m["power:+3V3"] = {json{{"model", "+3V3"}}, {{"+3V3", "1"}}};
         m["power:-5V"]  = {json{{"model", "-5V"}},  {{"-5V", "1"}}};
-        // Sources: number-keyed pins "+"/"-" (number == name), pin_order [+, -].
-        json src_order = json::array({"+", "-"});
-        m["Simulation_SPICE:V_source"] = {json{{"model", "V"}, {"pin_order", src_order}},
-                                          {{"+", "+"}, {"-", "-"}}};
-        m["Simulation_SPICE:I_source"] = {json{{"model", "I"}, {"pin_order", src_order}},
-                                          {{"+", "+"}, {"-", "-"}}};
+        // Real KiCad sources have numbered positive and negative pins.
+        for (const char* id : {"Simulation_SPICE:VDC", "Simulation_SPICE:VSIN",
+                               "Simulation_SPICE:VPULSE"})
+            m[id] = {json{{"model", "V"}, {"pin_order", rc_order}}, {}};
+        m["Simulation_SPICE:IDC"] = {json{{"model", "I"}, {"pin_order", rc_order}}, {}};
         // SPST switch: pins "1"/"2", names A/B, pin_order [1, 2].
         m["Device:Switch"] = {json{{"model", "S"}, {"pin_order", rc_order}},
                               {{"A", "1"}, {"B", "2"}}};
         return m;
     }();
     return t;
+}
+
+// KiCad stores model parameters as key=value pairs and maps symbol pin numbers
+// to model terminal names, e.g. "1=K 2=A" for a diode.
+std::map<std::string, std::string> kicad_assignments(const std::string& text,
+                                                      bool normalize_keys = true) {
+    std::map<std::string, std::string> result;
+    std::size_t pos = 0;
+    while (pos < text.size()) {
+        while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
+        const std::size_t begin = pos;
+        while (pos < text.size() && text[pos] != '=' &&
+               !std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
+        const std::string key = text.substr(begin, pos - begin);
+        while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
+        if (key.empty() || pos == text.size() || text[pos] != '=') {
+            while (pos < text.size() && !std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
+            continue;
+        }
+        ++pos;
+        while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
+        std::string value;
+        if (pos < text.size() && text[pos] == '"') {
+            ++pos;
+            while (pos < text.size() && text[pos] != '"') {
+                if (text[pos] == '\\' && pos + 1 < text.size()) ++pos;
+                value += text[pos++];
+            }
+            if (pos < text.size()) ++pos;
+        } else {
+            const auto start = pos;
+            while (pos < text.size() && !std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
+            value = text.substr(start, pos - start);
+        }
+        result[normalize_keys ? lower(key) : key] = value;
+    }
+    return result;
+}
+
+json kicad_sim_spec(const json& fields) {
+    if (!fields.is_object() || !fields.contains("Sim.Device") ||
+        !fields["Sim.Device"].is_string() || fields["Sim.Device"].get<std::string>().empty())
+        return nullptr;
+    const std::string device = upper(fields["Sim.Device"].get<std::string>());
+    const std::string type = upper(fields.value("Sim.Type", std::string()));
+    const auto assignments = kicad_assignments(fields.value("Sim.Params", std::string()));
+    json sim{{"model", device}, {"params", json::object()}};
+    const bool raw_subckt = device == "SPICE" && assignments.count("type") &&
+                            upper(assignments.at("type")) == "X" && assignments.count("model");
+    static const std::set<std::string> supported = {
+        "R", "C", "L", "V", "I", "D", "NPN", "PNP", "NMOS", "PMOS", "SW", "SUBCKT"};
+    if (raw_subckt) {
+        sim["model"] = "SUBCKT";
+        sim["subckt"] = assignments.at("model");
+    } else if (!supported.count(device)) sim["unsupported_device"] = device;
+    const std::string subckt = fields.value("Sim.Name", std::string());
+    const bool builtin_opamp = device == "SUBCKT" && upper(subckt) == "KICAD_BUILTIN_OPAMP";
+    if (builtin_opamp)
+        sim["model"] = "OPAMP";
+    else if (device == "SUBCKT" && !subckt.empty())
+        sim["subckt"] = subckt;
+    else if (device == "SUBCKT" && assignments.count("model"))
+        sim["subckt"] = assignments.at("model");
+    json& params = sim["params"];
+    for (const auto& [key, value] : assignments) {
+        if (auto parsed = parse_value(value); parsed && std::isfinite(*parsed))
+            params[upper(key)] = *parsed;
+        else if (key != "model" && key != "type" && key != "lib" && key != "pwl")
+            sim["invalid_parameter"] = key;
+    }
+    if (device == "V" || device == "I") {
+        auto numeric = [&](const char* key) -> std::optional<double> {
+            auto it = assignments.find(key);
+            if (it == assignments.end()) return std::nullopt;
+            auto value = parse_value(it->second);
+            return value && std::isfinite(*value) ? value : std::nullopt;
+        };
+        if (auto dc = numeric("dc")) params["dc"] = *dc;
+        if (auto ac = numeric("ac")) {
+            json ac_spec{{"mag", *ac}};
+            if (auto phase = numeric("ph")) ac_spec["phase"] = *phase;
+            sim["ac"] = std::move(ac_spec);
+        }
+        if (!type.empty() && type != "DC") {
+            if (type == "PULSE" || type == "SIN") {
+                json waveform{{"type", type}};
+                const std::vector<std::pair<std::string, std::string>> names =
+                    type == "PULSE"
+                        ? std::vector<std::pair<std::string, std::string>>{{"y1","v1"},{"y2","v2"},
+                              {"td","td"},{"tr","tr"},{"tf","tf"},{"tw","pw"},{"per","per"}}
+                        : std::vector<std::pair<std::string, std::string>>{{"dc","vo"},{"ampl","va"},
+                              {"f","f"},{"td","td"},{"theta","theta"}};
+                for (const auto& [source, target] : names)
+                    if (auto value = numeric(source.c_str())) waveform[target] = *value;
+                params["waveform"] = std::move(waveform);
+            } else if (type == "PWL" && assignments.count("pwl")) {
+                std::istringstream in(assignments.at("pwl"));
+                std::string t, v;
+                json points = json::array();
+                while (in >> t >> v) {
+                    const auto time = parse_value(t), value = parse_value(v);
+                    if (!time || !value) { points = json::array(); break; }
+                    points.push_back(json::array({*time, *value}));
+                }
+                if (points.size() >= 2) params["waveform"] = {{"type", "PWL"}, {"points", points}};
+                else sim["unsupported_type"] = type;
+            } else sim["unsupported_type"] = type;
+        }
+    }
+    if (device == "R" || device == "C" || device == "L") {
+        const auto it = assignments.find(lower(device));
+        if (it != assignments.end()) {
+            auto value = parse_value(it->second);
+            if (value && std::isfinite(*value)) sim["value"] = *value;
+        }
+        if (type == "POT") sim["unsupported_type"] = type;
+    }
+    const std::string pin_text = fields.value("Sim.Pins", std::string());
+    if (!pin_text.empty()) {
+        const auto pins = kicad_assignments(pin_text, false);
+        std::map<std::string, std::string> model_to_pin;
+        for (const auto& [number, terminal] : pins) model_to_pin[upper(terminal)] = number;
+        std::vector<std::string> terminals;
+        if (device == "D") terminals = {"A", "K"};
+        else if (device == "V" || device == "I") terminals = {"+", "-"};
+        else if (device == "NPN" || device == "PNP") terminals = {"C", "B", "E"};
+        else if (device == "NMOS" || device == "PMOS") terminals = {"D", "G", "S"};
+        else if (device == "SW") terminals = {"NO+", "NO-", "CTRL+", "CTRL-"};
+        else if (device == "R" || device == "C" || device == "L") terminals = {"1", "2"};
+        else if (builtin_opamp) terminals = {"IN+", "IN-", "VCC", "VEE", "OUT"};
+        else for (const auto& [terminal, number] : model_to_pin) terminals.push_back(terminal);
+        json order = json::array();
+        for (const auto& terminal : terminals) {
+            auto it = model_to_pin.find(terminal);
+            if (it == model_to_pin.end()) { sim["invalid_pins"] = true; break; }
+            order.push_back(it->second);
+        }
+        sim["pin_order"] = std::move(order);
+    }
+    return sim;
 }
 
 // spice._resolve_subckt_name: pick the built-in subckt name for a SUBCKT/OPAMP part.
@@ -1084,9 +1213,8 @@ json netlist_to_spice_circuit(const json& netlist, const json& sim_params) {
             continue;
         }
 
-        // Resolve sim dict — prefer one carried on the component, then fall back to the
-        // starter SYMBOL library (symbol_sim_table) by libid, EXACTLY as the oracle does
-        // (engine/sim/spice.py: comp.get("sim") or SYMBOLS[libid]["sim"]).
+        // An explicit simulation spec wins, followed by KiCad instance fields
+        // and finally the built-in starter library mapping.
         const std::map<std::string, SymbolSim>& sym_tbl = symbol_sim_table();
         auto sym_it = sym_tbl.find(libid);
         if (comp.contains("sim") && !comp["sim"].is_null() && !comp["sim"].is_object()) {
@@ -1094,9 +1222,38 @@ json netlist_to_spice_circuit(const json& netlist, const json& sim_params) {
             continue;
         }
         json sim = comp.contains("sim") && comp["sim"].is_object() ? comp["sim"] : json(nullptr);
+        if (sim.is_null() && comp.contains("fields")) sim = kicad_sim_spec(comp["fields"]);
         if (sim.is_null() && sym_it != sym_tbl.end()) sim = sym_it->second.sim;
         if (sim.is_null()) {
             warn_msgs.push_back(ref + " (" + libid + "): no sim model — skipped");
+            continue;
+        }
+        if ((!comp.contains("sim") || comp["sim"].is_null()) && sym_it != sym_tbl.end() &&
+            sim.contains("model") && sim["model"].is_string() &&
+            sim["model"] == sym_it->second.sim["model"] &&
+            sym_it->second.sim.contains("params") && sym_it->second.sim["params"].is_object()) {
+            if (!sim.contains("params") || !sim["params"].is_object()) sim["params"] = json::object();
+            for (auto it = sym_it->second.sim["params"].begin();
+                 it != sym_it->second.sim["params"].end(); ++it)
+                if (!sim["params"].contains(it.key())) sim["params"][it.key()] = it.value();
+        }
+        if (sim.contains("unsupported_device")) {
+            warn_msgs.push_back(ref + ": unsupported KiCad Sim.Device '" +
+                                sim["unsupported_device"].get<std::string>() + "' — skipped");
+            continue;
+        }
+        if (sim.contains("invalid_parameter")) {
+            warn_msgs.push_back(ref + ": invalid or unsupported KiCad Sim.Params value for '" +
+                                sim["invalid_parameter"].get<std::string>() + "' — skipped");
+            continue;
+        }
+        if (sim.value("invalid_pins", false)) {
+            warn_msgs.push_back(ref + ": KiCad Sim.Pins does not map the model terminals — skipped");
+            continue;
+        }
+        if (sim.contains("unsupported_type")) {
+            warn_msgs.push_back(ref + ": unsupported KiCad Sim.Type '" +
+                                sim["unsupported_type"].get<std::string>() + "' — skipped");
             continue;
         }
 
@@ -1109,8 +1266,8 @@ json netlist_to_spice_circuit(const json& netlist, const json& sim_params) {
         }
 
         // Power / ground symbols — not real devices, skip silently.
-        if (model_upper == "GND" || model_upper == "VCC" || model_upper == "+5V" ||
-            model_upper == "+3V3" || model_upper == "-5V")
+        if (model_upper == "GND" || model_upper == "VCC" || model_upper == "VEE" ||
+            model_upper == "+5V" || model_upper == "+3V3" || model_upper == "-5V")
             continue;
 
         std::vector<std::string> pin_order;
@@ -1201,6 +1358,7 @@ json netlist_to_spice_circuit(const json& netlist, const json& sim_params) {
             auto parsed = parse_value(value_token.get<std::string>());
             if (parsed && std::isfinite(*parsed)) float_value = *parsed;
         }
+        if (sim.contains("value") && sim["value"].is_number()) float_value = sim["value"];
 
         std::string kind = model_to_kind(model_upper, ref);
         if (kind == "X" || kind == "OPAMP") {

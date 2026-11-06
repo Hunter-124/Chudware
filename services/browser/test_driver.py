@@ -54,6 +54,38 @@ def test_backend_env_patchright_routes_headless(driver_mod, monkeypatch):
     assert driver_mod.headless_backend(platform="linux") == "patchright"
 
 
+@pytest.mark.parametrize(("selection", "platform"), [
+    (None, "darwin"),
+    ("playwright", "linux"),
+    ("patchright", "linux"),
+])
+def test_selected_playwright_client_exposes_interact(
+        driver_mod, monkeypatch, selection, platform):
+    from services.browser import cef_client, pw_client
+    if selection is not None:
+        monkeypatch.setenv("CHUDWARE_PW_BACKEND", selection)
+
+    def unexpected_cef():
+        raise AssertionError("must not fall back to CEF")
+
+    monkeypatch.setattr(cef_client, "client", unexpected_cef)
+    backend = driver_mod.headless_client(profile="vendor", platform=platform)
+    assert isinstance(backend, pw_client.PlaywrightClient)
+    assert callable(backend.fetch)
+    assert callable(backend.download)
+    assert callable(backend.interact)
+
+
+def test_selected_cef_client_keeps_interaction_capability(driver_mod, monkeypatch):
+    from services.browser import cef_client
+    backend = cef_client.CefDaemon()
+    monkeypatch.setenv("CHUDWARE_PW_BACKEND", "cef")
+    monkeypatch.setattr(cef_client, "client", lambda: backend)
+    selected = driver_mod.headless_client(profile="vendor", platform="linux")
+    assert selected is backend
+    assert callable(selected.interact)
+
+
 
 def test_backend_env_patchright(driver_mod, monkeypatch):
     monkeypatch.setenv("CHUDWARE_PW_BACKEND", "patchright")

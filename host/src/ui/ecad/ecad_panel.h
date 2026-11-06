@@ -1,12 +1,5 @@
-// EcadPanel — the dockable native schematic/PCB editor.
-//
-// The pinned manager owns sheet/layer/net navigation, engine-backed symbol search, canvas tools,
-// typed multi-selection inspection, ERC/DRC checks and schematic BOM export. The central EcadCanvas
-// owns presentation while this panel translates pointer/keyboard gestures into transactional
-// ecad_apply_ops batches. The schematic bottom strip hosts ERC results and simulation plots.
-//
-// Editor state is per ECAD DocTab through AppState::DocTab::ecadState; the public hooks below let
-// app.cpp adopt worker responses and route ribbon commands without exposing that private state.
+// KiCad project hub: read-only ECAD preview, project actions, checks and simulation.
+// Each ECAD DocTab owns its own mirror, camera, selection and check result.
 #pragma once
 
 #include <string>
@@ -20,60 +13,43 @@ namespace ui {
 class EcadMirror;  // fwd (defined in ecad_mirror.h)
 struct AdaptiveSurface;  // fwd (defined in ui_theme.h)
 
-// Draw the ECAD editor dock window. Call every frame from the app draw loop, after the other panels
-// (see ECAD_UI_INTEGRATION.md §(c)). Self-contained: opens/closes its own ImGui window.
-// No document and an untouched automatic PCB starter show the actionable welcome/AI
-// launchpad. Edit this board keeps the same document and exposes its editable grid;
-// authored board content, saved/dirty tabs and intentional New PCB tabs go straight to canvas.
+// Draw the read-only preview or the launchpad when no ECAD document is active.
 void drawEcadEditor(AppState& st);
 
-// Draw the "PCB Manager" / "Schematic Manager" body — the ECAD analogue of the Feature Manager tree,
-// restyled to match its chrome (pane-header chip, glass icon toolbar, tree-row layers/nets/symbols).
-// Hosted INSIDE the shared pinned left column (layout.cpp::drawLeftPane) when the Electronics
-// workspace is active, so the ECAD tab's left column shares the FeatureManager column's exact
-// geometry (position/width) — this is what keeps the doc-tab strip anchored at the same screen X as
-// the Model tab (see doc_tabs.cpp's overlayColumnEdge(0) consumer). No Begin/End of its own — the
-// caller owns the surrounding pinned window. `surf`/`halo` are the caller's already-resolved adaptive
-// glass surface + icon halo (same ones used for the FeatureManager body) so icon/text tinting matches.
+// Draw the project manager body in the Electronics workspace's pinned left column.
 void drawEcadManagerBody(AppState& st, const ui::AdaptiveSurface& surf, unsigned int halo);
 
-// Title for the manager's header chip ("PCB Manager" / "Schematic Manager"), reflecting the open
-// doc kind. The Electronics rail draws this chip beside its tab buttons (round-5b), so the header is
-// no longer owned by drawEcadManagerBody's body.
+// Title for the Electronics manager header.
 const char* ecadManagerTitle();
 
-// Draw the PCB DRC / unrouted summary as a right-aligned glass pill in the ribbon band's trailing
-// dead space. Call from the app draw loop right after drawRibbon when the Electronics workspace is
-// active, passing the ribbon band's top Y (screen space) and height. No-op for schematic docs (they
-// keep their own bottom ERC strip) and when no board is open. This is what lets the board canvas
-// reclaim the full height (its old bottom results strip is gone).
+// Draw the latest KiCad DRC summary in the ribbon band for an open PCB.
 void drawEcadRibbonStatus(AppState& st, float bandTopY, float bandH);
 
 // Prime the editor's active-AppState pointer (the same one drawEcadEditor/drawEcadManagerBody set as
 // their first line) WITHOUT drawing anything. Call once at the very top of the app frame, before any
-// workspace-entry logic that might call ecadAdopt/ecadEditorLoadResponse (e.g. the Electronics
-// workspace's auto-init-PCB1) on a frame where neither draw function has run yet this session — until
-// one of them runs, the state() resolver falls back to a process-wide singleton instead of the active
-// document tab's own state, so an RPC response adopted before that point silently lands in the wrong
-// place (loads, but the manager column / canvas the user actually sees still reads empty).
+// logic that might call ecadAdopt/ecadEditorLoadResponse on a frame where neither draw function has
+// run yet this session — until one of them runs, the state() resolver falls back to a process-wide
+// singleton instead of the active document tab's own state, so an RPC response adopted before that
+// point silently lands in the wrong place.
 void ecadPrimeActiveApp(AppState& st);
 
-// Accessor for the scaffold's editor mirror, so external code (a ribbon command handler, a scripted
-// shot) can feed it a fresh worker response without reaching through ImGui. Returns the same mirror
-// drawEcadEditor() renders. (In the permanent wiring this becomes `st.ecadMirror`.)
+// Access the active ECAD document's read-only preview mirror.
 EcadMirror& ecadEditorMirror();
 
-// Feed a worker `ecad_tree` / `ecad_apply_ops` response object ({revision, kind, tree, compile, …})
-// into the editor mirror and request a canvas fit when the document kind changes. Thin convenience
-// over ecadEditorMirror().loadFromTree(); call after every successful ECAD RPC (guide §(e)).
+// Adopt a tree or ops response for the active ECAD document.
 void ecadEditorLoadResponse(const nlohmann::json& resp);
 
 // Set the primary canvas selection to one frozen-contract "<kind>:<id>" token, or clear it.
 // Interactive selection is ordered multi-select; this single-token hook is for scripted scenarios.
 void ecadEditorSelect(const std::string& sel);
-// Arm a ribbon placement command. Supported kinds: symbol, label, power, junction, no_connect,
-// text, bus, footprint, via and zone.
-void ecadArmPlacement(const std::string& kind);
+// Raw status and check RPC data, and file state, are addressed to the appropriate ECAD tab.
+// A check result may include `_source_revision` to mark results from an older revision stale.
+void ecadSetKicadStatus(const nlohmann::json& status);
+void ecadSetCheckResult(const std::string& docId, const nlohmann::json& result);
+void ecadSetFileState(const std::string& docId, const std::string& path,
+                      bool dirty, bool fileChanged, bool kicadLocked);
+// Switch the active project manager to its KiCad checks view.
+void ecadEditorShowChecks();
 void ecadEditorHighlightNet(const std::string& net);
 
 // Pan + zoom the canvas to the first ERC/DRC violation that has a location and flash a marker there

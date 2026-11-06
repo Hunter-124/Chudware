@@ -5,8 +5,13 @@
 // Python transactional contract: apply to a working copy, commit on success).
 
 #include "doc/session.h"
+#include "harness/geometry.h"
+#include "doc/request_cancel.h"
 #include "doc/op_registry.h"
+#include "doc/scad.h"
+#include "doc/scad_projection.h"
 #include "geom/geometry_analysis.h"
+#include "geom/assembly_clearance.h"
 
 #include "util/aicm_handoff.h"
 #include "util/resource_governor.h"
@@ -24,6 +29,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -31,7 +37,9 @@
 #include <thread>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 #include "util/sha256.h"
 
@@ -39,6 +47,7 @@
 #include <functional>
 #include <iomanip>
 #include <optional>
+#include <deque>
 #include <sstream>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -100,6 +109,10 @@
 #include <BRepExtrema_DistShapeShape.hxx>
 #include <BRepAdaptor_Surface.hxx>
 #include <BRepAdaptor_Curve.hxx>
+#include <GeomAPI_ProjectPointOnCurve.hxx>
+#include <gp_Cylinder.hxx>
+#include <gp_Lin.hxx>
+#include <gp_Sphere.hxx>
 #include <BRepClass_FaceClassifier.hxx>
 #include <BRepClass3d_SolidClassifier.hxx>  // eval_feature_attachment support probes
 #include <BRepTopAdaptor_FClass2d.hxx>      // eval_feature_attachment UV-grid face sampling
@@ -117,6 +130,7 @@
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Wire.hxx>  // section_props stores closed section loops by value
 #include <TopoDS_Vertex.hxx>
+#include <BOPAlgo_Alerts.hxx>
 // eval_solid_health self-intersection: the kernel's single-body self-interference algorithm
 // plus the progress-indicator seam that is OCCT's only way to hand it a time budget.
 #include <BOPAlgo_CheckerSI.hxx>
@@ -148,6 +162,8 @@
 #include "geom/aicm.h"
 #include "geom/booleans.h"  // fuse_many — doc_eval_compare's default whole-doc shape
 #include "geom/fit.h"       // least-squares cylinder fit (doc_fit_cylinder_axis)
+#include "geom/wall_thickness.h"  // inscribed-sphere wall thickness (eval_thickness)
+#include "geom/edge_analysis.h"   // signed dihedral + concave blend faces (eval_edge_analysis)
 #include "geom/plane.h"
 #include "geom/face_normal.h"  // plane_outward_normal — handedness-aware planar normal
 #include "geom/profile.h"
@@ -158,6 +174,7 @@
 
 #include <miniz.h>  // PNG/deflate for the agent vision-review rasterizer (doc_render_png)
 #include "mate/mate.h"
+#include "sim/sim_cancel.h"  // authenticated cell actor for private scan inputs
 #include "materials/materials.h"  // doc_eval_mass: applied material density
 #include "sketch/sketch.h"
 #include "sketch/sketch_define.h"
@@ -177,11 +194,12 @@ namespace {
 // ----------------------------------------------------------------- session store
 // C18 active-sketch interaction state — C++ port of session.py::_SketchState. One
 // sketch is "entered" at a time; sketch_enter populates it, solve/drag warm-start
-// across it, sketch_exit clears it. solve_state is the warm SolveState (nullopt ==
-// cold); a doc mutation (apply_ops/undo/redo/revert) resets it to nullopt so a warm
-// state is never reused across a doc edit (session.py: active_sketch.solve_state = None).
+// across it, sketch_exit clears it. Warm solve state is only reused when its
+// recorded document revision still matches the current revision.
 struct SketchState {
     std::string sketch_fid;
+    std::uint64_t session_id = 0;           // identity of transient editor state, not a lock
+    long state_revision = -1;               // document revision used by the last solve/drag
     std::optional<chudware::sketch::SolveState> solve_state;  // warm start (nullopt == cold)
     json last_entities = json::object();   // id -> solved coord dict (entity_map form)
     json last_statuses = json::object();   // id -> "under"|"full"|"over"
@@ -265,10 +283,22 @@ struct AssemblyDisplay {
     json bodies;
 };
 
+// Byte ranges in asm_display.path. An unchanged component can reuse its exact
+// world-space AICM chunks without re-transforming or re-encoding its mesh.
+struct AssemblyDisplayChunk {
+    AsmBodyOut body;
+    gp_Trsf world;
+    ::geom::DisplayQuality quality;
+    std::size_t offset = 0;
+    std::size_t size = 0;
+    std::shared_ptr<const aicm::AicmBody> local_mesh;
+};
+
 // Retained handles keep TShape identities alive; IsEqual also checks world placement
 // and orientation. Topology descriptors and per-plane projections are derived lazily.
 struct ExternalProjectionCache {
     std::vector<TopoDS_Shape> shapes;
+    json owner_map;
     TopoDS_Shape body;
     std::optional<double> diag;
     std::optional<std::vector<TopoInfo>> faces, edges, vertices;
@@ -295,12 +325,33 @@ struct Session {
     bool owns_journal = false;
     json doc;
     long revision = 0;
+    long metadata_revision = 0;  // metadata changes do not advance geometry revision
     std::vector<std::string> undo_stack;  // JSON snapshots (newest at back)
     std::vector<std::string> redo_stack;
     bool dirty = false;
     std::string path;                                  // current .step+ path (or empty)
-    // Detached native imports retain source provenance and may save authored design
-    // edits back there. Study-only revisions do not grant source-save authority.
+    NativeFileStamp file_stamp;  // last file version opened or published by this session
+    // Only freshly minted, never persisted parts can prove there are no unknown
+    // persisted consumers of their feature IDs. Embedded/opened parts cannot.
+    bool history_private_origin = false;
+    // Hash of document.json as read, which may differ from the session after a
+    // cold build corrects a legacy fillet. Cache-only writeback must still target
+    // those original authored bytes; an explicit save writes the corrected tree.
+    std::string source_doc_hash;
+    std::optional<json> unverified_source_doc;
+    std::string unverified_materialized_hash;
+    bool unverified_source_was_dirty = false;
+    // Last committed path-backed source published for assembly consumers.
+    std::optional<std::string> observed_source_path;
+    std::string observed_source_input_path;
+    std::string published_source_path;
+    long published_source_revision = -1;
+    std::shared_ptr<const AssemblyLiveSource> published_source;
+    // Recovery-only source snapshots fill gaps until a live source or newer disk
+    // version supersedes them; they never enter the global live-source index.
+    std::shared_ptr<const AssemblyLiveSources> recovery_sources;
+    bool recovery_sources_verified = false;
+    // Detached native imports retain source provenance, never a save destination.
     std::string native_source_path;
     // Revisions are monotonic, including undo/revert. Only the three study mutation
     // RPCs increment this counter, so revision > study_revisions means design authoring
@@ -312,10 +363,18 @@ struct Session {
     std::string project_dir;
     std::string cache_trust = "verified";
     bool cache_verification_pending = false;
+    std::string scad_cache_identity;
     json cache_verification = json::object();
     json cache_warnings = json::array();
     json cached_assembly_response;
     std::map<std::string, std::string> extra_entries;  // unknown .step+ entries (verbatim)
+    // One decoded scan is retained per session for cheap paged mesh reads. The
+    // compressed payloads remain in extra_entries, including those needed by undo.
+    std::string mesh_ref_cached_sha;
+    std::shared_ptr<const MeshData> mesh_ref_cached;
+    std::unordered_map<std::string, json> mesh_ref_stats_cache;
+    // A scan-only transaction cannot change any assembly component geometry.
+    long mesh_ref_only_revision = -1;
     std::map<std::string, std::string> checkpoints;    // PM-cancel snapshots: id -> doc JSON
     std::optional<SketchState> active_sketch;          // C18 sketch-edit lifecycle
 
@@ -326,6 +385,10 @@ struct Session {
     // expansion, owner-map refresh — reuse this instead of recompiling the entire feature tree
     // on every click (measured ~190 ms/click on a modest part before this cache).
     std::shared_ptr<CompileResult> compiled;
+    // Display only: a complete earlier solve retained when the current history fails.
+    // Exact geometry consumers must use `compiled`, never this stale snapshot.
+    std::shared_ptr<const CompileResult> last_good_display;
+    json last_good_body_metadata;  // saved swatches belong to the saved mesh, not the failed tree
     long compiled_rev = -1;
     // True when `compiled` was hydrated on open from the display cache of a file without
     // build checkpoints (cache.json + cache.brep + cache.aicm): shapes, statuses, owner map,
@@ -366,10 +429,20 @@ struct Session {
     // C20 — assembly state. asm_result is the last assembly compile; asm_warm seeds the
     // next mate solve; explode_active/explode_factor drive tessellation-time offsets.
     std::shared_ptr<AssemblyResult> asm_result;        // nullptr until first assembly rebuild
+    json asm_sources;  // recursive source fingerprints belonging to asm_result / saved display
+    std::shared_ptr<const AssemblyLiveSources> asm_source_versions;
     AssemblyDisplay asm_display;
+    std::map<std::string, AssemblyDisplayChunk> asm_display_chunks;
+    // Pins the result represented by those byte ranges. A reset of display.source
+    // explicitly invalidates them even if the same handoff URI is republished.
+    std::shared_ptr<AssemblyResult> asm_display_chunks_source;
     chudware::mate::WarmMap asm_warm;
     bool explode_active = false;
     double explode_factor = 1.0;
+    // Automatic explode plan (factor-1 vectors) for explode_plan_source; recomputed only when
+    // the assembly result changes. Unused while the doc carries authored explode steps.
+    std::weak_ptr<AssemblyResult> explode_plan_source;
+    std::map<std::string, Eigen::Vector3d> explode_plan;
 
     // Display tessellation tier for THIS document's AICM meshes (geom::DisplayQuality).
     // Defaults from CHUDWARE_DISPLAY_QUALITY / Fine so headless renders and the GUI agree.
@@ -417,16 +490,24 @@ void Session::refresh_summary() {
     };
     const int feature_count = count("features");
     const int component_count = count("components");
-    const bool empty = feature_count == 0 &&
-                       (!isAsm || (component_count == 0 && count("mates") == 0));
+    const int mesh_reference_count = count("mesh_references");
     const std::string& name = doc.is_object() && doc.contains("name") && doc["name"].is_string()
                                   ? doc["name"].get_ref<const std::string&>() : doc_id;
     {
         std::lock_guard<std::mutex> summary(summary_mtx);
-        // Reads and expensive geometry-only queries need no allocation or rescan.
+        // Unchanged reads do not allocate or rescan the authored document.
+        const json* previous_stamp = summary_snapshot.is_object() &&
+                                     summary_snapshot.contains("file_stamp")
+                                         ? &summary_snapshot["file_stamp"] : nullptr;
+        const bool stamp_matches = previous_stamp && (file_stamp.valid
+            ? previous_stamp->is_object() && (*previous_stamp)["size"] == file_stamp.size &&
+              (*previous_stamp)["mtime_ns"] == file_stamp.mtime_ns &&
+              (*previous_stamp)["ino"] == file_stamp.ino
+            : previous_stamp->is_null());
         if (summary_snapshot.is_object() &&
             summary_snapshot["revision"] == revision &&
-            summary_snapshot["dirty"] == dirty &&
+            summary_snapshot["metadata_revision"] == metadata_revision &&
+            summary_snapshot["dirty"] == dirty && stamp_matches &&
             summary_snapshot["name"] == name &&
             summary_snapshot["kind"] == (isAsm ? "assembly" : "part") &&
             (path.empty() ? summary_snapshot["path"].is_null() : summary_snapshot["path"] == path) &&
@@ -434,14 +515,39 @@ void Session::refresh_summary() {
                                        : summary_snapshot["native_source_path"] == native_source_path) &&
             summary_snapshot["feature_count"] == feature_count &&
             summary_snapshot["component_count"] == component_count &&
-            summary_snapshot["empty"] == empty)
+            summary_snapshot.value("mesh_reference_count", 0) == mesh_reference_count)
             return;
     }
+    bool empty = metadata_revision == 0 && feature_count == 0 && mesh_reference_count == 0 &&
+                 (!isAsm || (component_count == 0 && count("mates") == 0));
+    if (empty && doc.is_object()) {
+        // Ignore identity and defaults, but preserve all authored fields, including
+        // studies, equations, metadata and forward-compatible unknown content.
+        for (auto it = doc.begin(); it != doc.end(); ++it) {
+            const auto& key = it.key();
+            const json& value = it.value();
+            if (key == "schema" || key == "id" || key == "name") continue;
+            if (key == "units" && value.is_object() && value.size() == 1 &&
+                value.contains("system") && value["system"] == "MMGS") continue;
+            if (key == "material" && !isAsm && value.is_object() && value.size() == 1 &&
+                value.contains("key") && value["key"] == "alu_6061") continue;
+            if (key == "equations" && value.is_object() && value.size() == 1 &&
+                value.contains("globals") && value["globals"].is_array() &&
+                value["globals"].empty()) continue;
+            if (value.is_null() || ((value.is_array() || value.is_object() || value.is_string()) &&
+                                    value.empty())) continue;
+            empty = false;
+            break;
+        }
+    }
+    const json stamp_json = file_stamp.valid
+        ? json{{"size", file_stamp.size}, {"mtime_ns", file_stamp.mtime_ns}, {"ino", file_stamp.ino}}
+        : json(nullptr);
     json reproducible_from = json::array();
     if (path.empty() && !native_source_path.empty() && revision == 0 && !dirty) {
         reproducible_from.push_back(native_source_path);
     } else if (!isAsm && path.empty() && native_source_path.empty() &&
-               feature_count > 0 && revision <= feature_count) {
+               feature_count > 0 && mesh_reference_count == 0 && revision <= feature_count) {
         for (const json& f : doc["features"]) {
             if (!f.is_object() || f.value("type", std::string()) != "import") {
                 reproducible_from.clear();
@@ -460,10 +566,13 @@ void Session::refresh_summary() {
     json next = {
         {"doc_id", doc_id}, {"name", name}, {"kind", isAsm ? "assembly" : "part"},
         {"path", path.empty() ? json(nullptr) : json(path)},
+        {"file_stamp", stamp_json},
         {"native_source_path", native_source_path.empty() ? json(nullptr) : json(native_source_path)},
         {"native_source_edited", !native_source_path.empty() && revision > study_revisions},
-        {"revision", revision}, {"dirty", dirty}, {"feature_count", feature_count},
-        {"component_count", component_count}, {"empty", empty},
+        {"revision", revision}, {"metadata_revision", metadata_revision},
+        {"dirty", dirty}, {"feature_count", feature_count},
+        {"component_count", component_count}, {"mesh_reference_count", mesh_reference_count},
+        {"empty", empty},
         {"reproducible_from", std::move(reproducible_from)},
     };
     std::lock_guard<std::mutex> summary(summary_mtx);
@@ -484,6 +593,8 @@ constexpr std::size_t kCheckpointLimit = 32;                   // PM-cancel snap
 
 // ---- Undo disk journal (P2 multi-user / long sessions) -----------------------
 // Path: <stateDir>/hostd_undo/<instance-key>/<doc_id>/<seq>.json
+// Ephemeral spill only: there is no persistent undo-stack index and it is not
+// crash recovery. Entries are deleted when their live session closes.
 // stateDir mirrors services/ipc/ipc_discovery stateDir() without linking it
 // (libchudware must not pull the hostd IPC layer).
 static std::string undo_state_dir() {
@@ -618,6 +729,248 @@ std::mutex g_registry_mtx;
 std::map<std::string, std::shared_ptr<Session>> g_sessions;
 std::atomic<std::uint64_t> g_cache_verification_active{0};
 
+// Keep a joinable record of every document background task, including work
+// spawned by a verification. Embedders drain it before static destruction.
+struct BackgroundTaskRegistry {
+    std::mutex mutex;
+    std::vector<std::shared_future<void>> futures;
+};
+
+BackgroundTaskRegistry& background_task_registry() {
+    static auto& registry = *new BackgroundTaskRegistry;
+    return registry;
+}
+
+template <typename Fn>
+std::shared_future<void> tracked_background_task(Fn&& fn) {
+    auto& registry = background_task_registry();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    for (auto it = registry.futures.begin(); it != registry.futures.end();) {
+        if (it->wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+            it = registry.futures.erase(it);
+        else ++it;
+    }
+    // Reserve before launch: an allocation failure must not discard the only
+    // join handle while the caller holds a scheduler or document mutex.
+    if (registry.futures.size() == registry.futures.capacity())
+        registry.futures.reserve(std::max<std::size_t>(1, registry.futures.capacity() * 2));
+    auto future = std::async(std::launch::async,
+        [task = std::forward<Fn>(fn)]() mutable {
+            // Release captured sessions before making the future ready.
+            auto work = std::move(task);
+            work();
+        }).share();
+    registry.futures.push_back(future);
+    return future;
+}
+
+void drain_tracked_background_tasks() {
+    auto& registry = background_task_registry();
+    for (;;) {
+        std::vector<std::shared_future<void>> batch;
+        {
+            std::lock_guard<std::mutex> lock(registry.mutex);
+            if (registry.futures.empty()) return;
+            batch.swap(registry.futures);
+        }
+        for (auto& future : batch) future.wait();
+        // A task can enqueue descendants; collect them on the next pass.
+    }
+}
+// Serializes lookup-or-open with every native path binding save.
+std::mutex g_open_path_mtx;
+
+// Assembly source snapshots and the reverse dependency index never hold a
+// document lock while looking up another document. Immutable compiled payloads
+// stay alive through shared_ptrs while an assembly is rebuilding.
+struct LiveSourceEntry {
+    std::shared_ptr<const AssemblyLiveSource> source;
+    std::uint64_t sequence = 0;
+};
+std::mutex g_assembly_sources_mtx;
+std::map<std::string, std::map<std::string, LiveSourceEntry>> g_assembly_sources;
+std::shared_ptr<const AssemblyLiveSources> g_assembly_source_snapshot;
+std::map<std::string, std::set<std::string>> g_assembly_dependents;
+std::map<std::string, std::set<std::string>> g_assembly_dependencies;
+std::uint64_t g_assembly_source_sequence = 0;
+
+std::string canonical_source_path(const std::string& path) {
+    if (path.empty()) return {};
+    std::error_code ec;
+    auto absolute = std::filesystem::absolute(std::filesystem::u8path(path), ec);
+    if (ec) absolute = std::filesystem::u8path(path).lexically_normal();
+    auto canonical = std::filesystem::weakly_canonical(absolute, ec);
+    return (ec ? absolute.lexically_normal() : canonical).string();
+}
+
+static json source_file_stamp(const NativeFileStamp& stamp) {
+    if (!stamp.valid) return nullptr;
+    return {{"size", stamp.size}, {"mtime_ns", stamp.mtime_ns},
+            {"ino", stamp.ino}, {"device", stamp.device}};
+}
+
+static std::shared_ptr<const AssemblyLiveSources> assembly_sources_for_session(
+        const Session& s, std::shared_ptr<const AssemblyLiveSources> current = {}) {
+    if (!current) current = AssemblySourceScope::current();
+    if (!current) current = assembly_live_sources();
+    if (!s.recovery_sources || s.recovery_sources->empty()) return current;
+    auto merged = std::make_shared<AssemblyLiveSources>();
+    for (const auto& [path, source] : *s.recovery_sources) {
+        // A later disk replacement wins over the captured source; an unchanged
+        // base file is older than the unsaved revision captured in recovery.
+        if (source_file_stamp(stepplus_file_stamp(path)) == source->base_file_stamp)
+            (*merged)[path] = source;
+    }
+    for (const auto& [path, source] : *current) (*merged)[path] = source;
+    return merged;
+}
+
+std::shared_ptr<const AssemblyLiveSource> find_assembly_live_source(const std::string& path) {
+    std::lock_guard<std::mutex> lock(g_assembly_sources_mtx);
+    const auto found = g_assembly_sources.find(path);
+    if (found == g_assembly_sources.end()) return {};
+    const LiveSourceEntry* latest = nullptr;
+    for (const auto& [id, entry] : found->second)
+        if (!latest || entry.sequence > latest->sequence) latest = &entry;
+    return latest ? latest->source : nullptr;
+}
+
+void erase_assembly_source_locked(const std::string& path, const std::string& id) {
+    auto found = g_assembly_sources.find(path);
+    if (found == g_assembly_sources.end()) return;
+    if (found->second.erase(id)) g_assembly_source_snapshot.reset();
+    if (found->second.empty()) g_assembly_sources.erase(found);
+}
+
+// Caller owns s.mtx. Capture only a changed committed revision or save/path
+// transition, and defer any dependent work until every document lock is released.
+void capture_assembly_source(Session& s, std::vector<std::string>& changed_paths) {
+    if (!s.owns_journal) return;
+    if (!s.observed_source_path || s.observed_source_input_path != s.path) {
+        std::string path = canonical_source_path(s.path);
+        if (s.observed_source_path && *s.observed_source_path != path) {
+            if (!s.observed_source_path->empty()) changed_paths.push_back(*s.observed_source_path);
+            if (!path.empty()) changed_paths.push_back(path);
+        }
+        s.observed_source_path = std::move(path);
+        s.observed_source_input_path = s.path;
+    }
+    const std::string& path = *s.observed_source_path;
+
+    if (!s.published_source_path.empty() && s.published_source_path != path) {
+        std::lock_guard<std::mutex> lock(g_assembly_sources_mtx);
+        erase_assembly_source_locked(s.published_source_path, s.doc_id);
+        changed_paths.push_back(s.published_source_path);
+        s.published_source_path.clear();
+        s.published_source.reset();
+        s.published_source_revision = -1;
+    }
+    if (s.mesh_ref_only_revision == s.revision && s.dirty) {
+        s.published_source_revision = s.revision;
+        return;
+    }
+    if (!s.dirty) {
+        if (!s.published_source_path.empty()) {
+            const AssemblyLiveSource* previous = s.published_source.get();
+            bool changed = !previous || previous->unverified || !s.file_stamp.valid ||
+                           !(stepplus_file_stamp(s.path) == s.file_stamp) ||
+                           previous->doc_hash != s.source_doc_hash;
+            {
+                std::lock_guard<std::mutex> lock(g_assembly_sources_mtx);
+                erase_assembly_source_locked(s.published_source_path, s.doc_id);
+                const auto remaining = g_assembly_sources.find(s.published_source_path);
+                if (remaining != g_assembly_sources.end()) {
+                    const LiveSourceEntry* latest = nullptr;
+                    for (const auto& [id, entry] : remaining->second)
+                        if (!latest || entry.sequence > latest->sequence) latest = &entry;
+                    changed = !previous || !latest || !latest->source || previous->unverified ||
+                              latest->source->unverified ||
+                              latest->source->doc_hash != previous->doc_hash;
+                }
+            }
+            // Saving the exact live revision changes its backing identity, not its
+            // geometry. A second refresh here races close and needlessly rebuilds
+            // dependents; genuinely different disk/live content still propagates.
+            if (changed) changed_paths.push_back(s.published_source_path);
+            s.published_source_path.clear();
+            s.published_source.reset();
+            s.published_source_revision = -1;
+        }
+        return;
+    }
+    if (path.empty()) return;
+    if (s.published_source && s.published_source_revision == s.revision &&
+        s.published_source->unsaved == s.dirty &&
+        s.published_source->unverified == (s.cache_trust == "unverified")) return;
+
+    const std::string hash = stepplus_doc_hash(s.doc);
+    const bool content_changed = !s.published_source || s.published_source->doc_hash != hash;
+    auto snapshot = std::make_shared<AssemblyLiveSource>();
+    snapshot->doc_hash = hash;
+    snapshot->source_doc_id = s.doc_id;
+    snapshot->revision = s.revision;
+    snapshot->base_file_stamp = source_file_stamp(s.file_stamp);
+    snapshot->unsaved = s.dirty;
+    snapshot->unverified = s.cache_trust == "unverified";
+    if (!content_changed) {
+        snapshot->document = s.published_source->document;
+        snapshot->part = s.published_source->part;
+    } else {
+        snapshot->document = std::make_shared<const json>(s.doc);
+        if (!s.is_assembly() && s.compiled && s.compiled_rev == s.revision)
+            snapshot->part = s.compiled;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_assembly_sources_mtx);
+        auto& entry = g_assembly_sources[path][s.doc_id];
+        if (content_changed || !entry.source) entry.sequence = ++g_assembly_source_sequence;
+        entry.source = snapshot;
+        g_assembly_source_snapshot.reset();
+    }
+    s.published_source = std::move(snapshot);
+    s.published_source_path = path;
+    s.published_source_revision = s.revision;
+    if (content_changed) changed_paths.push_back(path);
+}
+
+void update_assembly_dependencies(const Session& s, const json& sources,
+                                  const std::string& base_dir) {
+    if (!s.owns_journal) return;
+    std::set<std::string> paths;
+    if (sources.is_array()) for (const auto& row : sources) {
+        const std::string path = row.value("path", std::string());
+        if (path.empty()) continue;
+        auto full = std::filesystem::u8path(path);
+        if (full.is_relative()) full = std::filesystem::u8path(base_dir) / full;
+        paths.insert(canonical_source_path(full.string()));
+    }
+    std::lock_guard<std::mutex> lock(g_assembly_sources_mtx);
+    auto& previous = g_assembly_dependencies[s.doc_id];
+    for (const auto& path : previous) {
+        auto found = g_assembly_dependents.find(path);
+        if (found == g_assembly_dependents.end()) continue;
+        found->second.erase(s.doc_id);
+        if (found->second.empty()) g_assembly_dependents.erase(found);
+    }
+    for (const auto& path : paths) g_assembly_dependents[path].insert(s.doc_id);
+    previous = std::move(paths);
+}
+
+void remove_assembly_dependencies(const std::string& id) {
+    std::lock_guard<std::mutex> lock(g_assembly_sources_mtx);
+    const auto found = g_assembly_dependencies.find(id);
+    if (found == g_assembly_dependencies.end()) return;
+    for (const auto& path : found->second) {
+        auto dependent = g_assembly_dependents.find(path);
+        if (dependent == g_assembly_dependents.end()) continue;
+        dependent->second.erase(id);
+        if (dependent->second.empty()) g_assembly_dependents.erase(dependent);
+    }
+    g_assembly_dependencies.erase(found);
+}
+
+void flush_assembly_source_changes(std::vector<std::string> paths);
+
 // --- Contention meters (attributed to per-doc acquires) -----------------------
 struct ContentionMeters {
     std::atomic<unsigned long long> acquisitions{0};
@@ -683,6 +1036,30 @@ public:
     ~DocLock() {
         release_all();
         t_current_doc_lock = prev_;
+        if (prev_ && prev_->holds_any()) {
+            for (auto& path : source_changes_) prev_->defer_source_change(std::move(path));
+            for (auto& refresh : refreshes_)
+                prev_->defer_refresh(refresh.first, std::move(refresh.second));
+        } else {
+            try { flush_assembly_source_changes(std::move(source_changes_)); }
+            catch (const std::exception& e) {
+                std::fprintf(stderr, "assembly source propagation failed: %s\n", e.what());
+            } catch (...) {
+                std::fprintf(stderr, "assembly source propagation failed\n");
+            }
+            if (!refreshes_.empty()) {
+                std::function<void(const std::string&, const json&)> sink;
+                { std::lock_guard<std::mutex> lock(g_cache_refresh_mtx); sink = g_cache_refresh_sink; }
+                if (sink) {
+                    for (const auto& refresh : refreshes_) {
+                        try { sink(refresh.first, refresh.second); }
+                        catch (const std::exception& e) {
+                            std::fprintf(stderr, "assembly refresh publication failed: %s\n", e.what());
+                        }
+                    }
+                }
+            }
+        }
         // Meter the whole RAII scope as one acquisition (RPC granularity).
         const unsigned long long hold_ns =
             (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -748,6 +1125,14 @@ public:
         return nullptr;
     }
 
+    void defer_refresh(const std::string& id, json response) {
+        refreshes_.emplace_back(id, std::move(response));
+    }
+
+    void defer_source_change(std::string path) {
+        if (!path.empty()) source_changes_.push_back(std::move(path));
+    }
+
     // Crash recovery: unlock every session mutex this DocLock owns.
     void force_release() {
         for (auto& h : held_) {
@@ -773,15 +1158,44 @@ private:
                                  mw, q, std::memory_order_relaxed)) {
             }
         }
-        pin->mtx.lock();
+        bool cancelled = false;
+        auto& cancel = request_cancel;
+        if (!cancel.check || cancel.committed) {
+            pin->mtx.lock();
+        } else {
+            for (;;) {
+                if (cancel.check(cancel.user)) {
+                    cancelled = true;
+                    break;
+                }
+                if (pin->mtx.try_lock()) {
+                    if (cancel.check(cancel.user)) {
+                        pin->mtx.unlock();
+                        cancelled = true;
+                    } else {
+                        cancel.committed = true;
+                    }
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            }
+        }
         g_cont.waiters.fetch_sub(1, std::memory_order_relaxed);
         const auto w1 = std::chrono::steady_clock::now();
         wait_ns_ += (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
                         w1 - w0)
                         .count();
+        if (cancelled)
+            throw OpError("abandoned", "client disconnected while waiting for document");
     }
     void release_all() {
         for (auto& h : held_) {
+            try { capture_assembly_source(*h.pin, source_changes_); }
+            catch (const std::exception& e) {
+                std::fprintf(stderr, "assembly source snapshot failed: %s\n", e.what());
+            } catch (...) {
+                std::fprintf(stderr, "assembly source snapshot failed\n");
+            }
             h.pin->refresh_summary();
             h.pin->mtx.unlock();
         }
@@ -802,6 +1216,8 @@ private:
     }
 
     std::vector<Held> held_;
+    std::vector<std::pair<std::string, json>> refreshes_;
+    std::vector<std::string> source_changes_;
     DocLock* prev_ = nullptr;
     unsigned long long wait_ns_ = 0;
     std::chrono::steady_clock::time_point hold_t0_;
@@ -811,6 +1227,7 @@ private:
 std::atomic<unsigned long long> g_doc_seq{1};
 std::atomic<unsigned long long> g_ckpt_seq{1};
 std::atomic<unsigned long long> g_study_seq{1};
+std::atomic<std::uint64_t> g_sketch_session_seq{1};
 
 std::string new_checkpoint_id() {
     // Opaque, unique-per-process id (Python uses a uuid4 prefix; the value is only
@@ -1010,7 +1427,9 @@ json& require_sketch_feature(json& doc, const json& op, const json& id_map) {
 // Normalize + expand ONE inline sketch entity (defined below, after unwrap_value_scalars).
 // Used by BOTH op_add_feature (inline params.entities) and op_sketch_add_entity.
 std::vector<json> expand_sketch_entity(json ent, IdGen& gen, json& relations);
-void apply_one(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map);
+void apply_one(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map,
+               json* conversion_reports = nullptr, json* op_reports = nullptr,
+               bool reject_unknown = false);
 
 
 // Expand add_feature{type:"standard_part"} into the parts catalog generator's
@@ -1020,8 +1439,8 @@ void apply_one(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_
 // synthetic keys so sketch_add_entity / extrude refs resolve correctly. The
 // macro itself never lands as a feature in the tree — only the produced
 // cylinder/sketch/extrude/… features do (editable, saved in .step+).
-void expand_standard_part(json& doc, const json& feat, std::size_t idx,
-                          IdGen& gen, json& id_map) {
+void expand_standard_part(json& doc, const json& feat, const json& before, std::size_t idx,
+                          IdGen& gen, json& id_map, bool reject_unknown) {
     const json params = feat.contains("params") && feat["params"].is_object()
                             ? feat["params"]
                             : json::object();
@@ -1114,18 +1533,17 @@ void expand_standard_part(json& doc, const json& feat, std::size_t idx,
     std::string last_body_fid;
     for (std::size_t j = 0; j < pb.ops.size(); ++j) {
         json sub = pb.ops[j];  // deep copy
+        if (before.is_string() && sub.value("op", std::string()) == "add_feature")
+            sub["before"] = before;
         // Merge outer + local maps so generator-local $N resolve, while any
         // outer-batch placeholders the expansion doesn't use stay available.
         json sub_map = id_map;
         for (auto it = local_map.begin(); it != local_map.end(); ++it)
             sub_map[it.key()] = it.value();
 
-        const std::size_t n_before =
-            (doc.contains("features") && doc["features"].is_array()) ? doc["features"].size()
-                                                                    : 0;
 
         // apply_one records minted ids under $<j> in sub_map.
-        apply_one(doc, sub, /*idx=*/j, gen, sub_map);
+        apply_one(doc, sub, /*idx=*/j, gen, sub_map, nullptr, nullptr, reject_unknown);
 
         const std::string key = "$" + std::to_string(j);
         if (sub_map.contains(key)) {
@@ -1137,15 +1555,14 @@ void expand_standard_part(json& doc, const json& feat, std::size_t idx,
                     local_map[k] = it.value();
             }
         }
-        if (sub.value("op", "") == "add_feature" &&
-            doc.contains("features") && doc["features"].is_array() &&
-            doc["features"].size() > n_before) {
-            const json& nf = doc["features"].back();
-            const std::string fid = nf.value("id", std::string());
-            if (!fid.empty()) {
+        if (sub.value("op", "") == "add_feature" && sub_map.contains(key) &&
+            sub_map[key].is_string()) {
+            const std::string fid = sub_map[key].get<std::string>();
+            const json* nf = find_feature(doc, fid);
+            if (!fid.empty() && nf) {
                 if (first_fid.empty()) first_fid = fid;
                 // Body-ish types (not a bare sketch used as a hex profile).
-                const std::string t = nf.value("type", std::string());
+                const std::string t = nf->value("type", std::string());
                 if (t != "sketch" && t != "sketch3d" && t != "plane" && t != "axis" &&
                     t != "point" && t != "csys")
                     last_body_fid = fid;
@@ -1248,9 +1665,8 @@ void normalize_inline_sketch_entities(json& feat, IdGen& gen, json& id_map) {
     params["constraints"] = std::move(constraints);
 }
 
-// Refuse params the compiler does not read (validate.cpp::unknown_feature_params). Op path
-// only: a saved doc with a legacy inert key still opens, compiles and accepts edits that
-// do not set that key.
+// Agent mutations refuse params the compiler does not read. Saved documents and
+// GUI/import mutations retain legacy inert keys rather than blocking unrelated edits.
 void refuse_unknown_params(const char* op_name, const json& type, const json& params) {
     if (!type.is_string()) return;
     const std::vector<std::string> errs = unknown_feature_params(type.get<std::string>(), params);
@@ -1260,7 +1676,42 @@ void refuse_unknown_params(const char* op_name, const json& type, const json& pa
     throw OpError("invalid_op", msg, {{"reason", "unknown_param"}});
 }
 
-void op_add_feature(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
+void append_feature(json& doc, const json& feat);
+
+// Where an op that places a feature among its siblings puts it. `before` / `after` name an
+// existing feature (placeholders resolved); both absent or null means no anchor, and the
+// caller appends / moves to the end. `siblings` excludes a feature being moved, so a feature
+// can never anchor to itself. An anchor naming no sibling is refused: it used to fall
+// through to "append", answering ok with the feature somewhere the caller never asked for.
+std::optional<std::size_t> placement_index(const json& siblings, const json& op,
+                                           const json& id_map, const char* op_name) {
+    const bool has_before = op.contains("before") && !op["before"].is_null();
+    const bool has_after = op.contains("after") && !op["after"].is_null();
+    if (has_before && has_after)
+        throw OpError("invalid_op", std::string(op_name) + ": send `before` or `after`, not both");
+    if (!has_before && !has_after) return std::nullopt;
+    const char* key = has_before ? "before" : "after";
+    json anchor = op[key];
+    resolve_placeholders_deep(anchor, id_map);
+    if (!anchor.is_string())
+        throw OpError("invalid_op", std::string(op_name) + ": `" + key +
+                                        "` must be a feature id string (or null for none)");
+    const std::string id = anchor.get<std::string>();
+    std::string known;
+    std::size_t listed = 0;
+    for (std::size_t i = 0; i < siblings.size(); ++i) {
+        const std::string sid = siblings[i].value("id", std::string());
+        if (sid == id) return has_before ? i : i + 1;
+        if (listed < 8) { known += (listed ? ", " : "") + sid; ++listed; }
+    }
+    throw OpError("invalid_op", std::string(op_name) + ": `" + key + "` names '" + id +
+                                    "', which is not another feature in this document" +
+                                    (known.empty() ? "" : " (ids: " + known +
+                                                              (siblings.size() > listed ? ", …" : "") + ")"));
+}
+
+void op_add_feature(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map,
+                    bool reject_unknown) {
     json feat;
     if (op.contains("feature") && op["feature"].is_object()) {
         feat = op["feature"];
@@ -1290,7 +1741,15 @@ void op_add_feature(json& doc, const json& op, std::size_t idx, IdGen& gen, json
             if (feat.contains(k) && !feat["params"].contains(k))
                 feat["params"][k] = feat[k];
         }
-        expand_standard_part(doc, feat, idx, gen, id_map);
+        if (reject_unknown) refuse_unknown_params("add_feature", feat["type"], feat["params"]);
+        // The expansion inserts each generated feature immediately BEFORE its anchor, so
+        // an `after` anchor is expressed as the feature that follows it (null = append).
+        const json no_features = json::array();
+        const json& siblings = doc.contains("features") ? doc["features"] : no_features;
+        const auto at = placement_index(siblings, op, id_map, "add_feature");
+        json before = at && *at < siblings.size()
+                          ? json(siblings[*at].value("id", std::string())) : json(nullptr);
+        expand_standard_part(doc, feat, before, idx, gen, id_map, reject_unknown);
         return;
     }
     const std::string fid = gen.next("f");
@@ -1399,37 +1858,75 @@ void op_add_feature(json& doc, const json& op, std::size_t idx, IdGen& gen, json
     // start reporting itself. Param defaults live in the Python layer for the
     // same reason; see the scope note on normalize_feature_shape.
     normalize_feature_shape(env);
-    refuse_unknown_params("add_feature", env["type"], env["params"]);
+    if (reject_unknown) refuse_unknown_params("add_feature", env["type"], env["params"]);
     resolve_placeholders_deep(env["params"], id_map);
     resolve_placeholders_deep(env["refs"], id_map);
 
     json& feats = doc["features"];
-    if (op.contains("before") && op["before"].is_string()) {
-        const std::string before = op["before"].get<std::string>();
-        std::size_t pos = feats.size();
-        for (std::size_t i = 0; i < feats.size(); ++i)
-            if (feats[i].value("id", std::string()) == before) { pos = i; break; }
-        feats.insert(feats.begin() + pos, env);
+    if (const auto at = placement_index(feats, op, id_map, "add_feature")) {
+        feats.insert(feats.begin() + *at, env);
     } else {
-        feats.push_back(env);
+        append_feature(doc, env);
     }
     id_map["$" + std::to_string(idx)] = fid;
 }
 
-void op_edit_feature(json& doc, const json& op, IdGen& gen, json& id_map) {
-    json target = op.value("id", std::string());
+// The op-level keys edit_feature reads. Anything else used to be dropped without a word
+// (`{"op":"edit_feature","id":"f1","radius":5}` answered ok and changed nothing), so a
+// stray key is refused and the error names where it belongs. A `type` equal to the
+// feature's own only restates it and is harmless.
+void refuse_stray_edit_feature_keys(const json& op, const json& feature) {
+    static const std::set<std::string> kRead = {"op", "id", "name", "params", "refs"};
+    std::string msg;
+    for (auto it = op.begin(); it != op.end(); ++it) {
+        const std::string& k = it.key();
+        if (kRead.count(k)) continue;
+        std::string hint;
+        if (k == "type") {
+            if (it.value() == feature.value("type", json())) continue;
+            hint = "a feature's type cannot change; add_feature the new type, then delete_feature this one";
+        } else if (k == "suppressed") {
+            hint = "use {\"op\":\"set_suppressed\",\"id\":...,\"value\":true|false}";
+        } else if (k == "folder") {
+            hint = "use {\"op\":\"set_folder\",\"id\":...,\"folder\":...}";
+        } else if (k == "before" || k == "after") {
+            hint = "edit_feature does not move a feature; use reorder_feature {id, before|after}";
+        } else {
+            hint = "a parameter goes inside \"params\", a reference inside \"refs\"";
+        }
+        msg += (msg.empty() ? "'" : " | '") + k + "': " + hint;
+    }
+    if (msg.empty()) return;
+    throw OpError("invalid_op",
+                  "edit_feature: unknown op key(s) — " + msg +
+                      ". edit_feature reads only id, name, params and refs, so anything else "
+                      "would be ignored.",
+                  {{"reason", "unknown_op_key"}});
+}
+
+void op_edit_feature(json& doc, const json& op, IdGen& gen, json& id_map, bool reject_unknown) {
+    json target = op.contains("id") ? op["id"] : json();
     resolve_placeholders_deep(target, id_map);
+    if (!target.is_string())
+        throw OpError("invalid_op", "edit_feature: `id` must be the feature id string (e.g. \"f3\")");
     const std::string id = target.get<std::string>();
     json* f = find_feature(doc, id);
     if (!f) throw OpError("invalid_op", "edit_feature: no feature '" + id + "'");
-    if (op.contains("params")) {
+    refuse_stray_edit_feature_keys(op, *f);
+    for (const char* slot : {"params", "refs"})
+        if (op.contains(slot) && !op[slot].is_null() && !op[slot].is_object())
+            throw OpError("invalid_op", std::string("edit_feature: `") + slot +
+                                            "` must be an object of the keys to change (null deletes a key)");
+    if (op.contains("name") && !op["name"].is_string())
+        throw OpError("invalid_op", "edit_feature: `name` must be a string");
+    if (op.contains("params") && op["params"].is_object()) {
         json p = op["params"];
         resolve_placeholders_deep(p, id_map);
-        if (p.is_object()) refuse_unknown_params("edit_feature", f->value("type", json()), p);
+        if (reject_unknown) refuse_unknown_params("edit_feature", f->value("type", json()), p);
         if (!f->contains("params")) (*f)["params"] = json::object();
         patch((*f)["params"], p);
     }
-    if (op.contains("refs")) {
+    if (op.contains("refs") && op["refs"].is_object()) {
         json r = op["refs"];
         resolve_placeholders_deep(r, id_map);
         if (!f->contains("refs")) (*f)["refs"] = json::object();
@@ -1438,7 +1935,7 @@ void op_edit_feature(json& doc, const json& op, IdGen& gen, json& id_map) {
     if (op.contains("params") && op["params"].is_object() && op["params"].contains("entities"))
         normalize_inline_sketch_entities(*f, gen, id_map);
     normalize_feature_shape(*f);
-    if (op.contains("name") && op["name"].is_string()) (*f)["name"] = op["name"];
+    if (op.contains("name")) (*f)["name"] = op["name"];
 }
 
 void op_delete_feature(json& doc, const json& op) {
@@ -1465,6 +1962,18 @@ void op_delete_feature(json& doc, const json& op) {
 
     std::set<std::string> remove{id};
     if (cascade) for (const std::string& d : dependents) remove.insert(d);
+    const std::string bar = doc.contains("rollback_after") && doc["rollback_after"].is_string()
+                                ? doc["rollback_after"].get<std::string>() : std::string();
+    if (remove.count(bar)) {
+        std::string previous;
+        for (const json& f : feats) {
+            const std::string fid = f.value("id", std::string());
+            if (fid == bar) break;
+            if (!remove.count(fid)) previous = fid;
+        }
+        if (previous.empty()) doc.erase("rollback_after");
+        else doc["rollback_after"] = previous;
+    }
     json kept = json::array();
     for (const json& f : feats)
         if (!remove.count(f.value("id", std::string()))) kept.push_back(f);
@@ -1485,13 +1994,7 @@ void op_reorder_feature(json& doc, const json& op, const json& id_map) {
     }
     if (!found) throw OpError("invalid_op", "reorder_feature: no feature '" + id + "'");
     std::size_t pos = rest.size();
-    if (op.contains("before") && op["before"].is_string()) {
-        json target_before = op["before"];
-        resolve_placeholders_deep(target_before, id_map);
-        const std::string before = target_before.get<std::string>();
-        for (std::size_t i = 0; i < rest.size(); ++i)
-            if (rest[i].value("id", std::string()) == before) { pos = i; break; }
-    }
+    if (const auto at = placement_index(rest, op, id_map, "reorder_feature")) pos = *at;
     rest.insert(rest.begin() + pos, moved);
     feats = rest;
 }
@@ -1531,7 +2034,7 @@ void refresh_sketch_external_refs(json& doc, CompileCache* cache,
 void refresh_sketch3d_external_refs(json& doc, CompileCache* cache = nullptr,
                                     ::geom::DisplayQuality quality =
                                         ::geom::DisplayQuality::Fine);
-void op_sketch_delete_entity(json& doc, const json& op, const json& id_map);
+json op_sketch_delete_entity(json& doc, const json& op, const json& id_map);
 
 // Sketch entities/constraints take PLAIN numbers, but models often wrap scalars as
 // {"value":N,"expr":null} (the feature-param convention) -> "must be a number"
@@ -1696,19 +2199,29 @@ std::vector<json> expand_sketch_entity(json ent, IdGen& gen, json& relations) {
                 cx = ent["center"][0].get<double>();
                 cy = ent["center"][1].get<double>();
             }
-            auto getnum = [&](std::initializer_list<const char*> keys, double* o) -> bool {
-                for (const char* k : keys)
-                    if (ent.contains(k) && ent[k].is_number()) { *o = ent[k].get<double>(); return true; }
-                return false;
-            };
             const double apo = std::cos(M_PI / n);  // inradius / circumradius
-            double v = 0.0, R = 0.0;
-            if (getnum({"circumradius", "radius", "r", "vertex_radius"}, &v)) R = v;
-            else if (getnum({"across_flats", "width_across_flats", "af", "wrench", "flats",
-                             "flat_to_flat", "width"}, &v)) R = (v * 0.5) / apo;
-            else if (getnum({"inradius", "apothem"}, &v)) R = v / apo;
-            else if (getnum({"diameter"}, &v)) R = v * 0.5;  // circum-diameter
-            if (!(R > 0.0))
+            double R = 0.0;
+            int sizes = 0;
+            for (const char* k : {"circumradius", "radius", "r", "vertex_radius",
+                                  "across_flats", "width_across_flats", "af", "wrench",
+                                  "flats", "flat_to_flat", "width", "inradius", "apothem",
+                                  "diameter"}) {
+                if (!ent.contains(k)) continue;
+                ++sizes;
+                if (!ent[k].is_number())
+                    throw OpError("invalid_op", std::string("polygon: size '") + k + "' must be numeric");
+                const double v = ent[k].get<double>();
+                const std::string key(k);
+                if (key == "diameter") R = v * 0.5;
+                else if (key == "inradius" || key == "apothem") R = v / apo;
+                else if (key == "across_flats" || key == "width_across_flats" || key == "af" ||
+                         key == "wrench" || key == "flats" || key == "flat_to_flat" || key == "width")
+                    R = v * 0.5 / apo;
+                else R = v;
+            }
+            if (sizes != 1)
+                throw OpError("invalid_op", "polygon: specify exactly one size key");
+            if (!std::isfinite(R) || !(R > 0.0))
                 throw OpError("invalid_op",
                               "polygon: needs a size — 'across_flats' (wrench size), 'circumradius', "
                               "or 'inradius' (mm)");
@@ -1735,6 +2248,13 @@ std::vector<json> expand_sketch_entity(json ent, IdGen& gen, json& relations) {
             chain_relations(true);
             for (std::size_t i = 1; i < out.size(); ++i)
                 add_relation("equal", {out[0]["id"], out[i]["id"]});
+            if (n >= 4) {
+                const std::string circle = gen.next("e");
+                for (int i = 0; i < n; ++i)
+                    add_relation("point_on", {out[i]["id"].get<std::string>() + ".p1", circle});
+                out.push_back({{"id", circle}, {"type", "circle"}, {"center", {cx, cy}},
+                               {"radius", R}, {"construction", true}});
+            }
             return out;
         }
     }
@@ -1985,6 +2505,7 @@ void op_sketch_add_entity(json& doc, const json& op, std::size_t idx, IdGen& gen
         auto aliases = sketch_entity_aliases(sk);
         for (const json& c0 : op["constraints"]) {
             json c = c0;
+            c.erase("auto");  // Inline user/agent intent is explicit.
             // resolve $self (and $self.sub) in refs to the new entity id.
             if (c.contains("refs") && c["refs"].is_array()) {
                 for (json& rref : c["refs"]) {
@@ -2022,14 +2543,15 @@ void op_sketch_add_constraint(json& doc, const json& op, std::size_t idx, IdGen&
         throw OpError("invalid_op",
                       "sketch_add_constraint: 'constraint' object (or a top-level 'type') required");
     }
-    unwrap_value_scalars(c);  // accept {value:N} scalars in sketch constraints
-    // Dimensional constraints must store value as {value, expr} for schema validate.
-    // unwrap_value_scalars flattens {value:40, expr:null} → 40; re-wrap bare numbers
-    // (and leave already-object dims alone). Solver resolve_dim accepts both shapes.
+    // Unwrap auxiliary scalar fields without destroying a dimension expression.
+    const json authored_value = c.value("value", json());
+    unwrap_value_scalars(c);
+    if (authored_value.is_object()) c["value"] = authored_value;
+    // Dimensional constraints store bare numeric values in the schema's dim shape.
     if (c.contains("type") && c["type"].is_string()) {
         const std::string ct = c["type"].get<std::string>();
         if ((ct == "distance" || ct == "length" || ct == "angle" || ct == "radius" ||
-             ct == "diameter") &&
+             ct == "diameter" || ct == "rotate_point" || ct == "signed_distance") &&
             c.contains("value") && c["value"].is_number()) {
             c["value"] = json{{"value", c["value"].get<double>()}, {"expr", nullptr}};
         }
@@ -2068,10 +2590,12 @@ void op_sketch_add_constraint(json& doc, const json& op, std::size_t idx, IdGen&
         if (ctype == "coincident" || ctype == "parallel" || ctype == "perpendicular" ||
             ctype == "tangent" || ctype == "collinear" || ctype == "equal" ||
             ctype == "concentric" || ctype == "coradial" || ctype == "midpoint" ||
-            ctype == "point_on" || ctype == "angle") {
+            ctype == "point_on" || ctype == "angle" || ctype == "signed_distance") {
             if (nrefs < 2) bad(2, nullptr);
-        } else if (ctype == "symmetric") {
+        } else if (ctype == "symmetric" || ctype == "rotate_point") {
             if (nrefs < 3) bad(3, nullptr);
+        } else if (ctype == "equal_offset") {
+            if (nrefs < 4) bad(4, nullptr);
         } else if (ctype == "fix" || ctype == "radius" || ctype == "diameter" ||
                    ctype == "length") {
             if (nrefs < 1) bad(1, nullptr);
@@ -2099,36 +2623,73 @@ void op_sketch_add_constraint(json& doc, const json& op, std::size_t idx, IdGen&
         chudware::sketch::adopt_solved_coordinates(sk["params"], env_from_doc(doc));
     const std::string cid = gen.next("c");
     c["id"] = cid;
+    c.erase("auto");
     sk["params"]["constraints"].push_back(c);
     id_map["$" + std::to_string(idx)] = cid;
 }
 
-void op_sketch_fully_define(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
+void op_sketch_fully_define(json& doc, const json& op, std::size_t idx, IdGen& gen,
+                            json& id_map, json* reports) {
+    if (!op.contains("sketch") || !op["sketch"].is_string() ||
+        op["sketch"].get<std::string>().empty())
+        throw OpError("invalid_op", "sketch_fully_define: 'sketch' must be a feature id",
+                      {{"index", idx}});
     json& sketch = require_sketch_feature(doc, op, id_map);
     chudware::sketch::DefineOptions options;
+    for (const char* key : {"relations", "dimensions", "round"})
+        if (op.contains(key) && !op[key].is_boolean())
+            throw OpError("invalid_op", std::string("sketch_fully_define: '") + key + "' must be boolean");
     options.relations = op.value("relations", true);
     options.dimensions = op.value("dimensions", true);
-    options.anchor_origin = op.value("anchor", std::string("origin")) != "none";
-    if (op.contains("entities") && op["entities"].is_array())
+    options.round_dimensions = op.value("round", true);
+    if (op.contains("anchor") && (!op["anchor"].is_string() ||
+        (op["anchor"] != "origin" && op["anchor"] != "none")))
+        throw OpError("invalid_op", "sketch_fully_define: anchor must be 'origin' or 'none'");
+    options.anchor_origin = op.value("anchor", std::string("origin")) == "origin";
+    if (op.contains("entities")) {
+        if (!op["entities"].is_array())
+            throw OpError("invalid_op", "sketch_fully_define: entities must be a list of entity ids");
         for (json entity : op["entities"]) {
             resolve_placeholders_deep(entity, id_map);
-            if (entity.is_string()) options.only_entities.push_back(entity.get<std::string>());
+            if (!entity.is_string())
+                throw OpError("invalid_op", "sketch_fully_define: entities must contain entity ids");
+            const std::string id = entity.get<std::string>();
+            bool found = false;
+            for (const auto& e : sketch["params"]["entities"])
+                if (e.value("id", std::string()) == id) { found = true; break; }
+            if (!found)
+                throw OpError("invalid_op", "sketch_fully_define: unknown entity '" + id + "'");
+            options.only_entities.push_back(id);
         }
+    }
     const auto result = chudware::sketch::fully_define(sketch["params"], env_from_doc(doc), options);
     gen.scan(doc);
+    int dimensions = 0;
     for (std::size_t k = 0; k < result.constraints.size(); ++k) {
         json constraint = result.constraints[k];
+        if (constraint.contains("value")) ++dimensions;
         const std::string id = gen.next("c");
         constraint["id"] = id;
+        constraint["auto"] = true;
         sketch["params"]["constraints"].push_back(std::move(constraint));
         id_map["$" + std::to_string(idx) + (k ? "#" + std::to_string(k) : "")] = id;
+    }
+    if (reports) {
+        json report = {{"index", idx}, {"op", "sketch_fully_define"},
+                       {"sketch", sketch.value("id", std::string())},
+                       {"relations_added", result.constraints.size() - dimensions},
+                       {"dimensions_added", dimensions}, {"dof_before", result.dof_before},
+                       {"dof_after", result.dof_after}, {"notes", result.notes}};
+        if (result.rounded)
+            report["rounded"] = {{"count", result.rounded}, {"max_delta", result.rounded_max_delta}};
+        reports->push_back(std::move(report));
     }
 }
 
 // Convert Entities shares the cached whole-document projector with read-only previews.
 // Sources: face boundaries, model edges/vertices, isolated edge-plane pierce points,
 // datum planes/axes/origin, and world-lifted entities from another 2D sketch.
-// Output defaults to real geometry (construction:false), fix-pinned and associative.
+// Output defaults to construction geometry, fix-pinned and associative.
 // Each params.external_refs record owns stable entity ids, preserving attached relations
 // across refreshes. Dangling sources retain last-good geometry and become stale.
 // Set associative:false for a one-shot copy, or fix:false to leave projected curves free.
@@ -2143,10 +2704,13 @@ void op_sketch_convert(json& doc, const json& op, std::size_t idx, IdGen& gen, j
     CompileResult pre = compile_document(doc, env_from_doc(doc),
         inc_rebuild_enabled() ? apply_session->compile_cache.get() : nullptr,
         apply_session->display_quality);
+    if (!pre.ok)
+        throw OpError("rebuild_failed", "sketch_convert: source history did not rebuild",
+                      {{"reason", "feature_failed"}});
     auto& context = apply_session->external_projection_cache;
     const auto plane = cached_external_sketch_plane(doc, sk, pre, context);
     json res = project_external_refs(doc, plane, refs, &pre, false, &context);
-    const bool constr = op.value("construction", false);
+    const bool constr = op.value("construction", true);
     const bool fix = op.value("fix", true);
     const bool assoc = op.value("associative", true);
     std::vector<std::string> ids;
@@ -2349,35 +2913,66 @@ void op_sketch_edit_entity(json& doc, const json& op, const json& id_map) {
     patch(*target, patch_obj);
 }
 
-void op_sketch_delete_entity(json& doc, const json& op, const json& id_map) {
+json op_sketch_delete_entity(json& doc, const json& op, const json& id_map) {
     json& sk = require_sketch_feature(doc, op, id_map);
-    const std::string eid = op.value("id", std::string());
+    json id = op.value("id", json());
+    resolve_placeholders_deep(id, id_map);
+    if (!id.is_string() || id.get<std::string>().empty())
+        throw OpError("invalid_op", "sketch_delete_entity requires an entity id");
+    const std::string eid = id.get<std::string>();
     json kept = json::array();
+    bool found = false;
     for (const json& e : sk["params"]["entities"])
-        if (e.value("id", std::string()) != eid) kept.push_back(e);
-    sk["params"]["entities"] = kept;
-    // Cascade-drop constraints whose handles touch the entity (ref starts "eid" or "eid.").
-    json kc = json::array();
+        if (e.value("id", std::string()) == eid) found = true;
+        else kept.push_back(e);
+    if (!found)
+        throw OpError("invalid_op", "sketch_delete_entity: unknown entity '" + eid + "'");
+    sk["params"]["entities"] = std::move(kept);
+    json constraints = json::array(), dropped = json::array();
     for (const json& c : sk["params"]["constraints"]) {
         bool touches = false;
         if (c.contains("refs") && c["refs"].is_array())
-            for (const json& rref : c["refs"])
-                if (rref.is_string()) {
-                    const std::string s = rref.get<std::string>();
+            for (const json& ref : c["refs"])
+                if (ref.is_string()) {
+                    const std::string s = ref.get<std::string>();
                     if (s == eid || s.rfind(eid + ".", 0) == 0) { touches = true; break; }
                 }
-        if (!touches) kc.push_back(c);
+        if (touches) dropped.push_back(c.value("id", std::string()));
+        else constraints.push_back(c);
     }
-    sk["params"]["constraints"] = kc;
+    std::set<std::string> removed;
+    for (const json& id : dropped) removed.insert(id.get<std::string>());
+    json retained = json::array();
+    for (const json& c : constraints) {
+        if (removed.count(c.value("angle_ref", std::string())))
+            dropped.push_back(c.value("id", std::string()));
+        else retained.push_back(c);
+    }
+    sk["params"]["constraints"] = std::move(retained);
+    return dropped;
 }
 
-void op_sketch_delete_constraint(json& doc, const json& op, const json& id_map) {
+json op_sketch_delete_constraint(json& doc, const json& op, const json& id_map) {
     json& sk = require_sketch_feature(doc, op, id_map);
-    const std::string cid = op.value("id", std::string());
-    json kept = json::array();
-    for (const json& c : sk["params"]["constraints"])
-        if (c.value("id", std::string()) != cid) kept.push_back(c);
-    sk["params"]["constraints"] = kept;
+    json id = op.value("id", json());
+    resolve_placeholders_deep(id, id_map);
+    if (!id.is_string() || id.get<std::string>().empty())
+        throw OpError("invalid_op", "sketch_delete_constraint requires a constraint id");
+    const std::string cid = id.get<std::string>();
+    json kept = json::array(), dropped = json::array();
+    bool found = false;
+    for (const json& c : sk["params"]["constraints"]) {
+        if (c.value("id", std::string()) == cid) {
+            found = true;
+            dropped.push_back(cid);
+        } else if (c.value("angle_ref", std::string()) == cid) {
+            dropped.push_back(c.value("id", std::string()));
+        } else kept.push_back(c);
+    }
+    if (!found)
+        throw OpError("invalid_op", "sketch_delete_constraint: unknown constraint '" + cid + "'");
+    sk["params"]["constraints"] = std::move(kept);
+    return dropped;
 }
 
 void op_sketch_set_dim(json& doc, const json& op, const json& id_map) {
@@ -2385,6 +2980,16 @@ void op_sketch_set_dim(json& doc, const json& op, const json& id_map) {
     const std::string cid = op.value("id", std::string());
     for (json& c : sk["params"]["constraints"]) {
         if (c.value("id", std::string()) == cid) {
+            if (c.contains("angle_ref") &&
+                ((op.contains("value") && !op["value"].is_null()) ||
+                 (op.contains("expr") && !op["expr"].is_null()) ||
+                 (op.contains("driven") && !op["driven"].is_null())))
+                throw OpError("invalid_op", "sketch_set_dim: linked rotation follows " +
+                              c["angle_ref"].get<std::string>() + "; edit the master dimension");
+            if (op.contains("driven") && op["driven"] == true)
+                for (const json& follower : sk["params"]["constraints"])
+                    if (follower.value("angle_ref", std::string()) == cid)
+                        throw OpError("invalid_op", "sketch_set_dim: a rotation master with followers must stay driving");
             // A constraint's `value` is a dim object {value, expr} (see validate_dim).
             // Any subset of {value|expr, placement, driven} may be supplied; expr wins
             // over value when both are present (mirrors the Python oracle).
@@ -2394,9 +2999,11 @@ void op_sketch_set_dim(json& doc, const json& op, const json& id_map) {
                                  ? c["value"].value("value", 0.0)
                                  : 0.0;
                 c["value"] = json{{"value", cur}, {"expr", op["expr"]}};
+                c.erase("auto");
                 touched = true;
             } else if (op.contains("value") && !op["value"].is_null()) {
                 c["value"] = json{{"value", op["value"].get<double>()}, {"expr", nullptr}};
+                c.erase("auto");
                 touched = true;
             }
             if (op.contains("placement")) {
@@ -2419,6 +3026,12 @@ void op_sketch_set_dim(json& doc, const json& op, const json& id_map) {
             if (!touched)
                 throw OpError("invalid_op",
                               "sketch_set_dim requires 'value', 'expr', 'placement', or 'driven'");
+            if (c.contains("value")) {
+                const json value = c["value"];
+                for (json& follower : sk["params"]["constraints"])
+                    if (follower.value("angle_ref", std::string()) == cid)
+                        follower["value"] = value;
+            }
             return;
         }
     }
@@ -2693,23 +3306,87 @@ void op_sketch_extend(json& doc, const json& op, std::size_t idx, IdGen& gen, js
     id_map["$" + std::to_string(idx)] = eid;
 }
 
+// Evaluate dimensional op inputs using the same equation environment as the
+// solver and retain the authored expression in the driving constraint.
+std::pair<double, json> sketch_op_dimension(const json& doc, const json& op, const char* key) {
+    if (!op.contains(key))
+        throw OpError("invalid_op", std::string("missing numeric '") + key + "'");
+    const json& input = op[key];
+    json dim = input.is_number() ? json{{"value", input}, {"expr", nullptr}} : input;
+    if (!dim.is_object() || !dim.contains("value") || !dim["value"].is_number() ||
+        (dim.contains("expr") && !dim["expr"].is_null() && !dim["expr"].is_string()))
+        throw OpError("invalid_op", std::string("'") + key + "' must be a number or {value:number,expr:string|null}");
+    if (!dim.contains("expr")) dim["expr"] = nullptr;
+    double value = dim["value"].get<double>();
+    if (dim["expr"].is_string() && !dim["expr"].get<std::string>().empty()) {
+        std::map<std::string, double> env;
+        const json values = env_from_doc(doc);
+        for (const auto& [name, v] : values.items())
+            if (v.is_number()) env[name] = v.get<double>();
+        try {
+            value = chudware::util::evaluate(dim["expr"].get<std::string>(), env);
+        } catch (const std::exception& e) {
+            throw OpError("invalid_op", std::string("'") + key + "' expression: " + e.what());
+        }
+    }
+    if (!std::isfinite(value))
+        throw OpError("invalid_op", std::string("'") + key + "' must evaluate to a finite number");
+    return {value, dim};
+}
+
+void require_parametric_op_solved(const json& doc, const json& sketch, const char* operation) {
+    const auto solved = chudware::sketch::solve_sketch(sketch["params"], env_from_doc(doc), std::nullopt);
+    if (!solved.skipped.empty())
+        throw OpError("sketch_constraint_failed", std::string(operation) + ": constraint " +
+                      solved.skipped.front().first + " was skipped: " + solved.skipped.front().second);
+    if (!solved.converged || !solved.conflicting.empty())
+        throw OpError("sketch_constraint_failed", std::string(operation) +
+                      ": generated constraints cannot be solved: " +
+                      chudware::sketch::nonconvergence_reason(sketch["params"], solved));
+}
+
 void op_sketch_offset(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
     json& sk = require_sketch_feature(doc, op, id_map);
     if (!op.contains("entities") || !op["entities"].is_array() || op["entities"].empty())
         throw OpError("invalid_op", "sketch_offset requires a non-empty 'entities' id list");
-    if (!op.contains("distance") || !op["distance"].is_number())
-        throw OpError("invalid_op", "sketch_offset requires a numeric 'distance'");
-    if (!op.contains("side") || !op["side"].is_array() || op["side"].size() != 2)
-        throw OpError("invalid_op", "sketch_offset requires 'side': [u, v]");
-    double distance = op["distance"].get<double>();
+    if (!chudware::sketch::adopt_solved_coordinates(sk["params"], env_from_doc(doc)))
+        throw OpError("offset_failed", "sketch_offset: existing sketch does not solve");
+    auto [distance, distance_dim] = sketch_op_dimension(doc, op, "distance");
+    if (distance <= 0)
+        throw OpError("invalid_op", "sketch_offset requires a positive distance");
+    if (!op.contains("side") || !op["side"].is_array() || op["side"].size() != 2 ||
+        !op["side"][0].is_number() || !op["side"][1].is_number())
+        throw OpError("invalid_op", "sketch_offset requires numeric 'side': [u, v]");
     double sx = op["side"][0].get<double>(), sy = op["side"][1].get<double>();
     std::vector<json> chain;
     for (const json& e_id : op["entities"]) {
         json* ent = find_sketch_entity(sk, e_id.get<std::string>());
         if (!ent)
             throw OpError("invalid_op", "sketch_offset: entity '" + e_id.get<std::string>() + "' not found");
+        const std::string type = ent->value("type", std::string());
+        if (type != "line" && type != "arc" && type != "circle")
+            throw OpError("unsupported_entity", "sketch_offset supports lines, arcs, and circles");
+        if (type == "circle" && op["entities"].size() != 1)
+            throw OpError("invalid_op", "sketch_offset: a circle must be offset separately");
         chain.push_back(geom_view(*ent));
     }
+    auto endpoint = [](const json& entity, bool start) -> std::array<double, 2> {
+        if (entity["type"] == "line") {
+            const json& p = entity[start ? "p1" : "p2"];
+            return {p[0].get<double>(), p[1].get<double>()};
+        }
+        const double a = entity[start ? "start" : "end"].get<double>() * M_PI / 180.0;
+        const double r = entity["radius"].get<double>();
+        return {entity["center"][0].get<double>() + r * std::cos(a),
+                entity["center"][1].get<double>() + r * std::sin(a)};
+    };
+    auto joined = [&](const json& a, const json& b) {
+        const auto p = endpoint(a, false), q = endpoint(b, true);
+        return std::hypot(p[0] - q[0], p[1] - q[1]) <= 1e-5;
+    };
+    for (std::size_t i = 1; i < chain.size(); ++i)
+        if (!joined(chain[i - 1], chain[i]))
+            throw OpError("invalid_op", "sketch_offset requires an ordered connected chain");
     std::vector<json> out;
     bool closed = false;
     try {
@@ -2720,6 +3397,24 @@ void op_sketch_offset(json& doc, const json& op, std::size_t idx, IdGen& gen, js
                       "op[" + std::to_string(idx) + "]: sketch_offset involves an unsupported entity (" +
                           exc.etype + ")",
                       {{"index", idx}, {"reason", "unsupported entity '" + exc.etype + "'"}});
+    }
+    if (out.size() > 1) {
+        for (std::size_t i = 1; i < out.size(); ++i)
+            if (!joined(out[i - 1], out[i]))
+                throw OpError("offset_failed", "sketch_offset cannot join the requested offset spans");
+        if (closed && !joined(out.back(), out.front()))
+            throw OpError("offset_failed", "sketch_offset cannot close the requested offset chain");
+    }
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        if (chain[i]["type"] != "line") continue;
+        const auto a = endpoint(chain[i], true), b = endpoint(chain[i], false);
+        const auto p = endpoint(out[i], true), q = endpoint(out[i], false);
+        const double ux = b[0] - a[0], uy = b[1] - a[1], vx = q[0] - p[0], vy = q[1] - p[1];
+        const double ul = std::hypot(ux, uy), vl = std::hypot(vx, vy);
+        if (ul < 1e-10 || vl < 1e-10 || std::abs(ux * vy - uy * vx) > 1e-7 * ul * vl ||
+            std::abs(std::abs(ux * (p[1] - a[1]) - uy * (p[0] - a[0])) / ul - distance) >
+                1e-6 * std::max(1.0, distance))
+            throw OpError("offset_failed", "sketch_offset cannot preserve the requested parallel distance");
     }
     json& ents = sk["params"]["entities"];
     json& cons = sk["params"]["constraints"];
@@ -2742,6 +3437,68 @@ void op_sketch_offset(json& doc, const json& op, std::size_t idx, IdGen& gen, js
         cons.push_back({{"id", gen.next("c")}, {"type", "coincident"},
                         {"refs", {end_handle(a, "end"), end_handle(b, "start")}}});
     }
+    auto relation = [&](const char* type, json refs) {
+        cons.push_back({{"id", gen.next("c")}, {"type", type}, {"refs", std::move(refs)}});
+    };
+    std::string distance_link;
+    for (int i = 0; i < n; ++i) {
+        const std::string source = op["entities"][i].get<std::string>();
+        const std::string link = gen.next("e");
+        if (new_types[i] == "line") {
+            const auto a = endpoint(chain[i], true), b = endpoint(chain[i], false);
+            const auto q = endpoint(out[i], true);
+            const double length = std::hypot(b[0] - a[0], b[1] - a[1]);
+            const double nx = -(b[1] - a[1]) / length, ny = (b[0] - a[0]) / length;
+            const double shift = (q[0] - a[0]) * nx + (q[1] - a[1]) * ny;
+            ents.push_back({{"id", link}, {"type", "line"}, {"construction", true},
+                            {"p1", {a[0], a[1]}}, {"p2", {a[0] + nx * shift, a[1] + ny * shift}}});
+            relation("coincident", {source + ".p1", link + ".p1"});
+            relation("point_on", {link + ".p2", new_ids[i]});
+            relation("perpendicular", {source, link});
+            relation("parallel", {source, new_ids[i]});
+        } else {
+            relation("concentric", {source, new_ids[i]});
+            const double cx = chain[i]["center"][0].get<double>();
+            const double cy = chain[i]["center"][1].get<double>();
+            const double a = new_types[i] == "arc" ? chain[i]["start"].get<double>() * M_PI / 180.0 : 0.0;
+            const double r1 = chain[i]["radius"].get<double>(), r2 = out[i]["radius"].get<double>();
+            ents.push_back({{"id", link}, {"type", "line"}, {"construction", true},
+                            {"p1", {cx + r1 * std::cos(a), cy + r1 * std::sin(a)}},
+                            {"p2", {cx + r2 * std::cos(a), cy + r2 * std::sin(a)}}});
+            relation("point_on", {link + ".p1", source});
+            relation("point_on", {link + ".p2", new_ids[i]});
+            relation("point_on", {source + ".center", link});
+        }
+        if (distance_link.empty()) {
+            distance_link = link;
+            cons.push_back({{"id", gen.next("c")}, {"type", "distance"}, {"refs", {link}},
+                            {"value", distance_dim}});
+        } else {
+            relation("equal", {distance_link, link});
+        }
+    }
+    if (!closed && new_types[0] != "circle") {
+        for (const auto& [i, start] : std::vector<std::pair<int, bool>>{{0, true}, {n - 1, false}}) {
+            const std::string source = op["entities"][i].get<std::string>();
+            const std::string suffix = new_types[i] == "line" ? (start ? ".p1" : ".p2")
+                                                                : (start ? ".start" : ".end");
+            auto end_point = [&](const json& entity) -> json {
+                if (new_types[i] == "line") return entity[start ? "p1" : "p2"];
+                const double a = entity[start ? "start" : "end"].get<double>() * M_PI / 180.0;
+                const double r = entity["radius"].get<double>();
+                return json::array({entity["center"][0].get<double>() + r * std::cos(a),
+                                    entity["center"][1].get<double>() + r * std::sin(a)});
+            };
+            const std::string link = gen.next("e");
+            ents.push_back({{"id", link}, {"type", "line"}, {"construction", true},
+                            {"p1", end_point(chain[i])}, {"p2", end_point(out[i])}});
+            relation("coincident", {source + suffix, link + ".p1"});
+            relation("coincident", {new_ids[i] + suffix, link + ".p2"});
+            if (new_types[i] == "line") relation("perpendicular", {source, link});
+            else relation("point_on", {source + ".center", link});
+        }
+    }
+    require_parametric_op_solved(doc, sk, "sketch_offset");
     id_map["$" + std::to_string(idx)] = new_ids.empty() ? std::string() : new_ids[0];
     for (std::size_t k = 1; k < new_ids.size(); ++k)
         id_map["$" + std::to_string(idx) + "#" + std::to_string(k)] = new_ids[k];
@@ -2766,33 +3523,119 @@ void drop_corner_join(json& sk, const std::string& h1, const std::string& h2) {
                     if (r.get<std::string>() == h1) has1 = true;
                     if (r.get<std::string>() == h2) has2 = true;
                 }
-        if (has1 && has2) continue;
+        if (has1 && has2 && c.value("type", std::string()) == "coincident") continue;
         kept.push_back(c);
     }
     cons = kept;
 }
 
-void op_sketch_fillet(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
+void op_sketch_fillet(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map,
+                      json* op_reports) {
     json& sk = require_sketch_feature(doc, op, id_map);
     const std::string e1id = op.value("e1", std::string()), e2id = op.value("e2", std::string());
+    if (!chudware::sketch::adopt_solved_coordinates(sk["params"], env_from_doc(doc)))
+        throw OpError("fillet_failed", "sketch_fillet: existing sketch does not solve");
     json* e1 = find_sketch_entity(sk, e1id);
     json* e2 = find_sketch_entity(sk, e2id);
     if (!e1 || !e2)
         throw OpError("invalid_op", "sketch_fillet requires existing 'e1' and 'e2' entity ids");
     if (e1id == e2id)
         throw OpError("invalid_op", "sketch_fillet: e1 and e2 must be different entities");
-    if (!op.contains("radius") || !op["radius"].is_number() || op["radius"].get<double>() <= 0)
-        throw OpError("invalid_op", "sketch_fillet requires a positive numeric 'radius'");
-    double radius = op["radius"].get<double>();
+    auto [radius, radius_dim] = sketch_op_dimension(doc, op, "radius");
+    const double requested_radius = radius;
+    constexpr double min_radius = 1e-6;
+    radius = std::max(radius, min_radius);
     for (json* ent : {e1, e2})
         if (ent->value("type", std::string()) != "line")
             unsupported_entity(idx, "sketch_fillet supports line-line corners only — got", ent->value("type", std::string()));
     json res;
+    const json geom1 = geom_view(*e1), geom2 = geom_view(*e2);
     try {
-        res = sg::fillet_corner(geom_view(*e1), geom_view(*e2), radius);
+        res = sg::fillet_corner(geom1, geom2, radius);
     } catch (const sg::GeomError& exc) {
-        throw OpError("fillet_failed", "op[" + std::to_string(idx) + "]: sketch_fillet — " + exc.reason,
-                      {{"index", idx}, {"reason", exc.reason}});
+        if (exc.reason != "radius too large for this corner")
+            throw OpError("fillet_failed", "op[" + std::to_string(idx) + "]: sketch_fillet — " + exc.reason,
+                          {{"index", idx}, {"reason", exc.reason}});
+        double low = min_radius;
+        try {
+            res = sg::fillet_corner(geom1, geom2, low);
+        } catch (const sg::GeomError& small) {
+            throw OpError("fillet_failed", "sketch_fillet: no valid radius: " + small.reason);
+        }
+        double high = low;
+        while (high < radius) {
+            const double next = std::min(radius, high * 2.0);
+            try {
+                json candidate = sg::fillet_corner(geom1, geom2, next);
+                low = next;
+                res = std::move(candidate);
+                high = next;
+                if (next == radius) break;
+            } catch (const sg::GeomError&) {
+                high = next;
+                break;
+            }
+        }
+        for (int i = 0; i < 80; ++i) {
+            const double mid = low + (high - low) * 0.5;
+            if (mid == low || mid == high) break;
+            try {
+                json candidate = sg::fillet_corner(geom1, geom2, mid);
+                low = mid;
+                res = std::move(candidate);
+            } catch (const sg::GeomError&) { high = mid; }
+        }
+        radius = low;
+    }
+    std::optional<double> expression_upper_bound;
+    if (radius != requested_radius) {
+        if (radius_dim["expr"].is_string() && !radius_dim["expr"].get<std::string>().empty()) {
+            double upper = radius;
+            if (requested_radius < min_radius) {
+                double low = min_radius, high = min_radius;
+                while (true) {
+                    const double next = high * 2.0;
+                    if (!std::isfinite(next))
+                        throw OpError("fillet_failed", "sketch_fillet: cannot determine a finite radius limit");
+                    try {
+                        (void)sg::fillet_corner(geom1, geom2, next);
+                        low = high = next;
+                    } catch (const sg::GeomError&) {
+                        high = next;
+                        break;
+                    }
+                }
+                for (int i = 0; i < 80; ++i) {
+                    const double mid = low + (high - low) * 0.5;
+                    if (mid == low || mid == high) break;
+                    try { (void)sg::fillet_corner(geom1, geom2, mid); low = mid; }
+                    catch (const sg::GeomError&) { high = mid; }
+                }
+                upper = low;
+            }
+            expression_upper_bound = upper;
+            std::ostringstream bound;
+            bound << std::setprecision(17) << upper;
+            radius_dim["expr"] = "min(max((" + radius_dim["expr"].get<std::string>() +
+                                 "),1e-6)," + bound.str() + ")";
+        }
+        radius_dim["value"] = radius;
+    }
+    const std::string moved1 = line_end_handle(e1id, res["end_a"].get<std::string>());
+    const std::string moved2 = line_end_handle(e2id, res["end_b"].get<std::string>());
+    for (const json& c : sk["params"]["constraints"]) {
+        if (c.value("type", std::string()) != "fix" || !c.contains("refs") ||
+            !c["refs"].is_array()) continue;
+        for (const json& ref : c["refs"]) {
+            if (!ref.is_string()) continue;
+            const std::string h = ref.get<std::string>();
+            // A fix is anchored to authored geometry. Rewriting a fixed line,
+            // its midpoint, or the trimmed endpoint would silently move the fix.
+            if (h == e1id || h == e2id || h == moved1 || h == moved2 ||
+                h == e1id + ".mid" || h == e2id + ".mid")
+                throw OpError("fillet_failed", "sketch_fillet: a trimmed point is fixed",
+                              {{"index", idx}, {"constraint", c.value("id", std::string())}});
+        }
     }
     drop_corner_join(sk, line_end_handle(e1id, res["end_a"].get<std::string>()),
                      line_end_handle(e2id, res["end_b"].get<std::string>()));
@@ -2804,33 +3647,66 @@ void op_sketch_fillet(json& doc, const json& op, std::size_t idx, IdGen& gen, js
     arc["construction"] = false;
     sk["params"]["entities"].push_back(arc);
     json& cons = sk["params"]["constraints"];
+    const std::size_t first_fillet_constraint = cons.size();
     cons.push_back({{"id", gen.next("c")}, {"type", "coincident"},
                     {"refs", {aid + ".start", line_end_handle(e1id, res["end_a"].get<std::string>())}}});
     cons.push_back({{"id", gen.next("c")}, {"type", "coincident"},
                     {"refs", {aid + ".end", line_end_handle(e2id, res["end_b"].get<std::string>())}}});
     cons.push_back({{"id", gen.next("c")}, {"type", "tangent"}, {"refs", {aid, e1id}}});
     cons.push_back({{"id", gen.next("c")}, {"type", "tangent"}, {"refs", {aid, e2id}}});
+    const std::string radius_cid = gen.next("c");
+    cons.push_back({{"id", radius_cid}, {"type", "radius"}, {"refs", {aid}},
+                    {"value", radius_dim}});
+    // A fillet is one transaction: do not retain a tangency-only arc whose
+    // radius the solver moved, or a partially registered conflicting relation.
+    const auto solved = chudware::sketch::solve_sketch(sk["params"], env_from_doc(doc), std::nullopt);
+    bool fillet_constraint_skipped = false;
+    for (const auto& skipped : solved.skipped)
+        for (std::size_t i = first_fillet_constraint; i < cons.size(); ++i)
+            if (skipped.first == cons[i].value("id", std::string()))
+                fillet_constraint_skipped = true;
+    const bool radius_ok = solved.entities.contains(aid) &&
+        solved.entities[aid].contains("radius") && solved.entities[aid]["radius"].is_number() &&
+        std::abs(solved.entities[aid]["radius"].get<double>() - radius) <=
+            1e-7 * std::max(1.0, radius);
+    if (!solved.converged || !solved.conflicting.empty() || fillet_constraint_skipped || !radius_ok)
+        throw OpError("fillet_failed", "sketch_fillet: requested radius conflicts with sketch constraints",
+                      {{"index", idx}, {"reason", "radius or tangency constraints cannot be satisfied"}});
+    if (op_reports && radius != requested_radius) {
+        json report{{"index", idx}, {"op", "sketch_fillet"},
+                    {"requested_radius", requested_radius}, {"applied_radius", radius},
+                    {"reason", "radius clamped to the valid corner range"}};
+        if (expression_upper_bound) {
+            report["expression_clamp_min"] = min_radius;
+            report["expression_clamp_max"] = *expression_upper_bound;
+            report["bounds_basis"] = "corner geometry at operation time";
+        }
+        op_reports->push_back(std::move(report));
+    }
     id_map["$" + std::to_string(idx)] = aid;
 }
 
 void op_sketch_chamfer(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
     json& sk = require_sketch_feature(doc, op, id_map);
     const std::string e1id = op.value("e1", std::string()), e2id = op.value("e2", std::string());
+    if (!chudware::sketch::adopt_solved_coordinates(sk["params"], env_from_doc(doc)))
+        throw OpError("chamfer_failed", "sketch_chamfer: existing sketch does not solve");
     json* e1 = find_sketch_entity(sk, e1id);
     json* e2 = find_sketch_entity(sk, e2id);
     if (!e1 || !e2)
         throw OpError("invalid_op", "sketch_chamfer requires existing 'e1' and 'e2' entity ids");
     if (e1id == e2id)
         throw OpError("invalid_op", "sketch_chamfer: e1 and e2 must be different entities");
-    if (!op.contains("distance") || !op["distance"].is_number() || op["distance"].get<double>() <= 0)
-        throw OpError("invalid_op", "sketch_chamfer requires a positive numeric 'distance'");
-    double distance = op["distance"].get<double>();
+    auto [distance, distance_dim] = sketch_op_dimension(doc, op, "distance");
     double distance2 = distance;
+    json distance2_dim = distance_dim;
     if (op.contains("distance2") && !op["distance2"].is_null()) {
-        if (!op["distance2"].is_number() || op["distance2"].get<double>() <= 0)
-            throw OpError("invalid_op", "sketch_chamfer 'distance2' must be a positive number when given");
-        distance2 = op["distance2"].get<double>();
+        auto second = sketch_op_dimension(doc, op, "distance2");
+        distance2 = second.first;
+        distance2_dim = second.second;
     }
+    if (distance <= 0 || distance2 <= 0)
+        throw OpError("invalid_op", "sketch_chamfer distances must be positive");
     for (json* ent : {e1, e2})
         if (ent->value("type", std::string()) != "line")
             unsupported_entity(idx, "sketch_chamfer supports line-line corners only — got", ent->value("type", std::string()));
@@ -2841,6 +3717,7 @@ void op_sketch_chamfer(json& doc, const json& op, std::size_t idx, IdGen& gen, j
         throw OpError("chamfer_failed", "op[" + std::to_string(idx) + "]: sketch_chamfer — " + exc.reason,
                       {{"index", idx}, {"reason", exc.reason}});
     }
+    const json corner = (*e1)[res["end_a"] == "start" ? "p1" : "p2"];
     drop_corner_join(sk, line_end_handle(e1id, res["end_a"].get<std::string>()),
                      line_end_handle(e2id, res["end_b"].get<std::string>()));
     set_line_end(*e1, res["end_a"].get<std::string>(), res["ta"]);
@@ -2850,11 +3727,21 @@ void op_sketch_chamfer(json& doc, const json& op, std::size_t idx, IdGen& gen, j
                  {"p1", {res["ta"][0].get<double>(), res["ta"][1].get<double>()}},
                  {"p2", {res["tb"][0].get<double>(), res["tb"][1].get<double>()}}};
     sk["params"]["entities"].push_back(line);
+    const std::string corner_id = gen.next("e");
+    sk["params"]["entities"].push_back({{"id", corner_id}, {"type", "point"},
+                                          {"construction", true}, {"p", corner}});
     json& cons = sk["params"]["constraints"];
     cons.push_back({{"id", gen.next("c")}, {"type", "coincident"},
                     {"refs", {lid + ".p1", line_end_handle(e1id, res["end_a"].get<std::string>())}}});
     cons.push_back({{"id", gen.next("c")}, {"type", "coincident"},
                     {"refs", {lid + ".p2", line_end_handle(e2id, res["end_b"].get<std::string>())}}});
+    cons.push_back({{"id", gen.next("c")}, {"type", "point_on"}, {"refs", {corner_id, e1id}}});
+    cons.push_back({{"id", gen.next("c")}, {"type", "point_on"}, {"refs", {corner_id, e2id}}});
+    cons.push_back({{"id", gen.next("c")}, {"type", "distance"},
+                    {"refs", {corner_id, lid + ".p1"}}, {"value", distance_dim}});
+    cons.push_back({{"id", gen.next("c")}, {"type", "distance"},
+                    {"refs", {corner_id, lid + ".p2"}}, {"value", distance2_dim}});
+    require_parametric_op_solved(doc, sk, "sketch_chamfer");
     id_map["$" + std::to_string(idx)] = lid;
 }
 
@@ -2990,80 +3877,252 @@ void op_sketch_mirror_entities(json& doc, const json& op, std::size_t idx, IdGen
         id_map["$" + std::to_string(idx) + "#" + std::to_string(k)] = new_ids[k];
 }
 
+void sketch_circular_pattern(json& doc, json& sk, const json& op, std::size_t idx,
+                             IdGen& gen, json& id_map, bool rotation = false) {
+    if (!op.contains("count") || !op["count"].is_number_integer() || op["count"].get<int>() < 2)
+        throw OpError("invalid_op", "sketch_pattern_entities requires an integer count >= 2");
+    if (!op.contains("center") || !op["center"].is_array() || op["center"].size() != 2)
+        throw OpError("invalid_op", "circular pattern requires center [x,y]");
+    const int count = op["count"].get<int>();
+    const json center_args{{"cx", op["center"][0]}, {"cy", op["center"][1]}};
+    auto [cx, cx_dim] = sketch_op_dimension(doc, center_args, "cx");
+    auto [cy, cy_dim] = sketch_op_dimension(doc, center_args, "cy");
+    auto [angle, angle_dim] = sketch_op_dimension(doc, op, "angle");
+    const bool full = std::abs(std::abs(angle) - 360.0) < 1e-9;
+    const bool equal_spacing = op.value("equal_spacing", full);
+    const double step = angle / (equal_spacing ? count : 1);
+    if (!std::isfinite(cx) || !std::isfinite(cy) || (!rotation && std::abs(step) < 1e-9))
+        throw OpError("invalid_op", "circular pattern step must be nonzero");
+    for (int i = 1; !rotation && i < count; ++i)
+        if (std::abs(std::remainder(step * i, 360.0)) < 1e-9)
+            throw OpError("invalid_op", "circular pattern would stack copies; use equal_spacing for a full turn");
+    json signed_step_dim = {{"value", step}, {"expr", nullptr}};
+    if (angle_dim["expr"].is_string() && !angle_dim["expr"].get<std::string>().empty()) {
+        std::string expr = angle_dim["expr"].get<std::string>();
+        if (equal_spacing) expr = "(" + expr + ")/" + std::to_string(count);
+        signed_step_dim["expr"] = expr;
+    }
+    std::vector<json> sources;
+    for (const json& eid : op["entities"]) {
+        json* ent = find_sketch_entity(sk, eid.get<std::string>());
+        if (!ent) throw OpError("invalid_op", "circular pattern source not found");
+        if (!kMpSupported.count(ent->value("type", std::string())))
+            unsupported_entity(idx, "sketch_pattern_entities", ent->value("type", std::string()));
+        if (!rotation && ent->value("type", std::string()) == "circle" &&
+            std::hypot((*ent)["center"][0].get<double>() - cx,
+                       (*ent)["center"][1].get<double>() - cy) < 1e-9)
+            throw OpError("invalid_op", "circular pattern would stack a circle centered on the pattern center");
+        if (!rotation && ent->value("type", std::string()) == "line") {
+            const json& a = (*ent)["p1"];
+            const json& b = (*ent)["p2"];
+            if (std::hypot((a[0].get<double>() + b[0].get<double>()) * 0.5 - cx,
+                           (a[1].get<double>() + b[1].get<double>()) * 0.5 - cy) < 1e-9)
+                for (int i = 1; i < count; ++i)
+                    if (std::abs(std::remainder(step * i, 180.0)) < 1e-9)
+                        throw OpError("invalid_op", "circular pattern would stack a centered line");
+        }
+        sources.push_back(*ent);
+    }
+    json& ents = sk["params"]["entities"];
+    json& cons = sk["params"]["constraints"];
+    auto relation = [&](const char* type, json refs) {
+        cons.push_back({{"id", gen.next("c")}, {"type", type}, {"refs", std::move(refs)}});
+    };
+    const std::string center = gen.next("e");
+    ents.push_back({{"id", center}, {"type", "point"}, {"p", {cx, cy}}, {"construction", true}});
+    if (cx_dim["expr"].is_null() && cy_dim["expr"].is_null()) {
+        relation("fix", {center});
+    } else {
+        auto center_dim = [&](char axis, double value, json dim) {
+            if (value == 0.0 && dim["expr"].is_null()) {
+                relation(axis == 'h' ? "vertical" : "horizontal", {"origin", center});
+            } else {
+                dim["value"] = std::abs(value);
+                if (value < 0 && dim["expr"].is_string())
+                    dim["expr"] = "-(" + dim["expr"].get<std::string>() + ")";
+                cons.push_back({{"id", gen.next("c")}, {"type", "distance"},
+                                {"refs", {"origin", center}}, {"axis", std::string(1, axis)},
+                                {"value", dim}});
+            }
+        };
+        center_dim('h', cx, cx_dim);
+        center_dim('v', cy, cy_dim);
+    }
+    auto handles_for = [](const std::string& type) {
+        if (type == "line") return std::vector<std::string>{".p1", ".p2"};
+        if (type == "circle") return std::vector<std::string>{".center"};
+        return std::vector<std::string>{".center", ".start", ".end"};
+    };
+    std::vector<std::string> previous;
+    for (const json& source : sources) previous.push_back(source["id"].get<std::string>());
+    std::vector<std::string> new_ids;
+    std::string angle_master;
+    for (int i = 1; i < count; ++i) {
+        for (std::size_t j = 0; j < sources.size(); ++j) {
+            const json& source = sources[j];
+            const std::string type = source["type"].get<std::string>();
+            const json placed = rotate_entity(geom_view(source), cx, cy, step * i);
+            const std::string copy = gen.next("e");
+            new_ids.push_back(copy);
+            ents.push_back(stamp_entity(placed, copy, source.value("construction", false)));
+            for (const std::string& handle : handles_for(type)) {
+                const std::string cid = gen.next("c");
+                json rotation_constraint{{"id", cid}, {"type", "rotate_point"},
+                                         {"refs", {previous[j] + handle, copy + handle, center}},
+                                         {"value", signed_step_dim}};
+                if (angle_master.empty()) angle_master = cid;
+                else rotation_constraint["angle_ref"] = angle_master;
+                cons.push_back(std::move(rotation_constraint));
+            }
+            if (type == "circle") relation("equal", {previous[j], copy});
+            previous[j] = copy;
+        }
+    }
+    if (!rotation) require_parametric_op_solved(doc, sk, "sketch_pattern_entities");
+    id_map["$" + std::to_string(idx)] = new_ids[0];
+    for (std::size_t i = 1; i < new_ids.size(); ++i)
+        id_map["$" + std::to_string(idx) + "#" + std::to_string(i)] = new_ids[i];
+}
+
 void op_sketch_pattern_entities(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
     json& sk = require_sketch_feature(doc, op, id_map);
     if (!op.contains("entities") || !op["entities"].is_array() || op["entities"].empty())
         throw OpError("invalid_op", "sketch_pattern_entities requires a non-empty 'entities' id list");
+    if (!chudware::sketch::adopt_solved_coordinates(sk["params"], env_from_doc(doc)))
+        throw OpError("pattern_failed", "sketch_pattern_entities: existing sketch does not solve");
     const std::string mode = op.value("mode", std::string());
-    if (mode != "linear" && mode != "circular")
+    if (mode == "circular") {
+        sketch_circular_pattern(doc, sk, op, idx, gen, id_map);
+        return;
+    }
+    if (mode != "linear")
         throw OpError("invalid_op", "sketch_pattern_entities requires mode 'linear' or 'circular'");
     if (!op.contains("count") || !op["count"].is_number_integer() || op["count"].get<int>() < 2)
         throw OpError("invalid_op", "sketch_pattern_entities requires an integer 'count' >= 2");
-    int count = op["count"].get<int>();
+    if (!op.contains("dir") || !op["dir"].is_array() || op["dir"].size() != 2 ||
+        !op["dir"][0].is_number() || !op["dir"][1].is_number())
+        throw OpError("invalid_op", "sketch_pattern_entities requires 'dir': [dx, dy]");
+    auto [spacing, spacing_dim] = sketch_op_dimension(doc, op, "spacing");
+    if (spacing <= 0) throw OpError("invalid_op", "sketch_pattern_entities requires positive spacing");
+    double nx = op["dir"][0].get<double>(), ny = op["dir"][1].get<double>();
+    const double len = std::hypot(nx, ny);
+    if (!std::isfinite(len) || len < 1e-12)
+        throw OpError("invalid_op", "sketch_pattern_entities requires a finite nonzero direction");
+    nx /= len; ny /= len;
     std::vector<json> sources;
-    for (const json& e_id : op["entities"]) {
-        json* ent = find_sketch_entity(sk, e_id.get<std::string>());
-        if (!ent)
-            throw OpError("invalid_op",
-                          "sketch_pattern_entities: entity '" + e_id.get<std::string>() + "' not found");
-        if (!kMpSupported.count(ent->value("type", std::string())))
-            unsupported_entity(idx, "sketch_pattern_entities", ent->value("type", std::string()));
+    for (const json& eid : op["entities"]) {
+        json* ent = find_sketch_entity(sk, eid.get<std::string>());
+        if (!ent) throw OpError("invalid_op", "sketch_pattern_entities: source not found");
+        const std::string type = ent->value("type", std::string());
+        if (!kMpSupported.count(type))
+            unsupported_entity(idx, "sketch_pattern_entities", type);
         sources.push_back(*ent);
     }
-    // Per-step transforms: ("t", dx, dy) | ("r", cx, cy, ang).
-    struct Step { bool rot; double a, b, c; };
-    std::vector<Step> steps;
-    if (mode == "linear") {
-        if (!op.contains("dir") || !op["dir"].is_array() || op["dir"].size() != 2 ||
-            !op["dir"][0].is_number() || !op["dir"][1].is_number())
-            throw OpError("invalid_op", "sketch_pattern_entities (linear) requires 'dir': [dx, dy]");
-        if (!op.contains("spacing") || !op["spacing"].is_number())
-            throw OpError("invalid_op", "sketch_pattern_entities (linear) requires a numeric 'spacing'");
-        double nx = op["dir"][0].get<double>(), ny = op["dir"][1].get<double>();
-        double spacing = op["spacing"].get<double>();
-        double L = std::hypot(nx, ny);
-        if (L < 1e-12)
-            throw OpError("invalid_op", "sketch_pattern_entities (linear) 'dir' is zero-length");
-        nx /= L; ny /= L;
-        for (int i = 1; i < count; ++i) steps.push_back({false, nx * spacing * i, ny * spacing * i, 0.0});
-    } else {
-        if (!op.contains("center") || !op["center"].is_array() || op["center"].size() != 2 ||
-            !op["center"][0].is_number() || !op["center"][1].is_number())
-            throw OpError("invalid_op", "sketch_pattern_entities (circular) requires 'center': [x, y]");
-        if (!op.contains("angle") || !op["angle"].is_number())
-            throw OpError("invalid_op", "sketch_pattern_entities (circular) requires a numeric 'angle'");
-        double cx = op["center"][0].get<double>(), cy = op["center"][1].get<double>();
-        double angle = op["angle"].get<double>();
-        bool equal = op.value("equal_spacing", false);
-        double step_ang = equal ? (angle / count) : angle;
-        for (int i = 1; i < count; ++i) steps.push_back({true, cx, cy, step_ang * i});
-    }
     json& ents = sk["params"]["entities"];
-    std::vector<std::string> new_ids;
-    for (const Step& tf : steps) {
-        for (const json& ent : sources) {
-            json geom = geom_view(ent);
-            json placed = tf.rot ? rotate_entity(geom, tf.a, tf.b, tf.c)
-                                 : translate_entity(geom, tf.a, tf.b);
-            std::string neid = gen.next("e");
-            new_ids.push_back(neid);
-            ents.push_back(stamp_entity(placed, neid, ent.value("construction", false)));
+    json& cons = sk["params"]["constraints"];
+    const std::string direction = gen.next("e");
+    ents.push_back({{"id", direction}, {"type", "line"}, {"construction", true},
+                    {"p1", {0.0, 0.0}}, {"p2", {nx, ny}}});
+    cons.push_back({{"id", gen.next("c")}, {"type", "fix"}, {"refs", {direction}}});
+    std::vector<std::string> previous, new_ids;
+    std::string spacing_link;
+    for (const json& source : sources) previous.push_back(source["id"].get<std::string>());
+    for (int step = 1; step < op["count"].get<int>(); ++step) {
+        for (std::size_t j = 0; j < sources.size(); ++j) {
+            const json& source = sources[j];
+            const std::string type = source["type"].get<std::string>();
+            json placed = translate_entity(geom_view(source), nx * spacing * step, ny * spacing * step);
+            const std::string copy = gen.next("e");
+            new_ids.push_back(copy);
+            ents.push_back(stamp_entity(placed, copy, source.value("construction", false)));
+            const std::vector<std::string> handles = type == "line" ? std::vector<std::string>{".p1", ".p2"} :
+                type == "circle" ? std::vector<std::string>{".center"} :
+                                   std::vector<std::string>{".center", ".start", ".end"};
+            for (const std::string& suffix : handles) {
+                json p;
+                if (suffix == ".start" || suffix == ".end") {
+                    const double a = source[suffix == ".start" ? "start" : "end"].get<double>() * M_PI / 180.0;
+                    const double r = source["radius"].get<double>();
+                    p = json::array({source["center"][0].get<double>() + r * std::cos(a),
+                                     source["center"][1].get<double>() + r * std::sin(a)});
+                } else {
+                    const char* key = suffix == ".center" ? "center" : suffix == ".p1" ? "p1" : "p2";
+                    p = source[key];
+                }
+                p[0] = p[0].get<double>() + nx * spacing * (step - 1);
+                p[1] = p[1].get<double>() + ny * spacing * (step - 1);
+                json q = p;
+                q[0] = q[0].get<double>() + nx * spacing;
+                q[1] = q[1].get<double>() + ny * spacing;
+                const std::string link = gen.next("e");
+                ents.push_back({{"id", link}, {"type", "line"}, {"construction", true},
+                                {"p1", p}, {"p2", q}});
+                cons.push_back({{"id", gen.next("c")}, {"type", "coincident"},
+                                {"refs", {previous[j] + suffix, link + ".p1"}}});
+                cons.push_back({{"id", gen.next("c")}, {"type", "coincident"},
+                                {"refs", {copy + suffix, link + ".p2"}}});
+                cons.push_back({{"id", gen.next("c")}, {"type", "parallel"}, {"refs", {direction, link}}});
+                if (spacing_link.empty()) {
+                    spacing_link = link;
+                    cons.push_back({{"id", gen.next("c")}, {"type", "distance"}, {"refs", {link}},
+                                    {"value", spacing_dim}});
+                } else {
+                    cons.push_back({{"id", gen.next("c")}, {"type", "equal"}, {"refs", {spacing_link, link}}});
+                }
+            }
+            if (type == "circle")
+                cons.push_back({{"id", gen.next("c")}, {"type", "equal"}, {"refs", {previous[j], copy}}});
+            previous[j] = copy;
         }
     }
-    id_map["$" + std::to_string(idx)] = new_ids.empty() ? std::string() : new_ids[0];
+    require_parametric_op_solved(doc, sk, "sketch_pattern_entities");
+    id_map["$" + std::to_string(idx)] = new_ids[0];
     for (std::size_t k = 1; k < new_ids.size(); ++k)
         id_map["$" + std::to_string(idx) + "#" + std::to_string(k)] = new_ids[k];
+}
+
+// Keep a snapshot's placement and orientation, but leave its size free so
+// authored length/radius dimensions on the transformed entity remain editable.
+void anchor_transform_reference(json& entities, json& constraints, IdGen& gen,
+                                const json& source, const std::string& reference,
+                                bool pin_position = true) {
+    const std::string type = source.value("type", std::string());
+    if (pin_position)
+        constraints.push_back({{"id", gen.next("c")}, {"type", "fix"},
+                               {"refs", {reference + (type == "line" ? ".p1" : ".center")}}});
+    auto fixed_direction = [&](const json& a, const json& b) {
+        const std::string id = gen.next("e");
+        entities.push_back({{"id", id}, {"type", "line"}, {"construction", true},
+                            {"p1", a}, {"p2", b}});
+        constraints.push_back({{"id", gen.next("c")}, {"type", "fix"}, {"refs", {id}}});
+        return id;
+    };
+    if (type == "line") {
+        const std::string direction = fixed_direction(source["p1"], source["p2"]);
+        constraints.push_back({{"id", gen.next("c")}, {"type", "parallel"},
+                               {"refs", {reference, direction}}});
+    } else if (type == "arc") {
+        const json center = source["center"];
+        const double cx = center[0].get<double>(), cy = center[1].get<double>();
+        const double r = source["radius"].get<double>();
+        for (const char* end : {"start", "end"}) {
+            const double angle = source[end].get<double>() * M_PI / 180.0;
+            const json point = json::array({cx + r * std::cos(angle), cy + r * std::sin(angle)});
+            const std::string direction = fixed_direction(center, point);
+            constraints.push_back({{"id", gen.next("c")}, {"type", "point_on"},
+                                   {"refs", {reference + "." + end, direction}}});
+        }
+    }
 }
 
 void op_sketch_move(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
     json& sk = require_sketch_feature(doc, op, id_map);
     if (!op.contains("entities") || !op["entities"].is_array() || op["entities"].empty())
         throw OpError("invalid_op", "sketch_move requires a non-empty 'entities' id list");
-    if (!op.contains("dx") || !op["dx"].is_number())
-        throw OpError("invalid_op", "sketch_move requires a numeric 'dx'");
-    if (!op.contains("dy") || !op["dy"].is_number())
-        throw OpError("invalid_op", "sketch_move requires a numeric 'dy'");
-    double dx = op["dx"].get<double>(), dy = op["dy"].get<double>();
+    if (!chudware::sketch::adopt_solved_coordinates(sk["params"], env_from_doc(doc)))
+        throw OpError("move_failed", "sketch_move: existing sketch does not solve");
+    auto [dx, dx_dim] = sketch_op_dimension(doc, op, "dx");
+    auto [dy, dy_dim] = sketch_op_dimension(doc, op, "dy");
     bool copy_flag = false;
     if (op.contains("copy")) {
         if (!op["copy"].is_boolean()) throw OpError("invalid_op", "sketch_move 'copy' must be a bool");
@@ -3078,28 +4137,51 @@ void op_sketch_move(json& doc, const json& op, std::size_t idx, IdGen& gen, json
             unsupported_entity(idx, "sketch_move", ent->value("type", std::string()));
         source_ids.push_back(e_id.get<std::string>());
     }
-    if (!copy_flag) {
-        for (const std::string& sid : source_ids) {
+    json& ents = sk["params"]["entities"];
+    json& cons = sk["params"]["constraints"];
+    std::vector<std::string> results;
+    std::pair<std::string, std::string> horizontal_master, vertical_master;
+    auto offset_relation = [&](const std::string& a, const std::string& b, char axis, const json& dim) {
+        auto& master = axis == 'h' ? horizontal_master : vertical_master;
+        if (master.first.empty()) {
+            master = {a, b};
+            cons.push_back({{"id", gen.next("c")}, {"type", "signed_distance"},
+                            {"refs", {a, b}}, {"axis", std::string(1, axis)}, {"value", dim}});
+        } else {
+            cons.push_back({{"id", gen.next("c")}, {"type", "equal_offset"},
+                            {"refs", {a, b, master.first, master.second}}, {"axis", std::string(1, axis)}});
+        }
+    };
+    for (const std::string& sid : source_ids) {
+        const json original = *find_sketch_entity(sk, sid);
+        const std::string type = original["type"].get<std::string>();
+        const json moved = translate_entity(geom_view(original), dx, dy);
+        std::string anchor = sid, target = sid;
+        if (copy_flag) {
+            target = gen.next("e");
+            ents.push_back(stamp_entity(moved, target, original.value("construction", false)));
+        } else {
+            anchor = gen.next("e");
+            ents.push_back(stamp_entity(geom_view(original), anchor, true));
+            anchor_transform_reference(ents, cons, gen, original, anchor);
             json* ent = find_sketch_entity(sk, sid);
-            json moved = translate_entity(geom_view(*ent), dx, dy);
             for (auto it = moved.begin(); it != moved.end(); ++it) (*ent)[it.key()] = it.value();
         }
-        id_map["$" + std::to_string(idx)] = source_ids.empty() ? std::string() : source_ids[0];
-        return;
+        const auto handles = type == "line" ? std::vector<std::string>{".p1", ".p2"} :
+                             type == "circle" ? std::vector<std::string>{".center"} :
+                             std::vector<std::string>{".center", ".start", ".end"};
+        for (const std::string& h : handles) {
+            offset_relation(anchor + h, target + h, 'h', dx_dim);
+            offset_relation(anchor + h, target + h, 'v', dy_dim);
+        }
+        if (type == "circle")
+            cons.push_back({{"id", gen.next("c")}, {"type", "equal"}, {"refs", {anchor, target}}});
+        results.push_back(target);
     }
-    json& ents = sk["params"]["entities"];
-    std::vector<std::string> new_ids;
-    for (const std::string& sid : source_ids) {
-        json* ent = find_sketch_entity(sk, sid);
-        bool construction = ent->value("construction", false);
-        json geom = translate_entity(geom_view(*ent), dx, dy);
-        std::string neid = gen.next("e");
-        new_ids.push_back(neid);
-        ents.push_back(stamp_entity(geom, neid, construction));
-    }
-    id_map["$" + std::to_string(idx)] = new_ids.empty() ? std::string() : new_ids[0];
-    for (std::size_t k = 1; k < new_ids.size(); ++k)
-        id_map["$" + std::to_string(idx) + "#" + std::to_string(k)] = new_ids[k];
+    require_parametric_op_solved(doc, sk, "sketch_move");
+    id_map["$" + std::to_string(idx)] = results[0];
+    for (std::size_t k = 1; k < results.size(); ++k)
+        id_map["$" + std::to_string(idx) + "#" + std::to_string(k)] = results[k];
 }
 
 // Entity id owning a constraint ref token ("e3" -> "e3", "e3.p1" -> "e3").
@@ -3108,25 +4190,18 @@ static std::string ref_entity_id(const std::string& ref) {
     return dot == std::string::npos ? ref : ref.substr(0, dot);
 }
 
-// Rotate a selection of sketch entities about (cx, cy) by 'angle' degrees. Translation-style
-// counterpart of op_sketch_move. Because horizontal/vertical relations are axis-aligned, a
-// rotation whose net angle is not a multiple of 90 breaks them; we therefore rewrite the
-// horizontal/vertical constraints whose refs lie WHOLLY inside the rotated set:
-//   ~0 / 180 deg -> keep unchanged   |   90 / 270 deg -> swap horizontal<->vertical
-//   any other    -> drop (the GUI diffs before/after to report what was removed).
-// Constraints straddling rotated + fixed geometry are left for the solver to reconcile.
+// Rotate a selection about (cx, cy). Whole-selection axis locks are converted
+// to relative orientation, allowing later edits to the driving angle. Relations
+// straddling the selection remain for the solver to reconcile.
 void op_sketch_rotate(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
     json& sk = require_sketch_feature(doc, op, id_map);
     if (!op.contains("entities") || !op["entities"].is_array() || op["entities"].empty())
         throw OpError("invalid_op", "sketch_rotate requires a non-empty 'entities' id list");
-    if (!op.contains("cx") || !op["cx"].is_number())
-        throw OpError("invalid_op", "sketch_rotate requires a numeric 'cx'");
-    if (!op.contains("cy") || !op["cy"].is_number())
-        throw OpError("invalid_op", "sketch_rotate requires a numeric 'cy'");
-    if (!op.contains("angle") || !op["angle"].is_number())
-        throw OpError("invalid_op", "sketch_rotate requires a numeric 'angle' (degrees)");
-    double cx = op["cx"].get<double>(), cy = op["cy"].get<double>();
-    double angle = op["angle"].get<double>();
+    if (!chudware::sketch::adopt_solved_coordinates(sk["params"], env_from_doc(doc)))
+        throw OpError("rotate_failed", "sketch_rotate: existing sketch does not solve");
+    auto [cx, cx_dim] = sketch_op_dimension(doc, op, "cx");
+    auto [cy, cy_dim] = sketch_op_dimension(doc, op, "cy");
+    auto [angle, angle_dim] = sketch_op_dimension(doc, op, "angle");
     bool copy_flag = false;
     if (op.contains("copy")) {
         if (!op["copy"].is_boolean()) throw OpError("invalid_op", "sketch_rotate 'copy' must be a bool");
@@ -3142,86 +4217,106 @@ void op_sketch_rotate(json& doc, const json& op, std::size_t idx, IdGen& gen, js
         source_ids.push_back(e_id.get<std::string>());
     }
 
-    if (copy_flag) {
-        json& ents = sk["params"]["entities"];
-        std::vector<std::string> new_ids;
-        for (const std::string& sid : source_ids) {
-            json* ent = find_sketch_entity(sk, sid);
-            bool construction = ent->value("construction", false);
-            json geom = rotate_entity(geom_view(*ent), cx, cy, angle);
-            std::string neid = gen.next("e");
-            new_ids.push_back(neid);
-            ents.push_back(stamp_entity(geom, neid, construction));
+    json& ents = sk["params"]["entities"];
+    json& cons = sk["params"]["constraints"];
+    json inputs = json::array();
+    const std::set<std::string> moved(source_ids.begin(), source_ids.end());
+    bool externally_anchored = false;
+    if (!copy_flag) {
+        for (const json& c : cons) {
+            if (!c.contains("refs") || !c["refs"].is_array()) continue;
+            bool inside = false, outside = false;
+            for (const json& r : c["refs"]) {
+                if (!r.is_string()) continue;
+                if (moved.count(ref_entity_id(r.get<std::string>()))) inside = true;
+                else outside = true;
+            }
+            externally_anchored |= inside && outside;
         }
-        id_map["$" + std::to_string(idx)] = new_ids.empty() ? std::string() : new_ids[0];
-        for (std::size_t k = 1; k < new_ids.size(); ++k)
-            id_map["$" + std::to_string(idx) + "#" + std::to_string(k)] = new_ids[k];
+    }
+    if (copy_flag) {
+        for (const std::string& sid : source_ids) inputs.push_back(sid);
+    } else {
+        std::string first_handle;
+        json first_point;
+        for (const std::string& sid : source_ids) {
+            const json source = *find_sketch_entity(sk, sid);
+            const std::string ghost = gen.next("e");
+            ents.push_back(stamp_entity(geom_view(source), ghost, true));
+            anchor_transform_reference(ents, cons, gen, source, ghost, !externally_anchored);
+            if (externally_anchored) {
+                const bool line = source.value("type", std::string()) == "line";
+                const std::string handle = ghost + (line ? ".p1" : ".center");
+                const json point = source[line ? "p1" : "center"];
+                if (first_handle.empty()) {
+                    first_handle = handle;
+                    first_point = point;
+                } else {
+                    for (int axis = 0; axis < 2; ++axis)
+                        cons.push_back({{"id", gen.next("c")}, {"type", "signed_distance"},
+                                        {"refs", {first_handle, handle}},
+                                        {"axis", axis == 0 ? "h" : "v"},
+                                        {"value", {{"value", point[axis].get<double>() -
+                                                            first_point[axis].get<double>()},
+                                                   {"expr", nullptr}}}});
+                }
+            }
+            inputs.push_back(ghost);
+        }
+    }
+    json pattern{{"entities", inputs}, {"count", 2}, {"center", {cx_dim, cy_dim}},
+                 {"angle", angle_dim}, {"equal_spacing", false}};
+    const std::size_t first_new_constraint = cons.size();
+    sketch_circular_pattern(doc, sk, pattern, idx, gen, id_map, true);
+    if (copy_flag) {
+        require_parametric_op_solved(doc, sk, "sketch_rotate");
         return;
     }
-
-    // In-place rotate the geometry of every selected entity.
-    for (const std::string& sid : source_ids) {
-        json* ent = find_sketch_entity(sk, sid);
-        json rotated = rotate_entity(geom_view(*ent), cx, cy, angle);
-        for (auto it = rotated.begin(); it != rotated.end(); ++it) (*ent)[it.key()] = it.value();
+    for (std::size_t i = 0; i < source_ids.size(); ++i) {
+        const std::string key = "$" + std::to_string(idx) + (i ? "#" + std::to_string(i) : "");
+        const std::string copy = id_map[key].get<std::string>();
+        const json placed = geom_view(*find_sketch_entity(sk, copy));
+        json* target = find_sketch_entity(sk, source_ids[i]);
+        for (auto it = placed.begin(); it != placed.end(); ++it) (*target)[it.key()] = it.value();
+        for (std::size_t j = first_new_constraint; j < cons.size(); ++j) {
+            if (!cons[j].contains("refs")) continue;
+            for (json& ref : cons[j]["refs"]) {
+                if (!ref.is_string()) continue;
+                const std::string text = ref.get<std::string>();
+                if (text == copy || text.rfind(copy + ".", 0) == 0)
+                    ref = source_ids[i] + text.substr(copy.size());
+            }
+        }
+        for (auto it = ents.begin(); it != ents.end(); ++it)
+            if (it->value("id", std::string()) == copy) { ents.erase(it); break; }
+        id_map[key] = source_ids[i];
     }
 
-    // Rewrite horizontal/vertical relations wholly inside the rotated set.
-    double na = std::fmod(std::fmod(angle, 360.0) + 360.0, 360.0);  // normalize to [0,360)
-    const double eps = 1e-6;
-    bool is180 = std::fabs(na - 180.0) < eps || na < eps || std::fabs(na - 360.0) < eps;
-    bool is90 = std::fabs(na - 90.0) < eps || std::fabs(na - 270.0) < eps;
-    std::set<std::string> moved(source_ids.begin(), source_ids.end());
-    if (!is180 && sk["params"].contains("constraints") && sk["params"]["constraints"].is_array()) {
-        json& cons = sk["params"]["constraints"];
-        json kept = json::array();
-        // Whole-line horizontal/vertical locks being retired at a non-axis angle. We can't keep
-        // them (the line is no longer axis-aligned) and simply dropping them leaves the shape
-        // FLOPPY (under-defined) so the solver shears it on re-solve. Instead we record each line's
-        // original orientation and, below, re-impose the SAME relative rigidity with rotation-
-        // invariant parallel/perpendicular relations against a reference line — so a rotated square
-        // stays a rigid square (size + right angles preserved), just free to spin (1 DOF).
-        std::vector<std::pair<std::string, bool>> oriented;   // (line_id, wasHorizontal)
-        for (json& c : cons) {
-            const std::string ctype = c.value("type", std::string());
-            bool hv = (ctype == "horizontal" || ctype == "vertical");
-            bool wholly_inside = hv && c.contains("refs") && c["refs"].is_array() && !c["refs"].empty();
-            if (wholly_inside)
-                for (const auto& r : c["refs"])
-                    if (!moved.count(ref_entity_id(r.get<std::string>()))) { wholly_inside = false; break; }
-            if (hv && wholly_inside) {
-                if (is90) {                       // swap horizontal <-> vertical (still axis-aligned)
-                    c["type"] = (ctype == "horizontal") ? "vertical" : "horizontal";
-                    kept.push_back(c);
-                } else {
-                    // Non-axis angle: retire this lock. If it's a whole-line h/v (refs == [line_id]),
-                    // remember the line so we can re-impose parallel/perp rigidity below. Two-point
-                    // h/v forms (point alignment) can't be preserved this way — just drop them.
-                    if (c["refs"].size() == 1) {
-                        std::string eid = ref_entity_id(c["refs"][0].get<std::string>());
-                        json* le = find_sketch_entity(sk, eid);
-                        if (le && le->value("type", std::string()) == "line")
-                            oriented.push_back({eid, ctype == "horizontal"});
-                    }
+    // The transform links drive orientation. Preserve axis-aligned relations as
+    // reference annotations, so editing the rotation angle remains possible.
+    const double quarter_turns = angle / 90.0;
+    const bool axis_aligned = std::abs(quarter_turns - std::round(quarter_turns)) < 1e-9;
+    const bool swap_axes = std::abs(std::remainder(std::round(quarter_turns), 2.0)) > 0.5;
+    json kept = json::array();
+    for (json& c : cons) {
+        const std::string ctype = c.value("type", std::string());
+        const bool hv = ctype == "horizontal" || ctype == "vertical";
+        bool wholly_inside = hv && c.contains("refs") && c["refs"].is_array() && !c["refs"].empty();
+        if (wholly_inside)
+            for (const auto& r : c["refs"])
+                if (!r.is_string() || !moved.count(ref_entity_id(r.get<std::string>()))) {
+                    wholly_inside = false;
+                    break;
                 }
-            } else {
-                kept.push_back(c);
-            }
+        if (hv && wholly_inside) {
+            if (!axis_aligned) continue;
+            if (swap_axes) c["type"] = ctype == "horizontal" ? "vertical" : "horizontal";
+            c["driven"] = true;
         }
-        // Re-impose rigidity: pin every other retired line's orientation relative to the first
-        // (parallel if it had the same orientation, perpendicular if opposite). N locks -> N-1
-        // relative constraints, leaving one global spin DOF — shape-preserving, never distorting.
-        if (oriented.size() >= 2) {
-            const std::string& refLine = oriented.front().first;
-            const bool refH = oriented.front().second;
-            for (std::size_t i = 1; i < oriented.size(); ++i) {
-                const char* rtype = (oriented[i].second == refH) ? "parallel" : "perpendicular";
-                kept.push_back({{"id", gen.next("c")}, {"type", rtype},
-                                {"refs", json::array({refLine, oriented[i].first})}});
-            }
-        }
-        cons = kept;
+        kept.push_back(c);
     }
+    cons = std::move(kept);
+    require_parametric_op_solved(doc, sk, "sketch_rotate");
     id_map["$" + std::to_string(idx)] = source_ids.empty() ? std::string() : source_ids[0];
 }
 
@@ -3237,6 +4332,16 @@ bool valid_component_source(const json& source) {
     return source.is_object() &&
            ((source.contains("path") && source["path"].is_string()) ||
             (source.contains("embedded") && source["embedded"].is_string()));
+}
+
+std::string assembly_op_id(const json& op, std::size_t idx, const char* kind) {
+    const auto id = op.find("id");
+    if (id == op.end() || !id->is_string() || id->get_ref<const std::string&>().empty())
+        throw OpError("invalid_op",
+                      op["op"].get<std::string>() + ": 'id' must be a non-empty " + kind +
+                          " id string. Use the id field of the returned " + kind + " object.",
+                      {{"index", idx}, {"reason", "bad_id"}});
+    return id->get<std::string>();
 }
 
 void op_asm_insert_component(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
@@ -3282,7 +4387,7 @@ void op_asm_insert_component(json& doc, const json& op, std::size_t idx, IdGen& 
 }
 
 void op_asm_edit_component(json& doc, const json& op, std::size_t idx) {
-    const std::string kid = op.value("id", std::string());
+    const std::string kid = assembly_op_id(op, idx, "component");
     if (op.contains("source") && !valid_component_source(op["source"]))
         throw OpError("invalid_op", "asm_edit_component requires source.{path|embedded}",
                       {{"index", idx}});
@@ -3301,7 +4406,7 @@ void op_asm_edit_component(json& doc, const json& op, std::size_t idx) {
 }
 
 void op_asm_delete_component(json& doc, const json& op, std::size_t idx) {
-    const std::string kid = op.value("id", std::string());
+    const std::string kid = assembly_op_id(op, idx, "component");
     json comps = (doc.contains("components") && doc["components"].is_array()) ? doc["components"]
                                                                              : json::array();
     bool found = false;
@@ -3380,6 +4485,24 @@ void bind_assembly_reference_frames(json& doc) {
 void op_asm_add_mate(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
     if (!op.contains("mate") || !op["mate"].is_object())
         throw OpError("invalid_op", "asm_add_mate requires a 'mate' object", {{"index", idx}});
+    {
+        // An unknown type used to be written into the document and fail only as one line of
+        // the post-batch validation (or as a solver "unsupported mate type"). Refuse it here
+        // and list the vocabulary the solver actually builds.
+        const json& given = op["mate"].contains("type") ? op["mate"]["type"] : json();
+        const std::vector<std::string> types = mate_type_names();
+        if (!given.is_string() ||
+            std::find(types.begin(), types.end(), given.get<std::string>()) == types.end()) {
+            std::string list;
+            for (const std::string& t : types) list += (list.empty() ? "" : ", ") + t;
+            throw OpError("invalid_op",
+                          "asm_add_mate: mate.type " +
+                              (given.is_null() ? std::string("is missing")
+                                               : given.dump() + " is not a mate type") +
+                              ". Mate types: " + list,
+                          {{"index", idx}, {"mate_types", types}});
+        }
+    }
     json m = op["mate"];  // deep copy
     m["id"] = gen.next("m");
     if (!m.contains("suppressed")) m["suppressed"] = false;
@@ -3393,31 +4516,97 @@ void op_asm_add_mate(json& doc, const json& op, std::size_t idx, IdGen& gen, jso
     id_map["$" + std::to_string(idx)] = m["id"];
 }
 
+std::string component_source_base(const Session& s);
+
+// Check replacement refs with the schema and source-geometry resolver used by
+// assembly rebuilds. A suppressed mate is temporarily enabled for this probe,
+// including its components, so invalid refs cannot hide until re-enabled.
+void resolve_edited_mate_refs(json& mate, const json& doc, std::size_t idx) {
+    json components = json::array();
+    if (doc.contains("components") && doc["components"].is_array() &&
+        mate.contains("refs") && mate["refs"].is_array())
+        for (const json& component : doc["components"]) {
+            if (!component.is_object() || !component.contains("id") ||
+                !component["id"].is_string()) continue;
+            for (const json& ref : mate["refs"])
+                if (ref.is_object() && ref.contains("component") &&
+                    ref["component"].is_string() && ref["component"] == component["id"]) {
+                    components.push_back(component);
+                    break;
+                }
+        }
+    json probe = {{"schema", "aicad.asm/1"},
+                  {"components", std::move(components)},
+                  {"equations", doc.value("equations", json{{"globals", json::array()}})},
+                  {"mates", json::array({mate})}};
+    for (const std::string& error : validate_document(probe))
+        if (error.compare(0, 8, "mates[0]") == 0)
+            throw OpError("invalid_op", "asm_edit_mate: " + error,
+                          {{"index", idx}, {"reason", error}});
+
+    // A replacement is a new binding, even when it names a previously bound
+    // component. Do not retain its old frame or frames for removed components.
+    mate.erase("reference_frames");
+    bind_mate_reference_frames(mate, probe["components"]);
+    if (mate.value("suppressed", false))
+        for (json& component : probe["components"]) component["suppressed"] = false;
+    probe["mates"][0] = mate;
+    probe["mates"][0]["suppressed"] = false;
+
+    if (!apply_session) throw std::logic_error("asm_edit_mate requires an apply context");
+    const AssemblyResult resolved = compile_assembly(probe, component_source_base(*apply_session));
+    const std::string mid = mate.at("id").get<std::string>();
+    for (const AsmMateStatus& status : resolved.mate_status) {
+        if (status.id != mid) continue;
+        if (status.status == "unresolved")
+            throw OpError("invalid_op", "asm_edit_mate: mate '" + mid +
+                              "' could not resolve: " + status.reason,
+                          {{"index", idx}, {"mate", mid}, {"reason", status.reason},
+                           {"dangling_refs", status.dangling_refs}});
+        const auto geometry = resolved.mate_geometry.find(mid);
+        if (geometry != resolved.mate_geometry.end() &&
+            geometry->second.size() == mate["refs"].size()) return;
+        break;
+    }
+    throw OpError("invalid_op", "asm_edit_mate: mate '" + mid +
+                      "' did not resolve all replacement refs",
+                  {{"index", idx}, {"mate", mid}, {"reason", "unresolved_refs"}});
+}
+
 void op_asm_edit_mate(json& doc, const json& op, std::size_t idx) {
-    const std::string mid = op.value("id", std::string());
+    const std::string mid = assembly_op_id(op, idx, "mate");
+    for (auto it = op.begin(); it != op.end(); ++it)
+        if (it.key() != "op" && it.key() != "id" && it.key() != "value" &&
+            it.key() != "align" && it.key() != "suppressed" && it.key() != "refs")
+            throw OpError("invalid_op", "asm_edit_mate: unsupported key '" + it.key() +
+                              "'; allowed keys are op, id, value, align, suppressed, refs",
+                          {{"index", idx}, {"reason", "unsupported_key"}, {"key", it.key()}});
     if (doc.contains("mates") && doc["mates"].is_array())
         for (json& m : doc["mates"])
             if (m.value("id", std::string()) == mid) {
                 for (const char* k : {"value", "align", "suppressed"}) {
                     if (!op.contains(k) || op[k].is_null()) continue;
-                    // A partial value edit ({"value":{"value":60}}) must not wipe the hinge
-                    // `axis`/`axis_point` an angle mate carries beside its scalar: merge
-                    // object into object (edit keys win), replace anything else.
-                    if (std::string(k) == "value" && m.contains(k) && m[k].is_object() &&
-                        op[k].is_object())
+                    // A partial value edit ({"value":{"value":60}}) must preserve
+                    // an angle mate's axis and axis_point.
+                    if (std::string(k) == "value" && m.contains(k) &&
+                        m[k].is_object() && op[k].is_object())
                         m[k].merge_patch(op[k]);
                     else
                         m[k] = op[k];
                 }
-                if (doc.contains("components") && doc["components"].is_array())
+                if (op.contains("refs")) {
+                    m["refs"] = op["refs"];
+                    resolve_edited_mate_refs(m, doc, idx);
+                } else if (doc.contains("components") && doc["components"].is_array()) {
                     bind_mate_reference_frames(m, doc["components"]);
+                }
                 return;
             }
     throw OpError("invalid_op", "asm_edit_mate: '" + mid + "' not found", {{"index", idx}});
 }
 
 void op_asm_delete_mate(json& doc, const json& op, std::size_t idx) {
-    const std::string mid = op.value("id", std::string());
+    const std::string mid = assembly_op_id(op, idx, "mate");
     json mates = (doc.contains("mates") && doc["mates"].is_array()) ? doc["mates"] : json::array();
     bool found = false;
     for (const json& m : mates)
@@ -3828,12 +5017,18 @@ void reid_pasted_sketch(json& feat, IdGen& gen) {
 void append_feature(json& doc, const json& feat) {
     if (!doc.contains("features") || !doc["features"].is_array()) doc["features"] = json::array();
     json& feats = doc["features"];
-    const std::string rb = doc.value("rollback_after", std::string());
+    const std::string rb = doc.contains("rollback_after") && doc["rollback_after"].is_string()
+                               ? doc["rollback_after"].get<std::string>() : std::string();
+    if (rb == "start") {
+        feats.insert(feats.begin(), feat);
+        doc["rollback_after"] = feat["id"];
+        return;
+    }
     if (!rb.empty()) {
         int bar_pos = -1;
         for (std::size_t i = 0; i < feats.size(); ++i)
             if (feats[i].value("id", std::string()) == rb) { bar_pos = static_cast<int>(i); break; }
-        if (bar_pos >= 0 && bar_pos < static_cast<int>(feats.size()) - 1) {
+        if (bar_pos >= 0) {
             feats.insert(feats.begin() + bar_pos + 1, feat);
             doc["rollback_after"] = feat["id"];
             return;
@@ -4002,7 +5197,11 @@ void op_sketch_paste_entities(json& doc, const json& op, std::size_t idx, IdGen&
     for (const json& ne : new_entities) sk["params"]["entities"].push_back(ne);
 
     // Keep only constraints whose handles ALL land inside the pasted set (drop external/origin).
+    // Linked rotations must also include their master: remap both constraint ids together,
+    // never leave a pasted follower attached to the source sketch's master.
     json& cons = sk["params"]["constraints"];
+    std::vector<json> internal;
+    std::set<std::string> internal_ids;
     for (const json& con : src_cons) {
         if (!con.is_object()) continue;
         const json handles = con.contains("refs") ? con["refs"] : json::array();
@@ -4014,12 +5213,29 @@ void op_sketch_paste_entities(json& doc, const json& op, std::size_t idx, IdGen&
                     break;
                 }
         if (!all_in) continue;
+        internal.push_back(con);
+        if (con.contains("id") && con["id"].is_string())
+            internal_ids.insert(con["id"].get<std::string>());
+    }
+    std::map<std::string, std::string> cid_map;
+    for (const json& con : internal) {
+        if (con.contains("angle_ref") && (!con["angle_ref"].is_string() ||
+            !internal_ids.count(con["angle_ref"].get<std::string>()))) continue;
+        if (con.contains("id") && con["id"].is_string())
+            cid_map[con["id"].get<std::string>()] = gen.next("c");
+    }
+    for (const json& con : internal) {
+        if (con.contains("angle_ref") && (!con["angle_ref"].is_string() ||
+            !cid_map.count(con["angle_ref"].get<std::string>()))) continue;
         json nc = con;
-        nc["id"] = gen.next("c");
-        json nr = json::array();
-        for (const json& h : handles) nr.push_back(remap_handle(h, eid_map));
-        nc["refs"] = nr;
-        cons.push_back(nc);
+        const std::string old_id = con.value("id", std::string());
+        nc["id"] = cid_map.count(old_id) ? cid_map.at(old_id) : gen.next("c");
+        if (nc.contains("angle_ref"))
+            nc["angle_ref"] = cid_map.at(nc["angle_ref"].get<std::string>());
+        json refs = json::array();
+        for (const json& h : con["refs"]) refs.push_back(remap_handle(h, eid_map));
+        nc["refs"] = std::move(refs);
+        cons.push_back(std::move(nc));
     }
 
     std::vector<std::string> new_ids;
@@ -4288,34 +5504,528 @@ FaceAppearanceChange parse_face_appearance_change(const json& doc, const json& o
     return change;
 }
 
-void apply_one(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map) {
+// ------------------------------------------------------------ sketch3d atomic appends
+// The sketch3d tools used to read a feature's whole entities / constraints / external_refs
+// list, extend it and write it back with edit_feature, so two agents editing one sketch3d
+// lost each other's additions. These ops append to the LIVE tree inside apply_ops (one
+// DocLock, batches applied in sequence), so concurrent edits compose. Ids are minted here:
+// e<N> / c<N> per sketch (continuing its highest number), x<N> doc-wide via IdGen. Payloads
+// are validated by validate_document at the end of the batch — the same
+// validate_sketch3d_params edit_feature is held to — and a malformed payload is refused
+// naming the offending index/field, never dropped.
+
+json& require_sketch3d_feature(json& doc, const json& op, const json& id_map,
+                               const std::string& kind) {
+    json ref = op.contains("sketch") ? op["sketch"] : json();
+    resolve_placeholders_deep(ref, id_map);
+    if (!ref.is_string() || ref.get<std::string>().empty())
+        throw OpError("invalid_op", kind + ": 'sketch' must be a sketch3d feature id");
+    const std::string fid = ref.get<std::string>();
+    json* f = find_feature(doc, fid);
+    if (!f) throw OpError("invalid_op", kind + ": no feature '" + fid + "'");
+    const std::string type = f->value("type", std::string());
+    if (type != "sketch3d")
+        throw OpError("invalid_op", kind + ": feature '" + fid + "' is a " + type +
+                      ", not a sketch3d (2D sketches use sketch_add_entity / sketch_add_constraint)");
+    if (!f->contains("params") || !(*f)["params"].is_object()) (*f)["params"] = json::object();
+    json& p = (*f)["params"];
+    for (const char* key : {"entities", "constraints"}) {
+        if (!p.contains(key)) p[key] = json::array();
+        else if (!p[key].is_array())
+            throw OpError("invalid_op", kind + ": sketch3d '" + fid + "' params." + key +
+                          " is not a list");
+    }
+    return *f;
+}
+
+// Highest N among "<prefix>N" ids of a list of {id:...} objects (0 when none).
+int highest_numbered_id(const json& list, char prefix) {
+    int hi = 0;
+    for (const json& e : list) {
+        if (!e.is_object() || !e.contains("id") || !e["id"].is_string()) continue;
+        const std::string& id = e["id"].get_ref<const std::string&>();
+        if (id.size() < 2 || id.size() > 9 || id[0] != prefix) continue;
+        if (!std::all_of(id.begin() + 1, id.end(), [](unsigned char c) { return std::isdigit(c); }))
+            continue;
+        hi = std::max(hi, std::atoi(id.c_str() + 1));
+    }
+    return hi;
+}
+
+// The op's non-empty list payload `key`, copied with batch placeholders resolved.
+json sketch3d_payload_list(const json& op, const char* key, const std::string& kind,
+                           const char* shape, const json& id_map) {
+    if (!op.contains(key) || !op[key].is_array() || op[key].empty())
+        throw OpError("invalid_op", kind + ": '" + key + "' must be a non-empty list of " + shape);
+    json list = op[key];
+    resolve_placeholders_deep(list, id_map);
+    return list;
+}
+
+// Record minted ids the way sketch_add_entity does: $<index> first, $<index>#k the rest.
+void record_minted_ids(json& id_map, std::size_t idx, const std::vector<std::string>& ids) {
+    for (std::size_t k = 0; k < ids.size(); ++k)
+        id_map["$" + std::to_string(idx) + (k ? "#" + std::to_string(k) : std::string())] = ids[k];
+}
+
+// `$N.p2` / `$N#k` constraint refs name an entity minted earlier in this batch.
+void resolve_sketch3d_ref(json& ref, const json& id_map, const std::string& where) {
+    if (!ref.is_string()) return;  // the validator names a non-string handle
+    const std::string s = ref.get<std::string>();
+    if (s.empty() || s[0] != '$') return;
+    const auto dot = s.find('.');
+    const std::string base = s.substr(0, dot);
+    if (!id_map.contains(base) || !id_map[base].is_string())
+        throw OpError("invalid_op", where + ": placeholder '" + base +
+                      "' does not name an entity minted earlier in this batch");
+    ref = id_map[base].get<std::string>() + (dot == std::string::npos ? "" : s.substr(dot));
+}
+
+void op_sketch3d_add_entities(json& doc, const json& op, std::size_t idx, json& id_map) {
+    const std::string kind = "sketch3d_add_entities";
+    json& sk = require_sketch3d_feature(doc, op, id_map, kind);
+    const std::string fid = sk.value("id", std::string());
+    json fresh = sketch3d_payload_list(op, "entities", kind,
+                                       "sketch3d entities ({type, p/p1/p2/pm/points, ...})", id_map);
+    json& ents = sk["params"]["entities"];
+    int next = highest_numbered_id(ents, 'e');
+    std::set<std::string> used;
+    for (const json& e : ents)
+        if (e.is_object() && e.contains("id") && e["id"].is_string())
+            used.insert(e["id"].get<std::string>());
+    std::vector<std::string> minted;
+    for (std::size_t i = 0; i < fresh.size(); ++i) {
+        const std::string where = kind + ": entities[" + std::to_string(i) + "]";
+        json ent = std::move(fresh[i]);
+        if (!ent.is_object()) throw OpError("invalid_op", where + " must be an object {type, ...}");
+        unwrap_value_scalars(ent);
+        std::string id;
+        if (ent.contains("id") && !ent["id"].is_null()) {
+            if (!ent["id"].is_string())
+                throw OpError("invalid_op", where + ".id must be a string like \"e4\"");
+            id = ent["id"].get<std::string>();
+        }
+        if (id.empty()) id = "e" + std::to_string(++next);
+        else next = std::max(next, highest_numbered_id(json::array({json{{"id", id}}}), 'e'));
+        if (!used.insert(id).second)
+            throw OpError("invalid_op", where + ".id: '" + id + "' already exists in sketch3d '" +
+                          fid + "' — omit id to have one minted");
+        ent["id"] = id;
+        if (!ent.contains("construction")) ent["construction"] = false;
+        ents.push_back(std::move(ent));
+        minted.push_back(id);
+    }
+    record_minted_ids(id_map, idx, minted);
+}
+
+void op_sketch3d_add_constraints(json& doc, const json& op, std::size_t idx, json& id_map) {
+    const std::string kind = "sketch3d_add_constraints";
+    json& sk = require_sketch3d_feature(doc, op, id_map, kind);
+    const std::string fid = sk.value("id", std::string());
+    json fresh = sketch3d_payload_list(op, "constraints", kind,
+                                       "sketch3d constraints ({type, refs, value?, ...})", id_map);
+    json& cons = sk["params"]["constraints"];
+    int next = highest_numbered_id(cons, 'c');
+    std::set<std::string> used;
+    for (const json& c : cons)
+        if (c.is_object() && c.contains("id") && c["id"].is_string())
+            used.insert(c["id"].get<std::string>());
+    std::vector<std::string> minted;
+    for (std::size_t i = 0; i < fresh.size(); ++i) {
+        const std::string where = kind + ": constraints[" + std::to_string(i) + "]";
+        json c = std::move(fresh[i]);
+        if (!c.is_object() || !c.contains("type") || !c["type"].is_string() ||
+            c["type"].get<std::string>().empty())
+            throw OpError("invalid_op", where + " must be an object with a string 'type'");
+        if (c.contains("refs")) {
+            if (!c["refs"].is_array())
+                throw OpError("invalid_op", where + ".refs must be a list of handles");
+            for (json& r : c["refs"]) resolve_sketch3d_ref(r, id_map, where + ".refs");
+        }
+        // Dimensions are stored {value, expr} (the validator and solver read that form).
+        if (c.contains("value") && c["value"].is_number())
+            c["value"] = json{{"value", c["value"]}, {"expr", nullptr}};
+        std::string id;
+        if (c.contains("id") && !c["id"].is_null()) {
+            if (!c["id"].is_string())
+                throw OpError("invalid_op", where + ".id must be a string like \"c4\"");
+            id = c["id"].get<std::string>();
+        }
+        if (id.empty()) id = "c" + std::to_string(++next);
+        else next = std::max(next, highest_numbered_id(json::array({json{{"id", id}}}), 'c'));
+        if (!used.insert(id).second)
+            throw OpError("invalid_op", where + ".id: '" + id + "' already exists in sketch3d '" +
+                          fid + "' — omit id to have one minted");
+        c["id"] = id;
+        cons.push_back(std::move(c));
+        minted.push_back(id);
+    }
+    record_minted_ids(id_map, idx, minted);
+}
+
+void op_sketch3d_add_external_ref(json& doc, const json& op, std::size_t idx, IdGen& gen,
+                                  json& id_map) {
+    const std::string kind = "sketch3d_add_external_ref";
+    json& sk = require_sketch3d_feature(doc, op, id_map, kind);
+    const std::string fid = sk.value("id", std::string());
+    if (!op.contains("ref") || !op["ref"].is_object())
+        throw OpError("invalid_op", kind + ": 'ref' must be an object {source:{kind:\"vertex\", selector:{...}}}");
+    json ref = op["ref"];
+    resolve_placeholders_deep(ref, id_map);
+    if (!ref.contains("source") || !ref["source"].is_object() || !ref["source"].contains("kind") ||
+        !ref["source"]["kind"].is_string())
+        throw OpError("invalid_op", kind + ": ref.source must be an object with a string 'kind'");
+    json& p = sk["params"];
+    if (!p.contains("external_refs")) p["external_refs"] = json::array();
+    else if (!p["external_refs"].is_array())
+        throw OpError("invalid_op", kind + ": sketch3d '" + fid + "' params.external_refs is not a list");
+    json& refs = p["external_refs"];
+    std::string id;
+    if (ref.contains("id") && !ref["id"].is_null()) {
+        if (!ref["id"].is_string())
+            throw OpError("invalid_op", kind + ": ref.id must be a string like \"x3\"");
+        id = ref["id"].get<std::string>();
+    }
+    if (id.empty()) id = gen.next("x");
+    else gen.note(id);
+    for (const json& e : refs)
+        if (e.is_object() && e.value("id", std::string()) == id)
+            throw OpError("invalid_op", kind + ": ref.id '" + id + "' already exists in sketch3d '" +
+                          fid + "' — omit id to have one minted");
+    ref["id"] = id;
+    if (!ref.contains("stale")) ref["stale"] = true;  // refreshed by the batch's external-ref pass
+    refs.push_back(std::move(ref));
+    id_map["$" + std::to_string(idx)] = id;
+}
+
+// ---- document-metadata ops: set_suppressed, rename, set_units, set_material, set_appearance,
+// eq_set, eq_delete. Each validates its own input and throws OpError. They used to default
+// every missing or mistyped field — a missing `value` UNSUPPRESSED the feature, a bare
+// `rename` or `set_appearance` answered ok having changed nothing, a bad `color` leaked a
+// raw type_error — so an op that did nothing, or the opposite of what was asked, reported
+// success.
+
+double clamp01(double x) { return x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x); }
+
+bool is_blank_string(const json& v) {
+    return !v.is_string() || v.get_ref<const std::string&>().find_first_not_of(" \t\r\n") == std::string::npos;
+}
+
+// The `id` an op addresses, placeholders resolved.
+std::string op_target_id(const json& op, const json& id_map, const char* what) {
+    json target = op.contains("id") ? op["id"] : json();
+    resolve_placeholders_deep(target, id_map);
+    if (is_blank_string(target))
+        throw OpError("invalid_op", std::string(what) + " needs the target `id` (e.g. \"f3\")");
+    return target.get<std::string>();
+}
+
+void op_set_suppressed(json& doc, const json& op, const json& id_map) {
+    // `value` is the whole instruction. It used to default to false, so the natural
+    // `suppressed:true` spelling answered ok and UNSUPPRESSED the feature.
+    if (!op.contains("value") || !op["value"].is_boolean() || op.contains("suppressed"))
+        throw OpError("invalid_op",
+                      "set_suppressed needs value:true|false (it does not read `suppressed`): "
+                      "{\"op\":\"set_suppressed\",\"id\":\"f3\",\"value\":true}");
+    const bool value = op["value"].get<bool>();
+    const std::string id = op_target_id(op, id_map, "set_suppressed");
+    if (doc.value("schema", std::string()) == "aicad.asm/1") {
+        bool found = false;
+        for (json& c : doc["components"])
+            if (c.value("id", std::string()) == id) {
+                c["suppressed"] = value;
+                found = true;
+                break;
+            }
+        if (!found) throw OpError("invalid_op", "set_suppressed: component '" + id +
+            "' not found in assembly; feature ids require a part document");
+    } else {
+        json* f = find_feature(doc, id);
+        if (!f) throw OpError("invalid_op", "set_suppressed: feature '" + id +
+            "' not found in part; component ids require an assembly document");
+        (*f)["suppressed"] = value;
+    }
+}
+
+void op_rename(json& doc, const json& op, const json& id_map) {
+    if (!op.contains("name") || is_blank_string(op["name"]))
+        throw OpError("invalid_op",
+                      "rename needs name:\"<new name>\" (a non-empty string): "
+                      "{\"op\":\"rename\",\"id\":\"f1\",\"name\":\"BasePlate\"}");
+    const std::string id = op_target_id(op, id_map, "rename");
+    json* f = find_feature(doc, id);
+    if (!f) throw OpError("invalid_op", "rename: no feature '" + id + "'");
+    (*f)["name"] = op["name"];
+}
+
+void op_set_units(json& doc, const json& op) {
+    for (auto it = op.begin(); it != op.end(); ++it)
+        if (it.key() != "op" && it.key() != "system")
+            throw OpError("invalid_op", "set_units takes only `system` (MMGS or IPS); got key '" +
+                                            it.key() + "'");
+    const std::string system = op.contains("system") && op["system"].is_string()
+                                   ? op["system"].get<std::string>() : std::string();
+    if (system != "MMGS" && system != "IPS")
+        throw OpError("invalid_op",
+                      "set_units needs system:\"MMGS\" (mm/g/s) or \"IPS\" (in/lb/s): "
+                      "{\"op\":\"set_units\",\"system\":\"IPS\"}");
+    if (!doc.contains("units") || !doc["units"].is_object()) doc["units"] = json::object();
+    doc["units"]["system"] = system;
+}
+
+void op_set_material(json& doc, const json& op) {
+    for (auto it = op.begin(); it != op.end(); ++it) {
+        const std::string& k = it.key();
+        if (k != "op" && k != "key" && k != "id" && k != "identity_only")
+            throw OpError("invalid_op",
+                          "set_material reads only key (a registry material, or null to clear), "
+                          "id (a body such as b1) and identity_only; got key '" + k + "'");
+    }
+    if (!op.contains("key") || !(op["key"].is_null() || op["key"].is_string()))
+        throw OpError("invalid_op",
+                      "set_material needs key:\"<registry material>\" (null clears it): "
+                      "{\"op\":\"set_material\",\"key\":\"alu_6061\"}");
+    if (op.contains("identity_only") && !op["identity_only"].is_boolean())
+        throw OpError("invalid_op", "set_material: identity_only must be true or false");
+    json material = nullptr;
+    if (op["key"].is_string()) {
+        const std::string key = op["key"].get<std::string>();
+        if (is_blank_string(op["key"]))
+            throw OpError("invalid_op", "set_material: key is empty; pass null to clear the material");
+        // Mass, FEA and appearance all resolve the key through this registry. A key it has no
+        // row for would silently weigh as 7.85 g/cm^3 steel, so it is refused unless the
+        // caller says it is storing an identity the registry does not model (a custom alloy).
+        if (!op.value("identity_only", false) && ::chudware::materials::available() &&
+            ::chudware::materials::resolve_key(key).empty())
+            throw OpError("invalid_op",
+                          "set_material: '" + key + "' is not a material in the registry (use a "
+                          "registry key or alias, e.g. alu_6061, steel_1018, steel_304_stainless, "
+                          "ti_6al4v, brass_c360, abs, pla). For a designation the registry lacks, "
+                          "add identity_only:true to store the name without solve properties; mass "
+                          "then uses the 7.85 g/cm^3 steel default and says so.");
+        material = json{{"key", key}};
+    }
+    if (op.contains("id") && !op["id"].is_null()) {
+        if (doc.value("schema", std::string()) != "aicad.part/1")
+            throw OpError("invalid_op", "set_material: assign assembly materials in the source part");
+        const std::string id = op["id"].is_string() ? op["id"].get<std::string>() : std::string();
+        if (id.size() < 2 || id[0] != 'b' || id[1] < '1' || id[1] > '9' ||
+            !std::all_of(id.begin() + 2, id.end(), [](char c) { return c >= '0' && c <= '9'; }))
+            throw OpError("invalid_op", "set_material: expected a part body id such as b1");
+        if (!material.is_null()) {
+            doc["body_materials"][id] = material;
+        } else if (doc.contains("body_materials")) {
+            doc["body_materials"].erase(id);
+            if (doc["body_materials"].empty()) doc.erase("body_materials");
+        }
+    } else {
+        doc["material"] = material;
+        doc.erase("body_materials");
+    }
+}
+
+// C26 body colour + C32-A RealView material (doc_ops.md). `id` is a body key ("b<ordinal>"
+// for a part body, component id for assembly). A null `color` clears the body back to the
+// default; a colour with metallic/roughness stores the {color,metallic,roughness} form,
+// colour alone stores a bare [r,g,b]; metallic/roughness alone retune an existing entry.
+// The batch bumps the revision, so the AICM re-bakes.
+void op_set_appearance(json& doc, const json& op) {
+    if (!op.contains("id") || is_blank_string(op["id"]))
+        throw OpError("invalid_op", "set_appearance: missing body id (\"b1\" for the first body)");
+    const std::string id = op["id"].get<std::string>();
+    if (op.contains("faces"))
+        throw OpError("invalid_op", "set_appearance: face finishes require a final-part transaction");
+    auto channel = [&](const char* key) -> std::optional<double> {
+        if (!op.contains(key) || op[key].is_null()) return std::nullopt;
+        if (!op[key].is_number())
+            throw OpError("invalid_op", std::string("set_appearance: `") + key +
+                                            "` must be a number in 0..1, got " + op[key].type_name());
+        return clamp01(op[key].get<double>());
+    };
+    const std::optional<double> metallic = channel("metallic");
+    const std::optional<double> roughness = channel("roughness");
+    const bool clear = op.contains("color") && op["color"].is_null();
+    std::optional<json> colour;
+    if (op.contains("color") && !clear) {
+        const json& c = op["color"];
+        if (!c.is_array() || c.size() != 3 ||
+            !std::all_of(c.begin(), c.end(), [](const json& v) { return v.is_number(); }))
+            throw OpError("invalid_op",
+                          std::string("set_appearance: `color` must be [r,g,b], three numbers in "
+                                      "0..1 (null clears it); got ") + c.type_name());
+        colour = json::array({clamp01(c[0].get<double>()), clamp01(c[1].get<double>()),
+                              clamp01(c[2].get<double>())});
+    }
+    if (!clear && !colour && !metallic && !roughness)
+        throw OpError("invalid_op",
+                      "set_appearance changes nothing: pass color [r,g,b] (null clears the body "
+                      "to the default), and/or metallic / roughness (0..1)");
+    if (!doc.contains("appearances") || !doc["appearances"].is_object())
+        doc["appearances"] = json::object();
+    json& ap = doc["appearances"];
+    if (clear) {
+        ap.erase(id);  // clear to default
+    } else if (colour) {
+        if (metallic || roughness) {
+            json val = json{{"color", *colour}};
+            if (metallic) val["metallic"] = *metallic;
+            if (roughness) val["roughness"] = *roughness;
+            ap[id] = val;
+        } else {
+            ap[id] = *colour;  // bare [r,g,b]
+        }
+    } else {
+        // Finish-only tweak on an existing entry: keep its colour, update the material.
+        json val = ap.contains(id) && ap[id].is_object()
+                       ? ap[id]
+                       : json{{"color", ap.contains(id) && ap[id].is_array()
+                                            ? ap[id]
+                                            : json::array({0.71, 0.76, 0.82})}};
+        if (metallic) val["metallic"] = *metallic;
+        if (roughness) val["roughness"] = *roughness;
+        ap[id] = val;
+    }
+    if (ap.empty()) doc.erase("appearances");
+}
+
+// Equation globals: a name (an identifier — the document validator enforces the grammar) and
+// an expression string, or a bare number.
+std::string equation_name(const json& op, const char* what) {
+    if (!op.contains("name") || is_blank_string(op["name"]))
+        throw OpError("invalid_op", std::string(what) + " needs name:\"<equation name>\" (a non-empty string)");
+    return op["name"].get<std::string>();
+}
+
+void op_eq_set(json& doc, const json& op) {
+    const std::string name = equation_name(op, "eq_set");
+    std::string expr;
+    if (op.contains("expr") && op["expr"].is_string()) expr = op["expr"].get<std::string>();
+    else if (op.contains("expr") && op["expr"].is_number()) expr = op["expr"].dump();
+    if (expr.find_first_not_of(" \t\r\n") == std::string::npos)
+        throw OpError("invalid_op",
+                      "eq_set needs expr: a non-empty string like \"2*Depth\" (or a plain number): "
+                      "{\"op\":\"eq_set\",\"name\":\"Width\",\"expr\":\"2*Depth\"}");
+    if (!doc.contains("equations") || !doc["equations"].is_object()) doc["equations"] = json::object();
+    json& globals = doc["equations"]["globals"];
+    if (!globals.is_array()) globals = json::array();
+    for (json& g : globals)
+        if (g.is_object() && g.contains("name") && g["name"] == name) {
+            g["expr"] = expr;
+            return;
+        }
+    globals.push_back({{"name", name}, {"expr", expr}});
+}
+
+void op_eq_delete(json& doc, const json& op) {
+    const std::string name = equation_name(op, "eq_delete");
+    const bool has_globals = doc.contains("equations") && doc["equations"].is_object() &&
+                             doc["equations"].contains("globals") && doc["equations"]["globals"].is_array();
+    json kept = json::array();
+    std::string existing;
+    std::size_t listed = 0;
+    if (has_globals)
+        for (const json& g : doc["equations"]["globals"]) {
+            const bool match = g.is_object() && g.contains("name") && g["name"] == name;
+            if (!match) kept.push_back(g);
+            if (g.is_object() && g.contains("name") && g["name"].is_string() && listed++ < 12)
+                existing += (existing.empty() ? "" : ", ") + g["name"].get<std::string>();
+        }
+    if (!has_globals || kept.size() == doc["equations"]["globals"].size())
+        throw OpError("invalid_op", "eq_delete: no equation named '" + name + "'" +
+                                        (existing.empty() ? std::string(" (the document has no equations)")
+                                                          : " (equations: " + existing + ")"));
+    doc["equations"]["globals"] = std::move(kept);
+}
+
+void apply_one(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_map,
+               json* conversion_reports, json* op_reports, bool reject_unknown) {
     if (!op.is_object() || !op.contains("op") || !op["op"].is_string())
         throw OpError("unsupported", "op[" + std::to_string(idx) + "]: missing 'op'",
                       {{"index", idx}});
     const std::string k = op["op"].get<std::string>();
+    // All sketch mutation producers share this boundary, including inline drawing
+    // relations, conversion, fillet/chamfer, mirror/pattern and pasted geometry.
+    // Only new/promoted explicit intent settles auto constraints; deletion and
+    // annotation placement remain ordinary edits and do not refill deleted constraints.
+    std::string soft_sketch_id;
+    std::map<std::string, json> explicit_constraints;
+    json* feature = nullptr;
+    if (k.rfind("sketch_", 0) == 0 && k != "sketch_fully_define" && op.contains("sketch"))
+        feature = &require_sketch_feature(doc, op, id_map);
+    else if (k == "edit_feature" && op.contains("params") && op["params"].is_object() &&
+             op["params"].contains("constraints")) {
+        json target = op.value("id", std::string());
+        resolve_placeholders_deep(target, id_map);
+        if (target.is_string()) {
+            json* candidate = find_feature(doc, target.get<std::string>());
+            if (candidate && candidate->value("type", std::string()) == "sketch")
+                feature = candidate;
+        }
+    }
+    if (feature && feature->contains("params") && (*feature)["params"].is_object() &&
+        (*feature)["params"].contains("constraints") &&
+        (*feature)["params"]["constraints"].is_array()) {
+        const auto& constraints = (*feature)["params"]["constraints"];
+        if (std::any_of(constraints.begin(), constraints.end(),
+                        [](const json& c) { return c.value("auto", false); })) {
+            soft_sketch_id = feature->at("id").get<std::string>();
+            for (const auto& c : constraints) {
+                if (c.value("auto", false)) continue;
+                json intent = c;
+                intent.erase("placement");
+                explicit_constraints.emplace(c.at("id").get<std::string>(), std::move(intent));
+            }
+        }
+    }
 
-    if (k == "add_feature")              op_add_feature(doc, op, idx, gen, id_map);
-    else if (k == "edit_feature")        op_edit_feature(doc, op, gen, id_map);
+    if (k == "add_feature")              op_add_feature(doc, op, idx, gen, id_map, reject_unknown);
+    else if (k == "scad_convert") {
+        if (doc.value("schema", std::string()) != "aicad.part/1")
+            throw OpError("invalid_op", "scad_convert requires a part document");
+        const std::string direction = op.value("direction", std::string());
+        if (direction == "to_code") {
+            const double scale = op.value("mm_per_source_unit", 1.0);
+            if (!std::isfinite(scale) || scale <= 0)
+                throw OpError("invalid_op", "scad_convert: mm_per_source_unit must be finite and positive");
+            const json projected = scad::project_native(doc, scale);
+            if (!projected.value("ok", false))
+                throw OpError("invalid_op", "scad_convert: native graph cannot be projected: " +
+                              projected.value("report", json::object()).dump(), projected);
+            const std::string id = gen.next("f");
+            doc["features"] = json::array({json{{"id", id}, {"type", "scad"},
+                {"name", "OpenSCAD"}, {"suppressed", false},
+                {"params", projected.at("params")}, {"refs", json::object()}}});
+            if (conversion_reports)
+                conversion_reports->push_back({{"index", idx}, {"direction", direction},
+                                               {"report", projected.at("report")}});
+            id_map["$" + std::to_string(idx)] = id;
+        } else if (direction == "to_native") {
+            if (!doc.contains("features") || !doc["features"].is_array() ||
+                doc["features"].size() != 1 ||
+                doc["features"][0].value("type", std::string()) != "scad")
+                throw OpError("invalid_op", "scad_convert: to_native requires exactly one managed SCAD feature");
+            const json restored = scad::restore_native(doc["features"][0].at("params"));
+            if (!restored.value("ok", false))
+                throw OpError("invalid_op", "scad_convert: managed native graph cannot be restored: " +
+                              restored.value("report", json::object()).dump(), restored);
+            const json& original = restored.at("document");
+            const json& metadata = doc["features"][0]["params"]["native_projection"]["document"];
+            if (doc.value("equations", json::object()) != metadata.value("equations", json::object()))
+                throw OpError("invalid_op", "scad_convert: equations changed since projection");
+            doc["features"] = original.at("features");
+            if (original.contains("equations")) doc["equations"] = original["equations"];
+            if (conversion_reports)
+                conversion_reports->push_back({{"index", idx}, {"direction", direction},
+                                               {"report", restored.at("report")}});
+        } else {
+            throw OpError("invalid_op", "scad_convert: direction must be to_code or to_native");
+        }
+    }
+    else if (k == "edit_feature")        op_edit_feature(doc, op, gen, id_map, reject_unknown);
     else if (k == "delete_feature")      op_delete_feature(doc, op);
     else if (k == "reorder_feature")     op_reorder_feature(doc, op, id_map);
     else if (k == "set_suppressed") {
-        const std::string id = op.value("id", std::string());
-        if (doc.value("schema", std::string()) == "aicad.asm/1") {
-            bool found = false;
-            for (json& c : doc["components"])
-                if (c.value("id", std::string()) == id) {
-                    c["suppressed"] = op.value("value", false);
-                    found = true;
-                    break;
-                }
-            if (!found) throw OpError("invalid_op", "set_suppressed: component '" + id +
-                "' not found in assembly; feature ids require a part document");
-        } else {
-            json* f = find_feature(doc, id);
-            if (!f) throw OpError("invalid_op", "set_suppressed: feature '" + id +
-                "' not found in part; component ids require an assembly document");
-            (*f)["suppressed"] = op.value("value", false);
-        }
+        op_set_suppressed(doc, op, id_map);
     } else if (k == "set_folder") {
         // FeatureManager folder grouping ("Add Folder" / "Name & group" / "Remove from folder").
         // `folder` is a plain display-only tag on the feature (never affects geometry or rebuild);
@@ -4327,76 +6037,13 @@ void apply_one(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_
         if (folder.empty()) f->erase("folder");
         else (*f)["folder"] = folder;
     } else if (k == "rename") {
-        json* f = find_feature(doc, op.value("id", std::string()));
-        if (!f) throw OpError("invalid_op", "rename: no feature");
-        if (op.contains("name") && op["name"].is_string()) (*f)["name"] = op["name"];
+        op_rename(doc, op, id_map);
     } else if (k == "set_units") {
-        if (op.contains("system")) doc["units"]["system"] = op["system"];
+        op_set_units(doc, op);
     } else if (k == "set_material") {
-        const json material = op.contains("key") && !op["key"].is_null()
-                                  ? json{{"key", op["key"]}} : json(nullptr);
-        if (op.contains("id")) {
-            if (doc.value("schema", std::string()) != "aicad.part/1")
-                throw OpError("invalid_op", "set_material: assign assembly materials in the source part");
-            const std::string id = op.value("id", std::string());
-            if (id.size() < 2 || id[0] != 'b' || id[1] < '1' || id[1] > '9' ||
-                !std::all_of(id.begin() + 2, id.end(), [](char c) { return c >= '0' && c <= '9'; }))
-                throw OpError("invalid_op", "set_material: expected a part body id such as b1");
-            if (!material.is_null()) {
-                doc["body_materials"][id] = material;
-            } else if (doc.contains("body_materials")) {
-                doc["body_materials"].erase(id);
-                if (doc["body_materials"].empty()) doc.erase("body_materials");
-            }
-        } else {
-            doc["material"] = material;
-            doc.erase("body_materials");
-        }
+        op_set_material(doc, op);
     } else if (k == "set_appearance") {
-        // C26 body colour + C32-A RealView material (doc_ops.md). `id` is a body key ("b<ordinal>"
-        // for a part body, component id for assembly). A null/absent `color` clears the body back to
-        // the default; a colour with metallic/roughness stores the {color,metallic,roughness} form,
-        // colour alone stores a bare [r,g,b]. The batch bumps the revision, so the AICM re-bakes.
-        const std::string id = op.value("id", std::string());
-        if (id.empty()) throw OpError("invalid_op", "set_appearance: missing body id");
-        if (op.contains("faces"))
-            throw OpError("invalid_op", "set_appearance: face finishes require a final-part transaction");
-        if (!doc.contains("appearances") || !doc["appearances"].is_object())
-            doc["appearances"] = json::object();
-        json& ap = doc["appearances"];
-        const bool color_null = op.contains("color") && op["color"].is_null();
-        const bool has_color = op.contains("color") && op["color"].is_array() &&
-                               op["color"].size() >= 3;
-        auto c01 = [](double x) { return x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x); };
-        if (color_null) {
-            ap.erase(id);  // clear to default
-        } else if (has_color) {
-            json col = json::array();
-            for (int i = 0; i < 3; ++i) col.push_back(c01(op["color"][i].get<double>()));
-            const bool m = op.contains("metallic") && op["metallic"].is_number();
-            const bool r = op.contains("roughness") && op["roughness"].is_number();
-            if (m || r) {
-                json val = json{{"color", col}};
-                if (m) val["metallic"] = c01(op["metallic"].get<double>());
-                if (r) val["roughness"] = c01(op["roughness"].get<double>());
-                ap[id] = val;
-            } else {
-                ap[id] = col;  // bare [r,g,b]
-            }
-        } else if (op.contains("metallic") || op.contains("roughness")) {
-            // Finish-only tweak on an existing entry: keep its colour, update the material.
-            json val = ap.contains(id) && ap[id].is_object()
-                           ? ap[id]
-                           : json{{"color", ap.contains(id) && ap[id].is_array()
-                                                ? ap[id]
-                                                : json::array({0.71, 0.76, 0.82})}};
-            if (op.contains("metallic") && op["metallic"].is_number())
-                val["metallic"] = c01(op["metallic"].get<double>());
-            if (op.contains("roughness") && op["roughness"].is_number())
-                val["roughness"] = c01(op["roughness"].get<double>());
-            ap[id] = val;
-        }
-        if (ap.empty()) doc.erase("appearances");
+        op_set_appearance(doc, op);
     } else if (k == "set_rollback") {
         // Only `after` places the bar; any other key used to fall through to "bar at the
         // end" and answer ok:true with nothing changed.
@@ -4406,35 +6053,37 @@ void apply_one(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_
                               "set_rollback takes only `after` (the feature id the bar sits "
                               "after, or null for the end); got key '" + it.key() + "'",
                               {{"index", idx}});
-        if (op.contains("after") && !op["after"].is_null()) doc["rollback_after"] = op["after"];
+        if (op.contains("after") && !op["after"].is_null()) {
+            json after = op["after"];
+            resolve_placeholders_deep(after, id_map);
+            doc["rollback_after"] = std::move(after);
+        }
         else doc.erase("rollback_after");
     } else if (k == "eq_set") {
-        json& globals = doc["equations"]["globals"];
-        const std::string name = op.value("name", std::string());
-        bool replaced = false;
-        for (json& g : globals)
-            if (g.value("name", std::string()) == name) { g["expr"] = op.value("expr", std::string()); replaced = true; break; }
-        if (!replaced) globals.push_back({{"name", name}, {"expr", op.value("expr", std::string())}});
+        op_eq_set(doc, op);
     } else if (k == "eq_delete") {
-        json& globals = doc["equations"]["globals"];
-        json kept = json::array();
-        for (const json& g : globals)
-            if (g.value("name", std::string()) != op.value("name", std::string())) kept.push_back(g);
-        globals = kept;
+        op_eq_delete(doc, op);
     } else if (k == "sketch_add_entity")        op_sketch_add_entity(doc, op, idx, gen, id_map);
     else if (k == "sketch_add_constraint")      op_sketch_add_constraint(doc, op, idx, gen, id_map);
     else if (k == "sketch_edit_entity")         op_sketch_edit_entity(doc, op, id_map);
-    else if (k == "sketch_delete_entity")       op_sketch_delete_entity(doc, op, id_map);
-    else if (k == "sketch_delete_constraint")   op_sketch_delete_constraint(doc, op, id_map);
+    else if (k == "sketch_delete_entity" || k == "sketch_delete_constraint") {
+        const auto sketch_id = require_sketch_feature(doc, op, id_map).value("id", std::string());
+        json dropped = k == "sketch_delete_entity"
+            ? op_sketch_delete_entity(doc, op, id_map)
+            : op_sketch_delete_constraint(doc, op, id_map);
+        if (op_reports)
+            op_reports->push_back({{"index", idx}, {"op", k}, {"sketch", sketch_id},
+                                   {"id", op.value("id", json())}, {"dropped_constraints", dropped}});
+    }
     else if (k == "sketch_set_dim")             op_sketch_set_dim(doc, op, id_map);
     else if (k == "sketch_toggle_construction") op_sketch_toggle_construction(doc, op, id_map);
     else if (k == "sketch_convert")             op_sketch_convert(doc, op, idx, gen, id_map);
-    else if (k == "sketch_fully_define")        op_sketch_fully_define(doc, op, idx, gen, id_map);
+    else if (k == "sketch_fully_define")        op_sketch_fully_define(doc, op, idx, gen, id_map, op_reports);
     else if (k == "sketch_break_external_ref")  op_sketch_break_external_ref(doc, op, id_map);
     else if (k == "sketch_trim")                op_sketch_trim(doc, op, idx, gen, id_map);
     else if (k == "sketch_extend")              op_sketch_extend(doc, op, idx, gen, id_map);
     else if (k == "sketch_offset")              op_sketch_offset(doc, op, idx, gen, id_map);
-    else if (k == "sketch_fillet")              op_sketch_fillet(doc, op, idx, gen, id_map);
+    else if (k == "sketch_fillet")              op_sketch_fillet(doc, op, idx, gen, id_map, op_reports);
     else if (k == "sketch_chamfer")             op_sketch_chamfer(doc, op, idx, gen, id_map);
     else if (k == "sketch_mirror_entities")     op_sketch_mirror_entities(doc, op, idx, gen, id_map);
     else if (k == "sketch_pattern_entities")    op_sketch_pattern_entities(doc, op, idx, gen, id_map);
@@ -4462,16 +6111,51 @@ void apply_one(json& doc, const json& op, std::size_t idx, IdGen& gen, json& id_
     else if (k == "paste_feature")              op_paste_feature(doc, op, idx, gen, id_map);
     else if (k == "paste_feature_as_derived")   op_paste_feature_as_derived(doc, op, idx, gen, id_map);
     else if (k == "sketch_paste_entities")       op_sketch_paste_entities(doc, op, idx, gen, id_map);
+    else if (k == "sketch3d_add_entities")      op_sketch3d_add_entities(doc, op, idx, id_map);
+    else if (k == "sketch3d_add_constraints")   op_sketch3d_add_constraints(doc, op, idx, id_map);
+    else if (k == "sketch3d_add_external_ref")  op_sketch3d_add_external_ref(doc, op, idx, gen, id_map);
     else
         throw OpError("unsupported", unknown_doc_op_message(idx, k),
                       {{"index", idx}, {"reason", "not ported"},
                        {"suggestions", suggest_doc_ops(k, 5)}});
+    if (!soft_sketch_id.empty()) {
+        json* current = find_feature(doc, soft_sketch_id);
+        if (current && current->contains("params") && (*current)["params"].is_object() &&
+            (*current)["params"].contains("constraints") &&
+            (*current)["params"]["constraints"].is_array()) {
+            json& sketch = (*current)["params"];
+            const bool changed_intent = std::any_of(
+                sketch["constraints"].begin(), sketch["constraints"].end(), [&](const json& c) {
+                    if (c.value("auto", false)) return false;
+                    json intent = c;
+                    intent.erase("placement");
+                    const auto it = explicit_constraints.find(c.at("id").get<std::string>());
+                    return it == explicit_constraints.end() ||
+                           (k == "edit_feature" && it->second != intent);
+                });
+            const bool edited_dimension = k == "sketch_set_dim" &&
+                ((op.contains("value") && !op["value"].is_null()) ||
+                 (op.contains("expr") && !op["expr"].is_null()));
+            if (changed_intent || edited_dimension) {
+                auto settled = chudware::sketch::settle_auto_constraints(sketch, env_from_doc(doc));
+                for (auto& c : settled.sketch["constraints"])
+                    if (!c.contains("id")) c["id"] = gen.next("c");
+                if (op_reports && !settled.notes.empty())
+                    op_reports->push_back({{"index", idx}, {"op", k}, {"sketch", soft_sketch_id},
+                                           {"notes", settled.notes}, {"superseded", settled.superseded}});
+                sketch = std::move(settled.sketch);
+            }
+        }
+    }
 }
 
 // ----------------------------------------------------------------- rebuild + response
-// Evaluate the document's global equations into an env map (name -> value), in
-// listed order (a later global may reference an earlier one). Bad exprs are skipped.
-json env_from_doc(const json& doc) {
+// Evaluate the document's global equations into an env map (name -> value), in listed order
+// (a later global may reference an earlier one). A global that cannot be evaluated (unknown
+// name, division by zero, ...) is left out of the env, so each dimension using it fails on
+// its own; `problems`, when given, collects {name, expr, error} for each one so a reply can
+// name the global instead of leaving the failure to be rediscovered downstream.
+json eval_equation_globals(const json& doc, json* problems) {
     json env = json::object();
     if (doc.contains("equations") && doc["equations"].is_object() &&
         doc["equations"].contains("globals") && doc["equations"]["globals"].is_array()) {
@@ -4484,11 +6168,17 @@ json env_from_doc(const json& doc) {
                 double v = chudware::util::evaluate(expr, acc);
                 acc[name] = v;
                 env[name] = v;
-            } catch (...) { /* skip a bad global */ }
+            } catch (const std::exception& e) {
+                if (problems) problems->push_back({{"name", name}, {"expr", expr}, {"error", e.what()}});
+            } catch (...) {
+                if (problems) problems->push_back({{"name", name}, {"expr", expr}, {"error", "not evaluable"}});
+            }
         }
     }
     return env;
 }
+
+json env_from_doc(const json& doc) { return eval_equation_globals(doc, nullptr); }
 
 // Compile the session's LIVE part doc, reusing the cached result when the doc is unchanged
 // since the last compile. The cache is keyed on `revision`: every geometry-changing op bumps
@@ -4514,21 +6204,306 @@ bool inc_rebuild_enabled() {
     return enabled;
 }
 
+bool has_scad_feature(const json& doc) {
+    if (!doc.contains("features") || !doc["features"].is_array()) return false;
+    for (const auto& feature : doc["features"])
+        if (feature.is_object() && feature.value("type", std::string()) == "scad" &&
+            !feature.value("suppressed", false)) return true;
+    return false;
+}
+
+// The compiler reports the measured outcome, not mutations to its input. Apply
+// only its structured fillet result; expressions remain authored inputs and the
+// effective record is derived state, never a source for a later compile.
+bool apply_fillet_results(json& doc, const std::vector<FeatureStatus>& statuses,
+                          bool& literal_changed, std::string& error) {
+    if (!doc.contains("features") || !doc["features"].is_array()) return true;
+    std::map<std::string, const FeatureStatus*> by_id;
+    for (const auto& st : statuses) by_id[st.id] = &st;
+
+    json* overrides = nullptr;
+    if (doc.contains("configurations") && doc["configurations"].is_array() &&
+        !doc["configurations"].empty()) {
+        auto& configs = doc["configurations"];
+        json* selected = nullptr;
+        const std::string active = doc.value("active_configuration", std::string());
+        if (!active.empty())
+            for (auto& config : configs)
+                if (config.is_object() && config.value("name", std::string()) == active) {
+                    selected = &config;
+                    break;
+                }
+        if (!selected && configs[0].is_object()) selected = &configs[0];
+        if (selected && selected->contains("param_overrides") &&
+            (*selected)["param_overrides"].is_object())
+            overrides = &(*selected)["param_overrides"];
+    }
+
+    for (auto& feature : doc["features"]) {
+        if (!feature.is_object() || feature.value("type", std::string()) != "fillet") continue;
+        const std::string id = feature.value("id", std::string());
+        const auto found = by_id.find(id);
+        const FeatureStatus* st = found == by_id.end() ? nullptr : found->second;
+        // A rolled-back feature was not evaluated; preserve its authored and
+        // derived data instead of clearing its last recorded fillet result.
+        if (st && st->rolled_back) continue;
+        const json* result = nullptr;
+        if (st && st->ok && !st->rolled_back && st->data.is_object() &&
+            st->data.contains("fillet"))
+            result = &st->data["fillet"];
+        bool expression_adjusted = false;
+        json derived_requested;
+        if (result) {
+            if (!result->is_object() || !result->contains("requested") ||
+                !result->contains("effective") || !result->contains("adjustment") ||
+                !(*result)["requested"].is_object() || !(*result)["effective"].is_object() ||
+                !(*result)["adjustment"].is_string()) {
+                error = "fillet: malformed compiler correction";
+                return false;
+            }
+            derived_requested = (*result)["requested"];
+            for (const char* key : {"radius", "radius2"}) {
+                const json requested = (*result)["requested"].value(key, json());
+                const json effective = (*result)["effective"].value(key, json());
+                if (requested.is_null() && effective.is_null() && std::strcmp(key, "radius2") == 0)
+                    continue;
+                if (!requested.is_number() || !effective.is_number() ||
+                    !std::isfinite(requested.get<double>()) ||
+                    !std::isfinite(effective.get<double>()) || effective.get<double>() <= 0.0) {
+                    error = "fillet: invalid compiler correction";
+                    return false;
+                }
+                json* param = nullptr;
+                const std::string override_key = id + "." + key;
+                if (overrides && overrides->contains(override_key))
+                    param = &(*overrides)[override_key];
+                else if (feature.contains("params") && feature["params"].is_object() &&
+                         feature["params"].contains(key))
+                    param = &feature["params"][key];
+                else if (feature.contains(key))
+                    param = &feature[key];
+                if (!param) {
+                    error = "fillet: compiler correction has no authored dimension";
+                    return false;
+                }
+                const bool expression = param->is_string() ||
+                    (param->is_object() && param->contains("expr") &&
+                     (*param)["expr"].is_string() && !(*param)["expr"].get<std::string>().empty());
+                if (expression) {
+                    expression_adjusted |= requested.get<double>() != effective.get<double>();
+                } else if (param->is_number()) {
+                    if (param->get<double>() != effective.get<double>()) {
+                        *param = effective;
+                        literal_changed = true;
+                    }
+                } else if (param->is_object() && param->contains("value") &&
+                           (*param)["value"].is_number()) {
+                    if ((*param)["value"].get<double>() != effective.get<double>()) {
+                        (*param)["value"] = effective;
+                        literal_changed = true;
+                    }
+                } else {
+                    error = "fillet: compiler correction has an invalid authored dimension";
+                    return false;
+                }
+                if (!expression) derived_requested[key] = effective;
+            }
+        }
+        if (expression_adjusted) {
+            if (feature.contains("data") && !feature["data"].is_object()) {
+                error = "fillet: feature data is not an object";
+                return false;
+            }
+            if (!feature.contains("data")) feature["data"] = json::object();
+            bool lower = false, upper = false;
+            for (const char* key : {"radius", "radius2"}) {
+                if (derived_requested[key].is_null()) continue;
+                const double requested = derived_requested[key].get<double>();
+                const double effective = (*result)["effective"][key].get<double>();
+                lower |= effective > requested;
+                upper |= effective < requested;
+            }
+            feature["data"]["fillet_effective"] = {
+                {"requested", std::move(derived_requested)}, {"effective", (*result)["effective"]},
+                {"adjustment", lower && upper ? "both" : lower ? "lower" : upper ? "upper" : "none"}};
+        } else if (feature.contains("data") && feature["data"].is_object()) {
+            feature["data"].erase("fillet_effective");
+        }
+    }
+    return true;
+}
+
+bool has_fillet_result_work(const json& doc, const CompileResult& r) {
+    for (const auto& st : r.statuses)
+        if (st.ok && st.data.is_object() && st.data.contains("fillet") &&
+            st.data["fillet"].is_object() &&
+            st.data["fillet"].value("adjustment", std::string()) != "none")
+            return true;
+    if (doc.contains("features") && doc["features"].is_array())
+        for (const auto& feature : doc["features"])
+            if (feature.is_object() && feature.value("type", std::string()) == "fillet" &&
+                feature.contains("data") && feature["data"].is_object() &&
+                feature["data"].contains("fillet_effective"))
+                return true;
+    return false;
+}
+// A failed feature history may still contain independently built tool solids. Keep
+// its diagnostics and incremental prefix, but never expose those partial results
+// as current part geometry to viewport, exports, measurements, or selectors.
+static void discard_incomplete_geometry(CompileResult& r) {
+    if (r.ok) return;
+    r.aicm.clear();
+    r.body_count = 0;
+    r.volume = 0.0;
+    r.bodies_info.clear();
+    r.owner_map = json::object();
+    r.shapes.clear();
+    r.shape_face_owners.clear();
+    r.shape_edge_owners.clear();
+    r.tool_recs.clear();
+    r.weld_members = json::object();
+    r.sheet_metal_flat = json::object();
+    r.sheet_metal_bends.clear();
+    r.datums = json::array();
+}
+
+
 CompileResult compile_session(Session& s, bool restoring_cache = false) {
     if (s.cache_trust == "unverified" && !restoring_cache && !native_policy::recomputing_cache) {
         s.compile_cache = make_compile_cache();
         s.ckpt_memo.reset();
     }
-    return compile_document(s.doc, env_from_doc(s.doc),
-                            inc_rebuild_enabled() ? s.compile_cache.get() : nullptr,
-                            s.display_quality);
+    auto compile = [&]() {
+        return compile_document(s.doc, env_from_doc(s.doc),
+                                inc_rebuild_enabled() ? s.compile_cache.get() : nullptr,
+                                s.display_quality);
+    };
+    CompileResult r = compile();
+    if (!r.ok) {
+        discard_incomplete_geometry(r);
+        return r;
+    }
+    if (!has_fillet_result_work(s.doc, r)) return r;
+
+    const json before = s.doc;
+    const bool was_dirty = s.dirty;
+    const auto original_statuses = r.statuses;
+    // A correction can need several builds before mixed expression/literal
+    // endpoints stabilize. Preserve the evidence from every executed search,
+    // without counting a reused prefix twice.
+    struct FilletEvidence { int probes = 0; double tolerance = 0.0, ms = 0.0; };
+    std::map<std::string, FilletEvidence> evidence;
+    auto collect_evidence = [&](const CompileResult& pass) {
+        for (const auto& st : pass.statuses) {
+            if (!st.ok || !st.data.is_object() || !st.data.contains("fillet") ||
+                !st.data["fillet"].is_object()) continue;
+            const auto& report = st.data["fillet"];
+            auto it = evidence.find(st.id);
+            if (it != evidence.end() && st.reused) continue;
+            auto& total = evidence[st.id];
+            total.probes += report.value("probes", 0);
+            total.tolerance = std::max(total.tolerance, report.value("tolerance_mm", 0.0));
+            total.ms += st.ms;
+        }
+    };
+    collect_evidence(r);
+    constexpr int max_passes = 8;
+    bool changed = false;
+    std::string error;
+    for (int pass = 0; pass < max_passes; ++pass) {
+        bool literals = false;
+        if (!apply_fillet_results(s.doc, r.statuses, literals, error)) break;
+        changed |= literals;
+        if (!literals) {
+            if (changed) s.dirty = true;
+            // Report the user's original request for this transaction, but only
+            // the effective values of the final, actually compiled geometry.
+            for (auto& st : r.statuses) {
+                for (const auto& initial : original_statuses) {
+                    if (initial.id != st.id || !initial.data.is_object() ||
+                        !initial.data.contains("fillet") || !st.data.is_object() ||
+                        !st.data.contains("fillet")) continue;
+                    auto& final = st.data["fillet"];
+                    const auto& first = initial.data["fillet"];
+                    const auto measurements = evidence.find(st.id);
+                    if (measurements != evidence.end()) {
+                        final["probes"] = measurements->second.probes;
+                        final["tolerance_mm"] = measurements->second.tolerance;
+                        st.ms = measurements->second.ms;
+                    }
+                    if (first["requested"] == final["requested"]) break;
+                    const bool same_effective = first["effective"] == final["effective"];
+                    final["requested"] = first["requested"];
+                    bool lower = false, upper = false;
+                    for (const char* key : {"radius", "radius2"}) {
+                        if (final["requested"][key].is_null()) continue;
+                        const double request = final["requested"][key].get<double>();
+                        const double effective = final["effective"][key].get<double>();
+                        lower |= effective > request;
+                        upper |= effective < request;
+                    }
+                    final["adjustment"] = lower && upper ? "both" : lower ? "lower" :
+                                          upper ? "upper" : "none";
+                    if (same_effective) st.warning = initial.warning;
+                    else {
+                        st.warning = "fillet adjusted requested radii " +
+                            final["requested"].dump() + " to effective radii " +
+                            final["effective"].dump() + " mm";
+                    }
+                    break;
+                }
+            }
+            return r;
+        }
+        r = compile();
+        collect_evidence(r);
+        if (!r.ok) break;
+        if (pass + 1 == max_passes)
+            error = "fillet: corrected literal dimensions did not stabilize";
+    }
+    s.doc = before;
+    s.dirty = was_dirty;
+    if (!error.empty()) {
+        r.ok = false;
+        for (auto& st : r.statuses) {
+            if (st.type != "fillet" || !st.ok) continue;
+            st.ok = false;
+            st.error = error;
+            st.data = nullptr;
+            break;
+        }
+    }
+    discard_incomplete_geometry(r);
+    return r;
+}
+
+static void retain_session_compile(Session& s, const CompileResult& r, bool restoring_cache) {
+    if (!r.ok) {
+        if (s.compiled && s.compiled->ok) s.last_good_display = s.compiled;
+        s.cache_trust = "unverified";
+    } else {
+        s.last_good_display.reset();
+        if (!restoring_cache) s.last_good_body_metadata = json();
+        // A fresh compile_session discarded unverified checkpoints before solving.
+        if (!restoring_cache) {
+            s.cache_trust = "verified";
+            s.unverified_source_doc.reset();
+            s.unverified_materialized_hash.clear();
+        }
+    }
 }
 
 const CompileResult& ensure_compiled(Session& s) {
+    const std::string identity = has_scad_feature(s.doc) ? scad::cache_identity() : std::string();
+    if (!identity.empty() && !s.scad_cache_identity.empty() && identity != s.scad_cache_identity)
+        s.compiled.reset();
     if (!s.compiled || s.compiled_rev != s.revision) {
-        s.compiled = std::make_shared<CompileResult>(compile_session(s));
+        auto compiled = std::make_shared<CompileResult>(compile_session(s));
+        retain_session_compile(s, *compiled, false);
+        s.compiled = std::move(compiled);
         s.compiled_rev = s.revision;
         s.compiled_partial = false;
+        if (!identity.empty()) s.scad_cache_identity = identity;
     }
     return *s.compiled;
 }
@@ -4536,8 +6511,875 @@ const CompileResult& ensure_compiled(Session& s) {
 // ensure_compiled for readers of the compile-only side channels (tool_recs, weld_members,
 // sheet_metal_flat): a display-cache hydration (compiled_partial) never carried them.
 const CompileResult& ensure_compiled_full(Session& s) {
-    if (s.compiled_partial) s.compiled.reset();
+    if (s.compiled_partial) {
+        if (s.compiled && s.compiled->ok) s.last_good_display = s.compiled;
+        s.compiled.reset();
+    }
     return ensure_compiled(s);
+}
+// Model-history analysis deliberately inspects authored JSON only. It is not a
+// topology ownership analysis, a constraint solve, or a geometric certification.
+const json* history_field(const json& feature, const char* key) {
+    for (const char* container : {"refs", "params"}) {
+        auto c = feature.find(container);
+        if (c != feature.end() && c->is_object()) {
+            auto v = c->find(key);
+            if (v != c->end()) return &*v;
+        }
+    }
+    auto v = feature.find(key);
+    return v == feature.end() ? nullptr : &*v;
+}
+
+std::string history_string(const json& feature, const char* key, const std::string& fallback = {}) {
+    const json* v = history_field(feature, key);
+    return v && v->is_string() ? v->get<std::string>() : fallback;
+}
+
+bool history_bool(const json& feature, const char* key, bool fallback) {
+    const json* v = history_field(feature, key);
+    return v && v->is_boolean() ? v->get<bool>() : fallback;
+}
+
+bool history_suppressed(const json& feature) {
+    return feature.value("suppressed", false) || history_bool(feature, "suppressed", false);
+}
+
+std::optional<double> history_literal(const json* v) {
+    if (!v) return std::nullopt;
+    if (v->is_number()) return v->get<double>();
+    if (v->is_object() && v->contains("value") && (*v)["value"].is_number() &&
+        (!v->contains("expr") || (*v)["expr"].is_null())) {
+        for (auto it = v->begin(); it != v->end(); ++it)
+            if (it.key() != "value" && it.key() != "expr") return std::nullopt;
+        return (*v)["value"].get<double>();
+    }
+    return std::nullopt;
+}
+
+bool history_vec3(const json* v, std::array<double, 3>& out) {
+    if (!v || !v->is_array() || v->size() != 3) return false;
+    for (int i = 0; i != 3; ++i) {
+        const auto n = history_literal(&(*v)[i]);
+        if (!n || !std::isfinite(*n)) return false;
+        out[i] = *n;
+    }
+    return true;
+}
+
+// Primitive placement accepts numeric vectors, not dimension-value wrappers.
+bool history_primitive_vec3(const json* v, std::array<double, 3>& out) {
+    if (!v || !v->is_array() || v->size() < 3) return false;
+    for (int i = 0; i != 3; ++i) {
+        if (!(*v)[i].is_number()) return false;
+        out[i] = (*v)[i].get<double>();
+        if (!std::isfinite(out[i])) return false;
+    }
+    return true;
+}
+
+// Match the primitive compiler's signed axis words and vector normalization.
+// Invalid or expression-driven directions are not suitable for static grouping.
+std::optional<std::array<double, 3>> history_axis_direction(const json& value) {
+    Eigen::Vector3d direction;
+    if (value.is_array() && value.size() >= 3 && value[0].is_number() &&
+        value[1].is_number() && value[2].is_number()) {
+        direction = Eigen::Vector3d(value[0].get<double>(), value[1].get<double>(),
+                                    value[2].get<double>());
+    } else if (value.is_string()) {
+        std::string word;
+        for (char c : value.get_ref<const std::string&>()) {
+            const unsigned char u = static_cast<unsigned char>(c);
+            if (!std::isspace(u)) word += static_cast<char>(std::tolower(u));
+        }
+        if (word == "x" || word == "+x") direction = Eigen::Vector3d(1, 0, 0);
+        else if (word == "-x") direction = Eigen::Vector3d(-1, 0, 0);
+        else if (word == "y" || word == "+y") direction = Eigen::Vector3d(0, 1, 0);
+        else if (word == "-y") direction = Eigen::Vector3d(0, -1, 0);
+        else if (word == "z" || word == "+z" || word == "vertical")
+            direction = Eigen::Vector3d(0, 0, 1);
+        else if (word == "-z") direction = Eigen::Vector3d(0, 0, -1);
+        else return std::nullopt;
+    } else return std::nullopt;
+    const double length = direction.norm();
+    if (!direction.allFinite() || !std::isfinite(length) || !(length > 1e-9))
+        return std::nullopt;
+    direction.normalize();
+    // Signed zero must not distinguish equivalent serialized group keys.
+    return std::array<double, 3>{direction.x() == 0 ? 0.0 : direction.x(),
+                                 direction.y() == 0 ? 0.0 : direction.y(),
+                                 direction.z() == 0 ? 0.0 : direction.z()};
+}
+
+std::optional<std::array<double, 3>> history_primitive_axis(const json& feature) {
+    auto param = [&](const char* key) -> const json* {
+        auto params = feature.find("params");
+        if (params != feature.end() && params->is_object()) {
+            auto found = params->find(key);
+            if (found != params->end()) return &*found;
+        }
+        auto found = feature.find(key);
+        return found == feature.end() ? nullptr : &*found;
+    };
+    const json* axis = param("axis");
+    const json* axis_dir = param("axis_dir");
+    std::optional<std::array<double, 3>> ref_direction;
+    auto refs = feature.find("refs");
+    if (refs != feature.end() && refs->is_object()) {
+        auto ref = refs->find("axis");
+        if (ref != refs->end()) {
+            std::string datum;
+            if (ref->is_string()) datum = ref->get<std::string>();
+            else if (ref->is_object() && ref->value("kind", std::string()) == "datum" &&
+                     ref->contains("feature") && (*ref)["feature"].is_string())
+                datum = (*ref)["feature"].get<std::string>();
+            if (datum == "axis.x") ref_direction = std::array<double, 3>{1, 0, 0};
+            else if (datum == "axis.y") ref_direction = std::array<double, 3>{0, 1, 0};
+            else if (datum == "axis.z") ref_direction = std::array<double, 3>{0, 0, 1};
+            else if (ref->is_object() && ref->contains("axis") && (*ref)["axis"].is_array() &&
+                     (*ref)["axis"].size() == 3)
+                ref_direction = history_axis_direction((*ref)["axis"]);
+            // Recognized references become axis_dir in normalize_feature; an
+            // unrecognized one replaces axis, even when params supplied an axis.
+            if (!ref_direction) axis = &*ref;
+        }
+        auto ref_axis_dir = refs->find("axis_dir");
+        if (ref_axis_dir != refs->end()) {
+            axis_dir = &*ref_axis_dir;
+            ref_direction.reset();
+        } else if (ref_direction) {
+            axis_dir = nullptr;
+        }
+    }
+    if (axis && !axis->is_null()) return history_axis_direction(*axis);
+    if (axis_dir && !axis_dir->is_null()) return history_axis_direction(*axis_dir);
+    if (ref_direction) return ref_direction;
+    return std::array<double, 3>{0, 0, 1};
+}
+
+bool history_primitive_cut(const json& feature) {
+    const json* mode = history_field(feature, "mode");
+    const json* merge = history_field(feature, "merge");
+    return mode && mode->is_string() && *mode == "cut" &&
+           (!merge || (merge->is_boolean() && merge->get<bool>()));
+}
+
+bool history_has_expression(const json& v) {
+    if (v.is_object()) {
+        if (v.contains("expr") && !v["expr"].is_null()) return true;
+        for (auto it = v.begin(); it != v.end(); ++it)
+            if (history_has_expression(it.value())) return true;
+    } else if (v.is_array()) {
+        for (const auto& item : v)
+            if (history_has_expression(item)) return true;
+    }
+    return false;
+}
+bool history_has_metadata(const json& v) {
+    if (v.is_object()) {
+        // History reports can still run in a background component writeback at
+        // process exit. Read-only lookup tables must outlive those workers.
+        static const auto& keys = *new const std::unordered_set<std::string>{
+            "metadata", "annotations", "attributes", "tags", "derived_from",
+            "appearance", "material", "face_appearances"
+        };
+        for (auto it = v.begin(); it != v.end(); ++it)
+            if (keys.count(it.key()) || history_has_metadata(it.value())) return true;
+    } else if (v.is_array()) {
+        for (const auto& item : v) if (history_has_metadata(item)) return true;
+    }
+    return false;
+}
+
+
+// Feature IDs are f<digits>, including selector owners followed by #, dots in
+// configuration keys, or tokens inside expressions. Matching token boundaries
+// avoids treating f1 as a reference in f10. Object keys are scanned too.
+using HistoryRefs = std::unordered_map<std::string, std::size_t>;
+void history_scan_string(const std::string& text, HistoryRefs& refs) {
+    std::size_t pos = 0;
+    while (pos < text.size()) {
+        const unsigned char c = static_cast<unsigned char>(text[pos]);
+        if (!(std::isalnum(c) || c == '_')) { ++pos; continue; }
+        const std::size_t start = pos++;
+        while (pos < text.size()) {
+            const unsigned char ch = static_cast<unsigned char>(text[pos]);
+            if (!(std::isalnum(ch) || ch == '_')) break;
+            ++pos;
+        }
+        // Do not allocate a multi-megabyte token for an embedded BREP or image.
+        if (pos - start <= 256) {
+            auto found = refs.find(text.substr(start, pos - start));
+            if (found != refs.end()) ++found->second;
+        }
+    }
+    // Expressions can quote a feature name containing spaces or punctuation.
+    for (std::size_t p = 0; p < text.size(); ++p) {
+        if (text[p] != '\'' && text[p] != '"') continue;
+        const char quote = text[p];
+        const std::size_t start = p + 1;
+        std::size_t end = start;
+        while (end < text.size() && text[end] != quote) {
+            if (text[end] == '\\' && end + 1 < text.size()) ++end;
+            ++end;
+        }
+        if (end < text.size() && end - start <= 256) {
+            auto found = refs.find(text.substr(start, end - start));
+            if (found != refs.end()) ++found->second;
+        }
+        p = end;
+    }
+    // Also cover exact non-identifier names/IDs in opaque metadata.
+    auto whole = refs.find(text);
+    if (whole != refs.end() && (text.empty() ||
+        std::any_of(text.begin(), text.end(), [](unsigned char c) {
+            return !(std::isalnum(c) || c == '_');
+        }))) ++whole->second;
+}
+
+void history_scan_json(const json& v, HistoryRefs& refs) {
+    if (v.is_string()) history_scan_string(v.get_ref<const std::string&>(), refs);
+    else if (v.is_array()) {
+        for (const auto& item : v) history_scan_json(item, refs);
+    } else if (v.is_object()) {
+        for (auto it = v.begin(); it != v.end(); ++it) {
+            history_scan_string(it.key(), refs);
+            history_scan_json(it.value(), refs);
+        }
+    }
+}
+
+HistoryRefs history_references(const json& doc, const std::unordered_set<std::string>& ids) {
+    HistoryRefs refs;
+    for (const auto& id : ids) refs.emplace(id, 0);
+    if (!doc.is_object()) return refs;
+    for (auto it = doc.begin(); it != doc.end(); ++it) {
+        if (it.key() != "features") {
+            history_scan_string(it.key(), refs);
+            history_scan_json(it.value(), refs);
+            continue;
+        }
+        if (!it.value().is_array()) continue;
+        for (const auto& f : it.value()) {
+            if (!f.is_object()) { history_scan_json(f, refs); continue; }
+            for (auto field = f.begin(); field != f.end(); ++field) {
+                if (field.key() == "id" || field.key() == "name") continue;
+                history_scan_string(field.key(), refs);
+                history_scan_json(field.value(), refs);
+            }
+        }
+    }
+    return refs;
+}
+
+bool history_mentions_source(const json& v, const std::string& id, const std::string& name) {
+    if (v.is_string()) {
+        const auto& text = v.get_ref<const std::string&>();
+        return (!id.empty() && text.find(id) != std::string::npos) ||
+               (!name.empty() && text.find(name) != std::string::npos);
+    }
+    if (v.is_array()) {
+        for (const auto& item : v) if (history_mentions_source(item, id, name)) return true;
+    } else if (v.is_object()) {
+        for (auto it = v.begin(); it != v.end(); ++it)
+            if ((!id.empty() && it.key().find(id) != std::string::npos) ||
+                (!name.empty() && it.key().find(name) != std::string::npos) ||
+                history_mentions_source(it.value(), id, name)) return true;
+    }
+    return false;
+}
+// Defined with the cross-document dependency registry below; caller holds the registry mutex.
+bool history_registered_consumer_locked(const std::string& source_id);
+
+
+// Nonblocking locks avoid violating DocLock's sorted multi-document order. The
+// mutation retains them until commit, and rechecks the registry at the commit
+// boundary. A busy document is not evidence of absence of an external consumer.
+struct HistoryLiveGuard {
+    std::vector<std::shared_ptr<Session>> pins;
+    std::vector<std::unique_lock<std::mutex>> locks;
+    std::unordered_set<std::string> snapshot;
+    std::string blocker;
+
+    explicit HistoryLiveGuard(const Session& source) {
+        {
+            std::lock_guard<std::mutex> registry(g_registry_mtx);
+            for (const auto& [id, pin] : g_sessions) {
+                snapshot.insert(id);
+                if (id != source.doc_id) pins.push_back(pin);
+            }
+            if (history_registered_consumer_locked(source.doc_id))
+                blocker = "a registered external consumer may depend on this document";
+        }
+        if (!blocker.empty()) return;
+        const std::string name = source.doc.value("name", std::string());
+        for (const auto& pin : pins) {
+            Session* already = t_current_doc_lock ? t_current_doc_lock->find_held(pin->doc_id) : nullptr;
+            if (!already) {
+                locks.emplace_back(pin->mtx, std::try_to_lock);
+                if (!locks.back().owns_lock()) {
+                    blocker = "another open document is busy; its references cannot be checked";
+                    return;
+                }
+            }
+            if (history_mentions_source(pin->doc, source.doc_id, name)) {
+                blocker = "an open document may refer to this document";
+                return;
+            }
+        }
+    }
+
+    bool registry_unchanged_locked() const {
+        for (const auto& entry : g_sessions)
+            if (!snapshot.count(entry.first)) return false;
+        return true;
+    }
+};
+
+bool history_datum(const std::string& type) {
+    return type == "plane" || type == "axis" || type == "point" || type == "csys";
+}
+
+// No unknown node metadata may disappear as a side effect of cleanup.
+bool history_plain_envelope(const json& f) {
+    static const auto& allowed = *new const std::unordered_set<std::string>{
+        "id", "type", "name", "suppressed", "params", "refs",
+        // Accepted flat forms of datum and transform parameters.
+        "method", "base", "second", "points", "target", "origin", "x_dir", "y_dir",
+        "point", "normal", "direction", "offset", "flip", "body", "translate",
+        "rotate", "angle", "axis", "pivot", "copy", "a", "b", "coordinate",
+        "x", "y", "z", "fraction", "t"
+    };
+    for (auto it = f.begin(); it != f.end(); ++it)
+        if (!allowed.count(it.key())) return false;
+    return !history_has_expression(f) && !history_has_metadata(f);
+}
+
+bool history_known_datum(const json& f) {
+    static const auto& allowed = *new const std::unordered_set<std::string>{
+        "method", "base", "second", "points", "target", "origin", "x_dir", "y_dir",
+        "point", "normal", "direction", "offset", "flip", "body", "a", "b",
+        "coordinate", "x", "y", "z", "angle", "fraction", "t"
+    };
+    for (auto it = f.begin(); it != f.end(); ++it)
+        if (it.key() != "id" && it.key() != "type" && it.key() != "name" &&
+            it.key() != "suppressed" && it.key() != "params" && it.key() != "refs" &&
+            !allowed.count(it.key())) return false;
+    for (const char* container : {"params", "refs"}) {
+        if (!f.contains(container)) continue;
+        if (!f[container].is_object()) return false;
+        for (auto it = f[container].begin(); it != f[container].end(); ++it)
+            if (!allowed.count(it.key())) return false;
+    }
+    for (const char* key : {"offset", "angle", "x", "y", "z", "fraction", "t"}) {
+        const json* value = history_field(f, key);
+        if (value && !history_literal(value)) return false;
+    }
+    for (const char* key : {"coordinate", "normal", "direction"}) {
+        const json* value = history_field(f, key);
+        std::array<double, 3> ignored;
+        if (value && value->is_array() && !history_vec3(value, ignored)) return false;
+    }
+    return true;
+}
+
+bool history_zero_transform(const json& f) {
+    if (f.value("type", std::string()) != "transform") return false;
+    std::array<double, 3> translation{0, 0, 0};
+    if (const json* t = history_field(f, "translate"); t && !history_vec3(t, translation)) return false;
+    if (translation[0] != 0 || translation[1] != 0 || translation[2] != 0) return false;
+    const json* rotation = history_field(f, "rotate");
+    const json* angle = rotation && rotation->is_object() && rotation->contains("angle")
+        ? &(*rotation)["angle"] : history_field(f, "angle");
+    if (angle) {
+        auto value = history_literal(angle);
+        if (!value || *value != 0) return false;
+    }
+    return true;
+}
+
+bool history_simple_transform(const json& f) {
+    if (!history_plain_envelope(f) || history_bool(f, "copy", false)) return false;
+    static const auto& fields = *new const std::unordered_set<std::string>{
+        "id", "type", "name", "suppressed", "params", "refs", "translate",
+        "rotate", "angle", "axis", "pivot", "copy", "body"
+    };
+    for (auto it = f.begin(); it != f.end(); ++it)
+        if (!fields.count(it.key())) return false;
+    if (f.contains("params") && f["params"].is_object()) {
+        static const auto& allowed = *new const std::unordered_set<std::string>{
+            "translate", "rotate", "angle", "axis", "pivot", "copy", "body"
+        };
+        for (auto it = f["params"].begin(); it != f["params"].end(); ++it)
+            if (!allowed.count(it.key())) return false;
+    } else if (f.contains("params")) return false;
+    if (f.contains("refs")) {
+        if (!f["refs"].is_object()) return false;
+        for (auto it = f["refs"].begin(); it != f["refs"].end(); ++it)
+            if (it.key() != "body") return false;
+    }
+    if (const json* body = history_field(f, "body"); body && !body->is_string()) {
+        if (!body->is_object() || body->value("kind", std::string()) != "body" ||
+            !body->contains("owner_feature") || !(*body)["owner_feature"].is_string()) return false;
+        for (auto it = body->begin(); it != body->end(); ++it)
+            if (it.key() != "kind" && it.key() != "owner_feature") return false;
+    }
+    for (const char* key : {"axis", "pivot"}) {
+        std::array<double, 3> ignored;
+        if (const json* v = history_field(f, key); v && !history_vec3(v, ignored)) return false;
+    }
+    if (const json* r = history_field(f, "rotate")) {
+        if (r->is_object()) {
+            for (auto it = r->begin(); it != r->end(); ++it)
+                if (it.key() != "angle" && it.key() != "axis") return false;
+            std::array<double, 3> ignored;
+            if (r->contains("axis") && !history_vec3(&(*r)["axis"], ignored)) return false;
+        } else {
+            std::array<double, 3> ignored;
+            if (!history_vec3(r, ignored)) return false;
+        }
+    }
+    const json* copy = history_field(f, "copy");
+    return !copy || (copy->is_boolean() && !copy->get<bool>());
+}
+
+// The immediate following feature must replace the current body under its own
+// stable ID, without selecting some other body. Full validation checks the actual
+// surviving body IDs and geometry before committing the removal.
+bool history_current_body_successor(const json& f) {
+    if (history_field(f, "body")) return false;
+    const std::string type = f.value("type", std::string());
+    const std::string mode = history_string(f, "mode", type == "extrude" ? "new" : "boss");
+    if (type == "box" || type == "cylinder" || type == "cone" || type == "sphere" ||
+        type == "torus" || type == "extrude")
+        return (mode == "cut" || mode == "boss") && history_bool(f, "merge", true);
+    return false;
+}
+
+std::string history_ref_id(const json* ref) {
+    if (!ref) return {};
+    if (ref->is_string()) return ref->get<std::string>();
+    if (ref->is_array()) return ref->empty() ? std::string() : history_ref_id(&(*ref)[0]);
+    if (ref->is_object())
+        for (const char* key : {"owner_feature", "sketch", "feature", "id"})
+            if (ref->contains(key) && (*ref)[key].is_string()) return (*ref)[key].get<std::string>();
+    return {};
+}
+
+json history_finding(const std::string& code, const std::string& severity, const json& ids,
+                     const std::string& message, const std::string& suggestion, bool fixable,
+                     const json& evidence = json::object()) {
+    return {{"code", code}, {"severity", severity}, {"feature_ids", ids},
+            {"message", message}, {"suggestion", suggestion}, {"auto_fixable", fixable},
+            {"evidence", evidence}};
+}
+
+struct HistoryAnalysis {
+    json report;
+    std::unordered_set<std::string> eligible;
+};
+
+HistoryAnalysis analyze_model_history(const Session& s, const json& doc,
+                                      const std::string& live_blocker) {
+    if (doc.value("schema", std::string()) != "aicad.part/1")
+        throw OpError("invalid_op", "model history requires a part document");
+    const json empty = json::array();
+    const json& raw = doc.contains("features") && doc["features"].is_array() ? doc["features"] : empty;
+    const auto [cfg_name, config] = resolve_active_config(doc);
+    json configured_features;
+    if (config) configured_features = config_effective_features(raw, config);
+    const json& active = config ? configured_features : raw;
+    std::size_t limit = active.size();
+    if (doc.contains("rollback_after") && doc["rollback_after"].is_string()) {
+        if (doc["rollback_after"] == "start") limit = 0;
+        else for (std::size_t i = 0; i < active.size(); ++i)
+            if (active[i].value("id", std::string()) == doc["rollback_after"]) { limit = i + 1; break; }
+    }
+    const bool has_rollback = doc.contains("rollback_after") && !doc["rollback_after"].is_null();
+    const bool has_configs = doc.contains("configurations") && !doc["configurations"].empty();
+    const bool public_doc = !s.history_private_origin || !s.path.empty() || !s.native_source_path.empty();
+    std::unordered_set<std::string> ids;
+    std::unordered_map<std::string, std::size_t> positions;
+    bool opaque_history = false;
+    for (std::size_t i = 0; i < raw.size(); ++i) {
+        if (!raw[i].is_object()) continue;
+        const std::string id = raw[i].value("id", std::string());
+        const std::string name = raw[i].value("name", std::string());
+        if (!name.empty()) ids.insert(name);
+        const std::string type = raw[i].value("type", std::string());
+        if (type == "script" || type == "scad") opaque_history = true;
+        if (!id.empty()) { ids.insert(id); positions[id] = i; }
+    }
+    const HistoryRefs refs = history_references(doc, ids);
+    HistoryRefs active_refs;
+    for (const auto& entry : positions) active_refs.emplace(entry.first, 0);
+    for (std::size_t i = 0; i < limit; ++i) {
+        const json& f = active[i];
+        if (!f.is_object() || history_suppressed(f) ||
+            f.value("type", std::string()) == "sketch") continue;
+        // Only recognized geometry inputs establish that a sketch is used;
+        // arbitrary annotations mentioning its ID do not.
+        for (const char* slot : {"profile", "profiles", "sections", "path", "guides",
+                                  "positions", "positions_sketch", "sketch", "base"})
+            if (const json* value = history_field(f, slot)) history_scan_json(*value, active_refs);
+    }
+    json findings = json::array(), fixes = json::array(), blocked = json::array();
+    json limitations = json::array({
+        "Static document-history rules only; not a constraint solve, topology proof or geometric/engineering certification.",
+        "References in closed or persisted external documents cannot be exhaustively discovered; saved/public document feature IDs are not automatically removed."
+    });
+    if (has_configs) limitations.push_back("Automatic cleanup is blocked while named configurations exist.");
+    if (has_rollback) limitations.push_back("Automatic cleanup is blocked while the rollback bar is active.");
+    if (opaque_history) limitations.push_back("Scripted features may contain dependencies not recoverable from static references.");
+    if (!live_blocker.empty()) limitations.push_back(live_blocker);
+    HistoryAnalysis out;
+    json early_dressups = json::array(), pending_dressups = json::array(), later_structural = json::array();
+    struct Group { json ids = json::array(); json evidence = json::object(); };
+    std::vector<Group> transforms, dimensions, countersinks;
+    std::unordered_map<std::string, std::size_t> transform_groups, dimension_groups, countersink_groups;
+    std::size_t active_count = 0;
+    auto add_group = [](std::vector<Group>& groups, std::unordered_map<std::string, std::size_t>& index,
+                        const std::string& key, const json& feature_ids, const json& evidence) {
+        auto [it, inserted] = index.emplace(key, groups.size());
+        if (inserted) { groups.emplace_back(); groups.back().evidence = evidence; }
+        for (const auto& id : feature_ids) groups[it->second].ids.push_back(id);
+    };
+    auto common_blocker = [&]() -> std::string {
+        if (public_doc) return "persisted or public document may have unknown external consumers";
+        if (has_configs) return "named configurations may depend on this feature";
+        if (has_rollback) return "rollback is active";
+        if (opaque_history) return "scripted features may contain unknown dependencies";
+        return live_blocker;
+    };
+    for (std::size_t i = 0; i < active.size(); ++i) {
+        const json& f = active[i];
+        if (!f.is_object()) continue;
+        const std::string id = f.value("id", std::string());
+        const std::string type = f.value("type", std::string());
+        if (id.empty()) continue;
+        const bool enabled = i < limit && !history_suppressed(f);
+        if (!enabled) continue;
+        ++active_count;
+        const std::string name = f.value("name", std::string());
+        const bool referenced = (refs.count(id) && refs.at(id) != 0) ||
+                                (!name.empty() && refs.count(name) && refs.at(name) != 0);
+        if (history_datum(type) || history_zero_transform(f)) {
+            const bool datum = history_datum(type);
+            std::string reason = common_blocker();
+            if (reason.empty() && referenced) reason = "feature is referenced in the document";
+            if (reason.empty() && !history_plain_envelope(raw[i]))
+                reason = "feature has expressions or metadata that must be preserved";
+            if (reason.empty() && !datum && !history_simple_transform(raw[i]))
+                reason = "transform is a copy, expression-driven, or has unrecognized parameters";
+            if (reason.empty() && datum && !history_known_datum(raw[i]))
+                reason = "datum has unrecognized parameters or non-literal dimensions";
+            if (reason.empty() && !datum && history_field(raw[i], "body")) {
+                const std::string target = history_ref_id(history_field(raw[i], "body"));
+                if (i == 0 || target.empty() || active[i - 1].value("id", std::string()) != target ||
+                    history_suppressed(active[i - 1]))
+                    reason = "explicit target is not the immediately preceding body";
+            }
+            if (reason.empty() && !datum && doc.contains("face_appearances") &&
+                !doc["face_appearances"].empty())
+                reason = "face appearances require topology identity that cannot be proven here";
+            if (reason.empty() && !datum &&
+                (i + 1 >= limit || history_suppressed(active[i + 1]) ||
+                 !history_current_body_successor(active[i + 1])))
+                reason = "transform may remain an observable final body or change body identity";
+            const bool safe = reason.empty();
+            if (safe) {
+                out.eligible.insert(id);
+                fixes.push_back({{"feature_ids", json::array({id})},
+                    {"description", datum ? "Remove unreferenced datum" : "Remove literal identity transform"},
+                    {"ops", json::array({json{{"op", "simplify_history"}, {"features", json::array({id})}}})}});
+            } else blocked.push_back({{"feature_ids", json::array({id})}, {"reason", reason}});
+            if (!datum || !referenced) {
+                findings.push_back(history_finding(datum ? "unused_datum" : "identity_transform", "warning",
+                    json::array({id}), datum ? "Datum has no detected document references." :
+                                               "Transform has literal zero translation and rotation.",
+                    datum ? "Review whether the datum is needed; remove it only if all consumers are known." :
+                            "Review its placement intent and remove it only if body identity is preserved.",
+                    safe, {{"blocker", safe ? json(nullptr) : json(reason)}}));
+            }
+        }
+        if (type == "sketch") {
+            const json* constraints = history_field(f, "constraints");
+            const json* entities = history_field(f, "entities");
+            bool only_coincident = constraints && constraints->is_array() && !constraints->empty();
+            if (only_coincident) for (const auto& c : *constraints)
+                if (!c.is_object() || c.value("type", std::string()) != "coincident")
+                    { only_coincident = false; break; }
+            const bool actively_used = active_refs.count(id) && active_refs.at(id) != 0;
+            if (actively_used && entities && entities->is_array() && !entities->empty() && only_coincident)
+                findings.push_back(history_finding("sketch_intent_missing", "warning", json::array({id}),
+                    "Used sketch contains only coincident relations, with no authored dimensional or orientation relations.",
+                    "Add design-critical dimensions and geometric relations; inspect the sketch before changing constraints.",
+                    false, {{"constraint_count", constraints->size()}, {"basis", "static_relations_not_solver_dof"}}));
+        }
+        if (type == "fillet" || type == "chamfer") pending_dressups.push_back(id);
+        else if (!pending_dressups.empty() || !early_dressups.empty()) {
+            static const auto& structural = *new const std::unordered_set<std::string>{
+                "box", "cylinder", "cone", "sphere", "torus", "extrude", "revolve",
+                "sweep", "loft", "boolean", "hole", "rib", "shell", "thread", "split"
+            };
+            if (structural.count(type)) {
+                for (const auto& dressup : pending_dressups) early_dressups.push_back(dressup);
+                pending_dressups = json::array();
+                later_structural.push_back(id);
+            }
+        }
+        if (type == "boolean") {
+            const std::string operation = history_string(f, "op");
+            const json* tool_ref = history_field(f, "tools");
+            if (!tool_ref) tool_ref = history_field(f, "b");
+            const std::string tool = history_ref_id(tool_ref);
+            auto tp = positions.find(tool);
+            if ((operation == "cut" || operation == "subtract") && tp != positions.end() && tp->second < i) {
+                const json& t = active[tp->second];
+                const std::string source = history_ref_id(history_field(t, "body"));
+                auto ep = positions.find(source);
+                if (t.value("type", std::string()) == "transform" && !history_suppressed(t) &&
+                    !history_bool(t, "copy", false) && ep != positions.end() && ep->second < tp->second) {
+                    const json& e = active[ep->second];
+                    const std::string mode = history_string(e, "mode", "new");
+                    if (e.value("type", std::string()) == "extrude" && !history_suppressed(e) &&
+                        (mode == "new" || (mode == "boss" && !history_bool(e, "merge", true))))
+                        findings.push_back(history_finding("transformed_cut_tool", "warning",
+                            json::array({source, tool, id}),
+                            "A standalone extrude is transformed and then used as a boolean cut tool.",
+                            "Consider a sketch on an angled datum and a direct cut, if it preserves the intended geometry.",
+                            false));
+                }
+            }
+        }
+        if (type == "transform" && !history_has_expression(f) && !history_zero_transform(f)) {
+            std::array<double, 3> t{0,0,0}, axis{0,0,1}, pivot{0,0,0};
+            const json* tv = history_field(f, "translate");
+            const json* pv = history_field(f, "pivot");
+            const json* rv = history_field(f, "rotate");
+            const json* av = rv && rv->is_object() && rv->contains("angle") ? &(*rv)["angle"] : history_field(f, "angle");
+            const json* ax = rv && rv->is_object() ? (rv->contains("axis") ? &(*rv)["axis"] : nullptr)
+                                                    : (rv ? rv : history_field(f, "axis"));
+            const auto angle = av ? history_literal(av) : std::optional<double>(0);
+            if ((!tv || history_vec3(tv,t)) && (!pv || history_vec3(pv,pivot)) &&
+                (!ax || history_vec3(ax,axis)) && angle && std::isfinite(*angle)) {
+                json key = {{"translation", t}, {"axis", axis}, {"pivot", pivot}, {"angle", *angle}};
+                add_group(transforms, transform_groups, key.dump(), json::array({id}), key);
+            }
+        }
+        // Repeated authored sizes suggest shared design variables, never an inferred pattern.
+        static const auto& size_keys = *new const std::unordered_map<std::string, std::vector<std::string>>{
+            {"cylinder", {"radius", "height"}}, {"cone", {"r1", "r2", "height"}},
+            {"hole", {"diameter", "csink_d", "csink_angle"}}, {"fillet", {"radius"}},
+            {"chamfer", {"length"}}, {"extrude", {"depth"}}
+        };
+        auto keys = size_keys.find(type);
+        if (keys != size_keys.end()) for (const auto& key : keys->second) {
+            const auto value = history_literal(history_field(f, key.c_str()));
+            if (!value || !std::isfinite(*value) || *value == 0) continue;
+            json evidence = {{"feature_type", type}, {"parameter", key}, {"value", *value}};
+            add_group(dimensions, dimension_groups, evidence.dump(), json::array({id}), evidence);
+        }
+        if (type == "cone" && i > 0) {
+            const json& c = active[i - 1];
+            const auto radius = history_literal(history_field(c, "radius"));
+            const auto bore_height = history_literal(history_field(c, "height"));
+            const auto r1 = history_literal(history_field(f, "r1"));
+            const auto r2 = history_literal(history_field(f, "r2"));
+            const auto height = history_literal(history_field(f, "height"));
+            const json* ca = history_field(c, "at"), *fa = history_field(f, "at");
+            const json* co = history_field(c, "at_offset"), *fo = history_field(f, "at_offset");
+            const json* cc = history_field(c, "centered"), *fc = history_field(f, "centered");
+            std::array<double, 3> cp{}, fp{}, coff{}, foff{};
+            if (c.value("type", std::string()) == "cylinder" &&
+                !c.value("id", std::string()).empty() && !history_suppressed(c) &&
+                history_primitive_cut(c) && history_primitive_cut(f) &&
+                radius && bore_height && r1 && r2 && height &&
+                std::isfinite(*radius) && std::isfinite(*bore_height) &&
+                std::isfinite(*r1) && std::isfinite(*r2) && std::isfinite(*height) &&
+                *radius > 0 && *bore_height > 0 && *height > 0 &&
+                ((*r1 == *radius && *r2 > *radius) || (*r2 == *radius && *r1 > *radius)) &&
+                history_primitive_vec3(ca, cp) && history_primitive_vec3(fa, fp) && cp == fp &&
+                (!co || history_primitive_vec3(co, coff)) &&
+                (!fo || history_primitive_vec3(fo, foff)) && coff == foff &&
+                (!cc || cc->is_boolean()) && (!fc || fc->is_boolean()) &&
+                history_bool(c, "centered", true) == history_bool(f, "centered", true) &&
+                !history_has_expression(c) && !history_has_expression(f)) {
+                const auto caxis = history_primitive_axis(c), faxis = history_primitive_axis(f);
+                if (!caxis || !faxis || *caxis != *faxis) continue;
+                json evidence = {{"bore_radius", *radius}, {"bore_height", *bore_height},
+                                 {"outer_radius", std::max(*r1, *r2)}, {"cone_r1", *r1},
+                                 {"cone_r2", *r2}, {"cone_height", *height}, {"axis", *caxis},
+                                 {"centered", history_bool(c, "centered", true)}};
+                add_group(countersinks, countersink_groups, evidence.dump(),
+                          json::array({c.value("id", std::string()), id}), evidence);
+            }
+        }
+    }
+    if (!later_structural.empty()) {
+        for (const auto& id : later_structural) early_dressups.push_back(id);
+        findings.push_back(history_finding("dressup_before_structural", "warning", early_dressups,
+            "Dress-up features precede later structural operations.",
+            "Consider placing suitable fillets and chamfers later; review dependencies rather than automatically reordering.",
+            false));
+    }
+    for (const auto& g : transforms) if (g.ids.size() >= 2)
+        findings.push_back(history_finding("repeated_transform", "warning", g.ids,
+            "Multiple transforms use the same literal placement.",
+            "If these placements share design intent, drive them from shared parameters or a common datum.",
+            false, g.evidence));
+    for (const auto& g : dimensions) if (g.ids.size() >= 2)
+        findings.push_back(history_finding("repeated_dimension", "info", g.ids,
+            "Multiple features use the same literal size.",
+            "If the dimensions represent the same design intent, use a shared dimension or equation.",
+            false, g.evidence));
+    for (const auto& g : countersinks) if (g.ids.size() >= 4)
+        findings.push_back(history_finding("repeated_countersink", "warning", g.ids,
+            "Repeated coincident cylinder/cone cuts resemble countersinks.",
+            "Consider semantic countersink hole features and shared sizing; verify each location and geometry.",
+            false, g.evidence));
+    out.report = {{"ok", true}, {"doc_id", s.doc_id}, {"revision", s.revision}, {"complete", true},
+                  {"summary", findings.empty() ? "No history-rule findings." :
+                      std::to_string(findings.size()) + " history-rule findings; review design intent."},
+                  {"metrics", {{"feature_count", raw.size()}, {"active_feature_count", active_count},
+                               {"finding_count", findings.size()}, {"safe_fix_count", fixes.size()},
+                               {"active_configuration", cfg_name}}},
+                  {"findings", std::move(findings)}, {"safe_fixes", std::move(fixes)},
+                  {"blocked_fixes", std::move(blocked)}, {"limitations", std::move(limitations)}};
+    return out;
+}
+
+HistoryAnalysis history_preview(const Session& s, const json& doc,
+                                std::unique_ptr<HistoryLiveGuard>& guard) {
+    HistoryAnalysis analysis = analyze_model_history(s, doc, {});
+    if (!analysis.eligible.empty()) {
+        if (!guard) guard = std::make_unique<HistoryLiveGuard>(s);
+        if (!guard->blocker.empty())
+            analysis = analyze_model_history(s, doc, guard->blocker);
+    }
+    return analysis;
+}
+
+// Solid-history deletion is permitted only when a scratch compile preserves the
+// surviving body identities and both trustworthy directional material differences.
+void history_validate_solid_cleanup(const Session& s, const json& before, const json& after) {
+    const CompileResult old_result = compile_document(before, env_from_doc(before), nullptr, s.display_quality);
+    const CompileResult new_result = compile_document(after, env_from_doc(after), nullptr, s.display_quality);
+    if (!old_result.ok || !new_result.ok || old_result.shapes.size() != new_result.shapes.size() ||
+        old_result.bodies_info.size() != old_result.shapes.size() ||
+        new_result.bodies_info.size() != new_result.shapes.size())
+        throw OpError("invalid_op", "simplify_history: scratch compilation or body identity validation failed",
+                      {{"reason", "candidate_compile_or_body_identity"}});
+    for (std::size_t i = 0; i < old_result.shapes.size(); ++i) {
+        const auto& a = old_result.shapes[i];
+        const auto& b = new_result.shapes[i];
+        if (old_result.bodies_info[i].name != new_result.bodies_info[i].name ||
+            old_result.bodies_info[i].kind != "solid" || new_result.bodies_info[i].kind != "solid" ||
+            a.IsNull() || b.IsNull())
+            throw OpError("invalid_op", "simplify_history: surviving body identity or kind changed",
+                          {{"reason", "body_identity"}});
+        try {
+            if (!BRepCheck_Analyzer(a).IsValid() || !BRepCheck_Analyzer(b).IsValid())
+                throw OpError("invalid_op", "simplify_history: body validity could not be preserved",
+                              {{"reason", "invalid_geometry"}});
+            GProp_GProps original_properties, candidate_properties;
+            BRepGProp::VolumeProperties(a, original_properties);
+            BRepGProp::VolumeProperties(b, candidate_properties);
+            const double original_volume = original_properties.Mass();
+            const double candidate_volume = candidate_properties.Mass();
+            if (!std::isfinite(original_volume) || !std::isfinite(candidate_volume) ||
+                !(original_volume > 0) || !(candidate_volume > 0))
+                throw OpError("invalid_op", "simplify_history: material comparison was inconclusive",
+                              {{"reason", "comparison_degraded"}});
+            auto difference = [](const TopoDS_Shape& left, const TopoDS_Shape& right) {
+                TopTools_ListOfShape arguments, tools;
+                arguments.Append(left);
+                tools.Append(right);
+                BRepAlgoAPI_Cut cut;
+                cut.SetArguments(arguments);
+                cut.SetTools(tools);
+                cut.SetNonDestructive(Standard_True);
+                cut.Build();
+                if (!cut.IsDone() || cut.HasErrors() || cut.HasWarnings() ||
+                    cut.Shape().IsNull() || !BRepCheck_Analyzer(cut.Shape()).IsValid())
+                    throw OpError("invalid_op", "simplify_history: material comparison was inconclusive",
+                                  {{"reason", "comparison_degraded"}});
+                const TopoDS_Shape& residual = cut.Shape();
+                // A valid empty compound is the expected zero difference. Do not
+                // let loose topology or oppositely oriented solids cancel out in
+                // a single signed-mass sum and masquerade as zero material.
+                for (TopAbs_ShapeEnum kind : {TopAbs_FACE, TopAbs_EDGE, TopAbs_VERTEX}) {
+                    TopTools_IndexedMapOfShape all, in_solids;
+                    TopExp::MapShapes(residual, kind, all);
+                    for (TopExp_Explorer ex(residual, TopAbs_SOLID); ex.More(); ex.Next())
+                        TopExp::MapShapes(ex.Current(), kind, in_solids);
+                    if (all.Extent() != in_solids.Extent())
+                        throw OpError("invalid_op", "simplify_history: material comparison was inconclusive",
+                                      {{"reason", "comparison_degraded"}});
+                }
+                double volume = 0;
+                for (TopExp_Explorer ex(residual, TopAbs_SOLID); ex.More(); ex.Next()) {
+                    GProp_GProps properties;
+                    BRepGProp::VolumeProperties(ex.Current(), properties);
+                    const double part = std::abs(properties.Mass());
+                    if (!std::isfinite(part) || !(part > 0))
+                        throw OpError("invalid_op", "simplify_history: material comparison was inconclusive",
+                                      {{"reason", "comparison_degraded"}});
+                    volume += part;
+                }
+                if (!std::isfinite(volume))
+                    throw OpError("invalid_op", "simplify_history: material comparison was inconclusive",
+                                  {{"reason", "comparison_degraded"}});
+                return volume;
+            };
+            const double tolerance = std::max(1e-9, original_volume * 1e-10);
+            const double missing = difference(a, b);
+            const double extra = difference(b, a);
+            if (!std::isfinite(missing) || !std::isfinite(extra) || missing > tolerance || extra > tolerance)
+                throw OpError("invalid_op", "simplify_history: candidate changes material",
+                              {{"reason", "material_change"}, {"missing_mm3", missing}, {"extra_mm3", extra}});
+        } catch (const Standard_Failure&) {
+            throw OpError("invalid_op", "simplify_history: geometry validation failed",
+                          {{"reason", "geometry_validation_failed"}});
+        }
+    }
+}
+
+void history_apply_cleanup(Session& s, json& working, const json& op, const json& id_map,
+                           std::unique_ptr<HistoryLiveGuard>& guard,
+                           std::unordered_set<std::string>& removed_tokens) {
+    HistoryAnalysis analysis = history_preview(s, working, guard);
+    std::unordered_set<std::string> selected;
+    if (op.contains("features")) {
+        json requested = op["features"];
+        resolve_placeholders_deep(requested, id_map);
+        if (!requested.is_array())
+            throw OpError("invalid_op", "simplify_history: features must be an array of feature IDs");
+        for (const auto& item : requested) {
+            if (!item.is_string() || !analysis.eligible.count(item.get<std::string>()))
+                throw OpError("invalid_op", "simplify_history: requested feature is not eligible",
+                              {{"reason", "ineligible_feature"}, {"feature", item},
+                               {"blocked_fixes", analysis.report["blocked_fixes"]}});
+            selected.insert(item.get<std::string>());
+        }
+    } else {
+        selected = std::move(analysis.eligible);
+    }
+    if (selected.empty()) return;
+    json candidate = working;
+    json kept = json::array();
+    bool removes_solid_op = false;
+    for (const auto& f : working["features"]) {
+        const std::string id = f.value("id", std::string());
+        if (!selected.count(id)) { kept.push_back(f); continue; }
+        removed_tokens.insert(id);
+        const std::string name = f.value("name", std::string());
+        if (!name.empty()) removed_tokens.insert(name);
+        if (f.value("type", std::string()) == "transform") removes_solid_op = true;
+    }
+    candidate["features"] = std::move(kept);
+    if (removes_solid_op) history_validate_solid_cleanup(s, working, candidate);
+    working = std::move(candidate);
 }
 
 json ops_response(Session& s, const CompileResult& r, const json& id_map, bool with_tess,
@@ -4549,8 +7391,14 @@ json ops_response(Session& s, const CompileResult& r, const json& id_map, bool w
 // ops_response reads it — no extra copy of the aicm/shapes. Call this ONLY where `r` was just
 // compiled from the CURRENT live s.doc at the CURRENT s.revision (never the apply-batch rollback
 // path, where r is the rejected tree and the restored doc's cache is already valid).
-json warm_and_respond(Session& s, CompileResult r, const json& id_map, bool with_tess) {
+json warm_and_respond(Session& s, CompileResult r, const json& id_map, bool with_tess,
+                      bool restoring_cache = false) {
+    retain_session_compile(s, r, restoring_cache);
     json resp = ops_response(s, r, id_map, with_tess);
+    if (r.ok && has_scad_feature(s.doc)) {
+        const std::string identity = scad::cache_identity();
+        if (!identity.empty()) s.scad_cache_identity = identity;
+    }
     s.compiled = std::make_shared<CompileResult>(std::move(r));
     s.compiled_rev = s.revision;
     s.compiled_partial = false;
@@ -4560,10 +7408,8 @@ json warm_and_respond(Session& s, CompileResult r, const json& id_map, bool with
     return resp;
 }
 
-// Publish tess AICM via aicm_handoff (aicm-shm://…, or its own pid-scoped temp
-// file when shm is unavailable) so the host maps it without a second unscoped file. Empty
-// on a hard publish failure: responses then carry no aicm_path (the existing "no mesh"
-// signal) instead of failing an edit/open whose document state has already committed.
+// Publish a mesh without turning a publication failure into an empty model.
+// Callers report mesh_error and omit aicm_path when nonempty geometry failed.
 std::string publish_doc_aicm(const std::string& doc_id, long revision,
                              const uint8_t* data, std::size_t size) {
     if (size == 0) return {};
@@ -4572,7 +7418,7 @@ std::string publish_doc_aicm(const std::string& doc_id, long revision,
     // Drop old revisions so shm objects don't accumulate. Keep a few recent ones:
     // the host's async mesh loader may still be mapping the previous path
     // while this rebuild publishes the next.
-    if (revision > 3)
+    if (!uri.empty() && revision > 3)
         chudware::aicm_handoff::release_older_than(doc_id, revision - 3);
     return uri;
 }
@@ -4582,8 +7428,55 @@ std::string publish_doc_aicm(const std::string& doc_id, long revision,
     return publish_doc_aicm(doc_id, revision, aicm.data(), aicm.size());
 }
 
+// B-rep-exact stats of a compile's surviving shapes, memoized on the result. `basis` names
+// the method so a consumer never mixes it with the triangulated `volume`. Solids contribute
+// volume; surface bodies (open shells) only faces and bbox. The bbox is the exact one
+// doc_bbox reports (no triangulation, no tolerance gap).
+const json& exact_geometry_stats(const CompileResult& r) {
+    if (!r.exact_stats.is_null()) return r.exact_stats;
+    double volume = 0.0;
+    int faces = 0, solids = 0;
+    Bnd_Box box;
+    for (std::size_t i = 0; i < r.shapes.size(); ++i) {
+        const TopoDS_Shape& shape = r.shapes[i];
+        if (shape.IsNull()) continue;
+        BRepBndLib::AddOptimal(shape, box, /*useTriangulation=*/Standard_False,
+                               /*useShapeTolerance=*/Standard_False);
+        TopTools_IndexedMapOfShape face_map, solid_map;
+        TopExp::MapShapes(shape, TopAbs_FACE, face_map);
+        TopExp::MapShapes(shape, TopAbs_SOLID, solid_map);
+        faces += face_map.Extent();
+        solids += solid_map.Extent();
+        const bool surface = i < r.bodies_info.size() && r.bodies_info[i].kind == "surface";
+        if (surface) continue;
+        try {
+            GProp_GProps props;
+            BRepGProp::VolumeProperties(shape, props, /*OnlyClosed=*/Standard_False,
+                                        /*SkipShared=*/Standard_False,
+                                        /*UseTriangulation=*/Standard_False);
+            volume += props.Mass();
+        } catch (const Standard_Failure&) {
+            // A body OCCT cannot integrate contributes no volume; its faces still count.
+        }
+    }
+    json bounds = nullptr;
+    if (!box.IsVoid()) {
+        box.SetGap(0.0);
+        Standard_Real x0, y0, z0, x1, y1, z1;
+        box.Get(x0, y0, z0, x1, y1, z1);
+        bounds = {{"min", {x0, y0, z0}}, {"max", {x1, y1, z1}}, {"size", {x1 - x0, y1 - y0, z1 - z0}}};
+    }
+    r.exact_stats = {{"basis", "brep_exact"}, {"volume_mm3", volume}, {"bbox", std::move(bounds)},
+                     {"face_count", faces}, {"solid_count", solids}};
+    return r.exact_stats;
+}
+
 json ops_response(Session& s, const CompileResult& r, const json& id_map, bool with_tess,
                   const CompileResult* display_result) {
+    const CompileResult* selected = display_result ? display_result : &r;
+    const bool last_good = !selected->ok && s.last_good_display && s.last_good_display->ok;
+    if (last_good) selected = s.last_good_display.get();
+    const CompileResult& display = *selected;
     json fs = json::array();
     for (const FeatureStatus& st : r.statuses) {
         fs.push_back({{"id", st.id},
@@ -4596,24 +7489,46 @@ json ops_response(Session& s, const CompileResult& r, const json& id_map, bool w
                       // null for features that measure nothing.
                       {"data", st.data},
                       {"dangling_refs", json::array()},
-                      {"rolled_back", false}});
+                      {"rolled_back", st.rolled_back}});
     }
     json resp;
     resp["revision"] = s.revision;
+    resp["metadata_revision"] = s.metadata_revision;
     resp["id_map"] = id_map;
     resp["tree"] = s.doc;
     cache_response_fields(s, resp);
-    resp["owner_map"] = r.owner_map.is_null() ? json::object() : r.owner_map;
+    resp["geometry_state"] = last_good ? "last_good" : display.ok ? "current" : "incomplete";
+    if (last_good) {
+        if (!resp.contains("warnings") || !resp["warnings"].is_array())
+            resp["warnings"] = json::array();
+        resp["warnings"].push_back(
+            "last_good_geometry: displayed snapshot is stale; the current feature history failed");
+    }
+    // A global that cannot be evaluated is left out of the solve env (so each dimension using
+    // it fails on its own); name it here instead of leaving the cause to be rediscovered.
+    json equation_errors = json::array();
+    (void)eval_equation_globals(s.doc, &equation_errors);
+    if (!equation_errors.empty()) {
+        if (!resp.contains("warnings") || !resp["warnings"].is_array())
+            resp["warnings"] = json::array();
+        for (const json& e : equation_errors)
+            resp["warnings"].push_back("equation_unevaluated: global '" + e.at("name").get<std::string>() +
+                                       "' = '" + e.at("expr").get<std::string>() + "' was skipped (" +
+                                       e.at("error").get<std::string>() +
+                                       "); every dimension that uses it fails until it is fixed");
+        resp["equation_errors"] = std::move(equation_errors);
+    }
+    resp["owner_map"] = display.owner_map.is_null() ? json::object() : display.owner_map;
     // Displayable reference geometry (datum axes/planes/points/csys) — empty for docs with no
     // datum features. The host draws these as overlays; without it a created datum is invisible.
-    resp["datums"] = r.datums;
+    resp["datums"] = display.datums;
     json active_sketch_status = nullptr;
     if (s.active_sketch && !s.active_sketch->last_overall_status.empty())
         active_sketch_status = s.active_sketch->last_overall_status;
-    resp["rebuild"] = {{"feature_status", fs},
+    resp["rebuild"] = {{"ok", r.ok}, {"feature_status", fs},
                        {"doc_status", {{"active_sketch", active_sketch_status},
                                        {"mates", nullptr},
-                                       {"active_configuration", r.active_configuration},
+                                       {"active_configuration", display.active_configuration},
                                        // incremental-rebuild accounting (CompileCache)
                                        {"features_reused", r.features_reused},
                                        {"features_executed", r.features_executed},
@@ -4624,14 +7539,25 @@ json ops_response(Session& s, const CompileResult& r, const json& id_map, bool w
                                                      {"tess_extract", r.tess_extract_ms},
                                                      {"tess_write", r.tess_write_ms},
                                                      {"owner_map", r.owner_ms}}}}}};
-    resp["volume"] = r.volume;  // C++ convenience (geometric parity signal)
+    std::unique_ptr<HistoryLiveGuard> history_guard;
+    json history = history_preview(s, s.doc, history_guard).report;
+    history_guard.reset();
+    resp["rebuild"]["doc_status"]["model_history"] = history;
+    resp["model_history"] = std::move(history);
+    resp["volume"] = display.volume;  // C++ convenience (geometric parity signal)
+    // `volume` above is the display-triangulation estimate. `exact` is the B-rep basis a
+    // before/after delta must use (a small fillet changes it by less than the mesh error).
+    // Computed once per compile result and reused by every reply served from the cache; not
+    // computed for replies that skip tessellation (the interactive / bulk paths).
+    if (with_tess && (display.ok || !display.shapes.empty())) resp["exact"] = exact_geometry_stats(display);
     if (with_tess) {
-        const CompileResult& display = display_result ? *display_result : r;
         std::string aicm_path;
         if (!display.aicm.empty())
             aicm_path = publish_doc_aicm(s.doc_id, s.revision, display.aicm);
-        json bodies = json::array();
-        for (int i = 0; i < display.body_count; ++i) {
+        json bodies = last_good && s.last_good_body_metadata.is_array() &&
+                              s.last_good_body_metadata.size() == static_cast<std::size_t>(display.body_count)
+                          ? s.last_good_body_metadata : json::array();
+        if (bodies.empty()) for (int i = 0; i < display.body_count; ++i) {
             const std::string key = "b" + std::to_string(i + 1);
             // Report the per-body appearance (set_appearance) so the host's body list / swatch agree
             // with the baked AICM, instead of always showing the default grey dielectric.
@@ -4643,7 +7569,13 @@ json ops_response(Session& s, const CompileResult& r, const json& id_map, bool w
                               {"owner_key", key}, {"metallic", bmetal}, {"roughness", brough},
                               {"kind", display.bodies_info[static_cast<std::size_t>(i)].kind}});
         }
-        resp["tess"] = {{"aicm_path", aicm_path}, {"bodies", bodies}};
+        resp["tess"] = {{"bodies", bodies}};
+        if (aicm_path.empty() && (!display.aicm.empty() || display.body_count > 0)) {
+            resp["tess"]["mesh_error"] = "aicm_publication_failed";
+            resp["mesh_error"] = "aicm_publication_failed";
+        } else {
+            resp["tess"]["aicm_path"] = aicm_path;
+        }
     }
     return resp;
 }
@@ -4717,11 +7649,73 @@ std::string component_source_base(const Session& s) {
     return s.project_dir;
 }
 
-// Solve the assembly's mates, write the solved transforms back into the doc (so a save
-// captures the mated pose), and cache the AssemblyResult on the session (port of
-// session.py::_rebuild_assembly). component_source_base resolves relative source paths.
+// Preserve the identities actually used by a compile when saving into a new
+// directory; reading fresh disk fingerprints could certify a concurrent edit.
+json rebase_assembly_fingerprints(json sources, const std::string& old_base,
+                                  const std::string& new_base, bool persisted) {
+    if (!sources.is_array()) return sources;
+    const auto old_root = old_base.empty() ? std::filesystem::path()
+        : std::filesystem::absolute(std::filesystem::u8path(old_base)).lexically_normal();
+    const auto root = new_base.empty() ? std::filesystem::path()
+        : std::filesystem::absolute(std::filesystem::u8path(new_base)).lexically_normal();
+    for (auto& row : sources) {
+        if (persisted) row.erase("live_unsaved");
+        const std::string path = row.value("path", std::string());
+        if (path.empty()) continue;
+        const auto absolute = std::filesystem::absolute(
+            old_root / std::filesystem::u8path(path)).lexically_normal();
+        const auto local = root.empty() ? std::filesystem::path() : absolute.lexically_relative(root);
+        const auto first = local.begin();
+        row["path"] = !local.empty() && first != local.end() && *first != ".." && *first != "."
+                          ? local.generic_string() : absolute.string();
+    }
+    return sources;
+}
+
+// Does the stored 16-float row-major `transform` equal the solved one within `eps`? The
+// solver judges its positional (mm) and direction (dimensionless) residual rows against
+// the same threshold, so every entry is compared against it. A missing or malformed
+// stored transform never matches: writing one is a document change.
+static bool solved_pose_matches(const json& stored, const std::vector<double>& solved,
+                                double eps) {
+    if (!stored.is_array() || stored.size() != 16 || solved.size() != 16) return false;
+    for (std::size_t i = 0; i < 16; ++i) {
+        if (!stored[i].is_number()) return false;
+        if (std::abs(stored[i].get<double>() - solved[i]) > eps) return false;
+    }
+    return true;
+}
+
+// Did this compile place different component geometry than the result it replaces?
+// Component loads are cached per source stamp with one stable compound TShape, so an
+// unchanged source yields the identical TShape. No prior result means nobody has been
+// served geometry this compile could contradict.
+static bool assembly_geometry_changed(const AssemblyResult* prior, const AssemblyResult& next) {
+    if (!prior) return false;
+    if (prior->bodies.size() != next.bodies.size()) return true;
+    for (std::size_t i = 0; i < next.bodies.size(); ++i) {
+        const AsmBodyOut& a = prior->bodies[i];
+        const AsmBodyOut& b = next.bodies[i];
+        if (a.component_id != b.component_id || a.name != b.name ||
+            !a.shape_local.IsPartner(b.shape_local) || a.color != b.color ||
+            a.metallic != b.metallic || a.roughness != b.roughness ||
+            a.body_material_keys != b.body_material_keys ||
+            a.appearance_regions.size() != b.appearance_regions.size()) return true;
+        for (std::size_t j = 0; j < a.appearance_regions.size(); ++j) {
+            const auto& x = a.appearance_regions[j];
+            const auto& y = b.appearance_regions[j];
+            if (x.first_face != y.first_face || x.face_count != y.face_count ||
+                !std::equal(std::begin(x.color), std::end(x.color), std::begin(y.color)) ||
+                x.metallic != y.metallic || x.roughness != y.roughness) return true;
+        }
+    }
+    return false;
+}
+// Solve mates, persist solved transforms, and cache the assembly result.
 void rebuild_assembly(Session& s) {
+    AssemblySourceScope source_scope(assembly_sources_for_session(s));
     const std::string base_dir = component_source_base(s);
+    json sources = asm_live_component_fingerprints(s.doc, base_dir);
     std::optional<chudware::mate::WarmMap> warm;
     if (!s.asm_warm.empty()) warm = s.asm_warm;
     bind_assembly_reference_frames(s.doc);
@@ -4735,6 +7729,189 @@ void rebuild_assembly(Session& s) {
         }
     s.asm_warm = ares.warm;
     s.asm_result = std::make_shared<AssemblyResult>(std::move(ares));
+    s.asm_sources = std::move(sources);
+    s.asm_source_versions = AssemblySourceScope::current();
+    update_assembly_dependencies(s, s.asm_sources, base_dir);
+    s.cached_assembly_response = json();
+    // A source can change after this compile froze its snapshots but before
+    // its dependency paths were registered (notably on first open). After
+    // registration, close that race by queueing another pass if needed.
+    if (s.owns_journal && t_current_doc_lock &&
+        t_current_doc_lock->find_held(s.doc_id) == &s) {
+        const auto latest = assembly_sources_for_session(s, assembly_live_sources());
+        if (latest != AssemblySourceScope::current()) {
+            AssemblySourceScope latest_scope(latest);
+            if (!asm_live_fingerprints_match(s.doc, base_dir, s.asm_sources))
+                for (const auto& row : s.asm_sources) {
+                    auto path = std::filesystem::u8path(row.value("path", std::string()));
+                    if (path.empty()) continue;
+                    if (path.is_relative()) path = std::filesystem::u8path(base_dir) / path;
+                    t_current_doc_lock->defer_source_change(canonical_source_path(path.string()));
+                }
+        }
+    }
+}
+
+json ops_response_assembly(Session& s, const json& id_map, bool with_tess,
+                           std::vector<uint8_t>* aicm_blob_out);
+
+void ensure_assembly_current(Session& s, bool force = false) {
+    AssemblySourceScope source_scope(assembly_sources_for_session(s));
+    const bool sources_match =
+        asm_live_fingerprints_match(s.doc, component_source_base(s), s.asm_sources);
+    if (!force && s.asm_result && sources_match) return;
+
+    const auto prior = s.asm_result;
+    const bool had_cached_display = !s.cached_assembly_response.empty();
+    const json before = s.doc;
+    rebuild_assembly(s);
+
+    // Loading an unchanged persisted display, or compiling for the first time,
+    // is hydration, not a new edit.
+    if (!prior && (!had_cached_display || sources_match)) return;
+    const double eps = std::max(s.asm_result->tolerance, 1e-9);
+    bool moved = false;
+    if (before.contains("components") && before["components"].is_array()) {
+        for (const json& comp : before["components"]) {
+            auto it = s.asm_result->transforms.find(comp.value("id", std::string()));
+            if (it == s.asm_result->transforms.end()) continue;
+            const auto stored = comp.find("transform");
+            if (stored == comp.end() || !solved_pose_matches(*stored, it->second, eps)) {
+                moved = true;
+                break;
+            }
+        }
+    }
+    // Do not turn solver roundoff into an authored change on a no-op refresh.
+    if (!moved && before.contains("components") && s.doc.contains("components")) {
+        for (json& comp : s.doc["components"])
+            for (const json& old : before["components"])
+                if (old.value("id", std::string()) == comp.value("id", std::string())) {
+                    if (old.contains("transform")) comp["transform"] = old["transform"];
+                    else comp.erase("transform");
+                    break;
+                }
+    }
+    const bool changed = moved || s.doc != before ||
+        (!sources_match && assembly_geometry_changed(prior.get(), *s.asm_result)) ||
+        (!prior && had_cached_display && !sources_match);
+    if (!changed) return;
+    push_undo_document(s, before);
+    ++s.revision;
+    s.dirty = true;
+
+    // Some refresh-producing reads return no revision at all. Queue a full
+    // snapshot for the daemon after the document lock is released.
+    if (t_current_doc_lock && t_current_doc_lock->find_held(s.doc_id) == &s) {
+        bool has_sink;
+        { std::lock_guard<std::mutex> lock(g_cache_refresh_mtx); has_sink = bool(g_cache_refresh_sink); }
+        if (has_sink) {
+            json response = ops_response_assembly(s, json::object(), true, nullptr);
+            response["_refresh_kind"] = "assembly_source_refresh";
+            t_current_doc_lock->defer_refresh(s.doc_id, std::move(response));
+        }
+    }
+}
+
+// Queue dependent assemblies after the originating DocLock has been released.
+// A separate worker per active assembly avoids making either the editing RPC or
+// an unrelated assembly wait for a slow rebuild. Repeated changes coalesce into
+// one pending pass; a change during a rebuild requests one more pass.
+void flush_assembly_source_changes(std::vector<std::string> paths) {
+    std::set<std::string> ids;
+    {
+        std::lock_guard<std::mutex> lock(g_assembly_sources_mtx);
+        for (const auto& path : paths) {
+            const auto found = g_assembly_dependents.find(path);
+            if (found != g_assembly_dependents.end())
+                ids.insert(found->second.begin(), found->second.end());
+        }
+    }
+    if (ids.empty()) return;
+
+    struct RefreshTasks {
+        std::mutex mutex;
+        std::map<std::string, bool> pending;
+        std::vector<std::shared_future<void>> futures;
+        bool stopping = false;
+
+        ~RefreshTasks() {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                stopping = true;
+            }
+            // Join before the registry and source index are destroyed. Workers
+            // may publish further source changes, but admission is now closed.
+            for (auto& future : futures) if (future.valid()) future.wait();
+        }
+
+        void run(const std::string& id) {
+            for (;;) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    auto found = pending.find(id);
+                    if (found == pending.end()) return;
+                    if (stopping || !found->second) {
+                        pending.erase(found);
+                        return;
+                    }
+                    found->second = false;
+                }
+                try {
+                    // No source or scheduler mutex is held while acquiring a
+                    // document. This DocLock also delivers the refresh sink
+                    // after unlocking and queues any nested dependents.
+                    DocLock lock;
+                    Session& s = lock.acquire(id);
+                    if (s.is_assembly()) ensure_assembly_current(s);
+                } catch (const OpError& e) {
+                    if (e.code != "unknown_doc")
+                        std::fprintf(stderr, "assembly source refresh failed: %s\n", e.what());
+                } catch (const std::exception& e) {
+                    std::fprintf(stderr, "assembly source refresh failed: %s\n", e.what());
+                } catch (...) {
+                    std::fprintf(stderr, "assembly source refresh failed\n");
+                }
+            }
+        }
+
+        void enqueue(const std::set<std::string>& ids) {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (stopping) return;
+            for (auto it = futures.begin(); it != futures.end();) {
+                if (it->wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+                    it = futures.erase(it);
+                else ++it;
+            }
+            // Do not risk a blocking future destructor if growing the vector
+            // fails after a worker has already been launched.
+            futures.reserve(futures.size() + ids.size());
+            for (const auto& id : ids) {
+                auto inserted = pending.emplace(id, true);
+                if (!inserted.second) {
+                    inserted.first->second = true;
+                    continue;
+                }
+                // Keep hostd alive through refresh publication, just as for
+                // other background build/verification work.
+                g_cache_verification_active.fetch_add(1, std::memory_order_acq_rel);
+                try {
+                    futures.push_back(tracked_background_task([this, id] {
+                        struct Finish {
+                            ~Finish() { g_cache_verification_active.fetch_sub(1, std::memory_order_acq_rel); }
+                        } finish;
+                        run(id);
+                    }));
+                } catch (...) {
+                    g_cache_verification_active.fetch_sub(1, std::memory_order_acq_rel);
+                    pending.erase(inserted.first);
+                    throw;
+                }
+            }
+        }
+    };
+    static RefreshTasks tasks;
+    tasks.enqueue(ids);
 }
 
 // Is `cid` bound by any mate the solve will actually see? Mirrors compile_assembly's
@@ -4857,6 +8034,52 @@ void invalidate_warm_for_authored_poses(Session& s, const json& doc_after, const
     }
 }
 
+static bool assembly_display_chunk_matches(const AssemblyDisplayChunk& cached,
+                                           const AsmBodyOut& body, const gp_Trsf& world,
+                                           ::geom::DisplayQuality quality) {
+    const AsmBodyOut& old = cached.body;
+    if (cached.quality != quality || old.body_id != body.body_id ||
+        old.name != body.name || !old.shape_local.IsEqual(body.shape_local) ||
+        old.color != body.color || old.metallic != body.metallic ||
+        old.roughness != body.roughness ||
+        old.appearance_regions.size() != body.appearance_regions.size()) return false;
+    for (int row = 1; row <= 3; ++row)
+        for (int col = 1; col <= 4; ++col)
+            if (cached.world.Value(row, col) != world.Value(row, col)) return false;
+    for (std::size_t i = 0; i < body.appearance_regions.size(); ++i) {
+        const auto& a = old.appearance_regions[i];
+        const auto& b = body.appearance_regions[i];
+        if (a.first_face != b.first_face || a.face_count != b.face_count ||
+            !std::equal(std::begin(a.color), std::end(a.color), std::begin(b.color)) ||
+            a.metallic != b.metallic || a.roughness != b.roughness) return false;
+    }
+    return true;
+}
+
+// Factor-1 explode vectors: the doc's authored steps when it has any, else the automatic
+// plan (cached per assembly result — it depends only on the solved geometry).
+std::map<std::string, Eigen::Vector3d> session_explode_vectors(Session& s, bool* automatic = nullptr) {
+    const auto steps = s.doc.find("explode");
+    const bool authored = steps != s.doc.end() && steps->is_array() && !steps->empty();
+    if (automatic) *automatic = !authored;
+    if (authored) return explode_offsets(s.doc, 1.0);
+    if (!s.asm_result) return {};
+    if (s.explode_plan_source.lock() != s.asm_result) {
+        s.explode_plan = auto_explode_vectors(*s.asm_result);
+        s.explode_plan_source = s.asm_result;
+    }
+    return s.explode_plan;
+}
+
+// The explode offsets the display applies right now (empty while collapsed).
+std::map<std::string, Eigen::Vector3d> session_explode_offsets(Session& s) {
+    std::map<std::string, Eigen::Vector3d> offsets;
+    if (!s.explode_active) return offsets;
+    offsets = session_explode_vectors(s);
+    for (auto& [id, v] : offsets) v *= s.explode_factor;
+    return offsets;
+}
+
 // Tessellate each component (world-placed + optional explode offset) as one AICM body
 // and write the AICM (port of session.py::_write_aicm_assembly). Returns (path, bodies-meta).
 // `blob_out` (optional) receives the raw AICM bytes so doc_save can persist them as the
@@ -4877,9 +8100,21 @@ std::pair<std::string, json> write_aicm_assembly(Session& s,
         }
     }
     json bodies_meta = json::array();
-    std::vector<aicm::AicmBody> tesses;
-    std::map<std::string, Eigen::Vector3d> offsets;
-    if (s.explode_active) offsets = explode_offsets(s.doc, s.explode_factor);
+    // Cache only byte ranges into the previous handoff, not a second copy of
+    // every mesh. The complete flat AICM must still be copied for publication.
+    struct PreviousMapping {
+        chudware::aicm_handoff::Mapping value;
+        ~PreviousMapping() { chudware::aicm_handoff::unmap(value); }
+    } previous;
+    std::string map_error;
+    if (!display.path.empty() && !s.asm_display_chunks.empty() &&
+        s.asm_display_chunks_source && display.source.lock() == s.asm_display_chunks_source)
+        chudware::aicm_handoff::map(display.path, previous.value, map_error);
+    std::vector<uint8_t> blob{'A', 'I', 'C', 'M', 1, 0, 0, 0, 0, 0, 0, 0};
+    if (previous.value.size > blob.size()) blob.reserve(previous.value.size);
+    std::uint32_t chunk_count = 0;
+    std::map<std::string, AssemblyDisplayChunk> next_chunks;
+    const std::map<std::string, Eigen::Vector3d> offsets = session_explode_offsets(s);
     const AssemblyResult* ares = s.asm_result.get();
     if (ares) {
         // Local-frame tessellation cache: each component's mesh is computed ONCE per TShape
@@ -4906,14 +8141,17 @@ std::pair<std::string, json> write_aicm_assembly(Session& s,
         static std::uint64_t s_asm_tess_clock = 0;  // protected by s_asm_tess_mtx
         constexpr std::size_t kAsmTessCacheLimit = 128;
         // Caller holds s_asm_tess_mtx. Never discard a placeholder while another
-        // thread may be waiting for its shared future.
+        // thread may be waiting for its shared future. Displayed assemblies pin
+        // their own local meshes independently of this bounded shared LRU.
         auto trim_tess_cache = [&]() {
             for (auto it = s_asm_tess_cache.begin(); it != s_asm_tess_cache.end();) {
                 if (it->second.in_flight) { ++it; continue; }
                 const void* tshape = it->first.first;
-                const auto pins = std::count_if(
-                    s_asm_tess_cache.begin(), s_asm_tess_cache.end(),
-                    [tshape](const auto& entry) { return entry.first.first == tshape; });
+                const auto first = s_asm_tess_cache.lower_bound(
+                    {tshape, std::numeric_limits<int>::min()});
+                const auto last = s_asm_tess_cache.upper_bound(
+                    {tshape, std::numeric_limits<int>::max()});
+                const auto pins = std::distance(first, last);
                 if (it->second.shape.TShape()->GetRefCount() <= pins)
                     it = s_asm_tess_cache.erase(it);
                 else
@@ -4936,54 +8174,85 @@ std::pair<std::string, json> write_aicm_assembly(Session& s,
             auto oit = offsets.find(body.component_id);
             if (oit != offsets.end()) off = oit->second;
             float color[3] = {body.color[0], body.color[1], body.color[2]};
-            const gp_Trsf t = placed_world_trsf(body, off);
+            // Cached tessellation has identity location; nested source placements
+            // live on shape_local and must be restored before the outer placement.
+            const gp_Trsf t = placed_world_trsf(body, off) *
+                              body.shape_local.Location().Transformation();
+            const std::uint32_t body_chunks = body.appearance_regions.empty() ? 4u : 5u;
+            if (chunk_count > std::numeric_limits<std::uint32_t>::max() - body_chunks)
+                throw OpError("io_error", "too many assembly AICM chunks");
+            chunk_count += body_chunks;
+            bodies_meta.push_back({{"body_id", body.body_id}, {"name", body.name},
+                                   {"color", {body.color[0], body.color[1], body.color[2]}},
+                                   {"component", body.component_id},
+                                   {"owner_key", body.component_id},
+                                   {"metallic", body.metallic}, {"roughness", body.roughness}});
+            const std::size_t start = blob.size();
+            const auto cached = s.asm_display_chunks.find(body.component_id);
+            if (previous.value.data && cached != s.asm_display_chunks.end() &&
+                cached->second.offset <= previous.value.size &&
+                cached->second.size <= previous.value.size - cached->second.offset &&
+                assembly_display_chunk_matches(cached->second, body, t, s.display_quality)) {
+                const uint8_t* first = previous.value.data + cached->second.offset;
+                blob.insert(blob.end(), first, first + cached->second.size);
+                next_chunks.emplace(body.component_id, AssemblyDisplayChunk{
+                    body, t, s.display_quality, start, cached->second.size, cached->second.local_mesh});
+                continue;
+            }
             const bool rigid = std::abs(t.ScaleFactor() - 1.0) < 1e-12 && !t.IsNegative();
             aicm::AicmBody bt;
+            std::shared_ptr<const aicm::AicmBody> local_mesh;
             if (rigid) {
-                const AsmTessKey key{body.shape_local.TShape().get(), qkey};
-                std::shared_future<std::shared_ptr<const aicm::AicmBody>> fut;
-                std::shared_ptr<std::promise<std::shared_ptr<const aicm::AicmBody>>> mine;
-                {
-                    std::lock_guard<std::mutex> lk(s_asm_tess_mtx);
-                    auto it = s_asm_tess_cache.find(key);
-                    if (it != s_asm_tess_cache.end()) {
-                        fut = it->second.body;
-                        it->second.last_used = ++s_asm_tess_clock;
-                    } else {
-                        mine = std::make_shared<std::promise<std::shared_ptr<const aicm::AicmBody>>>();
-                        fut = mine->get_future().share();
-                        s_asm_tess_cache.emplace(key, AsmTessEntry{
-                            body.shape_local, fut, ++s_asm_tess_clock, true});
-                        trim_tess_cache();
-                    }
-                }
-                if (mine) {
-                    try {
-                        // Tessellate at IDENTITY location so the mesh is reusable for every
-                        // instance/placement of this component.
-                        const TopoDS_Shape local_shape =
-                            body.shape_local.Located(TopLoc_Location());
-                        const ::geom::DisplayDeflections d =
-                            ::geom::display_deflections(s.display_quality, local_shape);
-                        mine->set_value(std::make_shared<const aicm::AicmBody>(
-                            ::geom::tessellate_body(local_shape, 0, std::string(), color,
-                                                    d.lin, d.ang)));
-                        {
-                            std::lock_guard<std::mutex> lk(s_asm_tess_mtx);
-                            auto it = s_asm_tess_cache.find(key);
-                            if (it != s_asm_tess_cache.end()) it->second.in_flight = false;
+                if (cached != s.asm_display_chunks.end() &&
+                    cached->second.quality == s.display_quality &&
+                    cached->second.body.shape_local.IsPartner(body.shape_local) &&
+                    cached->second.body.shape_local.Orientation() == body.shape_local.Orientation())
+                    local_mesh = cached->second.local_mesh;
+                if (!local_mesh) {
+                    const AsmTessKey key{body.shape_local.TShape().get(), qkey};
+                    std::shared_future<std::shared_ptr<const aicm::AicmBody>> fut;
+                    std::shared_ptr<std::promise<std::shared_ptr<const aicm::AicmBody>>> mine;
+                    {
+                        std::lock_guard<std::mutex> lk(s_asm_tess_mtx);
+                        auto it = s_asm_tess_cache.find(key);
+                        if (it != s_asm_tess_cache.end()) {
+                            fut = it->second.body;
+                            it->second.last_used = ++s_asm_tess_clock;
+                        } else {
+                            mine = std::make_shared<std::promise<std::shared_ptr<const aicm::AicmBody>>>();
+                            fut = mine->get_future().share();
+                            s_asm_tess_cache.emplace(key, AsmTessEntry{
+                                body.shape_local, fut, ++s_asm_tess_clock, true});
                             trim_tess_cache();
                         }
-                    } catch (...) {
-                        mine->set_exception(std::current_exception());
-                        // A failed tessellation is NOT cached — the next caller for this key retries.
-                        std::lock_guard<std::mutex> lk(s_asm_tess_mtx);
-                        s_asm_tess_cache.erase(key);
-                        trim_tess_cache();
                     }
+                    if (mine) {
+                        try {
+                            // Tessellate at identity so every placement can reuse the mesh.
+                            const TopoDS_Shape local_shape =
+                                body.shape_local.Located(TopLoc_Location());
+                            const ::geom::DisplayDeflections d =
+                                ::geom::display_deflections(s.display_quality, local_shape);
+                            mine->set_value(std::make_shared<const aicm::AicmBody>(
+                                ::geom::tessellate_body(local_shape, 0, std::string(), color,
+                                                        d.lin, d.ang)));
+                            {
+                                std::lock_guard<std::mutex> lk(s_asm_tess_mtx);
+                                auto it = s_asm_tess_cache.find(key);
+                                if (it != s_asm_tess_cache.end()) it->second.in_flight = false;
+                                trim_tess_cache();
+                            }
+                        } catch (...) {
+                            mine->set_exception(std::current_exception());
+                            // A failed tessellation is not cached; the next caller retries.
+                            std::lock_guard<std::mutex> lk(s_asm_tess_mtx);
+                            s_asm_tess_cache.erase(key);
+                            trim_tess_cache();
+                        }
+                    }
+                    local_mesh = fut.get();  // rethrows for every waiter
                 }
-                std::shared_ptr<const aicm::AicmBody> local = fut.get();  // rethrows for every waiter
-                bt = *local;  // COW buffers — O(1) until the transform detaches
+                bt = *local_mesh;  // COW buffers — O(1) until the transform detaches
                 bt.body_id = static_cast<uint32_t>(body.body_id);
                 bt.name = body.name;
                 bt.color[0] = color[0]; bt.color[1] = color[1]; bt.color[2] = color[2];
@@ -4999,20 +8268,25 @@ std::pair<std::string, json> write_aicm_assembly(Session& s,
                                              body.metallic, body.roughness);
             }
             bt.appearance_regions = body.appearance_regions;
-            tesses.push_back(std::move(bt));
-            bodies_meta.push_back({{"body_id", body.body_id}, {"name", body.name},
-                                   {"color", {body.color[0], body.color[1], body.color[2]}},
-                                   {"component", body.component_id},
-                                   {"owner_key", body.component_id},
-                                   {"metallic", body.metallic}, {"roughness", body.roughness}});
+            std::vector<aicm::AicmBody> one;
+            one.push_back(std::move(bt));
+            const std::vector<uint8_t> encoded = aicm::write_aicm(one);
+            // The 12-byte header belongs to the assembled stream, not a body.
+            blob.insert(blob.end(), encoded.begin() + 12, encoded.end());
+            next_chunks.emplace(body.component_id, AssemblyDisplayChunk{
+                body, t, s.display_quality, start, blob.size() - start, std::move(local_mesh)});
         }
     }
-    std::vector<uint8_t> blob = aicm::write_aicm(tesses);
+    for (int i = 0; i < 4; ++i)
+        blob[8 + i] = static_cast<uint8_t>((chunk_count >> (8 * i)) & 0xff);
     if (blob_out) *blob_out = blob;
     std::string path = publish_doc_aicm(s.doc_id, s.revision, blob);
-    if (!path.empty() && s.asm_result)
+    if (!path.empty() && s.asm_result) {
         display = {s.asm_result, s.revision, s.display_quality, s.explode_active,
                    s.explode_factor, path, bodies_meta};
+        s.asm_display_chunks = std::move(next_chunks);
+        s.asm_display_chunks_source = s.asm_result;
+    }
     return {path, bodies_meta};
 }
 
@@ -5106,6 +8380,7 @@ json ops_response_assembly(Session& s, const json& id_map, bool with_tess = true
     }
     json response{
         {"revision", s.revision},
+        {"metadata_revision", s.metadata_revision},
         {"id_map", id_map},
         {"tree", s.doc},
         {"rebuild", rebuild},
@@ -5114,11 +8389,18 @@ json ops_response_assembly(Session& s, const json& id_map, bool with_tess = true
     cache_response_fields(s, response);
     if (with_tess) {
         auto [aicm_path, bodies_meta] = write_aicm_assembly(s, aicm_blob_out);
-        response["tess"] = {{"aicm_path", std::move(aicm_path)},
-                            {"bodies", std::move(bodies_meta)}};
+        const bool publication_failed = aicm_path.empty() && !bodies_meta.empty();
+        response["tess"] = {{"bodies", std::move(bodies_meta)}};
+        if (publication_failed) {
+            response["tess"]["mesh_error"] = "aicm_publication_failed";
+            response["mesh_error"] = "aicm_publication_failed";
+        } else {
+            response["tess"]["aicm_path"] = std::move(aicm_path);
+        }
     }
     if (s.cache_trust == "unverified" && s.owns_journal &&
-        !native_policy::recomputing_cache) {
+        !native_policy::recomputing_cache &&
+        asm_fingerprints_match(s.doc, component_source_base(s), s.asm_sources)) {
         schedule_cache_verification(s);
         cache_response_fields(s, response);
     }
@@ -5180,16 +8462,37 @@ void validate_config_edit(const json& working) {
                   {{"reason", "invalid configuration"}, {"errors", errs}});
 }
 
-// Commit a validated config edit: push one undo step, swap in the working doc, bump
-// the revision, recompile, and return the ops-response (session.py::_config_commit;
-// the C++ session always recompiles, so rebuild_needed is moot — same geometry).
+// A part configuration can change the selected fillet dimensions just like an
+// ordinary edit. Keep both history stacks and the live result until its complete
+// candidate compile (including literal stabilization) succeeds.
 json config_commit(Session& s, json&& working) {
-    push_undo(s);
+    if (s.is_assembly()) {
+        push_undo(s);
+        s.doc = std::move(working);
+        s.revision += 1;
+        s.dirty = true;
+        if (s.active_sketch) s.active_sketch->solve_state.reset();
+        CompileResult r = compile_session(s);
+        return warm_and_respond(s, std::move(r), json::object(), /*with_tess=*/true);
+    }
+    json before = std::move(s.doc);
+    const long revision = s.revision;
+    const bool dirty = s.dirty;
     s.doc = std::move(working);
-    s.revision += 1;
+    ++s.revision;
     s.dirty = true;
-    if (s.active_sketch) s.active_sketch->solve_state.reset();  // session.py::_config_commit
     CompileResult r = compile_session(s);
+    if (!r.ok) {
+        json rejected = std::move(s.doc);
+        s.doc = std::move(before);
+        s.revision = revision;
+        s.dirty = dirty;
+        json response = ops_response(s, r, json::object(), true, &ensure_compiled(s));
+        response["rejected_tree"] = std::move(rejected);
+        return response;
+    }
+    push_undo_document(s, before);
+    if (s.active_sketch) s.active_sketch->solve_state.reset();
     return warm_and_respond(s, std::move(r), json::object(), /*with_tess=*/true);
 }
 
@@ -5243,6 +8546,12 @@ std::vector<std::string> touched_sketch_fids(const json& ops, const json& id_map
             continue;
         }
         if (k.rfind("sketch_", 0) != 0) continue;  // not a sketch op
+        // Parametric transforms and dimension edits already define their own
+        // relations. Coincidence at one parameter value is not a permanent
+        // joint: auto-pinning it would block later movement or angle changes.
+        if (k == "sketch_move" || k == "sketch_rotate" ||
+            k == "sketch_pattern_entities" || k == "sketch_set_dim")
+            continue;
         if (!op.contains("sketch")) continue;
         json ref = op["sketch"];
         resolve_placeholders_deep(ref, id_map);
@@ -5309,11 +8618,39 @@ json assembly_transform_op(const json& doc, const json& op, const json& id_map) 
     return {{"op", "asm_edit_component"}, {"id", id}, {"transform", transform}};
 }
 
+// The bar is stored as the last compiled feature, or "start" before every feature.
+json rollback_suffix(const json& doc) {
+    if (!doc.contains("rollback_after") || !doc["rollback_after"].is_string() ||
+        !doc.contains("features") || !doc["features"].is_array()) return nullptr;
+    const std::string after = doc["rollback_after"].get<std::string>();
+    json hidden = json::array();
+    bool past_bar = after == "start";
+    for (const auto& feature : doc["features"]) {
+        if (!feature.is_object()) continue;
+        const std::string id = feature.value("id", std::string());
+        if (past_bar) hidden.push_back(id);
+        if (id == after) past_bar = true;
+    }
+    if (!past_bar || hidden.empty()) return nullptr;
+    return {{"after", after}, {"hidden_features", std::move(hidden)}};
+}
+
+std::string rollback_save_warning(const json& rollback) {
+    std::string ids;
+    for (const auto& id : rollback["hidden_features"]) {
+        if (!ids.empty()) ids += ", ";
+        ids += id.get<std::string>();
+    }
+    return "WARNING: saved with the rollback bar after " +
+        rollback["after"].get<std::string>() + "; these features were not built: " + ids +
+        ". Repair them and roll to the end before delivering the completed part.";
+}
+
 
 // Apply an op batch to a session that the caller already holds g_mtx for (the shared
 // transactional core of doc_apply_ops; doc_import_file reuses it).
 json apply_ops_locked(Session& s, long base_revision, const json& input_ops, bool coalesce,
-                      bool with_tess = true) {
+                      bool with_tess = true, bool reject_unknown = false) {
     if (base_revision >= 0 && base_revision != s.revision)
         throw OpError("stale_revision",
                       "base_revision " + std::to_string(base_revision) + " != current " +
@@ -5327,8 +8664,15 @@ json apply_ops_locked(Session& s, long base_revision, const json& input_ops, boo
     json working = s.doc;
     if (s.is_assembly()) bind_assembly_reference_frames(working);
     json id_map = json::object();
+    json conversion_reports = json::array();
+    json op_reports = json::array();
     IdGen gen(working);
     std::vector<FaceAppearanceChange> face_changes;
+    std::unique_ptr<HistoryLiveGuard> history_guard;
+    std::unordered_set<std::string> removed_history_tokens;
+    bool only_history_ops = !ops.empty();
+    bool history_or_readonly = true;
+    bool saw_history_op = false;
     auto is_delete = [](const json& op) {
         return op.is_object() && op.value("op", std::string()) == "delete_feature";
     };
@@ -5338,6 +8682,16 @@ json apply_ops_locked(Session& s, long base_revision, const json& input_ops, boo
         ~ApplyContext() { apply_session = previous; }
     } apply_context(s);
     for (std::size_t i = 0; i < ops.size(); ++i) {
+        if (ops[i].is_object() && ops[i].value("op", std::string()) == "simplify_history") {
+            saw_history_op = true;
+            if (s.is_assembly())
+                throw OpError("invalid_op", "simplify_history requires a part document");
+            history_apply_cleanup(s, working, ops[i], id_map, history_guard, removed_history_tokens);
+            continue;
+        }
+        only_history_ops = false;
+        if (!ops[i].is_object() || ops[i].value("op", std::string()) != "copy_feature")
+            history_or_readonly = false;
         if (!s.is_assembly() && is_delete(ops[i])) {
             // A run of delete_feature ops removes one SET of features: delete each feature
             // before the features it references (reverse tree order), so a batch naming a
@@ -5356,7 +8710,8 @@ json apply_ops_locked(Session& s, long base_revision, const json& input_ops, boo
             for (std::size_t k = i; k < end; ++k) order.emplace_back(tree_pos(k), k);
             std::stable_sort(order.begin(), order.end(),
                              [](const auto& a, const auto& b) { return a.first > b.first; });
-            for (const auto& [pos, k] : order) apply_one(working, ops[k], k, gen, id_map);
+            for (const auto& [pos, k] : order)
+                apply_one(working, ops[k], k, gen, id_map, nullptr, nullptr, reject_unknown);
             i = end - 1;
             continue;
         }
@@ -5365,7 +8720,25 @@ json apply_ops_locked(Session& s, long base_revision, const json& input_ops, boo
             ops[i].contains("faces"))
             face_changes.push_back(parse_face_appearance_change(working, ops[i]));
         else
-            apply_one(working, ops[i], i, gen, id_map);
+            apply_one(working, ops[i], i, gen, id_map, &conversion_reports, &op_reports, reject_unknown);
+    }
+    // A no-op cleanup must not refresh the tree, dirty it, advance the revision,
+    // or add an undo entry. Other operations retain their existing semantics.
+    if (saw_history_op && history_or_readonly && removed_history_tokens.empty()) {
+        history_guard.reset();
+        return ops_response(s, ensure_compiled(s), id_map, with_tess);
+    }
+    // Copy validates its own operands in apply_one. Unrelated invalid history must
+    // not prevent a read-only bundle or alter the document's revision and undo state.
+    if (is_readonly_batch(ops)) {
+        if (s.is_assembly()) {
+            // The public entry point already refreshes live assemblies. Scratch
+            // callers may still need hydration, but never force a second solve
+            // that could rewrite authored poses during a read-only operation.
+            ensure_assembly_current(s);
+            return ops_response_assembly(s, id_map, with_tess);
+        }
+        return ops_response(s, ensure_compiled(s), id_map, with_tess);
     }
     // File references are authored state: reject them before committing the candidate,
     // not merely as failed component/feature statuses after the revision has changed.
@@ -5407,14 +8780,55 @@ json apply_ops_locked(Session& s, long base_revision, const json& input_ops, boo
             maybe_auto_constrain(working, sk_fids, gen, touched_entity_ids(ops, id_map));
         }
     }
+    // Record the batch's own feature edits before external-ref refresh alters
+    // downstream caches. An auto rollback may never hide an authored feature.
+    std::unordered_set<std::string> authored_features;
+    std::unordered_map<std::string, const json*> original_features;
+    bool rollback_policy_ops = true;
+    bool moved_bar = false;
+    if (!s.is_assembly() && s.doc.contains("features") && s.doc["features"].is_array() &&
+        working.contains("features") && working["features"].is_array()) {
+        for (const auto& feature : s.doc["features"])
+            if (feature.is_object())
+                original_features.emplace(feature.value("id", std::string()), &feature);
+        for (const auto& feature : working["features"]) {
+            if (!feature.is_object()) continue;
+            const std::string id = feature.value("id", std::string());
+            const auto old = original_features.find(id);
+            if (old == original_features.end() || *old->second != feature)
+                authored_features.insert(id);
+        }
+        for (const auto& op : ops) {
+            if (!op.is_object()) { rollback_policy_ops = false; continue; }
+            const std::string kind = op.value("op", std::string());
+            if (kind == "set_rollback") moved_bar = true;
+            else if (kind == "edit_feature" || kind == "set_suppressed" ||
+                     kind == "reorder_feature") {
+                json target = op.value("id", json());
+                resolve_placeholders_deep(target, id_map);
+                if (target.is_string()) authored_features.insert(target.get<std::string>());
+                else rollback_policy_ops = false;
+            } else if (kind != "add_feature" && kind != "paste_feature" &&
+                       kind != "paste_feature_as_derived" && kind != "rename" &&
+                       kind != "set_folder" && kind != "copy_feature" &&
+                       kind.rfind("sketch_", 0) != 0) {
+                // Global and destructive operations lack a single history position.
+                rollback_policy_ops = false;
+            }
+        }
+        for (const auto& id : touched_sketch_fids(ops, id_map)) authored_features.insert(id);
+    } else {
+        rollback_policy_ops = false;
+    }
 
     // Associative Convert Entities — after the batch mutated the tree (an upstream
     // dim edit, a feature delete, a new boss...), re-resolve + re-project every sketch's
     // external_refs against the post-batch model so converted geometry follows its source.
     // Never blocks the edit: a total failure here leaves the last-good projected entities
     // in place (per-ref failures are already absorbed inside as stale marks). Skipped for
-    // read-only batches (they leave the doc untouched and return early below).
-    if (!is_readonly_batch(ops)) {
+    // read-only batches and cleanup-only batches. Cleanup has proven that removed
+    // IDs are unreferenced and must not rewrite unrelated projection snapshots.
+    if (!is_readonly_batch(ops) && !only_history_ops) {
         // Thread the session's incremental-rebuild cache through the refresh compiles:
         // `working` is THIS doc's tree (s.doc + this batch), and the cache is
         // content-addressed, so the unchanged feature prefix restores from checkpoints
@@ -5428,7 +8842,7 @@ json apply_ops_locked(Session& s, long base_revision, const json& input_ops, boo
         } catch (...) { /* keep last-good ground points */ }
     }
 
-    std::vector<std::string> errs = validate_document(working);
+    std::vector<std::string> errs = validate_document(working, reject_unknown);
     if (!errs.empty()) {
         std::string joined;
         for (std::size_t i = 0; i < errs.size() && i < 5; ++i) {
@@ -5505,6 +8919,13 @@ json apply_ops_locked(Session& s, long base_revision, const json& input_ops, boo
             records[record_id] = {{"selector", *selected}, {"appearance", change.appearance}};
         }
     }
+    if (!removed_history_tokens.empty()) {
+        const HistoryRefs remaining = history_references(working, removed_history_tokens);
+        for (const auto& [token, count] : remaining)
+            if (count)
+                throw OpError("invalid_op", "simplify_history: a later operation references a removed feature",
+                              {{"reason", "new_dependency"}, {"feature", token}});
+    }
 
     const json pose_transport = transport_carried_poses(s, working, ops);
     // The batch is validated and will be applied: drop the warm-start entry of every
@@ -5514,22 +8935,18 @@ json apply_ops_locked(Session& s, long base_revision, const json& input_ops, boo
     // doc, so a `fixed` promotion or a mate added in this same batch is already visible.
     invalidate_warm_for_authored_poses(s, working, ops);
 
-    // Read-only fast-path: a batch of only read-only ops (copy_feature) makes no document
-    // change — it only returns its result through id_map ($bundle). Skip the undo snapshot,
-    // the revision bump, and the dirty flag; the live doc is left untouched (session.py).
-    if (is_readonly_batch(ops)) {
-        if (s.is_assembly()) {
-            rebuild_assembly(s);
-            return ops_response_assembly(s, id_map, with_tess);
-        }
-        CompileResult r = compile_session(s);
-        return ops_response(s, r, id_map, with_tess);
-    }
 
     // Compile against the candidate as the live document, but keep sole ownership of
     // the pre-edit tree for rollback and the eventual undo entry. History remains
     // untouched until the candidate compiles successfully, so a rejection needs no
     // speculative undo/redo vector copies or journal cleanup.
+    std::unique_lock<std::mutex> history_registry_lock(g_registry_mtx, std::defer_lock);
+    if (!removed_history_tokens.empty() && history_guard) {
+        history_registry_lock.lock();
+        if (!history_guard->registry_unchanged_locked() || history_registered_consumer_locked(s.doc_id))
+            throw OpError("invalid_op", "simplify_history: external consumers changed during validation",
+                          {{"reason", "external_consumers_changed"}});
+    }
     json rollback_doc = std::move(s.doc);
     const long rollback_revision = s.revision;
     const bool rollback_dirty = s.dirty;
@@ -5537,6 +8954,7 @@ json apply_ops_locked(Session& s, long base_revision, const json& input_ops, boo
     s.doc = std::move(working);
     s.revision += 1;
     s.dirty = true;
+    if (history_registry_lock.owns_lock()) history_registry_lock.unlock();
     if (s.is_assembly()) {
         rebuild_assembly(s);
         if (!coalesce) push_undo_document(s, rollback_doc);
@@ -5545,6 +8963,153 @@ json apply_ops_locked(Session& s, long base_revision, const json& input_ops, boo
         return response;
     }
     CompileResult r = compile_session(s);
+    // An edit behind an existing bar must not silently persist an invalid
+    // authored feature. Probe the full candidate, while keeping the bar in
+    // place, and reject only if one of this batch's features fails there.
+    bool authored_hidden = false;
+    for (const auto& status : r.statuses)
+        if (status.rolled_back && authored_features.count(status.id)) authored_hidden = true;
+    if (r.ok && authored_hidden) {
+        try {
+            json full_history = s.doc;
+            full_history.erase("rollback_after");
+            CompileResult probe = compile_document(
+                full_history, env_from_doc(full_history),
+                inc_rebuild_enabled() ? s.compile_cache.get() : nullptr, s.display_quality);
+            for (const auto& status : probe.statuses)
+                if (authored_features.count(status.id) && (!status.ok || status.rolled_back)) {
+                    r = std::move(probe);
+                    break;
+                }
+        } catch (const std::exception& e) {
+            r.ok = false;
+            for (auto& status : r.statuses)
+                if (status.rolled_back && authored_features.count(status.id)) {
+                    status.ok = false;
+                    status.error = std::string("could not validate rolled-back feature: ") + e.what();
+                    break;
+                }
+        }
+    }
+    json auto_rollback;
+    if (!r.ok && rollback_policy_ops && !s.doc["features"].empty()) {
+        const auto& features = s.doc["features"];
+        std::size_t first_failure = features.size();
+        for (std::size_t i = 0; i < r.statuses.size() && i < features.size(); ++i) {
+            if (!r.statuses[i].ok) { first_failure = i; break; }
+        }
+        bool eligible = first_failure < features.size() &&
+            original_features.count(features[first_failure].value("id", std::string())) &&
+            (!authored_features.empty() || moved_bar);
+        // A damaged document may be repaired incrementally. Accept a partial
+        // repair only if at least one previously failing feature now builds
+        // and no previously built (or unverified) feature newly fails.
+        bool partial_repair = false;
+        if (eligible) {
+            std::optional<CompileResult> recomputed;
+            const CompileResult* baseline = nullptr;
+            if (s.compiled && s.compiled_rev == rollback_revision && s.cache_trust != "unverified")
+                baseline = s.compiled.get();
+            else {
+                try {
+                    recomputed.emplace(compile_document(
+                        rollback_doc, env_from_doc(rollback_doc),
+                        inc_rebuild_enabled() ? s.compile_cache.get() : nullptr, s.display_quality));
+                    baseline = &*recomputed;
+                } catch (...) {}
+            }
+            // If a repair is behind an earlier failure, the saved prefix does
+            // not say whether it was broken before. Compare the old full tree
+            // only in that case; otherwise ordinary edits use the cached prefix.
+            bool authored_past_failure = false;
+            for (std::size_t i = first_failure; i < features.size(); ++i)
+                if (authored_features.count(features[i].value("id", std::string())))
+                    authored_past_failure = true;
+            if (baseline && baseline->ok && authored_past_failure &&
+                rollback_doc.contains("rollback_after") && rollback_doc["rollback_after"].is_string()) {
+                try {
+                    json full_history = rollback_doc;
+                    full_history.erase("rollback_after");
+                    recomputed.emplace(compile_document(
+                        full_history, env_from_doc(full_history),
+                        inc_rebuild_enabled() ? s.compile_cache.get() : nullptr, s.display_quality));
+                    baseline = &*recomputed;
+                } catch (...) { baseline = nullptr; }
+            }
+            if (!baseline) eligible = false;
+            else if (!baseline->ok) {
+                std::unordered_map<std::string, const FeatureStatus*> previous;
+                for (const auto& status : baseline->statuses) previous[status.id] = &status;
+                bool repaired = false, new_failure = false;
+                for (const auto& status : r.statuses) {
+                    if (status.rolled_back) continue;
+                    const auto old = previous.find(status.id);
+                    if (!status.ok) {
+                        if (old == previous.end() || old->second->ok || old->second->rolled_back)
+                            new_failure = true;
+                    } else if (old != previous.end() && !old->second->ok &&
+                               !old->second->rolled_back) {
+                        repaired = true;
+                    }
+                }
+                partial_repair = repaired && !new_failure;
+                eligible = partial_repair;
+            }
+        }
+        // Every added/edited/reordered feature must actually have built. For a
+        // newly broken history it must also precede the failure, so the working
+        // prefix includes the edit. Partial repairs may fix a later independent
+        // feature, which stays authored but unbuilt behind the earlier failure.
+        for (std::size_t i = 0; eligible && i < features.size(); ++i) {
+            const std::string id = features[i].value("id", std::string());
+            if (authored_features.count(id) &&
+                (i >= r.statuses.size() || !r.statuses[i].ok || r.statuses[i].rolled_back ||
+                 (!partial_repair && i >= first_failure)))
+                eligible = false;
+        }
+        // Rolling forward alone may retry an already-hidden feature, but must
+        // not paper over a failure in the previously compiled prefix.
+        if (eligible && authored_features.empty()) {
+            eligible = false;
+            if (rollback_doc.contains("rollback_after") && rollback_doc["rollback_after"].is_string()) {
+                const std::string previous = rollback_doc["rollback_after"].get<std::string>();
+                if (previous == "start") eligible = true;
+                for (std::size_t i = 0; i < first_failure; ++i)
+                    if (features[i].value("id", std::string()) == previous) eligible = true;
+            }
+        }
+        if (eligible) {
+            json broken = json::array();
+            for (std::size_t i = first_failure; i < r.statuses.size() && i < features.size(); ++i) {
+                const auto& status = r.statuses[i];
+                if (!status.ok)
+                    broken.push_back({{"id", status.id}, {"name", features[i].value("name", std::string())},
+                                      {"type", status.type}, {"error", status.error}});
+            }
+            const std::string after = first_failure == 0 ? "start"
+                : features[first_failure - 1].value("id", std::string());
+            const json previous_bar = s.doc.value("rollback_after", json());
+            // External-ref refresh can update later features. Preserve the
+            // untouched suffix while retaining any explicitly repaired feature.
+            for (std::size_t i = first_failure; i < features.size(); ++i) {
+                const std::string id = s.doc["features"][i].value("id", std::string());
+                const auto old = original_features.find(id);
+                if (old != original_features.end() && !authored_features.count(id))
+                    s.doc["features"][i] = *old->second;
+            }
+            s.doc["rollback_after"] = after;
+            CompileResult failed = std::move(r);
+            r = compile_session(s);
+            if (r.ok) {
+                auto_rollback = rollback_suffix(s.doc);
+                auto_rollback["broken"] = std::move(broken);
+            } else {
+                if (previous_bar.is_null()) s.doc.erase("rollback_after");
+                else s.doc["rollback_after"] = previous_bar;
+                r = std::move(failed);
+            }
+        }
+    }
     if (!r.ok) {
         // `r` retains the rejected tree's feature failures for the in-band response;
         // restore the live document by move and leave both history stacks untouched.
@@ -5552,15 +9117,30 @@ json apply_ops_locked(Session& s, long base_revision, const json& input_ops, boo
         s.doc = std::move(rollback_doc);
         s.revision = rollback_revision;
         s.dirty = rollback_dirty;
+        history_guard.reset();
         // Diagnostics describe the rejected candidate; display data must describe
         // the restored document. Never overwrite its revision key with rejected AICM.
-        json response = ops_response(s, r, id_map, with_tess,
-                                     with_tess ? &ensure_compiled(s) : nullptr);
+        json response = ops_response(s, r, json::object(), with_tess, &ensure_compiled(s));
         response["rejected_tree"] = std::move(rejected_tree);
         return response;
     }
-    if (!coalesce) push_undo_document(s, rollback_doc);
-    return warm_and_respond(s, std::move(r), id_map, with_tess);
+    if (!coalesce || !removed_history_tokens.empty()) push_undo_document(s, rollback_doc);
+    history_guard.reset();
+    json response = warm_and_respond(s, std::move(r), id_map, with_tess);
+    if (!auto_rollback.is_null()) {
+        response["auto_rollback"] = std::move(auto_rollback);
+        const auto& first = response["auto_rollback"]["broken"][0];
+        response["warning"] =
+            "WARNING: the edit was kept, but " + first["id"].get<std::string>() +
+            " (" + first["name"].get<std::string>() + ") failed: " +
+            first["error"].get<std::string>() + ". The rollback bar is after " +
+            response["auto_rollback"]["after"].get<std::string>() +
+            "; repair the listed features, then set_rollback after null to rebuild "
+            "the complete history.";
+    }
+    if (!conversion_reports.empty()) response["scad_conversions"] = std::move(conversion_reports);
+    if (!op_reports.empty()) response["op_reports"] = std::move(op_reports);
+    return response;
 }
 
 // Create + register a blank part session. Inserts under the registry lock, then
@@ -5569,6 +9149,7 @@ Session& new_part_session_locked(const std::string& name) {
     auto s = std::make_shared<Session>();
     s->doc_id = new_doc_id();
     s->doc = blank_part(s->doc_id, name);
+    s->history_private_origin = true;
     s->revision = 0;
     const std::string id = s->doc_id;
     s->refresh_summary();  // initialize before the session becomes visible
@@ -5611,13 +9192,8 @@ json sketch_params(const json& feat) {
     return p;
 }
 
-// session.py::_resolve_sketch_plane — resolve refs.plane to a SketchPlane. Reserved
-// datums ("plane.top/front/right" or bare "top/front/right") map to the factory
-// frames; a plane-FEATURE id (offset/midplane/angle/etc.) is resolved by recompiling
-// the doc and reading that feature's resolved plane out of CompileResult.datums (which
-// now surfaces per-feature plane geometry — origin + x_dir/y_dir/normal). Only the
-// reserved factory frames are tried first; an unknown ref falls back to TOP. Throws on
-// no plane ref.
+// Resolve a plane against the compile at the sketch's position in history.
+// Never replace a missing or unresolvable reference with the world-top plane.
 static chudware::geom::SketchPlane resolve_sketch_plane_base(const json& doc, const json& feat,
                                                              const CompileResult* pre) {
     json plane_ref;
@@ -5667,62 +9243,34 @@ static chudware::geom::SketchPlane resolve_sketch_plane_base(const json& doc, co
             }
         }
     }
-    // Face-selector ref (kind == "face"): the sketch lives ON a model face, not a datum.
-    // Mirror the modeling path (document.cpp plane_of -> face_plane(resolve_face_sel(...)))
-    // so the live overlay lands on the picked face: recompile, resolve the face off the
-    // last surviving body, and return its actual plane (area-centroid origin +
-    // orientation-aware normal). Without this branch a face-sketch falls to
-    // SketchPlane::top() (origin at the world origin) and draws on the parallel base plane
-    // through the origin — the reported bug. Any failure falls through to top() (below).
-    if (plane_ref.is_object() && plane_ref.value("kind", std::string()) == "face") {
-        try {
-            const CompileResult& r = *pre;
-            if (!r.shapes.empty()) {
-                const TopoDS_Shape& body = r.shapes.back();
-                TopoDS_Face face;
-                // Primary: re-express the resolved make_selector as a centroid-near query so
-                // its UNIQUE centroid singles out one face even among symmetric duplicates —
-                // the same strategy eval_resolve_ref uses for a resolved face/edge selector.
-                const json& c = plane_ref.contains("centroid") ? plane_ref.at("centroid") : json();
-                if (c.is_array() && c.size() == 3 && c[0].is_number() && c[1].is_number() &&
-                    c[2].is_number()) {
-                    chudware::doc::QueryPicks qp = chudware::doc::resolve_geom_query(
-                        body, json{{"of", std::string("face")}, {"near", c}, {"count", 1}});
-                    if (qp.error.empty() && !qp.faces.empty()) face = qp.faces.front();
-                }
-                // Fallback: describe_faces + resolve for a selector with no centroid
-                // (eval_resolve_ref's legacy path).
-                if (face.IsNull()) {
-                    std::vector<TopoInfo> infos = describe_faces(body);
-                    ResolveResult rr = resolve(plane_ref, infos, bbox_diag(body));
-                    if (rr.index.has_value()) {
-                        int idx = 0;
-                        for (TopExp_Explorer ex(body, TopAbs_FACE); ex.More(); ex.Next(), ++idx)
-                            if (idx == *rr.index) { face = TopoDS::Face(ex.Current()); break; }
-                    }
-                }
-                if (!face.IsNull()) {
-                    BRepAdaptor_Surface ad(face);
-                    if (ad.GetType() == GeomAbs_Plane) {
-                        // origin (area centroid) + outward normal — mirrors face_plane()
-                        // in document.cpp (du×dv, orientation-aware); geom/face_normal.h
-                        // also honours left-handed plane frames (revolve end faces).
-                        const gp_Dir nd = ::chudware::geom::plane_outward_normal(face, ad.Plane());
-                        GProp_GProps props;
-                        BRepGProp::SurfaceProperties(face, props);
-                        gp_Pnt cm = props.CentreOfMass();
-                        return chudware::geom::SketchPlane::from(
-                            Eigen::Vector3d(cm.X(), cm.Y(), cm.Z()),
-                            Eigen::Vector3d(nd.X(), nd.Y(), nd.Z()));
-                    }
-                }
-            }
-        } catch (...) {
-            // Resolution failure (non-planar face, empty compile, stale selector) falls
-            // through to the existing SketchPlane::top() fallback — behaviour unchanged.
+    // Queries and fingerprint selectors use the compiler's face-pick path.
+    if (plane_ref.is_object() && pre && !pre->shapes.empty()) {
+        const TopoDS_Shape& body = pre->shapes.back();
+        TopoDS_Face face;
+        if (chudware::doc::is_geom_query(plane_ref)) {
+            const auto picks = chudware::doc::resolve_geom_query(body, plane_ref);
+            if (!picks.error.empty())
+                throw OpError("sketch_plane_unavailable", "sketch plane: " + picks.error);
+            if (!picks.faces.empty()) face = picks.faces.front();
+        } else {
+            const auto picks = chudware::doc::resolve_face_picks(body, plane_ref, "sketch plane");
+            if (!picks.faces.empty()) face = picks.faces.front();
+        }
+        if (!face.IsNull()) {
+            BRepAdaptor_Surface ad(face);
+            if (ad.GetType() != GeomAbs_Plane)
+                throw OpError("sketch_plane_unavailable", "sketch plane face is not planar");
+            const gp_Dir nd = ::chudware::geom::plane_outward_normal(face, ad.Plane());
+            GProp_GProps props;
+            BRepGProp::SurfaceProperties(face, props);
+            const gp_Pnt cm = props.CentreOfMass();
+            return chudware::geom::SketchPlane::from(
+                Eigen::Vector3d(cm.X(), cm.Y(), cm.Z()),
+                Eigen::Vector3d(nd.X(), nd.Y(), nd.Z()));
         }
     }
-    return chudware::geom::SketchPlane::top();
+    throw OpError("sketch_plane_unavailable", "sketch plane could not be resolved",
+                  {{"plane", plane_ref}});
 }
 
 // The sketch's optional `offset` (params.offset, or a top-level offset), evaluated against
@@ -5801,7 +9349,8 @@ std::vector<double> plane_frame(const chudware::geom::SketchPlane& p) {
 // session.py::_DIM_TYPES — a redundant DRIVING dim over-defines; geometric relations
 // don't (see _redundant_overdefines for the SW-parity rationale).
 bool is_dim_type(const std::string& t) {
-    return t == "distance" || t == "angle" || t == "radius" || t == "diameter" || t == "length";
+    return t == "distance" || t == "angle" || t == "radius" || t == "diameter" || t == "length" ||
+           t == "arc_length" || t == "rotate_point" || t == "signed_distance";
 }
 
 // session.py::_redundant_overdefines — true iff the redundant set contains a redundant
@@ -5813,7 +9362,7 @@ bool redundant_overdefines(const std::vector<std::string>& redundant,
         if (!constraints_by_id.contains(cid)) continue;
         const json& c = constraints_by_id[cid];
         if (c.is_object() && is_dim_type(c.value("type", std::string())) &&
-            !c.value("driven", false))
+            !c.value("driven", false) && !c.contains("angle_ref"))
             return true;
     }
     return false;
@@ -5865,6 +9414,8 @@ json sketch_constraints(const json& feat, const json& entity_coords) {
         rec["value"] = val_obj && val_obj->contains("value") ? (*val_obj)["value"] : json(nullptr);
         rec["expr"] = val_obj && val_obj->contains("expr") ? (*val_obj)["expr"] : json(nullptr);
         rec["driven"] = c.value("driven", false);
+        if (c.contains("auto")) rec["auto"] = c["auto"];
+        if (c.contains("angle_ref")) rec["angle_ref"] = c["angle_ref"];
         rec["placement"] = c.contains("placement") ? c["placement"] : json(nullptr);
         rec["measured"] = nullptr;
         if (c.contains("axis") && c["axis"].is_string() && !c["axis"].get<std::string>().empty())
@@ -6011,6 +9562,24 @@ json sketch_result(const json& feat, const SolveActive& packed,
 }
 
 }  // namespace
+
+std::shared_ptr<const AssemblyLiveSource> assembly_live_source(const std::string& canonical_path) {
+    return find_assembly_live_source(canonical_path);
+}
+
+std::shared_ptr<const AssemblyLiveSources> assembly_live_sources() {
+    std::lock_guard<std::mutex> lock(g_assembly_sources_mtx);
+    if (g_assembly_source_snapshot) return g_assembly_source_snapshot;
+    auto sources = std::make_shared<AssemblyLiveSources>();
+    for (const auto& [path, entries] : g_assembly_sources) {
+        const LiveSourceEntry* latest = nullptr;
+        for (const auto& [id, entry] : entries)
+            if (!latest || entry.sequence > latest->sequence) latest = &entry;
+        if (latest) sources->emplace(path, latest->source);
+    }
+    g_assembly_source_snapshot = sources;
+    return sources;
+}
 
 // ----------------------------------------------------------------- crash recovery
 // Drop orphaned per-doc mutexes left held by THIS thread after a Windows structured
@@ -6269,10 +9838,31 @@ json doc_new(const std::string& kind, const std::string& name, bool resume_if_op
 }
 
 json doc_apply_ops(const std::string& doc_id, long base_revision, const json& ops, bool coalesce,
-                   bool with_tess) {
+                   bool with_tess, bool reject_unknown) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    return apply_ops_locked(s, base_revision, ops, coalesce, with_tess);
+    if (s.is_assembly()) ensure_assembly_current(s);
+    return apply_ops_locked(s, base_revision, ops, coalesce, with_tess, reject_unknown);
+}
+
+json doc_eval_model_history(const std::string& doc_id, const json& params) {
+    if (!params.is_object())
+        throw OpError("invalid_op", "eval_model_history: params must be an object");
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    std::unique_ptr<HistoryLiveGuard> guard;
+    return history_preview(s, s.doc, guard).report;
+}
+
+void doc_mark_history_published(const std::string& doc_id) {
+    // Pin before taking the document lock, just as other registry readers do.
+    // A close between the pin and the lock leaves no live private source.
+    const auto session = pin_session(doc_id);
+    if (!session) return;
+    std::lock_guard<std::mutex> doc(session->mtx);
+    if (session->doc.is_object() && session->doc.contains("schema") &&
+        session->doc["schema"] == "aicad.part/1")
+        session->history_private_origin = false;
 }
 
 // Scratch callers share frozen compilation payloads, never mutable session ownership.
@@ -6281,7 +9871,22 @@ static void seed_cached_scratch(Session& scratch, const Session& live) {
     scratch.doc = live.doc;
     scratch.revision = live.revision;
     scratch.path = live.path;
+    scratch.history_private_origin = live.history_private_origin;
+    scratch.native_source_path = live.native_source_path;
+    scratch.source_doc_hash = live.source_doc_hash;
+    scratch.unverified_source_doc = live.unverified_source_doc;
+    scratch.unverified_materialized_hash = live.unverified_materialized_hash;
+    scratch.unverified_source_was_dirty = live.unverified_source_was_dirty;
+    scratch.recovery_sources = live.recovery_sources;
+    scratch.recovery_sources_verified = live.recovery_sources_verified;
+    scratch.asm_source_versions = live.asm_source_versions;
+    scratch.cache_trust = live.cache_trust;
+    scratch.last_good_body_metadata = live.last_good_body_metadata;
+    scratch.last_good_display = live.last_good_display;
     scratch.project_dir = live.project_dir;
+    scratch.scad_cache_identity = live.scad_cache_identity;
+    scratch.mesh_ref_cached_sha = live.mesh_ref_cached_sha;
+    scratch.mesh_ref_cached = live.mesh_ref_cached;
     scratch.display_quality = live.display_quality;
     scratch.active_sketch = live.active_sketch;
     if (scratch.active_sketch) {
@@ -6347,18 +9952,22 @@ static void rebase_component_paths(json& doc, const std::filesystem::path& old_b
 static json dry_run_scratch(Session& scratch, const json& ops) {
     const long source_revision = scratch.revision;
     try {
-        // apply_ops_locked THROWS on a structural/validation rejection (caught below) but
-        // RETURNS an in-band rejection on a compile failure (per the batch-atomicity contract:
-        // the doomed batch is restored, then its per-feature failure is surfaced in
-        // rebuild.feature_status). The dry-run gate must report {ok:false} for BOTH, so we
-        // inspect the returned feature_status for any ok:false and compose the same error
-        // string shape (the failing features' messages joined) the throw path produces.
+        // Structural failures throw. Part compile rejections return an explicit
+        // rejected_tree; an accepted read-only operation can instead carry failed
+        // statuses from the existing history. Assemblies still report candidate
+        // failures through their status rows rather than rejected_tree.
         json resp = apply_ops_locked(scratch, -1, ops, /*coalesce=*/true,
-                                     /*with_tess=*/false);
+                                     /*with_tess=*/false, /*reject_unknown=*/true);
         json result = {{"ok", true}, {"source_revision", source_revision},
                        {"rebuild", resp.at("rebuild")}};
+        if (resp.contains("auto_rollback")) {
+            result["auto_rollback"] = resp["auto_rollback"];
+            result["warning"] = resp["warning"];
+        }
+        const bool rejected = resp.contains("rejected_tree") && !resp["rejected_tree"].is_null();
+        const bool inspect_failures = rejected || (scratch.is_assembly() && !is_readonly_batch(ops));
         std::vector<std::string> feat_errs;
-        if (resp.contains("rebuild") && resp["rebuild"].is_object() &&
+        if (inspect_failures && resp.contains("rebuild") && resp["rebuild"].is_object() &&
             resp["rebuild"].contains("feature_status") &&
             resp["rebuild"]["feature_status"].is_array())
             for (const json& st : resp["rebuild"]["feature_status"])
@@ -6368,14 +9977,14 @@ static json dry_run_scratch(Session& scratch, const json& ops) {
                                            : std::string("feature compile failed");
                     feat_errs.push_back(st.value("id", std::string()) + ": " + emsg);
                 }
-        if (!feat_errs.empty()) {
+        if (rejected || !feat_errs.empty()) {
             std::string joined;
             for (std::size_t i = 0; i < feat_errs.size() && i < 5; ++i) {
                 if (i) joined += "; ";
                 joined += feat_errs[i];
             }
             result["ok"] = false;
-            result["error"] = "op batch rejected: " + joined;
+            result["error"] = joined.empty() ? "op batch rejected" : "op batch rejected: " + joined;
         }
         return result;
     } catch (const OpError& e) {
@@ -6434,13 +10043,75 @@ json doc_dry_run_ops(const std::string& doc_id, const json& ops, int budget_ms) 
                                         "isolated native preflight failed without geometry diagnostics"}};
 }
 
+static bool is_mesh_ref_member(const std::string& name) {
+    constexpr const char* prefix = "mesh_references/";
+    constexpr std::size_t prefix_size = 16;
+    return name.size() == prefix_size + 64 + 4 && name.rfind(prefix, 0) == 0 &&
+           name.compare(name.size()-4, 4, ".bin") == 0 &&
+           std::all_of(name.begin()+prefix_size, name.begin()+prefix_size+64, [](char c) {
+               return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+           });
+}
+
+// Payloads needed by undo/redo or a PM checkpoint must survive removal and
+// save. When history is trimmed, reclaim only members proven unreachable.
+static void prune_mesh_ref_payloads(Session& s) {
+    std::set<std::string> keep;
+    auto collect = [&](const json& document) {
+        if (!document.is_object() || !document.contains("mesh_references")) return true;
+        const auto& refs = document["mesh_references"];
+        if (!refs.is_array()) return false;
+        for (const auto& ref : refs) {
+            if (!ref.is_object() || !ref.contains("sha256") || !ref["sha256"].is_string()) return false;
+            keep.insert("mesh_references/" + ref["sha256"].get<std::string>() + ".bin");
+        }
+        return true;
+    };
+    if (!collect(s.doc)) return;
+    auto collect_snapshot = [&](const std::string& entry) {
+        const std::string text = materialize_history_entry(entry);
+        if (is_undo_stub(entry) && is_undo_stub(text)) return false;
+        const json doc = json::parse(text, nullptr, false);
+        return !doc.is_discarded() && collect(doc);
+    };
+    for (const auto& entry : s.undo_stack) if (!collect_snapshot(entry)) return;
+    for (const auto& entry : s.redo_stack) if (!collect_snapshot(entry)) return;
+    for (const auto& entry : s.checkpoints) if (!collect_snapshot(entry.second)) return;
+    for (auto it = s.extra_entries.begin(); it != s.extra_entries.end();) {
+        const std::string& name = it->first;
+        if (is_mesh_ref_member(name) && !keep.count(name)) {
+            if (name == "mesh_references/" + s.mesh_ref_cached_sha + ".bin") {
+                s.mesh_ref_cached.reset();
+                s.mesh_ref_cached_sha.clear();
+            }
+            it = s.extra_entries.erase(it);
+        } else ++it;
+    }
+}
+
+// Reference-only undo/redo keeps the exact compiled result warm. Compare every
+// other root member rather than copying the potentially large feature tree.
+static bool mesh_ref_only_change(const json& before, const json& after) {
+    if (!before.is_object() || !after.is_object()) return false;
+    const auto count = [](const json& doc) {
+        return doc.size() - (doc.contains("mesh_references") ? 1u : 0u);
+    };
+    if (count(before) != count(after)) return false;
+    for (auto it = before.begin(); it != before.end(); ++it) {
+        if (it.key() == "mesh_references") continue;
+        auto other = after.find(it.key());
+        if (other == after.end() || *other != it.value()) return false;
+    }
+    return before.value("mesh_references", json::array()) !=
+           after.value("mesh_references", json::array());
+}
+
 json doc_undo(const std::string& doc_id) {
     DocLock lk;
     Session& s = require_session(doc_id);
     if (s.undo_stack.empty())
         throw OpError("invalid_op", "nothing to undo", {{"reason", "empty undo stack"}});
-    s.redo_stack.push_back(s.doc.dump());
-    trim_history(s.doc_id, s.redo_stack);
+    // Do not change either stack until a spill has been materialized and parsed.
     // Materialize stubs on demand (disk journal for large history entries).
     const std::string entry = s.undo_stack.back();
     const std::string snap = materialize_history_entry(entry);
@@ -6448,14 +10119,35 @@ json doc_undo(const std::string& doc_id) {
         throw OpError("io_error", "history entry lost (undo journal unreadable)",
                       {{"reason", "stub materialize failed"},
                        {"path", undo_stub_path(entry)}});
-    drop_history_entry(entry);  // free journal file if it was a stub
+    json restored;
+    try {
+        restored = json::parse(snap);
+        if (!restored.is_object() || restored.value("schema", std::string()) !=
+                                         s.doc.value("schema", std::string()))
+            throw std::runtime_error("invalid document");
+    } catch (const std::exception& e) {
+        throw OpError("io_error", std::string("invalid undo history entry: ") + e.what());
+    }
+    s.redo_stack.push_back(s.doc.dump());
+    trim_history(s.doc_id, s.redo_stack);
+    drop_history_entry(entry);
     s.undo_stack.pop_back();
-    s.doc = json::parse(snap);
+    const bool reference_only = !s.is_assembly() && mesh_ref_only_change(s.doc, restored);
+    const bool warm = s.compiled && s.compiled_rev == s.revision;
+    s.doc = std::move(restored);
     s.revision += 1;  // undo bumps the revision forward (Python contract)
     s.dirty = true;
     // C50: drop warm sketch state so the next solve COLD-solves the restored seeds
     // (session.py: active_sketch.solve_state = None on undo/redo).
     if (s.active_sketch) s.active_sketch->solve_state.reset();
+    if (reference_only) {
+        s.mesh_ref_only_revision = s.revision;
+        if (warm) {
+            s.compiled_rev = s.revision;
+            return ops_response(s, *s.compiled, json::object(), /*with_tess=*/true);
+        }
+        return json{{"doc_id", s.doc_id}, {"revision", s.revision}, {"tree", s.doc}};
+    }
     if (s.is_assembly()) {
         s.asm_warm.clear();  // re-seed mate solve from the restored doc transforms
         rebuild_assembly(s);
@@ -6470,20 +10162,39 @@ json doc_redo(const std::string& doc_id) {
     Session& s = require_session(doc_id);
     if (s.redo_stack.empty())
         throw OpError("invalid_op", "nothing to redo", {{"reason", "empty redo stack"}});
-    s.undo_stack.push_back(s.doc.dump());
-    trim_history(s.doc_id, s.undo_stack);
     const std::string entry = s.redo_stack.back();
     const std::string snap = materialize_history_entry(entry);
     if (is_undo_stub(entry) && is_undo_stub(snap))
         throw OpError("io_error", "history entry lost (redo journal unreadable)",
                       {{"reason", "stub materialize failed"},
                        {"path", undo_stub_path(entry)}});
+    json restored;
+    try {
+        restored = json::parse(snap);
+        if (!restored.is_object() || restored.value("schema", std::string()) !=
+                                         s.doc.value("schema", std::string()))
+            throw std::runtime_error("invalid document");
+    } catch (const std::exception& e) {
+        throw OpError("io_error", std::string("invalid redo history entry: ") + e.what());
+    }
+    s.undo_stack.push_back(s.doc.dump());
+    trim_history(s.doc_id, s.undo_stack);
     drop_history_entry(entry);
     s.redo_stack.pop_back();
-    s.doc = json::parse(snap);
+    const bool reference_only = !s.is_assembly() && mesh_ref_only_change(s.doc, restored);
+    const bool warm = s.compiled && s.compiled_rev == s.revision;
+    s.doc = std::move(restored);
     s.revision += 1;
     s.dirty = true;
     if (s.active_sketch) s.active_sketch->solve_state.reset();  // C50 (see doc_undo)
+    if (reference_only) {
+        s.mesh_ref_only_revision = s.revision;
+        if (warm) {
+            s.compiled_rev = s.revision;
+            return ops_response(s, *s.compiled, json::object(), /*with_tess=*/true);
+        }
+        return json{{"doc_id", s.doc_id}, {"revision", s.revision}, {"tree", s.doc}};
+    }
     if (s.is_assembly()) {
         s.asm_warm.clear();  // re-seed mate solve from the restored doc transforms
         rebuild_assembly(s);
@@ -6501,6 +10212,7 @@ json doc_clear_history(const std::string& doc_id) {
     s.undo_stack.clear();
     s.redo_stack.clear();
     wipe_undo_journal(doc_id);
+    prune_mesh_ref_payloads(s);
     // No revision bump — save baseline, not an edit.
     return json{{"ok", true}, {"doc_id", doc_id}};
 }
@@ -6509,8 +10221,15 @@ json doc_tree(const std::string& doc_id) {
     DocLock lk;
     Session& s = require_session(doc_id);
     if (s.is_assembly()) {
+        AssemblySourceScope source_scope(assembly_sources_for_session(s));
+        // A cached persisted display needs no hydration while its sources
+        // match, but a queued background refresh must not make this read stale.
+        if (s.asm_result || s.cached_assembly_response.empty() ||
+            !asm_live_fingerprints_match(s.doc, component_source_base(s), s.asm_sources))
+            ensure_assembly_current(s);
         json resp;
         resp["revision"] = s.revision;
+        resp["metadata_revision"] = s.metadata_revision;
         resp["tree"] = s.doc;
         resp["owner_map"] = json::object();
         // The folder that relative component source paths resolve against (the file's
@@ -6524,6 +10243,7 @@ json doc_tree(const std::string& doc_id) {
     const CompileResult& r = ensure_compiled(s);
     json resp;
     resp["revision"] = s.revision;
+    resp["metadata_revision"] = s.metadata_revision;
     resp["tree"] = s.doc;
     resp["owner_map"] = r.owner_map.is_null() ? json::object() : r.owner_map;
     return resp;
@@ -6536,6 +10256,12 @@ json doc_live_source(const std::string& doc_id) {
     DocLock lk;
     if (!pin_session(doc_id)) return json(nullptr);
     Session& s = lk.acquire(doc_id);
+    if (s.is_assembly()) {
+        AssemblySourceScope source_scope(assembly_sources_for_session(s));
+        if (s.asm_result || s.cached_assembly_response.empty() ||
+            !asm_live_fingerprints_match(s.doc, component_source_base(s), s.asm_sources))
+            ensure_assembly_current(s);
+    }
     const std::string base = s.is_assembly() ? component_source_base(s) : std::string();
     return json{{"tree", s.doc}, {"env", env_from_doc(s.doc)}, {"revision", s.revision},
                 {"path", s.path.empty() ? json(nullptr) : json(s.path)},
@@ -6545,7 +10271,7 @@ json doc_live_source(const std::string& doc_id) {
                                : std::string()}};
 }
 
-std::string doc_find_open_by_path(const std::string& path) {
+static std::string find_open_by_path_except(const std::string& path, const std::string& exclude) {
     if (path.empty()) return {};
     namespace fs = std::filesystem;
     std::error_code wanted_ec;
@@ -6559,14 +10285,22 @@ std::string doc_find_open_by_path(const std::string& path) {
         for (const auto& entry : g_sessions) pins.push_back(entry);
     }
     for (const auto& [id, sp] : pins) {
+        if (id == exclude || !sp->owns_journal) continue;
         std::lock_guard<std::mutex> doc(sp->mtx);
         if (sp->path.empty()) continue;
+        std::error_code equivalent_ec;
+        if (fs::equivalent(fs::u8path(sp->path), fs::u8path(path), equivalent_ec) &&
+            !equivalent_ec) return id;  // inode/file index, including hard links
         std::error_code have_ec;
-        fs::path have = fs::weakly_canonical(fs::path(sp->path), have_ec);
-        if (have_ec) have = fs::path(sp->path).lexically_normal();
+        fs::path have = fs::weakly_canonical(fs::u8path(sp->path), have_ec);
+        if (have_ec) have = fs::absolute(fs::u8path(sp->path), have_ec).lexically_normal();
         if (have == wanted) return id;
     }
     return {};
+}
+
+std::string doc_find_open_by_path(const std::string& path) {
+    return find_open_by_path_except(path, {});
 }
 
 json doc_open_embedded(const json& document) {
@@ -6607,12 +10341,15 @@ json doc_activate(const std::string& doc_id) {
     DocLock lk;
     Session& s = require_session(doc_id);
     if (s.is_assembly()) {
-        if (!s.asm_result && !s.cached_assembly_response.empty()) {
+        AssemblySourceScope source_scope(assembly_sources_for_session(s));
+        if (!s.asm_result && !s.cached_assembly_response.empty() &&
+            asm_live_fingerprints_match(s.doc, component_source_base(s), s.asm_sources)) {
             json response = s.cached_assembly_response;
+            response["metadata_revision"] = s.metadata_revision;
             cache_response_fields(s, response);
             return response;
         }
-        if (!s.asm_result) rebuild_assembly(s);
+        ensure_assembly_current(s);
         return ops_response_assembly(s, json::object());
     }
     if (s.compiled && s.compiled_rev == s.revision)
@@ -6627,14 +10364,30 @@ json doc_activate(const std::string& doc_id) {
     CompileResult r = compile_session(s);
     return warm_and_respond(s, std::move(r), json::object(), /*with_tess=*/true);
 }
+static json write_back_build_state(Session& s, const std::string& path,
+                                   const NativeFileStamp& stamp, const std::string& source_hash,
+                                   const std::string& miss_reason, int features_executed);
+
+static void write_back_clean_rebuild(Session& s, json& response) {
+    if (s.path.empty() || s.dirty || !s.file_stamp.valid || s.source_doc_hash.empty() ||
+        s.cache_trust != "verified" || stepplus_doc_hash(s.doc) != s.source_doc_hash) return;
+    try {
+        response["cache"]["writeback"] = write_back_build_state(
+            s, s.path, s.file_stamp, s.source_doc_hash, "rebuild", 1);
+    } catch (const std::exception& e) {
+        response["cache"]["writeback"] = {{"written", false}, {"reason", e.what()}};
+    }
+}
 
 
 json doc_rebuild(const std::string& doc_id) {
     DocLock lk;
     Session& s = require_session(doc_id);
     if (s.is_assembly()) {
-        rebuild_assembly(s);
-        return ops_response_assembly(s, json::object());
+        ensure_assembly_current(s, true);
+        json response = ops_response_assembly(s, json::object());
+        write_back_clean_rebuild(s, response);
+        return response;
     }
     // An explicit rebuild also re-syncs associative Convert Entities (covers
     // mutation paths that bypass doc_apply_ops, e.g. sketch_drag_commit). No revision
@@ -6647,7 +10400,9 @@ json doc_rebuild(const std::string& doc_id) {
         refresh_sketch3d_external_refs(s.doc, cache, s.display_quality);
     } catch (...) { /* keep last-good ground points */ }
     CompileResult r = compile_session(s);
-    return warm_and_respond(s, std::move(r), json::object(), /*with_tess=*/true);
+    json response = warm_and_respond(s, std::move(r), json::object(), /*with_tess=*/true);
+    write_back_clean_rebuild(s, response);
+    return response;
 }
 
 // ============================================================ C20 assembly RPCs
@@ -6661,44 +10416,144 @@ json doc_rebuild(const std::string& doc_id) {
 // clean, already-solved assembly and dirtied it (revision 0->1) with nothing moved.
 // doc_set_explode_state toggles the explode view and re-tessellates without a revision bump.
 
-// Does the stored 16-float row-major `transform` equal the solved one within `eps`? The
-// solver judges its positional (mm) and direction (dimensionless) residual rows against
-// the same threshold, so every entry is compared against it. A missing or malformed
-// stored transform never matches: writing one is a document change.
-static bool solved_pose_matches(const json& stored, const std::vector<double>& solved,
-                                double eps) {
-    if (!stored.is_array() || stored.size() != 16 || solved.size() != 16) return false;
-    for (std::size_t i = 0; i < 16; ++i) {
-        if (!stored[i].is_number()) return false;
-        if (std::abs(stored[i].get<double>() - solved[i]) > eps) return false;
+
+// Analyse the current solved assembly without explicitly committing the analysis pose.
+// Source refresh follows the normal assembly-read semantics, including dependency updates.
+json doc_eval_assembly_dof(const std::string& doc_id, const json& params) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    if (!s.is_assembly())
+        throw OpError("invalid_op", "eval_assembly_dof requires an assembly");
+    ensure_assembly_current(s);
+    if (!s.asm_result || !s.asm_result->converged)
+        return {{"ok", false}, {"code", "assembly_not_converged"},
+                {"error", "Resolve failed components and mates before evaluating free motion."}};
+    const AssemblyResult& ar = *s.asm_result;
+    json components = json::array();
+    for (const json& c : s.doc.value("components", json::array())) {
+        if (c.value("suppressed", false)) continue;
+        const std::string id = c.value("id", std::string());
+        if (!ar.transforms.count(id))
+            return {{"ok", false}, {"code", "component_not_evaluated"},
+                    {"error", "A component has no solved placement."}, {"component", id}};
+        components.push_back(c);
     }
-    return true;
+    if (components.empty())
+        return {{"ok", false}, {"code", "nothing_evaluated"},
+                {"error", "The assembly has no unsuppressed components."}};
+    chudware::mate::ResolvedGeometry geometry;
+    for (const auto& [mid, refs] : ar.mate_geometry)
+        for (const AsmMateRefGeom& ref : refs)
+            geometry[{mid, ref.ref_index}] = ref.geom;
+    const auto result = chudware::mate::solve_mates(
+        components, s.doc.value("mates", json::array()), geometry, ar.warm,
+        std::nullopt, 1e-9, 80, std::nullopt, true);
+    if (!result.converged || result.dof != ar.dof)
+        return {{"ok", false}, {"code", "dof_analysis_inconsistent"},
+                {"error", "The cached assembly and the null-space solve disagree; rebuild and resolve mates."}};
+    int cursor = params.value("cursor", 0);
+    int limit = params.value("limit", 100);
+    if (cursor < 0 || limit < 1 || limit > 500)
+        throw OpError("invalid_op", "cursor must be nonnegative and limit must be between 1 and 500");
+    json full = chudware::mate::free_motion_to_json(result);
+    json page = json::array();
+    const int size = static_cast<int>(full["components"].size());
+    for (int i = cursor; i < size && i - cursor < limit; ++i)
+        page.push_back(full["components"][i]);
+    const int next = cursor >= size ? size : cursor + std::min(limit, size - cursor);
+    // Groups may be larger than a page; component and mate lists are capped explicitly.
+    json groups = json::array();
+    for (auto& group : full["groups"]) {
+        if (groups.size() >= 100) break;
+        for (const char* key : {"components", "mates"}) {
+            auto& values = group[key];
+            if (values.size() > 100) {
+                values.erase(values.begin() + 100, values.end());
+                group[std::string(key) + "_truncated"] = true;
+            }
+        }
+        groups.push_back(std::move(group));
+    }
+    return {{"ok", true}, {"converged", true}, {"dof", result.dof},
+            {"over_defined", result.over_defined}, {"components", std::move(page)},
+            {"groups", std::move(groups)}, {"groups_truncated", full["groups"].size() > 100},
+            {"truncated", next < size}, {"next_cursor", next < size ? json(next) : json(nullptr)},
+            {"basis", "first-order accepted-mate Jacobian null space at solved pose"},
+            {"confidence", "numerical"}, {"assumptions", json::array({
+                "Per-component freedoms can be coupled and are not additive.",
+                "Pattern-generated instances are not independent mate-solver components."})}};
 }
 
-// Did this compile place different component geometry than the result it replaces?
-// Component loads are cached per source stamp with one stable compound TShape, so an
-// unchanged source yields the identical TShape. No prior result means nobody has been
-// served geometry this compile could contradict.
-static bool assembly_geometry_changed(const AssemblyResult* prior, const AssemblyResult& next) {
-    if (!prior) return false;
-    if (prior->bodies.size() != next.bodies.size()) return true;
-    for (std::size_t i = 0; i < next.bodies.size(); ++i) {
-        const AsmBodyOut& a = prior->bodies[i];
-        const AsmBodyOut& b = next.bodies[i];
-        if (a.component_id != b.component_id || !a.shape_local.IsPartner(b.shape_local))
-            return true;
+json doc_asm_source_status(const std::string& doc_id) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    if (!s.is_assembly())
+        return {{"ok", true}, {"status", "not_assembly"}, {"matches", nullptr}};
+    AssemblySourceScope source_scope(assembly_sources_for_session(s));
+    const std::string base = component_source_base(s);
+    const json current = asm_live_component_fingerprints(s.doc, base);
+    const bool built = s.asm_result || !s.cached_assembly_response.empty();
+    const bool matches = built && asm_live_fingerprints_match(s.doc, base, s.asm_sources);
+    const json cached = s.asm_sources.is_array() ? s.asm_sources : json::array();
+    json rows = json::array();
+    std::vector<std::string> components;
+    if (s.doc.contains("components") && s.doc["components"].is_array())
+        for (const auto& c : s.doc["components"])
+            if (!c.value("suppressed", false))
+                components.push_back(c.value("id", std::string()));
+    const auto sources = AssemblySourceScope::current();
+    const size_t count = std::max(current.size(), built ? cached.size() : size_t(0));
+    for (size_t i = 0; i < count; ++i) {
+        const json now = i < current.size() ? current[i] : json(nullptr);
+        const json old = built && i < cached.size() ? cached[i] : json(nullptr);
+        bool same = now.is_object() && old.is_object() && now.value("path", json()) == old.value("path", json());
+        if (same && now.contains("doc_hash") && old.contains("doc_hash"))
+            same = now["doc_hash"] == old["doc_hash"];
+        else if (same)
+            same = !now.value("live_unsaved", false) && !old.value("live_unsaved", false) &&
+                   now.value("size", json()) == old.value("size", json()) &&
+                   now.value("mtime", json()) == old.value("mtime", json());
+        json row = {{"path", now.is_object() ? now.value("path", std::string())
+                                               : old.value("path", std::string())},
+                    {"current", now}, {"cached", old},
+                    {"changed", built ? json(!same) : json(nullptr)},
+                    {"open", false}, {"dirty", false}};
+        if (i < components.size()) row["component"] = components[i];
+        const std::string path = row["path"].get<std::string>();
+        if (!path.empty() && sources) {
+            std::error_code ec;
+            const auto full = std::filesystem::absolute(std::filesystem::path(base) / path);
+            const auto canonical = std::filesystem::weakly_canonical(full, ec);
+            const auto it = sources->find(ec ? full.lexically_normal().string() : canonical.string());
+            if (it != sources->end() && it->second) {
+                row["open"] = true;
+                row["dirty"] = it->second->unsaved;
+                row["doc_id"] = it->second->source_doc_id;
+            }
+        }
+        rows.push_back(std::move(row));
     }
-    return false;
+    return {{"ok", true}, {"status", !built ? "not_built" : matches ? "current" : "stale"},
+            {"matches", built ? json(matches) : json(nullptr)}, {"current", current},
+            {"cached", built ? json(cached) : json(nullptr)}, {"sources", std::move(rows)}};
 }
 
-json doc_solve_mates(const std::string& doc_id, const json& drag) {
+json doc_solve_mates(const std::string& doc_id, const json& drag, long expect_revision) {
     DocLock lk;
     Session& s = require_session(doc_id);
     if (!s.is_assembly())
         throw OpError("invalid_op", "doc_solve_mates: document is not an assembly",
                       {{"reason", "not an assembly"}});
+    ensure_assembly_current(s);
+    if (expect_revision >= 0 && expect_revision != s.revision)
+        throw OpError("stale_revision",
+                      "expect_revision " + std::to_string(expect_revision) +
+                          " != current " + std::to_string(s.revision),
+                      {{"current_revision", s.revision}});
     const std::string base_dir = component_source_base(s);
     const json before = s.doc;  // the undo entry, iff this solve changes the document
+    AssemblySourceScope source_scope;
+    json sources = asm_live_component_fingerprints(s.doc, base_dir);
 
     std::optional<chudware::mate::WarmMap> warm;
     if (!s.asm_warm.empty()) warm = s.asm_warm;
@@ -6738,6 +10593,9 @@ json doc_solve_mates(const std::string& doc_id, const json& drag) {
         moved || s.doc != before || assembly_geometry_changed(s.asm_result.get(), ares);
     s.asm_warm = ares.warm;
     s.asm_result = std::make_shared<AssemblyResult>(std::move(ares));
+    s.asm_sources = std::move(sources);
+    update_assembly_dependencies(s, s.asm_sources, base_dir);
+    s.cached_assembly_response = json();
     if (changed) {
         push_undo_document(s, before);
         s.revision += 1;
@@ -6754,8 +10612,53 @@ json doc_set_explode_state(const std::string& doc_id, bool active, double factor
                       {{"reason", "not an assembly"}});
     s.explode_active = active;
     s.explode_factor = std::max(0.0, std::min(1.0, factor));
-    if (!s.asm_result) rebuild_assembly(s);
-    return ops_response_assembly(s, json::object());  // view-only: no revision bump
+    ensure_assembly_current(s);
+    json response = ops_response_assembly(s, json::object());  // view-only: no revision bump
+    // The factor-1 vector of every moving component plus its collapsed box center, so a
+    // client can animate the explode on the GPU between factor commits and draw explode
+    // lines without another round trip; the collapsed and fully exploded boxes let it frame
+    // the motion before it starts.
+    bool automatic = false;
+    const auto vectors = session_explode_vectors(s, &automatic);
+    struct Row { json body_ids = json::array(); Bnd_Box box; };
+    std::map<std::string, Row> rows;
+    Bnd_Box collapsed, exploded;
+    if (s.asm_result)
+        for (const AsmBodyOut& body : s.asm_result->bodies) {
+            Bnd_Box box;
+            BRepBndLib::Add(placed_world_shape(body), box, /*useTriangulation=*/true);
+            if (box.IsVoid()) continue;
+            collapsed.Add(box);
+            const auto v = vectors.find(body.component_id);
+            if (v == vectors.end()) { exploded.Add(box); continue; }
+            Row& row = rows[body.component_id];
+            row.body_ids.push_back(body.body_id);
+            row.box.Add(box);
+            gp_Trsf shift;
+            shift.SetTranslation(gp_Vec(v->second.x(), v->second.y(), v->second.z()));
+            exploded.Add(box.Transformed(shift));
+        }
+    auto box_json = [](const Bnd_Box& b) -> json {
+        if (b.IsVoid()) return nullptr;
+        double xa, ya, za, xb, yb, zb;
+        b.Get(xa, ya, za, xb, yb, zb);
+        return {{"min", {xa, ya, za}}, {"max", {xb, yb, zb}}};
+    };
+    exploded.Add(collapsed);
+    json components = json::array();
+    for (auto& [id, row] : rows) {
+        const Eigen::Vector3d& v = vectors.at(id);
+        double xa, ya, za, xb, yb, zb;
+        row.box.Get(xa, ya, za, xb, yb, zb);
+        components.push_back({{"component", id}, {"body_ids", std::move(row.body_ids)},
+                              {"vector", {v.x(), v.y(), v.z()}},
+                              {"center", {0.5 * (xa + xb), 0.5 * (ya + yb), 0.5 * (za + zb)}}});
+    }
+    response["explode"] = {{"active", s.explode_active}, {"factor", s.explode_factor},
+                           {"automatic", automatic}, {"components", std::move(components)},
+                           {"bounds", {{"collapsed", box_json(collapsed)},
+                                       {"exploded", box_json(exploded)}}}};
+    return response;
 }
 
 // Total display triangles currently attached to `shapes`. BRepMesh writes its
@@ -6802,7 +10705,7 @@ json doc_set_display_quality(const std::string& doc_id, const std::string& quali
     json resp;
     long long tris = 0;
     if (s.is_assembly()) {
-        rebuild_assembly(s);
+        ensure_assembly_current(s);
         resp = ops_response_assembly(s, json::object());
         std::vector<TopoDS_Shape> shapes;
         if (const AssemblyResult* ares = s.asm_result.get())
@@ -6817,6 +10720,515 @@ json doc_set_display_quality(const std::string& doc_id, const std::string& quali
     resp["quality"] = ::geom::display_quality_name(q);
     resp["triangles"] = tris;
     return resp;  // view-only: no revision bump, no dirty flag
+}
+
+namespace {
+
+// References are document metadata, never modeling features. Their triangle
+// soups are separate, content-addressed native-container members.
+constexpr std::size_t kMeshRefMaxBytes = 64u * 1024u * 1024u;
+constexpr std::size_t kMeshRefMaxReply = 56u * 1024u * 1024u;
+constexpr std::size_t kMeshRefPageTriangles = 10000;
+constexpr const char* kMeshRefPrefix = "mesh_references/";
+
+[[noreturn]] void mesh_ref_error(const std::string& message) {
+    throw OpError("invalid_op", "mesh reference: " + message);
+}
+void mesh_ref_part(const Session& s) {
+    if (!s.doc.is_object() || s.doc.value("schema", std::string()) != "aicad.part/1")
+        mesh_ref_error("requires a part document");
+}
+json mesh_ref_entries(const Session& s) {
+    if (!s.doc.contains("mesh_references")) return json::array();
+    if (!s.doc["mesh_references"].is_array()) mesh_ref_error("invalid reference list");
+    return s.doc["mesh_references"];
+}
+std::size_t mesh_ref_find(const json& refs, const std::string& id) {
+    if (id.empty()) mesh_ref_error("id is required");
+    for (std::size_t i = 0; i < refs.size(); ++i)
+        if (refs[i].is_object() && refs[i].value("id", std::string()) == id) return i;
+    mesh_ref_error("unknown id '" + id + "'");
+}
+double mesh_ref_number(const json& value, const char* name) {
+    if (!value.is_number()) mesh_ref_error(std::string(name) + " must be a number");
+    const double out = value.get<double>();
+    if (!std::isfinite(out)) mesh_ref_error(std::string(name) + " must be finite");
+    return out;
+}
+struct MeshRefTransform {
+    double scale = 1.0;
+    std::array<std::array<double, 3>, 3> rotation{};
+    std::array<double, 3> translation{};
+};
+json mesh_ref_identity() {
+    return {{"mm_per_unit", 1.0}, {"rotation", {{1.0, 0.0, 0.0},
+                                                {0.0, 1.0, 0.0},
+                                                {0.0, 0.0, 1.0}}},
+            {"translation_mm", {0.0, 0.0, 0.0}}};
+}
+MeshRefTransform mesh_ref_transform(const json& value) {
+    if (!value.is_object() || !value.contains("mm_per_unit") ||
+        !value.contains("rotation") || !value.contains("translation_mm"))
+        mesh_ref_error("transform requires mm_per_unit, rotation and translation_mm");
+    MeshRefTransform t;
+    t.scale = mesh_ref_number(value["mm_per_unit"], "mm_per_unit");
+    if (t.scale <= 0.0) mesh_ref_error("mm_per_unit must be positive");
+    const auto& r = value["rotation"];
+    const auto& p = value["translation_mm"];
+    if (!r.is_array() || r.size() != 3 || !p.is_array() || p.size() != 3)
+        mesh_ref_error("rotation must be 3x3 and translation_mm must have three elements");
+    for (int i = 0; i < 3; ++i) {
+        if (!r[i].is_array() || r[i].size() != 3) mesh_ref_error("rotation must be 3x3");
+        t.translation[i] = mesh_ref_number(p[i], "translation_mm");
+        for (int j = 0; j < 3; ++j)
+            t.rotation[i][j] = mesh_ref_number(r[i][j], "rotation");
+    }
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) {
+            double dot = 0.0;
+            for (int k = 0; k < 3; ++k) dot += t.rotation[k][i] * t.rotation[k][j];
+            if (!std::isfinite(dot) || std::abs(dot - (i == j ? 1.0 : 0.0)) > 1e-6)
+                mesh_ref_error("rotation must be orthonormal");
+        }
+    const auto& a = t.rotation;
+    const double det = a[0][0] * (a[1][1]*a[2][2] - a[1][2]*a[2][1])
+                     - a[0][1] * (a[1][0]*a[2][2] - a[1][2]*a[2][0])
+                     + a[0][2] * (a[1][0]*a[2][1] - a[1][1]*a[2][0]);
+    if (!std::isfinite(det) || std::abs(det - 1.0) > 1e-6)
+        mesh_ref_error("rotation must be proper");
+    return t;
+}
+json mesh_ref_transform_json(const MeshRefTransform& t) {
+    return {{"mm_per_unit", t.scale}, {"rotation", t.rotation}, {"translation_mm", t.translation}};
+}
+std::array<double, 3> mesh_ref_point(const MeshData& mesh, std::size_t index,
+                                     const MeshRefTransform& t) {
+    std::array<double, 3> out{};
+    for (int i = 0; i < 3; ++i) {
+        double coord = 0.0;
+        for (int j = 0; j < 3; ++j) coord += t.rotation[i][j] * mesh.verts[index*3+j];
+        out[i] = t.scale * coord + t.translation[i];
+        if (!std::isfinite(out[i])) mesh_ref_error("transformed coordinates are not finite");
+    }
+    return out;
+}
+json mesh_ref_bbox(const MeshData& mesh, const MeshRefTransform& t) {
+    if (!mesh.vertex_count() || !mesh.triangle_count()) mesh_ref_error("mesh has no triangles");
+    auto lo = mesh_ref_point(mesh, 0, t);
+    auto hi = lo;
+    for (std::size_t i = 1; i < mesh.vertex_count(); ++i) {
+        const auto p = mesh_ref_point(mesh, i, t);
+        for (int j = 0; j < 3; ++j) { lo[j] = std::min(lo[j], p[j]); hi[j] = std::max(hi[j], p[j]); }
+    }
+    for (int j = 0; j < 3; ++j)
+        if (!std::isfinite(hi[j] - lo[j])) mesh_ref_error("transformed bounds are not finite");
+    return {{"min", lo}, {"max", hi}, {"size", {hi[0]-lo[0], hi[1]-lo[1], hi[2]-lo[2]}}};
+}
+
+void mesh_ref_put_u32(std::string& out, std::uint32_t n) {
+    for (int i = 0; i < 4; ++i) out.push_back(static_cast<char>((n >> (8*i)) & 255));
+}
+void mesh_ref_put_u64(std::string& out, std::uint64_t n) {
+    for (int i = 0; i < 8; ++i) out.push_back(static_cast<char>((n >> (8*i)) & 255));
+}
+std::uint64_t mesh_ref_get_uint(const std::string& in, std::size_t& pos, int bytes) {
+    if (pos > in.size() || in.size() - pos < static_cast<std::size_t>(bytes))
+        mesh_ref_error("truncated embedded mesh");
+    std::uint64_t n = 0;
+    for (int i = 0; i < bytes; ++i)
+        n |= std::uint64_t(static_cast<unsigned char>(in[pos++])) << (8*i);
+    return n;
+}
+std::string mesh_ref_encode(const MeshData& mesh, std::string& sha) {
+    const std::size_t nv = mesh.vertex_count(), nt = mesh.triangle_count();
+    if (!nv || !nt || mesh.verts.size() != nv*3 || mesh.tris.size() != nt*3 ||
+        nv > std::numeric_limits<std::uint32_t>::max() ||
+        nt > std::numeric_limits<std::uint32_t>::max() ||
+        nv > (kMeshRefMaxBytes - 16) / 24 ||
+        nt > (kMeshRefMaxBytes - 16 - nv*24) / 12)
+        mesh_ref_error("mesh is empty or exceeds the embedded mesh byte limit");
+    std::string raw;
+    raw.reserve(16 + nv*24 + nt*12);
+    raw.append("CHMR0001", 8);
+    mesh_ref_put_u32(raw, static_cast<std::uint32_t>(nv));
+    mesh_ref_put_u32(raw, static_cast<std::uint32_t>(nt));
+    for (double value : mesh.verts) {
+        if (!std::isfinite(value)) mesh_ref_error("mesh contains non-finite coordinates");
+        std::uint64_t bits;
+        static_assert(sizeof(bits) == sizeof(value), "binary64 required");
+        std::memcpy(&bits, &value, sizeof(bits));
+        mesh_ref_put_u64(raw, bits);
+    }
+    for (std::uint32_t index : mesh.tris) {
+        if (index >= nv) mesh_ref_error("mesh contains an out-of-range index");
+        mesh_ref_put_u32(raw, index);
+    }
+    sha = util::sha256_hex(raw);
+    mz_ulong compressed_len = mz_compressBound(static_cast<mz_ulong>(raw.size()));
+    std::string blob(16 + static_cast<std::size_t>(compressed_len), '\0');
+    std::memcpy(blob.data(), "CHMZ0001", 8);
+    for (int i = 0; i < 8; ++i)
+        blob[8+i] = static_cast<char>((std::uint64_t(raw.size()) >> (8*i)) & 255);
+    if (mz_compress2(reinterpret_cast<unsigned char*>(blob.data()+16), &compressed_len,
+                     reinterpret_cast<const unsigned char*>(raw.data()),
+                     static_cast<mz_ulong>(raw.size()), MZ_BEST_SPEED) != MZ_OK)
+        mesh_ref_error("could not compress mesh");
+    blob.resize(16 + static_cast<std::size_t>(compressed_len));
+    if (blob.size() > kMeshRefMaxBytes) mesh_ref_error("compressed mesh exceeds byte limit");
+    return blob;
+}
+MeshData mesh_ref_decode(const std::string& blob, const std::string& sha) {
+    if (blob.size() < 16 || blob.compare(0, 8, "CHMZ0001") != 0)
+        mesh_ref_error("invalid embedded mesh header");
+    std::size_t pos = 8;
+    const auto raw_size = mesh_ref_get_uint(blob, pos, 8);
+    if (raw_size < 16 || raw_size > kMeshRefMaxBytes) mesh_ref_error("embedded mesh exceeds byte limit");
+    std::string raw(static_cast<std::size_t>(raw_size), '\0');
+    mz_ulong actual = static_cast<mz_ulong>(raw.size());
+    if (mz_uncompress(reinterpret_cast<unsigned char*>(raw.data()), &actual,
+                      reinterpret_cast<const unsigned char*>(blob.data()+16),
+                      static_cast<mz_ulong>(blob.size()-16)) != MZ_OK || actual != raw.size() ||
+        util::sha256_hex(raw) != sha || raw.compare(0, 8, "CHMR0001") != 0)
+        mesh_ref_error("embedded mesh is corrupt or has the wrong digest");
+    pos = 8;
+    const std::uint64_t nv = mesh_ref_get_uint(raw, pos, 4);
+    const std::uint64_t nt = mesh_ref_get_uint(raw, pos, 4);
+    if (!nv || !nt || nv > (raw.size()-16)/24 ||
+        nt > (raw.size()-16-nv*24)/12 || 16+nv*24+nt*12 != raw.size())
+        mesh_ref_error("invalid embedded mesh counts");
+    MeshData mesh;
+    mesh.verts.reserve(static_cast<std::size_t>(nv*3));
+    mesh.tris.reserve(static_cast<std::size_t>(nt*3));
+    for (std::uint64_t i = 0; i < nv*3; ++i) {
+        const auto bits = mesh_ref_get_uint(raw, pos, 8);
+        double value;
+        std::memcpy(&value, &bits, sizeof(value));
+        if (!std::isfinite(value)) mesh_ref_error("embedded mesh has non-finite coordinates");
+        mesh.verts.push_back(value);
+    }
+    for (std::uint64_t i = 0; i < nt*3; ++i) {
+        const auto index = mesh_ref_get_uint(raw, pos, 4);
+        if (index >= nv) mesh_ref_error("embedded mesh index is out of range");
+        mesh.tris.push_back(static_cast<std::uint32_t>(index));
+    }
+    return mesh;
+}
+const MeshData& mesh_ref_payload(Session& s, const json& ref) {
+    const std::string sha = ref.value("sha256", std::string());
+    if (sha.size() != 64 || !std::all_of(sha.begin(), sha.end(), [](char c) {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        })) mesh_ref_error("invalid embedded mesh digest");
+    const auto it = s.extra_entries.find(std::string(kMeshRefPrefix) + sha + ".bin");
+    if (it == s.extra_entries.end()) mesh_ref_error("embedded mesh is missing");
+    if (s.mesh_ref_cached && s.mesh_ref_cached_sha == sha) return *s.mesh_ref_cached;
+    auto decoded = std::make_shared<MeshData>(mesh_ref_decode(it->second, sha));
+    s.mesh_ref_cached_sha = sha;
+    s.mesh_ref_cached = std::move(decoded);
+    return *s.mesh_ref_cached;
+}
+std::string mesh_ref_stats_key(const json& ref) {
+    return ref.at("sha256").get<std::string>() + "|" + ref.at("transform").dump();
+}
+void mesh_ref_cache_stats(Session& s, const json& ref, std::size_t triangles, const json& bbox) {
+    if (s.mesh_ref_stats_cache.size() >= 1024) s.mesh_ref_stats_cache.clear();
+    s.mesh_ref_stats_cache[mesh_ref_stats_key(ref)] = {{"triangles", triangles}, {"bbox_mm", bbox}};
+}
+const json& mesh_ref_stats(Session& s, const json& ref) {
+    const std::string key = mesh_ref_stats_key(ref);
+    auto found = s.mesh_ref_stats_cache.find(key);
+    if (found != s.mesh_ref_stats_cache.end()) return found->second;
+    const MeshData& mesh = mesh_ref_payload(s, ref);
+    const json bbox = mesh_ref_bbox(mesh, mesh_ref_transform(ref.at("transform")));
+    mesh_ref_cache_stats(s, ref, mesh.triangle_count(), bbox);
+    return s.mesh_ref_stats_cache.at(key);
+}
+void mesh_ref_color(const json& value) {
+    if (!value.is_array() || value.size() != 3) mesh_ref_error("color must be an RGB array");
+    for (const auto& c : value) {
+        const double n = mesh_ref_number(c, "color");
+        if (n < 0.0 || n > 1.0) mesh_ref_error("color must be in 0..1");
+    }
+}
+void mesh_ref_opacity(const json& value) {
+    const double n = mesh_ref_number(value, "opacity");
+    if (n < 0.0 || n > 1.0) mesh_ref_error("opacity must be in 0..1");
+}
+std::string mesh_ref_required_id(const json& args) {
+    if (!args.is_object() || !args.contains("id") || !args["id"].is_string())
+        mesh_ref_error("id is required");
+    return args["id"].get<std::string>();
+}
+json mesh_ref_commit(Session& s, json refs) {
+    push_undo(s);
+    s.doc["mesh_references"] = std::move(refs);
+    const bool warm = s.compiled && s.compiled_rev == s.revision;
+    ++s.revision;
+    s.mesh_ref_only_revision = s.revision;
+    s.dirty = true;
+    if (warm) s.compiled_rev = s.revision;
+    json response = warm ? ops_response(s, *s.compiled, json::object(), true)
+                         : json{{"revision", s.revision}, {"tree", s.doc}};
+    response["doc_id"] = s.doc_id;
+    response["ok"] = true;
+    return response;
+}
+std::uint64_t mesh_ref_nonnegative(const json& value, const char* name) {
+    if (!value.is_number_integer()) mesh_ref_error(std::string(name) + " must be an integer");
+    if (value.is_number_unsigned()) return value.get<std::uint64_t>();
+    const auto n = value.get<std::int64_t>();
+    if (n < 0) mesh_ref_error(std::string(name) + " must be non-negative");
+    return static_cast<std::uint64_t>(n);
+}
+}  // namespace
+
+json doc_mesh_ref_add(const std::string& doc_id, const json& args) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    mesh_ref_part(s);
+    if (!args.is_object() || !args.contains("path") || !args["path"].is_string() ||
+        args["path"].get_ref<const std::string&>().empty())
+        mesh_ref_error("path is required");
+    namespace fs = std::filesystem;
+    const std::string input = args["path"].get<std::string>();
+    const auto* principal = chudware::sim::current_cell_principal();
+    const std::string authenticated_actor = principal ? principal->actorKey : std::string();
+    std::string project = s.project_dir;
+    if (project.empty()) {
+        const char* env = std::getenv("CHUDWARE_PROJECT_DIR");
+        if (!env || !*env) env = std::getenv("CHUDWARE_FS_ROOT");
+        if (env && *env) project = env;
+    }
+    if (project.empty() && native_policy::rooted()) project = native_policy::setting(false);
+    if (project.empty() && !s.path.empty())
+        project = native_policy::path_utf8(fs::absolute(fs::u8path(s.path)).parent_path());
+    fs::path source;
+    try {
+        if (native_policy::rooted()) {
+            bool actor_source = false;
+            const std::string state = native_policy::setting(true);
+            const auto candidate = fs::u8path(input).lexically_normal();
+            if (!authenticated_actor.empty() && !state.empty() && candidate.is_absolute()) {
+                const auto state_root = fs::weakly_canonical(fs::u8path(state));
+                const auto actors = state_root / "actors";
+                const auto root = actors / util::sha256_hex(authenticated_actor).substr(0, 32);
+                const auto relative = candidate.lexically_relative(root);
+                if (!relative.empty() && *relative.begin() != "..") {
+                    if (fs::is_symlink(fs::symlink_status(actors)) ||
+                        fs::is_symlink(fs::symlink_status(root)))
+                        mesh_ref_error("actor root symlink traversal refused");
+                    auto walked = root;
+                    for (const auto& component : relative) {
+                        walked /= component;
+                        std::error_code ec;
+                        const auto status = fs::symlink_status(walked, ec);
+                        if (fs::is_symlink(status) ||
+                            (ec && ec != std::errc::no_such_file_or_directory))
+                            mesh_ref_error("actor source symlink traversal refused");
+                    }
+                    source = walked;
+                    actor_source = true;
+                }
+            }
+            if (!actor_source) {
+                const std::string authored = native_policy::authored_reference(input);
+                source = fs::u8path(native_policy::resolve_reference(authored));
+            }
+        } else {
+            source = fs::u8path(input);
+            if (source.is_relative()) {
+                if (project.empty()) mesh_ref_error("relative path requires a project directory");
+                source = fs::u8path(project) / source;
+            }
+        }
+        source = fs::weakly_canonical(source);
+    } catch (const OpError&) { throw; }
+      catch (const std::exception& e) { mesh_ref_error(std::string("source path refused: ") + e.what()); }
+    if (!fs::is_regular_file(source)) mesh_ref_error("source is not a regular file");
+    const std::string path = native_policy::path_utf8(source);
+    const std::string fmt = detect_format(path);
+    if (fmt != "ply" && fmt != "stl" && fmt != "obj")
+        mesh_ref_error("format must be ply, stl or obj");
+    std::string authored = path;
+    if (!project.empty()) {
+        const auto root = fs::weakly_canonical(fs::u8path(project));
+        const auto relative = source.lexically_relative(root);
+        if (!relative.empty() && *relative.begin() != "..")
+            authored = native_policy::generic_path_utf8(relative);
+    }
+    const auto t = mesh_ref_transform(args.value("transform", mesh_ref_identity()));
+    const json transform = mesh_ref_transform_json(t);
+    const json color = args.value("color", json::array({0.45, 0.65, 0.85}));
+    const json opacity = args.value("opacity", json(0.4));
+    mesh_ref_color(color);
+    mesh_ref_opacity(opacity);
+    if (args.contains("name") && !args["name"].is_string()) mesh_ref_error("name must be a string");
+    if (args.contains("approximate") && !args["approximate"].is_boolean())
+        mesh_ref_error("approximate must be boolean");
+    json provenance = {{"reveng_session", nullptr}, {"method", nullptr}};
+    if (args.contains("provenance") && !args["provenance"].is_null()) {
+        if (!args["provenance"].is_object()) mesh_ref_error("provenance must be an object");
+        for (const char* key : {"reveng_session", "method"})
+            if (args["provenance"].contains(key)) {
+                const auto& value = args["provenance"][key];
+                if (!value.is_null() && !value.is_string()) mesh_ref_error("invalid provenance");
+                provenance[key] = value;
+            }
+    }
+    json refs = mesh_ref_entries(s);
+    if (refs.size() >= 1000) mesh_ref_error("reference count limit exceeded");
+    std::size_t next = 1;
+    std::string id;
+    for (;;) {
+        id = "mr" + std::to_string(next++);
+        bool used = false;
+        for (const auto& ref : refs)
+            if (ref.is_object() && ref.value("id", std::string()) == id) { used = true; break; }
+        if (!used) break;
+    }
+    MeshData mesh = read_mesh(path, fmt);
+    std::string sha;
+    std::string blob = mesh_ref_encode(mesh, sha);
+    const json bbox = mesh_ref_bbox(mesh, t);
+    // Bound the compressed undo payloads separately from the JSON history. A
+    // duplicate SHA consumes no additional space. Reclaim only unreachable
+    // history before refusing a transaction that would exceed the budget.
+    const std::string member = std::string(kMeshRefPrefix) + sha + ".bin";
+    auto retained_bytes = [&]() {
+        std::size_t total = blob.size();
+        for (const auto& [name, data] : s.extra_entries)
+            if (is_mesh_ref_member(name) && name != member) total += data.size();
+        return total;
+    };
+    if (retained_bytes() > 192u * 1024u * 1024u) {
+        prune_mesh_ref_payloads(s);
+        if (retained_bytes() > 192u * 1024u * 1024u)
+            mesh_ref_error("embedded mesh history exceeds 192 MiB; clear undo history to reclaim it");
+    }
+    const auto triangles = mesh.triangle_count();
+    json ref = {{"id", id}, {"name", args.value("name", native_policy::path_utf8(source.stem()))},
+                {"source_path", authored}, {"sha256", sha}, {"format", fmt},
+                {"transform", transform}, {"visible", true}, {"opacity", opacity},
+                {"color", color}, {"approximate", args.value("approximate", false)},
+                {"provenance", provenance}};
+    mesh_ref_cache_stats(s, ref, triangles, bbox);
+    refs.push_back(std::move(ref));
+    s.extra_entries[member] = std::move(blob);
+    s.mesh_ref_cached_sha = sha;
+    s.mesh_ref_cached = std::make_shared<MeshData>(std::move(mesh));
+    json response = mesh_ref_commit(s, std::move(refs));
+    response["id"] = id;
+    response["triangles"] = triangles;
+    response["bbox_mm"] = bbox;
+    return response;
+}
+
+json doc_mesh_ref_list(const std::string& doc_id) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    mesh_ref_part(s);
+    json refs = mesh_ref_entries(s);
+    for (auto& ref : refs) {
+        const json& stats = mesh_ref_stats(s, ref);
+        ref["triangles"] = stats["triangles"];
+        ref["bbox_mm"] = stats["bbox_mm"];
+    }
+    return {{"ok", true}, {"refs", std::move(refs)}, {"revision", s.revision}};
+}
+
+json doc_mesh_ref_update(const std::string& doc_id, const json& args) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    mesh_ref_part(s);
+    const std::string id = mesh_ref_required_id(args);
+    json refs = mesh_ref_entries(s);
+    json& ref = refs[mesh_ref_find(refs, id)];
+    if (args.contains("name")) {
+        if (!args["name"].is_string()) mesh_ref_error("name must be a string");
+        ref["name"] = args["name"];
+    }
+    if (args.contains("visible")) {
+        if (!args["visible"].is_boolean()) mesh_ref_error("visible must be boolean");
+        ref["visible"] = args["visible"];
+    }
+    if (args.contains("opacity")) { mesh_ref_opacity(args["opacity"]); ref["opacity"] = args["opacity"]; }
+    if (args.contains("color")) { mesh_ref_color(args["color"]); ref["color"] = args["color"]; }
+    if (args.contains("transform")) {
+        const auto t = mesh_ref_transform(args["transform"]);
+        const MeshData& mesh = mesh_ref_payload(s, ref);
+        const json bbox = mesh_ref_bbox(mesh, t);
+        ref["transform"] = mesh_ref_transform_json(t);
+        mesh_ref_cache_stats(s, ref, mesh.triangle_count(), bbox);
+    }
+    return mesh_ref_commit(s, std::move(refs));
+}
+
+json doc_mesh_ref_remove(const std::string& doc_id, const json& args) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    mesh_ref_part(s);
+    const std::string id = mesh_ref_required_id(args);
+    json refs = mesh_ref_entries(s);
+    refs.erase(mesh_ref_find(refs, id));
+    return mesh_ref_commit(s, std::move(refs));
+}
+
+json doc_mesh_ref_mesh(const std::string& doc_id, const json& args) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    mesh_ref_part(s);
+    if (args.is_object() && args.contains("expected_revision")) {
+        const auto expected = mesh_ref_nonnegative(args["expected_revision"], "expected_revision");
+        if (expected != static_cast<std::uint64_t>(s.revision))
+            throw OpError("stale_revision", "mesh reference revision changed",
+                          {{"current_revision", s.revision}});
+    }
+    const std::string id = mesh_ref_required_id(args);
+    const json refs = mesh_ref_entries(s);
+    const json& ref = refs[mesh_ref_find(refs, id)];
+    const MeshData& mesh = mesh_ref_payload(s, ref);
+    const auto t = mesh_ref_transform(ref.at("transform"));
+    const std::size_t total = mesh.triangle_count();
+    const bool paged = args.contains("offset_tris") || args.contains("max_tris");
+    std::size_t offset = 0, count = total;
+    if (paged) {
+        const auto start = args.contains("offset_tris")
+            ? mesh_ref_nonnegative(args["offset_tris"], "offset_tris") : 0;
+        const auto max = args.contains("max_tris")
+            ? mesh_ref_nonnegative(args["max_tris"], "max_tris") : kMeshRefPageTriangles;
+        if (start > total || max == 0 || max > kMeshRefPageTriangles)
+            mesh_ref_error("invalid triangle page bounds");
+        offset = static_cast<std::size_t>(start);
+        count = std::min(static_cast<std::size_t>(max), total-offset);
+    } else if (mesh.vertex_count() * 78ull + total * 33ull > kMeshRefMaxReply) {
+        mesh_ref_error("mesh exceeds full response limit; request triangle pages");
+    }
+    std::vector<double> vertices;
+    std::vector<std::uint32_t> indices;
+    indices.reserve(count*3);
+    if (paged) {
+        std::unordered_map<std::uint32_t, std::uint32_t> remap;
+        remap.reserve(count*3);
+        vertices.reserve(count*9);
+        for (std::size_t i = offset*3; i < (offset+count)*3; ++i) {
+            const auto original = mesh.tris[i];
+            const auto inserted = remap.emplace(original, static_cast<std::uint32_t>(remap.size()));
+            if (inserted.second) {
+                const auto point = mesh_ref_point(mesh, original, t);
+                vertices.insert(vertices.end(), point.begin(), point.end());
+            }
+            indices.push_back(inserted.first->second);
+        }
+    } else {
+        vertices.reserve(mesh.verts.size());
+        for (std::size_t i = 0; i < mesh.vertex_count(); ++i) {
+            const auto point = mesh_ref_point(mesh, i, t);
+            vertices.insert(vertices.end(), point.begin(), point.end());
+        }
+        indices = mesh.tris;
+    }
+    return {{"ok", true}, {"vertices_mm", std::move(vertices)}, {"indices", std::move(indices)},
+            {"revision", s.revision}, {"total_tris", total}, {"offset_tris", offset},
+            {"next_offset_tris", offset+count < total ? json(offset+count) : json(nullptr)}};
 }
 
 // ============================================================ simulation studies
@@ -6838,6 +11250,7 @@ json doc_sim_study_list(const std::string& doc_id) {
 json doc_sim_study_add(const std::string& doc_id, const json& study) {
     DocLock lk;
     Session& s = require_session(doc_id);
+    push_undo(s);
     json entry = study.is_object() ? study : json::object();
     if (!s.doc.contains("studies") || !s.doc["studies"].is_array())
         s.doc["studies"] = json::array();
@@ -6847,7 +11260,6 @@ json doc_sim_study_add(const std::string& doc_id, const json& study) {
         entry["id"] = id;
     }
     s.doc["studies"].push_back(entry);
-    push_undo(s);
     s.revision += 1;
     s.study_revisions += 1;
     s.dirty = true;
@@ -6918,12 +11330,14 @@ json doc_sim_study_delete(const std::string& doc_id, const std::string& study_id
             }
             kept.push_back(el);
         }
-        if (found) s.doc["studies"] = std::move(kept);
+        if (found) {
+            push_undo(s);
+            s.doc["studies"] = std::move(kept);
+        }
     }
     if (!found)
         throw OpError("invalid_op", "no such study: " + study_id,
                       {{"reason", "unknown study"}, {"study_id", study_id}});
-    push_undo(s);
     s.revision += 1;
     s.study_revisions += 1;
     s.dirty = true;
@@ -6937,7 +11351,7 @@ json doc_sim_study_delete(const std::string& doc_id, const std::string& study_id
 // asm_world_bodies / asm_component_bodies). Returned as JSON metadata + a temp STEP
 // export per body is overkill; instead we surface per-body world bbox + name, which is
 // what the parity harness compares and what eval_interference's assembly branch consumes.
-json doc_asm_world_bodies(const std::string& doc_id, bool explode) {
+json doc_asm_world_bodies(const std::string& doc_id, bool explode, bool include_mate_axes) {
     DocLock lk;
     Session& s = require_session(doc_id);
     // Match gather_export_shapes / STEP traversal: one body can contain several solids.
@@ -6954,7 +11368,7 @@ json doc_asm_world_bodies(const std::string& doc_id, bool explode) {
         // still wants to see where each body sits in the shared frame. Compile and report each
         // surviving body's bbox — already in world coordinates (a part's transforms place
         // bodies absolutely). explode is an assembly-only concept here, so it is ignored.
-        CompileResult r = compile_session(s);
+        const CompileResult& r = ensure_compiled(s);
         json out = json::array();
         for (std::size_t i = 0; i < r.shapes.size(); ++i) {
             const TopoDS_Shape& world = r.shapes[i];
@@ -6975,9 +11389,9 @@ json doc_asm_world_bodies(const std::string& doc_id, bool explode) {
         }
         return json{{"bodies", out}, {"multibody_part", true}};
     }
-    rebuild_assembly(s);
+    ensure_assembly_current(s);
     std::map<std::string, Eigen::Vector3d> offsets;
-    if (explode && s.explode_active) offsets = explode_offsets(s.doc, s.explode_factor);
+    if (explode) offsets = session_explode_offsets(s);
     json out = json::array();
     if (s.asm_result)
         for (const AsmBodyOut& body : s.asm_result->bodies) {
@@ -6997,7 +11411,25 @@ json doc_asm_world_bodies(const std::string& doc_id, bool explode) {
             out.push_back({{"body_id", body.body_id}, {"name", body.name}, {"component", body.component_id}, {"bbox", bb},
                            {"source_ordinals", source_ordinals(world)}});
         }
-    return json{{"bodies", out}};
+    json result = {{"bodies", std::move(out)}};
+    if (include_mate_axes) {
+        json axes = json::object();
+        if (s.asm_result)
+            for (const auto& [id, refs] : s.asm_result->mate_geometry) {
+                json rows = json::array();
+                for (const AsmMateRefGeom& ref : refs) {
+                    if (ref.geom.kind != "axis") continue;
+                    const auto& p = ref.geom.point;
+                    const auto& d = ref.geom.direction;
+                    rows.push_back({{"ref_index", ref.ref_index}, {"component", ref.component},
+                                    {"point", {p.x(), p.y(), p.z()}},
+                                    {"direction", {d.x(), d.y(), d.z()}}});
+                }
+                if (!rows.empty()) axes[id] = std::move(rows);
+            }
+        result["mate_axes"] = std::move(axes);
+    }
+    return result;
 }
 
 json doc_asm_bom_components(const std::string& doc_id) {
@@ -7007,7 +11439,7 @@ json doc_asm_bom_components(const std::string& doc_id) {
     if (!pin_session(doc_id)) return json::array();
     Session& s = lk.acquire(doc_id);
     if (!s.is_assembly()) return json::array();
-    if (!s.asm_result) rebuild_assembly(s);
+    ensure_assembly_current(s);
     if (!s.asm_result) return json::array();
     // Count component-pattern instances seeded from each real component ("<seed>#<k>").
     std::map<std::string, int> instance_counts;
@@ -7037,7 +11469,8 @@ json doc_asm_bom_components(const std::string& doc_id) {
     return out;
 }
 
-bool doc_close(const std::string& doc_id) {
+// The caller holds g_open_path_mtx so reuse-open cannot select a closing session.
+static bool doc_close_with_path_lock(const std::string& doc_id) {
     // Pin the session WITHOUT erasing it yet — the erase only happens once we know the
     // session isn't mid-operation (see try_lock below).
     std::shared_ptr<Session> pin;
@@ -7069,12 +11502,24 @@ bool doc_close(const std::string& doc_id) {
         if (it == g_sessions.end()) return false;  // closed by a racing caller meanwhile
         g_sessions.erase(it);
     }
+    const std::string source_path = pin->published_source_path;
+    if (!source_path.empty()) {
+        std::lock_guard<std::mutex> lock(g_assembly_sources_mtx);
+        erase_assembly_source_locked(source_path, doc_id);
+    }
+    remove_assembly_dependencies(doc_id);
     // Drop any on-disk undo journal stubs for this doc before the session dies.
     for (const std::string& e : pin->undo_stack) drop_history_entry(e);
     for (const std::string& e : pin->redo_stack) drop_history_entry(e);
     pin->undo_stack.clear();
     pin->redo_stack.clear();
     doc.unlock();
+    if (!source_path.empty()) {
+        if (t_current_doc_lock && t_current_doc_lock->holds_any())
+            t_current_doc_lock->defer_source_change(source_path);
+        else
+            flush_assembly_source_changes({source_path});
+    }
     // With neither the doc nor registry lock held, drawings can safely project the
     // final snapshot and flag their views stale before this close returns.
     drawings_source_closed(doc_id, source_tree, source_env, source_revision);
@@ -7083,6 +11528,11 @@ bool doc_close(const std::string& doc_id) {
     // Free AICM shared-memory objects for this doc (all revisions).
     chudware::aicm_handoff::release_doc(doc_id);
     return true;
+}
+
+bool doc_close(const std::string& doc_id) {
+    std::lock_guard<std::mutex> paths(g_open_path_mtx);
+    return doc_close_with_path_lock(doc_id);
 }
 
 json doc_list() {
@@ -7098,6 +11548,7 @@ json doc_list() {
               [](const auto& a, const auto& b) { return a.first < b.first; });
     json docs = json::array();
     for (const auto& [id, sp] : pins) {
+        if (!sp->owns_journal) continue;  // private reload staging session
         std::unique_lock<std::mutex> doc(sp->mtx, std::try_to_lock);
         if (doc.owns_lock()) sp->refresh_summary();
         json entry;
@@ -7157,6 +11608,11 @@ json doc_revert(const std::string& doc_id, const std::string& checkpoint_id, lon
     s.doc = json::parse(snapshot);
     s.revision += 1;
     s.dirty = true;
+    if (s.is_assembly()) {
+        s.asm_warm.clear();
+        rebuild_assembly(s);
+        return ops_response_assembly(s, json::object());
+    }
     CompileResult r = compile_session(s);
     return warm_and_respond(s, std::move(r), json::object(), /*with_tess=*/true);
 }
@@ -7427,7 +11883,7 @@ json doc_config_set_suppression(const std::string& doc_id, const std::string& na
 // Assembly selectors stay local for mate/PM consumers; Measure world-places only
 // after binding the selector to this same body.
 json resolve_pick_assembly(Session& s, int body_id, const std::string& kind, int topo_id) {
-    if (!s.asm_result) rebuild_assembly(s);
+    ensure_assembly_current(s);
     const AssemblyResult* ares = s.asm_result.get();
     const auto body = ares ? std::find_if(ares->bodies.begin(), ares->bodies.end(),
         [body_id](const AsmBodyOut& b) { return b.body_id == body_id; })
@@ -7652,11 +12108,12 @@ bool eval_is_closed_solid(const TopoDS_Shape& shape) {
 // and every export threw "no bodies to export". No explode offset: an export captures the
 // assembled configuration, not the exploded view. Parts fall through to compile_document.
 // Mirror of tessellate_session_bodies' assembly branch, but yielding exact B-rep shapes.
-static std::vector<TopoDS_Shape> gather_export_shapes(Session& s, json* components = nullptr) {
+static std::vector<TopoDS_Shape> gather_export_shapes(Session& s, json* components = nullptr,
+                                                       bool refresh = true) {
     if (components) *components = json::array();
     if (s.is_assembly()) {
-        // A path-backed descendant can change without changing this document's revision.
-        rebuild_assembly(s);
+        // Recovery snapshots use the captured result and must never initiate a rebuild.
+        if (refresh) ensure_assembly_current(s);
         std::vector<TopoDS_Shape> shapes;
         std::map<std::string, int> solids_by_component;
         const AssemblyResult& ar = *s.asm_result;
@@ -7690,8 +12147,7 @@ static std::vector<TopoDS_Shape> gather_export_shapes(Session& s, json* componen
         }
         return shapes;
     }
-    CompileResult r = compile_session(s);
-    return r.shapes;
+    return ensure_compiled(s).shapes;
 }
 
 json doc_export_step(const std::string& doc_id, const std::string& path) {
@@ -8272,7 +12728,12 @@ ViewProjection perspective_view_projection(const PerspectiveCamera& camera, int 
 
 // `lam` is the vertex's diffuse term, carried through clipping so a body that ships
 // per-vertex normals shades SMOOTHLY (Gouraud) instead of one flat tone per triangle.
-struct ProjectedVertex { double pu, pv, pd, lam; };
+// `rgb` is the vertex's own base colour, read only for per-vertex coloured bodies (a
+// scalar field such as wall thickness).
+struct ProjectedVertex {
+    double pu, pv, pd, lam;
+    double rgb[3] = {0.0, 0.0, 0.0};
+};
 
 template <class SignedDistance>
 std::vector<ProjectedVertex> clip_halfspace(const std::vector<ProjectedVertex>& input,
@@ -8288,12 +12749,15 @@ std::vector<ProjectedVertex> clip_halfspace(const std::vector<ProjectedVertex>& 
         if (current_inside != previous_inside) {
             const double t = previous_distance /
                              (previous_distance - current_distance);
-            output.push_back({
+            ProjectedVertex cut_vertex{
                 previous.pu + t * (current.pu - previous.pu),
                 previous.pv + t * (current.pv - previous.pv),
                 previous.pd + t * (current.pd - previous.pd),
                 previous.lam + t * (current.lam - previous.lam),
-            });
+            };
+            for (int c = 0; c < 3; ++c)
+                cut_vertex.rgb[c] = previous.rgb[c] + t * (current.rgb[c] - previous.rgb[c]);
+            output.push_back(cut_vertex);
         }
         if (current_inside) output.push_back(current);
         previous = current;
@@ -8408,15 +12872,36 @@ void raster_projected_triangle(const ViewProjection& vp, const ProjectedVertex& 
     maxx = std::min(maxx, W - 1); maxy = std::min(maxy, H - 1);
     double area = (su1 - su0) * (sv2 - sv0) - (su2 - su0) * (sv1 - sv0);
     if (std::abs(area) < 1e-9) return;
+    struct RasterEdge {
+        double dx, dy, offset, inverse_area;
+        double weight(double x, double y) const {
+            return (dx * x + dy * y + offset) * inverse_area;
+        }
+    };
+    auto edge = [area](double x0, double y0, double x1, double y1) {
+        double direction = 1.0;
+        if (x0 > x1 || (x0 == x1 && y0 > y1)) {
+            std::swap(x0, x1);
+            std::swap(y0, y1);
+            direction = -1.0;
+        }
+        return RasterEdge{y0 - y1, x1 - x0, x0 * y1 - y0 * x1, direction / area};
+    };
+    // Canonical endpoints give adjacent triangles the same edge equation. Test
+    // all three edges: deriving a2 as 1-a0-a1 can round below zero on a shared
+    // diagonal and expose the opposite face through otherwise opaque geometry.
+    const auto e0 = edge(su1, sv1, su2, sv2);
+    const auto e1 = edge(su2, sv2, su0, sv0);
+    const auto e2 = edge(su0, sv0, su1, sv1);
     const double d0 = perspective ? 1.0 / p0.pd : p0.pd;
     const double d1 = perspective ? 1.0 / p1.pd : p1.pd;
     const double d2 = perspective ? 1.0 / p2.pd : p2.pd;
     for (int py = miny; py <= maxy; ++py)
         for (int px = minx; px <= maxx; ++px) {
             double fx = px + 0.5, fy = py + 0.5;
-            double a0 = ((su1 - fx) * (sv2 - fy) - (su2 - fx) * (sv1 - fy)) / area;
-            double a1 = ((su2 - fx) * (sv0 - fy) - (su0 - fx) * (sv2 - fy)) / area;
-            double a2 = 1.0 - a0 - a1;
+            double a0 = e0.weight(fx, fy);
+            double a1 = e1.weight(fx, fy);
+            double a2 = e2.weight(fx, fy);
             if (a0 < 0 || a1 < 0 || a2 < 0) continue;
             double depth = a0 * d0 + a1 * d1 + a2 * d2;
             if (!perspective && depth > clip_depth) continue;
@@ -8486,6 +12971,9 @@ constexpr int kSectionHatchPitch = 13;
 //                    nearest surviving fragment is a back face become the flat hatched CAP, a
 //                    dark 2 px outline traces the cap boundary, and the removed half is ghosted.
 //                    Null draws exactly the legacy pixels.
+//   `vertex_rgb`   — per body, 3 floats (0..1) per vertex: a scalar-field colouring (wall
+//                    thickness). A body with a matching array is drawn in those interpolated
+//                    colours instead of its base/appearance colour and orientation tint.
 bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
                         const std::vector<RenderLabel>& labels, int W, int H, RV3 viewDir,
                         const std::string& header, std::vector<unsigned char>& outImg,
@@ -8497,7 +12985,8 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
                         RenderFrame* out_frame = nullptr,
                         const PerspectiveCamera* perspective_camera = nullptr,
                         const unsigned char* background = nullptr,
-                        const SectionSpec* section = nullptr) {
+                        const SectionSpec* section = nullptr,
+                        const std::vector<std::vector<float>>* vertex_rgb = nullptr) {
     const bool perspective = perspective_camera != nullptr;
     // Camera framing reference: the drawn set unless the caller supplied a stable frame set.
     const std::vector<aicm::AicmBody>& frame_bodies =
@@ -8623,17 +13112,24 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
     // owns the depth test, Gouraud shade and alpha blend.
     auto raster_triangle = [&](const ProjectedVertex& p0, const ProjectedVertex& p1,
                                const ProjectedVertex& p2, double cr, double cg, double cb,
-                               unsigned char balpha) {
+                               unsigned char balpha, bool vertex_colored) {
         raster_projected_triangle(
             vp, p0, p1, p2, clip_depth,
             [&](size_t pi, double depth, double a0, double a1, double a2) {
                 if (depth > zbuf[pi]) {
                     zbuf[pi] = depth;
-                    // Gouraud: the diffuse term is interpolated, the base colour is flat.
+                    // Gouraud: the diffuse term is interpolated, the base colour is flat
+                    // unless the body carries per-vertex colours.
                     const double lam = a0 * p0.lam + a1 * p1.lam + a2 * p2.lam;
-                    const unsigned char R = (unsigned char)std::min(255.0, cr * 255 * lam);
-                    const unsigned char G = (unsigned char)std::min(255.0, cg * 255 * lam);
-                    const unsigned char B = (unsigned char)std::min(255.0, cb * 255 * lam);
+                    double r0 = cr, g0 = cg, b0 = cb;
+                    if (vertex_colored) {
+                        r0 = a0 * p0.rgb[0] + a1 * p1.rgb[0] + a2 * p2.rgb[0];
+                        g0 = a0 * p0.rgb[1] + a1 * p1.rgb[1] + a2 * p2.rgb[1];
+                        b0 = a0 * p0.rgb[2] + a1 * p1.rgb[2] + a2 * p2.rgb[2];
+                    }
+                    const unsigned char R = (unsigned char)std::clamp(r0 * 255 * lam, 0.0, 255.0);
+                    const unsigned char G = (unsigned char)std::clamp(g0 * 255 * lam, 0.0, 255.0);
+                    const unsigned char B = (unsigned char)std::clamp(b0 * 255 * lam, 0.0, 255.0);
                     if (balpha >= 255) {
                         img[pi * 3] = R; img[pi * 3 + 1] = G; img[pi * 3 + 2] = B;
                     } else {
@@ -8652,6 +13148,10 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
         const unsigned char balpha =
             (body_alpha && bi < body_alpha->size()) ? (*body_alpha)[bi] : (unsigned char)255;
         double br = b.color[0], bg = b.color[1], bb = b.color[2];
+        const float* vcol = (vertex_rgb && bi < vertex_rgb->size() &&
+                             (*vertex_rgb)[bi].size() == b.pos.size())
+                                ? (*vertex_rgb)[bi].data()
+                                : nullptr;
         // GSL render fix — decide the orientation hue ONCE per B-REP FACE, not per triangle.
         // The old code fed each triangle's own geometric normal to orient_tint, so a single
         // curved face (whose triangles point every which way) came back SPLATTERED with
@@ -8746,7 +13246,7 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
             } else if (orient_tint(fn.x, fn.y, fn.z, tint)) {
                 use_tint = true;  // raw mesh body (no FaceRec) -> legacy per-triangle behaviour
             }
-            if (use_tint && annotate) {   // orientation tint is an annotation — off for clean shots
+            if (use_tint && annotate && !vcol) {  // tint is an annotation — off for clean shots
                 const double mix = 0.55;
                 cr = (1 - mix) * cr + mix * (tint[0] / 255.0);
                 cg = (1 - mix) * cg + mix * (tint[1] / 255.0);
@@ -8757,8 +13257,14 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
             proj(w1.x, w1.y, w1.z, p1.pu, p1.pv, p1.pd);
             proj(w2.x, w2.y, w2.z, p2.pu, p2.pv, p2.pd);
             p0.lam = lam0; p1.lam = lam1; p2.lam = lam2;
+            if (vcol)
+                for (int c = 0; c < 3; ++c) {
+                    p0.rgb[c] = vcol[3 * i0 + c];
+                    p1.rgb[c] = vcol[3 * i1 + c];
+                    p2.rgb[c] = vcol[3 * i2 + c];
+                }
             if (!perspective && !section) {
-                raster_triangle(p0, p1, p2, cr, cg, cb, balpha);
+                raster_triangle(p0, p1, p2, cr, cg, cb, balpha, vcol != nullptr);
                 continue;
             }
             std::vector<ProjectedVertex> polygon{p0, p1, p2};
@@ -8782,7 +13288,8 @@ bool render_view_to_rgb(const std::vector<aicm::AicmBody>& bodies,
                     faces_away(vp, outward_triangle_normal(b, i0, i1, i2, fn), centroid);
             }
             for (size_t k = 1; k + 1 < polygon.size(); ++k)
-                raster_triangle(polygon[0], polygon[k], polygon[k + 1], cr, cg, cb, balpha);
+                raster_triangle(polygon[0], polygon[k], polygon[k + 1], cr, cg, cb, balpha,
+                                vcol != nullptr);
         }
     }
     const long paint_floor = (min_painted >= 0) ? (long)min_painted : (long)(W * H) / 400;
@@ -8979,7 +13486,321 @@ bool parse_render_background(const nlohmann::json& spec, unsigned char out_rgb[3
     return true;
 }
 
+// ----------------------------------------------------------- Wall-thickness study
+// One body's inscribed-sphere thickness field (geom/wall_thickness.h) on a refined copy of its
+// display tessellation. Shared by eval_thickness (the number + the colormap AICM) and the
+// thickness render option (the picture an agent looks at), so both show the same field.
+struct ThicknessStudy {
+    aicm::AicmBody body;                  // refined; FaceRec runs rebuilt over the new triangles
+    chudware::geom::ThicknessMesh mesh;   // tri_group = index into body.faces
+    chudware::geom::ThicknessResult field;
+    std::vector<double> areas;            // per vertex, mm^2
+    double spacing_mm = 0.0;
+    bool budget_limited = false;          // the requested spacing was coarsened to fit
+};
+
+const TopoDS_Shape& eval_active_shape(const CompileResult& r, const std::string& doc_id,
+                                      int body_id);
+
+// Auto spacing aims at ~150k samples per body; any spacing is coarsened past ~600k.
+constexpr double kThicknessAutoSamples = 150000.0;
+constexpr double kThicknessMaxSamples = 600000.0;
+
+// Refine `base` to the requested spacing (<= 0: auto) within the sample budget. `h` returns
+// the spacing actually used. Refinement is cheap next to measuring, so the count is checked
+// after the fact rather than predicted from the area (curved faces arrive pre-tessellated
+// far denser than any area rule assumes).
+chudware::geom::ThicknessMesh refine_to_budget(const chudware::geom::ThicknessMesh& base,
+                                               double requested, double& h) {
+    const bool auto_spacing = !(requested > 0.0);
+    const double target = auto_spacing ? kThicknessAutoSamples : kThicknessMaxSamples;
+    const double area = chudware::geom::mesh_area(base);
+    h = auto_spacing ? std::sqrt(4.0 * area / target) : requested;
+    // Never attempt a refinement predicted at more than twice the cap (bisection leaves at
+    // most ~6 area/h^2 vertices), so an over-fine request cannot exhaust memory first.
+    h = std::max(h, std::sqrt(6.0 * area / (2.0 * kThicknessMaxSamples)));
+    chudware::geom::ThicknessMesh mesh = chudware::geom::refine_mesh(base, h);
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        const auto n = static_cast<double>(mesh.n_verts());
+        // Past the base tessellation's own vertex count, coarser spacing cannot help.
+        if (n <= (auto_spacing ? 1.5 : 1.0) * target ||
+            n <= 1.05 * static_cast<double>(base.n_verts()))
+            break;
+        h *= 1.05 * std::sqrt(n / target);
+        mesh = chudware::geom::refine_mesh(base, h);
+    }
+    return mesh;
+}
+
+std::shared_ptr<const ThicknessStudy> thickness_study(Session& s, const CompileResult& r,
+                                                      int body_id, double resolution_mm) {
+    const TopoDS_Shape& shape = eval_active_shape(r, s.doc_id, body_id);
+    const int index = body_id >= 1 ? body_id : static_cast<int>(r.shapes.size());
+    const std::string key = s.doc_id + "#" + std::to_string(s.revision) + "#" +
+                            std::to_string(index) + "#" + std::to_string(resolution_mm);
+    // Small per-process memo: an agent's wall_thickness call evaluates, then renders several
+    // views of the same revision. Keyed by revision, so an edit never serves a stale field.
+    static std::mutex memo_mtx;
+    static std::deque<std::pair<std::string, std::shared_ptr<const ThicknessStudy>>> memo;
+    {
+        std::lock_guard<std::mutex> g(memo_mtx);
+        for (const auto& [k, v] : memo)
+            if (k == key) return v;
+    }
+
+    const std::string name =
+        index >= 1 && index <= static_cast<int>(r.bodies_info.size())
+            ? r.bodies_info[static_cast<std::size_t>(index - 1)].name
+            : std::string();
+    const float color[3] = {0.71f, 0.76f, 0.82f};
+    // The display deflections: BRepMesh keeps the triangulation the viewport already built,
+    // so measuring never re-meshes (or coarsens/refines) the shape the display shares.
+    const ::geom::DisplayDeflections d = ::geom::display_deflections(s.display_quality, shape);
+    aicm::AicmBody base = ::geom::tessellate_body(shape, 1, name.empty() ? "Body1" : name,
+                                                  color, d.lin, d.ang);
+
+    chudware::geom::ThicknessMesh mesh0;
+    mesh0.pos = base.pos.vec();
+    mesh0.idx = base.idx.vec();
+    const std::size_t nv = mesh0.n_verts(), nt = mesh0.n_tris();
+    mesh0.nrm.assign(3 * nv, 0.0f);
+    if (base.nrm.size() == base.pos.size()) {
+        mesh0.nrm = base.nrm.vec();
+    } else {
+        for (std::size_t t = 0; t < nt; ++t) {
+            const uint32_t* v = &mesh0.idx[3 * t];
+            float e1[3], e2[3];
+            for (int k = 0; k < 3; ++k) {
+                e1[k] = mesh0.pos[3 * v[1] + k] - mesh0.pos[3 * v[0] + k];
+                e2[k] = mesh0.pos[3 * v[2] + k] - mesh0.pos[3 * v[0] + k];
+            }
+            const float c[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2],
+                                e1[0] * e2[1] - e1[1] * e2[0]};
+            for (int j = 0; j < 3; ++j)
+                for (int k = 0; k < 3; ++k) mesh0.nrm[3 * v[j] + k] += c[k];
+        }
+    }
+    for (std::size_t i = 0; i < nv; ++i) {
+        float* n = &mesh0.nrm[3 * i];
+        const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        if (len > 1e-12f)
+            for (int k = 0; k < 3; ++k) n[k] /= len;
+    }
+    const auto no_face = static_cast<uint32_t>(base.faces.size());
+    mesh0.tri_group.assign(nt, no_face);
+    for (std::size_t fi = 0; fi < base.faces.size(); ++fi) {
+        const aicm::FaceRec& fr = base.faces[fi];
+        const std::size_t last = std::min<std::size_t>(std::size_t{fr.first_tri} + fr.tri_count, nt);
+        for (std::size_t t = fr.first_tri; t < last; ++t)
+            mesh0.tri_group[t] = static_cast<uint32_t>(fi);
+    }
+
+    double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
+    for (std::size_t i = 0; i < nv; ++i)
+        for (int k = 0; k < 3; ++k) {
+            lo[k] = std::min(lo[k], static_cast<double>(mesh0.pos[3 * i + k]));
+            hi[k] = std::max(hi[k], static_cast<double>(mesh0.pos[3 * i + k]));
+        }
+    const double diag = nv ? std::sqrt((hi[0] - lo[0]) * (hi[0] - lo[0]) +
+                                       (hi[1] - lo[1]) * (hi[1] - lo[1]) +
+                                       (hi[2] - lo[2]) * (hi[2] - lo[2]))
+                           : 1.0;
+    auto study = std::make_shared<ThicknessStudy>();
+    double h = 0.0;
+    study->mesh = refine_to_budget(mesh0, resolution_mm, h);
+    study->spacing_mm = h;
+    study->budget_limited = resolution_mm > 0.0 && h > resolution_mm * (1.0 + 1e-9);
+    study->areas = chudware::geom::vertex_areas(study->mesh);
+
+    chudware::geom::ThicknessOptions opt;
+    opt.coverage_radius_mm = std::max(10.0 * h, 0.1 * diag);
+    opt.coverage_tolerance_mm = 0.1 * h;
+    study->field = chudware::geom::measure_wall_thickness(study->mesh.pos, study->mesh.nrm,
+                                                          study->mesh.pos, study->mesh.nrm, opt);
+
+    // The refined display body: same identity, edges and B-rep vertices; FaceRec runs
+    // re-measured (refinement replaces each triangle by its children in place).
+    aicm::AicmBody& body = study->body;
+    body = base;
+    body.pos.clear();
+    body.pos.insert_end(study->mesh.pos.begin(), study->mesh.pos.end());
+    body.nrm.clear();
+    body.nrm.insert_end(study->mesh.nrm.begin(), study->mesh.nrm.end());
+    body.idx.clear();
+    body.idx.insert_end(study->mesh.idx.begin(), study->mesh.idx.end());
+    body.faces.clear();
+    const std::vector<uint32_t>& groups = study->mesh.tri_group;
+    for (std::size_t t = 0; t < groups.size();) {
+        std::size_t e = t;
+        while (e < groups.size() && groups[e] == groups[t]) ++e;
+        if (groups[t] != no_face) {
+            aicm::FaceRec fr = base.faces[groups[t]];
+            fr.first_tri = static_cast<uint32_t>(t);
+            fr.tri_count = static_cast<uint32_t>(e - t);
+            body.faces.push_back(fr);
+        }
+        t = e;
+    }
+
+    std::lock_guard<std::mutex> g(memo_mtx);
+    memo.emplace_back(key, study);
+    while (memo.size() > 6) memo.pop_front();
+    return study;
+}
+
+// The measured thickness direction at sample i: from the measuring ball's centre to the
+// opposing wall point that set it (null when unmeasured).
+json wall_direction_json(const chudware::geom::ThicknessResult& f, std::size_t i) {
+    const float* c = &f.center[3 * i];
+    const float* q = &f.opposite[3 * i];
+    const double d[3] = {q[0] - c[0], q[1] - c[1], q[2] - c[2]};
+    const double len = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    return len > 1e-12 ? json::array({d[0] / len, d[1] / len, d[2] / len}) : json(nullptr);
+}
+
+// Thin = red: v <= min_wall saturates red, the jet ramp runs backwards across
+// (min_wall, max_mm], v >= max_mm is blue, unmeasured is neutral grey. Same stops as the
+// viewport ramp (host/src/result_ramp.h) so an agent's picture reads like the GUI.
+void thickness_rgb(float v, double min_wall, double max_mm, float out[3]) {
+    if (!std::isfinite(v)) {
+        out[0] = out[1] = out[2] = 0.62f;
+        return;
+    }
+    static const float kStops[5][4] = {{0.00f, 0.00f, 0.10f, 0.55f},
+                                       {0.25f, 0.00f, 0.70f, 0.90f},
+                                       {0.50f, 0.10f, 0.80f, 0.20f},
+                                       {0.75f, 0.95f, 0.85f, 0.00f},
+                                       {1.00f, 0.85f, 0.10f, 0.10f}};
+    double t = (v - min_wall) / std::max(max_mm - min_wall, 1e-9);
+    t = 1.0 - std::clamp(t, 0.0, 1.0);
+    int k = 0;
+    while (k < 3 && t > kStops[k + 1][0]) ++k;
+    const double f = (t - kStops[k][0]) / (kStops[k + 1][0] - kStops[k][0]);
+    for (int c = 0; c < 3; ++c)
+        out[c] = static_cast<float>(kStops[k][c + 1] + (kStops[k + 1][c + 1] - kStops[k][c + 1]) * f);
+}
+
+// view.thickness {min_wall_mm, max_mm?, resolution?}: replace the drawn bodies with every
+// solid's thickness-coloured refined mesh. Returns false (reason set) on a bad spec.
+struct ThicknessView {
+    double min_wall_mm = 0.0, max_mm = 0.0, resolution_mm = 0.0;
+};
+bool parse_thickness_view(const json& view, std::optional<ThicknessView>& out,
+                          std::string& reason) {
+    out.reset();
+    if (!view.is_object() || !view.contains("thickness") || view.at("thickness").is_null())
+        return true;
+    const json& spec = view.at("thickness");
+    const auto number = [&](const char* key, double fallback, double& v) {
+        if (!spec.contains(key) || spec.at(key).is_null()) {
+            v = fallback;
+            return true;
+        }
+        if (!spec.at(key).is_number()) return false;
+        v = spec.at(key).get<double>();
+        return std::isfinite(v);
+    };
+    ThicknessView tv;
+    if (!spec.is_object() || !number("min_wall_mm", 0.0, tv.min_wall_mm) ||
+        !(tv.min_wall_mm > 0.0)) {
+        reason = "thickness.min_wall_mm must be a positive number (mm)";
+        return false;
+    }
+    if (!number("max_mm", 3.0 * tv.min_wall_mm, tv.max_mm) || !(tv.max_mm > tv.min_wall_mm)) {
+        reason = "thickness.max_mm must be a number greater than min_wall_mm";
+        return false;
+    }
+    if (!number("resolution", 0.0, tv.resolution_mm) || tv.resolution_mm < 0.0) {
+        reason = "thickness.resolution must be a non-negative number (mm)";
+        return false;
+    }
+    out = tv;
+    return true;
+}
+
+// Bodies + per-vertex colours for a thickness view, and the reply's `thickness` echo.
+void thickness_view_bodies(Session& s, const ThicknessView& tv,
+                           std::vector<aicm::AicmBody>& bodies,
+                           std::vector<std::vector<float>>& colors, json& echo) {
+    if (s.is_assembly())
+        throw OpError("invalid_op",
+                      "thickness views measure part bodies; open the component to analyze it",
+                      {{"reason", "assembly"}});
+    const CompileResult& r = ensure_compiled(s);
+    bodies.clear();
+    colors.clear();
+    double vmin = std::numeric_limits<double>::infinity(), spacing = 0.0;
+    for (std::size_t i = 0; i < r.shapes.size(); ++i) {
+        const auto study = thickness_study(s, r, static_cast<int>(i + 1), tv.resolution_mm);
+        bodies.push_back(study->body);
+        bodies.back().body_id = static_cast<uint32_t>(i + 1);
+        const std::vector<float>& values = study->field.thickness;
+        std::vector<float> rgb(3 * values.size());
+        for (std::size_t v = 0; v < values.size(); ++v) {
+            thickness_rgb(values[v], tv.min_wall_mm, tv.max_mm, &rgb[3 * v]);
+            if (std::isfinite(values[v])) vmin = std::min(vmin, static_cast<double>(values[v]));
+        }
+        colors.push_back(std::move(rgb));
+        spacing = std::max(spacing, study->spacing_mm);
+    }
+    echo = {{"min_wall_mm", tv.min_wall_mm}, {"max_mm", tv.max_mm},
+            {"min_thickness_mm", std::isfinite(vmin) ? json(vmin) : json(nullptr)},
+            {"spacing_mm", spacing}};
+}
+
+// Header legend in the 5x7 font's alphabet (it has no < > = glyphs).
+std::string thickness_header(const ThicknessView& tv) {
+    const auto fmt = [](double v) {
+        char buf[32];
+        std::snprintf(buf, sizeof buf, "%g", v);
+        return std::string(buf);
+    };
+    return "RED UNDER " + fmt(tv.min_wall_mm) + " BLUE OVER " + fmt(tv.max_mm) + " MM";
+}
+
 }  // namespace
+
+// Routing must not silently omit an obstacle when tessellation fails.
+chudware::harness::Scene doc_harness_scene(const std::string& doc_id) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    chudware::harness::Scene scene;
+    const auto append = [&](const TopoDS_Shape& shape, int id,
+                            const std::string& name, const std::string& component) {
+        if (shape.IsNull()) return;
+        TopExp_Explorer solids(shape, TopAbs_SOLID);
+        if (!solids.More()) return;
+        const float color[3] = {0.62f, 0.70f, 0.82f};
+        const auto deflection = ::geom::display_deflections(s.display_quality, shape);
+        auto mesh = ::geom::tessellate_body(shape, static_cast<uint32_t>(id), name,
+                                            color, deflection.lin, deflection.ang);
+        if (mesh.idx.empty() || mesh.pos.empty())
+            throw OpError("geometry_unavailable", "Could not tessellate a harness obstacle",
+                          {{"body_id", id}, {"name", name}});
+        chudware::harness::SceneBody body;
+        body.id = id;
+        body.name = name;
+        body.component = component;
+        body.pos.assign(mesh.pos.vec().begin(), mesh.pos.vec().end());
+        body.idx.assign(mesh.idx.vec().begin(), mesh.idx.vec().end());
+        scene.bodies.push_back(std::move(body));
+    };
+    if (s.is_assembly()) {
+        ensure_assembly_current(s);
+        if (s.asm_result)
+            for (const AsmBodyOut& body : s.asm_result->bodies)
+                append(placed_world_shape(body, std::nullopt), body.body_id,
+                       body.name, body.component_id);
+    } else {
+        const CompileResult& result = ensure_compiled(s);
+        for (std::size_t i = 0; i < result.shapes.size(); ++i) {
+            const std::string name = i < result.bodies_info.size()
+                ? result.bodies_info[i].name : "Body" + std::to_string(i + 1);
+            append(result.shapes[i], static_cast<int>(i + 1), name, name);
+        }
+    }
+    return scene;
+}
 
 // Tessellate the surviving solids of `s` into AICM bodies (no lock — callers hold g_mtx).
 static std::vector<aicm::AicmBody> tessellate_session_bodies(Session& s) {
@@ -8990,7 +13811,7 @@ static std::vector<aicm::AicmBody> tessellate_session_bodies(Session& s) {
     // to nothing (compile_document sees no features), which broke CFD/render on assemblies.
     // No explode offset here: consumers (CFD, iso render) want the assembled configuration.
     if (s.is_assembly()) {
-        if (!s.asm_result) rebuild_assembly(s);
+        ensure_assembly_current(s);
         const AssemblyResult* ares = s.asm_result.get();
         if (ares)
             for (const AsmBodyOut& body : ares->bodies) {
@@ -9008,7 +13829,7 @@ static std::vector<aicm::AicmBody> tessellate_session_bodies(Session& s) {
             }
         return bodies;
     }
-    CompileResult r = compile_session(s);
+    const CompileResult& r = ensure_compiled(s);
     uint32_t id = 1;
     const float color[3] = {0.62f, 0.70f, 0.82f};
     for (const auto& shp : r.shapes) {
@@ -9070,7 +13891,7 @@ static std::vector<RenderLabel> principal_face_labels(Session& s) {
     std::vector<RenderLabel> labels;
     if (s.is_assembly()) return labels;
     try {
-        CompileResult r = compile_session(s);
+        const CompileResult& r = ensure_compiled(s);
         if (r.shapes.empty()) return labels;
         const TopoDS_Shape& shp = r.shapes.back();
         struct Dir { const char* side; const char* label; RV3 nrm; unsigned char c[3]; };
@@ -9178,6 +13999,13 @@ json doc_render_view(const std::string& doc_id, const std::string& out_path,
                             {"reason", section_reason}, {"path", std::string()}};
             has_section = parsed > 0;
         }
+        std::optional<ThicknessView> thickness;
+        {
+            std::string thickness_reason;
+            if (!parse_thickness_view(view, thickness, thickness_reason))
+                return json{{"ok", false}, {"code", "thickness_invalid"},
+                            {"reason", thickness_reason}, {"path", std::string()}};
+        }
 
         int W = 512, H = 400;
         json requested_W = W, requested_H = H;
@@ -9222,7 +14050,13 @@ json doc_render_view(const std::string& doc_id, const std::string& out_path,
             requested_H = H;
         }
 
-        std::vector<aicm::AicmBody> bodies = tessellate_session_bodies(s);
+        std::vector<aicm::AicmBody> bodies;
+        std::vector<std::vector<float>> thickness_colors;
+        json thickness_echo;
+        if (thickness)
+            thickness_view_bodies(s, *thickness, bodies, thickness_colors, thickness_echo);
+        else
+            bodies = tessellate_session_bodies(s);
         if (bodies.empty()) return json{{"ok", false}, {"reason", "no bodies"}};
         std::string dims = bbox_dims_label(bodies);
         RenderFocus fbox;
@@ -9272,6 +14106,8 @@ json doc_render_view(const std::string& doc_id, const std::string& out_path,
                       + fmt1(fbox.hi.y - fbox.lo.y) + " X "
                       + fmt1(fbox.hi.z - fbox.lo.z) + " MM";
             if (fbox.clip_near) header += "  CUTAWAY";
+        } else if (!header.empty() && thickness) {
+            header += "  " + thickness_header(*thickness);
         } else if (!header.empty() && !dims.empty()) {
             header += "  " + dims;
         }
@@ -9289,7 +14125,8 @@ json doc_render_view(const std::string& doc_id, const std::string& out_path,
                                      /*frame_from=*/nullptr, min_painted,
                                      has_focus ? &fbox : nullptr, &frame, camera,
                                      has_bg ? bg : nullptr,
-                                     has_section ? &section : nullptr);
+                                     has_section ? &section : nullptr,
+                                     thickness ? &thickness_colors : nullptr);
         if (ok) {
             std::string png = encode_png_rgb(W, H, img);
             std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
@@ -9299,6 +14136,7 @@ json doc_render_view(const std::string& doc_id, const std::string& out_path,
                  {"view", rv.name}, {"dims", dims},
                  {"dir", json::array({rv.dir.x, rv.dir.y, rv.dir.z})}};
         if (has_section) out["section"] = section_spec_json(section);
+        if (thickness) out["thickness"] = thickness_echo;
         if (frame.W > 0 && camera) {
             const double tan_half_fov = std::tan(
                 camera->vertical_fov_deg * 3.14159265358979323846 / 360.0);
@@ -10032,14 +14870,29 @@ json doc_render_contact_sheet(const std::string& doc_id, const std::string& out_
         const bool has_bg = parse_render_background(background, bg);
         for (const auto& sp : specs) {
             ResolvedView rv = resolve_view_spec(sp);
-            std::string header = rv.name + (dims.empty() ? "" : "  " + dims);
+            std::optional<ThicknessView> thickness;
+            std::string thickness_reason;
+            if (!parse_thickness_view(sp, thickness, thickness_reason))
+                return json{{"ok", false}, {"code", "thickness_invalid"},
+                            {"reason", thickness_reason}};
+            std::vector<aicm::AicmBody> thickness_bodies;
+            std::vector<std::vector<float>> thickness_colors;
+            json thickness_echo;
+            if (thickness)
+                thickness_view_bodies(s, *thickness, thickness_bodies, thickness_colors,
+                                      thickness_echo);
+            std::string header =
+                rv.name + (thickness ? "  " + thickness_header(*thickness)
+                                     : (dims.empty() ? "" : "  " + dims));
             std::vector<unsigned char> img;
-            if (!render_view_to_rgb(bodies, labels, TW, TH, rv.dir, header, img,
+            if (!render_view_to_rgb(thickness ? thickness_bodies : bodies, labels, TW, TH, rv.dir,
+                                    header, img,
                                     /*annotate=*/true, /*body_alpha=*/nullptr,
                                     /*frame_from=*/nullptr, /*min_painted=*/-1,
                                     /*focus=*/nullptr, /*out_frame=*/nullptr,
                                     /*perspective_camera=*/nullptr,
-                                    has_bg ? bg : nullptr)) {
+                                    has_bg ? bg : nullptr, /*section=*/nullptr,
+                                    thickness ? &thickness_colors : nullptr)) {
                 // blank tile rather than dropping the slot — in the caller's own background,
                 // with a label that contrasts against it.
                 img.resize((size_t)TW * TH * 3);
@@ -10569,11 +15422,15 @@ json doc_query(const std::string& doc_id, const json& query) {
                       ? query["body_id"].get<int>() : 0;
     TopoDS_Shape shape;
     if (body_id >= 1) {
-        CompileResult r;
-        if (s.is_assembly())
-            r.shapes = gather_export_shapes(s);
-        else
-            r = compile_session(s);
+        CompileResult assembly_result;
+        const CompileResult* compiled;
+        if (s.is_assembly()) {
+            assembly_result.shapes = gather_export_shapes(s);
+            compiled = &assembly_result;
+        } else {
+            compiled = &ensure_compiled(s);
+        }
+        const CompileResult& r = *compiled;
         if (r.shapes.empty())
             throw_no_bodies(doc_id, r, "query");
         if (body_id > static_cast<int>(r.shapes.size()))
@@ -10585,20 +15442,16 @@ json doc_query(const std::string& doc_id, const json& query) {
     } else {
         shape = whole_doc_shape(s);
         if (shape.IsNull()) {
-            CompileResult r = compile_session(s);
+            const CompileResult& r = ensure_compiled(s);
             throw_no_bodies(doc_id, r, "query");
         }
     }
-    chudware::doc::QueryPicks qp = chudware::doc::resolve_geom_query(shape, query);
-    if (!qp.error.empty())
-        throw OpError("invalid_op", qp.error);
-    // Owner-map join keys (2026-09-27): owner_map addresses topology as [body ordinal,
-    // per-body 1-based TopExp index], while hint_index counts across the WHOLE document.
-    // Stamp both on every face/edge match so a caller joins exactly on a multi-body part
-    // instead of assuming one body (every feature on body 1 used to read as "consumed" as
-    // soon as a floating rib made a body 2).
-    if (qp.selectors.is_array() && !s.is_assembly()) {
-        std::vector<std::pair<int, int>> counts;  // per body: (faces, edges)
+    // Per-body topology sizes: (faces, edges) of each body's own TopExp unique map. Owner-map
+    // join keys address topology as [body ordinal, per-body 1-based TopExp index], while
+    // hint_index / the resolver's candidate index count across the WHOLE document — this table
+    // converts between the two (and resolves `within`).
+    std::vector<std::pair<int, int>> counts;
+    if (!s.is_assembly()) {
         if (body_id >= 1) {
             counts.assign(static_cast<std::size_t>(body_id), {0, 0});
             TopTools_IndexedMapOfShape fm, em;
@@ -10613,11 +15466,90 @@ json doc_query(const std::string& doc_id, const json& query) {
                 counts.emplace_back(fm.Extent(), em.Extent());
             }
         }
+    }
+    // `within`: [[body, topo], ...] — restrict the candidates to exactly those elements (the
+    // join key every match carries; query_geometry(owner=…) sends a feature's owned elements).
+    // Positional predicates (side/pick/near/count/index) then act INSIDE that set. A pair that
+    // names no element of the live document (the tree moved) simply admits nothing.
+    std::set<int> admitted_set;
+    const std::set<int>* admitted = nullptr;
+    if (query.is_object() && query.contains("within")) {
+        if (s.is_assembly())
+            throw OpError("invalid_op",
+                          "within is not supported on assembly documents (their elements are "
+                          "addressed per component)", {{"reason", "bad within"}});
+        const json& within = query["within"];
+        if (!within.is_array())
+            throw OpError("invalid_op",
+                          "within must be a list of [body, topo] pairs (the `body`/`topo` every "
+                          "query match carries)", {{"reason", "bad within"}});
+        std::string of = query.value("of", std::string("face"));
+        std::transform(of.begin(), of.end(), of.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        const bool want_edges = (of == "edge");
+        std::vector<int> offset(counts.size() + 1, 0);
+        for (std::size_t b = 0; b < counts.size(); ++b)
+            offset[b + 1] = offset[b] + (want_edges ? counts[b].second : counts[b].first);
+        for (const json& pair : within) {
+            if (!pair.is_array() || pair.size() != 2 || !pair[0].is_number_integer() ||
+                !pair[1].is_number_integer())
+                throw OpError("invalid_op",
+                              "within must be a list of [body, topo] integer pairs",
+                              {{"reason", "bad within"}});
+            const int b = pair[0].get<int>(), t = pair[1].get<int>();
+            if (b < 1 || b > static_cast<int>(counts.size()) || t < 1) continue;
+            const int n = want_edges ? counts[b - 1].second : counts[b - 1].first;
+            if (t > n) continue;
+            admitted_set.insert(offset[b - 1] + t - 1);
+        }
+        admitted = &admitted_set;
+    }
+    chudware::doc::QueryPicks qp = chudware::doc::resolve_geom_query(shape, query, admitted, true);
+    if (!qp.error.empty())
+        throw OpError("invalid_op", qp.error);
+    if (query.contains("fastener_geometry")) {
+        if (!query["fastener_geometry"].is_boolean())
+            throw OpError("invalid_op", "fastener_geometry must be a boolean");
+        if (query["fastener_geometry"].get<bool>())
+            chudware::doc::add_fastener_geometry(shape, qp);
+    }
+    // Assembly queries with an explicit body_id use the same per-body topology
+    // numbering as the geometry evidence above.
+    if (s.is_assembly() && body_id >= 1) {
+        for (json& m : qp.selectors) {
+            if (m.contains("hint_index") && m["hint_index"].is_number_integer()) {
+                m["body"] = body_id;
+                m["topo"] = m["hint_index"].get<int>() + 1;
+            }
+        }
+    }
+    // Stamp both join keys on every face/edge match so a caller joins exactly on a multi-body
+    // part instead of assuming one body (every feature on body 1 used to read as "consumed"
+    // as soon as a floating rib made a body 2).
+    if (qp.selectors.is_array() && !s.is_assembly()) {
+        std::map<std::pair<int, int>, const std::string*> owners;
+        bool owners_loaded = false;
         for (json& m : qp.selectors) {
             if (!m.is_object() || !m.contains("hint_index") || !m["hint_index"].is_number_integer())
                 continue;
             const std::string kind = m.value("kind", std::string());
             if (kind != "face" && kind != "edge") continue;
+            if (!owners_loaded) {
+                const json& owner_map = ensure_compiled(s).owner_map;
+                if (owner_map.is_object()) {
+                    for (auto it = owner_map.begin(); it != owner_map.end(); ++it) {
+                        auto elements = it.value().find(kind == "face" ? "faces" : "edges");
+                        if (elements == it.value().end() || !elements->is_array()) continue;
+                        for (const json& pair : *elements) {
+                            if (pair.is_array() && pair.size() == 2 &&
+                                pair[0].is_number_integer() && pair[1].is_number_integer())
+                                owners.emplace(std::make_pair(pair[0].get<int>(), pair[1].get<int>()),
+                                               &it.key());
+                        }
+                    }
+                }
+                owners_loaded = true;
+            }
             int h = m["hint_index"].get<int>();
             const std::size_t first = body_id >= 1 ? static_cast<std::size_t>(body_id - 1) : 0;
             for (std::size_t b = first; b < counts.size(); ++b) {
@@ -10625,6 +15557,8 @@ json doc_query(const std::string& doc_id, const json& query) {
                 if (h < n) {
                     m["body"] = static_cast<int>(b) + 1;
                     m["topo"] = h + 1;
+                    auto owner = owners.find({static_cast<int>(b) + 1, h + 1});
+                    if (owner != owners.end()) m["owner_feature"] = *owner->second;
                     break;
                 }
                 h -= n;
@@ -10632,7 +15566,16 @@ json doc_query(const std::string& doc_id, const json& query) {
         }
     }
     int count = qp.selectors.is_array() ? static_cast<int>(qp.selectors.size()) : 0;
-    return json{{"count", count}, {"matches", qp.selectors}};
+    json reply{{"count", count}, {"matches", qp.selectors}};
+    // A sid is a 24-bit geometry hash: identical instances and rare collisions share one. Name
+    // every shared sid among the matches (sid -> how many elements carry it) so the caller
+    // cannot bind "the" element with it unknowingly.
+    if (!qp.shared_sids.empty()) {
+        json shared = json::object();
+        for (const auto& [sid, n] : qp.shared_sids) shared[sid] = n;
+        reply["ambiguous_sids"] = std::move(shared);
+    }
+    return reply;
 }
 
 // doc_adjacency (GSL W3) — the face-adjacency graph the flat read-back never exposed. For each
@@ -10643,7 +15586,7 @@ json doc_query(const std::string& doc_id, const json& query) {
 json doc_adjacency(const std::string& doc_id) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    CompileResult r = compile_session(s);
+    const CompileResult& r = ensure_compiled(s);
     if (r.shapes.empty())
         throw_no_bodies(doc_id, r, "adjacency");
     const TopoDS_Shape& shape = r.shapes.back();
@@ -10700,6 +15643,8 @@ json doc_adjacency(const std::string& doc_id) {
             }
         } catch (const Standard_Failure&) {}
         edges.push_back({{"between", json::array({ia, ib})},
+                         {"between_sids", json::array({chudware::doc::selector_sid(faces[ia]),
+                                                       chudware::doc::selector_sid(faces[ib])})},
                          {"convex", convex},
                          {"surf", edge_surf},
                          {"length", round6(gp.Mass())}});
@@ -10710,7 +15655,11 @@ json doc_adjacency(const std::string& doc_id) {
         json sel = chudware::doc::make_selector(faces[i]);  // reuse Stage-0 side/surf
         json nb = json::array();
         for (int n : nbr[i]) nb.push_back(n);
+        // `ord` is only meaningful inside THIS reply; `sid` is the handle every other
+        // geometry tool (query_geometry, hover, measure_between) speaks, so the graph can be
+        // joined to them. A shared sid (identical instances / hash collision) is not unique.
         jfaces.push_back({{"ord", (int)i},
+                          {"sid", sel["sid"]},
                           {"surf", sel["surf"]},
                           {"side", sel["side"]},
                           {"concavity", sel["concavity"]},
@@ -10722,14 +15671,33 @@ json doc_adjacency(const std::string& doc_id) {
 // doc_set_meta / doc_get_meta — generic opaque document metadata, persisted inside the .step+
 // exactly like `studies` (the engine never interprets it). The intake subsystem keeps its
 // MeasuredPartProfile / ProcessProfile / CriticalDimensionLedger / FitReport / IntakeState here.
-json doc_set_meta(const std::string& doc_id, const std::string& key, const json& value) {
+json doc_set_meta(const std::string& doc_id, const std::string& key, const json& value,
+                  const std::string& member, const json& preserve) {
     DocLock lk;
     Session& s = require_session(doc_id);
     if (!s.doc.contains("meta") || !s.doc["meta"].is_object())
         s.doc["meta"] = json::object();
-    s.doc["meta"][key] = value;
+    if (member.empty()) {
+        s.doc["meta"][key] = value;
+    } else {
+        json& map = s.doc["meta"][key];
+        if (!map.is_object()) map = json::object();
+        auto it = map.find(member);
+        if (it != map.end() && it->is_object() && preserve.is_object() && !preserve.empty()) {
+            bool matches = true;
+            for (auto p = preserve.begin(); p != preserve.end(); ++p) {
+                auto existing = it->find(p.key());
+                if (existing == it->end() || *existing != p.value()) { matches = false; break; }
+            }
+            if (matches) return json{{"ok", true}, {"key", key}, {"revision", s.revision},
+                                     {"metadata_revision", s.metadata_revision}};
+        }
+        map[member] = value;
+    }
     s.dirty = true;
-    return json{{"ok", true}, {"key", key}};
+    ++s.metadata_revision;
+    return json{{"ok", true}, {"key", key}, {"revision", s.revision},
+                {"metadata_revision", s.metadata_revision}};
 }
 
 json doc_get_meta(const std::string& doc_id, const std::string& key) {
@@ -10749,12 +15717,14 @@ json doc_set_name(const std::string& doc_id, const std::string& name) {
     if (a != std::string::npos) {
         std::size_t b = name.find_last_not_of(" \t\r\n\f\v");
         std::string trimmed = name.substr(a, b - a + 1);
-        if (!trimmed.empty()) {
-            s.doc["name"] = trimmed;
+        if (!trimmed.empty() && (!s.doc.contains("name") || s.doc["name"] != trimmed)) {
+            s.doc["name"] = std::move(trimmed);
             s.dirty = true;
+            ++s.metadata_revision;
         }
     }
-    return json{{"ok", true}, {"name", s.doc.value("name", std::string())}};
+    return json{{"ok", true}, {"name", s.doc.value("name", std::string())},
+                {"revision", s.revision}, {"metadata_revision", s.metadata_revision}};
 }
 
 json doc_face_points(const std::string& doc_id, const json& selector, int max_n) {
@@ -10770,7 +15740,7 @@ json doc_face_points(const std::string& doc_id, const json& selector, int max_n)
     // dangling against whichever body compiled last. Single-body docs are unchanged.
     const TopoDS_Shape shape = whole_doc_shape(s);
     if (shape.IsNull()) {
-        CompileResult rr_fail = compile_session(s);
+        const CompileResult& rr_fail = ensure_compiled(s);
         throw_no_bodies(doc_id, rr_fail, "evaluate");
     }
 
@@ -11053,6 +16023,18 @@ json doc_eval_mass(const std::string& doc_id, int body_id,
     DocLock lk;
     Session& s = require_session(doc_id);
     constexpr double kDefaultDensity = 7.85;
+    // An explicit density is g/cm^3. Osmium, the densest element, is 22.6, so anything past 25
+    // is a unit slip (7850 is steel in kg/m^3 and would make the mass 1000x too large).
+    constexpr double kMaxDensityGcm3 = 25.0;
+    if (density_g_cm3 &&
+        (!std::isfinite(*density_g_cm3) || *density_g_cm3 <= 0.0 || *density_g_cm3 > kMaxDensityGcm3))
+        throw OpError("invalid_op",
+                      "density_g_cm3=" + std::to_string(*density_g_cm3) +
+                          " is not a physical density in g/cm^3 (0 < rho <= 25; steel 7.85, "
+                          "aluminium 2.70, ABS 1.04, osmium 22.6). A value in the thousands is "
+                          "kg/m^3 — divide by 1000.",
+                      {{"reason", "density unit"}, {"density_g_cm3", *density_g_cm3},
+                       {"max_density_g_cm3", kMaxDensityGcm3}});
     std::map<std::string, std::optional<double>> registry_density;
     auto material_for = [&](const std::string& key, const char* assigned_source) -> json {
         if (density_g_cm3) return json{{"density_g_cm3", *density_g_cm3}, {"source", "explicit"}};
@@ -11071,6 +16053,8 @@ json doc_eval_mass(const std::string& doc_id, int body_id,
                     {"unresolved_key", true}};
     };
 
+    // Only compiled shapes are physical bodies; mesh_references are display and
+    // measurement overlays and never contribute mass, volume, or body counts.
     // Flatten the surviving bodies into their individual CONNECTED solids. An in-document
     // boolean fuse / boss-merge of two DISJOINT solids (e.g. two cylinders placed far
     // apart) yields a single TopoDS_Compound holding multiple TopAbs_SOLIDs — OCCT does
@@ -11116,21 +16100,21 @@ json doc_eval_mass(const std::string& doc_id, int body_id,
             }
         }
     } else {
-        r = compile_session(s);
-        if (r.shapes.empty()) throw_no_bodies(doc_id, r, "evaluate");
+        const CompileResult& part = ensure_compiled(s);
+        if (part.shapes.empty()) throw_no_bodies(doc_id, part, "evaluate");
         const json body_materials = s.doc.value("body_materials", json::object());
-        for (std::size_t i = 0; i < r.shapes.size(); ++i) {
+        for (std::size_t i = 0; i < part.shapes.size(); ++i) {
             const uint32_t body_num = static_cast<uint32_t>(i + 1);
             const bool overridden =
                 body_materials.is_object() && body_materials.contains("b" + std::to_string(body_num));
-            add_exploded(r.shapes[i],
+            add_exploded(part.shapes[i],
                          material_for(doc_body_material_key(s.doc, body_num),
                                       overridden ? "body_material" : "document_material"));
         }
     }
 
     // Build the mass-props JSON block from a computed GProp_GProps (volume, mass, COM, the inertia
-    // tensor about the global origin, and its principal moments/axes). `scale` turns the props'
+    // tensor about the centre of mass, and its principal moments/axes). `scale` turns the props'
     // Mass()/inertia into grams (a unit-density volume prop times g/mm^3, or 1 for props already
     // accumulated with per-body densities). Shared by the single-body and per-body paths.
     auto props_json = [&](const GProp_GProps& props, double scale, double volume_mm3) -> json {
@@ -11168,6 +16152,16 @@ json doc_eval_mass(const std::string& doc_id, int body_id,
             {"principal_axes", principal_axes},
         };
     };
+    // Units and frame of the results above, stated once on every result. `inertia` is the full
+    // 3x3 tensor, row-major, about the CENTRE OF MASS `com` with axes parallel to the world
+    // axes (OCCT's MatrixOfInertia is already centroidal — do not subtract a parallel-axis
+    // term); a combined multi-body result is about the combined centre of mass.
+    auto stamp_units = [](json& out) {
+        out["units"] = {{"volume", "mm^3"}, {"mass", "g"}, {"com", "mm"},
+                        {"inertia", "g*mm^2"}, {"principal_moments", "g*mm^2"}};
+        out["inertia_frame"] = "centre of mass (com), axes parallel to the world axes; 3x3 "
+                               "row-major [Ixx,Ixy,Ixz,Iyx,Iyy,Iyz,Izx,Izy,Izz]";
+    };
     auto density_of = [](const MassSolid& m) { return m.material.at("density_g_cm3").get<double>(); };
 
     // Single explicit body, OR a genuinely single-solid document: report that one body
@@ -11195,6 +16189,7 @@ json doc_eval_mass(const std::string& doc_id, int body_id,
             BRepGProp::VolumeProperties(shape, props);  // unit density -> Mass() is volume in mm³
         json out = props_json(props, density_of(*one) * 1e-3, props.Mass());
         out["body_count"] = 1;
+        stamp_units(out);
         out["material"] = one->material;
         // Bug J4: VolumeProperties on a non-closed solid returns a meaningless CoM/inertia
         // (the integral over an unbounded volume). Don't report it as if trustworthy — flag it.
@@ -11250,6 +16245,7 @@ json doc_eval_mass(const std::string& doc_id, int body_id,
     json out = have_total ? props_json(total, 1.0, total_volume)
                           : json{{"volume_mm3", 0.0}, {"mass_g", 0.0}};
     out["body_count"] = static_cast<int>(solids.size());
+    stamp_units(out);
     out["bodies"] = std::move(bodies);
     if (uniform) {
         out["material"] = solids.front().material;
@@ -11495,17 +16491,41 @@ json build_cut_list(const json& weld_members) {
 
 }  // namespace
 
-// cutlist.cut_list_for_session — fresh compile so the weld_member compiler repopulates
-// the side-channel, then group. An assembly (no part weldment topology) reports an
-// empty cut list. A doc with no weld_member feature yields empty rows + zero totals.
+// Cut-list readers need the weld-member side channel; a display-only hydration
+// is compiled once, while a full saved compile can be reused.
 json doc_weld_cut_list(const std::string& doc_id) {
     DocLock lk;
     Session& s = require_session(doc_id);
     if (s.doc.value("kind", std::string()) == "assembly" ||
         s.doc.value("is_assembly", false))
         return build_cut_list(json::object());
-    CompileResult r = compile_session(s);
+    const CompileResult& r = ensure_compiled_full(s);
     return build_cut_list(r.weld_members);
+}
+
+void doc_flat_export_snapshot(const std::string& doc_id, TopoDS_Shape& shape, json& metadata) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    shape.Nullify();
+    metadata = nullptr;
+    if (s.compiled_partial)
+        throw OpError("flat_pattern_metadata_unavailable",
+                      "Flat-pattern metadata is unavailable in this legacy display-only cache; "
+                      "a rebuild is required before flat export.",
+                      {{"doc_id", doc_id}, {"reason", "legacy_display_cache"}});
+    const CompileResult& r = ensure_compiled(s);
+    if (!r.ok || r.shapes.empty() || !r.sheet_metal_flat.is_object()) return;
+    // Feature IDs are not lexicographically ordered (f9 follows f10); use the
+    // compile's actual feature history to choose the most recent flat pattern.
+    for (auto it = r.statuses.rbegin(); it != r.statuses.rend(); ++it) {
+        if (!it->ok || it->rolled_back || it->type != "sm_flat_pattern") continue;
+        auto found = r.sheet_metal_flat.find(it->id);
+        if (found != r.sheet_metal_flat.end() && found->is_object()) {
+            shape = r.shapes.back();
+            metadata = *found;
+            return;
+        }
+    }
 }
 
 // ----------------------------------------------------------------- Evaluate suite
@@ -11793,6 +16813,21 @@ void eval_measure_enrich(json& out, const TopoDS_Shape& raw) {
     }
 }
 
+// The axis of a cylindrical face or circular edge as a line (nullopt for any other element).
+std::optional<gp_Lin> eval_axis_line(const TopoDS_Shape& sh) {
+    try {
+        if (sh.ShapeType() == TopAbs_FACE) {
+            BRepAdaptor_Surface sa(TopoDS::Face(sh));
+            if (sa.GetType() == GeomAbs_Cylinder) return gp_Lin(sa.Cylinder().Axis());
+        } else if (sh.ShapeType() == TopAbs_EDGE) {
+            BRepAdaptor_Curve ca(TopoDS::Edge(sh));
+            if (ca.GetType() == GeomAbs_Circle) return gp_Lin(ca.Circle().Axis());
+        }
+    } catch (const Standard_Failure&) {
+    }
+    return std::nullopt;
+}
+
 
 // engine/doc/evaluate.py::_measure_single — 1 ref. EDGE -> radius+diameter+length (circle)
 // or length; FACE -> area+perimeter; VERTEX -> point; else volume.
@@ -11832,6 +16867,26 @@ json eval_measure_single(const TopoDS_Shape& raw) {
             perimeter = 0.0;
         }
         result = json{{"kind", "area"}, {"area", gp.Mass()}, {"perimeter", perimeter}};
+        // A cylindrical / spherical face also reports the size an engineer is asking for.
+        try {
+            BRepAdaptor_Surface sa(TopoDS::Face(raw));
+            if (sa.GetType() == GeomAbs_Cylinder) {
+                const gp_Cylinder cyl = sa.Cylinder();
+                const gp_Ax1 ax = cyl.Axis();
+                result["surface"] = "cylinder";
+                result["radius"] = cyl.Radius();
+                result["diameter"] = 2.0 * cyl.Radius();
+                result["axis"] = {ax.Direction().X(), ax.Direction().Y(), ax.Direction().Z()};
+                result["axis_point"] = {ax.Location().X(), ax.Location().Y(), ax.Location().Z()};
+            } else if (sa.GetType() == GeomAbs_Sphere) {
+                const gp_Sphere sph = sa.Sphere();
+                result["surface"] = "sphere";
+                result["radius"] = sph.Radius();
+                result["diameter"] = 2.0 * sph.Radius();
+                result["center"] = {sph.Location().X(), sph.Location().Y(), sph.Location().Z()};
+            }
+        } catch (const Standard_Failure&) {
+        }
     } else if (st == TopAbs_VERTEX) {
         gp_Pnt p = BRep_Tool::Pnt(TopoDS::Vertex(raw));
         result = json{{"kind", "point"},
@@ -11902,6 +16957,20 @@ json eval_measure_pair(const TopoDS_Shape& a, const TopoDS_Shape& b) {
     if (!result.contains("distance"))
         throw OpError("invalid_op", "Measure could not compute the distance between these elements",
                       {{"reason", "distance failed"}});
+    // Two cylindrical faces / circular edges: the AXIS-to-AXIS distance, which is the hole
+    // pitch or bolt spacing an engineer means — the surface-to-surface `distance` above is
+    // the wall gap and differs by the radii.
+    if (const auto la = eval_axis_line(a)) {
+        if (const auto lb = eval_axis_line(b)) {
+            constexpr double kParallelTol = 1e-6;  // rad
+            const bool parallel = la->Direction().IsParallel(lb->Direction(), kParallelTol);
+            double axis_angle = la->Direction().Angle(lb->Direction()) * 180.0 / M_PI;
+            if (axis_angle > 90.0) axis_angle = 180.0 - axis_angle;
+            result["axis_distance"] = la->Distance(*lb);
+            result["axes_parallel"] = parallel;
+            result["axis_angle"] = axis_angle;
+        }
+    }
     // Per-element enrichment for the two resolved refs (anchor/polyline on a/b).
     json ea = json::object();
     eval_measure_enrich(ea, a);
@@ -12032,7 +17101,7 @@ static EvalShapeSet gather_eval_shapes(Session& s) {
             result.body_ids.push_back(static_cast<int>(i + 1));
         return result;
     }
-    rebuild_assembly(s);
+    ensure_assembly_current(s);
     const AssemblyResult& ar = *s.asm_result;
     if (!ar.converged) failure(json::object(), "assembly_not_converged");
     for (const auto& status : ar.component_status)
@@ -12042,7 +17111,8 @@ static EvalShapeSet gather_eval_shapes(Session& s) {
     for (const auto& status : ar.feature_status)
         if (!status.ok) failure({{"feature_id", status.id}}, status.error);
     for (const auto& mate : ar.mate_status)
-        if (mate.status == "unresolved" || mate.status == "conflicting")
+        if (mate.status == "unresolved" || mate.status == "conflicting" ||
+            mate.status == "unsatisfied")
             failure({{"mate_id", mate.id}, {"status", mate.status}}, mate.reason);
     for (const auto& body : ar.bodies) {
         const json provenance{{"body_id", body.body_id}, {"component_id", body.component_id}};
@@ -12144,7 +17214,8 @@ json doc_eval_check(const std::string& doc_id, int body_id) {
     constexpr double TINY_EDGE_MM = 0.01;
     int tiny_edges = 0;
     for (int ei = 1; ei <= edge_map.Extent(); ++ei) {
-        if (eval_edge_length(TopoDS::Edge(edge_map.FindKey(ei))) < TINY_EDGE_MM) ++tiny_edges;
+        const TopoDS_Edge& edge = TopoDS::Edge(edge_map.FindKey(ei));
+        if (!BRep_Tool::Degenerated(edge) && eval_edge_length(edge) < TINY_EDGE_MM) ++tiny_edges;
     }
     if (tiny_edges > 0) {
         char buf[96];
@@ -12191,6 +17262,319 @@ json doc_eval_geometry_analysis(const std::string& doc_id, const json& options) 
     } catch (const std::invalid_argument& e) {
         throw OpError("invalid_op", e.what());
     }
+}
+
+json doc_eval_sheet_metal_bends(const std::string& doc_id) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    if (s.is_assembly())
+        throw OpError("invalid_op", "eval_sheet_metal_bends requires a part", json::object());
+    // Hydrated display caches do not contain this side channel. Do not discard
+    // the saved solve state or force a potentially long rebuild for a read.
+    if (s.compiled_partial)
+        throw OpError("invalid_op", "eval_sheet_metal_bends: bend records unavailable in saved display cache",
+                      json::object());
+    const CompileResult& r = ensure_compiled(s);
+    if (!r.ok)
+        throw OpError("invalid_op", "eval_sheet_metal_bends: part compilation failed", json::object());
+    json records = json::array();
+    for (const auto& b : r.sheet_metal_bends) {
+        records.push_back({
+            {"feature_id", b.feature_id}, {"angle_deg", b.angle},
+            {"radius_mm", b.radius}, {"thickness_mm", b.thickness},
+            {"bend_allowance_mm", b.bend_allowance},
+            {"wall_length_mm", b.wall_length}, {"position", b.position},
+            {"start", {b.p_start.x(), b.p_start.y(), b.p_start.z()}},
+            {"end", {b.p_end.x(), b.p_end.y(), b.p_end.z()}},
+            {"axis", {b.e_dir.x(), b.e_dir.y(), b.e_dir.z()}},
+            {"length_dir", {b.length_dir.x(), b.length_dir.y(), b.length_dir.z()}},
+            {"fold_dir", {b.fold_dir.x(), b.fold_dir.y(), b.fold_dir.z()}},
+            {"parent_index", b.parent_index}});
+    }
+    return {{"doc_id", doc_id}, {"revision", s.revision}, {"records", std::move(records)}};
+}
+
+// ── eval_edge_analysis ───────────────────────────────────────────────────────────────────
+// The signed, exact edge-by-edge answer to "where is this part's geometry a stress riser /
+// a missing fillet?": per manifold edge the interior dihedral in the material (90 = outside
+// corner, 180 = tangent, 270 = sharp inside corner) from outward face normals on the edges'
+// own pcurves (geom/edge_analysis.cpp), plus every concave blend face with its radius.
+// doc_adjacency answers a coarser question (a centroid-dot convex test, last body only, no
+// angle, no location). Every row names its topology by body + 1-based topo id AND by the same
+// stable sid describe_part / query_geometry hand back, and carries the owning feature from the
+// compile's owner map, so an agent can go straight from a finding to an add_features fillet.
+// Contract: contracts/worker_rpc.md "eval_edge_analysis".
+json doc_eval_edge_analysis(const std::string& doc_id, const json& params) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    const auto bad = [](const std::string& why, json detail = json::object()) {
+        return OpError("invalid_op", "eval_edge_analysis: " + why, std::move(detail));
+    };
+
+    int want_body = 0;
+    if (params.contains("body") && !params["body"].is_null()) {
+        if (!params["body"].is_number_integer() || params["body"].get<int>() < 1)
+            throw bad("body must be a positive integer body id");
+        want_body = params["body"].get<int>();
+    }
+    double min_dev = 5.0;
+    if (params.contains("min_dihedral_dev_deg") && !params["min_dihedral_dev_deg"].is_null()) {
+        if (!params["min_dihedral_dev_deg"].is_number()) throw bad("min_dihedral_dev_deg must be numeric");
+        min_dev = params["min_dihedral_dev_deg"].get<double>();
+        if (!std::isfinite(min_dev) || min_dev < 0.0 || min_dev >= 90.0)
+            throw bad("min_dihedral_dev_deg must be in [0, 90)");
+    }
+    long long limit = 200, cursor = 0;
+    if (params.contains("limit") && !params["limit"].is_null()) {
+        if (!params["limit"].is_number_integer() || params["limit"].get<long long>() < 1 ||
+            params["limit"].get<long long>() > 2000)
+            throw bad("limit must be an integer in [1, 2000]");
+        limit = params["limit"].get<long long>();
+    }
+    if (params.contains("cursor") && !params["cursor"].is_null()) {
+        if (!params["cursor"].is_number_integer() || params["cursor"].get<long long>() < 0)
+            throw bad("cursor must be a nonnegative integer (the previous page's next_cursor)");
+        cursor = params["cursor"].get<long long>();
+    }
+    if (params.contains("include_ligaments") && !params["include_ligaments"].is_boolean())
+        throw bad("include_ligaments must be boolean");
+    const bool include_ligaments = params.value("include_ligaments", false);
+    std::set<std::string> kinds = {"concave", "convex"};
+    if (params.contains("kinds") && !params["kinds"].is_null()) {
+        if (!params["kinds"].is_array() || params["kinds"].empty())
+            throw bad("kinds must be a nonempty array of concave|convex|smooth");
+        kinds.clear();
+        for (const json& k : params["kinds"]) {
+            const std::string name = k.is_string() ? k.get<std::string>() : std::string();
+            if (name != "concave" && name != "convex" && name != "smooth")
+                throw bad("kinds entries must be concave, convex or smooth", {{"got", k}});
+            kinds.insert(name);
+        }
+    }
+
+    const EvalShapeSet shapes = gather_eval_shapes(s);
+    if (shapes.compiled.shapes.empty())
+        throw_no_bodies(doc_id, shapes.compiled, "edge analysis");
+    std::vector<std::size_t> selected;
+    for (std::size_t k = 0; k < shapes.body_ids.size(); ++k)
+        if (want_body == 0 || shapes.body_ids[k] == want_body) selected.push_back(k);
+    if (selected.empty())
+        throw bad("body " + std::to_string(want_body) + " is not a surviving body in the document",
+                  {{"body_ids", shapes.body_ids}});
+
+    // (body ordinal, 1-based topo id) -> owning feature id, from the compile's owner map.
+    // Assemblies carry no part owner map: owner_feature is null there.
+    std::map<std::pair<int, int>, std::string> face_owner, edge_owner;
+    if (!s.is_assembly() && shapes.compiled.owner_map.is_object()) {
+        for (auto it = shapes.compiled.owner_map.begin(); it != shapes.compiled.owner_map.end(); ++it) {
+            for (const char* key : {"faces", "edges"}) {
+                const auto rows = it.value().find(key);
+                if (rows == it.value().end() || !rows->is_array()) continue;
+                auto& dst = key[0] == 'f' ? face_owner : edge_owner;
+                for (const json& pr : *rows)
+                    if (pr.is_array() && pr.size() == 2 && pr[0].is_number_integer() &&
+                        pr[1].is_number_integer())
+                        dst.emplace(std::make_pair(pr[0].get<int>(), pr[1].get<int>()), it.key());
+            }
+        }
+    }
+
+    struct Candidate { int rank; double deviation; int body_id; int edge_id; std::size_t shape_index; json row; };
+    std::vector<Candidate> candidates;
+    struct BlendCandidate { double radius; int body_id; int face_id; std::size_t shape_index; json row; };
+    std::vector<BlendCandidate> blend_candidates;
+    struct LigamentBody { int body_id; std::size_t shape_index; json report; };
+    std::vector<LigamentBody> ligament_bodies;
+    json bodies = json::array();
+    json unclassified = json::array();
+    long long unclassified_count = 0;
+    const auto rank_of = [](const std::string& kind) { return kind == "concave" ? 0 : kind == "convex" ? 1 : 2; };
+
+    for (const std::size_t k : selected) {
+        const int body_id = shapes.body_ids[k];
+        json analysis;
+        try {
+            json geom_options{{"min_dihedral_dev_deg", min_dev},
+                              {"include_ligaments", include_ligaments && cursor == 0}};
+            analysis = chudware::geom::edge_analysis(shapes.compiled.shapes[k], geom_options);
+        } catch (const std::invalid_argument& e) {
+            throw bad(e.what());
+        } catch (const Standard_Failure& e) {
+            throw bad(std::string("kernel failure on body ") + std::to_string(body_id) + ": " +
+                      (e.GetMessageString() ? e.GetMessageString() : "unknown"),
+                      {{"reason", "kernel_failure"}, {"body", body_id}});
+        }
+        int n_concave = 0, n_convex = 0, n_smooth = 0;
+        for (json& row : analysis["edges"]) {
+            const std::string kind = row.value("kind", std::string());
+            (kind == "concave" ? n_concave : kind == "convex" ? n_convex : n_smooth)++;
+            if (!kinds.count(kind)) continue;
+            candidates.push_back({rank_of(kind), row.value("deviation_deg", 0.0), body_id,
+                                  row.value("edge_id", 0), k, std::move(row)});
+        }
+        for (json& row : analysis["concave_blends"])
+            blend_candidates.push_back({row.value("radius_mm", 0.0), body_id, row.value("face_id", 0),
+                                        k, std::move(row)});
+        if (cursor == 0 && analysis.contains("ligaments"))
+            ligament_bodies.push_back({body_id, k, std::move(analysis["ligaments"])});
+        for (const json& u : analysis["unclassified_edges"]) {
+            ++unclassified_count;
+            if (unclassified.size() < 50)
+                unclassified.push_back({{"body", body_id}, {"topo", u.value("edge_id", 0)},
+                                        {"reason", u.value("reason", std::string())}});
+        }
+        bodies.push_back({{"body_id", body_id},
+                          {"face_count", analysis.value("face_count", 0)},
+                          {"edge_count", analysis.value("edge_count", 0)},
+                          {"concave_edges", n_concave},
+                          {"convex_edges", n_convex},
+                          {"smooth_edges", n_smooth},
+                          {"concave_blends", static_cast<int>(analysis["concave_blends"].size())},
+                          {"unclassified_edges", static_cast<int>(analysis["unclassified_edges"].size())}});
+    }
+
+    // Most stress-relevant first: concave, then by how sharp (largest deviation), stable on ids.
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+        if (a.rank != b.rank) return a.rank < b.rank;
+        if (a.deviation != b.deviation) return a.deviation > b.deviation;
+        if (a.body_id != b.body_id) return a.body_id < b.body_id;
+        return a.edge_id < b.edge_id;
+    });
+    const std::size_t total = candidates.size();
+    const std::size_t first = static_cast<std::size_t>(std::min<long long>(cursor, static_cast<long long>(total)));
+    const std::size_t last = static_cast<std::size_t>(std::min<long long>(
+        static_cast<long long>(first) + limit, static_cast<long long>(total)));
+
+    // Per-body lazy sid tables: faces share describe_faces' ordering with TopExp::MapShapes
+    // (one occurrence per face in a solid), edges use the unique MapShapes order.
+    std::map<std::size_t, std::vector<std::string>> face_sids;
+    std::map<std::size_t, TopTools_IndexedMapOfShape> edge_maps;
+    const auto face_sid_of = [&](std::size_t k, int face_id) -> std::string {
+        auto it = face_sids.find(k);
+        if (it == face_sids.end()) {
+            std::vector<std::string> sids;
+            try {
+                for (const TopoInfo& info : describe_faces(shapes.compiled.shapes[k]))
+                    sids.push_back(make_selector(info).value("sid", std::string()));
+            } catch (const Standard_Failure&) {}
+            it = face_sids.emplace(k, std::move(sids)).first;
+        }
+        return face_id >= 1 && static_cast<std::size_t>(face_id) <= it->second.size()
+                   ? it->second[static_cast<std::size_t>(face_id) - 1] : std::string();
+    };
+    const auto edge_sid_of = [&](std::size_t k, int edge_id) -> std::string {
+        auto it = edge_maps.find(k);
+        if (it == edge_maps.end()) {
+            it = edge_maps.try_emplace(k).first;
+            TopExp::MapShapes(shapes.compiled.shapes[k], TopAbs_EDGE, it->second);
+        }
+        if (edge_id < 1 || edge_id > it->second.Extent()) return {};
+        try {
+            return make_selector(edge_info(TopoDS::Edge(it->second.FindKey(edge_id)), edge_id - 1))
+                .value("sid", std::string());
+        } catch (const Standard_Failure&) { return {}; }
+    };
+    const auto owner_or_null = [](const std::map<std::pair<int, int>, std::string>& table, int body_id,
+                                  int topo) -> json {
+        const auto it = table.find({body_id, topo});
+        return it == table.end() ? json(nullptr) : json(it->second);
+    };
+
+    json edges_out = json::array();
+    for (std::size_t i = first; i < last; ++i) {
+        Candidate& c = candidates[i];
+        json row = std::move(c.row);
+        const json face_ids = row["face_ids"];
+        row.erase("face_ids");
+        row.erase("edge_id");
+        row["body"] = c.body_id;
+        row["topo"] = c.edge_id;
+        row["sid"] = edge_sid_of(c.shape_index, c.edge_id);
+        row["faces"] = json::array({face_sid_of(c.shape_index, face_ids[0].get<int>()),
+                                    face_sid_of(c.shape_index, face_ids[1].get<int>())});
+        row["face_topo"] = face_ids;
+        json owner = owner_or_null(edge_owner, c.body_id, c.edge_id);
+        for (int f = 0; f < 2 && owner.is_null(); ++f)
+            owner = owner_or_null(face_owner, c.body_id, face_ids[f].get<int>());
+        row["owner_feature"] = owner;
+        edges_out.push_back(std::move(row));
+    }
+
+    // Concave blends ride on the first page only; the smallest radius (the worst) first.
+    json blends_out = json::array();
+    bool blends_truncated = false;
+    if (cursor == 0) {
+        std::sort(blend_candidates.begin(), blend_candidates.end(),
+                  [](const BlendCandidate& a, const BlendCandidate& b) {
+                      if (a.radius != b.radius) return a.radius < b.radius;
+                      if (a.body_id != b.body_id) return a.body_id < b.body_id;
+                      return a.face_id < b.face_id;
+                  });
+        constexpr std::size_t kMaxBlends = 500;
+        blends_truncated = blend_candidates.size() > kMaxBlends;
+        for (std::size_t i = 0; i < blend_candidates.size() && i < kMaxBlends; ++i) {
+            BlendCandidate& b = blend_candidates[i];
+            json row = std::move(b.row);
+            const json adjacent = row["adjacent_face_ids"], tangent = row["tangent_face_ids"];
+            row.erase("adjacent_face_ids");
+            row.erase("tangent_face_ids");
+            row.erase("face_id");
+            row["body"] = b.body_id;
+            row["topo"] = b.face_id;
+            row["face_sid"] = face_sid_of(b.shape_index, b.face_id);
+            row["owner_feature"] = owner_or_null(face_owner, b.body_id, b.face_id);
+            row["adjacent_faces"] = json::array();
+            for (const json& id : adjacent) row["adjacent_faces"].push_back(face_sid_of(b.shape_index, id.get<int>()));
+            row["tangent_faces"] = json::array();
+            for (const json& id : tangent) row["tangent_faces"].push_back(face_sid_of(b.shape_index, id.get<int>()));
+            row["adjacent_face_topo"] = adjacent;
+            blends_out.push_back(std::move(row));
+        }
+    }
+    // Ligaments are finite-face distances, not certified through-material paths.
+    // Keep each body's completeness/budget diagnostics and cap the combined output.
+    json ligament_out = {{"rows", json::array()}, {"bodies", json::array()},
+                         {"truncated", false}};
+    for (auto& body : ligament_bodies) {
+        json report = std::move(body.report);
+        json rows = report.value("rows", json::array());
+        report.erase("rows");
+        report["body"] = body.body_id;
+        ligament_out["bodies"].push_back(std::move(report));
+        for (json& row : rows) {
+            if (ligament_out["rows"].size() >= 2000) {
+                ligament_out["truncated"] = true;
+                break;
+            }
+            const int face = row.value("face_id", 0);
+            const int other = row.value("other_face_id", 0);
+            row["body"] = body.body_id;
+            row["face_sid"] = face_sid_of(body.shape_index, face);
+            row["other_face_sid"] = face_sid_of(body.shape_index, other);
+            row["owner_feature"] = owner_or_null(face_owner, body.body_id, face);
+            row["other_owner_feature"] = owner_or_null(face_owner, body.body_id, other);
+            ligament_out["rows"].push_back(std::move(row));
+        }
+    }
+
+
+    return json{{"ok", true},
+                {"doc_id", doc_id},
+                {"revision", s.revision},
+                {"complete", shapes.complete},
+                {"source_failures", shapes.source_failures},
+                {"min_dihedral_dev_deg", min_dev},
+                {"kinds", json(kinds)},
+                {"bodies", std::move(bodies)},
+                {"total_edges", total},
+                {"edges", std::move(edges_out)},
+                {"truncated", last < total},
+                {"next_cursor", last < total ? json(last) : json(nullptr)},
+                {"concave_blends", std::move(blends_out)},
+                {"blends_truncated", blends_truncated},
+                {"ligaments", std::move(ligament_out)},
+                {"unclassified_count", unclassified_count},
+                {"unclassified_edges", std::move(unclassified)}};
 }
 
 // ── eval_solid_health ────────────────────────────────────────────────────────────────────
@@ -12448,7 +17832,7 @@ json doc_eval_model_integrity(const std::string& doc_id, const json& params) {
         if (map.IsEmpty()) source_failure(provenance, "source_has_no_solids");
     };
     if (s.is_assembly()) {
-        rebuild_assembly(s);  // refresh path-backed descendants, not just this doc's revision
+        ensure_assembly_current(s);
         const AssemblyResult& ar = *s.asm_result;
         out["assembly"]["converged"] = ar.converged;
         if (!ar.converged) out["complete"] = false;
@@ -12481,7 +17865,8 @@ json doc_eval_model_integrity(const std::string& doc_id, const json& params) {
             out["assembly"]["mates"].push_back({{"id", mate.id}, {"type", mate.type},
                 {"status", mate.status}, {"reason", mate.reason},
                 {"residual", mate.residual}, {"dangling_refs", mate.dangling_refs}});
-            if (mate.status == "unresolved" || mate.status == "conflicting") out["complete"] = false;
+            if (mate.status == "unresolved" || mate.status == "conflicting" ||
+                mate.status == "unsatisfied") out["complete"] = false;
         }
         for (const auto& body : ar.bodies) {
             // Authored IDs may themselves contain '#': prefer the exact component,
@@ -13186,14 +18571,26 @@ json doc_eval_section_props(const std::string& doc_id, const json& plane_ref) {
 
 // engine/doc/evaluate.py::symmetry via worker.py::_eval_symmetry. Mirror the active body
 // across the plane and measure the symmetric-difference volume. symmetric iff deviation
-// <= 1e-3 * max(vol, 1.0). Returns {"symmetric", "deviation_mm3"}.
+// <= 1e-3 * vol. `plane_ref` is a reserved datum name or {origin, normal[, xdir]}; body_id
+// is 1-based, <= 0 = the last body. Returns {"symmetric", "deviation_mm3", "volume_mm3",
+// "tolerance_mm3", "body_id", "plane": {"origin", "normal"}}.
+// A Boolean or mirror that cannot complete, or a body with no volume, is an OpError: a
+// failed measurement must never read as an asymmetry (it used to return deviation -1).
 json doc_eval_symmetry(const std::string& doc_id, int body_id, const json& plane_ref) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    CompileResult r = compile_session(s);
+    const CompileResult& r = ensure_compiled(s);
     const TopoDS_Shape& shape = eval_active_shape(r, doc_id, body_id);
     gp_Pln pln = eval_resolve_plane(plane_ref);
+    const int used_body = body_id >= 1 ? body_id : static_cast<int>(r.shapes.size());
 
+    const double vol_a = eval_vol_or_zero(shape);
+    if (vol_a <= 1e-9)
+        throw OpError("symmetry_failed",
+                      "body " + std::to_string(used_body) +
+                          " has no measurable volume (surface body or failed solid), so a "
+                          "mirror-symmetry check has nothing to compare",
+                      {{"doc_id", doc_id}, {"body_id", used_body}});
     try {
         // Mirror about the plane: SetMirror(gp_Ax2) is planar symmetry. gp_Pln.Position()
         // is a gp_Ax3; build the gp_Ax2 from its location + Z + X (matches _to_gp_plane ->
@@ -13203,21 +18600,38 @@ json doc_eval_symmetry(const std::string& doc_id, int body_id, const json& plane
         gp_Trsf mirror;
         mirror.SetMirror(ax2);
         BRepBuilderAPI_Transform xf(shape, mirror, Standard_True);
+        if (!xf.IsDone())
+            throw OpError("symmetry_failed", "mirroring the body across the plane failed",
+                          {{"doc_id", doc_id}, {"body_id", used_body}});
         TopoDS_Shape mirrored = xf.Shape();
 
-        double vol_a = eval_vol_or_zero(shape);
-        double vol_mirror = eval_vol_or_zero(mirrored);
-        double vol_common = 0.0;
+        const double vol_mirror = eval_vol_or_zero(mirrored);
         BRepAlgoAPI_Common common(shape, mirrored);
         common.Build();
-        if (common.IsDone()) vol_common = eval_vol_or_zero(common.Shape());
+        if (!common.IsDone() || common.HasErrors() || common.Shape().IsNull())
+            throw OpError("symmetry_failed",
+                          "the Boolean common of the body with its mirror image did not "
+                          "complete, so the symmetric-difference volume is unknown (this is "
+                          "NOT an asymmetry verdict) — run check_geometry_health on the body",
+                          {{"doc_id", doc_id}, {"body_id", used_body}});
+        const double vol_common = eval_vol_or_zero(common.Shape());
 
-        double deviation = (vol_a - vol_common) + (vol_mirror - vol_common);
-        deviation = std::max(0.0, deviation);
-        double threshold = 1e-3 * std::max(vol_a, 1.0);
-        return json{{"symmetric", deviation <= threshold}, {"deviation_mm3", deviation}};
+        const double deviation = std::max(0.0, (vol_a - vol_common) + (vol_mirror - vol_common));
+        const double tolerance = 1e-3 * vol_a;
+        return json{{"symmetric", deviation <= tolerance},
+                    {"deviation_mm3", deviation},
+                    {"volume_mm3", vol_a},
+                    {"tolerance_mm3", tolerance},
+                    {"body_id", used_body},
+                    {"plane",
+                     {{"origin", {pos.Location().X(), pos.Location().Y(), pos.Location().Z()}},
+                      {"normal", {pos.Direction().X(), pos.Direction().Y(), pos.Direction().Z()}}}}};
     } catch (const Standard_Failure& ex) {
-        return json{{"symmetric", false}, {"deviation_mm3", -1.0}, {"error", ex.GetMessageString()}};
+        throw OpError("symmetry_failed",
+                      std::string("the mirror/Boolean computation raised: ") +
+                          (ex.GetMessageString() ? ex.GetMessageString() : "unknown") +
+                          " — this is NOT an asymmetry verdict",
+                      {{"doc_id", doc_id}, {"body_id", used_body}});
     }
 }
 
@@ -13314,11 +18728,11 @@ json eval_overlap_mesh(const TopoDS_Shape& common_shape) {
     }
 }
 
-// Build overlap_bbox [[min],[max]] from BRepBndLib::Add of the Common shape.
+// Build world-space overlap bounds independently of prior mesh deflection.
 json eval_overlap_bbox(const TopoDS_Shape& common_shape) {
     try {
         Bnd_Box box;
-        BRepBndLib::Add(common_shape, box);
+        BRepBndLib::AddOptimal(common_shape, box, Standard_False, Standard_False);
         if (box.IsVoid()) return json::array();
         double xmn, ymn, zmn, xmx, ymx, zmx;
         box.Get(xmn, ymn, zmn, xmx, ymx, zmx);
@@ -13362,6 +18776,222 @@ TopoDS_Shape interference_local_boundary(const TopoDS_Shape& shape) {
     for (TopExp_Explorer shell(local, TopAbs_SHELL); shell.More(); shell.Next())
         builder.Add(boundary, shell.Current());
     return boundary;
+}
+
+struct InterferenceSolid {
+    TopoDS_Shape shape;
+    Bnd_Box box;
+};
+
+InterferenceSolid interference_solid(const TopoDS_Shape& shape) {
+    InterferenceSolid solid{shape, {}};
+    // Bounds must include subshape tolerances: a gap may skip a Boolean only
+    // when even these conservative boxes do not intersect.
+    BRepBndLib::AddOptimal(shape, solid.box, Standard_False, Standard_True);
+    if (solid.box.IsVoid() || solid.box.IsOpen())
+        throw std::runtime_error("constituent solid has empty or unbounded bounds");
+    double x0, y0, z0, x1, y1, z1;
+    solid.box.Get(x0, y0, z0, x1, y1, z1);
+    if (!std::isfinite(x0) || !std::isfinite(y0) || !std::isfinite(z0) ||
+        !std::isfinite(x1) || !std::isfinite(y1) || !std::isfinite(z1))
+        throw std::runtime_error("constituent solid has nonfinite bounds");
+    return solid;
+}
+
+std::vector<InterferenceSolid> interference_solids(const TopoDS_Shape& shape) {
+    TopTools_IndexedMapOfShape solids;
+    TopExp::MapShapes(shape, TopAbs_SOLID, solids);
+    std::vector<InterferenceSolid> result;
+    result.reserve(solids.Extent());
+    for (int i = 1; i <= solids.Extent(); ++i) {
+        try {
+            result.push_back(interference_solid(solids.FindKey(i)));
+        } catch (const std::exception& e) {
+            throw std::runtime_error("solid " + std::to_string(i) + ": " + e.what());
+        } catch (const Standard_Failure& e) {
+            const char* message = e.GetMessageString();
+            throw std::runtime_error("solid " + std::to_string(i) + ": " +
+                                     (message ? message : "OCCT bounds failed"));
+        }
+    }
+    return result;
+}
+
+template <typename Boolean>
+bool interference_boolean(const char* operation, const TopoDS_Shape& a, const TopoDS_Shape& b,
+                          TopoDS_Shape& result, bool& warnings,
+                          std::string& reason, std::string& detail, double fuzzy,
+                          const Handle(SelfIntersectBudget)& budget) {
+    Boolean boolean;
+    auto failed = [&](const char* cause) {
+        std::ostringstream errors;
+        boolean.DumpErrors(errors);
+        std::ostringstream message;
+        message << operation << " failed (IsDone=" << boolean.IsDone()
+                << ", HasErrors=" << boolean.HasErrors() << ")";
+        if (cause && *cause) message << ": " << cause;
+        if (!errors.str().empty()) message << "; OCCT errors: " << errors.str();
+        if (boolean.HasWarnings()) {
+            std::ostringstream alerts;
+            boolean.DumpWarnings(alerts);
+            if (!alerts.str().empty()) message << "; OCCT warnings: " << alerts.str();
+        }
+        reason = "boolean_failed";
+        detail = message.str();
+        return false;
+    };
+    try {
+        TopTools_ListOfShape arguments, tools;
+        arguments.Append(a);
+        tools.Append(b);
+        boolean.SetArguments(arguments);
+        boolean.SetTools(tools);
+        boolean.SetNonDestructive(Standard_True);
+        boolean.SetToFillHistory(Standard_False);
+        if (fuzzy > 0.0) boolean.SetFuzzyValue(fuzzy);
+        if (budget.IsNull()) boolean.Build();
+        else boolean.Build(budget->Start());
+        if (!boolean.IsDone() || boolean.HasErrors()) return failed(nullptr);
+        if (boolean.HasWarnings() &&
+            (boolean.HasWarning(STANDARD_TYPE(BOPAlgo_AlertEmptyShape)) ||
+             boolean.HasWarning(STANDARD_TYPE(BOPAlgo_AlertIntersectionOfPairOfShapesFailed)) ||
+             boolean.HasWarning(STANDARD_TYPE(BOPAlgo_AlertBuildingPCurveFailed)) ||
+             boolean.HasWarning(STANDARD_TYPE(BOPAlgo_AlertUnableToOrientTheShape)) ||
+             boolean.HasWarning(STANDARD_TYPE(BOPAlgo_AlertShellSplitterFailed))))
+            return failed("OCCT reported a failed or incomplete subshape operation");
+        result = boolean.Shape();
+        if (result.IsNull()) {
+            failed("null result");
+            reason = "boolean_result_missing";
+            return false;
+        }
+        warnings = warnings || boolean.HasWarnings();
+        return true;
+    } catch (const Standard_Failure& e) {
+        return failed(e.GetMessageString() ? e.GetMessageString() : "OCCT exception");
+    } catch (const std::exception& e) {
+        return failed(e.what());
+    }
+}
+
+using InterferenceBooleanAttempt = bool (*)(
+    const char*, const TopoDS_Shape&, const TopoDS_Shape&, TopoDS_Shape&, bool&,
+    std::string&, std::string&, double, const Handle(SelfIntersectBudget)&);
+
+struct InterferenceBooleanOverrides {
+    InterferenceBooleanAttempt common = nullptr, cut = nullptr, retry = nullptr;
+    double retry_seconds = 10.0;
+};
+
+struct InterferenceFallbackBudget {
+    // The ordinary interference report has no pair deadline. Limit the additional
+    // retry work across ALL constituent Commons and deduplication Cuts of one pair.
+    double seconds_left = 10.0;
+    double tolerance = 0.0;
+    bool common = false, cut = false, extrema = false;
+};
+
+template <typename Boolean>
+bool interference_boolean_with_fallback(
+    const char* operation, const TopoDS_Shape& a, const TopoDS_Shape& b,
+    TopoDS_Shape& result, bool& warnings, std::string& reason, std::string& detail,
+    InterferenceFallbackBudget& budget, bool is_common,
+    InterferenceBooleanAttempt exact_override = nullptr,
+    InterferenceBooleanAttempt retry_override = nullptr) {
+    const auto exact = exact_override ? exact_override : &interference_boolean<Boolean>;
+    const Handle(SelfIntersectBudget) no_budget;
+    if (exact(operation, a, b, result, warnings, reason, detail, 0.0, no_budget))
+        return true;
+
+    const std::string exact_reason = reason, exact_detail = detail;
+    std::string last_detail;
+    const auto retry = retry_override ? retry_override : &interference_boolean<Boolean>;
+    // Swapping Common operands may avoid an asymmetric intersection failure; Cut
+    // is directional and must never swap. Fuzzy tolerance can change the result,
+    // so even an empty result is explicitly identified as approximate.
+    for (double fuzzy : {1e-5, 1e-4, 1e-3}) {
+        for (int swapped = 0; swapped < (is_common ? 2 : 1); ++swapped) {
+            if (budget.seconds_left <= 0.0) {
+                reason = "pair_timeout";
+                detail = exact_detail + "; fuzzy Boolean retry budget exhausted";
+                return false;
+            }
+            const auto start = std::chrono::steady_clock::now();
+            Handle(SelfIntersectBudget) progress = new SelfIntersectBudget(budget.seconds_left);
+            TopoDS_Shape candidate;
+            bool retry_warnings = false;
+            std::string retry_reason, retry_detail;
+            const bool ok = retry(operation, swapped ? b : a, swapped ? a : b, candidate,
+                                  retry_warnings, retry_reason, retry_detail, fuzzy, progress);
+            const double elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start).count();
+            budget.seconds_left -= elapsed;
+            if (progress->broke() || budget.seconds_left <= 0.0) {
+                reason = "pair_timeout";
+                detail = exact_detail + "; fuzzy Boolean retry budget exhausted";
+                return false;
+            }
+            if (ok) {
+                result = candidate;
+                warnings = warnings || retry_warnings;
+                budget.tolerance = std::max(budget.tolerance, fuzzy);
+                if (is_common) budget.common = true;
+                else budget.cut = true;
+                reason.clear();
+                detail.clear();
+                return true;
+            }
+            last_detail = retry_detail;
+        }
+    }
+    // A positive set distance, including OCCT's solid-containment treatment,
+    // proves these constituents disjoint even when their AABBs overlap. This
+    // resolves an empty Common (or an unchanged Cut) without guessing a volume.
+    if (budget.seconds_left <= 0.0) {
+        reason = "pair_timeout";
+        detail = exact_detail + "; fallback retry budget exhausted";
+        return false;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    Handle(SelfIntersectBudget) progress = new SelfIntersectBudget(budget.seconds_left);
+    bool separated = false;
+    try {
+        BRepExtrema_DistShapeShape distance;
+        distance.LoadS1(a);
+        distance.LoadS2(b);
+        distance.Perform(progress->Start());
+        if (distance.IsDone() && !distance.InnerSolution()) {
+            const double value = distance.Value();
+            separated = std::isfinite(value) && value > 1e-6;
+        }
+    } catch (const Standard_Failure&) {
+    } catch (const std::exception&) {
+    }
+    budget.seconds_left -= std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    if (progress->broke() || budget.seconds_left <= 0.0) {
+        reason = "pair_timeout";
+        detail = exact_detail + "; fallback retry budget exhausted";
+        return false;
+    }
+    if (separated) {
+        if (is_common) {
+            BRep_Builder builder;
+            TopoDS_Compound empty;
+            builder.MakeCompound(empty);
+            result = empty;
+        } else {
+            result = a;
+        }
+        budget.extrema = true;
+        reason.clear();
+        detail.clear();
+        return true;
+    }
+    reason = exact_reason.empty() ? "boolean_failed" : exact_reason;
+    detail = exact_detail + "; fuzzy Boolean retries failed: " + last_detail +
+             "; extrema did not establish separation";
+    return false;
 }
 
 // Private to one immutable motion snapshot; never shared between studies or Evaluate
@@ -13428,7 +19058,8 @@ json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>
                          bool quick = false,
                          const std::vector<std::string>& component_ids = {},
                          bool include_overlap_mesh = true, bool classify_threshold = false,
-                         InterferenceSweepCache* sweep_cache = nullptr) {
+                         InterferenceSweepCache* sweep_cache = nullptr,
+                         const InterferenceBooleanOverrides* overrides = nullptr) {
     const std::size_t n = members.size();
     // The cache is deliberately confined to motion's fixed, scalar threshold request.
     if (!classify_threshold || include_overlap_mesh || sweep_cache == nullptr ||
@@ -13436,6 +19067,7 @@ json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>
         sweep_cache = nullptr;
     constexpr double INTERFERENCE_EPS = 1e-3;
     constexpr double kCoincidentTol = 1e-6;
+    constexpr double kClearanceTol = 1e-6;  // mm; distance/geometry tolerance band
     json parts = json::array();
     json geometry_failures = json::array();
     std::vector<Bnd_Box> boxes(n);
@@ -13534,16 +19166,28 @@ json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>
         if (local.IsNull()) local = interference_local_boundary(shape);
         return local.Moved(shape.Location());
     };
+    // Each placed member's conservative solid bounds are shared by all its
+    // candidate pairs, but only computed if its aggregate box overlaps another.
+    std::vector<std::vector<InterferenceSolid>> solid_cache(n);
+    std::vector<bool> solids_ready(n, false);
+    auto solids_at = [&](std::size_t i) -> const std::vector<InterferenceSolid>& {
+        if (!solids_ready[i]) {
+            solid_cache[i] = interference_solids(members[i].second);
+            solids_ready[i] = true;
+        }
+        return solid_cache[i];
+    };
     for (std::size_t i = 0; i < n; ++i) {
         for (std::size_t j = i + 1; j < n; ++j) {
             json pair = {{"a", members[i].first}, {"b", members[j].first},
                          {"component_a", component_id(i)}, {"component_b", component_id(j)}};
             auto* cached = sweep_cache ? &sweep_cache->pairs[pair_index] : nullptr;
             ++pair_index;
-            auto fail = [&](const char* reason) {
+            auto fail = [&](const char* reason, const std::string& detail = std::string()) {
                 if (cached) cached->kind = InterferenceSweepCache::Kind::none;
                 json failure = pair;
                 failure["reason"] = reason;
+                if (!detail.empty()) failure["detail"] = detail;
                 pair_failures.push_back(std::move(failure));
             };
             if (!usable[i] || !usable[j]) {
@@ -13591,44 +19235,120 @@ json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>
             double overlap = 0.0;
             TopoDS_Shape common_shape;
             if (gap_lb <= 0.0) {
+                InterferenceFallbackBudget fallback;
+                if (overrides) fallback.seconds_left = overrides->retry_seconds;
+                std::string phase = "member a constituent bounds";
                 try {
-                    TopTools_ListOfShape args, tools;
-                    args.Append(members[i].second);
-                    tools.Append(members[j].second);
-                    BRepAlgoAPI_Common common;
-                    common.SetArguments(args);
-                    common.SetTools(tools);
-                    common.SetNonDestructive(Standard_True);
-                    common.Build();
-                    if (!common.IsDone() || common.HasErrors()) {
-                        fail("boolean_failed");
+                    const auto& solids_a = solids_at(i);
+                    phase = "member b constituent bounds";
+                    const auto& solids_b = solids_at(j);
+                    std::vector<InterferenceSolid> occupied;
+                    std::string reason, detail;
+                    bool warnings = false, found_solid = false;
+                    for (std::size_t a = 0; a < solids_a.size() && reason.empty(); ++a) {
+                        for (std::size_t b = 0; b < solids_b.size() && reason.empty(); ++b) {
+                            if (solids_a[a].box.IsOut(solids_b[b].box)) continue;
+                            phase = "constituent solids a=" + std::to_string(a + 1) +
+                                    ", b=" + std::to_string(b + 1);
+                            TopoDS_Shape common;
+                            if (!interference_boolean_with_fallback<BRepAlgoAPI_Common>(
+                                    "Common", solids_a[a].shape, solids_b[b].shape,
+                                    common, warnings, reason, detail, fallback, true,
+                                    overrides ? overrides->common : nullptr,
+                                    overrides ? overrides->retry : nullptr))
+                                break;
+                            TopTools_IndexedMapOfShape common_solids;
+                            TopExp::MapShapes(common, TopAbs_SOLID, common_solids);
+                            found_solid = found_solid || common_solids.Extent() > 0;
+                            for (int k = 1; k <= common_solids.Extent() && reason.empty(); ++k) {
+                                std::vector<InterferenceSolid> pending;
+                                pending.push_back(interference_solid(common_solids.FindKey(k)));
+                                // Successive pairwise intersections may cover the same
+                                // material when either member contains overlapping solids.
+                                // Subtract the already-counted, disjoint pieces before
+                                // appending, never Boolean an overlapping compound as a whole.
+                                for (const InterferenceSolid& prior : occupied) {
+                                    if (pending.empty() || !reason.empty()) break;
+                                    std::vector<InterferenceSolid> remaining;
+                                    remaining.reserve(pending.size());
+                                    for (InterferenceSolid& candidate : pending) {
+                                        if (candidate.box.IsOut(prior.box)) {
+                                            remaining.push_back(std::move(candidate));
+                                            continue;
+                                        }
+                                        TopoDS_Shape residue;
+                                        if (!interference_boolean_with_fallback<BRepAlgoAPI_Cut>(
+                                                "Overlap deduplication Cut", candidate.shape,
+                                                prior.shape, residue, warnings, reason, detail,
+                                                fallback, false, overrides ? overrides->cut : nullptr,
+                                                overrides ? overrides->retry : nullptr))
+                                            break;
+                                        TopTools_IndexedMapOfShape residual_solids;
+                                        TopExp::MapShapes(residue, TopAbs_SOLID, residual_solids);
+                                        for (int r = 1; r <= residual_solids.Extent(); ++r)
+                                            remaining.push_back(interference_solid(
+                                                residual_solids.FindKey(r)));
+                                    }
+                                    pending = std::move(remaining);
+                                }
+                                if (reason.empty())
+                                    occupied.insert(occupied.end(),
+                                        std::make_move_iterator(pending.begin()),
+                                        std::make_move_iterator(pending.end()));
+                            }
+                        }
+                    }
+                    if (!reason.empty()) {
+                        fail(reason.c_str(), phase + ": " + detail);
                         continue;
                     }
-                    common_shape = common.Shape();
-                    if (common_shape.IsNull()) {
-                        fail("boolean_result_missing");
-                        continue;
+                    phase = "overlap volume";
+                    for (const InterferenceSolid& piece : occupied) {
+                        GProp_GProps props;
+                        BRepGProp::VolumeProperties(piece.shape, props);
+                        overlap += std::abs(props.Mass());
                     }
-                    GProp_GProps props;
-                    BRepGProp::VolumeProperties(common_shape, props);
-                    overlap = std::abs(props.Mass());
                     if (!std::isfinite(overlap)) {
-                        fail("overlap_volume_nonfinite");
+                        fail("overlap_volume_nonfinite", phase);
                         continue;
                     }
-                    // A below-interference-epsilon volume is NOT a disjointness
-                    // proof: a tiny contained solid still has solid distance zero.
-                    // Require exact zero AND no solid result, avoiding signed-mass
-                    // cancellation/underflow and retaining full-solid treatment
-                    // for any ambiguous or warning-bearing Boolean result.
+                    if (fallback.common || fallback.cut) {
+                        pair["method"] = fallback.common && fallback.cut
+                            ? "fallback_fuzzy_common_and_cut"
+                            : fallback.common ? "fallback_fuzzy_common" : "fallback_fuzzy_cut";
+                        pair["approximate"] = true;
+                        pair["volume_approximate"] = true;
+                        pair["fuzzy_tolerance_mm"] = fallback.tolerance;
+                    }
+                    if (fallback.extrema) {
+                        if (!fallback.common && !fallback.cut)
+                            pair["method"] = "fallback_extrema_disjoint";
+                        pair["fallback_extrema_disjoint"] = true;
+                    }
+                    if (include_overlap_mesh && overlap > INTERFERENCE_EPS) {
+                        if (occupied.size() == 1) {
+                            common_shape = occupied.front().shape;
+                        } else {
+                            BRep_Builder builder;
+                            TopoDS_Compound combined;
+                            builder.MakeCompound(combined);
+                            for (const InterferenceSolid& piece : occupied)
+                                builder.Add(combined, piece.shape);
+                            common_shape = combined;
+                        }
+                    }
+                    // A tiny contained solid still has zero set distance. Only a
+                    // warning-free result with no solid from any constituent
+                    // Common proves boundary-only distance is safe.
                     boundary_distance_safe = classify_threshold && overlap == 0.0 &&
-                        !common.HasWarnings() &&
-                        !TopExp_Explorer(common_shape, TopAbs_SOLID).More();
-                } catch (const Standard_Failure&) {
-                    fail("boolean_or_volume_failed");
+                                             !warnings && !found_solid &&
+                                             !fallback.common && !fallback.cut;
+                } catch (const Standard_Failure& e) {
+                    fail("boolean_or_volume_failed", phase + ": " +
+                         (e.GetMessageString() ? e.GetMessageString() : "OCCT exception"));
                     continue;
-                } catch (const std::exception&) {
-                    fail("boolean_or_volume_failed");
+                } catch (const std::exception& e) {
+                    fail("boolean_or_volume_failed", phase + ": " + e.what());
                     continue;
                 }
             }
@@ -13643,18 +19363,26 @@ json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>
                 remember(InterferenceSweepCache::Kind::interference);
                 interferences.push_back(std::move(pair));
             } else if (classify_threshold &&
-                       (min_clearance_mm <= 0.0 || gap_lb >= min_clearance_mm) &&
+                       (min_clearance_mm <= 0.0 || gap_lb > min_clearance_mm + kClearanceTol) &&
                        (!include_coincident || gap_lb > kCoincidentTol)) {
                 // An overlapping AABB reaches here only after a completed Common
                 // proved no interfering volume. With no clearance/contact request,
                 // that classification is complete even for nearly touching faces.
                 pair["distance_lower_bound_mm"] = gap_lb;
                 pair["distance_status"] = "lower_bound";
+                if (min_clearance_mm > 0.0) {
+                    pair["clearance_tolerance_mm"] = kClearanceTol;
+                    pair["clearance_status"] = "above";
+                }
                 remember(InterferenceSweepCache::Kind::clearance);
                 clearances.push_back(std::move(pair));
             } else if (!classify_threshold && quick && gap_lb > quick_window_mm) {
                 pair["distance"] = gap_lb;
                 pair["approx"] = true;
+                if (min_clearance_mm > 0.0) {
+                    pair["clearance_tolerance_mm"] = kClearanceTol;
+                    pair["clearance_status"] = "above";
+                }
                 remember(InterferenceSweepCache::Kind::clearance);
                 clearances.push_back(std::move(pair));
             } else {
@@ -13677,12 +19405,22 @@ json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>
                     }
                     pair["distance"] = value;
                     if (classify_threshold) pair["distance_status"] = "exact";
+                    if (min_clearance_mm > 0.0) {
+                        pair["clearance_tolerance_mm"] = kClearanceTol;
+                        if (value < min_clearance_mm - kClearanceTol) {
+                            pair["clearance_status"] = "below";
+                            pair["warning"] = "below min clearance";
+                        } else if (value <= min_clearance_mm + kClearanceTol) {
+                            pair["clearance_status"] = "within_tolerance";
+                            pair["warning"] = "within min clearance tolerance";
+                        } else {
+                            pair["clearance_status"] = "above";
+                        }
+                    }
                     if (include_coincident && value <= kCoincidentTol) {
                         remember(InterferenceSweepCache::Kind::contact);
                         contacts.push_back(std::move(pair));
                     } else {
-                        if (min_clearance_mm > 0.0 && value < min_clearance_mm)
-                            pair["warning"] = "below min clearance";
                         remember(InterferenceSweepCache::Kind::clearance);
                         clearances.push_back(std::move(pair));
                     }
@@ -13733,15 +19471,136 @@ json interference_report(const std::vector<std::pair<std::string, TopoDS_Shape>>
         summary = buf;
     } else
         summary = n < 2 ? "No body pairs to check (1 body)." : "No interference detected.";
+    if (min_clearance_mm > 0.0) {
+        std::size_t uncertain = 0;
+        for (const auto* rows : {&clearances, &contacts})
+            for (const json& pair : *rows)
+                if (pair.value("clearance_status", std::string()) == "within_tolerance") ++uncertain;
+        if (uncertain)
+            summary += " " + std::to_string(uncertain) +
+                       " pair(s) are within 0.000001 mm of the clearance threshold (uncertain).";
+    }
     return {{"ok", complete && interferences.empty()}, {"complete", complete},
             {"summary", summary}, {"pairs_checked", pairs_checked},
             {"pairs_reused", pairs_reused},
             {"clearance_mode", classify_threshold ? "threshold" : "exact"},
+            {"clearance_tolerance_mm", min_clearance_mm > 0.0 ? json(kClearanceTol) : json(nullptr)},
             {"pairs_total", n < 2 ? 0 : n * (n - 1) / 2},
             {"pair_failures", std::move(pair_failures)},
             {"geometry_failures", std::move(geometry_failures)}, {"parts", std::move(parts)},
             {"interferences", std::move(interferences)}, {"clearances", std::move(clearances)},
             {"contacts", std::move(contacts)}};
+}
+
+namespace {
+bool interference_injected_failure(const char*, const TopoDS_Shape&, const TopoDS_Shape&,
+                                   TopoDS_Shape&, bool&, std::string& reason,
+                                   std::string& detail, double,
+                                   const Handle(SelfIntersectBudget)&) {
+    reason = "boolean_failed";
+    detail = "injected Boolean failure";
+    return false;
+}
+}  // namespace
+
+// Test-only, in-process seam: exercise report assembly after a deterministic kernel
+// failure without process-global switches or changing the RPC's contract.
+json interference_report_with_injected_failure_for_testing(
+    const TopoDS_Shape& a, const TopoDS_Shape& b, bool threshold, bool coincident,
+    bool fail_common, bool fail_cut, bool fail_retries, double retry_seconds) {
+    InterferenceBooleanOverrides overrides;
+    if (fail_common) overrides.common = &interference_injected_failure;
+    if (fail_cut) overrides.cut = &interference_injected_failure;
+    if (fail_retries) overrides.retry = &interference_injected_failure;
+    overrides.retry_seconds = retry_seconds;
+    return interference_report({{"a", a}, {"b", b}}, coincident, 0.0, false,
+                               {}, true, threshold, nullptr, &overrides);
+}
+
+namespace {
+json clearance_session_report(const std::string& doc_id, const json& params, bool removal) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    std::vector<geom::clearance::Member> members;
+    json failures = json::array();
+    bool failures_truncated = false;
+    auto failure = [&](json item) {
+        if (failures.size() < 256) failures.push_back(std::move(item));
+        else failures_truncated = true;
+    };
+    auto add = [&](const std::string& id, const std::string& name, const TopoDS_Shape& shape) {
+        for (auto& member : members) {
+            if (member.id != id) continue;
+            if (member.shape.IsNull() || shape.IsNull()) {
+                member.shape.Nullify();
+                return;
+            }
+            BRep_Builder builder;
+            TopoDS_Compound compound;
+            builder.MakeCompound(compound);
+            builder.Add(compound, member.shape);
+            builder.Add(compound, shape);
+            member.shape = compound;
+            return;
+        }
+        members.push_back({id, name, shape});
+    };
+    if (s.is_assembly()) {
+        ensure_assembly_current(s);
+        if (!s.asm_result) {
+            failure({{"reason", "assembly_result_unavailable"}});
+        } else {
+            for (const auto& body : s.asm_result->bodies) {
+                TopoDS_Shape world;
+                try { world = placed_world_shape(body, std::nullopt); }
+                catch (const Standard_Failure&) {}
+                add(body.component_id, body.name, world);
+            }
+            for (const auto& status : s.asm_result->component_status) {
+                if (status.ok) continue;
+                failure({{"component", status.id}, {"reason", status.error.value_or("component_build_failed")}});
+                bool found = false;
+                for (auto& m : members) if (m.id == status.id) { m.shape.Nullify(); found = true; }
+                if (!found) add(status.id, status.id, TopoDS_Shape());
+            }
+            for (const auto& status : s.asm_result->feature_status)
+                if (!status.ok) failure({{"feature", status.id}, {"reason", "assembly_feature_build_failed"}});
+        }
+    } else {
+        const CompileResult& r = ensure_compiled(s);
+        for (std::size_t i = 0; i < r.shapes.size(); ++i) {
+            const std::string id = "b" + std::to_string(i + 1);
+            add(id, id, r.shapes[i]);
+        }
+        for (const auto& status : r.statuses)
+            if (!status.ok) failure({{"feature", status.id}, {"reason", "part_feature_build_failed"}});
+    }
+    if (members.empty()) failure({{"reason", "no_members"}});
+    try {
+        json result = removal ? geom::clearance::removal_report(members, params)
+                              : geom::clearance::envelope_report(members, params);
+        if (!failures.empty()) {
+            result["ok"] = false;
+            result["complete"] = false;
+            for (auto& row : result["results"]) {
+                row["status"] = "not_evaluated";
+                if (removal && row["clear"] == true) row["clear"] = nullptr;
+            }
+        }
+        result["source_failures"] = std::move(failures);
+        result["source_failures_truncated"] = failures_truncated;
+        return result;
+    } catch (const std::invalid_argument& e) {
+        throw OpError("invalid_op", e.what());
+    }
+}
+}  // namespace
+
+json doc_eval_removal_clearance(const std::string& doc_id, const json& params) {
+    return clearance_session_report(doc_id, params, true);
+}
+json doc_eval_envelope_clearance(const std::string& doc_id, const json& params) {
+    return clearance_session_report(doc_id, params, false);
 }
 
 // engine/doc/evaluate.py::interference via worker.py::_eval_interference.
@@ -13767,7 +19626,7 @@ json doc_eval_interference(const std::string& doc_id, const json& params) {
     std::vector<std::string> component_ids;
     json source_failures = json::array();
     if (s.is_assembly()) {
-        if (!s.asm_result) rebuild_assembly(s);
+        ensure_assembly_current(s);
         const AssemblyResult* ares = s.asm_result.get();
         if (ares) {
             for (const AsmBodyOut& body : ares->bodies) {
@@ -13801,7 +19660,7 @@ json doc_eval_interference(const std::string& doc_id, const json& params) {
                                                {"reason", "assembly_feature_build_failed"}});
         }
     } else {
-        CompileResult r = compile_session(s);
+        const CompileResult& r = ensure_compiled(s);
         for (std::size_t i = 0; i < r.shapes.size(); ++i) {
             const std::string id = "b" + std::to_string(i + 1);
             members.emplace_back(id, eval_interference_member_shape(r.shapes[i]));
@@ -13880,7 +19739,7 @@ json doc_eval_interference(const std::string& doc_id, const json& params) {
         throw OpError("invalid_op", "min_clearance_mm must be finite and non-negative");
     // `quick` (asm-fea F4, default false = oracle-exact): approximate FAR clearances by
     // their bbox gap ("approx": true) so narration callers don't pay the all-pairs exact
-    // distance pass on large assemblies. Interference volumes stay exact either way.
+    // distance pass on large assemblies. Fuzzy fallback volumes are marked approximate.
     const bool quick = params.contains("quick") && params["quick"].is_boolean() &&
                        params["quick"].get<bool>();
     json report = interference_report(members, include_coincident, min_clearance_mm, quick,
@@ -13896,14 +19755,8 @@ json doc_eval_interference(const std::string& doc_id, const json& params) {
     return report;
 }
 
-// B2 — intra-part FEATURE-overlap detection (see session.h doc_eval_feature_overlap for the
-// full contract). No Python analogue: assembly interference tests whole bodies across parts;
-// this tests each feature's own pre-boolean TOOL SOLID (CompileResult::tool_recs, populated in
-// document.cpp at every boolean callsite) against every OTHER feature's tool in the SAME part —
-// catching a boss silently fused into another boss, a cut that swallows an earlier boss whole,
-// or two cut tools that overlap (redundant material removal). Reuses the compile cache
-// (ensure_compiled) the same way interactive read paths (resolve_pick, face_edges, doc_status)
-// do, instead of unconditionally recompiling like doc_eval_interference above.
+// Intersections of recorded pre-boolean feature tools. These are tool-space
+// volumes, not evidence of material added or removed by either feature.
 json doc_eval_feature_overlap(const std::string& doc_id, const json& params) {
     DocLock lk;
     Session& s = require_session(doc_id);
@@ -13927,6 +19780,10 @@ json doc_eval_feature_overlap(const std::string& doc_id, const json& params) {
     };
 
     std::vector<json> pair_vec;
+    json failed_pairs = json::array();
+    std::set<std::string> unavailable;
+    for (const ToolRec& tr : r.tool_recs)
+        if (tr.role != "add" && tr.role != "cut") unavailable.insert(tr.feature_id);
     const std::size_t n = r.tool_recs.size();
     for (std::size_t i = 0; i < n; ++i) {
         const ToolRec& a = r.tool_recs[i];
@@ -13934,6 +19791,8 @@ json doc_eval_feature_overlap(const std::string& doc_id, const json& params) {
             const ToolRec& b = r.tool_recs[j];
             if (a.feature_id == b.feature_id) continue;  // same feature's own tool records
             if (has_filter && !filter.count(a.feature_id) && !filter.count(b.feature_id)) continue;
+            if ((a.role != "add" && a.role != "cut") ||
+                (b.role != "add" && b.role != "cut")) continue;
 
             bool ov_ok = false;
             double vol = 0.0;
@@ -13946,18 +19805,26 @@ json doc_eval_feature_overlap(const std::string& doc_id, const json& params) {
                 }
             } catch (const Standard_Failure&) {
             }
-            if (!ov_ok || vol < min_volume_mm3) continue;
-
+            if (!ov_ok) {
+                failed_pairs.push_back({{"a", a.feature_id}, {"b", b.feature_id},
+                                        {"reason", "tool_intersection_failed"}});
+                continue;
+            }
+            if (vol < min_volume_mm3) continue;
+            const std::string tool_kind = a.role == "add" && b.role == "add" ? "add_tool_overlap" :
+                                          a.role == "cut" && b.role == "cut" ? "cut_tool_overlap" :
+                                                                               "add_cut_tool_overlap";
+            // Preserve the published kind/ok contract for existing RPC clients.
+            // These historical names describe only tool geometry, not actual
+            // incremental material change.
             std::string kind;
-            if (a.role == "add" && b.role == "add") {
-                kind = "boss_overlap";
-            } else if (a.role == "cut" && b.role == "cut") {
-                kind = "cut_overlap";
-            } else {
-                const ToolRec& add_rec = (a.role == "add") ? a : b;
-                const double add_vol = eval_vol_or_zero(add_rec.tool);
-                kind = (add_vol > 1e-12 && vol >= 0.99 * add_vol) ? "boss_swallowed"
-                                                                  : "cut_into_boss";
+            if (tool_kind == "add_tool_overlap") kind = "boss_overlap";
+            else if (tool_kind == "cut_tool_overlap") kind = "cut_overlap";
+            else {
+                const ToolRec& add_rec = a.role == "add" ? a : b;
+                const double add_volume = eval_vol_or_zero(add_rec.tool);
+                kind = add_volume > 1e-12 && vol >= 0.99 * add_volume
+                           ? "boss_swallowed" : "cut_into_boss";
             }
             pair_vec.push_back(json{
                 {"a", a.feature_id},
@@ -13965,7 +19832,9 @@ json doc_eval_feature_overlap(const std::string& doc_id, const json& params) {
                 {"a_name", feature_name(a.feature_id)},
                 {"b_name", feature_name(b.feature_id)},
                 {"kind", kind},
+                {"tool_kind", tool_kind},
                 {"volume_mm3", vol},
+                {"volume_basis", "pre_boolean_tool_intersection"},
             });
         }
     }
@@ -13976,7 +19845,8 @@ json doc_eval_feature_overlap(const std::string& doc_id, const json& params) {
     // dead_features: any feature that contributed a tool_rec but owns no surviving
     // face/edge (fully consumed downstream) and did not itself error.
     std::set<std::string> toolmakers;
-    for (const ToolRec& tr : r.tool_recs) toolmakers.insert(tr.feature_id);
+    for (const ToolRec& tr : r.tool_recs)
+        if (tr.role == "add" || tr.role == "cut") toolmakers.insert(tr.feature_id);
     json dead_features = json::array();
     for (const std::string& fid : toolmakers) {
         bool feature_ok = false;
@@ -13990,24 +19860,17 @@ json doc_eval_feature_overlap(const std::string& doc_id, const json& params) {
         if (!has_faces) dead_features.push_back(fid);
     }
 
-    std::size_t n_swallowed = 0, n_boss = 0, n_cut = 0, n_into = 0;
-    for (const json& p : pair_vec) {
-        const std::string& k = p["kind"].get_ref<const std::string&>();
-        if (k == "boss_swallowed") ++n_swallowed;
-        else if (k == "boss_overlap") ++n_boss;
-        else if (k == "cut_overlap") ++n_cut;
-        else if (k == "cut_into_boss") ++n_into;
-    }
-
+    const bool complete = unavailable.empty() && failed_pairs.empty();
     std::string summary;
-    if (pair_vec.empty() && dead_features.empty()) {
-        summary = "No feature overlap detected.";
+    if (!complete) {
+        summary = "Feature tool overlap check incomplete.";
+    } else if (pair_vec.empty() && dead_features.empty()) {
+        summary = "No feature tool overlap detected.";
     } else {
         char buf[224];
         std::snprintf(buf, sizeof(buf),
-            "%zu overlapping pair(s) (%zu boss_swallowed, %zu boss_overlap, %zu cut_overlap, "
-            "%zu cut_into_boss); %zu dead feature(s)",
-            pair_vec.size(), n_swallowed, n_boss, n_cut, n_into, dead_features.size());
+            "%zu overlapping tool pair(s); %zu feature(s) without surviving owned faces",
+            pair_vec.size(), dead_features.size());
         summary = buf;
         if (!pair_vec.empty()) {
             const json& big = pair_vec.front();  // sorted volume desc
@@ -14015,17 +19878,26 @@ json doc_eval_feature_overlap(const std::string& doc_id, const json& params) {
             std::snprintf(vbuf, sizeof(vbuf), "; largest %s<->%s (%s) = %.1f mm^3",
                           big["a_name"].get<std::string>().c_str(),
                           big["b_name"].get<std::string>().c_str(),
-                          big["kind"].get<std::string>().c_str(),
+                          big["tool_kind"].get<std::string>().c_str(),
                           big["volume_mm3"].get<double>());
             summary += vbuf;
         }
     }
 
+    bool legacy_swallowed = false;
     json pairs = json::array();
-    for (json& p : pair_vec) pairs.push_back(std::move(p));
+    for (json& p : pair_vec) {
+        if (p.value("kind", std::string()) == "boss_swallowed") legacy_swallowed = true;
+        pairs.push_back(std::move(p));
+    }
 
     return json{
-        {"ok", n_swallowed == 0},
+        {"ok", complete && !legacy_swallowed},
+        {"complete", complete},
+        {"basis", "pre_boolean_tool_intersection"},
+        {"note", "Volumes are intersections of raw boolean tools, not measured material removal; through-all tools may overshoot. Legacy kind names and ok:false for boss_swallowed describe tool inclusion only, not proof that material was swallowed."},
+        {"unavailable_features", json(std::vector<std::string>(unavailable.begin(), unavailable.end()))},
+        {"failed_pairs", std::move(failed_pairs)},
         {"summary", summary},
         {"pairs", pairs},
         {"dead_features", dead_features},
@@ -14143,8 +20015,20 @@ json doc_eval_feature_attachment(const std::string& doc_id, const json& params) 
              {"not_checked", json::array()},
              {"thresholds", {{"overhang_frac", overhang_tol},
                              {"min_contact_frac", min_contact_frac}}}};
+    std::set<std::string> unavailable_patterns;
+    for (const ToolRec& tr : r.tool_recs)
+        if ((tr.role == "legacy_pattern_add" || tr.role == "unavailable_pattern_add") &&
+            (!has_filter || filter.count(tr.feature_id)))
+            unavailable_patterns.insert(tr.feature_id);
+    for (const std::string& fid : unavailable_patterns) out["not_checked"].push_back(fid);
+    out["unavailable_features"] = json(std::vector<std::string>(unavailable_patterns.begin(),
+                                                                 unavailable_patterns.end()));
     if (part_solids.empty()) {
-        out["summary"] = "No solid bodies — nothing to check for attachment.";
+        out["complete"] = unavailable_patterns.empty();
+        out["ok"] = unavailable_patterns.empty();
+        out["summary"] = unavailable_patterns.empty()
+            ? "No solid bodies — nothing to check for attachment."
+            : "Attachment check incomplete; pattern tools are unavailable.";
         return out;
     }
     const TopoDS_Compound part = compound_of(part_solids);
@@ -14216,6 +20100,14 @@ json doc_eval_feature_attachment(const std::string& doc_id, const json& params) 
 
     std::size_t n_float = 0, n_over = 0, n_touch = 0;
     std::set<std::string> flagged, seen_independent, attached;
+    // `not_checked` names every additive feature whose attachment could NOT be judged, once
+    // each, with the reason in `not_checked_reasons`. A feature that is skipped is never
+    // reported as attached.
+    std::set<std::string> not_checked_ids(unavailable_patterns.begin(), unavailable_patterns.end());
+    auto mark_not_checked = [&](const std::string& fid, const std::string& why) {
+        if (not_checked_ids.insert(fid).second) out["not_checked"].push_back(fid);
+        out["not_checked_reasons"][fid] = why;
+    };
     for (const ToolRec& tr : r.tool_recs) {
         if (tr.role != "add") continue;
         if (has_filter && !filter.count(tr.feature_id)) continue;
@@ -14230,7 +20122,7 @@ json doc_eval_feature_attachment(const std::string& doc_id, const json& params) 
             const double elapsed = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - t_start).count();
             if (elapsed > budget_s) {
-                out["not_checked"].push_back(tr.feature_id);
+                mark_not_checked(tr.feature_id, "the check's time budget was exhausted");
                 break;
             }
             const TopoDS_Shape& t = instances[inst];
@@ -14241,10 +20133,19 @@ json doc_eval_feature_attachment(const std::string& doc_id, const json& params) 
                 common.Build();
                 BRepAlgoAPI_Cut cut(part, t);
                 cut.Build();
-                if (!common.IsDone() || !cut.IsDone()) continue;
+                if (!common.IsDone() || !cut.IsDone() || common.HasErrors() || cut.HasErrors() ||
+                    common.Shape().IsNull() || cut.Shape().IsNull()) {
+                    mark_not_checked(tr.feature_id,
+                                     "the boolean common/cut of the part with this feature's "
+                                     "tool did not complete");
+                    continue;
+                }
                 X = common.Shape();
                 Y = cut.Shape();
-            } catch (const Standard_Failure&) {
+            } catch (const Standard_Failure& ex) {
+                mark_not_checked(tr.feature_id,
+                                 std::string("the boolean common/cut raised: ") +
+                                     (ex.GetMessageString() ? ex.GetMessageString() : "unknown"));
                 continue;
             }
             const double kept = eval_vol_or_zero(X);
@@ -14505,11 +20406,15 @@ json doc_eval_feature_attachment(const std::string& doc_id, const json& params) 
         }
     }
     for (const std::string& fid : attached)
-        if (!flagged.count(fid)) out["attached"].push_back(fid);
-    out["ok"] = flagged.empty();
+        if (!flagged.count(fid) && !not_checked_ids.count(fid)) out["attached"].push_back(fid);
+    out["complete"] = out["not_checked"].empty();
+    out["ok"] = flagged.empty() && out["complete"].get<bool>();
     out["flagged"] = json(std::vector<std::string>(flagged.begin(), flagged.end()));
     char sbuf[256];
-    if (flagged.empty())
+    if (!out["complete"].get<bool>())
+        std::snprintf(sbuf, sizeof(sbuf),
+                      "Attachment check incomplete; see not_checked and flagged features.");
+    else if (flagged.empty())
         std::snprintf(sbuf, sizeof(sbuf),
                       "Every additive feature is seated on the part (%zu solid%s).",
                       part_solids.size(), part_solids.size() == 1 ? "" : "s");
@@ -14808,7 +20713,7 @@ TopoDS_Face doc_face_wires_resolve(const TopoDS_Shape& body, const json& face_re
 json doc_face_wires(const std::string& doc_id, const json& params) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    CompileResult r = compile_session(s);
+    const CompileResult& r = ensure_compiled(s);
     if (r.shapes.empty())
         throw OpError("invalid_op", "doc_face_wires: document '" + doc_id + "' has no bodies",
                       {{"doc_id", doc_id}});
@@ -14843,10 +20748,23 @@ static TopoDS_Shape measure_resolve_ref(const json& ref, const TopoDS_Shape& bod
         const std::size_t count = query.faces.size() + query.edges.size();
         if (!count)
             throw OpError("invalid_op", "measure ref matched no geometry", {{"reason", "no match"}});
-        if (count > 1 && !ref.contains("pick") && !ref.contains("near") &&
-            !ref.contains("index") && !ref.contains("count"))
-            throw OpError("invalid_op", "measure ref matched multiple elements; narrow it with body_id, pick, near or index",
-                          {{"reason", "ambiguous"}});
+        // A measured side is ONE face/edge. pick/near/index/count narrow a query, but a tied
+        // pick (the four equal vertical edges, pick:"longest") or a count > 1 still leaves
+        // several, and taking the first of them would answer about an arbitrary one.
+        if (count > 1) {
+            std::string sids;
+            for (std::size_t i = 0; i < query.selectors.size() && i < 6; ++i) {
+                if (i) sids += ", ";
+                sids += query.selectors[i].value("sid", std::string("?"));
+            }
+            throw OpError("invalid_op",
+                          "measure ref matched " + std::to_string(count) + " elements (" + sids +
+                              (count > 6 ? ", …" : "") +
+                              "), not exactly one — a measured side must be a single face/edge. "
+                              "Single one out with near:[x,y,z] (the nearest wins), a pick that "
+                              "has no ties, or pass one of those sids.",
+                          {{"reason", "ambiguous"}, {"match_count", count}});
+        }
         return !query.faces.empty() ? TopoDS_Shape(query.faces.front())
                                     : TopoDS_Shape(query.edges.front());
     }
@@ -14969,7 +20887,7 @@ json doc_eval_measure(const std::string& doc_id, const json& refs) {
     const CompileResult* part = nullptr;
     const AssemblyResult* assembly = nullptr;
     if (s.is_assembly()) {
-        if (!s.asm_result) rebuild_assembly(s);
+        ensure_assembly_current(s);
         assembly = s.asm_result.get();
     } else {
         part = &ensure_compiled(s);
@@ -15101,12 +21019,12 @@ json doc_eval_measure(const std::string& doc_id, const json& refs) {
 }
 
 // ----------------------------------------------------------- Evaluate field methods
-// Ports of engine/doc/evaluate.py {draft_field, curvature_field, thickness_field} via the
-// worker.py _eval_draft/_eval_curvature/_eval_thickness handlers. Unlike the analytic eval
-// methods these tessellate the active body, compute a per-vertex SCALAR field, write it to a
-// temp .aicm file (a SCLR chunk on the tessellated body) and return {"aicm_path": <path>}.
-// Mirrors worker.py::_eval_write_field_aicm: tessellate (body_id=1) -> chunk_fn(tess,shape)
-// -> write_aicm_file(tmp, [tess], extra_chunks=[chunk]).
+// Ports of engine/doc/evaluate.py {draft_field, curvature_field} via the worker.py
+// _eval_draft/_eval_curvature handlers, plus the wall-thickness study (thickness_study above).
+// Unlike the analytic eval methods these tessellate the active body, compute a per-vertex
+// SCALAR field, write it to a temp .aicm file (a SCLR chunk on the tessellated body) and return
+// {"aicm_path": <path>}. Mirrors worker.py::_eval_write_field_aicm: tessellate (body_id=1) ->
+// chunk_fn(tess,shape) -> write_aicm_file(tmp, [tess], extra_chunks=[chunk]).
 
 namespace {
 
@@ -15154,90 +21072,6 @@ inline void field_vertex_normal(const aicm::AicmBody& body, std::size_t vi, doub
     out[0] = x * inv;
     out[1] = y * inv;
     out[2] = z * inv;
-}
-
-// engine/doc/evaluate.py::_moller_trumbore_all — for each ray, the smallest positive t
-// (distance along a UNIT direction) to a triangle of the mesh; inf if no hit. Same EPS=1e-10,
-// u/v barycentric bounds and t>EPS guard as the oracle. directions are unit vectors.
-//
-// EXIT FACES ONLY, NEVER GRAZING (load-bearing for wall thickness). The cast starts inside
-// the material, so the wall it measures ends where the ray LEAVES the material: a triangle
-// whose outward normal N points along the ray (d.N > 0, i.e. MT determinant a < 0, since
-// a = -d.(e1 x e2) and tessellate_body winds every triangle outward). That keeps the near
-// inner-shell wall of a hollow part (its outward normal faces the cavity, along the inward
-// ray), so a shell still reads its wall, not the cavity span. It rejects two false hits:
-//  * an ENTRY face (d.N < 0): the ray was outside the material, e.g. a rim sample whose ray
-//    ran along the adjacent face and struck the foot of a boss on it (GripperGears: a Ø8
-//    pin-end rim read 0.5 mm against the Ø7 collar foot);
-//  * a GRAZING face (d.N < min_exit_cos * |N|): the ray runs nearly in the face plane, so
-//    the hit is a tessellation-chord artefact, not an opposite wall.
-// Rejected triangles are skipped; the ray continues to the next exit face.
-std::vector<double> field_moller_trumbore_all(const std::vector<float>& pos,
-                                              const std::vector<uint32_t>& idx,
-                                              const std::vector<std::array<double, 3>>& origins,
-                                              const std::vector<std::array<double, 3>>& dirs,
-                                              double min_exit_cos) {
-    constexpr double EPS = 1e-10;
-    const std::size_t n_rays = origins.size();
-    const std::size_t n_tris = idx.size() / 3;
-    std::vector<double> dist(n_rays, std::numeric_limits<double>::infinity());
-
-    auto vtx = [&](uint32_t i, double out[3]) {
-        out[0] = pos[3 * i + 0];
-        out[1] = pos[3 * i + 1];
-        out[2] = pos[3 * i + 2];
-    };
-    auto cross = [](const double a[3], const double b[3], double o[3]) {
-        o[0] = a[1] * b[2] - a[2] * b[1];
-        o[1] = a[2] * b[0] - a[0] * b[2];
-        o[2] = a[0] * b[1] - a[1] * b[0];
-    };
-    auto dot = [](const double a[3], const double b[3]) {
-        return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-    };
-
-    // Precompute triangle edges (matches the oracle's V0/E1/E2 layout) and |e1 x e2|.
-    std::vector<std::array<double, 3>> V0(n_tris), E1(n_tris), E2(n_tris);
-    std::vector<double> N2(n_tris);
-    for (std::size_t t = 0; t < n_tris; ++t) {
-        double v0[3], v1[3], v2[3];
-        vtx(idx[3 * t + 0], v0);
-        vtx(idx[3 * t + 1], v1);
-        vtx(idx[3 * t + 2], v2);
-        V0[t] = {v0[0], v0[1], v0[2]};
-        E1[t] = {v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]};
-        E2[t] = {v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]};
-        double n[3];
-        cross(E1[t].data(), E2[t].data(), n);
-        N2[t] = std::sqrt(dot(n, n));
-    }
-
-    for (std::size_t ri = 0; ri < n_rays; ++ri) {
-        const double d[3] = {dirs[ri][0], dirs[ri][1], dirs[ri][2]};
-        const double o[3] = {origins[ri][0], origins[ri][1], origins[ri][2]};
-        double best = std::numeric_limits<double>::infinity();
-        for (std::size_t t = 0; t < n_tris; ++t) {
-            const double e1[3] = {E1[t][0], E1[t][1], E1[t][2]};
-            const double e2[3] = {E2[t][0], E2[t][1], E2[t][2]};
-            double h[3];
-            cross(d, e2, h);
-            double a = dot(e1, h);
-            // a = -d.N (unnormalized N): keep only exit faces at a steep enough angle.
-            if (-a <= std::max(EPS, min_exit_cos * N2[t])) continue;
-            double inv_a = 1.0 / a;
-            const double s[3] = {o[0] - V0[t][0], o[1] - V0[t][1], o[2] - V0[t][2]};
-            double u = inv_a * dot(s, h);
-            if (u < 0.0 || u > 1.0) continue;
-            double q[3];
-            cross(s, e1, q);
-            double v = inv_a * dot(q, d);
-            if (v < 0.0 || u + v > 1.0) continue;
-            double tval = inv_a * dot(e2, q);
-            if (tval > EPS && tval < best) best = tval;
-        }
-        dist[ri] = best;
-    }
-    return dist;
 }
 
 // Sample the TRUE surface of every face whose triangulation touches the sphere
@@ -15370,7 +21204,7 @@ json doc_fit_cylinder_axis(const std::string& doc_id, int body_id,
         throw OpError("invalid_op",
                       "search_radius_mm must be > 0 (it is the cull radius around `near`)",
                       {{"reason", "bad search_radius_mm"}});
-    CompileResult r = compile_session(s);
+    const CompileResult& r = ensure_compiled(s);
     const TopoDS_Shape& shape = field_active_shape(r, doc_id, body_id);
     try {
         BRepMesh_IncrementalMesh(shape, 0.1, Standard_False, 0.5, Standard_True).Perform();
@@ -15414,7 +21248,7 @@ json doc_eval_draft(const std::string& doc_id, int body_id, const std::array<dou
                     double angle_deg) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    CompileResult r = compile_session(s);
+    const CompileResult& r = ensure_compiled(s);
     const TopoDS_Shape& shape = field_active_shape(r, doc_id, body_id);
     const std::string name = (body_id >= 1 && body_id <= static_cast<int>(r.bodies_info.size()))
                                  ? r.bodies_info[static_cast<std::size_t>(body_id - 1)].name
@@ -15527,7 +21361,7 @@ json doc_eval_draft(const std::string& doc_id, int body_id, const std::array<dou
 json doc_eval_curvature(const std::string& doc_id, int body_id, const std::string& kind) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    CompileResult r = compile_session(s);
+    const CompileResult& r = ensure_compiled(s);
     const TopoDS_Shape& shape = field_active_shape(r, doc_id, body_id);
     const std::string name = (body_id >= 1 && body_id <= static_cast<int>(r.bodies_info.size()))
                                  ? r.bodies_info[static_cast<std::size_t>(body_id - 1)].name
@@ -15614,141 +21448,364 @@ json doc_eval_curvature(const std::string& doc_id, int body_id, const std::strin
     return out;
 }
 
-// engine/doc/evaluate.py::thickness_field. Per-vertex inward-raycast wall thickness: from each
-// vertex offset 1e-3 along -normal (the inward direction, since field_vertex_normal returns the
-// OUTWARD surface normal), cast -normal and take the NEAREST exit-face distance PLUS the
-// offset (the origin already sits OFFSET inside the surface, so the wall is d + OFFSET; the old
-// d - OFFSET counted the offset twice and read every wall 2e-3 mm thin). Only EXIT faces hit
-// at more than GRAZE_DEG to their plane count (field_moller_trumbore_all), so the cast stops
-// at the FIRST opposite wall — for a hollow shell that is the thin wall, not the far side
-// across the cavity.
-// Edge samples: tessellation vertices sit on face EDGES (every vertex of a planar face does).
-// From an edge vertex the -normal ray runs IN the plane of the adjacent face, on the solid
-// boundary, not through material; a boss standing on that face then stops it (GripperGears:
-// the Ø8 pin-end rim read 0.5 mm against the foot of the Ø7 collar, a 0.5 mm ledge). So each
-// origin also moves NUDGE into its own face, toward the centroids of its own triangles.
-// At an acute convex edge the adjacent face can still be a genuine nearby EXIT: the local
-// span tends to zero toward that edge. Keep it, but expose the ray and sampling basis rather
-// than claiming that this edge-local span is the minimum structural wall thickness.
-// The oracle's primary path is trimesh BVH; we port the deterministic Moller-Trumbore
-// FALLBACK (_moller_trumbore_all). chunk name "thickness". NOTE: parity here is
-// PHYSICAL (a tolerance band), not bit-exact — the oracle's BVH runs on a divergent mesh.
-// CAVEAT: thickness is a property of the SOLID. A solid block reports its full span (a 40 mm
-// cube -> ~40 mm), which is correct; only a body with a genuine cavity (e.g. an open shell)
-// has a thin wall to report (~2 mm for a 2 mm shell).
-json doc_eval_thickness(const std::string& doc_id, int body_id) {
+// Sample the existing field on a specified adjacent face, a small, reported distance
+// from an edge. A blend identifies its edge by its unique shared boundary with the
+// requested face; ambiguous boundaries are deliberately not guessed.
+json doc_eval_local_thickness(const std::string& doc_id, const json& params) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    CompileResult r = compile_session(s);
-    const TopoDS_Shape& shape = field_active_shape(r, doc_id, body_id);
-    const std::string name = (body_id >= 1 && body_id <= static_cast<int>(r.bodies_info.size()))
-                                 ? r.bodies_info[static_cast<std::size_t>(body_id - 1)].name
-                             : (!r.bodies_info.empty() ? r.bodies_info.back().name : std::string());
-    aicm::AicmBody body = field_tessellate(shape, name);
-
-    const std::size_t n = body.n_verts();
-    const float NaNf = std::numeric_limits<float>::quiet_NaN();
-    std::vector<float> values(n, NaNf);
-
-    constexpr double OFFSET = 1e-3;
-    constexpr double NUDGE = 1e-3;
-    constexpr double GRAZE_DEG = 5.0;
-    // Sum of (triangle centroid - vertex) over each vertex's own triangles. tessellate_body
-    // gives every B-rep face its own vertices, so this points into that vertex's face.
-    std::vector<std::array<double, 3>> inward(n, {0.0, 0.0, 0.0});
-    for (std::size_t t = 0; t + 2 < body.idx.size(); t += 3) {
-        const uint32_t c[3] = {body.idx[t], body.idx[t + 1], body.idx[t + 2]};
-        double centroid[3];
-        for (int k = 0; k < 3; ++k)
-            centroid[k] = (static_cast<double>(body.pos[3 * c[0] + k]) + body.pos[3 * c[1] + k] +
-                           body.pos[3 * c[2] + k]) / 3.0;
-        for (uint32_t vi : c)
-            for (int k = 0; k < 3; ++k) inward[vi][k] += centroid[k] - body.pos[3 * vi + k];
+    const auto bad = [](const std::string& message) {
+        return OpError("invalid_op", "eval_local_thickness: " + message);
+    };
+    const auto positive_id = [&](const char* key) {
+        if (!params.contains(key) || !params[key].is_number_integer() ||
+            params[key].get<int>() < 1)
+            throw bad(std::string(key) + " must be a positive integer");
+        return params[key].get<int>();
+    };
+    const int body_id = positive_id("body");
+    const int face_id = positive_id("face_topo");
+    const bool has_edge = params.contains("edge_topo") && !params["edge_topo"].is_null();
+    const bool has_blend = params.contains("blend_topo") && !params["blend_topo"].is_null();
+    if (has_edge == has_blend) throw bad("specify exactly one of edge_topo or blend_topo");
+    const int source_id = positive_id(has_edge ? "edge_topo" : "blend_topo");
+    double resolution = 0.0;
+    if (params.contains("resolution") && !params["resolution"].is_null()) {
+        if (!params["resolution"].is_number()) throw bad("resolution must be a nonnegative number");
+        resolution = params["resolution"].get<double>();
+        if (!std::isfinite(resolution) || resolution < 0.0)
+            throw bad("resolution must be a finite nonnegative number");
     }
-    std::vector<std::array<double, 3>> origins(n), dirs(n);
-    for (std::size_t i = 0; i < n; ++i) {
-        double nrm[3];
-        field_vertex_normal(body, i, nrm);
-        // Tangent part of the into-face direction, scaled to NUDGE (none when it vanishes).
-        std::array<double, 3> side = inward[i];
-        const double along = side[0] * nrm[0] + side[1] * nrm[1] + side[2] * nrm[2];
-        for (int k = 0; k < 3; ++k) side[k] -= along * nrm[k];
-        const double len = std::sqrt(side[0] * side[0] + side[1] * side[1] + side[2] * side[2]);
-        const double scale = len > 1e-12 ? NUDGE / len : 0.0;
-        origins[i] = {body.pos[3 * i + 0] - nrm[0] * OFFSET + side[0] * scale,
-                      body.pos[3 * i + 1] - nrm[1] * OFFSET + side[1] * scale,
-                      body.pos[3 * i + 2] - nrm[2] * OFFSET + side[2] * scale};
-        dirs[i] = {-nrm[0], -nrm[1], -nrm[2]};  // inward (unit, since normal is unit)
+    const CompileResult& r = ensure_compiled(s);
+    const TopoDS_Shape& shape = eval_active_shape(r, doc_id, body_id);
+    TopTools_IndexedMapOfShape faces, edges;
+    TopExp::MapShapes(shape, TopAbs_FACE, faces);
+    TopExp::MapShapes(shape, TopAbs_EDGE, edges);
+    if (face_id > faces.Extent()) throw bad("face_topo is not a face of the selected body");
+    TopTools_IndexedMapOfShape face_edges;
+    TopExp::MapShapes(faces.FindKey(face_id), TopAbs_EDGE, face_edges);
+    int edge_id = 0;
+    if (has_edge) {
+        if (source_id > edges.Extent() || !face_edges.Contains(edges.FindKey(source_id)))
+            throw bad("edge_topo is not a boundary of face_topo");
+        edge_id = source_id;
+    } else {
+        if (source_id > faces.Extent() || source_id == face_id)
+            throw bad("blend_topo must identify another face of the selected body");
+        TopTools_IndexedMapOfShape blend_edges;
+        TopExp::MapShapes(faces.FindKey(source_id), TopAbs_EDGE, blend_edges);
+        for (int i = 1; i <= face_edges.Extent(); ++i) {
+            if (!blend_edges.Contains(face_edges.FindKey(i))) continue;
+            if (edge_id != 0)
+                return {{"body", body_id}, {"face_topo", face_id}, {"revision", s.revision},
+                        {"samples", json::array()}, {"unavailable_reason", "ambiguous_shared_boundary"}};
+            edge_id = edges.FindIndex(face_edges.FindKey(i));
+        }
+        if (!edge_id)
+            return {{"body", body_id}, {"face_topo", face_id}, {"revision", s.revision},
+                    {"samples", json::array()}, {"unavailable_reason", "no_shared_boundary"}};
     }
-
-    std::vector<double> hits = field_moller_trumbore_all(
-        body.pos, body.idx, origins, dirs, std::sin(GRAZE_DEG * M_PI / 180.0));
-
-    float vmin = 0.0f, vmax = 0.0f;
-    double sum = 0.0;
-    std::size_t n_sampled = 0;  // vertices with a valid through-wall hit
-    std::size_t min_vertex = 0;
-    bool any = false;
-    for (std::size_t i = 0; i < n; ++i) {
-        double d = hits[i];
-        if (std::isfinite(d) && d > OFFSET) {
-            float t = static_cast<float>(d + OFFSET);
-            values[i] = t;
-            sum += t;
-            ++n_sampled;
-            if (!any) {
-                vmin = vmax = t;
-                min_vertex = i;
-                any = true;
-            } else {
-                if (t < vmin) {
-                    vmin = t;
-                    min_vertex = i;
-                }
-                vmax = std::max(vmax, t);
-            }
+    const auto study = thickness_study(s, r, body_id, resolution);
+    const double h = study->spacing_mm;
+    json out{{"body", body_id}, {"face_topo", face_id}, {"edge_topo", edge_id},
+             {"revision", s.revision}, {"samples", json::array()},
+             {"measurement_basis", {{"method", "inscribed_sphere"},
+                                    {"spacing_mm", h},
+                                    {"requested_spacing_mm", resolution > 0 ? json(resolution) : json(nullptr)},
+                                    {"budget_limited", study->budget_limited},
+                                    {"offset_target_mm", 2.0 * h},
+                                    {"offset_range_mm", {0.4 * h, 3.0 * h}},
+                                    {"edge_projection", "closest_point_on_brep_curve"}}}};
+    const auto infos = describe_faces(shape);
+    if (static_cast<std::size_t>(face_id) <= infos.size())
+        out["face_sid"] = make_selector(infos[static_cast<std::size_t>(face_id - 1)])
+                              .value("sid", std::string());
+    Standard_Real first = 0, last = 0;
+    const Handle(Geom_Curve) curve = BRep_Tool::Curve(TopoDS::Edge(edges.FindKey(edge_id)), first, last);
+    if (curve.IsNull() || !std::isfinite(first) || !std::isfinite(last) || first >= last || !(h > 0)) {
+        out["unavailable_reason"] = "edge_curve_unavailable";
+        return out;
+    }
+    std::vector<uint32_t> vertices;
+    std::vector<bool> seen(study->field.thickness.size(), false);
+    for (const auto& fr : study->body.faces) {
+        if (fr.face_id != static_cast<uint32_t>(face_id)) continue;
+        const std::size_t end = std::min<std::size_t>(3 * (std::size_t{fr.first_tri} + fr.tri_count),
+                                                      study->mesh.idx.size());
+        for (std::size_t k = 3 * std::size_t{fr.first_tri}; k < end; ++k) {
+            const uint32_t v = study->mesh.idx[k];
+            if (v < seen.size() && !seen[v]) { seen[v] = true; vertices.push_back(v); }
         }
     }
+    std::set<uint32_t> used;
+    for (double fraction : {0.25, 0.5, 0.75}) {
+        const gp_Pnt anchor = curve->Value(first + fraction * (last - first));
+        double best = std::numeric_limits<double>::infinity();
+        uint32_t best_v = 0;
+        gp_Pnt best_edge;
+        double best_offset = 0;
+        for (uint32_t v : vertices) {
+            if (used.count(v) || !std::isfinite(study->field.thickness[v]) ||
+                study->field.thickness[v] <= 0) continue;
+            const auto& p = study->mesh.pos;
+            const gp_Pnt sample(p[3 * v], p[3 * v + 1], p[3 * v + 2]);
+            const double to_anchor = sample.Distance(anchor);
+            if (to_anchor > 4.0 * h) continue;
+            try {
+                GeomAPI_ProjectPointOnCurve projection(sample, curve, first, last);
+                if (!projection.NbPoints()) continue;
+                const double offset = projection.LowerDistance();
+                if (!std::isfinite(offset) || offset < 0.4 * h || offset > 3.0 * h) continue;
+                const double score = std::abs(offset - 2.0 * h) + 0.25 * to_anchor;
+                if (score < best) {
+                    best = score;
+                    best_v = v;
+                    best_edge = projection.NearestPoint();
+                    best_offset = offset;
+                }
+            } catch (const Standard_Failure&) {
+                continue;
+            }
+        }
+        if (!std::isfinite(best)) continue;
+        used.insert(best_v);
+        const auto& p = study->mesh.pos;
+        out["samples"].push_back({{"at", {p[3 * best_v], p[3 * best_v + 1], p[3 * best_v + 2]}},
+                                  {"edge_at", {best_edge.X(), best_edge.Y(), best_edge.Z()}},
+                                  {"edge_topo", edge_id}, {"offset_mm", best_offset},
+                                  {"thickness_mm", study->field.thickness[best_v]}});
+    }
+    out["unavailable_reason"] = out["samples"].empty() ? json("no_local_measured_samples") : json(nullptr);
+    return out;
+}
 
-    auto chunk = aicm::scalar_chunk(body.body_id, "thickness", values, vmin, vmax);
-    json out{{"aicm_path", field_write_temp_aicm(body, chunk)}};
-    // These are local tessellated normal-ray spans, including edge tapers. They are not an
-    // interior-wall search or a verified structural/process minimum.
+// Wall-thickness study of one body: the inscribed-sphere field (geom/wall_thickness.h) on a
+// refined copy of the display tessellation (thickness_study), published as a SCLR
+// "thickness" chunk on that refined body. `resolution_mm` is the sample spacing (<= 0 picks
+// ~120k samples); `min_wall_mm` > 0 also extracts the connected regions thinner than it.
+// A solid block reads its full span (a 40 mm cube -> ~40 mm); NaN = no opposing wall
+// (an open sheet).
+json doc_eval_thickness(const std::string& doc_id, int body_id, double resolution_mm,
+                        double min_wall_mm) {
+    DocLock lk;
+    Session& s = require_session(doc_id);
+    if (!std::isfinite(resolution_mm) || resolution_mm < 0.0)
+        throw OpError("invalid_op", "resolution must be a non-negative number of mm",
+                      {{"reason", "bad resolution"}});
+    if (!std::isfinite(min_wall_mm) || min_wall_mm < 0.0)
+        throw OpError("invalid_op", "min_wall_mm must be a non-negative number of mm",
+                      {{"reason", "bad min_wall_mm"}});
+    const CompileResult& r = ensure_compiled(s);
+    const auto study = thickness_study(s, r, body_id, resolution_mm);
+    const chudware::geom::ThicknessResult& f = study->field;
+    const std::vector<float>& values = f.thickness;
+    const std::size_t n = values.size();
+
+    // Vertex -> B-rep face id (1-based TopExp index, the doc_query `topo` key).
+    std::vector<uint32_t> face_of(n, 0u);
+    for (const aicm::FaceRec& fr : study->body.faces)
+        for (std::size_t t = fr.first_tri; t < std::size_t{fr.first_tri} + fr.tri_count; ++t)
+            for (int k = 0; k < 3; ++k) face_of[study->mesh.idx[3 * t + k]] = fr.face_id;
+
+    float vmin = 0.0f, vmax = 0.0f;
+    double weighted = 0.0, weight = 0.0;
+    std::size_t n_sampled = 0, min_vertex = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const float v = values[i];
+        if (!std::isfinite(v)) continue;
+        if (n_sampled == 0 || v < vmin) {
+            vmin = v;
+            min_vertex = i;
+        }
+        vmax = n_sampled == 0 ? v : std::max(vmax, v);
+        weighted += study->areas[i] * v;
+        weight += study->areas[i];
+        ++n_sampled;
+    }
+
+    const auto vec3 = [](const float* p) { return json::array({p[0], p[1], p[2]}); };
+    const auto wall_direction = [&](std::size_t i) { return wall_direction_json(f, i); };
+    // Knife edge / taper: the two sides converge (> ~25 deg apart) instead of running parallel.
+    const auto kind = [&](std::size_t i) { return f.opposing_cos[i] > -0.9f ? "taper" : "wall"; };
+
+    auto chunk = aicm::scalar_chunk(study->body.body_id, "thickness", values, vmin, vmax);
+    json out{{"aicm_path", field_write_temp_aicm(study->body, chunk)}};
     if (n_sampled > 0) {
         out["min_thickness_mm"] = static_cast<double>(vmin);
         out["max_thickness_mm"] = static_cast<double>(vmax);
-        out["mean_thickness_mm"] = sum / static_cast<double>(n_sampled);
-        const auto& origin = origins[min_vertex];
-        const auto& dir = dirs[min_vertex];
-        std::array<double, 3> at, exit, tangent_nudge;
-        for (int k = 0; k < 3; ++k) {
-            at[k] = body.pos[3 * min_vertex + k];
-            exit[k] = origin[k] + dir[k] * hits[min_vertex];
-            tangent_nudge[k] = origin[k] - at[k] - dir[k] * OFFSET;
-        }
-        out["minimum_sample"] = {{"vertex_index", min_vertex}, {"at", at},
-                                 {"ray_origin", origin}, {"inward_direction", dir},
-                                 {"exit_at", exit}, {"tangent_nudge", tangent_nudge}};
+        out["mean_thickness_mm"] = weight > 0.0 ? weighted / weight : static_cast<double>(vmin);
+        const std::size_t i = min_vertex;
+        out["minimum_sample"] = {{"vertex_index", i},
+                                 {"at", vec3(&study->mesh.pos[3 * i])},
+                                 {"opposite_at", vec3(&f.opposite[3 * i])},
+                                 {"ball_center", vec3(&f.center[3 * i])},
+                                 {"wall_direction", wall_direction(i)},
+                                 {"face_id", face_of[i]},
+                                 {"opposing_cos", f.opposing_cos[i]},
+                                 {"kind", kind(i)}};
     } else {
         out["min_thickness_mm"] = nullptr;
         out["max_thickness_mm"] = nullptr;
         out["mean_thickness_mm"] = nullptr;
         out["minimum_sample"] = nullptr;
     }
-    out["n_sampled"] = static_cast<int>(n_sampled);
-    out["measurement_basis"] = {{"method", "tessellated_inward_normal_rays"},
-                                 {"samples", "face_local_mesh_vertices"},
-                                 {"n_vertices", n}, {"n_unmeasured", n - n_sampled},
-                                 {"surface_offset_mm", OFFSET}, {"tangent_nudge_mm", NUDGE},
-                                 {"minimum_exit_angle_deg", GRAZE_DEG},
-                                 {"minimum_accepted_span_exclusive_mm", 2.0 * OFFSET}};
+    out["n_sampled"] = n_sampled;
+    out["measurement_basis"] = {
+        {"method", "inscribed_sphere"},
+        {"spacing_mm", study->spacing_mm},
+        {"requested_spacing_mm", resolution_mm > 0.0 ? json(resolution_mm) : json(nullptr)},
+        {"budget_limited", study->budget_limited},
+        {"n_vertices", n},
+        {"n_unmeasured", n - n_sampled},
+        {"wall_separation_deg", chudware::geom::ThicknessOptions{}.wall_separation_deg}};
+
+    if (min_wall_mm > 0.0) {
+        const auto regions = chudware::geom::thin_regions(study->mesh, values, study->areas,
+                                                          min_wall_mm, 1.5 * study->spacing_mm);
+        constexpr std::size_t kMaxRegions = 24;
+        json rows = json::array();
+        double thin_area = 0.0;
+        for (const auto& reg : regions) {
+            thin_area += reg.area;
+            if (rows.size() >= kMaxRegions) continue;
+            const std::size_t i = reg.min_vertex;
+            json faces = json::array();
+            for (const uint32_t g : reg.groups)
+                if (g < study->body.faces.size()) faces.push_back(study->body.faces[g].face_id);
+            rows.push_back({{"min_thickness_mm", reg.min_thickness},
+                            {"at", vec3(&study->mesh.pos[3 * i])},
+                            {"opposite_at", vec3(&f.opposite[3 * i])},
+                            {"wall_direction", wall_direction(i)},
+                            {"centroid", reg.centroid},
+                            {"bbox", {{"min", reg.lo}, {"max", reg.hi}}},
+                            {"area_mm2", reg.area},
+                            {"face_ids", faces},
+                            {"kind", kind(i)},
+                            {"opposing_cos", f.opposing_cos[i]}});
+        }
+        out["min_wall_mm"] = min_wall_mm;
+        out["thin_area_mm2"] = thin_area;
+        out["n_thin_regions"] = regions.size();
+        out["thin_regions"] = std::move(rows);
+    }
     return out;
 }
 
+// Thickness at caller-supplied samples of a raw triangle mesh (services/dfam min_wall): the
+// blockers are the mesh refined to `resolution` with per-triangle normals (a raw mesh shares
+// vertices across creases, so its vertex normals would be wrong at every sharp edge).
+json doc_mesh_wall_thickness(const json& params) {
+    const auto floats = [&](const char* key) {
+        std::vector<float> out;
+        const auto it = params.find(key);
+        if (it == params.end() || !it->is_array() || it->size() % 3 != 0)
+            throw OpError("invalid_op", std::string(key) + " must be a flat [x,y,z,...] array",
+                          {{"reason", std::string("bad ") + key}});
+        out.reserve(it->size());
+        for (const json& v : *it) {
+            if (!v.is_number())
+                throw OpError("invalid_op", std::string(key) + " must hold numbers",
+                              {{"reason", std::string("bad ") + key}});
+            out.push_back(v.get<float>());
+        }
+        return out;
+    };
+    const std::vector<float> vertices = floats("vertices");
+    const std::vector<float> points = floats("points");
+    const std::vector<float> normals = floats("normals");
+    if (points.size() != normals.size())
+        throw OpError("invalid_op", "points and normals must have the same length",
+                      {{"reason", "points/normals mismatch"}});
+    const auto tri_it = params.find("triangles");
+    if (tri_it == params.end() || !tri_it->is_array() || tri_it->size() % 3 != 0)
+        throw OpError("invalid_op", "triangles must be a flat [a,b,c,...] index array",
+                      {{"reason", "bad triangles"}});
+    const double resolution = params.value("resolution", 0.0);
+    if (!std::isfinite(resolution) || resolution < 0.0)
+        throw OpError("invalid_op", "resolution must be a non-negative number of mm",
+                      {{"reason", "bad resolution"}});
+
+    // One vertex triple per triangle, carrying the triangle's own normal.
+    const std::size_t nv = vertices.size() / 3;
+    const std::size_t nt = tri_it->size() / 3;
+    chudware::geom::ThicknessMesh mesh;
+    mesh.pos.reserve(9 * nt);
+    mesh.nrm.reserve(9 * nt);
+    for (std::size_t t = 0; t < nt; ++t) {
+        uint32_t v[3];
+        for (int k = 0; k < 3; ++k) {
+            const json& j = (*tri_it)[3 * t + k];
+            if (!j.is_number_integer() || j.get<long long>() < 0 ||
+                static_cast<std::size_t>(j.get<long long>()) >= nv)
+                throw OpError("invalid_op", "triangle index out of range",
+                              {{"reason", "bad triangles"}, {"triangle", t}});
+            v[k] = j.get<uint32_t>();
+        }
+        double e1[3], e2[3];
+        for (int k = 0; k < 3; ++k) {
+            e1[k] = static_cast<double>(vertices[3 * v[1] + k]) - vertices[3 * v[0] + k];
+            e2[k] = static_cast<double>(vertices[3 * v[2] + k]) - vertices[3 * v[0] + k];
+        }
+        const double c[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2],
+                             e1[0] * e2[1] - e1[1] * e2[0]};
+        const double len = std::sqrt(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
+        if (!(len > 0.0)) continue;  // degenerate: no wall to offer
+        const auto base = static_cast<uint32_t>(mesh.pos.size() / 3);
+        for (int k = 0; k < 3; ++k) {
+            mesh.pos.insert(mesh.pos.end(), &vertices[3 * v[k]], &vertices[3 * v[k]] + 3);
+            for (int a = 0; a < 3; ++a) mesh.nrm.push_back(static_cast<float>(c[a] / len));
+            mesh.idx.push_back(base + static_cast<uint32_t>(k));
+        }
+        mesh.tri_group.push_back(static_cast<uint32_t>(t));
+    }
+    double h = 0.0;
+    const chudware::geom::ThicknessMesh blockers = refine_to_budget(mesh, resolution, h);
+    const double area = chudware::geom::mesh_area(mesh);
+
+    double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
+    for (std::size_t i = 0; i + 2 < blockers.pos.size(); i += 3)
+        for (int k = 0; k < 3; ++k) {
+            lo[k] = std::min(lo[k], static_cast<double>(blockers.pos[i + k]));
+            hi[k] = std::max(hi[k], static_cast<double>(blockers.pos[i + k]));
+        }
+    const double diag = blockers.pos.empty()
+                            ? 0.0
+                            : std::sqrt((hi[0] - lo[0]) * (hi[0] - lo[0]) +
+                                        (hi[1] - lo[1]) * (hi[1] - lo[1]) +
+                                        (hi[2] - lo[2]) * (hi[2] - lo[2]));
+    // Coverage runs among the query samples, so its reach and tolerance follow their spacing.
+    const std::size_t nq = points.size() / 3;
+    const double query_spacing = nq ? std::sqrt(area / static_cast<double>(nq)) : h;
+    chudware::geom::ThicknessOptions opt;
+    opt.coverage_radius_mm = std::max(10.0 * query_spacing, 0.1 * diag);
+    opt.coverage_tolerance_mm = 0.1 * std::max(h, query_spacing);
+    const chudware::geom::ThicknessResult f =
+        chudware::geom::measure_wall_thickness(blockers.pos, blockers.nrm, points, normals, opt);
+
+    json thickness = json::array(), opposing = json::array(), direction = json::array();
+    for (std::size_t i = 0; i < nq; ++i) {
+        thickness.push_back(std::isfinite(f.thickness[i]) ? json(f.thickness[i]) : json(nullptr));
+        opposing.push_back(std::isfinite(f.opposing_cos[i]) ? json(f.opposing_cos[i])
+                                                             : json(nullptr));
+        direction.push_back(wall_direction_json(f, i));
+    }
+    return json{{"ok", true},
+                {"thickness", std::move(thickness)},
+                {"opposing_cos", std::move(opposing)},
+                {"wall_direction", std::move(direction)},
+                {"spacing_mm", h},
+                {"n_blockers", blockers.n_verts()}};
+}
+
 json doc_push_pull(const std::string& doc_id, int body_id, int topo_id, double distance,
-                   bool commit) {
+                   bool commit, long expect_revision) {
     DocLock lk;
     Session& s = require_session(doc_id);
+    if (expect_revision >= 0 && expect_revision != s.revision)
+        throw OpError("stale_revision",
+                      "expect_revision " + std::to_string(expect_revision) +
+                          " != current " + std::to_string(s.revision),
+                      {{"current_revision", s.revision}});
     // plan_push_pull compiles + resolves the face owner (throws OpError on a bad
     // body_id/topo_id), never mutating the doc.
     PushPullPlan plan = plan_push_pull(s.doc, env_from_doc(s.doc), body_id, topo_id, distance);
@@ -15871,6 +21928,30 @@ json doc_export_file(const std::string& doc_id, const std::string& path, const s
                       "export_file: 'units' applies to dxf/dwg/sat only (" + fmt +
                           " is written in millimetres)",
                       {{"format", fmt}, {"units", units}});
+    if (fmt == "scad") {
+        const json& features = s.doc.value("features", json::array());
+        if (s.is_assembly() || features.size() != 1 ||
+            features[0].value("type", std::string()) != "scad" ||
+            features[0].value("suppressed", false))
+            throw OpError("export_failed", "SCAD source export requires exactly one active SCAD feature");
+        const json& scad_params = features[0].at("params");
+        if (scad_params.contains("native_projection")) {
+            const json restored = scad::restore_native(scad_params);
+            if (restored.value("ok", false)) {
+                const json original_equations = scad_params["native_projection"]["document"]
+                    .value("equations", json::object());
+                if (s.doc.value("equations", json::object()) != original_equations)
+                    throw OpError("export_failed", "managed SCAD equations changed since projection; restore or update the native graph before exporting");
+            }
+        }
+        std::map<std::string, double> env;
+        const json globals = env_from_doc(s.doc);
+        for (auto it = globals.begin(); it != globals.end(); ++it)
+            if (it.value().is_number()) env.emplace(it.key(), it.value().get<double>());
+        json result = scad::export_project(scad_params, native_policy::authored_reference(path), env);
+        result["format"] = "scad";
+        return result;
+    }
     json components;
     std::vector<TopoDS_Shape> shapes = gather_export_shapes(s, &components);
     if (shapes.empty())
@@ -16015,7 +22096,23 @@ json doc_export_file(const std::string& doc_id, const std::string& path, const s
                           {{"path", out}, {"format", fmt}});
         }
     } else {
-        meta["validated"] = false;  // bytes alone do not prove a solid-preserving round trip
+        meta["validated"] = false;  // no solid-preserving B-rep round trip
+        if (f == "stl") {
+            int source_solids = 0;
+            for (const TopoDS_Shape& shape : shapes)
+                if (!shape.IsNull())
+                    for (TopExp_Explorer ex(shape, TopAbs_SOLID); ex.More(); ex.Next())
+                        ++source_solids;
+            const std::string reason = "STL is a mesh format; no B-rep round-trip is performed";
+            meta["validation_skipped"] = reason;
+            meta["validation_stages"] = {
+                {"serialized_facet_collapse", {{"status", "passed"}}},
+                {"source_solid_facet_incidence_and_orientation",
+                    {{"status", source_solids ? "passed" : "skipped"},
+                     {"source_solids_checked", source_solids},
+                     {"scope", "per source solid; non-solid geometry is not checked"}}},
+                {"brep_round_trip", {{"status", "skipped"}, {"reason", reason}}}};
+        }
     }
     return meta;
 }
@@ -16138,6 +22235,67 @@ json doc_import_file(const std::string& path, const std::string& into, bool as_s
     // Resolve the format up front so a bad extension errors before we touch a session.
     std::string f = fmt.empty() ? detect_format(path) : fmt;
     const std::string stem = std::filesystem::path(path).stem().string();
+    if (f == "scad") {
+        json params = scad::import_project(authored_path);
+        Session& target = into.empty()
+            ? new_part_session_locked(stem.empty() ? std::string("Imported") : stem)
+            : require_session(into);
+        // The new session is registered while its document lock is held. If any
+        // stage fails, remove it before releasing that lock so an empty failed
+        // import can never be adopted as an opened document.
+        struct FailedImportCleanup {
+            Session* target;
+            bool armed;
+            ~FailedImportCleanup() noexcept {
+                if (!armed) return;
+                try {
+                    {
+                        std::lock_guard<std::mutex> reg(g_registry_mtx);
+                        auto it = g_sessions.find(target->doc_id);
+                        if (it != g_sessions.end() && it->second.get() == target)
+                            g_sessions.erase(it);
+                    }
+                    chudware::aicm_handoff::release_doc(target->doc_id);
+                } catch (...) {}
+            }
+        } cleanup{&target, into.empty()};
+        const std::string name = unique_feature_name(target, stem.empty() ? "OpenSCAD" : stem);
+        json ops = json::array();
+        if (params.contains("native_projection")) {
+            const json restored = scad::restore_native(params);
+            if (restored.value("ok", false)) {
+                const json equations = params["native_projection"]["document"]
+                    .value("equations", json::object());
+                if (!into.empty() && target.doc.value("equations", json::object()) != equations)
+                    throw OpError("import_failed", "managed SCAD equations conflict with the target document");
+                if (into.empty() && equations.contains("globals") && equations["globals"].is_array())
+                    for (const auto& global : equations["globals"])
+                        ops.push_back({{"op", "eq_set"}, {"name", global.at("name")},
+                                       {"expr", global.at("expr")}});
+            }
+        }
+        ops.push_back(json{{"op", "add_feature"},
+            {"feature", {{"type", "scad"}, {"name", name}, {"params", std::move(params)},
+                         {"refs", json::object()}}}});
+        json resp = apply_ops_locked(target, -1, ops, false);
+        if (resp.contains("rejected_tree")) {
+            std::string message = "SCAD import failed";
+            const json rebuild = resp.value("rebuild", json::object());
+            const json statuses = rebuild.value("feature_status", json::array());
+            if (statuses.is_array()) for (const auto& status : statuses) {
+                if (!status.is_object() || status.value("ok", true) ||
+                    !status.contains("error") || !status["error"].is_string()) continue;
+                message += ": " + status["error"].get<std::string>();
+            }
+            throw OpError("import_failed", message,
+                          {{"rebuild", rebuild}, {"rejected_tree", resp["rejected_tree"]}});
+        }
+        resp["doc_id"] = target.doc_id;
+        resp["import_fidelity"] = "faceted";
+        resp["history_recovered"] = false;
+        cleanup.armed = false;
+        return resp;
+    }
 
     // Prefer SolidWorks COM -> exact STEP when it is available.  Modern SLDPRT/SLDASM files
     // also carry a portable saved-display tessellation, so a missing/broken COM server falls
@@ -16451,38 +22609,43 @@ static int bake_import_features(json& doc) {
 static const char* const kBuildStateCaches[] = {"cache.json", "cache.aicm", "cache.brep",
                                                 "cache.ckpt", "cache.provenance"};
 
-// Persisted geometry cache (fast cold-open): regenerate into s.extra_entries the compiled
-// tessellation + ops-response as additive cache.* entries so a later doc_open can skip the
-// full compile_document rebuild, plus the per-feature build checkpoints (cache.ckpt) so the
-// reopened session is warm and its first edit executes only the edited tail. document.json
-// (the parametric source of truth) is untouched; open uses each entry only when its keys
-// still match (contracts/stepplus.md §4). Always erase first so a failed/again-uncached build
-// never ships a stale cache. Every entry that is not produced is named in the returned
-// `cache` diagnostics — never silent.
+// Regenerate derived build state only for a complete solve. A failed part is
+// rejected before touching the prior entries; neither an explicit save nor an
+// open-time writeback may replace the last recoverable full state with a prefix.
 //
-// geometry.step (contracts/stepplus.md §1) rides the SAME gate and the same erase-first
-// discipline: it is the AP214 snapshot of the last successful rebuild, so it is produced only
-// after a fully-ok rebuild of the tree being written as document.json. Carrying an older
-// snapshot forward instead would hand every foreign STEP reader geometry that disagrees with
-// the document beside it — the one thing the member exists to prevent.
-//
-// `target` is the container the entries are for (assembly fingerprints resolve against its
-// folder); `saved_doc` is the assembly tree written beside them. `asm_doc_hash` overrides the
-// assembly header's doc hash when the file keeps a tree other than `saved_doc` (the doc_open
-// write-back keeps the authored bytes; the session copy may carry load-time migrations).
+// `persisted_doc_hash` keys cache-only writeback to the authored document bytes,
+// even if a cold build corrected the in-memory tree. An ordinary save keys to
+// the tree it actually writes.
 static json persist_build_state(Session& s, const std::string& target, const json& saved_doc,
-                                const std::string* asm_doc_hash) {
+                                const std::string* persisted_doc_hash,
+                                bool refresh_assembly = true, bool recovery_sources = false) {
+    json cache_diag = {{"written", false}, {"entries", json::array()}};
+    const bool is_part =
+        s.doc.is_object() && s.doc.value("schema", std::string()) == "aicad.part/1";
+    if (is_part) {
+        const CompileResult& cr = ensure_compiled(s);
+        if (!cr.ok || s.cache_trust == "unverified") {
+            cache_diag["skipped_reason"] = cr.ok ? "unverified" : "feature_failed";
+            json failed = json::array();
+            for (const FeatureStatus& st : cr.statuses)
+                if (!st.ok) failed.push_back(st.id);
+            if (!failed.empty()) cache_diag["failed_features"] = std::move(failed);
+            return cache_diag;
+        }
+    }
     for (const char* name : kBuildStateCaches) s.extra_entries.erase(name);
     s.extra_entries.erase("geometry.step");
-    json cache_diag = {{"written", false}, {"entries", json::array()}};
     auto drop_caches = [&s]() {
         for (const char* name : kBuildStateCaches) s.extra_entries.erase(name);
         s.extra_entries.erase("geometry.step");
     };
-    const bool is_part =
-        s.doc.is_object() && s.doc.value("schema", std::string()) == "aicad.part/1";
     try {
-        if (s.cache_trust == "unverified") {
+        if (!is_part && s.cache_trust == "unverified") {
+            if (s.unverified_source_doc &&
+                stepplus_doc_hash(s.doc) == s.unverified_materialized_hash)
+                s.doc = *s.unverified_source_doc;
+            s.unverified_source_doc.reset();
+            s.unverified_materialized_hash.clear();
             s.compile_cache = make_compile_cache();
             s.ckpt_memo.reset();
             s.compiled.reset();
@@ -16499,12 +22662,19 @@ static json persist_build_state(Session& s, const std::string& target, const jso
             json failed = json::array();
             for (const FeatureStatus& st : cr.statuses)
                 if (!st.ok) failed.push_back(st.id);
-            const std::string doc_hash = stepplus_doc_hash(s.doc);
+            const std::string doc_hash = persisted_doc_hash ? *persisted_doc_hash
+                                                            : stepplus_doc_hash(s.doc);
             std::size_t budget = 0;
-            if (failed.empty() && !cr.aicm.empty()) {
+            if (cr.ok && failed.empty() && !cr.aicm.empty()) {
                 json cached = ops_response(s, cr, json::object(), /*with_tess=*/true);
-                if (cached.contains("tess") && cached["tess"].is_object())
-                    cached["tess"].erase("aicm_path");  // machine/temp-specific; rebuilt on open
+                if (cached.contains("tess") && cached["tess"].is_object()) {
+                    cached["tess"].erase("aicm_path");  // machine/temp-specific
+                    cached["tess"].erase("mesh_error");
+                }
+                cached.erase("mesh_error");
+                cached["cache_body_names"] = json::array();
+                for (const auto& body : cr.bodies_info)
+                    cached["cache_body_names"].push_back(body.name);
                 // `solved: true` is the crash-safety gate: it is ONLY ever written here, after
                 // a fully-ok rebuild, and both writers are atomic (tmp+rename) — a crash mid-
                 // rebuild can never persist a half-built cache. Readers treat absence as false.
@@ -16516,6 +22686,7 @@ static json persist_build_state(Session& s, const std::string& target, const jso
                                {"display_quality",
                                 ::geom::display_quality_name(s.display_quality)},
                                {"response", std::move(cached)}};
+                if (has_scad_feature(s.doc)) header["scad_runtime"] = s.scad_cache_identity;
                 s.extra_entries["cache.json"] = header.dump();
                 // Solved bodies (exact B-rep, no triangulation): an assembly loads this part
                 // as a component, and a reopen without checkpoints hydrates its session,
@@ -16524,31 +22695,15 @@ static json persist_build_state(Session& s, const std::string& target, const jso
                 // geometry.step: the AP214 snapshot foreign CAD opens (contracts/stepplus.md
                 // §1). The bodies are the ones this fully-ok rebuild just produced.
                 std::string geometry_step = stepplus_geometry_step_bytes(cr.shapes);
-                if (!geometry_step.empty())
-                    s.extra_entries["geometry.step"] = std::move(geometry_step);
-                // The mesh is optional: admitted only into the archive budget every other
-                // entry leaves (the bounded reader would discard a larger one).
-                budget = stepplus_optional_cache_budget(s.doc, s.extra_entries);
-                if (cr.aicm.size() <= budget) {
-                    s.extra_entries["cache.aicm"] = std::string(
-                        reinterpret_cast<const char*>(cr.aicm.data()), cr.aicm.size());
-                    budget -= cr.aicm.size();
-                } else {
-                    header["aicm"] = "budget";  // the open names this miss `budget`
-                    s.extra_entries["cache.json"] = header.dump();
-                    budget = stepplus_optional_cache_budget(s.doc, s.extra_entries);
-                    cache_diag["skipped_reason"] = "budget";
-                    cache_diag["dropped"] = json::array(
-                        {{{"entry", "cache.aicm"}, {"reason", "budget"},
-                          {"bytes", cr.aicm.size()}, {"budget_bytes", budget}}});
-                }
+                if (!cr.shapes.empty() && geometry_step.empty())
+                    throw std::runtime_error("failed to serialize complete geometry.step");
+                if (!geometry_step.empty()) s.extra_entries["geometry.step"] = std::move(geometry_step);
             } else {
-                // No display cache for a partially failed / empty rebuild; the build
-                // checkpoints of the features that succeeded are still persisted below.
-                cache_diag["skipped_reason"] = failed.empty() ? "empty_mesh" : "feature_failed";
+                // Empty documents have no display mesh but can still have checkpoints.
+                cache_diag["skipped_reason"] = cr.ok ? "empty_mesh" : "feature_failed";
                 if (!failed.empty()) cache_diag["failed_features"] = failed;
-                budget = stepplus_optional_cache_budget(s.doc, s.extra_entries);
             }
+            budget = stepplus_optional_cache_budget(s.doc, s.extra_entries);
             // Build checkpoints (cache.ckpt): the incremental-rebuild state that makes the
             // first edit after reopen execute only the affected tail.
             json ckpt_report;
@@ -16581,10 +22736,26 @@ static json persist_build_state(Session& s, const std::string& target, const jso
                 }
             }
             cache_diag["checkpoints"] = std::move(ckpt_report);
+            if (cr.ok && failed.empty() && !cr.aicm.empty()) {
+                // Allocate the remaining budget to display only after checkpoint
+                // encoding has reserved the solved incremental state.
+                budget = stepplus_optional_cache_budget(s.doc, s.extra_entries);
+                if (cr.aicm.size() <= budget) {
+                    s.extra_entries["cache.aicm"] = std::string(
+                        reinterpret_cast<const char*>(cr.aicm.data()), cr.aicm.size());
+                } else {
+                    json header = json::parse(s.extra_entries["cache.json"]);
+                    header["aicm"] = "budget";
+                    s.extra_entries["cache.json"] = header.dump();
+                    cache_diag["skipped_reason"] = "budget";
+                    cache_diag["dropped"] = json::array(
+                        {{{"entry", "cache.aicm"}, {"reason", "budget"},
+                          {"bytes", cr.aicm.size()}, {"budget_bytes", budget}}});
+                }
+            }
         } else if (s.doc.is_object() && s.doc.value("schema", std::string()) == "aicad.asm/1") {
-            // A cache-hit open leaves asm_result empty; rebuild here so a plain re-save
-            // doesn't strip the cache (components are hot in the load cache, so it's cheap).
-            if (!s.asm_result) rebuild_assembly(s);
+            // Ordinary saves refresh descendants; snapshots only use their captured solve.
+            if (refresh_assembly) ensure_assembly_current(s);
             // Assembly persisted-geometry cache: the solved, tessellated scene + the component
             // fingerprints it was built from. doc_open replays it only when the doc hash,
             // engine key AND every component file (path+size+mtime) are unchanged — display-
@@ -16593,7 +22764,14 @@ static json persist_build_state(Session& s, const std::string& target, const jso
             json failed = json::array();
             for (const AsmComponentStatus& cs : ar.component_status)
                 if (!cs.ok) failed.push_back(cs.id);
-            if (ar.bodies.empty()) {
+            if (!asm_fingerprints_match(s.doc, component_source_base(s), s.asm_sources) &&
+                !(recovery_sources && asm_live_fingerprints_match(
+                    s.doc, component_source_base(s), s.asm_sources))) {
+                // Live geometry is not the geometry identified by the on-disk
+                // sources. Do not put either a solved display or geometry.step
+                // beside disk fingerprints that would falsely certify it.
+                cache_diag["skipped_reason"] = "live_sources_unsaved";
+            } else if (ar.bodies.empty()) {
                 cache_diag["skipped_reason"] = "empty_mesh";
             } else if (!ar.converged) {
                 cache_diag["skipped_reason"] = "not_converged";
@@ -16605,25 +22783,34 @@ static json persist_build_state(Session& s, const std::string& target, const jso
                 // body in world coordinates, exactly as gather_export_shapes feeds every
                 // other writer (an assembly doc has no features of its own).
                 std::string geometry_step =
-                    stepplus_geometry_step_bytes(gather_export_shapes(s));
+                    stepplus_geometry_step_bytes(gather_export_shapes(s, nullptr, refresh_assembly));
                 if (!geometry_step.empty())
                     s.extra_entries["geometry.step"] = std::move(geometry_step);
                 std::vector<uint8_t> blob;
                 json cached = ops_response_assembly(s, json::object(), /*with_tess=*/true, &blob);
                 cached["tree"] = saved_doc;
-                if (cached.contains("tess") && cached["tess"].is_object())
+                if (cached.contains("tess") && cached["tess"].is_object()) {
                     cached["tess"].erase("aicm_path");
+                    cached["tess"].erase("mesh_error");
+                }
+                cached.erase("mesh_error");
                 const std::string base_dir = native_policy::path_utf8(
-                    std::filesystem::u8path(target).parent_path());
+                    std::filesystem::absolute(std::filesystem::u8path(target)).parent_path());
                 json header = {{"engine", stepplus_cache_engine_key()},
-                               {"doc_hash", asm_doc_hash ? *asm_doc_hash
-                                                         : stepplus_doc_hash(saved_doc)},
+                               {"doc_hash", persisted_doc_hash ? *persisted_doc_hash
+                                                               : stepplus_doc_hash(saved_doc)},
                                {"solved", true},
                                {"assembly_appearance", 1},
                                {"display_quality",
                                 ::geom::display_quality_name(s.display_quality)},
-                               {"components", asm_component_fingerprints(saved_doc, base_dir)},
+                               {"components", rebase_assembly_fingerprints(
+                                   s.asm_sources, component_source_base(s), base_dir, true)},
                                {"response", cached}};
+                if (recovery_sources && s.extra_entries.count("recovery/assembly_sources.json")) {
+                    header["recovery_sources_sha256"] =
+                        util::sha256_hex(s.extra_entries.at("recovery/assembly_sources.json"));
+                    header["recovery_base"] = base_dir;
+                }
                 if (!blob.empty()) {
                     s.extra_entries["cache.json"] = header.dump();
                     s.extra_entries["cache.aicm"] =
@@ -16645,7 +22832,344 @@ static json persist_build_state(Session& s, const std::string& target, const jso
     return cache_diag;
 }
 
-json doc_save(const std::string& doc_id, const std::string& path, bool preserve_path) {
+static void refuse_failed_part_save(const CompileResult& cr) {
+    json failed = json::array();
+    for (const auto& st : cr.statuses)
+        if (!st.ok) failed.push_back({{"id", st.id}, {"error", st.error}});
+    throw OpError("rebuild_failed", "doc_save: feature history did not rebuild; existing file preserved",
+                  {{"reason", "feature_failed"}, {"failed_features", std::move(failed)}});
+}
+
+// Saving an unverified display must validate the authored history in isolation.
+// A failed solve leaves the live tree, its display, revision, and target archive
+// untouched; a successful solve can be used directly by the subsequent writer.
+static void require_savable_part(Session& s) {
+    if (s.compiled && s.compiled_rev == s.revision && !s.compiled->ok)
+        refuse_failed_part_save(*s.compiled);
+    if (s.cache_trust != "unverified") {
+        const CompileResult& cr = ensure_compiled(s);
+        if (!cr.ok) refuse_failed_part_save(cr);
+        return;
+    }
+    Session scratch;
+    scratch.doc_id = s.doc_id;
+    scratch.doc = s.unverified_source_doc &&
+                          stepplus_doc_hash(s.doc) == s.unverified_materialized_hash
+                      ? *s.unverified_source_doc : s.doc;
+    scratch.revision = s.revision;
+    scratch.path = s.path;
+    scratch.native_source_path = s.native_source_path;
+    scratch.project_dir = s.project_dir;
+    scratch.display_quality = s.display_quality;
+    {
+        native_policy::CacheRecomputeScope scope;
+        const CompileResult& cr = ensure_compiled(scratch);
+        if (!cr.ok) refuse_failed_part_save(cr);
+    }
+    s.doc = std::move(scratch.doc);
+    s.dirty = s.dirty || scratch.dirty;
+    s.compiled = std::move(scratch.compiled);
+    s.compiled_rev = s.revision;
+    s.compiled_partial = false;
+    s.compile_cache = std::move(scratch.compile_cache);
+    s.ckpt_memo.reset();
+    s.last_good_display.reset();
+    s.last_good_body_metadata = json();
+    s.cache_trust = "verified";
+    s.unverified_source_doc.reset();
+    s.unverified_materialized_hash.clear();
+}
+
+// Bundle the exact live revisions used by the captured assembly solve. The
+// signed cache header authenticates this manifest, which in turn hashes each
+// embedded B-rep. Other assemblies never see these recovery-only sources.
+static json capture_recovery_assembly_sources(Session& snapshot, const std::string& base,
+                                               const AssemblyLiveSources& sources) {
+    for (auto it = snapshot.extra_entries.begin(); it != snapshot.extra_entries.end();) {
+        if (it->first == "recovery/assembly_sources.json" ||
+            it->first.rfind("recovery/assembly_sources/", 0) == 0)
+            it = snapshot.extra_entries.erase(it);
+        else ++it;
+    }
+    json rows = json::array();
+    std::set<std::string> included;
+    if (snapshot.asm_sources.is_array()) for (const auto& fingerprint : snapshot.asm_sources) {
+        auto path = std::filesystem::u8path(fingerprint.value("path", std::string()));
+        if (path.empty()) continue;
+        if (path.is_relative()) path = std::filesystem::u8path(base) / path;
+        const std::string canonical = canonical_source_path(path.string());
+        auto found = sources.find(canonical);
+        if (included.count(canonical)) continue;
+        if (found == sources.end() || !found->second || !found->second->document ||
+            found->second->doc_hash != fingerprint.value("doc_hash", std::string())) {
+            if (fingerprint.value("live_unsaved", false))
+                throw OpError("rebuild_failed", "recovery snapshot lost an assembly source revision",
+                              {{"path", canonical}, {"doc_hash", fingerprint.value("doc_hash", "")}});
+            continue;
+        }
+        included.insert(canonical);
+        const auto& source = *found->second;
+        json row = {{"path", canonical}, {"doc_id", source.source_doc_id},
+                    {"revision", source.revision}, {"doc_hash", source.doc_hash},
+                    {"base_file_stamp", source.base_file_stamp}, {"document", *source.document},
+                    {"unverified", source.unverified}};
+        if (source.part && source.part->ok && !source.part->shapes.empty()) {
+            const std::string member = "recovery/assembly_sources/" + util::sha256_hex(canonical) + ".brep";
+            std::string brep = brep_cache_encode(source.part->shapes);
+            row["brep"] = member;
+            row["brep_sha256"] = util::sha256_hex(brep);
+            row["owner_map"] = source.part->owner_map;
+            snapshot.extra_entries[member] = std::move(brep);
+        }
+        rows.push_back(std::move(row));
+    }
+    if (!rows.empty())
+        snapshot.extra_entries["recovery/assembly_sources.json"] =
+            json{{"schema", "chudware-assembly-recovery/1"}, {"sources", rows}}.dump();
+    return rows;
+}
+
+static std::shared_ptr<const AssemblyLiveSources> restore_recovery_assembly_sources(
+        const std::map<std::string, std::string>& entries, bool verified) {
+    const auto manifest = entries.find("recovery/assembly_sources.json");
+    if (manifest == entries.end()) return {};
+    bool authenticated = false;
+    auto cache = entries.find("cache.json");
+    if (verified && cache != entries.end()) {
+        const json header = json::parse(cache->second);
+        authenticated = header.value("recovery_sources_sha256", std::string()) ==
+                        util::sha256_hex(manifest->second);
+        if (!authenticated)
+            throw OpError("io_error", "recovery assembly source manifest does not match its cache");
+    }
+    const json payload = json::parse(manifest->second);
+    if (payload.value("schema", std::string()) != "chudware-assembly-recovery/1" ||
+        !payload.contains("sources") || !payload["sources"].is_array())
+        throw OpError("io_error", "invalid recovery assembly source manifest");
+    auto sources = std::make_shared<AssemblyLiveSources>();
+    for (const auto& row : payload["sources"]) {
+        const std::string path = row.at("path").get<std::string>();
+        if (path.empty() || !std::filesystem::u8path(path).is_absolute())
+            throw OpError("io_error", "invalid recovery assembly source path");
+        if (native_policy::rooted()) native_policy::authored_reference(path);
+        auto source = std::make_shared<AssemblyLiveSource>();
+        source->document = std::make_shared<const json>(row.at("document"));
+        source->doc_hash = row.at("doc_hash").get<std::string>();
+        if (source->doc_hash != stepplus_doc_hash(*source->document))
+            throw OpError("io_error", "recovery assembly source document hash mismatch");
+        source->source_doc_id = row.value("doc_id", std::string());
+        source->revision = row.value("revision", -1L);
+        source->base_file_stamp = row.value("base_file_stamp", json(nullptr));
+        source->unsaved = true;
+        source->unverified = !authenticated || row.value("unverified", false);
+        if (authenticated && !source->unverified && row.contains("brep")) {
+            const auto member = entries.find(row.at("brep").get<std::string>());
+            if (member == entries.end() ||
+                util::sha256_hex(member->second) != row.at("brep_sha256").get<std::string>())
+                throw OpError("io_error", "recovery assembly source build state is missing or corrupt");
+            auto part = std::make_shared<CompileResult>();
+            part->ok = true;
+            part->shapes = brep_cache_decode(member->second);
+            part->owner_map = row.value("owner_map", json::object());
+            source->part = std::move(part);
+        }
+        (*sources)[canonical_source_path(path)] = std::move(source);
+    }
+    return sources;
+}
+
+// Capture a committed revision briefly; all geometry encoding and archive I/O
+// happens on the private session, without refreshing or rebuilding the live doc.
+static json save_recovery_snapshot(const std::string& doc_id, const std::string& path) {
+    DrawingSaveRevisions drawing_revisions;
+    auto drawing_entries = drawings_for_source(doc_id, drawing_revisions);
+    Session snapshot;
+    std::shared_ptr<const AssemblyLiveSources> sources;
+    std::string target;
+    {
+        DocLock lock;
+        Session& live = require_session(doc_id);
+        target = path.empty() ? live.path : path;
+        if (target.empty())
+            throw OpError("io_error", "doc_save: no path given and document has no current path",
+                          {{"reason", "missing path"}});
+        seed_cached_scratch(snapshot, live);
+        snapshot.metadata_revision = live.metadata_revision;
+        snapshot.asm_result = live.asm_result;
+        snapshot.asm_sources = live.asm_sources;
+        snapshot.asm_display = live.asm_display;
+        sources = live.asm_source_versions ? live.asm_source_versions
+                                           : assembly_sources_for_session(live);
+        const bool assembly = live.is_assembly();
+        const bool keep_assembly_cache = assembly && !live.asm_result;
+        std::set<std::string> required_meshes;
+        if (!assembly)
+            for (const auto& ref : mesh_ref_entries(live))
+                required_meshes.insert(std::string(kMeshRefPrefix) +
+                                       ref.at("sha256").get<std::string>() + ".bin");
+        for (const auto& [name, data] : live.extra_entries) {
+            if (name.rfind("drawings/", 0) == 0 ||
+                (!assembly && is_mesh_ref_member(name) && !required_meshes.count(name))) continue;
+            const bool build_cache = name == "cache.json" || name == "cache.aicm" ||
+                                     name == "cache.brep" || name == "cache.ckpt" ||
+                                     name == "cache.provenance" || name == "geometry.step";
+            if (!build_cache || keep_assembly_cache) snapshot.extra_entries.emplace(name, data);
+        }
+        // Even an attempted recovery snapshot may publish feature IDs to consumers.
+        live.history_private_origin = false;
+    }
+    AssemblySourceScope source_scope(std::move(sources));
+    // The handoff publisher is keyed by doc_id/revision. Never overwrite the live
+    // viewport's mesh while serializing a snapshot on another thread.
+    snapshot.doc_id = doc_id + "-snapshot-" +
+        std::to_string(g_ckpt_seq.fetch_add(1, std::memory_order_relaxed));
+    struct ReleaseSnapshot {
+        Session& session;
+        ~ReleaseSnapshot() {
+            chudware::aicm_handoff::release_older_than(session.doc_id, session.revision + 1);
+        }
+    } release_snapshot{snapshot};
+
+    const bool empty_geometry = !snapshot.is_assembly() &&
+        (!snapshot.doc.contains("features") ||
+         (snapshot.doc["features"].is_array() && snapshot.doc["features"].empty()));
+    const bool current_build = snapshot.compiled && snapshot.compiled_rev == snapshot.revision &&
+                               snapshot.compiled->ok && snapshot.cache_trust != "unverified";
+    if (!snapshot.is_assembly() && !empty_geometry && !current_build) {
+        if (snapshot.compiled && snapshot.compiled_rev == snapshot.revision && !snapshot.compiled->ok)
+            refuse_failed_part_save(*snapshot.compiled);
+        throw OpError("rebuild_failed",
+                      "doc_save: recovery snapshot requires a complete verified build; existing file preserved",
+                      {{"reason", "no_verified_build"}});
+    }
+    for (auto& [name, data] : drawing_entries)
+        snapshot.extra_entries[name] = std::move(data);
+    bake_import_features(snapshot.doc);
+    json saved_doc = snapshot.doc;
+    const std::string old_base = snapshot.is_assembly() ? component_source_base(snapshot) : std::string();
+    json recovery_source_revisions = json::array();
+    if (snapshot.is_assembly()) {
+        // Recovery files move between tiers; references must not depend on the
+        // transient snapshot directory.
+        if (native_policy::rooted())
+            rebase_component_paths(saved_doc, std::filesystem::u8path(old_base),
+                                   std::filesystem::absolute(std::filesystem::u8path(target)).parent_path());
+        else
+            absolutize_component_paths(saved_doc, std::filesystem::u8path(old_base));
+        const auto captured = AssemblySourceScope::current();
+        if (captured) {
+            for (const auto& row : capture_recovery_assembly_sources(snapshot, old_base, *captured))
+                recovery_source_revisions.push_back({{"path", row["path"]}, {"doc_id", row["doc_id"]},
+                    {"revision", row["revision"]}, {"doc_hash", row["doc_hash"]},
+                    {"solved", row.contains("brep")}});
+        }
+    } else {
+        for (const auto& ref : mesh_ref_entries(snapshot))
+            mesh_ref_payload(snapshot, ref);
+    }
+
+    json cache_diag = {{"written", false}, {"entries", json::array()}};
+    if (empty_geometry && !current_build) {
+        cache_diag["skipped_reason"] = "empty_geometry";
+    } else if (!snapshot.is_assembly() ||
+        (snapshot.asm_result && snapshot.cache_trust != "unverified" &&
+         asm_live_fingerprints_match(snapshot.doc, old_base, snapshot.asm_sources))) {
+        cache_diag = persist_build_state(snapshot, target, saved_doc, nullptr, false,
+                                         snapshot.is_assembly());
+    } else {
+        // A warm-opened assembly may only have a persisted display, not an
+        // AssemblyResult. Preserve it only when it still certifies this tree and
+        // both the captured live sources and disk sources; never solve for autosave.
+        bool reused = false;
+        auto header = snapshot.extra_entries.find("cache.json");
+        if (snapshot.cache_trust != "unverified" && header != snapshot.extra_entries.end() &&
+            snapshot.extra_entries.count("cache.aicm")) {
+            try {
+                json cached = json::parse(header->second);
+                if (cached.value("solved", false) &&
+                    cached.contains("response") && cached["response"].is_object() &&
+                    cached.value("engine", std::string()) == stepplus_cache_engine_key() &&
+                    cached.value("doc_hash", std::string()) == stepplus_doc_hash(snapshot.doc) &&
+                    asm_live_fingerprints_match(snapshot.doc, old_base, snapshot.asm_sources)) {
+                    cached["doc_hash"] = stepplus_doc_hash(saved_doc);
+                    cached["components"] = rebase_assembly_fingerprints(
+                        snapshot.asm_sources, old_base,
+                        native_policy::path_utf8(std::filesystem::absolute(
+                            std::filesystem::u8path(target)).parent_path()), true);
+                    const auto manifest = snapshot.extra_entries.find("recovery/assembly_sources.json");
+                    if (manifest != snapshot.extra_entries.end()) {
+                        cached["recovery_sources_sha256"] = util::sha256_hex(manifest->second);
+                        cached["recovery_base"] = native_policy::path_utf8(std::filesystem::absolute(
+                            std::filesystem::u8path(target)).parent_path());
+                    } else {
+                        cached.erase("recovery_sources_sha256");
+                        cached.erase("recovery_base");
+                    }
+                    cached["response"]["tree"] = saved_doc;
+                    header->second = cached.dump();
+                    reused = true;
+                }
+            } catch (...) {}
+        }
+        if (!reused) {
+            for (const char* name : kBuildStateCaches) snapshot.extra_entries.erase(name);
+            snapshot.extra_entries.erase("geometry.step");
+            cache_diag["skipped_reason"] = "no_current_solve";
+        }
+    }
+    if (!recovery_source_revisions.empty())
+        cache_diag["source_revisions"] = std::move(recovery_source_revisions);
+    if (!snapshot.is_assembly() &&
+        (cache_diag.value("skipped_reason", std::string()) == "feature_failed" ||
+         cache_diag.value("skipped_reason", std::string()) == "unverified" ||
+         cache_diag.value("skipped_reason", std::string()) == "error"))
+        throw OpError("rebuild_failed", "doc_save: build state could not be persisted; existing file preserved",
+                      {{"cache", cache_diag}});
+
+    std::vector<std::string> dropped;
+    std::string out = stepplus_save(saved_doc, target, snapshot.extra_entries, &dropped);
+    for (const auto& name : dropped) {
+        snapshot.extra_entries.erase(name);
+        if (!cache_diag.contains("dropped")) cache_diag["dropped"] = json::array();
+        cache_diag["dropped"].push_back({{"entry", name}, {"reason", "budget"}});
+        if (name == "cache.aicm" && !cache_diag.contains("skipped_reason"))
+            cache_diag["skipped_reason"] = "budget";
+        if (name == "cache.ckpt" && cache_diag.contains("checkpoints")) {
+            cache_diag["checkpoints"]["written"] = false;
+            cache_diag["checkpoints"]["reason"] = "budget";
+        }
+    }
+    for (const char* name : kBuildStateCaches) {
+        if (!snapshot.extra_entries.count(name)) continue;
+        cache_diag["entries"].push_back(name);
+        if (std::string(name) == "cache.json") cache_diag["written"] = true;
+    }
+    json result = {{"path", out}, {"cache", std::move(cache_diag)}, {"preserve_path", true},
+                   {"revision", snapshot.revision}, {"saved_revision", snapshot.revision},
+                   {"metadata_revision", snapshot.metadata_revision}};
+    const json rollback = rollback_suffix(snapshot.doc);
+    if (!rollback.is_null()) {
+        result["rollback"] = rollback;
+        result["warning"] = rollback_save_warning(rollback);
+    }
+    return result;
+}
+
+
+json doc_save(const std::string& doc_id, const std::string& path, bool preserve_path, bool force,
+              bool overwrite_changed, const json& expected_disk_stamp) {
+    std::lock_guard<std::mutex> paths(g_open_path_mtx);
+    std::string target = path;
+    if (target.empty()) {
+        DocLock lock;
+        target = require_session(doc_id).path;
+    }
+    if (!force && !target.empty()) {
+        const std::string other = find_open_by_path_except(target, doc_id);
+        if (!other.empty())
+            return {{"ok", false}, {"code", "path_bound_to_other_doc"}, {"other_doc_id", other}};
+    }
+    if (preserve_path) return save_recovery_snapshot(doc_id, target);
     // W12+: embed every open drawing whose live source is this doc as a drawings/<id>.json
     // entry. Gather them BEFORE taking the session lock — drawings_for_source takes the
     // (separate) drawing lock, and a drawing projection takes drawing->session, so doing it
@@ -16665,29 +23189,40 @@ json doc_save(const std::string& doc_id, const std::string& path, bool preserve_
 
     DocLock lk;
     Session& live = require_session(doc_id);
-    std::unique_ptr<Session> snapshot;
-    if (preserve_path) {
-        // Snapshot tessellation republishes this doc/revision without its live
-        // exploded view. The live display must be regenerated on next activation.
-        live.asm_display.source.reset();
-        snapshot = std::make_unique<Session>();
-        seed_cached_scratch(*snapshot, live);
-        // Do not copy large caches only to erase them below. All other embedded
-        // studies/attachments survive; the drawing set is refreshed separately.
-        for (const auto& [name, data] : live.extra_entries)
-            if (name != "cache.json" && name != "cache.aicm" &&
-                name != "cache.brep" && name != "cache.ckpt" && name != "geometry.step" &&
-                name.rfind("drawings/", 0) != 0)
-                snapshot->extra_entries.emplace(name, data);
-        const auto base = std::filesystem::u8path(component_source_base(live));
-        if (!native_policy::rooted()) absolutize_component_paths(snapshot->doc, base);
-    }
-    Session& s = snapshot ? *snapshot : live;
-    const std::string target = !path.empty() ? path : s.path;
+    Session& s = live;
+    target = !path.empty() ? path : s.path;
     if (target.empty())
         throw OpError("io_error",
                       "doc_save: no path given and document has no current path",
                       {{"reason", "missing path"}});
+    std::error_code identity_error;
+    const bool same_path = !s.path.empty() &&
+        (canonical_source_path(s.path) == canonical_source_path(target) ||
+         std::filesystem::equivalent(std::filesystem::u8path(s.path),
+                                     std::filesystem::u8path(target), identity_error));
+    NativeFileStamp expected_stamp;
+    auto visible_stamp = [](const NativeFileStamp& stamp) -> json {
+        return stamp.valid ? json{{"size", stamp.size}, {"mtime_ns", stamp.mtime_ns}, {"ino", stamp.ino}}
+                           : json(nullptr);
+    };
+    if (same_path) {
+        expected_stamp = stepplus_file_stamp(target);
+        std::error_code exists_error;
+        const bool missing = !std::filesystem::exists(std::filesystem::u8path(target), exists_error) &&
+                             !exists_error;
+        const bool unchanged = missing || (s.file_stamp.valid && expected_stamp == s.file_stamp);
+        const json observed = visible_stamp(expected_stamp);
+        if (!unchanged && (!overwrite_changed || observed != expected_disk_stamp ||
+                           (!expected_stamp.valid && !missing)))
+            return {{"ok", false}, {"code", "disk_changed"}, {"doc_id", doc_id},
+                    {"path", target}, {"observed_stamp", observed}};
+    }
+    std::optional<AssemblySourceScope> source_scope;
+    if (s.is_assembly()) {
+        source_scope.emplace(assembly_sources_for_session(s));
+        ensure_assembly_current(s);
+    }
+    if (!s.is_assembly()) require_savable_part(s);
     // Re-write the live drawing set: drop any stale drawings/*.json carried over from a
     // previous open, then add the current ones (mirrors stepplus.py::save).
     for (auto it = s.extra_entries.begin(); it != s.extra_entries.end();) {
@@ -16695,22 +23230,69 @@ json doc_save(const std::string& doc_id, const std::string& path, bool preserve_
         else ++it;
     }
     for (auto& [name, data] : drawing_entries) s.extra_entries[name] = data;
+    const std::string old_source_base = s.is_assembly() ? component_source_base(s) : std::string();
 
     // Make every imported body self-contained before writing (Bug N-8).
     bake_import_features(s.doc);
     json saved_doc;
     if (s.is_assembly()) {
+        ensure_assembly_current(s);
         saved_doc = s.doc;
         const auto old_base = std::filesystem::u8path(component_source_base(s));
         rebase_component_paths(saved_doc, old_base,
                                std::filesystem::absolute(std::filesystem::u8path(target)).parent_path());
+        if (s.recovery_sources && s.asm_source_versions)
+            capture_recovery_assembly_sources(s, old_source_base, *s.asm_source_versions);
     }
 
-    json cache_diag = persist_build_state(s, target, saved_doc, nullptr);
+    // Undo and redo can still reference removed payloads. Exclude those members
+    // from this save and the cache budget without destroying the in-session
+    // history; restore them even when saving throws.
+    struct RetainedMeshHistory {
+        Session& session;
+        std::map<std::string, std::string> entries;
+        ~RetainedMeshHistory() { session.extra_entries.merge(entries); }
+    } retained_mesh_history{s, {}};
+    if (!s.is_assembly()) {
+        std::set<std::string> required;
+        for (const auto& ref : mesh_ref_entries(s)) {
+            // Refuse to write a non-self-contained or corrupt reference.
+            mesh_ref_payload(s, ref);
+            required.insert(std::string(kMeshRefPrefix) + ref.at("sha256").get<std::string>() + ".bin");
+        }
+        for (auto it = s.extra_entries.begin(); it != s.extra_entries.end();) {
+            if (is_mesh_ref_member(it->first) && !required.count(it->first)) {
+                auto obsolete = it++;
+                retained_mesh_history.entries.insert(s.extra_entries.extract(obsolete));
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    json cache_diag = persist_build_state(s, target, saved_doc, nullptr, true,
+                                          s.is_assembly() && bool(s.recovery_sources));
+    if (!s.is_assembly() &&
+        (cache_diag.value("skipped_reason", std::string()) == "feature_failed" ||
+         cache_diag.value("skipped_reason", std::string()) == "unverified" ||
+         cache_diag.value("skipped_reason", std::string()) == "error"))
+        throw OpError("rebuild_failed", "doc_save: build state could not be persisted; existing file preserved",
+                      {{"cache", cache_diag}});
 
     std::vector<std::string> dropped;
-    std::string out = stepplus_save(s.is_assembly() ? saved_doc : s.doc, target, s.extra_entries,
-                                    &dropped);
+    NativeFileStamp published_stamp;
+    std::string out;
+    try {
+        out = stepplus_save(s.is_assembly() ? saved_doc : s.doc, target, s.extra_entries,
+                            &dropped, &published_stamp, same_path ? &expected_stamp : nullptr);
+    } catch (const OpError& error) {
+        if (error.code != "disk_changed") throw;
+        return {{"ok", false}, {"code", "disk_changed"}, {"doc_id", doc_id}, {"path", target},
+                {"observed_stamp", visible_stamp(stepplus_file_stamp(target))}};
+    }
+    // Even preserve_path writes a usable .step+ snapshot whose feature IDs may
+    // acquire consumers. It is no longer a provably private, never-saved source.
+    live.history_private_origin = false;
     for (const std::string& name : dropped) {
         s.extra_entries.erase(name);
         if (!cache_diag.contains("dropped")) cache_diag["dropped"] = json::array();
@@ -16722,6 +23304,18 @@ json doc_save(const std::string& doc_id, const std::string& path, bool preserve_
             cache_diag["checkpoints"]["reason"] = "budget";
         }
     }
+    if (s.is_assembly() && s.recovery_sources) {
+        if (!s.extra_entries.count("recovery/assembly_sources.json")) {
+            s.recovery_sources.reset();
+            s.recovery_sources_verified = false;
+        } else if (s.extra_entries.count("cache.json")) {
+            // The just-published header signs the recaptured recovery manifest.
+            s.recovery_sources = restore_recovery_assembly_sources(s.extra_entries, true);
+            s.recovery_sources_verified = true;
+        } else {
+            s.recovery_sources_verified = false;
+        }
+    }
     // The caches are regenerated by every save and read only by doc_open, so the session
     // does not keep a second copy of them alive after they are on disk.
     for (const char* name : kBuildStateCaches) {
@@ -16731,18 +23325,30 @@ json doc_save(const std::string& doc_id, const std::string& path, bool preserve_
     }
     if (s.is_assembly()) s.doc = std::move(saved_doc);
     s.path = out;
+    s.file_stamp = published_stamp;
+    s.source_doc_hash = stepplus_doc_hash(s.doc);
+    s.unverified_source_doc.reset();
+    s.unverified_materialized_hash.clear();
     s.dirty = false;
-    if (snapshot && snapshot->ckpt_memo && live.compile_cache &&
-        snapshot->ckpt_memo_stamp == compile_cache_stamp(*live.compile_cache)) {
-        // The snapshot encoded the live session's (shared, unchanged) checkpoints.
-        live.ckpt_memo = snapshot->ckpt_memo;
-        live.ckpt_memo_report = snapshot->ckpt_memo_report;
-        live.ckpt_memo_stamp = snapshot->ckpt_memo_stamp;
-        live.ckpt_memo_doc_hash = snapshot->ckpt_memo_doc_hash;
+    if (s.is_assembly()) {
+        const std::string new_base = component_source_base(s);
+        if (old_source_base != new_base) {
+            s.asm_sources = rebase_assembly_fingerprints(
+                s.asm_sources, old_source_base, new_base, false);
+            update_assembly_dependencies(s, s.asm_sources, new_base);
+        }
     }
-    json result = {{"path", out}, {"cache", std::move(cache_diag)}};
-    if (preserve_path) result["preserve_path"] = true;
-    saved_drawings.saved = !preserve_path;
+    json result = {{"path", out}, {"cache", std::move(cache_diag)},
+                   {"saved_revision", s.revision}, {"metadata_revision", s.metadata_revision}};
+    const json rollback = rollback_suffix(s.doc);
+    if (!rollback.is_null()) {
+        result["rollback"] = rollback;
+        result["warning"] = rollback_save_warning(rollback);
+    }
+    result["drawing_saved_revisions"] = json::object();
+    for (const auto& [id, revisions] : drawing_revisions)
+        result["drawing_saved_revisions"][id] = revisions.first;
+    saved_drawings.saved = true;
     return result;
 }
 
@@ -16789,8 +23395,17 @@ static std::shared_ptr<CompileResult> hydrate_from_display_cache(const Session& 
     auto r = std::make_shared<CompileResult>();
     r->shapes = brep_cache_decode(brep);
     std::vector<std::string> names;
-    if (!aicm_body_names(aicm, names) || names.size() != r->shapes.size())
-        throw OpError("io_error", "cache.aicm: body names do not match cache.brep");
+    if (!aicm.empty()) {
+        if (!aicm_body_names(aicm, names) || names.size() != r->shapes.size())
+            throw OpError("io_error", "cache.aicm: body names do not match cache.brep");
+    } else {
+        if (!retessellate || !response.contains("cache_body_names") ||
+            !response["cache_body_names"].is_array())
+            throw OpError("io_error", "cache.json: missing body names for mesh rebuild");
+        names = response["cache_body_names"].get<std::vector<std::string>>();
+        if (names.size() != r->shapes.size())
+            throw OpError("io_error", "cache.json: body names do not match cache.brep");
+    }
     const json& bodies = response.at("tess").at("bodies");
     if (!bodies.is_array() || bodies.size() != r->shapes.size())
         throw OpError("io_error", "cache.json: body list does not match cache.brep");
@@ -16813,17 +23428,19 @@ static std::shared_ptr<CompileResult> hydrate_from_display_cache(const Session& 
         st.ok = f.at("ok").get<bool>();
         st.error = f.value("error", json()).is_string() ? f["error"].get<std::string>() : "";
         st.warning = f.value("warning", json()).is_string() ? f["warning"].get<std::string>() : "";
-        st.ms = f.value("ms", 0.0);
+        st.ms = 0.0;
         st.data = f.value("data", json());
-        st.reused = true;
+        st.rolled_back = f.value("rolled_back", false);
+        st.reused = !st.rolled_back;
+        if (st.reused) ++r->features_reused;
         r->ok = r->ok && st.ok;
         r->statuses.push_back(std::move(st));
     }
+    if (!r->ok) throw OpError("io_error", "cache.json: solved display contains failed features");
     r->owner_map = response.value("owner_map", json::object());
     r->datums = response.value("datums", json::array());
     r->active_configuration = rebuild.value("doc_status", json::object())
                                   .value("active_configuration", std::string("Default"));
-    r->features_reused = static_cast<int>(r->statuses.size());
     r->features_executed = 0;
     tessellate_solved_bodies(s.doc, *r, s.display_quality, retessellate);
     if (!retessellate) {
@@ -16832,6 +23449,89 @@ static std::shared_ptr<CompileResult> hydrate_from_display_cache(const Session& 
     }
     return r;
 }
+// A cache-only writeback keeps the original document.json. Reconstruct just the
+// compiler-authorized fillet state before matching checkpoints, without importing
+// other fields from the cached response tree.
+static bool restore_cached_fillet_state(Session& s, const json& response,
+                                        std::optional<json>& original) {
+    try {
+        const auto& rows = response.at("rebuild").at("feature_status");
+        if (!rows.is_array()) return false;
+        CompileResult cached;
+        cached.ok = true;
+        for (const auto& row : rows) {
+            FeatureStatus st;
+            st.id = row.at("id").get<std::string>();
+            st.ok = row.at("ok").get<bool>();
+            st.rolled_back = row.value("rolled_back", false);
+            st.data = row.value("data", json());
+            cached.statuses.push_back(std::move(st));
+        }
+        if (!has_fillet_result_work(s.doc, cached)) return true;
+        json corrected = s.doc;
+        bool literals = false;
+        std::string error;
+        if (!apply_fillet_results(corrected, cached.statuses, literals, error)) return false;
+        if (corrected != s.doc) {
+            original = s.doc;
+            if (s.cache_trust == "unverified") {
+                s.unverified_source_doc = s.doc;
+                s.unverified_source_was_dirty = s.dirty;
+            }
+            s.doc = std::move(corrected);
+            if (s.unverified_source_doc)
+                s.unverified_materialized_hash = stepplus_doc_hash(s.doc);
+            if (literals) s.dirty = true;
+        }
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+static bool solved_part_response(const json& response) {
+    try {
+        const auto& rebuild = response.at("rebuild");
+        if (!rebuild.is_object() || !rebuild.value("ok", true)) return false;
+        const auto& statuses = rebuild.at("feature_status");
+        if (!statuses.is_array()) return false;
+        for (const auto& status : statuses)
+            if (!status.is_object() || !status.at("ok").get<bool>()) return false;
+        return response.value("geometry_state", std::string("current")) == "current";
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+// A saved mesh can remain useful as a labelled stale display even when its
+// exact B-rep was omitted. This object is never used by geometry consumers.
+static std::shared_ptr<CompileResult> saved_display_only(const json& response,
+                                                         const std::string& aicm) {
+    if (!solved_part_response(response))
+        throw OpError("io_error", "cache.json: not a complete solved display");
+    std::vector<std::string> names;
+    const auto& bodies = response.at("tess").at("bodies");
+    if (!aicm_body_names(aicm, names) || names.empty() ||
+        !bodies.is_array() || names.size() != bodies.size())
+        throw OpError("io_error", "cache.aicm: body names do not match saved display");
+    auto display = std::make_shared<CompileResult>();
+    display->ok = true;
+    display->body_count = static_cast<int>(names.size());
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        BodyInfo body;
+        body.name = names[i];
+        body.kind = bodies[i].value("kind", std::string("solid"));
+        display->bodies_info.push_back(std::move(body));
+    }
+    display->aicm.assign(aicm.begin(), aicm.end());
+    display->owner_map = response.value("owner_map", json::object());
+    display->datums = response.value("datums", json::array());
+    display->volume = response.value("volume", 0.0);
+    display->active_configuration = response.at("rebuild").value("doc_status", json::object())
+                                        .value("active_configuration", std::string("Default"));
+    return display;
+}
+
 
 // A part reopened against its persisted caches (contracts/stepplus.md §4).
 struct PartCacheOpen {
@@ -16865,7 +23565,12 @@ static PartCacheOpen open_part_from_caches(Session& s,
     const std::string* cb = entry("cache.brep");
     const std::string* ck = entry("cache.ckpt");
     const std::string engine = stepplus_cache_engine_key();
-    const std::string doc_hash = stepplus_doc_hash(s.doc);
+    // Hash the loaded authored document before doc_open's session-only id
+    // and detached-copy name changes. Part geometry and authored feature inputs
+    // are unchanged; validate the cache against those original bytes, not the
+    // uniquified display name. Provenance/engine checks remain independent.
+    const std::string doc_hash = s.source_doc_hash.empty()
+        ? stepplus_doc_hash(s.doc) : s.source_doc_hash;
 
     // Display-cache verdict, in contract order (contracts/stepplus.md §4).
     json header;
@@ -16884,9 +23589,20 @@ static PartCacheOpen open_part_from_caches(Session& s,
         if (header.value("engine", std::string()) != engine) miss = "engine_key";
         else if (header.value("doc_hash", std::string()) != doc_hash) miss = "doc_hash";
         else if (!header.value("solved", false)) miss = "unsolved";
-        else if (!header.contains("response") || !header["response"].is_object())
+        else if (!header.contains("response") || !header["response"].is_object() ||
+                 !solved_part_response(header["response"]))
             miss = "decode_error";
     }
+    if (miss.empty() && has_scad_feature(s.doc)) {
+        const std::string current = scad::cache_identity();
+        const std::string saved = header.value("scad_runtime", std::string());
+        if (!current.empty() && current != saved) miss = "scad_runtime";
+        else s.scad_cache_identity = saved;
+    }
+    std::optional<json> original_before_correction;
+    const bool dirty_before_correction = s.dirty;
+    if (miss.empty() && !restore_cached_fillet_state(s, header["response"], original_before_correction))
+        miss = "decode_error";
     // From here the saved bodies/statuses/owner map describe THIS document; the mesh
     // additionally needs the same display tier and must be present.
     const bool geometry_ok = miss.empty();
@@ -16926,6 +23642,9 @@ static PartCacheOpen open_part_from_caches(Session& s,
     if (miss.empty()) {
         out.hit = true;
         out.resp = header["response"];
+        if (s.cache_trust == "unverified" && header["response"].contains("tess") &&
+            header["response"]["tess"].contains("bodies"))
+            s.last_good_body_metadata = header["response"]["tess"]["bodies"];
         // Re-materialize cached mesh via aicm-shm (same handoff as live rebuilds).
         std::string ap = publish_doc_aicm(s.doc_id, s.revision,
             reinterpret_cast<const uint8_t*>(ca->data()), ca->size());
@@ -16933,17 +23652,43 @@ static PartCacheOpen open_part_from_caches(Session& s,
             if (!out.resp.contains("tess") || !out.resp["tess"].is_object())
                 out.resp["tess"] = json::object();
             out.resp["tess"]["aicm_path"] = ap;
+        } else {
+            out.resp["tess"].erase("aicm_path");
+            out.resp["tess"]["mesh_error"] = "aicm_publication_failed";
+            out.resp["mesh_error"] = "aicm_publication_failed";
         }
         out.resp["revision"] = s.revision;  // override the cached (save-time) revision
         out.resp["tree"] = s.doc;
+        out.resp["geometry_state"] = "current";
+        out.resp["rebuild"]["ok"] = true;
+        // Save-time work is not work performed by this warm open.
+        json& rebuild = out.resp["rebuild"];
+        json& statuses = rebuild["feature_status"];
+        if (statuses.is_array()) {
+            for (json& status : statuses) {
+                status["reused"] = true;
+                status["ms"] = 0.0;
+            }
+            rebuild["doc_status"]["features_reused"] = statuses.size();
+        }
+        rebuild["doc_status"]["features_executed"] = 0;
+        json& phases = rebuild["doc_status"]["phase_ms"];
+        if (phases.is_object())
+            for (json& phase : phases)
+                if (phase.is_number()) phase = 0.0;
         // Warm the session: the first activate/pick/measure/save serves this result.
         std::shared_ptr<const CompileResult> full =
             restored ? compile_cache_full_result(*restored) : nullptr;
-        if (full) {
+        if (full && full->ok) {
             auto c = std::make_shared<CompileResult>(*full);
-            for (FeatureStatus& st : c->statuses) st.reused = true;
+            for (FeatureStatus& st : c->statuses) {
+                st.reused = true;
+                st.ms = 0.0;
+            }
             c->features_reused = static_cast<int>(c->statuses.size());
             c->features_executed = 0;
+            c->loop_ms = c->tess_ms = c->tess_mesh_ms = c->tess_extract_ms =
+                c->tess_write_ms = c->owner_ms = 0.0;
             s.compiled = std::move(c);
             s.compiled_rev = s.revision;
             s.compiled_partial = false;
@@ -16963,15 +23708,23 @@ static PartCacheOpen open_part_from_caches(Session& s,
         } else {
             out.diag["hydrate_error"] = "cache.brep " + missing("cache.brep");
         }
+        if (!s.compiled) {
+            try {
+                s.last_good_display = saved_display_only(header["response"], *ca);
+            } catch (const std::exception& e) {
+                out.diag["last_good_error"] = e.what();
+            }
+        }
         out.diag["features_executed"] = 0;
     } else {
         out.miss_reason = miss;
         bool done = false;
         // A tier mismatch on a file without usable checkpoints: the saved bodies are still
         // this document's exact geometry, so only the display mesh is rebuilt.
-        if (!restored && geometry_ok && cb && ca) {
+        if (geometry_ok && cb && (ca || header["response"].contains("cache_body_names"))) {
             try {
-                auto c = hydrate_from_display_cache(s, header["response"], *cb, *ca,
+                auto c = hydrate_from_display_cache(s, header["response"], *cb,
+                                                    ca ? *ca : std::string(),
                                                     /*retessellate=*/true);
                 out.resp = ops_response(s, *c, json::object(), /*with_tess=*/true);
                 s.compiled = std::move(c);
@@ -16988,8 +23741,43 @@ static PartCacheOpen open_part_from_caches(Session& s,
         if (!done) {
             CompileResult r = compile_session(s, /*restoring_cache=*/true);
             const int executed = r.features_executed;
-            out.resp = warm_and_respond(s, std::move(r), json::object(), /*with_tess=*/true);
-            out.warm = executed == 0;
+            if (!r.ok) {
+                if (original_before_correction) {
+                    s.doc = std::move(*original_before_correction);
+                    s.dirty = dirty_before_correction;
+                    s.unverified_source_doc.reset();
+                    s.unverified_materialized_hash.clear();
+                }
+                // A complete prior snapshot may be shown only as explicitly stale;
+                // it is never supplied to geometry operations on the failed tree.
+                if (header.is_object() && header.contains("solved") &&
+                    header["solved"].is_boolean() && header["solved"].get<bool>() &&
+                    header.contains("response") && solved_part_response(header["response"]) && ca) {
+                    try {
+                        if (cb) {
+                            try {
+                                s.last_good_display = hydrate_from_display_cache(
+                                    s, header["response"], *cb, *ca, /*retessellate=*/false);
+                                out.diag["last_good_from"] = "cache.brep";
+                            } catch (const std::exception&) {
+                                s.last_good_display = saved_display_only(header["response"], *ca);
+                                out.diag["last_good_from"] = "cache.aicm";
+                            }
+                        } else {
+                            s.last_good_display = saved_display_only(header["response"], *ca);
+                            out.diag["last_good_from"] = "cache.aicm";
+                        }
+                        if (s.last_good_display)
+                            s.last_good_body_metadata = header["response"]["tess"]["bodies"];
+                    } catch (const std::exception& e) {
+                        out.diag["last_good_error"] = e.what();
+                    }
+                }
+            }
+            const bool succeeded = r.ok;
+            out.resp = warm_and_respond(s, std::move(r), json::object(),
+                                        /*with_tess=*/true, /*restoring_cache=*/true);
+            out.warm = succeeded && executed == 0;
             out.diag["features_executed"] = executed;
         }
     }
@@ -17019,26 +23807,46 @@ static PartCacheOpen open_part_from_caches(Session& s,
 // Save the build an open just produced into the container it came from — only the derived
 // build-state members change (stepplus_write_build_state); the document, its metadata and
 // every other member stay byte-identical, so nothing reads the file as edited.
-//   * A part writes back when the open executed features that succeeded, or when its
-//     checkpoints carried a build the stale display cache no longer described (no failures,
-//     miss not the display tier or the archive budget, which a rewrite would only repeat) —
-//     then only if a valid cache.json comes out of it. A display-tier re-mesh or a retry of
-//     the same failing features has nothing new to keep.
-//   * An assembly writes back whenever its saved display missed.
+// A partial solve never replaces any persisted member, even if some features
+// executed successfully. Complete builds retain the normal warm-open writeback.
 // Returns the report doc_open puts in `cache.writeback`.
 static json write_back_build_state(Session& s, const std::string& path,
-                                   const NativeFileStamp& stamp, const std::string& asm_hash,
+                                   const NativeFileStamp& stamp, const std::string& source_hash,
                                    const std::string& miss_reason, int features_executed) {
     json report = {{"written", false}};
+    const bool recovery = s.is_assembly() && s.recovery_sources && !s.recovery_sources->empty();
+    std::optional<AssemblySourceScope> source_scope;
+    if (s.is_assembly()) source_scope.emplace(assembly_sources_for_session(s));
+    if (recovery) {
+        if (!s.recovery_sources_verified || !s.extra_entries.count("recovery/assembly_sources.json")) {
+            report["reason"] = "unverified_recovery_sources";
+            return report;
+        }
+        const auto active = AssemblySourceScope::current();
+        const auto base = std::filesystem::u8path(component_source_base(s));
+        if (s.asm_sources.is_array()) for (const auto& row : s.asm_sources) {
+            auto component = std::filesystem::u8path(row.value("path", std::string()));
+            if (component.empty()) continue;
+            if (component.is_relative()) component = base / component;
+            const auto key = canonical_source_path(component.string());
+            const auto live = active->find(key);
+            if (live == active->end() || !live->second->unsaved) continue;
+            const auto saved = s.recovery_sources->find(key);
+            if (saved == s.recovery_sources->end() ||
+                saved->second->doc_hash != live->second->doc_hash) {
+                report["reason"] = "recovery_sources_changed";
+                return report;
+            }
+        }
+    }
     bool display_only = false;
     if (!s.is_assembly()) {
-        int failed = 0;
-        if (s.compiled && s.compiled_rev == s.revision)
-            for (const FeatureStatus& st : s.compiled->statuses)
-                if (!st.ok) ++failed;
-        const bool rebuilt = features_executed > failed;
-        display_only = !rebuilt && failed == 0 && miss_reason != "display_quality" &&
-                       miss_reason != "budget";
+        if (!s.compiled || s.compiled_rev != s.revision || !s.compiled->ok) {
+            report["reason"] = "feature_failed";
+            return report;
+        }
+        const bool rebuilt = features_executed > 0;
+        display_only = !rebuilt && miss_reason != "display_quality" && miss_reason != "budget";
         if (!rebuilt && !display_only) {
             report["reason"] = "no_rebuild";
             return report;
@@ -17051,8 +23859,8 @@ static json write_back_build_state(Session& s, const std::string& path,
                 components.push_back({{"id", cs.id}, {"build_state", cs.build_state}});
         if (!components.empty()) report["components"] = std::move(components);
     }
-    const std::string doc_hash = s.is_assembly() ? asm_hash : stepplus_doc_hash(s.doc);
-    json built = persist_build_state(s, path, s.doc, s.is_assembly() ? &asm_hash : nullptr);
+    const std::string doc_hash = source_hash.empty() ? stepplus_doc_hash(s.doc) : source_hash;
+    json built = persist_build_state(s, path, s.doc, &doc_hash, true, recovery);
     std::map<std::string, std::string> entries;
     auto take = [&](const char* name) {
         auto it = s.extra_entries.find(name);
@@ -17064,11 +23872,12 @@ static json write_back_build_state(Session& s, const std::string& path,
     take("geometry.step");
     if (built.contains("skipped_reason")) report["cache_skipped_reason"] = built["skipped_reason"];
     if (built.contains("checkpoints")) report["checkpoints"] = built["checkpoints"];
-    if (!entries.count("cache.json") && (display_only || !entries.count("cache.ckpt"))) {
+    if (!entries.count("cache.json")) {
         report["reason"] = built.value("skipped_reason", std::string("empty_mesh"));
         return report;
     }
     const BuildStateWriteback wb = stepplus_write_build_state(path, stamp, doc_hash, entries);
+    if (wb.written) s.file_stamp = wb.stamp;
     report["written"] = wb.written;
     if (!wb.written) report["reason"] = wb.reason;
     report["entries"] = wb.entries;
@@ -17079,24 +23888,95 @@ static json write_back_build_state(Session& s, const std::string& path,
 CompileResult compile_component_with_build_state(const std::string& path, const json& doc,
                                                  const NativeFileStamp& stamp,
                                                  json& build_state) {
-    // A private session no client can see: the same compile + persisted state a part
-    // session opened from this file would produce.
-    Session part;
-    part.doc_id = "component-build";
-    part.doc = doc;
-    part.path = path;
-    ensure_compiled(part);
-    {
-        // Prefetch workers compile components in parallel; the STEP snapshot writer and the
-        // file rewrite run one component at a time.
-        static std::mutex persist_mtx;
-        std::lock_guard<std::mutex> lock(persist_mtx);
-        build_state = write_back_build_state(part, path, stamp, std::string(), std::string(),
-                                             part.compiled->features_executed);
-        // The cached response published its mesh for a client that never maps it.
-        chudware::aicm_handoff::release_older_than(part.doc_id, part.revision + 1);
+    // Only a missing/stale component cache reaches this path. Keep its complete
+    // build alive for writeback, but return the lightweight assembly inputs now.
+    auto part = std::make_shared<Session>();
+    part->doc_id = "component-build-" +
+        std::to_string(g_ckpt_seq.fetch_add(1, std::memory_order_relaxed));
+    part->doc = doc;
+    part->path = path;
+    part->source_doc_hash = stepplus_doc_hash(doc);
+    ensure_compiled(*part);
+    CompileResult result;
+    result.ok = part->compiled->ok;
+    result.statuses = part->compiled->statuses;
+    result.shapes = part->compiled->shapes;
+    result.owner_map = part->compiled->owner_map;
+    if (!result.ok) {
+        build_state = {{"written", false}, {"reason", "feature_failed"}};
+        return result;
     }
-    return std::move(*part.compiled);
+
+    // The caller may own an assembly's document lock (and may itself be a
+    // prefetch worker). Serialize and publish in the background, once per file
+    // stamp. The writeback still checks stamp and authored hash before rename.
+    struct Tasks {
+        std::mutex mutex;
+        std::set<std::string> pending;
+        std::vector<std::shared_future<void>> futures;
+        ~Tasks() {
+            for (auto& future : futures) if (future.valid()) future.wait();
+        }
+    };
+    static std::mutex persist_mtx;
+    static Tasks tasks;  // joins futures before persist_mtx is destroyed
+    const std::string key = path + "\n" + std::to_string(stamp.size) + ":" +
+                            std::to_string(stamp.mtime_ns);
+    std::lock_guard<std::mutex> tasks_lock(tasks.mutex);
+    for (auto it = tasks.futures.begin(); it != tasks.futures.end();) {
+        if (it->wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+            it = tasks.futures.erase(it);
+        else ++it;
+    }
+    if (tasks.pending.count(key)) {
+        build_state = {{"written", false}, {"reason", "already_scheduled"}};
+        return result;
+    }
+    if (tasks.futures.size() == tasks.futures.capacity())
+        tasks.futures.reserve(std::max<std::size_t>(1, tasks.futures.capacity() * 2));
+    tasks.pending.insert(key);
+    g_cache_verification_active.fetch_add(1, std::memory_order_acq_rel);
+    try {
+        tasks.futures.push_back(tracked_background_task([part, path, stamp, key]() {
+            struct Finish {
+                Tasks& tasks;
+                const std::string& key;
+                Session& part;
+                ~Finish() {
+                    chudware::aicm_handoff::release_older_than(part.doc_id, part.revision + 1);
+                    { std::lock_guard<std::mutex> lock(tasks.mutex); tasks.pending.erase(key); }
+                    g_cache_verification_active.fetch_sub(1, std::memory_order_acq_rel);
+                }
+            } finish{tasks, key, *part};
+            try {
+                std::lock_guard<std::mutex> lock(persist_mtx);
+                const json report = write_back_build_state(
+                    *part, path, stamp, part->source_doc_hash, std::string(),
+                    part->compiled->features_executed);
+                if (!report.value("written", false) &&
+                    report.value("reason", std::string()) != "file_changed")
+                    std::fprintf(stderr, "component build-state writeback failed for %s: %s\n",
+                                 path.c_str(), report.dump().c_str());
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "component build-state writeback failed for %s: %s\n",
+                             path.c_str(), e.what());
+            } catch (...) {
+                std::fprintf(stderr, "component build-state writeback failed for %s\n", path.c_str());
+            }
+        }));
+    } catch (const std::exception& e) {
+        tasks.pending.erase(key);
+        g_cache_verification_active.fetch_sub(1, std::memory_order_acq_rel);
+        build_state = {{"written", false}, {"reason", "scheduling_failed"}, {"error", e.what()}};
+        return result;
+    } catch (...) {
+        tasks.pending.erase(key);
+        g_cache_verification_active.fetch_sub(1, std::memory_order_acq_rel);
+        build_state = {{"written", false}, {"reason", "scheduling_failed"}};
+        return result;
+    }
+    build_state = {{"written", false}, {"reason", "scheduled"}};
+    return result;
 }
 
 void set_cache_refresh_sink(std::function<void(const std::string&, const json&)> sink) {
@@ -17118,18 +23998,25 @@ bool activity_counts(std::uint64_t& cache_verification, std::uint64_t& dirty_doc
     return complete;
 }
 
+void drain_background_tasks() {
+    drain_tracked_background_tasks();
+}
+
 namespace {
 static void schedule_cache_verification(Session& live) {
     if (live.cache_verification_pending) return;
     auto scratch = std::make_shared<Session>();
     scratch->doc_id = live.doc_id + "-cache-verification";
-    scratch->doc = live.doc;
+    const std::string hash = stepplus_doc_hash(live.doc);
+    const bool verify_authored = live.unverified_source_doc &&
+                                 hash == live.unverified_materialized_hash;
+    scratch->doc = verify_authored ? *live.unverified_source_doc : live.doc;
+    scratch->source_doc_hash = verify_authored ? live.source_doc_hash : hash;
     scratch->revision = live.revision;
     scratch->path = live.path;
     scratch->project_dir = live.project_dir;
     scratch->display_quality = live.display_quality;
     const std::string id = live.doc_id;
-    const std::string hash = stepplus_doc_hash(live.doc);
     const NativeFileStamp stamp = stepplus_file_stamp(live.path);
     const long revision = live.revision;
     auto mesh_digest = [](const std::vector<uint8_t>& mesh) {
@@ -17138,7 +24025,8 @@ static void schedule_cache_verification(Session& live) {
         return digest.finish_hex();
     };
     std::string previous;
-    if (live.compiled) previous = mesh_digest(live.compiled->aicm);
+    if (live.compiled && live.compiled->ok) previous = mesh_digest(live.compiled->aicm);
+    else if (live.last_good_display) previous = mesh_digest(live.last_good_display->aicm);
     else if (auto it = live.extra_entries.find("cache.aicm"); it != live.extra_entries.end())
         previous = util::sha256_hex(it->second);
     else if (live.asm_result) {
@@ -17148,7 +24036,13 @@ static void schedule_cache_verification(Session& live) {
     }
     // Futures join at shutdown before the document registry is destroyed.
     // Only ready tasks are discarded; admission never waits for a solve.
-    struct Tasks { std::mutex mutex; std::vector<std::future<void>> futures; };
+    struct Tasks {
+        std::mutex mutex;
+        std::vector<std::shared_future<void>> futures;
+        ~Tasks() {
+            for (auto& future : futures) if (future.valid()) future.wait();
+        }
+    };
     static Tasks tasks;
     std::lock_guard<std::mutex> tasks_lock(tasks.mutex);
     for (auto it = tasks.futures.begin(); it != tasks.futures.end();) {
@@ -17162,9 +24056,10 @@ static void schedule_cache_verification(Session& live) {
         tasks.futures.reserve(std::max<std::size_t>(1, tasks.futures.capacity() * 2));
     live.cache_verification_pending = true;
     g_cache_verification_active.fetch_add(1, std::memory_order_acq_rel);
-    std::future<void> task;
-    try { task = std::async(std::launch::async,
-        [scratch, id, hash, stamp, revision, mesh_digest, previous = std::move(previous)]() {
+    std::shared_future<void> task;
+    try { task = tracked_background_task(
+        [scratch, id, hash, verify_authored, stamp, revision, mesh_digest,
+         previous = std::move(previous)]() {
         struct ActivityGuard {
             ~ActivityGuard() { g_cache_verification_active.fetch_sub(1, std::memory_order_acq_rel); }
         } activity;
@@ -17175,10 +24070,15 @@ static void schedule_cache_verification(Session& live) {
         } release_scratch{scratch->doc_id, revision};
         json response;
         try {
-            native_policy::CacheRecomputeScope scope;
-            if (scratch->is_assembly()) rebuild_assembly(*scratch);
-            else ensure_compiled(*scratch);
-            json built = persist_build_state(*scratch, scratch->path, scratch->doc, nullptr);
+            json built;
+            {
+                native_policy::CacheRecomputeScope scope;
+                if (scratch->is_assembly()) rebuild_assembly(*scratch);
+                else ensure_compiled(*scratch);
+                const std::string* disk_hash = scratch->source_doc_hash.empty()
+                    ? nullptr : &scratch->source_doc_hash;
+                built = persist_build_state(*scratch, scratch->path, scratch->doc, disk_hash);
+            }
             std::string current;
             if (scratch->compiled) current = mesh_digest(scratch->compiled->aicm);
             else if (auto it = scratch->extra_entries.find("cache.aicm");
@@ -17194,44 +24094,106 @@ static void schedule_cache_verification(Session& live) {
             auto geometry = scratch->extra_entries.find("geometry.step");
             if (geometry != scratch->extra_entries.end())
                 entries.emplace(geometry->first, std::move(geometry->second));
+            bool writeback = false;
             {
                 DocLock lock;
                 Session& s = require_session(id);
                 if (s.revision != revision || stepplus_doc_hash(s.doc) != hash ||
-                    s.path != scratch->path || s.display_quality != scratch->display_quality) {
+                    s.path != scratch->path || s.display_quality != scratch->display_quality ||
+                    s.cache_trust != "unverified") {
                     s.cache_verification_pending = false;
-                    if (s.cache_trust == "unverified") schedule_cache_verification(s);
+                    if (s.cache_trust == "unverified" &&
+                        (!s.is_assembly() || asm_fingerprints_match(
+                            s.doc, component_source_base(s), s.asm_sources)))
+                        schedule_cache_verification(s);
                     return;
                 }
-                s.compile_cache = scratch->compile_cache;
-                s.compiled = scratch->compiled;
-                s.compiled_rev = s.compiled ? s.revision : -1;
-                s.compiled_partial = false;
-                s.ckpt_memo.reset();
-                s.asm_result = scratch->asm_result;
-                s.asm_warm = std::move(scratch->asm_warm);
-                s.asm_display.source.reset();
-                s.face_info_shape.Nullify();
-                s.face_infos.clear();
-                s.integrity_memo.reset();
-                s.cached_assembly_response = json();
-                s.cache_verification_pending = false;
-                s.cache_trust = built.contains("skipped_reason") ? "unverified" : "verified";
-                s.cache_verification = {{"mismatch", mismatch}, {"completed", true}};
-                if (mismatch) s.cache_warnings.push_back(
-                    "cache_mismatch: unverified cached geometry replaced by feature-history rebuild");
-                if (!scratch->path.empty() && entries.count("cache.json")) {
-                    const auto wb = stepplus_write_build_state(s.path, stamp, hash, entries);
-                    s.cache_verification["writeback"] = {{"written", wb.written}, {"reason", wb.reason}};
+                // A disk-only verification must not replace an assembly whose
+                // open descendants changed while the verification was running.
+                if (s.is_assembly() && !asm_live_fingerprints_match(
+                        s.doc, component_source_base(s), scratch->asm_sources)) {
+                    s.cache_verification_pending = false;
+                    return;
                 }
-                response = s.is_assembly() ? ops_response_assembly(s, json::object())
-                    : ops_response(s, *s.compiled, json::object(), true);
-                response["doc_id"] = id;
-                response["mismatch"] = mismatch;
-                response["warning"] = mismatch
-                    ? json("cache_mismatch: unverified cached geometry replaced by feature-history rebuild")
-                    : json(nullptr);
-                dep_notify_unlocked(id, s.revision);
+                if (!s.is_assembly() && scratch->compiled && !scratch->compiled->ok) {
+                    if (s.compiled && s.compiled->ok) s.last_good_display = s.compiled;
+                    if (verify_authored && s.unverified_source_doc) {
+                        s.doc = *s.unverified_source_doc;
+                        s.dirty = s.unverified_source_was_dirty;
+                    }
+                    s.unverified_source_doc.reset();
+                    s.unverified_materialized_hash.clear();
+                    s.compile_cache = scratch->compile_cache;
+                    s.compiled = scratch->compiled;
+                    s.compiled_rev = s.revision;
+                    s.compiled_partial = false;
+                    s.ckpt_memo.reset();
+                    s.cache_verification_pending = false;
+                    s.cache_trust = "unverified";
+                    json failed = json::array();
+                    for (const auto& st : s.compiled->statuses)
+                        if (!st.ok) failed.push_back({{"id", st.id}, {"error", st.error}});
+                    s.cache_verification = {{"completed", false}, {"error", "feature_failed"},
+                                            {"failed_features", std::move(failed)}};
+                    s.cache_warnings.push_back("cache_verification_failed: feature history did not rebuild");
+                    response = ops_response(s, *s.compiled, json::object(), true);
+                    response["doc_id"] = id;
+                    response["mismatch"] = false;
+                    response["warning"] = s.cache_warnings.back();
+                    dep_notify_unlocked(id, s.revision);
+                } else {
+                    if (!s.is_assembly() && verify_authored) {
+                        s.doc = scratch->doc;
+                        s.dirty = s.dirty || scratch->dirty;
+                    }
+                    s.last_good_display.reset();
+                    s.last_good_body_metadata = json();
+                    s.unverified_source_doc.reset();
+                    s.unverified_materialized_hash.clear();
+                    s.compile_cache = scratch->compile_cache;
+                    s.compiled = scratch->compiled;
+                    s.compiled_rev = s.compiled ? s.revision : -1;
+                    s.compiled_partial = false;
+                    s.ckpt_memo.reset();
+                    s.asm_result = scratch->asm_result;
+                    s.asm_sources = std::move(scratch->asm_sources);
+                    if (s.is_assembly())
+                        update_assembly_dependencies(s, s.asm_sources, component_source_base(s));
+                    s.asm_warm = std::move(scratch->asm_warm);
+                    s.asm_display.source.reset();
+                    s.face_info_shape.Nullify();
+                    s.face_infos.clear();
+                    s.integrity_memo.reset();
+                    s.cached_assembly_response = json();
+                    s.cache_verification_pending = false;
+                    s.cache_trust = built.contains("skipped_reason") ? "unverified" : "verified";
+                    s.cache_verification = {{"mismatch", mismatch}, {"completed", true}};
+                    if (mismatch) s.cache_warnings.push_back(
+                        "cache_mismatch: unverified cached geometry replaced by feature-history rebuild");
+                    writeback = !scratch->path.empty() && entries.count("cache.json");
+                    response = s.is_assembly() ? ops_response_assembly(s, json::object())
+                        : ops_response(s, *s.compiled, json::object(), true);
+                    response["doc_id"] = id;
+                    response["mismatch"] = mismatch;
+                    response["warning"] = mismatch
+                        ? json("cache_mismatch: unverified cached geometry replaced by feature-history rebuild")
+                        : json(nullptr);
+                    dep_notify_unlocked(id, s.revision);
+                }
+            }
+            if (writeback) {
+                const std::string& disk_hash = scratch->source_doc_hash.empty()
+                    ? hash : scratch->source_doc_hash;
+                const auto wb = stepplus_write_build_state(scratch->path, stamp, disk_hash, entries);
+                DocLock lock;
+                Session& s = require_session(id);
+                if (s.revision == revision && s.path == scratch->path &&
+                    (s.is_assembly() ? s.asm_result == scratch->asm_result
+                                     : s.compiled == scratch->compiled)) {
+                    if (wb.written && s.file_stamp == stamp) s.file_stamp = wb.stamp;
+                    s.cache_verification["writeback"] = {{"written", wb.written}, {"reason", wb.reason}};
+                    cache_response_fields(s, response);
+                }
             }
         } catch (const std::exception& e) {
             try {
@@ -17260,6 +24222,7 @@ static void schedule_cache_verification(Session& live) {
         if (!response.contains("warning"))
             response["warning"] = response.contains("warnings") && !response["warnings"].empty()
                 ? response["warnings"].back() : json(nullptr);
+        response["_refresh_kind"] = "cache_verification";
         std::function<void(const std::string&, const json&)> sink;
         { std::lock_guard<std::mutex> lock(g_cache_refresh_mtx); sink = g_cache_refresh_sink; }
         if (sink) try { sink(id, response); } catch (...) {}
@@ -17272,7 +24235,11 @@ static void schedule_cache_verification(Session& live) {
 }
 }  // namespace
 
-json doc_open(const std::string& path, bool as_solid, bool detach_path) {
+static json doc_open_impl(const std::string& path, bool as_solid, bool detach_path, bool recovered,
+                          bool reuse_open, bool for_reload,
+                          std::optional<::geom::DisplayQuality> reload_quality = std::nullopt,
+                          const std::string& recovery_original_path = {},
+                          const json& recovery_base_stamp = nullptr) {
     // Manual File>Open / File>Import of a NON-native file (.step/.stp/.iges/.brep/.stl/
     // .obj/.ply/.gltf/.glb/.3mf/.3dm/.sldprt/…) is NOT a .step+ container — importing it
     // as a fresh part doc is what the user expects (and is why "open a non-.step+ part"
@@ -17280,10 +24247,41 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
     // through the import lane, which mints a new part doc with the file's geometry baked in.
     if (!path.empty() && !is_stepplus_path(path))
         return doc_import_file(path, "", as_solid, "");
+    std::lock_guard<std::mutex> paths(g_open_path_mtx);
+    if (recovered && detach_path && !recovery_original_path.empty()) {
+        if (native_policy::rooted()) native_policy::authored_reference(recovery_original_path);
+        const std::string other = find_open_by_path_except(recovery_original_path, {});
+        if (!other.empty())
+            return {{"ok", false}, {"code", "path_bound_to_other_doc"}, {"other_doc_id", other}};
+    }
+    if (reuse_open && !detach_path) {
+        const std::string existing = find_open_by_path_except(path, {});
+        if (!existing.empty()) {
+            json response = doc_activate(existing);
+            response["doc_id"] = existing;
+            response["name"] = response.value("tree", json::object()).value("name", std::string());
+            response["reused"] = true;
+            return response;
+        }
+    }
 
     std::string opened_doc_id;
+    struct OpenRollback {
+        std::string id;
+        bool committed = false;
+        ~OpenRollback() { if (!committed && !id.empty()) try { doc_close_with_path_lock(id); } catch (...) {} }
+    } rollback;
     std::map<std::string, std::string> drawing_entries;  // restored after the session lock
     json resp;
+    struct PendingWriteback {
+        std::unique_ptr<Session> snapshot;
+        NativeFileStamp stamp;
+        std::string source_hash;
+        std::string miss_reason;
+        int features_executed = 0;
+        std::shared_ptr<const AssemblyLiveSources> sources;
+    };
+    std::unique_ptr<PendingWriteback> pending_writeback;
     {
     DocLock lk;
     // Taken before the read: a write that lands after it makes a later write-back refuse.
@@ -17305,8 +24303,10 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
     const bool cache_verified = stepplus_cache_verified(loaded.doc, loaded.extra);
 
     auto sp = std::make_shared<Session>();
+    if (reload_quality) sp->display_quality = *reload_quality;
     sp->doc_id = new_doc_id();
     sp->doc = std::move(loaded.doc);
+    sp->source_doc_hash = stepplus_doc_hash(sp->doc);
     sp->cache_trust = cache_verified ? "verified" : "unverified";
     // Validate the authored file, before detaching rewrites relative references
     // and gives its copy a unique display name. Those session-local changes do
@@ -17317,7 +24317,19 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
             ? stepplus_doc_hash(sp->doc) : std::string();
     sp->revision = 0;
     sp->path = detach_path ? std::string() : path;
-    if (detach_path) sp->native_source_path =
+    sp->file_stamp = opened_stamp;
+    if (recovered && detach_path && !recovery_original_path.empty()) {
+        sp->path = recovery_original_path;
+        const NativeFileStamp base = stepplus_file_stamp(recovery_original_path);
+        const json actual = base.valid ? json{{"size", base.size}, {"mtime_ns", base.mtime_ns},
+                                               {"ino", base.ino}} : json(nullptr);
+        sp->file_stamp = base.valid && actual == recovery_base_stamp ? base : NativeFileStamp{};
+    }
+    // A recovered crash survivor is unsaved work whose artifact the caller deletes next: no
+    // reproducible source to point at, and dirty so autosave, the quit prompt and doc-GC
+    // keep protecting it until the user saves or discards it.
+    if (recovered) sp->dirty = true;
+    else if (detach_path) sp->native_source_path =
         native_policy::path_utf8(std::filesystem::absolute(std::filesystem::u8path(path)));
     // Detached imports must retain relative component references without retaining
     // the source's save destination. Resolve against the container, not process cwd.
@@ -17329,6 +24341,10 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
             std::filesystem::absolute(std::filesystem::u8path(path)).parent_path());
     }
     sp->extra_entries = std::move(loaded.extra);
+    if (sp->is_assembly()) {
+        sp->recovery_sources = restore_recovery_assembly_sources(sp->extra_entries, cache_verified);
+        sp->recovery_sources_verified = cache_verified && bool(sp->recovery_sources);
+    }
     // Stamp the document's own id to the new session id (mirrors blank_part).
     if (sp->doc.is_object()) sp->doc["id"] = sp->doc_id;
     // Recovery opens reserve a unique display name before registry publication.
@@ -17341,10 +24357,13 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
     sp->refresh_summary();
     {
         std::lock_guard<std::mutex> reg(g_registry_mtx);
-        sp->owns_journal = true;
+        sp->owns_journal = !for_reload;
         g_sessions[sid] = sp;
     }
+    rollback.id = sid;
     Session& stored = lk.acquire(sid);
+    std::optional<AssemblySourceScope> recovery_scope;
+    if (stored.is_assembly()) recovery_scope.emplace(assembly_sources_for_session(stored));
 
     // Cache verdict surfaced on every open (contracts/stepplus.md §4): cache_hit, warm and,
     // on a miss, cache_miss_reason — never a silent full rebuild.
@@ -17379,6 +24398,11 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
                 json header = json::parse(cj->second);
                 const std::string base_dir = native_policy::path_utf8(
                     std::filesystem::u8path(path).parent_path());
+                json components = header.value("components", json());
+                if (header.contains("recovery_base") && header["recovery_base"].is_string())
+                    components = rebase_assembly_fingerprints(
+                        std::move(components), header["recovery_base"].get<std::string>(),
+                        base_dir, true);
                 if (!header.is_object() || !header.contains("response") ||
                     !header["response"].is_object())
                     miss_reason = "decode_error";
@@ -17389,11 +24413,12 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
                     miss_reason = "doc_hash";
                 else if (!header.value("solved", false))
                     miss_reason = "unsolved";
+                else if (!cache_verified && stored.recovery_sources && !stored.recovery_sources->empty())
+                    miss_reason = "unverified_recovery_sources";
                 else if (header.value("display_quality", std::string()) !=
                          ::geom::display_quality_name(stored.display_quality))
                     miss_reason = "display_quality";
-                else if (!asm_fingerprints_match(stored.doc, base_dir,
-                                                 header.value("components", json())))
+                else if (!asm_live_fingerprints_match(stored.doc, base_dir, components))
                     miss_reason = "components_changed";
                 if (miss_reason.empty()) {
                     resp = header["response"];
@@ -17403,18 +24428,28 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
                         if (!resp.contains("tess") || !resp["tess"].is_object())
                             resp["tess"] = json::object();
                         resp["tess"]["aicm_path"] = ap;
+                    } else {
+                        resp["tess"].erase("aicm_path");
+                        resp["tess"]["mesh_error"] = "aicm_publication_failed";
+                        resp["mesh_error"] = "aicm_publication_failed";
                     }
                     resp["revision"] = stored.revision;
                     resp["tree"] = stored.doc;
                     cache_hit = true;
                     warm = true;
                     stored.cached_assembly_response = resp;
+                    stored.asm_sources = std::move(components);
+                    stored.asm_source_versions = AssemblySourceScope::current();
+                    update_assembly_dependencies(stored, stored.asm_sources, base_dir);
                 }
             } catch (...) {
                 miss_reason = "decode_error";  // stale/corrupt cache -> full rebuild
             }
         }
         if (!cache_hit) {
+            // No saved assembly display was consumed: this response is built
+            // synchronously. Component build states can still mark it unverified.
+            stored.cache_trust = "verified";
             rebuild_assembly(stored);
             resp = ops_response_assembly(stored, json::object());
             warm = true;
@@ -17438,20 +24473,38 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
     const bool unverified_cached_state = !cache_verified &&
         (cache_hit || (cache_diag.contains("checkpoints") &&
                       cache_diag["checkpoints"].value("restored", false)));
-    if (unverified_cached_state) {
+    if (unverified_cached_state && !for_reload) {
         schedule_cache_verification(stored);
         cache_diag["verification"] = "background";
     }
+    if (!cache_hit && !stored.cache_verification_pending && !stored.is_assembly() &&
+        stored.compiled && stored.compiled->ok)
+        stored.cache_trust = "verified";  // a complete fresh solve, not merely an authenticated prefix
     if (!detach_path && !cache_hit && !stored.cache_verification_pending) {
-        stored.cache_trust = "verified";
-        cache_diag["writeback"] = write_back_build_state(
-            stored, path, opened_stamp, persisted_assembly_hash, miss_reason,
-            cache_diag.value("features_executed", 0));
-    }
-    if (!cache_hit && !stored.cache_verification_pending) {
-        stored.cache_trust = "verified";
+        pending_writeback = std::make_unique<PendingWriteback>();
+        pending_writeback->snapshot = std::make_unique<Session>();
+        Session& scratch = *pending_writeback->snapshot;
+        seed_cached_scratch(scratch, stored);
+        scratch.doc_id = stored.doc_id + "-writeback-" +
+            std::to_string(g_ckpt_seq.fetch_add(1, std::memory_order_relaxed));
+        scratch.asm_result = stored.asm_result;
+        scratch.asm_sources = stored.asm_sources;
+        scratch.asm_display = stored.asm_display;
+        for (const auto& [name, data] : stored.extra_entries) {
+            if (name != "cache.json" && name != "cache.aicm" &&
+                name != "cache.brep" && name != "cache.ckpt" &&
+                name != "cache.provenance" && name != "geometry.step")
+                scratch.extra_entries.emplace(name, data);
+        }
+        pending_writeback->stamp = opened_stamp;
+        pending_writeback->source_hash = stored.is_assembly() ? persisted_assembly_hash
+                                                              : stored.source_doc_hash;
+        pending_writeback->miss_reason = miss_reason;
+        pending_writeback->features_executed = cache_diag.value("features_executed", 0);
+        pending_writeback->sources = assembly_live_sources();
     }
     cache_response_fields(stored, resp);
+    resp["metadata_revision"] = stored.metadata_revision;
     resp["cache_hit"] = cache_hit;
     resp["warm"] = warm;
     if (!cache_hit) resp["cache_miss_reason"] = miss_reason;
@@ -17465,9 +24518,9 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
     for (const auto& [name, data] : stored.extra_entries)
         if (name.rfind("drawings/", 0) == 0) drawing_entries[name] = data;
 
-    // Warnings: container load notes + per-feature rebuild failures (the non-total-
-    // failure branch of the Python oracle; frozen-geometry fallback is deferred).
-    json warnings = json::array();
+    // Preserve cache/last-good warnings alongside container and feature diagnostics.
+    json warnings = resp.value("warnings", json::array());
+    if (!warnings.is_array()) warnings = json::array();
     for (const std::string& w : loaded.warnings) warnings.push_back(w);
     std::vector<std::string> failed;
     if (!stored.is_assembly() && stored.compiled && stored.compiled_rev == stored.revision)
@@ -17485,6 +24538,32 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
     resp["warnings"] = warnings;
     }  // release the session lock before restoring drawings (lock-order safety)
 
+    if (pending_writeback) {
+        Session& scratch = *pending_writeback->snapshot;
+        AssemblySourceScope source_scope(std::move(pending_writeback->sources));
+        try {
+            resp["cache"]["writeback"] = write_back_build_state(
+                scratch, path, pending_writeback->stamp, pending_writeback->source_hash,
+                pending_writeback->miss_reason, pending_writeback->features_executed);
+            if (scratch.file_stamp.valid) {
+                DocLock lock;
+                Session& live = require_session(opened_doc_id);
+                if (live.path == path && live.file_stamp == pending_writeback->stamp)
+                    live.file_stamp = scratch.file_stamp;
+            }
+        } catch (const std::exception& e) {
+            resp["cache"]["writeback"] = {{"written", false}, {"reason", e.what()}};
+        }
+        chudware::aicm_handoff::release_older_than(scratch.doc_id, scratch.revision + 1);
+    }
+    if (for_reload) {
+        DocLock lock;
+        require_session(opened_doc_id).path.clear();
+        resp["drawings"] = json::array();
+        rollback.committed = true;
+        return resp;
+    }
+
     // W12+ — restore any embedded drawings as FRESH drawing sessions re-pointed at this
     // reopened part, so they project against the reopened bodies. Fully contained: a
     // malformed / non-drawing entry is skipped, never breaking the part open. The host
@@ -17499,12 +24578,165 @@ json doc_open(const std::string& path, bool as_solid, bool detach_path) {
         }
     }
     resp["drawings"] = drawings;
+    rollback.committed = true;
     return resp;
+}
+
+json doc_open(const std::string& path, bool as_solid, bool detach_path, bool recovered,
+              bool reuse_open, const std::string& recovery_original_path,
+              const json& recovery_base_stamp) {
+    return doc_open_impl(path, as_solid, detach_path, recovered, reuse_open, false,
+                         std::nullopt, recovery_original_path, recovery_base_stamp);
+}
+
+json doc_reload(const std::string& doc_id, long expected_revision, long expected_metadata_revision) {
+    std::string path;
+    ::geom::DisplayQuality quality;
+    {
+        DocLock lock;
+        Session& live = require_session(doc_id);
+        path = live.path;
+        quality = live.display_quality;
+    }
+    if (path.empty())
+        throw OpError("io_error", "doc_reload: document has no bound path", {{"doc_id", doc_id}});
+
+    // Stage with the ordinary cache-aware open path, but do not register its
+    // drawings or publish it as an assembly source. Commit only after the file
+    // and destination are rechecked under both session locks.
+    json response = doc_open_impl(path, false, false, false, false, true, quality);
+    const std::string staged_id = response.at("doc_id").get<std::string>();
+    struct CloseStage {
+        std::string id;
+        ~CloseStage() { try { doc_close(id); } catch (...) {} }
+    } close_stage{staged_id};
+
+    {
+        DocLock lock;
+        Session& live = require_session(doc_id);
+        Session& staged = require_session(staged_id);
+        if ((expected_revision >= 0 && live.revision != expected_revision) ||
+            (expected_metadata_revision >= 0 && live.metadata_revision != expected_metadata_revision))
+            return {{"ok", false}, {"code", "stale_revision"},
+                    {"current_revision", live.revision},
+                    {"current_metadata_revision", live.metadata_revision}};
+        if (live.path != path || !(stepplus_file_stamp(path) == staged.file_stamp))
+            throw OpError("file_changed", "doc_reload: file changed during reload",
+                          {{"doc_id", doc_id}, {"path", path}});
+        const long revision = live.revision + 1;
+        const bool current_compile = staged.compiled && staged.compiled_rev == staged.revision;
+        for (const auto& entry : live.undo_stack) drop_history_entry(entry);
+        for (const auto& entry : live.redo_stack) drop_history_entry(entry);
+        live.undo_stack.clear();
+        live.redo_stack.clear();
+        live.checkpoints.clear();
+        live.active_sketch.reset();
+        live.doc = std::move(staged.doc);
+        live.doc["id"] = doc_id;
+        live.revision = revision;
+        ++live.metadata_revision;
+        live.dirty = staged.dirty;
+        live.file_stamp = staged.file_stamp;
+        live.source_doc_hash = std::move(staged.source_doc_hash);
+        live.unverified_source_doc = std::move(staged.unverified_source_doc);
+        live.unverified_materialized_hash = std::move(staged.unverified_materialized_hash);
+        live.unverified_source_was_dirty = staged.unverified_source_was_dirty;
+        live.native_source_path.clear();
+        live.history_private_origin = false;
+        live.cache_trust = std::move(staged.cache_trust);
+        live.cache_verification_pending = false;
+        live.cache_verification = std::move(staged.cache_verification);
+        live.cache_warnings = std::move(staged.cache_warnings);
+        live.scad_cache_identity = std::move(staged.scad_cache_identity);
+        live.extra_entries = std::move(staged.extra_entries);
+        live.recovery_sources = std::move(staged.recovery_sources);
+        live.recovery_sources_verified = staged.recovery_sources_verified;
+        live.mesh_ref_cached_sha.clear();
+        live.mesh_ref_cached.reset();
+        live.mesh_ref_stats_cache.clear();
+        live.mesh_ref_only_revision = -1;
+        live.compiled = std::move(staged.compiled);
+        live.compiled_rev = current_compile ? revision : -1;
+        live.compiled_partial = staged.compiled_partial;
+        live.last_good_display = std::move(staged.last_good_display);
+        live.last_good_body_metadata = std::move(staged.last_good_body_metadata);
+        live.compile_cache = std::move(staged.compile_cache);
+        live.ckpt_memo = std::move(staged.ckpt_memo);
+        live.ckpt_memo_report = std::move(staged.ckpt_memo_report);
+        live.ckpt_memo_stamp = staged.ckpt_memo_stamp;
+        live.ckpt_memo_doc_hash = std::move(staged.ckpt_memo_doc_hash);
+        live.external_projection_cache = ExternalProjectionCache{};
+        live.face_info_shape.Nullify();
+        live.face_infos.clear();
+        live.integrity_memo.reset();
+        live.asm_result = std::move(staged.asm_result);
+        live.asm_sources = std::move(staged.asm_sources);
+        live.asm_source_versions = std::move(staged.asm_source_versions);
+        live.asm_warm = std::move(staged.asm_warm);
+        live.asm_display = AssemblyDisplay{};
+        live.asm_display_chunks.clear();
+        live.asm_display_chunks_source.reset();
+        live.cached_assembly_response = json();
+        if (live.is_assembly())
+            update_assembly_dependencies(live, live.asm_sources, component_source_base(live));
+        else
+            remove_assembly_dependencies(doc_id);
+
+        if (response.contains("tess") && response["tess"].is_object() &&
+            response["tess"].value("aicm_path", json()).is_string()) {
+            const std::string uri = response["tess"]["aicm_path"].get<std::string>();
+            if (!uri.empty()) {
+                chudware::aicm_handoff::Mapping mapping;
+                std::string error, published;
+                if (chudware::aicm_handoff::map(uri, mapping, error)) {
+                    published = publish_doc_aicm(doc_id, revision, mapping.data, mapping.size);
+                    chudware::aicm_handoff::unmap(mapping);
+                }
+                if (published.empty()) {
+                    response["tess"].erase("aicm_path");
+                    response["tess"]["mesh_error"] = "aicm_publication_failed";
+                    response["mesh_error"] = "aicm_publication_failed";
+                } else {
+                    response["tess"]["aicm_path"] = published;
+                }
+            }
+        }
+        response["doc_id"] = doc_id;
+        response["revision"] = revision;
+        response["metadata_revision"] = live.metadata_revision;
+        response["tree"] = live.doc;
+        response["name"] = live.doc.value("name", std::string());
+        if (live.is_assembly() && !live.asm_result && response.value("cache_hit", false))
+            live.cached_assembly_response = response;
+        dep_notify_unlocked(doc_id, revision);
+        if (live.cache_trust == "unverified" && response.value("warm", false)) {
+            schedule_cache_verification(live);
+            cache_response_fields(live, response);
+        }
+    }
+    return response;
 }
 
 // ============================================================ C18 sketch RPCs
 // Port of engine/doc/session.py sketch_enter/solve/drag/drag_commit/exit/overview/
 // regions/probe/project_ref. doc_id-keyed; operate on the per-session active_sketch.
+
+static void require_sketch_session(const Session& s, const std::string& sketch_fid,
+                                   std::uint64_t session_id) {
+    if (session_id && (!s.active_sketch || s.active_sketch->sketch_fid != sketch_fid ||
+                       s.active_sketch->session_id != session_id))
+        throw OpError("sketch_session_changed", "the active sketch session has changed",
+                      {{"sketch", sketch_fid}});
+}
+
+static void require_sketch_revision(const Session& s, long expect_revision,
+                                    std::uint64_t session_id) {
+    if ((expect_revision >= 0 && expect_revision != s.revision) ||
+        (session_id && s.active_sketch && s.active_sketch->state_revision != s.revision))
+        throw OpError("stale_revision",
+                      "sketch state or expect_revision does not match the current revision",
+                      {{"current_revision", s.revision}});
+}
 
 json doc_sketch_enter(const std::string& doc_id, const std::string& sketch_fid) {
     DocLock lk;
@@ -17516,6 +24748,8 @@ json doc_sketch_enter(const std::string& doc_id, const std::string& sketch_fid) 
     SolveActive packed = solve_active(s, feat, std::nullopt);
     SketchState st;
     st.sketch_fid = sketch_fid;
+    st.session_id = g_sketch_session_seq.fetch_add(1);
+    st.state_revision = s.revision;
     st.solve_state = packed.state;
     st.last_entities = packed.entity_map;
     st.last_statuses = packed.statuses;
@@ -17524,32 +24758,43 @@ json doc_sketch_enter(const std::string& doc_id, const std::string& sketch_fid) 
     st.plane_frame = frame;
     s.active_sketch = std::move(st);
 
-    return sketch_result(feat, packed, frame, s.active_sketch->last_overall_status);
+    json result = sketch_result(feat, packed, frame, s.active_sketch->last_overall_status);
+    result["session_id"] = s.active_sketch->session_id;
+    result["revision"] = s.revision;
+    return result;
 }
 
-json doc_sketch_solve(const std::string& doc_id, const std::string& sketch_fid) {
+json doc_sketch_solve(const std::string& doc_id, const std::string& sketch_fid,
+                      std::uint64_t session_id) {
     DocLock lk;
     Session& s = require_session(doc_id);
+    require_sketch_session(s, sketch_fid, session_id);
     json& feat = find_sketch_feature(s, sketch_fid);
     std::optional<chudware::sketch::SolveState> warm;
-    if (s.active_sketch && s.active_sketch->sketch_fid == sketch_fid)
+    if (s.active_sketch && s.active_sketch->sketch_fid == sketch_fid &&
+        s.active_sketch->state_revision == s.revision)
         warm = s.active_sketch->solve_state;
     SolveActive packed = solve_active(s, feat, warm);
     if (!s.active_sketch || s.active_sketch->sketch_fid != sketch_fid) {
         chudware::geom::SketchPlane plane = resolve_sketch_plane(s, feat);
         SketchState st;
         st.sketch_fid = sketch_fid;
+        st.session_id = g_sketch_session_seq.fetch_add(1);
         st.plane_frame = plane_frame(plane);
         s.active_sketch = std::move(st);
     }
     s.active_sketch->solve_state = packed.state;
+    s.active_sketch->state_revision = s.revision;
     s.active_sketch->last_entities = packed.entity_map;
     s.active_sketch->last_statuses = packed.statuses;
     s.active_sketch->last_overall_status =
         overall_status(packed.statuses, packed.dof, packed.conflicting, packed.redundant,
                        packed.constraints_by_id);
-    return sketch_result(feat, packed, s.active_sketch->plane_frame,
-                         s.active_sketch->last_overall_status);
+    json result = sketch_result(feat, packed, s.active_sketch->plane_frame,
+                                s.active_sketch->last_overall_status);
+    result["session_id"] = s.active_sketch->session_id;
+    result["revision"] = s.revision;
+    return result;
 }
 
 json doc_sketch_overview(const std::string& doc_id, const std::string& sketch_fid) {
@@ -17566,22 +24811,34 @@ json doc_sketch_overview(const std::string& doc_id, const std::string& sketch_fi
     r["status"] = overall_status(packed.statuses, packed.dof, packed.conflicting,
                                  packed.redundant, packed.constraints_by_id);
     r["skipped_constraints"] = packed.skipped_constraints;
+    // Per-constraint rows carry the solver's measured value (null for relations). When the
+    // solve was rejected the entities above are the AUTHORED seeds, not a solved shape, and
+    // `measured` is taken from those seeds.
+    r["constraints"] = sketch_constraints(feat, packed.entity_map);
+    r["solve_rejected"] = packed.rejected;
+    r["conflicting"] = strvec_json(packed.conflicting);
+    r["redundant"] = strvec_json(packed.redundant);
     return r;
 }
 
 json doc_sketch_drag(const std::string& doc_id, const std::string& sketch_fid,
-                     const std::string& handle, const json& xy, const json& targets) {
+                     const std::string& handle, const json& xy, const json& targets,
+                     std::uint64_t session_id) {
     DocLock lk;
     Session& s = require_session(doc_id);
+    require_sketch_session(s, sketch_fid, session_id);
     json& feat = find_sketch_feature(s, sketch_fid);
-    // Not entered (or stale / cold) — enter implicitly so drag is still serviceable.
+    // Re-solve from the current document when another edit invalidated the warm state.
     if (!s.active_sketch || s.active_sketch->sketch_fid != sketch_fid ||
-        !s.active_sketch->solve_state) {
+        !s.active_sketch->solve_state || s.active_sketch->state_revision != s.revision) {
         chudware::geom::SketchPlane plane = resolve_sketch_plane(s, feat);
         std::vector<double> frame = plane_frame(plane);
         SolveActive packed = solve_active(s, feat, std::nullopt);
         SketchState st;
         st.sketch_fid = sketch_fid;
+        st.session_id = s.active_sketch && s.active_sketch->sketch_fid == sketch_fid
+                            ? s.active_sketch->session_id : g_sketch_session_seq.fetch_add(1);
+        st.state_revision = s.revision;
         st.solve_state = packed.state;
         st.last_entities = packed.entity_map;
         st.last_statuses = packed.statuses;
@@ -17650,6 +24907,8 @@ json doc_sketch_drag(const std::string& doc_id, const std::string& sketch_fid,
         err["statuses"] = res.contains("statuses") ? res["statuses"] : json::object();
         err["solve_rejected"] = false;
         err["constraints"] = sketch_constraints(feat, res_entities);
+        err["revision"] = s.revision;
+        err["session_id"] = st.session_id;
         return err;
     }
 
@@ -17665,13 +24924,18 @@ json doc_sketch_drag(const std::string& doc_id, const std::string& sketch_fid,
     out["statuses"] = st.last_statuses;
     out["solve_rejected"] = false;
     out["constraints"] = sketch_constraints(feat, res_entities);
+    out["revision"] = s.revision;
+    out["session_id"] = st.session_id;
     out["external"] = sketch_external_map(feat);  // keep converted-entity styling alive mid-drag
     return out;
 }
 
-json doc_sketch_drag_commit(const std::string& doc_id, const std::string& sketch_fid) {
+json doc_sketch_drag_commit(const std::string& doc_id, const std::string& sketch_fid,
+                            long expect_revision, std::uint64_t session_id) {
     DocLock lk;
     Session& s = require_session(doc_id);
+    require_sketch_session(s, sketch_fid, session_id);
+    require_sketch_revision(s, expect_revision, session_id);
     json& feat = find_sketch_feature(s, sketch_fid);
 
     json coords;
@@ -17711,6 +24975,7 @@ json doc_sketch_drag_commit(const std::string& doc_id, const std::string& sketch
             std::optional<chudware::sketch::SolveState> warm = s.active_sketch->solve_state;
             SolveActive packed = solve_active(s, feat2, warm);
             s.active_sketch->solve_state = packed.state;
+            s.active_sketch->state_revision = s.revision;
             s.active_sketch->last_entities = packed.entity_map;
             s.active_sketch->last_statuses = packed.statuses;
             s.active_sketch->last_overall_status =
@@ -17731,9 +24996,19 @@ json doc_sketch_drag_commit(const std::string& doc_id, const std::string& sketch
     return resp;
 }
 
-json doc_sketch_exit(const std::string& doc_id, const std::string& sketch_fid) {
+json doc_sketch_exit(const std::string& doc_id, const std::string& sketch_fid,
+                     long expect_revision, std::uint64_t session_id, bool discard_active) {
     DocLock lk;
     Session& s = require_session(doc_id);
+    if (discard_active) {
+        const bool matches = session_id && s.active_sketch &&
+                             s.active_sketch->sketch_fid == sketch_fid &&
+                             s.active_sketch->session_id == session_id;
+        if (matches) s.active_sketch.reset();
+        return json{{"ok", true}, {"discarded", matches}};
+    }
+    require_sketch_session(s, sketch_fid, session_id);
+    require_sketch_revision(s, expect_revision, session_id);
     json& feat = find_sketch_feature(s, sketch_fid);
 
     if (s.active_sketch && s.active_sketch->sketch_fid == sketch_fid &&
@@ -17770,7 +25045,8 @@ json doc_sketch_exit(const std::string& doc_id, const std::string& sketch_fid) {
             s.undo_stack.pop_back();  // nothing changed — no phantom undo step
         }
     }
-    s.active_sketch.reset();
+    if (s.active_sketch && s.active_sketch->sketch_fid == sketch_fid)
+        s.active_sketch.reset();
     CompileResult r = compile_session(s);
     return warm_and_respond(s, std::move(r), json::object(), /*with_tess=*/true);
 }
@@ -17843,14 +25119,20 @@ bool reg_build_edge(const json& ent, const chudware::geom::SketchPlane& pl, RegE
         if (t == "arc") {
             Eigen::Vector2d c(ent["center"][0], ent["center"][1]);
             double r = ent["radius"];
-            double a0 = ent["start"], a1 = ent["end"];
-            if (r <= kRegEps) return false;
+            const double sa = ent["start"], ea = ent["end"];  // degrees
+            if (r <= kRegEps || std::abs(ea - sa) < 1e-9) return false;
+            const bool ccw = ent.value("ccw", true);
+            const double a0 = sa * M_PI / 180.0, a1 = ea * M_PI / 180.0;
             double sweep = a1 - a0;
-            while (sweep <= 0.0) sweep += 2.0 * M_PI;
-            double amid = a0 + 0.5 * sweep;
-            Eigen::Vector2d ps(c.x() + r * std::cos(a0), c.y() + r * std::sin(a0));
-            Eigen::Vector2d pe(c.x() + r * std::cos(a1), c.y() + r * std::sin(a1));
-            Eigen::Vector2d pm(c.x() + r * std::cos(amid), c.y() + r * std::sin(amid));
+            if (ccw) {
+                while (sweep <= 0.0) sweep += 2.0 * M_PI;
+            } else {
+                while (sweep >= 0.0) sweep -= 2.0 * M_PI;
+            }
+            auto on = [&](double a) {
+                return Eigen::Vector2d(c.x() + r * std::cos(a), c.y() + r * std::sin(a));
+            };
+            const Eigen::Vector2d ps = on(a0), pe = on(a1), pm = on(a0 + 0.5 * sweep);
             GC_MakeArcOfCircle mkarc(reg_lift(pl, ps), reg_lift(pl, pm), reg_lift(pl, pe));
             if (!mkarc.IsDone()) return false;
             BRepBuilderAPI_MakeEdge mk(mkarc.Value());
@@ -17858,8 +25140,7 @@ bool reg_build_edge(const json& ent, const chudware::geom::SketchPlane& pl, RegE
             out.edge = mk.Edge(); out.p_start = ps; out.p_end = pe; out.closed = false;
             int n = 16;
             for (int i = 0; i <= n; ++i) {
-                double a = a0 + sweep * i / n;
-                out.samples.emplace_back(c.x() + r * std::cos(a), c.y() + r * std::sin(a));
+                out.samples.push_back(on(a0 + sweep * i / n));
             }
             return true;
         }
@@ -18241,7 +25522,8 @@ json doc_sketch_probe(const std::string& doc_id, const std::string& sketch_fid,
                       const json& action) {
     DocLock lk;
     Session& s = require_session(doc_id);
-    // The probe operates on the ACTIVE sketch (same context sketch_solve uses).
+    // The probe works on a COPY of the sketch feature found by id: it needs no active sketch
+    // session and never touches the user's (active_sketch is neither read nor written).
     json* featp = nullptr;
     try {
         featp = &find_sketch_feature(s, sketch_fid);
@@ -18249,9 +25531,6 @@ json doc_sketch_probe(const std::string& doc_id, const std::string& sketch_fid,
         return json{{"ok", false}, {"error", "no sketch feature '" + sketch_fid + "'"}};
     }
     json& feat = *featp;
-    if (!s.active_sketch || s.active_sketch->sketch_fid != sketch_fid)
-        return json{{"ok", false},
-                    {"error", "sketch '" + sketch_fid + "' is not the active sketch"}};
     if (!action.is_object() || action.size() != 1)
         return json{{"ok", false}, {"error", "action must be exactly one of "
                     "add_constraint / set_dim / delete_constraint"}};
@@ -18277,6 +25556,9 @@ json doc_sketch_probe(const std::string& doc_id, const std::string& sketch_fid,
 
     static const std::string kProbeCid = "__probe__";
     bool probe_is_dim = false;
+    json deleted_constraints = json::array();
+    const bool has_auto = std::any_of(cons.begin(), cons.end(),
+        [](const json& c) { return c.value("auto", false); });
 
     if (action.contains("add_constraint")) {
         const json& con = action["add_constraint"];
@@ -18284,27 +25566,42 @@ json doc_sketch_probe(const std::string& doc_id, const std::string& sketch_fid,
             return json{{"ok", false}, {"error", "add_constraint requires a constraint object"}};
         json c = con;
         c["id"] = kProbeCid;
-        probe_is_dim = is_dim_type(c.value("type", std::string()));
+        c.erase("auto");
+        probe_is_dim = is_dim_type(c.value("type", std::string())) && !c.contains("angle_ref");
         cons.push_back(std::move(c));
     } else if (action.contains("set_dim")) {
         const json& sd = action["set_dim"];
-        if (!sd.is_object() || !sd.contains("id"))
-            return json{{"ok", false}, {"error", "set_dim requires an 'id'"}};
+        if (!sd.is_object() || !sd.contains("id") || !sd["id"].is_string())
+            return json{{"ok", false}, {"error", "set_dim requires an 'id' (a constraint id string)"}};
         std::string cid = sd["id"].get<std::string>();
         json* target = nullptr;
         for (json& c : cons)
             if (c.is_object() && c.value("id", std::string()) == cid) { target = &c; break; }
         if (!target)
             return json{{"ok", false}, {"error", "set_dim: constraint '" + cid + "' not found"}};
+        if (target->contains("angle_ref") &&
+            ((sd.contains("value") && !sd["value"].is_null()) ||
+             (sd.contains("expr") && !sd["expr"].is_null()) ||
+             (sd.contains("driven") && !sd["driven"].is_null())))
+            return json{{"ok", false}, {"error", "set_dim: linked rotation follows " +
+                        (*target)["angle_ref"].get<std::string>() + "; edit the master dimension"}};
+        if (sd.contains("driven") && sd["driven"] == true)
+            for (const json& follower : cons)
+                if (follower.value("angle_ref", std::string()) == cid)
+                    return json{{"ok", false}, {"error", "set_dim: a rotation master with followers must stay driving"}};
         bool touched = false;
         if (sd.contains("expr") && !sd["expr"].is_null()) {
             double cur = (target->contains("value") && (*target)["value"].is_object() &&
                           (*target)["value"].contains("value"))
                              ? (*target)["value"]["value"].get<double>() : 0.0;
             (*target)["value"] = {{"value", cur}, {"expr", sd["expr"]}};
+            target->erase("auto");
             touched = true;
         } else if (sd.contains("value") && !sd["value"].is_null()) {
+            if (!sd["value"].is_number())
+                return json{{"ok", false}, {"error", "set_dim.value must be a number (use 'expr' for an expression)"}};
             (*target)["value"] = {{"value", sd["value"].get<double>()}, {"expr", nullptr}};
+            target->erase("auto");
             touched = true;
         }
         if (sd.contains("placement")) {
@@ -18319,22 +25616,35 @@ json doc_sketch_probe(const std::string& doc_id, const std::string& sketch_fid,
             touched = true;
         }
         if (sd.contains("driven") && !sd["driven"].is_null()) {
+            if (!sd["driven"].is_boolean())
+                return json{{"ok", false}, {"error", "set_dim.driven must be a bool"}};
             (*target)["driven"] = sd["driven"].get<bool>();
             touched = true;
         }
         if (!touched)
             return json{{"ok", false},
                         {"error", "set_dim requires 'value', 'expr', 'placement', or 'driven'"}};
+        if (target->contains("value")) {
+            const json value = (*target)["value"];
+            for (json& follower : cons)
+                if (follower.value("angle_ref", std::string()) == cid)
+                    follower["value"] = value;
+        }
     } else if (action.contains("delete_constraint")) {
         const json& dc = action["delete_constraint"];
-        if (!dc.is_object() || !dc.contains("id"))
-            return json{{"ok", false}, {"error", "delete_constraint requires an 'id'"}};
+        if (!dc.is_object() || !dc.contains("id") || !dc["id"].is_string())
+            return json{{"ok", false}, {"error", "delete_constraint requires an 'id' (a constraint id string)"}};
         std::string cid = dc["id"].get<std::string>();
         bool found = false;
         json kept = json::array();
-        for (const json& c : cons)
-            if (c.is_object() && c.value("id", std::string()) == cid) found = true;
-            else kept.push_back(c);
+        for (const json& c : cons) {
+            if (c.is_object() && c.value("id", std::string()) == cid) {
+                found = true;
+                deleted_constraints.push_back(cid);
+            } else if (c.is_object() && c.value("angle_ref", std::string()) == cid) {
+                deleted_constraints.push_back(c.value("id", std::string()));
+            } else kept.push_back(c);
+        }
         if (!found)
             return json{{"ok", false}, {"error", "delete_constraint: '" + cid + "' not found"}};
         params["constraints"] = kept;
@@ -18343,6 +25653,15 @@ json doc_sketch_probe(const std::string& doc_id, const std::string& sketch_fid,
                     "set_dim / delete_constraint"}};
     }
 
+    json settle_notes = json::array();
+    if (has_auto && !action.contains("delete_constraint")) {
+        auto settled = chudware::sketch::settle_auto_constraints(params, env);
+        std::size_t next = 0;
+        for (auto& c : settled.sketch["constraints"])
+            if (!c.contains("id")) c["id"] = "__probe_auto_" + std::to_string(next++);
+        params = std::move(settled.sketch);
+        for (const std::string& note : settled.notes) settle_notes.push_back(note);
+    }
     chudware::sketch::SketchSolution after = chudware::sketch::solve_sketch(params, env, std::nullopt);
     int dof_after = after.dof;
     const std::vector<std::string>& conflicting = after.conflicting;
@@ -18359,21 +25678,51 @@ json doc_sketch_probe(const std::string& doc_id, const std::string& sketch_fid,
     };
     bool would = in(conflicting, kProbeCid) ||
                  (probe_is_dim && in(redundant, kProbeCid)) ||
-                 (probe_is_dim && dof_after >= dof_before) ||
+                 (probe_is_dim && !has_auto && dof_after >= dof_before) ||
+                 redundant_overdefines(redundant, cons_by_id) ||
                  !after.converged || !conflicting.empty();
 
     json statuses = json::object();
     for (const auto& kv : after.statuses) statuses[kv.first] = kv.second;
+
+    // A proposed constraint the solver cannot even register (bad ref, unknown entity, an
+    // expression that does not evaluate) is reported as such, not as "no conflict".
+    if (action.contains("add_constraint"))
+        for (const auto& skipped : after.skipped)
+            if (skipped.first == kProbeCid)
+                return json{{"ok", false},
+                            {"error", "the proposed constraint would be skipped by the solver: " +
+                                      skipped.second}};
+
+    // For every conflicting/redundant constraint: the constraints it duplicates or contradicts.
+    json conflicts_with = json::object();
+    for (const std::vector<std::string>* ids : {&conflicting, &redundant})
+        for (const std::string& id : *ids) {
+            json partners = json::array();
+            for (const auto& entry : after.dependency_partners)
+                if (entry.first == id)
+                    for (const std::string& partner : entry.second) partners.push_back(partner);
+            conflicts_with[id] = std::move(partners);
+        }
+    json skipped_rows = json::array();
+    for (const auto& skipped : after.skipped)
+        skipped_rows.push_back({{"id", skipped.first}, {"reason", skipped.second}});
 
     json out;
     out["ok"] = true;
     out["status"] = overall_status(statuses, dof_after, conflicting, redundant, cons_by_id);
     out["dof_before"] = dof_before;
     out["dof_after"] = dof_after;
+    out["dof_delta"] = dof_after - dof_before;
     out["converged"] = after.converged;
     out["conflicting"] = strvec_json(conflicting);
     out["redundant"] = strvec_json(redundant);
+    out["skipped"] = std::move(skipped_rows);
+    out["conflicts_with"] = std::move(conflicts_with);
     out["would_over_define"] = would;
+    out["probe_id"] = kProbeCid;
+    if (!deleted_constraints.empty()) out["deleted_constraints"] = std::move(deleted_constraints);
+    if (!settle_notes.empty()) out["notes"] = std::move(settle_notes);
     return out;
 }
 
@@ -18395,21 +25744,27 @@ bool sketch_auto_coincident_enabled(const json& doc) {
 // Entity id of a handle ("L4.p2" -> "L4"; bare "P3" -> "P3").
 std::string handle_eid(const std::string& h) { return h.substr(0, h.find('.')); }
 
-// All handle pairs the sketch's constraints ALREADY coincident-link, as an
-// order-normalized "min\x1fmax" hash set. A coincident constraint pins point handles;
-// a pair is linked when ONE `coincident` constraint references BOTH handles
-// (exact-handle match, the granularity the auto pass proposes at). Built ONCE per
-// sketch so the O(E²) proximity loop in coincident_proposals queries in O(1) instead
-// of rescanning the constraint list for every candidate pair.
-std::unordered_set<std::string> coincident_pair_set(const json& constraints) {
+// Existing point links, normalized to the handles used by entity_endpoints.
+// Concentricity of bare round entities links their centers, not their arc ends.
+std::unordered_set<std::string> coincident_pair_set(const json& constraints,
+                                                     const json& solved_coords) {
     std::unordered_set<std::string> linked;
     if (!constraints.is_array()) return linked;
+    auto handle = [&](const std::string& ref) {
+        if (ref.find('.') != std::string::npos || !solved_coords.contains(ref)) return ref;
+        const std::string type = solved_coords[ref].value("type", std::string());
+        if (type == "circle" || type == "arc" || type == "ellipse" ||
+            type == "ellipse_arc" || type == "arc_slot") return ref + ".center";
+        return ref;
+    };
     for (const json& c : constraints) {
-        if (!c.is_object() || c.value("type", std::string()) != "coincident") continue;
+        if (!c.is_object()) continue;
+        const auto type = c.value("type", std::string());
+        if (type != "coincident" && type != "concentric") continue;
         if (!c.contains("refs") || !c["refs"].is_array()) continue;
         std::vector<std::string> hs;
         for (const json& r : c["refs"])
-            if (r.is_string()) hs.push_back(r.get<std::string>());
+            if (r.is_string()) hs.push_back(handle(r.get<std::string>()));
         for (size_t a = 0; a < hs.size(); ++a)
             for (size_t b = a + 1; b < hs.size(); ++b)
                 linked.insert(hs[a] < hs[b] ? hs[a] + '\x1f' + hs[b]
@@ -18432,7 +25787,7 @@ json coincident_proposals(const json& solved_coords, const json& constraints,
                           const std::unordered_set<std::string>& touched_eids = {}) {
     std::vector<chudware::sketch::Endpoint> eps =
         chudware::sketch::entity_endpoints(solved_coords);
-    const std::unordered_set<std::string> linked = coincident_pair_set(constraints);
+    const std::unordered_set<std::string> linked = coincident_pair_set(constraints, solved_coords);
     const bool scope = !touched_eids.empty();
     struct Cand { int i, j; double gap; };
     std::vector<Cand> cands;
@@ -18793,6 +26148,42 @@ json doc_sketch_health(const std::string& doc_id, const std::string& sketch_fid)
     json closure = closure_summary(sol.entities);
     int mregions = material_region_count(s, sketch_fid);
     if (mregions >= 0) closure["material_regions"] = mregions;
+    // Determine closure requirements only from actual authored consumers. A rib
+    // profile or sweep path may intentionally be open; an unused sketch has no
+    // established future use.
+    std::function<bool(const json&)> refers_to_sketch = [&](const json& ref) {
+        if (ref.is_string()) return ref.get<std::string>() == sketch_fid;
+        if (ref.is_array()) {
+            for (const json& item : ref) if (refers_to_sketch(item)) return true;
+        } else if (ref.is_object()) {
+            auto it = ref.find("sketch");
+            if (it != ref.end() && it->is_string() && it->get<std::string>() == sketch_fid)
+                return true;
+        }
+        return false;
+    };
+    bool needs_closed = false, open_path = false;
+    for (const json& f : s.doc.value("features", json::array())) {
+        if (!f.is_object() || f.value("suppressed", false)) continue;
+        const std::string type = f.value("type", std::string());
+        const json refs = f.value("refs", json::object());
+        auto has_ref = [&](const char* slot) {
+            return (refs.is_object() && refs.contains(slot) && refers_to_sketch(refs[slot])) ||
+                   (f.contains(slot) && refers_to_sketch(f[slot]));
+        };
+        // Revolve can auto-close an open profile to its axis, so it does not
+        // establish a closed-sketch requirement.
+        if ((type == "extrude" || type == "sm_base_flange" || type == "sweep" ||
+             type == "loft" || type == "surf_planar" || type == "surf_extrude" ||
+             type == "surf_revolve" || type == "surf_sweep") && has_ref("profile"))
+            needs_closed = true;
+        if ((type == "loft" || type == "surf_loft") && has_ref("sections")) needs_closed = true;
+        if ((type == "rib" && has_ref("profile")) ||
+            ((type == "sweep" || type == "surf_sweep") &&
+             (has_ref("path") || has_ref("guides")))) open_path = true;
+    }
+    closure["usage"] = needs_closed ? (open_path ? "mixed" : "closed_profile") :
+                       open_path ? "open_path" : "unknown";
 
     // ---- free-variable narration -------------------------------------------
     // Reuse the cold solve above (sol.x) — free_variables rebuilds the identical
@@ -18833,34 +26224,126 @@ json doc_sketch_health(const std::string& doc_id, const std::string& sketch_fid)
     for (const json& c : sk["constraints"])
         if (c.is_object() && c.contains("id"))
             cons_by_id[c["id"].get<std::string>()] = c;
+    // Test removal as a whole, from the solved state. A rank dependency alone
+    // is not evidence that deleting a complete multi-row relation is safe.
+    std::map<std::string, std::pair<int, bool>> trials;
+    auto removal_trial = [&](const std::string& cid) {
+        auto found = trials.find(cid);
+        if (found != trials.end()) return found->second;
+        std::pair<int, bool> result{-1, false};
+        if (sol.converged && sol.conflicting.empty()) {
+            json trial = sk;
+            trial["constraints"] = json::array();
+            for (const json& c : sk["constraints"])
+                if (c.value("id", std::string()) != cid) trial["constraints"].push_back(c);
+            try {
+                const auto after = chudware::sketch::solve_sketch(trial, env, sol.state);
+                const bool same_geometry = after.x.size() == sol.x.size() &&
+                    (after.x.size() == 0 || (after.x - sol.x).cwiseAbs().maxCoeff() <= 1e-7);
+                result = {after.dof - sol.dof, after.converged && after.conflicting.empty() &&
+                          after.skipped == sol.skipped && same_geometry};
+            } catch (...) { /* unavailable trial is never a deletion recommendation */ }
+        }
+        trials.emplace(cid, result);
+        return result;
+    };
+    // "c3 (distance 40)": id, type and the driving value or expression when it has one.
+    auto constraint_label = [&](const std::string& cid) {
+        if (!cons_by_id.contains(cid)) return cid + " (?)";
+        const json& c = cons_by_id[cid];
+        std::string text = cid + " (" + c.value("type", std::string("?"));
+        if (c.contains("value") && c["value"].is_object()) {
+            const json& v = c["value"];
+            if (v.contains("value") && v["value"].is_number()) {
+                char buf[32];
+                std::snprintf(buf, sizeof buf, "%.4g", v["value"].get<double>());
+                text += std::string(" ") + buf;
+            }
+            if (v.contains("expr") && v["expr"].is_string() && !v["expr"].get<std::string>().empty())
+                text += " = " + v["expr"].get<std::string>();
+        }
+        return text + ")";
+    };
+    // The other constraints this one duplicates or contradicts (minimal dependent set from the
+    // exact solve's Jacobian row dependency; the constraint itself is excluded).
+    auto partner_ids = [&](const std::string& cid) {
+        json ids = json::array();
+        for (const auto& entry : sol.dependency_partners)
+            if (entry.first == cid)
+                for (const std::string& partner : entry.second) ids.push_back(partner);
+        return ids;
+    };
+    auto constraint_brief = [&](const std::string& cid) -> json {
+        json row = {{"id", cid}, {"type", "?"}};
+        if (!cons_by_id.contains(cid)) return row;
+        const json& c = cons_by_id[cid];
+        row["type"] = c.value("type", std::string("?"));
+        if (c.contains("value") && c["value"].is_object()) {
+            const json& v = c["value"];
+            if (v.contains("value") && v["value"].is_number()) row["value"] = v["value"];
+            if (v.contains("expr") && v["expr"].is_string()) row["expr"] = v["expr"];
+        }
+        if (c.value("driven", false)) row["driven"] = true;
+        if (c.value("auto", false)) row["auto"] = true;
+        if (c.contains("angle_ref")) row["angle_ref"] = c["angle_ref"];
+        return row;
+    };
     auto tag_finding = [&](const std::string& cid, const char* kind) -> json {
-        json rec;
-        rec["id"] = cid;
-        std::string ctype = cons_by_id.contains(cid)
-                                ? cons_by_id[cid].value("type", std::string("?"))
-                                : std::string("?");
-        rec["type"] = ctype;
-        rec["suggestion"] = std::string("remove ") + kind + " constraint " + cid +
-                            " (" + ctype + ")";
-        return rec;
+        const std::string ctype = cons_by_id.contains(cid)
+                                      ? cons_by_id[cid].value("type", std::string("?"))
+                                      : std::string("?");
+        const auto trial = removal_trial(cid);
+        const bool redundant_kind = std::string(kind) == "redundant";
+        const bool safe = redundant_kind && trial.second && trial.first == 0;
+        const json partners = partner_ids(cid);
+        std::string partner_text;
+        for (const json& partner : partners)
+            partner_text += (partner_text.empty() ? "" : ", ") + constraint_label(partner.get<std::string>());
+        std::string suggestion;
+        if (safe) suggestion = "remove redundant constraint " + cid + " (" + ctype + ")";
+        else if (!partners.empty())
+            suggestion = std::string(redundant_kind ? "duplicates " : "cannot hold together with ") +
+                         partner_text + "; keep one: delete or change " + constraint_label(cid) +
+                         " or the partner(s)";
+        else suggestion = "inspect constraint " + cid + " (" + ctype + ")";
+        json row = {{"id", cid}, {"type", ctype}, {"removal_checked", trial.second},
+                    {"removal_preserves_dof_and_geometry", safe}, {"suggestion", suggestion}};
+        if (redundant_kind) {
+            row["redundant_with"] = partners;
+        } else {
+            row["conflicts_with"] = partners;
+            json set = json::array({constraint_brief(cid)});
+            for (const json& partner : partners) set.push_back(constraint_brief(partner.get<std::string>()));
+            row["conflict_set"] = std::move(set);
+        }
+        return row;
     };
     json redundant = json::array();
     for (const std::string& cid : sol.redundant) redundant.push_back(tag_finding(cid, "redundant"));
     json conflicting = json::array();
     for (const std::string& cid : sol.conflicting) conflicting.push_back(tag_finding(cid, "conflicting"));
+    json partial_dependencies = json::array();
+    if (sol.converged && sol.conflicting.empty()) {
+        for (const auto& [cid, rank_lost] : sol.partial_dependencies) {
+            if (!cons_by_id.contains(cid)) continue;
+            partial_dependencies.push_back({
+                {"id", cid}, {"type", cons_by_id[cid].value("type", std::string("?"))},
+                {"dof_added_by_removal", rank_lost},
+                {"finding", "partially dependent at the solved geometry; deleting the whole constraint adds DOF"}});
+        }
+    }
 
     // ---- overall verdict ----------------------------------------------------
     std::string status = overall_status(statuses, sol.dof, sol.conflicting, sol.redundant,
                                         cons_by_id);
 
-    // ---- constraint schedule (heuristic: geometric first, then driving dims) --
-    // Order the free DOFs into a suggested closing sequence. We do NOT fabricate exact
-    // constraints; we phrase actionable steps a driver can turn into add_constraint /
-    // sketch_set_dim calls. Geometric relations (coincident endpoints from the open
-    // chains) precede dimensions, matching how a person constrains a sketch.
-    json schedule = json::array();
+    // ---- hints (suggestions, not an ordered plan) -----------------------------
+    // One suggestion per open chain and per under-constrained entity: relations that would
+    // close the chain, and the entities whose free parameters need a relation or a driving
+    // dimension. Nothing here is a computed constraint; the order is only the order found.
+    json hints = json::array();
     // Step group 1: close open chains via coincident (from the closure gap endpoints).
-    if (closure.contains("open_endpoints") && closure["open_endpoints"].is_array() &&
+    if (needs_closed && closure.contains("open_endpoints") && closure["open_endpoints"].is_array() &&
         !closure["open_endpoints"].empty()) {
         json step;
         step["order"] = 1;
@@ -18868,7 +26351,7 @@ json doc_sketch_health(const std::string& doc_id, const std::string& sketch_fid)
         step["action"] = "coincident";
         step["why"] = "close the open profile chain at the dangling endpoints";
         step["handles"] = closure["open_endpoints"];
-        schedule.push_back(step);
+        hints.push_back(step);
     }
     // Step group 2: pin remaining geometric freedoms (per free variable, grouped).
     int order = 2;
@@ -18882,7 +26365,7 @@ json doc_sketch_health(const std::string& doc_id, const std::string& sketch_fid)
         for (size_t i = 0; i < ps.size(); ++i) { if (i) why += ", "; why += ps[i]; }
         step["why"] = why;
         step["entity"] = eid;
-        schedule.push_back(step);
+        hints.push_back(step);
     }
 
     // ---- advisory/1 emittable items -----------------------------------------
@@ -18894,37 +26377,55 @@ json doc_sketch_health(const std::string& doc_id, const std::string& sketch_fid)
     int adv = 0;
     auto adv_id = [&]() { return std::string("adv_skh_") + std::to_string(adv++); };
     for (const json& cf : conflicting) {
+        const std::string cid = cf.value("id", "?");
+        std::string finding = "constraint " + constraint_label(cid);
+        if (!cf["conflicts_with"].empty()) {
+            finding += " conflicts with ";
+            for (std::size_t k = 0; k < cf["conflicts_with"].size(); ++k)
+                finding += std::string(k ? ", " : "") + constraint_label(cf["conflicts_with"][k].get<std::string>());
+        } else {
+            finding += " conflicts";
+        }
+        finding += " — the sketch cannot solve";
         advisory.push_back({
             {"schema", "aicad.advisory/1"}, {"id", adv_id()}, {"stage", "sketch"},
             {"severity", "blocker"}, {"check", "sketch_conflict"},
-            {"finding", std::string("constraint ") + cf.value("id", "?") + " (" +
-                        cf.value("type", "?") + ") conflicts — the sketch cannot solve"},
+            {"finding", finding},
             {"refs", {{"doc_id", doc_id}, {"sketch", sketch_fid},
-                      {"constraints", json::array({cf.value("id", "?")})}}},
+                      {"constraints", cf["conflict_set"].empty() ? json::array({cid}) : [&] {
+                          json ids = json::array();
+                          for (const json& row : cf["conflict_set"]) ids.push_back(row["id"]);
+                          return ids;
+                      }()}}},
             {"candidate_fixes", json::array({{
-                {"action", "delete_constraint"},
-                {"params", {{"id", cf.value("id", "?")}}},
-                {"basis", "removing the over-defining constraint restores a solvable system"},
-                {"predicted_effect", "sketch solves; DOF returns to >= 0"},
-                {"confidence", "kernel"}}})},
-            {"source", {{"kind", "kernel"}, {"detail", "System::analyze conflicting_tags"}}}});
+                {"action", "inspect_constraint"},
+                {"params", {{"id", cid}, {"conflicts_with", cf["conflicts_with"]}}},
+                {"basis", "the solver reported a conflicting residual; the listed constraints are the minimal dependent set"},
+                {"predicted_effect", "delete or change ONE constraint of the set to resolve the conflict"},
+                {"confidence", cf["conflicts_with"].empty() ? "heuristic" : "kernel"}}})},
+            {"source", {{"kind", "kernel"}, {"detail", "System::analyze conflicting_tags + dependency_partners"}}}});
     }
     if (closure.contains("open_endpoints") && closure["open_endpoints"].is_array() &&
         !closure["open_endpoints"].empty()) {
+        json fixes = json::array();
+        if (needs_closed) fixes.push_back({
+            {"action", "sketch_auto_constrain"},
+            {"params", {{"sketch", sketch_fid}, {"apply", true}}},
+            {"basis", "touching endpoints within tolerance can be auto-coincident"},
+            {"predicted_effect", "nearby endpoints may be joined; inspect remaining gaps"},
+            {"confidence", "heuristic"}});
+        const std::string explanation = needs_closed
+            ? " — an authored consumer requires a closed profile"
+            : open_path ? " — an open path is valid for its authored consumer"
+                        : " — closure is required only if a future consumer needs a closed profile";
         advisory.push_back({
             {"schema", "aicad.advisory/1"}, {"id", adv_id()}, {"stage", "sketch"},
-            {"severity", "action"}, {"check", "sketch_open_profile"},
-            {"finding", std::string("open profile: ") +
-                        std::to_string(closure["open_endpoints"].size()) +
-                        " endpoint(s) not joined — the loop will not close for extrude"},
+            {"severity", needs_closed ? "action" : "info"}, {"check", "sketch_open_profile"},
+            {"finding", std::to_string(closure["open_endpoints"].size()) +
+                        " endpoint(s) not joined" + explanation},
             {"refs", {{"doc_id", doc_id}, {"sketch", sketch_fid},
                       {"handles", closure["open_endpoints"]}}},
-            {"candidate_fixes", json::array({{
-                {"action", "sketch_auto_constrain"},
-                {"params", {{"sketch", sketch_fid}, {"apply", true}}},
-                {"basis", "touching endpoints within tolerance can be auto-coincident"},
-                {"predicted_effect", "dangling endpoints pinned; chains close"},
-                {"confidence", "heuristic"}}})},
+            {"candidate_fixes", std::move(fixes)},
             {"source", {{"kind", "kernel"}, {"detail", "closure_summary loop endpoints"}}}});
     }
     if (sol.dof > 0 && !free_vars.empty()) {
@@ -18936,34 +26437,87 @@ json doc_sketch_health(const std::string& doc_id, const std::string& sketch_fid)
             {"refs", {{"doc_id", doc_id}, {"sketch", sketch_fid}}},
             {"numbers", {{"dof", sol.dof}}},
             {"candidate_fixes", json::array({{
-                {"action", "apply_constraint_schedule"},
-                {"params", {{"schedule", schedule}}},
-                {"basis", "geometric relations first, then driving dimensions, per DOF"},
+                {"action", "add_relations_then_dimensions"},
+                {"params", {{"hints", hints}}},
+                {"basis", "geometric relations first, then critical driving dimensions, per DOF"},
                 {"predicted_effect", "dof -> 0 (fully constrained)"},
                 {"confidence", "heuristic"}}})},
             {"source", {{"kind", "kernel"}, {"detail", "System::analyze dof + SVD null-space"}}}});
     }
     for (const json& rf : redundant) {
+        const bool safe = rf.value("removal_preserves_dof_and_geometry", false);
+        json fixes = json::array();
+        if (safe) fixes.push_back({
+            {"action", "delete_constraint"}, {"params", {{"id", rf.value("id", "?")}}},
+            {"basis", "whole-relation removal preserved rank, DOF and solved geometry in a trial"},
+            {"predicted_effect", "same DOF and geometry at the tested solution"},
+            {"confidence", "kernel"}});
         advisory.push_back({
             {"schema", "aicad.advisory/1"}, {"id", adv_id()}, {"stage", "sketch"},
-            {"severity", "hint"}, {"check", "sketch_redundant"},
-            {"finding", std::string("redundant constraint ") + rf.value("id", "?") + " (" +
-                        rf.value("type", "?") + ") adds no new information"},
+            {"severity", safe ? "hint" : "info"}, {"check", "sketch_redundant"},
+            {"finding", std::string("constraint ") + rf.value("id", "?") +
+                        (safe ? " is redundant at the solved geometry"
+                              : " has dependent rows; whole-removal safety is unconfirmed")},
             {"refs", {{"doc_id", doc_id}, {"sketch", sketch_fid},
                       {"constraints", json::array({rf.value("id", "?")})}}},
+            {"candidate_fixes", std::move(fixes)},
+            {"source", {{"kind", "kernel"}, {"detail", "whole-constraint rank and removal trial"}}}});
+    }
+    for (const json& partial : partial_dependencies) {
+        advisory.push_back({
+            {"schema", "aicad.advisory/1"}, {"id", adv_id()}, {"stage", "sketch"},
+            {"severity", "info"}, {"check", "sketch_partial_dependency"},
+            {"finding", partial["finding"]},
+            {"refs", {{"doc_id", doc_id}, {"sketch", sketch_fid},
+                      {"constraints", json::array({partial["id"]})}}},
+            {"candidate_fixes", json::array()},
+            {"source", {{"kind", "kernel"}, {"detail", "whole-constraint Jacobian rank removal"}}}});
+    }
+    if (!sol.skipped.empty()) {
+        json ids = json::array();
+        for (const auto& skipped : sol.skipped) ids.push_back(skipped.first);
+        advisory.push_back({
+            {"schema", "aicad.advisory/1"}, {"id", adv_id()}, {"stage", "sketch"},
+            {"severity", "action"}, {"check", "sketch_skipped_constraints"},
+            {"finding", std::to_string(sol.skipped.size()) +
+                        " constraint(s) are skipped and do NOT constrain the sketch (first: " +
+                        sol.skipped.front().first + " — " + sol.skipped.front().second + ")"},
+            {"refs", {{"doc_id", doc_id}, {"sketch", sketch_fid}, {"constraints", ids}}},
             {"candidate_fixes", json::array({{
-                {"action", "delete_constraint"},
-                {"params", {{"id", rf.value("id", "?")}}},
-                {"basis", "the relation is already implied by other constraints"},
-                {"predicted_effect", "no geometry change; a cleaner constraint set"},
+                {"action", "fix_or_delete_constraint"},
+                {"params", {{"ids", ids}}},
+                {"basis", "the solver could not register these constraints (see skipped_constraints[].reason)"},
+                {"predicted_effect", "dof then reflects every constraint you intended"},
                 {"confidence", "kernel"}}})},
-            {"source", {{"kind", "kernel"}, {"detail", "System::analyze redundant_tags"}}}});
+            {"source", {{"kind", "kernel"}, {"detail", "solve_sketch skipped constraints"}}}});
+    }
+    if (!sol.converged && sol.conflicting.empty()) {
+        advisory.push_back({
+            {"schema", "aicad.advisory/1"}, {"id", adv_id()}, {"stage", "sketch"},
+            {"severity", "blocker"}, {"check", "sketch_not_converged"},
+            {"finding", "the solver did not converge: no position satisfies every constraint"},
+            {"refs", {{"doc_id", doc_id}, {"sketch", sketch_fid}}},
+            {"candidate_fixes", json::array({{
+                {"action", "probe_constraints"},
+                {"params", {{"sketch", sketch_fid}}},
+                {"basis", "use sketch_probe to test deleting suspect dimensions one at a time"},
+                {"predicted_effect", "identifies the constraint whose removal restores convergence"},
+                {"confidence", "heuristic"}}})},
+            {"source", {{"kind", "kernel"}, {"detail", "solve_sketch converged=false"}}}});
     }
     if (advisory.empty()) {
+        // The "fully constrained" claim needs a converged solve, no skipped constraint and at
+        // least one entity; an empty sketch or an unconverged one has nothing to certify.
+        const bool clean = sol.converged && sol.skipped.empty() && !sk["entities"].empty() &&
+                           status == "full";
         advisory.push_back({
             {"schema", "aicad.advisory/1"}, {"id", adv_id()}, {"stage", "sketch"},
             {"severity", "info"}, {"check", "sketch_health"},
-            {"finding", "sketch is fully constrained and closed"},
+            {"finding", clean ? std::string("sketch is fully constrained and closed")
+                              : sk["entities"].empty()
+                                    ? std::string("sketch has no entities")
+                                    : "no finding to report; status=" + status + ", dof=" +
+                                          std::to_string(sol.dof)},
             {"refs", {{"doc_id", doc_id}, {"sketch", sketch_fid}}},
             {"candidate_fixes", json::array()},
             {"source", {{"kind", "kernel"}, {"detail", "System::analyze"}}}});
@@ -18972,17 +26526,25 @@ json doc_sketch_health(const std::string& doc_id, const std::string& sketch_fid)
     json out;
     out["ok"] = true;
     out["sketch"] = sketch_fid;
+    out["revision"] = s.revision;
     out["status"] = status;
     out["dof"] = sol.dof;
     out["converged"] = sol.converged;
+    if (!sol.converged)
+        out["nonconvergence_reason"] = chudware::sketch::nonconvergence_reason(sk, sol);
     out["skipped_constraints"] = skipped_constraints_json(sol.skipped, sk["constraints"]);
+    out["angle_links"] = json::array();
+    for (const json& c : sk["constraints"])
+        if (c.contains("angle_ref"))
+            out["angle_links"].push_back({{"id", c.value("id", std::string())}, {"angle_ref", c["angle_ref"]}});
     out["closure"] = closure;
     out["dof_narration"] = dof_narration;
     out["free_variables"] = free_vars;
     out["statuses"] = statuses;
     out["redundant"] = redundant;
+    out["partial_dependencies"] = partial_dependencies;
     out["conflicting"] = conflicting;
-    out["schedule"] = schedule;
+    out["hints"] = hints;
     out["advisory"] = advisory;
     // Associative Convert Entities status: one row per external ref, so a driver
     // (or the PM panel) sees which converted geometry is live vs stale (source no longer
@@ -19043,25 +26605,106 @@ std::pair<Eigen::Vector2d, Eigen::Vector2d> plane_plane_line_uv(
 // ref shape, no solid bodies (for face/edge refs), or a datum parallel to the sketch plane.
 void prepare_external_projection_cache(ExternalProjectionCache& context,
                                        const CompileResult& compiled) {
-    bool same = context.shapes.size() == compiled.shapes.size();
+    bool same = context.shapes.size() == compiled.shapes.size() &&
+                context.owner_map == compiled.owner_map;
     for (std::size_t i = 0; same && i < compiled.shapes.size(); ++i)
         same = context.shapes[i].IsEqual(compiled.shapes[i]);
     if (same) return;
     context = ExternalProjectionCache{};
     context.shapes = compiled.shapes;
+    context.owner_map = compiled.owner_map;
+}
+
+// The owner map uses per-body, 1-based unique topology indices, whereas projection
+// resolves on a compound. Join by shape identity rather than assuming those enumerations
+// have the same offsets (in particular, edges occur more than once in an explorer).
+std::vector<std::optional<std::string>> external_projection_owners(
+    const CompileResult& compiled, TopAbs_ShapeEnum kind,
+    const TopTools_IndexedMapOfShape& combined) {
+    std::vector<std::optional<std::string>> owners(combined.Extent() + 1);
+    std::vector<bool> conflicting(combined.Extent() + 1, false);
+    if (!compiled.owner_map.is_object()) return owners;
+    std::vector<TopTools_IndexedMapOfShape> per_body(compiled.shapes.size());
+    for (std::size_t i = 0; i < compiled.shapes.size(); ++i)
+        TopExp::MapShapes(compiled.shapes[i], kind, per_body[i]);
+    const char* key = kind == TopAbs_FACE ? "faces" : "edges";
+    for (auto it = compiled.owner_map.begin(); it != compiled.owner_map.end(); ++it) {
+        const auto rows = it.value().find(key);
+        if (rows == it.value().end() || !rows->is_array()) continue;
+        for (const json& pair : *rows) {
+            if (!pair.is_array() || pair.size() != 2 ||
+                !pair[0].is_number_integer() || !pair[1].is_number_integer()) continue;
+            const int body = pair[0].get<int>(), topo = pair[1].get<int>();
+            if (body < 1 || static_cast<std::size_t>(body) > per_body.size() ||
+                topo < 1 || topo > per_body[body - 1].Extent()) continue;
+            const int index = combined.FindIndex(per_body[body - 1].FindKey(topo));
+            if (!index || conflicting[index]) continue;
+            if (owners[index] && *owners[index] != it.key()) {
+                owners[index].reset();
+                conflicting[index] = true;
+            } else {
+                owners[index] = it.key();
+            }
+        }
+    }
+    return owners;
 }
 
 chudware::geom::SketchPlane cached_external_sketch_plane(
     const json& doc, const json& feature, const CompileResult& compiled,
     ExternalProjectionCache& context) {
     prepare_external_projection_cache(context, compiled);
-    const json key{{"refs", feature.value("refs", json::object())},
-                   {"plane", feature.value("plane", json())},
-                   {"offset", sketch_plane_offset(doc, feature)}, {"datums", compiled.datums}};
-    auto found = context.planes.find(feature.value("id", std::string()));
+    const std::string fid = feature.value("id", std::string());
+    json saved_frame;
+    for (const FeatureStatus& status : compiled.statuses) {
+        if (status.id != fid) continue;
+        if (!status.ok)
+            throw OpError("sketch_plane_unavailable", "sketch did not compile: " + status.error,
+                          {{"sketch", fid}});
+        if (status.data.is_object() && status.data.contains("sketch_plane"))
+            saved_frame = status.data["sketch_plane"];
+        break;
+    }
+    json key{{"refs", feature.value("refs", json::object())},
+             {"plane", feature.value("plane", json())},
+             {"offset", sketch_plane_offset(doc, feature)}, {"datums", compiled.datums},
+             {"saved_frame", saved_frame}};
+    // Old persisted checkpoints lack a frame. Include the authored history in
+    // the memo key so a changed upstream plane cannot reuse a stale result.
+    if (saved_frame.is_null()) key["history"] = doc.value("features", json::array());
+    auto found = context.planes.find(fid);
     if (found != context.planes.end() && found->second.first == key) return found->second.second;
-    const auto plane = resolve_sketch_plane_doc(doc, feature, &compiled);
-    context.planes.insert_or_assign(feature.value("id", std::string()), std::make_pair(key, plane));
+    chudware::geom::SketchPlane plane;
+    if (saved_frame.is_object()) {
+        auto v3 = [&](const char* k) {
+            const json& v = saved_frame.at(k);
+            if (!v.is_array() || v.size() != 3 || !v[0].is_number() ||
+                !v[1].is_number() || !v[2].is_number())
+                throw OpError("sketch_plane_unavailable", "cached sketch frame is malformed");
+            return Eigen::Vector3d(v[0].get<double>(), v[1].get<double>(), v[2].get<double>());
+        };
+        plane.origin = v3("origin");
+        plane.uAxis = v3("x_dir");
+        plane.vAxis = v3("y_dir");
+        plane.normal = v3("normal");
+    } else {
+        json prefix = doc;
+        json before = json::array();
+        bool found_feature = false;
+        for (const json& f : doc.value("features", json::array())) {
+            if (f.value("id", std::string()) == fid) { found_feature = true; break; }
+            before.push_back(f);
+        }
+        if (!found_feature)
+            throw OpError("sketch_plane_unavailable", "sketch is not present in feature history");
+        prefix["features"] = std::move(before);
+        prefix.erase("rollback_after");
+        const CompileResult pre = compile_document(prefix, env_from_doc(prefix));
+        if (!pre.ok)
+            throw OpError("sketch_plane_unavailable", "features before sketch did not compile");
+        plane = resolve_sketch_plane_doc(doc, feature, &pre);
+    }
+    context.planes.insert_or_assign(fid, std::make_pair(std::move(key), plane));
     return plane;
 }
 
@@ -19218,7 +26861,17 @@ json project_external_refs(const json& doc, const chudware::geom::SketchPlane& p
                                {{"reason", "dangling external ref"}});
             };
             if (k == "face") {
-                if (!context.faces) context.faces = describe_faces(body);
+                if (!context.faces) {
+                    context.faces = describe_faces(body);
+                    TopTools_IndexedMapOfShape face_map;
+                    TopExp::MapShapes(body, TopAbs_FACE, face_map);
+                    const auto owners = external_projection_owners(r, TopAbs_FACE, face_map);
+                    int idx = 0;
+                    for (TopExp_Explorer ex(body, TopAbs_FACE); ex.More(); ex.Next(), ++idx) {
+                        const int mapped = face_map.FindIndex(ex.Current());
+                        if (mapped) (*context.faces)[idx].owner = owners[mapped];
+                    }
+                }
                 ResolveResult rr = resolve(s, *context.faces, diag);
                 if (!rr.index.has_value()) throw dangle(rr);
                 int idx = 0;
@@ -19246,11 +26899,34 @@ json project_external_refs(const json& doc, const chudware::geom::SketchPlane& p
                     TopExp::MapShapes(body, TopAbs_EDGE, context.edge_map);
                     context.edges.emplace();
                     context.edges->reserve(context.edge_map.Extent());
-                    for (int i = 1; i <= context.edge_map.Extent(); ++i)
-                        context.edges->push_back(edge_info(
-                            TopoDS::Edge(context.edge_map.FindKey(i)), i - 1));
+                    const auto owners = external_projection_owners(r, TopAbs_EDGE, context.edge_map);
+                    for (int i = 1; i <= context.edge_map.Extent(); ++i) {
+                        TopoInfo info = edge_info(TopoDS::Edge(context.edge_map.FindKey(i)), i - 1);
+                        info.owner = owners[i];
+                        context.edges->push_back(std::move(info));
+                    }
                 }
                 ResolveResult rr = resolve(s, *context.edges, diag);
+                // A fixed absolute score margin can misclassify a clearly nearest
+                // parallel edge as symmetric when the body diagonal is large. For
+                // this unique-edge enumeration, allow its stable topology hint to
+                // corroborate (never override) a substantially better same-owner
+                // candidate. Equal or near-equal scores remain dangling.
+                if (!rr.index && !rr.owner_fallback && rr.score < 0.35 &&
+                    rr.second_score - rr.score > 0.01 &&
+                    rr.second_score > rr.score * 1.25 &&
+                    s.contains("owner_feature") && s["owner_feature"].is_string() &&
+                    s.contains("hint_index") && s["hint_index"].is_number_integer()) {
+                    const int hint = s["hint_index"].get<int>();
+                    if (hint >= 0 && hint < static_cast<int>(context.edges->size())) {
+                        const TopoInfo& candidate = (*context.edges)[hint];
+                        if (candidate.owner && *candidate.owner == s["owner_feature"].get<std::string>() &&
+                            std::abs(score_candidate(s, candidate, diag) - rr.score) < 1e-9) {
+                            rr.index = candidate.index;
+                            record_rebind(s, candidate, rr.score, rr.second_score, false);
+                        }
+                    }
+                }
                 if (!rr.index.has_value()) throw dangle(rr);
                 if (*rr.index >= 0 && *rr.index < context.edge_map.Extent())
                     return context.edge_map.FindKey(*rr.index + 1);
@@ -19273,10 +26949,10 @@ json project_external_refs(const json& doc, const chudware::geom::SketchPlane& p
             TopoDS_Shape sub = resolve_sub(sel, "edge");
             TopoDS_Edge edge = TopoDS::Edge(sub);
             if (ref.value("mode", std::string()) == "pierce") {
-                std::optional<Eigen::Vector2d> near;
+                std::optional<Eigen::Vector2d> preferred_point;
                 if (ref.contains("near") && ref["near"].is_array() && ref["near"].size() == 2)
-                    near = Eigen::Vector2d(ref["near"][0].get<double>(), ref["near"][1].get<double>());
-                const auto point = pierce_edge_to_plane(edge, plane, near);
+                    preferred_point = Eigen::Vector2d(ref["near"][0].get<double>(), ref["near"][1].get<double>());
+                const auto point = pierce_edge_to_plane(edge, plane, preferred_point);
                 if (!point)
                     throw OpError("convert_failed", "no_pierce: edge has no plane crossing",
                                   {{"reason", "no plane crossing"}});
@@ -19435,6 +27111,7 @@ void refresh_sketch_external_refs(json& doc, CompileCache* cache,
     // (passed as `&pre`). Projection resolves over all surviving bodies, matching
     // doc_query's selector domain. Use the session's incremental cache when supplied.
     CompileResult pre = compile_document(doc, env_from_doc(doc), cache, quality);
+    if (!pre.ok) return;  // never re-project onto incomplete intermediate tool solids
     ExternalProjectionCache local;
     if (!context) context = &local;
     prepare_external_projection_cache(*context, pre);
@@ -19544,6 +27221,7 @@ void refresh_sketch3d_external_refs(json& doc, CompileCache* cache,
     if (!any) return;
 
     CompileResult pre = compile_document(doc, env_from_doc(doc), cache, quality);
+    if (!pre.ok) return;  // retain the last-good external points on a failed history
     if (pre.shapes.empty()) {
         // No body yet (e.g. sketch3d is the very first feature) — every vertex ref
         // goes stale, kept at its last-good point.
@@ -19662,6 +27340,11 @@ struct DepEntry {
 
 // Outer key: source_doc_id. Value: all dependents registered against it.
 static std::map<std::string, std::vector<DepEntry>> g_dep_registry;
+
+bool history_registered_consumer_locked(const std::string& source_id) {
+    const auto it = g_dep_registry.find(source_id);
+    return it != g_dep_registry.end() && !it->second.empty();
+}
 
 }  // namespace
 
@@ -19835,14 +27518,19 @@ json build_motion_dynamics(
         for (const json& c : assembly_doc["components"])
             fixed_of[c.value("id", std::string())] = c.value("fixed", false);
 
-    double def_dens = 7.85;
+    // Density per component, most specific first: masses[cid] (the mass wins and the density is
+    // derived from it) > densities[cid] > the material applied to the component's source part
+    // at its registry density > default_density_g_cm3 (caller-given for components without
+    // a resolvable material). Never silently substitute an arbitrary material.
+    std::optional<double> caller_default_density;
     if (opts.contains("default_density_g_cm3")) {
         if (!opts["default_density_g_cm3"].is_number())
             motion_invalid("default_density_g_cm3 must be numeric");
-        def_dens = opts["default_density_g_cm3"].get<double>();
+        const double given = opts["default_density_g_cm3"].get<double>();
+        if (!std::isfinite(given) || given <= 0.0)
+            motion_invalid("default_density_g_cm3 must be finite and > 0");
+        caller_default_density = given;
     }
-    if (!std::isfinite(def_dens) || def_dens <= 0.0)
-        motion_invalid("default_density_g_cm3 must be finite and > 0");
 
     json densities = json::object();
     json masses = json::object();
@@ -19886,12 +27574,51 @@ json build_motion_dynamics(
         const double vol_mm3 = vp.Mass();
         if (!std::isfinite(vol_mm3) || vol_mm3 <= 0.0)
             motion_invalid("component '" + cid + "' has no positive solid volume");
-        double density_g_mm3 =
-            (densities.contains(cid) ? densities[cid].get<double>() : def_dens) * 1e-3;
-        double mass_kg = vol_mm3 * density_g_mm3 * 1e-3;
+        double density_g_mm3 = 0.0;
+        double mass_kg = 0.0;
+        std::string density_source;
+        std::string material_key;
         if (masses.contains(cid)) {
             mass_kg = masses[cid].get<double>();
             density_g_mm3 = mass_kg * 1e3 / vol_mm3;
+            density_source = "masses";
+        } else {
+            double density_g_cm3 = 0.0;
+            if (densities.contains(cid)) {
+                density_g_cm3 = densities[cid].get<double>();
+                density_source = "densities";
+            } else {
+                const std::set<std::string> keys(body.body_material_keys.begin(),
+                                                 body.body_material_keys.end());
+                if (keys.size() > 1)
+                    motion_invalid("component '" + cid + "' mixes materials in its source "
+                                   "bodies, so one density cannot give its inertia. Give "
+                                   "densities['" + cid + "'] (g/cm^3) or masses['" + cid +
+                                   "'] (kg)");
+                material_key = keys.empty() ? std::string() : *keys.begin();
+                std::optional<double> material_density;
+                if (!material_key.empty()) {
+                    const json d = ::chudware::materials::density(material_key);
+                    if (d.is_number() && std::isfinite(d.get<double>()) && d.get<double>() > 0.0)
+                        material_density = d.get<double>();
+                }
+                if (material_density) {
+                    density_g_cm3 = *material_density;
+                    density_source = "component_material";
+                } else if (caller_default_density) {
+                    density_g_cm3 = *caller_default_density;
+                    density_source = "default_density_g_cm3";
+                } else {
+                    motion_invalid("component '" + cid + "' has " +
+                        (material_key.empty()
+                             ? std::string("no applied material")
+                             : "material '" + material_key + "' with no registry density") +
+                        "; assign a material or pass densities['" + cid +
+                        "'], masses['" + cid + "'] or default_density_g_cm3");
+                }
+            }
+            density_g_mm3 = density_g_cm3 * 1e-3;
+            mass_kg = vol_mm3 * density_g_mm3 * 1e-3;
         }
         if (!std::isfinite(mass_kg) || mass_kg <= 0.0)
             motion_invalid("component '" + cid + "' mass must be finite and > 0 kg");
@@ -19931,6 +27658,9 @@ json build_motion_dynamics(
                             {"mass_kg", mass_kg},
                             {"volume_mm3", vol_mm3},
                             {"density_g_cm3", density_g_mm3 * 1e3},
+                            {"density_source", density_source},
+                            {"material_key", material_key.empty() ? json(nullptr)
+                                                                  : json(material_key)},
                             {"com_local_mm", {com.X(), com.Y(), com.Z()}},
                             {"inertia_com_kg_m2", inertia_j},
                             {"fixed", fixed}});
@@ -20706,7 +28436,8 @@ json doc_simulate_motion(const std::string& doc_id,
                     {"reason", status.error.value_or("component_build_failed")}});
             }
         for (const AsmMateStatus& status : solved.mate_status)
-            if (status.status == "unresolved" || status.status == "conflicting") {
+            if (status.status == "unresolved" || status.status == "conflicting" ||
+                status.status == "unsatisfied") {
                 converged = false;
                 issues.push_back("mate '" + status.id + "' is " + status.status);
             }
@@ -20825,7 +28556,17 @@ json doc_simulate_motion(const std::string& doc_id,
             }
             json report = interference_report(members, false, min_clearance_mm, false,
                                               component_ids, false, true, &interference_cache);
-            const bool complete = report.value("complete", false);
+            // The tolerance band is not a proven pass or violation. Preserve its
+            // measured pair evidence and prevent motion from reporting a clear
+            // sweep merely because the warning is not a definite collision.
+            for (const json& pair : report["clearances"]) {
+                if (pair.value("clearance_status", std::string()) != "within_tolerance")
+                    continue;
+                json uncertain = pair;
+                uncertain["reason"] = "clearance_within_tolerance";
+                report["pair_failures"].push_back(std::move(uncertain));
+            }
+            const bool complete = report.value("complete", false) && report["pair_failures"].empty();
             if (complete) ++frames_checked;
             frame["interference_complete"] = complete;
             frame["pairs_checked"] = report["pairs_checked"];
@@ -21033,17 +28774,30 @@ json doc_sketch3d_health(const std::string& doc_id, const std::string& sketch_fi
     if (!sol.conflicting.empty() || !sol.converged) status = "over";
     else if (sol.dof == 0) status = "full";
 
-    return json{{"ok", true},
-                {"status", status},
-                {"dof", sol.dof},
-                {"converged", sol.converged},
-                {"skipped_constraints", skipped_constraints_json(sol.skipped, sk["constraints"])},
-                {"statuses", statuses},
-                {"redundant", redundant},
-                {"conflicting", conflicting},
-                {"free", free_vars},
-                {"entities", sketch3d_entity_array(sol.entities, sk)},
-                {"wires", wires}};
+    // Which independent constraints each conflicting constraint contradicts.
+    json conflicts_with = json::object();
+    for (const auto& entry : sol.dependency_partners) {
+        if (std::find(sol.conflicting.begin(), sol.conflicting.end(), entry.first) ==
+            sol.conflicting.end())
+            continue;
+        conflicts_with[entry.first] = entry.second;
+    }
+
+    json out = json{{"ok", true},
+                    {"status", status},
+                    {"dof", sol.dof},
+                    {"converged", sol.converged},
+                    {"skipped_constraints", skipped_constraints_json(sol.skipped, sk["constraints"])},
+                    {"statuses", statuses},
+                    {"redundant", redundant},
+                    {"conflicting", conflicting},
+                    {"conflicts_with", conflicts_with},
+                    {"free", free_vars},
+                    {"entities", sketch3d_entity_array(sol.entities, sk)},
+                    {"wires", wires}};
+    // The same text the compile error carries; present only when the solve failed.
+    if (!sol.converged) out["nonconvergence_reason"] = chudware::sketch3d::nonconvergence_reason(sk, sol);
+    return out;
 }
 
 json doc_sketch3d_drag(const std::string& doc_id, const std::string& sketch_fid,

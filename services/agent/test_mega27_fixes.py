@@ -23,79 +23,22 @@ Schemas checked (no invented knobs):
 """
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
 import pytest
 
-_ROOT = Path(__file__).resolve().parents[2]
-_MEGA26 = _ROOT / "reports/runs/mega-26"
-_MEGA26_AC4 = _MEGA26 / "criterion_AC4.json"
-_MEGA26_LEDGER = _MEGA26 / "ledger.json"
-
-
-def _load_json(path: Path) -> dict:
-    if not path.is_file():
-        pytest.skip(f"fixture missing: {path}")
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
 def _ledger_ecad_calls() -> list[dict]:
-    data = _load_json(_MEGA26_LEDGER)
-    events = data if isinstance(data, list) else data.get("events") or []
-    out: list[dict] = []
-    for ev in events:
-        if not isinstance(ev, dict):
-            continue
-        if ev.get("event") not in (None, "tool_call") and "tool" not in ev:
-            # ledger rows may be bare tool_call records
-            if "tool" not in ev:
-                continue
-        tool = ev.get("tool")
-        if not tool:
-            continue
-        rec = {
-            "tool": tool,
-            "ok": bool(ev.get("ok", True)),
-            "args": ev.get("args") if isinstance(ev.get("args"), dict) else {},
-            "result": ev.get("result"),
-            "forced": bool(ev.get("forced")),
-            "force_reason": ev.get("force_reason"),
-        }
-        out.append(rec)
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Live fingerprints (mega-26 residual)
-# ---------------------------------------------------------------------------
-
-
-def test_mega26_ac4_fingerprint_clearance_still_dirty():
-    """D27 fixture: DRC clearance residual after B26 retry (errors≈23)."""
-    ac4 = _load_json(_MEGA26_AC4)
-    assert ac4.get("result") == "FAIL"
-    ev = ac4.get("evidence") or {}
-    drc = ev.get("drc") or ev.get("ecad_run_drc") or {}
-    errors = int(drc.get("errors") or 0)
-    assert errors >= 20, errors
-    assert "clearance" in str(drc.get("verdict") or "").lower() or errors > 0
-
-
-def test_mega26_ledger_board_had_no_outline_size_args():
-    """C27 fixture: mega-26 forced board_from_schematic lacked board_size."""
-    calls = _ledger_ecad_calls()
-    boards = [
-        c for c in calls
-        if c.get("tool") == "board_from_schematic" and c.get("ok")
+    """Representative schematic calls immediately before board creation."""
+    return [
+        {"tool": "ecad_new_schematic", "ok": True, "result": {"doc_id": "sch_c27"}},
+        {"tool": "ecad_place_symbol", "ok": True,
+         "args": {"libid": "Device:R", "ref": "R1"}, "result": {"ref": "R1"}},
+        {"tool": "ecad_place_symbol", "ok": True,
+         "args": {"libid": "MCU:Generic_QFP48", "ref": "U1"}, "result": {"ref": "U1"}},
+        {"tool": "board_from_schematic", "ok": True, "result": {"doc_id": "board"}},
     ]
-    if not boards:
-        pytest.skip("no board_from_schematic in mega-26 ledger")
-    for b in boards:
-        args = b.get("args") or {}
-        # Pre-fix: no outline room knobs on the call record.
-        assert "board_size" not in args or not args.get("board_size")
-        assert not args.get("outline_area_mm2")
+
+
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +131,7 @@ def test_c27_forced_board_args_carry_outline_room():
 
 
 def test_c27_mega26_ledger_replay_gets_outline_args():
-    """Replay mega-26-style pre-board snap: forced board carries outline knobs."""
+    """A pre-board residual receives outline sizing knobs."""
     from services.agent.agent_turn import _ecad_forced_tool_args
 
     calls = _ledger_ecad_calls()
@@ -529,8 +472,10 @@ def test_b26_y25_s23_hold_sim_and_clearance_intent():
     assert drc.get("doc_id") == brd
 
 
-def test_board_flow_outline_knobs_accepted():
+def test_board_flow_outline_knobs_accepted(tmp_path, monkeypatch):
     """Engine-side: board_flow._ensure_outline honors board_size / margin."""
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
     # board_flow drives the C++-backed facade now (services.mcp.ecad_common).
     from services.mcp.ecad_common import ecad_session, schema
     from services.mcp import board_flow as bf

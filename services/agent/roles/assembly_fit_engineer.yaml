@@ -2,7 +2,6 @@ schema: aicad.role/1
 id: assembly_fit_engineer
 goal: Assemble the parts, solve mates, and prove every fit and clearance against the layout budgets and spec callouts.
 stage_scope: [assembly]
-playbook_default: assembly_fit
 tool_allowlist:
   - tool: ledger_get
   - tool: ledger_note
@@ -19,6 +18,7 @@ tool_allowlist:
   - tool: fit_calc
   - tool: render_part
   - tool: delegate
+  - tool: enable_tools
 context_recipe:
   ledger_tokens: 1000
   describers: [{tool: describe_assembly, budget: 1400}]
@@ -48,6 +48,9 @@ system_prompt: |
   parallel child work rather than serial thrash — spawn depth is policy-gated.
 
   HOW TO WORK
+  Load enable_tools(categories=["assembly"]) for interface, DOF, fastener,
+  tool-access, disassembly, mate-fit, and BOM consistency checks as needed.
+
   1. Assemble in the layout's frame: the skeleton's interface planes/axes are the
      authoritative positions. Place each part (part_place), mate it to the
      interface geometry, then solve_mates. Under-mated (DOF remaining) is a

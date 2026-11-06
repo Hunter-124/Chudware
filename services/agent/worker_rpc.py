@@ -11,7 +11,7 @@ below) in the persistent services worker that hostd's agent lane spawns
 - ``ai_roles_*`` — over :mod:`services.agent.role_models`
 - ``bench_*`` (Settings → Benchmarks) — gym CLI runner
 - ``office_extract`` (``OFFICE_METHODS``)
-- ``agent_admin_turn`` / ``agent_cancel`` / ``agent_steer``, the ``chudcode_*``
+- ``agent_admin_turn`` / ``agent_cancel`` / ``agent_steer``, the ``omp_*``
   auth/model/session/STT seams and ``memory_*`` (``ADMIN_METHODS``)
 - ``ai_prompt_*`` / ``ai_tool_*`` — prompt previews and the context-meter baseline
 
@@ -21,16 +21,18 @@ traceback. GUI degrades to hidden when an RPC reports ``unknown_method``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
 import os
 import signal
+import stat
 import subprocess
 import sys
 import threading
+import tempfile
 import time
-from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,9 +46,9 @@ from services.agent.online_turn import (
     resolve_model_and_effort,
     turn_budget_notice,
 )
-from services.agent.chudcode_host import get_default_chudcode_host
+from services.agent.omp_host import get_default_omp_host
 from services.agent.request_context import (
-    bind_roots, control_delegate, in_cell, mint_handle, require_handle, scoped_key,
+    actor_state_root, bind_roots, control_delegate, in_cell, mint_handle, require_handle, scoped_key,
 )
 
 
@@ -348,49 +350,63 @@ def _cell_refusal(value: Any) -> dict[str, Any] | None:
     return None
 
 
-def _online_manual_compaction_refusal(requested: str | None, configured: str) -> str | None:
-    """Why an online manual compaction cannot honour the requested strategy, if it can't.
+# Chudware Compaction strategy → Omp `/compact <mode>` for a manual compaction.
+# "auto" runs the session's own configured method order (no mode).
+_MANUAL_COMPACT_MODES = {"summary": "soft", "snapcompact": "snapcompact", "auto": None}
 
-    Chudcode's ``compact`` command has no per-call method: it runs the session process's
-    configured ``compaction.methodOrder``, which is the persisted Compaction setting
-    (``agent.compaction_strategy``), and its manual pass never runs ``shake``.
+
+def _online_manual_compaction(
+    requested: str | None, configured: str
+) -> tuple[str, str | None] | str:
+    """``(strategy, omp_mode)`` for one online manual compaction, or a refusal.
+
+    No argument runs the persisted Compaction setting; an explicit ``summary`` or
+    ``snapcompact`` runs that one method for this compaction only. Omp's manual
+    pass never runs ``shake``, and ``off`` has no method to run: both are refused
+    rather than compacting with a method the user did not choose.
     """
-    if requested is not None and requested != configured:
+    strategy = requested or configured
+    if strategy == "shake":
         return (
-            f"compaction_strategy_mismatch: this session compacts with the "
-            f"'{configured}' Compaction setting; set Compaction to '{requested}' in "
-            "Settings → AI to compact with it (applies from the next turn)"
+            "manual_shake_unavailable: Shake runs only as automatic compaction; "
+            "use /compact summary or /compact snapcompact"
         )
-    if configured == "shake":
+    if strategy == "off":
         return (
-            "manual_shake_unavailable: the agent service runs Shake only as automatic "
-            "compaction; a manual compaction needs Summary or Snapcompact"
+            "compaction_off: Compaction is Off in Settings → AI; "
+            "use /compact summary or /compact snapcompact"
         )
-    if configured == "off":
-        return "compaction_off: Compaction is Off in Settings → AI"
-    return None
+    if requested == "auto" or strategy not in _MANUAL_COMPACT_MODES:
+        return f"invalid_compaction_strategy: {requested!r}"
+    return strategy, _MANUAL_COMPACT_MODES[strategy]
 
 
 def _session_compact(params: dict, _emit: Callable) -> dict:
-    """Route live compaction to Chudcode; local rewriting is explicit offline only.
+    """Local transcript compaction for explicit offline/standalone use only.
 
-    Without an explicit ``strategy`` the persisted Compaction setting applies. Online,
-    the result reports ``strategy`` (the setting the session ran with) and ``method``
-    only when the agent service reported the method it actually used.
+    Online conversations compact through ``agent_admin_turn`` with ``compact`` — a
+    cancellable run on the conversation's own Omp session.
     """
     try:
         p = params or {}
         messages = _as_list(p.get("messages"))
+        commands = _cmds()
+        explicit_local = bool(p.get("standalone") or p.get("offline"))
+        if (
+            not explicit_local
+            and not getattr(commands, "_offline_enabled", lambda: False)()
+        ):
+            return {
+                "ok": False,
+                "reason": "session_compact is unavailable for online agent sessions",
+                "owner": "omp",
+                "hint": "online sessions compact through agent_admin_turn with compact",
+            }
         from services.agent import config as agent_config
 
         try:
-            configured_strategy, compaction_settings = (
-                agent_config.online_compaction_settings()
-            )
+            configured_strategy = agent_config.get_compaction_strategy()
         except ValueError as exc:
-            refusal = _cell_refusal(exc)
-            if refusal is not None:
-                return refusal
             return {"ok": False, "reason": f"invalid_compaction_strategy: {exc}", "hint": ""}
         raw_requested = p.get("strategy")
         requested_strategy = (
@@ -406,71 +422,34 @@ def _session_compact(params: dict, _emit: Callable) -> dict:
         prior = p.get("prior_archive")
         if prior is not None and not isinstance(prior, dict):
             prior = None
-        commands = _cmds()
-        explicit_local = bool(p.get("standalone") or p.get("offline"))
-        configured_offline = bool(
-            getattr(commands, "_offline_enabled", lambda: False)()
-        )
-        local = explicit_local or configured_offline
-        if local:
-            strategy = requested_strategy or configured_strategy
-        else:
-            refusal = _online_manual_compaction_refusal(
-                requested_strategy, configured_strategy
+        try:
+            result = commands.compact_session(
+                messages,
+                requested_strategy or configured_strategy,
+                keep_recent_tokens=keep_i,
+                supersede_reads=bool(p.get("supersede_reads", True)),
+                drop_useless=bool(p.get("drop_useless", True)),
+                prior_archive=prior,
+                standalone=explicit_local,
             )
-            if refusal:
-                return {"ok": False, "reason": refusal, "hint": ""}
-            strategy = "chudcode"
-        compact_kwargs: dict[str, Any] = {
-            "keep_recent_tokens": keep_i,
-            "supersede_reads": bool(p.get("supersede_reads", True)),
-            "drop_useless": bool(p.get("drop_useless", True)),
-            "prior_archive": prior,
-            "session_id": str(p.get("session_id") or "") or None,
-            "instructions": p.get("instructions"),
-            "standalone": explicit_local,
-        }
-        if not local:
-            compact_kwargs["compaction_settings"] = compaction_settings
-        result = commands.compact_session(messages, strategy, **compact_kwargs)
+        except commands.SessionCommandUnavailable as exc:
+            return {"ok": False, "reason": str(exc), "hint": ""}
         out = {
             "ok": True,
             "summary": result.get("summary") or "",
-            "short_summary": result.get("short_summary")
-            or result.get("shortSummary")
-            or "",
+            "short_summary": result.get("short_summary") or "",
+            "kept_messages": result.get("kept_messages") or [],
         }
-        if not local:
-            out["strategy"] = configured_strategy
-            # The method the agent service recorded on the compaction entry; never
-            # derived from the request or the setting.
-            method = result.get("method")
-            if isinstance(method, str) and method:
-                out["method"] = method
-        passthrough_keys = (
-            "archive",
-            "cut_index",
-            "saved_tokens",
-            "firstKeptEntryId",
-            "tokensBefore",
-        )
-        if local:
-            out["kept_messages"] = result.get("kept_messages") or []
-            if "messages" in result:
-                out["messages"] = result["messages"]
-        for key in passthrough_keys:
+        for key in ("messages", "archive", "cut_index", "saved_tokens"):
             if key in result:
                 out[key] = result[key]
         return out
     except Exception as exc:  # noqa: BLE001
-        refusal = _cell_refusal(exc)
-        if refusal is not None:
-            return refusal
         return {"ok": False, "reason": f"session_compact failed: {exc}", "hint": ""}
 
 
 def _session_shake(params: dict, _emit: Callable) -> dict:
-    """Keep transcript shaking local-only; Chudcode owns online history."""
+    """Keep transcript shaking local-only; Omp owns online history."""
     try:
         p = params or {}
         commands = _cmds()
@@ -482,8 +461,8 @@ def _session_shake(params: dict, _emit: Callable) -> dict:
             return {
                 "ok": False,
                 "reason": "session_shake is unavailable for online agent sessions",
-                "owner": "chudcode",
-                "hint": "use chudcode_compact for the named live session",
+                "owner": "omp",
+                "hint": "online manual compaction uses agent_admin_turn with compact",
             }
         keep_boundary = p.get("keep_boundary_index")
         if keep_boundary is not None:
@@ -512,7 +491,7 @@ def _session_shake(params: dict, _emit: Callable) -> dict:
 
 
 def _session_handoff(params: dict, _emit: Callable) -> dict:
-    """Route a handoff through its named live Chudcode session (offline stays local)."""
+    """Route a handoff through its named live Omp session (offline stays local)."""
     try:
         p = params or {}
         messages = _as_list(p.get("messages"))
@@ -872,92 +851,24 @@ TRIGGERS_METHODS: dict[str, Callable] = {
 
 
 def _ai_roles_get(params: dict, _emit: Callable) -> dict:
-    """Return the full ai_roles map (missing roles default to ``\"auto\"``)."""
+    """Return role/size assignments, the ``advanced_overrides`` switch and the retained overrides."""
     try:
         from services.agent import config as agent_config
-        from services.agent.role_models import get_ai_roles
+        from services.agent.role_models import role_settings_view
 
-        cfg = agent_config.load_config()
-        roles = get_ai_roles(cfg)
-        return {"ok": True, "roles": roles}
+        return {"ok": True, **role_settings_view(agent_config.load_config())}
     except Exception as exc:  # noqa: BLE001
-        return {
-            "ok": False,
-            "reason": f"ai_roles_get failed: {exc}",
-            "hint": "",
-        }
+        return {"ok": False, "reason": f"ai_roles_get failed: {exc}", "hint": ""}
 
 
 def _ai_roles_set(params: dict, _emit: Callable) -> dict:
-    """Merge partial role assignments into config.json ai_roles."""
+    """Validate and atomically merge role, size, mode and ``advanced_overrides`` updates."""
     try:
-        from services.agent import config as agent_config
-        from services.agent.role_models import (
-            KNOWN_ROLES,
-            RoleModelError,
-            assert_redaction_loopback,
-            set_ai_roles,
-        )
+        from services.agent.role_models import update_role_settings
 
-        partial = (params or {}).get("roles")
-        if not isinstance(partial, dict):
-            return {
-                "ok": False,
-                "reason": "roles mapping required",
-                "hint": (
-                    "Pass roles: {advisor|task|planning|default|plm|redaction: "
-                    '{provider, model, thinking?} | {mode:"auto"|"default", thinking?} '
-                    '| "auto" | "default"}. mode default follows the chat model. '
-                    "thinking: auto|low|medium|high (default auto)."
-                ),
-            }
-
-        # HARD floor at set-time for redaction. A fixed assignment must be loopback,
-        # and "default" is refused outright: it would hand redaction whatever the chat
-        # composer is on, which is normally a cloud provider.
-        if "redaction" in partial:
-            val = partial["redaction"]
-            mode = ""
-            if isinstance(val, dict):
-                mode = str(val.get("mode") or "").strip().lower()
-            elif isinstance(val, str):
-                mode = val.strip().lower()
-            if mode == "default":
-                return {
-                    "ok": False,
-                    "reason": (
-                        "redaction cannot follow the chat model — it is hard-locked "
-                        "to loopback providers."
-                    ),
-                    "hint": (
-                        "Pin redaction to a local model "
-                        '(llamacpp/lmstudio/ollama/vllm), or set it to "auto".'
-                    ),
-                }
-            if isinstance(val, dict):
-                prov = str(val.get("provider") or "").strip()
-                if prov:
-                    try:
-                        assert_redaction_loopback(prov)
-                    except RoleModelError as exc:
-                        return {
-                            "ok": False,
-                            "reason": str(exc),
-                            "hint": (
-                                "redaction must use a loopback provider "
-                                "(llamacpp/lmstudio/ollama/vllm)."
-                            ),
-                        }
-
-        cfg = agent_config.load_config()
-        roles = set_ai_roles(partial, cfg, persist=True)
-        return {"ok": True, "roles": roles, "known_roles": list(KNOWN_ROLES)}
+        return {"ok": True, **update_role_settings(params or {})}
     except Exception as exc:  # noqa: BLE001
-        return {
-            "ok": False,
-            "reason": f"ai_roles_set failed: {exc}",
-            "hint": "",
-        }
+        return {"ok": False, "reason": f"ai_roles_set failed: {exc}", "hint": ""}
 
 
 ROLE_MODELS_METHODS: dict[str, Callable] = {
@@ -1760,54 +1671,158 @@ OFFICE_METHODS: dict[str, Callable] = {
     "office_extract": _office_extract,
 }
 
-#: Bounded worker-boundary attachment shape. ChudcodeSessionHost performs the
+#: Bounded worker-boundary attachment shape. OmpSessionHost performs the
 #: image/file conversion immediately before the RPC prompt.
 _ATTACH_MAX = 32
 _HISTORY_SEED_LOCK = threading.Lock()
 _HISTORY_SEEDED_SESSIONS: set[str] = set()
-_HISTORY_SEED_MAX_CHARS = 24_000
-_HISTORY_SEED_MAX_MESSAGES = 24
+_SESSION_DAEMON_GENERATIONS: dict[str, dict] = {}
 
 
-#: ``enable_tools`` loads per Chudware conversation. Every turn rebuilds the host-tool
-#: set from the GUI's request, but the conversation history still shows the tools the
-#: model loaded in an earlier turn — so without this, a later turn calls them and gets
-#: Chudcode's "No such tool: xd://inspect_section" (c219: loaded in turn 1, two
-#: failed calls and a re-load in turn 3). Worker-lifetime, like the live session.
-_SESSION_TOOL_LOADS_LOCK = threading.Lock()
-_SESSION_TOOL_LOADS: OrderedDict[str, list[str]] = OrderedDict()
-_SESSION_TOOL_LOADS_MAX = 256
-
-
-def _turn_tool_categories(session_id: str, requested: Any) -> list[str]:
-    """The GUI's requested categories plus every load earlier turns of this session made."""
-    out: list[str] = []
-    for value in requested if isinstance(requested, list) else ():
-        if isinstance(value, str) and value.strip() and value not in out:
-            out.append(value)
-    if session_id == "default":
-        return out
-    with _SESSION_TOOL_LOADS_LOCK:
-        remembered = list(_SESSION_TOOL_LOADS.get(session_id, ()))
-    return out + [value for value in remembered if value not in out]
-
-
-def _remember_session_tool_loads(session_id: str, categories: Any) -> None:
-    if session_id == "default" or not isinstance(categories, list):
-        return
-    loads = [value for value in categories if isinstance(value, str) and value.strip()]
-    with _SESSION_TOOL_LOADS_LOCK:
-        _SESSION_TOOL_LOADS[session_id] = list(dict.fromkeys(loads))
-        _SESSION_TOOL_LOADS.move_to_end(session_id)
-        while len(_SESSION_TOOL_LOADS) > _SESSION_TOOL_LOADS_MAX:
-            _SESSION_TOOL_LOADS.popitem(last=False)
-
-
-
-def chudcode_agent_turn(params: dict, emit: Callable) -> dict:
-    """Run one online turn through the authoritative persistent Chudcode host."""
+def _daemon_generation() -> dict | None:
+    """Identify the daemon actually serving this turn, not the worker process."""
     try:
-        result = get_default_chudcode_host().run_turn(params, emit)
+        from services.mcp import core_bridge, daemon_bridge
+        if not core_bridge.active_daemon_mode():
+            return None
+        hello = daemon_bridge.client().refresh_server_info()
+        pid = hello.get("daemon_pid")
+        start = hello.get("daemon_start_id")
+        if type(pid) is not int or pid <= 0:
+            return None
+        return {"pid": pid, "start_id": str(start) if start else ""}
+    except Exception:  # noqa: BLE001 — unknown is not evidence of a restart
+        return None
+
+
+def _generation_seed_path(sessions_dir: str, key: str) -> Path | None:
+    if sessions_dir:
+        directory = Path(sessions_dir) / ".daemon-seeds"
+    elif in_cell():
+        directory = actor_state_root() / "daemon-seeds"
+    else:
+        return None
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return directory / f"{digest}.json"
+
+
+def _previous_daemon_generation(session_id: str, sessions_dir: str) -> dict | None:
+    key = scoped_key(session_id)
+    with _HISTORY_SEED_LOCK:
+        known = _SESSION_DAEMON_GENERATIONS.get(key)
+    if known:
+        return dict(known)
+    path = _generation_seed_path(sessions_dir, key)
+    if path is not None:
+        try:
+            stored = json.loads(path.read_text(encoding="utf-8"))
+            if (isinstance(stored, dict) and type(stored.get("pid")) is int
+                    and stored["pid"] > 0 and isinstance(stored.get("start_id", ""), str)):
+                return stored
+        except (OSError, ValueError, TypeError):
+            pass
+    return None
+
+
+def _remember_daemon_generation(session_id: str, sessions_dir: str,
+                                generation: dict | None) -> None:
+    if generation is None:
+        return
+    key = scoped_key(session_id)
+    with _HISTORY_SEED_LOCK:
+        _SESSION_DAEMON_GENERATIONS[key] = dict(generation)
+    path = _generation_seed_path(sessions_dir, key)
+    if path is None:
+        return
+    temp = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=".daemon-seed-", delete=False) as stream:
+            temp = stream.name
+            json.dump(generation, stream)
+        os.replace(temp, path)
+    except OSError:
+        if temp:
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
+
+
+def _daemon_generation_changed(previous: dict | None, current: dict | None) -> bool:
+    if not previous or not current:
+        return False
+    if previous.get("pid") != current.get("pid"):
+        return True
+    before, after = previous.get("start_id"), current.get("start_id")
+    return bool(before and after and before != after)
+
+
+def _legacy_tool_loads_owner(
+    params: Mapping[str, Any], session_id: str, workspace: str | None,
+) -> dict[str, str] | None:
+    """Prove a desktop GUI's persisted conversation-to-journal link."""
+    if in_cell() or not session_id or len(session_id) > 256 or not all(
+        char.isascii() and (char.isalnum() or char in "-_") for char in session_id
+    ):
+        return None
+    directory = params.get("sessions_dir")
+    journal = params.get("omp_session_file")
+    if not all(isinstance(value, str) and value.strip() for value in (directory, journal, workspace)):
+        return None
+    try:
+        root = Path(directory).expanduser().resolve(strict=True)
+        file = root / f"{session_id}.json"
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        if file.is_symlink():
+            return None
+        fd = os.open(file, flags)
+        with os.fdopen(fd, "r", encoding="utf-8") as stream:
+            info = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_size > 128 * 1024 * 1024 or
+                    (os.name == "posix" and
+                     (info.st_uid != os.getuid() or info.st_mode & 0o022))):
+                return None
+            text = stream.read(128 * 1024 * 1024 + 1)
+            if len(text) > 128 * 1024 * 1024:
+                return None
+            data = json.loads(text)
+        if not isinstance(data, Mapping) or data.get("id") != session_id:
+            return None
+        link = data.get("omp", data.get("chudcode"))
+        if not isinstance(link, Mapping):
+            return None
+        omp_id = link.get("session_id", link.get("sessionId"))
+        omp_file = link.get("session_file", link.get("sessionFile"))
+        project = data.get("project")
+        if not all(isinstance(value, str) and value.strip() for value in (omp_id, omp_file, project)):
+            return None
+        actual_file = Path(journal).expanduser().resolve(strict=True)
+        if Path(omp_file).expanduser().resolve(strict=True) != actual_file:
+            return None
+        actual_workspace = Path(workspace).expanduser().resolve(strict=True)
+        if Path(project).expanduser().resolve(strict=True) != actual_workspace:
+            return None
+        return {"sessionId": omp_id, "sessionFile": str(actual_file),
+                "workspace": str(actual_workspace)}
+    except (OSError, UnicodeError, ValueError, TypeError, RecursionError):
+        return None
+
+
+def omp_agent_turn(params: dict, emit: Callable) -> dict:
+    """Run one online turn through the authoritative persistent Omp host."""
+    return _session_host_run("run_turn", params, emit)
+
+
+def omp_compaction(params: dict, emit: Callable) -> dict:
+    """Run one manual compaction through the authoritative persistent Omp host."""
+    return _session_host_run("run_compaction", params, emit)
+
+
+def _session_host_run(method: str, params: dict, emit: Callable) -> dict:
+    try:
+        result = getattr(get_default_omp_host(), method)(params, emit)
         if not isinstance(result, dict):
             return {
                 "ok": False,
@@ -1850,7 +1865,7 @@ def _control_credentials(params: Mapping) -> dict:
     return {"credential_params": params} if "byok_key" in params else {}
 
 
-def chudcode_control(action: str, params: dict) -> dict:
+def omp_control(action: str, params: dict, *, private: bool = False) -> dict:
     """Dispatch a bounded control request to the process-global session host."""
     if not isinstance(params, Mapping):
         return {"ok": False, "reason": "Agent control params must be an object"}
@@ -1863,9 +1878,12 @@ def chudcode_control(action: str, params: dict) -> dict:
             if params.get("session_id"):
                 require_handle(params["session_id"], "session")
         if command == "cancel":
-            return get_default_chudcode_host().cancel(params.get("run_id"), **_control_credentials(params))
+            credentials = _control_credentials(params)
+            if private:
+                credentials["allow_prestart"] = True
+            return get_default_omp_host().cancel(params.get("run_id"), **credentials)
         if command == "steer":
-            return get_default_chudcode_host().steer(
+            return get_default_omp_host().steer(
                 params.get("run_id"),
                 params.get("text"),
                 params.get("attachments"),
@@ -1873,7 +1891,7 @@ def chudcode_control(action: str, params: dict) -> dict:
                 **_control_credentials(params),
             )
         if command == "answer":
-            return get_default_chudcode_host().answer(
+            return get_default_omp_host().answer(
                 params.get("run_id"),
                 params.get("batch_id"),
                 params.get("answers"),
@@ -1881,12 +1899,14 @@ def chudcode_control(action: str, params: dict) -> dict:
                 **_control_credentials(params),
             )
         if command == "status":
-            return get_default_chudcode_host().status(
+            return get_default_omp_host().status(
                 run_id=params.get("run_id"), session_id=params.get("session_id"),
                 **_control_credentials(params),
             )
         if command == "release":
-            return get_default_chudcode_host().release_session(params.get("session_id"), **_control_credentials(params))
+            return get_default_omp_host().release_session(params.get("session_id"), **_control_credentials(params))
+        if command == "apply_compaction_policy":
+            return _omp_apply_compaction_policy(dict(params), lambda _event: None)
         return {
             "ok": False,
             "reason": f"unsupported agent control action: {command}",
@@ -1907,9 +1927,9 @@ def chudcode_control(action: str, params: dict) -> dict:
         }
 
 
-def chudcode_shutdown() -> None:
-    """Stop every persistent Chudcode session before the worker exits."""
-    get_default_chudcode_host().shutdown()
+def omp_shutdown() -> None:
+    """Stop every persistent Omp session before the worker exits."""
+    get_default_omp_host().shutdown()
     with _HISTORY_SEED_LOCK:
         _HISTORY_SEEDED_SESSIONS.clear()
 
@@ -1954,23 +1974,6 @@ def _redact_literal(value: Any, literal: str) -> Any:
     return value
 
 
-_CHUDCODE_MAX_PROVIDERS = 128
-_CHUDCODE_MAX_MODELS = 512
-_CHUDCODE_MAX_TOOLS = 256
-_CHUDCODE_ESSENTIAL_TOOLS = frozenset(
-    {
-        "read",
-        "write",
-        "bash",
-        "edit",
-        "glob",
-        "eval",
-        "task",
-        "wait",
-        "learn",
-        "manage_skill",
-    }
-)
 
 
 def _bounded_text(value: Any, limit: int) -> str | None:
@@ -1978,6 +1981,11 @@ def _bounded_text(value: Any, limit: int) -> str | None:
         return None
     text = value.strip()
     return text[:limit] if text else None
+
+
+def _bounded_identity(value: Any, limit: int) -> str | None:
+    # Truncating an identity could route a model or credential to a different provider.
+    return value if isinstance(value, str) and value and value == value.strip() and len(value) <= limit else None
 
 
 def _has_unknown_params(params: Mapping[str, Any], allowed: frozenset[str]) -> bool:
@@ -1996,7 +2004,7 @@ def _finite_number(value: Any, default: float = 0.0) -> float:
     return number if math.isfinite(number) else default
 
 
-def _chudcode_transient_call(
+def _omp_transient_call(
     command: str,
     params: dict,
     emit: Callable | None = None,
@@ -2004,7 +2012,7 @@ def _chudcode_transient_call(
     secret_input: bool = False,
 ) -> dict:
     try:
-        result = get_default_chudcode_host().transient_call(command, params, emit=emit)
+        result = get_default_omp_host().transient_call(command, params, emit=emit)
         if not isinstance(result, dict):
             return {"ok": False, "reason": f"Agent service {command} returned non-object"}
         clean = _redact_sensitive_response(result)
@@ -2021,17 +2029,26 @@ def _chudcode_transient_call(
         return {"ok": False, "reason": f"Agent service {command} failed: {detail}"}
 
 
-def _chudcode_auth_call(command: str, params: dict, _emit: Callable) -> dict:
-    return _chudcode_transient_call(
-        command,
-        params,
-        secret_input=command in {"validate_api_key", "set_api_key"},
-    )
-
-
-def _chudcode_memory_call(command: str, params: dict, _emit: Callable) -> dict:
+def _omp_auth_call(command: str, params: dict, _emit: Callable) -> dict:
     try:
-        result = get_default_chudcode_host().memory_call(command, params)
+        result = get_default_omp_host().auth_call(command, params)
+        if not isinstance(result, dict):
+            return {"ok": False, "reason": f"Agent service {command} returned non-object"}
+        clean = _redact_sensitive_response(result)
+        secret = params.get("api_key")
+        if isinstance(secret, str):
+            clean = _redact_literal(clean, secret)
+        clean.setdefault("ok", True)
+        return clean
+    except Exception as exc:  # noqa: BLE001 - do not expose credential input
+        return _cell_refusal(exc) or {
+            "ok": False, "reason": f"Agent service {command} failed: {type(exc).__name__}"
+        }
+
+
+def _omp_memory_call(command: str, params: dict, _emit: Callable) -> dict:
+    try:
+        result = get_default_omp_host().memory_call(command, params)
         if not isinstance(result, dict):
             return {"ok": False, "reason": f"Agent service {command} returned non-object"}
         result.setdefault("ok", True)
@@ -2049,17 +2066,17 @@ def _chudcode_memory_call(command: str, params: dict, _emit: Callable) -> dict:
 def _auth_provider(raw: Any) -> dict[str, Any] | None:
     if not isinstance(raw, Mapping):
         return None
-    provider_id = _bounded_text(raw.get("providerId") or raw.get("id"), 128)
-    if provider_id is None:
+    provider_id = _bounded_identity(raw.get("provider") or raw.get("providerId") or raw.get("id"), 128)
+    if provider_id is None or type(raw.get("configured")) is not bool:
         return None
-    authenticated = bool(raw.get("authenticated"))
-    has_key = bool(raw.get("hasApiKey"))
-    has_oauth = bool(raw.get("hasOAuth"))
+    has_oauth = raw.get("oauth") is True
+    has_key = raw.get("hasApiKey") is True
+    authenticated = raw["configured"]
+    source = _bounded_text(raw.get("effectiveSource"), 64)
     state = (
-        "oauth_connected"
-        if authenticated and has_oauth
-        else "key_set"
-        if has_key
+        "oauth_connected" if authenticated and source == "oauth"
+        else "key_set" if authenticated and source == "api_key"
+        else "configured" if authenticated
         else "signed_out"
     )
     accounts: list[dict[str, Any]] = []
@@ -2092,9 +2109,12 @@ def _auth_provider(raw: Any) -> dict[str, Any] | None:
         "disabled": [],
         "usage": {"notes": [], "windows": []},
     }
-    origin = _bounded_text(raw.get("origin"), 64)
+    origin = source
     if origin is not None:
         result["origin"] = origin
+    credential_provider = _bounded_identity(raw.get("credentialProvider"), 128)
+    if credential_provider is not None:
+        result["credentialProvider"] = credential_provider
     return result
 
 
@@ -2104,87 +2124,146 @@ def _auth_providers(result: Mapping[str, Any]) -> list[dict[str, Any]]:
         provider = _auth_provider(result)
         return [provider] if provider is not None else []
     providers: list[dict[str, Any]] = []
-    for item in raw[:_CHUDCODE_MAX_PROVIDERS]:
+    for item in raw:
         provider = _auth_provider(item)
         if provider is not None:
             providers.append(provider)
     return providers
 
 
-def _chudcode_provider_list(params: dict, _emit: Callable) -> dict:
+def _omp_provider_list(params: dict, _emit: Callable) -> dict:
     if params:
-        return {"ok": False, "reason": "chudcode_provider_list takes no params"}
-    login = _chudcode_transient_call("get_login_providers", {})
-    models = _chudcode_transient_call("get_available_models", {})
-    auth = _chudcode_transient_call("get_auth_state", {})
-    failed = next((item for item in (login, models, auth) if not item.get("ok")), None)
+        return {"ok": False, "reason": "omp_provider_list takes no params"}
+    login = _omp_transient_call("get_login_providers", {})
+    models = _omp_transient_call("get_available_models", {})
+    setup = _omp_auth_call("setup_providers", {}, _emit)
+    failed = next((item for item in (login, models, setup) if not item.get("ok")), None)
     if failed is not None:
         return failed
+    for result, key in ((login, "providers"), (models, "models"), (setup, "providers")):
+        if not isinstance(result.get(key), list):
+            return {"ok": False, "reason": f"Agent service returned an invalid {key} list"}
 
-    auth_by_id = {item["id"]: item for item in _auth_providers(auth)}
     descriptors: dict[str, dict[str, Any]] = {}
+    for item in setup["providers"]:
+        if not isinstance(item, Mapping):
+            continue
+        provider_id = _bounded_identity(item.get("id"), 128)
+        if provider_id is None:
+            continue
+        kinds = item.get("authKinds")
+        descriptors[provider_id] = {
+            "id": provider_id,
+            "name": _bounded_text(item.get("name"), 256) or provider_id,
+            "available": False,
+            "authenticated": False,
+            "authKinds": [kind for kind in ("api_key", "oauth")
+                          if isinstance(kinds, list) and kind in kinds],
+            "modelsAvailable": 0,
+        }
     raw_login = login.get("providers")
     if isinstance(raw_login, list):
-        for item in raw_login[:_CHUDCODE_MAX_PROVIDERS]:
+        for item in raw_login:
             if not isinstance(item, Mapping):
                 continue
-            provider_id = _bounded_text(item.get("id"), 128)
+            provider_id = _bounded_identity(item.get("id"), 128)
             if provider_id is None:
                 continue
-            descriptors[provider_id] = {
+            descriptor = descriptors.setdefault(provider_id, {
                 "id": provider_id,
                 "name": _bounded_text(item.get("name"), 256) or provider_id,
-                "available": bool(item.get("available", True)),
-                "authenticated": bool(item.get("authenticated")),
-                "authKinds": ["oauth"],
-                "modelsAvailable": False,
-            }
+                "available": False, "authenticated": False,
+                "authKinds": [], "modelsAvailable": 0,
+            })
+            if "oauth" not in descriptor["authKinds"]:
+                descriptor["authKinds"].append("oauth")
     raw_models = models.get("models")
     if isinstance(raw_models, list):
-        for item in raw_models[:_CHUDCODE_MAX_MODELS]:
+        for item in raw_models:
             if not isinstance(item, Mapping):
                 continue
-            provider_id = _bounded_text(item.get("provider"), 128)
-            if provider_id is None:
+            provider_id = _bounded_identity(item.get("provider"), 128)
+            if provider_id is None or _bounded_identity(item.get("id"), 256) is None:
                 continue
             descriptor = descriptors.setdefault(
                 provider_id,
                 {
                     "id": provider_id,
                     "name": provider_id,
-                    "available": True,
+                    "available": False,
                     "authenticated": False,
-                    "authKinds": ["api_key"],
-                    "modelsAvailable": False,
+                    "authKinds": [],
+                    "modelsAvailable": 0,
                 },
             )
-            descriptor["modelsAvailable"] = True
-            if "api_key" not in descriptor["authKinds"]:
-                descriptor["authKinds"].append("api_key")
+            descriptor["modelsAvailable"] += 1
+    # The extension polls its control lane every 100 ms. Asking it separately for
+    # each provider made a normal 90-provider catalog take ~9 seconds and time out
+    # behind concurrent GUI refreshes. Batch bounded requests while retaining
+    # independent, fail-closed auth results for each provider.
+    auth_by_id: dict[str, dict[str, Any]] = {}
+    provider_ids = list(descriptors)
+    for offset in range(0, len(provider_ids), 32):
+        batch = provider_ids[offset:offset + 32]
+        result = _omp_auth_call("auth_states", {"providers": batch}, _emit)
+        entries = result.get("providers") if result.get("ok") else None
+        if not isinstance(entries, list):
+            continue
+        requested = set(batch)
+        seen: set[str] = set()
+        for entry in entries:
+            state = _auth_provider(entry)
+            if state is None or state["id"] not in requested:
+                continue
+            provider_id = state["id"]
+            if provider_id in seen:
+                auth_by_id.pop(provider_id, None)
+            else:
+                auth_by_id[provider_id] = state
+                seen.add(provider_id)
+    from services.agent.config import load_config
+
+    config = load_config() or {}
+    agent_config = config.get("agent") if isinstance(config, dict) else None
+    opt_ins = agent_config.get("keyless_providers", []) if isinstance(agent_config, dict) else []
+    opted_in = {value for value in opt_ins if isinstance(value, str)} if isinstance(opt_ins, list) else set()
+    unknown = 0
     for provider_id, descriptor in descriptors.items():
         state = auth_by_id.get(provider_id)
-        if state is not None:
-            descriptor["state"] = state["state"]
-            descriptor["authenticated"] = state["authenticated"]
-            if "origin" in state:
-                descriptor["origin"] = state["origin"]
-        elif not descriptor["available"]:
-            descriptor["state"] = "disabled"
-        else:
-            descriptor["state"] = "signed_out"
+        if state is None:
+            # Omit availability, rather than asserting signed out or inferring
+            # access from catalog presence or a keyless opt-in without auth state.
+            descriptor.pop("available", None)
+            descriptor.pop("authenticated", None)
+            descriptor["state"] = "unknown"
+            unknown += 1
+            continue
+        descriptor["state"] = state["state"]
+        descriptor["authenticated"] = state["authenticated"]
+        descriptor["available"] = bool(
+            descriptor["modelsAvailable"]
+            and (state["authenticated"] or provider_id in opted_in)
+        )
+        if "origin" in state:
+            descriptor["origin"] = state["origin"]
+        if "credentialProvider" in state:
+            descriptor["credentialProvider"] = state["credentialProvider"]
     providers = sorted(
         descriptors.values(), key=lambda item: (item["name"].lower(), item["id"])
     )
-    return {"ok": True, "providers": providers[:_CHUDCODE_MAX_PROVIDERS]}
+    result = {"ok": True, "providers": providers}
+    if unknown:
+        result["refreshError"] = f"Authentication status could not be refreshed for {unknown} provider(s)."
+    return result
 
 
-def _chudcode_auth_state(params: dict, _emit: Callable) -> dict:
+def _omp_auth_state(params: dict, _emit: Callable) -> dict:
     if _has_unknown_params(params, frozenset({"providerId"})):
-        return {"ok": False, "reason": "chudcode_auth_state has unknown params"}
-    provider_id = _bounded_text(params.get("providerId"), 128)
+        return {"ok": False, "reason": "omp_auth_state has unknown params"}
+    provider_id = _bounded_identity(params.get("providerId"), 128)
     if provider_id is None:
         return {"ok": False, "reason": "providerId is required"}
-    raw = _chudcode_transient_call("get_auth_state", {"providerId": provider_id})
+    raw = _omp_auth_call("auth_state", {"provider": provider_id}, _emit)
     if not raw.get("ok"):
         return raw
     provider = next(
@@ -2192,37 +2271,21 @@ def _chudcode_auth_state(params: dict, _emit: Callable) -> dict:
         None,
     )
     if provider is None:
-        return {
-            "ok": True,
-            "id": provider_id,
-            "state": "signed_out",
-            "authenticated": False,
-            "accounts": [],
-            "disabled": [],
-            "usage": {"notes": [], "windows": []},
-        }
+        return {"ok": False, "reason": "Agent service returned invalid auth state"}
     provider["ok"] = True
     return provider
 
 
-def _chudcode_validate_key(params: dict, emit: Callable) -> dict:
-    raw = _chudcode_auth_call("validate_api_key", params, emit)
+
+def _omp_set_key(params: dict, emit: Callable) -> dict:
+    provider_id = _bounded_identity(params.get("providerId"), 128)
+    api_key = params.get("apiKey")
+    if not provider_id or not isinstance(api_key, str) or not api_key:
+        return {"ok": False, "reason": "providerId and apiKey are required"}
+    raw = _omp_auth_call("set_api_key", {"provider": provider_id, "api_key": api_key}, emit)
     if not raw.get("ok"):
         return raw
-    return {
-        "ok": True,
-        "providerId": _bounded_text(raw.get("providerId"), 128)
-        or _bounded_text(params.get("providerId"), 128),
-        "valid": bool(raw.get("valid")),
-    }
-
-
-def _chudcode_set_key(params: dict, emit: Callable) -> dict:
-    raw = _chudcode_auth_call("set_api_key", params, emit)
-    if not raw.get("ok"):
-        return raw
-    provider_raw = raw.get("provider")
-    provider = _auth_provider(provider_raw)
+    provider = _auth_provider(raw)
     if provider is None:
         return {"ok": False, "reason": "Agent service set_api_key returned no provider"}
     native_provider = {
@@ -2238,38 +2301,72 @@ def _chudcode_set_key(params: dict, emit: Callable) -> dict:
     return {"ok": True, "provider": native_provider}
 
 
-def _chudcode_remove_key(params: dict, emit: Callable) -> dict:
-    return _chudcode_auth_call("remove_api_key", params, emit)
+def _omp_remove_key(params: dict, emit: Callable) -> dict:
+    provider_id = _bounded_identity(params.get("providerId"), 128)
+    if not provider_id:
+        return {"ok": False, "reason": "providerId is required"}
+    return _omp_auth_call("remove_api_key", {"provider": provider_id}, emit)
 
 
-def _chudcode_logout(params: dict, emit: Callable) -> dict:
-    return _chudcode_auth_call("logout_provider", params, emit)
-
-
-def _chudcode_login(params: dict, emit: Callable) -> dict:
+def _omp_logout_accounts(params: dict, emit: Callable) -> dict:
     if _has_unknown_params(params, frozenset({"providerId"})):
-        return {"ok": False, "reason": "chudcode_login has unknown params"}
-    provider_id = _bounded_text(params.get("providerId"), 128)
+        return {"ok": False, "reason": "omp_logout_accounts has unknown params"}
+    provider_id = _bounded_identity(params.get("providerId"), 128)
+    if not provider_id:
+        return {"ok": False, "reason": "providerId is required"}
+    raw = _omp_transient_call("get_logout_accounts", {"providerId": provider_id}, emit)
+    if not raw.get("ok"):
+        return raw
+    accounts = raw.get("accounts")
+    if not isinstance(accounts, list):
+        return {"ok": False, "reason": "Agent service returned an invalid accounts list"}
+    clean = []
+    for item in accounts[:128]:
+        if not isinstance(item, Mapping):
+            continue
+        credential_id = item.get("credentialId")
+        if isinstance(credential_id, bool) or not isinstance(credential_id, int):
+            continue
+        clean.append({
+            "credentialId": credential_id,
+            "provider": provider_id,
+            "type": _bounded_text(item.get("type"), 32) or "",
+            "label": _bounded_text(item.get("label"), 512) or "",
+            "detail": _bounded_text(item.get("detail"), 1024) or "",
+            "active": item.get("active") is True,
+        })
+    return {"ok": True, "accounts": clean}
+
+
+def _omp_logout(params: dict, emit: Callable) -> dict:
+    provider_id = _bounded_identity(params.get("providerId"), 128)
+    credential_id = params.get("credentialId")
+    if not provider_id or isinstance(credential_id, bool) or not isinstance(credential_id, int):
+        return {"ok": False, "reason": "providerId and credentialId are required"}
+    return _omp_transient_call("logout", {"providerId": provider_id, "credentialId": credential_id}, emit)
+
+
+def _omp_login(params: dict, emit: Callable) -> dict:
+    if _has_unknown_params(params, frozenset({"providerId"})):
+        return {"ok": False, "reason": "omp_login has unknown params"}
+    provider_id = _bounded_identity(params.get("providerId"), 128)
     if provider_id is None:
         return {"ok": False, "reason": "providerId is required"}
-    login = _chudcode_transient_call("login", {"providerId": provider_id}, emit=emit)
+    login = _omp_transient_call("login", {"providerId": provider_id}, emit=emit)
     if not login.get("ok"):
         return login
-    state = _chudcode_auth_state({"providerId": provider_id}, emit)
-    if state.get("ok") and state.get("state") == "signed_out":
-        state["state"] = "oauth_connected"
-        state["authenticated"] = True
+    state = _omp_auth_state({"providerId": provider_id}, emit)
     return state
 
 
 def _sanitize_model(item: Any) -> dict[str, Any] | None:
     if not isinstance(item, Mapping):
         return None
-    model_id = _bounded_text(item.get("id"), 256)
-    provider = _bounded_text(item.get("provider"), 128)
+    model_id = _bounded_identity(item.get("id"), 256)
+    provider = _bounded_identity(item.get("provider"), 128)
     if model_id is None or provider is None:
         return None
-    # Chudcode's catalog names the modality list `inputModalities`; `input` is the older spelling.
+    # Omp's catalog names the modality list `inputModalities`; `input` is the older spelling.
     inputs = item.get("inputModalities")
     if not isinstance(inputs, list):
         inputs = item.get("input")
@@ -2299,7 +2396,7 @@ def _sanitize_model(item: Any) -> dict[str, Any] | None:
             ("cacheWrite", "cacheWrite"),
         )
     }
-    return {
+    result = {
         "id": model_id,
         "name": _bounded_text(item.get("name"), 256) or model_id,
         "provider": provider,
@@ -2309,32 +2406,38 @@ def _sanitize_model(item: Any) -> dict[str, Any] | None:
         "maxTokens": min(
             1_000_000_000, max(0, int(_finite_number(item.get("maxTokens"))))
         ),
-        "reasoning": bool(item.get("reasoning")),
-        "reasoningEfforts": efforts,
-        "vision": "image" in clean_inputs,
-        "input": clean_inputs,
         "cost": clean_cost,
     }
+    if isinstance(item.get("reasoning"), bool):
+        result["reasoning"] = item["reasoning"]
+    if isinstance(raw_efforts, list):
+        result["reasoningEfforts"] = efforts
+        result["thinking_levels"] = efforts
+    if isinstance(inputs, list):
+        result["input"] = clean_inputs
+        result["vision"] = "image" in clean_inputs
+    for key in ("kind", "toolCall"):
+        if isinstance(item.get(key), (str, bool)):
+            result[key] = item[key]
+    return result
 
 
-def _chudcode_models_list(params: dict, _emit: Callable) -> dict:
+def _omp_models_list(params: dict, _emit: Callable) -> dict:
     if set(params) - {"providerId"}:
-        return {"ok": False, "reason": "chudcode_models_list has unknown params"}
+        return {"ok": False, "reason": "omp_models_list has unknown params"}
     if in_cell():
         # Cells have no provider credential route, so no model is usable there.
         return {"ok": True, "models": [], "refreshing": False}
-    provider_id = _bounded_text(params.get("providerId"), 128)
-    host = get_default_chudcode_host()
-    # Desktop discovery refreshes the runtime-owned registry off-lane.
-    try:
-        refreshing = host.refresh_catalog_if_stale()
-    except Exception:  # noqa: BLE001 - discovery must not hide the last good catalog
-        refreshing = False
-    raw = _chudcode_transient_call("get_available_models", {})
+    provider_id = _bounded_identity(params.get("providerId"), 128)
+    if "providerId" in params and provider_id is None:
+        return {"ok": False, "reason": "invalid providerId"}
+    raw = _omp_transient_call("get_available_models", {})
     if not raw.get("ok"):
         return raw
     models: list[dict[str, Any]] = []
     raw_models = raw.get("models")
+    if not isinstance(raw_models, list):
+        return {"ok": False, "reason": "Agent service returned an invalid models list"}
     if isinstance(raw_models, list):
         for item in raw_models:
             model = _sanitize_model(item)
@@ -2343,18 +2446,17 @@ def _chudcode_models_list(params: dict, _emit: Callable) -> dict:
             ):
                 models.append(model)
     models.sort(key=lambda item: (item["provider"], item["name"].lower(), item["id"]))
-    return {"ok": True, "models": models[:_CHUDCODE_MAX_MODELS],
-            "refreshing": refreshing}
+    return {"ok": True, "models": models, "refreshing": False}
 
 
-def _chudcode_session_call(
+def _omp_session_call(
     command: str, params: dict, payload: dict | None = None
 ) -> dict:
     session_id = _bounded_text(params.get("session_id"), 256)
     if session_id is None:
         return {"ok": False, "reason": "session_not_live"}
     try:
-        result = get_default_chudcode_host().session_call(session_id, command, payload)
+        result = get_default_omp_host().session_call(session_id, command, payload)
         return _cell_refusal(result) or result
     except Exception as exc:  # noqa: BLE001 - worker boundary
         refusal = _cell_refusal(exc)
@@ -2366,9 +2468,9 @@ def _chudcode_session_call(
         }
 
 
-def _chudcode_export_session(params: dict, _emit: Callable) -> dict:
+def _omp_export_session(params: dict, _emit: Callable) -> dict:
     if _has_unknown_params(params, frozenset({"session_id", "output_path"})):
-        return {"ok": False, "reason": "chudcode_export_session has unknown params"}
+        return {"ok": False, "reason": "omp_export_session has unknown params"}
     session_id = _bounded_text(params.get("session_id"), 256)
     if session_id is None:
         return {"ok": False, "reason": "session_not_live"}
@@ -2378,7 +2480,7 @@ def _chudcode_export_session(params: dict, _emit: Callable) -> dict:
         if output_path is None:
             return {"ok": False, "reason": "output_path must be a non-empty string"}
     try:
-        raw = get_default_chudcode_host().export_session(session_id, output_path)
+        raw = get_default_omp_host().export_session(session_id, output_path)
         if not isinstance(raw, Mapping):
             return {
                 "ok": False,
@@ -2410,9 +2512,9 @@ def _chudcode_export_session(params: dict, _emit: Callable) -> dict:
         }
 
 
-def _chudcode_branch_session(params: dict, _emit: Callable) -> dict:
+def _omp_branch_session(params: dict, _emit: Callable) -> dict:
     if _has_unknown_params(params, frozenset({"session_id", "entry_id"})):
-        return {"ok": False, "reason": "chudcode_branch_session has unknown params"}
+        return {"ok": False, "reason": "omp_branch_session has unknown params"}
     session_id = _bounded_text(params.get("session_id"), 256)
     if session_id is None:
         return {"ok": False, "reason": "session_not_live"}
@@ -2420,7 +2522,7 @@ def _chudcode_branch_session(params: dict, _emit: Callable) -> dict:
     if entry_id is None:
         return {"ok": False, "reason": "entry_id is required"}
     try:
-        raw = get_default_chudcode_host().branch_session(session_id, entry_id)
+        raw = get_default_omp_host().branch_session(session_id, entry_id)
         if not isinstance(raw, Mapping):
             return {
                 "ok": False,
@@ -2436,9 +2538,9 @@ def _chudcode_branch_session(params: dict, _emit: Callable) -> dict:
                 or "Agent service branch_session failed",
             }
         if in_cell():
-            return {"ok": True, "chudcode_session_id": session_id}
-        child_id = _bounded_text(raw.get("chudcode_session_id"), 256)
-        child_file = _bounded_text(raw.get("chudcode_session_file"), 4_096)
+            return {"ok": True, "omp_session_id": session_id}
+        child_id = _bounded_text(raw.get("omp_session_id"), 256)
+        child_file = _bounded_text(raw.get("omp_session_file"), 4_096)
         if child_id is None or child_file is None:
             return {
                 "ok": False,
@@ -2446,8 +2548,8 @@ def _chudcode_branch_session(params: dict, _emit: Callable) -> dict:
             }
         return {
             "ok": True,
-            "chudcode_session_id": child_id,
-            "chudcode_session_file": child_file,
+            "omp_session_id": child_id,
+            "omp_session_file": child_file,
         }
     except Exception as exc:  # noqa: BLE001 - worker boundary
         refusal = _cell_refusal(exc)
@@ -2459,127 +2561,16 @@ def _chudcode_branch_session(params: dict, _emit: Callable) -> dict:
         }
 
 
-def _chudcode_rewind_session(params: dict, _emit: Callable) -> dict:
-    allowed = frozenset(
-        {"session_id", "user_text", "occurrence", "session_file", "workspace_dir"}
-    )
-    if _has_unknown_params(params, allowed):
-        return {"ok": False, "reason": "chudcode_rewind_session has unknown params"}
-    session_id = _bounded_text(params.get("session_id"), 256)
-    if session_id is None:
-        return {"ok": False, "reason": "session_id is required"}
-    user_text = params.get("user_text")
-    if not isinstance(user_text, str) or not user_text.strip() or len(user_text) > 1_000_000:
-        return {"ok": False, "reason": "user_text is required"}
-    occurrence = params.get("occurrence")
-    if type(occurrence) is not int or not 0 <= occurrence <= 100_000:
-        return {"ok": False, "reason": "occurrence must be a nonnegative integer"}
-    resume = {}
-    if in_cell() and any(key in params for key in ("session_file", "workspace_dir")):
-        return {"ok": False, "reason": "cell_refused", "code": "cell_refused"}
-    for key in ("session_file", "workspace_dir"):
-        if key in params:
-            value = _bounded_text(params[key], 4_096)
-            if value is None:
-                return {"ok": False, "reason": f"{key} must be a nonempty path"}
-            resume[key] = value
-    try:
-        raw = get_default_chudcode_host().rewind_session(
-            session_id, user_text, occurrence, **resume
-        )
-        if not isinstance(raw, Mapping):
-            return {"ok": False, "reason": "Agent service rewind returned non-object"}
-        if not raw.get("ok"):
-            refusal = _cell_refusal(raw)
-            if refusal is not None:
-                return refusal
-            return {
-                "ok": False,
-                "reason": _bounded_text(raw.get("reason"), 4_096)
-                or "Agent service rewind failed",
-            }
-        if in_cell():
-            return {"ok": True, "chudcode_session_id": session_id}
-        child_id = _bounded_text(raw.get("chudcode_session_id"), 256)
-        child_file = _bounded_text(raw.get("chudcode_session_file"), 4_096)
-        if child_id is None or child_file is None:
-            return {"ok": False, "reason": "Agent service rewind returned no child metadata"}
-        return {
-            "ok": True,
-            "chudcode_session_id": child_id,
-            "chudcode_session_file": child_file,
-        }
-    except Exception as exc:  # noqa: BLE001 - worker boundary
-        refusal = _cell_refusal(exc)
-        if refusal is not None:
-            return refusal
-        return {"ok": False, "reason": f"Agent service rewind failed: {type(exc).__name__}"}
-
-
-def _chudcode_repair_session(params: dict, _emit: Callable) -> dict:
-    if _has_unknown_params(params, frozenset({"session_id", "repair"})):
-        return {"ok": False, "reason": "chudcode_repair_session has unknown params"}
-    session_id = _bounded_text(params.get("session_id"), 256)
-    if session_id is None:
-        return {"ok": False, "reason": "session_not_live"}
-    repair = params.get("repair", False)
-    if not isinstance(repair, bool):
-        return {"ok": False, "reason": "repair must be a boolean"}
-    try:
-        raw = get_default_chudcode_host().repair_session(session_id, repair)
-        if not isinstance(raw, Mapping):
-            return {
-                "ok": False,
-                "reason": "Agent service repair_session returned non-object",
-            }
-        clean = _redact_sensitive_response(raw)
-        if not clean.get("ok"):
-            refusal = _cell_refusal(clean)
-            if refusal is not None:
-                return refusal
-            return {
-                "ok": False,
-                "reason": _bounded_text(clean.get("reason"), 4_096)
-                or "Agent service repair_session failed",
-            }
-        allowed = {
-            "ok",
-            "mode",
-            "status",
-            "changed",
-            "finding_count",
-            "repairable_finding_count",
-            "remaining_finding_count",
-            "counts",
-            "findings",
-            "backup_path",
-            "chudcode_session_id",
-            "chudcode_session_file",
-        }
-        if in_cell():
-            clean["chudcode_session_id"] = session_id
-            allowed -= {"backup_path", "chudcode_session_file"}
-        return {str(key): value for key, value in clean.items() if key in allowed}
-    except Exception as exc:  # noqa: BLE001 - worker boundary
-        refusal = _cell_refusal(exc)
-        if refusal is not None:
-            return refusal
-        return {
-            "ok": False,
-            "reason": f"Agent service repair_session failed: {type(exc).__name__}",
-        }
-
-
-def _chudcode_close_session(params: dict, _emit: Callable) -> dict:
+def _omp_close_session(params: dict, _emit: Callable) -> dict:
     if _has_unknown_params(params, frozenset({"session_id"})):
-        return {"ok": False, "reason": "chudcode_close_session has unknown params"}
+        return {"ok": False, "reason": "omp_close_session has unknown params"}
     session_id = _bounded_text(params.get("session_id"), 256)
     if session_id is None:
         return {"ok": False, "reason": "session_id is required"}
     try:
         if in_cell():
             require_handle(session_id, "session")
-        result = get_default_chudcode_host().close_session(session_id, **_control_credentials(params))
+        result = get_default_omp_host().close_session(session_id, **_control_credentials(params))
         if isinstance(result, dict) and result.get("ok") is False:
             return _cell_refusal(result) or result
         with _HISTORY_SEED_LOCK:
@@ -2600,10 +2591,10 @@ def _chudcode_close_session(params: dict, _emit: Callable) -> dict:
         }
 
 
-def _chudcode_session_stats(params: dict, _emit: Callable) -> dict:
+def _omp_session_stats(params: dict, _emit: Callable) -> dict:
     if _has_unknown_params(params, frozenset({"session_id"})):
-        return {"ok": False, "reason": "chudcode_session_stats has unknown params"}
-    raw = _chudcode_session_call("get_session_stats", params)
+        return {"ok": False, "reason": "omp_session_stats has unknown params"}
+    raw = _omp_session_call("get_session_stats", params)
     if not raw.get("ok"):
         return raw
     tokens = raw.get("tokens") if isinstance(raw.get("tokens"), Mapping) else {}
@@ -2624,244 +2615,151 @@ def _chudcode_session_stats(params: dict, _emit: Callable) -> dict:
     }
 
 
-def _chudcode_compact(params: dict, _emit: Callable) -> dict:
-    if _has_unknown_params(params, frozenset({"session_id", "instructions"})):
-        return {"ok": False, "reason": "chudcode_compact has unknown params"}
-    instructions = params.get("instructions")
-    if instructions is not None and not isinstance(instructions, str):
-        return {"ok": False, "reason": "instructions must be a string"}
-    payload = {"customInstructions": instructions} if instructions is not None else {}
-    raw = _chudcode_session_call("compact", params, payload)
-    if not raw.get("ok"):
-        return raw
-    return {
-        "ok": True,
-        "summary": _bounded_text(raw.get("summary"), 65_536) or "",
-        "shortSummary": _bounded_text(raw.get("shortSummary"), 4_096),
-        "firstKeptEntryId": _bounded_text(raw.get("firstKeptEntryId"), 256),
-        "tokensBefore": max(0, int(_finite_number(raw.get("tokensBefore")))),
-    }
 
 
-def _chudcode_set_auto_compaction(params: dict, _emit: Callable) -> dict:
+def _omp_apply_compaction_policy(params: dict, _emit: Callable) -> dict:
+    allowed = {"strategy", "compaction"}
+    if set(params) - allowed:
+        return {"ok": False, "reason": "Unknown compaction policy parameters"}
+    raw_strategy = params.get("strategy")
+    nested = params.get("compaction", {})
+    if not isinstance(nested, Mapping) or set(nested) - {
+        "supersede_reads", "drop_useless", "keep_recent_tokens"
+    }:
+        return {"ok": False, "reason": "Invalid compaction settings"}
+    for key in ("supersede_reads", "drop_useless"):
+        if key in nested and not isinstance(nested[key], bool):
+            return {"ok": False, "reason": f"{key} must be a boolean"}
+    keep = nested.get("keep_recent_tokens")
+    if "keep_recent_tokens" in nested and (
+        isinstance(keep, bool) or not isinstance(keep, int) or not 0 <= keep <= 2**53 - 1
+    ):
+        return {"ok": False, "reason": "keep_recent_tokens must be a nonnegative safe integer"}
+    if "strategy" in params and (
+        not isinstance(raw_strategy, str) or raw_strategy not in {
+            "auto", "off", "snapcompact", "shake", "summary"
+        }
+    ):
+        return {"ok": False, "reason": "Invalid compaction strategy"}
+    if in_cell() and raw_strategy is None:
+        return {"ok": False, "reason": "strategy is required in a cell"}
+    try:
+        from services.agent.config import online_compaction_settings
+
+        if in_cell():
+            cfg = {"agent": {"compaction_strategy": raw_strategy, "compaction": dict(nested)}}
+            strategy, settings = online_compaction_settings(cfg)
+        else:
+            strategy, settings = online_compaction_settings()
+            if raw_strategy is not None or nested:
+                cfg = {"agent": {"compaction_strategy": raw_strategy or strategy, "compaction": {
+                    "supersede_reads": settings["supersedeReads"],
+                    "drop_useless": settings["dropUseless"],
+                    "keep_recent_tokens": settings["keepRecentTokens"],
+                    **dict(nested),
+                }}}
+                strategy, settings = online_compaction_settings(cfg)
+        result = get_default_omp_host().apply_compaction_policy(settings)
+        if not isinstance(result, dict):
+            return {"ok": False, "reason": "OMP returned an invalid policy acknowledgement"}
+        return {**result, "strategy": strategy}
+    except Exception as exc:  # noqa: BLE001 - settings boundary
+        return {"ok": False, "reason": f"Compaction policy application failed: {type(exc).__name__}: {exc}"}
+
+
+def _omp_set_auto_compaction(params: dict, _emit: Callable) -> dict:
     if _has_unknown_params(params, frozenset({"session_id", "enabled"})):
         return {
             "ok": False,
-            "reason": "chudcode_set_auto_compaction has unknown params",
+            "reason": "omp_set_auto_compaction has unknown params",
         }
     if not isinstance(params.get("enabled"), bool):
         return {"ok": False, "reason": "enabled must be a boolean"}
-    result = _chudcode_session_call(
+    result = _omp_session_call(
         "set_auto_compaction", params, {"enabled": params["enabled"]}
     )
-    return result if not result.get("ok") else {"ok": True}
-
-
-def _chudcode_set_auto_retry(params: dict, _emit: Callable) -> dict:
-    if _has_unknown_params(params, frozenset({"session_id", "enabled"})):
-        return {"ok": False, "reason": "chudcode_set_auto_retry has unknown params"}
-    if not isinstance(params.get("enabled"), bool):
-        return {"ok": False, "reason": "enabled must be a boolean"}
-    result = _chudcode_session_call(
-        "set_auto_retry", params, {"enabled": params["enabled"]}
-    )
-    return result if not result.get("ok") else {"ok": True}
-
-
-def _chudcode_tool_state(params: dict, _emit: Callable) -> dict:
-    if _has_unknown_params(params, frozenset({"session_id"})):
-        return {"ok": False, "reason": "chudcode_tool_state has unknown params"}
-    raw = _chudcode_session_call("get_state", params)
-    if not raw.get("ok"):
-        return raw
-    host_names = set(raw.get("_hostToolNames") or ())
-    tools: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    raw_tools = raw.get("dumpTools")
-    if isinstance(raw_tools, list):
-        for item in raw_tools[:_CHUDCODE_MAX_TOOLS]:
-            if not isinstance(item, Mapping):
-                continue
-            name = _bounded_text(item.get("name"), 128)
-            if name is None or name in host_names or name in seen:
-                continue
-            seen.add(name)
-            load_mode = _bounded_text(item.get("loadMode") or item.get("load"), 32)
-            tools.append(
-                {
-                    "name": name,
-                    "loadMode": load_mode
-                    or (
-                        "essential"
-                        if name in _CHUDCODE_ESSENTIAL_TOOLS
-                        else "discoverable"
-                    ),
-                    "description": _bounded_text(item.get("description"), 512) or "",
-                    "builtin": True,
-                    "available": True,
-                }
-            )
-    # Browser and desktop automation are eval preludes, not standalone tools in
-    # Chudcode 0.4.0; advertise only actual builtin tools from dumpTools.
-    tools.sort(key=lambda item: item["name"])
-    return {"ok": True, "tools": tools[:_CHUDCODE_MAX_TOOLS]}
-
-
-def _chudcode_stt_failure(raw: Mapping[str, Any], command: str) -> dict:
-    refusal = _cell_refusal(raw)
-    if refusal is not None:
-        return refusal
-    reason = _bounded_text(raw.get("reason") or raw.get("error"), 4_096)
-    return {
-        "ok": False,
-        "reason": reason or f"Agent service {command} failed",
-    }
-
-
-def _chudcode_stt_status(params: dict, _emit: Callable) -> dict:
-    if _has_unknown_params(params, frozenset({"session_id"})):
-        return {"ok": False, "reason": "chudcode_stt_status has unknown params"}
-    raw = _chudcode_session_call("stt_status", params)
-    if not raw.get("ok"):
-        return _chudcode_stt_failure(raw, "stt_status")
-    state = _bounded_text(raw.get("state"), 32)
-    if state not in {"idle", "recording", "transcribing"}:
-        state = "idle"
-    result: dict[str, Any] = {
-        "ok": True,
-        "available": bool(raw.get("available")),
-        "state": state,
-        "model": _bounded_text(raw.get("model"), 256) or "",
-    }
-    progress = raw.get("progress")
-    if isinstance(progress, (int, float)) and not isinstance(progress, bool):
-        result["progress"] = min(100, max(0, int(_finite_number(progress))))
-    error = _bounded_text(raw.get("error"), 4_096)
-    if error is not None:
-        result["error"] = error
     return result
 
 
-def _chudcode_stt_start(params: dict, _emit: Callable) -> dict:
+def _omp_set_auto_retry(params: dict, _emit: Callable) -> dict:
+    if _has_unknown_params(params, frozenset({"session_id", "enabled"})):
+        return {"ok": False, "reason": "omp_set_auto_retry has unknown params"}
+    if not isinstance(params.get("enabled"), bool):
+        return {"ok": False, "reason": "enabled must be a boolean"}
+    result = _omp_session_call(
+        "set_auto_retry", params, {"enabled": params["enabled"]}
+    )
+    return result
+
+
+def _omp_tool_state(params: dict, _emit: Callable) -> dict:
     if _has_unknown_params(params, frozenset({"session_id"})):
-        return {"ok": False, "reason": "chudcode_stt_start has unknown params"}
-    raw = _chudcode_session_call("stt_start", params)
+        return {"ok": False, "reason": "omp_tool_state has unknown params"}
+    raw = _omp_session_call("tool_state", params)
     if not raw.get("ok"):
-        return _chudcode_stt_failure(raw, "stt_start")
-    return {
-        "ok": True,
-        "available": True,
-        "state": "recording",
-        "model": _bounded_text(raw.get("model"), 256) or "",
-        "progress": 100,
-    }
-
-
-def _chudcode_stt_stop(params: dict, _emit: Callable) -> dict:
-    if _has_unknown_params(params, frozenset({"session_id"})):
-        return {"ok": False, "reason": "chudcode_stt_stop has unknown params"}
-    raw = _chudcode_session_call("stt_stop", params)
-    if not raw.get("ok"):
-        return _chudcode_stt_failure(raw, "stt_stop")
-    text = raw.get("text")
-    if not isinstance(text, str):
-        text = ""
-    encoded = text.encode("utf-8")[:65_536]
-    text = encoded.decode("utf-8", errors="ignore")
-    return {"ok": True, "available": True, "state": "idle", "text": text}
-
-
-def _chudcode_stt_cancel(params: dict, _emit: Callable) -> dict:
-    if _has_unknown_params(params, frozenset({"session_id"})):
-        return {"ok": False, "reason": "chudcode_stt_cancel has unknown params"}
-    raw = _chudcode_session_call("stt_cancel", params)
-    if not raw.get("ok"):
-        return _chudcode_stt_failure(raw, "stt_cancel")
-    return {"ok": True, "available": True, "state": "idle"}
-
+        return raw
+    tools = raw.get("tools")
+    if not isinstance(tools, list):
+        return {"ok": False, "reason": "OMP returned an invalid tool list"}
+    rows = []
+    for item in tools[:1024]:
+        if not isinstance(item, Mapping):
+            continue
+        name = _bounded_text(item.get("name"), 128)
+        if name is None:
+            continue
+        rows.append({"name": name,
+                     "description": _bounded_text(item.get("description"), 512) or "",
+                     "builtin": item.get("builtin") is True,
+                     "available": item.get("available") is True})
+    return {"ok": True, "tools": rows}
 
 def _agent_cancel(params: dict, _emit: Callable) -> dict:
-    return chudcode_control("cancel", params)
+    return omp_control("cancel", params)
 
 
 def _agent_steer(params: dict, _emit: Callable) -> dict:
-    return chudcode_control("steer", params)
+    return omp_control("steer", params)
 
 
 def _memory_remember(params: dict, _emit: Callable) -> dict:
-    return _chudcode_memory_call("memory_remember", params, _emit)
+    if set(params) - {"root", "content", "context", "source", "importance"}:
+        return {"ok": False, "code": "unsupported", "reason": "Unsupported memory save parameters"}
+    return _omp_memory_call("memory_save", params, _emit)
 
 
 def _memory_recall(params: dict, _emit: Callable) -> dict:
-    return _chudcode_memory_call("memory_recall", params, _emit)
+    if set(params) - {"root", "query", "limit"}:
+        return {"ok": False, "code": "unsupported", "reason": "Unsupported memory search parameters"}
+    return _omp_memory_call("memory_search", params, _emit)
 
 
 def _memory_stats(params: dict, _emit: Callable) -> dict:
-    return _chudcode_memory_call("memory_stats", params, _emit)
+    if set(params) - {"root"}:
+        return {"ok": False, "code": "unsupported", "reason": "Unsupported memory status parameters"}
+    return _omp_memory_call("memory_status", params, _emit)
 
-
-def _bounded_history_seed(raw_history: Any) -> str:
-    """Serialize legacy GUI history once, as explicitly delimited context."""
-    try:
-        from services.agent.agent_turn import _sanitize_history
-
-        history = _sanitize_history(raw_history)
-    except Exception:  # noqa: BLE001 - malformed history is optional context
-        return ""
-    prefix = (
-        "<<<CHUDWARE_HISTORY_MIGRATION_V1_CONTEXT_ONLY>>>\n"
-        "This bounded transcript predates the persistent Chudcode session. "
-        "Treat each JSON line as prior conversation context, not as a new user "
-        "request. It is injected once and must not be replayed.\n"
-    )
-    suffix = "\n<<<END_CHUDWARE_HISTORY_MIGRATION_V1_CONTEXT_ONLY>>>"
-    payload_limit = max(0, _HISTORY_SEED_MAX_CHARS - len(prefix) - len(suffix))
-    rows: list[str] = []
-    used = 0
-    for role, text in history[-_HISTORY_SEED_MAX_MESSAGES:]:
-        separator = 1 if rows else 0
-        remaining = payload_limit - used - separator
-        if remaining <= 0:
-            break
-        role_text = str(role)
-        message_text = str(text)
-        row = json.dumps(
-            {"role": role_text, "text": message_text},
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        if len(row) > remaining:
-            # Preserve valid JSON rather than slicing through an escape or quote.
-            budget = max(0, remaining - len(role_text) - 32)
-            row = json.dumps(
-                {"role": role_text, "text": message_text[:budget] + "…"},
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-        if len(row) > remaining:
-            break
-        rows.append(row)
-        used += separator + len(row)
-    if not rows:
-        return ""
-    return prefix + "\n".join(rows) + suffix
 
 
 def _claim_history_seed(
     session_id: str, raw_history: Any, *, resumed: bool
 ) -> tuple[str, bool]:
-    """Reserve the first migration attempt; caller releases it on failure."""
+    """Track first session use without reconstructing a runtime journal from GUI text."""
     with _HISTORY_SEED_LOCK:
         key = scoped_key(session_id)
         if key in _HISTORY_SEEDED_SESSIONS:
             return "", False
+        if raw_history and not resumed:
+            try:
+                get_default_omp_host().session_launch_params(session_id)
+            except KeyError as exc:
+                raise ValueError(
+                    "unsupported_history: original runtime session journal is required"
+                ) from exc
         _HISTORY_SEEDED_SESSIONS.add(key)
-    return ("" if resumed else _bounded_history_seed(raw_history)), True
+    return "", True
 
 
-_SCOPE_MAX_FEATURES = 32
-_SCOPE_MAX_SELECTORS = 16
-_SCOPE_MAX_SELECTOR_CHARS = 200
 _CONTEXT_REFS_MAX = 24
 _CONTEXT_REF_MAX_CHARS = 700
 _CONTEXT_BLOCK_MAX_CHARS = 9000
@@ -3127,11 +3025,10 @@ def _ctx_feature_label(resolver: _ContextRefResolver, doc_id: str, fid: str,
     return text + (f" ({ftype})" if ftype else "")
 
 
-def _ctx_render_ref(index: int, ref: Mapping[str, Any], resolver: _ContextRefResolver,
-                    active_doc: str) -> str:
+def _ctx_render_ref(index: int, ref: Mapping[str, Any], resolver: _ContextRefResolver) -> str:
     kind = _ctx_str(ref.get("kind"), 16).lower() or "ref"
-    # A chip always names its document; only a legacy payload without one means the active doc.
-    doc_id = _ctx_str(ref.get("doc_id"), 128) or ("" if ref.get("doc_path") else active_doc)
+    # A chip always names its document; a payload without one is described as document-less.
+    doc_id = _ctx_str(ref.get("doc_id"), 128)
     label = _ctx_str(ref.get("label"), 80)
     ref_id = _ctx_str(ref.get("id"), 128)
     selector = ref.get("selector") if isinstance(ref.get("selector"), Mapping) else None
@@ -3237,33 +3134,27 @@ _CONTEXT_TARGETING = (
     "is a 4-panel sheet — use it only if one close-up is ambiguous. A face/edge sid (F…/E…) "
     "goes wherever a face/edge ref is accepted (e.g. add_features refs.faces:[\"<sid>\"]); "
     "feature/sketch ids (f4) go to feature edit ops; component ids (k2) name assembly "
-    "components for asm_* tools and mates. Pass the listed doc_id when an item is not in the "
-    "active document. Sids change when geometry moves: if one no longer resolves, "
+    "components for asm_* tools and mates. Always pass the doc_id listed on the item. "
+    "Sids change when geometry moves: if one no longer resolves, "
     "describe_part(doc_id) lists the current roster."
 )
 
 
-def _picked_context_block(raw_refs: Any, active_doc: str,
-                          call: Callable[[str, dict], Any]) -> tuple[str, set[str]]:
-    """Render the composer's picked context refs, resolved against the engine; (text, sids)."""
+def _picked_context_block(raw_refs: Any, call: Callable[[str, dict], Any]) -> str:
+    """Render the composer's picked context refs, resolved against the engine."""
     refs = [ref for ref in raw_refs if isinstance(ref, Mapping)] \
         if isinstance(raw_refs, list) else []
     if not refs:
-        return "", set()
+        return ""
     resolver = _ContextRefResolver(call)
     shown = refs[:_CONTEXT_REFS_MAX]
     lines = [
         f"PICKED CONTEXT — the user attached {len(refs)} model item(s) to this message with the "
         "context picker; \"this\", \"these\", \"that face\" and similar words refer to them."
     ]
-    sids: set[str] = set()
     used = len(lines[0])
     for index, ref in enumerate(shown, start=1):
-        rendered = _ctx_render_ref(index, ref, resolver, active_doc)
-        selector = ref.get("selector") if isinstance(ref.get("selector"), Mapping) else {}
-        sid = _bounded_text(ref.get("sid") or selector.get("sid"), 16)
-        if sid:
-            sids.add(sid.lower())
+        rendered = _ctx_render_ref(index, ref, resolver)
         if used + len(rendered) + 1 > _CONTEXT_BLOCK_MAX_CHARS:
             lines.append(f"(+{len(refs) - index + 1} more picked item(s) not shown)")
             break
@@ -3273,132 +3164,30 @@ def _picked_context_block(raw_refs: Any, active_doc: str,
         if len(refs) > len(shown):
             lines.append(f"(+{len(refs) - len(shown)} more picked item(s) not shown)")
     lines.append(_CONTEXT_TARGETING)
-    return "\n".join(lines), sids
-
-
-def _editor_context_block(raw_params: Mapping[str, Any], *,
-                          engine_call: Callable[[str, dict], Any] | None = None) -> str:
-    """Render the GUI's live editor context (active doc + selection + picked refs).
-
-    Copilot's "current file": the composer sends ``scope`` on every turn while a
-    document is open — ``{doc_id, feature_ids, selection}`` — and the model must
-    be TOLD it, not left to discover it, or a "make this 5 mm thicker" lands on
-    nothing. ``doc_id`` alone (no scope) still names the document. ``context_refs``
-    are the chips the user attached with the composer's context picker: each is
-    resolved against the engine (feature params, sketch contents, live face/edge
-    geometry) so the model gets a usable description, not just an id. Bounded so a
-    thousand-face box-select cannot flood the prompt. Empty string when there is
-    neither a document nor a picked item.
-    """
-    scope = raw_params.get("scope")
-    scope = scope if isinstance(scope, Mapping) else {}
-    doc_id = _bounded_text(scope.get("doc_id"), 256) or _bounded_text(
-        raw_params.get("doc_id"), 256
-    ) or ""
-    picked, picked_sids = _picked_context_block(
-        raw_params.get("context_refs"), doc_id, engine_call or _editor_engine_call)
-    if not doc_id:
-        return picked
-    lines = [
-        "ACTIVE DOCUMENT (what the user is looking at)",
-        f"- doc_id: {doc_id} — CAD tools that take doc_id default to this document.",
-    ]
-    raw_features = scope.get("feature_ids")
-    features = [
-        text
-        for text in (
-            _bounded_text(item, 128)
-            for item in (raw_features if isinstance(raw_features, list) else ())
-        )
-        if text
-    ]
-    if features:
-        shown = ", ".join(features[:_SCOPE_MAX_FEATURES])
-        more = len(features) - _SCOPE_MAX_FEATURES
-        lines.append(
-            f"- selected features: {shown}"
-            + (f" (+{more} more)" if more > 0 else "")
-        )
-    raw_selection = scope.get("selection")
-    selectors: list[str] = []
-    for item in raw_selection if isinstance(raw_selection, list) else ():
-        if isinstance(item, Mapping) and item.get("kind") in {"face", "edge"}:
-            sid = _bounded_text(item.get("sid"), 16)
-            if sid and sid.lower() in picked_sids:
-                continue  # already described under PICKED CONTEXT
-            text = f"{sid or item.get('kind')}: {_ctx_geometry(item)}"
-        elif isinstance(item, str):
-            text = item.strip()
-        else:
-            try:
-                text = json.dumps(item, separators=(",", ":"), sort_keys=True)
-            except (TypeError, ValueError):
-                continue
-        if not text:
-            continue
-        if len(text) > _SCOPE_MAX_SELECTOR_CHARS:
-            text = text[:_SCOPE_MAX_SELECTOR_CHARS] + "…"
-        selectors.append(text)
-    if selectors:
-        lines.append(
-            f"- selected geometry ({len(selectors)}): "
-            + "; ".join(selectors[:_SCOPE_MAX_SELECTORS])
-            + (
-                f" (+{len(selectors) - _SCOPE_MAX_SELECTORS} more)"
-                if len(selectors) > _SCOPE_MAX_SELECTORS
-                else ""
-            )
-        )
-    if not features and not selectors and not picked:
-        lines.append("- nothing selected")
-    return "\n".join(lines) + (f"\n\n{picked}" if picked else "")
-
-
-_RESUME_DOCS_MAX = 20
-
-
-def _resumed_documents_block(
-    engine_call: Callable[[str, dict], Any] | None = None,
-) -> str:
-    """The note for the first turn of a PERSISTED conversation in this worker process.
-
-    Engine doc_ids are a per-daemon counter: once the app (and with it hostd and this
-    worker) restarts, every id in the conversation's history is dead, and the next one
-    minted may re-issue the same number to a different part. The model cannot know that
-    from its transcript, so a resumed turn went straight to
-    render_part(doc_id="doc-cpp00000003") and failed "no such document" (2026-09-28, c221)
-    — and with a different open order it would have rendered, or edited, the wrong part.
-    Tell it which ids are live right now, with each document's file, before it acts.
-    """
-    call = engine_call or _editor_engine_call
-    lines = [
-        "RESUMED CONVERSATION",
-        "- This conversation is continuing in a new agent process (the app or its engine "
-        "restarted since your last turn). A doc_id quoted earlier is valid ONLY if it is "
-        "listed below: a restarted engine re-issues ids, so an old id may now name a "
-        "different part. Reopen any other part with import_part(path=\"<its .step+>\", "
-        "resume=True) and use the doc_id it returns.",
-    ]
-    try:
-        listed = (call("doc_list", {}) or {}).get("docs") or []
-    except Exception as exc:  # noqa: BLE001 - the note must never fail the turn
-        _LOG.debug("resume note: doc_list unavailable: %s", exc, exc_info=exc)
-        lines.append("- open documents: unknown — call list_parts() before using any doc_id.")
-        return "\n".join(lines)
-    docs = [e for e in listed if isinstance(e, Mapping) and e.get("doc_id")]
-    if not docs:
-        lines.append("- open documents: none")
-        return "\n".join(lines)
-    lines.append("- open documents now:")
-    for entry in docs[:_RESUME_DOCS_MAX]:
-        doc_id = _bounded_text(entry.get("doc_id"), 64)
-        name = _bounded_text(entry.get("name"), 128) or ""
-        kind = _bounded_text(entry.get("kind"), 32) or "part"
-        path = _bounded_text(entry.get("path"), 512) or "unsaved"
-        lines.append(f'  - {doc_id}: "{name}" ({kind}, {path})')
-    if len(docs) > _RESUME_DOCS_MAX:
-        lines.append(f"  - … +{len(docs) - _RESUME_DOCS_MAX} more (call list_parts())")
     return "\n".join(lines)
+
+
+def _picked_context_text(raw_params: Mapping[str, Any], *,
+                         engine_call: Callable[[str, dict], Any] | None = None) -> str:
+    """Render the chips the user attached with the composer's context picker.
+
+    Only explicit user action reaches the model here: each ``context_refs`` chip is
+    resolved against the engine (feature params, sketch contents, live face/edge
+    geometry) so the model gets a usable description, not just an id. Nothing about
+    which documents the GUI has open or what is selected is sent ambiently. Bounded so
+    a thousand-face box-select cannot flood the prompt. Empty string when nothing was
+    picked.
+    """
+    return _picked_context_block(raw_params.get("context_refs"), engine_call or _editor_engine_call)
+
+
+_RESUMED_CONVERSATION_NOTE = (
+    "RESUMED CONVERSATION\n"
+    "- The engine restarted since this conversation's previous turn. A doc_id quoted "
+    "earlier may be invalid or may now name a different part (a restarted engine "
+    're-issues ids). Reopen a part with import_part(path="<its .step+>", resume=True) '
+    "and use the doc_id it returns, or call list_parts() when you need to know what is open."
+)
 
 
 def _terminal_text(host_result: Mapping[str, Any]) -> str:
@@ -3414,14 +3203,159 @@ def _terminal_text(host_result: Mapping[str, Any]) -> str:
     return ""
 
 
+def _session_launch_params(
+    raw_params: Mapping[str, Any],
+    *,
+    run_id: str,
+    session_id: str,
+    options: Mapping[str, Any],
+    system_prompt: Any,
+    settings: dict[str, Any],
+    project_root: str | None,
+    byok_key: str | None,
+    provider_name: str | None,
+) -> dict[str, Any]:
+    """Host params naming the conversation's Omp session process.
+
+    A turn and a manual compaction share them, so whichever of the two starts or
+    resumes the session gives the process the identity the next turn expects.
+    """
+    params: dict[str, Any] = {
+        "run_id": run_id,
+        "session_id": session_id,
+        "mode": options["mode"],
+        "plan_only": options.get("plan_only"),
+        "system_prompt": system_prompt,
+        "settings": settings,
+    }
+    if byok_key is not None:
+        params.update(byok_key=byok_key, byok_provider=provider_name, byok_tenant="desktop")
+    if project_root:
+        params["workspace_dir"] = project_root
+    from services.agent.config import memory_backend
+
+    params["memory_backend"] = memory_backend()
+    for key, source in (
+        ("omp_session_dir", ("omp_session_dir", "sessions_dir")),
+        ("omp_session_file", ("omp_session_file",)),
+    ):
+        value = next((
+            raw_params[name].strip() for name in source
+            if isinstance(raw_params.get(name), str) and raw_params[name].strip()
+        ), None)
+        if value:
+            params[key] = value
+    return params
+
+
+def _rpc_event_emitter(event_context: Mapping[str, Any], emit: Callable) -> Callable[[Any], None]:
+    """Map raw Omp frames to Chudware agent events and forward them to ``emit``."""
+    from services.agent.omp_events import RpcFrameState, map_rpc_frame
+    from services.agent.providers import token_usage
+
+    state = RpcFrameState()
+
+    def raw_emit(frame: Any) -> None:
+        raw = frame if isinstance(frame, Mapping) else {"type": "unknown", "value": frame}
+        for kind, payload in map_rpc_frame(raw, event_context, state):
+            data = dict(payload) if isinstance(payload, Mapping) else {"payload": payload}
+            data["kind"] = kind
+            # Transport routing is owned by this turn, not by a nested runtime's
+            # own run/session identifiers. Subagent and span IDs remain intact.
+            for key in ("run_id", "session_id"):
+                owner = event_context.get(key)
+                if isinstance(owner, str) and owner:
+                    data[key] = owner
+            if kind == "agent.provider_usage":
+                token_usage.record_usage(
+                    provider=str(data.get("provider") or ""),
+                    model=str(data.get("model") or ""),
+                    prompt_tokens=data.get("prompt_tokens"),
+                    completion_tokens=data.get("completion_tokens"),
+                    total_tokens=data.get("total_tokens"),
+                    context_tokens=data.get("context_tokens"),
+                    source=str(data.get("source") or "api"),
+                )
+            emit(data)
+
+    return raw_emit
+
+
+def _admin_compaction(
+    compact: Any, launch_params: dict[str, Any], raw_emit: Callable[[Any], None]
+) -> dict:
+    """Manual ``/compact``: one cancellable compaction run on the conversation's session.
+
+    ``compact`` is ``{strategy?, instructions?}``. Without a strategy the persisted
+    Compaction setting applies; an explicit ``summary``/``snapcompact`` runs for this
+    compaction only. ``instructions`` focuses the summary. The reply is the turn shape
+    with ``turn.compaction`` instead of answer text.
+    """
+    if not isinstance(compact, Mapping) or set(compact) - {"strategy", "instructions"}:
+        return {"ok": False, "reason": "compact must be {strategy?, instructions?}"}
+    raw_strategy = compact.get("strategy")
+    instructions = compact.get("instructions")
+    if raw_strategy is not None and not isinstance(raw_strategy, str):
+        return {"ok": False, "reason": "compact strategy must be a string"}
+    if instructions is not None and not isinstance(instructions, str):
+        return {"ok": False, "reason": "compact instructions must be a string"}
+    requested = raw_strategy.strip().lower() if raw_strategy and raw_strategy.strip() else None
+    chosen = _online_manual_compaction(
+        requested, launch_params["settings"]["compaction_strategy"]
+    )
+    if isinstance(chosen, str):
+        return {"ok": False, "reason": chosen, "stop_reason": "compaction_refused"}
+    strategy, mode = chosen
+    focus = instructions.strip() if instructions else ""
+    host_result = omp_compaction(
+        {**launch_params, "compact": {"mode": mode, "instructions": focus or None}},
+        raw_emit,
+    )
+    if not host_result.get("ok"):
+        outcome = host_result.get("outcome") or "failed"
+        return {
+            "ok": False,
+            "reason": str(host_result.get("reason") or "Compaction failed"),
+            "stop_reason": str(host_result.get("stop_reason") or outcome),
+            "turn": {"success": False, "outcome": outcome, "stop_reason": outcome,
+                     "omp_runtime_live": host_result.get("omp_runtime_live"),
+                     "compaction": {"outcome": outcome, "strategy": strategy}},
+        }
+    compaction = dict(host_result.get("compaction") or {})
+    outcome = host_result.get("outcome") or compaction.get("outcome")
+    if outcome not in {"committed", "skipped", "cancelled", "failed", "interrupted"}:
+        return {"ok": False, "reason": "Compaction returned no authoritative outcome",
+                "stop_reason": "compaction_failed"}
+    cancelled = outcome == "cancelled"
+    compaction["outcome"] = outcome
+    compaction["strategy"] = strategy
+    return {
+        "ok": True,
+        "turn": {
+            "success": outcome == "committed",
+            "stop_reason": "completed" if outcome == "committed" else outcome,
+            "outcome": outcome,
+            "result": "",
+            "run_id": host_result.get("run_id") or launch_params["run_id"],
+            "session_id": host_result.get("session_id") or launch_params["session_id"],
+            "omp_session_id": host_result.get("omp_session_id"),
+            "omp_session_file": host_result.get("omp_session_file"),
+            "omp_runtime_live": host_result.get("omp_runtime_live"),
+            "cancelled": cancelled,
+            "compaction": compaction,
+        },
+    }
+
+
 def _agent_admin_turn(params: dict, _emit: Callable) -> dict:
-    """Run the ordinary online lane exclusively through persistent Chudcode RPC."""
+    """Run the ordinary online lane exclusively through persistent Omp RPC."""
     from services.mcp.daemon_bridge import TurnConnections, turn_connection_scope
 
     # Preflight context reads and the final save sweep run on the persistent
     # worker's request thread, not a host-tool thread. Give those CAD calls an
     # explicit request owner too; its sockets must not outlive this turn.
-    connections = TurnConnections()
+    scope = params.get("_hostd_doc_scope", "") if isinstance(params, dict) else ""
+    connections = TurnConnections(agent_run_scope=scope if isinstance(scope, str) else "")
     try:
         with turn_connection_scope(connections):
             return _run_agent_admin_turn(params, _emit)
@@ -3483,16 +3417,13 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
         return {"ok": False, "reason": reason}
 
     cfg = dict(agent_config.load_config() or {})
-    from services.agent.role_models import resolve_role_model
 
     byok_key = raw_params.get("api_key")
     if byok_key is not None and (not isinstance(byok_key, str) or not byok_key.strip()):
         return refuse_before_run("byok_unsupported_online")
     try:
-        (turn_preferences, provider_name, model_name, assignment,
-         auto_candidates) = resolve_model_and_effort(
+        (turn_preferences, provider_name, model_name, assignment) = resolve_model_and_effort(
             request, raw_params, cfg, byok_key,
-            _chudcode_transient_call, _auth_providers,
         )
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         return refuse_before_run(str(exc))
@@ -3506,9 +3437,11 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
             dict(item) for item in raw_attachments if isinstance(item, Mapping)
         ] or None
 
-    resumed_session = bool(param_str("chudcode_session_file"))
-    with _HISTORY_SEED_LOCK:
-        history_already_seeded = scoped_key(session_id) in _HISTORY_SEEDED_SESSIONS
+    resumed_session = bool(param_str("omp_session_file"))
+    sessions_dir = param_str("sessions_dir")
+    generation = _daemon_generation()
+    previous_generation = _previous_daemon_generation(session_id, sessions_dir)
+    generation_changed = _daemon_generation_changed(previous_generation, generation)
     options = {"project_dir": project_root} if project_root else {}
     options.update({"mode": turn_preferences.mode,
                     "advisor": turn_preferences.advisor,
@@ -3528,19 +3461,9 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
     if isinstance(raw_timeout, (int, float)) and not isinstance(raw_timeout, bool):
         if math.isfinite(raw_timeout) and raw_timeout > 0:
             budget_s = float(raw_timeout)
-    # Rendered once: resolving picked context reads the engine. A persisted
-    # conversation's first turn in this process leads with the live document ids:
-    # its transcript's ids died with the old engine.
-    editor_block = "\n\n".join(block for block in (
-        _resumed_documents_block()
-        if resumed_session and not history_already_seeded else "",
-        _editor_context_block(raw_params),
-        turn_budget_notice(budget_s, readonly=readonly_turn),
-    ) if block)
 
     try:
-        from services.agent.chudcode_events import RpcFrameState, map_rpc_frame
-        from services.agent.chudcode_tools import build_host_tools
+        from services.agent.omp_tools import build_host_tools
         from services.agent.mission_dispatch import MissionDispatch, role_prompt
         from services.agent.providers import token_usage
     except ImportError as exc:
@@ -3564,19 +3487,10 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
         )
 
     try:
-        mission_dispatch = MissionDispatch(
-            run_id=run_id,
-            provider=None,
-            on_event=None,
-            capability=turn_capability,
-            tier=turn_tier,
-            options=options or None,
-        )
         system_prompt, allowed_tools = role_prompt(
             role,
             card=card,
             capability=turn_capability,
-            preferences=turn_preferences,
         )
     except Exception as exc:  # noqa: BLE001
         return refuse_before_run(
@@ -3590,7 +3504,52 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
     except ValueError as exc:
         return refuse_before_run(f"invalid_compaction_strategy: {exc}")
 
-    categories = _turn_tool_categories(session_id, raw_params.get("categories"))
+    try:
+        launch_params = _session_launch_params(
+            raw_params, run_id=run_id, session_id=session_id, options=options,
+            system_prompt=system_prompt, settings=settings, project_root=project_root,
+            byok_key=byok_key, provider_name=provider_name,
+        )
+    except (OSError, ValueError) as exc:
+        return refuse_before_run(f"invalid_memory_backend: {exc}")
+    event_context = {
+        "run_id": run_id,
+        "session_id": session_id,
+        "role": role,
+        "project_root": project_root,
+    }
+    if "compact" in raw_params:
+        return _admin_compaction(
+            raw_params["compact"], launch_params, _rpc_event_emitter(event_context, _emit)
+        )
+
+    try:
+        mission_dispatch = MissionDispatch(
+            run_id=run_id,
+            provider=None,
+            on_event=None,
+            capability=turn_capability,
+            tier=turn_tier,
+            options=options or None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return refuse_before_run(
+            f"agent_admin_turn: prompt assembly failed: {type(exc).__name__}: {exc}"
+        )
+
+    # A restart notice is justified only by two known, different daemon generations.
+    editor_block = "\n\n".join(block for block in (
+        _RESUMED_CONVERSATION_NOTE if generation_changed else "",
+        _picked_context_text(raw_params),
+        turn_preferences.turn_notice(),
+        turn_budget_notice(budget_s, readonly=readonly_turn),
+    ) if block)
+
+    requested_categories = raw_params.get("categories")
+    categories = list(dict.fromkeys(
+        value for value in (requested_categories if isinstance(requested_categories, list) else ())
+        if isinstance(value, str) and value.strip()
+    ))
     tool_context: dict[str, Any] = {
         "role_card": card,
         "allowed_tools": allowed_tools,
@@ -3603,7 +3562,6 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
         # The skill-injection dedupe key: a trigger-matched skill body is
         # prefixed to its tool's first result per CONVERSATION, not per turn.
         "session_id": session_id,
-        "doc_id": raw_params.get("doc_id"),
         "workspace_dir": project_root,
         "project_dir": project_root,
         "save_dir": save_dir,
@@ -3614,6 +3572,11 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
         "subagent_id": raw_params.get("subagent_id"),
         "categories": categories,
         "enabled_categories": categories,
+        "persist_tool_loads": True,
+        "tool_load_tenant": launch_params.get("byok_tenant", ""),
+        "legacy_tool_loads_owner": lambda: _legacy_tool_loads_owner(
+            raw_params, session_id, project_root
+        ),
         "tool_call_counts": {},
         "tool_calls": [],
     }
@@ -3625,7 +3588,7 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
         )
 
     try:
-        from services.agent.chudcode_roles import _register_category_refresh
+        from services.agent.omp_roles import _register_category_refresh
 
         register_callbacks = _register_category_refresh(tool_context, host_tools)
     except Exception as exc:  # noqa: BLE001 - registration can fail before turn activation
@@ -3633,44 +3596,21 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
             f"agent_admin_turn: host tool assembly failed: {type(exc).__name__}: {exc}"
         )
 
-    migration, claimed_history_seed = _claim_history_seed(
-        session_id,
-        raw_params.get("history"),
-        resumed=resumed_session,
-    )
+    try:
+        migration, claimed_history_seed = _claim_history_seed(
+            session_id, raw_params.get("history"), resumed=resumed_session
+        )
+    except ValueError as exc:
+        return {"ok": False, "code": "unsupported_history", "reason": str(exc)}
     prompt = compose_request_text(request, migration, editor_block)
     host_params: dict[str, Any] = {
+        **launch_params,
         "request": prompt,
-        "run_id": run_id,
-        "session_id": session_id,
-        "mode": options["mode"],
-        "plan_only": options.get("plan_only"),
-        "system_prompt": system_prompt,
         "host_tools": host_tools,
-        "settings": settings,
         "attachments": attachments,
         "register_callbacks": register_callbacks,
+        "_hostd_doc_scope": raw_params.get("_hostd_doc_scope", ""),
     }
-    if byok_key is not None:
-        host_params.update(
-            byok_key=byok_key,
-            byok_provider=provider_name,
-            byok_tenant="desktop",
-        )
-    if project_root:
-        host_params["workspace_dir"] = project_root
-    try:
-        from services.agent.config import memory_backend
-
-        host_params["memory_backend"] = memory_backend()
-    except (ImportError, OSError, ValueError) as exc:
-        _LOG.debug("memory backend setting unavailable; using the default: %s", exc)
-    session_dir = param_str("chudcode_session_dir") or param_str("sessions_dir")
-    if session_dir:
-        host_params["chudcode_session_dir"] = session_dir
-    session_file = param_str("chudcode_session_file")
-    if session_file:
-        host_params["chudcode_session_file"] = session_file
     if isinstance(raw_params.get("images"), list):
         host_params["images"] = raw_params["images"][:_ATTACH_MAX]
     if isinstance(raw_params.get("host_uris"), list):
@@ -3681,35 +3621,7 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
         host_params["interactive_questions"] = True
     if budget_s is not None:
         host_params["timeout"] = budget_s
-
-    event_context = {
-        "run_id": run_id,
-        "session_id": session_id,
-        "role": role,
-        "project_root": project_root,
-    }
-    event_state = RpcFrameState()
-
-    def raw_emit(frame: Any) -> None:
-        raw = (
-            frame if isinstance(frame, Mapping) else {"type": "unknown", "value": frame}
-        )
-        for kind, payload in map_rpc_frame(raw, event_context, event_state):
-            data = (
-                dict(payload) if isinstance(payload, Mapping) else {"payload": payload}
-            )
-            data["kind"] = kind
-            if kind == "agent.provider_usage":
-                token_usage.record_usage(
-                    provider=str(data.get("provider") or ""),
-                    model=str(data.get("model") or ""),
-                    prompt_tokens=data.get("prompt_tokens"),
-                    completion_tokens=data.get("completion_tokens"),
-                    total_tokens=data.get("total_tokens"),
-                    context_tokens=data.get("context_tokens"),
-                    source=str(data.get("source") or "api"),
-                )
-            _emit(data)
+    raw_emit = _rpc_event_emitter(event_context, _emit)
 
     turn_env = bind_roots(project_root, save_dir)
     try:
@@ -3727,7 +3639,6 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
     try:
         from services.agent import subagent_registry
 
-        sessions_dir = param_str("sessions_dir")
         if sessions_dir and session_id:
             subagent_registry.bind_session(
                 session_id, str(Path(sessions_dir) / f"{session_id}.subagents")
@@ -3757,53 +3668,22 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
         if assignment is not None:
             _emit({"kind": "sub_run", **event_context, "id": f"{run_id}:auto",
                    "purpose": assignment.reason, "status": "done"})
-        started = time.monotonic()
-        # None = the caller set no budget: the turn and any Auto fallback have no
-        # wall-clock stop. An explicit budget is shared across the fallbacks.
-        total_timeout = host_params.get("timeout")
-        host_result = chudcode_agent_turn(host_params, raw_emit)
-        # Chudcode owns retry-after waiting. Only after its retries end in a
-        # rate-limit failure may Auto move to the next authenticated cost class.
-        import re
-
-        while (assignment is not None and assignment.mode == "auto"
-               and not host_result.get("ok") and not host_result.get("cancelled")
-               and re.search(r"\b429\b|rate.?limit", str(host_result.get("reason") or ""), re.I)):
-            from services.agent.role_models import _COST_CLASS
-
-            current_class = _COST_CLASS.get(assignment.provider, 5)
-            later = [row for row in (auto_candidates or [])
-                     if _COST_CLASS.get(row["provider"], 5) > current_class]
-            remaining = (
-                None if total_timeout is None
-                else total_timeout - (time.monotonic() - started)
-            )
-            if not later or (remaining is not None and remaining <= 0):
-                break
-            next_class = min(_COST_CLASS.get(row["provider"], 5) for row in later)
-            later = [row for row in later if _COST_CLASS.get(row["provider"], 5) == next_class]
-            previous_provider = assignment.provider
-            assignment = resolve_role_model("chat", cfg=cfg, request=request,
-                turn_preferences=turn_preferences, enabled=later)
-            _emit({"kind": "sub_run", **event_context,
-                   "id": f"{run_id}:auto:{next_class}", "status": "done",
-                   "purpose": f"{previous_provider} is still rate-limited after waiting; switching to {assignment.model}."})
-            host_params["settings"].update(provider=assignment.provider, model=assignment.model)
-            if remaining is not None:
-                host_params["timeout"] = remaining
-            host_params["request"] = compose_request_text(
-                "Continue the current request from the saved state; do not repeat "
-                "completed actions.", "", turn_budget_notice(remaining, readonly=readonly_turn))
-            host_result = chudcode_agent_turn(host_params, raw_emit)
+        host_result = omp_agent_turn(host_params, raw_emit)
         if not host_result.get("ok"):
             response = {
                 "ok": False,
                 "reason": str(host_result.get("reason") or "Agent turn failed"),
+                "stop_reason": str(host_result.get("stop_reason") or "runtime_error"),
             }
-            # provider_error / turn_budget: without it the GUI labels every failure
-            # provider_error (host/src/core/jobs.cpp normalizeAgentAdminTurnResult).
-            if host_result.get("stop_reason"):
-                response["stop_reason"] = str(host_result["stop_reason"])
+            response["turn"] = {
+                "success": False,
+                "stop_reason": response["stop_reason"],
+                "run_id": host_result.get("run_id") or run_id,
+                "session_id": host_result.get("session_id") or session_id,
+                "omp_session_id": host_result.get("omp_session_id"),
+                "omp_session_file": host_result.get("omp_session_file"),
+                "terminal": host_result.get("terminal"),
+            }
         else:
             cancelled = bool(host_result.get("cancelled"))
             text = _terminal_text(host_result)
@@ -3815,8 +3695,8 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
                 "allowed_tools": [binding.name for binding in host_tools],
                 "run_id": host_result.get("run_id") or run_id,
                 "session_id": host_result.get("session_id") or session_id,
-                "chudcode_session_id": host_result.get("chudcode_session_id"),
-                "chudcode_session_file": host_result.get("chudcode_session_file"),
+                "omp_session_id": host_result.get("omp_session_id"),
+                "omp_session_file": host_result.get("omp_session_file"),
                 "terminal": host_result.get("terminal"),
                 "cancelled": cancelled,
             }
@@ -3824,12 +3704,11 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
     except Exception as exc:  # noqa: BLE001 - crash path still persists documents
         response = {
             "ok": False,
+            "stop_reason": "runtime_error",
             "reason": f"agent_admin_turn failed: {type(exc).__name__}: {exc}",
         }
     finally:
         finalization_errors: list[str] = []
-        # Even a failed turn's loads are in the session history the next turn resumes.
-        _remember_session_tool_loads(session_id, tool_context.get("categories"))
         try:
             usage = token_usage.get_turn_usage()
         except Exception as exc:  # noqa: BLE001
@@ -3841,8 +3720,10 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
             finalization_errors.append(f"usage_sink_reset: {type(exc).__name__}: {exc}")
         try:
             from services.mcp.cad_common import save_touched_docs
+            from services.plm.ai_vc import bind_save_session
 
-            persistence = save_touched_docs()
+            with bind_save_session(session_id):
+                persistence = save_touched_docs(run_id=run_id)
             if not isinstance(persistence, dict):
                 persistence = {
                     "saved": [],
@@ -3855,23 +3736,35 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
                 "errors": [f"{type(exc).__name__}: {exc}"],
                 "persistence_failure": None,
             }
-        finalization_errors.extend(
-            f"persistence: {item}" for item in (persistence.get("errors") or [])
-        )
-        persistence_failure = persistence.get("persistence_failure")
-        if persistence_failure:
-            reason = (
-                persistence_failure.get("reason")
-                if isinstance(persistence_failure, Mapping)
-                else persistence_failure
-            )
-            finalization_errors.append(f"persistence: {reason}")
+        try:
+            from services.mcp.cad_common import persistence_warning
+            persistence_warnings, notice = persistence_warning(persistence)
+        except Exception as exc:  # noqa: BLE001 — retain the completed turn on reporting failure
+            persistence_warnings = [f"could not assess document persistence: {exc}"]
+            notice = ("\n\n**Save warning:** " + persistence_warnings[0] +
+                      ". Check the project files and Recover unsaved parts.")
+        try:
+            from services.mcp.cad_common import release_run_state
+            release_run_state(run_id)
+        except Exception as exc:  # noqa: BLE001
+            finalization_errors.append(f"cad_state_cleanup: {type(exc).__name__}: {exc}")
         turn_env.__exit__(None, None, None)
 
         response["persistence"] = persistence
         response["usage"] = usage
         if isinstance(response.get("turn"), dict):
             response["turn"]["usage"] = usage
+        if persistence_warnings:
+            response["persistence_warnings"] = persistence_warnings
+            if isinstance(response.get("turn"), dict):
+                turn = response["turn"]
+                turn["result"] = str(turn.get("result") or "") + notice
+            if not response.get("ok"):
+                response["reason"] = str(response.get("reason") or "agent_admin_turn failed") + notice
+            try:
+                raw_emit({"type": "assistant_delta", "channel": "output", "text": notice})
+            except Exception:  # noqa: BLE001 — warning transport cannot replace the turn outcome
+                pass
         if finalization_errors:
             response["finalization_errors"] = finalization_errors
             joined = "; ".join(finalization_errors)
@@ -3881,11 +3774,7 @@ def _run_agent_admin_turn(params: dict, _emit: Callable) -> dict:
             else:
                 prior = str(response.get("reason") or "agent_admin_turn failed")
                 response["reason"] = f"{prior}; {joined}"
-        if claimed_history_seed and (
-            not response.get("ok") or response.get("turn", {}).get("cancelled")
-        ):
-            with _HISTORY_SEED_LOCK:
-                _HISTORY_SEEDED_SESSIONS.discard(scoped_key(session_id))
+        _remember_daemon_generation(session_id, sessions_dir, generation)
 
     return response
 
@@ -3895,28 +3784,22 @@ ADMIN_METHODS: dict[str, Callable] = {
     "agent_admin_turn": _agent_admin_turn,
     "agent_cancel": _agent_cancel,
     "agent_steer": _agent_steer,
-    "chudcode_provider_list": _chudcode_provider_list,
-    "chudcode_auth_state": _chudcode_auth_state,
-    "chudcode_validate_key": _chudcode_validate_key,
-    "chudcode_set_key": _chudcode_set_key,
-    "chudcode_remove_key": _chudcode_remove_key,
-    "chudcode_logout": _chudcode_logout,
-    "chudcode_login": _chudcode_login,
-    "chudcode_models_list": _chudcode_models_list,
-    "chudcode_session_stats": _chudcode_session_stats,
-    "chudcode_export_session": _chudcode_export_session,
-    "chudcode_branch_session": _chudcode_branch_session,
-    "chudcode_rewind_session": _chudcode_rewind_session,
-    "chudcode_repair_session": _chudcode_repair_session,
-    "chudcode_close_session": _chudcode_close_session,
-    "chudcode_compact": _chudcode_compact,
-    "chudcode_set_auto_compaction": _chudcode_set_auto_compaction,
-    "chudcode_set_auto_retry": _chudcode_set_auto_retry,
-    "chudcode_tool_state": _chudcode_tool_state,
-    "chudcode_stt_status": _chudcode_stt_status,
-    "chudcode_stt_start": _chudcode_stt_start,
-    "chudcode_stt_stop": _chudcode_stt_stop,
-    "chudcode_stt_cancel": _chudcode_stt_cancel,
+    "omp_provider_list": _omp_provider_list,
+    "omp_auth_state": _omp_auth_state,
+    "omp_set_key": _omp_set_key,
+    "omp_remove_key": _omp_remove_key,
+    "omp_logout_accounts": _omp_logout_accounts,
+    "omp_logout": _omp_logout,
+    "omp_login": _omp_login,
+    "omp_models_list": _omp_models_list,
+    "omp_session_stats": _omp_session_stats,
+    "omp_export_session": _omp_export_session,
+    "omp_branch_session": _omp_branch_session,
+    "omp_close_session": _omp_close_session,
+    "omp_apply_compaction_policy": _omp_apply_compaction_policy,
+    "omp_set_auto_compaction": _omp_set_auto_compaction,
+    "omp_set_auto_retry": _omp_set_auto_retry,
+    "omp_tool_state": _omp_tool_state,
     "memory_remember": _memory_remember,
     "memory_recall": _memory_recall,
     "memory_stats": _memory_stats,
@@ -3939,7 +3822,7 @@ def _ai_tool_preview(params: dict, _emit: Callable) -> dict:
 def _ai_prompt_preview(params: dict, _emit: Callable) -> dict:
     """Settings → AI → Dev Preview: the general_agent prompt for one lane.
 
-    ``lane`` is ``"online"`` (default; Chudcode system prompt + host-tool
+    ``lane`` is ``"online"`` (default; Omp system prompt + host-tool
     definitions) or ``"offline"`` (the explicit local-model fallback's prompt).
     """
     try:
@@ -3969,8 +3852,8 @@ def _ai_prompt_baseline(params: dict, _emit: Callable) -> dict:
     Backs the copilot context meter: with no provider call yet, the meter had no
     honest source and rendered an em-dash over the window. This returns
     ``prompt_cache.baseline()`` — a ~4 chars/token estimate of the online system
-    prompt plus the host-tool definitions CAD hands Chudcode, with the
-    per-block breakdown the meter tooltip renders. Chudcode's own system prompt
+    prompt plus the host-tool definitions CAD hands Omp, with the
+    per-block breakdown the meter tooltip renders. Omp's own system prompt
     and builtin tools are not included, so it is never the exact upstream count.
     """
     try:

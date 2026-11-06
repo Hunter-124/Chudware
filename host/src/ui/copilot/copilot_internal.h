@@ -10,12 +10,12 @@
 //                          windowed log + stick-to-bottom
 //   activity_timeline.cpp  per-turn typed-block timeline: agent steps, thinking/action cards,
 //                          transparency rows, tool-call rows, artifact actions
-//   cards.cpp              plan/objectives section, clarify + plan-approve cards, corporate-org
-//                          cards, exec-mode (swarm/eng-firm/advisor) cards, AI-VC checkpoint UI
+//   cards.cpp              plan/objectives section, plan-approve card,
+//                          exec-mode (swarm/eng-firm/advisor) cards, AI-VC checkpoint UI
 //   ask_answers.cpp        GL-free ask_user question batches (AskBatch): suggested-default prefill,
 //                          RAW `answer` JSON per kind, session-file form (cards.cpp draws them)
 //   feed.cpp               feedTurnActivity: stream-event -> ActivityItem folding (orchestrator
-//                          events, corporate events, ops-JSON detection), chat-history dirty flag
+//                          events, ops-JSON detection), chat-history dirty flag
 //   conversations.cpp      conversation tabs + chat-history/prompt-draft persistence (incl.
 //                          WASM shared-chat sync), chat-triggered OpenFOAM poll
 //   settings.cpp           AI settings sections (provider/model/auth, generation, privacy,
@@ -23,6 +23,8 @@
 //   composer.cpp           wrapping chat input, attachments/context refs, run launch, slash
 //                          commands + slash-menu autocomplete (session cmds + skills),
 //                          submitTurn send path, composer prelude/toolbar/send-stop
+//   pending_stack.cpp      the pinned stack closing the chat log: pending steers (sent, unread) and
+//                          queued messages (edit / send now / cancel back to the composer)
 //   panel.cpp              the docked Copilot pane host (header, sessions/tasks/artifacts
 //                          panels, drawAIPanel) + the ai_workspace reuse hooks
 #pragma once
@@ -101,9 +103,8 @@ ImVec4 semanticOnGlass(const float role[4], const ui::AdaptiveSurface& surf);
 void   modeAccentRgb(int mode, float out[3]);
 // Map a raw ActivityItem status string ("running"/"pass"/"done"/"retry"/"fail"/
 // "skipped"/"") onto the kit's status vocabulary. ONE spelling of that mapping for the whole
-// copilot: the timeline spine, the action cards and the plan checklist all read it.
+// copilot: the plan checklist and the agent overview both read it.
 ui::kit::Status chatRowStatus(const std::string& status);
-void   drawStatusGlyph(const std::string& status, float box);
 void   drawBusyMark(float box);
 GlassBubble beginGlassBubble(float width, ui::GlassLevel level, float rounding);
 ImRect  endGlassBubble(const GlassBubble& b);
@@ -122,13 +123,34 @@ bool rewrapInPlace(char* buf, int len, float wrapW);
 // input's right edge — the in-box send button — never sit over the text.
 bool drawChatInput(const char* id, std::vector<char>& buf, const char* placeholder,
                    int maxLines, float rightReserve = 0.0f);
+// For a chat input other than the composer's (the queued-message editor): fill its buffer for a
+// FRESH widget, and read back what the user wrote (soft wraps flattened, typed breaks kept).
+void chatInputLoad(std::vector<char>& buf, const std::string& text);
+std::string chatInputText(const std::vector<char>& buf);
+
+// ---- composer spell check + word completion (composer_spell) ----
+// Load the word lists on first use and keep the completion vocabulary in step with the active
+// conversation. Once per frame, before the composer input draws.
+void composerSpellRefresh(AppState& st);
+// The completion drawn at the caret last frame ("" = none); Tab inserts it.
+const std::string& composerSpellGhost();
+// A correction picked from the right-click menu: replace bytes [begin, end) of the buffer.
+struct ComposerSpellFix {
+    int begin = 0, end = 0;
+    std::string text;
+};
+// Right after the composer's InputTextMultiline (it must be the last item): squiggle the
+// misspelled words, draw the ghost completion when `allowGhost`, run the right-click
+// correction menu. True when the user picked a correction (`fix` filled).
+bool composerSpellPaint(ImGuiID wid, const std::vector<char>& buf, const std::vector<int>& hard,
+                        bool allowGhost, ComposerSpellFix& fix);
 
 // ---- chat copy/paste affordances (ui_common) ----
 extern bool gShowThinking;   // session-only "Show assistant thoughts" toggle (not persisted)
 void        chatDrawCopyFlash();
 std::string chatInputSelection(ImGuiID id);
 void        chatCopyContext(const ImRect& rect, const char* popupId,
-                            const std::string& copyText,
+                            const std::function<std::string()>& copyText,
                             const std::string& copyAll = {},
                             const std::string& selText = {});
 // `keywords`: magic-keyword byte ranges into `plain` to paint with their static gradient
@@ -154,24 +176,17 @@ void        chatShimmerText(const char* text, const ImVec4& base, const ImVec4& 
 // (measured exactly as its soft-wrapper measures) — for shrink-to-fit bubbles.
 float       chatSoftWrapNaturalWidth(const std::string& text);
 void        chatHoverCopyGlyph(const ImRect& rect, const std::string& text);
+void        chatHoverCopyGlyph(const ImRect& rect, const std::function<std::string()>& text);
 std::string chatActivityCopyText(const ActivityItem& a);
 
 // ---- plan progress one-liner (cards) ----
-std::string planProgressLine(const PlanState& plan,
-                             const std::vector<ActivityItem>& activity);
-
-// ---- corporate chart field helpers (feed; shared with the corporate cards in cards.cpp) ----
-std::string    corpShortId(const std::string& id);
-int            corpWorkerCount(const nlohmann::json& dept);
-std::string    corpDeptHead(const nlohmann::json& dept);
-std::string    corpDeptLead(const nlohmann::json& dept);
-std::string    corpDeptNameOf(const nlohmann::json& dept);
-nlohmann::json corpParseChart(const ActivityItem& a);
+std::string planProgressLine(const ChatMsg& message);
 
 // ---- activity feed finalize + chat-history dirty tracking (feed) ----
 void finalizeThoughtBox(ActivityItem& a);
 void markChatHistoryDirty();
 extern std::atomic<bool> s_chatHistoryDirty;
+extern std::atomic<uint64_t> s_chatHistoryRevision;
 extern double            s_chatHistoryLastPersist;
 // Batch `batchId` anywhere in `msgs` (newest message first); `owner` receives its message.
 AskBatch* findAskBatch(std::vector<ChatMsg>& msgs, const std::string& batchId,
@@ -188,7 +203,7 @@ namespace ui {
 void appendChatRawMessage(AppState& st, const ChatMsg& message) noexcept;
 class ChatRawActivityCapture {
 public:
-    explicit ChatRawActivityCapture(ChatMsg& message) noexcept;
+    explicit ChatRawActivityCapture(ChatMsg& message, bool appendOnly = false) noexcept;
     ~ChatRawActivityCapture();
 
     ChatRawActivityCapture(const ChatRawActivityCapture&) = delete;
@@ -197,13 +212,23 @@ public:
 private:
     ChatMsg& message_;
     std::string conversationId_;
-    std::vector<std::string> before_;
+    size_t messageIndex_ = 0;
+    std::vector<uint64_t> before_;
+    bool appendOnly_ = false;
 };
 
 // ---- model label / token formatting (ui_common) ----
 std::string shortModelName(const std::string& id);
 std::string fmtTokens(int n);
 int         effectiveContextWindow(const Settings& s);
+
+// ---- transcript clock (chat_log) ----
+// "just now", "3m ago", "2h ago", "4d ago"; empty for an unknown (<= 0) stamp.
+std::string chatAgeLabel(double ts);
+// Local wall clock with seconds ("2:26:07 PM"); empty for an unknown stamp.
+std::string chatClockSeconds(double ts);
+// "3m ago · Sep 27, 2026, 2:26:07 PM" — the hover twin of a visible stamp.
+std::string chatTimeTooltip(double ts);
 
 // ---- copilot MENU chrome (ui_common) — Sessions / Tasks / Artifacts / Quick settings --------
 // One title/section/label treatment for all four header views (they share ONE scroll region,
@@ -227,16 +252,17 @@ void chatPaintDisclosure(ImDrawList* dl, ImVec2 c, float r, float openT, ImU32 c
 // Fence-aware assistant prose: ``` spans render via drawCodeBox, everything else through
 // stripMdMarks + chatDrawSelectableText. Returns the last prose segment's InputText id.
 ImGuiID     drawMdProse(const char* id, const std::string& in, const ImVec4& col, ImFont* mono);
-// Horizontal inset of the assistant's prose = the timeline rows' text column (rail + row pad).
+// Horizontal inset of the assistant's prose = the timeline rows' text column (the row pad).
 float       chatProseInsetX();
-void        drawActionCard(ActivityItem& a, const ui::Fonts& fonts, bool liveFrontier,
-                           bool onSpine);
+void        drawActionCard(ActivityItem& a, const ui::Fonts& fonts, bool liveFrontier);
 void        chatArtifactReveal(AppState& st, const std::string& path);
 void        chatArtifactOpenSmart(AppState& st, const std::string& path);
 void        chatArtifactActions(AppState& st, const std::string& path);
+// One "<kind>\t<path>" line of an ART blob. False for the trailing META/stamp lines the feed
+// appends and for corrupted continuation lines, so every artifact collector agrees.
+bool        artifactLine(const std::string& line, std::string* kindOut, std::string* pathOut);
 void        drawToolCallRow(AppState& st, ActivityItem& a, const ui::Fonts& fonts);
-void        drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, bool showThinking,
-                              bool isLastTurn = false);
+void        drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, bool showThinking);
 // ---- transcript scroll anchors (activity_timeline) ----
 // The ONE anchor mechanism shared by the run receipt's failure list and the cost-attribution
 // strip: both need "take me to that action card". Keyed the way the timeline keys its rows —
@@ -272,10 +298,10 @@ void        sanitizeAgentTextInPlace(AppState& st, std::string& s, bool jsonBody
 // timeline already showed so nothing prints twice.
 bool        isProseOutputRow(const ActivityItem& a);
 bool        timelineHasInlineProse(const ChatMsg& m);
-std::string timelineInlineProse(const ChatMsg& m);
+const std::string& timelineInlineProse(const ChatMsg& m);
 // m.text minus the prose the timeline drew inline: a whole reply that never streamed, or a
 // note appended after the fact ("(Stopped by you.)"). Empty when the timeline covered it all.
-std::string timelineProseTail(const ChatMsg& m);
+const std::string& timelineProseTail(const ChatMsg& m);
 
 // Packed tool-row detail: feedTurnActivity writes args_preview, then the capped failure text
 // after "\n\x1eERR\x1e\n", the image caption after "\n\x1eCAP\x1e\n", artifact paths after
@@ -297,9 +323,10 @@ ToolRowDetail splitToolRowDetail(const std::string& detail);
 // assistant bubble's meta row (both in k-token prompt-cache readouts).
 std::string chatTokCount(int n);
 
-// ---- run launch helpers (composer; shared with the clarify/plan-approve cards) ----
+// ---- run launch helpers (composer; shared with the plan-approve card) ----
 nlohmann::json agentProviderOverride(const Settings& s);
-// Launch ONE Chudcode general_agent turn for `request` on the active conversation. Never creates
+nlohmann::json composerTurnPayload(const Settings& s, const nlohmann::json& extra);
+// Launch ONE Omp general_agent turn for `request` on the active conversation. Never creates
 // or replaces a document — whether to new_part or edit the active doc is the agent's decision.
 // `extra` is merged on top of the provider override (attachments / context_refs / options…);
 // extra.options.mode defaults to the composer's current mode name ("agent"|"plan"|"ask").
@@ -309,9 +336,11 @@ void launchAgentTurn(AppState& st, const std::string& request,
 // thread; the result lands back on the batch through the composer's per-frame drain (composer).
 void agentAnswerDispatch(AppState& st, const std::string& runId, const std::string& batchId,
                          nlohmann::json answers, bool declined);
+// Queue `b`'s answers as the active conversation's next message (askAnswersMessage) when no
+// run is left to take them over the control lane. The composer's staged attachments stay put.
+void queueAskAnswersTurn(AppState& st, const AskBatch& b);
 
 // ---- cards (cards) ----
-void drawClarifyCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts);
 void drawPlanApproveCard(AppState& st, ChatMsg& m, const ui::Fonts& fonts);
 // The online agent's ask_user question batches on this turn: interactive while pending,
 // a compact read-only summary once resolved (cards.cpp). drawAskCards draws only batches with
@@ -321,10 +350,12 @@ void drawAskCards(AppState& st, ChatMsg& m, const ui::Fonts& fonts);
 void drawAskMarker(AppState& st, ChatMsg& m, const ActivityItem& marker, const ui::Fonts& fonts);
 // ActivityItem::stage of batch `batchId`'s rowKind-20 timeline marker.
 std::string askMarkerStage(const std::string& batchId);
-void drawCorpOrgCard(ActivityItem& a, const ui::Fonts& fonts);
-void drawCorpMeetingCard(ActivityItem& a, const ui::Fonts& fonts);
-void drawCorpSteeringCard(const ActivityItem& a, const ui::Fonts& fonts);
-void drawCorpMutedLine(const ActivityItem& a, const ui::Fonts& fonts);
+// Inter-agent message (rowKind 7): OMP's IRC card — header with sender, recipient and age over
+// the body's first lines on a quote gutter; click expands the whole body.
+void drawAgentMessageLine(const ActivityItem& a, const ui::Fonts& fonts);
+// One finished provider request (rowKind 21): time, elapsed since the prompt, tokens in/out,
+// prompt-cache reads, time to first token and output rate, as one dim line.
+void drawUsageLine(const ActivityItem& a, const ui::Fonts& fonts);
 void drawDelegationCard(const ActivityItem& a, const ui::Fonts& fonts);
 void drawSwarmWaveCard(const ActivityItem& a, const ui::Fonts& fonts);
 void drawFirmBidsCard(const ActivityItem& a, const ui::Fonts& fonts);
@@ -335,182 +366,41 @@ void drawAdvisorCard(ActivityItem& a, const ui::Fonts& fonts);
 // `live`: the row is running inside a running turn — shimmer + elapsed instead of a static title.
 void drawSubRunCard(const ActivityItem& a, const ui::Fonts& fonts, bool live);
 
-// ---- AI-VC (agent version control) state + cards (cards) ----
-struct AiVcCheckpoint {
-    std::string id;
-    int         turn = -1;     // agent turn index, or -1 if unset
-    std::string when;          // ISO timestamp
-    std::string label;         // tool/op-batch summary
-    int         features = 0;  // feature count at checkpoint
-    // v2 prompt/tool granularity (absent => -1 / empty → turn-level UI only)
-    std::string kind;          // "prompt" | "tool" | ""
-    int         msgIdx = -1;   // chat message ordinal for kind=prompt
-    int         callTurn = -1; // call.turn for kind=tool
-    int         callI = -1;    // call.i for kind=tool — 0-based tool ordinal WITHIN a run,
-                               // so it only identifies a call together with sessionId.
-    std::string sessionId;     // run that authored this checkpoint (call.i restarts per run)
-};
-
+// ---- AI-VC (agent version control) rollback (cards) ----
+// Shared with the AI workspace's checkpoint strip (ai/plan_board.cpp); the chat transcript
+// itself carries no restore controls.
 struct AiVcUi {
     bool available = true;     // false after unknown-method (hide all AI-VC chrome)
-    bool loading   = false;
-    bool busy      = false;
-    std::string err;
-    std::vector<AiVcCheckpoint> checkpoints;
-    double      lastFetch = 0.0;
-    std::string lastDocId;
-    // v2 capability flags — latched from the last successful timeline payload.
-    bool hasMsgGranularity  = false;  // any row carried msg_idx
-    bool hasCallGranularity = false;  // any row carried call:{turn,i}
-    // Inline confirm (click again) for per-turn / per-msg / per-call restore — never a modal.
-    int    confirmMsgIdx = -1;  // chat index pending confirm, -1 = none
-    int    confirmKind   = 0;   // 1 = before, 2 = after, 3 = user-msg rewind
-    int    confirmCallI  = -1;  // tool-call index within turn when confirmKind is call-scoped
-    double confirmUntil  = 0.0; // auto-clear after a few seconds
-
-    // Pre-rollback confirmation dialog (the warning ladder). Filled by the
-    // plm_rollback_check preflight RPC, shown in ONE modal before aiVcRollback runs.
-    struct Confirm {
-        bool open = false;          // request the modal next frame
-        bool busy = false;          // preflight RPC in flight
-        std::string to;             // rollback target awaiting confirmation
-        std::string toast;          // success toast after restore
-        // Preflight result (ok==false -> err/notFound describe why).
-        bool ok = false;
-        bool notFound = false;      // no checkpoint at that point (chat-only rewind)
-        std::string err;
-        std::string cpLabel;
-        std::string cpWhen;
-        int discardedCheckpoints = -1;  // -1 = unknown
-        int discardedTurns = -1;
-        int discardedMessages = -1;
-        bool geometryRollback = false;
-        // Backing-file provenance (externallyModified: -1 unknown, 0 no, 1 yes).
-        std::string filePath;
-        bool provenanceKnown = false;
-        int  externallyModified = -1;
-        double recordedMtime = 0.0;
-        double currentMtime = 0.0;
-    } confirm;
+    bool busy      = false;    // a plm_rollback is in flight
 };
 extern AiVcUi s_aiVc;
 
-// Staged "Edit message" — a conversation-scoped transaction. Nothing in the transcript moves
-// while the edit is staged: the tail [msgIdx..) is only HIDDEN by the chat log (and only once
-// the conversation's run is truly over), so a running reply, the run's chat indices and the
-// persisted history are never touched by staging. Esc / switching sessions just drops the
-// stage and restores the composer.
-// Sending runs, strictly in order and never concurrently with a turn:
-//   1. wait for the conversation's run to reach its actual terminal (editing during a run
-//      stops it first);
-//   2. chudcode_rewind_session — branch the runtime session to before the edited message;
-//   3. plm_rollback msg:<idx> — geometry (a missing checkpoint is a legitimate chat-only edit);
-//   4. commit: adopt the branch link, park the old tail as a ChatBranch, truncate, persist;
-//   5. exactly one submitTurn of the edited text (deferred until the conversation is viewed).
-// Any failure before 4 adopts nothing, keeps the tail and the edited composer text, launches no
-// run and says why.
-struct EditStage {
-    enum class Phase {
-        Off,
-        Staged,       // composer prefilled; sendRequested = waiting for the run to settle
-        Rewinding,    // chudcode_rewind_session in flight
-        RollingBack,  // plm_rollback msg:<idx> in flight
-        AwaitSubmit,  // committed; edited turn launches when its conversation is viewed
-    };
-    Phase phase = Phase::Off;
-    uint64_t gen = 0;             // transaction generation; stale callbacks compare it
-    std::string convId;           // the conversation being edited — never "whatever is viewed"
-    int  msgIdx = -1;             // edited user message index in that conversation
-    std::string targetText;       // typed text of the edited message (runtime match key)
-    int  occurrence = 0;          // earlier matching user messages (runtime match ordinal)
-    std::string savedPrompt;      // composer contents before edit (Esc restores)
-    std::vector<std::string> savedAttachments, savedImages;
-    std::vector<core::ContextRef> savedContextRefs;
-    bool sendRequested = false;   // Enter pressed; transaction starts once the run settled
-    std::string editedText;       // composer text frozen at send
-    std::vector<std::string> editedAttachments, editedImages;
-    std::vector<core::ContextRef> editedContextRefs;
-    std::string docId;            // document whose AI-VC chain rolls back
-    std::string newSessionId;     // rewind result, adopted only at commit
-    std::string newSessionFile;
-    bool geometryRolledBack = false;
-};
-extern EditStage s_edit;
-
-bool chatMsgMutatedDoc(const ChatMsg& m);
+// Restore the active document to checkpoint `to` (a plm_timeline id). Geometry only — the chat
+// is never touched — and refused while a run is live. Toasts the outcome.
 void aiVcRollback(AppState& st, const std::string& to, const std::string& okToast);
-// Request a rollback: runs the plm_rollback_check preflight, then shows the
-// single confirmation dialog (warning ladder) before anything destructive runs.
-void aiVcRequestRollback(AppState& st, const std::string& to, const std::string& okToast);
-// Draw the confirmation modal; call once per frame inside the chat window.
-void drawAiVcRollbackConfirm(AppState& st);
-// Checkpoint coverage for a msg:<idx> rewind target: 0 = no geometry checkpoint exists
-// for that message (chat-only rewind), 1 = a checkpoint exists (geometry rolls back too),
-// 2 = unknown (timeline not loaded yet — kicks a throttled fetch).
-int aiVcMsgCheckpointState(AppState& st, int msgIdx);
-// Shared wording so the user-message rewind and the assistant chat-only rewind never
-// diverge: the tip is shown BEFORE the click, the toast AFTER the rewind.
-const char* aiVcRewindTip(int cpState);
-std::string aiVcRewindToast(int cpState);
-void drawDoubleRewindGlyph(ImDrawList* dl, const ImVec2& mn, const ImVec2& mx,
-                           ImU32 col);
-void drawPencilGlyph(ImDrawList* dl, const ImVec2& mn, const ImVec2& mx, ImU32 col);
+
 // Header navigation: submit native hit zones, resolve clicks, then paint the final selection.
 struct HeaderBtnHit {
     ImRect rect;
+    ImGuiID id = 0;
     bool   clicked = false;
     bool   hovered = false;
     bool   held    = false;
 };
 HeaderBtnHit headerTextButtonHit(const char* id, float w);
-// Flat at rest; `withLabel=false` centres the icon and the caller provides its named tooltip.
+// Rounded, theme-native chrome; outlined actions retain a quiet edge at rest.
+// `withLabel=false` centres the icon and the caller provides its named tooltip.
+// `ownActiveFill=false`: the caller paints the selected face (a sliding tab indicator); the
+// button keeps only the active ink and hover wash.
 void headerTextButtonPaint(const HeaderBtnHit& h, const char* label, bool active,
-                           const char* iconName = nullptr, bool withLabel = true);
-// ---- staged edit transaction (cards.cpp; see EditStage) ----
-bool editStageInFlight();                    // rewind/rollback RPC outstanding (not cancellable)
-// The stage belongs to convId: its queue drain must not launch a turn under the edit.
-bool editStageHoldsConversation(const std::string& convId);
-// First message index the chat log hides for the viewed conversation, or -1. Only a staged
-// edit of a SETTLED conversation hides anything — a running tail always stays visible.
-int  editStageHideFrom(AppState& st);
-// Start editing user message msgIdx of the viewed conversation: prefill the composer. When
-// that conversation's run is live this also stops it (Stop-and-edit); nothing is hidden until
-// the run's actual terminal.
-void beginEditStage(AppState& st, int msgIdx);
-// Esc: drop the stage and restore the composer (staged only — an in-flight transaction cannot
-// be abandoned halfway). Returns false when it refused.
-bool cancelEditStage(AppState& st);
-// Called before the viewed conversation is parked (switch / new session): a merely staged edit
-// is cancelled while its conversation is still the viewed one, so its composer text and draft
-// are restored; an in-flight or committed transaction keeps running for ITS conversation.
-void editStageBeforeConversationPark(AppState& st);
-// Enter while staged: freeze `text` and start the transaction once the run has settled.
-void editStageSubmit(AppState& st, const std::string& text);
-// Per-frame driver (composer): starts a requested transaction once the run settled, and
-// launches a committed edit when its conversation is the viewed one.
-void editStageTick(AppState& st);
-// One-line composer status for the viewed conversation's edit, or nullptr.
-const char* editStageStatus(AppState& st);
-// RPC completions of the two transaction steps. Public so a harness can drive the exact
-// transaction with synthetic replies; a stale gen is ignored.
-void editStageOnRewindResult(AppState& st, uint64_t gen, const core::RpcResult& r);
-void editStageOnRollbackResult(AppState& st, uint64_t gen, const core::RpcResult& r);
-// Restore/rewind actions for an assistant turn. alwaysShow=true draws them as a bottom
-// action row (the chat-log default, matching the user bubble's own meta bar); false keeps
-// the hover-latched variant that anchors on a preceding label item.
-void drawAiVcTurnRestore(AppState& st, int msgIdx, int turnNum, bool alwaysShow = true);
-// Per-tool-call "before" rewind glyph, drawn on each tool-call row. Draws nothing unless
-// exactly one checkpoint matches (call ordinal + tool name), so it never offers a restore
-// the backend would refuse or, worse, resolve to the wrong state. There is no "after"
-// counterpart by design — "after call i" is "before call i+1", so before-only already
-// reaches every point in the turn.
-void drawAiVcCallRewind(AppState& st, int callI, const std::string& toolName);
-std::string aiVcCallCheckpointId(int callI, const std::string& toolName);
+                           const char* iconName = nullptr, bool withLabel = true,
+                           bool outlined = false, bool ownActiveFill = true);
 
 // ---- chat log (chat_log) ----
 void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
-                   float panelW, int msgIdx);
+                   float panelW);
 void drawChatLogWindowed(AppState& st);
+void chatLogMessageChanged(const ChatMsg& message) noexcept;
 // Drop stick-to-bottom on EVERY chat surface. A deferred scroll-to-anchor lands one frame after
 // the click; chatLogStickToBottom runs after the log every frame and would snap straight back to
 // the tail, so the jump has to un-stick first.
@@ -532,6 +422,7 @@ std::string newConvId(AppState& st);
 std::filesystem::path lexicalPath(std::string_view raw);
 std::string comparablePath(const std::filesystem::path& path);
 std::string convProjectKey(std::string_view rawDir);   // comparable key for a project folder
+const std::string& convProjectKey(const Conversation& conversation);
 std::string convProjectDir(AppState& st);              // the selected root (st.workspaceDir) only
 void        bindActiveConversationProject(AppState& st, const std::string& workspace);
 void        ensureConversations(AppState& st);
@@ -545,10 +436,9 @@ void        switchConversation(AppState& st, int idx);
 void        closeConversation(AppState& st, int idx);
 void        archiveConversation(AppState& st, int idx, bool archived);
 int         forkConversation(AppState& st, int idx);   // -> new conversation index, or -1
-// Chudcode session-recovery service latch (conversations): true until the first
-// unknown-method response proves the worker slice absent; the Sessions panel and the
-// post-turn health capture both honor (and may flip) it.
-bool&       chudcodeSessionServiceAvailable();
+// Omp session-recovery service latch (conversations): true until the first
+// unknown-method response proves the worker slice absent.
+bool&       ompSessionServiceAvailable();
 // Sessions list scope as last drawn (scenario probe): the project key it shows (empty for
 // Unassigned/All) and the root key it last snapped to. `drawn` = the list has drawn at least once.
 struct SessionsScopeProbe {
@@ -599,7 +489,7 @@ inline std::string userFacingRpcError(const core::RpcResult& r, const char* fall
 }
 
 // ---- composer + send path (composer) ----
-std::string composerText(const AppState& st);
+const std::string& composerText(const AppState& st);
 void drawBtwPanel(AppState& st);
 void submitTurn(AppState& st, const std::string& text);
 // Consume only referenced inline images, compact their numbering, and preserve ordinary files.
@@ -622,6 +512,25 @@ void requestStopRun(AppState& st);
 void composerSetText(AppState& st, const std::string& text);
 // Reset the restored buffer's widget/caret/hard-break state without deleting a saved draft.
 void composerResetInputState(AppState& st);
+
+// ---- queued messages + the pinned stack (composer queue ops, pending_stack UI) ----
+// Retype one queued message (its attachment draft follows the index).
+void setQueuedPromptText(AppState& st, size_t index, const std::string& text);
+// Cancel: take a queued message out of the queue and hand it back to the composer, text and
+// draft (attachments, inline images, context chips), merged with whatever the composer holds.
+void cancelQueuedPromptToComposer(AppState& st, size_t index);
+// Send now: the live run takes it as a steer when it accepts one, otherwise the message becomes
+// the next to launch and the live run is stopped. Returns true when it went out as a steer.
+bool queuedPromptSendNow(AppState& st, size_t index);
+// Would Send now deliver as a steer (vs stop the run and launch it next)? For tooltips.
+bool queuedSendNowSteers(AppState& st, size_t index);
+// True while the user is editing a queued message in the pinned stack: the composer's queue
+// drain waits so a message is never sent out from under its editor.
+bool queuedPromptEditHoldsDrain();
+// The pinned stack under the live turn: pending steers (sent, not yet read by the agent) and the
+// queued messages (not yet sent), as dimmed bubbles with quiet per-message actions. Drawn by the
+// chat log INSIDE its scrolling child, after the last message; `width` is the log's width.
+void drawPendingMessageStack(AppState& st, float width);
 void drawComposer(AppState& st, bool busy, bool canRun);
 
 // ---- sessions/tasks/artifacts panels (panel) ----

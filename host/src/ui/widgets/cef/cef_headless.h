@@ -27,8 +27,10 @@ namespace ui::cef {
 
 // Result of a headless page fetch.
 struct FetchResult {
-    bool        ok = false;      // navigation completed and HTML was captured
+    bool        ok = false;      // navigation committed and HTML was captured
+    bool        partial_load = false; // DOM ready, but subresources exceeded navigation deadline
     int         status = 0;      // HTTP status of the main document (0 if unknown)
+    std::string retry_after;     // raw Retry-After header, empty if absent
     std::string final_url;       // URL after redirects
     std::string html;            // serialized post-JS DOM of the main frame
 };
@@ -38,6 +40,9 @@ struct FetchResult {
 // selects a per-site cookie jar (CefRequestContext cache_path) — the same
 // per-vendor dir the interactive login window uses, so an authenticated session
 // carries over; empty uses the global context.
+// A committed 2xx document that reached DOMContentLoaded but is still waiting
+// on subresources at the navigation deadline returns with partial_load=true;
+// its unfinished browser is canceled before reuse.
 //
 // `settle_ms` is the dwell CEILING after load, not a fixed sleep. The main frame
 // is re-serialized every 100ms (the same CefFrame::GetSource path the final
@@ -93,12 +98,16 @@ void headless_pump(int ms);
 // default 6). Resolved once.
 int headless_max_inflight();
 
-// Fetch `url`'s raw bytes (datasheet / CAD file) through CEF's network stack with
-// the profile's cookies, writing them to `dest_path`. Returns true on a 2xx with a
-// non-empty body written. No page render — a direct CefURLRequest. `profile_dir`
-// as in headless_fetch.
-bool headless_download(const std::string& url, const std::string& dest_path,
-                       const std::string& profile_dir = "");
+// Fetch raw bytes through CEF's network stack with the profile's cookies.
+// The result retains response metadata even when the download fails.
+struct DownloadResult {
+    bool ok = false;
+    int status = 0;
+    std::string retry_after;
+    std::string final_url;
+};
+DownloadResult headless_download(const std::string& url, const std::string& dest_path,
+                                 const std::string& profile_dir = "");
 
 // DIAGNOSTIC: drive a real form login headlessly to OBSERVE a bot-wall verdict
 // (e.g. whether an invisible-reCAPTCHA login rejects our browser). Navigates to

@@ -18,8 +18,8 @@ Reuse, not fork:
   * `asm_world_bodies` (list_world_bodies) — enumerates the placed bodies/components + bboxes.
   * `cam_extract(kind="holes")` — OCCT hole grouping (minor/counterbore/countersink), used
     as a cross-check / richer hole classification on the whole doc.
-  * `research.thread_spec` — nominal fastener major diameter for the pass-through clearance check
-    (no new fit tables invented).
+  * `research.thread_spec` and the ISO 273 lookup — nominal fastener diameter and
+    published metric clearance-hole series.
   * `check_interference` remains the separate hard-clash gate; this tool is its alignment complement.
 
 --------------------------------------------------------------------------------------------
@@ -36,7 +36,7 @@ JSON CONTRACT  (interface_check return — consumed by layout_plan_tools; keep s
       {"id": "f2", "name": "bracket", "bbox": {...}}, ...
   ],
   "body_count": int,              # how many bodies the verdict weighed (scratch bodies included)
-  "pair_selection": "explicit"|"proximity"|"none",   # which rule produced `pairs`
+  "pair_selection": "explicit"|"proximity"|"contact_faces"|"none",
   "pairs": [                      # one entry per interface (component pair) examined
     {
       "a": "f2", "b": "f3",
@@ -45,7 +45,8 @@ JSON CONTRACT  (interface_check return — consumed by layout_plan_tools; keep s
         "hole_pattern": {
             "status": "pass"|"fail"|"skip",
             "matched":   [ {"a_hole": {...}, "b_hole": {...}, "pos_delta_mm": float,
-                            "dia_delta_mm": float } ],
+                            "dia_delta_mm": float, "diameter_fit": "similar"|"different",
+                            "clearance_verdict": "clear"|"insufficient"|"unverified" } ],
             "misaligned":[ {"a_hole": {...}, "b_hole": {...}, "pos_delta_mm": float,
                             "offset_vec_mm": [dx,dy,dz], "dia_delta_mm": float,
                             "fix": "..." } ],
@@ -64,13 +65,13 @@ JSON CONTRACT  (interface_check return — consumed by layout_plan_tools; keep s
             "gap_mm": float|null,           # signed: + = gap, - = overlap along the shared normal
             "parallel_angle_deg": float|null,
             "a_feature": "...", "b_feature": "...",
-            "fix": "...", "summary": "..."
+            "reference_source": "explicit"|"mate:<id>", "fix": "...", "summary": "..."
         },
         "fastener_passthrough": {
             "status": "pass"|"fail"|"skip",
             "fastener": "M6"|null,
             "stacks": [ {"nominal_mm": float, "min_hole_dia_mm": float,
-                         "clearance_mm": float, "passes": bool, "fix": "..."} ],
+                         "clearance_mm": float, "passes": bool|null, "status": str} ],
             "summary": "..."
         }
       }
@@ -101,7 +102,7 @@ if TYPE_CHECKING:
 # Tolerances (mm / deg). Deliberately modest defaults — an interface that lines up to
 # within these registers as "aligned"; anything looser is a real layout error worth flagging.
 DEFAULT_POS_TOL_MM = 0.20      # hole-pattern position registration tolerance
-DEFAULT_DIA_TOL_MM = 0.05      # hole diameter compatibility tolerance
+DEFAULT_DIA_TOL_MM = 0.05      # reportable bore diameter difference, not a fit tolerance
 DEFAULT_COAX_OFFSET_TOL_MM = 0.10   # coaxiality: perpendicular axis-to-axis distance
 DEFAULT_COAX_ANGLE_TOL_DEG = 0.50   # coaxiality: axis angular misalignment
 DEFAULT_PLANE_ANGLE_TOL_DEG = 0.50  # contact plane parallelism
@@ -121,10 +122,12 @@ V1_SCOPE_NOTE = (
     "suggest. Hole-pattern matching pairs holes whose axes are near-collinear across the "
     "interface; a deliberately different pattern reads as unmatched holes, not a misalignment. "
     "Coaxiality/contact-plane use the cylindrical/planar faces the geometry kernel reports; "
-    "spline/toroidal mating surfaces are out of scope. Fastener pass-through is a nominal "
-    "clearance-class check against research_thread_spec's major diameter (no thread engagement, "
-    "no head/washer seating, no torque). This is the alignment complement to check_interference "
-    "(hard clash), not a replacement for it."
+    "contact requires explicit faces or resolvable mate references, and otherwise is unverified. "
+    "Different bore diameters are not a positional error; nominal fastener clearance does not "
+    "establish head, grommet, or recess fit. Spline/toroidal surfaces are out of scope. "
+    "Pass-through assumes straight parallel bores, nominal diameter and an additional radial "
+    "relative-position uncertainty; it does not check thread engagement, head/washer seating, "
+    "hole size tolerance, or torque. This complements check_interference (hard clash)."
 )
 
 
@@ -276,12 +279,13 @@ def _check_hole_pattern(a_holes, b_holes, pos_tol, dia_tol, findings, a_id, b_id
         dia_delta = abs(ha["dia"] - best["dia"])
         rec = {"a_hole": _pub_hole(ha), "b_hole": _pub_hole(best),
                "pos_delta_mm": round(pos_delta, 4), "dia_delta_mm": round(dia_delta, 4)}
-        if pos_delta <= pos_tol and dia_delta <= dia_tol:
+        rec["diameter_fit"] = "different" if dia_delta > dia_tol else "similar"
+        if pos_delta <= pos_tol:
             matched.append(rec)
         else:
             direction = _dominant_axis_label(perp)
             rec["offset_vec_mm"] = [round(perp[0], 4), round(perp[1], 4), round(perp[2], 4)]
-            rec["fix"] = (f"shift {b_name} hole pattern {pos_delta:.2f} mm toward "
+            rec["fix"] = (f"shift {b_name} hole pattern {pos_delta:.4g} mm toward "
                           f"{_dominant_axis_label((-perp[0], -perp[1], -perp[2]))} to register "
                           f"with {a_name} (or re-datum the pattern)")
             misaligned.append(rec)
@@ -289,9 +293,8 @@ def _check_hole_pattern(a_holes, b_holes, pos_tol, dia_tol, findings, a_id, b_id
                 "severity": "fail", "component_a": a_id, "component_b": b_id,
                 "check": "hole_pattern", "feature": _hole_ref(ha),
                 "error_mm": round(pos_delta, 4),
-                "detail": (f"hole pattern on {b_name} offset {pos_delta:.2f} mm in {direction} "
-                           f"relative to {a_name}"
-                           + (f"; diameter differs by {dia_delta:.2f} mm" if dia_delta > dia_tol else "")),
+                "detail": (f"hole pattern on {b_name} offset {pos_delta:.4g} mm in {direction} "
+                           f"relative to {a_name}"),
                 "fix": rec["fix"],
             })
     unmatched_b = [hb for j, hb in enumerate(b_holes) if j not in used_b]
@@ -374,12 +377,13 @@ def _check_coaxiality(a_bosses, b_bores, b_bosses, a_bores, offset_tol, angle_to
 
 
 def _check_contact_plane(a_id, b_id, a_name, b_name, a_planes, b_planes,
-                         angle_tol, gap_tol, findings):
-    """Do the two components have flush, coplanar mating faces where they meet?
-
-    Heuristic: the intended contact faces are the closest opposed planar-face pair (normals
-    anti-parallel, faces facing each other). Report the gap (signed along the shared normal)
-    and the parallelism angle."""
+                         angle_tol, gap_tol, findings, reference=None):
+    """Compare named or mate-referenced planes; a heuristic cannot establish intent."""
+    if reference is None:
+        return {"status": "skip", "gap_mm": None, "parallel_angle_deg": None,
+                "a_feature": None, "b_feature": None,
+                "summary": "contact faces unverified; supply contact_faces or a planar mate"}
+    a_planes, b_planes, source = [reference[0]], [reference[1]], reference[2]
     best = None
     for fa in a_planes:
         na = _unit(_v(fa.get("normal", fa.get("axis", [0, 0, 1]))))
@@ -388,9 +392,7 @@ def _check_contact_plane(a_id, b_id, a_name, b_name, a_planes, b_planes,
             nb = _unit(_v(fb.get("normal", fb.get("axis", [0, 0, 1]))))
             cb_c = _v(fb.get("centroid", [0, 0, 0]))
             ang = _axis_angle_deg(na, nb)          # 0..90 (parallel planes)
-            # opposed faces: their outward normals point roughly opposite each other
-            if _dot(na, nb) > -0.5:
-                continue
+            # Explicit or mated references may have same-facing normals.
             gap = _dot(_sub(cb_c, ca), na)          # signed gap along A's outward normal
             lateral = _norm(_sub(_sub(cb_c, ca), (gap * na[0], gap * na[1], gap * na[2])))
             score = abs(gap) + 0.1 * lateral
@@ -400,11 +402,12 @@ def _check_contact_plane(a_id, b_id, a_name, b_name, a_planes, b_planes,
         return {"status": "skip", "gap_mm": None, "parallel_angle_deg": None,
                 "a_feature": None, "b_feature": None, "summary": "no opposed planar faces found"}
     _, gap, ang, fa, fb, lateral = best
-    a_ref = f"{fa.get('side', 'face')} planar face"
-    b_ref = f"{fb.get('side', 'face')} planar face"
+    a_ref = f"{fa.get('side', 'face')} planar face ({fa.get('sid', 'unknown')})"
+    b_ref = f"{fb.get('side', 'face')} planar face ({fb.get('sid', 'unknown')})"
     ok = abs(gap) <= gap_tol and ang <= angle_tol
     out = {"status": "pass" if ok else "fail", "gap_mm": round(gap, 4),
            "parallel_angle_deg": round(ang, 4), "a_feature": a_ref, "b_feature": b_ref,
+           "reference_source": source,
            "summary": (f"contact gap {gap:+.3f} mm, {ang:.2f}° out of parallel")}
     if not ok:
         if abs(gap) > gap_tol and gap > 0:
@@ -424,62 +427,96 @@ def _check_contact_plane(a_id, b_id, a_name, b_name, a_planes, b_planes,
     return out
 
 
-def _check_fastener_passthrough(a_holes, b_holes, fastener, findings, a_id, b_id, a_name, b_name):
-    """Can a nominal fastener pass through the mated hole stack? Clearance-class check that
-    reuses research_thread_spec's nominal MAJOR diameter (no new fit tables)."""
+def _check_fastener_passthrough(a_holes, b_holes, fastener, findings, a_id, b_id, a_name, b_name,
+                               clearance_class="normal", position_tolerance_mm=0.0):
+    """Evaluate straight-shank clearance of matched parallel bores, not thread engagement."""
     if not fastener:
         return {"status": "skip", "fastener": None, "stacks": [],
                 "summary": "no fastener given (pass fastener='M6' to check pass-through)"}
-    try:
-        from services.research.thread_spec import thread_spec as _thread_spec
-        spec = _thread_spec(str(fastener))
-    except Exception as e:  # noqa: BLE001
+    if (not isinstance(position_tolerance_mm, (int, float)) or isinstance(position_tolerance_mm, bool)
+            or not math.isfinite(position_tolerance_mm) or position_tolerance_mm < 0):
         return {"status": "skip", "fastener": fastener, "stacks": [],
-                "summary": f"could not resolve fastener spec: {e}"}
+                "summary": "position tolerance must be a finite nonnegative radial distance"}
+    from services.research.thread_spec import thread_spec
+    from services.research.fits import iso273_clearance_hole
+    spec = thread_spec(str(fastener))
     sp = spec.get("spec", {}) if isinstance(spec, dict) else {}
     nominal = sp.get("major_mm")
     if nominal is None:
-        maj_in = sp.get("major_in")
-        nominal = round(maj_in * 25.4, 4) if maj_in else None
-    if nominal is None:
         return {"status": "skip", "fastener": fastener, "stacks": [],
                 "summary": f"fastener {fastener} has no resolvable nominal diameter"}
-    # Build stacks: A holes matched to near-collinear B holes; the stack passes iff the
-    # SMALLEST bore in the stack clears the nominal fastener.
-    stacks, any_fail = [], False
-    used_b = set()
+    # ISO 273 is metric; an inch fastener with the same converted diameter is not an ISO row.
+    iso = (iso273_clearance_hole(nominal, clearance_class)
+           if str(fastener).strip().lower().startswith("m")
+           else {"ok": False, "reason": "non_metric_fastener"})
+    if iso.get("reason") == "unsupported_clearance_class":
+        return {"status": "skip", "fastener": fastener, "stacks": [],
+                "summary": iso["hint"]}
+    max_stacks = 100
+    truncated = len(a_holes) > max_stacks or len(b_holes) > max_stacks
+    a_holes, b_holes = a_holes[:max_stacks], b_holes[:max_stacks]
+    stacks, used_b = [], set()
     for ha in a_holes:
         best, best_lat, best_j = None, HOLE_MATCH_LATERAL_MM, None
         for j, hb in enumerate(b_holes):
-            if j in used_b:
+            if j in used_b or _axis_angle_deg(ha["axis"], hb["axis"]) >= 5.0:
                 continue
-            lat = _perp_distance_between_axes(ha["centroid"], ha["axis"], hb["centroid"], hb["axis"])
-            if _axis_angle_deg(ha["axis"], hb["axis"]) < 5.0 and lat < best_lat:
+            offset = _sub(hb["centroid"], ha["centroid"])
+            along = _dot(offset, ha["axis"])
+            lat = _norm(tuple(offset[k] - along * ha["axis"][k] for k in range(3)))
+            if lat < best_lat:
                 best, best_lat, best_j = hb, lat, j
-        min_dia = ha["dia"] if best is None else min(ha["dia"], best["dia"])
-        if best is not None:
-            used_b.add(best_j)
-        clearance = round(min_dia - nominal, 4)
-        passes = clearance > 0
-        rec = {"nominal_mm": nominal, "min_hole_dia_mm": round(min_dia, 4),
-               "clearance_mm": clearance, "passes": passes, "a_hole": _hole_ref(ha)}
+        rec = {"nominal_mm": nominal, "a_hole": _hole_ref(ha), "passes": None}
+        if best is None:
+            rec.update(status="not_evaluated", reason="no matching bore on the other component")
+            stacks.append(rec)
+            continue
+        used_b.add(best_j)
+        rec["b_hole"] = _hole_ref(best)
+        angle = _axis_angle_deg(ha["axis"], best["axis"])
+        if angle > 1e-5:
+            rec.update(status="not_evaluated", reason="nonparallel bores require finite bore extents")
+            stacks.append(rec)
+            continue
+        min_dia = min(ha["dia"], best["dia"])
+        clearance = min_dia - nominal
+        # The two allowable shank-centre disks overlap iff their radii sum exceeds
+        # the relative axis offset. Include the requested worst-case radial uncertainty.
+        margin = (ha["dia"] - nominal) / 2 + (best["dia"] - nominal) / 2 - best_lat - position_tolerance_mm
+        passes = clearance > 0 and margin > 0
+        rec.update(status="pass" if passes else "fail", passes=passes,
+                   min_hole_dia_mm=round(min_dia, 4), clearance_mm=round(clearance, 4),
+                   axis_offset_mm=round(best_lat, 4),
+                   position_tolerance_mm=position_tolerance_mm,
+                   radial_margin_mm=round(margin, 4))
+        if iso["ok"]:
+            rec["iso273_meets_series"] = min_dia >= iso["diameter_mm"]
         if not passes:
-            any_fail = True
-            rec["fix"] = (f"enlarge the {min_dia:g} mm bore to clear {fastener} "
-                          f"(needs > {nominal:g} mm)")
+            rec["fix"] = "reduce bore offset/position tolerance or enlarge the bores for the fastener"
             findings.append({
                 "severity": "fail", "component_a": a_id, "component_b": b_id,
                 "check": "fastener_passthrough", "feature": _hole_ref(ha),
-                "error_mm": round(nominal - min_dia, 4),
-                "detail": (f"{fastener} (Ø{nominal:g} mm) will not pass the {min_dia:g} mm bore "
-                           f"in the {a_name}/{b_name} stack"),
+                "error_mm": round(max(0.0, -clearance, -margin), 4),
+                "detail": f"{fastener} cannot clear the nominal bore stack at the specified offset and tolerance",
                 "fix": rec["fix"],
             })
         stacks.append(rec)
-    status = "fail" if any_fail else ("pass" if stacks else "skip")
+    for j, hb in enumerate(b_holes):
+        if j not in used_b:
+            if len(stacks) == max_stacks:
+                truncated = True
+                break
+            stacks.append({"a_hole": None, "b_hole": _hole_ref(hb), "passes": None,
+                           "status": "not_evaluated", "reason": "no matching bore on the other component"})
+    status = ("fail" if any(s["passes"] is False for s in stacks)
+              else "skip" if truncated or not stacks or any(s["passes"] is None for s in stacks) else "pass")
     return {"status": status, "fastener": fastener, "nominal_mm": nominal, "stacks": stacks,
-            "summary": (f"{sum(1 for s in stacks if s['passes'])}/{len(stacks)} stacks clear "
-                        f"{fastener}") if stacks else "no hole stacks to check"}
+            "truncated": truncated,
+            "iso273": iso if iso["ok"] else {"status": "not_evaluated", "reason": iso["reason"]},
+            "assumptions": ["nominal straight fastener and parallel cylindrical bores",
+                            "position tolerance is additional worst-case radial relative offset"],
+            "summary": f"{sum(s['passes'] is True for s in stacks)}/{len(stacks)} stacks clear {fastener}; "
+                       "unmatched, angled or truncated stacks are not evaluated"}
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +546,9 @@ def run_interface_check(
     coax_angle_tol_deg: float = DEFAULT_COAX_ANGLE_TOL_DEG,
     plane_angle_tol_deg: float = DEFAULT_PLANE_ANGLE_TOL_DEG,
     plane_gap_tol_mm: float = DEFAULT_PLANE_GAP_TOL_MM,
+    contact_faces: Optional[list] = None,
+    clearance_class: str = "normal",
+    fastener_position_tolerance_mm: float = 0.0,
 ) -> str:
     """Core implementation (importable by tests + the verify battery without going through MCP)."""
     from services.mcp import core_bridge as cb
@@ -535,6 +575,20 @@ def run_interface_check(
                               "name": b.get("name") or b.get("component") or f"b{idx+1}",
                               "bbox": b.get("bbox"), "body_id": idx + 1})
         id_to_meta = {c["id"]: c for c in comp_meta}
+        if contact_faces is not None:
+            if (not isinstance(contact_faces, list) or len(contact_faces) != 2
+                    or any(not isinstance(r, dict) or not isinstance(r.get("component"), str)
+                           or not isinstance(r.get("sid"), str) or not r["sid"]
+                           for r in contact_faces)
+                    or len({r["component"] for r in contact_faces}) != 2
+                    or any(r["component"] not in id_to_meta for r in contact_faces)):
+                return _dumps({"ok": False, "code": "bad_contact_faces",
+                               "error": "contact_faces must be two {component, sid} references "
+                                        "on distinct known components."})
+        tree = cb.call("doc_tree", {"doc_id": d}).get("tree") or {}
+        tree_components = {c["id"]: c for c in tree.get("components", [])
+                           if isinstance(c, dict) and c.get("id")}
+
 
         # Determine which pairs to examine.
         #
@@ -596,6 +650,15 @@ def run_interface_check(
                     a, b = comp_meta[i], comp_meta[j]
                     if a["bbox"] and b["bbox"] and _bbox_gap(a["bbox"], b["bbox"]) <= proximity_mm:
                         pairs_to_check.append((a, b))
+        if contact_faces is not None:
+            face_ids = {r["component"] for r in contact_faces}
+            if not any({a["id"], b["id"]} == face_ids for a, b in pairs_to_check):
+                if components:
+                    return _dumps({"ok": False, "code": "bad_contact_faces",
+                                   "error": "contact_faces components must be included in components."})
+                pairs_to_check.append(tuple(id_to_meta[r["component"]] for r in contact_faces))
+                pair_selection = "contact_faces"
+
 
         # Cache per-body geometry. Cylinders are split once into (bores, bosses):
         # bores drive hole-pattern + fastener checks, bores AND bosses drive coaxiality.
@@ -614,6 +677,32 @@ def run_interface_check(
                 planes_cache[bid] = _planar_faces_for_body(cb, d, bid)
             return planes_cache[bid]
 
+        def contact_reference(a, b):
+            a_planes, b_planes = planes_for(a), planes_for(b)
+            if contact_faces is not None:
+                refs = {r["component"]: r["sid"] for r in contact_faces}
+                if a["id"] in refs and b["id"] in refs:
+                    aa = [f for f in a_planes if f.get("sid") == refs[a["id"]]]
+                    bb = [f for f in b_planes if f.get("sid") == refs[b["id"]]]
+                    if len(aa) != 1 or len(bb) != 1:
+                        raise ValueError("contact_faces must identify one world planar face "
+                                         "on each named component")
+                    return aa[0], bb[0], "explicit"
+            from services.mcp.cad_render_tools import _mate_face_matches
+            for mate in tree.get("mates", []):
+                if (not isinstance(mate, dict) or mate.get("suppressed")
+                        or mate.get("type") not in ("coincident", "lock", "distance")):
+                    continue
+                refs = {r.get("component"): r for r in mate.get("refs", [])
+                        if isinstance(r, dict)}
+                if a["id"] not in refs or b["id"] not in refs:
+                    continue
+                aa = _mate_face_matches(refs[a["id"]], tree_components, {"face": a_planes})
+                bb = _mate_face_matches(refs[b["id"]], tree_components, {"face": b_planes})
+                if len(aa) == len(bb) == 1:
+                    return aa[0], bb[0], "mate:" + str(mate.get("id", ""))
+            return None
+
         all_findings: list[dict] = []
         pair_results: list[dict] = []
         for a, b in pairs_to_check:
@@ -630,11 +719,19 @@ def run_interface_check(
                 all_findings, a["id"], b["id"], a["name"], b["name"])
             checks["contact_plane"] = _check_contact_plane(
                 a["id"], b["id"], a["name"], b["name"],
-                planes_for(a), planes_for(b), plane_angle_tol_deg, plane_gap_tol_mm, all_findings)
+                planes_for(a), planes_for(b), plane_angle_tol_deg, plane_gap_tol_mm, all_findings,
+                contact_reference(a, b))
             # Fastener pass-through is through the bore stack.
             checks["fastener_passthrough"] = _check_fastener_passthrough(
                 a_bores, b_bores, fastener, all_findings,
-                a["id"], b["id"], a["name"], b["name"])
+                a["id"], b["id"], a["name"], b["name"],
+                clearance_class, fastener_position_tolerance_mm)
+            clearance = {s["a_hole"]: s for s in checks["fastener_passthrough"]["stacks"]}
+            for rec in checks["hole_pattern"]["matched"] + checks["hole_pattern"]["misaligned"]:
+                if rec["diameter_fit"] == "different":
+                    stack = clearance.get(rec["a_hole"]["ref"])
+                    rec["clearance_verdict"] = ("unverified" if stack is None or stack["passes"] is None else
+                                                  "clear" if stack["passes"] else "insufficient")
             pair_results.append({"a": a["id"], "b": b["id"],
                                  "a_name": a["name"], "b_name": b["name"], "checks": checks})
 
@@ -647,14 +744,15 @@ def run_interface_check(
         scope = (f"scope: {len(comp_meta)} body/bodies in the document, "
                  f"{len(pairs_to_check)} pair(s) checked "
                  + ("(explicit components=[...])" if pair_selection == "explicit"
+                    else "(includes explicit contact_faces)" if pair_selection == "contact_faces"
                     else f"(auto: bbox gap <= proximity_mm {proximity_mm} mm)") + ".")
         if not pairs_to_check:
             summary = ("No adjacent component pairs found within proximity_mm "
                        f"({proximity_mm} mm) among the {len(comp_meta)} bodies of this "
                        "document — name components=[a,b] to force a check.")
         elif not fails:
-            summary = (f"All {len(pairs_to_check)} interface(s) aligned "
-                       f"({len(all_findings)} advisory note(s)). {scope}")
+            summary = (f"No alignment failures in {len(pairs_to_check)} interface(s) "
+                       f"({len(all_findings)} advisory note(s)); skipped checks remain unverified. {scope}")
         else:
             summary = (f"{len(fails)} interface alignment failure(s) across "
                        f"{len(pairs_to_check)} interface(s): "
@@ -680,19 +778,22 @@ def register_interface_check_tools(mcp: "FastMCP") -> None:
         components: Optional[list] = None,
         fastener: Optional[str] = None,
         proximity_mm: float = DEFAULT_PROXIMITY_MM,
+        contact_faces: Optional[list] = None,
+        clearance_class: str = "normal",
+        fastener_position_tolerance_mm: float = 0.0,
     ) -> str:
         """Design-time INTERFACE ALIGNMENT check between mating components — the errors that
         pass check_interference (nothing overlaps) but are still wrong.
 
         Given an assembly / multi-body doc, examines each candidate mating pair (adjacent
         bounding boxes, or the components=["a","b"] you name) and reports, per interface:
-          * HOLE-PATTERN alignment — matches holes across the interface, flags position deltas
-            (mm, with the offset direction) and diameter mismatches; lists unmatched holes.
+          * HOLE-PATTERN alignment — flags position deltas, separately records diameter differences
+            and their nominal fastener clearance verdict, and lists unmatched holes.
           * COAXIALITY — mating bore/shaft axes: perpendicular offset (mm) + angular tilt (deg).
-          * CONTACT PLANE — the intended mating faces: coplanar/parallel? reports the signed
-            gap (+gap / -overlap) and out-of-parallel angle.
-          * FASTENER PASS-THROUGH — pass fastener="M6"/"1/4-20": does the nominal fastener clear
-            the mated hole stack? (clearance-class check via research_thread_spec — no new tables).
+          * CONTACT PLANE — explicit or mate-referenced faces: signed gap and parallelism.
+            Without resolvable references the contact check is skipped, not passed.
+          * FASTENER PASS-THROUGH — evaluates nominal straight-shank clearance for matched,
+            parallel bores with positional uncertainty; reports ISO 273 metric hole series.
 
         Every finding names the components + the feature (plain-words ref), the numeric error,
         and a FIX DIRECTION, so an agent can act on it during layout — e.g. "hole pattern on
@@ -708,14 +809,22 @@ def register_interface_check_tools(mcp: "FastMCP") -> None:
                         pairs. The ids are the `components[].id` of an un-scoped call.
           fastener:     optional thread designation ("M6", "1/4-20") to run the pass-through check.
           proximity_mm: bbox adjacency gap for auto-pair detection (default 2.0 mm).
+          contact_faces: optional [{"component":"k1","sid":"F..."}, {"component":"k2","sid":"F..."}]
+                         using world planar face SIDs from query_geometry; overrides mate references.
+          clearance_class: ISO 273 fine/close, medium/normal or coarse/loose (default normal).
+          fastener_position_tolerance_mm: additional worst-case radial relative bore-position
+                        uncertainty in mm (not a diametral GD&T zone; default 0).
 
         Returns a STABLE JSON verdict (tool="interface_check", version 1) with per-pair `checks`
         and a flat `findings` list. `status` is the verdict: "fail" when a finding has severity
-        "fail", "pass" when every checked pair aligns, "skip" when no pair was compared. A
+        "fail", "pass" when no checked finding fails (skipped checks remain unverified), or
+        "skip" when no pair was compared. A
         misalignment is a finding, so ok stays true. ok=false means the call was refused (bad
         or unknown components) or could not run. See `scope_note` for what v1 does NOT infer.
         This is the ALIGNMENT complement to check_interference (clash), not a replacement — run
         both.
         """
         return run_interface_check(doc_id=doc_id, components=components,
-                                   fastener=fastener, proximity_mm=proximity_mm)
+                                   fastener=fastener, proximity_mm=proximity_mm,
+                                   contact_faces=contact_faces, clearance_class=clearance_class,
+                                   fastener_position_tolerance_mm=fastener_position_tolerance_mm)

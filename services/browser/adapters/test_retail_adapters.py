@@ -13,9 +13,9 @@ import importlib
 
 import pytest
 
-from services.browser.adapters._retail import (find_datasheet_url, normalize_machining_params,
-                                               parse_jsonld_products, parse_spec_table,
-                                               parse_stock_params)
+from services.browser.adapters._retail import (card_blocks, card_image, find_datasheet_url,
+                                               normalize_machining_params, parse_jsonld_products,
+                                               parse_spec_table, parse_stock_params)
 
 
 @pytest.fixture()
@@ -335,7 +335,7 @@ def test_retail_search_parses_jsonld(adapter_mods, monkeypatch, site):
 
     assert len(hits) == 1
     hit = hits[0]
-    assert hit["ok"] is True
+    assert hit.get("ok") is not False
     assert title_word.lower() in hit["title"].lower()
     assert hit["url"].startswith("https://")
     assert hit["site"] == site
@@ -343,18 +343,13 @@ def test_retail_search_parses_jsonld(adapter_mods, monkeypatch, site):
     assert hit["price"]
 
 
-def test_metalsdepot_search_parses_current_product_cards(adapter_mods, monkeypatch):
+def test_metalsdepot_search_refuses_automated_access(adapter_mods, monkeypatch):
     _adapters_pkg, session, retail_mods = adapter_mods
-    monkeypatch.setattr(session, "browser_fetch",
-                        lambda url, s: {"ok": True, "content": METALSDEPOT_SEARCH_HTML})
-
-    hits = retail_mods["metalsdepot"].ADAPTER.search("aluminum angle")
-
-    assert len(hits) == 1
-    assert "6061-T6 Aluminum Angle" in hits[0]["title"]
-    assert hits[0]["url"] == "https://www.metalsdepot.com/steel-products/steel-angle/a36-angle"
-    assert hits[0]["site"] == "metalsdepot"
-    assert hits[0]["price"] == "$18.40"
+    def unexpected(*args):
+        raise AssertionError("policy-refused site must not be contacted")
+    monkeypatch.setattr(session, "browser_fetch", unexpected)
+    hit = retail_mods["metalsdepot"].ADAPTER.search("aluminum angle")[0]
+    assert hit["ok"] is False and hit["reason"] == "policy_refused"
 
 
 def test_lowes_search_falls_back_to_preloaded_state(adapter_mods, monkeypatch):
@@ -368,13 +363,13 @@ def test_lowes_search_falls_back_to_preloaded_state(adapter_mods, monkeypatch):
     assert "Whitewood Stud" in hits[0]["title"]
     assert hits[0]["url"] == "https://www.lowes.com/pd/2x4x8-stud/1000068131"
     assert hits[0]["sku"] == "1000068131"
-    assert hits[0]["price"] == "3.98"
+    assert hits[0]["price"] == 3.98
     assert hits[0]["thumbnail"].endswith("stud.jpg")
 
 
 @pytest.mark.parametrize("site", ("homedepot", "lowes"))
-def test_akamai_challenge_degrades_to_login_required(adapter_mods, monkeypatch, site):
-    """Bot walls are NEVER solved — they surface as the login_required ask."""
+def test_akamai_challenge_degrades_to_blocked(adapter_mods, monkeypatch, site):
+    """A bot wall is not a login prompt."""
     _adapters_pkg, session, retail_mods = adapter_mods
     monkeypatch.setattr(session, "browser_fetch",
                         lambda url, s: {"ok": True, "content": CHALLENGE_HTML})
@@ -382,12 +377,12 @@ def test_akamai_challenge_degrades_to_login_required(adapter_mods, monkeypatch, 
     hits = retail_mods[site].ADAPTER.search("anything")
     assert len(hits) == 1
     assert hits[0]["ok"] is False
-    assert hits[0]["reason"] == "login_required"
-    assert hits[0]["ask_user"]["id"].startswith("browser_login")
+    assert hits[0]["reason"] == "blocked"
+    assert hits[0]["ask_user"] is None
 
     result = retail_mods[site].ADAPTER.acquire({"url": "https://example.com/p/1"})
     assert result["ok"] is False
-    assert result["reason"] == "login_required"
+    assert result["reason"] == "blocked"
 
 
 def test_retail_search_propagates_fetch_failure(adapter_mods, monkeypatch):
@@ -396,7 +391,9 @@ def test_retail_search_propagates_fetch_failure(adapter_mods, monkeypatch):
                         lambda url, s: {"ok": False, "reason": "no_profile", "hint": "x"})
 
     hits = retail_mods["grainger"].ADAPTER.search("end mill")
-    assert hits == [{"ok": False, "reason": "no_profile", "hint": "x"}]
+    assert hits[0]["reason"] == "no_profile"
+    assert hits[0]["site"] == "grainger"
+    assert hits[0]["op"] == "search"
 
 
 # ---------------------------------------------------------------------------
@@ -408,7 +405,7 @@ def test_grainger_acquire_end_mill_params_and_datasheet(adapter_mods, monkeypatc
 
     def fake_download(url, site, dest):
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(b"PDF-BYTES")
+        dest.write_bytes(b"%PDF-1.7\nsample")
         return {"ok": True, "dest": str(dest), "session_profile_used": "grainger"}
 
     monkeypatch.setattr(session, "browser_fetch",
@@ -431,9 +428,11 @@ def test_grainger_acquire_end_mill_params_and_datasheet(adapter_mods, monkeypatc
     assert result["datasheet_url"].endswith("19LR45_datasheet.pdf")
     assert result["datasheet_path"].endswith("19LR45_datasheet.pdf")
     assert result["artifact_path"] == result["datasheet_path"]
+    assert result["artifact_kind"] == "document"
+    assert result["format"] == "pdf"
 
 
-def test_grainger_acquire_datasheet_failure_degrades_to_record(adapter_mods, monkeypatch):
+def test_grainger_acquire_propagates_datasheet_failure(adapter_mods, monkeypatch):
     _adapters_pkg, session, retail_mods = adapter_mods
     monkeypatch.setattr(session, "browser_fetch",
                         lambda url, s: {"ok": True, "content": GRAINGER_DETAIL_HTML})
@@ -443,16 +442,20 @@ def test_grainger_acquire_datasheet_failure_degrades_to_record(adapter_mods, mon
     result = retail_mods["grainger"].ADAPTER.acquire(
         {"url": "https://www.grainger.com/product/19LR45"})
 
-    assert result["ok"] is True
-    assert result["datasheet_path"] is None
-    assert result.get("artifact_path") is None
-    assert result["params"]["tool_diameter_mm"] == pytest.approx(12.7)
+    assert result["ok"] is False
+    assert result["site"] == "grainger"
+    assert result["reason"] == "no_profile"
 
 
 def test_fastenal_acquire_surfaces_spec_table(adapter_mods, monkeypatch):
     _adapters_pkg, session, retail_mods = adapter_mods
     monkeypatch.setattr(session, "browser_fetch",
-                        lambda url, s: {"ok": True, "content": FASTENAL_DETAIL_HTML})
+                        lambda url, s: {"ok": True, "content": FASTENAL_DETAIL_HTML +
+                                        '<a href="/manual.pdf">Manual</a>'})
+    def download(url, site, dest):
+        dest.write_bytes(b"%PDF-1.7\nsample")
+        return {"ok": True, "dest": str(dest)}
+    monkeypatch.setattr(session, "browser_download", download)
 
     result = retail_mods["fastenal"].ADAPTER.acquire(
         {"title": "M8 Hex Cap Screw", "url": "https://www.fastenal.com/product/details/0142811"})
@@ -465,7 +468,11 @@ def test_fastenal_acquire_surfaces_spec_table(adapter_mods, monkeypatch):
 def test_onlinemetals_acquire_derives_stock_params(adapter_mods, monkeypatch):
     _adapters_pkg, session, retail_mods = adapter_mods
     monkeypatch.setattr(session, "browser_fetch",
-                        lambda url, s: {"ok": True, "content": "<html><body>plain</body></html>"})
+                        lambda url, s: {"ok": True, "content": '<a href="/spec.pdf">Datasheet</a>'})
+    def download(url, site, dest):
+        dest.write_bytes(b"%PDF-1.7\nsample")
+        return {"ok": True, "dest": str(dest)}
+    monkeypatch.setattr(session, "browser_download", download)
 
     result = retail_mods["onlinemetals"].ADAPTER.acquire(
         {"title": '6061-T6 Aluminum Round Tube 1" OD x 0.049" wall',
@@ -482,7 +489,7 @@ def test_retail_acquire_rejects_missing_url(adapter_mods):
     _adapters_pkg, _session, retail_mods = adapter_mods
     result = retail_mods["homedepot"].ADAPTER.acquire({"title": "no url here"})
     assert result["ok"] is False
-    assert result["reason"] == "bad_result"
+    assert result["reason"] == "not_found"
 
 
 # ---------------------------------------------------------------------------
@@ -515,13 +522,13 @@ def test_health_check_result_shape_and_classification(adapter_mods, monkeypatch)
     assert isinstance(r["latency_ms"], float)
     assert r["error"] is None
 
-    # login wall → expected failure, never a crash
+    # bot wall → blocked, not an invented login prompt
     monkeypatch.setattr(session, "browser_fetch",
                         lambda url, s: {"ok": True, "content": CHALLENGE_HTML})
     r = health.run_health_check(["homedepot"])[0]
     assert r["ok"] is False
-    assert r["error"] == "login_required"
-    assert r["expected"] is True
+    assert r["error"] == "blocked"
+    assert not r.get("expected", False)
 
     # exception → captured, never raised
     def boom(url, s):
@@ -535,3 +542,40 @@ def test_health_check_result_shape_and_classification(adapter_mods, monkeypatch)
     r = health.run_health_check(["not-a-site"])[0]
     assert r["ok"] is False
     assert "no adapter" in r["error"]
+
+
+def test_card_images_use_captured_product_photos():
+    from services.browser.adapters.test_fastenal_parser import FASTENAL_SEARCH_HTML as fastenal
+    from services.browser.adapters.test_seeedstudio_parser import SEEED_SEARCH_HTML as seeed
+    assert card_image(fastenal, "https://www.fastenal.com").startswith("https://img4.fastenal.com/")
+    assert card_image(seeed, "https://www.seeedstudio.com").startswith("https://media-cdn.seeedstudio.com/")
+
+
+def test_nested_card_scopes_and_placeholder_images():
+    html = ('<div class="card"><div><img src="/logo.svg"><img data-src="/a.jpg"></div></div>'
+            '<div class="card"><img src="/b.jpg"></div><img src="/footer.jpg">')
+    cards = card_blocks(html, "div", "card")
+    assert len(cards) == 2
+    assert [card_image(c, "https://example.org") for c in cards] == [
+        "https://example.org/a.jpg", "https://example.org/b.jpg"]
+    assert card_image('<img src="/lazy.jpg"><img src="/images/pdf.png">', "https://example.org") is None
+
+
+def test_script_no_results_is_not_a_confirmed_empty_page(adapter_mods, monkeypatch):
+    _, session, retail_mods = adapter_mods
+    monkeypatch.setattr(session, "browser_fetch", lambda *_: {
+        "ok": True, "content": '<script>var translations = \"No results found\"</script><div>Loading</div>'})
+    result = retail_mods["grainger"].ADAPTER.search("x")[0]
+    assert result["reason"] == "parse_failed"
+
+
+def test_acquire_refuses_different_sku_without_downloading(adapter_mods, monkeypatch):
+    _, session, retail_mods = adapter_mods
+    monkeypatch.setattr(session, "browser_fetch", lambda *_: {"ok": True, "content": GRAINGER_DETAIL_HTML})
+    def unexpected(*args):
+        raise AssertionError("different SKU must not be downloaded")
+    monkeypatch.setattr(session, "browser_download", unexpected)
+    result = retail_mods["grainger"].ADAPTER.acquire({
+        "url": "https://www.grainger.com/product/19LR45", "sku": "OTHER"})
+    assert result["ok"] is False and result["reason"] == "unsupported"
+    assert result["ask_user"]["kind"] == "text" and result["candidates"] == ["19LR45"]

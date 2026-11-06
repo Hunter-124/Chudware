@@ -20,7 +20,8 @@ class CivilError(ValueError):
         self.extra = extra
 
     def to_dict(self) -> dict[str, Any]:
-        out: dict[str, Any] = {"ok": False, "reason": self.reason}
+        out: dict[str, Any] = {"ok": False, "error": self.reason, "code": self.reason,
+                               "reason": self.reason}
         if self.hint:
             out["hint"] = self.hint
         out.update(self.extra)

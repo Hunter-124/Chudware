@@ -96,6 +96,17 @@ def test_miss_then_hit_roundtrips_the_payload(cache_mods):
     assert hit["age_s"] >= _FETCHED_AGO_S - 1.0
 
 
+def test_cached_redirect_and_actual_session_context_roundtrip(cache_mods):
+    page_cache, _session, _rl = cache_mods
+    sent = _payload()
+    sent["final_url"] = "https://x/product/1"
+    sent["session_profile_used"] = "cef_global"
+    page_cache.put("https://x/1", "grabcad", sent)
+    cached = page_cache.get("https://x/1", "grabcad")
+    assert cached["final_url"] == sent["final_url"]
+    assert cached["session_profile_used"] == "cef_global"
+
+
 def test_key_is_scoped_by_site(cache_mods):
     page_cache, _session, _rl = cache_mods
     page_cache.put("https://x/1", "grabcad", _payload("<html>a</html>"))
@@ -104,12 +115,17 @@ def test_key_is_scoped_by_site(cache_mods):
 
 
 @pytest.mark.parametrize("payload", [
-    {"ok": False, "reason": "challenge_page", "hint": "captcha"},
-    {"ok": False, "reason": "bot_walled", "hint": "403"},
+    {"ok": False, "reason": "captcha", "hint": "captcha"},
+    {"ok": False, "reason": "blocked", "hint": "403"},
     {"ok": True, "content": "", "status": 200},
     {"ok": True, "content": "   ", "status": 200},
     {"ok": True, "content": "<html>error</html>", "status": 404},
     {"ok": True, "content": "<html>error</html>", "status": 403},
+    {"ok": True, "content": '<div class="g-recaptcha"></div>', "status": 200},
+    {"ok": True, "content": '<form><input type="password"></form>', "status": 200},
+    {"ok": True, "content": "<html>sign in</html>", "status": 200,
+     "final_url": "https://x/login"},
+    {"ok": True, "content": "<title>Access Denied</title>", "status": 200},
 ])
 def test_never_caches_failures_or_error_pages(cache_mods, payload):
     page_cache, _session, _rl = cache_mods
@@ -205,6 +221,71 @@ def test_purge_clears_by_site_and_wholesale(cache_mods):
 
     assert page_cache.purge() == 1
     assert page_cache.stats()["entries"] == 0
+
+
+def test_login_and_profile_delete_purge_only_the_changed_site(cache_mods, monkeypatch):
+    page_cache, _session, _rl = cache_mods
+    from services.browser import embed, profiles
+    page_cache.put("https://x/1", "grabcad", _payload())
+    page_cache.put("https://x/1", "other", _payload())
+    result = embed.import_session_cookies(
+        "grabcad", [{"name": "sid", "value": "new", "domain": ".grabcad.com"}])
+    assert result["ok"] and page_cache.get("https://x/1", "grabcad") is None
+    assert page_cache.get("https://x/1", "other") is not None
+
+    page_cache.put("https://x/1", "grabcad", _payload())
+    # Profile deletion must invalidate even while caching is disabled.
+    monkeypatch.setenv("CHUDWARE_PAGE_CACHE", "0")
+    assert profiles.delete_profile("grabcad")
+    monkeypatch.delenv("CHUDWARE_PAGE_CACHE")
+    assert page_cache.get("https://x/1", "grabcad") is None
+    assert page_cache.get("https://x/1", "other") is not None
+
+
+def test_inflight_fetch_does_not_repopulate_cache_after_login(cache_mods):
+    page_cache, session, _rl = cache_mods
+    from services.browser import embed
+
+    class Backend:
+        def fetch(self, url, **_kwargs):
+            embed.import_session_cookies(
+                "grabcad", [{"name": "sid", "value": "new", "domain": ".grabcad.com"}])
+            return {"ok": True, "status": 200, "final_url": url,
+                    "html": "<html>anonymous before login</html>"}
+
+    url = "https://grabcad.com/p/1"
+    result = session.browser_fetch(url, "grabcad", _cef=Backend(), min_interval=0)
+    assert result["ok"]
+    assert page_cache.get(url, "grabcad") is None
+
+
+def test_logout_transition_purges_cached_pages(cache_mods, monkeypatch):
+    import asyncio
+    import threading
+    from types import SimpleNamespace
+    from services.browser import embed
+
+    page_cache, _session, _rl = cache_mods
+    page_cache.put("https://x/1", "grabcad", _payload())
+    page_cache.put("https://x/1", "other", _payload())
+
+    class Page:
+        url = "https://grabcad.com/login"
+        async def content(self):
+            return '<form><input type="password"></form>'
+
+    async def stop(_seconds):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(embed.asyncio, "sleep", stop)
+    manager = embed.EmbedManager(clock=lambda: 100.0)
+    state = SimpleNamespace(page=Page(), frame_lock=threading.Lock(),
+                            login_state="logged_in", site="grabcad", url="")
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(manager._classify_loop(state))
+    assert state.login_state == "login_page"
+    assert page_cache.get("https://x/1", "grabcad") is None
+    assert page_cache.get("https://x/1", "other") is not None
 
 
 def test_stats_counts_hits_and_misses(cache_mods):
@@ -330,7 +411,7 @@ def test_browser_fetch_never_caches_an_http_error(cache_mods, monkeypatch):
     # A 403 arms the rate limiter's exponential backoff; neutralise it so the second
     # call measures the CACHE, not the (correct) 30 s penalty. Returning 0.0 is
     # "no wait was needed" — session.py reads that return value now, because a wait
-    # longer than session.COOLDOWN_WAIT_BUDGET_S short-circuits to a cooldown_active
+    # longer than session.COOLDOWN_WAIT_BUDGET_S short-circuits to a rate_limited
     # refusal instead of a second fetch.
     monkeypatch.setattr(ratelimit, "wait",
                         lambda site, *, min_interval=0.0, url=None, max_wait_s=None: 0.0)
@@ -351,5 +432,24 @@ def test_browser_fetch_never_caches_a_challenge_page(cache_mods):
 
     r = session.browser_fetch("https://grabcad.com/p/5", "grabcad",
                               _cef=cef, min_interval=0.0)
-    assert r["ok"] is False and r["reason"] == "challenge_page"
+    assert r["ok"] is False and r["reason"] == "captcha"
     assert _page_cache.stats()["entries"] == 0
+
+
+def test_partial_load_is_reported_but_not_cached(cache_mods, monkeypatch):
+    page_cache, session, ratelimit = cache_mods
+    monkeypatch.setattr(ratelimit, "wait", lambda *args, **kwargs: 0)
+
+    class PartialBackend:
+        calls = 0
+        def fetch(self, url, **_kwargs):
+            self.calls += 1
+            return {"ok": True, "status": 200, "final_url": url,
+                    "html": "<html>partial product page</html>", "partial_load": True}
+
+    backend = PartialBackend()
+    url = "https://grabcad.com/p/partial"
+    first = session.browser_fetch(url, "grabcad", _cef=backend, min_interval=0)
+    second = session.browser_fetch(url, "grabcad", _cef=backend, min_interval=0)
+    assert first["partial_load"] is True and second["partial_load"] is True
+    assert backend.calls == 2 and page_cache.get(url, "grabcad") is None

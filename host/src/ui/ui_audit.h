@@ -38,6 +38,7 @@
 //    exits with EXIT_FAILURE when N > 0, so any scenario can be gated on it.
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 #include <nlohmann/json.hpp>
@@ -75,13 +76,21 @@ bool active();
 //  frames, seconds, items_seen, windows_seen, windows:[root window names], truncated}
 const nlohmann::json& lastResult();
 
-// Last rendered frame's enabled labeled items, including submitted offscreen items:
-// [{id, label, window, visible, rect:[x1,y1,x2,y2], full_rect, clip, openable, opened, text_only}].
-// A visible rect is intersected with the real item clip; invisible rects are navigation evidence.
-// Rendered status text has id=0/text_only=true and is never an interactive pointer target.
-// Disclosure flags come from the final ImGui/kit annotation.
-// Collection is shot/audit-only, bounded to 4096 items; ordinary frames allocate nothing.
+// Last completed frame's labeled items, including disabled and submitted offscreen items:
+// [{id, label, native_label, window, visible, enabled, rect:[x1,y1,x2,y2],
+//   full_rect, clip, openable, opened, text_only}]. A visible rect is intersected with
+// the real item clip; invisible rects are navigation evidence, not pointer targets.
+// Rendered status text is observed when explicitly annotated by its drawing code; it
+// has id=0/text_only=true and is never an interactive pointer target. Disclosure flags
+// come from the final ImGui/kit annotation. Collection is shot/audit-only and bounded
+// to 4096 items; ordinary frames allocate nothing.
 const nlohmann::json& observedItems();
+
+// Look up an actual ItemAdd from the last completed observed frame by exact ID and
+// owner window, including controls (such as BeginCombo) that never emit ItemInfo.
+// On success item has the same shape as observedItems(); labels may be empty.
+// This is available only while observation is armed, between frames.
+bool observedItemById(std::uint32_t id, const std::string& window, nlohmann::json& item);
 
 // Active, visible window clips and their real scrolling state, bounded to 256 windows:
 // [{id, window, parent, rect, wheel_point, scroll_y, scroll_max_y, wheel_step_y, wheel_enabled}].

@@ -14,7 +14,7 @@ from contextlib import contextmanager
 # Parents publish children before releasing their reservations. Read the parents
 # first; never import a registry or call its lazy singleton getter here.
 _REGISTRIES = (
-    "services.agent.chudcode_host",
+    "services.agent.omp_host",
     "services.agent.worker_rpc",
     "services.mcp.reveng_common",
     "services.piping.worker_rpc",
@@ -296,7 +296,7 @@ def snapshot() -> dict[str, Any]:
             processes.extend(probe.get("processes", ()))
             idle_clients.extend(probe.get("idle_clients", ()))
             if probe.get("complete", True) is not True:
-                failures.add("sdk_unattested" if name.endswith("chudcode_host")
+                failures.add("sdk_unattested" if name.endswith("omp_host")
                              else "registry_probe_failed")
         except Exception:
             failures.add("registry_probe_failed")

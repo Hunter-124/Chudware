@@ -1483,6 +1483,10 @@ void drawPreviewCard(AppState& st, const std::string& session_id, const std::str
             cancelGaussian(st, ws.live->sid);
         }
     } else {
+#ifdef __EMSCRIPTEN__
+        kit::SecondaryButton("Start live splat", false,
+                             "Splat training requires a GPU, which the browser server sandbox does not expose.");
+#else
         const auto& gaussian = S().gaussian;
         const bool idle = !gaussian.pending &&
             (gaussian.status.empty() || gaussian.status == "done" ||
@@ -1503,6 +1507,7 @@ void drawPreviewCard(AppState& st, const std::string& session_id, const std::str
                 ws.accepted = ws.rejectedStale = ws.rejectedBlur = ws.rejectedSynthetic = ws.backpressured = 0;
             }
         }
+#endif
     }
     char counts[192];
     std::snprintf(counts, sizeof(counts),

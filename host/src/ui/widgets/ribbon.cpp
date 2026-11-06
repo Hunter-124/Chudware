@@ -14,7 +14,6 @@
 #include "../metrics.h"       // ui::metrics::px/U/stroke/rounding + ribbon tokens
 #include "../appearance_common.h"  // ui::kMaterials (material swatch colors)
 #include "../layout.h"        // ui::setEvalRibbonDock (Evaluate-tab inspector dock strip)
-#include "../web_capabilities.h"  // ui::webGapReason (WASM-build ribbon gating)
 #include "kit.h"
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -27,7 +26,9 @@
 #include <functional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -37,7 +38,7 @@
 static std::function<void(const char*)> s_RibbonCb;
 
 // C25: last-used variant per parent button cmd_id.
-static std::unordered_map<std::string, std::string> s_LastUsed;
+static std::unordered_map<std::string_view, std::string> s_LastUsed;
 
 // C25 FIX: flyout open requests must be deferred. The buttons run inside their own PushID
 // scope, so calling OpenPopup there hashes the popup id with the button's seed while the
@@ -123,65 +124,13 @@ static_assert(sizeof(kTabDisplayOrder) / sizeof(kTabDisplayOrder[0]) == kRibbonT
 // Default Model (0) — app.cpp sets the live value each frame via setRibbonWorkspace().
 static int s_workspace = 0;
 
-// sim-gui: dynamic command gating. Commands whose cmd_id starts with s_disabledPrefix render
-// disabled with s_disabledReason in their tooltip (instead of the static reserved-row reason). Used by
-// SimManager to grey the EM tools while the em_* solver backend is not installed. A second
-// consumer exists: ribbon_dynDisabledReason also falls through to ui::webGapReason(cmd_id),
-// which greys web-unsupported commands in the WASM build (data-driven from
-// ui/web_capabilities.cpp — no per-command state here).
-static std::string s_disabledPrefix;
-static std::string s_disabledReason;
-static std::string s_agentLockReason;
+// One snapshot for ribbon, palette-adjacent widgets and the S bar. The dispatcher
+// always checks a fresh context rather than trusting this render-time snapshot.
+static ui::CommandContext s_commandContext;
 
-// Simulate study context (setRibbonStudyContext): the selected study's type key, refreshed every
-// frame by SimManager::tick. It expires one frame after the last refresh, so a stale study never
-// gates the ribbon once no CAD document (and so no SimManager) is active.
-static std::string s_studyCtx;
-static int s_studyCtxFrame = -100;
-static const char* ribbon_studyCtx() {
-    return ImGui::GetFrameCount() - s_studyCtxFrame <= 1 ? s_studyCtx.c_str() : nullptr;
-}
-
-static const char* ribbon_dynDisabledReason(const char* cmd_id) {
-    if (!cmd_id) return nullptr;
-    if (!s_agentLockReason.empty() &&
-        ui::ribbonCommandCapability(cmd_id) == ui::CommandCapability::Mutate &&
-        std::strcmp(cmd_id, "sketch_exit") != 0 &&
-        std::strcmp(cmd_id, "sketch3d_exit") != 0 &&
-        std::strcmp(cmd_id, "sketch_cancel") != 0 &&
-        std::strcmp(cmd_id, "sketch3d_cancel") != 0)
-        return s_agentLockReason.c_str();
-    if (!s_disabledPrefix.empty() &&
-        std::strncmp(cmd_id, s_disabledPrefix.c_str(), s_disabledPrefix.size()) == 0)
-        return s_disabledReason.c_str();
-    // Simulate: commands that do not apply to the selected study (ribbon_def.cpp ribbonStudyGate).
-    const char* why = nullptr;
-    if (ui::ribbonStudyGate(cmd_id, ribbon_studyCtx(), &why) == ui::RibbonStudyGate::Disabled)
-        return why;
-    // Web-build capability gaps (ui/web_capabilities.cpp; folds to nullptr on
-    // native, so desktop rendering/tooltips are unchanged).
-    return ui::webGapReason(cmd_id);
-}
-// Effective enabled state for a row: the static schema-reserved flag (stretch) AND the dynamic
-// gates above. Every button/flyout/overflow row goes through this.
 static bool ribbon_cmdEnabled(const ui::RibbonCmd* c) {
-    return !c->stretch && !ribbon_dynDisabledReason(c->cmd_id);
-}
-
-// Why a schema-reserved (stretch) row is greyed: the concrete missing capability, so a hover tells
-// an engineer what is not supported instead of a placeholder. Unlisted rows get a plain statement.
-static const char* ribbon_reservedReason(const char* cmd_id) {
-    struct R { const char* id; const char* why; };
-    static const R kReasons[] = {
-        {"sk_spline_surface", "Not available yet: splines cannot be sketched directly on curved "
-                              "faces."},
-        {"sim_load_torque",   "Not available yet: the structural solver has no torque or moment "
-                              "load."},
-    };
-    if (cmd_id)
-        for (const auto& r : kReasons)
-            if (std::strcmp(r.id, cmd_id) == 0) return r.why;
-    return "Not available in this version.";
+    const auto state = ui::commandAvailability(c->cmd_id, s_commandContext);
+    return state.visible && state.enabled;
 }
 
 // W17 + per-workspace: control which tabs appear in the ribbon for the current workspace.
@@ -196,8 +145,7 @@ static const char* ribbon_reservedReason(const char* cmd_id) {
 //   Manufacture=4, PLM=5, PartsLibrary=6, AI=7
 //
 // PLM/PartsLibrary/AI: ribbon collapsed to 0 height upstream — this function is never reached.
-// Drawing workspace: contextual tabs only (View Layout 9, Annotation 10, Sketch 1).
-//   Within it the bools still control contextual sub-visibility (sketch-vs-sheet).
+// Drawing workspace: contextual View Layout and Annotation tabs only.
 // Simulate workspace: Simulation(3) + Reference shared group (added as sim-tab rows in ribbon_def).
 // Electronics workspace: PCB tab(7) only.
 // Manufacture workspace: Manufacture tab(12) only.
@@ -205,9 +153,9 @@ static const char* ribbon_reservedReason(const char* cmd_id) {
 //   Appearance — NO sim/cam/ecad unless the legacy bools also say yes.
 static bool ribbon_tabVisible(int tab, bool showSimulationTools, bool showPcbTools,
                               bool showDrawingTools) {
-    // Drawing workspace (or Drawing doc override): show View Layout, Annotation, Sketch only.
+    // Drawing workspace (or Drawing doc override) has no mechanical Sketch tab.
     if (showDrawingTools || s_workspace == 1 /*Drawing*/) {
-        return tab == 9 || tab == 10 || tab == 1;
+        return tab == 9 || tab == 10;
     }
 
     // Simulate workspace (sim-gui rework): the per-simulation-type tabs ONLY (Static / Modal /
@@ -317,37 +265,24 @@ enum CollapseLevel {
     COL_HIDDEN= 3,  // group goes into overflow chevron
 };
 
-// C24: split a big-button label into up to two lines.
-static float ribbon_wrapLabel(const char* label, std::string& l1, std::string& l2) {
-    l1 = label; l2.clear();
-    std::string s(label);
-    size_t nl = s.find('\n');
-    if (nl != std::string::npos) {
-        l1 = s.substr(0, nl);
-        l2 = s.substr(nl + 1);
-    } else {
-        size_t sp = s.rfind(' ');
-        if (sp != std::string::npos && s.size() > 7) {
-            l1 = s.substr(0, sp);
-            l2 = s.substr(sp + 1);
-        }
+// Split a big-button label into borrowed spans; rendering must not allocate
+// strings for every button on every frame.
+static void ribbon_wrapLabelFor(const char* cmd_id, const char* label, std::string_view& l1,
+                                std::string_view& l2) {
+    const std::string_view text(label);
+    l1 = text;
+    l2 = {};
+    // Launcher captions stay on one line so the arrow strip clears them.
+    if (cmd_id && ribbon_isLauncher(cmd_id)) return;
+    size_t split = text.find('\n');
+    if (split == std::string_view::npos) {
+        split = text.rfind(' ');
+        if (text.size() <= 7) split = std::string_view::npos;
     }
-    float w1 = ImGui::CalcTextSize(l1.c_str()).x;
-    float w2 = l2.empty() ? 0.0f : ImGui::CalcTextSize(l2.c_str()).x;
-    return w1 > w2 ? w1 : w2;
-}
-
-// Launcher split buttons ("New Study") keep their caption on ONE line: their arrow strip sits right
-// under the caption, and a two-line caption under the 36 px icon left the second line touching the
-// caret (and the button too narrow for its group caption). One line still fits kBigBtnMaxW.
-static float ribbon_wrapLabelFor(const char* cmd_id, const char* label, std::string& l1,
-                                 std::string& l2) {
-    if (cmd_id && ribbon_isLauncher(cmd_id)) {
-        l1 = label;
-        l2.clear();
-        return ImGui::CalcTextSize(label).x;
+    if (split != std::string_view::npos) {
+        l1 = text.substr(0, split);
+        l2 = text.substr(split + 1);
     }
-    return ribbon_wrapLabel(label, l1, l2);
 }
 
 // C25: snap to nearest integer pixel for crisp atlas rendering.
@@ -355,15 +290,16 @@ static float ribbon_wrapLabelFor(const char* cmd_id, const char* label, std::str
 // draw paths share the same pixel-grid math.
 static inline float snap(float v) { return std::floor(v + 0.5f); }
 
-// Width of a big button in screen pixels.
-// §2.1: ribbon_wrapLabel returns a CalcTextSize result (already screen-px / DPI-scaled), so the
-// label width is computed entirely in screen px (kBigLblPad scaled once) and clamped against the
-// screen-px min/max bounds. Mixing the screen-px text with *s once would double-scale the label.
+// Width of a big button in screen pixels. ImGui text sizes are already
+// DPI-scaled, so only the padding and min/max bounds are multiplied by uiScale.
 static float ribbon_bigBtnW(const char* cmd_id, const char* label, bool hasDrop) {
     float s = ui::uiScale;
-    std::string l1, l2;
+    std::string_view l1, l2;
     const char* visibleLabel = ribbon_displayLabel(cmd_id, label);
-    float lblWScreen = ribbon_wrapLabelFor(cmd_id, visibleLabel, l1, l2) + kBigLblPad * 2.0f * s;
+    ribbon_wrapLabelFor(cmd_id, visibleLabel, l1, l2);
+    const float w1 = ImGui::CalcTextSize(l1.data(), l1.data() + l1.size()).x;
+    const float w2 = l2.empty() ? 0.0f : ImGui::CalcTextSize(l2.data(), l2.data() + l2.size()).x;
+    float lblWScreen = std::max(w1, w2) + kBigLblPad * 2.0f * s;
     float base = (visibleLabel[0] == '\0' ? 46.0f : kBigBtnW) * s;
     if (lblWScreen > base) base = lblWScreen;
     if (base > kBigBtnMaxW * s) base = kBigBtnMaxW * s;
@@ -497,13 +433,17 @@ static float ribbon_smRowY(float contentY, int r) {
     return snap(contentY + pitch * (float)r);
 }
 
-// Group descriptor built each frame for the active tab
+// Group descriptor retained with the active layout.
 struct RibbonGroup {
     const char*                        label;
     std::vector<const ui::RibbonCmd*>  bigCmds;
     std::vector<const ui::RibbonCmd*>  smCmds;
     std::vector<const ui::RibbonCmd*>  subCmds;
     CollapseLevel                      collapse = COL_BIG;
+    std::vector<float> bigWidths;
+    std::vector<const ui::RibbonCmd*> rows;
+    std::vector<SmColumn> columns;
+    float contentW = 0.0f;
 };
 
 // ---------------------------------------------------------------------------
@@ -901,7 +841,8 @@ static const char* ribbon_tipFor(const char* cmd_id) {
         {"eval_mass_props",   "Compute mass, volume, center of mass."},
         {"eval_section_props","Compute area and section properties of a face."},
         {"eval_draft",        "Analyze draft angles relative to a pull direction."},
-        {"eval_thickness",    "Check wall thickness across the model."},
+        {"eval_thickness",    "Wall-thickness study: choose a process minimum, show thin walls in red "
+                              "and frame the thin regions. Also available from Evaluate."},
         {"eval_curvature",    "Display surface curvature."},
         {"eval_zebra",        "Show zebra stripes to inspect surface continuity."},
         {"eval_symmetry",     "Check the model for symmetry."},
@@ -1051,31 +992,26 @@ static const char* ribbon_tipFor(const char* cmd_id) {
         {"weld_member",       "Sweep a structural profile along the path segments."},
         {"weld_gusset",       "Add a triangular gusset plate to brace a corner."},
         {"weld_end_cap",      "Close the open end of a structural tube."},
-        // --- PCB: schematic, board, analysis, outputs ---
-        {"ecad_ai_design",    "Generate a schematic and PCB layout from a text prompt."},
-        {"ecad_new_sch",      "Start a new schematic sheet."},
-        {"ecad_new_pcb",      "Start a new PCB layout."},
-        {"ecad_open",         "Open an existing schematic or board."},
-        {"ecad_save",         "Save the schematic and board."},
-        {"sch_add_symbol",    "Place a component symbol on the schematic."},
-        {"sch_add_wire",      "Draw a wire between schematic pins."},
-        {"sch_add_label",     "Add a net label to name a connection."},
-        {"sch_add_power",     "Place a power or ground port."},
-        {"sch_annotate",      "Assign reference designators to the symbols."},
-        {"ecad_run_erc",      "Run electrical rule checks on the schematic."},
-        {"pcb_update_from_sch","Push schematic changes onto the board."},
-        {"pcb_add_footprint", "Place a component footprint on the board."},
-        {"pcb_add_track",     "Route a copper track between pads."},
-        {"pcb_add_via",       "Place a via connecting copper layers."},
-        {"pcb_add_zone",      "Draw a copper pour zone."},
-        {"ecad_autoroute",    "Automatically route the board's connections."},
-        {"ecad_fill_zones",   "Recompute copper pours around tracks and pads."},
-        {"ecad_run_drc",      "Run design rule checks on the board."},
-        {"ecad_simulate",     "Run a SPICE simulation of the circuit."},
-        {"ecad_to_3d",        "Build a 3D model of the populated board."},
-        {"ecad_export_gerber","Export Gerber fabrication files."},
-        {"ecad_export_drill", "Export the NC drill file."},
-        {"ecad_export_bom",   "Export the board bill of materials."},
+        // --- KiCad project hub ---
+        {"ecad_ai_design",          "Generate an electronics design from a text prompt."},
+        {"ecad_new_project",        "Create a KiCad project in the current working directory."},
+        {"ecad_open",               "Open a KiCad project, schematic or board."},
+        {"ecad_save",               "Save the active KiCad file."},
+        {"ecad_kicad_open_sch",     "Open the schematic in KiCad's Schematic Editor."},
+        {"ecad_kicad_open_pcb",     "Open the board in KiCad's PCB Editor."},
+        {"ecad_kicad_open_project", "Open the project in KiCad."},
+        {"ecad_run_erc",            "Run KiCad electrical rule checks."},
+        {"ecad_run_drc",            "Run KiCad board design rule checks."},
+        {"pcb_update_from_sch",     "Push schematic changes onto the board."},
+        {"ecad_autoroute",          "Automatically route the board's connections."},
+        {"ecad_fill_zones",         "Recompute copper pours around tracks and pads."},
+        {"ecad_simulate",           "Run a circuit simulation of the schematic."},
+        {"ecad_to_3d",              "Build a 3D model using KiCad's component models."},
+        {"ecad_export_fab",         "Export Gerbers, drill, position and BOM to the project's fab folder."},
+        {"ecad_export_step",        "Export the populated board as STEP."},
+        {"ecad_export_bom",         "Export the bill of materials using KiCad."},
+        {"sch_export_netlist",      "Export the KiCad schematic netlist."},
+        {"sch_export_pdf",          "Export the schematic as PDF."},
         // --- Surfaces ---
         {"surf_extrude",      "Create an open surface by extruding a profile."},
         {"surf_revolve",      "Create a surface by revolving a profile about an axis."},
@@ -1213,10 +1149,10 @@ static void ribbon_tooltip(const char* title, const char* cmd_id, const char* ic
             ImGui::PopStyleColor();
         }
         if (!enabled) {
-            // Dynamic gate (e.g. "EM solver not installed") beats the static reserved-row reason.
-            const char* why = ribbon_dynDisabledReason(cmd_id);
+            const auto state = ui::commandAvailability(cmd_id, s_commandContext);
             ImGui::PushStyleColor(ImGuiCol_Text, col(ui::palette.textDisabled));
-            ImGui::TextUnformatted(why ? why : ribbon_reservedReason(cmd_id));
+            ImGui::TextUnformatted(state.reason ? state.reason
+                                                : "Command unavailable in this context");
             ImGui::PopStyleColor();
         }
         ImGui::PopTextWrapPos();
@@ -1347,7 +1283,7 @@ static void ribbon_btnActive(ImDrawList* dl, ImVec2 p0, ImVec2 p1, float roundin
 // Draw a SW big button. Returns true if main area clicked.
 // wOverride < 0 => size from the passed (face) label as before; >= 0 => draw at this stable width
 // (the widest-variant width, so a split button never reflows/clips when the face label changes).
-static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
+static bool ribbon_bigBtn(const char* cmd_id, const char* faceId, const char* iconName,
                            const char* label, bool enabled, bool hasDrop,
                            float wOverride = -1.0f, bool highlight = false,
                            bool finishBadge = false) {
@@ -1382,17 +1318,19 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
     // dropH is snapped so mainH + dropH == bh exactly (no fractional seam between hit strips).
     float dropH = hasDrop ? snap(12.0f * s) : 0.0f;
     float mainH = bh - dropH;
-    clicked = ImGui::InvisibleButton("##main", ImVec2(bw, mainH));
+    clicked = ImGui::InvisibleButton("##main", ImVec2(bw, mainH), ImGuiButtonFlags_EnableNav);
     bool mainHov    = ImGui::IsItemHovered();
-    bool mainHovTip = ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal);
+    bool mainHovTip = ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal) || ImGui::IsItemFocused();
     bool mainPress  = ImGui::IsItemActive();
     bool dropHov    = false;
 
     if (hasDrop) {
         ImGui::SetCursorScreenPos(ImVec2(p0.x, p0.y + mainH));
-        dropClicked = ImGui::InvisibleButton("##drop", ImVec2(bw, dropH));
+        dropClicked = ImGui::InvisibleButton("##drop", ImVec2(bw, dropH), ImGuiButtonFlags_EnableNav);
         dropHov = ImGui::IsItemHovered();
-        if (dropClicked && enabled) s_flyoutOpenReq = cmd_id;   // deferred (ID-scope fix)
+        // Opening the menu is navigation, not execution: even disabled choices
+        // must remain reachable so their reasons can be inspected.
+        if (dropClicked) s_flyoutOpenReq = cmd_id;
     }
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -1400,17 +1338,17 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
     const ImVec2 p1(p0.x + bw, p0.y + bh);
 
     // State layering: liquid-glass rest/hover fill → bold active outline → press overlay.
-    const bool isActive = ribbon_isActive(cmd_id);
-    const bool hovAny   = (mainHov || dropHov) && enabled;
+    const bool isActive = ribbon_isActive(faceId) || ribbon_isActive(cmd_id);
+    const bool hovAny = (mainHov && enabled) || dropHov;
     if (highlight) {
         // Highlighted action (e.g. Finish Sketch): keep the neutral glass fill but wrap it in an
         // accent-GREEN border so it stands out from the tool buttons without flooding the tile green.
-        ribbon_btnRest(dl, p0, p1, rnd, enabled, /*inset=*/false, /*hovered=*/hovAny);
+        ribbon_btnRest(dl, p0, p1, rnd, enabled || hasDrop, /*inset=*/false, /*hovered=*/hovAny);
         const float* ok = ui::palette.statusOk;
         ImVec4 bc(ok[0], ok[1], ok[2], hovAny ? 1.0f : 0.90f);
         dl->AddRect(p0, p1, ImGui::ColorConvertFloat4ToU32(bc), rnd, 0, 2.0f * s);
     } else {
-        ribbon_btnRest(dl, p0, p1, rnd, enabled, /*inset=*/false, /*hovered=*/hovAny);
+        ribbon_btnRest(dl, p0, p1, rnd, enabled || hasDrop, /*inset=*/false, /*hovered=*/hovAny);
     }
     if (isActive) {
         // Armed tool: BOLD accent outline around the full bounding box (app-wide rule).
@@ -1422,7 +1360,7 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
         // edges by the shared split inset, so a split button reads as split before its flyout is
         // ever opened. Color is the border role at reduced alpha — theme role, no literal.
         float dvc[4];
-        ui::Palette::withAlpha(ui::palette.border, dvc, enabled ? 0.55f : 0.28f);
+        ui::Palette::withAlpha(ui::palette.border, dvc, 0.55f);
         const float dvInset = ui::metrics::ribbonSplitInset();
         dl->AddLine(ImVec2(snap(p0.x + dvInset),      snap(p0.y + mainH)),
                     ImVec2(snap(p0.x + bw - dvInset), snap(p0.y + mainH)),
@@ -1431,8 +1369,7 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
         // strip sits below the caption block, so it never overlaps the text.
         float ax = snap(p0.x + bw - 8.0f * s);
         float ay = snap(p0.y + mainH + dropH * 0.5f);
-        ImU32 aCol = enabled ? ui::Palette::toU32(ui::palette.text)
-                             : ui::Palette::toU32(ui::palette.textDisabled);
+        ImU32 aCol = ui::Palette::toU32(ui::palette.text);
         float hs = 3.5f * s;
         dl->AddTriangleFilled(ImVec2(ax - hs, ay - hs * 0.5f),
                               ImVec2(ax + hs, ay - hs * 0.5f),
@@ -1460,7 +1397,7 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
         const char* visibleLabel = ribbon_displayLabel(cmd_id, label);
         const float* matRgb = ribbon_matSwatchColor(cmd_id);
 
-        std::string l1, l2;
+        std::string_view l1, l2;
         ribbon_wrapLabelFor(cmd_id, visibleLabel, l1, l2);
         float lineH   = ImGui::GetTextLineHeight();
         int   nLines  = (visibleLabel[0] == '\0') ? 0 : (l2.empty() ? 1 : 2);
@@ -1477,7 +1414,7 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
             if (iy < p0.y + 3.0f * s) iy = snap(p0.y + 3.0f * s);
         }
 
-        ribbon_icon(dl, iconName, cx, iy + iconSz * 0.5f, iconSz, enabled, ribbon_isActive(cmd_id));
+        ribbon_icon(dl, iconName, cx, iy + iconSz * 0.5f, iconSz, enabled, isActive);
         (void)finishBadge;  // Finish Sketch reads via its green border alone — no check-badge overlay.
 
         // Material color swatch: a 20x4 bar under the icon previewing the exact color this button
@@ -1501,43 +1438,29 @@ static bool ribbon_bigBtn(const char* cmd_id, const char* iconName,
         // Clip to the content rect (same as main hit) so labels never spill into the drop strip.
         dl->PushClipRect(ImVec2(p0.x, p0.y), ImVec2(p0.x + bw, p0.y + mainH), true);
         if (visibleLabel[0] != '\0') {
-            ImVec2 t1 = ImGui::CalcTextSize(l1.c_str());
-            dl->AddText(nullptr, 0.0f, ImVec2(snap(cx - t1.x * 0.5f), ty), tCol, l1.c_str());
+            ImVec2 t1 = ImGui::CalcTextSize(l1.data(), l1.data() + l1.size());
+            dl->AddText(nullptr, 0.0f, ImVec2(snap(cx - t1.x * 0.5f), ty), tCol,
+                        l1.data(), l1.data() + l1.size());
             if (!l2.empty()) {
-                ImVec2 t2 = ImGui::CalcTextSize(l2.c_str());
+                ImVec2 t2 = ImGui::CalcTextSize(l2.data(), l2.data() + l2.size());
                 dl->AddText(nullptr, 0.0f, ImVec2(snap(cx - t2.x * 0.5f), snap(ty + lineH)),
-                            tCol, l2.c_str());
+                            tCol, l2.data(), l2.data() + l2.size());
             }
         }
         dl->PopClipRect();
     }
 
-    if (mainHovTip && ribbon_tooltipsEnabled()) ribbon_tooltip(label, cmd_id, iconName, enabled);
+    if ((mainHovTip || (clicked && !enabled)) && (ribbon_tooltipsEnabled() || !enabled))
+        ribbon_tooltip(label, faceId, iconName, enabled);
 
-    // C25: plain-click on split button fires last-used variant; if none chosen yet and the
-    // parent itself has no functional action (hasDrop=true), open the flyout instead.
-    if (clicked && enabled) {
-        if (hasDrop) {
-            auto it = s_LastUsed.find(cmd_id);
-            if (it != s_LastUsed.end() && !it->second.empty()) {
-                ribbon_fire(it->second.c_str());
-            } else {
-                // C34: plain click on a split button fires the PARENT tool itself (SolidWorks
-                // behavior — the flyout is the arrow's job). Parents with no action of their
-                // own are pre-seeded via kParentDefaults, so they never reach this branch.
-                ribbon_fire(cmd_id);
-            }
-        } else {
-            ribbon_fire(cmd_id);
-        }
-    }
+    if (clicked && enabled) ribbon_fire(faceId);
 
     ImGui::PopID();
     return clicked && enabled;
 }
 
 // Draw a big button degraded to small-row layout (icon + side label, one row height).
-static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
+static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* faceId, const char* iconName,
                                   const char* label, bool enabled, bool hasDrop,
                                   float wOverride = -1.0f) {
     float s      = ui::uiScale;
@@ -1567,37 +1490,36 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0,0,0,0));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0,0,0,0));
 
-    clicked = ImGui::InvisibleButton("##msm", ImVec2(mainW, rowH));
+    clicked = ImGui::InvisibleButton("##msm", ImVec2(mainW, rowH), ImGuiButtonFlags_EnableNav);
     bool mainHov    = ImGui::IsItemHovered();
-    bool mainHovTip = ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal);
+    bool mainHovTip = ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal) || ImGui::IsItemFocused();
     bool mainPress  = ImGui::IsItemActive();
     bool dropHov    = false;
 
     if (hasDrop) {
         ImGui::SameLine(0, 0);
-        dropClicked = ImGui::InvisibleButton("##mdr", ImVec2(dropW, rowH));
+        dropClicked = ImGui::InvisibleButton("##mdr", ImVec2(dropW, rowH), ImGuiButtonFlags_EnableNav);
         dropHov = ImGui::IsItemHovered();
-        if (dropClicked && enabled) s_flyoutOpenReq = cmd_id;   // deferred (ID-scope fix)
+        if (dropClicked) s_flyoutOpenReq = cmd_id;
     }
 
     ImDrawList* dl_sm = ImGui::GetWindowDrawList();
     float rnd_sm = ui::metrics::ribbonBtnRound();
-    const bool isActiveSm = ribbon_isActive(cmd_id);
+    const bool isActiveSm = ribbon_isActive(faceId) || ribbon_isActive(cmd_id);
     ImVec2 p1_sm(p0.x + totalW, p0.y + rowH);
 
     // State layering: liquid-glass rest/hover → active (bold outline) → press overlay.
     // inset=true: scale-aware 1px vertical inset so stacked rows don't share an edge pixel.
     // (Compact horizontal row: no room to stack the arrow under the 20px icon, so the arrow
     // keeps its trailing slot here — content is centered inside mainW, not the full totalW.)
-    ribbon_btnRest(dl_sm, p0, p1_sm, rnd_sm, enabled, /*inset=*/true,
-                   /*hovered=*/(mainHov || dropHov) && enabled);
+    ribbon_btnRest(dl_sm, p0, p1_sm, rnd_sm, enabled || hasDrop, /*inset=*/true,
+                   /*hovered=*/(mainHov && enabled) || dropHov);
     if (isActiveSm) ribbon_btnActive(dl_sm, p0, p1_sm, rnd_sm);
 
     if (hasDrop) {
         float ax = snap(p0.x + mainW + dropW * 0.5f);
         float ay = snap(p0.y + rowH * 0.5f);
-        ImU32 aCol = enabled ? ui::Palette::toU32(ui::palette.text)
-                             : ui::Palette::toU32(ui::palette.textDisabled);
+        ImU32 aCol = ui::Palette::toU32(ui::palette.text);
         float hs = 3.0f * s;
         dl_sm->AddTriangleFilled(ImVec2(ax - hs, ay - hs * 0.5f),
                                  ImVec2(ax + hs, ay - hs * 0.5f),
@@ -1622,7 +1544,7 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
         float ix = snap(p0.x + xoff + matPad);
         float iy = snap(p0.y + (rowH - iconSz) * 0.5f);
         ribbon_icon(dl, iconName, ix + iconSz * 0.5f, iy + iconSz * 0.5f, iconSz, enabled,
-                    ribbon_isActive(cmd_id));
+                    isActiveSm);
         if (matRgb) {
             // Vertical color swatch strip to the left of the icon (compact row layout).
             float stW = snap(4.0f * s), stH = snap(14.0f * s);
@@ -1645,23 +1567,29 @@ static bool ribbon_bigBtnAsSmall(const char* cmd_id, const char* iconName,
         dl->PopClipRect();
     }
 
-    if (mainHovTip && ribbon_tooltipsEnabled()) ribbon_tooltip(label, cmd_id, iconName, enabled);
+    if ((mainHovTip || (clicked && !enabled)) && (ribbon_tooltipsEnabled() || !enabled))
+        ribbon_tooltip(label, faceId, iconName, enabled);
 
-    if (clicked && enabled) {
-        if (hasDrop) {
-            auto it = s_LastUsed.find(cmd_id);
-            if (it != s_LastUsed.end() && !it->second.empty())
-                ribbon_fire(it->second.c_str());
-            else {
-                ribbon_fire(cmd_id);   // C34: plain click fires the parent (see bigBtn)
-            }
-        } else {
-            ribbon_fire(cmd_id);
-        }
-    }
+    if (clicked && enabled) ribbon_fire(faceId);
 
     ImGui::PopID();
     return clicked && enabled;
+}
+
+// In mouse-first mode ImGui does not close popups on Escape. Let only the
+// focused, topmost ribbon popup consume it, then lock the key for this frame:
+// the PM and viewport are drawn later and must not cancel their own edits too.
+static bool ribbon_dismissPopupOnEscape() {
+    ImGuiContext& g = *ImGui::GetCurrentContext();
+    ImGuiWindow* popup = ImGui::GetCurrentWindow();
+    if ((g.IO.ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard) || g.IO.WantTextInput ||
+        g.OpenPopupStack.empty() || g.OpenPopupStack.back().Window != popup ||
+        !g.NavWindow || !ImGui::IsWindowWithinBeginStackOf(g.NavWindow, popup) ||
+        !ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+        return false;
+    ImGui::SetKeyOwner(ImGuiKey_Escape, popup->ID, ImGuiInputFlags_LockThisFrame);
+    ImGui::CloseCurrentPopup();
+    return true;
 }
 
 // C25: flyout popup for a split button.
@@ -1670,26 +1598,30 @@ static const char* ribbon_flyoutPopup(const char* parentId,
     float s = ui::uiScale;
     const char* selected = nullptr;
 
-    std::string popId = std::string(parentId) + "_drop";
+    ImGui::PushID(parentId);
+    const char* popId = "##drop_popup";
     // Deferred open from the button (see s_flyoutOpenReq) — performed here so OpenPopup and
     // BeginPopup share the same ID scope.
     if (s_flyoutOpenReq == parentId) {
-        ImGui::OpenPopup(popId.c_str());
+        ImGui::OpenPopup(popId);
         s_flyoutOpenReq.clear();
     }
-    if (ImGui::BeginPopup(popId.c_str(), ImGuiWindowFlags_NoMove)) {
+    if (ImGui::BeginPopup(popId, ImGuiWindowFlags_NoMove)) {
+        if (ribbon_dismissPopupOnEscape()) {
+            ImGui::EndPopup();
+            ImGui::PopID();
+            return nullptr;
+        }
         float rowH   = snap(28.0f * s);
         float iconSz = snap(20.0f * s);
         float padX   = snap(8.0f * s);
         float gapX   = snap(6.0f * s);
 
-        // C25c FIX (defect 3): if this parent maps to a default functional command, render it as the
-        // first ENABLED row (e.g. "Ellipse" -> sk_ellipse) so the flyout offers a working primary
-        // action. The greyed variant rows follow. We synthesize a RibbonCmd for the default that
-        // points at the parent's icon/label and the mapped functional cmd_id.
+        // Synthesize the functional default; its availability comes from the
+        // same policy as every actual command, not the split parent.
         const ParentDefault* pd = ribbon_parentDefault(parentId);
         ui::RibbonCmd defaultRow{};
-        std::vector<const ui::RibbonCmd*> rows;
+        bool showDefault = false;
         if (pd) {
             defaultRow.cmd_id  = pd->defaultCmd;
             defaultRow.label   = pd->defaultLabel;
@@ -1697,42 +1629,45 @@ static const char* ribbon_flyoutPopup(const char* parentId,
             defaultRow.big     = false;
             defaultRow.sub_of  = parentId;
             defaultRow.stretch = false;   // functional
-            rows.push_back(&defaultRow);
+            showDefault = ui::commandAvailability(defaultRow.cmd_id, s_commandContext).visible;
         }
 
-        // N4 FIX: a split button whose PARENT is itself a functional command
-        // (revolve_boss/sweep_boss/loft_boss, sk_rect_corner, sk_arc_3pt, ...) had no flyout row for
-        // the parent, so once a *_cut / variant was picked (last-used) the user was stuck one-way —
-        // there was no way to switch BACK to the boss/base variant. Inject the parent itself as the
-        // FIRST row (unless a kParentDefaults row already stands in for the parent's action, or the
-        // parent is a pure flyout host with no engine action). Selecting it sets s_LastUsed[parent]=
-        // parent; resolveFace then finds no matching sub and falls back to the parent's own face.
+        // Include the functional parent when it is a distinct alternative,
+        // including the corner rectangle and 3-point arc alongside their
+        // synthesized center defaults.
         // A launcher's parent is the button face itself, so its flyout lists only the shortcuts.
         const ui::RibbonCmd* parentCmd = nullptr;
-        if (!pd && !ribbon_isLauncher(parentId)) {
+        if ((!pd || std::strcmp(parentId, "sk_rect_corner") == 0 ||
+             std::strcmp(parentId, "sk_arc_3pt") == 0) && !ribbon_isLauncher(parentId)) {
             int n = 0;
             const ui::RibbonCmd* all = ui::getRibbonCmds(n);
             for (int i = 0; i < n; ++i)
                 if (std::strcmp(all[i].cmd_id, parentId) == 0) { parentCmd = &all[i]; break; }
             // Only inject when the parent has its own action (not schema-reserved / stretch).
-            if (parentCmd && !parentCmd->stretch) rows.push_back(parentCmd);
+            if (parentCmd && (parentCmd->stretch ||
+                !ui::commandAvailability(parentCmd->cmd_id, s_commandContext).visible))
+                parentCmd = nullptr;
         }
 
-        // Dedupe: the injected parent-default row (e.g. sk_polygon -> sk_poly_hex "Hexagon") is often
-        // ALSO one of the variant subs. Adding it twice pushed the same cmd_id ID twice — the "2
-        // visible items with conflicting ID" warning — and listed "Hexagon" twice. Skip the sub that
-        // the default already stands in for.
-        for (const auto* sc : subs) {
-            if (pd && std::strcmp(sc->cmd_id, pd->defaultCmd) == 0) continue;
-            rows.push_back(sc);
-        }
+        // Iterate the default, distinct parent and matching variants without
+        // allocating a per-button row list. The default may also be a sub.
+        auto forEachRow = [&](const auto& visit) {
+            if (showDefault) visit(&defaultRow);
+            if (parentCmd) visit(parentCmd);
+            for (const auto* sc : subs) {
+                if (std::strcmp(sc->sub_of, parentId) != 0) continue;
+                if (pd && std::strcmp(sc->cmd_id, pd->defaultCmd) == 0) continue;
+                visit(sc);
+            }
+        };
 
         float maxLblW = 0.0f;
-        for (const auto* sc : rows)
+        forEachRow([&](const ui::RibbonCmd* sc) {
             maxLblW = ImMax(maxLblW, ImGui::CalcTextSize(sc->label).x);
+        });
         float popW = padX + iconSz + gapX + maxLblW + padX;
 
-        for (const auto* sc : rows) {
+        forEachRow([&](const ui::RibbonCmd* sc) {
             bool scEnabled = ribbon_cmdEnabled(sc);
             ImVec2 cp0 = ImGui::GetCursorScreenPos();
             ImGui::PushID(sc->cmd_id);
@@ -1741,8 +1676,9 @@ static const char* ribbon_flyoutPopup(const char* parentId,
             ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0,0,0,0));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0,0,0,0));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0,0,0,0));
-            bool rowClicked = ImGui::InvisibleButton("##fr", ImVec2(popW, rowH));
+            bool rowClicked = ImGui::InvisibleButton("##fr", ImVec2(popW, rowH), ImGuiButtonFlags_EnableNav);
             bool rowHov     = ImGui::IsItemHovered();
+            bool rowFocus   = ImGui::IsItemFocused();
             ImGui::PopStyleColor(3);
             ImGui::PopStyleVar();
 
@@ -1769,7 +1705,8 @@ static const char* ribbon_flyoutPopup(const char* parentId,
 
             // Same glass tooltip as the buttons: description, and the real disabled reason (e.g. a
             // web-build gap, or what a reserved row lacks).
-            if (rowHov && ribbon_tooltipsEnabled())
+            if ((rowHov || rowFocus || (rowClicked && !scEnabled)) &&
+                (ribbon_tooltipsEnabled() || !scEnabled))
                 ribbon_tooltip(sc->label, sc->cmd_id, sc->icon, scEnabled);
 
             if (rowClicked && scEnabled) {
@@ -1778,9 +1715,10 @@ static const char* ribbon_flyoutPopup(const char* parentId,
             }
 
             ImGui::PopID();
-        }
+        });
         ImGui::EndPopup();
     }
+    ImGui::PopID();
     return selected;
 }
 
@@ -1828,17 +1766,25 @@ static void ribbon_sketchFinishFlyout(const ui::RibbonCmd* cmd) {
     const bool  is3d      = std::strcmp(parentId, "sketch3d_exit") == 0;
     const char* cancelCmd = is3d ? "sketch3d_cancel" : "sketch_cancel";
 
-    std::string popId = std::string(parentId) + "_drop";
+    ImGui::PushID(parentId);
+    const char* popId = "##drop_popup";
     if (s_flyoutOpenReq == parentId) {
-        ImGui::OpenPopup(popId.c_str());
+        ImGui::OpenPopup(popId);
         s_flyoutOpenReq.clear();
     }
-    if (ImGui::BeginPopup(popId.c_str(), ImGuiWindowFlags_NoMove)) {
+    if (ImGui::BeginPopup(popId, ImGuiWindowFlags_NoMove)) {
+        if (ribbon_dismissPopupOnEscape()) {
+            ImGui::EndPopup();
+            ImGui::PopID();
+            return;
+        }
         float rowH   = snap(28.0f * s);
         float iconSz = snap(20.0f * s);
         float padX   = snap(8.0f * s);
         float gapX   = snap(6.0f * s);
         const char* label = "Cancel Sketch";
+        const auto availability = ui::commandAvailability(cancelCmd, s_commandContext);
+        const bool enabled = availability.visible && availability.enabled;
         float popW = padX + iconSz + gapX + ImGui::CalcTextSize(label).x + padX;
 
         ImVec2 cp0 = ImGui::GetCursorScreenPos();
@@ -1847,13 +1793,14 @@ static void ribbon_sketchFinishFlyout(const ui::RibbonCmd* cmd) {
         ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0,0,0,0));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0,0,0,0));
         ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0,0,0,0));
-        bool rowClicked = ImGui::InvisibleButton("##fr", ImVec2(popW, rowH));
+        bool rowClicked = ImGui::InvisibleButton("##fr", ImVec2(popW, rowH), ImGuiButtonFlags_EnableNav);
         bool rowHov     = ImGui::IsItemHovered();
+        bool rowFocus   = ImGui::IsItemFocused();
         ImGui::PopStyleColor(3);
         ImGui::PopStyleVar();
 
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        if (rowHov)
+        if (rowHov && enabled)
             dl->AddRectFilled(cp0, ImVec2(cp0.x + popW, cp0.y + rowH),
                               ui::Palette::toU32(ui::palette.buttonHovered),
                               ui::metrics::ribbonBtnRound());
@@ -1861,23 +1808,28 @@ static void ribbon_sketchFinishFlyout(const ui::RibbonCmd* cmd) {
             // Base pencil glyph + procedural ✗ badge (no dedicated sketch_cancel atlas glyph).
             float ix = snap(cp0.x + padX);
             float iy = snap(cp0.y + (rowH - iconSz) * 0.5f);
-            ribbon_icon(dl, "sketch", ix + iconSz * 0.5f, iy + iconSz * 0.5f, iconSz, true);
-            ribbon_sketchFinishBadge(dl, ix + iconSz * 0.5f, iy + iconSz * 0.5f, iconSz,
-                                     /*isCheck=*/false);
+            ribbon_icon(dl, "sketch", ix + iconSz * 0.5f, iy + iconSz * 0.5f, iconSz, enabled);
+            if (enabled)
+                ribbon_sketchFinishBadge(dl, ix + iconSz * 0.5f, iy + iconSz * 0.5f, iconSz,
+                                         /*isCheck=*/false);
         }
         {
             float tx = snap(cp0.x + padX + iconSz + gapX);
             float ty = snap(cp0.y + (rowH - ImGui::GetTextLineHeight()) * 0.5f);
             dl->AddText(nullptr, 0.0f, ImVec2(tx, ty),
-                        ui::Palette::toU32(ui::palette.text), label);
+                        ui::Palette::toU32(enabled ? ui::palette.text : ui::palette.textDisabled), label);
         }
-        if (rowClicked) {
+        if ((rowHov || rowFocus || (rowClicked && !enabled)) &&
+            (ribbon_tooltipsEnabled() || !enabled))
+            ribbon_tooltip(label, cancelCmd, "sketch", enabled);
+        if (rowClicked && enabled) {
             ribbon_fire(cancelCmd);
             ImGui::CloseCurrentPopup();
         }
         ImGui::PopID();
         ImGui::EndPopup();
     }
+    ImGui::PopID();
 }
 
 // Draw a small button. Returns true if clicked.
@@ -1905,9 +1857,9 @@ static bool ribbon_smBtn(const char* cmd_id, const char* iconName,
     ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0,0,0,0));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0,0,0,0));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0,0,0,0));
-    bool clicked = ImGui::InvisibleButton("##sm", ImVec2(totalW, rowH));
+    bool clicked = ImGui::InvisibleButton("##sm", ImVec2(totalW, rowH), ImGuiButtonFlags_EnableNav);
     bool hov     = ImGui::IsItemHovered();
-    bool hovTip  = ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal);
+    bool hovTip  = ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal) || ImGui::IsItemFocused();
     bool press   = ImGui::IsItemActive();
     ImGui::PopStyleColor(3);
     ImGui::PopStyleVar();
@@ -1961,7 +1913,8 @@ static bool ribbon_smBtn(const char* cmd_id, const char* iconName,
         dl->AddText(nullptr, 0.0f, ImVec2(tx, ty), tCol, label);
     }
 
-    if (hovTip && ribbon_tooltipsEnabled()) ribbon_tooltip(label, cmd_id, iconName, enabled);
+    if ((hovTip || (clicked && !enabled)) && (ribbon_tooltipsEnabled() || !enabled))
+        ribbon_tooltip(label, cmd_id, iconName, enabled);
 
     if (clicked && enabled) ribbon_fire(cmd_id);
     ImGui::PopID();
@@ -2026,18 +1979,16 @@ void setRibbonWorkspace(int workspace) {
     s_workspace = workspace;
 }
 
-void setRibbonDisabledPrefix(const char* prefix, const char* reason) {
-    s_disabledPrefix = prefix ? prefix : "";
-    s_disabledReason = (reason && *reason) ? reason : "Unavailable";
+void setRibbonCommandContext(const CommandContext& context) {
+    s_commandContext = context;
 }
 
-void setRibbonAgentLockReason(const char* reason) {
-    s_agentLockReason = reason ? reason : "";
+void setRibbonCommandContext(CommandContext&& context) {
+    s_commandContext = std::move(context);
 }
 
-void setRibbonStudyContext(const char* studyTypeKey) {
-    s_studyCtx = studyTypeKey ? studyTypeKey : "";
-    s_studyCtxFrame = ImGui::GetFrameCount();
+CommandAvailability ribbonCommandAvailability(const char* cmdId) {
+    return commandAvailability(cmdId, s_commandContext);
 }
 
 float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool showPcbTools,
@@ -2207,7 +2158,30 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
     const char* actTabName = kRibbonTabs[activeTab];
     s_tipTab = actTabName;   // per-tab tooltip overrides (ribbon_tipFor)
 
-    std::vector<RibbonGroup> groups;
+    // One active layout: table scans and text measurements only run when its inputs change.
+    struct LayoutCache {
+        int tab = -1, workspace = -1;
+        bool sketch = false, sketch3d = false, mobile = false;
+        float scale = 0.0f, bodyW = 0.0f, fontSize = 0.0f;
+        ImFont* font = nullptr;
+        std::string study;
+        std::vector<RibbonGroup> groups;
+        std::vector<float> widths;
+    };
+    static LayoutCache layout;
+    const float chevronW = 22.0f * s;
+    const float bodyW = (mobile ? vp->Size.x * 0.5f : vp->Size.x) - 8.0f * s;
+    const float availW = bodyW - chevronW;
+    const std::string& study = s_commandContext.selectedStudyType;
+    const bool rebuildLayout = layout.tab != activeTab || layout.workspace != s_workspace ||
+        layout.sketch != s_sketchActive || layout.sketch3d != s_sketch3dActive ||
+        layout.mobile != mobile || layout.scale != s || layout.bodyW != bodyW ||
+        layout.font != ImGui::GetFont() || layout.fontSize != ImGui::GetFontSize() ||
+        layout.study != study;
+    auto& groups = layout.groups;
+    auto& natW = layout.widths;
+    if (rebuildLayout) {
+    groups.clear();
     groups.reserve(16);
 
     // First pass: collect the set of replacement-parent cmd_ids present per (tab,group) so we can
@@ -2239,7 +2213,7 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
         if (!ribbonRowActive(i)) continue;
         // Simulate: a study type's own setup row on a shared tab (Buckling "Modes" on Static, …)
         // shows only while a study of that type is selected.
-        if (ribbonStudyGate(c.cmd_id, ribbon_studyCtx(), nullptr) == RibbonStudyGate::Hidden)
+        if (!commandAvailability(c.cmd_id, s_commandContext).visible)
             continue;
         // Sketch tab, no sketch being edited: present "New Sketch" in the "Exit Sketch" slot so the
         // user can start a sketch from this tab (matches the Features-tab entry point). Once a sketch
@@ -2279,12 +2253,10 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
     // Available body width. Reserve the overflow chevron up front so it never lands off-edge once
     // any group has to be hidden. (The sketch Finish/Cancel controls now live inline in the Sketch
     // group's New-Sketch slot, so no right-edge cluster width is reserved anymore.)
-    float chevronW  = 22.0f * s;                // reserved for overflow '»' button
-    float bodyW     = (mobile ? vp->Size.x * 0.5f : vp->Size.x) - 8.0f * s;
-    float availW    = bodyW - chevronW;
+    // Widths and collapse levels are retained until the layout key changes.
 
     // Compute natural widths at COL_BIG (per-column small-zone measuring — defect 1)
-    std::vector<float> natW(groups.size());
+    natW.resize(groups.size());
     for (int gi = 0; gi < (int)groups.size(); ++gi)
         natW[gi] = ribbon_groupNaturalW(groups[gi], COL_BIG);
 
@@ -2361,6 +2333,31 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
         for (auto& group : groups) group.collapse = COL_HIDDEN;
         std::fill(natW.begin(), natW.end(), 0.0f);
     }
+    layout.tab = activeTab;
+    layout.workspace = s_workspace;
+    layout.sketch = s_sketchActive;
+    layout.sketch3d = s_sketch3dActive;
+    layout.mobile = mobile;
+    layout.scale = s;
+    layout.bodyW = bodyW;
+    layout.font = ImGui::GetFont();
+    layout.fontSize = ImGui::GetFontSize();
+    layout.study = study;
+    for (auto& group : groups) {
+        group.contentW = ribbon_groupContentW(group, group.collapse);
+        for (const auto* cmd : group.bigCmds)
+            group.bigWidths.push_back(ribbon_bigBtnWMax(group, cmd, ribbon_hasSubs(group, cmd)));
+        std::vector<float> widths;
+        if (group.collapse != COL_BIG) {
+            group.rows = group.bigCmds;
+            for (const auto* cmd : group.bigCmds)
+                widths.push_back(ribbon_bigBtnAsSmallWMax(group, cmd, ribbon_hasSubs(group, cmd)));
+        }
+        group.rows.insert(group.rows.end(), group.smCmds.begin(), group.smCmds.end());
+        for (const auto* cmd : group.smCmds) widths.push_back(ribbon_smBtnW(cmd->label));
+        group.columns = ribbon_packColumns(widths, ribbon_rowsPerCol());
+    }
+    }
 
     // Determine if we need the chevron
     bool anyHidden = false;
@@ -2406,7 +2403,6 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
 
         bool isSmall = (grp.collapse != COL_BIG);
         float grpW = natW[gi];
-        int rowsPerCol = ribbon_rowsPerCol();
         // Shared vertical metrics for this group: padY + content zone + caption + padY.
         // Buttons start at contentY so they sit fully inside the pill at any uiScale.
         const float padY     = ribbon_groupPadY();
@@ -2416,7 +2412,7 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
         // caption is wider than its buttons gets a pill wider than its content. Left-aligning the
         // tiles in that pill leaves them visibly off the caption's axis — center the whole content
         // block in the slack instead, so pill, caption and tiles share one center line.
-        const float slack    = ImMax(0.0f, grpW - ribbon_groupContentW(grp, grp.collapse));
+        const float slack    = ImMax(0.0f, grpW - grp.contentW);
         const float startX   = curX + kGroupPadX * s + snap(slack * 0.5f);
 
         // --- Liquid-glass group background (drawn into the ribbon window's draw list) ---
@@ -2440,24 +2436,37 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
             ui::coloredRowWash(dl, g0, g1, rnd, gtint, /*strength*/0.16f, /*selected*/false);
         }
 
-        // Resolve the face icon/label of a split (drop) button, honoring last-used variant.
+        // Resolve the action, icon and label together: the remembered split face
+        // must be gated and described as the command it will actually execute.
         auto resolveFace = [&](const ui::RibbonCmd* cmd, bool drop,
-                               const char*& showIcon, const char*& showLabel) {
+                               const char*& showIcon, const char*& showLabel) -> const char* {
             showIcon = cmd->icon; showLabel = cmd->label;
-            if (!drop) return;
+            if (!drop || ribbon_isLauncher(cmd->cmd_id)) return cmd->cmd_id;
             auto it = s_LastUsed.find(cmd->cmd_id);
-            if (it == s_LastUsed.end() || it->second.empty()) return;
-            for (const auto* sc : grp.subCmds)
-                if (std::strcmp(sc->cmd_id, it->second.c_str()) == 0) {
-                    showIcon = sc->icon; showLabel = sc->label; return;
+            if (it == s_LastUsed.end() || it->second.empty()) return cmd->cmd_id;
+            const char* faceId = it->second.c_str();
+            if (const auto* pd = ribbon_parentDefault(cmd->cmd_id)) {
+                if (std::strcmp(faceId, pd->defaultCmd) == 0) {
+                    showIcon = pd->icon; showLabel = pd->defaultLabel;
+                    return faceId;
                 }
+            }
+            if (std::strcmp(faceId, cmd->cmd_id) == 0) return faceId;
+            for (const auto* sc : grp.subCmds)
+                if (std::strcmp(sc->sub_of, cmd->cmd_id) == 0 &&
+                    std::strcmp(sc->cmd_id, faceId) == 0) {
+                    showIcon = sc->icon; showLabel = sc->label; return faceId;
+                }
+            // A selected variant may have become context-hidden since it was chosen.
+            for (int i = 0; i < cmdCount; ++i)
+                if (std::strcmp(cmds[i].cmd_id, faceId) == 0 && ribbonRowActive(i)) {
+                    showIcon = cmds[i].icon; showLabel = cmds[i].label; break;
+                }
+            return faceId;
         };
         // Run a split button's flyout + fire chosen variant.
         auto runFlyout = [&](const ui::RibbonCmd* cmd) {
-            std::vector<const ui::RibbonCmd*> mySubs;
-            for (const auto* sc : grp.subCmds)
-                if (std::strcmp(sc->sub_of, cmd->cmd_id) == 0) mySubs.push_back(sc);
-            const char* chosen = ribbon_flyoutPopup(cmd->cmd_id, mySubs);
+            const char* chosen = ribbon_flyoutPopup(cmd->cmd_id, grp.subCmds);
             // A launcher's shortcut fires once; the face stays the launcher (no last-used swap).
             if (chosen) {
                 if (!ribbon_isLauncher(cmd->cmd_id)) s_LastUsed[cmd->cmd_id] = chosen;
@@ -2479,8 +2488,9 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                 // always finish; only the flyout cancels). Rendered in the New-Sketch slot.
                 if (ribbon_isSketchFinish(cmd)) {
                     ImGui::SetCursorPos(ImVec2(bx, contentY));
-                    float wStable = ribbon_bigBtnW(cmd->cmd_id, cmd->label, /*hasDrop=*/true);
-                    ribbon_bigBtn(cmd->cmd_id, cmd->icon, cmd->label, true, /*hasDrop=*/true,
+                    float wStable = grp.bigWidths[bi];
+                    ribbon_bigBtn(cmd->cmd_id, cmd->cmd_id, cmd->icon, cmd->label,
+                                  ribbon_cmdEnabled(cmd), /*hasDrop=*/true,
                                   wStable, /*highlight=*/true, /*finishBadge=*/true);
                     ribbon_sketchFinishFlyout(cmd);
                     bx += wStable;
@@ -2489,11 +2499,13 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                 bool drop = ribbon_hasSubs(grp, cmd);
                 ImGui::SetCursorPos(ImVec2(bx, contentY));
                 const char* showIcon; const char* showLabel;
-                resolveFace(cmd, drop, showIcon, showLabel);
+                const char* faceId = resolveFace(cmd, drop, showIcon, showLabel);
                 // N1-N5: stable widest-variant width — draw and advance share it so the face label
                 // (variant) can change without reflowing or bleeding into the neighbor.
-                float wStable = ribbon_bigBtnWMax(grp, cmd, drop);
-                ribbon_bigBtn(cmd->cmd_id, showIcon, showLabel, ribbon_cmdEnabled(cmd), drop, wStable);
+                float wStable = grp.bigWidths[bi];
+                const auto face = commandAvailability(faceId, s_commandContext);
+                ribbon_bigBtn(cmd->cmd_id, faceId, showIcon, showLabel,
+                              face.visible && face.enabled, drop, wStable);
                 if (drop) runFlyout(cmd);
                 bx += wStable;
             }
@@ -2501,9 +2513,7 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
             // small zone: pack into independently-measured columns (defect 1)
             if (!grp.smCmds.empty()) {
                 if (!grp.bigCmds.empty()) bx += 2.0f * s;  // mid-gap between big and small zones
-                std::vector<float> widths;
-                for (const auto* cmd : grp.smCmds) widths.push_back(ribbon_smBtnW(cmd->label));
-                auto cols = ribbon_packColumns(widths, rowsPerCol);
+                const auto& cols = grp.columns;
                 float sx = bx;
                 for (const auto& col : cols) {
                     // Every column sits on the shared row grid: a partially-filled column
@@ -2520,21 +2530,9 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
         } else {
             // --- SMALL (degraded) layout: big cmds degrade to small rows, then small cmds. All
             // flow into one combined column-packed stack (defect 1 — per-column widths). ---
-            std::vector<const ui::RibbonCmd*> rows = grp.bigCmds;
-            for (const auto* cmd : grp.smCmds) rows.push_back(cmd);
-
-            std::vector<float> widths;
-            int nBig = (int)grp.bigCmds.size();
-            for (int i = 0; i < (int)rows.size(); ++i) {
-                if (i < nBig) {
-                    // N1-N5: degraded big row reserves its widest-variant width.
-                    widths.push_back(ribbon_bigBtnAsSmallWMax(grp, rows[i],
-                                                              ribbon_hasSubs(grp, rows[i])));
-                } else {
-                    widths.push_back(ribbon_smBtnW(rows[i]->label));
-                }
-            }
-            auto cols = ribbon_packColumns(widths, rowsPerCol);
+            const auto& rows = grp.rows;
+            const int nBig = (int)grp.bigCmds.size();
+            const auto& cols = grp.columns;
             float sx = startX;
             for (const auto& col : cols) {
                 // Same shared row grid as the big-layout small zone: degraded big rows and plain
@@ -2548,17 +2546,18 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                         // not runFlyout — see the big-layout branch above for why).
                         if (ribbon_isSketchFinish(cmd)) {
                             // Draw at the COLUMN width so every row in this stack shares one edge.
-                            ribbon_bigBtnAsSmall(cmd->cmd_id, cmd->icon, cmd->label,
-                                                 true, /*hasDrop=*/true, col.width);
+                            ribbon_bigBtnAsSmall(cmd->cmd_id, cmd->cmd_id, cmd->icon, cmd->label,
+                                                 ribbon_cmdEnabled(cmd), /*hasDrop=*/true, col.width);
                             ribbon_sketchFinishFlyout(cmd);
                             continue;
                         }
                         bool drop = ribbon_hasSubs(grp, cmd);
                         const char* showIcon; const char* showLabel;
-                        resolveFace(cmd, drop, showIcon, showLabel);
+                        const char* faceId = resolveFace(cmd, drop, showIcon, showLabel);
                         // Uniform column width (the packer already reserved the widest variant).
-                        ribbon_bigBtnAsSmall(cmd->cmd_id, showIcon, showLabel,
-                                             ribbon_cmdEnabled(cmd), drop, col.width);
+                        const auto face = commandAvailability(faceId, s_commandContext);
+                        ribbon_bigBtnAsSmall(cmd->cmd_id, faceId, showIcon, showLabel,
+                                             face.visible && face.enabled, drop, col.width);
                         if (drop) runFlyout(cmd);
                     } else {
                         ribbon_smBtn(cmd->cmd_id, cmd->icon, cmd->label, ribbon_cmdEnabled(cmd),
@@ -2634,24 +2633,32 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
 
     // --- C25-W3G: overflow chevron ---
     if (anyHidden) {
+        // A tap on a disabled overflow item keeps its reason inline, where
+        // touch users can read it without relying on transient hover.
+        static const char* unavailableId = nullptr;
         if (mobile) {
             ImGui::SetCursorPos(ImVec2(ui::metrics::px(2.0f), 0.0f));
             if (ui::kit::secondaryButton("Commands", true, nullptr,
                                          ImVec2(bodyW - ui::metrics::px(4.0f),
-                                                bodyH2 - ui::metrics::px(4.0f))))
+                                                bodyH2 - ui::metrics::px(4.0f)))) {
+                unavailableId = nullptr;
                 ImGui::OpenPopup("##ribbon_overflow");
+            }
             ImGui::SetNextWindowSizeConstraints(ImVec2(0, 0),
                 ImVec2(vp->Size.x - ui::metrics::px(12.0f),
                        std::max(ui::metrics::px(44.0f), vp->Size.y - totalH - titleBarH)));
         } else {
             float bh = ribbon_contentH();
-            if (ribbon_overflowChevron(curX + 2.0f * s, ribbon_groupPadY(), bh))
+            if (ribbon_overflowChevron(curX + 2.0f * s, ribbon_groupPadY(), bh)) {
+                unavailableId = nullptr;
                 ImGui::OpenPopup("##ribbon_overflow");
+            }
         }
 
         if (ImGui::BeginPopup("##ribbon_overflow", ImGuiWindowFlags_NoMove)) {
-            // Draw hidden groups as flyout rows using the same flyout style
-            for (int gi = 0; gi < (int)groups.size(); ++gi) {
+            // Draw hidden groups as flyout rows using the same flyout style.
+            const bool dismissed = ribbon_dismissPopupOnEscape();
+            for (int gi = 0; !dismissed && gi < (int)groups.size(); ++gi) {
                 const RibbonGroup& grp = groups[gi];
                 if (grp.collapse != COL_HIDDEN) continue;
 
@@ -2667,8 +2674,10 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                 // `indent` steps in a folded split-button variant so it reads as belonging to the
                 // parent above it — without listing subs here, a group that overflows would make
                 // every folded variant unreachable.
-                auto overflowRow = [&](const ui::RibbonCmd* cmd, float indent) {
-                    bool enabled = ribbon_cmdEnabled(cmd);
+                auto overflowRow = [&](const ui::RibbonCmd* cmd, float indent, const char* parentId) {
+                    const auto availability = commandAvailability(cmd->cmd_id, s_commandContext);
+                    if (!availability.visible) return;
+                    const bool enabled = availability.enabled;
                     ImVec2 cp0 = ImGui::GetCursorScreenPos();
                     float rowH   = snap(ui::metrics::px(mobile ? 44.0f : 28.0f));
                     float iconSz = snap(ui::metrics::px(20.0f));
@@ -2684,8 +2693,10 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                     ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0,0,0,0));
                     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0,0,0,0));
                     ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0,0,0,0));
-                    bool rowClicked = ImGui::InvisibleButton("##ovrow", ImVec2(popW, rowH));
+                    bool rowClicked = ImGui::InvisibleButton("##ovrow", ImVec2(popW, rowH),
+                                                             ImGuiButtonFlags_EnableNav);
                     bool rowHov     = ImGui::IsItemHovered();
+                    bool rowFocus   = ImGui::IsItemFocused();
                     ImGui::PopStyleColor(3);
                     ImGui::PopStyleVar();
 
@@ -2713,24 +2724,66 @@ float drawRibbon(int& activeTab, bool visible, bool showSimulationTools, bool sh
                             odl->AddText(nullptr, 0.0f, ImVec2(tx, ty), tCol, cmd->label);
                         }
                     }
+                    if ((rowHov || rowFocus || (rowClicked && !enabled)) &&
+                        (ribbon_tooltipsEnabled() || !enabled))
+                        ribbon_tooltip(cmd->label, cmd->cmd_id, cmd->icon, enabled);
+                    if (rowClicked && !enabled) unavailableId = cmd->cmd_id;
+                    if (unavailableId && std::strcmp(unavailableId, cmd->cmd_id) == 0) {
+                        if (enabled) {
+                            unavailableId = nullptr;
+                        } else {
+                            ImGui::PushStyleColor(ImGuiCol_Text,
+                                ImVec4(palette.textDisabled[0], palette.textDisabled[1],
+                                       palette.textDisabled[2], 1.0f));
+                            ImGui::TextWrapped("%s", availability.reason ? availability.reason
+                                                      : "Command unavailable in this context");
+                            ImGui::PopStyleColor();
+                        }
+                    }
                     if (rowClicked && enabled) {
+                        if (parentId && !ribbon_isLauncher(parentId))
+                            s_LastUsed[parentId] = cmd->cmd_id;
                         ribbon_fire(cmd->cmd_id);
                         ImGui::CloseCurrentPopup();
                     }
                     ImGui::PopID();
                 };
                 for (const auto* cmd : grp.bigCmds) {
-                    overflowRow(cmd, 0.0f);
-                    for (const auto* sc : grp.subCmds)
-                        if (std::strcmp(sc->sub_of, cmd->cmd_id) == 0)
-                            overflowRow(sc, ui::metrics::U(3));
+                    const bool drop = ribbon_hasSubs(grp, cmd);
+                    const ParentDefault* pd = drop ? ribbon_parentDefault(cmd->cmd_id) : nullptr;
+                    // Ellipse's split host is represented by its functional default.
+                    ui::RibbonCmd primary = *cmd;
+                    if (pd && std::strcmp(cmd->cmd_id, "sk_ellipse_big") == 0) {
+                        primary.cmd_id = pd->defaultCmd;
+                        primary.label = pd->defaultLabel;
+                        primary.icon = pd->icon;
+                    }
+                    overflowRow(&primary, 0.0f, drop ? cmd->cmd_id : nullptr);
+                    bool defaultListed = pd && std::strcmp(primary.cmd_id, pd->defaultCmd) == 0;
+                    for (const auto* sc : grp.subCmds) {
+                        if (std::strcmp(sc->sub_of, cmd->cmd_id) != 0) continue;
+                        if (pd && std::strcmp(sc->cmd_id, pd->defaultCmd) == 0)
+                            defaultListed = true;
+                        overflowRow(sc, ui::metrics::U(3), cmd->cmd_id);
+                    }
+                    if (pd && !defaultListed) {
+                        const ui::RibbonCmd defaultRow{pd->defaultCmd, pd->defaultLabel, pd->icon,
+                                                      cmd->tab, cmd->group, false, cmd->cmd_id, false};
+                        overflowRow(&defaultRow, ui::metrics::U(3), cmd->cmd_id);
+                    }
+                    if (ribbon_isSketchFinish(cmd)) {
+                        const bool is3d = std::strcmp(cmd->cmd_id, "sketch3d_exit") == 0;
+                        const ui::RibbonCmd cancel{is3d ? "sketch3d_cancel" : "sketch_cancel",
+                                                   "Cancel Sketch", "sketch", cmd->tab, cmd->group,
+                                                   false, cmd->cmd_id, false};
+                        overflowRow(&cancel, ui::metrics::U(3), nullptr);
+                    }
                 }
                 for (const auto* cmd : grp.smCmds) {
-                    overflowRow(cmd, 0.0f);
-                    if (mobile)
-                        for (const auto* sc : grp.subCmds)
-                            if (std::strcmp(sc->sub_of, cmd->cmd_id) == 0)
-                                overflowRow(sc, ui::metrics::U(3));
+                    overflowRow(cmd, 0.0f, nullptr);
+                    for (const auto* sc : grp.subCmds)
+                        if (std::strcmp(sc->sub_of, cmd->cmd_id) == 0)
+                            overflowRow(sc, ui::metrics::U(3), cmd->cmd_id);
                 }
                 ImGui::Separator();
             }

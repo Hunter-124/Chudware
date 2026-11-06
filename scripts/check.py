@@ -19,8 +19,7 @@ Gates:
                             ribbon / pm_form) resolves to live code; a missing evidence source
                             or an empty harvest fails the gate.
   - agent_events_audit    : the aicad.agent_events/2 kind list (contracts/agent_events.json) matches
-                            both emitters (core C++ + Python services), and the kRoles prompt catalog
-                            matches services/agent/prompts/*.md (no C++<->Python agent drift).
+                            the Python emitter (services/agent/agent_events.py).
   - oracle_import_audit   : no import of the deleted engine/engine_oracle packages in services/,
                             scripts/ or tools/ outside scripts/oracle_import_allowlist.txt
                             (intentionally empty; thin-client ratchet).
@@ -34,10 +33,10 @@ Gates:
                             macOS — no NTFS-reserved characters, no trailing dot/space, no
                             reserved device names, no case-only collisions.
   - ui_shared_audit       : frozen UI vocabulary, icons and font assets agree with their manifest.
+  - pytest_suite_audit    : every Python test file belongs to a named suite.
 
-The Python service suites are NOT run here; scripts/gate.sh runs them per unit under services/,
-tools/, scripts/ and assets/ with the runtime venv, e.g.:
-    .venv-mcp/bin/python -X utf8 -m pytest services/agent -q
+No tests run here. Run suites isolated with scripts/testbox.py, e.g.:
+    scripts/testbox.py --suite agent
 Pre-commit install: see scripts/hooks/pre-commit.
 """
 from __future__ import annotations
@@ -46,19 +45,44 @@ import os
 import subprocess
 import sys
 
+if __package__:
+    from . import test_suites
+else:
+    import test_suites
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def audit_test_suites() -> int:
+    try:
+        manifest = test_suites.load()
+        unowned = [path for path in test_suites.test_files()
+                   if test_suites.pytest_suite(path, manifest) is None]
+    except (OSError, ValueError) as exc:
+        print(f"pytest suite manifest: {exc}")
+        return 1
+    if unowned:
+        print("Python test files without a suite:")
+        for path in unowned:
+            print(f"  {path}")
+        return 1
+    print("All Python test files have a suite.")
+    return 0
+
+
 
 GATES = [
     ("gui_lint (icons)", ["scripts/gui_lint.py", "--rule", "icons"]),
     ("gui_lint (theme)", ["scripts/gui_lint.py", "--rule", "theme"]),
     ("feature_surface_audit (ribbon -> handlers)", ["scripts/feature_surface_audit.py"]),
     ("parity_audit (spec <-> code drift)", ["scripts/parity_audit.py"]),
-    ("agent_events_audit (event kinds + role catalog)", ["scripts/agent_events_audit.py"]),
+    ("agent_events_audit (event kinds)", ["scripts/agent_events_audit.py"]),
     ("oracle_import_audit (services/scripts/tools thin-client ratchet)", ["scripts/oracle_import_audit.py"]),
     ("tool_panel_sync (Settings → AI → Tools fallback tables)", ["tools/gen_tool_panel_tables.py", "--check"]),
     ("advertised_tool_audit (named tools are reachable)", ["scripts/advertised_tool_audit.py"]),
     ("portable_paths_audit (tracked paths check out on Windows/macOS)", ["scripts/portable_paths_audit.py"]),
     ("ui_shared_audit (shared UI manifest and assets)", ["scripts/verify-ui-shared.py"]),
+    ("pytest_suite_audit (Python test ownership)", audit_test_suites),
 ]
 
 
@@ -66,7 +90,7 @@ def main() -> int:
     failures: list[tuple[str, int]] = []
     for name, args in GATES:
         print(f"\n=== {name} ===", flush=True)
-        rc = subprocess.run([sys.executable, *args], cwd=REPO).returncode
+        rc = args() if callable(args) else subprocess.run([sys.executable, *args], cwd=REPO).returncode
         if rc != 0:
             failures.append((name, rc))
     print("\n" + "=" * 64)

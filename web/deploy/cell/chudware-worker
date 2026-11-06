@@ -18,7 +18,7 @@ def worker_argv(arguments):
         raise ValueError("worker bootstrap requires a cell")
     environment = {**BASE_ENV, **actor_environment(), **{key: os.environ[key] for key in WORKER_ENV if key in os.environ},
         "CHUDWARE_WORKER_PYTHON": "/opt/chudware/venv/bin/python",
-        "CHUDWARE_CHUDCODE_BIN": "/opt/chudware/bin/chud"}
+        "CHUDWARE_OMP_BIN": "/opt/chudware/bin/omp"}
     executable = "/opt/chudware/venv/bin/python"
     return executable, [executable, "-I", "-c", BOOTSTRAP, *arguments], environment
 

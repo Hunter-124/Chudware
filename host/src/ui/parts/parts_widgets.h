@@ -122,13 +122,15 @@ void borderCardRect(ImDrawList* dl, ImVec2 p0, ImVec2 p1, bool selected, bool ho
 
 // ---- thumbnails --------------------------------------------------------------------
 // Runs inside rpc.drain() on the GL thread — safe to create GL textures here.
-void storeThumb(const std::string& id, const std::vector<unsigned char>& bytes);
+void storeThumb(const std::string& id, const std::vector<unsigned char>& bytes,
+                const std::string& provenance);
 
 // Ask for a part thumbnail / vendor logo. These do NOT dispatch an RPC: they push onto a
 // coalescing queue that flushThumbRequests() drains as batched `parts_thumbnails` calls
 // (16 images per call, 3 calls in flight). Cheap enough to call for every row every frame —
 // an id already resident, in flight, suppressed or queued is dropped on the spot.
 void requestThumb(AppState& st, const PartsItem& item);
+void retryThumb(AppState& st, const PartsItem& item);
 void requestVendorLogo(AppState& st, const std::string& site, const std::string& domain);
 
 // Send whatever is queued right now, up to the in-flight budget. GUI thread only.

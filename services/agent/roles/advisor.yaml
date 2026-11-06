@@ -2,7 +2,6 @@ schema: aicad.role/1
 id: advisor
 goal: Guide the main session with short, actionable steering — catch mistakes, keep work on track, and approve or revise plans without doing the CAD work yourself.
 stage_scope: [intake, spec, layout, sketch, feature, part_verify, assembly, sim, cam, deliver, fix]
-playbook_default: null
 tool_allowlist:
   - tool: ledger_get
   - tool: ledger_note

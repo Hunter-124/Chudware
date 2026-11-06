@@ -10,7 +10,11 @@ The battery is a THIN DISPATCHER — zero reimplementation of check logic. It:
 
 Per-check metadata:
   {name, cost: "subsecond"|"seconds"|"minutes", platform: "any"|"posix",
-   reward_shape: "binary"|"scalar"|"findings"}
+   reward_shape: "binary"|"scalar"|"findings"|"dfm"|"info"}
+
+A check scores 1.0 only on positive evidence: a crashed, refused or ok:false result scores 0.0
+with its reason, never 1.0. "info" checks (measure_part, measure_between) have no pass
+criterion, so a completed reading is reported under "informational", not as a pass or fail.
 """
 from __future__ import annotations
 
@@ -338,6 +342,30 @@ def _diff_pair_nets(nets: list[str]) -> Optional[tuple[str, str]]:
     return None
 
 
+def _applied_material_key(doc_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """(registry key, None) of the material applied to the document, read the way
+    measure_part's mass readout reads it (the engine's eval_mass, per-body override else the
+    document material). Return a reason when the applied material is absent, mixed,
+    or cannot be resolved for a solve; never substitute a different material."""
+    from services.mcp import core_bridge as cb  # noqa: PLC0415
+
+    try:
+        mass = cb.call("eval_mass", {"doc_id": doc_id or _cur_doc()}) or {}
+    except Exception as exc:  # noqa: BLE001
+        return None, f"the document's applied material could not be read ({exc})"
+    material = mass.get("material") if isinstance(mass.get("material"), dict) else {}
+    if material.get("mixed"):
+        return None, ("the document's bodies carry different materials; pass material= to "
+                      "choose the one this solve uses")
+    if material.get("unresolved_key"):
+        return None, (f"the applied material {material.get('key')!r} has no solve properties "
+                      "in the registry; pass material= (a name or an explicit property dict)")
+    key = material.get("key")
+    if material.get("source") == "default" or not key:
+        return None, "no applied material is available; set a material or pass material= explicitly"
+    return str(key), None
+
+
 def _adapt_check_kwargs(
     check_name: str,
     fn: Any,
@@ -464,7 +492,37 @@ def _adapt_check_kwargs(
             "no schematic open — ERC does not apply to a mechanical part",
         )
 
+    if "material" in sig_params and call_kwargs.get("material") is None:
+        # A solve describes the part the document describes: with no caller material, use the
+        # material applied to the model (the lookup measure_part's mass readout uses) rather
+        # than a tool default that silently contradicts it.
+        key, why = _applied_material_key(call_kwargs.get("doc_id") or doc_id)
+        if why:
+            return None, json.dumps({**_parse_jsonish(_skip_json(check_name, why)),
+                                     "not_evaluated": True, "reason": "material_unresolved"})
+        if key:
+            call_kwargs["material"] = key
     return call_kwargs, None
+
+
+# A sketch whose only consumers are open paths (a rib profile, a sweep path or guide), or that
+# no feature consumes yet, is legitimately open. Only a profile some feature needs closed
+# ("closed_profile"/"mixed"), or one whose usage the engine did not report, must close.
+_OPEN_OK_SKETCH_USAGES = frozenset({"open_path", "unknown"})
+
+
+def sketch_closure_usage(result: dict) -> str:
+    """The engine's closure usage in a check_sketch/sketch_health result ('' when absent)."""
+    closure = result.get("closure") if isinstance(result.get("closure"), dict) else {}
+    return str(closure.get("usage") or result.get("closure_usage") or "").lower()
+
+
+def sketch_has_unjoined_profile(result: dict) -> bool:
+    """True when *result* reports open endpoints that the sketch's usage does not excuse."""
+    closure = result.get("closure") if isinstance(result.get("closure"), dict) else {}
+    unjoined = (closure.get("closed_chains_ok") is False or bool(closure.get("open_endpoints"))
+                or bool(result.get("open_endpoints")))
+    return unjoined and sketch_closure_usage(result) not in _OPEN_OK_SKETCH_USAGES
 
 
 def _check_all_sketches(fn: Any, doc_id: Optional[str], kwargs: dict) -> dict:
@@ -488,15 +546,13 @@ def _check_all_sketches(fn: Any, doc_id: Optional[str], kwargs: dict) -> dict:
         result = {**result, "sketch": sketch}
         result["pinned_only"] = result.get("pinned_only") is True
         dof = result.get("dof")
-        closed = result.get("closure") or {}
         fully_defined = (
             result.get("ok") is True and result.get("fully_defined") is True
             and not result["pinned_only"] and not result.get("skipped")
             and result.get("status") not in ("under", "over")
             and not (isinstance(dof, (int, float)) and dof > 0)
             and not result.get("conflicting") and result.get("converged") is not False
-            and closed.get("closed_chains_ok") is not False
-            and not closed.get("open_endpoints") and not result.get("open_endpoints")
+            and not sketch_has_unjoined_profile(result)
             and not any(isinstance(f, dict) and (
                 f.get("ok") is False or f.get("severity") in ("error", "fail", "blocker"))
                 for f in result.get("findings") or [])
@@ -553,9 +609,9 @@ _REQ_MET_STATUSES: tuple[str, ...] = (_VERIFIED_STATUS, "pass", "ok")
 CHECKS: dict[str, tuple[str, str, str, str, str]] = {
     # --- geometry / sketch
     "check_sketch":              ("cad",  "check_sketch",              "subsecond", "any",   "binary"),
-    "measure_part":              ("cad",  "measure_part",              "subsecond", "any",   "scalar"),
-    "query_geometry":            ("cad",  "query_geometry",            "subsecond", "any",   "findings"),
-    "measure_between":           ("cad",  "measure_between",           "subsecond", "any",   "scalar"),
+    "measure_part":              ("cad",  "measure_part",              "subsecond", "any",   "info"),
+    "measure_between":           ("cad",  "measure_between",           "subsecond", "any",   "info"),
+    "query_geometry":            ("cad",  "query_geometry",            "subsecond", "any",   "info"),
     # cost classes follow docs/CUSTOM_MODEL_INTEGRATION_SURVEY.md §4.1/4.2
     "check_interference":        ("cad",  "check_interference",        "seconds",   "any",   "binary"),
     "check_feature_overlap":     ("cad",  "check_feature_overlap",     "seconds",   "any",   "binary"),
@@ -922,7 +978,7 @@ def _gap_req_join(doc_id: str = None, requirements: list = None, **_) -> str:
     (excluded from the denominator). score = met / non-waived total.
     """
     if not requirements:
-        return json.dumps({"ok": True, "score": 1.0, "note": "no requirements provided"})
+        return _skip_json("req_join", "no requirements provided")
     met = 0
     unmet: list = []
     inconsistent: list = []
@@ -942,7 +998,9 @@ def _gap_req_join(doc_id: str = None, requirements: list = None, **_) -> str:
             unmet.append(rid)
             continue
         met += 1
-    score = met / n_scored if n_scored else 1.0
+    if not n_scored:
+        return _skip_json("req_join", "all requirements are waived")
+    score = met / n_scored
     return json.dumps({
         "ok": score >= 1.0,
         "score": score,
@@ -988,7 +1046,7 @@ def _gap_layout_coverage(doc_id: str = None, **_) -> str:
     status == "verified" but trace.evidence == [] (inconsistent — same rule as req_join).
 
     Score = covered / total_critical.  ok = score >= 1.0 (all covered).
-    If no layout_plan meta exists: ok=True, score=1.0, note="no layout plan on file".
+    A missing layout plan or empty requirement list is skipped, not a passing check.
     """
     d = doc_id or _cur_doc()
     try:
@@ -1003,28 +1061,14 @@ def _gap_layout_coverage(doc_id: str = None, **_) -> str:
             raw_plan = None
 
         if not isinstance(raw_plan, dict) or raw_plan.get("schema") != "aicad.layout/1":
-            return json.dumps({
-                "ok": True,
-                "score": 1.0,
-                "note": "no layout plan on file — layout_plan() not called before modeling",
-                "covered": 0,
-                "total": 0,
-                "uncovered": [],
-            })
+            return _skip_json("layout_coverage", "no layout plan on file")
 
         critical_ids = list(raw_plan.get("critical_req_ids") or [])
         interface_ids = list(raw_plan.get("interface_req_ids") or [])
         all_layout_ids = critical_ids + interface_ids
 
         if not all_layout_ids:
-            return json.dumps({
-                "ok": True,
-                "score": 1.0,
-                "note": "layout plan exists but no critical dims or interfaces recorded",
-                "covered": 0,
-                "total": 0,
-                "uncovered": [],
-            })
+            return _skip_json("layout_coverage", "no layout-critical requirements recorded")
 
         # Load the aicad.req/1 doc
         try:
@@ -1118,13 +1162,11 @@ def _gap_power_budget(doc_id: str = None, power_source: dict = None,
     Delegates to services.mcp.power_budget.solve_power_budget: rail tree
     (source → converters → boardphys loads), duty-cycle weighting from an
     aicad.powerprofile/1 artifact, PDN cross-check, battery-life verdict.
-    Without a power_source kwarg the check passes with a skip note (the battery's
-    default all-subsecond sweep must stay green on non-electronic parts).
+    Without a power_source kwarg the check is skipped, not scored as a pass.
     Findings shape: overloads are severity="fail", other warnings severity="warn".
     """
     if not power_source:
-        return json.dumps({"ok": True, "findings": [],
-                           "note": "no power_source specified — power budget skipped"})
+        return _skip_json("power_budget", "no power_source specified")
     try:
         from services.mcp.power_budget import solve_power_budget, _load_json
         board = power_board
@@ -1159,17 +1201,99 @@ GAP_FNS: dict[str, Any] = {
 # Score extraction from JSON return
 # ---------------------------------------------------------------------------
 # Binary checks whose `ok` means "the check ran to completion", not "the design passed".
-# The named field carries the pass verdict.
+# The named field carries the pass verdict and must be literally True: a result that omits
+# it is not evidence of a pass.
 _BINARY_VERDICT_FIELDS: dict[str, str] = {
     "check_interference": "clear",
     "check_sketch": "fully_defined",
+    "check_symmetry": "symmetric",
+    "check_feature_overlap": "complete",
 }
 
 
-def _extract_score(check_name: str, reward_shape: str, result_json: str | dict) -> tuple[float, list]:
-    """Parse JSON return from a check function → (score 0..1, findings list)."""
+def _refused(check_name: str, r: dict, fallback: str) -> tuple[float, list]:
+    """A crashed, refused or ok:false result: 0.0 with the tool's own reason."""
+    return 0.0, [{"check": check_name, "ok": False,
+                  "detail": r.get("error") or r.get("summary") or fallback}]
+
+
+def _thin_region_detail(region: dict, floor: float) -> str:
+    value = region.get("min_thickness_mm")
+    measured = (f"{float(value):.3g} mm"
+                if isinstance(value, (int, float)) and not isinstance(value, bool)
+                else "thickness unmeasured")
+    detail = (f"thin region {region.get('index', '?')} (body {region.get('body', '?')}): "
+              f"{measured}, process minimum {floor:g} mm")
+    faces = [str(f) for f in region.get("faces") or []][:4]
+    if faces:
+        detail += f"; faces {', '.join(faces)}"
+    owners = [str(o.get("name") or o.get("id")) for o in region.get("built_by") or []
+              if isinstance(o, dict)][:3]
+    if owners:
+        detail += f"; built by {', '.join(owners)}"
+    return detail
+
+
+def _score_wall_thickness(r: dict) -> tuple[float, list]:
+    """wall_thickness passes only when no measured wall is thinner than the process minimum.
+
+    min_thickness_mm / n_thin_regions come from the engine's inscribed-sphere study; the
+    comparison floor is the min_wall_mm the study itself used. A failing score is the
+    thinnest-wall ratio (never 1.0)."""
+    name = "wall_thickness"
+    if r.get("ok") is not True:
+        return _refused(name, r, "wall_thickness did not run")
+    try:
+        floor = float(r["min_wall_mm"])
+        thinnest = float(r["min_thickness_mm"])
+    except (KeyError, TypeError, ValueError):
+        return _refused(name, {}, "wall_thickness returned no comparable "
+                                  "min_thickness_mm / min_wall_mm")
+    if not (math.isfinite(floor) and math.isfinite(thinnest)) or floor <= 0:
+        return _refused(name, {}, "wall_thickness returned a non-finite or non-positive "
+                                  "thickness or process minimum")
+    regions = [x for x in r.get("thin_regions") or [] if isinstance(x, dict)]
+    count = r.get("n_thin_regions")
+    n_thin = count if isinstance(count, int) and not isinstance(count, bool) else len(regions)
+    if thinnest >= floor and n_thin == 0:
+        return 1.0, []
+    findings = [{"check": name, "ok": False, "detail": _thin_region_detail(region, floor)}
+                for region in regions[:5]]
+    if not findings:
+        findings.append({"check": name, "ok": False,
+                         "detail": f"thinnest wall {thinnest:.3g} mm vs process minimum "
+                                   f"{floor:g} mm ({n_thin} thin region(s))"})
+    return max(0.0, min(0.99, thinnest / floor)), findings
+
+
+def _info_readout(check_name: str, r: dict) -> dict:
+    """The compact reading an info-only check reports in place of a score."""
+    if check_name == "measure_part":
+        mass = r.get("mass") if isinstance(r.get("mass"), dict) else {}
+        out = {key: mass[key] for key in ("volume_mm3", "mass_g", "body_count") if key in mass}
+        material = mass.get("material")
+        if isinstance(material, dict) and material.get("source"):
+            out["material_source"] = material["source"]
+        return out
+    if check_name == "measure_between":
+        return {key: r[key] for key in ("distance", "summary") if key in r}
+    if check_name == "query_geometry":
+        return {key: r[key] for key in ("matches", "summary") if key in r}
+    return {}
+
+
+def _extract_score(check_name: str, reward_shape: str,
+                   result_json: str | dict) -> tuple[Optional[float], list]:
+    """Parse JSON return from a check function → (score 0..1 | None, findings list).
+
+    A score is positive evidence, never the absence of complaints: 1.0 needs a result that
+    says it ran (ok:true) and carries no failing item, so a crashed, refused or ok:false
+    result is 0.0 with its reason. ``None`` is a completed reading with no pass criterion
+    (measure_part, measure_between): informational, neither a pass nor a fail."""
     try:
         r = result_json if isinstance(result_json, dict) else json.loads(result_json)
+        if not isinstance(r, dict):
+            raise ValueError("check result is not a JSON object")
     except Exception:
         return 0.0, [{"check": check_name, "error": "parse_error", "raw": str(result_json)[:200]}]
 
@@ -1193,6 +1317,7 @@ def _extract_score(check_name: str, reward_shape: str, result_json: str | dict) 
         return (1.0 if passed else 0.0), findings
 
     if check_name == "measure_between":
+        # A distance between two probe faces has no expected value to pass or fail against.
         distance = r.get("distance")
         try:
             measured = (r.get("ok") is True and not isinstance(distance, bool)
@@ -1200,19 +1325,20 @@ def _extract_score(check_name: str, reward_shape: str, result_json: str | dict) 
         except (TypeError, ValueError):
             measured = False
         if not measured:
-            return 0.0, [{
-                "check": check_name, "ok": False,
-                "detail": r.get("error") or r.get("summary")
-                          or "measure_between returned no finite distance evidence",
-            }]
+            return _refused(check_name, r, "measure_between returned no finite distance evidence")
         if abs(float(distance)) <= 1e-9:
             findings.append({
                 "check": check_name, "ok": True,
                 "detail": "distance 0.0 mm — coincident/adjacent faces "
                           "(honest finding, not a soft-zero failure)",
             })
-        return 1.0, findings
+        return None, findings
 
+    if reward_shape == "info":
+        # A reading has no pass criterion; ok only says the operation completed.
+        if r.get("ok") is not True:
+            return _refused(check_name, r, f"{check_name} did not complete")
+        return None, findings
 
     if reward_shape == "binary":
         # For a check whose ok only means "the check ran", the verdict is a separate field.
@@ -1221,10 +1347,13 @@ def _extract_score(check_name: str, reward_shape: str, result_json: str | dict) 
             verdict_field is None or r.get(verdict_field) is True)
         score = 1.0 if passed else 0.0
         if not passed:
+            detail = r.get("error") or r.get("summary") or r.get("verdict")
+            if not detail and verdict_field and r.get("ok"):
+                detail = f"{check_name} reported ok but not {verdict_field}=true"
             findings.append({
                 "check": check_name,
                 "ok": False,
-                "detail": r.get("summary") or r.get("error") or r.get("verdict") or "",
+                "detail": detail or "",
             })
 
     elif reward_shape == "scalar":
@@ -1302,30 +1431,39 @@ def _extract_score(check_name: str, reward_shape: str, result_json: str | dict) 
     else:  # "findings"
         # interface_check reports a `findings` list of {severity, detail, fix, ...};
         # only severity=="fail" entries should drive the score/fail (warns are advisory). Other
-        # findings-shaped checks use pairs/violations/etc. and every listed item counts.
-        if check_name == "interface_check" and r.get("ok") is not True:
-            # ok=false is a refusal or an error: the alignment was not checked.
-            score = 0.0
-            findings.append({
-                "check": check_name,
-                "ok": False,
-                "detail": r.get("error") or r.get("summary") or "interface_check did not run",
-            })
+        # findings-shaped checks use pairs/violations/etc. and every listed item counts. A
+        # result that is not ok:true and lists no item is a refusal or crash — the check did
+        # not run, which is a 0.0, never an empty (and therefore clean) list.
+        if r.get("ok") is not True and not (
+                isinstance(r.get("findings"), list)
+                and any(isinstance(f, dict) and f.get("severity") == "fail"
+                        for f in r["findings"])):
+            return _refused(check_name, r, f"{check_name} did not run or failed")
+        if check_name == "wall_thickness":
+            score, wall_findings = _score_wall_thickness(r)
+            findings.extend(wall_findings)
         elif "findings" in r and isinstance(r.get("findings"), list):
             fails = [f for f in r["findings"]
                      if isinstance(f, dict) and f.get("severity") == "fail"]
-            score = 1.0 if r.get("ok", not fails) and not fails else max(0.0, 1.0 - len(fails) * 0.1)
-            for f in fails:
-                detail = f.get("detail") or str(f)
-                if f.get("fix"):
-                    detail = f"{detail}  -> fix: {f['fix']}"
-                findings.append({"check": check_name, "ok": False, "detail": detail})
+            if r.get("ok") is not True and not fails:
+                score, findings = _refused(check_name, r, f"{check_name} did not run")
+            else:
+                score = (0.0 if r.get("ok") is not True else
+                         max(0.0, 1.0 - len(fails) * 0.1))
+                for f in fails:
+                    detail = f.get("detail") or str(f)
+                    if f.get("fix"):
+                        detail = f"{detail}  -> fix: {f['fix']}"
+                    findings.append({"check": check_name, "ok": False, "detail": detail})
         else:
             items = (r.get("pairs") or r.get("faces_below_threshold") or
                      r.get("violations") or r.get("spurious") or [])
-            score = 1.0 if not items else max(0.0, 1.0 - len(items) * 0.1)
-            for item in items:
-                findings.append({"check": check_name, "ok": False, "detail": str(item)})
+            if r.get("ok") is not True and not items:
+                score, findings = _refused(check_name, r, f"{check_name} did not run")
+            else:
+                score = 1.0 if not items else max(0.0, 1.0 - len(items) * 0.1)
+                for item in items:
+                    findings.append({"check": check_name, "ok": False, "detail": str(item)})
 
     return score, findings
 
@@ -1349,6 +1487,7 @@ def verify(doc_id: Optional[str], checks: list[str], **kwargs) -> dict:
           "elapsed_ms": float,
           "skipped": [check_name, ...],  # platform-filtered checks
           "interpreted": [{from, to}, ...],  # accepted check-name aliases
+          "informational": {check_name: reading},  # info-only checks that completed: no pass/fail
           "check_results": {"check_sketch": {fully_defined, pinned_only, sketches,
                                              findings, failures, ...}},
         }
@@ -1360,7 +1499,8 @@ def verify(doc_id: Optional[str], checks: list[str], **kwargs) -> dict:
 
     if not checks:
         checks = [n for n, meta in CHECKS.items()
-                  if meta[2] == "subsecond" and (meta[3] == "any" or is_posix)]
+                  if n != "query_geometry" and meta[2] == "subsecond"
+                  and (meta[3] == "any" or is_posix)]
 
     interpreted: list[dict[str, str]] = []
     normalized: list[str] = []
@@ -1388,6 +1528,7 @@ def verify(doc_id: Optional[str], checks: list[str], **kwargs) -> dict:
     findings: list[dict] = []
     skipped: list[str] = []
     check_results: dict[str, dict] = {}
+    informational: dict[str, dict] = {}
     study_only = _study_only_kinds(doc_id) if _SOLID_CHECKS.intersection(checks) else []
 
     for name in sorted(checks):  # deterministic order
@@ -1441,6 +1582,8 @@ def verify(doc_id: Optional[str], checks: list[str], **kwargs) -> dict:
                     })
                     continue
                 call_kwargs = adapted or {}
+                if name == "wall_thickness":
+                    call_kwargs["image"] = False  # the battery consumes readings, not the study image
                 probe_chosen = (name == "measure_between"
                                 and _measure_probe_chosen_by_battery(kwargs, call_kwargs))
                 result = (_check_all_sketches(fn, doc_id, kwargs)
@@ -1492,9 +1635,28 @@ def verify(doc_id: Optional[str], checks: list[str], **kwargs) -> dict:
             })
             continue
 
+        # A thickness study that measured nothing (no opposing wall found) is not evidence
+        # of adequate walls: not evaluated, never a pass.
+        if (name == "wall_thickness" and parsed_early.get("ok") is True
+                and parsed_early.get("min_thickness_mm") is None):
+            skipped.append(name)
+            findings.append({
+                "check": name,
+                "ok": True,
+                "skipped": True,
+                "not_evaluated": True,
+                "reason": "no_opposing_wall",
+                "detail": "Not evaluated: the study found no opposing wall to measure. A "
+                          "null thickness is not evidence the walls are adequate.",
+            })
+            continue
+
         score, flist = _extract_score(name, reward_shape, result)
-        scores[name] = score
         findings.extend(flist)
+        if score is None:
+            informational[name] = _info_readout(name, parsed_early)
+        else:
+            scores[name] = score
 
     elapsed = (time.monotonic() - t0) * 1000
     return {
@@ -1504,6 +1666,7 @@ def verify(doc_id: Optional[str], checks: list[str], **kwargs) -> dict:
         "skipped": sorted(skipped),
         "interpreted": interpreted,
         "check_results": check_results,
+        "informational": dict(sorted(informational.items())),
     }
 
 

@@ -17,6 +17,8 @@
 // freezes the resulting views with an explicit stale warning. An inline drawing
 // instead projects its fixed tree. source_revision tracks the source snapshot;
 // the compiled HLR geometry is recomputed from it on fetch.
+// Live drawings register as source consumers until closed or switched to inline
+// geometry, preventing automatic removal of feature IDs they may reference.
 #pragma once
 
 #include <map>
@@ -39,7 +41,7 @@ void drawings_saved(const DrawingSaveRevisions& revisions);
 std::map<std::string, std::string> drawings_for_source(
     const std::string& source_doc_id, DrawingSaveRevisions& revisions);
 // Called after a source session has been removed from the document registry.
-// Freeze every associated drawing on its final source tree/env and flag it stale.
+// Freeze associated drawings on its final tree/env, flag them stale and unlink.
 void drawings_source_closed(const std::string& source_doc_id,
                             const nlohmann::json& source_doc,
                             const nlohmann::json& source_env, long source_revision);
@@ -53,8 +55,9 @@ nlohmann::json register_restored_drawing(const nlohmann::json& drawing_doc,
                                          const std::string& source_doc_id);
 // Standalone editable drawing container (.draw+ / aicad.draw+/1). Save embeds the
 // source document by default plus a stale-safe cache of the last projected sheets.
-// Open returns {drawing_id, source_doc_id, source_state:live|embedded_opened|missing,
-// name, path}; a missing source remains viewable from cache/views.json.
+// A successfully embedded live source becomes public even if its .step+ is unsaved.
+// Open returns {drawing_id, source_doc_id, source_state:live|embedded_opened|missing|closed,
+// name, path}; a missing or closed source remains viewable from cache/views.json.
 nlohmann::json drawing_save_standalone(const std::string& drawing_id,
                                        const std::string& path);
 nlohmann::json drawing_open_standalone(const std::string& path);
@@ -72,9 +75,9 @@ nlohmann::json drawing_open_standalone(const std::string& path);
 nlohmann::json drawing_new(const nlohmann::json& source_doc, const nlohmann::json& env,
                            const std::string& name, const std::string& source_doc_id = "");
 
-// drawing_set_source: replace the stored source tree (+env) and bump the source
-// revision so all views re-project against the new bodies (mirrors an edit to the
-// open source in the oracle). Returns {doc_id, revision, source_revision}.
+// drawing_set_source: replace the stored source tree (+env), unlink the live
+// source, and bump the source revision so all views re-project against the new
+// bodies. Returns {doc_id, revision, source_revision}.
 nlohmann::json drawing_set_source(const std::string& doc_id, const nlohmann::json& source_doc,
                                   const nlohmann::json& env);
 
@@ -129,7 +132,8 @@ nlohmann::json drawing_add_dim(const std::string& doc_id, const std::string& vie
                                const std::string& type, const nlohmann::json& a,
                                const nlohmann::json& b, const nlohmann::json& c,
                                const nlohmann::json& d, const nlohmann::json& pos,
-                               const nlohmann::json& text);
+                               const nlohmann::json& text,
+                               const nlohmann::json& source_refs = nlohmann::json());
 // Structured manufacturing dimensions rendered by annot_draw.
 nlohmann::json drawing_add_chamfer_dimension(const std::string& doc_id,
                                              const std::string& view_id,

@@ -31,9 +31,8 @@ std::vector<nlohmann::json> iter_bom_components(const nlohmann::json& doc);
 // mcu_family of the FIRST non-dnp MCU component in the doc's BOM, or nullopt.
 std::optional<std::string> select_mcu_family(const nlohmann::json& doc);
 
-// Resolve a board_doc_ref to a doc dict: open ECAD session doc_id first, then
-// a file path (.ecad+ container or plain JSON). Returns null when
-// unresolvable — never throws (mirrors mcu_pinouts.resolve_board_doc).
+// Resolve a board_doc_ref or sch_doc_ref to a document: open session first,
+// then a KiCad file, legacy container, or plain JSON. Returns null when unresolvable.
 nlohmann::json resolve_board_doc(const std::string& ref);
 
 // Boot-strap / reset pin-or-net names (upper-case) for mcu_family.

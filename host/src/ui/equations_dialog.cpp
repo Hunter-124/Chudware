@@ -56,16 +56,12 @@ bool applyEqOp(AppState& st, const nlohmann::json& op, const char* what) {
         st.toast(ui::ToastLevel::Warn, "No document open.");
         return false;
     }
-    if (st.docLockedByAgent(st.docMirror.docId())) {
-        st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
-        return false;
-    }
     const std::string whatStr = what ? what : "equation";
     ++st.rebuildsInFlight;
     st.docMirror.applyOpsAsync(st.rpc, st.worker, nlohmann::json::array({op}),
-        [&st, whatStr](const core::OpsResponse& r, bool applied) {
+        [&st, whatStr](const core::OpsResponse& r, bool current) {
             --st.rebuildsInFlight;
-            if (!applied) return;
+            if (!current || !st.isActiveMirrorDoc()) return;
             if (!r.ok) {
                 std::string msg = r.error_message.empty() ? std::string("operation failed")
                                                           : r.error_message;
@@ -75,7 +71,6 @@ bool applyEqOp(AppState& st, const nlohmann::json& op, const char* what) {
                 return;
             }
             if (!r.aicm_path.empty()) st.loadDocMeshAsync(r.aicm_path);
-            st.markActiveTabDirty();
         });
     return true;
 }
@@ -94,8 +89,6 @@ struct ExprBuf {
 void drawEquationsDialog(AppState& st) {
     if (!st.showEquations) return;
     const auto& pal = ui::palette;
-    const bool locked = st.docLockedByAgent(st.docMirror.docId());
-    const std::string lockReason = locked ? st.agentLockReason(st.docMirror.docId()) : "";
 
     // Per-row expr edit buffers (persist across frames) + the Add-row buffers.
     static std::vector<ExprBuf> s_rows;
@@ -199,8 +192,8 @@ void drawEquationsDialog(AppState& st) {
                         ExprBuf* rb = nullptr;
                         for (auto& cand : s_rows) if (cand.name == name) { rb = &cand; break; }
                         if (rb && rb->lastDoc != expr) {
-                            // A lock must not discard a human's uncommitted expression.
-                            if (!locked || rb->lastDoc == rb->buf.data()) {
+                            // Preserve a human's uncommitted expression across external changes.
+                            if (rb->lastDoc == rb->buf.data()) {
                                 std::memset(rb->buf.data(), 0, rb->buf.size());
                                 std::strncpy(rb->buf.data(), expr.c_str(), rb->buf.size() - 1);
                             }
@@ -230,8 +223,7 @@ void drawEquationsDialog(AppState& st) {
                         // col 2: delete
                         ImGui::TableSetColumnIndex(2);
                         const std::string delTip = "Delete " + name;
-                        if (kit::iconButton("del", "delete",
-                                            locked ? lockReason.c_str() : delTip.c_str(), !locked))
+                        if (kit::iconButton("del", "delete", delTip.c_str(), true))
                             pendingDeleteName = name;
 
                         ImGui::PopID();
@@ -262,7 +254,7 @@ void drawEquationsDialog(AppState& st) {
                                                       s_addExpr.size(),
                                                       ImGuiInputTextFlags_EnterReturnsTrue);
             ImGui::SameLine();
-            bool addClicked = kit::primaryButton("Add", !locked, lockReason.c_str(),
+            bool addClicked = kit::primaryButton("Add", true, nullptr,
                                                  ImVec2(ui::metrics::asmBtnW(), 0));
 
             if (addClicked || exprEnter) {

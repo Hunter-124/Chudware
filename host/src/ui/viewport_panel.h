@@ -9,6 +9,13 @@ struct AppState;
 
 namespace ui {
 
+// A right click is complete only on release and only if it never became a drag.
+inline bool rightClickReleased() {
+    const ImGuiIO& io = ImGui::GetIO();
+    return ImGui::IsMouseReleased(ImGuiMouseButton_Right) &&
+        io.MouseDragMaxDistanceSqr[ImGuiMouseButton_Right] < io.MouseDragThreshold * io.MouseDragThreshold;
+}
+
 // Draw the Viewport dockable window if state.showViewport. `io` drives orbit/zoom interaction,
 // `busy` toggles the live-progress pill overlay.
 void drawViewportPanel(AppState& state, ImGuiIO& io, bool busy);

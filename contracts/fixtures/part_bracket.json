@@ -384,9 +384,7 @@
         "spacing2": {
           "value": 20.0,
           "expr": null
-        },
-        "reverse1": false,
-        "reverse2": false
+        }
       },
       "refs": {
         "dir1": "axis.x",

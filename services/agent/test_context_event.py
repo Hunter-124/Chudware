@@ -139,7 +139,10 @@ def test_unmeasured_call_emits_nothing():
     assert len(events) == 0
 
 
-def test_every_completion_emits_not_just_the_first():
+def test_every_completion_emits_not_just_the_first(monkeypatch):
+    from services.agent import guardrails
+    monkeypatch.setattr(guardrails, "_doc_tree", lambda *a, **kw: {"features": []})
+    monkeypatch.setattr(guardrails, "_engine_body_count", lambda doc_id: 1)
     # Tool call then finish == two provider completions, two meter updates.
     provider = _UsageProvider(replies=(_TOOL_CALL, _FINISH),
                               prompts=(1000, 2500))

@@ -18,7 +18,7 @@ from pathlib import Path
 
 _CAD_EXTS = {
     ".step+", ".step", ".stp", ".stl", ".3mf", ".iges", ".igs",
-    ".brep", ".dxf", ".dwg", ".sldprt", ".sldasm",
+    ".brep", ".dxf", ".dwg", ".sldprt", ".sldasm", ".scad",
 }
 _SKIP_DIRS = {".plm", ".chudware"}
 _MAX_CHARS = 1500
@@ -168,8 +168,9 @@ def project_context_block(root: str | Path | None, *, max_files: int = 40) -> st
             f"Project folder (absolute): {rp}",
             "The files below already exist on disk. Decide from this list and act",
             "in the SAME reply - never stop to deliberate or ask which to do:",
-            "- request clearly refers to one of these -> import_part(path=...) and",
-            "  work on THAT file; do not model it again from scratch.",
+            "- request clearly refers to one of these -> use import_part(path=...,",
+            "  resume=True) for an existing native .step+ you intend to edit in place;",
+            "  import other formats normally. Work on THAT file, not a new model.",
             "- request does not match any of them -> create the new part as usual.",
             "  That is expected; it is saved into this folder automatically.",
         ]

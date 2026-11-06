@@ -88,13 +88,13 @@ def resolve_model_and_effort(
     raw_params: Mapping[str, Any],
     cfg: Mapping[str, Any],
     byok_key: Any,
-    transient_call: Any,
-    auth_providers: Any,
-) -> tuple[Any, str, str, Any, list[dict[str, Any]] | None]:
-    """Resolve the turn preferences, available models and explicit override."""
-    from services.agent.chudcode_host import byok_provider_env
+) -> tuple[Any, str, str, Any]:
+    """Resolve exact turn preferences and the selected model."""
+    from services.agent.omp_host import byok_provider_env
     from services.agent.preferences import resolve_turn_preferences
-    from services.agent.role_models import _auto_local_provider, resolve_role_model
+    from services.agent.role_models import (
+        CONCRETE_THINKING, _auto_local_provider, get_role_thinking, resolve_role_model,
+    )
 
     def param_str(key: str) -> str:
         value = raw_params.get(key)
@@ -110,40 +110,29 @@ def resolve_model_and_effort(
         }
     preferences = resolve_turn_preferences(
         request, cfg=turn_cfg,
-        feature_count=max(0, int(raw_params.get("feature_count") or 0)),
         doc_count=max(1, int(raw_params.get("doc_count") or 1)),
         context_tokens=max(0, int(raw_params.get("context_tokens") or 0)),
         context_window=max(0, int(raw_params.get("context_window") or cfg.get("context_window") or 0)),
     )
+    role_effort = get_role_thinking("chat", cfg)
+    if role_effort in CONCRETE_THINKING:
+        from dataclasses import replace
+
+        preferences = replace(preferences, thinking=role_effort)
     provider, model = param_str("provider"), param_str("model")
     assignment = None
-    candidates = None
     if not provider and not model:
-        catalog = transient_call("get_available_models", {})
-        auth = transient_call("get_auth_state", {})
-        if not catalog.get("ok") or not auth.get("ok"):
-            raise RuntimeError("Cannot inspect available models. Repair the runtime or sign in in Accounts.")
-        authenticated = {row["id"] for row in auth_providers(auth) if row["authenticated"]}
-        candidates = [
-            {"provider": row["provider"], "model": row["id"],
-             "base_url": row.get("baseUrl") or row.get("base_url") or ""}
-            for row in catalog.get("models", [])
-            if isinstance(row, Mapping) and row.get("provider") and row.get("id")
-            and (row["provider"] in authenticated
-                 or _auto_local_provider(row["provider"], cfg, row.get("baseUrl") or row.get("base_url")))
-        ]
-        assignment = resolve_role_model(
-            "chat", cfg=cfg, request=request, turn_preferences=preferences, enabled=candidates
-        )
+        assignment = resolve_role_model("chat", cfg=cfg, turn_preferences=preferences)
         provider, model = assignment.provider, assignment.model
-    else:
-        provider = provider or str(cfg.get("provider") or "")
-        model = model or str(cfg.get("model") or "")
+        if assignment.is_session_default and "chat_assignment" not in cfg:
+            provider, model = str(cfg.get("provider") or ""), str(cfg.get("model") or "")
+    elif not provider or not model:
+        raise ValueError("An explicit model selection requires both provider and model")
     if preferences.local_only and not _auto_local_provider(provider, cfg):
         raise ValueError("This computer only requires a loopback model. Configure a local model in Accounts.")
     if byok_key is not None and byok_provider_env(provider) is None:
         raise ValueError("byok_unsupported_online")
-    return preferences, provider, model, assignment, candidates
+    return preferences, provider, model, assignment
 
 
 def resolve_settings(
@@ -153,16 +142,15 @@ def resolve_settings(
     model_name: str,
     cfg: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    """Assemble the Chudcode session settings for one online turn.
+    """Assemble the Omp session settings for one online turn.
 
     Compaction is the persisted user choice (``agent.compaction_strategy``), carried as
-    ``compaction_strategy`` plus ``compaction_settings`` (Chudcode ``compaction.*``
+    ``compaction_strategy`` plus ``compaction_settings`` (Omp ``compaction.*``
     sub-keys) for the conversation process configuration. A request cannot replace
     it: the process configuration is shared by every turn of the session.
     ``auto_compaction`` stays a session switch — sent only when the request names it,
-    or for ``auto`` when the turn policy asks for compaction — so a turn never resets
-    the user's per-session Auto-compaction choice. Raises :class:`ValueError` for an
-    unrecognized strategy.
+    so a turn never resets the user's per-session choice. Raises :class:`ValueError`
+    for an unrecognized strategy.
     """
     from services.agent.config import online_compaction_settings
 
@@ -174,9 +162,11 @@ def resolve_settings(
     settings["compaction_strategy"] = strategy
     settings["compaction_settings"] = compaction
     if not any(key in raw_params or key in settings for key in ("thinking", "reasoning_effort")):
-        settings["thinking"] = preferences.thinking
-    if preferences.schedule_compaction and strategy == "auto":
-        settings.setdefault("auto_compaction", True)
+        from services.agent.role_models import get_role_thinking
+
+        selected = get_role_thinking("chat", cfg)
+        if selected and selected != "auto":
+            settings["thinking"] = selected
     if provider_name:
         settings["provider"] = provider_name
     if model_name:

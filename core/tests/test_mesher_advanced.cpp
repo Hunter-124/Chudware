@@ -557,9 +557,9 @@ TEST_CASE("contact: interface_size_mm beats the fill's own size floor or refuses
 //
 // "No coarser than 12 mm" inside an 8 mm mesh is already true everywhere, so the
 // request now clamps to the background (mesher.cpp local_size_field), no wave
-// runs, and the contract is met. Whatever the study then does, it may not fail
-// for a MESHING reason.
-TEST_CASE("contact: an interface_size_mm coarser than the background is legal") {
+// runs, and the contract is met. Judge the mesh it delivered, independently of
+// whether contact resolution subsequently admits the coarse static solve.
+TEST_CASE("contact: an interface_size_mm at or above the background is legal") {
     const double gap = 0.4, pad = 12.0, base_h = 24.0;
     TopoDS_Shape base = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 100, 50, base_h).Shape();
     TopoDS_Shape block =
@@ -572,6 +572,11 @@ TEST_CASE("contact: an interface_size_mm coarser than the background is legal") 
     const std::string step = write_step(assembly, "contact_pad_coarse");
 
     const double background = 8.0;
+    double requested = background;
+    // Both requests produce a constant h_min == h_max size field over the
+    // planar interface seeds; constructing it must not allocate a spatial grid.
+    SUBCASE("request equals the background") { requested = background; }
+    SUBCASE("coarser request clamps to the background") { requested = 1.5 * background; }
     json fix = plane_grid_z(0, 100, 0, 50, 0.0);
     json load = plane_grid_z(44, 56, 19, 31, base_h + gap + 20.0);
     json study = make_study(step, 0.5, /*order=*/1, fix, load, /*F=*/4000.0);
@@ -580,18 +585,25 @@ TEST_CASE("contact: an interface_size_mm coarser than the background is legal") 
                             {"max_gap_mm", 0.5},
                             {"max_iterations", 25},
                             {"penalty_scale", 1.0},
-                            {"interface_size_mm", 1.5 * background}};
+                            {"interface_size_mm", requested}};
     const json r = fea_run_static(study);
     const std::string error = r.value("error", std::string());
-    MESSAGE("coarse interface request: ok=" << r.value("ok", false)
-                                            << " error=" << error);
-    // The three failures this case exists to forbid.
-    CHECK(error.find("GradedSizing") == std::string::npos);
-    CHECK(error.find("h_min") == std::string::npos);
-    CHECK(error.find("mesh failed") == std::string::npos);
-    // And the contract itself is met — a request the mesh already satisfies is
-    // never "not delivered".
-    CHECK(error.find("was not delivered") == std::string::npos);
+    MESSAGE("interface request " << requested << " mm: ok=" << r.value("ok", false)
+                                << " error=" << error);
+    // A legal request must produce a real, valid two-body mesh; an unrelated
+    // contact refusal may still prevent a coarse interface from being solved.
+    REQUIRE(r.contains("mesh_quality"));
+    const json& quality = r.at("mesh_quality");
+    CHECK(quality.at("n_elems").get<int>() > 0);
+    CHECK(quality.at("n_nodes").get<int>() > 0);
+    CHECK(quality.at("jacobian_min").get<double>() > 0.0);
+    CHECK(quality.at("min_tet_volume_mm3").get<double>() > 0.0);
+    CHECK(quality.at("connected_components").get<int>() == 2);
+    REQUIRE(r.contains("contact"));
+    const double delivered =
+        r.at("contact").at("resolution").at("h_interface_mm").get<double>();
+    CHECK(delivered > 0.0);
+    CHECK(delivered <= kLocalContractSlack * requested);
 }
 
 // ── The same contract on a TIGHT CURVED BORE ─────────────────────────────────

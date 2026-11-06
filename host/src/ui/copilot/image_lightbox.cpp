@@ -1,9 +1,8 @@
 // Copilot attachment image chrome: square composer thumbnails, aspect-preserving sent-message
 // previews, and the full-size viewer ("lightbox") a click on either opens.
 //
-// All share ONE bounded texture cache, so clicking an already-previewed attachment costs no
-// second GL upload. Uploads go through the same lazy ::loadTexture path the copilot timeline and
-// the AI-tab Documents preview use.
+// Decode and thumbnail resize happen on one background worker. The shared bounded cache uploads
+// at most one image per GUI frame; the viewer requests a full-resolution variant separately.
 //
 // The tile deliberately does NOT open a nested Begin()/End() window: a nested window over a
 // widget breaks hit-testing in this codebase (a real, previously-shipped bug — see
@@ -16,13 +15,24 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <unordered_map>
+#include <condition_variable>
+#include <deque>
+#include <filesystem>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <vector>
+#include "stb_image.h"
+#include "stb_image_resize2.h"
+#include "ui/anim.h"
 
 #include "imgui.h"
 #include "imgui_internal.h"      // ImRect (adaptivePanel/glassPanel) + GetKeyData (Esc swallow)
 
-#include "core/app_state.h"      // ::Tex / ::loadTexture / AppState (fonts)
+#include "core/app_state.h"      // ::Tex / AppState (fonts)
 #include "ui_theme.h"            // ui::palette / uiScale / adaptivePanel / glassPanel
 #include "ui/metrics.h"          // px / rounding / stroke — DPI-aware sizes
 #include "ui/clipboard_image.h"  // ui::isImageAttachment — is this attachment a raster image?
@@ -31,53 +41,184 @@
 namespace ui {
 namespace {
 
-// ---- shared bounded texture cache -----------------------------------------------------------
-// A pasted screenshot is multi-megapixel, so the ceiling here is tighter than the timeline's
-// artifact cache (activity_timeline.cpp). Composer chips, sent-message previews and the viewer
-// share it. `use` is a monotonically increasing stamp bumped on every hit; the lowest stamp is
-// the least-recently-used entry.
 struct ThumbTex {
-    ::Tex              tex;
-    unsigned long long use = 0;
+    ::Tex tex;
+    uint64_t use = 0;
+    int frame = -1;
+    bool pending = false, known = false;
+    std::filesystem::file_time_type mtime{};
+    double nextCheck = 0;
+};
+struct ImageJob {
+    std::weak_ptr<ThumbTex> slot;
+    std::string path;
+    int edge = 0;
+    bool known = false;
+    std::filesystem::file_time_type mtime{};
+};
+struct ImageResult {
+    std::weak_ptr<ThumbTex> slot;
+    std::vector<unsigned char> pixels;
+    std::unique_ptr<unsigned char, void(*)(void*)> original{nullptr, stbi_image_free};
+    int w = 0, h = 0;
+    bool unchanged = false;
+    std::filesystem::file_time_type mtime{};
+};
+struct ImageCache {
+    std::unordered_map<std::string, std::shared_ptr<ThumbTex>> slots;
+    uint64_t clock = 0;
+    int uploadedFrame = -1;
+    size_t textureBytes = 0;
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<ImageJob> jobs;
+    std::deque<ImageResult> ready;
+    bool stop = false;
+    std::thread worker;
+
+    ~ImageCache() {
+        { std::lock_guard<std::mutex> lock(mutex); stop = true; }
+        cv.notify_one();
+        if (worker.joinable()) worker.join();
+    }
+    void run() {
+        for (;;) {
+            ImageJob job;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                cv.wait(lock, [&] { return stop || (!jobs.empty() && ready.size() < 2); });
+                if (stop) return;
+                job = std::move(jobs.front());
+                jobs.pop_front();
+            }
+            if (job.slot.expired()) continue;
+            ImageResult result;
+            result.slot = job.slot;
+            std::error_code ec;
+            result.mtime = std::filesystem::last_write_time(job.path, ec);
+            result.unchanged = job.known && result.mtime == job.mtime;
+            if (!result.unchanged && !ec) {
+                int w = 0, h = 0, channels = 0;
+                unsigned char* pixels = stbi_load(job.path.c_str(), &w, &h, &channels, 4);
+                if (pixels && w > 0 && h > 0) {
+                    const double scale = std::min(1.0, (double)job.edge / std::max(w, h));
+                    result.w = std::max(1, (int)(w * scale));
+                    result.h = std::max(1, (int)(h * scale));
+                    if (result.w == w && result.h == h) {
+                        result.original.reset(pixels);
+                        pixels = nullptr;
+                    } else {
+                        result.pixels.resize((size_t)result.w * result.h * 4);
+                        if (!stbir_resize_uint8_srgb(pixels, w, h, 0, result.pixels.data(),
+                                                    result.w, result.h, 0, STBIR_RGBA)) {
+                            result.pixels.clear();
+                            result.w = result.h = 0;
+                        }
+                    }
+                }
+                stbi_image_free(pixels);
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (stop) return;
+                ready.push_back(std::move(result));
+            }
+            ui::anim::wakeLoop();
+        }
+    }
+    bool evict(int frame) {
+        auto oldest = slots.end();
+        for (auto it = slots.begin(); it != slots.end(); ++it)
+            if (it->second->frame != frame &&
+                (oldest == slots.end() || it->second->use < oldest->second->use))
+                oldest = it;
+        if (oldest == slots.end()) return false;
+        const ::Tex& tex = oldest->second->tex;
+        if (tex.id) {
+            const GLuint id = tex.id;
+            glDeleteTextures(1, &id);
+            textureBytes -= (size_t)tex.w * tex.h * 4;
+        }
+        slots.erase(oldest);
+        return true;
+    }
+    void upload(int frame) {
+        if (uploadedFrame == frame) return;
+        ImageResult result;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (ready.empty()) return;
+            result = std::move(ready.front());
+            ready.pop_front();
+        }
+        cv.notify_one();
+        auto slot = result.slot.lock();
+        if (!slot) return;
+        slot->pending = false;
+        slot->known = true;
+        slot->mtime = result.mtime;
+        if (result.unchanged) return;
+        uploadedFrame = frame;
+        // Never delete a texture already referenced by this frame's ImDrawData.
+        if (slot->frame == frame) {
+            slot->pending = true;
+            std::lock_guard<std::mutex> lock(mutex);
+            ready.push_front(std::move(result));
+            ui::anim::requestFramesAt(30);
+            return;
+        }
+        if (slot->tex.id) {
+            const GLuint old = slot->tex.id;
+            glDeleteTextures(1, &old);
+            textureBytes -= (size_t)slot->tex.w * slot->tex.h * 4;
+            slot->tex = {};
+        }
+        if (result.pixels.empty() && !result.original) return;
+        const size_t bytes = (size_t)result.w * result.h * 4;
+        const size_t limit = std::max(size_t(256 * 1024 * 1024), bytes);
+        slot->frame = frame;
+        while (textureBytes + bytes > limit && evict(frame)) {}
+        if (textureBytes + bytes > limit) {
+            slot->pending = true;
+            std::lock_guard<std::mutex> lock(mutex);
+            ready.push_front(std::move(result));
+            ui::anim::requestFramesAt(30);
+            return;
+        }
+        GLuint id = 0;
+        GLint previous = 0;
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous);
+        GLint unpackBuffer = 0, alignment = 0, rowLength = 0, skipRows = 0, skipPixels = 0;
+        glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpackBuffer);
+        glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+        glGetIntegerv(GL_UNPACK_ROW_LENGTH, &rowLength);
+        glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skipRows);
+        glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &skipPixels);
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+        glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+        glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+        glGenTextures(1, &id);
+        glBindTexture(GL_TEXTURE_2D, id);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, result.w, result.h, 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, result.original ? result.original.get() : result.pixels.data());
+        glBindTexture(GL_TEXTURE_2D, (GLuint)previous);
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)unpackBuffer);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, rowLength);
+        glPixelStorei(GL_UNPACK_SKIP_ROWS, skipRows);
+        glPixelStorei(GL_UNPACK_SKIP_PIXELS, skipPixels);
+        slot->tex = {id, result.w, result.h};
+        textureBytes += bytes;
+    }
 };
 
-constexpr size_t kThumbTexCap = 32;
-
-std::unordered_map<std::string, ThumbTex> g_tex;
-unsigned long long                        g_texClock = 0;
-
-// There is no shared Tex release helper in the host (app_state.cpp, docs_panel.cpp and
-// activity_timeline.cpp each delete inline exactly this way), so eviction deletes here. Always
-// on the GL thread: every caller below is a draw path.
-void releaseTex(::Tex& t) {
-    if (!t.id) return;
-    unsigned int id = t.id;
-    glDeleteTextures(1, &id);
-    t.id = 0;
-    t.w = t.h = 0;
-}
-
-// Lazy upload behind the LRU. A FAILED decode is cached too (tex.id == 0), which is what stops a
-// broken/unreadable path from re-decoding every single frame.
-const ::Tex& texFor(const std::string& path) {
-    auto it = g_tex.find(path);
-    if (it != g_tex.end()) {
-        it->second.use = ++g_texClock;
-        return it->second.tex;
-    }
-    // Evict BEFORE inserting so the map never exceeds the cap.
-    while (g_tex.size() >= kThumbTexCap) {
-        auto oldest = g_tex.begin();
-        for (auto i = g_tex.begin(); i != g_tex.end(); ++i)
-            if (i->second.use < oldest->second.use) oldest = i;
-        releaseTex(oldest->second.tex);
-        g_tex.erase(oldest);
-    }
-    ThumbTex e;
-    e.tex = ::loadTexture(path);
-    e.use = ++g_texClock;
-    return g_tex.emplace(path, e).first->second.tex;
-}
+ImageCache& imageCache() { static ImageCache cache; return cache; }
 
 // A usable upload: non-zero id AND real dimensions (the aspect math divides by them).
 bool usable(const ::Tex& t) { return t.id != 0 && t.w > 0 && t.h > 0; }
@@ -147,6 +288,57 @@ bool        g_lbOpen = false;
 
 }  // namespace
 
+namespace copilot {
+void initImageLoader() {
+    ImageCache& cache = imageCache();
+    if (!cache.worker.joinable())
+        cache.worker = std::thread([&cache] { cache.run(); });
+}
+
+ImTextureID asyncImageTexture(const std::string& path, int maxEdge, int* outW, int* outH) {
+    if (outW) *outW = 0;
+    if (outH) *outH = 0;
+    if (path.empty()) return 0;
+    static const int maxTexture = [] {
+        GLint value = 0;
+        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &value);
+        return std::max(1, (int)value);
+    }();
+    maxEdge = std::clamp(maxEdge, 1, maxTexture);
+    ImageCache& cache = imageCache();
+    // Startup owns thread creation; requesting an image must never exhaust the browser pool.
+    if (!cache.worker.joinable()) return 0;
+    const int frame = ImGui::GetFrameCount();
+    cache.upload(frame);
+    const std::string key = path + '\x1f' + std::to_string(maxEdge);
+    auto it = cache.slots.find(key);
+    if (it == cache.slots.end()) {
+        while (cache.slots.size() >= 96)
+            if (!cache.evict(frame)) { ui::anim::requestFramesAt(30); return 0; }
+        it = cache.slots.emplace(key, std::make_shared<ThumbTex>()).first;
+    }
+    const auto& slot = it->second;
+    slot->use = ++cache.clock;
+    slot->frame = frame;
+    const double now = ImGui::GetTime();
+    if (!slot->pending && now >= slot->nextCheck) {
+        slot->pending = true;
+        slot->nextCheck = now + 2.0 + (std::hash<std::string>{}(key) % 1000) * 0.001;
+        {
+            std::lock_guard<std::mutex> lock(cache.mutex);
+            cache.jobs.erase(std::remove_if(cache.jobs.begin(), cache.jobs.end(),
+                [](const ImageJob& job) { return job.slot.expired(); }), cache.jobs.end());
+            cache.jobs.push_back({slot, path, maxEdge, slot->known, slot->mtime});
+        }
+        cache.cv.notify_one();
+    }
+    if (slot->pending) ui::anim::requestFramesAt(30);
+    if (outW) *outW = slot->tex.w;
+    if (outH) *outH = slot->tex.h;
+    return (ImTextureID)(intptr_t)slot->tex.id;
+}
+}  // namespace copilot
+
 // =================================================================================================
 // thumbnail tile
 // =================================================================================================
@@ -205,20 +397,22 @@ static bool attachmentTile(const std::string& path, const ImVec2& size, const ::
 
 bool attachmentThumbnail(const std::string& path, float sizePx) {
     if (path.empty() || sizePx < 4.0f) return false;
+    ::Tex image;
     const ::Tex* tex = nullptr;
     if (isImageAttachment(path)) {
-        const ::Tex& t = texFor(path);
-        if (usable(t)) tex = &t;
+        image.id = (unsigned int)(intptr_t)copilot::asyncImageTexture(path, 256, &image.w, &image.h);
+        if (usable(image)) tex = &image;
     }
     return attachmentTile(path, ImVec2(sizePx, sizePx), tex);
 }
 
 bool attachmentImagePreview(const std::string& path, float maxWidth, float maxHeight) {
     if (path.empty() || maxWidth < 4.0f || maxHeight < 4.0f) return false;
+    ::Tex image;
     const ::Tex* tex = nullptr;
     if (isImageAttachment(path)) {
-        const ::Tex& t = texFor(path);
-        if (usable(t)) tex = &t;
+        image.id = (unsigned int)(intptr_t)copilot::asyncImageTexture(path, 1024, &image.w, &image.h);
+        if (usable(image)) tex = &image;
     }
     ImVec2 size(maxWidth, std::min(maxHeight, ImGui::GetTextLineHeight() * 4.0f));
     if (tex) {
@@ -282,9 +476,10 @@ void drawImageLightbox(AppState& st) {
                           ImGui::ColorConvertFloat4ToU32(
                               ImVec4(sh[0], sh[1], sh[2], 140.0f / 255.0f)));
 
-        // Same cache the tile filled: opening a thumbnailed chip is a map hit, not an upload.
-        const ::Tex& tex   = texFor(g_lbPath);
-        const bool   haveT = usable(tex);
+        ::Tex tex;
+        tex.id = (unsigned int)(intptr_t)copilot::asyncImageTexture(
+            g_lbPath, 1 << 30, &tex.w, &tex.h);
+        const bool haveT = usable(tex);
 
         const float pad  = metrics::px(10.0f);
         const float gap  = metrics::px(8.0f);

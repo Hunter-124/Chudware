@@ -1,7 +1,8 @@
 # Chudware User Manual
 
 Auto-generated from the ribbon command inventory, the
-in-app modeling guide, and the frozen contract set — see `tools/manual_gen.py`.
+in-app modeling guide, and the top-level `contracts/*.md` inventory — see `tools/manual_gen.py`.
+Nested files and machine-readable contracts are excluded.
 
 ## Contents
 

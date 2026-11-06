@@ -5,7 +5,7 @@ mission sequence:
 
     INTAKE → [CLARIFY] → SPECIFY
              → [DECOMPOSE → GEOMETRY → LINKAGE → BUILDPATH]
-             → [ORGANIZE] → PLAN → BUILD → VERIFY → [CORRECT ↺] → DELIVER
+             → PLAN → BUILD → VERIFY → [CORRECT ↺] → DELIVER
 
 The components are ready for a mission runtime to supply durable context and
 record transitions.  They are not yet wired into the production ``mission_start``
@@ -18,8 +18,8 @@ the manifest, ledger evidence, build graphs, node verdicts, and criterion result
 When a caller supplies a ledger, successful phase entry/exit is recorded as
 ``stage`` events before the in-memory transition is committed.
 
-Feature flags (``PipelineFlags``) control the optional organization and design
-pipeline stages.  Disabled stages are omitted when transition adjacency is
+Feature flags (``PipelineFlags``) control the optional design
+pipeline stages. Disabled stages are omitted when transition adjacency is
 checked.
 """
 from __future__ import annotations
@@ -45,7 +45,6 @@ class Phase(str, Enum):
     GEOMETRY = "geometry"        # Stage 2 — geometry realization (geometry_spec[])
     LINKAGE = "linkage"          # Stage 3 — topology / linkage (linkage[])
     BUILDPATH = "buildpath"      # Stage 4 — build-path planning (build_node[])
-    ORGANIZE = "organize"        # Phase 2.5 (contract §18) — feature-flagged
     PLAN = "plan"
     BUILD = "build"
     VERIFY = "verify"
@@ -53,7 +52,7 @@ class Phase(str, Enum):
     DELIVER = "deliver"
 
 
-# The full ordered sequence.  CLARIFY, ORGANIZE and CORRECT are conditionally
+# The full ordered sequence. CLARIFY and CORRECT are conditionally
 # skipped (see ``PhaseMachine.next_phase``); the ORDER itself never changes.
 PHASE_ORDER: tuple[Phase, ...] = (
     Phase.INTAKE,
@@ -64,7 +63,6 @@ PHASE_ORDER: tuple[Phase, ...] = (
     Phase.GEOMETRY,
     Phase.LINKAGE,
     Phase.BUILDPATH,
-    Phase.ORGANIZE,
     Phase.PLAN,
     Phase.BUILD,
     Phase.VERIFY,
@@ -118,23 +116,14 @@ class TransitionResult:
 
 @dataclass
 class PipelineFlags:
-    """Feature flags for the 1.3 org layer.
-
-    org_layer defaults ON (Phase 2.5 ORGANIZE is live).
-    build_council and overseer remain env-gated (default OFF).
+    """Feature flags for optional pipeline behavior.
 
     Environment overrides (always respected):
-      * ``CHUDWARE_ORG_LAYER=0``      → disable Phase 2.5 ORGANIZE (test/compat).
-      * ``CHUDWARE_ORG_LAYER=1``      → explicit enable (no-op; already on by default).
-      * ``CHUDWARE_BUILD_COUNCIL=1``  → require build-strategy council synthesis at the
-        PLAN exit gate (contract §19).
       * ``CHUDWARE_OVERSEER=1``       → overseer audit triggers are live.
       * ``CHUDWARE_DESIGN_PIPELINE=1`` → run the six-stage design-pipeline refinement
         (DECOMPOSE→GEOMETRY→LINKAGE→BUILDPATH between SPECIFY and PLAN).
         Default OFF — the existing pipeline is unchanged when off (contract §6).
     """
-    org_layer: bool = True   # ORGANIZE phase is live by default
-    build_council: bool = False
     overseer: bool = False
     design_pipeline: bool = False   # six-stage refinement, default OFF
 
@@ -146,8 +135,6 @@ class PipelineFlags:
                 return default
             return val in ("1", "true", "True")
         return cls(
-            org_layer=_on("CHUDWARE_ORG_LAYER", True),   # default ON
-            build_council=_on("CHUDWARE_BUILD_COUNCIL", False),
             overseer=_on("CHUDWARE_OVERSEER", False),
             design_pipeline=_on("CHUDWARE_DESIGN_PIPELINE", False),  # default OFF
         )
@@ -312,7 +299,6 @@ class PhaseMachine:
 
           * CLARIFY is skipped when there is no blocking ambiguity
             (``context["has_blocking_ambiguity"]`` is falsey);
-          * ORGANIZE is skipped unless the org layer flag is on;
           * CORRECT is skipped when there are no open failure cards
             (``context["open_failure_cards"]`` is empty).
 
@@ -323,11 +309,8 @@ class PhaseMachine:
             if cand is Phase.CLARIFY and not context.get("has_blocking_ambiguity"):
                 continue
             # The four design-pipeline phases are skipped unless the flag is on.
-            # With the flag off, next_phase(SPECIFY) advances straight to ORGANIZE/PLAN
-            # exactly as before — the existing pipeline is byte-for-byte unchanged.
+            # With the flag off, next_phase(SPECIFY) advances straight to PLAN.
             if cand in _DESIGN_PIPELINE_PHASES and not self.flags.design_pipeline:
-                continue
-            if cand is Phase.ORGANIZE and not self.flags.org_layer:
                 continue
             if cand is Phase.CORRECT and not context.get("open_failure_cards"):
                 continue
@@ -344,7 +327,6 @@ class PhaseMachine:
             phase for phase in PHASE_ORDER
             if not (
                 (phase in _DESIGN_PIPELINE_PHASES and not self.flags.design_pipeline)
-                or (phase is Phase.ORGANIZE and not self.flags.org_layer)
             )
         ]
         if frm not in active:
@@ -554,36 +536,18 @@ def _gate_buildpath(m: PhaseMachine, ctx: dict[str, Any]) -> GateResult:
     return GateResult(not reasons, "build_nodes_present", reasons, overseer=True)
 
 
-def _gate_organize(m: PhaseMachine, ctx: dict[str, Any]) -> GateResult:
-    """Departments instantiated from the manifest clusters (contract §18).
-
-    Feature-flagged: when the org layer is off this phase is never entered (see
-    ``next_phase``); if it *is* entered, the gate requires a non-empty org chart.
-    """
-    if not m.flags.org_layer:
-        return GateResult(True, "org_disabled")
-    if not (ctx.get("org_chart") or {}).get("departments"):
-        return GateResult(False, "departments_instantiated",
-                          ["org layer is enabled but no departments were "
-                           "instantiated from the manifest clusters"])
-    return GateResult(True, "departments_instantiated")
-
 
 def _gate_plan(m: PhaseMachine, ctx: dict[str, Any]) -> GateResult:
-    """Build graphs valid + (council synthesis recorded) + overseer ratified.
+    """Build graphs valid + overseer ratified.
 
     Uses the buildgraph validator (contract §13) result the caller supplies:
     ``build_graph_blockers`` is the list of blocker-severity findings (cycles are
-    surfaced by the caller as a blocker string).  Council synthesis is required
-    only when the build-council flag is on.
+    surfaced by the caller as a blocker string).
     """
     reasons: list[str] = []
     blockers = ctx.get("build_graph_blockers") or []
     if blockers:
         reasons.append(f"build graph has structural blockers: {blockers}")
-    if m.flags.build_council and not ctx.get("council_synthesis_recorded"):
-        reasons.append("build-strategy council synthesis not recorded "
-                       "(contract §19 Phase 3 exit requirement)")
     if not ctx.get("plan_ratified"):
         reasons.append("plan not overseer-ratified (trigger: plan_ratify)")
     return GateResult(not reasons, "graphs_valid_ratified", reasons, overseer=True)
@@ -698,7 +662,6 @@ _GATES: dict[Phase, GateCheck] = {
     Phase.GEOMETRY: _gate_geometry,
     Phase.LINKAGE: _gate_linkage,
     Phase.BUILDPATH: _gate_buildpath,
-    Phase.ORGANIZE: _gate_organize,
     Phase.PLAN: _gate_plan,
     Phase.BUILD: _gate_build,
     Phase.VERIFY: _gate_verify,

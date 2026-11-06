@@ -29,7 +29,7 @@ from typing import Any
 # civil_* key exists in ecad.py / sim.py, so each tool still has exactly one owner.
 _FAMILIES = (
     "advisor", "cad", "cam", "civil", "ecad", "em", "files", "firmware", "gsl",
-    "intake", "ledger", "manufacturing", "mission", "office", "org", "parts",
+    "harness", "intake", "ledger", "manufacturing", "mission", "office", "parts",
     "plm", "recon", "research", "reveng", "shell", "sim", "tasklist", "workspace",
 )
 

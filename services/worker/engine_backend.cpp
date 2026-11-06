@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <filesystem>
 #include <mutex>
+#include <algorithm>
+#include <memory>
 #include <thread>
 
 #include "cpp_core.h"
@@ -40,6 +42,41 @@ bool g_daemon = false;
 // by a daemon_draining refusal: that keeps daemon mode (see initOnce).
 bool g_daemonUnavailable = false;
 std::once_flag g_once;
+std::atomic<bool> g_initialized{false};
+std::atomic<bool> g_connectionCancelled{false};
+std::mutex g_startupClientMutex;
+chudware_ipc::EngineClient* g_startupClient = nullptr;
+
+// Abort startup before the final client is published. Clear the borrowed pointer
+// before its owner can destroy it; shutdown holds the same lock while aborting.
+struct StartupClientGuard {
+    explicit StartupClientGuard(chudware_ipc::EngineClient* client) {
+        std::lock_guard<std::mutex> lock(g_startupClientMutex);
+        g_startupClient = client;
+    }
+    ~StartupClientGuard() {
+        std::lock_guard<std::mutex> lock(g_startupClientMutex);
+        g_startupClient = nullptr;
+    }
+};
+
+bool connectionDelay(int milliseconds) {
+    const auto until = std::chrono::steady_clock::now() +
+                       std::chrono::milliseconds(milliseconds);
+    while (!g_connectionCancelled.load(std::memory_order_acquire)) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= until) return true;
+        std::this_thread::sleep_for(std::min(until - now,
+            std::chrono::steady_clock::duration(std::chrono::milliseconds(10))));
+    }
+    return false;
+}
+#ifndef __EMSCRIPTEN__
+thread_local GuiConnection* g_guiConnection = nullptr;
+thread_local bool g_guiDaemonRequested = true;
+std::thread::id g_guiThread;
+std::atomic<std::chrono::steady_clock::duration::rep> g_nextGuiTry{0};
+#endif
 
 struct AgentRunSlot {
     chudware_ipc::EngineClient* client = nullptr;
@@ -52,16 +89,13 @@ chudware_ipc::EngineClient* g_simRunClient = nullptr;
 std::mutex g_runClientMtx;
 
 // Streaming calls hold an EngineClient's mutex until they finish, so they stay off
-// the GUI document connection. Each agent call leases a private connection: hostd
+// the GUI document connection. Each agent turn leases a private connection: hostd
 // runs online turns in separate workers and DocLock serializes same-doc batches.
-// WorkerClient still serializes native agent runs and simulation solves.
-// Both host and translated core method names must select the same lane.
+// WorkerClient still serializes simulation solves on the simulation lane.
 // The simulation connection discards pushes not consumed live and never falls back
 // to g_client, since a long solve would otherwise freeze GUI document calls.
 bool isAgentLongRunMethod(const std::string& method) {
-    return method == "agent_run" || method == "agent_run_v2" ||
-           method == "agent_mission" || method == "agent_mission_v1" ||
-           method == "agent_admin_turn";
+    return method == "agent_admin_turn";
 }
 
 bool isSimLongRunMethod(const std::string& method) {
@@ -93,15 +127,6 @@ chudware_ipc::EngineClient* openRunClient(chudware_ipc::EngineClient*& slot,
     std::lock_guard<std::mutex> lk(g_runClientMtx);
     if (!slot) slot = createRunClient(discardUnconsumedEvents, err);
     return slot;
-}
-
-bool agentRunConnectionReady() {
-    std::lock_guard<std::mutex> lk(g_runClientMtx);
-    for (const auto& slot : g_agentRunClients)
-        if (slot.client) return true;
-    std::string err;
-    g_agentRunClients.front().client = createRunClient(false, err);
-    return g_agentRunClients.front().client != nullptr;
 }
 
 class AgentRunLease {
@@ -172,7 +197,7 @@ chudware_ipc::EngineClient* simRunClient(std::string& err) {
     return openRunClient(g_simRunClient, /*discardUnconsumedEvents=*/true, err);
 }
 
-// A draining hostd refuses every new non-control client with this hello error
+// A draining hostd refuses independent GUI clients with this hello error
 // (Server::drainRefusal). It holds the instance lock until it exits, so no successor can
 // start beside it, and a private in-process engine would not share its documents.
 bool isDrainRefusal(const json& helloError) {
@@ -246,7 +271,7 @@ void logPingLatency(chudware_ipc::EngineClient& c) {
     const int N = 200;
     const auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < N; ++i)
-        if (!c.call("ping", json::object(), r, e)) return;
+        if (!c.call("ping", json::object(), r, e, 5000, {}, &g_connectionCancelled)) return;
     const double us = std::chrono::duration<double, std::micro>(
                           std::chrono::steady_clock::now() - t0).count() / N;
     std::fprintf(stderr, "[engine] daemon ping round-trip: %.1f us/call (%d calls)\n", us, N);
@@ -268,10 +293,14 @@ void initOnce() {
     // one release; removal is a named N+1 task).
     const char* f = std::getenv("CHUDWARE_ENGINE_DAEMON");
     if (f && f[0] == '0') return;  // explicit opt-out -> legacy in-process
-    auto* c = new chudware_ipc::EngineClient();
+    auto owned = std::make_unique<chudware_ipc::EngineClient>();
+    auto* c = owned.get();
+    StartupClientGuard startupClient(c);
     chudware_ipc::EngineClient::Options opts;
     opts.hostdBin = hostdBinHint();
     opts.clientKind = "gui";
+    opts.primaryThread = g_guiThread;
+    opts.cancelled = &g_connectionCancelled;
     std::string err;
 
     // Transient-outage retry. hostd may be booting, restarting under systemd,
@@ -302,7 +331,9 @@ void initOnce() {
     bool draining = false;
     int spentMs = 0;
     for (size_t attempt = 0;; ++attempt) {
+        if (g_connectionCancelled.load(std::memory_order_acquire)) return;
         if (c->connectOrSpawn(opts, err)) { connected = true; break; }
+        if (g_connectionCancelled.load(std::memory_order_acquire)) return;
         // A draining hostd refuses by name and keeps refusing until it exits, so this
         // short ladder cannot outlast it. maintainConnection() waits for it instead.
         if (isDrainRefusal(c->helloError())) { draining = true; break; }
@@ -313,16 +344,17 @@ void initOnce() {
                      "[engine] hostd connect failed (%s) — retrying in %d ms "
                      "(attempt %zu)\n",
                      err.c_str(), waitMs, attempt + 2);
-        std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
+        if (!connectionDelay(waitMs)) return;
         spentMs += waitMs;
     }
+    if (g_connectionCancelled.load(std::memory_order_acquire)) return;
     if (draining) {
         // Never fall back to the in-process engine on a drain refusal: this window would
         // then edit documents that the agent and every other client cannot see, for the
         // whole session. Keep daemon mode with a client that is not connected yet, as the
         // browser build does. maintainConnection() shows the refusal on the unreachable
         // chip, retries, and starts the new daemon after the old one exits.
-        g_client = c;
+        g_client = owned.release();
         g_daemon = true;
         std::fprintf(stderr,
                      "[engine] %s — daemon mode stays on. Chudware connects when the "
@@ -344,16 +376,22 @@ void initOnce() {
                      "documents created by a shared chudware-hostd (including any agent "
                      "worker attached to it) will NOT be visible here.\n",
                      spentMs, err.c_str());
-        delete c;
         return;
     }
-    g_client = c;
+    g_client = owned.release();
     g_daemon = true;
     std::fprintf(stderr, "[engine] daemon mode: connected to chudware-hostd (state=%s)\n",
                  c->serverInfo().value("state", std::string("?")).c_str());
     const char* pingBench = std::getenv("CHUDWARE_PING_BENCH");
     if (pingBench && pingBench[0] == '1' && pingBench[1] == '\0') logPingLatency(*c);
 #endif
+}
+
+void initializeBackend() {
+    std::call_once(g_once, [] {
+        initOnce();
+        g_initialized.store(true, std::memory_order_release);
+    });
 }
 
 // Absorb {"code":"loading"}: the daemon binds before the (slow) OCCT load and
@@ -377,16 +415,30 @@ bool waitEngineReady(chudware_ipc::EngineClient& c, std::string& err) {
 }  // namespace
 
 bool daemonMode() {
-    std::call_once(g_once, initOnce);
+    // A pending GUI connection is daemon-intended, not an in-process verdict.
+    // Only background callers wait for the final verdict.
+#ifndef __EMSCRIPTEN__
+    if (g_guiConnection && !g_initialized.load(std::memory_order_acquire))
+        return g_guiDaemonRequested;
+#endif
+    initializeBackend();
     return g_daemon;
 }
 
 bool daemonUnavailable() {
-    std::call_once(g_once, initOnce);  // same guard: safe to call at any time
+#ifndef __EMSCRIPTEN__
+    if (g_guiConnection && !g_initialized.load(std::memory_order_acquire)) return false;
+#endif
+    initializeBackend();
     return g_daemonUnavailable;
 }
 
 chudware_ipc::EngineClient* client() {
+#ifndef __EMSCRIPTEN__
+    if (g_guiConnection && !g_initialized.load(std::memory_order_acquire)) return nullptr;
+    if (g_guiConnection && g_guiConnection->busy_.load(std::memory_order_acquire))
+        return nullptr;
+#endif
     return daemonMode() ? g_client : nullptr;
 }
 
@@ -412,6 +464,11 @@ static bool callDispatch(chudware_ipc::EngineClient* cl, const std::string& meth
     // synchronous and can't be interrupted (matches the pre-daemon behavior).
 #ifndef __EMSCRIPTEN__
     if (!daemonMode()) return core::cpp_core().call(method, params, result, err);
+    if (!cl) {
+        result = {{"code", "engine_unavailable"}, {"message", "engine connection is not ready"}};
+        err = "engine connection is not ready";
+        return false;
+    }
 #endif
     bool ok = cl->call(method, params, result, err, timeoutMs, onEvent);
 #ifndef __EMSCRIPTEN__
@@ -441,6 +498,18 @@ static bool callDispatch(chudware_ipc::EngineClient* cl, const std::string& meth
 
 bool call(const std::string& method, const json& params, json& result, std::string& err,
           int timeoutMs, const std::function<void(const json&)>& onEvent) {
+#ifndef __EMSCRIPTEN__
+    if (g_connectionCancelled.load(std::memory_order_acquire)) {
+        result = json();
+        err = "aborted";
+        return false;
+    }
+    if (g_guiConnection && connectionPending()) {
+        result = {{"code", "engine_starting"}, {"message", "engine connection is still starting"}};
+        err = "engine connection is still starting";
+        return false;
+    }
+#endif
     // Initialize daemon mode before copying g_client. A first short request reaches this
     // function before any other daemonMode() caller, so copying first would pass the
     // pre-initialization nullptr into callDispatch even though initOnce then armed daemon mode.
@@ -450,7 +519,14 @@ bool call(const std::string& method, const json& params, json& result, std::stri
     // to the initialized shared client if its connection can't be established; a simulation
     // solve fails instead (see isSimLongRunMethod).
     const bool useDaemon = daemonMode();
-    chudware_ipc::EngineClient* cl = useDaemon ? g_client : nullptr;
+#ifndef __EMSCRIPTEN__
+    if (g_connectionCancelled.load(std::memory_order_acquire)) {
+        result = json();
+        err = "aborted";
+        return false;
+    }
+#endif
+    chudware_ipc::EngineClient* cl = useDaemon ? client() : nullptr;
 #ifdef __EMSCRIPTEN__
     // Refuse before acquiring a streaming lane: an unadvertised call must not
     // wait for another run or establish an extra connection.
@@ -506,30 +582,43 @@ void abortRunClient() {
     if (g_simRunClient) g_simRunClient->abortPending();
 }
 
-bool runConnectionReady(RunLane lane) {
+bool simRunConnectionReady() {
+#ifndef __EMSCRIPTEN__
+    if (g_guiConnection && connectionPending()) return false;
+#endif
     if (!daemonMode()) return false;
-    switch (lane) {
-        case RunLane::Agent:
-            return agentRunConnectionReady();
-        case RunLane::Sim: {
-            std::string err;
-            return simRunClient(err) != nullptr;
-        }
-        case RunLane::None:
-            break;
-    }
-    return false;
+    std::string err;
+    return simRunClient(err) != nullptr;
 }
 
 bool available() {
+#ifndef __EMSCRIPTEN__
+    if (g_guiConnection && connectionPending()) return false;
+#endif
     if (daemonMode()) {
         // Reflect live socket health so callers don't pretend a wedged hostd is fine.
-        return g_client && g_client->connected();
+        auto* c = client();
+        return c && c->connected();
     }
     return core::cpp_core().available();
 }
 
 bool ensureLoaded(std::string& err) {
+#ifndef __EMSCRIPTEN__
+    if (g_connectionCancelled.load(std::memory_order_acquire)) {
+        err = "aborted";
+        return false;
+    }
+    if (g_guiConnection && connectionPending()) {
+        err = "engine connection is still starting";
+        return false;
+    }
+#endif
+    initializeBackend();
+    if (g_connectionCancelled.load(std::memory_order_acquire)) {
+        err = "aborted";
+        return false;
+    }
     if (daemonMode()) {
         if (g_client && g_client->connected()) return true;
         const json refusal = daemonRefusal();
@@ -542,6 +631,9 @@ bool ensureLoaded(std::string& err) {
 }
 
 json daemonRefusal() {
+#ifndef __EMSCRIPTEN__
+    if (g_guiConnection && connectionPending()) return json();
+#endif
     if (!daemonMode() || !g_client) return json();
     json refusal = g_client->helloError();
     return isDrainRefusal(refusal) ? refusal : json();
@@ -579,6 +671,22 @@ static int respawnCooldownSecs(int escalations) {
 #endif
 
 DaemonConnState maintainConnection() {
+#ifndef __EMSCRIPTEN__
+    if (g_connectionCancelled.load(std::memory_order_acquire))
+        return DaemonConnState::Unreachable;
+    if (g_guiConnection) {
+        if (connectionPending()) return DaemonConnState::Unreachable;
+        if (!g_daemon || !g_client) return DaemonConnState::InProc;
+        if (g_guiConnection->busy_.load(std::memory_order_acquire))
+            return DaemonConnState::Unreachable;
+        if (g_client->pollAlive()) {
+            g_nextGuiTry.store(0, std::memory_order_release);
+            return DaemonConnState::Connected;
+        }
+        g_guiConnection->requestMaintenance();
+        return DaemonConnState::Unreachable;
+    }
+#endif
     if (!daemonMode() || !g_client) return DaemonConnState::InProc;
     // Backoff state lives for the process lifetime; reset whenever the socket is
     // healthy so a call()-driven reconnect doesn't leave a stale nextTry delay.
@@ -589,6 +697,12 @@ DaemonConnState maintainConnection() {
     // over at the 30s cooldown instead of inheriting the 5-minute one.
     static int respawns = 0;
     static std::chrono::steady_clock::time_point nextRespawn{};
+    static uint64_t generation = 0;
+    if (generation != g_client->reconnectGeneration()) {
+        generation = g_client->reconnectGeneration();
+        failedAttempts = respawns = 0;
+        nextTry = nextRespawn = {};
+    }
     // pollAlive surfaces peer death (HUP/EOF) without waiting for the next RPC —
     // connected() alone stays true until something reads the dead socket.
     if (g_client->pollAlive()) {
@@ -596,6 +710,9 @@ DaemonConnState maintainConnection() {
         nextTry = {};
         respawns = 0;
         nextRespawn = {};
+#ifndef __EMSCRIPTEN__
+        g_nextGuiTry.store(0, std::memory_order_release);
+#endif
         return DaemonConnState::Connected;
     }
     // Dead socket: bounded reconnect (connect-only; no spawn — matches EngineClient
@@ -619,13 +736,18 @@ DaemonConnState maintainConnection() {
     const bool ok = g_client->tryReconnectNonBlocking(err, &deferred);
     if (!ok && deferred) return DaemonConnState::Unreachable;  // skip tick, no backoff
 #else
-    const bool ok = g_client->tryReconnect(err);
+    const bool ok = g_client->tryReconnect(err, &g_connectionCancelled);
 #endif
+    if (g_connectionCancelled.load(std::memory_order_acquire))
+        return DaemonConnState::Unreachable;
     if (ok) {
         failedAttempts = 0;
         nextTry = {};
         respawns = 0;
         nextRespawn = {};
+#ifndef __EMSCRIPTEN__
+        g_nextGuiTry.store(0, std::memory_order_release);
+#endif
         std::fprintf(stderr, "[engine] daemon reconnected (gen=%llu)\n",
                      (unsigned long long)g_client->reconnectGeneration());
         return DaemonConnState::Connected;
@@ -646,17 +768,16 @@ DaemonConnState maintainConnection() {
     //
     // Spawn-and-let-the-ladder-reconnect rather than calling connectOrSpawn()
     // here, deliberately. hostd binds its socket BEFORE the (slow) OCCT load, so
-    // the very next 1s tick normally connects — while connectOrSpawn() would
-    // stall this frame-loop thread for its whole connect budget AND poke
-    // EngineClient::conn_ from outside mtx_ (connectInner->tryConnect) while a
-    // worker-thread call() may still be unwinding on the dead socket.
+    // the very next 1s tick normally connects. Keep recovery attempts bounded
+    // instead of repeating the full startup budget, and never poke conn_ from
+    // outside mtx_ while a document call may still be unwinding on the dead socket.
     if (!draining && failedAttempts >= kRespawnAfterFailures && now >= nextRespawn) {
         ++respawns;
         const int cooldownS = respawnCooldownSecs(respawns);
         nextRespawn = now + std::chrono::seconds(cooldownS);
         const std::string bin = chudware_ipc::resolveHostdBin(hostdBinHint());
         std::string serr;
-        if (!bin.empty() && chudware_ipc::spawnDetached(bin, "", serr)) {
+        if (!bin.empty() && chudware_ipc::spawnDetached(bin, "", serr, &g_connectionCancelled)) {
             waitMs = 1000;  // back to the fast rung: it should be listening within ~1s
             std::fprintf(stderr,
                          "[engine] hostd gone after %d failed reconnects — respawned "
@@ -673,6 +794,9 @@ DaemonConnState maintainConnection() {
     }
 #endif
     nextTry = now + std::chrono::milliseconds(waitMs);
+#ifndef __EMSCRIPTEN__
+    g_nextGuiTry.store(nextTry.time_since_epoch().count(), std::memory_order_release);
+#endif
     if (failedAttempts == 1 || failedAttempts % 5 == 0) {
         std::fprintf(stderr,
                      "[engine] daemon unreachable (%s) — retry in %dms (attempt %d)\n",
@@ -680,5 +804,68 @@ DaemonConnState maintainConnection() {
     }
     return DaemonConnState::Unreachable;
 }
+
+#ifndef __EMSCRIPTEN__
+bool connectionPending() {
+    return !g_initialized.load(std::memory_order_acquire);
+}
+
+GuiConnection::GuiConnection(void (*wake)()) {
+    g_guiThread = std::this_thread::get_id();
+    g_guiConnection = this;
+    const char* daemon = std::getenv("CHUDWARE_ENGINE_DAEMON");
+    g_guiDaemonRequested = !(daemon && daemon[0] == '0');
+    g_connectionCancelled.store(false, std::memory_order_release);
+    worker_ = std::thread([this, wake] {
+        initializeBackend();
+        busy_.store(false, std::memory_order_release);
+        if (g_connectionCancelled.load(std::memory_order_acquire)) return;
+        if (wake) wake();
+        std::unique_lock<std::mutex> lock(mutex_);
+        for (;;) {
+            cv_.wait(lock, [this] { return quit_ || requested_; });
+            if (quit_) return;
+            requested_ = false;
+            lock.unlock();
+            maintainConnection();
+            busy_.store(false, std::memory_order_release);
+            if (wake) wake();
+            lock.lock();
+        }
+    });
+}
+
+void GuiConnection::requestMaintenance() {
+    if (std::chrono::steady_clock::now().time_since_epoch().count() <
+        g_nextGuiTry.load(std::memory_order_acquire)) return;
+    if (busy_.exchange(true, std::memory_order_acq_rel)) return;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        requested_ = true;
+    }
+    cv_.notify_one();
+}
+
+void GuiConnection::shutdown() {
+    if (!worker_.joinable()) return;
+    g_connectionCancelled.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(g_startupClientMutex);
+        if (g_startupClient) g_startupClient->abortPending();
+    }
+    if (busy_.load(std::memory_order_acquire) &&
+        g_initialized.load(std::memory_order_acquire) && g_client)
+        g_client->abortPending();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        quit_ = true;
+    }
+    cv_.notify_one();
+    worker_.join();
+    g_guiConnection = nullptr;
+}
+
+GuiConnection::~GuiConnection() { shutdown(); }
+#endif
 
 }  // namespace engine

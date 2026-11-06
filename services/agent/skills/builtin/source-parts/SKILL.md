@@ -10,6 +10,8 @@ triggers:
 
 # Source Parts
 
+If not already available, call `enable_tools(tools=["part_get", "list_standard_parts", "vendor_login", "cam_tool_import", "bom_price", "describe_part", "check_interference", "ask_user"])` and wait for it to succeed before using them; mode and role restrictions still apply.
+
 ## Search phrasing that works
 
 Prefer **spec-like queries** over prose:
@@ -28,6 +30,7 @@ Avoid: "a small bolt", "bearing for the shaft" without size.
 ## Reference acquisition order
 
 1. `part_search` / `make_standard_part` for catalog and standard parts (servos, steppers, bearings, fasteners, extrusions); use `part_get` to confirm dimensions, `list_standard_parts` for family/size keys, and `part_place` for a catalog record.
+   The `part_search` preview sheet labels match JSON row indices. Use CAD renders and product photos to select candidates, not to establish dimensions or identity; confirm those with `part_get` before acquiring. Missing previews are explicitly marked; `previews=False` skips the sheet.
 2. `match_model` / `part_source` for a discrete product's CAD. Follow the candidate's artifact plan; confirm ambiguous product identities.
 3. `fetch_cad_model(url)` for a specific model page or STEP/IGES file found by web search; if `import_part=False`, pass its `artifact_path` to `import_artifact`.
 4. Web search only for specs/datasheets absent from the library. Then COMMIT to cited dimensions with clearance and build; never loop on research. For an MG90S six-axis arm, search MG90S first, use its referenced servo envelope and mount dimensions, then design mating brackets.
@@ -43,3 +46,4 @@ Browse `parts_taxonomy(node_id?)` for facet keys when needed. Vendors requiring 
 ## Deeper docs
 
 - `cad_guide('parts')`, `cad_guide('sourcing')`, `cad_guide('cost')`
+

@@ -1,8 +1,8 @@
-"""Hermetic numerical geometry fixtures; no engine, optional ray backend or files."""
+"""Hermetic numerical geometry fixtures; no engine or files."""
 import numpy as np
 import pytest
 
-from .geometry import BuildGeometry, RayCaster, depth_peel, fit_cylinder, surface_samples, voxelize
+from .geometry import BuildGeometry, depth_peel, fit_cylinder, surface_samples, voxelize
 from .mesh import PrintMesh
 
 
@@ -74,11 +74,6 @@ def test_inverted_inner_cube_is_a_cavity_with_correct_normals():
     voxels = voxelize(geom, cell=1)
     assert voxels.solid.sum() == 1000 - 64
     assert not voxels.solid[4:8, 4:8, 4:8].any()
-    caster = RayCaster(geom, 1)
-    distance, triangle = caster.cast(np.array([[5., 5., 5.]]), np.array([[0., 0., 1.]]), 10,
-                                    opposing_normals=np.array([[0., 0., 1.]]))
-    assert distance[0] == pytest.approx(2)
-    assert geom.normals[triangle[0], 2] == -1
 
 
 @pytest.mark.parametrize("second", [box((5, 0, 0), (15, 10, 10)),
@@ -145,61 +140,6 @@ def test_grid_limits_include_padding_and_anisotropic_shapes(requested_pitch):
     assert np.all(voxels.origin + np.array(voxels.solid.shape) * voxels.cell >= geom.bounds[1] + voxels.cell - 1e-10)
     with pytest.raises(ValueError):
         voxelize(geom, cell=1, max_cells=26)
-
-
-def test_thin_plate_rays_nearest_hit_limits_normal_filter_and_ties():
-    geom = BuildGeometry(box((0, 0, 0), (10, 10, .02)))
-    caster = RayCaster(geom, cell=.5)
-    origins = np.array([[5, 5, .01], [5, 5, .01], [5, 5, 1], [11, 5, .01], [5, 5, .01]])
-    directions = np.array([[0, 0, 7], [0, 0, -4], [0, 0, -1], [0, 0, 1], [0, 0, 1]])
-    distance, triangle = caster.cast(origins, directions, [1, 1, 1, 1, .009])
-    np.testing.assert_allclose(distance[:3], [.01, .01, .98], atol=1e-12)
-    assert np.all(np.isinf(distance[3:]))
-    np.testing.assert_array_equal(triangle[:3], [2, 0, 2])
-    np.testing.assert_array_equal(triangle[3:], [-1, -1])
-    distance, triangle = caster.cast(origins[:1], directions[:1], 1,
-                                    opposing_normals=np.array([[0, 0, 1]]))
-    assert np.isinf(distance[0]) and triangle[0] == -1
-    distance, triangle = caster.cast(origins[:1], directions[:1], .01,
-                                    opposing_normals=np.array([[0, 0, -1]]))
-    assert distance[0] == pytest.approx(.01) and triangle[0] == 2
-
-
-def test_rays_outside_parallel_grid_edges_and_diagonal_traversal():
-    geom = BuildGeometry(box())
-    caster = RayCaster(geom, 1)
-    origins = np.array([[-2, -2, -2], [5, -2, 5], [10, 5, 5], [5, 5, 5], [-2, 11, 5]])
-    directions = np.array([[1, 1, 1], [0, 1, 0], [-1, 0, 0], [1, 1, 1], [1, 0, 0]])
-    distances, tri = caster.cast(origins, directions, np.inf)
-    np.testing.assert_allclose(distances[:4], [2 * np.sqrt(3), 2, 10, 5 * np.sqrt(3)], atol=1e-12)
-    assert np.isinf(distances[-1]) and tri[-1] == -1
-    assert np.all(tri[:4] >= 0)
-    with pytest.raises(ValueError):
-        caster.cast(origins[:1], np.zeros((1, 3)), 10)
-
-
-def test_ray_build_frame_and_nearest_triangle_coincident_tolerance():
-    mesh = box((20, -7, 13), (30, 3, 23))
-    geom = BuildGeometry(mesh, (2, 3, -5), 33)
-    caster = RayCaster(geom, .7)
-    model_origins = np.tile([25., -2., 18.], (5, 1))
-    model_directions = np.array([[1, 2, 3], [-1, 0, 0], [1, -3, 2], [0, 1, 1], [2, 2, -1]], dtype=float)
-    model_directions /= np.linalg.norm(model_directions, axis=1)[:, None]
-    origins = model_origins @ geom.rotation.T - [0, 0, geom.z_min]
-    directions = model_directions @ geom.rotation.T
-    distance, tri = caster.cast(origins, directions, 30)
-    expected = 5 / np.max(np.abs(model_directions), axis=1)
-    np.testing.assert_allclose(distance, expected, atol=1e-12)
-    assert np.all(tri >= 0)
-    # Triangle 0 is slightly farther but the same sheet within hit tolerance.
-    near_sheets = PrintMesh.from_arrays(
-        [[0, 0, 1.0000005], [2, 0, 1.0000005], [0, 2, 1.0000005],
-         [0, 0, 1], [2, 0, 1], [0, 2, 1]], [[0, 1, 2], [3, 4, 5]])
-    sheets = BuildGeometry(near_sheets)
-    distance, tri = RayCaster(sheets, 1).cast(
-        np.array([[.5, .5, -1.]]), np.array([[0, 0, 1.]]), 2)
-    assert tri[0] == 0
-    assert distance[0] == pytest.approx(1.0000005, abs=1e-10)
 
 
 def cylinder_samples(concave=False, taper=0):

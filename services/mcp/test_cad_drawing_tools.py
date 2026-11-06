@@ -182,9 +182,7 @@ def test_radius_and_diameter_on_the_same_circle_differ_by_exactly_two():
 
 
 def test_linear_and_angular_words_map_to_their_engine_types():
-    """`length` is a distance between two picks; `angle` is the four-point angular dim, which
-    the engine rejects for want of c/d — proving the WORD resolved rather than being refused
-    as unknown vocabulary."""
+    """Length and angle drafting words reach their corresponding dimension operations."""
     dwg, vid, center = _drawing_with_circle(_plate_with_hole())
     lin = _call("add_dimension", {"doc_id": dwg, "view_id": vid, "dtype": "length",
                                   "a": [center[0], center[1]], "b": [center[0] + 20.0, center[1]]})
@@ -194,10 +192,11 @@ def test_linear_and_angular_words_map_to_their_engine_types():
     assert ann["value"] > 0.0, ann
 
     ang = _call("add_dimension", {"doc_id": dwg, "view_id": vid, "dtype": "angle",
-                                  "a": center, "b": center})
-    assert ang["ok"] is False, ang
-    # The engine's own four-point complaint, i.e. the type resolved to angular_dim.
-    assert "angular_dim" in ang["error"] and "four" in ang["error"], ang
+                                  "a": center, "b": [center[0] + 10, center[1]],
+                                  "c": center, "d": [center[0], center[1] + 10]})
+    assert ang["ok"] and ang["dtype"] == "angular_dim", ang
+    assert ang["value"] == pytest.approx(90.0)
+    assert _the_annotation(dwg, vid, ang["annotation"])["value"] == pytest.approx(90.0)
 
 
 def test_unknown_dtype_still_fails_and_lists_the_real_vocabulary():
@@ -441,7 +440,7 @@ def test_model_items_basic_dims_runs_the_real_auto_dimension_pass():
     annotations the engine placed, not by ok:true."""
     mk = _call("make_drawing", {"doc_id": _plain_plate(), "views": ["front"],
                                 "model_items": "basic_dims", "hole_callouts": False})
-    assert mk["ok"] and mk["model_items"] is True, mk
+    assert mk["ok"] and mk["auto_dimensions_added"] > 0, mk
     assert _auto_dims(mk["drawing_doc_id"]) > 0, mk
 
 
@@ -450,7 +449,7 @@ def test_a_negative_model_items_word_is_not_truthy():
     auto-dimension pass the caller just switched OFF."""
     mk = _call("make_drawing", {"doc_id": _plain_plate(), "views": ["front"],
                                 "model_items": "none", "hole_callouts": False})
-    assert mk["ok"] and mk["model_items"] is False, mk
+    assert mk["ok"] and mk["auto_dimensions_added"] == 0, mk
     assert _auto_dims(mk["drawing_doc_id"]) == 0, mk
 
 
@@ -580,7 +579,7 @@ def test_svg_rejection_from_an_older_engine_degrades_honestly(monkeypatch, tmp_p
     assert result["ok"] is False, result
     assert result["reason"] == "engine_unsupported", result
     assert result["tool"] == "export_drawing", result
-    assert result["rpc"] == "export_drawing", result
+    assert result["rpc"] == "drawing_export", result
 
 
 def test_export_drawing_still_refuses_a_genuinely_unknown_argument(tmp_path):
@@ -1151,14 +1150,13 @@ def test_an_unresolvable_target_is_refused_naming_where_current_sids_come_from()
     assert _stored_annotations(dwg, top) == [], _stored_annotations(dwg, top)
 
 
-def test_a_between_two_picks_dimension_still_needs_b():
+def test_a_single_linear_dimension_rejects_a_round_model_target():
     doc = _plate_with_hole()
     sid = _round_sids(doc)[HOLE_D_MM / 2.0]
     dwg, top, _front = _plate_drawing(doc)
     r = _call("add_dimension", {"doc_id": dwg, "view_id": top, "dtype": "linear", "a": sid})
     assert r["ok"] is False, r
-    assert "needs both a and b" in r["error"], r
-    assert "diameter_dim" in r["error"], r
+    assert "not a straight model edge SID" in r["error"], r
     assert _stored_annotations(dwg, top) == [], _stored_annotations(dwg, top)
 
 
@@ -1460,7 +1458,7 @@ def test_the_earlier_fixes_still_work_beside_the_new_parameters():
     assert _sheet_size(mk["drawing_doc_id"]) == "A4", mk
     assert _title_block(mk["drawing_doc_id"])["title"] == "90x50x12 Plate", mk
     assert _drawing_name(mk["drawing_doc_id"]) == "PLATE-DWG", mk
-    assert mk["model_items"] is True and _auto_dims(mk["drawing_doc_id"]) > 0, mk
+    assert mk["auto_dimensions_added"] > 0 and _auto_dims(mk["drawing_doc_id"]) > 0, mk
     assert _views(mk["drawing_doc_id"])[0]["scale"] == 1.0, mk
 
 
@@ -1723,7 +1721,7 @@ def _complete_titleblock(dwg: str) -> None:
         "doc_id": dwg,
         "fields": {
             "title": "TEST PLATE", "part_number": "TP-1", "material": "6061-T6 ALUMINUM",
-            "scale": "1:1", "rev": "A", "finish": "RA 3.2 MAX",
+            "rev": "A", "finish": "RA 3.2 MAX",
             "drawn_by": "TEST", "date": "2026-08-26",
         },
     })
@@ -1753,17 +1751,15 @@ def _review_summary(dwg: str, audit_result=None) -> dict:
     return json.loads(text_items[-1].text)
 
 
-def test_hole_callout_emits_finished_thread_and_depth_text():
+def test_hole_callout_rejects_unverified_thread_and_depth():
     dwg, view_id, center = _drawing_with_circle(_plate_with_hole())
     result = _call("add_hole_callout", {
         "doc_id": dwg, "view_id": view_id, "a": center,
         "hole_type": "tapped", "thread": "M6x1.0", "depth": 14,
     })
-    assert result["ok"], result
-    assert "M6x1.0" in result["text"] and "14" in result["text"], result
-    assert "\u21a7" in result["text"], result
-    stored = _the_annotation(dwg, view_id, result["annotation"])
-    assert stored["thread"] == "M6x1.0" and stored["depth"] == 14
+    assert result["ok"] is False, result
+    assert not any(a.get("kind") == "hole_callout"
+                   for a in _stored_annotations(dwg, view_id))
 
 
 def test_dimension_tolerance_is_applied_atomically_at_creation():
@@ -1791,7 +1787,7 @@ def test_review_never_releases_a_bare_nominal_sheet_without_audit():
     assert "audit_drawing" in summary["manufacturing_ready_reason"], summary
 
 
-def test_audit_flags_missing_row_and_passes_when_exact_annotation_is_covered(monkeypatch):
+def test_audit_covers_explicit_row_but_refuses_missing_model_requirements(monkeypatch):
     dwg, made = _sheet_drawing()
     _complete_titleblock(dwg)
     bbox = _view(dwg, "v2")["bbox"]
@@ -1818,11 +1814,13 @@ def test_audit_flags_missing_row_and_passes_when_exact_annotation_is_covered(mon
             "annotation_id": dimension["annotation"], "critical": True,
         }]},
     )
-    assert covered["verdict"] == "release_ready", covered
-    assert covered["standards"]["failure_count"] == 0, covered
     assert covered["coverage_matrix"][0]["annotation_id"] == dimension["annotation"]
+    assert covered["coverage_matrix"][0]["status"] == "covered", covered
+    assert covered["verdict"] == "not_release_ready", covered
+    assert any(row["requirement_id"].startswith("model:") and row["status"] == "missing"
+               for row in covered["coverage_matrix"]), covered
     review = _review_summary(dwg, covered)
-    assert review["manufacturing_ready"] is True, review
+    assert review["manufacturing_ready"] is False, review
 
 
 def _audit_with_full(monkeypatch, dwg: str, source: str, full: dict, spec: dict) -> dict:
@@ -1957,10 +1955,11 @@ def test_missing_new_annotation_rpc_returns_engine_unsupported(monkeypatch):
     monkeypatch.setattr(cb, "call", missing_rpc)
     result = _call("add_chamfer_dimension", {
         "doc_id": dwg, "view_id": "front", "a": [200, 150],
-        "pos": [215, 165], "length": 1.0, "angle": 45,
+        "pos": [215, 165], "feature_ref": "f1", "length": 1.0, "angle": 45,
     })
     assert result == {
         "ok": False,
+        "code": "error",
         "reason": "engine_unsupported",
         "tool": "add_chamfer_dimension",
         "rpc": "drawing_add_chamfer_dimension",
@@ -1984,30 +1983,19 @@ def test_composite_gdt_preserves_second_row_and_full_modifiers():
     assert stored["row2"]["tol_value"] == "0.05"
 
 
-def test_hole_feature_ref_auto_populates_thread_depth_and_count(monkeypatch):
+def test_hole_callout_rejects_diameter_and_depth_inconsistent_with_model():
     source = _plate_with_hole()
     dwg, view_id, center = _drawing_with_circle(source)
-    real_call = cb.call
-
-    def with_tapped_semantics(method, params=None):
-        if method == "doc_tree" and params.get("doc_id") == source:
-            return {"tree": {"features": [{
-                "id": "f-taps", "name": "Clamp Threads", "type": "hole",
-                "params": {
-                    "style": "tap", "thread": "M6x1.0", "depth": 14, "end": "blind",
-                    "diameter": 5.0,
-                    "positions": [[-10, -10], [10, -10], [10, 10], [-10, 10]],
-                },
-            }]}}
-        return real_call(method, params)
-
-    monkeypatch.setattr(cb, "call", with_tapped_semantics)
-    result = _call("add_hole_callout", {
-        "doc_id": dwg, "view_id": view_id, "a": center, "feature_ref": "f-taps",
-    })
-    assert result["ok"], result
-    assert result["text"].startswith("4\u00d7 M6x1.0"), result
-    assert "\u21a7 14" in result["text"], result
+    features = cb.call("doc_tree", {"doc_id": source})["tree"]["features"]
+    hole = next(f for f in features if f.get("type") == "hole")
+    base = {"doc_id": dwg, "view_id": view_id, "a": center}
+    wrong_diameter = _call("add_hole_callout", {**base, "diameter": 6.0})
+    assert wrong_diameter["ok"] is False, wrong_diameter
+    wrong_depth = _call("add_hole_callout", {**base, "feature_ref": hole["id"], "depth": 7})
+    assert wrong_depth["ok"] is False, wrong_depth
+    correct = _call("add_hole_callout", {**base, "feature_ref": hole["id"]})
+    assert correct["ok"], correct
+    assert "8" in correct["text"] and "THRU" in correct["text"], correct
 
 
 def test_sheet_table_and_multi_sheet_export_tools_round_trip(tmp_path):
@@ -2035,19 +2023,51 @@ def test_sheet_table_and_multi_sheet_export_tools_round_trip(tmp_path):
     assert exported["ok"] and os.path.exists(exported["path"]), exported
 
 
+def test_chamfer_callout_uses_the_model_feature():
+    source = _plain_plate()
+    added = _call("add_features", {"doc_id": source, "ops": [
+        cb.feat("chamfer", "Edge break", {"distance": cb.dim(1.5)},
+                {"edges": {"of": "edge"}})]})
+    assert added["ok"], added
+    tree = cb.call("doc_tree", {"doc_id": source})
+    feature = next(f["id"] for f in tree["tree"]["features"] if f["name"] == "Edge break")
+    made = _call("make_drawing", {"doc_id": source, "views": ["front", "top"],
+                                  "model_items": False, "hole_callouts": False})
+    assert made["ok"], made
+    dwg = made["drawing_doc_id"]
+    owners = set(map(tuple, tree["owner_map"][feature]["edges"]))
+    for view in _views(dwg):
+        for line, provenance in zip(view.get("visible", []), view.get("visible_src", [])):
+            if (isinstance(provenance, dict)
+                    and (provenance.get("body"), provenance.get("edge_id")) in owners
+                    and len(line) == 2):
+                a = [(line[0][i] + line[1][i]) / 2 for i in (0, 1)]
+                args = {"doc_id": dwg, "view_id": view["view_id"], "a": provenance["sid"],
+                        "pos": [a[0] + 10, a[1] + 10], "feature_ref": feature}
+                bad = _call("add_chamfer_dimension", {**args, "length": 3.0})
+                assert not bad["ok"], bad
+                result = _call("add_chamfer_dimension", args)
+                assert result["ok"] and result["length"] == pytest.approx(1.5), result
+                assert result["angle"] == pytest.approx(45), result
+                edge_only = _call("add_chamfer_dimension", {
+                    key: value for key, value in args.items() if key != "feature_ref"})
+                assert edge_only["ok"] and edge_only["length"] == pytest.approx(1.5), edge_only
+                return
+    pytest.fail("no projected edge owned by the chamfer feature")
+
+
 def test_native_chamfer_ordinate_balloon_datum_and_extended_weld_tools():
     dwg, _mk = _sheet_drawing()
     bbox = _view(dwg, "v2")["bbox"]
-    chamfer = _call("add_chamfer_dimension", {
-        "doc_id": dwg, "view_id": "top", "a": [bbox[0], bbox[1]],
-        "pos": [bbox[0] - 15, bbox[1] - 15], "length": 1.5, "angle": 45,
-    })
-    assert chamfer["ok"] and chamfer["kind"] == "chamfer", chamfer
+    positions = {"x": [[30, 50], [40, 50]], "y": [[50, 30], [50, 40]]}
     ordinate = _call("add_ordinate_dimensions", {
         "doc_id": dwg, "view_id": "top", "origin": [bbox[0], bbox[1]],
         "points": [[bbox[2], bbox[1]], [bbox[0], bbox[3]]], "axis": "both",
+        "positions": positions,
     })
     assert ordinate["ok"] and ordinate["count"] >= 2, ordinate
+    stored = [_the_annotation(dwg, "v2", ann_id) for ann_id in ordinate["annotations"]]
+    assert [ann["pos"] for ann in stored] == positions["x"] + positions["y"], stored
     balloon = _call("add_balloon", {
         "doc_id": dwg, "view_id": "top", "a": [bbox[0], bbox[1]], "item": 1,
     })
@@ -2098,3 +2118,387 @@ def test_extended_view_and_section_controls_reach_the_engine():
     })
     assert plane["ok"], plane
     assert plane["plane"]["point"] == [0.0, 0.0, 3.0]
+
+
+def test_dogfood_audit_identity_and_callout(monkeypatch):
+    source = _call("new_part", {"name": "custom_bore_audit"})["doc_id"]
+    added = _call("add_features", {"doc_id": source, "ops": [
+        cb.feat("box", "Plate", {"length": cb.dim(60), "width": cb.dim(40),
+                                   "height": cb.dim(10)}),
+        cb.feat("hole", "Custom Bore", {"style": "simple", "standard": "custom",
+                                          "diameter": cb.dim(5), "end": "through_all"},
+                {"face": {"of": "face", "side": "top"}}),
+    ]})
+    assert added["ok"], added
+    bore = next(f for f in cb.call("doc_tree", {"doc_id": source})["tree"]["features"]
+                if f["name"] == "Custom Bore")
+    made = _call("make_drawing", {"doc_id": source, "views": ["front", "top"],
+                                   "model_items": False, "hole_callouts": False})
+    assert made["ok"], made
+    dwg = made["drawing_doc_id"]
+    front = next(vid for vid, orientation in made["views"].items() if orientation == "front")
+    top = next(vid for vid, orientation in made["views"].items() if orientation == "top")
+
+    for vid, tolerance in ((front, 0.1), (top, 0.2)):
+        bb = _view(dwg, vid)["bbox"]
+        dim = _call("add_dimension", {
+            "doc_id": dwg, "view_id": vid, "a": [bb[0], bb[1]], "b": [bb[2], bb[1]],
+            "tol_type": "symmetric", "tol_upper": tolerance,
+        })
+        assert dim["ok"] and dim["annotation"] == "a1", dim
+
+    circle = next(arc for arc in _view(dwg, top)["arcs"]
+                  if arc.get("closed") and
+                  abs(arc["radius"] / _view(dwg, top)["scale"] - 2.5) < 1e-4)
+    callout = _call("add_hole_callout", {
+        "doc_id": dwg, "view_id": top, "a": circle["center"], "feature_ref": bore["id"],
+    })
+    assert callout["ok"], callout
+    stored = _the_annotation(dwg, top, callout["annotation"])
+    assert stored["hole_type"] == "simple" and abs(stored["value"] - 5) < 1e-6, stored
+    assert not stored.get("thread"), stored
+
+    spec = {"requirements": [
+        {"requirement_id": "front", "type": "dimension_tolerance",
+         "view_id": front, "annotation_id": "a1", "tol_upper": 0.1},
+        {"requirement_id": "top", "type": "dimension_tolerance",
+         "view_id": top, "annotation_id": "a1", "tol_upper": 0.2},
+        {"requirement_id": "wrong-view", "type": "dimension_tolerance",
+         "view_id": front, "annotation_id": "a1", "tol_upper": 0.2},
+        {"requirement_id": "legacy", "type": "dimension_tolerance",
+         "annotation_id": "a1", "tol_upper": 0.1},
+    ]}
+    audit = _call("audit_drawing", {"doc_id": source, "drawing_id": dwg, "spec": spec})
+    by_req = {row["requirement_id"]: row for row in audit["coverage_matrix"]}
+    assert by_req["front"]["status"] == "covered" and by_req["front"]["view_id"] == front
+    assert by_req["top"]["status"] == "covered" and by_req["top"]["view_id"] == top
+    assert by_req["wrong-view"]["status"] == "missing", audit
+    assert by_req["legacy"]["status"] == "ambiguous", audit
+    assert set(by_req["legacy"]["candidate_view_ids"]) == {front, top}
+    assert audit["covered"] == sum(row["status"] == "covered" for row in audit["coverage_matrix"]), audit
+    assert audit["total"] == len(audit["coverage_matrix"]), audit
+    assert audit["verdict"] == "not_release_ready", audit
+    assert not [f for f in audit["standards_failures"] if f["check"] == "thread_callout"], audit
+
+    # A standards finding on one view must not suppress the same local id on another.
+    full = cb.call("drawing_get", {"doc_id": dwg})
+    for view in full["sheets"][0]["views"]:
+        if view.get("view_id") in {front, top}:
+            view["annotations"] = [{"id": "a1", "kind": "hole_callout",
+                                     "hole_type": "tapped", "text": "DIA 5"}]
+    findings = _audit_with_full(
+        monkeypatch, dwg, source, full,
+        {"requirements": [{"type": "title_field", "field": "title"}]})
+    invalid = [f for f in findings["standards_failures"]
+               if f["code"] == "thread_designation_invalid" and f["source"] == "annotation"]
+    assert {f["view_id"] for f in invalid} == {front, top}, findings
+
+
+def test_dogfood_patch_and_scale_truth():
+    source = _cube(40)
+    made = _call("make_drawing", {"doc_id": source, "views": ["front", "top"],
+                                   "model_items": False, "hole_callouts": False, "scale": 2})
+    assert made["ok"], made
+    dwg = made["drawing_doc_id"]
+    front = next(vid for vid, orientation in made["views"].items() if orientation == "front")
+    bb = _view(dwg, front)["bbox"]
+    dim = _call("add_dimension", {
+        "doc_id": dwg, "view_id": front, "a": [bb[0], bb[1]], "b": [bb[2], bb[1]],
+        "tol_type": "deviation", "tol_upper": 0.02, "tol_lower": 0.05,
+    })
+    assert dim["ok"], dim
+    ann_id = dim["annotation"]
+    before = cb.call("drawing_get", {"doc_id": dwg})
+    annotation_before = _the_annotation(dwg, front, ann_id)
+    refused = _call("edit_drawing_annotation", {
+        "doc_id": dwg, "view_id": front, "annotation_id": ann_id,
+        "fields": {"tol_upper": None, "suffix": " MUST NOT APPLY"},
+    })
+    assert not refused["ok"] and "tol_upper" in refused["error"], refused
+    assert _the_annotation(dwg, front, ann_id) == annotation_before
+    assert cb.call("drawing_get", {"doc_id": dwg})["revision"] == before["revision"]
+
+    with pytest.raises(cb.CoreError):
+        cb.call("drawing_set_annotation", {
+            "doc_id": dwg, "view_id": front, "ann_id": ann_id,
+            "patch": {"tol_lower": None, "suffix": " MUST NOT APPLY"},
+        })
+    assert _the_annotation(dwg, front, ann_id) == annotation_before
+    assert cb.call("drawing_get", {"doc_id": dwg})["revision"] == before["revision"]
+    changed = _call("edit_drawing_annotation", {
+        "doc_id": dwg, "view_id": front, "annotation_id": ann_id,
+        "fields": {"tol_type": "none", "suffix": " CHECKED"},
+    })
+    assert changed["ok"] and changed["fields_set"] == ["suffix", "tol_type"], changed
+    assert changed["annotation"]["tol_type"] == "none"
+    assert changed["annotation"]["text"].endswith(" CHECKED"), changed
+
+    title = _call("set_titleblock", {"doc_id": dwg, "fields": {"scale": "1:1"}})
+    assert any("scale" in warning.lower() for warning in title.get("warnings", [])), title
+    audit = _call("audit_drawing", {
+        "doc_id": source, "drawing_id": dwg,
+        "spec": {"requirements": [{"type": "title_field", "field": "scale"}]},
+    })
+    findings = [f for f in audit["standards_failures"] if f["code"] == "view_scale_mismatch"]
+    assert {f["view_id"] for f in findings} == set(made["views"]), audit
+    assert all(f["view_scale"] == 2 and f["printed_scale"] == "1:1" for f in findings)
+    assert audit["verdict"] == "not_release_ready", audit
+
+    auto = _call("make_drawing", {"doc_id": source, "views": ["front"], "model_items": False,
+                                   "hole_callouts": False, "title": {"scale": "37:1"}})
+    assert auto["ok"] and any("scale" in w.lower() for w in auto.get("warnings", [])), auto
+
+
+def test_scale_audit_respects_separately_labelled_views():
+    from services.mcp.cad_drawing_tools import _drawing_scale_findings
+
+    full = {"sheets": [{"id": "s1", "title_block": {"scale": "1:1"}, "views": [
+        {"view_id": "v1", "type": "base", "orientation": "front", "scale": 1},
+        {"view_id": "v2", "type": "detail", "orientation": "detail", "scale": 4},
+        {"view_id": "v3", "type": "iso", "orientation": "iso", "scale": 0.5,
+         "caption": "SCALE 1:2"},
+        {"view_id": "v4", "type": "section", "orientation": "section", "scale": 2},
+    ]}]}
+    findings = _drawing_scale_findings(full)
+    assert [row["view_id"] for row in findings] == ["v4"], findings
+    full["sheets"][0]["views"][2]["caption"] = "SCALE 1:5"
+    findings = _drawing_scale_findings(full)
+    assert {row["view_id"] for row in findings} == {"v3", "v4"}, findings
+
+
+def test_drawing_export_resolves_project_relative_and_absolute_paths(tmp_path, monkeypatch):
+    from services.agent.request_context import bind_roots
+
+    dwg, _ = _sheet_drawing()
+    project, worker = tmp_path / "project", tmp_path / "worker"
+    project.mkdir()
+    worker.mkdir()
+    monkeypatch.chdir(worker)
+    # Request-scoped root wins even if the worker environment names a different root.
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(worker))
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(worker))
+    with bind_roots(str(project)):
+        result = _call("export_drawing", {
+            "doc_id": dwg, "path": "parts/enclosure-drawing.pdf", "companions": ["dxf"],
+        })
+    expected = [project / "parts/enclosure-drawing.pdf", project / "parts/enclosure-drawing.dxf"]
+    assert result["ok"] and result["paths"] == [str(p) for p in expected], result
+    assert all(p.is_file() and p.stat().st_size > 0 for p in expected)
+    assert not (worker / "parts").exists()
+
+    monkeypatch.delenv("CHUDWARE_PROJECT_DIR")
+    monkeypatch.delenv("CHUDWARE_FS_ROOT")
+    absolute = tmp_path / "external" / "sheet.pdf"
+    result = _call("export_drawing", {
+        "doc_id": dwg, "path": str(absolute), "companions": ["dxf"],
+    })
+    assert result["ok"], result
+    assert result["paths"] == [str(absolute), str(absolute.with_suffix(".dxf"))], result
+    assert absolute.is_file() and absolute.with_suffix(".dxf").is_file()
+
+    refused = _call("export_drawing", {
+        "doc_id": dwg, "path": "missing-root.pdf", "companions": ["dxf"],
+    })
+    assert not refused["ok"] and "ABSOLUTE" in refused["error"], refused
+    assert not (worker / "missing-root.pdf").exists()
+    assert not (worker / "missing-root.dxf").exists()
+
+
+def test_drawing_export_refuses_sensitive_main_and_companion_before_writing(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    parts = project / "parts"
+    secrets = tmp_path / ".ssh"
+    parts.mkdir(parents=True)
+    secrets.mkdir()
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(project))
+    dwg, _ = _sheet_drawing()
+
+    direct = _call("export_drawing", {
+        "doc_id": dwg, "path": str(secrets / "drawing.pdf"), "companions": ["dxf"],
+    })
+    assert not direct["ok"] and "credential/key location" in direct["error"], direct
+    (parts / "drawing.dxf").symlink_to(secrets / "drawing.dxf")
+    companion = _call("export_drawing", {
+        "doc_id": dwg, "path": "parts/drawing.pdf", "companions": ["dxf"],
+    })
+    assert not companion["ok"] and "credential/key location" in companion["error"], companion
+    assert not (parts / "drawing.pdf").exists()
+    assert not list(secrets.iterdir())
+
+    # The engine derives *_s1.svg and *_s2.svg for a multi-sheet SVG companion.
+    sheet = _call("add_drawing_sheet", {"doc_id": dwg, "size": "A4", "name": "EXTRA"})
+    assert sheet["ok"], sheet
+    (parts / "multi_s2.svg").symlink_to(secrets / "multi_s2.svg")
+    multi = _call("export_drawing", {
+        "doc_id": dwg, "path": "parts/multi.pdf", "sheet": "all", "companions": ["svg"],
+    })
+    assert not multi["ok"] and "credential/key location" in multi["error"], multi
+    assert not (parts / "multi.pdf").exists()
+    assert not list(secrets.iterdir())
+    (parts / "multi_s2.svg").unlink()
+    exported = _call("export_drawing", {
+        "doc_id": dwg, "path": "parts/multi.pdf", "companions": ["svg"],
+    })
+    expected = [parts / "multi.pdf", parts / "multi_s1.svg", parts / "multi_s2.svg"]
+    assert exported["ok"] and exported["paths"] == [str(p) for p in expected], exported
+    assert all(p.is_file() and p.stat().st_size > 0 for p in expected)
+    svg = _call("export_drawing", {"doc_id": dwg, "path": "parts/views.svg"})
+    assert svg["ok"] and svg["page_count"] == 2, svg
+    assert svg["exported_sheets"] == ["s1", "s2"] and len(svg["sheet_mm_all"]) == 2, svg
+    assert svg["paths"] == [str(parts / "views_s1.svg"), str(parts / "views_s2.svg")], svg
+
+
+def test_drawing_export_simultaneous_request_roots_are_isolated(tmp_path, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from services.agent.request_context import bind_roots
+    from services.mcp import cad_drawing_tools as drawing
+
+    class Registry:
+        def __init__(self):
+            self.tools = {}
+
+        def tool(self):
+            def register(fn):
+                self.tools[fn.__name__] = fn
+                return fn
+            return register
+
+    roots = [tmp_path / "first", tmp_path / "second"]
+    for root in roots:
+        root.mkdir()
+    worker = tmp_path / "worker"
+    worker.mkdir()
+    monkeypatch.chdir(worker)
+    registry = Registry()
+    drawing.register_cad_drawing_tools(registry)
+    barrier = threading.Barrier(2)
+
+    def export(root):
+        with bind_roots(str(root)):
+            barrier.wait(timeout=10)
+            return json.loads(registry.tools["export_drawing"](
+                doc_id="dwg", path="parts/sheet.pdf", companions=["dxf"]))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(drawing, "_doc", lambda doc_id: doc_id)
+        patch.setattr(drawing.cb, "call", lambda method, params: {"path": params["path"]})
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(export, roots))
+    for root, result in zip(roots, results):
+        assert result["ok"], result
+        assert result["paths"] == [str(root / "parts/sheet.pdf"),
+                                    str(root / "parts/sheet.dxf")], result
+
+
+def test_audit_derives_missing_holes_from_the_model():
+    source = _plate_with_hole()
+    dwg, view_id, center = _drawing_with_circle(source)
+    spec = {"requirements": [{"type": "title_field", "field": "title"}]}
+    before = _call("audit_drawing", {"doc_id": source, "drawing_id": dwg, "spec": spec})
+    bore_rows = [row for row in before["coverage_matrix"]
+                 if row["requirement_id"].startswith("model:bore:")]
+    assert bore_rows and all(row["status"] == "missing" for row in bore_rows), before
+    callout = _call("add_hole_callout", {"doc_id": dwg, "view_id": view_id, "a": center})
+    assert callout["ok"], callout
+    after = _call("audit_drawing", {"doc_id": source, "drawing_id": dwg, "spec": spec})
+    bore_rows = [row for row in after["coverage_matrix"]
+                 if row["requirement_id"].startswith("model:bore:")]
+    assert bore_rows and all(row["status"] == "covered" for row in bore_rows), after
+
+
+def test_audit_checks_title_block_on_every_sheet():
+    source = _plain_plate()
+    made = _a_drawing(source)
+    dwg = made["drawing_doc_id"]
+    added = _call("add_drawing_sheet", {"doc_id": dwg, "name": "Sheet 2"})
+    assert added["ok"], added
+    sheet_id = added["sheet_id"]
+    title = _call("set_titleblock", {"doc_id": dwg, "sheet_id": sheet_id,
+                                      "fields": {"title": "SECOND SHEET"}})
+    assert title["ok"] and title["title_block"]["title"] == "SECOND SHEET", title
+    audit = _call("audit_drawing", {"doc_id": source, "drawing_id": dwg,
+                                    "spec": [{"type": "title_field", "field": "title"}]})
+    assert any(f.get("sheet_id") == sheet_id and f.get("code") == "title_field_missing"
+               for f in audit["standards"]["failures"]), audit
+
+
+def test_angular_dimension_accepts_two_model_line_targets():
+    source = _plain_plate()
+    made = _a_drawing(source)
+    dwg = made["drawing_doc_id"]
+    view = cb.call("drawing_get", {"doc_id": dwg})["sheets"][0]["views"][0]
+    lines = [(line, src["sid"]) for line, src in
+             zip(view["visible"], view["visible_src"])
+             if len(line) == 2 and src.get("sid")]
+    for line1, sid1 in lines:
+        dx1, dy1 = line1[1][0] - line1[0][0], line1[1][1] - line1[0][1]
+        for line2, sid2 in lines:
+            dx2, dy2 = line2[1][0] - line2[0][0], line2[1][1] - line2[0][1]
+            if sid1 != sid2 and abs(dx1 * dx2 + dy1 * dy2) < 1e-7:
+                result = _call("add_dimension", {"doc_id": dwg, "view_id": view["view_id"],
+                               "dtype": "angular_dim", "a": sid1, "b": sid2})
+                assert result["ok"] and result["value"] == pytest.approx(90), result
+                assert result["stale"] is False, result
+                return
+    pytest.fail("fixture has no visible perpendicular model edges")
+
+
+def test_linear_dimension_between_parallel_model_faces():
+    source = _plain_plate()
+    made = _a_drawing(source)
+    dwg = made["drawing_doc_id"]
+    faces = cb.call("doc_query", {"doc_id": source, "query": {"of": "face"}})["matches"]
+    left = next(f for f in faces if f.get("side") == "left")
+    right = next(f for f in faces if f.get("side") == "right")
+    result = _call("add_dimension", {"doc_id": dwg, "view_id": "front",
+                   "dtype": "linear_dim", "a": left["sid"], "b": right["sid"]})
+    assert result["ok"] and result["value"] == pytest.approx(90), result
+    assert result["stale"] is False, result
+
+
+def test_datum_and_surface_finish_reject_invalid_values_without_adding_symbols():
+    dwg, _ = _sheet_drawing()
+    before = len(_stored_annotations(dwg, "v2"))
+    datum = _call("add_datum", {"doc_id": dwg, "view_id": "top",
+                                "label": "A1", "a": [100, 100], "pos": [110, 110]})
+    finish = _call("add_surface_finish", {"doc_id": dwg, "view_id": "top",
+                   "ra": "1.6", "a": [100, 100], "pos": [110, 110],
+                   "machining": "sometimes"})
+    assert datum["ok"] is False, datum
+    assert finish["ok"] is False, finish
+    assert len(_stored_annotations(dwg, "v2")) == before
+
+
+def test_review_removes_rendered_temporary_png(tmp_path, monkeypatch):
+    from services.mcp import cad_drawing_tools
+    dwg, _ = _sheet_drawing()
+    path = tmp_path / "review.png"
+    monkeypatch.setattr(cad_drawing_tools, "_tmp", lambda suffix: str(path))
+    summary = _review_summary(dwg)
+    assert isinstance(summary["layout_clean"], bool), summary
+    assert not path.exists()
+
+
+def test_make_drawing_counts_and_reports_a_missing_requested_section():
+    source = _plain_plate()
+    made = _call("make_drawing", {"doc_id": source, "views": ["front"],
+                                  "model_items": True, "hole_callouts": False,
+                                  "sections": [{"parent": "missing-view", "axis": "vertical"}]})
+    assert made["ok"], made
+    assert made["auto_dimensions_added"] > 0, made
+    assert made["sections_added"] == 0, made
+    assert made.get("warnings"), made
+
+
+def test_audit_flags_numeric_override_that_disagrees_with_model():
+    source = _plate_with_hole()
+    dwg, view_id, center = _drawing_with_circle(source)
+    dim = _call("add_dimension", {"doc_id": dwg, "view_id": view_id, "a": center,
+                                   "dtype": "diameter_dim", "text": "999"})
+    assert dim["ok"] and dim["overridden"], dim
+    audit = _call("audit_drawing", {"doc_id": source, "drawing_id": dwg,
+                                    "spec": [{"type": "title_field", "field": "title"}]})
+    assert any(f.get("code") == "dimension_override_mismatch"
+               and f.get("annotation_id") == dim["annotation"]
+               for f in audit["standards"]["failures"]), audit

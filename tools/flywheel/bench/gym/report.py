@@ -7,9 +7,9 @@ Consumes a :class:`~tools.flywheel.bench.gym.runner.CycleResult` and produces:
     (never a prompt-wording change; those are lead-owned and surfaced as findings).
 
 Dial knobs the recommender may touch (all config/data):
-  * ``CHUDWARE_COUNCIL_FEATURE_THRESHOLD`` env / councils._DEFAULT_FEATURE_THRESHOLD
+  * ``CHUDWARE_DESIGN_PIPELINE`` env (PipelineFlags.design_pipeline)
   * tiers.yaml per-slot ``budgets`` (advisory/ledger/state), ``deliberation``,
-    ``playbook_enforcement``, ``max_tools_per_role``
+    ``capability_profile``, ``tool_schema_trim``
   * trigger-pack enablement (advisor advisory injection)
   * gym ``grind_threshold`` (anti-grind sensitivity)
 
@@ -29,17 +29,18 @@ from .taxonomy import TAXONOMY, misuse_fingerprints, _tool_call_events, _call_su
 # levers are deliberately excluded (lead-owned; see LEAD_LEVERS).
 CLASS_TO_DIAL: dict[str, dict[str, str]] = {
     "wrong_question": {
-        "knob": "playbook_enforcement / clarifier batch gate",
-        "action": "keep step_locked on local tiers; ensure the clarifier playbook's "
-                  "blocking-ambiguity check is enforced before Phase 2 (config, not prose)",
+        "knob": "tiers.yaml capability_profile / clarifier batch gate",
+        "action": "keep capability profile A (scaffold-hard) on local tiers; ensure the "
+                  "clarifier's blocking-ambiguity check is enforced before Phase 2 (config, not prose)",
     },
     "incoherent_geometry": {
-        "knob": "CHUDWARE_COUNCIL_FEATURE_THRESHOLD",
-        "action": "lower the build-strategy-council feature threshold so more parts get "
-                  "the four-seat review before build (more machinery for weaker models)",
+        "knob": "CHUDWARE_DESIGN_PIPELINE (PipelineFlags.design_pipeline)",
+        "action": "enable the six-stage design-pipeline refinement (DECOMPOSE→GEOMETRY→"
+                  "LINKAGE→BUILDPATH) so geometry is planned and gated before build "
+                  "(more machinery for weaker models)",
     },
     "tool_misuse": {
-        "knob": "tiers.yaml max_tools_per_role / tool_schema_trim",
+        "knob": "role tool_allowlist / tiers.yaml tool_schema_trim",
         "action": "tighten the per-role tool allowlist so the wrong tool is not in scope; "
                   "keep preflight on (config), and enable the tool-choice trigger pack",
     },
@@ -408,7 +409,7 @@ def _phase_mortality(cells: list[dict]) -> dict[str, Any]:
         # infer stop phase from stop_reason prefix (e.g. specify_incomplete)
         stop_phase = ""
         for cand in ("intake", "clarify", "specify", "plan", "build", "verify",
-                     "deliver", "correct", "organize", "decompose", "geometry"):
+                     "deliver", "correct", "decompose", "geometry"):
             if cand in stop.lower():
                 stop_phase = cand
                 break
@@ -722,7 +723,7 @@ def render_markdown(report: dict[str, Any]) -> str:
                  "below). Pass rates and taxonomy counts are the harness + classifier "
                  "exercised end to end on labeled fixtures. A model-behaviour DELTA from a "
                  "dial change is only measurable once a real model is provisioned; "
-                 "structural-dial deltas (council threshold, budgets) ARE real.")
+                 "structural-dial deltas (grind threshold, budgets) ARE real.")
         L.append("")
         L.append("> TIER IS A PASS-THROUGH DIMENSION IN MOCK MODE: scripted turns are "
                  "tier-invariant, so a challenge's `local-24k` and `frontier-200k` rows "

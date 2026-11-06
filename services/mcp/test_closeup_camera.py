@@ -23,11 +23,27 @@ def _corners(bb):
             for y in (bb["min"][1], bb["max"][1]) for z in (bb["min"][2], bb["max"][2])]
 
 
+def _perspective_frame(camera):
+    pos = np.asarray(camera["position"], dtype=float)
+    target = np.asarray(camera["target"], dtype=float)
+    forward = (target - pos) / np.linalg.norm(target - pos)
+    right = np.cross(forward, camera["up"])
+    right /= np.linalg.norm(right)
+    up = np.cross(right, forward)
+    width, height = camera["width"], camera["height"]
+    focal = height * 0.5 / math.tan(math.radians(camera["vertical_fov_deg"]) / 2)
+    depth = np.dot(target - pos, forward)
+    return {"projection": "perspective", "position": pos, "r": right, "u": up,
+            "f": forward, "focal": focal, "cx": width / 2, "cy": height / 2,
+            "near": camera["near"], "far": camera["far"], "W": width, "H": height,
+            "target_depth": depth, "scale": focal / depth}
+
+
 @pytest.mark.parametrize("view_dir", [(1, 1, 0.8), (0, -1, 0), (0, 0, 1), (-0.3, 0.2, -1)])
 def test_fit_distance_frames_every_corner_inside_the_margin(view_dir):
     W, H, margin = 512, 384, 0.35
     cam = vp.perspective_camera(_BOX, view_dir, W, H, margin=margin)
-    S = vp.perspective_project(_corners(_BOX), vp.perspective_frame(cam))
+    S = vp.perspective_project(_corners(_BOX), _perspective_frame(cam))
     fill = 1.0 / (1.0 + 2.0 * margin)
     # Every corner lands inside the padded frame, and the binding corner touches it.
     dx = np.abs(S[:, 0] - W / 2) / (W / 2)
@@ -42,7 +58,7 @@ def test_fit_distance_frames_every_corner_inside_the_margin(view_dir):
 
 def test_nearer_is_bigger_and_depth_is_reciprocal():
     cam = vp.perspective_camera(_BOX, (0, -1, 0), 400, 400, fov_deg=40)
-    fr = vp.perspective_frame(cam)
+    fr = _perspective_frame(cam)
     near_pt, far_pt = [(5.0, -5.0, 4.0)], [(5.0, 5.0, 4.0)]
     s_near, s_far = vp.perspective_project(near_pt, fr)[0], vp.perspective_project(far_pt, fr)[0]
     assert abs(s_near[0] - 200) > abs(s_far[0] - 200)          # same x offset, nearer = wider
@@ -63,13 +79,13 @@ def test_cutaway_near_plane_sits_just_in_front_of_the_target():
     front_depth = cam["distance"] - 4.0                           # box top is 4 mm above centre
     assert cam["near"] < front_depth
     assert cam["near"] > front_depth - 0.05 * 2 * math.dist(_BOX["min"], _BOX["max"])
-    behind = vp.perspective_project([(0.0, 0.0, 30.0)], vp.perspective_frame(cam))[0]
+    behind = vp.perspective_project([(0.0, 0.0, 30.0)], _perspective_frame(cam))[0]
     assert math.isnan(behind[0]) and behind[2] == -1e30          # cut away: never wins a z-test
 
 
 def test_echo_frame_matches_the_locally_built_frame():
     cam = vp.perspective_camera(_BOX, (1, 1, 0.8), 512, 384)
-    local = vp.perspective_frame(cam)
+    local = _perspective_frame(cam)
     echo = {"projection": "perspective", "position": cam["position"],
             "right": local["r"], "up": local["u"], "forward": local["f"],
             "focal_length_px": local["focal"], "principal_x_px": 256.0,
@@ -107,7 +123,7 @@ def test_battery_flags_each_detached_feature_with_its_closeup_call():
     with mock.patch("services.mcp.core_bridge.call", side_effect=call), \
             mock.patch.object(battery, "_is_drawing_doc", return_value=False):
         out = battery.verify("d1", ["attachment"])
-    assert out["scores"]["feature_attachment"] < 1.0
+    assert out["scores"]["feature_attachment"] == 0.0
     details = [f["detail"] for f in out["findings"]]
     assert any(d.startswith('f5 "Rib"') and 'target="f5"' in d for d in details)
     # The floating tab sits toward -Y (front): the suggested camera looks from the front.

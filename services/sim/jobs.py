@@ -23,6 +23,9 @@ The child runs with ``CHUDWARE_ENGINE_DAEMON=0`` (its own in-process ``libchudwa
 daemon, killing the child would leave the daemon still solving and the cancel would be a
 lie. The child opens no documents — a solve payload is self-contained (an exported STEP
 path plus a JSON study), so nothing is lost by not sharing the daemon's doc table.
+Desktop children inherit the initiating turn's selected project, save and filesystem
+roots in their own environment, including when the turn ends before the job completes.
+The parent process environment is not modified.
 
 STAGES
 ------
@@ -951,6 +954,13 @@ def start(kind: str, stage: str, payload: dict, meta: Optional[dict] = None) -> 
     env["PYTHONUNBUFFERED"] = "1"
     if _rc.in_cell():
         env["CHUDWARE_CELL"] = "1"
+    else:
+        # ContextVars are not inherited across exec. Give this child the
+        # initiating turn's exact roots without changing the worker environment
+        # shared by concurrent conversations.
+        for name in ("CHUDWARE_PROJECT_DIR", "CHUDWARE_PROJECT_SAVE_DIR",
+                     "CHUDWARE_FS_ROOT"):
+            env[name] = _rc.root_value(name)
     repo_root = Path(__file__).resolve().parents[2]
     env["PYTHONPATH"] = os.pathsep.join(
         [str(repo_root), env.get("PYTHONPATH", "")]).rstrip(os.pathsep)

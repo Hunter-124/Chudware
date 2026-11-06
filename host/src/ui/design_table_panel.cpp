@@ -307,10 +307,8 @@ void DesignTablePanel::draw(AppState& st) {
                       (int)names_.size(), names_.size() == 1 ? "" : "s",
                       (int)columns_.size(), columns_.size() == 1 ? "" : "s");
 
-    const bool busy = st.anyRunActive() || st.agentV2Running;
 
     // ---- toolbar: Add Config / Delete / Activate / Add Column ----
-    if (busy) ImGui::BeginDisabled();
     if (ui::kit::secondaryButton("Add Config...")) {
         addCfgOpen_ = true;
         addCfgName_[0] = 0;
@@ -337,8 +335,6 @@ void DesignTablePanel::draw(AppState& st) {
     }
     ImGui::SameLine();
     if (ui::kit::secondaryButton("Add Column...")) { addOpen_ = true; ImGui::OpenPopup("##addcol"); }
-    if (busy) ImGui::EndDisabled();
-    if (busy) ui::kit::dimText("Model update in progress.");
 
     // ---- add-column popup: candidate dims + suppression entries from the live model ----
     if (ImGui::BeginPopup("##addcol")) {
@@ -461,7 +457,7 @@ void DesignTablePanel::draw(AppState& st) {
             if (isActive) ImGui::PopStyleColor();
             if (clicked) {
                 selectedRow_ = row;
-                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && !isActive && !busy)
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && !isActive)
                     runConfigOp(st, "config_activate", {{"name", name}});
             }
 
@@ -481,12 +477,10 @@ void DesignTablePanel::draw(AppState& st) {
                             if (e != sIt->end() && e->is_boolean()) sup = e->get<bool>();
                         }
                     }
-                    if (busy) ImGui::BeginDisabled();
                     if (ImGui::Checkbox("##sup", &sup))
                         runConfigOp(st, "config_set_suppression",
                                     {{"name", name}, {"feature_id", c.featureId},
                                      {"suppressed", sup}});
-                    if (busy) ImGui::EndDisabled();
                 } else {
                     // Numeric param cell: blank = inherits base; an entered value sets the override;
                     // clearing it reverts to base (config_set_override clear:true).
@@ -515,15 +509,13 @@ void DesignTablePanel::draw(AppState& st) {
                     }
                     const std::string orig(buf);  // displayed override string before this edit
                     ImGui::SetNextItemWidth(-1);
-                    if (busy) ImGui::BeginDisabled();
                     const bool committed = ImGui::InputTextWithHint(
                         "##cell", placeholder.c_str(), buf, sizeof(buf),
                         ImGuiInputTextFlags_EnterReturnsTrue);
                     const bool deactivated = ImGui::IsItemDeactivatedAfterEdit();
-                    if (busy) ImGui::EndDisabled();
                     // Only write when the buffer actually changed: a bare focus-in/out must NOT
                     // re-issue an override (which would push a redundant undo step + rebuild).
-                    if ((committed || deactivated) && !busy && orig != std::string(buf)) {
+                    if ((committed || deactivated) && orig != std::string(buf)) {
                         std::string text(buf);
                         // Trim surrounding whitespace.
                         size_t a = text.find_first_not_of(" \t");

@@ -230,17 +230,18 @@ ChipGeom chipGeom(const char* label, bool withDot) {
 }
 
 // ---- 3D preview slots ---------------------------------------------------------------------------
-constexpr int kSlotCount = 6;   // None, SparseCloud, Splat, Mesh, Deviation, Parametric
-struct SlotRec {
-    ImRect rect;
-    ImRect clip;
-    bool   drawn = false;
-};
-SlotRec g_slots[kSlotCount];
+PreviewSlotPainter g_slotPainter = nullptr;
 
-inline int slotIndex(PreviewSlot s) {
-    const int i = (int)s;
-    return (i >= 0 && i < kSlotCount) ? i : 0;
+struct SlotPaint {
+    PreviewSlot slot;
+    ImRect      rect;
+    ImRect      clip;
+};
+
+// ImGui copies the SlotPaint into the draw list; the callback runs inside RenderDrawData.
+void paintSlotCallback(const ImDrawList*, const ImDrawCmd* cmd) {
+    const SlotPaint* paint = static_cast<const SlotPaint*>(cmd->UserCallbackData);
+    if (g_slotPainter && paint) g_slotPainter(paint->slot, paint->rect, paint->clip);
 }
 
 // ---- wrapped paragraph (CapabilityRow's always-visible fix-it hint) -----------------------------
@@ -353,7 +354,7 @@ void HonestyTag(const char* tier, const char* detail) {
     const char* t = (tier && tier[0]) ? tier : "unknown";
 
     Level       l   = Level::Neutral;
-    const char* why = "Provenance was not recorded for this value — treat it as unverified.";
+    const char* why = "Where this value came from was not recorded — treat it as unverified.";
     if (std::strcmp(t, "exact") == 0) {
         l   = Level::Ok;
         why = "Exact — read directly from a measured, dimensioned source (datasheet table, "
@@ -768,34 +769,20 @@ ImRect Viewport3DPreview(const char* id, const ImVec2& box, PreviewSlot slot,
     }
 
     const ImRect r(p0, p1);
-    SlotRec&     rec = g_slots[slotIndex(slot)];
-    rec.rect  = r;
-    rec.clip = r;
-    rec.clip.ClipWith(ImRect(dl->GetClipRectMin(), dl->GetClipRectMax()));
-    rec.drawn = true;
+    ImRect clip = r;
+    clip.ClipWith(ImRect(dl->GetClipRectMin(), dl->GetClipRectMax()));
+    if (slot != PreviewSlot::None && g_slotPainter && clip.GetWidth() > 0.0f &&
+        clip.GetHeight() > 0.0f) {
+        SlotPaint paint{slot, r, clip};
+        dl->AddCallback(paintSlotCallback, &paint, sizeof(paint));
+        dl->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
+    }
 
     ImGui::PopID();
     return r;
 }
 
-bool previewSlotRect(PreviewSlot slot, ImRect& out) {
-    const SlotRec& rec = g_slots[slotIndex(slot)];
-    if (!rec.drawn) return false;
-    out = rec.rect;
-    return true;
-}
-
-bool previewSlotClip(PreviewSlot slot, ImRect& out) {
-    const SlotRec& rec = g_slots[slotIndex(slot)];
-    if (!rec.drawn || rec.clip.GetWidth() <= 0.0f || rec.clip.GetHeight() <= 0.0f)
-        return false;
-    out = rec.clip;
-    return true;
-}
-
-void resetPreviewSlots() {
-    for (int i = 0; i < kSlotCount; ++i) g_slots[i].drawn = false;
-}
+void setPreviewSlotPainter(PreviewSlotPainter painter) { g_slotPainter = painter; }
 
 // =================================================================================================
 // empty / error states -> ui::kit::emptyState / blockedState

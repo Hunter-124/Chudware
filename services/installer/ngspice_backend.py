@@ -34,6 +34,7 @@ from __future__ import annotations
 import math
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -390,7 +391,81 @@ _TF_PATTERNS = {
 }
 
 
-def simulate_ngspice(circuit: dict, study: dict) -> dict:
+def prepare_kicad_netlist(text: str, project_dir: str) -> str:
+    """Inline model libraries and retain data cards, never ngspice control scripts."""
+    allowed = {".subckt", ".ends", ".model", ".param", ".func", ".global",
+               ".options", ".option", ".ic", ".nodeset", ".temp"}
+    discarded = {".end", ".title", ".op", ".dc", ".tran", ".ac", ".tf", ".save", ".probe"}
+    total = 0
+
+    def expand(source: str, base: str, stack: tuple[str, ...], section: str = "") -> list[str]:
+        nonlocal total
+        total += len(source.encode("utf-8"))
+        if total > 8 * 1024 * 1024 or len(stack) > 16:
+            raise NgspiceError("KiCad SPICE netlist and includes exceed the safety limit")
+        lines = source.splitlines()
+        if section:
+            selected: list[str] = []
+            inside = False
+            found = False
+            for line in lines:
+                words = line.strip().split()
+                directive = words[0].lower() if words else ""
+                if directive == ".lib" and len(words) == 2:
+                    inside = words[1].strip("'\"").lower() == section.lower()
+                    found = found or inside
+                    continue
+                if directive == ".endl":
+                    inside = False
+                    continue
+                if inside:
+                    selected.append(line)
+            if not found:
+                raise NgspiceError(f"SPICE library section {section!r} not found")
+            lines = selected
+        out: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if "\x00" in line:
+                raise NgspiceError("NUL in KiCad SPICE netlist")
+            if not stripped or stripped.startswith(("*", "+")):
+                out.append(line)
+                continue
+            if not stripped.startswith("."):
+                out.append(line)
+                continue
+            directive = stripped.split(None, 1)[0].lower()
+            if directive in (".include", ".inc", ".lib"):
+                try:
+                    words = shlex.split(stripped, posix=True)
+                except ValueError as exc:
+                    raise NgspiceError(f"invalid SPICE include: {exc}") from exc
+                if len(words) < 2 or len(words) > (3 if directive == ".lib" else 2):
+                    raise NgspiceError(f"invalid SPICE include: {line}")
+                filename = words[1].replace("${KIPRJMOD}", project_dir)
+                filename = os.path.realpath(os.path.join(base, os.path.expanduser(filename)))
+                if filename in stack:
+                    raise NgspiceError(f"recursive SPICE library include: {filename}")
+                try:
+                    with open(filename, encoding="utf-8") as model:
+                        contents = model.read(8 * 1024 * 1024 + 1)
+                except OSError as exc:
+                    raise NgspiceError(f"cannot read SPICE library {filename}: {exc}") from exc
+                out.extend(expand(contents, os.path.dirname(filename), stack + (filename,),
+                                  words[2] if len(words) == 3 else ""))
+            elif directive in discarded:
+                continue
+            elif directive in allowed:
+                out.append(line)
+            else:
+                raise NgspiceError(f"SPICE directive not permitted: {directive}")
+        return out
+
+    return "\n".join(["* KiCad schematic", *expand(text, project_dir, ())]) + "\n"
+
+
+def simulate_ngspice(circuit: dict, study: dict, *, netlist: str | None = None,
+                     project_dir: str = "") -> dict:
     """Run the study through ngspice; return a sim.md §4 result dict.
 
     Raises :class:`NgspiceError` on any subprocess/parse failure — the seam in
@@ -400,20 +475,28 @@ def simulate_ngspice(circuit: dict, study: dict) -> dict:
     log: list[str] = []
     result: dict = {"log": log, "convergence": {}}
     probes = list(study.get("probes", []))
-    if not probes:
+    if not probes and netlist is None:
         probes = _default_probes(circuit)
         if probes:
             log.append(f"probes: none specified — defaulting to all {len(probes)} "
                        "node/source outputs")
 
-    from services.sim.spice import _encode_spice_names
-    mapped_circuit, mapped_study, mapped_probes = _encode_spice_names(
-        circuit, {**study, "probes": probes})
+    if netlist is not None:
+        prepared = prepare_kicad_netlist(netlist, project_dir)
+        mapped_circuit = circuit
+        mapped_study = study
+        mapped_probes = {p: p for p in probes}
+    else:
+        from services.sim.spice import _encode_spice_names
+        mapped_circuit, mapped_study, mapped_probes = _encode_spice_names(
+            circuit, {**study, "probes": probes})
     for an, mapped_analysis in zip(study.get("analyses", []), mapped_study["analyses"]):
         atype = an.get("type")
         if atype not in SUPPORTED_ANALYSES:
             raise NgspiceError(f"unsupported analysis {atype!r}")
-        deck = _emit_deck_tokens(mapped_circuit, {"analyses": [mapped_analysis]})
+        deck = (prepared + _analysis_card(mapped_analysis) + "\n.end\n"
+                if netlist is not None else
+                _emit_deck_tokens(mapped_circuit, {"analyses": [mapped_analysis]}))
         want_raw = atype != "tf"
         raw_text, stdout = _run_ngspice(deck, want_raw)
 
@@ -434,6 +517,13 @@ def simulate_ngspice(circuit: dict, study: dict) -> dict:
             tail = "\n".join(stdout.splitlines()[-6:])
             raise NgspiceError(f"ngspice produced no rawfile for {atype}: {tail}")
         raw = _parse_rawfile(raw_text)
+        if netlist is not None and not probes:
+            names = raw["vars"] if atype == "op" else raw["vars"][1:]
+            probes = [name if name.lower().startswith(("v(", "i(")) else
+                      f"I({name[:-7]})" if name.lower().endswith("#branch") else
+                      f"V({name})" for name in names[:12]]
+            mapped_probes = {p: p for p in probes}
+            result["probes"] = probes
         n_pts = len(_scale_vec(raw))
         ok = n_pts > 0
 

@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <memory>
 #include <string>
 #include <unordered_map>
 
@@ -13,8 +14,12 @@
 #include "imgui_internal.h"     // ImRect (ui::adaptivePanel / ui::glassPanel rect argument)
 
 #include "appearance_common.h"
+#include "feature_tree.h"
 #include "layout.h"
 #include "metrics.h"
+#include "property_manager.h"
+#include "sketch_mode.h"
+#include "sketch3d_mode.h"
 #include "viewport_panel.h"
 #include "widgets/kit.h"
 #include "../core/app_state.h"
@@ -408,6 +413,7 @@ float EvaluateDialogs::requestedBodyAlpha() const {
 void EvaluateDialogs::clearFieldColormap(AppState& st) {
     st.colormapOn = false;
     st.legendOn = false;
+    st.legendValueScale = 1.0f;
     if (st.renderer) st.renderer->setColormapMode(false);
 }
 
@@ -429,6 +435,155 @@ void EvaluateDialogs::seedMassFromDoc(AppState& st) {
     massDocName_ = materialDisplayName(key);
     if (!massCustomDensity_) massDensity_ = materialDensityGcm3(key);
 }
+static bool historyDocumentIsActive(const AppState& st, const EvaluateDialogs* dialogs,
+                                    const std::string& docId) {
+    return st.evaluateDialogs == dialogs && st.docMirror.docId() == docId &&
+           st.activeTab >= 0 && st.activeTab < static_cast<int>(st.docTabs.size()) &&
+           st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Part &&
+           st.docTabs[st.activeTab].docId == docId;
+}
+
+void EvaluateDialogs::refreshModelHistoryDocument(AppState& st, const std::string& docId,
+                                                  int minimumRevision) {
+    const bool activeAtDispatch = historyDocumentIsActive(st, this, docId);
+    AppState::DocTab* target = activeAtDispatch ? &st.docTabs[st.activeTab] : nullptr;
+    if (!target) {
+        for (auto& candidate : st.docTabs) {
+            if (candidate.kind == AppState::DocTab::TabKind::Part && candidate.docId == docId &&
+                candidate.session && candidate.session->evaluate.get() == this) {
+                target = &candidate;
+                break;
+            }
+        }
+    }
+    if (!target) return;  // the original tab was closed
+    auto& tab = *target;
+    if (activeAtDispatch) minimumRevision = std::max(minimumRevision, st.docMirror.revision());
+
+    // A cheap doc_tree resync has no mesh. Do not let a switch away and back bind the older
+    // parked tree/mesh while this fetch is outstanding (or if it fails).
+    if (tab.session && tab.session->cachedRevision < minimumRevision) {
+        tab.meshCacheInvalidated = true;
+        tab.session->cachedRevision = -1;
+        tab.session->cachedMirror = {};
+        tab.session->cachedAicmPath.clear();
+        tab.session->cachedDocMesh.reset();
+        if (st.renderer) st.renderer->discardCachedMeshes(docId);
+    }
+
+    if (historyRefreshDocId_ != docId) {
+        historyRefreshDocId_ = docId;
+        historyRefreshMinimumRevision_ = -1;
+        historyRefreshPending_ = false;
+    }
+    historyRefreshMinimumRevision_ = std::max(historyRefreshMinimumRevision_, minimumRevision);
+    historyRefreshFailed_ = false;
+    if (historyRefreshPending_) return;
+
+    historyRefreshPending_ = true;
+    const uint64_t refreshGen = ++historyRefreshGeneration_;
+    const uint64_t mutationGen = st.docMirror.mutationGen();
+    const int revision = activeAtDispatch ? st.docMirror.revision() : -1;
+    const int requestedMinimum = historyRefreshMinimumRevision_;
+    const int cachedRevision = tab.session ? tab.session->cachedRevision : -1;
+    ++st.rebuildsInFlight;
+    st.rpc.call("doc_activate", {{"doc_id", docId}, {"origin", "system"}},
+        [this, &st, docId, refreshGen, mutationGen, revision, requestedMinimum,
+         cachedRevision](const core::RpcResult& refresh) {
+            --st.rebuildsInFlight;
+            if (refreshGen != historyRefreshGeneration_) return;
+            historyRefreshPending_ = false;
+            if (!historyDocumentIsActive(st, this, docId)) return;
+
+            // Unlike an analysis result, resource recovery must survive syncDocument changing
+            // gen_. If the mirror was rebound or mutated, fetch again after that newer work;
+            // never replay the rejected edit or adopt over its newer revision.
+            if (revision < 0 || st.docMirror.revision() != revision ||
+                st.docMirror.mutationGen() != mutationGen) {
+                historyNoticeRevision_ = st.docMirror.revision();
+                refreshModelHistoryDocument(st, docId, historyRefreshMinimumRevision_);
+                return;
+            }
+
+            const auto& response = refresh.result;
+            const bool valid = refresh.ok && response.is_object() && !response.contains("code") &&
+                !response.contains("rejected_tree") &&
+                (!response.contains("ok") || (response["ok"].is_boolean() && response["ok"].get<bool>())) &&
+                (!response.contains("doc_id") || (response["doc_id"].is_string() &&
+                                                  response["doc_id"] == docId)) &&
+                response.contains("revision") && response["revision"].is_number_integer() &&
+                response.contains("tree") && response["tree"].is_object() &&
+                response.contains("datums") && response["datums"].is_array() &&
+                response.contains("rebuild") && response["rebuild"].is_object() &&
+                response["rebuild"].contains("feature_status") &&
+                response["rebuild"]["feature_status"].is_array() &&
+                response.contains("tess") && response["tess"].is_object() &&
+                response["tess"].contains("aicm_path") && response["tess"]["aicm_path"].is_string() &&
+                response["tess"].contains("bodies") && response["tess"]["bodies"].is_array();
+            const int returnedRevision = valid ? response["revision"].get<int>() : -1;
+            const auto& currentTab = st.docTabs[st.activeTab];
+            const int currentCachedRevision = currentTab.session ? currentTab.session->cachedRevision : -1;
+            if (valid &&
+                ((historyRefreshMinimumRevision_ > requestedMinimum &&
+                  returnedRevision < historyRefreshMinimumRevision_) ||
+                 (currentCachedRevision > cachedRevision && returnedRevision < currentCachedRevision))) {
+                refreshModelHistoryDocument(st, docId,
+                    std::max(historyRefreshMinimumRevision_, currentCachedRevision));
+                return;
+            }
+            const std::string mesh = valid ? response["tess"]["aicm_path"].get<std::string>() : std::string();
+            if (!valid || returnedRevision < historyRefreshMinimumRevision_ ||
+                returnedRevision < currentCachedRevision ||
+                (mesh.empty() && !response["tess"]["bodies"].empty())) {
+                const std::string warning = "The current model could not be refreshed; the viewport "
+                                            "may be out of date. Use Refresh report to try again.";
+                if (historyNoticeIsError_ && !historyNotice_.empty()) historyNotice_ += " " + warning;
+                else historyNotice_ = warning;
+                historyNoticeIsError_ = true;
+                historyNoticeRevision_ = st.docMirror.revision();
+                historyRefreshFailed_ = true;
+                return;
+            }
+
+            // ingestTreeResponse retains the full activation's statuses, datum geometry and solid
+            // metadata and notifies the normal renderer listener, without rebinding the document.
+            historyNoticeRevision_ = returnedRevision;
+            if (!st.docMirror.ingestTreeResponse(response)) {
+                const std::string warning = "The current model could not be refreshed; the viewport "
+                                            "may be out of date. Use Refresh report to try again.";
+                if (historyNoticeIsError_ && !historyNotice_.empty()) historyNotice_ += " " + warning;
+                else historyNotice_ = warning;
+                historyNoticeIsError_ = true;
+                historyNoticeRevision_ = st.docMirror.revision();
+                historyRefreshFailed_ = true;
+                return;
+            }
+            st.syncActiveTabTitle();
+            auto& adoptedTab = st.docTabs[st.activeTab];
+            if (adoptedTab.session) {
+                adoptedTab.session->cachedRevision = returnedRevision;
+                adoptedTab.session->cachedMirror = st.docMirror.snapshot();
+                adoptedTab.session->cachedAicmPath = mesh;
+                adoptedTab.session->cachedDocMesh.reset();
+            }
+            adoptedTab.meshCacheInvalidated = true;
+            if (!mesh.empty()) {
+                st.loadDocMeshAsync(mesh, false, true, true);
+            } else {
+                st.unloadDocMesh();
+                if (st.renderer) st.renderer->setActiveMeshIdentity(docId, returnedRevision);
+                if (adoptedTab.session)
+                    adoptedTab.session->cachedDocMesh = std::make_shared<render::DocMesh>();
+                adoptedTab.meshCacheInvalidated = false;
+            }
+            historyRefreshMinimumRevision_ = -1;
+            historyRefreshDocId_.clear();
+            // A same-revision activation would otherwise look unchanged to syncDocument.
+            evalDocRevision_ = -1;
+            if (openWindow_ == "model_history") pending_ = true;
+        }, core::kLongEngineCallTimeoutMs);
+}
+
 
 // C39: evals run async on st.rpc — heavy methods (interference, thickness on a dense model)
 // used to freeze the window for their full duration. The callback runs on the GL thread
@@ -475,6 +630,31 @@ void EvaluateDialogs::runEval(AppState& st, const std::string& method,
         }
         if (!r.result.is_object()) {
             errorText_ = "Analysis returned an invalid result.";
+            return;
+        }
+        if (method == "eval_model_history" && r.result.contains("revision") &&
+            r.result["revision"].is_number_integer() &&
+            r.result.value("doc_id", std::string()) == docId &&
+            r.result["revision"].get<int>() > revision) {
+            // The report can see a foreign revision before the mirror does. Fetch the
+            // corresponding display resources independently of the report's generation.
+            if (historyNotice_.empty() || !historyNoticeIsError_) {
+                historyNotice_ = "The model changed externally; the report is being refreshed.";
+                historyNoticeIsError_ = false;
+            }
+            historyNoticeRevision_ = st.docMirror.revision();
+            refreshModelHistoryDocument(st, docId, r.result["revision"].get<int>());
+            return;
+        }
+        if (method == "eval_model_history" &&
+            (!r.result.value("ok", false) || !r.result.contains("revision") ||
+             !r.result["revision"].is_number_integer() ||
+             r.result.value("doc_id", std::string()) != docId ||
+             r.result["revision"].get<int>() != revision ||
+             !r.result.contains("findings") || !r.result["findings"].is_array() ||
+             !r.result.contains("safe_fixes") || !r.result["safe_fixes"].is_array() ||
+             !r.result.contains("limitations") || !r.result["limitations"].is_array())) {
+            errorText_ = "The history report is invalid or no longer matches this revision. Refresh it.";
             return;
         }
         result_ = r.result;
@@ -731,11 +911,12 @@ void EvaluateDialogs::runFieldEval(AppState& st, const std::string& method,
     pending_ = true;
     const int revision = st.docMirror.revision();
     const std::string fieldDocId = st.docMirror.docId();
+    const float minWall = method == "eval_thickness" ? extra.value("min_wall_mm", 1.0f) : 0.0f;
     // Keep the dock id visible while computing (do not flip to field_wait).
     if (restoreDock.empty()) openWindow_ = "field_wait";
     ++st.rebuildsInFlight;
     st.rpc.call(method, params,
-        [this, &st, gen, method, legendTitle, units, fieldDocId, revision, restoreDock](const core::RpcResult& r) {
+        [this, &st, gen, method, legendTitle, units, fieldDocId, revision, restoreDock, minWall](const core::RpcResult& r) {
             --st.rebuildsInFlight;
             if (gen != gen_ || openWindow_.empty()) return;
             if (st.docMirror.docId() != fieldDocId || st.docMirror.revision() != revision) {
@@ -775,14 +956,22 @@ void EvaluateDialogs::runFieldEval(AppState& st, const std::string& method,
                 return;
             }
             st.colormapOn = true;
-            if (st.renderer) st.renderer->setColormapMode(true);
+            if (st.renderer) {
+                const result_ramp::Display display = method == "eval_thickness"
+                    ? result_ramp::Display{true, true, minWall, 3.0f * minWall}
+                    : result_ramp::Display{};
+                st.renderer->setColormapMode(true, display);
+            }
             st.legendOn = true;
             st.legendTitle = legendTitle;
             st.legendUnits = units;
             float vmin = 0, vmax = 1;
             if (st.renderer && st.renderer->scalarRange(vmin, vmax)) {
-                st.legendMin = vmin;
-                st.legendMax = vmax;
+                const float toDisplay = method == "eval_thickness" && units == "in"
+                    ? 1.0f / 25.4f : 1.0f;
+                st.legendValueScale = toDisplay;
+                st.legendMin = vmin * toDisplay;
+                st.legendMax = vmax * toDisplay;
             }
             // Keep the interactive dock open (draft/thickness/curvature); legacy field_wait clears.
             if (!restoreDock.empty())
@@ -1558,12 +1747,15 @@ void EvaluateDialogs::tickSectionDrag(AppState& st) {
 bool EvaluateDialogs::handleCommand(AppState& st, const std::string& cmdId) {
     syncDocument(st);
     const bool exclusive = cmdId == "eval_measure" || cmdId == "eval_check" ||
-        cmdId == "eval_geometry" ||
+        cmdId == "eval_geometry" || cmdId == "eval_model_history" ||
         cmdId == "eval_interference" || cmdId == "eval_symmetry" ||
         cmdId == "eval_draft" || cmdId == "eval_thickness" || cmdId == "eval_curvature" ||
         cmdId == "eval_zebra";
     if (exclusive) {
         ++gen_;
+        ++thicknessProfileGen_;
+        thicknessProfilePending_ = false;
+        thicknessProfileError_.clear();
         pending_ = false;
         result_ = nlohmann::json::object();
         errorText_.clear();
@@ -1603,6 +1795,14 @@ bool EvaluateDialogs::handleCommand(AppState& st, const std::string& cmdId) {
         title_ = "Geometry Check";
         return true;
     }
+    if (cmdId == "eval_model_history") {
+        historyNotice_.clear();
+        historyStaleRejection_ = false;
+        openWindow_ = "model_history";
+        title_ = "Model History";
+        runEval(st, "eval_model_history", nlohmann::json::object());
+        return true;
+    }
     if (cmdId == "eval_geometry") {
         openWindow_ = "geometry";
         title_ = "Geometry Analysis";
@@ -1639,11 +1839,12 @@ bool EvaluateDialogs::handleCommand(AppState& st, const std::string& cmdId) {
     }
     if (cmdId == "eval_thickness") {
         thicknessRes_ = 0.5f;
+        thicknessMinWall_ = 1.0f;
+        thicknessProcesses_.clear();
+        thicknessProcess_ = 0;
         openWindow_ = "thickness";
         title_ = "Thickness Analysis";
-        runFieldEval(st, "eval_thickness", nlohmann::json::object(), "Wall thickness",
-                     st.ips() ? "in" : "mm");
-        if (openWindow_ == "field_wait" || openWindow_.empty()) openWindow_ = "thickness";
+        loadThicknessProcesses(st);
         return true;
     }
     if (cmdId == "eval_curvature") {
@@ -1671,6 +1872,11 @@ void EvaluateDialogs::syncDocument(AppState& st) {
     const int revision = st.docMirror.revision();
     if (docId == evalDocId_ && revision == evalDocRevision_) return;
     const bool switched = docId != evalDocId_;
+    if (switched || (historyNoticeRevision_ >= 0 && historyNoticeRevision_ != revision &&
+                     !historyStaleRejection_ && !(historyRefreshPending_ && historyNoticeIsError_))) {
+        historyNotice_.clear();
+        historyStaleRejection_ = false;
+    }
     evalDocId_ = docId;
     evalDocRevision_ = revision;
     ++gen_;
@@ -1711,6 +1917,7 @@ void EvaluateDialogs::syncDocument(AppState& st) {
     }
     if (openWindow_ == "check") runEval(st, "eval_check", nlohmann::json::object());
     else if (openWindow_ == "geometry") runGeometryAnalysis(st);
+    else if (openWindow_ == "model_history") runEval(st, "eval_model_history", nlohmann::json::object());
     else if (openWindow_ == "interference") {
         interferencePartNames_.clear();
         interferencePartChecked_.clear();
@@ -1883,10 +2090,6 @@ void EvaluateDialogs::drawMassWindow(AppState& st) {
         // explicit advanced density override below.
         auto applyMassMaterial = [&](const std::string& key) {
             if (!st.docMirror.hasDoc() || !st.workerStarted) return;
-            if (st.docLockedByAgent(st.docMirror.docId())) {
-                st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
-                return;
-            }
             std::vector<uint32_t> bodies = st.docBodyIds;
             if (bodies.empty()) bodies.push_back(1);
             float col[3]; float mtl = 0.0f, rgh = 0.5f;
@@ -1906,20 +2109,18 @@ void EvaluateDialogs::drawMassWindow(AppState& st) {
             massDensity_ = materialDensityGcm3(key);
             ++st.rebuildsInFlight;
             st.docMirror.applyOpsAsync(st.rpc, st.worker, ops,
-                [&st](const core::OpsResponse& resp, bool applied) {
+                [&st](const core::OpsResponse& resp, bool current) {
                     --st.rebuildsInFlight;
-                    if (!applied) return;
+                    if (!current || !st.isActiveMirrorDoc()) return;
                     if (resp.ok && !resp.aicm_path.empty()) {
                         st.loadDocMeshAsync(resp.aicm_path);
                     } else if (!resp.ok) {
                         st.addLog(std::string("[err] set_material: ") + resp.error_message);
-                        if (resp.error_code != "transport")
-                            st.toast(ui::ToastLevel::Error,
-                                     std::string("set_material failed: ") +
-                                     (resp.error_message.empty() ? resp.error_code
-                                                                 : resp.error_message));
+                        st.toast(ui::ToastLevel::Error,
+                                 std::string("set_material failed: ") +
+                                 (resp.error_message.empty() ? resp.error_code
+                                                             : resp.error_message));
                     }
-                    if (resp.ok) st.markActiveTabDirty();
                 });
             runMassEval(st, {{"density_g_cm3", (double)massDensity_}});
         };
@@ -2344,6 +2545,317 @@ void EvaluateDialogs::drawCheck(AppState&) {
                           toneOf(it.value("severity", std::string("info"))));
 }
 
+// The native report owns eligibility. The UI only collects the IDs already included in its
+// preview, so a click cannot silently apply a different set of candidates.
+static std::vector<std::string> historyPreviewIds(const nlohmann::json& report) {
+    std::vector<std::string> ids;
+    if (!report.contains("safe_fixes") || !report["safe_fixes"].is_array()) return ids;
+    for (const auto& fix : report["safe_fixes"]) {
+        if (!fix.is_object() || !fix.contains("feature_ids") || !fix["feature_ids"].is_array() ||
+            fix["feature_ids"].empty()) return {};
+        for (const auto& value : fix["feature_ids"]) {
+            if (!value.is_string() || value.get_ref<const std::string&>().empty()) return {};
+            const auto& id = value.get_ref<const std::string&>();
+            if (std::find(ids.begin(), ids.end(), id) == ids.end()) ids.push_back(id);
+        }
+    }
+    return ids;
+}
+
+static std::string historyFeatureName(const AppState& st, const std::string& id) {
+    const auto& tree = st.docMirror.tree();
+    if (tree.contains("features") && tree["features"].is_array()) {
+        for (const auto& feature : tree["features"]) {
+            if (feature.is_object() && feature.value("id", std::string()) == id) {
+                const std::string name = feature.value("name", std::string());
+                return name.empty() ? id : name;
+            }
+        }
+    }
+    return {};
+}
+
+static void drawHistoryFeatureRefs(AppState& st, const nlohmann::json& ids) {
+    if (!ids.is_array()) return;
+    const bool editing = (st.propertyManager && st.propertyManager->active()) ||
+                         (st.sketchMode && st.sketchMode->active()) ||
+                         (st.sketch3dMode && st.sketch3dMode->active()) || st.sketchPlanePickActive;
+    int index = 0;
+    for (const auto& item : ids) {
+        if (!item.is_string()) continue;
+        const auto& id = item.get_ref<const std::string&>();
+        const std::string name = historyFeatureName(st, id);
+        const std::string suffix = " (" + id + ")";
+        const float width = ImGui::GetContentRegionAvail().x;
+        const float nameWidth = std::max(0.0f, width - ImGui::CalcTextSize(suffix.c_str()).x -
+                                               ImGui::GetStyle().FramePadding.x * 2.0f);
+        const std::string shown = kit::elide(name.c_str(), nameWidth);
+        const std::string label = (name.empty() ? id : shown + suffix) + "###history_feature";
+        ImGui::PushID(index++);
+        if (kit::secondaryButton(label.c_str(), !name.empty() && !editing,
+                                 name.empty() ? "This feature is not present in the current tree." :
+                                                "Finish or cancel the current edit before selecting.",
+                                 ImVec2(width, 0))) {
+            st.clearSelection();
+            st.selectedFeatureId = id;
+            st.treeScrollToSelection = true;
+            st.showFeatureTree = true;
+            st.leftPaneTab = AppState::LP_FeatureManager;
+            refreshFeatureHighlight(st);
+        }
+        if (!name.empty() && shown != name && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", name.c_str());
+        ImGui::PopID();
+    }
+}
+
+void EvaluateDialogs::drawModelHistory(AppState& st) {
+    if (kit::secondaryButton("Refresh report###history_refresh",
+                             !pending_ && !historyMutationPending_ && !historyRefreshPending_ &&
+                             st.docMirror.hasDoc(),
+                             "Wait for the current operation.")) {
+        historyNotice_.clear();
+        historyStaleRejection_ = false;
+        if (historyRefreshFailed_)
+            refreshModelHistoryDocument(st, st.docMirror.docId(), historyRefreshMinimumRevision_);
+        else
+            runEval(st, "eval_model_history", nlohmann::json::object());
+    }
+    if (!historyNotice_.empty())
+        kit::inlineStatus(historyNotice_.c_str(), historyNoticeIsError_ ? kit::Tone::Warn : kit::Tone::Info);
+    if (pending_ || historyRefreshPending_) {
+        kit::spinner("Inspecting model history…");
+        return;
+    }
+    if (!errorText_.empty()) {
+        kit::blockedState("Model history unavailable", errorText_.c_str(),
+                          "Refresh the report before making changes.");
+        return;
+    }
+    if (!result_.contains("findings") || !result_["findings"].is_array() ||
+        !result_.contains("safe_fixes") || !result_["safe_fixes"].is_array()) {
+        kit::emptyState("results", "No history report", "Refresh to inspect this part.");
+        return;
+    }
+
+    const auto& findings = result_["findings"];
+    const auto& fixes = result_["safe_fixes"];
+    kit::chipFlowBegin("history_summary");
+    const std::string count = std::to_string(findings.size()) +
+                              (findings.size() == 1 ? " finding" : " findings");
+    kit::flowChip(count.c_str(), findings.empty() ? kit::Tone::Info : kit::Tone::Warn, true);
+    const std::string fixesCount = std::to_string(fixes.size()) + " safe cleanup" +
+                                   (fixes.size() == 1 ? "" : "s");
+    kit::flowChip(fixesCount.c_str(), fixes.empty() ? kit::Tone::Neutral : kit::Tone::Ok);
+    if (!result_.value("complete", false)) kit::flowChip("Incomplete report", kit::Tone::Warn);
+    kit::chipFlowEnd();
+    kit::dimText(result_.value("summary", std::string()).c_str());
+    kit::dimText("History rules are advisory; this is not a geometry or engineering certification.");
+    const auto& tree = st.docMirror.tree();
+    if (tree.contains("configurations") && !tree["configurations"].empty())
+        kit::inlineStatus("Refine validates the active configuration only; others may refuse when built.",
+                          kit::Tone::Warn);
+
+    if (kit::cardBegin("history_preview", "Safe cleanup preview")) {
+        if (fixes.empty()) {
+            kit::dimText("No automatic cleanup is eligible for this revision.");
+        } else {
+            int index = 0;
+            for (const auto& fix : fixes) {
+                if (!fix.is_object()) continue;
+                ImGui::PushID(index++);
+                ImGui::TextWrapped("%s", fix.value("description", std::string()).c_str());
+                if (fix.contains("feature_ids")) drawHistoryFeatureRefs(st, fix["feature_ids"]);
+                ImGui::PopID();
+            }
+            kit::dimText("Simplify applies this preview as one undoable edit. Nothing is saved automatically.");
+        }
+        if (result_.contains("blocked_fixes") && result_["blocked_fixes"].is_array() &&
+            !result_["blocked_fixes"].empty()) {
+            kit::dimText("Not eligible for automatic cleanup");
+            ImGui::PushID("blocked");
+            int blockedIndex = 0;
+            for (const auto& blocked : result_["blocked_fixes"]) {
+                if (!blocked.is_object()) continue;
+                ImGui::PushID(blockedIndex++);
+                ImGui::TextWrapped("%s", blocked.value("reason", std::string()).c_str());
+                if (blocked.contains("feature_ids")) drawHistoryFeatureRefs(st, blocked["feature_ids"]);
+                ImGui::PopID();
+            }
+            ImGui::PopID();
+        }
+    }
+    kit::cardEnd();
+
+    kit::sectionHeader("Findings", nullptr, nullptr, static_cast<int>(findings.size()));
+    if (findings.empty()) kit::dimText("No history findings were reported by these rules.");
+    int index = 0;
+    for (const auto& finding : findings) {
+        if (!finding.is_object()) continue;
+        ImGui::PushID(index++);
+        const std::string code = finding.value("code", std::string("finding"));
+        const std::string severity = finding.value("severity", std::string("info"));
+        const kit::Tone tone = severity == "error" ? kit::Tone::Err :
+                               severity == "warning" || severity == "warn" ? kit::Tone::Warn :
+                                                                            kit::Tone::Info;
+        if (kit::cardBegin("history_finding", "Finding")) {
+            std::string label = severity;
+            label += " - ";
+            label += code;
+            kit::inlineStatus(label.c_str(), tone);
+            ImGui::TextWrapped("%s", finding.value("message", std::string()).c_str());
+            if (finding.contains("feature_ids")) drawHistoryFeatureRefs(st, finding["feature_ids"]);
+            const std::string suggestion = finding.value("suggestion", std::string());
+            if (!suggestion.empty()) {
+                kit::dimText("Suggested action");
+                ImGui::TextWrapped("%s", suggestion.c_str());
+            }
+            if (finding.contains("evidence") && !finding["evidence"].is_null()) {
+                kit::dimText("Evidence");
+                const std::string evidence = finding["evidence"].dump(2);
+                ImGui::TextWrapped("%s", evidence.c_str());
+            }
+        }
+        kit::cardEnd();
+        ImGui::PopID();
+    }
+
+    if (kit::cardBegin("history_limitations", "Limitations")) {
+        if (result_.contains("limitations") && result_["limitations"].is_array()) {
+            for (const auto& limitation : result_["limitations"])
+                if (limitation.is_string()) ImGui::TextWrapped("%s", limitation.get_ref<const std::string&>().c_str());
+        }
+    }
+    kit::cardEnd();
+}
+
+std::string EvaluateDialogs::modelHistoryBlocker(const AppState& st, bool refine) const {
+    if (!st.workerStarted || !st.docMirror.hasDoc() || st.activeTab < 0 ||
+        st.activeTab >= static_cast<int>(st.docTabs.size()) ||
+        st.docTabs[st.activeTab].kind != AppState::DocTab::TabKind::Part ||
+        st.docTabs[st.activeTab].docId != st.docMirror.docId())
+        return "Open the part whose history you want to change.";
+    if (st.activeWorkspace == AppState::Workspace::Simulate)
+        return "Leave Simulation before editing model history.";
+    if ((st.propertyManager && st.propertyManager->active()) ||
+        (st.sketchMode && st.sketchMode->active()) ||
+        (st.sketch3dMode && st.sketch3dMode->active()) || st.sketchPlanePickActive)
+        return "Finish or cancel the current edit first.";
+    const auto& tree = st.docMirror.tree();
+    if (tree.contains("rollback_after") && !tree["rollback_after"].is_null())
+        return "Move the rollback bar to the end before changing history.";
+    if (!refine && tree.contains("configurations") && !tree["configurations"].empty())
+        return "Automatic cleanup is unavailable while named configurations exist.";
+    if (pending_ || historyMutationPending_ || historyRefreshPending_ || st.rebuildsInFlight > 0)
+        return "Wait for the current operation to finish.";
+    if (historyRefreshFailed_) return "Refresh the model before making changes.";
+    if (!errorText_.empty()) return "Refresh the report before making changes.";
+    if (!result_.is_object() || !result_.contains("revision") ||
+        !result_["revision"].is_number_integer() ||
+        result_.value("doc_id", std::string()) != st.docMirror.docId() ||
+        result_["revision"].get<int>() != st.docMirror.revision())
+        return "The report is stale. Refresh it before making changes.";
+    if (!result_.value("complete", false)) return "Refresh the incomplete history report first.";
+    if (refine) {
+        if (st.docBodyIds.empty() ||
+            (st.docMirror.solidPresenceKnown() && !st.docMirror.hasSolidBody()))
+            return "Create a solid body before refining its representation.";
+    } else if (historyPreviewIds(result_).empty()) {
+        return "No safe cleanup is available in this report.";
+    }
+    return {};
+}
+
+void EvaluateDialogs::applyModelHistory(AppState& st, bool refine) {
+    if (!modelHistoryBlocker(st, refine).empty()) return;
+    const int reportRevision = result_["revision"].get<int>();
+    const std::string docId = st.docMirror.docId();
+    nlohmann::json ops = nlohmann::json::array();
+    if (refine) {
+        ops.push_back({{"op", "add_feature"}, {"feature", {
+            {"type", "refine"}, {"name", "Refine representation"},
+            {"params", nlohmann::json::object()}, {"refs", nlohmann::json::object()}}}});
+    } else {
+        ops.push_back({{"op", "simplify_history"}, {"features", historyPreviewIds(result_)}});
+    }
+    // applyOpsAsync captures the current mirror revision as base_revision synchronously. The
+    // check above ties it to the displayed report; the worker rejects a concurrent foreign edit.
+    if (st.docMirror.docId() != docId || st.docMirror.revision() != reportRevision) return;
+    historyNotice_.clear();
+    historyStaleRejection_ = false;
+    historyMutationPending_ = true;
+    ++st.rebuildsInFlight;
+    st.docMirror.applyOpsAsync(st.rpc, st.worker, ops,
+        [this, &st, docId, reportRevision, refine](const core::OpsResponse& resp, bool current) {
+            --st.rebuildsInFlight;
+            historyMutationPending_ = false;
+            if (!current || !historyDocumentIsActive(st, this, docId)) return;
+            historyNoticeRevision_ = st.docMirror.revision();
+            const std::string action = refine ? "Refine representation" : "Simplify history";
+            if (!resp.ok) {
+                historyNoticeIsError_ = true;
+                const std::string detail = resp.error_message.empty() ? resp.error_code : resp.error_message;
+                historyNotice_ = action + " failed" +
+                    (resp.error_code.empty() ? std::string() : " (" + resp.error_code + ")") +
+                    (detail.empty() ? "." : ": " + detail);
+                st.toast(ui::ToastLevel::Error, historyNotice_);
+                if (resp.error_code == "stale_revision") {
+                    historyStaleRejection_ = true;
+                    int minimumRevision = std::max(reportRevision + 1, st.docMirror.revision());
+                    if (resp.error_detail.is_object() && resp.error_detail.contains("current_revision") &&
+                        resp.error_detail["current_revision"].is_number_integer())
+                        minimumRevision = std::max(minimumRevision,
+                            resp.error_detail["current_revision"].get<int>());
+                    refreshModelHistoryDocument(st, docId, minimumRevision);
+                }
+                return;
+            }
+            historyNoticeIsError_ = false;
+            if (refine) {
+                historyNotice_ = "Refine feature added to history.";
+                const std::string id = resp.id_map.is_object() ? resp.id_map.value("$0", std::string()) : std::string();
+                if (resp.feature_status.is_array()) {
+                    for (const auto& status : resp.feature_status) {
+                        if (!status.is_object() || status.value("id", std::string()) != id ||
+                            !status.contains("data") || !status["data"].is_object()) continue;
+                        const auto& data = status["data"];
+                        if (data.contains("before") && data["before"].is_object() &&
+                            data.contains("after") && data["after"].is_object()) {
+                            const auto& before = data["before"];
+                            const auto& after = data["after"];
+                            historyNotice_ = "Refine " + std::string(data.value("changed", false)
+                                ? "unified same-domain topology" : "found no same-domain changes") +
+                                ": faces " + std::to_string(before.value("faces", 0)) + " to " +
+                                std::to_string(after.value("faces", 0)) + ", edges " +
+                                std::to_string(before.value("edges", 0)) + " to " +
+                                std::to_string(after.value("edges", 0)) + ".";
+                        }
+                        break;
+                    }
+                }
+            }
+            if (!resp.aicm_path.empty()) st.loadDocMeshAsync(resp.aicm_path);
+            st.toast(ui::ToastLevel::Info, refine ? "Refine feature added to history."
+                                                 : "Safe history cleanup applied.");
+        });
+}
+
+void EvaluateDialogs::drawModelHistoryFooter(AppState& st) {
+    const std::string simplifyBlocker = modelHistoryBlocker(st, false);
+    const std::string refineBlocker = modelHistoryBlocker(st, true);
+    kit::ActionSpec a;
+    a.primaryLabel = "Simplify history";
+    a.primaryEnabled = simplifyBlocker.empty();
+    a.blocker = simplifyBlocker.empty() ? nullptr : simplifyBlocker.c_str();
+    a.secondaryLabel = "Refine representation";
+    a.secondaryEnabled = refineBlocker.empty();
+    a.secondaryReason = refineBlocker.empty() ? nullptr : refineBlocker.c_str();
+    switch (kit::actionFooter("history_actions", a)) {
+        case kit::FooterAction::Primary: applyModelHistory(st, false); break;
+        case kit::FooterAction::Secondary: applyModelHistory(st, true); break;
+        default: break;
+    }
+}
+
 void EvaluateDialogs::drawInterference(AppState& st) {
     const bool ips = st.ips();
     if (!errorText_.empty()) kit::blockedState("Interference unavailable", errorText_.c_str());
@@ -2536,10 +3048,76 @@ void EvaluateDialogs::drawZebra(AppState& st) {
     if (gZebraFreq != before && st.renderer) st.renderer->setZebra(true, gZebraFreq);
 }
 
+// dfm_* replies are {ok, result | error} envelopes (core/dfm/process_profiles.cpp call()).
+static const nlohmann::json* dfmValue(const core::RpcResult& r, std::string& err) {
+    if (!r.ok) {
+        err = r.err;
+        return nullptr;
+    }
+    if (!r.result.is_object() || !r.result.value("ok", false) || !r.result.contains("result")) {
+        err = r.result.is_object() ? r.result.value("error", std::string()) : std::string();
+        return nullptr;
+    }
+    return &r.result["result"];
+}
+
+void EvaluateDialogs::loadThicknessProcesses(AppState& st) {
+    const int gen = ++thicknessProfileGen_;
+    thicknessProfilePending_ = true;
+    thicknessProfileError_.clear();
+    st.rpc.call("dfm_known_processes", nlohmann::json::object(),
+        [this, &st, gen](const core::RpcResult& r) {
+            if (gen != thicknessProfileGen_ || openWindow_ != "thickness") return;
+            thicknessProfilePending_ = false;
+            std::string err;
+            const nlohmann::json* processes = dfmValue(r, err);
+            if (!processes || !processes->is_array() || processes->empty()) {
+                thicknessProfileError_ = err.empty() ? "Could not load manufacturing processes." : err;
+                return;
+            }
+            thicknessProcesses_.clear();
+            for (const auto& process : *processes)
+                if (process.is_string()) thicknessProcesses_.push_back(process.get<std::string>());
+            const auto fdm = std::find(thicknessProcesses_.begin(), thicknessProcesses_.end(), "fdm");
+            if (fdm == thicknessProcesses_.end()) {
+                thicknessProfileError_ = "Manufacturing profiles did not include the default FDM process.";
+                return;
+            }
+            thicknessProcess_ = (int)(fdm - thicknessProcesses_.begin());
+            loadThicknessProfile(st, true);
+        });
+}
+
+void EvaluateDialogs::loadThicknessProfile(AppState& st, bool runWhenReady) {
+    if (thicknessProcess_ < 0 || thicknessProcess_ >= (int)thicknessProcesses_.size()) return;
+    const int gen = ++thicknessProfileGen_;
+    thicknessProfilePending_ = true;
+    thicknessProfileError_.clear();
+    const std::string process = thicknessProcesses_[thicknessProcess_];
+    st.rpc.call("dfm_get_profile", {{"process", process}},
+        [this, &st, gen, runWhenReady](const core::RpcResult& r) {
+            if (gen != thicknessProfileGen_ || openWindow_ != "thickness") return;
+            thicknessProfilePending_ = false;
+            std::string err;
+            const nlohmann::json* value = dfmValue(r, err);
+            const nlohmann::json* profile =
+                value && value->is_object() && value->contains("params") ? &(*value)["params"]
+                                                                         : nullptr;
+            if (!profile || !profile->is_object() || !profile->contains("min_wall_mm") ||
+                !(*profile)["min_wall_mm"].is_number() ||
+                !((*profile)["min_wall_mm"].get<double>() > 0.0)) {
+                thicknessProfileError_ = err.empty() ? "Could not load the process minimum wall." : err;
+                return;
+            }
+            thicknessMinWall_ = (*profile)["min_wall_mm"].get<float>();
+            if (runWhenReady) runFieldTool(st, "thickness");
+        });
+}
+
 void EvaluateDialogs::drawFieldTool(AppState& st, const std::string& kind) {
     kit::inlineStatus(errorText_.c_str(), kit::Tone::Err);
     {
-        kit::FieldGroup g("field_params", "Pull direction");
+        kit::FieldGroup g("field_params", kind == "thickness" ? "Minimum wall" : "Pull direction");
         if (kind == "draft") {
             static const char* const kPulls[] = {"+X", "+Y", "+Z", "-Z"};
             kit::fieldEnum("pull", "Pull direction", &draftPull_, kPulls, 4,
@@ -2551,18 +3129,88 @@ void EvaluateDialogs::drawFieldTool(AppState& st, const std::string& kind) {
                                  .withTip("Faces with less draft than this against the pull "
                                           "direction are highlighted."));
         } else if (kind == "thickness") {
+            if (!thicknessProcesses_.empty() &&
+                kit::fieldCombo("process", "Process", &thicknessProcess_, thicknessProcesses_,
+                                kit::FieldOpts().withDisabled(thicknessProfilePending_ || pending_)
+                                    .withTip("Prefills the process minimum; you can override it below.")))
+                loadThicknessProfile(st, false);
+            kit::fieldNumber("minimum_wall", "Minimum wall", &thicknessMinWall_,
+                             lengthOpts(st.ips()).withRange(0.01, 1000.0)
+                                 .withDisabled(thicknessProfilePending_)
+                                 .withTip("Thickness at or below this limit is red. Values at or "
+                                          "above three times this limit are blue."));
             kit::fieldNumber("resolution", "Resolution", &thicknessRes_,
-                             lengthOpts(st.ips())
-                                 .withRange(0.05, 5.0)
-                                 .withTip("Sample spacing for the wall-thickness rays. Smaller is "
-                                          "finer and slower."));
+                             lengthOpts(st.ips()).withRange(0.05, 5.0)
+                                 .withTip("Surface measurement spacing for inscribed-sphere wall "
+                                          "thickness. Smaller is finer and slower; the sample "
+                                          "budget may coarsen it."));
         } else {
             static const char* const kKinds[] = {"Mean", "Gaussian", "Max", "Min"};
             kit::fieldEnum("kind", "Curvature", &curvatureKind_, kKinds, 4,
                            kit::FieldOpts().withTip("Which curvature the colormap shows."));
         }
     }
-    kit::dimText("Update recomputes the viewport colormap; the legend shows the value range.");
+    if (kind != "thickness") {
+        kit::dimText("Update recomputes the viewport colormap; the legend shows the value range.");
+        return;
+    }
+    kit::inlineStatus(thicknessProfileError_.c_str(), kit::Tone::Err);
+    kit::dimText("Thin is red; thick is blue. Grey is unmeasured. This is a sampled wall study, "
+                 "not a structural strength or printability guarantee.");
+    if (thicknessProfilePending_) kit::spinner("Loading process profile…");
+    else if (pending_) kit::spinner("Measuring wall thickness…");
+    if (!result_.contains("min_thickness_mm")) return;
+    const int count = result_.value("n_thin_regions", 0);
+    const auto& basis = result_.at("measurement_basis");
+    const bool limited = basis.value("budget_limited", false);
+    const auto& minimum = result_["min_thickness_mm"];
+    kit::keyValueCard("thickness_result", "Wall-thickness results", "thickness", {
+        {"Minimum thickness", minimum.is_number() ? evalLen(st, minimum.get<double>()) : "Unmeasured",
+         count ? kit::Tone::Err : kit::Tone::Neutral},
+        {"Thin area", evalQty(st.ips(), EvalQty::Area, result_.value("thin_area_mm2", 0.0))},
+        {"Thin regions", std::to_string(count)},
+        {"Measurement spacing", evalLen(st, basis.value("spacing_mm", 0.0)),
+         limited ? kit::Tone::Warn : kit::Tone::Neutral}});
+    if (limited)
+        kit::inlineStatus("Sample budget reached: measurement spacing was coarsened.",
+                          kit::Tone::Warn);
+    if (basis.value("n_unmeasured", 0) > 0)
+        kit::inlineStatus("Grey areas have no measured opposing wall.", kit::Tone::Warn);
+    if (!result_.contains("thin_regions") || !result_["thin_regions"].is_array()) return;
+    if (count == 0) {
+        kit::dimText("No thin regions found at this measurement spacing.");
+        return;
+    }
+    if (kit::cardBegin("thin_regions", "Thin regions", "thickness")) {
+        kit::dimText("Click a region to frame it in the viewport.");
+        int index = 0;
+        for (const auto& region : result_["thin_regions"]) {
+            const std::string label = "Region " + std::to_string(index + 1) + " · " +
+                region.value("kind", std::string("wall"));
+            const std::string meta = evalLen(st, region.value("min_thickness_mm", 0.0)) +
+                " · " + evalQty(st.ips(), EvalQty::Area, region.value("area_mm2", 0.0));
+            kit::RowStyle style;
+            style.meta = meta.c_str();
+            style.tooltip = "Frame this region's bounding box.";
+            ImGui::PushID(index++);
+            if (kit::row("region", label.c_str(), style) && region.contains("bbox")) {
+                const auto& box = region["bbox"];
+                if (box.contains("min") && box.contains("max") &&
+                    box["min"].is_array() && box["min"].size() == 3 &&
+                    box["max"].is_array() && box["max"].size() == 3) {
+                    for (int k = 0; k < 3; ++k) {
+                        st.zoomToBBoxMin[k] = box["min"][k].get<float>();
+                        st.zoomToBBoxMax[k] = box["max"][k].get<float>();
+                    }
+                    st.zoomToBBoxRequested = true;
+                }
+            }
+            ImGui::PopID();
+        }
+        if (count > (int)result_["thin_regions"].size())
+            kit::dimText("Showing the thinnest regions first; the total includes unlisted regions.");
+    }
+    kit::cardEnd();
 }
 
 void EvaluateDialogs::runFieldTool(AppState& st, const std::string& kind) {
@@ -2574,9 +3222,16 @@ void EvaluateDialogs::runFieldTool(AppState& st, const std::string& kind) {
                       {"angle_deg", (double)draftAngleDeg_}},
                      "Draft angle", "deg");
     } else if (kind == "thickness") {
-        nlohmann::json extra = nlohmann::json::object();
-        if (thicknessRes_ > 0.0f) extra["resolution"] = (double)thicknessRes_;
-        runFieldEval(st, "eval_thickness", extra, "Wall thickness", st.ips() ? "in" : "mm");
+        if (!(thicknessMinWall_ > 0.0f) || !(thicknessRes_ > 0.0f)) {
+            errorText_ = "Minimum wall and resolution must be positive.";
+            return;
+        }
+        const nlohmann::json extra = {{"min_wall_mm", (double)thicknessMinWall_},
+                                      {"resolution", (double)thicknessRes_}};
+        // ASCII only: the UI font has no U+2264 glyph.
+        const std::string label = "Wall thickness (red at or below " +
+            evalLen(st, thicknessMinWall_) + ")";
+        runFieldEval(st, "eval_thickness", extra, label, st.ips() ? "in" : "mm");
     } else if (kind == "curvature") {
         static const char* const kKinds[] = {"mean", "gaussian", "max", "min"};
         static const char* const kTitles[] = {"Mean curvature", "Gaussian curvature",
@@ -2591,7 +3246,7 @@ void EvaluateDialogs::runFieldTool(AppState& st, const std::string& kind) {
 // is no Cancel instead of offering a fake one.
 void EvaluateDialogs::drawExclusiveFooter(AppState& st, const std::string& kind) {
     kit::ActionSpec a;
-    a.running = pending_;
+    a.running = pending_ || (kind == "thickness" && thicknessProfilePending_);
     a.cancellable = false;
     a.cancelBlocker = "the analysis finishes on the worker. Close this window to discard its result.";
     if (kind == "zebra") {
@@ -2612,7 +3267,7 @@ void EvaluateDialogs::drawExclusiveFooter(AppState& st, const std::string& kind)
         return;
     }
     a.primaryLabel = "Update";
-    a.primaryEnabled = !pending_;
+    a.primaryEnabled = !a.running;
     a.stage = kind == "draft" ? "Computing draft" : kind == "thickness" ? "Computing thickness"
                                                                         : "Computing curvature";
     a.secondaryLabel = "Turn off";
@@ -2638,6 +3293,8 @@ void EvaluateDialogs::drawExclusiveWindow(AppState& st) {
     const ImVec2 toolSize(ui::metrics::px(480),
                           ui::metrics::px(openWindow_ == "interference" ? 580
                                           : openWindow_ == "measure"    ? 420
+                                          : openWindow_ == "model_history" ? 680
+                                          : openWindow_ == "thickness"  ? 620
                                                                         : 380));
     ui::setNextCommandDialogPlacement(winTitle.c_str(), toolSize,
         ImVec2(ui::metrics::px(340), ui::metrics::px(240)));
@@ -2657,6 +3314,8 @@ void EvaluateDialogs::drawExclusiveWindow(AppState& st) {
             drawGeometryAnalysis(st);
         } else if (kind == "check") {
             drawCheck(st);
+        } else if (kind == "model_history") {
+            drawModelHistory(st);
         } else if (kind == "interference") {
             drawInterference(st);
         } else if (kind == "symmetry") {
@@ -2670,16 +3329,19 @@ void EvaluateDialogs::drawExclusiveWindow(AppState& st) {
         } else if (kind == "field_err") {
             kit::blockedState("Field analysis unavailable", errorText_.c_str());
         }
-        if (kind == "geometry" || kind == "zebra" || kind == "draft" || kind == "thickness" ||
-            kind == "curvature") {
+        if (kind == "geometry" || kind == "model_history" || kind == "zebra" || kind == "draft" ||
+            kind == "thickness" || kind == "curvature") {
             kit::panelFooterBegin();
-            drawExclusiveFooter(st, kind);
+            if (kind == "model_history") drawModelHistoryFooter(st);
+            else drawExclusiveFooter(st, kind);
         }
         kit::panelEnd();
     }
     ImGui::End();
     if (!open || openWindow_.empty()) {
         ++gen_;
+        ++thicknessProfileGen_;
+        thicknessProfilePending_ = false;
         pending_ = false;
         measureDirty_ = false;
         result_ = nlohmann::json::object();

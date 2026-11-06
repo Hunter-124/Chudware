@@ -6,6 +6,8 @@
 #pragma once
 #include <string>
 #include <vector>
+#include <functional>
+#include <cstdint>
 #include <nlohmann/json.hpp>
 struct AppState;
 namespace ui {
@@ -20,6 +22,8 @@ void feedAgentDagEvent(const std::string& convId, const std::string& kind,
                        const nlohmann::json& data);
 // Returns null for an unseen conversation; restoration ignores records of an older schema.
 nlohmann::json agentDagToJson(const std::string& convId);
+uint64_t agentDagRevision(const std::string& convId);
+std::function<nlohmann::json()> agentDagSnapshot(const std::string& convId);
 void agentDagFromJson(const std::string& convId, const nlohmann::json& j);
 AgentDagSummary agentDagSummary(const std::string& convId);
 

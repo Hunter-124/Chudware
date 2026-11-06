@@ -33,6 +33,7 @@ import json
 import math
 import os
 import shutil
+from pathlib import Path
 
 import pytest
 
@@ -60,6 +61,11 @@ class _StubMCP:
 _TOOLS: dict = {}
 
 
+@pytest.fixture(autouse=True)
+def _isolated_ecad_workspace(monkeypatch, tmp_path):
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(tmp_path))
+
+
 def _tools() -> dict:
     global _TOOLS
     if not _TOOLS:
@@ -78,6 +84,7 @@ def _call(_name: str, **kw) -> dict:
 def _new_sch(name: str) -> str:
     r = _call("ecad_new_schematic", name=name)
     assert r["ok"], r
+    assert Path(r["path"]).is_file()
     return r["doc_id"]
 
 
@@ -87,51 +94,58 @@ def _wire(doc: str, a: str, ap: str, b: str, bp: str) -> None:
 
 
 def _set_sin(doc: str, ref: str, amplitude: float, freq: float) -> None:
-    """Give a placed V source a SIN transient waveform via sim_params (the GUI shape)."""
+    """Give a VSIN source a transient waveform through the GUI's sim_params path."""
     from services.mcp.ecad_common import ecad_session
     s = ecad_session.get_session(doc)
     sym = next(sym for sym in s.doc.get("symbols", []) if sym.get("ref") == ref)
+    # Disable the library's default sine so a dropped sim_params waveform cannot
+    # accidentally satisfy the waveform regression. Preserve the old DC value.
+    fields = dict(sym.get("fields") or {})
+    fields["Sim.Params"] = f"dc={sym['value']} ampl=0 f={freq} ac=0"
     ecad_session.apply_ops(s, s.revision, [
-        {"op": "sch_edit_symbol", "id": sym["id"],
+        {"op": "sch_edit_symbol", "id": sym["id"], "fields": fields,
          "sim_params": {"waveform": "SIN", "amplitude": str(amplitude),
                         "freq": str(freq)}}])
 
 
 def _circuit_of(doc: str) -> dict:
-    """The exact Circuit the tools simulate (netlist -> spice translation)."""
-    from services.mcp.ecad_common import ecad_session, netlist_mod
-    from services.sim.spice import netlist_to_spice_circuit
+    """The native Circuit the tools build from the schematic netlist."""
+    from services.mcp.ecad_common import ecad_session, netlist_mod, _netlist_to_circuit
     ses = ecad_session.get_session(doc)
-    circuit, _warns = netlist_to_spice_circuit(netlist_mod.build_netlist(ses.doc))
+    circuit, _warns = _netlist_to_circuit(netlist_mod.build_netlist(ses.doc))
     return circuit
 
 
-# V-source symbol: pins '+' at +5.08 and '-' at -5.08 from the anchor; a GND power
-# port placed at (x, y-5.08) bonds onto the '-' pin net and names it node 0.
-_VGND_DY = 5.08
+def _ground(doc: str, ref: str = "V1") -> dict:
+    from services.mcp.ecad_common import ecad_session, _placed_pins, _sym_by_ref
+    session = ecad_session.get_session(doc)
+    pins = _placed_pins(session.doc, _sym_by_ref(session.doc, ref))
+    pin = next(p for p in pins if p["number"] == "2")
+    return _call("ecad_add_power", net="GND", x=pin["xy"][0], y=pin["xy"][1], doc_id=doc)
 
 
-def _build_rc(doc: str, v: str = "5", r: str = "1k", c: str = "1u") -> None:
+def _build_rc(doc: str, v: str = "5", r: str = "1k", c: str = "1u",
+              source_libid: str = "Simulation_SPICE:VDC") -> None:
     """V1 -> R1 -> C1 -> back to V1, bottom net grounded."""
-    _call("ecad_place_symbol", libid="Simulation_SPICE:V_source", x=0, y=20, value=v, doc_id=doc)
+    _call("ecad_place_symbol", libid=source_libid, x=0, y=20, value=v, doc_id=doc)
     _call("ecad_place_symbol", libid="Device:R", x=20, y=20, value=r, angle=90, doc_id=doc)
     _call("ecad_place_symbol", libid="Device:C", x=20, y=0, value=c, angle=90, doc_id=doc)
     _wire(doc, "V1", "+", "R1", "2")
     _wire(doc, "R1", "1", "C1", "1")
     _wire(doc, "C1", "2", "V1", "-")
-    g = _call("ecad_add_power", net="GND", x=0, y=20 - _VGND_DY, doc_id=doc)
+    g = _ground(doc)
     assert g["net_size"] >= 2, f"GND port did not bond: {g}"
 
 
 def _build_divider(doc: str) -> None:
     """10 V / 1k+2k divider (the house pattern from test_ecad_tools.py)."""
-    _call("ecad_place_symbol", libid="Simulation_SPICE:V_source", x=0, y=20, value="10", doc_id=doc)
+    _call("ecad_place_symbol", libid="Simulation_SPICE:VDC", x=0, y=20, value="10", doc_id=doc)
     _call("ecad_place_symbol", libid="Device:R", x=20, y=20, value="1k", angle=90, doc_id=doc)
     _call("ecad_place_symbol", libid="Device:R", x=20, y=0, value="2k", angle=90, doc_id=doc)
     _wire(doc, "V1", "+", "R1", "2")
     _wire(doc, "R1", "1", "R2", "2")
     _wire(doc, "R2", "1", "V1", "-")
-    g = _call("ecad_add_power", net="GND", x=0, y=20 - _VGND_DY, doc_id=doc)
+    g = _ground(doc)
     assert g["net_size"] >= 2, f"GND port did not bond: {g}"
 
 
@@ -193,7 +207,7 @@ def test_rlc_resonance_peak():
     """Series-RLC band-pass through the schematic path: AC peak at f0 = 1/(2*pi*sqrt(LC))."""
     sim_run = _oracle_sim_run
     doc = _new_sch("e2e_rlc_ac")
-    _call("ecad_place_symbol", libid="Simulation_SPICE:V_source", x=0, y=30, value="1", doc_id=doc)
+    _call("ecad_place_symbol", libid="Simulation_SPICE:VDC", x=0, y=30, value="1", doc_id=doc)
     _call("ecad_place_symbol", libid="Device:L", x=20, y=30, value="1m", angle=90, doc_id=doc)
     _call("ecad_place_symbol", libid="Device:C", x=20, y=15, value="1u", angle=90, doc_id=doc)
     _call("ecad_place_symbol", libid="Device:R", x=20, y=0, value="10", angle=90, doc_id=doc)
@@ -201,7 +215,7 @@ def test_rlc_resonance_peak():
     _wire(doc, "L1", "1", "C1", "1")
     _wire(doc, "C1", "2", "R1", "2")
     _wire(doc, "R1", "1", "V1", "-")
-    g = _call("ecad_add_power", net="GND", x=0, y=30 - _VGND_DY, doc_id=doc)
+    g = _ground(doc)
     assert g["net_size"] >= 2, g
 
     # MCP tool run converges and auto-drives an AC stimulus (and says so).
@@ -253,13 +267,13 @@ def test_diode_rectifier_current_probe():
     """Half-wave rectifier with a SIN source: I(D1) probe finite (NaN regression) and
     the output actually rectifies (waveform seam-fix regression — was silently DC)."""
     doc = _new_sch("e2e_rectifier")
-    _call("ecad_place_symbol", libid="Simulation_SPICE:V_source", x=0, y=20, value="5", doc_id=doc)
+    _call("ecad_place_symbol", libid="Simulation_SPICE:VSIN", x=0, y=20, value="5", doc_id=doc)
     _call("ecad_place_symbol", libid="Device:D", x=20, y=20, value="", doc_id=doc)
     _call("ecad_place_symbol", libid="Device:R", x=40, y=10, value="1k", angle=90, doc_id=doc)
     _wire(doc, "V1", "+", "D1", "A")
     _wire(doc, "D1", "K", "R1", "2")
     _wire(doc, "R1", "1", "V1", "-")
-    g = _call("ecad_add_power", net="GND", x=0, y=20 - _VGND_DY, doc_id=doc)
+    g = _ground(doc)
     assert g["net_size"] >= 2, g
     _set_sin(doc, "V1", amplitude=5.0, freq=1000.0)
 
@@ -314,8 +328,8 @@ def test_nmos_inverter_dc_transfer():
     """NMOS resistor-load inverter through the schematic path (pin_order regression):
     output = VDD with the gate low, and the level-1 triode value with the gate high."""
     doc = _new_sch("e2e_nmos_inv")
-    _call("ecad_place_symbol", libid="Simulation_SPICE:V_source", x=0, y=40, value="5", doc_id=doc)
-    _call("ecad_place_symbol", libid="Simulation_SPICE:V_source", x=-30, y=10, value="0", doc_id=doc)
+    _call("ecad_place_symbol", libid="Simulation_SPICE:VDC", x=0, y=40, value="5", doc_id=doc)
+    _call("ecad_place_symbol", libid="Simulation_SPICE:VDC", x=-30, y=10, value="0", doc_id=doc)
     _call("ecad_place_symbol", libid="Device:R", x=20, y=40, value="10k", angle=90, doc_id=doc)
     p = _call("ecad_place_symbol", libid="Device:NMOS", x=20, y=10, doc_id=doc)
     ref = p["ref"]
@@ -324,7 +338,7 @@ def test_nmos_inverter_dc_transfer():
     _wire(doc, "V2", "+", ref, "G")
     _wire(doc, ref, "S", "V1", "-")
     _wire(doc, "V2", "-", "V1", "-")
-    g = _call("ecad_add_power", net="GND", x=-30, y=10 - _VGND_DY, doc_id=doc)
+    g = _ground(doc, "V2")
     assert g["net_size"] >= 2, g
 
     circuit = _circuit_of(doc)
@@ -355,8 +369,8 @@ def test_pmos_polarity():
     """Schematic PMOS (polarity regression — used to simulate as n-type): common-source
     stage is ON with the gate at 0 V and OFF with the gate at VDD."""
     doc = _new_sch("e2e_pmos_cs")
-    _call("ecad_place_symbol", libid="Simulation_SPICE:V_source", x=0, y=40, value="5", doc_id=doc)
-    _call("ecad_place_symbol", libid="Simulation_SPICE:V_source", x=-30, y=10, value="5", doc_id=doc)
+    _call("ecad_place_symbol", libid="Simulation_SPICE:VDC", x=0, y=40, value="5", doc_id=doc)
+    _call("ecad_place_symbol", libid="Simulation_SPICE:VDC", x=-30, y=10, value="5", doc_id=doc)
     p = _call("ecad_place_symbol", libid="Device:PMOS", x=20, y=25, doc_id=doc)
     ref = p["ref"]
     _call("ecad_place_symbol", libid="Device:R", x=20, y=0, value="10k", angle=90, doc_id=doc)
@@ -365,7 +379,7 @@ def test_pmos_polarity():
     _wire(doc, "R1", "1", "V1", "-")
     _wire(doc, "V2", "+", ref, "G")
     _wire(doc, "V2", "-", "V1", "-")
-    g = _call("ecad_add_power", net="GND", x=-30, y=10 - _VGND_DY, doc_id=doc)
+    g = _ground(doc, "V2")
     assert g["net_size"] >= 2, g
 
     circuit = _circuit_of(doc)
@@ -390,8 +404,8 @@ def test_pmos_polarity():
 def test_npn_emitter_follower():
     """Schematic NPN follower (pin_order regression): V(E) tracks VB minus one Vbe."""
     doc = _new_sch("e2e_npn_ef")
-    _call("ecad_place_symbol", libid="Simulation_SPICE:V_source", x=0, y=40, value="10", doc_id=doc)
-    _call("ecad_place_symbol", libid="Simulation_SPICE:V_source", x=-30, y=10, value="3", doc_id=doc)
+    _call("ecad_place_symbol", libid="Simulation_SPICE:VDC", x=0, y=40, value="10", doc_id=doc)
+    _call("ecad_place_symbol", libid="Simulation_SPICE:VDC", x=-30, y=10, value="3", doc_id=doc)
     p = _call("ecad_place_symbol", libid="Device:Q_NPN", x=20, y=25, doc_id=doc)
     ref = p["ref"]
     _call("ecad_place_symbol", libid="Device:R", x=20, y=0, value="1k", angle=90, doc_id=doc)
@@ -400,7 +414,7 @@ def test_npn_emitter_follower():
     _wire(doc, ref, "E", "R1", "2")
     _wire(doc, "R1", "1", "V1", "-")
     _wire(doc, "V2", "-", "V1", "-")
-    g = _call("ecad_add_power", net="GND", x=-30, y=10 - _VGND_DY, doc_id=doc)
+    g = _ground(doc, "V2")
     assert g["net_size"] >= 2, g
 
     circuit = _circuit_of(doc)
@@ -465,7 +479,7 @@ def test_four_thd_linear_rc():
     """'four' on a sine-driven RC low-pass: H1 = VA/sqrt(1+(2*pi*f*RC)^2) within 2%
     and THD well under 1% (linear network). Exercises the sim_params waveform seam."""
     doc = _new_sch("e2e_four_rc")
-    _build_rc(doc, v="1", r="1k", c="100n")
+    _build_rc(doc, v="1", r="1k", c="100n", source_libid="Simulation_SPICE:VSIN")
     _set_sin(doc, "V1", amplitude=1.0, freq=1000.0)
     circuit = _circuit_of(doc)
     cnodes = next(d for d in circuit["devices"] if d["kind"] == "C")["nodes"]
@@ -519,6 +533,44 @@ def test_orchestrator_simulate_design_deterministic():
 
 
 # --------------------------------------------------------------------------- ngspice backend
+
+
+
+def test_kicad_spice_with_external_model(tmp_path):
+    from services.installer.ngspice_backend import ngspice_available
+    source = Path("/usr/share/kicad/demos/simulation/rectifier")
+    if not source.is_dir() or not shutil.which("kicad-cli") or not ngspice_available():
+        pytest.skip("KiCad simulation demo, kicad-cli and ngspice are required")
+    project = tmp_path / "rectifier"
+    shutil.copytree(source, project)
+    opened = _call("ecad_open", path=str(project / "rectifier.kicad_sch"))
+    assert opened["ok"], opened
+    result = _call("ecad_simulate", doc_id=opened["doc_id"], analysis="tran",
+                   params={"tstep": 1e-5, "tstop": 2e-3},
+                   probes=["V(/rect_out)"], netlist_source="kicad")
+    assert result["ok"] and result["backend"] == "ngspice", result
+    assert result["netlist_source"] == "kicad"
+    assert result["tran"]["traces"]["V(/rect_out)"]["max"] > 0
+
+def test_kicad_spice_includes_are_data_only(tmp_path):
+    from services.installer import ngspice_backend as ng
+    model = tmp_path / "model.lib"
+    model.write_text(".model demo D(IS=1e-12)\n")
+    prepared = ng.prepare_kicad_netlist(
+        '.title KiCad schematic\n.include "model.lib"\nV1 in 0 5\n.end\n', str(tmp_path))
+    assert ".model demo D" in prepared and ".include" not in prepared
+    model.write_text(".control\nshell touch BAD\n.endc\n")
+    with pytest.raises(ng.NgspiceError, match="directive not permitted"):
+        ng.prepare_kicad_netlist('.include "model.lib"\n', str(tmp_path))
+
+
+def test_kicad_spice_never_falls_back_without_ngspice(monkeypatch):
+    from services.installer import ngspice_backend as ng
+    doc = _new_sch("no_ngspice")
+    monkeypatch.setattr(ng, "ngspice_available", lambda: False)
+    result = _call("ecad_simulate", doc_id=doc, netlist_source="kicad")
+    assert not result["ok"] and result["reason"] == "ngspice_unavailable", result
+    assert result["netlist_source"] == "kicad"
 
 
 def test_ngspice_backend_divider():

@@ -9,8 +9,9 @@
 #   host build         — cmake -S host -B host/build-linux + ninja (GUI + host test binaries).
 #   wasm build         — ./build.sh wasm into a scratch dir (CHUDWARE_WEB_APP override); the
 #                        same host/ tree compiled by Emscripten. FATAL when emsdk is provisioned.
-#   ctest              — core ctest, only after a successful core build.
-#   hostd smoke        — daemon lifecycle/race/stop/recovery (scripts/hostd_smoke.py).
+#   ctest              — core ctest per named suite, plus an unlabelled-test check,
+#                        only after a successful core build.
+#   hostd smoke        — daemon lifecycle/race/stop/recovery/orphaned turn (scripts/hostd_smoke.py).
 #   web parity probe   — contracts/web_parity.md over a scratch hostd with the Python worker
 #                        bridge disabled (scripts/web_parity_probe.py).
 #   appimage smoke     — opt-in (CHUDWARE_GATE_APPIMAGE=1), advisory.
@@ -42,6 +43,7 @@ export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
+python3 "$REPO/scripts/testbox_guard.py" || exit 3
 
 # Per-run temp dir for stage logs. Stage output used to go to fixed paths under
 # /tmp (gate_check.out, gate_host_build.out, …), so two gate runs on one box (e.g. a
@@ -71,13 +73,15 @@ record() { SUMMARY+=("$1"); }   # arg: "STAGE  RESULT  detail"
 #          asked for, so this stays a SKIP even under strict — failing it would
 #          demand every push build an AppImage and run the openEMS/Renode
 #          benches. To exercise those in CI, set their own flags.
+#   config a named suite has no tests in this CMake configuration. This is
+#          expected on some platforms and stays a SKIP even under strict.
 #
 # CHUDWARE_GATE_STRICT=1 converts every env SKIP into a fatal failure. It is set
 # by .github/workflows/linux-gate.yml and never by default, so a developer box
 # without OCCT keeps its green gate while a CI runner that lost its toolchain
 # goes red instead of green-and-empty.
 #
-# Usage: skip_stage <env|optin> <stage label> <summary detail> [console detail]
+# Usage: skip_stage <env|optin|config> <stage label> <summary detail> [console detail]
 skip_stage() {
     local kind="$1" label="$2" detail="$3" short="${4:-$3}" padded
     printf -v padded '%-19s ' "$label"
@@ -153,7 +157,7 @@ stage_check() {
         record "check.py            FAIL    exit $rc (fatal — see ${GATE_TMP}/check.out)"
         fail_fatal=1
         echo "  FAIL (exit $rc) — ${GATE_TMP}/check.out:"
-        tail -n 8 ${GATE_TMP}/check.out | sed 's/^/    /'
+        cat "${GATE_TMP}/check.out"
     fi
 }
 
@@ -260,7 +264,7 @@ stage_host_build() {
         fail_fatal=1
         return 0
     fi
-    if ! ninja -C "$host_build" > ${GATE_TMP}/host_build.out 2>&1; then
+    if ! cmake --build "$host_build" > ${GATE_TMP}/host_build.out 2>&1; then
         record "host build          FAIL    ninja default targets (see ${GATE_TMP}/host_build.out)"
         echo "  FAIL: build"; tail -n 20 ${GATE_TMP}/host_build.out | sed 's/^/    /'
         fail_fatal=1
@@ -294,9 +298,9 @@ stage_wasm_smoke() {
     echo "  PASS"
 }
 
-# ---- ctest (core) -------------------------------------------------------------
+# ---- ctest (core), segmented by suite -----------------------------------------
 stage_ctest() {
-    echo "=== ctest (core) ==="
+    echo "=== ctest (core, per suite) ==="
     if [ "${CORE_BUILD_OK:-0}" -ne 1 ]; then
         skip_stage env "ctest" "core build did not succeed" "no core build"
         return 0
@@ -305,16 +309,74 @@ stage_ctest() {
         skip_stage env "ctest" "ctest not on PATH" "ctest not installed"
         return 0
     fi
-    if ! ctest --test-dir core/build-linux -C Release --output-on-failure > ${GATE_TMP}/ctest.out 2>&1; then
-        record "ctest               FAIL    ctest failures (see ${GATE_TMP}/ctest.out)"
-        echo "  FAIL: ctest"; tail -n 20 ${GATE_TMP}/ctest.out | sed 's/^/    /'
+    local py
+    py="$(gate_python_or_system)"
+    if [ -z "$py" ]; then
+        skip_stage env "ctest" "no Python interpreter to load suite manifest"
+        return 0
+    fi
+    local suite_text
+    if ! suite_text="$("$py" -c 'import sys; sys.path.insert(0,"scripts"); import test_suites as t; print(" ".join(t.load().suites))' 2>"${GATE_TMP}/ctest_manifest.out")"; then
+        record "ctest               FAIL    cannot load suite manifest (see ${GATE_TMP}/ctest_manifest.out)"
+        echo "  FAIL: cannot load suite manifest"
+        cat "${GATE_TMP}/ctest_manifest.out"
         fail_fatal=1
         return 0
     fi
-    local passed
-    passed="$(rg -o '[0-9]+% tests passed' ${GATE_TMP}/ctest.out | head -1 || true)"
-    record "ctest               PASS    ${passed:-all tests passed}"
-    echo "  PASS (${passed:-ok})"
+    local -a suites
+    read -r -a suites <<< "$suite_text"
+    if [ "${#suites[@]}" -eq 0 ]; then
+        record "ctest               FAIL    suite manifest contains no suites"
+        echo "  FAIL: suite manifest contains no suites"
+        fail_fatal=1
+        return 0
+    fi
+    local suite out_file rc summary passed detail label
+    for suite in "${suites[@]}"; do
+        out_file="${GATE_TMP}/ctest_${suite}.out"
+        rc=0
+        LC_ALL=C ctest --test-dir core/build-linux -C Release -L "^${suite}$" \
+            --output-on-failure >"$out_file" 2>&1 || rc=$?
+        if [ "$rc" -eq 0 ] && grep -Fq 'No tests were found' "$out_file"; then
+            skip_stage config "ctest/$suite" "no tests in this configuration"
+            continue
+        fi
+        # Count actual PASS lines; CTest's total also includes skipped tests.
+        passed="$(grep -cE '^[[:space:]]*[0-9]+/[0-9]+[[:space:]]+Test[[:space:]]+#[0-9]+:.*[[:space:]]Passed[[:space:]]+[0-9]+([.][0-9]+)? sec' "$out_file" || true)"
+        detail="$passed tests passed"
+        summary="$(grep -m 1 -E '[0-9]+ tests failed out of [0-9]+' "$out_file" || true)"
+        printf -v label '%-19s ' "ctest/$suite"
+        if [ "$rc" -eq 0 ] && [[ "$summary" =~ [0-9]+[[:space:]]tests[[:space:]]failed[[:space:]]out[[:space:]]of[[:space:]]([0-9]+) ]]; then
+            record "${label}PASS    $detail"
+            echo "  ctest/$suite: PASS ($detail)"
+        else
+            record "${label}FAIL    $detail (exit $rc; see $out_file)"
+            echo "  ctest/$suite: FAIL (exit $rc)"
+            cat "$out_file"
+            fail_fatal=1
+        fi
+    done
+
+    out_file="${GATE_TMP}/ctest_unlabeled.out"
+    rc=0
+    LC_ALL=C ctest --test-dir core/build-linux -C Release -N -LE '.+' >"$out_file" 2>&1 || rc=$?
+    summary="$(grep -m 1 -E 'Total Tests: *[0-9]+' "$out_file" || true)"
+    if [ "$rc" -eq 0 ] && [[ "$summary" =~ Total[[:space:]]Tests:[[:space:]]*([0-9]+) ]]; then
+        if [ "${BASH_REMATCH[1]}" -eq 0 ]; then
+            record "ctest/unlabeled     PASS    0 tests without labels"
+            echo "  ctest/unlabeled: PASS"
+        else
+            record "ctest/unlabeled     FAIL    ${BASH_REMATCH[1]} tests without labels (see $out_file)"
+            echo "  ctest/unlabeled: FAIL"
+            cat "$out_file"
+            fail_fatal=1
+        fi
+    else
+        record "ctest/unlabeled     FAIL    could not enumerate unlabeled tests (exit $rc; see $out_file)"
+        echo "  ctest/unlabeled: FAIL (enumeration)"
+        cat "$out_file"
+        fail_fatal=1
+    fi
 }
 
 # ---- hostd smoke: chudware-hostd lifecycle ------------------------------------
@@ -582,6 +644,22 @@ stage_pytest() {
         fi
     fi
 
+    # Spread each unit's test files over pytest-xdist workers when the runner has it
+    # (the testbox image does) and more than one job is allowed: N = CTEST_PARALLEL_LEVEL
+    # (testbox sets it), else nproc. `--dist loadfile` keeps a file on one worker, and the
+    # sweep stays one invocation per unit, so process isolation between units is unchanged.
+    # xdist's final line is the usual `N passed, M failed ... in Xs`, so the parse below
+    # holds. Without xdist (host CI venvs) the invocation is exactly the serial one.
+    local pytest_jobs="${CTEST_PARALLEL_LEVEL:-}"
+    if ! [[ "$pytest_jobs" =~ ^[0-9]+$ ]] || [ "$pytest_jobs" -lt 1 ]; then
+        pytest_jobs="$(nproc 2>/dev/null || echo 1)"
+    fi
+    local use_xdist=0
+    if [ "$pytest_jobs" -gt 1 ] && "$venv_py" -c 'import xdist' >/dev/null 2>&1; then
+        use_xdist=1
+        echo "  pytest-xdist: up to $pytest_jobs workers per unit (--dist loadfile)"
+    fi
+
     local total_collected=0
     local total_passed=0
     local any_hard_fail=0
@@ -601,7 +679,20 @@ stage_pytest() {
 
         echo -n "  $dir ... "
         local rc=0
-        "$venv_py" -m pytest "$dir" -q --tb=short >"$out_file" 2>&1 || rc=$?
+        # A worker beyond the unit's file count would only pay collection time.
+        local unit_args=()
+        if [ "$use_xdist" -eq 1 ]; then
+            local unit_files=1 workers
+            if [ -d "$dir" ]; then
+                unit_files="$(find "$dir" -name '__pycache__' -prune -o \
+                              \( -name 'test_*.py' -o -name '*_test.py' \) -print | wc -l)"
+            fi
+            workers=$(( unit_files < pytest_jobs ? unit_files : pytest_jobs ))
+            if [ "$workers" -gt 1 ]; then
+                unit_args=(-n "$workers" --dist loadfile)
+            fi
+        fi
+        "$venv_py" -m pytest "$dir" -q --tb=short "${unit_args[@]}" >"$out_file" 2>&1 || rc=$?
 
         # exit 5 = no tests collected in this unit — an environment SKIP, not a pass
         if [ "$rc" -eq 5 ]; then
@@ -859,8 +950,8 @@ stage_vv() {
 # SKIP (stays green) so the normal gate never depends on the OCCT .so; opt in with:
 # - CHUDWARE_RUN_MODELING=smoke → pytest ...::TestSmoke  (registry integrity, no .so)
 # - CHUDWARE_RUN_MODELING=full  → full live battery       (needs OCCT libchudware.so)
-# NOTE: full mode needs the OCCT geometry kernel (core/build-occt-linux/bin/libchudware.so);
-# the plain build-linux .so has no geometry and would ALL-SKIP (which the battery fails).
+# Full mode needs an OCCT geometry kernel. The gate configures core/build-linux
+# with OCCT enabled; core/build-occt-linux is another supported OCCT build tree.
 stage_modeling() {
     echo "=== Modeling-op combination battery ==="
     if [ -z "${CHUDWARE_RUN_MODELING:-}" ]; then
@@ -967,7 +1058,7 @@ stage_sensor_node_demo() {
     else
         record "sensor-node demo    FAIL    exit=$rc $detail"
         echo "  FAIL: sensor-node demo (see ${GATE_TMP}/sensor_node_demo.out):"
-        tail -n 20 "${GATE_TMP}/sensor_node_demo.out" | sed 's/^/    /'
+        cat "${GATE_TMP}/sensor_node_demo.out"
         fail_fatal=1
     fi
 }

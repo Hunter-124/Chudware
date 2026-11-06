@@ -8,12 +8,10 @@
 // throwing (the security-critical refusal path). NO network clients built.
 #pragma once
 
-#include <map>
 #include <optional>
 #include <string>
 
 #include <nlohmann/json.hpp>
-#include "agent/firm_team.h"
 
 namespace chudware {
 namespace agent {
@@ -32,11 +30,6 @@ json load_config();
 
 // bool(cfg.get("offline_mode", False)).
 bool offline_enabled(const json& cfg);
-
-// consent_tier: resolve the telemetry consent tier from config.
-// Returns "off"|"meta"|"full". offline_enabled(cfg) hard-forces "off".
-// External default is "off". Unknown/missing values default to "off".
-std::string consent_tier(const json& cfg);
 
 // compliance_mode: "off" | "redact" | "local_only" (WS3 ITAR outbound redaction).
 // Reads the top-level "compliance_mode" config key; normalized case-insensitively
@@ -63,77 +56,6 @@ bool provider_offline_safe(const json& provider);
 // stale OAuth token in-process (agent/auth.cpp) and swap in the reloaded
 // config before reading tokens.
 json resolve_provider(const std::optional<std::string>& name, json cfg, const json& env);
-
-// --- experimental AI features (config "experimental" block) -----------------
-// These are opt-in, default-off knobs the host exposes in Settings -> Experimental. They are
-// ADDITIVE: with the block absent the resolved descriptor is byte-identical to the pre-feature
-// shape, so the run loop and the Python-parity gate are unchanged.
-//
-// resolve_review_provider: resolve a SEPARATE provider descriptor for the vision review/fix
-// stages from "experimental.vision_review" — a local OpenAI-compatible vision endpoint (e.g. a
-// self-hosted Qwen2.5-VL). This is the Seek-CAD-style split: a strong (or cloud) planner emits
-// ops while a local vision judge sees the render and drives self-correction, which also makes an
-// all-local ITAR-safe review loop possible. Returns a resolved descriptor (same shape as
-// resolve_provider, supports_vision forced on), {error:...} on an offline refusal, or null when
-// the block is absent/disabled. Inherits the ambient offline_mode guard.
-json resolve_review_provider(const json& cfg, const json& env);
-
-// apply_experimental: attach the experimental knobs onto an already-resolved MAIN descriptor so
-// the run loop is the single consumer. Adds "review_provider" (when resolve_review_provider yields
-// a usable descriptor) and the "cad_sequence_mode" bool (modeler prompt augmentation preferring an
-// editable parametric feature sequence over a monolithic solid). No-op when the block is absent.
-json apply_experimental(json resolved_main, const json& cfg, const json& env);
-
-// The model's total token context window for a resolved descriptor. Reads the descriptor's
-// "context_window" (populated by resolve_provider from the config override or a per-provider
-// default), falling back to the per-provider default by name if absent. Local/unknown providers
-// default to a conservative 8192 so we never overrun a small local window.
-int context_window_for(const json& provider_cfg);
-
-// Coordinate the per-call INPUT token cap with the OUTPUT token reservation so the two, plus a
-// safety margin, fit inside the model's context window. `desired_output` is the caller's wanted
-// output budget (e.g. call_budget_for). For a large (cloud) window the input cap stays lean
-// (kContextTokenCap) and output stays at `desired_output`; for a small LOCAL window BOTH shrink
-// so input + output + margin <= window. This is what stops local models from silently running
-// out of context mid-chain (the server truncating the prompt and the model emitting garbage).
-struct CallBudget {
-    int input_cap;  // max input (system + body) tokens to assemble for this call
-    int output;     // max output tokens to request from the provider
-};
-CallBudget fit_call_budget(const json& provider_cfg, int desired_output);
-
-// --- eng_firm.models (per-role provider overrides for the Eng. Firm org) ------
-// Nested under config.json "eng_firm": { "models": {
-//   "mission_planner"|"advisor"|"lead"|"subcontractor": {provider, model, thinking},
-//   "disciplines": { "mechanical"|...|"generalist": {provider, model, thinking} }
-// }}. All optional. Absent/empty → ambient provider (byte-identical to today).
-// Resolution for an awarded task:
-//   disciplines.<discipline> → lead|subcontractor (by team role) → ambient.
-struct EngFirmModelEntry {
-    std::string provider;
-    std::string model;
-    std::string thinking;
-    bool empty() const {
-        return provider.empty() && model.empty() && thinking.empty();
-    }
-};
-struct EngFirmModels {
-    EngFirmModelEntry mission_planner;
-    EngFirmModelEntry advisor;
-    EngFirmModelEntry lead;
-    EngFirmModelEntry subcontractor;
-    std::map<std::string, EngFirmModelEntry> disciplines;
-};
-// Parse eng_firm.models from cfg (or load_config() when cfg is null). Tolerant of
-// non-object/missing keys; never throws.
-EngFirmModels load_eng_firm_models(const json& cfg = json(nullptr));
-// Resolve an entry to a provider descriptor (same shape as resolve_provider).
-// Bare provider name via resolve_provider; "provider/model" overlay; thinking →
-// reasoning_effort. Empty entry or resolve failure → null (safe no-op). Never throws.
-json resolve_eng_firm_provider(const EngFirmModelEntry& e, const json& cfg,
-                               const json& env = json::object());
-// Discipline enum → lowercase eng_firm.models.disciplines key (Generalist → "generalist").
-std::string eng_firm_discipline_key(Discipline d);
 
 }  // namespace agent
 }  // namespace chudware

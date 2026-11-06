@@ -8,10 +8,7 @@ downloads anything and never attempts redistribution of Amazon's content; it
 only surfaces a link-out plus the price/availability fields a human would read
 off the page themselves.
 
-Amazon also runs aggressive bot detection. This adapter treats a CAPTCHA/
-bot-challenge page exactly like a login wall — it returns ``login_required``
-(never attempts to solve or bypass the challenge) so a human can complete it
-in their own saved browser profile if they choose to.
+Amazon bot challenges are reported distinctly and never solved or bypassed.
 
 LIVE SHAPE (verified 2026-07-07 against a real fetched
 ``https://www.amazon.com/s?k=m3+screw`` page, HTTP 200, no captcha): the search
@@ -35,7 +32,8 @@ import html
 import re
 
 from .. import session as _session
-from . import is_login_wall, login_required, provenance_envelope, register
+from . import fail, is_login_wall, login_required, make_hit, provenance_envelope, quote_query, register
+from ._retail import _is_captcha, card_image
 
 SITE = "amazon"
 BASE_URL = "https://www.amazon.com"
@@ -53,7 +51,7 @@ LICENSE_NOTE = (
 # carries a hidden sign-in nav form with that attribute (live-probe 2026-07-07
 # false positive); only markers unique to the actual auth interstitial belong here.
 _LOGIN_WALL_MARKERS = ('id="ap_email"', 'Sign in to your account')
-# Bot-challenge markers: never bypass, treat exactly like a login wall.
+# Bot-challenge markers: never bypass.
 _CHALLENGE_MARKERS = (
     "Enter the characters you see",
     "/errors/validateCaptcha",
@@ -96,15 +94,16 @@ class AmazonAdapter:
     key = SITE
 
     def search(self, query: str) -> list[dict]:
-        url = SEARCH_URL_TMPL.format(query=query.replace(" ", "+"))
+        url = SEARCH_URL_TMPL.format(query=quote_query(query))
         result = _session.browser_fetch(url, SITE)
         if not result.get("ok"):
-            return [result]
+            return [{**result, "site": SITE, "op": "search", "url": result.get("url") or url}]
         content = result.get("content", "")
+        if is_login_wall(content, _CHALLENGE_MARKERS) or _is_captcha(url, content):
+            reason = "captcha" if _is_captcha(url, content) else "blocked"
+            return [fail(SITE, "search", reason, "Amazon returned a robot check.", url=url)]
         if is_login_wall(content, _LOGIN_WALL_MARKERS):
-            return [login_required(SITE, url)]
-        if is_login_wall(content, _CHALLENGE_MARKERS):
-            return [login_required(SITE, url)]
+            return [{**login_required(SITE, url), "site": SITE, "op": "search", "url": url}]
         # Split the page on card boundaries and parse each card slice in
         # isolation so title/price never leak across cards.
         cards = list(_CARD_RE.finditer(content))
@@ -120,36 +119,40 @@ class AmazonAdapter:
             if not title_match:
                 continue  # no readable title → not a real product card
             price_match = _PRICE_RE.search(block)
-            hits.append({
-                "title": _strip_tags(title_match.group("title")),
-                # Canonical product URL from the ASIN — sponsored hrefs are
-                # /sspa/click tracking redirects, so we never trust the raw href.
-                "url": BASE_URL + "/dp/" + asin,
-                "site": SITE,
-                "sku": asin,   # the ASIN is the natural Amazon SKU
-                "asin": asin,
-                "price": price_match.group("price") if price_match else None,
-            })
+            hits.append(make_hit(
+                SITE, title=_strip_tags(title_match.group("title")),
+                url=BASE_URL + "/dp/" + asin, sku=asin,
+                price=float(price_match.group("price")[1:].replace(",", "")) if price_match else None,
+                currency="USD" if price_match else None,
+                thumbnail=card_image(block, result.get("final_url") or url),
+                extra={"asin": asin},
+            ))
+        if not hits and not re.search(r"\bno results for\b", content, re.I):
+            return [fail(SITE, "search", "parse_failed", "No recognizable results on the page.", url=url)]
         return hits
 
     def acquire(self, result: dict) -> dict:
         url = result.get("url", "")
         if not url:
-            return {"ok": False, "reason": "bad_result", "hint": "result has no 'url'"}
+            return fail(SITE, "acquire", "bad_result", "result has no 'url'")
 
         page = _session.browser_fetch(url, SITE)
         if not page.get("ok"):
-            return page
+            return {**page, "site": SITE, "op": "acquire", "url": page.get("url") or url}
         content = page.get("content", "")
+        if is_login_wall(content, _CHALLENGE_MARKERS) or _is_captcha(url, content):
+            reason = "captcha" if _is_captcha(url, content) else "blocked"
+            return fail(SITE, "acquire", reason, "Amazon returned a robot check.", url=url)
         if is_login_wall(content, _LOGIN_WALL_MARKERS):
-            return login_required(SITE, url)
-        # Bot-challenge: never attempt bypass, surface exactly like a login wall.
-        if is_login_wall(content, _CHALLENGE_MARKERS):
-            return login_required(SITE, url)
+            return {**login_required(SITE, url), "site": SITE, "op": "acquire", "url": url}
 
         price_match = _PRICE_RE.search(content)
         availability_match = _AVAILABILITY_RE.search(content)
         asin_match = _ASIN_RE.search(content)
+        requested = result.get("asin") or result.get("sku")
+        if requested and asin_match and str(requested).upper() != asin_match.group("asin").upper():
+            return fail(SITE, "acquire", "unsupported",
+                        "The product page identifies a different ASIN; select the requested product.", url=url)
 
         return provenance_envelope(
             source_url=url,

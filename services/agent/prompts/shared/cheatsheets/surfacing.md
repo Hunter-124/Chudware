@@ -6,10 +6,11 @@ cover, a freeform shell, or a panel a solid feature can't make cleanly. A surfac
 
 FEATURE TYPES (required params ; required refs):
   surf_planar     refs.profile                        -> flat surface from a closed sketch region.
-  surf_extrude    params end, depth ; refs.profile    -> open side-walls (NO end caps). flip opt.
+  surf_extrude    params end ; refs.profile           -> open side-walls (NO end caps). flip opt.
+                  depth is required for blind/mid_plane; through_all derives its extent.
   surf_revolve    params angle ; refs.profile, axis   -> revolved wall. axis = a reserved datum.
-  surf_sweep      refs.profile, path, [guides]        -> profile swept along a path (open tube).
-  surf_loft       refs.sections (>=2), [guides,centerline] ; params ruled(bool) -> blended wall.
+  surf_sweep      refs.profile, path                 -> profile swept along a path (open tube).
+  surf_loft       refs.sections (>=2) ; params ruled(bool) -> blended wall.
   surf_ruled      refs.edge_a, edge_b                 -> the exact ruled face between two edges.
   surf_offset     params distance ; refs.faces        -> offset a solid's face(s) into a surface.
   surf_fill       refs.edges (>=2) ; params continuity(g0/g1) -> a filled patch inside a boundary.
@@ -23,6 +24,8 @@ FEATURE TYPES (required params ; required refs):
   surf_delete_face   refs.faces                       -> open a solid by removing face(s) -> surface.
   surf_replace_face  refs.faces, surface              -> swap a solid's face for a surface (BOP
                   heal); the replacement must FULLY SPAN the target face or you get an open shell.
+
+Native surface sweep/loft do not implement guide or centerline references; omit them.
 
 INVOCATION:
   - One batch: "$N" = an earlier op's 0-based index; a separate batch uses the assigned "fN".

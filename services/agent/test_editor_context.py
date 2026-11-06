@@ -1,6 +1,6 @@
 """Picked model context (composer context picker) rendered into the online prompt.
 
-``worker_rpc._editor_context_block`` resolves each ``context_refs`` chip against the engine
+``worker_rpc._picked_context_text`` resolves each ``context_refs`` chip against the engine
 (doc_tree / doc_query / doc_resolve_pick). A fake engine stands in for hostd here; the real
 engine path is the same three calls.
 """
@@ -57,8 +57,8 @@ class FakeEngine:
 
 
 def _block(refs, engine, **extra):
-    params = {"scope": {"doc_id": DOC}, "context_refs": refs, **extra}
-    return worker_rpc._editor_context_block(params, engine_call=engine)
+    params = {"context_refs": refs, **extra}
+    return worker_rpc._picked_context_text(params, engine_call=engine)
 
 
 def test_face_and_edge_carry_owner_live_geometry_and_targeting():
@@ -116,8 +116,8 @@ def test_feature_sketch_component_and_body_summaries():
 
 def test_assembly_face_names_component_frame_and_skips_live_verification():
     engine = FakeEngine()
-    text = worker_rpc._editor_context_block(
-        {"scope": {"doc_id": ASM}, "context_refs": [
+    text = worker_rpc._picked_context_text(
+        {"context_refs": [
             {"kind": "face", "id": "Fa1b2c3", "doc_id": ASM, "label": "Face of Wheel",
              "selector": TOP, "component": "k2", "owner_feature": "f1"}]},
         engine_call=engine)
@@ -127,22 +127,18 @@ def test_assembly_face_names_component_frame_and_skips_live_verification():
     assert "doc_query" not in [m for m, _ in engine.calls]
 
 
-def test_selection_dedupes_picked_faces_bounds_refs_and_survives_engine_failure():
+def test_bounds_refs_survive_engine_failure_and_never_describe_the_open_document():
     many = [{"kind": "feature", "id": f"f{i}", "doc_id": DOC} for i in range(30)]
-    text = _block(many, FakeEngine(fail=True),
-                  scope={"doc_id": DOC, "selection": [TOP, EDGE]})
+    text = _block(many, FakeEngine(fail=True))
     assert "(+6 more picked item(s) not shown)" in text
     assert "24. FEATURE f23" in text and "25. FEATURE" not in text
 
-    deduped = worker_rpc._editor_context_block(
-        {"scope": {"doc_id": DOC, "selection": [TOP, EDGE]},
-         "context_refs": [{"kind": "face", "id": "Fa1b2c3", "doc_id": DOC, "selector": TOP}]},
+    # Chips name their own documents; the GUI's open document and selection are never
+    # rendered, even when a caller still sends them.
+    ambient = {"doc_id": DOC, "scope": {"doc_id": DOC, "selection": [TOP, EDGE]}}
+    assert worker_rpc._picked_context_text(ambient, engine_call=FakeEngine()) == ""
+    with_chip = worker_rpc._picked_context_text(
+        {**ambient, "context_refs": [{"kind": "sketch", "id": "f2", "doc_id": DOC}]},
         engine_call=FakeEngine())
-    assert "- selected geometry (1): E0f0f0f: line edge" in deduped
-
-    # No open document: the picked items are still described (they name their own docs).
-    no_doc = worker_rpc._editor_context_block(
-        {"context_refs": [{"kind": "sketch", "id": "f2", "doc_id": DOC}]},
-        engine_call=FakeEngine())
-    assert no_doc.startswith("PICKED CONTEXT") and "ACTIVE DOCUMENT" not in no_doc
-    assert worker_rpc._editor_context_block({}, engine_call=FakeEngine()) == ""
+    assert with_chip.startswith("PICKED CONTEXT")
+    assert "ACTIVE DOCUMENT" not in with_chip and "selected geometry" not in with_chip

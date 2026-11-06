@@ -4,10 +4,8 @@
 
 An anonymous headless fetch of these sites' search URLs does NOT reach a
 product-results page; each is fronted by an edge/bot-management layer that
-serves a block shell with HTTP 200. The honest, sanctioned behavior (same as
-grainger) is to degrade to the ``login_required`` ask — never solve or bypass
-the wall, and never silently parse the block shell to an empty result list
-("no hits parsed").
+serves a block shell with HTTP 200. Report the block without attempting to
+solve or bypass it, and never silently parse it as an empty result list.
 
 The fixtures below are VERBATIM captures of the real block pages returned on
 2026-07-07 (lowes/tractorsupply are Akamai edgesuite "Access Denied" pages,
@@ -104,9 +102,8 @@ _WALL_CASES = {
 
 
 @pytest.mark.parametrize("site", sorted(_WALL_CASES))
-def test_real_bot_wall_degrades_to_login_required(walled_mods, monkeypatch, site):
-    """The real block page must degrade to the login_required ask, never parse
-    to a silent empty list and never be bypassed."""
+def test_real_bot_wall_degrades_to_blocked(walled_mods, monkeypatch, site):
+    """A bot wall is not a sign-in requirement."""
     session, mods = walled_mods
     html = _WALL_CASES[site]
     monkeypatch.setattr(session, "browser_fetch",
@@ -116,8 +113,7 @@ def test_real_bot_wall_degrades_to_login_required(walled_mods, monkeypatch, site
 
     assert len(hits) == 1
     assert hits[0]["ok"] is False
-    assert hits[0]["reason"] == "login_required"
-    assert hits[0]["ask_user"]["id"].startswith("browser_login")
+    assert hits[0]["reason"] == "blocked"
 
 
 @pytest.mark.parametrize("site", sorted(_WALL_CASES))
@@ -131,4 +127,4 @@ def test_real_bot_wall_never_reaches_parse(walled_mods, monkeypatch, site):
 
     hits = mods[site].ADAPTER.search("anything")
     # A silent empty list (or a fabricated product hit) would both fail here.
-    assert hits and hits[0].get("reason") == "login_required"
+    assert hits and hits[0].get("reason") == "blocked"

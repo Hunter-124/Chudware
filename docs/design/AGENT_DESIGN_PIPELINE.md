@@ -1,23 +1,9 @@
 # Agent Design Pipeline — the guided design-thinking architecture
 
-**Status:** adopted architecture (2026-07-05, status updated 2026-10-04). The paragraphs
-below record the intended design pipeline, especially for local 24k–48k-context models,
-without choking frontier models (Opus/Sonnet). The pipeline is implemented; the text is the
-dated architecture intent, not an as-built spec. It refines, rather than replaces, the
-existing phase machine (`services/agent/pipeline/phases.py`), role roster
-(`services/agent/roles/`), advisory layer (`contracts/advisor.md`), councils
-(`services/agent/councils.py`), buildgraph (`aicad.buildgraph/1`), delegation/routing
-(`aicad.delegation/1`), effort tiers (`aicad.effort/1`), mission workspace (`aicad.mission`),
-and PLM vault (`aicad.plm/1`).
-
-Later changes:
-
-- **§3.6 effort and auto-mode.** Superseded by the 2026-09-07 Copilot-preferences cutover:
-  `services/agent/preferences.py` now owns Auto. The `ai_effort` preset API,
-  `effort_presets.yaml` and the preset tuner/scaffold selection were retired.
-- **Online model execution.** Since 2026-08-31, online model execution for pipeline roles
-  runs inside the embedded Chudcode RPC runtime. Stages, roles, councils and delegation
-  governance stay Chudware-owned ([Chudcode integration](../dev/chudcode-integration.md)).
+This document records the design pipeline and its rationale, not an as-built
+specification. Online model execution runs inside the official OMP RPC runtime;
+see [OMP integration](../dev/omp-integration.md). The council layer it describes
+(§3.3) has been removed.
 
 ---
 
@@ -37,8 +23,7 @@ needs from a **protected source of truth (the design ledger)**, does **one cogni
 and writes structured results back. At every stage the pipeline **punches through the abstraction the
 model can't hold** by (a) pre-decomposing the thinking into steps, (b) **proactively loading
 the exact helper/calculator/data/tool the current micro-task needs** so the model never has
-to recall or derive it, (c) convening **councils** at decision points to beat single-model
-blind spots, and (d) running an **overseer** that audits the chain-of-thought and re-grounds
+to recall or derive it, and (c) running an **overseer** that audits the chain-of-thought and re-grounds
 or re-routes — *diagnosing* problems into targeted corrections rather than blind retries.
 
 The same machinery **speeds up** a frontier model instead of constraining it: stages become
@@ -49,9 +34,9 @@ scaffolding dials down via effort/auto-mode. **Flexibility is a first-class requ
 
 ## 2. The design-thinking pipeline (the spine)
 
-Six stages, refining the existing `SPECIFY → ORGANIZE → PLAN → BUILD` span. Each stage is a
-role with a rich system prompt, a scoped context recipe, proactive helpers, an optional
-council, and an overseer audit gate. Each writes typed events to the ledger (§4).
+Six stages, refining the existing `SPECIFY → PLAN → BUILD` span. Each stage is a
+role with a rich system prompt, a scoped context recipe, proactive helpers,
+and an overseer audit gate. Each writes typed events to the ledger (§4).
 
 ### Stage 0 — INTENT CAPTURE  *(role: intake_analyst — exists)*
 Parse the request into **requirements, constraints, material, manufacturing process, use
@@ -97,8 +82,8 @@ choice, feature order so every reference exists when built, sketch planes, patte
 opportunities, minimal-setup orientation (helps downstream CAM).
 - **Output:** an `aicad.buildgraph/1` DAG — ordered ops with dependencies, **validated**
   (cycles, missing refs) and **preflighted** (shadow-clone dry-run per op).
-- **Council (build-strategy — exists):** MVP-first vs robustness-first vs manufacturing-first,
-  synthesized by a judge.
+- **Council (build-strategy — removed, see §3.3):** MVP-first vs robustness-first vs
+  manufacturing-first, synthesized by a judge.
 
 ### Stage 5 — EXECUTION  *(role: feature_modeler workers — exists; fan-out over the build DAG)*
 Fresh-context worker models execute each op/op-cluster via CAD tools, guided by the geometry
@@ -127,20 +112,16 @@ model is about to do) and **after** (diagnose, target the fix). This is what con
 guess-loops into one-shot corrections. Every acceptance criterion maps to a concrete check
 invocation; interface components carry extra context + checkers and are audited on failure.
 
-### 3.3 Guidance councils  *(contract: aicad.council/1)*
-N models debate a decision; a judge synthesizes. **Councils are available at every stage and
-configurable.** Defaults adapt to task-breakdown needs and cross-department
-dependencies; local tier runs them **wide** (free tokens), frontier runs **narrow or single**.
-When multiple model sources exist, councils prefer **diverse models** over temperature-only
-diversity. Council policy is per-stage, per-tier, and overridable in Advanced mode.
+### 3.3 Guidance councils  *(removed)*
+The council layer (`aicad.council/1`, `council_convene`) was removed with
+`services/agent/councils.py`; the per-stage "Council" bullets above are design
+history. Multi-angle review is available through ponder delegations
+(`aicad.delegation/1`) and the advisory/overseer audits.
 
 ### 3.4 Hierarchical delegation  *(contract: aicad.delegation/1 + routing)*
-An overseer/lead spawns lesser sub-agents; **sub-agents may spawn their own sub-agents
-recursively with no hard cap**, and every delegation auto-approves at every depth. The only
-rails are a **human-visible budget meter and a kill-switch** (runaway
-protection), plus per-role model routing. Sub-agent **model preferences are a GUI
-setting**. Each agent may hold **multiple open documents** so the user can watch every
-sub-agent build its part of an assembly simultaneously.
+An overseer or lead may delegate work to sub-agents. Agents can work across the
+workspace; edited parts already open to the user update in place, while other
+parts are shown when the user opens them or the agent presents them.
 
 ### 3.5 Sketch & GSL accuracy helpers
 The execution rung lives or dies on sketch quality:
@@ -153,15 +134,6 @@ The execution rung lives or dies on sketch quality:
   *see* what it built and what's left. This is the feedback channel that makes the loop
   converge.
 
-### 3.6 Effort, auto-mode, and the tuning loop  *(contract: aicad.effort/1; superseded, see Status)*
-- **Auto-mode (default):** a **workflow router** classifies the task and lets the model
-  self-select how much of the pipeline to use. **Local models default to the full
-  scaffold.**
-- **Advanced mode:** exposes every stage/council/helper knob to experienced users.
-- **The tuning loop:** a benchmark harness runs example tasks across workflow
-  configurations and **learns which scaffold level is best per task-class**, feeding the
-  auto-mode classifier. Choosing how to apply the workflows to each task class is a
-  measured, ongoing process — never a guess.
 
 ### 3.7 Transparency
 Every helper, advisory, council vote, tool call, auto-applied fix, and delegation is
@@ -204,7 +176,7 @@ until the spec_writer card enforced ledger-first — every stage inherits that r
 - Stage IO schemas (the typed handoffs above) and the ledger event kinds.
 - Stage-gate definitions (what makes each stage "complete" — read from the ledger).
 - How the six stages nest inside `phases.py` and reuse its gates.
-- Effort/auto-mode hooks (which stages/councils/helpers a scaffold level enables).
+- Effort/auto-mode hooks (which stages/helpers a scaffold level enables).
 - The advisor trigger bindings (`aicad.trigger/1`): geometry-kind → helper set.
 
 ---
@@ -214,8 +186,7 @@ until the spec_writer card enforced ledger-first — every stage inherits that r
 1. Every stage is a **skippable checkpoint**: a model that satisfies it in one pass advances
    immediately; nothing forces N steps.
 2. Helpers are **offered, not imposed** — a frontier model can decline and proceed.
-3. **Auto-mode** lets the model pick its own depth; **Advanced mode** hands control to the
-   user; **local default = full scaffold**.
+3. Adapt the workflow depth to the task without imposing a fixed scaffold.
 4. Council breadth and delegation depth are **config, per-tier**, not hard-coded.
 5. The pipeline **adds context and speed, never a fixed modeling path** — two models given the
    same brief may build different (valid) parts; the pipeline judges by the ledger + verify
@@ -228,7 +199,7 @@ until the spec_writer card enforced ledger-first — every stage inherits that r
 Commercial CAD copilots bolt an LLM onto a command API and hope. This pipeline instead **gives the model
 the translations, context, and assistance to actually do the job**: the abstraction ladder is
 pre-decomposed, the exact tool/calculator/data for the current micro-task is in front of the
-model automatically, councils cover its blind spots, an overseer catches its mistakes and
+model automatically, an overseer catches its mistakes and
 re-routes them precisely, and a text channel lets a no-vision local model *see* its own work.
 The result is that a **free local model** can produce a coherent, verified, manufacturable,
 version-controlled part — and a frontier model does it faster and more accurately than it
@@ -236,26 +207,6 @@ could unaided.
 
 ---
 
-## 8. Implementation map
-
-| component | depends on |
-|---|---|
-| `contracts/design_pipeline.md` (aicad.designpipe/1) + stages wired into `phases.py` | — |
-| feature_architect role + functional-decomposition helpers + coverage checker | contract |
-| geometry_designer role + **proactive op-aware helper/calculator registry** | contract |
-| linkage_planner role + reference-integrity/datum/interface checkers | contract |
-| Overseer audit-and-reroute loop + user-change → stage mapping | contract |
-| Advisory expansion — every checker → diagnostic advisor w/ targeted fix + tool | contract |
-| Sketch-completion + GSL-status-to-text + critical-dim scheme helpers | — |
-| Council policy engine — per-stage, per-tier, diverse-model, configurable | contract |
-| Hierarchical delegation (overseer-discretion recursion) + budget meter/kill-switch | contract |
-| Auto-mode workflow router + benchmark-based tuning loop | roles, councils |
-| GUI transparency panel (helpers/advisories/councils/delegation/tools) | advisory expansion |
-| GUI sub-agent model-preference settings + effort auto/advanced UI | delegation |
-| Multi-file agent view — watch N agents build N parts simultaneously | — |
-| Design-pipeline ↔ PLM wiring (stage checkpoints, rationale narrative) | contract, PLM GUI |
-
----
 
 ## 9. Presentation & workspaces (2026-07-05)
 
@@ -284,7 +235,7 @@ surface you switch to when you want to see and steer the whole operation. It con
   model or effort on the fly.
 - **Session management**: list, switch, fork, and resume agent sessions; the multi-file view
   so several parts under concurrent work are visible at once.
-- **The transparency stream**: helpers/advisories/councils/tool-calls, inline.
+- **The transparency stream**: helpers/advisories/tool-calls, inline.
 Switching INTO this workspace replaces the viewport with the comprehensive view; switching
 out returns to the model with the overlay copilot intact.
 
@@ -297,13 +248,4 @@ status colouring; the same widget embeds small in the overlay copilot (compact) 
 the AI-Agent workspace (full). Reuses the mission workspace event streams (`aicad.mission`)
 and the delegation tree (`aicad.delegation/1`). Glass design language, dark-mode contrast.
 
-### 9.4 AI time-remaining estimator
-A live **ETA to part-complete**: `remaining_tokens / effective_tokens_per_sec`, where
-`remaining_tokens` = Σ over not-yet-done subtasks of their **expected token cost** (from
-benchmark-measured per-role/per-stage token tables, fed by the tuning loop), and
-`effective_tokens_per_sec` = the live aggregate rate across
-running slots (the CUDA server's measured throughput). Shown as a **status-bar clock** (whole
-mission) and as **per-node ETAs on the DAG** (§9.3). Honest about uncertainty: shows a range
-when a subtask has few historical samples; never invents a number. Frontier-model runs use the
-provider's observed rate.
 

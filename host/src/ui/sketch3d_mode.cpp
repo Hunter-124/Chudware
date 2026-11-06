@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 
 #include "../core/app_state.h"
@@ -201,8 +202,10 @@ void Sketch3DMode::reloadParamsFromTree(AppState& st) {
     entJson_ = nlohmann::json::array();
     conJson_ = nlohmann::json::array();
     externalRefs_ = nlohmann::json::array();
+    paramsRevision_ = -1;
     const auto& tree = st.docMirror.tree();
-    if (!tree.is_object() || !tree.contains("features")) return;
+    if (st.docMirror.docId() != docId_ || !tree.is_object() ||
+        !tree.contains("features") || !tree["features"].is_array()) return;
     for (const auto& f : tree["features"]) {
         if (f.value("id", std::string()) != fid_) continue;
         const auto& params = f.value("params", nlohmann::json::object());
@@ -212,25 +215,88 @@ void Sketch3DMode::reloadParamsFromTree(AppState& st) {
             conJson_ = params["constraints"];
         if (params.contains("external_refs") && params["external_refs"].is_array())
             externalRefs_ = params["external_refs"];
+        paramsRevision_ = st.docMirror.revision();
         return;
     }
 }
 
+void Sketch3DMode::discardLocalEdit(AppState& st) {
+    ++dragGen_;
+    dragPending_ = dragInFlight_ = false;
+    dragArmed_ = dragging_ = false;
+    dragEntities_ = nlohmann::json();
+    dragHandle_.clear();
+    dragRevision_ = -1;
+    resetTool();
+    clearSel();
+    dimPopupOpen_ = planePopupOpen_ = false;
+    ents_.clear();
+    reloadParamsFromTree(st);
+    refreshHealth(st);
+}
+
+bool Sketch3DMode::requireCurrentParams(AppState& st, long sourceRevision, const char* label) {
+    if (st.docMirror.docId() != docId_) {
+        cancelRevision_ = -1;
+        return false;
+    }
+    if (sourceRevision >= 0 && sourceRevision == paramsRevision_ &&
+        sourceRevision == st.docMirror.revision()) return true;
+    cancelRevision_ = -1;
+    discardLocalEdit(st);
+    st.toast(ui::ToastLevel::Warn, std::string(label) +
+             ": the 3D sketch changed externally. Current geometry was reloaded; make a fresh edit.");
+    return false;
+}
+
+core::OpsResponse Sketch3DMode::applySketchOp(AppState& st, const nlohmann::json& op) {
+    if (st.docMirror.docId() != docId_) {
+        cancelRevision_ = -1;
+        core::OpsResponse result;
+        result.error_message = "The active document changed.";
+        return result;
+    }
+    const long before = st.docMirror.revision();
+    if (before != cancelRevision_) cancelRevision_ = -1;
+    auto result = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    if (cancelRevision_ >= 0) {
+        const bool unchanged = !result.ok && result.rejected && result.unchanged &&
+                               result.revision == before && st.docMirror.revision() == before;
+        if (st.docMirror.docId() != docId_ || cancelRevision_ != before)
+            cancelRevision_ = -1;
+        else if (result.ok && result.revision >= before && result.revision <= before + 1 &&
+                 st.docMirror.revision() == result.revision)
+            cancelRevision_ = result.revision;
+        else if (!unchanged)
+            cancelRevision_ = -1;
+    }
+    if (result.ok && result.auto_rollback.is_object()) {
+        const std::string msg = result.warning.empty()
+            ? "Downstream features failed; history was rolled back for repair."
+            : result.warning;
+        st.addLog("[sketch3d] " + msg);
+        st.toast(ui::ToastLevel::Warn, msg);
+    }
+    return result;
+}
+
 bool Sketch3DMode::commitParams(AppState& st, const nlohmann::json* entities,
                                 const nlohmann::json* constraints, const char* label) {
+    if (!requireCurrentParams(st, paramsRevision_, label)) return false;
     nlohmann::json params = nlohmann::json::object();
     if (entities) params["entities"] = *entities;
     if (constraints) params["constraints"] = *constraints;
     nlohmann::json op = {{"op", "edit_feature"}, {"id", fid_}, {"params", params}};
-    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    auto r = applySketchOp(st, op);
     if (!r.ok) {
-        st.toast(ui::ToastLevel::Warn, std::string(label) + ": " + r.error_message);
-        reloadParamsFromTree(st);   // drop the rejected local edit
+        discardLocalEdit(st);   // drop the rejected local edit and restore the current display
+        st.toast(ui::ToastLevel::Warn, r.error_code == "stale_revision"
+            ? std::string(label) + ": the 3D sketch changed externally. Current geometry was reloaded; make a fresh edit."
+            : std::string(label) + ": " + r.error_message);
         return false;
     }
     if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
-    if (entities) entJson_ = *entities;
-    if (constraints) conJson_ = *constraints;
+    // The mirror's returned tree is authoritative for both arrays.
     reloadParamsFromTree(st);
     refreshHealth(st);
     return true;
@@ -311,6 +377,11 @@ void Sketch3DMode::consumeModelVertexPick(AppState& st) {
     }
     auto selector = nlohmann::json::parse(item.selector, nullptr, false);
     if (!selector.is_object()) return;
+    if (!requireCurrentParams(st, paramsRevision_, "Reference Vertex")) {
+        setModelVertexPicking(st, false);
+        st.selection.clear();
+        return;
+    }
     reloadParamsFromTree(st);
     for (const auto& ref : externalRefs_) {
         if (ref.contains("source") && ref["source"].value("selector", nlohmann::json()) == selector) {
@@ -336,11 +407,14 @@ void Sketch3DMode::consumeModelVertexPick(AppState& st) {
     auto refs = externalRefs_;
     refs.push_back({{"id", id}, {"source", {{"kind", "vertex"}, {"selector", selector}}}, {"stale", true}});
     nlohmann::json op{{"op", "edit_feature"}, {"id", fid_}, {"params", {{"external_refs", refs}}}};
-    auto result = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    auto result = applySketchOp(st, op);
     setModelVertexPicking(st, false);
     st.selection.clear();
     if (!result.ok) {
-        st.toast(ui::ToastLevel::Warn, "Reference Vertex: " + result.error_message);
+        discardLocalEdit(st);
+        st.toast(ui::ToastLevel::Warn, result.error_code == "stale_revision"
+            ? "Reference Vertex: the 3D sketch changed externally. Current geometry was reloaded; make a fresh edit."
+            : "Reference Vertex: " + result.error_message);
         return;
     }
     if (!result.aicm_path.empty()) { std::string error; st.loadDocMesh(result.aicm_path, error); }
@@ -354,10 +428,6 @@ void Sketch3DMode::consumeModelVertexPick(AppState& st) {
 // ---------------------------------------------------------------------------
 
 bool Sketch3DMode::enterForFeature(AppState& st, const std::string& fid) {
-    if (st.activeDocLockedByAgent()) {
-        st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
-        return false;
-    }
     if (active_) exitSketch(st, true);
     if (!st.docMirror.hasDoc() || !st.workerStarted) return false;
     fid_ = fid;
@@ -375,17 +445,17 @@ bool Sketch3DMode::enterForFeature(AppState& st, const std::string& fid) {
     nlohmann::json cres, cp = {{"doc_id", docId_}};
     std::string cerr;
     cancelCheckpoint_.clear();
-    if (st.worker.call("doc_checkpoint", cp, cres, cerr) && cres.contains("checkpoint"))
+    cancelRevision_ = -1;
+    if (st.worker.call("doc_checkpoint", cp, cres, cerr) && cres.contains("checkpoint")) {
         cancelCheckpoint_ = cres["checkpoint"].get<std::string>();
+        cancelRevision_ = cres.value("revision", -1L);
+        if (cancelRevision_ != st.docMirror.revision()) cancelRevision_ = -1;
+    }
     st.addLog("[sketch3d] editing " + fid_);
     return true;
 }
 
 bool Sketch3DMode::enterNew(AppState& st) {
-    if (st.activeDocLockedByAgent()) {
-        st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
-        return false;
-    }
     if (!st.docMirror.hasDoc() || !st.workerStarted) return false;
     nlohmann::json op = {{"op", "add_feature"},
                          {"feature", {{"type", "sketch3d"}, {"name", "3DSketch"},
@@ -404,10 +474,11 @@ bool Sketch3DMode::enterNew(AppState& st) {
 void Sketch3DMode::exitSketch(AppState& st, bool keep) {
     if (!active_) return;
     setModelVertexPicking(st, false);
-    const bool locked = st.docLockedByAgent(docId_);
-    if (locked) keep = true;
-    if (!keep && !cancelCheckpoint_.empty() && st.docMirror.docId() == docId_) {
-        nlohmann::json res, params = {{"doc_id", docId_}, {"checkpoint", cancelCheckpoint_}};
+    bool safeCleanup = st.docMirror.docId() == docId_ && cancelRevision_ >= 0 &&
+                       st.docMirror.revision() == cancelRevision_;
+    if (!keep && safeCleanup && !cancelCheckpoint_.empty()) {
+        nlohmann::json res, params = {{"doc_id", docId_}, {"checkpoint", cancelCheckpoint_},
+                                      {"expect_revision", cancelRevision_}};
         std::string err;
         if (st.worker.call("doc_revert", params, res, err) && !res.contains("code")) {
             if (res.contains("tess") && res["tess"].is_object()) {
@@ -415,7 +486,15 @@ void Sketch3DMode::exitSketch(AppState& st, bool keep) {
                 if (!aicm.empty()) { std::string le; st.loadDocMesh(aicm, le); }
             }
             st.docMirror.resync(st.worker);
+            cancelRevision_ = res.value("revision", -1L);
+            safeCleanup = cancelRevision_ >= 0 && st.docMirror.revision() == cancelRevision_;
+        } else {
+            safeCleanup = false;
+            st.toast(ui::ToastLevel::Warn, "3D sketch changed while cancelling; current changes were kept.");
         }
+    }
+    else if (!keep && !safeCleanup && st.docMirror.docId() == docId_) {
+        st.toast(ui::ToastLevel::Warn, "3D sketch changed while editing; current changes were kept.");
     }
     // An EMPTY sketch is noise — delete it on exit rather than leaving a contentless feature in the
     // tree. Fires for a never-populated NEW sketch AND for an existing sketch the user emptied out.
@@ -427,12 +506,17 @@ void Sketch3DMode::exitSketch(AppState& st, bool keep) {
     // keep=false (Cancel): only delete a NEW empty sketch. An EXISTING sketch the user emptied was
     // just restored by the revert block above; entJson_ (the in-memory mirror) is stale-empty and
     // must NOT trigger a delete of the restored feature — the isNewEmpty_ gate protects it.
-    if (!locked && entJson_.empty() && (keep || isNewEmpty_) && st.docMirror.docId() == docId_) {
+    if (safeCleanup && entJson_.empty() && (keep || isNewEmpty_) && st.docMirror.docId() == docId_) {
         nlohmann::json op = {{"op", "delete_feature"}, {"id", fid_}};
         st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
     }
     active_ = false;
     fid_.clear(); docId_.clear(); cancelCheckpoint_.clear();
+    cancelRevision_ = -1;
+    paramsRevision_ = -1;
+    ++dragGen_;
+    dragPending_ = dragInFlight_ = false;
+    dragRevision_ = -1;
     ents_.clear(); entJson_ = nlohmann::json::array(); conJson_ = nlohmann::json::array();
     resetTool();
     clearSel();
@@ -721,10 +805,10 @@ void Sketch3DMode::commitLine(AppState& st) {
     if (!toolAxes_.empty() && !toolAxes_[0].empty())
         cs.push_back({{"type", "along_axis"}, {"refs", {"$self"}}, {"axis", toolAxes_[0]}});
     nlohmann::json e = {{"type", "line"}, {"p1", vj(toolPts_[0])}, {"p2", vj(toolPts_[1])}};
-    std::string id = addEntity(st, e, cs);
-    // chain: next segment starts here
+    // Preserve the chain endpoint before a rejected edit clears the pending tool state.
     Vec3 last = toolPts_[1];
     std::string lastSnap = toolSnaps_[1];
+    std::string id = addEntity(st, e, cs);
     toolPts_.clear(); toolSnaps_.clear(); toolAxes_.clear();
     if (!id.empty()) {
         chainPrevHandle_ = id + ".p2";
@@ -768,6 +852,12 @@ void Sketch3DMode::commitPoint(AppState& st) {
     nlohmann::json e = {{"type", "point"}, {"p", vj(toolPts_[0])}};
     addEntity(st, e, cs);
     toolPts_.clear(); toolSnaps_.clear(); toolAxes_.clear();
+}
+
+std::string Sketch3DMode::scenarioAddPoint(AppState& st, const Vec3& point) {
+    const char* shot = std::getenv("CHUDWARE_SHOT");
+    if (!active_ || !shot || std::string(shot) != "agentlock") return {};
+    return addEntity(st, {{"type", "point"}, {"p", vj(point)}}, nlohmann::json::array());
 }
 
 // ---------------------------------------------------------------------------
@@ -1013,11 +1103,11 @@ void Sketch3DMode::kickSketch3dDragAsync(AppState& st) {
     params["sketch"] = fid_;
     st.rpc.call("sketch3d_drag", std::move(params),
                 [this, &st, gen](const core::RpcResult& r) {
+                    if (gen != dragGen_) return;
                     dragInFlight_ = false;
-                    if (gen != dragGen_) {
-                        if (dragPending_ && dragging_) kickSketch3dDragAsync(st);
-                        return;
-                    }
+                    if (!active_ || st.docMirror.docId() != docId_ ||
+                        dragRevision_ != paramsRevision_ ||
+                        dragRevision_ != st.docMirror.revision()) return;
                     if (r.ok && r.result.is_object() && !r.result.contains("code") &&
                         r.result.value("ok", false)) {
                         applyEntities(r.result);
@@ -1054,6 +1144,7 @@ void Sketch3DMode::commitDrag(AppState& st) {
     ++dragGen_;
     dragPending_ = false;
     dragInFlight_ = false;
+    if (!requireCurrentParams(st, dragRevision_, "Drag")) return;
     if (dragEntities_.is_array() && !dragEntities_.empty()) {
         // Contract §4.3: commit = plain edit_feature with the last drag response's entities.
         nlohmann::json entities = nlohmann::json::array();
@@ -1066,6 +1157,7 @@ void Sketch3DMode::commitDrag(AppState& st) {
     }
     dragEntities_ = nlohmann::json();
     dragHandle_.clear();
+    dragRevision_ = -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1075,15 +1167,6 @@ void Sketch3DMode::commitDrag(AppState& st) {
 void Sketch3DMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
                                const ImVec2& imgMax, int vw, int vh, bool imgHovered) {
     if (!active_) return;
-    if (st.docLockedByAgent(docId_)) {
-        std::string part = "part";
-        for (const auto& tab : st.docTabs)
-            if (tab.docId == docId_) { part = tab.title; break; }
-        exitSketch(st, true);
-        st.toast(ui::ToastLevel::Info,
-                 "Agent started editing " + part + " — your sketch was kept and closed");
-        return;
-    }
     // Doc switched underneath us (tab change / close): drop out cleanly.
     if (!st.docMirror.hasDoc() || st.docMirror.docId() != docId_) { exitSketch(st, true); return; }
     if (!st.renderer) return;
@@ -1249,7 +1332,7 @@ void Sketch3DMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
             }
         }
         // Right-click ends a line chain without dropping the tool.
-        if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+        if (rightClickReleased()) {
             toolPts_.clear(); toolSnaps_.clear(); toolAxes_.clear();
             chainPrevHandle_.clear();
         }
@@ -1265,6 +1348,7 @@ void Sketch3DMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin,
                 toggleSel(hovHandle_);
             } else if (!hovHandle_.empty()) {
                 dragArmed_ = true;
+                dragRevision_ = paramsRevision_;
                 dragHandle_ = hovHandle_;
                 dragOrig_ = handleWorld(hovHandle_);
                 dragDownPos_ = io.MousePos;

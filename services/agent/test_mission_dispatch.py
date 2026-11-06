@@ -32,6 +32,22 @@ def md(ledger, cache_root):
     return MissionDispatch(run_id="t_w32_run", ledger=ledger)
 
 
+def test_nested_agents_keep_independent_shared_work_intents():
+    from services.agent.coordination import CoordinationBoard
+    from services.mcp.cad_common import agent_doc_context
+
+    board = CoordinationBoard("shared-run", persist=False)
+    mission = MissionDispatch(run_id="shared-run", coordination_board=board)
+    for agent in ("bore", "fillet"):
+        with agent_doc_context(agent, scope="shared-run"):
+            assert mission.coordinate_claim(["shared-doc"], agent)["ok"]
+    with agent_doc_context("bore", scope="shared-run"):
+        mission.coordinate_release()
+    assert [(c["agent_id"], c["resource"]) for c in board.board_snapshot()["claims"]] == [
+        ("fillet", "shared-doc"),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # resolution surface
 # ---------------------------------------------------------------------------
@@ -548,12 +564,15 @@ class TestPartSearch:
             price_max=9.0,
             vendors="mcmaster",
             in_stock=True,
+            detail="full",
+            include_live=False,
         )
         assert out["ok"] is True
         assert seen["category_id"] == "bearings_motion"
         assert seen["facets"] == {"bore_mm": 12}
         assert seen["price_max"] == 9.0 and seen["vendors"] == "mcmaster"
         assert seen["in_stock"] is True
+        assert seen["detail"] == "full" and seen["include_live"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -584,11 +603,50 @@ class TestPartsV2Handlers:
         import services.parts as hub
 
         monkeypatch.setattr(
-            hub, "get", lambda pid: {"part_id": pid} if pid == "x:1" else None
+            hub, "get", lambda pid, **kwargs: {"part_id": pid} if pid == "x:1" else None
         )
         assert md.part_get("x:1")["ok"] is True
         assert md.part_get("x:2")["ok"] is False
         assert md.part_get("")["ok"] is False
+
+    def test_part_get_forwards_live_and_acquisition_controls(self, md, monkeypatch):
+        import services.parts as hub
+        from services.agent import request_context
+
+        calls = []
+        monkeypatch.setattr(hub, "get", lambda pid, **kw: calls.append((pid, kw)) or {"part_id": pid})
+        monkeypatch.setattr(request_context, "in_cell", lambda: False)
+        assert md.part_get("x:1", include_live=False, acquire=True)["ok"] is True
+        assert calls == [("x:1", {"include_live": False, "acquire": True})]
+        monkeypatch.setattr(request_context, "in_cell", lambda: True)
+        result = md.part_get("x:1", acquire=True)
+        assert result["ok"] is False and "part_acquire" in result["reason"]
+        assert len(calls) == 1
+
+    def test_local_only_mission_parts_never_call_live_providers(self, md, monkeypatch):
+        from types import SimpleNamespace
+        import services.parts as parts
+        from services.parts.hub import PartsHub
+        from services.parts import parts_library
+
+        hub = PartsHub.__new__(PartsHub)
+        hub._index = SimpleNamespace(search=lambda *a, **kw: [], get=lambda *a: None)
+        hub._registry = SimpleNamespace(
+            providers=lambda: pytest.fail("live provider lookup"),
+            get_by_domain=lambda domain: [],
+        )
+        monkeypatch.setattr(hub, "_maybe_revalidate", lambda: None)
+        monkeypatch.setattr(hub, "_ensure_index", lambda: None)
+        monkeypatch.setattr(hub, "_search_live", lambda *a, **kw: pytest.fail("live search"))
+        monkeypatch.setattr(parts, "_get_hub", lambda: hub)
+        acquired = []
+        monkeypatch.setattr(parts_library, "acquire_part",
+                            lambda part_id, *, offline: acquired.append((part_id, offline)) or None)
+        search_result = md.part_search("missing", include_live=False)
+        assert search_result["ok"], search_result
+        assert not md.part_get("catalog:missing", include_live=False)["ok"]
+        assert not md.part_get("catalog:missing", include_live=False, acquire=True)["ok"]
+        assert acquired == [("catalog:missing", True)]
 
     def test_part_source_delegates_to_impl(self, md, monkeypatch):
         from services.mcp import parts_tools as pt

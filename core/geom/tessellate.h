@@ -61,6 +61,9 @@ DisplayQuality default_display_quality();
 // Populate the same per-face triangulations as tessellate_body, without extracting
 // or allocating an AICM packet. Component compilers retain these exact meshes for
 // the final assembly display pass rather than serializing discarded part packets.
+// Spline-bearing shapes use a deflection-relative minimum mesh edge size to
+// bound OCCT's refinement of highly segmented surfaces, capped for round edges.
+// This affects display triangulation only, never the underlying B-rep.
 DisplayDeflections mesh_body(const TopoDS_Shape& shape, double lin_deflection = 0.0,
                               double ang_deflection = 0.35);
 

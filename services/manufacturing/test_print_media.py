@@ -412,6 +412,142 @@ def test_source_packets_must_be_print_ready_and_hash_exact(drive, tmp_path):
     assert _tree(drive) == snapshot
 
 
+@pytest.mark.parametrize("command", [
+    b"M28 firmware.bin", b"M29", b"M500", b"M502", b"M559", b"M560",
+    b"M993", b"M994", b"M997 S0", b"N12m0997*23",
+    b"(startup) M 997", b"SAVE_CONFIG", b"FIRMWARE_RESTART", b"UPDATE_FIRMWARE",
+    b"G28\rM997",
+])
+@pytest.mark.parametrize("override", [False, True])
+def test_firmware_maintenance_never_reaches_media(drive, tmp_path, command, override):
+    job = _job(tmp_path / "unsafe", "part", b"G28\n" + command + b"\n",
+               print_ready=not override)
+    if override:
+        job["user_override"] = "put it on the drive anyway"
+    snapshot = _tree(drive)
+    result = _publish(drive, "arm", [job])
+    assert result["ok"] is False
+    assert result["job_errors"][0]["error"] == "unsafe_print_file"
+    assert _tree(drive) == snapshot
+
+
+@pytest.mark.parametrize("suffix,body", [
+    (".bin", b"G28\n"),
+    (".bgcode", b"GCDE\x00\x01\xfe\xff"),
+    (".gcode", b"\x00\x01\x02\xff"),
+    (".gcode", b"G28\n\xff\n"),
+])
+def test_firmware_or_uninspectable_payload_never_reaches_media(drive, tmp_path, suffix, body):
+    job = _job(tmp_path / "binary", "part", body, suffix=suffix)
+    snapshot = _tree(drive)
+    result = _publish(drive, "arm", [job])
+    assert result["ok"] is False
+    assert result["job_errors"][0]["error"] in {"gcode_not_printable", "unsafe_print_file"}
+    assert _tree(drive) == snapshot
+
+
+@pytest.mark.parametrize("name", [
+    "firmware.bin", "UPDATE.BIN", "board.hex", "board.uf2",
+    "UPDATE.BIN.", "UPDATE.BIN   ", "UPDATE.BIN . .", "board.HEX. ",
+])
+def test_existing_root_firmware_is_flagged_and_blocks_publication_without_mutation(
+        drive, tmp_path, name):
+    (drive / name).write_bytes(b"unverified firmware")
+    job = _job(tmp_path / "safe", "part", b"G28\nG1 X10 Y10\n")
+    snapshot = _tree(drive)
+    for offset in (0, 1, 100):
+        inventory = _inventory(drive, offset=offset, limit=1)
+        warning = next(w for w in inventory["warnings"] if w["code"] == "firmware_files_present")
+        assert warning["paths"] == [name]
+        assert inventory["reconciled"] is False
+        if offset == 100:
+            assert inventory["files"] == []
+    result = _publish(drive, "arm", [job])
+    assert result["ok"] is False
+    assert result["error"] == "firmware_files_present"
+    assert result["paths"] == [name]
+    assert _tree(drive) == snapshot
+
+
+def test_non_firmware_metadata_and_nested_files_are_preserved(drive, tmp_path):
+    files = {"firmware.bin.txt": b"notes", "firmware.json": b"{}",
+             "ordinary.part": b"temporary notes", "models/board.bin": b"unknown nested file"}
+    for name, data in files.items():
+        path = drive / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    inventory = _inventory(drive)
+    assert not any(w["code"] == "firmware_files_present" for w in inventory["warnings"])
+    result = _publish(drive, "arm", [_job(tmp_path / "safe", "part", b"G28\nG1 X1\n")])
+    assert result["ok"], result
+    assert all((drive / name).read_bytes() == data for name, data in files.items())
+
+
+@pytest.mark.parametrize("section", ["retire", "place", "delete_archives"])
+@pytest.mark.parametrize("phase", ["swapping", "committed"])
+@pytest.mark.parametrize("name", ["UPDATE.BIN", "UPDATE.BIN.", "board.hex  "])
+def test_forged_firmware_temporary_journal_paths_refuse_before_recovery(
+        drive, tmp_path, section, phase, name):
+    txn = "0123456789abcdef"
+    staged = f".chudware_staging_{txn}/{name}"
+    path = drive / staged
+    path.parent.mkdir()
+    body = b"held data"
+    path.write_bytes(body)
+    sha = hashlib.sha256(body).hexdigest()
+    journal = {
+        "schema": pm.SCHEMA_JOURNAL, "txn": txn, "phase": phase, "project": "ARM",
+        "layout": "root", "revision": 1, "retire": [], "place": [], "metadata": [],
+        "delete_archives": [],
+    }
+    if section == "retire":
+        journal[section] = [{"path": "old_upper_arm.gcode", "held": staged, "sha256": sha}]
+    elif section == "place":
+        journal[section] = [{"path": "part.gcode", "staged": staged, "sha256": sha}]
+    else:
+        journal[section] = [{"path": "CHUDWARE/ARCHIVE/ARM/ARM_RETIRED_BY_R001.zip",
+                             "held": staged, "sha256": sha}]
+    (drive / ".chudware_JOURNAL.json").write_text(json.dumps(journal))
+    snapshot = _tree(drive)
+    pending = _inventory(drive)["interrupted_publish"]
+    assert pending is not None and not pending["valid"]
+    result = _publish(drive, "arm", _rev1(tmp_path))
+    assert not result["ok"] and result["error"] == "journal_invalid", result
+    assert _tree(drive) == snapshot
+
+
+def test_recovery_checks_staged_path_components_before_mutating(drive, tmp_path):
+    txn = "0123456789abcdef"
+    staging = drive / f".chudware_staging_{txn}"
+    staging.mkdir()
+    outside = tmp_path / "outside.part"
+    outside.write_bytes(b"untouched")
+    (staging / "new-00.part").symlink_to(outside)
+    journal = {
+        "schema": pm.SCHEMA_JOURNAL, "txn": txn, "phase": "swapping",
+        "project": "ARM", "layout": "root", "revision": 1, "retire": [], "metadata": [],
+        "place": [{"path": "part.gcode", "staged": f"{staging.name}/new-00.part",
+                   "sha256": hashlib.sha256(b"untouched").hexdigest()}],
+    }
+    (drive / ".chudware_JOURNAL.json").write_text(json.dumps(journal))
+    snapshot = _tree(drive)
+    assert _inventory(drive)["interrupted_publish"]["valid"]
+    result = _publish(drive, "arm", _rev1(tmp_path))
+    assert not result["ok"] and result["error"] == "media_symlink", result
+    assert _tree(drive) == snapshot
+    assert outside.read_bytes() == b"untouched"
+
+
+def test_print_comments_and_display_text_do_not_trigger_maintenance_refusal(drive, tmp_path):
+    body = ("; Do not run M997\n(M500 disabled)\nM117 Do not run M997\n"
+            "M118 firmware.bin is not a print job\nG28\nG1 X10 Y10\n"
+            "; café: M994\n").encode("utf-8")
+    job = _job(tmp_path / "safe", "part", body)
+    result = _publish(drive, "arm", [job])
+    assert result["ok"], result
+    assert (drive / "part.gcode").read_bytes() == body
+
+
 def test_user_override_publishes_a_not_ready_job_with_its_failed_checks(drive, tmp_path):
     src = tmp_path / "override"
     ready = _job(src, "base", b"G1 BASE\n")
@@ -813,17 +949,15 @@ def test_legacy_interrupted_publish_recovers_then_migrates(drive, tmp_path):
 
 
 @pytest.mark.parametrize("layout", ["root", "project"])
-@pytest.mark.parametrize("suffix", [".gcode", ".gco", ".g", ".bgcode"])
+@pytest.mark.parametrize("suffix", [".gcode", ".gco", ".g"])
 def test_supported_print_files_are_delivered_raw_and_hash_exact(drive, tmp_path, layout, suffix):
-    body = b"GCDE\x00\x01\xfe\xff" if suffix == ".bgcode" else b"G1 BASE\n"
+    body = b"G1 BASE\n"
     job = _job(tmp_path / "src", "base", body, suffix=suffix)
     result = _publish(drive, "robot", [job], layout=layout)
     assert result["ok"], result
     entry = result["current"][0]
     prefix = "" if layout == "root" else "ROBOT/"
     assert entry["path"].startswith(prefix + "base.")
-    if suffix == ".bgcode":
-        assert entry["path"] == prefix + "base.bgcode"
     assert (drive / entry["path"]).read_bytes() == body
     assert entry["sha256"] == hashlib.sha256(body).hexdigest()
     _assert_delivery(drive, {entry["path"]: body,

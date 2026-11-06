@@ -45,11 +45,9 @@ only has to emit the right ``number`` per name — no new mechanism and no chang
 
 STORAGE
 -------
-``store_part`` writes into the native library dir (resolution tier 2,
-``native.Library.add_native_dir``) and registers it on the default singleton, so the
-part resolves on the very next call. There is no second resolution tier.
-Because tier 1 (starter) wins over tier 2, a generated part may never take a libid the
-starter library already owns — that would silently never resolve, so it is refused.
+``store_part`` writes into the native library dir and registers it on the default
+resolver. Generated parts take precedence over installed KiCad and starter parts;
+an existing generated file is only replaced when ``overwrite=True``.
 """
 
 from __future__ import annotations
@@ -868,7 +866,7 @@ def _wants_two_rows(numbering: str, n: int) -> bool:
 # ─── storage ─────────────────────────────────────────────────────────────────
 
 def library_dir() -> str:
-    """Native library dir generated parts are written to (resolution tier 2).
+    """Native library directory where generated parts are written.
 
     ``CHUDWARE_ECAD_LIB_DIR`` overrides (tests point it at a tmpdir); otherwise the
     platform app-data dir, matching the rest of services/ (``%APPDATA%/Chudware`` on
@@ -915,30 +913,18 @@ def store_part(symbol: dict | None = None, footprint: dict | None = None, *,
                notes: list | None = None) -> dict:
     """Write a generated symbol/footprint into the native library dir and register it.
 
-    Refuses a libid/fpid the STARTER library already owns whatever ``overwrite`` says:
-    starter is resolution tier 1, so a native file with that id could never resolve —
-    the write would look like success and change nothing.
-
-    Without ``overwrite`` an existing native file is a clear error and the stored part
-    is left untouched.
+    Generated definitions take precedence over installed and starter definitions.
+    Without ``overwrite`` an existing generated file is left untouched.
     """
-    from .starter import FOOTPRINTS, SYMBOLS
-
     directory = directory or library_dir()
+
     written: dict[str, str] = {}
-    for kind, obj, key, ext, sub, starter in (
-            ("symbol", symbol, "libid", ".sym.json", "symbols", SYMBOLS),
-            ("footprint", footprint, "fpid", ".fp.json", "footprints", FOOTPRINTS)):
+    for kind, obj, key, ext, sub in (
+            ("symbol", symbol, "libid", ".sym.json", "symbols"),
+            ("footprint", footprint, "fpid", ".fp.json", "footprints")):
         if not obj:
             continue
         ident = str(obj.get(key) or "")
-        if ident in starter:
-            raise _refuse(
-                f"{ident!r} is a STARTER library {kind} — it cannot be replaced by a "
-                "generated one",
-                needs="a different id; the starter library resolves FIRST, so a "
-                      "generated part with this id would never be found",
-                next_call=f"re-call with {key}='Generated:{ident.split(':')[-1]}'")
         path = os.path.join(directory, sub, _libid_to_filename(ident, ext))
         if os.path.exists(path) and not overwrite:
             raise _refuse(
@@ -952,8 +938,8 @@ def store_part(symbol: dict | None = None, footprint: dict | None = None, *,
         written[kind] = path
     _register(directory)
     if notes is not None and written:
-        notes.append(f"stored under {directory} (native library tier 2) and registered "
-                     "on the default resolver — resolvable on the next call.")
+        notes.append(f"stored under {directory} and registered on the default resolver "
+                     "with precedence over installed libraries.")
     return {"directory": directory, **written}
 
 

@@ -1,6 +1,6 @@
-"""Exact camera math for focused CAD renders: the engine's focused orthographic frame, the
-perspective `camera_pose.v1` fit, and the projection/clipping helpers every overlay uses to
-land on the pixels the engine drew. Which camera to use is shot_planner's job.
+"""Camera math for focused CAD renders: perspective `camera_pose.v1` fitting and the
+projection/clipping helpers overlays use to land on the pixels the engine drew.
+Which camera to use is shot_planner's job.
 """
 from __future__ import annotations
 
@@ -39,70 +39,6 @@ def _unit(v, fallback=None) -> tuple[float, float, float] | None:
     return (q[0] / length, q[1] / length, q[2] / length)
 
 
-def focus_frame(target_bbox: dict, view_dir, W: int, H: int, margin: float = 0.15) -> dict:
-    """Mirror the engine's focused orthographic projection exactly.
-
-    The focus AABB, rather than the whole part, supplies the camera centre and fit extents.
-    Planar/linear projected boxes are widened to two percent of the dominant span before the
-    explicit margin is applied.  Unlike whole-part auto-fit, focused fit has no 0.85 shrink.
-    """
-    lo0 = tuple(float(x) for x in target_bbox["min"][:3])
-    hi0 = tuple(float(x) for x in target_bbox["max"][:3])
-    lo = tuple(min(a, b) for a, b in zip(lo0, hi0))
-    hi = tuple(max(a, b) for a, b in zip(lo0, hi0))
-    center = tuple((a + b) * 0.5 for a, b in zip(lo, hi))
-
-    d = _unit(view_dir, _ISO_FALLBACK)
-    assert d is not None
-    up_ref = (0.0, 1.0, 0.0) if abs(d[2]) > 0.985 else (0.0, 0.0, 1.0)
-    r = _unit(_cross(up_ref, d))
-    assert r is not None
-    u = _cross(d, r)
-
-    projected_u: list[float] = []
-    projected_v: list[float] = []
-    for x in (lo[0], hi[0]):
-        for y in (lo[1], hi[1]):
-            for z in (lo[2], hi[2]):
-                rel = (x - center[0], y - center[1], z - center[2])
-                projected_u.append(_dot(rel, r))
-                projected_v.append(_dot(rel, u))
-    minu, maxu = min(projected_u), max(projected_u)
-    minv, maxv = min(projected_v), max(projected_v)
-
-    span = max(maxu - minu, maxv - minv, 1e-3)
-    if maxu - minu < span * 0.02:
-        mid = (minu + maxu) * 0.5
-        minu, maxu = mid - span * 0.01, mid + span * 0.01
-    if maxv - minv < span * 0.02:
-        mid = (minv + maxv) * 0.5
-        minv, maxv = mid - span * 0.01, mid + span * 0.01
-
-    pad = max(0.0, min(float(margin), 4.0))
-    du = (maxu - minu) * pad
-    dv = (maxv - minv) * pad
-    minu, maxu = minu - du, maxu + du
-    minv, maxv = minv - dv, maxv + dv
-
-    width = max(64, min(int(W), 2048))
-    height = max(64, min(int(H), 2048))
-    scale = min(width / max(maxu - minu, 1e-6), height / max(maxv - minv, 1e-6))
-    # The engine's near-clip plane: the front face of the focus box in camera depth. Fragments
-    # ABOVE it sit between the camera and the target and are cut away (RenderFocus.clip_near).
-    clip_depth = max(_dot((x - center[0], y - center[1], z - center[2]), d)
-                     for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2]))
-    return {
-        "center": center,
-        "r": r,
-        "u": u,
-        "d": d,
-        "scale": scale,
-        "cu": (minu + maxu) * 0.5,
-        "cv": (minv + maxv) * 0.5,
-        "W": width,
-        "H": height,
-        "clip_depth": float(clip_depth),
-    }
 
 
 # ------------------------------------------------------------------ perspective close-ups
@@ -214,22 +150,6 @@ def perspective_camera(target_bbox: dict, view_dir, W: int, H: int, *,
     }
 
 
-def perspective_frame(camera: dict) -> dict:
-    """The overlay frame for a perspective `camera` — the same record `frame_from_echo`
-    builds from the engine's echo, so tests and callers can project without a render."""
-    pos = tuple(float(x) for x in camera["position"])
-    tgt = tuple(float(x) for x in camera["target"])
-    forward = _unit((tgt[0] - pos[0], tgt[1] - pos[1], tgt[2] - pos[2]))
-    right = _unit(_cross(forward, _unit(camera["up"])))
-    up = _cross(right, forward)
-    W, H = int(camera["width"]), int(camera["height"])
-    focal = (H * 0.5) / math.tan(math.radians(float(camera["vertical_fov_deg"])) / 2.0)
-    depth = _dot((tgt[0] - pos[0], tgt[1] - pos[1], tgt[2] - pos[2]), forward)
-    return {"projection": "perspective", "position": pos, "r": right, "u": up, "f": forward,
-            "d": (-forward[0], -forward[1], -forward[2]), "focal": focal,
-            "cx": W / 2.0, "cy": H / 2.0, "near": float(camera["near"]),
-            "far": float(camera["far"]), "W": W, "H": H, "target_depth": depth,
-            "scale": focal / max(depth, 1e-9)}
 
 
 def frame_from_echo(frame: dict, camera: dict | None = None) -> dict:

@@ -2,8 +2,8 @@
 //
 // In-process Chromium Embedded Framework off-screen browser
 // (docs/design/cef_webview.md). Compiled only with CHUDWARE_ENABLE_CEF.
-// GL-thread-only public API; CEF's OnPaint delivers BGRA on a CEF thread,
-// copied under a mutex and uploaded to the GL texture in draw().
+// GL-thread-only public API; CEF's OnPaint copies changed BGRA regions under a
+// mutex. draw() stages those regions and uploads outside the mutex.
 //
 // Refcounting (the one thing you MUST NOT get wrong):
 // the CefClient handed to CreateBrowser is CEF-refcounted (IMPLEMENT_REFCOUNTING,
@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -57,6 +58,7 @@
 #include "cef_rpc_bridge.h"
 #include "cef_trace_file.h"
 #include "ui_theme.h"
+#include "ui/anim.h"
 
 namespace ui {
 
@@ -255,6 +257,101 @@ private:
     IMPLEMENT_REFCOUNTING(CookieCollector);
 };
 
+class CookieManagerReady : public CefCompletionCallback {
+public:
+    explicit CookieManagerReady(std::function<void()> fn) : fn_(std::move(fn)) {}
+    void OnComplete() override { fn_(); }
+private:
+    std::function<void()> fn_;
+    IMPLEMENT_REFCOUNTING(CookieManagerReady);
+};
+
+// Retain the latest image, copying only CEF's dirty pixels. A bounding rectangle
+// coalesces paints arriving before draw(), keeping pending work bounded.
+struct PaintUpload {
+    std::vector<unsigned char> bgra;
+    int width = 0, height = 0;
+    CefRect rect;
+};
+
+struct PaintBuffer {
+    std::vector<unsigned char> bgra;
+    int width = 0, height = 0;
+    CefRect dirty;
+
+    void paint(const void* pixels, int w, int h, const CefRenderHandler::RectList& rects) {
+        if (w != width || h != height) {
+            // A new texture needs the complete image, even with partial damage.
+            width = w; height = h;
+            const auto* src = static_cast<const unsigned char*>(pixels);
+            bgra.assign(src, src + static_cast<size_t>(w) * h * 4);
+            dirty = CefRect(0, 0, w, h);
+            return;
+        }
+        auto copyRect = [&](const CefRect& r) {
+            const int x0 = std::clamp(r.x, 0, w), y0 = std::clamp(r.y, 0, h);
+            const int x1 = std::clamp(r.x + r.width, x0, w);
+            const int y1 = std::clamp(r.y + r.height, y0, h);
+            if (x0 == x1 || y0 == y1) return;
+            const auto* src = static_cast<const unsigned char*>(pixels);
+            for (int y = y0; y < y1; ++y) {
+                const size_t offset = (static_cast<size_t>(y) * w + x0) * 4;
+                std::memcpy(bgra.data() + offset, src + offset,
+                            static_cast<size_t>(x1 - x0) * 4);
+            }
+            if (dirty.width == 0 || dirty.height == 0) {
+                dirty = CefRect(x0, y0, x1 - x0, y1 - y0);
+            } else {
+                const int right = std::max(dirty.x + dirty.width, x1);
+                const int bottom = std::max(dirty.y + dirty.height, y1);
+                dirty.x = std::min(dirty.x, x0); dirty.y = std::min(dirty.y, y0);
+                dirty.width = right - dirty.x; dirty.height = bottom - dirty.y;
+            }
+        };
+        if (rects.empty()) copyRect(CefRect(0, 0, w, h));
+        else for (const auto& rect : rects) copyRect(rect);
+    }
+
+    void stage(PaintUpload& upload) {
+        upload.rect = dirty;
+        if (dirty.width <= 0 || dirty.height <= 0) return;
+        upload.width = width; upload.height = height;
+        upload.bgra.resize(static_cast<size_t>(dirty.width) * dirty.height * 4);
+        const size_t rowBytes = static_cast<size_t>(dirty.width) * 4;
+        for (int y = 0; y < dirty.height; ++y) {
+            const size_t offset = (static_cast<size_t>(dirty.y + y) * width + dirty.x) * 4;
+            std::memcpy(upload.bgra.data() + static_cast<size_t>(y) * rowBytes,
+                        bgra.data() + offset, rowBytes);
+        }
+        dirty = CefRect();
+    }
+};
+
+void uploadPaint(const PaintUpload& upload, unsigned& tex, int& width, int& height) {
+    const auto& r = upload.rect;
+    if (r.width <= 0 || r.height <= 0) return;
+    if (!tex) glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    GLint alignment = 4, rowLength = 0;
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+    glGetIntegerv(GL_UNPACK_ROW_LENGTH, &rowLength);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    if (width != upload.width || height != upload.height) {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, upload.width, upload.height, 0,
+                     GL_BGRA, GL_UNSIGNED_BYTE, nullptr);
+        width = upload.width; height = upload.height;
+    }
+    glTexSubImage2D(GL_TEXTURE_2D, 0, r.x, r.y, r.width, r.height,
+                    GL_BGRA, GL_UNSIGNED_BYTE, upload.bgra.data());
+    glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, rowLength);
+}
+
 }  // namespace
 
 // ---- Shared: the CEF-callback ↔ widget handoff (plain, shared_ptr-owned) ------
@@ -264,9 +361,9 @@ struct CefWebView::Shared {
     std::mutex mtx;
 
     // Rendering handoff (guarded by mtx).
-    std::vector<unsigned char> bgra;   // latest PET_VIEW frame, paintW*paintH*4 BGRA
-    int  paintW = 0, paintH = 0;       // size CEF actually painted (OnPaint)
-    bool dirty  = false;
+    PaintBuffer viewPaint, popupPaint;
+    bool hidden = true;
+    std::chrono::steady_clock::time_point lastPaint;
 
     // OSR POPUP layer (HTML <select> dropdowns, autofill lists). In windowless
     // mode CEF paints these as a SEPARATE PET_POPUP element with its own buffer +
@@ -274,13 +371,11 @@ struct CefWebView::Shared {
     // them. Dropping PET_POPUP (the old behaviour) made every native dropdown
     // invisible/dead. We keep the popup buffer + rect here and composite it over
     // the main texture in draw(). Guarded by mtx.
-    std::vector<unsigned char> popupBgra;
-    int  popupW = 0, popupH = 0;       // size of the last PET_POPUP paint
+    int  popupW = 0, popupH = 0;       // popup geometry, in view pixels
     int  popupX = 0, popupY = 0;       // OnPopupSize origin, in view pixels
     bool popupShown = false;           // OnPopupShow(true/false)
-    bool popupDirty = false;
     // Requested view size (what draw() wants; GetViewRect returns this). Kept
-    // separate from paintW/H so a resize can't feed back into itself.
+    // separate from the painted image size so a resize can't feed back into itself.
     int  reqW = 1280, reqH = 800;
 
     // Status (written on CEF thread, read on GL thread; small races benign).
@@ -367,30 +462,30 @@ public:
         rect = CefRect(0, 0, s_->reqW > 0 ? s_->reqW : 1280,
                               s_->reqH > 0 ? s_->reqH : 800);
     }
-    void OnPaint(CefRefPtr<CefBrowser>, PaintElementType type, const RectList&,
+    void OnPaint(CefRefPtr<CefBrowser>, PaintElementType type, const RectList& rects,
                  const void* buffer, int width, int height) override {
-        const size_t n = static_cast<size_t>(width) * height * 4;
-        if (type == PET_POPUP) {
-            // <select> dropdown / autofill layer — keep it, composite in draw().
-            std::lock_guard<std::mutex> lk(s_->mtx);
-            s_->popupBgra.assign(static_cast<const unsigned char*>(buffer),
-                                 static_cast<const unsigned char*>(buffer) + n);
-            s_->popupW = width; s_->popupH = height; s_->popupDirty = true;
+        if ((type != PET_VIEW && type != PET_POPUP) || !buffer || width <= 0 || height <= 0)
             return;
+        {
+            std::lock_guard<std::mutex> lk(s_->mtx);
+            if (s_->hidden) return;
+            if (type == PET_POPUP) {
+                s_->popupPaint.paint(buffer, width, height, rects);
+                s_->popupW = width; s_->popupH = height;
+            } else {
+                if (!tracedFirstPaint_) { tracedFirstPaint_ = true; CEF_TRACE("OnPaint FIRST %dx%d", width, height); }
+                s_->viewPaint.paint(buffer, width, height, rects);
+                if (!s_->active) { s_->active = true; s_->starting = false; }
+            }
+            s_->lastPaint = std::chrono::steady_clock::now();
         }
-        if (type != PET_VIEW) return;
-        if (!tracedFirstPaint_) { tracedFirstPaint_ = true; CEF_TRACE("OnPaint FIRST %dx%d", width, height); }
-        std::lock_guard<std::mutex> lk(s_->mtx);
-        s_->bgra.assign(static_cast<const unsigned char*>(buffer),
-                        static_cast<const unsigned char*>(buffer) + n);
-        s_->paintW = width; s_->paintH = height; s_->dirty = true;
-        if (!s_->active) { s_->active = true; s_->starting = false; }
+        ui::anim::wakeLoop();
     }
     // OSR popup geometry/visibility (the <select> dropdown layer).
     void OnPopupShow(CefRefPtr<CefBrowser>, bool show) override {
         std::lock_guard<std::mutex> lk(s_->mtx);
         s_->popupShown = show;
-        if (!show) { s_->popupW = s_->popupH = 0; s_->popupDirty = true; }
+        if (!show) { s_->popupW = s_->popupH = 0; s_->popupPaint = PaintBuffer(); }
     }
     void OnPopupSize(CefRefPtr<CefBrowser>, const CefRect& rect) override {
         std::lock_guard<std::mutex> lk(s_->mtx);
@@ -401,7 +496,14 @@ public:
     // CefLifeSpanHandler
     void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
         browser_ = browser;
-        cef::note_browser_opened();   // frame loop pumps every frame while alive
+        cef::note_browser_opened();   // creation settled; subsequent pumps follow deadlines
+        bool hidden;
+        { std::lock_guard<std::mutex> lk(s_->mtx); hidden = s_->hidden; }
+        if (browser) {
+            browser->GetHost()->SetWindowlessFrameRate(hidden ? 1 : 30);
+            browser->GetHost()->WasHidden(hidden);
+            if (!hidden) browser->GetHost()->Invalidate(PET_VIEW);
+        }
         CEF_TRACE("OnAfterCreated (browser id=%d)", browser ? browser->GetIdentifier() : -1);
         // Copy-out: observe CDP replies so a Ctrl+C selection query can come back;
         // also carries the opt-in Network.responseReceived netlog (OnDevToolsEvent).
@@ -445,9 +547,21 @@ public:
         const std::string full  = major + "." + std::to_string(CHROME_VERSION_MINOR) +
                                   "." + std::to_string(CHROME_VERSION_BUILD) +
                                   "." + std::to_string(CHROME_VERSION_PATCH);
-        const std::string reducedUa =
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/" + major + ".0.0.0 Safari/537.36";
+#if defined(_WIN32)
+        constexpr const char* osUa = "Windows NT 10.0; Win64; x64";
+        constexpr const char* osPlatform = "Windows";
+        constexpr const char* navigatorPlatform = "Win32";
+#elif defined(__APPLE__)
+        constexpr const char* osUa = "Macintosh; Intel Mac OS X 10_15_7";
+        constexpr const char* osPlatform = "macOS";
+        constexpr const char* navigatorPlatform = "MacIntel";
+#else
+        constexpr const char* osUa = "X11; Linux x86_64";
+        constexpr const char* osPlatform = "Linux";
+        constexpr const char* navigatorPlatform = "Linux x86_64";
+#endif
+        const std::string reducedUa = std::string("Mozilla/5.0 (") + osUa +
+            ") AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + major + ".0.0.0 Safari/537.36";
 
         auto brand = [](const char* name, const std::string& ver) {
             CefRefPtr<CefDictionaryValue> d = CefDictionaryValue::Create();
@@ -468,7 +582,7 @@ public:
         meta->SetList("brands", brands);
         meta->SetList("fullVersionList", fullList);
         meta->SetString("fullVersion", full);
-        meta->SetString("platform", "Linux");
+        meta->SetString("platform", osPlatform);
         meta->SetString("platformVersion", "");
         meta->SetString("architecture", "x86");
         meta->SetString("model", "");
@@ -479,7 +593,7 @@ public:
         CefRefPtr<CefDictionaryValue> params = CefDictionaryValue::Create();
         params->SetString("userAgent", reducedUa);
         params->SetString("acceptLanguage", "en-US,en");   // unweighted; CDP adds q
-        params->SetString("platform", "Linux x86_64");
+        params->SetString("platform", navigatorPlatform);
         params->SetDictionary("userAgentMetadata", meta);
         browser->GetHost()->ExecuteDevToolsMethod(
             /*message_id=*/0, "Network.setUserAgentOverride", params);
@@ -653,6 +767,40 @@ struct CefWebView::Impl {
     int popupTexW = 0, popupTexH = 0;
     bool focused = false;
     bool invalidatedOnce_ = false;   // CHUDWARE_CEF_TRACE: log the first paint kick only
+    PaintUpload viewUpload, popupUpload;  // reusable, GL-thread-owned staging
+    int lastDrawFrame = -1;
+
+    static std::vector<Impl*>& instances() {
+        // Views can belong to function-static panel owners destroyed at exit.
+        // Keep the registry alive through their destructors, regardless of order.
+        static auto* const views = new std::vector<Impl*>();
+        return *views;
+    }
+
+    Impl() { instances().push_back(this); }
+    ~Impl() {
+        auto& views = instances();
+        views.erase(std::remove(views.begin(), views.end(), this), views.end());
+    }
+
+    void setVisible(bool visible) {
+        {
+            std::lock_guard<std::mutex> lk(s->mtx);
+            if (s->hidden == !visible) return;
+            s->hidden = !visible;
+        }
+        // Host methods may synchronously re-enter render callbacks.
+        if (client && client->browser()) {
+            auto host = client->browser()->GetHost();
+            host->SetWindowlessFrameRate(visible ? 30 : 1);
+            host->WasHidden(!visible);
+            if (visible) host->Invalidate(PET_VIEW);
+            else {
+                host->SetFocus(false);
+                focused = false;
+            }
+        }
+    }
 
     void createBrowser(const std::string& url, const std::string& cacheDir, bool startedAtAuth) {
         CEF_TRACE("createBrowser url=%s cache=%s onUiThread=%d",
@@ -780,13 +928,21 @@ struct CefWebView::Impl {
 // ---- public ------------------------------------------------------------------
 
 bool CefWebView::processReady() { return cef::initialized(); }
+
+void CefWebView::finishFrame() {
+    const int frame = ImGui::GetFrameCount();
+    for (auto* view : Impl::instances())
+        if (view->lastDrawFrame != frame) view->setVisible(false);
+}
 // available() == "can still host a browser". Only false after a hard cold-init
 // failure — while not yet initialized (lazy path) open() may still succeed.
 // Wizard must NOT treat "not yet init" as dead, or multi-site Connect falls
 // back to desktop before CEF has a chance.
 bool CefWebView::available() const { return !cef::init_failed(); }
 
-CefWebView::CefWebView() : impl_(std::make_unique<Impl>()) {}
+CefWebView::CefWebView() : impl_(std::make_unique<Impl>()) {
+    cef::setWakeCallback(ui::anim::wakeLoop);
+}
 
 CefWebView::~CefWebView() {
     { std::lock_guard<std::mutex> lk(impl_->s->mtx); impl_->s->detached = true; }
@@ -814,7 +970,11 @@ void CefWebView::open(AppState& st, const std::string& siteOrUrl, bool isUrl) {
         s.active = false; s.starting = true;
         s.url.clear(); s.loginState = "unknown"; s.startedAtAuth = false;
         s.lastError.clear();
-        s.bgra.clear(); s.paintW = s.paintH = 0; s.dirty = false;
+        s.viewPaint = PaintBuffer();
+        s.popupPaint = PaintBuffer();
+        s.popupShown = false;
+        s.popupW = s.popupH = 0;
+        s.popupX = s.popupY = 0;
     }
 
     AppState* stp = &st;   // AppState outlives every RPC/callback (app-lifetime object)
@@ -836,6 +996,7 @@ void CefWebView::open(AppState& st, const std::string& siteOrUrl, bool isUrl) {
         CEF_TRACE("open(site=%s) → rpc browser_start_url…", siteOrUrl.c_str());
         cef::rpc_start_url(*stp, siteOrUrl, [impl, req](bool ok, const std::string& url,
                                                         const std::string& /*plwCacheDir*/,
+                                                        const std::vector<std::string>& /*cookieDomains*/,
                                                         const std::string& err) {
             CEF_TRACE("rpc_start_url cb ok=%d url=%s err=%s onUiThread=%d",
                       (int)ok, url.c_str(), err.c_str(), (int)CefCurrentlyOn(TID_UI));
@@ -890,9 +1051,9 @@ void CefWebView::close(AppState& /*st*/) {
     s.loginState = "unknown";
     s.startedAtAuth = false;
     s.pendingNav.clear();
-    s.bgra.clear();
-    s.paintW = s.paintH = 0;
-    s.dirty = false;
+    s.viewPaint = PaintBuffer();
+    s.popupPaint = PaintBuffer();
+    s.popupShown = false;
 }
 
 void CefWebView::update(AppState& /*st*/) {
@@ -901,6 +1062,62 @@ void CefWebView::update(AppState& /*st*/) {
 }
 
 bool CefWebView::usesWorkerEmbed() const { return false; }
+void CefWebView::restoreVendorSessions(
+    AppState& st,
+    const std::vector<std::pair<std::string, std::vector<std::string>>>& sites) {
+    if (sites.empty() || !cef::initialized()) return;
+    if (!CefCurrentlyOn(TID_UI)) {
+        post_to_ui([&st, sites] { restoreVendorSessions(st, sites); });
+        return;
+    }
+
+    CefRefPtr<CefRequestContext> context;
+    for (Impl* view : Impl::instances()) {
+        if (!view->client || !view->client->browser()) continue;
+        auto candidate = view->client->browser()->GetHost()->GetRequestContext();
+        if (candidate && candidate->GetCachePath().ToString() == panel_profile_dir()) {
+            context = candidate;
+            break;
+        }
+    }
+    if (!context) {
+        CefRequestContextSettings settings;
+        CefString(&settings.cache_path) = panel_profile_dir();
+        context = CefRequestContext::CreateContext(settings, nullptr);
+    }
+    if (!context) return;
+
+    auto collector = CefRefPtr<CookieCollector>(new CookieCollector(
+        [&st, sites, context](std::vector<cef::SessionCookie> cookies) {
+            for (const auto& [site, domains] : sites) {
+                std::vector<cef::SessionCookie> matching;
+                for (const auto& cookie : cookies) {
+                    std::string domain = cookie.domain;
+                    std::transform(domain.begin(), domain.end(), domain.begin(),
+                                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                    if (!domain.empty() && domain.front() == '.') domain.erase(0, 1);
+                    for (const auto& allowed : domains) {
+                        if (!domain.empty() && !allowed.empty() &&
+                            (domain == allowed ||
+                             (domain.size() > allowed.size() &&
+                              domain.compare(domain.size() - allowed.size(), allowed.size(), allowed) == 0 &&
+                              domain[domain.size() - allowed.size() - 1] == '.'))) {
+                            matching.push_back(cookie);
+                            break;
+                        }
+                    }
+                }
+                if (!matching.empty())
+                    cef::rpc_session_import(st, site, std::move(matching),
+                                            [](bool, const std::string&) {});
+            }
+        }));
+    context->GetCookieManager(new CookieManagerReady([context, collector] {
+        CefRefPtr<CefCookieManager> manager = context->GetCookieManager(nullptr);
+        if (manager) manager->VisitAllCookies(collector);
+    }));
+}
+
 
 void CefWebView::exportSession(AppState& st, const std::string& site,
                                std::function<void(bool)> done) {
@@ -1194,6 +1411,8 @@ bool CefWebView::draw(AppState& /*st*/, ImVec2 avail) {
         std::lock_guard<std::mutex> lk(s.mtx);
         return s.active || s.starting;
     }
+    impl_->lastDrawFrame = ImGui::GetFrameCount();
+    impl_->setVisible(true);
 
     ImDrawList* dl  = ImGui::GetWindowDrawList();
     const ImVec2 p0 = ImGui::GetCursorScreenPos();
@@ -1206,15 +1425,10 @@ bool CefWebView::draw(AppState& /*st*/, ImVec2 avail) {
                     Palette::toU32(col), txt);
     };
 
-    // Record the requested size + upload the newest frame under the lock, but do
-    // NOT touch CEF while holding it. WasResized() synchronously re-enters
-    // GetViewRect() on THIS thread (TID_UI == the GL thread under the external
-    // message pump), and GetViewRect() locks s.mtx — a non-recursive relock =
-    // self-deadlock (the "freeze/abort on opening the browser" bug: main thread
-    // stuck in __lll_lock_wait, every CEF callback that wants s.mtx wedged behind
-    // it). So we only flip a flag here and call WasResized() after the lock drops.
+    // Stage pixels and status under the handoff lock. All GL uploads and CEF
+    // host calls stay outside it: WasResized() can re-enter GetViewRect().
     bool haveTex = false, starting = false, active = false, needResize = false;
-    bool popupShown = false;
+    bool popupShown = false, painting = false;
     int  popupX = 0, popupY = 0, popupW = 0, popupH = 0;
     std::string lastError, clipOut;
     {
@@ -1226,45 +1440,17 @@ bool CefWebView::draw(AppState& /*st*/, ImVec2 avail) {
             s.reqW = nw; s.reqH = nh;
             needResize = true;
         }
-        if (s.dirty && !s.bgra.empty() && s.paintW > 0 && s.paintH > 0) {
-            if (!impl_->tex) glGenTextures(1, &impl_->tex);
-            glBindTexture(GL_TEXTURE_2D, impl_->tex);
-            if (s.paintW != impl_->texW || s.paintH != impl_->texH) {
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, s.paintW, s.paintH, 0,
-                             GL_BGRA, GL_UNSIGNED_BYTE, s.bgra.data());  // CEF is BGRA
-                impl_->texW = s.paintW; impl_->texH = s.paintH;
-            } else {
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, s.paintW, s.paintH,
-                                GL_BGRA, GL_UNSIGNED_BYTE, s.bgra.data());
-            }
-            s.dirty = false;
-        }
-        // Upload the <select> popup layer too (same BGRA→GL path).
-        if (s.popupDirty && s.popupW > 0 && s.popupH > 0 && !s.popupBgra.empty()) {
-            if (!impl_->popupTex) glGenTextures(1, &impl_->popupTex);
-            glBindTexture(GL_TEXTURE_2D, impl_->popupTex);
-            if (s.popupW != impl_->popupTexW || s.popupH != impl_->popupTexH) {
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, s.popupW, s.popupH, 0,
-                             GL_BGRA, GL_UNSIGNED_BYTE, s.popupBgra.data());
-                impl_->popupTexW = s.popupW; impl_->popupTexH = s.popupH;
-            } else {
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, s.popupW, s.popupH,
-                                GL_BGRA, GL_UNSIGNED_BYTE, s.popupBgra.data());
-            }
-            s.popupDirty = false;
-        }
+        s.viewPaint.stage(impl_->viewUpload);
+        s.popupPaint.stage(impl_->popupUpload);
+        painting = std::chrono::steady_clock::now() - s.lastPaint <
+                   std::chrono::milliseconds(100);
         popupShown = s.popupShown && s.popupW > 0 && s.popupH > 0;
         popupX = s.popupX; popupY = s.popupY; popupW = s.popupW; popupH = s.popupH;
-        haveTex = impl_->tex && impl_->texW > 0 && impl_->texH > 0;
     }
+    uploadPaint(impl_->viewUpload, impl_->tex, impl_->texW, impl_->texH);
+    uploadPaint(impl_->popupUpload, impl_->popupTex, impl_->popupTexW, impl_->popupTexH);
+    haveTex = impl_->tex && impl_->texW > 0 && impl_->texH > 0;
+    if (painting || starting) ui::anim::requestFramesAt(30);
 
     // Copy-out: push the page selection to the host (GLFW) clipboard on the GL
     // thread. ImGui's clipboard is GL-thread-only, so it can't run in the CEF

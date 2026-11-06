@@ -24,9 +24,8 @@
 //   TopTools_IndexedMapOfShape, which de-duplicates: each unique edge is added to the
 //   MakeFillet/MakeChamfer builder exactly once.
 //
-// ERROR CONTAINMENT: each op gates on IsDone() and returns an empty TopoDS_Shape on
-// failure (e.g. a radius too large for the geometry) — never throws across the API
-// boundary, matching the contained-failure discipline of booleans.cpp / boolean.py.
+// Fillets return a classified, all-selected-edges result; chamfer failures are
+// contained at the API boundary and retain their existing best-effort semantics.
 #pragma once
 
 #include <optional>
@@ -41,11 +40,99 @@
 
 namespace geom {
 
-// Round the edges of `shape` with radius `r` (BRepFilletAPI_MakeFillet + Add(r, edge)).
-// If `dir` is given, only straight edges parallel to `dir` are rounded; otherwise ALL
-// edges. Empty shape on kernel failure (e.g. r exceeds the local geometry).
-TopoDS_Shape fillet_edges(const TopoDS_Shape& shape, double r,
-                          std::optional<Eigen::Vector3d> dir = std::nullopt);
+enum class FilletFailure {
+    none,
+    invalid_input,
+    invalid_selection,
+    unsupported_topology,
+    construction_failed,
+    invalid_geometry,
+    isolation_failed,
+    timed_out,
+    budget_exhausted,
+    unsupported_precision
+};
+
+enum class FilletValidationStatus { valid, rejected, timed_out };
+
+struct FilletValidationResult {
+    FilletValidationStatus status = FilletValidationStatus::valid;
+    std::string reason;
+};
+
+// An isolated probe executes a named policy, not a callback inherited from a
+// multithreaded host. The document supplies its matching function for explicitly
+// in-process builds; the worker links the same implementation. A basic_solid
+// callback is permitted only in-process; strict isolation rejects it rather
+// than silently ignoring it. A timeout stops the search, not a radius bound;
+// an earlier fully validated candidate remains usable.
+enum class FilletValidationPolicy { basic_solid, document_solid };
+using FilletValidationFn = FilletValidationResult (*)(const TopoDS_Shape&);
+struct FilletValidation {
+    FilletValidationPolicy policy = FilletValidationPolicy::basic_solid;
+    FilletValidationFn in_process = nullptr;
+};
+
+struct FilletResult {
+    TopoDS_Shape shape;  // null on failure; never a partial result
+    double requested_radius = 0.0;
+    std::optional<double> requested_radius2;
+    double effective_radius = 0.0;
+    std::optional<double> effective_radius2;
+    int selected_edges = 0;
+    int covered_edges = 0;
+    int probes = 0;
+    double tolerance_mm = 0.0;
+    FilletFailure failure = FilletFailure::none;
+    std::string reason;
+};
+
+// On the requested-radius fast path exactly one build is attempted. Otherwise a
+// bounded search finds a verified all-edge candidate. The tested tolerance is an
+// observed search resolution, not a guarantee of a global optimum: OCCT feasibility
+// can be non-monotonic. For unequal variable endpoints, each is improved toward
+// its request while keeping the other fixed, repeating in stable endpoint order
+// when the other changes. Equal requested endpoints remain equal. This preserves a
+// requested endpoint when possible; it does not claim a globally nearest pair.
+// All radii and tolerance are millimetres.
+// Search makes at most 72 probes under a 30 s aggregate budget, with at most
+// 5 s per isolated probe; on platforms or configurations using in-process
+// builds an individual native call has no hard wall-clock deadline. On timeout
+// or budget exhaustion after a verified candidate, the best candidate is
+// returned with a conservative resolution instead of discarding it.
+// Finite nonpositive radii are searched from model/kernel tolerances, not a fixed floor.
+// Variable endpoints must also exceed the relevant source and generated B-rep
+// tolerances; the check certifies resolvability, not a measured section radius.
+//
+// Implicit selection enumerates blendable edges (optionally parallel to dir).
+// Explicit picks must be unique edges of shape; seams, degenerates, unsupported
+// topology, and missing or unmappable picks are classified failures. Straight and
+// circular contact joins are supported for constant fillets; each selected
+// contact's two source bodies and every constructed corner must remain in the
+// same result solid, including after any ordinary selected edges are blended.
+// A contact is classified as volumetrically overlapping only when the Boolean
+// intersection establishes material above the local topology resolution.
+// A shallow, straight C0 crease rejected as tangent by OCCT can be rounded by
+// an exact planar-arc sweep when both support faces are constant along the edge.
+// This path is limited to a single solid, one such edge, constant radius and
+// a local material-removing blend; unsupported cases fail without a partial result.
+// Variable contact joins, conflicting radii at a shared contour vertex and unequal
+// endpoints on a closed edge are explicitly unsupported. Positive unequal
+// endpoints within OCCT's radius resolution are unsupported when both are
+// individually resolvable; an unresolvable endpoint instead enters correction.
+// OCCT interpolates along the contour spine; linear interpolation is not promised.
+FilletResult fillet_edges(const TopoDS_Shape& shape, double radius,
+                          std::optional<Eigen::Vector3d> dir = std::nullopt,
+                          std::optional<double> radius2 = std::nullopt,
+                          const FilletValidation& validate = {});
+
+FilletResult fillet_edges(const TopoDS_Shape& shape, double radius,
+                          const std::vector<TopoDS_Edge>& edges,
+                          std::optional<double> radius2 = std::nullopt,
+                          const FilletValidation& validate = {});
+
+// Entry point for the dedicated executable, not a public geometry operation.
+int fillet_worker_main(int argc, char** argv, FilletValidationFn document_validate);
 
 // Bevel the edges of `shape` with a symmetric setback `d` (BRepFilletAPI_MakeChamfer +
 // Add(d, edge)). Same `dir` selection rule as fillet_edges. Empty shape on kernel
@@ -53,37 +140,18 @@ TopoDS_Shape fillet_edges(const TopoDS_Shape& shape, double r,
 TopoDS_Shape chamfer_edges(const TopoDS_Shape& shape, double d,
                            std::optional<Eigen::Vector3d> dir = std::nullopt);
 
-// --- explicit-edge overloads (the doc model's edge-selector path) ---
-// Round/bevel EXACTLY the given `edges` (already resolved against the body's topology
-// by doc/picks::resolve_edge_picks). Rounds every edge that CAN be rounded at this radius;
-// if some can't (radius exceeds the local geometry, a corner combo OCCT can't resolve), they
-// are dropped and `*n_dropped` (when given) reports how many — the caller surfaces that as a
-// non-fatal warning rather than failing the whole feature. Empty shape only when NOTHING could
-// be rounded OR `edges` is empty.
-//
-// CONTACT EDGES: an edge shared by two solids of one body (two bodies that meet only along a
-// line, e.g. a ring resting on a tube's rim) has four faces, which BRepFilletAPI cannot blend.
-// fillet_edges fills every concave corner around such an edge with rolling-ball fillet
-// material and fuses it in, so the two solids become one. Supported for straight or circular
-// shared edges whose adjoining faces run straight away from the edge (planes, cylinders,
-// cones). `*why` (when given) names the reason a contact edge could not be joined.
-TopoDS_Shape fillet_edges(const TopoDS_Shape& shape, double r,
-                          const std::vector<TopoDS_Edge>& edges, int* n_dropped = nullptr,
-                          std::string* why = nullptr);
+// Explicit-edge chamfer overloads retain best-effort edge dropping.
 TopoDS_Shape chamfer_edges(const TopoDS_Shape& shape, double d,
                            const std::vector<TopoDS_Edge>& edges, int* n_dropped = nullptr);
 
-// Variable-radius fillet: a LINEAR radius law per edge from `r1` at the edge start to
-// `r2` at the edge end (BRepFilletAPI_MakeFillet::Add(r1, r2, edge)). Port of
-// dress.py::_variable_fillet. Same drop-and-report behaviour as fillet_edges.
-TopoDS_Shape fillet_edges_variable(const TopoDS_Shape& shape, double r1, double r2,
-                                   const std::vector<TopoDS_Edge>& edges, int* n_dropped = nullptr);
+// Variable-radius fillets use radius2 on fillet_edges above; the requested
+// endpoint law is never silently replaced by a constant-radius fillet.
 
 // Two-distance (asymmetric) chamfer: leg `d1` on the first incident face, `d2` on the
 // other (BRepFilletAPI_MakeChamfer::Add(d1, d2, edge, face)). Matches build123d
-// chamfer(length=d1, length2=d2). Same drop-and-report behaviour as fillet_edges: edges the
-// kernel can't bevel at this size are dropped (counted in `n_dropped`) instead of failing the
-// whole feature. Empty shape on total failure / empty `edges`.
+// chamfer(length=d1, length2=d2). Edges the kernel can't bevel at this size are
+// dropped (counted in `n_dropped`) instead of failing the whole feature.
+// Empty shape on total failure / empty `edges`.
 TopoDS_Shape chamfer_edges_two_distance(const TopoDS_Shape& shape, double d1, double d2,
                                         const std::vector<TopoDS_Edge>& edges,
                                         int* n_dropped = nullptr);

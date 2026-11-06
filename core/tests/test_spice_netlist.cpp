@@ -66,6 +66,32 @@ TEST_CASE("netlist_to_spice_circuit: Device:R libid symbol fallback") {
     CHECK(out["warnings"].empty());
 }
 
+TEST_CASE("KiCad simulation fields map model terminals and source waveforms") {
+    const json netlist = {{"components", json::array({
+        json{{"ref", "D1"}, {"libid", "Device:D"}, {"value", "D"},
+             {"pins", json{{"1", "CATHODE"}, {"2", "ANODE"}}},
+             {"fields", json{{"Sim.Device", "D"}, {"Sim.Pins", "1=K 2=A"},
+                             {"Sim.Params", "is=2n n=2"}}}},
+        json{{"ref", "V1"}, {"libid", "Simulation_SPICE:VPULSE"}, {"value", ""},
+             {"pins", json{{"1", "INPUT"}, {"2", "GND"}}},
+             {"fields", json{{"Sim.Device", "V"}, {"Sim.Type", "PULSE"},
+                             {"Sim.Pins", "1=+ 2=-"},
+                             {"Sim.Params", "y1=0 y2=5 tr=1n tf=2n tw=3u per=6u"}}}},
+        json{{"ref", "D2"}, {"libid", "Device:D"}, {"value", "D"},
+             {"pins", json{{"1", "K2"}, {"2", "A2"}}}}
+    })}};
+    const json result = netlist_to_spice_circuit(netlist, json::object());
+    REQUIRE(result["warnings"].empty());
+    const json& devices = result["circuit"]["devices"];
+    REQUIRE(devices.size() == 3);
+    CHECK(devices[0]["nodes"] == json::array({"ANODE", "CATHODE"}));
+    CHECK(devices[0]["params"]["IS"].get<double>() == doctest::Approx(2e-9));
+    CHECK(devices[1]["nodes"] == json::array({"INPUT", "0"}));
+    CHECK(devices[1]["params"]["waveform"]["type"] == "PULSE");
+    CHECK(devices[1]["params"]["waveform"]["pw"].get<double>() == doctest::Approx(3e-6));
+    CHECK(devices[2]["nodes"] == json::array({"A2", "K2"}));
+}
+
 TEST_CASE("parse_netlist: X OPAMP subckt expands with Dclamp model") {
     const std::string deck = "XU1 inp inn outp OPAMP\n";
     json c = parse_netlist(deck);
@@ -75,13 +101,16 @@ TEST_CASE("parse_netlist: X OPAMP subckt expands with Dclamp model") {
     CHECK(c["models"].contains("Dclamp"));
 }
 
-TEST_CASE("netlist_to_spice_circuit: abstract OPAMP uses its placed unit terminals") {
+TEST_CASE("netlist_to_spice_circuit: KiCad OPAMP maps inputs and output in model order") {
     json netlist = {
         {"components",
          json::array({json{{"ref", "U1"},
-                           {"libid", "Amplifier_Operational:OPAMP_dual"},
-                           {"value", "OPAMP"},
-                           {"pins", json{{"1", "INV"}, {"2", "IN"}, {"3", "OUT"}}}}})}};
+                           {"libid", "Simulation_SPICE:OPAMP"},
+                           {"pins", json{{"1", "IN"}, {"2", "INV"}, {"3", "VCC"},
+                                         {"4", "VEE"}, {"5", "OUT"}}},
+                           {"fields", json{{"Sim.Device", "SUBCKT"},
+                                           {"Sim.Name", "kicad_builtin_opamp"},
+                                           {"Sim.Pins", "1=in+ 2=in- 3=vcc 4=vee 5=out"}}}}})}};
     json out = netlist_to_spice_circuit(netlist, json::object());
     REQUIRE(out["warnings"].empty());
     REQUIRE_FALSE(out["circuit"]["devices"].empty());
@@ -90,6 +119,34 @@ TEST_CASE("netlist_to_spice_circuit: abstract OPAMP uses its placed unit termina
         for (const json& node : device["nodes"])
             saw_out = saw_out || node == "OUT";
     CHECK(saw_out);
+}
+
+TEST_CASE("KiCad raw SPICE subcircuits resolve the builtin timer model") {
+    const json netlist = {{"components", json::array({
+        json{{"ref", "U1"}, {"libid", "Timer:NE555D"},
+             {"pins", json{{"1", "GND"}, {"2", "TRIG"}, {"3", "OUT"}, {"4", "VCC"},
+                           {"5", "CTRL"}, {"6", "THR"}, {"7", "DIS"}, {"8", "VCC"}}},
+             {"fields", json{{"Sim.Device", "SPICE"},
+                             {"Sim.Params", "type=\"X\" model=\"NE555\" lib=\"\""},
+                             {"Sim.Pins", "1=1 2=2 3=3 4=4 5=5 6=6 7=7 8=8"}}}}
+    })}};
+    const json result = netlist_to_spice_circuit(netlist, json::object());
+    CHECK(result["warnings"].empty());
+    CHECK_FALSE(result["circuit"]["devices"].empty());
+}
+
+TEST_CASE("both real KiCad NE555 package variants have native simulation defaults") {
+    for (const char* id : {"Timer:NE555D", "Timer:NE555P"}) {
+        const json netlist = {{"components", json::array({
+            json{{"ref", "U1"}, {"libid", id},
+                 {"pins", json{{"1", "GND"}, {"2", "TRIG"}, {"3", "OUT"}, {"4", "VCC"},
+                               {"5", "CTRL"}, {"6", "THR"}, {"7", "DIS"}, {"8", "VCC"}}}}
+        })}};
+        const json result = netlist_to_spice_circuit(netlist, json::object());
+        INFO(id << ": " << result["warnings"].dump());
+        CHECK(result["warnings"].empty());
+        CHECK_FALSE(result["circuit"]["devices"].empty());
+    }
 }
 
 TEST_CASE("netlist_to_spice_circuit: unknown libid warns and skips") {

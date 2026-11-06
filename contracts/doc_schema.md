@@ -179,11 +179,16 @@ Constraint references use **handles**: `"e3"` = whole entity; point sub-refs:
 | `point_on` | 2 — point, entity | — |
 | `distance` | 2 — `[point, point]` or `[point, line entity]` | dimension value (mm) |
 | `angle` | 2 — line entity, line entity | dimension value (deg), measured/reported in `[0,180)` |
+| `rotate_point` | 3 — source point, target point, pivot point | signed angle (degrees); optional `angle_ref` names the independent driving master |
+| `signed_distance` | 2 — source point, target point | signed target-minus-source component (mm), with required `axis:"h"` or `"v"` |
+| `equal_offset` | 4 — source, target, reference source, reference target points | —; required `axis:"h"` or `"v"` |
 | `radius` | 1 — arc/circle | dimension value (mm) |
 | `diameter` | 1 — circle | dimension value (mm) |
 
 `driven:true` marks a reference dimension (measured, never enforced). Dimension constraints
-(`distance|angle|radius|diameter`) MUST carry `value`; the rest MUST NOT.
+(`distance|signed_distance|length|angle|rotate_point|radius|diameter|arc_length`) MUST carry `value`; the rest MUST NOT.
+An `angle_ref` follower mirrors its master's value and cannot be edited or driven independently.
+See [doc_ops.md](doc_ops.md) for linked rotation edit and deletion behavior.
 
 **Tangent branch (curve↔curve):** a `tangent` between two arcs/circles admits two arrangements —
 *external* (`|C0−C1| = r0+r1`) and *internal* (`|C0−C1| = |r0−r1|`, one nested inside the other).
@@ -743,3 +748,74 @@ the automatic `sketch_fully_define` the MCP `add_features` path appends (doc_ops
 Every kind is associative: each mutating rebuild strictly re-resolves it (scored selector match
 over all bodies, selectors.md thresholds) and marks it `stale` with last-good geometry when it no
 longer resolves. `mode`/`near` persist in `source`.
+
+## Soft sketch auto-constraints v1.1 (append-only, 2026-10-26)
+
+Additive amendment to §3.3; the document schema strings stay `aicad.part/1` and `aicad.asm/1`.
+Every 2D sketch constraint may carry optional `auto:bool`. `auto:true` identifies a relation
+or dimension inferred by `sketch_fully_define`; absent/false means explicit design intent.
+Auto constraints remain driving unless independently marked `driven:true`; they count in
+the solve and DOF normally. This field is persisted and included in sketch constraint readback.
+Existing documents without the field retain their previous explicit-constraint behavior.
+
+When explicit intent is added, compatible auto constraints retain their ids and declaration
+order; conflicting/redundant auto constraints may be removed and remaining freedom refilled
+with newly identified auto constraints (doc_ops §32). Editing an auto dimension's value or
+expression removes `auto`, promoting it to explicit. Annotation-placement edits do not.
+
+
+## Fillet requested and effective dimensions v2 (append-only)
+
+This is a semantic revision of native fillet compilation; it does not introduce
+an `aicad.part/2` schema string. The optional derived field below is additive
+to `aicad.part/1`, so older documents without it remain readable. On a fresh
+build their fillets use the current bounded, all-selected-edge behavior in
+[feature_params.md](feature_params.md), which may produce a different result or
+an explicit failure from the historical behavior.
+
+`params.radius` and, for variable fillets, `params.radius2` remain authored
+dimensions in canonical mm. On a successful correction, a literal's effective
+value is written to its canonical parameter (or to the existing active
+configuration override for that parameter). The correction is part of the same
+accepted edit and undo step, not a separate untracked display change. An
+expression-driven dimension keeps its authored expression and is re-evaluated
+on rebuild; the effective radius is not fed back as an expression input.
+
+When an expression-driven endpoint was corrected, the **feature envelope**
+may contain the following optional derived record, under `data`, not `params`:
+
+```text
+feature.data.fillet_effective = {
+  requested:  {radius: number, radius2: number | null},
+  effective:  {radius: number, radius2: number | null},
+  adjustment: "none" | "lower" | "upper" | "both"
+}
+```
+
+The radii are canonical mm, and a constant result has `radius2:null`. This
+record describes the last successfully built active configuration; it is not
+authored intent, an input to the next compile, or an independent feature.
+Successful rebuilds refresh it or clear it when no corrected expression needs
+it. In a mixed literal/expression fillet, stabilization may update literals
+before the final derived record is made, so the record is not an audit log of
+the original edit. The operation's `feature_status[].data.fillet` reports the
+request and final result for that response; it also carries coverage and search
+metadata as specified in [worker_rpc.md](worker_rpc.md).
+
+The live tree, accepted parameters, derived record, compiled geometry and
+persisted build cache must correspond to the same stabilized build. Cold-open
+build-state write-back preserves the source archive's authored entries; an
+explicit save writes the current tree, including any correction and applicable
+derived record. Cache identity, invalidation and warm reopen are specified in
+[stepplus.md](stepplus.md). Atomic rejection leaves the previous live state and
+history intact as specified in [doc_ops.md](doc_ops.md).
+
+## Automatic exploded view (append-only, 2026-11-04)
+
+An assembly whose `explode` list is absent or empty still explodes: the engine derives one
+view-only vector per component from the solved geometry and stores nothing in the document.
+The largest component stays put. Every other component leaves the smallest larger component
+whose box contains it (its parent) along its mate insertion axis when it has one, else along
+the world axis that clears the parent's face boxes soonest, and then moves with that parent.
+Siblings leaving the same parent stack so their exploded boxes never overlap. A non-empty
+`explode` list replaces the automatic plan entirely.

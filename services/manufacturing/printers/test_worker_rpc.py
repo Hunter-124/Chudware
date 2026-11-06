@@ -262,6 +262,37 @@ def test_worker_bridge_registration_drives_adapter_without_exposing_secrets() ->
         try:
             report = call("mfg_printer_adapter_probe", {"adapter_id": adapter_id})
             assert report["ok"] is True
+            for data, name in (
+                (b"G28\n", "firmware.bin"),
+                (b"\x00\xff\x01", "print.gcode"),
+                (b"G28\nM997\n", "print.gcode"),
+            ):
+                requests = len(server.requests)
+                rejected = call(
+                    "mfg_printer_adapter_upload",
+                    {
+                        "adapter_id": adapter_id,
+                        "artifact_b64": base64.b64encode(data).decode("ascii"),
+                        "original_name": name,
+                    },
+                )
+                assert rejected["ok"] is False
+                assert rejected["error"] == "UnsafePrintFile"
+                assert rejected["message"]
+                assert len(server.requests) == requests
+            requests = len(server.requests)
+            rejected = call(
+                "mfg_printer_adapter_start",
+                {
+                    "adapter_id": adapter_id,
+                    "remote_artifact": {"remote_path": "firmware.bin"},
+                    "authorization_token": "opaque-token",
+                },
+            )
+            assert rejected["ok"] is False
+            assert rejected["error"] == "UnsafePrintFile"
+            assert rejected["message"]
+            assert len(server.requests) == requests
             uploaded = call(
                 "mfg_printer_adapter_upload",
                 {

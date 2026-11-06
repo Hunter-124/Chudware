@@ -2,7 +2,6 @@ schema: aicad.role/1
 id: cam_programmer
 goal: Produce a simulated-clean, table-driven CAM program for the part - setups, tools, operations, and posted G-code.
 stage_scope: [cam]
-playbook_default: cam_job
 tool_allowlist:
   - tool: ledger_get
   - tool: ledger_note

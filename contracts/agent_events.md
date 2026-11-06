@@ -7,8 +7,8 @@
 > telemetry journal). Never duplicate this vocabulary in a parallel file.
 >
 > **Machine check:** the canonical machine-readable kind list is
-> `contracts/agent_events.json` (kinds + required payload fields), verified against both
-> emitters (`core/agent/events.cpp`, `services/agent/agent_events.py`) by
+> `contracts/agent_events.json` (kinds + required payload fields), verified against
+> the Python emitter (`services/agent/agent_events.py`) by
 > `scripts/agent_events_audit.py` (wired into `scripts/check.py`). Any kind added here
 > MUST be added to the JSON in the same change or the gate fails.
 >
@@ -203,7 +203,7 @@ A conforming consumer MUST:
 
 ## Early-stop detail (2026-07-16, additive)
 On `run_finished` / terminal `status` (phase done|error|failed|cancelled) and the
-agent run RPC result (`agent_run_v2`; formerly also `agent_design`, removed 2026-07-22),
+`agent_admin_turn` result (`agent_design` was removed 2026-07-22),
 optional additive fields:
 - `stop_reason` — short enum-ish string (confirmed|stabilized|refine_cap|max_iters|no_code|failed|provider_error|provider_auth|provider_unavailable|provider_refused|phase_step_cap|terminated_by_user|…)
 - `error_detail` — human sentence, secret-scrubbed, ≤~300 chars; empty on normal completion. Prefer over legacy `error`.
@@ -213,26 +213,14 @@ GUI renders error bubbles as `stopped: <stop_reason> — <error_detail>` when pr
 - Config `agent.max_subagent_depth` (int, default 2, root chat = depth 0): hard cap on subagent nesting LAYERS (not concurrency); spawn past cap → DelegationError "max subagent nesting depth (N) reached".
 - Coordination board (`services/agent/coordination.py`, per run_id, JSON sidecar `{runs_dir}/{run_id}.coordination.json`): `register_claim(agent_id, resources, intent) -> claim|CONFLICT(holder,intent)`, `release_claim`, `post_progress`, `board_snapshot`. Subagent tools: `coordinate_claim/release/progress/board`; board preamble injected into subagent prompts.
 
-## aicad.corporate/1 (2026-07-16, additive)
-Opt-in org mode. Config: `agent.corporate_mode` (bool, default false); `agent.corporate` {max_departments:3, team_leads:true, meeting_cadence:5, director_review:true}.
-Structure per run: director (depth 0) → department heads (depth 1, one per derived department, capped/merged) → workers (depth 2, head-spawned; team lead auto-promoted >3 workers).
-Channels (enforced): `dept:<id>` = head+workers(+lead); `heads` = heads+director. Worker→director → status=rejected.
-Meetings: every `meeting_cadence` worker completions or on blockage, head posts MeetingDigest {done,in_progress,blocked,risks,trigger,worker_completions} to heads; director review is template-first, LLM steering note only on misalignment/blockage.
-Tools: corporate_activate, channel_post, channel_read, chart, spawn_worker, hold_meeting, record_completion.
-
-## aicad.corporate/1 stream events (2026-07-16, additive)
-`kind:"corporate"`, `corp_event ∈ org_built|hire|team_lead|meeting|steering|route_rejected|wind_down`, `run_id`, `ts`, optional `chart_revision`/`dept`/`agent`, `payload` per event: org_built {chart_revision,director_id,departments[],mission_goals}; hire {role,rank,parent_id,dept_id,brief?,model?,live?}; team_lead {worker_id,dept_id,previous_rank}; meeting = MeetingDigest + counts; steering {text,to_dept,needs_llm,aligned,notes,llm_refined?}; route_rejected {from,channel,reason,from_rank}; wind_down {summary,success,departments_done,artifact_path?,digests}.
-Emission seam: services.agent.corporate.emit_corporate_event → agent_events.emit_event. GUI consumer: legacy_chat feedTurnActivity (rowKinds 4–8).
-Effective depth rule (binding): team-lead→worker spawns use effective_cap = max(agent.max_subagent_depth, 3) computed ONLY inside the corporate spawn path; the global key is never mutated and still governs flat delegation.
-
 ## Stream Thinking/Doing (2026-07-16, additive)
-C++ agent_run path now emits agent-level kinds previously Python-only:
-- `agent.thought`: after each provider completion when CompleteResult.thinking is non-empty. Fields: `id`, `text` (cap 4000 on C++; Python thought_event still caps 500), optional `model`, `stage`, `attempt`, `parent_id`, `actor`, `node_id` (=stage or `run`). Batched post-run on in-proc C++ path (no live stream refactor).
-- `agent.tool_call` **args_preview** (optional string, <=~2KB): capped JSON of tool/op args for the Doing drawer. Digests (`args_digest`/`result_digest`) unchanged. Producers: Python `tool_call_event`; C++ synthetic emit after `doc_apply_ops` with `tool_name` = op type (homogeneous) or `doc_apply_ops`, `target` best-effort, `ok`, `latency_ms`. Consumers MUST tolerate unknown fields (additive; no schema bump).
+Agent-level kinds:
+- `agent.thought`: Fields: `id`, `text` (Python thought_event caps 500), optional `model`, `stage`, `attempt`, `parent_id`, `actor`, `node_id` (=stage or `run`).
+- `agent.tool_call` **args_preview** (optional string, <=~2KB): capped JSON of tool/op args for the Doing drawer. Digests (`args_digest`/`result_digest`) unchanged. Producer: Python `tool_call_event`. Consumers MUST tolerate unknown fields (additive; no schema bump).
 
-## Tool artifacts + classification (2026-07-17, additive)
+## Tool artifacts (2026-07-17, additive)
 - `agent.tool_call` optional `artifacts` (array, <=8) of `{path, kind}` where `kind in image|mesh|file`: filesystem paths of deliverables produced by render/screenshot/export tools (contact sheets, `render_part`/`render_views`/`render_sketch`/`look_around` PNGs, STL/STEP exports). Lets the GUI expand a tool-call row to show the produced image(s) inline. `args_digest`/`result_digest` unchanged. Producer: Python `tool_call_event` when the tool result carries a path/`contact_sheet`. Consumers MUST tolerate unknown fields (additive; no schema bump).
-- `agent.classification` (new kind): emitted ONCE at request entry, BEFORE dispatch/routing, so the GUI can show the pre-flight task-classification step the user sees while "the request gets routed". Fields: `task_class` (workflow_router `TaskClass`), `scaffold_level`, `tier`, `reason` (<=160 chars), `request_snippet` (<=120 chars), optional `picked_model`, `picked_provider`. Mirrors `aicad.router/1` RouterResult. Producer: services.agent entry (mission/design) via `workflow_router.route`. Consumers tolerate unknown kinds (conformance §5); GUI renders a "Routing" card at the top of the copilot activity timeline.
+- (Removed) `agent.classification` is no longer produced; consumers tolerate it as an unknown kind (conformance §5).
 
 ## Role-change + delegation cards (2026-07-27, additive)
 - `agent.role` (new kind): emitted ONLY when the agent actually adopts a different role via `adopt_role` — never for the default first-turn `general_agent` entry. Fields: `node_id`, `role`, `goal` (<=280), `from_role`, `reason` (<=280). Producer: `services.agent.mission_dispatch.MissionDispatch.adopt_role` via `agent_events.role_event`. GUI: reveals the copilot Routing card (rowKind 10) with the new role; the per-request `agent.classification`/`complexity`/`task_route` telemetry alone now keeps the card hidden (stage `class:pending`) since every request enters via the universal `general_agent` role.
@@ -256,41 +244,38 @@ Host passes its ChatMsg transcript as messages[]; RPCs are pure transforms, host
 - session_shake {messages, mode(elide|images), aggressive?} -> {ok, messages, saved_tokens, notice}
 - session_handoff {messages, focus?, provider, model} -> {ok, document} (## Goal/Constraints/Progress/Key Decisions/Critical Context/Next Steps; new-session is host-side)
 - session_btw {messages, question, provider, model} -> {ok, answer} (ephemeral; never mutates history)
+- Manual compaction (2026-10-26, additive): online `/compact` is `agent_admin_turn` with `compact: {strategy?: "summary"|"snapcompact", instructions?}` (request = the typed slash text). It streams the `sub_run` compaction row and `agent.context`, is cancelled by `agent_cancel(run_id)`, and replies `{ok, turn:{..., result:"", cancelled, compaction:{strategy, method?, summary, shortSummary?, tokensBefore?, tokensAfter?, contextWindow?, firstKeptEntryId?}}}` or `{ok:false, reason, stop_reason: "compaction_failed"|"compaction_refused"}`. `session_compact` serves explicit offline/standalone compaction only.
 
-## plan_state (batch 2c, additive; C++ agent harness)
+## plan_state (batch 2c, additive)
 Event `kind:"plan_state"` { shape:"build_plan"|"checklist"|"phased_todo"|"objectives"|"dag", title, summary?, revision, items:[{id, title(<=10 words), desc(tooltip: purpose/dims/assignment), status:"pending"|"running"|"pass"|"fail"|"done"|"abandoned", kind:"part"|"step"|"task"|"objective"|"node"|"subagent", phase?, parent_id?, meta?}], edges?:[{from,to}] (dag only) }
-Producers: core/agent/machine.cpp (build_plan after plan pass; checklist from plan_steps live; objectives when plan JSON has objectives/acceptance/success_criteria); core/agent/run.cpp mission loop (phased_todo). DAG not emitted from C++ (host reads buildgraph sidecar/RPC). Back-compat: kind:"plan"+PlanInfo kept; host normalizes PlanInfo→plan_state build_plan when planState empty. Raw plan_steps/model_step/mission_* remain. GUI: copilot Plan/Objectives section (tiles+hover tooltips, todos tree, subagents) above the activity timeline.
-Python producer (2026-07-29, additive): `services/agent/task_list.py` publishes shape=`checklist` with `task:<n>`-namespaced ids on behalf of the `task_list` tool, streamed through `worker_rpc._agent_admin_turn`'s `_emit` and relayed verbatim by `core/agent/run.cpp`'s admin-turn branch. This is the ONLY plan_state producer reachable from the general lane (the universal online entry), which never enters the C++ machine/mission loops. Full-snapshot semantics: each publish restates every item, and the host's scoped-prune (common `task:` id prefix) drops rows the writer omitted.
+Producer: `services/agent/task_list.py` publishes shape=`checklist` with `task:<n>`-namespaced ids on behalf of the `task_list` tool, streamed through `worker_rpc._agent_admin_turn`'s `_emit`. Full-snapshot semantics: each publish restates every item, and the host's scoped-prune (common `task:` id prefix) drops rows the writer omitted. Back-compat: kind:"plan"+PlanInfo kept; host normalizes PlanInfo→plan_state build_plan when planState empty. GUI: copilot Plan/Objectives section (tiles+hover tooltips, todos tree, subagents) above the activity timeline.
 
 ## options.mode — copilot mode overhaul (Agent/Plan/Swarm/Edit/Ask)
-`options` on agent_run/agent_run_v2/agent_mission_v1 (agent_design removed 2026-07-22):
+`options` on the agent turn request (agent_design removed 2026-07-22):
 | key | type | default | meaning |
 |-----|------|---------|--------|
 | mode | agent|plan|swarm|edit|ask | agent | copilot composer mode (persisted host-side as config copilot_mode) |
 | plan_only | bool | false (true when mode=plan) | intake+plan → emit plan_state → stop before mutation; returns {status:plan_ready} |
 | approved_plan | string|obj | null | seed plan; skip re-plan; clears plan_only (execute pass) |
 | execute_as | agent|swarm | — | how an approved plan resumes |
-| corporate_force | bool | false (true when mode=swarm) | force subagent-manager/corporate |
 | scope | obj | {} | edit targeting {doc_id, feature_ids?, selection?, section?} |
 | advisor | bool | true | advisor on for run + subagents; config agent.advisor default true, env CHUDWARE_ADVISOR honored |
-Mode→role: agent→default, plan→planning, swarm→default(+corporate), edit→task, ask→default(read-only). Mode→tools (Python copilot_mode_tools): ask=read-only; plan=read+plan no mutation; edit=doc mutators no new_part/mission; agent=full+delegate; swarm=full+corporate/delegate. Subagents available in every mode. Plan gate: mode=plan → plan_only run → GUI drawPlanApproveCard (Execute as Agent/Swarm/Cancel) → resend approved_plan+execute_as. C++ (core/agent/run.cpp / core/api/libchudware.cpp) parses these; absent mode = legacy byte-identical.
+Mode→role: agent→default, plan→planning, swarm→default, edit→task, ask→default(read-only). Mode→tools (Python copilot_mode_tools): ask=read-only; plan=read+plan no mutation; edit=doc mutators no new_part/mission; agent=full+delegate; swarm=full+delegate. Subagents available in every mode. Plan gate: mode=plan → plan_only run → GUI drawPlanApproveCard (Execute as Agent/Swarm/Cancel) → resend approved_plan+execute_as.
 
 ## Mid-run steering (2026-07-19, additive)
-- `agent_steer` (new kind): emitted by the C++ run machine when a queued user steering
-  message is consumed at a stage/attempt boundary. Fields: `text` (the steering text).
-  The machine folds the text into the request as `[User steering] <text>` so the next
-  provider call sees it. Queue side: `agent_steer {run_id, text}` RPC (contracts/worker_rpc.md
-  §AI) → `{ok, steered}`; cooperative like `agent_cancel` — never interrupts an in-flight
-  provider HTTP call; unknown/finished run_id → `steered:false`. Consumers tolerate unknown
+- `agent_steer {run_id, text}` RPC (contracts/worker_rpc.md §AI) → `{ok, steered}`;
+  cooperative like `agent_cancel` — never interrupts an in-flight provider HTTP call;
+  unknown/finished run_id → `steered:false`. Online delivery is reported through the
+  `agent.steer` event (see "Online steer delivery" below). Consumers tolerate unknown
   kinds (conformance §5).
 
 ## No online classification step (2026-09-03, superseding)
 - `agent.classification`, `task_route` and `complexity` are no longer produced by the ONLINE
   lane and have no GUI consumer: the Routing card (rowKind 10), the session scope
   color-code and `agent_events.classification_event` were removed. A chat send is one
-  Chudcode `general_agent` turn; the model decides inline/delegate/mission itself. The native
-  offline pipeline (`core/agent/run.cpp`, `micro.cpp`) may still emit `agent.classification`
-  for its own stage structure; consumers MUST tolerate it exactly as any unknown kind (§5).
+  OMP `general_agent` turn; the model decides inline/delegate/mission itself. The
+  removed native offline pipeline was the only emitter of `agent.classification`;
+  consumers MUST tolerate it exactly as any unknown kind (§5).
 - Copilot modes are Agent | Plan | Ask only (`CopilotMode` 0/1/2). `swarm`/`edit`/`eng_firm`
   remain valid `options.mode` values for programmatic callers (the mode contract is unchanged)
   but the GUI never sends them; the plan-approve card resends `approved_plan` with
@@ -303,9 +288,9 @@ Mode→role: agent→default, plan→planning, swarm→default(+corporate), edit
 - `agent.message` (new kind): display-only mirror of agent-to-agent traffic so the main chat
   shows it inline. Fields: `node_id`, `id`, `channel` (`irc` | `pool` | `board`), `from`, `to`
   (`Main` for a message delivered to the main agent; `board` for a board post), `text` (the
-  message body, <=4096; never the prompt wrapper Chudcode renders around it), optional
+  message body, <=4096; never the prompt wrapper the runtime renders around it), optional
   `message_id`, `reply_to`, `mode` (workpool card mode), `run_id`, `actor`.
-- Producers: `services/agent/chudcode_events.py` maps Chudcode `irc_message` frames
+- Producers: `services/agent/omp_events.py` maps OMP `irc_message` frames
   (`irc:incoming` / `irc:relay` / `irc:workpool` records) — previously a `sub_run`
   "Message from <agent>" row whose body never rendered; `services/agent/coordination.py`
   `CoordinationBoard.post_progress` forwards each board post (`channel=board`) to the board's
@@ -317,22 +302,22 @@ Mode→role: agent→default, plan→planning, swarm→default(+corporate), edit
 
 ## Current producer ownership
 
-The online producer is the Chudcode session host and `services/agent/worker_rpc.py`.
-The offline-safe producer is `core/agent/run.cpp`; `services/agent/agent_turn.py`
+The online producer is the OMP session host (`services/agent/omp_host.py`) and `services/agent/worker_rpc.py`;
+`services/agent/agent_turn.py`
 retains the explicit Python provider loop. References above to `services.agent.loop`
 are historical implementation pointers, not an active module or wire requirement.
 
 ## Online steer delivery (append-only, 2026-10-11)
 
-- `agent.steer {steer_id, status}` (Chudcode lane, mapped from the session host's
-  `agent_steer` frame by `services/agent/chudcode_events.py`). `status`:
+- `agent.steer {steer_id, status}` (OMP lane, mapped from the session host's
+  `agent_steer` frame by `services/agent/omp_events.py`). `status`:
   - `delivered` — the steer's user message streamed into the turn (the model has it), or a
     message a Stop withdrew opened the conversation's next prompt (emitted after that turn's
     `agent_start`).
-  - `carried` — still in Chudcode's queue when the turn ended; withdrawn so Chudcode's settle
+  - `carried` — still in the runtime queue when the turn ended; withdrawn so its settle
     drain cannot answer it in an unobserved turn. It opens the conversation's next prompt.
 - `steer_id` is the GUI's correlation id from `agent_steer.steer_id`; steers sent without one
-  emit no event. Distinct from the C++ run machine's `agent_steer` kind above.
+  emit no event.
 - GUI: `copilot/feed.cpp::feedSteerEvent` moves the user bubble's `steerState`
   (`app_state.h` `SteerState`), drawn as a caption under the bubble (`chat_log.cpp`).
 
@@ -348,3 +333,90 @@ Confirmed delivery cannot be downgraded by a late queued/carried/failed control 
 Unknown user frames and a successful Stop are not blanket delivery evidence for other
 messages. Legacy saved transcripts may reconcile an exact, unique, image-free resolved
 question reply within the same turn; ambiguous or cross-turn matches remain unconfirmed.
+
+## Shared work board — `aicad.coordination/2` (2026-10-28)
+
+This version supersedes the exclusive-claim behavior in Subagent governance above.
+`coordinate_claim(resources, intent, agent_id?)` records advisory work intent, not
+custody or edit permission. Multiple agents may register the same document, feature
+or file; overlap never returns `CONFLICT`. Entries are keyed by resource and agent,
+and re-registering that pair retains its claim id while refreshing intent.
+The calling nested agent is the default identity; the root falls back to its run id.
+
+`coordinate_release` removes only the selected agent's entries. Omitted selectors
+remove all of that agent's entries; an explicit empty selection removes nothing.
+Every persisted board read/update refreshes under the sidecar lock, so progress or
+release from a stale worker cannot erase peer entries. Existing v1 entries become
+advisory on load; snapshots and subsequent writes use v2. Geometry is not locked by
+the board: engine operation batches remain atomic in arrival order, with ordinary
+geometry validation and no semantic conflict detection.
+
+## Official OMP producer cutover (2026-10-28)
+
+The online producer is `services/agent/omp_host.py` and `services/agent/omp_events.py`.
+A prompt response is not terminal evidence while asynchronous child
+work remains: completion follows runtime settlement. Stop, compaction failure,
+timeout or cancellation must not be presented as successful compaction. Events
+continue to carry the established user-visible contract; the trusted per-session
+extension binds root and child CAD callbacks to their actual agent identities.
+
+## Runtime failure classification (append-only, 2026-10-30)
+
+`runtime_error` is an additional `stop_reason` for host, worker, OMP process, control
+and protocol failures. `provider_error` remains for reported provider/API failures.
+An explicit turn budget or cancellation retains its existing stop reason.
+
+## Nested Eval tool lineage (append-only, 2026-10-31)
+
+An OMP Eval's bridged CAD calls emit individual tool-start status and
+`agent.tool_call` events. They carry `parent_id` when exactly one active Eval
+for the calling agent can own the call, and child calls carry `subagent_id`.
+If the parent cannot be determined unambiguously, these events instead carry
+optional `parent_unknown: true` and omit `parent_id`; consumers must not infer
+an Eval parent from another agent or from an overlapping Eval. Absence of the
+flag does not itself establish a parent. A structured CAD `ok:false` marks the
+individual row failed without changing the result returned to Eval. Direct
+`write xd://...` calls retain their existing single OMP row.
+
+This is an additive optional field; existing consumers ignore it under §5 and
+the `/2` schema is unchanged.
+
+## No ambient document context (append-only, 2026-11-05, superseding)
+
+This supersedes the `options.scope` bullet in "No online classification step" above. The GUI
+sends no per-turn document scope: `options.scope` and the top-level `doc_id` of
+`agent_admin_turn` are no longer sent, and the worker renders no ACTIVE DOCUMENT block and no
+open-document listing (including after a daemon restart). The model is never told, unasked,
+which documents the user has open; only user-picked `context_refs` chips reach the request
+(PICKED CONTEXT). Workers ignore a stray `scope`/`doc_id` from older clients.
+
+## OMP activity surface (append-only, 2026-11-05)
+
+Display-only projections of frames the official OMP runtime already streams. None of them
+sends anything to the runtime, so the provider prompt prefix (system prompt, tools, history)
+is unchanged. They are drawn only for the conversation's own root agent: task sub-agent
+frames (`subagent_event`) and `delegate` role sessions (`delegate_session` event context)
+keep their existing tool rows.
+
+- `agent.usage` (new kind, `services/agent/omp_events.py`): one billed provider request,
+  from the root `turn_end` envelope, so it follows that request's tool calls. Fields:
+  `node_id`, `id` (`usage:<timestamp_ms>`), `input`, `output`, `cache_read`, `cache_write`,
+  optional `timestamp_ms` (request start), `completed_ms`, `duration_ms`, `ttft_ms`,
+  `elapsed_ms` (from the latest non-agent user message to completion — OMP's Δ), `model`,
+  `provider`, `stop_reason`. GUI: rowKind 21 line (`copilot/feed.cpp`, `cards.cpp`), showing
+  in = `input + cache_write` like OMP.
+- `agent.message` gains optional `timestamp` (ms, the runtime's send time; board posts stamp
+  their post time). GUI: OMP-style IRC card — header with sender, recipient and age over up
+  to three body lines on a quote gutter; workpool `mode` shows in the header.
+- OMP's builtin `wait` maps to one `sub_run` (`id` `wait:<toolCallId>`) updated from its
+  `details.jobs` snapshots ("Waiting on 10 jobs", "Waiting on 7 of 10 jobs · 2 done",
+  "10 jobs settled"); it emits no `agent.tool_call`.
+- A successful root `todo` result also emits `plan_state` `{shape:"phased_todo",
+  title:"Todo", revision:0, items}` from `details.phases`; item ids are
+  `todo:<phase>/<content>` (one prune scope), `phase` is the OMP phase name, statuses map
+  `in_progress→running`, `completed→done`, `blocked→fail` (blocker as `desc`). The GUI phase
+  header shows `closed/total`. `todo_reminder` is a `status` notice (`phase:"todo_reminder"`)
+  and no longer a plan snapshot.
+- Supersedes "board preamble injected into subagent prompts" under Subagent governance: no
+  coordination-board text is injected into any prompt; the board reaches models only as
+  `coordinate_*` tool results.

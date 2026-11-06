@@ -15,6 +15,10 @@
 
 namespace chudware::sim {
 
+// Portable SPICE definition for the same NE555 model used by the native solver.
+// It can be embedded as schematic text for KiCad's simulator.
+const char* ne555_spice_model();
+
 // Parse a full SPICE deck into the Circuit dict (study is discarded, matching
 // spice.parse_spice). Built-in subckts (OPAMP, NE555) are always available and
 // X-instances are inlined exactly as the Python front-end does.

@@ -2,10 +2,12 @@
 // Compiled only with CHUDWARE_ENABLE_CEF (design: docs/design/cef_webview.md).
 #include "cef_app.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 
 #include "include/cef_app.h"
 #include "include/cef_command_line.h"
@@ -21,6 +23,7 @@ namespace ui::cef {
 namespace {
 
 bool g_initialized = false;
+bool g_headless_daemon = false;
 // Once CefInitialize has been attempted (success or fail), never call it again
 // in this process. A second CefInitialize after FAILED is a hard crash under
 // CEF 149 (SetSamplingProfiler SIGTRAP — vendor wizard coredumps 2026-07-10)
@@ -33,16 +36,18 @@ char** g_argv = nullptr;
 // CEF calls OnScheduleMessagePumpWork from any thread; the GL/UI loop drains it
 // via pump_if_due(). Atomic so the two threads don't need a lock.
 std::atomic<long long> g_pump_due{-1};
+// Installed by the GUI backend. The subprocess helper shares this file but must
+// not link ImGui/GLFW or the GUI animation implementation.
+std::atomic<void (*)()> g_wake_loop{nullptr};
 
-// Live OSR browser count. While > 0 the frame loop pumps CEF every frame (the
-// deadline model starves OSR during load); at 0 it pumps only on the deadline.
+// Live OSR browser count, maintained across asynchronous create/close callbacks.
 std::atomic<int> g_live_browsers{0};
 
 // Browsers whose CreateBrowser has been issued but whose OnAfterCreated has not
 // yet fired. CreateBrowser is async and needs several message-loop pumps to reach
 // OnAfterCreated; the deadline model can under-pump that window and wedge creation
 // (no OnAfterCreated → g_live_browsers never rises → permanent "Loading"). While
-// > 0 we pump every frame, exactly like a live browser.
+// > 0 we pump every frame, independent of the next scheduled deadline.
 std::atomic<int> g_creating{0};
 
 long long now_ms() {
@@ -98,6 +103,11 @@ public:
         // subprocesses (Check failed: HasSwitch(kLang)). Set it for every process.
         if (!cmd->HasSwitch("lang"))
             cmd->AppendSwitchWithValue("lang", "en-US");
+#if defined(__linux__)
+        // The windowless daemon must not depend on the GUI session's Wayland/X11
+        // socket. Leave the GUI's Ozone and clipboard behavior untouched.
+        if (g_headless_daemon) cmd->AppendSwitchWithValue("ozone-platform", "headless");
+#endif
         cmd->AppendSwitchWithValue("password-store", "basic");
         cmd->AppendSwitch("use-mock-keychain");
         // OSR renders off-screen, so keep the GPU off the native-window/Vulkan
@@ -208,10 +218,11 @@ public:
     }
 
     void OnScheduleMessagePumpWork(int64_t delay_ms) override {
-        // External-pump model: CEF asks to be pumped in delay_ms. Record the
-        // deadline; the GLFW frame loop calls cef::do_message_loop_work() when due
-        // (and glfwPostEmptyEvent wakes an idle loop). See cef::pump_due_in_ms().
+        // The loop bounds its idle wait by this deadline; immediate work also
+        // wakes a wait already in progress.
         schedule_pump(delay_ms);
+        if (delay_ms <= 0)
+            if (auto wake = g_wake_loop.load(std::memory_order_acquire)) wake();
     }
 
     // CRASH FIX (coredump-confirmed, SIGTRAP in RenderProcessHostImpl::
@@ -252,10 +263,11 @@ int execute_subprocess(int argc, char** argv) {
     return CefExecuteProcess(args, g_app.get(), nullptr);
 }
 
-bool initialize() {
+bool initialize(bool persistent_global) {
     if (g_initialized) return true;
     if (g_init_attempted) return false;   // prior fail — do not re-enter CefInitialize
     g_init_attempted = true;
+    g_headless_daemon = persistent_global;
 
     CefSettings settings;
     settings.windowless_rendering_enabled = 1;
@@ -290,6 +302,13 @@ bool initialize() {
     // separate. This tree is CEF's own (NOT the Playwright profiles) until the
     // cookie-interop pass — see cef_platform::cache_root().
     CefString(&settings.root_cache_path) = cache_root;
+    // The daemon imports GUI cookies into its global context. Without a cache
+    // path that context is incognito, so those cookies disappear at idle exit.
+    // Its root is separate from the GUI's ProcessSingleton-protected root.
+    if (persistent_global) {
+        CefString(&settings.cache_path) = cache_root;
+        settings.persist_session_cookies = 1;
+    }
     // Keep CEF's DEFAULT user agent (a genuine "Chrome/149… Safari/537.36" string
     // with no Headless/CEF token) — a hand-rolled UA that doesn't match the native
     // Sec-CH-UA client hints is a WORSE tell than the default. Only pin the
@@ -324,6 +343,10 @@ bool initialized() { return g_initialized; }
 
 bool init_failed() { return g_init_attempted && !g_initialized; }
 
+void setWakeCallback(void (*wake)()) {
+    g_wake_loop.store(wake, std::memory_order_release);
+}
+
 void note_browser_creating() { g_creating.fetch_add(1, std::memory_order_relaxed); }
 
 void note_browser_create_failed() {
@@ -340,25 +363,24 @@ void note_browser_closed() {
     if (prev <= 0) g_live_browsers.store(0, std::memory_order_relaxed);  // never negative
 }
 
+int msUntilDue() {
+    if (!g_initialized) return -1;
+    // Keep creation pumping until OnAfterCreated, even if CEF misses a schedule.
+    if (g_creating.load(std::memory_order_relaxed) > 0) return 0;
+    const long long due = g_pump_due.load(std::memory_order_relaxed);
+    if (due < 0) return -1;
+    const long long remaining = due - now_ms();
+    if (remaining <= 0) return 0;
+    return static_cast<int>(std::min(remaining,
+                                   static_cast<long long>(std::numeric_limits<int>::max())));
+}
+
 bool pump_if_due() {
-    if (!g_initialized) return false;
-    // Pump EVERY frame while any browser is alive OR is being created (live count
-    // is bumped in OnAfterCreated, which itself needs a pump — so also pump while
-    // a create is pending, tracked by a nonzero deadline). The external-pump
-    // deadline model proved unreliable for interactive OSR here: the panel hung on
-    // "Loading" while the --cef-shot path, which pumps continuously, worked. This
-    // matches that: the GLFW loop already spins at 60 fps (glfwPollEvents), so an
-    // unconditional pump-per-frame costs nothing extra and removes all dependence
-    // on OnScheduleMessagePumpWork firing. When fully idle (no browser, no pending
-    // deadline) we skip the call so a closed-panel app isn't needlessly poked.
-    const bool anyLive    = g_live_browsers.load(std::memory_order_relaxed) > 0;
-    const bool creating   = g_creating.load(std::memory_order_relaxed) > 0;
-    const bool createPend = g_pump_due.load(std::memory_order_relaxed) >= 0;
-    // Pump every frame while a browser is live OR a CreateBrowser is in flight
-    // (OnAfterCreated pending) — the latter closes the starvation window that left
-    // the vendor panel on "Loading" forever. Otherwise pump only on CEF's deadline.
-    if (!anyLive && !creating && !createPend) return false;
-    g_pump_due.store(-1, std::memory_order_relaxed);  // CEF reschedules the next
+    // Do not treat a future deadline (or a merely live browser) as work due now.
+    // Creation is the exception: under-pumping it historically wedged the panel
+    // on "Loading" before OnAfterCreated could settle the in-flight counter.
+    if (msUntilDue() != 0) return false;
+    g_pump_due.exchange(-1, std::memory_order_relaxed);  // CEF reschedules the next
     CefDoMessageLoopWork();
     return true;
 }

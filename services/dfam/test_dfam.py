@@ -1,4 +1,4 @@
-"""Hermetic, consumer-visible DFAM thresholds and model-frame measurements."""
+"""Consumer-visible DFAM thresholds; wall integration uses the native engine."""
 from __future__ import annotations
 from dataclasses import replace
 import time
@@ -6,6 +6,8 @@ import numpy as np
 import pytest
 import trimesh
 from . import FaceInfo, PrintMesh, PrintParams, analyze_printability, frame_for_build_dir, load_mesh_file
+from . import checks as dfam_checks
+from .geometry import BuildGeometry
 
 
 def box(size, center=(0,0,0)):
@@ -44,17 +46,167 @@ def annulus_hole(diameter, horizontal=False):
                      [FaceInfo("outer",1,0,"base"),FaceInfo("hole",1,1,"bore")])
 
 
+def test_open_concave_fillet_is_not_a_hole():
+    tube = trimesh.creation.annulus(r_min=.6, r_max=5, height=10, sections=64)
+    normals, centers = tube.face_normals, tube.triangles_center
+    inner = ((np.abs(normals[:, 2]) < .1) &
+             (np.einsum("ij,ij->i", normals[:, :2], centers[:, :2]) < 0))
+    # Four distinct pocket corners, each a quarter of a concave cylinder.
+    quarter = inner & (centers[:, 0] > 0) & (centers[:, 1] > 0)
+    pieces = []
+    for x, y in ((0, 0), (10, 0), (0, 10), (10, 10)):
+        part = tube.submesh([np.flatnonzero(quarter)], append=True, repair=False)
+        part.apply_translation([x, y, 0])
+        pieces.append(part)
+    joined = trimesh.util.concatenate(pieces)
+    ids = np.repeat(np.arange(4), [len(p.faces) for p in pieces])
+    corners = PrintMesh(joined.vertices, joined.faces, ids,
+                        [FaceInfo(f"corner:{i}", 1, 1, "pocket") for i in range(4)])
+    result = check(corners, "small_holes")
+    assert result["metrics"]["holes"] == 0
+    assert result["regions"] == []
+
+    # A real bore split across two CAD faces must be combined before closure.
+    split_ids = np.where(inner, np.where(centers[:, 0] >= 0, 1, 2), 0)
+    split = PrintMesh(tube.vertices, tube.faces, split_ids,
+                      [FaceInfo("outer", 1, 0, "base"),
+                       FaceInfo("bore:a", 1, 1, "bore"),
+                       FaceInfo("bore:b", 1, 1, "bore")])
+    result = check(split, "small_holes")
+    assert result["metrics"]["holes"] == 1
+    assert result["regions"][0]["diameter_mm"] == pytest.approx(1.2, abs=.03)
+    assert result["status"] == check(annulus_hole(1.2), "small_holes")["status"]
+
+
 def test_thin_vertical_plate_fails_and_reports_model_location():
     m = mesh_of(box((.6,20,20),(10,30,40)), attributed=True)
     result = check(m,"min_wall")
     assert result["status"] == "fail"
     assert result["value_mm"] == pytest.approx(.6, abs=.05)
-    assert result["limit_mm"] == 1.
+    assert result["limit_mm"] == pytest.approx(1.35)  # three 0.45 mm perimeters
     assert result["regions"][0]["classification"] == "vertical_wall"
     center = result["regions"][0]["centroid"]
     assert np.allclose(center,[10,30,40], atol=1)
     assert result["regions"][0]["faces"] == ["plane:1"]
     assert result["regions"][0]["built_by"] == ["extrude:1"]
+
+
+def test_thin_rib_top_uses_width_instead_of_normal_ray_height():
+    rib = box((.6, 6, 20), (10, 30, 40))
+    top = rib.face_normals[:, 2] > .99
+    mesh = PrintMesh(rib.vertices, rib.faces, top.astype(int),
+                     [FaceInfo("rib_sides", 1, 0, "rib"),
+                      FaceInfo("rib_top", 1, 0, "rib")])
+    result = check(mesh, "min_wall")
+    assert result["status"] == "fail"
+    # A downward normal ray from this top reads the 20 mm height. Coverage by
+    # the side's inscribed spheres must expose the 0.6 mm width on the top too,
+    # measured across the rib: the top is part of a vertical wall, not a skin.
+    region = next(r for r in result["regions"] if r["faces"] == ["rib_top"])
+    assert region["status"] == "fail"
+    assert region["classification"] == "vertical_wall"
+    assert region["thickness_mm"] == pytest.approx(.6, abs=.1)
+    assert region["thin_area_mm2"] > 0
+    assert region["centroid"][2] == pytest.approx(50)
+    assert result["metrics"]["measurement_basis"]["method"] == "inscribed_sphere"
+
+
+def test_min_wall_mocked_unmeasured_is_not_an_adequate_wall(monkeypatch):
+    def measure(method, params):
+        assert method == "mesh_wall_thickness"
+        count = len(params["points"]) // 3
+        return {"ok": True, "thickness": [None] * count, "opposing_cos": [None] * count,
+                "wall_direction": [None] * count, "spacing_mm": .2, "n_blockers": 30}
+
+    monkeypatch.setattr(dfam_checks.core_bridge, "call", measure)
+    result = check(mesh_of(box((20, 20, 20))), "min_wall")
+    assert result["status"] == "not_evaluated"
+    assert result["ok"] is None
+    assert result["value_mm"] is None
+    assert result["metrics"]["min_thickness_mm"] is None
+    assert result["metrics"]["thin_area_mm2"] == 0
+    assert result["metrics"]["knife_edge_area_mm2"] == 0
+    assert result["metrics"]["gap_fill"]["area_mm2"] == 0
+    assert result["metrics"]["measurement_basis"]["n_unmeasured"] == result["metrics"]["samples"]
+    assert result["regions"] == [] and result["fix"] == []
+    assert "No opposing wall measured" in result["note"]
+    assert "search" not in result["note"].lower()
+
+
+def test_min_wall_mocked_null_samples_do_not_become_thin_regions(monkeypatch):
+    mesh = mesh_of(box((20, 20, 20)), attributed=True)
+    geom = BuildGeometry(mesh)
+    tids = np.flatnonzero(np.abs(geom.normals[:, 2]) < .5)[:2]
+    samples = (geom.centroids[tids], geom.normals[tids], tids, np.array([7., 3.]))
+    monkeypatch.setattr(dfam_checks, "surface_samples", lambda _: samples)
+    monkeypatch.setattr(dfam_checks.core_bridge, "call", lambda *_: {
+        "ok": True, "thickness": [None, .6], "opposing_cos": [None, -1.],
+        "wall_direction": [None, (-samples[1][1]).tolist()], "spacing_mm": .2, "n_blockers": 30})
+    result = check(mesh, "min_wall")
+    assert result["status"] == "fail"
+    assert result["value_mm"] == pytest.approx(.6)
+    assert result["metrics"]["thin_area_mm2"] == 3
+    assert result["metrics"]["measurement_basis"]["n_unmeasured"] == 1
+    assert len(result["regions"]) == 1
+    assert result["regions"][0]["thin_area_mm2"] == 3
+    np.testing.assert_allclose(result["regions"][0]["centroid"],
+                               geom.model_points(samples[0][1:])[0], atol=.001)
+
+
+@pytest.mark.parametrize("thickness,opposing,horizontal,params,status,classification,gap", [
+    (.6, -1., False, PrintParams(), "fail", "vertical_wall", "pass"),
+    (.2, -.8, False, PrintParams(), "warn", "knife_edge", "pass"),
+    (.2, -.9, False, PrintParams(), "fail", "vertical_wall", "pass"),
+    (.5, -1., True, PrintParams(min_wall_mm=.4, nozzle_mm=.3), "fail", "horizontal_skin", "pass"),
+    (.8, -1., False, PrintParams(min_wall_mm=.4), "fail", "vertical_wall", "pass"),
+    (1.6, -1., False, PrintParams(), "pass", None, "warn"),
+    (1.8, -1., False, PrintParams(), "pass", None, "pass"),
+    (.3, -1., False, PrintParams(min_wall_mm=.2), "fail", "vertical_wall", "pass"),
+    (.3, -1., False, PrintParams(process="sla", min_wall_mm=.2), "pass", None, "pass"),
+    (.3, -1., False, PrintParams(process="sls", min_wall_mm=.2), "pass", None, "pass"),
+    (.3, -1., False, PrintParams(process="mjf", min_wall_mm=.2), "pass", None, "pass"),
+])
+def test_min_wall_mocked_print_semantics(monkeypatch, thickness, opposing, horizontal,
+                                        params, status, classification, gap):
+    mesh = mesh_of(box((20, 20, 20)), attributed=True)
+    geom = BuildGeometry(mesh)
+    tids = np.flatnonzero((np.abs(geom.normals[:, 2]) > .99) if horizontal else
+                         (np.abs(geom.normals[:, 2]) < .5))[:1]
+    samples = (geom.centroids[tids], geom.normals[tids], tids, np.array([5.]))
+    monkeypatch.setattr(dfam_checks, "surface_samples", lambda _: samples)
+    monkeypatch.setattr(dfam_checks.core_bridge, "call", lambda *_: {
+        "ok": True, "thickness": [thickness], "opposing_cos": [opposing],
+        "wall_direction": [(-samples[1][0]).tolist()], "spacing_mm": .1, "n_blockers": 100})
+    result = check(mesh, "min_wall", params)
+    assert result["status"] == status
+    assert result["value_mm"] == pytest.approx(thickness)
+    assert result["metrics"]["gap_fill"]["status"] == gap
+    assert result["metrics"]["knife_edge_area_mm2"] == (5 if classification == "knife_edge" else 0)
+    if classification is None:
+        assert result["regions"] == []
+    else:
+        region = result["regions"][0]
+        assert region["classification"] == classification
+        assert region["thin_area_mm2"] == 5
+        if horizontal:
+            assert region["layers"] == pytest.approx(thickness / params.layer_height_mm, abs=.001)
+            assert region["perimeters"] is None
+        else:
+            assert region["perimeters"] == pytest.approx(thickness / params.line_width_mm, abs=.001)
+            assert region["layers"] is None
+
+
+def test_min_wall_mocked_engine_failure_propagates_without_fallback(monkeypatch):
+    calls = []
+
+    def unavailable(method, _params):
+        calls.append(method)
+        raise RuntimeError("native thickness unavailable")
+
+    monkeypatch.setattr(dfam_checks.core_bridge, "call", unavailable)
+    with pytest.raises(RuntimeError, match="native thickness unavailable"):
+        check(mesh_of(box((20, 20, 20))), "min_wall")
+    assert calls == ["mesh_wall_thickness"]
 
 
 def knife_wedge(x=0.):
@@ -154,7 +306,8 @@ def test_sealed_void_and_unremovable_ceiling_support():
     assert result["status"] == "fail"
     sla=check(m,"internal_voids",PrintParams(process="sla"))
     assert sla["status"] == "fail"
-    assert "drain" in sla["fix"][0]
+    assert sla["metrics"]["sealed_cavities"] == 1
+    assert check(m,"internal_voids",PrintParams(process="mjf"))["status"] == "fail"
     bridgeable=check(m,"internal_voids",PrintParams(max_bridge_mm=12))
     assert bridgeable["status"] == "warn"
 
@@ -399,7 +552,7 @@ def test_separate_support_crumbs_do_not_add_up_to_a_trapped_body():
 def test_horizontal_skin_layers_and_informational_gap_fill():
     skin=check(mesh_of(box((20,20,.5))),"min_wall",
                PrintParams(min_wall_mm=.4,nozzle_mm=.3,layer_height_mm=.2))
-    assert skin["status"] == "warn"
+    assert skin["status"] == "fail"
     assert skin["regions"][0]["layers"] == pytest.approx(2.5,abs=.01)
     gap=check(mesh_of(box((1.6,20,20))),"min_wall")
     assert gap["status"] == "pass"

@@ -25,6 +25,13 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "and bed fit (printer=); rows name faces/features to fix."
         ),
     },
+    "dfm_reinforce": {
+        "prompt_note": (
+            "Preview FDM thin-wall edits on internal shadow clones. Inspect each verified "
+            "fix's before/after thickness and side effects; nothing is applied automatically. "
+            "No verified fix or unmeasured thickness is not evidence of safety."
+        ),
+    },
     "fit_report": {
         "prompt_note": (
             "No args = document report (needs measurements recorded first); "

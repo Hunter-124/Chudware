@@ -765,3 +765,24 @@ Revision strings and lifecycle belong to the item registry, not the filename.
 Two physical native files with distinct revision-suffixed names remain separate
 items until explicitly reconciled; a UI MUST NOT silently delete or merge them
 based only on their names.
+
+## Appendix G — MCP workspace path resolution (additive, 2026-10)
+
+Vault-backed MCP tools accept an omitted `path`, defaulting to the exact active
+request workspace (`CHUDWARE_PROJECT_DIR`, then `CHUDWARE_FS_ROOT`; standalone
+clients use the corresponding environment values). An explicit relative `path`
+resolves beneath that workspace; an absolute or `~` path needs no workspace.
+The selected directory is authoritative: a marked ancestor vault or the worker's
+current directory MUST NOT replace it. An unavailable default returns
+`{ok:false, reason:"project_root_unavailable", hint}` without opening a vault;
+an unresolvable explicit path returns `invalid_project`. These rules do not change
+the tracked-item `file_path`/`folder_path` fields or the vault's on-disk schema.
+
+## Appendix H — KiCad project tracking (contract revision 3)
+
+KiCad project, schematic and board files auto-register as `doc_type:"kicad"`,
+`kind:"ecad"`. Vault checkpoints store these files as raw file snapshots rather
+than exploding a native ZIP container; the historical `.ecad+` handling above
+applies only to legacy files. `ecad_diff` retains its existing four board change
+lists and adds vias, zones and outline, plus schematic object sections including
+symbols, wires and labels.

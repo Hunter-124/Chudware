@@ -363,18 +363,14 @@ def _same_answer(a: dict) -> dict:
 
 
 @pytest.mark.parametrize("alias", ALIASES)
-def test_each_alias_resolves_to_the_canonical_tool(box, alias):
-    canonical = _call("check_geometry_health", doc_id=box)
-    out = _call(alias, doc_id=box)
-    assert _same_answer(out) == _same_answer(canonical), \
-        f"{alias} answered differently from check_geometry_health"
-
-
-@pytest.mark.parametrize("alias", ALIASES + ("check_geometry_health",))
-def test_every_spelling_is_registered_on_the_mcp_surface(alias):
-    """External MCP clients resolve by NAME, so an alias must be a real registered tool."""
+def test_removed_aliases_are_not_registered(alias):
     from services.mcp import server
-    assert alias in server.mcp._tool_manager._tools
+    assert alias not in server.mcp._tool_manager._tools
+
+
+def test_canonical_health_tool_is_registered():
+    from services.mcp import server
+    assert "check_geometry_health" in server.mcp._tool_manager._tools
 
 
 def test_body_id_is_accepted_as_a_spelling_of_body(box):

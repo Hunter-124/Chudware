@@ -9,13 +9,11 @@ Outputs (both git-tracked):
 Modes:
   emit (default)  — needs the runtime venv (`.venv-mcp/bin/python`): warms the
                     live tool registry, rebuilds the snapshot, re-renders the
-                    header. Run this whenever MCP tools are added/renamed
-                    (enforced by services/agent/test_tool_guidance.py).
+                    header. Run this whenever MCP tools are added/renamed.
   --check         — stdlib-only: re-renders the header FROM THE SNAPSHOT and
                     diffs it against the .h on disk. Wired into scripts/check.py
-                    as the ``tool_panel_sync`` audit. (It checks snapshot⟷header
-                    consistency; live-registry⟷snapshot drift is the pytest
-                    test's job.)
+                    as the ``tool_panel_sync`` audit. It checks that the header
+                    renders the checked-in snapshot consistently.
 """
 from __future__ import annotations
 

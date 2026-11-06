@@ -27,10 +27,8 @@ enum ProviderIndex {
                           // so the offline (ITAR) guard REFUSES it while local stays allowed.
     PROV_XAI = 6,         // xAI Grok — API key (console.x.ai) and/or SuperGrok OAuth (xai-sub)
     PROV_CURSOR = 7,      // Cursor (Composer + proxied Anthropic/OpenAI models)
-    PROV_KIMISUB = 8,     // Kimi Code — online auth/execution through Chudcode.
-    PROV_ZENMUX = 9,      // ZenMux — online auth/execution through Chudcode. Default provider
-                          // (design decision 2026-07-23: free x-ai/grok-4.5-free tier works
-                          // without an xAI sign-in).
+    PROV_KIMISUB = 8,     // Legacy Kimi Code provider slot.
+    PROV_ZENMUX = 9,      // Legacy ZenMux provider slot; never a default.
     PROV_FREELLMAPI = 10, // Free AI (FreeLLMAPI, github.com/tashfeenahmed/freellmapi) — a
                           // self-hosted OpenAI-compatible router stacking ~28 providers' free
                           // tiers behind one endpoint + one unified key. Own native wire
@@ -187,26 +185,111 @@ inline const char* providerLabelForEndpoint(int provider, const char* base_url) 
     return providerLabel(provider);
 }
 
+// ---- legacy-generation model policy ------------------------------------------------------
+// ONE rule for what the user is offered: Claude older than 5.1 and every OpenAI model older
+// than GPT-6 (gpt-3.5/4*/4o/4.1/5/5.x, their codex variants, o1/o3/o4 reasoning models) are
+// never listed in a picker, on ANY provider route that exposes them (anthropic, openai,
+// openai-codex, openrouter `anthropic/...`, cursor, zenmux, bedrock, copilot, ...). Matching is
+// by id shape alone, so it is route-independent. This only governs what is OFFERED: a saved
+// selection that is now hidden stays the current selection and keeps its catalog metadata
+// (bridgeModelMeta still resolves it); it just is not a row in any list.
+// Every picker's list is built host-side from the catalog the worker returns (omp_models_list /
+// agent_list_models), so this is the only place the rule lives.
+//
+// Id shapes handled (case-insensitive, any provider prefix such as `anthropic/`, `cursor/`,
+// `us.anthropic.`): claude-opus-4-8, claude-sonnet-4-5-20250929, claude-3-5-sonnet-20241022,
+// claude-3.7-sonnet, claude-sonnet-5, claude-5-1-opus, claude-v2; gpt-6-sol, gpt-6.1-luna,
+// gpt-5.6-sol, gpt-4o, gpt-5-codex, chatgpt-4o-latest; o3, o4-mini, codex-mini-latest.
+// Ids with no parsable generation (gpt-oss-*, gpt-image-*, composer-*) are never hidden.
+inline std::vector<std::string> modelIdTokens(const std::string& id) {
+    std::vector<std::string> tokens;
+    std::string cur;
+    for (char ch : id) {
+        if (ch == '-' || ch == '_' || ch == '.' || ch == ':' || ch == '/' || ch == ' ') {
+            if (!cur.empty()) tokens.push_back(std::move(cur));
+            cur.clear();
+        } else {
+            cur.push_back((char)std::tolower((unsigned char)ch));
+        }
+    }
+    if (!cur.empty()) tokens.push_back(std::move(cur));
+    return tokens;
+}
+
+inline bool isLegacyGenerationModel(const std::string& id) {
+    const std::vector<std::string> t = modelIdTokens(id);
+    auto allDigits = [](const std::string& s, size_t maxLen) {
+        if (s.empty() || s.size() > maxLen) return false;
+        for (char ch : s)
+            if (!std::isdigit((unsigned char)ch)) return false;
+        return true;
+    };
+    // Leading integer of a token ("4o" -> 4, "6" -> 6); -1 when it does not start with a digit.
+    auto leadingInt = [](const std::string& s) {
+        if (s.empty() || !std::isdigit((unsigned char)s[0])) return -1;
+        int v = 0;
+        for (size_t i = 0; i < s.size() && std::isdigit((unsigned char)s[i]) && i < 4; ++i)
+            v = v * 10 + (s[i] - '0');
+        return v;
+    };
+    for (size_t i = 0; i < t.size(); ++i) {
+        // ---- Claude: <family>-<major>-<minor> or <major>-<minor>-<family> ----
+        if (t[i] == "claude") {
+            int major = -1;
+            size_t at = i + 1;
+            if (at < t.size() && t[at].size() > 1 && t[at][0] == 'v' &&
+                allDigits(t[at].substr(1), 2)) {
+                major = leadingInt(t[at].substr(1));      // claude-v2 / claude-v1.3
+            } else {
+                for (; at < t.size(); ++at) {
+                    if (t[at].size() == 8 && allDigits(t[at], 8)) break;  // date: no version
+                    if (allDigits(t[at], 2)) { major = leadingInt(t[at]); break; }
+                }
+            }
+            if (major < 0) continue;      // no parsable generation: never hide
+            int minor = 0;
+            if (at + 1 < t.size() && allDigits(t[at + 1], 2)) minor = leadingInt(t[at + 1]);
+            return major < 5 || (major == 5 && minor < 1);
+        }
+        // ---- OpenAI GPT: gpt-<major>[.<minor>][o]-... ; chatgpt-4o-latest ----
+        if (t[i] == "gpt" || t[i] == "chatgpt") {
+            if (i + 1 >= t.size()) continue;
+            const int major = leadingInt(t[i + 1]);
+            if (major < 0) continue;      // gpt-oss / gpt-image / gpt-realtime: not versioned
+            return major < 6;
+        }
+        if (t[i].size() > 3 && t[i].compare(0, 3, "gpt") == 0 &&
+            std::isdigit((unsigned char)t[i][3])) {
+            return leadingInt(t[i].substr(3)) < 6;      // "gpt4", "gpt4o"
+        }
+    }
+    // ---- OpenAI o-series / codex-mini: the BASE name (after any provider prefix) starts with
+    // o1 / o3 / o4 (o1-preview, o3-mini, o4-mini-high, openai/o3) or codex-mini. ----
+    if (!t.empty()) {
+        size_t base = 0;
+        const size_t slash = id.rfind('/');
+        if (slash != std::string::npos) base = modelIdTokens(id.substr(0, slash + 1)).size();
+        if (base < t.size()) {
+            const std::string& b = t[base];
+            if (b.size() >= 2 && b[0] == 'o' && allDigits(b.substr(1), 2)) return true;
+            if (b == "codex" && base + 1 < t.size() && t[base + 1] == "mini") return true;
+        }
+    }
+    return false;
+}
+
 // The built-in catalog of KNOWN cloud models. Local/llama.cpp models are discovered live
 // (a local endpoint can serve any GGUF), so they are NOT listed here — the probe fills them.
 inline const std::vector<ModelInfo>& builtinModels() {
     static const std::vector<ModelInfo> kModels = {
-        // ZenMux; default since 2026-07-23. Free x-ai/grok-4.5-free tier needs only a
-        // ZenMux sign-in through Chudcode, not an xAI credential.
-        {PROV_ZENMUX, "x-ai/grok-4.5-free", "Grok 4.5 (default, free via ZenMux)", true, true},
-        {PROV_ZENMUX, "moonshotai/kimi-k3", "Kimi K3 (via ZenMux)", true, true},
-        {PROV_ZENMUX, "moonshotai/kimi-k3-free", "Kimi K3 (free via ZenMux)", true, true},
         // Google API wire ids (the catalog overrides these offline fallback rows).
         {PROV_GEMINI, "gemini-3.1-pro-preview", "Gemini 3.1 Pro Preview", true, true},
         {PROV_GEMINI, "gemini-3.5-flash", "Gemini 3.5 Flash", true, true},
-        // Anthropic offline fallback; the live Chudcode catalog is authoritative online.
+        // Offline fallback metadata; OMP catalog is authoritative online. Claude < 5.1 and
+        // GPT < 6 are policy-hidden (isLegacyGenerationModel) and so never listed here.
         {PROV_ANTHROPIC, "claude-opus-5-5", "Claude Opus 5.5", true, true},
         {PROV_ANTHROPIC, "claude-sonnet-5-5", "Claude Sonnet 5.5", true, true},
-        {PROV_ANTHROPIC, "claude-opus-5", "Claude Opus 5", true, true},
-        {PROV_ANTHROPIC, "claude-sonnet-5", "Claude Sonnet 5", true, true},
-        {PROV_ANTHROPIC, "claude-fable-5", "Claude Fable 5", true, true},
-        {PROV_ANTHROPIC, "claude-mythos-5", "Claude Mythos 5", true, true},
-        {PROV_ANTHROPIC, "claude-haiku-4-5", "Claude Haiku 4.5", true, true},
+        {PROV_ANTHROPIC, "claude-haiku-5-5", "Claude Haiku 5.5", true, true},
         // OpenAI cloud (gpt-6-sol is current, 2026-09-22; older ≤ gpt-5.5 and o3 purged).
         {PROV_OPENAI, "gpt-6-sol", "GPT-6 Sol", true, true},
         {PROV_OPENAI, "gpt-6-luna", "GPT-6 Luna", true, true},

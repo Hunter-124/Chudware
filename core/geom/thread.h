@@ -1,23 +1,18 @@
-// Thread feature geometry (helical ISO-60° thread cut on a cylindrical face).
+// Thread feature geometry: a helical thread cut or raised ridge on a cylinder.
 //
-// A `thread` document feature (core/doc/document.cpp) threads a cylindrical face by
-// cutting a real helical V-groove out of the body: it builds a helix on the target
-// cylinder's axis at the pitch diameter, sweeps a SIMPLIFIED rounded ISO-60° thread
-// profile along it, and booleans the swept coil out of the solid. External threads
-// cut a groove into a shaft; internal threads cut into a bore wall.
+// The document compiler resolves the target face and thread size. This builder
+// sweeps a thread-form profile around the face's axis and subtracts it from or
+// fuses it to the body. External threads follow a shaft, internal threads a bore.
 //
-// WHY a separate translation unit: like curves.cpp (spine wires) and features.cpp
-// (primitives), this is a self-contained shape -> shape geometry builder with no
-// feature-tree knowledge. The document compiler resolves the target face (axis +
-// radius) and the size lookup, then hands this builder the raw numbers. Keeping it
-// here mirrors the Python split and keeps the helical-boolean fragility (which needs
-// careful turn caps + a graceful fallback) in one auditable place.
+// This self-contained shape -> shape builder receives the resolved axis and size
+// from the document compiler. A failed real cut or ridge is reported as an error;
+// it must never be mistaken for a successfully threaded, unchanged body.
 //
-// ROBUSTNESS CONTRACT (helical booleans are fragile in OCCT): on ANY failure — an
-// empty sweep, an empty cut, a thrown kernel exception, or a cut whose result fails
-// a BRepCheck validity test — cut_thread NEVER returns a corrupt body. It returns
-// the ORIGINAL body unchanged with fell_back=true and a human-readable warning, so a
-// thread that can't be cut degrades to a plain cylinder rather than breaking the part.
+// ROBUSTNESS CONTRACT: a successful result is a valid solid with changed volume.
+// Invalid input, incomplete runs, empty/invalid sweeps or booleans, and kernel
+// exceptions return ok=false with a diagnostic. The original body is retained in
+// shape for recovery only; it is not a successful substitute for real geometry.
+// Cosmetic threads are a separate, explicit document operation.
 #pragma once
 
 #include <string>
@@ -29,10 +24,10 @@
 namespace geom {
 
 struct ThreadResult {
-    TopoDS_Shape shape;       // the modified body (or the original on a fall-back)
-    bool ok = false;          // false only on a truly unusable input (e.g. null body)
-    bool fell_back = false;   // true: geometry failed, `shape` is the body UNTHREADED
-    std::string warning;      // non-empty on a fall-back (and some best-effort notes)
+    TopoDS_Shape shape;       // modified body on success; original body on failure
+    bool ok = false;          // true only when the requested real geometry succeeded
+    bool fell_back = false;   // true when real geometry failed and shape is unchanged
+    std::string warning;      // diagnostic on failure (or a best-effort note on success)
 };
 
 // Thread cross-section FORM. The cut/raised geometry is otherwise identical — only the
@@ -56,12 +51,11 @@ enum class ThreadForm {
 //               shaft thread (cut INWARD).
 //   raised      false (default) = CUT a V-groove (subtract material, the classic
 //               machined thread). true = ADD/EXTRUDE a raised helical ridge (fuse
-//               material — a cast/moulded/3D-printed external thread, a lead-screw
-//               or worm ridge). In raised mode the swept coil is FUSED onto the body
-//               and the validity check requires the volume to INCREASE, mirroring the
-//               cut path's fall-back contract in reverse.
-//   turns_cap   hard cap on the number of helical turns swept (robustness — a huge
-//               length/tiny pitch would otherwise sweep thousands of turns and hang).
+//               material — a cast/moulded/3D-printed external thread or lead screw).
+//               The selected cylinder is the root diameter; the ridge grows outward.
+//   turns_cap   cap on the complete run's helical turns, including end extensions
+//               (default 24). Runs exceeding it fail rather than silently truncate.
+//               An additional 128-section work limit bounds multi-start complexity.
 //
 // Never throws. See the ROBUSTNESS CONTRACT above.
 ThreadResult cut_thread(const TopoDS_Shape& body, const gp_Pnt& axis_loc,

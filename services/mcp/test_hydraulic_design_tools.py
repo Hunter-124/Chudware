@@ -337,7 +337,7 @@ def test_hydraulic_new_unknown_template_surfaces_refusal_without_persisting(stor
                "hint": "Valid templates: blank, power_unit, cylinder_circuit, motor_circuit."}
     store.replies["hydraulic_new"] = refusal
     res = _j(_tools()["hydraulic_new"](template="not_a_template", doc_id="doc-1"))
-    assert res == refusal
+    assert res == {**refusal, "code": "unknown_template", "error": "unknown_template"}
     assert ht._HYD["doc"] == prior and store.studies == []
     assert store.calls == [("hydraulic_new",
                             {"name": "Hydraulic Circuit", "template": "not_a_template"})]

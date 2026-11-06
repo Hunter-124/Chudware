@@ -4,6 +4,49 @@ from __future__ import annotations
 from typing import Any
 
 ENTRIES: dict[str, dict[str, Any]] = {
+    "scad_status": {"prompt_note": "Check the real renderer and isolation prerequisites; see cad_guide('scad')."},
+    "scad_inspect": {"prompt_note": "Inspect typed SCAD controls without rendering; lengths are canonical mm. See cad_guide('scad')."},
+    "scad_convert": {"prompt_note": "Atomic managed native/SCAD projection only; changed source and unsupported graphs refuse. See cad_guide('scad')."},
+    "part_library_ingest": {"prompt_note": "Register a rights-aware local manifest; source replacement requires explicit authorization. See cad_guide('parts')."},
+    "part_library_sync": {"prompt_note": "Explicit HTTPS manifest sync requires a pinned SHA-256. See cad_guide('parts')."},
+    "part_acquire": {"prompt_note": "Verify cached geometry or explicitly acquire it; offline=True forbids fetching. See cad_guide('parts')."},
+    "add_mesh_reference": {
+        "prompt_note": (
+            "Embed a PLY, STL or OBJ as a persistent non-solid reference in doc_id. "
+            "The transform maps source units to mm; mark uncertain geometry approximate."
+        ),
+    },
+    "list_mesh_references": {
+        "prompt_note": (
+            "List the document's embedded mesh references, including their IDs, placement "
+            "and bounds in mm, before updating, measuring or removing one."
+        ),
+    },
+    "update_mesh_reference": {
+        "prompt_note": (
+            "Use the reference id and doc_id to change its transform, visibility, "
+            "opacity, color or name; omitted fields remain unchanged."
+        ),
+    },
+    "remove_mesh_reference": {
+        "prompt_note": (
+            "Remove the reference identified by doc_id and id without changing solid features."
+        ),
+    },
+    "reveng_attach_reference": {
+        "prompt_note": (
+            "Embed a reconstruction from session_id in an existing doc_id as a non-solid "
+            "reference. Confirm scale first, or explicitly set approximate=True when the "
+            "reference is approximate; the reconstruction transform is applied once."
+        ),
+    },
+    "measure_mesh_reference": {
+        "prompt_note": (
+            "Measure sampled deviation in mm from an embedded mesh reference to the "
+            "part's B-rep using doc_id and reference id. n_samples controls sampling; "
+            "alignment defaults to world. Sampled deviation is not an exact comparison."
+        ),
+    },
     "inspect_native_files": {
         "prompt_note": (
             "Inventory .step+ metadata without import/open/compile/solve. Pass absolute "
@@ -29,22 +72,12 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "document name/component_names) and an absolute old-to-new path_map. Inspect "
             "first; never rename feature labels or rebuild/solve to organize files. "
             "Sources remain unchanged and destination overwrites are refused. Relative "
-            "references, including unmapped dependencies, are rebased. The unique result "
-            "JSON beside the plan records every native outcome; partial failure may mean "
-            "some copies exist. Read it before retrying, and never treat report failure "
-            "as proof that no native files were written."
-        ),
-    },
-    "analyze_stl_geometry": {
-        "prompt_note": (
-            "Alias of check_geometry_health. Takes doc_id, not a file path "
-            "— import_part the mesh first, then call this on the document."
-        ),
-    },
-    "assess_mesh_quality": {
-        "prompt_note": (
-            "Alias of check_geometry_health. We are a B-rep kernel, so this "
-            "reports SOLID topology health, not triangle quality."
+            "references, including unmapped dependencies, are rebased. Check the reply's "
+            "missing required direct-reference count and preview; later-batch mappings may "
+            "still be missing, and direct availability is not transitive closure. The unique "
+            "result JSON beside the plan records every native outcome; partial failure may "
+            "mean some copies exist. Read it before retrying; report failure does not prove "
+            "that no native files were written."
         ),
     },
     "check_geometry_health": {
@@ -75,6 +108,24 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "flags do not establish fastening, mechanical capture or a load path."
         ),
     },
+    "check_model_history": {
+        "prompt_note": (
+            "Read-only advisory history inspection, not geometry or solver certification. "
+            "Inspect findings, safe_fixes and blocked_fixes before cleanup. Repeated "
+            "dimensions or placements do not prove a relation, pattern or redundant "
+            "feature; preserve authored design intent."
+        ),
+    },
+    "simplify_part": {
+        "prompt_note": (
+            "Apply only still-eligible native history cleanup candidates; the engine "
+            "rechecks references, external consumers, geometry and revision atomically. "
+            "Blocked or inconclusive candidates must remain. Keep editable sketches, "
+            "relations and critical dimensions; do not replace the history with an "
+            "import or delete features merely to reduce its length. A successful "
+            "cleanup is one undo step."
+        ),
+    },
     "heal_body": {
         "prompt_note": (
             "The repair check_geometry_health refuses — use it ONLY on a body "
@@ -97,27 +148,6 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "material_change_pct and bad_edges_before/after, not just `fixed`. "
             "A defect your OWN features caused must be fixed at the feature; "
             "healing over it returns on the next parameter edit."
-        ),
-    },
-    "design_audit": {
-        "prompt_note": (
-            "Alias of check_geometry_health — solid soundness only. It does "
-            "NOT check DFM, tolerances or drawings; those are dfm_check, "
-            "stackup_analyze and review_drawing."
-        ),
-    },
-    "health_check": {
-        "prompt_note": (
-            "Alias of check_geometry_health for one body. For the "
-            "whole-part review battery call design_review; for sketch "
-            "state, sketch_health."
-        ),
-    },
-    "is_watertight": {
-        "prompt_note": (
-            "Alias of check_geometry_health (same tool, trimesh's name). "
-            "Returns the full report, not a bare bool — read `watertight` "
-            "plus free_edges/non_manifold_edges for why."
         ),
     },
     "activate_configuration": {
@@ -166,7 +196,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
         "prompt_note": (
             "Shop drawings should start make_drawing(model_items=False); place each "
             "ledger-driven dimension explicitly with tol_type/tol_upper/tol_lower at "
-            "creation. dtype='note' takes one anchor plus required text='...'."
+            "creation. view_id must name an existing view (make_drawing's view map or "
+            "add_drawing_view); read sizes from measure_part/describe_part. "
+            "dtype='note' takes one anchor plus required text='...'."
         ),
     },
     "add_drawing_view": {
@@ -178,15 +210,31 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "add_features": {
         "prompt_note": (
-            "Batch related ops in ONE call and read the reply's interpreted, per-feature "
-            "status and changes fields plus its overlap and attachment warnings "
-            "(floating/overhanging features) before anything else; a heavy op may return {job_id} — poll get_job. "
-            "Sketches: draw roughly, relations then functional driving dimensions, "
-            "sketch_fully_define, check_sketch (dof 0, not pinned_only). "
-            "Automatic definition (default on) runs after explicit intent; opt out with the "
-            "auto_define=false argument or auto_define:false on feature/params/authoring op. "
-            "Use origin/axis.h/axis.v refs, construction sketch_convert references, "
-            "true arcs/slots and symmetric centerlines; never blanket-fix profiles. "
+            "Batch related ops in ONE call. For existing features use minimal edit_feature "
+            "params/refs patches (cad_guide('edit_part')), preserving untouched values and "
+            "requerying topology after geometry changes. Read the completed reply's interpreted, "
+            "per-feature status, changes, overlap and attachment warnings. A status=running "
+            "reply with job_id is a handoff, not final body_count; wait_job and inspect its result. "
+            "For costly edits from Eval, use background=True and print job_id immediately; "
+            "wait_job must be a direct call outside Eval. Cancellation of Eval is not proof "
+            "the mutation stopped: recover its job or inspect the current revision before retrying. "
+            "Blind cuts start along the sketch normal; params.flip reverses it. Only a "
+            "simple blind cut without explicit direction/flip can retry the other side, "
+            "and only when the first removes no material. A cut into the wrong side "
+            "does not auto-correct. Display volume/deltas are approximate; missing "
+            "revision-correct baselines omit deltas. bore_faces_delta counts faces, not "
+            "holes; body_count is physical solids and logical_member_count compiled entries. "
+            "sketch_fillet radius is driving and clamps to the valid corner range "
+            "(op_reports requested_radius/applied_radius); clamped expressions retain the "
+            "original inside min/max bounds snapshotted from the corner, which later geometry "
+            "changes can invalidate. Conflicts reject atomically. Open rib/sweep "
+            "paths are intentional; a revolve may close to the axis. "
+            "Sketches: relations first (never `fix`), then only critical dimensions; "
+            "sketch_probe before a driving dimension; auto_define (default on, "
+            "auto_define=false opts out) fills the rest as auto constraints "
+            "(authored_dimensions vs auto_dimensions). Use origin/axis.h/axis.v refs, "
+            "construction sketch_convert references, true arcs/slots and symmetric "
+            "centerlines; check_sketch (dof 0, not pinned_only) before extruding. "
             "op rename relabels a FEATURE by id; no op renames the part — name it in "
             "new_part(name=…) and its file in save_part(path=…)."
         ),
@@ -200,9 +248,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "add_hole_callout": {
         "prompt_note": (
-            "Use instead of a projected tap-drill diameter: specify simple/tapped/"
-            "counterbore/countersink semantics, full thread, count and THRU/depth from "
-            "the ledger, then retain its annotation id for audit coverage."
+            "Use a=[x,y] in sheet mm at or near a projected circle or its centre; "
+            "model SIDs are not supported. Specify simple/tapped/counterbore/"
+            "countersink semantics, full thread where applicable, count and THRU/depth "
+            "from the ledger; retain view_id and annotation_id for audit coverage."
         ),
     },
     "add_ordinate_dimensions": {
@@ -258,7 +307,13 @@ ENTRIES: dict[str, dict[str, Any]] = {
     "asm_mate": {
         "prompt_note": (
             "Standard seat: concentric (shank↔bore) + coincident (head↔plate); each "
-            "query must resolve to ONE face/edge — narrow with pick/near/count."
+            "query must resolve to ONE source-part face/edge. For planar coincident, "
+            "align='aligned' requires opposite outward normals; parallel aligned requires "
+            "the same direction. Planar distance obeys normal · (point_b − point_a) = "
+            "sign × value, aligned=+1 and anti=-1; normal is the first planar reference's, "
+            "else the second's. Inspect returned directions, residual/tolerance, new mate "
+            "status and total/omitted counts. Unresolved source-frame candidates are "
+            "suggestions, never automatic remaps; see cad_guide('assembly')."
         ),
     },
     "assembly_plan_review": {
@@ -269,10 +324,11 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "audit_drawing": {
         "prompt_note": (
-            "Required release gate after current review_drawing: doc_id is the SOURCE "
-            "part/assembly and drawing_id its DRAWING doc. When a manufacturing plan "
-            "exists, pass the unchanged mfg_plan_get(view='audit_spec') result as spec. "
-            "Export needs verdict=release_ready with missing_critical empty."
+            "Release gate after current review_drawing: doc_id is the SOURCE part/assembly "
+            "and drawing_id its DRAWING doc. Pair view_id with annotation_id. Pass real "
+            "manufacturing requirements, or the unchanged mfg_plan_get(view='audit_spec') "
+            "result; an empty spec is refused. Release requires verdict=release_ready with "
+            "missing_critical empty. Draft export does not require a release audit."
         ),
     },
     "cad_graph": {
@@ -289,8 +345,15 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "cad_guide": {
         "prompt_note": (
-            "Call FIRST in any modeling session — 'overview' for the op cheatsheet, a "
-            "feature name ('hole', 'sweep') for its exact param shape."
+            "Omit topic for the compact topic index. Request the narrow feature topic "
+            "('hole', 'sweep', 'sketch'), 'edit_part' for existing native files, "
+            "'feature_history' for insertion/reorder/rollback, or the needed domain. "
+            "2D sketch operations such as 'sketch_fully_define' resolve to 'sketch'. "
+            "Hyphens and underscores are interchangeable. 'overview' and 'ops' contain "
+            "the full cheatsheet; 'add_features' is the complete mutation reference. "
+            "The reply is plain text; Eval's details.xdev.inner is already decoded. "
+            "A truncated text reply includes its complete-result path; the JSON file "
+            "decodes to the original string."
         ),
     },
     "cad_skill": {
@@ -299,20 +362,25 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "procedure, not the one-line summary in your role card. Call it BEFORE "
             "the first tool of that workflow (cad_skill(name=\"assembly-merge\") "
             "before import_part on foreign CAD, cad_skill(name=\"simulate\") before "
-            "an FEA release run). path=\"<file>\" reads a resource inside the pack."
+            "an FEA release run). path=\"<file>\" reads a resource inside the pack. "
+            "The reply is plain text; use Eval's already-decoded details.xdev.inner directly."
         ),
     },
     "check_feature_overlap": {
         "prompt_note": (
-            "add_features already runs this per batch (overlap_warnings) — call to "
-            "re-scan the whole tree or a features=[...] subset; bodies → check_interference."
+            "add_features runs a subset per batch; re-scan the tree or features=[...] here. "
+            "pairs are raw pre-boolean tool intersections, not measured material removal; "
+            "legacy boss_swallowed does not prove material loss. dead_features means no "
+            "surviving owned faces, not why. Read complete/unavailable_features/failed_pairs "
+            "and inspect actual geometry. Separate bodies → check_interference."
         ),
     },
     "check_interference": {
         "prompt_note": (
-            "Needs 2+ bodies — solve_mates first on an assembly so placements are real; "
-            "overlap INSIDE one part's features → check_feature_overlap. Read `clear` for "
-            "the verdict: ok=true only means the check completed, also when bodies clash."
+            "Solve mates first on an assembly so placements are real; intra-part tool "
+            "overlap → check_feature_overlap. Read clear for the verdict: ok=true only "
+            "means the check completed. Read clearance_status and clearance_tolerance_mm; "
+            "within_tolerance (±0.000001 mm) is not a definite pass or violation."
         ),
     },
     "check_metadata": {
@@ -337,8 +405,8 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "check_symmetry": {
         "prompt_note": (
-            "Confirms an intended mirror really is symmetric (deviation_mm3); spell the "
-            "plane as axis pair ('XY') or normal ('+z') — Z-up datums."
+            "Checks a body against a datum plane or custom origin/normal, optionally shifted "
+            "with offset; Boolean failure is an error, not an asymmetry verdict."
         ),
     },
     "close_part": {
@@ -357,7 +425,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
     "contact_sheet": {
         "prompt_note": (
             "Same planner 2x2 grid as render_part without a view; pass views=[...] only "
-            "when you need specific named angles."
+            "when you need specific named angles (a name that is not a view is an error "
+            "listing the valid ones). section=\"top\"|{plane,offset}|{origin,normal} cuts "
+            "every tile on that plane. Failed tiles are reported in the caption."
         ),
     },
     "design_review": {
@@ -381,8 +451,8 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "draft_analysis": {
         "prompt_note": (
-            "Mold-release check along pull_dir — the SIGN matters (-Z ≠ +Z); flagged "
-            "faces come back with centroid+area so you know where to add draft."
+            "Mesh-based absolute draft threshold on the last body only; it does not check "
+            "undercuts or prove moldability. Flagged faces include centroid and area."
         ),
     },
     "engine_profile": {
@@ -405,26 +475,36 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "edit_drawing_annotation": {
         "prompt_note": (
-            "Patch/delete by view_id + annotation_id from review_drawing; any mutation "
-            "invalidates the release sequence, so review_drawing then audit_drawing again."
+            "Patch/delete by view_id + annotation_id from review_drawing. To remove "
+            "displayed tolerance, pass the tol_type argument as 'none'; null patches "
+            "are refused atomically. Re-review after changes and re-audit before release."
         ),
     },
     "export_drawing": {
         "prompt_note": (
-            "Final drawing artifact only: make_drawing → current review_drawing → "
-            "audit_drawing(verdict=release_ready) → export. Release PDFs with editable "
-            "siblings in one call via fmt='pdf', companions=['dxf','svg']; use fmt='svg' "
-            "alone when only an editable illustration is needed. Use sheet='all' for the "
-            "controlled multi-sheet package; 3D exchange files use export_part."
+            "Review before export. A requested non-release draft may be exported without "
+            "audit; label it as a draft. For release, audit_drawing against actual "
+            "requirements must return release_ready with missing_critical empty; empty "
+            "specs refuse. PDF supports companions=['dxf','svg']; sheet='all' exports "
+            "the package. Relative paths use the selected project root; absolute paths "
+            "are accepted except credential/key destinations, including companions."
         ),
     },
     "export_part": {
         "prompt_note": (
-            "fmt='step' is standard machine-shop exchange; fmt='step+' saves the editable "
-            "native ZIP. Assembly exports resolve nested path-backed children or refuse "
-            "with the missing component/path; inspect components:[{name,solids,source}]. "
-            "validated:true means exact B-rep round-trip solid counts; mesh/native saves "
-            "do not claim that validation."
+            "To save a standalone native drawing use fmt='draw+', doc_id=<drawing_id>, "
+            "path='sheet.draw+'; save_part takes its open source part/assembly instead. "
+            "fmt='step' is machine-shop exchange; fmt='step+' is the editable native ZIP. "
+            "Assembly exports resolve nested children or refuse missing paths. STL "
+            "validation_stages reports facet checks and a skipped B-rep round-trip, "
+            "not an independent mesh reimport."
+        ),
+    },
+    "export_flat_dxf": {
+        "prompt_note": (
+            "Add sm_flat_pattern first, then export DXF/DWG with OUTLINE, BEND and CUTS "
+            "layers (PDF is unlayered). Model reliefs as editable through-cuts; legacy "
+            "display-only caches without flat metadata are refused."
         ),
     },
     "fit_cylinder_axis": {
@@ -453,38 +533,46 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "get_part": {
         "prompt_note": (
-            "summary=True on big/imported docs (elides BREP blobs); the full tree is "
-            "for round-trip param editing. Both forms: features at result['tree']['features']. "
-            "Feature ids here feed edits and config overrides."
+            "summary=True orients but elides values and refs. Use get_part(feature_ids=[...]) for "
+            "complete selected feature records; recover any truncated result before use. "
+            "Both forms put features at result['tree']['features']; ids feed edits. "
+            "An active tree.rollback_after remains visible: later features exist but are not built."
         ),
     },
     "import_part": {
         "prompt_note": (
             "into=doc_id adds an import feature there; omit for a NEW independent doc "
-            "(resume=False default), even if the source is open. resume=True explicitly "
-            "reuses that saved session. Use the returned doc_id and its feature ids. "
+            "(resume=False default), even if the source is open. resume=True reuses an "
+            "open document or binds the existing native file for editing, preserving history. "
+            "Use the returned doc_id and its feature ids. "
             ".sldprt prefers the SW tree; mesh → as_solid=True to sew a solid. "
             "Multi-body source: describe_part rosters the bodies, keep_bodies/"
-            "exclude_bodies (ordinals or names) drop the ones you don't want."
+            "exclude_bodies (ordinals or names) drop the ones you don't want. "
+            "On a format/units error confirm the path/extension and the document units first."
         ),
         "timeout_s": 600,
     },
     "inspect_feature": {
         "prompt_note": (
             "Planner close-ups (hero/alt/alt2, a section for internal features) + whole-part "
-            "context of one feature — only when render_part(target=...)'s grid is ambiguous."
+            "context of one feature — only when render_part(target=...)'s grid is ambiguous. "
+            "A panel that fails to render is listed in the caption; section numbers in it "
+            "are for the plane the panel shows."
         ),
     },
     "inspect_part": {
         "prompt_note": (
             "Single close-up = render_part(target=..., view=\"auto\") plus framing knobs "
-            "(zoom_factor, margin, cutaway); same target and view vocabulary."
+            "(zoom_factor, margin, cutaway); same target and view vocabulary. "
+            "section=\"top\"|{plane,offset}|{origin,normal} cuts on a plane YOU name "
+            "(datum planes pass through the world origin; give origin+normal through the "
+            "feature); it cannot be combined with cutaway."
         ),
     },
     "inspect_section": {
         "prompt_note": (
-            "The cut always passes through the ORIGIN on a reserved plane — returns "
-            "area/centroid/Ixx/Iyy; an offset cut belongs in a drawing (add_section_view)."
+            "Section properties cover the whole plane. A named datum can be shifted by "
+            "offset, or pass origin and normal for a custom plane; target_center is refused."
         ),
     },
     "interface_check": {
@@ -492,6 +580,36 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "Catches hole-pattern/coaxiality misalignment that passes check_interference "
             "— solve_mates first, run BOTH; fastener='M6' adds a pass-through check. Read "
             "`status` (pass|fail|skip) for the verdict: a misalignment keeps ok=true."
+        ),
+    },
+    "assembly_dof": {
+        "prompt_note": "Inspect remaining degrees of freedom and solve evidence; intended motion is not automatically a defect.",
+    },
+    "fastener_check": {
+        "prompt_note": (
+            "Inspects detected hardware and nearby bores. Distinguish measured candidate "
+            "geometry from evaluated requirements; inspect not_evaluated results. "
+            "Thread calculations require supplied requirements."
+        ),
+    },
+    "tool_access_check": {
+        "prompt_note": "Screens illustrative socket or hex-key envelopes. A modeled hit does not prove an actual tool is blocked; actual-tool access remains not_evaluated.",
+    },
+    "disassembly_check": {
+        "prompt_note": "Tests bounded straight-line directions and reports blockers and a greedy removal order. Untested paths and rotations are not proven impossible.",
+    },
+    "mate_fit_check": {
+        "prompt_note": (
+            "Checks concentric mates and reports measured fit character and nearest ISO candidate. "
+            "The candidate is not proof of the original designation or tolerance conformance; "
+            "acceptance against an ISO fit requires explicit nominal_mm and fit. Ambiguity is not_evaluated."
+        ),
+    },
+    "bom_consistency_check": {
+        "prompt_note": (
+            "Compare the assembly BOM with components, patterns, source metadata and detected "
+            "hardware coverage. Undetected fasteners and repeated source lines are not proof "
+            "of missing hardware or duplicate placements; inspect not_evaluated and source evidence."
         ),
     },
     "layout_plan": {
@@ -545,14 +663,16 @@ ENTRIES: dict[str, dict[str, Any]] = {
     "look_around": {
         "prompt_note": (
             "Tiled close-ups of ONE target (planner set, or ranked=False for an even orbit) — "
-            "only when render_part(target=...)'s grid leaves the shape ambiguous."
+            "only when render_part(target=...)'s grid leaves the shape ambiguous. "
+            "n_views is 1-8; more is an error, not a clamp."
         ),
     },
     "make_drawing": {
         "prompt_note": (
             "Build geometry first, then start shop drawings with model_items=False and "
-            "an explicit ledger-driven annotation plan. Returns drawing_doc_id + view "
-            "map; refine, review_drawing, audit_drawing, then export_drawing."
+            "a real annotation plan. Returns drawing_doc_id + view map. Set geometric "
+            "scale, not just title text; refine and review_drawing. Release requires "
+            "audit_drawing against real requirements, but draft export does not."
         ),
         "timeout_s": 300,
     },
@@ -602,14 +722,15 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "measure_between": {
         "prompt_note": (
-            "Each query must resolve to exactly ONE face/edge — narrow with pick/side "
-            "or run query_geometry first; omit b_query for intrinsic area/length/radius."
+            "Each side must resolve to exactly one element, including after pick/count/index. "
+            "Cylinders report diameter; two cylinder axes report pitch as axis_distance."
         ),
     },
     "measure_part": {
         "prompt_note": (
-            "Combined mass props over ALL bodies (per-body under mass.bodies[]); pass "
-            "density_g_cm3 for non-steel; also sanity-checks the solid is closed/valid."
+            "Applied materials supply density; missing or unresolved material appears in "
+            "warnings. density_g_cm3 is an override (steel 7.85, not 7850). body_id selects "
+            "one physical solid. Inertia is g·mm² about the centre of mass, world-aligned."
         ),
     },
     "mfg_plan_check": {
@@ -664,10 +785,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "query_geometry": {
         "prompt_note": (
-            "Plain-word phrases work for faces AND edges ('the vertical edges', 'the top "
-            "face') — confirm a pick resolves before referencing it in a feature; zero or "
-            ">1 match on a slot needing one → narrow with pick/near/count/index. Fully "
-            "open-ended explore → describe_part + hover instead."
+            "Plain-word phrases work for faces AND edges; confirm a pick resolves before "
+            "referencing it. {of:'face',sid:'...'} is accepted only when the live SID "
+            "matches that kind; contradictory kinds and extra predicates are refused. "
+            "Narrow ambiguous matches with pick/near/count/index."
         ),
     },
     "recover_parts": {
@@ -679,17 +800,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "pile leaves nothing able to resolve 'the part'."
         ),
     },
-    "redo": {
-        "prompt_note": (
-            "Usually denied for agents (undo_denied) — roll the doc back with "
-            "plm_timeline then plm_rollback instead; if it does run, render_part "
-            "to confirm the restored state."
-        ),
-    },
     "regen_diagnose": {
         "prompt_note": (
-            "For a FAILED rebuild — pass the failed doc JSON (+ last-good reference_json "
-            "for a drift check); record the verdict with regen_resolve. Needs a model provider."
+            "For a failed rebuild, pass doc_id or failed document_json; supply a known-good "
+            "reference_json to compare geometry. A rebuild alone is unverified."
         ),
         "timeout_s": 300,
     },
@@ -727,8 +841,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
         "prompt_note": (
             "Check numbers first; don't render after every mutation. One call = a 2x2 grid of "
             "the 4 most useful complementary shots (measured, SID-tagged, caption lists what "
-            "each tile shows and faces no tile sees); target= the feature id to frame it; "
-            "view= only for one specific single shot."
+            "each tile shows and faces no tile sees); target= the feature id to frame it "
+            "(emphasize= is the same thing — pass one, not both); view= only for one "
+            "specific single shot (\"auto\" = planner's best camera; an unknown name is an "
+            "error). section=\"top\"|{plane,offset}|{origin,normal} cuts on a plane you name."
         ),
     },
     "render_sketch": {
@@ -790,15 +906,17 @@ ENTRIES: dict[str, dict[str, Any]] = {
     "review_drawing": {
         "prompt_note": (
             "Inspect attached pixels plus sheet-mm JSON and clear layout/title/material "
-            "warnings after the last mutation. layout_clean is necessary, not release: "
-            "follow with audit_drawing against the ledger spec."
+            "warnings after the last mutation. layout_clean is not release certification; "
+            "for release follow with audit_drawing against real requirements. A requested "
+            "non-release draft may be exported without audit."
         ),
     },
     "save_part": {
         "prompt_note": (
-            "Native editable Chudware document only (.step+ ZIP); it is NOT ISO STEP and "
-            "a machine shop cannot treat it as .step. Save it for project history, and for "
-            "external manufacturing also call export_part(fmt='step', path='...step')."
+            "Native editable part/assembly only (.step+ ZIP); not ISO STEP. A drawing id "
+            "is refused: use export_part(fmt='draw+', doc_id=<drawing_id>, path=...) for "
+            "a standalone drawing, or save its open source part to embed drawings. For "
+            "external manufacturing also export_part(fmt='step', path='...step')."
         ),
     },
     "set_active_drawing_sheet": {
@@ -937,7 +1055,8 @@ ENTRIES: dict[str, dict[str, Any]] = {
     "solve_mates": {
         "prompt_note": (
             "Assembly docs only ('not an assembly' on a part); asm_mate already solves "
-            "by default — call after bulk edits, then list_world_bodies."
+            "by default — call after bulk edits, then list_world_bodies. Over- or "
+            "under-constrained mates: review the mate list and run interface_check."
         ),
     },
     "stackup_analyze": {
@@ -948,36 +1067,36 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "suggest_dimension_scheme": {
         "prompt_note": (
-            "Dimension plan for an existing sketch; size mating bores with fit_calc "
-            "FIRST (they come back needs_user_confirm). process drives the IT grade."
+            "Live authored sketch and process are required. Review proposed geometric "
+            "relation rows first, apply them and re-plan from solver health before adding "
+            "critical dimensions. Size mating bores with fit_calc."
         ),
     },
     "suggest_drawing_dimension_scheme": {
         "prompt_note": (
-            "Plan explicit shop-drawing coverage from doc_id + process; it proposes a "
-            "scheme but never supplies provenance or places annotations, so reconcile "
-            "every row with the ledger before add_dimension/add_hole_callout."
-        ),
-    },
-    "undo": {
-        "prompt_note": (
-            "Usually denied for agents (undo_denied) — roll the doc back with "
-            "plm_timeline then plm_rollback instead; if it does run, render_part "
-            "to confirm the rolled-back state."
+            "Plan explicit shop-drawing coverage from live authored doc_id + process; "
+            "unavailable geometry is refused, not replaced by a fixture. It proposes a "
+            "scheme but never places annotations. Rows marked placeable=false require a "
+            "view and resolved sheet attachment before invoking the suggested tool."
         ),
     },
     "verify_battery": {
         "prompt_note": (
             "Deterministic checks for THIS doc; the default set includes feature_attachment "
             "(floating / overhanging / edge-touching features, each with its close-up call) "
-            "and solid health. PASS covers only keys in scores; drawings, fits, loads, "
-            "tolerances and manufacturability need their own checks."
+            "and solid health. PASS covers only keys in scores; measurements are "
+            "informational. Drawings, fits, loads, tolerances and manufacturability need "
+            "their own checks."
         ),
     },
     "wall_thickness": {
         "prompt_note": (
-            "Headline is min_thickness_mm vs your process floor (~1 mm injection, "
-            "~0.8 mm FDM); null means an open/sheet body — confirm a solid with measure_part."
+            "While modelling printed parts, run this AND dfm_check. Inspect the default "
+            "RED process-minimum heat map; fix each red region at its named face/feature "
+            "or explicitly justify it before export/slicing. min_wall_mm defaults to the "
+            "bound process/FDM profile; resolution is optional mm spacing; image=False "
+            "returns JSON. Read the inscribed-sphere basis/spacing; null is unmeasured "
+            "(no opposing wall found), never evidence of safety."
         ),
     },
 }

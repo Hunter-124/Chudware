@@ -1,6 +1,7 @@
 #include "ecad/symlib.h"
 
 #include "ecad/kicad.h"
+#include "ecad/kicad_libs.h"
 
 #include <algorithm>
 #include <array>
@@ -166,12 +167,14 @@ json diode(const std::string& libid, const std::string& name,
         graphics.push_back(polyline({{0.4, 1.5}, {1.5, 2.6}, {1.1, 2.55}}));
         graphics.push_back(polyline({{-0.1, 1.8}, {1.0, 2.9}, {0.6, 2.85}}));
     }
-    return symbol(
+    json def = symbol(
         libid, name, description, {"diode", variant, "semiconductor"}, "D",
-        json::array({pin("K", "K", kGrid, 0.0, 0.0, "passive"),
-                     pin("A", "A", -kGrid, 0.0, 180.0, "passive")}),
+        json::array({pin("1", "K", kGrid, 0.0, 0.0, "passive"),
+                     pin("2", "A", -kGrid, 0.0, 180.0, "passive")}),
         std::move(graphics), footprint, false, 1,
-        json{{"model", "D"}, {"pin_order", json::array({"A", "K"})}}, {"D_*"});
+        json{{"model", "D"}, {"pin_order", json::array({"2", "1"})}}, {"D_*"});
+    def["fields"]["Sim.Pins"] = "1=K 2=A";
+    return def;
 }
 
 json transistor(const std::string& libid, const std::string& name,
@@ -316,18 +319,21 @@ void add_connector_family(std::map<std::string, json>& defs) {
     }
 }
 
-void add_spice_source(std::map<std::string, json>& defs, const std::string& libid,
-                      const std::string& name, const std::string& prefix) {
-    defs[libid] = symbol(
+void add_spice_source(std::map<std::string, json>& defs, const std::string& name,
+                      const std::string& device, const std::string& type,
+                      const std::string& params = {}) {
+    const std::string libid = "Simulation_SPICE:" + name;
+    json def = symbol(
         libid, name, "SPICE " + name + " independent source",
-        {"spice", "simulation", prefix == "V" ? "voltage" : "current", "source"}, prefix,
-        json::array({pin("1", "+", 0.0, kGrid, 90.0, "power_out"),
-                     pin("2", "-", 0.0, -kGrid, 270.0, "passive")}),
-        json::array({circle(0.0, 0.0, 1.5), text(0.0, 0.55, "+", 0.8),
-                     text(0.0, -0.55, "-", 0.8), line(0.0, kGrid, 0.0, 1.5),
-                     line(0.0, -1.5, 0.0, -kGrid)}),
-        "", false, 1,
-        json{{"model", prefix}, {"pin_order", json::array({"1", "2"})}});
+        {"spice", "simulation", device == "V" ? "voltage" : "current", "source"}, device,
+        json::array({pin("1", "", 0.0, kGrid, 90.0, "passive"),
+                     pin("2", "", 0.0, -kGrid, 270.0, "passive")}),
+        json::array({circle(0.0, 0.0, kGrid), text(0.0, 1.905, "+", 0.8)}),
+        "", false, 1, json{{"model", device}, {"pin_order", json::array({"1", "2"})}});
+    def["value"] = type == "DC" ? "1" : name;
+    def["fields"] = json{{"Sim.Device", device}, {"Sim.Type", type}, {"Sim.Pins", "1=+ 2=-"}};
+    if (!params.empty()) def["fields"]["Sim.Params"] = params;
+    defs[libid] = std::move(def);
 }
 
 std::map<std::string, json> make_catalog() {
@@ -410,6 +416,7 @@ std::map<std::string, json> make_catalog() {
     add_power(defs, "power:VCC", "VCC", "Positive logic supply", "positive", false);
     add_power(defs, "power:VDD", "VDD", "Positive device supply", "positive", false);
     add_power(defs, "power:VSS", "VSS", "Negative or ground device supply", "negative", false);
+    add_power(defs, "power:VEE", "VEE", "Negative device supply", "negative", false);
     add_power(defs, "power:+3V3", "+3V3", "+3.3 volt supply", "positive", false);
     add_power(defs, "power:+5V", "+5V", "+5 volt supply", "positive", false);
     add_power(defs, "power:+12V", "+12V", "+12 volt supply", "positive", false);
@@ -417,24 +424,59 @@ std::map<std::string, json> make_catalog() {
     add_power(defs, "power:VBUS", "VBUS", "USB bus power supply", "positive", false);
     add_power(defs, "power:PWR_FLAG", "PWR_FLAG", "Explicit ERC power source flag", "flag", true);
 
-    defs["Amplifier_Operational:LM358"] = dual_analog(
-        "Amplifier_Operational:LM358", "LM358", "LM358 dual operational amplifier (two opamp units plus power unit)", false);
-    defs["Amplifier_Operational:OPAMP_Dual_Generic"] = dual_analog(
-        "Amplifier_Operational:OPAMP_Dual_Generic", "OPAMP_Dual_Generic", "Generic dual opamp (two amplifier units plus power unit)", false);
+    {
+        json tri = polyline({{5.08, 0.0}, {-5.08, 5.08}, {-5.08, -5.08}, {5.08, 0.0}});
+        defs["Amplifier_Operational:LM358"] = symbol(
+            "Amplifier_Operational:LM358", "LM358", "LM358 dual operational amplifier",
+            {"opamp", "operational", "amplifier", "dual", "analog"}, "U",
+            json::array({pin("1", "", 5.08, 0.0, 0.0, "output", 1),
+                         pin("2", "-", -5.08, -2.54, 180.0, "input", 1),
+                         pin("3", "+", -5.08, 2.54, 180.0, "input", 1),
+                         pin("5", "+", -5.08, 2.54, 180.0, "input", 2),
+                         pin("6", "-", -5.08, -2.54, 180.0, "input", 2),
+                         pin("7", "", 5.08, 0.0, 0.0, "output", 2),
+                         pin("4", "V-", -2.54, -3.81, 270.0, "power_in", 3, "line", 3.81),
+                         pin("8", "V+", -2.54, 3.81, 90.0, "power_in", 3, "line", 3.81)}),
+            json::array({for_unit(tri, 1), for_unit(tri, 2)}),
+            "", false, 3, json(), {"SOIC-8*", "DIP-8*"});
+    }
     defs["Comparator:LM393"] = dual_analog(
         "Comparator:LM393", "LM393", "LM393 dual open-collector comparator (two comparator units plus power unit)", true);
-    defs["Timer:NE555"] = symbol(
-        "Timer:NE555", "NE555", "NE555 timer", {"timer", "555", "oscillator", "monostable"}, "U",
-        json::array({pin("1", "GND", 0.0, -kGrid, 270.0, "power_in"),
-                     pin("2", "TR", -kGrid, 1.27, 180.0, "input"),
-                     pin("3", "Q", kGrid, 1.27, 0.0, "output"),
-                     pin("4", "R", -kGrid, -1.27, 180.0, "input"),
-                     pin("5", "CV", kGrid, -1.27, 0.0, "input"),
-                     pin("6", "THR", -kGrid, 0.0, 180.0, "input"),
-                     pin("7", "DISCH", kGrid, 0.0, 0.0, "open_collector"),
-                     pin("8", "VCC", 0.0, kGrid, 90.0, "power_in")}),
-        json::array({rect(-kGrid, -kGrid, kGrid, kGrid), text(0.0, 0.0, "555", 1.0)}),
-        "Package_SO:SOIC-8", false, 1, json(), {"SOIC-8*", "DIP-8*"});
+    defs["Simulation_SPICE:OPAMP"] = symbol(
+        "Simulation_SPICE:OPAMP", "OPAMP", "Operational amplifier, single",
+        {"spice", "simulation", "opamp", "amplifier"}, "U",
+        json::array({pin("1", "+", -5.08, 2.54, 180.0, "input"),
+                     pin("2", "-", -5.08, -2.54, 180.0, "input"),
+                     pin("3", "V+", -2.54, 3.81, 90.0, "power_in", 1, "line", 3.81),
+                     pin("4", "V-", -2.54, -3.81, 270.0, "power_in", 1, "line", 3.81),
+                     pin("5", "", 5.08, 0.0, 0.0, "output")}),
+        json::array({polyline({{5.08, 0.0}, {-5.08, 5.08}, {-5.08, -5.08}, {5.08, 0.0}})}));
+    defs["Simulation_SPICE:OPAMP"]["fields"] =
+        json{{"Sim.Device", "SUBCKT"}, {"Sim.Library", "${KICAD9_SYMBOL_DIR}/Simulation_SPICE.sp"},
+             {"Sim.Name", "kicad_builtin_opamp"},
+             {"Sim.Pins", "1=in+ 2=in- 3=vcc 4=vee 5=out"}};
+    defs["Timer:NE555D"] = symbol(
+        "Timer:NE555D", "NE555D", "NE555 timer", {"timer", "555", "oscillator", "monostable"}, "U",
+        json::array({pin("1", "GND", 0.0, -7.62, 270.0, "power_in", 0),
+                     pin("2", "TRIG", -7.62, -5.08, 180.0, "input"),
+                     pin("3", "OUT", 7.62, 0.0, 0.0, "output"),
+                     pin("4", "~{RST}", -7.62, 5.08, 180.0, "input"),
+                     pin("5", "CONT", 0.0, 7.62, 90.0, "passive"),
+                     pin("6", "THRES", -7.62, -2.54, 180.0, "input"),
+                     pin("7", "DISCH", -7.62, 2.54, 180.0, "input"),
+                     pin("8", "VCC", 2.54, 7.62, 90.0, "power_in", 0)}),
+        json::array({rect(-7.62, -7.62, 7.62, 7.62)}),
+        "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm", false, 1,
+        json{{"model", "SUBCKT"}, {"subckt", "NE555"},
+             {"pin_order", json::array({"1", "2", "3", "4", "5", "6", "7", "8"})}},
+        {"SOIC-8*"});
+    defs["Timer:NE555P"] = defs["Timer:NE555D"];
+    defs["Timer:NE555P"]["libid"] = "Timer:NE555P";
+    defs["Timer:NE555P"]["name"] = "NE555P";
+    defs["Timer:NE555P"]["value"] = "NE555P";
+    defs["Timer:NE555P"]["description"] = "NE555 timer, PDIP-8";
+    defs["Timer:NE555P"]["default_footprint"] = "Package_DIP:DIP-8_W7.62mm";
+    defs["Timer:NE555P"]["footprint_filters"] = json::array({"DIP*W7.62mm*"});
     defs["Reference:LM4040"] = symbol(
         "Reference:LM4040", "LM4040", "Precision shunt voltage reference", {"reference", "shunt", "voltage", "precision"}, "U",
         json::array({pin("1", "K", kGrid, 0.0, 0.0, "passive"),
@@ -625,11 +667,11 @@ std::map<std::string, json> make_catalog() {
             {"mcu", "microcontroller", "module", "gpio", "20pin"}, "U", std::move(pins), std::move(graphics));
     }
 
-    add_spice_source(defs, "Simulation_SPICE:V_source", "V_source", "V");
-    add_spice_source(defs, "Simulation_SPICE:VDC", "VDC", "V");
-    add_spice_source(defs, "Simulation_SPICE:VAC", "VAC", "V");
-    add_spice_source(defs, "Simulation_SPICE:VPULSE", "VPULSE", "V");
-    add_spice_source(defs, "Simulation_SPICE:ISOURCE", "ISOURCE", "I");
+    add_spice_source(defs, "VDC", "V", "DC");
+    add_spice_source(defs, "VSIN", "V", "SIN", "dc=0 ampl=1 f=1k ac=1");
+    add_spice_source(defs, "VPULSE", "V", "PULSE",
+                     "y1=0 y2=1 td=2n tr=2n tf=2n tw=50n per=100n");
+    add_spice_source(defs, "IDC", "I", "DC");
 
     return defs;
 }
@@ -678,12 +720,6 @@ std::vector<std::string> keywords_of(const json& def) {
     return words;
 }
 
-std::map<std::string, json> merged_symbols() {
-    std::map<std::string, json> merged = builtins();
-    std::lock_guard<std::mutex> lock(registry_mutex());
-    for (const auto& entry : registry()) merged[entry.first] = entry.second;
-    return merged;
-}
 
 json catalog_entry(const std::string& libid, const json& def) {
     const std::string name = string_field(def, "name", libid.substr(libid.find(':') == std::string::npos
@@ -704,6 +740,25 @@ json catalog_entry(const std::string& libid, const json& def) {
                               ? def["power"].get<bool>() : false}};
 }
 
+std::map<std::string, json> merged_catalog() {
+    std::map<std::string, json> entries;
+    for (const auto& [id, def] : builtins()) entries[id] = catalog_entry(id, def);
+    for (const json& item : kicad_libs::symbol_catalog()) {
+        const std::string id = item.value("libid", std::string());
+        if (id.empty()) continue;
+        entries[id] = json{{"libid", id}, {"name", item.value("name", std::string())},
+                           {"description", item.value("description", std::string())},
+                           {"keywords", item.value("keywords", json::array())},
+                           {"prefix", item.value("prefix", std::string())},
+                           {"pin_count", item.value("pin_count", 0)},
+                           {"default_footprint", item.value("footprint", std::string())},
+                           {"power", item.value("power", false)}};
+    }
+    std::lock_guard<std::mutex> lock(registry_mutex());
+    for (const auto& [id, def] : registry()) entries[id] = catalog_entry(id, def);
+    return entries;
+}
+
 }  // namespace
 
 json resolve_symbol(const std::string& libid) {
@@ -712,24 +767,24 @@ json resolve_symbol(const std::string& libid) {
         auto it = registry().find(libid);
         if (it != registry().end()) return it->second;
     }
+    if (const auto node = kicad_libs::symbol_sexpr(libid)) {
+        const auto colon = libid.find(':');
+        return kicad::symbol_def(*node, libid.substr(0, colon));
+    }
     const auto& defs = builtins();
     auto it = defs.find(libid);
     return it == defs.end() ? json() : it->second;
 }
 
 std::vector<std::string> symbol_libids() {
-    std::set<std::string> ids;
-    for (const auto& entry : builtins()) ids.insert(entry.first);
-    {
-        std::lock_guard<std::mutex> lock(registry_mutex());
-        for (const auto& entry : registry()) ids.insert(entry.first);
-    }
-    return std::vector<std::string>(ids.begin(), ids.end());
+    std::vector<std::string> ids;
+    for (const auto& entry : merged_catalog()) ids.push_back(entry.first);
+    return ids;
 }
 
 json symbol_catalog() {
     json out = json::array();
-    for (const auto& entry : merged_symbols()) out.push_back(catalog_entry(entry.first, entry.second));
+    for (const auto& entry : merged_catalog()) out.push_back(entry.second);
     return out;
 }
 
@@ -741,8 +796,8 @@ json search_symbols(const std::string& query, int limit) {
     };
     const std::string needle = lowercase(query);
     std::vector<Hit> hits;
-    for (const auto& entry : merged_symbols()) {
-        const json summary = catalog_entry(entry.first, entry.second);
+    for (const auto& entry : merged_catalog()) {
+        const json& summary = entry.second;
         const std::string libid = lowercase(entry.first);
         const std::string name = lowercase(string_field(summary, "name"));
         const std::string description = lowercase(string_field(summary, "description"));

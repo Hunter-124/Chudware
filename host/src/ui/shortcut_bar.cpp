@@ -3,6 +3,8 @@
 
 #include "imgui.h"
 #include "icons.h"
+#include "ribbon_def.h"
+#include "widgets/ribbon.h"
 
 #include "../core/app_state.h"
 #include "../ui_theme.h"
@@ -32,8 +34,28 @@ static const SCmd kSketchCmds[] = {
     { "sketch_exit",    "ok_check",    "Exit Sketch"  },
 };
 
+static const SCmd kSketch3dCmds[] = {
+    { "sk3d_line",       "line",       "Line"          },
+    { "sk3d_arc",        "arc_3pt",    "3-Pt Arc"      },
+    { "sk3d_spline",     "spline",     "Spline"        },
+    { "sk3d_point",      "point_ent",  "Point"         },
+    { "sketch3d_exit",   "ok_check",   "Finish Sketch" },
+    { "sketch3d_cancel", "sketch",     "Cancel Sketch" },
+};
+
 static constexpr int kModelCount  = (int)(sizeof(kModelCmds)  / sizeof(kModelCmds[0]));
 static constexpr int kSketchCount = (int)(sizeof(kSketchCmds) / sizeof(kSketchCmds[0]));
+static constexpr int kSketch3dCount = (int)(sizeof(kSketch3dCmds) / sizeof(kSketch3dCmds[0]));
+
+static const SCmd* shortcutCommands(ShortcutContext context, int& count) {
+    switch (context) {
+    case ShortcutContext::Sketch2d: count = kSketchCount; return kSketchCmds;
+    case ShortcutContext::Sketch3d: count = kSketch3dCount; return kSketch3dCmds;
+    case ShortcutContext::Model:    count = kModelCount; return kModelCmds;
+    }
+    count = kModelCount;
+    return kModelCmds;
+}
 
 // ---- geometry (logical px at 1x) ----------------------------------------------
 // SINGLE source for the bar's metrics: update() previously placed/clamped the bar with a
@@ -50,17 +72,29 @@ static void shortcutBarSize(int nCmds, float& barW, float& barH) {
 }
 
 // ---- update ------------------------------------------------------------------
-void ShortcutBar::update(AppState& st, bool imgHovered, bool inSketch,
+void ShortcutBar::update(AppState& st, bool imgHovered, ShortcutContext context,
                          ImVec2 vr0, ImVec2 vr1) {
     ImGuiIO& io = ImGui::GetIO();
 
-    // Dismiss on Esc or when the viewport loses hover (click-outside handled in draw).
+    // Escape and click-outside dismiss the bar.
     if (m_visible) {
         if (ImGui::IsKeyPressed(ImGuiKey_Escape)) { dismiss(); return; }
     }
 
-    // Toggle on 'S' — only when viewport hovered and no text widget owns input.
-    if (imgHovered && !io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_S)) {
+    // The bar has its own child hit window above the viewport input surface.
+    // Treat that child as part of the viewport for the S toggle too.
+    bool barHovered = false;
+    if (m_visible && !imgHovered) {
+        int nCmds = 0;
+        shortcutCommands(context, nCmds);
+        float barW, barH;
+        shortcutBarSize(nCmds, barW, barH);
+        barHovered = io.MousePos.x >= m_pos.x && io.MousePos.x < m_pos.x + barW &&
+                     io.MousePos.y >= m_pos.y && io.MousePos.y < m_pos.y + barH &&
+                     ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
+    }
+    // Toggle on 'S' — only when the viewport or its bar is hovered and no text widget owns input.
+    if ((imgHovered || barHovered) && !io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_S)) {
         if (m_visible) {
             dismiss();
             return;
@@ -68,7 +102,8 @@ void ShortcutBar::update(AppState& st, bool imgHovered, bool inSketch,
         m_visible = true;
 
         const float s     = ui::uiScale;
-        const int   nCmds = inSketch ? kSketchCount : kModelCount;
+        int nCmds = 0;
+        shortcutCommands(context, nCmds);
         float barW, barH;
         shortcutBarSize(nCmds, barW, barH);
 
@@ -84,11 +119,11 @@ void ShortcutBar::update(AppState& st, bool imgHovered, bool inSketch,
 }
 
 // ---- draw --------------------------------------------------------------------
-void ShortcutBar::draw(AppState& st, bool inSketch) {
+void ShortcutBar::draw(AppState& st, ShortcutContext context) {
     if (!m_visible) return;
 
-    const SCmd* cmds  = inSketch ? kSketchCmds : kModelCmds;
-    const int   nCmds = inSketch ? kSketchCount : kModelCount;
+    int nCmds = 0;
+    const SCmd* cmds = shortcutCommands(context, nCmds);
     const float s     = ui::uiScale;
     const auto& pal   = ui::palette;
 
@@ -110,39 +145,59 @@ void ShortcutBar::draw(AppState& st, bool inSketch) {
     ui::glassPanel(dl, barRect, ui::GlassLevel::Regular, (kSBarBtn + kSBarPad * 2.0f) * 0.45f,
                    surf);
 
-    // Buttons (InvisibleButton over draw-list art, same pattern as HUD toolbar).
-    ImGui::PushID("##sbar");
-    for (int i = 0; i < nCmds; ++i) {
-        float bx = p0.x + pad + (float)i * (btnSz + pad);
-        float by = p0.y + pad;
-        ImGui::SetCursorScreenPos(ImVec2(bx, by));
-        ImGui::PushID(i);
-        bool clicked = ImGui::InvisibleButton("##sb", ImVec2(btnSz, btnSz));
-        bool hov     = ImGui::IsItemHovered();
-        if (hov) {
-            // Accent wash (not buttonHovered — near-invisible over the frosted pill).
-            dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + btnSz, by + btnSz),
-                              ui::Palette::toU32(pal.accentSoft), 4.0f * s);
-            ImGui::SetTooltip("%s", cmds[i].tip);
-        }
-        // SDF glyphs pair with the adaptive surface ink + contrast halo; multi-color raster
-        // icons keep their pre-colored pixels (white tint = identity, no halo).
-        const float iz = 22.0f * s;
-        const ImVec2 ic(bx + btnSz * 0.5f, by + btnSz * 0.5f);
-        if (ui::hasIconSdf(cmds[i].icon))
-            ui::drawIconGlass(dl, cmds[i].icon, ic, iz,
-                              ImGui::ColorConvertFloat4ToU32(surf.textPrimary),
-                              ui::glassIconHalo(surf));
-        else
-            ui::drawIconGlass(dl, cmds[i].icon, ic, iz,
-                              IM_COL32(255, 255, 255, 230), 0);  // gui-lint: allow identity tint at 90% — raster glyph keeps its own pixels
-        if (clicked) {
-            if (st.ribbonDispatch) st.ribbonDispatch(cmds[i].id);
-            dismiss();
+    // A foreground draw list changes paint order, not input order. The viewport's
+    // full-size InvisibleButton is submitted first and otherwise owns every press
+    // over this bar. A bounded child window lets the bar receive real clicks while
+    // leaving the rest of the viewport's navigation and picking surface unchanged.
+    const ImVec2 savedCursor = ImGui::GetCursorScreenPos();
+    ImGui::SetCursorScreenPos(p0);
+    if (ImGui::BeginChild("##shortcut_bar", ImVec2(barW, barH), ImGuiChildFlags_NavFlattened,
+                          ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar |
+                              ImGuiWindowFlags_NoScrollWithMouse)) {
+        ImGui::PushID("##sbar");
+        for (int i = 0; i < nCmds; ++i) {
+            float bx = p0.x + pad + (float)i * (btnSz + pad);
+            float by = p0.y + pad;
+            ImGui::SetCursorScreenPos(ImVec2(bx, by));
+            ImGui::PushID(i);
+            const CommandAvailability availability = ribbonCommandAvailability(cmds[i].id);
+            const bool enabled = availability.visible && availability.enabled;
+            bool clicked = ImGui::InvisibleButton("##sb", ImVec2(btnSz, btnSz), ImGuiButtonFlags_EnableNav);
+            bool hov = ImGui::IsItemHovered();
+            if (hov && enabled) {
+                // Accent wash (not buttonHovered — near-invisible over the frosted pill).
+                dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + btnSz, by + btnSz),
+                                  ui::Palette::toU32(pal.accentSoft), 4.0f * s);
+            }
+            if (hov || ImGui::IsItemFocused() || (clicked && !enabled)) {
+                if (enabled) ImGui::SetTooltip("%s", cmds[i].tip);
+                else ImGui::SetTooltip("%s\n%s", cmds[i].tip,
+                                       availability.reason ? availability.reason
+                                                           : "Command unavailable in this context");
+            }
+            // SDF glyphs pair with the adaptive surface ink + contrast halo; multi-color raster
+            // icons keep their pre-colored pixels (white tint = identity, no halo).
+            const float iz = 22.0f * s;
+            const ImVec2 ic(bx + btnSz * 0.5f, by + btnSz * 0.5f);
+            if (ui::hasIconSdf(cmds[i].icon))
+                ui::drawIconGlass(dl, cmds[i].icon, ic, iz,
+                                  enabled ? ImGui::ColorConvertFloat4ToU32(surf.textPrimary)
+                                          : ui::Palette::toU32(pal.textDisabled),
+                                  enabled ? ui::glassIconHalo(surf) : 0);
+            else
+                ui::drawIconGlass(dl, cmds[i].icon, ic, iz,
+                                  enabled ? ((IM_COL32_WHITE & ~IM_COL32_A_MASK) | (230u << IM_COL32_A_SHIFT))
+                                          : ui::Palette::toU32(pal.textDisabled), 0);
+            if (clicked && enabled) {
+                if (st.ribbonDispatch) st.ribbonDispatch(cmds[i].id);
+                dismiss();
+            }
+            ImGui::PopID();
         }
         ImGui::PopID();
     }
-    ImGui::PopID();
+    ImGui::EndChild();
+    ImGui::SetCursorScreenPos(savedCursor);
 
     // [workspace-tabs seam] Workspace-switch hint under the pill: the title-bar tabs are also
     // reachable via Ctrl+1..Ctrl+8 (key routing in app.cpp); surface that here since the shortcut

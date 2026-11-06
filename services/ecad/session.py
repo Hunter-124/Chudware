@@ -11,6 +11,8 @@ from services.mcp.ecad_common import EcadSession, OpError, ecad_session as _faca
 
 new_session = _facade.new_session
 get_session = _facade.get_session
+open_path = _facade.open_path
+save = _facade.save
 iter_sessions = _facade.iter_sessions
 apply_ops = _facade.apply_ops
 rebuild = _facade.rebuild
@@ -24,6 +26,6 @@ close_session = _facade.close_session
 _REGISTRY = _facade._REGISTRY
 
 __all__ = [
-    "EcadSession", "OpError", "new_session", "get_session", "iter_sessions",
-    "apply_ops", "rebuild", "tree", "swap_doc", "close_session", "_REGISTRY",
+    "EcadSession", "OpError", "new_session", "get_session", "open_path", "save",
+    "iter_sessions", "apply_ops", "rebuild", "tree", "swap_doc", "close_session", "_REGISTRY",
 ]

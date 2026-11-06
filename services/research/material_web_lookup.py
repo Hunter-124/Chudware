@@ -12,7 +12,7 @@ Posture (be factual): this tool was added as a deliberate project decision on
 * A **point-lookup** — a single named material at a time, never bulk/enumeration.
 
 It **never bypasses CAPTCHAs or bot-walls**: if ``browser_fetch`` returns ``ok:False``
-(including ``captcha_or_2fa_detected`` / ``bot_walled``) this module returns an honest
+(including ``captcha`` / ``blocked``) this module returns an honest
 degradation and does not retry-hammer. Known bot-walled sources (MatWeb) are refused
 without any fetch.
 
@@ -267,7 +267,7 @@ def material_web_lookup(material: str, property: Optional[str] = None,
     detail_url = src["material_url"](slug)
     dres = bsession.browser_fetch(detail_url, site)
     if not dres.get("ok"):
-        return fail(dres.get("reason", "browser_fetch_failed"),
+        return fail(dres.get("reason", "transport_failed"),
                     f"{src['label']} page unavailable ({dres.get('reason')}); not retrying.")
 
     # 4. Parse.

@@ -114,6 +114,21 @@ def test_battery_rejects_inconsistent_full_or_skipped_later_result(monkeypatch, 
     assert result["skipped"] == []
 
 
+@pytest.mark.parametrize("usage,expected", [
+    ("open_path", 1.0), ("unknown", 1.0),
+    ("closed_profile", 0.0), ("mixed", 0.0), ("", 0.0),
+])
+def test_open_sketch_endpoints_follow_consumer_usage(monkeypatch, usage, expected):
+    closure = {"closed_chains_ok": False, "open_endpoints": ["e1.end"]}
+    if usage:
+        closure["usage"] = usage
+    _install(monkeypatch, {"f1": _full("f1"), "f13": _full("f13", closure=closure)})
+    result = battery.verify("d1", ["check_sketch"])
+    assert result["scores"]["check_sketch"] == expected
+    assert result["check_results"]["check_sketch"]["fully_defined"] is (expected == 1.0)
+
+
+
 def test_battery_roster_failure_is_not_a_no_sketches_skip(monkeypatch):
     from services.mcp import core_bridge
 

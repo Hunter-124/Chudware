@@ -714,7 +714,7 @@ def make_markdown(data: dict) -> str:
             lines.append(f"- `{d['req_line'].split('#')[0].strip()}`")
         lines.append("Provision the complete reviewed offline runtime with "
                      "`CHUDWARE_WHEELHOUSE=/reviewed/wheelhouse scripts/provision_venv.sh`; "
-                     "never install chudcode-rpc from an index or editable checkout.")
+                     "never install omp-rpc from an index or editable checkout.")
         lines.append("")
 
     # Test pollution section (filled in separately — see audit script output)
@@ -902,7 +902,7 @@ def run_test_pollution(out_md_path: Path | None) -> str:
     lines.append("   raise on duplicate names or overwrite with a broken state from a sibling suite's")
     lines.append("   conftest patches.")
     lines.append("")
-    lines.append("2. **Singleton state leakage** — `_CUR`, `_DOC_ALIASES`, `_LAST_VOLUME` in `cad_tools.py`")
+    lines.append("2. **Singleton state leakage** — `_CUR` and `_DOC_ALIASES` in `cad_common.py`")
     lines.append("   and `_PIPING` in `piping_tools.py` are module-level globals; a test that creates a")
     lines.append("   part leaves a live `doc_id` that breaks a later test expecting empty state.")
     lines.append("")

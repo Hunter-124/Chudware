@@ -3,7 +3,7 @@
 // time, into N closed line segments. This proves the named shorthands added beyond "hexagon" produce
 // the right side count, honour an explicit "sides" override, accept the across_flats / circumradius /
 // inradius size conventions, and reject n<3 — i.e. the agent/MCP-facing vocabulary now offers more
-// than just hexagons, while staying plain lines downstream (no solver/region awareness needed).
+// than just hexagons; larger polygons also carry a construction circumcircle.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
@@ -39,16 +39,23 @@ json expand_polygon_entity(const json& entity) {
     return json::array();
 }
 
-// Every entity is a line and the loop closes (last.p2 == first.p1). Returns the line count.
+// The profile lines form a closed loop; the construction circle is not a side.
 int closed_loop_sides(const json& ents) {
     REQUIRE(ents.is_array());
-    for (const json& e : ents) CHECK(e.value("type", std::string()) == "line");
-    if (ents.empty()) return 0;
-    const json& p1 = ents.front().at("p1");
-    const json& pN = ents.back().at("p2");
+    json lines = json::array();
+    for (const json& e : ents) {
+        if (e.value("type", std::string()) == "line") lines.push_back(e);
+        else {
+            CHECK(e.value("type", std::string()) == "circle");
+            CHECK(e.value("construction", false));
+        }
+    }
+    if (lines.empty()) return 0;
+    const json& p1 = lines.front().at("p1");
+    const json& pN = lines.back().at("p2");
     CHECK(std::fabs(p1[0].get<double>() - pN[0].get<double>()) < 1e-9);
     CHECK(std::fabs(p1[1].get<double>() - pN[1].get<double>()) < 1e-9);
-    return static_cast<int>(ents.size());
+    return static_cast<int>(lines.size());
 }
 
 }  // namespace

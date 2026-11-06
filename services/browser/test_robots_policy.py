@@ -39,3 +39,19 @@ def test_robots_public_response_budget(monkeypatch, size, expected):
             pass
     monkeypatch.setattr(safe_http, "_PinnedConnection", Connection)
     assert ratelimit._fetch_robots_crawl_delay("public.fixture") == expected
+
+
+def test_robots_crawl_delay_is_cached_per_origin(monkeypatch):
+    metadata = {}
+    reads = []
+    monkeypatch.setattr(ratelimit.profiles, "load_meta", lambda _site: dict(metadata))
+    monkeypatch.setattr(ratelimit.profiles, "save_meta", lambda _site, **values: metadata.update(values))
+    monkeypatch.setattr(ratelimit, "_fetch_robots_crawl_delay",
+                        lambda origin: reads.append(origin) or float(len(reads)))
+    assert ratelimit.crawl_delay("vendor", "https://a.example/p") == 1
+    assert ratelimit.crawl_delay("vendor", "https://a.example:443/other") == 1
+    assert ratelimit.crawl_delay("vendor", "https://b.example/p") == 2
+    assert ratelimit.crawl_delay("vendor", "http://a.example/p") == 3
+    assert ratelimit.crawl_delay("vendor", "https://a.example:8443/p") == 4
+    assert reads == ["https://a.example", "https://b.example",
+                     "http://a.example", "https://a.example:8443"]

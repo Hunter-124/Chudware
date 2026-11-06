@@ -110,6 +110,8 @@
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepBuilderAPI_Sewing.hxx>
 #include <BRepLib.hxx>
+#include <BRepBndLib.hxx>
+#include <BRepClass3d_SolidClassifier.hxx>
 #include <BRepCheck_Analyzer.hxx>
 #include <BRepGProp.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
@@ -2030,6 +2032,7 @@ std::string detect_format(const std::string& path) {
         {".ply", "ply"},   {".gltf", "gltf"},{".glb", "glb"},  {".3dm", "3dm"},
         {".sldprt", "sldprt"}, {".sldasm", "sldasm"}, {".x_t", "x_t"}, {".x_b", "x_b"},
         {".dxf", "dxf"}, {".dwg", "dwg"}, {".sat", "sat"}, {".sab", "sat"},
+        {".scad", "scad"},
     };
     for (const auto& [e, f] : kMap)
         if (ext == e) return f;
@@ -2076,6 +2079,7 @@ const std::vector<FormatInfo>& format_registry() {
         {"step",   "STEP",                {".step", ".stp"}, "brep",        true,  true},
         {"iges",   "IGES",                {".iges", ".igs"}, "brep",        true,  true},
         {"brep",   "BREP (OpenCASCADE)",  {".brep"},         "brep",        true,  true},
+        {"scad",   "OpenSCAD source",     {".scad"},         "source",      true,  true},
         {"stl",    "STL",                 {".stl"},          "mesh",        true,  true},
         {"3mf",    "3MF",                 {".3mf"},          "mesh",        true,  true},
         {"obj",    "Wavefront OBJ",       {".obj"},          "mesh",        true,  true},
@@ -2397,9 +2401,15 @@ std::array<double, 3> stl_position(const gp_Pnt& p, bool ascii) {
 // serialized edge must appear twice, once in each direction. `facets[i - 1]` are
 // the serialized facets of `faces(i)`, exactly what stl_triangulation writes.
 void validate_stl_solid(const TopoDS_Shape& solid, const TopTools_IndexedMapOfShape& faces,
-                        const std::vector<std::vector<Poly_Triangle>>& facets, bool ascii) {
+                        const std::vector<std::vector<Poly_Triangle>>& facets, bool ascii,
+                        int solid_index) {
     std::map<std::array<double, 3>, std::uint32_t> positions;
-    struct Incidence { int count = 0, balance = 0; };
+    std::vector<std::array<double, 3>> coordinates;
+    struct FacetUse { int face, facet, direction; };
+    struct Incidence {
+        int count = 0, balance = 0;
+        std::array<FacetUse, 3> facets{};
+    };
     std::unordered_map<std::uint64_t, Incidence> edges;
     for (TopExp_Explorer ex(solid, TopAbs_FACE); ex.More(); ex.Next()) {
         const TopoDS_Face face = TopoDS::Face(ex.Current());
@@ -2409,9 +2419,13 @@ void validate_stl_solid(const TopoDS_Shape& solid, const TopTools_IndexedMapOfSh
         for (int i = 1; i <= tri->NbNodes(); ++i) {
             const auto key = stl_position(tri->Node(i).Transformed(loc.Transformation()), ascii);
             const auto inserted = positions.emplace(key, static_cast<std::uint32_t>(positions.size()));
+            if (inserted.second) coordinates.push_back(key);
             ids[i] = inserted.first->second;
         }
-        for (const auto& facet : facets[static_cast<std::size_t>(faces.FindIndex(face)) - 1]) {
+        const int face_index = faces.FindIndex(face);
+        int facet_index = 0;
+        for (const auto& facet : facets[static_cast<std::size_t>(face_index) - 1]) {
+            ++facet_index;
             int n[3];
             facet.Get(n[0], n[1], n[2]);
             if (face.Orientation() == TopAbs_REVERSED) std::swap(n[1], n[2]);
@@ -2419,17 +2433,36 @@ void validate_stl_solid(const TopoDS_Shape& solid, const TopTools_IndexedMapOfSh
                 const auto a = ids[n[k]], b = ids[n[(k + 1) % 3]];
                 const auto key = (static_cast<std::uint64_t>(std::min(a, b)) << 32) | std::max(a, b);
                 auto& use = edges[key];
+                if (use.count < static_cast<int>(use.facets.size()))
+                    use.facets[use.count] = {face_index, facet_index, a < b ? 1 : -1};
                 ++use.count;
                 use.balance += a < b ? 1 : -1;
             }
         }
     }
     if (edges.empty())
-        throw OpError("export_failed", "STL source solid has no facets");
-    for (const auto& edge : edges)
-        if (edge.second.count != 2 || edge.second.balance != 0)
+        throw OpError("export_failed", "STL source solid " + std::to_string(solid_index) +
+                      " has no facets", {{"source_solid_index", solid_index}});
+    for (const auto& edge : edges) {
+        if (edge.second.count != 2 || edge.second.balance != 0) {
+            const auto& a = coordinates[static_cast<std::uint32_t>(edge.first >> 32)];
+            const auto& b = coordinates[static_cast<std::uint32_t>(edge.first)];
+            nlohmann::json facet_context = nlohmann::json::array();
+            for (int i = 0; i < std::min(edge.second.count, 3); ++i) {
+                const auto& f = edge.second.facets[i];
+                facet_context.push_back({{"face_index", f.face}, {"facet_index", f.facet},
+                                         {"direction", f.direction}});
+            }
+            nlohmann::json detail = {{"source_solid_index", solid_index},
+                                     {"edge_start", a}, {"edge_end", b},
+                                     {"incidence_count", edge.second.count},
+                                     {"orientation_balance", edge.second.balance},
+                                     {"facets", std::move(facet_context)}};
             throw OpError("export_failed",
-                          "STL tessellation is not a closed consistently oriented source solid");
+                          "STL tessellation is not a closed consistently oriented source solid: " +
+                          detail.dump(), detail);
+        }
+    }
 }
 
 Handle(Poly_Triangulation) stl_triangulation(const TopoDS_Shape& shape, bool ascii) {
@@ -2475,8 +2508,9 @@ Handle(Poly_Triangulation) stl_triangulation(const TopoDS_Shape& shape, bool asc
         }
         offset += tri->NbNodes();
     }
+    int solid_index = 0;
     for (TopExp_Explorer ex(shape, TopAbs_SOLID); ex.More(); ex.Next())
-        validate_stl_solid(ex.Current(), faces, facets, ascii);
+        validate_stl_solid(ex.Current(), faces, facets, ascii, ++solid_index);
     return mesh;
 }
 
@@ -3266,27 +3300,77 @@ TopoDS_Shape mesh_to_shape(const MeshData& mesh) {
     sew.Perform();
     TopoDS_Shape sewn = sew.SewedShape();
     if (sewn.IsNull()) return TopoDS_Shape();
-    // Promote a closed shell to a solid (volume becomes meaningful).
-    TopoDS_Shape result = sewn;
+    // Sewing can return several disconnected shells (and free faces). Promote
+    // every closed shell, retaining all other topology rather than returning
+    // the first solid. Nested closed shells represent cavities; attach each to
+    // its nearest enclosing material shell, with alternating nesting depth.
+    struct ClosedShell {
+        TopoDS_Shell shell;
+        TopoDS_Shape solid;
+        Bnd_Box bounds;
+        gp_Pnt sample;
+        double volume;
+        int parent = -1;
+        int depth = 0;
+    };
+    std::vector<ClosedShell> closed;
+    BRepTools_ReShape remaining;
     for (TopExp_Explorer ex(sewn, TopAbs_SHELL); ex.More(); ex.Next()) {
-        TopoDS_Shell shell = TopoDS::Shell(ex.Current());
-        if (!BRep_Tool::IsClosed(shell)) continue;
-        const TopoDS_Shape solid = solid_from_closed_shell(shell);
-        if (solid.IsNull()) break;  // keep the sewn shell
-        result = solid;
-        // A triangle soup carries NO guarantee that its winding is outward, and neither
-        // sewing nor ShapeFix_Solid re-orients one: a SolidWorks saved-display import came
-        // through INSIDE-OUT (signed volume -374963 mm³ on a 375017 mm³ spacer, so
-        // eval_mass was ~28% wrong and the shading lit the far side). A closed solid must
-        // enclose POSITIVE volume, so when it does not, rebuild from the reversed shell —
-        // every face is then explored complemented, which flips winding and shading normals
-        // together (core/geom/tessellate.cpp).
-        if (shape_signed_volume(result) >= 0.0) break;
-        const TopoDS_Shape flipped =
-            solid_from_closed_shell(TopoDS::Shell(shell.Reversed()));
-        if (!flipped.IsNull() && shape_signed_volume(flipped) > 0.0) result = flipped;
-        break;  // single closed shell is the common case
+        const TopoDS_Shell shell = TopoDS::Shell(ex.Current());
+        if (remaining.IsRecorded(shell) || !BRep_Tool::IsClosed(shell)) continue;
+        TopoDS_Shape solid = solid_from_closed_shell(shell);
+        if (solid.IsNull()) continue;
+        if (shape_signed_volume(solid) < 0.0) {
+            const TopoDS_Shape flipped = solid_from_closed_shell(TopoDS::Shell(shell.Reversed()));
+            if (!flipped.IsNull() && shape_signed_volume(flipped) > 0.0) solid = flipped;
+        }
+        const double volume = shape_signed_volume(solid);
+        TopExp_Explorer vertex(solid, TopAbs_VERTEX);
+        TopExp_Explorer oriented_shell(solid, TopAbs_SHELL);
+        if (!(volume > 0.0) || !vertex.More() || !oriented_shell.More()) continue;
+        ClosedShell entry{TopoDS::Shell(oriented_shell.Current()), solid, Bnd_Box(),
+                          BRep_Tool::Pnt(TopoDS::Vertex(vertex.Current())), volume};
+        BRepBndLib::Add(solid, entry.bounds, Standard_False);
+        closed.push_back(std::move(entry));
+        remaining.Remove(shell);
     }
+    for (std::size_t i = 0; i < closed.size(); ++i) {
+        double parent_volume = std::numeric_limits<double>::infinity();
+        for (std::size_t j = 0; j < closed.size(); ++j) {
+            if (i == j || closed[j].volume <= closed[i].volume ||
+                closed[j].volume >= parent_volume || closed[j].bounds.IsOut(closed[i].sample))
+                continue;
+            BRepClass3d_SolidClassifier classifier(closed[j].solid, closed[i].sample,
+                                                   Precision::Confusion());
+            if (classifier.State() == TopAbs_IN) {
+                closed[i].parent = static_cast<int>(j);
+                parent_volume = closed[j].volume;
+            }
+        }
+    }
+    for (std::size_t i = 0; i < closed.size(); ++i)
+        for (int p = closed[i].parent; p >= 0; p = closed[static_cast<std::size_t>(p)].parent)
+            ++closed[i].depth;
+    std::vector<TopoDS_Shape> promoted;
+    promoted.reserve(closed.size() + 1);
+    for (std::size_t i = 0; i < closed.size(); ++i) {
+        if (closed[i].depth % 2 != 0) continue;
+        BRep_Builder builder;
+        TopoDS_Solid solid;
+        builder.MakeSolid(solid);
+        builder.Add(solid, closed[i].shell);
+        for (std::size_t j = 0; j < closed.size(); ++j)
+            if (closed[j].parent == static_cast<int>(i) && closed[j].depth % 2 != 0)
+                builder.Add(solid, closed[j].shell.Reversed());
+        if (!BRepCheck_Analyzer(solid).IsValid())
+            throw OpError("import_failed", "Mesh closed shells could not form valid solids");
+        promoted.push_back(solid);
+    }
+    if (!closed.empty()) {
+        TopoDS_Shape remainder = remaining.Apply(sewn);
+        if (!remainder.IsNull()) promoted.push_back(remainder);
+    }
+    TopoDS_Shape result = closed.empty() ? sewn : as_compound(promoted);
     // Smooth shading for every mesh import (SolidWorks saved-display, STL, OBJ, PLY, 3MF,
     // 3DM): one planar face per triangle otherwise renders as discrete facets. A 40 deg
     // crease keeps genuinely flat geometry flat, so a boxy STL is unchanged.
@@ -4047,7 +4131,8 @@ std::string b64_decode(const std::string& in) {
     }
     std::string out;
     out.reserve(in.size() / 4 * 3);
-    int val = 0, bits = -8;
+    uint32_t val = 0;
+    int bits = -8;
     for (unsigned char c : in) {
         if (c == '=' || rev[c] < 0) {
             if (c == '=') break;

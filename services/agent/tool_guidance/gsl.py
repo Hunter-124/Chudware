@@ -6,16 +6,21 @@ from typing import Any
 ENTRIES: dict[str, dict[str, Any]] = {
     "describe_part": {
         "prompt_note": (
-            "Make this the first read on any part — the returned sids (faces AND edges) "
-            "are the stable addresses every later hover() / query_geometry / edit call "
-            "uses. Call it before naming geometry you have not confirmed exists."
+            "Make this the first read on any part. Face and edge sids are revision-scoped "
+            "fingerprints, not permanent unique identities; refresh after edits and resolve "
+            "ambiguity before using one."
         ),
     },
     "query_adjacency": {
         "prompt_note": (
-            "Reach for it to reason about a shared edge — convex "
-            "outside-corner vs concave pocket edge — which the flat per-face "
-            "read-back never carries."
+            "Paged graph for shared edges: face sid and edge between_sids identify neighbors; "
+            "convex/concave classifies each shared edge. Applies to the last body."
+        ),
+    },
+    "doc_face_edges": {
+        "prompt_note": (
+            "Given a part body_id and face topo_id from query_geometry, page the body-local "
+            "edge topology IDs bordering that face."
         ),
     },
     "hover": {
@@ -37,6 +42,13 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "Apply relations then driving dimensions; sketch_fully_define handles residual "
             "freedom. Require dof 0 and not pinned_only, not merely status='full'. "
             "Read findings for pins, missing driving dimensions and origin/model references."
+        ),
+    },
+    "sketch_probe": {
+        "prompt_note": (
+            "Dry-run ONE add_constraint | set_dim | delete_constraint on a sketch (never "
+            "mutates it): read would_over_define, dof_delta, conflicts_with before adding a "
+            "driving dimension."
         ),
     },
     "sketch_auto_constrain": {

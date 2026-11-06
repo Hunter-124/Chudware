@@ -2,6 +2,7 @@
 // header and the grouped New Study picker (Simulation UI standard §2, §6).
 #include "sim_manager_internal.h"
 
+#include "../../app_commands.h"
 #include "../../core/sim_client.h"
 #include "../../renderer.h"
 #include "../layout.h" // ui::overlayColumnEdge — the study picker flies out beside the column
@@ -104,15 +105,11 @@ void SimManager::openNewStudyPicker() {
 
 void SimManager::drawTreeBody(AppState &st) {
   appSt_ = &st;
-  // Keep the mirror in step with the active document (cheap: re-pull only on a
-  // doc/revision change). A failed pull for this exact doc/revision is not re-issued every frame
-  // (each attempt is a blocking worker round-trip); the list below shows it with Retry instead.
+  // The active manager's tick refreshes the list independently of this pane.
   const bool listFailedHere = !listErrorDocId_.empty() && st.docMirror.hasDoc() &&
                               listErrorDocId_ == st.docMirror.docId() &&
                               listErrorRevision_ == (long)st.docMirror.revision();
-  if (!st.rpc.busy() && st.docMirror.hasDoc() && !listFailedHere &&
-      (lastDocId_ != st.docMirror.docId() || lastRevision_ != (long)st.docMirror.revision()))
-    refresh(st);
+
 
   // The Simulation body is embedded in the FeatureManager column, whose glass surface layout.cpp
   // already painted; its ADAPTIVE text is the pane-level ink for the whole body (mirrors
@@ -220,17 +217,25 @@ void SimManager::drawTreeBody(AppState &st) {
         listErrorDocId_.clear();
       return;
     }
-    kit::inlineStatus("Showing the last loaded studies; the latest list couldn't be loaded.",
+    kit::inlineStatus("The study list could not be refreshed. Retry before using it.",
                       kit::Tone::Warn);
     if (kit::secondaryButton("Retry###sim_list_retry"))
       listErrorDocId_.clear();
-  } else if (lastDocId_ != st.docMirror.docId()) {
-    kit::spinner("Loading saved studies\xe2\x80\xa6");
+  }
+  const bool listReady = lastDocId_ == st.docMirror.docId() &&
+                         lastRevision_ == st.docMirror.revision() &&
+                         !(refreshInFlight_ && refreshDocId_ == st.docMirror.docId()) &&
+                         !listFailedHere;
+  if (!listReady) {
+    if (!listFailedHere) kit::spinner("Loading saved studies\xe2\x80\xa6");
+    if (kit::secondaryButton("+ New study###sim_new_study", true, nullptr,
+                             ImVec2(ImGui::GetContentRegionAvail().x, 0.0f)))
+      newPickerRequested_ = true;
     return;
   }
   const int industrial = piping_.studyCount() + hydraulic_.studyCount();
   if (studies_.empty() && industrial == 0) {
-    if (activeDocIsAssembly(st)) {
+    if (activeMechanicalDocumentKind(st) == CommandDocKind::Assembly) {
       // Say plainly that THIS document has no study: rendered motion videos are files (often of
       // another assembly), never studies of this one.
       const std::string title = "No studies in " + st.docTabs[st.activeTab].title;
@@ -271,6 +276,14 @@ void SimManager::drawTreeBody(AppState &st) {
 
 // ---- grouped "New study" picker ------------------------------------------------------------------
 void SimManager::drawNewStudyPicker(AppState &st) {
+  if (newPickerRequested_) {
+    if (!creationDocId_.empty()) ++studyPresentationGeneration_;
+    refreshThermalCfdCapability(st);
+    if (listErrorDocId_ == st.docMirror.docId() &&
+        listErrorRevision_ == st.docMirror.revision())
+      listErrorDocId_.clear();
+    ensureStudyList(st);
+  }
   if (newPickerRequested_ || shotForcePicker) {
     ImGui::OpenPopup("##sim_new_study");
     newPickerRequested_ = false;
@@ -296,36 +309,25 @@ void SimManager::drawNewStudyPicker(AppState &st) {
     ui::popGlassWindowStyle();
     return;
   }
-
-  // Progressive disclosure by the open doc types: mechanical kinds need a part/assembly, Motion an
-  // assembly, Electronics a schematic, emulation a board or firmware project. Kinds whose engine
-  // leg is missing stay listed, dimmed, with the reason.
-  bool hasSch = false, hasPcb = false, hasAsm = false;
-  for (const auto &t : st.docTabs) {
-    hasSch = hasSch || t.kind == AppState::DocTab::TabKind::Schematic;
-    hasPcb = hasPcb || t.kind == AppState::DocTab::TabKind::PCB;
-    hasAsm = hasAsm || t.kind == AppState::DocTab::TabKind::Assembly;
+  // Keyboard navigation is normally disabled, so ImGui does not dismiss
+  // non-modal popups on Escape itself. Only the focused picker owns this key.
+  if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows |
+                             ImGuiFocusedFlags_NoPopupHierarchy) &&
+      ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+    ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+    ImGui::PopStyleVar(2);
+    ui::popGlassWindowStyle();
+    return;
   }
-  const bool mechDoc = st.docMirror.hasDoc();
-  const nlohmann::json flowCaps = st.simClient ? st.simClient->caps() : nlohmann::json::object();
-  const bool openfoamMissing = !flowCaps.is_object() || !flowCaps.value("openfoam", false);
-  auto capHint = [&](const char *leg, const char *flag, const char *fallback,
-                     bool &missing) -> std::string {
-    const auto it = caps_.find(leg);
-    missing = capsStatus_ == 1 && (it == caps_.end() || !it->is_object() || !it->value(flag, false));
-    return it != caps_.end() && it->is_object() ? it->value("hint", std::string(fallback))
-                                                : std::string(fallback);
-  };
-  bool ccxMissing = false, vibMissing = false;
-  const std::string ccxHint = capHint("ccx", "found", "CalculiX (ccx) not found.", ccxMissing);
-  const std::string vibHint = capHint("freq_response", "available",
-                                      "Vibration post-processing is unavailable.", vibMissing);
-#ifdef __EMSCRIPTEN__
-  const bool webNoPy = true;
-#else
-  const bool webNoPy = false;
-#endif
-  const std::string webHint = "Not available in the web version yet.";
+
+  // Mechanical choices follow the active tab, not a mirror or assembly left in the background.
+  // Use the same cached snapshot and availability policy as the ribbon and dispatcher.
+  const CommandContext context = commandContext(st);
+  const bool mechDoc = context.activeDocKind == CommandDocKind::Part ||
+                       context.activeDocKind == CommandDocKind::Assembly;
+  const bool hasSch = context.hasOpenSchematic;
+  const bool hasPcb = context.hasOpenBoard;
 
   enum class Act { Command, Electronics, Firmware };
   struct Entry {
@@ -341,66 +343,62 @@ void SimManager::drawNewStudyPicker(AppState &st) {
       "Structural", "Thermal", "Fluids", "Motion", "Electromagnetics", "Electronics",
       "Optimization", "Industrial"};
   std::vector<Entry> entries;
-  auto add = [&](int g, const char *icon, const char *title, const char *desc, bool disabled,
-                 std::string reason, Act act, const char *cmd) {
-    entries.push_back({g, icon, title, desc, !disabled, disabled ? std::move(reason) : std::string(),
-                       act, cmd});
+  auto addCommand = [&](int g, const char *icon, const char *title, const char *desc,
+                        const char *cmd) {
+    const CommandAvailability availability = commandAvailability(cmd, context);
+    if (!availability.visible)
+      return;
+    entries.push_back({g, icon, title, desc, availability.enabled,
+                       availability.reason ? availability.reason : "", Act::Command, cmd});
+  };
+  auto addSpecial = [&](int g, const char *icon, const char *title, const char *desc,
+                        bool enabled, std::string reason, Act act) {
+    entries.push_back({g, icon, title, desc, enabled, enabled ? std::string() : std::move(reason),
+                       act, nullptr});
   };
   if (mechDoc) {
-    add(GStruct, "study_static", "Static", "Stress, displacement, safety factor.", false, {},
-        Act::Command, "sim_new_static");
-    add(GStruct, "study_modal", "Modal", "Natural frequencies and mode shapes.", false, {},
-        Act::Command, "sim_new_modal");
-    add(GStruct, "study_buckling", "Buckling", "Buckling load factors and shapes.", false, {},
-        Act::Command, "sim_new_buckling");
-    add(GStruct, "study_fatigue", "Fatigue", "Cyclic-load life and safety factor.", false, {},
-        Act::Command, "sim_new_fatigue");
-    add(GStruct, "study_contact", "Contact", "Nonlinear contact check (CalculiX).",
-        webNoPy || ccxMissing, webNoPy ? webHint : ccxHint, Act::Command, "sim_new_contact");
-    add(GStruct, "study_vibration", "Vibration", "Response to harmonic base shaking.",
-        webNoPy || vibMissing, webNoPy ? webHint : vibHint, Act::Command, "sim_new_freqresp");
-    add(GThermal, "study_thermal_fea", "Thermal FEA", "Conduction, steady or transient.", false,
-        {}, Act::Command, "sim_new_thermal_fea");
-    add(GThermal, "study_thermal_cfd", "Thermal CFD", "Convection and conjugate heat (CFD).",
-        webNoPy || openfoamMissing,
-        webNoPy ? webHint : std::string("Needs OpenFOAM; use Thermal FEA."), Act::Command,
-        "sim_new_thermal");
-    add(GFluids, "study_flow", "Flow", "External flow: drag and lift.", webNoPy, webHint,
-        Act::Command, "sim_new_flow");
-    add(GFluids, "fluid", "Internal flow", "Pressure drop through a pipe run.", false, {},
-        Act::Command, "sim_piping_flow");
+    addCommand(GStruct, "study_static", "Static", "Stress, displacement, safety factor.",
+               "sim_new_static");
+    addCommand(GStruct, "study_modal", "Modal", "Natural frequencies and mode shapes.",
+               "sim_new_modal");
+    addCommand(GStruct, "study_buckling", "Buckling", "Buckling load factors and shapes.",
+               "sim_new_buckling");
+    addCommand(GStruct, "study_fatigue", "Fatigue", "Cyclic-load life and safety factor.",
+               "sim_new_fatigue");
+    addCommand(GStruct, "study_contact", "Contact", "Nonlinear contact check (CalculiX).",
+               "sim_new_contact");
+    addCommand(GStruct, "study_vibration", "Vibration", "Response to harmonic base shaking.",
+               "sim_new_freqresp");
+    addCommand(GThermal, "study_thermal_fea", "Thermal FEA", "Conduction, steady or transient.",
+               "sim_new_thermal_fea");
+    addCommand(GThermal, "study_thermal_cfd", "Thermal CFD", "Convection and conjugate heat (CFD).",
+               "sim_new_thermal");
+    addCommand(GFluids, "study_flow", "Flow", "External flow: drag and lift.", "sim_new_flow");
+    addCommand(GFluids, "fluid", "Internal flow", "Pressure drop through a pipe run.",
+               "sim_piping_flow");
+    addCommand(GMotion, "rotate_component", "Motion", "Drive mates, check interference.",
+               "sim_new_motion");
+    addCommand(GEm, "study_em", "Electromagnetic", "RF modes, S-parameters, time domain.",
+               "sim_em_eigen");
+    addCommand(GOpt, "study_topology", "Topology", "Optimize this part's material layout.",
+               "sim_new_topology");
+    addCommand(GIndustrial, "study_piping", "Pipe network", "Route, solve and code-check pipes.",
+               "sim_piping_new");
+    addCommand(GIndustrial, "study_hydraulics", "Hydraulic circuit", "Size and simulate fluid power.",
+               "sim_hyd_new");
+    addCommand(GIndustrial, "vessel", "Pressure vessel", "Shell and head thickness to code.",
+               "sim_piping_vessel");
+    addCommand(GIndustrial, "duct", "Duct system", "Duct sizing and pressure loss.",
+               "sim_piping_duct");
   }
-  if (hasAsm)
-    add(GMotion, "rotate_component", "Motion", "Drive mates, check interference.", false, {},
-        Act::Command, "sim_new_motion");
-  if (mechDoc)
-    add(GEm, "study_em", "Electromagnetic", "RF modes, S-parameters, time domain.",
-        emStatus_ < 0, "EM solver not installed.", Act::Command, "sim_em_eigen");
   if (hasSch || hasPcb)
-    add(GElec, "sch_simulate", "Circuit (SPICE)", "DC, AC and transient analysis.", !hasSch,
-        "Open the schematic tab.", Act::Electronics, nullptr);
+    addSpecial(GElec, "sch_simulate", "Circuit (SPICE)", "DC, AC and transient analysis.",
+               hasSch, "Open the schematic tab.", Act::Electronics);
   const bool fwProjects = fwsim_.projectsLoaded && !fwsim_.projectIds.empty();
   if (hasSch || hasPcb || fwProjects)
-    add(GElec, "cat_electronics", "Firmware emulation", "Run firmware in an emulator.",
-        fwStatus_ == 1 && !fwCanEmulate_,
-        fwHint_.empty() ? std::string("Install Renode or QEMU.") : fwHint_, Act::Firmware,
-        nullptr);
-  if (mechDoc) {
-    const bool topoAsm = activeDocIsAssembly(st);
-    const bool topoUnavailable = topoCaps_.state == topology::Capabilities::State::Unavailable;
-    add(GOpt, "study_topology", "Topology", "Optimize this part's material layout.",
-        topoAsm || topoUnavailable,
-        topoAsm ? std::string("Open a part, not an assembly.") : topoCaps_.error, Act::Command,
-        "sim_new_topology");
-    add(GIndustrial, "study_piping", "Pipe network", "Route, solve and code-check pipes.", false,
-        {}, Act::Command, "sim_piping_new");
-    add(GIndustrial, "study_hydraulics", "Hydraulic circuit", "Size and simulate fluid power.",
-        false, {}, Act::Command, "sim_hyd_new");
-    add(GIndustrial, "vessel", "Pressure vessel", "Shell and head thickness to code.", false, {},
-        Act::Command, "sim_piping_vessel");
-    add(GIndustrial, "duct", "Duct system", "Duct sizing and pressure loss.", false, {},
-        Act::Command, "sim_piping_duct");
-  }
+    addSpecial(GElec, "cat_electronics", "Firmware emulation", "Run firmware in an emulator.",
+               fwStatus_ != 1 || fwCanEmulate_,
+               fwHint_.empty() ? std::string("Install Renode or QEMU.") : fwHint_, Act::Firmware);
 
   // Group order is fixed; entries keep their insertion order within a group.
   std::vector<kit::PickerItem> items;
@@ -627,6 +625,7 @@ void SimManager::drawStudyRow(AppState &st, int i) {
     ImGui::SetCursorScreenPos(after);
   }
   if ((clicked || dbl) && !overLane) {
+    if (!creationDocId_.empty()) ++studyPresentationGeneration_;
     sel_ = i;
     node_ = SimNode::Study;
     armedWell_ = -1;
@@ -672,6 +671,7 @@ void SimManager::drawStudyRow(AppState &st, int i) {
       statusMark(ImVec2(c0.x + cw - kit::padX() - markW * 0.5f, c0.y + kit::padY() + lineH * 0.5f),
                  markW, cs, tip);
       if (hit || cdbl) {
+        if (!creationDocId_.empty()) ++studyPresentationGeneration_;
         node_ = n;
         loadIdx_ = n == SimNode::Load
                        ? (idx >= 0 ? idx : (s.loads.empty() ? -1 : 0))
@@ -826,8 +826,12 @@ void SimManager::drawStudyRow(AppState &st, int i) {
     ImGui::Unindent(ui::metrics::U(3.0f));
   }
   ImGui::PopID();
+  if ((wantOpen || ((clicked || dbl) && !overLane)) && isFlowFamily(s.type))
+    refreshThermalCfdCapability(st);
+
 
   if (wantOpen) {
+    if (!creationDocId_.empty()) ++studyPresentationGeneration_;
     sel_ = i;
     node_ = SimNode::Study;
     loadIdx_ = -1;
@@ -835,6 +839,7 @@ void SimManager::drawStudyRow(AppState &st, int i) {
     panelOpen_ = true;
   }
   if (wantRun) {
+    if (!creationDocId_.empty()) ++studyPresentationGeneration_;
     sel_ = i; // the run pipeline keys its in-flight study off the selection
     run(st, studies_[i]);
   }

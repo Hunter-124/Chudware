@@ -190,3 +190,18 @@ unrepresentable. A shared ref with equal units is still an error (`unit_ref_conf
 **Symbol assembly flags.** `in_bom` and `on_board` are first-class and settable (v1 hard-coded
 both to `true` at creation and offered no edit path), and `datasheet` is promoted out of `fields`
 into its own slot so the KiCad importer stops discarding it.
+
+## KiCad round trip — contract revision v2
+
+The in-memory schema identifier remains `aicad.sch/1`; KiCad project files, not this
+JSON representation, are the persisted authority. Imported objects retain `uuid` and
+`kicad_extra` (unmodelled child S-expression nodes as parsed JSON). The root `kicad`
+object retains `version`, `generator`, `generator_version`, `uuid`, `extra` (unmodelled
+top-level nodes) and `lib_symbols` mapping library IDs to raw symbol nodes. Copies drop
+their UUID; newly created objects receive RFC-4122 v4 UUIDs on write, stored back in
+the session for stable subsequent saves. The KiCad 10 writer converts +y-up document
+coordinates to KiCad +y-down and resolves embedded symbols from retained nodes, installed
+libraries, then native definitions. Unedited KiCad content must round-trip losslessly.
+The writer emits KiCad schematic version `20260306`, generator `chudware` and
+generator version `10.0`. KiCad CLI load and import/write/import fidelity are
+the acceptance oracles; repeated writes are byte-stable.

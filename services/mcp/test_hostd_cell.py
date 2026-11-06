@@ -11,6 +11,7 @@ from pathlib import Path
 import shutil
 import socket
 import subprocess
+import sys
 import time
 import tempfile
 import uuid
@@ -26,6 +27,10 @@ pytestmark = pytest.mark.skipif(os.name != "posix" or HOSTD is None,
                                 reason="built POSIX hostd required")
 BOX_OPS = [{"op": "add_feature", "feature": {"type": "box", "name": "b1",
             "params": {"length": 10, "width": 10, "height": 10}, "refs": {}}}]
+MESH_PLY = ("ply\nformat ascii 1.0\nelement vertex 4\n"
+            "property float x\nproperty float y\nproperty float z\n"
+            "element face 2\nproperty list uchar int vertex_indices\nend_header\n"
+            "0 0 0\n1 0 0\n1 1 0\n0 1 0\n3 0 1 2\n3 0 2 3\n")
 
 
 class Wire:
@@ -87,7 +92,7 @@ class Wire:
 
 
 class Cell:
-    def __init__(self, root, env_extra=None):
+    def __init__(self, root, env_extra=None, hostd_bin=None):
         self.state, self.work = root / "state", root / "work"
         self.state.mkdir(mode=0o700)
         self.work.mkdir()
@@ -104,7 +109,7 @@ class Cell:
                    CHUDWARE_CELL_METHODS_FILE=str(ROOT / "contracts/cell_methods.json"),
                    CHUDWARE_HOSTD_LINGER_SECS="600", CHUDWARE_HOSTD_GUI_EXIT_GRACE_S="600")
         env.update(env_extra or {})
-        self.proc = subprocess.Popen([str(HOSTD), "--cell", "--gateway-listen-fd",
+        self.proc = subprocess.Popen([str(hostd_bin or HOSTD), "--cell", "--gateway-listen-fd",
                                       str(self.listener.fileno()), "--cell-state", str(self.state),
                                       "--cell-work", str(self.work)], env=env,
                                      pass_fds=(self.listener.fileno(),),
@@ -219,28 +224,115 @@ def test_document_events_require_attachment_and_attribute_actor(cell):
     assert not [e for e in stranger.drain() if e.get("event", "").startswith("doc.")]
 
 
-def test_native_runs_are_opaque_owned_and_events_private(cell):
+def test_mesh_reference_rights_dispatch_and_events(cell):
+    actor = str(uuid.uuid4())
+    author = cell.connect(actor)
+    viewer = cell.connect(str(uuid.uuid4()), "viewer")
+    stranger = cell.connect(str(uuid.uuid4()))
+    viewer.call("subscribe", {"doc_ids": "*"})
+    stranger.call("subscribe", {"doc_ids": "*"})
+    doc = author.call("doc_new", {"kind": "part", "name": "reference-events"})["doc_id"]
+    assert viewer.call("attach_doc", {"doc_id": doc, "mode": "rw"})["mode"] == "ro"
+    (cell.work / "reference.ply").write_text(MESH_PLY)
+    assert viewer.call("doc_mesh_ref_list", {"doc_id": doc})["refs"] == []
+
+    added = author.call("doc_mesh_ref_add", {"doc_id": doc, "path": "reference.ply"})
+    ref = added["id"]
+    assert added["ok"] and added["triangles"] == 2
+    summary = next(row for row in author.call("doc_list")["docs"] if row["doc_id"] == doc)
+    assert summary["feature_count"] == 0 and summary["empty"] is False
+    events = [e for e in viewer.drain() if e.get("event") == "doc.changed"]
+    assert len(events) == 1
+    assert events[0]["data"]["doc_id"] == doc
+    assert events[0]["data"]["revision"] == added["revision"]
+    assert events[0]["data"]["method"] == "doc_mesh_ref_add"
+    assert events[0]["data"]["actor_key"] == actor
+    assert isinstance(events[0]["data"]["tree"], dict)
+    assert not [e for e in stranger.drain() if e.get("event", "").startswith("doc.")]
+
+    refs = viewer.call("doc_mesh_ref_list", {"doc_id": doc})
+    assert refs["revision"] == added["revision"] and refs["refs"][0]["id"] == ref
+    page = viewer.call("doc_mesh_ref_mesh", {"doc_id": doc, "id": ref,
+                       "offset_tris": 0, "max_tris": 1, "expected_revision": refs["revision"]})
+    assert page["total_tris"] == 2 and page["next_offset_tris"] == 1
+    assert len(page["indices"]) == 3
+    page = viewer.call("doc_mesh_ref_mesh", {"doc_id": doc, "id": ref,
+                       "offset_tris": page["next_offset_tris"], "max_tris": 1,
+                       "expected_revision": refs["revision"]})
+    assert len(page["indices"]) == 3 and page["next_offset_tris"] is None
+    assert not [e for e in viewer.drain() if e.get("event") == "doc.changed"]
+
+    for method, fields in (
+        ("doc_mesh_ref_add", {"path": "reference.ply"}),
+        ("doc_mesh_ref_update", {"id": ref, "visible": False}),
+        ("doc_mesh_ref_remove", {"id": ref}),
+    ):
+        viewer.denied(method, {"doc_id": doc, **fields}, "forbidden_right")
+
+    updated = author.call("doc_mesh_ref_update", {"doc_id": doc, "id": ref, "visible": False})
+    events = [e for e in viewer.drain() if e.get("event") == "doc.changed"]
+    assert len(events) == 1 and events[0]["data"]["method"] == "doc_mesh_ref_update"
+    assert events[0]["data"]["revision"] == updated["revision"]
+    viewer.denied("doc_mesh_ref_mesh", {"doc_id": doc, "id": ref, "offset_tris": 1,
+                  "expected_revision": refs["revision"]}, "stale_revision")
+    assert viewer.call("doc_mesh_ref_list", {"doc_id": doc})["refs"][0]["visible"] is False
+    removed = author.call("doc_mesh_ref_remove", {"doc_id": doc, "id": ref})
+    events = [e for e in viewer.drain() if e.get("event") == "doc.changed"]
+    assert len(events) == 1 and events[0]["data"]["method"] == "doc_mesh_ref_remove"
+    assert events[0]["data"]["revision"] == removed["revision"]
+    assert viewer.call("doc_mesh_ref_list", {"doc_id": doc})["refs"] == []
+    assert not [e for e in stranger.drain() if e.get("event", "").startswith("doc.")]
+
+
+def test_mesh_reference_add_confines_workspace_and_actor_paths(cell, tmp_path):
     actor, other = str(uuid.uuid4()), str(uuid.uuid4())
     author = cell.connect(actor)
-    foreign = cell.connect(other)
-    manager = cell.connect(str(uuid.uuid4()), "manager")
-    result = author.call("agent_run_design", {"provider": {"name": "openai"},
-                        "options": {"offline": True, "run_id": "caller-chosen"}})
-    run = result["run_id"]
-    assert run and run != "caller-chosen"
-    assert author.call("agent_run_events_read", {"run_id": run})
-    for method in ("agent_cancel", "agent_steer", "agent_run_event", "agent_run_events_read"):
-        foreign.denied(method, {"run_id": run, "text": "foreign", "kind": "foreign"}, "not_found")
-    manager.denied("agent_run_events_read", {"run_id": run}, "not_found")
-    for method in ("agent_steer", "agent_answer"):
-        manager.denied(method, {"run_id": run, "text": "manager"}, "not_found")
-    foreign.denied("agent_cancel", {"run_id": run,
-                   "control_delegate": {"actor_key": other, "right": "manager", "action": "cancel"},
-                   "ctx": {"cell": True, "actor_key": actor, "right": "manager"}},
-                   "not_found")
-    assert not [e for e in foreign.drain() if e.get("event") == "agent.event"]
-    assert any(e.get("event") == "agent.event" for e in author.drain())
-    author.denied("agent_run_events_read", {"run_id": "../outside"}, "not_found")
+    cell.connect(other)
+    doc = author.call("doc_new", {"kind": "part", "name": "reference-paths"})["doc_id"]
+    outside = tmp_path / "outside.ply"
+    outside.write_text(MESH_PLY)
+    (cell.work / "escape").symlink_to(tmp_path, target_is_directory=True)
+    (cell.work / "dangling").symlink_to(tmp_path / "missing", target_is_directory=True)
+    other_root = cell.state / "actors" / hashlib.sha256(other.encode()).hexdigest()[:32]
+    (other_root / "other.ply").write_text(MESH_PLY)
+    for path in (str(outside), "../outside.ply", "escape/outside.ply",
+                 "dangling/outside.ply", str(other_root / "other.ply")):
+        author.denied("doc_mesh_ref_add", {"doc_id": doc, "path": path}, "cell_refused")
+    assert author.call("doc_mesh_ref_list", {"doc_id": doc})["refs"] == []
+
+    own_root = cell.state / "actors" / hashlib.sha256(actor.encode()).hexdigest()[:32]
+    (own_root / "reference.ply").write_text(MESH_PLY)
+    (own_root / "escape").symlink_to(tmp_path, target_is_directory=True)
+    internal = cell.internal(actor)
+    internal.call("hello", {"client": "agent", "proto": 1})
+    internal.denied("doc_mesh_ref_add", {"doc_id": doc, "path": "/actor/escape/outside.ply"},
+                    "cell_refused")
+    added = internal.call("doc_mesh_ref_add", {"doc_id": doc, "path": "/actor/reference.ply"})
+    assert added["ok"] and added["triangles"] == 2
+    assert author.call("doc_mesh_ref_list", {"doc_id": doc})["refs"][0]["id"] == added["id"]
+
+
+def test_presentation_is_workspace_visible_without_broadening_other_events(cell):
+    author = cell.connect(str(uuid.uuid4()))
+    reader = cell.connect(str(uuid.uuid4()), "viewer")
+    reader.call("subscribe", {"doc_ids": "*"})
+    doc = author.call("doc_new", {"name": "shared-presentation"})["doc_id"]
+    author.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})
+    assert not [e for e in reader.drain() if e.get("event", "").startswith("doc.")]
+    reader.denied("doc_present", {"doc_id": doc}, "forbidden_right")
+    assert author.call("doc_present", {"doc_id": doc})["presented"] is True
+    events = reader.drain()
+    assert [e["data"] for e in events if e["event"] == "doc.presented"] == [
+        {"doc_id": doc, "name": "shared-presentation", "revision": 1}
+    ]
+    assert next(r for r in reader.call("doc_list")["docs"] if r["doc_id"] == doc)["presented"]
+    with tempfile.TemporaryDirectory(prefix="cw-cell-other-", dir="/tmp") as directory:
+        other = Cell(Path(directory))
+        try:
+            outsider = other.connect(str(uuid.uuid4()))
+            outsider.denied("doc_present", {"doc_id": doc}, "not_found")
+        finally:
+            other.stop()
 
 
 def test_paths_are_workspace_relative_and_symlinks_cannot_escape(cell, tmp_path):
@@ -254,7 +346,19 @@ def test_paths_are_workspace_relative_and_symlinks_cannot_escape(cell, tmp_path)
     (cell.work / "missing-escape").symlink_to(tmp_path / "not-created", target_is_directory=True)
     owner.denied("doc_open", {"path": "missing-escape/outside.step+"}, "cell_refused")
     owner.denied("doc_save", {"doc_id": doc, "path": "missing-escape/outside.step+"}, "cell_refused")
+    for dest in (str(tmp_path / "outside.zip"), "../outside.zip", "escape/outside.zip",
+                 "missing-escape/outside.zip"):
+        owner.denied("export_reveng_bundle", {"session_id": "unresolved", "dest": dest},
+                     "cell_refused")
     (cell.work / "future").symlink_to(cell.work / "not-created", target_is_directory=True)
+    # Runtime paths receive the same confinement as document paths, including
+    # paths nested in turn options. Nested absolute references never become a
+    # general escape hatch, even when they point into the workspace.
+    for key in ("omp_session_file", "omp_session_dir"):
+        owner.denied("agent_admin_turn", {key: str(tmp_path / "outside")}, "cell_refused")
+        owner.denied("agent_admin_turn", {"options": {key: str(cell.work / "inside")}},
+                     "cell_refused")
+        owner.denied("agent_admin_turn", {"options": {key: "../outside"}}, "cell_refused")
     owner.call("doc_save", {"doc_id": doc, "path": "future/inside.step+"})
     assert (cell.work / "not-created/inside.step+").is_file()
     saved = owner.call("doc_save", {"doc_id": doc, "path": "part.step+"})
@@ -365,6 +469,49 @@ def test_operator_is_gateway_private_control_only_and_creates_no_actor(cell):
     internal.denied("cell_census", {}, "cell_refused")
     assert operator.call("cell_census")["sessions"] == 2
 
+
+def test_stale_drain_fails_closed_on_cell_actor_sockets():
+    # Touch only the private executable watched by this scratch cell.
+    with tempfile.TemporaryDirectory(prefix="cw-cell-drain-", dir="/tmp") as directory:
+        root = Path(directory)
+        binary = root / "chudware-hostd"
+        shutil.copy2(HOSTD, binary)
+        libname = "libchudware.dylib" if sys.platform == "darwin" else "libchudware.so"
+        library = os.environ.get("CHUDWARE_LIBCHUDWARE") or str(Path(HOSTD).resolve().parent / libname)
+        scratch = Cell(root, {"CHUDWARE_HOSTD_STALECHECK_S": "1",
+                              "CHUDWARE_LIBCHUDWARE": library}, binary)
+        try:
+            owner = scratch.connect("owner", "owner")
+            internal = scratch.internal("owner")
+            internal.call("hello", {"client": "agent"})
+            operator = scratch.operator()
+            time.sleep(1.2)
+            old = binary.stat().st_mtime_ns
+            os.utime(binary, ns=(old + 2_000_000_000, old + 2_000_000_000))
+
+            deadline = time.monotonic() + 10
+            while True:
+                probe = scratch.internal("owner")
+                reply = probe.rpc("hello", {"client": "agent"})
+                probe.close()
+                if "error" in reply:
+                    assert reply["error"]["code"] == "daemon_draining", reply
+                    assert reply["error"]["reason"] == "stale_binary"
+                    break
+                assert time.monotonic() < deadline, "cell did not start stale drain"
+                time.sleep(0.05)
+
+            # Actor sockets cannot masquerade as the operator to escape the
+            # drain; already-authenticated connections retain their rights.
+            spoof = scratch.internal("owner")
+            spoof.denied("hello", {"client": "control"}, "daemon_draining")
+            owner.call("ping")
+            internal.call("ping")
+            assert operator.call("cell_census")["sessions"] >= 2
+            fresh_operator = scratch.operator()
+            fresh_operator.denied("doc_new", {}, "cell_refused")
+        finally:
+            scratch.stop()
 
 def test_pending_handshake_is_counted_and_accepted_work_continues_during_drain(cell):
     operator = cell.operator()

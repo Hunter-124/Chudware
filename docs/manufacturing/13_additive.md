@@ -1,14 +1,12 @@
 # Additive Manufacturing — Architecture Contract & Execution Plan
 
-**Owner:** AdditiveArchitecture · **Wave:** design-only, 2026-08-08.
+Design proposal. See the [as-built map](README.md#as-built-map) for the implemented subset.
 
-Domain names, corrected against the project path/prefix ruling (`GW-PATHS-ROOTS`): wire RPC
-`mfg_print_*`, events `mfg.print.*`, MCP family `manufacture`, contract
-`contracts/manufacturing_print.md`, doc schemas `chudware.print_*/1`, document extension
-`.print+`, C++ namespace `chudware::print`, GUI tree `host/src/ui/manufacture/print/`, service
-tree `services/manufacturing/slicer/`, fixtures `fixtures/mfg/print/`. The **one** ratified
-exception is the public `libchudware` C ABI, whose sixteen authoring methods keep `print_*`
-because DoD 16 forbids an `mfg_*` symbol there (§5, §12, §14.3).
+This design proposes wire RPC `mfg_print_*`, events `mfg.print.*`, MCP family
+`manufacture`, document schemas `chudware.print_*/1`, `.print+` files, and C++ namespace
+`chudware::print`. It proposes `print_*` names for any authoring-only `libchudware`
+entry points; the public C ABI must not export `mfg_*` symbols. See the as-built map
+for paths and interfaces that do not exist.
 
 Consumed verbatim, never redefined:
 - **Gateway** (`contracts/manufacturing_gateway.md`) — device identity, capability-set type and
@@ -34,13 +32,10 @@ Consumed verbatim, never redefined:
   observation `src`, never a truth value (§10).
 - **UX `AppState::mfg.mode`** (Offline-Simulation vs Live Machine).
 
-**Authoring vs device, held absolutely** (execution-plan ruling 3): every additive method —
-`mfg_print_*` on the wire, `print_*` in the C ABI — is document/authoring/slice/preflight/
-artifact. **No additive method may open a transport, take a lease, upload, or start anything**,
-and as of this revision that is asserted structurally by the strengthened `mfg-abi` smoke rather
-than inferred from a prefix (`GW-ABI-NO-DEVICE-ENTRY`, §12). `print_run_link` links to a run; it
-does not create one. Anything touching a device is an `mfg_run_*` / `mfg_device_*` call into
-gatewayd.
+**Authoring vs device:** proposed additive methods are limited to document authoring,
+slicing, preflight and artifacts. They must not open a transport, take a lease, upload,
+or start anything. `print_run_link` is a proposed link to a run, not a start command;
+device authority remains with the manufacturing gateway.
 
 **Gateway rules are cited by stable rule id, never by section number.** Gateway's numbering moved
 during the review pass and three domains ended up citing rules that had renumbered underneath
@@ -523,24 +518,14 @@ crash-isolating subprocess work in a dedicated Python worker (`contracts/worker_
 stated rationale for the sim worker — "it never touches live document state, so a crash cannot
 corrupt a session").
 
-**Prefix ruling applied, and the single exception recorded.** `GW-PATHS-ROOTS` puts RPC and
-events at `mfg_*`/`mfg.*`, so the additive **wire** surface is `mfg_print_*` / `mfg.print.*` —
-MCP tools and slice-worker methods both take the prefix, and the bare `print_*` RPC prefix this
-document previously used is withdrawn. The **public `libchudware` C ABI keeps `print_*`**, and
-that is a ratified exception rather than residual drift: DoD 16 forbids any `mfg_*` symbol in the
-public C ABI, so renaming those sixteen methods would create precisely the violation the naming
-ruling exists to protect. The exception — and the authoring-only ABI placement it encodes — is
-written into `contracts/manufacturing_gateway.md`, where the naming ruling lives, rather than
-being left as a local habit. The safety property that the old prefix was silently standing in for
-is now mechanized prefix-independently by the strengthened `mfg-abi` smoke (§12):
-**no `libchudware` entry point may open a transport, take a lease, upload, run, approve or command
-a device, whatever it is called** (`GW-ABI-NO-DEVICE-ENTRY`).
+**Prefix and authority boundary.** The proposed wire surface uses `mfg_print_*` /
+`mfg.print.*`; authoring-only public C ABI methods are proposed as `print_*`.
+Regardless of prefix, a `libchudware` entry point must not open a transport, take a
+lease, upload, run, approve or command a device (`GW-ABI-NO-DEVICE-ENTRY`, §12).
 
-### 5.1 C++ core — `core/api/libchudware.cpp`, appended after the `cam_*` block
+### 5.1 Proposed C++ authoring methods
 
-Sixteen methods, all authoring/preflight/artifact, all spelled `print_*` for the DoD-16 reason
-above. **None opens a transport, takes a lease, uploads, or starts** — and as of this revision
-that is asserted structurally by `mfg-abi`, not inferred from the name.
+The following authoring/preflight/artifact methods must not operate a device.
 
 | method | params → result |
 |---|---|
@@ -587,19 +572,10 @@ for different content and a numbering collision is not something a domain can re
 `mfg_print_artifact_info` · `mfg_print_gcode_stats` · `mfg_print_preflight` ·
 `mfg_print_run_status` (read-only view of a linked run record).
 
-**Family: `manufacture`, and only that one** (`GW-FAMILY-MANUFACTURE`). Every tool above registers
-through `view(mcp, "manufacture")` — the one shared family id covering the entire Manufacture
-surface, so Settings → AI → Tools carries a single honest toggle rather than one per domain that
-drift apart. Additive previously named **no** family at all, and an unlisted family defaults
-**on**, so this surface would have shipped enabled. Per-tool granularity is preserved exactly as
-every other domain preserves it — through the existing `get_tool_options` per-tool toggles, never
-through a second family.
-
-Two mechanisms this slice depends on but does not own: the family default itself
-(`DEFAULT_TOOL_FAMILIES` plus `DEFAULT_OFF_TOOL_FAMILIES` in `services/agent/config.py`) is
-Gateway-owned W1.1 work and a **hard predecessor** of additive's MCP wave — additive never edits
-that file; and additive's risk-class rows land as data appended by Gateway, the single owner of
-`services/mcp/tool_registry.py` for the wave.
+Proposed additive tools register in the shared `manufacture` family. The family is off by
+default in `services/agent/config.py` and requires an explicit
+`agent.tool_families.manufacture = true` setting, even when a role lists it. Per-tool
+controls remain available through `get_tool_options`.
 
 **There is no `mfg_print_start`, no `mfg_print_stage_artifact`, and no device-touching tool in the
 additive namespace at all.** Staging an artifact and starting a run are gateway `mfg_run_*` /
@@ -1338,54 +1314,11 @@ substitute a best guess for the closure.
 
 ---
 
-## 11. Dependency order
+## 11. Execution prerequisites
 
-```mermaid
-graph LR
-  W0[Wave 0: land dirty tree] --> A[A. vendor/slicer pin + vendor_slicer.py + license rows]
-  W0 --> B[B. core/print model project plate profile]
-  K[K. submit 10.1 kind table incl print.capability] --> C
-  GW1[Gateway W1.1: kind table, admission classes, manufacture family off, worker_rpc section] --> C
-  GW1 --> G
-  GW[Gateway: CapabilityTruth, run identity, ApprovalRecord] --> C[C. core/print preflight + capability]
-  UX[UX: app_state.h + mfg.mode + FreshValue] --> F
-  A --> D[D. services/manufacturing/slicer + services/manufacturing/slicer/sidecar.py]
-  B --> D
-  B --> E[E. libchudware print_* dispatch + doc_registry + CMake]
-  B --> C
-  D --> G[G. services/mcp/mfg_print_tools.py]
-  E --> G
-  C --> H[H. Gateway additive adapters: Moonraker then OctoPrint]
-  D --> H
-  E --> F[F. host/src/ui/manufacture/print mirror panel preview]
-  D --> F
-  H --> I[I. run records, approval binding, evidence clips]
-  F --> J[J. gate wiring: check.py audit + gate.sh stage + mfg-abi clause]
-  H --> J
-  H --> Q[E4/E5 printer qualification scripts]
-  Q --> P[E6 pilot printer, attended - the only unlock for execute]
-```
-
-| Wave | Work | Blocked on | Parallel with |
-|---|---|---|---|
-| 1.1 | **K** submit the §10.1 durable-result-kind table (seven kinds, both columns, incl. `print.capability`) to Gateway | nothing — it is data, not code | A, B |
-| 1 | **A** pin/lock/vendor script/license rows · **B** `core/print` model+project+plate+profile | nothing | each other |
-| 2 | **D** sidecar + slice worker · **E** RPC dispatch + CMake + doc_registry | A, B | each other |
-| 2 | **C** preflight + capability | Gateway publishing `CapabilityTruth`, `ApprovalRecord`, run identity **and** the two Stage-1 admission classes; K accepted | D, E |
-| 3 | **G** MCP tools · **F** GUI mirror/panel/preview | G ← D, E and Gateway's `manufacture`-family-default edit · F ← E, D and UX's `app_state.h`+`mfg.mode` | each other |
-| 3 | **H** additive adapters (Gateway's tree, additive family spec) | C, D | F, G |
-| 4 | **I** run records, approval binding, evidence clips | H | — |
-| 4 | **J** `scripts/check.py` audit + `gate.sh` stage + the `mfg-abi` clause of §12 | F, H | I |
-| 5.2 | **E4/E5** printer qualification, `scripts/qualify_print_e{4,5}.sh`, excluded from `gate.sh` | H | — |
-| 6+ | **E6** pilot printer, attended — the only step that unlocks `execute` | E4/E5 | — |
-
-Critical path: Gateway's W1.1 amendment (kind table, admission classes, `manufacture` family
-default, `contracts/worker_rpc.md` section allocation) → C → H → I. A, B and K start immediately.
-Shared-file serialization (UX first on `app_state.h`; `tool_panel_tables.*` regenerated, never
-hand-edited; `services/mcp/tool_registry.py` Gateway-owned, additive's risk rows appended by that
-owner) is sequenced by the execution plan.
-
----
+The shared `manufacture` tool family must remain off by default. Durable result kinds must
+be registered before their use. Virtual qualification does not authorize a physical printer:
+physical `execute` requires the attended E6 pilot and the gateway's approval and arbiter gates.
 
 ## 12. Tests, gates, and smokes
 
@@ -1625,71 +1558,24 @@ unreachable until E6 on a pilot printer, attended.
 
 ---
 
-## 14. Review closure — exact corrected paths, prefixes and kinds
+## 14. Naming
 
-Every row below is a reconciliation applied in this revision against
-the architecture plan review. Nothing here changes accepted product scope: additive
-remains in scope exactly as accepted, and physical execution stays deferred behind E6.
-
-### 14.1 Findings closed in this document
-
-| finding | what was wrong | what this document now says | where |
-|---|---|---|---|
-| **B4** | printer `execute` specified three incompatible ways (handshake / virtual qualification / E6) | a handshake yields `transport` **evidence** under the stage ceiling and raises no level; virtual qualification is a precondition for attempting E4; `execute` stays `assumed` with `missing_level:"execute"` until **E6 on a pilot printer, attended** | §8.2, §10, §11, §12 |
-| **B6** | five procedural guards claimed `src:"probed"` for an arbiter computation | those rows carry `admission:"procedural_fact"`; their `src` is whatever the gateway derives (`declared` for profile inputs); `probed` remains settable only by in-daemon transport code | §8.2 |
-| **B7** | additive re-declared capability as `{source: probed\|declared\|assumed, freshness}` with `– not claimed` as a third value | `CapabilityTruth` composed verbatim from `core/device/capability.h`; truth ∈ `verified\|declared\|assumed\|unsupported\|not_applicable`; `– not claimed` → `unsupported` + `why`; "probed after handshake" → `verified` + `evidence_ref`, under B4's ceiling | §10 |
-| **B8** | additive minted its own durable `seq` in the run file | the file-local ordinal is renamed `record_index`; every row a UI may paint takes its `seq` from `mfg_event_append` and is journaled there | §3.6, §8.4, §9, §10.1, §12 |
-| **B10** (additive half) | additive had submitted no durable-result-kind table, so every append would be refused and its capability registration rejected | seven kinds declared with both `GW-KIND-TWO-COLUMNS` columns, including `print.capability`; submitted as W1.1 work item **K** | §10.1, §11 |
-| **B12** (additive half) | additive named no MCP family, and an unlisted family defaults **on** | every additive tool registers through `view(mcp, "manufacture")`; granularity via the existing `get_tool_options` per-tool toggles; the family-default mechanism itself stays Gateway-owned and is a hard predecessor of additive's MCP wave | §5.3, §11, §12 |
-| **C1** | `host/src/ui/print/`, `print_*` RPC prefix, `services/gateway/**`, `services/slicer/**` | corrected in §14.2 and §14.3 | §0, §2, §5, §9, §11, §12 |
-| **C2** | the DoD-16 ABI gate is lexical, so sixteen `print_*` C ABI methods bypass it by construction | `mfg-abi` asserts the C ABI carries no transport, lease, run, approval or device-command entry point **regardless of prefix**; the authoring-only placement and the `print_*` exception are recorded in `contracts/manufacturing_gateway.md` | §5.1, §12 |
-| **C3** | additive split invalidation across five event names | **one** `mfg.print.invalidated` carrying the DoD-9 envelope; `class` carries alarm-vs-quiet, `reason` carries the per-trigger distinction; consumers branch on `class`, never on a name table | §8.2.1, §12 |
-| **C8** | freshness wrapping vs durable authored rows was ruled three ways across the batch | a durable authored row is journaled **and** published wrapped, with `state:"ok"` and `ttl_ms:null` for rows that do not decay | §3, §9, §10.1 |
-
-### 14.2 Corrected paths
-
-| was | is |
-|---|---|
-| `host/src/ui/print/**` | **`host/src/ui/manufacture/print/**`** |
-| `services/slicer/**` | **`services/manufacturing/slicer/**`** |
-| `services/slicer/testing/fake_slicer.py` | **`fixtures/mfg/print/fake_slicer.py`** |
-| `services/slicer/goldens/**` | **`fixtures/mfg/print/goldens/**`** |
-| `services/gateway/**` (virtual printers, additive's spec) | **`fixtures/mfg/print/**`** for the fixtures; **`services/manufacturing/gateway/**`** for Gateway's adapter code |
-| `services/mcp/print_tools.py` | **`services/mcp/mfg_print_tools.py`** |
-| `services/mcp/test_print_tools.py` | **`services/mcp/test_mfg_print_tools.py`** |
-| `core/print/**` | unchanged — `core/<domain>/**` is explicitly permitted by `GW-PATHS-ROOTS` |
-| `services/manufacturing/slicer/sidecar.py` | unchanged — the shipped slicer sidecar is the existing separate-process worker; only its RPC method names change (§14.3) |
-| `vendor/slicer/**` | unchanged — a vendor pin/patch/notices tree, not a service tree |
-| `core/tests/test_print_*.cpp` | unchanged, plus the new `test_print_kinds.cpp` |
-| `contracts/manufacturing_print.md` | unchanged |
-
-### 14.3 Corrected prefixes
+### 14.3 Proposed prefixes
 
 | surface | prefix | why |
 |---|---|---|
-| events | `mfg.print.*` | already compliant; now exactly **one** invalidation event on it, `mfg.print.invalidated` |
+| events | `mfg.print.*` | proposed invalidation event: `mfg.print.invalidated` |
 | MCP tools | **`mfg_print_*`** | `GW-PATHS-ROOTS`: RPC/events stay `mfg_*`/`mfg.*` |
 | slice-worker RPC (`services/manufacturing/slicer/sidecar.py`) | **`mfg_print_*`** | same ruling; a worker method is not a `libchudware` symbol, so DoD 16 does not bite |
-| `libchudware` C ABI (the sixteen authoring methods) | **`print_*`** — ratified exception | DoD 16 forbids an `mfg_*` symbol in the public C ABI, so renaming these would *create* the violation. Recorded in `contracts/manufacturing_gateway.md`, and mechanized prefix-independently by the strengthened `mfg-abi` (§12) so the exception costs no safety |
+| `libchudware` C ABI (proposed authoring methods) | `print_*` | the public C ABI must not export `mfg_*`; authoring methods must remain unable to command a device |
 | document schemas | `chudware.print_*/1` | unchanged — a document schema id is not an RPC name |
 | document extension | `.print+` | unchanged |
 | C++ namespace | `chudware::print` | unchanged |
 | MCP family | **`manufacture`** | one shared family for the whole Manufacture surface, off by default until commissioning |
 
-### 14.4 Durable result kinds registered
+### 14.4 Durable result kinds declared in the gateway contract
 
 `print.slice_result` · `print.artifact` · `print.procedural_fact` · `print.preflight` ·
 `print.run_link` · `print.capability` · `print.media_source`.
 Full two-column declarations, `supersede_with_parent` and `derived_from` in §10.1.
 
-### 14.5 Deliberately not closed here
-
-Named so the omission reads as ownership rather than oversight. **B1 / B2 / B3 / B5** (Stage-1
-admission classes, the corroboration rule, what the hardware-free E0–E3 gate proves,
-virtual-endpoint provenance) are Gateway text that this document consumes and cites by rule id.
-**B11** (the `manufacture`-family default) is Gateway's `services/agent/config.py` edit and a hard
-predecessor of additive's MCP wave. **B13** (`contracts/worker_rpc.md` section allocation) is
-Gateway's W1.1 publication, which §5.2 now defers to instead of claiming a number. **B14**
-(`services/mcp/tool_registry.py`) is Gateway-owned; additive's risk rows land as data that owner
-appends. **B16** (UX's run-approval row set) is the input to §8.2.1's audit check (ii), which
-additive explicitly does not own.

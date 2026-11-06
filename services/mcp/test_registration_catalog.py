@@ -97,6 +97,7 @@ class TestRegistrationCatalog(unittest.TestCase):
             reg.record(name, meta.get("family"), meta.get("risk"))
         reg.reset_policy()
 
+
     def test_every_registered_tool_has_a_valid_catalog_family(self):
         """No tool reaches the FastMCP registry without a catalog family in DEFAULT_TOOL_FAMILIES.
 
@@ -209,7 +210,7 @@ class TestWarmClearCatalogSemantics(unittest.TestCase):
                       "server-only 'office' family — the one-shot-import landmine is back")
         self.assertEqual(cat[probe].get("family"), "office")
         families = {m.get("family") for m in cat.values()}
-        for fam in ("office", "ecad", "gsl", "org"):
+        for fam in ("office", "ecad", "gsl"):
             self.assertIn(fam, families, f"family {fam!r} missing after clear+warm")
 
         # And it stays restored across a second warm (idempotent, not destructive).
@@ -229,13 +230,6 @@ class TestWarmClearCatalogSemantics(unittest.TestCase):
         reg.record("clean_room_probe", "cad", reg.RISK_READ)
         self.assertEqual({m["family"] for m in reg.catalog().values()},
                          {"workspace", "cad"})
-
-    def test_org_family_is_registered_on_the_live_server(self):
-        """The Settings -> AI -> Tools 'org' toggle governs real, registered tools."""
-        for name in ("channel_send", "request_raise", "request_resolve", "council_convene"):
-            self.assertIn(name, _TOOL_NAMES, f"{name} not on the FastMCP server")
-            self.assertEqual((_CATALOG_SNAPSHOT.get(name) or {}).get("family"), "org",
-                             f"{name} is not catalog-tagged family 'org'")
 
     def test_a_partial_baseline_import_is_reported_not_hidden(self):
         """A failed baseline import must be VISIBLE, because the catalog it leaves is a

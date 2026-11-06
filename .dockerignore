@@ -1,0 +1,102 @@
+# Deny by default: a source build must never send local state or credentials.
+**
+!build.sh
+!requirements.txt
+!LICENSE
+!THIRD_PARTY_NOTICES.md
+# Dockerfile copies these compile trees before its native/WASM build layers.
+# Keep host sources and C++ tests: core CMake declares cross-tree targets too.
+!core/
+!core/**
+!host/
+!host/CMakeLists.txt
+!host/src/
+!host/src/**
+!host/cmake/
+!host/cmake/**
+!host/extern/
+!host/extern/mapbox/
+!host/extern/mapbox/**
+!host/tests/
+!host/tests/**
+!host/wasm/
+!host/wasm/**
+!services/
+!services/**
+!contracts/
+!contracts/**
+# WASM links these assets and build.sh checks the staged bundle against them.
+!assets/
+!assets/fonts/
+!assets/fonts/**
+!assets/icons/
+!assets/icons/atlas.json
+!assets/icons/atlas_dark.png
+!assets/icons/atlas_light.png
+!assets/ui-shared-manifest.json
+!assets/logo_icon.png
+!assets/logo_wordmark.png
+!assets/logo_wordmark_dark.png
+!extern/
+!extern/glad/
+!extern/glad/**
+!scripts/
+!scripts/check_web_parity.py
+# Runtime-only helpers are copied after compilation, not into its cache key.
+!web/
+!web/gateway/
+!web/gateway/**
+!web/deploy/
+!web/deploy/Caddyfile
+!web/deploy/cell/
+!web/deploy/cell/**
+!web/deploy/container/
+!web/deploy/container/**
+
+# Re-exclude generated output and local/private material in allowed source trees.
+**/.*
+**/.*/**
+**/build
+**/build-*
+**/build/**
+**/build-*/**
+# Managed dependencies must be fetched in-image with their Git identities intact;
+# copying a host cache without .git makes the pinned-source checks reject it.
+**/third_party
+**/third_party/**
+**/dist
+**/dist/**
+**/__pycache__
+**/__pycache__/**
+**/*.pyc
+**/*.pyo
+**/*_test.py
+**/conftest.py
+# CMake declares native test targets even when only application targets build;
+# their C++ sources must remain available during configure.
+**/test_*.py
+**/AGENTS.md
+**/*.log
+**/*.tmp
+**/*.bak
+**/*~
+**/.env*
+**/*.env
+**/credentials*
+**/secrets*
+**/*.key
+**/*.pem
+**/*.p12
+**/*.pfx
+**/id_rsa*
+**/id_ed25519*
+**/config.json
+**/imgui.ini
+**/node_modules
+**/node_modules/**
+**/venv
+**/venv/**
+**/*.step+
+**/*.aicm
+**/*.sqlite*
+**/*.db

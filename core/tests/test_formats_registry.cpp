@@ -42,6 +42,7 @@
 #include <BRepPrimAPI_MakePrism.hxx>
 #include <BRepPrimAPI_MakeSphere.hxx>
 #include <BRepTools.hxx>
+#include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
 #include <GC_MakeArcOfCircle.hxx>
 #include <GProp_GProps.hxx>
@@ -52,6 +53,8 @@
 #include <TopExp_Explorer.hxx>
 #include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
 #include <TopoDS.hxx>
+#include <TopoDS_Shell.hxx>
+#include <TopoDS_Solid.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Vec.hxx>
 
@@ -70,12 +73,19 @@ TEST_CASE("doc_formats payload matches the Python oracle byte-for-byte (semantic
     REQUIRE(payload.contains("formats"));
     // nlohmann object equality is key-order-insensitive; array order IS compared,
     // so registry order must match the oracle exactly.
-    CHECK(payload["formats"] == json::parse(kOracleFormats));
+    json expected = json::parse(kOracleFormats);
+    expected.insert(expected.begin() + 3, json{{"fmt", "scad"}, {"label", "OpenSCAD source"},
+        {"exts", json::array({".scad"})}, {"lane", "source"},
+        {"can_import", true}, {"can_export", true}});
+    CHECK(payload["formats"] == expected);
 }
 
 TEST_CASE("format_registry exposes the full matrix in oracle order") {
     const auto& reg = chudware::doc::format_registry();
-    const json oracle = json::parse(kOracleFormats);
+    json oracle = json::parse(kOracleFormats);
+    oracle.insert(oracle.begin() + 3, json{{"fmt", "scad"}, {"label", "OpenSCAD source"},
+        {"exts", json::array({".scad"})}, {"lane", "source"},
+        {"can_import", true}, {"can_export", true}});
     REQUIRE(reg.size() == oracle.size());
     for (std::size_t i = 0; i < reg.size(); ++i) {
         CAPTURE(i);
@@ -390,6 +400,33 @@ TEST_CASE("STL refuses output precision collapse rather than deleting source fac
         CHECK(error.code == "export_failed");
     }
     CHECK_FALSE(std::filesystem::exists(output.path));
+}
+
+TEST_CASE("STL refusal identifies the source solid and serialized offending edge") {
+    const auto box = BRepPrimAPI_MakeBox(5, 6, 7).Shape();
+    BRep_Builder builder;
+    TopoDS_Shell shell;
+    builder.MakeShell(shell);
+    int face = 0;
+    for (TopExp_Explorer ex(box, TopAbs_FACE); ex.More(); ex.Next())
+        if (++face != 1) builder.Add(shell, ex.Current());
+    TopoDS_Solid open_solid;
+    builder.MakeSolid(open_solid);
+    builder.Add(open_solid, shell);
+    StlFile output;
+    try {
+        chudware::doc::export_bodies({open_solid}, output.path.string(), "stl");
+        FAIL("An open source solid must not export as a closed STL");
+    } catch (const chudware::doc::OpError& error) {
+        CHECK(error.code == "export_failed");
+        CHECK(error.detail.at("source_solid_index") == 1);
+        CHECK(error.detail.at("edge_start").size() == 3);
+        CHECK(error.detail.at("edge_end").size() == 3);
+        CHECK(error.detail.at("incidence_count") == 1);
+        CHECK(error.detail.at("orientation_balance").is_number_integer());
+        CHECK_FALSE(error.detail.at("facets").empty());
+        CHECK(std::string(error.what()).find("incidence_count") != std::string::npos);
+    }
 }
 
 TEST_CASE("STL continues to export ordinary open surface bodies") {

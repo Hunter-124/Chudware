@@ -8,10 +8,11 @@
 #include <iterator>
 #include <sstream>
 
+#include "../app_commands.h"
 #include "../bootstrap.h"
 #include "../core/sim_client.h"
 #include "sim/sim_manager_internal.h"
-#include "widgets/ribbon.h" // setRibbonStudyContext — per-study command applicability
+#include "ribbon_def.h"
 #include "sim/sim_interaction.h"
 
 namespace ui {
@@ -78,6 +79,60 @@ static StudyType studyTypeFromKey(const std::string &k) {
   if (k == "topology")
     return StudyType::Topology;
   return StudyType::Static;
+}
+
+void SimManager::populateCommandContext(CommandContext &context) const {
+  context.contactCapabilityKnown = capsStatus_ == 1;
+  context.vibrationCapabilityKnown = capsStatus_ == 1;
+  const auto hasCapability = [&](const char *leg, const char *flag) {
+    const auto it = caps_.find(leg);
+    return it != caps_.end() && it->is_object() && it->value(flag, false);
+  };
+  if (capsStatus_ == 1) {
+    context.contactCapabilityAvailable = hasCapability("ccx", "found");
+    context.vibrationCapabilityAvailable = hasCapability("freq_response", "available");
+  }
+  context.emAnalysisOpen = emPanelOpen_;
+  context.emCapabilityKnown = emStatus_ != 0 && emStatusResult_.is_object();
+  context.emCapabilityProbeFailed = emStatus_ != 0 && !emStatusResult_.is_object();
+  context.emCapabilityAvailable = emStatus_ > 0 &&
+      (!emPanelOpen_ || !em_.backendNames[static_cast<int>(emForm_)].empty());
+  context.thermalCfdCapabilityKnown = thermalCfdCapabilityKnown_;
+  context.thermalCfdCapabilityAvailable = thermalCfdCapabilityAvailable_;
+  context.topologyCapabilityKnown = topoCaps_.state != topology::Capabilities::State::Loading;
+  context.topologyCapabilityAvailable = topoCaps_.state == topology::Capabilities::State::Ready;
+
+  if ((context.activeDocKind != CommandDocKind::Part &&
+       context.activeDocKind != CommandDocKind::Assembly) ||
+      !context.activeMechanicalReady || context.activeDocId.empty())
+    return;
+  context.studyListPending = refreshInFlight_ && refreshDocId_ == context.activeDocId;
+  context.simCreationPending = creationDocId_ == context.activeDocId;
+  context.studyFactsCurrent = context.activeDocRevision >= 0 &&
+      context.activeDocId == lastDocId_ && lastRevision_ == context.activeDocRevision &&
+      !(listErrorDocId_ == context.activeDocId &&
+        listErrorRevision_ == context.activeDocRevision);
+  if (!context.studyFactsCurrent)
+    return;
+  const auto hasType = [&](StudyType type) {
+    return (studyTypesPresent_ & (uint32_t{1} << static_cast<unsigned>(type))) != 0;
+  };
+  context.hasModalStudy = hasType(StudyType::Modal);
+  context.hasBucklingStudy = hasType(StudyType::Buckling);
+  context.hasContactStudy = hasType(StudyType::Contact);
+  context.hasFreqResponseStudy = hasType(StudyType::FreqResponse);
+  context.hasThermalFeaStudy = hasType(StudyType::ThermalFea);
+  context.hasFatigueStudy = hasType(StudyType::Fatigue);
+  context.hasMotionStudy = hasType(StudyType::Motion);
+  context.hasFlowStudy = hasType(StudyType::Flow);
+  context.hasThermalStudy = hasType(StudyType::Thermal);
+  context.hasTopologyStudy = hasType(StudyType::Topology);
+  if (sel_ >= 0 && sel_ < static_cast<int>(studies_.size())) {
+    const Study &selected = studies_[sel_];
+    context.selectedStudyType = studyTypeKey(selected.type);
+    if (selected.type == StudyType::Topology)
+      context.topologyPhysics = topology::studyPhysics(selected.topo);
+  }
 }
 
 std::string SimWell::label() const {
@@ -240,20 +295,6 @@ SimManager::UnitSys SimManager::unitSys(const AppState &st) {
   return u; // defaults are already SI (MPa / mm / N)
 }
 
-namespace {
-
-void markSimDocDirty(AppState &st, const std::string &docId) {
-  for (auto &tab : st.docTabs) {
-    if (tab.docId != docId)
-      continue;
-    tab.dirty = true;
-    tab.historyCleared = false;
-    if (tab.aiHandoff)
-      tab.userAdopted = true;
-    return;
-  }
-}
-} // namespace
 
 // ---------------------------------------------------------------- ctor
 
@@ -1175,11 +1216,6 @@ bool SimManager::configureActiveStudy(AppState& st, const nlohmann::json& candid
     error = "/material must name an installed simulation material.";
     return false;
   }
-  if (updatePartMaterial && st.docLockedByAgent(st.docMirror.docId())) {
-    error = st.agentLockReason(st.docMirror.docId());
-    st.toast(ui::ToastLevel::Warn, error);
-    return false;
-  }
   const bool changed = setupDefinition(definition) != setupDefinition(before);
   if (changed && current.type != StudyType::Topology) {
     for (const char* key : {"results", "result", "result_summary", "summary",
@@ -1210,7 +1246,9 @@ bool SimManager::configureActiveStudy(AppState& st, const nlohmann::json& candid
       st.addLog("[sim] " + error);
       markStudiesStale();
     }
-    markSimDocDirty(st, st.docMirror.docId());
+    st.markHumanEdit(st.docMirror.docId(),
+                     restored.is_object() ? restored.value("revision", result.value("revision", 0))
+                                          : result.value("revision", 0));
     return false;
   }
   if (!changed) {
@@ -1234,7 +1272,7 @@ bool SimManager::configureActiveStudy(AppState& st, const nlohmann::json& candid
     loadIdx_ = -1;
   }
   ++parameterSourceGeneration_;
-  markSimDocDirty(st, st.docMirror.docId());
+  st.markHumanEdit(st.docMirror.docId(), result.value("revision", 0));
   return true;
 }
 
@@ -1334,42 +1372,106 @@ void SimManager::drawParameterEditor(AppState& st, Study& s) {
 // ---------------------------------------------------------------- refresh /
 // mirror
 
+void SimManager::ensureStudyList(AppState &st) {
+  if (st.simManager != this || activeMechanicalDocumentKind(st) == CommandDocKind::None ||
+      !st.docMirror.hasDoc() || st.docMirror.revision() < 0)
+    return;
+  const std::string &docId = st.docMirror.docId();
+  const long revision = st.docMirror.revision();
+  if (deferredCreationDocId_ == docId) {
+    const bool canAdopt = !refreshInFlight_ && deferredCreationRevision_ == revision &&
+                          deferredCreationGeneration_ == parameterSourceGeneration_;
+    core::RpcResult deferred;
+    deferred.ok = true;
+    deferred.result = std::move(deferredCreationList_);
+    deferredCreationDocId_.clear();
+    deferredCreationRevision_ = -1;
+    if (canAdopt)
+      receiveStudyList(st, deferred, docId, revision);
+    else
+      markStudiesStale();
+  }
+  if (refreshInFlight_ ||
+      (lastDocId_ == docId && lastRevision_ == revision) ||
+      (listErrorDocId_ == docId && listErrorRevision_ == revision))
+    return;
+  refresh(st);
+}
+
 void SimManager::refresh(AppState &st) {
-  if (!st.docMirror.hasDoc()) {
-    studies_.clear();
-    sel_ = -1;
+  if (st.simManager != this || activeMechanicalDocumentKind(st) == CommandDocKind::None ||
+      !st.docMirror.hasDoc() || st.docMirror.revision() < 0 || refreshInFlight_)
     return;
-  }
-  if (st.rpc.busy())
-    return; // Never wait on the motion solve's serialized worker mutex.
-  nlohmann::json res;
-  std::string err;
-  if (!st.worker.call("sim_study_list", {{"doc_id", st.docMirror.docId()}}, res,
-                      err, 15000) ||
-      !res.is_object() || res.contains("code") ||
-      !res.value("ok", true)) {
-    const std::string detail =
-        res.is_object() ? res.value("message", res.value("error", err))
-                        : (err.empty() ? "invalid response" : err);
+  const std::string docId = st.docMirror.docId();
+  const long revision = (long)st.docMirror.revision();
+  const uint64_t generation = parameterSourceGeneration_;
+  const std::weak_ptr<int> lifetime = rpcLifetime_;
+  refreshInFlight_ = true;
+  refreshDocId_ = docId;
+  st.rpc.call("sim_study_list", {{"doc_id", docId}},
+              [this, &st, docId, revision, generation, lifetime](const core::RpcResult &r) {
+    if (lifetime.expired()) return;
+    refreshInFlight_ = false;
+    refreshDocId_.clear();
+    if (!simOriginActive(st, this, docId) ||
+        activeMechanicalDocumentKind(st) == CommandDocKind::None)
+      return;
+    // Do not replace edits made after the list was requested, or accept an old revision.
+    if (generation != parameterSourceGeneration_ ||
+        revision != (long)st.docMirror.revision()) {
+      markStudiesStale();
+      return;
+    }
+    receiveStudyList(st, r, docId, revision);
+  }, 15000);
+}
+
+void SimManager::refreshNow(AppState &st) {
+  if (!st.docMirror.hasDoc() || st.rpc.busy()) return;
+  core::RpcResult r;
+  r.ok = st.worker.call("sim_study_list", {{"doc_id", st.docMirror.docId()}},
+                        r.result, r.err, 15000);
+  receiveStudyList(st, r, st.docMirror.docId(), (long)st.docMirror.revision());
+}
+
+void SimManager::receiveStudyList(AppState &st, const core::RpcResult &reply,
+                                  const std::string &docId, long revision) {
+  const auto &res = reply.result;
+  const auto &err = reply.err;
+  const auto fail = [&](const std::string &detail) {
     st.addLog("[sim] sim_study_list failed: " + detail);
-    listErrorDocId_ = st.docMirror.docId();
-    listErrorRevision_ = (long)st.docMirror.revision();
+    listErrorDocId_ = docId;
+    listErrorRevision_ = revision;
     listError_ = detail;
+    lastRevision_ = -1;
+  };
+  if (!reply.ok || !res.is_object() || res.contains("code") ||
+      !simJsonBool(res, "ok", true)) {
+    fail(res.is_object() ? simJsonText(res, "message", "error", err)
+                         : (err.empty() ? "invalid response" : err));
     return;
   }
-  listErrorDocId_.clear();
-  listError_.clear();
-  // Preserve the transient (non-persisted) result fields across a refresh by
-  // id.
+  const auto records = res.find("studies");
+  if (records == res.end() || !records->is_array() ||
+      !std::all_of(records->begin(), records->end(),
+                   [](const nlohmann::json &record) { return record.is_object(); })) {
+    fail("The engine returned an invalid study list.");
+    return;
+  }
+  // Capture the live selection at adoption time, not when the asynchronous request was sent.
+  const std::string selectedId = sel_ >= 0 && sel_ < static_cast<int>(studies_.size())
+                                     ? studies_[sel_].id : std::string();
+  const uint32_t previousTypes = studyTypesPresent_;
   std::vector<Study> prev = std::move(studies_);
   studies_.clear();
+  studyTypesPresent_ = 0;
   // Piping / vessel / duct / internal-flow records belong to the Piping panel and
   // hydraulic_circuit records to the Hydraulics panel, not the FEA mirror (studyFromJson would
   // misread them as static studies and persist them back as such).
   std::vector<nlohmann::json> pipingRecords;
   std::vector<nlohmann::json> hydraulicRecords;
-  if (res.contains("studies") && res["studies"].is_array())
-    for (const auto &j : res["studies"]) {
+  try {
+    for (const auto &j : *records) {
       if (j.is_object() &&
           PipingPanel::isPipingStudyType(j.value("type", std::string()))) {
         pipingRecords.push_back(j);
@@ -1459,15 +1561,38 @@ void SimManager::refresh(AppState &st) {
           s.motionPlotBody = p.motionPlotBody;
           break;
         }
+      studyTypesPresent_ |= uint32_t{1} << static_cast<unsigned>(s.type);
       studies_.push_back(std::move(s));
     }
-  lastDocId_ = st.docMirror.docId();
+  } catch (const nlohmann::json::exception &e) {
+    studies_ = std::move(prev);
+    studyTypesPresent_ = previousTypes;
+    fail(std::string("Invalid study record: ") + e.what());
+    return;
+  }
+  listErrorDocId_.clear();
+  listError_.clear();
+  lastDocId_ = docId;
   piping_.setStudies(st, lastDocId_, pipingRecords);
   hydraulic_.setStudies(st, lastDocId_, hydraulicRecords);
-  lastRevision_ = (long)st.docMirror.revision();
+  lastRevision_ = revision;
   ++parameterSourceGeneration_;
-  if (sel_ >= (int)studies_.size())
-    sel_ = studies_.empty() ? -1 : (int)studies_.size() - 1;
+  sel_ = -1;
+  if (!selectedId.empty()) {
+    for (int i = 0; i < static_cast<int>(studies_.size()); ++i)
+      if (studies_[i].id == selectedId) {
+        sel_ = i;
+        break;
+      }
+  }
+  if (sel_ < 0) {
+    node_ = SimNode::Study;
+    loadIdx_ = -1;
+    armedWell_ = -1;
+    panelOpen_ = false;
+    parameterEditorOpen_ = false;
+    runPage_ = RunPageView{};
+  }
 }
 
 void SimManager::persist(AppState &st, Study &s) {
@@ -1506,57 +1631,76 @@ void SimManager::persist(AppState &st, const std::string &docId, Study &s) {
   }
   s.definition = std::move(definition);
   s.typedBaseline = typedStudyJson(s);
-  if (s.type == StudyType::Motion || s.type == StudyType::Topology) {
-    const std::string studyId = s.id;
-    const bool topo = s.type == StudyType::Topology;
-    st.rpc.call("sim_study_edit",
-                {{"doc_id", docId}, {"study_id", studyId}, {"study", studyToJson(s)}},
-                [this, &st, docId, studyId, topo](const core::RpcResult &r) {
-      if (!simDocOpen(st, docId))
-        return;
-      if (!r.ok || !r.result.is_object() || r.result.contains("code") ||
-          !simJsonBool(r.result, "ok", true)) {
-        st.addLog(std::string(topo ? "[topology]" : "[motion]") + " could not save " +
-                  studyId + ": " + simJsonText(r.result, "message", "error", r.err));
-        if (simOriginActive(st, this, docId))
-          st.toast(ui::ToastLevel::Error,
-                   topo ? "Could not save the topology study; retry the edit."
-                        : "Could not save Motion setup; retry the edit.");
-        return;
-      }
-      markSimDocDirty(st, docId);
-    });
-    return;
-  }
-  nlohmann::json res;
-  std::string err;
-  nlohmann::json params = {{"doc_id", docId},
-                           {"study_id", s.id},
-                           {"study", studyToJson(s)}};
-  if (!st.worker.call("sim_study_edit", params, res, err, 15000) ||
-      !res.is_object() || res.contains("code") ||
-      !res.value("ok", true)) {
-    st.addLog("[sim] sim_study_edit failed for " + docId + ": " +
-              (res.is_object()
-                   ? res.value("message", res.value("error", err))
-                   : (err.empty() ? "invalid response" : err)));
-    if (simOriginActive(st, this, docId))
-      st.toast(ui::ToastLevel::Error, "Could not save simulation setup");
-    return;
-  }
-  markSimDocDirty(st, docId);
+  const std::string studyId = s.id;
+  const StudyType type = s.type;
+  const uint64_t generation = parameterSourceGeneration_;
+  const std::weak_ptr<int> lifetime = rpcLifetime_;
+  unsavedStudyEdits_[{docId, studyId}] = generation;
+  const auto key = std::make_pair(docId, studyId);
+  const uint64_t pendingSerial = ++pendingStudySequence_;
+  if (pendingStudyEdits_.find(key) == pendingStudyEdits_.end())
+    st.beginHumanMutation(docId);
+  pendingStudyEdits_[key] = pendingSerial;
+  // Replace only waiting edits, retaining their FIFO position ahead of save/delete actions.
+  // The in-flight definition still completes, followed by the latest drag sample.
+  st.rpc.callCoalesced("sim_study_edit",
+              {{"doc_id", docId}, {"study_id", studyId}, {"study", s.definition}},
+              [this, &st, docId, studyId, type, generation, lifetime, pendingSerial](const core::RpcResult &r) {
+    if (lifetime.expired()) { st.endHumanMutation(docId); return; }
+    const auto pending = pendingStudyEdits_.find({docId, studyId});
+    if (pending != pendingStudyEdits_.end() && pending->second == pendingSerial) {
+      pendingStudyEdits_.erase(pending);
+      st.endHumanMutation(docId);
+    }
+    if (!simDocOpen(st, docId)) return;
+    const bool topo = type == StudyType::Topology;
+    const bool motion = type == StudyType::Motion;
+    if (!r.ok || !r.result.is_object() || r.result.contains("code") ||
+        !simJsonBool(r.result, "ok", true)) {
+      st.addLog(std::string(topo ? "[topology]" : motion ? "[motion]" : "[sim]") +
+                " could not save " + studyId + " for " + docId + ": " +
+                simJsonText(r.result, "message", "error", r.err));
+      if (simOriginActive(st, this, docId))
+        st.toast(ui::ToastLevel::Error,
+                 topo ? "Could not save the topology study; retry the edit."
+                      : motion ? "Could not save Motion setup; retry the edit."
+                               : "Could not save simulation setup");
+      return;
+    }
+    st.markHumanEdit(docId, r.result.value("revision", 0));
+    const auto edit = unsavedStudyEdits_.find({docId, studyId});
+    if (edit != unsavedStudyEdits_.end() && edit->second == generation)
+      unsavedStudyEdits_.erase(edit);
+  }, docId + "|" + studyId,
+     type == StudyType::Motion || type == StudyType::Topology ? 120000 : 15000, 150);
 }
 
-void SimManager::newStudy(AppState &st, StudyType t) {
-  if (st.rpc.interactionBusy()) {
-    st.toast(ui::ToastLevel::Info, "Wait for the current engine request before adding a study.");
+bool SimManager::flushPendingEdits(AppState &st, const std::string &docId) {
+  // Callbacks erase completed entries, so snapshot keys before draining them.
+  std::vector<std::string> keys;
+  for (const auto &edit : unsavedStudyEdits_)
+    if (edit.first.first == docId)
+      keys.push_back(docId + "|" + edit.first.second);
+  for (const auto &key : keys)
+    st.rpc.flushCoalesced("sim_study_edit", key);
+  return std::none_of(unsavedStudyEdits_.begin(), unsavedStudyEdits_.end(),
+                      [&](const auto &edit) { return edit.first.first == docId; });
+}
+
+void SimManager::requestNewStudy(AppState &st, StudyType t) {
+  if (st.simManager != this || activeMechanicalDocumentKind(st) == CommandDocKind::None ||
+      !st.docMirror.hasDoc()) {
+    st.toast(ui::ToastLevel::Warn, "Open a part or assembly before creating a study.");
     return;
   }
-  if (!st.docMirror.hasDoc()) {
-    st.toast(ui::ToastLevel::Warn, "Open a part before creating a study");
+  const std::string docId = st.docMirror.docId();
+  const long revision = st.docMirror.revision();
+  if (!creationDocId_.empty() || refreshInFlight_ || revision < 0 ||
+      lastDocId_ != docId || lastRevision_ != revision ||
+      (listErrorDocId_ == docId && listErrorRevision_ == revision)) {
+    st.toast(ui::ToastLevel::Info, "Wait for the current study list before adding a study.");
     return;
   }
-  refresh(st);
   Study s;
   s.type = t;
   if (t == StudyType::Motion)
@@ -1598,18 +1742,7 @@ void SimManager::newStudy(AppState &st, StudyType t) {
     s.definition["flow"]["n_steps"] = 667;
   }
   if (t == StudyType::Topology) {
-    // A topology study optimizes ONE part's design domain: assemblies (several bodies to
-    // couple) and documents without a solid are refused rather than approximated.
-    if (activeDocIsAssembly(st)) {
-      st.toast(ui::ToastLevel::Warn,
-               "Topology optimization runs on a part's design domain. Open the part.");
-      return;
-    }
-    if (!hasSimulationGeometry(st)) {
-      st.toast(ui::ToastLevel::Warn,
-               "Model a solid design domain before creating a topology study.");
-      return;
-    }
+    // The shared command policy has already checked the active part and its cached solid domain.
     s.topo = nlohmann::json::object();
     s.topo["mesh_order"] = 1;
     nlohmann::json config;
@@ -1623,35 +1756,86 @@ void SimManager::newStudy(AppState &st, StudyType t) {
       s.topo["material"] = partMaterial;
     s.meshOrder = 1;
   }
-  nlohmann::json res;
-  std::string err;
-  nlohmann::json params = {{"doc_id", st.docMirror.docId()},
-                           {"study", studyToJson(s)}};
-  if (!st.worker.call("sim_study_add", params, res, err, 15000) ||
-      !res.is_object() || res.contains("code") ||
-      !res.value("ok", true)) {
-    st.addLog("[sim] sim_study_add failed: " +
-              (res.is_object()
-                   ? res.value("message", res.value("error", err))
-                   : (err.empty() ? "invalid response" : err)));
-    st.toast(ui::ToastLevel::Error, "Could not create simulation study");
-    return;
-  }
-  st.markActiveTabDirty();
-  refresh(st);
-  // Select the newly added study (matched by id).
-  std::string newId = res.value("study_id", std::string());
-  sel_ = -1;
-  for (int i = 0; i < (int)studies_.size(); ++i)
-    if (studies_[i].id == newId) {
-      sel_ = i;
-      break;
+  const uint64_t generation = parameterSourceGeneration_;
+  const uint64_t presentation = studyPresentationGeneration_;
+  const std::string selectedId = activeStudyId();
+  const auto workspace = st.activeWorkspace;
+  const int sidebar = st.revealSimManager ? 1 : st.simSidebarTab;
+  const int leftPane = st.leftPaneTab;
+  const int ribbon = st.ribbonTab;
+  const SimNode selectedNode = node_;
+  const int selectedLoad = loadIdx_;
+  const bool panelOpen = panelOpen_;
+  const bool parameterEditorOpen = parameterEditorOpen_;
+  const std::weak_ptr<int> lifetime = rpcLifetime_;
+  creationDocId_ = docId;
+  st.beginHumanMutation(docId);
+  st.rpc.call("sim_study_add", {{"doc_id", docId}, {"study", studyToJson(s)}},
+              [this, &st, docId, revision, generation, presentation, selectedId,
+               workspace, sidebar, leftPane, ribbon, selectedNode, selectedLoad,
+               panelOpen, parameterEditorOpen, lifetime](const core::RpcResult &reply) {
+    st.endHumanMutation(docId);
+    if (lifetime.expired()) return;
+    const auto &res = reply.result;
+    const bool accepted = reply.ok && res.is_object() && !res.contains("code") &&
+                          simJsonBool(res, "ok", true);
+    if (accepted || !reply.ok)
+      lastRevision_ = -1; // a successful or uncertain write invalidates the old list
+    creationDocId_.clear();
+    if (!simDocOpen(st, docId)) return;
+    if (!accepted) {
+      if (!reply.ok) markStudiesStale();
+      const std::string detail = res.is_object()
+          ? simJsonText(res, "message", "error", reply.err)
+          : (reply.err.empty() ? "invalid response" : reply.err);
+      st.addLog("[sim] sim_study_add failed: " + detail);
+      st.toast(ui::ToastLevel::Error, "Could not confirm creation of the simulation study.");
+      return;
     }
-  if (sel_ < 0 && !studies_.empty())
-    sel_ = (int)studies_.size() - 1;
-  node_ = SimNode::Study;
-  armedWell_ = -1;
-  st.leftPaneTab = AppState::LP_Simulation;
+    st.markHumanEdit(docId, res.value("revision", 0));
+    const auto id = res.find("study_id");
+    const auto records = res.find("studies");
+    if (id == res.end() || !id->is_string() || id->get_ref<const std::string &>().empty() ||
+        records == res.end() || !records->is_array() ||
+        std::none_of(records->begin(), records->end(), [&](const nlohmann::json &record) {
+          const auto entryId = record.is_object() ? record.find("id") : record.end();
+          return entryId != record.end() && entryId->is_string() && *entryId == *id;
+        })) {
+      markStudiesStale();
+      st.addLog("[sim] sim_study_add returned no selectable study in its list.");
+      st.toast(ui::ToastLevel::Warn, "Study creation returned an incomplete list; refreshing.");
+      return;
+    }
+    const std::string newId = id->get<std::string>();
+    const bool originActive = simOriginActive(st, this, docId) &&
+        activeMechanicalDocumentKind(st) != CommandDocKind::None;
+    const bool canAdopt = originActive && st.docMirror.revision() == revision &&
+                          parameterSourceGeneration_ == generation && !refreshInFlight_;
+    if (!canAdopt) {
+      deferredCreationDocId_ = docId;
+      deferredCreationRevision_ = revision;
+      deferredCreationGeneration_ = generation;
+      deferredCreationList_ = res;
+      return;
+    }
+    const bool present = studyPresentationGeneration_ == presentation &&
+        activeStudyId() == selectedId && st.activeWorkspace == workspace &&
+        st.simSidebarTab == sidebar && st.leftPaneTab == leftPane && st.ribbonTab == ribbon &&
+        node_ == selectedNode && loadIdx_ == selectedLoad && panelOpen_ == panelOpen &&
+        parameterEditorOpen_ == parameterEditorOpen;
+    receiveStudyList(st, reply, docId, revision);
+    if (lastRevision_ != revision) {
+      st.toast(ui::ToastLevel::Warn, "The study was created, but its list could not be loaded.");
+      return;
+    }
+    if (present && selectStudyById(st, newId)) {
+      st.activeWorkspace = AppState::Workspace::Simulate;
+      st.revealSimManager = true;
+      panelOpen_ = true;
+      parameterEditorOpen_ = false;
+      runPage_ = RunPageView{};
+    }
+  }, 15000);
 }
 
 void SimManager::deleteStudy(AppState &st, int i) {
@@ -1661,8 +1845,10 @@ void SimManager::deleteStudy(AppState &st, int i) {
   if (studies_[i].type == StudyType::Motion) {
     const std::string docId = st.docMirror.docId();
     invalidateMotion(studies_[i]);
+    st.beginHumanMutation(docId);
     st.rpc.call("sim_study_delete", {{"doc_id", docId}, {"study_id", id}},
                 [this, &st, docId, id](const core::RpcResult &r) {
+      st.endHumanMutation(docId);
       if (!simDocOpen(st, docId))
         return;
       if (!r.ok || !r.result.is_object() || r.result.contains("code") ||
@@ -1673,11 +1859,15 @@ void SimManager::deleteStudy(AppState &st, int i) {
           st.toast(ui::ToastLevel::Error, "Could not delete Motion study; retry.");
         return;
       }
+      unsavedStudyEdits_.erase({docId, id});
       const std::string selectedId = sel_ >= 0 && sel_ < static_cast<int>(studies_.size())
                                          ? studies_[sel_].id : std::string();
       studies_.erase(std::remove_if(studies_.begin(), studies_.end(),
                                     [&](const Study &study) { return study.id == id; }),
                      studies_.end());
+      if (std::none_of(studies_.begin(), studies_.end(),
+                       [](const Study &study) { return study.type == StudyType::Motion; }))
+        studyTypesPresent_ &= ~(uint32_t{1} << static_cast<unsigned>(StudyType::Motion));
       const auto selected = std::find_if(studies_.begin(), studies_.end(),
                                          [&](const Study &study) { return study.id == selectedId; });
       if (selected == studies_.end()) {
@@ -1688,7 +1878,7 @@ void SimManager::deleteStudy(AppState &st, int i) {
       else {
         sel_ = static_cast<int>(std::distance(studies_.begin(), selected));
       }
-      markSimDocDirty(st, docId);
+      st.markHumanEdit(docId, r.result.value("revision", 0));
     });
     return;
   }
@@ -1710,11 +1900,12 @@ void SimManager::deleteStudy(AppState &st, int i) {
     st.toast(ui::ToastLevel::Error, "Could not delete simulation study");
     return;
   }
-  st.markActiveTabDirty();
+  unsavedStudyEdits_.erase({st.docMirror.docId(), id});
+  st.markHumanEdit(st.docMirror.docId(), res.value("revision", 0));
   if (resultShown_) restoreModelMesh(st);
   else clearResultOverlay(st);
   armedWell_ = -1;
-  refresh(st);
+  refreshNow(st);
   if (sel_ >= (int)studies_.size())
     sel_ = studies_.empty() ? -1 : (int)studies_.size() - 1;
   node_ = SimNode::Study;
@@ -1724,6 +1915,20 @@ void SimManager::deleteStudy(AppState &st, int i) {
 // commands
 
 bool SimManager::handleCommand(AppState &st, const std::string &cmdId) {
+  const bool flowActivation = cmdId == "sim_new_picker" || cmdId == "sim_new_flow" ||
+      cmdId == "sim_new_thermal" || cmdId == "sim_fluid" || cmdId == "sim_flow_bc" ||
+      cmdId == "sim_flow_res" || cmdId == "sim_run";
+  const bool capabilityChanged = flowActivation && refreshThermalCfdCapability(st);
+  if (capabilityChanged || !commandDispatchChecked(st, cmdId.c_str())) {
+    const CommandAvailability availability = commandAvailability(cmdId.c_str(), commandContext(st));
+    if (!availability.visible || !availability.enabled) {
+      if (availability.reason)
+        st.toast(ui::ToastLevel::Warn, availability.reason);
+      return true;
+    }
+  }
+  if (!creationDocId_.empty())
+    ++studyPresentationGeneration_;
   if (cmdId == "sim_firmware_setup" || cmdId == "sim_board_thermal_setup") {
     st.activeWorkspace = AppState::Workspace::Simulate;
     st.leftPaneTab = AppState::LP_Simulation;
@@ -1779,7 +1984,7 @@ bool SimManager::handleCommand(AppState &st, const std::string &cmdId) {
     panelOpen_ = false;
     armedWell_ = -1;
     hydraulic_.close();
-    refresh(st);
+    refreshNow(st);
     return piping_.handleCommand(st, cmdId);
   }
   // Hydraulics tab: the Hydraulics panel takes over the pane the same way (its records are this
@@ -1792,7 +1997,7 @@ bool SimManager::handleCommand(AppState &st, const std::string &cmdId) {
     panelOpen_ = false;
     armedWell_ = -1;
     piping_.close();
-    refresh(st);
+    refreshNow(st);
     return hydraulic_.handleCommand(st, cmdId);
   }
   // Any other sim tool means the user left the Piping / Hydraulics panels.
@@ -1807,8 +2012,7 @@ bool SimManager::handleCommand(AppState &st, const std::string &cmdId) {
     openNewStudyPicker();
     return true;
   }
-  // EM (electromagnetics) tab: every sim_em_* command is gated on the em_*
-  // backend probe.
+  // EM setup stays available offline; the shared policy gates Run when the probe is missing.
   if (cmdId.rfind("sim_em_", 0) == 0)
     return handleEmCommand(st, cmdId);
   // Any non-EM sim tool means the user left the EM analysis — yield the pane
@@ -1817,51 +2021,26 @@ bool SimManager::handleCommand(AppState &st, const std::string &cmdId) {
   // opens.)
   emPanelOpen_ = false;
 
-  // sim-gui rework: creating a study opens its setup panel (PM-style, left
-  // pane) immediately.
-  auto newAndOpen = [&](StudyType t) {
-    newStudy(st, t);
-    if (sel_ >= 0) {
-      node_ = SimNode::Study;
-      panelOpen_ = true;
-      // A fresh study opens on its guided setup; the advanced editor stays folded.
-      parameterEditorOpen_ = false;
-    }
-    return true;
+  // Study creation is asynchronous; only its accepted returned ID may open a setup panel.
+  static const std::pair<const char *, StudyType> kNewStudies[] = {
+      {"sim_new_static", StudyType::Static}, {"sim_new_modal", StudyType::Modal},
+      {"sim_new_flow", StudyType::Flow}, {"sim_new_thermal", StudyType::Thermal},
+      {"sim_new_fatigue", StudyType::Fatigue}, {"sim_new_motion", StudyType::Motion},
+      {"sim_new_thermal_fea", StudyType::ThermalFea}, {"sim_new_buckling", StudyType::Buckling},
+      {"sim_new_contact", StudyType::Contact}, {"sim_new_freqresp", StudyType::FreqResponse},
   };
-  if (cmdId == "sim_new_static")
-    return newAndOpen(StudyType::Static);
-  if (cmdId == "sim_new_modal")
-    return newAndOpen(StudyType::Modal);
-  if (cmdId == "sim_new_flow")
-    return newAndOpen(StudyType::Flow);
-  if (cmdId == "sim_new_thermal")
-    return newAndOpen(StudyType::Thermal);
-  if (cmdId == "sim_new_fatigue")
-    return newAndOpen(StudyType::Fatigue);
-  if (cmdId == "sim_new_motion")
-    return newAndOpen(StudyType::Motion);
-  if (cmdId == "sim_new_thermal_fea")
-    return newAndOpen(StudyType::ThermalFea);
-  if (cmdId == "sim_new_buckling")
-    return newAndOpen(StudyType::Buckling);
-  if (cmdId == "sim_new_contact")
-    return newAndOpen(StudyType::Contact);
-  if (cmdId == "sim_new_freqresp")
-    return newAndOpen(StudyType::FreqResponse);
+  for (const auto &entry : kNewStudies) {
+    if (cmdId == entry.first) {
+      requestNewStudy(st, entry.second);
+      return true;
+    }
+  }
   if (cmdId == "sim_new_topology") {
     st.activeWorkspace = AppState::Workspace::Simulate;
     st.leftPaneTab = AppState::LP_Simulation;
     st.showRibbon = true;
     st.ribbonTab = kRibbonTabTopology;
-    if (topoCaps_.state == topology::Capabilities::State::Unavailable) {
-      st.toast(ui::ToastLevel::Warn, topoCaps_.error);
-      return true;
-    }
-    newAndOpen(StudyType::Topology); // before the probe: newStudy refuses while rpc is busy
-    if (sel_ >= 0 && sel_ < (int)studies_.size() &&
-        studies_[sel_].type == StudyType::Topology)
-      syncTopologyViews(studies_[sel_]);
+    requestNewStudy(st, StudyType::Topology);
     probeTopologyCaps(st);
     return true;
   }
@@ -1871,7 +2050,7 @@ bool SimManager::handleCommand(AppState &st, const std::string &cmdId) {
   // node in the Simulate workspace, where playback drives the viewport; only when the
   // document has none does it create one, exactly like "New Study" on the Motion tab.
   if (cmdId == "sim_motion_study") {
-    if (!activeDocIsAssembly(st)) {
+    if (activeMechanicalDocumentKind(st) != CommandDocKind::Assembly) {
       st.toast(ui::ToastLevel::Warn,
                "Motion studies drive assembly mates. Open an assembly first.");
       return true;
@@ -1881,21 +2060,24 @@ bool SimManager::handleCommand(AppState &st, const std::string &cmdId) {
     st.revealSimManager = true;
     st.showRibbon = true;
     st.ribbonTab = kRibbonTabMotion;
-    refresh(st);
-    if (!selectStudyOfType(StudyType::Motion))
-      return newAndOpen(StudyType::Motion);
+    if (!selectStudyOfType(StudyType::Motion)) {
+      requestNewStudy(st, StudyType::Motion);
+      return true;
+    }
     node_ = SimNode::Results;
     loadIdx_ = -1;
     armedWell_ = -1;
     panelOpen_ = true;
     return true;
   }
-  refresh(st);
 
   // Navigate the study pane to a setup page with the command's card scrolled into view (UI
   // standard decision 5): the editor opens on the Setup step (never a stale Run page).
   auto openSetup = [&](SimNode n, const char *focus) {
     st.leftPaneTab = AppState::LP_Simulation;
+    // Simulate's rail uses simSidebarTab, not leftPaneTab; show this explicitly
+    // requested setup even when Explorer was previously selected.
+    st.revealSimManager = true;
     node_ = n;
     if (n == SimNode::Load && sel_ >= 0 && sel_ < (int)studies_.size()) {
       const int nl = (int)studies_[sel_].loads.size();
@@ -1942,9 +2124,14 @@ bool SimManager::handleCommand(AppState &st, const std::string &cmdId) {
   for (const auto &tc : kTypedSetup) {
     if (cmdId != tc.id)
       continue;
-    const bool flowFamilySel = isFlowFamily(tc.t) && selIs(StudyType::Thermal);
-    if (!flowFamilySel && !selectStudyOfType(tc.t))
+    if (isFlowFamily(tc.t)) {
+      // The flow pages are shared by both CFD kinds; prefer the selected Thermal study.
+      if (!selIs(StudyType::Thermal) && !selectStudyOfType(StudyType::Flow) &&
+          !selectStudyOfType(StudyType::Thermal))
+        return needStudy(tc.t);
+    } else if (!selectStudyOfType(tc.t)) {
       return needStudy(tc.t);
+    }
     armedWell_ = -1;
     openSetup(tc.node, tc.focus);
     return true;
@@ -2258,12 +2445,15 @@ bool SimManager::takeFocus(const char *cardId) {
 }
 
 void SimManager::syncPaneContext(AppState &st) {
+  ensureStudyList(st);
+  // A capability probe that encountered a running job gets exactly one retry after the
+  // cached running state clears; no capability query is made on intervening frames.
+  if (thermalCfdAwaitingIdle_ && st.simClient && !st.simClient->job().running.load())
+    refreshThermalCfdCapability(st);
   const bool takeover = emPanelOpen_ || elPanelOpen_ || fwPanelOpen_ || handoffPanelOpen_ ||
                         piping_.isOpen() || hydraulic_.isOpen();
   const bool haveSel = sel_ >= 0 && sel_ < (int)studies_.size();
   const bool simWs = st.activeWorkspace == AppState::Workspace::Simulate;
-  // The ribbon greys the study commands that do not apply to the selected kind.
-  setRibbonStudyContext(haveSel && !takeover ? studyTypeKey(studies_[sel_].type) : "");
   // The Results page shows the result (or its empty state), never a setup-time mesh wireframe.
   if (node_ == SimNode::Results && !meshPreviewPending_ && !meshPreviewStudyId_.empty())
     clearMeshPreview();
@@ -2322,10 +2512,6 @@ void SimManager::configureActive(AppState &st, float density,
                                  const std::string &materialKey) {
   if (sel_ < 0 || sel_ >= (int)studies_.size())
     return;
-  if (!materialKey.empty() && st.docLockedByAgent(st.docMirror.docId())) {
-    st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
-    return;
-  }
   studies_[sel_].meshFineness =
       density; // density and fineness share the higher=finer sense
   if (!materialKey.empty() && !applyPartMaterial(st, studies_[sel_], materialKey))
@@ -2336,11 +2522,14 @@ void SimManager::configureActive(AppState &st, float density,
 bool SimManager::selectStudyById(AppState &st, const std::string &id) {
   for (int i = 0; i < (int)studies_.size(); ++i)
     if (studies_[i].id == id) {
+      if (!creationDocId_.empty()) ++studyPresentationGeneration_;
       sel_ = i;
       node_ = SimNode::Study;
       loadIdx_ = -1;
       armedWell_ = -1;
       st.leftPaneTab = AppState::LP_Simulation;
+      if (isFlowFamily(studies_[i].type))
+        refreshThermalCfdCapability(st);
       if (studies_[i].type == StudyType::Topology)
         syncTopologyViews(studies_[i]);
       return true;
@@ -2365,9 +2554,31 @@ std::string SimManager::activeStudyId() const {
 // work goes through st.rpc (callbacks drain on the GL thread) or the SimClient
 // job — never a sync worker.call in a draw path.
 
+bool SimManager::refreshThermalCfdCapability(AppState &st) {
+  if (thermalCfdCapabilityKnown_ || !st.simClient)
+    return false;
+  if (st.simClient->job().running.load()) {
+    thermalCfdAwaitingIdle_ = true;
+    return false;
+  }
+  thermalCfdAwaitingIdle_ = false;
+  // caps() may initialize the backend; this helper is called only for an explicit activation,
+  // the existing one-shot probe, or the end of a previously observed running job.
+  const nlohmann::json flowCaps = st.simClient->caps();
+  const auto openfoam = flowCaps.find("openfoam");
+  if (openfoam == flowCaps.end() || !openfoam->is_boolean()) {
+    thermalCfdAwaitingIdle_ = st.simClient->job().running.load();
+    return false;
+  }
+  thermalCfdCapabilityKnown_ = true;
+  thermalCfdCapabilityAvailable_ = openfoam->get<bool>();
+  return true;
+}
+
 void SimManager::probeCaps(AppState &st) {
   if (capsStatus_ != 0 || capsInflight_)
     return;
+  refreshThermalCfdCapability(st);
   capsInflight_ = true;
   st.rpc.call(
       "sim_caps", nlohmann::json::object(),

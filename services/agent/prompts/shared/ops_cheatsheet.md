@@ -36,13 +36,13 @@ approximate a curved or organic body with a stack of boxes.
   - A plain rectangular/cylindrical block            -> a primitive (box/cylinder) is fine.
 Use a raw `script` feature ONLY when no combination of the features below can express the geometry.
 
-READ THE RESULT — add_feature's response carries a `changes` summary ("added 2 faces
-(+2 cylinder); 2 new bore/hole(s); volume 24000→23435; part bbox 60x40x20 mm"), or
-"no geometry change", or "volume effectively UNCHANGED ... too small to be real material",
-or an "ENGINE WARNING:" prefix naming exactly what the kernel objected to. `changes.bbox_mm`
-is the whole part's overall size — check it against the size you were asked for instead of
-spending a measure_part call. Read all of this before building the next feature on the
-mutation instead of assuming the op did what you meant.
+READ THE RESULT — inspect `changes`, feature status and warnings before building on a mutation.
+Display-derived volume and its delta are approximate; a delta is omitted when no revision-correct
+baseline exists. `bore_faces_delta` counts cylindrical bore faces, not physical holes.
+`body_count` counts physical solids; `logical_member_count` counts compiled logical members.
+`changes.bbox_mm` is the whole part's overall size. Use measure_part for B-rep mass properties
+under `result["mass"]`, including `volume_mm3` and `mass_g`; verify critical geometry.
+Overlap warnings compare raw pre-boolean tools, not measured material removed or added.
 
 ----------------------------------------------------------------- ADD geometry (op "add_feature")
 
@@ -57,7 +57,8 @@ PRIMITIVES — box/cylinder/sphere/cone/torus. Centered on the origin by default
 
 SKETCH + a 2D-profile feature — this is how you make anything that is not a bare primitive.
   1) add_feature type "sketch", refs.plane = "plane.top" | "plane.front" | "plane.right"
-     (canonical names). plane.top = XY (+Z up), plane.front = XZ, plane.right = YZ.
+     (canonical names). XY, XZ, YZ are accepted aliases and normalize respectively to
+     plane.top (+Z up), plane.front and plane.right.
      SKETCH ON AN EXISTING FACE: set refs.plane to a face QUERY — e.g. {"of":"face","side":
      "top"} ("sketch on the top face"). Your 2D origin (0,0) is then the CENTRE of that face,
      so draw relative to it — no need to know its world height. Optional `offset`:<mm> lifts
@@ -82,8 +83,10 @@ SKETCH + a 2D-profile feature — this is how you make anything that is not a ba
      {"id":"c2","type":"radius","refs":["e1"],"value":{"value":8,"expr":null}}.
      Use unique eN/cN ids. Symmetric profiles use a construction centerline or axis.v;
      dimension only independent half-sizes/spacing. Use real tangent arcs/lines for slots,
-     not faceted polylines/splines. Require check_sketch: closed, dof == 0, not pinned_only,
-     no conflicts/skipped constraints. Never blanket-fix authored profiles.
+     not faceted polylines/splines. Require check_sketch: dof == 0, not pinned_only,
+     no conflicts/skipped constraints. Close profiles for features that require regions, but
+     leave intentional rib and sweep paths open; revolve can auto-close a profile to its axis.
+     Never blanket-fix authored profiles or delete a partially dependent constraint wholesale.
      add_features defaults auto_define:true after explicit intent. Staged work opts out
      with call auto_define:false or auto_define:false on feature/params/authoring op.
      Then explicitly define before use; initial entity coordinates are not constraints.
@@ -91,6 +94,10 @@ SKETCH + a 2D-profile feature — this is how you make anything that is not a ba
      EXTRUDE  params {mode:"boss"|"cut", end:"blind"|"through_all", depth:<mm>},
               refs.profile = [{"kind":"region","sketch":"$<idx>"|"f<id>","centroid":[x,y],"hint_index":0}]
               (extrudes/cuts ALL the sketch's regions).
+              A blind cut starts along the sketch normal; set params.flip:true to reverse it.
+              For a simple blind cut with no explicit direction or flip, the engine tries
+              the opposite direction only when the first removes NO material. A wrong-side
+              cut that intersects material does not auto-correct. Inspect the result.
      REVOLVE  params {mode, angle:{value:360,...}}, refs.profile = [region],
               refs.axis = an axis datum {"kind":"datum","feature":"axis.x"|"axis.y"|"axis.z"}
               (or a sketch line edge). The profile must lie OUTSIDE / beside the axis (offset it).
@@ -104,9 +111,9 @@ needed), same vocabulary for faces AND edges. INSPECT before you ACT: when you c
 geometry with certainty, call query_geometry FIRST and build the pick from what it returns
 rather than guessing a filter. You never need a face number, an edge number, or a coordinate.
   fillet  params {radius} refs.edges = {"of":"edge", ...}
-          VARIABLE-RADIUS: add params.radius2 — a linear taper r→r2 along each edge (requires
-          explicit edge picks, not a direction filter). e.g. r=3, radius2=1 tapers each selected
-          edge from 3mm to 1mm.
+          VARIABLE-RADIUS: params {type:"variable", radius:r, radius2:r2} assigns the edge
+          START/END radii along OCCT's contour interpolation, not a guaranteed linear taper.
+          refs.edges accepts selectors or queries, including {"of":"edge","parallel":"z"}.
   chamfer params {length} refs.edges = {...}
           ASYMMETRIC: add params.length2 — leg d1=length on one incident face, d2=length2 on the
           other (requires explicit edge picks). e.g. length=2, length2=0.5.
@@ -160,8 +167,8 @@ itself; use it as refs.path of a SWEEP to make a spring, coil, or thread.
    "refs":{"base":"plane.top"}}
 
 RIB — thin support web grown from an open sketch contour (type "rib"). The sketch must contain
-  an OPEN line/arc/spline that bridges the body. The engine drops the contour inward toward the
-  body centroid, thickens it by `thickness`, trims it to the body bbox, and fuses it.
+  an OPEN line/arc/spline that bridges the body. The engine considers both drop directions
+  against actual support; ambiguous, detached, unbounded or ineffective webs are refused.
   refs.profile = [region selector pointing at the open contour sketch]. Optional params.thickness
   (default 3mm). The sketch plane is typically a side face or datum plane; the rib web grows
   perpendicular to that plane.
@@ -219,6 +226,12 @@ for the common machining features; they take a face in plain words and need no p
           world_center?:[x,y,z]}. refs.face = a face query (defaults to the top face); the ring
           is centred on the face centre, or on world_center (a point on the ring's axis). e.g. 6×⌀5 on a 40mm circle:
           {"type":"bolt_circle","params":{"diameter":5,"count":6,"pcd":40},"refs":{"face":{"of":"face","side":"top"}}}
+  thread — real helical cut or raised ridge on refs.target_face (a cylindrical face). Use
+          size or both major_dia + pitch; omit length for the full run. `turns` caps swept
+          turns (default 24, including end extensions); insufficient cap or failed real
+          geometry rejects the operation, never silently shortens it or switches to cosmetic.
+          Explicit cosmetic makes no physical thread; preview/draft is provisional only.
+          Detail: cheatsheets/thread.
   rib    — a thin web from an open sketch profile. refs.profile = [region]. (See sheet if present.)
   standard_part — a catalog HARDWARE part expanded into normal editable tree features (same
           generators as parts_make). PREFER over hand-modeling stock hardware. params {family
@@ -234,8 +247,9 @@ its own detailed cheatsheet; the essentials to invoke them:
     [region], makes the flat base AND marks the part as sheet metal; then bend walls off its straight
     top-rim edges with sm_edge_flange {length,angle} / sm_hem {hem_type} / sm_jog {offset,angle}, each
     refs.edge = ONE straight edge on a thickness face — query_geometry({"of":"edge","surf":"line",
-    "near":[x,y,z],"count":1}) FIRST and pass the RESOLVED match back (this slot rejects a bare query);
-    sm_flat_pattern unfolds the developed blank. Detail: cheatsheets/sheetmetal.
+    "near":[x,y,z],"count":1}) FIRST and pass the RESOLVED match back (this slot rejects a bare query).
+    Model reliefs with editable through-cuts; add sm_flat_pattern before export_flat_dxf for
+    OUTLINE/BEND/CUTS layers. Detail: cad_guide("sheetmetal") and cad_guide("sm_relief").
   WELDMENTS (weld_*) — a frame of stock members. Sketch the centerline PATH, then weld_member
     {profile, +per-profile dims, joint:"miter"|"butt"|"cope"} -> ONE member body per path segment.
     profiles: square_tube/rect_tube/round_tube/angle_L/flat_bar/c_channel/i_beam/t_section. ! refs.sketch
@@ -349,7 +363,8 @@ sketch_convert      {"op":"sketch_convert","sketch":"f1","refs":[{"kind":"edge",
                     Then use e.g. coincident refs:["e1.p1","$<convert-index>.p"] for a vertex.
 
 sketch_fillet       {"op":"sketch_fillet","sketch":"f1","e1":"e1","e2":"e2","radius":2}
-                    Line-line corners only; trims lines, adds true arc and tangent relations.
+                    Line-line corners only; trims lines, adds a tangent arc with a driving
+                    radius. Conflicting requested radii reject atomically.
 sketch_trim         {"op":"sketch_trim","sketch":"f1","entity":"e3","point":[10,4],"keep_construction":true}
                     Remove the span under point; optionally retain it as construction.
 sketch_mirror_entities {"op":"sketch_mirror_entities","sketch":"f1","entities":["e1"],"line":"e9"}
@@ -381,8 +396,9 @@ B — a 60x40 plate 6mm thick with four 3mm corner holes (sketch circles + extru
  {"op":"add_feature","feature":{"type":"extrude","name":"Drill","params":{"mode":"cut","end":"through_all"},"refs":{"profile":"$1"}}}
 ]
 
-C — a vase as a SOLID OF REVOLUTION. The half-profile must be a CLOSED region: the curved outer
-wall (a spline) plus a straight line back down the Z axis to close it. Revolve 360 about Z:
+C — a vase as a SOLID OF REVOLUTION. This example explicitly closes the curved outer
+wall (a spline) with a straight line down the Z axis; a suitable open profile can also
+auto-close to the axis. Revolve 360 about Z:
 [
  {"op":"add_feature","feature":{"type":"sketch","name":"Profile","refs":{"plane":"plane.front"},"params":{"entities":[{"id":"e1","type":"spline","points":[[0,0],[15,0],[18,20],[10,45],[12,60],[0,60]]},{"id":"e2","type":"line","p1":[0,60],"p2":[0,0]}],"constraints":[{"id":"c1","type":"coincident","refs":["e1.start","e2.p2"]},{"id":"c2","type":"coincident","refs":["e1.end","e2.p1"]},{"id":"c3","type":"coincident","refs":["e2.p2","origin"]},{"id":"c4","type":"vertical","refs":["e2"]},{"id":"c5","type":"length","refs":["e2"],"value":{"value":60,"expr":null}}]}}},
  {"op":"sketch_fully_define","sketch":"$0"},

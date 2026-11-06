@@ -36,6 +36,8 @@ from __future__ import annotations
 
 import math
 import os
+import json
+import tempfile
 from collections import defaultdict
 from typing import Optional, Union
 
@@ -1101,10 +1103,81 @@ def _plane_hint_block(hints: Optional[dict]) -> tuple:
                            "z": round(spans["z"][1] - spans["z"][0], 4)}}, None
 
 
+_UNCLAIMED_EXAMPLE_LIMIT = 100
+
+
+def _recognition_evidence(unclaimed: list) -> dict:
+    """Store the complete face records in actor-owned storage, return bounded examples."""
+    from services.mcp.reveng_common import _reveng_dir
+
+    directory = _reveng_dir() / "recognition"
+    directory.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix="unclaimed-",
+                                     suffix=".json", dir=directory, delete=False) as stream:
+        json.dump(unclaimed, stream)
+        path = stream.name
+    return {"unclaimed": unclaimed[:_UNCLAIMED_EXAMPLE_LIMIT],
+            "unclaimed_count": len(unclaimed), "unclaimed_path": path}
+
+
 # ---------------------------------------------------------------- registration
+
+def attach_reference(session_id: str, doc_id: str, name: Optional[str] = None,
+                     approximate: bool = False) -> dict:
+    """Attach a session surface, applying its reconstruction transform exactly once."""
+    from services.mcp.reveng_common import _load_session
+    from services.mcp.cad_reference_tools import add_reference
+    from services.vision.recon_transform import ReconTransform
+
+    session = _load_session(session_id)
+    if session is None:
+        return {"ok": False, "reason": "session_not_found"}
+    artifacts = session.get("artifacts") or {}
+    path = artifacts.get("mesh_path")
+    if not path:
+        return {"ok": False, "reason": "no_mesh"}
+    data = session.get("recon_transform")
+    transform = ReconTransform.from_json(data) if data else ReconTransform.identity()
+    if not transform.confirmed and not approximate:
+        return {"ok": False, "reason": "scale_unconfirmed",
+                "hint": "Confirm the scale, or set approximate=True for an explicitly approximate reference."}
+    is_approximate = approximate or not transform.confirmed or bool(
+        (session.get("honesty") or {}).get("approximate"))
+    label = name or "Scan reference"
+    if is_approximate and "approximate" not in label.lower():
+        label = f"{label} (approximate)"
+    placement = ReconTransform.identity() if artifacts.get("mesh_transform_applied") else transform
+    pose = {key: getattr(placement, key) for key in ("mm_per_unit", "rotation", "translation_mm")}
+    return add_reference(doc_id, path, name=label, transform=pose,
+                         approximate=is_approximate,
+                         provenance={"reveng_session": session_id, "method": transform.source},
+                         authorize=False)
+
 
 def register_recon_tools(mcp: FastMCP) -> None:
     """Attach the reverse-engineering tools to the FastMCP server."""
+
+    @mcp.tool()
+    def reveng_attach_reference(session_id: str, doc_id: str, name: Optional[str] = None,
+                                approximate: bool = False) -> str:
+        """Embed a reconstruction in an existing part, requiring confirmed scale unless approximate."""
+        try:
+            return _dumps(attach_reference(session_id, doc_id, name, approximate))
+        except Exception as exc:
+            return _err(exc)
+
+    @mcp.tool()
+    def measure_mesh_reference(doc_id: str, id: str, n_samples: int = 20000,
+                               alignment: str = "world") -> str:
+        """Measure sampled deviation from a mesh reference to the part's B-rep in mm."""
+        try:
+            from services.vision.deviation import compute_deviation
+            doc = _doc(doc_id)
+            return _dumps(compute_deviation(None, brep_doc_id=doc, mesh_ref_doc_id=doc,
+                                            query_mesh_ref_id=id, n_samples=n_samples,
+                                            alignment=alignment))
+        except Exception as exc:
+            return _err(exc)
 
     @mcp.tool()
     def reverse_engineer(source: str, name: Optional[str] = None,
@@ -1127,7 +1200,10 @@ def register_recon_tools(mcp: FastMCP) -> None:
                  only improve or be reverted, never regress the match. Fits are accepted on
                  FIT QUALITY (`residual_mm`, `inliers`), not on `confidence` — segment_fit
                  computes that as a mesh-share ratio. Omitting hints leaves the pipeline
-                 byte-for-byte unchanged.
+                 byte-for-byte unchanged. New fit documents also report `approximate`, units,
+                 calibration provenance, per-primitive residuals and uncertainty. An
+                 approximate fit or one in reconstruction units is not evidence of metric
+                 accuracy; obtain a confirmed scale before relying on any rebuilt dimension.
 
         Pipeline: import -> deterministic recognition (prismatic/turned base, holes, patterns,
         fillet/chamfer candidates) -> rebuild in batches (base -> holes -> patterns -> dress-
@@ -1147,6 +1223,9 @@ def register_recon_tools(mcp: FastMCP) -> None:
         """
         try:
             notes: list = []
+            if isinstance(hints, dict) and hints.get("approximate"):
+                notes.append("Approximate, unconfirmed-scale fits supplied: reconstructed "
+                             "dimensions are not verified metric measurements.")
             src = source.strip()
             path = src
             is_mesh_src = False
@@ -1640,17 +1719,19 @@ def register_recon_tools(mcp: FastMCP) -> None:
                                                "(see rejected)"})
 
             # ---------------- final verification + report
-            if applied:
+            has_body = bool(applied) and bool(
+                cb.call("asm_world_bodies", {"doc_id": new_doc, "explode": False}).get("bodies"))
+            if has_body:
                 try:
                     final = _compare(ref_doc, new_doc)
                 except Exception as e:  # noqa: BLE001
                     final = {"match_pct": None, "summary": f"final compare failed: {e}"}
             else:
-                # Nothing was rebuilt (e.g. faceted mesh input): an honest 0, not a
-                # confusing compare-against-an-empty-doc error.
-                final = {"match_pct": 0.0,
-                         "summary": "no features rebuilt — the deterministic passes claimed "
-                                    "nothing; see recognition.unclaimed"}
+                final = {"match_pct": None, "summary": (
+                    "rebuilt features produced no bodies; see recognition.unclaimed"
+                    if applied else
+                    "no features rebuilt — the deterministic passes claimed nothing; "
+                    "see recognition.unclaimed")}
             match_pct = final.get("match_pct")
             unexplained = {"missing_mm3": final.get("missing_mm3"),
                            "extra_mm3": final.get("extra_mm3"),
@@ -1667,15 +1748,20 @@ def register_recon_tools(mcp: FastMCP) -> None:
             if plan["unclaimed"]:
                 steps.append("hover(sid) the `recognition.unclaimed` faces on the SOURCE doc "
                              "to understand what geometry the passes could not explain")
-            steps.append("edit any recovered feature's params with add_features "
-                         "(edit_feature) — the tree recompiles parametrically; verify edits "
-                         "with compare_parts(ref, rebuilt)")
-
-            _CUR["doc_id"] = new_doc
-            try:
-                _publish_current(new_doc)
-            except Exception:  # noqa: BLE001
-                pass
+            if has_body:
+                steps.append("edit any recovered feature's params with add_features "
+                             "(edit_feature) — the tree recompiles parametrically; verify edits "
+                             "with compare_parts(ref, rebuilt)")
+                _CUR["doc_id"] = new_doc
+                try:
+                    _publish_current(new_doc)
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                try:
+                    cb.call("doc_close", {"doc_id": new_doc})
+                except Exception as exc:  # noqa: BLE001
+                    notes.append(f"could not close empty rebuild document: {exc}")
 
             # Re-order candidates by ranker score (flag-gated, default OFF)
             _bbox = plan.get("bbox_mm") or [1.0, 1.0, 1.0]
@@ -1683,8 +1769,9 @@ def register_recon_tools(mcp: FastMCP) -> None:
             candidates = _reorder_candidates(candidates, ref_faces, _diag)
 
             return _dumps({
-                "ok": True,
-                "doc_id": new_doc,
+                "ok": has_body,
+                **({} if has_body else {"reason": "no_features_rebuilt"}),
+                "doc_id": new_doc if has_body else None,
                 "ref_doc_id": ref_doc,
                 "match_pct": round(match_pct, 3) if match_pct is not None else None,
                 "summary": final.get("summary"),
@@ -1698,14 +1785,14 @@ def register_recon_tools(mcp: FastMCP) -> None:
                                 "bbox_mm": plan["bbox_mm"],
                                 "holes": len(plan["holes"]),
                                 "patterns": plan["patterns"],
-                                "unclaimed": plan["unclaimed"]},
+                                **_recognition_evidence(plan["unclaimed"])},
             })
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
     @mcp.tool()
     def compare_parts(doc_a: str, doc_b: str, body_a: Optional[str] = None,
-                      body_b: Optional[str] = None) -> str:
+                      body_b: Optional[str] = None, alignment: str = "world") -> str:
         """Boolean-compare two documents' solids: how much volume they share and where they
         differ. The ground-truth check behind reverse_engineer — use it after ANY manual
         rebuild/edit to prove the geometry still matches a reference.
@@ -1717,19 +1804,45 @@ def register_recon_tools(mcp: FastMCP) -> None:
 
         Returns {ok, match_pct, volume_a_mm3, volume_b_mm3, common_mm3, missing_mm3,
         extra_mm3, residual_regions:[{side, volume_mm3, center, bbox}], summary}. match_pct =
-        common / max(volumes). WORLD-FRAME comparison — no alignment/ICP is attempted, so the
-        parts must already sit in the same coordinates; a perfect copy that has been moved
-        reports a LOW match, which is correct for this tool's purpose. If the boolean fails
-        (sick imported geometry) the result degrades to volume/bbox agreement with
-        degraded:true and match_pct:null rather than guessing.
+        common / max(volumes). Boolean volumes ALWAYS compare WORLD-FRAME placement.
+        alignment="world" (default) does only that exact boolean comparison.
+        alignment="icp" additionally tessellates both entire documents and reports
+        `aligned_surface_deviation`, including the rigid 4x4 transform mapping B to A,
+        registration fitness and sampled RMS/max deviation in mm. It does NOT change
+        placement or the world-frame boolean volumes. ICP cannot determine scale,
+        can be ambiguous for symmetric/incomplete shapes, and sampled/tessellated
+        distances are approximate. Both documents must already be metric. ICP cannot
+        select individual bodies; omit body_a/body_b or use world mode.
+        If the boolean fails (sick imported geometry) the result degrades to volume/bbox
+        agreement with degraded:true and match_pct:null rather than guessing.
         """
         try:
+            if alignment not in ("world", "icp"):
+                return _dumps({"ok": False, "error": "alignment must be 'world' or 'icp'"})
+            if alignment == "icp" and (body_a or body_b):
+                return _dumps({"ok": False, "error": "ICP compares complete documents; "
+                               "omit body_a/body_b or use world alignment."})
             params: dict = {"doc_a": _doc(doc_a), "doc_b": _doc(doc_b)}
             if body_a:
                 params["body_a"] = body_a
             if body_b:
                 params["body_b"] = body_b
             res = cb.call("eval_compare", params)
+            if alignment == "icp" and res.get("ok", True):
+                from services.vision.deviation import (
+                    _temporary_mesh_directory, _tessellate_document, compute_deviation,
+                )
+
+                with _temporary_mesh_directory() as directory:
+                    query = _tessellate_document(params["doc_b"], f"{directory}/query.stl")
+                    surface = compute_deviation(query, brep_doc_id=params["doc_a"],
+                                                alignment="icp")
+                if not surface.get("ok"):
+                    return _dumps({"ok": False, "error": "aligned surface comparison failed",
+                                   "details": surface, "world_comparison": res})
+                surface["mesh_path"] = None  # the internal STL has been deleted
+                surface["query_doc_id"] = params["doc_b"]
+                res["aligned_surface_deviation"] = surface
             return _dumps({"ok": res.get("ok", True), **res})
         except Exception as e:  # noqa: BLE001
             return _err(e)

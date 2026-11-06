@@ -1,23 +1,16 @@
-"""Mesh-vs-mesh geometric deviation for the reverse-engineering verification loop.
+"""Sampled surface deviation, optionally aligning a scan to a CAD reference.
 
-Computes max deviation, RMS, per-region heat buckets, and per-vertex distances
-(for colour-coding in the GUI).  Implements the deviation schema from
-``contracts/reveng.md §5``.
-
-Heavy deps (scipy, numpy, trimesh) are imported lazily — every public function
-degrades gracefully when they are absent, returning ``{"ok": False, ...}``.
-
-Typical usage::
-
-    result = compute_deviation(mesh_path="mesh/cleaned.ply",
-                               ref_path="mesh/reference.ply")
-    # result["ok"] is True, result["max_mm"], result["rms_mm"], ...
-
-MCP wiring lives in ``services/mcp/reveng_tools.py`` (RE-02).
+Reference documents are tessellated through the same core bridge export used by
+``export_part(fmt="stl")``. Alignment is opt-in: ``world`` preserves placement;
+``icp`` uses PCA initialisations followed by Open3D point-to-point ICP. Returned
+distances approximate surface distance using sampled points, not exact B-rep
+distances or a manufacturing tolerance.
 """
 from __future__ import annotations
 
+import itertools
 import math
+import tempfile
 from typing import Optional
 
 # ---------------------------------------------------------------------------
@@ -45,6 +38,13 @@ except Exception:  # noqa: BLE001
     trimesh = None  # type: ignore
     _HAVE_TRIMESH = False
 
+try:
+    import open3d as o3d  # type: ignore
+    _HAVE_OPEN3D = True
+except Exception:  # noqa: BLE001
+    o3d = None  # type: ignore
+    _HAVE_OPEN3D = False
+
 _MISSING_HINT = (
     "pip install numpy scipy trimesh"
 )
@@ -71,6 +71,30 @@ def _load_mesh(path: str):
         geom = max(mesh.geometry.values(), key=lambda g: len(g.vertices))
         mesh = geom
     return mesh
+
+
+def _document_mesh_reference(doc_id: str, reference_id: str):
+    """Read transformed reference triangles without exporting solids."""
+    from services.mcp import core_bridge
+    vertices, faces = [], []
+    offset, vertex_base = 0, 0
+    while True:
+        result = core_bridge.call("doc_mesh_ref_mesh", {
+            "doc_id": doc_id, "id": reference_id, "offset_tris": offset, "max_tris": 10000})
+        if not result.get("ok"):
+            raise ValueError(result.get("reason") or result.get("error") or "mesh reference unavailable")
+        page_vertices = np.asarray(result["vertices_mm"], dtype=np.float64).reshape((-1, 3))
+        page_faces = np.asarray(result["indices"], dtype=np.int64).reshape((-1, 3))
+        vertices.append(page_vertices)
+        faces.append(page_faces + vertex_base)
+        vertex_base += len(page_vertices)
+        next_offset = result.get("next_offset_tris")
+        if next_offset is None:
+            break
+        if next_offset <= offset:
+            raise ValueError("mesh reference returned an invalid page offset")
+        offset = next_offset
+    return trimesh.Trimesh(vertices=np.concatenate(vertices), faces=np.concatenate(faces), process=False)
 
 
 def _sample_surface(mesh, n_samples: int):
@@ -102,43 +126,135 @@ def _build_buckets(dists, bucket_spec, n_vertices: int):
     return buckets
 
 
+def _validate_cloud(points):
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 3 or len(pts) < 3 or not np.isfinite(pts).all():
+        raise ValueError("point cloud must contain at least three finite 3D points")
+    return pts
+
+
+def _align_clouds(query, reference, alignment: str):
+    """Return transformed query points and the query-to-reference alignment record."""
+    if alignment == "world":
+        return query, {"mode": "world", "transform_query_to_reference": np.eye(4).tolist()}
+    if alignment != "icp":
+        raise ValueError("alignment must be 'world' or 'icp'")
+    if not _HAVE_OPEN3D:
+        raise ImportError("ICP alignment needs Open3D; pip install open3d")
+
+    # Try all proper sign/permutation choices of the PCA frames; otherwise an
+    # asymmetric object can land in the wrong 180-degree orientation. Bound the
+    # registration clouds and score before running ICP on the best four candidates.
+    q = query[np.linspace(0, len(query) - 1, min(len(query), 4000), dtype=int)]
+    r = reference[np.linspace(0, len(reference) - 1, min(len(reference), 4000), dtype=int)]
+    cq, cr = q.mean(axis=0), r.mean(axis=0)
+    _, vq = np.linalg.eigh((q - cq).T @ (q - cq))
+    _, vr = np.linalg.eigh((r - cr).T @ (r - cr))
+    vq, vr = vq[:, ::-1], vr[:, ::-1]
+    tree_q, tree_r = cKDTree(q), cKDTree(r)
+
+    def score(rotation, translation):
+        qt = q @ rotation.T + translation
+        # Reverse distances are evaluated in the original query frame.
+        rb = (r - translation) @ rotation
+        a = tree_r.query(qt)[0]
+        b = tree_q.query(rb)[0]
+        return float((np.mean(a * a) + np.mean(b * b)) / 2.0)
+
+    candidates = []
+    for perm in itertools.permutations(range(3)):
+        for signs in itertools.product((-1.0, 1.0), repeat=3):
+            permutation = np.eye(3)[:, perm] @ np.diag(signs)
+            rotation = vr @ permutation @ vq.T
+            if np.linalg.det(rotation) < 0:
+                continue
+            translation = cr - rotation @ cq
+            matrix = np.eye(4)
+            matrix[:3, :3], matrix[:3, 3] = rotation, translation
+            candidates.append((score(rotation, translation), matrix))
+    candidates.sort(key=lambda item: item[0])
+    extent = float(np.linalg.norm(np.ptp(r, axis=0)))
+    if extent <= 1e-12:
+        raise ValueError("reference cloud has no spatial extent for alignment")
+    threshold = max(0.15 * extent, 1e-6)
+    source, target = o3d.geometry.PointCloud(), o3d.geometry.PointCloud()
+    source.points = o3d.utility.Vector3dVector(q)
+    target.points = o3d.utility.Vector3dVector(r)
+    reg = o3d.pipelines.registration
+    best = None
+    for _, initial in candidates[:4]:
+        result = reg.registration_icp(
+            source, target, threshold, initial,
+            reg.TransformationEstimationPointToPoint(),
+            reg.ICPConvergenceCriteria(max_iteration=80),
+        )
+        matrix = np.asarray(result.transformation)
+        if result.fitness <= 0 or not np.isfinite(matrix).all():
+            continue
+        final_score = score(matrix[:3, :3], matrix[:3, 3])
+        if best is None or final_score < best[0]:
+            best = (final_score, matrix, result)
+    if best is None:
+        raise ValueError("ICP found no correspondences; check scale and capture overlap")
+    _, matrix, result = best
+    aligned = query @ matrix[:3, :3].T + matrix[:3, 3]
+    return aligned, {
+        "mode": "icp",
+        "method": "pca_multistart_point_to_point_icp",
+        "transform_query_to_reference": matrix.tolist(),
+        "fitness": float(result.fitness),
+        "inlier_rmse_mm": float(result.inlier_rmse),
+        "correspondence_distance_mm": threshold,
+        "note": "Rigid alignment can be ambiguous for symmetric or incomplete surfaces; "
+                "inspect the transform and overlap before interpreting deviation.",
+    }
+
+
+def _tessellate_document(doc_id: str, destination: str):
+    """Export a temporary reference STL using the CAD document RPC."""
+    from services.mcp import core_bridge
+
+    result = core_bridge.call("export_file", {
+        "doc_id": doc_id, "path": destination, "format": "stl",
+    })
+    if result.get("ok") is False:
+        raise ValueError(result.get("reason") or result.get("error") or "STL export failed")
+    return result.get("path", destination)
+
+
+def _temporary_mesh_directory():
+    """Use a scoped workspace temp directory in a cell and system temp locally."""
+    from services.agent import request_context
+
+    directory = request_context.cell_path("/work") if request_context.in_cell() else None
+    return tempfile.TemporaryDirectory(prefix=".chudware_deviation_", dir=directory)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 def compute_deviation(
-    mesh_path: str,
-    ref_path: str,
+    mesh_path: Optional[str],
+    ref_path: Optional[str] = None,
     *,
     session_id: str = "",
     brep_doc_id: Optional[str] = None,
+    query_mesh_ref_id: Optional[str] = None,
+    ref_mesh_ref_id: Optional[str] = None,
+    mesh_ref_doc_id: Optional[str] = None,
     n_samples: int = _DEFAULT_SAMPLES,
     bucket_spec: Optional[list] = None,
+    alignment: str = "world",
 ) -> dict:
-    """Compute geometric deviation between two mesh files.
+    """Compare a mesh with a reference mesh or a tessellated B-rep document.
 
-    Parameters
-    ----------
-    mesh_path:
-        Path to the query mesh (the scanned / reconstructed mesh).
-    ref_path:
-        Path to the reference mesh (ground-truth or parametric-exported tessellation).
-    session_id:
-        RE session identifier — echoed back into the result dict.
-    brep_doc_id:
-        Optional B-Rep doc id (when ref was tessellated from a parametric model).
-    n_samples:
-        Number of surface samples used for KD-tree distance probing.
-    bucket_spec:
-        List of ``(lo_mm, hi_mm_or_None, hex_color)`` tuples.
-        Defaults to ``DEFAULT_BUCKETS_MM``.
-
-    Returns
-    -------
-    dict
-        Conforms to ``contracts/reveng.md §5`` deviation schema plus
-        ``vertex_distances_mm`` (list[float]) for colour-coding.
-        On failure returns ``{"ok": False, "reason": ..., "hint": ...}``.
+    Supply ``ref_path`` or, when absent, ``brep_doc_id``. Both must already use
+    the same physical units (mm); alignment never estimates scale. ``world``
+    compares existing placement, while ``icp`` rigidly aligns query to reference
+    first and reports its 4x4 transform and registration quality. Distances are
+    query-surface samples to a denser reference sample, not exact surface or
+    vertex distances. Sampling and tessellation impose additional uncertainty.
     """
     if bucket_spec is None:
         bucket_spec = DEFAULT_BUCKETS_MM
@@ -150,36 +266,46 @@ def compute_deviation(
     if not _HAVE_TRIMESH:
         return {"ok": False, "reason": "trimesh not installed", "hint": _MISSING_HINT}
 
+    if (query_mesh_ref_id or ref_mesh_ref_id) and not mesh_ref_doc_id:
+        return {"ok": False, "reason": "mesh_ref_doc_id_required",
+                "hint": "Supply the document containing the mesh reference."}
+    if not mesh_path and not query_mesh_ref_id:
+        return {"ok": False, "reason": "no_query", "hint": "Supply mesh_path or query_mesh_ref_id."}
+    if not ref_path and not brep_doc_id and not ref_mesh_ref_id:
+        return {"ok": False, "reason": "no_reference",
+                "hint": "Supply ref_path, brep_doc_id or ref_mesh_ref_id."}
     try:
-        mesh_q = _load_mesh(mesh_path)
-        mesh_r = _load_mesh(ref_path)
+        mesh_q = (_document_mesh_reference(mesh_ref_doc_id, query_mesh_ref_id)
+                  if query_mesh_ref_id else _load_mesh(mesh_path))
+        if ref_mesh_ref_id:
+            mesh_r = _document_mesh_reference(mesh_ref_doc_id, ref_mesh_ref_id)
+        elif ref_path:
+            mesh_r = _load_mesh(ref_path)
+        else:
+            with _temporary_mesh_directory() as temp_dir:
+                path = _tessellate_document(brep_doc_id, f"{temp_dir}/reference.stl")
+                mesh_r = _load_mesh(path)
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "reason": f"mesh load error: {exc}", "hint": "check file paths"}
+        return {"ok": False, "reason": f"reference or mesh load error: {exc}",
+                "hint": "Check the mesh path and that the reference document has geometry."}
 
     try:
-        query_pts = _sample_surface(mesh_q, n_samples)
-        # Sample the reference surface densely for a faithful KD-tree proxy;
-        # use 4× samples so the tree is much denser than query to minimise
-        # the nearest-point vs nearest-surface approximation error.
-        ref_pts = _sample_surface(mesh_r, n_samples * 4)
-        dists = _kdtree_distances(query_pts, ref_pts)
+        if int(n_samples) < 3:
+            raise ValueError("n_samples must be at least 3")
+        query_pts = _sample_surface(mesh_q, int(n_samples))
+        # A denser reference reduces nearest-sample error; it does not eliminate it.
+        ref_pts = _sample_surface(mesh_r, int(n_samples) * 4)
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "reason": f"distance computation error: {exc}", "hint": ""}
-
-    max_mm = float(dists.max())
-    rms_mm = float(math.sqrt((dists ** 2).mean()))
-    buckets = _build_buckets(dists, bucket_spec, len(query_pts))
-
-    return {
-        "ok": True,
-        "session_id": session_id,
-        "max_mm": max_mm,
-        "rms_mm": rms_mm,
-        "buckets": buckets,
-        "mesh_path": mesh_path,
-        "brep_doc_id": brep_doc_id,
-        "vertex_distances_mm": dists.tolist(),
-    }
+        return {"ok": False, "reason": f"surface sampling error: {exc}", "hint": ""}
+    result = compute_deviation_from_arrays(
+        query_pts, ref_pts, session_id=session_id, brep_doc_id=brep_doc_id,
+        bucket_spec=bucket_spec, alignment=alignment,
+    )
+    if result.get("ok"):
+        result["mesh_path"] = mesh_path
+        result["distance_basis"] = "query_surface_samples_to_reference_surface_samples"
+        result["reference_samples"] = len(ref_pts)
+    return result
 
 
 def compute_deviation_from_arrays(
@@ -189,6 +315,7 @@ def compute_deviation_from_arrays(
     session_id: str = "",
     brep_doc_id: Optional[str] = None,
     bucket_spec: Optional[list] = None,
+    alignment: str = "world",
 ) -> dict:
     """Compute deviation directly from vertex arrays (numpy (N,3) float64).
 
@@ -196,6 +323,7 @@ def compute_deviation_from_arrays(
     trimesh objects).  Both arrays are treated as *unordered point clouds*;
     nearest-surface distance is approximated by nearest-point distance.
 
+    ``alignment`` is ``world`` or ``icp``; the transform maps query to reference.
     Same return schema as :func:`compute_deviation`.
     """
     if bucket_spec is None:
@@ -207,11 +335,13 @@ def compute_deviation_from_arrays(
         return {"ok": False, "reason": "scipy not installed", "hint": _MISSING_HINT}
 
     try:
-        q = np.asarray(query_vertices, dtype=np.float64)
-        r = np.asarray(ref_vertices, dtype=np.float64)
+        q = _validate_cloud(query_vertices)
+        r = _validate_cloud(ref_vertices)
+        q, alignment_record = _align_clouds(q, r, alignment)
         dists = _kdtree_distances(q, r)
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "reason": f"distance computation error: {exc}", "hint": ""}
+        return {"ok": False, "reason": f"alignment or distance computation error: {exc}",
+                "hint": "Use world or icp alignment with valid, similarly scaled geometry."}
 
     max_mm = float(dists.max())
     rms_mm = float(math.sqrt((dists ** 2).mean()))
@@ -226,4 +356,6 @@ def compute_deviation_from_arrays(
         "mesh_path": None,
         "brep_doc_id": brep_doc_id,
         "vertex_distances_mm": dists.tolist(),
+        "alignment": alignment_record,
+        "distance_basis": "query_points_to_reference_points",
     }

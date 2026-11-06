@@ -1,6 +1,6 @@
 # Contracts Summary
 
-51 frozen contracts under `contracts/`:
+53 top-level `contracts/*.md` files; nested files and machine-readable contracts are excluded:
 
 - `README.md` — contracts/ — frozen interface seams
 - `advisor.md` — contracts/advisor.md — Advisory Layer contracts (aicad.advisor/1.7)
@@ -14,7 +14,7 @@
 - `dag_schema.md` — Contract: DAG Orchestrator Schema — `aicad.dag/1`
 - `deliverables.md` — Contract: Deliverables — `deliverables/1`
 - `design_pipeline.md` — contracts/design_pipeline.md — Design pipeline contract (`aicad.designpipe/1`)
-- `doc_ops.md` — Contract: Document Ops — v1.1
+- `doc_ops.md` — Contract: Document Ops — v1.2 (v2 amendments below)
 - `doc_schema.md` — Contract: Document Schema — `aicad.part/1` · `aicad.asm/1` · `aicad.drawing/1`
 - `drives_schema.md` — Contract: hydraulic motor sizing and pump drive selection
 - `events.md` — Contract: Event Stream — v2
@@ -31,6 +31,7 @@
 - `licenses.md` — Contract: Dependency License Ledger
 - `manufacturing_gateway.md` — Contract: Manufacturing Gateway — v1
 - `mesh_format.md` — Contract: AICM v1 — tessellation + overlay binary format
+- `model_history.md` — Model history evaluation and simplification
 - `narration.md` — Narration Style Guide
 - `office.md` — Contract: Office documents — `office/1` (T-office)
 - `parts.md` — Contract: Unified Parts Library — `aicad.parts/1`
@@ -43,9 +44,10 @@
 - `research_tools.md` — Contract: Research tools — look-it-up instead of recall (`research_*`)
 - `reveng.md` — Contract: Reverse Engineering — `aicad.reveng_*` — v1
 - `selectors.md` — Contract: Selectors — stable references into B-rep topology
+- `shape_build_worker.md` — Shape-build worker contract (v1)
 - `sim_handoff.md` — Contract: `aicad.simhandoff/1` — cross-sim handoff & verify envelopes
 - `sketch3d_gui_contract.md` — Contract: 3D Sketch (`sketch3d`) — GUI / RPC surface — v1
-- `skills.md` — Contract: Copilot Skills — v1
+- `skills.md` — Contract: Copilot Skills — v2
 - `sourcing.md` — Contract: Part Sourcing Fan-out — `aicad.part_source/1`
 - `sourcing_schema.md` — Contract: Sourcing Schema — `aicad.sourcing/1`
 - `stepplus.md` — Contract: `.step+` container — v1

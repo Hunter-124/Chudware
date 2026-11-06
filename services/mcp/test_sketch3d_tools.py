@@ -56,6 +56,7 @@ from services.mcp.sketch3d_tools import (  # noqa: E402
     _arc_polyline,
     _curves_to_entities,
     _free_narration,
+    _health_read,
     _polyline_length,
     _resolve_pipe_mode,
     _sample_polyline,
@@ -126,15 +127,18 @@ class TestCurveMapping:
         assert ents[1]["type"] == "point" and ents[1]["p"] == [9, 9, 9]
 
     def test_raw_engine_entity_passthrough(self):
-        ents = _curves_to_entities(
-            [{"type": "line", "p1": [0, 0, 0], "p2": [1, 1, 1]}], start_n=4)
-        assert ents[0]["id"] == "e5"
+        ents = _curves_to_entities([{"type": "line", "p1": [0, 0, 0], "p2": [1, 1, 1]}])
+        assert ents[0]["id"] == "e1"
         assert ents[0]["construction"] is False
 
-    def test_id_continuation(self):
-        ents = _curves_to_entities(
-            [{"kind": "line", "pts": [[0, 0, 0], [1, 0, 0]]}], start_n=7)
-        assert ents[0]["id"] == "e8"
+    def test_mint_ids_false_leaves_ids_to_the_engine(self):
+        ents = _curves_to_entities([
+            {"kind": "line", "pts": [[0, 0, 0], [1, 0, 0]]},
+            {"type": "point", "p": [1, 2, 3]},
+            {"type": "point", "p": [4, 5, 6], "id": "e9"},
+        ], mint_ids=False)
+        assert "id" not in ents[0] and "id" not in ents[1]
+        assert ents[2]["id"] == "e9"
 
     def test_bad_kind_raises(self):
         with pytest.raises(ValueError):
@@ -199,6 +203,169 @@ class TestFreeNarration:
 
     def test_empty(self):
         assert _free_narration([]) == ""
+
+
+class TestHealthReadSkippedConstraints:
+    """A skipped constraint is not being solved: never report 'Fully defined' over it."""
+
+    _FULL = {"status": "full", "dof": 0, "converged": True, "conflicting": [],
+             "redundant": [], "wires": [], "free": [], "skipped_constraints": []}
+
+    def test_clean_sketch_is_fully_defined(self):
+        read = _health_read(self._FULL)
+        assert read["fully_defined"] is True
+        assert "Fully defined" in read["summary"]
+
+    def test_skipped_constraint_blocks_fully_defined_and_is_listed(self):
+        skipped = [{"id": "c4", "type": "along_axis", "reason": "along_axis: zero dir"}]
+        read = _health_read({**self._FULL, "skipped_constraints": skipped})
+        assert read["fully_defined"] is False
+        assert read["skipped_constraints"] == skipped
+        assert "Fully defined" not in read["summary"]
+        assert "c4" in read["summary"] and "along_axis: zero dir" in read["summary"]
+
+    def test_skipped_constraint_is_listed_on_an_under_defined_sketch_too(self):
+        skipped = [{"id": "c2", "type": "midpoint", "reason": "unknown entity in handle 'e9.p'"}]
+        read = _health_read({**self._FULL, "status": "under", "dof": 3,
+                             "skipped_constraints": skipped})
+        assert read["fully_defined"] is False
+        assert "Under-defined" in read["summary"] and "c2" in read["summary"]
+
+    def test_unconverged_is_never_fully_defined_even_at_dof_zero(self):
+        read = _health_read({**self._FULL, "status": "over", "converged": False})
+        assert read["fully_defined"] is False
+
+    def test_engine_nonconvergence_reason_is_the_verdict(self):
+        reason = ("sketch3d did not converge: the constraints conflict. Conflicting "
+                  "constraints: c3 (distance 50) conflicts with c1 (fix), c2 (fix).")
+        read = _health_read({**self._FULL, "status": "over", "converged": False,
+                             "conflicting": ["c3"], "conflicts_with": {"c3": ["c1", "c2"]},
+                             "nonconvergence_reason": reason})
+        assert reason in read["summary"]
+        assert read["nonconvergence_reason"] == reason
+        assert read["conflicts_with"] == {"c3": ["c1", "c2"]}
+
+
+class _FakeEngine:
+    """Stands in for libchudware: records every call, answers the few the tools make."""
+
+    def __init__(self, id_map, health=None):
+        self.calls = []
+        self.id_map = id_map
+        self.revision = 1
+        self.health = health or {"status": "under", "dof": 3, "converged": True,
+                                 "conflicting": [], "redundant": [], "wires": [],
+                                 "skipped_constraints": []}
+
+    def __call__(self, method, params):
+        self.calls.append((method, params))
+        if method == "doc_list":
+            return {"docs": [{"doc_id": "p1", "name": "p"}]}
+        if method == "doc_tree":
+            return {"revision": self.revision, "tree": {"features": [
+                {"id": "f3", "type": "sketch3d",
+                 "params": {"entities": [{"id": "e1"}], "constraints": [],
+                            "external_refs": [{"id": "x4", "last_point": [1, 2, 3],
+                                               "stale": False}]}}]}}
+        if method == "doc_checkpoint":
+            return {"checkpoint": "c", "revision": 1}
+        if method == "doc_apply_ops":
+            return {"revision": 2, "id_map": self.id_map,
+                    "rebuild": {"feature_status": [{"id": "f3", "ok": True}]}}
+        if method == "sketch3d_health":
+            return self.health
+        return {}
+
+    def applied_ops(self):
+        return [op for method, params in self.calls if method == "doc_apply_ops"
+                for op in params["ops"]]
+
+
+class TestAtomicAppendOps:
+    """The tools send engine-side atomic appends, never a read-modify-write edit_feature."""
+
+    def test_add_curves_sends_one_atomic_entity_append(self, monkeypatch):
+        eng = _FakeEngine({"$0": "e2", "$0#1": "e3"})
+        monkeypatch.setattr(cb, "call", eng)
+        r, _ = _call("sketch3d_add_curves", {
+            "sketch3d_id": "f3", "doc_id": "p1",
+            "curves": [{"kind": "polyline", "pts": [[0, 0, 0], [1, 0, 0], [1, 1, 0]]}]})
+        assert r and r["ok"], r
+        ops = eng.applied_ops()
+        assert [o["op"] for o in ops] == ["sketch3d_add_entities"]
+        assert ops[0]["sketch"] == "f3"
+        assert len(ops[0]["entities"]) == 2
+        assert all("id" not in e for e in ops[0]["entities"])  # the engine mints them
+        assert r["new_entity_ids"] == ["e2", "e3"] and r["added"] == 2
+
+    def test_add_constraints_sends_one_atomic_append_with_wrapped_values(self, monkeypatch):
+        eng = _FakeEngine({"$0": "c5", "$0#1": "c6"})
+        monkeypatch.setattr(cb, "call", eng)
+        r, _ = _call("sketch3d_add_constraints", {
+            "sketch3d_id": "f3", "doc_id": "p1",
+            "constraints": [{"type": "length", "refs": ["e1"], "value": 40},
+                            {"type": "along_axis", "refs": ["e1"], "axis": "z"}]})
+        assert r and r["ok"], r
+        ops = eng.applied_ops()
+        assert [o["op"] for o in ops] == ["sketch3d_add_constraints"]
+        cons = ops[0]["constraints"]
+        assert cons[0]["value"] == {"value": 40.0, "expr": None}
+        assert all("id" not in c for c in cons)
+        assert r["new_constraint_ids"] == ["c5", "c6"]
+
+    def test_ref_vertex_sends_one_atomic_external_ref_append(self, monkeypatch):
+        eng = _FakeEngine({"$0": "x4"})
+        monkeypatch.setattr(cb, "call", eng)
+        selector = {"kind": "vertex", "centroid": [1, 2, 3]}
+        r, _ = _call("sketch3d_ref_vertex", {"sketch3d_id": "f3", "doc_id": "p1",
+                                             "selector": selector})
+        assert r and r["ok"], r
+        ops = eng.applied_ops()
+        assert ops == [{"op": "sketch3d_add_external_ref", "sketch": "f3",
+                        "ref": {"source": {"kind": "vertex", "selector": selector}}}]
+        assert r["ref_id"] == "x4" and r["point"] == [1, 2, 3]
+
+    def test_engine_that_does_not_report_minted_ids_is_an_error_not_a_guess(self, monkeypatch):
+        eng = _FakeEngine({})
+        monkeypatch.setattr(cb, "call", eng)
+        r, _ = _call("sketch3d_add_curves", {
+            "sketch3d_id": "f3", "doc_id": "p1",
+            "curves": [{"kind": "line", "pts": [[0, 0, 0], [1, 0, 0]]}]})
+        assert r and r["ok"] is False
+        assert "minted" in r["error"]
+
+    def test_check_sketch3d_never_calls_a_skipped_constraint_sketch_fully_defined(self, monkeypatch):
+        eng = _FakeEngine({}, health={
+            "status": "full", "dof": 0, "converged": True, "conflicting": [], "redundant": [],
+            "wires": [], "free": [],
+            "skipped_constraints": [{"id": "c2", "type": "along_axis",
+                                     "reason": "along_axis: zero dir"}]})
+        monkeypatch.setattr(cb, "call", eng)
+        r, _ = _call("check_sketch3d", {"sketch3d_id": "f3", "doc_id": "p1"})
+        assert r and r["ok"], r
+        assert r["fully_defined"] is False
+        assert r["skipped_constraints"][0]["id"] == "c2"
+
+    @pytest.mark.parametrize("before,after", [(1, 1), (1, 2), (None, None), (True, True)])
+    def test_check_sketch3d_revision_brackets_health(self, monkeypatch, before, after):
+        eng = _FakeEngine({})
+        eng.revision = before
+
+        def call(method, params):
+            result = eng(method, params)
+            if method == "sketch3d_health":
+                eng.revision = after
+            return result
+
+        monkeypatch.setattr(cb, "call", call)
+        r, _ = _call("check_sketch3d", {"sketch3d_id": "f3", "doc_id": "p1"})
+        assert r["ok"], r
+        stable = type(before) is int and type(after) is int and before == after
+        assert r["revision_stale"] is not stable
+        if stable:
+            assert r["revision"] == before
+        else:
+            assert "revision" not in r
 
 
 class TestResolvePipeMode:

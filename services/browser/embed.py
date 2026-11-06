@@ -211,12 +211,9 @@ def classify_login_state(site: str | None, content: str | None, url: str) -> str
 
 
 # ---------------------------------------------------------------------------
-# GUI-browser session hand-off: the in-process CEF browser exports its cookie
-# jar after a verified sign-in; we normalise it to Playwright's add_cookies
-# shape, stage it (profiles.save_session_cookies) and stamp the login as
-# verified. Every subsequent persistent context opened for the site — headless
-# browser_fetch/browser_download AND embed sessions — injects the staged jar
-# once, after which the cookies live natively in the Playwright profile.
+# GUI CEF exports its cookies for the worker's transient Playwright hand-off.
+# The GUI RPC separately imports the jar into CEF's shared global context.
+# These stores have different lifetimes and are not the site's metadata profile.
 
 _SAME_SITE_MAP = {
     "strict": "Strict", "lax": "Lax", "none": "None",
@@ -261,6 +258,7 @@ def import_session_cookies(site: str, cookies: list[dict],
     if not normalized:
         return fail("no_cookies", f"no usable cookies exported for '{site}'")
     count = profiles.save_session_cookies(site, normalized)
+    profiles.invalidate_cache(site)
     profiles.touch_created(site)
     now = time.time()
     fields: dict[str, Any] = {"last_login_ts": now, "session_import_ts": now}
@@ -595,6 +593,8 @@ class EmbedManager:
                     state = classify_login_state(s.site, content, cur_url)
                 else:
                     state = prev_state or "unknown"
+                if s.site and prev_state == "logged_in" and state == "login_page":
+                    await asyncio.to_thread(profiles.invalidate_cache, s.site)
                 with s.frame_lock:
                     s.url = cur_url
                     s.login_state = state
@@ -913,6 +913,7 @@ class EmbedManager:
                 # here, where the live page actually classified as logged_in.
                 now = time.time()
                 profiles.save_meta(site, last_login_ts=now, login_verified_ts=now)
+                profiles.invalidate_cache(site)
             except Exception:  # noqa: BLE001 — bookkeeping only
                 pass
 

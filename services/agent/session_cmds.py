@@ -1,6 +1,6 @@
-"""Session command backends for persistent Chudcode and explicit offline use.
+"""Session command backends for persistent Omp and explicit offline use.
 
-Online compaction and retry state are delegated to the live Chudcode session.
+Online compaction and retry state are delegated to the live Omp session.
 Deterministic transcript transforms remain available only when a caller opts
 into standalone mode or Chudware is explicitly offline. Inputs are never mutated.
 """
@@ -180,6 +180,27 @@ def _normalize_messages(messages: list | None) -> list[dict]:
     return out
 
 
+_TRANSCRIPT_MAX_CHARS = 200_000
+
+
+def _transcript_block(history: list[dict]) -> str:
+    """Render normalized messages as prompt text, keeping the newest when oversized."""
+    turns = []
+    for message in history:
+        content = message.get("content") or []
+        text = "".join(
+            part["text"]
+            for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        ).strip()
+        if text:
+            turns.append(f"[{message.get('role')}]\n{text}")
+    body = "\n\n".join(turns)
+    if len(body) > _TRANSCRIPT_MAX_CHARS:
+        body = "[earlier conversation omitted]\n" + body[-_TRANSCRIPT_MAX_CHARS:]
+    return f"<conversation>\n{body}\n</conversation>"
+
+
 # ---------------------------------------------------------------------------
 # One-shot role helpers
 # ---------------------------------------------------------------------------
@@ -225,7 +246,7 @@ def _run_one_shot_role(
     max_tokens: int,
     standalone: bool,
 ) -> str:
-    from services.agent.chudcode_roles import run_role_turn  # noqa: PLC0415
+    from services.agent.omp_roles import run_role_turn  # noqa: PLC0415
 
     local = _local_compaction(standalone)
     parent_session = str(session_id or "").strip()
@@ -246,8 +267,8 @@ def _run_one_shot_role(
         "offline": local,
     }
     if not local:
-        from services.agent.chudcode_host import get_default_chudcode_host
-        host = get_default_chudcode_host()
+        from services.agent.omp_host import get_default_omp_host
+        host = get_default_omp_host()
         inherit = getattr(host, "session_launch_params", None)
         if callable(inherit):
             try:
@@ -275,7 +296,7 @@ def _run_one_shot_role(
 
 
 class SessionCommandUnavailable(RuntimeError):
-    """A command requiring a live Chudcode session could not be served."""
+    """The requested session command cannot be served without changing its semantics."""
 
     def __init__(self, message: str, *, code: str | None = None):
         super().__init__(message)
@@ -295,11 +316,10 @@ def _local_compaction(standalone: bool) -> bool:
     return bool(standalone) or _offline_enabled()
 
 
-def _chudcode_session_call(
+def _omp_session_call(
     session_id: str | None,
     command: str,
     params: dict[str, Any] | None = None,
-    **host_options: Any,
 ) -> dict[str, Any]:
     key = str(session_id or "").strip()
     if not key:
@@ -308,13 +328,11 @@ def _chudcode_session_call(
             "pass standalone=True only for explicit local/offline use"
         )
     try:
-        from services.agent.chudcode_host import (  # noqa: PLC0415
-            get_default_chudcode_host,
+        from services.agent.omp_host import (  # noqa: PLC0415
+            get_default_omp_host,
         )
 
-        result = get_default_chudcode_host().session_call(
-            key, command, params, **host_options
-        )
+        result = get_default_omp_host().session_call(key, command, params)
     except Exception as exc:  # noqa: BLE001 - process boundary
         code = getattr(exc, "code", None)
         if code is None:
@@ -336,15 +354,15 @@ def _chudcode_session_call(
 
 
 def set_auto_compaction(session_id: str, enabled: bool) -> dict[str, Any]:
-    """Set Chudcode's per-session automatic compaction authority."""
-    return _chudcode_session_call(
+    """Set Omp's per-session automatic compaction authority."""
+    return _omp_session_call(
         session_id, "set_auto_compaction", {"enabled": bool(enabled)}
     )
 
 
 def set_auto_retry(session_id: str, enabled: bool) -> dict[str, Any]:
-    """Set Chudcode's per-session retry/cache policy."""
-    return _chudcode_session_call(
+    """Set Omp's per-session retry/cache policy."""
+    return _omp_session_call(
         session_id, "set_auto_retry", {"enabled": bool(enabled)}
     )
 
@@ -363,12 +381,13 @@ def handoff_document(
     session_id: str | None = None,
     standalone: bool = False,
 ) -> str:
-    """Generate a handoff from the authoritative live Chudcode session.
+    """Generate a handoff from the authoritative live Omp session.
 
     Online mode calls the session's native ``handoff`` side request so it sees
-    Chudcode's persisted/compacted context and selected provider.  Explicit
-    offline/standalone mode uses one bounded offline-safe role turn.  Caller
-    messages are snapshotted and never mutated.
+    Omp's persisted/compacted context and selected provider; a conversation whose
+    runtime is not live gets the handoff written from the caller's transcript in one
+    bounded no-tool turn.  Explicit offline/standalone mode uses one bounded
+    offline-safe role turn.  Caller messages are snapshotted and never mutated.
     """
     history = _normalize_messages(_snapshot_messages(messages))
     if _local_compaction(standalone):
@@ -388,7 +407,26 @@ def handoff_document(
     note = str(focus or "").strip()
     if note:
         payload["customInstructions"] = note
-    result = _chudcode_session_call(session_id, "handoff", payload)
+    try:
+        result = _omp_session_call(session_id, "handoff", payload)
+    except SessionCommandUnavailable as exc:
+        if exc.code != "session_not_live":
+            raise
+        # The conversation's runtime is not running (app restart, idle eviction) and
+        # session calls never resume one: write the handoff from the visible transcript
+        # in one bounded no-tool turn instead.
+        return _run_one_shot_role(
+            command="handoff",
+            request="\n\n".join(
+                (_HANDOFF_SYSTEM, _transcript_block(history), _handoff_user_prompt(focus))
+            ),
+            messages=[],
+            session_id=session_id,
+            provider=provider,
+            model=model,
+            max_tokens=4096,
+            standalone=False,
+        )
     for key in ("document", "handoff", "text", "summary", "result"):
         value = result.get(key)
         if isinstance(value, str) and value.strip():
@@ -444,19 +482,17 @@ def compact_session(
     supersede_reads: bool = True,
     drop_useless: bool = True,
     prior_archive: dict | None = None,
-    session_id: str | None = None,
-    instructions: str | None = None,
     standalone: bool = False,
-    compaction_settings: dict[str, Any] | None = None,
 ) -> dict:
-    """Compact one session without creating a second compaction authority.
+    """Compact a transcript locally, only for explicit offline/standalone use.
 
-    A live online session delegates to Chudcode's ``compact`` command, run with
-    ``compaction_settings`` (Chudcode ``compaction.*`` sub-keys of the persisted
-    Compaction setting) so the method is the user's current choice. Local
-    transcript rewriting is available only with ``standalone=True`` or when
-    Chudware is explicitly offline.
+    Online conversations compact on their own Omp session through the
+    ``agent_admin_turn`` compaction run, never here.
     """
+    if not _local_compaction(standalone):
+        raise SessionCommandUnavailable(
+            "local session compaction is unavailable for online agent sessions"
+        )
     msgs = _snapshot_messages(messages)
     strat = (strategy or "off").strip().lower()
     if strat in ("off", "", "none", "disabled"):
@@ -465,21 +501,17 @@ def compact_session(
             "summary": "",
             "short_summary": "",
         }
-    if not _local_compaction(standalone):
-        payload = {}
-        note = str(instructions or "").strip()
-        if note:
-            payload["customInstructions"] = note
-        if compaction_settings is None:
-            return _chudcode_session_call(session_id, "compact", payload)
-        return _chudcode_session_call(
-            session_id, "compact", payload, compaction_settings=compaction_settings
+    if strat not in ("shake", "snapcompact"):
+        raise SessionCommandUnavailable(
+            f"Selected offline compaction {strat!r} is unavailable; "
+            "choose snapcompact or shake explicitly"
         )
 
     comp = importlib.import_module("services.agent.compaction")
     if strat == "shake":
         result = comp.shake_messages(msgs, mode="elide", aggressive=False)
         return {
+            "messages": result.get("messages", msgs),
             "kept_messages": result.get("messages", msgs),
             "summary": "",
             "short_summary": "",

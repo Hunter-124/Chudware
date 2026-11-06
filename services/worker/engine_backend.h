@@ -29,6 +29,12 @@
 
 #include <string>
 #include <functional>
+#ifndef __EMSCRIPTEN__
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#endif
 
 #include <nlohmann/json.hpp>
 
@@ -57,9 +63,39 @@ inline bool webCellMethodAllowed(const nlohmann::json& info, const std::string& 
 }
 
 
-// True iff the daemon backend was selected at startup (resolved once, thread-safe):
-// connected, or refused by a draining hostd and waiting for it to exit. False = legacy
-// in-process libchudware.
+enum class DaemonConnState { InProc, Connected, Unreachable };
+#ifndef __EMSCRIPTEN__
+// Native GUI lifetime: connect/spawn/hello and proactive reconnect run on one worker.
+// On this thread daemonMode() reports the requested backend while initialization is
+// pending; client() is null until the final daemon-vs-inproc verdict is published.
+// Synchronous GUI dispatch rejects pending initialization with engine_starting.
+// Shutdown cancels retries/connect/hello/version/drain waits, aborts the active
+// transport, then joins; it never terminates the shared daemon.
+// Other threads retain the blocking startup contract (notably WorkerClient's engine pin).
+class GuiConnection {
+public:
+    explicit GuiConnection(void (*wake)());
+    ~GuiConnection();
+    void shutdown();
+    GuiConnection(const GuiConnection&) = delete;
+    GuiConnection& operator=(const GuiConnection&) = delete;
+private:
+    friend DaemonConnState maintainConnection();
+    friend chudware_ipc::EngineClient* client();
+    void requestMaintenance();
+    std::thread worker_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::atomic<bool> busy_{true};
+    bool requested_ = false, quit_ = false;
+};
+// Nonblocking; the worker's final backend verdict is required before spawning a
+// Python worker, so both processes get the same CHUDWARE_ENGINE_DAEMON pin.
+bool connectionPending();
+#endif
+// True iff the daemon backend was selected at startup (resolved once, thread-safe),
+// including a draining daemon that refuses this client. A pending GuiConnection
+// reports the requested backend; false after initialization means legacy in-process.
 bool daemonMode();
 
 // True only when daemon mode was WANTED (no explicit CHUDWARE_ENGINE_DAEMON=0)
@@ -71,8 +107,8 @@ bool daemonUnavailable();
 
 // The `daemon_draining` hello error from the shared connection's last connect attempt
 // (Server::drainRefusal: reason, daemon_pid, active_clients, message, hint, ...), or
-// null. A draining hostd refuses every new non-control client until it exits; the GUI
-// shows this on its unreachable chip. Safe to call from any thread.
+// null. An independent GUI connection is refused during a drain; the GUI shows
+// this on its unreachable chip. Safe to call from any thread.
 nlohmann::json daemonRefusal();
 
 // The live daemon connection (nullptr unless daemonMode()). GUI-thread event
@@ -104,15 +140,15 @@ bool call(const std::string& method, const nlohmann::json& params,
           nlohmann::json& result, std::string& err, int timeoutMs = -1,
           const std::function<void(const nlohmann::json&)>& onEvent = {});
 
-// Teardown-only: wake blocked agent/mission and simulation runs on their separate dedicated
+// Teardown-only: wake blocked agent and simulation runs on their separate dedicated
 // connections so app quit / AsyncRpc shutdown never hangs. No-op for unopened connections.
 void abortRunClient();
 
-// The dedicated daemon connections a method streams on. Agent runs (agent_admin_turn,
-// agent_run[_v2], agent_mission[_v1]) lease one of at most eight private connections,
-// waiting when all are occupied. They fall back to the shared GUI connection only when
-// none can open and the pool is empty. Simulation solves and sim_mesh use one private
-// connection with no fallback. The lanes are independent: a chat turn never waits for a solve.
+// The dedicated daemon connections a method streams on. Agent turns (agent_admin_turn)
+// lease one of at most eight private connections, waiting when all are occupied. They fall
+// back to the shared GUI connection only when none can open and the pool is empty.
+// Simulation solves and sim_mesh use one private connection with no fallback. The lanes
+// are independent: a chat turn never waits for a solve.
 enum class RunLane { None, Agent, Sim };
 RunLane runLane(const std::string& method);
 
@@ -121,11 +157,10 @@ RunLane runLane(const std::string& method);
 // WorkerClient sends it over a short-lived side connection while the lane is busy.
 bool isSimLanePreview(const std::string& method);
 
-// True when a dedicated connection exists for `lane` or can be opened lazily.
-// Agent calls lease a pooled connection; simulation calls reuse their single connection.
-// WorkerClient uses this to release native long runs from callMtx_. Online daemon turns
-// never take that mutex. False for RunLane::None and off daemon mode.
-bool runConnectionReady(RunLane lane);
+// True when the simulation lane's dedicated connection exists or can be opened lazily.
+// WorkerClient uses this to release a solve from callMtx_ onto the simulation lane mutex.
+// Online daemon agent turns never take either mutex. False off daemon mode.
+bool simRunConnectionReady();
 
 // Backend availability probes with InProcCore semantics (routing predicates in
 // worker_client.cpp use these instead of core::cpp_core() directly). In daemon
@@ -133,13 +168,13 @@ bool runConnectionReady(RunLane lane);
 bool available();
 bool ensureLoaded(std::string& err);
 
-// GUI-thread daemon liveness: probes the socket and, when dead, attempts a
-// bounded reconnect with backoff (1s → 2s → 5s → every 10s). After 3 failed
+// GUI-thread daemon liveness: probes the socket and, when dead, queues a reconnect
+// on GuiConnection's worker with backoff (1s → 2s → 5s → every 10s). Without a
+// GuiConnection, callers retain the blocking bounded-reconnect contract. After 3 failed
 // connects it spawns a new hostd, rate limited — never while a draining hostd
 // refuses this client (daemonRefusal()), because that daemon still holds the
 // instance lock. InProc / non-daemon → InProc (no-op). Call once per frame from
 // engineEventsTick before bootstrap/drain.
-enum class DaemonConnState { InProc, Connected, Unreachable };
 DaemonConnState maintainConnection();
 
 }  // namespace engine

@@ -21,3 +21,7 @@ struct Mesh {
 // Load a binary STL. Welds coincident vertices and averages face normals so curved
 // surfaces shade smoothly. Returns false on read/parse failure.
 bool loadBinarySTL(const std::string& path, Mesh& out, std::string& err);
+#ifdef __EMSCRIPTEN__
+// Parse a fetched binary STL directly from its in-memory response.
+bool loadBinarySTLBytes(const uint8_t* data, size_t size, Mesh& out, std::string& err);
+#endif

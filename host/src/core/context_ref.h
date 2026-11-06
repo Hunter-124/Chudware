@@ -5,7 +5,7 @@
 // The same record is the pending chip above the composer, the chip on the SENT user bubble
 // (persisted with the conversation) and — through contextRefToJson — one element of the turn
 // payload's `context_refs` array, which the worker resolves against the engine and renders into
-// the prompt (services/agent/worker_rpc.py::_editor_context_block).
+// the prompt (services/agent/worker_rpc.py::_picked_context_text).
 #pragma once
 
 #include <cstdint>
@@ -61,7 +61,7 @@ std::vector<ContextRef> contextRefsFromJson(const nlohmann::json& arr);
 std::string contextRefGeometry(const ContextRef& ref);
 
 // A model-facing "Context references:" block for the lanes the worker renderer does not reach
-// (the explicit offline core route and a mid-run steer). Empty for no refs.
+// (a mid-run steer). Empty for no refs.
 std::string contextRefsPromptText(const std::vector<ContextRef>& refs);
 
 }  // namespace core

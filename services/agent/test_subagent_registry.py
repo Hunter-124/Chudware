@@ -38,9 +38,6 @@ def _tmp_registry(tmp_path, monkeypatch):
     # provider. Force the legacy no-assignment path instead.
     monkeypatch.setattr("services.agent.config.load_config", lambda *a, **k: {})
     monkeypatch.setattr(
-        "services.agent.role_models.resolve_for_node", lambda *a, **k: None
-    )
-    monkeypatch.setattr(
         "services.agent.role_models.resolve_role_model", lambda *a, **k: None
     )
     # bind_session is a process-level global: clear it so a session-bound raw
@@ -365,7 +362,7 @@ def test_run_turn_honors_terminate_at_boundary():
 
 
 def test_delegate_registers_streams_spawn_and_executes(monkeypatch, tmp_path):
-    from services.agent import chudcode_roles
+    from services.agent import omp_roles
     monkeypatch.delenv("CHUDWARE_PROJECT_DIR", raising=False)
     monkeypatch.delenv("CHUDWARE_FS_ROOT", raising=False)
     project = tmp_path / "active-project"
@@ -377,7 +374,7 @@ def test_delegate_registers_streams_spawn_and_executes(monkeypatch, tmp_path):
         events.append(dict(data))
 
     monkeypatch.setattr(
-        chudcode_roles,
+        omp_roles,
         "run_role_turn",
         lambda *args, **kwargs: {
             "success": True,
@@ -414,10 +411,10 @@ def test_delegate_registers_streams_spawn_and_executes(monkeypatch, tmp_path):
 
 
 def test_delegate_without_python_provider_surfaces_chudcode_failure(monkeypatch):
-    from services.agent import chudcode_roles
+    from services.agent import omp_roles
 
     monkeypatch.setattr(
-        chudcode_roles,
+        omp_roles,
         "run_role_turn",
         lambda *args, **kwargs: {
             "success": False,

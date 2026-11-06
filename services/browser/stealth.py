@@ -9,28 +9,23 @@ that still resolves in front of real content is handled as a data-quality signal
 (:mod:`.challenge`) — its markup is skipped, not parsed as product data — rather
 than treated as a stop sign.
 
-The governing principle is **consistency, not mimicry**. An inconsistent
-fingerprint (UA header says Chrome but ``navigator.webdriver`` is true, or
-``Sec-CH-UA`` still says ``HeadlessChrome``) reads to a bot-scorer as *active
-evasion* — worse than a plain automated browser. So every value we present is
-derived from the REAL bundled Chromium at its REAL version, with only the
-"Headless" label stripped; the OS stays honest (Linux). The one deliberate
-exception is the WebGL vendor/renderer (see INIT_SCRIPT): CEF's
-``--use-angle=swiftshader`` crash-workaround leaks a "SwiftShader" software-GL
-renderer that is itself a strong bot tell, so we mask it with a plausible
-desktop-Linux Intel/Mesa GPU consistent with the Linux UA.
+The governing principle is **consistency, not mimicry**. The UA and client hints
+use the bundled Chromium version and the current operating system, with the
+"Headless" label stripped. The deliberate exception is the headless WebGL
+vendor/renderer (see INIT_SCRIPT): a static Intel/Mesa value masks SwiftShader
+and is not derived from the actual GPU or operating system.
 
 Applied identically to both browser surfaces so they share one fingerprint:
   * page fetches — :mod:`.session` (browser_fetch / browser_login / browser_download)
   * interactive login wizard — :mod:`.embed`
 
-Empirically verified on Chromium 149 (2026-07-07): with the launch flag +
-CDP ``Network.setUserAgentOverride`` below, a header reflector sees
-``User-Agent: …Chrome/149…`` and ``Sec-CH-UA: "Chromium";v="149", "Google
-Chrome";v="149", "Not)A;Brand";v="24"`` — no "Headless" in either, versions
-agree, platform "Linux".
+On Linux with Chromium 149 (2026-07-07), a header reflector showed agreeing
+Chrome and client-hint versions and platform "Linux". Other supported desktop
+systems use their own corresponding UA and client-hint platform.
 """
 from __future__ import annotations
+
+import platform
 
 from typing import Any
 
@@ -39,9 +34,9 @@ from typing import Any
 # it whenever a real Chromium is present.
 FALLBACK_FULL_VERSION = "149.0.7827.55"
 
-# Desktop-Linux Chrome UA. ``{ver}`` is the full Chromium version — matching the
-# real binary keeps the UA header consistent with the native Sec-CH-UA brands.
-_UA_TEMPLATE = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+# Chrome's reduced desktop OS tokens still identify the actual OS. The version
+# is the full detected Chromium version, matching the client-hint brands.
+_UA_TEMPLATE = ("Mozilla/5.0 ({os}) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/{ver} Safari/537.36")
 
 _ACCEPT_LANGUAGE = "en-US,en;q=0.9"
@@ -124,13 +119,43 @@ INIT_SCRIPT = _INIT_SCRIPT_BASE + "\n" + _INIT_SCRIPT_WEBGL
 INIT_SCRIPT_HEADED = _INIT_SCRIPT_BASE
 
 
+def _platform_identity() -> tuple[str, str, str]:
+    """Return the UA OS token, navigator.platform and UA-CH platform."""
+    system = platform.system()
+    if system == "Darwin":
+        # Chrome uses this legacy Intel token even on Apple Silicon.
+        return "Macintosh; Intel Mac OS X 10_15_7", "MacIntel", "macOS"
+    if system == "Windows":
+        return "Windows NT 10.0; Win64; x64", "Win32", "Windows"
+    if system == "Linux":
+        return "X11; Linux x86_64", "Linux x86_64", "Linux"
+    # Do not silently claim Linux on other desktop platforms.
+    native = " ".join(part for part in (system, platform.machine()) if part)
+    return f"X11; {native}", native, system
+
+
+def _cpu_metadata() -> tuple[str, str]:
+    """Return UA-CH architecture and bitness when the machine is known."""
+    machine = platform.machine().lower()
+    if machine in ("x86_64", "amd64", "x64"):
+        return "x86", "64"
+    if machine in ("x86", "i386", "i486", "i586", "i686"):
+        return "x86", "32"
+    if machine in ("arm64", "arm64e", "aarch64"):
+        return "arm", "64"
+    if machine.startswith("arm"):
+        return "arm", "32"
+    return "", ""
+
+
 def _major(full_version: str) -> str:
     return (full_version or FALLBACK_FULL_VERSION).split(".")[0]
 
 
 def user_agent(full_version: str) -> str:
     """Desktop Chrome UA string for ``full_version`` (Headless label stripped)."""
-    return _UA_TEMPLATE.format(ver=full_version or FALLBACK_FULL_VERSION)
+    os_token, _, _ = _platform_identity()
+    return _UA_TEMPLATE.format(os=os_token, ver=full_version or FALLBACK_FULL_VERSION)
 
 
 def launch_args(*, headless: bool) -> list[str]:
@@ -158,6 +183,9 @@ def context_options(ua: str) -> dict[str, Any]:
 
 
 def _ua_metadata(full_version: str) -> dict[str, Any]:
+    full_version = full_version or FALLBACK_FULL_VERSION
+    _, _, client_platform = _platform_identity()
+    architecture, bitness = _cpu_metadata()
     major = _major(full_version)
     # Mirror what real desktop Chrome sends, swapping the "HeadlessChrome" brand
     # (which the native client-hints emit) for "Google Chrome".
@@ -175,12 +203,12 @@ def _ua_metadata(full_version: str) -> dict[str, Any]:
         "brands": brands,
         "fullVersion": full_version,
         "fullVersionList": full_list,
-        "platform": "Linux",
+        "platform": client_platform,
         "platformVersion": "",
-        "architecture": "x86",
+        "architecture": architecture,
         "model": "",
         "mobile": False,
-        "bitness": "64",
+        "bitness": bitness,
         "wow64": False,
     }
 
@@ -190,10 +218,11 @@ def cdp_ua_override_params(ua: str, full_version: str) -> dict[str, Any]:
     the Sec-CH-UA client hints together so they can't drift apart. This is the
     piece that scrubs "HeadlessChrome" from Sec-CH-UA (the context ``user_agent``
     kwarg only touches the UA header)."""
+    _, navigator_platform, _ = _platform_identity()
     return {
         "userAgent": ua,
         "acceptLanguage": _CDP_ACCEPT_LANGUAGE,  # unweighted; CDP adds q itself
-        "platform": "Linux x86_64",
+        "platform": navigator_platform,
         "userAgentMetadata": _ua_metadata(full_version),
     }
 

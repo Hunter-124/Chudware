@@ -62,9 +62,9 @@ class CoreFamiliesAdapter:
         norm = query.strip().lower()
         results = []
         for rec in self.iter_records():
-            title = (rec.get("title") or "").lower()
-            designation = (rec.get("designation") or "").lower()
-            if norm in title or norm in designation:
+            text = " ".join(str(rec.get(key) or "")
+                            for key in ("title", "designation", "description")).lower()
+            if norm in text:
                 results.append(rec)
         return results
 
@@ -95,12 +95,12 @@ class CoreFamiliesAdapter:
             family = fam_entry.get("key") or fam_entry.get("family") or ""
             if not family:
                 continue
-            description = fam_entry.get("description") or fam_entry.get("name") or family
+            description = str(fam_entry.get("description") or "")
             sizes = fam_entry.get("sizes") or []
             if not sizes:
                 continue
             for size in sizes:
-                yield _make_record(family, str(size), description)
+                yield _make_record(family, str(size), description, fam_entry)
 
 
 # ---------------------------------------------------------------------------
@@ -113,22 +113,25 @@ def _family_of(rec: dict) -> str:
     return gr.get("family") or ""
 
 
-def _make_record(family: str, size: str, description: str) -> dict:
+def _make_record(family: str, size: str, description: str, entry: dict) -> dict:
     catalog_id = f"{family}:{size}"
     part_id = f"mech_family:{catalog_id}"
-    title = f"{description} {size}".strip()
+    family_label = str(entry.get("name") or family.replace("_", " ").title())
+    title = f"{family_label} {size}".strip()
+    geometry_ref = {"kind": "core_family", "family": family, "size": size}
+    for field in ("needs_length", "lengths_mm"):
+        if field in entry:
+            geometry_ref[field] = entry[field]
     return {
         "part_id":      part_id,
         "domain":       "mech_family",
         "title":        title,
-        "standard":     None,
+        "family":       family_label,
+        "description":  description,
+        "standard":     entry.get("standard"),
         "designation":  size,
         "params":       {"family": family, "size": size},
-        "geometry_ref": {
-            "kind":   "core_family",
-            "family": family,
-            "size":   size,
-        },
+        "geometry_ref": geometry_ref,
         "sourcing":     [],
         "provenance":   "Chudware core/parts parametric catalog; proprietary.",
         "license":      "proprietary",

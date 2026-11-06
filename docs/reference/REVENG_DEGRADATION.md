@@ -28,7 +28,7 @@ into `single_photo`. `missing` lists the provisioning keys whose artifact is abs
 | Key | Kind / mode | Available when |
 |-----|-------------|----------------|
 | `colmap` | Python (`pip`) | `pycolmap` imports in the services Python runtime (no `COLMAP_BIN` lookup) |
-| `openmvs` | binary (`env`, AGPL) | `OPENMVS_BIN` names an existing path or a command on `PATH`, else `openmvs` is on `PATH` |
+| `openmvs` | binary (`download`, AGPL) | `OPENMVS_BIN` directory (authoritative when set), else the five tools on `PATH`, else the managed install `$XDG_DATA_HOME/Chudware/tools/openmvs/v2.4.0/` (default `~/.local/share/...`) |
 | `brush` | binary (`download`) | `BRUSH_BIN` resolves via `PATH` lookup (an explicit override is authoritative even when invalid), else the managed install `$XDG_DATA_HOME/Chudware/tools/brush/v0.3.0/brush_app` (default `~/.local/share/...`) is executable |
 | `triposr` | weights (`download`) | `TRIPOSR_WEIGHTS` names an existing path or a command on `PATH` (no cache probe) |
 | `vggt` | weights (`env`) | `VGGT_WEIGHTS` names an existing path or a command on `PATH`, else `vggt` on `PATH` |
@@ -57,8 +57,8 @@ Emitted verbatim by `reveng_status()`:
 | Condition | Banner |
 |-----------|--------|
 | `sparse` false | `Sparse reconstruction unavailable: install pycolmap in the services Python runtime.` |
-| `openmvs` absent | `Dense mesh (OpenMVS) not configured. OpenMVS is AGPL-3.0 -> install it yourself and set OPENMVS_BIN (subprocess only, never bundled).` |
-| `splat` false | `3D Gaussian Splatting needs pycolmap and Brush: python scripts/provision_reveng.py.` |
+| `openmvs` absent | `Dense mesh (OpenMVS) not installed: use reveng_install_tools (or add its tools to PATH / set OPENMVS_BIN).` |
+| `splat` false | `3D Gaussian Splatting needs pycolmap and Brush: use reveng_install_tools.` |
 | `single_photo` false | `Single-photo tier unavailable: TripoSR/TRELLIS weights not provisioned.` |
 | `cad_recode` absent | `ML parametric (CAD-Recode) unavailable: set CAD_RECODE_WEIGHTS or snapshot_download('filapro/cad-recode-v1.5') (~4GB VRAM bf16).` |
 
@@ -97,7 +97,7 @@ agent provider layer.
 | Backend | License (descriptor) | Policy in code |
 |---------|----------------------|----------------|
 | pycolmap | BSD-3-Clause | optional Python import in the services runtime; never bundles the COLMAP binary |
-| OpenMVS | **AGPL-3.0** | `mode: "env"`, no fetch URL — **subprocess only, never linked/bundled/auto-fetched**; user installs and sets `OPENMVS_BIN` |
+| OpenMVS | **AGPL-3.0** | `mode: "download"`; `scripts/provision_reveng.py` installs the SHA-256-pinned v2.4.0 Linux x86_64 release. Run as a subprocess only, never linked or bundled; `OPENMVS_BIN` / `PATH` override |
 | Brush | Apache-2.0 | subprocess; `scripts/provision_reveng.py` installs the v0.3.0 Linux x86_64 release verified against the pinned SHA256 (or clones the pinned source with `--source-checkout`) |
 | TripoSR | MIT | weights descriptor, SHA256 `PENDING` — a download path must refuse until a real hash is pinned |
 | TRELLIS | MIT | as TripoSR |

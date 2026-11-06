@@ -81,7 +81,7 @@ def _make_record(series: str, w_mm: float, h_mm: float, slot_mm: float,
     w_in, h_in = w_mm / _MM_PER_IN, h_mm / _MM_PER_IN
     size_label = (f"{w_mm:g}mm x {h_mm:g}mm" if is_metric
                   else f"{w_in:g}\" x {h_in:g}\"")
-    title = f"{series} T-Slot Aluminum Extrusion {size_label} {synonyms} {_ALLOY_SYN}"
+    title = f"{series} T-Slot Aluminum Extrusion {size_label}, {_ALLOY}"
     params = {
         "series": series,
         "width_mm": w_mm,
@@ -104,6 +104,8 @@ def _make_record(series: str, w_mm: float, h_mm: float, slot_mm: float,
         "part_id": f"section:T-SLOT:{series}",
         "domain": _DOMAIN,
         "title": title,
+        "family": "T-Slot Aluminum Extrusion",
+        "aliases": [synonyms, _ALLOY_SYN],
         "standard": "T-SLOT",
         "designation": series,
         "params": params,
@@ -144,7 +146,8 @@ class ExtrusionAdapter:
         recs = list(self.iter_records())
         if not norm:
             return recs
-        return [r for r in recs if norm in r["title"].lower()]
+        return [r for r in recs
+                if norm in " ".join([r["title"], *r["aliases"]]).lower()]
 
     def get(self, part_id: str) -> dict | None:
         if not part_id or not part_id.startswith("section:T-SLOT:"):

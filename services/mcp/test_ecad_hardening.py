@@ -16,11 +16,18 @@ import pathlib
 import tempfile
 import time
 
+import pytest
+
 import services.mcp.ecad_common as et  # budget/session internals moved
 import services.mcp.ecad_sch_tools as sch_tools
 from services.ecad import autosave as eauto
 from services.mcp.ecad_common import ecad_session as esess
 from services.mcp.ecad_tools import register_ecad_tools
+
+
+@pytest.fixture(autouse=True)
+def _isolated_ecad_workspace(monkeypatch, tmp_path):
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(tmp_path))
 
 
 class _StubMCP:
@@ -269,12 +276,10 @@ def test_terminal_job_retention_has_a_hard_count_bound() -> None:
 
 def test_autoroute_overrun_returns_clean_message() -> None:
     """A router overrun returns a job and the test drains that worker before teardown."""
-    import services.mcp.ecad_pcb_tools as _pcb_tools  # tool RPCs via ecad_common._rpc
-
     tools = _tools()
     _call(tools, "ecad_new_pcb", name="HeavyBoard")
 
-    orig = _pcb_tools._rpc
+    orig = et._rpc
     orig_budget = et._ECAD_HEAVY_BUDGET_S
     gate = et._threading.Event()
     et._ECAD_HEAVY_BUDGET_S = 1.0
@@ -287,7 +292,7 @@ def test_autoroute_overrun_returns_clean_message() -> None:
             return {"ok": True, "routed": True}
         return orig(method, params)
 
-    _pcb_tools._rpc = _slow_rpc
+    et._rpc = _slow_rpc
     try:
         t0 = time.time()
         p = _call(tools, "ecad_autoroute")
@@ -301,7 +306,7 @@ def test_autoroute_overrun_returns_clean_message() -> None:
             if drained.get("status") in ("done", "error"):
                 break
             time.sleep(0.01)
-        _pcb_tools._rpc = orig
+        et._rpc = orig
         et._ECAD_HEAVY_BUDGET_S = orig_budget
 
     assert dt < 3, f"autoroute hung past its budget ({dt:.1f}s) — would trip the transport timeout"
@@ -319,11 +324,13 @@ def test_simulate_overrun_returns_clean_message() -> None:
     # minimal sim-able schematic: a source + resistor to ground (recipe via ecad_design is heavy;
     # build by hand so the test is fast and deterministic).
     _call(tools, "ecad_new_schematic", name="SimBoard")
-    _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:V_source", x=0, y=0,
-          ref="V1", value="5")
+    source = _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:VDC", x=0, y=0,
+                   ref="V1", value="5")
     _call(tools, "ecad_place_symbol", libid="Device:R", x=10, y=0, ref="R1", value="1k")
     _call(tools, "ecad_wire", from_ref="V1", from_pin="1", to_ref="R1", to_pin="1")
-    _call(tools, "ecad_add_power", net="GND", x=0, y=-10)
+    _call(tools, "ecad_wire", from_ref="V1", from_pin="2", to_ref="R1", to_pin="2")
+    negative = next(pin["xy"] for pin in source["pins"] if pin["number"] == "2")
+    _call(tools, "ecad_add_power", net="GND", x=negative[0], y=negative[1])
 
     orig = _sim_tools._sim_run
     orig_budget = et._ECAD_HEAVY_BUDGET_S
@@ -365,11 +372,16 @@ def test_nonconvergence_is_not_reported_as_success() -> None:
 
     tools = _tools()
     _call(tools, "ecad_new_schematic", name="Nonconverged")
-    _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:V_source",
-          x=0, y=0, ref="V1", value="5")
+    source = _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:VDC",
+                   x=0, y=0, ref="V1", value="5")
     _call(tools, "ecad_place_symbol", libid="Device:R",
           x=10, y=0, ref="R1", value="1k")
     _call(tools, "ecad_wire", from_ref="V1", from_pin="1", to_ref="R1", to_pin="1")
+    _call(tools, "ecad_wire", from_ref="V1", from_pin="2", to_ref="R1", to_pin="2")
+    negative = next(pin["xy"] for pin in source["pins"] if pin["number"] == "2")
+    _call(tools, "ecad_add_power", net="GND", x=negative[0], y=negative[1])
+    positive = next(pin["xy"] for pin in source["pins"] if pin["number"] == "1")
+    _call(tools, "ecad_label", text="OUT", x=positive[0], y=positive[1])
 
     original = _sim_tools._sim_run
 
@@ -385,7 +397,7 @@ def test_nonconvergence_is_not_reported_as_success() -> None:
     _sim_tools._sim_run = _nonconverged
     try:
         simulation = _call(tools, "ecad_simulate", analysis="op")
-        transfer = _call(tools, "ecad_tf", output="V(N$1)", source="V1")
+        transfer = _call(tools, "ecad_tf", output="V(OUT)", source="V1")
     finally:
         _sim_tools._sim_run = original
 
@@ -416,7 +428,8 @@ def test_mcp_autosave_and_recover() -> None:
         r = _call(tools, "ecad_new_schematic", name="AutosaveMe")
         _call(tools, "ecad_place_symbol", libid="Device:R", x=0, y=0, ref="R1", value="4k7")
         sch_id = r["doc_id"]
-        assert (pathlib.Path(d) / f"{sch_id}.json").exists(), "tool mutation did not autosave"
+        assert pathlib.Path(r["path"]).is_file()
+        assert eauto._STATE["snapshots"][sch_id].exists(), "tool mutation did not autosave"
 
         # simulate a restart: a fresh process session id + cleared registry, then recover.
         et._ECAD_SESSION_ID = "RESTARTED"
@@ -475,7 +488,7 @@ def test_recover_never_overwrites_active_docs() -> None:
         r = _call(tools, "ecad_new_schematic", name="OldDoc")
         _call(tools, "ecad_place_symbol", libid="Device:R", x=0, y=0, ref="R1", value="1k")
         old_id = r["doc_id"]
-        assert (pathlib.Path(d) / f"{old_id}.json").exists()
+        assert eauto._STATE["snapshots"][old_id].exists()
 
         # Simulate restart: clear registry + pointers, then create a NEW live doc BEFORE recover.
         et._ECAD_SESSION_ID = "RESTARTED2"
@@ -564,7 +577,7 @@ def test_ecad_design_slow_provider_falls_back_promptly() -> None:
     os.environ["CHUDWARE_ECAD_PLAN_BUDGET_S"] = "1.0"
 
     # Patch the resolver ecad_design actually calls, not the retired SDK config seam.
-    from services.agent.providers import chudcode_provider as helper
+    from services.agent.providers import omp_provider as helper
     orig_get = helper.helper_provider
 
     def resolve_provider(role, *, cancel=None, timeout=None):

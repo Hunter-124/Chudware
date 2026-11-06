@@ -11,6 +11,7 @@
 #include <map>
 #include <limits>
 #include <regex>
+#include <string_view>
 #include <set>
 #include <vector>
 
@@ -329,6 +330,11 @@ void op_sch_add_symbol(json& doc, const json& op, int index, json& id_map, json&
         def.contains("datasheet") && def["datasheet"].is_string()
             ? def["datasheet"].get<std::string>()
             : std::string();
+    json fields = def.contains("fields") && def["fields"].is_object()
+                      ? def["fields"] : json::object();
+    if (op.contains("fields"))
+        for (auto it = op["fields"].begin(); it != op["fields"].end(); ++it)
+            fields[it.key()] = it.value();
     json sym{
         {"id", sid},
         {"libid", libid},
@@ -339,7 +345,7 @@ void op_sch_add_symbol(json& doc, const json& op, int index, json& id_map, json&
         {"angle", op.contains("angle") ? op["angle"].get<double>() : 0.0},
         {"mirror", mirror},
         {"unit", op.contains("unit") ? op["unit"].get<int>() : 1},
-        {"fields", op.contains("fields") ? op["fields"] : json::object()},
+        {"fields", std::move(fields)},
         {"in_bom", op.value("in_bom", true)},
         {"on_board", op.value("on_board", true)},
         {"dnp", op.value("dnp", false)},
@@ -942,6 +948,76 @@ std::string pin_number(const json& pin) {
                                      : pin["number"].dump();
 }
 
+// Resolve the physical pin first by number, then name, then the KiCad model
+// terminal recorded in Sim.Pins. Instance fields override library defaults.
+const json* route_pin(const json& def, const json& symbol, const std::string& requested) {
+    const json& pins = def["pins"];
+    const int unit = symbol_unit(symbol);
+    auto number_matches = [](const json& pin, std::string_view number) {
+        if (!pin.contains("number")) return false;
+        if (pin["number"].is_string())
+            return std::string_view(pin["number"].get_ref<const std::string&>()) == number;
+        return std::string_view(pin_number(pin)) == number;
+    };
+    for (const json& pin : pins)
+        if (pin.is_object() && pin_on_unit(pin, unit) && number_matches(pin, requested))
+            return &pin;
+    for (const json& pin : pins) {
+        if (!pin.is_object() || !pin_on_unit(pin, unit) || !pin.contains("name")) continue;
+        if (pin["name"].is_string() ? pin["name"].get_ref<const std::string&>() == requested
+                                    : pin["name"].dump() == requested)
+            return &pin;
+    }
+
+    const json* mapping = nullptr;
+    if (symbol.contains("fields") && symbol["fields"].is_object() &&
+        symbol["fields"].contains("Sim.Pins"))
+        mapping = &symbol["fields"]["Sim.Pins"];
+    else if (def.contains("fields") && def["fields"].is_object() &&
+             def["fields"].contains("Sim.Pins"))
+        mapping = &def["fields"]["Sim.Pins"];
+    if (!mapping || !mapping->is_string()) return nullptr;
+    const std::string& text = mapping->get_ref<const std::string&>();
+    std::size_t pos = 0;
+    while (pos < text.size()) {
+        while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
+        const std::size_t start = pos;
+        while (pos < text.size() && text[pos] != '=' &&
+               !std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
+        const std::string_view number(text.data() + start, pos - start);
+        while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
+        if (number.empty() || pos == text.size() || text[pos] != '=') {
+            while (pos < text.size() && !std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
+            continue;
+        }
+        ++pos;
+        while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
+        bool matches = false;
+        if (pos < text.size() && text[pos] == '"') {
+            ++pos;
+            std::size_t length = 0;
+            matches = true;
+            while (pos < text.size() && text[pos] != '"') {
+                char c = text[pos++];
+                if (c == '\\' && pos < text.size()) c = text[pos++];
+                if (length >= requested.size() || requested[length] != c) matches = false;
+                ++length;
+            }
+            if (pos < text.size()) ++pos;
+            matches = matches && length == requested.size();
+        } else {
+            const std::size_t value = pos;
+            while (pos < text.size() && !std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
+            matches = std::string_view(text.data() + value, pos - value) == requested;
+        }
+        if (matches)
+            for (const json& pin : pins)
+                if (pin.is_object() && pin_on_unit(pin, unit) && number_matches(pin, number))
+                    return &pin;
+    }
+    return nullptr;
+}
+
 RoutePoint pin_root_world(const json& symbol, const json& pin) {
     json root_pin = pin;
     root_pin["length"] = 0.0;
@@ -1040,15 +1116,10 @@ RouteEndpoint route_endpoint(const json& doc, const json& ref, const json& id_ma
         doc["lib_cache"].contains(libid)) {
         const json& def = doc["lib_cache"][libid];
         if (def.is_object() && def.contains("pins") && def["pins"].is_array()) {
-            const int unit = symbol_unit(*symbol);
-            for (const json& pin : def["pins"]) {
-                if (!pin.is_object() || !pin_on_unit(pin, unit)) continue;
+            const json* resolved = route_pin(def, *symbol, requested);
+            if (resolved) {
+                const json& pin = *resolved;
                 const std::string number = pin_number(pin);
-                const std::string name =
-                    pin.contains("name") && pin["name"].is_string()
-                        ? pin["name"].get<std::string>()
-                        : (pin.contains("name") ? pin["name"].dump() : std::string());
-                if (number != requested && name != requested) continue;
                 RouteEndpoint endpoint;
                 endpoint.symbol = symbol;
                 endpoint.symbol_id = symbol_id;
@@ -1655,6 +1726,33 @@ void op_sch_delete_sheet_pin(json& doc, const json& op, int index, json& id_map)
     (*symbol)["pins"] = std::move(kept);
 }
 
+void strip_raw_uuids(json& value) {
+    if (!value.is_array()) return;
+    for (std::size_t i = value.size(); i > 0; --i) {
+        json& part = value[i - 1];
+        if (part.is_array() && part.size() > 1 && part[0] == "uuid")
+            value.erase(i - 1);
+        else strip_raw_uuids(part);
+    }
+}
+
+// Copies are new KiCad objects, including their nested pins/pads/graphics.
+void clear_copy_uuids(json& object) {
+    if (object.is_array()) {
+        for (auto& item : object) clear_copy_uuids(item);
+        return;
+    }
+    if (!object.is_object()) return;
+    object.erase("uuid");
+    object.erase("kicad_pins");
+    object.erase("kicad_segments");
+    if (object.contains("fields") && object["fields"].is_object())
+        object["fields"].erase("kicad_uuid");
+    if (object.contains("kicad_extra")) strip_raw_uuids(object["kicad_extra"]);
+    for (const char* key : {"pins", "pads", "graphics", "kicad_original"})
+        if (object.contains(key)) clear_copy_uuids(object[key]);
+}
+
 void op_sch_import_kicad(json& doc, const json& op, int index, json& id_map,
                          json& warnings) {
     require_sch(doc, index);
@@ -1705,6 +1803,11 @@ void op_sch_import_kicad(json& doc, const json& op, int index, json& id_map,
             allocator[spec.key] = json::array();
         for (json& item : imported[spec.key]) {
             if (!item.is_object()) continue;
+            if (mode == "merge") {
+                clear_copy_uuids(item);
+                if (std::string(spec.key) == "symbols" || std::string(spec.key) == "power" ||
+                    std::string(spec.key) == "sheet_symbols") item["kicad_copy"] = true;
+            }
             const std::string old_id = item.value("id", std::string());
             const std::string new_id = next_id(allocator, spec.prefix);
             allocator[spec.key].push_back({{"id", new_id}});
@@ -1730,6 +1833,14 @@ void op_sch_import_kicad(json& doc, const json& op, int index, json& id_map,
     if (imported.contains("lib_cache") && imported["lib_cache"].is_object())
         for (auto it = imported["lib_cache"].begin(); it != imported["lib_cache"].end(); ++it)
             doc["lib_cache"][it.key()] = it.value();
+    if (imported.contains("kicad") && imported["kicad"].contains("lib_symbols") &&
+        imported["kicad"]["lib_symbols"].is_object()) {
+        if (!doc.contains("kicad") || !doc["kicad"].is_object()) doc["kicad"] = json::object();
+        if (!doc["kicad"].contains("lib_symbols") || !doc["kicad"]["lib_symbols"].is_object())
+            doc["kicad"]["lib_symbols"] = json::object();
+        for (const auto& [libid, node] : imported["kicad"]["lib_symbols"].items())
+            doc["kicad"]["lib_symbols"][libid] = node;
+    }
 
     for (const EntitySpec& spec : specs) {
         if (mode == "replace") {
@@ -1834,6 +1945,7 @@ json resolve_fp_def(const json&, const std::string& fpid, const json& caller_def
     return json{{"fpid", fpid}, {"pads", json::array()}};
 }
 
+
 void op_pcb_add_footprint(json& doc, const json& op, int index, json& id_map) {
     require_pcb(doc, index);
     if (!op.contains("fpid") || !op["fpid"].is_string() || op["fpid"].get<std::string>().empty())
@@ -1853,6 +1965,9 @@ void op_pcb_add_footprint(json& doc, const json& op, int index, json& id_map) {
                {"side", side}, {"pads", pads},
                {"graphics", fpdef.contains("graphics") ? fpdef["graphics"] : json::array()},
                {"attr", fpdef.value("attr", std::string("smd"))}};
+    if (fpdef.value("_chudware_custom", false)) fp["_chudware_custom"] = true;
+    clear_copy_uuids(fp["pads"]);
+    clear_copy_uuids(fp["graphics"]);
     if (op.contains("linked_symbol") && !op["linked_symbol"].is_null())
         fp["linked_symbol"] = resolve_placeholder(op["linked_symbol"], id_map, index);
     doc["footprints"].push_back(fp);

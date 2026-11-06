@@ -7,7 +7,8 @@ Proves the deterministic offline/test-harness conversation-history contract:
   * No history keeps the prior message shape unchanged.
   * Malformed entries are dropped, never crashed on.
   * Caps (<=12 entries, <=8000 chars total, clip to 1500 + " …") are enforced
-    by dropping from the front so recent turns are kept.
+    by dropping from the front in aligned chunks so recent turns are kept and
+    the window prefix only changes once per chunk.
   * The current request stays the last user message and is never merged into
     history; _request_wants_work sees only the request.
 
@@ -17,8 +18,21 @@ Run: pytest services/agent/test_conversation_history.py -q -p no:randomly
 
 from __future__ import annotations
 
+import pytest
+
 from services.agent import agent_turn
 from services.agent import mission_dispatch
+
+
+@pytest.fixture(autouse=True)
+def _no_request_dependent_tail(monkeypatch):
+    """Skill activation and project-memory recall ride at the tail of the
+    current user message and depend on process-wide session state; these tests
+    pin the exact message shape, so take both out of the picture."""
+    monkeypatch.setattr("services.agent.skills.activate_for_prompt",
+                        lambda *a, **k: [])
+    monkeypatch.setattr("services.agent.config.memory_enabled",
+                        lambda *a, **k: False)
 
 
 class _RecordingProvider:
@@ -143,6 +157,44 @@ def test_caps_drop_from_the_front():
     # The current request is untouched and last.
     assert msgs[-1]["role"] == "user"
     assert msgs[-1]["content"][0]["text"] == "current question"
+
+
+def _grow(n):
+    return [
+        {"role": "user" if i % 2 == 0 else "assistant", "text": f"entry-{i:02d}"}
+        for i in range(n)
+    ]
+
+
+def test_window_prefix_is_stable_while_history_fits_and_moves_in_chunks():
+    """A local server reuses its KV cache only for an identical prefix, and the
+    transcript is re-sent every turn. Under the caps turn N+1 must only APPEND
+    to turn N's history; past the entry cap the front is dropped in aligned
+    chunks, so consecutive turns share the same first entry."""
+    firsts = []
+    prev = None
+    for n in range(1, 31):
+        kept = agent_turn._sanitize_history(_grow(n))
+        if prev is not None and n <= 12:
+            assert kept[:len(prev)] == prev
+        firsts.append(kept[0][1])
+        prev = kept
+    assert firsts[:12] == ["entry-00"] * 12
+    # Windows may only restart on a chunk boundary, never entry by entry.
+    assert all(
+        int(first.split("-")[1]) % agent_turn._HISTORY_DROP_CHUNK == 0
+        for first in firsts
+    )
+    assert len(set(firsts)) <= 1 + 30 // agent_turn._HISTORY_DROP_CHUNK
+
+
+def test_oversized_window_falls_back_to_the_newest_entries_that_fit():
+    # Six full-size entries exceed the char cap, and dropping the only aligned
+    # chunk would empty the window: keep the newest entries that fit instead.
+    big = [{"role": "user", "text": "z" * 1500} for _ in range(6)]
+    kept = agent_turn._sanitize_history(big)
+    assert len(kept) == 5
+    assert sum(len(text) for _, text in kept) <= 8000
 
 
 def test_single_entry_clip_to_1500_with_ellipsis():

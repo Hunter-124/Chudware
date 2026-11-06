@@ -20,6 +20,12 @@ namespace ui {
 
 namespace {
 
+struct RebuildInFlight {
+  explicit RebuildInFlight(AppState &state) : st(state) { ++st.rebuildsInFlight; }
+  ~RebuildInFlight() { --st.rebuildsInFlight; }
+  AppState &st;
+};
+
 struct TopologyPrintProcesses {
   std::vector<nlohmann::json> entries;
   std::vector<std::string> labels, tips;
@@ -293,18 +299,20 @@ std::string SimManager::topologyGeometryKey(AppState &st) {
   if (!st.docMirror.hasDoc())
     return {};
   const long rev = (long)st.docMirror.revision();
-  if (topoGeomDocId_ == st.docMirror.docId() && topoGeomRevision_ == rev)
+  if (topoGeomDocId_ == st.docMirror.docId() && topoGeomRevision_ == rev &&
+      topoGeomMutationGeneration_ == st.docMirror.mutationGen())
     return topoGeomKey_;
   // Runtime identity changes on reopen, but unchanged source geometry stays current.
   topoGeomKey_ = topology::geometryKey(st.docMirror.tree());
   topoGeomDocId_ = st.docMirror.docId();
   topoGeomRevision_ = rev;
+  topoGeomMutationGeneration_ = st.docMirror.mutationGen();
   return topoGeomKey_;
 }
 
 bool SimManager::topologyReady(AppState &st, const Study &s, std::string &blocker) const {
-  if (activeDocIsAssembly(st)) {
-    blocker = "Topology optimization runs on a part document, not an assembly.";
+  if (activeMechanicalDocumentKind(st) != CommandDocKind::Part) {
+    blocker = "Open a part document for topology optimization.";
     return false;
   }
   if (topoCaps_.state == topology::Capabilities::State::Loading) {
@@ -547,16 +555,27 @@ void SimManager::checkTopologyDfam(AppState &st, Study &s, const std::string &ow
 }
 
 void SimManager::refreshTopologyRunsView(AppState &st, Study &s, bool force) {
-  const nlohmann::json runs = s.topo.value("runs", nlohmann::json::array());
-  const std::string geom = topologyGeometryKey(st);
-  const std::string key = std::to_string(runs.is_array() ? runs.size() : 0) + "|" + geom +
-                          "|" +
-                          (runs.is_array() && !runs.empty() ? topoRunIdOf(runs.back(), runs.size() - 1)
-                                                            : std::string());
-  if (!force && key == s.topoRunsCheckKey)
+  const long revision = (long)st.docMirror.revision();
+  const uint64_t mutation = st.docMirror.mutationGen();
+  if (!force && !s.topoRunsCheckKey.empty() &&
+      s.topoRunsSourceGeneration == parameterSourceGeneration_ &&
+      s.topoRunsMirrorGeneration == mutation && s.topoRunsRevision == revision)
     return;
+  static const nlohmann::json noRuns = nlohmann::json::array();
+  const auto it = s.topo.find("runs");
+  const nlohmann::json &runs =
+      it != s.topo.end() && it->is_array() ? *it : noRuns;
+  const std::string geom = topologyGeometryKey(st);
+  s.topoRunsSourceGeneration = parameterSourceGeneration_;
+  s.topoRunsMirrorGeneration = mutation;
+  s.topoRunsRevision = revision;
+  const std::string key = st.docMirror.docId() + "|" + geom + "|" +
+                          std::to_string(runs.size()) + "|" +
+                          (runs.empty() ? std::string()
+                                        : topoRunIdOf(runs.back(), runs.size() - 1));
+  if (!force && key == s.topoRunsCheckKey) return;
   s.topoRunsCheckKey = key;
-  nlohmann::json view = runs.is_array() ? runs : nlohmann::json::array();
+  nlohmann::json view = runs;
   for (auto &run : view) {
     if (!run.is_object())
       continue;
@@ -764,12 +783,11 @@ void SimManager::continueTopologyInCad(AppState &st, Study &s, const std::string
     return;
   }
   st.toast(ui::ToastLevel::Info, "Creating an editable solid from the optimized surface...");
-  ++st.rebuildsInFlight;
+  const auto rebuildInFlight = std::make_shared<RebuildInFlight>(st);
   st.rpc.call("import_file", {{"path", path}, {"as_solid", true}},
-              [&st](const core::RpcResult &r) {
+              [&st, rebuildInFlight](const core::RpcResult &r) {
     if (!r.ok || !r.result.is_object() || r.result.contains("code") ||
         !simJsonBool(r.result, "ok", true)) {
-      --st.rebuildsInFlight;
       st.toast(ui::ToastLevel::Error, "Could not create the optimized CAD part: " +
           simJsonText(r.result, "message", "error", r.err));
       return;
@@ -778,26 +796,20 @@ void SimManager::continueTopologyInCad(AppState &st, Study &s, const std::string
     if (rebuild.contains("feature_status") && rebuild["feature_status"].is_array())
       for (const auto &f : rebuild["feature_status"])
         if (!simJsonBool(f, "ok", false)) {
-          --st.rebuildsInFlight;
           st.toast(ui::ToastLevel::Error, "Could not create the optimized CAD part: " +
               simJsonText(f, "error", "message", "solid reconstruction failed"));
           return;
         }
     const std::string doc = topoStr(r.result, "doc_id");
     if (doc.empty()) {
-      --st.rebuildsInFlight;
       st.toast(ui::ToastLevel::Error, "Solid import returned no document.");
       return;
     }
-    st.rpc.call("doc_activate", {{"doc_id", doc}},
-                [&st, doc](const core::RpcResult &activated) {
-      --st.rebuildsInFlight;
+    st.rpc.call("doc_activate", {{"doc_id", doc}, {"origin", "system"}},
+                [&st, doc, rebuildInFlight](const core::RpcResult &activated) {
       std::string aicm, err;
-      const bool suppress = st.suppressTabDirty;
-      st.suppressTabDirty = true;
       const bool ok = activated.ok && activated.result.is_object() &&
           st.docMirror.adoptActivateResponse(doc, activated.result, aicm, err);
-      st.suppressTabDirty = suppress;
       if (!ok) {
         st.toast(ui::ToastLevel::Error, "Created the optimized part, but could not open it: " +
             (activated.ok ? err : activated.err));
@@ -808,7 +820,7 @@ void SimManager::continueTopologyInCad(AppState &st, Study &s, const std::string
       st.ensureActiveTab();
       st.clearViewportForNewDoc();
       st.applyDocDrivenVisibility(st.docMirror.tree());
-      st.markActiveTabDirty();
+      st.markHumanEdit(doc, st.docMirror.revision());
       if (!aicm.empty()) {
         st.fitViewOnNextMeshCommit = true;
         st.loadDocMeshAsync(aicm);

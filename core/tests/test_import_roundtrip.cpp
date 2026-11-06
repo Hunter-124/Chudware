@@ -785,6 +785,52 @@ TEST_CASE("modern SolidWorks assembly preserves instances and transforms") {
     fs::remove(source);
 }
 
+TEST_CASE("mesh sewing preserves disconnected solids and nested cavities") {
+    using chudware::doc::MeshData;
+    auto cube = [](MeshData& mesh, double x, double y, double z, double side, bool reverse) {
+        const std::uint32_t base = static_cast<std::uint32_t>(mesh.vertex_count());
+        for (const auto& p : std::array<std::array<double, 3>, 8>{{
+                 {{x,y,z}}, {{x+side,y,z}}, {{x+side,y+side,z}}, {{x,y+side,z}},
+                 {{x,y,z+side}}, {{x+side,y,z+side}}, {{x+side,y+side,z+side}}, {{x,y+side,z+side}}
+             }})
+            mesh.verts.insert(mesh.verts.end(), p.begin(), p.end());
+        static constexpr std::uint32_t faces[] = {
+            0,2,1, 0,3,2, 4,5,6, 4,6,7, 0,1,5, 0,5,4,
+            1,2,6, 1,6,5, 2,3,7, 2,7,6, 3,0,4, 3,4,7
+        };
+        for (std::size_t i = 0; i < sizeof(faces) / sizeof(faces[0]); i += 3) {
+            mesh.tris.push_back(base + faces[i]);
+            mesh.tris.push_back(base + faces[i + (reverse ? 2 : 1)]);
+            mesh.tris.push_back(base + faces[i + (reverse ? 1 : 2)]);
+        }
+    };
+    SUBCASE("separate closed components") {
+        MeshData mesh;
+        cube(mesh, 0, 0, 0, 2, false);
+        cube(mesh, 5, 0, 0, 2, false);
+        const TopoDS_Shape shape = chudware::doc::mesh_to_shape(mesh);
+        REQUIRE_FALSE(shape.IsNull());
+        const auto bodies = chudware::doc::split_import_bodies(shape);
+        REQUIRE(bodies.size() == 2);
+        CHECK(vol(shape) == doctest::Approx(16.0).epsilon(1e-8));
+        Bnd_Box bounds;
+        BRepBndLib::Add(shape, bounds);
+        double x0,y0,z0,x1,y1,z1;
+        bounds.Get(x0,y0,z0,x1,y1,z1);
+        CHECK(x1 - x0 == doctest::Approx(7.0).epsilon(1e-6));
+    }
+    SUBCASE("inner closed shell remains a cavity") {
+        MeshData mesh;
+        cube(mesh, 0, 0, 0, 10, false);
+        cube(mesh, 3, 3, 3, 4, true);
+        const TopoDS_Shape shape = chudware::doc::mesh_to_shape(mesh);
+        REQUIRE_FALSE(shape.IsNull());
+        CHECK(BRepCheck_Analyzer(shape).IsValid());
+        CHECK(chudware::doc::split_import_bodies(shape).size() == 1);
+        CHECK(vol(shape) == doctest::Approx(936.0).epsilon(1e-8));
+    }
+}
+
 // A faceted cylinder wound INSIDE-OUT — exactly the shape a SolidWorks saved-display import
 // arrived in (signed volume -374963 mm³ on a 375017 mm³ spacer, so eval_mass was 28% wrong).
 // mesh_to_shape must hand back a solid with POSITIVE volume, merge each coplanar facet set

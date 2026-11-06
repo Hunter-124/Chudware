@@ -26,26 +26,15 @@
 namespace chudware {
 namespace agent {
 namespace {
-// Per-thread sink so a design/micro run can observe every HTTP completion without
-// threading RunEvents through complete()'s call graph.
-thread_local std::function<void(const json&)> g_provider_call_emitter;
-// Per-thread sink for incremental token deltas (streaming completions). kind is
-// "text" or "thinking". nullptr = no live streaming (behaviour == pre-streaming).
-thread_local std::function<void(const std::string&, const std::string&)> g_provider_delta_emitter;
-// Active run cancel flag (shared with HTTP xfer callback via set_http_cancel_flag).
-thread_local const std::atomic<bool>* g_provider_cancel = nullptr;
-
 // Incremental Server-Sent-Events accumulator for OpenAI-compatible `stream:true`
-// chat completions. feed() is called per received network buffer; it reassembles
-// `data:` lines across buffer boundaries, accumulates content + reasoning deltas,
-// and forwards each delta to the live emitter as it arrives.
+// chat completions. feed() reassembles `data:` lines across network buffers and
+// accumulates content and reasoning deltas.
 struct SseAccum {
     std::string text;
     std::string thinking;
     std::string carry;
     void reset() { text.clear(); thinking.clear(); carry.clear(); }
-    void feed(const char* data, size_t len,
-              const std::function<void(const std::string&, const std::string&)>& emit) {
+    void feed(const char* data, size_t len) {
         carry.append(data, len);
         size_t nl;
         while ((nl = carry.find('\n')) != std::string::npos) {
@@ -65,12 +54,12 @@ struct SseAccum {
             const json& d = j["choices"][0].value("delta", json::object());
             if (d.contains("content") && d["content"].is_string()) {
                 const std::string c = d["content"].get<std::string>();
-                if (!c.empty()) { text += c; if (emit) emit(c, "text"); }
+                if (!c.empty()) text += c;
             }
             for (const char* k : {"reasoning_content", "reasoning"}) {
                 if (d.contains(k) && d[k].is_string()) {
                     const std::string c = d[k].get<std::string>();
-                    if (!c.empty()) { thinking += c; if (emit) emit(c, "thinking"); }
+                    if (!c.empty()) thinking += c;
                     break;
                 }
             }
@@ -118,49 +107,11 @@ std::string request_id_from_body(const std::string& body) {
     return {};
 }
 
-void emit_provider_call(const CompleteResult& res, const std::string& provider) {
-    auto& emit = g_provider_call_emitter;
-    if (!emit) return;
-    json ev = {
-        {"kind", "provider_call"},
-        {"provider", provider},
-        {"endpoint", res.endpoint},
-        {"model", res.model},
-        {"http_status", res.http_status},
-        {"latency_ms", res.latency_ms},
-        {"request_id", res.request_id},
-        {"attempt", res.attempt > 0 ? res.attempt : 1},
-        {"error_excerpt", res.error_excerpt},
-        {"ok", res.error.empty()},
-    };
-    try {
-        emit(ev);
-    } catch (...) {
-    }
-}
 }  // namespace
-
-void set_provider_call_emitter(std::function<void(const json&)> emit) {
-    g_provider_call_emitter = std::move(emit);
-}
-std::function<void(const json&)>& provider_call_emitter() { return g_provider_call_emitter; }
-
-void set_provider_delta_emitter(std::function<void(const std::string&, const std::string&)> emit) {
-    g_provider_delta_emitter = std::move(emit);
-}
-std::function<void(const std::string&, const std::string&)>& provider_delta_emitter() {
-    return g_provider_delta_emitter;
-}
-
-void set_provider_cancel_flag(const std::atomic<bool>* flag) {
-    g_provider_cancel = flag;
-    set_http_cancel_flag(flag);
-}
-const std::atomic<bool>* provider_cancel_flag() { return g_provider_cancel; }
 
 
 const char* kAnthropicDefaultModel = "claude-opus-5-5";
-const char* kOpenAIDefaultModel = "gpt-4o";  // API-key endpoint; GPT-6 Sol is Codex-only
+const char* kOpenAIDefaultModel = "gpt-6-sol";
 
 // --------------------------------------------------------------------------- base.py
 json text_part(const std::string& text) { return json{{"type", "text"}, {"text", text}}; }
@@ -174,7 +125,7 @@ json user_message(const json& parts) { return json{{"role", "user"}, {"content",
 // throws type_error.302 when the key EXISTS but is null (it only returns the default when
 // the key is ABSENT). The resolved provider descriptor sets api_key/base_url to null on
 // purpose (e.g. gemini has base_url:null; llamacpp/local has api_key:null), so value() here
-// would throw -> the run aborts and the host masks it as "unknown method: agent_run_v2".
+// would throw and the RPC would fail with an opaque type_error.
 std::string str_or(const json& cfg, const char* key, const std::string& dflt = std::string()) {
     auto it = cfg.find(key);
     if (it == cfg.end() || !it->is_string()) return dflt;
@@ -899,46 +850,6 @@ std::string MockProvider::complete() {
     std::string reply = replies_[idx];
     ++i_;
     return reply;
-}
-
-std::string RoleScriptedProvider::role_of(const std::string& system) {
-    std::string s;
-    s.reserve(system.size());
-    for (char c : system) s.push_back(static_cast<char>(std::tolower((unsigned char)c)));
-
-    auto starts = [&](const char* pfx) { return s.rfind(pfx, 0) == 0; };
-    if (starts("role:")) {
-        // first line after "role:" up to '\n', then strip the value.
-        std::string first = s.substr(0, s.find('\n'));
-        std::string val = first.substr(first.find(':') + 1);
-        // strip() — leading/trailing whitespace.
-        size_t a = val.find_first_not_of(" \t\r\n");
-        size_t b = val.find_last_not_of(" \t\r\n");
-        if (a == std::string::npos) return std::string();
-        return val.substr(a, b - a + 1);
-    }
-    if (starts("you are the intake")) return "intake";
-    if (s.find("planning a cad build") != std::string::npos) return "planner";
-    if (starts("you are the modeler")) return "modeler";
-    if (starts("you are the reviewer")) return "reviewer";
-    if (starts("you are the fixer")) return "fixer";
-    if (starts("you are the memory")) return "memory";
-    return "?";
-}
-
-std::string RoleScriptedProvider::complete(const std::string& system) {
-    std::string role = role_of(system);
-    auto it = by_role_.find(role);
-    if (it == by_role_.end() || !it->is_array() || it->empty()) {
-        return "MOCK-MISSING-ROLE:" + role;
-    }
-    json& queue = *it;
-    if (queue.size() > 1) {
-        std::string reply = queue.front().get<std::string>();
-        queue.erase(queue.begin());  // pop(0)
-        return reply;
-    }
-    return queue.front().get<std::string>();
 }
 
 // POST with transparent retry on rate-limit / transient overload (HTTP 429/503). Cloud free
@@ -1688,13 +1599,11 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
             r.text = redaction_rehydrate_text(r.text, redact_map);
             r.thinking = redaction_rehydrate_text(r.thinking, redact_map);
         }
-        emit_provider_call(r, provider);
         return r;
     };
 
     // Cooperative cancel — checked before any network work and between retries.
-    if (http_cancel_requested() ||
-        (g_provider_cancel && g_provider_cancel->load(std::memory_order_acquire))) {
+    if (http_cancel_requested()) {
         res.error = "cancelled";
         return finish(std::move(res));
     }
@@ -1796,9 +1705,8 @@ CompleteResult complete(const std::string& provider, const json& cfg, const std:
                 if (k.is_string() && !k.get<std::string>().empty())
                     keys.push_back(k.get<std::string>());
         SseAccum acc;
-        auto& delta_emit = g_provider_delta_emitter;
         HttpChunkCb on_chunk = [&](const char* data, size_t len) {
-            acc.feed(data, len, delta_emit);
+            acc.feed(data, len);
         };
         HttpResponse hr;
         int attempt = 1;
@@ -1950,12 +1858,6 @@ AssistCompleteFn make_assist_provider(const json& descriptor) {
         };
     }
     std::string name = d.value("name", std::string());
-    if (name == "mock" && d.contains("by_role") && d["by_role"].is_object()) {
-        auto rp = std::make_shared<RoleScriptedProvider>(d["by_role"]);
-        return [rp](const std::string& system, const std::string&, std::string*) -> std::string {
-            return rp->complete(system);
-        };
-    }
     if (name == "mock") {
         std::vector<std::string> replies;
         if (d.contains("replies") && d["replies"].is_array())

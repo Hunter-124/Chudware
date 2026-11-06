@@ -10,12 +10,19 @@ cell published on this workspace's /engine bridge.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
 import json
 import logging
 import os
 import secrets
 import shutil
 import stat
+import tempfile
+import unicodedata
+import zipfile
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -125,6 +132,172 @@ def workspace_list(dir: str = "") -> dict[str, Any]:
 def workspace_download(path: str) -> StreamingResponse:
     fd, st = cells.open_beneath(_root(), path, max_bytes=settings.max_upload_bytes)
     return stream_open_file(fd, st, filename=Path(path).name, headers={"Cache-Control": "no-store"})
+
+_REVENG_ARTIFACT_MAX = 2 * 1024 * 1024 * 1024
+_REVENG_ARTIFACT_SUFFIXES = {
+    "gaussian_ply": {".ply"}, "mesh_ply": {".ply"}, "mesh_stl": {".stl"},
+    "binary_stl": {".stl"}, "mesh_obj": {".obj"},
+    "sparse_points": {".bin", ".txt"},
+}
+
+
+@router.get("/reveng/artifact/{artifact_id}")
+def reveng_artifact(artifact_id: str) -> StreamingResponse:
+    """Stream only a worker-published artifact belonging to this principal."""
+    if len(artifact_id) != 64 or any(c not in "0123456789abcdef" for c in artifact_id):
+        raise HTTPException(404, "artifact not found")
+    principal = cells.resolve_workspace()
+    actor = hashlib.sha256(principal.actor_key.encode()).hexdigest()[:32]
+    owner = hashlib.sha256(repr((principal.workspace_key, principal.actor_key)).encode()).hexdigest()[:32]
+    root = cells.state_root(principal) / "actors" / actor / "data" / owner / "reveng"
+    fd, _ = cells.open_beneath(root, f"artifact_refs/{artifact_id}", max_bytes=4096)
+    try:
+        with os.fdopen(fd, "rb") as stream:
+            grant = json.load(stream)
+    except (ValueError, UnicodeError, OSError, RecursionError):
+        raise HTTPException(404, "artifact not found") from None
+    if not isinstance(grant, dict):
+        raise HTTPException(404, "artifact not found")
+    path, size, modified, kind = (grant.get("path"), grant.get("size"),
+                                  grant.get("mtime_ns"), grant.get("kind"))
+    if (not isinstance(path, str) or not isinstance(size, int) or isinstance(size, bool)
+            or not isinstance(modified, int) or isinstance(modified, bool)
+            or not isinstance(kind, str) or not 0 < size <= _REVENG_ARTIFACT_MAX
+            or kind not in _REVENG_ARTIFACT_SUFFIXES
+            or Path(path).suffix.lower() not in _REVENG_ARTIFACT_SUFFIXES[kind]):
+        raise HTTPException(404, "artifact not found")
+    parts = path.split("/")
+    if (len(parts) < 2 or not parts[0].startswith("session-")
+            or any(part in ("", ".", "..") for part in parts)
+            or "\\" in path or path.startswith("/")
+            or (kind == "sparse_points" and parts[-1] not in ("points3D.bin", "points3D.txt"))):
+        raise HTTPException(404, "artifact not found")
+    signature = f"{path}\0{size}\0{modified}\0{kind}"
+    if hashlib.sha256(signature.encode()).hexdigest() != artifact_id:
+        raise HTTPException(404, "artifact not found")
+    fd, st = cells.open_beneath(root, path, max_bytes=_REVENG_ARTIFACT_MAX)
+    if st.st_size != size or st.st_mtime_ns != modified:
+        os.close(fd)
+        raise HTTPException(404, "artifact changed")
+    return stream_open_file(fd, st, filename=parts[-1], headers={"Cache-Control": "no-store"})
+
+
+def _scad_member(path: Any) -> str:
+    """Require a portable, unambiguous ZIP member name without normalizing it."""
+    if (not isinstance(path, str) or not path or path.startswith("/")
+            or "\\" in path or ":" in path
+            or any(ord(c) < 32 or 127 <= ord(c) <= 159 or 0xD800 <= ord(c) <= 0xDFFF
+                   for c in path) or len(path.encode("utf-8")) > 1024):
+        raise HTTPException(400, "invalid SCAD export path")
+    parts = path.split("/")
+    reserved = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)),
+                *(f"lpt{i}" for i in range(1, 10))}
+    if any(not part or part in {".", ".."} or part.endswith((" ", "."))
+           or part.split(".", 1)[0].casefold() in reserved for part in parts):
+        raise HTTPException(400, "invalid SCAD export path")
+    return path
+
+
+@router.post("/workspace/scad-export")
+def workspace_scad_export(body: dict[str, Any]) -> StreamingResponse:
+    """Package exactly the engine's SCAD manifest, checked against embedded project metadata."""
+    path = _scad_member(body.get("path"))
+    if not path.lower().endswith(".scad"):
+        raise HTTPException(400, "SCAD source required")
+    exported, reused = body.get("exported_files"), body.get("reused_files")
+    if not isinstance(exported, list) or not isinstance(reused, list):
+        raise HTTPException(400, "incomplete SCAD export manifest")
+    if not 1 <= len(exported) + len(reused) <= 129 or exported.count(path) != 1:
+        raise HTTPException(400, "incomplete SCAD export manifest")
+    parent = path.rpartition("/")[0]
+    prefix = parent + "/" if parent else ""
+    members: dict[str, str] = {}
+    folded: set[str] = set()
+    component_spellings: dict[str, str] = {}
+    for item in exported + reused:
+        item = _scad_member(item)
+        if not item.startswith(prefix) or item == prefix:
+            raise HTTPException(400, "SCAD export outside selected directory")
+        name = _scad_member(item[len(prefix):])
+        key = unicodedata.normalize("NFC", name).casefold()
+        if key in folded or any(key.startswith(old + "/") or old.startswith(key + "/")
+                                for old in folded):
+            raise HTTPException(400, "colliding SCAD export members")
+        parts = name.split("/")
+        for i in range(1, len(parts) + 1):
+            spelling = "/".join(parts[:i])
+            folded_path = unicodedata.normalize("NFC", spelling).casefold()
+            previous = component_spellings.setdefault(folded_path, spelling)
+            if previous != spelling:
+                raise HTTPException(400, "colliding SCAD export members")
+        folded.add(key)
+        members[name] = item
+
+    source_name = path[len(prefix):]
+    cap = settings.max_upload_bytes
+    with ExitStack() as stack:
+        files = {}
+        total = 0
+        for name, item in members.items():
+            fd, info = cells.open_beneath(_root(), item, max_bytes=cap)
+            f = stack.enter_context(os.fdopen(fd, "rb"))
+            total += info.st_size
+            if total > cap:
+                raise HTTPException(413, "SCAD export exceeds size limit")
+            files[name] = (f, info.st_size)
+
+        source_file, source_size = files[source_name]
+        source = source_file.read(source_size + 1)
+        if len(source) != source_size:
+            raise HTTPException(409, "SCAD source changed during export")
+        marker = b"// CHUDWARE_SCAD_PROJECT_V1 "
+        if not source.startswith(marker) or b"\n" not in source:
+            raise HTTPException(400, "missing SCAD export metadata")
+        try:
+            encoded = source[len(marker):source.index(b"\n")]
+            metadata = json.loads(base64.b64decode(encoded, validate=True))
+            params = metadata["params"]
+            if not isinstance(params, dict):
+                raise ValueError("invalid parameters")
+            dependencies = params.get("files", [])
+            if not isinstance(dependencies, list) or len(dependencies) > 128:
+                raise ValueError("invalid dependency list")
+            expected = {}
+            for dependency in dependencies:
+                name = _scad_member(dependency["path"])
+                data = base64.b64decode(dependency["data_b64"], validate=True)
+                if len(data) > cap or name in expected:
+                    raise ValueError("invalid dependency")
+                expected[name] = (len(data), hashlib.sha256(data).digest())
+        except (KeyError, TypeError, ValueError, UnicodeError, binascii.Error, RecursionError):
+            raise HTTPException(400, "invalid SCAD export metadata") from None
+        if set(members) != {source_name} | set(expected) or source_name in expected:
+            raise HTTPException(400, "incomplete SCAD export manifest")
+
+        archive = stack.enter_context(tempfile.TemporaryFile())
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as bundle:
+            bundle.writestr(source_name, source)
+            for name, (size, digest) in expected.items():
+                file, actual_size = files[name]
+                if actual_size != size:
+                    raise HTTPException(409, "SCAD dependency changed during export")
+                checksum = hashlib.sha256()
+                remaining = size
+                with bundle.open(name, "w") as output:
+                    while remaining:
+                        chunk = file.read(min(remaining, 1 << 20))
+                        if not chunk:
+                            raise HTTPException(409, "SCAD dependency changed during export")
+                        remaining -= len(chunk)
+                        checksum.update(chunk)
+                        output.write(chunk)
+                if file.read(1) or checksum.digest() != digest:
+                    raise HTTPException(409, "SCAD dependency changed during export")
+        archive.flush()
+        archive.seek(0)
+        fd = os.dup(archive.fileno())
+        return stream_open_file(fd, os.fstat(fd), filename=source_name + ".zip",
+                                headers={"Cache-Control": "no-store"})
 
 
 @router.post("/workspace/upload")

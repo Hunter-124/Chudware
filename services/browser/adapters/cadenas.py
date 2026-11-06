@@ -1,137 +1,134 @@
-"""services/browser/adapters/cadenas.py — CADENAS PARTcommunity / 3Dfindit adapter.
+"""CADENAS 3Dfindit search and honest configurator capability reporting.
 
-3Dfindit.com / PARTcommunity is the CADENAS white-label CAD portal engine behind
-thousands of manufacturer catalogs — the STEP/native geometry only emerges after
-driving a JavaScript part configurator (and usually a login). This v1 CANNOT drive
-that interactive configurator headlessly, so it is HONEST about the limitation:
-
-- `search` parses the server-rendered result grid: each product is an
-  `<a class="gridCardBody" href="/en/digitaltwin/...">` card carrying a
-  `.part-nn-name` id, a `.text` human title, a `img.nodeImage` thumbnail and a
-  `img.supplierImage title="<Manufacturer>"`. Manufacturer/directory index cards
-  (`/en/cad-bim-library/manufacturer/...`) are also surfaced as candidate links.
-- `acquire` does NOT attempt to fake a download: it degrades to login_required
-  (or terms_confirmation_required) because the actual STEP artifact is gated
-  behind interactive configuration this adapter cannot perform. When and if a
-  configurator-driving capability lands, this is the seam to upgrade.
-
-NOTE: the search selectors were verified 2026-07-08 against a saved live
-3dfindit.com results page (query "bearing", HTTP 200). The product data is
-present in the initial HTML (no __NEXT_DATA__; the JSON-LD block is only site
-metadata) as `.gridCardBody` cards inside the `resultNodes` grid.
+Digital-twin cards are configurable catalog families, not configured SKUs. The
+portal's interactive part generator is not driven by this adapter, so acquiring
+one cannot silently select a variant or claim a terms wall when there is none.
 """
 from __future__ import annotations
 
+import html
 import re
+from urllib.parse import urlsplit
 
-from .. import session as _session
-from . import (is_login_wall, login_required, register, terms_confirmation_required)
+from .. import challenge, session as _session
+from . import (abs_url, fail, is_login_wall, login_required, make_hit, quote_query,
+               register, source_failure, terms_confirmation_required)
+from ._retail import card_image
 
 SITE = "cadenas"
 BASE_URL = "https://www.3dfindit.com"
 SEARCH_URL_TMPL = BASE_URL + "/en/search?q={query}"
-LICENSE_NOTE = (
-    "CADENAS PARTcommunity / 3Dfindit CAD models are supplied by manufacturer "
-    "catalogs to registered users under each manufacturer's terms, produced on "
-    "demand by an interactive configurator. This adapter records provenance but "
-    "does not download: the STEP only emerges after interactive configuration "
-    "and login that this v1 cannot perform. See contracts/license_debt.md."
-)
-_TERMS_SUMMARY = (
-    "the STEP model is generated only after you drive the manufacturer's part "
-    "configurator and accept its terms; this adapter cannot do that on your behalf"
-)
 
 _LOGIN_WALL_MARKERS = ('Please log in', 'id="id_username"', 'class="login-form"',
                        'Sign in to download', 'Login required')
-# Server-rendered result grid: each hit is <a class="gridCardBody" href="...">...</a>.
-# Product cards link to /en/digitaltwin/<slug>?path=...; manufacturer/directory
-# index cards link to /en/cad-bim-library/manufacturer/<slug>. Both are useful
-# candidate links.
+_TERMS_MARKERS = ('Accept the terms', 'class="supplier-terms"', 'License agreement required')
 _CARD_RE = re.compile(
-    r'<a\b[^>]*class="[^"]*gridCardBody[^"]*"[^>]*href="(?P<href>/en/[^"?#]+(?:\?[^"]*)?)"[^>]*>'
-    r'(?P<card>.*?)</a>', re.IGNORECASE | re.DOTALL)
-# Human-friendly title inside a product card, then the machine part-id fallback.
-_TEXT_RE = re.compile(r'<div[^>]*class="[^"]*\btext\b[^"]*"[^>]*>(?P<t>.*?)</div>',
+    r'<a\b(?=[^>]*\bclass\s*=\s*["\'][^"\']*\b(?:gridCardBody|grid-card-wrapper)\b[^"\']*["\'])'
+    r'(?=[^>]*\bhref\s*=\s*(?P<quote>["\'])(?P<href>.*?)(?P=quote))[^>]*>'
+    r'(?P<card>.*?)</a\s*>', re.IGNORECASE | re.DOTALL)
+_TEXT_RE = re.compile(r'<div\b[^>]*class\s*=\s*["\'][^"\']*\btext\b[^"\']*["\'][^>]*>(?P<t>.*?)</div>',
                       re.IGNORECASE | re.DOTALL)
-_NNNAME_RE = re.compile(r'<div[^>]*class="[^"]*part-nn-name[^"]*"[^>]*>(?P<t>.*?)</div>',
+_NNNAME_RE = re.compile(r'<div\b[^>]*class\s*=\s*["\'][^"\']*\bpart-nn-name\b[^"\']*["\'][^>]*>(?P<t>.*?)</div>',
                         re.IGNORECASE | re.DOTALL)
-_THUMB_RE = re.compile(r'<img[^>]*class="[^"]*nodeImage[^"]*"[^>]*src="(?P<src>[^"]+)"',
-                       re.IGNORECASE)
-_SUPPLIER_RE = re.compile(r'<img[^>]*class="[^"]*supplierImage[^"]*"[^>]*title="(?P<mfr>[^"]+)"',
-                          re.IGNORECASE)
+_CATALOG_NAME_RE = re.compile(r'<div\b[^>]*class\s*=\s*["\'][^"\']*\bcatalog-name\b[^"\']*["\'][^>]*>(?P<t>.*?)</div>',
+                              re.IGNORECASE | re.DOTALL)
+_NODE_IMAGE_RE = re.compile(
+    r'<img\b(?=[^>]*\bclass\s*=\s*["\'][^"\']*\b(?:nodeImage|node-image)\b[^"\']*["\'])[^>]*>',
+    re.IGNORECASE | re.DOTALL)
+_SUPPLIER_RE = re.compile(
+    r'<img\b(?=[^>]*\bclass\s*=\s*["\'][^"\']*\bsupplierImage\b[^"\']*["\'])'
+    r'(?=[^>]*\btitle\s*=\s*(?P<quote>["\'])(?P<mfr>.*?)(?P=quote))[^>]*>', re.IGNORECASE | re.DOTALL)
+_SUPPLIER_INFO_RE = re.compile(
+    r'<div\b(?=[^>]*\bclass\s*=\s*["\'][^"\']*\bsupplier-info\b[^"\']*["\'])'
+    r'(?=[^>]*\btitle\s*=\s*(?P<quote>["\'])(?P<mfr>.*?)(?P=quote))[^>]*>', re.IGNORECASE | re.DOTALL)
+_EMPTY_RE = re.compile(r'\b(?:no results|no products found|0 results)\b', re.IGNORECASE)
 
 
-def _strip_tags(text: str) -> str:
-    # Drop <mark> search-highlight and any other markup, unescape common entities.
-    text = re.sub(r"<[^>]+>", "", text)
-    for a, b in (("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),
-                 ("&quot;", '"'), ("&#39;", "'"), ("&nbsp;", " ")):
-        text = text.replace(a, b)
-    return text.strip()
+def _text(value: str) -> str:
+    return re.sub(r'\s+', ' ', html.unescape(re.sub(r'<[^>]+>', ' ', value))).strip()
+
+
+def _page_failure(content: str, final_url: str, op: str, url: str) -> dict | None:
+    kind = challenge.classify_challenge(content, final_url)
+    if kind:
+        return fail(SITE, op, "captcha" if kind == "captcha" else "blocked",
+                    "The site presented a browser challenge.", url=final_url)
+    if challenge.is_login_page("", final_url) or is_login_wall(content, _LOGIN_WALL_MARKERS):
+        return source_failure(SITE, op, login_required(SITE, url), url=url)
+    return None
 
 
 class CadenasAdapter:
     key = SITE
+    hosts = ("3dfindit.com",)
+    result_kinds = ("series", "category")
+    cad_acquisition = False
+    login_required = True
+    api = False
 
     def search(self, query: str) -> list[dict]:
-        url = SEARCH_URL_TMPL.format(query=query.replace(" ", "+"))
-        result = _session.browser_fetch(url, SITE)
-        if not result.get("ok"):
-            return [result]
-        content = result.get("content", "")
-        if is_login_wall(content, _LOGIN_WALL_MARKERS):
-            return [login_required(SITE, url)]
+        url = SEARCH_URL_TMPL.format(query=quote_query(query))
+        page = _session.browser_fetch(url, SITE)
+        if not page.get("ok"):
+            return [source_failure(SITE, "search", page, url=url)]
+        content = page.get("content", "")
+        final_url = page.get("final_url") or url
+        failure = _page_failure(content, final_url, "search", url)
+        if failure:
+            return [failure]
         hits = []
-        for m in _CARD_RE.finditer(content):
-            href = m.group("href")
-            card = m.group("card")
-            is_product = "/digitaltwin/" in href
-            # Title: human .text for products, else the machine part-id, else slug.
-            title = ""
-            tm = _TEXT_RE.search(card) or _NNNAME_RE.search(card)
-            if tm:
-                title = _strip_tags(tm.group("t"))
-            if not title:
-                # Manufacturer/directory index cards carry their name as plain text.
-                title = _strip_tags(card)
-            if not title:
-                title = href.rsplit("/", 1)[-1].split("?", 1)[0]
-
-            hit = {
-                "title": title,
-                "url": BASE_URL + href,
-                "site": SITE,
-                "kind": "part" if is_product else "catalog",
-            }
-            thumb = _THUMB_RE.search(card)
-            if thumb:
-                hit["thumbnail"] = _strip_tags(thumb.group("src"))
-            sup = _SUPPLIER_RE.search(card)
-            if sup:
-                hit["manufacturer"] = _strip_tags(sup.group("mfr"))
-            nn = _NNNAME_RE.search(card)
-            if nn:
-                pn = _strip_tags(nn.group("t"))
-                if pn:
-                    hit["part_number"] = pn
-            hits.append(hit)
+        seen: set[str] = set()
+        for match in _CARD_RE.finditer(content):
+            href = abs_url(final_url, html.unescape(match.group("href")))
+            if not href:
+                continue
+            parsed = urlsplit(href)
+            if not parsed.hostname or parsed.hostname.lower().removeprefix("www.") != "3dfindit.com":
+                continue
+            if "/digitaltwin/" in parsed.path:
+                kind = "series"
+            elif "/cad-bim-library/manufacturer/" in parsed.path:
+                kind = "category"
+            else:
+                continue
+            if href in seen:
+                continue
+            seen.add(href)
+            card = match.group("card")
+            name = _TEXT_RE.search(card) or _NNNAME_RE.search(card) or _CATALOG_NAME_RE.search(card)
+            title = _text(name.group("t")) if name else _text(card)
+            title = title or parsed.path.rstrip("/").rsplit("/", 1)[-1].replace("-", " ")
+            node = _NODE_IMAGE_RE.search(card)
+            supplier = _SUPPLIER_RE.search(card) or _SUPPLIER_INFO_RE.search(card)
+            number = _NNNAME_RE.search(card) if _TEXT_RE.search(card) else None
+            catalog_id = _text(number.group("t")) if number else ""
+            hits.append(make_hit(
+                SITE, title=title, url=href, kind=kind,
+                manufacturer=html.unescape(supplier.group("mfr")).strip() if supplier else None,
+                thumbnail=card_image(node.group(0), final_url) if node and kind == "series" else None,
+                extra={"catalog_id": catalog_id} if catalog_id else None))
+        if not hits and not _EMPTY_RE.search(content):
+            return [fail(SITE, "search", "parse_failed", "No recognizable catalog cards on the page.", url=url)]
         return hits
 
     def acquire(self, result: dict) -> dict:
         url = result.get("url", "")
         if not url:
-            return {"ok": False, "reason": "bad_result", "hint": "result has no 'url'"}
-
+            return fail(SITE, "acquire", "not_found", "Result has no URL.")
         page = _session.browser_fetch(url, SITE)
-        if page.get("ok"):
-            content = page.get("content", "")
-            if is_login_wall(content, _LOGIN_WALL_MARKERS):
-                return login_required(SITE, url)
-
-        # Honest degradation: the STEP artifact is gated behind an interactive
-        # JS configurator (and terms click-through) this v1 cannot drive.
-        return terms_confirmation_required(SITE, url, _TERMS_SUMMARY)
+        if not page.get("ok"):
+            return source_failure(SITE, "acquire", page, url=url)
+        content = page.get("content", "")
+        failure = _page_failure(content, page.get("final_url") or url, "acquire", url)
+        if failure:
+            return failure
+        if is_login_wall(content, _TERMS_MARKERS):
+            notice = terms_confirmation_required(SITE, url, "this catalog requires accepting download terms")
+            return fail(SITE, "acquire", "terms_required", notice["hint"], url=url,
+                        ask_user=notice["ask_user"])
+        return fail(SITE, "acquire", "unsupported",
+                    "This catalog's interactive configuration and CAD generation are not supported; "
+                    "configure and download the exact part on the supplier site.", url=url)
 
 
 ADAPTER = register(CadenasAdapter())

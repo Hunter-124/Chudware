@@ -94,6 +94,31 @@ TEST_CASE("bom rollup: made/bought classification, aggregation, board merge") {
     CHECK(bom[3]["mpn"] == "RC0603FR-0710KL");
 }
 
+TEST_CASE("bom rollup: persisted catalog identity is bought without invented vendor data") {
+    const json tree = json::parse(R"({"tree":{"components":[
+      {"name":"M5 x 10","source":{"path":"m5x10.step+"},
+       "catalog_metadata":{"part_record":{"part_id":"fastener:ISO 4762:M5"}}},
+      {"name":"M5 x 10","source":{"path":"m5x10.step+"},
+       "catalog_metadata":{"part_record":{"part_id":"fastener:ISO 4762:M5"}}},
+      {"name":"M5 x 20","source":{"path":"m5x20.step+"},
+       "catalog_metadata":{"part_record":{"part_id":"fastener:ISO 4762:M5"}}},
+      {"name":"bracket","source":{"path":"bracket.step+"}}
+    ]}})");
+    const json bom = bom_price_lines(tree, Seams{});
+    REQUIRE(bom.size() == 3);
+    CHECK(bom[0]["kind"] == "bought");
+    CHECK(bom[0]["part_ref"] == "fastener:ISO 4762:M5");
+    CHECK(bom[0]["quantity"] == 2);
+    CHECK(bom[0]["mpn"].is_null());
+    CHECK(bom[0]["vendor_part"].is_null());
+    CHECK(bom[0]["unit_cost"].is_null());
+    CHECK(bom[0]["ext_cost"].is_null());
+    CHECK(bom[1]["kind"] == "bought");
+    CHECK(bom[1]["quantity"] == 1);
+    CHECK(bom[2]["kind"] == "made");
+    CHECK(bom[2]["part_ref"].is_null());
+}
+
 TEST_CASE("bom rollup: non-assembly tree yields an empty BOM") {
     CHECK(bom_rollup_lines(json::object(), Seams{}).empty());
     CHECK(bom_rollup_lines(json::parse(R"({"tree":{"features":[]}})"), Seams{}).empty());
@@ -585,6 +610,16 @@ TEST_CASE("vendor registry: register_local_cad copies + indexes the record") {
                     ProviderError);
 }
 
+TEST_CASE("vendor registry accepts native STEP plus files") {
+    namespace fs = std::filesystem;
+    const fs::path src = fs::temp_directory_path() / "chudware_vendor_native_test.step+";
+    { std::ofstream out(src); out << "native container fixture"; }
+    const json rec = register_local_cad("Native Vendor", "STEPPLUS-1",
+                                        {{"cad_path", src.string()}});
+    CHECK(rec["cad_format"] == "step+");
+    CHECK(fs::exists(rec["cad_path"].get<std::string>()));
+}
+
 TEST_CASE("vendor registry lookup uses supplier-qualified keys and deterministic fallback") {
     namespace fs = std::filesystem;
     register_local_cad("Zeta Supply", "MATCH-42",
@@ -634,6 +669,19 @@ TEST_CASE("vendor registry price-only upsert preserves CAD and price provenance"
          {"specs", json::parse(R"({"diameter_mm":12.0})")},
          {"description", "original"}});
     CHECK(initial["fetched_ts"].is_null());
+    // Simulate additive catalog fields written by the Python registry owner.
+    const fs::path index_path = fs::path(vendor_parts_dir()) / "index.json";
+    {
+        std::ifstream in(index_path);
+        json index = json::parse(in);
+        index["merge-vendor::merge-1"]["part_record"] = {
+            {"part_id", "fastener:publisher:item"}, {"units", "mm"},
+            {"rights", {{"redistribute", false}}}};
+        index["merge-vendor::merge-1"]["unknown_metadata"] = {{"nested", 42}};
+        in.close();
+        std::ofstream out(index_path);
+        out << index.dump(2);
+    }
 
     const json provenance = json::parse(
         R"({"method":"browser_scrape","source_url":"https://example.test/part",
@@ -650,6 +698,8 @@ TEST_CASE("vendor registry price-only upsert preserves CAD and price provenance"
     REQUIRE(priced["fetched_ts"].is_number());
     CHECK(priced["fetched_ts"].get<double>() > 0.0);
     CHECK(priced["provenance"] == provenance);
+    CHECK(priced["part_record"]["units"] == "mm");
+    CHECK(priced["unknown_metadata"]["nested"] == 42);
 
     const json fetched_ts = priced["fetched_ts"];
     const json renamed = register_local_cad(

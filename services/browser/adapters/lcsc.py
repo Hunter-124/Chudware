@@ -1,22 +1,17 @@
-"""services/browser/adapters/lcsc.py — LCSC source adapter.
+"""LCSC electronic-component search and manufacturer datasheet acquisition.
 
-LCSC (lcsc.com) is the electronic-components distributor behind JLCPCB's
-parts library. Search/pricing/stock pages are public (no login for browse);
-bulk pricing/order flows need the user's own account. Like jlcpcb.py, this
-adapter's `acquire` returns a STRUCTURED price/stock record for ECAD BOM
-matching — plus the part's datasheet PDF when the detail page links one
-(the one downloadable artifact LCSC exposes here).
-
-NOTE: the regexes/markers below are a v1 best-effort shape, not verified
-against a live LCSC session (the gated integration suite covers the real per-source integration
-tests behind an env flag).
+The search results identify LCSC SKUs; this adapter downloads datasheets, not CAD.
 """
 from __future__ import annotations
 
+import html
 import re
 
-from .. import session as _session
-from . import download_path, is_login_wall, login_required, provenance_envelope, register
+from .. import challenge, session as _session
+from ..cad_validate import classify_artifact
+from . import (download_path, fail, is_login_wall, login_required, make_hit,
+               provenance_envelope, quote_query, register, source_failure)
+from ._retail import RetailAdapter, _challenge, _price, _stock, card_image, find_datasheet_url, visible_text
 
 SITE = "lcsc"
 BASE_URL = "https://www.lcsc.com"
@@ -30,101 +25,129 @@ LICENSE_NOTE = (
 )
 
 _LOGIN_WALL_MARKERS = ('id="login-email"', 'class="login-dialog"')
-# LCSC's search results are a Nuxt/Vue SSR table (verified live 2026-07-11): rows
-# are JS-clickable <tr>s, NOT <a href="/product-detail/…"> anchors. Each product
-# cell carries `aria-label="<manufacturer part title> detail page" title="C<code>"`
-# — the one solid, per-row extraction anchor. The canonical detail URL is derived
-# from the LCSC code as /product-detail/C<code>.html.
+_CHALLENGE_MARKERS = ("Access Denied", "Pardon Our Interruption", "Just a moment")
+# The product cell of the rendered result table identifies the LCSC SKU.
 _RESULT_RE = re.compile(
-    r'aria-label="(?P<title>[^"]+?)\s+detail page"\s+title="(?P<lcsc>C\d+)"',
-    re.IGNORECASE)
+    r'''<\w+\b(?=[^>]*\baria-label=["'](?P<title>[^"']+?)\s+detail page["'])'''
+    r'''(?=[^>]*\btitle=["'](?P<lcsc>C\d+)["'])[^>]*>''', re.IGNORECASE)
+_ROW_RE = re.compile(r'<tr\b[^>]*>.*?</tr>', re.IGNORECASE | re.DOTALL)
 _LCSC_RE = re.compile(r'<span[^>]*class="[^"]*lcsc-number[^"]*"[^>]*>(?P<lcsc>C\d+)</span>',
                       re.IGNORECASE)
-_PRICE_RE = re.compile(r'<span[^>]*class="[^"]*price[^"]*"[^>]*>\$(?P<price>[0-9,.]+)</span>',
+_PRICE_RE = re.compile(r'<span[^>]*class="[^"]*price[^"]*"[^>]*>\s*\$(?P<price>[0-9,.]+)\s*</span>',
                        re.IGNORECASE)
 _STOCK_RE = re.compile(
-    r'<span[^>]*class="[^"]*stock[^"]*"[^>]*>(?P<stock>[0-9,]+)\s*(?:in stock)?</span>',
+    r'<span[^>]*class="[^"]*stock[^"]*"[^>]*>\s*(?P<stock>[0-9,]+)\s*(?:in stock)?\s*</span>',
     re.IGNORECASE)
-_DATASHEET_RE = re.compile(r'href="(?P<href>[^"]+\.pdf(?:\?[^"]*)?)"', re.IGNORECASE)
-
-
-def _strip_tags(text: str) -> str:
-    return re.sub(r"<[^>]+>", "", text).strip()
+_MPN_RE = re.compile(r'<span[^>]*class="[^"]*\bmpn\b[^"]*"[^>]*>([^<]+)</span>', re.IGNORECASE)
+_MANUFACTURER_RE = re.compile(
+    r'<span[^>]*class="[^"]*\bmanufacturer\b[^"]*"[^>]*>([^<]+)</span>', re.IGNORECASE)
+_SKU_IN_URL_RE = re.compile(r'(?:^|[/_-])(C\d+)(?:\.html)?(?:[?#]|$)', re.IGNORECASE)
+_NO_RESULTS_RE = re.compile(r'\b(?:no results(?: found)?|no products found|0 results)\b', re.IGNORECASE)
 
 
 class LcscAdapter:
     key = SITE
+    hosts = ("lcsc.com",)
+    result_kinds = ("product",)
+    cad_acquisition = False
+    login_required = False
+    api = False
 
     def search(self, query: str) -> list[dict]:
-        url = SEARCH_URL_TMPL.format(query=query.replace(" ", "+"))
+        url = SEARCH_URL_TMPL.format(query=quote_query(query))
         result = _session.browser_fetch(url, SITE)
         if not result.get("ok"):
-            return [result]
+            return [source_failure(SITE, "search", result, url=url)]
         content = result.get("content", "")
-        if is_login_wall(content, _LOGIN_WALL_MARKERS):
-            return [login_required(SITE, url)]
+        page_url = result.get("final_url") or url
+        if challenge.classify_challenge(content, page_url) == "captcha" or is_login_wall(content, _CHALLENGE_MARKERS):
+            return [_challenge(SITE, "search", page_url, content)]
+        if RetailAdapter._redirected_to_login(url, page_url) or (
+                is_login_wall(content, _LOGIN_WALL_MARKERS) and not _RESULT_RE.search(content)):
+            return [source_failure(SITE, "search", login_required(SITE, page_url), url=page_url)]
+
         hits = []
         seen: set[str] = set()
-        for m in _RESULT_RE.finditer(content):
-            lcsc = m.group("lcsc")
-            if lcsc in seen:
+        rows = list(_ROW_RE.finditer(content))
+        matches = [(m, row.group()) for row in rows for m in _RESULT_RE.finditer(row.group())]
+        if not matches:
+            matches = [(m, m.group()) for m in _RESULT_RE.finditer(content)]
+        for match, row in matches:
+            sku = match.group("lcsc").upper()
+            if sku in seen:
                 continue
-            seen.add(lcsc)
-            hits.append({
-                "title": _strip_tags(m.group("title")),
-                "url": f"{BASE_URL}/product-detail/{lcsc}.html",
-                "site": SITE,
-                "lcsc": lcsc,
-                # Price/stock live in sibling table cells whose row-to-cell
-                # association is fragile in the SSR markup; left to acquire() on
-                # the detail page rather than guessed from the results table.
-                "price": None,
-                "stock": None,
-            })
+            seen.add(sku)
+            price, stock = _PRICE_RE.search(row), _STOCK_RE.search(row)
+            mpn, manufacturer = _MPN_RE.search(row), _MANUFACTURER_RE.search(row)
+            hits.append(make_hit(
+                SITE, title=html.unescape(match.group("title")).strip(),
+                url=f"{BASE_URL}/product-detail/{sku}.html", kind="product", sku=sku,
+                mpn=html.unescape(mpn.group(1)).strip() if mpn else None,
+                manufacturer=html.unescape(manufacturer.group(1)).strip() if manufacturer else None,
+                price=_price(price.group("price")) if price else None,
+                currency="USD" if price else None, stock=_stock(stock.group("stock")) if stock else None,
+                thumbnail=card_image(row, result.get("final_url") or url),
+            ))
+        if not hits and not _NO_RESULTS_RE.search(visible_text(content)):
+            return [fail(SITE, "search", "parse_failed", "No recognizable LCSC results were rendered.", url=url)]
         return hits
 
     def acquire(self, result: dict) -> dict:
         url = result.get("url", "")
         if not url:
-            return {"ok": False, "reason": "bad_result", "hint": "result has no 'url'"}
-
+            return fail(SITE, "acquire", "not_found", "Result has no product URL.")
         page = _session.browser_fetch(url, SITE)
         if not page.get("ok"):
-            return page
+            return source_failure(SITE, "acquire", page, url=url)
         content = page.get("content", "")
-        if is_login_wall(content, _LOGIN_WALL_MARKERS):
-            return login_required(SITE, url)
+        page_url = page.get("final_url") or url
+        if challenge.classify_challenge(content, page_url) == "captcha" or is_login_wall(content, _CHALLENGE_MARKERS):
+            return _challenge(SITE, "acquire", page_url, content)
+        datasheet_url = find_datasheet_url(content, page_url)
+        if RetailAdapter._redirected_to_login(url, page_url) or (
+                is_login_wall(content, _LOGIN_WALL_MARKERS) and not _LCSC_RE.search(content)
+                and not datasheet_url):
+            return source_failure(SITE, "acquire", login_required(SITE, page_url), url=page_url)
 
         lcsc_match = _LCSC_RE.search(content)
-        price_match = _PRICE_RE.search(content)
-        stock_match = _STOCK_RE.search(content)
+        path_matches = [_SKU_IN_URL_RE.search(candidate) for candidate in
+                        (url, page.get("final_url") or url)]
+        identified = [str(result["sku"]).upper()] if result.get("sku") else []
+        identified.extend(match.group(1).upper() for match in path_matches if match)
+        if lcsc_match:
+            identified.append(lcsc_match.group("lcsc").upper())
+        expected = identified[0] if identified else None
+        actual = lcsc_match.group("lcsc").upper() if lcsc_match else None
+        if len(set(identified)) > 1:
+            return fail(SITE, "acquire", "unsupported", "The detail page identifies a different LCSC SKU.",
+                        url=url, ask_user="Select the desired LCSC SKU explicitly.")
 
-        # Datasheet PDF is the one downloadable artifact; its absence is not an
-        # error — the structured price/stock record is still the deliverable.
-        artifact_path = None
-        datasheet_url = None
-        ds_match = _DATASHEET_RE.search(content)
-        if ds_match:
-            datasheet_url = ds_match.group("href")
-            if datasheet_url.startswith("/"):
-                datasheet_url = BASE_URL + datasheet_url
-            dest, refusal = download_path(SITE, datasheet_url, default="datasheet.pdf")
-            if refusal is not None:
-                return refusal
-            outcome = _session.browser_download(datasheet_url, SITE, dest)
-            if outcome.get("ok"):
-                artifact_path = outcome["dest"]
+        if not datasheet_url:
+            return fail(SITE, "acquire", "not_found", "No datasheet PDF was found on this product page.", url=url)
+        dest, refusal = download_path(SITE, datasheet_url, default="datasheet.pdf")
+        if refusal is not None:
+            return {**fail(SITE, "acquire", "policy_refused", refusal.get("hint", "Invalid destination."),
+                           url=datasheet_url), "detail": refusal.get("reason")}
+        outcome = _session.browser_download(datasheet_url, SITE, dest)
+        if not outcome.get("ok"):
+            return source_failure(SITE, "acquire", outcome, url=datasheet_url)
+        artifact_path = outcome.get("dest")
+        if not artifact_path:
+            return fail(SITE, "acquire", "parse_failed", "Download returned no file.", url=datasheet_url)
+        checked = classify_artifact(artifact_path, "document")
+        if not checked["ok"] or checked["format"] != "pdf":
+            return fail(SITE, "acquire", "parse_failed", checked["reason"] or "Invalid PDF.", url=datasheet_url)
 
+        price, stock = _PRICE_RE.search(content), _STOCK_RE.search(content)
         return provenance_envelope(
-            source_url=url,
+            source_url=page.get("final_url") or url,
             session_profile_used=page.get("session_profile_used", SITE),
-            license_note=LICENSE_NOTE,
-            artifact_path=artifact_path,
-            title=result.get("title", ""),
-            lcsc=lcsc_match.group("lcsc") if lcsc_match else result.get("lcsc"),
-            price=("$" + price_match.group("price")) if price_match else result.get("price"),
-            stock=stock_match.group("stock") if stock_match else result.get("stock"),
-            datasheet_url=datasheet_url,
+            license_note=LICENSE_NOTE, artifact_path=outcome["dest"], artifact_kind="document", format="pdf",
+            title=result.get("title", ""), sku=actual or expected,
+            price=_price(price.group("price")) if price else result.get("price"),
+            currency="USD" if price else result.get("currency"),
+            stock=_stock(stock.group("stock")) if stock else result.get("stock"),
+            datasheet_url=datasheet_url, datasheet_path=outcome["dest"],
         )
 
 

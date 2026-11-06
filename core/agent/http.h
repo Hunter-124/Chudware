@@ -15,9 +15,8 @@
 namespace chudware {
 namespace agent {
 
-// Thread-local cooperative-cancel for in-flight HTTP. complete()/run_design set this
-// from the run's RunControl so CURLOPT_XFERINFOFUNCTION (and WinHTTP read loops) can
-// abort mid-transfer within ~1s of agent_cancel. nullptr = no cancel (default).
+// Thread-local cooperative cancellation for in-flight HTTP. A caller may install a flag
+// so the transfer can abort when it is set; nullptr means no cancellation (default).
 void set_http_cancel_flag(const std::atomic<bool>* flag);
 const std::atomic<bool>* http_cancel_flag();
 bool http_cancel_requested();

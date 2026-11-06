@@ -1,14 +1,21 @@
 """Offline boundary tests: public fixture transport is redirected only by the test."""
 import gzip
+import hashlib
 import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 
 from services.net import safe_http as http
 
+
+# Stream a real STEP solid, padded with legal whitespace to exceed one socket
+# read. Other fixture endpoints still stream arbitrary bytes.
+STEP_FIXTURE = (Path(__file__).parent / "testdata" / "transport_sphere.txt").read_bytes().replace(
+    b"ENDSEC;\nDATA;", b"\n" * 65536 + b"ENDSEC;\nDATA;", 1)
 
 @pytest.fixture
 def server():
@@ -39,11 +46,16 @@ def server():
                 payload = b""
             else:
                 self.send_response(200)
-                payload = b"fixture public content" if self.path == "/ok" else b"x" * 65536
+                payload = (b"fixture public content" if self.path == "/ok" else
+                           STEP_FIXTURE if self.path.startswith("/models/") else b"x" * 65536)
                 if self.path == "/gzip":
                     payload = gzip.compress(payload)
                     self.send_header("Content-Encoding", "gzip")
-            if self.path != "/chunked":
+            if self.path == "/truncated":
+                self.send_header("Content-Length", str(len(payload) + 10))
+                self.send_header("Connection", "close")
+                self.close_connection = True
+            elif self.path != "/chunked":
                 self.send_header("Content-Length", str(len(payload)))
             else:
                 self.send_header("Connection", "close")
@@ -202,6 +214,91 @@ def test_response_idle_budget_stops_waiting_and_removes_partial_artifact(public_
     assert not destination.exists()
 
 
+@pytest.mark.parametrize("route,payload", [
+    ("/ok", b"fixture public content"),
+    ("/redirect", b"fixture public content"),
+    ("/gzip", b"x" * 65536),
+])
+def test_download_verifies_published_decoded_bytes(public_fixture, tmp_path, route, payload):
+    url, _, _, _ = public_fixture
+    destination = tmp_path / "artifact.step"
+    destination.write_bytes(b"previous")
+    response = http.download(url + route, destination, max_bytes=131072,
+                             expected_sha256=hashlib.sha256(payload).hexdigest().upper(),
+                             expected_size=len(payload))
+    assert response.bytes_written == len(payload)
+    assert destination.read_bytes() == payload
+    assert list(tmp_path.iterdir()) == [destination]
+
+
+def test_digest_only_download_stages_before_replacement(public_fixture, tmp_path, monkeypatch):
+    url, _, _, _ = public_fixture
+    destination = tmp_path / "manifest.json"
+    destination.write_bytes(b"previous")
+    replace = http.os.replace
+    staging_paths = []
+
+    def observe_replace(source, target):
+        staging_paths.append(source)
+        assert source != target
+        assert destination.read_bytes() == (b"previous" if len(staging_paths) == 1
+                                            else b"fixture public content")
+        assert source.read_bytes() == b"fixture public content"
+        replace(source, target)
+
+    monkeypatch.setattr(http.os, "replace", observe_replace)
+    digest = hashlib.sha256(b"fixture public content").hexdigest()
+    http.download(url + "/ok", destination, expected_sha256=digest)
+    http.download(url + "/ok", destination, expected_sha256=digest)
+    assert len(set(staging_paths)) == 2
+    assert destination.read_bytes() == b"fixture public content"
+
+
+@pytest.mark.parametrize("expectations", [
+    {"expected_sha256": "0" * 64},
+    {"expected_size": 1},
+    {"expected_sha256": "0" * 64, "expected_size": 22},
+])
+def test_integrity_failure_preserves_existing_destination(public_fixture, tmp_path, expectations):
+    url, _, _, _ = public_fixture
+    destination = tmp_path / "artifact.step"
+    destination.write_bytes(b"previous")
+    with pytest.raises(http.IntegrityError):
+        http.download(url + "/ok", destination, **expectations)
+    assert destination.read_bytes() == b"previous"
+    assert list(tmp_path.iterdir()) == [destination]
+
+
+@pytest.mark.parametrize("route,kwargs,error", [
+    ("/large", {"max_bytes": 1024}, http.ResponseTooLarge),
+    ("/chunked", {"max_bytes": 1024}, http.ResponseTooLarge),
+    ("/gzip", {"max_bytes": 1024}, http.ResponseTooLarge),
+    ("/truncated", {}, http.OutboundPolicyError),
+    ("/idle", {"idle_timeout": 0.03}, TimeoutError),
+])
+def test_incomplete_download_preserves_existing_destination(public_fixture, tmp_path, route, kwargs, error):
+    url, _, _, _ = public_fixture
+    destination = tmp_path / "artifact.step"
+    destination.write_bytes(b"previous")
+    with pytest.raises(error):
+        http.download(url + route, destination, **kwargs)
+    assert destination.read_bytes() == b"previous"
+    assert list(tmp_path.iterdir()) == [destination]
+
+
+@pytest.mark.parametrize("expectations", [
+    {"expected_sha256": "xyz"},
+    {"expected_sha256": "g" * 64},
+    {"expected_size": -1},
+    {"expected_size": True},
+])
+def test_invalid_expectations_fail_before_network(public_fixture, tmp_path, expectations):
+    url, seen, _, _ = public_fixture
+    with pytest.raises(ValueError):
+        http.download(url + "/ok", tmp_path / "artifact.step", **expectations)
+    assert seen == []
+
+
 @pytest.mark.parametrize("url", ["file:///etc/hosts", "ftp://public.fixture/part.step",
                                  "https://user:password@public.fixture/part.step"])
 def test_scheme_and_userinfo_policy_precedes_dns(url, monkeypatch):
@@ -324,7 +421,8 @@ def test_catalog_and_harvest_confine_real_loopback_downloads(public_fixture, mon
     monkeypatch.setattr(session, "browser_fetch", lambda *_: {
         "ok": True, "content": f'<a href="{hostile}">Download CAD</a>'})
     refused = thk.ADAPTER.acquire({"url": "https://www.thk.com/fixture"})
-    assert refused["ok"] is False and refused["reason"] == "unsafe_filename"
+    assert refused["ok"] is False and refused["reason"] == "policy_refused"
+    assert refused["original_reason"] == "unsafe_filename"
     assert worker_rpc._download_into(hostile, "fixture", harvest_root) == (None, None)
     assert seen == connections == []
     assert not harvest_root.exists()
@@ -339,7 +437,15 @@ def test_catalog_and_harvest_confine_real_loopback_downloads(public_fixture, mon
     harvest_dest = harvest_root / "轴 bracket.step"
     assert acquired["ok"] is True and acquired["artifact_path"] == str(catalog_dest)
     assert harvested == harvest_dest and refusal is None
-    assert catalog_dest.read_bytes() == harvest_dest.read_bytes() == b"x" * 65536
+    assert catalog_dest.read_bytes() == harvest_dest.read_bytes() == STEP_FIXTURE
     assert list(catalog_root.rglob("*.step")) == [catalog_dest]
     assert list(harvest_root.rglob("*.step")) == [harvest_dest]
     assert len(seen) == len(connections) == 2
+
+    invalid = url + "/invalid/%E8%BD%B4%20bracket.step"
+    monkeypatch.setattr(session, "browser_fetch", lambda *_: {
+        "ok": True, "content": f'<a href="{invalid}">Download CAD</a>'})
+    rejected = thk.ADAPTER.acquire({"url": "https://www.thk.com/fixture"})
+    assert rejected["ok"] is False and rejected["reason"] == "parse_failed"
+    assert catalog_dest.read_bytes() == STEP_FIXTURE
+    assert list(catalog_root.rglob(".cad-*")) == []

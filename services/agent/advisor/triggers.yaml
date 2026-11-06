@@ -79,7 +79,7 @@ triggers:
           input_map:
             nominal: null
             fit: "H7/p6"
-      exemplar: "H7/p6 on dia 20: min interference 0.017 mm, max 0.042 mm (ISO 286, fit_calc)"
+      exemplar: "H7/p6 on dia 20: min interference 0.001 mm, max 0.035 mm (ISO 286, fit_calc)"
     budget_tokens: 250
     cooldown_turns: 8
 
@@ -109,11 +109,11 @@ triggers:
       tools:
         - wall_thickness
       events:
-        - thin_wall        # geometry event: wall_thickness check flagged a wall < 2 mm
+        - thin_wall        # geometry event: wall-thickness screening flagged a thin region
     inject:
       context_pack: thin_wall
       prerun_calcs: []
-      exemplar: "FDM: min wall 1.2 mm; SLA: 0.6 mm; CNC: depends on tool; source: wall_thickness.py"
+      exemplar: "Run wall_thickness() AND dfm_check; fix or justify every RED region before export/slicing. Use the bound process/FDM profile minimum."
     budget_tokens: 200
     cooldown_turns: 6
 
@@ -229,6 +229,13 @@ triggers:
         - part_place
         - solve_mates
         - check_interference
+        - interface_check
+        - assembly_dof
+        - fastener_check
+        - tool_access_check
+        - disassembly_check
+        - mate_fit_check
+        - bom_consistency_check
       events:
         - assembly_body_added
     inject:
@@ -252,11 +259,14 @@ triggers:
         - dfm_check
         - wall_thickness
         - resolve_process
+        - dfm_reinforce
+        - add_features
+        - edit_feature
       events: []
     inject:
       context_pack: dfm_pre_op
       prerun_calcs: []
-      exemplar: "Run dfm_check before export; wall < process minimum and missing draft are blockers (advisor names delta + fix)"
+      exemplar: "At additive milestones after edits, run dfm_check and dfm_reinforce; inspect verified fixes and rerun after changes."
     budget_tokens: 200
     cooldown_turns: 8
 
@@ -399,6 +409,23 @@ triggers:
     budget_tokens: 300
     cooldown_turns: 8
 
+  - id: stress_concentration
+    match:
+      keywords:
+        - "\\bstress (?:riser|concentration)"
+        - "\\bsharp (?:corner|edge)"
+        - "\\bnotch sensitivity\\b"
+      tools:
+        - run_fea_static
+        - find_stress_risers
+      events: []
+    inject:
+      context_pack: stress_concentration
+      prerun_calcs: []
+      exemplar: "Locate the concentration, inspect the load path and compare local mesh refinement before claiming strength."
+    budget_tokens: 300
+    cooldown_turns: 8
+
   - id: ecad_design
     match:
       keywords:
@@ -431,6 +458,37 @@ triggers:
       context_pack: ecad_design
       prerun_calcs: []
       exemplar: "Schematic -> ERC -> board_from_schematic -> DRC; nets before SPICE (ecad_design pack)"
+    budget_tokens: 250
+    cooldown_turns: 8
+
+  - id: harness_design
+    match:
+      keywords:
+        - "\\bwir(?:e|ing) harness\\b"
+        - "\\bwire loom\\b"
+        - "\\bformboard\\b"
+      tools:
+        - harness_new
+        - harness_add_connector
+        - harness_add_wire
+        - harness_connect
+        - harness_from_netlist
+        - harness_route
+        - harness_check
+        - harness_build_geometry
+        - harness_report
+        - harness_formboard
+        - harness_get
+        - harness_edit
+        - harness_electrical_check
+        - harness_bus_check
+        - harness_cable_model
+        - harness_to_bus_links
+      events: []
+    inject:
+      context_pack: harness_design
+      prerun_calcs: []
+      exemplar: "Define connectivity and placements, route, check, then produce harness deliverables."
     budget_tokens: 250
     cooldown_turns: 8
 

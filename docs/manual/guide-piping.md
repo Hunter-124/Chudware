@@ -43,7 +43,8 @@ WORKFLOW:
      the corridor, lower clearance_mm, change grid_mm), start_inside_obstacle /
      end_inside_obstacle (move the point to the nozzle face or ignore that body).
   2. piping_fluid(name, T=<K>, P=<Pa>)  Resolve fluid properties (sourced values).
-  3. piping_solve(doc, boundary, fluid=None, pumps=None, doc_id=None, network=None)
+  3. piping_solve(doc=None, boundary=None, fluid=None, pumps=None,
+       network_type='liquid', source_handoff=None, doc_id=None, network=None)
      1-D steady solve: flows + pressure map. boundary entries name a node AND
      carry one condition, e.g.
        {'run':'r1','end':'start','pressure':400}   (kPa gauge — fixes it)

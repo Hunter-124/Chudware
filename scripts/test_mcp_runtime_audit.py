@@ -14,21 +14,21 @@ import mcp_runtime_audit as audit
 
 
 def test_file_install_satisfies_pin_but_wrong_version_does_not(tmp_path, monkeypatch):
-    metadata = tmp_path / "chudcode_rpc-0.2.0.dist-info"
+    metadata = tmp_path / "omp_rpc-0.2.0.dist-info"
     metadata.mkdir()
-    (metadata / "METADATA").write_text("Name: chudcode-rpc\nVersion: 0.2.0\n")
+    (metadata / "METADATA").write_text("Name: omp-rpc\nVersion: 0.2.0\n")
     (metadata / "direct_url.json").write_text(json.dumps({
-        "url": (tmp_path / "src" / "chudcode-rpc").as_uri(),
+        "url": (tmp_path / "src" / "omp-rpc").as_uri(),
         "dir_info": {"editable": True},
     }))
     distributions = importlib.metadata.distributions
     monkeypatch.setattr(importlib.metadata, "distributions", lambda: distributions(path=[str(tmp_path)]))
     requirements = tmp_path / "requirements.txt"
-    requirements.write_text("chudcode-rpc==0.2.0 # local editable package\n")
+    requirements.write_text("omp-rpc==0.2.0 # local editable package\n")
     assert check_dependencies(requirements)["declared_missing"] == []
-    (metadata / "METADATA").write_text("Name: chudcode-rpc\nVersion: 0.1.0\n")
+    (metadata / "METADATA").write_text("Name: omp-rpc\nVersion: 0.1.0\n")
     assert check_dependencies(requirements)["declared_missing"] == [
-        {"pkg": "chudcode-rpc", "req_line": "chudcode-rpc==0.2.0 # local editable package"},
+        {"pkg": "omp-rpc", "req_line": "omp-rpc==0.2.0 # local editable package"},
     ]
 
 

@@ -17,12 +17,12 @@ CAPABILITY_KEYS = {"sparse", "dense", "splat", "single_photo", "webcam", "gpu"}
 PROVISIONING_KEYS = {"colmap", "openmvs", "brush", "triposr", "vggt", "docling"}
 
 
-def test_openmvs_is_agpl_discovery_only():
-    """AGPL guardrail: OpenMVS must be subprocess/discovery-only, never fetched."""
+def test_openmvs_is_pinned_download_run_as_subprocess():
     d = rp.REVENG_DESCRIPTORS["openmvs"]
     assert d["license"] == "AGPL-3.0"
-    assert d["mode"] == "env", "OpenMVS (AGPL) must not be a download descriptor"
-    assert d.get("url") is None, "OpenMVS (AGPL) must have no fetch URL"
+    assert d["mode"] == "download"
+    assert d["url"] == rp.OPENMVS_URL and d["sha256"] == rp.OPENMVS_SHA256
+    assert len(rp.OPENMVS_SHA256) == 64
     assert d["env_var"] == "OPENMVS_BIN"
 
 
@@ -35,8 +35,8 @@ def clean_env(monkeypatch, tmp_path):
                 "TRIPOSR_WEIGHTS", "TRELLIS_WEIGHTS", "VGGT_WEIGHTS",
                 "CAD_RECODE_WEIGHTS", "CHUDWARE_TEST_CAMERA", "CUDA_VISIBLE_DEVICES"):
         monkeypatch.delenv(var, raising=False)
-    # neutralize PATH-based tool discovery so the offline assertions are deterministic
-    monkeypatch.setattr(rp.shutil, "which", lambda *_a, **_k: None)
+    # Hide host tools while still allowing absolute executable overrides to resolve.
+    monkeypatch.setenv("PATH", "")
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     real_import = builtins.__import__
 
@@ -73,16 +73,30 @@ def test_status_offline_all_missing(clean_env, monkeypatch):
     assert st["banners"], "should surface fix-it banners when everything is missing"
 
 
+def _install_openmvs(tmp_path):
+    directory = tmp_path / "openmvs"
+    directory.mkdir()
+    for name in ("InterfaceCOLMAP", "DensifyPointCloud", "ReconstructMesh",
+                 "RefineMesh", "TextureMesh"):
+        executable = directory / name
+        executable.write_text("#!/bin/sh\n")
+        executable.chmod(0o755)
+    return directory
+
+
 def test_env_provisioned_flips_available(clean_env, monkeypatch, tmp_path):
     """OpenMVS can be installed without its required sparse reconstruction runtime."""
-    executable = tmp_path / "DensifyPointCloud"
-    executable.write_text("#!/bin/sh\n")
-    executable.chmod(0o755)
-    monkeypatch.setenv("OPENMVS_BIN", str(executable))
+    directory = _install_openmvs(tmp_path)
+    monkeypatch.setenv("OPENMVS_BIN", str(directory))
     st = rp.reveng_status()
     assert st["provisioning"]["openmvs"] is True
     assert "openmvs" not in st["missing"]
     assert st["capabilities"]["dense"] is False
+    # A partial installation is not usable by the dense backend.
+    (directory / "TextureMesh").unlink()
+    st = rp.reveng_status()
+    assert st["provisioning"]["openmvs"] is False
+    assert "openmvs" in st["missing"]
 
 
 def test_colmap_binary_does_not_replace_pycolmap(clean_env, monkeypatch, tmp_path):
@@ -91,7 +105,7 @@ def test_colmap_binary_does_not_replace_pycolmap(clean_env, monkeypatch, tmp_pat
     executable.write_text("#!/bin/sh\n")
     executable.chmod(0o755)
     monkeypatch.setenv("COLMAP_BIN", str(executable))
-    monkeypatch.setenv("OPENMVS_BIN", str(executable))
+    monkeypatch.setenv("OPENMVS_BIN", str(_install_openmvs(tmp_path)))
     brush = rp.brush_install_dir() / "brush_app"
     brush.parent.mkdir(parents=True)
     brush.write_text("#!/bin/sh\n")

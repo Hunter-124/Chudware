@@ -73,6 +73,7 @@ def test_lists_cad_files_newest_first_with_size_and_age(tmp_path):
     assert str(tmp_path) in blk
     assert "already exist" in blk.lower()
     assert "import_part" in blk
+    assert "resume=True" in blk
     # Both branches must be present: a bare prohibition deadlocked k3 live
     # (it deliberated "import or build?" instead of acting).
     assert "create the new part" in blk

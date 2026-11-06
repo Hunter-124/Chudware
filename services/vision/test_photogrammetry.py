@@ -163,6 +163,8 @@ class TestCleanupMeshOpen3dMocked:
         fake_mesh.get_axis_aligned_bounding_box.return_value = fake_aabb
         fake_mesh.vertices = [None] * n_vertices
         fake_mesh.triangles = [None] * n_triangles
+        fake_mesh.vertex_normals = []
+        fake_mesh.triangle_normals = []
 
         fake_o3d = MagicMock()
         fake_o3d.io.read_triangle_mesh.return_value = fake_mesh
@@ -188,10 +190,10 @@ class TestCleanupMeshOpen3dMocked:
         fake_mesh.remove_degenerate_triangles.assert_called_once()
         fake_mesh.remove_duplicated_vertices.assert_called_once()
         fake_mesh.remove_unreferenced_vertices.assert_called_once()
-        fake_mesh.scale.assert_called_once()
+        fake_mesh.transform.assert_called_once()
         fake_o3d.io.write_triangle_mesh.assert_called_once()
         # target_longest_mm normalises: 300 mm target / 150-unit longest extent = 2x.
-        assert fake_mesh.scale.call_args[0][0] == pytest.approx(2.0)
+        assert fake_mesh.transform.call_args[0][0][0, 0] == pytest.approx(2.0)
 
     def test_cleanup_mesh_mm_per_unit_multiplies(self, monkeypatch, tmp_path):
         """mm_per_unit is a ratio: it multiplies, it does NOT normalise the bbox."""
@@ -206,7 +208,7 @@ class TestCleanupMeshOpen3dMocked:
         assert result["scale_applied"] is True
         assert result["scale_mode"] == "mm_per_unit"
         # The factor is the ratio itself — never 2.5 / 150 (the normalising semantic).
-        assert fake_mesh.scale.call_args[0][0] == pytest.approx(2.5)
+        assert fake_mesh.transform.call_args[0][0][0, 0] == pytest.approx(2.5)
 
     def test_cleanup_mesh_rejects_both_scale_params(self, monkeypatch, tmp_path):
         """The two units are mutually exclusive — supplying both is a caller bug."""
@@ -226,7 +228,7 @@ class TestCleanupMeshOpen3dMocked:
         assert "hint" in result
         # Rejected before any geometry was touched or written.
         fake_o3d.io.read_triangle_mesh.assert_not_called()
-        fake_mesh.scale.assert_not_called()
+        fake_mesh.transform.assert_not_called()
         fake_o3d.io.write_triangle_mesh.assert_not_called()
 
     def test_cleanup_mesh_no_scale_keeps_input_units(self, monkeypatch, tmp_path):
@@ -240,7 +242,7 @@ class TestCleanupMeshOpen3dMocked:
         assert result["ok"] is True
         assert result["scale_applied"] is False
         assert result["scale_mode"] is None
-        fake_mesh.scale.assert_not_called()
+        fake_mesh.transform.assert_not_called()
         assert any("input units" in n for n in result["notes"])
 
     def test_cleanup_mesh_rejects_nonpositive_scale(self, monkeypatch, tmp_path):

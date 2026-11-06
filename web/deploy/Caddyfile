@@ -1,0 +1,25 @@
+{
+	admin off
+	# Non-root proxy needs no capability to bind privileged container ports.
+	http_port 8080
+	https_port 8443
+	servers {
+		protocols h1 h2
+	}
+}
+
+{$CHUDWARE_DOMAIN} {
+	# No matcher: authentication covers app/assets, workspace, meshes, health
+	# and WebSocket upgrade requests alike. Caddy requires a bcrypt hash, not
+	# plaintext; missing values fail configuration rather than opening access.
+	basic_auth {
+		{$CHUDWARE_AUTH_USER} {$CHUDWARE_AUTH_HASH}
+	}
+	reverse_proxy chudware:8300 {
+		# Authentication belongs at this proxy. Never send its password-bearing
+		# headers to the gateway or the credential-isolated engine/worker tree.
+		header_up -Authorization
+		header_up -Proxy-Authorization
+		# Original Host and Origin are preserved; WebSockets upgrade natively.
+	}
+}

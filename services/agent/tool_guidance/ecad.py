@@ -15,10 +15,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "ecad_bom": {
         "prompt_note": (
-            "Schematic BOM writer, not the PCB fabrication ecad_export. Exact "
-            "dialect: ecad_bom(doc_id='', fmt='csv'|'json', "
-            "exclude_dnp=True, path=None). path writes the full returned text "
-            "client-side. Next: ecad_plot for the drawing deliverable."
+            "Schematic BOM output via KiCad CLI. Exact dialect: "
+            "ecad_bom(doc_id='', fmt='csv'|'json', "
+            "exclude_dnp=True, path=None). Next: ecad_plot for the drawing deliverable."
         ),
     },
     "ecad_bus": {
@@ -55,21 +54,14 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "returned pin/net/ERC readback."
         ),
     },
-    "ecad_export_kicad": {
-        "prompt_note": (
-            "Write a KiCad 7 .kicad_sch artifact. Exact dialect: "
-            "ecad_export_kicad(path='design.kicad_sch', doc_id=''). The "
-            "write is client-side and returns confirmed bytes/path. Next: "
-            "ecad_plot(fmt='pdf') for a human-readable deliverable."
-        ),
+    "ecad_find_footprint": {
+        "prompt_note": "Search installed KiCad footprints with ecad_find_footprint(query='', limit=30); use the returned fpid rather than guessing.",
     },
-    "ecad_import_kicad": {
-        "prompt_note": (
-            "Import an existing .kicad_sch into the active schematic. Exact "
-            "dialect: ecad_import_kicad(path, mode='merge'|'replace', "
-            "doc_id=''). The source path must exist. Next: ecad_annotate, "
-            "ecad_status, then ecad_lint_schematic."
-        ),
+    "ecad_kicad_status": {
+        "prompt_note": "Use ecad_kicad_status() to inspect the KiCad installation and available libraries before checks or exports.",
+    },
+    "ecad_open": {
+        "prompt_note": "Open a KiCad project, schematic, or board with ecad_open(path). Agent edits are saved to the bound KiCad files; resolve lock or external-change errors rather than overwriting another editor.",
     },
     "ecad_junction": {
         "prompt_note": (
@@ -84,8 +76,7 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "Compiled connectivity readback. Exact dialect: "
             "ecad_netlist(doc_id='', fmt='summary'|'json'|'kicad', "
             "path=None). summary is bounded names/counts; json is the full "
-            "structured netlist; kicad uses the native writer and path writes "
-            "the full text. Next: ecad_bom and ecad_plot."
+            "structured netlist; a path produces a KiCad CLI netlist artifact."
         ),
     },
     "ecad_no_connect": {
@@ -179,8 +170,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "board_from_schematic": {
         "prompt_note": (
-            "One-call layout on the active wired schematic — pass ERC first; "
-            "read residual_drc honestly, then ecad_run_dfm / ecad_run_pdn."
+            "One-call layout on the wired schematic. By default creates a sibling "
+            "board file; if it already exists, ecad_open it and use "
+            "ecad_update_from_sch instead. pcb_name or pcb_path selects a "
+            "separate board without overwrite. Pass ERC first and inspect DRC."
         ),
         "timeout_s": 300,
     },
@@ -215,8 +208,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "ecad_autoroute": {
         "prompt_note": (
-            "Needs a ratsnest — ecad_update_from_sch first. Failed nets are "
-            "named; give them room or route by hand. ecad_optimize_traces "
+            "Needs a ratsnest — ecad_update_from_sch first; run ecad_run_erc before "
+            "routing. Failed nets are named; check net classes and placement "
+            "density, give them room or route by hand. ecad_optimize_traces "
             "polishes after."
         ),
         "timeout_s": 180,
@@ -246,15 +240,15 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "ecad_export": {
         "prompt_note": (
-            "Run ecad_fill_zones first so Gerbers carry the true pour. "
-            "kind='constraints' emits FPGA XDC/LPF — pair with "
-            "ecad_fpga_check."
+            "KiCad CLI generates fabrication outputs and STEP. Use "
+            "ecad_export(kind='gerber', path=..., opts=None) after checking "
+            "the board; opts passes export options through to KiCad."
         ),
     },
     "ecad_fill_zones": {
         "prompt_note": (
-            "Required before Gerber export — the post-edit preview fill is "
-            "coarse and not what ships. Re-run after any copper edit."
+            "Fill copper zones after routing and re-run after copper edits. "
+            "KiCad's DRC also refills zones for its check."
         ),
     },
     "ecad_find_part": {
@@ -266,8 +260,7 @@ ENTRIES: dict[str, dict[str, Any]] = {
     "ecad_fpga_check": {
         "prompt_note": (
             "Schematic-side (not board) bank/pin checks; pass io= to declare "
-            "IOSTANDARDs or VCCIO inference is a guess. Export constraints "
-            "after via ecad_export."
+            "IOSTANDARDs or VCCIO inference is a guess."
         ),
     },
     "ecad_label": {
@@ -279,9 +272,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "ecad_make_board": {
         "prompt_note": (
-            "One-shot sync->route->fill->DRC from the active schematic "
-            "(pass doc_id when several are open); hostcheck=True folds in "
-            "the MCU rule pack."
+            "One-shot sync->route->fill->DRC from the active schematic. By "
+            "default creates a sibling board; if it exists, ecad_open it and "
+            "use ecad_update_from_sch. pcb_name or pcb_path selects a separate "
+            "board without overwrite; hostcheck=True adds the MCU rule pack."
         ),
         "timeout_s": 300,
     },
@@ -322,16 +316,14 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "ecad_run_drc": {
         "prompt_note": (
-            "Advisory spacing/size check after routing — the by_rule "
-            "grouping says widen, move, or re-space. Pair with "
-            "ecad_run_dfm before export."
+            "KiCad CLI runs the authoritative board DRC. Inspect its "
+            "violations and pair it with ecad_run_dfm before export."
         ),
     },
     "ecad_run_erc": {
         "prompt_note": (
-            "Schematic gate before board sync: errors (output shorts, "
-            "undriven power) are real bugs; warnings are usually unwired "
-            "pins. Never blocks edits."
+            "KiCad CLI runs the authoritative schematic ERC before board "
+            "sync. Inspect violations; unavailable is not a clean result."
         ),
     },
     "ecad_run_hostcheck": {
@@ -366,8 +358,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
     "ecad_simulate": {
         "prompt_note": (
             "Start with 'op', then tran/ac; omitting probes returns a "
-            "bounded ~12-node set. ngspice unlocks vendor models but "
-            "degrades honestly to mna."
+            "bounded ~12-node set. netlist_source='native' is the default; "
+            "netlist_source='kicad' uses KiCad-exported SPICE models and "
+            "includes with ngspice and never falls back to MNA. Inspect the "
+            "reported netlist_source and actual backend."
         ),
         "timeout_s": 180,
     },

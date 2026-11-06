@@ -5,8 +5,7 @@ A part is either {"type": "text", "text": str} or {"type": "image", "path": str}
 Each adapter converts these to its own API's wire format (Anthropic image blocks,
 OpenAI image_url data URIs, etc.), so the loop stays provider-agnostic.
 
-Provider delta sink seam (mirrors core/agent/run.cpp's set_provider_delta_emitter
-/ ProviderDeltaGuard): a thread-local sink a streaming-capable provider feeds raw
+Provider delta sink seam: a thread-local sink a streaming-capable provider feeds raw
 text/thinking fragments into while a completion streams. Display-only — the
 provider's final result still carries the full text. Unset means no streaming,
 zero overhead.

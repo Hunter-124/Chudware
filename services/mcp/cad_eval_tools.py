@@ -27,6 +27,7 @@ from .cad_common import (
     _bbox_from_points,
     _between_from_batch,
     _build_emphasis_palette,
+    _captioned_render,
     _camera_dir_for_target,
     _doc,
     _dumps,
@@ -44,12 +45,13 @@ from .cad_common import (
     _roster_text,
     _target_bbox,
     _target_feature_roster,
+    _tile_pngs_grid,
+    _tmp,
     already_resolved_selector,
     is_geom_query,
     normalize_geom_query,
     note_interference_check,
     render_output_path,
-    resolve_readback_selector,
     cb,
 )
 
@@ -237,19 +239,19 @@ def _doc_body_count(doc_id: str) -> int:
                 if isinstance(m, dict) and m.get("body") is not None), default=1)
 
 
-def _eval_thickness_all_bodies(doc_id: str) -> tuple[dict, list]:
-    """(merged eval_thickness reply, [(body ordinal, field handle), ...]).
-
-    eval_thickness measures ONE body — the last, unless `body` names one — so on a
-    part with a second solid every other body went unmeasured and the "thinnest wall"
-    could be anything but. A single-body part keeps the engine's reply byte-for-byte.
-    """
+def _eval_thickness_all_bodies(doc_id: str, min_wall_mm: float,
+                               resolution: float | None = None) -> tuple[dict, list]:
+    """Merge the native study across all solids, retaining each field's body ordinal."""
+    params = {"doc_id": doc_id, "min_wall_mm": min_wall_mm}
+    if resolution is not None:
+        params["resolution"] = resolution
     count = _doc_body_count(doc_id)
     if count <= 1:
-        res = cb.call("eval_thickness", {"doc_id": doc_id})
+        res = cb.call("eval_thickness", params)
+        res["thin_regions"] = [dict(r, body=1) for r in res.get("thin_regions") or []]
         handle = res.get("aicm_path")
         return res, ([(1, str(handle))] if handle else [])
-    per = [(b, cb.call("eval_thickness", {"doc_id": doc_id, "body": b}))
+    per = [(b, cb.call("eval_thickness", {**params, "body": b}))
            for b in range(1, count + 1)]
     measured = [(b, r) for b, r in per if r.get("min_thickness_mm") is not None]
     n_total = sum(int(r.get("n_sampled") or 0) for _, r in per)
@@ -263,6 +265,10 @@ def _eval_thickness_all_bodies(doc_id: str) -> tuple[dict, list]:
         for key in ("n_vertices", "n_unmeasured"):
             basis[key] = sum(int((r.get("measurement_basis") or {}).get(key) or 0)
                              for _, r in per)
+        basis["spacing_mm"] = max(float((r.get("measurement_basis") or {}).get("spacing_mm") or 0)
+                                  for _, r in per)
+        basis["budget_limited"] = any(
+            (r.get("measurement_basis") or {}).get("budget_limited") for _, r in per)
     minimum_sample = thinnest.get("minimum_sample")
     merged = {
         "aicm_path": thinnest.get("aicm_path"),
@@ -275,67 +281,160 @@ def _eval_thickness_all_bodies(doc_id: str) -> tuple[dict, list]:
         "minimum_sample": ({**minimum_sample, "body": min_body}
                            if isinstance(minimum_sample, dict) else None),
         "bodies": [{"body": b, "min_thickness_mm": r.get("min_thickness_mm")} for b, r in per],
+        "min_wall_mm": min_wall_mm,
+        "thin_area_mm2": sum(float(r.get("thin_area_mm2") or 0) for _, r in per),
+        "n_thin_regions": sum(int(r.get("n_thin_regions") or 0) for _, r in per),
+        "thin_regions": sorted(
+            (dict(region, body=b) for b, r in per for region in r.get("thin_regions") or []),
+            key=lambda r: r["min_thickness_mm"]),
     }
     return merged, [(b, str(r["aicm_path"])) for b, r in measured if r.get("aicm_path")]
 
 
-def _wall_thickness_result(doc_id: str) -> dict:
-    """Build the canonical whole-part wall-thickness response for every route."""
-    res, fields = _eval_thickness_all_bodies(doc_id)
+def _wall_minimum(doc_id: str, min_wall_mm: float | None) -> float:
+    """Use the persisted set_process profile, otherwise the native FDM profile."""
+    if min_wall_mm is None:
+        from .intake_tools import _K_PROCESS, _dfm, _get
+        profile = _get(doc_id, _K_PROCESS)
+        if not isinstance(profile, dict) or (profile.get("params") or {}).get("min_wall_mm") is None:
+            profile = _dfm("dfm_get_profile", {
+                "process": (profile.get("process") if isinstance(profile, dict) else None) or "fdm"})
+        min_wall_mm = profile["params"]["min_wall_mm"]
+    if isinstance(min_wall_mm, bool) or not math.isfinite(min_wall_mm) or min_wall_mm <= 0:
+        raise ValueError("min_wall_mm must be a positive, finite thickness in mm.")
+    return float(min_wall_mm)
+
+
+def _wall_face_metadata(doc_id: str) -> dict:
+    """Join body-local TopExp face IDs to SIDs and the feature that last rebuilt them."""
+    feats, owner_map = _target_feature_roster(doc_id)
+    names = {str(f.get("id")): f.get("name") for f in feats}
+    faces = (cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "face"}}) or {}
+             ).get("matches") or []
+    metadata = {(int(m["body"]), int(m["topo"])): {
+        "face": m.get("sid"), "surf": m.get("surf")} for m in faces
+        if isinstance(m, dict) and m.get("body") is not None and m.get("topo") is not None}
+    for fid, owner in owner_map.items():
+        for pair in owner.get("faces") or []:
+            if isinstance(pair, list) and len(pair) == 2:
+                metadata.setdefault((int(pair[0]), int(pair[1])), {})["built_by"] = {
+                    "id": str(fid), "name": names.get(str(fid))}
+    return metadata
+
+
+def _wall_thickness_result(doc_id: str, min_wall_mm: float | None = None,
+                           resolution: float | None = None) -> dict:
+    """Build the canonical whole-part study, including actionable thin-region ownership."""
+    threshold = _wall_minimum(doc_id, min_wall_mm)
+    if resolution is not None and (
+            isinstance(resolution, bool) or not math.isfinite(resolution) or resolution <= 0):
+        raise ValueError("resolution must be a positive, finite sample spacing in mm.")
+    res, fields = _eval_thickness_all_bodies(doc_id, threshold, resolution)
     mn = res.get("min_thickness_mm")
-    if mn is not None:
-        mean = res.get("mean_thickness_mm")
-        summary = (f"minimum sampled local wall span = {mn:.4g} mm"
-                   + (f" (mean {mean:.4g} mm)" if mean is not None else "")
-                   + "; includes edge tapers, not a verified structural wall minimum")
-    else:
-        summary = ("no accepted inward-ray wall span — rays can miss an exit, graze a face, "
-                   "or fall below the sampling cutoff; this does not establish wall thickness "
-                   "or safety")
-    # Keep this insertion order identical to the long-standing wall_thickness response.
+    basis = res.get("measurement_basis") or {}
+    spacing = basis.get("spacing_mm")
+    summary = (f"minimum inscribed-sphere wall thickness = {mn:.4g} mm"
+               if mn is not None else "wall thickness unmeasured: no opposing wall found")
+    summary += f"; process comparison minimum = {threshold:g} mm"
     out = {"ok": True, "doc_id": doc_id, "summary": summary, **res}
-    out["measurement_caveat"] = (
-        "Tessellated surface-normal ray spans include real local taper at acute convex edges. "
-        "A boundary minimum is neither a verified structural wall thickness nor evidence that "
-        "the part is safe; a dihedral angle alone cannot dismiss it. Inspect sections at and "
-        "near the reported location and the relevant load path. Unsampled regions and spans "
-        "below the acceptance cutoff remain unresolved.")
+    out["min_wall_mm"] = threshold
+    out["basis_note"] = ("Inscribed-sphere wall thickness"
+                         + (f"; surface spacing {spacing:.4g} mm" if spacing else "")
+                         + "; mesh-based screening, not manufacturing approval.")
+    out["colour_legend"] = (
+        f"red <= {threshold:g} mm; yellow/green/cyan increasing; "
+        f"blue >= {3 * threshold:g} mm; grey = unmeasured")
+    metadata = _wall_face_metadata(doc_id)
+    for index, region in enumerate(out.get("thin_regions") or [], start=1):
+        region["index"] = index
+        face_info = [metadata.get((region["body"], int(fid)), {})
+                     for fid in region.get("face_ids") or []]
+        region["faces"] = list(dict.fromkeys(m["face"] for m in face_info if m.get("face")))
+        owners = {m["built_by"]["id"]: m["built_by"] for m in face_info if m.get("built_by")}
+        region["built_by"] = list(owners.values())
     if mn is not None and fields:
-        try:
-            out["thinnest"] = _thinnest_wall_faces(doc_id, fields)
-            minimum_sample = out.get("minimum_sample")
-            if isinstance(minimum_sample, dict):
-                minimum_sample = {**minimum_sample,
-                                  "body": minimum_sample.get("body", 1)}
-                for spot in out["thinnest"]:
-                    if (spot["body"] == minimum_sample["body"]
-                            and spot["vertex_index"] == minimum_sample["vertex_index"]):
-                        minimum_sample.update({key: spot[key] for key in
-                                               ("sample_location", "face", "surf", "built_by")
-                                               if key in spot})
-                        break
-                out["minimum_sample"] = minimum_sample
-        except Exception as exc:  # noqa: BLE001 — the measurement itself still stands
-            out["thinnest_unavailable"] = f"{type(exc).__name__}: {exc}"
+        out["thinnest"] = _thinnest_wall_faces(doc_id, fields, metadata=metadata)
+    minimum_sample = out.get("minimum_sample")
+    if isinstance(minimum_sample, dict):
+        minimum_sample = dict(minimum_sample, body=minimum_sample.get("body", 1))
+        minimum_sample.update(metadata.get(
+            (minimum_sample["body"], minimum_sample.get("face_id")), {}))
+        out["minimum_sample"] = minimum_sample
     return out
+
+
+_WALL_REGIONS_CAP = 20
+_WALL_REGION_FACES_CAP = 12
+
+
+def _cap_wall_result(result: dict) -> dict:
+    """The JSON form of a wall study, bounded: the thinnest `_WALL_REGIONS_CAP` regions, each
+    naming at most `_WALL_REGION_FACES_CAP` faces. The cut is announced, never silent."""
+    out = dict(result)
+    regions = [r for r in (out.get("thin_regions") or []) if isinstance(r, dict)]
+    if len(regions) > _WALL_REGIONS_CAP:
+        regions.sort(key=lambda r: (r.get("min_thickness_mm") is None,
+                                    r.get("min_thickness_mm") or 0.0))
+        out["thin_regions_truncated"] = {
+            "returned": _WALL_REGIONS_CAP, "total": len(regions),
+            "note": "thinnest regions first; fix those and re-run for the rest"}
+        regions = regions[:_WALL_REGIONS_CAP]
+    capped = []
+    for region in regions:
+        region = dict(region)
+        for key in ("faces", "face_ids", "built_by"):
+            listed = region.get(key) or []
+            if len(listed) > _WALL_REGION_FACES_CAP:
+                region[key] = listed[:_WALL_REGION_FACES_CAP]
+                region[f"{key}_total"] = len(listed)
+        capped.append(region)
+    if "thin_regions" in out:
+        out["thin_regions"] = capped
+    return out
+
+
+def _mass_warnings(mass: dict) -> list:
+    """Top-level warnings for an eval_mass result.
+
+    A density that was DEFAULTED (steel, 7.85 g/cm^3) instead of read from an applied material
+    used to be visible only as `mass.material.source == "default"` — one level down, easy to
+    miss while quoting a mass. This lifts it, and the engine's own reliability warnings (an
+    open shell makes volume/inertia meaningless), to the response top level."""
+    out: list = []
+
+    def _material(material, who: str = "") -> None:
+        if not isinstance(material, dict):
+            return
+        if material.get("unresolved_key"):
+            out.append(f"{who}material key {material.get('key')!r} has no density in the material "
+                       f"registry, so 7.85 g/cm^3 (steel) was ASSUMED — mass and inertia scale "
+                       f"with it; fix the material key or pass density_g_cm3=")
+        elif material.get("source") == "default":
+            out.append(f"{who}no material is applied, so 7.85 g/cm^3 (steel) was ASSUMED — mass "
+                       f"and inertia scale with it; set_material(...) or pass density_g_cm3= / "
+                       f"material=")
+
+    bodies = [b for b in (mass.get("bodies") or []) if isinstance(b, dict)]
+    _material(mass.get("material"))
+    if (mass.get("material") or {}).get("mixed"):
+        for b in bodies:
+            _material(b.get("material"), f"body {b.get('body_id')}: ")
+    if mass.get("warning"):
+        out.append(str(mass["warning"]))
+    for b in bodies:
+        if b.get("warning"):
+            out.append(f"body {b.get('body_id')}: {b['warning']}")
+    return list(dict.fromkeys(out))
 
 
 _THINNEST_FACES = 3
 
 
-def _thinnest_wall_faces(doc_id: str, fields: list) -> list:
-    """WHERE the thinnest walls are: the lowest-thickness faces, each with its thinnest sample.
+def _thinnest_wall_faces(doc_id: str, fields: list, *, metadata: dict | None = None) -> list:
+    """Locate the lowest inscribed-sphere face minima on the refined field mesh.
 
-    eval_thickness samples the tessellation vertices and writes the per-vertex thickness
-    into its colour-map field. A bare minimum sent agents bisecting the tree by suppressing
-    features one at a time to find the face that owned it (c219: three sub-agents, ~25
-    add_features + wall_thickness round trips). Each field holds one body (always labelled
-    1 inside the field); `fields` pairs it with the document's body ordinal. Its FACE ids are
-    that body's TopExp index — the `topo` of doc_query and the second half of every owner_map
-    pair — so each spot is named by face sid and by the feature whose rebuild produced that
-    face. That is the raw owner_map join, not describe_part's de-smeared one: the de-smear
-    costs seconds per call on a 90-face part, and "the feature that last rebuilt this
-    face" is the one to edit.
+    Each field labels its body as 1; `fields` retains the document ordinal. FaceRec IDs
+    are body-local TopExp indices, the same keys used by doc_query and owner_map.
     """
     import numpy as np
 
@@ -374,31 +473,102 @@ def _thinnest_wall_faces(doc_id: str, fields: list) -> list:
     if not ranked:
         return []
 
-    # The thickness field's (body_id, face_id) is the same (body ordinal, per-body TopExp
-    # index) key owner_map pairs and doc_query's body/topo stamps use, so every body joins.
-    feats, owner_map = _target_feature_roster(doc_id)
-    names = {str(f.get("id")): f.get("name") for f in feats}
-    faces = (cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "face"}}) or {}
-             ).get("matches") or []
-    by_key = {(int(m["body"]), int(m["topo"])): m for m in faces
-              if isinstance(m, dict) and m.get("body") is not None
-              and m.get("topo") is not None}
-    built_by = {(int(pair[0]), int(pair[1])): str(fid) for fid, om in owner_map.items()
-                for pair in (om.get("faces") or [])
-                if isinstance(pair, list) and len(pair) == 2}
+    if metadata is None:
+        metadata = _wall_face_metadata(doc_id)
     spots = []
     for thickness, body_id, face_id, vertex_index, point, location in ranked:
         spot = {"thickness_mm": round(thickness, 4), "at": point, "body": body_id,
                 "vertex_index": vertex_index, "sample_location": location}
-        match = by_key.get((body_id, face_id))
-        if match is not None:
-            spot["face"] = match.get("sid")
-            spot["surf"] = match.get("surf")
-        owner = built_by.get((body_id, face_id))
-        if owner:
-            spot["built_by"] = {"id": owner, "name": names.get(owner)}
+        spot.update(metadata.get((body_id, face_id), {}))
         spots.append(spot)
     return spots
+
+
+def _wall_region_section(region: dict, view_dir) -> tuple:
+    """(section, camera direction) showing a thin region's wall in cross-section.
+
+    The plane passes through the region centroid, CONTAINS the measured wall direction (so
+    the cut shows the wall's own thickness) and crosses the region's longest extent (so a
+    long thin rib is cut across, not along). The camera looks from the removed side."""
+    from . import cad_viewpoint as vp
+    axis = vp._unit(region["wall_direction"])
+    if axis is None:
+        raise ValueError("Thin region has no wall-thickness direction to section.")
+
+    def across(ref):
+        return vp._unit([ref[k] - vp._dot(ref, axis) * axis[k] for k in range(3)])
+
+    lo, hi = region["bbox"]["min"], region["bbox"]["max"]
+    normal = None
+    for _, k in sorted(((hi[k] - lo[k], k) for k in range(3)), reverse=True):
+        if abs(axis[k]) < 0.9:  # an extent that is not the wall direction itself
+            normal = across([1.0 if j == k else 0.0 for j in range(3)])
+            break
+    view = vp._unit(view_dir, (1, 1, 0.8))
+    if normal is None:
+        normal = across(view) or across(min(((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+                                            key=lambda r: abs(vp._dot(r, axis))))
+    if vp._dot(normal, view) < 0:
+        normal = [-c for c in normal]
+    # Mostly face-on to the cut, tilted along the wall and along the cut (toward the side the
+    # overview camera came from) so the section reads in 3D context.
+    along = vp._cross(normal, axis)
+    if vp._dot(along, view) < 0:
+        along = [-c for c in along]
+    direction = vp._unit([normal[k] + 0.35 * axis[k] + 0.35 * along[k] for k in range(3)])
+    return {"point": list(region["centroid"]), "normal": list(normal)}, direction
+
+
+def _wall_thickness_image(doc_id: str, result: dict) -> list:
+    """Planner-chosen whole-part heat maps plus ghosted cuts through the worst regions."""
+    from . import shot_planner
+    threshold = result["min_wall_mm"]
+    heatmap = {"min_wall_mm": threshold}
+    requested = (result.get("measurement_basis") or {}).get("requested_spacing_mm")
+    if requested is not None:
+        heatmap["resolution"] = requested
+    plan = shot_planner.plan_shots(doc_id, k=2)
+    tiles, labels = [], []
+    for index, view in enumerate(plan["views"], start=1):
+        label = f"Whole part {index}"
+        png, _, _ = _render_view_png(
+            doc_id, view["dir"], _tmp(".png"), name=label.upper(), camera=view["camera"],
+            section=view.get("section"), thickness=heatmap, annotate=True)
+        tiles.append(png)
+        labels.append(label)
+    for region in (result.get("thin_regions") or [])[:3]:
+        section, direction = _wall_region_section(region, plan["views"][0]["dir"])
+        # Frame the region (and its opposing side) as a thin slab around the cut: along the
+        # section normal only `pad` of depth, so the region's length does not shrink the
+        # wall's cross-section in the picture.
+        bbox = region["bbox"]
+        pad = max(threshold, 2 * region["min_thickness_mm"])
+        normal, point = section["normal"], section["point"]
+        focus = {"min": [], "max": []}
+        for k in range(3):
+            lo = min(bbox["min"][k], region["opposite_at"][k]) - pad
+            hi = max(bbox["max"][k], region["opposite_at"][k]) + pad
+            w = abs(normal[k])
+            focus["min"].append(w * (point[k] - pad) + (1 - w) * lo)
+            focus["max"].append(w * (point[k] + pad) + (1 - w) * hi)
+        label = f"Region {region['index']}: {region['min_thickness_mm']:.3g} mm"
+        png, _, _ = _render_view_png(
+            doc_id, direction, _tmp(".png"), name=label.upper(), focus=focus,
+            section=section, thickness=heatmap, W=512, H=384, annotate=True)
+        tiles.append(png)
+        labels.append(label)
+    png = _tile_pngs_grid(
+        tiles, render_output_path(f"{doc_id}-wall-thickness", ".png"), labels=labels, cols=2)
+    caption = {key: result.get(key) for key in (
+        "min_thickness_mm", "min_wall_mm", "thin_area_mm2", "n_thin_regions")}
+    caption["regions"] = [
+        {key: r.get(key) for key in ("index", "body", "min_thickness_mm", "kind", "faces",
+                                   "built_by", "at")}
+        for r in result.get("thin_regions") or []]
+    caption["panels"] = labels
+    caption["colour_legend"] = result["colour_legend"]
+    caption["basis_note"] = result["basis_note"]
+    return _captioned_render(png, doc_id, labels, caption=_dumps(caption))
 
 
 def _add_box_call(doc_id: str) -> str:
@@ -615,6 +785,69 @@ def _read_plane(tool: str, plane, notes: list) -> str:
     return hit
 
 
+_DATUM_NORMALS = {"top": [0.0, 0.0, 1.0], "front": [0.0, -1.0, 0.0], "right": [1.0, 0.0, 0.0]}
+
+
+def _cut_plane_ref(tool: str, plane, offset, origin, normal, xdir, notes: list):
+    """The engine plane ref for a cutting/mirror plane in any of the spellings inspect_section
+    and check_symmetry accept: a datum name (str) for an unshifted reserved plane, otherwise
+    {origin, normal[, xdir]}. Sources, one at a time:
+      * plane={origin,normal[,xdir]}                      a custom plane object
+      * origin= + normal= [+ xdir=]                       the same, flattened
+      * plane="top"/"XY"/"+z"... [+ offset= mm]           a reserved datum, optionally shifted
+                                                          along its normal
+    offset= may also shift a custom plane along its normal. Every rewrite lands in `notes`;
+    an under-specified or contradictory plane is a teaching error, never a guess."""
+    if offset is not None and (isinstance(offset, bool) or
+                               not isinstance(offset, (int, float)) or
+                               not math.isfinite(offset)):
+        raise ValueError(f"{tool}(): offset must be a finite number in mm.")
+    if isinstance(plane, dict):
+        plane_ref: Union[str, dict] = dict(plane)
+        if origin is not None or normal is not None or xdir is not None:
+            raise ValueError(
+                f"{tool}(): pass the custom plane either as plane={{origin,normal"
+                "[,xdir]} OR as flattened origin=/normal=/xdir= arguments, not both.")
+    elif origin is not None or normal is not None or xdir is not None:
+        if origin is None or normal is None:
+            raise ValueError(
+                f"{tool}(): a custom plane needs both origin=[x,y,z] and "
+                "normal=[nx,ny,nz]; xdir=[x,y,z] is optional.")
+        plane_ref = {"origin": origin, "normal": normal}
+        if xdir is not None:
+            plane_ref["xdir"] = xdir
+        if plane is not None:
+            raise ValueError(f"{tool}(): specify either plane= or origin=/normal=, not both.")
+    else:
+        named = _read_plane(tool, plane, notes)
+        plane_ref = named
+        if offset is not None:
+            if isinstance(offset, bool) or not isinstance(offset, (int, float)):
+                raise ValueError(f"{tool}(offset={offset!r}): offset must be a number in mm.")
+            distance = float(offset)
+            if distance != 0.0:
+                n = _DATUM_NORMALS[named]
+                plane_ref = {"origin": [distance * n[0], distance * n[1], distance * n[2]],
+                             "normal": list(n)}
+                notes.append(f"offset={distance:g} mm shifted the {named!r} datum along its normal")
+                offset = None  # applied; do not re-shift in the custom-plane path below
+    if isinstance(plane_ref, dict) and offset not in (None, 0, 0.0):
+        if "origin" not in plane_ref or "normal" not in plane_ref:
+            raise ValueError(f"{tool}(): offset on a custom plane requires origin and normal.")
+        o = plane_ref.get("origin")
+        n = plane_ref.get("normal")
+        if not (isinstance(o, (list, tuple)) and len(o) == 3
+                and isinstance(n, (list, tuple)) and len(n) == 3):
+            raise ValueError(f"{tool}(): custom plane origin/normal must be numeric [x,y,z].")
+        mag = sum(float(v) * float(v) for v in n) ** 0.5
+        if mag <= 1e-12:
+            raise ValueError(f"{tool}(): custom plane normal is near-zero.")
+        distance = float(offset)
+        plane_ref["origin"] = [float(o[i]) + distance * float(n[i]) / mag for i in range(3)]
+        notes.append(f"offset={distance:g} mm shifted the custom plane along its normal")
+    return plane_ref
+
+
 def _read_direction(tool: str, param: str, value, default: tuple) -> tuple:
     """A [x,y,z] direction from a vector OR a signed axis/side word, never from a guess.
 
@@ -698,6 +931,8 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def query_geometry(query: Optional[Union[str, dict]] = None,
                        doc_id: Optional[str] = None,
+                       owner: Optional[str] = None, feature: Optional[str] = None,
+                       offset: int = 0, page_size: int = 100,
                        **kwargs: Annotated[Any, Field(default=None)]) -> str:
         """Resolve a STRUCTURED face/edge query against the part — explore/confirm geometry.
 
@@ -731,13 +966,16 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                                            assembled into {"of":"face","side":"top"}
           surface= / shape=                spellings of `surf`
           limit= / max= / max_results=     spellings of `count` (a result cap)
-        A spelling that is NOT query vocabulary (target="bushing_body") is read as the SUBJECT
-        — the part or feature the query is about: an open document's id/name selects that
-        document, a feature name is reported (this tool always searches the whole document),
-        and anything else is reported as unresolved instead of quietly steering the query.
+        owner= or feature= names a feature by ID or name; only its raw doc_tree owner_map
+        faces/edges are considered, BEFORE side, pick, near, count and index. This is
+        engine attribution, which may include geometry regenerated by a boolean, not
+        necessarily only geometry created by the feature. offset/page_size page results
+        (default 100, maximum 100). count remains a geometric selection cap.
+        Shared SIDs are reported in ambiguous_sids; never assume a SID uniquely identifies
+        geometry when it is listed there.
 
         Returns each matching face/edge with its shape (surf), side, signed outward normal,
-        centroid, size and stable sid (round faces add radius, concavity and axis_point — a point
+        centroid, size and revision-scoped sid (round faces add radius, concavity and axis_point — a point
         ON the cylinder/cone axis; torus faces such as sweep bends instead add major_radius,
         minor_radius, torus_axis and torus_center — bend radius, tube radius, bend axis and
         bend centre), so you can confirm "the top face" resolves before you
@@ -751,24 +989,62 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         try:
             extra = _extra_kwargs(dict(kwargs))
             notes: list = []
+            if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+                raise ValueError("offset must be a nonnegative integer.")
+            if isinstance(page_size, bool) or not isinstance(page_size, int) or not 1 <= page_size <= 100:
+                raise ValueError("page_size must be an integer from 1 to 100.")
+            if isinstance(query, dict):
+                query = dict(query)
+                for key in ("owner", "feature"):
+                    if key in query:
+                        value = query.pop(key)
+                        current = owner if key == "owner" else feature
+                        if current is not None and current != value:
+                            raise ValueError(f"{key} supplied twice with different values.")
+                        if key == "owner":
+                            owner = value
+                        else:
+                            feature = value
+            if owner is not None and feature is not None and owner != feature:
+                raise ValueError("owner and feature name the same predicate; specify only one.")
+            owner = owner if owner is not None else feature
             # A sid IS an element, not a query. This tool hands sids out on every match and
             # the docs tell the model to address the element by one, so asking about a sid
             # here has exactly one meaning. Live claude-opus-5 2026-08-04:
             # query_geometry(doc_id=…, sid="F1b1b80") answered "needs a geometry query".
             sid = extra.pop("sid", None)
-            if sid is None and isinstance(query, dict) and set(query) == {"sid"}:
-                sid, query = query["sid"], None
+            kind = extra.pop("of", None) if sid is not None else None
+            if isinstance(query, dict) and "sid" in query:
+                if sid is not None:
+                    raise ValueError("query_geometry: specify sid only once.")
+                unsupported = set(query) - {"sid", "of"}
+                if unsupported:
+                    raise ValueError(f"query_geometry: sid cannot be combined with predicates {sorted(unsupported)}.")
+                sid, kind, query = query["sid"], query.get("of"), None
             if sid is None and isinstance(query, str) and _SID_RE.fullmatch(query.strip()):
                 sid, query = query.strip(), None
-            if isinstance(sid, str) and sid.strip():
+            if sid is not None:
+                if not isinstance(sid, str) or not sid.strip():
+                    raise ValueError("query_geometry: sid must be a nonempty string.")
+                if query is not None or extra or owner is not None:
+                    raise ValueError("query_geometry: sid cannot be combined with other query predicates or arguments.")
+                if not _SID_RE.fullmatch(sid.strip()) or sid.strip()[0].lower() not in ("f", "e"):
+                    raise ValueError("query_geometry: sid must be a face or edge SID.")
                 d = _doc(doc_id)
-                match = resolve_readback_selector(d, {"sid": sid.strip()})
-                notes.append(f'sid="{sid.strip()}" names ONE element — resolved it against '
-                             f"this document instead of reading it as a query predicate "
-                             f"(the engine has no `sid` predicate)")
-                return _dumps(_interpreted(
-                    {"ok": True, "doc_id": d, "query": {"sid": sid.strip()},
-                     "count": 1, "matches": [match]}, notes))
+                actual_kind = {"f": "face", "e": "edge"}[sid.strip()[0].lower()]
+                if kind is not None and kind != actual_kind:
+                    raise ValueError(f"query_geometry: of={kind!r} contradicts sid {sid!r}, which names a {actual_kind}.")
+                res = cb.call("doc_query", {"doc_id": d, "query": {"of": actual_kind}}) or {}
+                matches = [m for m in res.get("matches", [])
+                           if str(m.get("sid", "")).casefold() == sid.strip().casefold()]
+                if not matches:
+                    raise ValueError(f"query_geometry: no {actual_kind} with sid {sid!r}; requery current geometry.")
+                if len(matches) != 1:
+                    raise ValueError(f"query_geometry: sid {sid!r} is ambiguous ({len(matches)} matches); use geometry predicates and body/topo to distinguish them.")
+                return _dumps({"ok": True, "doc_id": d, "query": {"sid": sid.strip()},
+                               "count": 1, "total_count": 1, "offset": offset,
+                               "page_size": page_size, "next_offset": None,
+                               "matches": matches[offset:offset + page_size]})
             q, subjects = _read_query("query_geometry", query, extra, notes)
             # Output-shape flags asking for something this tool ALREADY does. Every match carries
             # centroid/normal/axis unconditionally, so return_coords=True is a request that is
@@ -846,8 +1122,19 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                     f"matches below answer query={json.dumps(q, sort_keys=True)} over the whole "
                     f"document; call get_part or describe_part to see what is really there.")
 
+            engine_query = dict(q)
+            if owner is not None:
+                tree = cb.call("doc_tree", {"doc_id": d}) or {}
+                feats = (tree.get("tree") or {}).get("features") or []
+                fid, fname, _ = _resolve_feature_ref(d, owner, feats, what="owner")
+                owned = (tree.get("owner_map") or {}).get(fid) or {}
+                kind = str(q.get("of", "face")).lower()
+                if kind not in ("face", "edge"):
+                    raise ValueError("owner filtering supports face or edge queries only.")
+                engine_query["within"] = owned.get("faces" if kind == "face" else "edges") or []
+
             try:
-                res = cb.call("doc_query", {"doc_id": d, "query": q})
+                res = cb.call("doc_query", {"doc_id": d, "query": engine_query})
             except CoreError as ce:
                 raise _teach_no_bodies(
                     ce, d, f"query_geometry(query={json.dumps(q, sort_keys=True)})") from None
@@ -857,12 +1144,24 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
             # needs to see what it actually asked for before trusting the matches.
             out = {"ok": True, "doc_id": d, "query": q}
             out.update(res if isinstance(res, dict) else {"result": res})
+            matches = out.get("matches") or []
+            out["total_count"] = len(matches)
+            out["offset"] = offset
+            out["page_size"] = page_size
+            out["matches"] = matches[offset:offset + page_size]
+            out["next_offset"] = offset + page_size if offset + page_size < len(matches) else None
+            if "ambiguous_sids" in out:
+                page_sids = {m.get("sid") for m in out["matches"]}
+                out["ambiguous_sids"] = {sid: n for sid, n in out["ambiguous_sids"].items()
+                                         if sid in page_sids}
+            if owner is not None:
+                out["owner"] = {"id": fid, "name": fname, "source": "doc_tree.owner_map"}
             # Geometry selectors are revision-sensitive. Return a deliberately bounded tree
             # fingerprint with every successful query so the caller can tell whether a later
             # mutation invalidated these sids without receiving every feature's parameters.
             out["doc_id"] = d
             out["model_state"] = _query_model_state(d)
-            if not (out.get("matches") or []):
+            if not matches:
                 out["note"] = ("no face/edge matched this query — loosen it (drop `side` or "
                                "`surf`) or call describe_part to see the actual roster")
             if unresolved:
@@ -895,6 +1194,16 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
           redundant    constraint ids implied by the others (harmless, but a redundant DRIVING
                        dimension over-defines — prefer a relation or delete the duplicate)
           summary      one-line plain-English verdict + what to add/remove to reach dof 0
+          converged    whether the solver converged; fully_defined requires it, plus dof 0, no
+                       conflicts, no skipped constraints and NOTHING fix-pinned (pinned_entities
+                       empty — a single dimension beside blanket fix pins is still pinned)
+          authored_dimensions / auto_dimensions  driving dimensions you authored vs engine-minted
+                       auto ones (sketch_fully_define); findings all_dimensions_auto and
+                       dimension_heavy (with relation_dimension_ratio) say when to confirm/replace
+                       auto values with the critical dimensions or trade dimensions for relations
+          hints        unordered suggestions from sketch_health (NOT an ordered plan)
+          closure_usage / open_endpoints  open endpoints are a defect only when closure_usage is
+                       closed_profile or mixed; for open_path / unknown they are informational
 
         Workflow: after authoring a sketch, READ the ASCII readback from the mutation response
         (or call render_sketch_ascii), then call this / sketch_health; if `under`, add the missing
@@ -922,11 +1231,16 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
             # conflicting/redundant are [{id,type,suggestion}] objects, from which we pull the
             # ids for check_sketch's id-list contract. (The old "doc_sketch_solve"/"sketch_fid"
             # call never dispatched — wrong method + key — so check_sketch silently errored.)
+            snapshot = cb.call("doc_tree", {"doc_id": d})
             r = cb.call("sketch_health", {"doc_id": d, "sketch": sketch})
+            if r.get("ok") is False:
+                return _dumps(r)
             status = r.get("status", "")
             dof = r.get("dof")
             from services.mcp.ascii2d import live_sketch_design_intent
-            intent = live_sketch_design_intent(d, sketch, r)
+            intent = live_sketch_design_intent(d, sketch, r, snapshot=snapshot)
+            revision_before = snapshot.get("revision")
+            revision_after = cb.call("doc_tree", {"doc_id": d}).get("revision")
 
             def _ids(items):
                 out = []
@@ -940,19 +1254,45 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
             conflicting = _ids(r.get("conflicting"))
             redundant = _ids(r.get("redundant"))
             narration = r.get("dof_narration")
-            fully_defined = (dof == 0 and status != "over" and not conflicting
-                             and not intent["pinned_only"] and not r.get("skipped_constraints"))
+            skipped = r.get("skipped_constraints") or []
+            converged = r.get("converged")
+            pinned = intent["pinned_entities"]
+            # Solver truth AND-ed with everything that makes dof 0 meaningless: a failed solve,
+            # skipped (unapplied) constraints, conflicts, or ANY fix-pinned authored entity —
+            # not only the pinned_only shape (one dimension beside blanket pins is still pinned).
+            fully_defined = (dof == 0 and status == "full" and not conflicting
+                             and converged is True and not skipped and not pinned)
             if conflicting:
                 summary = (f"Over-defined: {len(conflicting)} conflicting constraint(s) "
-                           f"{conflicting} — remove one to resolve the contradiction.")
+                           f"{conflicting} — remove one to resolve the contradiction "
+                           "(sketch_health lists each one's conflicting partners and values).")
+            elif converged is not True:
+                if skipped:
+                    reason = (f"{len(skipped)} constraint(s) were skipped: " + "; ".join(
+                        f"{row.get('id', '?')} ({row.get('reason', 'no reason reported')})"
+                        if isinstance(row, dict) else str(row) for row in skipped[:4]))
+                elif converged is False:
+                    reason = ("the solver reported converged=false without naming a conflict "
+                              "or a skipped constraint — read sketch_health(text=True)")
+                else:
+                    reason = "sketch_health reported no convergence flag"
+                summary = (f"Not converged: dof {dof} is not a definition state — {reason}. "
+                           "Fix that first; fully_defined cannot be claimed.")
             elif intent["pinned_only"]:
                 summary = ("Pinned instead of constrained (pinned_only): remove profile fix "
                            "relations, add design-intent relations/driving dimensions, then "
                            "sketch_fully_define. DOF 0 from blanket pins is not fully defined.")
-            elif fully_defined:
-                summary = "Fully defined (dof 0) — constrained parametrically, not fix-pinned."
-            elif r.get("skipped_constraints"):
+            elif pinned:
+                summary = (f"Not fully defined: authored entities {pinned} are fix-pinned, so "
+                           "dof 0 does not mean they are constrained parametrically — replace "
+                           "each fix with relations (horizontal/vertical, coincident, tangent, "
+                           "equal) and the critical dimensions.")
+            elif skipped:
                 summary = "Constraints were skipped — correct their refs/type before declaring fully defined."
+            elif fully_defined:
+                summary = "Fully defined (dof 0, converged) — constrained by relations and dimensions, nothing fix-pinned."
+            elif dof == 0:
+                summary = f"Not fully defined: solver reports status {status!r} despite dof 0; inspect sketch_health."
             else:
                 summary = (f"Under-defined: {dof} degree(s) of freedom remain — add geometric "
                            f"relations and/or driving dimensions until dof reaches 0.")
@@ -960,15 +1300,21 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                     summary += f" Free: {narration}"
                 if redundant:
                     summary += f" (Also {len(redundant)} redundant: {redundant}.)"
+            closure = r.get("closure") or {}
             out = {"ok": True, "doc_id": d, "sketch": sketch, "status": status,
-                   "dof": dof, "fully_defined": fully_defined,
+                   "dof": dof, "converged": converged, "fully_defined": fully_defined,
                    "conflicting": conflicting, "redundant": redundant, "summary": summary,
                    # narrated enrichment straight from sketch_health (the advisor source).
-                   "open_endpoints": (r.get("closure") or {}).get("open_endpoints"),
-                   "dof_narration": narration, "schedule": r.get("schedule"),
+                   "open_endpoints": closure.get("open_endpoints"),
+                   "closure_usage": closure.get("usage"),
+                   "dof_narration": narration, "hints": r.get("hints"),
                    "advisory": r.get("advisory")}
             out.update(intent)
-            out["skipped_constraints"] = r.get("skipped_constraints") or []
+            out["skipped_constraints"] = skipped
+            if type(revision_before) is int and type(revision_after) is int and revision_before == revision_after:
+                out["revision"] = revision_before
+            else:
+                out["revision_stale"] = True
             return _dumps(_interpreted(out, notes))
         except Exception as e:  # noqa: BLE001
             return _err(_teach_unknown_sketch(_teach_no_bodies(
@@ -1180,23 +1526,34 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def measure_part(doc_id: Optional[str] = None, density_g_cm3: Optional[float] = None,
+                     body_id: Optional[int] = None,
                      **kwargs: Annotated[Any, Field(default=None)]) -> str:
         """Mass properties of the current part: volume (mm^3), mass (g), centre of mass, inertia.
 
         Mass uses the material applied to the model: each body's set_material override, else
         the part material (assembly components use their source parts' materials). Only a body
-        with no material falls back to 7.85 g/cm^3 steel. `mass.material` names the density
-        and its `source` (body_material | document_material | component_material | default |
-        explicit; `per_body` with `mixed:true` when bodies differ). density_g_cm3 overrides
-        every body for this readout. It is also accepted as density= / density_g_cc= /
-        material_density= / rho=, or as a NAME: material="aluminum" resolves its registry
-        density, including density-only and orthotropic records. Also runs a geometry sanity
-        check (closed/valid solid).
+        with no material — or a material key the registry has no density for — falls back to
+        7.85 g/cm^3 steel, and then the top-level `warnings` says so (never silent).
+        `mass.material` names the density and its `source` (body_material | document_material |
+        component_material | default | explicit; `per_body` with `mixed:true` when bodies
+        differ). density_g_cm3 overrides every body for this readout. It is also accepted as
+        density= / density_g_cc= / material_density= / rho=, or as a NAME: material="aluminum"
+        resolves its registry density, including density-only and orthotropic records. The
+        density is g/cm^3 and a value above 25 (osmium, the densest element, is 22.6) is
+        REFUSED as a unit error — steel is 7.85, not 7850. The geometry sanity check covers
+        only the last compiled body and is skipped for a selected physical solid; use
+        check_geometry_health to check every body. Check failures appear in `warnings`.
 
-        Multi-body docs: the top-level volume/mass/com/inertia are the COMBINED total of ALL
-        bodies, and `mass.bodies[]` lists each body's own properties (with `mass.body_count`).
-        Pass body_id via a direct query if you need just one. (Previously this silently reported
-        only the last body of an assembly.)
+        Results are nested under `mass`: use `result["mass"]["volume_mm3"]` and
+        `result["mass"]["mass_g"]`. Volume is also available as top-level `volume_mm3`.
+        Units and frame are stated in `mass.units` / `mass.inertia_frame`: volume mm^3, mass g,
+        com mm, inertia g*mm^2 as the full 3x3 tensor (row-major) about the CENTRE OF MASS with
+        axes parallel to the world axes; principal_moments (g*mm^2, ascending) and
+        principal_axes are its eigen-decomposition.
+        For multi-body docs these are the COMBINED total of ALL bodies (about the combined
+        centre of mass), and `mass.bodies[]` lists each body's own properties (with
+        `mass.body_count`). body_id=N (1-based, an entry of mass.bodies[]) measures just that
+        one physical solid.
 
         Whole-part wall thickness is also accepted only under exact intent spellings — e.g.
         `measure_part(kind="thickness")` or `measure_part(what="wall thickness")` routes to
@@ -1235,6 +1592,12 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                         f"measure_part(density_g_cm3={density!r}): density is a NUMBER in g/cm^3 "
                         "(steel 7.85, aluminium 2.70, ABS 1.04), or pass material= with a name "
                         "from the material table.") from None
+                if not math.isfinite(density) or not 0 < density <= 25:
+                    raise ValueError(
+                        f"measure_part: density {density!r} must be in g/cm^3, between 0 and 25; "
+                        "steel is 7.85 g/cm^3 (7850 kg/m^3). Divide kg/m^3 by 1000.")
+            body_id = _one_alias("measure_part", "body_id", extra, ("body", "body_number"),
+                                 body_id, notes)
             # A "what should I measure" argument is ambiguous, and the two readings need OPPOSITE
             # answers, so the VALUE decides — not the key.
             #  * exact whole-part thickness spellings route to the dedicated wall-thickness probe;
@@ -1279,19 +1642,45 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                         f"first lists the candidates and their sids, and describe_part(doc_id) "
                         f"gives the part's bbox plus the named face/edge roster.")
             _reject_unknown("measure_part", extra,
-                            "it takes doc_id= and density_g_cm3= only.")
+                            "it takes doc_id=, body_id= and density_g_cm3= only.")
+            if body_id is not None and (isinstance(body_id, bool) or not isinstance(body_id, int)
+                                        or body_id < 1):
+                raise ValueError(
+                    f"measure_part(body_id={body_id!r}): body_id is a 1-based physical solid "
+                    "number — the entries of mass.bodies[] from a call without it.")
             d = _doc(doc_id)
             if route_wall_thickness:
+                if body_id is not None or density is not None:
+                    raise ValueError("wall thickness is whole-part; body_id and density do not apply.")
                 return _dumps(_interpreted(_wall_thickness_result(d), notes))
             params = {"doc_id": d}
             if density is not None:
                 params["density_g_cm3"] = density
+            if body_id is not None:
+                params["body"] = body_id
             mass = cb.call("eval_mass", params)
             out = {"ok": True, "doc_id": d, "mass": mass}
-            try:
-                out["check"] = cb.call("eval_check", {"doc_id": d})
-            except CoreError:
-                pass
+            if "volume_mm3" in mass:
+                out["volume_mm3"] = mass["volume_mm3"]
+            warnings = _mass_warnings(mass)
+            # eval_check inspects the last compiled body, not all physical solids; its body
+            # numbering differs from eval_mass's exploded solids. State its scope explicitly.
+            if body_id is None:
+                try:
+                    out["check"] = cb.call("eval_check", {"doc_id": d})
+                    out["check_scope"] = "last compiled body only"
+                    if mass.get("body_count", 1) > 1:
+                        warnings.append("geometry sanity check covers only the last compiled body; "
+                                        "use check_geometry_health to check every body")
+                except CoreError as ce:
+                    out["check"] = {"ran": False, "error": str(ce)}
+                    warnings.append(f"the geometry sanity check did NOT run ({ce}); the "
+                                    f"numbers above are unchecked")
+            else:
+                warnings.append("geometry sanity check not run for an individual physical solid; "
+                                "use check_geometry_health")
+            if warnings:
+                out["warnings"] = warnings
             return _dumps(_interpreted(out, notes))
         except Exception as e:  # noqa: BLE001
             return _err(_teach_no_bodies(e, d, "measure_part()"))
@@ -1312,18 +1701,26 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         {"of":"edge","parallel":"z","pick":"largest"}).
 
         One query (b_query omitted) -> that single feature's intrinsic measure:
-          * a face   -> its area (mm^2)
-          * an edge  -> its length (mm), or radius (mm) for a circular edge
+          * a face   -> its area (mm^2) and perimeter; a CYLINDRICAL or SPHERICAL face also
+            reports radius and diameter (mm), plus axis/axis_point (cylinder) or center (sphere)
+          * an edge  -> its length (mm), or radius and diameter (mm) for a circular edge
           * a vertex -> its point coordinates
         Two queries -> the minimum DISTANCE (mm) between them (with the two closest points) and,
         when applicable (face↔face normals or edge↔edge tangents), the ANGLE (degrees, 0..90).
+        When BOTH are cylindrical faces or circular edges (two holes, two pins) it also returns
+        axis_distance — the distance between the two AXES, i.e. the hole pitch / centre spacing —
+        with axes_parallel and axis_angle. `distance` stays the surface-to-surface gap, which
+        differs from the pitch by the radii.
 
-        Each query must resolve to exactly ONE face/edge. If it matches several (e.g. "all the
-        vertical edges"), narrow it with a predicate ("pick":"largest"/"side":"top"/…) — call
-        query_geometry(query) first to see the candidates. Returns a readable `summary` line.
-        Engine readback SIDs are accepted verbatim, but geometry edits can retire them.
-        A dangling-selector error names live alternatives; when a selector also supplies
-        its old centroid, alternatives are ranked by that location. Never treat those
+        Each query must resolve to EXACTLY ONE face/edge. Several matches are an error that
+        lists their sids, even when the query carries pick/count/index: a tied pick (the four
+        equal vertical edges, pick:"longest") is NOT broken by taking the first. Narrow it with
+        near:[x,y,z] (nearest wins), a pick with no ties, or pass one sid — query_geometry(query)
+        shows the candidates. Returns a readable `summary` line.
+        A sid is a REVISION-scoped fingerprint (24-bit hash of kind, shape, centroid, radius):
+        geometry edits retire it, and a sid shared by several elements is refused as
+        ambiguous. A dangling-selector error names live alternatives; when a selector also
+        supplies its old centroid, alternatives are ranked by that location. Never treat those
         suggestions as automatic replacements: query the current geometry before retrying.
 
         ACCEPTED SPELLINGS (echoed in `interpreted`): a= / from= / first= / target= for
@@ -1379,11 +1776,21 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                     parts.append(f"distance {res['distance']:.4g} mm")
                 if "angle" in res:
                     parts.append(f"angle {res['angle']:.4g} deg")
+                if "axis_distance" in res:
+                    kind_note = ("parallel axes" if res.get("axes_parallel")
+                                 else f"skew axes, {res.get('axis_angle', 0.0):.3g} deg apart")
+                    parts.append(f"axis-to-axis distance {res['axis_distance']:.4g} mm "
+                                 f"({kind_note}; for parallel holes this is the pitch, while "
+                                 f"`distance` is the wall-to-wall gap)")
                 out["summary"] = ("between the two selections: " + ", ".join(parts)) if parts \
                     else "no distance/angle computed"
             else:
                 if kind == "area":
                     out["summary"] = f"area = {res.get('area'):.6g} mm^2"
+                    if res.get("radius") is not None:
+                        out["summary"] += (f"; {res.get('surface', 'round')} face radius "
+                                           f"{res['radius']:.6g} mm (diameter "
+                                           f"{res['diameter']:.6g} mm)")
                 elif kind == "length":
                     out["summary"] = f"length = {res.get('length'):.6g} mm"
                 elif kind == "radius":
@@ -1565,21 +1972,30 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         bounds cannot decide them. Bounds are distance_lower_bound_mm, NOT measured gaps;
         threshold mode cannot claim a tightest gap. For overlap WITHIN a single part's own
         features use check_feature_overlap instead — this tool sees whole bodies/components.
-        members: optional exact member names, e.g. ["b434", "b435"] for a multi-body part;
-        assembly names match parts[].name. Checks only pairs WITHIN this selection. Unknown
-        names are refused. Omit or pass [] to check all members. A scoped result does not
+        members: optional exact member names or assembly component IDs; components is an alias.
+        Checks only pairs WITHIN this selection. Unknown names are refused.
+        Omit or pass [] to check all members. A scoped result does not
         verify placement of the rest of the document; scope and pair counts are explicit.
 
         include_coincident: also classify near-zero-clearance face-touching pairs (distance
         <= 1e-6 mm) as `contacts` entries instead of clearances — the "coincident faces" case
         SolidWorks flags separately (two parts touching exactly, not overlapping or gapped).
-        min_clearance_mm: tag any clearance pair tighter than this with a "below min clearance"
-        warning (e.g. flag a press-fit gap that's actually too tight to assemble by hand). Also
-        accepted as min_clearance= / clearance= / clearance_mm= / min_gap_mm=, and
+        min_clearance_mm: compare clearances against this minimum. Measured pairs report
+        clearance_status="below"|"within_tolerance"|"above" and clearance_tolerance_mm.
+        A gap within the band is not a definite pass or violation. Also accepted as
+        min_clearance= / clearance= / clearance_mm= / min_gap_mm=, and
         include_coincident= as coincident= / include_contacts= (echoed in `interpreted`).
 
         Returns {ok, clear, complete, clearance_mode, summary, pairs_checked, pairs_total,
         parts:[{name,bbox,volume}], interferences:[{a,b,volume}], clearances, contacts}.
+        Pairs resolved with a fuzzy Boolean fallback have method="fallback_fuzzy_common",
+        "fallback_fuzzy_cut", or "fallback_fuzzy_common_and_cut", approximate=true and
+        fuzzy_tolerance_mm; their overlap classification and volume are approximate.
+        fallback_extrema_disjoint=true marks constituent separation established by
+        positive solid distance when Booleans failed; method="fallback_extrema_disjoint"
+        is used when no fuzzy Boolean was needed. Both fallbacks can occur in one pair.
+        Additional fallback attempts share a 10 s cooperative OCCT budget per pair;
+        exhaustion leaves that pair incomplete rather than reporting a clear result.
         A threshold clearance has distance_status="lower_bound" and distance_lower_bound_mm,
         or distance_status="exact" and distance; contacts carry exact distance.
         ok tells you if the check ran to completion. It does NOT tell you if the bodies clash.
@@ -1596,6 +2012,8 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         try:
             extra = _extra_kwargs(dict(kwargs))
             notes: list = []
+            members = _one_alias("check_interference", "members", extra,
+                                 ("components",), members, notes)
             coincident = _one_alias(
                 "check_interference", "include_coincident", extra,
                 ("coincident", "include_contacts", "contacts"), include_coincident, notes)
@@ -1617,6 +2035,11 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                             "it takes doc_id=, include_coincident=, min_clearance_mm=, members= "
                             "and clearance_mode='exact'|'threshold'.")
             d = _doc(doc_id)
+            if members:
+                bodies = cb.call("asm_world_bodies", {"doc_id": d, "explode": False}).get("bodies", [])
+                by_id = {b.get("component"): b.get("name") for b in bodies
+                         if b.get("component") and b.get("name")}
+                members = [by_id.get(member, member) for member in members]
             params = {"doc_id": d, "include_coincident": include_coincident,
                       "min_clearance_mm": min_clearance_mm, "clearance_mode": clearance_mode}
             if members is not None:
@@ -1638,6 +2061,23 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
             return _dumps(_interpreted(out, notes))
         except Exception as e:  # noqa: BLE001
             return _err(_teach_no_bodies(e, d, "check_interference()"))
+
+    @mcp.tool()
+    def check_model_history(doc_id: Optional[str] = None) -> str:
+        """Inspect a part's editable feature history without changing or rebuilding it.
+
+        Returns native history findings, suggested edits, conservative safe-fix candidates,
+        the analyzed revision and limitations. A complete report covers the native history
+        rules only; it does not certify geometry, engineering safety or manufacturability.
+        Use simplify_part() to preview the exact eligible operations and opt in to applying
+        them. Non-automatic suggestions require human judgment.
+        """
+        try:
+            d = _doc(doc_id)
+            return _dumps(cb.call("eval_model_history", {"doc_id": d}))
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
 
     @mcp.tool()
     def inspect_model_integrity(
@@ -1724,15 +2164,13 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def check_feature_overlap(doc_id: Optional[str] = None, features: Optional[list] = None,
                               **kwargs: Annotated[Any, Field(default=None)]) -> str:
-        """Intra-PART feature-vs-feature overlap — do two of THIS part's own features collide?
+        """Inspect intersections between this part's pre-boolean feature tools.
 
-        Tests each feature's own pre-boolean tool solid (the shape it added/removed BEFORE it
-        got fused/cut into the body) against every other feature's tool, so it catches things a
-        single compiled solid can't show you: two bosses that silently merged (add+add), a
-        redundant cut carved twice over the same region (cut+cut), or — the dangerous one — a
-        later cut that erased an EARLIER boss entirely (add+cut where the common volume ≈ the
-        boss's whole volume). Use this for one part's feature tree; use check_interference for
-        separate BODIES or assembly components.
+        Compares the raw tool solids before they are fused or cut into the body. Their
+        intersection is NOT a measurement of material added or removed: for example, a
+        through-all cutting tool can extend far beyond the part. Inspect the model and
+        feature history before interpreting an intersection. Use check_interference for
+        separate bodies or assembly components.
 
         features (optional): restrict the scan to pairs involving these feature ids (e.g. the
         ids you just added) instead of the whole tree — add_features already runs this
@@ -1742,17 +2180,16 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         accepted and wrapped into a list, as are feature= / feature_ids= / ids= (echoed in
         `interpreted`).
 
-        Returns {ok, summary, pairs:[{a, b, a_name, b_name, kind, volume_mm3}], dead_features}.
-          kind "boss_overlap"   — two ADDITIVE features share volume (often intentional — a
-                                  boss deliberately overlapping a rib — but flagged as a warning).
-          kind "cut_overlap"    — two cuts remove overlapping material (a redundant cut, usually
-                                  a modeling mistake worth cleaning up).
-          kind "cut_into_boss"  — a cut removes PART of an earlier additive feature.
-          kind "boss_swallowed" — a cut removes essentially the WHOLE earlier boss (>=99% of its
-                                  volume) — almost certainly an error; this is the ONLY kind that
-                                  sets ok:false.
-        dead_features: feature ids that built successfully but own NO surviving faces (fully
-        consumed by a later op) — a feature silently doing nothing right now.
+        Returns {ok, summary, basis, note, pairs:[{a, b, a_name, b_name, kind,
+        tool_kind, volume_mm3, volume_basis}], dead_features}. The basis is
+        "pre_boolean_tool_intersection"; tool_kind is "add_tool_overlap",
+        "cut_tool_overlap", or "add_cut_tool_overlap". Legacy kind values are
+        "boss_overlap", "cut_overlap", "cut_into_boss", and "boss_swallowed".
+        They describe tool-space intersections, not proof that a boss was swallowed
+        or material was removed twice. Legacy ok=false for "boss_swallowed" flags
+        a tool-space finding, not a confirmed loss of material.
+        dead_features identifies feature ids with no surviving owned faces; investigate
+        their history rather than assuming why those faces disappeared.
         """
         d = None
         try:
@@ -1780,19 +2217,32 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
-    def check_symmetry(plane: Optional[str] = None, doc_id: Optional[str] = None,
+    def check_symmetry(plane: Optional[Union[str, dict]] = None, doc_id: Optional[str] = None,
+                       offset: Optional[float] = None, origin: Optional[list] = None,
+                       normal: Optional[list] = None, body: Optional[int] = None,
                        **kwargs: Annotated[Any, Field(default=None)]) -> str:
-        """Is the part mirror-symmetric about a principal datum plane? Returns the deviation.
+        """Is the part mirror-symmetric about a plane? Returns the deviation.
 
         plane : "top" (XY, mirror across Z), "front" (XZ, mirror across Y), or "right" (YZ,
-                mirror across X) — the reserved Chudware datum planes (Z-up). The plane may be
-                spelled as its axis pair ("XY"/"xz"/"YZ"), as a normal axis ("z"/"+x"), or as
-                about= / datum= / mirror_plane= / about_plane=; every rewrite is echoed in
-                `interpreted`, and an unreadable name lists the three legal planes.
-        Mirrors the active body across the plane and measures the symmetric-difference volume.
-        Returns {symmetric: bool, deviation_mm3}: symmetric is True when the leftover volume is
-        within a tiny tolerance (1e-3 of the part volume). Handy to confirm a feature you meant
-        to place symmetrically really is, or to pick a sensible mirror plane.
+                mirror across X) — the reserved Chudware datum planes (Z-up) through the world
+                origin. Spellable as its axis pair ("XY"/"xz"/"YZ"), a normal axis ("z"/"+x"),
+                or as about= / datum= / mirror_plane= / about_plane=.
+        offset: shift a named plane by this many mm along its normal — a part symmetric about
+                x = 30 is not symmetric about the origin plane.
+        origin/normal: ANY plane, as origin=[x,y,z] with normal=[nx,ny,nz] (both required), or
+                plane={"origin":[…],"normal":[…]}. A part's own mid-plane is origin = bbox
+                centre (describe_part gives the bbox).
+        body  : 1-based body number (also body_id=); omit for the LAST body. Pass it to check
+                an earlier body of a multi-body part.
+        Every rewrite is echoed in `interpreted`; an unreadable plane name lists the three
+        legal planes.
+
+        Mirrors the chosen body across the plane and measures the symmetric-difference volume.
+        Returns {symmetric: bool, deviation_mm3, volume_mm3, tolerance_mm3, body_id, plane:
+        {origin, normal}}: symmetric is True when the leftover volume is within 1e-3 of the body
+        volume. If the mirror or its Boolean cannot complete, or the body has no volume, the
+        call is an ERROR (code symmetry_failed) — never an "asymmetric" verdict. Handy to
+        confirm a feature you meant to place symmetrically really is, or to pick a mirror plane.
         """
         d = None
         try:
@@ -1801,18 +2251,43 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
             plane = _one_alias("check_symmetry", "plane", extra,
                                ("about", "about_plane", "datum", "datum_plane", "mirror_plane",
                                 "plane_name", "axis"), plane, notes)
-            _reject_unknown("check_symmetry", extra, "it takes plane= and doc_id=.")
-            plane = _read_plane("check_symmetry", plane, notes)
+            offset = _one_alias("check_symmetry", "offset", extra,
+                                ("offset_mm", "distance", "distance_mm"), offset, notes)
+            origin = _one_alias("check_symmetry", "origin", extra,
+                                ("point", "location"), origin, notes)
+            normal = _one_alias("check_symmetry", "normal", extra,
+                                ("normal_dir", "direction"), normal, notes)
+            body = _one_alias("check_symmetry", "body", extra, ("body_id",), body, notes)
+            _reject_unknown("check_symmetry", extra,
+                            "it takes plane=, offset=, origin=, normal=, body= and doc_id=.")
+            if body is not None and (isinstance(body, bool) or not isinstance(body, int)
+                                     or body < 1):
+                raise ValueError(f"check_symmetry(body={body!r}): body is a 1-based body number.")
+            plane_ref = _cut_plane_ref("check_symmetry", plane, offset, origin, normal, None,
+                                       notes)
             d = _doc(doc_id)
-            res = cb.call("eval_symmetry", {"doc_id": d, "plane": plane})
-            sym = res.get("symmetric")
-            dev = res.get("deviation_mm3")
-            summary = (f"symmetric about plane '{plane}' (deviation {dev:.4g} mm^3)" if sym
-                       else f"NOT symmetric about plane '{plane}' (deviation {dev:.4g} mm^3)")
-            return _dumps(_interpreted(
-                {"ok": True, "doc_id": d, "plane": plane, "summary": summary, **res}, notes))
+            params = {"doc_id": d, "plane": plane_ref}
+            if body is not None:
+                params["body"] = body
+            res = cb.call("eval_symmetry", params)
+            if (not isinstance(res, dict) or res.get("error") or
+                    not isinstance(res.get("symmetric"), bool) or
+                    not isinstance(res.get("deviation_mm3"), (int, float)) or
+                    not math.isfinite(res["deviation_mm3"]) or res["deviation_mm3"] < 0):
+                raise ValueError(f"symmetry evaluation failed or returned no valid verdict: {res!r}")
+            dev = float(res["deviation_mm3"])
+            vol = float(res.get("volume_mm3") or 0.0)
+            where = plane_ref if isinstance(plane_ref, str) else "the given plane"
+            pct = f", {100.0 * dev / vol:.3g}% of the body volume" if vol > 0 else ""
+            summary = (f"body {res.get('body_id')} is symmetric about '{where}' "
+                       f"(deviation {dev:.4g} mm^3{pct})" if res.get("symmetric")
+                       else f"body {res.get('body_id')} is NOT symmetric about '{where}' "
+                            f"(deviation {dev:.4g} mm^3{pct}; tolerance "
+                            f"{res.get('tolerance_mm3', 0.0):.4g} mm^3)")
+            return _dumps(_interpreted({"ok": True, "doc_id": d, "summary": summary, **res},
+                                       notes))
         except Exception as e:  # noqa: BLE001
-            return _err(_teach_no_bodies(e, d, f'check_symmetry(plane="{plane or "top"}")'))
+            return _err(_teach_no_bodies(e, d, 'check_symmetry(plane="top")'))
 
 
 
@@ -1823,6 +2298,7 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                         origin: Optional[list] = None,
                         normal: Optional[list] = None,
                         xdir: Optional[list] = None,
+                        target_center: Optional[list] = None,
                         **kwargs: Annotated[Any, Field(default=None)]) -> str:
         """Cut the part with a plane and report the CROSS-SECTION area + section moments.
 
@@ -1838,6 +2314,8 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                 world-origin datum. offset_mm=, distance= and a numeric at= are accepted.
         origin/normal/xdir: flattened spelling of the custom-plane object. origin and normal
                 must be supplied together; xdir is optional.
+        target_center: REFUSED — it used to be accepted and ignored. Use origin=/normal= (cut
+                through a point) or offset= (shift a named plane) to place the cut.
 
         Returns {ok, area_mm2, centroid:[x,y,z], Ixx, Iyy, Ixy, summary}:
           * area_mm2 — the cross-section area (mm^2), the headline number. For a solid this is
@@ -1857,6 +2335,13 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
         try:
             extra = _extra_kwargs(dict(kwargs))
             notes: list = []
+            if target_center is not None:
+                raise ValueError(
+                    "inspect_section(): target_center does nothing here — this tool sections "
+                    "the WHOLE plane, so it cannot be 'aimed' at a point. To cut THROUGH a "
+                    "point pass origin=[x,y,z] with normal=[nx,ny,nz] (or a named plane with "
+                    "offset= in mm along its normal); for a picture of the cut use "
+                    "render_part(section=...).")
 
             at = extra.pop("at", None)
             if at is not None:
@@ -1888,64 +2373,8 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
                 "inspect_section", extra,
                 "it takes plane=, offset=, origin=, normal=, xdir= and doc_id=.")
 
-            if isinstance(plane, dict):
-                plane_ref: Union[str, dict] = dict(plane)
-                if origin is not None or normal is not None or xdir is not None:
-                    raise ValueError(
-                        "inspect_section(): pass the custom plane either as plane={origin,normal"
-                        "[,xdir]} OR as flattened origin=/normal=/xdir= arguments, not both.")
-            elif origin is not None or normal is not None or xdir is not None:
-                if origin is None or normal is None:
-                    raise ValueError(
-                        "inspect_section(): a custom cut needs both origin=[x,y,z] and "
-                        "normal=[nx,ny,nz]; xdir=[x,y,z] is optional.")
-                plane_ref = {"origin": origin, "normal": normal}
-                if xdir is not None:
-                    plane_ref["xdir"] = xdir
-                if plane is not None:
-                    notes.append(
-                        f"plane={plane!r} ignored because explicit origin=/normal= define the cut")
-            else:
-                named = _read_plane("inspect_section", plane, notes)
-                plane_ref = named
-                if offset is not None:
-                    if isinstance(offset, bool) or not isinstance(offset, (int, float)):
-                        raise ValueError(
-                            f"inspect_section(offset={offset!r}): offset must be a number in mm.")
-                    distance = float(offset)
-                    if distance != 0.0:
-                        normals = {
-                            "top": [0.0, 0.0, 1.0],
-                            "front": [0.0, -1.0, 0.0],
-                            "right": [1.0, 0.0, 0.0],
-                        }
-                        n = normals[named]
-                        plane_ref = {
-                            "origin": [distance * n[0], distance * n[1], distance * n[2]],
-                            "normal": n,
-                        }
-                        notes.append(
-                            f"offset={distance:g} mm shifted the {named!r} datum along its normal")
-
-                        offset = None  # already applied; do not re-shift in the custom-plane path
-            if isinstance(plane_ref, dict) and offset not in (None, 0, 0.0):
-                if "origin" not in plane_ref or "normal" not in plane_ref:
-                    raise ValueError(
-                        "inspect_section(): offset on a custom plane requires origin and normal.")
-                o = plane_ref.get("origin")
-                n = plane_ref.get("normal")
-                if not (isinstance(o, (list, tuple)) and len(o) == 3
-                        and isinstance(n, (list, tuple)) and len(n) == 3):
-                    raise ValueError(
-                        "inspect_section(): custom plane origin/normal must be numeric [x,y,z].")
-                mag = sum(float(v) * float(v) for v in n) ** 0.5
-                if mag <= 1e-12:
-                    raise ValueError("inspect_section(): custom plane normal is near-zero.")
-                distance = float(offset)
-                plane_ref["origin"] = [
-                    float(o[i]) + distance * float(n[i]) / mag for i in range(3)
-                ]
-                notes.append(f"offset={distance:g} mm shifted the custom plane along its normal")
+            plane_ref = _cut_plane_ref("inspect_section", plane, offset, origin, normal, xdir,
+                                       notes)
 
             d = _doc(doc_id)
             res = cb.call("eval_section_props", {"doc_id": d, "plane": plane_ref})
@@ -1967,43 +2396,33 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
-    def wall_thickness(doc_id: Optional[str] = None) -> str:
-        """Sample local wall spans by inward normal rays; NOT a structural-wall safety verdict.
+    def wall_thickness(doc_id: Optional[str] = None, min_wall_mm: Optional[float] = None,
+                       resolution: Optional[float] = None, image: bool = True) -> Any:
+        """Study wall thickness on EVERY solid, with an actionable red-to-blue heat map.
 
-        The minimum includes real local taper at acute convex edges, where a normal-ray span
-        tends to zero even when the adjacent wall is thick. A micron value is not automatically
-        a self-hit, and a moderate dihedral angle does not prove the part safe. Inspect sections
-        at AND near its location and the relevant load path before accepting or redesigning it.
-        No edge samples or low percentiles are removed.
+        min_wall_mm: comparison minimum T; defaults to the bound set_process profile, else
+        the FDM process profile. resolution: optional surface spacing in mm (reported in
+        measurement_basis; the engine may coarsen it to its sample budget).
 
-        Rays start at each face-local tessellation vertex, shifted tangentially 0.001 mm into
-        its face and normally 0.001 mm into the material. Only outward EXIT hits more than 5°
-        from the exit plane count; the reported span adds back the inward offset. Accepted
-        spans must exceed 0.002 mm. These are mesh-based samples, not an exact B-rep minimum,
-        a precision guarantee, or coverage of unsampled/sub-cutoff thin regions.
+        By default returns [Image, caption]: complementary whole-part views and ghosted
+        cross-sections through up to three worst thin regions. Red <= T, blue >= 3T,
+        grey = unmeasured. Region numbers match the caption; faces and built_by identify
+        exactly where to edit. Fix or explicitly justify every red region before print export.
 
-        Returns {ok, min_thickness_mm, mean_thickness_mm, max_thickness_mm, n_sampled,
-        aicm_path, summary, thinnest, minimum_sample, measurement_basis, measurement_caveat}:
-          * min/mean/max — sampled local normal-ray spans; null if no accepted span.
-          * minimum_sample — unrounded tessellation `at`, vertex_index, body, actual ray_origin,
-            inward_direction, exit_at, and tangent_nudge vector. The span is the distance
-            from ray_origin to exit_at PLUS measurement_basis.surface_offset_mm.
-          * measurement_basis — method, sampling locations, vertex/unmeasured counts, offsets,
-            exit-angle filter, and minimum_accepted_span_exclusive_mm. Missing rays and
-            sub-cutoff spans are unresolved, not proof of adequate thickness.
-          * thinnest — up to 3 face minima, each {thickness_mm, at:[x,y,z], body, vertex_index,
-            sample_location, face:<sid>, surf, built_by:{id,name}}. `at` is the mesh vertex,
-            not the nudged ray origin. sample_location is face_mesh_boundary (which can also
-            be a face seam) or face_mesh_interior; neither label alone classifies structural
-            safety. built_by names the feature that last rebuilt the face. Locate it with
-            inspect_section/query_geometry instead of suppressing features to find it.
-          * aicm_path — field file for the in-app thickness colour-map viewer.
-        Process minimum comparisons are screening findings, not manufacturing approval.
+        image=False returns JSON: min/mean/max_thickness_mm, min_wall_mm, thin_area_mm2,
+        thin_regions ({index, body, min_thickness_mm, kind, faces, built_by, at, opposite_at,
+        bbox}), thinnest face minima, minimum_sample, measurement_basis and field aicm_path.
+        The JSON lists the 20 THINNEST regions only (each with at most 12 face names);
+        `thin_regions_truncated` gives the true total when it cut some, and n_thin_regions
+        always counts them all. Inscribed-sphere measurements use a refined surface mesh;
+        null means unmeasured (no opposing wall found), not proof of adequate thickness. Run
+        dfm_check too.
         """
         d = None
         try:
             d = _doc(doc_id)
-            return _dumps(_wall_thickness_result(d))
+            result = _wall_thickness_result(d, min_wall_mm, resolution)
+            return _wall_thickness_image(d, result) if image else _dumps(_cap_wall_result(result))
         except Exception as e:  # noqa: BLE001
             return _err(_teach_no_bodies(e, d, "wall_thickness()"))
 
@@ -2013,11 +2432,14 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
     def draft_analysis(pull_dir: Optional[list] = None, min_draft_deg: float = 3.0,
                        doc_id: Optional[str] = None,
                        **kwargs: Annotated[Any, Field(default=None)]) -> str:
-        """Moldability check: which faces lack enough DRAFT to release from the mold?
+        """Draft-angle check along ONE pull direction: which faces have less than min_draft_deg of draft?
 
         For a given mold-pull (ejection) direction it measures each face's draft angle — how far
-        its surface tilts away from the pull axis. Faces whose worst-case draft is below
+        its surface tilts away from the pull axis — from the tessellated surface normals, as an
+        ABSOLUTE value, on the LAST body only. Faces whose worst-case |draft| is below
         min_draft_deg would drag on the tool during ejection and need a draft feature added.
+        It does NOT detect undercuts, choose a parting line or find side actions, so a clean
+        result means "draft >= min_draft_deg everywhere", never "moldable".
 
         pull_dir : the mold-opening / ejection direction as [x,y,z] (defaults to +Z, [0,0,1]).
                    A signed axis or side word is accepted too — "+z"/"-z"/"x"/"bottom"/"front" —
@@ -2033,9 +2455,10 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
 
         Returns {ok, min_draft_deg, max_draft_deg, threshold_deg, n_faces_below_threshold,
         faces_below_threshold:[{face_id, min_draft_deg, area_mm2, centroid}], aicm_path,
-        summary}. n_faces_below_threshold == 0 means every face clears the threshold (good to
-        mold along that direction). The faces_below_threshold list (centroid + area) tells you
-        WHERE to add draft. aicm_path is the colour-map field for the in-app viewer.
+        summary}. n_faces_below_threshold == 0 means every face has at least min_draft_deg of
+        draft along that pull (it is NOT a moldability verdict — see above). The
+        faces_below_threshold list (centroid + area) tells you WHERE to add draft. aicm_path is
+        the colour-map field for the in-app viewer.
         """
         d = None
         try:
@@ -2066,8 +2489,10 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
             n_bad = res.get("n_faces_below_threshold", 0)
             thr = res.get("threshold_deg", min_draft_deg)
             if n_bad == 0:
-                summary = (f"all faces have >= {thr:g}deg draft along pull {list(pull)} — "
-                           f"moldable in that direction")
+                summary = (f"every face has >= {thr:g}deg draft along pull {list(pull)} "
+                           f"(|draft| per mesh vertex, last body only). That is ALL this "
+                           f"checks: undercuts, parting line and side actions are not "
+                           f"analysed, so it is not a moldability verdict")
             else:
                 summary = (f"{n_bad} face(s) below the {thr:g}deg draft minimum along pull "
                            f"{list(pull)} — add draft there before molding: add_features with a "
@@ -2308,38 +2733,9 @@ def register_cad_eval_tools(mcp: FastMCP) -> None:
           arrived broken from an IMPORT — no feature of yours authored it — call heal_body,
           which records the repair as a feature (ShapeFix, then the opt-in sewing /
           orientation / rebuild_solid rungs) and refuses one that would cost material.
-
-        Aliases (same tool): is_watertight, assess_mesh_quality, analyze_stl_geometry,
-        health_check, design_audit.
         """
         return _health_report(doc_id, body, body_id, repair, fill_holes, fix_normals,
                               fix_winding, "check_geometry_health")
-
-    # The spellings models already write for this question, resolved to the ONE
-    # implementation above rather than reimplemented. `is_watertight` is the trimesh verb;
-    # the rest are the namings observed across the CAD/mesh MCP ecosystem.
-    for _alias_name in ("is_watertight", "assess_mesh_quality", "analyze_stl_geometry",
-                        "health_check", "design_audit"):
-
-        def _make_alias(alias: str):
-            def _health_alias(doc_id: Optional[str] = None,
-                              body: Optional[int] = None,
-                              body_id: Optional[int] = None,
-                              repair: bool = False,
-                              fill_holes: bool = False,
-                              fix_normals: bool = False,
-                              fix_winding: bool = False) -> str:
-                return _health_report(doc_id, body, body_id, repair, fill_holes,
-                                      fix_normals, fix_winding, alias)
-            _health_alias.__name__ = alias
-            return _health_alias
-
-        mcp.tool(name=_alias_name, description=(
-            f"Alias of check_geometry_health — solid health: watertight / closed-manifold "
-            f"verdict per body with the free-edge, non-manifold-edge, shell/face counts and "
-            f"offending sids that justify it, plus volume sign. Identical arguments and "
-            f"identical answer; call check_geometry_health directly if you prefer. Repair "
-            f"arguments are refused, not performed."))(_make_alias(_alias_name))
 
     # ------------------------------------------------------------------ solid repair
     # check_geometry_health REFUSES repair, and that refusal is right for a defect the

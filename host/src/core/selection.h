@@ -20,6 +20,7 @@ struct SelItem {
     std::string selector;         // JSON selector ref (empty until resolved by C16)
     std::string resolution_error; // terminal pick failure; empty on successful resolution
     uint64_t resolve_request = 0; // nonzero while this exact pick has an async request queued
+    int deferred_revision = -1;   // document revision of a pick waiting for an idle engine queue
 };
 
 class Selection {
@@ -76,6 +77,27 @@ public:
         for (const auto& it : items_)
             if (it.hit == hit) return true;
         return false;
+    }
+
+    // Re-run the observer for picks it deferred: still pending, with no request in flight.
+    void retryDeferred() {
+        for (const auto& it : items_)
+            if (it.pending_resolve && it.resolve_request == 0 && it.hit.valid()) {
+                notify();
+                return;
+            }
+    }
+
+    // Drop these picks with one notification (a PropertyManager well consumed them).
+    void erase(const std::vector<render::PickHit>& hits) {
+        const auto before = items_.size();
+        for (const auto& hit : hits)
+            for (size_t i = 0; i < items_.size(); ++i)
+                if (items_[i].hit == hit) {
+                    items_.erase(items_.begin() + i);
+                    break;
+                }
+        if (items_.size() != before) notify();
     }
 
     // Subscribe to selection changes. Single observer slot is enough for the panels we have;

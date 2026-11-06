@@ -115,8 +115,8 @@ std::string baseName(const std::string& path) {
     return cut == std::string::npos ? path : path.substr(cut + 1);
 }
 
-void prefill(AskQuestion& q) {
-    const nlohmann::json& s = q.suggested;
+// Set the edit state from a RAW value: the question's `suggested` default, or a saved draft.
+void prefill(AskQuestion& q, const nlohmann::json& s) {
     if (q.kind == "choice") {
         q.checked.assign(q.options.size(), 0);
         if (q.multi) {
@@ -163,6 +163,8 @@ void prefill(AskQuestion& q) {
             have = true;
         }
         if (have) askBufSet(q.textBuf, fmtNumber(v));
+        // A draft keeps typed text that is not a number yet ("12." mid-edit).
+        else if (s.is_object() && s.contains("text")) askBufSet(q.textBuf, jsonStr(s, "text"));
     } else if (q.kind == "approval") {
         if (s.is_boolean()) {
             q.approval = s.get<bool>() ? 1 : 0;
@@ -197,6 +199,18 @@ void prefill(AskQuestion& q) {
         askBufSet(q.textBuf, s.is_string() ? s.get<std::string>()
                                            : (s.is_null() ? std::string() : s.dump()));
     }
+}
+
+// Back to an unanswered form, before a draft replaces the suggested prefill.
+void clearEdits(AskQuestion& q) {
+    q.choice = -1;
+    q.checked.assign(q.options.size(), 0);
+    q.otherOn = false;
+    askBufSet(q.otherBuf, std::string());
+    askBufSet(q.textBuf, std::string());
+    q.unit.clear();
+    q.approval = -1;
+    q.picks.clear();
 }
 
 }  // namespace
@@ -262,7 +276,7 @@ AskQuestion askQuestionFromJson(const nlohmann::json& j) {
     q.docId = jsonStr(j, "doc_id");
     // A choice with no usable options can only be answered in words.
     if (q.kind == "choice" && q.options.empty()) q.kind = "text";
-    prefill(q);
+    prefill(q, q.suggested);
     return q;
 }
 
@@ -453,6 +467,30 @@ void applyAskAnswerEvent(AskBatch& b, const nlohmann::json& data) {
     if (!reply.empty()) b.reply = reply;
 }
 
+nlohmann::json askDraft(const AskBatch& b) {
+    nlohmann::json out = nlohmann::json::object();
+    for (const auto& q : b.questions) {
+        if (q.id.empty()) continue;
+        nlohmann::json v = askAnswerValue(q);
+        if (v.is_null() && q.kind == "dimension") {
+            const std::string typed = askBufStr(q.textBuf);
+            if (!trim(typed).empty()) v = {{"text", typed}, {"unit", q.unit}};
+        }
+        out[q.id] = std::move(v);
+    }
+    return out;
+}
+
+std::string askAnswersMessage(const AskBatch& b) {
+    std::string out = "Here are my answers to your questions:";
+    for (const auto& q : b.questions) {
+        out += "\n- " + (q.prompt.empty() ? q.id : q.prompt) + ": ";
+        const auto it = b.answers.find(q.id);
+        out += it != b.answers.end() ? askAnswerText(q, *it) : "(use your suggested default)";
+    }
+    return out;
+}
+
 nlohmann::json askBatchToJson(const AskBatch& b) {
     nlohmann::json qs = nlohmann::json::array();
     for (const auto& q : b.questions) qs.push_back(q.src);
@@ -469,6 +507,7 @@ nlohmann::json askBatchToJson(const AskBatch& b) {
     if (!b.error.empty()) j["error"] = b.error;
     if (b.answers.is_object() && !b.answers.empty()) j["answers"] = b.answers;
     if (!b.reply.empty()) j["reply"] = b.reply;
+    if (askStatusOpen(b.status)) j["draft"] = askDraft(b);
     return j;
 }
 
@@ -479,10 +518,17 @@ AskBatch askBatchFromJson(const nlohmann::json& j) {
     b.error = jsonStr(j, "error");
     if (auto it = j.find("answers"); it != j.end() && it->is_object()) b.answers = *it;
     b.reply = jsonStr(j, "reply");
-    if (askStatusOpen(b.status)) {
-        b.status = AskStatus::Expired;
-        if (b.error.empty()) b.error = "The run that asked has ended.";
-    }
+    if (!askStatusOpen(b.status)) return b;
+    // Still open when saved: the app closed or crashed mid-question. It asks again, holding
+    // what the user had entered. A submit whose outcome never arrived is open again too.
+    b.status = AskStatus::Pending;
+    b.error.clear();
+    if (auto d = j.find("draft"); d != j.end() && d->is_object())
+        for (auto& q : b.questions)
+            if (auto v = d->find(q.id); !q.id.empty() && v != d->end()) {
+                clearEdits(q);
+                prefill(q, *v);
+            }
     return b;
 }
 

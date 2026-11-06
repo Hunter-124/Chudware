@@ -9,6 +9,7 @@
 // function not in _FUNCS, keyword arguments, or any other construct. '^' -> '**'.
 #include "doc/validate.h"
 #include "doc/picks.h"  // shared geometry-query vocabulary, errors, and grammar
+#include "doc/scad.h"
 #include <algorithm>
 
 #include <cctype>
@@ -117,6 +118,9 @@ const std::map<string, ConstraintSpec> CONSTRAINT_SPECS = {
     {"symmetric", {3, 3, false}},
     {"fix", {1, 1, false}},
     {"point_on", {2, 2, false}},
+    {"rotate_point", {3, 3, true}},
+    {"signed_distance", {2, 2, true}},
+    {"equal_offset", {4, 4, false}},
     // distance: 2 refs = point-point/point-line; 1 bare line/slot ref = line length
     // (modeler Smart-Dimension shorthand). "length" is the explicit 1-ref form.
     {"distance", {1, 2, true}},
@@ -189,7 +193,8 @@ const std::map<string, FeatureSpec> FEATURE_TYPES = {
     // enforces that either/or, so neither is a universally-required param). An optional
     // `from` start reference and `flip` direction are validated by the compiler.
     // target_face = the cylindrical face to thread.
-    {"thread", {{}, {{"target_face", RefForm::Sel, true}}}},
+    {"thread", {{}, {{"target_face", RefForm::Sel, true},
+                     {"from", RefForm::SelOrDatum, false}}}},
     // text: emboss/engrave a string onto a planar face. `text` (the string) is always
     // required; height/depth/mode/font/align are optional (compiler defaults). target_face
     // = the planar face to mark.
@@ -223,6 +228,9 @@ const std::map<string, FeatureSpec> FEATURE_TYPES = {
     // fix_small_edges are optional), no ref slots — the optional target `body` is a
     // top-level feature id read by the compiler, not a ref (same shape as transform).
     {"heal", {{}, {}}},
+    // Refinement changes representation, never repairs geometry. Its only optional
+    // input is the body feature id (also accepted in params for flat callers).
+    {"refine", {{}, {{"body", RefForm::SelOrDatum, false}}}},
     {"boolean", {{"op"}, {{"targets", RefForm::SelList, true},
                           {"tools", RefForm::SelList, false}}}},
     {"sm_base_flange", {{}, {{"profile", RefForm::SelList, true}}}},
@@ -235,6 +243,7 @@ const std::map<string, FeatureSpec> FEATURE_TYPES = {
     {"weld_gusset", {{}, {{"faces", RefForm::SelList, true}}}},
     {"weld_end_cap", {{}, {{"face", RefForm::SelOrDatum, true}}}},
     {"script", {{"code"}, {}}},
+    {"scad", {{"source"}, {}}},
     {"import", {{"source_path", "format"}, {}}},
     // Macro: expands at apply-time into the parts catalog generator's op sequence
     // (same path as parts_make RPC). Never reaches the geometry compiler as itself —
@@ -248,7 +257,7 @@ const std::map<string, FeatureSpec> FEATURE_TYPES = {
                                                      {"components", RefForm::CompList, true}}}},
     {"asm_circular_pattern", {{"count", "angle"}, {{"axis", RefForm::SelOrDatum, true},
                                                    {"components", RefForm::CompList, true}}}},
-    {"surf_extrude", {{"end", "depth"}, {{"profile", RefForm::SelList, true}}}},
+    {"surf_extrude", {{"end"}, {{"profile", RefForm::SelList, true}}}},
     {"surf_revolve", {{"angle"}, {{"profile", RefForm::SelList, true},
                                   {"axis", RefForm::SelOrDatum, true}}}},
     {"surf_sweep", {{}, {{"profile", RefForm::SelList, true},
@@ -475,12 +484,8 @@ class ExprParser {
             skip_ws();
             if (peek() != ')') throw ExprParseError{"syntax error"};
             ++pos_;
-            // Python's expr_names = {n.id for n in ast.walk(tree) if isinstance(n,
-            // ast.Name) ...}. ast.walk DOES visit Call.func (an ast.Name), so the
-            // function name (e.g. "sin") IS collected. Collect it here too so our
-            // names() matches ast.walk exactly (numbers are skipped by the lexer, so
-            // scientific-notation literals like 2e5 never leak an 'e' identifier).
-            if (name != "pi") names_.insert(name);
+            // The call target is not a free variable. Its name was checked
+            // against the whitelist above; only its arguments are dependencies.
             return;
         }
         // Python 3.8+ parses True/False/None as ast.Constant, not ast.Name -> _check
@@ -539,13 +544,8 @@ string validate_expr(const string& expr) {
     return "";
 }
 
-// equations.expr_names: the set of referenced names, excluding _CONSTS = {pi}.
-// Mirrors {n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and n.id not in
-// _CONSTS} — which INCLUDES function-call names (Call.func is an ast.Name). The parser
-// collects both bare names and call names (pi excluded), and crucially skips numeric
-// literals so scientific notation like 2e5 does not leak an 'e'. Callers only invoke
-// this AFTER validate_expr passed, so re-parsing never throws here; if it somehow does,
-// return what we have (matching that EquationError would surface as set() in validate_dim).
+// Return variable dependencies, excluding constants and whitelisted call targets.
+// A bare variable named like a function is still a dependency.
 std::set<string> expr_names(const string& expr) {
     ExprParser p(normalize_caret(expr), EQ_FUNCS, /*check_names=*/false, {}, "");
     try {
@@ -1097,6 +1097,8 @@ vector<string> validate_constraint(const json& c, const string& where,
     if (!id.is_string() || !std::regex_match(id.get<string>(), CONSTRAINT_ID_RE)) {
         errs.push_back(where + ".id: must match c<N>");
     }
+    if (has(c, "auto") && !get(c, "auto").is_boolean())
+        errs.push_back(where + ".auto: must be bool");
     const ConstraintSpec& spec = sit->second;
     const json& refsj = get(c, "refs");
     vector<json> refs;
@@ -1168,7 +1170,7 @@ vector<string> validate_constraint(const json& c, const string& where,
         return {has_dot, et};
     };
 
-    auto bad_ref = [&](size_t i, const string& expected) {
+    auto bad_ref = [&errs, &where, &refs, &ctype](size_t i, const string& expected) {
         errs.push_back(where + ".refs[" + std::to_string(i) + "]: '" +
                        (refs[i].is_string() ? refs[i].get<string>() : refs[i].dump()) +
                        "' " + ctype + " needs " + expected);
@@ -1202,6 +1204,14 @@ vector<string> validate_constraint(const json& c, const string& where,
     if (ctype == "parallel" || ctype == "perpendicular" || ctype == "collinear" || ctype == "angle") {
         for (size_t i = 0; i < refs.size(); ++i)
             if (!entity_ref(i, {"line", "slot"})) bad_ref(i, "a line/slot/axis ref");
+    }
+    if (ctype == "rotate_point" || ctype == "signed_distance" || ctype == "equal_offset") {
+        for (size_t i = 0; i < refs.size(); ++i)
+            if (!point_ref(i)) bad_ref(i, "a point handle");
+    }
+    if (ctype == "signed_distance" || ctype == "equal_offset") {
+        if (get(c, "axis") != "h" && get(c, "axis") != "v")
+            errs.push_back(where + ".axis: must be 'h' or 'v'");
     }
     if (ctype == "concentric") {
         for (size_t i = 0; i < refs.size(); ++i)
@@ -1341,6 +1351,30 @@ vector<string> validate_sketch_params(const json& params, const string& where,
             }
             seen_c.insert(cid);
         }
+    }
+    std::map<string, const json*> constraints_by_id;
+    for (const auto& c : constraints)
+        if (c.is_object() && get(c, "id").is_string())
+            constraints_by_id[get(c, "id").get<string>()] = &c;
+    for (size_t i = 0; i < constraints.size(); ++i) {
+        const json& c = constraints[i];
+        if (!c.is_object() || !has(c, "angle_ref")) continue;
+        const string loc = where + ".constraints[" + std::to_string(i) + "].angle_ref";
+        if (get(c, "type") != "rotate_point" || !get(c, "angle_ref").is_string()) {
+            errs.push_back(loc + ": only rotate_point accepts a constraint-id string");
+            continue;
+        }
+        const string id = get(c, "angle_ref").get<string>();
+        auto master = constraints_by_id.find(id);
+        if (master == constraints_by_id.end() || id == get(c, "id") ||
+            get(*master->second, "type") != "rotate_point" || has(*master->second, "angle_ref") ||
+            get(*master->second, "driven") == true || get(c, "driven") == true ||
+            get(*master->second, "auto") == true || get(c, "auto") == true) {
+            errs.push_back(loc + ": must name a different, explicit independent driving rotate_point in this sketch");
+            continue;
+        }
+        if (get(c, "value") != get(*master->second, "value"))
+            errs.push_back(loc + ": linked value must match its master");
     }
     return errs;
 }
@@ -1548,7 +1582,8 @@ bool truthy(const json& v) {
 vector<string> validate_feature(const json& f, const string& where,
                                 const std::set<string>& earlier_ids,
                                 const std::set<string>& globals_names,
-                                const std::set<string>& component_ids) {
+                                const std::set<string>& component_ids,
+                                bool reject_unknown_refs) {
     vector<string> errs;
     if (!f.is_object()) {
         return {where + ": feature must be an object"};
@@ -1557,9 +1592,8 @@ vector<string> validate_feature(const json& f, const string& where,
     string ftype = ftypej.is_string() ? ftypej.get<string>() : "";
     auto spit = FEATURE_TYPES.find(ftype);
     if (!ftypej.is_string() || spit == FEATURE_TYPES.end()) {
-        // Contentless before: "is not a feature type" alone — substring preserved
-        // (core/agent/run.cpp::looks_like_unknown_op_error matches on it) while the
-        // offending value and the full vocabulary are now named, per validate_entity's fix.
+        // Contentless before: "is not a feature type" alone — that substring is preserved while
+        // the offending value and the full vocabulary are now named, per validate_entity's fix.
         string got = ftypej.is_string() ? ("\"" + ftype + "\"")
                      : ftypej.is_null()  ? "absent"
                                          : "not a string";
@@ -1602,12 +1636,26 @@ vector<string> validate_feature(const json& f, const string& where,
             errs.push_back(where + ".params." + key + ": required for " + ftype);
         }
     }
+    // Through-all surface extrusion derives its extent from the profile; only
+    // depth-driven ends require an authored depth.
+    if (ftype == "surf_extrude" && get(params, "end") != "through_all" &&
+        !params.contains("depth"))
+        errs.push_back(where + ".params.depth: required for surf_extrude");
     // Dimension-shaped params get dim validation.
     for (auto it = params.begin(); it != params.end(); ++it) {
         const json& v = it.value();
-        if (v.is_object() && (v.contains("value") || v.contains("expr"))) {
+        if (ftype != "scad" && v.is_object() && (v.contains("value") || v.contains("expr"))) {
             auto de = validate_dim(v, where + ".params." + it.key(), globals_names);
             errs.insert(errs.end(), de.begin(), de.end());
+        }
+    }
+    if (ftype == "scad") {
+        try {
+            const json result = scad::inspect(params);
+            if (!result.value("ok", false))
+                errs.push_back(where + ".params: " + result.value("error", string("invalid SCAD parameters")));
+        } catch (const std::exception& e) {
+            errs.push_back(where + ".params: " + e.what());
         }
     }
 
@@ -1708,7 +1756,14 @@ vector<string> validate_feature(const json& f, const string& where,
         }
         // An explicit axis/direction vector is valid in a direction slot, whatever
         // wrapper the model put around it (the compiler reads the `axis` vector).
-        if (AXIS_DIR_SLOTS.count(name) && is_explicit_axis(v)) continue;
+        if (AXIS_DIR_SLOTS.count(name) && is_explicit_axis(v)) {
+            for (const char* point_key : {"centroid", "point", "origin"}) {
+                const auto point = v.find(point_key);
+                if (point != v.end() && !point->is_null() && !is_vec(*point, 3))
+                    errs.push_back(loc + "." + point_key + ": must be [x,y,z]");
+            }
+            continue;
+        }
         // hole `positions` is a list of [u,v] face-local coordinate pairs — that is what
         // the compiler reads and what the cheatsheet teaches. (The slot is typed SelList
         // for a legacy vertex-selector form, which the compiler never actually consumes.)
@@ -1840,6 +1895,7 @@ vector<string> validate_feature(const json& f, const string& where,
             }
         }
     }
+    if (!reject_unknown_refs) return errs;
     // Unknown ref slots. TEACH, don't just reject: name the slots this feature
     // type actually takes, read straight from the same FeatureSpec that rejected
     // it (never a second hand-maintained table), so the model can rewrite the op
@@ -1969,8 +2025,9 @@ vector<string> validate_rollback(const json& doc, const std::set<string>& featur
     const json& rb = get(doc, "rollback_after");
     if (rb.is_null()) return {};
     if (!rb.is_string()) {
-        return {"rollback_after: must be a feature id string or null"};
+        return {"rollback_after: must be a feature id, 'start', or null"};
     }
+    if (rb == "start" && get(doc, "schema") == "aicad.part/1") return {};
     if (feature_ids.find(rb.get<string>()) == feature_ids.end()) {
         return {"rollback_after: '" + rb.get<string>() + "' is not an existing feature id"};
     }
@@ -2116,7 +2173,7 @@ vector<string> validate_studies(const json& doc) {
     return errs;
 }
 
-vector<string> validate_part(const json& doc) {
+vector<string> validate_part(const json& doc, bool reject_unknown_refs) {
     if (!doc.is_object()) {
         return {"document must be a JSON object"};
     }
@@ -2163,7 +2220,7 @@ vector<string> validate_part(const json& doc) {
                               ? get(f, "id").get<string>()
                               : (f.is_object() && !get(f, "id").is_null() ? get(f, "id").dump() : "None");
         string loc = "features[" + std::to_string(i) + "](" + fid_disp + ")";
-        auto fe = validate_feature(f, loc, earlier, globals_names, no_components);
+        auto fe = validate_feature(f, loc, earlier, globals_names, no_components, reject_unknown_refs);
         errs.insert(errs.end(), fe.begin(), fe.end());
         if (f.is_object() && get(f, "id").is_string()) {
             if (seen.count(fid_str)) {
@@ -2210,7 +2267,7 @@ bool mate_coupling_spec(const string& t, vector<string>& req, vector<string>& op
     return false;
 }
 
-vector<string> validate_assembly(const json& doc) {
+vector<string> validate_assembly(const json& doc, bool reject_unknown_refs) {
     if (!doc.is_object()) {
         return {"document must be a JSON object"};
     }
@@ -2347,8 +2404,12 @@ vector<string> validate_assembly(const json& doc) {
             const json& f = feats[i];
             string fid = (f.is_object() && get(f, "id").is_string()) ? get(f, "id").get<string>() : "";
             string fid_disp = fid.empty() ? "None" : fid;
+            if (f.is_object() && get(f, "type") == "refine") {
+                errs.push_back("features[" + std::to_string(i) + "](" + fid_disp +
+                               ").type: refine is not supported in assembly documents");
+            }
             auto fe = validate_feature(f, "features[" + std::to_string(i) + "](" + fid_disp + ")",
-                                       earlier, globals_names, comp_ids);
+                                       earlier, globals_names, comp_ids, reject_unknown_refs);
             errs.insert(errs.end(), fe.begin(), fe.end());
             if (!fid.empty()) {
                 earlier.insert(fid);
@@ -2400,75 +2461,356 @@ std::vector<std::string> feature_type_names() {
     return out;
 }
 
+// Export MATE_TYPES (same single-owner rule as feature_type_names) so asm_add_mate can refuse
+// an unknown type with the full vocabulary at op time.
+std::vector<std::string> mate_type_names() {
+    return std::vector<std::string>(MATE_TYPES.begin(), MATE_TYPES.end());  // std::set: sorted
+}
+
 // --------------------------------------------------------------------------- params
 
 // Param keys the compiler READS, per feature type. A key outside the set is inert: the
 // feature builds as if the key were absent, with ok:true. The 6-axis trace (2026-10-10)
 // sent extrude params.reverse:true on many cuts and pads; the engine reads `flip`, so
-// each one built the wrong way with no error. Only types listed here are checked.
+// each one built the wrong way with no error. The op path (session.cpp
+// refuse_unknown_params) therefore refuses a key outside the row of the feature's type.
 //
-// extrude: every key core/doc/document.cpp's extrude branch reads from the flattened
-// feature (params + refs), plus the keys the GUI Extrude form writes (host/src/ui/
-// pm_forms.cpp: offset2, end2_offset, which the Direction-2 conditions carry), plus
-// `suppressed` (compile_document reads it from the flattened feature for every type).
-// Ref-slot names are accepted in params too: normalize_feature flattens params and
-// refs into one dict, so the compiler reads them from either container.
+// Each row is the union of
+//   * every key core/doc/document.cpp's compile branch for the type reads from the
+//     flattened feature (params + refs merged by normalize_feature), including the
+//     shared readers (solid_mode: mode/merge; body_ref: body) and the synonyms
+//     normalize_feature itself consumes (hole/bolt_circle diameter, chamfer length);
+//   * the keys the GUI forms write (host/src/ui/pm_forms.cpp, submitted through
+//     edit_feature by property_manager). A few of those are inert in the compiler
+//     (revolve end/flip/dir2/angle2, hole nx/ny/dx/dy, thread custom_size/full_length,
+//     sweep twist_*, loft tangency_*, rib side/draft/flip, boolean keep_tools) but the
+//     form always sends them, so refusing them would break the GUI;
+//   * the keys other writers send: the parts catalog generators (core/parts), the import
+//     paths (session.cpp doc_import_file / vendor import), the assembly pattern
+//     compiler (assembly.cpp), and the canonical side of the services/mcp/cad_doc_tools.py
+//     normalizers.
+// `suppressed` is read by compile_document for every type, so it is always accepted
+// and is added by accepted_keys() rather than repeated per row. Ref-slot names are
+// also accepted in params, but slots requiring normalization (e.g. pattern directions
+// and seed features) must be placed in refs to receive that normalization.
+//
+// `params` of a fillet/chamfer/sm_hem/weld_* may carry `type`: normalize_feature remaps
+// params.type to hem_type (the feature's own "type" must survive the flatten), and the
+// compiler reads hem_type as the sub-type, so both spellings are listed.
 namespace {
 
-const std::map<string, std::set<string>> FEATURE_PARAM_KEYS = {
+using KeySet = std::set<string>;
+
+KeySet join(KeySet base, const KeySet& more) {
+    base.insert(more.begin(), more.end());
+    return base;
+}
+
+// box/cylinder/sphere/cone/torus placement + body policy (document.cpp primitive branch
+// and session.cpp kPrimitiveKeys). `axis_dir` is what normalize_feature writes for refs.axis.
+const KeySet PRIMITIVE_KEYS = {"at", "at_offset", "axis", "axis_dir", "centered", "mode", "merge"};
+
+// hole and bolt_circle share the bore description. The synonym rows are the ones
+// normalize_feature turns into `diameter` (dia/d/... , a radius, or a fastener
+// designation resolved from the metric table).
+const KeySet BORE_KEYS = {
+    "style", "end", "depth", "diameter", "cbore_d", "cbore_depth", "csink_d", "csink_angle", "body",
+    "dia", "d", "bore_diameter", "bore_dia", "hole_diameter", "hole_dia", "bore", "radius", "r",
+    "bore_radius", "standard", "thread", "screw", "fastener", "bolt", "tap", "size",
+};
+
+const std::map<string, KeySet> FEATURE_PARAM_KEYS = {
+    // --- datums: `method` plus that method's own scalars; selectors are ref slots.
+    {"plane", {"method", "offset", "angle", "flip", "origin", "normal", "fraction", "t"}},
+    {"axis", {"method"}},
+    {"point", {"method", "coordinate", "x", "y", "z", "body", "uv", "t", "fraction", "other"}},
+    {"csys", {}},
+    // --- sketches: geometry payloads. `auto_define` is the sketch auto-constraint policy
+    // (validate_sketch_params); `offset` shifts the sketch along its plane normal.
+    {"sketch", {"entities", "constraints", "external_refs", "offset", "auto_define"}},
+    {"sketch3d", {"entities", "constraints", "external_refs"}},
+    // --- primitives
+    {"box", join(PRIMITIVE_KEYS, {"length", "width", "height"})},
+    {"cylinder", join(PRIMITIVE_KEYS, {"radius", "height"})},
+    {"sphere", join(PRIMITIVE_KEYS, {"radius"})},
+    {"cone", join(PRIMITIVE_KEYS, {"r1", "r2", "height"})},
+    {"torus", join(PRIMITIVE_KEYS, {"major_r", "minor_r"})},
+    // --- sketched features. Direction-2 offset keys remain accepted for compatibility,
+    // although the current compiler only implements blind and through-all Direction 2.
     {"extrude", {"mode", "merge", "end", "depth", "mid_plane", "dir", "flip",
                  "thin", "thin_thickness", "thin_side", "draft", "draft_outward",
                  "start", "start_offset", "offset", "end_offset", "end2", "depth2",
-                 "offset2", "end2_offset", "suppressed"}},
+                 "offset2", "end2_offset"}},
+    {"revolve", {"mode", "merge", "angle", "axis_pt", "axis_dir", "thin", "thin_thickness",
+                 "thin_side", "end", "flip", "dir2", "angle2"}},
+    {"sweep", {"mode", "merge", "orientation", "twist_turns", "twist_degrees"}},
+    {"loft", {"mode", "merge", "ruled", "tangency_start", "tangency_end"}},
+    {"helix", {"pitch", "height", "radius", "turns", "taper", "start_angle", "ccw", "spiral",
+               "shape", "start_radius", "pitch_table"}},
+    // thread: `face`, `from`, `start_ref`, `start`, `profile` are the compiler's fallback
+    // spellings of target_face / from / form; reverse and flip_direction fall back to flip.
+    {"thread", {"size", "major_dia", "pitch", "length", "starts", "handedness", "style", "form",
+                "profile", "mode", "turns", "face", "from", "start_ref", "start", "flip",
+                "reverse", "flip_direction", "preview", "draft", "body", "custom_size",
+                "full_length"}},
+    {"text", {"text", "string", "value", "height", "size", "depth", "mode", "font", "halign",
+              "valign", "offset", "face", "body"}},
+    // --- dress-up
+    {"fillet", {"radius", "radius2", "type", "hem_type", "dir", "body"}},
+    {"chamfer", {"length", "distance", "length2", "angle", "type", "hem_type", "dir", "body"}},
+    {"shell", {"thickness", "outward", "body"}},
+    {"draft", {"angle", "mode", "pull_dir", "plane_point", "plane_normal", "body"}},
+    {"hole", join(BORE_KEYS, {"world_points", "nx", "ny", "dx", "dy"})},
+    {"bolt_circle", join(BORE_KEYS, {"count", "pcd", "bolt_circle_d", "start_angle",
+                                     "world_center"})},
+    {"rib", {"thickness", "body", "side", "draft", "flip"}},
+    // --- patterns, mirror, bodies
+    {"linear_pattern", {"count1", "spacing1", "count2", "spacing2", "seed"}},
+    {"circular_pattern", {"count", "angle", "equal_spacing", "axis_pt", "axis_dir", "seed"}},
+    {"mirror", {"merge", "seed", "plane_point", "plane_normal", "body"}},
+    {"transform", {"translate", "rotate", "angle", "axis", "pivot", "copy", "body"}},
+    {"heal", {"body", "tolerance", "fix_small_edges", "fix_orientation", "rebuild_solid",
+              "unify_faces", "sew_tolerance_mm", "rebuild_fuzzy_mm", "max_volume_change_pct"}},
+    {"refine", {"body"}},
+    {"boolean", {"op", "a", "b", "keep_tools"}},
+    {"split", {"keep"}},
+    // --- sheet metal
+    {"sm_base_flange", {"thickness", "k_factor", "default_bend_radius"}},
+    {"sm_edge_flange", {"angle", "length", "radius", "k_factor", "position", "flip"}},
+    {"sm_hem", {"hem_type", "type", "length", "radius", "k_factor", "flip"}},
+    {"sm_jog", {"angle", "offset", "length", "radius", "k_factor", "position", "flip"}},
+    {"sm_flat_pattern", {}},
+    // --- weldments (weld_profile_dims reads size/thickness/w/h/od/leg/tw/tf per profile)
+    {"weld_member", {"profile", "size", "thickness", "w", "h", "od", "leg", "tw", "tf",
+                     "justify", "angle", "trim_corners", "joint"}},
+    {"weld_gusset", {"thickness", "d1", "d2", "type", "hem_type", "location", "offset"}},
+    {"weld_end_cap", {"thickness", "type", "hem_type", "overhang", "offset"}},
+    // --- external geometry. import: the compiler's keys plus the provenance the import
+    // paths record (original_name, source_units, import_fidelity, editable_as, as_solid,
+    // vendor_*), which edit_feature may re-send.
+    {"import", {"source_path", "format", "original_name", "embedded_brep", "embedded_bodies",
+                "embedded_body_names", "keep_bodies", "exclude_bodies", "source_units",
+                "import_fidelity", "editable_as", "as_solid", "vendor_supplier",
+                "vendor_part_number", "vendor_product_url"}},
+    {"scad", {"source", "files", "parameters", "parameter_schema",
+              "mm_per_source_unit", "native_projection"}},
+    {"script", {"code"}},
+    {"standard_part", {"family", "kind", "type", "size", "thread", "designation", "bore",
+                       "length_mm", "length", "L", "options"}},
+    // --- assembly component patterns (assembly.cpp compile_component_patterns)
+    {"asm_linear_pattern", {"count1", "spacing1"}},
+    {"asm_circular_pattern", {"count", "angle", "equal_spacing"}},
+    // --- surfaces
+    {"surf_extrude", {"end", "depth", "flip"}},
+    {"surf_revolve", {"angle", "axis_pt", "axis_dir"}},
+    {"surf_sweep", {}},
+    {"surf_loft", {"ruled"}},
+    {"surf_planar", {}},
+    {"surf_offset", {"distance", "body"}},
+    {"surf_ruled", {}},
+    {"surf_boundary", {"continuity"}},
+    {"surf_fill", {"continuity"}},
+    {"surf_knit", {}},
+    {"surf_thicken", {"thickness", "side", "flip"}},
+    {"surf_trim", {"keep"}},
+    {"surf_untrim", {"body"}},
+    {"surf_delete_face", {"body"}},
+    {"surf_replace_face", {"body"}},
 };
 
-// A short STE hint for an invented key whose intent is clear.
-string param_key_hint(const string& type, const string& key) {
-    if (type != "extrude") return {};
-    static const std::map<string, string> hints = {
-        {"reverse", "To extrude in the opposite direction, set \"flip\": true."},
-        {"reversed", "To extrude in the opposite direction, set \"flip\": true."},
-        {"reverse_direction", "To extrude in the opposite direction, set \"flip\": true."},
-        {"flip_direction", "To extrude in the opposite direction, set \"flip\": true."},
-        {"flipped", "To extrude in the opposite direction, set \"flip\": true."},
-        {"opposite", "To extrude in the opposite direction, set \"flip\": true."},
-        {"direction", "To extrude in the opposite direction, set \"flip\": true. "
-                      "To give a direction vector, use \"dir\": [x, y, z]."},
-        {"distance", "Give the extrude length in \"depth\"."},
-        {"length", "Give the extrude length in \"depth\"."},
-        {"height", "Give the extrude length in \"depth\"."},
-        {"extent", "Give the extrude length in \"depth\"."},
-        {"amount", "Give the extrude length in \"depth\"."},
-        {"thickness", "Give the extrude length in \"depth\". "
-                      "For a thin wall, use \"thin_thickness\"."},
-        {"symmetric", "To extrude on both sides of the sketch plane, set \"end\": \"mid_plane\"."},
-        {"midplane", "To extrude on both sides of the sketch plane, set \"end\": \"mid_plane\"."},
-        {"both_sides", "To extrude on both sides of the sketch plane, set \"end\": \"mid_plane\"."},
-        {"both_directions", "To extrude on both sides of the sketch plane, set \"end\": \"mid_plane\"."},
-        {"taper", "Give the draft angle in \"draft\"."},
-        {"taper_angle", "Give the draft angle in \"draft\"."},
-        {"draft_angle", "Give the draft angle in \"draft\"."},
-        {"operation", "Use \"mode\": \"boss\" or \"mode\": \"cut\"."},
-        {"boolean", "Use \"mode\": \"boss\" or \"mode\": \"cut\"."},
-        {"through_all", "Set \"end\": \"through_all\"."},
+// The row plus the key every feature type accepts.
+KeySet accepted_keys(const KeySet& row) {
+    KeySet out = row;
+    out.insert("suppressed");
+    return out;
+}
+
+using HintMap = std::map<string, std::map<string, string>>;
+
+// Short STE hints for an invented key whose intent is clear. Every target key below is
+// one the compile branch (or normalize_feature) reads — checked against document.cpp,
+// never copied from a dialect table — so a hint never points at another inert key.
+HintMap build_hints() {
+    HintMap h;
+    auto add = [&h](const string& type, std::initializer_list<const char*> keys,
+                    const string& text) {
+        for (const char* k : keys) h[type][k] = text;
     };
-    const auto it = hints.find(key);
-    return it == hints.end() ? string() : it->second;
+
+    const string flip = "To extrude in the opposite direction, set \"flip\": true.";
+    add("extrude", {"reverse", "reversed", "reverse_direction", "flip_direction", "flipped",
+                    "opposite"}, flip);
+    add("extrude", {"direction"}, flip + " To give a direction vector, use \"dir\": [x, y, z].");
+    add("extrude", {"distance", "length", "height", "extent", "amount"},
+        "Give the extrude length in \"depth\".");
+    add("extrude", {"thickness"},
+        "Give the extrude length in \"depth\". For a thin wall, use \"thin_thickness\".");
+    add("extrude", {"symmetric", "midplane", "both_sides", "both_directions"},
+        "To extrude on both sides of the sketch plane, set \"end\": \"mid_plane\".");
+    add("extrude", {"taper", "taper_angle", "draft_angle"}, "Give the draft angle in \"draft\".");
+    add("extrude", {"operation", "boolean"}, "Use \"mode\": \"boss\" or \"mode\": \"cut\".");
+    add("extrude", {"through_all"}, "Set \"end\": \"through_all\".");
+
+    const string place = "Place it with \"at\": [x, y, z] (and orient it with \"axis\").";
+    const string solid_mode = "Use \"mode\": \"boss\" or \"cut\", and \"merge\": false for a separate body.";
+    for (const char* t : {"box", "cylinder", "sphere", "cone", "torus"}) {
+        add(t, {"position", "location", "center", "centre", "origin", "placement"}, place);
+        add(t, {"direction", "orientation", "normal", "dir"},
+            "Orient it with \"axis\": [x, y, z] (its local +Z points along it).");
+        add(t, {"operation", "boolean", "subtract", "cut"}, solid_mode);
+    }
+    add("box", {"depth", "size", "dimensions"}, "A box takes \"length\", \"width\" and \"height\".");
+    add("cylinder", {"diameter", "dia", "d"}, "Give the radius (half the diameter) in \"radius\".");
+    add("cylinder", {"depth", "length", "thickness", "extent"}, "Give the cylinder length in \"height\".");
+    add("sphere", {"diameter", "dia", "d"}, "Give the radius (half the diameter) in \"radius\".");
+    add("cone", {"radius", "radius1", "radius2", "base_radius", "bottom_radius", "top_radius"},
+        "A cone takes \"r1\" (base radius), \"r2\" (top radius, 0 = point) and \"height\".");
+    add("torus", {"radius", "major_radius", "minor_radius", "tube_radius", "ring_radius"},
+        "A torus takes \"major_r\" (ring centre-line radius) and \"minor_r\" (tube radius).");
+
+    add("plane", {"distance", "height", "z", "position"}, "Give the offset from the base in \"offset\".");
+    add("plane", {"rotation", "tilt"}, "Give the tilt in \"angle\" (degrees; method \"angle\").");
+    add("sketch", {"origin", "center", "centre", "position", "location", "plane_offset", "z"},
+        "A sketch sits on refs.plane; shift it along that plane's normal with \"offset\".");
+    add("helix", {"diameter"}, "Give the radius (half the diameter) in \"radius\".");
+    add("helix", {"revolutions", "rotations"}, "Give the number of turns in \"turns\".");
+
+    add("revolve", {"degrees", "sweep_angle", "revolve_angle", "total_angle"},
+        "Give the sweep angle in \"angle\" (degrees).");
+    add("rib", {"width", "rib_thickness", "wall_thickness", "wall", "t"},
+        "Give the rib width in \"thickness\".");
+    add("shell", {"wall_thickness", "wall", "wall_t", "t", "width"},
+        "Give the wall thickness in \"thickness\".");
+    add("shell", {"faces", "open_faces", "remove_faces", "open"},
+        "Name the faces to open in refs.remove.");
+
+    add("thread", {"depth", "thread_length", "thread_depth", "run", "engagement"},
+        "Give the thread run in \"length\" (omit it to thread the whole face).");
+    add("thread", {"diameter", "major_diameter", "nominal_diameter", "nominal_dia"},
+        "Give a custom thread's outer diameter in \"major_dia\" (with \"pitch\"), or name a "
+        "standard \"size\" such as \"M8\".");
+    add("thread", {"thread_size", "designation"},
+        "Name the standard thread in \"size\", e.g. \"M8\" or \"1/4-20\".");
+    add("thread", {"left_hand", "lefthand", "left"}, "For a left-hand thread set \"handedness\": \"left\".");
+    add("thread", {"internal", "bore"}, "For a thread inside a bore set \"style\": \"internal\".");
+
+    add("fillet", {"r", "rad", "size", "distance", "length", "amount", "fillet_radius", "width"},
+        "Give the fillet size in \"radius\".");
+    add("fillet", {"end_radius", "radius_end", "r2"},
+        "For a variable fillet give the end size in \"radius2\" with \"type\": \"variable\".");
+    add("chamfer", {"size", "d", "d1", "width", "amount", "leg", "setback"},
+        "Give the setback in \"length\" (a second leg goes in \"length2\").");
+    add("chamfer", {"d2"}, "Give the second setback in \"length2\".");
+    add("draft", {"draft_angle", "taper", "taper_angle", "degrees", "deg"},
+        "Give the draft angle in \"angle\".");
+    add("draft", {"pull_direction", "direction"},
+        "Give the pull direction in refs.pull (axis.x|axis.y|axis.z or {\"axis\": [x, y, z]}).");
+
+    for (const char* t : {"hole", "bolt_circle"}) {
+        add(t, {"through_all", "through"}, "Set \"end\": \"through_all\" (or \"end\": \"blind\" with \"depth\").");
+        add(t, {"hole_type", "kind", "form"}, "Give the hole kind in \"style\": simple|cbore|csink|tap.");
+        add(t, {"cbore_diameter", "counterbore_diameter", "cbore_dia"}, "Give the counterbore diameter in \"cbore_d\".");
+        add(t, {"counterbore_depth"}, "Give the counterbore depth in \"cbore_depth\".");
+        add(t, {"csink_diameter", "countersink_diameter", "csink_dia"}, "Give the countersink diameter in \"csink_d\".");
+    }
+    add("hole", {"type"}, "Give the hole kind in \"style\": simple|cbore|csink|tap.");
+    add("hole", {"position", "center", "centre", "at", "location"},
+        "Place holes with refs.face plus \"positions\": [[u, v], ...] (face-local mm) or "
+        "\"world_points\": [[x, y, z], ...].");
+    add("bolt_circle", {"circle_diameter", "bolt_circle_diameter", "pitch_circle_diameter", "bcd"},
+        "Give the bolt-circle diameter in \"pcd\".");
+    add("bolt_circle", {"holes", "num_holes", "number", "n", "qty"}, "Give the hole count in \"count\".");
+    add("bolt_circle", {"angle", "rotation", "start"}, "Give the first hole's angle in \"start_angle\" (degrees).");
+    add("bolt_circle", {"center", "centre", "at", "position"},
+        "Centre the ring with \"world_center\": [x, y, z] (omit it to use the face centre).");
+
+    add("linear_pattern", {"count", "number", "n", "instances", "qty"}, "Give the count in \"count1\".");
+    add("linear_pattern", {"spacing", "distance", "pitch", "step"}, "Give the spacing in \"spacing1\".");
+    add("linear_pattern", {"reverse", "reverse1", "reversed", "flip"},
+        "To pattern the other way give \"spacing1\" a negative value, or a negative direction "
+        "in refs.dir1 such as {\"axis\": [-1, 0, 0]}.");
+    add("linear_pattern", {"direction", "axis"},
+        "Give the direction in refs.dir1 (axis.x|axis.y|axis.z or {\"axis\": [x, y, z]}).");
+    add("circular_pattern", {"instances", "number", "n", "qty"}, "Give the count in \"count\".");
+    add("circular_pattern", {"total_angle", "sweep", "span"}, "Give the angle in \"angle\" (degrees).");
+    add("circular_pattern", {"step", "spacing_angle"},
+        "Give the increment in \"angle\" and set \"equal_spacing\": false.");
+
+    add("mirror", {"mirror_plane", "symmetry_plane", "about", "across"},
+        "Name the mirror plane in refs.plane (plane.top|plane.front|plane.right or a planar face).");
+    add("boolean", {"operation", "type", "mode", "kind"},
+        "Use \"op\": \"fuse\", \"cut\" or \"common\" (or combine|subtract|intersect).");
+    add("boolean", {"target", "base"},
+        "Name the two bodies in \"a\" (kept) and \"b\" (tool), or in refs.targets / refs.tools.");
+    add("transform", {"translation", "move", "offset", "position", "delta", "displacement"},
+        "Give the move in \"translate\": [x, y, z].");
+    add("transform", {"rotation", "degrees", "angle_deg"},
+        "Rotate with \"angle\" (degrees) about \"axis\": [x, y, z], optionally around \"pivot\".");
+    add("text", {"content", "label", "caption"}, "Give the string in \"text\".");
+    add("text", {"font_size", "text_height", "character_height"}, "Give the character height in \"height\".");
+    add("text", {"emboss", "engrave", "raised"}, "Set \"mode\": \"emboss\" (raised) or \"engrave\" (recessed).");
+    add("heal", {"tol", "precision"}, "Give the ShapeFix precision in \"tolerance\" (mm).");
+    add("heal", {"sew_tolerance"}, "Give the sewing tolerance in \"sew_tolerance_mm\".");
+    add("import", {"path", "file", "filename", "filepath"}, "Give the file in \"source_path\".");
+
+    const string sm_k = "Give the k-factor in \"k_factor\".";
+    add("sm_base_flange", {"sheet_thickness", "material_thickness", "gauge", "wall_thickness", "t"},
+        "Give the sheet thickness in \"thickness\".");
+    add("sm_base_flange", {"bend_radius", "radius", "inner_radius", "default_radius", "bend_r"},
+        "Give the default bend radius in \"default_bend_radius\".");
+    add("sm_base_flange", {"kfactor", "k", "k_fac", "bend_k"}, sm_k);
+    for (const char* t : {"sm_edge_flange", "sm_hem", "sm_jog"}) {
+        add(t, {"height", "flange_length", "flange_height", "wall_length", "wall", "leg", "leg_length"},
+            "Give the wall length in \"length\".");
+        add(t, {"bend_radius", "inner_radius", "bend_r"}, "Give the inner bend radius in \"radius\".");
+        add(t, {"kfactor", "k", "k_fac", "bend_k"}, sm_k);
+    }
+    add("sm_edge_flange", {"bend_angle", "fold_angle", "flange_angle"}, "Give the bend angle in \"angle\" (degrees).");
+    add("sm_jog", {"bend_angle", "fold_angle", "jog_angle"}, "Give the bend angle in \"angle\" (degrees).");
+    add("sm_jog", {"jog_offset", "step", "step_offset", "z_offset"}, "Give the jog height in \"offset\".");
+    add("sm_hem", {"hem_style", "style"}, "Give the hem kind in \"hem_type\": closed|open|teardrop.");
+
+    add("surf_extrude", {"distance", "length", "height", "thickness"}, "Give the extent in \"depth\".");
+    add("surf_offset", {"offset", "thickness"}, "Give the offset in \"distance\".");
+    add("surf_thicken", {"offset", "distance", "depth"}, "Give the wall thickness in \"thickness\".");
+    return h;
+}
+
+const HintMap& hints() {
+    static const HintMap h = build_hints();
+    return h;
+}
+
+string param_key_hint(const string& type, const string& key) {
+    const auto t = hints().find(type);
+    if (t == hints().end()) return {};
+    const auto k = t->second.find(key);
+    return k == t->second.end() ? string() : k->second;
 }
 
 }  // namespace
+
+std::map<std::string, std::vector<std::string>> feature_param_keys() {
+    std::map<std::string, std::vector<std::string>> out;
+    for (const auto& [type, row] : FEATURE_PARAM_KEYS) {
+        const KeySet keys = accepted_keys(row);  // std::set: already sorted
+        out[type] = std::vector<std::string>(keys.begin(), keys.end());
+    }
+    return out;
+}
 
 std::vector<std::string> unknown_feature_params(const std::string& type,
                                                 const nlohmann::json& params) {
     std::vector<std::string> errs;
     const auto keys_it = FEATURE_PARAM_KEYS.find(type);
     if (keys_it == FEATURE_PARAM_KEYS.end() || !params.is_object()) return errs;
-    std::set<string> accepted = keys_it->second;
+    const KeySet listed = accepted_keys(keys_it->second);
+    KeySet accepted = listed;
     const auto spec_it = FEATURE_TYPES.find(type);
     if (spec_it != FEATURE_TYPES.end())
         for (const RefSlot& slot : spec_it->second.refs) accepted.insert(slot.name);
     string list;
-    for (const string& k : keys_it->second) list += (list.empty() ? "" : ", ") + k;
+    for (const string& k : listed) list += (list.empty() ? "" : ", ") + k;
     for (auto it = params.begin(); it != params.end(); ++it) {
         // A null value sets nothing (edit_feature deletes the key with it).
         if (it.value().is_null() || accepted.count(it.key())) continue;
@@ -2623,17 +2965,17 @@ std::vector<std::string> normalize_feature_shape(nlohmann::json& feature) {
 
 // --------------------------------------------------------------------------- public
 
-std::vector<std::string> validate_document(const nlohmann::json& doc) {
+std::vector<std::string> validate_document(const nlohmann::json& doc, bool reject_unknown_refs) {
     if (!doc.is_object()) {
         return {"document must be a JSON object"};
     }
     const json& schj = get(doc, "schema");
     string schema = schj.is_string() ? schj.get<string>() : "";
     if (schj.is_string() && schema == "aicad.part/1") {
-        return validate_part(doc);
+        return validate_part(doc, reject_unknown_refs);
     }
     if (schj.is_string() && schema == "aicad.asm/1") {
-        return validate_assembly(doc);
+        return validate_assembly(doc, reject_unknown_refs);
     }
     string got = schj.is_string() ? schj.get<string>() : (schj.is_null() ? "None" : schj.dump());
     return {"schema: unknown '" + got + "'"};

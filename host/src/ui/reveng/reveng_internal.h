@@ -4,6 +4,7 @@
 // call in a draw path (known freeze bug); all session data arrives via ASYNC st.rpc.call.
 #pragma once
 
+#include <array>
 #include <string>
 #include <cstdint>
 #include <memory>
@@ -21,12 +22,11 @@ struct AppState;
 namespace ui {
 namespace reveng {
 
-// RE-30: Source lane — determines which stages appear in the adaptive stepper.
-//   Scan        : Source → Scale → Reconstruct → Model → Review → Deliver
-//   Datasheet   : Source → Model → Review → Deliver  (skip Scale + Reconstruct)
-//   Web         : Source → Model → Review → Deliver  (skip Scale + Reconstruct)
-//   FromLibrary : seeded externally; auto-routed to Scan or Datasheet/Web
-enum class SourceMode { Scan, Datasheet, Web, FromLibrary };
+// Intake lane — determines which stages appear in the adaptive stepper.
+//   Scan      : Source → Scale → Reconstruct → Model → Review → Deliver
+//   Reference : Source → Model → Review → Deliver  (part number / URL / datasheet / library part;
+//               an existing CAD model is searched for BEFORE anything is built)
+enum class SourceMode { Scan, Reference };
 
 // RE-40: one-shot deep-link target for the three DISTINCT Sources entry points. The ribbon
 // buttons reveng_add_photos / reveng_add_video / reveng_webcam used to collapse into one
@@ -60,6 +60,7 @@ struct SessionSummary {
     std::string status;   // capturing|reconstructing|modeling|review|done|error
     bool approximate = false;
     int images = 0;
+    std::string lane;     // "scan" | "reference" (session.lane); empty for older sessions
     // RE-40: the rest of what list_reveng_sessions already returns. The rail cards and the
     // properties Details tab show these instead of re-fetching the full manifest per row.
     std::string createdAt;   // ISO-8601
@@ -120,6 +121,15 @@ struct GaussianViewCamera {
     float intrinsics[6] = {};  // fx, fy, cx, cy, source width, source height
 };
 
+// The actual similarity attached to a loaded preview, not a later poll's transform.
+struct SplatPreviewTransform {
+    bool metric = false;
+    bool valid = true;
+    double mmPerUnit = 1.0;
+    std::array<double, 9> rotation{1,0,0, 0,1,0, 0,0,1};
+    std::array<double, 3> translation{0,0,0};
+};
+
 // Local Gaussian jobs are independent of the scaled CAD/mesh reconstruction mission.
 struct GaussianState {
     int mode = 0, quality = 1, iterations = 2000;
@@ -158,6 +168,7 @@ struct ScaleState {
     std::string curMethod;
     double      mmPerUnit   = 0.0;
     double      residualPct = 0.0;
+    bool        hasResidual = false;
     bool        confirmed   = false;
 };
 
@@ -205,7 +216,8 @@ struct DeliverState {
     int         matSize = 0;    // 0=A4, 1=Letter
     bool        matPending = false;
     std::string matErr;
-    std::string matPath;
+    std::string matPath;         // printable PDF
+    std::string matPreviewPath;  // PNG of the same page for the hero preview
 };
 
 // RE-40: mirror of reveng_status() — capability + provisioning probe (contracts/reveng.md §8.1).
@@ -214,6 +226,7 @@ struct DeliverState {
 struct CapabilityState {
     bool loaded  = false;
     bool pending = false;
+    bool manual  = false;   // a USER-requested re-check is in flight (background polls stay silent)
     double lastT = -100.0;
     std::string err;
 
@@ -233,17 +246,44 @@ struct CapabilityState {
     };
     std::vector<Artifact> artifacts;
     std::vector<std::string> banners;   // license / degradation notices
+
+    // reveng_install_tools: the app fetches Brush / OpenMVS itself (background thread in the
+    // worker; progress rides on reveng_status().install). autoTried: one automatic attempt per
+    // app run, so a failed download never loops.
+    bool installRunning = false;
+    bool installPending = false;   // reveng_install_tools RPC in flight
+    bool installAutoTried = false;
+    std::string installTool, installMsg, installErr;
+    double installDone = 0.0, installTotal = 0.0;
 };
 
-// RE-40: one entry of session.provenance[] (contracts/reveng.md §2). The backend appends a free
-// dict per pipeline step (`{"step": "n_reconstruct", "sparse_backend": …, "ts": …}`), so only
-// `step` and `ts` are structural — everything else is flattened into `detail` for display.
-// Rendered as the properties column's Provenance timeline: this is the audit trail that makes a
-// photo-derived model defensible ("where did this number come from?").
-struct ProvenanceRecord {
-    std::string step;    // "set_scale" | "n_reconstruct" | "n_fit" | "attach_result" | …
-    std::string ts;      // ISO-8601 when the record carries one; empty otherwise
-    std::string detail;  // remaining fields flattened to "k=v · k=v"
+// One existing CAD model found for a reference session (reveng_find_models candidates[]).
+struct ModelCandidate {
+    std::string title;
+    std::string site;
+    std::string url;
+    std::string confidence;  // "exact" | "strong" | "weak"
+};
+
+// Reference lane: search for an existing model first, then fall back to building one from
+// documents. Mirrors session.reference so a reopened session shows its last search.
+struct ReferenceState {
+    char queryBuf[512] = {};
+    // The search runs in the background on the worker (reference.status searching → done |
+    // failed); searchPending holds until the detail poll shows the result for searchQuery.
+    bool searchPending = false;
+    std::string searchQuery;
+    bool searched = false;          // a search result (live or mirrored) is on screen
+    std::string searchErr;
+    std::string hint;
+    std::vector<ModelCandidate> candidates;
+    std::string standardPart;       // "M3x10 socket head screw (iso4762)" when standard hardware
+    int sitesSearched = 0;
+
+    std::string usePendingKey;      // url or path being fetched; empty when idle
+    std::string useErr;
+    std::string modelPath;          // session.reference.model.path once a model is chosen
+    std::string modelSource;        // source_url or "local file"
 };
 
 // File-static store for the whole workspace. Async-load bookkeeping mirrors the parts /
@@ -256,6 +296,8 @@ struct RevEngState {
     // RE-30: active source lane (drives adaptive stepper + Sources panel).
     SourceMode sourceMode = SourceMode::Scan;
 
+    // Selected video for this session; opening a clip does not start extraction or training.
+    std::string sourceVideoPath;
     // New-session creation (rail affordance — RE UI polish).
     char        newNameBuf[128] = {};
     bool        newSessionPending = false;
@@ -272,17 +314,22 @@ struct RevEngState {
     std::vector<GalleryImage> galleryImages;
     int gallerySession = -1;        // selected index when gallery was last reset
 
-    // RE-30: reveng_research_source (Web lane) async state.
-    char researchQueryBuf[512] = {};
-    std::string researchQuery;
+    // RE-30: reveng_research_source (reference lane, build-from-documents fallback) async state.
+    // The query itself is ReferenceState::queryBuf — one box drives model search and research.
     std::string researchResult;
     std::string researchErr;
     bool researchPending = false;
 
-    // RE-30: reveng_ingest_datasheet (Datasheet lane) async state.
+    // RE-30: reveng_ingest_datasheet (reference lane, build-from-documents fallback) async state.
     std::string datasheetPath;
     std::string datasheetErr;
     bool datasheetPending = false;
+
+    // Reference lane (model search + chosen model). Reset on session switch.
+    ReferenceState ref;
+    // Session the lane was last auto-chosen for (from session.lane), so the detail poll picks the
+    // lane once per session instead of overriding the user's choice every few seconds.
+    std::string laneChosenFor;
 
     // Phone capture session (start_capture_session / stop_capture_session).
     bool        phonePending = false;
@@ -307,6 +354,18 @@ struct RevEngState {
     ModelState   model;
     DeliverState deliver;
 
+    // Display-space cloud and index-aligned native SfM coordinates for metric calibration.
+    std::vector<render::SparsePoint> sparsePoints;
+    std::vector<std::array<double, 3>> sparseNativePoints;
+    Vec3 sparseCenter;
+    float sparseRadius = 1.0f;
+    std::string sparsePreviewError;
+    std::shared_ptr<render::DocMesh> meshPreview;
+    std::shared_ptr<render::DocMesh> parametricPreview;
+    std::string meshPreviewError, parametricPreviewError;
+    uint64_t meshPreviewRevision = 0, parametricPreviewRevision = 0;
+    uint64_t sparsePreviewRevision = 0;
+
     // RE-21: GL overlay — point cloud + camera frusta. Owned here so it persists across frames.
     render::RePoints rePoints;
 
@@ -315,13 +374,20 @@ struct RevEngState {
     // draw() is a no-op until a cloud is loaded; safe to call every frame.
     render::SplatRenderer splat;
     bool splatLoaded = false;   // true once load() has been attempted for this session
+    bool splatPreviewCurrent = false;
     std::string splatPathTried; // path last load attempt used (avoid reloading same path)
+    render::RePoints splatPickMarks;
+    SplatPreviewTransform splatArtifactTransform, splatDisplayedTransform;
+    uint64_t splatPreviewRevision = 0;
 
     // Session detail mirror (from get_reveng_session) — artifact paths for Reconstruct.
     std::string detailSessionId;     // session_id the detail was fetched for
     std::string artifactSplatPath;   // absolute or session-relative splat .ply
     std::string artifactMeshPath;    // absolute or session-relative mesh
     std::string artifactSparseDir;
+    bool        artifactIsImportedSplat = false;
+    std::string splatImportLoss;
+    bool        splatUntransformed = false;
     bool        detailPending = false;
     double      lastDetailT = -100.0;
     std::string detailErr;
@@ -336,19 +402,21 @@ struct RevEngState {
     bool cannedFixtureLoaded = false;
 
     // ---- RE-40 overhaul: shell + preview state -------------------------------------------------
-    // Capability probe (reveng_status). Drives the properties-column capability panel, the
+    // Capability probe (reveng_status). Drives the Summary column's missing-tools card, the
     // Reconstruct stage's pre-flight gate, and the Sources stage's webcam availability copy.
     CapabilityState caps;
 
     // Session rail filter (substring match over name + session_id).
     char railFilterBuf[128] = {};
+    // Working folder the current list belongs to; a change re-lists and drops the selection.
+    std::string listedProject;
+    // True while a USER-requested refresh is in flight. Background polls never touch the
+    // Refresh button, so it does not flash every few seconds.
+    bool listManual = false;
 
     // Contact-sheet selection — the gallery drives the Scale stage's two-point picker and the
     // hero preview, so the selected index is shared workspace state rather than panel-local.
     int selectedImage = -1;
-
-    // Right column view: 0 = Session details, 1 = Capabilities, 2 = Provenance log.
-    int propsTab = 0;
 
     // User intent for the two side columns (rail / properties). The stage body always stays
     // visible; collapsing rolls a column to a header strip + chevron (same affordance as the pinned columns).
@@ -364,10 +432,6 @@ struct RevEngState {
     // session switch. Drives the TOP stage stepper's per-step colour + reachability, so the
     // wizard's progress indicator reflects real backend state instead of just where you clicked.
     StageState stages[kStageCount];
-
-    // RE-40: session.provenance[] mirror — the Provenance tab's timeline. Same lifetime as the
-    // stage mirror (filled by the detail poll, cleared on session switch).
-    std::vector<ProvenanceRecord> provenance;
 
     // RE-40: one-shot ribbon deep-link (see SourceFocus above). Set by handleRevEngCommand for
     // reveng_add_photos / reveng_add_video / reveng_webcam; CONSUMED AND CLEARED by
@@ -386,6 +450,7 @@ float valueChipW(const char* label, const char* value);
 void  flowSameLine(float rightX, float w, float gap);
 
 Renderer::CameraXform gaussianPreviewCamera(int width, int height);
+Renderer::CameraXform sparsePreviewCamera(int width, int height);
 
 // RE-21/RE-40: Apply one aicad.reveng_events/1 event to the singleton state.
 // Called from core::engineEventsTick()'s EventJournal tail (and from app.cpp's canned

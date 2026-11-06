@@ -17,9 +17,11 @@ const nlohmann::json NIL;
 // Starter-library symbol eng supply.rails, probed from
 // engine_oracle/ecad/library/starter.py at port time (2026-07-22).
 const std::map<std::string, nlohmann::json> kSymbolEngRails = {
-    {"Amplifier_Operational:OPAMP_dual", nlohmann::json::array({
+    {"Amplifier_Operational:LM358", nlohmann::json::array({
         rail("V+", 3.0, 5.0, 32.0, 0.0007, NIL)})},
-    {"Timer:NE555", nlohmann::json::array({
+    {"Timer:NE555D", nlohmann::json::array({
+        rail("VCC", 4.5, 5.0, 16.0, 0.003, NIL)})},
+    {"Timer:NE555P", nlohmann::json::array({
         rail("VCC", 4.5, 5.0, 16.0, 0.003, NIL)})},
     {"Regulator_Linear:AMS1117-3.3", nlohmann::json::array({
         rail("VIN", 4.75, 5.0, 12.0, 0.01, NIL),

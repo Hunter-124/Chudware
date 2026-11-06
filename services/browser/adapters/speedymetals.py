@@ -5,23 +5,21 @@ titles are richly structured (``6061-T6 Aluminum Round Tube 1" OD x 0.049"
 wall``), so ``acquire`` derives canonical stock params
 (:func:`~._retail.parse_stock_params`) — alloy, profile, od_mm/wall_mm/
 thickness_mm — from the title plus any spec table, instead of machining
-params. Challenge pages degrade to ``login_required`` — never solved.
+params. Search rows do not necessarily carry a price or quantity.
 
-Live-verified 2026-07-10: the real ASP.NET search is
-``/search.aspx?SearchTerm=<q>`` (HTTP 200; the old ``/search?q=`` guess 404'd).
-Results are a server-rendered table — NOT JSON-LD Products, so the default parse
-found nothing. Each row is ``<td><a href="p-<id>.aspx">Title</a></td>`` followed
-by Material and Shape cells; this adapter overrides :meth:`parse_search` to read
-them (hrefs are relative → joined onto ``base_url``). The catalog is browsable
-with no login; the header "Sign In" widget is a false wall marker and is dropped.
+The public search uses ``/search.aspx?SearchTerm=<q>`` and historically
+rendered product rows in a table. If it instead returns its blank search form
+without processing the supplied query, free-text search is unavailable; report
+that explicitly rather than pretending the query had no matches.
+The catalog is browsable without login; the header sign-in widget is not a wall.
 """
 from __future__ import annotations
 
 import re
-from urllib.parse import urljoin
+from html import unescape
 
-from . import register
-from ._retail import RetailAdapter, _strip_tags, parse_stock_params
+from . import abs_url, fail, register
+from ._retail import RetailAdapter, _strip_tags, card_image, parse_stock_params
 
 SITE = "speedymetals"
 BASE_URL = "https://www.speedymetals.com"
@@ -40,10 +38,19 @@ _LOGIN_WALL_MARKERS: tuple[str, ...] = ()
 _CHALLENGE_MARKERS = ("Access Denied", "Pardon Our Interruption")
 
 # Results table row: title anchor + Material cell + Shape cell.
-_ROW_RE = re.compile(
-    r'<a href="(?P<href>p-\d+[^"]*\.aspx)">(?P<title>[^<]+)</a>\s*</td>\s*'
-    r'<td[^>]*>(?P<material>[^<]*?)</td>\s*<td[^>]*>(?P<shape>[^<]*?)</td>',
+_ROW_RE = re.compile(r'<tr\b[^>]*>(?P<row>.*?)</tr>', re.IGNORECASE | re.DOTALL)
+_CELL_RE = re.compile(r'<td\b(?P<attrs>[^>]*)>(?P<body>.*?)</td>', re.IGNORECASE | re.DOTALL)
+_PART_RE = re.compile(
+    r'<a\b(?=[^>]*\bhref=["\'](?P<href>(?:https?://[^/]+/|/)?'
+    r'p-\d+[^"\']*?\.aspx(?:\?[^"\']*)?)["\'])[^>]*>(?P<title>.*?)</a>',
     re.IGNORECASE | re.DOTALL)
+_PRICE_RE = re.compile(r'^\s*\$\s*([0-9][0-9,]*(?:\.[0-9]{2})?)\s*$')
+_STOCK_CLASS_RE = re.compile(r'\bclass=["\'][^"\']*\bstock\b[^"\']*["\']', re.IGNORECASE)
+_BLANK_SEARCH_FORM = re.compile(
+    r'''<form\b(?=[^>]*\bname=["']SearchForm2["'])[^>]*>.*?'''
+    r'''<input\b(?=[^>]*\bname=["']SearchTerm["'])(?=[^>]*\bvalue=["']["'])[^>]*>''',
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 class SpeedyMetalsAdapter(RetailAdapter):
@@ -54,22 +61,46 @@ class SpeedyMetalsAdapter(RetailAdapter):
     login_wall_markers = _LOGIN_WALL_MARKERS
     challenge_markers = _CHALLENGE_MARKERS
 
+    def parse_search_page(self, content: str, final_url: str) -> list[dict]:
+        hits = self.parse_search(content)
+        if not hits and not self.is_no_results(content) and _BLANK_SEARCH_FORM.search(content):
+            return [fail(self.key, "search", "unsupported",
+                         "Speedy Metals returned its blank search form instead of processing the search query.",
+                         url=final_url)]
+        return hits
+
     def parse_search(self, content: str) -> list[dict]:
         hits: list[dict] = []
         seen: set[str] = set()
-        for m in _ROW_RE.finditer(content):
-            url = urljoin(self.base_url + "/", m.group("href"))
-            if url in seen:
+        for row_match in _ROW_RE.finditer(content or ""):
+            row = row_match.group("row")
+            cells = list(_CELL_RE.finditer(row))
+            for index, cell in enumerate(cells):
+                part = _PART_RE.search(cell.group("body"))
+                if part:
+                    break
+            else:
+                continue
+            if len(cells) <= index + 2:
+                continue
+            url = abs_url(BASE_URL + "/", unescape(part.group("href")))
+            title = unescape(_strip_tags(part.group("title")))
+            if not url or not title or url in seen:
                 continue
             seen.add(url)
-            title = _strip_tags(m.group("title"))
-            if not title:
-                continue
-            hit = {"ok": True, "title": title, "url": url, "site": SITE}
-            material = _strip_tags(m.group("material"))
-            shape = _strip_tags(m.group("shape"))
+            material = unescape(_strip_tags(cells[index + 1].group("body")))
+            shape = unescape(_strip_tags(cells[index + 2].group("body")))
+            hit = {"ok": True, "title": title, "url": url, "material": material or None,
+                   "thumbnail": card_image(row, BASE_URL)}
             if material or shape:
                 hit["category"] = " / ".join(x for x in (material, shape) if x)
+            for cell in cells[index + 3:]:
+                value = unescape(_strip_tags(cell.group("body")))
+                price = _PRICE_RE.fullmatch(value)
+                if price:
+                    hit["price"] = "$" + price.group(1)
+                elif _STOCK_CLASS_RE.search(cell.group("attrs")) and value.isdigit():
+                    hit["stock"] = int(value)
             hits.append(hit)
         return hits
 

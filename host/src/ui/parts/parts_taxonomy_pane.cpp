@@ -230,34 +230,6 @@ void drawTaxonomyPane(AppState& st, float paneW) {
     // full-width row below subtracts it so no pill is ever painted under the scrollbar.
     const float laneW = ui::metrics::px(ui::kChatScrollbarLane);
 
-    // Count rides in the header's trailing slot (never baked into the label) — nullptr while
-    // the tree is still loading so the header does not flash a "0".
-    char catCount[16];
-    const char* catTrailing = nullptr;
-    int rootCount = 0;
-    if (S().taxonomyIsTree) {
-        rootCount = (int)S().taxonomyRoot.children.size();
-    } else {
-        for (const auto& c : S().categories)
-            if (c.parentId.empty()) ++rootCount;
-    }
-    if (rootCount > 0) {
-        std::snprintf(catCount, sizeof(catCount), "%d", rootCount);
-        catTrailing = catCount;
-    }
-    // Header and rows share the same right edge; the trailing count must not
-    // occupy the pill scrollbar's reserved lane.
-    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(0, 0));
-    if (ImGui::BeginTable("##categories_header", 1,
-                         ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoPadOuterX |
-                         ImGuiTableFlags_NoPadInnerX,
-                         ImVec2(ImGui::GetContentRegionAvail().x - laneW, 0))) {
-        ImGui::TableNextColumn();
-        sectionHeader("Categories", /*firstInPane=*/true, "parts_all", catTrailing);
-        ImGui::EndTable();
-    }
-    ImGui::PopStyleVar();
-    ImGui::Dummy(ImVec2(0, 2.0f * sc));   // first row is not welded to the header rule
 
     // "All Parts" is not a taxonomy node, so it has no category hue — it wears the app accent,
     // which is exactly the "everything" colour the rest of the workspace already uses.

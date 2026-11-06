@@ -1,16 +1,20 @@
 ---
 title: Install on Linux
-description: Download the x86-64 Chudware build for Linux from GitHub Releases as an AppImage, a distribution package, or a plain archive.
+description: Linux desktop availability, configured x86-64 packages, and the experimental Docker Compose browser deployment.
 section: Installation
 order: 20
 ---
-## Get the current build
+## Current availability
 
-Open the [latest release on GitHub](https://github.com/Hunter-124/Chudware/releases/latest) and download the Linux x86-64 file that fits your system. No account is needed. GitHub shows a SHA-256 digest beside each asset; compare it with the output of `sha256sum` before you install.
+For the browser deployment, follow [self-hosting from source](/docs/self-hosting/) on a Linux x86-64 host. It uses Docker Compose and has single-operator and browser AI limitations.
+
+Public desktop installers are not yet available. Clone the [public MIT repository](https://github.com/Hunter-124/Chudware) and follow its [native build instructions](https://github.com/Hunter-124/Chudware#building-from-source). Supported desktop SDK and native runtime dependencies use pinned release assets in this same repository. [Contact the project](/contact/) about optional paid hosting.
+
+The formats below describe configured desktop packaging, not public downloads. When an official installer is published, compare its SHA-256 digest with `sha256sum` before installing it.
 
 ## AppImage
 
-The AppImage is one portable file with nothing to install. Mark it executable and run it:
+An AppImage is one portable file. For a trusted desktop release that actually includes it, mark that file executable and run it:
 
 ```sh
 chmod +x Chudware-*-linux-x86_64.AppImage
@@ -31,10 +35,10 @@ On Fedora and RHEL, install the `.rpm` with dnf (or zypper on openSUSE):
 sudo dnf install ./chudware-*.x86_64.rpm
 ```
 
-The `.tar.zst` archive runs on any distribution: unpack it and start Chudware from wherever you put it. Not every release carries every format; the release's asset list is authoritative.
+Use only packages actually listed in an official desktop release. The current release workflow targets AppImage, DEB, and RPM; an archive produced by a local packaging script is not a published release.
 
 ## Requirements and updates
 
 The build is 64-bit and needs a graphics driver capable of a modern hardware-accelerated 3D context; without one the application does not start.
 
-Chudware checks GitHub for newer releases and verifies each update's Ed25519 signature before staging it. Only install Chudware from the project's GitHub releases or a build you made [from source](https://github.com/Hunter-124/Chudware#building-from-source).
+The desktop updater verifies signed update manifests and each update's Ed25519 signature before staging it. This does not make unpublished builds available. Use a trusted source build or a verified official desktop release after publication; runtime-only prereleases are not desktop installers.

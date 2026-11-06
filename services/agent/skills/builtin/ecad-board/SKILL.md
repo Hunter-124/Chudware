@@ -27,10 +27,13 @@ triggers:
      counts + crossings / courtyard overlaps / unconnected multi-pad nets)
    - fix placement or re-route → re-read
    - before declaring the board done: `render_board_ascii` (full) + `ecad_run_drc` / DFM
-6. `ecad_to_3d` (or project equivalent) to merge into the mechanical assembly.
+6. Call `ecad_to_3d(doc_id=board_id)` to export a STEP and import a new CAD part.
+   Insert its returned `step_path` (or a saved native version) using
+   `asm_add_component(path=step_path, doc_id=assembly_id)`, then mate it.
 7. Validate: board-in-enclosure interference, connector mate alignment (`interface_check`),
    power budget if rails exist.
-8. Done: `verify_battery` including any ECAD/power checks wired for the doc.
+8. Request appropriate ECAD and power checks explicitly in `verify_battery`; inspect
+   `coverage.ran` and `coverage.skipped`. The default battery only covers its reported checks.
 
 ## Rules
 

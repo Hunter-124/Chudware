@@ -18,7 +18,7 @@ from __future__ import annotations
 import re
 
 from . import register
-from ._retail import RetailAdapter, _strip_tags
+from ._retail import RetailAdapter, _strip_tags, card_image
 
 SITE = "surpluscenter"
 BASE_URL = "https://www.surpluscenter.com"
@@ -49,6 +49,11 @@ _PRICE_RE = re.compile(
 
 class SurplusCenterAdapter(RetailAdapter):
     key = SITE
+    hosts = ("www.surpluscenter.com", "surpluscenter.com")
+    result_kinds = ("product",)
+    cad_acquisition = False
+    login_required = False
+    api = False
     base_url = BASE_URL
     search_url_tmpl = SEARCH_URL_TMPL
     license_note = LICENSE_NOTE
@@ -75,6 +80,7 @@ class SurplusCenterAdapter(RetailAdapter):
                 "title": _strip_tags(m.group("title")),
                 "url": url,
                 "site": SITE,
+                "thumbnail": card_image(block, url),
             }
             pid = _PID_RE.search(block)
             if pid:
@@ -82,6 +88,10 @@ class SurplusCenterAdapter(RetailAdapter):
             price = _PRICE_RE.search(block)
             if price:
                 hit["price"] = price.group("price")
+                hit["currency"] = "USD"
+            stock = re.search(r'([\d,]+)\s+In Stock', _strip_tags(block), re.I)
+            if stock:
+                hit["stock"] = stock.group(1)
             hits.append(hit)
         return hits
 

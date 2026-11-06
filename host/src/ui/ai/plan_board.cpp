@@ -140,6 +140,11 @@ std::string pbPlanAsText(const PlanState& ps) {
 void pbAfterEdit(AppState& st, const std::string& summary) {
     markChatHistoryDirty();
     for (auto& m : st.chat) m.uiCachedH = -1.0f;  // the plan card's height may change
+    ChatMsg* msg = pbActivePlanMsg(st);
+    if (msg) {
+        ++msg->revision;
+        chatLogMessageChanged(*msg);
+    }
     const std::string convId = st.activeConvId();
     std::string runId;
     if (st.workerStarted && aiTurnActive(st)) {
@@ -148,7 +153,6 @@ void pbAfterEdit(AppState& st, const std::string& summary) {
             runId = run->runId;
         }
     }
-    const ChatMsg* msg = pbActivePlanMsg(st);
     if (!runId.empty() && msg) {
         agentControlDispatch(st, runId,
                              "The user edited the plan: " + summary + ".\n" +
@@ -465,7 +469,7 @@ void pbDrawTimeline(AppState& st, const AdaptiveSurface& surf, int verbosity) {
         x += ImGui::CalcTextSize(kindTag).x + ui::metrics::cpMenuRowPadX();
 
         // Restore button (right edge) — inline click-again confirm, routes through the
-        // shared aiVcRollback (honors chat_truncate_to, refreshes mirror, toasts).
+        // shared aiVcRollback (geometry only: refreshes the mirror, toasts, leaves the chat alone).
         const bool armed = s_tl.confirmIdx == ri;
         const char* rbLabel = armed ? "Confirm?" : "Restore";
         const float rbW = ImGui::CalcTextSize(rbLabel).x + 16.0f * S +
@@ -594,7 +598,7 @@ void pbDrawPlanSection(AppState& st, const AdaptiveSurface& surf, int verbosity)
     }
     // Live progress line (the same one-liner the Copilot plan card shows).
     if (plan && !plan->items.empty()) {
-        const std::string prog = planProgressLine(*plan, msg->activity);
+        const std::string prog = planProgressLine(*msg);
         if (!prog.empty()) {
             ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
             ImGui::TextWrapped("%s", prog.c_str());

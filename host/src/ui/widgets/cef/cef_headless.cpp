@@ -9,6 +9,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -21,6 +22,8 @@
 #include "include/cef_render_handler.h"
 #include "include/cef_request.h"
 #include "include/cef_request_context.h"
+#include "include/cef_request_handler.h"
+#include "include/cef_resource_request_handler.h"
 #include "include/cef_response.h"
 #include "include/cef_string_visitor.h"
 #include "include/cef_urlrequest.h"
@@ -105,27 +108,52 @@ private:
 class FetchClient : public CefClient,
                     public CefRenderHandler,
                     public CefLifeSpanHandler,
-                    public CefLoadHandler {
+                    public CefLoadHandler,
+                    public CefRequestHandler,
+                    public CefResourceRequestHandler {
 public:
     CefRefPtr<CefRenderHandler>   GetRenderHandler() override   { return this; }
     CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
     CefRefPtr<CefLoadHandler>     GetLoadHandler() override     { return this; }
+    CefRefPtr<CefRequestHandler>  GetRequestHandler() override  { return this; }
 
     CefRefPtr<CefBrowser> browser() const { return browser_; }
     bool created() const { return created_; }
     bool loaded() const { return load_end_; }
+    uint64_t document_generation() const { return document_generation_; }
+    bool blank_loaded() const { return blank_loaded_; }
+    bool committed2xx() {
+        if (!load_started_) return false;
+        std::lock_guard<std::mutex> lock(response_mutex_);
+        return response_status_ >= 200 && response_status_ < 300;
+    }
     int  status() const { return status_; }
+    void copyResponse(FetchResult& out) {
+        std::lock_guard<std::mutex> lock(response_mutex_);
+        out.status = response_status_ ? response_status_ : status_;
+        out.retry_after = retry_after_;
+        out.final_url = final_url_;
+    }
 
     // Point the reused browser at a new URL and arm a fresh load wait.
     void navigate(const std::string& url) {
         load_end_ = false;
+        load_started_ = false;
+        blank_loaded_ = false;
         status_ = 0;
+        {
+            std::lock_guard<std::mutex> lock(response_mutex_);
+            recovering_ = (url == "about:blank");
+            response_status_ = 0;
+            retry_after_.clear();
+            final_url_ = url;
+        }
         if (browser_) if (CefRefPtr<CefFrame> f = browser_->GetMainFrame()) f->LoadURL(url);
     }
 
     // DIAGNOSTIC (login_probe): re-arm the load wait to catch a form-submit POST nav,
     // and run JS in the main frame via ExecuteJavaScript (no CDP/Runtime tell).
-    void armLoadWait() { load_end_ = false; status_ = 0; }
+    void armLoadWait() { load_end_ = false; load_started_ = false; status_ = 0; }
     void runJs(const std::string& js) {
         if (browser_) if (CefRefPtr<CefFrame> f = browser_->GetMainFrame())
             f->ExecuteJavaScript(js, f->GetURL(), 0);
@@ -143,9 +171,70 @@ public:
         created_ = true;
     }
 
-    // CefLoadHandler — only the real navigation counts, not the about:blank seed.
+    bool OnBeforeBrowse(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
+                        CefRefPtr<CefRequest> request, bool, bool is_redirect) override {
+        if (!frame->IsMain() || is_redirect) return false;
+        load_started_ = false;
+        load_end_ = false;
+        std::lock_guard<std::mutex> lock(response_mutex_);
+        if (!recovering_) {
+            response_status_ = 0;
+            retry_after_.clear();
+            final_url_ = request->GetURL().ToString();
+        }
+        return false;
+    }
+
+    CefRefPtr<CefResourceRequestHandler> GetResourceRequestHandler(
+        CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, CefRefPtr<CefRequest> request,
+        bool is_navigation, bool, const CefString&, bool&) override {
+        return is_navigation && request->GetResourceType() == RT_MAIN_FRAME ? this : nullptr;
+    }
+    void OnResourceRedirect(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>,
+                            CefRefPtr<CefRequest>, CefRefPtr<CefResponse> response,
+                            CefString& new_url) override {
+        std::lock_guard<std::mutex> lock(response_mutex_);
+        if (recovering_) return;
+        response_status_ = response->GetStatus();
+        retry_after_ = response->GetHeaderByName("Retry-After").ToString();
+        final_url_ = new_url.ToString();
+    }
+
+
+    bool OnResourceResponse(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>,
+                            CefRefPtr<CefRequest> request,
+                            CefRefPtr<CefResponse> response) override {
+        std::lock_guard<std::mutex> lock(response_mutex_);
+        if (recovering_) return false;
+        response_status_ = response->GetStatus();
+        retry_after_ = response->GetHeaderByName("Retry-After").ToString();
+        final_url_ = response->GetURL().ToString();
+        if (final_url_.empty()) final_url_ = request->GetURL().ToString();
+        return false;
+    }
+
+    // OnLoadStart is the commit barrier: a late OnLoadEnd from the previous
+    // document must never make a freshly requested URL eligible for capture.
+    void OnLoadStart(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame,
+                     TransitionType) override {
+        if (!frame->IsMain()) return;
+        ++document_generation_;
+        load_end_ = false;
+        const std::string url = frame->GetURL().ToString();
+        std::lock_guard<std::mutex> lock(response_mutex_);
+        started_blank_ = recovering_;
+        load_started_ = started_blank_ ? url == "about:blank"
+                                       : url.rfind("about:", 0) != 0;
+    }
+
     void OnLoadEnd(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame, int http) override {
-        if (frame->IsMain() && frame->GetURL().ToString().rfind("about:", 0) != 0) {
+        if (!frame->IsMain()) return;
+        const std::string url = frame->GetURL().ToString();
+        if (!load_started_) return;
+        if (started_blank_) {
+            if (url != "about:blank") return;
+            blank_loaded_ = true;
+        } else {
             status_ = http;
             load_end_ = true;
         }
@@ -154,7 +243,16 @@ public:
 private:
     bool created_ = false;
     bool load_end_ = false;
+    bool load_started_ = false;
+    bool blank_loaded_ = false;
+    uint64_t document_generation_ = 0;
+    bool started_blank_ = false;
     int  status_ = 0;
+    std::mutex response_mutex_;
+    bool recovering_ = true;
+    int response_status_ = 0;
+    std::string retry_after_;
+    std::string final_url_ = "about:blank";
     CefRefPtr<CefBrowser> browser_;
     CefRefPtr<CefRegistration> stealth_reg_;  // keeps the DevTools agent attached
     IMPLEMENT_REFCOUNTING(FetchClient);
@@ -290,11 +388,9 @@ uint64_t dom_hash(const std::string& s) {
     return h;
 }
 
-// One pooled browser. `busy` = owned by a live job or a synchronous headless_*
-// call. `free_at` parks a browser that was abandoned mid-flight (deadline abort,
-// nav timeout, scripted interact) until its cancel-to-about:blank has certainly
-// quiesced — that is the ONLY path by which one request could ever observe
-// another request's DOM, and this is where it is closed.
+// An abandoned browser is parked until both its abort cooldown and the
+// about:blank commit/load barrier have completed. A timer alone cannot prove
+// that callbacks or the previous document have quiesced.
 struct PoolEntry {
     CefRefPtr<FetchClient> client;
     bool busy = false;
@@ -318,8 +414,8 @@ CefRefPtr<FetchClient> spawn_client(const std::string& profile_dir) {
     if (!CefBrowserHost::CreateBrowser(window_info, client, "about:blank", settings,
                                        nullptr, make_context(profile_dir)))
         return nullptr;
-    for (int i = 0; i < 500 && !client->created(); ++i) pump(20);
-    return client->created() ? client : nullptr;
+    for (int i = 0; i < 500 && (!client->created() || !client->blank_loaded()); ++i) pump(20);
+    return client->created() && client->blank_loaded() ? client : nullptr;
 }
 
 // Reserve an idle browser, growing the pool on demand. Returns the entry index,
@@ -329,7 +425,12 @@ int acquire_slot(const std::string& profile_dir) {
     std::vector<PoolEntry>& v = pool_map()[profile_dir];
     const steady::time_point now = steady::now();
     for (size_t i = 0; i < v.size(); ++i)
-        if (!v[i].busy && now >= v[i].free_at) { v[i].busy = true; return static_cast<int>(i); }
+        if (!v[i].busy && now >= v[i].free_at &&
+            (v[i].free_at == steady::time_point{} || v[i].client->blank_loaded())) {
+            v[i].busy = true;
+            v[i].free_at = {};
+            return static_cast<int>(i);
+        }
     // Headroom above the in-flight cap for entries still cooling after an abort.
     if (static_cast<int>(v.size()) >= headless_max_inflight() + 4) return -1;
     CefRefPtr<FetchClient> c = spawn_client(profile_dir);
@@ -338,18 +439,17 @@ int acquire_slot(const std::string& profile_dir) {
     return static_cast<int>(v.size() - 1);
 }
 
-// Hand a browser back. `dirty` = abandoned with a load possibly still running:
-// cancel it (LoadURL about:blank aborts the pending navigation in Blink) and park
-// the entry for a cooldown so a late OnLoadEnd cannot be read as the next
-// tenant's load-end.
+// Every slot crosses a completed about:blank navigation before reuse. Dirty
+// slots also wait out the abort cooldown.
 void release_slot(const std::string& profile_dir, int idx, bool dirty) {
     auto it = pool_map().find(profile_dir);
     if (it == pool_map().end()) return;
     std::vector<PoolEntry>& v = it->second;
     if (idx < 0 || idx >= static_cast<int>(v.size())) return;
-    if (dirty && v[idx].client) {
+    if (v[idx].client) {
         v[idx].client->navigate("about:blank");
-        v[idx].free_at = steady::now() + std::chrono::milliseconds(kAbortCooldownMs);
+        v[idx].free_at = steady::now() +
+                         std::chrono::milliseconds(dirty ? kAbortCooldownMs : 0);
     }
     v[idx].busy = false;
 }
@@ -409,19 +509,33 @@ public:
     bool step() {
         if (state_ == State::Finished) return true;
         const steady::time_point now = steady::now();
+        // A page may navigate itself while settling or while GetSource is in
+        // flight. Discard that snapshot and wait for the new committed document
+        // instead of either returning stale HTML or failing a valid redirect.
+        if ((state_ == State::Settling || state_ == State::Capturing) &&
+            (!client_->loaded() || client_->document_generation() != settle_generation_)) {
+            visitor_ = nullptr;
+            last_hash_ = 0;
+            state_ = State::Navigating;
+            t_state_ = now;
+        }
         switch (state_) {
         case State::Navigating:
             if (client_->loaded()) {
                 t_settle_ = now;
                 t_probe_  = now;
+                settle_generation_ = client_->document_generation();
                 t_quiet_  = now;
                 state_    = State::Settling;
                 if (settle_ms_ == 0) { state_ = State::Capturing; t_state_ = now; beginProbe(); }
             } else if (ms_between(t_state_, now) >= kNavTimeoutMs) {
-                // The navigation never completed. Do NOT hand back the reused
-                // browser's stale previous-page DOM as success — fail so the
-                // caller degrades/retries (unchanged from the serial path).
-                finishFail();
+                if (!client_->committed2xx()) { finishFail(); break; }
+                state_ = State::Partial;
+                t_state_ = now;
+                probe_generation_ = client_->document_generation();
+                partial_token_ = std::to_string(reinterpret_cast<uintptr_t>(this)) + "-" +
+                                 std::to_string(probe_generation_);
+                beginPartialProbe();
             }
             break;
 
@@ -460,6 +574,26 @@ public:
             else if (ms_between(t_state_, now) >= kCaptureTimeoutMs) finishFail();
             break;
 
+        case State::Partial:
+            if (client_->document_generation() != probe_generation_ || !client_->committed2xx()) {
+                finishFail();
+            } else if (visitor_ && visitor_->done()) {
+                std::string html = visitor_->html();
+                visitor_ = nullptr;
+                const std::string marker = " data-chudware-partial-ready=\"" + partial_token_ + "\"";
+                const size_t pos = html.find(marker);
+                if (pos != std::string::npos) {
+                    html.erase(pos, marker.size());
+                    finishOk(html, /*partial=*/true);
+                }
+            }
+            if (state_ == State::Partial) {
+                if (ms_between(t_state_, now) >= kCaptureTimeoutMs) finishFail();
+                else if (!visitor_ && ms_between(t_probe_, now) >= kProbeSliceMs)
+                    beginPartialProbe();
+            }
+            break;
+
         case State::Finished:
             break;
         }
@@ -477,35 +611,64 @@ public:
     }
 
 private:
-    enum class State { Navigating, Settling, Capturing, Finished };
+    enum class State { Navigating, Settling, Capturing, Partial, Finished };
 
     void beginProbe() {
         if (visitor_) return;
         CefRefPtr<CefBrowser> b = client_->browser();
         CefRefPtr<CefFrame> f = b ? b->GetMainFrame() : nullptr;
         if (!f) { finishFail(); return; }
+        if (!client_->loaded()) { finishFail(); return; }
+        probe_generation_ = client_->document_generation();
         visitor_ = new SourceVisitor();
         f->GetSource(visitor_);           // async — completes under the shared pump
         t_probe_ = steady::now();
     }
+    void beginPartialProbe() {
+        CefRefPtr<CefBrowser> b = client_->browser();
+        CefRefPtr<CefFrame> f = b ? b->GetMainFrame() : nullptr;
+        if (!f) { finishFail(); return; }
+        client_->runJs("if (document.readyState !== 'loading' && document.documentElement) "
+                       "document.documentElement.setAttribute('data-chudware-partial-ready','" +
+                       partial_token_ + "');");
+        visitor_ = new SourceVisitor();
+        f->GetSource(visitor_);
+        t_probe_ = steady::now();
+    }
 
-    void finishOk(const std::string& html) {
+    void clearPartialMarker() {
+        client_->runJs("if (document.documentElement) "
+                       "document.documentElement.removeAttribute('data-chudware-partial-ready');");
+    }
+
+    void finishOk(const std::string& html, bool partial = false) {
+        if ((!partial && !client_->loaded()) || client_->document_generation() != probe_generation_ ||
+            (partial && !client_->committed2xx())) {
+            finishFail();
+            return;
+        }
+        if (partial) {
+            clearPartialMarker();
+            dirty_ = true;  // unfinished subresources must be canceled before reuse
+            result_.partial_load = true;
+        }
         result_.ok     = true;
         result_.html   = html;
-        result_.status = client_->status();
-        if (CefRefPtr<CefBrowser> b = client_->browser())
-            if (CefRefPtr<CefFrame> f = b->GetMainFrame())
-                result_.final_url = f->GetURL().ToString();
+        client_->copyResponse(result_);
         state_ = State::Finished;
     }
 
     void finishFail() {
-        result_ = FetchResult{};
+        if (state_ == State::Partial) clearPartialMarker();
+        client_->copyResponse(result_);
         dirty_  = true;      // a load may still be running — cancel + cool the browser
         state_  = State::Finished;
     }
 
     std::string profile_;
+    std::string partial_token_;
+    uint64_t    settle_generation_ = 0;
+    uint64_t    probe_generation_ = 0;
     int         slot_ = -1;
     CefRefPtr<FetchClient> client_;
     std::string url_;
@@ -563,7 +726,7 @@ FetchResult headless_login_probe(const std::string& url, const std::string& fill
 
     client->navigate(url);
     for (int i = 0; i < 500 && !client->loaded(); ++i) pump(20);
-    if (!client->loaded()) return out;
+    if (!client->loaded()) { client->copyResponse(out); return out; }
     if (settle_ms > 0) pump(settle_ms);      // let form_key + reCAPTCHA arm
 
     // Inject TRUSTED human interaction before submitting: reCAPTCHA weights mouse
@@ -605,11 +768,10 @@ FetchResult headless_login_probe(const std::string& url, const std::string& fill
             if (visitor->done()) {
                 out.ok = true;
                 out.html = visitor->html();
-                out.status = client->status();
-                out.final_url = frame->GetURL().ToString();
             }
         }
     }
+    client->copyResponse(out);
     return out;
 }
 
@@ -640,7 +802,7 @@ FetchResult headless_interact(const std::string& url, const std::string& script,
 
     client->navigate(url);
     for (int i = 0; i < 500 && !client->loaded(); ++i) pump(20);
-    if (!client->loaded()) return out;
+    if (!client->loaded()) { client->copyResponse(out); return out; }
 
     // Mark the windowless browser visible/focused so visibility-gated SPA code runs
     // (document.visibilityState='visible'), then let the page settle before the
@@ -671,10 +833,8 @@ FetchResult headless_interact(const std::string& url, const std::string& script,
     if (client->browser()) {
         out.ok = true;
         out.html = html;
-        out.status = client->status();
-        if (CefRefPtr<CefFrame> f = client->browser()->GetMainFrame())
-            out.final_url = f->GetURL().ToString();
     }
+    client->copyResponse(out);
     return out;
 }
 
@@ -687,9 +847,11 @@ void headless_close_all() {
     pool_map().clear();
 }
 
-bool headless_download(const std::string& url, const std::string& dest_path,
-                       const std::string& profile_dir) {
-    if (tenant_cell() || !initialized()) return false;
+DownloadResult headless_download(const std::string& url, const std::string& dest_path,
+                                 const std::string& profile_dir) {
+    DownloadResult out;
+    out.final_url = url;
+    if (tenant_cell() || !initialized()) return out;
 
     CefRefPtr<CefRequest> request = CefRequest::Create();
     request->SetURL(url);
@@ -702,20 +864,24 @@ bool headless_download(const std::string& url, const std::string& dest_path,
     CefRefPtr<CefURLRequest> req =
         CefURLRequest::Create(request, client, make_context(profile_dir));
 
-    if (!req) return false;
+    if (!req) return out;
     while (!client->done() && !client->idle()) pump(10);
-    if (!client->done()) { req->Cancel(); return false; }
-    if (client->too_large() || req->GetRequestStatus() != UR_SUCCESS) return false;
-
-    int status = 0;
-    if (CefRefPtr<CefResponse> resp = req->GetResponse()) status = resp->GetStatus();
-    if (status < 200 || status >= 300 || client->bytes().empty()) return false;
+    if (CefRefPtr<CefResponse> resp = req->GetResponse()) {
+        out.status = resp->GetStatus();
+        out.retry_after = resp->GetHeaderByName("Retry-After").ToString();
+        const std::string resolved = resp->GetURL().ToString();
+        if (!resolved.empty()) out.final_url = resolved;
+    }
+    if (!client->done()) { req->Cancel(); return out; }
+    if (client->too_large() || req->GetRequestStatus() != UR_SUCCESS) return out;
+    if (out.status < 200 || out.status >= 300 || client->bytes().empty()) return out;
 
     std::ofstream f(dest_path, std::ios::binary);
-    if (!f) return false;
+    if (!f) return out;
     f.write(reinterpret_cast<const char*>(client->bytes().data()),
             static_cast<std::streamsize>(client->bytes().size()));
-    return static_cast<bool>(f);
+    out.ok = static_cast<bool>(f);
+    return out;
 }
 
 namespace {

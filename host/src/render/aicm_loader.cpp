@@ -92,6 +92,111 @@ struct Cursor {
     }
 };
 
+void prepareDerivedMesh(DocMesh& doc) {
+    size_t faceCount = 0, edgeCount = 0;
+    for (const auto& b : doc.bodies) {
+        faceCount += b.faces.size();
+        edgeCount += b.edges.size();
+    }
+    doc.faceNormalCache.reserve(faceCount);
+    doc.faceBBoxCache.reserve(faceCount);
+    doc.edgeCentroidCache.reserve(edgeCount);
+    doc.bodyBBoxCache.reserve(doc.bodies.size());
+    for (auto& b : doc.bodies) {
+        b.faceIds.assign(b.pos.size() / 3, 0u);
+        Vec3 mn(1e30f, 1e30f, 1e30f), mx(-1e30f, -1e30f, -1e30f);
+        for (size_t i = 0; i + 2 < b.pos.size(); i += 3) {
+            mn.x = std::min(mn.x, b.pos[i]); mx.x = std::max(mx.x, b.pos[i]);
+            mn.y = std::min(mn.y, b.pos[i + 1]); mx.y = std::max(mx.y, b.pos[i + 1]);
+            mn.z = std::min(mn.z, b.pos[i + 2]); mx.z = std::max(mx.z, b.pos[i + 2]);
+        }
+        if (!b.pos.empty())
+            doc.bodyBBoxCache[b.body_id] = {mn.x, mn.y, mn.z, mx.x, mx.y, mx.z};
+        for (const auto& fr : b.faces) {
+            float nx = 0, ny = 0, nz = 0, cx = 0, cy = 0, cz = 0, totalArea = 0;
+            float fmn[3] = {1e30f, 1e30f, 1e30f}, fmx[3] = {-1e30f, -1e30f, -1e30f};
+            bool any = false;
+            // Same encoding as IdPass::encodeId: body[31:20], kind[19:18], topo[17:0].
+            const uint32_t id = (b.body_id << 20) | (1u << 18) | fr.face_id;
+            for (uint32_t t = 0; t < fr.tri_count; ++t) {
+                const size_t base = (size_t(fr.first_tri) + t) * 3;
+                if (base + 2 >= b.idx.size()) break;
+                const uint32_t i0 = b.idx[base], i1 = b.idx[base + 1], i2 = b.idx[base + 2];
+                const float* p0 = &b.pos[size_t(i0) * 3];
+                const float* p1 = &b.pos[size_t(i1) * 3];
+                const float* p2 = &b.pos[size_t(i2) * 3];
+                b.faceIds[i0] = id; b.faceIds[i1] = id; b.faceIds[i2] = id;
+                for (const float* p : {p0, p1, p2}) {
+                    for (int c = 0; c < 3; ++c) {
+                        fmn[c] = std::min(fmn[c], p[c]);
+                        fmx[c] = std::max(fmx[c], p[c]);
+                    }
+                }
+                any = true;
+                const float e1x = p1[0]-p0[0], e1y = p1[1]-p0[1], e1z = p1[2]-p0[2];
+                const float e2x = p2[0]-p0[0], e2y = p2[1]-p0[1], e2z = p2[2]-p0[2];
+                const float crx = e1y*e2z - e1z*e2y;
+                const float cry = e1z*e2x - e1x*e2z;
+                const float crz = e1x*e2y - e1y*e2x;
+                const float area = std::sqrt(crx*crx + cry*cry + crz*crz);
+                nx += crx; ny += cry; nz += crz;
+                cx += (p0[0]+p1[0]+p2[0]) * (1.0f/3.0f) * area;
+                cy += (p0[1]+p1[1]+p2[1]) * (1.0f/3.0f) * area;
+                cz += (p0[2]+p1[2]+p2[2]) * (1.0f/3.0f) * area;
+                totalArea += area;
+            }
+            const uint64_t key = (uint64_t(b.body_id) << 32) | fr.face_id;
+            if (any) doc.faceBBoxCache[key] = {fmn[0], fmn[1], fmn[2], fmx[0], fmx[1], fmx[2]};
+            const float len = std::sqrt(nx*nx + ny*ny + nz*nz);
+            if (len < 1e-12f) continue;
+            if (totalArea > 1e-12f) { cx /= totalArea; cy /= totalArea; cz /= totalArea; }
+            doc.faceNormalCache[key] = {nx/len, ny/len, nz/len, cx, cy, cz};
+        }
+        size_t segments = 0;
+        for (const auto& es : b.edges)
+            if (es.pt_count > 1) segments += size_t(es.pt_count) - 1;
+        b.edgeLines.reserve(segments * 6);
+        b.edgeIds.reserve(segments * 2);
+        for (const auto& es : b.edges) {
+            double cx = 0, cy = 0, cz = 0;
+            const uint32_t id = (b.body_id << 20) | (2u << 18) | es.edge_id;
+            for (uint32_t p = 0; p < es.pt_count; ++p) {
+                const float* a = &b.edge_pts[(size_t(es.first_pt) + p) * 3];
+                cx += a[0]; cy += a[1]; cz += a[2];
+                if (p + 1 < es.pt_count) {
+                    const float* next = a + 3;
+                    b.edgeLines.insert(b.edgeLines.end(),
+                        {a[0], a[1], a[2], next[0], next[1], next[2]});
+                    b.edgeIds.push_back(id);
+                    b.edgeIds.push_back(id);
+                }
+            }
+            if (es.pt_count)
+                doc.edgeCentroidCache[(uint64_t(b.body_id) << 32) | es.edge_id] =
+                    {float(cx/es.pt_count), float(cy/es.pt_count), float(cz/es.pt_count)};
+        }
+        b.vertexPoints.reserve(b.brep_verts.size() * 3);
+        b.vertexIds.reserve(b.brep_verts.size());
+        for (const auto& v : b.brep_verts) {
+            b.vertexPoints.insert(b.vertexPoints.end(), {v.xyz[0], v.xyz[1], v.xyz[2]});
+            b.vertexIds.push_back((b.body_id << 20) | (3u << 18) | v.vertex_id);
+        }
+        if (!b.pos.empty()) {
+            b.shadedMesh.positions = b.pos;
+            b.shadedMesh.normals = b.nrm;
+            b.shadedMesh.indices = b.idx;
+            b.shadedMesh.edgeLines = b.edgeLines;
+            b.shadedMesh.bbMin = mn;
+            b.shadedMesh.bbMax = mx;
+            b.shadedMesh.center = (mn + mx) * 0.5f;
+            b.shadedMesh.radius = std::max(0.001f, length(mx - mn) * 0.5f);
+        }
+    }
+    for (auto& field : doc.scalars) field.valueCount = field.values.size();
+    for (auto& field : doc.displacements) field.vectorSize = field.vec.size();
+    doc.derivedReady = true;
+}
+
 }  // namespace
 
 bool parseAicm(const uint8_t* data, size_t size, DocMesh& out, std::string& err) {
@@ -401,6 +506,7 @@ bool parseAicm(const uint8_t* data, size_t size, DocMesh& out, std::string& err)
         body->appearance_regions = std::move(regions);
     }
 
+    prepareDerivedMesh(mesh);
     out = std::move(mesh);
     return true;
 }

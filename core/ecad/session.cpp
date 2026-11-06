@@ -6,11 +6,16 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <set>
@@ -36,14 +41,12 @@ namespace fs = std::filesystem;
 #include "ecad/dfm.h"
 #include "ecad/drc.h"
 #include "ecad/erc.h"
-#include "ecad/fabformats.h"
 #include "ecad/impedance.h"
 #include "ecad/kicad.h"
+#include "ecad/kicad_libs.h"
 #include "ecad/netlist.h"
 #include "ecad/recipes.h"
 #include "ecad/schema.h"
-#include "ecad/schexport.h"
-#include "ecad/schplot.h"
 #include "ecad/symlib.h"
 #include "ecad/sync.h"
 #include "ecad/zonefill.h"
@@ -59,18 +62,34 @@ namespace {
 
 constexpr std::size_t kUndoLimit = 100;
 
+struct FileStamp {
+    bool exists = false;
+    std::uintmax_t size = 0;
+    std::int64_t mtime = 0;
+    std::uint64_t hash = 0;
+};
+
+bool operator==(const FileStamp& a, const FileStamp& b) {
+    return a.exists == b.exists && (!a.exists ||
+        (a.size == b.size && a.mtime == b.mtime && a.hash == b.hash));
+}
+bool operator!=(const FileStamp& a, const FileStamp& b) { return !(a == b); }
+
 struct Session {
     std::string doc_id;
     json doc;
     long revision = 0;
-    std::string path;          // native .ecad+ save target ("" until first save)
-    std::string source_path;   // foreign file this doc was imported from ("" if native)
-    std::string source_format;  // "kicad_sch" | "kicad_pcb" | "" (native)
+    std::string path;
+    FileStamp stamp;
+    FileStamp project_stamp;
+    FileStamp rules_stamp;
+    json project_document = nullptr;
+    std::string custom_rules;
+    json saved_settings = nullptr;
     bool dirty = false;
-    std::vector<std::string> undo_stack;  // canonical JSON snapshots (doc only)
+    std::vector<std::string> undo_stack;
     std::vector<std::string> redo_stack;
     json last_compile = nullptr;
-    std::map<std::string, std::string> extra_entries;  // unknown .ecad+ entries (verbatim)
 };
 
 std::mutex g_mtx;
@@ -124,20 +143,586 @@ Session& require_session(const std::string& doc_id) {
     auto it = g_sessions.find(doc_id);
     if (it == g_sessions.end())
         throw OpError("unknown_doc", "no open ECAD document '" + doc_id + "'", {{"doc_id", doc_id}});
+    const fs::path bound = fs::u8path(it->second.path);
+    kicad_libs::set_project_dir(bound.empty() ? std::string() :
+                                fs::absolute(bound).parent_path().u8string());
     return it->second;
 }
+
+[[noreturn]] void file_error(const std::string& message, const fs::path& path) {
+    throw OpError("io_error", message + ": " + path.u8string(), {{"path", path.u8string()}});
+}
+
+std::string extension(const fs::path& path) {
+    std::string out = path.extension().u8string();
+    std::transform(out.begin(), out.end(), out.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return out;
+}
+
+bool same_path(const fs::path& a, const fs::path& b) {
+    std::error_code ec1, ec2;
+    const auto ca = fs::weakly_canonical(a, ec1);
+    const auto cb = fs::weakly_canonical(b, ec2);
+    return !ec1 && !ec2 ? ca == cb : a.lexically_normal() == b.lexically_normal();
+}
+
+std::uint64_t content_hash(const std::string& bytes) {
+    std::uint64_t hash = 14695981039346656037ULL;
+    for (unsigned char byte : bytes) {
+        hash ^= byte;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+FileStamp file_stamp(const fs::path& path) {
+    std::error_code ec;
+    FileStamp result;
+    result.exists = fs::exists(path, ec);
+    if (ec) file_error("cannot stat ECAD file", path);
+    if (!result.exists) return result;
+    result.size = fs::file_size(path, ec);
+    if (ec) file_error("cannot stat ECAD file", path);
+    const auto time = fs::last_write_time(path, ec);
+    if (ec) file_error("cannot stat ECAD file", path);
+    result.mtime = static_cast<std::int64_t>(time.time_since_epoch().count());
+    std::ifstream in(path, std::ios::binary);
+    if (!in) file_error("cannot read ECAD file", path);
+    result.hash = 14695981039346656037ULL;
+    char buffer[65536];
+    std::uintmax_t read = 0;
+    while (in) {
+        in.read(buffer, sizeof(buffer));
+        const auto count = in.gcount();
+        read += static_cast<std::uintmax_t>(count);
+        for (std::streamsize i = 0; i < count; ++i) {
+            result.hash ^= static_cast<unsigned char>(buffer[i]);
+            result.hash *= 1099511628211ULL;
+        }
+    }
+    if (in.bad()) file_error("cannot read ECAD file", path);
+    const auto size_after = fs::file_size(path, ec);
+    if (ec) file_error("ECAD file changed while reading", path);
+    const auto time_after = fs::last_write_time(path, ec);
+    if (ec || read != result.size || size_after != result.size || time_after != time)
+        file_error("ECAD file changed while reading", path);
+    return result;
+}
+
+json stamp_json(const FileStamp& stamp) {
+    return {{"exists", stamp.exists}, {"size", stamp.size}, {"mtime", stamp.mtime},
+            {"hash", std::to_string(stamp.hash)}};
+}
+
+FileStamp stamp_from_json(const json& data) {
+    FileStamp stamp;
+    if (!data.is_object()) return stamp;
+    try {
+        stamp.exists = data.value("exists", false);
+        stamp.size = data.value("size", std::uintmax_t{0});
+        stamp.mtime = data.value("mtime", std::int64_t{0});
+        stamp.hash = std::stoull(data.value("hash", std::string("0")));
+    } catch (const std::exception&) {
+        throw OpError("io_error", "invalid ECAD recovery fingerprint");
+    }
+    return stamp;
+}
+
+bool kicad_locked(const fs::path& path) {
+    if (path.empty()) return false;
+    std::error_code ec;
+    const auto lock = path.parent_path() / fs::u8path("~" + path.filename().u8string() + ".lck");
+    const bool exists = fs::exists(lock, ec);
+    if (ec) file_error("cannot inspect KiCad lock", lock);
+    return exists;
+}
+
+void ensure_parent(const fs::path& path) {
+    const fs::path parent = path.has_parent_path() ? path.parent_path() : fs::path(".");
+    std::error_code ec;
+    fs::create_directories(parent, ec);
+    if (ec) file_error("cannot create ECAD directory", parent);
+}
+
+// Stage in the destination directory, sync, and publish atomically. The optional
+// final check closes the serialization window for lock/conflict detection.
+void atomic_write(const fs::path& path, const std::string& bytes,
+                  const std::function<void()>& before_commit = {}, bool if_missing = false,
+                  bool fail_if_exists = false) {
+    ensure_parent(path);
+    static std::atomic<unsigned long long> seq{0};
+    fs::path stage;
+#ifdef _WIN32
+    HANDLE file = INVALID_HANDLE_VALUE;
+    for (;;) {
+        stage = path;
+        stage += ".tmp." + std::to_string(GetCurrentProcessId()) + "." +
+                 std::to_string(seq.fetch_add(1));
+        file = CreateFileW(stage.wstring().c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file != INVALID_HANDLE_VALUE) break;
+        if (GetLastError() != ERROR_FILE_EXISTS) file_error("cannot create ECAD stage", stage);
+    }
+    bool ok = true;
+    for (std::size_t pos = 0; ok && pos < bytes.size();) {
+        DWORD written = 0;
+        const DWORD n = static_cast<DWORD>(std::min<std::size_t>(bytes.size() - pos, 65536));
+        ok = WriteFile(file, bytes.data() + pos, n, &written, nullptr) && written > 0;
+        pos += written;
+    }
+    ok = ok && FlushFileBuffers(file);
+    ok = CloseHandle(file) && ok;
+#else
+    int file = -1;
+    for (;;) {
+        stage = path;
+        stage += ".tmp." + std::to_string(getpid()) + "." +
+                 std::to_string(seq.fetch_add(1));
+        file = ::open(stage.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0666);
+        if (file >= 0) break;
+        if (errno != EEXIST) file_error("cannot create ECAD stage", stage);
+    }
+    bool ok = true;
+    for (std::size_t pos = 0; ok && pos < bytes.size();) {
+        const auto n = ::write(file, bytes.data() + pos, bytes.size() - pos);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) ok = false;
+        else pos += static_cast<std::size_t>(n);
+    }
+    if (ok) ok = ::fsync(file) == 0;
+    if (::close(file) != 0) ok = false;
+#endif
+    if (!ok) {
+        std::error_code ec;
+        fs::remove(stage, ec);
+        file_error("cannot write ECAD stage", stage);
+    }
+    try {
+        if (before_commit) before_commit();
+#ifdef _WIN32
+        const DWORD flags = MOVEFILE_WRITE_THROUGH | (if_missing ? 0 : MOVEFILE_REPLACE_EXISTING);
+        if (!MoveFileExW(stage.wstring().c_str(), path.wstring().c_str(), flags)) {
+            if (!if_missing || fail_if_exists || (GetLastError() != ERROR_ALREADY_EXISTS &&
+                                                   GetLastError() != ERROR_FILE_EXISTS))
+                file_error("cannot replace ECAD file", path);
+        }
+#else
+        if (if_missing) {
+            if (::link(stage.c_str(), path.c_str()) != 0 && (errno != EEXIST || fail_if_exists))
+                file_error("cannot create ECAD file", path);
+        } else if (::rename(stage.c_str(), path.c_str()) != 0) {
+            file_error("cannot replace ECAD file", path);
+        }
+        const fs::path parent = path.has_parent_path() ? path.parent_path() : fs::path(".");
+        int dir = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY);
+        if (dir < 0) file_error("cannot sync ECAD directory", parent);
+        const bool synced = ::fsync(dir) == 0;
+        const bool closed = ::close(dir) == 0;
+        if (!synced || !closed) file_error("cannot sync ECAD directory", parent);
+#endif
+    } catch (...) {
+        std::error_code ec;
+        fs::remove(stage, ec);
+        throw;
+    }
+    std::error_code ec;
+    fs::remove(stage, ec);
+}
+
+void ensure_project(const fs::path& document, bool require_missing = false) {
+    fs::path project = document;
+    project.replace_extension(".kicad_pro");
+    if (fs::exists(project)) {
+        if (require_missing)
+            throw OpError("io_error", "ecad_new_project: file already exists",
+                          {{"path", project.u8string()}});
+        return;
+    }
+    auto check_lock = [&]() {
+        if (kicad_locked(project))
+            throw OpError("kicad_locked", "KiCad has the project file open",
+                          {{"path", project.u8string()}});
+    };
+    check_lock();
+    const json data = {
+        {"board", {{"design_settings", {{"defaults", json::object()},
+            {"diff_pair_dimensions", json::array()}, {"drc_exclusions", json::array()},
+            {"rules", json::object()}, {"track_widths", json::array()},
+            {"via_dimensions", json::array()}}}}},
+        {"boards", json::array()},
+        {"libraries", {{"pinned_footprint_libs", json::array()},
+                       {"pinned_symbol_libs", json::array()}}},
+        {"meta", {{"filename", project.filename().u8string()}, {"version", 1}}},
+        {"net_settings", {{"classes", json::array()}, {"meta", {{"version", 0}}}}},
+        {"pcbnew", {{"page_layout_descr_file", ""}}},
+        {"sheets", json::array()}, {"text_variables", json::object()}};
+    atomic_write(project, data.dump(2) + "\n", check_lock, true, require_missing);
+}
+
+std::string project_path(const std::string& document) {
+    if (document.empty()) return {};
+    fs::path project = fs::u8path(document);
+    project.replace_extension(".kicad_pro");
+    std::error_code ec;
+    const bool exists = fs::is_regular_file(project, ec);
+    if (ec && ec != std::errc::no_such_file_or_directory)
+        file_error("cannot inspect KiCad project", project);
+    return exists ? project.u8string() : std::string();
+}
+
+fs::path companion_project(const fs::path& document) {
+    fs::path path = document;
+    path.replace_extension(".kicad_pro");
+    return path;
+}
+
+fs::path companion_rules(const fs::path& document) {
+    fs::path path = document;
+    path.replace_extension(".kicad_dru");
+    return path;
+}
+
+struct ProjectSnapshot {
+    json data = json::object();
+    FileStamp stamp;
+    FileStamp rules_stamp;
+    std::string rules;
+};
+
+ProjectSnapshot read_project(const fs::path& document) {
+    ProjectSnapshot result;
+    const fs::path path = companion_project(document);
+    result.stamp = file_stamp(path);
+    if (result.stamp.exists) {
+        std::ifstream input(path, std::ios::binary);
+        try {
+            input >> result.data;
+            if (!result.data.is_object()) throw std::runtime_error("expected a JSON object");
+        } catch (const std::exception& exc) {
+            throw OpError("io_error", "invalid KiCad project '" + path.u8string() + "': " + exc.what(),
+                          {{"path", path.u8string()}});
+        }
+        if (file_stamp(path) != result.stamp)
+            throw OpError("external_change", "KiCad project changed while reading",
+                          {{"path", path.u8string()}});
+    }
+    const fs::path rules = companion_rules(document);
+    result.rules_stamp = file_stamp(rules);
+    if (result.rules_stamp.exists) {
+        std::ifstream input(rules, std::ios::binary);
+        if (!input) file_error("cannot read KiCad custom rules", rules);
+        result.rules.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+        if (input.bad()) file_error("cannot read KiCad custom rules", rules);
+        if (file_stamp(rules) != result.rules_stamp)
+            throw OpError("external_change", "KiCad custom rules changed while reading",
+                          {{"path", rules.u8string()}});
+    }
+    return result;
+}
+
+const json* object_member(const json& parent, const char* key) {
+    if (!parent.is_object()) return nullptr;
+    const auto it = parent.find(key);
+    return it == parent.end() ? nullptr : &*it;
+}
+
+json& ensure_object(json& parent, const char* key) {
+    json& value = parent[key];
+    if (value.is_null()) value = json::object();
+    if (!value.is_object())
+        throw OpError("io_error", std::string("invalid KiCad project object: ") + key);
+    return value;
+}
+
+bool same_project_document(const json& left, const json& right) {
+    if (!left.is_object() || !right.is_object() || left.size() != right.size()) return false;
+    for (const auto& [key, value] : left.items()) {
+        auto other = right.find(key);
+        if (other == right.end()) return false;
+        if (key != "meta" || !value.is_object() || !other->is_object()) {
+            if (value != *other) return false;
+            continue;
+        }
+        const auto left_count = value.size() - (value.contains("filename") ? 1 : 0);
+        const auto right_count = other->size() - (other->contains("filename") ? 1 : 0);
+        if (left_count != right_count) return false;
+        for (const auto& [meta_key, meta_value] : value.items()) {
+            if (meta_key == "filename") continue;
+            auto found = other->find(meta_key);
+            if (found == other->end() || *found != meta_value) return false;
+        }
+    }
+    return true;
+}
+
+std::string native_class(const std::string& name) { return name == "Default" ? "default" : name; }
+std::string kicad_class(const std::string& name) { return name == "default" ? "Default" : name; }
+
+// KiCad's net-class patterns use '*' and '?' wildcards over complete net names.
+bool net_pattern_matches(const std::string& pattern, const std::string& name) {
+    std::size_t p = 0, n = 0, star = std::string::npos, retry = 0;
+    while (n < name.size()) {
+        if (p < pattern.size() && (pattern[p] == '?' || pattern[p] == name[n])) {
+            ++p; ++n;
+        } else if (p < pattern.size() && pattern[p] == '*') {
+            star = p++; retry = n;
+        } else if (star != std::string::npos) {
+            p = star + 1; n = ++retry;
+        } else {
+            return false;
+        }
+    }
+    while (p < pattern.size() && pattern[p] == '*') ++p;
+    return p == pattern.size();
+}
+
+constexpr const char* kAnalysisVariable = "CHUDWARE_ECAD_ANALYSIS_V1";
+const std::pair<const char*, const char*> kClassFields[] = {
+    {"clearance", "clearance"}, {"track_width", "track_width"},
+    {"via_diameter", "via_diameter"}, {"via_drill", "via_drill"},
+    {"diff_gap", "diff_pair_gap"}, {"diff_width", "diff_pair_width"}};
+const std::pair<const char*, const char*> kRuleFields[] = {
+    {"clearance", "min_clearance"}, {"track_width_min", "min_track_width"},
+    {"via_diameter_min", "min_via_diameter"}, {"via_drill_min", "min_through_hole_diameter"},
+    {"annular_ring_min", "min_via_annular_width"}, {"hole_to_hole_min", "min_hole_to_hole"},
+    {"edge_clearance", "min_copper_edge_clearance"}, {"silk_to_mask_min", "min_silk_clearance"}};
+
+bool mapped_field(const std::string& name, const std::pair<const char*, const char*>* fields,
+                  std::size_t count) {
+    for (std::size_t i = 0; i < count; ++i) if (name == fields[i].first) return true;
+    return false;
+}
+
+json board_settings(const json& doc) {
+    json assignments = json::object();
+    if (doc.contains("nets") && doc["nets"].is_array()) {
+        for (const auto& net : doc["nets"]) {
+            if (net.is_object() && net.contains("name") && net["name"].is_string())
+                assignments[net["name"].get<std::string>()] =
+                    net.contains("class") && net["class"].is_string() ? net["class"] : json("default");
+        }
+    }
+    return {{"classes", doc.value("net_classes", json::object())},
+            {"rules", doc.value("rules", json::object())},
+            {"assignments", std::move(assignments)}};
+}
+
+void restore_board_settings(json& doc, const json& settings) {
+    if (!settings.is_object()) return;
+    if (settings.contains("classes") && settings["classes"].is_object())
+        doc["net_classes"] = settings["classes"];
+    if (settings.contains("rules") && settings["rules"].is_object()) doc["rules"] = settings["rules"];
+    if (settings.contains("assignments") && settings["assignments"].is_object() &&
+        doc.contains("nets") && doc["nets"].is_array()) {
+        for (auto& net : doc["nets"]) {
+            if (!net.is_object() || !net.contains("name") || !net["name"].is_string()) continue;
+            const auto it = settings["assignments"].find(net["name"].get<std::string>());
+            if (it != settings["assignments"].end() && it->is_string()) net["class"] = *it;
+        }
+    }
+}
+
+void import_project_settings(json& doc, const json& project) {
+    if (!schema::is_board(doc)) return;
+    const json* settings = object_member(project, "net_settings");
+    const json* classes = settings ? object_member(*settings, "classes") : nullptr;
+    if (classes && classes->is_array() && !classes->empty()) {
+        json loaded = json::object();
+        for (const auto& entry : *classes) {
+            if (!entry.is_object() || !entry.contains("name") || !entry["name"].is_string()) continue;
+            json values = json::object();
+            for (const auto& [native, kicad] : kClassFields)
+                if (entry.contains(kicad) && entry[kicad].is_number()) values[native] = entry[kicad];
+            loaded[native_class(entry["name"].get<std::string>())] = std::move(values);
+        }
+        if (!loaded.empty()) doc["net_classes"] = std::move(loaded);
+    }
+    const json* board = object_member(project, "board");
+    const json* design = board ? object_member(*board, "design_settings") : nullptr;
+    const json* rules = design ? object_member(*design, "rules") : nullptr;
+    if (rules && rules->is_object()) {
+        for (const auto& [native, kicad] : kRuleFields)
+            if (rules->contains(kicad) && (*rules)[kicad].is_number())
+                doc["rules"][native] = (*rules)[kicad];
+    }
+    const json* variables = object_member(project, "text_variables");
+    if (variables && variables->is_object() && variables->contains(kAnalysisVariable)) {
+        const auto& stored = (*variables)[kAnalysisVariable];
+        if (!stored.is_string()) throw OpError("io_error", "invalid Chudware project analysis data");
+        json extra = json::parse(stored.get<std::string>(), nullptr, false);
+        if (!extra.is_object()) throw OpError("io_error", "invalid Chudware project analysis data");
+        if (extra.contains("rules") && extra["rules"].is_object())
+            for (const auto& [key, value] : extra["rules"].items())
+                if (!mapped_field(key, kRuleFields, std::size(kRuleFields))) doc["rules"][key] = value;
+        if (extra.contains("classes") && extra["classes"].is_object()) {
+            for (const auto& [name, values] : extra["classes"].items()) {
+                if (!doc["net_classes"].contains(name) || !values.is_object()) continue;
+                for (const auto& [key, value] : values.items())
+                    if (!mapped_field(key, kClassFields, std::size(kClassFields)))
+                        doc["net_classes"][name][key] = value;
+            }
+        }
+    }
+    const json* assignments = settings ? object_member(*settings, "netclass_assignments") : nullptr;
+    const json* patterns = settings ? object_member(*settings, "netclass_patterns") : nullptr;
+    if (!doc.contains("nets") || !doc["nets"].is_array()) return;
+    for (auto& net : doc["nets"]) {
+        if (!net.is_object() || !net.contains("name") || !net["name"].is_string()) continue;
+        const std::string name = net["name"].get<std::string>();
+        std::string cls;
+        if (assignments && assignments->is_object()) {
+            const auto it = assignments->find(name);
+            if (it != assignments->end()) {
+                if (it->is_string()) cls = it->get<std::string>();
+                else if (it->is_array() && !it->empty() && (*it)[0].is_string())
+                    cls = (*it)[0].get<std::string>();
+            }
+        }
+        if (cls.empty() && patterns && patterns->is_array()) {
+            for (const auto& entry : *patterns) {
+                if (entry.is_object() && entry.contains("pattern") && entry["pattern"].is_string() &&
+                    entry.contains("netclass") && entry["netclass"].is_string() &&
+                    net_pattern_matches(entry["pattern"].get<std::string>(), name)) {
+                    cls = entry["netclass"].get<std::string>();
+                    break;
+                }
+            }
+        }
+        if (!cls.empty()) net["class"] = native_class(cls);
+    }
+}
+
+json merge_project_settings(json project, const json& current, const json& baseline, bool same_target) {
+    const json old_classes = baseline.is_object() ? baseline.value("classes", json::object())
+                                                   : json::object();
+    const json old_rules = baseline.is_object() ? baseline.value("rules", json::object())
+                                                 : json::object();
+    const json old_assignments = baseline.is_object() ? baseline.value("assignments", json::object())
+                                                       : json::object();
+    const json& classes = current.at("classes");
+    const json& rules = current.at("rules");
+    const json& assignments = current.at("assignments");
+    const bool classes_changed = !same_target || !baseline.is_object() || classes != old_classes;
+    const bool rules_changed = !same_target || !baseline.is_object() || rules != old_rules;
+    const bool assignments_changed = !same_target || !baseline.is_object() ||
+                                     assignments != old_assignments;
+    json extra = json::object();
+    const json* vars = object_member(project, "text_variables");
+    if (vars && vars->is_object() && vars->contains(kAnalysisVariable)) {
+        const json& stored = (*vars)[kAnalysisVariable];
+        if (!stored.is_string()) throw OpError("io_error", "invalid Chudware project analysis data");
+        extra = json::parse(stored.get<std::string>(), nullptr, false);
+        if (!extra.is_object()) throw OpError("io_error", "invalid Chudware project analysis data");
+    }
+    if (classes_changed) {
+        json& net_settings = ensure_object(project, "net_settings");
+        json existing = net_settings.value("classes", json::array());
+        if (!existing.is_array()) throw OpError("io_error", "invalid KiCad project net classes");
+        json updated = json::array();
+        std::set<std::string> seen;
+        auto merge_class = [&](const std::string& name, json entry) {
+            const json& values = classes.at(name);
+            entry["name"] = kicad_class(name);
+            for (const auto& [native, kicad] : kClassFields)
+                if (values.contains(native) && values[native].is_number()) entry[kicad] = values[native];
+            if (values.contains("diff_gap") && !values.contains("diff_width") &&
+                values.contains("track_width") && values["track_width"].is_number())
+                entry["diff_pair_width"] = values["track_width"];
+            updated.push_back(std::move(entry));
+            seen.insert(name);
+        };
+        for (const auto& entry : existing) {
+            if (!entry.is_object() || !entry.contains("name") || !entry["name"].is_string()) {
+                updated.push_back(entry);
+                continue;
+            }
+            const std::string name = native_class(entry["name"].get<std::string>());
+            if (classes.contains(name) && classes[name].is_object()) merge_class(name, entry);
+            else if (!same_target || !old_classes.contains(name)) updated.push_back(entry);
+        }
+        for (const auto& [name, values] : classes.items()) {
+            if (!values.is_object() || seen.count(name)) continue;
+            json entry{{"bus_width", 12}, {"line_style", 0}, {"microvia_diameter", 0.3},
+                       {"microvia_drill", 0.1}, {"pcb_color", "rgba(0, 0, 0, 0.000)"},
+                       {"schematic_color", "rgba(0, 0, 0, 0.000)"}, {"wire_width", 6},
+                       {"priority", name == "default" ? 2147483647 : 0}};
+            merge_class(name, std::move(entry));
+        }
+        net_settings["classes"] = std::move(updated);
+        json& meta = ensure_object(net_settings, "meta");
+        if (!meta.contains("version") || !meta["version"].is_number_integer() ||
+            meta["version"].get<int>() < 5) meta["version"] = 5;
+        json& class_extra = ensure_object(extra, "classes");
+        if (same_target && old_classes.is_object())
+            for (const auto& [name, unused] : old_classes.items())
+                if (!classes.contains(name)) class_extra.erase(name);
+        for (const auto& [name, values] : classes.items()) {
+            if (!values.is_object()) continue;
+            json unknown = json::object();
+            for (const auto& [key, value] : values.items())
+                if (!mapped_field(key, kClassFields, std::size(kClassFields))) unknown[key] = value;
+            if (unknown.empty()) class_extra.erase(name);
+            else class_extra[name] = std::move(unknown);
+        }
+        if (class_extra.empty()) extra.erase("classes");
+    }
+    if (rules_changed) {
+        json& board = ensure_object(project, "board");
+        json& design = ensure_object(board, "design_settings");
+        json& target_rules = ensure_object(design, "rules");
+        for (const auto& [native, kicad] : kRuleFields)
+            if (rules.contains(native) && rules[native].is_number()) target_rules[kicad] = rules[native];
+        json unknown = json::object();
+        for (const auto& [key, value] : rules.items())
+            if (!mapped_field(key, kRuleFields, std::size(kRuleFields))) unknown[key] = value;
+        if (unknown.empty()) extra.erase("rules");
+        else extra["rules"] = std::move(unknown);
+    }
+    if (assignments_changed) {
+        json& net_settings = ensure_object(project, "net_settings");
+        json& target_assignments = ensure_object(net_settings, "netclass_assignments");
+        for (const auto& [name, value] : assignments.items()) {
+            if (!value.is_string()) continue;
+            if (same_target && old_assignments.contains(name) && old_assignments[name] == value) continue;
+            target_assignments[name] = json::array({kicad_class(value.get<std::string>())});
+        }
+    }
+    if (classes_changed || rules_changed) {
+        json& variables = ensure_object(project, "text_variables");
+        if (extra.empty()) variables.erase(kAnalysisVariable);
+        else variables[kAnalysisVariable] = extra.dump();
+    }
+    return project;
+}
+
+json import_file(const fs::path& path) {
+    const std::string ext = extension(path);
+    const char* which = ext == ".kicad_sch" ? "import_kicad_sch" : "import_kicad_pcb";
+    try {
+        return ext == ".kicad_sch" ? kicad::import_kicad_sch(path.u8string())
+                                    : kicad::import_kicad_pcb(path.u8string());
+    } catch (const std::exception& exc) {
+        throw OpError("io_error", std::string(which) + " failed for '" + path.u8string() +
+                      "': " + exc.what(), {{"path", path.u8string()}});
+    }
+}
+
+json save_locked(Session& s, const std::string& path, const json& recovery,
+                 bool require_missing = false);
 
 // Canonical snapshot (sorted keys, compact) — same intent as Python's
 // json.dumps(sort_keys=True, separators=(",", ":")). nlohmann::json::parse round-
 // trips it back to an identical object.
 std::string snapshot(const json& doc) { return doc.dump(); }
 
-// Flush bounded undo stack to per-doc telemetry journal next to the .ecad+ container.
+// Flush bounded undo snapshots to a per-document journal.
 // Journal path: <doc_path>.ecad_journal.jsonl. Best-effort; never throws.
 static void flush_ecad_journal(const Session& s) {
     if (s.path.empty()) return;
     try {
-        fs::path journal = fs::path(s.path).replace_extension("").string() + ".ecad_journal.jsonl";
+        fs::path journal = fs::u8path(s.path).replace_extension("");
+        journal += ".ecad_journal.jsonl";
         std::ofstream fh(journal, std::ios::binary | std::ios::trunc);
         if (!fh) return;
         for (const auto& snap : s.undo_stack) {
@@ -158,12 +743,14 @@ void push_undo(Session& s) {
 // engine/ecad/session.py::_INTERACTIVE_FILL_RESOLUTION.
 constexpr double kInteractiveFillResolution = 0.25;
 
-// Recompute every copper zone's filled_polys IN PLACE on `doc`
-// (engine/ecad/session.py::_fill_zones_into). Returns the number of zones filled,
-// or -1 if there were no zones. fill_zones is pure (returns a filled copy); we
-// copy each zone's freshly-computed filled_polys back onto the working doc.
+// Refresh native zones for interactive feedback. Imported KiCad fills stay
+// untouched until an explicit ecad_fill_zones request.
 int fill_zones_into(json& doc, double resolution) {
     if (!doc.contains("zones") || !doc["zones"].is_array() || doc["zones"].empty()) return -1;
+    const auto& zones = doc["zones"];
+    if (std::all_of(zones.begin(), zones.end(),
+                    [](const json& zone) { return zone.contains("kicad_extra"); }))
+        return static_cast<int>(zones.size());
     json filled = fill_zones(doc, resolution);
     std::map<json, json> by_id;
     if (filled.contains("zones") && filled["zones"].is_array()) {
@@ -173,6 +760,10 @@ int fill_zones_into(json& doc, double resolution) {
     }
     int n = 0;
     for (auto& zone : doc["zones"]) {
+        if (zone.contains("kicad_extra")) {
+            ++n;
+            continue;
+        }
         json key = zone.contains("id") ? zone["id"] : json(nullptr);
         auto it = by_id.find(key);
         zone["filled_polys"] = (it != by_id.end()) ? it->second : json::array();
@@ -219,7 +810,46 @@ json ops_response(Session& s, const json& id_map, const json& warnings,
     return resp;
 }
 
+json reload_locked(Session& s) {
+    if (s.path.empty())
+        throw OpError("needs_path", "ecad_reload: document has no bound KiCad path");
+    const fs::path path = fs::u8path(s.path);
+    const FileStamp before = file_stamp(path);
+    if (!before.exists) file_error("ECAD file does not exist", path);
+    json doc = import_file(path);
+    const FileStamp after = file_stamp(path);
+    if (before != after)
+        throw OpError("external_change", "ECAD file changed while reloading", {{"path", s.path}});
+    if (schema::doc_kind(doc) != schema::doc_kind(s.doc))
+        throw OpError("invalid_op", "reloaded document kind does not match session");
+    ProjectSnapshot project = read_project(path);
+    if (schema::is_board(doc)) import_project_settings(doc, project.data);
+    doc["id"] = s.doc_id;
+    s.doc = std::move(doc);
+    s.stamp = after;
+    s.project_stamp = project.stamp;
+    s.rules_stamp = project.rules_stamp;
+    s.project_document = project.stamp.exists ? std::move(project.data) : json(nullptr);
+    s.custom_rules = std::move(project.rules);
+    s.saved_settings = schema::is_board(s.doc) ? board_settings(s.doc) : json(nullptr);
+    s.dirty = false;
+    s.undo_stack.clear();
+    s.redo_stack.clear();
+    ++s.revision;
+    json result = ops_response(s, json::object(), json::array(), false);
+    result["doc_id"] = s.doc_id;
+    result["path"] = s.path;
+    result["project"] = project_path(s.path);
+    return result;
+}
+
 }  // namespace
+
+json kicad_project_settings(const json& project, const json& board) {
+    if (!project.is_object() || !schema::is_board(board))
+        throw OpError("invalid_op", "KiCad project settings require a project object and PCB");
+    return merge_project_settings(project, board_settings(board), nullptr, false);
+}
 
 bool dirty_document_count(std::uint64_t& count) {
     std::unique_lock<std::mutex> lock(g_mtx, std::try_to_lock);
@@ -228,8 +858,10 @@ bool dirty_document_count(std::uint64_t& count) {
     return true;
 }
 
-json ecad_new(const std::string& kind, const std::string& name) {
+json ecad_new(const std::string& kind, const std::string& name, const std::string& path) {
     EcadLock lk;
+    kicad_libs::set_project_dir(path.empty() ? std::string() :
+                                fs::absolute(fs::u8path(path)).parent_path().u8string());
     json doc;
     if (kind == "sch")
         doc = schema::new_schematic(name.empty() ? "Schematic1" : name);
@@ -241,18 +873,28 @@ json ecad_new(const std::string& kind, const std::string& name) {
     Session s;
     s.doc_id = new_doc_id();
     s.doc = std::move(doc);
-    s.doc["id"] = s.doc_id;  // Python uses a uuid4; the session id is faithful here
-    s.revision = 0;
-    Session& stored = g_sessions[s.doc_id] = std::move(s);
-    // ecad_new -> rebuild() (no op application, no rev bump) + doc_id. Compile FIRST
-    // (it may write filled_polys into the doc) so `tree` carries the current fills.
-    json cf = compile_field(stored.doc);
-    stored.last_compile = cf;
-    json resp = {{"revision", stored.revision}, {"id_map", json::object()},
-                 {"kind", schema::doc_kind(stored.doc)}, {"tree", stored.doc},
-                 {"compile", cf}};
-    resp["doc_id"] = stored.doc_id;
-    return resp;
+    s.doc["id"] = s.doc_id;
+    const std::string id = s.doc_id;
+    Session& stored = g_sessions[id] = std::move(s);
+    try {
+        if (!path.empty() && kind == "pcb") {
+            const auto project = read_project(fs::u8path(path));
+            import_project_settings(stored.doc, project.data);
+            const json* net_settings = object_member(project.data, "net_settings");
+            const json* classes = net_settings ? object_member(*net_settings, "classes") : nullptr;
+            if (classes && classes->is_array() && !classes->empty())
+                stored.saved_settings = board_settings(stored.doc);
+        }
+        if (!path.empty()) save_locked(stored, path, nullptr, true);
+        json resp = ops_response(stored, json::object(), json::array(), false);
+        resp["doc_id"] = id;
+        resp["path"] = stored.path;
+        resp["project"] = project_path(stored.path);
+        return resp;
+    } catch (...) {
+        g_sessions.erase(id);
+        throw;
+    }
 }
 
 json ecad_apply_ops(const std::string& doc_id, long base_revision, const json& ops) {
@@ -265,6 +907,9 @@ json ecad_apply_ops(const std::string& doc_id, long base_revision, const json& o
                       {{"current_revision", s.revision}});
 
     json res = apply_ops(s.doc, ops.is_null() ? json::array() : ops);  // throws on failure
+    if (res["doc"] == s.doc)
+        return ops_response(s, res["id_map"],
+                            res.contains("warnings") ? res["warnings"] : json::array());
 
     push_undo(s);
     s.doc = res["doc"];
@@ -306,10 +951,26 @@ json ecad_redo(const std::string& doc_id) {
 json ecad_tree(const std::string& doc_id) {
     EcadLock lk;
     Session& s = require_session(doc_id);
-    json cf = s.last_compile.is_null() ? compile_field(s.doc) : s.last_compile;
+    const FileStamp current = s.path.empty() ? FileStamp{} : file_stamp(fs::u8path(s.path));
+    const bool project_changed = !s.path.empty() &&
+        (file_stamp(companion_project(fs::u8path(s.path))) != s.project_stamp ||
+         file_stamp(companion_rules(fs::u8path(s.path))) != s.rules_stamp);
+    const bool changed = !s.path.empty() && (current != s.stamp || project_changed);
+    if (changed && current.exists && !s.dirty) reload_locked(s);
+    json cf = s.last_compile.is_null() ? compile_field(s.doc, false) : s.last_compile;
     s.last_compile = cf;
     return json{{"revision", s.revision}, {"kind", schema::doc_kind(s.doc)},
-                {"tree", s.doc}, {"compile", cf}};
+                {"tree", s.doc}, {"compile", cf}, {"path", s.path},
+                {"file_changed", changed}, {"kicad_locked", kicad_locked(fs::u8path(s.path))},
+                {"dirty", s.dirty}, {"project", project_path(s.path)}};
+}
+
+json ecad_reload(const std::string& doc_id, bool discard) {
+    EcadLock lk;
+    Session& s = require_session(doc_id);
+    if (s.dirty && !discard)
+        throw OpError("dirty", "ecad_reload: document has unsaved edits", {{"doc_id", doc_id}});
+    return reload_locked(s);
 }
 
 json ecad_rebuild(const std::string& doc_id) {
@@ -371,7 +1032,7 @@ json ecad_describe(const std::string& doc_id, long budget) {
             if (out.size() >= cap) break;
             out.push_back(json{{"rule", v->value("rule", std::string())},
                                {"severity", v->value("severity", std::string())},
-                               {"net", v->value("net", std::string())},
+                               {"net", v->contains("net") ? v->at("net") : json("")},
                                {"message", v->value("message", std::string())}});
         }
         return out;
@@ -381,8 +1042,7 @@ json ecad_describe(const std::string& doc_id, long budget) {
              {"name", doc.value("name", std::string())},
              {"revision", s.revision},
              {"compiled", compiled},
-             {"path", s.path},
-             {"source_path", s.source_path}};
+             {"path", s.path}};
 
     if (schema::is_schematic(doc)) {
         int erc_err = 0, erc_warn = 0;
@@ -534,390 +1194,445 @@ json ecad_dfm_board(const json& board, const json& rules) {
     return dfm_response(board, rules);
 }
 
+
+
+// ------------------------------------------------------------------- save / open
+
 namespace {
 
-void require_svg_leaf(const std::string& name, bool allow_empty = false) {
-    if (name.empty() && allow_empty) return;
-    if (name.empty() || name == "." || name == ".." ||
-        name.find_first_of("/\\:*?\"<>|") != std::string::npos ||
-        name.back() == '.' || name.back() == ' ' ||
-        std::any_of(name.begin(), name.end(), [](unsigned char c) { return c < 32 || c == 127; }))
-        throw OpError("invalid_op", "ecad_export: SVG sheet must be a safe filename leaf",
-                      {{"reason", "unsafe SVG leaf"}});
+fs::path recovery_dir(const json& metadata) {
+    if (metadata.is_object() && metadata.contains("recovery_dir")) {
+        if (!metadata["recovery_dir"].is_string() || metadata["recovery_dir"].get<std::string>().empty())
+            throw OpError("invalid_op", "ecad_save: recovery_dir must be a nonempty path");
+        return fs::u8path(metadata["recovery_dir"].get<std::string>());
+    }
+    if (const char* p = std::getenv("CHUDWARE_ECAD_AUTOSAVE_DIR"); p && *p) return fs::u8path(p);
+    const char* appdata = std::getenv("APPDATA");
+    return (appdata && *appdata ? fs::u8path(appdata) : fs::temp_directory_path()) /
+           "Chudware" / "ecad_autosave";
 }
 
-// SVG outputs have a checked parent and a non-following final open. In particular,
-// a pre-existing symlink must not be truncated between the containment check and
-// the write. POSIX opens relative to the pinned destination directory descriptor.
-void write_svg_file(const fs::path& target, const fs::path& directory,
-                    const std::string& text) {
-    require_svg_leaf(target.filename().string());
-    std::error_code ec;
-    const fs::path root = fs::canonical(directory, ec);
-    if (ec) throw OpError("io_error", "ecad_export: cannot resolve SVG destination");
-    const fs::path resolved = fs::weakly_canonical(target, ec);
-    if (ec || resolved.parent_path() != root)
-        throw OpError("io_error", "ecad_export: SVG output escapes destination",
-                      {{"path", target.string()}});
-    auto fail = [&]() {
-        throw OpError("io_error", "ecad_export: cannot write SVG '" + target.string() + "'",
-                      {{"path", target.string()}, {"kind", "svg"}});
-    };
+unsigned long recovery_pid() {
 #ifdef _WIN32
-    struct HandleGuard {
-        HANDLE value;
-        ~HandleGuard() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); }
-    };
-    HandleGuard file{CreateFileW((root / target.filename()).wstring().c_str(), GENERIC_WRITE,
-                                0, nullptr, OPEN_ALWAYS, FILE_FLAG_OPEN_REPARSE_POINT, nullptr)};
-    if (file.value == INVALID_HANDLE_VALUE) fail();
-    BY_HANDLE_FILE_INFORMATION st{};
-    if (!GetFileInformationByHandle(file.value, &st) ||
-        (st.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)))
-        fail();
-    LARGE_INTEGER zero{};
-    if (!SetFilePointerEx(file.value, zero, nullptr, FILE_BEGIN) || !SetEndOfFile(file.value))
-        fail();
-    std::size_t written = 0;
-    while (written < text.size()) {
-        DWORD n = 0;
-        const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(text.size() - written,
-                                                                    1024 * 1024 * 1024));
-        if (!WriteFile(file.value, text.data() + written, chunk, &n, nullptr) || !n) fail();
-        written += n;
-    }
+    return GetCurrentProcessId();
 #else
-    struct FdGuard {
-        int value;
-        ~FdGuard() { if (value >= 0) ::close(value); }
-    };
-    FdGuard dir{::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)};
-    if (dir.value < 0) fail();
-    FdGuard file{::openat(dir.value, target.filename().c_str(),
-                         O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0666)};
-    if (file.value < 0) fail();
-    struct stat st{};
-    if (::fstat(file.value, &st) || !S_ISREG(st.st_mode) || ::ftruncate(file.value, 0)) fail();
-    std::size_t written = 0;
-    while (written < text.size()) {
-        const ssize_t n = ::write(file.value, text.data() + written,
-                                 std::min<std::size_t>(text.size() - written, 1024 * 1024 * 1024));
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) fail();
-        written += static_cast<std::size_t>(n);
-    }
+    return static_cast<unsigned long>(getpid());
 #endif
 }
 
-// Conventional on-disk filename for one exported logical key. Gerber keys are layer
-// ids and map to the RS-274X extensions fabricators expect; everything else is a
-// single well-known artifact.
-std::string export_filename(const std::string& kind, const std::string& key,
-                            const std::string& stem, const json& opts) {
-    auto plain = [&](const char* ext) { return stem + ext; };
-    if (kind == "gerber") {
-        static const std::map<std::string, std::string> kExt = {
-            {"F.Cu", ".GTL"},     {"B.Cu", ".GBL"},    {"F.SilkS", ".GTO"},
-            {"B.SilkS", ".GBO"},  {"F.Mask", ".GTS"},  {"B.Mask", ".GBS"},
-            {"F.Paste", ".GTP"},  {"B.Paste", ".GBP"}, {"Edge.Cuts", ".GKO"},
-            {"F.Fab", ".GM2"},    {"B.Fab", ".GM3"},   {"F.CrtYd", ".GM4"},
-            {"B.CrtYd", ".GM5"}};
-        auto it = kExt.find(key);
-        if (it != kExt.end()) return stem + it->second;
-        // Inner copper: In1.Cu -> .G2, In2.Cu -> .G3, ...
-        if (key.rfind("In", 0) == 0) {
-            const std::size_t dot = key.find('.');
-            const std::string n = key.substr(2, dot == std::string::npos ? dot : dot - 2);
-            if (!n.empty() && n.find_first_not_of("0123456789") == std::string::npos)
-                return stem + ".G" + std::to_string(std::stoi(n) + 1);
-        }
-        std::string safe = key;
-        for (char& c : safe)
-            if (c == '.' || c == '/' || c == '\\') c = '_';
-        return stem + "-" + safe + ".gbr";
-    }
-    if (kind == "drill") return stem + (key == "npth" ? "-NPTH.drl" : "-PTH.drl");
-    if (kind == "cpl") return plain("-cpl.csv");
-    if (kind == "bom")
-        return plain(opts.value("fmt", std::string("csv")) == "json" ? "-bom.json" : "-bom.csv");
-    if (kind == "netlist") return plain(".net");
-    if (kind == "spice") return plain(".cir");
-    if (kind == "kicad") return plain(".kicad_sch");
-    if (kind == "pdf") return plain(".pdf");
-    if (kind == "svg") {
-        require_svg_leaf(key, true);
-        return key.empty() ? plain(".svg") : stem + "-" + key + ".svg";
-    }
-    return stem + "-" + key;
-}
-
-// True when `p` should be treated as a DIRECTORY to drop files into rather than the
-// literal output file: it exists as a directory, ends in a separator, or has no
-// extension on its final component.
-bool looks_like_directory(const std::string& p) {
-    if (p.empty()) return false;
+bool in_recovery_dir(const fs::path& target, const fs::path& directory) {
     std::error_code ec;
-    if (fs::is_directory(fs::path(p), ec)) return true;
-    const char last = p.back();
-    if (last == '/' || last == '\\') return true;
-    const std::string leaf = fs::path(p).filename().string();
-    return leaf.find('.') == std::string::npos;
+    const auto root = fs::weakly_canonical(directory, ec);
+    if (ec) file_error("cannot resolve ECAD recovery directory", directory);
+    const auto resolved = fs::weakly_canonical(target, ec);
+    if (ec) file_error("cannot resolve ECAD recovery path", target);
+    const auto relative = resolved.lexically_relative(root);
+    return !relative.empty() && relative != "." && *relative.begin() != "..";
 }
 
-// Write every produced file. `path` empty -> nothing is written and `paths` is empty
-// (the caller keeps the in-memory text). Never reports a write it did not do.
-json write_export_files(const json& files, const std::string& kind, const std::string& path,
-                        const std::string& stem, const json& opts) {
-    json paths = json::array();
-    if (path.empty() || !files.is_object() || files.empty()) return paths;
-
-    const bool as_dir = files.size() > 1 || looks_like_directory(path);
-    // Validate every sheet before creating directories or writing any page.
-    if (kind == "svg")
-        for (auto it = files.begin(); it != files.end(); ++it) {
-            require_svg_leaf(it.key(), true);
-            require_svg_leaf(export_filename(kind, it.key(), stem, opts));
-        }
-    std::error_code ec;
-    if (as_dir) fs::create_directories(fs::path(path), ec);
-    else if (fs::path(path).has_parent_path())
-        fs::create_directories(fs::path(path).parent_path(), ec);
-
-    for (auto it = files.begin(); it != files.end(); ++it) {
-        if (!it.value().is_string()) continue;
-        const fs::path target =
-            as_dir ? fs::path(path) / export_filename(kind, it.key(), stem, opts) : fs::path(path);
-        if (kind == "svg") {
-            const fs::path directory = as_dir ? fs::path(path)
-                                              : (target.has_parent_path() ? target.parent_path()
-                                                                          : fs::path("."));
-            write_svg_file(target, directory, it.value().get_ref<const std::string&>());
-            paths.push_back(target.string());
-            continue;
-        }
-        std::ofstream fh(target, std::ios::binary | std::ios::trunc);
-        if (!fh)
-            throw OpError("io_error", "ecad_export: cannot write '" + target.string() + "'",
-                          {{"path", target.string()}, {"kind", kind}});
-        const std::string& text = it.value().get_ref<const std::string&>();
-        fh.write(text.data(), (std::streamsize)text.size());
-        if (!fh)
-            throw OpError("io_error", "ecad_export: write failed for '" + target.string() + "'",
-                          {{"path", target.string()}, {"kind", kind}});
-        paths.push_back(target.string());
+json save_locked(Session& s, const std::string& path, const json& recovery, bool require_missing) {
+    const bool snapshot = recovery.is_object() || (recovery.is_boolean() && recovery.get<bool>());
+    const fs::path root = snapshot ? recovery_dir(recovery) : fs::path{};
+    const std::string kind = schema::doc_kind(s.doc);
+    const bool board = kind == "pcb";
+    const std::string expected = board ? ".kicad_pcb" : ".kicad_sch";
+    std::string target = path.empty() ? s.path : path;
+    if (snapshot && path.empty()) {
+        static std::atomic<unsigned long long> sequence{0};
+        target = (root /
+            ("recovery-" + std::to_string(recovery_pid()) + "-" + s.doc_id + "-" +
+             std::to_string(std::chrono::system_clock::now().time_since_epoch().count()) + "-" +
+             std::to_string(sequence.fetch_add(1)) + expected)).u8string();
     }
-    return paths;
-}
+    if (target.empty()) throw OpError("needs_path", "ecad_save: choose a KiCad file path");
+    const fs::path target_path = fs::u8path(target);
+    const fs::path bound_path = fs::u8path(s.path);
+    const fs::path project_path = companion_project(target_path);
+    const fs::path rules_path = companion_rules(target_path);
+    const bool same_target = !s.path.empty() && same_path(target_path, bound_path);
+    const bool save_as = !snapshot && !s.path.empty() && !same_target;
+    const bool bound_schematic = !snapshot && same_target && !board;
+    const bool require_new = require_missing || (!snapshot && s.path.empty());
+    if (snapshot && (!in_recovery_dir(target_path, root) || same_target))
+        throw OpError("io_error", "ecad_save: recovery requires a separate path in the recovery directory");
+    if (extension(target_path) != expected)
+        throw OpError("invalid_op", "ecad_save: " + kind + " requires a " + expected + " path",
+                      {{"path", target}});
+    bool watch_project = false, write_project = false;
+    bool write_rules = false;
+    FileStamp target_project_stamp, target_rules_stamp;
+    auto check_project = [&]() {
+        if (write_project && kicad_locked(project_path))
+            throw OpError("kicad_locked", "KiCad has the project file open",
+                          {{"path", project_path.u8string()}});
+        if (file_stamp(project_path) != target_project_stamp)
+            throw OpError("external_change", "KiCad project changed outside this session",
+                          {{"path", project_path.u8string()}});
+    };
+    auto check_rules = [&]() {
+        if (write_rules && kicad_locked(rules_path))
+            throw OpError("kicad_locked", "KiCad has the custom rules file open",
+                          {{"path", rules_path.u8string()}});
+        if (file_stamp(rules_path) != target_rules_stamp)
+            throw OpError("external_change", "KiCad custom rules changed outside this session",
+                          {{"path", rules_path.u8string()}});
+    };
+    auto check = [&]() {
+        if (kicad_locked(target_path))
+            throw OpError("kicad_locked", "KiCad has the target file open", {{"path", target}});
+        if (!snapshot && same_target && file_stamp(bound_path) != s.stamp)
+            throw OpError("external_change", "KiCad file changed outside this session",
+                          {{"path", s.path}});
+        if (!snapshot && board && same_target &&
+            file_stamp(companion_project(bound_path)) != s.project_stamp)
+            throw OpError("external_change", "KiCad project changed outside this session",
+                          {{"path", companion_project(bound_path).u8string()}});
+        if (require_new && fs::exists(target_path))
+            throw OpError("io_error", "ecad_save: target already exists", {{"path", target}});
+        if (watch_project) check_project();
+    };
+    check();
+    const fs::path library_doc = !s.path.empty() ? bound_path : target_path;
+    kicad_libs::set_project_dir(fs::absolute(library_doc).parent_path().u8string());
+    json document = s.doc;
+    kicad::assign_uuids(document);
+    const std::string bytes = board ? kicad::write_kicad_pcb(document)
+                                    : kicad::write_kicad_sch(document);
+    ProjectSnapshot target_project;
+    json settings;
+    json merged_project;
+    std::string project_bytes;
+    bool update_project = false;
+    if (!snapshot && !bound_schematic) {
+        target_project = read_project(target_path);
+        const bool existed = target_project.stamp.exists;
+        const ProjectSnapshot source = save_as ? read_project(bound_path) : ProjectSnapshot{};
+        const bool source_project = save_as && source.stamp.exists;
+        if (save_as && existed &&
+            (!source_project || !same_project_document(source.data, target_project.data)))
+            throw OpError("external_change", "Save As target has a different KiCad project",
+                          {{"path", project_path.u8string()}});
+        if (save_as && target_project.rules_stamp.exists &&
+            (!source.rules_stamp.exists || target_project.rules != source.rules))
+            throw OpError("external_change", "Save As target has different KiCad custom rules",
+                          {{"path", rules_path.u8string()}});
 
-plot::PlotOpts plot_opts_from(const json& opts) {
-    plot::PlotOpts po;
-    po.sheet = opts.value("sheet", std::string());
-    if (opts.contains("frame") && opts["frame"].is_boolean()) po.frame = opts["frame"].get<bool>();
-    if (opts.contains("title_block") && opts["title_block"].is_boolean())
-        po.title_block = opts["title_block"].get<bool>();
-    if (opts.contains("pin_numbers") && opts["pin_numbers"].is_boolean())
-        po.pin_numbers = opts["pin_numbers"].get<bool>();
-    if (opts.contains("pin_names") && opts["pin_names"].is_boolean())
-        po.pin_names = opts["pin_names"].get<bool>();
-    po.paper = opts.value("paper", std::string("A4"));
-    if (opts.contains("margin_mm") && opts["margin_mm"].is_number())
-        po.margin_mm = opts["margin_mm"].get<double>();
-    return po;
-}
-
-// A filesystem-safe stem for the exported artifacts, from the document name.
-std::string export_stem(const json& doc) {
-    std::string stem = doc.is_object() ? doc.value("name", std::string()) : std::string();
-    if (stem.empty()) stem = schema::is_board(doc) ? "board" : "schematic";
-    for (char& c : stem)
-        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' ||
-            c == '>' || c == '|')
-            c = '_';
-    return stem;
+        if (!existed) {
+            if (source_project) {
+                json copy = source.data;
+                ensure_object(copy, "meta")["filename"] = project_path.filename().u8string();
+                const std::string copy_bytes = copy.dump(2) + "\n";
+                target_project_stamp = target_project.stamp;
+                write_project = true;
+                check_project();
+                atomic_write(project_path, copy_bytes, check_project, true, true);
+                target_project.stamp = file_stamp(project_path);
+                if (!target_project.stamp.exists || target_project.stamp.size != copy_bytes.size() ||
+                    target_project.stamp.hash != content_hash(copy_bytes))
+                    throw OpError("external_change", "KiCad project changed while copying",
+                                  {{"path", project_path.u8string()}});
+                target_project.data = std::move(copy);
+                write_project = false;
+            } else {
+                ensure_project(target_path, true);
+                target_project = read_project(target_path);
+                if (same_target) s.project_stamp = target_project.stamp;
+            }
+        }
+        if (save_as && source.rules_stamp.exists && !target_project.rules_stamp.exists) {
+            target_rules_stamp = target_project.rules_stamp;
+            write_rules = true;
+            check_rules();
+            atomic_write(rules_path, source.rules, check_rules, true, true);
+            target_project.rules_stamp = file_stamp(rules_path);
+            if (!target_project.rules_stamp.exists ||
+                target_project.rules_stamp.size != source.rules.size() ||
+                target_project.rules_stamp.hash != content_hash(source.rules))
+                throw OpError("external_change", "KiCad custom rules changed while copying",
+                              {{"path", rules_path.u8string()}});
+            target_project.rules = source.rules;
+            write_rules = false;
+        }
+        target_project_stamp = target_project.stamp;
+        target_rules_stamp = target_project.rules_stamp;
+        if (board && same_target && target_project.stamp != s.project_stamp)
+            throw OpError("external_change", "KiCad project changed outside this session",
+                          {{"path", project_path.u8string()}});
+        if (board) {
+            settings = board_settings(document);
+            const bool existing_new_board = require_missing && s.saved_settings.is_object() &&
+                                            settings == s.saved_settings && existed;
+            const bool source_baseline = same_target || source_project;
+            update_project = !existing_new_board &&
+                ((!existed && !source_project) || !source_baseline ||
+                 !s.saved_settings.is_object() || settings != s.saved_settings);
+            if (update_project) {
+                watch_project = true;
+                write_project = true;
+                check_project();
+                merged_project = merge_project_settings(target_project.data, settings,
+                                                        s.saved_settings, source_baseline);
+                project_bytes = merged_project.dump(2) + "\n";
+            }
+        }
+    }
+    atomic_write(target_path, bytes, check, require_new, require_new);
+    const FileStamp written = file_stamp(target_path);
+    if (!written.exists || written.size != bytes.size() || written.hash != content_hash(bytes))
+        throw OpError("external_change", "ECAD file changed while saving", {{"path", target}});
+    if (snapshot) {
+        json metadata = recovery.is_object() ? recovery : json::object();
+        if (!metadata.contains("pid")) metadata["pid"] = recovery_pid();
+        if (!metadata.contains("doc_id")) metadata["doc_id"] = s.doc_id;
+        if (!metadata.contains("name")) metadata["name"] = s.doc.value("name", std::string());
+        if (!metadata.contains("kind")) metadata["kind"] = kind;
+        metadata["human_dirty"] = true;
+        metadata["revision"] = s.revision;
+        metadata["path"] = s.path;
+        metadata["snapshot"] = target;
+        metadata["baseline"] = stamp_json(s.stamp);
+        metadata["snapshot_size"] = written.size;
+        metadata["snapshot_hash"] = std::to_string(written.hash);
+        metadata["project_baseline"] = stamp_json(s.project_stamp);
+        metadata["rules_baseline"] = stamp_json(s.rules_stamp);
+        metadata["project_document"] = s.project_document;
+        if (s.rules_stamp.exists) metadata["custom_rules"] = s.custom_rules;
+        if (board) {
+            metadata["board_settings"] = board_settings(document);
+            metadata["saved_board_settings"] = s.saved_settings;
+        }
+        fs::path sidecar = target_path; sidecar += ".recovery.json";
+        atomic_write(sidecar, metadata.dump(2) + "\n");
+        s.doc = std::move(document);
+    } else {
+        s.path = target;
+        s.stamp = written;
+        s.doc = std::move(document);
+        s.dirty = true;
+        if (bound_schematic) {
+            // Saving a schematic does not write project settings or rules.
+            // Do not let unrelated companion edits block it, and discard any
+            // cached companion content whose fingerprint is no longer current.
+            const auto project_stamp = file_stamp(project_path);
+            const auto rules_stamp = file_stamp(rules_path);
+            if (project_stamp != s.project_stamp) s.project_document = nullptr;
+            if (rules_stamp != s.rules_stamp) s.custom_rules.clear();
+            s.project_stamp = project_stamp;
+            s.rules_stamp = rules_stamp;
+        } else {
+            s.project_stamp = target_project.stamp;
+            s.rules_stamp = target_project.rules_stamp;
+            s.project_document = target_project.stamp.exists ? std::move(target_project.data) : json(nullptr);
+            s.custom_rules = std::move(target_project.rules);
+        }
+        if (board) {
+            s.saved_settings = nullptr;
+            if (update_project) {
+                atomic_write(project_path, project_bytes, check_project);
+                const auto project_written = file_stamp(project_path);
+                if (!project_written.exists || project_written.size != project_bytes.size() ||
+                    project_written.hash != content_hash(project_bytes))
+                    throw OpError("external_change", "KiCad project changed while saving",
+                                  {{"path", project_path.u8string()}});
+                // A PCB save may update the shared project settings. Advance
+                // sibling schematic baselines only when they still match the
+                // exact project revision this save replaced.
+                for (auto& [other_id, other] : g_sessions) {
+                    if (&other == &s || other.path.empty() || !schema::is_schematic(other.doc) ||
+                        other.project_stamp != target_project_stamp ||
+                        !same_path(companion_project(fs::u8path(other.path)), project_path))
+                        continue;
+                    other.project_stamp = project_written;
+                    other.project_document = merged_project;
+                }
+                s.project_stamp = project_written;
+                s.project_document = std::move(merged_project);
+            }
+            s.saved_settings = std::move(settings);
+        }
+        s.dirty = false;
+    }
+    return {{"path", target}, {"format", "kicad"}, {"saved_revision", s.revision}};
 }
 
 }  // namespace
 
-json ecad_export(const json& params) {
-    const std::string kind = params.value("kind", std::string());
-    const json opts = params.contains("opts") && params["opts"].is_object() ? params["opts"]
-                                                                            : json::object();
-    const std::string path = params.value("path", std::string());
-
-    // Resolve the document: a stateless inline `board`/`doc` wins (parity-harness path),
-    // else the open session.
-    json doc;
-    if (params.contains("board") && params["board"].is_object()) {
-        doc = params["board"];
-    } else if (params.contains("doc") && params["doc"].is_object()) {
-        doc = params["doc"];
-    } else {
-        EcadLock lk;
-        Session& s = require_session(params.value("doc_id", std::string()));
-        doc = s.doc;
-    }
-
-    static const std::set<std::string> kPcbKinds = {"gerber", "drill", "cpl"};
-    static const std::set<std::string> kSchKinds = {"netlist", "spice", "kicad", "svg", "pdf"};
-    const bool is_pcb = schema::is_board(doc);
-    const bool is_sch = schema::is_schematic(doc);
-
-    if (kPcbKinds.count(kind)) {
-        if (!is_pcb)
-            throw OpError("invalid_op", kind + " export requires a pcb document",
-                          {{"reason", "wrong doc kind"}, {"kind", kind}});
-    } else if (kSchKinds.count(kind)) {
-        if (!is_sch)
-            throw OpError("invalid_op", kind + " export requires a sch document",
-                          {{"reason", "wrong doc kind"}, {"kind", kind}});
-    } else if (kind == "bom") {
-        // BOM is meaningful from EITHER side: the board knows placements, the schematic
-        // knows the netlist's components. Both are supported.
-        if (!is_pcb && !is_sch)
-            throw OpError("invalid_op", "bom export requires an ECAD document",
-                          {{"reason", "wrong doc kind"}, {"kind", kind}});
-    } else {
-        throw OpError("invalid_op", "ecad_export: unknown kind '" + kind + "'", {{"kind", kind}});
-    }
-
-    json files = json::object();
-    json warnings = json::array();
-    if (kind == "gerber") {
-        for (auto& kv : fab::write_gerbers(doc)) files[kv.first] = kv.second;
-    } else if (kind == "drill") {
-        for (auto& kv : fab::write_drill(doc)) files[kv.first] = kv.second;
-    } else if (kind == "cpl") {
-        const bool excl_tht = opts.contains("exclude_tht") && opts["exclude_tht"].is_boolean()
-                                  ? opts["exclude_tht"].get<bool>()
-                                  : true;
-        const bool excl_virt = opts.contains("exclude_virtual") && opts["exclude_virtual"].is_boolean()
-                                   ? opts["exclude_virtual"].get<bool>()
-                                   : true;
-        files["cpl"] = fab::write_placement(doc, excl_tht, excl_virt);
-    } else if (kind == "bom") {
-        const std::string fmt = opts.value("fmt", std::string("csv"));
-        const bool excl = opts.contains("exclude_dnp") && opts["exclude_dnp"].is_boolean()
-                              ? opts["exclude_dnp"].get<bool>()
-                              : true;
-        files["bom"] = is_pcb ? fab::write_bom(doc, fmt, excl)
-                              : fab::write_sch_bom(build_netlist(doc), fmt, excl);
-    } else if (kind == "netlist") {
-        files["netlist"] = fab::write_sch_netlist(doc, build_netlist(doc));
-    } else if (kind == "spice") {
-        files["spice"] = fab::write_spice_deck(doc, build_netlist(doc));
-    } else if (kind == "kicad") {
-        files["kicad"] = kicad::export_kicad_sch(doc);
-        warnings.push_back(
-            "kicad export is best-effort: chudware-only fields are written as properties");
-    } else if (kind == "svg") {
-        require_svg_leaf(opts.value("sheet", std::string()), true);
-        for (const auto& page : plot::schematic_svg_pages(doc, plot_opts_from(opts))) {
-            require_svg_leaf(page.first, true);
-            files[page.first] = page.second;
-        }
-    } else if (kind == "pdf") {
-        files["pdf"] = plot::schematic_pdf(doc, plot_opts_from(opts));
-    }
-
-    const std::string stem = export_stem(doc);
-    json out{{"files", files},
-             {"paths", write_export_files(files, kind, path, stem, opts)},
-             {"kind", kind}};
-    if (!warnings.empty()) out["warnings"] = warnings;
-    return out;
-}
-
-// ------------------------------------------------------------------- save / open
-
-json ecad_save(const std::string& doc_id, const std::string& path) {
+json ecad_save(const std::string& doc_id, const std::string& path, const json& recovery) {
     EcadLock lk;
-    Session& s = require_session(doc_id);
-    const std::string target = !path.empty() ? path : s.path;
-    if (target.empty())
-        throw OpError("io_error",
-                      "ecad_save: no path given and document has no current path",
-                      {{"reason", "missing path"}});
-    // Refuse to write a ZIP container over a foreign source file even if the caller
-    // asks explicitly — that silently destroys the user's .kicad_sch.
-    if (!s.source_path.empty() && fs::path(target) == fs::path(s.source_path))
-        throw OpError("io_error",
-                      "ecad_save: refusing to overwrite the imported source '" + s.source_path +
-                          "' with a .ecad+ container — save elsewhere, or use "
-                          "ecad_export(kind=\"kicad\") to write KiCad text back",
-                      {{"reason", "foreign source"}, {"source_path", s.source_path}});
-    std::string out = ecad_container_save(s.doc, target, s.extra_entries);
-    s.path = out;
-    s.dirty = false;
-    json resp{{"path", out}, {"format", "ecad+"}};
-    if (!s.source_path.empty()) resp["source_path"] = s.source_path;
-    return resp;
+    return save_locked(require_session(doc_id), path, recovery);
 }
 
 json ecad_open(const std::string& path) {
     EcadLock lk;
-
-    // Dispatch by extension (engine/ecad/rpc.py::_ecad_open): KiCad files route to
-    // their S-expr importers; .ecad+/.ecad/.json and anything else falls through to
-    // the container open below. The Python ImportError ("not_available") branch does
-    // not exist here — the C++ importers are always linked.
-    std::string suffix;
-    {
-        const std::size_t dot = path.find_last_of('.');
-        suffix = dot == std::string::npos ? "" : path.substr(dot);
-        for (char& c : suffix) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    json doc;
-    std::map<std::string, std::string> extra_entries;
+    if (path.empty()) throw OpError("io_error", "ecad_open: path is required");
+    const fs::path input = fs::u8path(path);
+    kicad_libs::set_project_dir(fs::absolute(input).parent_path().u8string());
+    const std::string suffix = extension(input);
+    const bool kicad_file = suffix == ".kicad_sch" || suffix == ".kicad_pcb";
+    json doc, metadata;
+    FileStamp stamp;
     std::vector<std::string> load_warnings;
-    if (suffix == ".kicad_sch" || suffix == ".kicad_pcb") {
-        const char* which = suffix == ".kicad_sch" ? "import_kicad_sch" : "import_kicad_pcb";
-        try {
-            doc = suffix == ".kicad_sch" ? kicad::import_kicad_sch(path)
-                                         : kicad::import_kicad_pcb(path);
-        } catch (const std::exception& exc) {
-            throw OpError("io_error",
-                          std::string(which) + " failed for '" + path + "': " + exc.what(),
-                          {{"path", path}});
+    if (kicad_file) {
+        const FileStamp before = file_stamp(input);
+        if (!before.exists) file_error("ECAD file does not exist", input);
+        doc = import_file(input);
+        stamp = file_stamp(input);
+        if (before != stamp)
+            throw OpError("external_change", "ECAD file changed while opening", {{"path", path}});
+        fs::path sidecar = input; sidecar += ".recovery.json";
+        if (fs::exists(sidecar)) {
+            std::ifstream in(sidecar);
+            try {
+                in >> metadata;
+                if (!metadata.value("human_dirty", false) ||
+                    !metadata.contains("snapshot") || !metadata["snapshot"].is_string() ||
+                    !same_path(fs::u8path(metadata["snapshot"].get<std::string>()), input) ||
+                    metadata.value("snapshot_size", std::uintmax_t{0}) != stamp.size ||
+                    metadata.value("snapshot_hash", std::string()) != std::to_string(stamp.hash))
+                    throw std::runtime_error("snapshot metadata does not match file");
+            } catch (const std::exception& exc) {
+                throw OpError("io_error", std::string("invalid ECAD recovery metadata: ") + exc.what(),
+                              {{"path", sidecar.u8string()}});
+            }
         }
+    } else if (suffix == ".ecad+" || suffix == ".ecad" || suffix == ".json") {
+        std::ifstream stream(input, std::ios::binary);
+        if (!stream) file_error("cannot read legacy ECAD file", input);
+        if ((stream >> std::ws).peek() == '{') {
+            try {
+                json payload;
+                stream >> payload;
+                if (payload.is_object() && payload.contains("doc") && payload["doc"].is_object()) {
+                    doc = payload["doc"];
+                    metadata = payload;
+                } else {
+                    doc = std::move(payload);
+                }
+            } catch (const std::exception& exc) {
+                throw OpError("io_error", std::string("invalid legacy ECAD JSON: ") + exc.what(),
+                              {{"path", path}});
+            }
+        } else {
+            auto loaded = ecad_container_open(path);
+            doc = std::move(loaded.doc);
+            load_warnings = std::move(loaded.warnings);
+            const auto marker = loaded.extra.find("chudware/recovery.json");
+            if (marker != loaded.extra.end()) metadata = json::parse(marker->second, nullptr, false);
+            for (const auto& [name, bytes] : loaded.extra) {
+                (void)bytes;
+                if (name != "thumbnail.png" && name != "chudware/recovery.json")
+                    load_warnings.push_back("Legacy attachment is not included in KiCad migration: " + name);
+            }
+        }
+        load_warnings.push_back("Legacy ECAD document imported for migration; save to a KiCad file.");
     } else {
-        EcadContainerDoc loaded = ecad_container_open(path);  // throws OpError on a bad file
-        doc = std::move(loaded.doc);
-        extra_entries = std::move(loaded.extra);
-        load_warnings = std::move(loaded.warnings);
+        throw OpError("invalid_op", "ecad_open: unsupported ECAD file extension", {{"path", path}});
     }
-
-    if (!(schema::is_schematic(doc) || schema::is_board(doc))) {
-        std::string sch = doc.is_object() ? doc.value("schema", std::string()) : "";
-        throw OpError("invalid_op", "not an ECAD document (" + sch + ")",
-                      {{"reason", "unknown schema"}});
+    if (!(schema::is_schematic(doc) || schema::is_board(doc)))
+        throw OpError("invalid_op", "not an ECAD document", {{"path", path}});
+    const bool recovered = metadata.is_object() && metadata.value("human_dirty", false);
+    ProjectSnapshot project;
+    if (recovered && schema::is_board(doc) && metadata.contains("board_settings"))
+        restore_board_settings(doc, metadata["board_settings"]);
+    else if (kicad_file && !recovered) {
+        project = read_project(input);
+        if (schema::is_board(doc)) import_project_settings(doc, project.data);
     }
 
     Session s;
     s.doc_id = new_doc_id();
-    s.doc = doc;                   // open_session deep-copies the doc
-    s.doc["id"] = s.doc_id;        // Python uses uuid4; the session id is faithful here
-    s.revision = 0;
-    if (suffix == ".kicad_sch" || suffix == ".kicad_pcb") {
-        // Imported foreign file: remember where it came from, and point the NATIVE save
-        // target at a sibling .ecad+ so a pathless Save can never clobber the source.
-        s.source_path = path;
-        s.source_format = suffix == ".kicad_sch" ? "kicad_sch" : "kicad_pcb";
-        s.path = fs::path(path).replace_extension(".ecad+").string();
-        load_warnings.push_back("imported " + s.source_format + " — Save writes the native '" +
-                                s.path + "'; the source file is left untouched");
-    } else {
+    s.doc = std::move(doc);
+    s.doc["id"] = s.doc_id;
+    if (recovered) {
+        if (metadata.contains("name") && metadata["name"].is_string() &&
+            !metadata["name"].get<std::string>().empty())
+            s.doc["name"] = metadata["name"];
+        const std::string original = metadata.contains("path") && metadata["path"].is_string()
+                                         ? metadata["path"].get<std::string>() : std::string();
+        const std::string expected = schema::is_schematic(s.doc) ? ".kicad_sch" : ".kicad_pcb";
+        if (!original.empty() && extension(fs::u8path(original)) == expected) {
+            s.path = original;
+            // An old recovery with no fingerprint must not overwrite an existing file.
+            s.stamp = stamp_from_json(metadata.value("baseline", json::object()));
+            s.project_stamp = stamp_from_json(metadata.value("project_baseline", json::object()));
+            s.rules_stamp = stamp_from_json(metadata.value("rules_baseline", json::object()));
+            if (metadata.contains("project_document") && metadata["project_document"].is_object())
+                s.project_document = metadata["project_document"];
+            if (metadata.contains("custom_rules") && metadata["custom_rules"].is_string())
+                s.custom_rules = metadata["custom_rules"].get<std::string>();
+            if (schema::is_board(s.doc) && metadata.contains("saved_board_settings") &&
+                metadata["saved_board_settings"].is_object())
+                s.saved_settings = metadata["saved_board_settings"];
+        }
+        s.dirty = true;
+        load_warnings.push_back("Recovered unsaved ECAD work.");
+    } else if (kicad_file) {
         s.path = path;
+        s.stamp = stamp;
+        s.project_stamp = project.stamp;
+        s.rules_stamp = project.rules_stamp;
+        s.project_document = project.stamp.exists ? std::move(project.data) : json(nullptr);
+        s.custom_rules = std::move(project.rules);
+        if (schema::is_board(s.doc)) s.saved_settings = board_settings(s.doc);
     }
-    s.extra_entries = std::move(extra_entries);
-    Session& stored = g_sessions[s.doc_id] = std::move(s);
+    const std::string id = s.doc_id;
+    Session& stored = g_sessions[id] = std::move(s);
+    try {
+        json resp = ops_response(stored, json::object(), json::array(), false);
+        resp["doc_id"] = id;
+        resp["path"] = stored.path;
+        resp["project"] = project_path(stored.path);
+        resp["warnings"] = load_warnings;
+        return resp;
+    } catch (...) {
+        g_sessions.erase(id);
+        throw;
+    }
+}
 
-    // ecad_open -> rebuild() (no op application, no rev bump) + doc_id + warnings.
-    json resp = ops_response(stored, json::object(), json::array());
-    resp["doc_id"] = stored.doc_id;
-    json warnings = json::array();
-    for (const std::string& w : load_warnings) warnings.push_back(w);
-    resp["warnings"] = warnings;
-    return resp;
+json ecad_new_project(const std::string& dir, const std::string& name) {
+    if (dir.empty() || name.empty() || name == "." || name == ".." ||
+        fs::u8path(name).filename().u8string() != name)
+        throw OpError("invalid_op", "ecad_new_project requires a directory and a project name");
+    const fs::path base = fs::u8path(dir) / fs::u8path(name);
+    fs::path project = base; project += ".kicad_pro";
+    fs::path sch_path = base; sch_path += ".kicad_sch";
+    fs::path pcb_path = base; pcb_path += ".kicad_pcb";
+    for (const auto& file : {project, sch_path, pcb_path})
+        if (fs::exists(file))
+            throw OpError("io_error", "ecad_new_project: file already exists", {{"path", file.u8string()}});
+    ensure_project(sch_path, true);
+    json sch, pcb;
+    try {
+        sch = ecad_new("sch", name, sch_path.u8string());
+        pcb = ecad_new("pcb", name, pcb_path.u8string());
+    } catch (...) {
+        if (sch.is_object()) ecad_close(sch.value("doc_id", std::string()));
+        if (pcb.is_object()) ecad_close(pcb.value("doc_id", std::string()));
+        throw;
+    }
+    return {{"project", project.u8string()}, {"sch", sch}, {"pcb", pcb}};
+}
+
+json ecad_open_project(const std::string& path) {
+    const fs::path input = fs::u8path(path);
+    const std::string ext = extension(input);
+    if (path.empty() || (ext != ".kicad_pro" && ext != ".kicad_sch" && ext != ".kicad_pcb"))
+        throw OpError("invalid_op", "ecad_open_project requires a KiCad project, schematic, or board");
+    if (!fs::exists(input)) file_error("KiCad project file does not exist", input);
+    fs::path project = input; project.replace_extension(".kicad_pro");
+    fs::path sch_path = input; sch_path.replace_extension(".kicad_sch");
+    fs::path pcb_path = input; pcb_path.replace_extension(".kicad_pcb");
+    json sch = nullptr, pcb = nullptr;
+    try {
+        if (fs::exists(sch_path)) sch = ecad_open(sch_path.u8string());
+        if (fs::exists(pcb_path)) pcb = ecad_open(pcb_path.u8string());
+    } catch (...) {
+        if (sch.is_object()) ecad_close(sch.value("doc_id", std::string()));
+        if (pcb.is_object()) ecad_close(pcb.value("doc_id", std::string()));
+        throw;
+    }
+    return {{"project", project.u8string()}, {"sch", sch}, {"pcb", pcb}};
 }
 
 // ------------------------------------------------------------- update_from_sch
@@ -942,6 +1657,8 @@ json swap_doc_locked(Session& s, const json& new_doc, long base_revision, const 
         throw OpError("invalid_op", "resulting document failed validation: " + joined,
                       {{"reason", errs.empty() ? "invalid document" : errs[0]}});
     }
+    if (s.doc == new_doc)
+        return ops_response(s, json::object(), warnings, refresh_zone_fill);
     push_undo(s);
     s.doc = new_doc;  // deep copy (value semantics)
     s.revision += 1;
@@ -981,6 +1698,9 @@ json ecad_update_from_sch(const std::string& board_doc_id, const std::string& sc
     }
     // Carry the schematic's id so sync records board.linked_sch = the source schematic.
     netlist["id"] = sch_s.doc.contains("id") ? sch_s.doc["id"] : json(nullptr);
+    // Netlist resolution uses the schematic's tables; footprint placement uses
+    // the board project's tables, which can belong to a different project.
+    (void)require_session(board_doc_id);
 
     json result = update_board_from_sch(board_s.doc, netlist,
                                         place_origin.is_null() ? json(nullptr) : place_origin, prune);
@@ -1114,10 +1834,12 @@ json apply_route_result(Session& s, const json& result, long base_revision,
                           std::to_string(s.revision),
                       {{"current_revision", s.revision}});
     json res = apply_ops(s.doc, ops);
-    push_undo(s);
-    s.doc = res["doc"];
-    s.revision += 1;
-    s.dirty = true;
+    if (s.doc != res["doc"]) {
+        push_undo(s);
+        s.doc = res["doc"];
+        s.revision += 1;
+        s.dirty = true;
+    }
     json resp = ops_response(s, res["id_map"],
                              res.contains("warnings") ? res["warnings"] : json::array());
     if (!warnings.empty()) {
@@ -1329,6 +2051,15 @@ json ecad_session_doc(const std::string& doc_id) {
     return s.doc;  // value semantics -> deep copy
 }
 
+json session_file_info(const std::string& doc_id, bool include_doc) {
+    EcadLock lk;
+    Session& s = require_session(doc_id);
+    json result{{"path", s.path}, {"kind", schema::doc_kind(s.doc)}, {"dirty", s.dirty},
+                {"revision", s.revision}};
+    if (include_doc) result["doc"] = s.doc;
+    return result;
+}
+
 // ------------------------------------------------------------------ resolve_pick
 
 namespace {
@@ -1504,8 +2235,7 @@ json ecad_resolve_pick(const std::string& doc_id, const json& xy, const json& ki
         if (layer.empty()) return true;
         if (e.contains("layer") && e["layer"].is_string()) return e["layer"] == layer;
         if (e.contains("layers") && e["layers"].is_array())
-            for (const auto& l : e["layers"])
-                if (l.is_string() && l.get<std::string>() == layer) return true;
+            return schema::pad_has_layer(e, layer);
         return !e.contains("layer") && !e.contains("layers");
     };
     if (wanted("pad") && doc.contains("footprints") && doc["footprints"].is_array()) {
@@ -1602,15 +2332,12 @@ std::pair<double, double> pin_root_world(const json& sym, const json& pin) {
     return schema::pin_world(sym, p);
 }
 
-// Locate a pin definition by NUMBER, falling back to NAME (the recipe vocabulary uses
-// "+"/"-" for sources but "1"/"2" for passives).
+// Recipes address actual KiCad pins by number.
 const json* find_pin(const json& def, const std::string& want) {
     auto pins = def.find("pins");
     if (pins == def.end() || !pins->is_array()) return nullptr;
     for (const auto& p : *pins)
         if (p.value("number", std::string()) == want) return &p;
-    for (const auto& p : *pins)
-        if (p.value("name", std::string()) == want) return &p;
     return nullptr;
 }
 
@@ -1690,6 +2417,7 @@ json ecad_design(const std::string& request, const std::string& name) {
     std::sort(net_names.begin(), net_names.end());
 
     constexpr double kStub = 5.08;  // two grid steps
+    std::set<std::string> flagged_supplies;
     for (const std::string& net : net_names) {
         const json& members = design["nets"][net];
         if (!members.is_array()) continue;
@@ -1715,19 +2443,34 @@ json ecad_design(const std::string& request, const std::string& name) {
             if (mag < 1e-9) { dx = 1.0; dy = 0.0; } else { dx /= mag; dy /= mag; }
             const double ex = tip.first + dx * kStub, ey = tip.second + dy * kStub;
 
-            wire_ops.push_back(json{{"op", "sch_add_wire"},
-                                    {"pts", json::array({json::array({tip.first, tip.second}),
-                                                         json::array({ex, ey})})}});
-            if (is_supply_net(net))
+            const bool supply = is_supply_net(net);
+            const bool flag = supply && flagged_supplies.insert(net).second;
+            const json tip_pos = json::array({tip.first, tip.second});
+            const json end_pos = json::array({ex, ey});
+            if (flag) {
+                // KiCad connects a flag to a wire endpoint, not its interior.
+                const json midpoint = json::array({(tip.first + ex) / 2.0,
+                                                   (tip.second + ey) / 2.0});
+                wire_ops.push_back(json{{"op", "sch_add_wire"},
+                                        {"pts", json::array({tip_pos, midpoint})}});
+                wire_ops.push_back(json{{"op", "sch_add_wire"},
+                                        {"pts", json::array({midpoint, end_pos})}});
+                wire_ops.push_back(json{{"op", "sch_add_power"}, {"pos", midpoint},
+                                        {"net", net}, {"symbol", "PWR_FLAG"}});
+            } else {
+                wire_ops.push_back(json{{"op", "sch_add_wire"},
+                                        {"pts", json::array({tip_pos, end_pos})}});
+            }
+            if (supply) {
                 wire_ops.push_back(json{{"op", "sch_add_power"},
                                         {"pos", json::array({ex, ey})},
                                         {"net", net},
                                         {"symbol", power_symbol_for(net)}});
-            else
+            } else
                 wire_ops.push_back(json{{"op", "sch_add_label"},
                                         {"pos", json::array({ex, ey})},
                                         {"text", net},
-                                        {"scope", "global"}});
+                                        {"scope", "local"}});
         }
     }
     if (!wire_ops.empty()) {
@@ -1743,6 +2486,9 @@ json ecad_design(const std::string& request, const std::string& name) {
                             {"rev", "A"},
                             {"comment1", design.value("request", request)},
                             {"comment2", design.value("notes", std::string())}});
+    if (design.contains("spice_directives") && design["spice_directives"].is_string())
+        meta_ops.push_back(json{{"op", "sch_add_text"}, {"pos", json::array({0.0, -90.0})},
+                                {"text", design["spice_directives"]}, {"size", 1.0}});
     json final_resp = ecad_apply_ops(doc_id, revision, meta_ops);
 
     final_resp["doc_id"] = doc_id;

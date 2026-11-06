@@ -10,6 +10,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
+#include <csignal>
+#include <thread>
 
 #include <fcntl.h>
 #include <limits.h>
@@ -172,7 +175,12 @@ void SingleInstance::release() {
     }
 }
 
-bool spawnDetached(const std::string& exe, const std::string& arg, std::string& err) {
+bool spawnDetached(const std::string& exe, const std::string& arg, std::string& err,
+                   const std::atomic<bool>* cancelled) {
+    if (cancelled && cancelled->load(std::memory_order_acquire)) {
+        err = "aborted";
+        return false;
+    }
 #ifndef CHUDWARE_DEVELOPER_BUILD
     namespace fs = std::filesystem;
     const fs::path self = chudware::platform::executablePath();
@@ -237,7 +245,30 @@ bool spawnDetached(const std::string& exe, const std::string& arg, std::string& 
     ::close(pinnedFd);
 #endif
     int status = 0;
-    ::waitpid(pid, &status, 0);
+    if (cancelled) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        for (;;) {
+            const pid_t reaped = ::waitpid(pid, &status, WNOHANG);
+            if (reaped == pid) break;
+            if (reaped < 0 && errno != EINTR) {
+                err = "hostd spawn acknowledgement failed";
+                return false;
+            }
+            if (cancelled->load(std::memory_order_acquire) ||
+                std::chrono::steady_clock::now() >= deadline) {
+                // Only the intermediate spawn helper is ours to terminate, never
+                // a daemon that may already be running work in its own process.
+                ::kill(pid, SIGKILL);
+                while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+                err = cancelled->load(std::memory_order_acquire)
+                    ? "aborted" : "hostd spawn acknowledgement timed out";
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    } else {
+        while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    }
     return true;
 }
 

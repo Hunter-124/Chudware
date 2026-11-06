@@ -14,10 +14,14 @@
 #include <functional>
 #include <string>
 
-#include "agent/state.h"  // ojson
+#include <nlohmann/json.hpp>
 
 namespace chudware {
 namespace agent {
+
+// Ordered JSON: object key iteration preserves INSERTION order, so doc digests and
+// form schemas are rendered into prompts in the order the caller built them.
+using ojson = nlohmann::ordered_json;
 
 extern const char* kAskRole;    // "ask"
 extern const char* kAskSystem;  // the verbatim _SYSTEM string

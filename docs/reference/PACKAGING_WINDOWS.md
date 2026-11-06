@@ -16,13 +16,13 @@ from the same generated version header.
   into `host\build-win`.
 - **Compiled sidecars** — `packaging/windows/build_sidecars.ps1` Nuitka-compiles
   `chudware-worker.exe` and `chudware-mcp.exe` from `services/compiled_entry.py`, stages the
-  pinned Chudcode `chud.exe`, and generates the protected prompt/role assets. It needs a
+  pinned official OMP `omp.exe`, and generates the protected prompt/role assets. It needs a
   release Python with `packaging/requirements-release.txt` installed (Nuitka, PyYAML,
   cryptography, and the runtime packages the sidecars must bundle, e.g. pycolmap/numpy) and
   host/hostd trees configured with `-DCHUDWARE_DEVELOPER_BUILD=OFF`.
 - **`services/installer/build_release.py`** — copies the GUI runtime tree (rejecting source,
   `.pdb`, test binaries and symlinks), the required `chudware-hostd.exe`,
-  `chudware-worker.exe`, `chudware-mcp.exe`, `chud.exe`, `chudware-uninstall-helper.exe`,
+  `chudware-worker.exe`, `chudware-mcp.exe`, `omp.exe`, `chudware-uninstall-helper.exe`,
   `install.ps1`, the repository-root `LICENSE` and `THIRD_PARTY_NOTICES.md` into
   `<out>\Chudware\`, then writes and verifies the payload manifest.
   `--prepare-signing --payload-only` emits the signing preimage; `--finalize-signing <sig>`
@@ -50,13 +50,13 @@ from the same generated version header.
    `CHUDWARE_WHEELHOUSE` (reviewed offline wheelhouse) and `CHUDWARE_BASE_PYTHON` (separate
    base interpreter); `build_sidecars.ps1` then authenticates the venv against
    `vendor/python/RUNTIME_WHEELS.lock` before compiling.
-3. The Chudcode artifact (`CHUDWARE_CHUD_BIN`) matching `vendor/chudcode/CHUDCODE_ARTIFACT.lock`:
-   `python scripts\pin_chudcode.py ensure --target windows-x86_64 --cache-dir <dir>` downloads
-   and verifies it from the public Chudcode release.
+3. The official OMP artifact (`CHUDWARE_OMP_BIN` or `-OmpBinary`) matching `vendor/omp/OMP_ARTIFACT.lock`:
+   `python scripts\pin_omp.py ensure --target windows-x86_64 --cache-dir <dir>` downloads
+   and verifies the upstream release binary. The sidecar build also stages the locked notices.
 4. [Inno Setup 6](https://jrsoftware.org/isinfo.php), with `ISCC.exe` on `PATH` or its full
    path in `ISCC`.
 5. The release key id/public key for payload signing, and for Authenticode the certificate and
-   Windows SDK `signtool.exe` described in `docs/SIGNING.md`.
+   Windows SDK `signtool.exe` described in [SIGNING.md](SIGNING.md).
 
 ## Build
 
@@ -77,8 +77,8 @@ powershell -ExecutionPolicy Bypass -File packaging\windows\build_sidecars.ps1 `
 
 python -m services.installer.build_release --prepare-signing --payload-only --out dist `
   --worker-bin $sidecars\chudware-worker.exe --mcp-bin $sidecars\chudware-mcp.exe `
-  --chud-bin $sidecars\chud.exe
-# sign dist\Chudware\payload-manifest.v1.preimage (packaging/ci_sign.py or sign_release.py), then:
+  --omp-bin $sidecars\omp.exe
+# sign dist\payload-manifest.v1.preimage (packaging/ci_sign.py or sign_release.py), then:
 python -m services.installer.build_release --finalize-signing .\payload.sig `
   --release-public-key .\release-public.pem --out dist
 # -> dist\Chudware-Setup-<CHUDWARE_VERSION>-x86_64.exe
@@ -120,8 +120,9 @@ The platform sources include `services/ipc/ipc_transport_win.cpp`,
 `core/hostd/worker_bridge.cpp` and `services/mcp/daemon_bridge.py`. The checklist
 below remains the installed-runtime acceptance gate, not a claim that every
 manual scenario has passed.
-Use an isolated instance key for this checklist and only terminate the daemon and
-children started for that validation. A running user session is not a test fixture.
+Use an isolated developer-build instance key, or an isolated install path for a
+release build (which ignores key overrides). Only terminate the daemon and children
+started for that validation. A running user session is not a test fixture.
 
 ### Build
 
@@ -221,7 +222,7 @@ children started for that validation. A running user session is not a test fixtu
 
 ## Installer integration — verification checklist
 
-Current wiring (untested on a real Windows box): `build_release.py` requires and stages
+Current wiring: `build_release.py` requires and stages
 `chudware-hostd.exe` (never its `.pdb`); the `.iss` sets `CloseApplications=yes`; the developer
 `install.ps1` stops install-dir daemons (`--stop --force`, then an image-path-scoped
 `taskkill`) and `register_mcp.py --hostd-bin` pins `CHUDWARE_HOSTD_BIN` in the MCP server env.

@@ -8,9 +8,10 @@
 #include "agent_text.h"
 #include "stream_rows.h"              // ui::streamTextVisible — a blank prose box draws nothing
 #include "tool_outcome.h"
+#include "activity_settlement.h"
 #include "ui/copilot/tool_phrase.h"   // human phrasing + grouping for raw MCP tool symbols
 #include "ui/ai/ai_prefs.h"           // cached chat-display prefs (Settings -> AI -> Harness)
-#include "gl_compat.h"                // glDeleteTextures — bounded artifact texture cache
+#include "ui/copilot/image_lightbox.h"
 #include "util/time_local.h"
 #include "ui/file_dialog.h"
 
@@ -68,9 +69,9 @@ std::string sanitizeAgentText(AppState& st, const std::string& s, bool jsonBody)
 
 // Applied IN PLACE, so the persisted transcript and the right-click "Copy text" path
 // (ui_common chatActivityCopyText) see the same clean strings. Restricted to the prose row kinds
-// (0 thinking/action, 1 context chip, 2 thought box, 3 tool call) — rowKind >= 4 are
-// corporate/swarm cards whose detail is a JSON payload cards.cpp re-parses, and those carry no
-// doc ids. Only a tool row's detail is an args JSON body.
+// (0 thinking/action, 1 context chip, 2 thought box, 3 tool call). Other row kinds
+// include structured card payloads that must not be rewritten. Only a tool row's
+// detail is an args JSON body.
 //
 // Both halves are idempotent, but "idempotent" is not "free": their unchanged path still returns
 // the string BY VALUE. This runs over every visible row every frame, and a mission turn keeps
@@ -88,19 +89,23 @@ void sanitizeAgentTextInPlace(AppState& st, std::string& s, bool jsonBody) {
 // minted a new doc-cpp00000003, and the card turned into "no such document 'AI: upper_arm_revD'
 // … Open parts: sixaxis=\"sixaxis\"" — a tab label the agent never sent, reported as missing
 // while it sat open (2026-09-28, c221). A failure is a diagnostic; its ids stay verbatim.
-static void sanitizeActivityItem(AppState& st, ActivityItem& a) {
-    if (a.rowKind > 3) return;
-    if (a.rowKind == 3 && a.status == "fail") {
-        for (std::string* s : {&a.reason, &a.detail, &a.title})
-            if (!s->empty() && ui::agentTextMayChange(*s)) *s = ui::foldToAtlasGlyphs(*s);
-        return;
-    }
+static bool sanitizeActivityItem(AppState& st, ActivityItem& a) {
+    if (a.rowKind > 3) return false;
+    const bool failed = a.rowKind == 3 && a.status == "fail";
+    bool changed = false;
     // A tool row's reason is its TARGET ("AI: surface"), a compact label on the row's title
     // line: the "(doc-cpp00000002)" parenthetical is engine noise there, exactly as in the args
     // JSON. Prose rows keep it (it reads well inside a sentence).
-    sanitizeAgentTextInPlace(st, a.reason, /*jsonBody=*/a.rowKind == 3);
-    sanitizeAgentTextInPlace(st, a.detail, /*jsonBody=*/a.rowKind == 3);
-    sanitizeAgentTextInPlace(st, a.title);
+    for (std::string* s : {&a.reason, &a.detail, &a.title}) {
+        if (s->empty() || !ui::agentTextMayChange(*s)) continue;
+        std::string clean = failed ? ui::foldToAtlasGlyphs(*s)
+            : sanitizeAgentText(st, *s, a.rowKind == 3 && s != &a.title);
+        if (*s != clean) {
+            *s = std::move(clean);
+            changed = true;
+        }
+    }
+    return changed;
 }
 
 // ---- collapse animation (ui::chatCollapseAnim) ----------------------------------------------
@@ -180,8 +185,9 @@ static void endCollapseBody(CollapseBody& b) {
 //   raw ops payload          one dim mono line with the same disclosure
 //   anything that failed     a soft rounded Tone::Err tint + hairline (a refusal: Tone::Info)
 //
-// Status lives in the run spine's gutter, so no row carries a coloured rail any more: a rail per
-// step was the "hard red bar" that made a failed call read like a broken layout.
+// Status lives in the row's own tone, not in a glyph: a failed call is the soft Tone::Err tint plus an
+// error-toned title, a live one swaps its icon for the busy mark, and no row carries a coloured rail
+// — a rail per step was the "hard red bar" that made a failed call read like a broken layout.
 //
 // Measure-then-fill exactly like beginGlassBubble: the body draws on a front channel and the shell
 // is painted behind it once the child's true height is known, so an auto-height row needs no
@@ -282,10 +288,9 @@ static ImRect endRowShell(const RowShell& sh) {
     return r;
 }
 
-// The tone for a row, from the same status vocabulary the gutter spine mark uses — so a red mark
-// in the gutter can never sit beside an amber shell. A plain COMPLETED step gets Neutral rather
-// than Tone::Ok on purpose: the gutter already carries its check, and eight green shells down a
-// finished turn is a wall of chroma that says nothing.
+// The tone for a row, from the harness status vocabulary. A plain COMPLETED step gets Neutral
+// rather than Tone::Ok on purpose: eight green shells down a finished turn is a wall of chroma that
+// says nothing.
 static ui::kit::Tone rowToneOf(const std::string& status, bool guardRefusal) {
     if (status == "fail" || status == "error")
         return guardRefusal ? ui::kit::Tone::Info : ui::kit::Tone::Err;
@@ -299,15 +304,6 @@ static ui::kit::Tone rowToneOf(const std::string& status, bool guardRefusal) {
 // Every disclosable row shares ONE header grammar: [icon] title  dim target ...... meta [chevron].
 // The chevron lane is reserved on every row (drawer or not) so the right-aligned numbers form one
 // column down the whole turn.
-
-// Where the header line's centre landed, for the run spine: each row painter records the FIRST
-// header it draws, so the gutter mark sits on the title's centre line rather than on a guessed
-// offset from the row's top. drawAgentTimeline resets it before every row.
-static float g_rowHeadY = -1.0f;
-static void noteRowHead() {
-    if (g_rowHeadY >= 0.0f) return;
-    g_rowHeadY = (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f;
-}
 
 // Right-hand lanes of a header line, in window-local x. The chevron cell sits flush right, inset by
 // half a pad so the pane's overlaid pill scrollbar can never cover it; meta right-aligns against it.
@@ -337,8 +333,8 @@ void chatPaintDisclosure(ImDrawList* dl, ImVec2 c, float r, float openT, ImU32 c
     dl->AddPolyline(pts, 3, col, ImDrawFlags_None, ui::metrics::stroke(1.5f));
 }
 
-// The whole header line is the disclosure's hit target (no "(details)" link to aim at). A real
-// control on the line — the per-call rewind glyph — keeps its own click. Returns {hovered, clicked}.
+// The whole header line is the disclosure's hit target (no "(details)" link to aim at). Any
+// real control on the line keeps its own click. Returns {hovered, clicked}.
 struct HeaderHit {
     bool hovered = false;
     bool clicked = false;
@@ -378,6 +374,21 @@ static void rowIcon(const char* name, const ImVec4& tint) {
     const float  y  = p.y + (lh - gz) * 0.5f;
     ImGui::GetWindowDrawList()->AddImage(iv.texId, ImVec2(p.x, y), ImVec2(p.x + gz, y + gz),
                                          iv.uv0, iv.uv1, ImGui::ColorConvertFloat4ToU32(tint));
+}
+
+// The row's leading cell: its atlas icon, or — while the step is running — the busy mark in the
+// same cell, so a live row announces itself with no gutter column and no status glyph.
+static void rowLead(const char* name, const ImVec4& tint, bool running) {
+    if (!running) {
+        rowIcon(name, tint);
+        return;
+    }
+    const float  lh = ImGui::GetTextLineHeight();
+    const float  gz = lh * 0.86f;
+    const ImVec2 p  = ImGui::GetCursorScreenPos();
+    ImGui::Dummy(ImVec2(gz, lh));
+    ui::kit::statusGlyph(ImGui::GetWindowDrawList(), ImVec2(p.x + gz * 0.5f, p.y + lh * 0.5f),
+                         gz * 0.30f, ui::kit::Status::Running, chatSurf());
 }
 
 // Small rounded count badge sized to the text line ("Read  [2]"), so a folded group never grows
@@ -425,39 +436,11 @@ static void italicText(const char* text, const ImVec4& col) {
     italicEnd(s);
 }
 
-// ---- inline artifact thumbnails: bounded texture cache --------------------------------------
-// Renders are now written once per render_part call, so the old unbounded path-keyed map leaked
-// one GL texture per call for the life of the process. LRU-bounded; eviction deletes on the GL
-// thread, the only thread that ever draws these rows. There is no shared Tex release helper in
-// the host (app_state.cpp:1176 deletes inline exactly the same way), so the delete lives here.
-struct ArtTexEntry {
-    Tex                tex;
-    unsigned long long use = 0;
-};
-static std::unordered_map<std::string, ArtTexEntry> s_artTex;
-static unsigned long long s_artTexClock = 0;
-static constexpr size_t kArtTexCap = 48;
-
-static const Tex& artTexFor(const std::string& path) {
-    auto it = s_artTex.find(path);
-    if (it != s_artTex.end()) {
-        it->second.use = ++s_artTexClock;
-        return it->second.tex;
-    }
-    while (s_artTex.size() >= kArtTexCap) {
-        auto oldest = s_artTex.begin();
-        for (auto i = s_artTex.begin(); i != s_artTex.end(); ++i)
-            if (i->second.use < oldest->second.use) oldest = i;
-        if (oldest->second.tex.id) {
-            unsigned int id = oldest->second.tex.id;
-            glDeleteTextures(1, &id);
-        }
-        s_artTex.erase(oldest);
-    }
-    ArtTexEntry e;
-    e.tex = loadTexture(path);
-    e.use = ++s_artTexClock;
-    return s_artTex.emplace(path, e).first->second.tex;
+// Decoding is shared with attachment previews; no file I/O or GL upload occurs here.
+static Tex artTexFor(const std::string& path) {
+    Tex tex;
+    tex.id = (unsigned int)(intptr_t)ui::copilot::asyncImageTexture(path, 1024, &tex.w, &tex.h);
+    return tex;
 }
 
 // C45: local models reply in markdown but ImGui renders plain text — the raw ** and ###
@@ -579,22 +562,37 @@ static bool isThinkingItem(const ActivityItem& a) {
 // Declared in copilot_internal.h: chat_log.cpp bounds its model-name labels with it too.
 std::string chatEllipsize(const std::string& s, float maxW) {
     if (maxW <= 0.0f) return s;
-    if (ImGui::CalcTextSize(s.c_str()).x <= maxW) return s;
+    ImFont* font = ImGui::GetFont();
+    const float fs = ImGui::GetFontSize();
+    const char* begin = s.data();
+    const char* end = begin + s.size();
+    const char* cut = begin;
+    font->CalcTextSizeA(fs, maxW, 0.0f, begin, end, &cut);
+    if (cut == end) return s;
     static const char* kEll = "\xe2\x80\xa6";
-    const float ellW = ImGui::CalcTextSize(kEll).x;
-    std::string out = s;
-    while (!out.empty() && ImGui::CalcTextSize(out.c_str()).x + ellW > maxW) out.pop_back();
-    while (!out.empty() && (out.back() & 0xC0) == 0x80) out.pop_back();  // UTF-8 boundary
-    while (!out.empty() && out.back() == ' ') out.pop_back();
-    return out.empty() ? s : out + kEll;
+    const float ellW = font->CalcTextSizeA(fs, FLT_MAX, 0.0f, kEll).x;
+    font->CalcTextSizeA(fs, ImMax(0.0f, maxW - ellW), 0.0f, begin, end, &cut);
+    while (cut > begin && cut[-1] == ' ') --cut;
+    return std::string(begin, cut) + kEll;
 }
 
 // The reasoning one-liner shared by drawThinkingBlock and drawThoughtBox: a dim italic label (the
 // working sweep while it is live) and — while collapsed — the thought's first line, ellipsized, on
 // the SAME line instead of a second one. The tooltip carries the untruncated preview line: an
 // ellipsis with no way to read what it ate is a dead end. Returns the header's centre y.
+static std::string thoughtPreview(const std::string& text) {
+    size_t end = 0;
+    while (end < text.size() && end < 256 && text[end] != '\n') ++end;
+    const bool capped = end < text.size() && text[end] != '\n';
+    while (end > 0 && end < text.size() && ((unsigned char)text[end] & 0xC0) == 0x80) --end;
+    std::string preview = stripMdMarks(text.substr(0, end));
+    if (capped) preview += "\xe2\x80\xa6";
+    return preview;
+}
+
 static float thoughtHeader(const ui::Fonts& fonts, const char* label, bool live,
-                           const std::string& preview, const RowLanes& lanes) {
+                           const std::string& preview, const RowLanes& lanes,
+                           const std::string& fullDetail) {
     const ui::AdaptiveSurface& surf = chatSurf();
     ImGui::PushFont(fonts.body);
     {
@@ -610,7 +608,6 @@ static float thoughtHeader(const ui::Fonts& fonts, const char* label, bool live,
         }
         italicEnd(s);
     }
-    noteRowHead();
     const float centerY = (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f;
     if (!preview.empty()) {
         ImGui::SameLine(0, ui::metrics::U(1.5f));
@@ -618,12 +615,76 @@ static float thoughtHeader(const ui::Fonts& fonts, const char* label, bool live,
         if (room > ui::metrics::U(8.0f)) {
             const std::string fit = chatEllipsize(preview, room);
             italicText(fit.c_str(), surf.textTertiary);
-            if (fit != preview && ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", preview.c_str());
+            if (ImGui::IsItemHovered()) {
+                const size_t lineEnd = fullDetail.find('\n');
+                if (fit != preview || std::min(lineEnd, fullDetail.size()) > 256) {
+                    const std::string fullPreview = stripMdMarks(fullDetail.substr(0, lineEnd));
+                    ImGui::SetTooltip("%s", fullPreview.c_str());
+                }
+            }
         }
     }
     ImGui::PopFont();
     return centerY;
+}
+
+struct SentDetail {
+    uint64_t revision = ~uint64_t(0);
+    const char* source = nullptr;
+    size_t size = 0;
+    int frame = -1;
+    std::string reply, sent;
+    std::vector<std::string> alternatives;
+};
+
+static const SentDetail& sentDetail(const ActivityItem& a) {
+    static std::unordered_map<ImGuiID, SentDetail> cache;
+    const ImGuiID id = ImGui::GetID("##sent_detail");
+    if (cache.find(id) == cache.end() && cache.size() >= 64) {
+        auto oldest = cache.begin();
+        for (auto it = cache.begin(); it != cache.end(); ++it)
+            if (it->second.frame < oldest->second.frame) oldest = it;
+        cache.erase(oldest);
+    }
+    SentDetail& d = cache[id];
+    if (d.revision != a.revision || d.source != a.detail.data() || d.size != a.detail.size()) {
+        d.reply = a.detail;
+        d.sent.clear();
+        d.alternatives.clear();
+        const char* mark = "\n\x1e" "SENT\x1e\n";
+        const char* bare = "\x1e" "SENT\x1e\n";
+        const size_t at = d.reply.find(mark);
+        if (at != std::string::npos) {
+            d.sent = d.reply.substr(at + std::strlen(mark));
+            d.reply.resize(at);
+        } else if (d.reply.rfind(bare, 0) == 0) {
+            d.sent = d.reply.substr(std::strlen(bare));
+            d.reply.clear();
+        }
+        if (!d.reply.empty() && (d.reply[0] == '{' || d.reply[0] == '[')) {
+            const auto j = nlohmann::json::parse(d.reply, nullptr, false);
+            if (j.is_object()) {
+                for (const char* key : {"alternatives", "alt_classes", "candidates"}) {
+                    const auto found = j.find(key);
+                    if (found == j.end() || !found->is_array()) continue;
+                    for (const auto& item : *found) {
+                        if (item.is_string()) d.alternatives.push_back(item.get<std::string>());
+                        else if (item.is_object()) {
+                            std::string title = jstr(item, "task_class");
+                            if (title.empty()) title = jstr(item, "class");
+                            if (title.empty()) title = jstr(item, "name");
+                            if (!title.empty()) d.alternatives.push_back(std::move(title));
+                        }
+                    }
+                }
+            }
+        }
+        d.revision = a.revision;
+        d.source = a.detail.data();
+        d.size = a.detail.size();
+    }
+    d.frame = ImGui::GetFrameCount();
+    return d;
 }
 
 // A collapsible, dimmed reasoning block. While it is the live frontier of the turn (or still
@@ -637,7 +698,6 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
         ImGui::Indent(ui::kit::padX());   // the rows' text column: one left edge for the timeline
         ImGui::PushFont(fonts.body);
         italicText(label, chatSurf().textSecondary);
-        noteRowHead();
         ImGui::PopFont();
         ImGui::Unindent(ui::kit::padX());
         return;
@@ -647,20 +707,9 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
     // explicitly toggled it: a user collapse must stick even mid-run.
     const bool open = a.userToggled ? a.expanded : (a.expanded || a.streaming || liveFrontier);
     // Split detail into reply body + optional packed sent-prompt trailer.
-    std::string replyBody = a.detail;
-    std::string sentBody;
-    {
-        const char* kSentMark = "\n\x1e" "SENT\x1e\n";
-        const char* kSentMarkBare = "\x1e" "SENT\x1e\n";
-        size_t mark = replyBody.find(kSentMark);
-        if (mark != std::string::npos) {
-            sentBody = replyBody.substr(mark + std::strlen(kSentMark));
-            replyBody = replyBody.substr(0, mark);
-        } else if (replyBody.rfind(kSentMarkBare, 0) == 0) {
-            sentBody = replyBody.substr(std::strlen(kSentMarkBare));
-            replyBody.clear();
-        }
-    }
+    const SentDetail& detail = sentDetail(a);
+    const std::string& replyBody = detail.reply;
+    const std::string& sentBody = detail.sent;
     const bool hasDetail = !replyBody.empty() || !sentBody.empty();
     // Collapse animation: the body eases shut over anim::kBase instead of vanishing.
     const ImGuiID animKey = ImGui::GetID("##thinkblk_anim");
@@ -674,9 +723,9 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
     const RowLanes lanes = rowLanes(true);
     const float    topY  = ImGui::GetCursorScreenPos().y;
     const std::string preview = (openE <= 0.0f && !replyBody.empty())
-        ? stripMdMarks(replyBody.substr(0, replyBody.find('\n')))
+        ? thoughtPreview(replyBody)
         : std::string();
-    const float centerY = thoughtHeader(fonts, label, a.streaming, preview, lanes);
+    const float centerY = thoughtHeader(fonts, label, a.streaming, preview, lanes, replyBody);
     if (hasDetail) {
         const HeaderHit hh = headerHit(topY, ImGui::GetItemRectMax().y + rowPadY());
         if (hh.clicked) { a.expanded = !open; a.userToggled = true; }
@@ -705,62 +754,25 @@ static void drawThinkingBlock(ActivityItem& a, const ui::Fonts& fonts, bool show
     }
 
     ImRect thinkRect = endRowShell(sh);
-    const std::string thinkCopy = chatActivityCopyText(a);
-    chatCopyContext(thinkRect, "##think_copy", thinkCopy);
+    chatCopyContext(thinkRect, "##think_copy", [&] { return chatActivityCopyText(a); });
 
 }
 
-// An orchestrator build stage: status glyph + stage icon + human label + duration/ops meta, the
-// verdict folded in as a result line, and an expandable drawer with the raw detail.
+// An orchestrator build stage: stage icon (the busy mark while it runs) + human label + duration/ops
+// meta, the verdict folded in as a result line, and an expandable drawer with the raw detail.
 //
 // Silhouette: a faint rounded tone wash fading toward its foot plus a soft same-tone hairline. The
 // card is one beat in the run's story, not a document, so it is lit, never boxed or railed.
-//
-// `onSpine` = the run spine is drawing this row's status mark out in the left gutter, so the card
-// must NOT draw its own leading glyph — two marks for one step reads as two steps. The card keeps
-// drawing its own when it is rendered outside a timeline (drawToolCallRow's single-row entry).
-void drawActionCard(ActivityItem& a, const ui::Fonts& fonts, bool liveFrontier, bool onSpine) {
+void drawActionCard(ActivityItem& a, const ui::Fonts& fonts, bool liveFrontier) {
     const auto& pal = ui::palette;
     const bool running = a.status == "running";
     const bool fail    = a.status == "fail";
 
     // Split detail into reply body + optional packed sent-prompt trailer.
-    std::string replyBody = a.detail;
-    std::string sentBody;
-    {
-        const char* kSentMark = "\n\x1e" "SENT\x1e\n";
-        const char* kSentMarkBare = "\x1e" "SENT\x1e\n";
-        size_t mark = replyBody.find(kSentMark);
-        if (mark != std::string::npos) {
-            sentBody = replyBody.substr(mark + std::strlen(kSentMark));
-            replyBody = replyBody.substr(0, mark);
-        } else if (replyBody.rfind(kSentMarkBare, 0) == 0) {
-            sentBody = replyBody.substr(std::strlen(kSentMarkBare));
-            replyBody.clear();
-        }
-    }
-    // Optional alternatives packed as JSON in detail (intake/understanding cards).
-    std::vector<std::string> altLines;
-    if (!replyBody.empty() && (replyBody[0] == '{' || replyBody[0] == '[')) {
-        try {
-            auto j = nlohmann::json::parse(replyBody, nullptr, false);
-            if (!j.is_discarded() && j.is_object()) {
-                auto pull = [&](const char* key) {
-                    if (!j.contains(key) || !j[key].is_array()) return;
-                    for (const auto& it : j[key]) {
-                        if (it.is_string()) altLines.push_back(it.get<std::string>());
-                        else if (it.is_object()) {
-                            std::string tc = jstr(it, "task_class");
-                            if (tc.empty()) tc = jstr(it, "class");
-                            if (tc.empty()) tc = jstr(it, "name");
-                            if (!tc.empty()) altLines.push_back(std::move(tc));
-                        }
-                    }
-                };
-                pull("alternatives"); pull("alt_classes"); pull("candidates");
-            }
-        } catch (...) {}
-    }
+    const SentDetail& detail = sentDetail(a);
+    const std::string& replyBody = detail.reply;
+    const std::string& sentBody = detail.sent;
+    const auto& altLines = detail.alternatives;
     // Every action card lands EXPANDED while it is the live frontier (the most recent visible
     // row mid-turn) or still running, and auto-collapses once the next row lands or the turn
     // ends — UNLESS the user explicitly toggled it (userToggled always wins, both directions).
@@ -778,18 +790,12 @@ void drawActionCard(ActivityItem& a, const ui::Fonts& fonts, bool liveFrontier, 
     const ui::AdaptiveSurface& surf = chatSurf();
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);   // base ink (dimText derives from it)
 
-    // ---- header row: [status glyph] stage icon + label ...... meta [chevron] ----
-    // The spine already carries this step's mark in the gutter; drawing a second one here would
-    // read as two steps, and reserving its empty cell only wasted width.
+    // ---- header row: [stage icon | busy mark] label ...... meta [chevron] ----
     const RowLanes lanes = rowLanes(true);
     const float    topY  = ImGui::GetCursorScreenPos().y;
     const float    gap   = ui::metrics::U(1.5f);
-    if (!onSpine) {
-        drawStatusGlyph(a.status, ImGui::GetTextLineHeight());
-        ImGui::SameLine(0, gap);
-    }
-    rowIcon(stageIconName(a.stage, a.missionHeader),
-            running ? surf.textPrimary : surf.textSecondary);
+    rowLead(stageIconName(a.stage, a.missionHeader),
+            running ? surf.textPrimary : surf.textSecondary, running);
     ImGui::SameLine(0, gap);
     char meta[96] = "";
     if (a.opsCount > 0 && a.durationMs > 0)
@@ -807,7 +813,6 @@ void drawActionCard(ActivityItem& a, const ui::Fonts& fonts, bool liveFrontier, 
         a.title, ImMax(lanes.metaRight - ImGui::GetCursorPosX() - metaW, ui::metrics::U(6.0f)));
     ImGui::TextColored(titleCol, "%s", titleFit.c_str());
     ImGui::PopFont();
-    noteRowHead();
     const float centerY = (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f;
     if (titleFit != a.title && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", a.title.c_str());
     if (meta[0]) {
@@ -864,8 +869,7 @@ void drawActionCard(ActivityItem& a, const ui::Fonts& fonts, bool liveFrontier, 
     ImGui::PopStyleColor();   // base ink
     ImRect cardRect = endRowShell(sh);
     {
-        const std::string copyTxt = chatActivityCopyText(a);
-        chatCopyContext(cardRect, "##act_copy", copyTxt);
+        chatCopyContext(cardRect, "##act_copy", [&] { return chatActivityCopyText(a); });
 
     }
 }
@@ -889,17 +893,16 @@ static void drawContextChip(const ActivityItem& a, const ui::Fonts& fonts) {
     ImGui::PushFont(fonts.body);
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textTertiary);
     // ONE line, ellipsized against the shared right lane: these chips are inline transparency
-    // notes, and a wrapped second line ran ragged past the icon gutter (and could spill past the
+    // notes, and a wrapped second line ran ragged past the icon column (and could spill past the
     // timeline's right edge). The full text stays on the hover tooltip.
     const std::string clipped =
         chatEllipsize(line, rowLanes(true).metaRight - ImGui::GetCursorPosX());
     ImGui::TextUnformatted(clipped.c_str());
-    noteRowHead();
     if (clipped != line && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", line.c_str());
     ImGui::PopStyleColor();
     ImGui::PopFont();
     const ImRect chipRect = endRowShell(sh);
-    chatCopyContext(chipRect, "##ctx_copy", line);
+    chatCopyContext(chipRect, "##ctx_copy", [&] { return line; });
 }
 
 // A plain-prose "Output" box IS the model's reply, drawn where it arrived. It used to be a
@@ -913,52 +916,85 @@ bool isProseOutputRow(const ActivityItem& a) {
     return a.opsCount <= 0 && a.title.find("Building ops") == std::string::npos;
 }
 
-// The prose the timeline renders inline, in arrival order. feed.cpp appends the SAME bytes to
-// both the box and m.text from one delta, and drawAgentTimeline runs the boxes through the
-// same sanitizer chat_log runs over m.text, so this is a byte-exact prefix of m.text.
-std::string timelineInlineProse(const ChatMsg& m) {
-    std::string out;
-    for (const auto& a : m.activity)
-        if (isProseOutputRow(a)) out += a.detail;
-    return out;
+struct TimelineProseCache {
+    struct Part { size_t offset = 0; bool visible = false; };
+    uint64_t revision = ~uint64_t(0);
+    double stamp = -1.0;
+    size_t rows = 0, textSize = 0, visible = 0;
+    const char* textData = nullptr;
+    int frame = -1;
+    std::map<size_t, Part> parts;
+    std::string shown, tail;
+};
+
+static TimelineProseCache& timelineProseCache(const ChatMsg& m) {
+    static std::unordered_map<const ChatMsg*, TimelineProseCache> caches;
+    if (caches.find(&m) == caches.end() && caches.size() >= 64) {
+        auto oldest = caches.begin();
+        for (auto it = caches.begin(); it != caches.end(); ++it)
+            if (it->second.frame < oldest->second.frame) oldest = it;
+        caches.erase(oldest);
+    }
+    auto& cache = caches[&m];
+    cache.frame = ImGui::GetFrameCount();
+    if (cache.revision == m.revision && cache.stamp == m.ts && cache.rows == m.activity.size() &&
+        cache.textSize == m.text.size() && cache.textData == m.text.data()) return cache;
+    size_t from = 0;
+    if (cache.stamp == m.ts && m.activity.size() >= cache.rows &&
+        m.uiActivityDirtyFrom < m.activity.size())
+        from = std::min(m.uiActivityDirtyFrom, cache.rows);
+    const auto first = cache.parts.lower_bound(from);
+    if (first != cache.parts.end()) cache.shown.resize(first->second.offset);
+    for (auto it = first; it != cache.parts.end(); ++it)
+        if (it->second.visible) --cache.visible;
+    cache.parts.erase(first, cache.parts.end());
+    for (size_t i = from; i < m.activity.size(); ++i) {
+        const auto& row = m.activity[i];
+        if (!isProseOutputRow(row)) continue;
+        const bool visible = ui::streamTextVisible(row.detail);
+        cache.parts.emplace(i, TimelineProseCache::Part{cache.shown.size(), visible});
+        cache.shown += row.detail;
+        if (visible) ++cache.visible;
+    }
+    cache.tail.clear();
+    if (cache.shown.empty()) cache.tail = m.text;
+    else if (m.text.size() > cache.shown.size() &&
+             m.text.compare(0, cache.shown.size(), cache.shown) == 0) {
+        const size_t start = m.text.find_first_not_of("\n\r ", cache.shown.size());
+        if (start != std::string::npos) cache.tail = m.text.substr(start);
+    }
+    cache.revision = m.revision;
+    cache.stamp = m.ts;
+    cache.rows = m.activity.size();
+    cache.textSize = m.text.size();
+    cache.textData = m.text.data();
+    return cache;
 }
 
-bool timelineHasInlineProse(const ChatMsg& m) {
-    for (const auto& a : m.activity)
-        if (isProseOutputRow(a) && ui::streamTextVisible(a.detail)) return true;
-    return false;
-}
+const std::string& timelineInlineProse(const ChatMsg& m) { return timelineProseCache(m).shown; }
+
+bool timelineHasInlineProse(const ChatMsg& m) { return timelineProseCache(m).visible != 0; }
 
 // What m.text carries BEYOND the inline prose: a reply promoted whole (nothing streamed), or a
 // note appended after the fact such as "(Stopped by you.)". Callers render this instead of
 // m.text so nothing prints twice. If the two ever diverge (a doc-id substitution spanning a
 // segment boundary is the only known way), the timeline is authoritative and the tail is
 // dropped — a missing rename is a far smaller defect than the whole reply printed twice.
-std::string timelineProseTail(const ChatMsg& m) {
-    const std::string shown = timelineInlineProse(m);
-    if (shown.empty()) return m.text;
-    if (m.text.size() <= shown.size()) return {};
-    if (m.text.compare(0, shown.size(), shown) != 0) return {};
-    // An appended note ("\n\n(Stopped by you.)", a failure message) starts with its separator;
-    // the tail renders as its own card, where those blank lines are just a gap at the top.
-    const size_t start = m.text.find_first_not_of("\n\r ", shown.size());
-    return start == std::string::npos ? std::string() : m.text.substr(start);
-}
+const std::string& timelineProseTail(const ChatMsg& m) { return timelineProseCache(m).tail; }
 
 // Horizontal inset of the assistant's prose: the timeline rows' text column (the row pad), so an
 // answer and the tool/thought rows above it share one left edge.
 float chatProseInsetX() { return ui::kit::padX(); }
 
 // The model's prose — the answer — as the calm centre of the column: no card, no rim, the text
-// flowing full-width on the pane's glass like a reply in a modern chat (the timeline steps out of
-// the spine gutter for it), while every stage/thought/tool row is a quiet log line. Selectable for
+// flowing full-width on the pane's glass like a reply in a modern chat, while every stage/thought/
+// tool row is a quiet log line. Selectable for
 // click-drag + Ctrl+C; right-click copies the selection or the whole segment — the same affordances
 // the single trailing reply card used to carry, which chat_log.cpp now only draws for a reply the
 // timeline never saw.
 static void drawProseBubble(ActivityItem& a, const ui::Fonts& fonts) {
     if (!ui::streamTextVisible(a.detail)) return;   // an empty segment is not a card
     ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
-    const std::string prose = stripMdMarks(a.detail);
     GlassBubble gb = beginOpenBubble(ImGui::GetContentRegionAvail().x);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                         ImVec2(chatProseInsetX(), ui::metrics::cpChatCardPadY()));
@@ -973,13 +1009,14 @@ static void drawProseBubble(ActivityItem& a, const ui::Fonts& fonts) {
     {
         const ImVec2 wp = ImGui::GetWindowPos();
         const ImVec2 ws = ImGui::GetWindowSize();
-        chatHoverCopyGlyph(ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)), prose);
+        chatHoverCopyGlyph(ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)),
+                           [&] { return stripMdMarks(a.detail); });
     }
     ImGui::EndChild();
     ImGui::PopStyleVar();   // ##prose WindowPadding
     const ImRect proseRect = endOpenBubble(gb);
     const std::string sel = chatInputSelection(textId);
-    chatCopyContext(proseRect, "##prose_copy", prose, prose, sel);
+    chatCopyContext(proseRect, "##prose_copy", [&] { return stripMdMarks(a.detail); }, {}, sel);
 }
 
 // M13 — the model's thoughts as ONE dim italic line with a disclosure chevron. While deltas stream
@@ -1007,7 +1044,6 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
         else
             ImGui::TextColored(surf.textSecondary, "Thinking");
         italicEnd(s);
-        noteRowHead();
         ImGui::PopFont();
         ImGui::Unindent(ui::kit::padX());
         return;
@@ -1047,7 +1083,6 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
         ImGui::TextUnformatted(fit.c_str());
         ImGui::PopStyleColor();
         if (fonts.mono) ImGui::PopFont();
-        noteRowHead();
         const float centerY = (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f;
         if (fit != line && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", line.c_str());
         if (hasDetail) {
@@ -1061,7 +1096,7 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
             endCollapseBody(cb);
         }
         const ImRect opsRect = endRowShell(sh);
-        chatCopyContext(opsRect, "##thought_copy", chatActivityCopyText(a));
+        chatCopyContext(opsRect, "##thought_copy", [&] { return chatActivityCopyText(a); });
         return;
     }
 
@@ -1071,10 +1106,10 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
     const RowLanes lanes = rowLanes(true);
     const float    topY  = ImGui::GetCursorScreenPos().y;
     const std::string preview = (openE <= 0.0f && hasDetail)
-        ? stripMdMarks(a.detail.substr(0, a.detail.find('\n')))
+        ? thoughtPreview(a.detail)
         : std::string();
     const float centerY = thoughtHeader(fonts, a.title.empty() ? "Thinking" : a.title.c_str(),
-                                        a.streaming, preview, lanes);
+                                        a.streaming, preview, lanes, a.detail);
     if (hasDetail) {
         const HeaderHit hh = headerHit(topY, ImGui::GetItemRectMax().y + rowPadY());
         if (hh.clicked) { a.expanded = !open; a.userToggled = true; }
@@ -1093,8 +1128,7 @@ static void drawThoughtBox(ActivityItem& a, const ui::Fonts& fonts, bool showThi
         endCollapseBody(cb);
     }
     ImRect thoughtRect = endRowShell(sh);
-    const std::string thoughtCopy = chatActivityCopyText(a);
-    chatCopyContext(thoughtRect, "##thought_copy", thoughtCopy);
+    chatCopyContext(thoughtRect, "##thought_copy", [&] { return chatActivityCopyText(a); });
 }
 
 // ---- artifact file actions ---------------------------------------------------------------
@@ -1140,10 +1174,11 @@ static std::string chatLowerExt(const std::string& p) {
 // Extensions the app itself opens (mirrors file_explorer.cpp isKnownExt: native
 // .draw+/.step+ containers, CAD import formats incl. AutoCAD DXF/DWG and ACIS, ECAD/KiCad).
 static bool chatAppOpenableExt(const std::string& e) {
-    return e == ".draw+" || e == ".step+" || e == ".step" || e == ".stp" ||
+    return e == ".scad" || e == ".draw+" || e == ".step+" || e == ".step" || e == ".stp" ||
            e == ".iges" || e == ".igs" || e == ".stl" || e == ".3mf" ||
            e == ".dxf" || e == ".dwg" || e == ".sat" || e == ".sab" ||
-           e == ".ecad+" || e == ".ecad" || e == ".kicad_sch" || e == ".kicad_pcb";
+           e == ".ecad+" || e == ".ecad" || e == ".kicad_sch" || e == ".kicad_pcb" ||
+           e == ".kicad_pro";
 }
 
 // Smart "open": CAD/ECAD files open IN THE APP's viewport via st.requestOpenPath (the same
@@ -1262,11 +1297,10 @@ ToolRowDetail splitToolRowDetail(const std::string& detail) {
 // the turn wrote 93 files.
 //
 // A real artifact path therefore has to look like one: no leading/trailing space, a directory
-// separator, and a basename ending in a 1-8 character extension of alphanumerics plus '+' (the
-// native ".step+"/".ecad+" containers). Deliberately NOT "no spaces in the basename" — a part named
-// "rev 2 plate" exports to "rev 2 plate.step" and that file is real. Measured against all 634
-// artifact lines in the local session stores: 0 prose lines survive, every well-formed path does.
-static bool artifactLine(const std::string& line, std::string* kindOut, std::string* pathOut) {
+// separator, and a basename ending in a short extension or a KiCad project-file extension.
+// Deliberately NOT "no spaces in the basename" — a part named
+// "rev 2 plate" exports to "rev 2 plate.step" and that file is real.
+bool artifactLine(const std::string& line, std::string* kindOut, std::string* pathOut) {
     const size_t tab = line.find('\t');
     if (tab == std::string::npos) return false;
     const std::string kind = line.substr(0, tab);
@@ -1280,9 +1314,14 @@ static bool artifactLine(const std::string& line, std::string* kindOut, std::str
     const size_t dot = path.find_last_of('.');
     if (dot == std::string::npos || dot <= slash + 1) return false;   // no basename, or dotfile
     const std::string ext = path.substr(dot + 1);
-    if (ext.empty() || ext.size() > 8) return false;
-    for (unsigned char c : ext)
-        if (!std::isalnum(c) && c != '+') return false;
+    std::string lowerExt = ext;
+    for (char& c : lowerExt) c = (char)std::tolower((unsigned char)c);
+    const bool kicad = lowerExt == "kicad_pro" || lowerExt == "kicad_sch" || lowerExt == "kicad_pcb";
+    if (!kicad) {
+        if (ext.empty() || ext.size() > 8) return false;
+        for (unsigned char c : ext)
+            if (!std::isalnum(c) && c != '+') return false;
+    }
     if (kindOut) *kindOut = kind;
     if (pathOut) *pathOut = path;
     return true;
@@ -1426,36 +1465,45 @@ static ToolOutcomePresentation toolOutcomePresentation(const ActivityItem& a) {
     return p;
 }
 
-// A live turn is deliberately not windowed by chat_log.cpp. Cache its tool rows here instead:
-// the old loop reparsed every packed detail (including folded members) and submitted every
-// auto-height child even when thousands of pixels outside the log's clip rectangle.
-// Snapshots are byte-exact, not pointer/size/hash keys: completion and steering may replace a
-// string in place without changing its length. Only changed tools pay for parsing/sanitizing.
+struct ToolArgsView {
+    std::string code;     // code/script/source/command string value, unescaped (verbatim)
+    std::string fields;   // every other key as "key: value" lines
+    std::string raw;      // fallback only: pretty JSON or the preview text, verbatim
+};
+// Revision stamps are maintained by feed.cpp and by local disclosure edits. Only changed
+// payloads pay for sanitizing/parsing; settled rows retain measured heights for windowing.
+static ToolArgsView toolArgsView(const std::string& args);
 struct ToolTimelineRow {
-    ActivityItem source;
+    uint64_t revision = ~uint64_t(0);
+    int changedFrame = -1;
+    bool expanded = false, userToggled = false;
     ToolRowDetail parts;
+    bool partsCached = false;
     ToolOutcomePresentation outcome;
     std::string groupKey;
-    bool valid = false, changed = true, images = false, files = false, settled = false;
-    float height = -1.0f, headOffset = -1.0f;
+    ToolArgsView args;
+    bool argsReady = false;
+    size_t argsSize = 0, argsHash = 0;
+    bool valid = false, images = false, files = false, settled = false;
+    float height = -1.0f;
     float drawerHeight = -1.0f, evidenceHeight = -1.0f, artifactHeight = -1.0f;
+    size_t bytesAfter = 0, lastVisibleAfter = size_t(-1);
     size_t end = 0;
-    int rewind = -1;
     bool frontier = false;
 };
 
-static bool sameToolRow(const ActivityItem& a, const ActivityItem& b) {
-    return a.rowKind == b.rowKind && a.stage == b.stage && a.title == b.title &&
-           a.reason == b.reason && a.status == b.status && a.detail == b.detail &&
-           a.durationMs == b.durationMs && a.expanded == b.expanded &&
-           a.userToggled == b.userToggled && a.streaming == b.streaming;
-}
+
+struct TimelineSpan {
+    size_t first = 0, last = 0;
+    float top = 0.0f, bottom = 0.0f;
+};
 
 struct ToolTimelineCache {
     std::vector<ToolTimelineRow> rows;
-    std::vector<std::pair<std::string, std::string>> docs;
+    uint64_t docsRevision = ~uint64_t(0);
     std::string conversation;
-    ImGuiStyle style{};
+    ImVec2 itemSpacing{-1, -1}, framePadding{-1, -1}, windowPadding{-1, -1}, cellPadding{-1, -1};
+    float indentSpacing = -1.0f, scrollbarSize = -1.0f;
     ImFont* font = nullptr;
     ImFont* mono = nullptr;
     ImFont* medium = nullptr;
@@ -1463,58 +1511,112 @@ struct ToolTimelineCache {
     int detail = -1, frame = -1;
     double stamp = 0.0;
     bool renders = false, grouping = false, humanize = false, collapse = false;
-    bool rewindAvailable = false, rewindBusy = false;
-    double checkpointFetch = -1.0;
-    size_t checkpoints = 0;
+    uint64_t revision = ~uint64_t(0);
+    bool running = false;
+    size_t activityCount = 0, lastVisible = size_t(-1);
+    uint64_t layoutRevision = 0;
+    std::vector<TimelineSpan> spans;
+    uint64_t spanRevision = ~uint64_t(0);
+    bool spansReady = false, spanThinking = false;
+    size_t prefixSpans = 0;
+    int planRevision = -1;
+    size_t planItems = 0, planSummary = 0, planTitle = 0, planRow = size_t(-1);
+    std::string planShape;
+    float scale = -1.0f;
 };
 
 static std::unordered_map<ImGuiID, ToolTimelineCache> s_toolTimelines;
 
-static ToolTimelineCache& toolTimelineCache(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
-    // Bound both lifetime and retained transcripts. No pointers into chat/activity survive a
-    // frame (switching conversations and growing the vectors can move all of their storage).
-    const ImGuiID id = ImGui::GetID("##tool_timeline_cache");
-    const int frame = ImGui::GetFrameCount();
-    for (auto it = s_toolTimelines.begin(); it != s_toolTimelines.end();) {
-        if (it->first != id && frame - it->second.frame > 120) it = s_toolTimelines.erase(it);
-        else ++it;
+// Tabs are shared by every turn; resolve their display names once, not once per message.
+static uint64_t timelineDocRevision(const AppState& st) {
+    static int frame = -1;
+    static uint64_t revision = 0;
+    static std::vector<std::pair<std::string, std::string>> docs;
+    if (frame == ImGui::GetFrameCount()) return revision;
+    frame = ImGui::GetFrameCount();
+    bool changed = docs.size() != st.docTabs.size();
+    docs.resize(st.docTabs.size());
+    for (size_t i = 0; i < docs.size(); ++i) {
+        const auto& tab = st.docTabs[i];
+        const std::string title = tab.displayTitle();
+        if (docs[i].first != tab.docId || docs[i].second != title) {
+            docs[i] = {tab.docId, title};
+            changed = true;
+        }
     }
-    if (s_toolTimelines.find(id) == s_toolTimelines.end() && s_toolTimelines.size() >= 8) {
+    if (changed) ++revision;
+    return revision;
+}
+
+static ToolTimelineCache& toolTimelineCache(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
+    const ImGuiID id = ImGui::GetID("##tool_timeline_cache");
+    const uint64_t beforeRevision = m.revision;
+    const int frame = ImGui::GetFrameCount();
+    if (s_toolTimelines.find(id) == s_toolTimelines.end() && s_toolTimelines.size() >= 64) {
         auto oldest = s_toolTimelines.begin();
         for (auto it = s_toolTimelines.begin(); it != s_toolTimelines.end(); ++it)
             if (it->second.frame < oldest->second.frame) oldest = it;
         s_toolTimelines.erase(oldest);
     }
     ToolTimelineCache& cache = s_toolTimelines[id];
-    const std::string conversation = st.activeConvId();
+    static const std::string emptyConversation;
+    const std::string& conversation = st.activeConv >= 0 && st.activeConv < (int)st.conversations.size()
+        ? st.conversations[st.activeConv].id : emptyConversation;
     if (cache.conversation != conversation || cache.stamp != m.ts) {
         cache = ToolTimelineCache{};
         cache.conversation = conversation;
         cache.stamp = m.ts;
     }
     cache.frame = frame;
-    bool docsChanged = cache.docs.size() != st.docTabs.size();
-    if (!docsChanged)
-        for (size_t i = 0; i < st.docTabs.size(); ++i)
-            if (cache.docs[i].first != st.docTabs[i].docId ||
-                cache.docs[i].second != st.docTabs[i].displayTitle()) { docsChanged = true; break; }
-    if (docsChanged) {
-        cache.docs.clear();
-        for (const auto& tab : st.docTabs) cache.docs.emplace_back(tab.docId, tab.displayTitle());
-    }
+    const uint64_t docsRevision = timelineDocRevision(st);
+    const bool docsChanged = cache.docsRevision != docsRevision;
+    cache.docsRevision = docsRevision;
+    const ImGuiStyle& style = ImGui::GetStyle();
+    auto different = [](ImVec2 a, ImVec2 b) { return a.x != b.x || a.y != b.y; };
     const float width = ImGui::GetContentRegionAvail().x;
     const bool humanize = ui::chatHumanizeDocIds();
+    const bool sanitizeChanged = docsChanged || cache.humanize != humanize;
     const bool layoutChanged = cache.width != width || cache.font != ImGui::GetFont() ||
         cache.mono != fonts.mono || cache.medium != fonts.medium ||
         cache.fontSize != ImGui::GetFontSize() ||
         cache.monoSize != (fonts.mono ? fonts.mono->FontSize * fonts.mono->Scale : 0.0f) ||
         cache.mediumSize != (fonts.medium ? fonts.medium->FontSize * fonts.medium->Scale : 0.0f) ||
-        std::memcmp(&cache.style, &ImGui::GetStyle(), sizeof(ImGuiStyle)) != 0 ||
+        different(cache.itemSpacing, style.ItemSpacing) ||
+        different(cache.framePadding, style.FramePadding) ||
+        different(cache.windowPadding, style.WindowPadding) ||
+        different(cache.cellPadding, style.CellPadding) ||
+        cache.indentSpacing != style.IndentSpacing || cache.scrollbarSize != style.ScrollbarSize ||
         cache.detail != ui::chatToolDetail() || cache.renders != ui::chatShowRenders() ||
         cache.grouping != ui::chatGroupToolCalls() || cache.collapse != ui::chatCollapseAnim() ||
-        cache.rewindAvailable != s_aiVc.available || cache.rewindBusy != s_aiVc.busy ||
-        cache.checkpointFetch != s_aiVc.lastFetch || cache.checkpoints != s_aiVc.checkpoints.size() ||
-        cache.humanize != humanize;
+        sanitizeChanged ||
+        cache.scale != ui::uiScale || cache.planRevision != m.planState.revision ||
+        cache.planItems != m.planState.items.size() || cache.planSummary != m.planState.summary.size() ||
+        cache.planTitle != m.planState.title.size() || cache.planShape != m.planState.shape;
+    const bool messageChanged = cache.revision != m.revision || cache.running != m.running ||
+        cache.activityCount != m.activity.size();
+    if (!layoutChanged && !messageChanged) return cache;
+    size_t updateFrom = 0;
+    if (!layoutChanged && cache.running == m.running &&
+        m.activity.size() >= cache.activityCount && m.uiActivityDirtyFrom > 0 &&
+        m.uiActivityDirtyFrom < m.activity.size()) {
+        updateFrom = std::min(m.uiActivityDirtyFrom, cache.activityCount);
+        if (updateFrom > 0) --updateFrom;
+        if (m.activity.size() != cache.activityCount && cache.lastVisible != size_t(-1))
+            updateFrom = std::min(updateFrom, cache.lastVisible);
+        if (updateFrom > cache.rows.size() ||
+            (updateFrom > 0 && !cache.rows[updateFrom - 1].valid)) updateFrom = 0;
+    }
+    const size_t knownSpans = cache.spansReady ? cache.spans.size() : cache.prefixSpans;
+    if (updateFrom > 0 && knownSpans > 0) {
+        const auto end = cache.spans.begin() + knownSpans;
+        cache.prefixSpans = size_t(std::lower_bound(cache.spans.begin(), end, updateFrom,
+            [](const TimelineSpan& span, size_t row) { return span.last < row; }) - cache.spans.begin());
+        cache.spans.resize(cache.prefixSpans);
+    } else {
+        cache.prefixSpans = 0;
+    }
+    cache.spansReady = false;
+    ++cache.layoutRevision;
     cache.width = width;
     cache.font = ImGui::GetFont();
     cache.mono = fonts.mono;
@@ -1522,47 +1624,106 @@ static ToolTimelineCache& toolTimelineCache(AppState& st, ChatMsg& m, const ui::
     cache.fontSize = ImGui::GetFontSize();
     cache.monoSize = fonts.mono ? fonts.mono->FontSize * fonts.mono->Scale : 0.0f;
     cache.mediumSize = fonts.medium ? fonts.medium->FontSize * fonts.medium->Scale : 0.0f;
-    cache.style = ImGui::GetStyle();
+    cache.itemSpacing = style.ItemSpacing;
+    cache.framePadding = style.FramePadding;
+    cache.windowPadding = style.WindowPadding;
+    cache.cellPadding = style.CellPadding;
+    cache.indentSpacing = style.IndentSpacing;
+    cache.scrollbarSize = style.ScrollbarSize;
     cache.detail = ui::chatToolDetail();
     cache.renders = ui::chatShowRenders();
     cache.grouping = ui::chatGroupToolCalls();
     cache.collapse = ui::chatCollapseAnim();
-    const bool sanitizeChanged = docsChanged || cache.humanize != humanize;
-    cache.rewindAvailable = s_aiVc.available;
-    cache.rewindBusy = s_aiVc.busy;
-    cache.checkpointFetch = s_aiVc.lastFetch;
-    cache.checkpoints = s_aiVc.checkpoints.size();
+    cache.planRevision = m.planState.revision;
+    cache.planItems = m.planState.items.size();
+    cache.planSummary = m.planState.summary.size();
+    cache.planTitle = m.planState.title.size();
+    cache.planShape = m.planState.shape;
+    cache.scale = ui::uiScale;
+    if (updateFrom == 0) cache.planRow = size_t(-1);
+    bool planProgressChanged = false;
+    bool proseSanitized = false;
     cache.humanize = humanize;
-    // At most 8192 rows / 4 MiB of source text per timeline (parsed trailers retain at most
-    // another copy). Larger transcripts still render correctly; excess rows use the old path.
     cache.rows.resize(std::min(m.activity.size(), size_t(8192)));
-    size_t bytes = 0;
-    for (size_t i = 0; i < m.activity.size(); ++i) {
+    size_t bytes = updateFrom > 0 ? cache.rows[updateFrom - 1].bytesAfter : 0;
+    cache.lastVisible = updateFrom > 0 ? cache.rows[updateFrom - 1].lastVisibleAfter : size_t(-1);
+    for (size_t i = updateFrom; i < m.activity.size(); ++i) {
         ActivityItem& a = m.activity[i];
+        if (a.rowKind == 18) cache.planRow = i;
+        if (!m.running) {
+            const bool close = !a.userToggled && (a.rowKind == 2 || isThinkingItem(a));
+            if (a.streaming || a.status == "running" || (close && a.expanded)) {
+                a.streaming = false;
+                if (a.status == "running" && !settleUnfinishedCompaction(a, "interrupted"))
+                    a.status = "done";
+                if (close) a.expanded = false;
+                ++a.revision;
+                ++m.revision;
+            }
+        }
+        if (a.stage != "__stop_meta__" && a.rowKind != 9 && !a.isRetiredCorporateRow() &&
+            (!isProseOutputRow(a) || ui::streamTextVisible(a.detail))) cache.lastVisible = i;
         const size_t rowBytes = a.detail.size() + a.title.size() + a.reason.size() + a.stage.size();
-        if (a.rowKind != 3 || i >= cache.rows.size() || rowBytes > 4 * 1024 * 1024 - bytes) {
-            if (i < cache.rows.size()) cache.rows[i] = ToolTimelineRow{};
-            sanitizeActivityItem(st, a);
+        if (i >= cache.rows.size()) {
+            if (sanitizeActivityItem(st, a)) {
+                ++a.revision;
+                ++m.revision;
+                proseSanitized |= isProseOutputRow(a);
+            }
             continue;
         }
-        bytes += rowBytes;
+        const bool keepParts = a.rowKind == 3 && rowBytes <= 16 * 1024 * 1024 - bytes;
+        if (keepParts) bytes += rowBytes;
         ToolTimelineRow& row = cache.rows[i];
-        row.changed = !row.valid || !sameToolRow(row.source, a) || sanitizeChanged;
-        if (row.changed) {
-            sanitizeActivityItem(st, a);
-            row.source = ActivityItem(a);  // replace old capacities as well as old content
-            row.parts = splitToolRowDetail(a.detail);
+        row.bytesAfter = bytes;
+        row.lastVisibleAfter = cache.lastVisible;
+        const bool changed = !row.valid || row.revision != a.revision ||
+            row.expanded != a.expanded || row.userToggled != a.userToggled ||
+            row.partsCached != keepParts || sanitizeChanged;
+        if (changed) {
+            // Prose may already be cached this frame; invalidate it on actual text changes,
+            // including new rows arriving with unchanged document/settings inputs.
+            if (sanitizeActivityItem(st, a)) {
+                ++a.revision;
+                ++m.revision;
+                proseSanitized |= isProseOutputRow(a);
+            }
+            row.revision = a.revision;
+            row.expanded = a.expanded;
+            row.userToggled = a.userToggled;
+            row.changedFrame = frame;
+            ToolRowDetail parts = a.rowKind == 3 ? splitToolRowDetail(a.detail) : ToolRowDetail{};
             row.outcome = toolOutcomePresentation(a);
-            row.images = hasImageArtifacts(row.parts.arts);
-            row.files = drawerHasArtifacts(row.parts.arts, true);
-            row.groupKey = row.outcome.succeeded
+            if (a.rowKind == 0) planProgressChanged = true;
+            row.images = hasImageArtifacts(parts.arts);
+            row.files = drawerHasArtifacts(parts.arts, true);
+            row.parts = keepParts ? std::move(parts) : ToolRowDetail{};
+            row.partsCached = keepParts;
+            row.groupKey = a.rowKind == 3 && row.outcome.succeeded
                 ? ui::toolPhrase(a.title, a.reason, true).groupKey : std::string();
+            row.args = ToolArgsView{};
+            row.argsReady = false;
             row.valid = true;
         }
-        if (row.changed || layoutChanged) {
+        if (changed || layoutChanged) {
             row.height = row.drawerHeight = row.evidenceHeight = row.artifactHeight = -1.0f;
+            row.settled = false;
         }
     }
+    if (planProgressChanged && cache.planRow < cache.rows.size()) {
+        cache.rows[cache.planRow].height = -1.0f;
+        cache.rows[cache.planRow].settled = false;
+        const auto end = cache.spans.begin() + cache.prefixSpans;
+        cache.prefixSpans = size_t(std::lower_bound(cache.spans.begin(), end, cache.planRow,
+            [](const TimelineSpan& span, size_t row) { return span.last < row; }) - cache.spans.begin());
+        cache.spans.resize(cache.prefixSpans);
+    }
+    cache.revision = m.revision;
+    cache.running = m.running;
+    cache.activityCount = m.activity.size();
+    m.uiActivityDirtyFrom = m.activity.size();
+    if (proseSanitized) timelineProseCache(m);
+    if (m.revision != beforeRevision) ui::chatLogMessageChanged(m);
     return cache;
 }
 
@@ -1642,11 +1803,6 @@ static void drawToolDetailBox(const char* id, const std::string& text, ImFont* f
 // backticks are code, not markdown. Producers ship args_preview as JSON capped at ~2 KB with a
 // trailing "…", so a long eval script is usually NOT parseable JSON — its code string is then
 // salvaged from the prefix. The right-click Copy keeps the raw preview.
-struct ToolArgsView {
-    std::string code;     // code/script/source/command string value, unescaped (verbatim)
-    std::string fields;   // every other key as "key: value" lines
-    std::string raw;      // fallback only: pretty JSON or the preview text, verbatim
-};
 
 static constexpr const char* kToolCodeKeys[] = {"code", "script", "source", "command", "cmd"};
 
@@ -1768,9 +1924,18 @@ static ToolArgsView toolArgsView(const std::string& args) {
 
 // The Doing drawer's argument section: the code in the mono code box, the remaining arguments as
 // a key: value list, and raw text (verbatim, mono) only when neither exists.
-static void drawToolArgs(const std::string& args, const ui::Fonts& fonts) {
+static void drawToolArgs(const std::string& args, const ui::Fonts& fonts,
+                         ToolTimelineRow* row = nullptr) {
     if (args.empty()) return;
-    const ToolArgsView v = toolArgsView(args);
+    const size_t hash = row ? std::hash<std::string>{}(args) : 0;
+    if (row && (!row->argsReady || row->argsSize != args.size() || row->argsHash != hash)) {
+        row->args = toolArgsView(args);
+        row->argsReady = true;
+        row->argsSize = args.size();
+        row->argsHash = hash;
+    }
+    const ToolArgsView uncached = row ? ToolArgsView{} : toolArgsView(args);
+    const ToolArgsView& v = row ? row->args : uncached;
     if (!v.code.empty())
         drawCodeBox("##toolcode", v.code, fonts.mono, ui::metrics::px(260.0f));
     if (!v.fields.empty())
@@ -1781,7 +1946,7 @@ static void drawToolArgs(const std::string& args, const ui::Fonts& fonts) {
                           /*failure=*/false);
 }
 
-// M14 — one tool call as ONE dense rounded LOG LINE, not a card: [status mark in the gutter] tool
+// M14 — one tool call as ONE dense rounded LOG LINE, not a card: the tool
 // icon, the HUMAN title (tool_phrase.h turns `add_features` into "Building geometry"), the target it
 // acts on, a right-aligned latency/cache figure and the disclosure chevron. Nothing was dropped to
 // get there: the raw MCP symbol, the wall clock and the full target live on the title's tooltip,
@@ -1795,9 +1960,8 @@ static void drawToolArgs(const std::string& args, const ui::Fonts& fonts) {
 // a non-null `group` of >1 is a fold of consecutive SIMILAR successful calls (drawAgentTimeline
 // computes both runs), shown as ONE line with a count badge and its members' targets joined.
 static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& fonts,
-                                int failCount, bool liveFrontier, int callI = -1,
+                                int failCount, bool liveFrontier,
                                 const std::vector<ActivityItem*>* group = nullptr,
-                                bool onSpine = false,
                                 const std::vector<ActivityItem>* timeline = nullptr,
                                 std::vector<ToolTimelineRow>* cachedRows = nullptr) {
     const float gap = ui::metrics::U(1.5f);
@@ -1814,12 +1978,13 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
         const size_t idx = size_t(&row - timeline->data());
         return idx < cachedRows->size() && (*cachedRows)[idx].valid ? &(*cachedRows)[idx] : nullptr;
     };
-    const ToolTimelineRow* rowCache = cached(a);
-    const ToolRowDetail uncachedParts = rowCache ? ToolRowDetail{} : splitToolRowDetail(a.detail);
-    const ToolRowDetail& parts = rowCache ? rowCache->parts : uncachedParts;
+    ToolTimelineRow* rowCache = cached(a);
+    const bool cachedParts = rowCache && rowCache->partsCached;
+    const ToolRowDetail uncachedParts = cachedParts ? ToolRowDetail{} : splitToolRowDetail(a.detail);
+    const ToolRowDetail& parts = cachedParts ? rowCache->parts : uncachedParts;
     ToolRowDetail memberParts;
     auto detailOf = [&](const ActivityItem& row) -> const ToolRowDetail& {
-        if (const ToolTimelineRow* c = cached(row)) return c->parts;
+        if (const ToolTimelineRow* c = cached(row); c && c->partsCached) return c->parts;
         memberParts = splitToolRowDetail(row.detail);
         return memberParts;
     };
@@ -1951,7 +2116,7 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
                 continue;
             ++imgI;
             ImGui::PushID(imgI);
-            const Tex& tx = artTexFor(path);
+            const Tex tx = artTexFor(path);
             if (tx.id) {
                 const float maxTw = ui::metrics::copilotThumbW();
                 const float tw = logW < maxTw ? logW : maxTw;
@@ -2042,32 +2207,19 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
     // figures form one column down the turn) and the meta figure right-aligned against it.
     const RowLanes lanes = rowLanes(!simple);
     const float metaW = metaS.empty() ? 0.0f : ImGui::CalcTextSize(metaS.c_str()).x + gap;
-    // The per-call rewind glyph SameLines itself in and is self-gating, so its slot has to be
-    // reserved up front or a long title pushes it under the meta figure. Resolved ONCE here and
-    // used to skip the painter entirely when there is no checkpoint, so the row does not pay for
-    // the same checkpoint scan twice.
-    const bool hasRewind = groupN == 1 && ui::s_aiVc.available && !ui::s_aiVc.busy &&
-                           !ui::aiVcCallCheckpointId(callI, a.title).empty();
-    const float rewindW = hasRewind ? ImGui::GetTextLineHeight() * 1.15f + ui::metrics::U(2.0f)
-                                    : 0.0f;
 
-    // ---- header: [status glyph] icon  Title [n]  dim target ........ meta  [chevron]
-    // Same rule as drawActionCard: when the run spine owns this row's mark out in the gutter, the
-    // row must not paint a second one (nor reserve its empty cell). UNKNOWN uses the Retry ring, a
-    // declined call the Skipped dash, and every true failure the Failed cross.
+    // ---- header: icon  Title [n]  dim target ........ meta  [chevron]
+    // No status glyph: a failure is the Err-toned icon + title + inline cause on the tinted shell, an
+    // UNKNOWN timeout the Warn tone, a declined call the Info tone (all `outcomeTone`), and a running
+    // call swaps its icon for the busy mark.
     const float topY = ImGui::GetCursorScreenPos().y;
-    if (!onSpine) {
-        drawStatusGlyph(hardFail ? "fail" : declined ? "skipped" : timeout ? "retry" : a.status,
-                        ImGui::GetTextLineHeight());
-        ImGui::SameLine(0, gap);
-    }
-    rowIcon("cat_tools", exceptional ? outcomeTone : surf.textSecondary);
+    rowLead("cat_tools", exceptional ? outcomeTone : surf.textSecondary, a.status == "running");
     ImGui::SameLine(0, gap);
     const float titleX = ImGui::GetCursorPosX();   // the second (error) line hangs from here
     // What is left on THIS line once the right-hand cluster is reserved. Measure only AFTER a
     // SameLine: following a text item the cursor has already wrapped to the line start.
     auto lineRoom = [&]() {
-        return lanes.metaRight - ImGui::GetCursorPosX() - metaW - rewindW;
+        return lanes.metaRight - ImGui::GetCursorPosX() - metaW;
     };
     const bool phraseOk = outcome.structured ? outcome.succeeded : !hardFail;
     // A fold shows its base phrasing plus a count BADGE, not "Reading × 3" spelled into the title.
@@ -2085,7 +2237,6 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
         chatEllipsize(humanTitle, ImMax(lineRoom() - badgeW, ui::metrics::U(6.0f)));
     ImGui::TextColored(exceptional ? outcomeTone : surf.textPrimary, "%s", titleFit.c_str());
     ImGui::PopFont();
-    noteRowHead();
     const float centerY = (ImGui::GetItemRectMin().y + ImGui::GetItemRectMax().y) * 0.5f;
     if (ImGui::IsItemHovered()) {
         // Everything the single line could not afford, in one place: the untruncated phrasing,
@@ -2158,7 +2309,6 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
         if ((fit != tgt || groupN > 1) && ImGui::IsItemHovered())
             ImGui::SetTooltip("%s", tgtTip.c_str());
     }
-    if (hasRewind) drawAiVcCallRewind(st, callI, a.title);
 
     // ---- the right-aligned latency/outcome figure, in the slot reserved above. SameLine FIRST,
     // then decide: if the slot did not survive the title/target elision, the figure takes its own
@@ -2228,7 +2378,7 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
                     const ToolRowDetail& mp = detailOf(*mi);
                     const std::string t = ui::humanTarget(mi->reason);
                     if (!t.empty()) dimText(t.c_str());
-                    drawToolArgs(mp.args, fonts);
+                    drawToolArgs(mp.args, fonts, cached(*mi));
                     drawArtifacts(mp);
                 });
                 ImGui::PopID();
@@ -2257,7 +2407,7 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
             // Longer arguments still get their own box; right-click Copy retains the whole detail.
             if (!argsBody.empty() &&
                 !(declined && errBody.find(argsBody) != std::string::npos))
-                drawToolArgs(argsBody, fonts);
+                drawToolArgs(argsBody, fonts, rowCache);
             drawArtifacts(parts);
         }
         endCollapseBody(cb);
@@ -2283,15 +2433,13 @@ static void drawToolCallRowImpl(AppState& st, ActivityItem& a, const ui::Fonts& 
     }
     ImRect rowRect = endRowShell(sh);
     {
-        const std::string toolCopy = chatActivityCopyText(a);
-        chatCopyContext(rowRect, "##tool_copy", toolCopy);
+        chatCopyContext(rowRect, "##tool_copy", [&] { return chatActivityCopyText(a); });
 
     }
 }
 
 void drawToolCallRow(AppState& st, ActivityItem& a, const ui::Fonts& fonts) {
-    // Standalone caller (outside the turn timeline): never the live frontier -> collapsed,
-    // and with no turn/call ordinal there is no per-call rewind to offer.
+    // Standalone caller (outside the turn timeline): never the live frontier -> collapsed.
     sanitizeActivityItem(st, a);
     drawToolCallRowImpl(st, a, fonts, /*failCount=*/1, /*liveFrontier=*/false);
 }
@@ -2370,6 +2518,7 @@ struct TurnReceipt {
 // MUST run in the MESSAGE id scope, before any PushID: activityAnchorId is only meaningful there.
 TurnReceipt buildReceipt(const ChatMsg& m) {
     TurnReceipt r;
+    const auto timeline = s_toolTimelines.find(ImGui::GetID("##tool_timeline_cache"));
     for (size_t i = 0; i < m.activity.size(); ++i) {
         const ActivityItem& a = m.activity[i];
         if (a.stage == "__stop_meta__" || a.rowKind == 9) continue;
@@ -2393,8 +2542,15 @@ TurnReceipt buildReceipt(const ChatMsg& m) {
         } else if (a.rowKind == 3) {
             // The synthesized "Session files" row is presentation, not a call the engine made.
             if (a.stage != "artifacts") ++r.toolCalls;
-            const ToolRowDetail parts = splitToolRowDetail(a.detail);
-            const ToolOutcomePresentation outcome = toolOutcomePresentation(a);
+            const ToolTimelineRow* cached = timeline != s_toolTimelines.end() &&
+                i < timeline->second.rows.size() && timeline->second.rows[i].valid &&
+                timeline->second.rows[i].revision == a.revision ? &timeline->second.rows[i] : nullptr;
+            const bool cachedParts = cached && cached->partsCached;
+            const ToolRowDetail uncachedParts = cachedParts ? ToolRowDetail{} : splitToolRowDetail(a.detail);
+            const ToolRowDetail& parts = cachedParts ? cached->parts : uncachedParts;
+            const ToolOutcomePresentation uncachedOutcome = cached ? ToolOutcomePresentation{}
+                                                                   : toolOutcomePresentation(a);
+            const ToolOutcomePresentation& outcome = cached ? cached->outcome : uncachedOutcome;
             if (outcome.failure || outcome.declined || outcome.timeout) {
                 if (outcome.declined) ++r.skipped;
                 else if (outcome.timeout) ++r.unknown;
@@ -2515,7 +2671,34 @@ void drawTurnReceipt(AppState& st, ChatMsg& m) {
     if (m.activity.empty()) return;
     // Built HERE, in the message id scope, before the shell pushes an id of its own: every anchor
     // in the receipt has to resolve to the same id the timeline's row loop will compute.
-    const TurnReceipt r = buildReceipt(m);
+    struct Entry {
+        uint64_t revision = ~uint64_t(0), layout = ~uint64_t(0);
+        double stamp = -1.0;
+        size_t count = 0;
+        int frame = -1;
+        TurnReceipt receipt;
+    };
+    static std::unordered_map<ImGuiID, Entry> receipts;
+    const ImGuiID id = ImGui::GetID("##cached_turn_receipt");
+    if (receipts.find(id) == receipts.end() && receipts.size() >= 64) {
+        auto oldest = receipts.begin();
+        for (auto it = receipts.begin(); it != receipts.end(); ++it)
+            if (it->second.frame < oldest->second.frame) oldest = it;
+        receipts.erase(oldest);
+    }
+    Entry& entry = receipts[id];
+    const auto timeline = s_toolTimelines.find(ImGui::GetID("##tool_timeline_cache"));
+    const uint64_t layout = timeline == s_toolTimelines.end() ? 0 : timeline->second.layoutRevision;
+    if (entry.revision != m.revision || entry.stamp != m.ts ||
+        entry.count != m.activity.size() || entry.layout != layout) {
+        entry.receipt = buildReceipt(m);
+        entry.revision = m.revision;
+        entry.stamp = m.ts;
+        entry.count = m.activity.size();
+        entry.layout = layout;
+    }
+    entry.frame = ImGui::GetFrameCount();
+    const TurnReceipt& r = entry.receipt;
     const int totalTok = r.tokensIn + r.tokensOut;
     if (r.toolCalls == 0 && totalTok == 0 && r.files.empty() && r.fails.empty()) return;
     const bool hasBody = !r.fails.empty() || !r.files.empty() || (!r.stages.empty() && totalTok > 0);
@@ -2617,222 +2800,100 @@ void drawTurnReceipt(AppState& st, ChatMsg& m) {
     if (openState != wasOpen) m.uiCachedH = -1.0f;
 }
 
-// ---- the run spine -----------------------------------------------------------------------------
-namespace {
-// One status mark on the rail. Collected during the row loop and painted afterwards, because the
-// rail's extent is only known once every row has landed. `joined` = a rail segment connects this
-// mark to the previous one; the assistant's own prose breaks the rail, so each burst of tool work
-// between two sentences reads as its own run.
-struct SpineMark {
-    float           y;
-    ui::kit::Status st;
-    bool            joined = true;
-};
-
-// RAII guard around an ImDrawListSplitter. Merging is the whole point: an unmerged splitter does
-// not fail loudly, it silently corrupts every subsequent primitive in the window, which is a
-// spectacularly confusing failure mode to debug. The destructor merges if the caller has not, so
-// no early return — or an exception out of a card painter — can leak one.
-class ChannelSplit {
-public:
-    ChannelSplit(ImDrawList* dl, int channels) : dl_(dl) {
-        if (!dl_) return;
-        split_.Split(dl_, channels);
-        active_ = true;
-    }
-    ChannelSplit(const ChannelSplit&) = delete;
-    ChannelSplit& operator=(const ChannelSplit&) = delete;
-    ~ChannelSplit() { merge(); }
-    void setChannel(int c) {
-        if (active_) split_.SetCurrentChannel(dl_, c);
-    }
-    void merge() {
-        if (!active_) return;
-        active_ = false;
-        split_.Merge(dl_);
-    }
-
-private:
-    ImDrawList*        dl_ = nullptr;
-    ImDrawListSplitter split_;
-    bool               active_ = false;
-};
-
-// What this row's mark says. It uses the same structured taxonomy as the row's own glyph so the
-// gutter cannot disagree with the label beside it. Missing/future values deliberately fall through
-// to the legacy status mapping.
-ui::kit::Status spineStatusOf(const ActivityItem& a, bool turnRunning, bool frontier,
-                             const ToolOutcomePresentation* outcome = nullptr) {
-    switch (outcome ? outcome->info.kind : ui::copilot::toolOutcomeFromDetail(a.detail).kind) {
-        case ui::copilot::ToolOutcomeKind::Ok:
-            return ui::kit::Status::Done;
-        case ui::copilot::ToolOutcomeKind::PolicyRefusal:
-            return ui::kit::Status::Skipped;
-        case ui::copilot::ToolOutcomeKind::GuardBlock:
-            return ui::kit::Status::Skipped;
-        case ui::copilot::ToolOutcomeKind::ValidationError:
-            return ui::kit::Status::Failed;
-        case ui::copilot::ToolOutcomeKind::TimeoutUnknown:
-            return ui::kit::Status::Retry;
-        case ui::copilot::ToolOutcomeKind::InternalError:
-            return ui::kit::Status::Failed;
-        case ui::copilot::ToolOutcomeKind::ToolError:
-            return ui::kit::Status::Failed;
-        case ui::copilot::ToolOutcomeKind::Legacy:
-        default:
-            break;
-    }
-    if (a.status == "fail" || a.status == "error") return ui::kit::Status::Failed;
-    if (a.status == "running" || (turnRunning && frontier)) return ui::kit::Status::Running;
-    if (a.status == "done" || a.status == "ok" || a.status == "pass") return ui::kit::Status::Done;
-    if (a.status == "skipped") return ui::kit::Status::Skipped;
-    if (a.status == "retry") return ui::kit::Status::Retry;
-    return ui::kit::Status::Pending;
-}
-
-// Paint the rail and its marks. Called with the splitter on the BACK channel so the hairline sits
-// under the rows no matter what order they were submitted in.
-//
-// The rail spans mark-to-mark, never the whole turn height: that is what makes it survive the
-// grouped-tool fold, the collapse animations and the synthesized "Session files" presentation row.
-// A row that drew nothing contributed no mark, so the rail simply does not reach it — it can never
-// draw a segment to a step that is not on screen. Each segment stops short of the marks at both
-// ends: a hairline driven THROUGH a check mark is the sharp joint that made the old spine read as
-// wiring; with a gap the marks are beads on a thread.
-void paintRunSpine(ImDrawList* dl, float railX, float cell,
-                   const std::vector<SpineMark>& marks, bool running) {
-    if (!dl || marks.empty()) return;
-    const ui::AdaptiveSurface& surf = chatSurf();
-    const float r     = cell * 0.36f;                       // lighter marks than the text cell
-    const float clear = r + ui::metrics::U(0.75f);          // rail stops this far from a mark
-    const float thick = ui::metrics::stroke(1.0f);
-    // The track: a hairline in the tertiary ink, so it reads as structure rather than content.
-    // 0.75, not 0.55: pixel-measured against the light glass surface, 0.55 put only ~30/255
-    // between the rail and the panel — below the point where a hairline reads as a deliberate
-    // connector rather than a compression artifact.
-    ImVec4 track = surf.textTertiary;
-    track.w *= 0.75f;
-    const ImU32 trackU = ImGui::ColorConvertFloat4ToU32(track);
-    for (size_t i = 1; i < marks.size(); ++i) {
-        if (!marks[i].joined) continue;
-        const float y0 = marks[i - 1].y + clear;
-        const float y1 = marks[i].y - clear;
-        if (y1 > y0) dl->AddLine(ImVec2(railX, y0), ImVec2(railX, y1), trackU, thick);
-    }
-
-    // The LIVE segment: from the last completed mark down to the running one, marching downward.
-    // This is the whole point of the spine — "how far into the turn is the agent" answerable at a
-    // glance. Only drawn while a turn is actually running, so a finished transcript is completely
-    // static and requests no frames.
-    if (running) {
-        size_t runIdx = marks.size();
-        for (size_t i = 0; i < marks.size(); ++i)
-            if (marks[i].st == ui::kit::Status::Running) { runIdx = i; break; }
-        if (runIdx > 0 && runIdx < marks.size() && marks[runIdx].joined) {
-            const float segTop = marks[runIdx - 1].y + clear;
-            const float segBot = marks[runIdx].y - clear;
-            if (segBot > segTop) {
-                // A short bright head sliding down the segment, rather than pulsing the whole
-                // length: motion with a direction reads as progress, motion without one reads as
-                // an error state.
-                const float span = segBot - segTop;
-                const float head = ImMin(span, cell * 1.6f);
-                const float p    = ui::anim::phase(ui::anim::kMarch);
-                const float hy   = segTop + p * span;
-                const ImU32 hot  = ui::kit::toneU32(ui::kit::Tone::Accent, 0.85f);
-                const ImU32 cold = ui::kit::toneU32(ui::kit::Tone::Accent, 0.0f);
-                const int   v0   = dl->VtxBuffer.Size;
-                dl->AddLine(ImVec2(railX, ImMax(segTop, hy - head)), ImVec2(railX, hy), hot,
-                            ui::metrics::stroke(2.0f));
-                ImGui::ShadeVertsLinearColorGradientKeepAlpha(
-                    dl, v0, dl->VtxBuffer.Size, ImVec2(railX, ImMax(segTop, hy - head)),
-                    ImVec2(railX, hy), cold, hot);
-            }
-        }
-    }
-    for (const SpineMark& mk : marks)
-        ui::kit::statusGlyph(dl, ImVec2(railX, mk.y), r, mk.st, surf);
-}
-}  // namespace
-
-
-void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, bool showThinking,
-                       bool isLastTurn) {
+void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, bool showThinking) {
     if (m.activity.empty()) return;
     // ONE rhythm for the whole run (metrics.h:93): a streaming conversation is denser than a
-    // docked menu, and every kit widget any row draws — here, or in the corp/firm/swarm family
-    // cards.cpp draws for us — must resolve its padding from the SAME density or the stack
+    // docked menu, and every kit widget any row draws — here or in cards.cpp — must resolve
+    // its padding from the SAME density or the stack
     // alternates rhythms row to row, which is the uneven spacing a live session called trash.
     ui::kit::pushDensity(ui::kit::Density::Compact);
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
                         ImVec2(ImGui::GetStyle().ItemSpacing.x, ui::metrics::cpChatRowGap()));
     const bool turnRunning = m.running;
-    if (!turnRunning) {
-        // Stale live rows on a finished turn (restored history, terminal events dropped after
-        // a stop) would animate forever — clamp them once here, idempotently. Thinking/thought
-        // rows also collapse once the turn is done: nothing is still "filling out", and an
-        // open reasoning box per turn floods scrollback (the user re-opens with one click).
-        for (auto& a : m.activity) {
-            if (a.streaming) a.streaming = false;
-            if (a.status == "running") a.status = "done";
-            if (!a.userToggled && (a.rowKind == 2 || isThinkingItem(a))) a.expanded = false;
-        }
-    }
+    // Terminal normalization is revision-gated inside toolTimelineCache.
     // Resolve opaque doc ids to part names and fold uncovered glyphs before ANY row is measured
     // or drawn — one place, every row kind, and the widths computed below are the final ones.
     ToolTimelineCache& toolCache = toolTimelineCache(st, m, fonts);
+    if (toolCache.spanThinking != showThinking) {
+        toolCache.spanThinking = showThinking;
+        toolCache.spansReady = false;
+        toolCache.prefixSpans = 0;
+        ++toolCache.layoutRevision;
+        for (auto& row : toolCache.rows) {
+            row.height = -1.0f;
+            row.settled = false;
+        }
+    }
     auto cachedTool = [&](size_t idx) -> ToolTimelineRow* {
         return idx < toolCache.rows.size() && toolCache.rows[idx].valid ? &toolCache.rows[idx] : nullptr;
     };
     // No blanket leading Dummy here: EVERY dispatched row (both the local draw* functions below
-    // and cards.cpp's corp/firm/swarm family) already opens with its own cpChatRowGap() Dummy —
+    // and cards.cpp's cards) already opens with its own cpChatRowGap() Dummy —
     // one used to sit here too, doubling the gap above the first card in every turn.
     // The live frontier: the most recent row this loop will actually draw (skip conditions
     // below). Only that row auto-expands mid-turn; earlier rows collapse to summary+icon.
-    size_t lastVisible = (size_t)-1;
-    for (size_t i = 0; i < m.activity.size(); ++i) {
-        const ActivityItem& a = m.activity[i];
-        if (a.stage == "__stop_meta__" || a.rowKind == 9) continue;
-        if (isProseOutputRow(a) && !ui::streamTextVisible(a.detail)) continue;
-        lastVisible = i;
-    }
+    const size_t lastVisible = toolCache.lastVisible;
 
-    // ---- the run spine -------------------------------------------------------------------
-    // A hairline down the left gutter of the turn with each step's status mark ON it, so "how far
-    // into this run is the agent" is answerable across the room. The rail is derived ENTIRELY
-    // from where rows actually landed this frame, which is what makes it survive the grouped-tool
-    // fold, the collapse animations and the synthesized "Session files" row: a row that did not
-    // draw contributes no mark, and the rail spans mark-to-mark, so it can never run to a step
-    // that is not on screen. The assistant's prose steps OUT of the gutter (full width) and breaks
-    // the rail there.
-    //
-    // It paints into a BACK channel of the window draw list so it sits under every card
-    // regardless of submission order. ChannelSplit merges in its destructor, so every exit from
-    // this function — the normal path, and a throw out of any card painter — leaves the draw
-    // list intact; an unmerged splitter silently corrupts the whole window.
-    const float spineCell = ImGui::GetTextLineHeight();             // the status-mark glyph cell
-    const float spineW    = spineCell + ui::kit::padX() * 0.5f;     // gutter the rows indent past
-    const float railX     = ImGui::GetCursorScreenPos().x + spineCell * 0.5f;
-    // Keep the nearest offscreen mark at each boundary, so clipped rail segments are identical
-    // without generating glyphs/vertices for every tool in a long active turn.
-    static std::vector<SpineMark> spineMarks;
-    spineMarks.clear();
+    // Rows start at the content edge: there is no gutter column, so tool rows, thoughts and prose
+    // share one left edge (chatProseInsetX). The spans below record each row's extent so a run of
+    // settled off-screen rows collapses to one spacer.
     const ImRect timelineClip = ImGui::GetCurrentWindow()->ClipRect;
-    bool spineBreak = false;   // prose landed since the last mark: do not join across it
-    ImDrawList* const spineDl = ImGui::GetWindowDrawList();
-    ChannelSplit spine(spineDl, 2);
-    spine.setChannel(1);
-    ImGui::Indent(spineW);
-    // Tool-call ordinal within the turn — the `i` of an AI-VC "call:<turn>:<i>" target.
-    // Counted over rowKind-3 rows only (the timeline also carries thinking, context and
-    // card rows), and NOT over the synthesized "Session files" artifact row, which is a
-    // presentation row rather than a call the engine checkpointed.
-    int toolOrdinal = -1;
-    for (size_t i = 0; i < m.activity.size(); ++i) {
+    const float timelineTop = ImGui::GetCursorScreenPos().y;
+    const float slack = ImGui::GetTextLineHeightWithSpacing() * 2.0f;
+    auto spacer = [](float height) {
+        if (height <= 0.0f) return;
+        const float y = ImGui::GetCursorPosY();
+        ImGui::Dummy(ImVec2(0, ImMax(0.0f, height - ImGui::GetStyle().ItemSpacing.y)));
+        ImGui::SetCursorPosY(y + height);
+    };
+    const bool indexed = toolCache.spansReady && toolCache.spanRevision == toolCache.layoutRevision &&
+        toolCache.spanThinking == showThinking &&
+        !g_pendingAnchor && !toolCache.spans.empty();
+    const bool prefixIndexed = !indexed && !g_pendingAnchor && toolCache.prefixSpans > 0;
+    const size_t knownSpans = indexed ? toolCache.spans.size()
+                                     : (prefixIndexed ? toolCache.prefixSpans : 0);
+    if (prefixIndexed) {
+        toolCache.spans.resize(knownSpans);
+    }
+    size_t beginSpan = 0, endSpan = knownSpans;
+    size_t beginRow = 0, endRow = m.activity.size();
+    const size_t prefixEndRow = prefixIndexed ? toolCache.spans.back().last + 1 : 0;
+    size_t prefixVisibleEndRow = prefixEndRow;
+    float suffixHeight = 0.0f;
+    if (indexed || prefixIndexed) {
+        const auto& spans = toolCache.spans;
+        beginSpan = size_t(std::lower_bound(spans.begin(), spans.end(),
+            timelineClip.Min.y - slack - timelineTop,
+            [](const TimelineSpan& span, float y) { return span.bottom < y; }) - spans.begin());
+        endSpan = size_t(std::upper_bound(spans.begin() + beginSpan, spans.end(),
+            timelineClip.Max.y + slack - timelineTop,
+            [](float y, const TimelineSpan& span) { return y < span.top; }) - spans.begin());
+        beginRow = beginSpan < spans.size() ? spans[beginSpan].first
+                                          : (prefixIndexed ? prefixEndRow : m.activity.size());
+        prefixVisibleEndRow = endSpan < spans.size() ? spans[endSpan].first : prefixEndRow;
+        if (indexed) endRow = endSpan < spans.size() ? spans[endSpan].first : m.activity.size();
+        const float prefix = beginSpan < spans.size() ? spans[beginSpan].top : spans.back().bottom;
+        const float suffixTop = endSpan < spans.size() ? spans[endSpan].top : spans.back().bottom;
+        suffixHeight = spans.back().bottom - suffixTop;
+        spacer(prefix);
+    } else {
+        toolCache.spans.clear();
+    }
+    bool allSettled = m.activity.size() <= toolCache.rows.size();
+    bool indexChanged = false;
+    size_t settledPrefix = prefixIndexed ? knownSpans : 0;
+    bool prefixSettled = true;
+    for (size_t i = beginRow; i < endRow; ++i) {
+        if (prefixIndexed && i >= prefixVisibleEndRow && i < prefixEndRow) {
+            spacer(suffixHeight);
+            i = prefixEndRow;
+            if (i >= endRow) break;
+        }
         ActivityItem& a = m.activity[i];
-        // Hidden meta row carrying stop_reason / error_detail — never drawn as a card.
-        // Provider-call rows (rowKind 9) aggregate into the collapsible Provider log.
-        if (a.stage == "__stop_meta__" || a.rowKind == 9) continue;
+        // Hidden stop metadata, provider-call rows, and retired corporate cards are not
+        // drawn inline. Provider calls aggregate into the collapsible Provider log.
+        if (a.stage == "__stop_meta__" || a.rowKind == 9 || a.isRetiredCorporateRow()) continue;
+        const size_t spanFirst = i;
         const bool liveFrontier = turnRunning && (i == lastVisible);
         // Deferred scroll-to-anchor: the receipt / cost strip requested this row LAST frame, when
         // the render-windowing cache may still have had the message collapsed to a spacer.
@@ -2840,31 +2901,28 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, bool sh
         // documented to be called from the turn footer, i.e. the message scope, not the row scope.
         // The cursor is at the row's top edge here, which is the position we want to bring into
         // view; a tall card centred on its own middle would push its header offscreen.
-        const bool anchorRequested = g_pendingAnchor == activityAnchorId((int)i);
-        consumeAnchorScroll(activityAnchorId((int)i));
+        const ImGuiID anchorId = activityAnchorId((int)i);
+        const bool anchorRequested = g_pendingAnchor == anchorId;
+        consumeAnchorScroll(anchorId);
         ImGui::PushID((int)i);
-        // Where this row's status mark sits on the rail, and what it says. Captured around the
-        // dispatch so a row that draws nothing (an empty prose segment) leaves no orphan mark.
         const float rowTopY = ImGui::GetCursorScreenPos().y;
-        ToolTimelineRow* const firstTool = a.rowKind == 3 ? cachedTool(i) : nullptr;
-        const ui::kit::Status rowStatus = spineStatusOf(a, turnRunning, i == lastVisible,
-                                                       firstTool ? &firstTool->outcome : nullptr);
-        const bool onSpine = !isProseOutputRow(a) && a.rowKind != 1 && a.rowKind != 20;
-        g_rowHeadY = -1.0f;   // each painter records its own header centre (noteRowHead)
-        if (isProseOutputRow(a)) {
-            // The model's own words, in the column at the point it said them — full width, out of
-            // the spine gutter, and the rail breaks around them.
-            ImGui::Unindent(spineW);
+        ToolTimelineRow* const cachedRow = cachedTool(i);
+        ToolTimelineRow* const firstTool = a.rowKind == 3 ? cachedRow : nullptr;
+        const bool oldExpanded = a.expanded, oldToggled = a.userToggled;
+        const bool skipNonTool = a.rowKind != 3 && cachedRow && cachedRow->settled &&
+            cachedRow->height >= 0.0f && !anchorRequested && !liveFrontier &&
+            cachedRow->frontier == liveFrontier &&
+            (rowTopY + cachedRow->height < timelineClip.Min.y - slack ||
+             rowTopY > timelineClip.Max.y + slack);
+        if (skipNonTool) {
+            spacer(cachedRow->height);
+        } else if (isProseOutputRow(a)) {
+            // The model's own words, in the column at the point it said them — full width.
             drawProseBubble(a, fonts);
-            ImGui::Indent(spineW);
-            if (ImGui::GetCursorScreenPos().y > rowTopY) spineBreak = true;
         } else if (a.rowKind == 20) {
             // ask_user marker — the question card (form while pending, summary once answered)
-            // at the point the agent asked, full width like prose, breaking the rail.
-            ImGui::Unindent(spineW);
+            // at the point the agent asked, full width like prose.
             drawAskMarker(st, m, a, fonts);
-            ImGui::Indent(spineW);
-            if (ImGui::GetCursorScreenPos().y > rowTopY) spineBreak = true;
         } else if (a.rowKind == 1) {
             drawContextChip(a, fonts);
         } else if (a.rowKind == 2) {
@@ -2932,28 +2990,12 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, bool sh
                     }
                 }
             }
-            // This row's call ordinal. The synthesized "Session files" row is presentation,
-            // not a checkpointed call, so it never consumes an index. A coalesced run of
-            // identical failures — or a folded group of similar successes — draws ONE row but
-            // consumed that many calls, so the ordinal advances by all of them.
-            int callIdx = -1;
-            if (a.stage != "artifacts") {
-                callIdx = ++toolOrdinal;
-                if (failCount > 1) toolOrdinal += failCount - 1;
-                if (groupCount > 1) toolOrdinal += (int)groupCount - 1;
-            }
-            // A grouped card must never offer a rewind glyph pointing at an arbitrary member;
-            // the identical-failure fold still rewinds to before the FIRST attempt. The most
-            // recent row of the whole chat (the live frontier of the LAST turn) offers none
-            // either: it IS the current state — there is nothing to rewind to.
-            const bool chatFrontier = isLastTurn && (frontIdx == lastVisible);
-            const int rewindIdx = (groupCount > 1 || chatFrontier) ? -1 : callIdx;
             bool changed = !firstTool;
             bool anchor = anchorRequested;
             ImGui::PopID();
             for (size_t k = firstIdx; k <= frontIdx; ++k) {
                 const ToolTimelineRow* member = cachedTool(k);
-                changed = changed || !member || member->changed;
+                changed = changed || !member || member->changedFrame == ImGui::GetFrameCount();
                 const ImGuiID messageAnchor = activityAnchorId((int)k);
                 anchor = anchor || g_pendingAnchor == messageAnchor;
                 consumeAnchorScroll(messageAnchor);
@@ -2963,22 +3005,31 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, bool sh
             const ImRect clip = ImGui::GetCurrentWindow()->ClipRect;
             const float slack = ImGui::GetTextLineHeightWithSpacing() * 2.0f;
             const bool reusable = firstTool && !changed && firstTool->height > 0.0f &&
-                firstTool->settled && firstTool->end == frontIdx && firstTool->rewind == rewindIdx &&
+                firstTool->settled && firstTool->end == frontIdx &&
                 firstTool->frontier == frontier && a.stage != "artifacts";
             if (reusable && !anchor &&
                 (rowTopY + firstTool->height < clip.Min.y - slack || rowTopY > clip.Max.y + slack)) {
                 const float y = ImGui::GetCursorPosY();
                 ImGui::Dummy(ImVec2(0.0f, ImMax(0.0f, firstTool->height - ImGui::GetStyle().ItemSpacing.y)));
                 ImGui::SetCursorPosY(y + firstTool->height);
-                g_rowHeadY = rowTopY + firstTool->headOffset;
             } else {
                 std::vector<ActivityItem*> group;
                 if (groupCount > 1) {
                     group.reserve(groupCount);
                     for (size_t k = firstIdx; k <= frontIdx; ++k) group.push_back(&m.activity[k]);
                 }
-                drawToolCallRowImpl(st, m.activity[drawIdx], fonts, failCount, frontier, rewindIdx,
-                                    group.size() > 1 ? &group : nullptr, onSpine, &m.activity, &toolCache.rows);
+                const bool beforeExpanded = m.activity[drawIdx].expanded;
+                const bool beforeToggled = m.activity[drawIdx].userToggled;
+                drawToolCallRowImpl(st, m.activity[drawIdx], fonts, failCount, frontier,
+                                    group.size() > 1 ? &group : nullptr, &m.activity,
+                                    &toolCache.rows);
+                if (m.activity[drawIdx].expanded != beforeExpanded ||
+                    m.activity[drawIdx].userToggled != beforeToggled) {
+                    ++m.activity[drawIdx].revision;
+                    ++m.revision;
+                    m.uiActivityDirtyFrom = std::min(m.uiActivityDirtyFrom, drawIdx);
+                    indexChanged = true;
+                }
                 if (firstTool) {
                     const float height = ImGui::GetCursorScreenPos().y - rowTopY;
                     // AutoResizeY consumes the previous frame's content extent. Never freeze
@@ -2986,9 +3037,7 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, bool sh
                     const bool stableHeight = firstTool->height > 0.0f &&
                                               std::fabs(firstTool->height - height) < 0.5f;
                     firstTool->height = height;
-                    firstTool->headOffset = g_rowHeadY - rowTopY;
                     firstTool->end = frontIdx;
-                    firstTool->rewind = rewindIdx;
                     firstTool->frontier = frontier;
                     const auto anim = s_collapseT.find(ImGui::GetID("##toolrow_anim"));
                     firstTool->settled = stableHeight && (!ui::chatCollapseAnim() ||
@@ -2997,14 +3046,10 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, bool sh
             }
         } else if (a.rowKind == 19) {
             drawDelegationCard(a, fonts);
-        } else if (a.rowKind == 4) {
-            drawCorpOrgCard(a, fonts);
-        } else if (a.rowKind == 5) {
-            drawCorpMeetingCard(a, fonts);
-        } else if (a.rowKind == 6) {
-            drawCorpSteeringCard(a, fonts);
-        } else if (a.rowKind == 7 || a.rowKind == 8) {
-            drawCorpMutedLine(a, fonts);
+        } else if (a.rowKind == 7) {
+            drawAgentMessageLine(a, fonts);
+        } else if (a.rowKind == 21) {
+            drawUsageLine(a, fonts);
         } else if (a.rowKind == 11) {
             drawSwarmWaveCard(a, fonts);
         } else if (a.rowKind == 12) {
@@ -3022,45 +3067,70 @@ void drawAgentTimeline(AppState& st, ChatMsg& m, const ui::Fonts& fonts, bool sh
         } else if (a.rowKind == 18) {
             // Plan position marker — the plan/objectives section renders HERE, where the plan
             // first arrived in the event stream, instead of pinned to the top of the turn.
-            if (m.planState.present) drawPlanSection(m.planState, m.activity, fonts);
+            if (m.planState.present) drawPlanSection(m, fonts);
         } else if (isThinkingItem(a)) {
             drawThinkingBlock(a, fonts, showThinking, liveFrontier);
         } else {
-            drawActionCard(a, fonts, liveFrontier, onSpine);
+            drawActionCard(a, fonts, liveFrontier);
         }
-        // The mark's y: the centre of the row's own header line, as the painter recorded it — so
-        // the glyph sits level with the title, and a card with a long open drawer never floats its
-        // mark halfway down the rail. Painters that record nothing (cards.cpp's family) fall back
-        // to the first-line estimate. Clamped inside the row either way.
-        if (onSpine) {
-            const float rowBotY = ImGui::GetCursorScreenPos().y;
-            if (rowBotY > rowTopY) {
-                const float half = spineCell * 0.5f;
-                const float my = g_rowHeadY >= rowTopY
-                    ? g_rowHeadY
-                    : rowTopY + ui::metrics::cpChatRowGap() + ui::kit::padY() + half;
-                const float lo = rowTopY + half;
-                const float hi = ImMax(lo, rowBotY - half);
-                const SpineMark mark{ImClamp(my, lo, hi), rowStatus, !spineBreak};
-                if (mark.y < timelineClip.Min.y - spineCell) {
-                    if (spineMarks.empty()) spineMarks.push_back(mark);
-                    else spineMarks.back() = mark;
-                } else if (spineMarks.empty() || spineMarks.back().y <= timelineClip.Max.y + spineCell) {
-                    spineMarks.push_back(mark);
+        if (a.rowKind != 3 && (a.expanded != oldExpanded || a.userToggled != oldToggled)) {
+            ++a.revision;
+            ++m.revision;
+            m.uiActivityDirtyFrom = std::min(m.uiActivityDirtyFrom, spanFirst);
+            indexChanged = true;
+        }
+        if (a.rowKind != 3 && cachedRow && !skipNonTool) {
+            const float height = ImGui::GetCursorScreenPos().y - rowTopY;
+            const bool stable = cachedRow->height >= 0.0f &&
+                std::fabs(cachedRow->height - height) < 0.5f;
+            cachedRow->height = height;
+            cachedRow->frontier = liveFrontier;
+            bool animating = false;
+            if (ui::chatCollapseAnim())
+                for (const char* key : {"##thinkblk_anim", "##thoughtbox_anim", "##actcard_anim"}) {
+                    const auto anim = s_collapseT.find(ImGui::GetID(key));
+                    if (anim != s_collapseT.end() && anim->second.t != 0.0f && anim->second.t != 1.0f)
+                        animating = true;
                 }
-                spineBreak = false;
-            }
+            cachedRow->settled = stable && !animating;
+        }
+        const float bottom = ImGui::GetCursorScreenPos().y - timelineTop;
+        if (!indexed && (!prefixIndexed || spanFirst >= prefixEndRow)) {
+            TimelineSpan span;
+            span.first = spanFirst;
+            span.last = i;
+            span.top = rowTopY - timelineTop;
+            span.bottom = bottom;
+            toolCache.spans.push_back(span);
+            allSettled = allSettled && cachedRow && cachedRow->settled;
+            if (prefixSettled && cachedRow && cachedRow->settled) ++settledPrefix;
+            else prefixSettled = false;
+        } else {
+            const auto span = std::lower_bound(toolCache.spans.begin() + beginSpan,
+                toolCache.spans.begin() + endSpan, spanFirst,
+                [](const TimelineSpan& entry, size_t row) { return entry.first < row; });
+            if (span == toolCache.spans.begin() + endSpan ||
+                std::fabs((bottom - (rowTopY - timelineTop)) - (span->bottom - span->top)) >= 0.5f ||
+                !cachedRow || !cachedRow->settled)
+                indexChanged = true;
         }
         ImGui::PopID();
     }
-    ImGui::Unindent(spineW);
-    spine.setChannel(0);
-    paintRunSpine(spineDl, railX, spineCell, spineMarks, turnRunning);
-    spine.merge();   // explicit, ahead of the guard, so the rail is in the list before PopStyleVar
+    if (indexed) {
+        spacer(suffixHeight);
+        if (indexChanged) {
+            toolCache.spansReady = false;
+            toolCache.prefixSpans = 0;
+        }
+    } else {
+        toolCache.spansReady = allSettled && !indexChanged;
+        toolCache.spanRevision = toolCache.layoutRevision;
+        toolCache.spanThinking = showThinking;
+        toolCache.prefixSpans = indexChanged || toolCache.spansReady ? 0 : settledPrefix;
+    }
+    if (indexChanged) ui::chatLogMessageChanged(m);
     ImGui::PopStyleVar();   // timeline-wide compact ItemSpacing
     ui::kit::popDensity();
 }
-
-// Forward: user bubble + rewind/edit actions (defined after AI-VC helpers).
 
 }  // namespace ui

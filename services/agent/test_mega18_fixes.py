@@ -3,57 +3,11 @@
 Axes:
   Z2r — parts placed but no power symbols force-EXECUTES ecad_add_power (cascade,
         not schedule-only); returned refs feed ecad_wire; self-loop guard rejects
-        same-ref pairs when ≥2 live refs. Replay mega-17 ledger fixture.
+        same-ref pairs when ≥2 live refs. Exercise the mega-17 residual shape.
   Z4  — AC5 grader reads real ecad_simulate payload; null V(3V3) → FAIL naming
         missing net, never NOT-CHECKED when the tool ran.
 """
 from __future__ import annotations
-
-import json
-from pathlib import Path
-
-import pytest
-
-
-_MEGA17_LEDGER = (
-    Path(__file__).resolve().parents[2]
-    / "reports/runs/mega-17/attempt-2-primary-graded-z2fail/ledger.json"
-)
-
-
-def _mega17_ecad_calls() -> list[dict]:
-    """Reconstruct ECAD call records from mega-17 a2 ledger."""
-    if not _MEGA17_LEDGER.is_file():
-        pytest.skip(f"mega-17 ledger fixture missing: {_MEGA17_LEDGER}")
-    raw = json.loads(_MEGA17_LEDGER.read_text(encoding="utf-8"))
-    events = raw if isinstance(raw, list) else raw.get("events", [])
-    calls: list[dict] = []
-    for e in events:
-        pl = e.get("payload") or e
-        if pl.get("event") != "tool_call":
-            continue
-        tool = pl.get("tool")
-        if not tool:
-            continue
-        if not (
-            str(tool).startswith("ecad_") or tool in ("board_from_schematic",)
-        ):
-            continue
-        if "ok" not in pl:
-            continue
-        rec = {
-            "tool": tool,
-            "args": pl.get("args") or {},
-            "ok": bool(pl.get("ok")),
-            "result": pl.get("result"),
-        }
-        if isinstance(rec["result"], str):
-            try:
-                rec["result"] = json.loads(rec["result"])
-            except Exception:  # noqa: BLE001
-                pass
-        calls.append(rec)
-    return calls
 
 
 def _synthetic_mega17_residual_calls() -> list[dict]:
@@ -62,7 +16,7 @@ def _synthetic_mega17_residual_calls() -> list[dict]:
         {
             "tool": "ecad_new_schematic",
             "ok": True,
-            "args": {"name": "RocketFlightComputer"},
+            "args": {"name": "SensorController"},
             "result": {"ok": True, "doc_id": "fb6e6e4b586d"},
         },
         {
@@ -258,29 +212,14 @@ def test_forced_wire_after_power_prefers_power_pin():
     assert "#PWR01" in {args["from_ref"], args["to_ref"]}, args
 
 
-def test_mega17_ledger_replay_produces_add_power_and_valid_wire():
-    """Replay ledger residual: cascade yields add_power + non-self wire."""
+def test_residual_replay_produces_add_power_and_valid_wire():
+    """Cascade yields add_power and a non-self wire."""
     from services.agent.agent_turn import (
         _ecad_chain_need, _ecad_force_chain_cascade, _ecad_forced_tool_args,
         _ecad_last_place_refs,
     )
 
-    try:
-        ledger_calls = _mega17_ecad_calls()
-    except Exception:  # noqa: BLE001
-        ledger_calls = []
-    residual: list[dict] = []
-    for c in ledger_calls:
-        if c.get("tool") in (
-            "board_from_schematic", "ecad_run_drc",
-            "ecad_run_erc", "ecad_simulate",
-        ):
-            break
-        residual.append(c)
-    if not residual or not any(
-        c.get("tool") == "ecad_place_symbol" and c.get("ok") for c in residual
-    ):
-        residual = _synthetic_mega17_residual_calls()
+    residual = _synthetic_mega17_residual_calls()
 
     allow = {
         "ecad_new_schematic", "ecad_place_symbol", "ecad_wire",

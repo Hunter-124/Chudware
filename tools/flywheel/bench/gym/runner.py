@@ -171,8 +171,7 @@ def execution_probe() -> ExecProbe:
     frontier = _frontier_credentials_present()
     local = _local_model_present()
 
-    # A real agent function is the node runner's shared Chudcode role-turn path,
-    # not a silent/stubbed result and not the retired Python cloud-provider loop.
+    # Presence is only a prerequisite, not proof that a provider turn will succeed.
     real_agent = _real_agent_fn_present()
 
     return ExecProbe(
@@ -265,19 +264,12 @@ def ensure_capable_interpreter(module: str) -> None:
 
 
 def _real_agent_fn_present() -> bool:
-    """True when DAG nodes are wired to the shared Chudcode role runner."""
+    """Check that the DAG runner and its OMP role dependency are importable."""
     try:
-        import importlib
-
-        importlib.import_module("services.agent.chudcode_roles")
-        nr = importlib.import_module("services.dag.node_runner")
-        src = importlib.import_module("inspect").getsource(nr._default_agent_fn)
-        return (
-            "run_role_turn" in src
-            and "get_provider" not in src
-            and "providers.anthropic" not in src
-        )
-    except Exception:
+        from services.agent.omp_roles import run_role_turn
+        from services.dag.node_runner import make_default_agent_fn
+        return callable(run_role_turn) and callable(make_default_agent_fn)
+    except ImportError:
         return False
 
 
@@ -486,7 +478,7 @@ def default_tools_for_division(division: str) -> list[str]:
         "verify_battery",
         "check_interference",
         "plm_checkpoint",
-        "undo",
+        "plm_restore",
         "fit_calc",
         "render_part",
         "contact_sheet",
@@ -735,7 +727,7 @@ def run_cell(
 
 # Explicit local tiers construct one offline-safe provider and cache managed
 # llama.cpp instances because VRAM is finite. Paid tiers never enter this cache:
-# they carry provider/model identifiers into Chudcode.
+# they carry provider/model identifiers into OMP.
 _LOCAL_PROVIDER_CACHE: dict[str, Any] = {}
 _DEFAULT_LOCAL_MODEL = "qwen3-4b"  # the bundled CUDA model the tuning loop benchmarks (tiers.yaml local_models.fanout)
 
@@ -749,14 +741,14 @@ _DEFAULT_LOCAL_MODEL = "qwen3-4b"  # the bundled CUDA model the tuning loop benc
 #                                              prompted-JSON + roles.validate_handoff)
 #   local-24k-gemma3-qat  -> gemma3-4b-qat   (smallest footprint, FULL GBNF grammar
 #                                              compliance — structured/grammar-requiring
-#                                              roles actually exercise the schema_to_gbnf
+#                                              roles actually exercise the GBNF grammar
 #                                              path here, which qwen3-4b's tier never does)
 #   local-24k-gemma4-e4b  -> gemma4-e4b      (larger/slower GBNF worker; comparison-only,
 #                                              no measured upside over gemma3-4b-qat today)
 #
 # Local tier/model mapping remains in services.agent.tiers so the gym and the
 # deterministic provider factory share one source of truth. Paid benchmark tiers
-# carry only provider/model identifiers into Chudcode; no Python cloud provider
+# carry only provider/model identifiers into OMP; no Python cloud provider
 # is constructed.
 
 
@@ -845,7 +837,7 @@ def _offline_provider_for_tier(tier: str, cfg: dict[str, Any]):
 
 
 def _online_settings_for_tier(tier: str, cfg: dict[str, Any]) -> dict[str, Any]:
-    """Resolve provider/model identifiers for Chudcode without creating an adapter."""
+    """Resolve provider/model identifiers for OMP without creating an adapter."""
     from services.agent.tiers import parse_openrouter_tier, parse_xai_tier
 
     openrouter_model = parse_openrouter_tier(tier)
@@ -865,7 +857,7 @@ def _online_settings_for_tier(tier: str, cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 def _tier_execution(tier: str) -> dict[str, Any]:
-    """Return one honest benchmark route: local provider or Chudcode settings."""
+    """Return one honest benchmark route: local provider or OMP settings."""
     cfg = _load_benchmark_config()
     override = str(os.environ.get("CHUDWARE_PROVIDER") or "").strip().lower()
     configured = str(cfg.get("provider") or "").strip().lower()
@@ -926,26 +918,26 @@ def _message_payload(messages: list[dict]) -> tuple[str, list[dict]]:
     return "\n\n".join(lines) or "Analyze the attached input.", attachments
 
 
-class _ChudcodeCompletionProvider:
-    """Provider-shaped diagnostic adapter backed by the shared Chudcode host."""
+class _OmpCompletionProvider:
+    """Provider-shaped diagnostic adapter backed by the shared OMP host."""
 
     supports_vision = True
 
     def __init__(self, settings: dict[str, Any]):
         self.settings = dict(settings)
-        self.name = str(settings.get("provider") or "chudcode")
+        self.name = str(settings.get("provider") or "omp")
         self.model = str(settings.get("model") or "")
         self._calls = 0
 
     def complete(
         self, system: str, messages: list[dict], max_tokens: int = 8000
     ) -> str:
-        from services.agent.chudcode_host import get_default_chudcode_host
+        from services.agent.omp_host import get_default_omp_host
 
         self._calls += 1
         session_id = f"gym-diag-{id(self):x}-{self._calls}"
         request, attachments = _message_payload(messages)
-        host = get_default_chudcode_host()
+        host = get_default_omp_host()
         try:
             result = host.run_turn(
                 {
@@ -969,24 +961,22 @@ class _ChudcodeCompletionProvider:
             reason = (
                 result.get("reason")
                 if isinstance(result, dict)
-                else "Chudcode returned a non-object result"
+                else "OMP returned a non-object result"
             )
-            raise RuntimeError(str(reason or "Chudcode diagnostic completion failed"))
-        if isinstance(result.get("result"), str):
-            return result["result"]
-        terminal = result.get("terminal")
-        if isinstance(terminal, dict):
-            for key in ("text", "result", "message", "content"):
-                if isinstance(terminal.get(key), str):
-                    return terminal[key]
-        raise RuntimeError("Chudcode diagnostic completion returned no text")
+            raise RuntimeError(str(reason or "OMP diagnostic completion failed"))
+        if not result.get("terminal"):
+            raise RuntimeError("OMP diagnostic completion did not settle")
+        text = result.get("result")
+        if isinstance(text, str) and text.strip():
+            return text
+        raise RuntimeError("OMP diagnostic completion returned no text")
 
 
 def _completion_provider_for_tier(tier: str):
     route = _tier_execution(tier)
     if route["offline"]:
         return route["provider"]
-    return _ChudcodeCompletionProvider(route["settings"])
+    return _OmpCompletionProvider(route["settings"])
 
 
 def _benchmark_agent_fn(base_agent_fn, role_settings: dict[str, Any], offline: bool):
@@ -1014,10 +1004,9 @@ def _drive_mission_pipeline(
 ) -> dict:
     """Drive the mission pipeline for ONE gym cell and return its mission record.
 
-    The Python mission front door (``services.agent.loop.run_mission``) was removed in
-    favour of the C++ core's ``agent_mission_v1``.
-    The gym grades the PYTHON ledger the pipeline writes, so it cannot go through the
-    core RPC; it composes the surviving deterministic primitives itself, in the same
+    The Python mission front door (``services.agent.loop.run_mission``) was removed.
+    The gym grades the PYTHON ledger the pipeline writes, so it composes the surviving
+    deterministic primitives itself, in the same
     order and with the same phase/status vocabulary the deleted front door used:
 
       INTAKE (fixture ``intake_fn``) → ``validate_manifest`` → manifest + AC mirror
@@ -1106,7 +1095,7 @@ def _drive_mission_pipeline(
         }
 
     graph = build_mission_graph(
-        manifest, graph_id=run_id, org_layer=flags.org_layer, default_autonomy="auto"
+        manifest, graph_id=run_id, default_autonomy="auto"
     )
     if not execute_dag:
         return {
@@ -1121,7 +1110,7 @@ def _drive_mission_pipeline(
     from services.dag import node_runner
 
     # Online nodes receive provider/model identifiers and execute through the
-    # shared Chudcode role runner. Explicit local tiers alone receive a Python
+    # shared OMP role runner. Explicit local tiers alone receive a Python
     # provider and the offline marker required by node_runner.
     base_agent_fn = node_runner.make_default_agent_fn(ledger=ledger, provider=provider)
 
@@ -1145,7 +1134,7 @@ def _drive_mission_pipeline(
 
 
 def _run_mission_real(challenge: Challenge, run_id: str, tier: str) -> dict | None:
-    """Drive one real cell through Chudcode or an explicit offline local provider.
+    """Drive one real cell through OMP or an explicit offline local provider.
 
     Failures remain mission data so the benchmark records the observed cause
     instead of silently substituting a mock.

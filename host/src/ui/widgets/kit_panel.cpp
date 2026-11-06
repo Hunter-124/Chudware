@@ -29,6 +29,17 @@ std::vector<std::string> wrapLines(const char* text, float maxW, int maxLines, b
 }  // namespace detail
 namespace {
 
+void storeMeasuredHeight(ImGuiStorage* store, ImGuiID key, float height) {
+    const float epsilon = ui::metrics::stroke(1.0f) * 0.5f;
+    if (std::fabs(store->GetFloat(key, 0.0f) - height) <= epsilon) return;
+    const ImGuiID frameKey = ImHashStr("height_measure_frame", 0, key);
+    const int frame = ImGui::GetFrameCount();
+    // A re-measure is allowed one settle frame, not an endless scrollbar/wrap feedback loop.
+    if (store->GetInt(frameKey, -100) != frame - 1) anim::requestFrames();
+    store->SetInt(frameKey, frame);
+    store->SetFloat(key, height);
+}
+
 // ---- ratios / opacities (the COLOR is always a palette role) ----------------------------------
 constexpr float kTrackA       = 0.85f;   // segmented track, same as kit::segmented
 constexpr float kSegSelA      = 0.85f;   // selected segment fill
@@ -901,14 +912,7 @@ void panelEnd() {
         footH = ImMax(win->DC.CursorMaxPos.y - f.footStartY, 0.0f);
         win->DC.CursorMaxPos.y = ImMax(win->DC.CursorMaxPos.y, f.savedMaxY);
     }
-    if (f.store) {
-        // A footer that grew/shrank this frame was laid out against the old height; pump one
-        // more frame so the body re-fits immediately instead of at the 20 Hz idle floor. The
-        // footer status is capped at two lines, so this happens on state/message changes only.
-        if (std::fabs(f.store->GetFloat(f.footKey, 0.0f) - footH) > ui::metrics::stroke(1.0f) * 0.5f)
-            anim::requestFrames();
-        f.store->SetFloat(f.footKey, footH);
-    }
+    if (f.store) storeMeasuredHeight(f.store, f.footKey, footH);
     ImGui::PopID();
 }
 
@@ -1278,8 +1282,7 @@ int groupedPicker(const char* id, const PickerGroup* groups, int groupCount, flo
     // Content height (trailing item spacing excluded) for next frame's sizing; pump a frame when
     // it changed so the popup settles at once.
     const float measured = ImMax(ImGui::GetCursorPosY() - sty.ItemSpacing.y, 0.0f);
-    if (std::fabs(measured - contentH) > ui::metrics::stroke(1.0f) * 0.5f) anim::requestFrames();
-    store->SetFloat(hKey, measured);
+    storeMeasuredHeight(store, hKey, measured);
 
     if (laneW > 0.0f) ImGui::Indent(laneW);   // undo before the scrollbar geometry read
     ui::drawWindowPillScrollbarV(inkSurf(), ui::kChatScrollbar);

@@ -1,5 +1,5 @@
 // Copilot activity feed: feedTurnActivity — folds streamed
-// orchestrator events (stage/agent/plan/mission/corporate kinds) into a turn's ActivityItem
+// orchestrator events (stage/agent/plan/mission kinds) into a turn's ActivityItem
 // timeline, plus the stream:out ops-JSON detection and the chat-history dirty flag the
 // persistence debounce (conversations.cpp) reads. Pure state folding, no drawing.
 
@@ -7,6 +7,9 @@
 #include "agent_text.h"
 #include "stream_rows.h"
 #include "tool_outcome.h"
+#include "activity_settlement.h"
+#include <map>
+#include <tuple>
 
 // ============================ transparent activity timeline ============================
 // Map a raw orchestrator stage key to a plain-language heading the user can follow.
@@ -23,568 +26,143 @@ static std::string friendlyStageTitle(const std::string& stage) {
     return t.empty() ? std::string("\xe2\x80\xa6") : t;  // ellipsis — never a fake "Working"
 }
 
-// ============================ Corporate Roles (aicad.corporate/1) ============================
-// Additive kind="corporate" events (corp_event ∈ org_built|hire|team_lead|meeting|steering|
-// route_rejected|wind_down). Stored as ActivityItem rows with rowKind 4–8 so we never touch
-// the shared app_state.h. Org chart updates in place; meetings/steering are compact cards;
-// route rejections are muted one-liners. Missing fields degrade silently.
-//
-// rowKind 4 = org chart (stage "corp:org", detail = JSON snapshot)
-// rowKind 5 = meeting digest (stage "corp:meet:<n>", detail = JSON digest)
-// rowKind 6 = steering note (stage "corp:steer:<n>", reason = text)
-// rowKind 7 = route rejected (stage "corp:rej:<n>", reason = muted line); also inter-agent
-//             messages (stage "msg:<channel>:<id>", title = from, reason = to, detail = body)
-// rowKind 8 = wind-down summary (stage "corp:wind", reason = final line)
+// Each live output row keeps a bounded incremental lexer; no accumulated JSON is parsed.
+struct OpsStreamProbe {
+    struct Frame { char kind; bool value = true, key = true; std::string field; int tag = -1; };
+    size_t detected = 0, parsed = 0, opsAt = std::string::npos, fenceAt = 0;
+    int fence = 0, ticks = 0;
+    bool first = true, lineStart = true, inString = false, escape = false, stringKey = false;
+    bool complete = false, rootArray = false;
+    std::string token, label, opLabel, toolLabel;
+    std::vector<Frame> stack;
+    int counts[3] = {0, -1, -1};  // root array, ops array, tool_calls array
+    uint64_t used = 0;
 
-static const nlohmann::json& corpPayloadObj(const nlohmann::json& data) {
-    static const nlohmann::json kEmpty = nlohmann::json::object();
-    if (data.is_object() && data.contains("payload") && data["payload"].is_object())
-        return data["payload"];
-    // Tolerate flat envelopes (fields at top level) — additive streams may omit nesting.
-    return data.is_object() ? data : kEmpty;
-}
-
-static std::string corpDeptLabel(const nlohmann::json& data, const nlohmann::json& payload) {
-    if (data.is_object() && data.contains("dept")) {
-        const auto& d = data["dept"];
-        if (d.is_string()) return d.get<std::string>();
-        if (d.is_object()) {
-            std::string n = jstr(d, "name");
-            if (n.empty()) n = jstr(d, "id");
-            return n;
+    void detect(const std::string& text) {
+        for (; detected < text.size() && opsAt == std::string::npos; ++detected) {
+            const char c = text[detected];
+            const bool white = c == ' ' || c == '\t' || c == '\r' || c == '\n';
+            if (first && !white) {
+                first = false;
+                if (c == '{' || c == '[') { opsAt = detected; break; }
+            }
+            if (fence == 1) {
+                if (c == '\r' || c == '\n') fence = 2;
+                continue;
+            }
+            if (fence == 2) {
+                if (white) continue;
+                if (c == '{' || c == '[') { opsAt = fenceAt; break; }
+                fence = 0;
+            }
+            if (lineStart && c == '`') {
+                if (ticks++ == 0) fenceAt = detected;
+                if (ticks == 3) { fence = 1; ticks = 0; }
+                continue;
+            }
+            if (c == '\n' || c == '\r') { lineStart = true; ticks = 0; }
+            else if (c != ' ' && c != '\t') { lineStart = false; ticks = 0; }
+            else if (ticks) { lineStart = false; ticks = 0; }
         }
     }
-    std::string n = jstr(payload, "name");
-    if (n.empty()) n = jstr(payload, "dept_id");
-    if (n.empty()) n = jstr(payload, "to_dept");
-    if (n.empty()) n = jstr(payload, "digest_dept");
-    return n;
-}
-
-static std::string corpAgentId(const nlohmann::json& data, const nlohmann::json& payload) {
-    std::string a = jstr(data, "agent");
-    if (a.empty()) a = jstr(payload, "agent");
-    if (a.empty()) a = jstr(payload, "agent_id");
-    if (a.empty()) a = jstr(payload, "worker_id");
-    if (a.empty()) a = jstr(payload, "from");
-    return a;
-}
-
-// Short seat id for display (drop run-id suffixes when long).
-std::string corpShortId(const std::string& id) {
-    if (id.size() <= 28) return id;
-    return id.substr(0, 24) + "\xe2\x80\xa6";
-}
-
-int corpWorkerCount(const nlohmann::json& dept) {
-    if (!dept.is_object()) return 0;
-    if (dept.contains("workers") && dept["workers"].is_array())
-        return (int)dept["workers"].size();
-    if (dept.contains("worker_count") && dept["worker_count"].is_number_integer())
-        return dept["worker_count"].get<int>();
-    if (dept.contains("workers") && dept["workers"].is_number_integer())
-        return dept["workers"].get<int>();
-    return 0;
-}
-
-std::string corpDeptHead(const nlohmann::json& dept) {
-    std::string h = jstr(dept, "head");
-    if (h.empty()) h = jstr(dept, "head_id");
-    return h;
-}
-
-std::string corpDeptLead(const nlohmann::json& dept) {
-    std::string l = jstr(dept, "lead");
-    if (l.empty()) l = jstr(dept, "team_lead");
-    if (l.empty()) l = jstr(dept, "team_lead_id");
-    return l;
-}
-
-std::string corpDeptNameOf(const nlohmann::json& dept) {
-    std::string n = jstr(dept, "name");
-    if (n.empty()) n = jstr(dept, "id");
-    if (n.empty()) n = "department";
-    return n;
-}
-
-// Normalize any payload departments array into a compact chart JSON for the org card.
-static nlohmann::json corpNormalizeChart(const nlohmann::json& payload) {
-    nlohmann::json chart = nlohmann::json::object();
-    std::string dir = jstr(payload, "director_id");
-    if (dir.empty()) dir = jstr(payload, "director");
-    chart["director"] = dir;
-    const nlohmann::json* src = nullptr;
-    if (payload.contains("departments") && payload["departments"].is_array())
-        src = &payload["departments"];
-    else if (payload.contains("chart") && payload["chart"].is_object()) {
-        const auto& c = payload["chart"];
-        if (dir.empty()) {
-            dir = jstr(c, "director_id");
-            if (dir.empty()) dir = jstr(c, "director");
-            chart["director"] = dir;
+    void count(const std::string& text) {
+        // Skip an optional opening markdown fence once, even when its tag arrives in pieces.
+        if (parsed == 0) {
+            size_t p = text.find_first_not_of(" \t\r\n");
+            if (p == std::string::npos) return;
+            if (text[p] == '`') {
+                p = text.find_first_of("\r\n", p);
+                if (p == std::string::npos) return;
+                p = text.find_first_not_of(" \t\r\n", p);
+                if (p == std::string::npos) return;
+            }
+            parsed = p;
         }
-        if (c.contains("departments") && c["departments"].is_array())
-            src = &c["departments"];
-    }
-    nlohmann::json depts = nlohmann::json::array();
-    if (src) {
-        for (const auto& d : *src) {
-            if (!d.is_object()) continue;
-            nlohmann::json row = nlohmann::json::object();
-            row["id"] = jstr(d, "id");
-            row["name"] = corpDeptNameOf(d);
-            row["head"] = corpDeptHead(d);
-            row["lead"] = corpDeptLead(d);
-            int wc = corpWorkerCount(d);
-            row["workers"] = wc;
-            // Keep worker ids when present so hire can de-dupe.
-            if (d.contains("workers") && d["workers"].is_array())
-                row["worker_ids"] = d["workers"];
-            depts.push_back(std::move(row));
-        }
-    }
-    chart["departments"] = std::move(depts);
-    return chart;
-}
-
-static std::string corpOrgReason(const nlohmann::json& chart) {
-    int nDepts = 0, nWorkers = 0;
-    if (chart.contains("departments") && chart["departments"].is_array()) {
-        nDepts = (int)chart["departments"].size();
-        for (const auto& d : chart["departments"])
-            nWorkers += corpWorkerCount(d);
-    }
-    std::string dir = jstr(chart, "director");
-    char buf[160];
-    if (!dir.empty())
-        std::snprintf(buf, sizeof(buf), "Director \xc2\xb7 %d dept%s \xc2\xb7 %d worker%s",
-                      nDepts, nDepts == 1 ? "" : "s", nWorkers, nWorkers == 1 ? "" : "s");
-    else
-        std::snprintf(buf, sizeof(buf), "%d dept%s \xc2\xb7 %d worker%s",
-                      nDepts, nDepts == 1 ? "" : "s", nWorkers, nWorkers == 1 ? "" : "s");
-    return std::string(buf);
-}
-
-static ActivityItem* corpFindOrg(ChatMsg& m) {
-    for (auto it = m.activity.rbegin(); it != m.activity.rend(); ++it)
-        if (it->rowKind == 4 && it->stage == "corp:org") return &*it;
-    return nullptr;
-}
-
-static ActivityItem& corpEnsureOrg(ChatMsg& m) {
-    if (ActivityItem* a = corpFindOrg(m)) return *a;
-    ActivityItem ni;
-    ni.rowKind = 4;
-    ni.stage = "corp:org";
-    ni.title = "Corporate org";
-    ni.status = "done";
-    m.activity.push_back(std::move(ni));
-    return m.activity.back();
-}
-
-nlohmann::json corpParseChart(const ActivityItem& a) {
-    if (a.detail.empty()) return nlohmann::json::object({{"departments", nlohmann::json::array()}});
-    try {
-        auto j = nlohmann::json::parse(a.detail);
-        if (j.is_object()) return j;
-    } catch (...) {}
-    return nlohmann::json::object({{"departments", nlohmann::json::array()}});
-}
-
-static void corpApplyOrgBuilt(ChatMsg& m, const nlohmann::json& payload) {
-    ActivityItem& a = corpEnsureOrg(m);
-    nlohmann::json chart = corpNormalizeChart(payload);
-    a.detail = chart.dump();
-    a.reason = corpOrgReason(chart);
-    a.title = "Corporate org";
-    a.status = "done";
-}
-
-// Patch the in-place org card on hire / team_lead when a full departments[] is absent.
-static void corpPatchOrgSeat(ChatMsg& m, const nlohmann::json& data, const nlohmann::json& payload,
-                             bool asTeamLead) {
-    // Prefer full chart replacement when the backend includes departments.
-    if ((payload.contains("departments") && payload["departments"].is_array()) ||
-        (payload.contains("chart") && payload["chart"].is_object())) {
-        corpApplyOrgBuilt(m, payload);
-        return;
-    }
-    ActivityItem& a = corpEnsureOrg(m);
-    nlohmann::json chart = corpParseChart(a);
-    if (!chart.contains("departments") || !chart["departments"].is_array())
-        chart["departments"] = nlohmann::json::array();
-
-    std::string did = jstr(payload, "dept_id");
-    std::string dname = corpDeptLabel(data, payload);
-    if (did.empty() && !dname.empty()) did = dname;
-    std::string agent = corpAgentId(data, payload);
-    std::string role = jstr(payload, "role");
-    if (agent.empty() && !role.empty()) agent = role;
-
-    nlohmann::json* row = nullptr;
-    for (auto& d : chart["departments"]) {
-        if (!d.is_object()) continue;
-        if ((!did.empty() && (jstr(d, "id") == did || jstr(d, "name") == did)) ||
-            (!dname.empty() && (jstr(d, "name") == dname || jstr(d, "id") == dname))) {
-            row = &d;
-            break;
-        }
-    }
-    if (!row) {
-        nlohmann::json nd = nlohmann::json::object();
-        nd["id"] = did;
-        nd["name"] = dname.empty() ? (did.empty() ? "department" : did) : dname;
-        nd["head"] = jstr(payload, "parent_id");
-        nd["lead"] = "";
-        nd["workers"] = 0;
-        nd["worker_ids"] = nlohmann::json::array();
-        chart["departments"].push_back(std::move(nd));
-        row = &chart["departments"].back();
-    }
-
-    if (!agent.empty()) {
-        if (!row->contains("worker_ids") || !(*row)["worker_ids"].is_array())
-            (*row)["worker_ids"] = nlohmann::json::array();
-        bool found = false;
-        for (const auto& w : (*row)["worker_ids"])
-            if (w.is_string() && w.get<std::string>() == agent) { found = true; break; }
-        if (!found) {
-            (*row)["worker_ids"].push_back(agent);
-            (*row)["workers"] = (int)(*row)["worker_ids"].size();
-        } else {
-            (*row)["workers"] = (int)(*row)["worker_ids"].size();
-        }
-        if (asTeamLead || jstr(payload, "rank") == "team_lead")
-            (*row)["lead"] = agent;
-    } else if (asTeamLead) {
-        std::string lead = jstr(payload, "worker_id");
-        if (lead.empty()) lead = jstr(payload, "team_lead_id");
-        if (!lead.empty()) (*row)["lead"] = lead;
-    }
-
-    a.detail = chart.dump();
-    a.reason = corpOrgReason(chart);
-    a.status = "done";
-}
-
-static int corpListCount(const nlohmann::json& o, const char* key) {
-    if (!o.is_object() || !o.contains(key)) return 0;
-    const auto& v = o[key];
-    if (v.is_array()) return (int)v.size();
-    if (v.is_number_integer()) return v.get<int>();
-    if (v.is_number_float()) return (int)v.get<double>();
-    return 0;
-}
-
-static std::string corpJoinRisks(const nlohmann::json& payload) {
-    if (!payload.contains("risks")) return {};
-    const auto& r = payload["risks"];
-    if (r.is_string()) return r.get<std::string>();
-    if (!r.is_array()) return {};
-    std::string out;
-    for (const auto& item : r) {
-        std::string s;
-        if (item.is_string()) s = item.get<std::string>();
-        if (s.empty()) continue;
-        if (!out.empty()) out += "; ";
-        out += s;
-        if (out.size() > 160) { out.resize(157); out += "\xe2\x80\xa6"; break; }
-    }
-    return out;
-}
-
-static void corpApplyMeeting(ChatMsg& m, const nlohmann::json& data, const nlohmann::json& payload) {
-    ActivityItem ni;
-    ni.rowKind = 5;
-    ni.stage = "corp:meet:" + std::to_string(m.activity.size());
-    std::string dept = corpDeptLabel(data, payload);
-    if (dept.empty()) dept = jstr(payload, "dept_id");
-    ni.title = dept.empty() ? "Meeting" : ("Meeting \xc2\xb7 " + dept);
-
-    int done = corpListCount(payload, "done");
-    int prog = corpListCount(payload, "in_progress");
-    if (prog == 0) prog = corpListCount(payload, "in-progress");
-    int blocked = corpListCount(payload, "blocked");
-    // Prefer explicit counts when backend sends them alongside lists.
-    if (payload.contains("done_count") && payload["done_count"].is_number_integer())
-        done = payload["done_count"].get<int>();
-    if (payload.contains("in_progress_count") && payload["in_progress_count"].is_number_integer())
-        prog = payload["in_progress_count"].get<int>();
-    if (payload.contains("blocked_count") && payload["blocked_count"].is_number_integer())
-        blocked = payload["blocked_count"].get<int>();
-
-    char line[192];
-    std::snprintf(line, sizeof(line), "done %d \xc2\xb7 in progress %d \xc2\xb7 blocked %d",
-                  done, prog, blocked);
-    ni.reason = line;
-    std::string risks = corpJoinRisks(payload);
-    if (!risks.empty()) {
-        ni.reason += "\nRisks: " + risks;
-    }
-    // Pack counts for the card renderer (no app_state fields).
-    ni.tokensIn = done;
-    ni.tokensOut = prog;
-    ni.opsCount = blocked;
-    ni.status = blocked > 0 ? "warn" : "done";
-    ni.expanded = false;
-
-    nlohmann::json dig = nlohmann::json::object();
-    dig["dept"] = dept;
-    dig["done"] = done;
-    dig["in_progress"] = prog;
-    dig["blocked"] = blocked;
-    dig["risks"] = risks;
-    dig["trigger"] = jstr(payload, "trigger");
-    dig["worker_completions"] = jint(payload, "worker_completions");
-    // Preserve list bodies for expand.
-    if (payload.contains("done") && payload["done"].is_array()) dig["done_items"] = payload["done"];
-    if (payload.contains("in_progress") && payload["in_progress"].is_array())
-        dig["in_progress_items"] = payload["in_progress"];
-    if (payload.contains("blocked") && payload["blocked"].is_array())
-        dig["blocked_items"] = payload["blocked"];
-    ni.detail = dig.dump();
-    m.activity.push_back(std::move(ni));
-}
-
-static void corpApplySteering(ChatMsg& m, const nlohmann::json& data, const nlohmann::json& payload) {
-    ActivityItem ni;
-    ni.rowKind = 6;
-    ni.stage = "corp:steer:" + std::to_string(m.activity.size());
-    std::string dept = corpDeptLabel(data, payload);
-    ni.title = dept.empty() ? "Director steering" : ("Director steering \xc2\xb7 " + dept);
-    std::string text = jstr(payload, "text");
-    if (text.empty()) text = jstr(payload, "steering");
-    if (text.empty()) text = jstr(payload, "note");
-    if (text.empty() && payload.contains("notes") && payload["notes"].is_array()) {
-        for (const auto& n : payload["notes"]) {
-            if (!n.is_string()) continue;
-            if (!text.empty()) text += " ";
-            text += n.get<std::string>();
-        }
-    }
-    ni.reason = text;
-    ni.detail = text;
-    ni.status = "done";
-    m.activity.push_back(std::move(ni));
-}
-
-static void corpApplyRouteRejected(ChatMsg& m, const nlohmann::json& data,
-                                   const nlohmann::json& payload) {
-    ActivityItem ni;
-    ni.rowKind = 7;
-    ni.stage = "corp:rej:" + std::to_string(m.activity.size());
-    std::string from = jstr(payload, "from");
-    if (from.empty()) from = corpAgentId(data, payload);
-    std::string to = jstr(payload, "to");
-    if (to.empty()) to = jstr(payload, "channel");
-    std::string reason = jstr(payload, "reason");
-    // Prefer a backend-provided line; else compose the design-doc muted form.
-    std::string line = jstr(payload, "line");
-    if (line.empty()) line = jstr(payload, "message");
-    if (line.empty()) {
-        if (!from.empty() && (to.find("director") != std::string::npos ||
-                              reason.find("director") != std::string::npos ||
-                              reason.find("heads") != std::string::npos ||
-                              to.empty())) {
-            line = "worker " + corpShortId(from) +
-                   " \xe2\x86\x92 director blocked \xe2\x80\x94 routed to head";
-        } else if (!from.empty()) {
-            line = corpShortId(from) + " route blocked";
-            if (!to.empty()) line += " \xe2\x86\x92 " + to;
-            if (!reason.empty()) line += " \xe2\x80\x94 " + reason;
-        } else {
-            line = reason.empty() ? "route rejected" : reason;
-        }
-    }
-    ni.reason = line;
-    ni.title = line;
-    ni.status = "done";
-    m.activity.push_back(std::move(ni));
-}
-
-static void corpApplyWindDown(ChatMsg& m, const nlohmann::json& data,
-                              const nlohmann::json& payload) {
-    (void)data;
-    ActivityItem ni;
-    ni.rowKind = 8;
-    ni.stage = "corp:wind";
-    ni.title = "Org wind-down";
-    std::string summary = jstr(payload, "summary");
-    if (summary.empty()) summary = jstr(payload, "text");
-    if (summary.empty()) summary = jstr(payload, "message");
-    int done = 0;
-    if (payload.contains("departments_done")) {
-        if (payload["departments_done"].is_array())
-            done = (int)payload["departments_done"].size();
-        else if (payload["departments_done"].is_number_integer())
-            done = payload["departments_done"].get<int>();
-    }
-    if (summary.empty()) {
-        if (done > 0) {
-            char buf[96];
-            std::snprintf(buf, sizeof(buf), "Corporate org finished \xc2\xb7 %d department%s",
-                          done, done == 1 ? "" : "s");
-            summary = buf;
-        } else {
-            summary = "Corporate org finished";
-        }
-    }
-    // Also refresh the org card summary line if present.
-    if (ActivityItem* org = corpFindOrg(m)) {
-        if (!summary.empty()) org->reason = summary;
-        org->status = "done";
-    }
-    ni.reason = summary;
-    ni.detail = summary;
-    ni.status = "done";
-    m.activity.push_back(std::move(ni));
-}
-
-static void feedCorporateEvent(ChatMsg& m, const nlohmann::json& data) {
-    const nlohmann::json& payload = corpPayloadObj(data);
-    std::string ce = jstr(data, "corp_event");
-    if (ce.empty()) ce = jstr(data, "event");
-    if (ce.empty()) ce = jstr(payload, "corp_event");
-    if (ce.empty()) return;  // unknown / incomplete — silent no-op
-
-    if (ce == "org_built") {
-        corpApplyOrgBuilt(m, payload);
-    } else if (ce == "hire") {
-        corpPatchOrgSeat(m, data, payload, /*asTeamLead=*/false);
-    } else if (ce == "team_lead") {
-        corpPatchOrgSeat(m, data, payload, /*asTeamLead=*/true);
-    } else if (ce == "meeting") {
-        corpApplyMeeting(m, data, payload);
-    } else if (ce == "steering") {
-        corpApplySteering(m, data, payload);
-    } else if (ce == "route_rejected") {
-        corpApplyRouteRejected(m, data, payload);
-    } else if (ce == "wind_down") {
-        corpApplyWindDown(m, data, payload);
-    }
-    // Unknown corp_event values: ignore (forward-compatible).
-}
-
-// ---- stream:out ops-JSON detection (F1) ----
-// Classify the accumulated Output stream as model ops/tool JSON once the first non-whitespace
-// char is '{' or '[', OR a ``` / ```json fence appears whose body starts with { or [.
-// Returns byte offset where the ops blob begins (0 = whole stream is ops; npos = prose).
-// No streaming JSON parser — line-based prefix / fence scan only.
-static size_t findOpsJsonStart(const std::string& s) {
-    size_t i = 0;
-    while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) ++i;
-    if (i >= s.size()) return std::string::npos;
-    if (s[i] == '{' || s[i] == '[') return i;
-    // Scan for a markdown fence (at line start) whose body opens with { or [.
-    // Handles mixed content: prose before the fence stays as prose.
-    for (size_t p = i; p + 3 <= s.size(); ++p) {
-        if (s.compare(p, 3, "```") != 0) continue;
-        // Fence must be at start or after a newline (allow spaces before fence on its line).
-        if (p > 0) {
-            size_t q = p;
-            while (q > 0 && (s[q - 1] == ' ' || s[q - 1] == '\t')) --q;
-            if (q > 0 && s[q - 1] != '\n' && s[q - 1] != '\r') continue;
-        }
-        size_t j = p + 3;
-        while (j < s.size() && s[j] != '\n' && s[j] != '\r') ++j;  // skip lang tag
-        while (j < s.size() && (s[j] == '\n' || s[j] == '\r' || s[j] == ' ' || s[j] == '\t')) ++j;
-        if (j < s.size() && (s[j] == '{' || s[j] == '[')) return p;
-    }
-    return std::string::npos;
-}
-
-// Best-effort op count from a JSON prefix: count top-level objects in an array, or 1 for object.
-// Falls back to -1 when not parseable yet (caller shows byte count).
-static int countOpsInJsonPrefix(const std::string& s) {
-    size_t i = 0;
-    while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) ++i;
-    if (i >= s.size()) return -1;
-    // Strip optional fence wrapper for counting.
-    std::string body = s;
-    if (s.compare(i, 3, "```") == 0) {
-        size_t j = i + 3;
-        while (j < s.size() && s[j] != '\n' && s[j] != '\r') ++j;
-        while (j < s.size() && (s[j] == '\n' || s[j] == '\r')) ++j;
-        size_t end = s.rfind("```");
-        if (end != std::string::npos && end > j)
-            body = s.substr(j, end - j);
-        else
-            body = s.substr(j);
-        i = 0;
-        while (i < body.size() && (body[i] == ' ' || body[i] == '\t' || body[i] == '\r' || body[i] == '\n')) ++i;
-    } else {
-        body = s;
-    }
-    if (i >= body.size()) return -1;
-    try {
-        auto j = nlohmann::json::parse(body, nullptr, false);
-        if (j.is_discarded()) {
-            // Incomplete stream: count rough object starts in an array prefix.
-            if (body[i] == '[') {
-                int n = 0;
-                int depth = 0;
-                bool inStr = false, esc = false;
-                for (size_t k = i; k < body.size(); ++k) {
-                    char c = body[k];
-                    if (inStr) {
-                        if (esc) esc = false;
-                        else if (c == '\\') esc = true;
-                        else if (c == '"') inStr = false;
-                        continue;
-                    }
-                    if (c == '"') { inStr = true; continue; }
-                    if (c == '{' ) {
-                        if (depth == 1) ++n;  // top-level array element object
-                        ++depth;
-                    } else if (c == '}') {
-                        if (depth > 0) --depth;
-                    } else if (c == '[') {
-                        ++depth;
-                    } else if (c == ']') {
-                        if (depth > 0) --depth;
+        for (; parsed < text.size(); ++parsed) {
+            if (complete) {
+                if (text[parsed] != '{' && text[parsed] != '[') continue;
+                complete = false;
+            }
+            const char c = text[parsed];
+            if (inString) {
+                if (escape) { escape = false; if (token.size() < 65) token += c; continue; }
+                if (c == '\\') { escape = true; continue; }
+                if (c != '"') { if (token.size() < 65) token += c; continue; }
+                inString = false;
+                if (!stack.empty() && stack.back().kind == '{') {
+                    if (stringKey) stack.back().field = token;
+                    else if (!token.empty() && token.size() <= 64) {
+                        if (stack.back().field == "op") opLabel = token;
+                        else if (stack.back().field == "tool") toolLabel = token;
                     }
                 }
-                return n > 0 ? n : -1;
+                continue;
             }
-            return -1;
-        }
-        if (j.is_array()) return (int)j.size();
-        if (j.is_object()) {
-            // Prefer an "ops" array field when present.
-            if (j.contains("ops") && j["ops"].is_array()) return (int)j["ops"].size();
-            if (j.contains("tool_calls") && j["tool_calls"].is_array())
-                return (int)j["tool_calls"].size();
-            return 1;
-        }
-    } catch (...) {}
-    return -1;
-}
-
-// Best-effort label of the most recent op in a streamed ops-JSON prefix: the last
-// "op"/"tool" string field. Powers the live "Building ops…" summary so the user sees
-// WHAT is being built in real time without opening the raw JSON expander.
-static std::string lastOpLabelInJsonPrefix(const std::string& s) {
-    static const char* keys[] = {"\"op\"", "\"tool\""};
-    for (const char* k : keys) {
-        size_t pos = s.rfind(k);
-        while (pos != std::string::npos) {
-            size_t p = pos + std::strlen(k);
-            while (p < s.size() && (s[p] == ' ' || s[p] == '\t' || s[p] == '\r' || s[p] == '\n')) ++p;
-            if (p < s.size() && s[p] == ':') {
-                ++p;
-                while (p < s.size() && (s[p] == ' ' || s[p] == '\t')) ++p;
-                if (p < s.size() && s[p] == '"') {
-                    size_t e = s.find('"', p + 1);
-                    if (e != std::string::npos && e > p + 1 && e - p - 1 <= 64)
-                        return s.substr(p + 1, e - p - 1);
-                    if (e == std::string::npos && s.size() > p + 1 && s.size() - p - 1 <= 64)
-                        return s.substr(p + 1) + "\xe2\x80\xa6";   // value still streaming
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+            if (c == ',') {
+                if (!stack.empty()) { stack.back().value = true; stack.back().key = true; }
+                continue;
+            }
+            if (c == ':') { if (!stack.empty()) stack.back().key = false; continue; }
+            if (c == ']' || c == '}') {
+                if (!stack.empty()) stack.pop_back();
+                if (stack.empty()) complete = true;
+                continue;
+            }
+            if (!stack.empty() && stack.back().kind == '[' && stack.back().value) {
+                auto& parent = stack.back();
+                if (parent.tag >= 0) ++counts[parent.tag];
+                parent.value = false;
+            }
+            if (c == '"') {
+                inString = true; escape = false; token.clear();
+                stringKey = !stack.empty() && stack.back().kind == '{' && stack.back().key;
+            } else if (c == '[' || c == '{') {
+                int tag = -1;
+                if (c == '[') {
+                    if (stack.empty()) { tag = 0; rootArray = true; }
+                    else if (stack.size() == 1 && stack.back().kind == '{') {
+                        if (stack.back().field == "ops") tag = 1;
+                        else if (stack.back().field == "tool_calls") tag = 2;
+                    }
+                    if (tag >= 0) counts[tag] = 0;
                 }
+                if (stack.size() < 256) stack.push_back({c, true, true, {}, tag});
+                else { complete = true; break; }  // Display-only count; raw content is untouched.
             }
-            pos = (pos == 0) ? std::string::npos : s.rfind(k, pos - 1);
+        }
+        label = opLabel.empty() ? toolLabel : opLabel;
+        if (inString && !stringKey && !stack.empty() && !token.empty() && token.size() <= 64) {
+            const auto& field = stack.back().field;
+            if (field == "op" || (field == "tool" && opLabel.empty()))
+                label = token + "\xe2\x80\xa6";
         }
     }
-    return {};
+    int count() const {
+        if (counts[1] >= 0) return counts[1];
+        if (counts[2] >= 0) return counts[2];
+        if (counts[0] > 0) return counts[0];
+        return complete ? (rootArray ? counts[0] : 1) : -1;
+    }
+};
+
+static OpsStreamProbe& opsStreamProbe(const ChatMsg& message, size_t row, size_t size) {
+    static std::map<std::tuple<uintptr_t, double, size_t>, OpsStreamProbe> probes;
+    static uint64_t use = 0;
+    const auto key = std::make_tuple(reinterpret_cast<uintptr_t>(&message), message.ts, row);
+    auto it = probes.find(key);
+    if (it == probes.end()) {
+        if (probes.size() >= 64) {
+            auto oldest = std::min_element(probes.begin(), probes.end(), [](const auto& a, const auto& b) {
+                return a.second.used < b.second.used;
+            });
+            probes.erase(oldest);
+        }
+        it = probes.emplace(key, OpsStreamProbe{}).first;
+    }
+    if (size < it->second.detected || size < it->second.parsed) it->second = OpsStreamProbe{};
+    it->second.used = ++use;
+    return it->second;
 }
 
 // Finalize a thought/output box: stop streaming. Ops JSON stays collapsed unless
@@ -594,6 +172,7 @@ static std::string lastOpLabelInJsonPrefix(const std::string& s) {
 // they want the audit (userToggled always wins, both directions).
 // Prose Output keeps the user's last expanded state.
 void finalizeThoughtBox(ActivityItem& a) {
+    ++a.revision;
     a.streaming = false;
     if (a.status == "running" || a.status.empty()) a.status = "done";
     const bool isOps = (a.stage == "stream:out" && a.opsCount > 0) ||
@@ -658,14 +237,16 @@ static void separateLiveStreamThoughtParagraph(ChatMsg& m) {
 // Mid-turn chat_history flush (resume-safe). feedTurnActivity sets the dirty flag;
 // the GL draw path calls maybePersistChatHistoryDebounced with AppState.
 std::atomic<bool> s_chatHistoryDirty{false};
+std::atomic<uint64_t> s_chatHistoryRevision{0};
 double s_chatHistoryLastPersist = -1e9;
 
 void markChatHistoryDirty() {
     s_chatHistoryDirty.store(true, std::memory_order_relaxed);
+    s_chatHistoryRevision.fetch_add(1, std::memory_order_relaxed);
 }
 
 void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json& data) {
-    ui::ChatRawActivityCapture rawCapture(m);
+    ui::ChatRawActivityCapture rawCapture(m, kind == "assistant_delta" || kind == "agent.thought.delta");
     m.lastEventTs = chatNowEpoch();
     // Plan-section position marker (rowKind 18): the plan/objectives section renders at the
     // point in the timeline where the plan FIRST arrived, not pinned to the top of the turn.
@@ -1413,6 +994,7 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         // A sub-run finished (one mission task) OR a single-run completed. Close only the rows
         // for the CURRENT task; mission_finished does the final sweep. Outside a mission this
         // closes everything, as before.
+        bool compactionClosed = false;
         for (auto& a : m.activity) {
             if (a.missionHeader) continue;
             if (a.rowKind == 2) {
@@ -1428,10 +1010,17 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
                 continue;
             }
             if (a.status == "running" || a.status.empty()) {
-                a.status = "done";
-                a.streaming = false;
+                if (ui::settleUnfinishedCompaction(a, jstr(data, "status"))) {
+                    compactionClosed = true;
+                } else {
+                    a.status = "done";
+                    a.streaming = false;
+                }
             }
         }
+        if (compactionClosed) m.liveStatus.clear();
+        // The streamed terminal precedes the authoritative maintenance receipt.
+        // Keep the message live until the result drain knows whether it committed.
         // Capture additive early-stop fields (ErrorDetail / contracts): stop_reason +
         // error_detail + error_human. Reason/detail are stashed as a meta activity row so the
         // error card can render "stopped: <reason> — <detail>"; error_human is the short
@@ -1476,6 +1065,7 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             m.liveStatus = statusText;
         }
         if (phase == "done" || phase == "error" || phase == "failed" || phase == "cancelled") {
+            if (phase != "done" && !m.compactionRun) ui::settleCompactionMessage(m, phase);
             std::string sr = jstr(data, "stop_reason");
             std::string ed = jstr(data, "error_detail");
             if (ed.empty()) ed = jstr(data, "error");
@@ -1578,16 +1168,20 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         const bool visible = ui::streamTextVisible(txt);
         const std::string key = think ? "thought:stream" : "stream:out";
 
-        // Ordered view of this turn's live-stream boxes (indices back into m.activity).
-        std::vector<ui::StreamRowState> rows;
-        std::vector<size_t> rowAt;
-        rows.reserve(8);
-        rowAt.reserve(8);
-        for (size_t i = 0; i < m.activity.size(); ++i) {
+        // Only the newest box on each channel can affect the routing decision.
+        static std::vector<ui::StreamRowState> rows;
+        static std::vector<size_t> rowAt;
+        rows.clear(); rowAt.clear();
+        rows.reserve(2); rowAt.reserve(2);
+        bool foundThink = false, foundOutput = false;
+        for (size_t n = m.activity.size(); n > 0 && !(foundThink && foundOutput); --n) {
+            const size_t i = n - 1;
             const ActivityItem& r = m.activity[i];
             if (r.rowKind != 2) continue;
             const bool isThink = (r.stage == "thought:stream");
             if (!isThink && r.stage != "stream:out") continue;
+            if (isThink ? foundThink : foundOutput) continue;
+            (isThink ? foundThink : foundOutput) = true;
             ui::StreamRowState s;
             s.thinking  = isThink;
             s.ops       = !isThink && (r.opsCount > 0 ||
@@ -1597,6 +1191,8 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             rows.push_back(s);
             rowAt.push_back(i);
         }
+        std::reverse(rows.begin(), rows.end());
+        std::reverse(rowAt.begin(), rowAt.end());
         // A channel switch carrying real content IS a visible boundary: close the other
         // channel's live box so this burst, and the next one on that channel, land in
         // arrival order instead of growing a box already drawn above.
@@ -1642,8 +1238,10 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             if (!txt.empty()) a->detail += txt;
             a->streaming = true;   // re-opens a finalized (coalesced) ops box
             a->status    = "running";
+            auto& probe = opsStreamProbe(m, (size_t)(a - m.activity.data()), a->detail.size());
             const bool wasOps = (a->opsCount > 0);
-            const size_t opsAt = wasOps ? 0 : findOpsJsonStart(a->detail);
+            if (!wasOps) probe.detect(a->detail);
+            const size_t opsAt = wasOps ? 0 : probe.opsAt;
             const bool isOps = wasOps || (opsAt != std::string::npos);
             if (isOps) {
                 if (!wasOps) {
@@ -1656,13 +1254,16 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
                     a->opsCount = 1;      // flag: ops-JSON mode (updated with real count below)
                     // If detail still holds leading prose, drop it from the ops box body so the
                     // expander shows JSON only.
-                    if (opsAt != std::string::npos && opsAt > 0 && opsAt <= a->detail.size())
+                    if (opsAt != std::string::npos && opsAt > 0 && opsAt <= a->detail.size()) {
                         a->detail.erase(0, opsAt);
+                        probe = OpsStreamProbe{};
+                    }
                 }
                 // Refresh one-line summary into reason; keep raw JSON in detail.
-                int nOps = countOpsInJsonPrefix(a->detail);
+                probe.count(a->detail);
+                const int nOps = probe.count();
                 if (nOps > 0) a->opsCount = nOps;
-                const std::string opLbl = lastOpLabelInJsonPrefix(a->detail);
+                const std::string& opLbl = probe.label;
                 if (nOps > 0) {
                     char buf[64];
                     std::snprintf(buf, sizeof(buf), "%d op%s", nOps, nOps == 1 ? "" : "s");
@@ -1833,7 +1434,7 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         }
         if (!existingCard) m.activity.push_back(std::move(scratch));
     } else if (kind == "provider_call") {
-        // In-depth provider HTTP call log (InAppDiag / core agent). One row per attempt.
+        // In-depth provider HTTP call log (InAppDiag). One row per attempt.
         // rowKind 9; fields packed into existing ActivityItem slots so we never touch
         // the shared app_state.h:
         //   title      = "provider · model" (display)
@@ -1913,10 +1514,6 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         ni.status = ok ? "done" : "fail";
         ni.stage = "prov:" + std::to_string(m.activity.size());
         m.activity.push_back(std::move(ni));
-    } else if (kind == "corporate") {                               // Corporate Roles live UI
-        // Additive aicad.corporate/1 stream: corp_event + optional dept/agent/payload.
-        // Same drain as stage/tool events (app.cpp strips orch_ prefix).
-        feedCorporateEvent(m, data);
     } else if (kind == "swarm_wave") {
         // Wave header: "Wave N/M" + task titles with status. One card per wave start.
         ActivityItem ni;
@@ -2254,6 +1851,11 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
             ni.detail = purpose;
             m.activity.push_back(std::move(ni));
         } else {
+            // A delayed compaction frame cannot overwrite an already terminal outcome.
+            if (existing->status != "running" &&
+                (existing->stage.find("compaction:") != std::string::npos ||
+                 existing->title.rfind("Context compaction", 0) == 0 ||
+                 existing->title.rfind("Context compacted", 0) == 0)) return;
             if (existing->status == "running" && norm != "running") closedLive = existing->title;
             if (existing->status != "running" && norm == "running")
                 existing->startedTs = chatNowEpoch();
@@ -2272,9 +1874,10 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         }
     } else if (kind == "agent.message") {
         // Inter-agent traffic (IRC between agents, workpool dispatch cards, coordination-board
-        // posts): ONE compact transcript line per message, drawn by drawCorpMutedLine's
-        // agent-message branch (stage "msg:<channel>:<id>"). title = sender, reason =
-        // recipient, detail = body. Replayed frames carry the same id and are dropped.
+        // posts): one header + quoted-body block per message, drawn by drawAgentMessageLine
+        // (stage "msg:<channel>:<id>"). title = sender, reason = recipient, detail = body,
+        // status = the workpool card mode ("done" otherwise), eventTs = send time.
+        // Replayed frames carry the same id and are dropped.
         std::string text = jstr(data, "text");
         if (text.find_first_not_of(" \t\r\n") == std::string::npos) return;
         std::string channel = jstr(data, "channel");
@@ -2294,7 +1897,35 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         if (ni.title.empty()) ni.title = "agent";
         ni.reason = ui::foldToAtlasGlyphs(jstr(data, "to"));
         ni.detail = ui::foldToAtlasGlyphs(text);
+        const std::string mode = jstr(data, "mode");
+        ni.status = mode.empty() ? std::string("done") : ui::foldToAtlasGlyphs(mode);
+        // The runtime's own send time (ms); arrival time for producers that send none.
+        const double sentMs = jnum(data, "timestamp");
+        ni.eventTs = sentMs > 0.0 ? sentMs / 1000.0 : chatNowEpoch();
+        m.activity.push_back(std::move(ni));
+    } else if (kind == "agent.usage") {
+        // One finished provider request of the root agent (OMP's per-message usage row):
+        // tokens in/out, prompt-cache reads and timing, as a dim line after that request's
+        // tool calls. Deduped by its id so a replayed frame never doubles it.
+        const std::string key = "usage:" + jstr(data, "id");
+        for (auto it = m.activity.rbegin(); it != m.activity.rend(); ++it)
+            if (it->rowKind == 21 && it->stage == key) return;
+        finalizeLiveStreamBoxes(m);
+        nlohmann::json d = {
+            {"in", jint(data, "input")},           {"out", jint(data, "output")},
+            {"cache_read", jint(data, "cache_read")}, {"cache_write", jint(data, "cache_write")},
+            {"ttft_ms", jint(data, "ttft_ms")},    {"duration_ms", jint(data, "duration_ms")},
+            {"elapsed_ms", jint(data, "elapsed_ms")},
+            {"model", ui::foldToAtlasGlyphs(jstr(data, "model"))},
+        };
+        ActivityItem ni;
+        ni.rowKind = 21;
+        ni.stage = key;
+        ni.title = "usage";
         ni.status = "done";
+        ni.detail = d.dump();
+        const double startedMs = jnum(data, "timestamp_ms");
+        ni.eventTs = startedMs > 0.0 ? startedMs / 1000.0 : chatNowEpoch();
         m.activity.push_back(std::move(ni));
     } else if (kind == "agent.context") {
         separateLiveStreamThoughtParagraph(m);
@@ -2324,7 +1955,7 @@ void feedTurnActivity(ChatMsg& m, const std::string& kind, const nlohmann::json&
         kind == "agent.thought" || kind == "agent.thought.delta" || kind == "assistant_delta" ||
         kind == "agent.tool_call" || kind == "agent.role" ||
         kind == "agent.spawn" || kind == "plan_state" || kind == "plan" ||
-        kind == "agent.message") {
+        kind == "agent.message" || kind == "agent.usage") {
         markChatHistoryDirty();
         if (kind == "run_finished" || kind == "mission_finished")
             s_chatHistoryLastPersist = -1e9;  // force next draw flush
@@ -2367,6 +1998,9 @@ void anchorLegacyAsks(ChatMsg& m) {
         marker.stage = stage;
         marker.status = "done";
         m.activity.insert(m.activity.begin() + (std::ptrdiff_t)(at + 1), std::move(marker));
+        m.uiActivityDirtyFrom = std::min(m.uiActivityDirtyFrom, at + 1);
+        ++m.revision;
+        ui::chatLogMessageChanged(m);
         searchFrom = at + 2;
     }
 }
@@ -2392,6 +2026,9 @@ bool feedAskEvent(std::vector<ChatMsg>& msgs, ChatMsg* active, const std::string
         host->activity.push_back(std::move(marker));
         host->asks.push_back(std::move(incoming));
         host->uiCachedH = -1.0f;
+        host->uiActivityDirtyFrom = std::min(host->uiActivityDirtyFrom, host->activity.size() - 1);
+        ++host->revision;
+        ui::chatLogMessageChanged(*host);
         markChatHistoryDirty();
         s_chatHistoryLastPersist = -1e9;   // a question is worth an immediate flush
         return true;
@@ -2401,6 +2038,8 @@ bool feedAskEvent(std::vector<ChatMsg>& msgs, ChatMsg* active, const std::string
         if (AskBatch* b = findAskBatch(msgs, jstr(data, "batch_id"), &owner)) {
             applyAskAnswerEvent(*b, data);
             owner->uiCachedH = -1.0f;
+            ++owner->revision;
+            ui::chatLogMessageChanged(*owner);
             markChatHistoryDirty();
             s_chatHistoryLastPersist = -1e9;
         }
@@ -2417,6 +2056,8 @@ bool closeOpenAsks(std::vector<ChatMsg>& msgs) {
                 b.status = AskStatus::Cancelled;
                 b.error.clear();
                 m.uiCachedH = -1.0f;
+                ++m.revision;
+                ui::chatLogMessageChanged(m);
                 changed = true;
             }
     if (changed) markChatHistoryDirty();
@@ -2442,6 +2083,8 @@ bool setSteerState(std::vector<ChatMsg>& msgs, const std::string& steerId, int s
             return false;
         it->steerState = state;
         it->uiCachedH = -1.0f;
+        ++it->revision;
+        ui::chatLogMessageChanged(*it);
         markChatHistoryDirty();
         return true;
     }
@@ -2465,6 +2108,8 @@ bool settleOpenSteers(std::vector<ChatMsg>& msgs) {
         if (m.fromUser && (m.steerState == STEER_SENDING || m.steerState == STEER_QUEUED)) {
             m.steerState = STEER_FAILED;
             m.uiCachedH = -1.0f;
+            ++m.revision;
+            ui::chatLogMessageChanged(m);
             changed = true;
         }
     if (changed) markChatHistoryDirty();
@@ -2500,6 +2145,8 @@ bool ui::reconcileResolvedAskReplies(std::vector<ChatMsg>& msgs) {
                     continue;
                 match->steerState = STEER_DELIVERED;
                 match->uiCachedH = -1.0f;
+                ++match->revision;
+                ui::chatLogMessageChanged(*match);
                 changed = true;
             }
         }

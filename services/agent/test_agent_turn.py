@@ -22,7 +22,10 @@ class _ScriptedProvider:
         return self._replies.pop(0) if self._replies else "no more"
 
 
-def test_turn_dispatches_tool_then_finishes():
+def test_turn_dispatches_tool_then_finishes(monkeypatch):
+    from services.agent import guardrails
+    monkeypatch.setattr(guardrails, "_doc_tree", lambda *a, **kw: {"features": []})
+    monkeypatch.setattr(guardrails, "_engine_body_count", lambda doc_id: 1)
     provider = _ScriptedProvider([
         '```json\n{"tool": "measure_part", "args": {"doc_id": "d1"}}\n```',
         '```json\n{"done": true, "handoff": {"summary": "measured"}}\n```',
@@ -164,9 +167,12 @@ def test_turn_honours_max_tokens_cap():
     assert seen["max_tokens"] == 8000  # caller-supplied tier budget wins
 
 
-def test_turn_logs_every_tool_call_to_ledger():
+def test_turn_logs_every_tool_call_to_ledger(monkeypatch):
     """Ledger events for every turn — each dispatched tool call is
     appended as an agent_turn event when a ledger is supplied."""
+    from services.agent import guardrails
+    monkeypatch.setattr(guardrails, "_doc_tree", lambda *a, **kw: {"features": []})
+    monkeypatch.setattr(guardrails, "_engine_body_count", lambda doc_id: 1)
     provider = _ScriptedProvider([
         '```json\n{"tool": "measure_part", "args": {"doc_id": "d1"}}\n```',
         '```json\n{"tool": "fit_report", "args": {}}\n```',
@@ -754,41 +760,3 @@ def test_is_internal_dispatch_fault_classifies_by_type_and_depth():
         _wraps_typeerror()  # TypeError raised INSIDE a nested call, depth >= 2
     except TypeError as e:
         assert agent_turn._is_internal_dispatch_fault(e) is True
-
-
-def test_resolve_tool_dispatch_bad_kwarg_typeerror_unaffected(monkeypatch):
-    """A genuine bad-kwarg call through _resolve_tool_dispatch's fallback
-    dispatcher must keep its existing has_var/cleaned-kwargs retry behaviour
-    — never reclassified as an internal fault."""
-    def _fake_tool(doc_id):
-        return {"ok": True, "doc_id": doc_id}
-
-    monkeypatch.setattr(
-        agent_turn, "_bind_tool",
-        lambda name: _fake_tool if name == "measure_part" else None,
-    )
-    disp = agent_turn._resolve_tool_dispatch()
-    result = disp("measure_part", {"wrong_kw": 1})
-    assert result["ok"] is False
-    assert result.get("reason") != "internal_error"
-    assert "missing" in result["error"].lower() or "argument" in result["error"].lower()
-
-
-def test_resolve_tool_dispatch_body_fault_is_internal_and_logged(monkeypatch, caplog):
-    """A tool body that raises AttributeError through _resolve_tool_dispatch's
-    fallback dispatcher must be classified internal and its traceback logged."""
-    import logging
-
-    def _fake_tool(doc_id=None):
-        return "oops".get("x")  # AttributeError raised inside the tool body
-
-    monkeypatch.setattr(
-        agent_turn, "_bind_tool",
-        lambda name: _fake_tool if name == "measure_part" else None,
-    )
-    disp = agent_turn._resolve_tool_dispatch()
-    with caplog.at_level(logging.ERROR, logger="chudware.agent_turn"):
-        result = disp("measure_part", {"doc_id": "d1"})
-    assert result["reason"] == "internal_error"
-    assert result["internal_error"] is True
-    assert any("internal tool-dispatch fault" in r.message for r in caplog.records)

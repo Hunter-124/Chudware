@@ -2,6 +2,8 @@
 #include "parts/parts_data.h"
 #include "parts/parts.h"
 
+#include <algorithm>
+
 namespace chudware {
 namespace parts {
 namespace data {
@@ -41,6 +43,30 @@ const std::vector<SaeRow>& sae() {
     return t;
 }
 
+const SocketRow* find_shcs_socket(const std::string& size) {
+    // ISO 4762 / DIN 912 nominal key s and minimum socket depth t:
+    // https://www.aramfix.com/content/files/i762caill/datasheet%20iso%204762.pdf
+    // ASME B18.3 nominal key sizes and minimum t, inches converted to mm:
+    // https://fullerfasteners.com/tech/ansi-asme-b18-3-specifications-hex-socket-head-cap-screws/
+    // Exact fractional key sizes are used rather than rounded table decimals.
+    static const SocketRow rows[] = {
+        {"M1.6", 1.5, 0.7}, {"M2", 1.5, 1.0}, {"M2.5", 2.0, 1.1},
+        {"M3", 2.5, 1.3}, {"M4", 3.0, 2.0}, {"M5", 4.0, 2.5},
+        {"M6", 5.0, 3.0}, {"M8", 6.0, 4.0}, {"M10", 8.0, 5.0},
+        {"M12", 10.0, 6.0},
+        {"#6-32", 7.0/64.0*25.4, 0.064*25.4},
+        {"#8-32", 9.0/64.0*25.4, 0.077*25.4},
+        {"#10-24", 5.0/32.0*25.4, 0.090*25.4},
+        {"1/4-20", 3.0/16.0*25.4, 0.120*25.4},
+        {"5/16-18", 1.0/4.0*25.4, 0.151*25.4},
+        {"3/8-16", 5.0/16.0*25.4, 0.182*25.4},
+        {"1/2-13", 3.0/8.0*25.4, 0.245*25.4},
+    };
+    for (const auto& row : rows)
+        if (size == row.size) return &row;
+    return nullptr;
+}
+
 const std::vector<BearingRow>& bearings() {
     // ISO 15 deep-groove envelopes (bore, OD, width) mm. Keep in lockstep with
     // engine_oracle/data/bolts/bearings.blt.yaml so make_standard_part finds every
@@ -61,6 +87,82 @@ const std::vector<BearingRow>& bearings() {
     };
     return t;
 }
+
+const std::vector<OringRow>& orings_as568() {
+    // SAE AS568B nominal ID and section, transcribed from the same source table
+    // as services/parts/adapters/orings_adapter.py (cross-checked there against
+    // Parker ORD-5700 and other published charts). IDs below are thousandths of
+    // an inch, in consecutive dash-number order, not rounded millimetres.
+    static const std::vector<OringRow> rows = [] {
+        constexpr int ids_001[] = {
+            29, 42, 56, 70, 101, 114, 145, 176, 208, 239, 301, 364,
+            426, 489, 551, 614, 676, 739, 801, 864, 926, 989, 1051, 1114,
+            1176, 1239, 1301, 1364, 1489, 1614, 1739, 1864, 1989, 2114, 2239, 2364,
+            2489, 2614, 2739, 2864, 2989, 3239, 3489, 3739, 3989, 4239, 4489, 4739,
+            4989, 5239,
+        };
+        constexpr int ids_102[] = {
+            49, 81, 112, 143, 174, 206, 237, 299, 362, 424, 487, 549,
+            612, 674, 737, 799, 862, 924, 987, 1049, 1112, 1174, 1237, 1299,
+            1362, 1424, 1487, 1549, 1612, 1674, 1737, 1799, 1862, 1925, 1987, 2050,
+            2112, 2175, 2237, 2300, 2362, 2425, 2487, 2550, 2612, 2675, 2737, 2800,
+            2862, 2987, 3237, 3487, 3737, 3987, 4237, 4487, 4737, 4987, 5237, 5487,
+            5737, 5987, 6237, 6487, 6737, 6987, 7237, 7487, 7737, 7987, 8237, 8487,
+            8737, 8987, 9237, 9487, 9737,
+        };
+        constexpr int ids_201[] = {
+            171, 234, 296, 359, 421, 484, 546, 609, 671, 734, 796, 859,
+            921, 984, 1046, 1109, 1171, 1234, 1296, 1359, 1421, 1484, 1609, 1734,
+            1859, 1984, 2109, 2234, 2359, 2484, 2609, 2734, 2859, 2984, 3109, 3234,
+            3359, 3484, 3609, 3734, 3859, 3984, 4109, 4234, 4359, 4484, 4609, 4734,
+            4859, 4984, 5109, 5234, 5359, 5484, 5609, 5734, 5859, 5984, 6234, 6484,
+            6734, 6984, 7234, 7484, 7734, 7984, 8234, 8484, 8734, 8984, 9234, 9484,
+            9734, 9984, 10484, 10984, 11484, 11984, 12984, 13984, 14984, 15955, 16955, 17955,
+        };
+        constexpr int ids_309[] = {
+            412, 475, 537, 600, 662, 725, 787, 850, 912, 975, 1034, 1100,
+            1162, 1225, 1287, 1350, 1475, 1600, 1725, 1850, 1975, 2100, 2225, 2350,
+            2475, 2600, 2725, 2850, 2975, 3100, 3225, 3350, 3475, 3600, 3725, 3850,
+            3975, 4100, 4225, 4350, 4475, 4600, 4725, 4850, 4975, 5100, 5225, 5350,
+            5475, 5600, 5725, 5850, 5975, 6225, 6475, 6725, 6975, 7225, 7475, 7725,
+            7975, 8225, 8475, 8725, 8975, 9225, 9475, 9725, 9975, 10475, 10975, 11475,
+            11975, 12975, 13975, 14975, 15955, 16955, 17955, 18955, 19955, 20955,
+        };
+        constexpr int ids_425[] = {
+            4475, 4600, 4725, 4850, 4975, 5100, 5225, 5350, 5475, 5600, 5725, 5850,
+            5975, 6225, 6475, 6725, 6975, 7225, 7475, 7725, 7975, 8475, 8975, 9475,
+            9975, 10475, 10975, 11475, 11975, 12475, 12975, 13475, 13975, 14475, 14975, 15475,
+            15955, 16455, 16955, 17455, 17955, 18455, 18955,
+        };
+        std::vector<OringRow> result;
+        result.reserve(336);
+        auto append_series = [&](int first, const auto& ids, int section_mils) {
+            int dash = first;
+            for (int id_mils : ids) {
+                const std::string digits = std::to_string(dash);
+                const int cs_mils = first == 1 && dash <= 3 ? 30 + 10 * dash : section_mils;
+                result.push_back({"AS568-" + std::string(3 - digits.size(), '0') + digits,
+                                  id_mils, cs_mils});
+                ++dash;
+            }
+        };
+        append_series(1, ids_001, 70);
+        append_series(102, ids_102, 103);
+        append_series(201, ids_201, 139);
+        append_series(309, ids_309, 210);
+        append_series(425, ids_425, 275);
+        return result;
+    }();
+    return rows;
+}
+
+const OringRow* find_oring_as568(const std::string& size) {
+    const auto& rows = orings_as568();
+    const auto it = std::lower_bound(rows.begin(), rows.end(), size,
+        [](const OringRow& row, const std::string& key) { return row.size < key; });
+    return it != rows.end() && it->size == size ? &*it : nullptr;
+}
+
 const std::vector<HobbyServoRow>& hobby_servos() {
     // TowerPro product pages include the A–F mechanical drawing: B=case L,
     // D=case W, C=case H below output, E=outer tab span, F=tab underside
@@ -76,14 +178,50 @@ const std::vector<HobbyServoRow>& hobby_servos() {
          5.6, 6.0, 2.5, 4.8, 1.6, 20,
          "https://towerpro.com.tw/product/mg90s-3/",
          "TowerPro drawing B/D/C/E/F/A=22.8/12.4/28.4/32.1/18.5/32.5 mm (product text rounds width to 12.2); hole pitch, diameter, boss and spline are nominal fit dimensions, verify on actual servo."},
-        {"MG996R", 40.9, 20.0, 37.0, 54.0, 3.0, 26.8, 3.2, 49.5,
-         10.0, 12.0, 3.0, 5.9, 2.9, 25,
+        // MG996R / MG995 detail, mm (the latter uses the same nominal housing):
+        // TowerPro A/B/C/D/E/F = 42.7/40.9/37/20/54/26.8:
+        // https://towerpro.com.tw/product/mg996r/
+        // https://torqpro.com/wp-content/uploads/2014/07/%E5%B0%8F%E9%A6%AC%E9%81%94%E5%B0%BA%E5%AF%B8%E6%A8%99%E7%A4%BA%E5%9C%96B.jpg
+        // TowerPro text instead says 40.7 x 19.7 x 42.9; retain the existing
+        // 42.9 overall and z=40 output datum for compatible part placement.
+        // MG995 vendor sheet quotes 40.7 x 19.7 x 42.9; its remaining housing
+        // details use the MG996R values above/below as proxies:
+        // https://cdn.shopify.com/s/files/1/0058/3145/8904/files/MG995.PDF
+        // Components101 depicts slots, steps and a low exit at the output end,
+        // but gives different case dimensions (40.3 x 20 x 36.6, E=53.6, F=26.6):
+        // https://components101.com/sites/default/files/inline-images/MG996R-Servo-Motor-2-D-Model.png
+        // Futaba's S3003 establishes only the comparable standard-size envelope:
+        // https://futabausa.com/wp-content/uploads/2019/07/S3003.pdf
+        // The owner confirmed the existing 49.5 longitudinal slot-center pitch.
+        // The existing 10.0 shaft-from-end and 2.9 shaft height are nominal
+        // proxies, not drawing dimensions. Ø5.9 is a nominal approximation to
+        // the community-measured ~Ø6.0 25T spline (not a tooth-standard drawing):
+        // https://www.thingiverse.com/thing:4750282
+        // Four slots and approximate transverse 10.0 pitch, Ø4.8 grommet hole,
+        // 3.2 opening and 2.5 tab thickness are visually estimated from the
+        // Components101 drawing above; they are not dimensioned there.
+        // Other *estimated*, not manufacturer dimensions: cap H4.0/inset 0.25
+        // per side; bottom H2.0/inset 0.4; gear boss Ø17/Ø14 lower H1.5 and total
+        // H3.0; secondary bump Ø7, 11.5 toward -X from output, H0.8;
+        // cable block 2 x 4 x 3 at z=2 on +X;
+        // spline root Ø5.5; M3 nominal tap bore Ø2.5 x 4.5 deep. The photos
+        // show the shapes but do not dimension them:
+        // https://towerpro.com.tw/wp-content/uploads/2014/08/MG996R-3b.jpg
+        // https://towerpro.com.tw/wp-content/uploads/2014/08/MG996R-b2.jpg
+        // A vendor calls the arm screw M4, so check the actual thread:
+        // https://www.handsontec.com/dataspecs/motor_fan/MG996R.pdf
+        {"MG996R", 40.9, 20.0, 37.0, 54.0, 2.5, 26.8, 4.8, 49.5,
+         10.0, 17.0, 3.0, 5.9, 2.9, 25,
          "https://towerpro.com.tw/product/mg996r/",
-         "TowerPro drawing B/D/C/E/F=40.9/20/37/54/26.8; product text quotes approx. 40.7x19.7x42.9. Hole pitch, diameter and boss dimensions are nominal fit dimensions; verify on actual servo."},
-        {"MG995", 40.7, 19.7, 37.0, 54.0, 3.0, 26.8, 3.2, 49.5,
-         10.0, 12.0, 3.0, 5.9, 2.9, 25,
+         "TowerPro drawing B/D/C/E/F=40.9/20/37/54/26.8 mm; A=42.7, but product text and this compatibility model use 42.9. Four slots, cap, gear bosses, cable exit and spline details are approximate; verify physical units, including counterfeits. Rubber grommets/eyelets are optional and not modeled.",
+         {3.2, 10.0, 4.0, 0.25, 2.0, 0.4, 14.0, 1.5, 7.0, 11.5, 0.8,
+          2.0, 4.0, 3.0, 2.0, 5.5, 2.5, 4.5}},
+        {"MG995", 40.7, 19.7, 37.0, 54.0, 2.5, 26.8, 4.8, 49.5,
+         10.0, 17.0, 3.0, 5.9, 2.9, 25,
          "https://cdn.shopify.com/s/files/1/0058/3145/8904/files/MG995.PDF",
-         "MG995 sheet: approx. 40.7x19.7x42.9 overall. Case height and mounting details use TowerPro MG996R envelope as a nominal fit proxy; check the actual MG995 before tooling."},
+         "MG995 sheet: approx. 40.7x19.7x42.9 overall. Case height, mounting and other housing details use the MG996R as nominal proxies; verify the actual servo, including counterfeits. Rubber grommets/eyelets are optional and not modeled.",
+         {3.2, 10.0, 4.0, 0.25, 2.0, 0.4, 14.0, 1.5, 7.0, 11.5, 0.8,
+          2.0, 4.0, 3.0, 2.0, 5.5, 2.5, 4.5}},
         {"DS3218", 40.0, 20.0, 36.5, 54.0, 3.0, 26.0, 3.2, 49.5,
          10.0, 12.0, 2.0, 5.9, 2.0, 25,
          "https://m.media-amazon.com/images/I/81p5zAoqJ0L.pdf",
@@ -156,6 +294,13 @@ std::vector<std::string> bearing_sizes() {
     for (const data::BearingRow& r : data::bearings()) v.push_back(r.size);
     return v;
 }
+std::vector<std::string> oring_sizes() {
+    std::vector<std::string> v;
+    const auto& rows = data::orings_as568();
+    v.reserve(rows.size());
+    for (const data::OringRow& r : rows) v.push_back(r.size);
+    return v;
+}
 std::vector<std::string> dowel_sizes() {
     std::vector<std::string> v;
     for (double d : data::dowel_diameters()) {
@@ -210,6 +355,9 @@ std::vector<Family> catalog() {
                  metric_sizes(2, 6), kInsertLengths});
     f.push_back({"bearing", "Deep-Groove Ball Bearing", "Bearings", "ISO 15 (deep groove)",
                  "Ball-bearing envelope (outer ring × bore × width).", false, bearing_sizes(), {}});
+    f.push_back({"oring_as568", "AS568 O-Ring", "Seals", "SAE AS568B",
+                 "Nominal circular-section O-ring; ID and section from the AS568B table, tolerances omitted.",
+                 false, oring_sizes(), {}});
     f.push_back({"hobby_servo", "Hobby Servo", "Motors & Actuators", "Manufacturer nominal envelopes",
                  "Micro and standard-size hobby servo; editable case, mounting flange/holes and output axis.",
                  false, hobby_servo_sizes(), {}});
@@ -232,6 +380,14 @@ json catalog_json() {
             j["size_sources"] = json::object();
             for (const data::HobbyServoRow& row : data::hobby_servos())
                 j["size_sources"][row.size] = {{"source", row.source}, {"notes", row.notes}};
+        }
+        if (fam.key == "oring_as568") {
+            j["size_sources"] = json::object();
+            for (const data::OringRow& row : data::orings_as568())
+                j["size_sources"][row.size] = {
+                    {"source", "SAE AS568B nominal table; cross-checked against Parker ORD-5700 and other published charts"},
+                    {"id_in", row.id_mils / 1000.0}, {"cs_in", row.cs_mils / 1000.0},
+                    {"notes", "Nominal dimensions; tolerances omitted"}};
         }
         families.push_back(std::move(j));
     }

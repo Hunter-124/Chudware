@@ -5,8 +5,8 @@ diagnosis (``services.agent.regen_diagnosis``), verifies the proposed fix agains
 when present, and returns a fix-preview card (``services.agent.regen_card``). The model call
 is logged as an IP-18 correction trace via the agent LoggingProvider.
 
-The model step is one tool-free completion through the Chudcode runtime
-(``providers.chudcode_provider.helper_provider``); an explicit offline/local-only
+The model step is one tool-free completion through the OMP runtime
+(``providers.omp_provider.helper_provider``); an explicit offline/local-only
 configuration binds an offline-safe provider instead. When the step cannot run, the card
 still carries the detected failures and the runtime's reason.
 
@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 from typing import Callable, Optional
 
-from services.agent.chudcode_host import HelperCompletionError
+from services.agent.omp_host import HelperCompletionError
 from services.agent.providers.base import ProviderUnreachable
 from services.agent.regen_diagnosis import detect_failures, diagnostic_failures
 
@@ -49,44 +49,35 @@ def _journal_sink() -> Callable[[dict], None]:
 
 def _resolve_provider(cancel: Optional[Callable[[], bool]] = None):
     """The helper provider for the fixer's model step (see ``helper_provider``)."""
-    from services.agent.providers.chudcode_provider import helper_provider
+    from services.agent.providers.omp_provider import helper_provider
     return helper_provider("fixer", cancel=cancel)
 
 
 def _verify(document: dict, diagnosis, reference_document: Optional[dict]):
-    """Score the proposed fix with the strongest available signal:
-      * core + reference doc  -> binary rebuild AND compare_parts vs the last-good revision;
-      * core, no reference    -> does the fix rebuild? (no known-good to compare an in-the-wild
-                                 failure against);
-      * no core               -> structural only; native-only failures remain unverified
-    Returns (score|None, detail)."""
+    """A successful rebuild alone or structural fixture scan cannot establish geometry."""
+    from services.agent.regen_verify import make_live_verifier, rebuild_only, verify_live
+
     claimed = diagnosis.n_applied > 0
-    try:
-        from tools.flywheel.bench.benches import regen_fix as RF
-        opener, compare_fn = RF._make_live_verifier()
-    except Exception:
-        opener = compare_fn = None
-
+    opener, compare_fn = make_live_verifier()
     if opener is None:
-        if any(f.kind == "native_rebuild" for f in diagnostic_failures(document)):
-            return None, {"mode": "unavailable", "reason": "native rebuild verification unavailable"}
-        cleared = not detect_failures(diagnosis.fixed_document)
-        return (1.0 if (claimed and cleared) else 0.0), {"mode": "fixture", "anomaly_gone": cleared}
-
+        return None, {"mode": "fixture", "anomaly_gone": not detect_failures(
+            diagnosis.fixed_document), "reason": "native geometry verification unavailable"}
     if reference_document is not None:
-        score, _passed, detail = RF.verify_fix(
-            diagnosis.fixed_document, claimed, {},
-            good_document=reference_document, opener=opener, compare_fn=compare_fn)
-        return score, detail
-
-    res = opener(diagnosis.fixed_document)
-    try:
-        return (1.0 if (claimed and res["rebuilt"]) else 0.0), {
-            "mode": "live-rebuild-only", "rebuilt": res["rebuilt"], "rebuild_error": res.get("error")}
-    finally:
-        closer = getattr(opener, "close", None)
-        if closer and res.get("doc_id"):
-            closer(res["doc_id"])
+        score, _, detail = verify_live(diagnosis.fixed_document, claimed, reference_document,
+                                       opener=opener, compare_fn=compare_fn)
+        source = document.get("tree", document)
+        fixed = diagnosis.fixed_document.get("tree", diagnosis.fixed_document)
+        source_ids = {f.get("id") for f in source.get("features", []) if isinstance(f, dict)}
+        fixed_ids = {f.get("id") for f in fixed.get("features", []) if isinstance(f, dict)}
+        removed = sorted(str(fid) for fid in source_ids - fixed_ids if fid)
+        if removed:
+            detail["removed_features"] = removed
+            detail["verdict"] = "fail"
+            return 0.0, detail
+        return (None if detail.get("verdict") == "error" else score), detail
+    detail = rebuild_only(diagnosis.fixed_document, opener=opener)
+    detail["reason"] = "no pre-failure reference geometry available for comparison"
+    return (0.0 if not claimed or not detail["rebuilt"] else None), detail
 
 
 def _no_llm_result(document: dict, reason: str) -> dict:
@@ -112,7 +103,7 @@ def diagnose_failed_document(document: dict, *, provider=None,
 
     ``document`` is a full aicad.part/1 doc or a ``{revision, tree, owner_map}`` wrapper.
     ``reference_document`` (optional) is the last known-good revision, enabling the compare_parts
-    drift check. ``provider`` defaults to the helper provider (Chudcode runtime online, the
+    drift check. ``provider`` defaults to the helper provider (OMP runtime online, the
     bound offline-safe provider offline); ``cancel`` stops its model step. When the model step
     cannot be set up or does not answer, the tool returns ``ok=False`` with the detected
     failures (still useful) and the reason, rather than guessing.
@@ -152,26 +143,35 @@ def register_regen_tools(mcp) -> None:
     """Register the ``regen_diagnose`` MCP tool onto *mcp* (append-only, IP-18)."""
 
     @mcp.tool()
-    def regen_diagnose(document_json: str, reference_json: str = "",
-                       engine_error: str = "", cancel=None) -> str:
+    def regen_diagnose(document_json: str = "", reference_json: str = "",
+                       engine_error: str = "", doc_id: Optional[str] = None) -> str:
         """Diagnose a document that FAILED TO REBUILD and return a fix-preview card the user can
         accept/edit/reject.
 
-        ``document_json``: the failed document as JSON — a full ``aicad.part/1`` doc or a
-        ``{"revision","tree","owner_map"}`` wrapper. ``reference_json`` (optional): the last
-        known-good revision, enabling a compare_parts drift check on the proposed fix.
-        ``engine_error`` (optional): the engine's feature_status error text, added to the
-        diagnosis context.
+        Pass doc_id to inspect an open document, or document_json for a supplied failed
+        document (not both). reference_json optionally supplies the last known-good revision
+        for geometry comparison. engine_error adds native failure context.
 
         Returns a JSON card: ``{ok, artifact_id, card:{diagnosis, fix_ops, changes, semantic_diff,
         verifier, actions}}``. The fix ops are editable doc-ops (R1 parity). The call is logged as
         an IP-18 correction trace. ``ok=false`` (with the detected failures and the reason) when
         the model step is unavailable or fails.
         """
+        if bool(document_json.strip()) == bool(doc_id):
+            return json.dumps({"ok": False, "error": "Pass exactly one of doc_id or document_json."})
         try:
-            document = json.loads(document_json)
-        except json.JSONDecodeError as e:
-            return json.dumps({"ok": False, "error": f"document_json: invalid JSON — {e}"})
+            if doc_id:
+                from services.mcp import core_bridge as cb
+                cb.lease_document(doc_id)
+                document = cb.call("doc_tree", {"doc_id": doc_id})
+                rebuilt = cb.call("doc_rebuild", {"doc_id": doc_id})
+                document["rebuild"] = rebuilt.get("rebuild", rebuilt)
+            else:
+                document = json.loads(document_json)
+            if not isinstance(document, dict):
+                raise ValueError("document must be a JSON object")
+        except Exception as e:
+            return json.dumps({"ok": False, "error": str(e)})
         reference = None
         if reference_json.strip():
             try:
@@ -179,8 +179,7 @@ def register_regen_tools(mcp) -> None:
             except json.JSONDecodeError as e:
                 return json.dumps({"ok": False, "error": f"reference_json: invalid JSON — {e}"})
         result = diagnose_failed_document(
-            document, reference_document=reference, engine_error=engine_error or None,
-            cancel=cancel if callable(cancel) else None)
+            document, reference_document=reference, engine_error=engine_error or None)
         return json.dumps(result, default=str)
 
     @mcp.tool()

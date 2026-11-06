@@ -245,3 +245,113 @@ class TestDeviationCorrectness:
         result = compute_deviation("/no/such/mesh.ply", "/also/missing.ply")
         assert result["ok"] is False
         assert "reason" in result
+
+
+@pytest.mark.skipif(not (_HAVE_NP and _HAVE_SCIPY), reason="numpy/scipy not installed")
+def test_icp_aligns_a_rotated_translated_noisy_copy():
+    pytest.importorskip("open3d")
+    rng = np.random.default_rng(240)
+    reference = rng.normal(size=(800, 3)) * [23.0, 9.0, 4.0]
+    reference[:, 0] += 3.0 * (reference[:, 2] > 0)
+    a, b = 0.62, -0.34
+    rz = np.array([[math.cos(a), -math.sin(a), 0],
+                   [math.sin(a), math.cos(a), 0], [0, 0, 1]])
+    ry = np.array([[math.cos(b), 0, math.sin(b)], [0, 1, 0],
+                   [-math.sin(b), 0, math.cos(b)]])
+    rotation = rz @ ry
+    translation = np.array([18.0, -13.0, 7.0])
+    query = reference @ rotation.T + translation + rng.normal(scale=0.005, size=reference.shape)
+
+    world = compute_deviation_from_arrays(query, reference, alignment="world")
+    aligned = compute_deviation_from_arrays(query, reference, alignment="icp")
+    assert world["ok"] and aligned["ok"], aligned
+    assert world["rms_mm"] > 1.0
+    assert aligned["rms_mm"] < 0.03
+    record = aligned["alignment"]
+    assert record["mode"] == "icp" and record["fitness"] > 0.99
+    matrix = np.asarray(record["transform_query_to_reference"])
+    assert np.allclose(matrix[:3, :3], rotation.T, atol=1e-3)
+    assert np.allclose(matrix[:3, 3], -rotation.T @ translation, atol=0.01)
+    assert np.allclose(matrix[3], [0, 0, 0, 1])
+
+
+@pytest.mark.skipif(not _HAVE_ALL, reason="numpy/scipy/trimesh not installed")
+def test_brep_reference_uses_core_export_and_cleans_temp_mesh(tmp_path, monkeypatch):
+    from services.mcp import core_bridge
+
+    source = trimesh.creation.box(extents=[10, 8, 6])
+    query = tmp_path / "query.ply"
+    source.export(query)
+    calls = []
+
+    def export(method, params):
+        calls.append((method, dict(params)))
+        assert method == "export_file"
+        assert params["doc_id"] == "reference_doc" and params["format"] == "stl"
+        source.export(params["path"])
+        return {"ok": True, "path": params["path"]}
+
+    monkeypatch.setattr(core_bridge, "call", export)
+    result = compute_deviation(str(query), brep_doc_id="reference_doc", n_samples=1500)
+    assert result["ok"], result
+    assert result["brep_doc_id"] == "reference_doc"
+    assert result["alignment"]["mode"] == "world"
+    assert result["distance_basis"] == "query_surface_samples_to_reference_surface_samples"
+    assert calls and not Path(calls[0][1]["path"]).exists()
+
+
+@pytest.mark.skipif(not (_HAVE_NP and _HAVE_SCIPY), reason="numpy/scipy not installed")
+def test_unavailable_icp_and_bad_alignment_fail_honestly(monkeypatch):
+    from ..vision import deviation
+
+    cloud = np.array([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]])
+    monkeypatch.setattr(deviation, "_HAVE_OPEN3D", False)
+    unavailable = deviation.compute_deviation_from_arrays(cloud, cloud, alignment="icp")
+    assert not unavailable["ok"] and "Open3D" in unavailable["reason"]
+    invalid = deviation.compute_deviation_from_arrays(cloud, cloud, alignment="guess")
+    assert not invalid["ok"] and "'world' or 'icp'" in invalid["reason"]
+
+
+def test_compare_parts_icp_reports_surface_alignment_not_aligned_booleans(monkeypatch):
+    import json
+
+    pytest.importorskip("mcp.server.fastmcp")
+    from services.mcp import recon_tools
+    from services.vision import deviation
+
+    class Registry:
+        def __init__(self):
+            self.tools = {}
+
+        def tool(self):
+            def register(function):
+                self.tools[function.__name__] = function
+                return function
+            return register
+
+    registry = Registry()
+    recon_tools.register_recon_tools(registry)
+    calls = []
+    monkeypatch.setattr(recon_tools, "_doc", lambda doc: doc)
+    monkeypatch.setattr(recon_tools.cb, "call",
+                        lambda method, params: {"ok": True, "match_pct": 12.0})
+    monkeypatch.setattr(deviation, "_tessellate_document",
+                        lambda doc, path: calls.append(("export", doc)) or path)
+
+    def compare(query, **kwargs):
+        calls.append(("compare", kwargs))
+        return {"ok": True, "mesh_path": query, "rms_mm": 0.02,
+                "alignment": {"mode": kwargs["alignment"]}}
+
+    monkeypatch.setattr(deviation, "compute_deviation", compare)
+    tool = registry.tools["compare_parts"]
+    world = json.loads(tool(doc_a="a", doc_b="b"))
+    assert world["ok"] and world["match_pct"] == 12.0 and not calls
+    aligned = json.loads(tool(doc_a="a", doc_b="b", alignment="icp"))
+    assert aligned["ok"] and aligned["match_pct"] == 12.0
+    assert calls == [("export", "b"), ("compare", {"brep_doc_id": "a", "alignment": "icp"})]
+    surface = aligned["aligned_surface_deviation"]
+    assert surface["alignment"]["mode"] == "icp" and surface["query_doc_id"] == "b"
+    assert surface["mesh_path"] is None
+    refused = json.loads(tool(doc_a="a", doc_b="b", body_a="body1", alignment="icp"))
+    assert not refused["ok"] and "complete documents" in refused["error"]

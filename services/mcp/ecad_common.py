@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import math
 import os
 from typing import Any, Optional, Union
@@ -19,10 +20,10 @@ from services.mcp import core_bridge as cb
 # engine.ecad.{session,netlist,schema,ops} imports are replaced by the RPC-backed shims
 # below (ecad_session facade, netlist_mod facade, schema facade, OpError). Modules with NO
 # C++ counterpart stay as direct imports (re-homed under services/):
-#   - services.ecad.library.search/resolve (no ecad_library RPC; reads starter/kicad_sym data)
-#   - services.ecad.metadata (advisory eng-metadata layer, Python-only)
-#   - services.ecad.autosave (lazy, crash-recovery; Python-only)
-from services.ecad.library import search as lib_search  # STAYS: no ecad_library RPC surface
+#   - services.ecad.library (custom Python catalog/substitution)
+#   - services.ecad.metadata (advisory engineering metadata)
+#   - services.ecad.autosave (crash-recovery coordination)
+from services.ecad.library import search as lib_search
 
 try:  # engineering-metadata layer — advisory, must never break the tools
     from services.ecad import metadata as _eng_metadata  # STAYS: no C++ counterpart
@@ -184,6 +185,12 @@ class EcadSession:
             self.revision = resp["revision"]
         if isinstance(resp.get("compile"), dict):
             self.last_compile = resp["compile"]
+        if "path" in resp:
+            self.path = resp["path"] or None
+        if isinstance(resp.get("dirty"), bool):
+            self.dirty = resp["dirty"]
+        self.file_changed = bool(resp.get("file_changed", False))
+        self.kicad_locked = bool(resp.get("kicad_locked", False))
 
 
 class _SessionFacade:
@@ -201,15 +208,19 @@ class _SessionFacade:
         return self._by_id
 
     @staticmethod
-    def _autosave(session: EcadSession) -> None:
-        """Crash-recovery persist after every mutation (mirrors where engine.ecad.session
-        called autosave_session; no-op unless armed). engine.ecad.autosave STAYS (no C++
-        counterpart)."""
+    def _autosave(session: EcadSession) -> bool:
+        """Commit a recovery snapshot without undoing an accepted edit on failure."""
         try:
-            from services.ecad import autosave as _eauto  # STAYS: no C++ counterpart
-            _eauto.autosave_session(session)
+            from services.ecad import autosave as _eauto
+            if not _eauto.is_enabled():
+                return False
+            committed = _eauto.autosave_session(session)
+            if not committed:
+                logging.getLogger(__name__).error("ECAD autosave failed for %s", session.doc_id)
+            return committed
         except Exception:  # noqa: BLE001
-            pass
+            logging.getLogger(__name__).exception("ECAD autosave failed for %s", session.doc_id)
+            return False
 
     def _resolve(self, doc_id: str) -> str:
         seen = set()
@@ -224,14 +235,109 @@ class _SessionFacade:
 
     # -- engine.ecad.session API surface -------------------------------------
 
-    def new_session(self, kind: str = "sch", name: str | None = None) -> EcadSession:
-        resp = _rpc("ecad_new", {"kind": kind, "name": name or ""})
-        s = EcadSession(resp["doc_id"], resp.get("tree") or {},
-                        revision=resp.get("revision", 0),
-                        compile_field=resp.get("compile"))
-        self._register(s)
-        self._autosave(s)  # persist from creation (mirrors engine.ecad.session.new_session)
-        return s
+    def new_session(self, kind: str = "sch", name: str | None = None,
+                    path: str | None = None, *, unique: bool = False) -> EcadSession:
+        """Create a document; standalone defaults can choose a fresh project name."""
+        with _ECAD_OPERATION_LOCK:
+            while True:
+                target = (_default_ecad_path(kind, name or "", path or "", unique=True)
+                          if unique else path)
+                automatic = unique and not path
+                if target and os.path.lexists(target):
+                    if automatic:
+                        continue
+                    raise OpError("already_exists",
+                                  f"KiCad file already exists: {target}. "
+                                  "Use ecad_open to open it, or choose a different path.",
+                                  {"path": target})
+                params = {"kind": kind, "name": name or ""}
+                if target:
+                    params["path"] = target
+                try:
+                    resp = _rpc("ecad_new", params)
+                except OpError as error:
+                    # Another process can create the target after the existence check.
+                    if (target and error.code == "io_error" and
+                            error.detail.get("path") == target and os.path.lexists(target) and
+                            any(message in error.message for message in (
+                                "target already exists", "cannot create ECAD file",
+                                "cannot replace ECAD file"))):
+                        if automatic:
+                            continue
+                        raise OpError("already_exists",
+                                      f"KiCad file already exists: {target}. "
+                                      "Use ecad_open to open it, or choose a different path.",
+                                      {"path": target}) from error
+                    raise
+                session = self._from_response(resp)
+                self._autosave(session)
+                return session
+
+    def _from_response(self, resp: dict) -> EcadSession:
+        s = EcadSession(resp["doc_id"], resp.get("tree") or {})
+        s._update(resp)
+        s.warnings = list(resp.get("warnings") or [])
+        return self._register(s)
+
+    def open_path(self, path: str) -> EcadSession:
+        """Open a KiCad file, reusing a registered session for the same bound path."""
+        target = _ecad_input_path(path)
+        for session in self.iter_sessions():
+            if session.path and os.path.realpath(session.path) == os.path.realpath(target):
+                return self.get_session(session.doc_id)
+        return self._from_response(_rpc("ecad_open", {"path": target}))
+
+    def preflight(self, session: EcadSession) -> dict:
+        """Refuse edits while KiCad owns the file or a dirty session conflicts with disk."""
+        state = self.tree(session)
+        if state.get("kicad_locked"):
+            raise OpError("kicad_locked", "KiCad has locked the document",
+                          {"path": session.path, "applied": False})
+        if state.get("file_changed"):
+            raise OpError("external_change", "The document changed on disk",
+                          {"path": session.path, "applied": False})
+        return state
+
+    def save(self, session: EcadSession, path: str | None = None) -> dict:
+        params = {"doc_id": session.doc_id}
+        if path:
+            params["path"] = path
+        result = _rpc("ecad_save", params)
+        session.path = result.get("path") or session.path
+        # Save assigns persistent KiCad UUIDs; refresh the client copy before any
+        # subsequent swap or readback can accidentally discard those identities.
+        session._update(_rpc("ecad_tree", {"doc_id": session.doc_id}))
+        session.dirty = False
+        return result
+
+    def bind_unbound(self, session: EcadSession) -> EcadSession:
+        """Give an agent-facing legacy/unbound session a new KiCad project path."""
+        if not session.path:
+            raw_name = str(session.doc.get("name") or "electronics")
+            name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in raw_name)
+            self.save(session, _unique_ecad_path(session.kind, name or "electronics"))
+        return session
+
+    def _save_mutation(self, session: EcadSession) -> None:
+        if session.path:
+            try:
+                self.save(session)
+            except OpError as exc:
+                self._autosave(session)
+                exc.detail.update({"applied": True, "revision": session.revision,
+                                   "path": session.path})
+                raise
+        self._autosave(session)
+
+    def mutate_rpc(self, session: EcadSession, method: str, params: dict) -> dict:
+        """Run a stateful mutation and persist it under the same session lock."""
+        with _ECAD_OPERATION_LOCK:
+            self.bind_unbound(session)
+            self.preflight(session)
+            resp = _rpc(method, {**params, "doc_id": session.doc_id})
+            session._update(resp)
+            self._save_mutation(session)
+            return resp
 
     def get_session(self, doc_id: str) -> EcadSession:
         did = self._resolve(doc_id)
@@ -244,12 +350,11 @@ class _SessionFacade:
         return self._register(s)
 
     def open_session(self, doc: dict, path: str | None = None) -> EcadSession:
-        """engine.ecad.session.open_session: adopt an inline doc dict (autosave recovery)."""
-        resp = _mint_from_doc(doc)
-        s = EcadSession(resp["doc_id"], resp.get("tree") or {},
-                        revision=resp.get("revision", 0),
-                        compile_field=resp.get("compile"), path=path)
-        return self._register(s)
+        """Adopt an inline document in an unbound C++ session."""
+        s = self._from_response(_mint_from_doc(doc))
+        if path:
+            self.save(s, path)
+        return s
 
     def iter_sessions(self) -> list[EcadSession]:
         return list(self._by_id.values())
@@ -264,23 +369,20 @@ class _SessionFacade:
         self._by_id.pop(real, None)
         if doc_id != real:
             self._alias.pop(doc_id, None)
-        try:
-            from services.ecad import autosave as _eauto
-            _eauto.remove(real)  # closing removes the crash-recovery file (no resurrection)
-        except Exception:  # noqa: BLE001
-            pass
         return True
 
     def apply_ops(self, session: EcadSession, base_revision: int | None, ops: list[dict],
                   emit=None) -> dict:
-        resp = _rpc("ecad_apply_ops", {
-            "doc_id": session.doc_id,
-            "base_revision": base_revision if base_revision is not None else -1,
-            "ops": _attach_lib_defs(session, ops),
-        })
-        session._update(resp)
-        self._autosave(session)
-        return resp
+        with _ECAD_OPERATION_LOCK:
+            self.preflight(session)
+            resp = _rpc("ecad_apply_ops", {
+                "doc_id": session.doc_id,
+                "base_revision": base_revision if base_revision is not None else -1,
+                "ops": _attach_lib_defs(session, ops),
+            })
+            session._update(resp)
+            self._save_mutation(session)
+            return resp
 
     def rebuild(self, session: EcadSession, emit=None) -> dict:
         resp = _rpc("ecad_rebuild", {"doc_id": session.doc_id})
@@ -297,91 +399,78 @@ class _SessionFacade:
         """Wholesale doc replacement via the ecad_swap_doc RPC: validate ->
         undo snapshot -> swap -> revision+1 -> compile, all inside the C++ session, so
         doc_id and undo history survive (the pre-RPC re-mint restarted both)."""
-        resp = _rpc("ecad_swap_doc", {
-            "doc_id": session.doc_id,
-            "doc": new_doc,
-            "base_revision": base_revision if base_revision is not None else -1,
-            "warnings": list(warnings) if warnings else [],
-        })
-        session._update(resp)
-        self._register(session)
-        self._autosave(session)
-        return resp
+        with _ECAD_OPERATION_LOCK:
+            self.preflight(session)
+            resp = _rpc("ecad_swap_doc", {
+                "doc_id": session.doc_id,
+                "doc": new_doc,
+                "base_revision": base_revision if base_revision is not None else -1,
+                "warnings": list(warnings) if warnings else [],
+            })
+            session._update(resp)
+            self._register(session)
+            self._save_mutation(session)
+            return resp
 
 
 ecad_session = _SessionFacade()
 
 
 def _attach_lib_defs(session: EcadSession, ops: list[dict]) -> list[dict]:
-    """Inline resolved symbol/footprint defs on add ops that lack one.
-
-    The Python op handlers fell back to engine.ecad.library when an op carried no ``def``;
-    the C++ core has NO library server-side (core/ecad/ops.cpp ensure_lib_def / resolve_fp_def
-    stub instead — a stub corrupts ref-prefix annotation, pin geometry, and pads). The library
-    module itself has no RPC surface (STAYS), so resolution happens here at the seam, exactly
-    where the old op-layer fallback sat.
-    """
-    lib = None
+    """Prefer explicit/project definitions, then native KiCad, then starter definitions."""
+    from services.ecad import library as lib
+    catalog = lib.get_default_library()
     out: list[dict] = []
     for op in ops:
-        if isinstance(op, dict) and "def" not in op:
-            kind = op.get("op")
-            key = ("libid" if kind == "sch_add_symbol"
-                   else "fpid" if kind == "pcb_add_footprint" else None)
-            ident = op.get(key) if key else None
-            if isinstance(ident, str) and ident and not (
-                    key == "libid" and ident in (session.doc.get("lib_cache") or {})):
-                if lib is None:
-                    try:
-                        from services.ecad import library as _lib  # STAYS: no ecad_library RPC
-                        lib = _lib
-                    except Exception:  # noqa: BLE001
-                        lib = False
-                if lib:
-                    try:
-                        d = (lib.resolve(ident) if key == "libid"
-                             else (lib.resolve_footprint(ident)
-                                   if hasattr(lib, "resolve_footprint")
-                                   else lib.resolve(ident)))
-                        if isinstance(d, dict):
-                            op = {**op, "def": d}
-                    except Exception:  # noqa: BLE001 — library is best-effort, never hard-fail
-                        pass
+        if not isinstance(op, dict):
+            out.append(op)
+            continue
+        kind = op.get("op")
+        key = ("libid" if kind == "sch_add_symbol" else
+               "fpid" if kind == "pcb_add_footprint" else None)
+        ident = op.get(key) if key else None
+        if not isinstance(ident, str) or not ident:
+            out.append(op)
+            continue
+        if isinstance(op.get("def"), dict):
+            op = {**op, "def": {**op["def"], "_chudware_custom": True}}
+        elif not (key == "libid" and ident in (session.doc.get("lib_cache") or {})):
+            custom = (catalog.custom_symbol(ident) if key == "libid"
+                      else catalog.custom_footprint(ident))
+            if custom is not None:
+                op = {**op, "def": {**custom, "_chudware_custom": True}}
+            else:
+                method = "ecad_symbols" if key == "libid" else "ecad_footprints"
+                field = "symbols" if key == "libid" else "footprints"
+                native = _rpc(method, {"query": ident, "limit": 1, "resolve": True,
+                                       "doc_id": session.doc_id})
+                match = next((hit for hit in native.get(field, [])
+                              if isinstance(hit, dict) and hit.get(key) == ident), None)
+                if key == "fpid" and match and isinstance(match.get("definition"), dict):
+                    # pcb_add_footprint consumes the resolved pads/graphics from its def.
+                    op = {**op, "def": match["definition"]}
+                elif not match:
+                    fallback = (catalog._resolve_sym(ident) if key == "libid"
+                                else catalog._resolve_fp(ident))
+                    if isinstance(fallback, dict):
+                        op = {**op, "def": {**fallback, "_chudware_custom": True}}
         out.append(op)
     return out
 
 
 def _mint_from_doc(doc: dict) -> dict:
-    """Mint a C++ session owning an inline doc dict via a temp .ecad+ container + ecad_open.
-
-    (No ecad_swap_doc / ecad_mint RPC surface yet — see swap_doc.) Returns the ecad_open
-    ops-response (+ doc_id)."""
-    import tempfile
-    import zipfile
-
-    kind = _doc_kind(doc)
-    meta = {
-        "container": "aicad.ecad+/1",
-        "app_version": "mcp-swap",
-        "kind": kind,
-        "schema": doc.get("schema", ""),
-        "created": "",
-        "modified": "",
-        "units": doc.get("units") if isinstance(doc.get("units"), dict) else {},
-        "name": doc.get("name", "Untitled"),
-    }
-    tmp = tempfile.NamedTemporaryFile(suffix=".ecad+", delete=False)
-    tmp.close()
+    """Adopt an inline document without writing a temporary legacy container."""
+    created = _rpc("ecad_new", {"kind": _doc_kind(doc), "name": doc.get("name", "")})
+    adopted = dict(doc)
+    adopted["id"] = created["doc_id"]
     try:
-        with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as z:
-            z.writestr("meta.json", json.dumps(meta))
-            z.writestr("document.json", json.dumps(doc))
-        return _rpc("ecad_open", {"path": tmp.name})
-    finally:
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
+        result = _rpc("ecad_swap_doc", {"doc_id": created["doc_id"], "doc": adopted,
+                                        "base_revision": created.get("revision", 0)})
+    except Exception:
+        _rpc("ecad_close", {"doc_id": created["doc_id"]})
+        raise
+    result["doc_id"] = created["doc_id"]
+    return result
 
 
 class _NetlistFacade:
@@ -436,13 +525,12 @@ class _NetlistFacade:
                 comp.setdefault("ac_phase", sp["ac_phase"])
             if isinstance(sp.get("eng"), dict):
                 comp.setdefault("eng_overrides", sp["eng"])
-            # Third gap: the Python netlist->circuit translator fell back to the starter
-            # SYMBOLS library for a component's "sim" mapping (spice.py:766-770); the C++
-            # translator has no library server-side but DOES honor a "sim" carried on the
-            # component (pin_order, model). Attach it from the doc's lib_cache so Q/M/subckt
-            # parts get the right node order (pin_order) and model server-side.
+            # Explicit KiCad Sim.* fields carry the authoritative model, including
+            # source waveform parameters. Only synthesize a starter mapping when
+            # the compiled component has no KiCad model of its own.
             sim_def = sdef.get("sim")
-            if sim_def is not None:
+            fields = comp.get("fields") or {}
+            if sim_def is not None and not fields.get("Sim.Device"):
                 comp.setdefault("sim", sim_def)
         return nl
 
@@ -466,9 +554,9 @@ _DEFAULT_FOOTPRINTS = {
     "Device:Q_PNP": "Package_TO_SOT_SMD:SOT-23",
     "Device:NMOS": "Package_TO_SOT_SMD:SOT-23",
     "Device:PMOS": "Package_TO_SOT_SMD:SOT-23",
-    "Amplifier_Operational:OPAMP_dual": "Package_SO:SOIC-8",
-    "Amplifier_Operational:LM358": "Package_SO:SOIC-8",
-    "Timer:NE555": "Package_DIP:DIP-8",
+    "Amplifier_Operational:LM358": "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm",
+    "Timer:NE555P": "Package_DIP:DIP-8_W7.62mm",
+    "Timer:NE555D": "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm",
     "Regulator_Linear:AMS1117-3.3": "Package_TO_SOT_SMD:SOT-223",
     "Regulator_Linear:7805": "Package_TO_SOT_THT:TO-220-3",
     "MCU:Generic_QFP48": "Package_QFP:LQFP-48_7x7mm_P0.5mm",
@@ -592,7 +680,7 @@ def _rescue_unresolved_footprints(board: dict, report: dict, comps_by_ref: dict)
     bound = 0
     for ref, fpid in unresolved:
         try:
-            fpdef = lib.resolve_footprint(fpid)
+            fpdef = lib.get_default_library()._resolve_fp(fpid)
         except Exception:  # noqa: BLE001
             fpdef = None
         comp = comps_by_ref.get(ref)
@@ -665,7 +753,8 @@ def _update_from_sch(board_session, sch_session, *, prune: bool = False,
                 no_footprint.append([str(comp.get("ref") or ""), str(comp.get("libid") or "")])
     # Carry the schematic's id so sync records board.linked_sch = the source schematic.
     netlist["id"] = sch_session.doc.get("id")
-    params: dict = {"board": board_session.doc, "sch_netlist": netlist, "prune": bool(prune)}
+    params: dict = {"board": board_session.doc, "board_doc_id": board_session.doc_id,
+                    "sch_netlist": netlist, "prune": bool(prune)}
     if place_origin is not None:
         params["place_origin"] = place_origin
     result = _rpc("ecad_update_from_sch", params)  # inline path (a "board" object is present)
@@ -876,13 +965,7 @@ _ECAD_SESSION_ID = _uuid_ecad.uuid4().hex[:12]
 
 
 def enable_ecad_autosave() -> None:
-    """Arm ECAD crash-recovery autosave for this server process. Called once from
-    server._warm_core at startup. Best-effort.
-
-    NOTE: with ECAD sessions in the C++ core, autosave is no longer mutation-hooked
-    (the Python session drove it before); it fires from _autosave_all_open_ecad — the pre-heavy-op
-    sweep — and from recovery. The OpenECAD docs remain invisible to the daemon's own part-doc
-    autosave (core/hostd/autosave.cpp), so this stays armed in both engine modes."""
+    """Arm private KiCad recovery snapshots for this server process."""
     try:
         from services.ecad import autosave as _eauto
         _eauto.enable(_ECAD_SESSION_ID)
@@ -895,9 +978,7 @@ def recover_ecad_autosaved(scope: str = "recent"):
     and re-point _ECAD['current_*'] at the recovered docs so default-doc tool calls work. Returns
     the recovery list. Best-effort — never raises into startup.
 
-    The autosave FILES are still written by services.ecad.autosave (no C++ counterpart —
-    the direct import stays), but recovery now re-mints the doc into the C++ session registry
-    (temp .ecad+ container + ecad_open) instead of the deleted Python session registry.
+    Recovery opens the KiCad snapshot and its sidecar without overwriting the user's file.
 
     MONOTONICITY (critical): recovery runs on a BACKGROUND warm thread (server._warm_core), so it
     can finish AFTER a user has already called ecad_new_schematic / ecad_new_pcb / ecad_design on
@@ -905,56 +986,8 @@ def recover_ecad_autosaved(scope: str = "recent"):
     explicitly-selected document. The recovered sessions still land in the session registry and
     remain addressable by their explicit doc_id.
     """
-    try:
-        from services.ecad import autosave as _eauto  # STAYS: no C++ counterpart
-        _eauto.prune()
-        files = sorted(_eauto.autosave_dir().glob("*.json"))
-    except Exception:  # noqa: BLE001
-        return []
-    info: list = []  # (path, payload, session_tag, saved_at)
-    for p in files:
-        try:
-            payload = json.loads(p.read_text(encoding="utf-8"))
-            ts = float(payload.get("saved_at", p.stat().st_mtime))
-        except Exception:  # noqa: BLE001 — skip a half-written/corrupt file
-            continue
-        if isinstance(payload, dict):
-            info.append((p, payload, payload.get("session"), ts))
-    if scope != "all":
-        prior = [t for t in info if t[2] != _ECAD_SESSION_ID]  # exclude our own session
-        if prior:
-            latest = max(prior, key=lambda t: t[3])[2]  # most-recent prior session's tag
-            if latest is None:
-                prior.sort(key=lambda t: t[3], reverse=True)
-                info = prior[:8]
-            else:
-                info = [t for t in prior if t[2] == latest]
-        else:
-            info = []
-    recovered: list = []
-    for p, payload, _tag, _ts in info:
-        doc = payload.get("doc")
-        if not isinstance(doc, dict) or not (_is_schematic(doc) or _is_board(doc)):
-            continue
-        try:
-            resp = _mint_from_doc(doc)
-        except Exception:  # noqa: BLE001 — a bad doc must never break recovery
-            continue
-        s = ecad_session._register(EcadSession(
-            resp["doc_id"], resp.get("tree") or {}, revision=resp.get("revision", 0),
-            compile_field=resp.get("compile"), path=payload.get("path")))
-        recovered.append({"doc_id": s.doc_id, "kind": s.kind,
-                          "name": doc.get("name", ""),
-                          "original_doc_id": payload.get("doc_id")})
-        # MIGRATE the file: persist the reopened doc under its NEW id (current session tag) and
-        # delete the stale prior-session source, so the autosave dir doesn't grow per restart.
-        try:
-            if _eauto.is_enabled():
-                _eauto.autosave_session(s)
-                if p.name != f"{s.doc_id}.json":
-                    p.unlink(missing_ok=True)
-        except Exception:  # noqa: BLE001 — migration is best-effort; never fail recovery
-            pass
+    from services.ecad import autosave as _eauto
+    recovered = _eauto.recover_ecad_autosaved(scope)
     # Re-establish the "active" docs so ecad_status / ecad_simulate / etc. find a default doc after
     # a restart, mirroring how cad_tools.recover_autosaved sets _CUR["doc_id"].
     #
@@ -1235,26 +1268,71 @@ def _active_pcb_id(doc_id: str | None) -> str | None:
     return doc_id or _ECAD["current_pcb"]
 
 
+def _ecad_input_path(path: str) -> str:
+    from .cad_common import resolve_agent_path
+    return resolve_agent_path(path, "electronics path")
+
+
+def _default_ecad_path(kind: str, name: str, path: str = "", *, unique: bool = False) -> str:
+    """Resolve a KiCad path, optionally choosing an unused automatic project name."""
+    from .cad_common import _project_dir, _sanitize_output_path, root_value
+    if kind not in ("sch", "pcb"):
+        raise ValueError("kind must be 'sch' or 'pcb'")
+    if path:
+        target = _sanitize_output_path(path)
+    else:
+        if not name or name in (".", "..") or os.path.basename(name) != name:
+            raise ValueError("name must be a non-empty filename, not a path")
+        root = _project_dir() or root_value("CHUDWARE_FS_ROOT").strip() or os.getcwd()
+        project_name = name
+        index = 2
+        while unique and os.path.lexists(os.path.join(
+                root, project_name, f"{project_name}.kicad_{kind}")):
+            project_name = f"{name}-{index}"
+            index += 1
+        target = _sanitize_output_path(os.path.join(
+            root, project_name, f"{project_name}.kicad_{kind}"))
+    if not target.lower().endswith(f".kicad_{kind}"):
+        raise ValueError(f"path must end in .kicad_{kind}")
+    return target
+
+
+def _unique_ecad_path(kind: str, name: str) -> str:
+    """Choose an unused generated project name; ecad_new still refuses races."""
+    target = _default_ecad_path(kind, name)
+    index = 2
+    while os.path.lexists(os.path.dirname(target)):
+        target = _default_ecad_path(kind, f"{name}-{index}")
+        index += 1
+    return target
+
+
+def _resolve_ecad_session(ref: str | None, kind: str = "") -> EcadSession:
+    did = ref or (_active_sch_id(None) if kind == "sch" else
+                  _active_pcb_id(None) if kind == "pcb" else
+                  _ECAD["current"] or _ECAD["current_sch"] or _ECAD["current_pcb"])
+    if not did:
+        raise OpError("no_doc", "no active electronics document — create or open one first", {})
+    lower = str(did).lower()
+    if lower.endswith((".kicad_sch", ".kicad_pcb", ".ecad+", ".ecad", ".json")):
+        try:
+            session = ecad_session.open_path(str(did))
+        except ValueError as exc:
+            raise OpError("invalid_path", str(exc), {}) from exc
+    else:
+        session = ecad_session.get_session(str(did))
+    if kind and session.kind != kind:
+        raise OpError("wrong_kind", f"doc '{did}' is a {session.kind}, not a {kind}", {})
+    ecad_session.bind_unbound(session)
+    return session
+
+
 def _get_sch(doc_id: str | None):
-    """Resolve the active schematic session, or raise OpError with a friendly message."""
-    did = _active_sch_id(doc_id)
-    if did is None:
-        raise OpError("no_doc", "no active schematic — call ecad_new_schematic(name) first",
-                      {})
-    s = ecad_session.get_session(did)
-    if s.kind != "sch":
-        raise OpError("wrong_kind", f"doc '{did}' is a {s.kind}, not a schematic", {})
-    return s
+    return _resolve_ecad_session(doc_id, "sch")
 
 
 def _get_pcb(doc_id: str | None):
-    did = _active_pcb_id(doc_id)
-    if did is None:
-        raise OpError("no_doc", "no active board — call ecad_new_pcb(name) first", {})
-    s = ecad_session.get_session(did)
-    if s.kind != "pcb":
-        raise OpError("wrong_kind", f"doc '{did}' is a {s.kind}, not a board", {})
-    return s
+    return _resolve_ecad_session(doc_id, "pcb")
 
 
 def _sym_by_ref(doc: dict, ref: str) -> dict | None:

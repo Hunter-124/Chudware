@@ -1,7 +1,8 @@
 """Deterministic mesh-based Design-for-Additive analysis and orientation ranking.
 
 All lengths are millimetres. Locations are model-frame coordinates, and build
-heights are bed-relative. No engine, slicer, network, or undeclared dependencies.
+heights are bed-relative. Wall thickness uses the native engine's inscribed-sphere
+measurement; the remaining checks need no slicer or network.
 """
 from __future__ import annotations
 from .mesh import FaceInfo, PrintMesh, load_mesh_file

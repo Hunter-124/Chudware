@@ -27,10 +27,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-# The DFM process ids the profiles module knows (fdm/cnc_mill/lathe/sheet_metal/
-# laser/injection). We map the geometry_designer's user-facing process words onto
-# these canonical ids so a "machined" request and a "printed" request resolve to
-# genuinely different profiles.
+# User-facing process words map only to their corresponding canonical process.
 _PROCESS_ALIASES: dict[str, str] = {
     "machined": "cnc_mill", "machining": "cnc_mill", "cnc": "cnc_mill",
     "milled": "cnc_mill", "mill": "cnc_mill", "cnc_mill": "cnc_mill",
@@ -40,54 +37,34 @@ _PROCESS_ALIASES: dict[str, str] = {
     "cnc machining": "cnc_mill", "cnc_machining": "cnc_mill",
     "turned": "lathe", "lathe": "lathe",
     "printed": "fdm", "3d printed": "fdm", "3dp": "fdm", "fdm": "fdm",
-    "fff": "fdm", "additive": "fdm", "sla": "fdm",
+    "fff": "fdm", "additive": "fdm",
+    "sla": "sla", "stereolithography": "sla",
+    "sls": "sls", "selective laser sintering": "sls",
+    "mjf": "mjf", "multi jet fusion": "mjf", "multi-jet fusion": "mjf",
+    "cast": "cast", "casting": "cast", "sand casting": "cast",
     "molded": "injection", "moulded": "injection", "injection": "injection",
-    "injection molded": "injection", "cast": "injection",
+    "injection molded": "injection",
     "sheet": "sheet_metal", "sheet metal": "sheet_metal",
     "sheet_metal": "sheet_metal", "formed": "sheet_metal", "bent": "sheet_metal",
-    "laser": "laser", "laser cut": "laser", "waterjet": "laser",
+    "laser": "laser", "laser cut": "laser",
 }
 
 
 def canonical_process(process: Optional[str]) -> str:
-    """Map a user-facing process word to a process_profiles id (default fdm)."""
+    """Normalize a process word; only an omitted process defaults to FDM."""
     if not process:
         return "fdm"
     key = process.strip().lower()
-    return _PROCESS_ALIASES.get(key, key if key in _KNOWN_PROFILE_IDS() else "fdm")
+    return _PROCESS_ALIASES.get(key, key)
 
 
 def canonical_process_strict(process: Optional[str]) -> Optional[str]:
-    """Map a known process alias to its canonical id; pass anything else through.
-
-    :func:`canonical_process` defaults an unrecognized word to ``fdm``, which is
-    right for a profile lookup that must always produce something but WRONG for
-    a tool argument: silently manufacturing for the wrong process is worse than
-    refusing. This variant maps only what it actually knows and returns the
-    input untouched otherwise, so the caller's existing "Unknown process 'x'.
-    Known processes: [...]" teaching error still fires for a genuine typo.
-
-    Live 2026-08-04 (bracket mission, BOTH opus-5 and k3-256k): the mission says
-    the part "will be machined", and both models called
-    ``set_process("machining")`` / ``dfm_check(process="machining")``. The alias
-    table below already knew that word — nothing consulted it.
-    """
+    """Normalize known aliases while preserving unknown values for caller errors."""
     if not process:
         return process
     return _PROCESS_ALIASES.get(process.strip().lower(), process)
 
 
-def _KNOWN_PROFILE_IDS() -> set[str]:
-    """The DfM process ids, from the C++ core (core/dfm, ``dfm_known_processes``);
-    the literal set is the offline fallback when no engine bridge is up."""
-    try:
-        from services.mcp import core_bridge as cb  # noqa: PLC0415
-        r = cb.call("dfm_known_processes", {})
-        if r.get("ok") and isinstance(r.get("result"), list):
-            return set(r["result"])
-    except Exception:  # noqa: BLE001
-        pass
-    return {"fdm", "cnc_mill", "lathe", "sheet_metal", "laser", "injection"}
 
 # Offline mirror of the load-bearing DfM profile fields.  These are copied verbatim
 # from ``core/dfm/process_profiles.cpp::profiles`` so the agent-side helper remains
@@ -141,6 +118,19 @@ _OFFLINE_PROFILE_PARAMS: dict[str, dict[str, Any]] = {
         "draft": {"required": True, "min_deg": 1.0},
         "overhang": {"max_deg": None, "max_bridge_mm": None},
         "thread": {"strategy": "molded", "printed_ok_min": None},
+    },
+    # The C++ profile sources the wall limits from sand-casting, Formlabs
+    # Form 4/Fuse 1 and Tempus 3D MJF design guides, respectively.
+    **{
+        process: {
+            "min_wall_mm": wall, "min_feature_mm": None, "hole_comp_mm": None,
+            "tolerance_band_mm": None,
+            "fit_classes_mm": {"slip": None, "location": None, "press": None, "free": None},
+            "draft": {"required": process == "cast", "min_deg": 1.0 if process == "cast" else None},
+            "overhang": {"max_deg": None, "max_bridge_mm": None},
+            "thread": {"strategy": None, "printed_ok_min": None},
+        }
+        for process, wall in (("cast", 3.0), ("sla", 0.2), ("sls", 0.6), ("mjf", 0.5))
     },
 }
 
@@ -272,6 +262,9 @@ def _profile(process: str) -> dict[str, Any]:
         from services.mcp import core_bridge as cb  # noqa: PLC0415
         r = cb.call("dfm_get_profile", {"process": proc})
     except Exception:  # noqa: BLE001 - missing runtime core is a supported configuration
+        if proc not in _OFFLINE_PROFILE_PARAMS:
+            raise ValueError(f"Unknown process {proc!r}. Known processes: "
+                             f"{list(_OFFLINE_PROFILE_PARAMS)}.") from None
         return {"process": proc, "params": _OFFLINE_PROFILE_PARAMS[proc]}
     if not r.get("ok"):
         raise ValueError(r.get("error") or "dfm_get_profile failed")
@@ -433,13 +426,14 @@ def resolve_bend(*, thickness_mm: Optional[float] = None,
 
 def resolve_draft(*, draw_depth_mm: Optional[float] = None, finish: str = "smooth",
                   process: str = "injection", **_: Any) -> HelperResult:
-    prof = _profile("injection")["params"]
+    proc = canonical_process(process)
+    prof = _profile(proc)["params"]
     draft = prof.get("draft", {})
     numbers: dict[str, Any] = {"process_min_draft_deg": draft.get("min_deg"),
                                "draft_required": draft.get("required")}
-    prov = (f"process_profiles injection.draft.min_deg = {draft.get('min_deg')}° "
+    prov = (f"process_profiles {proc}.draft.min_deg = {draft.get('min_deg')}° "
             f"(required={draft.get('required')}) [core/dfm/process_profiles.cpp]")
-    if draw_depth_mm:
+    if draw_depth_mm and proc == "injection":
         try:
             from services.research.calcs import run_calc
             r = run_calc("draft_check", {"draw_depth_mm": float(draw_depth_mm),

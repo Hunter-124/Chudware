@@ -449,7 +449,7 @@ def _plm_rollback_check(params: dict, _emit: Callable) -> dict:
 
     Params: ``doc_id?``, ``to``, ``file_path?`` (doc's backing file, fallback
     when the checkpoint predates file provenance), ``chat_size?`` (for the
-    discarded-messages count). Shape: ``{ok, discarded_checkpoints,
+    discarded-messages count), ``session_id?`` (the active conversation). Shape: ``{ok, discarded_checkpoints,
     discarded_turns, discarded_messages, geometry_rollback, chat_truncate_to,
     file:{path, provenance_known, externally_modified, ...}}``.
     """
@@ -463,6 +463,7 @@ def _plm_rollback_check(params: dict, _emit: Callable) -> dict:
     to = str((params or {}).get("to", "") or "")
     file_path = str((params or {}).get("file_path") or "") or None
     chat_size = (params or {}).get("chat_size")
+    session_id = str((params or {}).get("session_id") or "") or None
     project_dir = ((params or {}).get("path")
                    or (params or {}).get("project_dir"))
     try:
@@ -475,7 +476,8 @@ def _plm_rollback_check(params: dict, _emit: Callable) -> dict:
         chat_size = None
     try:
         return ai_vc.plm_rollback_check(doc_id, to, store=store,
-                                        file_path=file_path, chat_size=chat_size)
+                                        file_path=file_path, chat_size=chat_size,
+                                        session_id=session_id)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "reason": "internal",
                 "hint": f"{type(e).__name__}: {e}"}

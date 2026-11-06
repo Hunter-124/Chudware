@@ -5,10 +5,14 @@ from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
 from mcp.server.fastmcp import Image
 from typing import Callable, Optional
 from typing import Union
+import difflib
 import hashlib
 import json
 import os
 import math
+import re
+
+from services.agent.request_context import root_value
 
 from . import cad_viewpoint as _vp
 from . import shot_planner as _sp
@@ -23,7 +27,6 @@ from .cad_common import (
     _as_face_query,
     _annot_font,
     _annotate_render,
-    _auto_section_for_target,
     _build_emphasis_palette,
     _camera_dir_for_target,
     _captioned_render,
@@ -48,6 +51,8 @@ from .cad_common import (
     _tile_pngs_grid,
     _tmp,
     _vnorm,
+    _vcross,
+    _vdot,
     cb,
     render_background,
     render_output_path,
@@ -258,14 +263,206 @@ def _render_stem(doc_id: str, label: str = "") -> str:
     return f"{base}-{label}" if label else base
 
 
+# ------------------------------------------------------------------ view / section vocabulary
+_NAMED_VIEWS = ("front", "back", "left", "right", "top", "bottom", "iso")
+_CAMERA_DICT_HELP = ('a camera dict {"azimuth": deg, "elevation": deg} (az 0 = front, 90 = right) '
+                     'or {"dir": [x, y, z]} (scene -> camera)')
+
+# look_around renders one engine-framed close-up per angle into a 2-column sheet. Past eight the
+# sheet is four 512x384 rows of angles that no longer differ, so over the cap is an error the
+# caller has to read, not a quiet clamp to some other N.
+_LOOK_AROUND_MAX_VIEWS = 8
+
+# The three reserved datum planes, same names and normals as inspect_section (Z-up):
+# plane name -> (axes, normal). The half on the +normal side is the one a section removes.
+_SECTION_PLANES = {"top": ("XY", (0.0, 0.0, 1.0)),
+                   "front": ("XZ", (0.0, -1.0, 0.0)),
+                   "right": ("YZ", (1.0, 0.0, 0.0))}
+_SECTION_PLANE_NAMES = {"top": "top", "xy": "top", "front": "front", "xz": "front",
+                        "right": "right", "yz": "right"}
+_SECTION_KEYS = ("plane", "offset", "origin", "normal", "flip")
+_SECTION_HELP = (
+    'section= takes a datum plane name — "top" (XY, normal +Z), "front" (XZ, normal -Y) or '
+    '"right" (YZ, normal +X); XY/XZ/YZ spell the same planes — or a dict: {"plane": name, '
+    '"offset": mm along the plane normal} or {"origin": [x, y, z], "normal": [nx, ny, nz]}, '
+    'each with an optional "flip": true that keeps the other half. The half on the +normal side '
+    'is removed (drawn as a ghost outline) and the cut face is hatched; a datum plane passes '
+    'through the WORLD ORIGIN unless offset moves it, exactly like inspect_section.')
+
+
+def _vec(v) -> str:
+    return "[" + ", ".join(f"{float(c):.4g}" for c in v) + "]"
+
+
+def _check_views(tool: str, view_list: list, matches: Optional[list] = None) -> list:
+    """The camera direction of every entry of an explicit view list, or a teaching ValueError
+    naming the first entry that is not a view. A bad name never degrades to some other camera:
+    that tile would carry the requested label over a picture of something else. "auto" (the
+    mean normal of the target's faces) needs a target with faces to mean anything."""
+    dirs = []
+    for v in view_list:
+        key = v.strip().lower() if isinstance(v, str) else v
+        if isinstance(key, str) and key == "auto" and not matches:
+            raise ValueError(
+                f"{tool}: view 'auto' aims at the target's faces and there is no such target "
+                f"here — name a view instead: {', '.join(_NAMED_VIEWS)}, or {_CAMERA_DICT_HELP}.")
+        try:
+            dirs.append(_camera_dir_for_target(matches or [], key))
+        except (ValueError, TypeError, KeyError) as e:
+            near = difflib.get_close_matches(key, _NAMED_VIEWS, n=1) if isinstance(key, str) else []
+            raise ValueError(
+                f"{tool}: {v!r} is not a view ({e}). "
+                + (f"Did you mean {near[0]!r}? " if near else "")
+                + f"Named views: {', '.join(_NAMED_VIEWS)}; or {_CAMERA_DICT_HELP}.") from None
+    return dirs
+
+
+def _failed_note(failures: list, total: int, noun: str = "views") -> str:
+    """Caption sentence for tiles that did not render, so a sheet never silently shows fewer
+    pictures than were asked for. `failures` is [(label, reason)]."""
+    if not failures:
+        return ""
+    return (f" {len(failures)} of {total} {noun} FAILED to render and are missing from the "
+            f"image — " + "; ".join(f"{name}: {str(why)[:160]}" for name, why in failures) + ".")
+
+
+def _all_failed(tool: str, failures: list, total: int, noun: str = "views") -> ValueError:
+    """The error for a call where no tile rendered: every reason, not a generic refusal."""
+    return ValueError(
+        f"{tool}: all {total} {noun} failed to render — "
+        + ("; ".join(f"{name}: {str(why)[:200]}" for name, why in failures)
+           or "the engine returned no image") + ".")
+
+
+def _finite3(tool: str, key: str, value) -> tuple:
+    if (not isinstance(value, (list, tuple)) or len(value) != 3
+            or any(isinstance(c, bool) or not isinstance(c, (int, float)) or not math.isfinite(c)
+                   for c in value)):
+        raise ValueError(f"{tool}: section {key}={value!r} must be three finite numbers "
+                         f"[x, y, z] in mm.")
+    return tuple(float(c) for c in value)
+
+
+def _parse_section(section, *, tool: str) -> tuple:
+    """(section, description) for render_part / inspect_part / contact_sheet `section=`, or
+    (None, "") when none was given. `section` is {"point", "normal"} — the shape
+    _render_view_png / the engine's view.section take: the half-space dot(p - point, normal) <= 0
+    is kept. Accepts the inspect_section plane vocabulary in compact form; anything that is not
+    exactly one plane is refused with the vocabulary, never guessed."""
+    section = _normalize_target(section)
+    if section is None:
+        return None, ""
+    if isinstance(section, str):
+        section = {"plane": section}
+    if not isinstance(section, dict):
+        raise ValueError(f"{tool}: section={section!r} is not a plane. {_SECTION_HELP}")
+    extra = sorted(str(k) for k in set(section) - set(_SECTION_KEYS))
+    if extra:
+        raise ValueError(f"{tool}: section has unknown key(s) {extra}; it takes only "
+                         f"{', '.join(_SECTION_KEYS)}. {_SECTION_HELP}")
+    plane, origin, normal = section.get("plane"), section.get("origin"), section.get("normal")
+    offset, flip = section.get("offset"), section.get("flip", False)
+    if not isinstance(flip, bool):
+        raise ValueError(f"{tool}: section flip={flip!r} must be true or false.")
+    if offset is not None and (isinstance(offset, bool) or not isinstance(offset, (int, float))
+                               or not math.isfinite(offset)):
+        raise ValueError(f"{tool}: section offset={offset!r} must be a finite number of mm "
+                         f"along the plane normal.")
+    if plane is not None and (origin is not None or normal is not None):
+        raise ValueError(f"{tool}: section gives both plane={plane!r} and origin/normal — pass "
+                         f"a datum plane name (optionally with offset) OR origin+normal, not "
+                         f"both. {_SECTION_HELP}")
+    if plane is not None:
+        key = _SECTION_PLANE_NAMES.get(re.sub(r"^plane[._ ]", "", str(plane).strip().lower()))
+        if key is None:
+            raise ValueError(f"{tool}: section plane {plane!r} is not a reserved datum plane. "
+                             f"{_SECTION_HELP}")
+        axes, n = _SECTION_PLANES[key]
+        point = tuple((offset or 0.0) * c for c in n)
+        what = (f"datum plane {key!r} ({axes})"
+                + (f" shifted {offset:g} mm along its normal" if offset
+                   else " through the world origin"))
+    else:
+        if origin is None or normal is None:
+            raise ValueError(f"{tool}: a custom section needs BOTH origin=[x, y, z] and "
+                             f"normal=[nx, ny, nz] (or a datum plane name). {_SECTION_HELP}")
+        point = _finite3(tool, "origin", origin)
+        raw_n = _finite3(tool, "normal", normal)
+        mag = math.sqrt(sum(c * c for c in raw_n))
+        if mag < 1e-9:
+            raise ValueError(f"{tool}: section normal {list(normal)!r} has zero length.")
+        n = tuple(c / mag for c in raw_n)
+        if offset:
+            point = tuple(p + offset * c for p, c in zip(point, n))
+        what = f"custom plane through {_vec(point)}" + (
+            f" (moved {offset:g} mm along its normal)" if offset else "")
+    if flip:
+        n = tuple(-c for c in n)
+        what += ", flipped"
+    desc = (f"SECTION by {what}: the half on the +normal side {_vec(n)} is removed and drawn as "
+            f"a ghost outline, the cut face is hatched")
+    return {"point": [float(c) for c in point], "normal": [float(c) for c in n]}, desc
+
+
+def _section_cameras(section: dict) -> list:
+    """Four directions that LOOK AT a section's cut face: on the removed (+normal) side, 45 deg
+    off the plane normal, at four azimuths around it — the pose the shot planner gives its own
+    section cameras, so the hatched cap is in view and the ghosted half is behind the lens."""
+    n = _vnorm(section["normal"])
+    ref = (0.0, 1.0, 0.0) if abs(n[2]) > 0.985 else (0.0, 0.0, 1.0)
+    t0 = _vnorm(_vcross(ref, n))
+    t1 = _vcross(n, t0)
+    c = s = math.sqrt(0.5)
+    return [_vnorm(tuple(c * n[i] + s * sign * t[i] for i in range(3)))
+            for t, sign in ((t0, 1.0), (t1, 1.0), (t0, -1.0), (t1, -1.0))]
+
+
+def _section_pins(section: dict) -> list:
+    """The four cut-face cameras as shot_planner `pinned` views, every one carrying the
+    caller's section — the planner grid with the cut applied to every tile."""
+    plane = {"point": list(section["point"]), "normal": list(section["normal"])}
+    return [{"dir": list(d), "label": f"section cut {i + 1}", "section": dict(plane)}
+            for i, d in enumerate(_section_cameras(section))]
+
+
+def _section_numbers(d: str, section: dict) -> str:
+    """Cross-section numbers for EXACTLY the plane that was rendered (same origin + normal as
+    the engine's view.section), so a caption never describes a different cut than the image."""
+    plane = {"origin": [float(c) for c in section["point"]],
+             "normal": [float(c) for c in section["normal"]]}
+    where = f"plane through {_vec(plane['origin'])} normal {_vec(plane['normal'])}"
+    try:
+        res = cb.call("eval_section_props", {"doc_id": d, "plane": plane}) or {}
+    except Exception as e:  # noqa: BLE001 — the image stands; the caption says why no numbers
+        return f"unavailable for the {where} ({e})"
+    area = res.get("area_mm2") or 0.0
+    if area > 0:
+        return f"area {area:.4g} mm² on the {where}"
+    return f"the {where} cuts no material (area 0)"
+
+
+def _section_caption(d: str, section: dict, desc: str, view_dir=None) -> str:
+    """The caption block for an explicit section= render: which plane was cut, the numbers on
+    that same plane, and a warning when the camera cannot see the cut face."""
+    out = f" {desc}. Section numbers (same plane as the image): {_section_numbers(d, section)}."
+    if view_dir is not None and _vdot(_vnorm(view_dir), _vnorm(section["normal"])) < 0.05:
+        out += (" WARNING: this camera is on the kept side of the cut (or edge-on to it), so the "
+                "hatched cut face is hidden — pass section with \"flip\": true, or a view from "
+                "the +normal side.")
+    return out
+
+
 def _annotated_view_tiles(d: str, view_list: list, highlight=None, annotate: bool = True,
                           part_bb: Optional[dict] = None, target_bb: Optional[dict] = None,
                           matches: Optional[list] = None,
                           emphasis_mode: Optional[str] = None,
                           margin: float = _CLOSEUP_MARGIN,
                           clip_near: bool = False,
-                          background: Optional[list] = None) -> tuple:
-    """Render each view on its own, overlay the mesh annotation, return (tiles, labels, infos).
+                          background: Optional[list] = None,
+                          point: Optional[tuple] = None, *, tool: str,
+                          section: Optional[dict] = None) -> tuple:
+    """Render each view on its own, overlay the mesh annotation, return
+    (tiles, labels, infos, failures).
 
     The native doc_render_contact_sheet RPC tiles inside the engine, so there is no per-tile
     image to draw B-rep edges or a highlight onto. Rendering view-by-view costs ~11 ms of
@@ -276,17 +473,19 @@ def _annotated_view_tiles(d: str, view_list: list, highlight=None, annotate: boo
     upscaled 16x and a real close-up — and the overlay reprojects through the camera the
     engine reports, so the emphasis mask lands on the actual target pixels. `clip_near` cuts
     the near material away in every tile, which is the only way an ortho sweep of an INTERNAL
-    target shows anything at all — uncut, six of the seven tiles are a flat slab."""
+    target shows anything at all — uncut, six of the seven tiles are a flat slab. `section`
+    ({"point","normal"}) cuts every tile on the same plane (ghost + hatch).
+
+    Every view is validated BEFORE any render (a bad name raises, see _check_views). A tile
+    whose render the engine refuses is not dropped silently: it comes back in `failures`
+    as [(label, reason)] for the caller to put in the caption."""
     focused = bool(target_bb)
     emphasis = ({"matches": list(matches or []), "mode": emphasis_mode or "emphasis",
                  "label": None} if focused and emphasis_mode and matches else None)
-    tiles, labels, infos = [], [], []
-    for v in view_list:
-        try:
-            vd = _camera_dir_for_target(matches or [], v if v != "auto" else "auto")
-        except Exception:  # noqa: BLE001
-            vd = _vnorm((1.0, 1.0, 0.8))
-        name = v if isinstance(v, str) else "custom"
+    dirs = _check_views(tool, view_list, matches)
+    tiles, labels, infos, failures = [], [], [], []
+    for v, vd in zip(view_list, dirs):
+        name = v.strip().lower() if isinstance(v, str) else "custom"
         # Internal plumbing: every tile is composed into ONE sheet by the caller
         # (_tile_pngs_grid) and is never handed to the model, so tiles stay on the scratch
         # prefix — only the finished sheet gets a durable render_output_path.
@@ -297,19 +496,23 @@ def _annotated_view_tiles(d: str, view_list: list, highlight=None, annotate: boo
                 focus=target_bb if focused else None, margin=margin,
                 clip_near=bool(clip_near) and focused,
                 W=_CLOSEUP_W if focused else 512, H=_CLOSEUP_H if focused else 400,
-                annotate=bool(annotate), background=background)
-        except ValueError:
+                annotate=bool(annotate), background=background, section=section)
+        except ValueError as e:
+            failures.append((name, str(e)))
             continue
         info = None
         if annotate or highlight is not None or emphasis is not None:
             png_tile, info = _annotate_render(
-                png_tile, d, vd, highlight=highlight, edges=bool(annotate),
+                png_tile, d, vd, highlight=highlight,
+                edges=bool(annotate) and section is None,
                 callouts=bool(annotate) and not focused,
                 scale=bool(annotate), frame=frame, emphasis=emphasis)
+        if point is not None:
+            _tile_decorator(point)(png_tile, frame, {})
         tiles.append(png_tile)
         labels.append(name)
         infos.append(info)
-    return tiles, labels, infos
+    return tiles, labels, infos, failures
 
 
 # Close-ups are what the verify loop looks at after nearly every mutation, so their size is
@@ -655,6 +858,9 @@ def _split_view(view) -> tuple:
                 opts[key] = float(opts[key])
             except (TypeError, ValueError):
                 raise ValueError(f"view.{key} must be a number (got {opts[key]!r})") from None
+            if key == "distance" and opts[key] == 0:
+                opts[key] = None
+                continue
             if not math.isfinite(opts[key]) or opts[key] <= 0:
                 raise ValueError(f"view.{key} must be a positive number")
     direction = rest if any(k in rest for k in ("dir", "azimuth", "elevation")) else "auto"
@@ -667,6 +873,18 @@ def _union_bbox(boxes: list) -> dict:
     hi = tuple(max(float(b["max"][k]) for b in boxes) for k in range(3))
     return {"min": lo, "max": hi, "size": tuple(hi[k] - lo[k] for k in range(3)),
             "center": tuple((hi[k] + lo[k]) * 0.5 for k in range(3))}
+
+
+def _normalize_target(value):
+    """Decode structured JSON targets without changing ordinary selector strings."""
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (ValueError, TypeError):
+            return value
+        if isinstance(decoded, (dict, list)):
+            return decoded
+    return value
 
 
 def _point_of(target) -> Optional[tuple]:
@@ -687,6 +905,18 @@ def _resolve_camera_target(d: str, target, part_bb: Optional[dict]) -> tuple:
     """(resolved, target_bb, point) for any close-up target: a feature / face / edge / sid
     through _resolve_inspect_target, or a bare world point framed as a cube of `radius`
     (default 8 % of the part diagonal, at least 2 mm)."""
+    if isinstance(target, str) and re.fullmatch(r"k\d+(?:#\d+)?", target):
+        bodies = (cb.call("asm_world_bodies", {"doc_id": d, "explode": False}) or {}).get("bodies", [])
+        selected = [b for b in bodies if b.get("component") == target]
+        if selected:
+            matches = []
+            for body in selected:
+                for ordinal in body.get("source_ordinals") or [body["body_id"]]:
+                    result = cb.call("doc_query", {"doc_id": d,
+                                                  "query": {"of": "face", "body_id": ordinal}})
+                    matches.extend(result.get("matches") or [])
+            bbox = _union_bbox([b["bbox"] for b in selected])
+            return {"matches": matches, "label": target, "kind": "component"}, bbox, None
     p = _point_of(target)
     if p is None:
         resolved = _resolve_inspect_target(d, target)
@@ -799,10 +1029,10 @@ _RENDER_SAVE_ROOT_VARS = ("CHUDWARE_PROJECT_SAVE_DIR", "CHUDWARE_PROJECT_DIR",
 
 
 def _render_save_roots() -> list:
-    """[(env var, real root)] for every configured workspace/project directory."""
+    """[(root variable, real root)] for the current request's workspace/project."""
     out: list = []
     for var in _RENDER_SAVE_ROOT_VARS:
-        raw = (os.environ.get(var) or "").strip()
+        raw = root_value(var).strip()
         if raw:
             out.append((var, os.path.realpath(os.path.expanduser(raw))))
     return out
@@ -1072,7 +1302,8 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                     annotate: bool = True,
                     display_quality: Optional[str] = None,
                     background: Optional[Union[list, str]] = None,
-                    save_path: Optional[str] = None) -> list:
+                    save_path: Optional[str] = None,
+                    section: Optional[Union[str, dict]] = None) -> list:
         """Render the part and return [image, caption] so you can SEE it.
 
         DEFAULT (no `view`): ONE image holding the FOUR most useful complementary shots, a
@@ -1090,17 +1321,20 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         boundary-condition coverage to the ranking; a target also includes its adjacent
         faces as surrounding context. Documents without studies or mates need no setup.
 
-        target: frame the grid on ONE thing — a feature id or name ("f5", "Rib"), a face/edge
-        sid or geometry query ({"of":"face","side":"top"}), a list of those, or a world point
+        target: frame the grid on ONE thing — a feature id or name ("f5", "Rib"), an assembly
+        component id ("k9"), a face/edge sid or geometry query ({"of":"face","side":"top"}),
         [x, y, z] / {"point": [x, y, z], "radius": mm}. The target is painted (shading kept),
         the rest dimmed, occluded parts of it ghosted; an attachment defect found by
         eval_feature_attachment gets tile A aimed at it with its evidence painted.
-        emphasize is an alias; emphasis_mode "per_face" colours each face distinctly.
+        emphasize is an alias of target — pass ONE of them; both together is an error (give
+        target a list to frame several things, or highlight= to paint without reframing).
+        emphasis_mode "per_face" colours each face distinctly.
+        Structured target, emphasize and highlight values also accept JSON-encoded strings.
 
         view: ONE single shot instead of the grid — "auto" (the planner's best single view),
         "front"/"back"/"top"/"bottom"/"left"/"right"/"iso", or a dict: {"azimuth": deg,
         "elevation": deg} (az 0 = front, 90 = right) or {"dir": [x, y, z]} (scene -> camera),
-        plus optional "distance" (mm, camera to target), "fov" (deg, default 30) and
+        plus optional "distance" (mm, camera to target; 0 or null auto-fits), "fov" (deg, default 30) and
         "projection" ("perspective" default for close-ups, "ortho" for a drawing-like framed
         view; {"projection": "perspective"} alone gives a perspective shot of the whole part).
         highlight: paint + label targets WITHOUT reframing (same vocabulary, list allowed).
@@ -1109,6 +1343,20 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         background: [r,g,b] or "#rrggbb". save_path: also write the exact PNG to this path
         inside the project. A relative path is project-root relative. The caption gives the
         absolute saved path.
+
+        An unknown view name is an error that lists the valid ones — it never renders some
+        other camera under that label. view="auto" with no target is the planner's best single
+        camera for the whole part.
+
+        section: cut the part open on ONE plane instead of letting the planner choose —
+        "top"/"front"/"right" (also XY/XZ/YZ) or {"plane": name, "offset": mm} or
+        {"origin": [x, y, z], "normal": [nx, ny, nz]}, with optional "flip": true. The half on
+        the +normal side is removed and drawn as a ghost outline, the cut face is hatched
+        (top removes the upper half; a datum plane passes through the WORLD ORIGIN unless
+        offset moves it, as in inspect_section). No view = the 4-tile grid, every tile cut
+        on that plane; with a view the single shot is cut on it. The caption names the plane
+        and gives the section area computed on that same plane. A bad plane or normal is an
+        error.
 
         Result: you see the image. Eval code (write xd://render_part) gets one mapping:
         {"ok": true, "caption": str, "images": [{"path", "mime", "width", "height"}],
@@ -1120,6 +1368,14 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         # Validate the destination BEFORE any engine work: a refused path must not cost a
         # render (and must be reported as the argument error it is, not as a render failure).
         save_to = _render_save_target(save_path)
+        target, emphasize, highlight = map(_normalize_target, (target, emphasize, highlight))
+        if target is not None and emphasize is not None:
+            raise ValueError(
+                "render_part: pass target= OR emphasize=, not both — emphasize is only an alias "
+                "of target (the thing to frame AND paint), so two values leave the framing "
+                "ambiguous. To frame and paint several things give target a list, e.g. "
+                "target=[\"f2\", \"f5\"]; to paint something WITHOUT reframing use highlight=.")
+        sec, sec_desc = _parse_section(section, tool="render_part")
         bg = render_background(background)
         d = _doc(doc_id)
         if display_quality is not None:
@@ -1130,10 +1386,14 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         view_spec, cam_opts = _split_view(view)
         view_name = view if isinstance(view, str) else "custom"
         emp_spec = emphasize if emphasize is not None else target
+        auto_view = isinstance(view_spec, str) and view_spec.strip().lower() == "auto"
 
         if view is None:
             part_bb = cb.call("doc_bbox", {"doc_id": d}) or {}
             if not part_bb.get("size"):
+                if sec is not None:
+                    raise ValueError("render_part: section= cuts a 3D part, and this document "
+                                     "has no solid to cut (it is a drawing or empty).")
                 # A drawing document has no solid to plan cameras around; its sheet is the
                 # picture.
                 png = render_output_path(_render_stem(d, "drawing"), ".png")
@@ -1145,18 +1405,24 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                     return _with_save_note(_captioned_render(png, d, ["drawing"]),
                                            _render_save_note(png, save_to))
                 raise ValueError("Render failed: no bodies to render")
+            sec_pins = _section_pins(sec) if sec is not None else None
             if emp_spec is None:
-                plan = _sp.plan_shots(d, k=4, part_bbox=part_bb, roles=_planning_roles(d))
+                plan = _sp.plan_shots(d, k=4, part_bbox=part_bb, roles=_planning_roles(d),
+                                      pinned=sec_pins)
                 png, caption = _shot_grid(d, plan, stem=_render_stem(d, "shots"),
                                           highlight=highlight, emphasis_mode=None,
                                           annotate=bool(annotate), background=bg)
+                if sec is not None:
+                    caption += _section_caption(d, sec, sec_desc)
                 return _with_save_note([Image(path=png), caption],
                                        _render_save_note(png, save_to))
             _sp.prime_face_clouds(d)
             resolved, target_bb, point = _render_target(d, emp_spec, part_bb)
             label = str(resolved.get("label") or "target")
-            defect = _attachment_defect(d, resolved)
-            pinned = None
+            # An explicit section is the caller's chosen cut: the defect camera would compete
+            # with it for tile A, so it only runs on the planner's own choice of views.
+            defect = None if sec is not None else _attachment_defect(d, resolved)
+            pinned = sec_pins
             if defect:
                 pinned = [{"dir": list(_defect_view_dir(defect, part_bb, d)),
                            "label": f"shows-{defect.get('verdict')}", "defect": defect,
@@ -1175,6 +1441,8 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                 caption += (f" ATTACHMENT DEFECT ({defect.get('verdict')}): "
                             f"{defect.get('detail')} — tile A is aimed to show it, with the "
                             f"evidence painted.")
+            if sec is not None:
+                caption += _section_caption(d, sec, sec_desc)
             return _with_save_note([Image(path=png), caption], _render_save_note(png, save_to))
 
         whole_persp = emp_spec is None and isinstance(view, dict) and (
@@ -1191,16 +1459,21 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                 resolved, target_bb, point = _render_target(d, emp_spec, part_bb)
             matches = resolved["matches"]
             internal = bool(matches) and _target_is_internal(matches, part_bb)
-            section = None
-            if isinstance(view_spec, str) and view_spec.lower() == "auto":
-                view_dir, view_label, defect, section = _auto_view(
-                    d, resolved if not whole_persp else {}, matches, target_bb, part_bb, point)
-                clip = False
+            section = sec
+            if auto_view:
+                if sec is not None:
+                    view_dir, view_label, defect, clip = (
+                        _section_cameras(sec)[0], "section", None, False)
+                else:
+                    view_dir, view_label, defect, section = _auto_view(
+                        d, resolved if not whole_persp else {}, matches, target_bb, part_bb,
+                        point)
+                    clip = False
             else:
-                view_dir = _camera_dir_for_target(matches, view_spec)
+                view_dir = _check_views("render_part", [view_spec], matches)[0]
                 view_label = view_spec if isinstance(view_spec, str) else "custom"
-                defect = _attachment_defect(d, resolved)
-                clip = internal
+                defect = None if sec is not None else _attachment_defect(d, resolved)
+                clip = internal and sec is None
             projection = cam_opts["projection"] or "perspective"
             label = str(resolved.get("label") or "target")
             png, ann_info = _closeup(
@@ -1224,14 +1497,16 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                    f"depth)" if cam.get("distance") else ", orthographic")
                 + (", near-plane cutaway (internal target)" if clip else "")
                 + (", SECTION through the target (cut face hatched, removed half ghosted)"
-                   if section else "") + "."
+                   if section is not None and sec is None else "") + "."
             ) + _visibility_note(ann_info)
             if defect:
                 caption_extra += (f" ATTACHMENT DEFECT ({defect.get('verdict')}, camera chosen to "
                                   f"show it): {defect.get('detail')}")
-            if internal:
-                sec = _auto_section_for_target(d, matches, target_bb)
-                caption_extra += f" Auto-section: {sec.get('summary') or sec.get('plane')}."
+            if sec is not None:
+                caption_extra += _section_caption(d, sec, sec_desc, view_dir)
+            elif section is not None:
+                caption_extra += (" Section numbers (same plane as the image): "
+                                  f"{_section_numbers(d, section)}.")
             caption_extra += _palette_caption_block(
                 ((ann_info.get("emphasis") or {}).get("palette")) if ann_info else None)
             result = _captioned_render(png, d, [f"closeup-{view_label}"],
@@ -1243,14 +1518,32 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         png = render_output_path(_render_stem(d, view_name), ".png")
         ann_info = None
         view_dir = None
-        if view_spec != "auto":
-            try:
-                view_dir = _camera_dir_for_target([], view_spec)
-            except Exception:  # noqa: BLE001
-                view_dir = _vnorm((1.0, 1.0, 0.8))
+        auto_note = ""
+        if auto_view:
+            # view="auto" is the planner's best single camera for the whole part (or, with a
+            # section=, the camera that looks at its cut face). A document with no solid is a
+            # drawing: view_dir stays None and the engine's own render / drawing sheet answers.
+            part_bb = cb.call("doc_bbox", {"doc_id": d}) or {}
+            if part_bb.get("size"):
+                if sec is not None:
+                    view_dir = _section_cameras(sec)[0]
+                    auto_note = " Auto view: looking at the cut face."
+                else:
+                    best = _sp.plan_shots(d, k=1, part_bbox=part_bb,
+                                          roles=_planning_roles(d))["views"][0]
+                    view_dir = _vnorm(tuple(best["dir"]))
+                    auto_note = (f" Auto view: the shot planner's best single camera "
+                                 f"({best.get('label') or 'auto'}), dir "
+                                 f"[{view_dir[0]:.2f}, {view_dir[1]:.2f}, {view_dir[2]:.2f}].")
+            elif sec is not None:
+                raise ValueError("render_part: section= cuts a 3D part, and this document has "
+                                 "no solid to cut (it is a drawing or empty).")
+        else:
+            view_dir = _check_views("render_part", [view_spec])[0]
         if view_dir is not None:
             png, frame, _r = _render_view_png(d, view_dir, png, name=str(view_name).upper(),
-                                              annotate=bool(annotate), background=bg)
+                                              annotate=bool(annotate), background=bg,
+                                              section=sec)
         else:
             frame = None
             params = {"doc_id": d, "out_path": png, "annotate": bool(annotate)}
@@ -1269,15 +1562,20 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         # Mesh-accurate overlay: B-rep edges (hidden-line removed), explicit `highlight`
         # targets, feature callouts and a scale bar, reprojected through the SAME camera the
         # engine just rendered — its own echoed frame when it gave us one. Degrades to a
-        # no-op if the tessellation or numpy is unavailable.
+        # no-op if the tessellation or numpy is unavailable. A section skips the Python edge
+        # overlay: the engine already draws the ghost's edges.
         if annotate or highlight is not None:
             render_dir = view_dir if view_dir is not None else _vnorm((1.0, 1.0, 0.8))
             png, ann_info = _annotate_render(
                 png, d, render_dir, highlight=highlight, frame=frame,
-                edges=bool(annotate), callouts=bool(annotate), scale=bool(annotate),
+                edges=bool(annotate) and sec is None, callouts=bool(annotate),
+                scale=bool(annotate),
                 out_png=render_output_path(_render_stem(d, view_name), ".png"))
 
-        result = _captioned_render(png, d, [view_name], annotations=ann_info)
+        extra = auto_note + (_section_caption(d, sec, sec_desc, view_dir)
+                             if sec is not None else "")
+        result = _captioned_render(png, d, [view_name], annotations=ann_info,
+                                   extra=extra.strip())
         return _with_save_note(result, _render_save_note(png, save_to))
 
 
@@ -1288,7 +1586,8 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                       highlight: Optional[Union[str, dict, list]] = None,
                       annotate: bool = True,
                       background: Optional[Union[list, str]] = None,
-                      save_path: Optional[str] = None) -> list:
+                      save_path: Optional[str] = None,
+                      section: Optional[Union[str, dict]] = None) -> list:
         """Render SEVERAL labelled views tiled into ONE image — the fastest multi-angle self-check.
 
         Default (no `views`): the planner's 4 most useful complementary views of the whole part
@@ -1300,6 +1599,18 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         {"dir":[x,y,z]} — see render_part). Each such tile is headed with its view name and
         (with annotate=True) carries the B-rep EDGE outline with hidden lines removed, feature
         CALLOUTS and a SCALE BAR.
+
+        An unknown view name is an error that lists the valid ones — it never renders some
+        other camera under that label. If some tiles fail to render the caption says "N of M
+        views failed" with each reason; if every tile fails the call errors with the reasons.
+
+        section: cut EVERY tile on one plane (ghost outline of the removed half, hatched cut
+        face) — "top"/"front"/"right" (also XY/XZ/YZ) or {"plane": name, "offset": mm} or
+        {"origin": [x, y, z], "normal": [nx, ny, nz]}, optional "flip": true. The half on the
+        +normal side is removed; a datum plane passes through the WORLD ORIGIN unless offset
+        moves it (as in inspect_section). Without `views` the 4 tiles are cameras looking at
+        the cut face from four sides. The caption names the plane and gives the section area
+        on that same plane. A bad plane is an error.
 
         highlight: same target vocabulary as render_part — a feature NAME ("Boss"), a feature id
         ("f2"), a sid ("F58db6d"), a geometry-query dict, or a list of those. The target is
@@ -1324,17 +1635,26 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         what no tile could see.
         """
         save_to = _render_save_target(save_path)
+        highlight = _normalize_target(highlight)
+        sec, sec_desc = _parse_section(section, tool="contact_sheet")
         bg = render_background(background)
         d = _doc(doc_id)
         if not views:
-            plan = _sp.plan_shots(d, k=4)
+            plan = _sp.plan_shots(d, k=4,
+                                  pinned=_section_pins(sec) if sec is not None else None)
             png, caption = _shot_grid(d, plan, stem=_render_stem(d, "contact-sheet"),
                                       highlight=highlight, emphasis_mode=None,
                                       annotate=bool(annotate), background=bg)
+            if sec is not None:
+                caption += _section_caption(d, sec, sec_desc)
             return _with_save_note([Image(path=png), caption], _render_save_note(png, save_to))
-        if not annotate and highlight is None:
+        view_list = _normalize_view_list(views)
+        _check_views("contact_sheet", view_list)
+        # The engine's own sheet has no per-tile image to cut, paint or annotate: it is only
+        # used when there is nothing to overlay and no section to apply.
+        if not annotate and highlight is None and sec is None:
             png = render_output_path(_render_stem(d, "contact-sheet"), ".png")
-            params = {"doc_id": d, "out_path": png, "views": views}
+            params = {"doc_id": d, "out_path": png, "views": view_list}
             if bg is not None:
                 params["background"] = bg
             r = cb.call("doc_render_contact_sheet", params)
@@ -1342,21 +1662,24 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                 raise ValueError(
                     f"Contact sheet failed: "
                     f"{r.get('reason', r.get('error', 'no bodies to render'))}")
-            return _with_save_note(_captioned_render(png, d, views),
+            return _with_save_note(_captioned_render(png, d, view_list),
                                    _render_save_note(png, save_to))
 
-        tiles, labels, infos = _annotated_view_tiles(d, views, highlight=highlight,
-                                                     annotate=annotate, background=bg)
+        tiles, labels, infos, failures = _annotated_view_tiles(
+            d, view_list, highlight=highlight, annotate=annotate, background=bg,
+            tool="contact_sheet", section=sec)
         if not tiles:
-            raise ValueError("Contact sheet failed: no bodies to render")
+            raise _all_failed("contact_sheet", failures, len(view_list))
         out = render_output_path(_render_stem(d, "contact-sheet"), ".png")
         _tile_pngs_grid(tiles, out, labels=labels,
                         cols=max(1, int(math.ceil(math.sqrt(len(tiles))))))
+        extra = (f"Contact sheet, {len(tiles)} tiles: " + ", ".join(labels) + "."
+                 + _failed_note(failures, len(view_list)))
+        if sec is not None:
+            extra += _section_caption(d, sec, sec_desc)
         return _with_save_note(
             _captioned_render(out, d, labels,
-                              annotations=_merge_annotation_infos(infos),
-                              extra=f"Contact sheet, {len(tiles)} tiles: "
-                                    + ", ".join(labels) + "."),
+                              annotations=_merge_annotation_infos(infos), extra=extra),
             _render_save_note(out, save_to))
 
 
@@ -1364,7 +1687,7 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def render_views(doc_id: Optional[str] = None,
                      views: Optional[list] = None,
-                     target: Optional[Union[str, dict]] = None,
+                     target: Optional[Union[str, dict, list]] = None,
                      highlight: Optional[Union[str, dict, list]] = None,
                      annotate: bool = True,
                      background: Optional[Union[list, str]] = None,
@@ -1381,9 +1704,12 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         views=[...]: exactly those views instead (named views and/or custom
         {"azimuth","elevation"} / {"dir":[x,y,z]} specs — same vocabulary as render_part), e.g.
         ["front","back","left","right","top","bottom","iso"] for the 6-ortho+iso drawing set.
+        An unknown view name is an error that lists the valid ones; tiles that fail to render
+        are reported in the caption ("N of M views failed"), and the call errors if all fail.
 
-        target (optional): frame every tile on the target (feature id "f2", sid, or a
-        plain-word face/edge query); it is painted in the emphasis colour in every tile.
+        target (optional): frame every tile on a feature id "f2", sid, geometry query,
+        or world point [x,y,z] / {"point":[x,y,z],"radius":mm}, as in render_part.
+        Geometry is emphasized; a point gets a crosshair, not a face selection.
 
         highlight (optional): same target vocabulary as render_part — a feature NAME ("Boss"),
         a feature id ("f2"), a sid ("F58db6d"), a query dict, or a list of those. Painted in a
@@ -1409,22 +1735,26 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         is highlighted and in what colour, and what no view could see plus the tool for it.
         """
         save_to = _render_save_target(save_path)
+        target, highlight = map(_normalize_target, (target, highlight))
         bg = render_background(background)
         d = _doc(doc_id)
         if not views:
             plan_target = None
+            point = None
             label = "views"
             if target is not None:
-                resolved = _resolve_inspect_target(d, target)
+                part_bb = cb.call("doc_bbox", {"doc_id": d}) or {}
+                if not part_bb.get("size"):
+                    raise ValueError("render_views: the part has no geometry to frame yet")
+                resolved, target_bb, point = _render_target(d, target, part_bb)
                 label = str(resolved.get("label") or "target")
                 plan_target = {"matches": resolved["matches"], "label": label,
-                               "bbox": _target_bbox(d, resolved["matches"]),
-                               "kind": resolved.get("kind")}
+                               "bbox": target_bb, "kind": resolved.get("kind")}
             plan = _sp.plan_shots(d, target=plan_target, k=7)
             png, caption = _shot_grid(
                 d, plan, stem=_render_stem(d, f"{label}-views" if plan_target else "views"),
                 highlight=highlight, emphasis_mode="emphasis" if plan_target else None,
-                annotate=bool(annotate), background=bg)
+                annotate=bool(annotate), background=bg, point=point)
             return _with_save_note([Image(path=png), f"render_views grid. {caption}"],
                                    _render_save_note(png, save_to))
 
@@ -1433,6 +1763,7 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
             # Native engine sheet only when there is nothing to overlay (it tiles internally,
             # so there is no per-tile image to draw edges or a highlight onto).
             if not annotate and highlight is None:
+                _check_views("render_views", view_list)
                 png = render_output_path(_render_stem(d, "views"), ".png")
                 params = {"doc_id": d, "out_path": png, "views": view_list}
                 if bg is not None:
@@ -1449,57 +1780,59 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                                       extra=f"render_views grid ({len(names)} tiles: "
                                             + ", ".join(str(n) for n in names) + ")."),
                     _render_save_note(png, save_to))
-            tiles, labels, infos = _annotated_view_tiles(d, view_list, highlight=highlight,
-                                                         annotate=annotate, background=bg)
+            tiles, labels, infos, failures = _annotated_view_tiles(
+                d, view_list, highlight=highlight, annotate=annotate, background=bg,
+                tool="render_views")
             if not tiles:
-                raise ValueError("render_views failed: no bodies to render")
+                raise _all_failed("render_views", failures, len(view_list))
             out = render_output_path(_render_stem(d, "views"), ".png")
             _tile_pngs_grid(tiles, out, labels=labels, cols=3)
             return _with_save_note(
                 _captioned_render(out, d, labels,
                                   annotations=_merge_annotation_infos(infos),
                                   extra=f"render_views grid ({len(tiles)} tiles: "
-                                        + ", ".join(labels) + ")."),
+                                        + ", ".join(labels) + ")."
+                                        + _failed_note(failures, len(view_list))),
                 _render_save_note(out, save_to))
 
         # Target-framed explicit views: the ENGINE frames each tile on the target AABB (a real
         # close-up per view), and every tile carries the exact-mask emphasis so you can tell at
         # a glance which of the requested cameras actually sees the feature.
-        resolved = _resolve_inspect_target(d, target)
-        matches = resolved["matches"]
-        target_bb = _target_bbox(d, matches)
         part_bb = cb.call("doc_bbox", {"doc_id": d})
         if not part_bb or not part_bb.get("size"):
             raise ValueError("no part bounding box — build geometry first")
+        resolved, target_bb, point = _render_target(d, target, part_bb)
+        matches = resolved["matches"]
 
-        tile_paths, labels, infos = _annotated_view_tiles(
+        tile_paths, labels, infos, failures = _annotated_view_tiles(
             d, view_list, highlight=highlight, annotate=annotate,
             part_bb=part_bb, target_bb=target_bb, matches=matches,
             emphasis_mode="emphasis",
-            clip_near=_target_is_internal(matches, part_bb), background=bg)
+            clip_near=bool(matches) and _target_is_internal(matches, part_bb),
+            background=bg, point=point, tool="render_views")
         if not tile_paths:
-            raise ValueError("render_views: every tile render failed")
+            raise _all_failed("render_views", failures, len(view_list))
         out = render_output_path(
             _render_stem(d, f"{resolved.get('label') or 'target'}-views"), ".png")
         # 3-column grid reads better for 6–7 views than the 2-col look_around default.
         _tile_pngs_grid(tile_paths, out, labels=labels, cols=3)
         seen = [labels[i] for i, inf in enumerate(infos)
                 if ((inf or {}).get("emphasis") or {}).get("target_px")]
-        try:
-            first_dir = _camera_dir_for_target(matches, view_list[0])
-        except ValueError:
-            first_dir = _vnorm((1.0, 1.0, 0.8))
+        first_dir = _camera_dir_for_target(matches, view_list[0])
         caption = (
             f"render_views of {resolved.get('label')!r}: {len(tile_paths)} labelled tiles "
             f"({', '.join(labels)}), each FRAMED on the target by the engine. "
-            f"Views that actually show the target: "
-            f"{', '.join(seen) if seen else 'none — try inspect_section'}. "
+            + ("Crosshair marks the requested world point; no face is selected. "
+               if point is not None else
+               f"Views that actually show the target: "
+               f"{', '.join(seen) if seen else 'none — try inspect_section'}. ")
             + _inspect_caption(d, resolved, target_bb, first_dir,
                                method="focus", n_matches=len(matches))
         )
         ann = _merge_annotation_infos(infos)
         if ann:
             caption += " " + _render_annotation_caption("target-framed grid", ann)
+        caption += _failed_note(failures, len(view_list))
         return _with_save_note([Image(path=out), caption],
                                _render_save_note(out, save_to))
 
@@ -1725,16 +2058,36 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                      annotate: bool = True,
                      emphasize: bool = True,
                      emphasis_mode: str = "emphasis",
-                     cutaway: Optional[bool] = None) -> list:
+                     cutaway: Optional[bool] = None,
+                     section: Optional[Union[str, dict]] = None) -> list:
         """CLOSE-UP of one face/edge/feature/point with framing controls — render_part(target=,
         view="auto") plus zoom_factor (>1 tighter), margin (context padding per side, default
         0.22), cutaway (None = auto: the planner's best single view, which is a SECTION through
         the target when no exterior camera shows it well; True forces a near-plane cutaway,
         False forces an uncut view) and emphasize=False (no paint). Same target and view
         vocabulary as render_part, including "distance", "fov" and "projection" in a view dict;
-        perspective by default. Returns [image, caption] with what is framed, key dims, how
-        much of the target the camera saw, and the camera.
+        perspective by default. An unknown view name is an error that lists the valid ones.
+
+        section: cut on ONE plane you name instead of the planner's choice — "top"/"front"/
+        "right" (also XY/XZ/YZ), {"plane": name, "offset": mm} or {"origin": [x, y, z],
+        "normal": [nx, ny, nz]}, each with an optional "flip": true. The half on the +normal
+        side is removed and drawn as a ghost outline, the cut face is hatched. A datum plane
+        passes through the WORLD ORIGIN unless offset moves it (as in inspect_section), so for
+        a feature away from the origin give origin+normal through it. view="auto" then looks
+        at the cut face; a view you name is used as given. Not combinable with cutaway. A bad
+        plane is an error.
+
+        Returns [image, caption] with what is framed, key dims, how much of the target the
+        camera saw, the camera, and — for any section — the plane that was cut with its area
+        computed on that same plane.
         """
+        target = _normalize_target(target)
+        sec, sec_desc = _parse_section(section, tool="inspect_part")
+        if sec is not None and cutaway is not None:
+            raise ValueError(
+                "inspect_part: section= and cutaway= are two ways of opening the part — pass "
+                "only one. section= cuts on the plane you name; cutaway= clips the material "
+                "between the camera and the target.")
         d = _doc(doc_id)
         try:
             part_bb = cb.call("doc_bbox", {"doc_id": d})
@@ -1747,18 +2100,23 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         view_spec, cam_opts = _split_view(view)
 
         internal = bool(matches) and _target_is_internal(matches, part_bb)
-        section = None
+        section = sec
         if view_spec is None or (isinstance(view_spec, str) and view_spec.lower() == "auto"):
-            view_dir, view_label, defect, section = _auto_view(
-                d, resolved, matches, target_bb, part_bb, point)
-            clip = bool(cutaway)
-            if cutaway is not None:
-                section = None
+            if sec is not None:
+                view_dir, view_label, defect, clip = (
+                    _section_cameras(sec)[0], "section", None, False)
+            else:
+                view_dir, view_label, defect, section = _auto_view(
+                    d, resolved, matches, target_bb, part_bb, point)
+                clip = bool(cutaway)
+                if cutaway is not None:
+                    section = None
         else:
-            view_dir, view_label = _camera_dir_for_target(matches, view_spec), (
-                view_spec if isinstance(view_spec, str) else "custom")
-            defect = _attachment_defect(d, resolved)
-            clip = internal if cutaway is None else bool(cutaway)
+            view_dir = _check_views("inspect_part", [view_spec], matches)[0]
+            view_label = view_spec if isinstance(view_spec, str) else "custom"
+            defect = None if sec is not None else _attachment_defect(d, resolved)
+            clip = False if sec is not None else (internal if cutaway is None
+                                                  else bool(cutaway))
 
         label = str(resolved.get("label") or "target")
         png_out, info = _closeup(
@@ -1782,13 +2140,13 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         if clip:
             caption += (" Near-clip CUTAWAY: material between the camera and the target has been"
                         " cut away so you can see into it.")
-        if section:
+        if sec is not None:
+            caption += _section_caption(d, sec, sec_desc, view_dir)
+        elif section:
             caption += (" SECTION through the target: the cut face is hatched and the removed "
-                        "half is drawn as a ghost outline.")
+                        "half is drawn as a ghost outline. Section numbers (same plane as the "
+                        f"image): {_section_numbers(d, section)}.")
         caption += _visibility_note(info)
-        if internal:
-            sec = _auto_section_for_target(d, matches, target_bb)
-            caption += f" Auto-section: {sec.get('summary') or sec.get('plane')}."
         palette = ((info.get("emphasis") or {}).get("palette")) if info else None
         if palette:
             caption += _palette_caption_block(palette)
@@ -1821,10 +2179,23 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
           cutaway for an internal target) — use when you specifically want even angular
           coverage rather than the best views.
 
+        n_views: how many angles, 1 to 8 (default 4). More than 8 is an error, not a clamp —
+        past eight the tiles repeat angles; for broader coverage use inspect_feature or
+        render_views(target=...). Tiles that fail to render are listed in the caption ("N of M
+        close-ups failed"); the call errors if all fail.
+
         Use when render_part's grid leaves the shape ambiguous; check numbers first.
 
         Returns [image, caption]. The caption ranks the angles by measured target visibility.
         """
+        if (isinstance(n_views, bool) or not isinstance(n_views, int)
+                or not 1 <= n_views <= _LOOK_AROUND_MAX_VIEWS):
+            raise ValueError(
+                f"look_around: n_views={n_views!r} is out of range — pass a whole number from 1 "
+                f"to {_LOOK_AROUND_MAX_VIEWS} (default 4). Beyond {_LOOK_AROUND_MAX_VIEWS} the "
+                f"tiles repeat angles; for broader coverage use inspect_feature(target) or "
+                f"render_views(target=..., views=[...]).")
+        target = _normalize_target(target)
         d = _doc(doc_id)
         resolved = _resolve_inspect_target(d, target)
         matches = resolved["matches"]
@@ -1833,7 +2204,7 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         if not part_bb or not part_bb.get("size"):
             raise ValueError("no part bounding box — build geometry first")
 
-        n = max(int(n_views), 1)
+        n = n_views
         label = str(resolved.get("label") or "target")
         plan_target = {"matches": matches, "label": label, "bbox": target_bb,
                        "kind": resolved.get("kind")}
@@ -1850,7 +2221,7 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
             picks = [{"dir": vd, "label": f"orbit {i * step}deg", "section": None}
                      for i, vd in enumerate(_orbit_view_dirs(tuple(base), n=n))]
 
-        tiles, labels, infos, dirs = [], [], [], []
+        tiles, labels, infos, dirs, failures = [], [], [], [], []
         for i, p in enumerate(picks):
             try:
                 png, info = _closeup(
@@ -1859,7 +2230,8 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                     emphasis_mode="emphasis" if emphasize else None,
                     margin=float(margin) / max(float(zoom_factor), 0.25),
                     clip_near=clip, annotate=bool(annotate), section=p.get("section"))
-            except ValueError:
+            except ValueError as e:
+                failures.append((str(p.get("label") or f"view {i + 1}"), str(e)))
                 continue
             vis = ((info or {}).get("emphasis") or {}).get("coverage")
             tiles.append(png)
@@ -1869,7 +2241,7 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
             infos.append(info)
             dirs.append(p["dir"])
         if not tiles:
-            raise ValueError("look_around: every close-up render failed")
+            raise _all_failed("look_around", failures, len(picks), "close-ups")
         out = render_output_path(_render_stem(d, f"{label}-look-around"), ".png")
         _tile_pngs_grid(tiles, out, labels=labels, cols=2 if len(tiles) > 1 else 1)
         best = max(range(len(infos)),
@@ -1881,6 +2253,7 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
             + _inspect_caption(d, resolved, target_bb, dirs[best],
                                method="focus", n_matches=len(matches))
         )
+        caption += _failed_note(failures, len(picks), "close-ups")
         return [Image(path=out), caption]
 
 
@@ -1914,6 +2287,10 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
         and the boundary is outlined. `emphasis_mode="per_face"` gives each face its own colour.
         `panels` trims the sheet (1 = hero only, 2 = hero+alt, 3 = +alt2, 4 = +context).
         `view` pins the HERO camera; the planner fills the other panels around it.
+        A panel whose render fails is listed in the caption ("N of M panels failed" with the
+        reason); the call errors only if every panel fails. For a SECTION panel the caption
+        gives the section area computed on the very plane that panel shows. An unknown `view`
+        name is an error that lists the valid ones.
 
         The caption already carries: key dims of the target (area/length/radius), a describe_part
         outline EXCERPT, the emphasis palette metadata, and — per panel — how much of the target
@@ -1923,6 +2300,7 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
 
         Returns [image, caption].
         """
+        target = _normalize_target(target)
         d = _doc(doc_id)
         resolved = _resolve_inspect_target(d, target)
         matches = resolved["matches"]
@@ -1932,12 +2310,11 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
             raise ValueError("no part bounding box — build geometry first")
 
         want = max(1, min(int(panels), 4))
-        internal = _target_is_internal(matches, part_bb)
         label = str(resolved.get("label") or "target")
         mode = emphasis_mode or "emphasis"
 
         hint = None if (view is None or (isinstance(view, str) and view.lower() == "auto")) else view
-        pinned = ([{"dir": list(_camera_dir_for_target(matches, hint)),
+        pinned = ([{"dir": list(_check_views("inspect_feature", [hint], matches)[0]),
                     "label": hint if isinstance(hint, str) else "custom"}]
                   if hint is not None else None)
         plan = _sp.plan_shots(d, target={"matches": matches, "label": label, "bbox": target_bb,
@@ -1945,14 +2322,15 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                               k=min(want, 3), pinned=pinned)
         panels_spec = list(zip(("HERO", "ALT", "ALT2"), plan["views"][:min(want, 3)]))
 
-        tiles, labels, infos = [], [], []
+        tiles, labels, infos, failures, cuts = [], [], [], [], []
         for tag, pick in panels_spec:
             try:
                 png, info = _closeup(
                     d, matches, target_bb, pick["dir"], label=label,
                     stem=_render_stem(d, f"{label}-{tag.lower()}"),
                     emphasis_mode=mode, annotate=bool(annotate), section=pick.get("section"))
-            except ValueError:
+            except ValueError as e:
+                failures.append((tag, str(e)))
                 continue
             cov = ((info or {}).get("emphasis") or {}).get("coverage") or 0.0
             tiles.append(png)
@@ -1960,6 +2338,8 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                           + ("  SECTION" if pick.get("section") else "")
                           + f"  {cov * 100:.1f}% target")
             infos.append(info)
+            if pick.get("section"):
+                cuts.append((tag, pick["section"]))
 
         # CONTEXT: the whole part from the camera that best shows the target within it.
         if want >= 4:
@@ -1978,13 +2358,14 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                 tiles.append(ctx)
                 labels.append(f"CONTEXT  whole part, {label} highlighted")
                 infos.append(ctx_info)
-            except ValueError:
-                pass
+            except ValueError as e:
+                failures.append(("CONTEXT", str(e)))
 
+        total = len(panels_spec) + (1 if want >= 4 else 0)
         if not tiles:
-            raise ValueError(
-                f"inspect_feature: every panel render failed for {label!r} — call "
-                f"render_part(doc_id={d!r}) to check the part renders at all.")
+            err = _all_failed("inspect_feature", failures, total, "panels")
+            raise ValueError(f"{err} Call render_part(doc_id={d!r}) to check the part renders "
+                             f"at all.")
         out = (tiles[0] if len(tiles) == 1 else
                _tile_pngs_grid(tiles,
                                render_output_path(_render_stem(d, f"{label}-inspect"), ".png"),
@@ -1997,9 +2378,12 @@ def register_cad_render_tools(mcp: FastMCP) -> None:
                     + (f" ({plan['model_note']})" if plan.get("model_note") else "") + ".")
         caption += _visibility_note(infos[0] if infos else None)
         caption += f" describe_part excerpt: {_describe_part_excerpt(d)}"
-        if internal:
-            sec = _auto_section_for_target(d, matches, target_bb)
-            caption += f" Auto-section: {sec.get('summary') or sec.get('plane')}."
+        caption += _failed_note(failures, total, "panels")
+        if cuts:
+            # The numbers of the planes the panels actually show — never a different plane.
+            caption += (" Section numbers (same planes as the images): "
+                        + "; ".join(f"{tag}: {_section_numbers(d, sec)}" for tag, sec in cuts)
+                        + ".")
         palette = ((infos[0].get("emphasis") or {}).get("palette")) if infos and infos[0] else None
         caption += _palette_caption_block(palette)
         return [Image(path=out), caption]

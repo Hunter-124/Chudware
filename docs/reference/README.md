@@ -11,35 +11,40 @@ decompiled code. That clean-room framing is preserved in each file below;
 treat it as load-bearing (it is what keeps this material safe to have in the tree
 alongside dependencies with license obligations — see `contracts/licenses.md`).
 
-The **clean-room CAD-format set** — the three files under **Contents** below —
+The **clean-room CAD-format set** — the three files under **Clean-room format reference** below —
 describes the public CAD format landscape and the classic AutoCAD-lineage data
 model, then cross-links to where this repo's *actual* interop surface sits
 today. The public-spec material is background, not a description of Chudware's
 document model; explicitly labelled repo annotations describe the current implementation.
 **Keeping this clean** governs the clean-room format set.
 
-This directory has since also become the home for Chudware's own build,
-packaging, operations and domain references, which `docs/README.md` indexes as
-"build/packaging guides, CAD data-model and file-format references, runbooks".
-Those files do describe Chudware internals; the clean-room rule does not apply
-to them, and they are not part of the clean-room set:
+## Chudware operations and domain references
+
+These files describe Chudware internals; the clean-room sourcing rule does not
+apply to them, and they are not part of the three-file clean-room set.
+
+### Build, release and operations
 
 - **[HOSTD.md](HOSTD.md)** — `chudware-hostd` shared engine daemon operator reference.
 - **[BUILD_WINDOWS.md](BUILD_WINDOWS.md)** — building core, host and the Python runtime
   on Windows.
 - **[PACKAGING_WINDOWS.md](PACKAGING_WINDOWS.md)** — the Windows release/installer
-  pipeline and the manual runtime checklist.
+  pipeline and manual runtime checklist.
 - **[CI.md](CI.md)** — continuous integration: workflows, gates and how to reproduce them
   locally.
+- **[RELEASING.md](RELEASING.md)** — release pipeline and GitHub Releases publishing.
+- **[SIGNING.md](SIGNING.md)** — release signing, platform certificates and notarization.
+
+### Product and domain references
+
 - **[REVENG_DEGRADATION.md](REVENG_DEGRADATION.md)** — Reverse Engineering capability
   matrix and banners from `services/vision/reveng_provision.py`.
 - **[EM_SIMULATION.md](EM_SIMULATION.md)** — full-wave EM simulation family.
-- **[SENSOR_NODE_DEMO.md](SENSOR_NODE_DEMO.md)** — dated (2026-07-10) STM32 sensor-node
-  end-to-end demo record.
-- **[parts_library_data_coverage.md](parts_library_data_coverage.md)** — dated
-  (2026-07-08) Parts Library data-coverage findings.
+- **[SENSOR_NODE_DEMO.md](SENSOR_NODE_DEMO.md)** — STM32 sensor-node end-to-end demo
+  guide, including per-leg PASS/SKIP limitations.
 
-## Contents
+
+## Clean-room format reference
 
 - **[cad-file-formats.md](cad-file-formats.md)** — survey of ~12 CAD/BIM/mesh
   format families (DWG, DXF, DGN, DWF/DWFx, IFC, STEP, IGES, PRC, LandXML,
@@ -83,10 +88,6 @@ referenced — lives here:
   transforms. Imported bodies are baked into `.step+`, remain editable as native import
   features, export normally, and feed Polyhedral-FEA. Parasolid `.x_t`/`.x_b`
   still needs SolidWorks/NX conversion because it has no saved-display lane.
-- **Planned format work** — Parasolid payload extraction, CATIA V5, Inventor and Altium
-  clean-room parsers, and a decision on ODA membership for higher-fidelity DWG/Revit.
-  This directory is meant to give whoever picks up the next format a running start on
-  the public-spec landscape without having to re-derive it.
 - **`contracts/licenses.md`** — the binding, append-only license ledger for every
   dependency this repo actually ships or links against. When a format-support
   library is added for real (not just referenced here), it needs a row there,
@@ -107,6 +108,6 @@ Do not add anything to the three-file clean-room format set that was learned fro
 a proprietary binary, decompiled code, or a vendor SDK's internal (non-public)
 documentation. If a new format needs to be added to this reference set, source it
 the same way the original three files were sourced: the format's own public/ISO/ANSI/ASTM
-specification, or openly published vendor developer docs. This keeps
-`docs/reference/` safe to reference from anywhere in the repo (see the clean-room
+specification, or openly published vendor developer docs. This keeps the
+three-file set safe to reference from anywhere in the repo (see the clean-room
 posture recorded for KiCad and BOLTS in `contracts/licenses.md`).

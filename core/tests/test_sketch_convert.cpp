@@ -165,6 +165,9 @@ TEST_CASE("kernel: in-plane circle stays a circle; perpendicular line collapses 
 
 TEST_CASE("op: sketch_convert projects a face loop as REAL entities and they extrude") {
     const double W = 40.0, D = 30.0, H = 20.0;
+    bool construction = true;
+    SUBCASE("default construction geometry") {}
+    SUBCASE("explicit profile geometry") { construction = false; }
     std::string doc_id = make_box("ConvertOp", W, D, H);
 
     // A second, empty sketch ON the top face (the resolver's own selector).
@@ -181,8 +184,10 @@ TEST_CASE("op: sketch_convert projects a face loop as REAL entities and they ext
     // Convert Entities on the BOTTOM face — an external face, not the sketch's own plane.
     json qb = doc_query(doc_id, json{{"of", "face"}, {"side", "bottom"}});
     REQUIRE(qb.value("count", 0) >= 1);
-    json cv = json::array({json{{"op", "sketch_convert"}, {"sketch", fid},
-        {"refs", json::array({json{{"kind", "face"}, {"selector", qb.at("matches").at(0)}}})}}});
+    json convert{{"op", "sketch_convert"}, {"sketch", fid},
+        {"refs", json::array({json{{"kind", "face"}, {"selector", qb.at("matches").at(0)}}})}};
+    if (!construction) convert["construction"] = false;
+    json cv = json::array({convert});
     json cr = doc_apply_ops(doc_id, -1, cv, false);
 
     // Contract: $0 = first new entity, $0#1.. = the rest (4 lines for a rectangular loop).
@@ -194,20 +199,23 @@ TEST_CASE("op: sketch_convert projects a face loop as REAL entities and they ext
         new_ids.push_back(idm.at("$0#" + std::to_string(k)).get<std::string>());
     CHECK(new_ids.size() == 4);
 
-    // The converted entities live in the sketch as REAL geometry (construction:false —
-    // SolidWorks Convert Entities parity; the old GUI click produced NOTHING).
+    // Projection is construction by default; explicit false creates a profile.
     json enter = doc_sketch_enter(doc_id, fid);
     REQUIRE(enter.contains("entities"));
     int real_converted = 0;
     for (const auto& e : enter["entities"]) {
         for (const auto& id : new_ids)
             if (e.value("id", std::string()) == id) {
-                CHECK_FALSE(e.value("construction", true));
+                CHECK(e.value("construction", false) == construction);
                 ++real_converted;
             }
     }
     CHECK(real_converted == 4);
     chudware::doc::doc_sketch_exit(doc_id, fid);
+    if (construction) {
+        chudware::doc::doc_close(doc_id);
+        return;
+    }
 
     // And they are a usable profile: extrude the converted loop (region centroid at the
     // face-frame origin (0,0) — the top face's centroid frame).
@@ -255,6 +263,7 @@ TEST_CASE("assoc: converted entities re-project (stable ids) when the source mov
     json qb = doc_query(doc_id, json{{"of", "face"}, {"side", "bottom"}});
     REQUIRE(qb.value("count", 0) >= 1);
     json cv = json::array({json{{"op", "sketch_convert"}, {"sketch", fid},
+        {"construction", false},
         {"refs", json::array({json{{"kind", "face"}, {"selector", qb.at("matches").at(0)}}})}}});
     json cr = doc_apply_ops(doc_id, -1, cv, false);
 
@@ -416,6 +425,7 @@ TEST_CASE("assoc: undo/redo across a re-projection restores both states") {
     json qb = doc_query(doc_id, json{{"of", "face"}, {"side", "bottom"}});
     REQUIRE(qb.value("count", 0) >= 1);
     json cv = json::array({json{{"op", "sketch_convert"}, {"sketch", fid},
+        {"construction", false},
         {"refs", json::array({json{{"kind", "face"}, {"selector", qb.at("matches").at(0)}}})}}});
     doc_apply_ops(doc_id, -1, cv, false);
 
@@ -733,6 +743,8 @@ TEST_CASE("profile: a centroid pick whose region disappears after an edit fails 
         REQUIRE_MESSAGE(st.value("ok", false), "two-rect boss failed: " << st.dump());
     CHECK(built.value("volume", 0.0) == doctest::Approx(2 * 10.0 * 10.0 * 5.0).epsilon(1e-6));
     const std::string sk = built.at("id_map").at("$0").get<std::string>();
+    const std::string boss_id = built.at("id_map").at("$1").get<std::string>();
+    const json original_boss = feature_of(built.at("tree"), boss_id);
     const long rev = built.at("revision").get<long>();
 
     // Open the second rectangle. Before the fix the [25,5] pick snapped onto the first
@@ -740,18 +752,25 @@ TEST_CASE("profile: a centroid pick whose region disappears after an edit fails 
     json rr = doc_apply_ops(doc_id, -1, json::array({json{{"op", "sketch_delete_entity"},
                                                           {"sketch", sk}, {"id", "e8"}}}),
                             false);
-    const json& rows = rr.at("rebuild").at("feature_status");
-    const json& boss = rows.back();
-    const std::string err = boss.value("error", json(nullptr)).is_string()
-                                ? boss["error"].get<std::string>() : std::string();
+    REQUIRE_FALSE(rr.contains("rejected_tree"));
+    REQUIRE(rr.contains("auto_rollback"));
+    REQUIRE(rr["auto_rollback"]["broken"].size() == 1);
+    const json& boss = rr["auto_rollback"]["broken"][0];
+    const std::string err = boss.at("error").get<std::string>();
     MESSAGE("lost region -> " << err);
-    REQUIRE_MESSAGE(!boss.value("ok", true), "a lost region must fail the feature, not shrink it");
+    CHECK(boss.at("id") == boss_id);
+    CHECK(boss.at("name") == "Boss");
+    CHECK(boss.at("type") == "extrude");
     CHECK(err.find("profile[1]") != std::string::npos);
     CHECK(err.find("outside") != std::string::npos);
     CHECK(err.find("1 material region") != std::string::npos);
-    // The batch rolled back: same revision, e8 still in the sketch.
-    CHECK(rr.at("revision").get<long>() == rev);
-    CHECK(!entity_of(feature_of(rr.at("tree"), sk), "e8").is_null());
+    CHECK(rr.at("revision").get<long>() == rev + 1);
+    CHECK(rr["tree"]["rollback_after"] == sk);
+    CHECK(rr["auto_rollback"]["after"] == sk);
+    CHECK(rr["auto_rollback"]["hidden_features"] == json::array({boss_id}));
+    CHECK(entity_of(feature_of(rr.at("tree"), sk), "e8").is_null());
+    CHECK(feature_of(rr.at("tree"), boss_id) == original_boss);
+    CHECK(rr["rebuild"]["feature_status"].back()["rolled_back"] == true);
 }
 
 TEST_CASE("profile: two centroid picks that land on ONE region refuse (regions merged)") {
@@ -783,6 +802,34 @@ json convert_one(const std::string& doc, const std::string& sketch, const json& 
     return doc_apply_ops(doc, -1, json::array({
         json{{"op", "sketch_convert"}, {"sketch", sketch}, {"refs", json::array({ref})}}}), false);
 }
+}
+
+TEST_CASE("assoc: owner-attributed edge follows a source edit") {
+    const std::string doc = make_box("EdgeOwnerReference", 40, 30, 20);
+    const std::string sketch = add_projection_sketch(doc, 50);
+    const json query = doc_query(doc, {{"of", "edge"}, {"near", {40, 15, 20}}, {"count", 1}});
+    REQUIRE(query.at("count").get<int>() == 1);
+    const json selector = query.at("matches").front();
+    REQUIRE(selector.at("owner_feature") == "f2");
+    const json converted = convert_one(doc, sketch, {{"kind", "edge"}, {"selector", selector}});
+    const std::string eid = converted.at("id_map").at("$0");
+    const json edited = doc_apply_ops(doc, -1, json::array({
+        json{{"op", "sketch_edit_entity"}, {"sketch", "f1"}, {"id", "e1"},
+             {"params", {{"p2", {60, 0}}}}},
+        json{{"op", "sketch_edit_entity"}, {"sketch", "f1"}, {"id", "e2"},
+             {"params", {{"p1", {60, 0}}, {"p2", {60, 30}}}}},
+        json{{"op", "sketch_edit_entity"}, {"sketch", "f1"}, {"id", "e3"},
+             {"params", {{"p1", {60, 30}}}}}
+    }), false);
+    const json feature = feature_of(edited.at("tree"), sketch);
+    const json& ref = feature.at("params").at("external_refs").front();
+    CHECK_FALSE(ref.at("stale").get<bool>());
+    REQUIRE(ref.at("entity_ids").front() == eid);
+    const json edge = entity_of(feature, eid);
+    REQUIRE(edge.at("type") == "line");
+    CHECK(edge.at("p1").at(0).get<double>() == doctest::Approx(60));
+    CHECK(edge.at("p2").at(0).get<double>() == doctest::Approx(60));
+    chudware::doc::doc_close(doc);
 }
 
 TEST_CASE("convert: model vertex becomes an associative projected point") {
@@ -926,6 +973,24 @@ TEST_CASE("convert: another sketch entity is world lifted and re-resolved after 
     chudware::doc::doc_close(doc);
 }
 
+TEST_CASE("fully define op: missing or invalid sketch returns invalid_op") {
+    const std::string doc = doc_new("part", "FullyDefineMissingSketch").at("doc_id");
+    for (const json& op : {json{{"op", "sketch_fully_define"}},
+                           json{{"op", "sketch_fully_define"}, {"sketch", 42}},
+                           json{{"op", "sketch_fully_define"}, {"sketch", ""}}}) {
+        bool caught = false;
+        try {
+            doc_apply_ops(doc, -1, json::array({op}), false);
+        } catch (const chudware::doc::OpError& error) {
+            caught = true;
+            CHECK(error.code == "invalid_op");
+            CHECK(error.detail.at("index") == 0);
+        }
+        CHECK(caught);
+    }
+    chudware::doc::doc_close(doc);
+}
+
 TEST_CASE("fully define op: same-batch rectangle receives design-intent constraints and DOF zero") {
     const std::string doc = doc_new("part", "FullyDefineRectangle").at("doc_id");
     const json result = doc_apply_ops(doc, -1, json::array({
@@ -962,14 +1027,264 @@ TEST_CASE("composites: polygon and polyline retain connected editable design int
              {"entity", {{"type", "polyline"}, {"points", {{30, 0}, {40, 0}, {40, 10}}}}}}
     }), false);
     const json params = feature_of(result.at("tree"), sketch).at("params");
-    int coincident = 0, equal = 0;
+    int coincident = 0, equal = 0, on_circle = 0;
     for (const json& constraint : params.at("constraints")) {
         coincident += constraint.at("type") == "coincident";
         equal += constraint.at("type") == "equal";
+        on_circle += constraint.at("type") == "point_on";
     }
-    CHECK(params.at("entities").size() == 7);
+    CHECK(params.at("entities").size() == 8);
     CHECK(coincident == 6);
     CHECK(equal == 4);
+    CHECK(on_circle == 5);
+    int construction_circles = 0;
+    for (const json& e : params.at("entities"))
+        if (e.at("type") == "circle" && e.value("construction", false)) ++construction_circles;
+    CHECK(construction_circles == 1);
     CHECK(chudware::doc::doc_sketch_health(doc, sketch).at("skipped_constraints").empty());
+    const std::string first = result.at("id_map").at("$0");
+    doc_apply_ops(doc, -1, json::array({
+        {{"op", "sketch_add_constraint"}, {"sketch", sketch},
+         {"constraint", {{"type", "length"}, {"refs", {first}}, {"value", dimv(8.0)}}}}
+    }), false);
+    const json overview = chudware::doc::doc_sketch_overview(doc, sketch);
+    const auto find_solved = [&](const std::string& id) -> json {
+        for (const json& e : overview.at("entities"))
+            if (e.value("id", std::string()) == id) return e;
+        return nullptr;
+    };
+    const json circle = find_solved(result.at("id_map").at("$0#5").get<std::string>());
+    REQUIRE(circle.is_object());
+    const double radius = circle.at("radius").get<double>();
+    for (int i = 0; i < 5; ++i) {
+        const std::string key = i == 0 ? "$0" : "$0#" + std::to_string(i);
+        const json edge = find_solved(result.at("id_map").at(key).get<std::string>());
+        REQUIRE(edge.is_object());
+        const auto& a = edge.at("p1");
+        const auto& b = edge.at("p2");
+        CHECK(std::hypot(a[0].get<double>() - b[0].get<double>(),
+                         a[1].get<double>() - b[1].get<double>()) == doctest::Approx(8.0).epsilon(1e-6));
+        CHECK(std::hypot(a[0].get<double>() - circle.at("center")[0].get<double>(),
+                         a[1].get<double>() - circle.at("center")[1].get<double>()) ==
+              doctest::Approx(radius).epsilon(1e-6));
+    }
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("composites: polygon rejects conflicting size keys") {
+    const std::string doc = doc_new("part", "PolygonSizeConflict").at("doc_id");
+    const std::string sketch = add_projection_sketch(doc);
+    const json op{{"op", "sketch_add_entity"}, {"sketch", sketch},
+                  {"entity", {{"type", "polygon"}, {"sides", 6},
+                              {"radius", 10}, {"across_flats", 15}}}};
+    CHECK_THROWS_AS(doc_apply_ops(doc, -1, json::array({op}), false), chudware::doc::OpError);
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("soft auto constraints yield to explicit dimensions and retain unrelated ids") {
+    const std::string doc = doc_new("part", "SoftAutoRectangle").at("doc_id");
+    chudware::doc::doc_set_meta(doc, "sketch.auto_coincident", false);
+    const json created = doc_apply_ops(doc, -1, json::array({
+        json{{"op", "add_feature"}, {"feature", {{"type", "sketch"},
+            {"params", {{"entities", rect_entities(40, 30)}, {"constraints", json::array()}}},
+            {"refs", {{"plane", "plane.top"}}}}}},
+        json{{"op", "sketch_fully_define"}, {"sketch", "$0"}}}), false);
+    const std::string sketch = created.at("id_map").at("$0");
+    const auto before = feature_of(created.at("tree"), sketch).at("params").at("constraints");
+    std::string old_width, height;
+    for (const auto& c : before) {
+        CHECK(c.value("auto", false));
+        if (c.contains("value") && c.at("refs") == json::array({"e1"})) old_width = c.at("id");
+        if (c.contains("value") && c.at("refs") == json::array({"e2"})) height = c.at("id");
+    }
+    REQUIRE_FALSE(old_width.empty());
+    REQUIRE_FALSE(height.empty());
+    const json width = {{"type", "length"}, {"refs", {"e1"}}, {"value", dimv(50)}};
+    doc_sketch_enter(doc, sketch);
+    const auto probe = chudware::doc::doc_sketch_probe(doc, sketch, {{"add_constraint", width}});
+    CHECK_MESSAGE(!probe.at("would_over_define").get<bool>(), probe.dump());
+    const auto changed = doc_apply_ops(doc, -1, json::array({
+        json{{"op", "sketch_add_constraint"}, {"sketch", sketch}, {"constraint", width}}}), false);
+    const std::string explicit_id = changed.at("id_map").at("$0");
+    const auto after = feature_of(changed.at("tree"), sketch).at("params").at("constraints");
+    bool found_height = false, found_explicit = false;
+    for (const auto& c : after) {
+        CHECK(c.at("id") != old_width);
+        if (c.at("id") == height) { found_height = true; CHECK(c.value("auto", false)); }
+        if (c.at("id") == explicit_id) { found_explicit = true; CHECK_FALSE(c.contains("auto")); }
+    }
+    CHECK(found_height);
+    CHECK(found_explicit);
+    const auto health = chudware::doc::doc_sketch_health(doc, sketch);
+    CHECK_MESSAGE(health.at("status") == "full", health.dump());
+    CHECK(health.at("dof") == 0);
+    CHECK(health.at("converged").get<bool>());
+    CHECK(health.at("conflicting").empty());
+    CHECK(health.at("redundant").empty());
+    const auto duplicate = chudware::doc::doc_sketch_probe(doc, sketch, {{"add_constraint", width}});
+    CHECK_MESSAGE(duplicate.at("would_over_define").get<bool>(), duplicate.dump());
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("auto dimension editing promotes intent but label movement and deletion do not refill") {
+    const std::string doc = doc_new("part", "PromoteAutoDimension").at("doc_id");
+    const auto created = doc_apply_ops(doc, -1, json::array({
+        json{{"op", "add_feature"}, {"feature", {{"type", "sketch"},
+            {"params", {{"entities", rect_entities(40, 30)}, {"constraints", json::array()}}},
+            {"refs", {{"plane", "plane.top"}}}}}},
+        json{{"op", "sketch_fully_define"}, {"sketch", "$0"}}}), false);
+    const std::string sketch = created.at("id_map").at("$0");
+    std::string cid, auto_height;
+    const auto initial_constraints = feature_of(created.at("tree"), sketch).at("params").at("constraints");
+    for (const auto& c : initial_constraints) {
+        if (c.contains("value") && c.at("refs") == json::array({"e1"})) cid = c.at("id");
+        if (c.contains("value") && c.at("refs") == json::array({"e2"})) auto_height = c.at("id");
+    }
+    REQUIRE_FALSE(cid.empty());
+    REQUIRE_FALSE(auto_height.empty());
+    auto moved = doc_apply_ops(doc, -1, json::array({
+        json{{"op", "sketch_set_dim"}, {"sketch", sketch}, {"id", cid}, {"placement", {20, -8}}}}), false);
+    const auto moved_constraints = feature_of(moved.at("tree"), sketch).at("params").at("constraints");
+    for (const auto& c : moved_constraints)
+        if (c.at("id") == cid) CHECK(c.value("auto", false));
+    auto edited = doc_apply_ops(doc, -1, json::array({
+        json{{"op", "eq_set"}, {"name", "Width"}, {"expr", "50"}},
+        json{{"op", "sketch_set_dim"}, {"sketch", sketch}, {"id", cid}, {"expr", "Width"}}}), false);
+    const auto edited_constraints = feature_of(edited.at("tree"), sketch).at("params").at("constraints");
+    for (const auto& c : edited_constraints)
+        if (c.at("id") == cid) CHECK_FALSE(c.contains("auto"));
+    CHECK(chudware::doc::doc_sketch_health(doc, sketch).at("status") == "full");
+    doc_apply_ops(doc, -1, json::array({
+        json{{"op", "sketch_delete_constraint"}, {"sketch", sketch}, {"id", auto_height}}}), false);
+    CHECK(chudware::doc::doc_sketch_health(doc, sketch).at("dof").get<int>() > 0);
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("explicit relation still conflicts with an explicit angle dimension") {
+    const std::string doc = doc_new("part", "ExplicitAngleConflict").at("doc_id");
+    const auto created = doc_apply_ops(doc, -1, json::array({
+        json{{"op", "add_feature"}, {"feature", {{"type", "sketch"},
+            {"params", {{"entities", json::array({line("e1", 0, 0, 40, 40)})},
+                        {"constraints", json::array({json{{"id", "c1"}, {"type", "angle"},
+                            {"refs", {"e1", "axis.h"}}, {"value", dimv(45)}}})}}},
+            {"refs", {{"plane", "plane.top"}}}}}},
+        json{{"op", "sketch_fully_define"}, {"sketch", "$0"}}}), false);
+    const std::string sketch = created.at("id_map").at("$0");
+    doc_sketch_enter(doc, sketch);
+    const auto probe = chudware::doc::doc_sketch_probe(doc, sketch,
+        {{"add_constraint", {{"type", "horizontal"}, {"refs", {"e1"}}}}});
+    CHECK_MESSAGE(probe.at("would_over_define").get<bool>(), probe.dump());
+    CHECK(probe.at("status") == "over");
+    const auto rejected = doc_apply_ops(doc, -1, json::array({
+        json{{"op", "sketch_add_constraint"}, {"sketch", sketch},
+             {"constraint", {{"type", "horizontal"}, {"refs", {"e1"}}}}}}), false);
+    bool failed = false;
+    for (const auto& status : rejected.at("rebuild").at("feature_status"))
+        failed |= !status.value("ok", true);
+    CHECK_MESSAGE(failed, rejected.dump());
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("bulk sketch constraints supersede auto dimensions without losing unrelated intent") {
+    const std::string doc = doc_new("part", "BulkSoftConstraints").at("doc_id");
+    const auto created = doc_apply_ops(doc, -1, json::array({
+        json{{"op", "add_feature"}, {"feature", {{"type", "sketch"},
+            {"params", {{"entities", json::array({
+                json{{"id", "e1"}, {"type", "circle"}, {"center", {0, 0}}, {"radius", 10}},
+                json{{"id", "e2"}, {"type", "circle"}, {"center", {40, 0}}, {"radius", 5}}
+            })}, {"constraints", json::array()}}},
+            {"refs", {{"plane", "plane.top"}}}}}},
+        json{{"op", "sketch_fully_define"}, {"sketch", "$0"}}}), false);
+    const std::string sketch = created.at("id_map").at("$0");
+    const json before = feature_of(created.at("tree"), sketch).at("params").at("constraints");
+    std::string old_radius, unrelated;
+    for (const auto& c : before) {
+        if (c.contains("value") && c.at("refs") == json::array({"e1"})) old_radius = c.at("id");
+        if (c.contains("value") && c.at("refs") == json::array({"e2"})) unrelated = c.at("id");
+    }
+    REQUIRE_FALSE(old_radius.empty());
+    REQUIRE_FALSE(unrelated.empty());
+    json bulk = before;
+    bulk.push_back({{"id", "c100"}, {"type", "radius"}, {"refs", {"e1"}}, {"value", dimv(20)}});
+    const auto edited = doc_apply_ops(doc, -1, json::array({
+        json{{"op", "edit_feature"}, {"id", sketch}, {"params", {{"constraints", bulk}}}}
+    }), false);
+    const json after = feature_of(edited.at("tree"), sketch).at("params").at("constraints");
+    bool found_explicit = false, found_unrelated = false;
+    for (const auto& c : after) {
+        CHECK(c.at("id") != old_radius);
+        if (c.at("id") == "c100") { found_explicit = true; CHECK_FALSE(c.value("auto", false)); }
+        if (c.at("id") == unrelated) { found_unrelated = true; CHECK(c.value("auto", false)); }
+    }
+    CHECK(found_explicit);
+    CHECK(found_unrelated);
+    const auto health = chudware::doc::doc_sketch_health(doc, sketch);
+    CHECK_MESSAGE(health.at("converged").get<bool>(), health.dump());
+    CHECK(health.at("conflicting").empty());
+    const auto undone = chudware::doc::doc_undo(doc);
+    CHECK(feature_of(undone.at("tree"), sketch).at("params").at("constraints") == before);
+    const auto redone = chudware::doc::doc_redo(doc);
+    CHECK(feature_of(redone.at("tree"), sketch).at("params").at("constraints") == after);
+
+    // Annotation movement and deletion are not new geometric intent and must
+    // not replace, refill, or renumber constraints.
+    json annotation = after;
+    for (auto& c : annotation)
+        if (c.at("id") == "c100") c["placement"] = {12, -7};
+    const auto moved = doc_apply_ops(doc, -1, json::array({
+        json{{"op", "edit_feature"}, {"id", sketch}, {"params", {{"constraints", annotation}}}}
+    }), false);
+    CHECK(feature_of(moved.at("tree"), sketch).at("params").at("constraints") == annotation);
+    json deleted = json::array();
+    for (const auto& c : annotation)
+        if (c.at("id") != unrelated) deleted.push_back(c);
+    const auto removed = doc_apply_ops(doc, -1, json::array({
+        json{{"op", "edit_feature"}, {"id", sketch}, {"params", {{"constraints", deleted}}}}
+    }), false);
+    CHECK(feature_of(removed.at("tree"), sketch).at("params").at("constraints") == deleted);
+    CHECK(feature_of(chudware::doc::doc_undo(doc).at("tree"), sketch)
+              .at("params").at("constraints") == annotation);
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("bulk edits promote auto dimensions and change existing explicit intent") {
+    const std::string doc = doc_new("part", "BulkPromote").at("doc_id");
+    const auto created = doc_apply_ops(doc, -1, json::array({
+        json{{"op", "add_feature"}, {"feature", {{"type", "sketch"},
+            {"params", {{"entities", rect_entities(40, 30)}, {"constraints", json::array()}}},
+            {"refs", {{"plane", "plane.top"}}}}}},
+        json{{"op", "sketch_fully_define"}, {"sketch", "$0"}}}), false);
+    const std::string sketch = created.at("id_map").at("$0");
+    const json original = feature_of(created.at("tree"), sketch).at("params").at("constraints");
+    json promoted = original;
+    std::string id, unrelated;
+    for (auto& c : promoted) {
+        if (c.contains("value") && c.at("refs") == json::array({"e1"})) {
+            id = c.at("id");
+            c.erase("auto");
+            c["value"] = dimv(50);
+        }
+        if (c.contains("value") && c.at("refs") == json::array({"e2"})) unrelated = c.at("id");
+    }
+    REQUIRE_FALSE(id.empty());
+    REQUIRE_FALSE(unrelated.empty());
+    auto apply = [&](const json& constraints) {
+        return doc_apply_ops(doc, -1, json::array({
+            json{{"op", "edit_feature"}, {"id", sketch}, {"params", {{"constraints", constraints}}}}
+        }), false);
+    };
+    const json first = feature_of(apply(promoted).at("tree"), sketch).at("params").at("constraints");
+    bool found = false;
+    for (const auto& c : first) if (c.at("id") == unrelated) found = true;
+    CHECK(found);
+    CHECK(chudware::doc::doc_sketch_health(doc, sketch).at("conflicting").empty());
+    json changed = first;
+    for (auto& c : changed) if (c.at("id") == id) c["value"] = dimv(60);
+    const json second = feature_of(apply(changed).at("tree"), sketch).at("params").at("constraints");
+    CHECK(chudware::doc::doc_sketch_health(doc, sketch).at("conflicting").empty());
+    CHECK(feature_of(chudware::doc::doc_undo(doc).at("tree"), sketch)
+              .at("params").at("constraints") == first);
+    CHECK(feature_of(chudware::doc::doc_redo(doc).at("tree"), sketch)
+              .at("params").at("constraints") == second);
     chudware::doc::doc_close(doc);
 }

@@ -32,8 +32,8 @@
    ],
    "run_id": "mission-run-18d931da796cdaa2",
    "session_id": "smoke6axis4",
-   "chudcode_session_id": "01a0e323-7046-7000-be0a-3d053c09b913",
-   "chudcode_session_file": "/tmp/av/sessions/2026-09-27T13-52-25-670Z_01a0e323-7046-7000-be0a-3d053c09b913.jsonl",
+   "omp_session_id": "01a0e323-7046-7000-be0a-3d053c09b913",
+   "omp_session_file": "/tmp/av/sessions/2026-09-27T13-52-25-670Z_01a0e323-7046-7000-be0a-3d053c09b913.jsonl",
    "terminal": {
     "type": "agent_end",
     "isTerminal": true

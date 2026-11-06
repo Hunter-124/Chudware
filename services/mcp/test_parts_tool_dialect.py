@@ -41,12 +41,16 @@ WIDENED_TOOLS = (
 
 def _dispatch(tool: str, /, **kwargs):
     """Exactly what the built-in agent does. Returns (payload, reconciler_error)."""
+    if tool == "part_search":
+        kwargs.setdefault("previews", False)
     fn = at._bind_tool(tool)
     assert fn is not None, f"{tool} does not resolve in the MCP registry"
     bound, _notes, err = at._reconcile_kwargs(tool, fn, kwargs)
     if err is not None:
         return None, str(err.get("error", ""))
     out = fn(**bound)
+    if tool == "part_search" and isinstance(out, list):
+        out = out[-1]
     return (json.loads(out) if isinstance(out, str) else out), None
 
 
@@ -252,17 +256,12 @@ def test_malformed_doc_json_quotes_the_error_and_shows_an_example():
     assert "json.dumps(doc)" in out["hint"]
 
 
-def test_doc_id_string_is_ignored_for_a_part_that_makes_its_own_doc(placed):
-    """Recorded failure: doc="doc-cpp0000000d" -> "doc argument is not valid JSON."
-
-    A mechanical placement CREATES its document, so a doc id there is harmless —
-    but it must be reported, never swallowed.
-    """
-    out = _call("part_place", part_id=M8, doc="doc-cpp0000000d", params="{}")
-    assert out["ok"] is True
-    assert placed["params"]["doc"] is None
-    note = _notes(out)
-    assert "doc-cpp0000000d" in note and "core_family" in note
+@pytest.mark.parametrize("target", ["doc", "doc_id", "document_id", "target_doc_id", "assembly_id"])
+def test_existing_document_id_is_rejected_for_mechanical_placement(placed, target):
+    out = _call("part_place", part_id=M8, **{target: "doc-cpp0000000d"})
+    assert out["ok"] is False
+    assert "target document" in out["reason"].lower()
+    assert not placed
 
 
 def test_flat_placement_kwargs_fold_into_params(placed):
@@ -376,7 +375,7 @@ def test_cam_tool_import_accepts_tool_id_spellings():
 
 def test_import_artifact_accepts_file_path_spellings(tmp_path):
     step = tmp_path / "part.step"
-    step.write_text("ISO-10303-21;\n")
+    step.write_text("ISO-10303-21;\nHEADER;\nENDSEC;\n")
     out = _call("import_artifact", file_path=str(step))
     reason = str(out.get("reason", ""))
     # The alias resolved to a real, existing path: neither the "no place for"
@@ -469,6 +468,8 @@ def test_canonical_calls_still_work_through_fastmcp(monkeypatch):
     mgr = _fastmcp_tools()
 
     search = asyncio.run(mgr.get_tool("part_search").run({"query": "M8 socket head"}))
+    from mcp.server.fastmcp import Image
+    assert any(isinstance(block, Image) for block in search)
     assert json.loads(_text(search))["ok"] is True
 
     import services.mcp.core_bridge as bridge
@@ -485,5 +486,7 @@ def _text(result) -> str:
     if isinstance(result, tuple):
         result = result[0]
     if isinstance(result, list) and result:
-        return getattr(result[0], "text", str(result[0]))
+        return next(block if isinstance(block, str) else block.text
+                    for block in result
+                    if isinstance(block, str) or getattr(block, "type", None) == "text")
     return result if isinstance(result, str) else str(result)

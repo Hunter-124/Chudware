@@ -18,6 +18,7 @@
 
 #include "doc/document.h"
 #include "doc/native_policy.h"
+#include "doc/scad.h"
 
 #include <algorithm>
 #include <array>
@@ -47,6 +48,7 @@
 #include <BRep_Tool.hxx>
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepAdaptor_Surface.hxx>
+#include <BRepBuilderAPI_Copy.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
@@ -67,6 +69,7 @@
 #include <BRepExtrema_DistShapeShape.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>  // thread draft-preview band tool
+#include <BRepPrimAPI_MakePrism.hxx>
 #include <BRepAlgoAPI_Cut.hxx>           // thread draft-preview band boolean
 #include <BRepAlgoAPI_Fuse.hxx>
 #include <BRepTools.hxx>
@@ -258,6 +261,7 @@ public:
     std::size_t count(const std::string& id) const { return m_.count(id); }
     FeatureResultPtr& at(const std::string& id) { return m_.at(id); }
     const FeatureResultPtr& at(const std::string& id) const { return m_.at(id); }
+    void erase(const std::string& id) { m_.erase(id); }
     void clear() { m_.clear(); }
     std::size_t size() const { return m_.size(); }
 
@@ -318,6 +322,22 @@ static uint64_t cc_fnv1a(const std::string& s, uint64_t seed = 14695981039346656
     return h;
 }
 
+// `fillet_effective` is persisted derived output, not a feature input. Use the
+// same canonical hash for both prefix and suffix dependencies, so a refresh of
+// that record cannot invalidate geometry checkpoints.
+uint64_t cc_hash_feature(const json& feature, uint64_t seed) {
+    auto data = feature.is_object() ? feature.find("data") : feature.end();
+    if (feature.is_object() && feature.value("type", std::string()) == "fillet" &&
+        data != feature.end() && data->is_object() &&
+        (data->empty() || data->contains("fillet_effective"))) {
+        json input = feature;
+        input["data"].erase("fillet_effective");
+        if (input["data"].empty()) input.erase("data");
+        return cc_fnv1a(input.dump(), seed);
+    }
+    return cc_fnv1a(feature.dump(), seed);
+}
+
 // Above this many features we skip checkpointing (memory guard; a doc this deep is
 // far outside every real workload — the cache degrades to the old full rebuild).
 constexpr std::size_t kCompileCacheMaxFeatures = 1024;
@@ -325,7 +345,7 @@ constexpr std::size_t kCompileCacheMaxFeatures = 1024;
 // The compile-input chain (see CompileCache): h0 folds env, active configuration,
 // display tier and compile mode; h[i+1] folds feature i's json into h[i]. Shared by
 // compile_document and the persisted-cache codec so both key checkpoints identically.
-std::vector<uint64_t> cc_chain(const json& features, const json& env_json,
+std::vector<uint64_t> cc_chain(const json& doc, const json& features, const json& env_json,
                                const std::string& active_configuration,
                                ::geom::DisplayQuality quality, bool with_display,
                                bool with_owners) {
@@ -341,18 +361,53 @@ std::vector<uint64_t> cc_chain(const json& features, const json& env_json,
     h = cc_fnv1a(with_display ? "display" : "component_geometry", h);
     if (with_owners) h = cc_fnv1a("owners", h);
     chain.push_back(h);
-    for (std::size_t i = 0; i < n; ++i)
-        chain.push_back(cc_fnv1a(features[i].dump(), chain.back()));
+    std::optional<std::string> scad_identity;
+    // Only refine depends on later topology references and document-level finishes.
+    // Keep the old keys byte-for-byte for documents without refine, so their saved
+    // checkpoints still restore. A suffix edit invalidates refine and its successors.
+    const bool has_refine = std::any_of(features.begin(), features.end(), [](const json& f) {
+        return f.is_object() && f.value("type", std::string()) == "refine";
+    });
+    std::vector<uint64_t> suffix;
+    uint64_t refine_doc_key = 0;
+    if (has_refine) {
+        suffix.resize(n + 1, 1469598103934665603ULL);
+        for (std::size_t i = n; i > 0; --i)
+            suffix[i - 1] = cc_hash_feature(features[i - 1], suffix[i]);
+        refine_doc_key = 1469598103934665603ULL;
+        for (auto it = doc.begin(); it != doc.end(); ++it) {
+            if (it.key() == "features" || it.key() == "mesh_references") continue;
+            refine_doc_key = cc_fnv1a(it.key(), refine_doc_key);
+            refine_doc_key = cc_fnv1a(it.value().dump(), refine_doc_key);
+        }
+    }
+    for (std::size_t i = 0; i < n; ++i) {
+        const json& feature = features[i];
+        uint64_t next = cc_hash_feature(feature, chain.back());
+        if (features[i].is_object() && features[i].value("type", std::string()) == "scad" &&
+            !features[i].value("suppressed", false)) {
+            if (!scad_identity) scad_identity = scad::cache_identity();
+            next = cc_fnv1a(*scad_identity, next);
+        }
+        if (feature.is_object() && feature.value("type", std::string()) == "refine") {
+            next = cc_fnv1a(std::to_string(suffix[i + 1]), next);
+            next = cc_fnv1a(std::to_string(refine_doc_key), next);
+        }
+        chain.push_back(next);
+    }
     return chain;
 }
 
 // Full-result key: the chain tail folded with the doc's body + face appearances (they
 // bake into the post-loop AICM colors only).
 uint64_t cc_full_key(const json& doc, uint64_t chain_tail) {
-    return cc_fnv1a(
+    uint64_t key = cc_fnv1a(
         doc.contains("appearances") ? doc["appearances"].dump() : std::string(),
         cc_fnv1a(doc.contains("face_appearances") ? doc["face_appearances"].dump() : std::string(),
                  chain_tail));
+    if (doc.contains("rollback_after") && !doc["rollback_after"].is_null())
+        key = cc_fnv1a(doc["rollback_after"].dump(), key);
+    return key;
 }
 
 std::atomic<uint64_t> g_cc_stamp{0};
@@ -379,6 +434,10 @@ static std::atomic<uint64_t> g_cc_bodies_tessellated{0};
 struct CachedBody {
     aicm::AicmBody body;  // body_id is a placeholder; the reuse site re-stamps it
     BodyInfo info;        // name is re-stamped to the reusing feature's id
+    // A restored checkpoint can reuse its already-encoded AICM directly. The
+    // slices refer to last_result's immutable bytes, not a second 100 MB mesh.
+    std::shared_ptr<const CompileResult> encoded;
+    std::size_t begin = 0, body_end = 0, name_end = 0, appearance = 0, end = 0;
 };
 
 struct CompileCache {
@@ -393,9 +452,8 @@ struct CompileCache {
     std::shared_ptr<const CompileResult> last_result;
     uint64_t full_key = 0;
     // Per-body tessellation+stats cache. Key = (TShape*, is_surface, appearance hash).
-    // Only bodies at an IDENTITY top-level location are cached (the part-compile path;
-    // located assembly instances are recomputed). Replaced wholesale each compile with
-    // the set that survived, so a discarded body's mesh is freed.
+    // Only identity-location, forward-oriented bodies are cached. Entries are
+    // replaced with the surviving bodies after each compile.
     std::map<std::tuple<const void*, bool, uint64_t>,
              std::shared_ptr<const CachedBody>> body_cache;
     // Process-unique contents stamp (compile_cache_stamp): renewed on every commit and
@@ -1190,14 +1248,26 @@ std::optional<std::pair<Eigen::Vector3d, Eigen::Vector3d>> axis_from_datum(const
 // geometry directly but wrap it in an invented `kind` (e.g. {"kind":"axis",...} or an
 // edge-selector with a bogus `surf`) instead of the documented datum ref. The geometry
 // is unambiguous, so we accept it -> (point, unit dir). nullopt if there is no usable
-// 3-vector direction. (A reserved datum is handled by axis_from_datum first.)
+// 3-vector direction, OR if a through-point key is present but is not exactly three
+// numbers: that is a mistake (a 2-D point, a stringified vector), and quietly falling back
+// to the origin would revolve/pattern about the wrong line. (validate.cpp refuses the same
+// shapes up front with a teaching error; this keeps a saved doc from guessing.) A reserved
+// datum is handled by axis_from_datum first. The reserved datums are unsigned (axis.x = +X),
+// so a negative cardinal travels as {"axis":[-1,0,0]}.
 std::optional<std::pair<Eigen::Vector3d, Eigen::Vector3d>> axis_from_explicit(const json& ref) {
     if (!ref.is_object()) return std::nullopt;
     auto dir = opt_vec3(ref, "axis");
     if (!dir || !(dir->norm() > 1e-9)) return std::nullopt;
     Eigen::Vector3d pt(0, 0, 0);
     for (const char* k : {"centroid", "point", "origin"}) {
-        if (auto p = opt_vec3(ref, k)) { pt = *p; break; }
+        const auto it = ref.find(k);
+        if (it == ref.end() || it->is_null()) continue;
+        if (!it->is_array() || it->size() != 3 || !(*it)[0].is_number() ||
+            !(*it)[1].is_number() || !(*it)[2].is_number())
+            return std::nullopt;
+        pt = Eigen::Vector3d((*it)[0].get<double>(), (*it)[1].get<double>(),
+                             (*it)[2].get<double>());
+        break;
     }
     return std::make_pair(pt, dir->normalized());
 }
@@ -1789,7 +1859,9 @@ json normalize_feature(const json& raw) {
                     f["neutral"] = val;
                 }
             } else if (slot == "pull") {
-                if (auto ax = axis_from_datum(val))
+                auto ax = axis_from_datum(val);
+                if (!ax) ax = axis_from_explicit(val);
+                if (ax)
                     f["pull_dir"] = {ax->second.x(), ax->second.y(), ax->second.z()};
                 else
                     f["pull"] = val;
@@ -1923,7 +1995,8 @@ private:
     std::atomic<bool> broke_{false};
 };
 
-std::string dress_geometry_rejection(const TopoDS_Shape& shape) {
+std::string dress_geometry_rejection(const TopoDS_Shape& shape, bool* timed_out = nullptr) {
+    if (timed_out) *timed_out = false;
     const std::vector<std::string> issues = heal_brep_issues(shape);
     if (!issues.empty()) {
         std::string reason = "BRepCheck failed: ";
@@ -1944,6 +2017,10 @@ std::string dress_geometry_rejection(const TopoDS_Shape& shape) {
         TopExp::MapShapes(shape, TopAbs_SOLID, solids);
         if (solids.IsEmpty()) return "result contains no solid";
         Handle(DressValidityBudget) budget = new DressValidityBudget;
+        auto timeout_reason = [&]() -> std::string {
+            if (timed_out) *timed_out = true;
+            return "self-intersection validation incomplete (20 s budget exceeded)";
+        };
         for (int si = 1; si <= solids.Extent(); ++si) {
             BOPAlgo_CheckerSI checker;
             TopTools_ListOfShape one;
@@ -1952,9 +2029,13 @@ std::string dress_geometry_rejection(const TopoDS_Shape& shape) {
             checker.SetLevelOfCheck(9);
             checker.SetNonDestructive(Standard_True);
             checker.SetRunParallel(Standard_False);
-            checker.Perform(budget->Start());
-            if (budget->broke())
-                return "self-intersection validation incomplete (20 s budget exceeded)";
+            try {
+                checker.Perform(budget->Start());
+            } catch (...) {
+                if (budget->broke()) return timeout_reason();
+                throw;
+            }
+            if (budget->broke()) return timeout_reason();
             if (checker.HasErrors()) {
                 std::ostringstream errors;
                 checker.DumpErrors(errors);
@@ -1985,6 +2066,18 @@ std::string dress_geometry_rejection(const TopoDS_Shape& shape) {
 }
 
 }  // namespace
+
+::geom::FilletValidationResult validate_fillet_solid(const TopoDS_Shape& shape) {
+    if (!dress_is_closed_solid(shape))
+        return {::geom::FilletValidationStatus::rejected, "result is not a closed solid"};
+    bool timed_out = false;
+    std::string reason = dress_geometry_rejection(shape, &timed_out);
+    if (timed_out)
+        return {::geom::FilletValidationStatus::timed_out, std::move(reason)};
+    if (!reason.empty())
+        return {::geom::FilletValidationStatus::rejected, std::move(reason)};
+    return {};
+}
 
 // ----------------------------------------------------------------- compile_document
 // --------------------------------------------------------------------------- configurations
@@ -2172,6 +2265,335 @@ void apply_doc_face_appearances(const json& doc, uint32_t body_num,
     }
 }
 
+namespace {
+
+// The style key is shared by live tessellation and restored AICM bodies.
+uint64_t cc_body_style(const json& doc, uint32_t body_num, ::geom::DisplayQuality quality,
+                       const float color[3], float metal, float rough) {
+    uint64_t h = 1469598103934665603ULL;
+    const float vals[5] = {color[0], color[1], color[2], metal, rough};
+    for (float f : vals) {
+        uint32_t bits;
+        std::memcpy(&bits, &f, sizeof(bits));
+        h = (h ^ bits) * 1099511628211ULL;
+    }
+    h = (h ^ static_cast<uint64_t>(quality)) * 1099511628211ULL;
+    const auto faces = doc.find("face_appearances");
+    const std::string key = "b" + std::to_string(body_num);
+    return cc_fnv1a(faces != doc.end() && faces->contains(key)
+                        ? faces->at(key).dump() : std::string(), h);
+}
+
+uint32_t cc_u32(const std::vector<uint8_t>& data, std::size_t at) {
+    uint32_t value = 0;
+    for (unsigned i = 0; i < 4; ++i) value |= uint32_t(data[at + i]) << (8 * i);
+    return value;
+}
+
+uint64_t cc_u64(const std::vector<uint8_t>& data, std::size_t at) {
+    uint64_t value = 0;
+    for (unsigned i = 0; i < 8; ++i) value |= uint64_t(data[at + i]) << (8 * i);
+    return value;
+}
+
+void cc_put_le(std::vector<uint8_t>& out, uint64_t value, unsigned bytes) {
+    for (unsigned i = 0; i < bytes; ++i) out.push_back(static_cast<uint8_t>(value >> (8 * i)));
+}
+
+// The full result already owns the display mesh. Index its body chunks against
+// the checkpoint TShapes rather than remeshing after edits or reopen. Reject
+// unfamiliar/malformed packets without replacing the existing body cache.
+void cc_index_body_cache(CompileCache& cache, const json& doc, ::geom::DisplayQuality quality) {
+    const auto& full = cache.last_result;
+    if (!full || full->shapes.size() != full->bodies_info.size()) return;
+    const auto& data = full->aicm;
+    if (data.size() < 12 || std::memcmp(data.data(), "AICM", 4) != 0 || cc_u32(data, 4) != 1)
+        return;
+    std::size_t pos = 12;
+    uint32_t chunks = 0;
+    std::vector<std::shared_ptr<CachedBody>> restored;
+    restored.reserve(full->shapes.size());
+    auto chunk = [&](const char* tag, std::size_t& start, std::size_t& end) {
+        if (pos > data.size() || data.size() - pos < 12 ||
+            std::memcmp(data.data() + pos, tag, 4) != 0) return false;
+        const uint64_t n = cc_u64(data, pos + 4);
+        if (n > data.size() - pos - 12) return false;
+        start = pos;
+        end = pos + 12 + static_cast<std::size_t>(n);
+        pos = end;
+        ++chunks;
+        return true;
+    };
+    for (std::size_t i = 0; i < full->shapes.size(); ++i) {
+        auto body = std::make_shared<CachedBody>();
+        body->encoded = full;
+        if (!chunk("BODY", body->begin, body->body_end) ||
+            body->body_end - body->begin < 18 ||
+            cc_u32(data, body->begin + 12) != i + 1) return;
+        const std::size_t name_len = data[body->begin + 16] |
+                                     (std::size_t(data[body->begin + 17]) << 8);
+        body->name_end = body->begin + 18 + name_len;
+        if (body->name_end > body->body_end || body->body_end - body->name_end < 28) return;
+        const std::string& name = full->bodies_info[i].name;
+        if (name_len != std::min<std::size_t>(name.size(), 0xffff) ||
+            std::memcmp(data.data() + body->begin + 18, name.data(), name_len) != 0) return;
+        std::size_t start, end;
+        if (!chunk("FACE", start, end) || !chunk("EDGE", start, end) ||
+            !chunk("VERT", start, end)) return;
+        body->appearance = pos;
+        if (data.size() - pos >= 4 && std::memcmp(data.data() + pos, "APRG", 4) == 0) {
+            if (!chunk("APRG", start, end) || end - start < 20 ||
+                cc_u32(data, start + 12) != i + 1) return;
+        }
+        body->end = pos;
+        body->info = full->bodies_info[i];
+        restored.push_back(std::move(body));
+    }
+    if (pos != data.size() || chunks != cc_u32(data, 8)) return;
+    decltype(cache.body_cache) indexed;
+    for (std::size_t i = 0; i < restored.size(); ++i) {
+        const TopoDS_Shape& shape = full->shapes[i];
+        if (shape.IsNull() || !shape.Location().IsIdentity() ||
+            shape.Orientation() != TopAbs_FORWARD) continue;
+        const uint32_t number = static_cast<uint32_t>(i + 1);
+        float color[3] = {0.71f, 0.76f, 0.82f}, metal = 0.0f, rough = 0.5f;
+        apply_doc_appearance(doc, number, color, metal, rough);
+        indexed.emplace(
+            std::make_tuple(static_cast<const void*>(shape.TShape().get()),
+                            restored[i]->info.kind == "surface",
+                            cc_body_style(doc, number, quality, color, metal, rough)),
+            restored[i]);
+    }
+    cache.body_cache = std::move(indexed);
+}
+
+// Write mixed live and restored bodies, copying cached wire-format chunks directly.
+// Only the body ordinal/name and APRG ordinal can change when a body moves in order.
+std::vector<uint8_t> cc_write_bodies(
+    const std::vector<aicm::AicmBody>& bodies,
+    const std::vector<std::shared_ptr<const CachedBody>>& encoded) {
+    std::size_t bytes = 12;
+    for (std::size_t i = 0; i < bodies.size(); ++i) {
+        const auto& b = bodies[i];
+        const std::size_t name_size = std::min<std::size_t>(b.name.size(), 0xffff);
+        if (encoded[i]) {
+            bytes += encoded[i]->end - encoded[i]->begin -
+                     (encoded[i]->name_end - encoded[i]->begin - 18) + name_size;
+        } else {
+            bytes += 48 + 4 + 2 + name_size + 12 + 8 + 8 +
+                     4 * (b.pos.size() + b.nrm.size() + b.idx.size()) +
+                     4 + 13 * b.faces.size() + 8 + 13 * b.edges.size() +
+                     4 * b.edge_pts.size() + 4 + 16 * b.verts.size();
+            if (!b.appearance_regions.empty()) bytes += 20 + 28 * b.appearance_regions.size();
+        }
+    }
+    std::vector<uint8_t> out;
+    out.reserve(bytes);
+    out.insert(out.end(), {'A', 'I', 'C', 'M'});
+    cc_put_le(out, 1, 4);
+    cc_put_le(out, 0, 4);
+    uint32_t chunks = 0;
+    for (std::size_t i = 0; i < bodies.size(); ++i) {
+        const auto& b = bodies[i];
+        if (!encoded[i]) {
+            const auto packet = aicm::write_aicm({b});
+            chunks += cc_u32(packet, 8);
+            out.insert(out.end(), packet.begin() + 12, packet.end());
+            continue;
+        }
+        const CachedBody& c = *encoded[i];
+        const auto& source = c.encoded->aicm;
+        const std::size_t name_size = std::min<std::size_t>(b.name.size(), 0xffff);
+        const std::size_t old_name_size = c.name_end - c.begin - 18;
+        out.insert(out.end(), source.begin() + c.begin, source.begin() + c.begin + 4);
+        cc_put_le(out, c.body_end - c.begin - 12 - old_name_size + name_size, 8);
+        cc_put_le(out, b.body_id, 4);
+        cc_put_le(out, name_size, 2);
+        out.insert(out.end(), b.name.begin(), b.name.begin() + name_size);
+        out.insert(out.end(), source.begin() + c.name_end, source.begin() + c.appearance);
+        chunks += 4;
+        if (c.appearance != c.end) {
+            out.insert(out.end(), source.begin() + c.appearance, source.begin() + c.appearance + 12);
+            cc_put_le(out, b.body_id, 4);
+            out.insert(out.end(), source.begin() + c.appearance + 16, source.begin() + c.end);
+            ++chunks;
+        }
+    }
+    for (unsigned i = 0; i < 4; ++i) out[8 + i] = static_cast<uint8_t>(chunks >> (8 * i));
+    return out;
+}
+
+// Keep the copy and unifier histories local as well as recording them for owner
+// attribution. A disappeared seam is allowed; a referenced seam is not.
+struct RefineTopology {
+    TopTools_IndexedMapOfShape before, after;
+    std::vector<std::vector<int>> images;
+    std::vector<int> predecessors;
+};
+
+RefineTopology refine_topology(const TopoDS_Shape& before, const TopoDS_Shape& after,
+                              TopAbs_ShapeEnum kind,
+                              const std::vector<Handle(BRepTools_History)>& histories) {
+    RefineTopology map;
+    TopExp::MapShapes(before, kind, map.before);
+    TopExp::MapShapes(after, kind, map.after);
+    map.images.resize(static_cast<std::size_t>(map.before.Extent()) + 1);
+    map.predecessors.resize(static_cast<std::size_t>(map.after.Extent()) + 1, 0);
+    for (int i = 1; i <= map.before.Extent(); ++i) {
+        TopTools_ListOfShape images;
+        ::geom::op_history_images(map.before.FindKey(i), histories, images);
+        for (TopTools_ListIteratorOfListOfShape it(images); it.More(); it.Next()) {
+            const int j = map.after.FindIndex(it.Value());
+            if (j == 0) continue;
+            auto& row = map.images[static_cast<std::size_t>(i)];
+            if (std::find(row.begin(), row.end(), j) == row.end()) {
+                row.push_back(j);
+                ++map.predecessors[static_cast<std::size_t>(j)];
+            }
+        }
+    }
+    return map;
+}
+
+bool refine_one_to_one(const RefineTopology& map) {
+    if (map.before.Extent() != map.after.Extent()) return false;
+    for (int i = 1; i <= map.before.Extent(); ++i) {
+        const auto& row = map.images[static_cast<std::size_t>(i)];
+        if (row.size() != 1 || map.predecessors[static_cast<std::size_t>(row[0])] != 1)
+            return false;
+    }
+    return true;
+}
+
+// Exact persisted fingerprints, not the normal fuzzy selector fallback. An exact
+// output-only match can have been authored after refine; a pre-refine match must
+// retain a unique one-to-one history image.
+std::vector<int> refine_fingerprint_matches(const TopoDS_Shape& shape,
+                                            const RefineTopology& topology,
+                                            const json& selector, bool output) {
+    std::vector<int> found;
+    if (!selector.is_object() || !selector.contains("sid") ||
+        !selector["sid"].is_string() || !selector.contains("centroid") ||
+        !selector.contains("kind") || !selector["kind"].is_string()) return found;
+    const std::string kind = selector["kind"].get<std::string>();
+    auto matches = [&](const json& candidate) {
+        for (const char* key : {"kind", "sid", "surf", "centroid", "axis", "area_or_len",
+                                "normal", "side", "concavity", "radius"}) {
+            if (selector.contains(key) &&
+                (!candidate.contains(key) || selector.at(key) != candidate.at(key)))
+                return false;
+        }
+        return true;
+    };
+    if (kind == "face") {
+        const auto inventory = face_sid_inventory(shape);
+        const auto it = inventory.find(selector["sid"].get<std::string>());
+        if (it != inventory.end())
+            for (const auto& item : it->second)
+                if (matches(item.second)) found.push_back(static_cast<int>(item.first));
+    } else {
+        const auto& shapes = output ? topology.after : topology.before;
+        for (int i = 1; i <= shapes.Extent(); ++i) {
+            const json candidate = make_pick_selector(shape, kind, i, std::nullopt);
+            if (candidate.is_object() && matches(candidate)) found.push_back(i);
+        }
+    }
+    return found;
+}
+
+bool refine_preserves_fingerprint(const TopoDS_Shape& before, const TopoDS_Shape& after,
+                                  const RefineTopology& topology, const json& selector) {
+    const auto old_matches = refine_fingerprint_matches(before, topology, selector, false);
+    const auto new_matches = refine_fingerprint_matches(after, topology, selector, true);
+    if (old_matches.size() > 1 || new_matches.size() != 1) return false;
+    if (old_matches.empty()) return true;
+    const auto& images = topology.images[static_cast<std::size_t>(old_matches[0])];
+    return images.size() == 1 && images[0] == new_matches[0] &&
+           topology.predecessors[static_cast<std::size_t>(images[0])] == 1;
+}
+
+bool refine_preserves_query(const TopoDS_Shape& before, const TopoDS_Shape& after,
+                            const RefineTopology& faces, const RefineTopology& edges,
+                            const json& query) {
+    const QueryPicks old_picks = resolve_geom_query(before, query);
+    const QueryPicks new_picks = resolve_geom_query(after, query);
+    if (!old_picks.error.empty() || !new_picks.error.empty()) return false;
+    // resolve_geom_query defaults absent/null/empty "of" to faces and matches
+    // the domain case-insensitively. Select the history map the same way.
+    std::string of = query.contains("of") && query["of"].is_string()
+                         ? query["of"].get<std::string>() : std::string();
+    std::transform(of.begin(), of.end(), of.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    const bool want_faces = of.empty() || of == "face";
+    const RefineTopology& topology = want_faces ? faces : edges;
+    std::vector<int> old_indices, new_indices;
+    if (want_faces) {
+        for (const auto& s : old_picks.faces) old_indices.push_back(topology.before.FindIndex(s));
+        for (const auto& s : new_picks.faces) new_indices.push_back(topology.after.FindIndex(s));
+    } else {
+        for (const auto& s : old_picks.edges) old_indices.push_back(topology.before.FindIndex(s));
+        for (const auto& s : new_picks.edges) new_indices.push_back(topology.after.FindIndex(s));
+    }
+    if (old_indices.empty() || old_indices.size() != new_indices.size()) return false;
+    // Preserve order too: single-ref slots consume the first query match.
+    for (std::size_t i = 0; i < old_indices.size(); ++i) {
+        if (old_indices[i] <= 0 || new_indices[i] <= 0) return false;
+        const auto& images = topology.images[static_cast<std::size_t>(old_indices[i])];
+        if (images.size() != 1 || images[0] != new_indices[i] ||
+            topology.predecessors[static_cast<std::size_t>(images[0])] != 1) return false;
+    }
+    return true;
+}
+
+bool refine_references_safe(const json& value, const TopoDS_Shape& before,
+                            const TopoDS_Shape& after, const RefineTopology& faces,
+                            const RefineTopology& edges, const RefineTopology& vertices) {
+    if (value.is_array()) {
+        for (const auto& item : value)
+            if (!refine_references_safe(item, before, after, faces, edges, vertices)) return false;
+    } else if (value.is_object()) {
+        const std::string kind = value.contains("kind") && value["kind"].is_string()
+                                     ? value["kind"].get<std::string>() : std::string();
+        // Convert Entities wraps the actual selector in source.kind + selector.
+        // Its consumer supplies the wrapper's kind when the selector omits it.
+        if ((kind == "face" || kind == "edge" || kind == "vertex") &&
+            value.contains("selector")) {
+            if (!value["selector"].is_object()) return false;
+            json selector = value["selector"];
+            if (!selector.contains("kind") && !is_geom_query(selector)) selector["kind"] = kind;
+            if (!selector.contains("kind") || !selector["kind"].is_string() ||
+                selector["kind"] != kind) return false;
+            // Associative refresh resolves the nested selector as a fingerprint,
+            // even when it also contains query-readback fields such as "of".
+            const RefineTopology& map = kind == "face" ? faces : kind == "edge" ? edges : vertices;
+            return refine_preserves_fingerprint(before, after, map, selector);
+        }
+        // The recursive scan also visits non-selector metadata. A non-string kind
+        // is harmless there, but an "of" object with such a kind cannot be a
+        // query the consumer can resolve.
+        if (value.contains("kind") && !value["kind"].is_string()) {
+            if (value.contains("of")) return false;
+        } else if (is_geom_query(value)) {
+            return refine_preserves_query(before, after, faces, edges, value);
+        }
+        if (kind == "face" || kind == "edge" || kind == "vertex") {
+            const RefineTopology& map = kind == "face" ? faces : kind == "edge" ? edges : vertices;
+            return refine_preserves_fingerprint(before, after, map, value);
+        }
+        for (auto it = value.begin(); it != value.end(); ++it) {
+            if ((it.key() == "edge_index" || it.key() == "edge_indices" ||
+                 it.key() == "face_index" || it.key() == "face_indices" ||
+                 it.key() == "vertex_index" || it.key() == "vertex_indices") &&
+                !it.value().is_null()) return false;
+            if (!refine_references_safe(it.value(), before, after, faces, edges, vertices))
+                return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
 CompileResult compile_document(const json& doc, const json& env_json, CompileCache* cache,
                                ::geom::DisplayQuality quality, bool with_display,
                                bool with_owners) {
@@ -2218,13 +2640,9 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
     std::map<std::string, TopoDS_Shape> tool_body_of;
     std::map<std::string, std::string> feature_op_of;  // "add" | "cut"
 
-    // B1 — feature-overlap detection: record each feature's actual pre-boolean tool
-    // solid + its add/cut role into result.tool_recs (see ToolRec in document.h).
-    // Deliberately independent of tool_body_of/feature_op_of above: those are tuned
-    // for pattern/mirror REPLAY (an additive pattern's tool_body_of is its whole
-    // grown body, so an outer pattern can re-fuse it), whereas doc_eval_feature_
-    // overlap needs the real incremental geometry a feature added or removed so a
-    // pairwise BRepAlgoAPI_Common between two records measures genuine overlap.
+    // Record pre-boolean tools for tool-space overlap diagnostics. These are not
+    // measured added/removed material: through-all tools may extend beyond the body.
+    // Pattern replay uses separate, seed-inclusive tools in tool_body_of.
     // A null shape is never recorded (defensive; every callsite already guards
     // IsNull before this point).
     auto record_tool = [&](const std::string& fid, const char* role, const TopoDS_Shape& shp) {
@@ -2849,22 +3267,29 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
     std::vector<std::shared_ptr<const FeatureStatus>> status_ptrs;
 
     // ------------------------------------------ incremental-rebuild cache probe
-    // Hash the compile INPUTS into a chain (h0 = env + active config; h[i+1] = h[i]
-    // folded with feature i's json — the loop's only per-feature inputs, verified: the
-    // loop body reads nothing else from `doc`). Then (a) an identical chain + identical
-    // appearances returns the previous CompileResult outright, and (b) otherwise the
-    // deepest checkpoint whose chain prefix still matches is RESTORED and the loop
-    // starts after it — editing feature k recompiles only k..N. Content-addressed:
-    // undo/redo/config switches/rolled-back failed compiles all just hash to whatever
-    // prefix genuinely still matches.
+    // Hash compile inputs into a prefix chain (including refine's suffix dependency).
+    // An identical chain and appearance returns the whole previous result; otherwise
+    // restore the deepest matching prefix. Eligible downstream features are checked
+    // separately against their cached inputs before their loop iteration.
     const std::size_t n_features = features.is_array() ? features.size() : 0;
+    std::size_t active_features = n_features;
+    if (doc.contains("rollback_after") && doc["rollback_after"].is_string()) {
+        const std::string bar = doc["rollback_after"].get<std::string>();
+        if (bar == "start") active_features = 0;
+        else for (std::size_t i = 0; i < n_features; ++i) {
+            if (features[i].is_object() && features[i].value("id", std::string()) == bar) {
+                active_features = i + 1;
+                break;
+            }
+        }
+    }
     const bool use_cache = cache != nullptr && n_features > 0 &&
                            n_features <= kCompileCacheMaxFeatures;
     g_cc_compiles.fetch_add(1, std::memory_order_relaxed);
     std::vector<uint64_t> chain;
     std::size_t start_at = 0;
     if (use_cache) {
-        chain = cc_chain(features, env_json, result.active_configuration, quality,
+        chain = cc_chain(doc, features, env_json, result.active_configuration, quality,
                          with_display, with_owners);
         // (a) FULL match — same env/config/features and same appearances (they bake into
         // the post-loop AICM colors) -> serve the whole previous result.
@@ -2872,16 +3297,17 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         if (cache->last_result && cache->full_key == full_key &&
             cache->chain == chain) {
             CompileResult out = *cache->last_result;
-            for (FeatureStatus& fst : out.statuses) fst.reused = true;
-            out.features_reused = static_cast<int>(out.statuses.size());
+            for (FeatureStatus& fst : out.statuses)
+                fst.reused = !fst.rolled_back;
+            out.features_reused = static_cast<int>(active_features);
             out.features_executed = 0;
             g_cc_full_hits.fetch_add(1, std::memory_order_relaxed);
-            g_cc_features_reused.fetch_add(out.statuses.size(), std::memory_order_relaxed);
+            g_cc_features_reused.fetch_add(active_features, std::memory_order_relaxed);
             return out;
         }
         // (b) PREFIX match — longest i with chain[i] equal and a live checkpoint.
         std::size_t match = 0;
-        const std::size_t lim = std::min(chain.size(), cache->chain.size());
+        const std::size_t lim = std::min({chain.size(), cache->chain.size(), active_features + 1});
         for (std::size_t i = 0; i < lim; ++i) {
             if (chain[i] != cache->chain[i]) break;
             match = i;  // chain[i] matched => the state after i features is reusable
@@ -3076,13 +3502,121 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         ck->edge_owners = edge_owners;
         new_snaps[after_idx] = std::move(ck);
     };
+    // A changed prefix does not imply that every later feature depends on it.
+    // Index the old checkpoints by feature id, but replay only the small set below
+    // whose complete inputs and side effects are known. The chain seed must still
+    // match (environment, configuration, quality and compile mode).
+    std::unordered_map<std::string, std::size_t> old_feature_index;
+    if (use_cache && !cache->chain.empty() && chain.front() == cache->chain.front()) {
+        for (std::size_t i = 1; i < cache->snaps.size() && i < cache->chain.size(); ++i) {
+            const auto& snap = cache->snaps[i];
+            if (!snap || snap->statuses.size() != i) continue;
+            const std::string& fid = snap->statuses.back()->id;
+            auto [it, inserted] = old_feature_index.emplace(fid, i - 1);
+            if (!inserted) it->second = std::numeric_limits<std::size_t>::max();
+        }
+    }
     result.features_reused = static_cast<int>(start_at);
-    result.features_executed = static_cast<int>(n_features - start_at);
-    g_cc_features_reused.fetch_add(start_at, std::memory_order_relaxed);
-    g_cc_features_executed.fetch_add(n_features - start_at, std::memory_order_relaxed);
+    result.features_executed = 0;
+
+    auto reuse_independent = [&](const json& raw, const json& feat,
+                                 const std::string& id, const std::string& type) {
+        auto ix = old_feature_index.find(id);
+        if (ix == old_feature_index.end()) return false;
+        const std::size_t i = ix->second;
+        if (i >= cache->chain.size() - 1 || i + 1 >= cache->snaps.size() ||
+            !cache->snaps[i + 1] || (i > 0 && !cache->snaps[i]) ||
+            cc_hash_feature(raw, cache->chain[i]) != cache->chain[i + 1] ||
+            results.count(id)) return false;
+        const CompileCkpt* before = i ? cache->snaps[i].get() : nullptr;
+        const CompileCkpt& after = *cache->snaps[i + 1];
+        if (after.statuses.size() != i + 1 || !after.statuses.back()->ok ||
+            after.statuses.back()->rolled_back || !after.results.count(id)) return false;
+        const std::string fname = raw.value("name", id);
+        auto same_input = [&](const std::string& input) {
+            if (input.empty() || !before) return false;
+            auto old = before->results.find(input);
+            auto now = results.find(input);
+            return old != before->results.end() && now != results.end() &&
+                   old->second == now->second;
+        };
+        const FeatureResultPtr& saved = after.results.at(id);
+        if (!saved) return false;
+        bool eligible = false;
+        if (type == "sketch3d") {
+            eligible = std::holds_alternative<Sketch3DResult>(*saved);
+        } else if (type == "plane" && feat.value("method", std::string("offset")) == "point_normal") {
+            // Only literal origins; datum/vertex selectors depend on upstream geometry.
+            auto origin = feat.find("origin");
+            eligible = origin != feat.end() && origin->is_array() && origin->size() >= 3 &&
+                       (*origin)[0].is_number() && (*origin)[1].is_number() &&
+                       (*origin)[2].is_number() && std::holds_alternative<PlaneResult>(*saved);
+        } else if (type == "sketch") {
+            auto plane = feat.find("plane");
+            eligible = plane != feat.end() && plane->is_string() &&
+                       same_input(plane->get<std::string>()) &&
+                       std::holds_alternative<SketchResult>(*saved);
+        } else if (type == "sweep" && feat.value("mode", std::string("boss")) == "new") {
+            auto path = feat.find("path");
+            auto profile = feat.find("profile");
+            eligible = before && path != feat.end() && profile != feat.end() &&
+                       same_input(selector_owner_id(*path)) &&
+                       same_input(profile_sketch_id(*profile)) &&
+                       std::holds_alternative<SolidResult>(*saved) &&
+                       !after.source_of.count(id) && after.tool_body_of.count(id) &&
+                       after.feature_op_of.count(id) &&
+                       after.tool_recs.size() == before->tool_recs.size() + 1 &&
+                       after.tool_recs.back().feature_id == id;
+            auto guides = feat.find("guides");
+            if (eligible && guides != feat.end() && guides->is_array())
+                for (const json& guide : *guides)
+                    if (!same_input(selector_owner_id(guide))) eligible = false;
+        }
+        if (!eligible) return false;
+        FeatureStatus reused = *after.statuses.back();
+        const bool was_duplicate = !fname.empty() && before && before->seen_names.count(fname);
+        const bool is_duplicate = !fname.empty() && seen_names.count(fname);
+        if (was_duplicate != is_duplicate) {
+            const std::string note = "duplicate feature name '" + fname + "' in this document";
+            if (was_duplicate) {
+                const std::string suffix = "; " + note;
+                if (reused.warning == note) reused.warning.clear();
+                else if (reused.warning.size() >= suffix.size() &&
+                         reused.warning.compare(reused.warning.size() - suffix.size(),
+                                                suffix.size(), suffix) == 0)
+                    reused.warning.erase(reused.warning.size() - suffix.size());
+                else
+                    return false;  // Do not guess at an unfamiliar cached warning.
+            } else {
+                reused.warning = reused.warning.empty() ? note : reused.warning + "; " + note;
+            }
+        }
+
+        results.put_shared(id, saved);
+        if (!fname.empty()) seen_names.insert(fname);
+        if (type == "sweep") {
+            solid_order.push_back(id);
+            tool_body_of[id] = after.tool_body_of.at(id);
+            feature_op_of[id] = after.feature_op_of.at(id);
+            result.tool_recs.push_back(after.tool_recs.back());
+            auto fo = after.face_owners.find(id);
+            if (fo != after.face_owners.end()) face_owners[id] = fo->second;
+            auto eo = after.edge_owners.find(id);
+            if (eo != after.edge_owners.end()) edge_owners[id] = eo->second;
+        }
+        if (was_duplicate != is_duplicate) {
+            reused.reused = false;
+            status_ptrs.push_back(std::make_shared<const FeatureStatus>(reused));
+        } else {
+            status_ptrs.push_back(after.statuses.back());
+        }
+        reused.reused = true;
+        result.statuses.push_back(std::move(reused));
+        return true;
+    };
 
     const auto _loop_t0 = std::chrono::steady_clock::now();
-    for (std::size_t _fi = start_at; _fi < n_features; ++_fi) {
+    for (std::size_t _fi = start_at; _fi < active_features; ++_fi) {
         const json& raw = features[_fi];
         // Accept the host's canonical {params,refs} shape OR the simplified flat
         // shape, normalizing to flat so the compilers below read either (see
@@ -3090,6 +3624,14 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         const json feat = normalize_feature(raw);
         const std::string id = feat.value("id", std::string("?"));
         const std::string type = feat.value("type", std::string(""));
+
+        if (!raw.value("suppressed", false) && !feat.value("suppressed", false) &&
+            reuse_independent(raw, feat, id, type)) {
+            ++result.features_reused;
+            capture_ckpt(_fi + 1);
+            continue;
+        }
+        ++result.features_executed;
 
         FeatureStatus st;
         st.id = id;
@@ -3126,13 +3668,30 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         // the body this feature consumed — restoring `consumed` keeps the prior body alive
         // in the surviving-bodies tessellation (the feature simply fails, geometry intact).
         const std::set<std::string> consumed_snapshot = consumed;
+        const bool fillet_had_result = type == "fillet" && results.count(id) != 0;
         // Record the op histories of THIS feature's geom ops (owner attribution below).
         const ::geom::OpHistoryScope op_histories(attribute_owners);
+        // Collects the refs this feature re-binds by geometry match (reported just below the
+        // per-feature try/catch). Declared here so every resolve() inside the compile is seen.
+        chudware::doc::RebindScope rebind_notes;
 
         // Per-feature compile wrapped so an OCCT/eval throw becomes an error status,
         // never a crash (compile_document never-raises contract).
         try {
-            if (type == "sketch") {
+            if (type == "scad") {
+                auto built = scad::build(raw.value("params", json::object()), env);
+                if (built.shape.IsNull()) throw std::runtime_error("scad: renderer produced no geometry");
+                const auto bodies = split_import_bodies(built.shape);
+                for (std::size_t k = 0; k < bodies.size(); ++k) {
+                    const std::string pid = k == 0 ? id : id + "#" + std::to_string(k);
+                    results[pid] = SolidResult{bodies[k]};
+                    if (!TopExp_Explorer(bodies[k], TopAbs_SOLID).More())
+                        body_kinds[pid] = "surface";
+                    solid_order.push_back(pid);
+                }
+                st.data = std::move(built.report);
+                st.ok = true;
+            } else if (type == "sketch") {
                 // Solve the 2D sketch, then build planar faces on the named plane.
                 json sk;
                 sk["entities"] = feat.value("entities", json::array());
@@ -3161,6 +3720,13 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 // valid path/trace for a sweep/rib. A consuming feature that needs a
                 // face (extrude/revolve) raises if faces is empty.
                 results[id] = SketchResult{std::move(faces), plane, sol.entities};
+                auto frame_vec = [](const Eigen::Vector3d& v) {
+                    return json::array({v.x(), v.y(), v.z()});
+                };
+                st.data["sketch_plane"] = {{"origin", frame_vec(plane.origin)},
+                                           {"x_dir", frame_vec(plane.uAxis)},
+                                           {"y_dir", frame_vec(plane.vAxis)},
+                                           {"normal", frame_vec(plane.normal)}};
                 st.ok = true;
                 // Associative Convert Entities: a stale external ref (source
                 // selector no longer resolves; last-good projected geometry kept) is a
@@ -3224,7 +3790,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 chudware::sketch3d::Sketch3DSolution sol =
                     chudware::sketch3d::solve_sketch3d(sk, env_json);
                 if (!sol.converged)
-                    throw std::runtime_error("sketch3d did not converge");
+                    throw std::runtime_error(chudware::sketch3d::nonconvergence_reason(sk, sol));
                 std::vector<TopoDS_Wire> wires =
                     chudware::geom::wires_from_sketch3d(sol.entities);
                 // NB: zero wires is NOT an error here — a points-only skeleton is
@@ -5149,9 +5715,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 } else {
                     throw std::runtime_error("revolve: missing axis");
                 }
-                // Canonical revolve angle is in DEGREES (SolidWorks/Python); the
-                // kernel revolve_face takes radians. (No existing test drives the
-                // revolve branch, so aligning to the canonical degree contract is safe.)
+                // Canonical revolve angle is in DEGREES (SolidWorks/Python); the kernel
+                // revolve_face takes radians.
                 const double angle_deg =
                     feat.contains("angle") ? num_or_expr(feat.at("angle"), env) : 360.0;
                 const double angle = radians(angle_deg);
@@ -5561,10 +6126,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 st.ok = true;
 
             } else if (type == "rib") {
-                // Thin support wall grown from an OPEN sketch contour: silhouette
-                // dropped in-plane toward the body, thickened across the sketch
-                // normal, trimmed to the body bbox, fused. Port of the parallel/
-                // centered path of engine/doc/features/rib.py.
+                // Grow an open contour toward actual supports, not toward a bbox
+                // centroid. Consider both in-plane directions and reject ambiguity.
                 const std::string body_id = body_ref(feat);
                 if (body_id.empty())
                     throw std::runtime_error("rib: no body ref and no current body");
@@ -5587,43 +6150,78 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 if (contour.IsNull())
                     throw std::runtime_error("rib: profile sketch produced no contour");
 
-                // Body bbox -> center (for the inward drop) + a clip box (+5 margin).
                 Bnd_Box bb;
                 BRepBndLib::Add(body, bb);
+                if (bb.IsVoid()) throw std::runtime_error("rib: body has no bounds");
                 double xmn, ymn, zmn, xmx, ymx, zmx;
                 bb.Get(xmn, ymn, zmn, xmx, ymx, zmx);
-                Eigen::Vector3d bc((xmn + xmx) / 2, (ymn + ymx) / 2, (zmn + zmx) / 2);
-
                 TopoDS_Vertex v1, v2;
                 TopExp::Vertices(contour, v1, v2);
-                if (v1.IsNull() || v2.IsNull())
+                if (v1.IsNull() || v2.IsNull() || v1.IsSame(v2))
                     throw std::runtime_error("rib: contour is closed (a rib needs an open contour)");
                 gp_Pnt q1 = BRep_Tool::Pnt(v1), q2 = BRep_Tool::Pnt(v2);
-                Eigen::Vector3d mid((q1.X() + q2.X()) / 2, (q1.Y() + q2.Y()) / 2,
-                                    (q1.Z() + q2.Z()) / 2);
-                Eigen::Vector3d toward = bc - mid;
-                const double reach = chudware::doc::bbox_diag(body) * 1.5;
-
-                TopoDS_Shape slab = ::geom::make_rib_slab(contour, src.plane.normal,
-                                                          toward, thickness, reach);
-                if (slab.IsNull())
-                    throw std::runtime_error("rib: could not build the rib slab");
-
-                // Trim the slab to the body bbox (+5) so the drop doesn't dangle.
-                TopoDS_Shape clip = ::geom::make_box_at(xmn - 5, ymn - 5, zmn - 5,
-                                                        (xmx - xmn) + 10, (ymx - ymn) + 10,
-                                                        (zmx - zmn) + 10);
-                TopoDS_Shape trimmed = ::geom::common(slab, clip);
-                if (trimmed.IsNull()) trimmed = slab;  // keep untrimmed; fuse still works
-
-                GProp_GProps gb, ga;
+                Eigen::Vector3d chord(q2.X() - q1.X(), q2.Y() - q1.Y(), q2.Z() - q1.Z());
+                Eigen::Vector3d drop = src.plane.normal.cross(chord);
+                if (drop.norm() < 1e-9)
+                    throw std::runtime_error("rib: contour has no unambiguous drop direction");
+                drop.normalize();
+                const double reach = chudware::doc::bbox_diag(body) * 1.5 + thickness;
+                gp_Trsf back;
+                back.SetTranslation(gp_Vec(-src.plane.normal.x() * thickness / 2,
+                                           -src.plane.normal.y() * thickness / 2,
+                                           -src.plane.normal.z() * thickness / 2));
+                TopoDS_Shape start = BRepPrimAPI_MakePrism(
+                    BRepBuilderAPI_Transform(contour, back, true).Shape(),
+                    gp_Vec(src.plane.normal.x() * thickness,
+                           src.plane.normal.y() * thickness,
+                           src.plane.normal.z() * thickness)).Shape();
+                GProp_GProps gb;
                 BRepGProp::VolumeProperties(body, gb);
-                TopoDS_Shape out = ::geom::fuse_unify(body, trimmed);
-                if (out.IsNull())
-                    throw std::runtime_error("rib: fusing the rib to the body failed");
-                BRepGProp::VolumeProperties(out, ga);
-                if (ga.Mass() - gb.Mass() <= 1e-6)
-                    throw std::runtime_error("rib added no material (contour must bridge the body)");
+                std::vector<std::pair<TopoDS_Shape, TopoDS_Shape>> candidates;
+                for (double sign : {1.0, -1.0}) {
+                    TopoDS_Shape slab = ::geom::make_rib_slab(
+                        contour, src.plane.normal, sign * drop, thickness, reach);
+                    if (slab.IsNull()) continue;
+                    // Cutting away the support separates the bounded web from
+                    // material beyond it. Select only regions with a face on the
+                    // authored contour; never truncate an unsupported region at a box.
+                    TopoDS_Shape free = ::geom::cut(slab, body);
+                    if (free.IsNull()) continue;
+                    for (TopExp_Explorer ex(free, TopAbs_SOLID); ex.More(); ex.Next()) {
+                        const TopoDS_Shape piece = ex.Current();
+                        TopoDS_Shape on_start = ::geom::common(piece, start);
+                        if (on_start.IsNull()) continue;
+                        GProp_GProps area;
+                        BRepGProp::SurfaceProperties(on_start, area);
+                        if (area.Mass() <= 1e-8) continue;
+                        Bnd_Box pb;
+                        BRepBndLib::Add(piece, pb);
+                        if (pb.IsVoid()) continue;
+                        double ax, ay, az, bx, by, bz;
+                        pb.Get(ax, ay, az, bx, by, bz);
+                        const double tol = 1e-5;
+                        if (ax < xmn - tol || ay < ymn - tol || az < zmn - tol ||
+                            bx > xmx + tol || by > ymx + tol || bz > zmx + tol)
+                            continue;
+                        TopoDS_Shape fused = ::geom::fuse_unify(body, piece);
+                        if (fused.IsNull() || !BRepCheck_Analyzer(fused).IsValid()) continue;
+                        int nsolids = 0;
+                        for (TopExp_Explorer sx(fused, TopAbs_SOLID); sx.More(); sx.Next())
+                            ++nsolids;
+                        GProp_GProps ga;
+                        BRepGProp::VolumeProperties(fused, ga);
+                        if (nsolids == 1 && ga.Mass() > gb.Mass() + 1e-6)
+                            candidates.emplace_back(piece, fused);
+                    }
+                }
+                if (candidates.empty())
+                    throw std::runtime_error(
+                        "rib: no bounded, face-supported connected web reaches the contour");
+                if (candidates.size() != 1)
+                    throw std::runtime_error(
+                        "rib: support is ambiguous in the two drop directions");
+                const TopoDS_Shape& trimmed = candidates.front().first;
+                const TopoDS_Shape& out = candidates.front().second;
                 record_tool(id, "add", trimmed);
 
                 consumed.insert(body_id);
@@ -5633,6 +6231,20 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 st.ok = true;
 
             } else if (type == "boolean") {
+                // A boolean combines exactly TWO bodies (a, b). normalize_feature maps only the
+                // FIRST entry of refs.targets / refs.tools onto them, so a longer list used to be
+                // truncated silently and the extra bodies were left untouched — refuse it.
+                if (raw.contains("refs") && raw["refs"].is_object()) {
+                    for (const char* slot : {"targets", "tools"}) {
+                        const auto sit = raw["refs"].find(slot);
+                        if (sit != raw["refs"].end() && sit->is_array() && sit->size() > 1)
+                            throw std::runtime_error(
+                                std::string("boolean: refs.") + slot + " lists " +
+                                std::to_string(sit->size()) + " bodies, but a boolean combines "
+                                "exactly two (one target, one tool). Chain booleans: combine the "
+                                "first pair, then use that result as the target of the next one");
+                    }
+                }
                 const std::string op = req_str(feat, "op");
                 const std::string a_id = req_str(feat, "a");
                 const std::string b_id = req_str(feat, "b");
@@ -5724,14 +6336,16 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 // An "edges" key (a single selector object, or a non-empty json array of
                 // selectors) routes to the edge-SELECTOR path: each selector is resolved
                 // against the body's live B-rep topology (doc/picks::resolve_edge_picks).
-                // A dangling selector throws (-> per-feature error status, the never-raise
-                // contract). When "edges" is absent the legacy `dir`-filter path runs
-                // unchanged.
+                // A fillet rejects any dangling selector instead of committing a subset.
+                // When "edges" is absent the legacy `dir`-filter path is used.
                 auto edges_it = feat.find("edges");
                 const bool has_edge_sel =
                     edges_it != feat.end() &&
                     (edges_it->is_object() ||
                      (edges_it->is_array() && !edges_it->empty()));
+                if (type == "fillet" && edges_it != feat.end() && !edges_it->is_null() &&
+                    !has_edge_sel)
+                    throw std::runtime_error("fillet: edges must contain at least one edge selector or query");
                 if (!blend_type.empty() && blend_type != "vertex" && !has_edge_sel)
                     throw std::runtime_error(type + ": refs.edges required for type '" +
                                              blend_type + "'");
@@ -5741,7 +6355,58 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 if (has_edge_sel) validate_selector_refs(*edges_it, type.c_str());
 
                 std::optional<std::vector<TopoDS_Edge>> picked;
-                int n_dangling = 0;   // picks that couldn't be located on the body (skipped + warned)
+                int n_dangling = 0;   // chamfer retains its existing partial-pick behavior
+                auto reject_dangling_fillet = [&](const chudware::doc::EdgePicks& picks) {
+                    if (type != "fillet" || picks.dangling.empty()) return;
+                    std::string reason = "fillet: selected edge selector(s) dangling; re-pick: ";
+                    for (const auto& dangling : picks.dangling) {
+                        if (reason.back() != ' ') reason += "; ";
+                        reason += dangling;
+                    }
+                    throw std::runtime_error(reason);
+                };
+                auto resolve_selected_edges = [&](const json& selectors,
+                                                  const std::vector<std::size_t>* source_indices) {
+                    if (type != "fillet" || !selectors.is_array())
+                        return chudware::doc::resolve_edge_picks(body, selectors);
+                    auto map_reasons = [](chudware::doc::EdgePicks& picks,
+                                          const std::vector<std::size_t>& source) {
+                        // EdgePicks identifies failures by index in the submitted
+                        // selector array. Preserve the original positions if queries
+                        // or duplicate selectors were removed before that submission.
+                        for (std::string& reason : picks.dangling) {
+                            for (std::size_t i = 0; i < source.size(); ++i) {
+                                const std::string prefix = "edges[" + std::to_string(i) + "]:";
+                                if (reason.compare(0, prefix.size(), prefix) == 0) {
+                                    reason.replace(0, prefix.size(),
+                                                   "edges[" + std::to_string(source[i]) + "]:");
+                                    break;
+                                }
+                            }
+                        }
+                    };
+                    // Identical selectors denote the same pick. Resolving them as
+                    // separate claims can assign the second to a different edge.
+                    for (auto it = selectors.begin(); it != selectors.end(); ++it) {
+                        if (std::find(selectors.begin(), it, *it) != it) {
+                            json unique = json::array();
+                            std::vector<std::size_t> source;
+                            for (std::size_t i = 0; i < selectors.size(); ++i) {
+                                const json& selector = selectors[i];
+                                if (std::find(unique.begin(), unique.end(), selector) != unique.end())
+                                    continue;
+                                unique.push_back(selector);
+                                source.push_back(source_indices ? (*source_indices)[i] : i);
+                            }
+                            auto picks = chudware::doc::resolve_edge_picks(body, unique);
+                            map_reasons(picks, source);
+                            return picks;
+                        }
+                    }
+                    auto picks = chudware::doc::resolve_edge_picks(body, selectors);
+                    if (source_indices) map_reasons(picks, *source_indices);
+                    return picks;
+                };
                 // A semantic geometry QUERY ({"of":"edge",...}) lets the agent name edges
                 // it cannot click — "all edges", "the vertical edges", "the top rim". It
                 // expands against the LIVE body to concrete unique edges (doc/picks).
@@ -5763,34 +6428,50 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     std::vector<TopoDS_Edge> all;
                     TopTools_IndexedMapOfShape seen;
                     json plain = json::array();
-                    for (const json& el : *edges_it) {
+                    std::vector<std::size_t> plain_indices;
+                    for (std::size_t edge_index = 0; edge_index < edges_it->size(); ++edge_index) {
+                        const json& el = (*edges_it)[edge_index];
                         if (chudware::doc::is_geom_query(el)) {
                             chudware::doc::QueryPicks qp = chudware::doc::resolve_geom_query(body, el);
                             if (!qp.error.empty())
-                                throw std::runtime_error(type + ": " + qp.error);
-                            for (TopoDS_Edge& e : qp.edges)
-                                if (seen.Add(e)) all.push_back(e);
+                                throw std::runtime_error(type + ": " +
+                                    (type == "fillet" ? "edges[" + std::to_string(edge_index) + "]: " : "") +
+                                    qp.error);
+                            if (type == "fillet" && qp.edges.empty())
+                                throw std::runtime_error("fillet: edges[" +
+                                    std::to_string(edge_index) + "] query matched no edges");
+                            for (const TopoDS_Edge& e : qp.edges) {
+                                if (!seen.Contains(e)) {
+                                    seen.Add(e);
+                                    all.push_back(e);
+                                }
+                            }
                         } else {
                             plain.push_back(el);  // batch the concrete selectors below
+                            if (type == "fillet") plain_indices.push_back(edge_index);
                         }
                     }
                     if (!plain.empty()) {
-                        chudware::doc::EdgePicks picks = chudware::doc::resolve_edge_picks(body, plain);
+                        chudware::doc::EdgePicks picks = resolve_selected_edges(
+                            plain, type == "fillet" ? &plain_indices : nullptr);
+                        reject_dangling_fillet(picks);
                         n_dangling += (int)picks.dangling.size();
-                        for (TopoDS_Edge& e : picks.edges)
-                            if (seen.Add(e)) all.push_back(e);
+                        for (const TopoDS_Edge& e : picks.edges) {
+                            if (!seen.Contains(e)) {
+                                seen.Add(e);
+                                all.push_back(e);
+                            }
+                        }
                     }
                     if (all.empty())
                         throw std::runtime_error(type + ": edge query/selectors matched no edges");
                     picked = std::move(all);
                 } else if (has_edge_sel) {
-                    chudware::doc::EdgePicks picks =
-                        chudware::doc::resolve_edge_picks(body, *edges_it);
+                    chudware::doc::EdgePicks picks = resolve_selected_edges(*edges_it, nullptr);
+                    reject_dangling_fillet(picks);
                     n_dangling = (int)picks.dangling.size();
-                    // Don't fail the WHOLE feature when one freshly-picked selector is stale (a very
-                    // common case while editing a fillet to add edges — the pick is captured against
-                    // the live preview, which the round has trimmed). Round the edges that DID
-                    // resolve and report the rest as a non-fatal warning. Only a total miss errors.
+                    // Chamfer retains its previous partial-selector behavior. Fillet
+                    // selectors were checked above and must all resolve.
                     if (picks.edges.empty()) {
                         std::string msg = type + ": none of the selected edges could be located on "
                             "the body";
@@ -5848,23 +6529,19 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     throw std::runtime_error(type + ": no edges matched the query");
 
                 TopoDS_Shape out;
-                int n_dropped = 0;      // explicit picks that couldn't be blended at this size
-                std::string contact_why;  // why a fillet could not join bodies at a shared edge
-                double blend_size = 0.0;  // radius / distance, for the warning text
-                // Read the requested size first so a SUB-TOLERANCE blend can be detected
-                // BEFORE OCCT runs (Bug K6): a positive radius/distance below the modelling
-                // tolerance (1e-7) removes no detectable material — OCCT no-ops it or hands
-                // back the body unchanged, which used to report a silent success. Warn,
-                // pass the body through unchanged, and skip the (pointless) kernel call.
+                int n_dropped = 0;      // chamfer picks that could not be beveled
+                double blend_size = 0.0;  // radius / distance in millimeters
+                std::optional<::geom::FilletResult> fillet_result;
                 const char* size_key = type == "fillet" ? "radius" : "distance";
                 if (!feat.contains(size_key) || feat.at(size_key).is_null())
                     throw std::runtime_error(type + ": missing required " +
                                              (type == "fillet" ? std::string("radius")
                                                                : std::string("distance/length")));
                 blend_size = num_or_expr(feat.at(size_key), env);
-                if (!(blend_size > 0.0))
-                    throw std::runtime_error(
-                        type + (type == "fillet" ? " radius must be > 0" : " distance must be > 0"));
+                if (type == "fillet" && !std::isfinite(blend_size))
+                    throw std::runtime_error("fillet: radius must be finite");
+                if (type == "chamfer" && !(blend_size > 0.0))
+                    throw std::runtime_error("chamfer distance must be > 0");
                 double chamfer_angle = 0.0;
                 std::optional<TopoDS_Face> chamfer_reference_face;
                 if (type == "chamfer" && blend_type == "distance_angle") {
@@ -5907,30 +6584,61 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         chamfer_reference_face = face;
                     }
                 }
-                bool sub_tolerance = blend_size < 1e-7;
+                // The pre-existing tiny-distance pass-through is chamfer-only. A
+                // fillet must always produce a real blend on every selected edge.
+                const bool sub_tolerance = type == "chamfer" && blend_size < 1e-7;
                 if (sub_tolerance) {
                     char buf[160];
                     std::snprintf(buf, sizeof(buf),
-                        "%s %.3g below tolerance; no material removed", type.c_str(), blend_size);
+                        "chamfer %.3g below tolerance; no material removed", blend_size);
                     st.warning = buf;
-                    out = body;  // pass through unchanged — the blend is a no-op
+                    out = body;
                 } else if (type == "fillet") {
-                    const double radius = blend_size;
-                    // Variable-radius fillet (dress.py): a linear law r1->r2 along the edge,
-                    // active when radius2 > 0 and differs from radius. Requires picked edges
-                    // (the variable law is per-edge; the dir-filter path stays uniform).
-                    double radius2 = ((blend_type.empty() || blend_type == "variable") &&
-                                      feat.contains("radius2"))
-                        ? num_or_expr(feat.at("radius2"), env) : 0.0;
-                    const bool variable = (blend_type.empty() || blend_type == "variable") &&
-                                          picked && radius2 > 0.0 &&
-                                          std::abs(radius2 - radius) > 1e-9;
-                    if (variable)
-                        out = ::geom::fillet_edges_variable(body, radius, radius2, *picked, &n_dropped);
-                    else
-                        out = picked ? ::geom::fillet_edges(body, radius, *picked, &n_dropped,
-                                                            &contact_why)
-                                     : ::geom::fillet_edges(body, radius, dir);
+                    std::optional<double> radius2;
+                    if ((blend_type.empty() || blend_type == "variable") &&
+                        feat.contains("radius2") && !feat.at("radius2").is_null()) {
+                        const double requested = num_or_expr(feat.at("radius2"), env);
+                        if (!std::isfinite(requested))
+                            throw std::runtime_error("fillet: radius2 must be finite");
+                        // No subtype keeps the legacy absent/zero/equal constant
+                        // interpretation. A nonzero unequal radius2 selects the
+                        // variable law even when the endpoints differ only slightly.
+                        // Explicit variable mode always retains its endpoint law.
+                        if (blend_type == "variable" ||
+                            (picked && requested != 0.0 && requested != blend_size))
+                            radius2 = requested;
+                    }
+                    auto bk_src = body_kinds.find(body_id);
+                    const bool src_is_surface =
+                        bk_src != body_kinds.end() && bk_src->second == "surface";
+                    ::geom::FilletValidation validate;
+                    if (!src_is_surface)
+                        validate = {::geom::FilletValidationPolicy::document_solid,
+                                    &validate_fillet_solid};
+                    fillet_result = picked
+                        ? ::geom::fillet_edges(body, blend_size, *picked, radius2, validate)
+                        : ::geom::fillet_edges(body, blend_size, dir, radius2, validate);
+                    const auto& result = *fillet_result;
+                    if (result.failure != ::geom::FilletFailure::none || result.shape.IsNull())
+                        throw std::runtime_error("fillet: " +
+                            (result.reason.empty()
+                                ? std::string("could not construct a valid blend on every selected edge; revise the radius or selection")
+                                : result.reason));
+                    if (result.selected_edges <= 0 ||
+                        result.covered_edges != result.selected_edges ||
+                        (picked && result.selected_edges != static_cast<int>(picked->size())) ||
+                        result.requested_radius != blend_size ||
+                        result.requested_radius2 != radius2 ||
+                        !std::isfinite(result.effective_radius) || result.effective_radius <= 0.0 ||
+                        result.effective_radius2.has_value() != radius2.has_value() ||
+                        (result.effective_radius2 &&
+                         (!std::isfinite(*result.effective_radius2) || *result.effective_radius2 <= 0.0)) ||
+                        !std::isfinite(result.tolerance_mm) || result.tolerance_mm < 0.0 ||
+                        result.probes <= 0)
+                        throw std::runtime_error(
+                            "fillet: kernel did not produce a valid result covering every selected edge");
+                    out = result.shape;
+                    blend_size = result.effective_radius;
                 } else {
                     const double distance = blend_size;
                     // Two-distance (asymmetric) chamfer (dress.py): leg d1 on one face, d2
@@ -5961,12 +6669,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                                      : ::geom::chamfer_edges(body, distance, dir);
                 }
                 if (out.IsNull()) {
-                    // A shared edge between two bodies the joining fillet can't serve:
-                    // name the reason rather than calling the radius too large.
-                    if (!contact_why.empty())
-                        throw std::runtime_error(type + ": " + contact_why);
-                    // A null kernel result does not establish radius feasibility:
-                    // unsupported edge topology and failed corner construction also land here.
+                    // A null kernel result does not establish size feasibility.
                     if (picked && !picked->empty()) {
                         char buf[256];
                         std::snprintf(buf, sizeof(buf),
@@ -5979,66 +6682,46 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     }
                     throw std::runtime_error(type + " produced an empty shape");
                 }
-                // "Too large for the BODY" guard. Best-effort dropping is meant to skip a FEW
-                // too-tight edges (a tight rim, a small boss) while rounding the rest — NOT to
-                // quietly commit a heavily-reduced body when the size is infeasible for MOST of
-                // the selection. If more than half the picked edges had to be dropped, the size
-                // is simply too large here: fail loudly and leave the body intact (the user's
-                // intent on an oversize "round everything" — B6-2). The watertight drop-blender
-                // still handles the genuine "round 149 of 190, skip 41" case, where only a small
-                // fraction drops, by committing the closed partial with a warning.
-                if (!sub_tolerance && picked && n_dropped * 2 > static_cast<int>(picked->size())) {
-                    if (!contact_why.empty())
-                        throw std::runtime_error(type + ": " + contact_why);
+                // Chamfers retain their existing partial-edge behavior.
+                if (type == "chamfer" && !sub_tolerance && picked &&
+                    n_dropped * 2 > static_cast<int>(picked->size())) {
                     char tbuf[224];
                     std::snprintf(tbuf, sizeof(tbuf),
                         "%s: %.4g mm is too large for this body — %d of %d selected edge(s) "
                         "couldn't be %s. Reduce the %s or select fewer edges.",
                         type.c_str(), blend_size, n_dropped, static_cast<int>(picked->size()),
-                        type == "fillet" ? "rounded" : "beveled",
+                        "chamfered",
                         type == "fillet" ? "radius" : "distance");
                     throw std::runtime_error(tbuf);
                 }
-                // Partial success: some selected edges were too tight for the size, and/or some
-                // selectors couldn't be located on the body (stale preview pick). The feature still
-                // applies to the edges that worked — surface the rest as a non-fatal warning so the
-                // user knows to lower the size or re-pick, rather than silently leaving them sharp.
-                if (!sub_tolerance && picked && (n_dropped > 0 || n_dangling > 0)) {
+                // Chamfer reports any edges dropped or dangling selectors.
+                if (type == "chamfer" && !sub_tolerance && picked &&
+                    (n_dropped > 0 || n_dangling > 0)) {
                     const int requested = (int)picked->size() + n_dangling;
-                    const int rounded = (int)picked->size() - n_dropped;
+                    const int chamfered = (int)picked->size() - n_dropped;
                     char buf[240];
                     const char* sz = type == "fillet" ? "radius" : "distance";
                     if (n_dangling > 0 && n_dropped > 0)
                         std::snprintf(buf, sizeof(buf),
-                            "rounded %d of %d edge(s) at %.4g mm; %d too tight, %d couldn't be "
+                            "chamfered %d of %d edge(s) at %.4g mm; %d too tight, %d couldn't be "
                             "located - lower the %s or re-pick those edge(s)",
-                            rounded, requested, blend_size, n_dropped, n_dangling, sz);
+                            chamfered, requested, blend_size, n_dropped, n_dangling, sz);
                     else if (n_dropped > 0)
                         std::snprintf(buf, sizeof(buf),
-                            "rounded %d of %d edge(s) at %.4g mm; %d too tight - lower the %s or "
+                            "chamfered %d of %d edge(s) at %.4g mm; %d too tight - lower the %s or "
                             "deselect those edge(s)",
-                            rounded, requested, blend_size, n_dropped, sz);
+                            chamfered, requested, blend_size, n_dropped, sz);
                     else
                         std::snprintf(buf, sizeof(buf),
-                            "rounded %d of %d edge(s); %d selector(s) couldn't be located - re-pick "
+                            "chamfered %d of %d edge(s); %d selector(s) couldn't be located - re-pick "
                             "those edge(s)",
-                            rounded, requested, n_dangling);
-                    st.warning = contact_why.empty() ? std::string(buf)
-                                                     : std::string(buf) + " (" + contact_why + ")";
+                            chamfered, requested, n_dangling);
+                    st.warning = buf;
                 }
 
-                // OPEN-SHELL guard (Bug S2): the drop-failing blender rounds the FEASIBLE
-                // edges and skips the too-tight ones — but if a skipped edge was geometry
-                // OCCT couldn't reseal, the committed B-rep can be an OPEN shell (genuine
-                // free edges) even though its volume is positive (so the N2 negative-volume
-                // guard passes). eval_check would then report free_edges and STEP-export
-                // re-validation would fail, yet the feature reported ok:true. A dress op
-                // must NEVER ship an open body: validate the result is a CLOSED solid using
-                // the SEAM-AWARE free-edge test (so a valid cylinder/sphere/revolved body's
-                // seam edges are NOT mistaken for free edges). A sub-tolerance pass-through
-                // (out == body) is the unchanged input, already closed — skip the check.
-                // SURFACE (open sheet) source bodies are legitimately open — skip the
-                // closed-solid post-check for them (mirrors sanitize_solid's surface exemption).
+                // Final independent validation applies even to a fillet candidate
+                // already checked during search. Surface sources remain exempt from
+                // solid closure checks, as does the chamfer-only pass-through.
                 {
                     auto bk_src = body_kinds.find(body_id);
                     const bool src_is_surface =
@@ -6061,6 +6744,44 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                                 " mm produced invalid geometry: " + rejection +
                                 ". Reduce the " + (type == "fillet" ? "radius" : "distance") +
                                 " or revise the selected edges; the preceding body is unchanged.");
+                    }
+                }
+                if (fillet_result) {
+                    const auto& result = *fillet_result;
+                    bool lower = result.effective_radius > result.requested_radius;
+                    bool upper = result.effective_radius < result.requested_radius;
+                    if (result.requested_radius2 && result.effective_radius2) {
+                        lower = lower || *result.effective_radius2 > *result.requested_radius2;
+                        upper = upper || *result.effective_radius2 < *result.requested_radius2;
+                    }
+                    const char* adjustment = lower && upper ? "both" : lower ? "lower" :
+                                             upper ? "upper" : "none";
+                    st.data = {{"fillet", {
+                        {"requested", {{"radius", result.requested_radius},
+                                       {"radius2", result.requested_radius2
+                                           ? json(*result.requested_radius2) : json(nullptr)}}},
+                        {"effective", {{"radius", result.effective_radius},
+                                       {"radius2", result.effective_radius2
+                                           ? json(*result.effective_radius2) : json(nullptr)}}},
+                        {"adjustment", adjustment},
+                        {"selected_edges", result.selected_edges},
+                        {"covered_edges", result.covered_edges},
+                        {"tolerance_mm", result.tolerance_mm},
+                        {"probes", result.probes}
+                    }}};
+                    if (lower || upper) {
+                        char buf[256];
+                        if (result.requested_radius2) {
+                            std::snprintf(buf, sizeof(buf),
+                                "fillet radii adjusted from %.12g, %.12g mm to %.12g, %.12g mm",
+                                result.requested_radius, *result.requested_radius2,
+                                result.effective_radius, *result.effective_radius2);
+                        } else {
+                            std::snprintf(buf, sizeof(buf),
+                                "fillet radius adjusted from %.12g mm to %.12g mm",
+                                result.requested_radius, result.effective_radius);
+                        }
+                        st.warning = buf;
                     }
                 }
 
@@ -6208,18 +6929,23 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     tool_body_of[id] = res;
                     feature_op_of[id] = "add";
                 }
-                {
-                    // Additive pattern: tool_body_of/res above intentionally holds the
-                    // whole GROWN body (so an outer pattern can re-fuse it wholesale);
-                    // for overlap detection we want only the material THIS feature
-                    // added, so build the seed+copies union the same way the cut branch
-                    // already does for pattern_tool.
-                    TopoDS_Shape overlap_tool = pattern_tool;
-                    if (seed_op != "cut") {
-                        TopoDS_Shape pu = ::geom::fuse_many(seed_tool, copies);
-                        if (!pu.IsNull()) overlap_tool = pu;
+                if (!copies.empty()) {
+                    // The seed is already a feature of its own. Record only new
+                    // instances, without subtracting any real overlap with the seed.
+                    TopoDS_Shape overlap_tool = copies.front();
+                    copies.erase(copies.begin());
+                    if (!copies.empty()) {
+                        try {
+                            overlap_tool = ::geom::fuse_many(overlap_tool, copies);
+                        } catch (const Standard_Failure&) {
+                            overlap_tool.Nullify();
+                        }
                     }
-                    record_tool(id, seed_op == "cut" ? "cut" : "add", overlap_tool);
+                    if (overlap_tool.IsNull())
+                        result.tool_recs.push_back(
+                            ToolRec{id, "unavailable_pattern_" + seed_op, TopoDS_Shape()});
+                    else
+                        record_tool(id, seed_op == "cut" ? "cut" : "add", overlap_tool);
                 }
 
                 results[id] = SolidResult{res};
@@ -6251,8 +6977,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         " instances exceeds the limit (" +
                         std::to_string(kPatternInstanceLimit) + "); reduce the count");
 
-                // Angle is in DEGREES (SolidWorks + pattern.py convention) — note this
-                // DIFFERS from revolve's angle, which is radians.
+                // Angle is in DEGREES (SolidWorks + pattern.py convention), the same unit
+                // as revolve's angle.
                 const double angle_deg = feat.contains("angle")
                     ? num_or_expr(feat.at("angle"), env) : 360.0;
                 const bool equal_spacing = feat.value("equal_spacing", true);
@@ -6309,12 +7035,20 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     feature_op_of[id] = "add";
                 }
                 {
-                    TopoDS_Shape overlap_tool = pattern_tool;
-                    if (seed_op != "cut") {
-                        TopoDS_Shape pu = ::geom::fuse_many(seed_tool, copies);
-                        if (!pu.IsNull()) overlap_tool = pu;
+                    TopoDS_Shape overlap_tool = copies.front();
+                    copies.erase(copies.begin());
+                    if (!copies.empty()) {
+                        try {
+                            overlap_tool = ::geom::fuse_many(overlap_tool, copies);
+                        } catch (const Standard_Failure&) {
+                            overlap_tool.Nullify();
+                        }
                     }
-                    record_tool(id, seed_op == "cut" ? "cut" : "add", overlap_tool);
+                    if (overlap_tool.IsNull())
+                        result.tool_recs.push_back(
+                            ToolRec{id, "unavailable_pattern_" + seed_op, TopoDS_Shape()});
+                    else
+                        record_tool(id, seed_op == "cut" ? "cut" : "add", overlap_tool);
                 }
 
                 results[id] = SolidResult{res};
@@ -6547,6 +7281,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                             std::abs(angle_deg) > 1e-9 ? radians(angle_deg) : 0.0;
                         std::vector<ToolRec> moved_copies;
                         for (ToolRec& tr : result.tool_recs) {
+                            if (tr.tool.IsNull()) continue;  // unavailable diagnostic has no pose
                             bool mine = moved.count(tr.feature_id) > 0;
                             bool shared = mine && stays.count(tr.feature_id) > 0;
                             if (!mine && !stays.count(tr.feature_id) && touches(tr.tool, body)) {
@@ -6579,6 +7314,395 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                                  "(zero motion — no translate/rotate given)";
                 st.ok = true;
 
+            } else if (type == "refine") {
+                st.data = {{"attempted", false}, {"changed", false}};
+                auto refuse = [&](const std::string& reason) -> void {
+                    st.data["refusal"] = reason;
+                    throw std::runtime_error("refine REFUSED; body unchanged: " + reason);
+                };
+                try {
+                    const std::string body_id = body_ref(feat);
+                    if (body_id.empty()) refuse("no target body and no current body");
+                    std::string eff_id = body_id;
+                    std::set<std::string> guard;
+                    while (consumed.count(eff_id) && superseded_by.count(eff_id) &&
+                           guard.insert(eff_id).second)
+                        eff_id = superseded_by[eff_id];
+                    if (consumed.count(eff_id))
+                        refuse("target body is consumed and has no live replacement");
+                    const TopoDS_Shape& body = require_solid(results, eff_id, "body");
+                    // Appending a replacement otherwise reorders b1/b2/... and silently
+                    // transfers ordinal-indexed body materials and appearances.
+                    if (eff_id != current_solid_id())
+                        refuse("target is not the current body; replacing it would reorder body "
+                               "material and appearance assignments");
+                    const auto count = [](const TopoDS_Shape& shape, TopAbs_ShapeEnum kind) {
+                        TopTools_IndexedMapOfShape map;
+                        TopExp::MapShapes(shape, kind, map);
+                        return map.Extent();
+                    };
+                    const auto bounds = [&](const TopoDS_Shape& shape) {
+                        Bnd_Box box;
+                        BRepBndLib::Add(shape, box, Standard_False);
+                        if (box.IsVoid() || box.IsOpen()) refuse("bounding box is unavailable");
+                        std::array<double, 6> v{};
+                        box.Get(v[0], v[1], v[2], v[3], v[4], v[5]);
+                        for (double x : v)
+                            if (!std::isfinite(x)) refuse("bounding box is non-finite");
+                        return v;
+                    };
+                    const auto volume = [&](const TopoDS_Shape& shape) {
+                        GProp_GProps props;
+                        BRepGProp::VolumeProperties(shape, props);
+                        const double v = props.Mass();
+                        if (!std::isfinite(v)) refuse("material volume is non-finite");
+                        return v;
+                    };
+                    const int nsolids = count(body, TopAbs_SOLID);
+                    const int nfaces = count(body, TopAbs_FACE);
+                    const int nedges = count(body, TopAbs_EDGE);
+                    const bool before_valid = !body.IsNull() && BRepCheck_Analyzer(body).IsValid();
+                    st.data["before"] = {{"faces", nfaces}, {"edges", nedges},
+                                         {"solids", nsolids}, {"valid", before_valid}};
+                    if (!before_valid || nsolids == 0 || nfaces == 0)
+                        refuse("input is not a valid solid; use heal for repair");
+                    auto only_solid_topology = [&](const TopoDS_Shape& shape) {
+                        for (TopAbs_ShapeEnum kind : {TopAbs_FACE, TopAbs_EDGE, TopAbs_VERTEX}) {
+                            TopTools_IndexedMapOfShape all, in_solids;
+                            TopExp::MapShapes(shape, kind, all);
+                            for (TopExp_Explorer ex(shape, TopAbs_SOLID); ex.More(); ex.Next())
+                                TopExp::MapShapes(ex.Current(), kind, in_solids);
+                            if (all.Extent() != in_solids.Extent()) return false;
+                        }
+                        return true;
+                    };
+                    if (!only_solid_topology(body))
+                        refuse("input has topology outside its solid material");
+                    const double before_volume = volume(body);
+                    if (!(before_volume > 0.0)) refuse("input has no positive material volume");
+                    const auto before_box = bounds(body);
+                    st.data["before"]["volume_mm3"] = before_volume;
+                    st.data["before"]["bbox_mm"] = before_box;
+
+                    // Safe-input mode alone is insufficient: OCCT can edit shared edge
+                    // TShapes. Copy topology before unification, just as geom::unify_same_domain
+                    // does, but never convert an exception or missing result to success.
+                    BRepBuilderAPI_Copy copier(body, Standard_False, Standard_False);
+                    if (!copier.IsDone() || copier.Shape().IsNull())
+                        refuse("the topology copy failed");
+                    TopTools_ListOfShape args;
+                    args.Append(body);
+                    Handle(BRepTools_History) copy_history = new BRepTools_History(args, copier);
+                    ShapeUpgrade_UnifySameDomain unify(copier.Shape(), Standard_True,
+                                                       Standard_True, Standard_False);
+                    st.data["attempted"] = true;
+                    unify.Build();
+                    TopoDS_Shape out = unify.Shape();
+                    if (out.IsNull() || unify.History().IsNull())
+                        refuse("same-domain unification returned no shape or operation history");
+                    const std::vector<Handle(BRepTools_History)> histories = {
+                        copy_history, unify.History()};
+                    const int out_solids = count(out, TopAbs_SOLID);
+                    const int out_faces = count(out, TopAbs_FACE);
+                    const int out_edges = count(out, TopAbs_EDGE);
+                    const bool after_valid = BRepCheck_Analyzer(out).IsValid();
+                    st.data["after"] = {{"faces", out_faces}, {"edges", out_edges},
+                                        {"solids", out_solids}, {"valid", after_valid}};
+                    if (!after_valid || out_solids != nsolids || out_faces == 0)
+                        refuse("result is invalid or changed the solid count");
+                    const double after_volume = volume(out);
+                    if (!(after_volume > 0.0)) refuse("result has no positive material volume");
+                    if (!only_solid_topology(out))
+                        refuse("result has topology outside its solid material");
+                    const auto after_box = bounds(out);
+                    st.data["after"]["volume_mm3"] = after_volume;
+                    st.data["after"]["bbox_mm"] = after_box;
+                    const double dx = before_box[3] - before_box[0];
+                    const double dy = before_box[4] - before_box[1];
+                    const double dz = before_box[5] - before_box[2];
+                    const double bbox_tolerance =
+                        std::max(10.0 * Precision::Confusion(), std::sqrt(dx*dx + dy*dy + dz*dz) * 1e-9);
+                    double bbox_delta = 0.0;
+                    for (std::size_t i = 0; i < before_box.size(); ++i)
+                        bbox_delta = std::max(bbox_delta, std::abs(before_box[i] - after_box[i]));
+                    st.data["bbox_max_difference_mm"] = bbox_delta;
+                    st.data["bbox_tolerance_mm"] = bbox_tolerance;
+                    if (bbox_delta > bbox_tolerance) refuse("bounding box changed");
+
+                    // Equal total volumes are not evidence of equal material. Test both
+                    // directional differences with non-destructive kernel booleans.
+                    auto difference = [&](const TopoDS_Shape& left, const TopoDS_Shape& right,
+                                          const char* direction) {
+                        TopTools_ListOfShape a, b;
+                        a.Append(left);
+                        b.Append(right);
+                        BRepAlgoAPI_Cut cut;
+                        cut.SetArguments(a);
+                        cut.SetTools(b);
+                        cut.SetNonDestructive(Standard_True);
+                        json& check = st.data["material_difference_checks"][direction];
+                        check = {{"done", false}, {"has_errors", nullptr}, {"has_warnings", nullptr},
+                                 {"result_null", nullptr}, {"result_valid", nullptr}};
+                        try {
+                            cut.Build();
+                            const bool done = cut.IsDone();
+                            const bool errors = cut.HasErrors();
+                            const bool warnings = cut.HasWarnings();
+                            check["done"] = done;
+                            check["has_errors"] = errors;
+                            check["has_warnings"] = warnings;
+                            if (errors) {
+                                std::ostringstream report;
+                                cut.DumpErrors(report);
+                                check["errors"] = report.str();
+                            }
+                            if (warnings) {
+                                std::ostringstream report;
+                                cut.DumpWarnings(report);
+                                check["warnings"] = report.str();
+                            }
+                            if (done) {
+                                const TopoDS_Shape& residual = cut.Shape();
+                                check["result_null"] = residual.IsNull();
+                                if (!residual.IsNull())
+                                    check["result_valid"] = BRepCheck_Analyzer(residual).IsValid();
+                            }
+                            if (!done || errors || warnings || check["result_null"] == true ||
+                                check["result_valid"] != true)
+                                refuse(std::string("the ") + direction +
+                                       " directional material-difference check was inconclusive");
+                            return std::abs(volume(cut.Shape()));
+                        } catch (const Standard_Failure& e) {
+                            check["exception"] = e.GetMessageString() ? e.GetMessageString() : "OCCT failure";
+                            if (check["has_errors"].is_null()) {
+                                check["done"] = cut.IsDone();
+                                check["has_errors"] = cut.HasErrors();
+                                check["has_warnings"] = cut.HasWarnings();
+                                if (cut.HasErrors()) {
+                                    std::ostringstream report;
+                                    cut.DumpErrors(report);
+                                    check["errors"] = report.str();
+                                }
+                                if (cut.HasWarnings()) {
+                                    std::ostringstream report;
+                                    cut.DumpWarnings(report);
+                                    check["warnings"] = report.str();
+                                }
+                            }
+                            throw;
+                        }
+                    };
+                    const double removed = difference(body, out, "removed");
+                    st.data["material_difference_mm3"]["removed"] = removed;
+                    const double added = difference(out, body, "added");
+                    const double material_tolerance = std::max(1e-9, before_volume * 1e-10);
+                    st.data["material_difference_mm3"] =
+                        {{"removed", removed}, {"added", added}, {"tolerance", material_tolerance}};
+                    if (removed > material_tolerance || added > material_tolerance)
+                        refuse("directional material difference exceeds tolerance");
+
+                    const RefineTopology faces = refine_topology(body, out, TopAbs_FACE, histories);
+                    const RefineTopology edges = refine_topology(body, out, TopAbs_EDGE, histories);
+                    const RefineTopology vertices = refine_topology(body, out, TopAbs_VERTEX, histories);
+                    // Every resulting face/edge must be explained by the operation history,
+                    // and the analytic surface/curve kind must survive each mapping.
+                    for (int j = 1; j <= faces.after.Extent(); ++j)
+                        if (faces.predecessors[static_cast<std::size_t>(j)] == 0)
+                            refuse("result face has no trustworthy source history");
+                    for (int i = 1; i <= faces.before.Extent(); ++i) {
+                        const auto& images = faces.images[static_cast<std::size_t>(i)];
+                        if (images.empty()) refuse("source face has no trustworthy result history");
+                        const auto old_type = BRepAdaptor_Surface(TopoDS::Face(faces.before.FindKey(i))).GetType();
+                        for (int j : images)
+                            if (BRepAdaptor_Surface(TopoDS::Face(faces.after.FindKey(j))).GetType() != old_type)
+                                refuse("a face changed analytic surface type");
+                    }
+                    for (int j = 1; j <= edges.after.Extent(); ++j)
+                        if (edges.predecessors[static_cast<std::size_t>(j)] == 0)
+                            refuse("result edge has no trustworthy source history");
+                    for (int i = 1; i <= edges.before.Extent(); ++i) {
+                        const TopoDS_Edge old_edge = TopoDS::Edge(edges.before.FindKey(i));
+                        for (int j : edges.images[static_cast<std::size_t>(i)]) {
+                            const TopoDS_Edge new_edge = TopoDS::Edge(edges.after.FindKey(j));
+                            const bool old_degenerate = BRep_Tool::Degenerated(old_edge);
+                            if (old_degenerate != BRep_Tool::Degenerated(new_edge))
+                                refuse("an edge changed degeneracy");
+                            if (!old_degenerate &&
+                                BRepAdaptor_Curve(old_edge).GetType() != BRepAdaptor_Curve(new_edge).GetType())
+                                refuse("an edge changed analytic curve type");
+                        }
+                    }
+                    const bool changed = !refine_one_to_one(faces) || !refine_one_to_one(edges);
+                    st.data["candidate_changed"] = changed;
+                    // Only transform/heal/refine follow superseded_by. Other explicit
+                    // body consumers would read a cached ancestor and leave the refined
+                    // body live, even when refinement made no topology change.
+                    std::set<std::string> old_body_ids{eff_id};
+                    for (const auto& link : superseded_by) {
+                        std::string cursor = link.first;
+                        std::set<std::string> visited;
+                        while (consumed.count(cursor) && superseded_by.count(cursor) &&
+                               visited.insert(cursor).second)
+                            cursor = superseded_by.at(cursor);
+                        if (cursor == eff_id) old_body_ids.insert(link.first);
+                    }
+                    const auto old_body_ref = [&](const json& ref) {
+                        if (ref.is_array()) {
+                            for (const auto& item : ref)
+                                if (old_body_ids.count(selector_owner_id(item))) return true;
+                            return false;
+                        }
+                        return old_body_ids.count(selector_owner_id(ref)) != 0;
+                    };
+                    for (std::size_t k = _fi + 1; k < active_features; ++k) {
+                        const json later = normalize_feature(features[k]);
+                        if (features[k].value("suppressed", false) ||
+                            later.value("suppressed", false)) continue;
+                        const std::string later_type = later.value("type", std::string());
+                        const bool reads_body =
+                            later_type == "rib" || later_type == "fillet" || later_type == "chamfer" ||
+                            later_type == "mirror" || later_type == "hole" || later_type == "bolt_circle" ||
+                            later_type == "shell" || later_type == "draft" || later_type == "thread" ||
+                            later_type == "text" || later_type == "surf_offset" ||
+                            later_type == "surf_delete_face" || later_type == "surf_untrim" ||
+                            later_type == "surf_replace_face";
+                        bool stale_target = reads_body &&
+                                            later.contains("body") && old_body_ref(later["body"]);
+                        if (later_type == "boolean")
+                            stale_target = (later.contains("a") && old_body_ref(later["a"])) ||
+                                           (later.contains("b") && old_body_ref(later["b"]));
+                        if (later_type == "surf_trim" || later_type == "surf_thicken")
+                            stale_target = later.contains("surface") && old_body_ref(later["surface"]);
+                        if (later_type == "surf_knit")
+                            stale_target = later.contains("surfaces") && old_body_ref(later["surfaces"]);
+                        if (stale_target)
+                            refuse("downstream feature '" + later.value("id", std::string("?")) +
+                                   "' explicitly targets a superseded source body; target the refine result");
+                    }
+                    if (changed) {
+                        for (std::size_t k = _fi + 1; k < n_features; ++k) {
+                            const json later = normalize_feature(features[k]);
+                            const std::string later_type = later.value("type", std::string());
+                            if ((later_type == "fillet" || later_type == "chamfer") &&
+                                !later.contains("edges") && !later.contains("vertices"))
+                                refuse("downstream feature '" + later.value("id", std::string("?")) +
+                                       "' implicitly selects edges whose topology changed");
+                            if (!refine_references_safe(features[k], body, out, faces, edges, vertices))
+                                refuse("downstream feature '" +
+                                       features[k].value("id", std::string("?")) +
+                                       "' has an ambiguous or changed topology reference");
+                        }
+                        for (auto it = doc.begin(); it != doc.end(); ++it) {
+                            if (it.key() == "features" || it.key() == "face_appearances") continue;
+                            if (!refine_references_safe(it.value(), body, out, faces, edges, vertices))
+                                refuse("document field '" + it.key() + "' has an ambiguous topology reference");
+                        }
+                        const auto all = doc.find("face_appearances");
+                        if (all != doc.end() && !all->is_object())
+                            refuse("face appearance records are malformed");
+                        bool has_finishes = false;
+                        if (all != doc.end())
+                            for (auto it = all->begin(); it != all->end(); ++it)
+                                if (!it.value().is_object() || !it.value().empty()) {
+                                    has_finishes = true;
+                                    break;
+                                }
+                        if (has_finishes) {
+                            // Finish keys refer to FINAL surviving-body ordinals, not the
+                            // number of bodies live at this point. Simulate suffix moves
+                            // when their lineage is unambiguous; other solid operations may
+                            // change body order or topology in ways we cannot prove here.
+                            std::vector<std::string> live;
+                            for (const auto& sid : solid_order)
+                                if (!consumed.count(sid) && sid != eff_id) live.push_back(sid);
+                            live.push_back(id);
+                            auto links = superseded_by;
+                            links[eff_id] = id;
+                            // true means a downstream transform changed this descendant's
+                            // pose, so its final finish cannot be checked against `out`.
+                            std::map<std::string, bool> descendants{{id, false}};
+                            for (std::size_t k = _fi + 1; k < active_features; ++k) {
+                                const json later = normalize_feature(features[k]);
+                                if (features[k].value("suppressed", false) ||
+                                    later.value("suppressed", false)) continue;
+                                const std::string lt = later.value("type", std::string());
+                                if (lt == "sketch" || lt == "sketch3d" || lt == "plane" ||
+                                    lt == "axis" || lt == "point" || lt == "csys" || lt == "helix")
+                                    continue;
+                                if (lt != "transform")
+                                    refuse("final body order for face finishes cannot be proven through downstream feature '" +
+                                           later.value("id", std::string("?")) + "'");
+                                std::string target = later.contains("body")
+                                    ? selector_owner_id(later["body"])
+                                    : (live.empty() ? std::string() : live.back());
+                                std::set<std::string> visited;
+                                while (std::find(live.begin(), live.end(), target) == live.end() &&
+                                       links.count(target) && visited.insert(target).second)
+                                    target = links.at(target);
+                                auto pos = std::find(live.begin(), live.end(), target);
+                                if (pos == live.end())
+                                    refuse("final body order for face finishes cannot be proven through a transform target");
+                                const std::string next = later.value("id", std::string());
+                                if (next.empty())
+                                    refuse("final body order for face finishes cannot be proven through an unnamed transform");
+                                const bool copy = later.value("copy", false);
+                                auto descendant = descendants.find(target);
+                                if (descendant != descendants.end()) {
+                                    Eigen::Vector3d translation = Eigen::Vector3d::Zero();
+                                    if (auto t = opt_vec3(later, "translate")) translation = *t;
+                                    const json rotation = later.value("rotate", json());
+                                    const double angle = rotation.is_object() && rotation.contains("angle")
+                                        ? num_or_expr(rotation.at("angle"), env)
+                                        : later.contains("angle") ? num_or_expr(later.at("angle"), env) : 0.0;
+                                    const bool same_pose =
+                                        translation.x() == 0.0 && translation.y() == 0.0 &&
+                                        translation.z() == 0.0 && std::abs(angle) <= 1e-9;
+                                    descendants[next] = descendant->second || !same_pose;
+                                    if (!copy) descendants.erase(descendant);
+                                }
+                                if (!copy) {
+                                    live.erase(pos);
+                                    links[target] = next;
+                                }
+                                live.push_back(next);
+                            }
+                            for (std::size_t k = 0; k < live.size(); ++k) {
+                                const auto descendant = descendants.find(live[k]);
+                                if (descendant == descendants.end()) continue;
+                                const std::string key = "b" + std::to_string(k + 1);
+                                if (!all->contains(key)) continue;
+                                const json& records = all->at(key);
+                                if (!records.is_object()) refuse("face appearance records are malformed");
+                                if (descendant->second && !records.empty())
+                                    refuse("a face finish on a downstream transformed refine result cannot be mapped");
+                                for (auto it = records.begin(); it != records.end(); ++it) {
+                                    if (!it.value().is_object() || !it.value().contains("selector") ||
+                                        !it.value().contains("appearance") ||
+                                        !refine_preserves_fingerprint(body, out, faces, it.value()["selector"]))
+                                        refuse("a face finish cannot be preserved unambiguously");
+                                }
+                            }
+                        }
+                        ::geom::op_history_record(copy_history);
+                        ::geom::op_history_record(unify.History());
+                    } else {
+                        // No topology reduction: retain the original exact handle and finishes.
+                        out = body;
+                        st.warning = "refine found no same-domain faces or edges to merge";
+                    }
+                    st.data["changed"] = changed;
+                    consumed.insert(eff_id);
+                    superseded_by[eff_id] = id;
+                    source_of[id] = eff_id;
+                    tool_body_of[id] = out;
+                    feature_op_of[id] = "add";
+                    results[id] = SolidResult{out};
+                    solid_order.push_back(id);
+                    st.ok = true;
+                } catch (const Standard_Failure& e) {
+                    refuse(std::string("kernel could not prove a safe refinement: ") +
+                           (e.GetMessageString() ? e.GetMessageString() : "OCCT failure"));
+                }
             } else if (type == "heal") {
                 // REPAIR a topologically broken solid — the op that had no answer before.
                 // A live frame assembly's imported STEP spine failed health with
@@ -7886,6 +9010,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     rec.wall_length = wall; rec.position = position;
                     rec.p_start = fr.p_start; rec.p_end = fr.p_end;
                     rec.e_dir = fr.e_dir; rec.length_dir = fr.length_dir;
+                    rec.fold_dir = fold_dir;
                     new_recs.push_back(rec);
 
                 } else if (type == "sm_hem") {
@@ -7922,9 +9047,10 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                     rec.thickness = thickness;
                     rec.bend_allowance = ::geom::sm_bend_allowance(bend_angle, inner_radius,
                                                                    thickness, k_factor);
-                    rec.wall_length = length; rec.position = "material_inside";
+                    rec.wall_length = length; rec.position = "bend_outside";
                     rec.p_start = fr.p_start; rec.p_end = fr.p_end;
                     rec.e_dir = fr.e_dir; rec.length_dir = fr.length_dir;
+                    rec.fold_dir = fold_dir;
                     new_recs.push_back(rec);
 
                 } else {  // sm_jog
@@ -7972,18 +9098,35 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         thickness, ops, start_x, start_y);
                     rec_angle = angle_deg; rec_radius = inner_radius; rec_wall = wall;
                     rec_position = position;
-                    // up bend (wall = connector) + back bend (wall = length).
-                    for (double w : {connector, wall}) {
-                        ::geom::BendRecord rec;
-                        rec.angle = angle_deg; rec.radius = inner_radius;
-                        rec.thickness = thickness;
-                        rec.bend_allowance = ::geom::sm_bend_allowance(angle_deg, inner_radius,
-                                                                       thickness, k_factor);
-                        rec.wall_length = w; rec.position = position;
-                        rec.p_start = fr.p_start; rec.p_end = fr.p_end;
-                        rec.e_dir = fr.e_dir; rec.length_dir = fr.length_dir;
-                        new_recs.push_back(rec);
-                    }
+                    // Record the two actual tangent frames. The second bend
+                    // starts on the opposite skin of the connector and returns
+                    // toward the original sheet direction.
+                    ::geom::BendRecord first;
+                    first.angle = angle_deg; first.radius = inner_radius;
+                    first.thickness = thickness;
+                    first.bend_allowance = ::geom::sm_bend_allowance(
+                        angle_deg, inner_radius, thickness, k_factor);
+                    first.wall_length = connector; first.position = "bend_outside";
+                    first.p_start = fr.p_start + fr.length_dir * (start_x + pre_run + thickness);
+                    first.p_end = first.p_start + fr.e_dir * fr.edge_length;
+                    first.e_dir = fr.e_dir; first.length_dir = fr.length_dir;
+                    first.fold_dir = fold_dir;
+                    new_recs.push_back(first);
+                    const Eigen::Vector3d connector_dir =
+                        fr.length_dir * std::cos(ang) + fold_dir * std::sin(ang);
+                    const Eigen::Vector3d connector_radial =
+                        fr.length_dir * std::sin(ang) - fold_dir * std::cos(ang);
+                    ::geom::BendRecord second = first;
+                    second.wall_length = wall;
+                    second.p_start = first.p_start
+                        + fr.length_dir * (inner_radius * std::sin(ang))
+                        + fold_dir * (inner_radius * (1.0 - std::cos(ang)))
+                        + connector_dir * connector + connector_radial * thickness;
+                    second.p_end = second.p_start + fr.e_dir * fr.edge_length;
+                    second.length_dir = connector_dir;
+                    second.fold_dir = connector_radial;
+                    second.parent_index = static_cast<int>(bend_records.size());
+                    new_recs.push_back(second);
                 }
                 (void)rec_angle; (void)rec_radius; (void)rec_wall; (void)rec_position;
 
@@ -8008,7 +9151,10 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 if (ga.Mass() <= gb.Mass() + 1e-9)
                     throw std::runtime_error(type + ": added no material (degenerate placement?)");
 
-                for (const ::geom::BendRecord& r : new_recs) bend_records.push_back(r);
+                for (::geom::BendRecord& r : new_recs) {
+                    r.feature_id = id;
+                    bend_records.push_back(r);
+                }
                 consumed.insert(body_id);
                 source_of[id] = body_id;
                 results[id] = SolidResult{fused};
@@ -8016,10 +9162,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 st.ok = true;
 
             } else if (type == "sm_flat_pattern") {
-                // Unfold the running sheet-metal body into its FLAT PATTERN (developed
-                // blank): rebuild the flat base from the largest broad face + add one
-                // developed strip (BA + wall) per bend record. Port of
-                // engine/doc/features/sheetmetal_flat.py::compile_sm_flat_pattern.
+                // Develop the actual base and flange faces in a common frame.
                 if (!sheet_ctx.active)
                     throw std::runtime_error("sm_flat_pattern: the active body is not sheet metal");
                 const std::string body_id = current_solid_id();
@@ -8028,12 +9171,22 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 const TopoDS_Shape& body = require_solid(results, body_id, "body");
                 if (bend_records.empty())
                     throw std::runtime_error("sm_flat_pattern: the part has no bends to unfold");
+                std::string base_id;
+                for (auto it = result.statuses.rbegin(); it != result.statuses.rend(); ++it)
+                    if (it->ok && !it->rolled_back && it->type == "sm_base_flange") {
+                        base_id = it->id;
+                        break;
+                    }
+                if (base_id.empty())
+                    throw std::runtime_error("sm_flat_pattern: original base flange is unavailable");
+                const TopoDS_Shape& base = require_solid(results, base_id, "base flange");
 
                 ::geom::FlatPattern fpat =
-                    ::geom::sm_flat_pattern(body, sheet_ctx.thickness, bend_records);
+                    ::geom::sm_flat_pattern(body, base, sheet_ctx.thickness, bend_records);
                 const TopoDS_Shape& flat = fpat.solid;
                 if (flat.IsNull())
-                    throw std::runtime_error("sm_flat_pattern: produced an empty flat body");
+                    throw std::runtime_error("sm_flat_pattern: " +
+                        (fpat.error.empty() ? std::string("produced an empty flat body") : fpat.error));
                 GProp_GProps gf;
                 BRepGProp::VolumeProperties(flat, gf);
                 if (gf.Mass() <= 1e-9)
@@ -8941,10 +10094,9 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 //              a lightweight representation that always succeeds).
                 // Ref: target_face = the cylindrical face to thread (its axis + radius).
                 //
-                // ROBUSTNESS: helical booleans are fragile. cut_thread caps the turns,
-                // uses a rounded (not razor-sharp) profile, BRepCheck-validates the cut,
-                // and on ANY failure leaves the body UNTHREADED (the plain cylinder) with
-                // a clear warning rather than breaking the part.
+                // Real cuts and raised threads must produce valid geometry. If the
+                // helical operation fails, report its diagnostic and reject the
+                // candidate before consuming the existing body.
                 const std::string body_id = body_ref(feat);
                 if (body_id.empty())
                     throw std::runtime_error("thread: no body ref and no current body");
@@ -9251,21 +10403,21 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                         solid_order.push_back(id);
                         st.ok = true;
                     } else {
-                    ::geom::ThreadResult tr = ::geom::cut_thread(
-                        body, axis_loc, run_dir, cyl_radius, pitch, major_dia, length,
-                        starts, lefthand, internal, raised, turns_cap, tform);
-                    if (tr.shape.IsNull())
-                        throw std::runtime_error(
-                            tr.warning.empty() ? std::string("thread: produced an empty shape")
-                                               : tr.warning);
-                    if (!tr.warning.empty()) st.warning = tr.warning;
+                        ::geom::ThreadResult tr = ::geom::cut_thread(
+                            body, axis_loc, run_dir, cyl_radius, pitch, major_dia, length,
+                            starts, lefthand, internal, raised, turns_cap, tform);
+                        if (!tr.ok || tr.fell_back || tr.shape.IsNull())
+                            throw std::runtime_error(
+                                tr.warning.empty() ? std::string("thread: real geometry failed")
+                                                   : tr.warning);
+                        if (!tr.warning.empty()) st.warning = tr.warning;
 
-                    // The threaded (or, on a fall-back, unthreaded) body REPLACES the input.
-                    consumed.insert(body_id);
-                    source_of[id] = body_id;
-                    results[id] = SolidResult{tr.shape};
-                    solid_order.push_back(id);
-                    st.ok = true;
+                        // The real threaded body replaces the input only on success.
+                        consumed.insert(body_id);
+                        source_of[id] = body_id;
+                        results[id] = SolidResult{tr.shape};
+                        solid_order.push_back(id);
+                        st.ok = true;
                     }
                 }
 
@@ -9486,6 +10638,43 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
             st.ok = false;
             st.error = "unknown error during feature compile";
         }
+        if (!st.ok && type == "fillet") {
+            // Even a late sanitation/backstop failure must leave the preceding
+            // body available to subsequent features and must not publish a
+            // successful-result report for discarded geometry.
+            consumed = consumed_snapshot;
+            if (solid_order.size() > solids_before) solid_order.resize(solids_before);
+            if (!fillet_had_result) {
+                results.erase(id);
+                source_of.erase(id);
+            }
+            st.data = nullptr;
+            st.warning.clear();
+        }
+
+        // References that re-bound by geometry match instead of reproducing the element they
+        // were created on (selectors.h RebindScope). Name them, so an upstream edit that moved
+        // a face cannot silently retarget this feature's refs.
+        if (st.ok) {
+            const auto notes = rebind_notes.take();
+            const std::string rebinds = chudware::doc::format_rebind_notes(notes);
+            if (!rebinds.empty()) {
+                st.warning = st.warning.empty() ? rebinds : (st.warning + "; " + rebinds);
+                if (st.data.is_null()) st.data = json::object();
+                if (st.data.is_object()) {
+                    json records = json::array();
+                    for (const auto& note : notes)
+                        records.push_back({
+                            {"feature", id}, {"ref", note.ref}, {"kind", note.kind},
+                            {"owner", note.owner ? json(*note.owner) : json(nullptr)},
+                            {"best_score", note.best_score},
+                            {"margin", std::isfinite(note.margin) ? json(note.margin) : json(nullptr)},
+                            {"moved_distance_mm", note.moved_mm},
+                            {"owner_fallback", note.owner_fallback}});
+                    st.data["reference_rebinds"] = std::move(records);
+                }
+            }
+        }
 
         // DUPLICATE-NAME warning (Bug K9): a second feature with the same display name is
         // accepted (no hard error — that would break existing flows), but flagged so the
@@ -9515,6 +10704,16 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         }
         capture_ckpt(_fi + 1);
     }
+    g_cc_features_reused.fetch_add(result.features_reused, std::memory_order_relaxed);
+    g_cc_features_executed.fetch_add(result.features_executed, std::memory_order_relaxed);
+    for (std::size_t i = active_features; i < n_features; ++i) {
+        FeatureStatus st;
+        st.id = features[i].value("id", std::string("?"));
+        st.type = features[i].value("type", std::string());
+        st.ok = true;
+        st.rolled_back = true;
+        result.statuses.push_back(std::move(st));
+    }
 
     result.loop_ms = std::chrono::duration<double, std::milli>(
                          std::chrono::steady_clock::now() - _loop_t0).count();
@@ -9525,10 +10724,11 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
     const auto _tess_t0 = std::chrono::steady_clock::now();
     ::geom::tess_timing_reset();
     std::vector<aicm::AicmBody> bodies;
+    std::vector<std::shared_ptr<const CachedBody>> encoded_bodies;
+    bool has_encoded_body = false;
     const float color[3] = {0.71f, 0.76f, 0.82f};  // default dielectric grey
     uint32_t body_num = 1;
     const bool has_appearances = doc.contains("appearances") && doc["appearances"].is_object();
-    const auto face_appearances = doc.find("face_appearances");
     // Per-TShape stats cache: volume/area/face-count/edge-count are geometry-only (location-
     // invariant), so instanced bodies that SHARE a TShape (e.g. the 4 wheels) compute the
     // mass props ONCE. Keyed by (TShape*, is_surface) so a surface vs solid use of the same
@@ -9546,20 +10746,6 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
     CompileCache* bc = (use_cache && tess_cache_on && with_display) ? cache : nullptr;
     std::map<std::tuple<const void*, bool, uint64_t>,
              std::shared_ptr<const CachedBody>> new_body_cache;
-    // Bit-exact hash of a body's baked appearance (color+metal+rough) PLUS the display
-    // quality tier, so a set_appearance change or a display-quality change is a cache
-    // miss while geometry-identical bodies with identical appearance+quality still hit.
-    auto appearance_hash = [quality](const float col[3], float metal, float rough) -> uint64_t {
-        uint64_t h = 1469598103934665603ULL;
-        const float vals[5] = {col[0], col[1], col[2], metal, rough};
-        for (float f : vals) {
-            uint32_t bits;
-            std::memcpy(&bits, &f, sizeof(bits));
-            h = (h ^ bits) * 1099511628211ULL;
-        }
-        h = (h ^ static_cast<uint64_t>(quality)) * 1099511628211ULL;
-        return h;
-    };
     // with_owners: per-shape owner maps, index-aligned with result.shapes.
     auto note_shape_owners = [&](const std::string& sid) {
         if (!with_owners) return;
@@ -9604,12 +10790,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
             std::tuple<const void*, bool, uint64_t> ck;
             if (cacheable)
                 ck = std::make_tuple(static_cast<const void*>(shape.TShape().get()),
-                                     is_surface, cc_fnv1a(
-                                         face_appearances != doc.end() &&
-                                                 face_appearances->contains("b" + std::to_string(body_num))
-                                             ? face_appearances->at("b" + std::to_string(body_num)).dump()
-                                             : std::string(),
-                                         appearance_hash(bcolor, bmetal, brough)));
+                                     is_surface,
+                                     cc_body_style(doc, body_num, quality, bcolor, bmetal, brough));
 
             std::shared_ptr<const CachedBody> hit;
             if (cacheable) {
@@ -9624,6 +10806,8 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 b.body_id = body_num;
                 b.name = sid;
                 bodies.push_back(std::move(b));
+                encoded_bodies.push_back(hit->encoded ? hit : nullptr);
+                has_encoded_body = has_encoded_body || static_cast<bool>(hit->encoded);
                 result.shapes.push_back(shape);
                 note_shape_owners(sid);
                 BodyInfo bi = hit->info;
@@ -9700,6 +10884,7 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
                 new_body_cache.emplace(ck, std::move(cbdy));
             }
             bodies.push_back(std::move(b));
+            encoded_bodies.push_back(nullptr);
             result.bodies_info.push_back(std::move(bi));
         } catch (...) {
             // A tessellation failure must not crash the rebuild; skip this body.
@@ -9709,7 +10894,9 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
 
     result.body_count = static_cast<int>(with_display ? bodies.size() : result.shapes.size());
     const auto _write_t0 = std::chrono::steady_clock::now();
-    if (with_display) result.aicm = aicm::write_aicm(bodies);
+    if (with_display)
+        result.aicm = has_encoded_body ? cc_write_bodies(bodies, encoded_bodies)
+                                       : aicm::write_aicm(bodies);
     result.tess_write_ms = std::chrono::duration<double, std::milli>(
                                std::chrono::steady_clock::now() - _write_t0).count();
     result.tess_ms = std::chrono::duration<double, std::milli>(
@@ -9817,25 +11004,32 @@ CompileResult compile_document(const json& doc, const json& env_json, CompileCac
         result.datums.push_back(std::move(d));
     }
 
+    // Compiled bend frames are historical construction records, not proof that
+    // subsequent cuts or transformations left those surfaces unchanged.
+    result.sheet_metal_bends = std::move(bend_records);
+
     // ok iff every feature compiled cleanly.
     result.ok = true;
     for (const FeatureStatus& s : result.statuses)
         if (!s.ok) { result.ok = false; break; }
 
-    // Commit this compile into the cache: the new chain + per-feature checkpoints
-    // replace the old wholesale (content-addressed, so replacing never loses anything
-    // a future compile could still legally reuse — a diverged prefix can't match), and
-    // the full result is kept for the identical-inputs fast path. Stored statuses are
-    // scrubbed of the `reused` flag so a later restore re-marks exactly its own prefix.
+    // Commit this compile's chain, checkpoints and full result. Stored statuses
+    // are scrubbed of `reused` so a later compile marks its own cache hits.
     if (use_cache) {
         auto stored = std::make_shared<CompileResult>(result);
         for (FeatureStatus& fst : stored->statuses) fst.reused = false;
         stored->features_reused = 0;
-        stored->features_executed = static_cast<int>(n_features);
+        stored->features_executed = static_cast<int>(active_features);
         cache->chain = std::move(chain);
         cache->snaps = std::move(new_snaps);
         cache->full_key = cc_full_key(doc, cache->chain.back());
         cache->last_result = std::move(stored);
+        if (bc) {
+            // Rebase slices on this result so a few surviving bodies do not pin
+            // an older, much larger AICM packet.
+            try { cc_index_body_cache(*cache, doc, quality); }
+            catch (...) { /* Keep the already-built per-body cache. */ }
+        }
         cache->stamp = cc_next_stamp();
     }
 
@@ -9949,7 +11143,8 @@ chudware::geom::SketchPlane ckpt_plane_from(const json& j) {
 json ckpt_vec_json(const Eigen::Vector3d& v) { return json::array({v.x(), v.y(), v.z()}); }
 
 json ckpt_status(const FeatureStatus& st) {
-    return json::array({st.id, st.type, st.ok, st.error, st.warning, st.ms, st.data});
+    return json::array({st.id, st.type, st.ok, st.error, st.warning, st.ms, st.data,
+                        st.rolled_back});
 }
 
 FeatureStatus ckpt_status_from(const json& j) {
@@ -9961,6 +11156,7 @@ FeatureStatus ckpt_status_from(const json& j) {
     st.warning = j.at(4).get<std::string>();
     st.ms = j.at(5).get<double>();
     st.data = j.at(6);
+    st.rolled_back = j.size() > 7 && j.at(7).get<bool>();
     return st;
 }
 
@@ -10074,7 +11270,8 @@ public:
             bends.push_back(json::array({b.angle, b.radius, b.thickness, b.bend_allowance,
                                          b.wall_length, b.position, ckpt_vec_json(b.p_start),
                                          ckpt_vec_json(b.p_end), ckpt_vec_json(b.e_dir),
-                                         ckpt_vec_json(b.length_dir)}));
+                                         ckpt_vec_json(b.length_dir), ckpt_vec_json(b.fold_dir),
+                                         b.parent_index}));
         json imports = json::array();
         for (const auto& [h, shapes] : ck.import_cache) {
             json idx = json::array();
@@ -10205,6 +11402,18 @@ public:
             statuses_.push_back(std::make_shared<const FeatureStatus>(ckpt_status_from(j)));
         for (const json& j : root.at("tool_recs"))
             tool_recs_.push_back(ToolRec{str(j.at(0)), str(j.at(1)), shape(j.at(2))});
+        // Old pattern diagnostic tools included their seed. Preserve the saved
+        // geometry and checkpoints, but mark those records as unusable for overlap
+        // diagnostics rather than reporting the seed's self-intersection as real.
+        if (!root.value("pattern_copy_tools", false)) {
+            std::set<std::string> patterns;
+            for (const auto& st : statuses_)
+                if (st->type == "linear_pattern" || st->type == "circular_pattern")
+                    patterns.insert(st->id);
+            for (ToolRec& tr : tool_recs_)
+                if (patterns.count(tr.feature_id) && (tr.role == "add" || tr.role == "cut"))
+                    tr.role = "legacy_pattern_" + tr.role;
+        }
         for (const json& j : root.at("owners")) {
             std::map<int, std::string> m;
             for (const json& kv : j) m.emplace(kv.at(0).get<int>(), str(kv.at(1)));
@@ -10300,6 +11509,8 @@ public:
             r.p_end = ckpt_vec(b.at(7), 0);
             r.e_dir = ckpt_vec(b.at(8), 0);
             r.length_dir = ckpt_vec(b.at(9), 0);
+            if (b.size() > 10) r.fold_dir = ckpt_vec(b.at(10), 0);
+            if (b.size() > 11) r.parent_index = b.at(11).get<int>();
             ck->bend_records.push_back(std::move(r));
         }
         for (const json& kv : e.at("ic")) {
@@ -10342,7 +11553,9 @@ public:
         r->tess_extract_ms = t.at(4).get<double>();
         r->tess_write_ms = t.at(5).get<double>();
         r->features_reused = 0;
-        r->features_executed = static_cast<int>(r->statuses.size());
+        r->features_executed = static_cast<int>(std::count_if(
+            r->statuses.begin(), r->statuses.end(),
+            [](const FeatureStatus& st) { return !st.rolled_back; }));
         return r;
     }
 
@@ -10364,7 +11577,8 @@ struct CkptInputs {
 };
 
 CkptInputs ckpt_inputs(const json& doc) {
-    static const json empty = json::array();
+    // Checkpoint encoding can finish on a background thread at process exit.
+    static const json& empty = *new const json(json::array());
     const json& base = doc.contains("features") && doc.at("features").is_array()
                            ? doc.at("features") : empty;
     auto [cfg_name, cfg] = resolve_active_config(doc);
@@ -10396,7 +11610,7 @@ std::string compile_cache_encode(const CompileCache& cache, const json& doc, con
         return {};
     }
     const std::vector<uint64_t> chain =
-        cc_chain(in.features, env, in.active_configuration, quality, true, false);
+        cc_chain(doc, in.features, env, in.active_configuration, quality, true, false);
     // Deepest index whose chain still matches the cached compile: only those checkpoints
     // describe THIS document (the cache holds the last compile, which doc_save just ran).
     std::size_t m = 0;
@@ -10443,6 +11657,7 @@ std::string compile_cache_encode(const CompileCache& cache, const json& doc, con
         CkptWriter w;
         json root = {{"format", kCkptFormat},
                      {"engine", engine_key},
+                     {"pattern_copy_tools", true},
                      {"doc_hash", doc_hash},
                      {"quality", ::geom::display_quality_name(quality)},
                      {"chain", std::vector<uint64_t>(cache.chain.begin(),
@@ -10511,7 +11726,7 @@ std::shared_ptr<CompileCache> compile_cache_decode(const std::string& blob, cons
         }
         const auto stored = root.at("chain").get<std::vector<uint64_t>>();
         const std::vector<uint64_t> saved_chain =
-            cc_chain(in.features, env, in.active_configuration, saved_quality, true, false);
+            cc_chain(doc, in.features, env, in.active_configuration, saved_quality, true, false);
         std::size_t m = 0;
         bool any = false;
         for (std::size_t i = 0; i < std::min(stored.size(), saved_chain.size()); ++i) {
@@ -10527,7 +11742,7 @@ std::shared_ptr<CompileCache> compile_cache_decode(const std::string& blob, cons
         // B-rep only, so a different tier simply re-meshes the surviving bodies.
         std::vector<uint64_t> chain = saved_quality == quality
             ? saved_chain
-            : cc_chain(in.features, env, in.active_configuration, quality, true, false);
+            : cc_chain(doc, in.features, env, in.active_configuration, quality, true, false);
         chain.resize(m + 1);
 
         CkptReader rd(root);
@@ -10559,6 +11774,10 @@ std::shared_ptr<CompileCache> compile_cache_decode(const std::string& blob, cons
         if (why_not_full.empty()) {
             cache->last_result = rd.full(full, std::vector<uint8_t>(aicm->begin(), aicm->end()));
             cache->full_key = full.at("full_key").get<uint64_t>();
+            // Body indexing is an optional acceleration; an unusable packet must
+            // not discard otherwise valid geometry and feature checkpoints.
+            try { cc_index_body_cache(*cache, doc, quality); }
+            catch (...) { cache->body_cache.clear(); }
             report["full_result"] = true;
         } else {
             report["full_result_reason"] = why_not_full;

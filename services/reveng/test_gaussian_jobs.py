@@ -81,7 +81,7 @@ class GaussianJobsTests(unittest.TestCase):
         support = self.base / "support"
         support.mkdir()
         (support / "sitecustomize.py").write_text(textwrap.dedent("""
-            import sys, types, shutil
+            import json, sys, types, shutil
             from pathlib import Path
             sfm = types.ModuleType("services.vision.colmap_pipeline")
             class Reconstruction:
@@ -102,6 +102,16 @@ class GaussianJobsTests(unittest.TestCase):
                     (sparse / (name + ".txt")).write_text("# controlled SfM fixture")
                 return {"ok": True, "registered": len(list(Path(image_dir).iterdir())),
                         "sparse_dir": str(sparse)}
+            def prepare_dataset(sparse_dir, image_dir, dataset_dir, *, source_image_map=None):
+                root = Path(dataset_dir)
+                undistort_images(str(root), sparse_dir, image_dir)
+                mapping = dict(source_image_map or {})
+                mapping_path = root / "image_name_map.json"
+                mapping_path.write_text(json.dumps(mapping))
+                return {"ok": True, "dataset_dir": str(root), "sparse_dir": str(root / "sparse"),
+                        "images_dir": str(root / "images"), "image_name_map": mapping,
+                        "image_name_map_path": str(mapping_path), "registered": len(mapping)}
+            sfm.prepare_dataset = prepare_dataset
             sfm.run_sparse = run_sparse
             sfm._import_pycolmap = lambda: types.SimpleNamespace(
                 Reconstruction=Reconstruction, undistort_images=undistort_images)
@@ -243,8 +253,8 @@ class GaussianJobsTests(unittest.TestCase):
             root, marker, teardown = map(Path, sys.argv[1:])
             worker.paths.RUNTIME = root / "runtime"
             worker._warm_prompt_cache = lambda: None
-            worker._warm_chudcode_service = lambda: None
-            worker._shutdown_chudcode = lambda: (teardown / "chudcode").touch()
+            worker._warm_omp_service = lambda: None
+            worker._shutdown_omp = lambda: (teardown / "chudcode").touch()
             worker._drain_box_mirror_on_exit = lambda: (teardown / "box").touch()
             def hold(params, emit):
                 assert jobs.start("re_test", live=True)["ok"]
@@ -287,8 +297,8 @@ class GaussianJobsTests(unittest.TestCase):
             root = Path(sys.argv[1])
             worker.paths.RUNTIME = root / "runtime"
             worker._warm_prompt_cache = lambda: None
-            worker._warm_chudcode_service = lambda: None
-            worker._shutdown_chudcode = lambda: (root / "chudcode").touch()
+            worker._warm_omp_service = lambda: None
+            worker._shutdown_omp = lambda: (root / "chudcode").touch()
             worker._drain_box_mirror_on_exit = lambda: (root / "box").touch()
             def fail():
                 raise OSError("controlled cleanup failure")

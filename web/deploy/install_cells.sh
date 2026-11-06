@@ -5,7 +5,7 @@
 # Stages a cell payload into $CHUDWARE_WEB_HOME/releases/<id>/cell and points
 # $CHUDWARE_WEB_HOME/current at it. The payload holds hostd and the engine
 # library, the Python worker venv and services, the agent prompts, the cell
-# method policy, the verified Chudcode runtime and the cell launchers. The
+# method policy, the verified OMP runtime and the cell launchers. The
 # script also creates the gateway venv, writes a default cell runtime
 # configuration when none exists, and installs the systemd user units. It
 # starts nothing. Cells additionally need root-provisioned disk quotas; see
@@ -18,7 +18,7 @@
 #   CHUDWARE_WEB_HOME        install root (default ~/.local/share/chudware-web)
 #   CHUDWARE_WORKSPACE_ROOT  operator workspace (default $CHUDWARE_WEB_HOME/workspace)
 #   CHUDWARE_ENGINE_DIR      engine build output (default core/build-occt-linux/bin)
-#   CHUDWARE_CHUD_BIN        local Chudcode binary to verify and stage. When unset,
+#   CHUDWARE_OMP_BIN        local OMP binary to verify and stage. When unset,
 #                            the pinned public release is downloaded and verified.
 # ===========================================================================
 set -euo pipefail
@@ -38,9 +38,11 @@ die() { echo "[cells] ERROR: $*" >&2; exit 1; }
 [ -x "$PYTHON" ] || die "$PYTHON is required (cells run the system interpreter)"
 command -v systemctl >/dev/null 2>&1 || die "systemctl is required"
 command -v git >/dev/null 2>&1 || die "git is required to install the pinned worker requirements"
-for f in chudware-hostd libchudware.so; do
+for f in chudware-hostd chudware-shape-build-worker libchudware.so; do
   [ -f "$ENGINE/$f" ] || die "$ENGINE/$f missing (run ./build.sh daemon)"
 done
+[ -s "$ENGINE/chudware-shape-build-worker" ] && [ -x "$ENGINE/chudware-shape-build-worker" ] \
+  || die "$ENGINE/chudware-shape-build-worker must be nonempty and executable (run ./build.sh daemon)"
 
 # Cell launchers refuse any symlinked path component, so record real paths.
 mkdir -p "$WEB_HOME/releases" "$WEB_HOME/cells" "$WORKSPACE"
@@ -53,9 +55,9 @@ trap 'rm -rf "$STAGE"' EXIT
 CELL="$STAGE/cell"
 mkdir -p "$CELL/bin" "$CELL/agent/prompts" "$CELL/contracts"
 
-# Engine: hostd, the engine library and the optional siblings it loads from
-# its own directory (meshing, 3MF, and the learned-mesh advisor runtime).
-for f in chudware-hostd libchudware.so libngcore.so libnglib.so lib3mf.so "$ENGINE"/libonnxruntime*; do
+# Engine: hostd, the shape-build helper, the engine library and optional siblings
+# it loads from its own directory (meshing, 3MF, and the learned-mesh advisor runtime).
+for f in chudware-hostd chudware-shape-build-worker libchudware.so libngcore.so libnglib.so lib3mf.so "$ENGINE"/libonnxruntime*; do
   f="$(basename "$f")"
   if [ -e "$ENGINE/$f" ]; then cp -L "$ENGINE/$f" "$CELL/bin/$f"; fi
 done
@@ -64,19 +66,19 @@ LD_LIBRARY_PATH="$CELL/bin" "$CELL/bin/chudware-hostd" --version >/dev/null \
   || die "staged chudware-hostd cannot load its staged engine library"
 echo "[cells] staged engine from $ENGINE"
 
-# Chudcode: a pinned binary, verified against vendor/chudcode/CHUDCODE_ARTIFACT.lock.
-CHUD="${CHUDWARE_CHUD_BIN:-}"
-if [ -z "$CHUD" ]; then
-  CHUD="$("$PYTHON" "$ROOT/scripts/pin_chudcode.py" ensure --target linux-x86_64 \
-    --cache-dir "$WEB_HOME/chudcode-cache" | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["path"])')" \
-    || die "could not obtain a verified Chudcode binary"
+# OMP: a pinned binary, verified against vendor/omp/OMP_ARTIFACT.lock.
+OMP="${CHUDWARE_OMP_BIN:-}"
+if [ -z "$OMP" ]; then
+  OMP="$("$PYTHON" "$ROOT/scripts/pin_omp.py" ensure --target linux-x86_64 \
+    --cache-dir "$WEB_HOME/omp-cache" | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["path"])')" \
+    || die "could not obtain a verified OMP binary"
 fi
-"$PYTHON" "$ROOT/scripts/pin_chudcode.py" stage --target linux-x86_64 \
-  --input "$CHUD" --output "$CELL/bin/chud" >/dev/null || die "Chudcode verification failed"
-"$PYTHON" "$ROOT/scripts/pin_chudcode.py" stage-notices --output-dir "$CELL" >/dev/null \
-  || die "Chudcode notice verification failed"
-cp "$ROOT/vendor/chudcode/CHUDCODE_ARTIFACT.lock" "$CELL/CHUDCODE_ARTIFACT.lock"
-echo "[cells] staged verified Chudcode"
+"$PYTHON" "$ROOT/scripts/pin_omp.py" stage --target linux-x86_64 \
+  --input "$OMP" --output "$CELL/bin/omp" >/dev/null || die "OMP verification failed"
+"$PYTHON" "$ROOT/scripts/pin_omp.py" stage-notices --output-dir "$CELL" >/dev/null \
+  || die "OMP notice verification failed"
+cp "$ROOT/vendor/omp/OMP_ARTIFACT.lock" "$CELL/OMP_ARTIFACT.lock"
+echo "[cells] staged verified OMP"
 
 # Worker venv. Built beside the payload, then materialized without symlinks
 # (the cell rejects links) with script shebangs pointing at /opt/chudware.

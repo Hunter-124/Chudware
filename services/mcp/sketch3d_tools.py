@@ -2,14 +2,16 @@
 
 These tools drive the REAL engine `sketch3d` feature (doc_schema §3B, contract:
 contracts/sketch3d_gui_contract.md).  A 3D sketch is an ordinary feature in the part's
-history — world-mm free-space entities (point / line / 3-point arc / spline), a constraint
-solver (coincident, fix, distance, length, parallel, perpendicular, angle, along_axis,
-point_on), and compiled 3D wire chains that a downstream `sweep` consumes as `path` or a
+history — world-mm free-space entities (point / line / 3-point arc / spline / eq_curve3d), a
+constraint solver (coincident, fix, distance, length, parallel, perpendicular, angle,
+along_axis, point_on, tangent, equal, midpoint, collinear, concentric, coradial, on_plane,
+parallel_plane, normal_plane, symmetric — exactly the list in core/sketch/sketch3d.h), and
+compiled 3D wire chains that a downstream `sweep` consumes as `path` or a
 `guides[]` entry.  Persistence comes free with the document (save/undo/redo/PLM).
 
     sketch3d_new(name)                    create a real sketch3d FEATURE in the active doc
-    sketch3d_add_curves(id, curves)       append entities (edit_feature) + solve report
-    sketch3d_add_constraints(id, cons)    append constraints + narrated solve results
+    sketch3d_add_curves(id, curves)       append entities atomically + solve report
+    sketch3d_add_constraints(id, cons)    append constraints atomically + narrated solve results
     check_sketch3d(id)                    narrated health (status/dof/conflicts/free vars)
     sketch3d_get(id)                      authored params + SOLVED entities/wires/dof
     sketch3d_list()                       all sketch3d features in the doc
@@ -29,8 +31,10 @@ solver).  They were re-pointed to the engine feature when `sketch3d` landed
 (core/sketch/sketch3d.cpp, sketch3d_health/sketch3d_drag RPCs).  Tool names and rough
 signatures were kept stable; `sketch3d_id` now means the doc FEATURE id (e.g. "f3").
 
-Engine RPCs used: doc_apply_ops (add/edit_feature), doc_tree, sketch3d_health,
-eval_section_props, eval_mass, doc_render_* for previews.
+Engine RPCs used: doc_apply_ops (add_feature + the atomic append ops sketch3d_add_entities /
+sketch3d_add_constraints / sketch3d_add_external_ref — no read-modify-write, so concurrent
+agents never overwrite each other), doc_tree, sketch3d_health, eval_section_props, eval_mass,
+doc_render_* for previews.
 
 Registered onto the FastMCP instance by register_sketch3d_tools(mcp).
 """
@@ -109,13 +113,15 @@ def _mirror(doc_id: str) -> None:
         pass
 
 
-def _next_id(entities: list, prefix: str) -> int:
-    n = 0
-    for e in entities or []:
-        eid = str((e or {}).get("id", ""))
-        if eid.startswith(prefix) and eid[len(prefix):].isdigit():
-            n = max(n, int(eid[len(prefix):]))
-    return n
+def _minted_ids(result: dict, idx: int, n: int, what: str) -> list:
+    """The ids the engine minted for op `idx` of a batch: `$idx`, then `$idx#1`… (n in all)."""
+    id_map = (result or {}).get("id_map") or {}
+    keys = [f"${idx}"] + [f"${idx}#{k}" for k in range(1, n)]
+    missing = [k for k in keys if not isinstance(id_map.get(k), str)]
+    if missing:
+        raise ValueError(f"the engine did not report the {what} id(s) it minted "
+                         f"(missing {missing} in id_map)")
+    return [id_map[k] for k in keys]
 
 
 def _dim(v: Any) -> dict:
@@ -157,22 +163,28 @@ def _validate_pts(pts: Any, min_n: int = 1, name: str = "pts") -> list:
     return [_coerce_point3(p, f"{name}[{i}]") for i, p in enumerate(pts)]
 
 
-def _curves_to_entities(curves: list, start_n: int = 0) -> list:
+def _curves_to_entities(curves: list, mint_ids: bool = True) -> list:
     """Map curve specs to engine `sketch3d` entities (doc_schema §3B).
 
     Accepts TWO forms per element:
       • legacy curve spec {kind: line|polyline|spline|arc, pts: [[x,y,z],…]}
         (polyline expands to one line entity per consecutive pair; arc pts = [start,mid,end])
       • raw engine entity {id?, type: point|line|arc|spline, construction?, p/p1/p2/pm/points}
-        (missing ids are auto-assigned e<N> continuing from the existing max)
+
+    `mint_ids=True` numbers entities without an id e1, e2, … (a standalone feature payload);
+    `mint_ids=False` leaves them id-less for the engine's atomic `sketch3d_add_entities` op,
+    which mints against the live sketch.
     """
     entities: list = []
-    n = start_n
+    n = 0
 
     def _eid() -> str:
         nonlocal n
         n += 1
         return f"e{n}"
+
+    def _stamp(ent: dict) -> dict:
+        return {"id": _eid(), **ent} if mint_ids else ent
 
     # Raw-entity point fields keyed by type — used both to detect the raw-entity form
     # without a "type" key (see kind/type fallback below) and to coerce each point.
@@ -204,7 +216,9 @@ def _curves_to_entities(curves: list, start_n: int = 0) -> list:
                 ent["points"] = [_coerce_point3(p, f"curves[{i}].points[{j}]")
                                  for j, p in enumerate(raw_points)]
             if not ent.get("id"):
-                ent["id"] = _eid()
+                ent.pop("id", None)
+                if mint_ids:
+                    ent["id"] = _eid()
             else:
                 m = str(ent["id"])
                 if m.startswith("e") and m[1:].isdigit():
@@ -218,29 +232,29 @@ def _curves_to_entities(curves: list, start_n: int = 0) -> list:
             pts = _validate_pts(spec.get("pts", []), 2)
             if len(pts) != 2:
                 raise ValueError(f"curves[{i}]: a 'line' needs exactly 2 points; got {len(pts)}.")
-            entities.append({"id": _eid(), "type": "line", "construction": cons,
-                             "p1": pts[0], "p2": pts[1]})
+            entities.append(_stamp({"type": "line", "construction": cons,
+                                    "p1": pts[0], "p2": pts[1]}))
         elif kind == "arc":
             pts = _validate_pts(spec.get("pts", []), 3)
             if len(pts) != 3:
                 raise ValueError(
                     f"curves[{i}]: an 'arc' needs exactly 3 points [start, mid, end]; "
                     f"got {len(pts)}.")
-            entities.append({"id": _eid(), "type": "arc", "construction": cons,
-                             "p1": pts[0], "pm": pts[1], "p2": pts[2]})
+            entities.append(_stamp({"type": "arc", "construction": cons,
+                                    "p1": pts[0], "pm": pts[1], "p2": pts[2]}))
         elif kind == "spline":
             pts = _validate_pts(spec.get("pts", []), 2)
-            entities.append({"id": _eid(), "type": "spline", "construction": cons,
-                             "points": pts})
+            entities.append(_stamp({"type": "spline", "construction": cons,
+                                    "points": pts}))
         elif kind == "polyline":
             pts = _validate_pts(spec.get("pts", []), 2)
             for j in range(len(pts) - 1):
-                entities.append({"id": _eid(), "type": "line", "construction": cons,
-                                 "p1": pts[j], "p2": pts[j + 1]})
+                entities.append(_stamp({"type": "line", "construction": cons,
+                                        "p1": pts[j], "p2": pts[j + 1]}))
         elif kind == "point":
             pts = _validate_pts(spec.get("pts", []), 1)
-            entities.append({"id": _eid(), "type": "point", "construction": cons,
-                             "p": pts[0]})
+            entities.append(_stamp({"type": "point", "construction": cons,
+                                    "p": pts[0]}))
         elif kind == "eq_curve3d":
             # Equation-driven 3D curve (doc_schema §3B): x(t)/y(t)/z(t) expression
             # strings over t in [t1, t2] (degrees trig, doc equations — §4). 0 DOF —
@@ -250,9 +264,9 @@ def _curves_to_entities(curves: list, start_n: int = 0) -> list:
             for key in ("xt", "yt", "zt"):
                 if not isinstance(spec.get(key), str):
                     raise ValueError(f"curves[{i}]: eq_curve3d needs a string '{key}' expression")
-            entities.append({"id": _eid(), "type": "eq_curve3d", "construction": cons,
-                             "xt": spec["xt"], "yt": spec["yt"], "zt": spec["zt"],
-                             "t1": spec.get("t1", 0), "t2": spec.get("t2", 1)})
+            entities.append(_stamp({"type": "eq_curve3d", "construction": cons,
+                                    "xt": spec["xt"], "yt": spec["yt"], "zt": spec["zt"],
+                                    "t1": spec.get("t1", 0), "t2": spec.get("t2", 1)}))
         else:
             raise ValueError(
                 f"curves[{i}]: unknown kind {kind!r}. Use 'line', 'polyline', 'spline', "
@@ -425,8 +439,18 @@ def _free_narration(free: list) -> str:
     return "; ".join(parts)
 
 
+def _skipped_text(skipped: list) -> str:
+    return "; ".join(f"{s.get('id', '?')} ({s.get('type') or '?'}): "
+                     f"{s.get('reason') or 'unusable constraint'}" for s in skipped)
+
+
 def _health_read(h: dict) -> dict:
-    """check_sketch-style narrated read of a sketch3d_health response."""
+    """check_sketch-style narrated read of a sketch3d_health response.
+
+    `fully_defined` is true only when the solve converged, nothing conflicts, dof is 0 AND
+    no constraint was skipped — a skipped constraint is not being solved, so a sketch that
+    carries one is never reported as fully defined.
+    """
     status = h.get("status", "")
     dof = h.get("dof", 0)
     conflicting = h.get("conflicting") or []
@@ -434,13 +458,26 @@ def _health_read(h: dict) -> dict:
     free_text = _free_narration(h.get("free"))
     converged = h.get("converged", True)
     wires = h.get("wires") or []
-    if conflicting or status == "over":
-        summary = (f"Over-defined: {len(conflicting)} conflicting constraint(s) "
-                   f"{conflicting} — remove one to resolve the contradiction.")
-        if not converged:
-            summary += " (Solver did not converge.)"
+    skipped = [s for s in (h.get("skipped_constraints") or []) if isinstance(s, dict)]
+    reason = h.get("nonconvergence_reason")
+    skipped_note = (f" {len(skipped)} constraint(s) were SKIPPED and are not being solved — "
+                    f"{_skipped_text(skipped)}. Fix or delete them.") if skipped else ""
+    if conflicting or status == "over" or not converged:
+        if reason:
+            # The engine's text already names the conflicting constraints and any skipped ones.
+            summary = f"Over-defined: {reason}"
+        else:
+            summary = (f"Over-defined: {len(conflicting)} conflicting constraint(s) "
+                       f"{conflicting} — remove one to resolve the contradiction.")
+            if not converged:
+                summary += " (Solver did not converge.)"
+            summary += skipped_note
     elif status == "full" or dof == 0:
-        summary = "Fully defined (dof 0) — every entity is pinned by constraints."
+        if skipped:
+            summary = ("NOT fully defined: dof is 0 but the skipped constraints are not part "
+                       f"of the solve.{skipped_note}")
+        else:
+            summary = "Fully defined (dof 0) — every entity is pinned by constraints."
     else:
         summary = (f"Under-defined: {dof} degree(s) of freedom remain — add constraints "
                    f"(fix / along_axis / length / distance / coincident / …) until dof is 0.")
@@ -448,6 +485,7 @@ def _health_read(h: dict) -> dict:
             summary += f" Free: {free_text}."
         if redundant:
             summary += f" (Also {len(redundant)} redundant: {redundant}.)"
+        summary += skipped_note
     if wires:
         wire_txt = ", ".join(
             f"wire {i}: {w.get('n_edges', '?')} edge(s)"
@@ -458,10 +496,14 @@ def _health_read(h: dict) -> dict:
     return {
         "status": status,
         "dof": dof,
-        "fully_defined": (status == "full" or dof == 0) and not conflicting,
+        "fully_defined": ((status == "full" or dof == 0) and not conflicting
+                          and bool(converged) and not skipped),
         "converged": converged,
         "conflicting": conflicting,
+        "conflicts_with": h.get("conflicts_with") or {},
         "redundant": redundant,
+        "skipped_constraints": skipped,
+        "nonconvergence_reason": reason,
         "free": h.get("free") or [],
         "free_narration": free_text,
         "entity_statuses": h.get("statuses") or {},
@@ -647,7 +689,7 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def sketch3d_add_curves(sketch3d_id: str, curves: list,
                             doc_id: Optional[str] = None) -> str:
-        """Append curve entities to a sketch3d feature (edit_feature) and report the solve.
+        """Append curve entities to a sketch3d feature atomically and report the solve.
 
         sketch3d_id: the FEATURE id returned by sketch3d_new (e.g. "f3").
         curves: a list where each element is EITHER
@@ -668,9 +710,7 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
-            feat = _find_sketch3d(d, sketch3d_id)
-            params = feat.get("params") or {}
-            entities = list(params.get("entities") or [])
+            _find_sketch3d(d, sketch3d_id)
             # A model-stringified curves list (JSON or Python-repr) is the same dialect
             # cad_common.require_list already teaches elsewhere — coerce before the shape
             # check so this fails on genuine garbage, not on a well-formed batch that just
@@ -680,14 +720,17 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
                                    '[{"kind":"line","pts":[[x,y,z],[x,y,z]]}]')
             if not curves:
                 return _dumps({"ok": False, "error": "curves must be a non-empty list"})
-            new_ents = _curves_to_entities(curves, start_n=_next_id(entities, "e"))
-            entities.extend(new_ents)
-            _apply_ops(d, [{"op": "edit_feature", "id": sketch3d_id,
-                            "params": {"entities": entities}}])
+            # Ids are minted by the engine inside the atomic append (e<N> continuing the
+            # sketch's own highest), so two agents appending to one sketch never collide.
+            new_ents = _curves_to_entities(curves, mint_ids=False)
+            r = _apply_ops(d, [{"op": "sketch3d_add_entities", "sketch": sketch3d_id,
+                                "entities": new_ents}])
+            new_ids = _minted_ids(r, 0, len(new_ents), "entity")
+            entities = (_find_sketch3d(d, sketch3d_id).get("params") or {}).get("entities") or []
             read = _health_read(_health(d, sketch3d_id))
             return _dumps({"ok": True, "id": sketch3d_id, "doc_id": d,
                            "added": len(new_ents), "entity_count": len(entities),
-                           "new_entity_ids": [e["id"] for e in new_ents],
+                           "new_entity_ids": new_ids,
                            "health": read})
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -726,9 +769,7 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
-            feat = _find_sketch3d(d, sketch3d_id)
-            params = feat.get("params") or {}
-            cons = list(params.get("constraints") or [])
+            _find_sketch3d(d, sketch3d_id)
             # Same stringified-list dialect as curves — coerce before the shape check
             # rather than bare-isinstance-rejecting a well-formed but stringified batch.
             constraints = require_list(constraints, "constraints",
@@ -736,26 +777,25 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
                                         '[{"type":"fix","refs":["e1"]}]')
             if not constraints:
                 return _dumps({"ok": False, "error": "constraints must be a non-empty list"})
-            n = _next_id(cons, "c")
             added = []
             for i, c in enumerate(constraints):
                 if not isinstance(c, dict) or not c.get("type"):
                     return _dumps({"ok": False,
                                    "error": f"constraints[{i}] must be a dict with 'type'"})
                 rec = dict(c)
-                if not rec.get("id"):
-                    n += 1
-                    rec["id"] = f"c{n}"
-                if "value" in rec and not isinstance(rec["value"], dict):
+                if rec.get("value") is not None and not isinstance(rec["value"], dict):
                     rec["value"] = _dim(rec["value"])
                 added.append(rec)
-            cons.extend(added)
-            _apply_ops(d, [{"op": "edit_feature", "id": sketch3d_id,
-                            "params": {"constraints": cons}}])
+            # Atomic append inside the engine (ids "c<N>" minted there): concurrent edits to
+            # the same sketch3d compose instead of the last whole-list write winning.
+            r = _apply_ops(d, [{"op": "sketch3d_add_constraints", "sketch": sketch3d_id,
+                                "constraints": added}])
+            new_ids = _minted_ids(r, 0, len(added), "constraint")
+            cons = (_find_sketch3d(d, sketch3d_id).get("params") or {}).get("constraints") or []
             read = _health_read(_health(d, sketch3d_id))
             return _dumps({"ok": True, "id": sketch3d_id, "doc_id": d,
                            "added": len(added),
-                           "new_constraint_ids": [c["id"] for c in added],
+                           "new_constraint_ids": new_ids,
                            "constraint_count": len(cons), "health": read})
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -783,7 +823,7 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
-            feat = _find_sketch3d(d, sketch3d_id)
+            _find_sketch3d(d, sketch3d_id)
             if selector is not None:
                 # A stringified selector dict is the same dialect require_mapping already
                 # teaches on cad_asm_tools' `a`/`b` — coerce before it gets embedded verbatim
@@ -802,29 +842,14 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
                 selector = pick.get("selector")
                 if not selector:
                     return _dumps({"ok": False, "error": f"vertex pick {topo_id} did not resolve"})
-            # Mint a doc-wide-unique "x<N>" id (external refs share their own id space —
-            # separate from "e<N>" entities / "c<N>" constraints — across every sketch3d
-            # feature, so a ref minted for one sketch never collides with another's).
-            used = set()
-            for f in _tree_features(d):
-                if f.get("type") != "sketch3d":
-                    continue
-                for xr in ((f.get("params") or {}).get("external_refs") or []):
-                    rid = xr.get("id") if isinstance(xr, dict) else None
-                    if isinstance(rid, str) and rid.startswith("x") and rid[1:].isdigit():
-                        used.add(int(rid[1:]))
-            n = (max(used) + 1) if used else 1
-            ref_id = f"x{n}"
-            refs = list((feat.get("params") or {}).get("external_refs") or [])
-            refs.append({"id": ref_id, "source": {"kind": "vertex", "selector": selector},
-                        "stale": True})
-            _apply_ops(d, [{"op": "edit_feature", "id": sketch3d_id,
-                            "params": {"external_refs": refs}}])
-            # Force a rebuild so refresh_sketch3d_external_refs resolves it immediately
-            # (edit_feature alone re-solves the sketch but the refresh pass runs on every
-            # mutating apply_ops batch, so this has already happened by now — the extra
-            # doc_rebuild call just guarantees a fresh read-back for the caller).
-            cb.call("doc_rebuild", {"doc_id": d})
+            # The engine mints the doc-wide-unique "x<N>" id (external refs share their own
+            # id space — separate from "e<N>" entities / "c<N>" constraints — across every
+            # sketch3d feature) and appends it atomically, so a concurrent edit to the same
+            # sketch is never overwritten. The same batch's external-ref pass resolves the
+            # vertex immediately, so last_point / stale are already current below.
+            r = _apply_ops(d, [{"op": "sketch3d_add_external_ref", "sketch": sketch3d_id,
+                                "ref": {"source": {"kind": "vertex", "selector": selector}}}])
+            ref_id = _minted_ids(r, 0, 1, "external reference")[0]
             feat2 = _find_sketch3d(d, sketch3d_id)
             refs2 = (feat2.get("params") or {}).get("external_refs") or []
             rec = next((r for r in refs2 if r.get("id") == ref_id), None)
@@ -844,9 +869,17 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
 
         Solves the sketch3d feature (stateless sketch3d_health RPC) and returns:
           status        "full" (fully defined — the goal), "under", or "over" (conflict)
+          fully_defined true only if converged, dof 0, no conflicts AND no skipped constraints
           dof           remaining degrees of freedom (0 = fully defined)
           conflicting   constraint ids that contradict each other — remove one
+          conflicts_with {conflicting id: [constraint ids it contradicts]}
+          nonconvergence_reason  why the solve failed, naming the conflicting constraints
+                        with type and value (absent/null when it converged)
+          skipped_constraints [{id, type, reason}] constraints the solver could not use —
+                        NOT solved; a sketch carrying one is never "fully defined"
           redundant     constraint ids implied by the others
+          revision      document revision checked, only when stable across the health read
+          revision_stale true if the revision changed or could not be established; re-check
           free_narration remaining loose coordinates in plain words ("e2: p2 x/y/z loose")
           entity_statuses per-entity full/under/over
           wires         chain report [{closed, n_edges}] — index k maps 1:1 to the sweep
@@ -860,9 +893,16 @@ def register_sketch3d_tools(mcp: FastMCP) -> None:
         """
         try:
             d = _doc(doc_id)
+            before = cb.call("doc_tree", {"doc_id": d}).get("revision")
             _find_sketch3d(d, sketch3d_id)
             read = _health_read(_health(d, sketch3d_id))
-            return _dumps({"ok": True, "doc_id": d, "sketch": sketch3d_id, **read})
+            after = cb.call("doc_tree", {"doc_id": d}).get("revision")
+            stable = type(before) is int and type(after) is int and before == after
+            result = {"ok": True, "doc_id": d, "sketch": sketch3d_id,
+                      **read, "revision_stale": not stable}
+            if stable:
+                result["revision"] = before
+            return _dumps(result)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

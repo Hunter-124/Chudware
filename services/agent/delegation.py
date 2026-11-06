@@ -9,8 +9,8 @@ What this module provides
     ``delegation`` (contract §12).  Every node transition is a ledger event.
 
 ``delegate(role, brief, budget, ...)``
-    The callable exposed to roles as the ``delegate`` tool (contract §12 + roles.py
-    FEATURE_FLAGGED_TOOLS).  Returns a request handle; the caller polls status.
+    The callable behind the ``delegate`` tool (contract §12); the tool itself is the
+    mission-scoped ``MissionDispatch.delegate``.  Returns a request handle; the caller polls status.
 
 ``DelegationNode``
     One spawned sub-agent slot: role + model (resolved via routing) + brief +
@@ -363,17 +363,6 @@ def delegation_budget_requirements(
             "mandated_calls": 0,
             "tier": tier,
         }
-
-
-def minimum_delegation_tokens(
-    role: str,
-    brief: str,
-    *,
-    tier: str | None = None,
-) -> tuple[int, int]:
-    """Compatibility view of the structural floor and mandatory call count."""
-    req = delegation_budget_requirements(role, brief, tier=tier)
-    return int(req["required_tokens"]), int(req["mandated_calls"])
 
 
 # ---------------------------------------------------------------------------
@@ -1050,7 +1039,7 @@ def delegate(
     effort: str | None = None,
     project_dir: str | None = None,
 ) -> dict:
-    """The ``delegate`` tool exposed to role cards per contract §12 + roles.py allowlist.
+    """The ``delegate`` tool exposed to role cards per contract §12.
 
     Validates and delegates via *tree*. Returns ``ok=True`` with the serialised
     node on success, or ``ok=False`` with a stable refusal reason and actionable
@@ -1095,135 +1084,6 @@ def delegate(
             "status": "failed",
             **exc.details,
         }
-
-
-
-
-# ---------------------------------------------------------------------------
-# MCP tool registration (optional thin wrapper for the in-app path)
-# ---------------------------------------------------------------------------
-
-def register_delegation_tools(registry: Any, tree: DelegationTree | None = None) -> None:
-    """Register delegation tools with an MCP tool registry.
-
-    The registry is the one from services/mcp/tool_registry.py.  This makes
-    ``delegate`` and ``kill_delegation_tree`` real registered tools.
-
-    *tree* is optional — when None, the tools return an error asking the caller
-    to provide a tree via the mission context.  The actual mission loop injects
-    the live tree through the context mechanism.
-
-    Registered tools:
-      ``delegate``            — spawn a sub-agent (hard-capped by max_subagent_depth).
-      ``kill_delegation_tree``— human kill-switch: halt the whole tree immediately.
-      ``delegation_budget``   — read the live budget meter (tokens + agent count).
-    """
-    def _delegate_tool(
-        role: str,
-        brief: str,
-        budget_tokens: int,
-        kind: str = "worker",
-        parent_id: Optional[str] = None,
-        docs: Optional[list] = None,
-        effort: Optional[str] = None,
-    ) -> dict:
-        if tree is None:
-            return {"error": "delegate tool: no delegation tree available in this context",
-                    "status": "failed"}
-        return delegate(
-            role, brief, budget_tokens,
-            tree=tree,
-            parent_id=parent_id,
-            kind=kind,
-            docs=docs,
-            effort=effort,
-        )
-
-    def _kill_tree_tool() -> dict:
-        if tree is None:
-            return {"error": "kill_delegation_tree: no delegation tree in this context",
-                    "status": "failed"}
-        try:
-            tree.kill()
-            return {"killed": True, "budget_meter": tree.budget_meter.to_dict()}
-        except Exception as exc:  # noqa: BLE001
-            return {"error": str(exc), "status": "failed"}
-
-    def _budget_tool() -> dict:
-        if tree is None:
-            return {"error": "delegation_budget: no delegation tree in this context",
-                    "status": "failed"}
-        return tree.budget_meter.to_dict()
-
-    try:
-        registry.register(
-            "delegate",
-            _delegate_tool,
-            description=(
-                "Spawn a sub-agent role with an isolated brief and token budget. "
-                "Nesting is hard-capped by agent.max_subagent_depth (default 2; "
-                "root chat = depth 0). Spawns past the limit refuse with "
-                "'max subagent nesting depth (N) reached'. "
-                "Every valid delegation is auto-approved before this tool returns. "
-                "A depth_warning or agent_limit_warning advisory is emitted when soft limits "
-                "are reached, but the spawn still proceeds (until the hard nesting cap). "
-                "Optional 'effort' (low|medium|high): when the subagent role's Thinking is "
-                "Auto, the dispatcher uses this as reasoning effort; omit to let the harness "
-                "judge complexity (default medium). "
-                "Returns the delegation node dict including status and model assignment."
-            ),
-            parameters={
-                "type": "object",
-                "required": ["role", "brief", "budget_tokens"],
-                "properties": {
-                    "role": {"type": "string", "description": "Role id to spawn"},
-                    "brief": {"type": "string", "maxLength": 20000,
-                              "description": (
-                                  "Self-contained assignment for the sub-agent. It CANNOT see "
-                                  "your conversation, so include every requirement, dimension "
-                                  "and acceptance criterion it needs. Delivered to the child in "
-                                  "full; the delegation record keeps a 500-char summary.")},
-                    "budget_tokens": {"type": "integer",
-                                      "description": "Token budget for the sub-agent"},
-                    "kind": {"type": "string", "enum": ["worker", "ponder"],
-                             "description": "worker (default) or ponder (read-only, any depth)"},
-                    "parent_id": {"type": "string",
-                                  "description": "Parent node id (defaults to orchestrator root)"},
-                    "docs": {"type": "array",
-                             "description": "Doc lease requests [{doc_id, lease}]"},
-                    "effort": {
-                        "type": "string",
-                        "enum": ["low", "medium", "high"],
-                        "description": (
-                            "Optional reasoning effort for the subagent when its role "
-                            "Thinking is Auto. Omit for harness judgment (default medium)."
-                        ),
-                    },
-                },
-            },
-        )
-        registry.register(
-            "kill_delegation_tree",
-            _kill_tree_tool,
-            description=(
-                "Human kill-switch: immediately revoke the entire delegation tree from root, "
-                "halt all active sub-agents, and prevent any new spawns. "
-                "Use when the delegation tree is suspected to be runaway. "
-                "Returns the final budget meter snapshot."
-            ),
-            parameters={"type": "object", "required": [], "properties": {}},
-        )
-        registry.register(
-            "delegation_budget",
-            _budget_tool,
-            description=(
-                "Return the live tree-wide budget meter: tokens spent/granted/remaining, "
-                "agents spawned/remaining, soft_depth_limit, max_agents, and killed status."
-            ),
-            parameters={"type": "object", "required": [], "properties": {}},
-        )
-    except Exception:  # noqa: BLE001 — registration failure must not crash startup
-        pass
 
 
 # ---------------------------------------------------------------------------

@@ -16,13 +16,11 @@ enum class State {
     Downloading,
     Staged,
     ManualDownload,
-    Mandatory,
     Error,
 };
 
 struct Manifest {
     std::string version;
-    std::string minSupported;
     std::string platform;
     std::string arch;
     std::string keyId;
@@ -38,7 +36,6 @@ struct Snapshot {
     std::string version;
     std::string message;
     std::string downloadUrl;
-    bool mandatory = false;
     std::uint64_t reportSerial = 0;
 };
 
@@ -53,8 +50,6 @@ enum class ApplyResult {
 // Semantic-version precedence per semver.org. Build metadata is ignored.
 // Invalid inputs compare lower than valid ones; two invalid strings compare equal.
 int compareVersions(const std::string& lhs, const std::string& rhs);
-bool requiresMandatoryUpdate(const std::string& current,
-                             const std::string& minSupported);
 
 // The signed release manifest one target polls: the `update-<platform>-<arch>.json`
 // asset of the latest GitHub release. `platform` is windows|macos|linux and

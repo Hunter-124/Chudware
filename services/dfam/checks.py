@@ -14,9 +14,11 @@ from scipy.spatial import ConvexHull, QhullError
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 
+from services.mcp import core_bridge
+
 from .mesh import PrintMesh
 from .params import PrintParams
-from .geometry import BuildGeometry, RayCaster, depth_peel, fit_cylinder, surface_samples, voxelize
+from .geometry import BuildGeometry, depth_peel, fit_cylinder, surface_samples, voxelize
 
 CHECK_NAMES = ("min_wall", "overhang", "bridges", "support", "small_holes", "internal_voids",
                "bed_adhesion", "build_volume")
@@ -31,7 +33,12 @@ def row(check: str, status: str, note: str, metrics=None, limits=None, regions=N
     return {"check": check, "status": status,
             "ok": False if status == "fail" else True if status in ("pass", "warn") else None,
             "note": note, "metrics": metrics or {}, "limits": limits or {},
-            "regions": regions or [], "regions_omitted": int(omitted), "fix": fix or []}
+            "basis": "native inscribed-sphere mesh samples" if check == "min_wall" else
+                     "sampled tessellation and build-frame geometry",
+            "confidence": "geometry_heuristic",
+            "assumptions": ["Mesh sampling and process parameters limit this screening; verify against the selected manufacturing setup."],
+            "regions": regions or [], "regions_omitted": int(omitted), "fix": fix or [],
+            "fix_ops": []}
 
 
 _STATUS_RANK = {"fail": 0, "warn": 1}
@@ -255,8 +262,23 @@ class CheckContext:
                     candidates.append(fit)
                 else:
                     duplicate["tids"] = np.concatenate([duplicate["tids"], tids])
-        self._holes = candidates
-        return candidates
+        # A concave fillet can fit the same cylinder as a bore.  Combine split
+        # faces first, then require the mesh to cover the entire circumference.
+        # The 20-degree smooth-facet limit above permits a little tessellation
+        # tolerance while rejecting open cylindrical patches.
+        closed = []
+        for fit in candidates:
+            axis = fit["axis"]
+            basis = np.cross(axis, np.eye(3)[np.argmin(np.abs(axis))])
+            basis /= np.linalg.norm(basis)
+            other = np.cross(axis, basis)
+            points = g.triangles[fit["tids"]].reshape(-1, 3) - fit["center"]
+            angles = np.sort(np.mod(np.arctan2(points @ other, points @ basis), 2 * math.pi))
+            gaps = np.diff(np.r_[angles, angles[0] + 2 * math.pi])
+            if np.max(gaps) <= math.radians(25):
+                closed.append(fit)
+        self._holes = closed
+        return closed
 
     @property
     def small_horizontal(self):
@@ -270,23 +292,27 @@ class CheckContext:
 def min_wall(ctx: CheckContext) -> dict:
     g, p = ctx.geom, ctx.params
     points, normals, tids, weights = surface_samples(g)
-    reach = max(3 * p.min_wall_mm, 3.0, 2 * p.line_width_mm, 3 * p.layer_height_mm)
-    eps = min(1e-4, p.nozzle_mm * 1e-3)
-    distances, hits = RayCaster(g, cell=reach).cast(points - eps * normals, -normals,
-                                                    reach, opposing_normals=normals)
-    thickness = distances + eps
+    measured = core_bridge.call("mesh_wall_thickness", {
+        "vertices": g.vertices.ravel().tolist(),
+        "triangles": g.mesh.triangles.ravel().tolist(),
+        "points": points.ravel().tolist(),
+        "normals": normals.ravel().tolist(),
+    })
+    thickness = np.asarray(measured["thickness"], dtype=float)
+    opposing = np.asarray(measured["opposing_cos"], dtype=float)
     finite = np.isfinite(thickness)
-    vertical = np.abs(normals[:, 2]) < 0.5
+    # Orientation follows the measured thickness direction, not the sample's own normal:
+    # the side face of a thin horizontal skin is covered by the skin's vertical span.
+    direction = np.array([d if d is not None else n for d, n in
+                          zip(measured["wall_direction"], normals.tolist())], dtype=float)
+    vertical = np.abs(direction[:, 2]) < 0.5
     fdm = p.process == "fdm"
-    required = max(p.min_wall_mm, p.nozzle_mm) if fdm else p.min_wall_mm
+    required = max(p.min_wall_mm, p.nozzle_mm, p.walls * p.line_width_mm) if fdm else p.min_wall_mm
     # A wall has near-parallel opposing faces. Where they converge at more than ~25°
     # (a fillet or arc running out into a flat), the thin strip is a knife edge: the
     # slicer drops or feathers it, which is a cosmetic warning, not a wall that fails.
-    opposing = np.full(len(points), -1.0)
-    hit_ids = np.asarray(hits)
-    valid_hits = finite & (hit_ids >= 0)
-    opposing[valid_hits] = np.einsum("ij,ij->i", normals[valid_hits],
-                                     g.normals[hit_ids[valid_hits].astype(int)])
+    # The sphere's controlling wall pair also supplies taper classification when
+    # coverage transfers a rib-side measurement onto its top face.
     wedge = finite & (opposing > -0.9)
     thin = finite & (thickness < required - 1e-6)
     failing = thin & ~wedge
@@ -315,23 +341,30 @@ def min_wall(ctx: CheckContext) -> dict:
     walls = finite & ~wedge
     value = float(thickness[walls].min()) if walls.any() else (
         float(thickness[finite].min()) if finite.any() else None)
-    status = "fail" if failing.any() else "warn" if warning.any() else "pass"
-    target = max(p.min_wall_mm, p.nozzle_mm, 2 * p.line_width_mm) if fdm else p.min_wall_mm
+    status = ("not_evaluated" if not finite.any() else "fail" if failing.any() else
+              "warn" if warning.any() else "pass")
+    target = required
     remedy = (f"thicken to >= {target:g} mm ({math.ceil(target / p.line_width_mm)} perimeters at {p.line_width_mm:g} mm)"
               if fdm else f"thicken to >= {target:g} mm")
     result = row("min_wall", status,
-                 f"Minimum measured wall {value:.3f} mm; required {p.min_wall_mm:g} mm." if value is not None else
-                 f"No wall thinner than the {reach:g} mm search range; required {p.min_wall_mm:g} mm.",
-                 {"min_thickness_mm": value, "search_distance_mm": reach,
+                 f"Minimum measured wall {value:.3f} mm; required {required:g} mm." if value is not None else
+                 f"No opposing wall measured by inscribed spheres; required {required:g} mm.",
+                 {"min_thickness_mm": value,
+                  "measurement_basis": {"method": "inscribed_sphere",
+                                        "spacing_mm": measured["spacing_mm"],
+                                        "n_blockers": measured["n_blockers"],
+                                        "wall_separation_deg": 120,
+                                        "query_sampling": "area_stratified",
+                                        "n_unmeasured": int((~finite).sum())},
                   "thin_area_mm2": float(weights[failing | warning].sum()),
                   "knife_edge_area_mm2": float(weights[knife].sum()), "samples": len(points),
                   "gap_fill": {"status": "warn" if gap.any() else "pass",
                                "area_mm2": float(weights[gap].sum()),
                                "note": "Walls between 2 and 6 line widths far from an integer perimeter count require gap fill."}},
                  {"min_wall_mm": p.min_wall_mm, "nozzle_mm": p.nozzle_mm,
-                  "line_width_mm": p.line_width_mm, "minimum_skin_layers": 3}, shown,
-                 [remedy] if status != "pass" else [], omitted, ctx.detail)
-    result.update(value_mm=value, limit_mm=p.min_wall_mm)
+                  "line_width_mm": p.line_width_mm, "perimeters": p.walls, "minimum_skin_layers": 3}, shown,
+                 [remedy] if status in ("fail", "warn") else [], omitted, ctx.detail)
+    result.update(value_mm=value, limit_mm=required)
     return result
 
 
@@ -724,7 +757,7 @@ def internal_voids(ctx: CheckContext) -> dict:
         trapped_in = np.bincount(labels[ctx._inaccessible["mask"]], minlength=len(sizes)) * vox.cell**3
 
     def cavity_status(label: int) -> str:
-        return "fail" if p.process in ("sla", "sls") or _trapped(float(trapped_in[label]), vox.cell) else "warn"
+        return "fail" if p.process in ("sla", "sls", "mjf") or _trapped(float(trapped_in[label]), vox.cell) else "warn"
 
     # The row fails on a cavity that traps support, not on crumbs summed across the part.
     trapped = any(cavity_status(label) == "fail" for label in sealed)
@@ -741,7 +774,7 @@ def internal_voids(ctx: CheckContext) -> dict:
     slices = ndimage.find_objects(bodies)
     peel, data = ctx.peel, support_data(ctx)
     for label, bounds in enumerate(slices, 1):
-        if bounds is None:
+        if bounds is None or p.process in ("sls", "mjf"):
             continue
         lowest = vox.origin[2] + bounds[2].start * vox.cell
         if lowest <= vox.cell + .05:
@@ -765,9 +798,9 @@ def internal_voids(ctx: CheckContext) -> dict:
                                        classification="floating_body", status="fail"))
     shown, omitted = _ranked(floating + regions, ctx.limit, lambda r: -r["volume_mm3"])
     omitted += len(sealed) - len(regions)
-    status = ("fail" if floating or (len(sealed) and p.process in ("sla", "sls")) or trapped
+    status = ("fail" if floating or (len(sealed) and p.process in ("sla", "sls", "mjf")) or trapped
               else "warn" if len(sealed) else "pass")
-    fix = ["add >= 2 drain holes >= 3.5 mm to release trapped resin/powder"] if len(sealed) and p.process in ("sla", "sls") else []
+    fix = ["Add appropriately sized escape openings for trapped resin or powder; consult the process provider."] if len(sealed) and p.process in ("sla", "sls", "mjf") else []
     if len(sealed) and p.process == "fdm":
         fix.append("sealed cavity: make ceiling bridgeable, split part, or add a support-removal access opening")
     if floating:
@@ -776,7 +809,7 @@ def internal_voids(ctx: CheckContext) -> dict:
                f"{len(sealed)} sealed cavities ({void_volume:.1f} mm3); {len(floating)} floating bodies without a support path.",
                {"sealed_cavities": len(sealed), "void_volume_mm3": void_volume,
                 "floating_bodies": len(floating), "enclosed_support_mm3": enclosed, "voxel_mm": vox.cell},
-               {"access_mm": p.access_mm, "drain_holes": 2, "drain_diameter_mm": 3.5},
+               {"access_mm": p.access_mm},
                shown, fix, omitted, ctx.detail)
 
 

@@ -1,6 +1,7 @@
 """Real private-artifact/socket regressions, never using an existing daemon."""
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import shlex
@@ -128,8 +129,10 @@ def test_autosave_and_child_logs_private_under_022(monkeypatch, tmp_path):
             deadline = time.monotonic() + 20
             snapshots = []
             while time.monotonic() < deadline:
-                snapshots = list(state.rglob(doc_id + ".step+"))
-                if snapshots and snapshots[0].with_suffix(".json").exists():
+                snapshots = [p for p in state.rglob("*.step+")
+                             if p.with_suffix(".json").exists()
+                             and json.loads(p.with_suffix(".json").read_text()).get("doc_id") == doc_id]
+                if snapshots:
                     break
                 assert process.poll() is None, "scratch daemon exited during autosave"
                 client.call("ping")

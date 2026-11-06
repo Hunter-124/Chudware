@@ -209,12 +209,23 @@ class TestLayoutPlanCapture:
 class TestLayoutCoverageGate:
     """_gap_layout_coverage correctly WARN/FAILs and then passes."""
 
-    def test_no_layout_plan_passes(self, mock_cb):
-        """When no layout_plan meta exists, gate passes with informational note."""
-        result = _gap_layout_coverage_direct("doc-test")
-        assert result["ok"] is True
-        assert result["total"] == 0
-        assert "no layout plan" in result["note"]
+    @pytest.mark.parametrize("plan,reason", [
+        (None, "no layout plan"),
+        ({"schema": "aicad.layout/1", "critical_req_ids": [],
+          "interface_req_ids": []}, "no layout-critical requirements"),
+    ])
+    def test_no_scorable_layout_requirements_skip(self, mock_cb, plan, reason):
+        from services.verify.battery import verify
+
+        if plan is not None:
+            _META_STORE["doc-test"] = {"layout_plan": plan}
+        direct = _gap_layout_coverage_direct("doc-test")
+        assert direct["skipped"] is True
+        assert reason in direct["skip_reason"]
+        result = verify(doc_id="doc-test", checks=["layout_coverage"])
+        assert result["scores"] == {}
+        assert result["skipped"] == ["layout_coverage"]
+        assert reason in result["findings"][0]["detail"]
 
     def test_unverified_dims_fail(self, mock_cb):
         """After layout_plan but before verification, gate fails."""

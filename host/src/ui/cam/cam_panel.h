@@ -13,11 +13,14 @@ struct Mesh;  // fwd (host/src/mesh.h, global namespace)
 namespace ui {
 
 struct CamBackplot;  // fwd (cam_mirror.h)
+struct CommandContext;
 
-// Adopt an existing CAM job doc (for example one built by the copilot CAM fast path).
+// Adopt an existing CAM job doc (for example one built by cam_program).
 void camLoadJob(AppState& st, const std::string& docId);
 // Route Manufacture ribbon commands against the integrated workspace selection.
 void camHandleCommand(AppState& st, const std::string& cmd);
+// Copy job, setup, busy and source facts without invoking the engine.
+void camPopulateCommandContext(const AppState& st, CommandContext& context);
 
 // Integrated left-rail bodies. They draw inside their caller's surface (no Begin/End).
 void drawCamTreeBody(AppState& st);

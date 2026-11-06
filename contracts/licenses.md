@@ -32,7 +32,7 @@ Rules:
 - Adding, upgrading or removing a dependency updates its row here and its entry in
   `THIRD_PARTY_NOTICES.md` in the same change. Exact pins live in the build or provisioning file
   cited in each row (`core/CMakeLists.txt`, `host/CMakeLists.txt`, `core/cmake/Provision*.cmake`,
-  `scripts/fetch_cef_*`, `requirements.txt`, `vendor/chudcode/CHUDCODE_ARTIFACT.lock`, the
+  `scripts/fetch_cef_*`, `requirements.txt`, `vendor/omp/OMP_ARTIFACT.lock`, the
   provisioning descriptors); the row records the pinned version.
 - Copyleft code is never copied, ported, or reworded into the tree. Functionality also offered by
   GPL projects (KiCad, BOLTS, FreeCAD Path, CalculiX, LibreDWG, ...) is reimplemented clean-room
@@ -42,7 +42,7 @@ Rules:
 - Tables transcribed from standards and references record facts (dimensions, material
   properties), not copied compilations; their sources are recorded under
   [Data and reference material](#data-and-reference-material).
-- Re-audit this ledger whenever a pin, `requirements.txt`, the Chudcode lock or a provisioning
+- Re-audit this ledger whenever a pin, `requirements.txt`, the OMP lock or a provisioning
   descriptor changes.
 
 ## Native libraries (C/C++)
@@ -70,14 +70,18 @@ Rules:
 | **TweetNaCl** | LicenseRef-PublicDomain | Ed25519 signature verification (`crypto_sign_open`) for signed release-payload manifests (`core/security/integrity.cpp`) and signed update manifests (`host/src/update/updater.cpp`) | in-process, vendored as `core/util/tweetnacl.{c,h}`; compiled into `chudware_util`, the update and uninstall helpers and the WASM client. Chosen over OpenSSL or libsodium to avoid a per-platform system dependency on a path every build needs. Verification only: no signing key is part of the repository or any artifact. Randomness comes from first-party `core/util/randombytes.cpp`. |
 | **Chromium Embedded Framework (CEF)** 149.0.6+g0d0eeb6 (Chromium 149.0.7827.201) | BSD-3-Clause (CEF and Chromium) plus the licenses of Chromium's bundled third-party code, listed in the distribution's `CREDITS.html` | in-application off-screen browser (`host/src/ui/widgets/cef/`) | **dynamic**. SHA-256 pinned minimal binary distribution fetched by `scripts/fetch_cef_posix.sh` / `scripts/fetch_cef_windows.ps1` into `extern/cef/` (not committed); shipped with native desktop builds (`CHUDWARE_ENABLE_CEF`, default ON), never with WASM builds. The distribution's `LICENSE.txt` and `CREDITS.html` must accompany shipped binaries; tracked in `license_debt.md`. |
 | libcurl (system) | curl | HTTP client for model-provider and update requests | **dynamic**, system library. |
+| libzstd (system, optional) | BSD-3-Clause | SPZ v4 Gaussian splat decompression (`services/formats/splat_io.py`) | in-process via Python `ctypes`, discovered as a user-installed system shared library; not downloaded or bundled by this adapter. |
 | Platform runtime libraries bundled in the Linux AppImage dependency closure (for example libstdc++, libgcc, libgomp, X11/Wayland client libraries, zlib) | each under its distribution license (libstdc++/libgomp: GPL-3.0-or-later WITH GCC-exception-3.1) | C/C++ runtime, OpenMP threading, windowing | **dynamic**. `packaging/linux/build_appimage.sh` copies the `ldd` closure minus the AppImage excludelist; the exact set depends on the build host. Notices are covered by the open item in `license_debt.md`. |
 | CUDA Toolkit (optional) | LicenseRef-NVIDIA-CUDA-EULA | CUDA lattice-Boltzmann backend | system, opt-in `CHUDWARE_WITH_CUDA` (default OFF); the CUDA runtime is not bundled by any packaging script. |
-| Emscripten toolchain runtime (version of the developer's `emsdk`) | Emscripten: MIT OR NCSA; musl libc: MIT; libc++/libc++abi/compiler-rt: Apache-2.0 WITH LLVM-exception (per upstream) | runtime libraries linked into the experimental WASM web client | in-process (static in the WASM output). |
+| Emscripten toolchain runtime (6.0.3 in the browser container; otherwise the developer's `emsdk`) | Emscripten: MIT OR NCSA; musl libc: MIT; libc++/libc++abi/compiler-rt: Apache-2.0 WITH LLVM-exception (per upstream) | runtime libraries linked into the experimental WASM web client | in-process (static in the WASM output); the container toolchain stage uses `emscripten/emsdk:6.0.3`, not the runtime service image. |
 
 ## Python runtime packages (`requirements.txt`)
 
-All are installed from wheels into the Chudware Python runtime; none is vendored in the
-repository. Optional packages that are feature-detected at run time are listed in the next table.
+Runtime packages are installed from wheels (or the SDK source described below) into the
+Chudware Python runtime; none is vendored in the repository. The browser container
+installs the root requirements except the optional `omp-rpc` source-archive line,
+retaining non-AI Python-backed features. Optional packages that are feature-detected
+at run time are listed in the next table.
 
 | dependency | license | role | posture |
 |---|---|---|---|
@@ -96,7 +100,7 @@ repository. Optional packages that are feature-detected at run time are listed i
 | opencv-python-headless | Apache-2.0 (wheels bundle FFmpeg under LGPL-2.1-or-later, per upstream) | ChArUco/ArUco fiducial detection and pixel-to-millimetre homography; OpenCV core only, no contrib modules | in-process; optional at run time (vision tools degrade when absent) |
 | pycolmap (Linux x86-64, Windows, macOS arm64) | BSD-3-Clause | sparse structure-from-motion for reverse engineering | in-process; also force-included in the compiled sidecars by `packaging/requirements-release.txt` |
 | mcp | MIT | MCP server and tool schemas | in-process |
-| chudcode-rpc 0.3.1 | MIT | typed RPC client for the Chudcode runtime | in-process; built from the Chudcode repository at the commit in `vendor/chudcode/CHUDCODE_ARTIFACT.lock`; not published on PyPI |
+| omp-rpc 0.1.0 | MIT | official typed RPC client for the optional native online-agent runtime | in-process; built from the SHA-256-pinned upstream source archive at commit `413d278a87a69b453efabf8d1fedb9940385e8c6`; browser container omits this optional SDK. |
 | anthropic / openai / httpx | MIT / Apache-2.0 / BSD-3-Clause | model-provider SDKs and HTTP | in-process |
 | scikit-fem / meshio / pyamg | BSD-3-Clause / MIT / MIT | Python-side FEA assembly, mesh I/O, AMG preconditioner | in-process |
 | python-pptx / python-docx / openpyxl | MIT | `.pptx` / `.docx` / `.xlsx` deliverables and edits | in-process |
@@ -140,31 +144,40 @@ repository. Optional packages that are feature-detected at run time are listed i
 | ordered-set | MIT | Nuitka dependency | build tool |
 | zstandard / PyYAML / cryptography | BSD-3-Clause / MIT / Apache-2.0 OR BSD-3-Clause | release-build helpers and signing | build tool |
 | patchelf | GPL-3.0-or-later | rewrites ELF run paths during Linux release builds | build tool only; never shipped |
+| pytest-xdist 3.8.0 / execnet 2.1.2 | MIT / MIT | parallel pytest workers in the test container image (`tools/testbox/Containerfile`) | build tool; test-only, installed in the image's own venv, never shipped |
 | fastapi / uvicorn[standard] / websockets / httpx / python-multipart / anyio | MIT / BSD-3-Clause / BSD-3-Clause / BSD-3-Clause / Apache-2.0 / MIT | experimental self-hosted web gateway (`web/gateway/requirements.txt`) | in-process in the gateway service; not part of the desktop application |
 | astro / @astrojs/mdx / pagefind / wrangler | MIT / MIT / MIT / MIT OR Apache-2.0 | static build and search index for the promotional website (`website/package.json`) | build tools; the generated site includes Pagefind's search UI (MIT) |
 | sharp (npm override) with prebuilt libvips | Apache-2.0; libvips binaries LGPL-3.0-or-later | image processing during the website build | build tool only; nothing from it is served |
 | `coi-serviceworker.js` 0.1.7 | MIT | sets COOP/COEP headers client-side so the WASM web client can use `SharedArrayBuffer` | in-process, vendored as `host/wasm/coi-serviceworker.js` (upstream `gzuidhof/coi-serviceworker`) |
+| Docker Engine / Docker Compose v2 (Compose 2.24.4+ for the HTTPS override) | Apache-2.0 (Moby/Compose; Docker Desktop has separate product terms) | host-side build and orchestration for `web/compose.yaml` | user-installed tooling, not linked into Chudware or included in its application image. A compatible Podman/Compose provider is an alternative under its own license. |
+| Fedora 44 container packages | per-package licenses (including LGPL libraries and GPL OS tools) | native build stage and Linux runtime environment in `web/deploy/container/Dockerfile` | operating-system packages, not relicensed by Chudware's MIT license. Preserve their package license files and metadata; redistribution/source obligations apply to each package. Exact installed versions are the image's RPM inventory, not a fixed whole-distribution license. |
+| bubblewrap (Fedora package) | LGPL-2.0-or-later | isolated actor/worker subprocesses in the browser container and advanced systemd deployment | separate OS executable, never linked or imported into Chudware. Installed in the container runtime; user-installed for systemd. Preserve the package's license and corresponding-source information when redistributing the image. Upstream: https://github.com/containers/bubblewrap. |
+| Caddy 2.10.2 (`caddy:2.10.2-alpine`) | Apache-2.0 (Caddy); image OS packages retain their own licenses | optional TLS and HTTP Basic authentication proxy in `web/compose.https.yaml` | separate upstream container image, not part of the Chudware process or desktop payload. Preserve upstream image/package notices when redistributing. Upstream: https://github.com/caddyserver/caddy. |
+| AppArmor 4.x `apparmor_parser` | GPL-2.0-only (parser); host dependencies retain their own licenses | loads the optional named container profile on namespace-restricting AppArmor hosts such as Ubuntu 24.04+ | user-installed host subprocess only; never linked, imported or included in the Chudware image. The supplied profile is Chudware configuration, not vendored AppArmor implementation. Upstream: https://gitlab.com/apparmor/apparmor. |
 
 ## Agent runtime
 
 | dependency | license | role | posture |
 |---|---|---|---|
-| **Chudcode** 0.4.3 (commit `2eaba2f4606984172f31f108459d9529d4ee5e38`; engine 18.4.4; RPC protocol 2) | MIT (Chudcode modifies Oh My Pi, also MIT) | compiled online agent runtime: providers, sessions, memory, compaction, browser/computer use, speech-to-text, host-tool orchestration | **subprocess** over RPC. The public release binary for each platform is downloaded and verified against the SHA-256 values in `vendor/chudcode/CHUDCODE_ARTIFACT.lock`; Chudware never imports or vendors the Chudcode engine source. The binary embeds the Bun runtime and bundled packages and fonts, all covered by `vendor/chudcode/CHUDCODE-NOTICE` and `vendor/chudcode/CHUDCODE-THIRD-PARTY-NOTICES.txt`; both files are hash-locked and required in every desktop and web payload. |
+| **Oh My Pi** 18.13.3 (commit `413d278a87a69b453efabf8d1fedb9940385e8c6`; RPC protocol 2) | MIT | optional native online-agent runtime: providers, sessions, memory, compaction and agent orchestration | **subprocess** over RPC. Upstream binary assets, source revision and notices are pinned in `vendor/omp/OMP_ARTIFACT.lock`; preserve `vendor/omp/OMP-LICENSE` and `vendor/omp/OMP-THIRD-PARTY-NOTICES.txt` with the payload. |
 
 ## External tools (subprocess only)
 
-None of these is linked, imported, vendored or bundled. Each is discovered on `PATH`, through an
-environment variable, or in a per-user install that a provisioning script creates on the user's
-machine at the user's request. Absence degrades the feature with an actionable message. The
-licenses in this table are those published by each upstream project; none of these tools has a
-copy of its license in this repository because none is distributed with Chudware.
+These tools run as separate programs, never linked or imported into Chudware. Unless a
+row says otherwise, they are user-installed, discovered on `PATH` or through an
+environment variable, or provisioned into the user's environment on request; they
+are not shipped in desktop artifacts. The browser container additionally installs
+ngspice as a separate Fedora OS package, retaining its package notices and source
+obligations. Absence of an optional tool degrades its feature with an actionable message.
+The licenses below are those published by each upstream project.
 
 | tool | license | role | posture |
 |---|---|---|---|
+| OpenSCAD | GPL-2.0-or-later | SCAD rendering and import | separate user-installed executable, never linked or imported; `PATH` or `CHUDWARE_OPENSCAD_BIN`. Linux execution also requires bubblewrap and enabled user namespaces. Redistributors of OpenSCAD must satisfy its own license obligations. |
 | PrusaSlicer 2.9.6 (stock) | AGPL-3.0-or-later | FFF slicing for `slice_part` (`services/manufacturing/slicer/prusaslicer.py`); vendor profiles are read from the installed slicer, never copied into the repository | subprocess; user-installed (Flathub per-user install on Linux) |
 | CalculiX (`ccx`) | GPL-2.0-or-later | thermal and contact FEA tools (`services/mcp/fea_advanced.py`) and the V&V cross-check (`scripts/vv_benchmark.py`) | subprocess; `PATH` or `CHUDWARE_CCX`. Input decks are generated from Chudware geometry in the public Abaqus/CalculiX syntax; no CalculiX decks or templates are copied. Linear buckling uses Chudware's in-process Spectra solver, not CalculiX. |
 | OpenFOAM | GPL-3.0-or-later | accurate CFD and conjugate heat transfer backend (`services/sim/foam_runner.py`) | subprocess; user install, or `tools/provision_openfoam.py --install` creates a conda-forge environment for the user. Case files are plain OpenFOAM input dictionaries. |
-| ngspice | BSD-3-Clause with GPL-licensed parts (per upstream) | optional circuit-simulation backend for vendor `.SUBCKT` models (`services/installer/ngspice_backend.py`) | subprocess; `PATH` or `CHUDWARE_NGSPICE`. The native MNA solver (`core/sim/spice.cpp`) is the default. |
+| ngspice | BSD-3-Clause with GPL-licensed parts (per upstream) | optional circuit-simulation backend for vendor `.SUBCKT` models (`services/installer/ngspice_backend.py`) | separate executable; `PATH` or `CHUDWARE_NGSPICE`. User-installed for desktop; installed as a Fedora OS package in the browser container, with package license/source obligations preserved. The native MNA solver (`core/sim/spice.cpp`) is the default. |
 | LibreDWG `dwg2dxf` 0.14 | GPL-3.0-or-later | DWG read and independent re-read of written DWG files | subprocess; `PATH`, else the per-user install that `scripts/provision_libredwg.py` builds from the SHA-256-pinned upstream release. DWG writing is Chudware's own encoder (`core/doc/dwg_write.cpp`). |
 | ODA File Converter | proprietary freeware | DWG to DXF conversion for `services/formats/formats_dwg.py` via `ezdxf.addons.odafc` | subprocess; user-installed |
 | pandoc | GPL-2.0-or-later | markup conversion for deliverables | subprocess; `PATH` |
@@ -178,8 +191,9 @@ copy of its license in this repository because none is distributed with Chudware
 | clangd | Apache-2.0 WITH LLVM-exception | language server for the firmware code panel | subprocess (JSON-RPC over stdio) |
 | COLMAP | BSD-3-Clause | photogrammetry alternative (`COLMAP_BIN`) | subprocess; user-installed |
 | Meshroom / AliceVision | MPL-2.0 | photogrammetry (`MESHROOM_BIN`) | subprocess; user-installed |
-| OpenMVS | AGPL-3.0 | dense reconstruction (`OPENMVS_BIN`) | subprocess, discovery only: no download URL is recorded and nothing is fetched. Tracked in `license_debt.md`. |
+| OpenMVS v2.4.0 | AGPL-3.0 | dense reconstruction (`OPENMVS_BIN`) | subprocess; downloaded on request by `scripts/provision_reveng.py` from the upstream release (SHA-256 pinned in `services/vision/reveng_provision.py`), never bundled or linked. Tracked in `license_debt.md`. |
 | Brush v0.3.0 | Apache-2.0 | Gaussian-splat trainer for reverse engineering | subprocess; downloaded on request by `scripts/provision_reveng.py` from the upstream release (SHA-256 and source commit pinned in `services/vision/reveng_provision.py`) |
+| FFmpeg / ffprobe | LGPL-2.1-or-later or GPL, depending on the user-installed build and enabled codecs | optional video stream metadata, timing and decoding fallback | subprocess; user-installed on `PATH`, never downloaded or bundled by this adapter. The separate Windows OCCT FFmpeg DLL debt remains tracked in `license_debt.md` item 24. |
 | llama.cpp `llama-server` | MIT | local OpenAI-compatible model server | subprocess or user-run server; `services/installer/llamacpp.py` never downloads binaries |
 | LM Studio, Ollama, vLLM and other OpenAI-compatible servers | each under its own terms | user-run local model servers | external server reached over HTTP; no code incorporated |
 | Gmsh + GetDP, Elmer, Meep | GPL-2.0-or-later | EM solver adapters (`services/sim/em/adapters.py`) | detection only; any execution path must follow the reviewed linkage mode recorded in `license_debt.md` |
@@ -202,6 +216,7 @@ copy of its license in this repository because none is distributed with Chudware
 |---|---|---|---|
 | Rubik, JetBrains Mono (`assets/fonts/`) | OFL-1.1 | UI fonts | bundled; text in `assets/fonts/OFL.txt` |
 | `assets/fonts/CADSymbols.ttf` (renamed subset of DejaVu Sans 2.35) | Bitstream Vera Fonts license AND Arev Fonts license; DejaVu changes public domain | CAD and GD&T symbol glyphs | bundled; text in `assets/fonts/LICENSE-DejaVu.txt` |
+| SCOWL 2020.12.07 word lists, ordered by Moby Words II frequency lists (`assets/dict/en_US.txt`) | SCOWL license (MIT-like permissive; incorporates public-domain Moby/12Dicts/ENABLE and permissively licensed Ispell/VarCon lists); Moby public domain | copilot composer spell check and word completion | bundled; generated by `scripts/build_spell_dictionary.py` (sha256-pinned sources); notice in the file header, full text in `assets/dict/LICENSE-SCOWL.txt` |
 | civil V&V fixtures (`services/civil/data/`) | US-government public domain / MIT (EPANET) / BSD-3-Clause (WNTR, NumPy notices) | EPANET Net1 `.inp`, reference results from WNTR 1.5 and EPA SWMM 5.2 via pyswmm, NRCS NEH/TR-55 and FHWA HDS-5 coefficient tables, NOAA Atlas 14 sample | test data; notices retained in `epanet_net1.inp`. WNTR, pyswmm and IfcOpenShell (LGPL-3.0) were used outside the tree to generate or check fixtures and are not dependencies. |
 | AISC section table (`services/structural/data/aisc_shapes/aisc_shapes_curated.json`) | factual data | W/S/C section properties for demand/capacity checks | Curated table of about 18 common shapes. Property values (A, Ix, Sx, Zx, ...) are physical facts restated from published engineering references (Salmon and Johnson, *Steel Structures*, 5th ed.; CISC Handbook), not a copy of the AISC Shapes Database compilation. Other shapes require a user-supplied AISC spreadsheet at run time; none is bundled. |
 | Lumber sizes (`services/structural/data/lumber_table.json`) | factual data | dressed lumber dimensions and section properties | PS 20 dressed sizes and NDS Supplement Table 4A design values are standard facts; no NDS text is copied. |
@@ -216,12 +231,15 @@ copy of its license in this repository because none is distributed with Chudware
 | ezdxf SAB tag table and DXF SAT decryption rule | MIT | `core/doc/acis_read.cpp` | in-process; attribution in the file header, license text in `THIRD_PARTY_NOTICES.md` |
 | Jeffrey Walton's SHA-NI SHA-256 (`sha256-x86.c`) | public domain | `core/util/sha256.h` | in-process; attribution in the file |
 | Renode platform descriptions and STM32 bxCAN register conventions (Antmicro) | MIT | `core/firmware/templates_embedded.cpp` (emitted with its own `LICENSE`), `core/firmware/renode/TimedSTM32CAN.cs` | in-process; full MIT text kept in both files |
+| [GaussianSplats3D](https://github.com/mkkellogg/GaussianSplats3D) KSplat format algorithms (Mark Kellogg) | MIT | `services/formats/_splat_ksplat.py` | in-process; full attribution and permission notice in the module and `THIRD_PARTY_NOTICES.md` |
+| [Niantic SPZ](https://github.com/nianticlabs/spz) at `affd0ecea7fbb4c265ee119475af7ee5b2997482` (Niantic Labs and Adobe) | MIT | `services/formats/_splat_spz.py` | in-process; full attribution and permission notice in the module and `THIRD_PARTY_NOTICES.md` |
 
 ## ECAD module posture
 
 | item | license | role | posture |
 |---|---|---|---|
 | **KiCad source** | GPL-3.0-or-later (application); GPL-2.0-or-later (`libs/kimath`) | reference only | **excluded**: never copied, linked, or ported. Concepts are reimplemented clean-room. `core/docs/kicad_reference.md` lists which KiCad third-party components are permissive. |
+| **KiCad 10 application** (`kicad`, `eeschema`, `pcbnew`, `kicad-cli`) | GPL-3.0-or-later | User-installed electronics editors, checks and exports | Out-of-process runtime tool only; invoked as separate processes, never linked or bundled. Uses libraries from the user's KiCad installation. |
 | KiCad file formats (`.kicad_sch`, `.kicad_pcb`, `.kicad_sym`, `.kicad_mod`, S-expressions) | n/a (format) | import/export | Parsing a documented format is interoperability; `services/ecad/library/sexpr.py` is clean-room. |
 | KiCad official libraries (symbols, footprints, 3D models) | CC-BY-SA-4.0 with the KiCad design-output exception | user-supplied content | Not vendored. Users point Chudware at their own installed libraries; the exception lets designs use them without inheriting the license. Attribution is preserved on import. |
 | Native circuit simulator and EDA engine (`core/sim/spice.cpp`, `core/ecad/`) | MIT (first-party) | EDA engine and MNA simulator | original code |

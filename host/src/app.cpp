@@ -14,7 +14,6 @@
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #include <emscripten/html5.h>
-#include <deque>
 // Worker stderr often never reaches the page console under PROXY_TO_PTHREAD;
 // always mirror the last checkpoint onto #status via the browser main thread.
 inline void wasmBootDom(const char *msg) {
@@ -73,30 +72,46 @@ inline void wasmBootReady() {
 #include "stb_image_write.h"
 
 #include <nlohmann/json.hpp>
-#include "miniz.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
+#include <fstream>
+#include <future>
+#include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #ifndef _WIN32
 #include <csignal>
 #include <unistd.h>
 #endif
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #include "app_commands.h" // ribbon command router (dispatchCmd family table)
 #include "bootstrap.h"
 #include "mesh.h"
 #include "renderer.h"
+#include "render/backdrop_text.h"
+#include "render/mesh_reference.h"
+#include "render/mesh_reference_data.h"
 #include "ui_theme.h"
 #include "win_chrome.h"
 #include "worker_client.h"
@@ -104,17 +119,20 @@ inline void wasmBootReady() {
 #include "render/id_pass.h"
 #include "render/overlays.h"
 #include "render/splat_renderer.h" // RE-27: splat GL draw in reveng reconstruct stage
+#include "render/doc_thumbnail.h"
 
 #include "core/app_state.h"
 #include "core/engine_events.h" // Phase 4: per-frame hostd event drain (daemon mode)
 #include "core/fs_backend.h"
 #include "core/startup_trace.h"
 #include "engine_backend.h" // Phase 4: engine::daemonMode() (services/worker)
+#include "platform/kicad_launch.h"
 #include "ipc_client.h"     // services/ipc EngineClient (orphan recovery RPCs)
 #include "ipc_discovery.h" // H2 shot: spawnDetached/resolveHostdBin for hostd bounce
 
 #ifdef CHUDWARE_ENABLE_CEF
 #include "ui/widgets/cef/cef_app.h" // CEF process lifecycle (init/pump/shutdown)
+#include "ui/widgets/cef/cef_web_view.h"
 #endif
 #include "core/cpp_core.h" // sampling-profiler RPCs (prof_start/prof_stop) via libchudware
 #include "core/jobs.h"
@@ -125,20 +143,21 @@ inline void wasmBootReady() {
 #include "ui/cam/cam_panel.h" // CAM: manufacturing workspace (toolpaths / post / sim)
 #include "ui/config_panel.h" // Configurations (SolidWorks ConfigurationManager)
 #include "ui/console_panel.h"
-#include "ui/chudcode_session_actions.h" // agent.session -> conversation resume link
+#include "ui/omp_session_actions.h" // agent.session -> conversation resume link
 #include "ui/copilot/copilot.h"
+#include "ui/copilot/activity_settlement.h"
 #include "ui/copilot/context_chips.h"  // pumpContextRefFocus — chip click waiting on a tab switch
+#include "ui/copilot/context_estimate.h" // per-conversation meter routing
 #include "ui/cursors.h"       // W1-B: cursor manager
 #include "ui/cutlist_panel.h" // Weldment Cut List (SolidWorks Weldment Cut List)
 #include "ui/design_table_panel.h" // Design Table (SolidWorks editable config grid)
 #include "ui/doc_tabs.h"
 #include "ui/drawing_panel.h" // W17: drawing ribbon command dispatch (drawingHandleCommand)
 #include "ui/ecad/ecad_mirror.h" // complete type for EcadMirror::setDocId
-#include "ui/ecad/ecad_panel.h" // ECAD 2D editor
-#include "ui/metrics.h" // ECAD command modals use the shared DPI-scaled size tokens
+#include "ui/ecad/ecad_panel.h" // read-only KiCad project hub
+#include "ui/metrics.h"
 #include "ui/feature_tree.h"
-#include "ui/file_dialog.h" // Wave Y: native Save As / Open dialogs for .ecad+
-#include "ui/file_dialog.h" // W14: native Save-As for 2D export (flat-pattern DXF)
+#include "ui/file_dialog.h"
 #include "ui/file_explorer.h" // Wave 3: File Explorer + workspace/recent helpers
 #include "ui/firmware/fw_workspace.h" // Firmware workspace (drawFirmwareWorkspace + shot fixture)
 #include "ui/manufacture/manufacture_panel.h" // P4 manufacturing operator surface + RPC dispatch
@@ -149,7 +168,7 @@ inline void wasmBootReady() {
 #include "ui/property_manager.h"
 #include "ui/reveng/dim_review.h" // RE-22 dimension-confirm review + deviation panels
 #include "ui/reveng/reveng_internal.h" // RE-22: S() + Stage enum for shot seeding
-#include "ui/reveng/reveng_widgets.h" // RE-40: kit::previewSlotRect (3D preview slots)
+#include "ui/reveng/reveng_widgets.h" // RE-40: kit::setPreviewSlotPainter (3D preview slots)
 #include "ui/reveng/reveng_workspace.h" // Reverse Engineering workspace full-body shell (RE-03)
 #include "ui/ribbon_def.h"
 #include "ui/settings_modal.h"
@@ -167,6 +186,7 @@ inline void wasmBootReady() {
 #include "ui/widgets/kit.h"
 // --- C19: simulation + flow + evaluate UI ---
 #include "core/sim_client.h"
+#include "core/frame_stats.h"
 #include "ui/evaluate_dialogs.h"
 #include "ui/sim_manager.h"
 // --- end C19 ---
@@ -175,8 +195,11 @@ inline void wasmBootReady() {
 // --- end C20b ---
 #include "ui/command_search.h" // unified settings + modeling-tools search popup
 #include "ui/equations_dialog.h" // Equations / Global Variables editor
+#include "ui/scad_editor.h"
 #include "ui/profiler_window.h" // in-app sampling-profiler window (text report + flamegraph)
-#include "ui/scenarios.h" // scripted screenshot/test scenarios (m1/sketch/asm/fea/evalmass/activity)
+#ifndef __EMSCRIPTEN__
+#include "ui/scenarios.h" // native scripted screenshot/test scenarios
+#endif
 #include "ui/web_panel.h" // "Web" title-bar chip: full-window in-app CEF browser
 // [workspace-tabs seam] full-body workspace renderers for PLM and PartsLibrary.
 #include "ui/parts/parts_workspace.h"
@@ -195,13 +218,6 @@ bool guiConsumeActivationRequest();
 std::string guiTakeActivationDoc();
 #endif
 
-// ui/copilot/composer.cpp — hand the context meter the PROVENANCE of the window an agent.context
-// event just reported ("user" | "catalog" | "probe" | "heuristic" | ""; empty == heuristic).
-// Forward-declared here rather than published in a header because the meter is a single global
-// gauge and this is its only writer; see the g_ctxWindowSource note in composer.cpp.
-namespace ui {
-void setContextWindowSource(const std::string &src);
-}
 
 // =====================================================================================
 // ECAD GUI command wiring. Creates/routes native ECAD documents through ecad_*
@@ -212,63 +228,48 @@ void setContextWindowSource(const std::string &src);
 // =====================================================================================
 namespace {
 
-// Reserved document-lock chrome: unlike a viewport overlay it never covers a workspace's
-// controls, document tabs or Copilot. Stop intentionally covers all live in-app conversations:
-// foreign writes do not carry a reliable conversation owner (including parallel sub-agents).
-float agentLockBannerHeight(const AppState& st) {
-  return st.activeDocLockedByAgent()
-             ? ImGui::GetFrameHeight() + ui::metrics::cpMenuRowPadY() * 2.0f
-             : 0.0f;
+void swapFrameBuffers(GLFWwindow *win) {
+  core::framestats::Scope timing("swap");
+  glfwSwapBuffers(win);
+  core::framestats::markSwap(timing.elapsedMs());
 }
 
-void drawAgentLockBanner(AppState& st, float x, float y, float w, float h) {
-  if (h <= 0.0f) return;
-  const float padX = ui::metrics::cpMenuRowPadX();
-  const float padY = ui::metrics::cpMenuRowPadY();
-  const float gap = ui::metrics::cpMenuHeadGap();
-  const std::string reason = st.agentLockReason(st.docMirror.docId());
-  bool running = false, stopping = true;
-  for (const auto& entry : st.runs) {
-    if (!entry.second || !entry.second->running.load()) continue;
-    running = true;
-    stopping = stopping && entry.second->stopRequested.load();
+std::string compactionNotice(const nlohmann::json& compaction) {
+  const std::string method = jstr(compaction, "method");
+  std::string label;
+  if (method == "soft") label = "summary";
+  else if (method == "snapcompact") label = "snapcompact";
+  else if (method == "remote") label = "provider-native compaction";
+  else {
+    label = jstr(compaction, "strategy");
+    if (label == "auto") label.clear();
   }
-  const char* label = stopping ? "Stopping…###agent_lock_stop" : "Stop###agent_lock_stop";
-  const float buttonW = running ? ImGui::CalcTextSize(label, nullptr, true).x +
-                                     ImGui::GetStyle().FramePadding.x * 2.0f : 0.0f;
-  float wash[4];
-  ui::Palette::withAlpha(ui::palette.statusWarn, wash, 0.14f);
-  ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_Always);
-  ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_Always);
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(padX, padY));
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
-  ImGui::PushStyleColor(ImGuiCol_WindowBg, ImGui::ColorConvertU32ToFloat4(ui::Palette::toU32(wash)));
-  if (ImGui::Begin("##agent_lock_strip", nullptr,
-                   ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings |
-                       ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBringToFrontOnFocus |
-                       ImGuiWindowFlags_NoScrollWithMouse)) {
-    ImGui::AlignTextToFramePadding();
-    const float textW = std::max(0.0f, w - padX * 2.0f -
-                                          (running ? buttonW + gap : 0.0f));
-    const std::string text = ui::kit::elide(reason.c_str(), textW);
-    ImGui::TextUnformatted(text.c_str());
-    if (ImGui::IsItemHovered()) ui::kit::tooltip(reason.c_str());
-    if (running) {
-      ImGui::SameLine();
-      ImGui::SetCursorPos(ImVec2(w - padX - buttonW, padY));
-      if (ui::kit::dangerButton(label, !stopping, "Waiting for the agent to stop",
-                                ImVec2(buttonW, 0.0f))) {
-        for (const auto& entry : st.runs)
-          if (entry.second && entry.second->running.load())
-            ui::requestStopRunFor(st, entry.first);
-      }
-    }
-  }
-  ImGui::End();
-  ImGui::PopStyleColor();
-  ImGui::PopStyleVar(3);
+  std::string notice = "Context compacted";
+  if (!label.empty()) notice += " (" + label + ")";
+  const auto before = compaction.find("tokensBefore");
+  const auto after = compaction.find("tokensAfter");
+  const bool hasBefore = before != compaction.end() && before->is_number_integer() &&
+                         before->get<int>() >= 0;
+  const bool hasAfter = after != compaction.end() && after->is_number_integer() &&
+                        after->get<int>() >= 0;
+  auto tokens = [](int count) {
+    char buffer[32];
+    if (count >= 1000) std::snprintf(buffer, sizeof(buffer), "%.1fk", count / 1000.0);
+    else std::snprintf(buffer, sizeof(buffer), "%d", count);
+    return std::string(buffer);
+  };
+  const std::string beforeMark = compaction.value("tokensBeforeEstimated", false) ? "~" : "";
+  const std::string afterMark = compaction.value("tokensAfterEstimated", false) ? "~" : "";
+  if (hasBefore && hasAfter)
+    notice += ": " + beforeMark + tokens(before->get<int>()) + " to " +
+              afterMark + tokens(after->get<int>()) + " tokens";
+  else if (hasBefore)
+    notice += ", was " + beforeMark + tokens(before->get<int>()) + " tokens";
+  else if (hasAfter)
+    notice += ": " + afterMark + tokens(after->get<int>()) + " tokens";
+  return notice + ".";
 }
+
 
 // Appearance ribbon: apply a set_appearance op to the whole model (body "b1")
 // and reload the mesh so the new color/material shows immediately.
@@ -293,11 +294,11 @@ void applyModelAppearance(AppState &st, const float *color, float metallic,
   ++st.rebuildsInFlight;
   st.docMirror.applyOpsAsync(
       st.rpc, st.worker, nlohmann::json::array({op}),
-      [&st](const core::OpsResponse &resp, bool applied) {
+      [&st](const core::OpsResponse &resp, bool current) {
         --st.rebuildsInFlight;
-        if (!applied)
+        if (!current)
           return;
-        if (resp.ok && !resp.aicm_path.empty()) {
+        if (resp.ok && st.isActiveMirrorDoc() && !resp.aicm_path.empty()) {
           st.loadDocMeshAsync(resp.aicm_path);
         } else if (!resp.ok) {
           st.addLog("[err] set_appearance: " + resp.error_message);
@@ -319,6 +320,14 @@ void ecadAdopt(AppState &st, const nlohmann::json &res) {
            tab.kind == AppState::DocTab::TabKind::PCB) &&
           tab.ecadDocId == st.ecadDocId) {
         tab.ecadRevision = st.ecadRevision;
+        if (res.contains("dirty") && res["dirty"].is_boolean())
+          tab.ecadSessionDirty = res["dirty"].get<bool>();
+        if (res.contains("file_changed") && res["file_changed"].is_boolean())
+          tab.ecadFileChanged = res["file_changed"].get<bool>();
+        if (res.contains("kicad_locked") && res["kicad_locked"].is_boolean())
+          tab.ecadKicadLocked = res["kicad_locked"].get<bool>();
+        ui::ecadSetFileState(tab.ecadDocId, tab.path, tab.dirty || tab.ecadSessionDirty,
+                             tab.ecadFileChanged, tab.ecadKicadLocked);
         break;
       }
     }
@@ -332,11 +341,15 @@ bool ecadCall(AppState &st, const char *method, const nlohmann::json &params,
               nlohmann::json &res) {
   std::string err;
   if (!st.worker.call(method, params, res, err)) {
-    st.toast(ui::ToastLevel::Error, std::string("ECAD ") + method + ": " + err);
+    const std::string message = std::string("ECAD ") + method + ": " + err;
+    st.addLog("[err] " + message);
+    st.toast(ui::ToastLevel::Error, message);
     return false;
   }
   if (res.is_object() && res.contains("code")) {
-    st.toast(ui::ToastLevel::Error, "ECAD: " + jstr(res, "message"));
+    const std::string message = std::string("ECAD ") + method + ": " + jstr(res, "message");
+    st.addLog("[err] " + message);
+    st.toast(ui::ToastLevel::Error, message);
     return false;
   }
   return true;
@@ -437,86 +450,38 @@ bool ecadAddResponseTab(AppState &st, const nlohmann::json &res,
                         : "ECAD response did not identify its document kind");
     return false;
   }
-  std::string title = ecadResponseTitle(res);
-  if (title.empty())
-    title = fallbackTitle;
+  const std::string path = jstr(res, "path");
+  std::string title = path.empty() ? ecadResponseTitle(res)
+                                   : std::filesystem::u8path(path).filename().u8string();
+  if (title.empty()) title = fallbackTitle;
   st.addEcadTab(kind, id, jint(res, "revision"), title);
+  ui::ecadPrimeActiveApp(st);
+  auto &tab = st.docTabs[st.activeTab];
+  tab.path = path;
+  tab.ecadProjectPath = jstr(res, "project");
+  st.syncEcadProjectFiles(tab.ecadProjectPath);
   ecadAdopt(st, res);
   return true;
 }
 
-void ecadNewDoc(AppState &st, const char *kind) {
-  nlohmann::json res;
-  if (!ecadCall(st, "ecad_new", {{"kind", kind}}, res))
-    return;
-  // Wave 2 (GUI rework): open a first-class Schematic/PCB tab for the new doc
-  // and make it active BEFORE adopting, so ecadAdopt's mirror load
-  // (ecadEditorLoadResponse) lands in THIS tab's per-document EcadEditorState
-  // (the ecad_panel state() resolver targets the active ECAD tab).
-  const std::string id = jstr(res, "doc_id");
-  const int rev = jint(res, "revision");
-  st.addEcadTab(kind, id, rev, /*title=*/std::string());
-  ecadAdopt(st, res);
-  st.addLog(std::string("[ecad] new ") + kind + " doc " + st.ecadDocId);
-  st.toast(ui::ToastLevel::Info,
-           std::string("New ECAD ") +
-               (std::string(kind) == "sch" ? "schematic" : "board"));
-  ImGui::SetWindowFocus("ECAD"); // bring the editor tab forward
-}
-
-// Auto-init: when the Electronics workspace is entered with no ECAD document
-// open, create a default "PCB1" board so the user always lands in a usable,
-// editable layout instead of the empty launchpad. Runs from the app loop
-// (workspace-entry edge), NEVER from a draw path — an ecad_new call in
-// drawEcadEditor's every-frame empty branch would spawn infinite boards + risk
-// the GL-thread-RPC freeze. On worker failure it is a no-op: the launchpad
-// stays as the graceful fallback (item 4: flag/degrade, never render a broken
-// viewport).
-void ecadAutoInitBoard(AppState &st) {
-  if (!st.ecadDocId.empty())
-    return; // a board/schematic is already open — nothing to do
-  nlohmann::json res;
-  if (!ecadCall(st, "ecad_new", {{"kind", "pcb"}}, res)) {
-    // Backend hook missing/unavailable: degrade gracefully, keep the AI
-    // launchpad reachable.
-    st.addLog("[ecad] auto-init PCB1 skipped (worker ecad_new unavailable) — "
-              "launchpad shown");
-    return;
-  }
-  const std::string id = jstr(res, "doc_id");
-  const int rev = jint(res, "revision");
-  st.addEcadTab("pcb", id, rev, /*title=*/"PCB1");
-  // Disposable starter: if the user leaves Electronics without adding anything,
-  // this blank PCB1 is discarded (AppState::discardWorkspaceStarter). Any edit
-  // sets the tab dirty and it survives.
-  if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size())
-    st.docTabs[st.activeTab].isStarter = true;
-  ecadAdopt(st, res);
-  st.addLog("[ecad] auto-init default board PCB1 (" + st.ecadDocId + ")");
-  st.toast(ui::ToastLevel::Info, "Started a new board: PCB1");
-  ImGui::SetWindowFocus("ECAD");
-}
-
-// A doc-scoped RPC that returns an ops-response (rebuild / autoroute /
-// fill_zones) -> refresh.
+// Run an in-house board operation and refresh its preview.
 void ecadDocRpc(AppState &st, const char *method, const char *okMsg) {
   if (st.ecadDocId.empty()) {
     st.toast(ui::ToastLevel::Warn, "Open an ECAD document first");
     return;
   }
   nlohmann::json res;
+  const int before = st.ecadRevision;
   if (!ecadCall(st, method, {{"doc_id", st.ecadDocId}}, res))
     return;
   ecadAdopt(st, res);
-  st.markEcadTabDirty(
-      st.ecadDocId); // rebuild / autoroute / fill_zones mutate the board
+  if (st.ecadRevision > before)
+    st.markEcadTabDirty(st.ecadDocId);
   if (okMsg)
     st.toast(ui::ToastLevel::Info, okMsg);
 }
 
-// Apply an op batch to the current ECAD doc (canvas place/route edits) with the
-// optimistic- concurrency + stale-revision-resync discipline
-// core/doc_mirror.cpp uses for the CAD doc.
+// Apply generated AI-board operations with optimistic revision checking.
 bool ecadApplyOps(AppState &st, const nlohmann::json &ops) {
   if (st.ecadDocId.empty() || !ops.is_array() || ops.empty())
     return false;
@@ -543,68 +508,29 @@ bool ecadApplyOps(AppState &st, const nlohmann::json &ops) {
     return false;
   }
   ecadAdopt(st, res);
-  st.markEcadTabDirty(
-      st.ecadDocId); // canvas place/route/move/delete/edit → unsaved
   return true;
 }
 
-// Undo / Redo the current ECAD doc via the worker's history (ecad_undo /
-// ecad_redo). Both return an ops-response ({revision,kind,tree,compile}); we
-// adopt it into the editor mirror like any other mutation so the canvas +
-// revision badge reflect the new history position. No-op without a doc.
-void ecadUndo(AppState &st) {
-  if (st.ecadDocId.empty())
-    return;
-  nlohmann::json res;
-  std::string err;
-  if (!st.worker.call("ecad_undo", {{"doc_id", st.ecadDocId}}, res, err)) {
-    st.toast(ui::ToastLevel::Error, "ECAD undo: " + err);
-    return;
-  }
-  if (res.is_object() && res.contains("code")) {
-    st.toast(ui::ToastLevel::Warn, "ECAD undo: " + jstr(res, "message"));
-    return;
-  }
-  ecadAdopt(st, res);
-  st.markEcadTabDirty(st.ecadDocId);
-  st.toast(ui::ToastLevel::Info, "Undo");
-}
 
-void ecadRedo(AppState &st) {
-  if (st.ecadDocId.empty())
-    return;
-  nlohmann::json res;
-  std::string err;
-  if (!st.worker.call("ecad_redo", {{"doc_id", st.ecadDocId}}, res, err)) {
-    st.toast(ui::ToastLevel::Error, "ECAD redo: " + err);
-    return;
-  }
-  if (res.is_object() && res.contains("code")) {
-    st.toast(ui::ToastLevel::Warn, "ECAD redo: " + jstr(res, "message"));
-    return;
-  }
-  ecadAdopt(st, res);
-  st.markEcadTabDirty(st.ecadDocId);
-  st.toast(ui::ToastLevel::Info, "Redo");
-}
-
-void ecadExport(AppState &st, const char *kind, const char *requiredDocKind) {
-  if (!ecadRequireKind(st, requiredDocKind, "Export")) {
-    return;
-  }
-  std::error_code ec;
-  const std::string dir = appdataAppDir() + "/ecad_out";
-  std::filesystem::create_directories(dir, ec);
-  if (ec) {
-    st.toast(ui::ToastLevel::Error,
-             "Export directory could not be created: " + ec.message());
-    st.addLog("[err] [ecad] export directory " + dir + ": " + ec.message());
-    return;
+bool ecadExport(AppState &st, const char *kind, const char *requiredDocKind,
+                const std::string &directory = {}, bool announce = true) {
+  if (!ecadRequireKind(st, requiredDocKind, "Export")) return false;
+  std::string dir = directory;
+  if (dir.empty()) {
+    if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
+        !st.docTabs[st.activeTab].path.empty())
+      dir = (std::filesystem::u8path(st.docTabs[st.activeTab].path).parent_path() / "exports").u8string();
+    else if (!st.workspaceDir.empty())
+      dir = (std::filesystem::u8path(st.workspaceDir) / "exports").u8string();
+    else {
+      st.toast(ui::ToastLevel::Warn, "Choose a working directory before exporting");
+      return false;
+    }
   }
   nlohmann::json res;
   if (!ecadCall(st, "ecad_export",
                 {{"doc_id", st.ecadDocId}, {"kind", kind}, {"path", dir}}, res))
-    return;
+    return false;
   ecadReportWarnings(st, res, std::string("Export ") + kind);
 
   std::vector<std::string> paths;
@@ -615,17 +541,9 @@ void ecadExport(AppState &st, const char *kind, const char *requiredDocKind) {
         paths.push_back(path.get<std::string>());
   }
   if (paths.empty()) {
-    const auto files = res.find("files");
-    const bool inMemoryOnly =
-        files != res.end() && files->is_object() && !files->empty();
-    const std::string reason =
-        inMemoryOnly ? "the exporter returned in-memory content only"
-                     : "the exporter produced no files";
-    st.toast(ui::ToastLevel::Warn,
-             std::string("No ") + kind + " files were written: " + reason);
-    st.addLog("[warn] [ecad] export " + std::string(kind) +
-              " wrote no paths (" + reason + ")");
-    return;
+    st.toast(ui::ToastLevel::Warn, std::string("No ") + kind + " files were written");
+    st.addLog("[warn] [ecad] export " + std::string(kind) + " wrote no paths");
+    return false;
   }
 
   std::string list;
@@ -635,108 +553,453 @@ void ecadExport(AppState &st, const char *kind, const char *requiredDocKind) {
     list += path;
     st.addLog("[ecad] export " + std::string(kind) + " wrote " + path);
   }
-  st.toast(ui::ToastLevel::Info,
-           std::string("Exported ") + kind + ": " + list);
+  if (announce)
+    st.toast(ui::ToastLevel::Info, std::string("Exported ") + kind + ": " + list);
+  return true;
 }
 
-// Save the open ECAD document to a native `.ecad+` container (ZIP) via a Save
-// As dialog; the worker's ecad_save writes through engine.ecad.formats. Reuses
-// the doc's current name as the suggested file.
+// Save via the same KiCad-aware per-tab path as the File menu.
 void ecadSaveDoc(AppState &st) {
-  if (st.ecadDocId.empty()) {
-    st.toast(ui::ToastLevel::Warn, "Design or open an ECAD document to save");
-    return;
-  }
-  // Prefer the unified per-tab saver when this ECAD doc has a tab — it re-saves
-  // silently to the tab's known path (Save-As only on first save) and clears
-  // the tab's unsaved marker.
   for (int i = 0; i < (int)st.docTabs.size(); ++i) {
-    const auto &t = st.docTabs[i];
-    if ((t.kind == AppState::DocTab::TabKind::Schematic ||
-         t.kind == AppState::DocTab::TabKind::PCB) &&
-        t.ecadDocId == st.ecadDocId) {
-      ui::saveDocTab(st, i, /*forceDialog=*/false);
+    if (!st.ecadDocId.empty() && st.docTabs[i].ecadDocId == st.ecadDocId) {
+      ui::saveDocTab(st, i, false);
       return;
     }
   }
-  // Defensive fallback for any externally-created ECAD document that has not
-  // yet acquired a tab.
-  const std::string name = ui::ecadEditorMirror().name();
-  const std::string path = ui::saveFileDialog(
-      "Chudware ECAD design (*.ecad+)\0*.ecad+\0All files (*.*)\0*.*\0", "ecad+",
-      name.empty() ? "design" : name.c_str());
-  if (path.empty())
-    return; // cancelled
-  nlohmann::json res;
-  if (!ecadCall(st, "ecad_save", {{"doc_id", st.ecadDocId}, {"path", path}},
-                res))
-    return;
-  const std::string returnedPath = jstr(res, "path");
-  const std::string saved = returnedPath.empty() ? path : returnedPath;
-  const std::string format = jstr(res, "format");
-  const std::string source = jstr(res, "source_path");
-  std::string notice = "Saved " + saved;
-  if (!format.empty())
-    notice += " (" + format + ")";
-  if (!source.empty())
-    notice += "; imported source preserved: " + source;
-  st.toast(ui::ToastLevel::Info, notice);
-  st.addLog("[ecad] " + notice);
+  st.toast(ui::ToastLevel::Warn, "Open an electronics document to save");
 }
 
-// Open an ECAD document by absolute path (Wave 3: the File Explorer / Recent
-// route here for .ecad+/.kicad_sch/.kicad_pcb files). The loaded doc adopts
-// into the editor mirror and surfaces.
-void ecadOpenPath(AppState &st, const std::string &path) {
-  if (path.empty())
+// Poll on the async lane; a clean changed file is reloaded by ecad_tree itself.
+void ecadHubTick(AppState &st) {
+  if (st.activeWorkspace != AppState::Workspace::Electronics &&
+      !st.activeTabIsEcad() && !st.wantEcad) return;
+  ui::anim::requestFramesAt(1.0f);
+  const char *shotKind = st.wantEcad ? std::getenv("CHUDWARE_ECAD_KIND") : nullptr;
+  if (shotKind && std::strcmp(shotKind, "missing") == 0) {
+    st.ecadKicadStatus = {{"found", false}};
+    st.ecadKicadStatusKnown = true;
+    ui::ecadSetKicadStatus(st.ecadKicadStatus);
     return;
-  nlohmann::json res;
-  if (!ecadCall(st, "ecad_open", {{"path", path}}, res))
-    return;
-  ecadReportWarnings(st, res, "Open");
-  if (!ecadResponseSucceeded(st, res, "Open"))
-    return;
-  const std::string title = std::filesystem::path(path).stem().string();
-  if (!ecadAddResponseTab(st, res, title))
-    return;
-  // The tab's save identity follows the engine's import rule: native documents
-  // save back to themselves; KiCad imports save to a sibling native container
-  // and never overwrite the source.
-  if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {
-    std::filesystem::path savePath(path);
-    std::string ext = savePath.extension().string();
-    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
-      return static_cast<char>(std::tolower(c));
-    });
-    if (ext == ".kicad_sch" || ext == ".kicad_pcb")
-      savePath.replace_extension(".ecad+");
-    st.docTabs[st.activeTab].path = savePath.string();
   }
+  if (!st.workerStarted) return;
+  static bool statusPending = false;
+  static std::chrono::steady_clock::time_point nextStatus{};
+  const auto now = std::chrono::steady_clock::now();
+  if (!st.ecadKicadStatusKnown && !statusPending && now >= nextStatus) {
+    statusPending = true;
+    st.rpc.call("ecad_kicad_status", nlohmann::json::object(),
+                [&st](const core::RpcResult &r) {
+      statusPending = false;
+      if (!r.ok || !r.result.is_object() || r.result.contains("code")) {
+        st.addLog("[ecad] KiCad status failed: " +
+                  (r.err.empty() ? jstr(r.result, "message") : r.err));
+        nextStatus = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        return;
+      }
+      st.ecadKicadStatus = r.result;
+      st.ecadKicadStatusKnown = true;
+      ui::ecadSetKicadStatus(st.ecadKicadStatus);
+    }, 15000);
+  }
+  if (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size()) return;
+  const auto &active = st.docTabs[st.activeTab];
+  if (active.ecadDocId.empty()) return;
+  static bool pending = false;
+  static std::chrono::steady_clock::time_point next{};
+  const auto pollNow = std::chrono::steady_clock::now();
+  if (pending || pollNow < next) return;
+  pending = true;
+  next = pollNow + std::chrono::seconds(1);
+  const std::string id = active.ecadDocId;
+  st.rpc.call("ecad_tree", {{"doc_id", id}}, [&st, id](const core::RpcResult &r) {
+    pending = false;
+    if (!r.ok || !r.result.is_object() || r.result.contains("code")) {
+      if (!r.err.empty()) st.addLog("[ecad] live sync: " + r.err);
+      return;
+    }
+    for (auto &tab : st.docTabs) {
+      if (tab.ecadDocId != id) continue;
+      const int revision = r.result.value("revision", -1);
+      if (revision >= 0 && revision < tab.ecadRevision) return;
+      const bool revisionChanged = revision >= 0 && revision != tab.ecadRevision;
+      if (revision >= 0) tab.ecadRevision = revision;
+      tab.ecadSessionDirty = r.result.value("dirty", tab.ecadSessionDirty);
+      tab.ecadFileChanged = r.result.value("file_changed", false);
+      tab.ecadKicadLocked = r.result.value("kicad_locked", false);
+      if (r.result.contains("path") && r.result["path"].is_string()) {
+        const std::string path = r.result["path"].get<std::string>();
+        if (path != tab.path) {
+          tab.path = path;
+          if (!path.empty()) tab.title = std::filesystem::u8path(path).filename().u8string();
+        }
+      }
+      if (r.result.contains("project") && r.result["project"].is_string()) {
+        const std::string project = r.result["project"].get<std::string>();
+        if (project != tab.ecadProjectPath) {
+          tab.ecadProjectPath = project;
+          tab.ecadProjectSchPath.clear();
+          tab.ecadProjectPcbPath.clear();
+        }
+      }
+      st.syncEcadProjectFiles(tab.ecadProjectPath);
+      ui::ecadSetFileState(id, tab.path, tab.dirty || tab.ecadSessionDirty,
+                           tab.ecadFileChanged, tab.ecadKicadLocked);
+      if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
+          st.docTabs[st.activeTab].ecadDocId == id) {
+        st.ecadRevision = tab.ecadRevision;
+        if ((revisionChanged || (tab.ecadFileChanged && !tab.ecadSessionDirty)) &&
+            r.result.contains("tree"))
+          ui::ecadEditorLoadResponse(r.result);
+      }
+      return;
+    }
+  });
+}
+
+#ifndef __EMSCRIPTEN__
+namespace {
+struct EcadRecoveryState {
+  std::string session = std::to_string(
+      std::chrono::system_clock::now().time_since_epoch().count());
+  std::map<std::string, int> committed;
+  std::map<std::string, std::filesystem::path> snapshots;
+  std::map<std::string, std::filesystem::path> sources;
+  std::map<std::string, int> saved;
+  std::future<int> write;
+  std::string writingDoc;
+  std::filesystem::path writingPath;
+  std::chrono::steady_clock::time_point next{};
+  bool recovered = false;
+};
+
+EcadRecoveryState &ecadRecoveryState() {
+  static EcadRecoveryState state;
+  return state;
+}
+
+unsigned long ecadProcessId() {
+#ifdef _WIN32
+  return GetCurrentProcessId();
+#else
+  return static_cast<unsigned long>(getpid());
+#endif
+}
+
+std::filesystem::path ecadRecoveryDir() {
+  if (const char *p = std::getenv("CHUDWARE_ECAD_AUTOSAVE_DIR"); p && *p)
+    return p;
+  const char *base = std::getenv("APPDATA");
+  return (base && *base ? std::filesystem::path(base)
+                        : std::filesystem::temp_directory_path()) /
+         "Chudware" / "ecad_autosave";
+}
+
+
+bool ecadProcessAlive(unsigned long pid) {
+  if (!pid) return false;
+#ifdef _WIN32
+  HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (!process) return GetLastError() == ERROR_ACCESS_DENIED;
+  DWORD code = 0;
+  const bool alive = GetExitCodeProcess(process, &code) && code == STILL_ACTIVE;
+  CloseHandle(process);
+  return alive;
+#else
+  return kill(static_cast<pid_t>(pid), 0) == 0 || errno == EPERM;
+#endif
+}
+void ecadRemoveRecovery(const std::filesystem::path &snapshot, std::error_code &ec) {
+  std::filesystem::remove(snapshot, ec);
+  if (ec) return;
+  auto sidecar = snapshot;
+  sidecar += ".recovery.json";
+  std::filesystem::remove(sidecar, ec);
+}
+
+void ecadRecoverySavedImpl(const std::string &docId, int savedRevision) {
+  auto &state = ecadRecoveryState();
+  auto saved = state.saved.find(docId);
+  if (saved == state.saved.end()) state.saved[docId] = savedRevision;
+  else saved->second = std::max(saved->second, savedRevision);
+  auto snapshot = state.snapshots.find(docId);
+  auto revision = state.committed.find(docId);
+  if (!(state.write.valid() && state.writingDoc == docId) &&
+      snapshot != state.snapshots.end() && revision != state.committed.end() &&
+      revision->second <= savedRevision) {
+    std::error_code ec;
+    ecadRemoveRecovery(snapshot->second, ec);
+    if (!ec) {
+      state.snapshots.erase(snapshot);
+      state.committed.erase(revision);
+    }
+  }
+  auto source = state.sources.find(docId);
+  if (source != state.sources.end() && savedRevision >= 0) {
+    std::error_code ec;
+    ecadRemoveRecovery(source->second, ec);
+    if (!ec) state.sources.erase(source);
+  }
+}
+
+
+void ecadRecoveryTick(AppState &st) {
+  auto &state = ecadRecoveryState();
+  if (!st.workerStarted || (engine::daemonMode() && !st.daemonEverConnected)) return;
+  if (!state.recovered) {
+    state.recovered = true;
+    std::error_code ec;
+    const auto dir = ecadRecoveryDir();
+    if (std::filesystem::exists(dir, ec)) {
+      struct Candidate { int revision; std::string snapshot, name; };
+      std::map<std::pair<unsigned long, std::string>, std::vector<Candidate>> candidates;
+      for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        nlohmann::json payload;
+        const std::string sidecar = it->path().u8string();
+        const std::string suffix = ".recovery.json";
+        if (sidecar.size() <= suffix.size() ||
+            sidecar.compare(sidecar.size() - suffix.size(), suffix.size(), suffix) != 0)
+          continue;
+        const std::string snapshot = sidecar.substr(0, sidecar.size() - suffix.size());
+        const auto ext = std::filesystem::u8path(snapshot).extension().u8string();
+        if (ext != ".kicad_sch" && ext != ".kicad_pcb") continue;
+        try {
+          std::ifstream input(it->path());
+          input >> payload;
+          if (!payload.is_object() || !payload.value("human_dirty", false) ||
+              ecadProcessAlive(payload.value("pid", 0UL)) ||
+              payload.value("snapshot", std::string()) != snapshot) continue;
+          const auto key = std::make_pair(payload.value("pid", 0UL),
+                                          payload.value("doc_id", std::string()));
+          if (key.second.empty()) continue;
+          candidates[key].push_back({payload.value("revision", -1), snapshot,
+                                      payload.value("name", std::string("Recovered ECAD"))});
+        } catch (...) { continue; }
+      }
+      for (auto &entry : candidates) {
+        auto &snapshots = entry.second;
+        std::sort(snapshots.begin(), snapshots.end(), [](const Candidate &a, const Candidate &b) {
+          return a.revision != b.revision ? a.revision > b.revision : a.snapshot > b.snapshot;
+        });
+        for (size_t i = 0; i < snapshots.size(); ++i) {
+          nlohmann::json opened;
+          std::string error;
+          if (!st.worker.call("ecad_open", {{"path", snapshots[i].snapshot}}, opened, error) ||
+              !opened.is_object() || opened.contains("code")) {
+            st.addLog("[warn] [ecad] recovery could not open " + snapshots[i].snapshot +
+                      ": " + (error.empty() ? jstr(opened, "message") : error));
+            continue;
+          }
+          if (!ecadAddResponseTab(st, opened, snapshots[i].name)) continue;
+          auto &tab = st.docTabs[st.activeTab];
+          if (!tab.path.empty()) tab.title = std::filesystem::u8path(tab.path).filename().u8string();
+          tab.ecadSessionDirty = true;
+          st.markEcadTabDirty(tab.ecadDocId);
+          ui::ecadSetFileState(tab.ecadDocId, tab.path, true,
+                               tab.ecadFileChanged, tab.ecadKicadLocked);
+          state.sources[tab.ecadDocId] = snapshots[i].snapshot;
+          for (size_t older = i + 1; older < snapshots.size(); ++older) {
+            std::error_code removeError;
+            ecadRemoveRecovery(snapshots[older].snapshot, removeError);
+          }
+          break;
+        }
+      }
+    }
+  }
+  if (state.write.valid()) {
+    if (state.write.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+    const int revision = state.write.get();
+    if (revision >= 0) {
+      auto previous = state.snapshots.find(state.writingDoc);
+      if (previous != state.snapshots.end() && previous->second != state.writingPath) {
+        std::error_code ec;
+        ecadRemoveRecovery(previous->second, ec);
+      }
+      state.committed[state.writingDoc] = revision;
+      state.snapshots[state.writingDoc] = state.writingPath;
+      auto old = state.sources.find(state.writingDoc);
+      if (old != state.sources.end() && old->second != state.writingPath) {
+        std::error_code ec;
+        ecadRemoveRecovery(old->second, ec);
+        if (!ec) state.sources.erase(old);
+      }
+      auto saved = state.saved.find(state.writingDoc);
+      if (saved != state.saved.end())
+        ecadRecoverySavedImpl(state.writingDoc, saved->second);
+    } else {
+      std::error_code ec;
+      ecadRemoveRecovery(state.writingPath, ec);
+      st.addLog("[err] ECAD recovery snapshot failed for " + state.writingDoc);
+    }
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (now < state.next) return;
+  state.next = now + std::chrono::seconds(2);
+  for (const auto &tab : st.docTabs) {
+    if (tab.kind != AppState::DocTab::TabKind::Schematic &&
+        tab.kind != AppState::DocTab::TabKind::PCB) continue;
+    if (!tab.dirty) {
+      for (auto *files : {&state.snapshots, &state.sources}) {
+        auto it = files->find(tab.ecadDocId);
+        if (it != files->end()) {
+          std::error_code ec;
+          ecadRemoveRecovery(it->second, ec);
+          if (!ec) files->erase(it);
+        }
+      }
+      state.committed.erase(tab.ecadDocId);
+      continue;
+    }
+    const int rev = tab.ecadRevision;
+    if (rev < 0) continue;
+    auto committed = state.committed.find(tab.ecadDocId);
+    if (committed != state.committed.end() && committed->second == rev) continue;
+    const auto path = ecadRecoveryDir() /
+        ("gui-" + std::to_string(ecadProcessId()) + "-" + state.session + "-" +
+         tab.ecadDocId + "-" + std::to_string(rev) + "-" +
+         std::to_string(now.time_since_epoch().count()) +
+         (tab.kind == AppState::DocTab::TabKind::Schematic ? ".kicad_sch" : ".kicad_pcb"));
+    nlohmann::json metadata = {{"pid", ecadProcessId()}, {"doc_id", tab.ecadDocId},
+                               {"name", tab.title}, {"path", tab.path},
+                               {"recovery_dir", ecadRecoveryDir().u8string()}};
+    state.writingDoc = tab.ecadDocId;
+    state.writingPath = path;
+    auto *worker = &st.worker;
+    const std::string docId = tab.ecadDocId;
+    state.write = std::async(std::launch::async, [worker, docId, path, metadata]() {
+      nlohmann::json result;
+      std::string err;
+      if (!worker->call("ecad_save", {{"doc_id", docId}, {"path", path.u8string()},
+                                      {"recovery", metadata}}, result, err) ||
+          result.contains("code"))
+        return -1;
+      return result.value("saved_revision", -1);
+    });
+    break;
+  }
+}
+
+void ecadRecoveryShutdown(const AppState &st) {
+  auto &state = ecadRecoveryState();
+  if (state.write.valid()) {
+    const int revision = state.write.get();
+    if (revision >= 0) {
+      auto previous = state.snapshots.find(state.writingDoc);
+      if (previous != state.snapshots.end() && previous->second != state.writingPath) {
+        std::error_code ec;
+        ecadRemoveRecovery(previous->second, ec);
+      }
+      state.committed[state.writingDoc] = revision;
+      state.snapshots[state.writingDoc] = state.writingPath;
+      auto old = state.sources.find(state.writingDoc);
+      if (old != state.sources.end() && old->second != state.writingPath) {
+        std::error_code ec;
+        ecadRemoveRecovery(old->second, ec);
+        if (!ec) state.sources.erase(old);
+      }
+      auto saved = state.saved.find(state.writingDoc);
+      if (saved != state.saved.end())
+        ecadRecoverySavedImpl(state.writingDoc, saved->second);
+    }
+  }
+  for (const auto &tab : st.docTabs) {
+    if ((tab.kind == AppState::DocTab::TabKind::Schematic ||
+         tab.kind == AppState::DocTab::TabKind::PCB) && !tab.dirty) {
+      auto saved = state.saved.find(tab.ecadDocId);
+      if (saved != state.saved.end())
+        ecadRecoverySavedImpl(tab.ecadDocId, saved->second);
+    }
+  }
+}
+} // namespace
+#endif
+
+bool ecadAddProject(AppState &st, const nlohmann::json &res) {
+  const std::string project = jstr(res, "project");
+  if (project.empty()) {
+    st.toast(ui::ToastLevel::Error, "KiCad project response has no project path");
+    return false;
+  }
+  bool opened = false;
+  for (const char *kind : {"sch", "pcb"}) {
+    auto it = res.find(kind);
+    if (it == res.end() || !it->is_object()) continue;
+    nlohmann::json doc = *it;
+    if (jstr(doc, "path").empty()) {
+      auto path = std::filesystem::u8path(project);
+      path.replace_extension(std::string(kind) == "sch" ? ".kicad_sch" : ".kicad_pcb");
+      doc["path"] = path.u8string();
+    }
+    const std::string file = jstr(doc, "path");
+    int existing = -1;
+    for (int i = 0; i < (int)st.docTabs.size(); ++i)
+      if (!st.docTabs[i].ecadDocId.empty() &&
+          std::filesystem::u8path(st.docTabs[i].path).lexically_normal() ==
+              std::filesystem::u8path(file).lexically_normal()) {
+        existing = i;
+        break;
+      }
+    if (existing >= 0) {
+      const std::string redundantId = jstr(doc, "doc_id");
+      if (!redundantId.empty() && redundantId != st.docTabs[existing].ecadDocId)
+        st.rpc.call("ecad_close", {{"doc_id", redundantId}}, [](const core::RpcResult &) {});
+      st.docTabs[existing].ecadProjectPath = project;
+      st.switchToTab(existing);
+      opened = true;
+    } else if (ecadAddResponseTab(st, doc)) {
+      st.docTabs[st.activeTab].ecadProjectPath = project;
+      opened = true;
+    }
+  }
+  st.syncEcadProjectFiles(project);
+  if (opened) st.activeWorkspace = AppState::Workspace::Electronics;
+  if (!opened) st.toast(ui::ToastLevel::Warn, "The KiCad project contains no schematic or board");
+  return opened;
+}
+
+void ecadOpenPath(AppState &st, const std::string &path) {
+  if (path.empty()) return;
+  std::string ext = std::filesystem::u8path(path).extension().u8string();
+  std::transform(ext.begin(), ext.end(), ext.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  if (ext != ".kicad_pro") {
+    for (int i = 0; i < (int)st.docTabs.size(); ++i)
+      if (!st.docTabs[i].ecadDocId.empty() && !st.docTabs[i].path.empty() &&
+          std::filesystem::u8path(st.docTabs[i].path).lexically_normal() ==
+              std::filesystem::u8path(path).lexically_normal()) {
+        st.switchToTab(i);
+        st.activeWorkspace = AppState::Workspace::Electronics;
+        st.wantFocusEcad = 6;
+        st.pushRecentFile(path);
+        return;
+      }
+  }
+  nlohmann::json res;
+  if (!ecadCall(st, ext == ".kicad_pro" ? "ecad_open_project" : "ecad_open",
+                {{"path", path}}, res)) return;
+  bool opened = false;
+  if (ext == ".kicad_pro") {
+    opened = ecadAddProject(st, res);
+  } else {
+    ecadReportWarnings(st, res, "Open");
+    if (ecadResponseSucceeded(st, res, "Open"))
+      opened = ecadAddResponseTab(st, res, std::filesystem::u8path(path).filename().u8string());
+  }
+  if (!opened) return;
   st.wantFocusEcad = 6;
   st.toast(ui::ToastLevel::Info, "Opened " + path);
-  st.addLog("[ecad] opened " + path + " as " + st.ecadDocId);
+  st.addLog("[ecad] opened " + path);
   st.pushRecentFile(path);
 }
 
-// Open an ECAD document (native .ecad+ / .ecad / .json, or a KiCad
-// .kicad_sch/.kicad_pcb which the worker imports) via an Open dialog. The
-// loaded doc adopts into the editor mirror and surfaces.
 void ecadOpenDoc(AppState &st) {
   const std::string path = ui::openFileDialog(
-      "ECAD / KiCad files\0*.ecad+;*.ecad;*.json;*.kicad_sch;*.kicad_pcb\0"
-      "Chudware ECAD design (*.ecad+)\0*.ecad+\0KiCad schematic "
-      "(*.kicad_sch)\0*.kicad_sch\0"
-      "KiCad board (*.kicad_pcb)\0*.kicad_pcb\0All files (*.*)\0*.*\0");
-  if (path.empty())
-    return; // cancelled
-  ecadOpenPath(st, path);
-}
-
-void ecadImportKiCadSchematic(AppState &st) {
-  const std::string path = ui::openFileDialog(
-      "KiCad schematic (*.kicad_sch)\0*.kicad_sch\0All files (*.*)\0*.*\0");
-  if (!path.empty())
-    ecadOpenPath(st, path);
+      "KiCad and legacy electronics files\0*.kicad_pro;*.kicad_sch;*.kicad_pcb;*.ecad+;*.ecad;*.json\0"
+      "KiCad project (*.kicad_pro)\0*.kicad_pro\0"
+      "KiCad schematic (*.kicad_sch)\0*.kicad_sch\0"
+      "KiCad board (*.kicad_pcb)\0*.kicad_pcb\0"
+      "All files (*.*)\0*.*\0");
+  if (!path.empty()) ecadOpenPath(st, path);
 }
 
 struct Ecad3dLinks {
@@ -800,6 +1063,10 @@ std::string ecadBoardPartStem(const AppState &st,
 void ecadTo3d(AppState &st) {
   if (!ecadRequireKind(st, "pcb", "Board to 3D"))
     return;
+  if (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size()) return;
+  if (st.docTabs[st.activeTab].path.empty() &&
+      ui::saveDocTab(st, st.activeTab, false) != ui::TabSaveResult::Saved)
+    return;
 
   const std::string boardDocId = st.ecadDocId;
   auto &links = ecad3dLinks().partByBoard;
@@ -821,41 +1088,16 @@ void ecadTo3d(AppState &st) {
       links.erase(linked); // the user closed the 3D tab: mint afresh
   }
 
-  std::error_code ec;
-  const std::string dir = appdataAppDir() + "/ecad_out";
-  std::filesystem::create_directories(dir, ec);
   const std::string partName = ecadBoardPartStem(st, boardDocId);
-  const std::string step = dir + "/" + partName + ".step";
+  nlohmann::json params = {{"doc_id", boardDocId}};
+  if (!intoDocId.empty()) params["into_doc_id"] = intoDocId;
   nlohmann::json res;
-  if (!ecadCall(st, "ecad_to_3d",
-                {{"doc_id", boardDocId},
-                 {"path", step},
-                 {"into_doc_id", intoDocId}},
-                res))
+  if (!ecadCall(st, "ecad_to_3d", params, res)) return;
+  const std::string stepPath = jstr(res, "step_path");
+  const std::string partDocId = jstr(res, "part_doc_id");
+  if (stepPath.empty()) {
+    st.toast(ui::ToastLevel::Error, "KiCad did not return the board STEP path");
     return;
-
-  std::string stepPath = jstr(res, "step_path");
-  if (stepPath.empty())
-    stepPath = step;
-  std::string partDocId = jstr(res, "part_doc_id");
-  if (partDocId.empty() && !intoDocId.empty()) {
-    // A daemon restart can retire the mapped worker document before the GUI
-    // receives its close event. Retry once without the stale target so a
-    // re-export mints a fresh tab instead of getting stuck on that id forever.
-    st.addLog("[ecad] linked 3D part " + intoDocId +
-              " unavailable; retrying with a fresh part");
-    nlohmann::json fresh;
-    if (ecadCall(st, "ecad_to_3d",
-                 {{"doc_id", boardDocId},
-                  {"path", step},
-                  {"into_doc_id", std::string()}},
-                 fresh)) {
-      res = std::move(fresh);
-      stepPath = jstr(res, "step_path");
-      if (stepPath.empty())
-        stepPath = step;
-      partDocId = jstr(res, "part_doc_id");
-    }
   }
   if (partDocId.empty()) {
     links.erase(boardDocId);
@@ -878,11 +1120,8 @@ void ecadTo3d(AppState &st) {
 
   std::string aicmPath;
   std::string err;
-  const bool wasSuppressing = st.suppressTabDirty;
-  st.suppressTabDirty = true;
   const bool activated =
       st.docMirror.activate(st.worker, partDocId, aicmPath, err);
-  st.suppressTabDirty = wasSuppressing;
   if (!activated) {
     links.erase(boardDocId);
     st.toast(ui::ToastLevel::Warn,
@@ -922,26 +1161,79 @@ void ecadTo3d(AppState &st) {
 }
 
 
+bool ecadPersistGenerated(AppState &st, const std::string &docId,
+                          const std::string &title) {
+  for (auto &tab : st.docTabs) {
+    if (tab.ecadDocId != docId)
+      continue;
+    if (tab.dirty) {
+      st.toast(ui::ToastLevel::Error, "Cannot automatically save human ECAD edits");
+      return false;
+    }
+    auto path = std::filesystem::u8path(tab.path);
+    if (path.empty()) {
+      if (st.workspaceDir.empty()) {
+        st.toast(ui::ToastLevel::Error, "Choose a working directory for the KiCad project");
+        return false;
+      }
+      std::string error;
+      const std::string base = ecadSafeStem(title, "ECAD");
+      std::string stem = base;
+      std::filesystem::path dir = std::filesystem::u8path(st.workspaceDir) / stem;
+      for (unsigned n = 2;; ++n) {
+        const auto info = chudware::fsBackend().stat(dir.u8string(), error);
+        if (!error.empty()) break;
+        if (!info.exists) break;
+        stem = base + "_" + std::to_string(n);
+        dir = std::filesystem::u8path(st.workspaceDir) / stem;
+      }
+      if (!error.empty() || !chudware::fsBackend().mkdir(dir.u8string(), error)) {
+        st.toast(ui::ToastLevel::Error, "Cannot create KiCad project directory: " + error);
+        return false;
+      }
+      path = dir / (stem + (tab.kind == AppState::DocTab::TabKind::Schematic
+                               ? ".kicad_sch" : ".kicad_pcb"));
+    }
+    nlohmann::json saved;
+    if (!ecadCall(st, "ecad_save", {{"doc_id", docId}, {"path", path.u8string()}}, saved))
+      return false;
+    tab.path = saved.value("path", path.u8string());
+    tab.title = std::filesystem::u8path(tab.path).filename().u8string();
+    auto project = std::filesystem::u8path(tab.path);
+    project.replace_extension(".kicad_pro");
+    tab.ecadProjectPath = project.u8string();
+    st.syncEcadProjectFiles(tab.ecadProjectPath);
+    tab.ecadSessionDirty = false;
+    tab.ecadFileChanged = false;
+    tab.ecadKicadLocked = false;
+    ui::ecadSetFileState(docId, tab.path, tab.dirty, false, false);
+    st.addLog("[ecad] AI work saved: " + tab.path);
+    return true;
+  }
+  return false;
+}
+
 // AI-design an ECAD schematic from a natural-language request (the launchpad /
 // "AI Design" command): run the orchestrator (ecad_design) on the worker, then
 // load the produced schematic into the editor.
-void ecadAiDesign(AppState &st, const std::string &request) {
+bool ecadAiDesign(AppState &st, const std::string &request) {
   if (request.empty())
-    return;
+    return false;
   st.toast(ui::ToastLevel::Info, "AI: designing \"" + request + "\" ...");
   st.addLog("[ecad] AI design: " + request);
   nlohmann::json res;
   if (!ecadCall(st, "ecad_design", {{"request", request}}, res))
-    return;
+    return false;
   ecadReportWarnings(st, res, "AI design");
   if (!ecadAddResponseTab(st, res, "AI Schematic"))
-    return;
-  st.markEcadTabDirty(st.ecadDocId);
+    return false;
+  if (!ecadPersistGenerated(st, st.ecadDocId, "AI_Schematic"))
+    return false;
   const std::string recipe = jstr(res, "recipe_used");
   if (!ecadResponseSucceeded(st, res, "AI design")) {
     if (!recipe.empty())
       st.addLog("[ecad] incomplete AI design used recipe=" + recipe);
-    return;
+    return false;
   }
   st.wantFocusEcad = 6;
   st.toast(ui::ToastLevel::Info,
@@ -949,6 +1241,7 @@ void ecadAiDesign(AppState &st, const std::string &request) {
                           : ("AI design ready (recipe: " + recipe + ")"));
   st.addLog("[ecad] AI design ready: " + st.ecadDocId +
             (recipe.empty() ? std::string() : " recipe=" + recipe));
+  return true;
 }
 
 // One-click "AI Board": NL request -> AI designs a schematic -> a board is
@@ -972,7 +1265,8 @@ void ecadAiBoard(AppState &st, const std::string &request) {
   ecadReportWarnings(st, res, "AI board schematic");
   if (!ecadAddResponseTab(st, res, "AI Board Schematic"))
     return;
-  st.markEcadTabDirty(st.ecadDocId);
+  if (!ecadPersistGenerated(st, st.ecadDocId, "AI_Board"))
+    return;
   if (!ecadResponseSucceeded(st, res, "AI board schematic")) {
     const std::string recipe = jstr(res, "recipe_used");
     if (!recipe.empty())
@@ -980,6 +1274,8 @@ void ecadAiBoard(AppState &st, const std::string &request) {
     return;
   }
   const std::string schId = st.ecadDocId;
+  auto boardPath = std::filesystem::u8path(st.docTabs[st.activeTab].path);
+  boardPath.replace_extension(".kicad_pcb");
   st.addLog("[ecad] AI board: schematic " + schId);
 
   // b. Create and tab the empty board before adopting it, so the panel's
@@ -989,6 +1285,7 @@ void ecadAiBoard(AppState &st, const std::string &request) {
       !ecadAddResponseTab(st, pcbRes, "AI Board"))
     return;
   const std::string pcbId = st.ecadDocId;
+  st.docTabs[st.activeTab].path = boardPath.u8string();
 
   // c. Populate the board from the schematic netlist and adopt that returned
   // board response directly.
@@ -1000,7 +1297,8 @@ void ecadAiBoard(AppState &st, const std::string &request) {
   if (!ecadResponseSucceeded(st, upd, "Update board"))
     return;
   ecadAdopt(st, upd);
-  st.markEcadTabDirty(pcbId);
+  if (!ecadPersistGenerated(st, pcbId, "AI_Board"))
+    return;
 
   // d. Auto-outline: axis-aligned bbox over every footprint pad's world
   // position (inflated by the
@@ -1042,7 +1340,7 @@ void ecadAiBoard(AppState &st, const std::string &request) {
       nlohmann::json ops = nlohmann::json::array();
       ops.push_back(
           {{"op", "pcb_set_outline"}, {"closed", true}, {"shapes", shapes}});
-      if (!ecadApplyOps(st, ops))
+      if (!ecadApplyOps(st, ops) || !ecadPersistGenerated(st, pcbId, "AI_Board"))
         return;
       st.addLog("[ecad] AI board: outline " +
                 std::to_string((int)(maxX - minX)) + "x" +
@@ -1060,7 +1358,8 @@ void ecadAiBoard(AppState &st, const std::string &request) {
   if (!ecadResponseSucceeded(st, route, "Autoroute"))
     return;
   ecadAdopt(st, route);
-  st.markEcadTabDirty(pcbId);
+  if (!ecadPersistGenerated(st, pcbId, "AI_Board"))
+    return;
 
   st.wantFocusEcad = 6; // surface the ECAD tab so the routed board is visible
   st.toast(ui::ToastLevel::Info,
@@ -1096,16 +1395,10 @@ std::string nextEcadSimJobId() {
 
 bool ecadSimSourceStillActive(const AppState &st,
                               const std::string &docId) {
-  const bool tabOpen =
-      std::any_of(st.docTabs.begin(), st.docTabs.end(),
-                  [&](const AppState::DocTab &tab) {
-                    return tab.kind == AppState::DocTab::TabKind::Schematic &&
-                           tab.ecadDocId == docId;
-                  });
-  const bool active = st.ecadDocId == docId &&
-                      ui::ecadEditorMirror().docId() == docId;
-  // The ECAD screenshot fixture intentionally adopts an un-tabbed document.
-  return active && (tabOpen || st.wantEcad);
+  if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size())
+    return st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Schematic &&
+           st.docTabs[st.activeTab].ecadDocId == docId;
+  return st.wantEcad && st.ecadDocId == docId;
 }
 
 bool ecadSimShotActive(const AppState &st) {
@@ -1113,9 +1406,16 @@ bool ecadSimShotActive(const AppState &st) {
   return st.wantEcad && kind && std::strcmp(kind, "sim") == 0;
 }
 
-void ecadSimulate(AppState &st) {
-  if (!ecadRequireKind(st, "sch", "Simulation"))
+void ecadSimulate(AppState &st, const std::string &requestedDoc = {}, int requestedAnalysis = -1) {
+  const std::string source = requestedDoc.empty() ? st.ecadDocId : requestedDoc;
+  const bool exists = std::any_of(st.docTabs.begin(), st.docTabs.end(), [&](const AppState::DocTab &tab) {
+    return tab.kind == AppState::DocTab::TabKind::Schematic && tab.ecadDocId == source;
+  });
+  if (source.empty() || (!exists && !(st.wantEcad && ecadActiveKind(st) == "sch"))) {
+    st.toast(ui::ToastLevel::Warn, "Simulation requires an open schematic");
     return;
+  }
+  const int selectedAnalysis = requestedAnalysis < 0 ? st.ecadSimAnalysis : requestedAnalysis;
   auto &run = ecadSimRunState();
   if (run.running) {
     st.toast(ui::ToastLevel::Info, "A circuit simulation is already running");
@@ -1123,7 +1423,7 @@ void ecadSimulate(AppState &st) {
   }
 
   nlohmann::json study;
-  if (st.ecadSimAnalysis == 1) {
+  if (selectedAnalysis == 1) {
     study = {{"analyses",
               {{{"type", "ac"},
                 {"sweep", "dec"},
@@ -1138,8 +1438,8 @@ void ecadSimulate(AppState &st) {
   run.running = true;
   run.cancelRequested = false;
   run.jobId = nextEcadSimJobId();
-  run.docId = st.ecadDocId;
-  run.analysis = st.ecadSimAnalysis;
+  run.docId = source;
+  run.analysis = selectedAnalysis;
   const std::string docId = run.docId;
   const std::string jobId = run.jobId;
   const int analysis = run.analysis;
@@ -1196,15 +1496,23 @@ void ecadSimulate(AppState &st) {
           return;
         }
 
+        const nlohmann::json results = r.result.contains("results")
+            ? r.result["results"] : nlohmann::json::object();
+        bool retained = false;
+        for (auto &tab : st.docTabs) {
+          if (tab.kind == AppState::DocTab::TabKind::Schematic && tab.ecadDocId == docId) {
+            tab.ecadSimResults = results;
+            tab.ecadSimAnalysis = analysis;
+            retained = true;
+            break;
+          }
+        }
         if (!sourceActive) {
-          st.addLog("[ecad] simulation result ignored because source document " +
-                    docId + " is no longer active");
+          st.addLog(retained ? "[ecad] simulation completed for background schematic " + docId
+                             : "[ecad] simulation source was closed: " + docId);
           return;
         }
-
-        st.ecadSimResults =
-            r.result.contains("results") ? r.result["results"]
-                                         : nlohmann::json::object();
+        st.ecadSimResults = results;
         const bool converged = jbool(r.result, "converged");
         if (converged) {
           st.status = "Circuit simulation complete";
@@ -1277,12 +1585,9 @@ void ecadCancelSimulation(AppState &st) {
 
 struct EcadCommandDialogs {
   bool aiPromptRequested = false;
-  bool sheetPropertiesRequested = false;
+  bool projectPromptRequested = false;
   char aiRequest[1024]{};
-  char sheetName[256]{};
-  std::string sheetId;
-  float sheetW = 297.0f;
-  float sheetH = 210.0f;
+  char projectName[256] = "Electronics";
 };
 
 EcadCommandDialogs &ecadCommandDialogs() {
@@ -1298,46 +1603,18 @@ void ecadRequestAiPrompt(AppState &st) {
   st.wantFocusEcad = 6;
 }
 
-void ecadRequestSheetProperties(AppState &st) {
-  if (!ecadRequireKind(st, "sch", "Sheet properties"))
-    return;
-  const auto &mirror = ui::ecadEditorMirror();
-  const std::string active = mirror.activeSheet();
-  for (const auto &sheet : mirror.sheets()) {
-    if (sheet.id == active) {
-      auto &dialogs = ecadCommandDialogs();
-      dialogs.sheetId = sheet.id;
-      dialogs.sheetW = sheet.w;
-      dialogs.sheetH = sheet.h;
-      std::snprintf(dialogs.sheetName, sizeof(dialogs.sheetName), "%s",
-                    sheet.name.c_str());
-      dialogs.sheetPropertiesRequested = true;
-      return;
-    }
-  }
-  st.toast(ui::ToastLevel::Warn, "The active schematic has no editable sheet");
-}
-
-void ecadNewSheet(AppState &st) {
-  if (!ecadRequireKind(st, "sch", "New sheet"))
-    return;
-  const std::string name =
-      "Sheet " + std::to_string(ui::ecadEditorMirror().sheets().size() + 1);
-  if (!ecadApplyOps(
-          st, nlohmann::json::array(
-                  {{{"op", "sch_add_sheet"}, {"name", name}}})))
-    return;
-  auto &mirror = ui::ecadEditorMirror();
-  if (!mirror.sheets().empty())
-    mirror.setActiveSheet(mirror.sheets().back().id);
-  st.toast(ui::ToastLevel::Info, "Created " + name);
-  st.wantFocusEcad = 4;
-}
 
 void ecadUpdateBoardFromSchematic(AppState &st) {
   int schTab = -1;
   int boardTab = -1;
+  if (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size() ||
+      st.docTabs[st.activeTab].ecadDocId.empty()) {
+    st.toast(ui::ToastLevel::Warn, "Select a KiCad schematic or board first");
+    return;
+  }
+  const std::string project = st.docTabs[st.activeTab].ecadProjectPath;
   for (int i = (int)st.docTabs.size() - 1; i >= 0; --i) {
+    if (st.docTabs[i].ecadProjectPath != project) continue;
     if (schTab < 0 &&
         st.docTabs[i].kind == AppState::DocTab::TabKind::Schematic)
       schTab = i;
@@ -1361,6 +1638,7 @@ void ecadUpdateBoardFromSchematic(AppState &st) {
   const std::string boardId = st.docTabs[boardTab].ecadDocId;
   if (st.activeTab != boardTab)
     st.switchToTab(boardTab);
+  const int before = st.ecadRevision;
   nlohmann::json res;
   if (!ecadCall(st, "ecad_update_from_sch",
                 {{"sch_doc_id", schId}, {"board_doc_id", boardId}}, res))
@@ -1369,20 +1647,12 @@ void ecadUpdateBoardFromSchematic(AppState &st) {
   if (!ecadResponseSucceeded(st, res, "Update board"))
     return;
   ecadAdopt(st, res);
-  st.markEcadTabDirty(boardId);
+  if (st.ecadRevision > before)
+    st.markEcadTabDirty(boardId);
   st.toast(ui::ToastLevel::Info, "Board updated from schematic");
   st.addLog("[ecad] updated board " + boardId + " from schematic " + schId);
 }
 
-void ecadArmPlacement(AppState &st, const char *kind, const char *docKind,
-                      const char *message) {
-  if (!ecadRequireKind(st, docKind, "Placement"))
-    return;
-  st.ecadTool = 1;
-  ui::ecadArmPlacement(kind);
-  st.wantFocusEcad = 4;
-  st.toast(ui::ToastLevel::Info, message);
-}
 
 void ecadDrawCommandDialogs(AppState &st) {
   auto &dialogs = ecadCommandDialogs();
@@ -1421,39 +1691,33 @@ void ecadDrawCommandDialogs(AppState &st) {
     ImGui::EndPopup();
   }
 
-  if (dialogs.sheetPropertiesRequested) {
-    ImGui::OpenPopup("Sheet Properties##ecad_sheet_properties");
-    dialogs.sheetPropertiesRequested = false;
+  if (dialogs.projectPromptRequested) {
+    ImGui::OpenPopup("New KiCad Project##ecad_project");
+    dialogs.projectPromptRequested = false;
   }
   ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-  bool sheetOpen = true;
-  if (ImGui::BeginPopupModal("Sheet Properties##ecad_sheet_properties",
-                             &sheetOpen,
-                             ImGuiWindowFlags_AlwaysAutoResize |
-                                 ImGuiWindowFlags_NoSavedSettings)) {
+  bool projectOpen = true;
+  if (ImGui::BeginPopupModal("New KiCad Project##ecad_project", &projectOpen,
+                             ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+    ImGui::Text("Working directory: %s", st.workspaceDir.empty() ? "(choose one first)" : st.workspaceDir.c_str());
     ImGui::SetNextItemWidth(ui::metrics::px(320.0f));
-    ImGui::InputText("Name", dialogs.sheetName, sizeof(dialogs.sheetName));
-    ImGui::SetNextItemWidth(ui::metrics::px(160.0f));
-    ImGui::InputFloat("Width (mm)", &dialogs.sheetW, 0.0f, 0.0f, "%.2f");
-    ImGui::SetNextItemWidth(ui::metrics::px(160.0f));
-    ImGui::InputFloat("Height (mm)", &dialogs.sheetH, 0.0f, 0.0f, "%.2f");
-    const bool valid = dialogs.sheetName[0] != '\0' && dialogs.sheetW > 0.0f &&
-                       dialogs.sheetH > 0.0f;
-    if (!valid)
-      ImGui::BeginDisabled();
-    if (ImGui::Button("Apply", ImVec2(ui::metrics::px(96.0f), 0.0f))) {
-      const nlohmann::json ops = nlohmann::json::array(
-          {{{"op", "sch_edit_sheet"},
-            {"id", dialogs.sheetId},
-            {"name", dialogs.sheetName},
-            {"size", {dialogs.sheetW, dialogs.sheetH}}}});
-      if (ecadApplyOps(st, ops)) {
-        st.toast(ui::ToastLevel::Info, "Sheet properties updated");
+    ImGui::InputText("Project name", dialogs.projectName, sizeof(dialogs.projectName));
+    const std::string name = dialogs.projectName;
+    const bool valid = !st.workspaceDir.empty() && !name.empty() && name != "." && name != ".." &&
+                       name.find_first_of("/\\") == std::string::npos &&
+                       std::none_of(name.begin(), name.end(), [](unsigned char c) { return c < 32; });
+    if (!valid) ImGui::BeginDisabled();
+    if (ImGui::Button("Create", ImVec2(ui::metrics::px(96.0f), 0.0f))) {
+      const auto dir = std::filesystem::u8path(st.workspaceDir) / std::filesystem::u8path(name);
+      nlohmann::json res;
+      if (ecadCall(st, "ecad_new_project", {{"dir", dir.u8string()}, {"name", name}}, res) &&
+          ecadAddProject(st, res)) {
+        st.pushRecentFile(jstr(res, "project"));
+        st.toast(ui::ToastLevel::Info, "Created KiCad project " + name);
         ImGui::CloseCurrentPopup();
       }
     }
-    if (!valid)
-      ImGui::EndDisabled();
+    if (!valid) ImGui::EndDisabled();
     ImGui::SameLine(0.0f, ui::metrics::cpMenuRowGap());
     if (ImGui::Button("Cancel", ImVec2(ui::metrics::px(88.0f), 0.0f)))
       ImGui::CloseCurrentPopup();
@@ -1489,46 +1753,187 @@ void ecadDrawCommandDialogs(AppState &st) {
 
 }
 
-// Route every ECAD ribbon command. Entity-placement commands arm the shared
-// canvas seam; document commands execute immediately.
+void ecadRunKicadCheck(AppState &st) {
+  if (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size()) return;
+  const auto &tab = st.docTabs[st.activeTab];
+  const std::string id = tab.ecadDocId;
+  const int revision = tab.ecadRevision;
+  if (id.empty()) return;
+  st.rpc.call("ecad_kicad_check", {{"doc_id", id}},
+              [&st, id, revision](const core::RpcResult &r) {
+    if (!r.ok || !r.result.is_object() || r.result.contains("code")) {
+      const std::string error = r.err.empty() ? jstr(r.result, "message") : r.err;
+      st.toast(ui::ToastLevel::Error, "KiCad check failed: " + error);
+      return;
+    }
+    nlohmann::json result = r.result;
+    result["_source_revision"] = revision;
+    ui::ecadSetCheckResult(id, result);
+    st.addLog("[ecad] KiCad " + jstr(result, "kind") + " completed for " + id);
+  }, core::kLongEngineCallTimeoutMs);
+}
+
+void ecadReloadFromKicad(AppState &st) {
+  if (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size()) return;
+  const std::string id = st.docTabs[st.activeTab].ecadDocId;
+  if (id.empty()) return;
+  st.rpc.call("ecad_reload", {{"doc_id", id}, {"discard", true}},
+              [&st, id](const core::RpcResult &r) {
+    if (!r.ok || !r.result.is_object() || r.result.contains("code")) {
+      st.toast(ui::ToastLevel::Error, "Reload failed: " +
+               (r.err.empty() ? jstr(r.result, "message") : r.err));
+      return;
+    }
+    for (auto &tab : st.docTabs) {
+      if (tab.ecadDocId != id) continue;
+      const int revision = r.result.value("revision", -1);
+      if (revision >= 0 && revision < tab.ecadRevision) return;
+      tab.ecadRevision = revision;
+      tab.dirty = false;
+      tab.lastHumanEditRevision = -1;
+      tab.ecadSessionDirty = false;
+      tab.ecadFileChanged = false;
+      tab.ecadKicadLocked = r.result.value("kicad_locked", tab.ecadKicadLocked);
+      ui::ecadSetFileState(id, tab.path, false, false, tab.ecadKicadLocked);
+#ifndef __EMSCRIPTEN__
+      ecadRecoverySavedImpl(id, revision);
+#endif
+      if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
+          st.docTabs[st.activeTab].ecadDocId == id) {
+        st.ecadRevision = revision;
+        ui::ecadEditorLoadResponse(r.result);
+      }
+      st.toast(ui::ToastLevel::Info, "Reloaded the KiCad file");
+      return;
+    }
+  });
+}
+
+void ecadLaunchKicad(AppState &st, const std::string &cmd) {
+#ifdef __EMSCRIPTEN__
+  (void)cmd;
+  st.toast(ui::ToastLevel::Warn, "Opening KiCad requires the desktop app");
+#else
+  if (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size()) return;
+  const auto &active = st.docTabs[st.activeTab];
+  if (active.ecadDocId.empty()) return;
+  struct Launch {
+    std::string activeId, project, command;
+    std::vector<std::string> ids;
+    size_t pending = 0;
+    bool failed = false;
+  };
+  auto launch = std::make_shared<Launch>();
+  launch->activeId = active.ecadDocId;
+  launch->project = active.ecadProjectPath;
+  launch->command = cmd;
+  for (const auto &tab : st.docTabs) {
+    if (tab.ecadDocId == launch->activeId ||
+        (cmd == "ecad_kicad_open_project" && !launch->project.empty() &&
+         tab.ecadProjectPath == launch->project && !tab.ecadDocId.empty()))
+      launch->ids.push_back(tab.ecadDocId);
+  }
+  launch->pending = launch->ids.size();
+  for (const std::string &id : launch->ids) {
+    st.rpc.call("ecad_tree", {{"doc_id", id}}, [&st, launch, id](const core::RpcResult &r) {
+      if (!r.ok || !r.result.is_object() || r.result.contains("code")) {
+        launch->failed = true;
+        st.toast(ui::ToastLevel::Error, "Could not check KiCad document before opening: " +
+                 (r.err.empty() ? jstr(r.result, "message") : r.err));
+      } else {
+        for (auto &tab : st.docTabs) {
+          if (tab.ecadDocId != id) continue;
+          const int revision = r.result.value("revision", -1);
+          if (revision >= 0 && revision < tab.ecadRevision) {
+            launch->failed = true;
+            st.toast(ui::ToastLevel::Warn, "The electronics document changed; open KiCad again.");
+            break;
+          }
+          const bool changed = revision >= 0 && revision != tab.ecadRevision;
+          if (revision >= 0) tab.ecadRevision = revision;
+          tab.ecadSessionDirty = r.result.value("dirty", tab.ecadSessionDirty);
+          tab.ecadFileChanged = r.result.value("file_changed", false);
+          tab.ecadKicadLocked = r.result.value("kicad_locked", false);
+          if (r.result.contains("path") && r.result["path"].is_string()) {
+            tab.path = r.result["path"].get<std::string>();
+            if (!tab.path.empty()) tab.title = std::filesystem::u8path(tab.path).filename().u8string();
+          }
+          if (r.result.contains("project") && r.result["project"].is_string()) {
+            const std::string project = r.result["project"].get<std::string>();
+            if (project != tab.ecadProjectPath) {
+              tab.ecadProjectPath = project;
+              tab.ecadProjectSchPath.clear();
+              tab.ecadProjectPcbPath.clear();
+            }
+          }
+          st.syncEcadProjectFiles(tab.ecadProjectPath);
+          ui::ecadSetFileState(id, tab.path, tab.dirty || tab.ecadSessionDirty,
+                               tab.ecadFileChanged, tab.ecadKicadLocked);
+          if (changed && st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
+              st.docTabs[st.activeTab].ecadDocId == id) {
+            st.ecadRevision = tab.ecadRevision;
+            ui::ecadEditorLoadResponse(r.result);
+          }
+          break;
+        }
+      }
+      if (--launch->pending != 0 || launch->failed) return;
+      int activeIndex = -1;
+      for (const auto &saveId : launch->ids) {
+        int index = -1;
+        for (int i = 0; i < (int)st.docTabs.size(); ++i)
+          if (st.docTabs[i].ecadDocId == saveId) { index = i; break; }
+        if (index < 0) continue;
+        if (saveId == launch->activeId) activeIndex = index;
+        const auto &tab = st.docTabs[index];
+        if (tab.dirty || tab.ecadSessionDirty || tab.path.empty())
+          if (ui::saveDocTab(st, index, false) != ui::TabSaveResult::Saved) return;
+      }
+      if (activeIndex < 0) return;
+      const auto &tab = st.docTabs[activeIndex];
+      const bool project = launch->command == "ecad_kicad_open_project";
+      const char *key = project ? "kicad" :
+          launch->command == "ecad_kicad_open_sch" ? "eeschema" : "pcbnew";
+      const std::string executable = jstr(st.ecadKicadStatus, key);
+      const std::string file = project ? tab.ecadProjectPath : tab.path;
+      if (file.empty()) {
+        st.toast(ui::ToastLevel::Warn, "Save the KiCad project before opening it");
+        return;
+      }
+      if (!platform::launchKicad(executable, file))
+        st.toast(ui::ToastLevel::Error, "Could not launch KiCad for " + file);
+    });
+  }
+#endif
+}
+
+// All editor mutations are handled by KiCad; these are project-hub actions.
 void ecadDispatch(AppState &st, const std::string &cmd) {
-  if (cmd == "ecad_ai_design") {
-    ecadRequestAiPrompt(st);
+  if (cmd == "ecad_ai_design") { ecadRequestAiPrompt(st); return; }
+  if (cmd == "ecad_new_project") {
+    ecadCommandDialogs().projectPromptRequested = true;
+    st.wantFocusEcad = 6;
     return;
   }
-  if (cmd == "ecad_new_sch") {
-    ecadNewDoc(st, "sch");
+  if (cmd == "ecad_open") { ecadOpenDoc(st); return; }
+  if (cmd == "ecad_save") { ecadSaveDoc(st); return; }
+  if (cmd == "ecad_save_as") {
+    ui::saveDocTab(st, st.activeTab, true);
     return;
   }
-  if (cmd == "ecad_new_pcb") {
-    ecadNewDoc(st, "pcb");
-    return;
-  }
-  if (cmd == "ecad_open") {
-    ecadOpenDoc(st);
-    return;
-  }
-  if (cmd == "ecad_save") {
-    ecadSaveDoc(st);
-    return;
-  }
-  if (cmd == "sch_import_kicad") {
-    ecadImportKiCadSchematic(st);
-    return;
-  }
-  if (cmd == "ecad_run_erc") {
-    if (ecadRequireKind(st, "sch", "ERC"))
-      ecadDocRpc(st, "ecad_rebuild", "ERC updated");
-    return;
-  }
-  if (cmd == "ecad_run_drc") {
-    if (ecadRequireKind(st, "pcb", "DRC"))
-      ecadDocRpc(st, "ecad_rebuild", "DRC updated");
+  if (cmd == "ecad_kicad_open_sch" || cmd == "ecad_kicad_open_pcb" ||
+      cmd == "ecad_kicad_open_project") { ecadLaunchKicad(st, cmd); return; }
+  if (cmd == "ecad_reload") { ecadReloadFromKicad(st); return; }
+  if (cmd == "ecad_run_erc" || cmd == "ecad_run_drc") {
+    if (ecadRequireKind(st, cmd == "ecad_run_erc" ? "sch" : "pcb", "KiCad check"))
+      ecadRunKicadCheck(st);
     return;
   }
   if (cmd == "ecad_simulate") {
     if (ecadRequireKind(st, "sch", "Simulation")) {
       st.ecadSimGo = true;
+      st.ecadSimRequestedDocId = st.ecadDocId;
+      st.ecadSimRequestedAnalysis = st.ecadSimAnalysis;
       st.wantFocusEcad = 4;
     }
     return;
@@ -1543,135 +1948,41 @@ void ecadDispatch(AppState &st, const std::string &cmd) {
       ecadDocRpc(st, "ecad_fill_zones", "Copper zones filled");
     return;
   }
-  if (cmd == "ecad_to_3d") {
-    ecadTo3d(st);
-    return;
-  }
-  if (cmd == "pcb_update_from_sch") {
-    ecadUpdateBoardFromSchematic(st);
-    return;
-  }
-  if (cmd == "ecad_export_gerber") {
-    ecadExport(st, "gerber", "pcb");
-    return;
-  }
-  if (cmd == "ecad_export_drill") {
-    ecadExport(st, "drill", "pcb");
-    return;
-  }
-  if (cmd == "ecad_export_bom") {
-    ecadExport(st, "bom", "pcb");
-    return;
-  }
-  if (cmd == "sch_export_netlist") {
-    ecadExport(st, "netlist", "sch");
-    return;
-  }
-  if (cmd == "sch_export_bom") {
-    ecadExport(st, "bom", "sch");
-    return;
-  }
-  if (cmd == "sch_export_spice") {
-    ecadExport(st, "spice", "sch");
-    return;
-  }
-  if (cmd == "sch_export_kicad") {
-    ecadExport(st, "kicad", "sch");
-    return;
-  }
-  if (cmd == "sch_export_svg") {
-    ecadExport(st, "svg", "sch");
-    return;
-  }
-  if (cmd == "sch_export_pdf" || cmd == "sch_plot") {
-    ecadExport(st, "pdf", "sch");
-    return;
-  }
-  if (cmd == "sch_annotate") {
-    if (!ecadRequireKind(st, "sch", "Annotate"))
+  if (cmd == "ecad_to_3d") { ecadTo3d(st); return; }
+  if (cmd == "pcb_update_from_sch") { ecadUpdateBoardFromSchematic(st); return; }
+  if (cmd == "ecad_export_fab") {
+    if (!ecadRequireKind(st, "pcb", "Fabrication export") ||
+        st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size()) return;
+    const std::string path = st.docTabs[st.activeTab].path;
+    if (path.empty()) {
+      st.toast(ui::ToastLevel::Warn, "Save the board before exporting fabrication files");
       return;
-    const bool ok = ecadApplyOps(
-        st, nlohmann::json::array({{{"op", "sch_annotate"},
-                                    {"scope", "all"},
-                                    {"mode", "reset"}}}));
-    if (ok) {
-      st.toast(ui::ToastLevel::Info, "Schematic annotated");
-      st.wantFocusEcad = 4;
     }
+    const std::string dir = (std::filesystem::u8path(path).parent_path() / "fab").u8string();
+    for (const char *kind : {"gerber", "drill", "cpl", "bom"})
+      if (!ecadExport(st, kind, "pcb", dir, false)) return;
+    st.toast(ui::ToastLevel::Info, "Fabrication files exported to " + dir);
     return;
   }
-  if (cmd == "sch_new_sheet") {
-    ecadNewSheet(st);
+  if (cmd == "ecad_export_step") { ecadExport(st, "step", "pcb"); return; }
+  if (cmd == "ecad_export_bom") {
+    const std::string kind = ecadActiveKind(st);
+    if (!kind.empty()) ecadExport(st, "bom", kind.c_str());
     return;
   }
-  if (cmd == "sch_sheet" || cmd == "sch_sheet_properties") {
-    ecadRequestSheetProperties(st);
-    return;
-  }
-  if (cmd == "sch_add_symbol") {
-    ecadArmPlacement(st, "symbol", "sch",
-                     "Place symbol: choose a part, then click the canvas");
-    return;
-  }
-  if (cmd == "sch_add_label") {
-    ecadArmPlacement(st, "label", "sch",
-                     "Place net label: click the canvas");
-    return;
-  }
-  if (cmd == "sch_add_power") {
-    ecadArmPlacement(st, "power", "sch",
-                     "Place power port: click the canvas");
-    return;
-  }
-  if (cmd == "sch_add_junction") {
-    ecadArmPlacement(st, "junction", "sch",
-                     "Place junction: click the canvas");
-    return;
-  }
-  if (cmd == "sch_add_no_connect") {
-    ecadArmPlacement(st, "no_connect", "sch",
-                     "Place no-connect: click a pin");
-    return;
-  }
-  if (cmd == "sch_add_text") {
-    ecadArmPlacement(st, "text", "sch",
-                     "Place schematic text: click the canvas");
-    return;
-  }
-  if (cmd == "sch_add_bus") {
-    ecadArmPlacement(st, "bus", "sch",
-                     "Place bus: click points; right-click to finish");
-    return;
-  }
-  if (cmd == "pcb_add_footprint") {
-    ecadArmPlacement(st, "footprint", "pcb",
-                     "Place footprint: click the canvas");
-    return;
-  }
-  if (cmd == "pcb_add_via") {
-    ecadArmPlacement(st, "via", "pcb", "Place via: click a routed net");
-    return;
-  }
-  if (cmd == "pcb_add_zone") {
-    ecadArmPlacement(st, "zone", "pcb",
-                     "Place copper zone: click polygon points");
-    return;
-  }
-  if (cmd == "sch_add_wire" || cmd == "pcb_add_track") {
-    const char *kind = cmd == "sch_add_wire" ? "sch" : "pcb";
-    if (!ecadRequireKind(st, kind, "Route"))
-      return;
-    st.ecadTool = 2;
-    st.wantFocusEcad = 4;
-    st.toast(ui::ToastLevel::Info,
-             "Route tool: click points; Esc or right-click to finish");
-    return;
-  }
+  if (cmd == "sch_export_netlist") { ecadExport(st, "netlist", "sch"); return; }
+  if (cmd == "sch_export_pdf") { ecadExport(st, "pdf", "sch"); return; }
   st.addLog("[warn] [ecad] unhandled command id: " + cmd);
   st.toast(ui::ToastLevel::Warn, "Unhandled ECAD command: " + cmd);
 }
 
 } // namespace
+
+#ifndef __EMSCRIPTEN__
+void ecadRecoverySaved(const std::string &docId, int savedRevision) {
+  ecadRecoverySavedImpl(docId, savedRevision);
+}
+#endif
 
 // W16: apply the param-less sm_flat_pattern feature (Sheet Metal "Flatten") +
 // reload the mesh. One-click feature (no PM form) — add_feature then
@@ -1690,9 +2001,9 @@ static void applyFlatPattern(AppState &st) {
                                 {"params", nlohmann::json::object()}}}}});
   ++st.rebuildsInFlight;
   st.docMirror.applyOpsAsync(
-      st.rpc, st.worker, ops, [&st](const core::OpsResponse &r, bool applied) {
+      st.rpc, st.worker, ops, [&st](const core::OpsResponse &r, bool current) {
         --st.rebuildsInFlight;
-        if (!applied)
+        if (!current || !st.isActiveMirrorDoc())
           return;
         if (r.ok && !r.aicm_path.empty()) {
           st.loadDocMeshAsync(r.aicm_path);
@@ -1949,6 +2260,9 @@ static void exportFile3d(AppState &st, const std::string &fmt) {
   } else if (fmt == "dwg") {
     ext = "dwg";
     filter = "AutoCAD DWG (*.dwg)\0*.dwg\0All files (*.*)\0*.*\0";
+  } else if (fmt == "scad") {
+    ext = "scad";
+    filter = "OpenSCAD (*.scad)\0*.scad\0All files (*.*)\0*.*\0";
   }
 
   // Suggested base name from the doc title (alnum/_/-, spaces -> _).
@@ -1990,13 +2304,23 @@ static void exportFile3d(AppState &st, const std::string &fmt) {
   const bool asciiStl = fmt == "stl" && st.exportTess.ascii;
 
   std::string err;
+  nlohmann::json exportResult;
   std::string written =
       st.docMirror.exportFile(st.worker, st.docMirror.docId(), path, fmt, err,
-                              linDef, angDef, relDef, asciiStl);
+                              linDef, angDef, relDef, asciiStl, &exportResult);
+#ifdef __EMSCRIPTEN__
+  if (!written.empty() && fmt == "scad" &&
+      !chudware::fsDownloadScadProject(path, exportResult.dump(), err))
+    written.clear();
+#endif
   if (!written.empty()) {
     st.addLog("[export] " + fmt + ": " + written);
     st.toast(ui::ToastLevel::Info, "Exported " + written);
+#ifdef __EMSCRIPTEN__
+    if (fmt != "scad") ui::afterFileWritten(written);
+#else
     ui::afterFileWritten(written);
+#endif
   } else {
     st.addLog("[export] " + fmt + " failed: " + err);
     st.toast(ui::ToastLevel::Warn,
@@ -2023,22 +2347,25 @@ static void exportFile3d(AppState &st, const std::string &fmt) {
 static GLFWdropfun g_prevDropCallback = nullptr;
 
 static bool dropPathHasKnownExt(const std::string &path) {
-  std::string ext = std::filesystem::path(path).extension().string();
+  std::string ext = std::filesystem::u8path(path).extension().u8string();
   std::transform(ext.begin(), ext.end(), ext.begin(),
                  [](unsigned char c) { return (char)std::tolower(c); });
   // F4: every importable 3D format (see core/doc/formats.cpp format_registry()
   // / doc_formats RPC) plus the ECAD/KiCad family, the AutoCAD DXF/DWG lane and
   // ACIS .sat/.sab. The GL-thread pump branches CAD vs ECAD by extension.
-  return ext == ".draw+" || ext == ".step+" || ext == ".step" ||
+  return ext == ".scad" || ext == ".draw+" || ext == ".step+" || ext == ".step" ||
          ext == ".stp" || ext == ".iges" || ext == ".igs" ||
          ext == ".brep" || ext == ".stl" || ext == ".3mf" ||
          ext == ".obj" || ext == ".ply" || ext == ".gltf" || ext == ".glb" ||
          ext == ".3dm" || ext == ".dxf" || ext == ".dwg" || ext == ".sat" ||
+         ext == ".splat" || ext == ".spz" || ext == ".ksplat" ||
+         ext == ".mp4" || ext == ".mov" || ext == ".webm" ||
+         ext == ".mkv" || ext == ".avi" ||
          ext == ".sab" || ext == ".sldprt" ||
          ext == ".sldasm" || ext == ".x_t" ||
          ext == ".x_b" || // experimental (SW COM)
          ext == ".ecad+" || ext == ".ecad" || ext == ".kicad_sch" ||
-         ext == ".kicad_pcb";
+         ext == ".kicad_pcb" || ext == ".kicad_pro";
 }
 
 static void onFileDrop(GLFWwindow *win, int count, const char **paths) {
@@ -2068,7 +2395,7 @@ static void onFileDrop(GLFWwindow *win, int count, const char **paths) {
     }
   }
   if (first.empty()) {
-    st.toast(ui::ToastLevel::Warn, "Drop a CAD or ECAD file to open it");
+    st.toast(ui::ToastLevel::Warn, "Drop a CAD, ECAD, splat or video file to open it");
     return;
   }
   // Route the first valid file through the same deferred pump the menu/Explorer
@@ -2221,7 +2548,7 @@ static void ensureStarterDoc(AppState &st, bool shot) {
     return;
   // Never drop a blank starter next to parts the daemon is offering for crash
   // recovery.
-  if (st.recoveryPromptCount > 0 || st.recoveryModalOpen)
+  if (!st.recoveryPrompt.empty() || st.recoveryModalOpen || st.recoveryInFlight)
     return;
 #ifdef __EMSCRIPTEN__
   // Web: workerStarted is synthetic (set at boot to unlock the UI); the daemon
@@ -2307,31 +2634,406 @@ static void ensureStarterDoc(AppState &st, bool shot) {
 #endif
 }
 
-// Save every dirty tab for the exit flow ("Save All & Quit"), dispatching by
-// kind via the unified saver (CAD .step+, ECAD .ecad+, Drawing → its source
-// part). Titled docs re-save silently; untitled ones raise a Save-As dialog.
-// Restores the originally-active tab afterward (CAD/Drawing saves re-point the
-// mirror). Returns true only if every dirty doc is now clean — a cancelled
-// Save-As or a save failure returns false → abort the quit so nothing is lost.
-static bool saveAllDirtyForQuit(AppState &st) {
-  const int origActive = st.activeTab;
-  bool allSaved = true;
-  for (int i = 0; i < (int)st.docTabs.size(); ++i) {
-    if (!st.docTabs[i].dirty)
-      continue;
-    // Only save user-owned docs — a pure AI mirror the user never adopted isn't
-    // theirs to save (its agent owns it). In practice such a tab is never
-    // dirty, but guard anyway.
-    if (st.docTabs[i].aiHandoff && !st.docTabs[i].userAdopted)
-      continue;
-    ui::TabSaveResult r = ui::saveDocTab(st, i, /*forceDialog=*/false);
-    if (r == ui::TabSaveResult::Cancelled || r == ui::TabSaveResult::Failed)
-      allSaved = false;
+// Save one stable tab identity at a time. A dialog cancellation, failed RPC, or
+// later human edit prevents quit; no queued save is treated as complete.
+struct SaveAllRun : std::enable_shared_from_this<SaveAllRun> {
+  struct Key { AppState::DocTab::TabKind kind; std::string id; };
+  AppState &st;
+  bool forQuit;
+  std::vector<Key> tabs;
+  size_t next = 0;
+  int saved = 0;
+  std::function<void(bool, int)> done;
+
+  SaveAllRun(AppState &state, bool quit, std::function<void(bool, int)> callback)
+      : st(state), forQuit(quit), done(std::move(callback)) {}
+
+  static std::string idFor(const AppState::DocTab &tab) {
+    using K = AppState::DocTab::TabKind;
+    if (tab.kind == K::Drawing) return tab.drawingDocId;
+    if (tab.kind == K::Schematic || tab.kind == K::PCB) return tab.ecadDocId;
+    return tab.docId;
   }
-  if (origActive >= 0 && origActive < (int)st.docTabs.size())
-    st.switchToTab(origActive); // restore the originally-active document
-  return allSaved;
+
+  void advance() {
+    while (next < tabs.size()) {
+      const Key key = tabs[next++];
+      int index = -1;
+      for (int i = 0; i < (int)st.docTabs.size(); ++i)
+        if (st.docTabs[i].kind == key.kind && idFor(st.docTabs[i]) == key.id) {
+          index = i;
+          break;
+        }
+      if (index < 0) continue;
+      const auto &tab = st.docTabs[index];
+      if ((forQuit && !tab.dirty) || (!tab.dirty && tab.path.empty()))
+        continue;
+      auto self = shared_from_this();
+      ui::saveDocTab(st, index, false, [self](ui::TabSaveResult result) {
+        if (result == ui::TabSaveResult::Saved) ++self->saved;
+        if (result == ui::TabSaveResult::Cancelled || result == ui::TabSaveResult::Failed) {
+          self->done(false, self->saved);
+          return;
+        }
+        self->advance();
+      });
+      return;
+    }
+    bool clean = !forQuit || !st.hasPendingHumanMutations();
+    if (forQuit)
+      for (const auto &tab : st.docTabs) if (tab.dirty) clean = false;
+    done(clean, saved);
+  }
+};
+
+static void saveAllTabs(AppState &st, bool forQuit, std::function<void(bool, int)> done) {
+  auto run = std::make_shared<SaveAllRun>(st, forQuit, std::move(done));
+  // Saving the source first also captures its embedded drawings. Standalone
+  // drawings are subsequently saved to their own paths.
+  for (int drawings = 0; drawings < 2; ++drawings)
+    for (const auto &tab : st.docTabs) {
+      const bool drawing = tab.kind == AppState::DocTab::TabKind::Drawing;
+      if (drawing != (drawings != 0) || (forQuit && !tab.dirty) ||
+          (!tab.dirty && tab.aiHandoff && !tab.userAdopted)) continue;
+      const std::string id = SaveAllRun::idFor(tab);
+      if (!id.empty()) run->tabs.push_back({tab.kind, id});
+    }
+  run->advance();
 }
+
+// "Recover" in the orphan-recovery prompt: reopen the entries ONE AT A TIME on the async
+// primary lane. The old synchronous recovery_open{all} parked the GL thread for the whole
+// batch — 28 crash survivors including a large assembly froze the window for half an hour.
+// Each completion queues the next, so the attach/tree calls a recovered tab's mirror issues
+// get FIFO slots between opens and every tab comes alive as soon as its own doc is ready.
+struct OrphanRecoveryRun {
+  std::vector<AppState::RecoveryEntry> entries;
+  size_t next = 0;
+  int opened = 0;
+  std::vector<std::string> failed;
+};
+
+static void recoverNextOrphan(AppState &st, std::shared_ptr<OrphanRecoveryRun> run) {
+  if (run->next >= run->entries.size()) {
+    st.recoveryInFlight = false;
+    if (run->failed.empty()) {
+      st.toast(ui::ToastLevel::Info, "Recovered " + std::to_string(run->opened) +
+                                         " part" + (run->opened == 1 ? "" : "s"));
+    } else {
+      std::string names;
+      for (const auto &n : run->failed)
+        names += (names.empty() ? "" : ", ") + n;
+      st.toast(ui::ToastLevel::Warn,
+               "Recovered " + std::to_string(run->opened) + " of " +
+                   std::to_string(run->entries.size()) + " parts — " + names +
+                   " could not be reopened (they remain recoverable next launch)");
+    }
+    return;
+  }
+  const AppState::RecoveryEntry entry = run->entries[run->next++];
+  st.rpc.callPrimary(
+      "recovery_open", nlohmann::json{{"id", entry.id}},
+      [&st, run, entry](const core::RpcResult &r) {
+        std::vector<std::string> ids;
+        bool diskConflict = false;
+        nlohmann::json observedStamp;
+        if (r.ok && r.result.is_object() && r.result.contains("opened") &&
+            r.result["opened"].is_array()) {
+          for (const auto &o : r.result["opened"]) {
+            if (o.is_object() && o.contains("doc_id") && o["doc_id"].is_string()) {
+              ids.push_back(o["doc_id"].get<std::string>());
+              diskConflict = diskConflict || o.value("disk_conflict", false);
+              if (o.value("disk_conflict", false))
+                observedStamp = o.value("observed_stamp", nlohmann::json());
+            }
+          }
+        }
+        if (ids.empty()) {
+          run->failed.push_back(entry.name);
+          st.addLog("[recovery] " + entry.name + " not reopened: " +
+                    (r.ok ? r.result.value("message", std::string("no document"))
+                          : r.err));
+        } else {
+          core::mirrorRecoveredDocs(st, ids, entry.humanDirty, 0, entry.path,
+                                    diskConflict, observedStamp);
+          run->opened += static_cast<int>(ids.size());
+        }
+        recoverNextOrphan(st, run);
+      },
+      core::kLongEngineCallTimeoutMs);
+}
+
+namespace ui {
+namespace {
+struct ReferenceFetch {
+  std::string docId, id, key;
+  uint64_t generation = 0;
+  int revision = -1;
+  size_t offset = 0, total = 0;
+  std::shared_ptr<Mesh> mesh = std::make_shared<Mesh>();
+};
+
+struct ReferenceMirror {
+  MeshReferenceView view;
+  int revision = -1;
+  uint64_t generation = 0;
+  bool listing = false;
+  std::unordered_set<std::string> fetching;
+  std::unordered_map<std::string, std::shared_ptr<Mesh>> cache;
+  std::deque<std::string> cacheOrder;
+};
+ReferenceMirror& referenceMirror() {
+  static ReferenceMirror mirror;
+  return mirror;
+}
+
+std::string referenceKey(const nlohmann::json& ref) {
+  return render::meshReferenceKey(ref);
+}
+
+void trimReferenceCache(ReferenceMirror& m) {
+  std::unordered_set<std::string> activeKeys;
+  for (const auto& ref : m.view.refs) activeKeys.insert(referenceKey(ref));
+  const auto bytes = [](const Mesh& mesh) {
+    return (mesh.positions.capacity() + mesh.normals.capacity()) * sizeof(float) +
+           mesh.indices.capacity() * sizeof(uint32_t);
+  };
+  size_t totalBytes = 0;
+  for (const auto& entry : m.cache) totalBytes += bytes(*entry.second);
+  size_t candidates = m.cacheOrder.size();
+  constexpr size_t kMaxCachedBytes = size_t(256) * 1024 * 1024;
+  while ((m.cacheOrder.size() > 6 || totalBytes > kMaxCachedBytes) && candidates--) {
+    std::string key = std::move(m.cacheOrder.front());
+    m.cacheOrder.pop_front();
+    if (activeKeys.count(key)) {
+      m.cacheOrder.push_back(std::move(key));
+    } else {
+      auto it = m.cache.find(key);
+      if (it != m.cache.end()) {
+        totalBytes -= bytes(*it->second);
+        m.cache.erase(it);
+      }
+    }
+  }
+}
+
+bool referenceActive(const AppState& st, const std::string& doc) {
+  return st.isActiveMirrorDoc() && st.activeTab >= 0 &&
+      st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Part &&
+      st.docMirror.docId() == doc;
+}
+
+std::string referenceRpcError(const core::RpcResult& r, const char* fallback) {
+  if (r.result.is_object()) {
+    for (const char* key : {"message", "error", "reason"}) {
+      const auto it = r.result.find(key);
+      if (it != r.result.end() && it->is_string() && !it->get_ref<const std::string&>().empty())
+        return it->get<std::string>();
+    }
+  }
+  return r.err.empty() ? std::string(fallback) : r.err;
+}
+
+void publishReferenceMeshes(AppState& st) {
+  auto& m = referenceMirror();
+  if (!st.renderer) return;
+  std::vector<Renderer::MeshReference> meshes;
+  meshes.reserve(m.view.refs.size());
+  for (const auto& ref : m.view.refs) {
+    if (!ref.is_object()) continue;
+    const std::string key = referenceKey(ref);
+    auto found = m.cache.find(key);
+    if (found == m.cache.end()) continue;
+    Renderer::MeshReference item;
+    item.id = ref.value("id", std::string());
+    item.key = key;
+    item.mesh = found->second;
+    item.visible = ref.value("visible", true);
+    item.opacity = std::clamp(ref.value("opacity", 0.4f), 0.0f, 1.0f);
+    const auto color = ref.find("color");
+    if (color != ref.end() && color->is_array() && color->size() == 3 &&
+        (*color)[0].is_number() && (*color)[1].is_number() && (*color)[2].is_number()) {
+      for (size_t i = 0; i < 3; ++i)
+        item.color[i] = std::clamp((*color)[i].get<float>(), 0.0f, 1.0f);
+    }
+    const auto bbox = ref.find("bbox_mm");
+    if (bbox != ref.end() && bbox->is_object() && bbox->contains("min") && bbox->contains("max") &&
+        (*bbox)["min"].is_array() && (*bbox)["max"].is_array() &&
+        (*bbox)["min"].size() == 3 && (*bbox)["max"].size() == 3) {
+      item.hasBounds = true;
+      for (size_t i = 0; i < 3; ++i) {
+        if (!(*bbox)["min"][i].is_number() || !(*bbox)["max"][i].is_number()) {
+          item.hasBounds = false;
+          break;
+        }
+        item.bboxMin[i] = (*bbox)["min"][i].get<float>();
+        item.bboxMax[i] = (*bbox)["max"][i].get<float>();
+        if (!std::isfinite(item.bboxMin[i]) || !std::isfinite(item.bboxMax[i]))
+          item.hasBounds = false;
+      }
+    }
+    meshes.push_back(std::move(item));
+  }
+  st.renderer->setMeshReferences(std::move(meshes));
+}
+
+void referenceFailure(AppState& st, const std::shared_ptr<ReferenceFetch>& fetch,
+                      const std::string& message) {
+  auto& m = referenceMirror();
+  if (fetch->generation != m.generation || m.view.docId != fetch->docId) return;
+  m.fetching.erase(fetch->key);
+  m.view.loading = m.listing || !m.fetching.empty();
+  m.view.error = message;
+  st.addLog("[reference] " + message);
+}
+
+void fetchReferencePage(AppState& st, const std::shared_ptr<ReferenceFetch>& fetch) {
+  st.rpc.call("doc_mesh_ref_mesh",
+              {{"doc_id", fetch->docId}, {"id", fetch->id},
+               {"expected_revision", fetch->revision}, {"offset_tris", fetch->offset},
+               {"max_tris", 10000}},
+              [&st, fetch](const core::RpcResult& r) {
+    auto& m = referenceMirror();
+    if (fetch->generation != m.generation || m.view.docId != fetch->docId ||
+        !referenceActive(st, fetch->docId)) return;
+    if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) {
+      const std::string code = r.result.is_object()
+          ? r.result.value("code", std::string()) : std::string();
+      if (code == "stale_revision" || r.err.find("stale_revision") != std::string::npos) {
+        m.fetching.erase(fetch->key);
+        m.revision = -1;
+        refreshMeshReferences(st, fetch->docId);
+      } else {
+        referenceFailure(st, fetch, referenceRpcError(r, "Could not load reference mesh"));
+      }
+      return;
+    }
+    try {
+      render::appendMeshReferencePage(*fetch->mesh, r.result, fetch->offset, fetch->total);
+      if (fetch->offset < fetch->total) {
+        fetchReferencePage(st, fetch);
+        return;
+      }
+      m.cache[fetch->key] = fetch->mesh;
+      m.cacheOrder.push_back(fetch->key);
+      trimReferenceCache(m);
+      m.fetching.erase(fetch->key);
+      m.view.loading = m.listing || !m.fetching.empty();
+      publishReferenceMeshes(st);
+    } catch (const std::exception& e) {
+      referenceFailure(st, fetch, std::string("Invalid reference mesh: ") + e.what());
+    }
+  });
+}
+}  // namespace
+
+const MeshReferenceView& meshReferenceView() { return referenceMirror().view; }
+
+bool meshReferenceLoaded(const std::string& id) {
+  const auto& m = referenceMirror();
+  for (const auto& ref : m.view.refs)
+    if (ref.is_object() && ref.value("id", std::string()) == id)
+      return m.cache.count(referenceKey(ref)) != 0;
+  return false;
+}
+
+void tickMeshReferences(AppState& st) {
+  auto& m = referenceMirror();
+  const std::string doc = st.workerStarted && referenceActive(st, st.docMirror.docId())
+      ? st.docMirror.docId() : std::string();
+  if (doc == m.view.docId && (!doc.empty() && m.revision == st.docMirror.revision())) return;
+  if (doc.empty() && m.view.docId.empty()) return;
+  const bool switched = doc != m.view.docId;
+  ++m.generation;
+  m.fetching.clear();
+  m.listing = false;
+  m.revision = doc.empty() ? -1 : st.docMirror.revision();
+  if (switched) {
+    m.view.docId = doc;
+    m.view.refs = nlohmann::json::array();
+    m.view.error.clear();
+    trimReferenceCache(m);
+    publishReferenceMeshes(st);
+  }
+  if (doc.empty()) { m.view.loading = false; return; }
+  m.view.loading = m.listing = true;
+  const uint64_t generation = m.generation;
+  st.rpc.call("doc_mesh_ref_list", {{"doc_id", doc}}, [&st, doc, generation](const core::RpcResult& r) {
+    auto& current = referenceMirror();
+    if (current.generation != generation || !referenceActive(st, doc)) return;
+    current.listing = false;
+    current.view.loading = false;
+    if (!r.ok || !r.result.is_object() || !r.result.value("ok", false) ||
+        !r.result.contains("refs") || !r.result["refs"].is_array()) {
+      current.view.error = referenceRpcError(r, "Could not list scan references");
+      st.addLog("[reference] " + current.view.error);
+      return;
+    }
+    current.view.error.clear();
+    current.view.refs = r.result["refs"];
+    const int revision = r.result.value("revision", current.revision);
+    publishReferenceMeshes(st);
+    for (const auto& ref : current.view.refs) {
+      if (!ref.is_object()) continue;
+      const std::string key = referenceKey(ref);
+      const std::string id = ref.value("id", std::string());
+      const size_t triangles = ref.value("triangles", size_t(0));
+      if (key.empty() || id.empty() || !triangles || current.cache.count(key) ||
+          !current.fetching.insert(key).second) continue;
+      auto fetch = std::make_shared<ReferenceFetch>();
+      fetch->docId = doc; fetch->id = id; fetch->key = key;
+      fetch->generation = generation; fetch->revision = revision; fetch->total = triangles;
+      fetchReferencePage(st, fetch);
+    }
+    current.view.loading = !current.fetching.empty();
+  });
+}
+
+void refreshMeshReferences(AppState& st, const std::string& docId) {
+  auto& m = referenceMirror();
+  if (m.view.docId == docId) m.revision = -1;
+  st.rpc.call("doc_tree", {{"doc_id", docId}}, [&st, docId](const core::RpcResult& r) {
+    if (!referenceActive(st, docId) || !r.ok || !r.result.is_object()) return;
+    if (r.result.value("revision", -1) < st.docMirror.revision()) return;
+    st.docMirror.ingestTreeResponse(r.result);
+  });
+}
+
+void meshReferenceMutationCompleted(AppState& st, const std::string& docId, int revision) {
+  // Tree-only native transactions advance the document revision without a new AICM.
+  // Invalidate parked revision identities so tab switching cannot restore an older tree.
+  st.markHumanEdit(docId, revision);
+  for (auto& tab : st.docTabs) {
+    if (tab.docId != docId) continue;
+    tab.meshCacheInvalidated = true;
+    if (tab.session) tab.session->cachedAicmPath.clear();
+  }
+  if (st.renderer) st.renderer->discardCachedMeshes(docId);
+  refreshMeshReferences(st, docId);
+}
+
+void mutateMeshReference(AppState& st, const char* method, nlohmann::json params) {
+  auto& m = referenceMirror();
+  if (m.view.writing || !st.workerStarted || !referenceActive(st, st.docMirror.docId())) return;
+  const std::string doc = st.docMirror.docId();
+  params["doc_id"] = doc;
+  m.view.error.clear();
+  m.view.writing = true;
+  st.beginHumanMutation(doc);
+  st.rpc.call(method, std::move(params), [&st, doc](const core::RpcResult& r) {
+    st.endHumanMutation(doc);
+    auto& current = referenceMirror();
+    current.view.writing = false;
+    if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) {
+      const std::string message = referenceRpcError(r, "Scan reference operation failed");
+      if (current.view.docId == doc) current.view.error = message;
+      st.toast(ToastLevel::Error, message);
+      return;
+    }
+    meshReferenceMutationCompleted(st, doc, r.result.value("revision", 0));
+  });
+}
+}  // namespace ui
 
 // TEMP DIAGNOSTIC: forward decl for the vendor-wizard headless repro in
 // run_gui.
@@ -2582,7 +3284,112 @@ EMSCRIPTEN_KEEPALIVE void chudware_mobile_key(int key) {
 } // extern "C"
 #endif
 
+// RE-40: GL content of the Reverse-Engineering 3D preview slots. kit::Viewport3DPreview queues
+// this as a draw-list callback at the rect it reserves, so it runs INSIDE ImGui's draw pass in
+// window order: windows drawn later (Settings, modals, popups, tooltips) cover it. It runs with
+// ImGui's render state bound; the kit resets that state after each call.
+static void paintRevEngPreviewSlot(ui::reveng::kit::PreviewSlot slot, const ImRect &rect,
+                                   const ImRect &clip) {
+  using ui::reveng::kit::PreviewSlot;
+  const ImDrawData *dd = ImGui::GetDrawData();
+  if (!dd) return;
+  core::framestats::Scope timing("reverse_eng");
+  ui::reveng::RevEngState &rs = ui::reveng::S();
+  const ImVec2 org = dd->DisplayPos, fbs = dd->FramebufferScale;
+  const int dw = (int)(dd->DisplaySize.x * fbs.x);
+  const int dh = (int)(dd->DisplaySize.y * fbs.y);
+  // Map an ImGui screen rect (top-left origin, logical px) onto the GL
+  // viewport (bottom-left origin, framebuffer px). Returns false when the
+  // rect is degenerate or fully off-screen.
+  auto toFramebuffer = [&](const ImRect &r, int &x, int &y, int &w, int &h) {
+    x = (int)((r.Min.x - org.x) * fbs.x);
+    w = (int)((r.Max.x - r.Min.x) * fbs.x);
+    h = (int)((r.Max.y - r.Min.y) * fbs.y);
+    y = dh - (int)((r.Max.y - org.y) * fbs.y); // flip Y
+    return w > 1 && h > 1 && x < dw && y < dh && x + w > 0 && y + h > 0;
+  };
+  int vx = 0, vy = 0, vw = 0, vh = 0, cx = 0, cy = 0, cw = 0, ch = 0;
+  if (!toFramebuffer(rect, vx, vy, vw, vh) || !toFramebuffer(clip, cx, cy, cw, ch))
+    return;
+  glViewport(vx, vy, vw, vh);
+  glEnable(GL_SCISSOR_TEST);
+  glScissor(std::max(0, cx), std::max(0, cy), std::min(dw, cx + cw) - std::max(0, cx),
+            std::min(dh, cy + ch) - std::max(0, cy));
+  // ImGui clears color only. Stale default-framebuffer depth must not
+  // occlude this independent preview; never clear outside its slot.
+  GLboolean previousDepthMask = GL_TRUE;
+  glGetBooleanv(GL_DEPTH_WRITEMASK, &previousDepthMask);
+  glDepthMask(GL_TRUE);
+  const GLfloat clearDepth = 1.0f;
+  glClearBufferfv(GL_DEPTH, 0, &clearDepth);
+  glDepthMask(previousDepthMask);
+
+  // Mesh and built-document slots use the same shaded CAD thumbnail pass
+  // as Active Work, cached until the artifact or viewport size changes.
+  struct ReThumbnail {
+    unsigned int tex = 0;
+    int width = 0, height = 0;
+    uint64_t revision = 0;
+    bool attempted = false;
+  };
+  static ReThumbnail meshThumb, parametricThumb;
+  static GLuint reReadFbo = 0;
+  auto drawDocument = [&](const std::shared_ptr<render::DocMesh> &doc, uint64_t revision,
+                          ReThumbnail &thumb, std::string &error) {
+    if (!doc || doc->empty()) return;
+    const int w = std::clamp(vw, 16, 2048);
+    const int h = std::clamp(vh, 16, 2048);
+    if (!thumb.attempted || thumb.width != w || thumb.height != h ||
+        thumb.revision != revision) {
+      thumb.width = w; thumb.height = h; thumb.revision = revision;
+      thumb.attempted = true;
+      std::string drawError;
+      if (!render::renderDocThumbnail(*doc, w, h, render::DocThumbStyle{}, thumb.tex,
+                                      drawError))
+        error = drawError.empty() ? "Cannot render document preview." : drawError;
+      else
+        error.clear();
+    }
+    if (!thumb.tex || !error.empty()) return;
+    GLint previousRead = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previousRead);
+    if (!reReadFbo) glGenFramebuffers(1, &reReadFbo);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, reReadFbo);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, thumb.tex, 0);
+    if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE)
+      glBlitFramebuffer(0, h, w, 0, vx, vy, vx + vw, vy + vh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, previousRead);
+  };
+
+  switch (slot) {
+  case PreviewSlot::Splat: // RE-27: 3DGS splat (Brush export)
+    if (rs.splatLoaded && rs.splat.hasSplats()) {
+      const Renderer::CameraXform cam = ui::reveng::gaussianPreviewCamera(vw, vh);
+      rs.splat.draw(cam);
+      if (rs.stage == ui::reveng::Stage::Scale && rs.splatPickMarks.hasPoints())
+        rs.splatPickMarks.draw(cam);
+    }
+    break;
+  case PreviewSlot::SparseCloud: // RE-21: sparse point cloud + camera frusta
+    if (rs.rePoints.hasPoints() || rs.rePoints.hasFrusta())
+      rs.rePoints.draw(ui::reveng::sparsePreviewCamera(vw, vh));
+    break;
+  case PreviewSlot::Mesh:
+    drawDocument(rs.meshPreview, rs.meshPreviewRevision, meshThumb, rs.meshPreviewError);
+    break;
+  case PreviewSlot::Parametric:
+    drawDocument(rs.parametricPreview, rs.parametricPreviewRevision, parametricThumb,
+                 rs.parametricPreviewError);
+    break;
+  case PreviewSlot::None:
+  case PreviewSlot::Deviation: // painted by ImGui (dim_review paintErrorField)
+    break;
+  }
+}
+
 int run_gui(const char *screenshotPath, const char *openPath) {
+  core::framestats::ReportOnExit frameStatsReport;
   startup_trace::mark("run_gui entry");
 #ifndef __EMSCRIPTEN__
   s_nativeStartup = {};
@@ -2688,6 +3495,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   std::fprintf(stderr, "[wasm-boot] GL context current\n");
   wasmSetupCanvasResize(win);
 #endif
+#ifndef __EMSCRIPTEN__
+  engine::GuiConnection guiConnection(ui::anim::wakeLoop);
+#endif
 
   // CEF (when the cef backend is selected) is initialised early in main(),
   // before GLFW — see main.cpp. Nothing to do here.
@@ -2712,8 +3522,8 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   // that split entirely: Manufacture keeps the native 3D viewport edge to edge,
   // with its job/output controls in the pinned left column. Rolling the schema
   // prevents a saved v5 "CAM" dock node from permanently stealing viewport space.
-  // The ini is also the columns' width persistence, so their sizes still survive
-  // restarts without a second settings path.
+  // The ini is also the FeatureManager column's width persistence; the Copilot column is
+  // NoResize and persists its width as Settings::copilotWidth ("copilot_width").
   static std::string iniPath = appdataAppDir() + "/imgui_gui_v6.ini";
   io.IniFilename = shot ? nullptr : iniPath.c_str();
 
@@ -2755,7 +3565,40 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   std::fprintf(stderr, "[wasm-boot] ImGui_ImplOpenGL3_Init done\n");
 #else
   ImGui_ImplOpenGL3_Init("#version 330");
+  {
+    // Device objects alone do not force drivers such as llvmpipe to JIT the
+    // blend/vertex-state variant. Submit one unswapped startup pixel as well.
+    ImGui_ImplOpenGL3_CreateDeviceObjects();
+    ImDrawList warmDraw(ImGui::GetDrawListSharedData());
+    warmDraw._ResetForNewFrame();
+    warmDraw.PushClipRect(ImVec2(0, 0), ImVec2(1, 1));
+    warmDraw.AddImage(io.Fonts->TexID, ImVec2(0, 0), ImVec2(1, 1));
+    // Font/icon/viewport textures can have different power-of-two axes. Warm
+    // the four clamp/linear sampler shapes, not only the font-atlas variant.
+    GLuint warmTextures[4]{};
+    glGenTextures(4, warmTextures);
+    const unsigned char pixels[3 * 3 * 4]{};
+    for (int i = 0; i < 4; ++i) {
+      glBindTexture(GL_TEXTURE_2D, warmTextures[i]);
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 2 + (i & 1), 2 + ((i >> 1) & 1),
+                   0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      warmDraw.AddImage((ImTextureID)(intptr_t)warmTextures[i], ImVec2(0, 0), ImVec2(1, 1));
+    }
+    ImDrawData warmData;
+    warmData.Valid = true;
+    warmData.DisplaySize = ImVec2(1, 1);
+    warmData.FramebufferScale = ImVec2(1, 1);
+    warmData.AddDrawList(&warmDraw);
+    ImGui_ImplOpenGL3_RenderDrawData(&warmData);
+    glFinish();
+    glDeleteTextures(4, warmTextures);
+  }
 #endif
+  ui::reveng::kit::setPreviewSlotPainter(&paintRevEngPreviewSlot);
 
   // Borderless window: strip the OS title bar/frame and drive our own
   // (drag/resize/snap stay native). Must be installed after the ImGui GLFW
@@ -2918,12 +3761,11 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   // --- end C20b ---
 
   // C17/C18: SINGLE ribbon-command dispatcher. The ribbon callback and
-  // st.ribbonDispatch (used by the shortcut bar / gesture wheel) route through
+  // st.ribbonDispatch (used by the shortcut bar) route through
   // the SAME lambda so the two paths can never drift apart — they were
   // previously hand-duplicated (Wave 1B unification).
-  //   - App-level policy stays here: prof_toggle, the Simulation lockout (runs
-  //   before family
-  //     routing), PM-cancel-on-sketch_new, and the unhandled-stub log.
+  //   - App-level dispatch checks shared availability before side effects,
+  //     then handles prof_toggle and the stub log.
   //   - every command FAMILY (sketch, edit_*, dwg_, display_/appr_,
   //   asm_, ecad_/sch_/pcb_,
   //     cam_, reveng_, PM forms, sm_, sim_, eval_) lives in an ordered rule
@@ -2935,61 +3777,31 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         {cmdEditCopy, cmdEditCut, cmdEditPaste, cmdEditDelete, cmdEditSelectAll,
          cmdMakeDrawing, cmdDisplayStyle, cmdAppearance, cmdFlatPattern,
          cmdFlatDxf, ecadDispatch});
-    if (!router.authorize(st, cmd_id)) return;
+    if (!cmd_id || !*cmd_id)
+      return;
+    const ui::CommandContext context = ui::commandContext(st);
+    const ui::CommandAvailability availability = ui::commandAvailability(cmd_id, context);
+    if (!availability.visible || !availability.enabled) {
+      st.toast(ui::ToastLevel::Info,
+               availability.reason ? availability.reason : "Command unavailable in this context");
+      return;
+    }
     // Multi-document: handlers resolve the PropertyManager / SketchMode /
     // EvaluateDialogs of the ACTIVE document through the AppState& they are
     // handed (st.* are re-seated on every tab switch), so no per-call shadowing
-    // locals are needed here anymore. Evaluate > Profiler: global,
-    // document-independent — handle before any lockout so it can be toggled at
-    // any time (including mid-edit, which is exactly when you want to profile).
+    // locals are needed here anymore. Evaluate > Profiler is global and
+    // document-independent.
     if (std::strcmp(cmd_id, "prof_toggle") == 0) {
       st.showProfilerWindow = true;
       return;
     }
-    // Simulation lockout: while the Simulation workspace is active the model is
-    // frozen — a study's fixtures/loads/results are tied to the current
-    // geometry, so changing the part's shape from under them is disallowed
-    // (SolidWorks freezes the model inside a study the same way). We block the
-    // feature/sketch/assembly/edit verbs but leave simulation (sim_*),
-    // inspection (eval_*) and view/camera commands free so the user can still
-    // measure, orient and set up the study. The toast tells them the one move
-    // that unlocks editing: leave the Simulation tab.
-    if (st.inSimulation()) {
-      std::string c(cmd_id);
-      auto pre = [&](const char *p) { return c.rfind(p, 0) == 0; };
-      const bool allowed =
-          pre("sim_") || pre("eval_") || pre("view_") || pre("zoom") ||
-          pre("cam_") || pre("display_") || pre("section") || pre("rollback") ||
-          pre("config_") || c == "toggle_units" || c == "make_drawing";
-      const bool modeling =
-          pre("sketch") || pre("sk_") || pre("smart_dim") || pre("extrude") ||
-          pre("revolve") || pre("fillet") || pre("chamfer") || pre("shell") ||
-          pre("draft") || pre("hole") || pre("sweep") || pre("loft") ||
-          pre("boss") || pre("cut") || pre("pattern") || pre("mirror") ||
-          pre("rib") || pre("dome") || pre("wrap") || pre("split") ||
-          pre("combine") || pre("scale") || pre("move") || pre("boolean") ||
-          pre("helix") || pre("ref_") || pre("datum") || pre("plane") ||
-          pre("axis") || pre("weld") || pre("sm_") || pre("asm_") ||
-          pre("edit_") || c == "new_assembly";
-      if (modeling && !allowed) {
-        st.toast(ui::ToastLevel::Info, "Model is locked in Simulation — leave "
-                                       "the Simulation tab to edit it");
-        return;
-      }
-    }
-    // C43: starting a sketch while a PM form is open cancels the form first
-    // (revert preview + close). Without this, plane-pick and the PM coexisted:
-    // the PM hid the FeatureManager, both fought over the viewport mouse, and
-    // Esc couldn't untangle it.
-    if (st.propertyManager->active() && std::strcmp(cmd_id, "sketch_new") == 0)
-      st.propertyManager->cancelEdits(st);
     // Family routing lives in the ordered rule table
     // (app_commands.cpp). Built once; the rules are stateless and resolve every
     // subsystem through the AppState& at call time. The app-level family
     // handlers (cmdEdit*/cmdDisplayStyle/cmdAppearance/...) stay in this file
     // and are handed over via RibbonCommandHooks.
-    // Family routing uses the same router that authorized this command above.
-    if (router.dispatch(st, cmd_id))
+    // Family routing uses the ordered router built above.
+    if (router.dispatch(st, cmd_id, context))
       return;
     // Commands without a handler log a stub line so they stay observable until
     // later cards wire them.
@@ -3007,6 +3819,13 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   st.orthographic =
       st.settings
           .orthographic; // live projection mode mirrors the persisted setting
+  // Viewport display toggles, View-menu panel visibility and the sketch defaults come back as the
+  // user left them. Screenshot/automation runs keep the built-in defaults (and never persist).
+  if (!shot) {
+    st.seedViewPrefsFromSettings();
+    sketchMode.applyPreferences(st.settings.sketchShowGrid,
+                                st.settings.sketchAutoRelations);
+  }
   // Liquid glass v2.1: install + resolve the persisted appearance config before
   // the first frame (idempotent; re-pushed every frame in the loop below so
   // runtime mutations self-heal).
@@ -3064,6 +3883,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     }
     bool simPickConsumed =
         false; // a sim face pick was routed into a fixture/load well this pass
+    // Picks a PropertyManager well consumed (added, toggled off or rejected) and stale deferred
+    // picks. The well draws its own picks, so a pick it does not hold must not stay highlighted
+    // as selected: an orange edge beside an empty Edges well read as a pick the form lost.
+    std::vector<render::PickHit> released;
     for (auto &item : st.selection.mutableItems()) {
       if (!item.pending_resolve || item.resolve_request != 0 || !item.hit.valid())
         continue;
@@ -3076,6 +3899,14 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       if (!kindStr) {
         item.pending_resolve = false;
         item.resolution_error = "This topology kind cannot be resolved.";
+        continue;
+      }
+      // A deferred pick's topology ids belong to the revision it was clicked on.
+      if (item.deferred_revision >= 0 && item.deferred_revision != st.docMirror.revision()) {
+        item.pending_resolve = false;
+        item.resolution_error = "The document changed while resolving this pick. Select it again.";
+        st.toast(ui::ToastLevel::Info, item.resolution_error);
+        released.push_back(item.hit);
         continue;
       }
       const bool routedPick =
@@ -3142,9 +3973,11 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         continue;
       }
       if (st.rpc.busy()) {
-        item.pending_resolve = false;
-        item.resolution_error = "The engine is busy. Select this element again when the operation finishes.";
-        st.toast(ui::ToastLevel::Info, item.resolution_error);
+        // The routed paths resolve synchronously and must not block the GL thread behind queued
+        // engine work. Keep the pick pending; the per-frame retry resolves it once the queue is
+        // idle. Dropping it lost clicks whenever anything was queued, even the open form's own
+        // once-per-second edit_hold renewal.
+        if (item.deferred_revision < 0) item.deferred_revision = st.docMirror.revision();
         continue;
       }
       std::string err;
@@ -3166,7 +3999,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
             item.pending_resolve = false;
             try {
               nlohmann::json selObj = nlohmann::json::parse(asel);
-              ap->routeAsmPick(selObj, comp, (int)item.hit.kind);
+              ap->routeAsmPick(selObj, comp, item.hit.body_id);
             } catch (...) {
             }
           }
@@ -3219,6 +4052,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         item.selector = st.docMirror.resolvePick(st.worker, item.hit.body_id, kindStr,
                                                  item.hit.topo_id, err);
         item.resolution_error = item.selector.empty() ? err : std::string();
+        released.push_back(item.hit); // the face's edges are in the well; the face is not
         continue;
       }
       // Body wells (boolean targets/tools): resolve the clicked element's
@@ -3235,8 +4069,8 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         item.selector = sel;
         item.pending_resolve = false;
         // C17: route the freshly resolved pick into the active PropertyManager
-        // well (filtered by the well's allowed kinds). Consumed picks do not
-        // affect the viewport highlight set beyond their normal selection role.
+        // well (filtered by the well's allowed kinds). The well then owns the
+        // pick's highlight, so the pick leaves the global selection.
         if (st.propertyManager) {
           auto *pm = st.propertyManager;
           if (pm->active()) {
@@ -3266,6 +4100,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
               }
             } catch (...) {
             }
+            released.push_back(item.hit);
           }
         }
         // Simulation studies: route a FACE pick into the armed fixture/load
@@ -3293,8 +4128,14 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         item.selector.clear();
         item.resolution_error = err.empty() ? "The selected topology could not be resolved." : err;
         st.addLog("[selection] " + item.resolution_error);
+        if (st.propertyManager && st.propertyManager->active()) {
+          st.toast(ui::ToastLevel::Info, item.resolution_error);
+          released.push_back(item.hit);
+        }
       }
     }
+    if (!released.empty())
+      st.selection.erase(released);
     // A routed sim face pick belongs to the fixture/load WELL (shown as the
     // green/red face wash), not the global selection. Clear st.selection so sim
     // picks never ACCUMULATE here and get scooped into the next well's capture
@@ -3305,15 +4146,37 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       st.selection.clear();
   });
 
+  st.docMirror.setAcceptedOpsObserver(
+      [&st](const core::OpsResponse &r, bool revisionChanged) {
+        st.adoptCurrentOpsResponse(r, revisionChanged);
+      });
+  st.docMirror.setSupersededOpsObserver(
+      [&st](const std::string &docId, int baseRevision) {
+        st.catchUpSupersededOps(docId, baseRevision);
+      });
+  st.docMirror.setPendingOpsObserver([&st](const std::string &id, bool pending) {
+    if (pending) st.beginHumanMutation(id); else st.endHumanMutation(id);
+  });
+  st.docMirror.setHumanMutationObserver([&st](const std::string &id, int revision) {
+    st.markHumanEdit(id, revision);
+  });
+
   // C16: Doc mirror listener — re-draws the tree whenever a snapshot is adopted.
   // (Tree reads st.docMirror.tree() directly; listener fires on the calling
   // thread.)
-  st.docMirror.setListener([&st](bool revisionChanged) {
+  st.docMirror.setListener([&st](bool) {
     // Nothing to do beyond triggering a redraw; ImGui redraws every frame so
     // the tree panel auto-updates from docMirror.tree() on the next frame.
     // We log the new revision for observability.
     st.addLog("[doc] tree updated  rev=" +
               std::to_string(st.docMirror.revision()));
+    if (!st.isActiveMirrorDoc() &&
+        std::any_of(st.docTabs.begin(), st.docTabs.end(), [&st](const auto &tab) {
+          return !tab.docId.empty() && tab.docId == st.docMirror.docId();
+        })) {
+      st.parkInactiveMirrorTree();
+      return;
+    }
     // C38 (T1): this is the single central choke point — DocMirror::notify()
     // fires here after EVERY adopted tree (applyOps, resync, undo, redo, newPart)
     // once the rebuilt owner map is stored. Re-derive the feature highlight
@@ -3628,21 +4491,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       st.applyDatumVisibility(); // re-apply the FeatureManager eye hides to the
                                  // fresh datums
     }
-    // Only a native revision change to this document is a real edit. Refreshing the
-    // same snapshot (including an agent turn that made no changes) still updates
-    // consumers, but must not claim unsaved changes or adopt an untouched AI tab.
-    // Tab/open bindings retain their explicit suppressTabDirty guard. Also skip
-    // the open-second-file interval before applyOpenedDoc adds the matching tab.
-    if (!st.suppressTabDirty) {
-      const bool activeMatchesMirror =
-          st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
-          st.docTabs[st.activeTab].docId == st.docMirror.docId();
-      if (activeMatchesMirror) {
-        if (revisionChanged)
-          st.markActiveTabDirty();
-        st.syncActiveTabTitle();
-      }
-    }
+    if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
+        st.docTabs[st.activeTab].docId == st.docMirror.docId())
+      st.syncActiveTabTitle();
   });
 
   // W1-B (item 2/11): route otherwise-silent failures into the toast system.
@@ -3708,22 +4559,13 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   });
 
   // ---------- runtime + worker ----------
-  // ITEM 15: on interactive launches, DEFER tryStartWorker (libchudware dlopen +
-  // OCCT + daemon hello) off the pre-loop path so the first frames can paint
-  // chrome and become interactive. Shot/scenario mode still boots synchronously
-  // so captures stay deterministic.
-  // Every desktop platform routes through tryStartWorker: the managed worker
-  // first, then the in-process C++ core (libchudware), and only if both are
-  // unavailable one automatic runtime setup. A missing managed runtime must not
-  // keep a loadable libchudware from serving the session or a headless capture.
-  if (shot) {
-    st.tryStartWorker();
-  } else {
-    st.workerBootPending = true;
-    st.startupPhase = "Starting engine\xe2\x80\xa6";
-    st.status = "Starting engine...";
-    st.statusKind = 0;
-  }
+  // Wait for the final backend verdict before spawning the managed worker: it
+  // must inherit the same daemon/in-process pin. Both native shots and interactive
+  // launches paint while connect/spawn/hello runs on the connection worker.
+  st.workerBootPending = true;
+  st.startupPhase = "Starting engine\xe2\x80\xa6";
+  st.status = "Starting engine...";
+  st.statusKind = 0;
 
   // NOTE: the old "welcome model" (mounting_plate.stl into the bare renderer)
   // is gone — it contradicted the empty Part1 document (a mesh with no tree
@@ -3760,23 +4602,15 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   st.wantPick = shot && shotMode && std::strcmp(shotMode, "pick") == 0;
   st.wantRibbon = shot && shotMode && std::strcmp(shotMode, "ribbon") == 0;
 #ifndef __EMSCRIPTEN__
-  if (shot && shotMode &&
-      (std::strcmp(shotMode, "update_available") == 0 ||
-       std::strcmp(shotMode, "update_mandatory") == 0)) {
-    const bool mandatory = std::strcmp(shotMode, "update_mandatory") == 0;
+  if (shot && shotMode && std::strcmp(shotMode, "update_available") == 0) {
     chudware::update::Snapshot update;
-    update.state = mandatory ? chudware::update::State::Mandatory
-                             : chudware::update::State::Available;
+    update.state = chudware::update::State::Available;
     update.version = "1.2.0";
-    update.message = mandatory
-                         ? "Chudware 1.1.0 or newer is required"
-                         : "Update available \xe2\x80\x94 1.2.0";
+    update.message = "Update available \xe2\x80\x94 1.2.0";
     update.downloadUrl = "https://github.com/Hunter-124/Chudware/releases/tag/v1.2.0";
-    update.mandatory = mandatory;
     chudware::update::globalUpdater().setTestSnapshot(std::move(update));
-    std::printf("[update-shot] mode=%s chip=Update-%s-1.2.0 auto_modal=%d\n",
-                shotMode, mandatory ? "required" : "available",
-                mandatory ? 1 : 0);
+    std::printf("[update-shot] mode=%s chip=Update-available-1.2.0 auto_modal=0\n",
+                shotMode);
     std::fflush(stdout);
   }
 #endif
@@ -3875,7 +4709,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     st.leftPaneTab = AppState::LP_Simulation;
   }
   st.wantCam = shot && shotMode &&
-               std::strcmp(shotMode, "cam") == 0; // CAM copilot fast-path
+               std::strcmp(shotMode, "cam") == 0; // CAM workspace scenario
   if (st.wantCam) {
     st.showRibbon = true;
     st.ribbonTab = AppState::RT_Manufacture;
@@ -3982,6 +4816,29 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     seedRevengCanned("re_canned_cap", "Bracket scan (canned)", "capturing", 3);
     ui::reveng::S().stage = ui::reveng::Stage::Source;
   }
+  // CHUDWARE_SHOT=reveng_reference: the From-reference intake with a canned
+  // existing-model search (demo rows, shot-only) and the Summary column pinned
+  // open, so the search-first layout can be verified headlessly.
+  if (shot && shotMode && std::strcmp(shotMode, "reveng_reference") == 0) {
+    st.showRibbon = true;
+    st.activeWorkspace = AppState::Workspace::ReverseEng;
+    seedRevengCanned("re_canned_ref", "MG996R servo (canned)", "capturing", 0);
+    auto &rs = ui::reveng::S();
+    rs.sessions.back().lane = "reference";
+    rs.stage = ui::reveng::Stage::Source;
+    rs.sourceMode = ui::reveng::SourceMode::Reference;
+    rs.laneChosenFor = "re_canned_ref";
+    rs.propsIntent = ui::reveng::ColumnIntent::Expanded;
+    std::snprintf(rs.ref.queryBuf, sizeof(rs.ref.queryBuf), "%s", "MG996R servo");
+    rs.ref.searched = true;
+    rs.ref.sitesSearched = 22;
+    rs.ref.candidates = {
+        {"Servo MG996R", "grabcad", "https://grabcad.com/library/servo-mg996r-10", "weak"},
+        {"MG996R servo motor", "grabcad", "https://grabcad.com/library/mg996r-servo-motor-4", "weak"},
+        {"MG996R/MG995/DS3115 Servo Base Bracket", "grabcad",
+         "https://grabcad.com/library/mg996r-mg995-ds3115-servo-base-bracket-1", "weak"},
+    };
+  }
   // CHUDWARE_SHOT=reveng_scale: Scale stage with a canned session.
   if (shot && shotMode && std::strcmp(shotMode, "reveng_scale") == 0) {
     st.showRibbon = true;
@@ -4022,9 +4879,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   }
   // RE-40 note: the reveng_* family used to need its own workspace re-assert here. The
   // generic shot pin below (AppState::shotWorkspacePin) now covers every scenario.
-  // CHUDWARE_SHOT=parts: open the Parts Library workspace with a synthetic
-  // no-model result row so the "Generate 3D model" action (RE-32) is visible in
-  // the shot.
+  // CHUDWARE_SHOT=parts: capture the real Parts Library browse; optional
+  // CHUDWARE_PARTS_SHOT_VIEW=grid|list and CHUDWARE_PARTS_SHOT_SELECT=<row>
+  // choose the result view and open a real result's detail drawer.
   if (shot && shotMode && std::strcmp(shotMode, "parts") == 0) {
     st.showRibbon = true;
     st.activeWorkspace = AppState::Workspace::PartsLibrary;
@@ -4348,6 +5205,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   const bool shotChatContext =
       shot && shotModeEnv && std::strcmp(shotModeEnv, "chat_context") == 0;
   int chatContextBoundAt = -1;  // frame the chat_context chips were bound to a live doc
+  bool chatContextCreateTried = false;
   auto shotContextChip = [](const char* kind, const char* id, const char* label,
                             const char* type, nlohmann::json selector) {
     core::ContextRef r;
@@ -4537,6 +5395,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   // so a chat shot always shows the scenario it names.
   const std::vector<ChatMsg> shotChatSeed = st.chat;
 
+#ifndef __EMSCRIPTEN__
   // Scripted screenshot/test scenarios
   // (CHUDWARE_SHOT=m1/sketch/asm/fea/evalmass/activity): the six step machines +
   // their per-step backbuffer captures, extracted to ui::ScenarioRunner
@@ -4544,9 +5403,11 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   // endFrame() handles the captures and the scenario-driven swap+continue /
   // swap+break at loop bottom.
   ui::ScenarioRunner scenarios;
+#endif
 
   auto desiredThemeForFrame = [&st]() {
-    if (const char *envTheme = std::getenv("CHUDWARE_THEME")) {
+    static const char *envTheme = std::getenv("CHUDWARE_THEME");
+    if (envTheme) {
       if (std::strcmp(envTheme, "light") == 0)
         return ui::Theme::Light;
       if (std::strcmp(envTheme, "dark") == 0)
@@ -4593,13 +5454,71 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     shotExitCode = 1;
   };
 
+  // Enable exact full-run capture before the first recorded frame, including setup.
+  if (shot && shotMode && std::strcmp(shotMode, "frameperf") == 0) {
+    const char *repo = std::getenv("CHUDWARE_REPO");
+    core::framestats::setOutputPath(std::string(repo ? repo : ".") +
+                                    "/scratch/frameperf/framestats.json");
+  }
+
+  st.rpc.setWakeCallback(ui::anim::wakeLoop);
+  st.authRpc.setWakeCallback(ui::anim::wakeLoop);
+  st.rpc.setPrimaryCaller([](const std::string &method, const nlohmann::json &params,
+                            nlohmann::json &result, std::string &err, int timeoutMs,
+                            const std::atomic<bool> &cancelled) {
+    if (cancelled.load()) {
+      err = "aborted";
+      return false;
+    }
+    if (auto *client = engine::client())
+      return client->call(method, params, result, err, timeoutMs, {}, &cancelled);
+    err = "primary engine connection is unavailable";
+    return false;
+  });
+  int postInputFrames = 0;
+  bool quitAfterPendingEdits = false;
   WASM_BOOT_LOG("[wasm-boot] entering main loop\n");
-  while (!glfwWindowShouldClose(win)) {
+  for (;;) {
+    if (quitAfterPendingEdits && !st.hasPendingHumanMutations()) {
+      quitAfterPendingEdits = false;
+      glfwSetWindowShouldClose(win, GLFW_TRUE);
+    }
+    // Unsaved-changes guard on exit, at the loop HEAD so it sees every close
+    // request before the loop can end: the title-bar X and File > Quit set
+    // glfwSetWindowShouldClose mid-frame (after any check in the body, so a
+    // mid-body guard let them quit silently and discard unsaved parts), the
+    // window manager / Alt+F4 during event polling. If any document has unsaved
+    // edits and the user hasn't already confirmed, cancel the close and raise
+    // the exit confirmation modal. A clean session (or an already-confirmed
+    // quit) falls straight through and the loop exits.
+    if (glfwWindowShouldClose(win)) {
+      if (!shot && st.hasPendingHumanMutations()) {
+        glfwSetWindowShouldClose(win, GLFW_FALSE);
+        quitAfterPendingEdits = true;
+        // A newly accepted edit must be assessed after it settles, even if a
+        // previous save/discard decision was already confirmed.
+        st.quitConfirmed = false;
+      } else if (!shot && !st.quitConfirmed) {
+        const bool anyDirty = std::any_of(st.docTabs.begin(), st.docTabs.end(),
+                                          [](const auto &t) { return t.dirty; });
+        // In-flight copilot runs get their own prompt before the dirty-doc modal.
+        if (st.anyRunActive()) {
+          glfwSetWindowShouldClose(win, GLFW_FALSE);
+          st.wantQuitAgentConfirm = true;
+        } else if (anyDirty) {
+          glfwSetWindowShouldClose(win, GLFW_FALSE);
+          st.wantQuitConfirm = true;
+        }
+      }
+      if (glfwWindowShouldClose(win))
+        break;
+    }
+    core::framestats::Frame frameTiming;
 #ifdef __EMSCRIPTEN__
     const bool engineTickAllowed = true;
 #else
-    // daemonMode() initializes and connects on first use. Even the legacy
-    // handoff check must wait until the native shell has actually been swapped.
+    // Connection startup is asynchronous. Bootstrap and the legacy handoff
+    // check still wait until the interactive native shell has been swapped.
     const bool engineTickAllowed = shot || s_nativeStartup.firstFramePresented;
 #endif
 #ifdef __EMSCRIPTEN__
@@ -4652,10 +5571,17 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // First frames: minimal paint only — full UI path is too deep for ASYNCIFY
     // until the rewind stack has settled after a few yields.
     if (s_wasmFrames <= 2) {
-      glfwPollEvents();
-      ImGui_ImplOpenGL3_NewFrame();
-      ImGui_ImplGlfw_NewFrame();
-      ImGui::NewFrame();
+      {
+        core::framestats::Scope timing("event_wait");
+        glfwPollEvents();
+        core::framestats::markWait(timing.elapsedMs());
+      }
+      {
+        core::framestats::Scope timing("imgui_new_frame");
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+      }
       ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Always);
       ImGui::Begin("Chudware WASM", nullptr,
                    ImGuiWindowFlags_AlwaysAutoResize |
@@ -4663,47 +5589,72 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       ImGui::Text("Chudware WASM boot — frame %d", s_wasmFrames);
       ImGui::Text("ASYNCIFY warmup (full UI next)");
       ImGui::End();
-      ImGui::Render();
+      {
+        core::framestats::Scope timing("imgui_render");
+        ImGui::Render();
+      }
       int dw = 0, dh = 0;
       glfwGetFramebufferSize(win, &dw, &dh);
       glViewport(0, 0, dw, dh);
       glClearColor(0.07f, 0.09f, 0.11f, 1.0f);
       glClear(GL_COLOR_BUFFER_BIT);
-      ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-      glfwSwapBuffers(win);
+      {
+        core::framestats::Scope timing("imgui_draw");
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+      }
+      swapFrameBuffers(win);
       emscripten_sleep(0);
       continue;
     }
     wasmDrainHudCommands(st);
 #endif
-    // Idle render throttle. When nothing needs continuous redraw (no
-    // animation, no async RPCs, no camera tween, no headless shot), wait up to
-    // 50ms for an event instead of spinning at full vsync and burning a core.
-    // Input still wakes immediately. CEF's pump_if_due below still runs every
-    // frame after wait; when browsers are live the 20 Hz floor is enough for
-    // its deadline path, and note_browser_* still forces work.
-    //
-    // ui::anim::consumeFrameRequest() is the GENERAL hook: any painter that is
-    // mid-motion calls ui::anim::requestFrames() while it draws, and this reads
-    // and clears the flag once per frame. It must be consumed unconditionally
-    // (not short-circuited behind the other terms) or a busy frame would leave a
-    // stale request behind and pin the loop awake after the motion stopped.
-    // st.animActive stays separate: it is the 3D CAD camera tween's own flag and
-    // doc_tabs.cpp clears it on tab switches, so it is not a general-purpose pump.
+    // Interactive motion polls; ambient painters renew deadlines without pinning vsync.
+    // Consume requests unconditionally so a separate busy source cannot leave stale flags.
     {
+      ImGuiContext *ctx = ImGui::GetCurrentContext();
+      if (ctx->InputEventsQueue.Size > 0)
+        postInputFrames = 3;
       const bool wantFrames = ui::anim::consumeFrameRequest();
-      const bool busy = wantFrames || st.animActive || st.rebuildsInFlight > 0 ||
-                        st.rpc.busy() || (st.simClient && st.simClient->busy());
-      if (busy || shot || !engineTickAllowed) {
-        glfwPollEvents();
-      } else {
+      if (st.simClient && st.simClient->busy())
+        ui::anim::requestFramesAt(15.0f);
+      const double ambientWait = ui::anim::consumeAmbientWait();
+      const bool busy = wantFrames || postInputFrames > 0 || st.animActive ||
+                        st.rebuildsInFlight > 0 || st.rpc.interactionBusy();
+      core::framestats::Scope timing("event_wait");
 #ifdef __EMSCRIPTEN__
-        glfwPollEvents(); // wait-timeout can stall under PROXY_TO_PTHREAD +
-                          // contrib.glfw3
+      (void)ambientWait;
+      (void)busy;
+      core::framestats::setIdle(false); // browser waits stall PROXY_TO_PTHREAD + contrib.glfw3
+      glfwPollEvents();
 #else
-        glfwWaitEventsTimeout(0.05);
-#endif // 20 Hz idle floor
+      const bool hidden = !shot && (chrome::iconified(win) ||
+                                   !glfwGetWindowAttrib(win, GLFW_VISIBLE));
+      double waitSeconds = ambientWait;
+      bool poll = busy || shot || !engineTickAllowed;
+#ifdef CHUDWARE_ENABLE_CEF
+      const int cefDueMs = ui::cef::msUntilDue();
+      if (cefDueMs >= 0)
+        waitSeconds = std::min(waitSeconds, static_cast<double>(cefDueMs) * 0.001);
+#endif
+      // A minimized swap is not guaranteed to block, even if an animation/job is active.
+      if (hidden) {
+        poll = false;
+        waitSeconds = 0.25;
       }
+      core::framestats::setIdle(!poll);
+      if (poll || waitSeconds <= 0.0)
+        glfwPollEvents();
+      else
+        glfwWaitEventsTimeout(waitSeconds);
+#endif
+      core::framestats::markWait(timing.elapsedMs());
+      // Empty events posted by background workers wake delivery, not three vsync frames.
+      // Input (including ImGui's trickled press/release queue) does need settle frames.
+      if (ctx->InputEventsQueue.Size > 0)
+        postInputFrames = 3;
+      else if (postInputFrames > 0)
+        --postInputFrames;
+      ui::anim::beginFrame();
     }
 #ifndef __EMSCRIPTEN__
     // A second launch stood down and handed us its turn (single-instance guard, main.cpp). The
@@ -4726,7 +5677,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     }
 #endif
 #ifdef CHUDWARE_ENABLE_CEF
-    ui::cef::pump_if_due(); // drive CEF's message loop when its deadline is due
+    {
+      core::framestats::Scope timing("cef");
+      ui::cef::pump_if_due(); // drive CEF's message loop when its deadline is due
+    }
     {
       static const char *dbgVendor = std::getenv("CHUDWARE_DEBUG_CEF_VENDOR");
       static long dbgFrame = 0;
@@ -4745,35 +5699,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // Borderless-window chrome: drag / edge-resize / double-click-maximize off
     // the same title-bar HitLayout the GUI publishes. No-op on Windows (the
     // WndProc handles it).
-    chrome::tick(win, &hitLayout);
-
-    // Unsaved-changes guard on exit. A close request (title-bar X / Alt+F4 /
-    // File > Quit all set glfwSetWindowShouldClose) is intercepted here: if any
-    // document has unsaved edits and the user hasn't already confirmed, cancel
-    // the close and raise the exit confirmation modal. A clean session (or an
-    // already-confirmed quit) falls straight through and the loop exits.
-    if (!shot && glfwWindowShouldClose(win) && !st.quitConfirmed) {
-      bool anyDirty = false;
-      for (const auto &t : st.docTabs)
-        // Only warn about USER-owned docs: a doc the user created/opened, or an
-        // AI mirror they adopted by editing. Pure AI mirror tabs are excluded —
-        // the agent owns their save discipline, and any unsaved AI work is
-        // preserved by the daemon's recovery tier, so nagging the user about
-        // them would be a false positive.
-        if (t.dirty && (!t.aiHandoff || t.userAdopted)) {
-          anyDirty = true;
-          break;
-        }
-      // In-flight copilot runs get their own prompt FIRST (Continue in
-      // background / Stop agent & quit); the dirty-doc modal follows when both
-      // apply.
-      if (st.anyRunActive()) {
-        glfwSetWindowShouldClose(win, GLFW_FALSE);
-        st.wantQuitAgentConfirm = true;
-      } else if (anyDirty) {
-        glfwSetWindowShouldClose(win, GLFW_FALSE);
-        st.wantQuitConfirm = true;
-      }
+    {
+      core::framestats::Scope timing("chrome");
+      chrome::tick(win, &hitLayout);
     }
 
     if (st.setupDone.exchange(false)) {
@@ -4808,27 +5736,27 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       ++s_bootDeferFrames;
       const bool bootReady = s_bootDeferFrames >= 2;
 #else
-      const bool bootReady = s_nativeStartup.firstFramePresented;
+      const bool bootReady = (shot || s_nativeStartup.firstFramePresented) &&
+                             !engine::connectionPending();
 #endif
       if (bootReady) {
-        st.workerBootPending = false;
         st.startupPhase = "Warming up kernel\xe2\x80\xa6";
         st.status = "Warming up kernel...";
         st.statusKind = 0;
         st.tryStartWorker();
-        if (st.setupRunning.load()) {
-          st.startupPhase = "Provisioning runtime\xe2\x80\xa6";
-        } else if (st.workerStarted) {
-          if (st.starterTried || st.docMirror.hasDoc() || !st.docTabs.empty() ||
-              st.designStarted)
-            st.startupPhase.clear();
-          else
-            st.startupPhase = "Opening starter part\xe2\x80\xa6";
-        } else {
-          // tryStartWorker already set status / statusKind for the failure
-          // path.
+      }
+    }
+    if (st.pollWorkerStartup()) {
+      if (st.setupRunning.load()) {
+        st.startupPhase = "Provisioning runtime\xe2\x80\xa6";
+      } else if (st.workerStarted) {
+        if (st.starterTried || st.docMirror.hasDoc() || !st.docTabs.empty() ||
+            st.designStarted)
           st.startupPhase.clear();
-        }
+        else
+          st.startupPhase = "Opening starter part\xe2\x80\xa6";
+      } else {
+        st.startupPhase.clear();
       }
     }
 #ifndef __EMSCRIPTEN__
@@ -4851,27 +5779,43 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // C39: deliver finished async worker calls — their callbacks run HERE, on
     // the GL thread, before this frame's panels draw, so results land like any
     // other state.
+    ui::ecadPrimeActiveApp(st);
+    core::framestats::Scope rpcTiming("async_rpc");
     st.rpc.drain();
+    st.authRpc.drain();   // sign-in results/events: their own queue, same GL-thread contract
+    ui::tickMeshReferences(st);
+    // Form-routed picks deferred behind queued engine work resolve once the queue is idle.
+    if (!st.rpc.busy())
+      st.selection.retryDeferred();
     // A chat context chip clicked for another tab selects its entity once that tab is live.
     ui::pumpContextRefFocus(st);
     // Manufacturing panels enqueue intent only. Dispatch after the prior frame's
     // callbacks drain, before hostd events update the read-only mirror.
     ui::dispatchManufactureRequests(st);
+    rpcTiming.stop();
     // Commit mesh loads that finished disk-parse on the loader thread
     // (GL upload only here; stale gens dropped so keep-last-good stays on
     // screen).
-    st.drainMeshLoads();
+    {
+      core::framestats::Scope timing("mesh_loads");
+      st.drainMeshLoads();
+    }
 #ifdef __EMSCRIPTEN__
     // Browser canvas drop → fsUpload → requestOpenPath (set by
     // chudware_web_drop_done).
     drainWebFileDrop(st);
 #endif
-    // Phase 4 (shared engine daemon): drain hostd push events — foreign-edit
-    // mirror refresh, mirror tabs from doc.opened, lease toasts. No-op in
-    // legacy (in-process) mode.
-    if (engineTickAllowed)
+    // Drain document refreshes and shared-engine lifecycle events without changing
+    // the current tab; in-process cache refreshes use the same routing.
+    if (engineTickAllowed) {
+      core::framestats::Scope timing("engine_events");
       core::engineEventsTick(st);
+    }
+    if (engineTickAllowed)
+      ecadHubTick(st);
 #ifndef __EMSCRIPTEN__
+    if (engineTickAllowed)
+      ecadRecoveryTick(st);
     if (engineTickAllowed) {
       if (!s_nativeStartup.daemonConnectedMarked) {
         if (auto *c = engine::client(); c && c->connected()) {
@@ -4917,35 +5861,49 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       }
     }
 
-    // Live-preview monotonic guard: shared by orch_doc.preview consume (below)
-    // and the end-of-run path so we skip the sticky "Refreshing model..." pill
-    // when the mesh is already current (last previewed revision == run final
-    // revision).
-    static int s_lastPreviewRev = 0;
-    static std::string s_lastPreviewDocId;
-
     // Drain streamed agent progress into the running assistant message of the
     // conversation that OWNS each run, so every conversation updates live.
     // Runs are keyed by conversation id: a background conversation's run
     // streams into its own (parked) transcript and never into whatever is on
     // screen.
-    for (auto &[runConvId, runPtr] : st.runs) {
+    core::framestats::Scope agentTiming("agent_events");
+    // Resume at the first unserviced run when the shared budget expires.
+    // Keep an index rather than an iterator because run slots can change
+    // between frames.
+    static size_t nextAgentRun = 0;
+    const size_t agentRunCount = st.runs.size();
+    auto agentRunIt = st.runs.begin();
+    if (agentRunCount != 0) {
+      nextAgentRun %= agentRunCount;
+      for (size_t skipped = 0; skipped < nextAgentRun; ++skipped)
+        ++agentRunIt;
+    }
+    const auto agentDeadline = std::chrono::steady_clock::now() +
+                               std::chrono::milliseconds(2);
+    bool servicedAgentRun = false;
+    for (size_t visited = 0; visited < agentRunCount;
+         ++visited, ++agentRunIt,
+         nextAgentRun = (nextAgentRun + 1) % agentRunCount) {
+      if (agentRunIt == st.runs.end())
+        agentRunIt = st.runs.begin();
+      auto &[runConvId, runPtr] = *agentRunIt;
       if (!runPtr)
         continue;
       JobState &job = *runPtr;
-      std::vector<AgentEvent> evs;
-      {
+      // Stop discards normal rendering; maintenance can still invalidate its
+      // owner's context when the outcome is uncertain or committed.
+      if (job.stopRequested.load() && !job.isCompaction) {
         std::lock_guard<std::mutex> lk(job.evMtx);
-        if (!job.events.empty())
-          evs.swap(job.events);
-      }
-      // The user stopped this run — drop its streamed events so the (finalized)
-      // chat message and status line don't flicker with live progress while the
-      // worker winds down.
-      if (job.stopRequested.load())
-        evs.clear();
-      if (evs.empty())
+        job.events.clear();
         continue;
+      }
+      if (!agentEventsPending(job))
+        continue;
+      if (servicedAgentRun &&
+          std::chrono::steady_clock::now() >= agentDeadline) {
+        ui::anim::requestFrames();
+        break;
+      }
       std::vector<ChatMsg> *msgs = conversationMsgs(st, runConvId);
       ChatMsg *active = nullptr;
       if (msgs) {
@@ -4955,9 +5913,8 @@ int run_gui(const char *screenshotPath, const char *openPath) {
             break;
           }
       }
-      // Viewport, status line and the live-preview trackers are singular app
-      // state: only a run whose document is the one on screen may touch them.
-      // A background run still streams into its own bubble above.
+      // Preview trackers are document-scoped; live status is conversation-scoped.
+      // A background run still streams into its own bubble.
       const bool isViewedDoc =
           !job.docKey.empty() && job.docKey == st.chatDocKey;
       // The context meter is a property of the CONVERSATION, not of a document: a general-lane
@@ -4966,12 +5923,30 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       // pressure matters most. Conversation::lastContextTokens is already per-session, which
       // says the same thing. Scope it to the conversation the user is looking at.
       const bool isViewedConv = runConvId == st.activeConvId();
-      for (auto &e : evs) {
+      Conversation *parkedConv = nullptr;
+      if (!isViewedConv)
+        for (auto &conv : st.conversations)
+          if (conv.id == runConvId) {
+            parkedConv = &conv;
+            break;
+          }
+      AgentEvent e;
+      size_t drained = 0;
+      servicedAgentRun = true;
+      // At least one event advances even if setup used the remaining budget.
+      while (drained < 16 &&
+             (drained == 0 || std::chrono::steady_clock::now() < agentDeadline) &&
+             takeAgentEvent(job, e)) {
+        ++drained;
+        if (job.stopRequested.load() && e.kind != "orch_agent.context")
+          continue;
         // --- route orchestrator events to the Agent Workflow DAG store ---
         if (e.kind.rfind("orch_", 0) == 0) {
           std::string orchKind = e.kind.substr(5); // strip "orch_"
           try {
-            nlohmann::json data = nlohmann::json::parse(e.text);
+            if (!e.data)
+              continue;
+            const nlohmann::json &data = *e.data;
             // Phase 2 (M9/M10): feed the owning conversation's Agent Workflow
             // DAG store. Keyed by runConvId, so every chat builds its OWN
             // execution trace and two concurrent runs never blank or hijack
@@ -4981,15 +5956,29 @@ int run_gui(const char *screenshotPath, const char *openPath) {
             // trunk turn). GL-thread only; the stores are plain statics in
             // ai_workspace.cpp.
             ui::feedAgentDagEvent(runConvId, orchKind, data);
-            ui::activeWorkFeedEvent(orchKind, data);
+            ui::activeWorkFeedEvent(runConvId, orchKind, data);
             // Fold the event into the running turn's inline activity timeline
             // so the conversation transparently shows what the AI is
             // doing/thinking. ask_user questions/answers become question
             // cards instead; an answer can resolve a batch in an OLDER
             // bubble (a composer reply split the turn), so it needs msgs.
+            bool steerEvent = false;
             const bool askEvent =
                 msgs && (feedAskEvent(*msgs, active, orchKind, data) ||
-                         feedSteerEvent(*msgs, orchKind, data));
+                         (steerEvent = feedSteerEvent(*msgs, orchKind, data)));
+            // A steer the agent just read marks a point of the run: the transcript closes the
+            // live message there and opens a fresh one under the steer's bubble. The vector
+            // grew, so every pointer into it is stale — re-find the live message, and the rest
+            // of this batch streams below the bubble.
+            if (steerEvent && data.contains("steer_id") && data["steer_id"].is_string() &&
+                ui::placeSteerInTranscript(st, *msgs, data["steer_id"].get<std::string>())) {
+              active = nullptr;
+              for (auto it = msgs->rbegin(); it != msgs->rend(); ++it)
+                if (!it->fromUser && it->running) {
+                  active = &(*it);
+                  break;
+                }
+            }
             if (!askEvent && active)
               feedTurnActivity(*active, orchKind, data);
             // Context meter. THREE sources, one per lane — do not collapse:
@@ -5007,8 +5996,8 @@ int run_gui(const char *screenshotPath, const char *openPath) {
             //   * agent_output (C++ agent lane): tokens.in fallback — C++
             //     agent_output usually has tokens:null, so agent_call is
             //     preferred, but honour a real number when one arrives.
-            // Viewed doc only — the meter and the preview trackers describe
-            // the document the user is looking at.
+            // The meter belongs to the run's conversation; preview trackers belong to the
+            // currently viewed document.
             //
             // ONE reset point: run_started opens every run on both lanes (the
             // live Python general lane emits it first, then thinking/tool rows
@@ -5025,54 +6014,51 @@ int run_gui(const char *screenshotPath, const char *openPath) {
             // 1000000. An absent/empty key is treated as heuristic, so an
             // older worker degrades safely.
             if (orchKind == "run_started") {
-              if (isViewedConv) {
-                st.lastContextTokens = 0;
-                st.lastContextWindow = 0;
-                ui::setContextWindowSource(std::string());
-              }
-              if (isViewedDoc) {
-                // Preview trackers ARE document state — they stay doc-scoped.
-                s_lastPreviewRev = 0;
-                s_lastPreviewDocId.clear();
-              }
+              ui::storeConversationContext(st.lastContextTokens, st.conversations,
+                                           isViewedConv, runConvId, 0);
+              ui::storeConversationWindow(st.lastContextWindow, st.lastContextWindowSource,
+                                          st.conversations, isViewedConv, runConvId, 0, {});
             } else if (orchKind == "agent.context") {
-              if (isViewedConv) {
-                if (data.contains("used") && data["used"].is_number_integer()) {
-                  int used = data["used"].get<int>();
+              if (data.contains("used") &&
+                  (data["used"].is_null() || data["used"].is_number_integer())) {
+                int stored = -1;  // OMP has no post-compaction occupancy yet.
+                if (data["used"].is_number_integer()) {
+                  const int used = data["used"].get<int>();
                   if (used >= 0)
-                    st.lastContextTokens = used;
+                    stored = data.value("source", std::string()) == "estimate"
+                                 ? ui::storedContextEstimate(used) : ui::storedContextMeasurement(used);
+                  else
+                    continue;
                 }
-                if (data.contains("window") &&
-                    data["window"].is_number_integer()) {
-                  int win = data["window"].get<int>();
-                  if (win > 0) {
-                    st.lastContextWindow = win;
-                    // Provenance travels WITH the window it describes, so the
-                    // meter can never pair a new number with a stale source.
-                    ui::setContextWindowSource(
-                        data.value("window_source", std::string()));
-                  }
-                }
+                ui::storeConversationContext(st.lastContextTokens, st.conversations,
+                                             isViewedConv, runConvId, stored);
+              }
+              if (data.contains("window") && data["window"].is_number_integer()) {
+                const int win = data["window"].get<int>();
+                if (win > 0)
+                  ui::storeConversationWindow(
+                      st.lastContextWindow, st.lastContextWindowSource, st.conversations,
+                      isViewedConv, runConvId, win, data.value("window_source", std::string()));
               }
             } else if (orchKind == "agent.session") {
-              // The Chudcode resume key, sent as the turn starts. Persist it now: the old
+              // The Omp resume key, sent as the turn starts. Persist it now: the old
               // post-turn doctor capture never ran when the daemon died mid-turn
               // (2026-09-27, c217), leaving a 2-hour session unresumable.
 #ifdef __EMSCRIPTEN__
               const auto handle = cellAgentSessionHandle(runConvId);
               if (!handle.empty()) {
-                ui::ChudcodeSessionLink &link = ui::chudcodeSessionLinkEnsure(runConvId);
+                ui::OmpSessionLink &link = ui::ompSessionLinkEnsure(runConvId);
                 link.sessionId = handle;
                 link.sessionFile.clear();
                 ui::persistChatHistory(st);
               }
 #else
-              const std::string file = data.value("chudcode_session_file", std::string());
+              const std::string file = data.value("omp_session_file", std::string());
               if (!file.empty()) {
-                ui::ChudcodeSessionLink &link = ui::chudcodeSessionLinkEnsure(runConvId);
+                ui::OmpSessionLink &link = ui::ompSessionLinkEnsure(runConvId);
                 if (link.sessionFile != file) {
                   link.sessionFile = file;
-                  const std::string sid = data.value("chudcode_session_id", std::string());
+                  const std::string sid = data.value("omp_session_id", std::string());
                   if (!sid.empty())
                     link.sessionId = sid;
                   ui::persistChatHistory(st);
@@ -5086,14 +6072,16 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                 est = data["context_tokens_est"].get<int>();
               if (est <= 0)
                 est = data.value("context_tokens_est", 0);
-              if (est > 0 && isViewedDoc)
-                st.lastContextTokens = std::max(st.lastContextTokens, est);
+              if (est > 0)
+                ui::storeConversationContextPeak(st.lastContextTokens, st.conversations,
+                                                 isViewedConv, runConvId, est);
             } else if (orchKind == "agent_output" &&
                        data.contains("tokens") &&
                        data["tokens"].is_object()) {
               int in = data["tokens"].value("in", 0);
-              if (in > 0 && isViewedDoc)
-                st.lastContextTokens = in;
+              if (in > 0)
+                ui::storeConversationContext(st.lastContextTokens, st.conversations,
+                                             isViewedConv, runConvId, in);
             } else if (orchKind == "part_named") {
               // Naming stage: stash the AI-chosen part name for the
               // run-finish path (title refresh + auto-save). Result part_name
@@ -5119,60 +6107,80 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                   ui::plmAutoRecordSave(st, p);
               }
             } else if (orchKind == "doc.preview") {
-              // Live viewport preview: agent successfully applied ops.
-              // data = {doc_id, revision, aicm_path}. Monotonic rev guard +
-              // mid-edit skip (same gate as engine_events doc.changed). The
-              // prevDocId == docMirror.docId() test below is the real view
-              // gate here — a background run's doc is never the active mirror.
+              // A preview can only be paired with the exact tree revision on screen.
               const std::string prevDocId =
                   data.value("doc_id", std::string());
               const int prevRev = data.value("revision", 0);
               const std::string aicm = data.value("aicm_path", std::string());
-              if (prevDocId != s_lastPreviewDocId) {
-                s_lastPreviewDocId = prevDocId;
-                s_lastPreviewRev = 0;
-              }
               const bool midEdit =
                   (st.sketchMode && st.sketchMode->active()) ||
+                  (st.sketch3dMode && st.sketch3dMode->active()) ||
                   (st.propertyManager && st.propertyManager->active());
               // Match the run's target: active DocMirror doc (launch always
               // targets the then-active doc; switching away must not
               // clobber).
-              if (!midEdit && !prevDocId.empty() &&
+              if (!midEdit && !prevDocId.empty() && st.isActiveMirrorDoc() &&
                   prevDocId == st.docMirror.docId() &&
-                  prevRev > s_lastPreviewRev && !aicm.empty()) {
-                s_lastPreviewRev = prevRev;
-                st.loadDocMeshAsync(aicm);
-                st.livePhase =
+                  prevRev == st.docMirror.revision() && !aicm.empty() &&
+                  (st.committedMeshDocId != prevDocId || st.committedMeshRevision != prevRev)) {
+                st.loadDocMeshAsync(aicm, false, true, true, true);
+                const std::string phase =
                     "Building\xe2\x80\xa6 rev " + std::to_string(prevRev);
+                if (isViewedConv)
+                  st.livePhase = phase;
+                else if (parkedConv)
+                  parkedConv->viewLivePhase = phase;
                 if (active)
-                  active->liveStatus = st.livePhase;
+                  active->liveStatus = phase;
               }
             }
           } catch (...) {
           }
           // Also update the compact status line in the chat
-          if (!e.notes.empty()) {
-            if (isViewedDoc)
+          const bool terminalNote =
+              e.data && ((orchKind == "sub_run" &&
+                          e.data->value("status", std::string()) != "running" &&
+                          e.data->value("status", std::string()) != "started") ||
+                         orchKind == "run_finished" ||
+                         (orchKind == "status" &&
+                          (e.data->value("phase", std::string()) == "error" ||
+                           e.data->value("phase", std::string()) == "failed" ||
+                           e.data->value("phase", std::string()) == "cancelled")));
+          if (!e.notes.empty() && !terminalNote) {
+            if (isViewedConv)
               st.agentV2Status = e.notes;
-            if (active)
+            else if (parkedConv)
+              parkedConv->viewAgentV2Status = e.notes;
+            if (active && active->running)
               active->liveStatus = e.notes;
           }
         }
       }
+      if (agentEventsPending(job))
+        ui::anim::requestFrames();
     }
 
     // A finished run belongs to ITS conversation. Walk every run slot and route
     // each completed run's final text / plan gate / error card into the
-    // conversation it was launched from. Viewport, tab and status-bar state is
-    // singular, so only a run whose document is the one on screen may touch it.
+    // conversation it was launched from. Viewport and tab state is document-scoped;
+    // chat status belongs to the conversation that owns the run.
     for (auto &[runConvId, runPtr] : st.runs) {
-      if (!runPtr || !runPtr->ready.exchange(false))
+      // Finalization must follow every queued stream event, even across frames.
+      if (!runPtr || agentEventsPending(*runPtr) || !runPtr->ready.exchange(false))
         continue;
       JobState &job = *runPtr;
       std::lock_guard<std::mutex> lk(job.mtx);
-      const bool isViewedDoc =
-          !job.docKey.empty() && job.docKey == st.chatDocKey;
+      const bool isViewedDoc = !job.runDocId.empty()
+          ? st.isActiveMirrorDoc() && st.docMirror.docId() == job.runDocId
+          : (!job.docKey.empty() && job.docKey == st.chatDocKey);
+      const bool isViewedConv = runConvId == st.activeConvId();
+      Conversation *parkedConv = nullptr;
+      if (!isViewedConv)
+        for (auto &conv : st.conversations)
+          if (conv.id == runConvId) {
+            parkedConv = &conv;
+            break;
+          }
       std::vector<ChatMsg> *msgsPtr = conversationMsgs(st, runConvId);
       // The turn is over: a question it asked can no longer be answered.
       if (msgsPtr) {
@@ -5182,17 +6190,124 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         if (!job.stopRequested.load() && job.stopReason != "cancelled")
           settleOpenSteers(*msgsPtr);
       }
-      // The status line is viewport-singular — a background run must never
-      // repaint it for the document the user is actually looking at.
       auto setStatus = [&](const char *text, int kind) {
-        if (!isViewedDoc)
-          return;
-        st.status = text;
-        st.statusKind = kind;
+        if (isViewedConv) {
+          st.status = text;
+          st.statusKind = kind;
+        } else if (parkedConv) {
+          parkedConv->viewStatus = text;
+          parkedConv->viewStatusKind = kind;
+        }
       };
-      if (isViewedDoc) {
+      if (isViewedConv) {
         st.livePhase.clear();
         st.agentV2Status.clear();
+      } else if (parkedConv) {
+        parkedConv->viewLivePhase.clear();
+        parkedConv->viewAgentV2Status.clear();
+      }
+      if (job.isCompaction) {
+        // Maintenance never adopts/refreshes documents, invents answer prose, or asks for a plan.
+        // isViewedConv also controls the receipt's conversation-owned context.
+        ChatMsg* compactionMessage = nullptr;
+        if (msgsPtr) for (auto it = msgsPtr->rbegin(); it != msgsPtr->rend(); ++it)
+          if (!it->fromUser && it->compactionRun) {
+            compactionMessage = &*it;
+            break;
+          }
+        const bool committed = ui::applyCommittedCompactionReceipt(
+            job.compactionTurn, st.lastContextTokens, st.conversations,
+            isViewedConv, runConvId, compactionMessage);
+        const std::string outcome = jstr(job.compactionTurn, "outcome");
+        const bool stopped = !committed && (outcome == "cancelled" ||
+            (outcome.empty() && (job.stopRequested.load() || job.stopReason == "cancelled")));
+        const bool skipped = !committed &&
+                             (outcome == "skipped" || (outcome.empty() && job.stopReason == "skipped"));
+        const nlohmann::json& compaction =
+            job.compactionTurn.contains("compaction") &&
+                    job.compactionTurn["compaction"].is_object()
+                ? job.compactionTurn["compaction"] : job.compactionTurn;
+        std::string notice;
+        if (stopped) {
+          notice = "Compaction stopped.";
+        } else if (skipped) {
+          notice = "Compaction skipped; the context was not changed.";
+        } else if (committed) {
+          notice = compactionNotice(compaction);
+        } else {
+          std::string reason = !job.errorDetail.empty() ? job.errorDetail
+                               : !job.error.empty() ? job.error
+                               : job.stopReason.empty() ? "Compaction failed" : job.stopReason;
+          if (reason.find("worker_lane_busy") != std::string::npos ||
+              reason.find("worker lane busy") != std::string::npos)
+            reason = "Available when the current run finishes.";
+          notice = "Couldn't compact this conversation: " + reason;
+          if (isViewedConv) st.toast(ui::ToastLevel::Warn, notice);
+          ui::restoreUnsentForConversation(st, runConvId, job.docKey, job.compactionCommand);
+        }
+        setStatus(stopped ? "Compaction stopped."
+                          : skipped ? "Compaction skipped."
+                          : committed ? "Context compacted." : "Compaction failed.",
+                  committed ? 0 : 1);
+        // A resumed maintenance session remains live, including when no agent.session event landed.
+#ifdef __EMSCRIPTEN__
+        if (const std::string handle = cellAgentSessionHandle(runConvId); !handle.empty()) {
+          auto& link = ui::ompSessionLinkEnsure(runConvId);
+          link.sessionId = handle;
+          link.sessionFile.clear();
+          link.runtimeLive = true;
+        }
+#else
+        if (const std::string file = jstr(job.compactionTurn, "omp_session_file");
+            !file.empty()) {
+          auto& link = ui::ompSessionLinkEnsure(runConvId);
+          link.sessionFile = file;
+          const std::string sessionId = jstr(job.compactionTurn, "omp_session_id");
+          if (!sessionId.empty()) link.sessionId = sessionId;
+          link.runtimeLive = true;
+        }
+#endif
+        if (job.compactionTurn.contains("omp_runtime_live") &&
+            job.compactionTurn["omp_runtime_live"].is_boolean())
+          ui::ompSessionLinkEnsure(runConvId).runtimeLive =
+              job.compactionTurn["omp_runtime_live"].get<bool>();
+        if (compactionMessage) {
+          ui::settleCompactionMessage(*compactionMessage, stopped ? "cancelled"
+                                        : skipped || committed ? "interrupted" : "failed");
+          ActivityItem* row = nullptr;
+          for (auto& item : compactionMessage->activity)
+            if (item.rowKind == 17 && item.stage.find("compaction:") != std::string::npos) {
+              row = &item;
+              break;
+            }
+          if (!row) {
+            ActivityItem item;
+            item.rowKind = 17;
+            item.stage = "subrun:compaction:" + job.runId;
+            compactionMessage->activity.push_back(std::move(item));
+            row = &compactionMessage->activity.back();
+          }
+          row->status = committed ? "done" : stopped ? "cancelled" : skipped ? "skipped" : "fail";
+          row->title = committed ? "Context compacted" : stopped ? "Compaction stopped"
+                       : skipped ? "Compaction skipped" : "Context compaction failed";
+          row->reason.clear();
+          row->streaming = false;
+          ++row->revision;
+          compactionMessage->errKind = ERR_NONE;
+          compactionMessage->errorHuman.clear();
+          compactionMessage->errorFull.clear();
+          compactionMessage->planApprovePending = false;
+          compactionMessage->text = std::move(notice);
+          ++compactionMessage->revision;
+        }
+        job.stopRequested = false;
+        job.runId.clear();
+        st.agentV2Running = st.anyRunActive();
+        st.addLog(stopped ? "[..] /compact stopped"
+                         : skipped ? "[..] /compact skipped"
+                         : committed ? "[..] /compact ok" : "[..] /compact failed");
+        ui::persistChatHistory(st);
+        continue;
       }
       if (job.stopRequested.load() || job.stopReason == "cancelled") {
         // The user stopped this run (or engine returned cancel_result after
@@ -5233,45 +6348,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         // refresh the tree and get the latest aicm_path, then load it into the
         // viewport.
         const bool wasV2 = st.agentV2Running;
-        // WS3: a true-assembly run produced a NEW assembly document (its own
-        // .step+) rather than mutating the active doc. Open that file as a
-        // fresh tab via the GL-thread open pump — featureTreeOpenPath detects
-        // the aicad.asm schema and routes the open to the Python worker (the
-        // C++ core rejects opening assemblies by design). The active part doc
-        // was untouched, so we skip the doc_rebuild-on-current-doc below for
-        // this case.
-        const bool openedNewDoc =
-            wasV2 && !job.createdDocPath.empty() && job.error.empty();
-        if (openedNewDoc && isViewedDoc) {
-          st.requestOpenPath = job.createdDocPath;
-          st.addLog("[v2] assembly built -> opening as new tab: " +
-                    job.createdDocPath);
-        }
-        // W17: the run built a 2D drawing — adopt it as a Drawing tab (the
-        // active part was NOT mutated, so we skip the doc_rebuild below).
-        const bool madeDrawing =
-            wasV2 && !job.drawingDocId.empty() && job.error.empty();
-        if (madeDrawing && isViewedDoc) {
-          st.adoptDrawingTab(job.drawingDocId, job.drawingName,
-                             job.drawingSourceId);
-          st.addLog("[v2] drawing built -> opened drawing tab " +
-                    job.drawingDocId);
-          job.drawingDocId.clear();
-        }
-        // CAM fast-path: the run built a machining job from the current part.
-        // Load it into the Manufacture workspace panel and switch to it (the
-        // active part doc was NOT mutated, so the doc_rebuild below is skipped
-        // — same as drawing).
-        const bool madeCam =
-            wasV2 && !job.camDocId.empty() && job.error.empty();
-        if (madeCam && isViewedDoc) {
-          ui::camLoadJob(st, job.camDocId);
-          st.showRibbon = true;
-          st.ribbonTab = AppState::RT_Manufacture;
-          st.addLog("[v2] CAM job built -> opened Manufacture workspace " +
-                    job.camDocId);
-          job.camDocId.clear();
-        }
         // Ground truth, ungated: another conversation may still be working, and
         // a background run finishing must not lie about that either way.
         st.agentV2Running = st.anyRunActive();
@@ -5279,8 +6355,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         // so it only runs when this run's document is the one on screen.
         if (isViewedDoc) {
           // plan_ready mutates nothing — skip doc_activate / mesh reload.
-          if (!job.planReady && !openedNewDoc && !madeDrawing && !madeCam &&
-              st.docMirror.hasDoc() && job.error.empty()) {
+          if (!job.planReady && st.docMirror.hasDoc() && job.error.empty()) {
             // C39: a forced rebuild can take tens of seconds on a heavy doc —
             // the old sync call froze the window right after the agent
             // finished. Queue async; the callback (a later frame's drain, GL
@@ -5292,13 +6367,16 @@ int run_gui(const char *screenshotPath, const char *openPath) {
             // tree).
             const int finalRev = job.finalRevision;
             const bool meshAlreadyCurrent =
-                s_lastPreviewRev > 0 &&
-                s_lastPreviewDocId == st.docMirror.docId() && finalRev > 0 &&
-                s_lastPreviewRev == finalRev;
-            if (!meshAlreadyCurrent)
-              st.livePhase = "Refreshing model...";
-            else
-              st.livePhase.clear();
+                finalRev > 0 && st.committedMeshDocId == st.docMirror.docId() &&
+                st.committedMeshRevision == finalRev;
+            if (isViewedConv) {
+              if (!meshAlreadyCurrent)
+                st.livePhase = "Refreshing model...";
+              else
+                st.livePhase.clear();
+            } else if (parkedConv) {
+              parkedConv->viewLivePhase = meshAlreadyCurrent ? "" : "Refreshing model...";
+            }
             // Multi-document: capture the doc this rebuild targets. If the user
             // switches to another tab before the async result drains, the
             // callback must NOT resync / reload the FOREGROUND doc with this
@@ -5309,45 +6387,91 @@ int run_gui(const char *screenshotPath, const char *openPath) {
             const std::string rebuildDocId = st.docMirror.docId();
             ++st.rebuildsInFlight;
             st.rpc.call(
-                "doc_activate", {{"doc_id", rebuildDocId}},
-                [&st, rebuildDocId,
+                "doc_activate", {{"doc_id", rebuildDocId}, {"origin", "system"}},
+                [&st, rebuildDocId, runConvId, finalRev,
                  meshAlreadyCurrent](const core::RpcResult &r) {
                   --st.rebuildsInFlight;
-                  st.livePhase.clear();
-                  if (st.docMirror.docId() != rebuildDocId) {
+                  if (runConvId == st.activeConvId()) {
+                    if (st.livePhase == "Refreshing model...")
+                      st.livePhase.clear();
+                  } else {
+                    for (auto &conv : st.conversations)
+                      if (conv.id == runConvId && conv.viewLivePhase == "Refreshing model...") {
+                        conv.viewLivePhase.clear();
+                        break;
+                      }
+                  }
+                  if (!st.isActiveMirrorDoc() || st.docMirror.docId() != rebuildDocId) {
+                    core::requireDocMesh(rebuildDocId, finalRev);
                     st.addLog("[v2] doc_rebuild result for " + rebuildDocId +
                               " ignored — active doc changed");
                     return;
                   }
-                  if (r.ok) {
-                    // W1-B (item 6): STALENESS FIX. Reloading the mesh alone
-                    // left the FeatureManager showing PRE-run features. Resync
-                    // (doc_tree — a fast call) pulls the new tree + revision +
-                    // owner map and fires the listener so the tree repaints
-                    // with what the agent built.
-                    st.docMirror.resync(st.worker);
-                    // Naming stage: tree now carries the AI name — refresh tab
-                    // title so viewport + Feature Manager match (path basename
-                    // wins once the auto-save below lands).
+                  if (r.ok && r.result.is_object() && !r.result.contains("code")) {
+                    const int revision = r.result.value("revision", -1);
+                    if (revision >= 0 && revision < st.docMirror.revision())
+                      return;
+                    std::string aicm;
+                    bool usableMesh = false;
+                    if (r.result.contains("tess") && r.result["tess"].is_object() &&
+                        !r.result.contains("mesh_error") &&
+                        !r.result["tess"].contains("mesh_error")) {
+                      const auto &tess = r.result["tess"];
+                      if (tess.contains("aicm_path") && tess["aicm_path"].is_string()) {
+                        aicm = tess["aicm_path"].get<std::string>();
+                        usableMesh = !aicm.empty() ||
+                            (tess.contains("bodies") && tess["bodies"].is_array() &&
+                             tess["bodies"].empty());
+                      }
+                    }
+                    const bool haveMesh = meshAlreadyCurrent && revision == st.committedMeshRevision;
+                    auto admitMesh = [&st, rebuildDocId](int rev, const std::string &mesh,
+                                                         bool usable) {
+                      if (!usable) {
+                        core::requireDocMesh(rebuildDocId, rev);
+                      } else if (!mesh.empty()) {
+                        st.loadDocMeshAsync(mesh);
+                      } else {
+                        st.unloadDocMesh();
+                        st.committedMeshDocId = rebuildDocId;
+                        st.committedMeshRevision = rev;
+                        core::meshCatchupFinished(rebuildDocId, rev, true);
+                      }
+                    };
+                    if (!r.result.contains("tree") || !r.result["tree"].is_object()) {
+                      // Old activation responses need a tree read, but never a
+                      // synchronous resync from this GL-thread completion.
+                      st.rpc.callPrimary("doc_tree", {{"doc_id", rebuildDocId}},
+                          [&st, rebuildDocId, revision, haveMesh, usableMesh,
+                           aicm, admitMesh](const core::RpcResult &tree) {
+                        if (!tree.ok || st.docMirror.docId() != rebuildDocId ||
+                            tree.result.value("revision", -1) < st.docMirror.revision())
+                          return;
+                        if (!st.docMirror.ingestTreeResponse(tree.result))
+                          return;
+                        st.syncActiveTabTitle();
+                        if (!haveMesh && revision == st.docMirror.revision())
+                          admitMesh(revision, aicm, usableMesh);
+                        else if (!haveMesh)
+                          core::requireDocMesh(rebuildDocId, st.docMirror.revision());
+                        st.addLog("[v2] asynchronous tree refresh after run: rev=" +
+                                  std::to_string(st.docMirror.revision()));
+                      }, 5000);
+                      return;
+                    }
+                    if (!st.docMirror.ingestTreeResponse(r.result))
+                      return;
                     st.syncActiveTabTitle();
                     // C40: doc_activate is an ops-response — the mesh path
                     // lives at tess.aicm_path. Skip reload when live previews
                     // already showed this revision (meshAlreadyCurrent).
-                    if (!meshAlreadyCurrent) {
-                      std::string aicmPath;
-                      if (r.result.contains("tess") &&
-                          r.result["tess"].is_object())
-                        aicmPath = r.result["tess"].value("aicm_path", "");
-                      if (aicmPath.empty())
-                        aicmPath = r.result.value("aicm_path", "");
-                      if (!aicmPath.empty())
-                        st.loadDocMeshAsync(aicmPath);
-                    }
+                    if (!haveMesh) admitMesh(revision, aicm, usableMesh);
                     st.addLog(
-                        "[v2] doc_activate + resync after run: rev=" +
+                        "[v2] doc_activate after run: rev=" +
                         std::to_string(st.docMirror.revision()) +
-                        (meshAlreadyCurrent ? " (mesh already current)" : ""));
+                        (haveMesh ? " (mesh already current)" : ""));
                   } else {
+                    core::requireDocMesh(rebuildDocId, finalRev);
                     st.addLog("[err] doc_activate after v2 run: " + r.err);
                     st.toast(
                         ui::ToastLevel::Error,
@@ -5356,112 +6480,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                 },
                 60000);
           }
-          // Part naming: refresh title + auto-save <name>.step+ into the
-          // workspace. Engine already renamed the doc (doc_set_name); we mirror
-          // that into the tab and persist so displayTitle() / Feature Manager /
-          // viewport all agree.
-          if (!openedNewDoc && !madeDrawing && !madeCam &&
-              st.docMirror.hasDoc() && job.error.empty() &&
-              !job.partName.empty() && job.finalRevision > 0) {
-            const std::string partName = job.partName;
-            // Optimistic title so the strip updates even before async resync
-            // lands.
-            if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
-                st.docTabs[st.activeTab].docId == st.docMirror.docId()) {
-              st.docTabs[st.activeTab].title = partName;
-            }
-            st.syncActiveTabTitle();
-            // File-first persistence: the core agent already saved the part
-            // itself (modeling start + milestone re-saves + memory-stage
-            // rename) and reported the path in the run result's saved_path.
-            // Save straight onto THAT path — unique-ifying here would write a
-            // duplicate <name>_2.step+ next to the agent's <name>.step+. Still
-            // goes through featureTreeSaveDocToPath so the tab path / dirty
-            // clear / recents / PLM auto-record all fire as usual.
-            if (!job.savedPath.empty()) {
-              st.addLog("[v2] saving named part onto agent-persisted path -> " +
-                        job.savedPath);
-              ui::featureTreeSaveDocToPath(st, job.savedPath,
-                                           /*requireNonEmpty=*/true);
-            } else {
-              // Sanitize to a filesystem-safe stem (match drawing export
-              // style).
-              std::string stem;
-              stem.reserve(partName.size());
-              for (unsigned char c : partName) {
-                if (c == ' ')
-                  stem.push_back('_');
-                else if (std::isalnum(c) || c == '_' || c == '-')
-                  stem.push_back((char)c);
-              }
-              if (stem.empty())
-                stem = "Part";
-              ui::ensureWorkspaceDir(st);
-              std::string dir = st.workspaceDir;
-#ifdef __EMSCRIPTEN__
-              // Web: workspace lives on the gateway FS — never std::filesystem
-              // for host paths.
-              {
-                auto &fsb = chudware::fsBackend();
-                std::string ferr;
-                if (dir.empty() || dir == "/workspace") {
-                  // defaultRoot() calls ensureRoot internally.
-                  dir = fsb.defaultRoot();
-                  st.workspaceDir = dir;
-                }
-                fsb.mkdir(dir, ferr); // idempotent
-                auto joinWs = [](const std::string &a, const std::string &b) {
-                  if (a.empty() || a == "/")
-                    return a == "/" ? ("/" + b) : b;
-                  char last = a.back();
-                  if (last == '/' || last == '\\')
-                    return a + b;
-                  return a + "/" + b;
-                };
-                std::string candidate = joinWs(dir, stem + ".step+");
-                std::string serr;
-                if (fsb.stat(candidate, serr).exists) {
-                  for (int n = 2; n < 10000; ++n) {
-                    std::string alt =
-                        joinWs(dir, stem + "_" + std::to_string(n) + ".step+");
-                    if (!fsb.stat(alt, serr).exists) {
-                      candidate = alt;
-                      break;
-                    }
-                  }
-                }
-                st.addLog("[v2] auto-saving named part -> " + candidate);
-                ui::featureTreeSaveDocToPath(st, candidate,
-                                             /*requireNonEmpty=*/true);
-              }
-#else
-              if (dir.empty())
-                dir = defaultWorkspaceDir();
-              namespace fs = std::filesystem;
-              std::error_code ec;
-              fs::create_directories(dir, ec); // idempotent
-              fs::path candidate = fs::path(dir) / (stem + ".step+");
-              if (fs::exists(candidate, ec)) {
-                for (int n = 2; n < 10000; ++n) {
-                  fs::path alt = fs::path(dir) /
-                                 (stem + "_" + std::to_string(n) + ".step+");
-                  if (!fs::exists(alt, ec)) {
-                    candidate = alt;
-                    break;
-                  }
-                }
-              }
-              const std::string savePath = candidate.string();
-              st.addLog("[v2] auto-saving named part -> " + savePath);
-              ui::featureTreeSaveDocToPath(st, savePath,
-                                           /*requireNonEmpty=*/true);
-#endif
-            } // end legacy unique-ify auto-save (no agent-persisted saved_path)
-          }
         }
         // --- end C22b ---
         std::string assistant;
-        // The actionable one-liner (core/agent error_human) and the WHOLE raw failure text.
+        // The actionable one-liner (error_human) and the WHOLE raw failure text.
         // Both ride onto the assistant ChatMsg: headline + expandable "Error details" body.
         std::string assistantErrHuman, assistantErrFull;
         int assistantErr = ERR_NONE;
@@ -5492,7 +6514,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           }
         } else if (!job.error.empty() && job.stopReason == "turn_budget") {
           // The agent was still working when the turn's time budget ran out and the
-          // worker aborted the run (services/agent/chudcode_host.py). That is not an app
+          // worker aborted the run (services/agent/omp_host.py). That is not an app
           // failure: no red "System error", no error toast — say what happened and how
           // to go on.
           setStatus("Turn time limit reached", 1);
@@ -5680,7 +6702,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                    !job.missionVerdict.empty() && job.error.empty()) {
           // Mission run: the report/verdict prose IS the assistant's reply (it
           // already narrates what was built + the analysis conclusion). The
-          // assembly tab / doc rebuild were handled above; we just surface the
+          // doc rebuild was handled above; we just surface the
           // verdict as the bubble text.
           setStatus("Done", 0);
           assistant = job.missionVerdict;
@@ -5703,13 +6725,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                                     "did, and no geometry was built. Nothing was "
                                     "changed - try rephrasing the request.")
                               : job.agentSummary;
-            } else if (openedNewDoc)
-              assistant =
-                  "Done - I built each part as its own editable document and "
-                  "assembled them with positioned components. The assembly is "
-                  "opening in a new tab; each component is a separate part you "
-                  "can edit. Ask for a tweak and I'll revise.";
-            else
+            } else
               assistant = "Done - I built this as parametric features; see the "
                           "FeatureManager "
                           "tree and the viewport. Switch to \"Edit part\" to "
@@ -5857,6 +6873,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         ui::persistChatHistory(st);
       } // end else (run not stopped by the user)
     } // end per-run finished-result routing
+    agentTiming.stop();
 
     // C16 tree shot: run the doc smoke once the worker is ready (fires the
     // first time workerStarted is true after a wantTree shot). Synchronous
@@ -6122,121 +7139,57 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       }
     }
 
-    auto seedEcadShotFixture = [&](nlohmann::json &out) -> bool {
-      using json = nlohmann::json;
-      const std::string path = appdataAppDir() + "/ecad-shot-fixture.ecad+";
-      std::error_code ec;
-      std::filesystem::create_directories(appdataAppDir(), ec);
-      json doc = {
-          {"schema", "aicad.pcb/1"},
-          {"id", ""},
-          {"name", "ECAD Shot Fixture"},
-          {"linked_sch", nullptr},
-          {"stackup",
-           {{"copper_layers", 2},
-            {"thickness", 1.6},
-            {"layers",
-             json::array({{{"id", "F.Cu"}, {"type", "copper"}, {"thickness", 0.035}},
-                          {{"id", "diel1"}, {"type", "core"}, {"thickness", 1.53}, {"er", 4.5}},
-                          {{"id", "B.Cu"}, {"type", "copper"}, {"thickness", 0.035}}})}}},
-          {"outline", {{"shapes", json::array()}, {"closed", false}}},
-          {"footprints", json::array()},
-          {"tracks", json::array()},
-          {"vias", json::array()},
-          {"zones", json::array()},
-          {"graphics", json::array()},
-          {"rules",
-           {{"clearance", 0.2},
-            {"track_width_min", 0.15},
-            {"via_diameter_min", 0.45},
-            {"via_drill_min", 0.2},
-            {"annular_ring_min", 0.13},
-            {"hole_to_hole_min", 0.25},
-            {"edge_clearance", 0.3},
-            {"silk_to_mask_min", 0.15}}},
-          {"nets", json::array({{{"name", "GND"}, {"class", "default"}},
-                                {{"name", "SIG"}, {"class", "default"}}})},
-          {"net_classes",
-           {{"default",
-             {{"clearance", 0.2},
-              {"track_width", 0.25},
-              {"via_diameter", 0.8},
-              {"via_drill", 0.4}}}}},
-          {"origin", json::array({0.0, 0.0})}};
-      json meta = {{"container", "aicad.ecad+/1"},
-                   {"app_version", "ecad-shot"},
-                   {"kind", "pcb"},
-                   {"schema", "aicad.pcb/1"},
-                   {"created", ""},
-                   {"modified", ""},
-                   {"units", json::object()},
-                   {"name", "ECAD Shot Fixture"}};
-      mz_zip_archive zip{};
-      if (!mz_zip_writer_init_file(&zip, path.c_str(), 0))
-        return false;
-      const std::string metaText = meta.dump();
-      const std::string docText = doc.dump();
-      bool ok = mz_zip_writer_add_mem(&zip, "meta.json", metaText.data(),
-                                      metaText.size(), MZ_BEST_SPEED) &&
-                mz_zip_writer_add_mem(&zip, "document.json", docText.data(),
-                                      docText.size(), MZ_BEST_SPEED) &&
-                mz_zip_writer_finalize_archive(&zip);
-      mz_zip_writer_end(&zip);
-      if (!ok)
-        return false;
+    auto seedEcadShotFixture = [&](nlohmann::json &out, std::string &path) -> bool {
+      path = (std::filesystem::temp_directory_path() /
+          ("chudware-ecad-shot-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+           ".kicad_pcb")).string();
+      std::ofstream fixture(path, std::ios::binary);
+      fixture << R"KICAD((kicad_pcb (version 20221018) (generator "chudware")
+  (general (thickness 1.6))
+  (layers (0 "F.Cu" signal) (31 "B.Cu" signal) (44 "Edge.Cuts" user))
+  (net 0 "") (net 1 "GND") (net 2 "SIG"))
+)KICAD";
+      fixture.close();
+      if (!fixture) return false;
       std::string err;
-      ok = st.worker.call("ecad_open", {{"path", path}}, out, err, 60000);
-      std::filesystem::remove(path, ec);
-      std::printf("[ecad-shot] fixture_open ok=%d%s\n", (int)ok,
-                  (out.is_object() && out.contains("code")) ? " (code-err)" : "");
+      const bool ok = st.worker.call("ecad_open", {{"path", path}}, out, err, 60000);
+      std::printf("[ecad-shot] fixture_open ok=%d%s %s\n", (int)ok,
+                  (out.is_object() && out.contains("code")) ? " (code-err)" : "", err.c_str());
       std::fflush(stdout);
       return ok && !(out.is_object() && out.contains("code"));
     };
 
     // ECAD GUI shot — seed a deterministic routed PCB through the native worker
     // RPCs. Only the explicit AI variants use a provider.
-    if (st.wantEcad && !st.ecadShotDone && st.workerStarted) {
+    if (st.wantEcad && !st.ecadShotDone && st.workerStarted &&
+        (!engine::daemonMode() || st.daemonEverConnected)) {
       st.ecadShotDone = true;
       auto ecall = [&](const char *m, const nlohmann::json &p,
                        nlohmann::json &out) -> bool {
         std::string e;
         bool ok = st.worker.call(m, p, out, e, 60000);
-        std::printf("[ecad-shot] %s ok=%d%s\n", m, (int)ok,
-                    (out.is_object() && out.contains("code")) ? " (code-err)"
-                                                              : "");
+        const bool hasCode = out.is_object() && out.contains("code");
+        const std::string detail = hasCode ? out.dump() : e;
+        std::printf("[ecad-shot] %s ok=%d%s %s\n", m, (int)ok,
+                    hasCode ? " (code-err)" : "", detail.c_str());
         std::fflush(stdout);
         return ok && !(out.is_object() && out.contains("code"));
       };
       const char *kindEnv = std::getenv("CHUDWARE_ECAD_KIND");
+      const bool wantProject = kindEnv && std::strcmp(kindEnv, "project") == 0;
+      const bool wantChecks = kindEnv && std::strcmp(kindEnv, "checks") == 0;
+      const bool wantMissing = kindEnv && std::strcmp(kindEnv, "missing") == 0;
       const bool wantPcb =
-          !kindEnv || std::strcmp(kindEnv, "pcb") == 0 ||
-          std::strcmp(kindEnv, "hidefront") == 0 ||
-          std::strcmp(kindEnv, "netselect") == 0;
+          !kindEnv || std::strcmp(kindEnv, "pcb") == 0 || wantProject || wantChecks ||
+          std::strcmp(kindEnv, "hidefront") == 0 || std::strcmp(kindEnv, "netselect") == 0;
       const bool want3d = kindEnv && std::strcmp(kindEnv, "3d") == 0;
       const bool wantAi = kindEnv && std::strcmp(kindEnv, "ai") == 0;
-      const bool wantHideFront =
-          kindEnv && std::strcmp(kindEnv, "hidefront") == 0;
-      const bool wantNetSelect =
-          kindEnv && std::strcmp(kindEnv, "netselect") == 0;
-      const bool wantEdit = kindEnv && std::strcmp(kindEnv, "editsch") == 0;
-      const bool wantSelect =
-          kindEnv && std::strcmp(kindEnv, "select") == 0; // selection highlight
-      const bool wantDel =
-          kindEnv && std::strcmp(kindEnv, "del") == 0; // delete a symbol
-      const bool wantSim =
-          kindEnv && std::strcmp(kindEnv, "sim") == 0; // simulate + plot
-      const bool wantUndo =
-          kindEnv && std::strcmp(kindEnv, "undo") == 0; // history undo
-      const bool wantAiBoard =
-          kindEnv && std::strcmp(kindEnv, "aiboard") == 0; // Wave U one-click
-      const bool wantAiBoard3d =
-          kindEnv && std::strcmp(kindEnv, "aiboard3d") == 0; // Wave X chain
-      const bool wantRotate =
-          kindEnv && std::strcmp(kindEnv, "rotate") == 0; // Wave W rotate
-      const bool wantSaveOpen =
-          kindEnv && std::strcmp(kindEnv, "saveopen") == 0; // Wave Y roundtrip
-      const bool wantViolZoom = kindEnv && std::strcmp(kindEnv, "violzoom") ==
-                                               0; // Wave Z zoom-to-ERC
+      const bool wantHideFront = kindEnv && std::strcmp(kindEnv, "hidefront") == 0;
+      const bool wantNetSelect = kindEnv && std::strcmp(kindEnv, "netselect") == 0;
+      const bool wantSim = kindEnv && std::strcmp(kindEnv, "sim") == 0;
+      const bool wantAiBoard = kindEnv && std::strcmp(kindEnv, "aiboard") == 0;
+      const bool wantAiBoard3d = kindEnv && std::strcmp(kindEnv, "aiboard3d") == 0;
+      const bool wantViolZoom = kindEnv && std::strcmp(kindEnv, "violzoom") == 0;
       nlohmann::json r;
       std::string showId;
       if (wantAiBoard || wantAiBoard3d) {
@@ -6261,21 +7214,16 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           std::printf("[ecad-shot] aiboard3d: exported board -> CAD 3D part\n");
         }
         std::fflush(stdout);
-      } else if (wantAi) {
-        st.wantFocusEcad =
-            6; // surface the empty AI launchpad for the screenshot
-      } else if (wantEdit || wantSelect || wantDel || wantRotate ||
-                 wantViolZoom) {
-        // Exercise the Place/Route tools by applying the ops a user's clicks
-        // would produce. select/del/rotate/violzoom reuse this schematic batch
-        // (it has unconnected pins -> ERC violations with locations) then drive
-        // selection/delete/rotate/zoom-to-violation.
+      } else if (wantAi || wantMissing) {
+        st.wantFocusEcad = 6;
+      } else if (wantViolZoom) {
+        // Seed real unconnected schematic pins for KiCad ERC navigation.
         if (ecall("ecad_new", {{"kind", "sch"}}, r)) {
           const std::string id = jstr(r, "doc_id");
           const int rev = jint(r, "revision");
           nlohmann::json ops = nlohmann::json::array();
           ops.push_back({{"op", "sch_add_symbol"},
-                         {"libid", "Simulation_SPICE:V_source"},
+                         {"libid", "Simulation_SPICE:VDC"},
                          {"pos", {10, 42}},
                          {"value", "5"}});
           ops.push_back({{"op", "sch_add_symbol"},
@@ -6299,37 +7247,11 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                          {"pts", {{32, 32}, {54, 32}, {54, 26}}}});
           ecall("ecad_apply_ops",
                 {{"doc_id", id}, {"base_revision", rev}, {"ops", ops}}, r);
-          st.ecadTool =
-              wantEdit ? 1
-                       : 0; // editsch shows Place; select/del/rotate use Select
           showId = id;
-          if (wantDel) {
-            // Delete one symbol directly (what the Delete key emits) so the
-            // shot shows FEWER symbols than the editsch baseline. Re-read the
-            // new revision first.
-            const int rev2 = jint(r, "revision");
-            nlohmann::json delOps = nlohmann::json::array();
-            delOps.push_back({{"op", "sch_delete_symbol"},
-                              {"id", "s2"}}); // the 2nd symbol (a 10k R)
-            ecall("ecad_apply_ops",
-                  {{"doc_id", id}, {"base_revision", rev2}, {"ops", delOps}},
-                  r);
-          }
-          if (wantRotate) {
-            // Rotate s2 (a 10k R) by 90 deg — exactly the op the Rotate button
-            // / R key emits — so the shot shows the resistor turned on its
-            // side. Re-read revision.
-            const int rev2 = jint(r, "revision");
-            nlohmann::json rotOps = nlohmann::json::array();
-            rotOps.push_back(
-                {{"op", "sch_edit_symbol"}, {"id", "s2"}, {"angle", 90}});
-            ecall("ecad_apply_ops",
-                  {{"doc_id", id}, {"base_revision", rev2}, {"ops", rotOps}},
-                  r);
-          }
         }
       } else if (wantPcb || want3d) {
-        if (seedEcadShotFixture(r)) {
+        std::string fixturePath;
+        if (seedEcadShotFixture(r, fixturePath)) {
           const std::string pcbId = jstr(r, "doc_id");
           const int rev = jint(r, "revision");
           nlohmann::json ops = nlohmann::json::array();
@@ -6468,97 +7390,88 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           if (ecall("ecad_apply_ops",
                     {{"doc_id", pcbId}, {"base_revision", rev}, {"ops", ops}},
                     r)) {
-            if (want3d) {
-              st.ecadDocId = pcbId;
-              ecadTo3d(st);
-            } else {
-              showId = pcbId;
+            const auto dir = std::filesystem::temp_directory_path() /
+                ("chudware-kicad-shot-" +
+                 std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            const auto board = dir / "Fixture.kicad_pcb";
+            nlohmann::json saved;
+            if (!ec && ecall("ecad_save", {{"doc_id", pcbId}, {"path", board.u8string()}}, saved)) {
+              if (wantProject || wantChecks) {
+                nlohmann::json project;
+                if (ecall("ecad_open_project", {{"path", (dir / "Fixture.kicad_pro").u8string()}}, project) &&
+                    ecadAddProject(st, project))
+                  showId = st.ecadDocId;
+              } else {
+                showId = pcbId;
+              }
             }
           }
         }
-      } else if (wantUndo) {
-        // Undo demo: build a schematic in TWO separate op batches (so the
-        // worker records two undoable history steps), then below we load it and
-        // ecadUndo() once -> the second batch (the capacitor) is rolled back
-        // and the symbol count drops by one.
-        if (ecall("ecad_new", {{"kind", "sch"}}, r)) {
-          const std::string id = jstr(r, "doc_id");
-          int rev = jint(r, "revision");
-          // Batch 1: place a resistor.
-          nlohmann::json b1 = nlohmann::json::array();
-          b1.push_back({{"op", "sch_add_symbol"},
-                        {"libid", "Device:R"},
-                        {"pos", {20, 30}},
-                        {"value", "10k"}});
-          if (ecall("ecad_apply_ops",
-                    {{"doc_id", id}, {"base_revision", rev}, {"ops", b1}}, r))
-            rev = jint(r, "revision");
-          // Batch 2: place a capacitor (a distinct undoable step).
-          nlohmann::json b2 = nlohmann::json::array();
-          b2.push_back({{"op", "sch_add_symbol"},
-                        {"libid", "Device:C"},
-                        {"pos", {40, 30}},
-                        {"value", "100n"}});
-          ecall("ecad_apply_ops",
-                {{"doc_id", id}, {"base_revision", rev}, {"ops", b2}}, r);
-          showId = id;
-        }
-      } else if (wantSaveOpen) {
-        // Wave Y: exercise the GUI's exact Save -> Open RPC path (minus the
-        // modal dialog, which can't run headless). Design a divider schematic,
-        // ecad_save it to a temp .ecad+, ecad_open it back into a fresh
-        // session, and show the reopened doc. The before/after symbol counts
-        // must match for a clean round-trip.
-        if (ecall("ecad_design",
-                  {{"request", "5V resistive divider with 2.5V output"}}, r)) {
-          const std::string srcId = jstr(r, "doc_id");
-          nlohmann::json before;
-          ecall("ecad_tree", {{"doc_id", srcId}}, before);
-          const int nBefore =
-              before.contains("tree") && before["tree"].contains("symbols")
-                  ? (int)before["tree"]["symbols"].size()
-                  : -1;
-          std::error_code ec;
-          const std::string dir = appdataAppDir() + "/ecad_out";
-          std::filesystem::create_directories(dir, ec);
-          const std::string path = dir + "/roundtrip.ecad+";
-          nlohmann::json sres;
-          ecall("ecad_save", {{"doc_id", srcId}, {"path", path}}, sres);
-          nlohmann::json ores;
-          if (ecall("ecad_open", {{"path", path}}, ores)) {
-            const std::string openedId = jstr(ores, "doc_id");
-            const int nAfter =
-                ores.contains("tree") && ores["tree"].contains("symbols")
-                    ? (int)ores["tree"]["symbols"].size()
-                    : -1;
-            std::printf(
-                "[ecad-shot] saveopen: symbols before=%d after=%d (%s)\n",
-                nBefore, nAfter,
-                nBefore == nAfter ? "ROUND-TRIP OK" : "MISMATCH");
-            showId = openedId; // show the REOPENED doc
-          }
-          std::fflush(stdout);
+        std::error_code fixtureError;
+        std::filesystem::remove(fixturePath, fixtureError);
+        if (showId.empty()) {
+          std::fprintf(stderr, "[ecad-shot] PCB fixture creation or project opening failed\n");
+          shotExitCode = 1;
+          break;
         }
       } else if (wantSim) {
-        // Native simulator demo: design a verified RC low-pass and run an AC
-        // sweep so the shot plots its frequency-response rolloff in the
-        // Simulation tab. (ecad_simulate injects a unit AC stimulus on the
-        // input source when the study is AC, so |H(f)| is meaningful.)
-        if (ecall("ecad_design", {{"request", "RC low-pass filter at 1kHz"}},
-                  r))
-          showId = jstr(r, "doc_id");
-        st.ecadSimAnalysis = 1; // AC sweep (frequency response)
+        // Build a reproducible RC low-pass from real KiCad symbols and wires,
+        // then persist it just as a generated project before running AC.
+        const bool created = ecall("ecad_new", {{"kind", "sch"}, {"name", "RC Low-pass"}}, r);
+        const std::string id = created ? jstr(r, "doc_id") : std::string();
+        const int rev = created ? jint(r, "revision") : 0;
+        const nlohmann::json ops = nlohmann::json::array({
+          {{"op", "sch_add_symbol"}, {"libid", "Simulation_SPICE:VDC"}, {"ref", "V1"},
+           {"value", "0"}, {"pos", {0, 0}}},
+          {{"op", "sch_add_symbol"}, {"libid", "Device:R"}, {"ref", "R1"},
+           {"value", "1k"}, {"pos", {25.4, 5.08}}, {"angle", 90}},
+          {{"op", "sch_add_symbol"}, {"libid", "Device:C"}, {"ref", "C1"},
+           {"value", "159n"}, {"pos", {50.8, 0}}},
+          {{"op", "sch_add_wire"}, {"pts", {{0, 5.08}, {21.59, 5.08}}}},
+          {{"op", "sch_add_wire"}, {"pts", {{29.21, 5.08}, {50.8, 5.08}, {50.8, 3.81}}}},
+          {{"op", "sch_add_wire"}, {"pts", {{50.8, -3.81}, {50.8, -10.16},
+                                              {0, -10.16}, {0, -5.08}}}},
+          {{"op", "sch_add_power"}, {"net", "GND"}, {"pos", {0, -5.08}}},
+          {{"op", "sch_add_label"}, {"text", "OUT"}, {"pos", {50.8, 5.08}}}
+        });
+        if (!id.empty() &&
+            ecall("ecad_apply_ops", {{"doc_id", id}, {"base_revision", rev}, {"ops", ops}}, r)) {
+          r["doc_id"] = id;
+          if (ecadAddResponseTab(st, r, "RC Low-pass") &&
+              ecadPersistGenerated(st, id, "RC_Lowpass"))
+            showId = id;
+        }
+        if (showId.empty()) {
+          std::fprintf(stderr, "[ecad-shot] RC schematic creation or save failed\n");
+          shotExitCode = 1;
+          break;
+        }
       } else if (!wantHideFront && !wantNetSelect) {
         // Provider-backed path retained only for explicit non-default variants.
-        if (ecall("ecad_design",
-                  {{"request", "5V resistive divider with 2.5V output"}}, r))
-          showId = jstr(r, "doc_id");
+        if (ecadAiDesign(st, "5V resistive divider with 2.5V output"))
+          showId = st.ecadDocId;
+        else {
+          std::fprintf(stderr, "[ecad-shot] AI schematic creation or save failed\n");
+          shotExitCode = 1;
+          break;
+        }
       }
-      if (!showId.empty() && ecall("ecad_tree", {{"doc_id", showId}}, r)) {
-        st.ecadDocId = showId;
-        st.ecadRevision = jint(r, "revision");
-        ui::ecadEditorMirror().setDocId(showId);
-        ui::ecadEditorLoadResponse(r);
+      const bool loaded = !showId.empty() && ecall("ecad_tree", {{"doc_id", showId}}, r);
+      if (!showId.empty() && !loaded) {
+        std::fprintf(stderr, "[ecad-shot] failed to read fixture tree\n");
+        shotExitCode = 1;
+        break;
+      }
+      if (loaded) {
+        r["doc_id"] = showId;
+        if (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size() ||
+            st.docTabs[st.activeTab].ecadDocId != showId) {
+          ecadAddResponseTab(st, r);
+        } else {
+          ecadAdopt(st, r);
+        }
         if (wantHideFront)
           ui::ecadEditorMirror().setLayerVisible("F.Cu", false);
         if (wantNetSelect)
@@ -6574,25 +7487,19 @@ int run_gui(const char *screenshotPath, const char *openPath) {
             (int)ui::ecadEditorMirror().drc().size(),
             (int)ui::ecadEditorMirror().layerVisible("F.Cu"),
             (int)ui::ecadEditorMirror().netVisible("SIG"));
-        if (wantSelect || wantRotate) {
-          // Drive selection without a mouse so the shot shows the highlight
-          // halo (+ the property inspector). Pick a real symbol id from the
-          // loaded mirror (the 2nd symbol when present); for rotate this is s2
-          // — the resistor we turned 90 deg.
-          const auto &syms = ui::ecadEditorMirror().symbols();
-          // Selection tokens are "<kind>:<id>" with the frozen kind prefixes
-          // (sym/pin/wire/bus/…): the old short "s:" no longer matches.
-          const std::string sel =
-              "sym:" + (syms.size() >= 2
-                            ? syms[1].id
-                            : (syms.empty() ? std::string("s1") : syms[0].id));
-          ui::ecadEditorSelect(sel);
-          std::printf("[ecad-shot] selected %s (%d symbols)\n", sel.c_str(),
-                      (int)syms.size());
+        if (wantChecks || wantViolZoom) {
+          nlohmann::json check;
+          if (ecall("ecad_kicad_check", {{"doc_id", showId}}, check)) {
+            check["_source_revision"] = st.ecadRevision;
+            ui::ecadSetCheckResult(showId, check);
+            ui::ecadEditorShowChecks();
+          }
+          else {
+            std::fprintf(stderr, "[ecad-shot] KiCad check failed\n");
+            shotExitCode = 1;
+            break;
+          }
         }
-        if (wantDel)
-          std::printf("[ecad-shot] after delete: %d symbols\n",
-                      (int)ui::ecadEditorMirror().symbols().size());
         if (wantViolZoom) {
           // Zoom-to-violation: pan/zoom the canvas to the first located ERC
           // violation and flash the marker — exactly what clicking a violation
@@ -6603,17 +7510,12 @@ int run_gui(const char *screenshotPath, const char *openPath) {
               "[ecad-shot] violzoom: focused first located violation = %d\n",
               (int)ok);
         }
-        if (wantUndo) {
-          // Undo the capacitor batch (the 2nd, most-recent history step).
-          // Confirm via the editor mirror that the symbol count dropped by one
-          // (2 -> 1).
-          const int before = (int)ui::ecadEditorMirror().symbols().size();
-          ecadUndo(st);
-          const int after = (int)ui::ecadEditorMirror().symbols().size();
-          std::printf("[ecad-shot] undo: symbols %d -> %d (rev %d)\n", before,
-                      after, st.ecadRevision);
+        if (want3d) {
+          ecadTo3d(st);
+          st.wantFocusEcad = 0;
         }
         if (wantSim) {
+          st.ecadSimAnalysis = 1;
           // Queue the simulation off the render thread. The ECAD shot capture
           // gate below waits explicitly for ecadSimRunState().running to clear,
           // so the plotted curve is fully settled before the PNG is written.
@@ -6625,6 +7527,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       }
     }
 
+#ifndef __EMSCRIPTEN__
     // ---------- scripted scenarios
     // (CHUDWARE_SHOT=m1/sketch/asm/fea/evalmass/activity) ---------- Frame-driven
     // state machines that issue scripted ops through the REAL worker, drive the
@@ -6633,14 +7536,27 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     const bool pointerShot =
         st.shot && shotMode &&
         (std::strcmp(shotMode, "siminteractive") == 0 ||
+         std::strcmp(shotMode, "uxquality") == 0 ||
+         std::strcmp(shotMode, "agentlock") == 0 ||
+         std::strcmp(shotMode, "scad_edit") == 0 ||
+         std::strcmp(shotMode, "parts_catalog") == 0 ||
          std::strcmp(shotMode, "simaudit") == 0 ||
          std::strcmp(shotMode, "pipedraw") == 0 ||
          std::strcmp(shotMode, "hydraulics3d") == 0 ||
          std::strcmp(shotMode, "chat_inline") == 0 ||
+         std::strcmp(shotMode, "text_contrast") == 0 ||
+         std::strcmp(shotMode, "composer_spell") == 0 ||
          std::strcmp(shotMode, "copilot_ui") == 0 ||
-         std::strcmp(shotMode, "dwgopen") == 0);
-    if (!pointerShot)
+         std::strcmp(shotMode, "copilot_showcase") == 0 ||
+         std::strcmp(shotMode, "settings_routes") == 0 ||
+         std::strcmp(shotMode, "model_settings") == 0 ||
+         std::strcmp(shotMode, "dwgopen") == 0 ||
+         std::strcmp(shotMode, "frameperf") == 0);
+    if (!pointerShot) {
+      core::framestats::Scope timing("scenario");
       scenarios.tick(st);
+    }
+#endif
 
     // Keep theme state coherent across runtime toggles, screenshot scenarios,
     // and any accidental style leak. This runs before NewFrame so docked panes
@@ -6652,11 +7568,14 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // and Settings modal — deliberately ANY run, not just the viewed one.
     bool busy = st.anyRunActive();
 
+    core::framestats::Scope newFrameTiming("imgui_new_frame");
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();
 #ifdef __EMSCRIPTEN__
     wasmDrainTextInput();
 #endif
+    newFrameTiming.stop();
+#ifndef __EMSCRIPTEN__
     // Headless-capture hygiene, same reasoning as the toast suppression above: the
     // window opens under wherever the real cursor happens to sit, so a --ui-screenshot
     // frame can catch a ribbon/button tooltip parked over the very chrome the shot is
@@ -6666,11 +7585,16 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     if (st.shot && !pointerShot)
       ImGui::GetIO().AddMousePosEvent(-FLT_MAX, -FLT_MAX);
     if (pointerShot) {
+      core::framestats::Scope timing("scenario");
       scenarios.tick(st);
       ensureFrameTheme();
       busy = st.anyRunActive();
     }
-    ImGui::NewFrame();
+#endif
+    {
+      core::framestats::Scope timing("imgui_new_frame");
+      ImGui::NewFrame();
+    }
 
     // Liquid glass v2.1: per-frame Settings -> resolved-glass push. Idempotent
     // (exact-match early-out in setGlassConfig => free), so any code path that
@@ -6696,22 +7620,15 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     //   edit history),
     //   - skip while a sketch is active (sketch mode owns in-sketch undo in a
     //   later wave),
-    //   - skip while a background job / v2 agent run is in flight (same canDoc
-    //   gate the toolbar
-    //     uses), so we never mutate the doc under a running worker call,
-    //   - skip while the ECAD editor window is focused — that window owns
-    //   Ctrl+Z for its own
-    //     history (ecadUndo/ecadRedo, gated inside drawEcadEditor) and must not
-    //     also drive the CAD doc's undo,
+    //   - skip the read-only ECAD hub so it cannot undo a parked mechanical document,
     //   - skip Drawing / Schematic / PCB tabs and any moment the live DocMirror
     //   is not the
     //     active tab's doc (tab switch parks the previous part behind the
     //     sheet; async rebind can lag activeTab). docUndo/docRedo also refuse
     //     those cases as a second gate.
     {
-      const bool canDoc =
-          st.workerStarted && !st.anyRunActive() && !st.agentV2Running &&
-          !st.activeDocLockedByAgent();
+      core::framestats::Scope timing("input");
+      const bool canDoc = st.workerStarted;
       const bool textFocus = io.WantTextInput;
       const bool inSketchNow = st.sketchMode->active() ||
                                (st.sketch3dMode && st.sketch3dMode->active());
@@ -6804,10 +7721,8 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       // ---- Wave 3: Ctrl+O / Ctrl+S / Ctrl+Shift+S file shortcuts ----
       // Set request flags consumed by the GL-thread file pump below (after the
       // input block) so the native dialog opens with the doc swap off the ImGui
-      // input path. Skip while a text field or the ECAD window owns input (the
-      // ECAD editor has its own save). Ctrl+S/Shift+S require a live doc;
-      // Ctrl+O is always allowed.
-      if (appShortcutsOk && !ecadFocused && (io.KeyCtrl || io.KeySuper)) {
+      // input path. Text fields retain their own shortcuts; the hub uses the shared save path.
+      if (appShortcutsOk && (io.KeyCtrl || io.KeySuper)) {
         if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_O, false))
           st.requestOpenDialog = true;
         else if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_S, false))
@@ -6854,15 +7769,13 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // shortcuts set. Runs once per frame on the GL thread, OUTSIDE the ImGui
     // input/menu walk, so the native dialog + DocMirror swap never re-enters a
     // draw. Open paths are dispatched by extension: CAD -> featureTreeOpenPath,
-    // ECAD/KiCad -> ecadOpenPath. Each open/save records Recent. Gated on a
-    // live, idle worker (mirrors the FeatureManager toolbar's canDoc gate) so
-    // we never swap the doc under a running call; a queued request waits one
-    // frame rather than firing early.
+    // ECAD/KiCad -> ecadOpenPath. Each open/save records Recent. Document
+    // operations use the engine's normal per-document serialization.
     if (st.requestOpenDialog || !st.requestOpenPath.empty() || st.requestSave ||
         st.requestSaveAs || st.requestSaveAll ||
         !st.requestExportFormat.empty()) {
-      const bool fileReady =
-          st.workerStarted && !st.anyRunActive() && !st.agentV2Running;
+      core::framestats::Scope timing("file_requests");
+      const bool fileReady = st.workerStarted;
       if (!fileReady) {
         // Drop save/export/recent requests (need a doc); keep open requests
         // pending until ready.
@@ -6874,19 +7787,23 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       } else {
         if (st.requestOpenDialog) {
           st.requestOpenDialog = false;
-          std::string opened = ui::featureTreeOpenDialog(st);
-          if (!opened.empty())
-            st.pushRecentFile(opened);
+          if (st.activeWorkspace == AppState::Workspace::Electronics) {
+            ecadOpenDoc(st);
+          } else {
+            std::string opened = ui::featureTreeOpenDialog(st);
+            if (!opened.empty()) st.pushRecentFile(opened);
+          }
         }
         if (!st.requestOpenPath.empty()) {
           std::string path = st.requestOpenPath;
           st.requestOpenPath.clear();
-          std::string ext = std::filesystem::path(path).extension().string();
+          std::string ext = std::filesystem::u8path(path).extension().u8string();
           std::transform(ext.begin(), ext.end(), ext.begin(),
                          [](unsigned char c) { return (char)std::tolower(c); });
           const bool isDrawing = (ext == ".draw+");
           const bool isEcad = (ext == ".ecad+" || ext == ".ecad" ||
-                               ext == ".kicad_sch" || ext == ".kicad_pcb");
+                               ext == ".kicad_sch" || ext == ".kicad_pcb" ||
+                               ext == ".kicad_pro");
           if (isDrawing) {
             if (ui::featureTreeOpenDrawingPath(st, path))
               st.pushRecentFile(path);
@@ -6907,55 +7824,19 @@ int run_gui(const char *screenshotPath, const char *openPath) {
               st.fitViewOnNextMeshCommit = true;
           }
         }
-        // Save / Save As route through the unified per-tab saver so the active
-        // tab saves by its kind (CAD .step+, ECAD .ecad+, or a Drawing via its
-        // source part). saveDocTab records Recent + clears the unsaved marker
-        // itself. Saving a Drawing switches the mirror to its source part, so
-        // restore the active tab afterward (a no-op for CAD/ECAD saves).
+        // Save by tab identity; neither individual nor batch saves change focus.
         if (st.requestSave || st.requestSaveAs) {
           const bool asSave = st.requestSaveAs;
           st.requestSave = st.requestSaveAs = false;
-          const int origActive = st.activeTab;
-          ui::saveDocTab(st, origActive, /*forceDialog=*/asSave);
-          if (origActive >= 0 && origActive < (int)st.docTabs.size() &&
-              st.activeTab != origActive)
-            st.switchToTab(origActive);
+          ui::saveDocTab(st, st.activeTab, asSave);
         }
-        // Wave-5-fill: Save All — save every part/assembly + ECAD tab via the
-        // unified saver. Titled docs re-save silently; the never-saved ACTIVE
-        // doc falls back to a Save-As prompt (a batch must not pop one dialog
-        // per untitled doc, so untitled BACKGROUND tabs are left for an
-        // explicit per-doc Save). Drawing tabs are skipped — they persist when
-        // their source part is saved (which this loop does, clearing their
-        // markers). The original active tab is restored afterward (CAD saves
-        // re-point the mirror as a side effect).
         if (st.requestSaveAll) {
           st.requestSaveAll = false;
-          const int origActive = st.activeTab;
-          int savedCount = 0, failCount = 0;
-          for (int i = 0; i < (int)st.docTabs.size(); ++i) {
-            const AppState::DocTab &tab = st.docTabs[i];
-            if (tab.kind == AppState::DocTab::TabKind::Drawing)
-              continue; // via source part
-            if (tab.path.empty() && i != origActive)
-              continue; // untitled background
-            ui::TabSaveResult r = ui::saveDocTab(st, i, /*forceDialog=*/false);
-            if (r == ui::TabSaveResult::Saved)
-              ++savedCount;
-            else if (r == ui::TabSaveResult::Failed)
-              ++failCount;
-          }
-          if (origActive >= 0 && origActive < (int)st.docTabs.size())
-            st.switchToTab(
-                origActive); // restore the originally-active document
-          if (savedCount || failCount)
-            st.toast(failCount ? ui::ToastLevel::Warn : ui::ToastLevel::Info,
-                     "Save All: " + std::to_string(savedCount) + " saved" +
-                         (failCount
-                              ? (", " + std::to_string(failCount) + " failed")
-                              : ""));
-          else
-            st.toast(ui::ToastLevel::Info, "Save All: nothing to save");
+          saveAllTabs(st, false, [&st](bool ok, int count) {
+            st.toast(ok ? ui::ToastLevel::Info : ui::ToastLevel::Warn,
+                     "Save All: " + std::to_string(count) + " saved" +
+                         (ok ? "" : "; stopped before all documents were saved"));
+          });
         }
         // Wave-5-fill: Export <fmt> — native Save-As + DocMirror::exportFile
         // for the active doc.
@@ -7019,7 +7900,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // feedTurnActivity -> transcript rows + plan), with the event kinds and payload keys the
     // worker sends (orch_<kind> with the prefix stripped). Runs once the restore has settled on
     // a conversation id. The run is marked live with a sentinel run id no worker event can bind
-    // to (runForEvent matches by id first and only binds runs whose id is empty).
+    // to (runForEvent requires an exact run-id match).
     if (shot && st.wantChat && st.frame >= 1) {
       static bool s_chatRunSeeded = false;
       const std::string convId = st.activeConvId();
@@ -7078,6 +7959,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           } catch (const std::exception& error) {
             std::fprintf(stderr, "chat_evidence: %s\n", error.what());
             std::fflush(nullptr);
+            core::framestats::flushReport();
             std::_Exit(EXIT_FAILURE);
           }
         } else {
@@ -7165,11 +8047,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     if (shotChatContext && st.frame >= 1 && chatContextBoundAt < 0) {
       const bool haveDoc = st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
                            !st.docTabs[(size_t)st.activeTab].docId.empty();
-      if (!haveDoc && st.frame == 3 && st.workerStarted) {
+      if (!haveDoc && !chatContextCreateTried && st.frame >= 3 && st.workerStarted) {
+        chatContextCreateTried = true;
         std::string err;
-        st.suppressTabDirty = true;
         const bool ok = st.docMirror.newPart(st.worker, err);
-        st.suppressTabDirty = false;
         if (ok) {
           st.clearViewportForNewDoc();
           st.addDocTab(/*isAssembly=*/false);
@@ -7211,10 +8092,13 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // ---------- custom title bar (our own; the OS title bar is stripped)
     // ----------
     ImGuiViewport *vp = ImGui::GetMainViewport();
-    const bool maximized = glfwGetWindowAttrib(win, GLFW_MAXIMIZED) != 0;
+    const bool maximized = chrome::maximized(win);
 
     float barH = 0.0f;
-    ui::drawTitleBar(st, maximized, barH);
+    {
+      core::framestats::Scope timing("title_bar");
+      ui::drawTitleBar(st, maximized, barH);
+    }
 
     // Window title mirrors the active document + dirty marker
     // (SolidWorks-style). Cheap change-detection so glfwSetWindowTitle only
@@ -7240,6 +8124,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // ---------- C14: ribbon bar (drawn between title bar and dockspace)
     // ---------- syncIconTheme keeps texture selection in sync with the active
     // theme.
+    core::framestats::Scope ribbonTiming("ribbon");
     ui::syncIconTheme();
     // C34: SolidWorks behavior — entering a sketch flips the ribbon to the
     // Sketch tab, exiting returns to Features. Edge-triggered so the user can
@@ -7282,6 +8167,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // active title-bar workspace so Model shows modeling tools, Simulate shows
     // sim tools, etc.
     ui::setRibbonWorkspace(static_cast<int>(st.activeWorkspace));
+    ui::setRibbonCommandContext(ui::commandContext(st));
     // The Drawing workspace always shows the drawing tabs (View Layout / Annotation), with or
     // without a drawing open, so it never lands on an unrelated modeling tab.
     const bool drawingRibbon = st.activeTabIsDrawing() ||
@@ -7289,10 +8175,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     if (drawingRibbon && st.ribbonTab != AppState::RT_ViewLayout &&
         st.ribbonTab != AppState::RT_Annotation)
       st.ribbonTab = AppState::RT_ViewLayout;
-    const std::string ribbonAgentLockReason =
-        st.agentLockReason(st.docMirror.docId());
-    ui::setRibbonAgentLockReason(ribbonAgentLockReason.empty()
-                                    ? nullptr : ribbonAgentLockReason.c_str());
     float ribbonH =
         ui::drawRibbon(st.ribbonTab, st.showRibbon, st.showSimulationTools,
                        st.showPcbTools, barH, drawingRibbon);
@@ -7317,13 +8199,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       ui::drawManufactureModeBar(st, vp->Pos.x, vp->Pos.y + barH + ribbonH,
                                  vp->Size.x, mfgBarH);
 
-    // ---------- agent-lock strip ----------
-    // Reserved chrome for the same reason as the Manufacture strip: a floating
-    // overlay would cover whichever workspace element sits at the top-left.
-    const float agentBarH = agentLockBannerHeight(st);
-    if (agentBarH > 0.0f)
-      drawAgentLockBanner(st, vp->Pos.x, vp->Pos.y + barH + ribbonH + mfgBarH,
-                          vp->Size.x, agentBarH);
+    ribbonTiming.stop();
 
     // ---------- default starter document ----------
     // Open straight into a fresh part on launch (non-shot) so the app is
@@ -7338,8 +8214,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
 
     // ---------- dockspace host (between the title bar+ribbon and the status
     // bar) ----------
+    core::framestats::Scope layoutTiming("layout");
     const float statusH = ImGui::GetTextLineHeight() + 8.0f * scale;
-    const float dockTopY = barH + ribbonH + mfgBarH + agentBarH;
+    const float dockTopY = barH + ribbonH + mfgBarH;
 #ifdef __EMSCRIPTEN__
     const float mobileHudH = g_wasmMobile ? 56.0f : 0.0f;
 #else
@@ -7413,8 +8290,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                      ImGuiDockNodeFlags_PassthruCentralNode);
     ImGui::PopStyleColor(5);
     ImGui::End();
+    layoutTiming.stop();
 
     // ---------- status bar ----------
+    core::framestats::Scope statusTiming("status_bar");
 #ifdef __EMSCRIPTEN__
     ImGuiViewport statusViewport;
     statusViewport.ID = vp->ID;
@@ -7424,6 +8303,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
 #else
     ui::drawStatusBar(st, vp, statusH, busy, hostFlags);
 #endif
+    statusTiming.stop();
 
     // ---------- panels (pinned glass columns + floating dialogs over the
     // full-width 3D) ---- The SolidWorks-faithful tabbed LEFT column (Explorer
@@ -7457,7 +8337,8 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // run (they set only the ribbon and left-pane tab up front), so pinning Model at setup
     // pinned them to Model forever - the Simulation Manager scenarios then captured the
     // Feature Manager. Model is never a pin target for exactly that reason.
-    if (shot && !st.wantWorkspace) {
+    // The catalog scenario deliberately transitions from Parts Library to the placed part.
+    if (shot && !st.wantWorkspace && !(shotMode && std::strcmp(shotMode, "parts_catalog") == 0)) {
       if (st.activeWorkspace != AppState::Workspace::Model)
         st.shotWorkspacePin = (int)st.activeWorkspace;
       else if (st.shotWorkspacePin >= 0)
@@ -7514,32 +8395,25 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // Electronics (AppState::switchToTab), so a board is always reachable.
     const bool wsShowEcad = (ws == WS::Electronics);
 
-    // ---- Electronics workspace-entry auto-init (hoisted ABOVE drawLeftPane)
-    // ---- Must run before drawLeftPane (below) so its ECAD "PCB Manager" body
-    // (layout.cpp's Electronics branch -> ecad_panel.cpp::drawEcadManagerBody)
-    // sees the freshly-created board on the SAME frame the workspace is
-    // entered, instead of one frame of "No PCB/schematic document open" while
-    // the mirror is still empty. wantFocusEcad's actual SetNextWindowFocus
-    // stays below, right before drawEcadEditor draws — window-focus calls that
-    // fire before their window's Begin() are a no-op, so only the doc-creation
-    // edge needs to move.
+    // ---- Electronics workspace-entry edge (hoisted ABOVE drawLeftPane) ----
+    // Entering Electronics never creates a document: with no ECAD document
+    // open, the editor shows its launchpad (New PCB / New Schematic / Open /
+    // AI design) and the manager column its empty state, the same way the
+    // other workspaces present an empty context. wantFocusEcad's actual
+    // SetNextWindowFocus stays below, right before drawEcadEditor draws —
+    // window-focus calls that fire before their window's Begin() are a no-op.
     //
-    // ecadPrimeActiveApp is needed because ecadAutoInitBoard's ecad_new ->
-    // ecadAdopt can be the FIRST-EVER ECAD call this session (a brand new
-    // Electronics entry, nothing loaded yet) — before either drawEcadEditor or
-    // drawEcadManagerBody has run once to set the state() resolver's
-    // active-AppState pointer. Without priming it first, ecadAdopt's mirror
-    // load lands in the process-wide fallback state instead of the just-created
-    // PCB1 tab's own state, so the manager body / canvas the user actually sees
-    // still reads "no document" this frame.
+    // ecadPrimeActiveApp points the ECAD state() resolver at this AppState
+    // before any ECAD RPC response can be adopted this frame (e.g. an open
+    // pumped before drawEcadEditor/drawEcadManagerBody have ever run), so the
+    // response lands in the active tab's own state, not the process fallback.
     ui::ecadPrimeActiveApp(st);
     static WS ecadPrevWsForInit = WS::Model;
     if (ws != ecadPrevWsForInit) {
+      core::framestats::Scope timing("workspace_transition");
       // Leaving a workspace: discard its untouched auto-created starter doc
-      // (blank PCB1, an untouched starter Part, etc.) so a blank initial
-      // document doesn't linger. Runs BEFORE the Electronics auto-init below so
-      // entering Electronics from a blank Model drops that starter part first,
-      // then creates PCB1. Never closes the last tab.
+      // (an untouched starter Part) so a blank initial document doesn't
+      // linger. Never closes the last tab.
       st.discardWorkspaceStarter(ecadPrevWsForInit);
       // discardWorkspaceStarter -> closeDocTab -> neighbor switchToTab can flip
       // the workspace (a Part neighbor pulls to Model); re-assert the workspace
@@ -7547,11 +8421,6 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       st.activeWorkspace = ws;
       if (ws == WS::Electronics) {
         st.wantFocusEcad = 2; // pop the ECAD tab forward for a couple of frames
-        // Auto-init a default PCB1 board on first entry with nothing open, so
-        // the user lands in a usable layout (item 1). Edge-triggered here
-        // (once), never in the draw path. No-op when a doc is already open;
-        // graceful fallback on worker error.
-        ecadAutoInitBoard(st);
       } else if (ecadPrevWsForInit == WS::Electronics) {
         st.wantFocusEcad = 0;     // cancel any pending grab from the stay
         st.wantFocusViewport = 2; // bring the 3D view back to the central node
@@ -7609,11 +8478,14 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       // pinned column serves every workspace.
       const bool showLeftPane = true;
       if (st.propertyManager->active()) {
+        core::framestats::Scope timing("property_manager");
         st.propertyManager->tick(st);
         if (showLeftPane)
           st.showFeatureTree = true;
       }
       if (st.showFeatureTree && showLeftPane) {
+        core::framestats::Scope timing(st.propertyManager->active()
+                                          ? "property_manager" : "feature_tree");
         // Pass the effective tab as a temporary override via the AppState
         // field; restore after. drawLeftPane reads st.leftPaneTab directly, so
         // we temporarily set it per-frame.
@@ -7621,6 +8493,16 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         if (effectiveLeftTab != savedTab)
           st.leftPaneTab = effectiveLeftTab;
         ui::drawLeftPane(st, [&st](const std::string &fid) {
+          const auto& tree = st.docMirror.tree();
+          if (tree.contains("features") && tree["features"].is_array()) {
+            for (const auto& f : tree["features"]) {
+              if (f.is_object() && f.value("id", std::string()) == fid &&
+                  f.value("type", std::string()) == "scad") {
+                ui::openScadEditor(st, st.docMirror.docId(), fid);
+                return;
+              }
+            }
+          }
           st.propertyManager->openForEdit(st, fid);
         });
         if (effectiveLeftTab != savedTab)
@@ -7635,6 +8517,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // expanded chat on the same st.chat state — drawing both would double the
     // conversation panel.
     if (ws != WS::AI && !webActive) {
+      core::framestats::Scope timing("copilot");
       // Copilot busy/enabled are PER CONVERSATION: a run in some other
       // conversation must never lock the composer of the one on screen.
       const bool chatBusy = st.convRunning(st.activeConvId());
@@ -7659,11 +8542,17 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       // camActiveBackplot viewport overlay ("Show in 3D").
       const bool skipViewport = (ws == WS::Electronics);
       if (!skipViewport) {
-        if (st.wantFocusViewport > 0) {
+        // Focusing a dock window closes popups above it, including first-run and recovery modals.
+        // Keep the request pending until the user finishes the popup.
+        if (st.wantFocusViewport > 0 &&
+            !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) {
           ImGui::SetNextWindowFocus();
           st.wantFocusViewport--;
         }
-        ui::drawViewportPanel(st, io, busy);
+        {
+          core::framestats::Scope timing("viewport");
+          ui::drawViewportPanel(st, io, busy);
+        }
       }
     }
     // Manufacture owns no floating operator surface any more: Devices / Run /
@@ -7671,14 +8560,15 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // mode strip is chrome under the ribbon (above). This call only bootstraps
     // the mirror's list RPCs and hosts the approval dialog.
     if (!webActive && ws == WS::Manufacture) {
+      core::framestats::Scope timing("manufacture");
       ui::drawManufacturePanel(st);
       ui::camDrawPostConfirm(st);
     }
 
     if (!wsFullBody) {
       // ---- ECAD editor (Electronics workspace or when an ECAD doc is open)
-      // ---- The workspace-entry edge trigger (auto-init PCB1 + arming
-      // wantFocusEcad/ wantFocusViewport) now runs ABOVE drawLeftPane — see the
+      // ---- The workspace-entry edge trigger (arming wantFocusEcad /
+      // wantFocusViewport) runs ABOVE drawLeftPane — see the
       // hoisted block above. This must stay edge-triggered: SetNextWindowFocus
       // -> FocusWindow steals ImGui's ActiveId from widgets in every other
       // window, so a continuous per-frame grab would cancel any click outside
@@ -7695,8 +8585,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         ImGui::SetNextWindowFocus();
         st.wantFocusEcad--;
       }
-      if (wsShowEcad)
+      if (wsShowEcad) {
+        core::framestats::Scope timing("ecad");
         ui::drawEcadEditor(st); // ECAD 2D editor
+      }
     }
 
 
@@ -7706,6 +8598,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // directly into the overlay band area as floating non-docked glass panels,
     // same pattern as drawLeftPane).
     if (!webActive && (ws == WS::PLM || ws == WS::PartsLibrary)) {
+      core::framestats::Scope timing(ws == WS::PLM ? "plm" : "parts_library");
       // PLM / Parts Library: full-body workspaces. The body functions emit
       // widgets directly (no Begin of their own), so host them in ONE
       // borderless window spanning the whole central band — otherwise ImGui
@@ -7742,6 +8635,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         ImGui::End();
       }
     } else if (!webActive && ws == WS::AI) {
+      core::framestats::Scope timing("ai_workspace");
       // AI workspace: full-body AI hub spanning the whole central band —
       // [sessions + sub-agents rail] | [expanded Copilot chat / project DAG] |
       // [AI settings]. Unlike PLM/Parts this fills to band.maxX (drawAIPanel's
@@ -7766,6 +8660,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         ImGui::End();
       }
     } else if (!webActive && ws == WS::ReverseEng) {
+      core::framestats::Scope timing("reverse_eng");
       // RE-ANCHOR(reveng): full-body Reverse Engineering workspace
       // (RE-03/RE-19/RE-21).
       const ui::OverlayBand &band = ui::overlayBand();
@@ -7789,6 +8684,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         ImGui::End();
       }
     } else if (!webActive && ws == WS::Firmware) {
+      core::framestats::Scope timing("firmware");
       // Full-body Firmware workspace (project rail |
       // build/emulation/trace | fw_status-gated backend rail). Same borderless
       // central-band host as PLM/RevEng.
@@ -7823,13 +8719,35 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // the single central renderer for the frame (viewport / left pane /
     // full-body workspaces above are all suppressed via wsFullBody|webActive) —
     // one body owner = no focus/z fights.
-    if (webActive)
+    if (webActive) {
+      core::framestats::Scope timing("web");
       ui::drawWebBrowserPanel(st);
+    }
 
     // App-owned ECAD command dialogs remain reachable regardless of whether
     // the editor is empty or already showing a document.
+    core::framestats::Scope dialogsTiming("dialogs");
     ecadDrawCommandDialogs(st);
 
+    // Hub actions share the ribbon's availability and dispatch path.
+    if (!st.ecadPanelCmd.empty()) {
+      const std::string c = st.ecadPanelCmd;
+      const std::string origin = st.ecadPanelDocId;
+      const int analysis = st.ecadPanelSimAnalysis;
+      st.ecadPanelCmd.clear();
+      st.ecadPanelDocId.clear();
+      if (c == "ecad_simulate" && !origin.empty()) {
+        st.ecadSimRequestedDocId = origin;
+        st.ecadSimRequestedAnalysis = analysis;
+        st.ecadSimGo = true;
+      } else if (!origin.empty() &&
+                 (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size() ||
+                  st.docTabs[st.activeTab].ecadDocId != origin)) {
+        st.toast(ui::ToastLevel::Warn, "Electronics selection changed; choose the action again.");
+      } else if (st.ribbonDispatch) {
+        st.ribbonDispatch(c.c_str());
+      }
+    }
     if (st.ecadAiGo) {
       st.ecadAiGo = false;
       ecadAiDesign(st, st.ecadAiRequest);
@@ -7838,37 +8756,21 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       st.ecadAiBoardGo = false;
       ecadAiBoard(st, st.ecadAiRequest);
     } // Wave U
-    if (st.ecadOpsGo) {
-      st.ecadOpsGo = false;
-      ecadApplyOps(st, st.ecadPendingOps);
-    } // Wave Q
     if (st.ecadSimGo) {
       st.ecadSimGo = false;
-      ecadSimulate(st);
+      const std::string source = std::move(st.ecadSimRequestedDocId);
+      st.ecadSimRequestedDocId.clear();
+      ecadSimulate(st, source, st.ecadSimRequestedAnalysis);
     } // native simulator
-    if (st.ecadUndoGo) {
-      st.ecadUndoGo = false;
-      ecadUndo(st);
-    } // ECAD history undo
-    if (st.ecadRedoGo) {
-      st.ecadRedoGo = false;
-      ecadRedo(st);
-    } // ECAD history redo
-    // Panel-owned toolbar action (item 3 check buttons): route through the
-    // shared ribbon handler so Annotate / Update Board behave identically
-    // whether fired from the ribbon or the panel.
-    if (!st.ecadPanelCmd.empty()) {
-      const std::string c = st.ecadPanelCmd;
-      st.ecadPanelCmd.clear();
-      ecadDispatch(st, c);
-    }
 
     // ---------- C19: simulation (active doc) + evaluate dialogs ----------
     // The active document's SimManager drains its own SimClient job
     // (owner-gated) and loads result overlays. Its tree + setup forms render in
     // the left pane's Simulation tab (drawLeftPane).
-    if (st.simManager)
+    if (st.simManager) {
+      core::framestats::Scope timing("simulation");
       st.simManager->tick(st);
+    }
     st.evaluateDialogs->draw(
         st); // active doc's Measure/Mass/Section windows (per-doc; re-seated)
 
@@ -7920,9 +8822,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         // After the agent choice: dirty user docs still get the save prompt,
         // otherwise the quit proceeds.
         auto proceedQuit = [&st, win] {
-          bool anyDirty = false;
+          bool anyDirty = st.hasPendingHumanMutations();
           for (const auto &t : st.docTabs)
-            if (t.dirty && (!t.aiHandoff || t.userAdopted)) {
+            if (t.dirty) {
               anyDirty = true;
               break;
             }
@@ -7974,6 +8876,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // the re-issued close request falls through the guard to the real exit.
     {
       static bool s_quitModalOpen = false;
+      static bool s_quitSavePending = false;
       if (st.wantQuitConfirm) {
         st.wantQuitConfirm = false;
         s_quitModalOpen = true;
@@ -7984,16 +8887,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           ImVec2(vp->Pos.x + vp->Size.x * 0.5f, vp->Pos.y + vp->Size.y * 0.5f),
           ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
       bool open = true;
-      if (ImGui::BeginPopupModal("Quit Chudware?##appquit", &open,
+      if (ImGui::BeginPopupModal("Quit Chudware?##appquit", s_quitSavePending ? nullptr : &open,
                                  ImGuiWindowFlags_AlwaysAutoResize |
                                      ImGuiWindowFlags_NoSavedSettings)) {
-        // Only USER-owned docs (own tabs + adopted AI mirrors) are the user's
-        // to save — pure AI mirror tabs are the agent's responsibility and are
-        // covered by the daemon recovery tier, so they're excluded from this
-        // prompt (no false positives).
-        auto userOwnedDirty = [](const AppState::DocTab &t) {
-          return t.dirty && (!t.aiHandoff || t.userAdopted);
-        };
+        auto userOwnedDirty = [](const AppState::DocTab &t) { return t.dirty; };
         int n = 0;
         for (const auto &t : st.docTabs)
           if (userOwnedDirty(t))
@@ -8008,15 +8905,20 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         ImGui::TextUnformatted("Save before quitting?");
         ImGui::Spacing();
         const float bw = 150.0f * scale;
+        const bool waitForEdits = st.hasPendingHumanMutations();
+        const bool controlsDisabled = s_quitSavePending || waitForEdits;
+        if (waitForEdits) ImGui::TextUnformatted("Waiting for pending edits...");
+        if (controlsDisabled) ImGui::BeginDisabled();
         if (ImGui::Button("Save All & Quit", ImVec2(bw, 0))) {
-          if (saveAllDirtyForQuit(st)) {
+          s_quitSavePending = true;
+          saveAllTabs(st, true, [&st, win](bool ok, int) {
+            s_quitSavePending = false;
+            if (!ok) return;
             st.quitConfirmed = true;
-            glfwSetWindowShouldClose(win, GLFW_TRUE);
             s_quitModalOpen = false;
-            ImGui::CloseCurrentPopup();
-          }
-          // else: a Save-As was cancelled — keep the modal up so nothing is
-          // lost.
+            glfwSetWindowShouldClose(win, GLFW_TRUE);
+          });
+          if (!s_quitModalOpen) ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
         if (ImGui::Button("Quit Without Saving",
@@ -8031,6 +8933,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           s_quitModalOpen = false;
           ImGui::CloseCurrentPopup();
         }
+        if (controlsDisabled) ImGui::EndDisabled();
         ImGui::EndPopup();
       }
       if (!open)
@@ -8038,25 +8941,29 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     }
 
     // ---------- orphan recovery prompt (daemon mode) ----------
-    // Raised from the daemon bootstrap (st.recoveryPromptCount) when the daemon
+    // Raised from the daemon bootstrap (st.recoveryPrompt) when the daemon
     // reports retired docs from a previous session awaiting explicit recovery.
-    // Recover opens them all (tabs then appear via the normal doc.opened mirror
-    // path); Discard drops them daemon-side; Later just dismisses — the daemon
-    // keeps the entries, so the prompt returns on the next app start.
+    // Recover reopens them one at a time in the background (recoverNextOrphan);
+    // Discard drops them daemon-side; Later just dismisses — the daemon keeps
+    // the entries, so the prompt returns on the next app start.
     {
+      // Saved display tier -> every open part/assembly doc (restart restore + docs opened later).
+      st.syncDisplayQuality();
+      // User-owned viewport toggles / modeless View windows -> Settings (saved only when changed).
+      st.persistViewPrefs();
       if (std::string configWarning = takeConfigCorruptionWarning();
           !configWarning.empty())
         st.toast(ui::ToastLevel::Warn, std::move(configWarning));
-      static int s_recoveryCount = 0;
+      static std::vector<AppState::RecoveryEntry> s_recoveryEntries;
       // Never raise it during a headless capture: this modal is centred and app-modal, so it
       // covered the very panel every CHUDWARE_SHOT scenario exists to photograph (the reveng_*
       // captures were all screenshotting this dialog). Shot runs are throwaway processes and
       // must not answer recover/discard on the user's behalf, so just leave the entries alone —
       // "Later" is the daemon-side no-op and this is equivalent to it.
-      if (st.recoveryPromptCount > 0 && shot) st.recoveryPromptCount = 0;
-      if (st.recoveryPromptCount > 0) {
-        s_recoveryCount = st.recoveryPromptCount;
-        st.recoveryPromptCount = 0;
+      if (!st.recoveryPrompt.empty() && shot) st.recoveryPrompt.clear();
+      if (!st.recoveryPrompt.empty()) {
+        s_recoveryEntries = std::move(st.recoveryPrompt);
+        st.recoveryPrompt.clear();
         st.recoveryModalOpen = true;
       }
       if (st.recoveryModalOpen)
@@ -8068,46 +8975,38 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       if (ImGui::BeginPopupModal("Recover unsaved parts?##recovery", &ropen,
                                  ImGuiWindowFlags_AlwaysAutoResize |
                                      ImGuiWindowFlags_NoSavedSettings)) {
-        ImGui::Text("%d unsaved part%s from a previous session.",
-                    s_recoveryCount, s_recoveryCount == 1 ? "" : "s");
+        const size_t n = s_recoveryEntries.size();
+        ImGui::Text("%zu unsaved part%s from a previous session:", n,
+                    n == 1 ? "" : "s");
+        ImGui::Spacing();
+        // Name every part: a bare count gave no way to tell real work from an
+        // agent's scratch copies before committing to reopen all of them.
+        const float rowH = ImGui::GetTextLineHeightWithSpacing();
+        if (ImGui::BeginChild("##recovery_names",
+                              ImVec2(360.0f * scale,
+                                     rowH * static_cast<float>(std::min<size_t>(n, 10)) +
+                                         ImGui::GetStyle().WindowPadding.y * 2.0f),
+                              ImGuiChildFlags_Borders)) {
+          for (const auto &e : s_recoveryEntries)
+            ImGui::BulletText("%s", e.name.c_str());
+        }
+        ImGui::EndChild();
         ImGui::Spacing();
         ImGui::TextUnformatted("Recover them now, or discard them for good?");
         ImGui::Spacing();
         const float bw = 110.0f * scale;
         if (ImGui::Button("Recover", ImVec2(bw, 0))) {
-          if (auto *c = engine::client()) {
-            nlohmann::json r;
-            std::string e;
-            if (c->call("recovery_open", nlohmann::json{{"all", true}}, r, e)) {
-              // The daemon minted a fresh doc for each recovered
-              // orphan and returned their doc_ids in `opened`. Its
-              // doc.opened fanout EXCLUDES us (the caller), so mirror
-              // the tabs here from the return value — otherwise the
-              // recovered parts only surface on the next app launch.
-              std::vector<std::string> ids;
-              if (r.is_object() && r.contains("opened") &&
-                  r["opened"].is_array()) {
-                for (const auto &o : r["opened"])
-                  if (o.is_object() && o.contains("doc_id") &&
-                      o["doc_id"].is_string())
-                    ids.push_back(o["doc_id"].get<std::string>());
-              }
-              core::mirrorRecoveredDocs(st, ids);
-              const int n = static_cast<int>(ids.size());
-              if (n < s_recoveryCount) {
-                st.toast(ui::ToastLevel::Warn,
-                         "Recovered " + std::to_string(n) + " of " +
-                             std::to_string(s_recoveryCount) + " parts — " +
-                             std::to_string(s_recoveryCount - n) +
-                             " could not be reopened (they remain recoverable next launch)");
-              } else {
-                st.toast(ui::ToastLevel::Info, "Recovered " + std::to_string(n) +
-                                                   " part" + (n == 1 ? "" : "s"));
-              }
-            } else {
-              st.toast(ui::ToastLevel::Error, "Recovery failed: " + e);
-            }
+          if (engine::client() && !s_recoveryEntries.empty()) {
+            auto run = std::make_shared<OrphanRecoveryRun>();
+            run->entries = std::move(s_recoveryEntries);
+            st.recoveryInFlight = true;
+            st.toast(ui::ToastLevel::Info,
+                     "Recovering " + std::to_string(run->entries.size()) +
+                         " part" + (run->entries.size() == 1 ? "" : "s") +
+                         " in the background — each tab opens when it is ready");
+            recoverNextOrphan(st, std::move(run));
           }
+          s_recoveryEntries.clear();
           st.recoveryModalOpen = false;
           ImGui::CloseCurrentPopup();
         }
@@ -8116,22 +9015,27 @@ int run_gui(const char *screenshotPath, const char *openPath) {
           if (auto *c = engine::client()) {
             nlohmann::json r;
             std::string e;
-            if (!c->call("recovery_discard", nlohmann::json{{"all", true}}, r,
-                         e))
+            nlohmann::json ids = nlohmann::json::array();
+            for (const auto &entry : s_recoveryEntries) ids.push_back(entry.id);
+            if (!c->call("recovery_discard", nlohmann::json{{"ids", ids}}, r, e))
               st.toast(ui::ToastLevel::Error, "Discard failed: " + e);
           }
+          s_recoveryEntries.clear();
           st.recoveryModalOpen = false;
           ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
         if (ImGui::Button("Later", ImVec2(90.0f * scale, 0))) {
+          s_recoveryEntries.clear();
           st.recoveryModalOpen = false;
           ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();
       }
-      if (!ropen)
+      if (!ropen) {
+        s_recoveryEntries.clear();
         st.recoveryModalOpen = false; // title-bar X = Later
+      }
     }
 
     // ---------- mesh-export tessellation options ----------
@@ -8273,6 +9177,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // node (double-click) or View > Equations. Lists doc.equations.globals;
     // add/edit -> eq_set, delete -> eq_delete, then reloads the mesh.
     ui::drawEquationsDialog(st);
+    ui::drawScadEditor(st);
 
     // Configurations now lives inside the left manager's ConfigurationManager
     // tab, matching the commercial CAD mental model instead of floating as a
@@ -8290,6 +9195,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // members grouped by profile + length into rows with quantities. No-op
     // unless st.showCutListPanel.
     cutListPanel.draw(st);
+    dialogsTiming.stop();
 
     // ---------- C15 pick-shot driver: simulate a center-screen pick ----------
     // The viewport panel rendered the id buffer for this frame's camera; pick
@@ -8318,41 +9224,8 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     }
 
     // ---------- modals ----------
+    core::framestats::Scope modalsTiming("dialogs");
     ui::drawSettingsModal(st, busy);
-#ifndef __EMSCRIPTEN__
-    {
-      const auto update = chudware::update::globalUpdater().snapshot();
-      if (update.mandatory) {
-        ImGui::SetNextWindowPos(vp->Pos, ImGuiCond_Always);
-        ImGui::SetNextWindowSize(vp->Size, ImGuiCond_Always);
-        ImGui::SetNextWindowViewport(vp->ID);
-        ImGui::Begin("##MandatoryUpdate", nullptr,
-                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                         ImGuiWindowFlags_NoSavedSettings |
-                         ImGuiWindowFlags_NoDocking);
-        const float width = std::min(520.0f * ui::uiScale,
-                                     ImGui::GetContentRegionAvail().x);
-        ImGui::SetCursorPos(
-            ImVec2((ImGui::GetWindowWidth() - width) * 0.5f,
-                   ImGui::GetWindowHeight() * 0.30f));
-        ImGui::BeginGroup();
-        ImGui::PushFont(st.fonts.h1);
-        ImGui::TextUnformatted("A mandatory update is required");
-        ImGui::PopFont();
-        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + width);
-        ImGui::TextWrapped("%s", update.message.c_str());
-        ImGui::TextWrapped(
-            "This version can no longer connect to Chudware services. "
-            "Your documents remain on this computer.");
-        ImGui::PopTextWrapPos();
-        if (!update.downloadUrl.empty() &&
-            ImGui::Button("Download update", ImVec2(180.0f * ui::uiScale, 0)))
-          ui::openExternalHttpUrl(update.downloadUrl);
-        ImGui::EndGroup();
-        ImGui::End();
-      }
-    }
-#endif
 
     // Provider brand icons: drain the requests queued by every drawProviderLogo() call this
     // frame (composer model chip, Settings rows, …). This MUST live in the always-drawn frame
@@ -8365,6 +9238,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // ----------
     ui::drawProfilerWindow(st);
     ui::drawCommandSearch(st);
+    modalsTiming.stop();
 
     // ---------- click empty space (any panel whitespace) to deselect
     // everything ---------- The viewport's own full-window input surface
@@ -8377,7 +9251,13 @@ int run_gui(const char *screenshotPath, const char *openPath) {
 
     // ---------- splash notifications (top-left glass; click to copy + clear)
     // ----------
-    ui::drawToasts(st);
+    {
+      core::framestats::Scope timing("toasts");
+      ui::drawToasts(st);
+    }
+#ifdef CHUDWARE_ENABLE_CEF
+    ui::CefWebView::finishFrame();
+#endif
 
     // ---------- W1-B: consume this frame's cursor request (item 3) ----------
     // After all panels have had a chance to call st.requestCursor(); suspends
@@ -8385,7 +9265,10 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // cursor was requested, else restores.
     ui::applyCursorRequest(st, win);
 
-    ImGui::Render();
+    {
+      core::framestats::Scope timing("imgui_render");
+      ImGui::Render();
+    }
 #ifdef __EMSCRIPTEN__
     wasmPublishTextInput();
 #endif
@@ -8395,105 +9278,13 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     glClearColor(ui::palette.windowBg[0], ui::palette.windowBg[1],
                  ui::palette.windowBg[2], 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
-    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-
-    // RE-40: Reverse-Engineering 3D preview slots. The RE panels reserve screen
-    // rects via ui::reveng::kit::Viewport3DPreview() during the ImGui pass and
-    // publish them per-frame; we render into those rects here, after ImGui, so
-    // the GL content composites over the reserved (empty-framed) region.
-    //
-    // Previously the splat was drawn with a full-window viewport and a fixed
-    // look-at, so it ignored where the panel actually was and smeared across the
-    // whole workspace. Now each slot draws inside its own scissored rect.
-    if (st.activeWorkspace == AppState::Workspace::ReverseEng) {
-      ui::reveng::RevEngState &rs = ui::reveng::S();
-      const ImGuiIO &pio = ImGui::GetIO();
-      const float sx =
-          pio.DisplaySize.x > 0.0f ? (float)dw / pio.DisplaySize.x : 1.0f;
-      const float sy =
-          pio.DisplaySize.y > 0.0f ? (float)dh / pio.DisplaySize.y : 1.0f;
-
-      // Map an ImGui screen rect (top-left origin, logical px) onto the GL
-      // viewport (bottom-left origin, framebuffer px). Returns false when the
-      // rect is degenerate or fully off-screen.
-      auto slotViewport = [&](const ImRect &r, int &vx, int &vy, int &vw,
-                              int &vh) -> bool {
-        vx = (int)(r.Min.x * sx);
-        vw = (int)((r.Max.x - r.Min.x) * sx);
-        vh = (int)((r.Max.y - r.Min.y) * sy);
-        vy = dh - (int)(r.Max.y * sy);  // flip Y
-        return vw > 1 && vh > 1 && vx < dw && vy < dh &&
-               vx + vw > 0 && vy + vh > 0;
-      };
-
-      // Preserve the existing sparse-cloud framing; Gaussian previews have
-      // their own bounds-fitted interactive camera in the workspace.
-      auto slotCamera = [](int vw, int vh) {
-        Renderer::CameraXform cam;
-        cam.ssWidth = vw;
-        cam.ssHeight = vh;
-        Vec3 eye{22.0f, 18.0f, 38.0f};
-        Vec3 center{0.0f, 0.0f, 7.5f};
-        Vec3 up{0.0f, 0.0f, 1.0f};
-        float aspect = vh > 0 ? (float)vw / (float)vh : 1.0f;
-        Mat4 proj =
-            perspective(35.0f * 3.14159265f / 180.0f, aspect, 1.0f, 500.0f);
-        cam.mvp = mul(proj, lookAt(eye, center, up));
-        cam.eye = eye;
-        cam.center = center;
-        cam.radius = 20.0f;
-        return cam;
-      };
-
-      auto drawSlot = [&](ui::reveng::kit::PreviewSlot slot,
-                          const std::function<void(const Renderer::CameraXform &)>
-                              &render) {
-        ImRect r, clip;
-        if (!ui::reveng::kit::previewSlotRect(slot, r) ||
-            !ui::reveng::kit::previewSlotClip(slot, clip)) return;
-        int vx = 0, vy = 0, vw = 0, vh = 0;
-        if (!slotViewport(r, vx, vy, vw, vh)) return;
-        int cx = 0, cy = 0, cw = 0, ch = 0;
-        if (!slotViewport(clip, cx, cy, cw, ch)) return;
-        GLint previousScissor[4];
-        GLboolean previousDepthMask = GL_TRUE;
-        const GLboolean scissorEnabled = glIsEnabled(GL_SCISSOR_TEST);
-        glGetIntegerv(GL_SCISSOR_BOX, previousScissor);
-        glGetBooleanv(GL_DEPTH_WRITEMASK, &previousDepthMask);
-        glViewport(vx, vy, vw, vh);
-        glEnable(GL_SCISSOR_TEST);
-        glScissor(std::max(0, cx), std::max(0, cy),
-                  std::min(dw, cx + cw) - std::max(0, cx),
-                  std::min(dh, cy + ch) - std::max(0, cy));
-        // ImGui clears color only. Stale default-framebuffer depth must not
-        // occlude this independent preview; never clear outside its slot.
-        glDepthMask(GL_TRUE);
-        const GLfloat clearDepth = 1.0f;
-        glClearBufferfv(GL_DEPTH, 0, &clearDepth);
-        glDepthMask(previousDepthMask);
-        render(slot == ui::reveng::kit::PreviewSlot::Splat
-                   ? ui::reveng::gaussianPreviewCamera(vw, vh)
-                   : slotCamera(vw, vh));
-        glScissor(previousScissor[0], previousScissor[1],
-                  previousScissor[2], previousScissor[3]);
-        if (!scissorEnabled) glDisable(GL_SCISSOR_TEST);
-      };
-
-      // RE-27: 3DGS splat (Brush export) — the Reconstruct stage's splat slot.
-      if (rs.splatLoaded && rs.splat.hasSplats()) {
-        drawSlot(ui::reveng::kit::PreviewSlot::Splat,
-                 [&](const Renderer::CameraXform &cam) { rs.splat.draw(cam); });
-      }
-      // RE-21/RE-40: sparse point cloud + camera frusta. RevEngState::rePoints
-      // has been populated since RE-21 but had NO draw call anywhere in the
-      // tree, so the sparse preview was always empty. It is drawn here now.
-      if (rs.rePoints.hasPoints() || rs.rePoints.hasFrusta()) {
-        drawSlot(ui::reveng::kit::PreviewSlot::SparseCloud,
-                 [&](const Renderer::CameraXform &cam) { rs.rePoints.draw(cam); });
-      }
-      glViewport(0, 0, dw, dh);
+    {
+      core::framestats::Scope timing("imgui_draw");
+      ui::adaptCopilotTextToBackdrop(ImGui::GetDrawData());
+      ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
     }
 
+#ifndef __EMSCRIPTEN__
     // Scripted-scenario per-step captures + frame-loop control
     // (m1/sketch/asm/fea/evalmass/ activity): endFrame() writes any pending
     // step screenshot from the backbuffer, mirrors the final step to
@@ -8501,6 +9292,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // loop iteration short (was the inline swap+continue) or ended the loop
     // (swap+break).
     {
+      core::framestats::Scope timing("capture");
       ui::ScenarioRunner::FrameAction act =
           scenarios.endFrame(st, dw, dh, screenshotPath);
       if (act == ui::ScenarioRunner::FrameAction::Break)
@@ -8513,6 +9305,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
         continue;
       }
     }
+#endif
 
     // tree shot needs extra frames for the tree to repaint after async doc load
     // wantTree but !treeShotDone: keep waiting (up to 30 frames) for the worker
@@ -8525,10 +9318,24 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     if (st.wantEquations)
       shotFrame = st.equationsShotDone ? 10 : 30;
     if (st.wantEcad) {
-      if (!st.ecadShotDone)
-        shotFrame = 150; // worker + design
+      if (!st.ecadShotDone || !st.ecadKicadStatusKnown) {
+        static const auto started = std::chrono::steady_clock::now();
+        if (std::chrono::steady_clock::now() - started > std::chrono::seconds(90)) {
+          std::fprintf(stderr, "[ecad-shot] timed out waiting for fixture and KiCad status\n");
+          shotExitCode = 1;
+          break;
+        }
+        shotFrame = 99999; // wait for the fixture and resolved installation state
+      }
       else if (ecadSimShotActive(st) && ecadSimRunState().running)
         shotFrame = 99999; // deterministic sim shot: wait for async completion
+      else if (ecadSimShotActive(st) &&
+               (!st.ecadSimResults.is_object() || st.ecadSimResults.empty())) {
+        std::fprintf(stderr, "[ecad-shot] circuit simulation produced no results: %s\n",
+                     st.status.c_str());
+        shotExitCode = 1;
+        break;
+      }
       else if (st.wantFocusViewport > 0 || st.wantFocusEcad > 0)
         shotFrame = 99999; // let focus settle
       else
@@ -8561,12 +9368,24 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       // than hanging the harness forever.
       shotFrame = plmShotAt > 0 ? plmShotAt : (st.frame >= 1200 ? st.frame : 99999);
     }
-    // Parts Library: its taxonomy/vendor fetches queue behind startup traffic on the single
-    // async RPC lane, so capture once they have settled (bounded, never the 99999 abort path).
+    // Parts Library: wait for catalog/search and visible previews, with a
+    // wall-clock ceiling independent of the renderer's variable frame rate.
     if (shot && shotMode && std::strcmp(shotMode, "parts") == 0) {
       static int partsShotAt = -1;
+      static const auto partsShotDeadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(60);
       if (partsShotAt < 0 && st.frame > 6 && ui::partsLibrarySettled(st)) partsShotAt = st.frame + 8;
-      shotFrame = partsShotAt > 0 ? partsShotAt : 900;
+      shotFrame = partsShotAt > 0 ? partsShotAt :
+          (std::chrono::steady_clock::now() >= partsShotDeadline ? st.frame :
+           std::numeric_limits<int>::max());
+    }
+    // Explorer: capture once document previews have rendered (and any scripted open landed),
+    // bounded so a wedged load still produces a picture.
+    if (shot && shotMode && std::strcmp(shotMode, "explorer") == 0) {
+      static int explorerShotAt = -1;
+      if (explorerShotAt < 0 && st.frame > 6 && ui::fileExplorerShotSettled(st))
+        explorerShotAt = st.frame + 12;
+      shotFrame = explorerShotAt > 0 ? explorerShotAt : 1500;
     }
     // iconpipe: keep the loop alive (offscreen icon renders happen in
     // tick()) until every recipe is captured, then exit promptly — the --shot
@@ -8582,6 +9401,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // => final post-reconnect shot at that absolute frame.
     if (st.wantDaemonH2) {
       if (st.daemonH2CaptureFrame == -1) {
+        core::framestats::Scope timing("capture");
         const char *slash = std::strrchr(screenshotPath, '/');
         std::string midPath = slash ? std::string(screenshotPath, slash + 1) +
                                           "daemon_h2_notice.png"
@@ -8605,6 +9425,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     // Enter) as a mid PNG; the final capture at frame 8 shows the accepted fill.
     if (st.wantCopilotSlash) {
       if (st.frame == 4) {
+        core::framestats::Scope timing("capture");
         const char *slash = std::strrchr(screenshotPath, '/');
         std::string midPath = slash ? std::string(screenshotPath, slash + 1) +
                                           "copilot_slash_menu.png"
@@ -8626,6 +9447,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       break;
     }
     if (shot && ++st.frame >= shotFrame) {
+      core::framestats::Scope timing("capture");
       std::vector<unsigned char> px(dw * dh * 4);
       glReadBuffer(GL_BACK);
       glReadPixels(0, 0, dw, dh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
@@ -8636,7 +9458,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
       std::printf("ui screenshot -> %s (%dx%d)\n", screenshotPath, dw, dh);
       break;
     }
-    glfwSwapBuffers(win);
+    swapFrameBuffers(win);
 #ifndef __EMSCRIPTEN__
     if (!s_nativeStartup.firstFramePresented) {
       s_nativeStartup.firstFramePresented = true;
@@ -8658,31 +9480,26 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     emscripten_sleep(0);
 #endif
   }
+  core::framestats::flushReport();
+  // RPC-backed settings edits (skills/rules editors, model-assignment draft) must be handed to
+  // the worker while the RPC layer is still up: st.rpc.shutdown() below aborts the in-flight call.
+  if (!shot)
+    ui::flushSettingsModalRpcEdits(st);
+  core::shutdownEngineEvents();
 
   // Release any in-flight RPC before quit cleanup takes the daemon client's lock.
   if (std::getenv("CHUDWARE_DEBUG_SHUTDOWN"))
     std::fprintf(stderr, "[td] rpc.shutdown\n");
+#ifndef __EMSCRIPTEN__
+  ecadRecoveryShutdown(st);
+  guiConnection.shutdown();
+#endif
   st.rpc.shutdown(); // Abort the in-flight one before bounded cleanup.
+  st.authRpc.shutdown();
+  st.waitWorkerStartup();
 
-  // Clean-exit signal (daemon mode): closing the app normally is a DELIBERATE
-  // exit. In-flight agent runs are NOT cancelled here — they execute
-  // daemon-side and survive by design; the quit modal already gave the user
-  // the explicit "Stop agent & quit" choice (agent_cancel) when a run was
-  // live, and hostd exits on its own once the work finishes.
-  //  * USER-owned docs (own tabs + adopted AI mirrors): doc_discard — drop the
-  //  parts we're
-  //    leaving unsaved so, once abandoned, the daemon doesn't retire them and
-  //    flood the "Recover unsaved parts?" prompt next launch. This is what
-  //    makes recovery CRASH-ONLY for user docs (a crash never reaches this
-  //    teardown, so its docs are retired + offered). The user was already
-  //    warned about these by the quit modal.
-  //  * PURE AI mirror tabs (un-adopted): only detach_doc — never discard. The
-  //  agent may still
-  //    be building the doc (discard would degrade to detach anyway), but if the
-  //    agent already finished a DIRTY doc, discarding here would purge its
-  //    autosave and lose the work. A plain detach leaves it for the daemon's
-  //    GC/retire tier so it's recoverable — closing the real data-loss hole.
-  //    Screenshot/headless runs skip it.
+  // Detach clean tabs without destroying agent work. Only an explicitly confirmed
+  // quit-without-saving may discard a tab with outstanding human edits.
   if (!shot && engine::daemonMode()) {
     if (auto *c = engine::client()) {
       const auto deadline = std::chrono::steady_clock::now() +
@@ -8695,11 +9512,11 @@ int run_gui(const char *screenshotPath, const char *openPath) {
                                    deadline - std::chrono::steady_clock::now()).count();
         if (remaining <= 0)
           break;
-        const bool userOwned = !t.aiHandoff || t.userAdopted;
+        const bool discardHumanEdits = t.dirty && st.quitConfirmed;
         nlohmann::json res;
         std::string err;
         const int timeoutMs = remaining > 3000 ? 3000 : static_cast<int>(remaining);
-        if (!c->call(userOwned ? "doc_discard" : "detach_doc", {{"doc_id", t.docId}},
+        if (!c->call(discardHumanEdits ? "doc_discard" : "detach_doc", {{"doc_id", t.docId}},
                      res, err, timeoutMs)) {
           st.addLog("[tabs] quit cleanup stopped: " + err);
           break; // A timed-out call would reconnect before the next one.
@@ -8708,6 +9525,9 @@ int run_gui(const char *screenshotPath, const char *openPath) {
     }
   }
 
+  // Debounced settings autosaves (system-prompt / role-prompt editors) commit here; the config
+  // writer itself is drained by stopMeshLoader()'s flushConfigWrites() below.
+  ui::flushSettingsModalEdits(st);
   ui::shutdownAgentControl(st);
   ui::flushChatPersistence(st); // drain transcript and draft writes before teardown
   ui::freeIcons(); // C14: release atlas textures while GL context is still live
@@ -8733,6 +9553,7 @@ int run_gui(const char *screenshotPath, const char *openPath) {
   // RE-40: release the RE workspace's camera + GL textures while the context is
   // still current (must precede ImGui_ImplOpenGL3_Shutdown / glfwDestroyWindow).
   ui::revengWorkspaceTeardown();
+  ui::shutdownBackdropText();
   ImGui_ImplOpenGL3_Shutdown();
   ImGui_ImplGlfw_Shutdown();
   ImGui::DestroyContext();

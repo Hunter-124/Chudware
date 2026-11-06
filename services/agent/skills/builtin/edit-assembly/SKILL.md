@@ -10,6 +10,8 @@ triggers:
 
 # Edit Assembly
 
+If not already available, call `enable_tools(tools=["fit_calc", "part_search", "part_place", "describe_assembly", "simulate_motion", "verify_battery"])` and wait for it to succeed before using them; mode and role restrictions still apply.
+
 ## Interface-first mating (mandatory)
 
 1. Identify every mating interface (hole pattern, coaxial bore/shaft, flush faces, fastener stack).
@@ -28,7 +30,7 @@ triggers:
    - `check_interference(doc_id)` — hard clash
    - `interface_check(doc_id)` — hole patterns, coaxiality, flush contact, fastener pass-through (catches errors interference misses)
 6. Motion (if needed): `simulate_motion(mate_id, start, stop)` and re-check interference across the sweep.
-7. Done: `verify_battery(doc_id)` with no FAILs.
+7. Done: `verify_battery(doc_id=doc_id)` with no FAILs.
 
 ## Rules
 

@@ -2,7 +2,7 @@
 //
 // A PINNED, full-height, rounded liquid-glass column overlaid on the viewport's right edge with
 // ~12dp margins (geometry from ui::viewportBackdrop(); visible left-edge resize boundary + grip;
-// the docked task-pane layout is gone — this is the only layout). Top-down: a compact flat
+// the docked task-pane layout is gone — this is the only layout). Top-down: a compact rounded
 // header with a live, run-tinted tesseract, Chat / Tasks / Artifacts navigation, settings and
 // collapse actions. Sessions / New chat share that row when their measured widths fit, and
 // move together onto a second row otherwise; small panes retain named tooltips for icon tabs.
@@ -26,8 +26,11 @@
 #include "core/engine_events.h"  // core::mirrorRecoveredDocs — Reopen a dismissed live agent doc
 #include "ui/ai/ai_prefs.h"      // ui::chatShowRenders — Artifacts render-thumbnail display pref
 #include "ui/ai/agent_dag.h"      // one terminal-state source for every sub-agent surface
-#include "gl_compat.h"           // glDeleteTextures — LRU eviction of render thumbnails
-#include "ui/chudcode_session_actions.h"  // Chudcode session recovery (export/branch/repair/close)
+#include "image_lightbox.h"
+#include "ui/omp_session_actions.h"  // OMP session recovery
+#include "ui/workspace_home.h"      // empty-workspace home: wider chat column
+#include "ui/copilot/inline_image_refs.h"  // stripInlineImageMarkers — Sessions titles
+#include "util/time_local.h"        // chudware::util::localTime — Sessions recency groups
 #include <string_view>
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -70,6 +73,16 @@ static CpTab cpTabAfterClick(CpTab current, CpTab clicked) {
     return (current == clicked) ? CpTab::Chat : clicked;
 }
 
+// A fresh, empty chat in the active project: the same reset the header's "New chat" performs.
+static void cpStartNewChat(AppState& st) {
+    newConversation(st);
+    composerSetText(st, "");
+    st.pendingAttachments.clear();
+    st.pendingInlineImagePaths.clear();
+    st.pendingContextRefs.clear();
+    st.contextPickActive = false;
+}
+
 // Compact AI-settings popover body (provider + model + effort + run toggles + "All settings...");
 // defined below with the picker helpers, hosted by the header Settings button.
 
@@ -105,24 +118,97 @@ static void copilotTaskProgress(AppState& st, int& done, int& total) {
     }
 }
 
+// Scale the alpha of every vertex in dl->VtxBuffer[from, end) by `a`. Used for the view-switch
+// fade: widgets, custom draw-list painters (ColorConvertFloat4ToU32) and images all end up as
+// vertices, so scaling them is the only way the fade covers fills, borders and text alike.
+static void cpFadeDrawList(ImDrawList* dl, int from, float a) {
+    for (int i = from; i < dl->VtxBuffer.Size; ++i) {
+        ImU32& c = dl->VtxBuffer[i].col;
+        const ImU32 alpha = static_cast<ImU32>(static_cast<float>(c >> IM_COL32_A_SHIFT) * a + 0.5f);
+        c = (c & ~IM_COL32_A_MASK) | (alpha << IM_COL32_A_SHIFT);
+    }
+}
+
+// A child window's draw list holds only what this frame drew into it (it is reset on the frame's
+// first Begin), so the whole list and every nested child window's list belong to the view.
+static void cpFadeWindowTree(ImGuiWindow* w, float a) {
+    cpFadeDrawList(w->DrawList, 0, a);
+    for (ImGuiWindow* child : w->DC.ChildWindows) cpFadeWindowTree(child, a);
+}
+
+// Sliding selection pill behind the header tabs. `tab` identifies the selection (a change starts
+// the glide); `target` is the selected tab's rect this frame. Once settled it simply tracks the
+// target, so resizing the column never drags the pill behind its tab. `snap` (screenshot
+// captures) lands the pill instantly so a capture never depends on frame timing.
+static void drawCopilotTabIndicator(int tab, const ImRect& target, bool hovered, bool held,
+                                    bool snap) {
+    struct Glide {
+        bool  seeded = false;
+        int   tab = 0;
+        float p = 1.0f;       // 0..1 progress of the current glide
+        float from[4] = {};   // rect when the glide began: minX, minY, maxX, maxY
+        float cur[4] = {};    // rect drawn last frame
+    };
+    static Glide g;
+    const float to[4] = {target.Min.x, target.Min.y, target.Max.x, target.Max.y};
+    if (!g.seeded) {
+        std::copy(to, to + 4, g.cur);
+        g.seeded = true;
+        g.tab = tab;
+    } else if (tab != g.tab) {
+        std::copy(g.cur, g.cur + 4, g.from);
+        g.tab = tab;
+        g.p = 0.0f;
+    }
+    if (snap) g.p = 1.0f;
+    if (g.p < 1.0f) {
+        g.p = std::min(1.0f, g.p + ui::anim::dt() / ui::anim::kBase);
+        ui::anim::requestFrames();
+    }
+    if (g.p >= 1.0f) {
+        std::copy(to, to + 4, g.cur);
+    } else {
+        const bool right = (to[0] + to[2]) > (g.from[0] + g.from[2]);
+        const float lead = ui::anim::easeOut(g.p);
+        const float trail = ui::anim::easeOut(std::clamp((g.p - 0.15f) / 0.85f, 0.0f, 1.0f));
+        const float eMin = right ? trail : lead;   // the edge the pill moves AWAY from lags
+        const float eMax = right ? lead : trail;
+        g.cur[0] = g.from[0] + (to[0] - g.from[0]) * eMin;
+        g.cur[2] = g.from[2] + (to[2] - g.from[2]) * eMax;
+        g.cur[1] = g.from[1] + (to[1] - g.from[1]) * lead;
+        g.cur[3] = g.from[3] + (to[3] - g.from[3]) * lead;
+    }
+    const float hv = ui::anim::toward(ImGui::GetID("##hdr_ind_hover"),
+                                      hovered ? 1.0f : 0.0f, ui::anim::kFast);
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImVec4 fill = semanticOnGlass(ui::palette.accent, surf);
+    ImVec4 edge = fill;
+    fill.w = 0.12f + 0.05f * hv + (held ? 0.06f : 0.0f);
+    edge.w = 0.42f;
+    ui::controlFace(ImGui::GetWindowDrawList(), ImVec2(g.cur[0], g.cur[1]), ImVec2(g.cur[2], g.cur[3]),
+                    ImGui::GetColorU32(fill), ImGui::GetColorU32(edge), ui::kit::chipRound(),
+                    held ? 0.0f : 1.0f);
+}
+
 static void drawCopilotHeader(AppState& st, bool busy) {
     const auto& pal = ui::palette;
     const CpTab tabIn = cpActiveTab(st);
     CpTab tabOut = tabIn;
-    // Compact logical metrics, independent of the global form-control padding.
+    // Keep header controls independent of the global form-control padding.
+    ui::kit::pushDensity(ui::kit::Density::Compact);
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
-                        ImVec2(ui::metrics::px(6.0f), ui::metrics::px(3.0f)));
+                        ImVec2(ui::metrics::cpMenuHeadGap(), ui::kit::padY()));
     const float h = ImGui::GetFrameHeight();
-    const float mark = ui::metrics::px(26.0f);
+    const float mark = std::max(ui::metrics::iconHeader(), h);
     const float rowH = std::max(mark, h);
-    const float gap = ui::metrics::px(4.0f);
-    const float left = ui::metrics::U(2.0f);  // clear the column resize strip
-    const float right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
+    const float gap = ui::metrics::U(1.0f);
+    const float left = ui::kit::gutter();  // clear the column resize strip
+    const float right = ImGui::GetWindowWidth() - left;
     const float avail = right - left;
-    const float top = ImGui::GetCursorPosY() + ui::metrics::px(3.0f);
+    const float top = ui::metrics::U(1.0f);
     const float iconW = h;
     auto textW = [&](const char* label) {
-        return ImGui::CalcTextSize(label).x + ui::metrics::px(12.0f);
+        return ImGui::CalcTextSize(label).x + ImGui::GetStyle().FramePadding.x * 2.0f;
     };
 
     int done = 0, total = 0;
@@ -131,7 +217,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     if (total > 0) std::snprintf(tasks, sizeof(tasks), "Tasks %d/%d", done, total);
     else std::snprintf(tasks, sizeof(tasks), "Tasks");
     const float sessW = textW("Sessions");
-    const float newW = textW("New chat");
+    const float newW = textW("New chat") + std::min(ui::metrics::iconHeader(), h - gap) + gap;
     const float fullTabs = textW("Chat") + textW(tasks) + textW("Artifacts");
     const bool oneRow = mark + fullTabs + sessW + newW + iconW * 2.0f + gap * 7.0f <= avail;
     const float navRoom = avail - mark - iconW * 2.0f - gap * 4.0f -
@@ -163,6 +249,7 @@ static void drawCopilotHeader(AppState& st, bool busy) {
                       mark, ImGui::GetTime(), ui::tesseractAnimFromInt(st.settings.brandAnim),
                       ImGui::ColorConvertFloat4ToU32(
                           ImVec4(statusCol[0], statusCol[1], statusCol[2], 1.0f)));
+    ui::anim::requestFramesAt(30);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", statusTip);
 
     float x = left + mark + gap;
@@ -181,44 +268,61 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     if (arts.clicked) tabOut = cpTabAfterClick(tabIn, CpTab::Artifacts);
 
     const float actionY = oneRow ? navY : top + rowH + gap;
-    x = oneRow ? x : left;
+    x = oneRow ? right - iconW * 2.0f - gap * 3.0f - sessW - newW : left;
     const auto sessions = hit("##hdr_sess", sessW, actionY);
-    if (!oneRow) x = right - newW;
-    const auto fresh = hit("##hdr_new", newW, actionY);
+    const bool newText = oneRow || sessW + newW + gap <= avail;
+    const float freshW = newText ? newW : iconW;
+    if (!oneRow) x = right - freshW;
+    const auto fresh = hit("##hdr_new", freshW, actionY);
     if (sessions.clicked) tabOut = cpTabAfterClick(tabIn, CpTab::Sessions);
     if (fresh.clicked) tabOut = CpTab::Chat;
 
     x = right - iconW * 2.0f - gap;
     const auto gear = hit("##hdr_gear", iconW, navY);
     if (gear.clicked) tabOut = cpTabAfterClick(tabIn, CpTab::Settings);
-    ImGui::SetCursorPos(ImVec2(right - iconW, navY));
-    ImGui::PushStyleColor(ImGuiCol_Button,
-        ImVec4(chatSurf().tint.x, chatSurf().tint.y, chatSurf().tint.z, 0.0f));
-    if (ImGui::ArrowButton("##cp_collapse", s_cpCollapsed ? ImGuiDir_Down : ImGuiDir_Up)) {
+    const auto collapse = hit("##cp_collapse", iconW, navY);
+    if (collapse.clicked) {
         s_cpCollapsed = !s_cpCollapsed;
         st.settings.copilotCollapsed = s_cpCollapsed;
         saveSettings(st.settings);
     }
-    ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("%s", s_cpCollapsed ? "Expand Copilot" : "Collapse Copilot");
     if (tabOut != tabIn) cpSetTab(st, tabOut);
-    if (fresh.clicked) {
-        newConversation(st);
-        composerSetText(st, "");
-        st.pendingAttachments.clear();
-        st.pendingInlineImagePaths.clear();
-        st.pendingContextRefs.clear();
-        st.contextPickActive = false;
+    if (fresh.clicked) cpStartNewChat(st);
+    // The selected tab's face is ONE pill that glides between tabs (leading edge first, trailing
+    // edge catching up) instead of each tab snapping its own fill on and off. It is emitted before
+    // the buttons so their ink and icons draw on top of it.
+    {
+        const HeaderBtnHit* on = &chat;
+        switch (tabOut) {
+            case CpTab::Tasks:     on = &task;     break;
+            case CpTab::Artifacts: on = &arts;     break;
+            case CpTab::Sessions:  on = &sessions; break;
+            case CpTab::Settings:  on = &gear;     break;
+            default:               break;
+        }
+        drawCopilotTabIndicator(static_cast<int>(tabOut), on->rect, on->hovered, on->held, st.shot);
     }
     // Text-only tabs when there is room; icon-only tabs at small widths. The same measured
     // widths drive hits and paint, and all selection paints use this frame's resolved tab.
-    headerTextButtonPaint(chat, "Chat", tabOut == CpTab::Chat, chatText ? nullptr : "ai_panel", chatText);
-    headerTextButtonPaint(task, tasks, tabOut == CpTab::Tasks, tasksText ? nullptr : "plan_board", tasksText);
-    headerTextButtonPaint(arts, "Artifacts", tabOut == CpTab::Artifacts, artsText ? nullptr : "artifacts", artsText);
-    headerTextButtonPaint(sessions, "Sessions", tabOut == CpTab::Sessions);
-    headerTextButtonPaint(fresh, "New chat", false);
-    headerTextButtonPaint(gear, "Settings", tabOut == CpTab::Settings, "settings", false);
+    headerTextButtonPaint(chat, "Chat", tabOut == CpTab::Chat, chatText ? nullptr : "ai_panel", chatText, false, false);
+    headerTextButtonPaint(task, tasks, tabOut == CpTab::Tasks, tasksText ? nullptr : "plan_board", tasksText, false, false);
+    headerTextButtonPaint(arts, "Artifacts", tabOut == CpTab::Artifacts, artsText ? nullptr : "artifacts", artsText, false, false);
+    headerTextButtonPaint(sessions, "Sessions", tabOut == CpTab::Sessions, nullptr, true, true, false);
+    headerTextButtonPaint(fresh, "New chat", false, "new_doc", newText, true);
+    headerTextButtonPaint(gear, "Settings", tabOut == CpTab::Settings, "settings", false, false, false);
+    headerTextButtonPaint(collapse, "", false, nullptr, false, true);
+    const ImVec2 center = collapse.rect.GetCenter();
+    const float r = ImGui::GetTextLineHeight() * 0.22f;
+    const float direction = s_cpCollapsed ? 1.0f : -1.0f;
+    const ImVec2 chevron[] = {
+        ImVec2(center.x - r, center.y - direction * r * 0.5f),
+        ImVec2(center.x, center.y + direction * r * 0.5f),
+        ImVec2(center.x + r, center.y - direction * r * 0.5f)};
+    ImGui::GetWindowDrawList()->AddPolyline(chevron, 3,
+        ImGui::GetColorU32(chatSurf().textSecondary), ImDrawFlags_None,
+        ui::metrics::stroke(1.5f));
+    if (collapse.hovered)
+        ImGui::SetTooltip("%s", s_cpCollapsed ? "Expand Copilot" : "Collapse Copilot");
     if (chat.hovered) ImGui::SetTooltip("Chat \xc2\xb7 the current conversation");
     else if (task.hovered) {
         if (total > 0) ImGui::SetTooltip("Tasks \xc2\xb7 %d of %d complete", done, total);
@@ -227,44 +331,37 @@ static void drawCopilotHeader(AppState& st, bool busy) {
     else if (sessions.hovered) ImGui::SetTooltip("Sessions \xc2\xb7 chats in the active project");
     else if (fresh.hovered) ImGui::SetTooltip("New chat \xc2\xb7 start a fresh session");
     else if (gear.hovered) ImGui::SetTooltip("AI settings");
-    ImGui::SetCursorPos(ImVec2(left, actionY + h + ui::metrics::px(3.0f)));
+    ImGui::SetCursorPos(ImVec2(left, top + rowH + (oneRow ? 0.0f : gap + h) + gap));
     ImGui::Dummy(ImVec2(0, 0));
     ImGui::PopStyleVar();
+    ui::kit::popDensity();
 }
 
-// In-flight marker for a session row: the brand tesseract spinner at the row's left edge,
-// animated by the same per-frame repaint that streams the run itself. Returns the extra
-// x-indent title/subtitle text must use to clear the icon in every project-scoped Sessions row.
-static float drawSessionRunningIcon(ImDrawList* dl, const ui::AdaptiveSurface& surf,
-                                    const ImVec2& rowMin, float rowH, float padX, float sc) {
-    const float sz = std::max(ui::kTesseractSpinnerMinPx, rowH - 14.0f * sc);
-    const ImVec2 center(rowMin.x + padX + sz * 0.5f, rowMin.y + rowH * 0.5f);
+// In-flight marker for a session row: the brand tesseract spinner in the row's leading slot,
+// animated by the same per-frame repaint that streams the run itself. Rows reserve
+// sessRunningIconSize() plus a gap before their text, so title and meta clear the icon.
+static float sessRunningIconSize() {
+    return std::max(ui::kTesseractSpinnerMinPx, ui::metrics::px(18.0f));
+}
+static void drawSessionRunningIcon(ImDrawList* dl, const ui::AdaptiveSurface& surf,
+                                   const ImVec2& center) {
     ImVec4 accInk = semanticOnGlass(ui::palette.accent, surf);
     accInk.w = 1.0f;
-    ui::drawTesseractSpinner(dl, center, sz, ImGui::GetTime(),
+    ui::drawTesseractSpinner(dl, center, sessRunningIconSize(), ImGui::GetTime(),
                              ImGui::ColorConvertFloat4ToU32(accInk));
-    return sz + 6.0f * sc;  // icon box + gap before the text
 }
 
 
-// ---- Chudcode session recovery card (Sessions rows -> Manage) --------------------------------
-// Per-session export / diagnose / repair / branch / runtime-close against the exact worker
-// methods chudcode_export_session / chudcode_repair_session / chudcode_branch_session /
-// chudcode_close_session. ONE card is open at a time; every async completion is generation-
-// guarded so a card switched mid-flight never adopts a stale response.
+// Session recovery actions supported by the runtime. Async completions are generation-guarded.
 namespace {
 
 struct CcManageUi {
     std::string convId;          // session the card is open for; empty = closed
     uint64_t gen = 0;            // bumped on open/close — stale RPC completions drop
-    bool exportBusy = false, doctorBusy = false, closeBusy = false, branchBusy = false;
-    bool repairMode = false;     // the in-flight doctor call is a repair, not a dry-run
-    bool confirmRepair = false;  // inline confirm armed (explicit in-app confirmation)
-    std::string err;             // last action failure (inlineStatus)
-    std::string exportPath;      // last successful export destination
-    bool haveDoctor = false;
-    ui::ChudcodeDoctorSummary doctor;  // last diagnose/repair summary
-    std::string backupPath;      // backup written by the last repair
+    bool exportBusy = false, closeBusy = false, branchBusy = false;
+    char branchEntry[257] = {};
+    std::string err;
+    std::string exportPath;
 
     // Reset every field EXCEPT the generation, which must only ever advance — a reset that
     // zeroed it would let a pre-reset RPC completion match a post-reset card again.
@@ -288,8 +385,8 @@ constexpr const char* kCcNotLiveHint =
 // Shared refusal triage for every recovery completion. Returns true when the response was
 // consumed as a failure (latched-absent / transport / clean not-live refusal).
 bool ccConsumeFailure(const std::string& convId, const core::RpcResult& r, const char* what) {
-    if (chudcodeSessionRpcAbsent(r.ok, r.err, r.result)) {
-        chudcodeSessionServiceAvailable() = false;  // older service — whole surface off
+    if (ompSessionRpcAbsent(r.ok, r.err, r.result)) {
+        ompSessionServiceAvailable() = false;  // older service — whole surface off
         return true;
     }
     if (!r.ok) {
@@ -301,10 +398,10 @@ bool ccConsumeFailure(const std::string& convId, const core::RpcResult& r, const
                               userFacingRpcError(r, "the AI service did not respond.");
         return true;
     }
-    if (chudcodeSessionNotLive(r.result)) {
+    if (ompSessionNotLive(r.result)) {
         // Clean refusal, not an error: the runtime is gone (restart / closed). Record the
         // truth so the buttons disable with the resume hint instead of retrying.
-        chudcodeSessionLinkEnsure(convId).runtimeLive = false;
+        ompSessionLinkEnsure(convId).runtimeLive = false;
         s_ccm.err = kCcNotLiveHint;
         return true;
     }
@@ -316,15 +413,15 @@ void ccStartExport(AppState& st, const std::string& convId, const std::string& o
     s_ccm.err.clear();
     const uint64_t gen = s_ccm.gen;
     AppState* stp = &st;
-    st.rpc.call(kChudcodeExportSessionMethod,
-                chudcodeExportSessionParams(convId, outputPath),
+    st.rpc.call(kOmpExportSessionMethod,
+                ompExportSessionParams(convId, outputPath),
                 [stp, gen, convId](const core::RpcResult& r) {
         if (s_ccm.gen != gen) return;
         s_ccm.exportBusy = false;
         if (ccConsumeFailure(convId, r, "Export")) return;
-        ChudcodeExportResult res;
-        if (!parseChudcodeExportResult(r.result, res)) {
-            s_ccm.err = chudcodeActionError(r.result, "Export failed.");
+        OmpExportResult res;
+        if (!parseOmpExportResult(r.result, res)) {
+            s_ccm.err = ompActionError(r.result, "Export failed.");
             return;
         }
         s_ccm.exportPath = res.path;
@@ -333,55 +430,17 @@ void ccStartExport(AppState& st, const std::string& convId, const std::string& o
     }, 120000);
 }
 
-// One completion shape for Diagnose (repair=false, read-only) and Repair (repair=true,
-// backup-first): both return the bounded doctor summary; only repair may carry backup_path.
-void ccStartDoctor(AppState& st, const std::string& convId, bool repair) {
-    s_ccm.doctorBusy = true;
-    s_ccm.repairMode = repair;
-    s_ccm.confirmRepair = false;
-    s_ccm.err.clear();
-    const uint64_t gen = s_ccm.gen;
-    AppState* stp = &st;
-    st.rpc.call(kChudcodeRepairSessionMethod,
-                chudcodeRepairSessionParams(convId, repair),
-                [stp, gen, convId, repair](const core::RpcResult& r) {
-        if (s_ccm.gen != gen) return;
-        s_ccm.doctorBusy = false;
-        if (ccConsumeFailure(convId, r, repair ? "Repair" : "Diagnose")) return;
-        ChudcodeDoctorSummary summary;
-        if (!parseChudcodeDoctorSummary(r.result, summary)) {
-            s_ccm.err = chudcodeActionError(
-                r.result, repair ? "Repair returned no summary." : "Diagnose returned no summary.");
-            return;
-        }
-        s_ccm.haveDoctor = true;
-        s_ccm.doctor = summary;
-        if (!summary.backupPath.empty()) s_ccm.backupPath = summary.backupPath;
-        // Health (and any reported id/file) persists with the conversation.
-        applyChudcodeDoctor(chudcodeSessionLinkEnsure(convId), summary);
-#ifdef __EMSCRIPTEN__
-        chudcodeSessionLinkSet(convId, chudcodeSessionLinkEnsure(convId));
-#endif
-        markChatHistoryDirty();
-        if (repair)
-            stp->toast(summary.changed ? ui::ToastLevel::Success : ui::ToastLevel::Info,
-                       summary.changed
-                           ? "Session file repaired \xe2\x80\x94 backup kept."
-                           : "Nothing to repair \xe2\x80\x94 session file left untouched.");
-    }, 120000);
-}
-
 void ccStartClose(AppState& st, const std::string& convId) {
     s_ccm.closeBusy = true;
     s_ccm.err.clear();
     const uint64_t gen = s_ccm.gen;
     AppState* stp = &st;
-    st.rpc.call(kChudcodeCloseSessionMethod, chudcodeCloseSessionParams(convId),
+    st.rpc.call(kOmpCloseSessionMethod, ompCloseSessionParams(convId),
                 [stp, gen, convId](const core::RpcResult& r) {
         if (s_ccm.gen != gen) return;
         s_ccm.closeBusy = false;
-        if (chudcodeSessionRpcAbsent(r.ok, r.err, r.result)) {
-            chudcodeSessionServiceAvailable() = false;
+        if (ompSessionRpcAbsent(r.ok, r.err, r.result)) {
+            ompSessionServiceAvailable() = false;
             return;
         }
         if (!r.ok) {
@@ -391,79 +450,71 @@ void ccStartClose(AppState& st, const std::string& convId) {
                                   userFacingRpcError(r, "the AI service did not respond.");
             return;
         }
-        if (!parseChudcodeCloseResult(r.result)) {
-            s_ccm.err = chudcodeActionError(r.result, "Close failed.");
+        if (!parseOmpCloseResult(r.result)) {
+            s_ccm.err = ompActionError(r.result, "Close failed.");
             return;
         }
         // Idempotent by contract: the runtime is gone either way; the persisted file stays.
-        chudcodeSessionLinkEnsure(convId).runtimeLive = false;
+        ompSessionLinkEnsure(convId).runtimeLive = false;
         stp->toast(ui::ToastLevel::Info,
                    "Runtime closed \xe2\x80\x94 transcript kept. Sending a message resumes it.");
     }, 30000);
 }
-
 void ccStartBranch(AppState& st, const std::string& convId, const std::string& entryId) {
     s_ccm.branchBusy = true;
     s_ccm.err.clear();
     const uint64_t gen = s_ccm.gen;
     AppState* stp = &st;
-    st.rpc.call(kChudcodeBranchSessionMethod,
-                chudcodeBranchSessionParams(convId, entryId),
+    st.rpc.call(kOmpBranchSessionMethod, ompBranchSessionParams(convId, entryId),
                 [stp, gen, convId](const core::RpcResult& r) {
-        if (s_ccm.gen == gen) s_ccm.branchBusy = false;
-        if (s_ccm.gen == gen && ccConsumeFailure(convId, r, "Branch")) return;
-        ChudcodeBranchResult br;
-        if (!parseChudcodeBranchResult(r.result, br)) {
-            if (s_ccm.gen == gen)
-                s_ccm.err = chudcodeActionError(r.result, "Branch failed.");
+        if (s_ccm.gen != gen) return;
+        s_ccm.branchBusy = false;
+        if (ccConsumeFailure(convId, r, "Branch")) return;
+        OmpBranchResult result;
+        if (!parseOmpBranchResult(r.result, result)) {
+            s_ccm.err = ompActionError(r.result, "Branch failed.");
             return;
         }
-        AppState& st2 = *stp;
         int idx = -1;
-        for (int i = 0; i < (int)st2.conversations.size(); ++i)
-            if (st2.conversations[i].id == convId) { idx = i; break; }
+        for (int i = 0; i < (int)stp->conversations.size(); ++i)
+            if (stp->conversations[i].id == convId) { idx = i; break; }
         if (idx < 0) {
-            st2.toast(ui::ToastLevel::Warn,
-                      "Branch succeeded but the source session is gone \xe2\x80\x94 not mapped.");
+            s_ccm.err = "Branch succeeded, but the source conversation is no longer open.";
             return;
         }
-        // Chudware lineage: the fork copies the transcript, revert branches and raw logs.
-        const int forkIdx = forkConversation(st2, idx);
+        const int forkIdx = forkConversation(*stp, idx);
         if (forkIdx < 0) {
-            st2.toast(ui::ToastLevel::Error, "Branch succeeded but forking the session failed.");
+            s_ccm.err = "Branch succeeded, but the conversation could not be created.";
             return;
         }
-        // The service branched the runtime in place, captured the child and disposed the
-        // runtime (backend contract). The ORIGINAL resumes later from its own persisted
-        // file; the FORK owns the returned child session id/file and resumes from those.
-        chudcodeSessionLinkEnsure(convId).runtimeLive = false;
-        ChudcodeSessionLink forkLink;
-        forkLink.sessionId = br.sessionId;
-        forkLink.sessionFile = br.sessionFile;
-        chudcodeSessionLinkSet(st2.conversations[forkIdx].id, std::move(forkLink));
+        ompSessionLinkEnsure(convId).runtimeLive = false;
+        OmpSessionLink forkLink;
+        forkLink.sessionId = result.sessionId;
+        forkLink.sessionFile = result.sessionFile;
+        ompSessionLinkSet(stp->conversations[forkIdx].id, std::move(forkLink));
 #ifdef __EMSCRIPTEN__
-        bindCellAgentSessionHandle(st2.conversations[forkIdx].id, br.sessionId,
+        bindCellAgentSessionHandle(stp->conversations[forkIdx].id, result.sessionId,
                                   cellAgentSessionProvider(convId));
 #endif
         markChatHistoryDirty();
-        st2.toast(ui::ToastLevel::Success,
-                  "Branched into \"" + st2.conversations[forkIdx].title +
-                      "\" \xe2\x80\x94 its next message resumes from the branch point.");
-        s_ccm.close();  // forkConversation switched to the new chat; the card follows
+        stp->toast(ui::ToastLevel::Success, "Branched conversation is ready to resume.");
+        s_ccm.close();
     }, 60000);
 }
 
+
+
 // The expanded recovery card, drawn directly under its session row.
-void drawChudcodeManageCard(AppState& st, const Conversation& c, bool running) {
+void drawOmpManageCard(AppState& st, const Conversation& c, bool running) {
     const std::string& convId = c.id;
-    const ChudcodeSessionLink* link = chudcodeSessionLink(convId);
-    const bool serviceOk = chudcodeSessionServiceAvailable();
+    const OmpSessionLink* link = ompSessionLink(convId);
+    const bool serviceOk = ompSessionServiceAvailable();
 #ifdef __EMSCRIPTEN__
     const bool live = link && link->runtimeLive && !cellAgentSessionHandle(convId).empty();
 #else
     const bool live = link && link->runtimeLive;
 #endif
-    const bool busy = s_ccm.exportBusy || s_ccm.doctorBusy || s_ccm.closeBusy || s_ccm.branchBusy;
+    const bool busy = s_ccm.exportBusy || s_ccm.closeBusy || s_ccm.branchBusy;
     // Every recovery action goes to the AI service, which cannot take them while ANY run (on
     // this session or another) is in progress — so they wait for the run instead of failing.
     const bool runActive = running || st.anyRunActive();
@@ -490,13 +541,6 @@ void drawChudcodeManageCard(AppState& st, const Conversation& c, bool running) {
                           live ? "This app process holds the live service-side session."
                                : "No live runtime \xe2\x80\x94 sending a message resumes the "
                                  "persisted session.");
-            ImGui::SameLine(0.0f, ui::metrics::U(1.0f));
-            const std::string health = link ? link->health : std::string();
-            const int hc = chudcodeHealthClass(health);
-            ui::kit::chip(chudcodeHealthLabel(health),
-                          hc == 0 ? ui::kit::Tone::Ok
-                                  : hc == 1 ? ui::kit::Tone::Warn : ui::kit::Tone::Neutral,
-                          /*dot=*/true, "Last session-file health verdict (persisted).");
             if (link && !link->sessionId.empty())
                 ui::kit::keyValueRow("Agent session", link->sessionId.c_str(),
                                      ui::kit::Tone::Neutral, /*copyable=*/true);
@@ -521,18 +565,6 @@ void drawChudcodeManageCard(AppState& st, const Conversation& c, bool running) {
             if (ImGui::IsItemHovered() && actionable)
                 ImGui::SetTooltip("Default destination: the project's chat-exports folder.");
             ImGui::SameLine(0.0f, ui::metrics::U(1.0f));
-            if (ui::kit::secondaryButton(
-                    s_ccm.doctorBusy && !s_ccm.repairMode ? "Diagnosing\xe2\x80\xa6" : "Diagnose",
-                    actionable, whyNot))
-                ccStartDoctor(st, convId, /*repair=*/false);
-            if (ImGui::IsItemHovered() && actionable)
-                ImGui::SetTooltip("Read-only session-file check \xe2\x80\x94 changes nothing.");
-            ImGui::SameLine(0.0f, ui::metrics::U(1.0f));
-            if (ui::kit::secondaryButton(
-                    s_ccm.doctorBusy && s_ccm.repairMode ? "Repairing\xe2\x80\xa6" : "Repair\xe2\x80\xa6",
-                    actionable, whyNot))
-                s_ccm.confirmRepair = !s_ccm.confirmRepair;
-            ImGui::SameLine(0.0f, ui::metrics::U(1.0f));
             if (ui::kit::secondaryButton(s_ccm.closeBusy ? "Closing\xe2\x80\xa6" : "Close runtime",
                                          serviceOk && live && !runActive && !busy,
                                          !live ? "No live runtime to close \xe2\x80\x94 already inactive."
@@ -541,16 +573,17 @@ void drawChudcodeManageCard(AppState& st, const Conversation& c, bool running) {
             if (ImGui::IsItemHovered() && live && !runActive)
                 ImGui::SetTooltip("Stops the service-side process only. The transcript and the "
                                   "persisted session file are kept \xe2\x80\x94 unlike Delete.");
-
-            // Explicit in-app confirmation before anything rewrites the session file.
-            if (s_ccm.confirmRepair) {
-                ui::kit::dimText("Repair rewrites the session file after saving a backup. "
-                                 "Findings that would require inventing data are left untouched.");
-                if (ui::kit::dangerButton("Repair now", actionable, whyNot))
-                    ccStartDoctor(st, convId, /*repair=*/true);
-                ImGui::SameLine(0.0f, ui::metrics::U(1.0f));
-                if (ui::kit::secondaryButton("Cancel")) s_ccm.confirmRepair = false;
-            }
+#ifdef __EMSCRIPTEN__
+            ui::kit::dimText("Branching runtime sessions is unavailable in this web session.");
+#else
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::InputTextWithHint("##branch_entry", "Runtime entry ID",
+                                     s_ccm.branchEntry, sizeof(s_ccm.branchEntry));
+            if (ui::kit::secondaryButton(s_ccm.branchBusy ? "Branching..." : "Branch at entry",
+                                         actionable && s_ccm.branchEntry[0],
+                                         actionable ? "Enter a runtime entry ID." : whyNot))
+                ccStartBranch(st, convId, s_ccm.branchEntry);
+#endif
 
             // A "wait for the run" refusal is not a failure: calm tone, and it clears itself
             // once the run is over and the actions are live again.
@@ -568,60 +601,6 @@ void drawChudcodeManageCard(AppState& st, const Conversation& c, bool running) {
                     ui::revealInFileManager(s_ccm.exportPath);
             }
 
-            // ---- doctor summary -------------------------------------------------------------
-            if (s_ccm.haveDoctor) {
-                const ChudcodeDoctorSummary& d = s_ccm.doctor;
-                const int hcd = chudcodeHealthClass(d.status);
-                ui::kit::sectionHeader(d.mode == "repair" ? "Repair result" : "Diagnosis",
-                                       nullptr, nullptr, -1, false);
-                ui::kit::chip(chudcodeHealthLabel(d.status),
-                              hcd == 0 ? ui::kit::Tone::Ok
-                                       : hcd == 1 ? ui::kit::Tone::Warn : ui::kit::Tone::Neutral,
-                              /*dot=*/true);
-                if (d.findingCount > 0) {
-                    char line[128];
-                    std::snprintf(line, sizeof(line), "%d finding%s \xc2\xb7 %d repairable%s",
-                                  d.findingCount, d.findingCount == 1 ? "" : "s",
-                                  d.repairableFindingCount < 0 ? 0 : d.repairableFindingCount,
-                                  d.remainingFindingCount > 0 ? " \xc2\xb7 issues remain" : "");
-                    ui::kit::dimText(line);
-                }
-                if (!s_ccm.backupPath.empty()) {
-                    ui::kit::keyValueRow("Backup", s_ccm.backupPath.c_str(),
-                                         ui::kit::Tone::Neutral, /*copyable=*/true);
-                    if (ui::haveOsFileManager() && ui::kit::secondaryButton("Show backup"))
-                        ui::revealInFileManager(s_ccm.backupPath);
-                }
-                for (int fi = 0; fi < (int)d.findings.size(); ++fi) {
-                    const ChudcodeDoctorFinding& f = d.findings[fi];
-                    ImGui::PushID(fi);
-                    ui::kit::chip(f.code.empty() ? "finding" : f.code.c_str(),
-                                  f.repairable ? ui::kit::Tone::Warn : ui::kit::Tone::Err,
-                                  /*dot=*/false,
-                                  f.repairable ? "Repair can fix this finding."
-                                               : "Not automatically repairable.");
-                    if (!f.entryId.empty()) {
-                        // A finding anchored on a Chudcode DAG entry is a branch point: fork
-                        // this conversation and continue from just before the damage.
-                        ImGui::SameLine(0.0f, ui::metrics::U(1.0f));
-                        if (ui::kit::secondaryButton(
-                                s_ccm.branchBusy ? "Branching\xe2\x80\xa6" : "Branch here",
-                                actionable && !s_ccm.branchBusy, whyNot))
-                            ccStartBranch(st, convId, f.entryId);
-                        if (ImGui::IsItemHovered() && actionable)
-                            ImGui::SetTooltip("Fork this session and continue from entry %s "
-                                              "(the original keeps its full history).",
-                                              f.entryId.c_str());
-                    }
-                    if (!f.message.empty()) ui::kit::dimText(f.message.c_str());
-                    ImGui::PopID();
-                }
-                if (hcd == 1 && !d.findings.empty() &&
-                    std::none_of(d.findings.begin(), d.findings.end(),
-                                 [](const ChudcodeDoctorFinding& f) { return !f.entryId.empty(); }))
-                    ui::kit::dimText("No finding is anchored on a session entry \xe2\x80\x94 "
-                                     "branching is unavailable for this damage.");
-            }
         }
     }
     ui::kit::cardEnd();
@@ -679,7 +658,7 @@ std::vector<SessProjectEntry> sessProjects(const AppState& st, bool archived,
     unassigned = 0;
     if (!activeKey.empty()) out.push_back({activeKey, activeDir, sessProjectName(activeDir), 0});
     for (const Conversation& c : st.conversations) {
-        const std::string key = convProjectKey(c.projectDir);
+        const std::string& key = convProjectKey(c);
         const int n = (c.archived == archived) ? 1 : 0;
         if (key.empty()) { unassigned += n; continue; }
         auto it = std::find_if(out.begin(), out.end(),
@@ -696,10 +675,183 @@ std::vector<SessProjectEntry> sessProjects(const AppState& st, bool archived,
     return out;
 }
 
-// Header switcher: a popover listing every project that has sessions, the viewed one checked.
-void drawSessionsProjectSwitcher(const std::vector<SessProjectEntry>& projects, int unassigned,
-                                 const std::string& activeKey, float maxLabelW) {
+// ---- Sessions list chrome -----------------------------------------------------------------------
+// Header controls and row furniture are painted onto the window draw list in the pane's
+// chat-surface ink (chatSurf tones), so they read over any viewport backdrop in both themes, and
+// every position derives from the row / pill rect — nothing leans on ImGui cursor drift.
+
+// Session whose inline delete confirmation is up / whose overflow menu is open. Both keep their
+// row submitted while it is scrolled out of view, so the prompt and the popup survive scrolling.
+// Keyed by id: the list re-sorts by activity as sessions are used.
+std::string s_delConfirm;
+std::string s_menuConv;
+char        s_filter[96] = {};
+
+ImU32 sessInk(ImVec4 c, float alpha) {
+    c.w *= alpha;
+    return ImGui::ColorConvertFloat4ToU32(c);
+}
+
+// The title as listed: inline-image markers ("[Image #1]") stripped; an emptied or missing title
+// falls back to the session's own slot number (stable, unlike a display position, which moves
+// as the list re-sorts).
+std::string sessDisplayTitle(const Conversation& c, int slot) {
+    std::string title = ui::copilot::stripInlineImageMarkers(c.title);
+    if (title.empty()) title = "Session " + std::to_string(slot + 1);
+    return title;
+}
+
+bool sessMatchesFilter(const std::string& title, const std::string& needleLower) {
+    if (needleLower.empty()) return true;
+    std::string hay;
+    hay.reserve(title.size());
+    for (const char ch : title) hay += (char)std::tolower((unsigned char)ch);
+    return hay.find(needleLower) != std::string::npos;
+}
+
+// ---- recency groups ---------------------------------------------------------------------------
+// Today / Yesterday / Earlier by a session's LAST message time (ChatMsg::ts; 0 = unknown, which
+// files under Earlier). Local calendar days, not 24 h windows.
+struct SessDays { double today = 0.0, yesterday = 0.0; };   // local midnights, epoch seconds
+
+SessDays sessDayStarts() {
+    SessDays d;
+    std::tm t{};
+    if (!chudware::util::localTime((std::time_t)chatNowEpoch(), t)) return d;
+    t.tm_hour = t.tm_min = t.tm_sec = 0;
+    t.tm_isdst = -1;
+    d.today = (double)std::mktime(&t);
+    t.tm_mday -= 1;   // mktime normalises across month and year edges
+    t.tm_isdst = -1;
+    d.yesterday = (double)std::mktime(&t);
+    return d;
+}
+
+int sessBucket(double ts, const SessDays& d) {
+    if (!(ts > 0.0)) return 2;
+    if (ts >= d.today) return 0;
+    return ts >= d.yesterday ? 1 : 2;
+}
+
+const char* const kSessBucketLabel[3] = {"Today", "Yesterday", "Earlier"};
+
+// Compact age for the meta line: "just now", "5m ago", "2h ago", "3d ago", then a bare date.
+std::string sessAgeLabel(double ts) {
+    if (!(ts > 0.0)) return std::string();
+    static const char* const kMonths[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                          "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    const double age = chatNowEpoch() - ts;
+    char buf[32];
+    if (age < 45.0) return "just now";
+    if (age < 3600.0)
+        std::snprintf(buf, sizeof(buf), "%dm ago", std::max(1, (int)(age / 60.0)));
+    else if (age < 86400.0)
+        std::snprintf(buf, sizeof(buf), "%dh ago", (int)(age / 3600.0));
+    else if (age < 7.0 * 86400.0)
+        std::snprintf(buf, sizeof(buf), "%dd ago", (int)(age / 86400.0));
+    else {
+        std::tm then{}, now{};
+        if (!chudware::util::localTime((std::time_t)ts, then)) return std::string();
+        chudware::util::localTime((std::time_t)chatNowEpoch(), now);
+        if (then.tm_year == now.tm_year)
+            std::snprintf(buf, sizeof(buf), "%s %d", kMonths[then.tm_mon], then.tm_mday);
+        else
+            std::snprintf(buf, sizeof(buf), "%s %d, %d", kMonths[then.tm_mon], then.tm_mday,
+                          then.tm_year + 1900);
+    }
+    return buf;
+}
+
+// ---- vector glyphs (the app font has no dots/chevron/folder codepoints worth trusting) ----------
+// Three stacked dots: the overflow ("more") mark.
+void sessDrawKebab(ImDrawList* dl, const ImVec2& c, float size, ImU32 col) {
+    const float r = ui::metrics::px(1.6f);
+    const float step = std::max(r * 2.8f, size * 0.24f);
+    for (int k = -1; k <= 1; ++k)
+        dl->AddCircleFilled(ImVec2(c.x, c.y + (float)k * step), r, col);
+}
+
+void sessDrawChevronDown(ImDrawList* dl, const ImVec2& c, float r, ImU32 col) {
+    const ImVec2 pts[3] = {ImVec2(c.x - r, c.y - r * 0.5f), ImVec2(c.x, c.y + r * 0.5f),
+                           ImVec2(c.x + r, c.y - r * 0.5f)};
+    dl->AddPolyline(pts, 3, col, ImDrawFlags_None, ui::metrics::stroke(1.5f));
+}
+
+// Closed folder: a tabbed outline.
+void sessDrawFolder(ImDrawList* dl, const ImVec2& c, float size, ImU32 col) {
+    const float t = ui::metrics::stroke(1.3f);
+    const float w = size, h = size * 0.74f;
+    const float x0 = c.x - w * 0.5f, y0 = c.y - h * 0.5f;
+    const float tab = h * 0.28f, r = size * 0.10f, tabW = w * 0.40f;
+    dl->AddRect(ImVec2(x0, y0 + tab), ImVec2(x0 + w, y0 + h), col, r, 0, t);
+    const ImVec2 flap[5] = {ImVec2(x0, y0 + tab), ImVec2(x0, y0 + r), ImVec2(x0 + r, y0),
+                            ImVec2(x0 + tabW, y0), ImVec2(x0 + tabW + tab * 0.8f, y0 + tab)};
+    dl->AddPolyline(flap, 5, col, ImDrawFlags_None, t);
+}
+
+// Pill backing for the header controls and in-row buttons: a hairline outline and a wash that
+// eases in with `hv`; `on` (0..1) swaps both to the accent so an engaged filter reads engaged.
+void sessPillFace(ImDrawList* dl, const ui::AdaptiveSurface& surf, const ImVec2& p0,
+                  const ImVec2& p1, float hv, float on) {
+    const ImVec4 ink = surf.textPrimary;
+    const ImVec4 acc = semanticOnGlass(ui::palette.accent, surf);
+    const ImVec4 fillIdle(ink.x, ink.y, ink.z, 0.05f + 0.07f * hv);
+    const ImVec4 fillOn(acc.x, acc.y, acc.z, 0.20f + 0.08f * hv);
+    const ImVec4 lineIdle(ink.x, ink.y, ink.z, 0.16f + 0.10f * hv);
+    const ImVec4 lineOn(acc.x, acc.y, acc.z, 0.60f);
+    const float rnd = ui::metrics::cpMenuChipRound();
+    dl->AddRectFilled(p0, p1, ImGui::ColorConvertFloat4ToU32(ImLerp(fillIdle, fillOn, on)), rnd);
+    dl->AddRect(p0, p1, ImGui::ColorConvertFloat4ToU32(ImLerp(lineIdle, lineOn, on)), rnd, 0,
+                ui::metrics::stroke(1.0f));
+}
+
+// Small text button for in-row prompts (the delete confirmation), placed by explicit rect so the
+// row keeps its computed geometry. `danger` fills it with the error tone.
+bool sessTextButton(const char* id, const char* label, const ImVec2& p0, const ImVec2& p1,
+                    bool danger, const ui::AdaptiveSurface& surf) {
+    ImGui::PushID(id);
+    ImGui::SetCursorScreenPos(p0);
+    const bool clicked = ImGui::InvisibleButton("##btn", ImVec2(p1.x - p0.x, p1.y - p0.y));
+    const bool hovered = ImGui::IsItemHovered();
+    const float hv = ui::anim::toward(ImGui::GetID("##hv"), hovered ? 1.0f : 0.0f,
+                                      ui::anim::kFast);
+    ImGui::PopID();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec4 ink = surf.textPrimary;
+    if (danger) {
+        const float* e = ui::palette.statusErr;
+        const ImVec4 fill(e[0], e[1], e[2], 0.80f + 0.20f * hv);
+        dl->AddRectFilled(p0, p1, ImGui::ColorConvertFloat4ToU32(fill),
+                          ui::metrics::cpMenuChipRound());
+        ink = ui::maxContrastTextOn(fill);
+    } else {
+        sessPillFace(dl, surf, p0, p1, hv, 0.0f);
+    }
+    const ImVec2 ts = ImGui::CalcTextSize(label);
+    dl->AddText(ImVec2(p0.x + (p1.x - p0.x - ts.x) * 0.5f, p0.y + (p1.y - p0.y - ts.y) * 0.5f),
+                ImGui::ColorConvertFloat4ToU32(ink), label);
+    if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    return clicked;
+}
+
+// ---- header toolbar ---------------------------------------------------------------------------
+// Under the title: the project dropdown chip (folder, name, chevron) on the left and the archived
+// toggle on the right, both one frame tall so they share a baseline. The chip's popup lists every
+// project that has sessions, the viewed one checked.
+void drawSessionsToolbar(const ui::AdaptiveSurface& surf,
+                         const std::vector<SessProjectEntry>& projects, int unassigned,
+                         const std::string& activeKey, bool* showArchived) {
     SessScopeState& S = s_sessScope;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 o = ImGui::GetCursorScreenPos();
+    const float availW = ImGui::GetContentRegionAvail().x;
+    const float h = ImGui::GetFrameHeight();
+    const float lineH = ImGui::GetTextLineHeight();
+    const float padX = ui::metrics::px(9.0f);
+    const float gap = ui::metrics::px(6.0f);
+    const float glyph = ui::metrics::px(14.0f);
+    const float chevR = ui::metrics::px(3.5f);
+
     std::string label;
     if (S.scope == SessScope::All)             label = "All projects";
     else if (S.scope == SessScope::Unassigned) label = "Unassigned";
@@ -708,40 +860,425 @@ void drawSessionsProjectSwitcher(const std::vector<SessProjectEntry>& projects, 
         for (const auto& e : projects)
             if (e.key == S.key) { label = e.name; break; }
     }
-    label = ui::kit::elide(label.c_str(), maxLabelW);
-    if (!ui::kit::popoverBegin("##sess_project", label.c_str())) {
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(S.scope == SessScope::All
-                ? "Showing sessions from every project. Click to pick one project."
-                : S.scope == SessScope::Unassigned
-                    ? "Showing sessions with no project. Click to pick a project."
-                    : "Showing this project's sessions only. Click to view another project's.");
-        return;
+    const char* const toggleLabel = "Archived";
+    const float toggleW = ImGui::CalcTextSize(toggleLabel).x + padX * 2.0f;
+    const float chipChrome = padX * 2.0f + glyph + gap * 2.0f + chevR * 2.0f;
+    // The project name yields first when the column is narrow; the toggle never shrinks.
+    label = ui::kit::elide(label.c_str(),
+                           std::max(ui::metrics::px(24.0f), availW - toggleW - gap - chipChrome));
+    const float chipW = chipChrome + ImGui::CalcTextSize(label.c_str()).x;
+    const ImVec2 chipMax(o.x + chipW, o.y + h);
+
+    ImGui::PushID("sess_toolbar");
+
+    // ---- project chip
+    ImGui::SetCursorScreenPos(o);
+    if (ImGui::InvisibleButton("##project", ImVec2(chipW, h))) ImGui::OpenPopup("##project_menu");
+    const bool chipHot = ImGui::IsItemHovered();
+    const bool chipOpen = ImGui::IsPopupOpen("##project_menu");
+    if (chipHot && !chipOpen) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        ImGui::SetTooltip(S.scope == SessScope::All
+            ? "Showing sessions from every project. Click to pick one project."
+            : S.scope == SessScope::Unassigned
+                ? "Showing sessions with no project. Click to pick a project."
+                : "Showing this project's sessions only. Click to view another project's.");
     }
-    for (const auto& e : projects) {
-        ImGui::PushID(e.key.c_str());
-        char item[160];
-        std::snprintf(item, sizeof(item), "%s  (%d)", e.name.c_str(), e.count);
-        const bool checked = S.scope == SessScope::Project && S.key == e.key;
-        if (ImGui::MenuItem(item, e.key == activeKey ? "active" : nullptr, checked)) {
-            S.scope = SessScope::Project;
-            S.key   = e.key;
-            S.dir   = e.dir;
+    const float chv = ui::anim::toward(ImGui::GetID("##chv"),
+                                       (chipHot || chipOpen) ? 1.0f : 0.0f, ui::anim::kFast);
+    sessPillFace(dl, surf, o, chipMax, chv, 0.0f);
+    {
+        const float cy = o.y + h * 0.5f;
+        float x = o.x + padX;
+        sessDrawFolder(dl, ImVec2(x + glyph * 0.5f, cy), glyph, sessInk(surf.textSecondary, 1.0f));
+        x += glyph + gap;
+        dl->AddText(ImVec2(x, o.y + (h - lineH) * 0.5f), sessInk(surf.textPrimary, 1.0f),
+                    label.c_str());
+        x += ImGui::CalcTextSize(label.c_str()).x + gap;
+        sessDrawChevronDown(dl, ImVec2(x + chevR, cy), chevR, sessInk(surf.textSecondary, 1.0f));
+    }
+
+    ui::pushContextMenuStyle();
+    ImGui::SetNextWindowPos(ImVec2(o.x, chipMax.y + ui::metrics::px(3.0f)), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(chipW, 0.0f), ImVec2(FLT_MAX, FLT_MAX));
+    if (ImGui::BeginPopup("##project_menu")) {
+        for (const auto& e : projects) {
+            ImGui::PushID(e.key.c_str());
+            char item[160];
+            std::snprintf(item, sizeof(item), "%s  (%d)", e.name.c_str(), e.count);
+            const bool checked = S.scope == SessScope::Project && S.key == e.key;
+            if (ImGui::MenuItem(item, e.key == activeKey ? "active" : nullptr, checked)) {
+                S.scope = SessScope::Project;
+                S.key   = e.key;
+                S.dir   = e.dir;
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", e.dir.c_str());
+            ImGui::PopID();
         }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", e.dir.c_str());
-        ImGui::PopID();
+        if (projects.empty()) ui::cpMenuHint("No project has sessions yet.");
+        ImGui::Separator();
+        char un[64];
+        std::snprintf(un, sizeof(un), "Unassigned  (%d)", unassigned);
+        if (ImGui::MenuItem(un, nullptr, S.scope == SessScope::Unassigned))
+            S.scope = SessScope::Unassigned;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Sessions that never recorded a project folder.");
+        if (ImGui::MenuItem("All projects", nullptr, S.scope == SessScope::All))
+            S.scope = SessScope::All;
+        ImGui::EndPopup();
     }
-    if (projects.empty()) ui::cpMenuHint("No project has sessions yet.");
-    ImGui::Separator();
-    char un[64];
-    std::snprintf(un, sizeof(un), "Unassigned  (%d)", unassigned);
-    if (ImGui::MenuItem(un, nullptr, S.scope == SessScope::Unassigned))
-        S.scope = SessScope::Unassigned;
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Sessions that never recorded a project folder.");
-    if (ImGui::MenuItem("All projects", nullptr, S.scope == SessScope::All))
-        S.scope = SessScope::All;
-    ui::kit::popoverEnd();
+    ui::popContextMenuStyle();
+
+    // ---- archived toggle (right-aligned)
+    const ImVec2 tMin(o.x + availW - toggleW, o.y);
+    const ImVec2 tMax(tMin.x + toggleW, tMin.y + h);
+    ImGui::SetCursorScreenPos(tMin);
+    if (ImGui::InvisibleButton("##archived", ImVec2(toggleW, h))) *showArchived = !*showArchived;
+    const bool togHot = ImGui::IsItemHovered();
+    if (togHot) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        ImGui::SetTooltip("%s", *showArchived
+            ? "Showing archived sessions only. Turn off to return to your active list."
+            : "Archived sessions are hidden from this list \xe2\x80\x94 turn on to review or "
+              "restore them. Archiving keeps the full transcript (unlike Delete).");
+    }
+    const float tv = ui::anim::toward(ImGui::GetID("##tv"), togHot ? 1.0f : 0.0f,
+                                      ui::anim::kFast);
+    const float on = ui::anim::toward(ImGui::GetID("##on"), *showArchived ? 1.0f : 0.0f,
+                                      ui::anim::kFast);
+    sessPillFace(dl, surf, tMin, tMax, tv, on);
+    dl->AddText(ImVec2(tMin.x + padX, o.y + (h - lineH) * 0.5f),
+                sessInk(ImLerp(surf.textSecondary, surf.textPrimary, std::max(tv, on)), 1.0f),
+                toggleLabel);
+    ImGui::PopID();
+
+    // One item spanning the row advances the cursor past it (and validates the window extent).
+    ImGui::SetCursorScreenPos(o);
+    ImGui::Dummy(ImVec2(availW, h));
+}
+
+// ---- session rows ------------------------------------------------------------------------------
+struct SessRowStyle {
+    float padX = 0.0f;
+    float rowH = 0.0f, rowRndDp = 0.0f;               // rowRndDp: glassRowBackground scales itself
+    float titleH = 0.0f, metaH = 0.0f, lineGap = 0.0f;
+    float kebabSz = 0.0f, kebabEdge = 0.0f;
+    float actionW = 0.0f;                              // right zone title/meta never enter
+    ImFont* titleFont = nullptr;
+    bool allProjects = false;
+};
+
+struct SessRowResult {
+    bool running = false;
+    bool del = false, fork = false, archive = false, manage = false;
+};
+
+// One session row at `rowMin`, `g.rowH` tall: leading slot (running spinner), title, one meta line
+// (age · message count [· project] + doc chip) and a right-hand overflow button. Everything is
+// laid out from the row rect, so content is centred and the text clip ends before the action
+// zone on every row, hovered or not. List-mutating actions are RETURNED, never run here — the
+// caller owns the iteration the mutation would invalidate.
+SessRowResult drawSessionRow(AppState& st, int i, const SessRowStyle& g, const ImVec2& rowMin,
+                             float rowW, double ts, const ui::AdaptiveSurface& surf) {
+    const auto& pal = ui::palette;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const Conversation& c = st.conversations[i];
+    const std::vector<ChatMsg>& msgs = (i == st.activeConv) ? st.chat : c.msgs;
+    const std::string title = sessDisplayTitle(c, i);
+    // Everything below that reads `msgs` is evaluated BEFORE a click can switch conversations
+    // (which moves the message buffers between st.chat and the parked conversation).
+    const int nMsg = (int)msgs.size();
+    SessRowResult out;
+    // Truthful per-session state: this conversation's own run, not a global flag. The
+    // trailing-message scan catches a running message that has no JobState in
+    // st.runs.
+    out.running = st.convRunning(c.id) ||
+                  (!msgs.empty() && !msgs.back().fromUser && msgs.back().running);
+    const bool running = out.running;
+    if (running && s_delConfirm == c.id) s_delConfirm.clear();   // a live run cannot be deleted
+    const bool renaming = s_rename.id == c.id;
+    const bool confirming = s_delConfirm == c.id;
+    const char* const archLabel = c.archived ? "Restore" : "Archive";
+    const ImVec2 rowMax(rowMin.x + rowW, rowMin.y + g.rowH);
+    const ImVec2 kbMin(rowMax.x - g.kebabEdge - g.kebabSz,
+                       rowMin.y + (g.rowH - g.kebabSz) * 0.5f);
+
+    ImGui::PushID(c.id.c_str());
+
+    // ---- hit items. Submitted first (they draw nothing) so hover is known before painting. The
+    // row button stops short of the action zone and the overflow button sits inside it: they never
+    // overlap, so hover and clicks go where the pointer is.
+    bool picked = false, pickHover = false, kebabHover = false;
+    ImGui::SetCursorScreenPos(rowMin);
+    if (renaming || confirming) {
+        // The title is an edit box / the row is a prompt: it must not also be a click target.
+        ImGui::Dummy(ImVec2(rowW, g.rowH));
+    } else {
+        picked = ImGui::InvisibleButton("##pick", ImVec2(std::max(1.0f, rowW - g.actionW), g.rowH));
+        pickHover = ImGui::IsItemHovered();
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+            s_menuConv = c.id;
+            ImGui::OpenPopup("##sessrow_menu");
+        }
+        ImGui::SetCursorScreenPos(kbMin);
+        if (ImGui::InvisibleButton("##more", ImVec2(g.kebabSz, g.kebabSz))) {
+            s_menuConv = c.id;
+            ImGui::OpenPopup("##sessrow_menu");
+        }
+        kebabHover = ImGui::IsItemHovered();
+    }
+    const bool menuOpen = ImGui::IsPopupOpen("##sessrow_menu");
+    if (!menuOpen && s_menuConv == c.id) s_menuConv.clear();
+
+    // ---- text geometry
+    const float runSz = sessRunningIconSize();
+    const float leadW = running ? runSz + ui::metrics::px(8.0f) : 0.0f;
+    const float textX = rowMin.x + g.padX + leadW;
+    const float textMaxW = std::max(ui::metrics::px(24.0f), rowMax.x - g.actionW - textX);
+    const float blockTop = rowMin.y + (g.rowH - (g.titleH + g.lineGap + g.metaH)) * 0.5f;
+    const float metaY = blockTop + g.titleH + g.lineGap;
+
+    // Meta line: age · message count [· project]. "All projects" reveals which project each
+    // session belongs to; unassigned sessions say so rather than posing as the current project's.
+    std::string meta;
+    auto addMeta = [&meta](const std::string& part) {
+        if (part.empty()) return;
+        if (!meta.empty()) meta += " \xc2\xb7 ";
+        meta += part;
+    };
+    if (nMsg == 0) {
+        addMeta("Empty session");
+    } else {
+        addMeta(sessAgeLabel(ts));
+        addMeta(nMsg == 1 ? std::string("1 message") : std::to_string(nMsg) + " messages");
+    }
+    if (g.allProjects)
+        addMeta(c.projectDir.empty() ? std::string("Unassigned") : sessProjectName(c.projectDir));
+    const std::string shownMeta = ui::kit::elide(meta.c_str(), textMaxW);
+    const float metaW = ImGui::CalcTextSize(shownMeta.c_str()).x;
+
+    // A session can carry a docLink reference: file: links always show (basename); doc: links
+    // resolve only while the tab is open. The chip sits INLINE after the meta text, and is dropped
+    // (never squeezed over the text) when the row has no room for a readable one.
+    std::string badge;
+    int badgeTab = -1;
+    if (c.docLink.rfind("file:", 0) == 0) {
+        const std::string p = c.docLink.substr(5);
+        const size_t slash = p.find_last_of("/\\");
+        badge = slash == std::string::npos ? p : p.substr(slash + 1);
+        for (int ti = 0; ti < (int)st.docTabs.size(); ++ti)
+            if (st.docTabs[ti].path == p) { badgeTab = ti; break; }
+    } else if (c.docLink.rfind("doc:", 0) == 0) {
+        const std::string id = c.docLink.substr(4);
+        for (int ti = 0; ti < (int)st.docTabs.size(); ++ti)
+            if (st.docTabs[ti].docId == id) {
+                // t.title can still be a placeholder ("Part1") or an opaque id;
+                // displayTitle() resolves the handoff/tree/path name instead.
+                badgeTab = ti; badge = st.docTabs[ti].displayTitle(); break;
+            }
+    }
+    const float chipPadX = ui::metrics::px(5.0f);
+    std::string chipText;
+    ImVec2 chipMin(0.0f, 0.0f), chipMax(0.0f, 0.0f);
+    if (!badge.empty() && !renaming && !confirming) {
+        const float gapMeta = ui::metrics::px(6.0f);
+        // Never let a long filename eat the whole meta line — cap at half the row.
+        const float inner = std::min(textMaxW - metaW - gapMeta, rowW * 0.5f) - chipPadX * 2.0f;
+        if (inner >= ui::metrics::px(28.0f)) {
+            chipText = ui::kit::elide(badge.c_str(), inner);
+            if (!chipText.empty()) {
+                chipMin = ImVec2(textX + metaW + gapMeta, metaY - ui::metrics::px(1.0f));
+                chipMax = ImVec2(chipMin.x + ImGui::CalcTextSize(chipText.c_str()).x + chipPadX * 2.0f,
+                                 metaY + g.metaH + ui::metrics::px(1.0f));
+            }
+        }
+    }
+    // The chip is a click target INSIDE the row button: routed by rect here instead of by a second
+    // overlapping item, which ImGui would resolve unpredictably.
+    const bool chipHit = !chipText.empty() && pickHover && ImGui::IsMouseHoveringRect(chipMin, chipMax);
+
+    // Picking stays live during a run (multi-session): switching parks the viewed conversation;
+    // its run keeps streaming into it in the background.
+    if (picked) {
+        if (chipHit && badgeTab >= 0) {
+            st.switchToTab(badgeTab);
+        } else {
+            // Always land in chat for the chosen session — including re-clicking
+            // the already-active one (switchConversation early-returns on same idx).
+            if (i != st.activeConv) switchConversation(st, i);
+            cpSetTab(st, CpTab::Chat);
+        }
+    }
+
+    // ---- paint
+    // Re-read the selection: it may have just changed under the click above, and painting from a
+    // stale value left the row you clicked unhighlighted for a frame (and the old row still lit).
+    const bool active = (i == st.activeConv);
+    // The wash tracks the whole row rect, not only the two hit items, so crossing the few pixels
+    // between the row button and the overflow button never flickers it off.
+    const bool overRow = ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem) &&
+                         ImGui::IsMouseHoveringRect(rowMin, rowMax);
+    const bool hot = !renaming && !confirming &&
+                     (overRow || pickHover || kebabHover || menuOpen);
+    const float hv  = ui::anim::toward(ImGui::GetID("##hv"),  hot ? 1.0f : 0.0f, ui::anim::kFast);
+    const float act = ui::anim::toward(ImGui::GetID("##act"), active ? 1.0f : 0.0f,
+                                       ui::anim::kBase);
+    ui::glassRowBackground(dl, rowMin, rowMax, g.rowRndDp, false, false,
+                           0.34f + 0.10f * hv + 0.12f * act);
+    if (act > 0.01f) {
+        // The open session: a soft accent wash and a slim accent bar down the leading edge.
+        ui::coloredRowWash(dl, rowMin, rowMax, g.rowRndDp, pal.accent, 0.20f * act, false);
+        const float barW = ui::metrics::px(3.0f);
+        const float barX = rowMin.x + ui::metrics::px(2.0f);
+        const float barInset = g.rowH * 0.22f;
+        dl->AddRectFilled(ImVec2(barX, rowMin.y + barInset),
+                          ImVec2(barX + barW, rowMax.y - barInset),
+                          sessInk(semanticOnGlass(pal.accent, surf), act), barW * 0.5f);
+    }
+    if (confirming) ui::coloredRowWash(dl, rowMin, rowMax, g.rowRndDp, pal.statusErr, 0.30f, false);
+    if (running)
+        drawSessionRunningIcon(dl, surf,
+                               ImVec2(rowMin.x + g.padX + runSz * 0.5f, rowMin.y + g.rowH * 0.5f));
+
+    bool doDel = false, doArchive = false, doFork = false, doManage = false, doRename = false;
+    if (renaming) {
+        // Inline rename: Enter or clicking away saves, Esc cancels. An empty name hands the
+        // session back to its automatic title.
+        const float padRename = ui::metrics::px(1.5f);
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(ui::metrics::px(5.0f), padRename));
+        ImGui::SetCursorScreenPos(ImVec2(textX, blockTop - padRename));
+        ImGui::SetNextItemWidth(std::max(ui::metrics::px(24.0f), rowMax.x - g.padX - textX));
+        if (s_rename.frames++ == 0) ImGui::SetKeyboardFocusHere();
+        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
+        const bool enter = ImGui::InputText("##rename", s_rename.buf, sizeof(s_rename.buf),
+                                            ImGuiInputTextFlags_EnterReturnsTrue |
+                                                ImGuiInputTextFlags_AutoSelectAll);
+        ImGui::PopStyleColor();
+        ImGui::PopStyleVar();
+        if (ImGui::IsItemActive()) s_rename.everActive = true;
+        const bool deactivated = ImGui::IsItemDeactivated();
+        if (enter || (deactivated && !ImGui::IsKeyPressed(ImGuiKey_Escape))) {
+            renameConversation(st, i, s_rename.buf);
+            s_rename = SessRename{};
+        } else if (deactivated || (!s_rename.everActive && s_rename.frames > 3) ||
+                   (s_rename.everActive && !ImGui::IsItemActive())) {
+            // Esc, focus never landed, or the box lost focus while the row was off-screen:
+            // leave the name as it was.
+            s_rename = SessRename{};
+        }
+        dl->AddText(ImVec2(textX, metaY), sessInk(surf.textTertiary, 1.0f),
+                    ui::kit::elide("Enter to save \xc2\xb7 Esc to cancel", textMaxW).c_str());
+    } else if (confirming) {
+        // Inline delete confirmation: the row becomes the prompt, buttons on its right edge.
+        const float btnH = g.kebabSz;
+        const float btnY = rowMin.y + (g.rowH - btnH) * 0.5f;
+        const float btnPadX = ui::metrics::px(10.0f);
+        const float delW = ImGui::CalcTextSize("Delete").x + btnPadX * 2.0f;
+        const float cancelW = ImGui::CalcTextSize("Cancel").x + btnPadX * 2.0f;
+        const ImVec2 delMin(rowMax.x - g.kebabEdge - delW, btnY);
+        const ImVec2 cancelMin(delMin.x - ui::metrics::px(6.0f) - cancelW, btnY);
+        const float promptW = std::max(ui::metrics::px(24.0f),
+                                       cancelMin.x - ui::metrics::px(8.0f) - textX);
+        if (g.titleFont) ImGui::PushFont(g.titleFont);
+        dl->AddText(ImVec2(textX, blockTop), sessInk(surf.textPrimary, 1.0f),
+                    ui::kit::elide("Delete session?", promptW).c_str());
+        if (g.titleFont) ImGui::PopFont();
+        dl->AddText(ImVec2(textX, metaY), sessInk(surf.textSecondary, 0.9f),
+                    ui::kit::elide(title.c_str(), promptW).c_str());
+        const bool cancel = sessTextButton("##delcancel", "Cancel", cancelMin,
+                                           ImVec2(cancelMin.x + cancelW, btnY + btnH), false, surf);
+        const bool ok = sessTextButton("##delok", "Delete", delMin,
+                                       ImVec2(delMin.x + delW, btnY + btnH), true, surf);
+        if (ok) doDel = true;
+        if (cancel || (ImGui::IsKeyPressed(ImGuiKey_Escape, false) &&
+                       ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)))
+            s_delConfirm.clear();
+    } else {
+        if (g.titleFont) ImGui::PushFont(g.titleFont);
+        const std::string titleShown = ui::kit::elide(title.c_str(), textMaxW);
+        dl->AddText(ImVec2(textX, blockTop), sessInk(surf.textPrimary, 1.0f), titleShown.c_str());
+        if (g.titleFont) ImGui::PopFont();
+        dl->AddText(ImVec2(textX, metaY), sessInk(surf.textSecondary, 0.9f), shownMeta.c_str());
+        if (!chipText.empty()) {
+            const float chipH = chipMax.y - chipMin.y;
+            dl->AddRectFilled(chipMin, chipMax,
+                              sessInk(surf.textPrimary, (badgeTab >= 0 ? 0.12f : 0.06f) +
+                                                            (chipHit ? 0.07f : 0.0f)),
+                              ui::metrics::cpMenuChipRound());
+            ImVec4 chipInk = badgeTab >= 0 ? surf.textSecondary : surf.textTertiary;
+            chipInk.w = 1.0f;
+            dl->AddText(ImVec2(chipMin.x + chipPadX, chipMin.y + (chipH - g.metaH) * 0.5f),
+                        ImGui::ColorConvertFloat4ToU32(chipInk), chipText.c_str());
+        }
+
+        // Overflow button: faint at rest (the visible sign a session can be managed, and the only
+        // route to its actions without a hover-capable pointer), full on hover or selection.
+        const bool kebabHot = kebabHover || menuOpen;
+        const float kv = ui::anim::toward(ImGui::GetID("##kv"), kebabHot ? 1.0f : 0.0f,
+                                          ui::anim::kFast);
+        if (kv > 0.01f)
+            dl->AddRectFilled(kbMin, ImVec2(kbMin.x + g.kebabSz, kbMin.y + g.kebabSz),
+                              sessInk(surf.textPrimary, 0.10f * kv),
+                              ui::metrics::cpMenuChipRound());
+        const float restA = 0.42f + 0.58f * std::max(hv, act * 0.6f);
+        sessDrawKebab(dl, ImVec2(kbMin.x + g.kebabSz * 0.5f, kbMin.y + g.kebabSz * 0.5f),
+                      g.kebabSz,
+                      sessInk(ImLerp(surf.textSecondary, surf.textPrimary, kv), std::max(restA, kv)));
+
+        if (kebabHover) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            ImGui::SetTooltip("Session actions");
+        } else if (chipHit) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            ImGui::SetTooltip("%s", badgeTab >= 0 ? "Jump to this document's tab"
+                                                  : "Document not open");
+        } else if (pickHover) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            if (titleShown != title) ImGui::SetTooltip("%s", title.c_str());
+        }
+    }
+
+    // Overflow menu: every session action, on every row. Right-clicking the row opens it too.
+    ui::pushContextMenuStyle();
+    if (ImGui::BeginPopup("##sessrow_menu")) {
+        constexpr const char* kAfterThisRun = "Available when this session's run finishes.";
+        if (ImGui::MenuItem("Rename")) doRename = true;
+        if (ImGui::MenuItem("Fork")) doFork = true;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Fork this session into a new idle copy");
+        if (ImGui::MenuItem(archLabel, nullptr, false, !running)) doArchive = true;
+        if (running && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("%s", kAfterThisRun);
+        else if (!running && ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", c.archived
+                ? "Restore to the active sessions list"
+                : "Archive: hides from the default list but keeps the full transcript (unlike "
+                  "Delete). Turn on \"Archived\" above to find it again.");
+        if (ImGui::MenuItem(s_ccm.convId == c.id ? "Hide recovery" : "Manage")) doManage = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Session recovery: export, branch, and close runtime");
+        ImGui::Separator();
+        // Destructive: opens the row's own confirmation; nothing is deleted from the menu itself.
+        if (ImGui::MenuItem("Delete", nullptr, false, !running)) s_delConfirm = c.id;
+        if (running && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("%s", kAfterThisRun);
+        ImGui::EndPopup();
+    }
+    ui::popContextMenuStyle();
+    if (doRename) {
+        s_rename = SessRename{};
+        s_rename.id = c.id;
+        std::snprintf(s_rename.buf, sizeof(s_rename.buf), "%s",
+                      ui::copilot::stripInlineImageMarkers(c.title).c_str());
+    }
+
+    ImGui::PopID();
+    // Destructive row actions are blocked only for the row whose own run is live — an unrelated
+    // background run never locks them.
+    out.del = doDel && !running;
+    out.archive = doArchive && !running;
+    out.fork = doFork;
+    out.manage = doManage;
+    return out;
 }
 }  // namespace
 
@@ -758,14 +1295,13 @@ SessionsScopeProbe sessionsScopeProbe() {
 void drawSessionsPanel(AppState& st, bool busy) {
     (void)busy;  // runs are per-conversation; this panel never locks on the viewed run
     const float sc = ui::uiScale;
-    const auto& pal = ui::palette;
     const ui::AdaptiveSurface& surf = chatSurf();
 
     ensureConversations(st);
 
-    // One title treatment for every copilot menu (ui_common cpMenu*). The project switcher and
-    // the "Show archived" filter sit in the header's accessory slot — above the rule, next to
-    // the title cluster — instead of full body rows between the button and the list.
+    // One title treatment for every copilot menu (ui_common cpMenu*). The project dropdown and
+    // the archived toggle share ONE toolbar row in the header's accessory slot — above the rule,
+    // under the title — instead of full body rows between the title and the list.
     static bool s_showArchived = false;
     SessScopeState& scope = s_sessScope;
     const std::string activeDir = convProjectDir(st);
@@ -782,22 +1318,7 @@ void drawSessionsPanel(AppState& st, bool busy) {
     const std::vector<SessProjectEntry> projects =
         sessProjects(st, s_showArchived, activeKey, activeDir, unassigned);
     ui::cpMenuHeader(st.fonts, "Sessions", nullptr, [&]{
-        drawSessionsProjectSwitcher(projects, unassigned, activeKey,
-                                    ImGui::GetContentRegionAvail().x * 0.45f);
-        ImGui::SameLine(0.0f, ui::metrics::U(1.0f));
-        // The kit checkbox paints its own themed box (the raw ImGui box rendered as a bare black
-        // block on dark glass). Its ink still comes from the glass surface like every other label
-        // in this menu: the theme's default text tone vanished against the bright viewport
-        // backdrop showing through the copilot column.
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-        ui::kit::checkbox("sess_show_archived", "Show archived", &s_showArchived,
-                          s_showArchived
-                              ? "Showing archived sessions only. Turn off to return to your "
-                                "active list."
-                              : "Archived sessions are hidden from this list \xe2\x80\x94 turn "
-                                "on to review or restore them. Archiving keeps the full "
-                                "transcript (unlike Delete).");
-        ImGui::PopStyleColor();
+        drawSessionsToolbar(surf, projects, unassigned, activeKey, &s_showArchived);
     });
     const bool allProjects = scope.scope == SessScope::All;
     // Peeking at another project's sessions: offer the real project switch (the same path as
@@ -819,386 +1340,196 @@ void drawSessionsPanel(AppState& st, bool busy) {
         ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
     }
 
-    // No new-session action here: in the dock, the pinned header's "New chat" (row 2, next to
-    // the Sessions toggle) is the one way to start a session from any overlay; the full AI
-    // workspace carries New session in its own chat header. This panel only lists, switches
-    // and manages the viewed project's sessions.
+    // Starting a session from a populated list is the pinned header's "New chat" (row 2, next to
+    // the Sessions toggle); this panel only offers it from the empty state. The full AI workspace
+    // carries New session in its own chat header.
 
-    const ImGuiStyle& style = ImGui::GetStyle();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
     // Row shape/rhythm from the shared copilot-menu tokens, so session rows, artifact cards and
-    // task rows carry ONE corner, ONE inner padding and ONE gap.
-    const float padX     = ui::metrics::cpMenuRowPadX();
-    const float padY     = ui::metrics::cpMenuRowPadY();
-    const float rowGap   = ui::metrics::cpMenuRowGap();
-    const float rowRnd   = ui::metrics::cpMenuRowRound();   // already DPI-scaled: direct draw calls
-    const float rowRndDp = rowRnd / sc;                     // glassRowBackground scales internally
-    const float fh = ImGui::GetFontSize();
-    const float titleH = fh;
-    const float subH  = fh * 0.92f;
-    const float rowH  = padY * 2.0f + titleH + 2.0f * sc + subH;
-    const float trashSz = ImGui::GetFrameHeight();
+    // task rows carry ONE corner, ONE inner padding and ONE gap. Every row is the same height:
+    // padding + a medium-weight title line + a meta line.
+    SessRowStyle row;
+    row.padX      = ui::metrics::cpMenuRowPadX();
+    row.rowRndDp  = ui::metrics::cpMenuRowRound() / sc;   // glassRowBackground scales internally
+    row.titleFont = st.fonts.medium;
+    if (row.titleFont) ImGui::PushFont(row.titleFont);
+    row.titleH    = ImGui::GetTextLineHeight();
+    if (row.titleFont) ImGui::PopFont();
+    row.metaH     = ImGui::GetTextLineHeight();
+    row.lineGap   = ui::metrics::px(2.0f);
+    row.rowH      = ui::metrics::cpMenuRowPadY() * 2.0f + row.titleH + row.lineGap + row.metaH;
+    row.kebabSz   = std::min(row.rowH - ui::metrics::px(12.0f),
+                             std::max(ImGui::GetFrameHeight(), ui::metrics::px(26.0f)));
+    row.kebabEdge = ui::metrics::px(6.0f);
+    row.actionW   = row.kebabSz + row.kebabEdge + ui::metrics::px(4.0f);
+    row.allProjects = allProjects;
+    const float rowGap = ui::metrics::cpMenuRowGap();
+
     // Project scope comes from the session's OWN stored projectDir (captured at creation,
     // restamped per turn), never from a live scan of what it produced. Only the viewed
     // project's sessions are listed; sessions with no stored project appear ONLY under
     // "Unassigned" (they used to leak into every project's list).
     const std::string viewKey = scope.scope == SessScope::Unassigned ? std::string() : scope.key;
-    bool anyRowShown = false;
-    // Newest sessions first: newConversation() appends, so the tail of st.conversations is the
-    // most recent session — walk the vector back-to-front so it lands at the TOP of the list.
+    std::vector<int> scoped;   // slots in the viewed project / archived state, newest-created first
     for (int i = (int)st.conversations.size() - 1; i >= 0; --i) {
-        Conversation& c = st.conversations[i];
-        if (c.archived != s_showArchived) continue;
-        // The active transcript lives in st.chat; parked conversations retain theirs in
-        // Conversation::msgs.
-        if (!allProjects && convProjectKey(c.projectDir) != viewKey) continue;
-        const std::vector<ChatMsg>& msgs = (i == st.activeConv) ? st.chat : c.msgs;
-        anyRowShown = true;
-        // Fallback number is the conversation's own slot, not the display row — with the
-        // newest-first order a row position changes every session, a slot number does not.
-        std::string title = c.title.empty() ? ("Session " + std::to_string(i + 1)) : c.title;
-        // Truthful per-session state: this conversation's own run, not a global flag. The
-        // trailing-message scan catches one-shot RPC turns (agent_ask_v2 …) that never get
-        // a JobState in st.runs.
-        const bool running = st.convRunning(c.id) ||
-            (!msgs.empty() && !msgs.back().fromUser && msgs.back().running);
-        bool active = (i == st.activeConv);
+        const Conversation& c = st.conversations[i];
+        if (c.archived != s_showArchived || (!allProjects && convProjectKey(c) != viewKey))
+            continue;
+        scoped.push_back(i);
+    }
 
-        char sub[96];
-        const int nMsg = (int)msgs.size();
-        if (nMsg == 0)
-            std::snprintf(sub, sizeof(sub), "Empty session");
-        else if (nMsg == 1)
-            std::snprintf(sub, sizeof(sub), "1 message");
-        else
-            std::snprintf(sub, sizeof(sub), "%d messages", nMsg);
-        const char* archLabel = c.archived ? "Restore" : "Archive";
-        const float archBtnW = ImGui::CalcTextSize(archLabel).x + 16.0f * sc;
-        const float forkBtnW = ImGui::CalcTextSize("Fork").x + 16.0f * sc;
-        const float manageBtnW = ImGui::CalcTextSize("Manage").x + 16.0f * sc;
-        const float actionGap = 4.0f * sc;
-        // Action-zone geometry must be computed ONCE and shared by the title clip and the
-        // buttons below: the reserve used to assume the trash button was trashSz wide, but
-        // the drawn ImageButton is img + FramePadding*2 (wider) — the Archive button slid
-        // left over the title text on active/hovered rows.
-        const float delImg  = trashSz - 8.0f * sc;
-        const float delBtnW = delImg + style.FramePadding.x * 2.0f;
-        const float delBtnH = delImg + style.FramePadding.y * 2.0f;
-        const float rightMargin = 4.0f * sc;
-        // The overflow button is PERMANENT on every row — the visible sign that a session can be
-        // managed, and the only route to its actions without a hover-capable pointer. The hover
-        // buttons stay as a shortcut to its left.
-        const float moreW = delBtnH;
-        const float moreReserve = moreW + rightMargin + actionGap;
-        const bool renaming = s_rename.id == c.id;
+    // The filter field only appears once the list is long enough to need it — and never hides
+    // while it is still filtering.
+    if (scoped.size() > 8 || s_filter[0] != '\0') {
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::cpMenuChipRound());
+        ImGui::InputTextWithHint("##sess_filter", "Filter sessions\xe2\x80\xa6", s_filter,
+                                 sizeof(s_filter), ImGuiInputTextFlags_EscapeClearsAll);
+        ImGui::PopStyleVar();
+        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
+    }
+    std::string needle;
+    for (const char* p = s_filter; *p; ++p) needle += (char)std::tolower((unsigned char)*p);
 
-        ImGui::PushID(i);
-        const ImVec2 rowMin = ImGui::GetCursorScreenPos();
-        const float  rowW   = ImGui::GetContentRegionAvail().x;
-        const ImVec2 rowMax(rowMin.x + rowW, rowMin.y + rowH);
+    std::vector<int> visibleSessions;
+    for (const int i : scoped)
+        if (sessMatchesFilter(sessDisplayTitle(st.conversations[i], i), needle))
+            visibleSessions.push_back(i);
 
-        // Every row reserves the permanent overflow button; the hover shortcut buttons
-        // (Manage/Fork/Archive/Delete) only EXIST while the pointer is on the row, so only that
-        // row reserves their width. The ACTIVE row is marked by its highlight, not by permanent
-        // buttons — showing them there squeezed the open session's title to one letter. Hover is
-        // tested against the row rect directly: the reserve is needed BEFORE this frame's
-        // InvisibleButton reports its hover state.
-        const bool rowHot = ImGui::IsMouseHoveringRect(rowMin, rowMax);
-        // Shortcuts are added right-to-left (Delete, Archive, Fork, Manage) only while the title
-        // keeps a readable share of the row; whatever does not fit stays in the overflow menu,
-        // which carries every action. The title is never covered.
-        const float titleKeep = std::max(ui::metrics::px(110.0f), rowW * 0.45f);
-        const float shortcutRoom = rowW - padX * 2.0f - moreReserve - titleKeep;
-        float actionsW = 0.0f;
-        bool showDelBtn = false, showArchBtn = false, showForkBtn = false, showManageBtn = false;
-        auto takeShortcut = [&](float w, bool& flag) {
-            if (actionsW + w + actionGap > shortcutRoom) return false;
-            actionsW += w + actionGap;
-            flag = true;
-            return true;
-        };
-        if (rowHot && !renaming && takeShortcut(delBtnW, showDelBtn) &&
-            takeShortcut(archBtnW, showArchBtn) && takeShortcut(forkBtnW, showForkBtn))
-            takeShortcut(manageBtnW, showManageBtn);
-        const float actionsReserve = moreReserve + actionsW;
+    // Most recently active first, grouped by calendar day. Activity is the LAST message's time;
+    // the open session with nothing said yet counts as now, so a fresh chat leads the list. The
+    // sort is stable: sessions with equal (or unknown) times keep newest-created-first order.
+    const double now = chatNowEpoch();
+    auto lastTs = [&](int i) -> double {
+        const std::vector<ChatMsg>& m = (i == st.activeConv) ? st.chat : st.conversations[i].msgs;
+        if (m.empty()) return i == st.activeConv ? now : 0.0;
+        return std::max(0.0, m.back().ts);
+    };
+    std::stable_sort(visibleSessions.begin(), visibleSessions.end(),
+                     [&](int a, int b) { return lastTs(a) > lastTs(b); });
+    const SessDays days = sessDayStarts();
+    std::vector<double> tsOf(visibleSessions.size());
+    std::vector<int> bucketOf(visibleSessions.size());
+    int bucketsSeen = 0;
+    for (size_t k = 0; k < visibleSessions.size(); ++k) {
+        tsOf[k] = lastTs(visibleSessions[k]);
+        bucketOf[k] = sessBucket(tsOf[k], days);
+        bucketsSeen |= 1 << bucketOf[k];
+    }
+    // Group headers only earn their space when the list actually spans more than one group.
+    const bool grouped = (bucketsSeen & (bucketsSeen - 1)) != 0;
 
-        // While the title is an edit box the row must not also be a click target: the button
-        // would claim hover first and swallow the clicks meant for the text field.
-        bool picked = false;
-        const ImVec2 pickSize(std::max(1.0f, rowW - actionsReserve - padX), rowH);
-        if (renaming) {
-            ImGui::Dummy(pickSize);
-        } else {
-            picked = ImGui::InvisibleButton("##pickconv", pickSize);
-            if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) ImGui::OpenPopup("##sessrow_menu");
+    if (visibleSessions.empty()) {
+        if (!scoped.empty()) {
+            ui::kit::emptyState("history", "No matching sessions",
+                                "Try part of a session title.");
+            return;
         }
-        // NOTE: do NOT use IsItemHovered() on ##pickconv for row-hover logic — that
-        // button is shrunk to exclude the action zone, so its hover drops the moment
-        // the mouse reaches for the Archive/Delete buttons and they vanish under the
-        // cursor. rowHot (the full-row rect test above) is the one true predicate.
-        // Picking stays live during a run (multi-session): switching parks the viewed
-        // conversation; its run keeps streaming into it in the background.
-        if (picked) {
-            // Always land in chat for the chosen session — including re-clicking
-            // the already-active one (switchConversation early-returns on same idx).
-            if (i != st.activeConv)
-                switchConversation(st, i);
+        std::string title, body;
+        if (s_showArchived) {
+            title = "No archived sessions";
+            body  = "Archive a session from its menu to keep its transcript without cluttering "
+                    "this list.";
+        } else if (scope.scope == SessScope::Unassigned) {
+            title = "No unassigned sessions";
+            body  = "Sessions that never recorded a project folder show up here.";
+        } else if (allProjects) {
+            title = "No sessions yet";
+            body  = "Start a chat and it is saved here.";
+        } else if (peeking) {
+            title = "No sessions in " + peekName;
+            body  = "Switch to this project to start one.";
+        } else {
+            title = "No sessions in this project";
+            body  = "Start a chat \xe2\x80\x94 it is saved here so you can come back to it.";
+        }
+        // New chat lands in the ACTIVE project, so it is only offered where the result would
+        // show up in the list the user is looking at.
+        const bool canStart = !s_showArchived && !peeking && scope.scope != SessScope::Unassigned;
+        if (ui::kit::emptyState("history", title.c_str(), body.c_str(),
+                                canStart ? "New chat" : nullptr)) {
+            cpStartNewChat(st);
             cpSetTab(st, CpTab::Chat);
         }
+        return;
+    }
 
-        // Re-read the selection: `active` above was captured BEFORE the click that just
-        // switched conversations, and painting from it left the row you clicked unhighlighted
-        // for a frame (and the old row still lit).
-        active = (i == st.activeConv);
-        float wash = active ? 0.55f : (rowHot ? 0.44f : 0.34f);
-        ui::glassRowBackground(dl, rowMin, rowMax, rowRndDp, false, active, wash);
-
-        // Titles and snippets are user text of arbitrary length and are painted straight onto
-        // the draw list, which does NOT clip to the row — a long snippet used to run out past
-        // the card, under the scrollbar and off the column edge. Clip both to the room they
-        // actually have (title also yields the action-button zone) with a real ellipsis.
-        const float titleY = rowMin.y + padY;
-        // In-flight sessions get the animated tesseract icon at the row's left edge; text
-        // indents past it only for those rows.
-        const float runIndent = running ? drawSessionRunningIcon(dl, surf, rowMin, rowH, padX, sc)
-                                        : 0.0f;
-        const float textMaxW = std::max(ui::metrics::px(24.0f),
-                                        rowW - padX * 2.0f - actionsReserve - runIndent);
-        if (renaming) {
-            // Inline rename: Enter or clicking away saves, Esc cancels. An empty name hands the
-            // session back to its automatic title.
-            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f * sc, 1.0f * sc));
-            ImGui::SetCursorScreenPos(ImVec2(rowMin.x + padX + runIndent,
-                                             std::max(rowMin.y, titleY - 1.0f * sc)));
-            ImGui::SetNextItemWidth(textMaxW);
-            if (s_rename.frames++ == 0) ImGui::SetKeyboardFocusHere();
-            ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-            const bool enter = ImGui::InputText("##rename", s_rename.buf, sizeof(s_rename.buf),
-                                                ImGuiInputTextFlags_EnterReturnsTrue |
-                                                    ImGuiInputTextFlags_AutoSelectAll);
-            ImGui::PopStyleColor();
-            ImGui::PopStyleVar();
-            if (ImGui::IsItemActive()) s_rename.everActive = true;
-            const bool deactivated = ImGui::IsItemDeactivated();
-            if (enter || (deactivated && !ImGui::IsKeyPressed(ImGuiKey_Escape))) {
-                renameConversation(st, i, s_rename.buf);
-                s_rename = SessRename{};
-            } else if (deactivated || (!s_rename.everActive && s_rename.frames > 3) ||
-                       (s_rename.everActive && !ImGui::IsItemActive())) {
-                // Esc, focus never landed, or the box lost focus while the row was off-screen:
-                // leave the name as it was.
-                s_rename = SessRename{};
+    // Rows are placed from a running `y`, not ImGui's cursor, and only the rows on screen are
+    // submitted (skipped ones advance `y` by their exact height, so the scroll extent is stable).
+    // Rows that must stay alive while scrolled away — the open recovery card, an inline rename or
+    // delete prompt, an open overflow menu — are always submitted.
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float x0 = ImGui::GetCursorScreenPos().x;
+    const float rowW = ImGui::GetContentRegionAvail().x;
+    float y = ImGui::GetCursorScreenPos().y;
+    bool listChanged = false;   // a row action mutated st.conversations: indices below are stale
+    int lastBucket = -1;
+    for (size_t k = 0; k < visibleSessions.size(); ++k) {
+        const int i = visibleSessions[k];
+        const int bucket = bucketOf[k];
+        if (grouped && bucket != lastBucket) {
+            // Group label with a faint rule running out to the row edge.
+            const float headTop = lastBucket < 0 ? 0.0f : ui::metrics::px(10.0f);
+            const float headH = headTop + row.metaH + ui::metrics::px(4.0f);
+            if (!listChanged &&
+                ImGui::IsRectVisible(ImVec2(x0, y), ImVec2(x0 + rowW, y + headH))) {
+                const char* label = kSessBucketLabel[bucket];
+                const float lx = x0 + row.padX;
+                const float ly = y + headTop;
+                ImVec4 ink = surf.textTertiary;
+                ink.w = 1.0f;
+                dl->AddText(ImVec2(lx, ly), ImGui::ColorConvertFloat4ToU32(ink), label);
+                const float ruleX = lx + ImGui::CalcTextSize(label).x + ui::metrics::px(8.0f);
+                const float ruleEnd = x0 + rowW - row.padX;
+                if (ruleEnd > ruleX)
+                    dl->AddLine(ImVec2(ruleX, ly + row.metaH * 0.5f),
+                                ImVec2(ruleEnd, ly + row.metaH * 0.5f),
+                                sessInk(surf.textTertiary, 0.35f), ui::metrics::stroke(1.0f));
             }
-        } else {
-            const std::string titleShown = ui::kit::elide(title.c_str(), textMaxW);
-            ImU32 ink = ImGui::ColorConvertFloat4ToU32(surf.textPrimary);
-            dl->AddText(ImVec2(rowMin.x + padX + runIndent, titleY), ink, titleShown.c_str());
+            y += headH;
+        }
+        lastBucket = bucket;
+        // After a list action the remaining rows are only measured, never submitted, so the
+        // window keeps its full extent for the frame and the scroll position is not clamped.
+        if (listChanged) {
+            y += row.rowH + rowGap;
+            continue;
         }
 
-        // Project-matching sessions can optionally carry a docLink reference. Show the linked
-        // document's name on the sub line; clicking it jumps to that document's tab when open.
-        // file: links always render (basename); doc: links only resolve while the tab is open,
-        // otherwise the badge is hidden.
-        // Resolved BEFORE the subtitle so the sub's clip yields room for the badge. The badge
-        // is skipped on hover/active rows: its right-aligned slot is exactly where the
-        // Archive/Delete action buttons appear, and painting both stacked the two (plus the
-        // badge's invisible click target swallowed the row-action clicks).
-        std::string badge;
-        int badgeTab = -1;
-        const bool showBadge = !rowHot;
-        if (showBadge && c.docLink.rfind("file:", 0) == 0) {
-            const std::string p = c.docLink.substr(5);
-            const size_t slash = p.find_last_of("/\\");
-            badge = slash == std::string::npos ? p : p.substr(slash + 1);
-            for (int ti = 0; ti < (int)st.docTabs.size(); ++ti)
-                if (st.docTabs[ti].path == p) { badgeTab = ti; break; }
-        } else if (showBadge && c.docLink.rfind("doc:", 0) == 0) {
-            const std::string id = c.docLink.substr(4);
-            for (int ti = 0; ti < (int)st.docTabs.size(); ++ti)
-                if (st.docTabs[ti].docId == id) {
-                    // t.title can still be a placeholder ("Part1") or an opaque id;
-                    // displayTitle() resolves the handoff/tree/path name instead.
-                    badgeTab = ti; badge = st.docTabs[ti].displayTitle(); break;
-                }
+        const Conversation& c = st.conversations[i];
+        const bool pinned = s_ccm.convId == c.id || s_rename.id == c.id ||
+                            s_delConfirm == c.id || s_menuConv == c.id;
+        if (!pinned && !ImGui::IsRectVisible(ImVec2(x0, y), ImVec2(x0 + rowW, y + row.rowH))) {
+            y += row.rowH + rowGap;
+            continue;
         }
-        float badgeW = 0.0f;
-        float badgeX0 = 0.0f, badgeX1 = 0.0f;
-        if (!badge.empty()) {
-            // Never let a long filename eat the whole sub line — cap at half the row.
-            badge = ui::kit::elide(badge.c_str(),
-                                   std::max(ui::metrics::px(24.0f), rowW * 0.5f - padX));
-            badgeW = ImGui::CalcTextSize(badge.c_str()).x + 8.0f * sc;
-            // Right-aligned just left of the permanent overflow button — hover/active rows never
-            // reach here (showBadge above), so this never collides with the action buttons.
-            badgeX1 = rowMax.x - moreReserve;
-            badgeX0 = std::max(rowMin.x + padX + runIndent, badgeX1 - badgeW);
-        }
-        // Clip the subtitle to the room it ACTUALLY has: up to the badge's left edge when a
-        // badge is drawn, else up to the row's action zone (overflow button, plus the hover
-        // buttons on a hot row).
-        const float subRight = badgeW > 0.0f ? badgeX0 - 6.0f * sc : rowMax.x - actionsReserve;
-        const float subMaxW = std::max(ui::metrics::px(24.0f),
-                                       subRight - (rowMin.x + padX + runIndent));
-        dl->AddText(ImVec2(rowMin.x + padX + runIndent, titleY + titleH + 2.0f * sc),
-                    ImGui::ColorConvertFloat4ToU32(surf.textSecondary),
-                    ui::kit::elide(sub, subMaxW).c_str());
-        // "All projects" reveals which project each session belongs to: a dimmed column on
-        // the sub line, right of the message count. Unassigned sessions say so explicitly
-        // rather than looking like they belong to the current project.
-        if (allProjects) {
-            const float subW = ImGui::CalcTextSize(ui::kit::elide(sub, subMaxW).c_str()).x;
-            const float projX = rowMin.x + padX + runIndent + subW + 8.0f * sc;
-            const float projMaxW = subRight - projX;
-            if (projMaxW > ui::metrics::px(16.0f)) {
-                const std::string projName =
-                    c.projectDir.empty() ? std::string("Unassigned") : sessProjectName(c.projectDir);
-                ImVec4 projInk = surf.textTertiary;
-                projInk.w = 1.0f;
-                dl->AddText(ImVec2(projX, titleY + titleH + 2.0f * sc),
-                            ImGui::ColorConvertFloat4ToU32(projInk),
-                            ui::kit::elide(projName.c_str(), projMaxW).c_str());
-            }
-        }
-
-        if (!badge.empty()) {
-            const ImVec2 bsz = ImGui::CalcTextSize(badge.c_str());
-            const float bx0 = badgeX0, bx1 = badgeX1;
-            const float by0 = rowMin.y + padY + titleH + 2.0f * sc
-                              + (subH - bsz.y) * 0.5f - 1.0f * sc;
-            const float by1 = by0 + bsz.y + 2.0f * sc;
-            ImVec4 badgeBg(surf.textPrimary.x, surf.textPrimary.y, surf.textPrimary.z, 0.10f);
-            if (badgeTab < 0) badgeBg.w = 0.05f;
-            dl->AddRectFilled(ImVec2(bx0, by0), ImVec2(bx1, by1),
-                              ImGui::ColorConvertFloat4ToU32(badgeBg),
-                              ui::metrics::cpMenuChipRound());
-            ImVec4 badgeInk = badgeTab >= 0 ? surf.textSecondary : surf.textTertiary;
-            badgeInk.w = 1.0f;
-            dl->AddText(ImVec2(bx0 + 4.0f * sc, by0 + 1.0f * sc),
-                        ImGui::ColorConvertFloat4ToU32(badgeInk), badge.c_str());
-            ImGui::SetCursorScreenPos(ImVec2(bx0, by0));
-            ImGui::InvisibleButton("##docbadge", ImVec2(bx1 - bx0, by1 - by0));
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", badgeTab >= 0
-                    ? "Jump to this document's tab" : "Document not open");
-            if (ImGui::IsItemClicked() && badgeTab >= 0)
-                st.switchToTab(badgeTab);
-        }
-
-        bool doDel = false;
-        bool doArchiveToggle = false;
-        bool doFork = false;
-        bool doManage = false;
-        bool doRename = false;
-        const float btnY = rowMin.y + (rowH - delBtnH) * 0.5f;
-        const float moreX = rowMax.x - rightMargin - moreW;
-        // Shortcuts are laid out right-to-left from the overflow button, each only when
-        // takeShortcut() above found room for it (the same set the title clip reserved).
-        float nextX = moreX;
-        if (showDelBtn) {
-            const float delX = nextX - actionGap - delBtnW;
-            nextX = delX;
-            ImGui::SetCursorScreenPos(ImVec2(delX, btnY));
-            IconUV trash = ui::getIcon("delete", 20);
-            bool del = trash.valid
-                ? ImGui::ImageButton("##delconv", trash.texId, ImVec2(delImg, delImg), trash.uv0, trash.uv1)
-                : ImGui::SmallButton("x");
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(running ? "Delete \xe2\x80\x94 available when this session's run finishes."
-                                          : "Delete this session");
-            // Destructive row actions are blocked only for the row whose own run is live —
-            // an unrelated background run never locks them.
-            doDel = del && !running;
-        }
-        if (showArchBtn) {
-            const float archX = nextX - archBtnW - actionGap;
-            nextX = archX;
-            ImGui::SetCursorScreenPos(ImVec2(archX, btnY));
-            bool archClick = ImGui::Button(archLabel, ImVec2(archBtnW, delBtnH));
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(c.archived
-                    ? "Restore to the active sessions list"
-                    : "Archive: hides from the default list but keeps the full transcript "
-                      "(unlike Delete). Turn on \"Show archived\" above to find it again.");
-            doArchiveToggle = archClick && !running;
-        }
-        if (showForkBtn) {
-            const float forkX = nextX - forkBtnW - actionGap;
-            nextX = forkX;
-            ImGui::SetCursorScreenPos(ImVec2(forkX, btnY));
-            doFork = ImGui::Button("Fork", ImVec2(forkBtnW, delBtnH));
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Fork this session into a new idle copy");
-        }
-        if (showManageBtn) {
-            const float mgX = nextX - manageBtnW - actionGap;
-            ImGui::SetCursorScreenPos(ImVec2(mgX, btnY));
-            doManage = ImGui::Button("Manage", ImVec2(manageBtnW, delBtnH));
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(s_ccm.convId == c.id
-                    ? "Hide session recovery"
-                    : "Session recovery: export, diagnose/repair, branch, close runtime");
-        }
-
-        // Permanent overflow: the same actions (plus Rename) on every row, hover or not.
-        // Right-clicking the row opens the same menu.
-        ImGui::SetCursorScreenPos(ImVec2(moreX, btnY));
-        if (ImGui::Button("\xe2\x80\xa6##sessrow_more", ImVec2(moreW, delBtnH)))
-            ImGui::OpenPopup("##sessrow_menu");
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Session actions");
-        ui::pushContextMenuStyle();
-        if (ImGui::BeginPopup("##sessrow_menu")) {
-            constexpr const char* kAfterThisRun =
-                "Available when this session's run finishes.";
-            if (ImGui::MenuItem("Rename")) doRename = true;
-            if (ImGui::MenuItem("Fork")) doFork = true;
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Fork this session into a new idle copy");
-            if (ImGui::MenuItem(archLabel, nullptr, false, !running)) doArchiveToggle = true;
-            if (running && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                ImGui::SetTooltip("%s", kAfterThisRun);
-            if (ImGui::MenuItem(s_ccm.convId == c.id ? "Hide recovery" : "Manage")) doManage = true;
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Session recovery: export, diagnose/repair, branch, close runtime");
-            ImGui::Separator();
-            if (ImGui::MenuItem("Delete", nullptr, false, !running)) doDel = true;
-            if (running && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                ImGui::SetTooltip("%s", kAfterThisRun);
-            ImGui::EndPopup();
-        }
-        ui::popContextMenuStyle();
-        if (doRename) {
-            s_rename = SessRename{};
-            s_rename.id = c.id;
-            std::snprintf(s_rename.buf, sizeof(s_rename.buf), "%s", c.title.c_str());
-        }
-
-        ImGui::SetCursorScreenPos(ImVec2(rowMin.x, rowMax.y + rowGap));
-        ImGui::PopID();
-        // Toggle + draw the recovery card directly under its own row (persists while the
-        // pointer leaves the row — only the toggle button is hover-gated, not the card).
-        if (doManage) {
+        const SessRowResult res = drawSessionRow(st, i, row, ImVec2(x0, y), rowW, tsOf[k], surf);
+        y += row.rowH + rowGap;
+        ImGui::SetCursorScreenPos(ImVec2(x0, y));
+        // Toggle + draw the recovery card directly under its own row (it persists while the
+        // pointer leaves the row — only the toggle is an action, not the card).
+        if (res.manage) {
             if (s_ccm.convId == c.id) s_ccm.close();
             else s_ccm.open(c.id);
         }
-        if (s_ccm.convId == c.id) drawChudcodeManageCard(st, c, running);
-        if (doDel) { closeConversation(st, i); break; }
-        if (doFork) { forkConversation(st, i); break; }
-        if (doArchiveToggle) { archiveConversation(st, i, !c.archived); break; }
+        if (s_ccm.convId == c.id) {
+            drawOmpManageCard(st, c, res.running);
+            y = ImGui::GetCursorScreenPos().y;
+        }
+        if (res.del) {
+            s_delConfirm.clear();
+            closeConversation(st, i);
+            listChanged = true;
+        } else if (res.fork) {
+            forkConversation(st, i);
+            listChanged = true;
+        } else if (res.archive) {
+            archiveConversation(st, i, !c.archived);
+            listChanged = true;
+        }
     }
-    if (!anyRowShown) {
-        // Same tone and indent as every other "nothing here yet" line in the copilot menus.
-        std::string where;
-        if (scope.scope == SessScope::Project)
-            where = peeking ? " in " + peekName : std::string(" in this project");
-        const std::string hint =
-            allProjects                           ? std::string(s_showArchived ? "No archived sessions."
-                                                                               : "No sessions yet.")
-            : scope.scope == SessScope::Unassigned ? std::string(s_showArchived
-                                                        ? "No archived unassigned sessions."
-                                                        : "No unassigned sessions.")
-            : (s_showArchived ? "No archived sessions" : "No sessions") + where + ".";
-        ui::cpMenuHint(hint.c_str());
-    }
-
+    // An item at the end of the list validates the window extent the skipped rows never claimed.
+    ImGui::SetCursorScreenPos(ImVec2(x0, y));
+    ImGui::Dummy(ImVec2(rowW, 0.0f));
 }
 
 // PlanItem::status -> the app's one status vocabulary.
@@ -1387,27 +1718,40 @@ static void drawTaskListPanel(AppState& st, bool busy) {
 }
 
 // ============================ Session Artifacts presentation ============================
-// The Artifacts tab is an asset BROWSER: every row says what KIND of thing it is, how big it is
-// and when it landed, and carries persistent actions. All chrome comes from ui::kit, so an
-// artifact row and a PLM row are the same object.
+// The Artifacts tab is an asset BROWSER for what the agent produced this session, grouped by KIND:
+// Models / Drawings / Images / Data are collapsible sections and a chip row narrows the view to
+// one kind. Images are a responsive thumbnail grid; everything else is a list of uniform rows
+// (kind plate, name, a quiet "what . size" line, age) whose actions fade in over the age on hover
+// and repeat in the right-click menu. Rows and tiles are painted straight onto the pane's glass in
+// the copilot's adaptive ink, so they stay legible over any viewport backdrop in both themes.
 
-// One listed artifact. `open` is the row's activation; `image` marks an ART-stream image.
-struct ArtiDocRow {
-    std::string label, tooltip, path;
-    std::function<void()> open;
-    bool image = false;
-};
+// What an artifact IS. Doubles as the section it lands in and (+1) as its filter chip index.
+enum ArtiBucket { ArtiModels = 0, ArtiDrawings, ArtiImages, ArtiData };
+static constexpr int kArtiKinds    = 4;
+// The user's own open documents are a fifth, collapsed-by-default section after the four kinds.
+static constexpr int kArtiOpenSec  = kArtiKinds;
+static constexpr int kArtiSections = kArtiKinds + 1;
 
-enum ArtiBucket { ArtiModels = 0, ArtiDrawings, ArtiData, ArtiOther };
-
-// What an artifact IS — resolved once from its extension, then reused for the leading icon, the
-// secondary line and the section bucket. The old panel put the PARENT FOLDER on the second line,
-// which for a session whose output all lands in one directory is the same string on every row.
+// What an artifact IS — resolved once, then reused for the leading icon, the secondary line and the
+// section it lands in, so a row's section can never disagree with the kind its icon claims.
 struct ArtiClass {
     const char* icon   = "file_generic";
     const char* what   = "File";
-    bool        image  = false;
-    ArtiBucket  bucket = ArtiOther;
+    ArtiBucket  bucket = ArtiData;
+};
+
+// One listed artifact. `open` is the row's activation (an image row views the image full size).
+struct ArtiDocRow {
+    std::string key;                  // stable ImGui / animation id
+    std::string label;
+    std::string path;                 // the file on disk; empty for a document with no file yet
+    std::string revealPath;           // "show in file manager" target (an unsaved doc: the project folder)
+    std::function<void()> open;
+    ArtiClass   cls;
+    bool        doc    = false;       // a document tab rather than a produced file
+    bool        live   = false;       // an agent is editing this document right now
+    bool        closed = false;       // view closed while the agent kept building: the only action is Reopen
+    bool        own    = false;       // opened by the user and never touched by the agent
 };
 
 static std::string artiLower(std::string s) {
@@ -1417,11 +1761,6 @@ static std::string artiLower(std::string s) {
 
 static ArtiClass artiClassify(const std::string& path, const std::string& label) {
     ArtiClass c;
-    if (path.empty()) {
-        c.icon = "part";
-        c.what = "Live document";
-        return c;
-    }
     const size_t slash = path.find_last_of("/\\");
     const size_t dot   = path.find_last_of('.');
     std::string ext;
@@ -1429,49 +1768,52 @@ static ArtiClass artiClassify(const std::string& path, const std::string& label)
         ext = artiLower(path.substr(dot + 1));
 
     static const struct {
-        const char* ext; const char* icon; const char* what; bool image; ArtiBucket bucket;
+        const char* ext; const char* icon; const char* what; ArtiBucket bucket;
     } kMap[] = {
-        {"step+",  "file_step",    "CAD document",       false, ArtiModels},
-        {"aicm",   "file_step",    "CAD model",          false, ArtiModels},
-        {"draw+",  "file_doc",     "Drawing document",   false, ArtiDrawings},
-        {"ecad+",  "file_data",    "Electronics document", false, ArtiModels},
-        {"step",   "file_step",    "STEP export",        false, ArtiModels},
-        {"stp",    "file_step",    "STEP export",        false, ArtiModels},
-        {"iges",   "file_step",    "IGES export",        false, ArtiModels},
-        {"igs",    "file_step",    "IGES export",        false, ArtiModels},
-        {"sldprt", "file_step",    "CAD part",           false, ArtiModels},
-        {"x_t",    "file_step",    "Parasolid export",   false, ArtiModels},
-        {"stl",    "file_mesh",    "STL mesh",           false, ArtiModels},
-        {"obj",    "file_mesh",    "OBJ mesh",           false, ArtiModels},
-        {"ply",    "file_mesh",    "PLY mesh",           false, ArtiModels},
-        {"3mf",    "file_mesh",    "3MF print file",     false, ArtiModels},
-        {"png",    "file_image",   "Render",             true,  ArtiOther},
-        {"jpg",    "file_image",   "Render",             true,  ArtiOther},
-        {"jpeg",   "file_image",   "Render",             true,  ArtiOther},
-        {"webp",   "file_image",   "Render",             true,  ArtiOther},
-        {"pdf",    "file_doc",     "PDF document",       false, ArtiDrawings},
-        {"dxf",    "file_doc",     "DXF drawing",        false, ArtiDrawings},
-        {"svg",    "file_doc",     "SVG drawing",        false, ArtiDrawings},
-        {"md",     "file_doc",     "Notes",              false, ArtiData},
-        {"txt",    "file_doc",     "Text file",          false, ArtiData},
-        {"docx",   "file_doc",     "Word document",      false, ArtiData},
-        {"json",   "file_data",    "JSON data",          false, ArtiData},
-        {"csv",    "file_data",    "CSV table",          false, ArtiData},
-        {"xml",    "file_data",    "XML data",           false, ArtiData},
-        {"yaml",   "file_data",    "YAML data",          false, ArtiData},
-        {"yml",    "file_data",    "YAML data",          false, ArtiData},
-        {"py",     "file_code",    "Python script",      false, ArtiData},
-        {"cpp",    "file_code",    "C++ source",         false, ArtiData},
-        {"js",     "file_code",    "JavaScript source",  false, ArtiData},
-        {"ts",     "file_code",    "TypeScript source",  false, ArtiData},
-        {"zip",    "file_archive", "Archive",            false, ArtiOther},
-        {"tar",    "file_archive", "Archive",            false, ArtiOther},
-        {"7z",     "file_archive", "Archive",            false, ArtiOther},
-        {"gz",     "file_archive", "Archive",            false, ArtiOther},
+        {"step+",  "file_step",    "CAD document",       ArtiModels},
+        {"aicm",   "file_step",    "CAD model",          ArtiModels},
+        {"draw+",  "file_doc",     "Drawing document",   ArtiDrawings},
+        {"kicad_pro", "file_data", "KiCad project",       ArtiModels},
+        {"kicad_sch", "file_data", "KiCad schematic",     ArtiModels},
+        {"kicad_pcb", "file_data", "KiCad board",         ArtiModels},
+        {"step",   "file_step",    "STEP export",        ArtiModels},
+        {"stp",    "file_step",    "STEP export",        ArtiModels},
+        {"iges",   "file_step",    "IGES export",        ArtiModels},
+        {"igs",    "file_step",    "IGES export",        ArtiModels},
+        {"sldprt", "file_step",    "CAD part",           ArtiModels},
+        {"x_t",    "file_step",    "Parasolid export",   ArtiModels},
+        {"stl",    "file_mesh",    "STL mesh",           ArtiModels},
+        {"obj",    "file_mesh",    "OBJ mesh",           ArtiModels},
+        {"ply",    "file_mesh",    "PLY mesh",           ArtiModels},
+        {"3mf",    "file_mesh",    "3MF print file",     ArtiModels},
+        {"png",    "file_image",   "Render",             ArtiImages},
+        {"jpg",    "file_image",   "Render",             ArtiImages},
+        {"jpeg",   "file_image",   "Render",             ArtiImages},
+        {"webp",   "file_image",   "Render",             ArtiImages},
+        {"pdf",    "file_doc",     "PDF document",       ArtiDrawings},
+        {"dxf",    "file_doc",     "DXF drawing",        ArtiDrawings},
+        {"dwg",    "file_doc",     "DWG drawing",        ArtiDrawings},
+        {"svg",    "file_doc",     "SVG drawing",        ArtiDrawings},
+        {"md",     "file_doc",     "Notes",              ArtiData},
+        {"txt",    "file_doc",     "Text file",          ArtiData},
+        {"docx",   "file_doc",     "Word document",      ArtiData},
+        {"json",   "file_data",    "JSON data",          ArtiData},
+        {"csv",    "file_data",    "CSV table",          ArtiData},
+        {"xml",    "file_data",    "XML data",           ArtiData},
+        {"yaml",   "file_data",    "YAML data",          ArtiData},
+        {"yml",    "file_data",    "YAML data",          ArtiData},
+        {"py",     "file_code",    "Python script",      ArtiData},
+        {"cpp",    "file_code",    "C++ source",         ArtiData},
+        {"js",     "file_code",    "JavaScript source",  ArtiData},
+        {"ts",     "file_code",    "TypeScript source",  ArtiData},
+        {"zip",    "file_archive", "Archive",            ArtiData},
+        {"tar",    "file_archive", "Archive",            ArtiData},
+        {"7z",     "file_archive", "Archive",            ArtiData},
+        {"gz",     "file_archive", "Archive",            ArtiData},
     };
     for (const auto& m : kMap) {
         if (ext != m.ext) continue;
-        c.icon = m.icon; c.what = m.what; c.image = m.image; c.bucket = m.bucket;
+        c.icon = m.icon; c.what = m.what; c.bucket = m.bucket;
         break;
     }
     // A CSV the agent produced is almost always the BOM; say so rather than "CSV table".
@@ -1480,11 +1822,44 @@ static ArtiClass artiClassify(const std::string& path, const std::string& label)
     return c;
 }
 
+// A document tab's kind: the leading icon and the "what it is" line of its row.
+static ArtiClass artiDocClass(const AppState::DocTab& t) {
+    using K = AppState::DocTab::TabKind;
+    ArtiClass c;
+    c.bucket = ArtiModels;
+    switch (t.kind) {
+        case K::Assembly:
+            c.icon = "assembly";
+            c.what = "Assembly";
+            break;
+        case K::Drawing:
+            c.icon   = "ws_drawing";
+            c.what   = "Drawing";
+            c.bucket = ArtiDrawings;
+            break;
+        case K::Schematic:
+            c.icon = "schematic";
+            c.what = "Schematic";
+            break;
+        case K::PCB:
+            c.icon = "ecad_pcb";
+            c.what = "PCB layout";
+            break;
+        case K::Part:
+        default:
+            c.icon = "part";
+            c.what = "Part";
+            break;
+    }
+    return c;
+}
+
 // Size + age for the row's meta column, from ONE cached stat.
 struct ArtiStat {
     unsigned long long size  = 0;
     double             mtime = 0.0;   // unix seconds; 0 = unknown
-    bool               ok    = false;
+    bool               ok    = false;   // the file exists and was readable at the last sample
+    bool               known = false;   // at least one sample has landed (the first pass is paced)
 };
 
 // BOUNDED stat cache: the panel repaints every frame and stat()ing 50 artifact paths per frame is
@@ -1496,6 +1871,7 @@ static ArtiStat artiStatOf(const std::string& path) {
     static std::unordered_map<std::string, Slot> s_cache;
     static constexpr size_t kMaxResident = 128;
     static constexpr double kStatTtl     = 2.0;
+    static int refreshedFrame = -1;
     const double now = ImGui::GetTime();
 
     auto it = s_cache.find(path);
@@ -1509,7 +1885,9 @@ static ArtiStat artiStatOf(const std::string& path) {
         it = s_cache.emplace(path, Slot{}).first;
     }
     Slot& s = it->second;
-    if (now - s.taken >= kStatTtl) {
+    if (now - s.taken >= kStatTtl && refreshedFrame != ImGui::GetFrameCount()) {
+        refreshedFrame = ImGui::GetFrameCount();
+        s.st.known = true;
         namespace fs = std::filesystem;
         std::error_code ec;
         const auto sz = fs::file_size(path, ec);
@@ -1525,9 +1903,11 @@ static ArtiStat artiStatOf(const std::string& path) {
                 s.st.mtime = std::chrono::duration<double>(sysT.time_since_epoch()).count();
             }
         }
-        s.taken = now;
+        s.taken = now + (std::hash<std::string>{}(path) % 1000) * 0.001;
     }
     s.lastUse = now;
+    // First samples are paced one per frame; keep frames coming until every row has its own.
+    if (!s.st.known) ui::anim::requestFrames();
     return s.st;   // by value: the next call may evict/rehash this slot
 }
 
@@ -1550,47 +1930,25 @@ static float artiEnterAlpha(double t0, int index) {
                              ui::anim::kSlow);
 }
 
-// Render-thumbnail cache for the Artifacts tab's "Renders" grid. The panel is redrawn every
-// frame, so each PNG the agent produced is decoded and uploaded ONCE and then keyed by path —
-// the same lazy-upload shape the inline chat tool rows use (activity_timeline.cpp s_artTex),
-// but BOUNDED: a long session emits hundreds of render_part files and an unbounded map would
-// hold a GL texture per file forever. 32 resident entries, least-recently-used evicted and its
-// texture released. A FAILED decode is cached as id == 0 so a missing/corrupt file is not
-// re-read every frame; callers fall back to a dim text row for it.
+// Grid tiles decode at half the transcript's edge: a tile is at most ~300 physical px wide and a
+// full-size view goes through the lightbox. No decode on the GL thread.
 static Tex artiRenderThumb(const std::string& path) {
-    struct Slot { Tex tex; double lastUse = 0.0; };
-    static std::unordered_map<std::string, Slot> s_cache;
-    static constexpr size_t kMaxResident = 32;
-    const double now = ImGui::GetTime();
-    auto it = s_cache.find(path);
-    if (it == s_cache.end()) {
-        if (s_cache.size() >= kMaxResident) {
-            auto oldest = s_cache.begin();
-            for (auto i = s_cache.begin(); i != s_cache.end(); ++i)
-                if (i->second.lastUse < oldest->second.lastUse) oldest = i;
-            if (oldest->second.tex.id) {
-                GLuint dead = (GLuint)oldest->second.tex.id;
-                glDeleteTextures(1, &dead);
-            }
-            s_cache.erase(oldest);
-        }
-        it = s_cache.emplace(path, Slot{loadTexture(path), now}).first;
-    }
-    it->second.lastUse = now;
-    return it->second.tex;   // by value: the next call may evict/rehash this slot
+    Tex tex;
+    tex.id = (unsigned int)(intptr_t)ui::copilot::asyncImageTexture(path, 512, &tex.w, &tex.h);
+    return tex;
 }
 
-// Filter / disclosure / view-mode state for the Artifacts tab. These lived in file statics, so a
-// filter typed in one session was still applied — invisibly, because the field only appears past
-// eight rows — after switching to another. Keyed to the viewed conversation and reset with it.
+// Filter / disclosure state for the Artifacts tab. These lived in file statics, so a filter typed
+// in one session was still applied — invisibly, because the field only appears past eight rows —
+// after switching to another. Keyed to the viewed conversation and reset with it.
 struct ArtiUiState {
     std::string convId;
-    char        filter[192]     = "";
-    bool        showOtherDocs   = false;
-    bool        showAllRenders  = false;
-    int         viewMode        = 0;    // 0 = List, 1 = Grid
-    double      enterT0         = 0.0;  // stagger origin for the row entrance
-    int         lastFrame       = -2;
+    char        filter[192]           = "";
+    int         kind                  = 0;   // 0 = every kind, else ArtiBucket + 1
+    bool        open[kArtiSections]   = {true, true, true, true, false};   // section disclosure
+    double      openT0[kArtiSections] = {};  // when each section last expanded (row entrance origin)
+    double      enterT0               = 0.0; // stagger origin for the whole panel's entrance
+    int         lastFrame             = -2;
 };
 static ArtiUiState& artiUi(const AppState& st) {
     static ArtiUiState s;
@@ -1608,176 +1966,444 @@ static ArtiUiState& artiUi(const AppState& st) {
     return s;
 }
 
-// One artifact row: kit chrome, a kind icon (or the render thumbnail), "2.4 MB . 3 min ago" in the
-// meta column, and a PERSISTENT action lane. Hover-gated actions are unreachable by keyboard and
-// touch and invisible in a screenshot, which is why they are always drawn now.
-static void artiRow(AppState& st, const ArtiDocRow& r, int index, double t0, bool thumbsOn) {
-    const ArtiClass cls = artiClassify(r.path, r.label);
+// ImU32 of a palette role / an adaptive ink at `a` alpha (the kit's own helper is private to kit.cpp).
+static ImU32 artiRole(const float c[4], float a = 1.0f) {
+    return ImGui::ColorConvertFloat4ToU32(ImVec4(c[0], c[1], c[2], c[3] * a));
+}
+static ImU32 artiInk(const ImVec4& c, float a = 1.0f) {
+    return ImGui::ColorConvertFloat4ToU32(ImVec4(c.x, c.y, c.z, c.w * a));
+}
 
-    std::string meta;
-    if (!r.path.empty()) {
-        const ArtiStat s = artiStatOf(r.path);
-        if (s.ok) {
-            meta = ui::kit::fmtBytes(s.size);
-            const std::string ago = ui::kit::fmtAgo(s.mtime);
-            if (!ago.empty()) meta += " \xc2\xb7 " + ago;
+// A named atlas glyph centred at `c`. Line-art glyphs take the theme's text role; the raster
+// file-kind tiles keep their baked colors (white tint), as the doc-tab strip does.
+static void artiPaintIcon(ImDrawList* dl, const char* name, ImVec2 c, float sz, float alpha = 1.0f) {
+    if (!name || !name[0] || sz <= 0.0f) return;
+    if (ui::hasIconSdf(name)) {
+        ui::drawIconGlass(dl, name, c, sz, artiRole(ui::palette.text, alpha), 0);
+        return;
+    }
+    const ui::IconUV ic = ui::getIcon(name, sz >= ui::metrics::iconHeader() ? ui::kIconCellLarge
+                                                                            : ui::kIconCellSmall);
+    if (!ic.valid) return;
+    const float r = sz * 0.5f;
+    dl->AddImage(ic.texId, ImVec2(c.x - r, c.y - r), ImVec2(c.x + r, c.y + r), ic.uv0, ic.uv1,
+                 IM_COL32(255, 255, 255, (int)(255.0f * ImClamp(alpha, 0.0f, 1.0f))));
+}
+
+// Row geometry shared by artiRow and the list clipper in drawArtifactsPanel: two text lines inside
+// an inset, so every row is the same height whatever it holds.
+static float artiRowInset() { return ui::metrics::U(1.25f); }
+static float artiRowHeight() {
+    return ImGui::GetTextLineHeight() * 2.0f + ui::metrics::U(0.5f) + artiRowInset() * 2.0f;
+}
+
+// What the row's primary action does, for its tooltip and its menu entry.
+static const char* artiOpenVerb(const ArtiDocRow& r) {
+    if (r.closed) return "Reopen live view";
+    if (r.cls.bucket == ArtiImages) return "View full size";
+    return r.doc ? "Switch to document" : "Open";
+}
+
+static void artiCopyPath(AppState& st, const std::string& path) {
+    ImGui::SetClipboardText(path.c_str());
+    st.toast(ui::ToastLevel::Info, "Path copied to the clipboard");
+}
+
+// The right-click menu shared by rows and tiles. Call inside the item's PushID scope; the caller
+// opens "##arti_ctx" on a right click of its hit item.
+static void artiContextMenu(AppState& st, const ArtiDocRow& r) {
+    ui::pushContextMenuStyle();
+    if (ImGui::BeginPopup("##arti_ctx")) {
+        if (r.open && ImGui::MenuItem(artiOpenVerb(r))) r.open();
+        if (r.cls.bucket == ArtiImages && ImGui::MenuItem("Open with default app"))
+            chatArtifactOpenSmart(st, r.path);
+        if (!r.revealPath.empty() && ImGui::MenuItem("Show in file manager"))
+            chatArtifactReveal(st, r.revealPath);
+        if (!r.path.empty() && ImGui::MenuItem("Copy path")) artiCopyPath(st, r.path);
+        ImGui::EndPopup();
+    }
+    ui::popContextMenuStyle();
+}
+
+// One artifact row, painted onto the glass in the copilot's adaptive ink:
+//
+//   [ plate ]  Name (medium)                                   3 min ago    <- at rest
+//   [  icon ]  STEP export . 2.4 MB                         [open][dir][copy] <- on hover
+//
+// The right lane is ONE slot that crossfades between the age and the action buttons, so hovering
+// never reflows the text (the text column is sized for the wider of the two). Everything is laid
+// out from the same computed geometry, so plate, both text lines and the buttons share a centre.
+static void artiRow(AppState& st, const ArtiDocRow& r, int index, double t0) {
+    namespace M = ui::metrics;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    const ArtiStat stat    = r.path.empty() ? ArtiStat{} : artiStatOf(r.path);
+    const bool     missing = !r.doc && stat.known && !stat.ok;
+
+    // Quiet second line: what it is, then how big (or why there is no size to show).
+    std::string meta = r.cls.what;
+    if (r.closed)                     meta += " \xc2\xb7 closed, the agent may still be building";
+    else if (missing)                 meta += " \xc2\xb7 file not found";
+    else if (stat.ok)                 meta += " \xc2\xb7 " + ui::kit::fmtBytes(stat.size);
+    else if (r.doc && r.path.empty()) meta += " \xc2\xb7 not saved yet";
+    // The lane's resting text: a live document says so, a file says how long ago it landed.
+    const std::string rest = r.live ? std::string("Editing")
+                                    : (stat.ok ? ui::kit::fmtAgo(stat.mtime) : std::string());
+
+    const float lineH     = ImGui::GetTextLineHeight();
+    const float inset     = artiRowInset();
+    const float rowH      = artiRowHeight();
+    const float tile      = rowH - inset * 2.0f;
+    const float btn       = lineH + M::U(1.5f);
+    const float btnGap    = M::U(0.5f);
+    const bool  canReveal = !r.revealPath.empty();
+    const bool  canCopy   = !r.path.empty();
+    const int   nAct      = 1 + (canReveal ? 1 : 0) + (canCopy ? 1 : 0);
+    const float actionsW  = btn * (float)nAct + btnGap * (float)(nAct - 1);
+    const float dotR      = M::U(0.5f);
+    const float dotGap    = M::U(1.0f);
+    const float restW     = rest.empty() ? 0.0f
+                          : ImGui::CalcTextSize(rest.c_str()).x +
+                                (r.live ? dotR * 2.0f + dotGap : 0.0f);
+    const float laneW     = ImMax(actionsW, restW);
+    const float padR      = inset + M::U(0.5f);
+    const float rowW      = ImMax(ImGui::GetContentRegionAvail().x, M::stroke(1.0f));
+
+    // Entrance: rows land as a wave, fading in while easing down from a few px above.
+    const float  a    = artiEnterAlpha(t0, index);
+    const float  off  = (1.0f - a) * M::px(8.0f);
+    const int    vtx0 = dl->VtxBuffer.Size;
+    const ImVec2 base = ImGui::GetCursorScreenPos();
+    const ImVec2 p0(base.x, base.y - off);
+    const ImVec2 p1(p0.x + rowW, p0.y + rowH);
+
+    ImGui::PushID(r.key.c_str());
+    ImGui::SetCursorScreenPos(p0);
+    ImGui::SetNextItemAllowOverlap();   // the action lane is submitted ON TOP of the row's hit box
+    const bool   activated = ImGui::InvisibleButton("##hit", ImVec2(rowW, rowH));
+    const bool   tipHover  = ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort);
+    const ImVec2 after     = ImGui::GetCursorScreenPos();
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) ImGui::OpenPopup("##arti_ctx");
+
+    // A row with its menu open stays "hot" so its actions do not vanish under the menu.
+    const bool  ctxOpen = ImGui::IsPopupOpen("##arti_ctx");
+    const bool  hot     = ctxOpen || (ImGui::IsWindowHovered() && ImGui::IsMouseHoveringRect(p0, p1));
+    const float hv      = ui::anim::toward(ImGui::GetID("##hv"), hot ? 1.0f : 0.0f, ui::anim::kFast);
+
+    const float rndDp = M::cpMenuRowRound() / M::scale();   // glass helpers take LOGICAL dp
+    ui::glassRowBackground(dl, p0, p1, rndDp, false, false, 0.30f + 0.16f * hv);
+    if (hv > 0.01f) ui::coloredRowWash(dl, p0, p1, rndDp, ui::palette.accent, 0.12f * hv, false);
+
+    // Kind plate: a themed matte square so the file-kind glyph reads over any backdrop.
+    const float  dim = missing ? 0.55f : 1.0f;
+    const ImVec2 t0p(p0.x + inset, p0.y + inset);
+    const ImVec2 t1p(t0p.x + tile, t0p.y + tile);
+    const float  tileRnd = M::cpMenuChipRound();
+    dl->AddRectFilled(t0p, t1p, artiRole(ui::palette.codeBg, 0.80f * dim), tileRnd);
+    dl->AddRect(t0p, t1p, artiRole(ui::palette.border, 0.55f * dim), tileRnd, 0, M::stroke(1.0f));
+    artiPaintIcon(dl, r.cls.icon, ImVec2((t0p.x + t1p.x) * 0.5f, (t0p.y + t1p.y) * 0.5f),
+                  tile * 0.62f, dim);
+
+    // Text column: name in the medium weight over the quiet kind / size line.
+    const float textX  = t1p.x + M::U(2.0f);
+    const float laneR  = p1.x - padR;
+    const float textW  = ImMax(laneR - laneW - M::U(1.5f) - textX, M::px(24.0f));
+    const float titleY = p0.y + inset;
+    if (st.fonts.medium) ImGui::PushFont(st.fonts.medium);
+    const std::string title = ui::kit::elide(r.label.c_str(), textW);
+    dl->AddText(ImVec2(textX, titleY), artiInk(surf.textPrimary, dim), title.c_str());
+    if (st.fonts.medium) ImGui::PopFont();
+    ImVec4 metaInk = surf.textSecondary;
+    metaInk.w *= 0.9f;
+    dl->AddText(ImVec2(textX, titleY + lineH + M::U(0.5f)), artiInk(metaInk, dim),
+                ui::kit::elide(meta.c_str(), textW).c_str());
+
+    // Right lane, resting state: the age (or the live marker) fades out as the buttons fade in.
+    const float restA = 1.0f - hv;
+    if (!rest.empty() && restA > 0.01f) {
+        const float rx = laneR - restW;
+        const float ry = p0.y + (rowH - lineH) * 0.5f;
+        if (r.live) {
+            const ImVec4 acc  = semanticOnGlass(ui::palette.accent, surf);
+            const float  beat = 0.55f + 0.45f * ui::anim::pulse();
+            dl->AddCircleFilled(ImVec2(rx + dotR, ry + lineH * 0.5f), dotR,
+                                artiInk(acc, beat * restA));
+            dl->AddText(ImVec2(rx + dotR * 2.0f + dotGap, ry), artiInk(acc, restA), rest.c_str());
+        } else {
+            ImVec4 quiet = surf.textTertiary;
+            quiet.w      = 1.0f;
+            dl->AddText(ImVec2(rx, ry), artiInk(quiet, restA), rest.c_str());
         }
     }
-    std::string tip = r.tooltip.empty() ? (r.path.empty() ? r.label : r.path) : r.tooltip;
-    if (!meta.empty()) tip += "\n" + meta;
 
-    ui::kit::RowStyle rs;
-    rs.icon      = cls.icon;
-    rs.iconTone  = ui::kit::Tone::Accent;
-    rs.secondary = cls.what;              // never empty — the row height below relies on it
-    rs.meta      = meta.empty() ? nullptr : meta.c_str();
-    rs.tooltip   = tip.c_str();
-    if (cls.image && thumbsOn) {
-        const Tex t = artiRenderThumb(r.path);
-        if (t.id) rs.thumb = (ImTextureID)(intptr_t)t.id;
+    // Right lane, hover state. Submitted while fading out too, so the crossfade is symmetric.
+    bool overLane = false;
+    if (hot || hv > 0.02f) {
+        const float bx0  = laneR - actionsW;
+        const float by   = p0.y + (rowH - btn) * 0.5f;
+        overLane = hot && ImGui::IsMouseHoveringRect(ImVec2(bx0, p0.y), ImVec2(laneR, p1.y), false);
+        const int bvtx = dl->VtxBuffer.Size;
+        float bx = bx0;
+        ImGui::SetCursorScreenPos(ImVec2(bx, by));
+        if (ui::kit::iconButton("open", "open", artiOpenVerb(r), true, ui::kit::Tone::Neutral,
+                                btn) && r.open)
+            r.open();
+        if (canReveal) {
+            bx += btn + btnGap;
+            ImGui::SetCursorScreenPos(ImVec2(bx, by));
+            // body_folder is the atlas's plain folder mark; there is no separate "reveal" glyph.
+            if (ui::kit::iconButton("reveal", "body_folder", "Show in file manager", true,
+                                    ui::kit::Tone::Neutral, btn))
+                chatArtifactReveal(st, r.revealPath);
+        }
+        if (canCopy) {
+            bx += btn + btnGap;
+            ImGui::SetCursorScreenPos(ImVec2(bx, by));
+            if (ui::kit::iconButton("copy", "copy", "Copy the full path", true,
+                                    ui::kit::Tone::Neutral, btn))
+                artiCopyPath(st, r.path);
+        }
+        artiFadeVerts(dl, bvtx, hv);
     }
 
-    const float btn    = ImGui::GetFrameHeight();
-    const float btnGap = ui::metrics::U(0.5f);
-    const int   nAct   = r.path.empty() ? 1 : 3;
-    rs.actionsW = btn * (float)nAct + btnGap * (float)(nAct - 1);
-
-    const float  lineH = ImGui::GetTextLineHeight();
-    const float  rowH  = lineH * 2.0f + ui::metrics::U(0.5f) + ui::kit::padY() * 2.0f;
-    const float  rowW  = ImGui::GetContentRegionAvail().x;
-    const float  a     = artiEnterAlpha(t0, index);
-    const float  off   = (1.0f - a) * ui::metrics::px(8.0f);
-    ImDrawList*  dl    = ImGui::GetWindowDrawList();
-    const int    vtx0  = dl->VtxBuffer.Size;
-
-    const ImVec2 base = ImGui::GetCursorScreenPos();
-    if (off > 0.0f) ImGui::SetCursorScreenPos(ImVec2(base.x, base.y - off));
-    const ImVec2 p0 = ImGui::GetCursorScreenPos();
-
-    ImGui::PushID(index);
-    ImGui::SetNextItemAllowOverlap();   // the action lane is submitted ON TOP of the row's hit box
-    const bool   activated = ui::kit::row("arti", r.label.c_str(), rs);
-    const ImVec2 after     = ImGui::GetCursorScreenPos();
-
-    // The action lane lives inside the row's hit box and is submitted after it. AllowOverlap hands
-    // the click to the buttons, but exclude their strip from the row activation explicitly anyway:
-    // on the first hot frame the buttons were not hovered last frame, and "Folder" would then both
-    // reveal the file AND open the artifact.
-    const float bx0 = p0.x + rowW - ui::kit::padX() - rs.actionsW;
-    const bool  overLane = ImGui::IsMouseHoveringRect(ImVec2(bx0, p0.y),
-                                                      ImVec2(bx0 + rs.actionsW, p0.y + rowH),
-                                                      /*clip=*/false);
+    // AllowOverlap hands the click to the buttons, but exclude their strip from the row
+    // activation explicitly anyway: on the first hot frame the buttons were not hovered last
+    // frame, and "Show in file manager" would otherwise both reveal the file AND open it.
     if (activated && !overLane && r.open) r.open();
-
-    float bx = bx0;
-    const float by = p0.y + (rowH - btn) * 0.5f;
-    ImGui::SetCursorScreenPos(ImVec2(bx, by));
-    if (ui::kit::iconButton("open", "open",
-                            r.path.empty() ? "Reopen the live view of this part"
-                                           : "Open this artifact",
-                            true, ui::kit::Tone::Neutral, btn) && r.open)
-        r.open();
-    if (!r.path.empty()) {
-        bx += btn + btnGap;
-        ImGui::SetCursorScreenPos(ImVec2(bx, by));
-        if (ui::kit::iconButton("copy", "copy", "Copy the full path to the clipboard", true,
-                                ui::kit::Tone::Neutral, btn))
-            ImGui::SetClipboardText(r.path.c_str());
-        bx += btn + btnGap;
-        ImGui::SetCursorScreenPos(ImVec2(bx, by));
-        // body_folder is the atlas's plain folder mark; there is no separate "reveal" glyph.
-        if (ui::kit::iconButton("reveal", "body_folder", "Show in the file manager", true,
-                                ui::kit::Tone::Neutral, btn))
-            chatArtifactReveal(st, r.path);
+    if (hot && !overLane && !ctxOpen) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    if (tipHover && !overLane) {
+        std::string tip = r.label;
+        if (!r.path.empty()) tip += "\n" + r.path;
+        tip += "\n" + meta;
+        if (!rest.empty() && !r.live) tip += " \xc2\xb7 " + rest;
+        ui::kit::tooltip(tip.c_str());
     }
+    artiContextMenu(st, r);
     ImGui::PopID();
 
     if (a < 1.0f) artiFadeVerts(dl, vtx0, a);
     ImGui::SetCursorScreenPos(ImVec2(after.x, after.y + off));
 }
 
-// Square image tiles. The Copilot dock is narrow, so the grid reflows down to two columns and
-// gives up entirely below the minimum content width rather than clipping tiles to slivers.
+// Image tiles: a responsive grid of uniform rounded plates (4:3, the image aspect-fit inside) with
+// the file name under each. Columns come from the available width — one on the narrowest dock,
+// up to four on a wide one. Hover lifts the plate and lights its edge; a click views full size.
+// Only the rows inside the viewport are submitted, so a 200-render session decodes a screenful.
 // `enterBase` continues the panel-wide entrance wave instead of restarting it at zero.
-static constexpr float kArtiGridHoverLift = 0.03f;   // 1.00 -> 1.03 on hover
-static bool artiDrawGrid(AppState& st, const std::vector<const ArtiDocRow*>& rows, double t0,
-                         int enterBase, std::vector<const ArtiDocRow*>& fallbackOut) {
-    const float availW = ImGui::GetContentRegionAvail().x;
-    if (availW < ui::metrics::px(180.0f)) return false;   // caller falls back to the list
+static void artiDrawGrid(AppState& st, const std::vector<const ArtiDocRow*>& rows, double t0,
+                         int enterBase) {
+    namespace M = ui::metrics;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
 
-    const float gap  = ui::kit::rowGap();
-    int         cols = (int)((availW + gap) / (ui::metrics::px(120.0f) + gap));
-    cols = ImClamp(cols, 2, 4);
-    const float cell = (availW - gap * (float)(cols - 1)) / (float)cols;
-    const float rnd  = ui::metrics::cpMenuRowRound();
-    const float rndDp = rnd / ui::metrics::scale();
+    const float availW = ImMax(ImGui::GetContentRegionAvail().x, M::px(40.0f));
+    const float gap    = M::U(1.5f);
+    const int   cols   = ImClamp((int)((availW + gap) / (M::px(112.0f) + gap)), 1, 4);
+    const float cell   = (availW - gap * (float)(cols - 1)) / (float)cols;
+    const float plateH = std::floor(cell * 0.75f);
+    const float lineH  = ImGui::GetTextLineHeight();
+    const float capGap = M::U(0.75f);
+    const float tileH  = plateH + capGap + lineH;
+    const float pitch  = tileH + gap;
+    const float rnd    = M::cpMenuRowRound();
+    const float rndDp  = rnd / M::scale();
+    const float pad    = M::px(3.0f);
+    const float lift   = M::px(2.0f);
 
-    const ImVec2 origin = ImGui::GetCursorScreenPos();
-    ImDrawList*  dl     = ImGui::GetWindowDrawList();
-    int          shown  = 0;
+    const ImVec2 origin   = ImGui::GetCursorScreenPos();
+    const int    gridRows = ((int)rows.size() + cols - 1) / cols;
+    const ImRect clip     = ImGui::GetCurrentWindow()->ClipRect;
+    const int    firstRow = ImMax(0, (int)std::floor((clip.Min.y - origin.y) / pitch));
+    const int    lastRow  = ImMin(gridRows, (int)std::ceil((clip.Max.y - origin.y) / pitch));
+    const size_t begin    = (size_t)firstRow * (size_t)cols;
+    const size_t end      = ImMin(rows.size(), (size_t)ImMax(firstRow, lastRow) * (size_t)cols);
 
-    ImGui::PushID("arti_grid");
-    for (size_t i = 0; i < rows.size(); ++i) {
+    for (size_t i = begin; i < end; ++i) {
         const ArtiDocRow& r = *rows[i];
-        const Tex tex = artiRenderThumb(r.path);
-        if (!tex.id || tex.w <= 0 || tex.h <= 0) {
-            fallbackOut.push_back(&r);   // missing / corrupt / half-written stays visible as a row
-            continue;
-        }
-        const float  a   = artiEnterAlpha(t0, enterBase + (int)i);
-        const float  off = (1.0f - a) * ui::metrics::px(8.0f);
-        const ImVec2 p0(origin.x + (float)(shown % cols) * (cell + gap),
-                        origin.y + (float)(shown / cols) * (cell + gap) - off);
+        const Tex   tex = artiRenderThumb(r.path);
+        const float a   = artiEnterAlpha(t0, enterBase + (int)i);
+        const float off = (1.0f - a) * M::px(8.0f);
+        const ImVec2 p0(origin.x + (float)(i % (size_t)cols) * (cell + gap),
+                        origin.y + (float)(i / (size_t)cols) * pitch - off);
         const int vtx0 = dl->VtxBuffer.Size;
 
-        ImGui::PushID((int)i);
+        ImGui::PushID(r.key.c_str());
         ImGui::SetCursorScreenPos(p0);
-        ImGui::InvisibleButton("##tile", ImVec2(cell, cell));
-        const bool hot = ImGui::IsItemHovered();
-        if (ImGui::IsItemClicked()) chatArtifactOpenSmart(st, r.path);
+        const bool clicked = ImGui::InvisibleButton("##tile", ImVec2(cell, tileH));
+        const bool hot     = ImGui::IsItemHovered();
+        const bool tipHot  = ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort);
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) ImGui::OpenPopup("##arti_ctx");
+        if (clicked && r.open) r.open();
 
-        const float k = 1.0f + kArtiGridHoverLift *
-                                   ui::anim::toward(ImGui::GetID("##lift"), hot ? 1.0f : 0.0f,
-                                                    ui::anim::kFast);
-        const ImVec2 c(p0.x + cell * 0.5f, p0.y + cell * 0.5f);
-        const ImVec2 q0(c.x - cell * 0.5f * k, c.y - cell * 0.5f * k);
-        const ImVec2 q1(c.x + cell * 0.5f * k, c.y + cell * 0.5f * k);
-        if (k > 1.0f) ui::glassSelectionGlow(dl, q0, q1, rndDp, ui::palette.accent);
-        dl->AddImageRounded((ImTextureID)(intptr_t)tex.id, q0, q1, ImVec2(0, 0), ImVec2(1, 1),
-                            IM_COL32_WHITE, rnd);
-        if (hot) {
-            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-            ImGui::SetTooltip("%s\n%s", r.label.c_str(), r.path.c_str());
+        const float  hv = ui::anim::toward(ImGui::GetID("##hv"), hot ? 1.0f : 0.0f, ui::anim::kFast);
+        const float  grow = lift * hv;
+        const ImVec2 q0(p0.x - grow, p0.y - grow);
+        const ImVec2 q1(p0.x + cell + grow, p0.y + plateH + grow);
+
+        // Plate, then the image aspect-fit inside it (or the kind glyph until the decode lands).
+        dl->AddRectFilled(q0, q1, artiRole(ui::palette.codeBg, 0.85f), rnd);
+        const ImVec2 in0(q0.x + pad, q0.y + pad), in1(q1.x - pad, q1.y - pad);
+        const ImVec2 mid((in0.x + in1.x) * 0.5f, (in0.y + in1.y) * 0.5f);
+        if (tex.id && tex.w > 0 && tex.h > 0) {
+            const float fit = ImMin((in1.x - in0.x) / (float)tex.w, (in1.y - in0.y) / (float)tex.h);
+            const float hw = (float)tex.w * fit * 0.5f, hh = (float)tex.h * fit * 0.5f;
+            dl->AddImageRounded((ImTextureID)(intptr_t)tex.id, ImVec2(mid.x - hw, mid.y - hh),
+                                ImVec2(mid.x + hw, mid.y + hh), ImVec2(0, 0), ImVec2(1, 1),
+                                IM_COL32_WHITE, ImMax(rnd - pad, M::stroke(1.0f)));
+        } else {
+            artiPaintIcon(dl, r.cls.icon, mid, M::iconHeader() * 1.4f, 0.45f);
         }
+        // Edge: the quiet border, easing to the accent with the lift.
+        const ImVec4 edge = ImLerp(ImVec4(ui::palette.border[0], ui::palette.border[1],
+                                          ui::palette.border[2], ui::palette.border[3] * 0.6f),
+                                   ImVec4(ui::palette.accent[0], ui::palette.accent[1],
+                                          ui::palette.accent[2], ui::palette.accent[3]), hv);
+        dl->AddRect(q0, q1, artiInk(edge), rnd, 0, M::stroke(1.0f));
+        if (hv > 0.02f) {
+            float acc[4];
+            ui::Palette::withAlpha(ui::palette.accent, acc, hv);
+            // The glow self-insets by 2 dp, so hand it the plate grown by the same amount.
+            ui::glassSelectionGlow(dl, ImVec2(q0.x - M::px(2.0f), q0.y - M::px(2.0f)),
+                                   ImVec2(q1.x + M::px(2.0f), q1.y + M::px(2.0f)), rndDp, acc);
+        }
+
+        // Caption: the file name, brightening with the hover.
+        const ImVec4 capInk = ImLerp(surf.textSecondary, surf.textPrimary, hv);
+        dl->AddText(ImVec2(p0.x + M::px(2.0f), p0.y + plateH + capGap), artiInk(capInk),
+                    ui::kit::elide(r.label.c_str(), cell - M::px(4.0f)).c_str());
+
+        if (hot) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (tipHot) ui::kit::tooltip((r.label + "\n" + r.path).c_str());
+        artiContextMenu(st, r);
         ImGui::PopID();
 
         if (a < 1.0f) artiFadeVerts(dl, vtx0, a);
-        ++shown;
     }
-    ImGui::PopID();
 
-    const int gridRows = (shown + cols - 1) / cols;
     ImGui::SetCursorScreenPos(origin);
-    if (gridRows > 0)
-        ImGui::Dummy(ImVec2(availW, (float)gridRows * cell + (float)(gridRows - 1) * gap));
-    return true;
+    if (gridRows > 0) ImGui::Dummy(ImVec2(availW, (float)gridRows * pitch - gap));
+}
+
+// A collapsible section header: animated disclosure chevron, the label in small caps, a quiet
+// count. `reserveRight` px at the right edge stay out of the toggle's hit area so the caller can
+// place a trailing control on the returned rect (then restore the cursor to `after`).
+struct ArtiHeader {
+    ImVec2 min;                 // top-left of the header row
+    float  w = 0.0f, h = 0.0f;
+    ImVec2 after;               // cursor below the header
+};
+
+static ArtiHeader artiSectionHeader(const ui::Fonts& fonts, const char* id, const char* label,
+                                    int count, bool* open, bool first, float reserveRight,
+                                    const char* tip) {
+    namespace M = ui::metrics;
+    const ui::AdaptiveSurface& surf = chatSurf();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    if (!first) ImGui::Dummy(ImVec2(0.0f, M::cpMenuSectionGap()));
+
+    ArtiHeader hd;
+    const float lineH = ImGui::GetTextLineHeight();
+    hd.min = ImGui::GetCursorScreenPos();
+    hd.w   = ImMax(ImGui::GetContentRegionAvail().x, M::stroke(1.0f));
+    hd.h   = lineH + M::U(1.5f);
+
+    ImGui::PushID(id);
+    if (ImGui::InvisibleButton("##head", ImVec2(ImMax(hd.w - reserveRight, M::stroke(1.0f)), hd.h)))
+        *open = !*open;
+    const bool  hovered = ImGui::IsItemHovered();
+    const float hv      = ui::anim::toward(ImGui::GetID("##hv"), hovered ? 1.0f : 0.0f,
+                                           ui::anim::kFast);
+    const float openT   = ui::anim::toward(ImGui::GetID("##open"), *open ? 1.0f : 0.0f,
+                                           ui::anim::kBase);
+    ImGui::PopID();
+    if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    if (hovered && tip && tip[0]) ui::kit::tooltip(tip);
+
+    const float cy = hd.min.y + hd.h * 0.5f;
+    chatPaintDisclosure(dl, ImVec2(hd.min.x + lineH * 0.4f, cy), lineH * 0.38f, openT,
+                        artiInk(ImLerp(surf.textTertiary, surf.textSecondary, hv)));
+
+    // Small caps: the medium weight, upper-cased, a notch under the body size.
+    if (fonts.medium) ImGui::PushFont(fonts.medium);
+    ImFont*     capsFont = ImGui::GetFont();
+    const float fs       = ImGui::GetFontSize() * 0.82f;
+    std::string caps(label);
+    for (char& ch : caps) ch = (char)std::toupper((unsigned char)ch);
+    const ImVec2 ls = capsFont->CalcTextSizeA(fs, FLT_MAX, 0.0f, caps.c_str());
+    const float  lx = hd.min.x + lineH * 0.95f;
+    dl->AddText(capsFont, fs, ImVec2(lx, cy - ls.y * 0.5f),
+                artiInk(ImLerp(surf.textSecondary, surf.textPrimary, hv)), caps.c_str());
+    if (fonts.medium) ImGui::PopFont();
+
+    const std::string cnt     = ui::kit::fmtCount((long long)count);
+    ImFont*           bodyFont = ImGui::GetFont();
+    const ImVec2      cs      = bodyFont->CalcTextSizeA(fs, FLT_MAX, 0.0f, cnt.c_str());
+    ImVec4            cntInk  = surf.textTertiary;
+    cntInk.w                  = 1.0f;
+    dl->AddText(bodyFont, fs, ImVec2(lx + ls.x + M::U(1.5f), cy - cs.y * 0.5f), artiInk(cntInk),
+                cnt.c_str());
+
+    ImGui::Dummy(ImVec2(0.0f, M::cpMenuHeadGap()));
+    hd.after = ImGui::GetCursorScreenPos();
+    return hd;
+}
+
+// Kind filter chips, wrapped to as many lines as the width needs. A kind with nothing in it is
+// hidden (the active one stays so it can always be left); "All" counts what the text filter kept.
+static void artiKindChips(ArtiUiState& ui_, const int (&count)[kArtiKinds], int total) {
+    namespace M = ui::metrics;
+    static const char* const kLabels[kArtiKinds + 1] = {"All", "Models", "Drawings", "Images", "Data"};
+    static const char* const kTips[kArtiKinds + 1] = {
+        "Everything the agent produced this session",
+        "Parts, assemblies, and CAD or mesh exports",
+        "Drawings, PDFs and vector exports",
+        "Renders and screenshots",
+        "Spreadsheets, notes, scripts and other files",
+    };
+
+    const float  availW = ImMax(ImGui::GetContentRegionAvail().x, M::px(40.0f));
+    const float  gap    = M::U(1.0f);
+    const float  padX   = M::U(1.5f);   // the kit chip's own inner padding
+    const float  chipH  = ImGui::GetTextLineHeight() + M::U(1.0f);
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+
+    float x = 0.0f, y = 0.0f;
+    for (int i = 0; i <= kArtiKinds; ++i) {
+        const int n = i == 0 ? total : count[i - 1];
+        if (i > 0 && n == 0 && ui_.kind != i) continue;
+        char label[48];
+        std::snprintf(label, sizeof(label), "%s %d##kind%d", kLabels[i], n, i);
+        const float w = ImGui::CalcTextSize(label, nullptr, true).x + padX * 2.0f;
+        if (x > 0.0f && x + w > availW) {
+            x = 0.0f;
+            y += chipH + gap;
+        }
+        ImGui::SetCursorScreenPos(ImVec2(origin.x + x, origin.y + y));
+        bool on = ui_.kind == i;
+        if (ui::kit::toggleChip(label, &on, ui::kit::Tone::Accent, kTips[i]) && ui_.kind != i) {
+            ui_.kind    = i;
+            ui_.enterT0 = ImGui::GetTime();   // the new set of rows lands as a wave
+        }
+        x += w + gap;
+    }
+    ImGui::SetCursorScreenPos(origin);
+    ImGui::Dummy(ImVec2(availW, y + chipH));
 }
 
 // Session Artifacts is a browser for session output: agent-touched documents, render images and
-// produced files. Run telemetry stays in the Tasks panel.
+// produced files, grouped by kind. Run telemetry stays in the Tasks panel.
 static void drawArtifactsPanel(AppState& st, bool busy) {
     (void)busy;
+    namespace M = ui::metrics;
     ArtiUiState& ui_ = artiUi(st);
-    ui::cpMenuHeader(st.fonts, "Session Artifacts",
-                     "Documents, renders and files produced or touched by this session.");
 
     // The question this panel answers is "what did the AGENT touch", not "what is open" — the old
     // single list showed every doc tab, so a session that built one part looked like it built
     // four. A tab counts as agent-touched when it was handed off by an agent OR carries an agent
-    // edit stamp; everything else is the user's own document and goes behind a collapsed line.
-    std::vector<ArtiDocRow> agentRows;   // documents this session's agent opened / built / edited
-    std::vector<ArtiDocRow> otherRows;   // the user's own open documents (collapsed by default)
-    std::vector<ArtiDocRow> fileRows;    // files the agent wrote this session (renders included)
+    // edit stamp; everything else is the user's own document (`own`) and goes behind a collapsed
+    // section. Documents come first, then produced files newest-first.
+    std::vector<ArtiDocRow> rows;
     {
         // Dedup doc-tab rows: an AI read-only mirror tab and the user's own tab can be
         // two docTabs entries for the SAME underlying document. Two things independently
@@ -1794,41 +2420,51 @@ static void drawArtifactsPanel(AppState& st, bool busy) {
                 !seenId.insert("title:" + t.title).second)
                 continue;  // last resort for a tab with neither identifier
             ArtiDocRow r;
+            r.doc = true;
+            r.cls = artiDocClass(t);
             // displayTitle() is the one label that refuses to hand back an opaque
             // "doc-cpp…" id (doc_tabs.cpp:95); the old t.title fallback chain ended on
             // t.docId, so a part the agent opened listed itself as its engine id.
             r.label = t.displayTitle();
+            if (r.label.empty()) r.label = r.cls.what;
+            r.path = t.path;
             // Unsaved in-memory docs have no file to reveal — fall back to their save
             // destination (the project/workspace folder) so the location action always exists.
-            r.path  = !t.path.empty() ? t.path : st.plmProjectPath();
-            r.tooltip = r.path.empty() ? r.label : (r.label + "\n" + r.path);
-            r.open  = [&st, ti]() { st.switchToTab(ti); };
-            const bool agentTouched =
-                t.aiHandoff || t.lastAgentEditAt != std::chrono::steady_clock::time_point{};
-            (agentTouched ? agentRows : otherRows).push_back(std::move(r));
+            r.revealPath = !t.path.empty() ? t.path : st.plmProjectPath();
+            r.key  = "doc:" + (!t.docId.empty() ? t.docId
+                               : !t.path.empty() ? t.path : "title:" + t.title);
+            r.live = t.aiPulse;
+            r.open = [&st, ti]() { st.switchToTab(ti); };
+            r.own  = !(t.aiHandoff ||
+                       t.lastAgentEditAt != std::chrono::steady_clock::time_point{});
+            rows.push_back(std::move(r));
         }
         // Docs the user closed from the viewport while an agent kept building them.
         // hostd degraded that close to a detach (the work is independent of the
         // user's tabs), so the part is still live — list it with a Reopen action
         // instead of letting it vanish from the session's artifacts entirely.
-        // These are agent documents by construction, so they belong in the agent bucket.
+        // These are agent documents by construction, so they are never `own`.
         for (const auto& [docId, label] : st.dismissedMirrorDocs) {
             if (docId.empty() || !seenId.insert(docId).second) continue;
             ArtiDocRow r;
-            r.label = (label.empty() ? docId : label) + "  (closed \xe2\x80\x94 agent may still be building)";
-            r.path.clear();     // no file yet; the only action is to reopen the view
-            r.tooltip = "Reopen the live view of this part";
-            r.open = [&st, docId]() {
-                st.dismissedMirrorDocs.erase(docId);
-                core::mirrorRecoveredDocs(st, {docId});
+            r.doc    = true;
+            r.closed = true;   // no file yet; the only action is to reopen the view
+            r.cls    = ArtiClass{"part", "Part", ArtiModels};
+            r.label  = label.empty() ? std::string("Closed part") : label;
+            const std::string id = docId;   // copied: a structured binding cannot be captured
+            r.key    = "closed:" + id;
+            r.open   = [&st, id]() {
+                st.dismissedMirrorDocs.erase(id);
+                core::mirrorRecoveredDocs(st, {id});
             };
-            agentRows.push_back(std::move(r));
+            rows.push_back(std::move(r));
         }
         // Cross-source dedup: seed `seen` with the doc tabs' real file paths so a file
         // already listed as an open document is not repeated as a produced-file row.
         std::set<std::string> seen;
         for (const auto& t : st.docTabs)
             if (!t.path.empty()) seen.insert(t.path);
+        std::vector<ArtiDocRow> files;   // chronological, as the chat produced them
         for (const auto& m : st.chat) {
             if (m.fromUser) continue;
             for (const auto& a : m.activity) {
@@ -1840,194 +2476,202 @@ static void drawArtifactsPanel(AppState& st, bool busy) {
                 std::istringstream iss(blob);
                 std::string line;
                 while (std::getline(iss, line)) {
-                    if (line.empty()) continue;
-                    size_t tab = line.find('\t');
-                    std::string kindA = tab == std::string::npos ? "file" : line.substr(0, tab);
-                    std::string path  = tab == std::string::npos ? line : line.substr(tab + 1);
-                    if (path.empty() || !seen.insert(path).second) continue;
+                    std::string kindA, path;
+                    if (!artifactLine(line, &kindA, &path) || !seen.insert(path).second) continue;
                     std::string base = path;
                     size_t slash = base.find_last_of("/\\");
                     if (slash != std::string::npos) base = base.substr(slash + 1);
                     ArtiDocRow r;
-                    r.label   = base;
-                    r.path    = path;
-                    r.tooltip = path;
-                    r.image   = (kindA == "image");
-                    r.open    = [&st, path]() { chatArtifactOpenSmart(st, path); };
-                    fileRows.push_back(std::move(r));
+                    r.label      = base;
+                    r.path       = path;
+                    r.revealPath = path;
+                    r.key        = "file:" + path;
+                    r.cls        = artiClassify(path, base);
+                    // One classifier drives the icon, the "what it IS" line AND the section; the
+                    // ART stream can still know an image the extension does not say so.
+                    if (kindA == "image" && r.cls.bucket != ArtiImages) {
+                        r.cls.icon   = "file_image";
+                        r.cls.what   = "Render";
+                        r.cls.bucket = ArtiImages;
+                    }
+                    if (r.cls.bucket == ArtiImages)
+                        r.open = [path]() { openImageLightbox(path); };
+                    else
+                        r.open = [&st, path]() { chatArtifactOpenSmart(st, path); };
+                    files.push_back(std::move(r));
                 }
             }
         }
+        rows.insert(rows.end(), std::make_move_iterator(files.rbegin()),
+                    std::make_move_iterator(files.rend()));
     }
+    int agentCount = 0;
+    for (const ArtiDocRow& r : rows)
+        if (!r.own) ++agentCount;
 
-    // Panel-level actions stay above browsing/filter chrome. Project-folder reveal accepts a
-    // directory directly; render visibility uses the existing cached chat display preference.
-    const std::string projectPath = st.plmProjectPath();
-    bool rendersOn = ui::chatShowRenders();
-    if (ui::kit::secondaryButton("Open project folder", !projectPath.empty(),
-                                 "Open or choose a project before revealing its folder.",
-                                 ImVec2(-FLT_MIN, 0)))
-        chatArtifactReveal(st, projectPath);
-
-    if (ui::kit::toggleChip("Renders", &rendersOn, ui::kit::Tone::Accent,
-                            "Show or hide image previews here and in the chat transcript."))
-        ui::setChatShowRenders(rendersOn);
+    // ---- header: title, a one-line count, and the project-folder action on the title row ----
+    char subtitle[64];
+    if (agentCount == 0)
+        std::snprintf(subtitle, sizeof(subtitle), "Nothing produced yet");
+    else
+        std::snprintf(subtitle, sizeof(subtitle), "%d %s from this session", agentCount,
+                      agentCount == 1 ? "item" : "items");
+    const float  titleH = st.fonts.medium ? st.fonts.medium->FontSize : ImGui::GetTextLineHeight();
+    const ImVec2 hdrTop = ImGui::GetCursorScreenPos();
+    const float  hdrW   = ImGui::GetContentRegionAvail().x;
+    ui::cpMenuHeader(st.fonts, "Artifacts", subtitle);
     {
-        // List / Grid sits on the same control line, right-aligned.
-        static const char* kViewLabels[]   = {"List", "Grid"};
-        static const char* kViewTooltips[] = {"One row per artifact, with size and age",
-                                              "Renders as square preview tiles"};
-        const float segW = ui::metrics::px(104.0f);
-        ImGui::SameLine();
-        const float slack = ImGui::GetContentRegionAvail().x - segW;
-        if (slack > 0.0f) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + slack);
-        ui::kit::segmented("arti_view", kViewLabels, 2, &ui_.viewMode, segW, kViewTooltips);
+        // Project-folder reveal accepts a directory directly. The button sits at the right edge
+        // of the title line, centred on it (the header owns its own cursor, so place it, then put
+        // the cursor back).
+        const std::string projectPath = st.plmProjectPath();
+        const ImVec2      keep        = ImGui::GetCursorScreenPos();
+        const float       btn         = ImGui::GetTextLineHeight() + M::U(1.5f);
+        ImGui::SetCursorScreenPos(ImVec2(hdrTop.x + hdrW - btn, hdrTop.y + (titleH - btn) * 0.5f));
+        if (ui::kit::iconButton("arti_project", "body_folder",
+                                projectPath.empty()
+                                    ? "Open or choose a project to show its folder"
+                                    : "Show the project folder in the file manager",
+                                !projectPath.empty(), ui::kit::Tone::Neutral, btn))
+            chatArtifactReveal(st, projectPath);
+        ImGui::SetCursorScreenPos(keep);
     }
-    ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
 
-    const size_t totalRows = agentRows.size() + otherRows.size() + fileRows.size();
-    const bool showFilter = totalRows > 8;
+    // Everything below spaces itself with explicit tokens, so row pitch and the list clipper agree.
+    const ImVec2 spc = ImGui::GetStyle().ItemSpacing;
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(spc.x, 0.0f));
+
+    const bool showFilter = rows.size() > 8;
     if (showFilter) {
         ImGui::SetNextItemWidth(-FLT_MIN);
-        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ui::metrics::cpMenuChipRound());
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, M::cpMenuChipRound());
         ImGui::InputTextWithHint("##artifact_filter", "Filter artifacts\xe2\x80\xa6",
                                  ui_.filter, sizeof(ui_.filter));
         ImGui::PopStyleVar();
-        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuCtlGap()));
+        ImGui::Dummy(ImVec2(0.0f, M::cpMenuCtlGap()));
     }
-    const bool filterActive = showFilter && ui_.filter[0] != '\0';
-    const std::string filterNeedle = filterActive ? artiLower(ui_.filter) : std::string();
+    const bool        filterActive = showFilter && ui_.filter[0] != '\0';
+    const std::string needle       = filterActive ? artiLower(ui_.filter) : std::string();
     auto matches = [&](const ArtiDocRow& r) {
         if (!filterActive) return true;
-        return artiLower(r.label).find(filterNeedle) != std::string::npos ||
-               artiLower(r.path).find(filterNeedle) != std::string::npos;
+        return artiLower(r.label).find(needle) != std::string::npos ||
+               artiLower(r.path).find(needle) != std::string::npos;
     };
 
-    std::vector<const ArtiDocRow*> documents;
-    std::vector<const ArtiDocRow*> renders;
-    std::vector<const ArtiDocRow*> otherDocs;
-    for (const auto& r : agentRows) if (matches(r)) documents.push_back(&r);
-    for (const auto& r : otherRows) if (matches(r)) otherDocs.push_back(&r);
-    // Chat activity is chronological. Collect render and file rows back-to-front once so every
-    // rendering loop can index from zero while still presenting newest output first.
-    for (auto it = fileRows.rbegin(); it != fileRows.rend(); ++it)
-        if (it->image && matches(*it)) renders.push_back(&*it);
-
-    // One classifier drives the leading icon, the "what it IS" line AND this bucketing, so a row's
-    // section can never disagree with the kind its icon claims.
-    std::vector<const ArtiDocRow*> buckets[4];
-    for (auto it = fileRows.rbegin(); it != fileRows.rend(); ++it) {
-        if (it->image || !matches(*it)) continue;
-        buckets[artiClassify(it->path, it->label).bucket].push_back(&*it);
-    }
-
-    const size_t fileCount = buckets[ArtiModels].size() + buckets[ArtiDrawings].size() +
-                             buckets[ArtiData].size() + buckets[ArtiOther].size();
-    const size_t matchCount = documents.size() + renders.size() + fileCount + otherDocs.size();
-    if (filterActive && matchCount == 0)
-        ui::kit::emptyState("artifacts", "No matches",
-                            "Try a document name, a file name or a folder.");
-
-    // One entrance wave across the whole panel: the running index makes section 2 continue
-    // section 1's stagger instead of restarting it.
-    int enterIdx = 0;
-
-    // ---- Documents ----
-    ui::kit::sectionHeader("Documents", "part", nullptr, (int)documents.size(), /*first=*/true);
-    if (documents.empty()) {
-        ui::kit::emptyState(nullptr, filterActive ? "No matching documents" : "No documents yet",
-                            "Parts the agent opens, imports or edits appear here.");
-    } else {
-        ImGui::PushID("arti_docs");
-        for (const ArtiDocRow* r : documents)
-            artiRow(st, *r, enterIdx++, ui_.enterT0, rendersOn);
-        ImGui::PopID();
-    }
-
-    // ---- Renders ----
-    ui::kit::sectionHeader("Renders", "file_image", nullptr, (int)renders.size());
-    if (renders.empty()) {
-        ui::kit::emptyState(nullptr, filterActive ? "No matching renders" : "No renders yet",
-                            "Images produced for agent vision appear here as preview tiles.");
-    } else if (!rendersOn) {
-        ui::kit::emptyState(nullptr, "Render previews are hidden",
-                            "Use the Renders control above to show them.");
-    } else {
-        // The overflow used to be a dead-end "+N more" line. It is a real control now.
-        const size_t kCap = 24;
-        const size_t drawCount = ui_.showAllRenders ? renders.size()
-                                                    : std::min(renders.size(), kCap);
-        std::vector<const ArtiDocRow*> shown(renders.begin(), renders.begin() + (long)drawCount);
-        std::vector<const ArtiDocRow*> fallbackRows;
-
-        ImGui::PushID("arti_renders");
-        const bool gridded =
-            ui_.viewMode == 1 && artiDrawGrid(st, shown, ui_.enterT0, enterIdx, fallbackRows);
-        if (gridded) enterIdx += (int)shown.size();
-        if (!gridded) {
-            for (const ArtiDocRow* r : shown)
-                artiRow(st, *r, enterIdx++, ui_.enterT0, rendersOn);
+    // ---- bucket rows by kind (the user's own tabs all go to the collapsed fifth section) ----
+    std::vector<const ArtiDocRow*> sec[kArtiSections];
+    int kindCount[kArtiKinds] = {0, 0, 0, 0};
+    int matched = 0;
+    for (const ArtiDocRow& r : rows) {
+        if (!matches(r)) continue;
+        const int k = (int)r.cls.bucket;
+        if (!r.own) {
+            ++kindCount[k];
+            ++matched;
         }
-        // Missing, corrupt or half-written images stay visible as ordinary rows.
-        for (const ArtiDocRow* r : fallbackRows)
-            artiRow(st, *r, enterIdx++, ui_.enterT0, /*thumbsOn=*/false);
-        ImGui::PopID();
+        if (ui_.kind != 0 && ui_.kind - 1 != k) continue;
+        sec[r.own ? kArtiOpenSec : k].push_back(&r);
+    }
 
-        const size_t more = renders.size() - drawCount;
-        if (more > 0) {
-            char mline[64];
-            std::snprintf(mline, sizeof(mline), "Show all %d renders##arti_showall",
-                          (int)renders.size());
-            if (ui::kit::secondaryButton(mline)) ui_.showAllRenders = true;
+    int kindsPresent = 0;
+    for (int n : kindCount)
+        if (n > 0) ++kindsPresent;
+    if (agentCount > 0 && (kindsPresent >= 2 || ui_.kind != 0)) {
+        artiKindChips(ui_, kindCount, matched);
+        ImGui::Dummy(ImVec2(0.0f, M::cpMenuCtlGap()));
+    }
+
+    bool anyShown = false;
+    for (const auto& list : sec)
+        if (!list.empty()) anyShown = true;
+    if (agentCount == 0) {
+        // The kit's empty-state spacing assumes the default item spacing.
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, spc);
+        ui::kit::emptyState("artifacts", "No artifacts yet",
+                            "Models, drawings, renders and files the agent produces appear here "
+                            "as it works.");
+        ImGui::PopStyleVar();
+    } else if (!anyShown) {
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, spc);
+        const bool clear = ui::kit::emptyState("artifacts", "Nothing matches",
+                                               "No artifact fits the current filter.",
+                                               "Clear filters");
+        ImGui::PopStyleVar();
+        if (clear) {
+            ui_.kind      = 0;
+            ui_.filter[0] = '\0';
         }
     }
 
-    // ---- Files ----
-    ui::kit::sectionHeader("Files", "file_generic", nullptr, (int)fileCount);
-    if (fileCount == 0) {
-        ui::kit::emptyState(nullptr, filterActive ? "No matching files" : "No files yet",
-                            "Exported models, drawings, data and other files appear here.");
-    } else {
-        auto drawFileGroup = [&](const char* label, const char* id, ArtiBucket b) {
-            if (buckets[b].empty()) return;
-            ui::cpMenuLabel(label);
-            ImGui::PushID(id);
-            for (const ArtiDocRow* r : buckets[b])
-                artiRow(st, *r, enterIdx++, ui_.enterT0, rendersOn);
-            ImGui::PopID();
-        };
-        ImGui::PushID("arti_files");
-        drawFileGroup("Models", "models", ArtiModels);
-        drawFileGroup("Drawings / exports", "drawings", ArtiDrawings);
-        drawFileGroup("Data", "data", ArtiData);
-        drawFileGroup("Other", "other", ArtiOther);
-        ImGui::PopID();
-    }
-
-    // ---- Other open documents ----
+    // ---- sections ----
+    static const char* const kSecId[kArtiSections]    = {"models", "drawings", "images", "data", "own"};
+    static const char* const kSecLabel[kArtiSections] = {"Models", "Drawings", "Images", "Data",
+                                                         "Open documents"};
     // The user's own tabs must not dominate this panel, but dropping them outright would lose the
     // only way to reach a part the agent worked on BEFORE the handoff / edit-stamp flags were set
-    // — so they stay, collapsed behind a click-to-expand line.
-    ui::kit::sectionHeader("Other open documents", "open", nullptr, (int)otherDocs.size());
-    if (otherDocs.empty()) {
-        ui::kit::emptyState(nullptr,
-                            filterActive ? "No matching open documents" : "Nothing else open",
-                            "User-opened tabs appear here, collapsed away from session output.");
-    } else {
-        // The ## suffix keeps ONE ImGui id across the Show/Hide label flip.
-        char line[96];
-        std::snprintf(line, sizeof(line), "%s %d other open document%s##arti_otherdocs",
-                      ui_.showOtherDocs ? "Hide" : "Show", (int)otherDocs.size(),
-                      otherDocs.size() == 1 ? "" : "s");
-        if (ui::kit::secondaryButton(line)) ui_.showOtherDocs = !ui_.showOtherDocs;
-        if (ui_.showOtherDocs) {
-            ImGui::PushID("arti_other_docs");
-            for (const ArtiDocRow* r : otherDocs)
-                artiRow(st, *r, enterIdx++, ui_.enterT0, rendersOn);
-            ImGui::PopID();
+    // — so they stay, collapsed until the header is clicked.
+    static const char* const kSecTip[kArtiSections]   = {
+        nullptr, nullptr, nullptr, nullptr,
+        "Documents you opened yourself. Parts the agent has worked on are listed under their kind.",
+    };
+    const float rowGap   = M::cpMenuRowGap();
+    const bool  previews = ui::chatShowRenders();
+    int         enterIdx = 0;   // one entrance wave across the panel: section 2 continues section 1
+    bool        first    = true;
+    for (int s = 0; s < kArtiSections; ++s) {
+        const std::vector<const ArtiDocRow*>& list = sec[s];
+        if (list.empty()) continue;
+        const bool images = s == (int)ArtiImages;
+        // Previews is a pane-wide display pref (shared with the transcript); it lives on the
+        // header of the one section it governs.
+        const float chipW = images ? ImGui::CalcTextSize("Previews").x + M::U(1.5f) * 2.0f : 0.0f;
+
+        // A text filter searches the user's tabs too, so their section opens while one is typed.
+        const bool forced  = s == kArtiOpenSec && filterActive;
+        bool       open    = ui_.open[s] || forced;
+        const bool wasOpen = open;
+        const ArtiHeader hd = artiSectionHeader(st.fonts, kSecId[s], kSecLabel[s], (int)list.size(),
+                                                &open, first, images ? chipW + M::U(1.0f) : 0.0f,
+                                                kSecTip[s]);
+        first = false;
+        if (!forced) {
+            if (open && !wasOpen) ui_.openT0[s] = ImGui::GetTime();   // rows re-enter on expand
+            ui_.open[s] = open;
         }
+        if (images) {
+            const float chipH = ImGui::GetTextLineHeight() + M::U(1.0f);
+            bool        on    = previews;
+            ImGui::SetCursorScreenPos(ImVec2(hd.min.x + hd.w - chipW,
+                                             hd.min.y + (hd.h - chipH) * 0.5f));
+            if (ui::kit::toggleChip("Previews", &on, ui::kit::Tone::Accent,
+                                    "Show or hide image previews here and in the chat transcript."))
+                ui::setChatShowRenders(on);
+            ImGui::SetCursorScreenPos(hd.after);
+        }
+        if (!open) continue;
+
+        const double secT0 = ImMax(ui_.enterT0, ui_.openT0[s]);
+        ImGui::PushID(kSecId[s]);
+        if (images && previews) {
+            artiDrawGrid(st, list, secT0, enterIdx);
+        } else {
+            ImGuiListClipper clipper;
+            clipper.Begin((int)list.size(), artiRowHeight() + rowGap);
+            while (clipper.Step()) {
+                for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+                    artiRow(st, *list[(size_t)i], enterIdx + i, secT0);
+                    ImGui::Dummy(ImVec2(0.0f, rowGap));
+                }
+            }
+        }
+        enterIdx += (int)list.size();
+        ImGui::PopID();
     }
-    ImGui::Dummy(ImVec2(0, ui::kit::rowGap()));
+    ImGui::Dummy(ImVec2(0.0f, M::cpMenuSectionGap()));
+    ImGui::PopStyleVar();   // ItemSpacing
+
+    // The full-size viewer normally rides on the composer, which the menu views replace.
+    drawImageLightbox(st);
 }
 
 
@@ -2048,7 +2692,18 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     // base_url, so this is cheap.
     refreshModelAvailability(st, false);
 
-    static float s_paneW = 0.0f;                    // column width (px), session-persistent
+    static float s_paneW = 0.0f;                    // column width (px); persisted as Settings::copilotWidth
+    static bool s_savePaneW = false;                // a column drag just ended: persist the clamped width
+    static const bool shotNarrow = std::getenv("CHUDWARE_COPILOT_NARROW") != nullptr;
+    static const bool shotCollapsed = std::getenv("CHUDWARE_COPILOT_COLLAPSED") != nullptr;
+    static const float shotWidth = [] {
+        const char* value = std::getenv("CHUDWARE_COPILOT_WIDTH");
+        return value ? (float)std::atof(value) : 0.0f;
+    }();
+    static const std::string shotView = [] {
+        const char* value = std::getenv("CHUDWARE_COPILOT_VIEW");
+        return value ? std::string(value) : std::string();
+    }();
     // s_cpCollapsed is file-scoped (shared with drawCopilotHeader's collapse chevron). Seed it
     // once from the persisted setting (a collapsed Copilot column stays collapsed across
     // restarts) — can't do this at s_cpCollapsed's own file-scope initializer since that runs
@@ -2070,6 +2725,7 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         band.valid = band.maxX > band.minX && band.maxY > band.minY;
     }
     const bool overlay = band.valid;
+    float homeBlend = 0.0f;   // workspace home widening (workspace_home.h), overlay columns only
     // ONE bubble radius shared by the window clip and the drawn glass (same rule as drawLeftPane):
     // the resolved Copilot rounding knob wins when set, else the 12dp bubble default.
     const ui::GlassStyleResolved& rsCp = ui::glassStyleResolved(ui::GlassGroup::Copilot);
@@ -2089,20 +2745,23 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         // "Reset layout" (slot 1 = Copilot column) restores the default width + expands it.
         if (ui::takeOverlayColumnReset(1)) {
             s_paneW = 0.0f;
+            st.settings.copilotWidth = 0.0f;       // default width again (saved just below)
             s_cpCollapsed = false;
             st.settings.copilotCollapsed = false;
             saveSettings(st.settings);
         }
-        if (s_paneW <= 0.0f) s_paneW = ui::metrics::dockRightTarget();
-        if (std::getenv("CHUDWARE_COPILOT_NARROW"))       // shot: capture the narrowest column
+        // Seed from the persisted width (logical px) on the first frame after launch / a reset.
+        if (s_paneW <= 0.0f)
+            s_paneW = st.settings.copilotWidth > 0.0f
+                          ? ui::metrics::px(st.settings.copilotWidth)
+                          : ui::metrics::dockRightTarget();
+        if (shotNarrow)       // shot: capture the narrowest column
             s_paneW = ui::metrics::dockRightMin();
-        if (st.shot)
-            if (const char* width = std::getenv("CHUDWARE_COPILOT_WIDTH"))
-                s_paneW = ui::metrics::px(std::atof(width));
+        if (st.shot && shotWidth > 0) s_paneW = ui::metrics::px(shotWidth);
         // Shot: mirrors CHUDWARE_FM_COLLAPSED — --ui-screenshot always resets the overlay
         // columns for determinism (see the reset branch above), which clobbers the persisted
         // collapse setting before it can render; force it back for the collapsed capture.
-        if (std::getenv("CHUDWARE_COPILOT_COLLAPSED")) {
+        if (shotCollapsed) {
             s_cpCollapsed = true;
             s_cpAnim.snap(true, colH);  // snap immediately — headless captures must not depend on frame count
         }
@@ -2113,14 +2772,27 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         const float paneW = mobile ? std::min(availableW, ui::metrics::dockRightTarget())
                                   : std::min(std::max(s_paneW, ui::metrics::dockRightMin()), maxW);
         if (!mobile) s_paneW = paneW;
+        if (s_savePaneW && !mobile) {
+            s_savePaneW = false;
+            st.settings.copilotWidth = paneW / ui::uiScale;
+            saveSettings(st.settings);
+        }
+        // Workspace home (no document open): the chat gets more room too, easing back after.
+        homeBlend = mobile ? 0.0f : ui::workspaceHomeBlend(st);
+        float shownW = paneW;
+        if (homeBlend > 0.0f) {
+            const float homeW = std::clamp((band.maxX - band.minX) * 0.30f, paneW,
+                                           std::max(paneW, std::min(maxW, 600.0f * ui::uiScale)));
+            shownW = paneW + (homeW - paneW) * homeBlend;
+        }
 
         // Vertical collapse — the column rolls UP to its header row (drawCopilotHeader)
         // instead of shrinking to a pill in both axes (mirrors the FeatureManager column; see
         // ui::PanelCollapseAnim). Width is unaffected by collapse.
         const float animatedH = s_cpAnim.tick(s_cpCollapsed, colH);
         const float winH = mobile ? std::min(animatedH, colH) : animatedH;
-        ImGui::SetNextWindowPos(ImVec2(band.maxX - marginX - paneW, colY), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(paneW, winH), ImGuiCond_Always);
+        ImGui::SetNextWindowPos(ImVec2(band.maxX - marginX - shownW, colY), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(shownW, winH), ImGuiCond_Always);
         if (mobile)
             ImGui::SetNextWindowSizeConstraints(ImVec2(1.0f, 1.0f), ImVec2(paneW, colH));
         flags |= ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
@@ -2163,18 +2835,24 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         if (overlay) ui::publishOverlayColumnEdge(1, wmin.x);
     }
 
-    // Collapse chip floats just left of the column (see drawCopilotHeader) so header
-    // content can start flush without a chevron reserve.
-
     // Left-edge resize boundary — the same visible hairline + grip + hover glow as the
     // FeatureManager column (ui::columnResizeEdge, layout.h). Dragging left widens the column;
     // s_paneW is clamped at the top of the next frame; double-click restores the default width.
-    // Submitted before the header so the collapse chip (later, overlapping) keeps its clicks.
+    // Submitted before the header; its controls remain inset clear of the resize hit zone.
     if (overlay) {
         const ui::ColumnResizeResult rz = ui::columnResizeEdge(
-            "##copilot_resize", /*rightEdge=*/false, ImGui::GetWindowWidth(), !mobile);
-        if (rz.resetRequested) s_paneW = ui::metrics::dockRightTarget();
-        else if (rz.active)    s_paneW = rz.width;
+            "##copilot_resize", /*rightEdge=*/false, ImGui::GetWindowWidth(),
+            !mobile && homeBlend <= 0.0f);
+        static bool s_wasResizing = false;
+        if (rz.resetRequested) {
+            s_paneW = ui::metrics::dockRightTarget();
+            st.settings.copilotWidth = 0.0f;
+            saveSettings(st.settings);
+        } else if (rz.active) {
+            s_paneW = rz.width;
+        }
+        if (s_wasResizing && !rz.active && !rz.resetRequested) s_savePaneW = true;
+        s_wasResizing = rz.active;
     }
 
     // focusSettingsTab opens the Settings modal AI tab (full form + leaderboard).
@@ -2197,14 +2875,26 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
     // AFTER syncChatToDoc (which loads/ensures the resident sessions) and re-tops-up each frame so
     // the demo rows survive to the capture frame. Screenshot-only — gated on the env var, no effect
     // in a normal run.
-    if (const char* cpView = std::getenv("CHUDWARE_COPILOT_VIEW")) {
+    if (!shotView.empty()) {
+        const char* cpView = shotView.c_str();
         ensureConversations(st);
         st.conversations[0].title = "Knurled hex standoff";
         while (st.conversations.size() < 3) {
             Conversation cx; cx.id = newConvId(st);
-            cx.title = (st.conversations.size() == 1) ? "Bracket + FEA study"
-                                                      : "Gearbox housing revision";
+            const bool first = st.conversations.size() == 1;
+            // The first demo row carries a raw inline-image marker like a real prompt-derived title.
+            cx.title = first ? "[Image #1]modify this part so it fits the Bracket + FEA study"
+                             : "Gearbox housing revision";
             cx.projectDir = convProjectDir(st);  // demo rows must pass the project filter
+            // Real message times, so the Sessions recency groups and ages are exercised.
+            const double ago = first ? 5.0 * 3600.0 : 2.0 * 86400.0;
+            for (int m = 0; m < (first ? 6 : 14); ++m) {
+                ChatMsg msg;
+                msg.fromUser = (m % 2) == 0;
+                msg.text = "Demo message";
+                msg.ts = chatNowEpoch() - ago + (double)m;
+                cx.msgs.push_back(std::move(msg));
+            }
             st.conversations.push_back(std::move(cx));
         }
         if (std::strcmp(cpView, "sessions") == 0)       cpSetTab(st, CpTab::Sessions);
@@ -2275,6 +2965,19 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
                            : st.showArtifacts         ? "cp_artifacts"
                            : st.showSessionsPicker    ? "cp_sessions"
                                                       : "cp_chat";
+        // View switch: the incoming view fades in (menus also settle up from a few px below) over
+        // ~kFast. It runs on wall-clock dt and never gates input; screenshot captures land at once.
+        static ImGuiID s_viewShown = 0;
+        static float   s_viewP = 1.0f;
+        const ImGuiID  viewKey = ImHashStr(viewId);
+        if (s_viewShown == 0) s_viewShown = viewKey;
+        else if (viewKey != s_viewShown) { s_viewShown = viewKey; s_viewP = 0.0f; }
+        if (st.shot) s_viewP = 1.0f;
+        if (s_viewP < 1.0f) {
+            s_viewP = std::min(1.0f, s_viewP + ui::anim::dt() / ui::anim::kFast);
+            ui::anim::requestFrames();
+        }
+        const float viewE = ui::anim::easeOut(s_viewP);
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
         // Horizontal gutter is ASYMMETRIC: the pill scrollbar is clipped to this child, so the
         // right side must reserve a full kChatScrollbarLane for it or bubbles run under the bar.
@@ -2282,7 +2985,11 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         // edge back with a negative Indent below. Chat keeps its tight left gutter (bubbles/cards
         // need the column width); the MENU views keep the shared cpMenuGutter so
         // Sessions/Tasks/Artifacts/Settings all start on one left edge.
-        const float padL = overlayOpen ? ui::metrics::cpMenuGutter() : 3.0f * ui::uiScale;
+        // Menu content starts on the header's left edge: the window's own padding already
+        // supplies part of the gutter, so only the remainder is added here (no double inset).
+        const float outerPadX = ImGui::GetCursorPosX();
+        const float padL = overlayOpen ? std::max(0.0f, ui::metrics::cpMenuGutter() - outerPadX)
+                                       : 3.0f * ui::uiScale;
         const float padR = std::max(padL, ui::metrics::px(ui::kChatScrollbarLane));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                             overlayOpen
@@ -2296,10 +3003,18 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         // own position in that view every time they left and came back (reported as "switching
         // tabs is jarring") and, worse, snapped Chat back to the top whenever the user had
         // scrolled up and stick-to-bottom was disengaged. Let each view remember itself.
+        // Everything the view paints lands in its child window tree (and, for code that paints into
+        // the parent list directly, in the outer window's list past this mark); both are faded by
+        // vertex alpha after EndChild.
+        ImDrawList* outerDl = ImGui::GetWindowDrawList();
+        const int outerVtx0 = outerDl->VtxBuffer.Size;
         ImGui::BeginChild(viewId, ImVec2(0, chatH), ImGuiChildFlags_AlwaysUseWindowPadding,
                           ImGuiWindowFlags_NoScrollbar);
+        ImGuiWindow* viewWin = ImGui::GetCurrentWindow();
         if (padR > padL) ImGui::Indent(padL - padR);   // negative: pull the LEFT edge back to padL
         if (mobile && overlayOpen) drawRuntimeBanner(st);
+        if (overlayOpen && viewE < 1.0f)
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (1.0f - viewE) * ui::metrics::px(6.0f));
         if (st.showAISettingsOverlay) {
             drawAISettingsBody(st, busy);
         } else if (st.showTaskList || st.showArtifacts || st.showSessionsPicker) {
@@ -2322,6 +3037,11 @@ void drawAIPanel(AppState& st, bool busy, bool canRun) {
         // Chat scrollbar: 9px, sitting ON the right edge of the lane reserved by padR above.
         ui::drawWindowPillScrollbarV(chatSurf(), ui::kChatScrollbar);
         ImGui::EndChild();
+        if (viewE < 1.0f) {
+            const float fade = 0.2f + 0.8f * viewE;
+            cpFadeWindowTree(viewWin, fade);
+            cpFadeDrawList(outerDl, outerVtx0, fade);
+        }
 
         // Top fade mask over the conversation scroll viewport.
         if (logScrolled) {

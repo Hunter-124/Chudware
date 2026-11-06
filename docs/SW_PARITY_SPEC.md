@@ -1,23 +1,7 @@
 # SolidWorks Parity Specification (SW_PARITY_SPEC)
 
-## Update 2026-06-14 — engine parity push (commits f725fe7..6128e9b)
-
-10 engine commits, 660 tests green (0 failed). Summary of jumps:
-
-- **Surfacing**: 0% → 47% — all 15 surface features implemented in engine (surf_planar / extrude / revolve / sweep / loft / offset / ruled / boundary / fill / knit / thicken / trim / untrim / delete_face / replace_face) plus the surface-body foundation (body `kind`, two-sided render, area mass). Host ribbon/PM forms not yet wired — all 18 changed rows are `partial` pending the host GUI work.
-- **Part Features**: 46% → 51% — full SW option matrix added to engine (extrude end conditions + Dir2 + thin; revolve Dir2/mid/up-to-surface/thin/centerline; sweep guides/twist/orientation/thin; loft guides/centerline/tangency/thin; fillet face-fillet/conic/tangent-prop; chamfer angle×distance/vertex; shell multi-thickness; draft parting-line/step; rib explicit drop dir; hole ANSI/UNC/BSP/NPT tables + cosmetic-thread record + sketch-point positions; linear/circular pattern skip/vary/bidirectional; mirror bodies+merge; reference plane/axis/point extra methods; helix variable-pitch + flat spiral; non-planar split). All host PM forms pending — new rows stay `partial`.
-- **Sketcher**: 80% → 81% — curve↔curve tangent constraint now covers all arc/spline/conic combinations (test_sketch_tangent.py); the P0 gap is closed.
-- **Drawings**: 33% → 37% — radial, diameter, angular dimensions + center marks/lines added to engine (test_drawing_dims_ext.py) via arc extraction through HLR projection; host rendering annotation polish pending.
-- **Sheet Metal**: 33% → 39% — cut→flat-pattern propagation fully done (sheetmetal_flat.py + export2d.py CUTS layer; test_sheetmetal_cuts.py) and corner relief geometry (rect/obround/tear) done (test_sheetmetal_cuts.py); both are engine-geometry DoD → `done`.
-- **Weldments**: 33% → 36% — I/W-beam + T-section profiles + 28-size catalogue added; butt + cope trim implemented (test_weldment_ext.py); `partial` (notch/scribe remain).
-- **Overall**: 54% → 57%.
-
----
-
-**Status:** Canonical parity standard for Chudware. This is the contract the project
-is built to reach: every capability keeps its SolidWorks acceptance condition, status,
-and concrete evidence. The dated update above records the original engine push, not
-current test results or current source paths.
+**Status:** Parity standard for Chudware: each capability retains its SolidWorks
+acceptance condition, status and concrete evidence.
 
 **Scope:** Mechanical CAD parity is measured against SolidWorks 2020–2025. The ECAD /
 Electronics area has no SolidWorks analog and is measured against a KiCad-class baseline;
@@ -34,56 +18,23 @@ identify the comparison baselines. Chudware is not affiliated with or endorsed b
 **Conservatism rule:** where evidence was ambiguous or a sub-condition unverified, the
 capability is scored down. A capability is `done` only when its evidence is concrete.
 
-**Evidence refresh (2026-10-04):** live pointers below name C++ compiler dispatch,
-document ops, worker RPCs, ribbon commands and PropertyManager forms. Artifact presence
-does **not** establish every acceptance sub-condition; unchanged statuses retain the
-prior assessment unless a specific contradiction is identified. Prose without a
-checkable pointer remains explicitly unverifiable in `scripts/parity_audit.py`.
-Historical Python test names and measurements in the dated update are not live evidence.
+**Evidence:** Pointers below name compiler dispatch, document ops, worker RPCs,
+ribbon commands and PropertyManager forms. Artifact presence does **not** establish
+every acceptance sub-condition. Prose without a checkable pointer remains explicitly
+unverifiable in `scripts/parity_audit.py`.
 
 **Parity %** per area is computed as `(done + beyond + 0.5·partial) / total`.
 
 ---
 
-## Parity scorecard — historical 2026-06-14 snapshot
-
-| Area | done | partial | missing | beyond | total | Parity % |
-|------|-----:|--------:|--------:|-------:|------:|---------:|
-| Sketcher (2D) | 44 | 4 | 9 | 0 | 57 | **81%** |
-| Part Features (3D Solid) | 5 | 28 | 4 | 0 | 37 | **51%** |
-| Assemblies | 20 | 14 | 16 | 1 | 51 | **55%** |
-| Drawings | 17 | 12 | 33 | 0 | 62 | **37%** |
-| Sheet Metal | 9 | 3 | 15 | 0 | 27 | **39%** |
-| Weldments | 5 | 5 | 11 | 0 | 21 | **36%** |
-| Surfacing | 0 | 18 | 1 | 0 | 19 | **47%** |
-| Configurations & Design Tables | 15 | 2 | 7 | 0 | 24 | **67%** |
-| Evaluate & Analysis | 6 | 9 | 11 | 1 | 27 | **43%** |
-| Import / Export / Interop | 12 | 12 | 11 | 0 | 35 | **51%** |
-| UI / UX / Interaction | 41 | 13 | 16 | 2 | 72 | **69%** |
-| ECAD / Electronics (beyond-SW) | 30 | 6 | 8 | 3 | 47 | **77%** |
-| **TOTAL** | **204** | **126** | **142** | **7** | **479** | **57%** |
-
-The scorecard records the 2026-06-14 assessment; it is not a fresh measurement of
-today's tree. `python3 scripts/parity_audit.py` computes status totals and live-pointer
-coverage from the rows below. It does not run acceptance tests. The current C++ host
-has surfacing ribbon/forms and extended feature controls; their existence alone does
-not promote the inherited `partial` rows to full SolidWorks parity.
-
-The implementation backlog derived from every `partial` and `missing` row below used to
-live in `SW_PARITY_GAPS.md` (pruned 2026-07-23 in bb29af1c); the status rows in this
-document are now the single source of truth.
+`python3 scripts/parity_audit.py` computes status totals and live-pointer coverage
+from the rows below. It does not run acceptance tests.
 
 ---
 
 ## 1. Sketcher (2D)
 
-The sketcher is at roughly SolidWorks 2020 parity on the core workflow: a full entity
-suite over a Newton/LM solver with analytic Jacobians, the complete geometric-constraint
-set (including the P0 curve↔curve tangent gap closed 2026-06-14), Smart Dimension with
-the Modify box (driven dims, equation links, over-define pre-flight, double-click edit),
-and the editing tools (trim/extend/offset/fillet/chamfer/mirror/pattern/convert/move).
-Gaps include blocks, pierce, arc-corner fillets and non-primitive entity transforms.
-Rotate Entities now has a dedicated selection/center/angle tool.
+The inventory below records sketching acceptance conditions and evidence.
 
 | Capability | SW acceptance condition | Status | Evidence |
 |---|---|---|---|
@@ -240,8 +191,8 @@ advanced/mechanical mates, mirror, flexible sub-assemblies, and in-context editi
 | Circular Component Pattern | Count + angle + equal-spacing + axis (edge/datum) | **partial** | world datum axes only; no partial-fill angle option |
 | Mirror Component | Mirror comps across a plane, BOM listed | **missing** | no asm_mirror feature/engine/UI |
 | Exploded View — manual steps | Drag comps with triad to author named steps; animate | **partial** | flat-list steps via op; no triad authoring, no per-step animate/reorder |
-| Exploded View — factor slider | 0→1 interpolation, display-only | done | rpc `doc_set_explode_state`; `core/doc/session.cpp`; host explode slider |
-| Exploded View — explode lines | Dashed guide rails from exploded to mated pos | **missing** | no line rendering/emission |
+| Exploded View — factor slider | 0→1 interpolation, display-only | done | rpc `doc_set_explode_state` (returns per-component vectors); automatic plan when no steps (`auto_explode_vectors`, `core/doc/assembly.cpp`); host slides bodies on the GPU while dragging/animating and bakes once per gesture |
+| Exploded View — explode lines | Dashed guide rails from exploded to mated pos | **partial** | dashed home→current lines while the Exploded View form is open; not stored, not on drawings |
 | Interference Detection | Pairwise overlap volume + min clearance, highlight | done | rpc `eval_interference`; `core/doc/session.cpp`; `host/src/ui/evaluate_dialogs.cpp` inventory/overlay path; complete clearance/highlight acceptance retains the prior assessment |
 | BOM — assembly panel | Live item/name/qty/desc/mass, CSV/annotation | **partial** | Name/Source/Qty/Mass + CSV; no Description/custom props, no balloons, no sort/filter |
 | BOM — drawing integration | Linked auto-updating BOM table + balloons on sheet | **partial** | drawing_bom data exists; no UI table insert, no balloons |
@@ -499,7 +450,7 @@ mesh-quality, probe or coordinate-system acceptance condition.
 | Interference Detection | Pairwise overlap volume + clearance, highlight, options | **partial** | rpc `eval_interference`; `host/src/ui/evaluate_dialogs.cpp` interference inventory and overlays; complete clearance/coincident/options acceptance remains unverified |
 | Geometry Check | BRepCheck + free/short/sliver census | done | rpc `eval_check`; `core/doc/session.cpp`; color-coded host list |
 | Draft Analysis | Pull direction + threshold color map | done | rpc `eval_draft`; `host/src/ui/evaluate_dialogs.cpp` Pull X/Y/Z/-Z and angle controls |
-| Thickness Analysis | Per-vertex wall thickness color map | done | rpc `eval_thickness`; `core/doc/session.cpp`; host field overlay |
+| Thickness Analysis | Sampled inscribed-sphere wall-thickness study; process minimum, thin=red fixed range, thin-region framing | done | rpc `eval_thickness` (`min_wall_mm`, honoured `resolution`); `host/src/ui/evaluate_dialogs.cpp`; Evaluate and Simulate → Static; minimum/thin area/regions/actual spacing cards, shared renderer/legend range [T, 3T], budget/unmeasured caveats |
 | Curvature Analysis | Mean/Gaussian/max curvature color map | done | rpc `eval_curvature`; `host/src/ui/evaluate_dialogs.cpp` mean/Gaussian/max/min controls |
 | Zebra Stripes | Reflected stripes for G1/G2 inspection | done | setZebra; GLSL zebra |
 | Symmetry Check | (SW has none) mirror-and-diff symmetry test | **beyond** | rpc `eval_symmetry`; `core/doc/session.cpp`; `host/src/ui/evaluate_dialogs.cpp` Front/Top/Right plane picker |
@@ -559,7 +510,7 @@ Parasolid, and no color/unit/assembly-hierarchy round-trip on STEP.
 | Export selected bodies only | Body filter on export | **missing** | always all bodies |
 | Save a copy as | Export without changing session path | **missing** | save always updates path |
 | Pack and Go | Self-contained archive with references | **partial** | .step+ embeds drawings/components; import source_path absolute (breaks off-machine) |
-| ECAD native (.ecad+) | ZIP container save/open | done | rpc `ecad_save`/`ecad_open`; `core/ecad/container.cpp`; native ECAD Save/Open dialogs |
+| Legacy ECAD container | One-way open/migration | historical | `ecad_open` accepts legacy files; saving writes KiCad files |
 | KiCad .kicad_sch import | KiCad 6/7/8 schematic parse | done | import_kicad_sch; file filter |
 | KiCad .kicad_pcb import | KiCad 6/7/8 board parse | done | import_kicad_pcb; ecad_open |
 | Gerber / drill export | RS-274X + Excellon | done | ecad_export gerber/drill |
@@ -606,7 +557,7 @@ and high-DPI ribbon arithmetic.
 | Selection — 3D box select | Rubber-band window/crossing select | **missing** | only sketch has 2D box select |
 | Selection — 3D lasso select | Freeform closed-curve select | **missing** | not implemented |
 | Selection — selection filter | Global face/edge/vertex/body filter bar | **missing** | per-PM-well filtering only |
-| Mouse gestures — RMB drag wheel | 8-segment radial view wheel | done | mouse_gestures.cpp kSegs |
+| Mouse gestures — RMB drag pan | Right-drag pans the viewport | done | viewport_panel pan navigation |
 | Mouse gestures — orbit | LMB/MMB orbit, Ctrl pan, Shift zoom | done | viewport_panel orbit/pan/zoom |
 | Mouse gestures — scroll zoom to cursor | Wheel zooms toward cursor point | done | cursor-tracking pan compensation |
 | Mouse gestures — double-MMB zoom-to-fit | Reset view to fit | done | double-click MMB fit |
@@ -661,38 +612,37 @@ and high-DPI ribbon arithmetic.
 ## 12. ECAD / Electronics (beyond-SW differentiator)
 
 SolidWorks has no native PCB capability, so **every item here is beyond-SW by definition**;
-parity is measured against a KiCad-class baseline. The headless engine (schematic capture,
-hierarchical sheets, netlist, ERC, PCB layout, DRC, zone fill, Gerber/BOM/drill, PCB→3D
-bridge, native MNA SPICE) is done and verified across 27 test suites; the C++ GUI is built
-and headlessly verified through Wave Z. The AI design orchestrator and 24-tool MCP API are
-genuine differentiators KiCad lacks. Gaps: KiCad write-back export, cross-probe, variants.
+The scorecard below is a historical assessment, not a current validation report.
+The current Electronics workspace is a KiCad project hub: humans edit in KiCad,
+the canvas is read-only, agents use ECAD operations, and KiCad supplies authoritative
+checks and fabrication outputs. KiCad files are the document of record.
 
 | Capability | KiCad-class acceptance condition | Status | Evidence |
 |---|---|---|---|
 | Schematic Document Model | Symbols/wires/junctions/labels/buses/power/hier, version-locked | done | rpc `ecad_schema`; `core/ecad/schema.cpp` aicad.sch/1 validation |
 | PCB Document Model | Stackup/outline/footprints/tracks/vias/zones/rules/nets, version-locked | done | rpc `ecad_schema`; `core/ecad/schema.cpp` aicad.pcb/1 validation |
-| Schematic Capture | Place/wire/junction/label/power/no-connect/annotate, undo | done | op `sch_add_symbol`/`sch_add_wire`/`sch_add_junction`/`sch_add_label`/`sch_add_power`/`sch_add_no_connect`/`sch_annotate`; rpc `ecad_undo`; `core/ecad/ops.cpp` |
+| Schematic Capture | Place/wire/junction/label/power/no-connect/annotate, undo | done | KiCad Schematic Editor; agent schematic operations in `core/ecad/ops.cpp` |
 | Hierarchical Multi-Sheet | Sheet symbols + pins + hier bridge + ERC | done | sheets/sheet_symbols; netlist hierarchy bridge; erc |
 | Netlist Extraction | Deterministic union-find, name priority, byte-stable | done | `core/ecad/netlist.cpp` extraction; byte stability remains a behavioral acceptance, not a file-presence check |
-| Electrical Rules Check (ERC) | Full KiCad-class rule set, advisory | done | `core/ecad/erc.cpp` electrical rules; unchanged acceptance assessment, not proved by artifact presence alone |
+| Electrical Rules Check (ERC) | KiCad ERC | done | `ecad_kicad_check`; `kicad-cli sch erc` |
 | Symbol Library — KiCad Import | Parse .kicad_sym, multi-unit, body graphics | done | rpc `ecad_load_symbol_library`; `core/ecad/symlib.cpp` KiCad symbol parsing |
 | Symbol Library — Clean-Room Starter | Built-in R/L/C/diode/…/IC with IPC-7351 | done | `core/ecad/library.cpp` starter library; inherited count/layout acceptance is not a fresh test result |
 | Footprint Library — KiCad Import | Parse .kicad_mod / .pretty | done | `core/ecad/kicad.cpp` footprint parsing |
 | Schematic→PCB Update | Idempotent footprint+net population, prune | done | op `pcb_update_from_sch`; rpc `ecad_update_from_sch`; `core/ecad/sync.cpp` |
-| PCB — Footprint Placement | Place/rotate/flip/ref-value, grid snap | done | pcb_add/edit/delete_footprint; canvas tools |
-| PCB — Manual Track Routing | Segment+arc, layer change via via, net widths | done | pcb_add_track/via; Route tool |
+| PCB — Footprint Placement | Place/rotate/flip/ref-value, grid snap | done | KiCad PCB editor; agent footprint ops |
+| PCB — Manual Track Routing | Segment+arc, layer change via via, net widths | done | KiCad PCB editor; agent track/via ops |
 | PCB Autorouter | Maze/Lee + net classes + rip-up + diff-pair | done | rpc `ecad_autoroute`; `core/ecad/autoroute.cpp`; complete routing acceptance is not established by the RPC pointer alone |
 | Copper Zone Fill | Flood + clearance + thermal relief + island removal | done | rpc `ecad_fill_zones`; `core/ecad/zonefill.cpp` |
-| Design Rule Check (DRC) | Net-aware clearance + width/via/ring/hole/edge/unrouted | done | `core/ecad/drc.cpp`; full rule acceptance retains the prior assessment |
+| Design Rule Check (DRC) | KiCad DRC | done | `ecad_kicad_check`; `kicad-cli pcb drc` |
 | Design for Manufacturing (DFM) | Silk/mask/acid-trap/courtyard/annular/drill | done | rpc `ecad_dfm`; `core/ecad/dfm.cpp` |
-| Gerber / Fab Output | RS-274X + Excellon + BOM + CPL | done | gerber/excellon/bom/placement |
-| PCB→3D STEP + CAD Bridge | Board substrate+components → STEP into CAD part | done | rpc `ecad_to_3d`; `core/api/libchudware.cpp` native board export and document import |
+| Gerber / Fab Output | RS-274X + Excellon + BOM + CPL | done | `ecad_export`; `kicad-cli` |
+| PCB→3D STEP + CAD Bridge | Board substrate+components → STEP into CAD part | done | `ecad_to_3d`; `kicad-cli pcb export step` and document import |
 | Native SPICE — DC/Transient/AC | MNA solver, Newton, no external dep | done | rpc `sim_spice`; `core/sim/spice.cpp`; historical analytic gate count is not a current test result |
 | Extended Simulation Analyses | Fourier/THD, Monte-Carlo, temp sweep, noise, .tf, .step | done | rpc `sim_spice`; `core/sim/spice.cpp`; complete analysis matrix retains the prior assessment |
 | SPICE Netlist Import / Export | Round-trip R/L/C/V/I/D/BJT/MOS/OPAMP/.subckt | done | rpc `sim_netlist_parse`/`sim_netlist_to_circuit`; `core/sim/netlist.cpp`; full round-trip acceptance retains the prior assessment |
 | Signal Integrity — Controlled Impedance | Microstrip/stripline/CPWG/diff-pair Z0 from stackup | done | rpc `ecad_impedance`; `core/ecad/impedance.cpp` |
-| KiCad File Interoperability | Import + export .kicad_sch/.kicad_pcb | **partial** | import done; export (kicad_export) raises not_available |
-| Native Container (.ecad+) | ZIP container, forward-compatible | done | rpc `ecad_save`/`ecad_open`; `core/ecad/container.cpp` |
+| KiCad project files | Schematic and board open/save | done | `ecad_open`, `ecad_save`; KiCad project is authoritative |
+| Legacy ECAD container | Open for one-way migration | done | `ecad_open`; saves write KiCad files |
 | PCB Stackup Definition | Copper layers + dielectric + thickness/Er | done | schema stackup; pcb_set_stackup |
 | Session Management | 100-deep undo/redo, transactional ops, multi-doc | done | rpc `ecad_apply_ops`/`ecad_undo`/`ecad_redo`/`ecad_new`; `core/ecad/session.cpp` |
 | AI Schematic Design Orchestrator | NL → ERC-clean, sim-checked schematic | **beyond** | rpc `ecad_design`; `core/ecad/session.cpp`; orchestrated ERC/simulation acceptance is not implied by RPC presence |
@@ -711,7 +661,7 @@ genuine differentiators KiCad lacks. Gaps: KiCad write-back export, cross-probe,
 | Power Integrity / IR Drop | Power-net resistance + voltage drop | **missing** | not implemented |
 | Thermal Simulation of PCB | Component temperatures from power map | **missing** | temp sweep is device-param only |
 | IBIS / S-Parameter | High-speed IO buffer / Touchstone models | **missing** | not implemented |
-| KiCad Schematic Export | Write .kicad_sch back to KiCad | **missing** | kicad_export not present (import-only) |
+| KiCad Schematic Save | Write `.kicad_sch` | done | `ecad_save` |
 | Diff-Pair Length Match (manual) | Tune existing routed pair to match | **partial** | available during autoroute only; no post-hoc op |
 | Schematic Cross-Probe to PCB | Select in one view highlights the other | **missing** | no highlight sync |
 | Component Rotation / Assembly Rules | Reflow-direction / edge-straddle checks | **missing** | not implemented |

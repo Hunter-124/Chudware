@@ -1,5 +1,6 @@
 // Owner-private daemon state primitives. Never rely on the process umask.
 #pragma once
+#include <atomic>
 
 #include <cstdio>
 #include <cstdint>
@@ -185,10 +186,67 @@ inline bool privateWrite(const std::string& path, const std::string& text) {
     return std::fclose(stream) == 0 && written;
 }
 
+// The file must already have been flushed by stdio. Publish only complete,
+// durable data, without replacing an existing recovery artifact.
+inline bool syncPrivateFile(FILE* stream) {
+    if (std::fflush(stream) != 0) return false;
+#ifdef _WIN32
+    const intptr_t handle = _get_osfhandle(_fileno(stream));
+    return handle != -1 && FlushFileBuffers(reinterpret_cast<HANDLE>(handle));
+#else
+    return ::fsync(::fileno(stream)) == 0;
+#endif
+}
+
+inline bool syncParentDirectory(const std::string& path) {
+#ifdef _WIN32
+    // MOVEFILE_WRITE_THROUGH below flushes the rename on Windows.
+    (void)path;
+    return true;
+#else
+    const auto parent = std::filesystem::u8path(path).parent_path();
+    const int fd = ::open((parent.empty() ? "." : parent.string()).c_str(),
+                          O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return false;
+    const bool ok = ::fsync(fd) == 0;
+    ::close(fd);
+    return ok;
+#endif
+}
+
+inline std::string privateStageName(const std::string& destination) {
+    static std::atomic<unsigned long long> serial{0};
+#ifdef _WIN32
+    const auto pid = GetCurrentProcessId();
+#else
+    const auto pid = ::getpid();
+#endif
+    return destination + ".tmp-" + std::to_string(pid) + "-" +
+           std::to_string(serial.fetch_add(1, std::memory_order_relaxed));
+}
+
+inline bool publishPrivateFile(const std::string& stage, const std::string& destination) {
+#ifdef _WIN32
+    if (!MoveFileExW(std::filesystem::u8path(stage).c_str(),
+                     std::filesystem::u8path(destination).c_str(), MOVEFILE_WRITE_THROUGH))
+        return false;
+#else
+    // link is an atomic no-replace publish on the same filesystem.
+    if (::link(stage.c_str(), destination.c_str()) != 0) return false;
+    if (::unlink(stage.c_str()) != 0) return false;
+#endif
+    return syncParentDirectory(destination);
+}
+
 inline bool privateCopy(const std::string& source, const std::string& destination) {
+#ifdef _WIN32
+    FILE* input = _wfopen(std::filesystem::u8path(source).c_str(), L"rb");
+#else
     FILE* input = std::fopen(source.c_str(), "rb");
+#endif
     if (!input) return false;
-    FILE* output = privateFile(destination, false, true);
+    const std::string stage = privateStageName(destination);
+    FILE* output = privateFile(stage, false, true);
     if (!output) { std::fclose(input); return false; }
     char buffer[16384];
     size_t size;
@@ -197,8 +255,10 @@ inline bool privateCopy(const std::string& source, const std::string& destinatio
         if (std::fwrite(buffer, 1, size, output) != size) { ok = false; break; }
     ok = ok && !std::ferror(input);
     std::fclose(input);
+    if (ok) ok = syncPrivateFile(output);
     ok = std::fclose(output) == 0 && ok;
-    if (!ok) { std::error_code ec; std::filesystem::remove(destination, ec); }
+    if (ok) ok = publishPrivateFile(stage, destination);
+    if (!ok) { std::error_code ec; std::filesystem::remove(stage, ec); }
     return ok;
 }
 }  // namespace chudware_ipc

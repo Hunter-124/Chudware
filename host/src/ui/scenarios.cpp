@@ -9,68 +9,96 @@
 #include <GLFW/glfw3.h>
 
 #include "stb_image_write.h"
+#include "miniz.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <functional>
+#include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 #include <map>
 #include <sstream>
+#include <utility>
+#include <set>
+#include <unordered_map>
 
 #include "../core/app_state.h"
+#include "../core/frame_stats.h"
+#include "../app_commands.h"
 #include "../core/sim_client.h"  // simaudit: mesh-preview idle wait (SimClient::busy)
 #include "../renderer.h"  // iconpipe: transparent thumbnail render + FBO readback
 #include "../render/splat_renderer.h"  // RE-28: 3DGS splat renderer
-#include "cam/cam_panel.h"  // camLoadJob (CAM copilot fast-path scenario)
+#include "../render/mesh_reference.h"
+#include "cam/cam_panel.h"  // camLoadJob (CAM workspace scenario)
 #include "asm_panels.h"
 #include "camera_anim.h"
+#include "anim.h"
 #include "evaluate_dialogs.h"
 #include "manufacture/manufacture_panel.h"
 #include "property_manager.h"
 #include "doc_tabs.h"
+#include "ecad/ecad_panel.h"
+#include "ecad/ecad_mirror.h"
+#include "scad_editor.h"
+#include "parts/parts_internal.h"
 #include "onboarding.h"
 #include "sim_manager.h"
 #include "sim_topology.h"
 #include "sketch_mode.h"
 #include "sketch3d_mode.h"
 #include "ui_audit.h"  // simaudit + CHUDWARE_IDAUDIT: test-engine-hook ID-conflict / clipping audit
+#include "widgets/ribbon.h"
 #include "viewport_panel.h"
 #include "layout.h"  // overlayBand: demoreview Simulation-column clip check
 #include "copilot/copilot_internal.h"  // projectchat: session store, root reconciliation, Sessions probe
+#include "ui/copilot/inline_image_refs.h"  // copilot_showcase: Sessions titles never show "[Image #N]"
+#include "util/time_local.h"  // copilot_showcase: local-midnight session timestamps
 #include "sim/sim_scene.h"
 #include "../ui_theme.h"
 #include <array>
 #include "../render/id_pass.h"
 #include <imgui_internal.h>
+#include "imgui_impl_opengl3.h"
 #include "firmware/fw_workspace.h"
 #include "engine_backend.h"
 #include "ipc_client.h"
 
 namespace {
 
+void swapScenarioFrame(GLFWwindow* win) {
+    core::framestats::Scope timing("swap");
+    glfwSwapBuffers(win);
+    core::framestats::markSwap(timing.elapsedMs());
+}
+
 // Read the current GL_BACK buffer, flip it vertically, and write it as an RGBA PNG to `path`
 // (and `mirrorPath` when given). A null path skips that write; the readback still happens,
 // matching the former inline capture blocks.
-void writeBackbufferPng(const char* path, int dw, int dh, const char* mirrorPath = nullptr) {
+bool writeBackbufferPng(const char* path, int dw, int dh, const char* mirrorPath = nullptr) {
     std::vector<unsigned char> px(dw * dh * 4);
     glReadBuffer(GL_BACK);
     glReadPixels(0, 0, dw, dh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
     std::vector<unsigned char> flip(dw * dh * 4);
     for (int y = 0; y < dh; ++y)
         std::memcpy(&flip[(dh - 1 - y) * dw * 4], &px[y * dw * 4], dw * 4);
-    if (path) stbi_write_png(path, dw, dh, 4, flip.data(), dw * 4);
-    if (mirrorPath) stbi_write_png(mirrorPath, dw, dh, 4, flip.data(), dw * 4);
+    const bool primary = !path || stbi_write_png(path, dw, dh, 4, flip.data(), dw * 4) != 0;
+    const bool mirror = !mirrorPath || stbi_write_png(mirrorPath, dw, dh, 4, flip.data(), dw * 4) != 0;
+    return primary && mirror;
 }
 
 // Use the exact published image rectangle and last renderer camera, including lens shift.
@@ -93,28 +121,64 @@ bool sceneShotPoint(AppState& st, const float world[3], ImVec2& screen) {
         screen.y > lo.y + 36 && screen.y < hi.y - 36;
 }
 
-// Read the actual shaded viewport FBO, not chrome/schematic pixels. Count foreground
-// in projected geometry patches against a same-row background sample (the studio
-// background has a vertical gradient). Patches away from the obstacle keep the original
-// piping shot from passing merely because its solid box is visible.
-nlohmann::json sceneShotPixels(AppState& st, const std::vector<std::array<float, 3>>& points) {
+// Compare projected geometry against a same-row background sample (the studio
+// background has a vertical gradient). The piping checks use the scene FBO so
+// chrome cannot count as pipe. Catalog proof can instead sample the composed
+// backbuffer, i.e. the exact image saved by the screenshot, within the clear rect.
+nlohmann::json sceneShotPixels(AppState& st, const std::vector<std::array<float, 3>>& points,
+                               bool composed = false, std::vector<size_t>* visibleIndices = nullptr) {
     ui::simscene::ViewportCtx vp;
     ImVec2 lo, hi;
     if (!sceneShotViewport(st, vp) || !ui::viewportClearRect(lo, hi))
         return {{"ok", false}, {"reason", "no_rendered_viewport"}};
-    const int w = vp.cam.ssWidth, h = vp.cam.ssHeight;
+    int w = vp.cam.ssWidth, h = vp.cam.ssHeight;
+    if (composed) glfwGetFramebufferSize(st.win, &w, &h);
     if (w <= 0 || h <= 0) return {{"ok", false}, {"reason", "empty_framebuffer"}};
     std::vector<unsigned char> pixels(static_cast<size_t>(w) * h * 4);
-    st.renderer->beginOverlay();
+    GLint oldPackBuffer = 0, oldAlignment = 0, oldRowLength = 0, oldSkipRows = 0, oldSkipPixels = 0;
+    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &oldPackBuffer);
+    glGetIntegerv(GL_PACK_ALIGNMENT, &oldAlignment);
+    glGetIntegerv(GL_PACK_ROW_LENGTH, &oldRowLength);
+    glGetIntegerv(GL_PACK_SKIP_ROWS, &oldSkipRows);
+    glGetIntegerv(GL_PACK_SKIP_PIXELS, &oldSkipPixels);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_PACK_SKIP_ROWS, 0);
+    glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+    GLint oldReadFbo = 0, oldReadBuffer = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &oldReadFbo);
+    if (composed) {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        glGetIntegerv(GL_READ_BUFFER, &oldReadBuffer);
+        glReadBuffer(GL_BACK);
+    } else {
+        st.renderer->beginOverlay();
+        glGetIntegerv(GL_READ_BUFFER, &oldReadBuffer);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+    }
     glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
-    st.renderer->endOverlay();
+    glReadBuffer(oldReadBuffer);
+    if (!composed) st.renderer->endOverlay(false);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, oldReadFbo);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, oldPackBuffer);
+    glPixelStorei(GL_PACK_ALIGNMENT, oldAlignment);
+    glPixelStorei(GL_PACK_ROW_LENGTH, oldRowLength);
+    glPixelStorei(GL_PACK_SKIP_ROWS, oldSkipRows);
+    glPixelStorei(GL_PACK_SKIP_PIXELS, oldSkipPixels);
+    const auto* mainVp = ImGui::GetMainViewport();
     auto pixel = [&](float x, float y) {
-        const int ix = std::clamp((int)((x - vp.imgMin.x) * w / vp.vw), 0, w - 1);
-        const int iy = std::clamp(h - 1 - (int)((y - vp.imgMin.y) * h / vp.vh), 0, h - 1);
+        const int ix = composed
+            ? std::clamp((int)((x - mainVp->Pos.x) * w / mainVp->Size.x), 0, w - 1)
+            : std::clamp((int)((x - vp.imgMin.x) * w / vp.vw), 0, w - 1);
+        const int iy = composed
+            ? std::clamp(h - 1 - (int)((y - mainVp->Pos.y) * h / mainVp->Size.y), 0, h - 1)
+            : std::clamp(h - 1 - (int)((y - vp.imgMin.y) * h / vp.vh), 0, h - 1);
         return &pixels[(static_cast<size_t>(iy) * w + ix) * 4];
     };
     int different = 0, sampled = 0, patches = 0, visiblePatches = 0;
-    for (const auto& p : points) {
+    for (size_t index = 0; index < points.size(); ++index) {
+        const auto& p = points[index];
         ImVec2 s;
         if (!sceneShotPoint(st, p.data(), s)) continue;
         ++patches;
@@ -127,23 +191,27 @@ nlohmann::json sceneShotPixels(AppState& st, const std::vector<std::array<float,
             ++sampled;
             if (delta > 24) ++different;
         }
-        if (different - before >= 20) ++visiblePatches;
+        if (different - before >= 20) {
+            ++visiblePatches;
+            if (visibleIndices) visibleIndices->push_back(index);
+        }
     }
     return {{"ok", patches > 0 && different >= 40}, {"foreground_pixels", different},
             {"sampled_pixels", sampled}, {"projected_patches", patches}, {"visible_patches", visiblePatches},
-            {"clear_rect", {lo.x, lo.y, hi.x, hi.y}}, {"source", "rendered_viewport_fbo"}};
+            {"clear_rect", {lo.x, lo.y, hi.x, hi.y}},
+            {"source", composed ? "composited_backbuffer" : "rendered_viewport_fbo"}};
 }
 
 struct SceneShotInput {
     int phase = 0;
     ImVec2 point;
-    bool click(ImVec2 p, bool shift = false) {
+    bool click(ImVec2 p, bool shift = false, int button = 0) {
         auto& io = ImGui::GetIO();
         if (phase == 0) point = p;
         io.AddMousePosEvent(point.x, point.y);
         io.AddKeyEvent(ImGuiMod_Shift, shift);
-        if (phase == 1) io.AddMouseButtonEvent(0, true);
-        if (phase == 2) io.AddMouseButtonEvent(0, false);
+        if (phase == 1) io.AddMouseButtonEvent(button, true);
+        if (phase == 2) io.AddMouseButtonEvent(button, false);
         if (++phase < 5) return false;
         io.AddKeyEvent(ImGuiMod_Shift, false);
         phase = 0;
@@ -441,7 +509,7 @@ bool pipingShotEndFrame(AppState& st, int dw, int dh, const char* screenshotPath
         P.capture.clear();
         P.captureWait = 0;
     }
-    glfwSwapBuffers(st.win);
+    swapScenarioFrame(st.win);
     breakLoop = false;
     if (P.done && P.capture.empty()) {
         const std::string path = P.dir + "/piping_report.json";
@@ -452,10 +520,176 @@ bool pipingShotEndFrame(AppState& st, int dw, int dh, const char* screenshotPath
         std::fflush(stdout);
         if (P.failed || !out) {
             std::fflush(nullptr);
+            core::framestats::flushReport();
             std::_Exit(EXIT_FAILURE);
         }
         breakLoop = true;
     }
+    return true;
+}
+
+// ---------- wall-thickness study (CHUDWARE_SHOT=thickness) ----------
+struct ThicknessShot {
+    bool init = false, want = false, done = false, failed = false;
+    int step = 0, settle = 0;
+    double started = 0.0;
+    std::string dir;
+    nlohmann::json report;
+};
+ThicknessShot g_thickness;
+
+void thicknessFail(const std::string& detail) {
+    auto& shot = g_thickness;
+    shot.failed = shot.done = true;
+    shot.report["ok"] = false;
+    shot.report["error"] = detail;
+    std::fprintf(stderr, "thickness: FAILED: %s\n", detail.c_str());
+    std::fflush(stderr);
+}
+
+void thicknessShotTick(AppState& st) {
+    auto& shot = g_thickness;
+    if (!shot.init) {
+        shot.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        shot.want = st.shot && mode && std::strcmp(mode, "thickness") == 0;
+        if (!shot.want) return;
+        const char* repo = std::getenv("CHUDWARE_REPO");
+        shot.dir = std::string(repo ? repo : ".") + "/scratch/thickness_shots";
+        std::error_code ec;
+        std::filesystem::create_directories(shot.dir, ec);
+        shot.report = {{"scenario", "thickness"}, {"ok", false}};
+        shot.started = pipingNow();
+        if (ec) thicknessFail("Could not create capture directory: " + ec.message());
+    }
+    if (!shot.want || shot.done) return;
+    if (pipingNow() - shot.started > 180.0) {
+        thicknessFail("Timed out waiting for the wall-thickness study.");
+        return;
+    }
+    if (!st.workerStarted || st.frame < 5) return;
+    if (shot.settle > 0) { --shot.settle; return; }
+    if (st.rpc.busy()) return;
+    if (shot.step == 0) {
+        std::string error;
+        if (!st.docMirror.newPart(st.worker, error)) { thicknessFail(error); return; }
+        st.clearViewportForNewDoc();
+        st.addDocTab(false);
+        auto dim = [](double v) { return nlohmann::json{{"value", v}, {"expr", nullptr}}; };
+        auto box = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {
+                {"type", "box"}, {"name", "Thickness study blank"},
+                {"params", {{"length", dim(40)}, {"width", dim(30)}, {"height", dim(20)}}},
+                {"centered", true}}}}}));
+        if (!box.ok) { thicknessFail("Box: " + box.error_message); return; }
+        nlohmann::json top;
+        double topZ = -std::numeric_limits<double>::infinity();
+        for (int face = 1; face <= 6; ++face) {
+            const std::string selector = st.docMirror.resolvePick(st.worker, 1, "face", face, error);
+            const auto candidate = nlohmann::json::parse(selector, nullptr, false);
+            if (candidate.is_discarded() || !candidate.is_object() ||
+                !candidate.contains("centroid") || !candidate["centroid"].is_array() ||
+                candidate["centroid"].size() != 3) continue;
+            const double z = candidate["centroid"][2].get<double>();
+            if (z > topZ) { topZ = z; top = candidate; }
+        }
+        if (top.is_null()) { thicknessFail("Could not resolve the shell's open top face."); return; }
+        auto shell = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {
+                {"type", "shell"}, {"name", "Deliberately thin 0.6 mm walls"},
+                {"params", {{"thickness", dim(0.6)}}},
+                {"refs", {{"remove", nlohmann::json::array({top})}}}}}}}));
+        if (!shell.ok || shell.aicm_path.empty() || !st.loadDocMesh(shell.aicm_path, error)) {
+            thicknessFail("Shell: " + shell.error_message + " " + error);
+            return;
+        }
+        st.activeWorkspace = AppState::Workspace::Simulate;
+        st.ribbonTab = 13;  // Static, beside the FEA study launcher
+        st.showRibbon = true;
+        st.yaw = 35; st.pitch = 30; st.zoom = 1.0f;
+        shot.step = 1;
+        shot.settle = 8;
+        return;
+    }
+    if (!st.evaluateDialogs || !st.renderer) {
+        thicknessFail("No Evaluate tool or renderer for the active part.");
+        return;
+    }
+    if (shot.step == 1) {
+        if (!st.evaluateDialogs->handleCommand(st, "eval_thickness")) {
+            thicknessFail("The thickness command was not handled.");
+            return;
+        }
+        shot.step = 2;
+        return;
+    }
+    if (shot.step == 2) {
+        if (st.evaluateDialogs->analysisPending()) return;
+        const auto& error = st.evaluateDialogs->analysisError();
+        if (!error.empty()) { thicknessFail(error); return; }
+        const auto& result = st.evaluateDialogs->analysisResult();
+        if (!result.is_object() || !result.contains("min_thickness_mm") ||
+            !result["min_thickness_mm"].is_number()) {
+            thicknessFail("No measured thickness returned.");
+            return;
+        }
+        float low = 0.0f, high = 0.0f;
+        const auto& display = st.renderer->scalarDisplay();
+        const bool range = st.renderer->scalarRange(low, high);
+        const int regions = result.value("n_thin_regions", 0);
+        shot.report["result"] = result;
+        shot.report["legend"] = {
+            {"on", st.legendOn}, {"colormap", st.colormapOn}, {"title", st.legendTitle},
+            {"units", st.legendUnits}, {"min", st.legendMin}, {"max", st.legendMax},
+            {"reversed", display.reversed}, {"fixed_range", display.fixedRange},
+            {"renderer_min", low}, {"renderer_max", high}, {"thin_regions", regions}};
+        std::printf("thickness: %s\n", shot.report["legend"].dump().c_str());
+        std::fflush(stdout);
+        const double minimum = result["min_thickness_mm"].get<double>();
+        // The legend follows the user's unit system; the renderer range stays in mm.
+        const bool inches = st.legendUnits == "in";
+        const float toDisplay = inches ? 1.0f / 25.4f : 1.0f;
+        if (!st.colormapOn || !st.legendOn || !display.reversed || !display.fixedRange ||
+            !range || std::fabs(low - 1.0f) > 1e-5f || std::fabs(high - 3.0f) > 1e-5f ||
+            (!inches && st.legendUnits != "mm") ||
+            std::fabs(st.legendMin - low * toDisplay) > 1e-5f ||
+            std::fabs(st.legendMax - high * toDisplay) > 1e-5f ||
+            std::fabs(result.value("min_wall_mm", 0.0) - 1.0) > 1e-5 ||
+            minimum < 0.45 || minimum > 0.75 || regions < 1 ||
+            result.value("thin_area_mm2", 0.0) <= 0.0) {
+            thicknessFail("Expected 0.6 mm thin walls and a fixed red-at-1 mm / blue-at-3 mm legend.");
+            return;
+        }
+        shot.step = 3;
+        shot.settle = 8;
+        return;
+    }
+    shot.report["ok"] = true;
+    shot.done = true;
+}
+
+bool thicknessShotEndFrame(AppState& st, int dw, int dh, const char* screenshotPath,
+                           bool& breakLoop) {
+    auto& shot = g_thickness;
+    if (!shot.want) return false;
+    ++st.frame;
+    if (shot.done) {
+        const std::string capture = shot.dir + (shot.failed ? "/thickness_FAILED.png" : "/thickness.png");
+        writeBackbufferPng(capture.c_str(), dw, dh, screenshotPath);
+        shot.report["capture"] = capture;
+        std::ofstream out(shot.dir + "/thickness_report.json", std::ios::trunc);
+        out << shot.report.dump(2) << '\n';
+        out.close();
+        std::printf("thickness: capture -> %s ok=%d\n", capture.c_str(), (int)!shot.failed);
+        std::fflush(stdout);
+        if (shot.failed || !out) {
+            std::fflush(nullptr);
+            core::framestats::flushReport();
+            std::_Exit(EXIT_FAILURE);
+        }
+    }
+    swapScenarioFrame(st.win);
+    breakLoop = shot.done;
     return true;
 }
 
@@ -1040,7 +1274,7 @@ bool hydraulicsShotEndFrame(AppState& st, int dw, int dh, const char* screenshot
         H.capture.clear();
         H.captureWait = 0;
     }
-    glfwSwapBuffers(st.win);
+    swapScenarioFrame(st.win);
     breakLoop = false;
     if (H.done && H.capture.empty() && H.queued.empty()) {
         const std::string path = H.dir + (H.view3d ? "/hydraulics3d_report.json" : "/hydraulics_report.json");
@@ -1051,6 +1285,7 @@ bool hydraulicsShotEndFrame(AppState& st, int dw, int dh, const char* screenshot
         std::fflush(stdout);
         if (H.failed || !out) {
             std::fflush(nullptr);
+            core::framestats::flushReport();
             std::_Exit(EXIT_FAILURE);
         }
         breakLoop = true;
@@ -1128,11 +1363,13 @@ ImVec2 shotPoint(const nlohmann::json& item) {
     return ImVec2(x, y);
 }
 
-void shotScrollTo(const char* label, const char* window = nullptr, bool frameWholeItem = false) {
+void shotScrollTo(const char* label, const char* window = nullptr, bool frameWholeItem = false,
+                  const nlohmann::json* exact = nullptr) {
     auto& N = g_simNavigation;
-    if (N.target != label) { N = ShotNavigation(); N.target = label; }
+    const std::string key = std::string(label) + (exact ? std::to_string(exact->value("id", 0u)) : "");
+    if (N.target != key) { N = ShotNavigation(); N.target = key; }
     if (N.wheels >= 96) return;  // Existing step deadlines report the bounded search failure.
-    const auto* target = shotItem(label, false, window);
+    const auto* target = exact ? exact : shotItem(label, false, window);
     const nlohmann::json* pane = nullptr;
     size_t depth = 0;
     for (const auto& w : ui::audit::observedWindows()) {
@@ -1142,6 +1379,9 @@ void shotScrollTo(const char* label, const char* window = nullptr, bool frameWho
             const auto& owner = (*target)["window"].get_ref<const std::string&>();
             if (owner != name && (owner.size() <= name.size() ||
                 owner.compare(0, name.size(), name) != 0 || owner[name.size()] != '/')) continue;
+        } else if (window && (name.find(window) != std::string::npos ||
+                   (std::strstr(window, "##ai_") && name.find("##ai_sub_body") != std::string::npos))) {
+            // Scan the requested editor or its Settings scroll body for unsubmitted controls.
         } else if (name.find("SimulationManager") == std::string::npos &&
                    name.find("Firmware") == std::string::npos &&
                    name.find("firmware") == std::string::npos) continue;
@@ -1653,7 +1893,7 @@ bool demoReviewEndFrame(AppState& st, int dw, int dh, const char* screenshotPath
         D.capture.clear();
         D.captureWait = 0;
     }
-    glfwSwapBuffers(st.win);
+    swapScenarioFrame(st.win);
     breakLoop = false;
     if (D.done && D.capture.empty()) {
         const std::string path = D.dir + "/demoreview_report.json";
@@ -1665,6 +1905,7 @@ bool demoReviewEndFrame(AppState& st, int dw, int dh, const char* screenshotPath
         std::fflush(stdout);
         if (D.failed || !out) {
             std::fflush(nullptr);
+            core::framestats::flushReport();
             std::_Exit(EXIT_FAILURE);
         }
         breakLoop = true;
@@ -2021,7 +2262,7 @@ bool dwgOpenEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, b
         D.capture.clear();
         D.captureWait = 0;
     }
-    glfwSwapBuffers(st.win);
+    swapScenarioFrame(st.win);
     breakLoop = false;
     if (D.done && D.capture.empty()) {
         const std::string path = D.dir + "/dwgopen_report.json";
@@ -2033,6 +2274,212 @@ bool dwgOpenEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, b
         std::fflush(stdout);
         if (D.failed || !out) {
             std::fflush(nullptr);
+            core::framestats::flushReport();
+            std::_Exit(EXIT_FAILURE);
+        }
+        breakLoop = true;
+    }
+    return true;
+}
+
+// ---------- exploded-view scenario (CHUDWARE_SHOT=explode) ----------
+// Opens $CHUDWARE_SHOT_DOC (an assembly, opened in place: point it at a scratch copy) and the
+// Exploded View form, drags the factor slider to 0.6 and releases, then eases to exploded and back
+// with the Collapse/Exploded buttons' animation path. Proves a slider drag slides parts on GPU
+// body offsets with no engine round trip, that one release bakes the gesture (the baked mesh
+// replaces the offsets), and that the camera framing never moves. Captures collapsed / drag
+// preview / baked / exploded / collapsed again plus explode_report.json beside --ui-screenshot;
+// exits non-zero on failure.
+struct ExplodeShot {
+    bool init = false, want = false, done = false, failed = false;
+    int step = 0, settle = 0, captureWait = 0, shotNo = 0;
+    double started = 0.0, stepStart = 0.0;
+    std::string dir, capture, pendingShot;
+    Vec3 center0;
+    nlohmann::json report;
+};
+ExplodeShot g_explode;
+
+void explodeFail(const std::string& code, const nlohmann::json& evidence) {
+    auto& E = g_explode;
+    std::printf("explode: FAILED [%s] %s\n", code.c_str(), evidence.dump().c_str());
+    std::fflush(stdout);
+    E.report["ok"] = false;
+    E.report["failure"] = {{"code", code}, {"evidence", evidence}, {"step", E.step}};
+    E.failed = E.done = true;
+    E.capture = E.dir + "/explode_FAILED.png";
+}
+
+void explodeTick(AppState& st) {
+    auto& E = g_explode;
+    if (!E.init) {
+        E.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        E.want = st.shot && mode && std::strcmp(mode, "explode") == 0;
+        if (!E.want) return;
+        E.started = E.stepStart = pipingNow();
+        E.report = {{"scenario", "explode"}, {"ok", false}, {"captures", nlohmann::json::array()},
+                    {"checks", nlohmann::json::array()}};
+    }
+    if (!E.want || E.done || E.dir.empty() || !st.asmPanels || !st.renderer) return;
+    if (pipingNow() - E.started > 900 || pipingNow() - E.stepStart > 300) {
+        explodeFail("timeout", {{"seconds", pipingNow() - E.started}}); return;
+    }
+    if (!st.workerStarted || st.frame < 5 || !E.capture.empty()) return;
+    if (E.settle > 0) { --E.settle; return; }
+    if (!E.pendingShot.empty()) {  // let the requested state render before capturing it
+        E.capture = E.pendingShot;
+        E.pendingShot.clear();
+        return;
+    }
+    ui::AsmPanels& ap = *st.asmPanels;
+    Renderer& r = *st.renderer;
+    auto next = [&](int step) { E.step = step; E.stepStart = pipingNow(); };
+    auto shoot = [&](const char* name) {
+        char file[64];
+        std::snprintf(file, sizeof file, "/explode_%02d_%s.png", ++E.shotNo, name);
+        E.pendingShot = E.dir + file;
+        E.settle = 15;
+    };
+    auto check = [&](const std::string& name, bool ok, const nlohmann::json& evidence) {
+        E.report["checks"].push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
+        std::printf("explode: %s %s\n", ok ? "PASS" : "FAIL", name.c_str());
+        std::fflush(stdout);
+        if (!ok) explodeFail(name, evidence);
+        return ok;
+    };
+    auto idle = [&] { return !st.rpc.busy() && st.rebuildsInFlight == 0 && !ui::cameraAnimating(); };
+    auto settled = [&] { return idle() && !ap.explodeAnimating() && !r.hasBodyOffsets(); };
+    auto centerJson = [&] {
+        const Vec3 c = r.modelCenter();
+        return nlohmann::json::array({c.x, c.y, c.z});
+    };
+    switch (E.step) {
+    case 0: {
+        const char* doc = std::getenv("CHUDWARE_SHOT_DOC");
+        std::error_code ec;
+        if (!doc || !*doc || !std::filesystem::is_regular_file(doc, ec)) {
+            explodeFail("no_doc", {{"path", doc ? doc : ""}}); return;
+        }
+        E.report["doc"] = doc;
+        st.requestOpenPath = doc;
+        next(1);
+        return;
+    }
+    case 1: {  // the assembly is active and meshed
+        if (!st.docMirror.hasDoc() || !st.hasDocMesh || !idle()) return;
+        st.yaw = 35.0f; st.pitch = 24.0f;
+        E.center0 = r.modelCenter();
+        E.report["center_collapsed"] = centerJson();
+        shoot("collapsed");
+        next(2);
+        return;
+    }
+    case 2:
+        ap.handleCommand(st, "asm_explode");
+        next(3);
+        return;
+    case 3: {  // vectors arrived; drag the slider to 0.6 (GPU preview, no engine call)
+        if (!idle()) return;
+        if (!check("vectors", ap.explodeComponentCount() > 0,
+                   {{"components", ap.explodeComponentCount()}})) return;
+        E.report["components"] = ap.explodeComponentCount();
+        E.report["mesh_generation_before"] = r.meshGeneration();
+        ap.previewExplode(0.6f);
+        next(4);
+        return;
+    }
+    case 4: {  // mid-drag: GPU offsets live, no engine call, picking held off
+        if (!r.hasBodyOffsets()) return;
+        if (!check("gpu_drag_without_rpc", !st.rpc.busy(), {{"rpc_busy", st.rpc.busy()}})) return;
+        shoot("drag_preview_060");
+        next(5);
+        return;
+    }
+    case 5:  // release: one bake for the whole gesture
+        ap.releaseExplode(st);
+        next(6);
+        return;
+    case 6: {  // settled: the baked mesh replaced the offsets and framing never moved
+        if (!settled()) return;
+        const Vec3 c = r.modelCenter();
+        E.report["center_after_release"] = centerJson();
+        if (!check("baked_mesh_uploaded",
+                   r.meshGeneration() != E.report["mesh_generation_before"].get<uint64_t>(),
+                   {{"generation", r.meshGeneration()}})) return;
+        if (!check("framing_held", c.x == E.center0.x && c.y == E.center0.y && c.z == E.center0.z,
+                   {{"before", E.report["center_collapsed"]},
+                    {"after", E.report["center_after_release"]}}))
+            return;
+        shoot("baked_060");
+        next(7);
+        return;
+    }
+    case 7:
+        ap.animateExplodeTo(st, 1.0f);
+        next(8);
+        return;
+    case 8:
+        if (!settled()) return;
+        shoot("exploded");
+        next(9);
+        return;
+    case 9:
+        ap.animateExplodeTo(st, 0.0f);
+        next(10);
+        return;
+    case 10: {
+        if (!settled()) return;
+        const Vec3 c = r.modelCenter();
+        if (!check("framing_held_collapsed",
+                   c.x == E.center0.x && c.y == E.center0.y && c.z == E.center0.z,
+                   {{"after", centerJson()}})) return;
+        shoot("collapsed_again");
+        next(11);
+        return;
+    }
+    case 11:
+        E.report["ok"] = true;
+        E.done = true;
+        return;
+    default:
+        return;
+    }
+}
+
+bool explodeEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, bool& breakLoop) {
+    auto& E = g_explode;
+    if (!E.want) return false;
+    ++st.frame;
+    if (E.dir.empty()) {
+        const std::filesystem::path shot = screenshotPath && *screenshotPath ? screenshotPath : "";
+        const char* repo = std::getenv("CHUDWARE_REPO");
+        E.dir = shot.has_parent_path() ? shot.parent_path().string()
+                                       : std::string(repo ? repo : ".") + "/scratch/explode_shots";
+        std::error_code ec;
+        std::filesystem::create_directories(E.dir, ec);
+    }
+    if (!E.capture.empty() && (!st.rpc.busy() || ++E.captureWait > 600)) {
+        writeBackbufferPng(E.capture.c_str(), dw, dh, E.done ? screenshotPath : nullptr);
+        std::printf("explode: screenshot -> %s (%dx%d)\n", E.capture.c_str(), dw, dh);
+        std::fflush(stdout);
+        E.report["captures"].push_back(E.capture);
+        E.capture.clear();
+        E.captureWait = 0;
+    }
+    swapScenarioFrame(st.win);
+    breakLoop = false;
+    if (E.done && E.capture.empty()) {
+        const std::string path = E.dir + "/explode_report.json";
+        E.report["seconds"] = pipingNow() - E.started;
+        std::ofstream out(path, std::ios::trunc);
+        out << E.report.dump(2) << '\n';
+        out.close();
+        std::printf("explode: report -> %s ok=%d\n", path.c_str(), (int)E.report.value("ok", false));
+        std::fflush(stdout);
+        if (E.failed || !out) {
+            std::fflush(nullptr);
+            core::framestats::flushReport();
             std::_Exit(EXIT_FAILURE);
         }
         breakLoop = true;
@@ -2413,7 +2860,7 @@ bool projectChatEndFrame(AppState& st, int dw, int dh, const char* screenshotPat
         P.capture.clear();
         P.captureWait = 0;
     }
-    glfwSwapBuffers(st.win);
+    swapScenarioFrame(st.win);
     breakLoop = false;
     if (P.done && P.capture.empty()) {
         const std::string path = P.dir + "/projectchat_report.json";
@@ -2425,8 +2872,483 @@ bool projectChatEndFrame(AppState& st, int dw, int dh, const char* screenshotPat
         std::fflush(stdout);
         if (P.failed || !out) {
             std::fflush(nullptr);
+            core::framestats::flushReport();
             std::_Exit(EXIT_FAILURE);
         }
+        breakLoop = true;
+    }
+    return true;
+}
+
+// Drive the real per-conversation event/result drain without a provider. The injected
+// envelopes are the translated OMP manual_compaction_start/end and context_update frames.
+struct CompactUiShot {
+    bool init = false, want = false, done = false, failed = false, baseline = false;
+    int step = 0, settle = 0, owner = -1;
+    double started = 0;
+    std::string dir, capture, queued, ownerId;
+    nlohmann::json checks = nlohmann::json::array();
+} g_compactUi;
+
+void compactUiCheck(const char* name, bool ok, const nlohmann::json& evidence = {}) {
+    auto& p = g_compactUi;
+    p.checks.push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
+    std::printf("compact_ui: %s %s %s\n", ok ? "PASS" : "FAIL", name, evidence.dump().c_str());
+    std::fflush(stdout);
+    if (!ok) p.failed = true;
+}
+
+void compactUiTick(AppState& st) {
+    auto& p = g_compactUi;
+    if (!p.init) {
+        p.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        p.want = st.shot && mode && std::strcmp(mode, "compact_ui") == 0;
+        if (!p.want) return;
+        const char* dir = std::getenv("CHUDWARE_COMPACT_UI_OUT");
+        p.dir = dir ? dir : "scratch/compact_ui_shots";
+        p.baseline = std::getenv("CHUDWARE_COMPACT_UI_BASELINE") != nullptr;
+        std::filesystem::create_directories(p.dir);
+        p.started = pipingNow();
+    }
+    if (!p.want || p.done) return;
+    if (pipingNow() - p.started > 120) {
+        compactUiCheck("timeout", false, {{"step", p.step}});
+        p.done = true;
+        p.capture = p.dir + "/timeout.png";
+        return;
+    }
+    if (!st.workerStarted || st.frame < 5 || !p.capture.empty()) return;
+    ui::audit::observedItems();
+    st.showAIPanel = true;
+    st.activeWorkspace = AppState::Workspace::Model;
+    if (p.settle > 0) { --p.settle; return; }
+    if (!p.queued.empty()) { p.capture = p.queued; p.queued.clear(); return; }
+    auto next = [&](int step, const char* image = nullptr) {
+        p.step = step;
+        p.settle = 8;
+        if (image) p.queued = p.dir + "/" + image + ".png";
+    };
+    auto event = [&](JobState& job, const char* kind, nlohmann::json data,
+                     const std::string& notes = std::string()) {
+        std::lock_guard<std::mutex> lk(job.evMtx);
+        job.events.push_back({std::string("orch_") + kind, notes,
+                              std::make_shared<const nlohmann::json>(std::move(data))});
+    };
+    auto start = [&]() -> JobState& {
+        ui::composerSetText(st, "");
+        ChatMsg m;
+        m.running = true;
+        m.compactionRun = true;
+        m.liveStatus = "Compacting context\xe2\x80\xa6";
+        st.chat.push_back(std::move(m));
+        auto run = st.activeRun();
+        run->isCompaction = true;
+        run->compactionTurn = nlohmann::json::object();
+        run->compactionCommand = "/compact summary keep the dimensions";
+        run->convId = st.activeConvId();
+        run->docKey = st.chatDocKey;
+        run->runId = "compact-ui";
+        run->error.clear();
+        run->errorDetail.clear();
+        run->stopReason.clear();
+        run->stopRequested = false;
+        run->ready = false;
+        run->running = true;
+        st.agentV2Running = true;
+        st.status = "Compacting context...";
+        st.livePhase = "Compacting context\xe2\x80\xa6";
+        return *run;
+    };
+    auto startEvent = [&](JobState& job) {
+        event(job, "sub_run", {{"id", "compaction:compact-ui"}, {"purpose", "Compacting context"},
+                               {"status", "running"}});
+    };
+    auto finish = [&](JobState& job, const std::string& outcome, bool stream) {
+        nlohmann::json comp = {{"method", "soft"}, {"tokensBefore", 150000}, {"tokensAfter", 22000},
+                               {"tokensBeforeEstimated", false}, {"tokensAfterEstimated", true}};
+        if (stream) {
+            const std::string title = outcome == "committed"
+                ? "Context compacted (150.0k to ~22.0k tokens)"
+                : outcome == "cancelled" ? "Context compaction cancelled"
+                : outcome == "skipped" ? "Context compaction skipped" : "Context compaction failed";
+            if (outcome == "committed")
+                event(job, "agent.context", {{"used", 22000}, {"source", "estimate"}});
+            event(job, "sub_run", {{"id", "compaction:compact-ui"}, {"purpose", title},
+                                   {"status", outcome == "committed" ? "done"
+                                                  : outcome == "failed" ? "fail" : outcome}});
+            event(job, "run_finished", {{"status", outcome == "committed" ? "done" : outcome}});
+        }
+        job.compactionTurn = {{"outcome", outcome}};
+        if (outcome == "committed") job.compactionTurn["compaction"] = std::move(comp);
+        if (outcome == "failed") job.errorDetail = stream ? "Provider request failed" : "worker_lane_busy";
+        job.running = false;
+        job.ready = true;
+    };
+    auto snapshot = [&](const ChatMsg& m) {
+        nlohmann::json rows = nlohmann::json::array();
+        for (const auto& a : m.activity)
+            rows.push_back({{"title", a.title}, {"status", a.status}, {"stage", a.stage}});
+        return nlohmann::json{{"running", m.running}, {"compaction", m.compactionRun},
+                              {"text", m.text}, {"rows", rows}, {"status", st.status},
+                              {"phase", st.livePhase}, {"tokens", st.lastContextTokens},
+                              {"draft", ui::composerText(st)}};
+    };
+    switch (p.step) {
+    case 0: {
+        glfwSetWindowSize(st.win, 1280, 1000);
+        ui::ensureConversations(st);
+        st.chat.clear();
+        ChatMsg user; user.fromUser = true; user.text = "Keep the mounting holes and dimensions.";
+        st.chat.push_back(std::move(user));
+        ChatMsg answer; answer.text = "The mounting holes are preserved.";
+        st.chat.push_back(std::move(answer));
+        st.designStarted = true;
+        st.settings.contextWindow = 200000;
+        st.lastContextTokens = 150000;
+        st.lastContextWindow = 1000000;
+        st.lastContextWindowSource = "probe";
+        p.owner = st.activeConv;
+        p.ownerId = st.activeConvId();
+        JobState& job = start();
+        startEvent(job);
+        next(1, "01_running");
+        break;
+    }
+    case 1: {
+        auto& m = st.chat.back();
+        compactUiCheck("running_row_is_live", m.running && m.activity.size() == 1 &&
+                       m.activity[0].status == "running", snapshot(m));
+        ui::submitTurn(st, "Please continue after compaction.");
+        compactUiCheck("followup_is_queued_not_steered",
+                       st.queuedPrompts.size() == 1 &&
+                       st.queuedPrompts[0] == "Please continue after compaction.",
+                       {{"queued", st.queuedPrompts}});
+        st.queuedPrompts.clear();
+        st.queuedPromptDrafts.clear();
+        auto& job = *st.activeRun();
+        event(job, "agent.context", {{"used", 22000}, {"source", "estimate"}});
+        event(job, "sub_run", {{"id", "compaction:compact-ui"},
+                               {"purpose", "Context compacted (150.0k to ~22.0k tokens)"},
+                               {"status", "done"}});
+        event(job, "run_finished", {{"status", "done"}});
+        next(101, "01a_waiting_for_receipt");
+        break;
+    }
+    case 101: {
+        auto& m = st.chat.back();
+        compactUiCheck("terminal_stream_waits_for_receipt",
+                       m.running && m.text.empty() && !m.activity.empty() &&
+                       m.activity[0].status == "done", snapshot(m));
+        finish(*st.activeRun(), "committed", false);
+        next(2, "02_committed");
+        break;
+    }
+    case 2: {
+        auto& m = st.chat.back();
+        compactUiCheck("commit_has_one_notice_and_exact_meter",
+                       !m.running && m.compactionRun && m.activity.size() == 1 &&
+                       m.activity[0].status == "done" && m.text.find("Context compacted") == 0 &&
+                       st.lastContextTokens == -22002 && st.livePhase.empty(), snapshot(m));
+        int visibleNotices = 0;
+        bool noticeFits = false;
+        for (const auto& item : ui::audit::observedItems()) {
+            if (item.value("label", std::string()) != m.text || !item.value("visible", false))
+                continue;
+            ++visibleNotices;
+            const auto& r = item["full_rect"];
+            const auto& clip = item["clip"];
+            noticeFits = r[2].get<float>() <= clip[2].get<float>() + 1.0f &&
+                         r[3].get<float>() <= clip[3].get<float>() + 1.0f;
+        }
+        compactUiCheck("one_wrapped_maintenance_notice", visibleNotices == 1 && noticeFits &&
+                       m.text.find(" to ") != std::string::npos &&
+                       m.text.find("\xe2\x86\x92") == std::string::npos,
+                       {{"visible", visibleNotices}, {"fits", noticeFits}, {"text", m.text}});
+        ui::persistChatHistory(st);
+        ui::loadChatHistory(st);
+        next(3, "03_reloaded");
+        break;
+    }
+    case 3: {
+        auto& m = st.chat.back();
+        compactUiCheck("reload_keeps_maintenance_identity", m.compactionRun &&
+                       !m.running && m.text.find("Context compacted") == 0 &&
+                       st.lastContextTokens == -22002, snapshot(m));
+        JobState& job = start();
+        finish(job, "failed", false);
+        next(4, "04_busy_refusal");
+        break;
+    }
+    case 4: {
+        auto& m = st.chat.back();
+        compactUiCheck("busy_failure_restores_command", !m.running &&
+                       m.text.find("Couldn't compact") == 0 &&
+                       m.text.find("worker_lane_busy") == std::string::npos &&
+                       ui::composerText(st) == "/compact summary keep the dimensions" &&
+                       st.livePhase.empty(), snapshot(m));
+        JobState& job = start();
+        startEvent(job);
+        next(5);
+        break;
+    }
+    case 5:
+        finish(*st.activeRun(), "failed", true);
+        next(6, "05_provider_failure");
+        break;
+    case 6: {
+        auto& m = st.chat.back();
+        compactUiCheck("provider_failure_settles", !m.running && !m.activity.empty() &&
+                       m.activity[0].status == "fail" && m.text.find("Provider request failed") != std::string::npos,
+                       snapshot(m));
+        JobState& job = start();
+        startEvent(job);
+        next(7);
+        break;
+    }
+    case 7:
+        // No IPC is sent: this shot's synthetic job is not a worker-owned run.
+        st.workerStarted = false;
+        ui::requestStopRun(st);
+        st.workerStarted = true;
+        next(8, "06_stopping");
+        break;
+    case 8:
+        compactUiCheck("stop_waits_for_real_receipt", st.chat.back().running &&
+                       st.activeRun()->stopRequested.load() &&
+                       st.chat.back().liveStatus == "Stopping compaction\xe2\x80\xa6",
+                       snapshot(st.chat.back()));
+        finish(*st.activeRun(), "cancelled", true);
+        next(9, "07_stopped");
+        break;
+    case 9: {
+        auto& m = st.chat.back();
+        compactUiCheck("stop_settles_without_spinning", !m.running && !m.activity.empty() &&
+                       m.activity[0].status != "running" && m.text == "Compaction stopped." &&
+                       st.livePhase.empty(), snapshot(m));
+        JobState& job = start();
+        startEvent(job);
+        next(10);
+        break;
+    }
+    case 10:
+        finish(*st.activeRun(), "skipped", true);
+        next(11, "08_skipped");
+        break;
+    case 11: {
+        auto& m = st.chat.back();
+        compactUiCheck("skipped_settles_truthfully", !m.running && !m.activity.empty() &&
+                       m.activity[0].status == "skipped" && m.text.find("skipped") != std::string::npos,
+                       snapshot(m));
+        JobState& job = start();
+        startEvent(job);
+        ui::newConversation(st);
+        ChatMsg u; u.fromUser = true; u.text = "This is another conversation.";
+        st.chat.push_back(std::move(u));
+        compactUiCheck("switch_clears_foreign_compaction_status",
+                       st.livePhase.empty() && st.status != "Compacting context...",
+                       {{"status", st.status}, {"phase", st.livePhase}});
+        compactUiCheck("fresh_conversation_does_not_inherit_context_window",
+                       st.lastContextWindow == 0 && st.lastContextWindowSource.empty(),
+                       {{"window", st.lastContextWindow}, {"source", st.lastContextWindowSource}});
+        st.lastContextWindow = 200000;
+        st.lastContextWindowSource = "catalog";
+        if (std::getenv("CHUDWARE_COMPACT_UI_FAKE_WORKER")) {
+            ui::submitTurn(st, "/compact snapcompact");
+            auto* own = st.runIfExists(st.activeConvId());
+            const bool launched = own && own->running.load() && own->isCompaction &&
+                                  st.chat.back().compactionRun;
+            compactUiCheck("compact_admitted_while_other_conversation_runs", launched,
+                           {{"launched", launched}, {"other_running", st.convRunning(p.ownerId)}});
+            if (launched) ui::requestStopRun(st);
+            next(110, "09a_admission");
+            break;
+        }
+        st.status = "Other conversation is working.";
+        st.statusKind = 2;
+        st.livePhase = "Other work";
+        next(12, "09_background");
+        break;
+    }
+    case 110: {
+        const auto* own = st.runIfExists(st.activeConvId());
+        if (own && (own->running.load() || own->ready.load())) return;
+        st.status = "Other conversation is working.";
+        st.statusKind = 2;
+        st.livePhase = "Other work";
+        next(12, "09_background");
+        break;
+    }
+    case 12: {
+        auto* job = st.runIfExists(p.ownerId);
+        st.agentV2Status = "Visible conversation status";
+        event(*job, "provider_call", {{"provider", "fixture"}, {"model", "fixture"}},
+              "Background provider work");
+        next(120);
+        break;
+    }
+    case 120: {
+        compactUiCheck("background_event_preserves_visible_agent_status",
+                       st.agentV2Status == "Visible conversation status",
+                       {{"agent_status", st.agentV2Status}});
+        auto* job = st.runIfExists(p.ownerId);
+        finish(*job, "committed", true);
+        next(13);
+        break;
+    }
+    case 13: {
+        compactUiCheck("background_completion_preserves_visible_status",
+                       st.status == "Other conversation is working." && st.statusKind == 2 &&
+                       st.livePhase == "Other work" && st.agentV2Status == "Visible conversation status",
+                       {{"status", st.status}, {"status_kind", st.statusKind}, {"phase", st.livePhase},
+                        {"agent_status", st.agentV2Status}});
+        const bool selection = st.activeConvId() != p.ownerId;
+        ui::switchConversation(st, p.owner);
+        compactUiCheck("background_return_does_not_show_other_conversation_status",
+                       st.status == "Context compacted." && st.statusKind == 0 &&
+                       st.livePhase.empty() && st.agentV2Status.empty(),
+                       {{"status", st.status}, {"status_kind", st.statusKind}, {"phase", st.livePhase},
+                        {"agent_status", st.agentV2Status}});
+        compactUiCheck("owner_context_window_restored_after_switch",
+                       st.lastContextWindow == 1000000 && st.lastContextWindowSource == "probe",
+                       {{"window", st.lastContextWindow}, {"source", st.lastContextWindowSource}});
+        auto& m = st.chat.back();
+        compactUiCheck("background_commit_owns_its_result", selection && st.activeConvId() == p.ownerId &&
+                       m.compactionRun && !m.running && st.lastContextTokens == -22002,
+                       snapshot(m));
+        ChatMsg pending;
+        pending.running = true;
+        st.chat.push_back(std::move(pending));
+        auto job = st.activeRun();
+        job->isCompaction = false;
+        job->convId = p.ownerId;
+        job->runId = "background-normal";
+        job->error.clear();
+        job->errorDetail.clear();
+        job->stopReason = "cancelled";
+        job->ready = false;
+        job->running = true;
+        ui::newConversation(st);
+        ChatMsg other;
+        other.fromUser = true;
+        other.text = "Another conversation on the same document.";
+        st.chat.push_back(std::move(other));
+        st.status = "Visible normal status";
+        st.statusKind = 2;
+        st.livePhase = "Visible normal phase";
+        st.agentV2Status = "Visible normal agent status";
+        job->docKey = st.chatDocKey;
+        job->stopRequested = true;
+        job->running = false;
+        job->ready = true;
+        next(130, "10_background_return");
+        break;
+    }
+    case 130: {
+        compactUiCheck("background_normal_completion_preserves_visible_status",
+                       st.status == "Visible normal status" && st.statusKind == 2 &&
+                       st.livePhase == "Visible normal phase" &&
+                       st.agentV2Status == "Visible normal agent status",
+                       {{"status", st.status}, {"status_kind", st.statusKind}, {"phase", st.livePhase},
+                        {"agent_status", st.agentV2Status}, {"doc_key", st.chatDocKey}});
+        ui::switchConversation(st, p.owner);
+        compactUiCheck("background_normal_completion_updates_own_status",
+                       st.status == "Stopped." && st.statusKind == 1 &&
+                       st.livePhase.empty() && st.agentV2Status.empty(),
+                       {{"status", st.status}, {"status_kind", st.statusKind}, {"phase", st.livePhase},
+                        {"agent_status", st.agentV2Status}});
+        next(14);
+        break;
+    }
+    case 14: {
+        JobState& job = start();
+        startEvent(job);
+        ui::newConversation(st);
+        ChatMsg user; user.fromUser = true; user.text = "Keep this selection.";
+        st.chat.push_back(std::move(user));
+        ui::composerSetText(st, "A different draft");
+        finish(job, "failed", false);
+        next(15);
+        break;
+    }
+    case 15: {
+        compactUiCheck("background_failure_does_not_change_selection_or_draft",
+                       st.activeConvId() != p.ownerId && ui::composerText(st) == "A different draft",
+                       {{"active", st.activeConvId()}, {"draft", ui::composerText(st)}});
+        ui::switchConversation(st, p.owner);
+        compactUiCheck("background_failure_restores_own_command",
+                       ui::composerText(st) == "/compact summary keep the dimensions",
+                       snapshot(st.chat.back()));
+        next(16, "12_background_failure");
+        break;
+    }
+    case 16: {
+        ui::composerSetText(st, "");
+        ui::newConversation(st);
+        ChatMsg a; a.fromUser = true; a.text = "Earlier request";
+        st.chat.push_back(std::move(a));
+        ChatMsg b; b.text = "Earlier response";
+        st.chat.push_back(std::move(b));
+        p.owner = st.activeConv;
+        p.ownerId = st.activeConvId();
+        next(18);
+        break;
+    }
+    case 18: {
+        JobState& job = start();
+        startEvent(job);
+        next(19);
+        break;
+    }
+    case 19: {
+        ui::persistChatHistory(st);
+        st.activeRun()->running = false;
+        // Simulate the fresh process's chrome as well as its detached job state.
+        st.status = "Ready.";
+        st.livePhase.clear();
+        ui::loadChatHistory(st);
+        compactUiCheck("interrupted_compaction_reload_is_unknown_not_answer",
+                       st.chat.back().compactionRun && !st.chat.back().running &&
+                       st.chat.back().text.find("result is unknown") != std::string::npos &&
+                       st.lastContextTokens == -1, snapshot(st.chat.back()));
+        next(20, "15_interrupted_reload");
+        break;
+    }
+    case 20: {
+        JobState& job = start();
+        startEvent(job);
+        finish(job, "committed", false);
+        job.compactionTurn["compaction"]["tokensAfter"] = 0;
+        job.compactionTurn["compaction"]["tokensAfterEstimated"] = false;
+        next(21, "16_measured_zero");
+        break;
+    }
+    case 21:
+        compactUiCheck("committed_zero_is_not_reestimated",
+                       st.lastContextTokens == std::numeric_limits<int>::min() && !st.chat.back().running,
+                       snapshot(st.chat.back()));
+        p.done = true;
+        p.capture = p.dir + "/17_final.png";
+        break;
+    }
+}
+
+bool compactUiEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, bool& breakLoop) {
+    auto& p = g_compactUi;
+    if (!p.want) return false;
+    ++st.frame;
+    if (!p.capture.empty()) {
+        writeBackbufferPng(p.capture.c_str(), dw, dh, p.done ? screenshotPath : nullptr);
+        std::printf("compact_ui: screenshot -> %s\n", p.capture.c_str());
+        p.capture.clear();
+    }
+    swapScenarioFrame(st.win);
+    breakLoop = false;
+    if (p.done) {
+        std::ofstream out(p.dir + "/report.json");
+        out << nlohmann::json({{"ok", !p.failed}, {"checks", p.checks}}).dump(2) << '\n';
+        out.close();
+        if ((p.failed && !p.baseline) || !out) { std::fflush(nullptr); std::_Exit(EXIT_FAILURE); }
         breakLoop = true;
     }
     return true;
@@ -2437,7 +3359,8 @@ bool projectChatEndFrame(AppState& st, int dw, int dh, const char* screenshotPat
 // delivered moves its bubble, late queued/failed/carried responses never move it back, and
 // the run's end fails what it never confirmed. Resolved asks recover exact text-only replies
 // on a real persistence/reload; ambiguous, unrelated, cross-turn and image replies stay honest.
-// Live and restored pre-marker question cards both draw where the agent asked.
+// Live and restored pre-marker question cards both draw where the agent asked; a question still
+// open when the app closed asks again with the user's draft.
 // Captures + steerstatus_report.json land in
 // scratch/steerstatus_shots; a failure exits non-zero. Run with a private HOME/XDG_DATA_HOME
 // (gate.sh shot_env) — the seeded chat is persisted like any other.
@@ -2637,6 +3560,15 @@ void steerStatusTick(AppState& st) {
         asked.asks.push_back(resolved("b-recover", "Use command strips outdoors."));
         asked.asks.push_back(resolved("b-images", "Use the four holes [Image #1]."));
         asked.asks.push_back(resolved("b-ambiguous", "PETG"));
+        // Open when the app closed: it must come back asking, with what the user had entered.
+        AskBatch open = askBatchFromEvent(
+            {{"batch_id", "b-open"}, {"run_id", "run-gone"},
+             {"questions", {{{"id", "mount"}, {"kind", "choice"}, {"prompt", "Which mount?"},
+                             {"options", {"Command strips", "Screws"}}, {"suggested", "Screws"}},
+                            {{"id", "note"}, {"kind", "text"}, {"prompt", "Anything else?"}}}}});
+        open.questions[0].choice = 0;
+        askBufSet(open.questions[1].textBuf, "Keep it under 40 g");
+        asked.asks.push_back(std::move(open));
         st.chat.push_back(std::move(asked));
         user("Use command strips outdoors.", "s-resolved", STEER_FAILED);
         user("Keep it stealthy.", "s-unconfirmed", STEER_QUEUED);
@@ -2654,6 +3586,16 @@ void steerStatusTick(AppState& st) {
                             st.chat.size() == count && st.chat[1].text ==
                                 "Checking the mount; this thought must survive recovery.",
                         {{"state", steerStateOf(st, "s-resolved")}, {"messages", st.chat.size()}}))
+            return;
+        const AskBatch* reopened = nullptr;
+        for (const AskBatch& b : st.chat[1].asks)
+            if (b.batchId == "b-open") reopened = &b;
+        if (!steerCheck("open_question_asks_again_with_draft_after_restart",
+                        reopened && reopened->status == AskStatus::Pending &&
+                            reopened->questions[0].choice == 0 &&
+                            askBufStr(reopened->questions[1].textBuf) == "Keep it under 40 g",
+                        {{"found", reopened != nullptr},
+                         {"status", reopened ? askStatusName(reopened->status) : ""}}))
             return;
         if (!steerCheck("reload_keeps_unknown_images_ambiguous_and_other_turn_unread",
                         steerStateOf(st, "s-unconfirmed") == STEER_FAILED &&
@@ -2685,15 +3627,86 @@ void steerStatusTick(AppState& st) {
                             st.chat[1].asks.back().status == AskStatus::Reply,
                         {{"state", steerStateOf(st, "s-unconfirmed")}}))
             return;
+        P.queued = P.dir + "/steerstatus_04_recovered.png";
         P.settle = 8;
         P.step = 5;
         return;
     }
-    case 5:
+    case 5: {
+        // A steer the agent has not read stays pinned under the live turn instead of sitting in
+        // the transcript; a queued message waits below it, with its draft.
+        st.chat.clear();
+        st.queuedPrompts.clear();
+        st.queuedPromptDrafts.clear();
+        user("Redesign the turret base for one MG996R.", nullptr, STEER_NONE);
+        ChatMsg live;
+        live.running = true;
+        live.text = "Checking the carrier before the next write.";
+        live.liveStatus = "Running write";
+        st.chat.push_back(std::move(live));
+        user("Add a roof too.", "s-pin-a", STEER_SENDING);
+        user("And make it PETG.", "s-pin-b", STEER_QUEUED);
+        st.queuedPrompts.push_back("Then print it at 0.2 mm layers.");
+        st.queuedPromptDrafts.push_back({{"attachments", nlohmann::json::array({"/tmp/pin_ref.png"})},
+                                         {"inline_images", nlohmann::json::array()},
+                                         {"context_refs", nlohmann::json::array()}});
+        if (!steerCheck("pending_steers_trail_the_live_turn",
+                        st.chat.size() == 4 && ::pendingSteerTail(st.chat) == 2 &&
+                            ui::aiTurnActive(st),
+                        {{"size", st.chat.size()}, {"tail", ::pendingSteerTail(st.chat)}}))
+            return;
+        P.queued = P.dir + "/steerstatus_05_pinned.png";
+        P.settle = 8;
+        P.step = 6;
+        return;
+    }
+    case 6: {
+        // The agent reads the first steer: it takes its place below the turn so far, a fresh
+        // live turn opens under it and the steer still unread stays pinned. A repeated delivery
+        // event places nothing.
+        const bool handled = ::feedSteerEvent(
+            st.chat, "agent.steer", {{"steer_id", "s-pin-a"}, {"status", "delivered"}});
+        const bool placed = ui::placeSteerInTranscript(st, st.chat, "s-pin-a");
+        const bool ordered = st.chat.size() == 5 && !st.chat[1].running && st.chat[1].steerSplit &&
+                             st.chat[2].steerId == "s-pin-a" &&
+                             st.chat[2].steerState == STEER_DELIVERED && !st.chat[3].fromUser &&
+                             st.chat[3].running && st.chat[4].steerId == "s-pin-b" &&
+                             ::pendingSteerTail(st.chat) == 4;
+        if (!steerCheck("read_steer_places_at_delivery_point_and_opens_live_turn",
+                        handled && placed && ordered,
+                        {{"handled", handled}, {"placed", placed}, {"size", st.chat.size()}}))
+            return;
+        const bool again = ui::placeSteerInTranscript(st, st.chat, "s-pin-a");
+        if (!steerCheck("repeated_delivery_places_nothing", !again && st.chat.size() == 5,
+                        {{"again", again}, {"size", st.chat.size()}}))
+            return;
+        P.queued = P.dir + "/steerstatus_06_placed.png";
+        P.settle = 8;
+        P.step = 7;
+        return;
+    }
+    case 7: {
+        // Cancel on a queued message hands it back to the composer, merged with what is already
+        // staged there: queued text first, a blank line, the existing text; attachments unioned.
+        ui::composerSetText(st, "Keep the wall 3 mm.");
+        st.pendingAttachments = {"/tmp/pin_other.png"};
+        ui::cancelQueuedPromptToComposer(st, 0);
+        const std::string composed = ui::composerText(st);
+        const bool merged = st.queuedPrompts.empty() && st.queuedPromptDrafts.empty() &&
+                            composed == "Then print it at 0.2 mm layers.\n\nKeep the wall 3 mm." &&
+                            st.pendingAttachments.size() == 2 &&
+                            st.pendingAttachments[0] == "/tmp/pin_ref.png" &&
+                            st.pendingAttachments[1] == "/tmp/pin_other.png";
+        ui::composerSetText(st, std::string());
+        st.pendingAttachments.clear();
+        if (!steerCheck("cancel_returns_queued_message_to_composer_merged", merged,
+                        {{"composer", composed}, {"queued", st.queuedPrompts.size()}}))
+            return;
         P.report["ok"] = true;
         P.done = true;
-        P.capture = P.dir + "/steerstatus_04_recovered.png";
+        P.capture = P.dir + "/steerstatus_07_cancelled.png";
         return;
+    }
     default:
         return;
     }
@@ -2710,7 +3723,7 @@ bool steerStatusEndFrame(AppState& st, int dw, int dh, const char* screenshotPat
         P.report["captures"].push_back(P.capture);
         P.capture.clear();
     }
-    glfwSwapBuffers(st.win);
+    swapScenarioFrame(st.win);
     breakLoop = false;
     if (P.done && P.capture.empty()) {
         const std::string path = P.dir + "/steerstatus_report.json";
@@ -2721,6 +3734,7 @@ bool steerStatusEndFrame(AppState& st, int dw, int dh, const char* screenshotPat
         std::fflush(stdout);
         if (P.failed || !out) {
             std::fflush(nullptr);
+            core::framestats::flushReport();
             std::_Exit(EXIT_FAILURE);
         }
         breakLoop = true;
@@ -2907,20 +3921,10 @@ void chatInlineTick(AppState& st) {
                 attachments[1].value("path", "") == P.paths[0] &&
                 request == "[Image #1] then [Image #2]",
                 {{"request", request}, {"attachments", attachments}})) return;
-        ui::composerSetText(st, "Unsent draft");
-        ui::beginEditStage(st, 0);
         next(11);
         break;
     }
     case 11: {
-        if (!chatInlineCheck("edit_restores_sent_references_and_exact_images",
-                st.pendingInlineImagePaths == P.paths &&
-                ui::composerText(st) == st.chat[0].text,
-                {{"text", ui::composerText(st)}, {"paths", st.pendingInlineImagePaths}})) return;
-        if (!chatInlineCheck("edit_cancel_restores_previous_draft",
-                ui::cancelEditStage(st) && ui::composerText(st) == "Unsent draft" &&
-                st.pendingInlineImagePaths.empty(),
-                {{"text", ui::composerText(st)}})) return;
         ui::composerSetText(st, "");
         ui::persistChatHistory(st);
         ui::loadChatHistory(st);
@@ -2998,25 +4002,380 @@ bool chatInlineEndFrame(AppState& st, int dw, int dh, const char* screenshotPath
         P.report["captures"].push_back(P.capture);
         P.capture.clear();
     }
-    glfwSwapBuffers(st.win);
+    swapScenarioFrame(st.win);
     breakLoop = P.done;
     if (P.done) {
         std::ofstream("scratch/chat_inline_shots/report.json") << P.report.dump(2) << '\n';
-        if (P.failed) { std::fflush(nullptr); std::_Exit(EXIT_FAILURE); }
+        if (P.failed) {
+            core::framestats::flushReport();
+            std::fflush(nullptr);
+            std::_Exit(EXIT_FAILURE);
+        }
     }
     return true;
 }
 
-// CHUDWARE_SHOT=agentlock: a real foreign write lands during an open human sketch.
-// The post-checkpoint human feature and foreign feature must both survive the keep-exit.
+// CHUDWARE_SHOT=composer_spell: the prompt box's spell check and word completion on the real
+// widget. A typo gets squiggled, a ghost completion appears after a word prefix and Tab takes
+// it, and the right-click menu's first correction replaces the typo in place. Then Up/Down
+// recall of sent slash commands and the draft kept by a refused /compact.
+struct ComposerSpellShot {
+    bool want = false, init = false, done = false, failed = false;
+    int step = 0, settle = 0, mousePhase = 0;
+    ImVec2 point;                 // click target, fixed for the whole press/release gesture
+    std::vector<ImGuiKey> keys;   // tapped one per press/release frame pair
+    int keyIndex = 0;
+    bool keyDown = false;
+    double started = 0;
+    std::string capture;
+    nlohmann::json report = {{"checks", nlohmann::json::array()}};
+} g_composerSpell;
+
+bool composerSpellCheck(const char* name, bool ok, const nlohmann::json& evidence) {
+    auto& P = g_composerSpell;
+    P.report["checks"].push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
+    std::printf("composer_spell: %s %s\n", ok ? "PASS" : "FAIL", name);
+    std::fflush(stdout);
+    if (!ok) {
+        P.failed = P.done = true;
+        P.capture = "scratch/composer_spell_shots/FAILED.png";
+    }
+    return ok;
+}
+
+void composerSpellTick(AppState& st) {
+    auto& P = g_composerSpell;
+    if (!P.init) {
+        P.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        P.want = st.shot && mode && std::strcmp(mode, "composer_spell") == 0;
+        P.started = pipingNow();
+    }
+    if (!P.want || P.done) return;
+    if (pipingNow() - P.started > 120) {
+        composerSpellCheck("timeout", false, {{"step", P.step}});
+        return;
+    }
+    if (!st.workerStarted || st.frame < 5 || !P.capture.empty()) return;
+    st.activeWorkspace = AppState::Workspace::AI;
+    ui::audit::observedItems();   // enable the real-item hooks for the prompt/menu rects
+    if (P.settle > 0) { --P.settle; return; }
+    ImGuiIO& io = ImGui::GetIO();
+    if (P.keyIndex < (int)P.keys.size()) {
+        io.AddKeyEvent(P.keys[P.keyIndex], !P.keyDown);
+        P.keyDown = !P.keyDown;
+        if (!P.keyDown) ++P.keyIndex;
+        return;
+    }
+    auto next = [&](int step, int settle = 6) { P.step = step; P.settle = settle; };
+    auto tap = [&](std::vector<ImGuiKey> k, int step) {
+        P.keys = std::move(k); P.keyIndex = 0; P.keyDown = false; next(step, 2);
+    };
+    static const std::string kTypo = "Make the bracekt thicker";
+    switch (P.step) {
+    case 0:
+        std::filesystem::create_directories("scratch/composer_spell_shots");
+        glfwSetWindowSize(st.win, 1340, 1000);
+        st.chat.clear();
+        st.designStarted = true;
+        ui::composerSetText(st, kTypo);   // also refocuses the box
+        next(1);
+        break;
+    case 1:
+        // A fresh widget state puts the caret at 0: Ctrl+End before typing the prefix.
+        P.capture = "scratch/composer_spell_shots/01_squiggle.png";
+        io.AddKeyEvent(ImGuiMod_Ctrl, true);
+        io.AddKeyEvent(ImGuiKey_End, true);
+        next(10, 0);
+        break;
+    case 10:
+        io.AddKeyEvent(ImGuiKey_End, false);
+        io.AddKeyEvent(ImGuiMod_Ctrl, false);
+        next(11, 1);
+        break;
+    case 11:
+        io.AddInputCharactersUTF8(" and chamf");
+        next(2);
+        break;
+    case 2:
+        if (!composerSpellCheck("ghost_completes_word_prefix", composerSpellGhost() == "er",
+                                {{"ghost", composerSpellGhost()}, {"text", ui::composerText(st)}}))
+            return;
+        P.capture = "scratch/composer_spell_shots/02_ghost.png";
+        next(3, 1);
+        break;
+    case 3:
+        io.AddKeyEvent(ImGuiKey_Tab, true);
+        next(4, 0);
+        break;
+    case 4:
+        io.AddKeyEvent(ImGuiKey_Tab, false);
+        next(5);
+        break;
+    case 5: {
+        const std::string text = ui::composerText(st);
+        if (!composerSpellCheck("tab_takes_completion_and_keeps_focus",
+                                text == kTypo + " and chamfer" &&
+                                    ImGui::GetActiveID() != 0 && composerSpellGhost().empty(),
+                                {{"text", text}, {"ghost", composerSpellGhost()}}))
+            return;
+        next(6);
+        break;
+    }
+    case 6: {
+        // Right-click the middle of "bracekt" on the real prompt item.
+        const nlohmann::json* prompt = nullptr;
+        for (const auto& item : ui::audit::observedItems())
+            if (item.value("label", "").find("##aiprompt") == 0 && item.value("visible", false)) {
+                prompt = &item;
+                break;
+            }
+        if (!prompt) return;
+        const auto& r = (*prompt)["rect"];
+        const float x = r[0].get<float>() + ImGui::GetStyle().FramePadding.x +
+                        ImGui::CalcTextSize("Make the bra").x;
+        const float y = r[1].get<float>() + ImGui::GetStyle().FramePadding.y +
+                        ImGui::GetTextLineHeight() * 0.5f;
+        io.AddMousePosEvent(x, y);
+        if (P.mousePhase == 1) io.AddMouseButtonEvent(ImGuiMouseButton_Right, true);
+        if (P.mousePhase == 2) io.AddMouseButtonEvent(ImGuiMouseButton_Right, false);
+        if (++P.mousePhase < 5) return;
+        P.mousePhase = 0;
+        next(7);
+        break;
+    }
+    case 7: {
+        const auto* fix = shotItem("bracket");
+        if (!composerSpellCheck("right_click_offers_correction",
+                                fix && shotItem("Add to dictionary") && shotItem("Ignore"),
+                                {{"popup_open", ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId)}}))
+            return;
+        P.capture = "scratch/composer_spell_shots/03_menu.png";
+        next(8, 1);
+        break;
+    }
+    case 8: {
+        // The menu closes on release, so the target is found once and kept for the gesture.
+        if (P.mousePhase == 0) {
+            const auto* fix = shotItem("bracket");
+            if (!fix) return;
+            P.point = shotPoint(*fix);
+        }
+        io.AddMousePosEvent(P.point.x, P.point.y);
+        if (P.mousePhase == 1) io.AddMouseButtonEvent(ImGuiMouseButton_Left, true);
+        if (P.mousePhase == 2) io.AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+        if (++P.mousePhase < 5) return;
+        P.mousePhase = 0;
+        next(9, 8);
+        break;
+    }
+    case 9: {
+        const std::string text = ui::composerText(st);
+        if (!composerSpellCheck("correction_replaces_word_in_place",
+                                text == "Make the bracket thicker and chamfer",
+                                {{"text", text}}))
+            return;
+        P.capture = "scratch/composer_spell_shots/04_corrected.png";
+        next(20);
+        break;
+    }
+    case 20: {
+        // A slash command leaves no user bubble, yet Up must recall it (a failed /compact
+        // focus text is otherwise retyped by hand). Trailing space: Enter sends, no menu.
+        ChatMsg earlier;
+        earlier.fromUser = true;
+        earlier.text = "Earlier message\nsecond line";
+        st.chat.push_back(std::move(earlier));
+        ui::composerSetText(st, "/help ");
+        tap({ImGuiKey_Enter}, 21);
+        break;
+    }
+    case 21:
+        if (!composerSpellCheck("slash_command_sent", ui::composerText(st).empty(),
+                                {{"text", ui::composerText(st)}})) return;
+        tap({ImGuiKey_UpArrow}, 22);
+        break;
+    case 22:
+        if (!composerSpellCheck("up_recalls_newest_slash_command",
+                                ui::composerText(st) == "/help",
+                                {{"text", ui::composerText(st)}})) return;
+        // "/help" opens the slash menu; a recalled entry still walks the history.
+        tap({ImGuiKey_UpArrow}, 23);
+        break;
+    case 23:
+        if (!composerSpellCheck("up_walks_past_command_to_older_message",
+                                ui::composerText(st) == "Earlier message\nsecond line",
+                                {{"text", ui::composerText(st)}})) return;
+        // The caret lands on the recalled message's last line, so Down walks forward at once.
+        tap({ImGuiKey_DownArrow}, 230);
+        break;
+    case 230:
+        if (!composerSpellCheck("down_walks_forward_from_multiline_message",
+                                ui::composerText(st) == "/help",
+                                {{"text", ui::composerText(st)}})) return;
+        tap({ImGuiKey_DownArrow}, 24);
+        break;
+    case 24:
+        if (!composerSpellCheck("down_returns_to_empty_box", ui::composerText(st).empty(),
+                                {{"text", ui::composerText(st)}})) return;
+        ui::composerSetText(st, "/compact snapcompact keep details");
+        tap({ImGuiKey_Enter}, 25);
+        break;
+    case 25:
+        if (!composerSpellCheck("invalid_compact_preserves_draft",
+                                ui::composerText(st) == "/compact snapcompact keep details",
+                                {{"text", ui::composerText(st)}})) return;
+        P.report["ok"] = true;
+        P.capture = "scratch/composer_spell_shots/05_refused_compact_kept.png";
+        P.done = true;
+        break;
+    }
+}
+
+bool composerSpellEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, bool& breakLoop) {
+    auto& P = g_composerSpell;
+    if (!P.want) return false;
+    ++st.frame;
+    if (!P.capture.empty()) {
+        writeBackbufferPng(P.capture.c_str(), dw, dh, P.done ? screenshotPath : nullptr);
+        P.report["captures"].push_back(P.capture);
+        P.capture.clear();
+    }
+    swapScenarioFrame(st.win);
+    breakLoop = P.done;
+    if (P.done) {
+        std::ofstream("scratch/composer_spell_shots/report.json") << P.report.dump(2) << '\n';
+        if (P.failed) {
+            core::framestats::flushReport();
+            std::fflush(nullptr);
+            std::_Exit(EXIT_FAILURE);
+        }
+    }
+    return true;
+}
+
+// These shared observers resolve real items; agentlock supplies its own input and checks.
+const nlohmann::json* uxField(const char* type, const char* key, const char* primitive);
+const nlohmann::json* uxFeatureRow(const char* name);
+const nlohmann::json* uxRibbonItem(const char* cmd);
+const nlohmann::json* uxRibbonDropItem(const char* cmd);
+const nlohmann::json* uxRibbonPopupRow(const char* cmd, const char* primitive);
+bool uxInlineError();
+nlohmann::json uxVisibleBounds(const AppState& st);
+
+struct AgentLockHoldGate {
+    std::string doc;
+    std::atomic<bool> expectOld{false}, oldReady{false}, oldOk{false}, allowOld{false};
+    std::atomic<bool> expectPreHold{false}, preHoldBlocked{false}, allowPreHold{false};
+    std::atomic<bool> expectRelease{false}, releaseReady{false}, releaseOk{false};
+    std::atomic<bool> expectCheckpoint{false}, checkpointBlocked{false}, allowCheckpoint{false};
+    std::atomic<bool> timedOut{false};
+    std::atomic<double> oldAt{0.0};
+    nlohmann::json oldResult, releaseResult;
+    std::string oldError, releaseError;
+} g_agentLockGate;
+
+bool agentLockPrimary(const std::string& method, const nlohmann::json& params,
+                      nlohmann::json& result, std::string& error, int timeout,
+                      const std::atomic<bool>& cancelled) {
+    if (cancelled.load()) { error = "aborted"; return false; }
+    if (auto* client = engine::client())
+        return client->call(method, params, result, error, timeout, {}, &cancelled);
+    error = "primary engine connection is unavailable";
+    return false;
+}
+
+void agentLockGateWait(std::atomic<bool>& release, const std::atomic<bool>& cancelled) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (!release.load() && !cancelled.load()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            g_agentLockGate.timedOut.store(true);
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+}
+
+// Shot-only interception preserves the real primary connection, response and FIFO.
+bool agentLockGatedPrimary(const std::string& method, const nlohmann::json& params,
+                           nlohmann::json& result, std::string& error, int timeout,
+                           const std::atomic<bool>& cancelled) {
+    auto& gate = g_agentLockGate;
+    const bool target = params.is_object() && params.value("doc_id", std::string()) == gate.doc;
+    if (target && method == "doc_checkpoint" && gate.expectCheckpoint.exchange(false)) {
+        gate.checkpointBlocked.store(true);
+        agentLockGateWait(gate.allowCheckpoint, cancelled);
+    }
+    if (target && method == "edit_hold" && gate.expectPreHold.exchange(false)) {
+        gate.preHoldBlocked.store(true);
+        agentLockGateWait(gate.allowPreHold, cancelled);
+    }
+    const bool ok = agentLockPrimary(method, params, result, error, timeout, cancelled);
+    if (target && method == "edit_hold" && gate.expectOld.exchange(false)) {
+        gate.oldResult = result;
+        gate.oldError = error;
+        gate.oldOk.store(ok && result.is_object() && result.value("ok", false));
+        gate.oldAt.store(pipingNow());
+        gate.oldReady.store(true);
+        agentLockGateWait(gate.allowOld, cancelled);
+    } else if (target && method == "edit_release" && gate.expectRelease.exchange(false)) {
+        gate.releaseResult = result;
+        gate.releaseError = error;
+        gate.releaseOk.store(ok && result.is_object() && result.value("ok", false));
+        gate.releaseReady.store(true);
+    }
+    return ok;
+}
+
+// CHUDWARE_SHOT=agentlock: a real foreign write lands during an open human
+// sketch; human edits and undo/redo remain available while a run is active.
 struct AgentLockShot {
-    bool init = false, want = false, done = false, failed = false, realForeign = false;
+    bool init = false, want = false, done = false, failed = false;
     int step = 0, settle = 0;
     double started = 0.0;
-    std::string dir, capture, queued, doc, sketch, conv, viewed;
-    nlohmann::json report;
+    int previewRevision = -1;
+    std::string dir, capture, queued, doc, sketch, box, conv, sketch3d, initialPoint;
+    nlohmann::json report, baseline, before, sentinel, study;
+    SceneShotInput input;
+    bool pointerActive = false, gateInstalled = false;
+    ImGuiID pointerId = 0;
+    ImVec2 pointerPoint;
+    std::string pointerOwner, pointerWindow;
+    size_t actionIndex = 0;
+    AppState* state = nullptr;
+    std::unique_ptr<chudware_ipc::EngineClient> foreign;
+    bool foreignHeld = false, toastOverride = false, savedSuppressToasts = false;
 };
 AgentLockShot g_agentLock;
+
+void agentLockAbortGate() {
+    auto& P = g_agentLock;
+    if (!P.gateInstalled || !P.state) return;
+    g_agentLockGate.allowOld.store(true);
+    g_agentLockGate.allowPreHold.store(true);
+    g_agentLockGate.allowCheckpoint.store(true);
+    if (P.toastOverride) {
+        P.state->suppressToasts = P.savedSuppressToasts;
+        P.toastOverride = false;
+    }
+    if (P.foreign) {
+        nlohmann::json released;
+        std::string error;
+        if (P.foreignHeld)
+            P.foreign->call("edit_release", {{"doc_id", P.doc}}, released, error, 3000);
+        P.foreign->disconnect();
+        P.foreign.reset();
+        P.foreignHeld = false;
+    }
+    P.state->rpc.shutdown(); // joins the owned RPC thread before the failure exit
+    P.state->rpc.setPrimaryCaller(agentLockPrimary);
+    nlohmann::json result;
+    std::string error;
+    if (auto* client = engine::client())
+        client->call("edit_release", {{"doc_id", P.doc}}, result, error, 3000);
+    P.report["gate_cleanup"] = {{"release", result}, {"error", error}};
+    P.gateInstalled = false;
+}
 
 bool agentLockCheck(const char* name, bool ok, const nlohmann::json& evidence) {
     auto& P = g_agentLock;
@@ -3024,12 +4383,106 @@ bool agentLockCheck(const char* name, bool ok, const nlohmann::json& evidence) {
     std::printf("[agentlock-shot] %s %s %s\n", ok ? "PASS" : "FAIL", name, evidence.dump().c_str());
     std::fflush(stdout);
     if (!ok) {
+        agentLockAbortGate();
+        ImGui::GetIO().AddMouseButtonEvent(0, false);
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false);
         P.failed = P.done = true;
         P.report["failure"] = name;
         P.queued.clear();
         P.capture = P.dir + "/agentlock_FAILED.png";
     }
     return ok;
+}
+
+bool agentLockClick(const char* owner, const nlohmann::json* item, const char* window) {
+    auto& P = g_agentLock;
+    if (!P.pointerActive) {
+        if (!item || !item->value("visible", false)) {
+            shotScrollTo(owner, window, true, item);
+            return false;
+        }
+        if (!agentLockCheck("hold_gesture_enabled_item",
+                            item->value("enabled", false) && !item->value("text_only", false) &&
+                            item->value("id", ImGuiID(0)) != 0,
+                            {{"owner", owner}, {"item", *item}})) return false;
+        P.pointerActive = true;
+        P.pointerOwner = owner;
+        P.pointerId = item->value("id", ImGuiID(0));
+        P.pointerWindow = item->value("window", std::string());
+        P.pointerPoint = shotPoint(*item);
+        P.actionIndex = P.report["actions"].size();
+        P.report["actions"].push_back({{"owner", owner}, {"item", *item},
+                                       {"point", {P.pointerPoint.x, P.pointerPoint.y}},
+                                       {"presses", 0}, {"releases", 0}, {"completed", false}});
+    }
+    if (!agentLockCheck("hold_gesture_same_owner", P.pointerOwner == owner,
+                        {{"expected", P.pointerOwner}, {"actual", owner}})) return false;
+    if (P.input.phase == 1) {
+        nlohmann::json current;
+        const bool found = ui::audit::observedItemById(P.pointerId, P.pointerWindow, current);
+        bool stable = found && current.value("visible", false) && current.value("enabled", false);
+        if (stable) {
+            const auto& rect = current["rect"];
+            stable = P.pointerPoint.x >= rect[0].get<float>() &&
+                     P.pointerPoint.x < rect[2].get<float>() &&
+                     P.pointerPoint.y >= rect[1].get<float>() &&
+                     P.pointerPoint.y < rect[3].get<float>();
+        }
+        if (!agentLockCheck("hold_gesture_target_stable", stable,
+                            {{"owner", owner}, {"current", current}})) return false;
+        P.report["actions"][P.actionIndex]["presses"] = 1;
+    } else if (P.input.phase == 2) {
+        if (!agentLockCheck("hold_gesture_press_owned",
+                            ImGui::GetCurrentContext()->ActiveId == P.pointerId,
+                            {{"owner", owner}, {"target", P.pointerId},
+                             {"active_id", ImGui::GetCurrentContext()->ActiveId}})) return false;
+        P.report["actions"][P.actionIndex]["releases"] = 1;
+    }
+    if (!P.input.click(P.pointerPoint)) return false;
+    P.report["actions"][P.actionIndex]["completed"] = true;
+    P.pointerActive = false;
+    return true;
+}
+
+nlohmann::json agentLockDocumentState(const AppState& st) {
+    nlohmann::json picks = nlohmann::json::array();
+    for (const auto& item : st.selection.items())
+        picks.push_back({{"body", item.hit.body_id}, {"kind", static_cast<int>(item.hit.kind)},
+                         {"topo", item.hit.topo_id}, {"selector", item.selector},
+                         {"pending", item.pending_resolve}, {"error", item.resolution_error}});
+    return {{"doc", st.docMirror.docId()}, {"tab", st.activeTab}, {"tree", st.docMirror.tree()},
+            {"revision", st.docMirror.revision()}, {"status", st.docMirror.featureStatus()},
+            {"dirty", st.docTabs[st.activeTab].dirty}, {"selection", st.selectedFeatureId},
+            {"picks", picks}, {"has_mesh", st.hasDocMesh}, {"bounds", uxVisibleBounds(st)},
+            {"body_visibility", st.bodyVisible}, {"mesh_generation", st.meshGen()},
+            {"pm", static_cast<uint64_t>(reinterpret_cast<uintptr_t>(st.propertyManager))}};
+}
+
+nlohmann::json agentLockVisibleState(AppState& st) {
+    auto* pm = st.propertyManager;
+    const auto* field = uxField("fillet", "radius", "##dim");
+    const ImGuiID id = field ? field->value("id", ImGuiID(0)) : 0;
+    const auto* text = id ? ImGui::GetInputTextState(id) : nullptr;
+    nlohmann::json callouts = nlohmann::json::array();
+    for (const auto& item : pm->calloutItems(st))
+        callouts.push_back({{"label", item.label}, {"value", item.value}});
+    auto state = agentLockDocumentState(st);
+    state.update({{"active", pm->active()}, {"form", pm->activeFormType()}, {"target", pm->targetId()},
+                  {"accept_pending", pm->acceptPending()}, {"preview_pending", pm->previewPending()},
+                  {"error", pm->previewError()}, {"warning", pm->previewWarning()},
+                  {"inline_error", uxInlineError()}, {"callouts", callouts},
+                  {"input_id", id}, {"input_active", id && ImGui::GetCurrentContext()->ActiveId == id},
+                  {"input", text && text->TextA.Data ? text->TextA.Data : ""}});
+    return state;
+}
+
+int agentLockStaleToastCount(AppState& st) {
+    std::lock_guard<std::mutex> lock(st.toastsMtx);
+    int count = 0;
+    for (const auto& toast : st.toasts)
+        if (toast.msg.find("client is editing this part") != std::string::npos)
+            count += toast.count;
+    return count;
 }
 
 nlohmann::json agentLockSketchOp(const char* name) {
@@ -3047,19 +4500,21 @@ void agentLockTick(AppState& st) {
         const char* mode = std::getenv("CHUDWARE_SHOT");
         P.want = st.shot && mode && std::strcmp(mode, "agentlock") == 0;
         if (!P.want) return;
-        const char* repo = std::getenv("CHUDWARE_REPO");
-        P.dir = std::string(repo ? repo : ".") + "/scratch/agentlock_shots";
-        std::error_code ec;
-        std::filesystem::create_directories(P.dir, ec);
         P.started = pipingNow();
         P.report = {{"scenario", "agentlock"}, {"ok", false},
-                    {"checks", nlohmann::json::array()}, {"captures", nlohmann::json::array()}};
+                    {"checks", nlohmann::json::array()}, {"actions", nlohmann::json::array()},
+                    {"captures", nlohmann::json::array()}};
     }
     if (!P.want || P.done) return;
     if (pipingNow() - P.started > 120.0) {
         agentLockCheck("timeout", false, {{"step", P.step}}); return;
     }
-    if (!st.workerStarted || st.frame < 5 || !P.capture.empty() || st.rpc.busy()) return;
+    if (!st.workerStarted || st.frame < 5 || !P.capture.empty() ||
+        (P.step < 16 && st.rpc.busy())) return;
+    if (P.step >= 16) ui::audit::observedItems();
+    if (P.gateInstalled && g_agentLockGate.timedOut.load()) {
+        agentLockCheck("hold_gate_deadline", false, {{"step", P.step}}); return;
+    }
     if (P.settle > 0) { --P.settle; return; }
     if (!P.queued.empty()) { P.capture = std::move(P.queued); P.queued.clear(); return; }
     auto shoot = [&](const char* name) {
@@ -3074,11 +4529,23 @@ void agentLockTick(AppState& st) {
             if (feature.value("name", std::string()) == name) return true;
         return false;
     };
+    auto boxParam = [&](const char* key) {
+        const auto& tree = st.docMirror.tree();
+        if (!tree.contains("features") || !tree["features"].is_array()) return -1.0;
+        for (const auto& feature : tree["features"]) {
+            if (feature.value("id", std::string()) != P.box) continue;
+            const auto& value = feature["params"][key];
+            return value.is_object() ? value.value("value", -1.0) : value.get<double>();
+        }
+        return -1.0;
+    };
+    auto boxLength = [&]() { return boxParam("length"); };
     std::string err;
     switch (P.step) {
     case 0: {
         st.showRibbon = true;
         st.activeWorkspace = AppState::Workspace::Model;
+        st.settings.units = Units::MMGS;
         if (!agentLockCheck("new_part", st.docMirror.newPart(st.worker, err), {{"error", err}})) return;
         st.addDocTab(false);
         P.doc = st.docMirror.docId();
@@ -3093,6 +4560,7 @@ void agentLockTick(AppState& st) {
         }));
         if (!agentLockCheck("build_part", r.ok, {{"error", r.error_message}})) return;
         if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
+        P.box = r.id_map.value("$0", std::string());
         P.sketch = r.id_map.value("$1", std::string());
         if (!agentLockCheck("open_human_sketch",
                             !P.sketch.empty() && st.sketchMode->enterForFeature(st, P.sketch),
@@ -3102,6 +4570,14 @@ void agentLockTick(AppState& st) {
             nlohmann::json::array({agentLockSketchOp("Human work after checkpoint")}));
         if (!agentLockCheck("human_work_after_checkpoint", human.ok,
                             {{"revision", human.revision}, {"error", human.error_message}})) return;
+        ui::ensureConversations(st);
+        P.conv = "agentlock-background";
+        Conversation conv;
+        conv.id = P.conv;
+        conv.title = "Document editing agent";
+        conv.projectDir = st.workspaceDir;
+        st.conversations.push_back(std::move(conv));
+        st.runFor(P.conv)->running.store(true);
         ++P.step;
         P.settle = 4;
         return;
@@ -3109,126 +4585,881 @@ void agentLockTick(AppState& st) {
     case 1: {
         const auto ops = nlohmann::json::array({agentLockSketchOp("Foreign agent feature")});
 #ifndef __EMSCRIPTEN__
-        if (engine::daemonMode()) {
-            chudware_ipc::EngineClient foreign;
-            chudware_ipc::EngineClient::Options options;
-            options.clientKind = "mcp";
-            options.allowSpawn = false;
-            nlohmann::json result;
-            bool ok = foreign.connectOrSpawn(options, err) &&
-                foreign.call("attach_doc", {{"doc_id", P.doc}, {"mode", "rw"}}, result, err, 15000) &&
-                foreign.call("doc_apply_ops",
-                    {{"doc_id", P.doc}, {"base_revision", st.docMirror.revision()}, {"ops", ops}},
-                    result, err, 15000);
-            ok = ok && !result.contains("code") && result.contains("revision");
-            if (!agentLockCheck("real_foreign_write", ok, {{"error", err}, {"result", result}})) return;
-            P.realForeign = true;
-        } else
+        if (!agentLockCheck("daemon_required", engine::daemonMode(), {})) return;
+        chudware_ipc::EngineClient foreign;
+        chudware_ipc::EngineClient::Options options;
+        options.clientKind = "mcp";
+        options.allowSpawn = false;
+        nlohmann::json result;
+        bool ok = foreign.connectOrSpawn(options, err) &&
+            foreign.call("attach_doc", {{"doc_id", P.doc}, {"mode", "rw"}}, result, err, 15000) &&
+            foreign.call("doc_apply_ops",
+                {{"doc_id", P.doc}, {"base_revision", st.docMirror.revision()}, {"ops", ops}},
+                result, err, 15000);
+        ok = ok && !result.contains("code") && result.contains("revision");
+        if (!agentLockCheck("real_foreign_write", ok, {{"error", err}, {"result", result}})) return;
+#else
+        agentLockCheck("native_daemon_required", false, {}); return;
 #endif
-        {
-            const auto r = st.docMirror.applyOps(st.worker, ops);
-            if (!agentLockCheck("foreign_write_without_daemon", r.ok,
-                                {{"error", r.error_message}})) return;
-            st.docTabs[st.activeTab].lastForeignWriteAt = std::chrono::steady_clock::now();
-            P.report["foreign_event_skipped"] = "This runtime has no second native daemon connection";
-        }
         ++P.step;
         P.settle = 4;
         return;
     }
     case 2: {
-        if (!agentLockCheck("foreign_event_stamps_lock",
-                            st.activeDocLockedByAgent() &&
-                                st.docTabs[st.activeTab].lastForeignWriteAt !=
-                                    std::chrono::steady_clock::time_point{},
-                            {{"real_foreign_write", P.realForeign},
-                             {"reason", st.agentLockReason(P.doc)}})) return;
-        if (!agentLockCheck("session_closed_without_revert", !st.sketchMode->active() &&
+        if (!agentLockCheck("human_sketch_remains_open_during_foreign_edit",
+                            st.sketchMode->active() && st.runFor(P.conv)->running.load(),
+                            {{"sketch_active", st.sketchMode->active()}})) return;
+        if (!agentLockCheck("foreign_revision_visible",
+                            st.docMirror.resync(st.worker) && featureNamed("Foreign agent feature"),
+                            {{"tree", st.docMirror.tree()}})) return;
+        const auto human = st.docMirror.applyOps(st.worker,
+            nlohmann::json::array({agentLockSketchOp("Human parallel edit")}));
+        if (!agentLockCheck("human_mutation_while_run_active",
+                            human.ok && st.runFor(P.conv)->running.load(),
+                            {{"revision", human.revision}, {"error", human.error_message}})) return;
+        st.sketchMode->exitSketch(st, true);
+        if (!agentLockCheck("both_edit_streams_survive",
                             st.docMirror.resync(st.worker) && featureNamed("Human sketch") &&
                             featureNamed("Human work after checkpoint") &&
-                            featureNamed("Foreign agent feature"),
-                            {{"sketch_active", st.sketchMode->active()},
-                             {"tree", st.docMirror.tree()}})) return;
-        shoot("01_external_locked");
-        return;
-    }
-    case 3: {
-        ImGuiWindow* banner = ImGui::FindWindowByName("##agent_lock_strip");
-        if (!agentLockCheck("external_banner_reserved_chrome",
-                            banner && banner->WasActive && ui::overlayBand().minY >=
-                                banner->Pos.y + banner->Size.y,
-                            {{"banner_visible", banner && banner->WasActive}})) return;
-        ui::ensureConversations(st);
-        P.viewed = st.activeConvId();
-        P.conv = "agentlock-background";
-        Conversation conv;
-        conv.id = P.conv;
-        conv.title = "Document editing agent";
-        conv.projectDir = st.workspaceDir;
-        ChatMsg live;
-        live.running = true;
-        live.text = "Editing this part";
-        conv.msgs.push_back(std::move(live));
-        st.conversations.push_back(std::move(conv));
-        st.runFor(P.conv)->running.store(true);
-        st.docTabs[st.activeTab].lastForeignWriteAt = std::chrono::steady_clock::now();
-        shoot("02_in_app_locked");
-        return;
-    }
-    case 4: {
-        if (st.ribbonDispatch) st.ribbonDispatch("extrude_boss");
-        if (!agentLockCheck("ribbon_mutation_refused", st.propertyManager &&
-                            !st.propertyManager->active(), nlohmann::json::object())) return;
-        const int revision = st.docMirror.revision();
+                            featureNamed("Foreign agent feature") && featureNamed("Human parallel edit"),
+                            {{"tree", st.docMirror.tree()}})) return;
         const auto undo = st.docUndo();
-        if (!agentLockCheck("undo_refused", !undo.ok && undo.error_code == "agent_edit_locked" &&
-                            st.docMirror.revision() == revision,
-                            {{"error_code", undo.error_code}, {"revision", revision}})) return;
-        // The synthetic run has no provider to cancel. Exercise the real named-stop UI path
-        // without sending an empty run_id cancel to any actual worker.
-        const bool workerStarted = st.workerStarted;
-        st.workerStarted = false;
-        ui::requestStopRunFor(st, P.conv);
-        st.workerStarted = workerStarted;
-        const auto* run = st.runIfExists(P.conv);
-        const auto* msgs = conversationMsgs(st, P.conv);
-        if (!agentLockCheck("stop_targets_background_conversation",
-                            run && run->running.load() && run->stopRequested.load() &&
-                                st.activeConvId() == P.viewed && msgs && !msgs->back().running &&
-                                st.activeDocLockedByAgent(),
-                            {{"viewed_conversation", st.activeConvId()},
-                             {"stopped_conversation", P.conv}})) return;
-        shoot("03_stopping");
+        if (!agentLockCheck("undo_while_run_active", undo.ok && st.runFor(P.conv)->running.load(),
+                            {{"error", undo.error_message}})) return;
+        const auto redo = st.docRedo();
+        if (!agentLockCheck("redo_preserves_both_streams", redo.ok &&
+                            featureNamed("Foreign agent feature") && featureNamed("Human parallel edit"),
+                            {{"error", redo.error_message}})) return;
+        shoot("01_collaborative_edit");
         return;
     }
-    case 5: {
-        ImGuiWindow* banner = ImGui::FindWindowByName("##agent_lock_strip");
-        if (!agentLockCheck("stopping_retains_banner_and_lock",
-                            banner && banner->WasActive && st.activeDocLockedByAgent(),
-                            nlohmann::json::object())) return;
-        st.runFor(P.conv)->running.store(false);
-        st.agentV2Running = st.anyRunActive();
-        st.docTabs[st.activeTab].lastForeignWriteAt =
-            std::chrono::steady_clock::now() - std::chrono::seconds(10);
-        ++P.step;
+    case 3:
+        if (!agentLockCheck("human_can_reopen_sketch_while_run_active",
+                            st.runFor(P.conv)->running.load() &&
+                            st.sketchMode->enterForFeature(st, P.sketch),
+                            {{"sketch", P.sketch}})) return;
+        st.sketchMode->exitSketch(st, true);
+        if (!agentLockCheck("edits_retained_after_sketch",
+                            st.docMirror.resync(st.worker) && featureNamed("Foreign agent feature") &&
+                            featureNamed("Human parallel edit"),
+                            {{"tree", st.docMirror.tree()}})) return;
+        shoot("02_collaborative_sketch");
+        return;
+    case 4:
+        P.previewRevision = st.docMirror.revision();
+        if (!agentLockCheck("pm_open_without_peer", st.propertyManager->openForEdit(st, P.box),
+                            {{"box", P.box}})) return;
+        if (!agentLockCheck("pm_preview_without_peer", st.propertyManager->dragSetDim("length", 37.0),
+                            {})) return;
+        ++P.step; return;
+    case 5:
+        if (st.docMirror.revision() <= P.previewRevision || boxLength() != 37.0) return;
+        if (!agentLockCheck("pm_cancel_without_peer", st.propertyManager->cancelEdits(st),
+                            {{"preview_length", boxLength()}})) return;
+        ++P.step; return;
+    case 6:
+        if (st.propertyManager->active()) return;
+        if (!agentLockCheck("pm_cancel_restores_only_preview",
+                            st.docMirror.resync(st.worker) && boxLength() == 30.0 &&
+                            featureNamed("Foreign agent feature") && featureNamed("Human parallel edit"),
+                            {{"length", boxLength()}, {"tree", st.docMirror.tree()}})) return;
+        P.previewRevision = st.docMirror.revision();
+        if (!agentLockCheck("pm_open_for_peer_race", st.propertyManager->openForEdit(st, P.box), {})) return;
+        if (!agentLockCheck("pm_preview_for_peer_race", st.propertyManager->dragSetDim("length", 42.0), {})) return;
+        ++P.step; return;
+    case 7: {
+        if (st.docMirror.revision() <= P.previewRevision || boxLength() != 42.0) return;
+#ifndef __EMSCRIPTEN__
+        // Simulate the hold ending while the form remains open. The foreign
+        // write then uses the normal daemon attachment/serialization path.
+        nlohmann::json result;
+        auto* primary = engine::client();
+        const bool released = primary && primary->call("edit_release", {{"doc_id", P.doc}},
+                                                       result, err, 15000) &&
+                              !result.contains("code");
+        if (!agentLockCheck("pm_hold_released_for_peer", released, {{"error", err}, {"result", result}})) return;
+        chudware_ipc::EngineClient foreign;
+        chudware_ipc::EngineClient::Options options;
+        options.clientKind = "mcp"; options.allowSpawn = false;
+        bool ok = foreign.connectOrSpawn(options, err) &&
+            foreign.call("attach_doc", {{"doc_id", P.doc}, {"mode", "rw"}}, result, err, 15000) &&
+            foreign.call("doc_apply_ops", {{"doc_id", P.doc}, {"base_revision", st.docMirror.revision()},
+                {"ops", nlohmann::json::array({agentLockSketchOp("Peer during PM preview")})}},
+                result, err, 15000) && !result.contains("code");
+        if (!agentLockCheck("peer_mutation_during_pm", ok, {{"error", err}, {"result", result}})) return;
+        if (!agentLockCheck("pm_stale_cancel_refuses_follow_on",
+                            !st.propertyManager->cancelEdits(st), {})) return;
+        ++P.step; return;
+#else
+        agentLockCheck("native_daemon_required", false, {}); return;
+#endif
+    }
+    case 8:
+        if (st.propertyManager->active()) return;
+        if (!agentLockCheck("pm_stale_cancel_keeps_both_writers",
+                            st.docMirror.resync(st.worker) && boxLength() == 42.0 &&
+                            featureNamed("Peer during PM preview") &&
+                            featureNamed("Human parallel edit") && st.runFor(P.conv)->running.load(),
+                            {{"length", boxLength()}, {"tree", st.docMirror.tree()}})) return;
+        shoot("03_pm_concurrent_cancel");
+        return;
+    case 9:
+        if (!agentLockCheck("pm_open_for_rebase", st.propertyManager->openForEdit(st, P.box), {})) return;
+        ++P.step; return;
+    case 10: {
+#ifndef __EMSCRIPTEN__
+        nlohmann::json result;
+        auto* primary = engine::client();
+        const bool released = primary && primary->call("edit_release", {{"doc_id", P.doc}},
+                                                       result, err, 15000) &&
+                              !result.contains("code");
+        if (!agentLockCheck("pm_rebase_hold_released", released, {{"error", err}, {"result", result}})) return;
+        chudware_ipc::EngineClient foreign;
+        chudware_ipc::EngineClient::Options options;
+        options.clientKind = "mcp"; options.allowSpawn = false;
+        const bool ok = foreign.connectOrSpawn(options, err) &&
+            foreign.call("attach_doc", {{"doc_id", P.doc}, {"mode", "rw"}}, result, err, 15000) &&
+            foreign.call("doc_apply_ops", {{"doc_id", P.doc}, {"base_revision", st.docMirror.revision()},
+                {"ops", nlohmann::json::array({
+                    {{"op", "edit_feature"}, {"id", P.box}, {"params", {{"height", 13.0}}}}
+                })}}, result, err, 15000) && !result.contains("code");
+        if (!agentLockCheck("peer_changes_height_in_open_pm", ok, {{"error", err}, {"result", result}})) return;
+        if (!agentLockCheck("pm_refreshes_foreign_revision",
+                            st.docMirror.resync(st.worker) && boxParam("height") == 13.0,
+                            {{"tree", st.docMirror.tree()}})) return;
+        if (!agentLockCheck("pm_stale_human_length_gesture",
+                            st.propertyManager->dragSetDim("length", 47.0), {})) return;
+        P.settle = 8; ++P.step; return;
+#else
+        agentLockCheck("native_daemon_required", false, {}); return;
+#endif
+    }
+    case 11: {
+        nlohmann::json displayed = nlohmann::json::object();
+        for (const auto& item : st.propertyManager->calloutItems(st)) displayed[item.label] = item.value;
+        if (!agentLockCheck("pm_stale_payload_reloaded_without_write",
+                            st.propertyManager->active() && boxLength() == 42.0 &&
+                            boxParam("height") == 13.0 && displayed.value("Height", "") == "13 mm",
+                            {{"length", boxLength()}, {"height", boxParam("height")}, {"displayed", displayed}})) return;
+        P.previewRevision = st.docMirror.revision();
+        if (!agentLockCheck("pm_fresh_human_length_gesture",
+                            st.propertyManager->dragSetDim("length", 47.0), {})) return;
+        ++P.step; return;
+    }
+    case 12:
+        if (st.docMirror.revision() <= P.previewRevision || boxLength() != 47.0) return;
+        if (!agentLockCheck("pm_fresh_edit_preserves_peer_height",
+                            boxParam("height") == 13.0, {{"tree", st.docMirror.tree()}})) return;
+        st.propertyManager->closeIfActive();
+        shoot("04_pm_rebased");
+        return;
+    case 13:
+        if (!agentLockCheck("sketch3d_open_during_run", st.sketch3dMode &&
+                            st.sketch3dMode->enterNew(st) && st.runFor(P.conv)->running.load(), {})) return;
+        P.sketch3d = st.sketch3dMode->sketchId();
+        P.initialPoint = st.sketch3dMode->scenarioAddPoint(st, Vec3{1.0f, 2.0f, 3.0f});
+        if (!agentLockCheck("sketch3d_initial_human_point", !P.initialPoint.empty(),
+                            {{"id", P.initialPoint}})) return;
+        ++P.step; return;
+    case 14: {
+#ifndef __EMSCRIPTEN__
+        nlohmann::json entities;
+        for (const auto& feature : st.docMirror.tree()["features"])
+            if (feature.value("id", std::string()) == P.sketch3d)
+                entities = feature["params"]["entities"];
+        if (!agentLockCheck("sketch3d_native_entities", entities.is_array(),
+                            {{"entities", entities}})) return;
+        entities.push_back({{"id", "e77"}, {"type", "point"}, {"construction", false},
+                            {"p", {5.0, 6.0, 7.0}}});
+        chudware_ipc::EngineClient foreign;
+        chudware_ipc::EngineClient::Options options;
+        options.clientKind = "mcp"; options.allowSpawn = false;
+        nlohmann::json result;
+        const bool ok = foreign.connectOrSpawn(options, err) &&
+            foreign.call("attach_doc", {{"doc_id", P.doc}, {"mode", "rw"}}, result, err, 15000) &&
+            foreign.call("doc_apply_ops", {{"doc_id", P.doc}, {"base_revision", st.docMirror.revision()},
+                {"ops", nlohmann::json::array({
+                    {{"op", "edit_feature"}, {"id", P.sketch3d}, {"params", {{"entities", entities}}}}
+                })}}, result, err, 15000) && !result.contains("code");
+        if (!agentLockCheck("peer_adds_sketch3d_point", ok, {{"error", err}, {"result", result}})) return;
+        if (!agentLockCheck("sketch3d_refreshes_foreign_revision", st.docMirror.resync(st.worker),
+                            {{"revision", st.docMirror.revision()}})) return;
+        const int peerRevision = st.docMirror.revision();
+        const std::string rejected = st.sketch3dMode->scenarioAddPoint(st, Vec3{8.0f, 9.0f, 10.0f});
+        if (!agentLockCheck("sketch3d_stale_payload_rejected",
+                            rejected.empty() && st.docMirror.revision() == peerRevision,
+                            {{"returned_id", rejected}, {"revision", st.docMirror.revision()}})) return;
+        const std::string fresh = st.sketch3dMode->scenarioAddPoint(st, Vec3{8.0f, 9.0f, 10.0f});
+        if (!agentLockCheck("sketch3d_fresh_point_added", !fresh.empty() && fresh != "e77",
+                            {{"returned_id", fresh}})) return;
+        nlohmann::json after;
+        for (const auto& feature : st.docMirror.tree()["features"])
+            if (feature.value("id", std::string()) == P.sketch3d)
+                after = feature["params"]["entities"];
+        bool haveInitial = false, havePeer = false, haveFresh = false;
+        if (after.is_array()) for (const auto& entity : after) {
+            const std::string id = entity.value("id", std::string());
+            haveInitial |= id == P.initialPoint;
+            havePeer |= id == "e77";
+            haveFresh |= id == fresh;
+        }
+        if (!agentLockCheck("sketch3d_fresh_edit_preserves_peer_entities",
+                            haveInitial && havePeer && haveFresh,
+                            {{"entities", after}})) return;
+        st.sketch3dMode->exitSketch(st, true);
+        shoot("05_sketch3d_rebased");
+        return;
+#else
+        agentLockCheck("native_daemon_required", false, {}); return;
+#endif
+    }
+    case 15: {
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.ribbonTab = AppState::RT_Features;
+        st.leftPaneTab = AppState::LP_FeatureManager;
+        ui::audit::AuditOptions options;
+        options.regions = ui::audit::RegionLeftPane | ui::audit::RegionRibbon |
+                          ui::audit::RegionFloating | ui::audit::RegionChrome;
+        options.frames = 1000000;
+        options.maxFrames = 0;
+        options.maxPathQueries = 0;
+        if (!agentLockCheck("hold_audit_started", ui::audit::begin("agentlock_hold", options), {})) return;
+        P.step = 16;
         P.settle = 4;
         return;
     }
-    case 6: {
-        if (!agentLockCheck("controls_unlock_after_grace",
-                            !st.activeDocLockedByAgent() && st.agentLockReason(P.doc).empty(),
-                            {{"grace_s", AppState::kAgentLockGraceS}})) return;
-        if (!agentLockCheck("human_can_edit_again", st.sketchMode->enterForFeature(st, P.sketch),
-                            {{"sketch", P.sketch}})) return;
-        st.sketchMode->exitSketch(st, true);
-        const auto undo = st.docUndo();
-        if (!agentLockCheck("undo_available_after_unlock", undo.ok,
-                            {{"error", undo.error_message}})) return;
-        const auto redo = st.docRedo();
-        if (!agentLockCheck("redo_restores_agent_work", redo.ok &&
-                            featureNamed("Foreign agent feature"),
-                            {{"error", redo.error_message}})) return;
-        shoot("04_unlocked");
+    case 16:
+        if (agentLockClick("Lock test block", uxFeatureRow("Lock test block"), "FeatureManager")) {
+            if (!agentLockCheck("hold_real_feature_selection", st.selectedFeatureId == P.box,
+                                {{"selected", st.selectedFeatureId}, {"box", P.box}})) return;
+            P.step = 17;
+        }
+        return;
+    case 17: {
+        if (st.rpc.busy()) return;
+        auto& gate = g_agentLockGate;
+        gate.doc = P.doc;
+        gate.expectOld.store(true);
+        P.state = &st;
+        P.gateInstalled = true;
+        P.baseline = agentLockDocumentState(st);
+        st.rpc.setPrimaryCaller(agentLockGatedPrimary);
+        if (!agentLockCheck("hold_a_editor_open",
+                            st.docMirror.docId() == P.doc &&
+                            st.propertyManager->openForEdit(st, P.box),
+                            {{"baseline", P.baseline}})) return;
+        P.step = 18;
+        return;
+    }
+    case 18: {
+        auto& gate = g_agentLockGate;
+        if (!gate.oldReady.load()) return;
+#ifndef __EMSCRIPTEN__
+        chudware_ipc::EngineClient foreign;
+        chudware_ipc::EngineClient::Options options;
+        options.clientKind = "mcp";
+        options.allowSpawn = false;
+        nlohmann::json attached, busy;
+        std::string foreignError;
+        const bool connected = foreign.connectOrSpawn(options, foreignError);
+        const bool attachedOk = connected &&
+            foreign.call("attach_doc", {{"doc_id", P.doc}, {"mode", "rw"}},
+                         attached, foreignError, 15000);
+        const bool acquired = attachedOk &&
+            foreign.call("edit_hold", {{"doc_id", P.doc}}, busy, foreignError, 15000);
+        foreign.disconnect();
+        if (!agentLockCheck("hold_a_real_owned_lease",
+                            gate.oldOk.load() && attachedOk && !acquired &&
+                            busy.is_object() && busy.value("code", std::string()) == "busy_preview" &&
+                            !gate.allowOld.load() && gate.oldResult.value("hold_secs", 0) > 0,
+                            {{"old_result", gate.oldResult}, {"old_error", gate.oldError},
+                             {"foreign_attach", attached}, {"foreign_reply", busy},
+                             {"foreign_error", foreignError}})) return;
+#else
+        agentLockCheck("native_daemon_required", false, {}); return;
+#endif
+        // The checkpoint was ahead of this hold in the real FIFO. Allow its callback
+        // to drain before issuing the ordinary user Cancel.
+        P.settle = 3;
+        P.step = 19;
+        return;
+    }
+    case 19:
+        if (!P.pointerActive) g_agentLockGate.expectRelease.store(true);
+        if (agentLockClick("##pm_cancel", shotItem("##pm_cancel", true, nullptr), nullptr))
+            P.step = 20;
+        return;
+    case 20: {
+        auto& gate = g_agentLockGate;
+        if (!agentLockCheck("hold_a_real_cancel_before_old_reply",
+                            !st.propertyManager->active() && gate.oldReady.load() &&
+                            !gate.allowOld.load() && st.docMirror.docId() == P.doc &&
+                            st.docMirror.tree() == P.baseline["tree"] &&
+                            st.docMirror.revision() == P.baseline["revision"],
+                            {{"baseline", P.baseline}, {"tree", st.docMirror.tree()}})) return;
+        P.sentinel = nullptr;
+        st.rpc.callPrimary("doc_tree", {{"doc_id", P.doc}}, [&P](const core::RpcResult& result) {
+            P.sentinel = {{"ok", result.ok}, {"result", result.result}, {"error", result.err}};
+        });
+        gate.expectCheckpoint.store(true);
+        P.step = 21;
+        return;
+    }
+    case 21: {
+        const auto* item = uxRibbonItem("fillet");
+        const auto current = ui::commandAvailability("fillet", ui::commandContext(st));
+        const auto shown = ui::ribbonCommandAvailability("fillet");
+        if (!P.pointerActive &&
+            !agentLockCheck("hold_b_real_ribbon_available",
+                            item && item->value("visible", false) && item->value("enabled", false) &&
+                            current.visible && current.enabled && shown.visible && shown.enabled,
+                            {{"item", item ? *item : nlohmann::json()},
+                             {"reason", current.reason ? current.reason : ""}})) return;
+        if (agentLockClick("fillet", item, "##RibbonBar")) P.step = 22;
+        return;
+    }
+    case 22:
+        if (!agentLockCheck("hold_b_same_pm_real_form",
+                            st.propertyManager->active() && st.propertyManager->activeFormType() == "fillet" &&
+                            st.propertyManager->targetId().empty() &&
+                            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(st.propertyManager)) ==
+                                P.baseline["pm"].get<uint64_t>() &&
+                            g_agentLockGate.oldReady.load() && !g_agentLockGate.allowOld.load(),
+                            {{"form", st.propertyManager->activeFormType()},
+                             {"target", st.propertyManager->targetId()}, {"baseline", P.baseline}})) return;
+        if (agentLockClick("=##dim_txt", uxField("fillet", "radius", "=##dim_txt"), "FeatureManager"))
+            P.step = 23;
+        return;
+    case 23:
+        if (agentLockClick("##dim", uxField("fillet", "radius", "##dim"), "FeatureManager")) P.step = 24;
+        return;
+    case 24:
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, true);
+        ImGui::GetIO().AddKeyEvent(ImGuiKey_A, true);
+        P.step = 25; return;
+    case 25:
+        ImGui::GetIO().AddKeyEvent(ImGuiKey_A, false);
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false);
+        P.step = 26; return;
+    case 26:
+        ImGui::GetIO().AddInputCharactersUTF8("not-a-dimension");
+        P.report["actions"].push_back({{"action", "type dimension"},
+                                        {"form", "fillet"}, {"field", "radius"},
+                                        {"text", "not-a-dimension"}});
+        P.step = 27; return;
+    case 27: {
+        const auto state = agentLockVisibleState(st);
+        if (!agentLockCheck("hold_b_real_live_draft", state.value("input_active", false) &&
+                            state.value("input", std::string()) == "not-a-dimension",
+                            {{"state", state}})) return;
+        P.step = 28; return;
+    }
+    case 28:
+        if (P.input.key(ImGuiKey_Enter)) P.step = 280;
+        return;
+    case 280:
+        if (agentLockClick("##dim", uxField("fillet", "radius", "##dim"), "FeatureManager"))
+            P.step = 29;
+        return;
+    case 29: {
+        P.before = agentLockVisibleState(st);
+        if (!agentLockCheck("hold_b_snapshot_before_old_reply",
+                            P.before.value("active", false) && P.before.value("form", "") == "fillet" &&
+                            P.before.value("target", "") == "" &&
+                            P.before.value("input_active", false) &&
+                            P.before.value("input", "") == "not-a-dimension" &&
+                            P.before.value("inline_error", false) && P.before.value("error", "") == "" &&
+                            agentLockDocumentState(st) == P.baseline &&
+                            g_agentLockGate.oldReady.load() && !g_agentLockGate.allowOld.load(),
+                            {{"state", P.before}, {"baseline", P.baseline}})) return;
+        g_agentLockGate.allowOld.store(true);
+        P.step = 30;
+        return;
+    }
+    case 30: {
+        auto& gate = g_agentLockGate;
+        if (P.sentinel.is_null() || !gate.checkpointBlocked.load() || !gate.releaseReady.load()) return;
+#ifndef __EMSCRIPTEN__
+        chudware_ipc::EngineClient foreign;
+        chudware_ipc::EngineClient::Options options;
+        options.clientKind = "mcp";
+        options.allowSpawn = false;
+        nlohmann::json attached, hold, release;
+        std::string foreignError;
+        const bool connected = foreign.connectOrSpawn(options, foreignError);
+        const bool attachedOk = connected &&
+            foreign.call("attach_doc", {{"doc_id", P.doc}, {"mode", "rw"}},
+                         attached, foreignError, 15000);
+        const bool held = attachedOk &&
+            foreign.call("edit_hold", {{"doc_id", P.doc}}, hold, foreignError, 15000) &&
+            hold.is_object() && hold.value("ok", false);
+        const bool released = held &&
+            foreign.call("edit_release", {{"doc_id", P.doc}}, release, foreignError, 15000) &&
+            release.is_object() && release.value("ok", false);
+        foreign.disconnect();
+        const double age = pipingNow() - gate.oldAt.load();
+        if (!agentLockCheck("hold_a_released_before_b_checkpoint",
+                            P.sentinel.is_object() && P.sentinel.value("ok", false) &&
+                            P.sentinel["result"].is_object() &&
+                            P.sentinel["result"].value("revision", -1) == P.baseline["revision"] &&
+                            P.sentinel["result"].value("tree", nlohmann::json()) == P.baseline["tree"] &&
+                            gate.releaseOk.load() &&
+                            age < gate.oldResult.value("hold_secs", 0) && held && released &&
+                            gate.checkpointBlocked.load() && !gate.allowCheckpoint.load(),
+                            {{"sentinel", P.sentinel}, {"a_release", gate.releaseResult},
+                             {"a_release_error", gate.releaseError}, {"age_seconds", age},
+                             {"lease_seconds", gate.oldResult.value("hold_secs", 0)},
+                             {"foreign_attach", attached}, {"foreign_hold", hold},
+                             {"foreign_release", release}, {"foreign_error", foreignError}})) return;
+#else
+        agentLockCheck("native_daemon_required", false, {}); return;
+#endif
+        gate.allowCheckpoint.store(true);
+        P.step = 31;
+        return;
+    }
+    case 31: {
+        if (st.rpc.busy()) return;
+        const auto after = agentLockVisibleState(st);
+        if (!agentLockCheck("hold_old_callback_preserves_b",
+                            after == P.before && !g_agentLockGate.timedOut.load(),
+                            {{"before", P.before}, {"after", after}, {"sentinel", P.sentinel}})) return;
+        P.step = 32;
+        return;
+    }
+    case 32:
+        if (agentLockClick("##pm_cancel", shotItem("##pm_cancel", true, nullptr), nullptr))
+            P.step = 33;
+        return;
+    case 33: {
+        if (st.rpc.busy() || st.propertyManager->active()) return;
+        if (!agentLockCheck("hold_b_real_cancel_preserves_document",
+                            st.docMirror.tree() == P.baseline["tree"] &&
+                            st.docMirror.revision() == P.baseline["revision"] &&
+                            st.selectedFeatureId == P.baseline["selection"],
+                            {{"tree", st.docMirror.tree()}, {"baseline", P.baseline}})) return;
+        auto& gate = g_agentLockGate;
+        gate.oldReady.store(false);
+        gate.oldOk.store(false);
+        gate.allowOld.store(false);
+        gate.expectOld.store(true);
+        gate.preHoldBlocked.store(false);
+        gate.allowPreHold.store(false);
+        gate.expectPreHold.store(true);
+        gate.expectRelease.store(false);
+        gate.releaseReady.store(false);
+        gate.releaseOk.store(false);
+        gate.expectCheckpoint.store(false);
+        gate.oldResult = nullptr;
+        gate.oldError.clear();
+        gate.releaseResult = nullptr;
+        gate.releaseError.clear();
+        P.step = 40;
+        return;
+    }
+    case 40:
+        if (!agentLockCheck("busy_hold_a_editor_open",
+                            st.propertyManager->openForEdit(st, P.box) &&
+                            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(st.propertyManager)) ==
+                                P.baseline["pm"].get<uint64_t>(),
+                            {{"baseline", P.baseline}})) return;
+        P.step = 41;
+        return;
+    case 41: {
+        auto& gate = g_agentLockGate;
+        if (!gate.preHoldBlocked.load()) return;
+#ifndef __EMSCRIPTEN__
+        P.foreign = std::make_unique<chudware_ipc::EngineClient>();
+        chudware_ipc::EngineClient::Options options;
+        options.clientKind = "mcp";
+        options.allowSpawn = false;
+        nlohmann::json attached, held;
+        std::string foreignError;
+        const bool connected = P.foreign->connectOrSpawn(options, foreignError);
+        const bool attachedOk = connected &&
+            P.foreign->call("attach_doc", {{"doc_id", P.doc}, {"mode", "rw"}},
+                            attached, foreignError, 15000);
+        P.foreignHeld = attachedOk &&
+            P.foreign->call("edit_hold", {{"doc_id", P.doc}}, held, foreignError, 15000) &&
+            held.is_object() && held.value("ok", false);
+        if (!agentLockCheck("busy_hold_foreign_real_lease_after_checkpoint",
+                            P.foreignHeld && gate.preHoldBlocked.load() && !gate.allowPreHold.load(),
+                            {{"attach", attached}, {"hold", held}, {"error", foreignError}})) return;
+#else
+        agentLockCheck("native_daemon_required", false, {}); return;
+#endif
+        gate.allowPreHold.store(true);
+        P.step = 42;
+        return;
+    }
+    case 42: {
+        auto& gate = g_agentLockGate;
+        if (!gate.oldReady.load()) return;
+#ifndef __EMSCRIPTEN__
+        nlohmann::json released;
+        std::string foreignError;
+        const bool releasedOk = P.foreign && P.foreignHeld &&
+            P.foreign->call("edit_release", {{"doc_id", P.doc}}, released, foreignError, 15000) &&
+            released.is_object() && released.value("ok", false);
+        if (!agentLockCheck("busy_hold_real_old_rejection_gated",
+                            !gate.oldOk.load() && gate.oldResult.is_object() &&
+                            gate.oldResult.value("code", std::string()) == "busy_preview" &&
+                            !gate.allowOld.load() && releasedOk,
+                            {{"old_result", gate.oldResult}, {"old_error", gate.oldError},
+                             {"foreign_release", released}, {"foreign_error", foreignError}})) return;
+        P.foreignHeld = false;
+        P.foreign->disconnect();
+        P.foreign.reset();
+#else
+        agentLockCheck("native_daemon_required", false, {}); return;
+#endif
+        P.settle = 3;
+        P.step = 43;
+        return;
+    }
+    case 43:
+        if (!P.pointerActive) g_agentLockGate.expectRelease.store(true);
+        if (agentLockClick("##pm_cancel", shotItem("##pm_cancel", true, nullptr), nullptr)) P.step = 44;
+        return;
+    case 44:
+        if (!agentLockCheck("busy_hold_a_real_cancel_before_reply",
+                            !st.propertyManager->active() && !g_agentLockGate.allowOld.load() &&
+                            st.docMirror.tree() == P.baseline["tree"] &&
+                            st.docMirror.revision() == P.baseline["revision"],
+                            {{"tree", st.docMirror.tree()}, {"baseline", P.baseline}})) return;
+        P.sentinel = nullptr;
+        st.rpc.callPrimary("doc_tree", {{"doc_id", P.doc}}, [&P](const core::RpcResult& result) {
+            P.sentinel = {{"ok", result.ok}, {"result", result.result}, {"error", result.err}};
+        });
+        P.step = 45;
+        return;
+    case 45: {
+        const auto* item = uxRibbonItem("fillet");
+        const auto current = ui::commandAvailability("fillet", ui::commandContext(st));
+        const auto shown = ui::ribbonCommandAvailability("fillet");
+        if (!P.pointerActive &&
+            !agentLockCheck("busy_hold_b_real_ribbon_available",
+                            item && item->value("visible", false) && item->value("enabled", false) &&
+                            current.visible && current.enabled && shown.visible && shown.enabled,
+                            {{"item", item ? *item : nlohmann::json()},
+                             {"reason", current.reason ? current.reason : ""}})) return;
+        if (agentLockClick("fillet", item, "##RibbonBar")) P.step = 46;
+        return;
+    }
+    case 46:
+        if (!agentLockCheck("busy_hold_b_same_pm_real_form",
+                            st.propertyManager->active() && st.propertyManager->activeFormType() == "fillet" &&
+                            st.propertyManager->targetId().empty() &&
+                            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(st.propertyManager)) ==
+                                P.baseline["pm"].get<uint64_t>() && !g_agentLockGate.allowOld.load(),
+                            {{"form", st.propertyManager->activeFormType()}, {"baseline", P.baseline}})) return;
+        if (agentLockClick("=##dim_txt", uxField("fillet", "radius", "=##dim_txt"), "FeatureManager"))
+            P.step = 47;
+        return;
+    case 47:
+        if (agentLockClick("##dim", uxField("fillet", "radius", "##dim"), "FeatureManager")) P.step = 48;
+        return;
+    case 48:
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, true);
+        ImGui::GetIO().AddKeyEvent(ImGuiKey_A, true);
+        P.step = 49; return;
+    case 49:
+        ImGui::GetIO().AddKeyEvent(ImGuiKey_A, false);
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false);
+        P.step = 50; return;
+    case 50:
+        ImGui::GetIO().AddInputCharactersUTF8("busy-hold-draft");
+        P.report["actions"].push_back({{"action", "type dimension"},
+                                        {"form", "fillet"}, {"field", "radius"},
+                                        {"text", "busy-hold-draft"}});
+        P.step = 51; return;
+    case 51: {
+        const auto state = agentLockVisibleState(st);
+        if (!agentLockCheck("busy_hold_b_real_live_draft",
+                            state.value("input_active", false) &&
+                            state.value("input", std::string()) == "busy-hold-draft",
+                            {{"state", state}})) return;
+        P.step = 52; return;
+    }
+    case 52:
+        if (P.input.key(ImGuiKey_Enter)) P.step = 520;
+        return;
+    case 520:
+        if (agentLockClick("##dim", uxField("fillet", "radius", "##dim"), "FeatureManager"))
+            P.step = 53;
+        return;
+    case 53: {
+        P.before = agentLockVisibleState(st);
+        if (!agentLockCheck("busy_hold_b_snapshot_before_old_reply",
+                            P.before.value("active", false) && P.before.value("form", "") == "fillet" &&
+                            P.before.value("target", "") == "" && P.before.value("input_active", false) &&
+                            P.before.value("input", "") == "busy-hold-draft" &&
+                            P.before.value("inline_error", false) && P.before.value("error", "") == "" &&
+                            agentLockDocumentState(st) == P.baseline &&
+                            g_agentLockGate.oldReady.load() && !g_agentLockGate.allowOld.load(),
+                            {{"state", P.before}, {"baseline", P.baseline}})) return;
+        P.savedSuppressToasts = st.suppressToasts;
+        P.toastOverride = true;
+        st.suppressToasts = false;
+        P.baseline["busy_toasts"] = agentLockStaleToastCount(st);
+        g_agentLockGate.allowOld.store(true);
+        P.step = 54;
+        return;
+    }
+    case 54: {
+        if (st.rpc.busy()) return;
+        const auto after = agentLockVisibleState(st);
+        const int staleToasts = agentLockStaleToastCount(st);
+        if (!agentLockCheck("busy_hold_old_callback_preserves_b",
+                            P.sentinel.is_object() && P.sentinel.value("ok", false) &&
+                            P.sentinel["result"].is_object() &&
+                            P.sentinel["result"].value("revision", -1) == P.baseline["revision"] &&
+                            P.sentinel["result"].value("tree", nlohmann::json()) == P.baseline["tree"] &&
+                            g_agentLockGate.releaseReady.load() && g_agentLockGate.releaseOk.load() &&
+                            after == P.before && staleToasts == P.baseline["busy_toasts"].get<int>() &&
+                            !g_agentLockGate.timedOut.load(),
+                            {{"before", P.before}, {"after", after}, {"sentinel", P.sentinel},
+                             {"old_busy", g_agentLockGate.oldResult},
+                             {"stale_toasts", staleToasts}})) return;
+#ifndef __EMSCRIPTEN__
+        chudware_ipc::EngineClient foreign;
+        chudware_ipc::EngineClient::Options options;
+        options.clientKind = "mcp";
+        options.allowSpawn = false;
+        nlohmann::json attached, busy;
+        std::string foreignError;
+        const bool connected = foreign.connectOrSpawn(options, foreignError);
+        const bool attachedOk = connected &&
+            foreign.call("attach_doc", {{"doc_id", P.doc}, {"mode", "rw"}},
+                         attached, foreignError, 15000);
+        const bool held = attachedOk &&
+            foreign.call("edit_hold", {{"doc_id", P.doc}}, busy, foreignError, 15000);
+        foreign.disconnect();
+        if (!agentLockCheck("busy_hold_b_actually_owns_lease",
+                            attachedOk && !held && busy.is_object() &&
+                            busy.value("code", std::string()) == "busy_preview",
+                            {{"attach", attached}, {"reply", busy}, {"error", foreignError}})) return;
+#else
+        agentLockCheck("native_daemon_required", false, {}); return;
+#endif
+        P.baseline["b_hold_probe_at"] = pipingNow();
+        P.step = 55;
+        return;
+    }
+    case 55:
+        if (agentLockClick("##pm_cancel", shotItem("##pm_cancel", true, nullptr), nullptr)) P.step = 56;
+        return;
+    case 56: {
+        if (st.rpc.busy() || st.propertyManager->active()) return;
+#ifndef __EMSCRIPTEN__
+        chudware_ipc::EngineClient foreign;
+        chudware_ipc::EngineClient::Options options;
+        options.clientKind = "mcp";
+        options.allowSpawn = false;
+        nlohmann::json attached, held, released;
+        std::string foreignError;
+        const bool connected = foreign.connectOrSpawn(options, foreignError);
+        const bool attachedOk = connected &&
+            foreign.call("attach_doc", {{"doc_id", P.doc}, {"mode", "rw"}},
+                         attached, foreignError, 15000);
+        const bool acquired = attachedOk &&
+            foreign.call("edit_hold", {{"doc_id", P.doc}}, held, foreignError, 15000) &&
+            held.is_object() && held.value("ok", false);
+        const bool releasedOk = acquired &&
+            foreign.call("edit_release", {{"doc_id", P.doc}}, released, foreignError, 15000) &&
+            released.is_object() && released.value("ok", false);
+        foreign.disconnect();
+        if (!agentLockCheck("busy_hold_b_cancel_releases_owned_lease",
+                            acquired && releasedOk &&
+                            pipingNow() - P.baseline["b_hold_probe_at"].get<double>() <
+                                held.value("hold_secs", 0) &&
+                            st.docMirror.tree() == P.baseline["tree"] &&
+                            st.docMirror.revision() == P.baseline["revision"] &&
+                            st.selectedFeatureId == P.baseline["selection"] &&
+                            agentLockStaleToastCount(st) == P.baseline["busy_toasts"].get<int>(),
+                            {{"attach", attached}, {"hold", held}, {"release", released},
+                             {"error", foreignError}, {"tree", st.docMirror.tree()}})) return;
+#else
+        agentLockCheck("native_daemon_required", false, {}); return;
+#endif
+        st.suppressToasts = P.savedSuppressToasts;
+        P.toastOverride = false;
+        st.rpc.setPrimaryCaller(agentLockPrimary);
+        P.gateInstalled = false;
+        P.step = 57;
+        return;
+    }
+    case 57:
+        if (agentLockClick("##ws_2", shotItem("##ws_2", true, "##MainMenuBar"), "##MainMenuBar")) {
+            P.step = 58;
+            P.settle = 8;
+        }
+        return;
+    case 58:
+        if (!agentLockCheck("daemon_study_simulate_workspace",
+                            st.activeWorkspace == AppState::Workspace::Simulate &&
+                            st.docMirror.docId() == P.doc &&
+                            st.activeTab == P.baseline["tab"].get<int>(),
+                            {{"workspace", static_cast<int>(st.activeWorkspace)},
+                             {"doc", st.docMirror.docId()}, {"tab", st.activeTab}})) return;
+        if (agentLockClick("Static", shotItem("Static", true, "##RibbonBar"), "##RibbonBar")) {
+            P.step = 59;
+            P.settle = 4;
+        }
+        return;
+    case 59: {
+        const auto context = ui::commandContext(st);
+        if (st.rpc.busy() || context.studyListPending || context.simCreationPending ||
+            !context.studyFactsCurrent) return;
+        const auto available = ui::commandAvailability("sim_new_static", context);
+        const auto displayed = ui::ribbonCommandAvailability("sim_new_static");
+        const auto* caret = uxRibbonDropItem("sim_new_picker");
+        nlohmann::json list;
+        std::string listError;
+        const bool listed = st.worker.call("sim_study_list", {{"doc_id", P.doc}}, list, listError, 15000);
+        if (!agentLockCheck("daemon_study_real_empty_origin",
+                            engine::daemonMode() && st.simManager &&
+                            st.activeWorkspace == AppState::Workspace::Simulate &&
+                            st.docMirror.docId() == P.doc && context.activeDocId == P.doc &&
+                            st.activeTab == P.baseline["tab"].get<int>() &&
+                            st.docMirror.revision() == P.baseline["revision"] &&
+                            st.docMirror.tree() == P.baseline["tree"] &&
+                            st.simManager->studyCount() == 0 && st.simManager->activeStudyId().empty() &&
+                            listed && list.is_object() && list.value("studies", nlohmann::json()).is_array() &&
+                            list["studies"].empty() && available.visible && available.enabled &&
+                            displayed.visible && displayed.enabled && caret &&
+                            caret->value("visible", false) && caret->value("enabled", false),
+                            {{"native", list}, {"error", listError},
+                             {"caret", caret ? *caret : nlohmann::json()},
+                             {"reason", available.reason ? available.reason : ""},
+                             {"doc", st.docMirror.docId()}, {"revision", st.docMirror.revision()}})) return;
+        P.study = {{"before", list}, {"doc", P.doc}, {"revision", st.docMirror.revision()},
+                   {"tab", st.activeTab}, {"count", st.simManager->studyCount()},
+                   {"barrier", nullptr}, {"pending_observed", false}};
+        P.step = 60;
+        return;
+    }
+    case 60:
+        if (agentLockClick("sim_new_picker_caret", uxRibbonDropItem("sim_new_picker"), "##RibbonBar")) {
+            P.step = 61;
+            P.settle = 2;
+        }
+        return;
+    case 61: {
+        const auto* row = uxRibbonPopupRow("sim_new_static", "##fr");
+        if (!P.pointerActive && (!row || !row->value("visible", false))) {
+            shotScrollTo("sim_new_static", "##Popup_", true, row);
+            return;
+        }
+        if (!P.pointerActive && !P.study.value("barrier_queued", false)) {
+            const auto available = ui::commandAvailability("sim_new_static", ui::commandContext(st));
+            const auto displayed = ui::ribbonCommandAvailability("sim_new_static");
+            if (!agentLockCheck("daemon_study_real_static_variant",
+                                row && row->value("visible", false) && row->value("enabled", false) &&
+                                available.visible && available.enabled && displayed.visible && displayed.enabled,
+                                {{"item", row ? *row : nlohmann::json()},
+                                 {"reason", available.reason ? available.reason : ""}})) return;
+            // Real metadata remains non-interaction work while holding the FIFO ahead of the
+            // user's real study-add. This makes the queued, not-yet-delivered phase observable.
+            P.study["barrier_queued"] = true;
+            st.rpc.callCoalesced("sim_caps", nlohmann::json::object(),
+                [&P](const core::RpcResult& result) {
+                    P.study["barrier"] = {{"ok", result.ok}, {"result", result.result},
+                                          {"error", result.err}};
+                }, "agentlock-static-study-barrier", 15000, 1500);
+        }
+        if (agentLockClick("sim_new_static_variant", row, "##Popup_")) P.step = 62;
+        return;
+    }
+    case 62:
+        if (st.rpc.busy()) return;
+        P.step = 63; // The callback drained before this tick; wait for its actual presented frame.
+        return;
+    case 63: {
+        const auto context = ui::commandContext(st);
+        if (st.rpc.busy() || context.studyListPending || context.simCreationPending ||
+            !context.studyFactsCurrent) return;
+        const auto definition = st.simManager ? st.simManager->activeStudyDefinition() : nlohmann::json();
+        const std::string selected = st.simManager ? st.simManager->activeStudyId() : "";
+        nlohmann::json list, nativeDoc;
+        std::string listError, docError;
+        const bool listed = st.worker.call("sim_study_list", {{"doc_id", P.doc}}, list, listError, 15000);
+        const bool readDoc = st.worker.call("doc_tree", {{"doc_id", P.doc}}, nativeDoc, docError, 15000);
+        const auto records = list.is_object() ? list.value("studies", nlohmann::json()) : nlohmann::json();
+        auto nativeModel = nativeDoc.is_object() ? nativeDoc.value("tree", nlohmann::json()) : nlohmann::json();
+        auto baselineModel = P.baseline["tree"];
+        if (nativeModel.is_object()) nativeModel.erase("studies");
+        if (baselineModel.is_object()) baselineModel.erase("studies");
+        const bool selectedRecord = records.is_array() && records.size() == 1 &&
+            records[0].is_object() && records[0].value("id", std::string()) == selected &&
+            records[0].value("type", std::string()) == "static";
+        const int nativeRevision = list.is_object() ? list.value("revision", -1) : -1;
+        const int beforeRevision = P.study["before"].value("revision", -1);
+        if (!agentLockCheck("daemon_study_real_async_receipt_and_origin",
+                            P.study.value("pending_observed", false) &&
+                            P.study["barrier"].is_object() && P.study["barrier"].value("ok", false) &&
+                            st.simManager && st.simManager->studyCount() == P.study["count"].get<int>() + 1 &&
+                            !selected.empty() && definition.is_object() &&
+                            definition.value("id", std::string()) == selected &&
+                            definition.value("type", std::string()) == "static" &&
+                            listed && selectedRecord && beforeRevision >= 0 &&
+                            beforeRevision == P.study["revision"] && nativeRevision > beforeRevision &&
+                            readDoc && nativeDoc.is_object() && nativeDoc.value("revision", -1) == nativeRevision &&
+                            nativeDoc.value("tree", nlohmann::json()).is_object() &&
+                            nativeDoc["tree"].value("studies", nlohmann::json()) == records &&
+                            nativeModel.is_object() && nativeModel == baselineModel &&
+                            st.docMirror.docId() == P.study["doc"] && context.activeDocId == P.doc &&
+                            st.activeTab == P.study["tab"].get<int>() &&
+                            st.docMirror.revision() == P.study["revision"] &&
+                            st.docMirror.tree() == P.baseline["tree"] &&
+                            st.activeWorkspace == AppState::Workspace::Simulate,
+                            {{"pending", P.study}, {"selected_id", selected}, {"definition", definition},
+                             {"native", list}, {"native_doc", nativeDoc}, {"list_error", listError},
+                             {"doc_error", docError}, {"mirror_doc", st.docMirror.docId()},
+                             {"mirror_revision", st.docMirror.revision()}})) return;
+        P.study["receipt"] = {{"id", selected}, {"definition", definition}, {"native", list},
+                              {"native_doc", nativeDoc}};
+        P.study["receipt_time"] = pipingNow();
+        // A newly opened auto-sized card measures while hidden on its first draw. Inspect
+        // a subsequent real frame, not the still-hidden first observation.
+        P.step = 65;
+        return;
+    }
+    case 65: {
+        const auto* fixture = shotItem("Fixture", false, "##sim_body");
+        if (!fixture || !fixture->value("visible", false)) {
+            if (pipingNow() - P.study["receipt_time"].get<double>() >= 5.0) {
+                nlohmann::json items = nlohmann::json::array();
+                for (const auto& item : ui::audit::observedItems())
+                    if (item.value("window", std::string()).find("##sim_body") != std::string::npos)
+                        items.push_back(item);
+                agentLockCheck("daemon_study_real_async_id_and_presentation", false,
+                               {{"receipt", P.study["receipt"]}, {"items", items}});
+                return;
+            }
+            if (fixture) shotScrollTo("Fixture", "##sim_body", true, fixture);
+            return;
+        }
+        const auto context = ui::commandContext(st);
+        const auto definition = st.simManager ? st.simManager->activeStudyDefinition() : nlohmann::json();
+        const std::string selected = st.simManager ? st.simManager->activeStudyId() : "";
+        if (!agentLockCheck("daemon_study_real_async_id_and_presentation",
+                            P.study.value("pending_observed", false) && st.simManager &&
+                            st.simManager->studyCount() == P.study["count"].get<int>() + 1 &&
+                            selected == P.study["receipt"]["id"] &&
+                            definition == P.study["receipt"]["definition"] &&
+                            st.docMirror.docId() == P.study["doc"] && context.activeDocId == P.doc &&
+                            st.activeTab == P.study["tab"].get<int>() &&
+                            st.docMirror.revision() == P.study["revision"] &&
+                            st.docMirror.tree() == P.baseline["tree"] &&
+                            st.activeWorkspace == AppState::Workspace::Simulate &&
+                            st.simSidebarTab == 1 && fixture->value("enabled", false),
+                            {{"receipt", P.study["receipt"]}, {"selected_id", selected},
+                             {"definition", definition}, {"sidebar", st.simSidebarTab},
+                             {"fixture", *fixture}})) return;
+        P.report["daemon_static_study"] = {{"receipt", P.study["receipt"]},
+                                            {"interaction", P.study}, {"fixture", *fixture}};
+        P.step = 64;
         return;
     }
     default:
@@ -3243,33 +5474,881 @@ bool agentLockEndFrame(AppState& st, int dw, int dh, const char* screenshotPath,
     auto& P = g_agentLock;
     if (!P.want) return false;
     ++st.frame;
+    // The real release frame has submitted the study-add, but the next frame has not drained
+    // its callback. Record the genuine queued state rather than inferring it from the final UI.
+    if (!P.done && P.step == 61 && P.input.phase >= 3 && st.simManager &&
+        P.study.is_object() && !P.study.value("pending_observed", false)) {
+        const auto context = ui::commandContext(st);
+        if (context.simCreationPending) {
+            P.study["pending"] = {{"doc", context.activeDocId}, {"tab", st.activeTab},
+                                   {"revision", st.docMirror.revision()},
+                                   {"creation_pending", context.simCreationPending},
+                                   {"interaction_busy", st.rpc.interactionBusy()},
+                                   {"barrier_outstanding", P.study["barrier"].is_null()},
+                                   {"count", st.simManager->studyCount()},
+                                   {"selected_id", st.simManager->activeStudyId()}};
+            P.study["pending_observed"] = context.activeDocId == P.doc &&
+                st.activeTab == P.study["tab"].get<int>() &&
+                st.docMirror.revision() == P.study["revision"] &&
+                st.rpc.interactionBusy() && P.study["barrier"].is_null() &&
+                st.simManager->studyCount() == P.study["count"].get<int>() &&
+                st.simManager->activeStudyId().empty();
+        }
+    }
+    if (P.dir.empty()) {
+        const std::filesystem::path shot = screenshotPath && *screenshotPath ? screenshotPath : "";
+        const char* repo = std::getenv("CHUDWARE_REPO");
+        P.dir = shot.has_parent_path() ? shot.parent_path().string()
+                                       : std::string(repo ? repo : ".") + "/scratch/agentlock_shots";
+        std::error_code ec;
+        std::filesystem::create_directories(P.dir, ec);
+    }
     if (!P.capture.empty()) {
         writeBackbufferPng(P.capture.c_str(), dw, dh, P.done ? screenshotPath : nullptr);
         P.report["captures"].push_back(P.capture);
         P.capture.clear();
     }
-    glfwSwapBuffers(st.win);
+    swapScenarioFrame(st.win);
     breakLoop = false;
     if (P.done) {
+        if (!P.conv.empty()) st.runFor(P.conv)->running.store(false);
         const std::string path = P.dir + "/agentlock_report.json";
         std::ofstream out(path, std::ios::trunc);
         out << P.report.dump(2) << '\n';
         out.close();
         std::printf("[agentlock-shot] report %s %s\n", path.c_str(), P.report.dump().c_str());
         std::fflush(stdout);
-        if (P.failed || !out) { std::fflush(nullptr); std::_Exit(EXIT_FAILURE); }
+        if (P.failed || !out) {
+            core::framestats::flushReport();
+            std::fflush(nullptr);
+            std::_Exit(EXIT_FAILURE);
+        }
         breakLoop = true;
     }
     return true;
 }
 
+// Real in-memory source edits, renderer meshes, tab caches, and PM deferral in
+// either the private daemon or in-process backend. No assembly rebuild/save is
+// issued after the source edits.
+struct AssemblyRefreshShot {
+    bool init = false, want = false, done = false, failed = false;
+    int step = 0, partTab = -1, assemblyTab = -1, revision = -1;
+    double started = 0, since = 0;
+    std::string dir, path, original, part, assembly, feature, capture;
+    nlohmann::json report;
+} g_assemblyRefresh;
+
+bool assemblyRefreshCheck(const char* name, bool ok, const nlohmann::json& evidence) {
+    auto& s = g_assemblyRefresh;
+    s.report["checks"].push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
+    std::printf("[asm-refresh] %s %s %s\n", ok ? "PASS" : "FAIL", name, evidence.dump().c_str());
+    std::fflush(stdout);
+    if (!ok) {
+        s.failed = s.done = true;
+        s.report["failure"] = {{"name", name}, {"step", s.step}};
+        s.capture = s.dir + "/FAILED.png";
+    }
+    return ok;
+}
+
+double assemblyRefreshLength(const std::unordered_map<uint32_t, std::array<float, 6>>& bounds) {
+    if (bounds.size() != 1) return -1.0;
+    const auto& b = bounds.begin()->second;
+    return b[3] - b[0];
+}
+
+std::string assemblyRefreshFile(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    return in ? std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>())
+              : std::string();
+}
+
+void assemblyRefreshTick(AppState& st) {
+    auto& s = g_assemblyRefresh;
+    if (!s.init) {
+        s.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        s.want = st.shot && mode && std::strcmp(mode, "asm_refresh") == 0;
+        if (!s.want) return;
+        const char* out = std::getenv("CHUDWARE_ASM_REFRESH_OUT");
+        s.dir = out && *out ? out : "scratch/asm_refresh_shots";
+        std::error_code ec;
+        std::filesystem::create_directories(s.dir, ec);
+        s.path = (std::filesystem::absolute(s.dir) / "source.step+").string();
+        s.started = pipingNow();
+        s.report = {{"scenario", "asm_refresh"}, {"ok", false},
+                    {"checks", nlohmann::json::array()}, {"captures", nlohmann::json::array()}};
+        if (ec) { assemblyRefreshCheck("output_directory", false, {{"error", ec.message()}}); return; }
+    }
+    if (!s.want || s.done) return;
+    if (pipingNow() - s.started > 120.0) {
+        assemblyRefreshCheck("timeout", false, {{"step", s.step},
+            {"active_doc", st.docMirror.docId()}, {"revision", st.docMirror.revision()},
+            {"visible_length", assemblyRefreshLength(st.bodyBBoxCache)}}); return;
+    }
+    if (!st.workerStarted || st.frame < 5 || st.rpc.busy() || !s.capture.empty()) return;
+    if (engine::daemonMode() && !st.daemonEverConnected) return;
+    auto selected = [&](const std::string& doc) {
+        return st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
+               st.docTabs[st.activeTab].docId == doc && st.docMirror.docId() == doc;
+    };
+    auto faceSelected = [&]() {
+        if (st.selection.size() != 1) return false;
+        const auto& hit = st.selection.items()[0].hit;
+        return hit.body_id == 1 && hit.kind == render::PickKind::Face && hit.topo_id == 1;
+    };
+    auto visibleLength = [&]() {
+        return st.hasDocMesh && st.renderer && st.renderer->bodyCount() == 1
+                   ? assemblyRefreshLength(st.bodyBBoxCache) : -1.0;
+    };
+    auto near = [](double a, double b) { return std::fabs(a - b) < 0.01; };
+    auto editSource = [&](double length) {
+        nlohmann::json result;
+        std::string err;
+        const bool ok = st.worker.call("doc_apply_ops",
+            {{"doc_id", s.part}, {"base_revision", -1}, {"with_tess", false},
+             {"ops", nlohmann::json::array({{{"op", "edit_feature"}, {"id", s.feature},
+                                               {"params", {{"length", length}}}}})}},
+            result, err, 60000) && !result.contains("code");
+        return assemblyRefreshCheck("source_edit", ok, {{"length", length}, {"error", err}});
+    };
+    std::string err;
+    switch (s.step) {
+    case 0: {
+        st.activeWorkspace = AppState::Workspace::Model;
+        if (!assemblyRefreshCheck("new_part", st.docMirror.newPart(st.worker, err), {{"error", err}})) return;
+        st.addDocTab(false);
+        s.partTab = st.activeTab;
+        s.part = st.docMirror.docId();
+        const auto box = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Source box"},
+                {"params", {{"length", 10.0}, {"width", 10.0}, {"height", 10.0},
+                            {"centered", true}}}}}}}));
+        if (!assemblyRefreshCheck("build_part", box.ok && !box.aicm_path.empty(),
+                                  {{"error", box.error_message}})) return;
+        s.feature = box.id_map.value("$0", std::string());
+        if (!assemblyRefreshCheck("load_part", !s.feature.empty() &&
+                                  st.loadDocMesh(box.aicm_path, err), {{"error", err}})) return;
+        nlohmann::json saved;
+        if (!assemblyRefreshCheck("save_initial_source",
+                st.worker.call("doc_save", {{"doc_id", s.part}, {"path", s.path}}, saved, err, 60000) &&
+                !saved.contains("code"), {{"error", err}})) return;
+        st.docTabs[s.partTab].path = s.path;
+        s.original = assemblyRefreshFile(s.path);
+        if (!assemblyRefreshCheck("source_file_exists", !s.original.empty(), {{"path", s.path}})) return;
+        if (!assemblyRefreshCheck("new_assembly", st.docMirror.newAssembly(st.worker, err),
+                                  {{"error", err}})) return;
+        st.clearViewportForNewDoc();
+        st.addDocTab(true);
+        s.assemblyTab = st.activeTab;
+        s.assembly = st.docMirror.docId();
+        const auto inserted = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "asm_insert_component"}, {"source", {{"path", s.path}}}, {"fixed", true}}
+        }));
+        if (!assemblyRefreshCheck("insert_component", inserted.ok && !inserted.aicm_path.empty(),
+                                  {{"error", inserted.error_message}})) return;
+        if (!assemblyRefreshCheck("baseline_mesh", st.loadDocMesh(inserted.aicm_path, err) &&
+                                  near(visibleLength(), 10.0), {{"error", err},
+                                  {"length", visibleLength()}})) return;
+        s.revision = st.docMirror.revision();
+        render::PickHit hit;
+        hit.body_id = 1; hit.kind = render::PickKind::Face; hit.topo_id = 1;
+        st.selection.selectOne(hit);
+        st.yaw = 35; st.pitch = 28; st.zoom = 1.0f;
+        s.capture = s.dir + "/01_initial.png";
+        ++s.step; return;
+    }
+    case 1:
+        if (!editSource(20.0)) return;
+        ++s.step; return;
+    case 2:
+        if (!selected(s.assembly) || st.docMirror.revision() <= s.revision ||
+            !near(visibleLength(), 20.0)) return;
+        if (!assemblyRefreshCheck("active_push_mesh_and_selection",
+                faceSelected() && st.activeTab == s.assemblyTab,
+                {{"length", visibleLength()}, {"revision", st.docMirror.revision()},
+                 {"selection", st.selection.size()}})) return;
+        s.revision = st.docMirror.revision();
+        s.capture = s.dir + "/02_active_push.png";
+        ++s.step; return;
+    case 3: {
+        if (selected(s.assembly)) { st.switchToTab(s.partTab); return; }
+        if (!selected(s.part)) return;
+        // The first edit came from a background raw source call. Resync the
+        // source mirror before simulating the user's next edit, never the assembly.
+        if (!assemblyRefreshCheck("source_resync", st.docMirror.resync(st.worker), {})) return;
+        const auto changed = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "edit_feature"}, {"id", s.feature}, {"params", {{"length", 30.0}}}}
+        }));
+        if (!assemblyRefreshCheck("human_source_edit", changed.ok && !changed.aicm_path.empty() &&
+                                  st.loadDocMesh(changed.aicm_path, err), {{"error", err}})) return;
+        render::PickHit hit;
+        hit.body_id = 1; hit.kind = render::PickKind::Face; hit.topo_id = 1;
+        st.selection.selectOne(hit);
+        ++s.step; return;
+    }
+    case 4: {
+        const auto& tab = st.docTabs[s.assemblyTab];
+        if (!tab.session || !tab.session->cachedDocMesh || tab.meshCacheInvalidated ||
+            tab.session->cachedRevision <= s.revision ||
+            !near(assemblyRefreshLength(tab.session->cachedDocMesh->bodyBBoxCache), 30.0)) return;
+        if (!assemblyRefreshCheck("background_push_does_not_select_assembly",
+                selected(s.part) && faceSelected() && near(visibleLength(), 30.0),
+                {{"active_doc", st.docMirror.docId()}, {"part_length", visibleLength()},
+                 {"cached_length", assemblyRefreshLength(tab.session->cachedDocMesh->bodyBBoxCache)}})) return;
+        s.revision = tab.session->cachedRevision;
+        st.switchToTab(s.assemblyTab);
+        ++s.step; return;
+    }
+    case 5:
+        if (!selected(s.assembly) || !near(visibleLength(), 30.0)) return;
+        if (!assemblyRefreshCheck("cached_switch_mesh_and_selection", faceSelected(),
+                                  {{"length", visibleLength()}, {"selection", st.selection.size()}})) return;
+        s.capture = s.dir + "/03_background_switch.png";
+        st.propertyManager->openGuest(st, "Assembly edit", "mate",
+            [](AppState&) {}, [](AppState&) {}, [](AppState&) {});
+        if (!assemblyRefreshCheck("editor_open", st.propertyManager->active(), {})) return;
+        if (!editSource(40.0)) return;
+        s.since = pipingNow();
+        ++s.step; return;
+    case 6:
+        if (pipingNow() - s.since < 0.5) return;
+        if (!assemblyRefreshCheck("active_edit_defers_push",
+                selected(s.assembly) && st.propertyManager->active() &&
+                st.docMirror.revision() == s.revision && near(visibleLength(), 30.0),
+                {{"length", visibleLength()}, {"revision", st.docMirror.revision()}})) return;
+        st.switchToTab(s.partTab);
+        if (!editSource(45.0)) return;
+        s.since = pipingNow();
+        ++s.step; return;
+    case 7:
+        if (pipingNow() - s.since < 0.5 || !selected(s.part)) return;
+        st.switchToTab(s.assemblyTab);
+        ++s.step; return;
+    case 8:
+        if (!selected(s.assembly)) return;
+        if (!assemblyRefreshCheck("parked_edit_defers_push",
+                st.propertyManager->active() && st.docMirror.revision() == s.revision &&
+                near(visibleLength(), 30.0),
+                {{"length", visibleLength()}, {"revision", st.docMirror.revision()}})) return;
+        st.propertyManager->closeGuest();
+        ++s.step; return;
+    case 9:
+        if (!selected(s.assembly) || st.docMirror.revision() <= s.revision ||
+            !near(visibleLength(), 45.0)) return;
+        if (!assemblyRefreshCheck("deferred_latest_mesh", faceSelected(),
+                {{"length", visibleLength()}, {"revision", st.docMirror.revision()},
+                 {"selection", st.selection.size()}})) return;
+        if (!assemblyRefreshCheck("source_never_saved_after_edits",
+                assemblyRefreshFile(s.path) == s.original, {{"path", s.path}})) return;
+        s.report["ok"] = true;
+        s.done = true;
+        s.capture = s.dir + "/04_deferred.png";
+        return;
+    }
+}
+
+bool assemblyRefreshEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, bool& done) {
+    auto& s = g_assemblyRefresh;
+    if (!s.want) return false;
+    ++st.frame;
+    if (!s.capture.empty()) {
+        if (!writeBackbufferPng(s.capture.c_str(), dw, dh, s.done ? screenshotPath : nullptr))
+            s.failed = true;
+        s.report["captures"].push_back(s.capture);
+        s.capture.clear();
+    }
+    swapScenarioFrame(st.win);
+    done = s.done;
+    if (done) {
+        s.report["ok"] = !s.failed;
+        s.report["seconds"] = pipingNow() - s.started;
+        std::ofstream out(s.dir + "/report.json", std::ios::trunc);
+        out << s.report.dump(2) << '\n';
+        out.close();
+        if (s.failed || !out) {
+            core::framestats::flushReport();
+            std::fflush(nullptr);
+            std::_Exit(EXIT_FAILURE);
+        }
+    }
+    return true;
+}
+// A private local model fixture drives the actual composer, worker and native daemon. The
+// fixture validates its own tool results and retained OMP journal; this scenario observes the
+// GUI's transcript, presentation, selected tab and rendered native document.
+struct OmpGuiShot {
+    bool init = false, want = false, done = false, failed = false;
+    int step = 0, settle = 0;
+    double started = 0;
+    std::string dir, capture, conv, doc, firstRun;
+    size_t baseMessages = 0;
+    std::set<std::string> initialDocs;
+    SceneShotInput input;
+    nlohmann::json report;
+} g_ompGui;
+
+bool ompGuiCheck(const char* name, bool ok, const nlohmann::json& evidence) {
+    auto& s = g_ompGui;
+    s.report["checks"].push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
+    if (!ok) {
+        s.failed = s.done = true;
+        s.report["failure"] = {{"name", name}, {"step", s.step}, {"evidence", evidence}};
+        if (!s.dir.empty()) s.capture = s.dir + "/FAILED.png";
+    }
+    return ok;
+}
+
+void ompGuiTick(AppState& st) {
+    auto& s = g_ompGui;
+    static const char* prompts[] = {
+        "Fixture GUI turn one: create and present a generic box.",
+        "Fixture GUI turn two: retain the previous box and conversation."
+    };
+    static const char* replies[] = {
+        "Fixture GUI box created and presented.",
+        "Fixture GUI second turn retained the previous journal."
+    };
+    if (!s.init) {
+        s.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        s.want = st.shot && mode && std::strcmp(mode, "omp_gui") == 0;
+        if (!s.want) return;
+        // Screenshot runs skip the automatic starter document; start this conversation empty.
+        st.starterTried = true;
+        const char* out = std::getenv("CHUDWARE_OMP_GUI_OUT");
+        s.report = {{"scenario", "omp_gui"}, {"ok", false},
+                    {"checks", nlohmann::json::array()}, {"captures", nlohmann::json::array()}};
+        s.started = pipingNow();
+        if (!out || !*out) {
+            ompGuiCheck("private_output_required", false, {{"env", "CHUDWARE_OMP_GUI_OUT"}});
+            return;
+        }
+        s.dir = out;
+        std::error_code ec;
+        std::filesystem::create_directories(s.dir, ec);
+        if (ec) { ompGuiCheck("output_directory", false, {{"error", ec.message()}}); return; }
+    }
+    if (!s.want || s.done) return;
+    ui::audit::observedItems();
+    if (pipingNow() - s.started > 300) {
+        ompGuiCheck("timeout", false, {{"step", s.step}, {"messages", st.chat.size()},
+                                      {"conversation", st.activeConvId()}});
+        return;
+    }
+    if (!st.workerStarted || st.workerBootPending || !st.startupPhase.empty() ||
+        !st.daemonEverConnected || st.frame < 5 || !s.capture.empty()) return;
+    if (s.settle > 0) { --s.settle; return; }
+    auto next = [&](int step, int settle = 6) { s.step = step; s.settle = settle; };
+    auto promptItem = [&]() -> const nlohmann::json* {
+        for (const auto& item : ui::audit::observedItems())
+            if (item.value("label", std::string()).find("##aiprompt") == 0 &&
+                item.value("visible", false) && item.value("enabled", true)) return &item;
+        return nullptr;
+    };
+    auto fixtureEvents = [&]() {
+        nlohmann::json events = nlohmann::json::array();
+        std::ifstream in(std::filesystem::path(s.dir).parent_path() / "events.jsonl");
+        std::string line;
+        while (std::getline(in, line)) {
+            const auto event = nlohmann::json::parse(line, nullptr, false);
+            if (event.is_object()) events.push_back(event);
+        }
+        return events;
+    };
+    auto runEvidence = [&](int turn) {
+        nlohmann::json rows = nlohmann::json::array();
+        const ChatMsg& m = st.chat[s.baseMessages + turn * 2 + 1];
+        bool clean = m.errKind == ERR_NONE && !m.resultPartial;
+        int tools = 0;
+        for (const auto& row : m.activity) {
+            rows.push_back({{"kind", row.rowKind}, {"title", row.title},
+                            {"status", row.status}, {"detail", row.detail}, {"reason", row.reason}});
+            if (row.status == "fail" || row.status == "failed") clean = false;
+            if (row.rowKind == 3) ++tools;
+        }
+        auto job = st.activeRun();
+        std::string run, error, reason;
+        {
+            std::lock_guard<std::mutex> lock(job->mtx);
+            run = job->runId; error = job->error; reason = job->stopReason;
+        }
+        nlohmann::json evidence = {{"run_id", run}, {"session_id", s.conv},
+            {"text", m.text}, {"error_kind", m.errKind}, {"error", error},
+            {"error_human", m.errorHuman}, {"error_full", m.errorFull},
+            {"stop_reason", reason}, {"tool_rows", tools}, {"activity", rows}};
+        s.report["turns"].push_back(evidence);
+        clean = clean && error.empty() && !run.empty() && m.text == replies[turn] &&
+                st.chat[s.baseMessages + turn * 2].fromUser &&
+                st.chat[s.baseMessages + turn * 2].text == prompts[turn] &&
+                st.activeConvId() == s.conv;
+        if (turn == 0) { s.firstRun = run; clean = clean && tools > 0; }
+        else clean = clean && run != s.firstRun;
+        return ompGuiCheck(turn == 0 ? "first_turn_settled" : "second_turn_settled", clean, evidence);
+    };
+    auto tabIndex = [&]() {
+        for (int i = 0; i < (int)st.docTabs.size(); ++i)
+            if (st.docTabs[i].docId == s.doc) return i;
+        return -1;
+    };
+    switch (s.step) {
+    case 0:
+        st.activeWorkspace = AppState::Workspace::AI;
+        if (!ompGuiCheck("native_daemon_required", engine::daemonMode(), {})) return;
+        glfwSetWindowSize(st.win, 1440, 1000);
+        st.settings.ompProvider = "fixture-local";
+        std::snprintf(st.settings.model, sizeof(st.settings.model), "%s", "fixture-box-model");
+        st.settings.composerFollowRoles = false;
+        st.settings.copilotMode = st.aiInteraction = (int)CopilotMode::Agent;
+        s.conv = st.activeConvId();
+        s.baseMessages = st.chat.size();
+        for (const auto& tab : st.docTabs) s.initialDocs.insert(tab.docId);
+        s.report["provider"] = "fixture-local";
+        s.report["model"] = "fixture-box-model";
+        s.report["conversation_id"] = s.conv;
+        s.report["turns"] = nlohmann::json::array();
+        if (!ompGuiCheck("private_fresh_conversation", !s.conv.empty() && s.baseMessages == 0,
+                         {{"conversation", s.conv}, {"messages", s.baseMessages}})) return;
+        ui::composerSetText(st, prompts[0]);
+        next(1, 100);
+        return;
+    case 1:
+    case 7: {
+        if (!s.input.phase) {
+            const auto* item = promptItem();
+            if (!item) return;
+            s.input.point = shotPoint(*item);
+        }
+        if (s.input.click(s.input.point)) next(s.step == 1 ? 2 : 8);
+        return;
+    }
+    case 2:
+    case 8:
+        if (s.input.key(ImGuiKey_Enter)) next(s.step == 2 ? 3 : 9);
+        return;
+    case 3:
+    case 9: {
+        const int turn = s.step == 3 ? 0 : 1;
+        const size_t need = s.baseMessages + (turn + 1) * 2;
+        const auto job = st.activeRun();
+        if (st.chat.size() < need || job->running.load() || job->ready.load() ||
+            st.chat[need - 1].running) return;
+        if (!runEvidence(turn)) return;
+        s.capture = s.dir + (turn == 0 ? "/01_first_turn.png" : "/03_second_turn.png");
+        next(turn == 0 ? 4 : 10, 12);
+        return;
+    }
+    case 4: {
+        std::vector<std::string> added;
+        for (const auto& tab : st.docTabs)
+            if (!s.initialDocs.count(tab.docId)) added.push_back(tab.docId);
+        if (added.empty()) return;
+        const auto events = fixtureEvents();
+        nlohmann::json outcomes = nlohmann::json::array();
+        std::set<std::string> calls;
+        std::string presented;
+        bool successful = true;
+        for (const auto& e : events) {
+            if (e.value("event", std::string()) != "tool_result") continue;
+            const std::string id = e.value("call_id", std::string());
+            const auto result = e.value("result", nlohmann::json::object());
+            calls.insert(id);
+            outcomes.push_back({{"call_id", id}, {"result", result}});
+            successful = successful && result.is_object() && result.value("ok", false);
+            if (id == "gui_show" && result.value("presented", false))
+                presented = result.value("doc_id", std::string());
+        }
+        for (const char* id : {"gui_discover", "gui_enable", "gui_new", "gui_add", "gui_measure", "gui_show"})
+            successful = successful && calls.count(id) == 1;
+        s.report["fixture_tool_outcomes"] = outcomes;
+        if (!ompGuiCheck("only_presented_document_opened",
+                         successful && added.size() == 1 && !presented.empty() && added[0] == presented,
+                         {{"new_documents", added}, {"presented_document", presented},
+                          {"tool_outcomes", outcomes}})) return;
+        s.doc = presented;
+        s.report["doc_id"] = s.doc;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.shotWorkspacePin = -1;
+        next(5);
+        return;
+    }
+    case 5: {
+        const int idx = tabIndex();
+        if (idx < 0) return;
+        if (!s.input.phase) {
+            const nlohmann::json* target = nullptr;
+            for (const auto& item : ui::audit::observedItems()) {
+                if (item.value("label", std::string()) != "##tab" || !item.value("visible", false)) continue;
+                auto* window = ImGui::FindWindowByName(item.value("window", std::string()).c_str());
+                if (!window) continue;
+                const ImGuiID scope = ImHashData(&idx, sizeof(idx), window->ID);
+                if (item.value("id", ImGuiID(0)) == ImHashStr("##tab", 0, scope)) { target = &item; break; }
+            }
+            if (!target) return;
+            s.input.point = shotPoint(*target);
+        }
+        if (s.input.click(s.input.point)) next(6, 12);
+        return;
+    }
+    case 6: {
+        if (tabIndex() != st.activeTab || st.docMirror.docId() != s.doc || !st.hasDocMesh ||
+            st.rpc.busy() || st.rebuildsInFlight) return;
+        const auto tree = st.docMirror.tree();
+        nlohmann::json bbox; std::string error;
+        const bool called = st.worker.call("doc_bbox", {{"doc_id", s.doc}}, bbox, error, 60000);
+        bool dimensions = called && bbox.contains("min") && bbox.contains("max") &&
+                          bbox["min"].is_array() && bbox["max"].is_array() &&
+                          bbox["min"].size() == 3 && bbox["max"].size() == 3;
+        if (dimensions) {
+            const double expected[] = {40, 30, 20};
+            for (int i = 0; i < 3; ++i)
+                dimensions = dimensions && bbox["min"][i].is_number() && bbox["max"][i].is_number() &&
+                    std::fabs(bbox["max"][i].get<double>() - bbox["min"][i].get<double>() - expected[i]) < 0.05;
+        }
+        bool feature = false;
+        if (tree.contains("features") && tree["features"].is_array())
+            for (const auto& f : tree["features"])
+                if (f.is_object() && f.value("name", std::string()) == "Block") feature = true;
+        if (!ompGuiCheck("selected_native_mesh_and_feature", dimensions && feature,
+                         {{"doc_id", s.doc}, {"mesh", st.hasDocMesh}, {"tree", tree},
+                          {"bbox", bbox}, {"error", error}})) return;
+        s.capture = s.dir + "/02_presented_box.png";
+        ui::composerSetText(st, prompts[1]);
+        next(7, 12);
+        return;
+    }
+    case 10:
+        {
+            const auto events = fixtureEvents();
+            bool retained = false;
+            for (const auto& e : events)
+                if (e.value("event", std::string()) == "journal_retained" &&
+                    e.value("doc_id", std::string()) == s.doc &&
+                    std::fabs(e.value("volume_mm3", 0.0) - 24000.0) < 0.01) retained = true;
+            if (!ompGuiCheck("fixture_confirmed_same_journal", retained, {{"events", events}})) return;
+        }
+        if (!ompGuiCheck("second_turn_keeps_document_selected",
+                         st.activeConvId() == s.conv && tabIndex() == st.activeTab &&
+                         st.docMirror.docId() == s.doc && st.hasDocMesh,
+                         {{"conversation", st.activeConvId()}, {"document", st.docMirror.docId()},
+                          {"mesh", st.hasDocMesh}})) return;
+        s.report["ok"] = true;
+        s.done = true;
+        s.capture = s.dir + "/04_final.png";
+        return;
+    }
+}
+
+bool ompGuiEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, bool& breakLoop) {
+    auto& s = g_ompGui;
+    if (!s.want) return false;
+    ++st.frame;
+    if (!s.capture.empty()) {
+        writeBackbufferPng(s.capture.c_str(), dw, dh, s.done ? screenshotPath : nullptr);
+        s.report["captures"].push_back(s.capture);
+        s.capture.clear();
+    }
+    swapScenarioFrame(st.win);
+    breakLoop = s.done;
+    if (s.done) {
+        s.report["seconds"] = pipingNow() - s.started;
+        std::ofstream out(s.dir.empty() ? "/dev/null" : s.dir + "/report.json", std::ios::trunc);
+        out << s.report.dump(2) << '\n';
+        out.close();
+        std::printf("[omp-gui-shot] %s\n", s.report.dump().c_str());
+        std::fflush(stdout);
+        if (s.failed || !out) {
+            core::framestats::flushReport();
+            std::fflush(nullptr);
+            std::_Exit(EXIT_FAILURE);
+        }
+    }
+    return true;
+}
+
+// Real hostd presentation policy: a second MCP seat authors two documents,
+// presents one, and leaves the other hidden until the user opens its saved file.
+struct PresentationShot {
+    bool init = false, want = false, done = false, failed = false;
+    int step = 0;
+    double started = 0.0, since = 0.0;
+    std::string dir, capture, user, hidden, shown, path, shownPath, dismissed, dismissedPath;
+    long hiddenRevision = 0, shownRevision = 0, diskRevision = 0;
+    size_t diskTabCount = 0;
+    nlohmann::json report;
+#ifndef __EMSCRIPTEN__
+    std::unique_ptr<chudware_ipc::EngineClient> foreign;
+#endif
+};
+PresentationShot g_presentation;
+
+bool presentationCheck(const char* name, bool ok, const nlohmann::json& evidence) {
+    auto& P = g_presentation;
+    P.report["checks"].push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
+    if (!ok) {
+        P.failed = P.done = true;
+        P.report["failure"] = name;
+        P.capture = P.dir + "/failed.png";
+    }
+    return ok;
+}
+
+void presentationTick(AppState& st) {
+    auto& P = g_presentation;
+    if (!P.init) {
+        P.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        P.want = st.shot && mode && std::strcmp(mode, "presentation") == 0;
+        if (!P.want) return;
+        const char* repo = std::getenv("CHUDWARE_REPO");
+        P.dir = std::string(repo ? repo : ".") + "/scratch/presentation_shots";
+        std::error_code ec;
+        std::filesystem::create_directories(P.dir, ec);
+        P.path = P.dir + "/hidden.step+";
+        P.shownPath = P.dir + "/shown.step+";
+        P.dismissedPath = P.dir + "/dismissed.step+";
+        P.started = pipingNow();
+        P.report = {{"scenario", "presentation"}, {"ok", false},
+                    {"checks", nlohmann::json::array()}, {"captures", nlohmann::json::array()}};
+    }
+    if (!P.want || P.done) return;
+    if (pipingNow() - P.started > 120.0) {
+        presentationCheck("timeout", false, {{"step", P.step}}); return;
+    }
+    if (!st.workerStarted || st.frame < 5 || !st.daemonEverConnected) return;
+#ifdef __EMSCRIPTEN__
+    presentationCheck("native_daemon_required", false, {}); return;
+#else
+    auto tab = [&](const std::string& id) {
+        for (int i = 0; i < (int)st.docTabs.size(); ++i)
+            if (st.docTabs[i].docId == id) return i;
+        return -1;
+    };
+    auto tabCount = [&](const std::string& id) {
+        int count = 0;
+        for (const auto& t : st.docTabs) if (t.docId == id) ++count;
+        return count;
+    };
+    auto active = [&]() {
+        return st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()
+            ? st.docTabs[st.activeTab].docId : std::string();
+    };
+    auto call = [&](const char* method, const nlohmann::json& params, nlohmann::json& result) {
+        std::string err;
+        const bool ok = P.foreign->call(method, params, result, err, 30000) &&
+                        result.is_object() && !result.contains("code");
+        return presentationCheck(method, ok, {{"error", err}, {"result", result}});
+    };
+    auto box = [](const char* name) {
+        return nlohmann::json::array({{{"op", "add_feature"}, {"feature", {
+            {"type", "box"}, {"name", name},
+            {"params", {{"length", {{"value", 30.0}, {"expr", nullptr}}},
+                        {"width", {{"value", 20.0}, {"expr", nullptr}}},
+                        {"height", {{"value", 8.0}, {"expr", nullptr}}},
+                        {"centered", true}}}}}}});
+    };
+    nlohmann::json r;
+    switch (P.step) {
+    case 0: {
+        if (!presentationCheck("daemon_required", engine::daemonMode(), {})) return;
+        std::string err;
+        if (!presentationCheck("user_part", st.docMirror.newPart(st.worker, err), {{"error", err}})) return;
+        st.addDocTab(false);
+        P.user = st.docMirror.docId();
+        auto userOps = st.docMirror.applyOps(st.worker, box("User content"));
+        if (!presentationCheck("user_content", userOps.ok, {{"error", userOps.error_message}})) return;
+        if (!userOps.aicm_path.empty()) { std::string le; st.loadDocMesh(userOps.aicm_path, le); }
+        P.foreign = std::make_unique<chudware_ipc::EngineClient>();
+        chudware_ipc::EngineClient::Options opts;
+        opts.clientKind = "mcp"; opts.allowSpawn = false;
+        if (!presentationCheck("foreign_connect", P.foreign->connectOrSpawn(opts, err), {{"error", err}})) return;
+        if (!call("doc_new", {{"kind", "part"}, {"name", "Hidden working part"}}, r)) return;
+        P.hidden = r.value("doc_id", std::string());
+        if (!call("doc_apply_ops", {{"doc_id", P.hidden}, {"base_revision", r.value("revision", 0)},
+                                    {"ops", box("Hidden block")}}, r)) return;
+        P.hiddenRevision = r.value("revision", 0L);
+        if (!call("doc_save", {{"doc_id", P.hidden}, {"path", P.path}}, r)) return;
+        if (!call("doc_apply_ops", {{"doc_id", P.hidden}, {"base_revision", P.hiddenRevision},
+                                    {"ops", nlohmann::json::array({agentLockSketchOp("Unsaved hidden edit")})}}, r)) return;
+        P.hiddenRevision = r.value("revision", 0L);
+        if (!call("doc_new", {{"kind", "part"}, {"name", "Presented part"}}, r)) return;
+        P.shown = r.value("doc_id", std::string());
+        if (!call("doc_apply_ops", {{"doc_id", P.shown}, {"base_revision", r.value("revision", 0)},
+                                    {"ops", box("Presented block")}}, r)) return;
+        P.shownRevision = r.value("revision", 0L);
+        if (!call("doc_save", {{"doc_id", P.shown}, {"path", P.shownPath}}, r)) return;
+        if (!call("doc_apply_ops", {{"doc_id", P.shown}, {"base_revision", P.shownRevision},
+                                    {"ops", nlohmann::json::array({agentLockSketchOp("Unsaved shown edit")})}}, r)) return;
+        P.shownRevision = r.value("revision", 0L);
+        P.since = pipingNow(); ++P.step; return;
+    }
+    case 1:
+        if (pipingNow() - P.since < 1.0) return;
+        if (!presentationCheck("working_documents_hidden", tab(P.hidden) < 0 && tab(P.shown) < 0 &&
+                               active() == P.user,
+                               {{"hidden_tab", tab(P.hidden)}, {"shown_tab", tab(P.shown)}, {"active", active()}})) return;
+        if (!call("doc_present", {{"doc_id", P.shown}}, r)) return;
+        ++P.step; return;
+    case 2:
+        if (tab(P.shown) < 0) return;
+        if (!presentationCheck("presentation_reveals_only_selected", tab(P.hidden) < 0 && active() == P.user,
+                               {{"shown_tab", tab(P.shown)}, {"hidden_tab", tab(P.hidden)}, {"active", active()}})) return;
+        if (!presentationCheck("open_presented_started", ui::featureTreeOpenPath(st, P.shownPath),
+                               {{"path", P.shownPath}})) return;
+        ++P.step; return;
+    case 3:
+        if (tab(P.shown) < 0 || active() != P.shown) return;
+        if (!presentationCheck("presented_open_keeps_agent_work_clean",
+                               tabCount(P.shown) == 1 && st.docTabs[tab(P.shown)].path == P.shownPath &&
+                               !st.docTabs[tab(P.shown)].dirty,
+                               {{"count", tabCount(P.shown)}, {"path", st.docTabs[tab(P.shown)].path},
+                                {"dirty", st.docTabs[tab(P.shown)].dirty}})) return;
+        if (!call("doc_list", nlohmann::json::object(), r)) return;
+        {
+            bool guiWriter = false;
+            for (const auto& doc : r["docs"])
+                if (doc.value("doc_id", std::string()) == P.shown)
+                    guiWriter = doc.value("other_writer", false);
+            if (!presentationCheck("presented_open_attaches_rw", guiWriter, {{"docs", r["docs"]}})) return;
+        }
+        if (!call("detach_doc", {{"doc_id", P.shown}}, r)) return;
+        P.since = pipingNow(); ++P.step; return;
+    case 4:
+        if (pipingNow() - P.since < 1.0) return;
+        if (!presentationCheck("opened_view_survives_writer_detach",
+                               tab(P.shown) >= 0 && active() == P.shown &&
+                               !st.docTabs[tab(P.shown)].dirty,
+                               {{"active", active()}, {"shown_tab", tab(P.shown)}})) return;
+        st.switchToTab(tab(P.user));
+        if (!presentationCheck("concurrent_open_started", ui::featureTreeOpenPath(st, P.path) &&
+                               ui::featureTreeOpenPath(st, P.path), {{"path", P.path}})) return;
+        if (!call("doc_present", {{"doc_id", P.hidden}}, r)) return;
+        ++P.step; return;
+    case 5:
+        if (active() != P.hidden || st.docMirror.docId() != P.hidden || st.rpc.busy()) return;
+        if (!presentationCheck("concurrent_open_and_presentation_deduplicate",
+                               tabCount(P.hidden) == 1 && !st.docTabs[tab(P.hidden)].dirty,
+                               {{"count", tabCount(P.hidden)}, {"dirty", st.docTabs[tab(P.hidden)].dirty},
+                                {"doc_id", active()}})) return;
+        if (!call("doc_apply_ops", {{"doc_id", P.hidden}, {"base_revision", P.hiddenRevision},
+                                    {"ops", nlohmann::json::array({agentLockSketchOp("Agent live edit")})}}, r)) return;
+        P.hiddenRevision = r.value("revision", 0L);
+        ++P.step; return;
+    case 6: {
+        if (st.docMirror.revision() < P.hiddenRevision) return;
+        bool featureFound = false;
+        const auto& tree = st.docMirror.tree();
+        if (tree.contains("features") && tree["features"].is_array())
+            for (const auto& feature : tree["features"])
+                if (feature.is_object() && feature.value("name", std::string()) == "Agent live edit")
+                    featureFound = true;
+        if (!presentationCheck("manual_open_stays_selected_and_live", active() == P.hidden &&
+                               st.docMirror.docId() == P.hidden && st.docMirror.revision() >= P.hiddenRevision &&
+                               tab(P.hidden) >= 0 && !st.docTabs[tab(P.hidden)].dirty && featureFound,
+                               {{"active", active()}, {"revision", st.docMirror.revision()},
+                                {"expected_revision", P.hiddenRevision}, {"feature_found", featureFound},
+                                {"dirty", tab(P.hidden) >= 0 && st.docTabs[tab(P.hidden)].dirty}})) return;
+        P.diskRevision = st.docMirror.revision();
+        P.diskTabCount = st.docTabs.size();
+        if (!call("doc_new", {{"kind", "part"}, {"name", "Disk replacement"}}, r)) return;
+        const std::string replacement = r.value("doc_id", std::string());
+        if (!call("doc_apply_ops", {{"doc_id", replacement}, {"base_revision", r.value("revision", 0)},
+                                    {"ops", box("Disk replacement block")}}, r)) return;
+        const std::string replacementPath = P.dir + "/replacement.step+";
+        if (!call("doc_save", {{"doc_id", replacement}, {"path", replacementPath}}, r)) return;
+        std::error_code ec;
+        std::filesystem::rename(replacementPath, P.path, ec);
+        if (!presentationCheck("external_disk_rewrite_started", !ec,
+                               {{"path", P.path}, {"error", ec.message()}})) return;
+        ++P.step; return;
+    }
+    case 7: {
+        const auto& tree = st.docMirror.tree();
+        bool replacementFound = tree.value("name", std::string()) == "Disk replacement";
+        if (tree.contains("features") && tree["features"].is_array())
+            for (const auto& feature : tree["features"])
+                if (feature.is_object() && feature.value("name", std::string()) == "Disk replacement block")
+                    replacementFound = true;
+        if (st.docMirror.docId() != P.hidden || st.docMirror.revision() <= P.diskRevision ||
+            !replacementFound) return;
+        if (!presentationCheck("external_disk_rewrite_reloads_open_tab",
+                               active() == P.hidden && tab(P.hidden) >= 0 &&
+                               tabCount(P.hidden) == 1 && st.docTabs.size() == P.diskTabCount &&
+                               !st.docTabs[tab(P.hidden)].dirty && st.hasDocMesh,
+                               {{"active", active()}, {"doc_id", st.docMirror.docId()},
+                                {"revision", st.docMirror.revision()}, {"previous_revision", P.diskRevision},
+                                {"feature_found", replacementFound}, {"count", tabCount(P.hidden)},
+                                {"tabs", st.docTabs.size()}, {"previous_tabs", P.diskTabCount},
+                                {"dirty", tab(P.hidden) >= 0 && st.docTabs[tab(P.hidden)].dirty},
+                                {"mesh", st.hasDocMesh}})) return;
+        if (!call("doc_new", {{"kind", "part"}, {"name", "Dismissed part"}}, r)) return;
+        P.dismissed = r.value("doc_id", std::string());
+        if (!call("doc_apply_ops", {{"doc_id", P.dismissed}, {"base_revision", r.value("revision", 0)},
+                                    {"ops", box("Dismissed block")}}, r)) return;
+        if (!call("doc_save", {{"doc_id", P.dismissed}, {"path", P.dismissedPath}}, r)) return;
+        if (!call("doc_present", {{"doc_id", P.dismissed}}, r)) return;
+        ++P.step; return;
+    }
+    case 8:
+        if (tab(P.dismissed) < 0) return;
+        st.closeDocTab(tab(P.dismissed));
+        if (!call("doc_present", {{"doc_id", P.dismissed}}, r)) return;
+        P.since = pipingNow(); ++P.step; return;
+    case 9:
+        if (pipingNow() - P.since < 1.0) return;
+        if (!presentationCheck("dismissed_presentation_stays_closed",
+                               tab(P.dismissed) < 0 && active() == P.hidden,
+                               {{"tab", tab(P.dismissed)}, {"active", active()}})) return;
+        if (!presentationCheck("dismissed_manual_open_started",
+                               ui::featureTreeOpenPath(st, P.dismissedPath), {{"path", P.dismissedPath}})) return;
+        ++P.step; return;
+    case 10:
+        if (active() != P.dismissed || tab(P.dismissed) < 0 || st.rpc.busy()) return;
+        if (!presentationCheck("dismissed_manual_open_restores_live_view",
+                               tabCount(P.dismissed) == 1 && st.docTabs[tab(P.dismissed)].path == P.dismissedPath,
+                               {{"count", tabCount(P.dismissed)}, {"active", active()}})) return;
+        P.report["ok"] = true;
+        P.done = true;
+        P.capture = P.dir + "/final.png";
+        return;
+    }
+#endif
+}
+
+bool presentationEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, bool& breakLoop) {
+    auto& P = g_presentation;
+    if (!P.want) return false;
+    ++st.frame;
+    if (!P.capture.empty()) {
+        writeBackbufferPng(P.capture.c_str(), dw, dh, P.done ? screenshotPath : nullptr);
+        P.report["captures"].push_back(P.capture);
+        P.capture.clear();
+    }
+    swapScenarioFrame(st.win);
+    breakLoop = P.done;
+    if (P.done) {
+        std::ofstream out(P.dir + "/report.json", std::ios::trunc);
+        out << P.report.dump(2) << '\n';
+        out.close();
+        if (P.failed || !out) {
+            core::framestats::flushReport();
+            std::fflush(nullptr);
+            std::_Exit(EXIT_FAILURE);
+        }
+    }
+    return true;
+}
+
+
 // CHUDWARE_SHOT=featurestate: native document authority through the actual PM and tab listener.
 struct FeatureStateShot {
     bool init = false, want = false, done = false, failed = false, dragApplied = false;
-    int step = 0, settle = 0, refreshRevision = -1;
+    int step = 0, settle = 0, refreshRevision = -1, saveResult = -1;
     double started = 0.0;
     SceneShotInput input;
     std::string dir, path, feature, capture, queued;
+    std::string backgroundDoc, backgroundPath, foregroundDoc, foregroundPath, foregroundFeature;
     nlohmann::json report;
 };
 FeatureStateShot g_featureState;
@@ -3350,14 +6429,27 @@ void featureStateTick(AppState& st) {
         }
         return values;
     };
-    auto save = [&]() {
+    auto save = [&](int nextStep) {
         st.docTabs[st.activeTab].path = P.path;
-        const auto result = ui::saveDocTab(st, st.activeTab, false);
-        return featureStateCheck("ordinary_tab_save", result == ui::TabSaveResult::Saved,
-                                 {{"path", P.path}, {"result", (int)result}}) && stateMatches(false);
+        P.saveResult = -1;
+        P.step = nextStep;
+        ui::saveDocTab(st, st.activeTab, false, [&P](ui::TabSaveResult result) {
+            P.saveResult = static_cast<int>(result);
+        });
+    };
+    auto saved = [&]() {
+        return featureStateCheck("ordinary_tab_save",
+                                 P.saveResult == static_cast<int>(ui::TabSaveResult::Saved),
+                                 {{"path", P.path}, {"result", P.saveResult}}) && stateMatches(false);
     };
     auto reopen = [&]() {
         std::string error;
+        const std::string oldId = st.docMirror.docId();
+        nlohmann::json closed;
+        if (!featureStateCheck("close_before_cache_reopen",
+                st.worker.call("doc_close", {{"doc_id", oldId}}, closed, error) &&
+                !closed.contains("code"), {{"error", error}, {"response", closed}})) return false;
+        st.closeDocTab(st.activeTab);
         const bool opened = st.docMirror.open(st.worker, P.path, error);
         if (!featureStateCheck("saved_cache_reopen", opened &&
                 st.docMirror.lastOpenedCacheHit() && st.docMirror.lastOpenedWarm(),
@@ -3387,10 +6479,16 @@ void featureStateTick(AppState& st) {
         P.feature = r.id_map.value("$0", std::string());
         if (!featureStateCheck("canonical_numeric_box", r.ok && !P.feature.empty(),
                                {{"response_tree", r.tree}, {"error", r.error_message}})) return;
-        if (!stateMatches(true) || !save() || !reopen()) return;
+        if (!stateMatches(true)) return;
+        save(1000);
+        return;
+    }
+    case 1000: {
+        if (!saved() || !reopen()) return;
         P.refreshRevision = st.docMirror.revision();
         if (!featureStateCheck("opened_revision_zero", P.refreshRevision == 0,
                                {{"revision", P.refreshRevision}})) return;
+        P.step = 0;
         shoot("01_open_clean");
         return;
     }
@@ -3462,11 +6560,15 @@ void featureStateTick(AppState& st) {
                 dims == nlohmann::json{{"length", 42.0}, {"width", 30.0}, {"height", 20.0}},
                 {{"canonical", dims}, {"displayed", formValues()}}) || !stateMatches(true)) return;
         st.propertyManager->closeIfActive();
-        if (!save()) return;
+        save(3000);
+        return;
+    }
+    case 3000: {
+        if (!saved()) return;
         // The engine commits outside this mirror, just as another human/agent writer does.
         nlohmann::json response;
         const bool edited = st.worker.call("doc_apply_ops", {{"doc_id", st.docMirror.docId()},
-            {"base_revision", -1}, {"ops", nlohmann::json::array({
+            {"base_revision", -1}, {"origin", "system"}, {"ops", nlohmann::json::array({
                 {{"op", "edit_feature"}, {"id", P.feature}, {"params", {{"height", 25.0}}}}
             })}}, response, err);
         if (!featureStateCheck("out_of_band_native_edit",
@@ -3475,9 +6577,11 @@ void featureStateTick(AppState& st) {
         std::string aicm;
         const bool adopted = pushed.adoptActivateResponse(st.docMirror.docId(), response, aicm, err) &&
                              st.docMirror.restoreSnapshot(pushed.snapshot());
-        if (!featureStateCheck("adopt_real_published_snapshot", adopted,
-                {{"revision", response.value("revision", -1)}, {"error", err}}) ||
-            !stateMatches(true)) return;
+        const auto foreignState = nativeState();
+        if (!featureStateCheck("adopt_real_published_snapshot", adopted &&
+                foreignState.value("dirty", false) && !st.docTabs[st.activeTab].dirty,
+                {{"revision", response.value("revision", -1)}, {"error", err},
+                 {"native", foreignState}, {"tab_dirty", st.docTabs[st.activeTab].dirty}})) return;
         if (!aicm.empty()) st.loadDocMesh(aicm, err);
         const auto human = st.docMirror.applyOps(st.worker, nlohmann::json::array({
             {{"op", "edit_feature"}, {"id", P.feature}, {"params", {{"width", 35.0}}}}
@@ -3493,12 +6597,17 @@ void featureStateTick(AppState& st) {
         if (!featureStateCheck("redo_keeps_foreign_edit", redo.ok &&
                 dimensions() == nlohmann::json{{"length", 42.0}, {"width", 35.0}, {"height", 25.0}},
                 {{"canonical", dimensions()}, {"error", redo.error_message}}) || !stateMatches(true)) return;
-        if (!save() || !reopen()) return;
+        save(3001);
+        return;
+    }
+    case 3001: {
+        if (!saved() || !reopen()) return;
         const bool opened = st.propertyManager->openForEdit(st, P.feature);
         const auto displayed = formValues();
         if (!featureStateCheck("wrapped_dimensions_reopen", opened &&
                 displayed == nlohmann::json{{"Length", "42 mm"}, {"Width", "35 mm"}, {"Height", "25 mm"}},
                 {{"displayed", displayed}, {"canonical", dimensions()}})) return;
+        P.step = 3;
         shoot("03_shared_edits_saved_clean");
         return;
     }
@@ -3515,9 +6624,103 @@ void featureStateTick(AppState& st) {
                 displayed == nlohmann::json{{"Length", "=46"}, {"Width", "35 mm"}, {"Height", "26 mm"}},
                 {{"displayed", displayed}, {"canonical", dimensions()}, {"error", edit.error_message}}) ||
             !stateMatches(true)) return;
+        shoot("04_expression_preserved");
+        return;
+    }
+    case 5: {
+        st.propertyManager->closeIfActive();
+        auto makeBox = [&](int length, std::string& id, std::string& feature) {
+            if (!st.docMirror.newPart(st.worker, err)) return false;
+            st.clearViewportForNewDoc();
+            st.addDocTab(false);
+            const auto result = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Save fixture"},
+                    {"params", {{"length", length}, {"width", 10}, {"height", 10}}},
+                    {"refs", nlohmann::json::object()}}}}
+            }));
+            id = st.docMirror.docId();
+            feature = result.id_map.value("$0", std::string());
+            return result.ok && !id.empty() && !feature.empty();
+        };
+        std::string backgroundFeature;
+        if (!featureStateCheck("cold_save_background_fixture",
+                makeBox(12, P.backgroundDoc, backgroundFeature), {{"error", err}})) return;
+        const int background = st.activeTab;
+        P.backgroundPath = (std::filesystem::absolute(P.dir) / "cold_background.step+").string();
+        st.docTabs[background].path = P.backgroundPath;
+        if (!featureStateCheck("cold_save_foreground_fixture",
+                makeBox(28, P.foregroundDoc, P.foregroundFeature), {{"error", err}})) return;
+        P.foregroundPath = (std::filesystem::absolute(P.dir) / "cold_foreground.step+").string();
+        st.docTabs[st.activeTab].path = P.foregroundPath;
+        st.ensureTabSession(st.docTabs[background]);
+        st.docTabs[background].session->cachedMirror = {};
+        st.docTabs[background].session->cachedRevision = -1;
+        st.docTabs[background].session->cachedDocMesh.reset();
+        st.docTabs[background].meshCacheInvalidated = true;
+        st.requestSaveAll = true;
+        P.step = 50;
+        return;
+    }
+    case 50: {
+        if (st.requestSaveAll || st.rpc.busy()) return;
+        auto savedLength = [&](const std::string& path) {
+            nlohmann::json opened, closed;
+            std::string error;
+            if (!st.worker.call("doc_open", {{"path", path}, {"detach_path", true}}, opened, error) ||
+                opened.contains("code")) return -1.0;
+            double length = -1.0;
+            const auto tree = opened.value("tree", nlohmann::json::object());
+            for (const auto& feature : tree.value("features", nlohmann::json::array())) {
+                if (feature.value("type", std::string()) != "box") continue;
+                const auto value = feature.value("params", nlohmann::json::object()).value("length", nlohmann::json());
+                if (value.is_number()) length = value.get<double>();
+                else if (value.is_object()) length = value.value("value", -1.0);
+            }
+            const std::string id = opened.value("doc_id", std::string());
+            if (!id.empty()) st.worker.call("doc_close", {{"doc_id", id}}, closed, error);
+            return length;
+        };
+        const double backgroundLength = savedLength(P.backgroundPath);
+        const double foregroundLength = savedLength(P.foregroundPath);
+        if (!featureStateCheck("save_all_cold_background_identity",
+                st.docMirror.docId() == P.foregroundDoc && st.activeTab >= 0 &&
+                st.docTabs[st.activeTab].docId == P.foregroundDoc &&
+                backgroundLength == 12.0 && foregroundLength == 28.0,
+                {{"background_length", backgroundLength}, {"foreground_length", foregroundLength},
+                 {"active_doc", st.docMirror.docId()}})) return;
+        const auto edit = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "edit_feature"}, {"id", P.foregroundFeature}, {"params", {{"length", 33}}}}
+        }));
+        if (!featureStateCheck("save_as_failure_fixture", edit.ok && st.docTabs[st.activeTab].dirty,
+                               {{"error", edit.error_message}})) return;
+        P.saveResult = -1;
+        P.step = 51;
+        ui::saveCadDocument(st, P.foregroundDoc, P.backgroundPath, false,
+            [&P](ui::TabSaveResult result) { P.saveResult = static_cast<int>(result); });
+        return;
+    }
+    case 51: {
+        if (P.saveResult < 0) return;
+        const bool selected = st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size();
+        const std::string selectedPath = selected ? st.docTabs[st.activeTab].path : std::string();
+        if (!featureStateCheck("save_as_failure_preserves_dirty_and_path",
+                P.saveResult == static_cast<int>(ui::TabSaveResult::Failed) &&
+                selected && st.docTabs[st.activeTab].docId == P.foregroundDoc &&
+                st.docTabs[st.activeTab].dirty && selectedPath == P.foregroundPath,
+                {{"result", P.saveResult}, {"path", selectedPath}})) return;
+        if (std::getenv("CHUDWARE_NO_FILE_DIALOGS")) {
+            int cancelled = -1;
+            ui::saveDocTab(st, st.activeTab, true, [&cancelled](ui::TabSaveResult result) {
+                cancelled = static_cast<int>(result);
+            });
+            if (!featureStateCheck("save_as_cancel_preserves_dirty_and_path",
+                    cancelled == static_cast<int>(ui::TabSaveResult::Cancelled) &&
+                    st.docTabs[st.activeTab].dirty && st.docTabs[st.activeTab].path == P.foregroundPath,
+                    {{"result", cancelled}, {"path", st.docTabs[st.activeTab].path}})) return;
+        }
         P.report["ok"] = true;
         P.done = true;
-        P.capture = P.dir + "/04_expression_preserved.png";
+        P.capture = P.dir + "/05_save_identity.png";
         return;
     }
     }
@@ -3532,13 +6735,5693 @@ bool featureStateEndFrame(AppState& st, int dw, int dh, const char* screenshotPa
         P.report["captures"].push_back(P.capture);
         P.capture.clear();
     }
-    glfwSwapBuffers(st.win);
+    swapScenarioFrame(st.win);
     done = P.done;
     if (done) {
         std::ofstream out(P.dir + "/report.json", std::ios::trunc);
         out << P.report.dump(2) << '\n';
         out.close();
-        if (!out || P.failed) { std::fflush(nullptr); std::_Exit(EXIT_FAILURE); }
+        if (!out || P.failed) {
+            core::framestats::flushReport();
+            std::fflush(nullptr);
+            std::_Exit(EXIT_FAILURE);
+        }
+    }
+    return true;
+}
+
+// A pointer gesture owns its originally observed item until release and settle,
+// even if activating it removes the item or changes the visible workspace.
+struct UxPointerGesture {
+    bool active = false, mismatched = false, initiallyEnabled = true;
+    std::string owner, window;
+    ImGuiID id = 0;
+    ImVec2 point;
+    size_t actionIndex = 0;
+    int button = 0, presses = 0, releases = 0;
+};
+
+// Real worker mutations and rendered gestures; fixture construction never fabricates replies.
+struct UxQualityShot {
+    bool init = false, want = false, done = false, failed = false;
+    bool sawAcceptPending = false, sawPreviewPending = false, sawPendingTogether = false;
+    bool sketchForeign = false;
+    int step = 0, settle = 0, textPhase = 0, filletCase = 0, partTab = -1;
+    int revision = -1;
+    double started = 0, stepStart = 0;
+    SceneShotInput input;
+    UxPointerGesture pointer;
+    std::string dir, capture, feature, box, part, secondary;
+    std::string seekForm, seekField, seekPrimitive;
+    std::string regressionCase;
+    nlohmann::json report, baseline, background, previewMass, unthreadedMass, fieldObservation;
+};
+UxQualityShot g_ux;
+
+bool uxCheck(const std::string& name, bool ok, nlohmann::json evidence = {}) {
+    auto& s = g_ux;
+    s.report["checks"].push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
+    std::printf("[uxquality] %s %s %s\n", ok ? "PASS" : "FAIL", name.c_str(),
+                evidence.dump().c_str());
+    std::fflush(stdout);
+    if (!ok) {
+        s.failed = s.done = true;
+        s.report["failure"] = {{"name", name}, {"step", s.step}, {"evidence", evidence},
+                               {"items", ui::audit::observedItems()},
+                               {"windows", ui::audit::observedWindows()}};
+        s.capture = s.dir + "/FAILED.png";
+        ImGui::GetIO().AddMouseButtonEvent(0, false);
+        ImGui::GetIO().AddMouseButtonEvent(1, false);
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false);
+    }
+    return ok;
+}
+
+const nlohmann::json* uxFeature(const AppState& st, const std::string& id) {
+    const auto& tree = st.docMirror.tree();
+    if (!tree.is_object() || !tree.contains("features") || !tree["features"].is_array())
+        return nullptr;
+    for (const auto& f : tree["features"])
+        if (f.is_object() && f.value("id", std::string()) == id) return &f;
+    return nullptr;
+}
+
+double uxNumber(const nlohmann::json& value) {
+    if (value.is_number()) return value.get<double>();
+    if (value.is_object() && value.contains("value") && value["value"].is_number())
+        return value["value"].get<double>();
+    return std::numeric_limits<double>::quiet_NaN();
+}
+
+nlohmann::json uxMass(AppState& st) {
+    nlohmann::json result;
+    std::string error;
+    if (!st.worker.call("eval_mass", {{"doc_id", st.docMirror.docId()}}, result, error, 60000))
+        return {{"error", error}};
+    return result;
+}
+
+bool uxSolid(const nlohmann::json& mass) {
+    if (!mass.is_object()) return false;
+    auto one = [](const nlohmann::json& body) {
+        if (!body.is_object() || !body.contains("volume_mm3") ||
+            !body["volume_mm3"].is_number()) return false;
+        const double volume = body["volume_mm3"].get<double>();
+        return std::isfinite(volume) && volume > 0.0 &&
+               body.value("closed_solid", true) && !body.value("surface", false) &&
+               !body.value("is_surface", false);
+    };
+    if (!mass.contains("bodies")) return mass.value("body_count", 0) == 1 && one(mass);
+    if (!mass["bodies"].is_array() || mass["bodies"].empty()) return false;
+    for (const auto& body : mass["bodies"])
+        if (!one(body)) return false;
+    return true;
+}
+
+bool uxCachedMeshWidth(const std::shared_ptr<render::DocMesh>& mesh, float expected) {
+    if (!mesh) return false;
+    for (const auto& entry : mesh->bodyBBoxCache)
+        if (std::abs((entry.second[3] - entry.second[0]) - expected) < 0.02f) return true;
+    return false;
+}
+
+nlohmann::json uxStatus(const nlohmann::json& statuses, const std::string& id) {
+    if (statuses.is_array())
+        for (const auto& status : statuses)
+            if (status.is_object() && status.value("id", std::string()) == id) return status;
+    return nullptr;
+}
+
+// Match real PM group/index scopes, not a similarly labelled widget elsewhere.
+const nlohmann::json* uxField(const char* type, const char* key, const char* primitive) {
+    const auto* form = ui::pmFindForm(type);
+    if (!form) return nullptr;
+    for (size_t i = 0; i < form->fields.size(); ++i) {
+        const auto& def = form->fields[i];
+        if (std::strcmp(def.key, key) != 0) continue;
+        const int index = static_cast<int>(i);
+        for (const auto& observedWindow : ui::audit::observedWindows()) {
+            const std::string window = observedWindow.value("window", std::string());
+            if (window.find("FeatureManager") == std::string::npos &&
+                window.find("##PMFloating") == std::string::npos) continue;
+            ImGuiWindow* w = ImGui::FindWindowByName(window.c_str());
+            if (!w) continue;
+            ImGuiID id = ImHashStr(def.group, 0, w->ID);
+            id = ImHashData(&index, sizeof(index), id);
+            id = ImHashStr(primitive, 0, id);
+            if (ui::audit::observedItemById(id, window, g_ux.fieldObservation))
+                return &g_ux.fieldObservation;
+        }
+    }
+    return nullptr;
+}
+
+bool uxContinuePointer(const std::string& owner) {
+    auto& s = g_ux;
+    auto& p = s.pointer;
+    p.mismatched = p.mismatched || owner != p.owner;
+
+    // The hover frame precedes the press. Do not press a different item that
+    // has replaced or moved out from under the original target in that frame.
+    if (s.input.phase == 1) {
+        nlohmann::json current;
+        const bool found = ui::audit::observedItemById(p.id, p.window, current);
+        bool stable = found && current.value("visible", false) &&
+                      (!p.initiallyEnabled || current.value("enabled", true));
+        if (stable) {
+            const auto& r = current["rect"];
+            stable = p.point.x >= r[0].get<float>() && p.point.x < r[2].get<float>() &&
+                     p.point.y >= r[1].get<float>() && p.point.y < r[3].get<float>();
+        }
+        if (!stable || p.mismatched) {
+            const auto original = s.report["actions"][p.actionIndex];
+            p.active = false;
+            s.input.phase = 0;
+            uxCheck("pointer_original_target_before_press", false,
+                    {{"original", original}, {"current", current}, {"requested", owner}});
+            return false;
+        }
+        ++p.presses;
+    } else if (s.input.phase == 2) {
+        ++p.releases;
+    }
+    const bool done = s.input.click(p.point, false, p.button);
+    auto& action = s.report["actions"][p.actionIndex];
+    action["press_events"] = p.presses;
+    action["release_events"] = p.releases;
+    if (!done) return false;
+    action["completed"] = true;
+    const bool valid = !p.mismatched && p.presses == 1 && p.releases == 1;
+    const auto evidence = action;
+    p.active = false;
+    if (!valid) {
+        uxCheck("pointer_gesture_identity_and_release", false,
+                {{"action", evidence}, {"requested", owner}});
+        return false;
+    }
+    return true;
+}
+
+// Resolve only on gesture start. Once started, the original ID, window and point
+// own the press/release, regardless of later observations or readiness changes.
+template <typename Resolve>
+bool uxTryActivate(const std::string& owner, const char* seek, const char* window,
+                   Resolve&& resolve, bool ready = true, bool scrollMissing = true,
+                   int button = 0, const char* actionName = "click") {
+    auto& s = g_ux;
+    if (s.pointer.active) return uxContinuePointer(owner);
+    if (!ready) return false;
+    if (s.input.phase) {
+        uxCheck("pointer_input_not_already_in_use", false, {{"owner", owner}, {"phase", s.input.phase}});
+        return false;
+    }
+    const auto* item = resolve();
+    if (s.failed) return false;
+    bool clickable = item && item->value("visible", false);
+    if (clickable) {
+        const auto& r = (*item)["rect"];
+        clickable = r[2].template get<float>() - r[0].template get<float>() >= 6.0f &&
+                    r[3].template get<float>() - r[1].template get<float>() >= 6.0f;
+    }
+    if (!clickable) {
+        if (item || scrollMissing) {
+            const std::string observedWindow = item ? item->value("window", std::string()) : "";
+            shotScrollTo(seek, item ? observedWindow.c_str() : window, true, item);
+        }
+        return false;
+    }
+    if (!uxCheck("interactive_pointer_target", item->value("id", ImGuiID(0)) != 0 &&
+                 !item->value("text_only", false), {{"seek", seek}, {"item", *item}}))
+        return false;
+    auto& p = s.pointer;
+    p = UxPointerGesture();
+    p.active = true;
+    p.owner = owner;
+    p.id = item->value("id", ImGuiID(0));
+    p.window = item->value("window", std::string());
+    p.point = shotPoint(*item);
+    p.initiallyEnabled = item->value("enabled", true);
+    p.button = button;
+    p.actionIndex = s.report["actions"].size();
+    s.report["actions"].push_back({{"action", actionName}, {"target", seek}, {"item", *item},
+                                   {"point", {p.point.x, p.point.y}}, {"button", button},
+                                   {"press_events", 0}, {"release_events", 0}, {"completed", false}});
+    return uxContinuePointer(owner);
+}
+
+template <typename Resolve>
+bool uxClickItem(const char* seek, const char* window, Resolve&& resolve, bool ready = true) {
+    return uxTryActivate(std::string("item:") + (window ? window : "") + "/" + seek,
+                         seek, window, std::forward<Resolve>(resolve), ready);
+}
+
+bool uxClick(const char* label, const char* window = nullptr, bool ready = true) {
+    return uxTryActivate(std::string("label:") + (window ? window : "") + "/" + label,
+                         label, window, [&]() { return shotItem(label, true, window); }, ready);
+}
+
+// formTabs paints its labels itself; target the actual Network tab's scoped ImGui ID.
+bool uxClickPipingNetworkTab() {
+    return uxTryActivate("piping-network-tab", "Piping Network tab", nullptr, [&]() -> const nlohmann::json* {
+        for (const auto& observed : ui::audit::observedWindows()) {
+            const std::string name = observed.value("window", std::string());
+            if (name.find("##sim_body") == std::string::npos) continue;
+            ImGuiWindow* window = ImGui::FindWindowByName(name.c_str());
+            if (!window) continue;
+            ImGuiID id = ImHashStr("piping_panel", 0, window->ID);
+            id = ImHashStr("forms", 0, id);
+            const int index = 0;
+            id = ImHashData(&index, sizeof(index), id);
+            id = ImHashStr("##tab", 0, id);
+            if (ui::audit::observedItemById(id, name, g_ux.fieldObservation))
+                return &g_ux.fieldObservation;
+        }
+        return nullptr;
+    }, true, false);
+}
+// Locate the actual Modes input in the card's field group, not another numeric field.
+const nlohmann::json* uxModalModesItem() {
+    for (const auto& observed : ui::audit::observedWindows()) {
+        const std::string name = observed.value("window", std::string());
+        if (name.find("##sim_body") == std::string::npos ||
+            name.find("kit_card_body") == std::string::npos) continue;
+        ImGuiWindow* window = ImGui::FindWindowByName(name.c_str());
+        if (!window) continue;
+        ImGuiID id = ImHashStr("modes", 0, window->ID);
+        id = ImHashStr("n", 0, id);
+        id = ImHashStr("##v", 0, id);
+        if (ui::audit::observedItemById(id, name, g_ux.fieldObservation))
+            return &g_ux.fieldObservation;
+    }
+    return nullptr;
+}
+
+// Tooltip text is painted by ImGui rather than registered as a labelled item. Inspect the
+// previous rendered tooltip's non-white atlas vertices so a background alone cannot count.
+int uxTooltipTextVertices() {
+    const ImVec2 white = ImGui::GetIO().Fonts->TexUvWhitePixel;
+    int vertices = 0;
+    for (const auto& observed : ui::audit::observedWindows()) {
+        const std::string name = observed.value("window", std::string());
+        if (name.find("##Tooltip") == std::string::npos) continue;
+        ImGuiWindow* window = ImGui::FindWindowByName(name.c_str());
+        if (!window || !window->DrawList) continue;
+        const auto& r = observed["rect"];
+        for (const auto& v : window->DrawList->VtxBuffer) {
+            if ((v.col >> IM_COL32_A_SHIFT) == 0 ||
+                (std::abs(v.uv.x - white.x) < 1e-6f && std::abs(v.uv.y - white.y) < 1e-6f))
+                continue;
+            if (v.pos.x >= r[0].get<float>() && v.pos.x <= r[2].get<float>() &&
+                v.pos.y >= r[1].get<float>() && v.pos.y <= r[3].get<float>()) ++vertices;
+        }
+    }
+    return vertices;
+}
+// Verify the reason itself was rendered in the tooltip, not merely that some tooltip existed.
+// The current blocker is ASCII; compare the ordered visible glyph quads against the live atlas.
+bool uxTooltipContains(const std::string& text) {
+    const auto& fonts = ImGui::GetIO().Fonts->Fonts;
+    for (const auto& observed : ui::audit::observedWindows()) {
+        const std::string name = observed.value("window", std::string());
+        if (name.find("##Tooltip") == std::string::npos) continue;
+        ImGuiWindow* window = ImGui::FindWindowByName(name.c_str());
+        if (!window || !window->DrawList) continue;
+        const auto& rect = observed["rect"];
+        const auto& vertices = window->DrawList->VtxBuffer;
+        for (int f = 0; f < fonts.Size; ++f) {
+            std::vector<const ImFontGlyph*> glyphs;
+            for (unsigned char c : text) {
+                if (c >= 0x80) { glyphs.clear(); break; }
+                if (std::isspace(c)) continue;
+                const ImFontGlyph* glyph = fonts[f]->FindGlyphNoFallback((ImWchar)c);
+                if (!glyph || !glyph->Visible) { glyphs.clear(); break; }
+                glyphs.push_back(glyph);
+            }
+            if (glyphs.empty()) continue;
+            for (int start = 0; start + (int)glyphs.size() * 4 <= vertices.Size; ++start) {
+                bool match = true;
+                for (size_t i = 0; i < glyphs.size(); ++i) {
+                    const ImDrawVert& a = vertices[start + (int)i * 4];
+                    const ImDrawVert& b = vertices[start + (int)i * 4 + 2];
+                    const ImFontGlyph& g = *glyphs[i];
+                    if ((a.col >> IM_COL32_A_SHIFT) == 0 ||
+                        std::abs(a.uv.x - g.U0) > 1e-6f || std::abs(a.uv.y - g.V0) > 1e-6f ||
+                        std::abs(b.uv.x - g.U1) > 1e-6f || std::abs(b.uv.y - g.V1) > 1e-6f ||
+                        b.pos.x < rect[0].get<float>() || a.pos.x > rect[2].get<float>() ||
+                        b.pos.y < rect[1].get<float>() || a.pos.y > rect[3].get<float>()) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) return true;
+            }
+        }
+    }
+    return false;
+}
+
+
+
+bool uxClickRail(const char* child, const char* railId) {
+    return uxTryActivate(std::string("rail:") + child + "/" + railId, railId, child,
+                         [&]() -> const nlohmann::json* {
+        for (const auto& observed : ui::audit::observedWindows()) {
+            const std::string name = observed.value("window", std::string());
+            if (name.find(child) == std::string::npos) continue;
+            ImGuiWindow* window = ImGui::FindWindowByName(name.c_str());
+            if (!window) continue;
+            const ImGuiID parent = ImHashStr(railId, 0, window->ID);
+            const ImGuiID id = ImHashStr("##lp_tab", 0, parent);
+            if (ui::audit::observedItemById(id, name, g_ux.fieldObservation))
+                return &g_ux.fieldObservation;
+        }
+        return nullptr;
+    }, true, false);
+}
+
+const nlohmann::json* uxFeatureRow(const char* name) {
+    const size_t length = std::strlen(name);
+    for (const auto& item : ui::audit::observedItems()) {
+        const std::string label = item.value("label", std::string());
+        const std::string window = item.value("window", std::string());
+        if (window.find("FeatureManager") != std::string::npos && label.size() >= length &&
+            label.compare(label.size() - length, length, name) == 0 &&
+            item.value("id", ImGuiID(0)) != 0 && !item.value("text_only", false))
+            return &item;
+    }
+    return nullptr;
+}
+
+bool uxClickFeatureRow(const char* name) {
+    return uxTryActivate(std::string("feature-row:") + name, name, "FeatureManager",
+                         [&]() { return uxFeatureRow(name); });
+}
+
+bool uxRightClickFeatureRow(const char* name) {
+    return uxTryActivate(std::string("feature-row-right:") + name, name, "FeatureManager",
+                         [&]() { return uxFeatureRow(name); }, true, true, 1,
+                         "right-click feature tree row");
+}
+
+bool uxFieldClick(const char* type, const char* key, const char* primitive) {
+    auto& s = g_ux;
+    if (s.seekForm != type || s.seekField != key || s.seekPrimitive != primitive) {
+        s.seekForm = type; s.seekField = key; s.seekPrimitive = primitive;
+    }
+    return uxTryActivate(std::string("field:") + type + "/" + key + "/" + primitive,
+                         primitive, "FeatureManager", [&]() -> const nlohmann::json* {
+        const auto* item = uxField(type, key, primitive);
+        if (item && !item->value("enabled", true)) {
+            uxCheck("property_control_enabled", false,
+                    {{"form", type}, {"field", key}, {"primitive", primitive}, {"item", *item}});
+        }
+        return item;
+    });
+}
+
+bool uxEnsureGroup(const char* label) {
+    const std::string owner = std::string("group:") + label;
+    if (!g_ux.pointer.active) {
+        const auto* header = shotItem(label, false, "FeatureManager");
+        if (header && header->value("openable", false) && header->value("opened", false))
+            return true;
+    }
+    uxTryActivate(owner, label, "FeatureManager",
+                  [&]() { return shotItem(label, false, "FeatureManager"); });
+    return false;
+}
+
+// Read the actual active ImGui input after the typing frame, before clicking OK. The
+// authoritative rebuild checks below remain the proof of the committed value.
+bool uxTypedDimension(const char* type, const char* key, const char* text, bool numeric) {
+    const auto* item = uxField(type, key, "##dim");
+    const ImGuiID id = item ? item->value("id", ImGuiID(0)) : 0;
+    const auto* state = id ? ImGui::GetInputTextState(id) : nullptr;
+    const std::string actual = state && state->TextA.Data ? state->TextA.Data : "";
+    const bool active = id && ImGui::GetCurrentContext()->ActiveId == id;
+    return uxCheck("typed_dimension_live_buffer",
+                   item && item->value("visible", false) && item->value("enabled", true) &&
+                   active && state && actual == text,
+                   {{"form", type}, {"field", key}, {"numeric", numeric},
+                    {"expected", text}, {"actual", actual}, {"active", active},
+                    {"item", item ? *item : nlohmann::json()}});
+}
+
+// Do not press Enter: the following step clicks actual OK with the typed field still focused.
+bool uxTypeDim(const char* type, const char* key, const char* text, bool enterTextMode) {
+    auto& s = g_ux;
+    auto& io = ImGui::GetIO();
+    if (s.textPhase == 0) {
+        if (enterTextMode && !uxFieldClick(type, key, "=##dim_txt")) return false;
+        s.textPhase = 1;
+        return false;
+    }
+    if (s.textPhase == 1) {
+        if (!uxFieldClick(type, key, "##dim")) return false;
+    } else if (s.textPhase == 2) {
+        io.AddKeyEvent(ImGuiMod_Ctrl, true); io.AddKeyEvent(ImGuiKey_A, true);
+    } else if (s.textPhase == 3) {
+        io.AddKeyEvent(ImGuiKey_A, false); io.AddKeyEvent(ImGuiMod_Ctrl, false);
+    } else if (s.textPhase == 4) {
+        io.AddInputCharactersUTF8(text);
+        s.report["actions"].push_back({{"action", "type dimension"}, {"form", type},
+                                       {"field", key}, {"text", text}});
+    } else {
+        if (!uxTypedDimension(type, key, text, false)) return false;
+        s.textPhase = 0;
+        return true;
+    }
+    ++s.textPhase;
+    return false;
+}
+
+bool uxTypeNumeric(const char* type, const char* key, const char* text) {
+    auto& s = g_ux;
+    auto& io = ImGui::GetIO();
+    if (s.textPhase == 0) {
+        io.AddKeyEvent(ImGuiMod_Ctrl, true);
+        if (!uxFieldClick(type, key, "##dim")) return false;
+        io.AddKeyEvent(ImGuiMod_Ctrl, false);
+    } else if (s.textPhase == 1) {
+        io.AddKeyEvent(ImGuiMod_Ctrl, true); io.AddKeyEvent(ImGuiKey_A, true);
+    } else if (s.textPhase == 2) {
+        io.AddKeyEvent(ImGuiKey_A, false); io.AddKeyEvent(ImGuiMod_Ctrl, false);
+    } else if (s.textPhase == 3) {
+        io.AddInputCharactersUTF8(text);
+        s.report["actions"].push_back({{"action", "ctrl-click numeric entry"}, {"form", type},
+                                       {"field", key}, {"text", text}});
+    } else {
+        if (!uxTypedDimension(type, key, text, true)) return false;
+        s.textPhase = 0;
+        return true;
+    }
+    ++s.textPhase;
+    return false;
+}
+
+bool uxClearText(const char* type, const char* key) {
+    auto& s = g_ux;
+    auto& io = ImGui::GetIO();
+    if (s.textPhase == 0) {
+        if (!uxFieldClick(type, key, "##text")) return false;
+    } else if (s.textPhase == 1) {
+        io.AddKeyEvent(ImGuiMod_Ctrl, true); io.AddKeyEvent(ImGuiKey_A, true);
+    } else if (s.textPhase == 2) {
+        io.AddKeyEvent(ImGuiKey_A, false); io.AddKeyEvent(ImGuiMod_Ctrl, false);
+    } else if (s.textPhase == 3) {
+        io.AddKeyEvent(ImGuiKey_Backspace, true);
+    } else if (s.textPhase == 4) {
+        io.AddKeyEvent(ImGuiKey_Backspace, false);
+    } else {
+        s.report["actions"].push_back({{"action", "clear optional text"}, {"form", type},
+                                       {"field", key}});
+        s.textPhase = 0;
+        return true;
+    }
+    ++s.textPhase;
+    return false;
+}
+
+bool uxInlineError() {
+    for (const auto& item : ui::audit::observedItems()) {
+        const auto text = item.value("label", std::string());
+        if (item.value("text_only", false) && item.value("visible", false) &&
+            !text.empty() && text[0] == '!' &&
+            (item.value("window", std::string()).find("FeatureManager") != std::string::npos ||
+             item.value("window", std::string()).find("##PMFloating") != std::string::npos))
+            return true;
+    }
+    return false;
+}
+// Require the actual PM status item, scrolling its real owner if necessary.
+bool uxEnsurePmStatus(const char* check, const char* text) {
+    const auto* item = shotItem(text, false, "FeatureManager");
+    if (!item) item = shotItem(text, false, "##PMFloating");
+    if (!item) {
+        uxCheck(check, false, {{"expected", text}, {"items", ui::audit::observedItems()}});
+        return false;
+    }
+    if (!item->value("visible", false)) {
+        shotScrollTo(text, item->value("window", std::string()).c_str(), true, item);
+        return false;
+    }
+    return uxCheck(check, item->value("text_only", false), {{"status", *item}});
+}
+
+nlohmann::json uxVisibleBounds(const AppState& st) {
+    nlohmann::json bounds = nlohmann::json::object();
+    for (const auto& body : st.bodyBBoxCache) bounds[std::to_string(body.first)] = body.second;
+    return bounds;
+}
+
+void uxNext(int step, int settle = 3) {
+    auto& s = g_ux;
+    s.step = step;
+    s.settle = settle;
+    s.stepStart = pipingNow();
+    g_simNavigation = ShotNavigation();
+}
+
+void uxRegressionDone(const char* name, int next) {
+    auto& s = g_ux;
+    s.capture = s.dir + "/" + name + "_passed.png";
+    if (!s.regressionCase.empty() || next == 0) {
+        s.report["ok"] = true;
+        s.done = true;
+    } else {
+        uxNext(next);
+    }
+}
+
+bool uxNewBox(AppState& st, const char* name) {
+    std::string error;
+    const bool created = st.docMirror.newPart(st.worker, error);
+    if (!uxCheck("new_private_part", created, {{"error", error}}))
+        return false;
+    st.clearViewportForNewDoc();
+    st.addDocTab(false);
+    const auto result = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", name},
+            {"params", {{"length", 40.0}, {"width", 30.0}, {"height", 20.0},
+                        {"centered", true}}}}}}
+    }));
+    g_ux.box = result.id_map.is_object() ? result.id_map.value("$0", std::string()) : "";
+    const bool loaded = result.ok && !result.aicm_path.empty() &&
+                        st.loadDocMesh(result.aicm_path, error);
+    return uxCheck("box_fixture", loaded && !g_ux.box.empty(),
+                   {{"tree", result.tree}, {"status", result.feature_status},
+                    {"error", result.error_message}, {"mesh_error", error}});
+}
+
+bool uxOpenExtrudeCancelFixture(AppState& st) {
+    auto& s = g_ux;
+    nlohmann::json native;
+    std::string error;
+    const bool read = st.worker.call("doc_tree", {{"doc_id", st.docMirror.docId()}}, native, error, 15000);
+    s.baseline = {{"doc_id", st.docMirror.docId()}, {"tree", st.docMirror.tree()}, {"mass", uxMass(st)}};
+    const auto nativeTree = native.is_object() ? native.value("tree", nlohmann::json()) : nlohmann::json();
+    if (!uxCheck("extrude_cancel_native_baseline", read && nativeTree.is_object() &&
+                 native.value("revision", -1) == st.docMirror.revision() &&
+                 nativeTree.value("features", nlohmann::json()) ==
+                     s.baseline["tree"].value("features", nlohmann::json()) &&
+                 uxSolid(s.baseline["mass"]),
+                 {{"baseline", s.baseline}, {"native", native}, {"error", error}})) return false;
+    return uxCheck("extrude_editor_open", st.propertyManager->openForCommand(st, "extrude_boss"), {});
+}
+
+bool uxExtrudeCancelRestored(AppState& st, const char* name) {
+    auto& s = g_ux;
+    nlohmann::json native;
+    std::string error;
+    const bool read = st.worker.call("doc_tree", {{"doc_id", s.baseline["doc_id"]}}, native, error, 15000);
+    const auto nativeTree = native.is_object() ? native.value("tree", nlohmann::json()) : nlohmann::json();
+    const auto mass = uxMass(st);
+    return uxCheck(name, read && nativeTree.is_object() &&
+                   st.docMirror.docId() == s.baseline["doc_id"] &&
+                   native.value("revision", -1) == st.docMirror.revision() &&
+                   nativeTree.value("features", nlohmann::json()) ==
+                       s.baseline["tree"].value("features", nlohmann::json()) &&
+                   st.docMirror.tree().value("features", nlohmann::json()) ==
+                       s.baseline["tree"].value("features", nlohmann::json()) &&
+                   uxSolid(mass) && std::abs(mass.value("volume_mm3", 0.0) -
+                       s.baseline["mass"].value("volume_mm3", 0.0)) < 1e-6,
+                   {{"before", s.baseline}, {"native", native}, {"mirror", st.docMirror.tree()},
+                    {"mass", mass}, {"error", error}});
+}
+
+// A real closed sketch region feeds either a drafted solid or an open surface wall.
+bool uxExtrudeFixture(AppState& st, bool surface) {
+    auto& s = g_ux;
+    st.shotWorkspacePin = -1;
+    st.activeWorkspace = AppState::Workspace::Model;
+    st.settings.units = Units::MMGS;
+    st.workspaceDir = std::filesystem::absolute(s.dir).string();
+    std::string error;
+    if (!uxCheck("extrude_regression_new_part", st.docMirror.newPart(st.worker, error),
+                 {{"error", error}})) return false;
+    st.clearViewportForNewDoc(); st.addDocTab(false);
+    nlohmann::json params = {{"end", "blind"}, {"depth", 10.0}};
+    if (!surface) {
+        params["mode"] = "boss";
+        params["draft"] = 5.0;
+        params["draft_outward"] = false;
+    }
+    const auto result = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "sketch"}, {"name", "Profile"},
+            {"params", {{"entities", nlohmann::json::array()},
+                        {"constraints", nlohmann::json::array()}}},
+            {"refs", {{"plane", "plane.top"}}}}}},
+        {{"op", "sketch_add_entity"}, {"sketch", "$0"},
+         {"entity", {{"type", "line"}, {"p1", {-20, -15}}, {"p2", {20, -15}}}}},
+        {{"op", "sketch_add_entity"}, {"sketch", "$0"},
+         {"entity", {{"type", "line"}, {"p1", {20, -15}}, {"p2", {20, 15}}}}},
+        {{"op", "sketch_add_entity"}, {"sketch", "$0"},
+         {"entity", {{"type", "line"}, {"p1", {20, 15}}, {"p2", {-20, 15}}}}},
+        {{"op", "sketch_add_entity"}, {"sketch", "$0"},
+         {"entity", {{"type", "line"}, {"p1", {-20, 15}}, {"p2", {-20, -15}}}}},
+        {{"op", "add_feature"}, {"feature", {
+            {"type", surface ? "surf_extrude" : "extrude"}, {"name", "Extrude fixture"},
+            {"params", params}, {"refs", {{"profile", nlohmann::json::array({
+                {{"kind", "region"}, {"sketch", "$0"}, {"centroid", {0, 0}}, {"hint_index", 0}}
+            })}}}}}}
+    }));
+    s.feature = result.id_map.is_object() ? result.id_map.value("$5", std::string()) : "";
+    const auto status = uxStatus(result.feature_status, s.feature);
+    const bool loaded = result.ok && !result.aicm_path.empty() &&
+                        st.loadDocMesh(result.aicm_path, error);
+    return uxCheck(surface ? "surface_extrude_fixture" : "inward_draft_fixture",
+                   loaded && !s.feature.empty() && status.is_object() && status.value("ok", false) &&
+                   st.propertyManager->openForEdit(st, s.feature),
+                   {{"tree", result.tree}, {"status", result.feature_status},
+                    {"error", result.error_message}, {"mesh_error", error}});
+}
+
+// A real authored failed-history file, with its original thumbnail and metadata,
+// deliberately omitting derived geometry/cache members so native open rebuilds it.
+bool uxWriteFailedHistory(const std::string& source, const std::string& dest) {
+    mz_zip_archive input{};
+    if (!uxCheck("copy_fixture_read_archive", mz_zip_reader_init_file(&input, source.c_str(), 0),
+                 {{"source", source}})) return false;
+    auto entry = [&](const char* name, std::string& out) {
+        size_t size = 0;
+        void* bytes = mz_zip_reader_extract_file_to_heap(&input, name, &size, 0);
+        if (!bytes) return false;
+        out.assign(static_cast<const char*>(bytes), size);
+        mz_free(bytes);
+        return true;
+    };
+    std::string thumb, meta, document;
+    const bool read = entry("thumbnail.png", thumb) && entry("meta.json", meta) &&
+                      entry("document.json", document);
+    mz_zip_reader_end(&input);
+    auto tree = nlohmann::json::parse(document, nullptr, false);
+    if (!uxCheck("copy_fixture_authored_document", read && tree.is_object() &&
+                 tree.contains("features") && tree["features"].is_array(),
+                 {{"source", source}})) return false;
+    tree["features"].push_back({{"id", "fixture_broken"}, {"type", "unsupported_feature"},
+                                {"params", nlohmann::json::object()}, {"refs", nlohmann::json::object()}});
+    document = tree.dump(2);
+    mz_zip_archive output{};
+    const bool opened = mz_zip_writer_init_file(&output, dest.c_str(), 0);
+    const bool written = opened &&
+        mz_zip_writer_add_mem(&output, "thumbnail.png", thumb.data(), thumb.size(), MZ_NO_COMPRESSION) &&
+        mz_zip_writer_add_mem(&output, "meta.json", meta.data(), meta.size(), MZ_BEST_SPEED) &&
+        mz_zip_writer_add_mem(&output, "document.json", document.data(), document.size(), MZ_BEST_SPEED) &&
+        mz_zip_writer_finalize_archive(&output);
+    if (opened) mz_zip_writer_end(&output);
+    return uxCheck("copy_fixture_written", written, {{"destination", dest}, {"tree", tree}});
+}
+
+// Real base flange and resolved rim edge; the optional separate sphere makes
+// Flatten's actual current-body candidate fail without disabling the command.
+bool uxSheetFixture(AppState& st, bool sphere) {
+    auto& s = g_ux;
+    st.shotWorkspacePin = -1;
+    st.activeWorkspace = AppState::Workspace::Model;
+    st.settings.units = Units::MMGS;
+    st.workspaceDir = std::filesystem::absolute(s.dir).string();
+    st.suppressToasts = false;
+    std::string error;
+    if (!uxCheck("sheet_feedback_new_part", st.docMirror.newPart(st.worker, error), {{"error", error}}))
+        return false;
+    st.clearViewportForNewDoc(); st.addDocTab(false);
+    const auto base = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "sketch"}, {"name", "Sheet profile"},
+            {"params", {{"entities", nlohmann::json::array()},
+                        {"constraints", nlohmann::json::array()}}},
+            {"refs", {{"plane", "plane.top"}}}}}},
+        {{"op", "sketch_add_entity"}, {"sketch", "$0"},
+         {"entity", {{"type", "line"}, {"p1", {-30, -20}}, {"p2", {30, -20}}}}},
+        {{"op", "sketch_add_entity"}, {"sketch", "$0"},
+         {"entity", {{"type", "line"}, {"p1", {30, -20}}, {"p2", {30, 20}}}}},
+        {{"op", "sketch_add_entity"}, {"sketch", "$0"},
+         {"entity", {{"type", "line"}, {"p1", {30, 20}}, {"p2", {-30, 20}}}}},
+        {{"op", "sketch_add_entity"}, {"sketch", "$0"},
+         {"entity", {{"type", "line"}, {"p1", {-30, 20}}, {"p2", {-30, -20}}}}},
+        {{"op", "add_feature"}, {"feature", {{"type", "sm_base_flange"}, {"name", "Base"},
+            {"params", {{"thickness", 2.0}}},
+            {"refs", {{"profile", nlohmann::json::array({
+                {{"kind", "region"}, {"sketch", "$0"}, {"centroid", {0, 0}}, {"hint_index", 0}}
+            })}}}}}}
+    }));
+    s.box = base.id_map.is_object() ? base.id_map.value("$5", std::string()) : "";
+    nlohmann::json edges;
+    const bool queried = base.ok && st.worker.call("doc_query",
+        {{"doc_id", st.docMirror.docId()},
+         {"query", {{"of", "edge"}, {"surf", "line"}, {"near", {0, 20, 1}}, {"count", 1}}}},
+        edges, error, 15000);
+    if (!uxCheck("sheet_feedback_resolved_edge", queried && edges.is_object() &&
+                 !edges.contains("code") && edges.contains("matches") && edges["matches"].is_array() &&
+                 !edges["matches"].empty() && !s.box.empty(),
+                 {{"base", base.tree}, {"status", base.feature_status}, {"query", edges},
+                  {"error", error}})) return false;
+    auto final = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+        {{"op", "add_feature"}, {"feature", {{"type", "sm_edge_flange"}, {"name", "Bend"},
+            {"params", {{"length", 15.0}, {"angle", 90.0}}},
+            {"refs", {{"edge", edges["matches"][0]}}}}}}
+    }));
+    s.feature = final.id_map.is_object() ? final.id_map.value("$0", std::string()) : "";
+    if (sphere && final.ok) {
+        final = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "sphere"}, {"name", "Separate sphere"},
+                {"params", {{"radius", 5.0}, {"mode", "new"}, {"at", {100, 0, 0}}}}}}}
+        }));
+    }
+    const auto status = uxStatus(final.feature_status, s.feature);
+    const bool loaded = final.ok && !final.aicm_path.empty() && st.loadDocMesh(final.aicm_path, error);
+    s.baseline = {{"tree", st.docMirror.tree()}, {"revision", st.docMirror.revision()},
+                  {"status", st.docMirror.featureStatus()}, {"mass", uxMass(st)}};
+    return uxCheck("sheet_feedback_fixture", loaded && !s.feature.empty() && status.is_object() &&
+                   status.value("ok", false) && st.hasDocMesh,
+                   {{"tree", final.tree}, {"status", final.feature_status}, {"error", final.error_message},
+                    {"mesh_error", error}, {"mass", s.baseline["mass"]}});
+}
+
+bool uxContext(AppState& st, const char* name,
+               std::initializer_list<std::pair<const char*, bool>> expected) {
+    const auto context = ui::commandContext(st);
+    nlohmann::json rows = nlohmann::json::array();
+    bool ok = true;
+    for (const auto& e : expected) {
+        const auto a = ui::commandAvailability(e.first, context);
+        const auto ribbon = ui::ribbonCommandAvailability(e.first);
+        const bool same = a.visible == ribbon.visible && a.enabled == ribbon.enabled;
+        ok = ok && a.enabled == e.second && same && (a.enabled || a.reason);
+        rows.push_back({{"command", e.first}, {"expected_enabled", e.second},
+                        {"visible", a.visible}, {"enabled", a.enabled},
+                        {"reason", a.reason ? a.reason : ""},
+                        {"ribbon_visible", ribbon.visible}, {"ribbon_enabled", ribbon.enabled},
+                        {"ribbon_reason", ribbon.reason ? ribbon.reason : ""}});
+    }
+    nlohmann::json evidence = {{"name", name}, {"document_kind", (int)context.activeDocKind},
+        {"document_id", context.activeDocId}, {"workspace", context.workspace},
+        {"sketch2d", context.sketch2dActive}, {"sketch3d", context.sketch3dActive},
+        {"solid", context.modelHasSolid}, {"selected_study", context.selectedStudyType},
+        {"schematic_open", context.hasOpenSchematic}, {"board_open", context.hasOpenBoard},
+        {"cam_job", context.camHasJob}, {"cam_setup", context.camHasSetup},
+        {"capabilities", {
+            {"contact_known", context.contactCapabilityKnown},
+            {"contact_available", context.contactCapabilityAvailable},
+            {"vibration_known", context.vibrationCapabilityKnown},
+            {"vibration_available", context.vibrationCapabilityAvailable},
+            {"em_known", context.emCapabilityKnown}, {"em_available", context.emCapabilityAvailable},
+            {"topology_known", context.topologyCapabilityKnown},
+            {"topology_available", context.topologyCapabilityAvailable}}},
+        {"commands", rows}};
+    if (st.activeTab >= 0 && st.activeTab < static_cast<int>(st.docTabs.size())) {
+        const auto& tab = st.docTabs[st.activeTab];
+        evidence["tab_kind"] = static_cast<int>(tab.kind);
+        evidence["tab_doc_id"] = tab.docId;
+        evidence["tab_is_assembly"] = tab.isAssembly;
+        evidence["presented_mirror"] = tab.aiHandoff;
+    }
+    evidence["mirror_doc_id"] = st.docMirror.docId();
+    evidence["mirror_schema"] = st.docMirror.tree().is_object()
+        ? st.docMirror.tree().value("schema", std::string()) : std::string();
+    g_ux.report["contexts"].push_back(evidence);
+    return uxCheck(std::string("availability_") + name, ok, evidence);
+}
+
+const nlohmann::json* uxRibbonItem(const char* cmd) {
+    for (const auto& item : ui::audit::observedItems()) {
+        const auto window = item.value("window", std::string());
+        if (window.find("##RibbonBar") == std::string::npos) continue;
+        ImGuiWindow* w = ImGui::FindWindowByName(window.c_str());
+        if (!w) continue;
+        const ImGuiID parent = ImHashStr(cmd, 0, w->ID);
+        for (const char* primitive : {"##main", "##sm", "##msm"}) {
+            if (item.value("id", ImGuiID(0)) == ImHashStr(primitive, 0, parent)) return &item;
+        }
+    }
+    return nullptr;
+}
+
+const nlohmann::json* uxRibbonDropItem(const char* cmd) {
+    for (const auto& item : ui::audit::observedItems()) {
+        const auto window = item.value("window", std::string());
+        if (window.find("##RibbonBar") == std::string::npos) continue;
+        ImGuiWindow* w = ImGui::FindWindowByName(window.c_str());
+        if (!w) continue;
+        const ImGuiID parent = ImHashStr(cmd, 0, w->ID);
+        for (const char* primitive : {"##drop", "##mdr"})
+            if (item.value("id", ImGuiID(0)) == ImHashStr(primitive, 0, parent)) return &item;
+    }
+    return nullptr;
+}
+
+// The ribbon draws its popup rows with scoped IDs and painted labels. Resolve the
+// real item in the actual popup window rather than guessing a label hit target.
+const nlohmann::json* uxRibbonPopupRow(const char* cmd, const char* primitive) {
+    for (const auto& observed : ui::audit::observedWindows()) {
+        const std::string window = observed.value("window", std::string());
+        if (window.find("##Popup_") == std::string::npos) continue;
+        ImGuiWindow* w = ImGui::FindWindowByName(window.c_str());
+        if (!w) continue;
+        const ImGuiID parent = ImHashStr(cmd, 0, w->ID);
+        const ImGuiID id = ImHashStr(primitive, 0, parent);
+        if (ui::audit::observedItemById(id, window, g_ux.fieldObservation))
+            return &g_ux.fieldObservation;
+    }
+    return nullptr;
+}
+
+template <typename Resolve>
+bool uxClickOwned(const char* check, const char* target, const char* window, Resolve&& resolve) {
+    auto& s = g_ux;
+    if (s.pointer.active && s.input.phase == 2) {
+        const ImGuiID active = ImGui::GetCurrentContext()->ActiveId;
+        if (!uxCheck(check, active == s.pointer.id && ImGui::IsMouseDown(ImGuiMouseButton_Left),
+                     {{"target_id", s.pointer.id}, {"active_id", active},
+                      {"window", s.pointer.window}})) return false;
+    }
+    return uxClickItem(target, window, std::forward<Resolve>(resolve));
+}
+
+int uxReasonToastCount(AppState& st, const std::string& reason) {
+    std::lock_guard<std::mutex> lock(st.toastsMtx);
+    int count = 0;
+    for (const auto& toast : st.toasts)
+        if (toast.msg == reason) count += toast.count;
+    return count;
+}
+
+// Keep the pointer on the original observed row long enough for its real
+// tooltip to render, and verify the reason's actual glyphs, not just a tooltip.
+bool uxHoverUnavailable(const char* check) {
+    auto& s = g_ux;
+    const auto& item = s.baseline["hover_item"];
+    const ImGuiID id = item.value("id", ImGuiID(0));
+    const std::string window = item.value("window", std::string());
+    const ImVec2 point = shotPoint(item);
+    nlohmann::json current;
+    const bool found = ui::audit::observedItemById(id, window, current);
+    bool stable = found && current.value("visible", false);
+    if (stable) {
+        const auto& r = current["rect"];
+        stable = point.x >= r[0].get<float>() && point.x < r[2].get<float>() &&
+                 point.y >= r[1].get<float>() && point.y < r[3].get<float>();
+    }
+    if (!stable)
+        return uxCheck(check, false, {{"original", item}, {"current", current}});
+    s.input.point = point;
+    ImGui::GetIO().AddMousePosEvent(point.x, point.y);
+    const int frames = s.baseline.value("hover_frames", 0);
+    s.baseline["hover_frames"] = frames + 1;
+    if (frames < 4) return false;
+    const std::string reason = s.baseline["hover_reason"].get<std::string>();
+    const ImGuiID hovered = ImGui::GetCurrentContext()->HoveredId;
+    const int vertices = uxTooltipTextVertices();
+    const bool rendered = uxTooltipContains(reason);
+    return uxCheck(check, hovered == id && rendered && vertices >= 4,
+                   {{"item", item}, {"hovered_id", hovered}, {"reason", reason},
+                    {"rendered_reason", rendered}, {"tooltip_text_vertices", vertices}});
+}
+
+const nlohmann::json* uxShortcutItem(int index) {
+    for (const auto& item : ui::audit::observedItems()) {
+        const auto window = item.value("window", std::string());
+        ImGuiWindow* w = ImGui::FindWindowByName(window.c_str());
+        if (!w) continue;
+        ImGuiID id = ImHashStr("##sbar", 0, w->ID);
+        id = ImHashData(&index, sizeof(index), id);
+        id = ImHashStr("##sb", 0, id);
+        if (item.value("id", ImGuiID(0)) == id && item.value("visible", false)) return &item;
+    }
+    return nullptr;
+}
+// The observed item alone does not encode the shortcut's command policy: its
+// InvisibleButton remains interactive to explain why unavailable commands are disabled.
+bool uxCheckShortcutRendered(AppState& st, const char* name, int index, const char* command) {
+    const auto* item = uxShortcutItem(index);
+    const auto shown = ui::ribbonCommandAvailability(command);
+    const auto fresh = ui::commandAvailability(command, ui::commandContext(st));
+    return uxCheck(name, item && item->value("enabled", false) &&
+                        shown.visible && shown.enabled && fresh.visible && fresh.enabled,
+                   {{"item", item ? *item : nlohmann::json()}, {"command", command},
+                    {"rendered_visible", shown.visible}, {"rendered_enabled", shown.enabled},
+                    {"fresh_visible", fresh.visible}, {"fresh_enabled", fresh.enabled}});
+}
+
+bool uxClickShortcut(int index, const char* context) {
+    auto& s = g_ux;
+    if (s.pointer.active && s.input.phase == 2) {
+        const ImGuiID active = ImGui::GetCurrentContext()->ActiveId;
+        if (!uxCheck(std::string("shortcut_") + context + "_press_owned_by_button",
+                     active == s.pointer.id && ImGui::IsMouseDown(ImGuiMouseButton_Left),
+                     {{"target_id", s.pointer.id}, {"active_id", active},
+                      {"window", s.pointer.window}})) return false;
+    }
+    return uxClickItem("##sb", "Viewport", [&]() { return uxShortcutItem(index); });
+}
+
+
+void uxQualityTick(AppState& st) {
+    auto& s = g_ux;
+    if (!s.init) {
+        s.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        s.want = st.shot && mode && std::strcmp(mode, "uxquality") == 0;
+        if (!s.want) return;
+        const char* out = std::getenv("CHUDWARE_UXQUALITY_OUT");
+        const char* repo = std::getenv("CHUDWARE_REPO");
+        s.dir = out && *out ? out : std::string(repo ? repo : ".") + "/scratch/uxquality_shots";
+        std::error_code ec;
+        std::filesystem::create_directories(s.dir, ec);
+        s.started = s.stepStart = pipingNow();
+        s.report = {{"scenario", "uxquality"}, {"ok", false},
+                    {"scope", "Private real DocMirror and rendered ImGui gestures; bounded UX smoke, not general geometry or solver certification."},
+                    {"checks", nlohmann::json::array()}, {"actions", nlohmann::json::array()},
+                    {"captures", nlohmann::json::array()}, {"contexts", nlohmann::json::array()}};
+        if (!uxCheck("output_directory", !ec, {{"path", s.dir}, {"error", ec.message()}})) return;
+        const char* daemon = std::getenv("CHUDWARE_ENGINE_DAEMON");
+        if (!uxCheck("private_engine_required", daemon && std::strcmp(daemon, "0") == 0 &&
+                     !engine::daemonMode(), {{"CHUDWARE_ENGINE_DAEMON", daemon ? daemon : "(unset)"},
+                                             {"daemon_mode", engine::daemonMode()}})) return;
+        const char* selected = std::getenv("CHU_UXQUALITY_CASE");
+        if (selected && *selected) {
+            s.regressionCase = selected;
+            const std::pair<const char*, int> cases[] = {
+                {"numeric_escape", 3000}, {"units_blur", 3100},
+                {"cancel_atomic", 3200}, {"inward_draft", 3300},
+                {"legacy_variable", 3400}, {"legacy_equal_expression", 3410},
+                {"fillet_reopen", 3500},
+                {"thread_autosize", 3600}, {"surface_through_all", 3700},
+                {"presented_motion", 3800}, {"sketch2d_cancel", 3900},
+                {"equation_rejection", 4000}, {"study_identity", 4100},
+                {"sketch3d_cancel", 4200}, {"sketch3d_foreign", 4250},
+                {"study_lifecycle", 4300}, {"feature_rejection", 4400},
+                {"flatten_rejection", 4500}, {"assembly_failed_component", 4600},
+                {"copy_failed_history", 4700}, {"copy_resync_race", 4800},
+                {"obsolete_rejection", 4900}, {"ecad_queued_origin", 5000},
+                {"parked_mutation", 5100}, {"parked_mechanical", 5200},
+                {"piping_footer", 5300}, {"hole_thread", 1159}, {"commands", 199}
+            };
+            for (const auto& entry : cases)
+                if (s.regressionCase == entry.first) s.step = entry.second;
+            if (!uxCheck("recognized_regression_case", s.step != 0,
+                         {{"case", s.regressionCase}})) return;
+        }
+        s.report["selection"] = s.regressionCase.empty() ? "all" : s.regressionCase;
+    }
+    if (!s.want || s.done) return;
+    ui::audit::observedItems();
+    if (pipingNow() - s.started > 1200.0 || pipingNow() - s.stepStart > 120.0) {
+        uxCheck("timeout", false, {{"step", s.step}, {"revision", st.docMirror.revision()},
+                                   {"status", st.docMirror.featureStatus()}, {"tree", st.docMirror.tree()},
+                                   {"form_active", st.propertyManager && st.propertyManager->active()},
+                                   {"accept_pending", st.propertyManager && st.propertyManager->acceptPending()},
+                                   {"preview_pending", st.propertyManager && st.propertyManager->previewPending()},
+                                   {"preview_error", st.propertyManager ? st.propertyManager->previewError() : ""},
+                                   {"active_form", st.propertyManager ? st.propertyManager->activeFormType() : ""},
+                                   {"input_phase", s.input.phase}, {"text_phase", s.textPhase},
+                                   {"last_field", {{"form", s.seekForm}, {"field", s.seekField},
+                                                   {"primitive", s.seekPrimitive}}},
+                                   {"imgui_active_id", ImGui::GetCurrentContext()->ActiveId},
+                                   {"navigation", shotNavigationEvidence()}}); return;
+    }
+    if (!st.workerStarted || st.frame < 5 || !s.capture.empty()) return;
+    if (s.settle > 0) { --s.settle; return; }
+    auto pm = [&]() { return st.propertyManager; };
+    auto current = [&]() -> nlohmann::json {
+        const auto* f = uxFeature(st, s.feature);
+        return f ? *f : nlohmann::json::object();
+    };
+    auto shoot = [&](const std::string& name) { s.capture = s.dir + "/" + name + ".png"; };
+    auto clickOk = [&]() { return uxClick("##pm_ok"); };
+    auto clickCancel = [&]() { return uxClick("##pm_cancel"); };
+    auto idle = [&]() { return !st.rpc.busy() && !st.rebuildsInFlight &&
+                               pm() && !pm()->previewPending() && !pm()->acceptPending(); };
+    auto value = [&](const char* key) {
+        const auto f = current();
+        return f.is_object() && f.contains("params") && f["params"].contains(key)
+                   ? uxNumber(f["params"][key]) : std::numeric_limits<double>::quiet_NaN();
+    };
+    std::string error;
+    switch (s.step) {
+    case 0:
+        if (!uxCheck("item_observer_ready", !ui::audit::observedItems().empty() &&
+                     !ui::audit::observedWindows().empty(),
+                     {{"item_count", ui::audit::observedItems().size()},
+                      {"window_count", ui::audit::observedWindows().size()}})) return;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.settings.units = Units::MMGS;
+        st.workspaceDir = std::filesystem::absolute(s.dir).string();
+        if (!uxNewBox(st, "UX fillet blank")) return;
+        uxNext(1); return;
+    case 1: {
+        // Every case starts from the same blank; the engine resolves all four vertical edges.
+        struct Case { const char* name; const char* type; double radius; double radius2;
+                      bool expression = false; };
+        static const Case cases[] = {
+            {"constant_large", "constant", 100.0, 0.0},
+            {"constant_tiny", "constant", 1e-12, 0.0},
+            {"constant_zero", "constant", 0.0, 0.0},
+            {"constant_negative", "constant", -1.0, 0.0},
+            {"variable_large", "variable", 100.0, 3.0},
+            {"variable_tiny", "variable", 1e-12, 3.0},
+            {"variable_zero", "variable", 0.0, 3.0},
+            {"variable_negative", "variable", -1.0, 3.0},
+            {"constant_expression", "constant", 100.0, 0.0, true},
+            {"variable_expression", "variable", 100.0, 3.0, true},
+        };
+        const Case& c = cases[s.filletCase];
+        nlohmann::json params = {{"type", c.type}, {"radius", c.radius}};
+        if (std::strcmp(c.type, "variable") == 0) params["radius2"] = c.radius2;
+        if (c.expression) {
+            const auto eq = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                {{"op", "eq_set"}, {"name", "UXRadius"}, {"expr", "100"}}
+            }));
+            if (!uxCheck("fillet_expression_fixture", eq.ok, {{"error", eq.error_message}})) return;
+            params["radius"] = {{"value", c.radius}, {"expr", "UXRadius"}};
+        }
+        const auto result = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "fillet"}, {"name", c.name},
+                {"params", params}, {"refs", {{"edges", {{"of", "edge"}, {"parallel", "z"}}}}}}}}
+        }));
+        s.feature = result.id_map.is_object() ? result.id_map.value("$0", std::string()) : "";
+        const auto status = uxStatus(result.feature_status, s.feature);
+        const auto data = status.is_object() && status.contains("data") && status["data"].is_object()
+                              ? status["data"].value("fillet", nlohmann::json()) : nlohmann::json();
+        const auto* feature = uxFeature(st, s.feature);
+        bool evidence = result.ok && feature && data.is_object() &&
+                        data.contains("requested") && data.contains("effective") &&
+                        data["effective"].is_object() && data["effective"].contains("radius") &&
+                        data["effective"]["radius"].is_number() &&
+                        data.value("selected_edges", 0) == 4 &&
+                        data.value("covered_edges", 0) == 4 &&
+                        data.value("adjustment", std::string("none")) != "none";
+        const double effective = evidence ? data["effective"]["radius"].get<double>() : -1.0;
+        evidence = evidence && std::isfinite(effective) && effective > 0.0 &&
+                   (c.radius > 10.0 ? effective < c.radius : effective > c.radius);
+        if (evidence)
+            evidence = data["requested"].is_object() &&
+                       data["requested"].contains("radius") &&
+                       data["requested"]["radius"].is_number() &&
+                       data["requested"]["radius"].get<double>() == c.radius;
+        if (evidence && std::strcmp(c.type, "variable") == 0) {
+            evidence = data["effective"].contains("radius2") &&
+                       data["effective"]["radius2"].is_number() &&
+                       data["effective"]["radius2"].get<double>() > 0.0 &&
+                       data["requested"].contains("radius2") &&
+                       data["requested"]["radius2"].is_number() &&
+                       data["requested"]["radius2"].get<double>() == c.radius2 &&
+                       std::abs(uxNumber((*feature)["params"]["radius2"]) -
+                                data["effective"]["radius2"].get<double>()) < 1e-6;
+        }
+        if (evidence && c.expression) {
+            const auto& p = (*feature)["params"]["radius"];
+            const auto derived = feature->value("data", nlohmann::json::object())
+                                     .value("fillet_effective", nlohmann::json());
+            evidence = p.is_object() && p.value("expr", std::string()) == "UXRadius" &&
+                       derived.is_object() && derived.contains("effective") &&
+                       std::abs(derived["effective"].value("radius", -1.0) - effective) < 1e-6;
+        } else if (evidence) {
+            evidence = std::abs(uxNumber((*feature)["params"]["radius"]) - effective) <=
+                       std::max(1e-8, std::abs(effective) * 1e-6);
+        }
+        const bool loaded = result.ok && !result.aicm_path.empty() &&
+                            st.loadDocMesh(result.aicm_path, error);
+        const auto mass = uxMass(st);
+        const double volume = mass.value("volume_mm3", 0.0);
+        const double expectedVolume = 24000.0 - (4.0 - std::acos(-1.0)) * effective * effective * 20.0;
+        const bool geometryMatches = std::strcmp(c.type, "constant") != 0 ||
+                                     std::abs(volume - expectedVolume) < 0.1;
+        if (!uxCheck(std::string("fillet_") + c.name, evidence && loaded && uxSolid(mass) &&
+                     geometryMatches,
+                     {{"request", params}, {"feature", feature ? *feature : nlohmann::json()},
+                      {"status", status}, {"mass", mass}, {"expected_constant_volume", expectedVolume},
+                      {"mesh_error", error},
+                      {"error", result.error_message}})) return;
+        shoot(std::string("fillet_") + c.name);
+        uxNext(2); return;
+    }
+    case 2:
+        if (!uxCheck("matrix_fillet_editor", pm()->openForEdit(st, s.feature),
+                     {{"feature", current()}, {"case_index", s.filletCase}})) return;
+        uxNext(300); return;
+    case 300: {
+        static const char* inputs[] = {"100mm", "0.000000000001mm", "0mm", "-1mm",
+                                       "100mm", "0.000000000001mm", "0mm", "-1mm",
+                                       "=UXRadius", "=UXRadius"};
+        if (uxTypeDim("fillet", "radius", inputs[s.filletCase], s.filletCase < 8)) {
+            shoot("fillet_input_" + std::to_string(s.filletCase));
+            uxNext(301, 0);
+        }
+        return;
+    }
+    case 301:
+        if (clickOk()) uxNext(302, 0);
+        return;
+    case 302: {
+        if (!idle()) return;
+        static const double requests[] = {100.0, 1e-12, 0.0, -1.0, 100.0,
+                                          1e-12, 0.0, -1.0, 100.0, 100.0};
+        const auto status = uxStatus(st.docMirror.featureStatus(), s.feature);
+        const auto data = status.is_object() && status.contains("data") && status["data"].is_object()
+                              ? status["data"].value("fillet", nlohmann::json()) : nlohmann::json();
+        const auto f = current();
+        const auto radius = f.value("params", nlohmann::json::object()).value("radius", nlohmann::json());
+        const auto mass = uxMass(st);
+        bool valid = !pm()->active() && data.is_object() && data.contains("requested") &&
+                     data["requested"].is_object() && data["requested"].contains("radius") &&
+                     data["requested"]["radius"].is_number() &&
+                     data["requested"]["radius"].get<double>() == requests[s.filletCase] &&
+                     data.contains("effective") && data["effective"].is_object() &&
+                     data["effective"].contains("radius") && data["effective"]["radius"].is_number() &&
+                     data.value("selected_edges", 0) == 4 && data.value("covered_edges", 0) == 4;
+        if (valid) {
+            const double effective = data["effective"]["radius"].get<double>();
+            valid = effective > 0.0 && std::isfinite(effective) &&
+                (requests[s.filletCase] > 10.0 ? effective < requests[s.filletCase]
+                                               : effective > requests[s.filletCase]);
+            if (s.filletCase < 8)
+                valid = valid && std::abs(uxNumber(radius) - effective) < 1e-6;
+            else
+                valid = valid && radius.is_object() &&
+                        radius.value("expr", std::string()) == "UXRadius" &&
+                        f.value("data", nlohmann::json::object()).contains("fillet_effective");
+        }
+        if (!uxCheck("fillet_ui_matrix_" + std::to_string(s.filletCase), valid && uxSolid(mass),
+                     {{"feature", f}, {"status", status}, {"mass", mass},
+                      {"pending_observed", s.sawAcceptPending}})) return;
+        if (++s.filletCase < 10) {
+            if (!uxNewBox(st, "UX fillet blank")) return;
+            uxNext(1); return;
+        }
+        s.filletCase = 0; uxNext(3); return;
+    }
+    case 3: {
+        if (!uxNewBox(st, "UI fillet blank")) return;
+        const auto eq = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "eq_set"}, {"name", "UXRadius"}, {"expr", "100"}}
+        }));
+        nlohmann::json edges = nlohmann::json::array();
+        for (int i = 1; i <= 12; ++i) {
+            const auto raw = st.docMirror.resolvePick(st.worker, 1, "edge", i, error);
+            const auto edge = nlohmann::json::parse(raw, nullptr, false);
+            if (edge.is_object() && edge.contains("axis") && edge["axis"].is_array() &&
+                edge["axis"].size() == 3 && edge["axis"][2].is_number() &&
+                std::abs(edge["axis"][2].get<double>()) > 0.9) edges.push_back(edge);
+        }
+        nlohmann::json params = {{"type", s.filletCase ? "variable" : "constant"}, {"radius", 2.0}};
+        if (s.filletCase) params["radius2"] = 3.0;
+        const auto result = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "fillet"}, {"name", "UI fillet"},
+                {"params", params}, {"refs", {{"edges", edges}}}}}}
+        }));
+        s.feature = result.id_map.is_object() ? result.id_map.value("$0", std::string()) : "";
+        const bool loaded = result.ok && !result.aicm_path.empty() &&
+                            st.loadDocMesh(result.aicm_path, error);
+        if (!uxCheck("ui_fillet_fixture", eq.ok && edges.size() == 4 && loaded &&
+                     !s.feature.empty() && pm()->openForEdit(st, s.feature),
+                     {{"edges", edges}, {"status", result.feature_status},
+                      {"error", result.error_message}})) return;
+        uxNext(4); return;
+    }
+    case 4:
+        if (uxTypeDim("fillet", "radius", "100mm", true)) uxNext(5, 0);
+        return;
+    case 5:
+        if (s.input.key(ImGuiKey_Enter)) uxNext(6, 0);
+        return;
+    case 6: {
+        if (!idle()) return;
+        const auto status = uxStatus(st.docMirror.featureStatus(), s.feature);
+        const auto data = status.is_object() && status.contains("data") && status["data"].is_object()
+                              ? status["data"].value("fillet", nlohmann::json()) : nlohmann::json();
+        std::string displayed;
+        for (const auto& item : pm()->calloutItems(st))
+            if (item.label == "Radius") displayed = item.value;
+        const double effective = data.is_object() && data.contains("effective") &&
+                                 data["effective"].is_object()
+                                     ? data["effective"].value("radius", -1.0) : -1.0;
+        const auto mass = uxMass(st);
+        if (!uxCheck(s.filletCase ? "ui_variable_fillet_corrected" : "ui_constant_fillet_corrected",
+                     pm()->active() && pm()->previewError().empty() && effective > 0.0 &&
+                     effective < 100.0 && data.value("selected_edges", 0) == 4 &&
+                     data.value("covered_edges", 0) == 4 &&
+                     std::abs(value("radius") - effective) < 1e-6 &&
+                     !displayed.empty() &&
+                     std::abs(std::strtod(displayed.c_str(), nullptr) - effective) < 0.02 &&
+                     !pm()->previewWarning().empty() && uxSolid(mass),
+                     {{"feature", current()}, {"status", status}, {"displayed", displayed},
+                      {"warning", pm()->previewWarning()}, {"mass", mass}})) return;
+        shoot(s.filletCase ? "ui_variable_fillet" : "ui_constant_fillet");
+        uxNext(7); return;
+    }
+    case 7:
+        if (clickOk()) uxNext(8, 0);
+        return;
+    case 8:
+        if (!idle()) return;
+        if (!uxCheck("fillet_preview_accept", !pm()->active(), {{"feature", current()}})) return;
+        if (!uxCheck("expression_fillet_editor", pm()->openForEdit(st, s.feature), {})) return;
+        uxNext(9); return;
+    case 9:
+        if (uxTypeDim("fillet", "radius", "=UXRadius", true)) uxNext(40, 0);
+        return;
+    case 40:
+        if (clickOk()) uxNext(41, 0);
+        return;
+    case 41: {
+        if (!idle()) return;
+        const auto f = current();
+        const auto radius = f.value("params", nlohmann::json::object()).value("radius", nlohmann::json());
+        const auto derived = f.value("data", nlohmann::json::object())
+                                 .value("fillet_effective", nlohmann::json());
+        const auto mass = uxMass(st);
+        if (!uxCheck("ui_fillet_expression_preserved",
+                     !pm()->active() && radius.is_object() &&
+                     radius.value("expr", std::string()) == "UXRadius" && derived.is_object() &&
+                     derived.contains("requested") && derived["requested"].value("radius", 0.0) == 100.0 &&
+                     uxSolid(mass),
+                     {{"feature", f}, {"status", st.docMirror.featureStatus()}, {"mass", mass}}))
+            return;
+        const std::string saved = (std::filesystem::absolute(s.dir) /
+            (s.filletCase ? "variable_expression.step+" : "constant_expression.step+")).string();
+        const bool savedOk = st.docMirror.save(st.worker, saved, error);
+        const bool opened = savedOk && st.docMirror.open(st.worker, saved, error);
+        if (!uxCheck("fillet_expression_warm_reopen",
+                     opened && st.docMirror.lastOpenedCacheHit() && st.docMirror.lastOpenedWarm() &&
+                     uxFeature(st, s.feature) &&
+                     (*uxFeature(st, s.feature)).value("data", nlohmann::json::object())
+                         .contains("fillet_effective"),
+                     {{"path", saved}, {"error", error},
+                      {"cache_hit", st.docMirror.lastOpenedCacheHit()},
+                      {"warm", st.docMirror.lastOpenedWarm()}, {"tree", st.docMirror.tree()}})) return;
+        st.addDocTab(false);
+        if (++s.filletCase < 2) { uxNext(3); return; }
+        if (!uxNewBox(st, "UX typed dimensions")) return;
+        s.feature = s.box;
+        s.part = st.docMirror.docId();
+        s.partTab = st.activeTab;
+        if (!uxCheck("box_editor_open", pm() && pm()->openForEdit(st, s.feature),
+                     {{"feature", s.feature}})) return;
+        s.baseline = current(); uxNext(10); return;
+    }
+    case 10:
+        if (uxTypeDim("box", "length", "not-a-dimension", true)) uxNext(11, 0);
+        return;
+    case 11:
+        if (clickOk()) uxNext(12, 4);
+        return;
+    case 12:
+        if (!uxCheck("malformed_immediate_ok_stays_open",
+                     pm()->active() && uxInlineError() && current() == s.baseline,
+                     {{"feature", current()}, {"preview_error", pm()->previewError()},
+                      {"items", ui::audit::observedItems()}})) return;
+        shoot("box_invalid"); uxNext(13); return;
+    case 13:
+        if (uxTypeDim("box", "length", "48mm", false)) {
+            s.sawAcceptPending = s.sawPreviewPending = false;
+            uxNext(14, 0);
+        }
+        return;
+    case 14:
+        if (clickOk()) uxNext(15, 0);
+        return;
+    case 15:
+        if (!idle()) return;
+        if (!uxCheck("valid_immediate_ok_waits_for_real_result",
+                     !pm()->active() && s.sawAcceptPending &&
+                     std::abs(value("length") - 48.0) < 1e-6 && uxSolid(uxMass(st)),
+                     {{"feature", current()}, {"accept_pending_observed", s.sawAcceptPending},
+                      {"preview_pending_observed", s.sawPreviewPending},
+                      {"status", st.docMirror.featureStatus()}})) return;
+        st.settings.units = Units::IPS;
+        if (!uxCheck("ips_box_editor_open", pm()->openForEdit(st, s.feature), {})) return;
+        uxNext(16); return;
+    case 16:
+        if (uxTypeDim("box", "length", "1mm", true)) uxNext(17, 0);
+        return;
+    case 17:
+        if (clickOk()) uxNext(18, 0);
+        return;
+    case 18:
+        if (!idle()) return;
+        if (!uxCheck("ips_explicit_mm_is_one_mm", !pm()->active() &&
+                     std::abs(value("length") - 1.0) < 1e-6,
+                     {{"feature", current()}, {"status", st.docMirror.featureStatus()}})) return;
+        if (!uxCheck("overflow_editor_open", pm()->openForEdit(st, s.feature), {})) return;
+        s.baseline = current(); uxNext(19); return;
+    case 19:
+        if (uxTypeDim("box", "length", "1e308in", true)) uxNext(20, 0);
+        return;
+    case 20:
+        if (clickOk()) uxNext(21, 4);
+        return;
+    case 21:
+        if (!uxCheck("ips_overflow_refused", pm()->active() && uxInlineError() &&
+                     current() == s.baseline, {{"feature", current()},
+                                               {"items", ui::audit::observedItems()}})) return;
+        shoot("ips_overflow"); uxNext(22); return;
+    case 22:
+        if (clickCancel()) uxNext(23);
+        return;
+    case 23:
+        if (!idle() || pm()->active()) return;
+        st.settings.units = Units::MMGS;
+        if (!uxCheck("cancel_after_invalid_input", current() == s.baseline, {{"feature", current()}}))
+            return;
+        if (!uxCheck("numeric_editor_open", pm()->openForEdit(st, s.feature), {})) return;
+        uxNext(230); return;
+    case 230:
+        if (uxTypeNumeric("box", "length", "4.5")) {
+            // Change document display units while the original MMGS editor still owns its buffer.
+            st.settings.units = Units::IPS;
+            uxNext(231, 0);
+        }
+        return;
+    case 231:
+        if (clickOk()) uxNext(232, 0);
+        return;
+    case 232:
+        if (!idle()) return;
+        if (!uxCheck("numeric_entry_keeps_original_units_on_switch",
+                     !pm()->active() && std::abs(value("length") - 4.5) < 1e-6,
+                     {{"feature", current()}, {"units_after_edit", "IPS"}})) return;
+        if (!uxCheck("invalid_numeric_editor_open", pm()->openForEdit(st, s.feature), {})) return;
+        s.baseline = current();
+        uxNext(233); return;
+    case 233:
+        if (uxTypeNumeric("box", "length", "1e+")) uxNext(234, 0);
+        return;
+    case 234:
+        if (clickOk()) uxNext(235, 4);
+        return;
+    case 235:
+        if (!uxCheck("malformed_numeric_immediate_ok_refused", pm()->active() &&
+                     uxInlineError() && current() == s.baseline,
+                     {{"feature", current()}, {"items", ui::audit::observedItems()}})) return;
+        st.settings.units = Units::MMGS;
+        uxNext(236); return;
+    case 236:
+        if (!uxCheck("unit_switch_preserves_invalid_numeric_edit",
+                     pm()->active() && uxInlineError() && current() == s.baseline,
+                     {{"feature", current()}, {"items", ui::audit::observedItems()}})) return;
+        shoot("numeric_invalid_unit_switch"); uxNext(237); return;
+    case 237:
+        if (clickCancel()) uxNext(238, 0);
+        return;
+    case 238:
+        if (!idle() || pm()->active()) return;
+        if (!uxCheck("rejection_editor_open", pm()->openForEdit(st, s.feature), {})) return;
+        s.baseline = current(); uxNext(24); return;
+    case 24:
+        if (uxTypeDim("box", "length", "12mm", true)) uxNext(25, 0);
+        return;
+    case 25:
+        if (s.input.key(ImGuiKey_Enter)) uxNext(26, 0);
+        return;
+    case 26:
+        if (!idle() || std::abs(value("length") - 12.0) > 1e-6) return;
+        // The callback drains before this tick; inspect a frame rendered after that drain.
+        uxNext(261, 0); return;
+    case 261:
+        if (!idle() || std::abs(value("length") - 12.0) > 1e-6) return;
+        if (!uxEnsurePmStatus("preview_up_to_date_rendered", "Preview up to date")) return;
+        if (!uxCheck("real_preview_before_rejection", pm()->active(), {{"feature", current()}})) return;
+        uxNext(27); return;
+    case 27:
+        if (uxTypeDim("box", "length", "=ux_missing_variable", true)) {
+            s.sawAcceptPending = s.sawPreviewPending = false;
+            uxNext(28, 0);
+        }
+        return;
+    case 28:
+        if (clickOk()) uxNext(29, 0);
+        return;
+    case 29:
+        if (!idle()) return;
+        // The observed item snapshot still belongs to the frame before the rejection callback.
+        uxNext(291, 0); return;
+    case 291:
+        if (!idle()) return;
+        if (!uxEnsurePmStatus("preview_failed_rendered", "Preview failed")) return;
+        if (!uxCheck("known_worker_rejection_keeps_form_open",
+                     pm()->active() && !pm()->previewError().empty() &&
+                     std::abs(value("length") - 12.0) < 1e-6 && s.sawAcceptPending,
+                     {{"feature", current()}, {"error", pm()->previewError()},
+                      {"status", st.docMirror.featureStatus()}, {"pending_observed", s.sawAcceptPending}}))
+            return;
+        shoot("worker_rejection"); uxNext(30); return;
+    case 30:
+        if (clickCancel()) uxNext(31, 0);
+        return;
+    case 31:
+        if (!idle() || pm()->active()) return;
+        if (!uxCheck("cancel_after_known_rejection_restores_checkpoint",
+                     current() == s.baseline, {{"before", s.baseline}, {"after", current()}})) return;
+        uxNext(100); return;
+    case 100: {
+        // A real datum feature gives the editor an existing reference and checkpoint.
+        const auto result = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "plane"}, {"name", "UX offset plane"},
+                {"params", {{"method", "offset"}, {"offset", 10.0}}},
+                {"refs", {{"base", "plane.top"}}}}}}
+        }));
+        s.feature = result.id_map.is_object() ? result.id_map.value("$0", std::string()) : "";
+        if (!uxCheck("offset_plane_fixture", result.ok && !s.feature.empty() &&
+                     pm()->openForEdit(st, s.feature),
+                     {{"tree", result.tree}, {"status", result.feature_status},
+                      {"error", result.error_message}})) return;
+        uxNext(101); return;
+    }
+    case 101:
+        if (uxTypeDim("plane", "offset", "-5mm", true)) uxNext(102, 0);
+        return;
+    case 102:
+        if (clickOk()) uxNext(103, 0);
+        return;
+    case 103:
+        if (!idle()) return;
+        if (!uxCheck("signed_plane_offset", !pm()->active() && std::abs(value("offset") + 5.0) < 1e-6 &&
+                     !st.docMirror.refDatums().empty(),
+                     {{"feature", current()}, {"datums", st.docMirror.refDatums()},
+                      {"status", st.docMirror.featureStatus()}})) return;
+        s.secondary = s.feature;
+        if (!uxCheck("zero_plane_editor", pm()->openForEdit(st, s.feature), {})) return;
+        uxNext(104); return;
+    case 104:
+        if (uxTypeDim("plane", "offset", "0mm", true)) uxNext(105, 0);
+        return;
+    case 105:
+        if (clickOk()) uxNext(106, 0);
+        return;
+    case 106: {
+        if (!idle()) return;
+        if (!uxCheck("zero_plane_offset", !pm()->active() && std::abs(value("offset")) < 1e-6,
+                     {{"feature", current()}, {"datums", st.docMirror.refDatums()},
+                      {"status", st.docMirror.featureStatus()}})) return;
+        // The midpoint is between parallel, distinct real datum planes.
+        const auto second = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "plane"}, {"name", "UX parallel plane"},
+                {"params", {{"method", "offset"}, {"offset", 12.0}}},
+                {"refs", {{"base", "plane.top"}}}}}}
+        }));
+        s.secondary = second.id_map.is_object() ? second.id_map.value("$0", std::string()) : "";
+        const auto middle = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "plane"}, {"name", "UX mid plane"},
+                {"params", {{"method", "midplane"}}},
+                {"refs", {{"base", "plane.top"}, {"second", s.secondary}}}}}}
+        }));
+        s.feature = middle.id_map.is_object() ? middle.id_map.value("$0", std::string()) : "";
+        if (!uxCheck("midplane_reference_fixture", second.ok && middle.ok && !s.feature.empty() &&
+                     pm()->openForEdit(st, s.feature),
+                     {{"second_status", second.feature_status}, {"middle_status", middle.feature_status},
+                      {"error", middle.error_message}})) return;
+        uxNext(107); return;
+    }
+    case 107:
+        if (uxFieldClick("plane", "flip", "##chk")) uxNext(108, 0);
+        return;
+    case 108:
+        if (clickOk()) uxNext(109, 0);
+        return;
+    case 109:
+        if (!idle()) return;
+        if (!uxCheck("midplane_reference_ready", !pm()->active() && current().is_object() &&
+                     current().value("params", nlohmann::json::object()).value("method", "") == "midplane" &&
+                     current()["params"].value("flip", false),
+                     {{"feature", current()}, {"status", st.docMirror.featureStatus()},
+                      {"datums", st.docMirror.refDatums()}})) return;
+        uxNext(1091); return;
+    case 1091: {
+        nlohmann::json points = nlohmann::json::array();
+        for (int i = 1; i <= 3; ++i) {
+            const auto raw = st.docMirror.resolvePick(st.worker, 1, "vertex", i, error);
+            const auto point = nlohmann::json::parse(raw, nullptr, false);
+            if (point.is_object()) points.push_back(point);
+        }
+        const auto plane = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "plane"}, {"name", "UX three point plane"},
+                {"params", {{"method", "three_point"}}}, {"refs", {{"points", points}}}}}}
+        }));
+        s.feature = plane.id_map.is_object() ? plane.id_map.value("$0", std::string()) : "";
+        if (!uxCheck("three_point_plane_fixture", points.size() == 3 && plane.ok &&
+                     !s.feature.empty() && pm()->openForEdit(st, s.feature),
+                     {{"points", points}, {"status", plane.feature_status},
+                      {"error", plane.error_message}})) return;
+        uxNext(1092); return;
+    }
+    case 1092:
+        if (uxFieldClick("plane", "flip", "##chk")) uxNext(1093, 0);
+        return;
+    case 1093:
+        if (clickOk()) uxNext(1094, 0);
+        return;
+    case 1094:
+        if (!idle()) return;
+        if (!uxCheck("three_point_plane_reference_ready", !pm()->active() &&
+                     current().value("params", nlohmann::json::object()).value("method", "") == "three_point" &&
+                     current()["params"].value("flip", false),
+                     {{"feature", current()}, {"status", st.docMirror.featureStatus()},
+                      {"datums", st.docMirror.refDatums()}})) return;
+        if (!uxOpenExtrudeCancelFixture(st)) return;
+        uxNext(110); return;
+    case 110:
+        if (uxFieldClick("extrude", "draft_outward", "##chk")) uxNext(111);
+        return;
+    case 111:
+        if (!uxCheck("draft_angle_appears_for_blind",
+                     uxField("extrude", "draft", "##dim") != nullptr,
+                     {{"items", ui::audit::observedItems()}})) return;
+        {
+            const auto* draftDirection = uxField("extrude", "draft_outward", "##chk");
+            if (!uxCheck("extrude_draft_direction_authored", draftDirection &&
+                         draftDirection->value("checkable", false) && draftDirection->value("checked", false),
+                         {{"item", draftDirection ? *draftDirection : nlohmann::json()}})) return;
+        }
+        if (uxFieldClick("extrude", "end", "##combo")) uxNext(112);
+        return;
+    case 112:
+        if (!s.pointer.active && !uxCheck("unsupported_extrude_direction_one_options_absent",
+                     !shotItem("Up To Next", false, "##Combo") &&
+                     !shotItem("Up To Body", false, "##Combo") &&
+                     shotItem("Through All", false, "##Combo"),
+                     {{"items", ui::audit::observedItems()}})) return;
+        if (uxClick("Through All", "##Combo")) uxNext(113);
+        return;
+    case 113:
+        if (!uxCheck("nested_draft_hidden_with_controller",
+                     !uxField("extrude", "draft_outward", "##chk") &&
+                     !uxField("extrude", "draft", "##dim"),
+                     {{"items", ui::audit::observedItems()}})) return;
+        if (uxEnsureGroup("Direction 2")) uxNext(1131);
+        return;
+    case 1131:
+        if (uxFieldClick("extrude", "end2", "##combo")) uxNext(114);
+        return;
+    case 114:
+        if (!uxCheck("unsupported_extrude_direction_two_options_absent",
+                     shotItem("Blind", false, "##Combo") &&
+                     shotItem("Through All", false, "##Combo") &&
+                     !shotItem("Up To Next", false, "##Combo") &&
+                     !shotItem("Up To Plane/Surface", false, "##Combo") &&
+                     !shotItem("Up To Body", false, "##Combo"),
+                     {{"items", ui::audit::observedItems()}})) return;
+        shoot("extrude_options"); uxNext(1141, 0); return;
+    case 1141:
+        if (s.input.key(ImGuiKey_Escape)) uxNext(1142, 0);
+        return;
+    case 1142:
+        if (!uxCheck("extrude_popup_escape_keeps_form_and_hidden_draft",
+                     pm()->active() && pm()->activeFormType() == "extrude" &&
+                     !ImGui::IsPopupOpen(nullptr,
+                         ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel) &&
+                     !uxField("extrude", "draft_outward", "##chk") &&
+                     !uxField("extrude", "draft", "##dim"),
+                     {{"items", ui::audit::observedItems()},
+                      {"tree", st.docMirror.tree()}})) return;
+        uxNext(11421, 0); return;
+    case 11421:
+        if (uxFieldClick("extrude", "end", "##combo")) uxNext(11422);
+        return;
+    case 11422:
+        if (uxClick("Blind", "##Combo")) uxNext(11423);
+        return;
+    case 11423: {
+        const auto* check = uxField("extrude", "draft_outward", "##chk");
+        const nlohmann::json direction = check ? *check : nlohmann::json();
+        const auto* angle = uxField("extrude", "draft", "##dim");
+        if (!uxCheck("extrude_popup_escape_preserves_authored_draft",
+                     pm()->active() && direction.is_object() &&
+                     direction.value("checkable", false) && direction.value("checked", false) && angle,
+                     {{"draft_direction", direction}, {"draft_angle", angle ? *angle : nlohmann::json()}}))
+            return;
+        uxNext(115); return;
+    }
+    case 115:
+        if (clickCancel()) {
+            const auto action = s.report["actions"].back();
+            if (!uxCheck("extrude_cancel_pointer_completed_once",
+                         action.value("target", std::string()) == "##pm_cancel" &&
+                         action.value("press_events", 0) == 1 &&
+                         action.value("release_events", 0) == 1 && action.value("completed", false),
+                         {{"action", action}})) return;
+            uxNext(116, 0);
+        }
+        return;
+    case 116:
+        if (!idle() || pm()->active()) return;
+        if (!uxExtrudeCancelRestored(st, "extrude_cancel_restores_native_baseline") ||
+            !uxOpenExtrudeCancelFixture(st)) return;
+        uxNext(1162); return;
+    case 1162:
+        if (uxFieldClick("extrude", "end", "##combo")) uxNext(1163);
+        return;
+    case 1163:
+        if (s.input.key(ImGuiKey_Escape)) uxNext(1164, 0);
+        return;
+    case 1164:
+        if (!uxCheck("extrude_first_escape_only_dismisses_popup",
+                     pm()->active() && pm()->activeFormType() == "extrude" &&
+                     !ImGui::IsPopupOpen(nullptr,
+                         ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel),
+                     {{"items", ui::audit::observedItems()}})) return;
+        uxNext(1165); return;
+    case 1165:
+        if (s.input.key(ImGuiKey_Escape)) uxNext(1166, 0);
+        return;
+    case 1166:
+        if (!idle() || pm()->active()) return;
+        if (!uxExtrudeCancelRestored(st, "extrude_second_escape_cancels_to_native_baseline")) return;
+        uxNext(1161, 0); return;
+    case 1159:
+        st.shotWorkspacePin = -1;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.settings.units = Units::MMGS;
+        st.workspaceDir = std::filesystem::absolute(s.dir).string();
+        uxNext(1161); return;
+    case 1161: {
+        if (!uxNewBox(st, "UX hole blank")) return;
+        const auto result = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "hole"}, {"name", "UX custom hole"},
+                {"params", {{"style", "simple"}, {"standard", "custom"}, {"diameter", 8.0},
+                            {"end", "through_all"}}},
+                {"refs", {{"face", {{"of", "face"}, {"side", "top"}}}}}}}}
+        }));
+        s.feature = result.id_map.is_object() ? result.id_map.value("$0", std::string()) : "";
+        if (!uxCheck("custom_hole_fixture", result.ok && !s.feature.empty() &&
+                     pm()->openForEdit(st, s.feature),
+                     {{"status", result.feature_status}, {"error", result.error_message}})) return;
+        uxNext(117); return;
+    }
+    case 117:
+        if (uxFieldClick("hole", "standard", "##combo")) uxNext(118);
+        return;
+    case 118:
+        if (uxClick("M3", "##Combo")) uxNext(119, 0);
+        return;
+    case 119:
+        if (clickOk()) uxNext(120, 0);
+        return;
+    case 120: {
+        if (!idle()) return;
+        const auto f = current();
+        const auto mass = uxMass(st);
+        const auto params = f.value("params", nlohmann::json::object());
+        const double volume = mass.value("volume_mm3", 0.0);
+        const double expected = 24000.0 - 3.141592653589793 * 1.7 * 1.7 * 20.0;
+        if (!uxCheck("hole_standard_clears_custom_diameter_and_cuts",
+                     !pm()->active() && params.value("standard", "") == "M3" &&
+                     !params.contains("diameter") && uxSolid(mass) &&
+                     std::abs(volume - expected) < 2.0,
+                     {{"feature", f}, {"mass", mass}, {"expected_volume", expected},
+                      {"status", st.docMirror.featureStatus()}})) return;
+        shoot("hole_standard"); uxNext(121); return;
+    }
+    case 121: {
+        const bool created = st.docMirror.newPart(st.worker, error);
+        if (!uxCheck("thread_private_part", created, {{"error", error}}))
+            return;
+        st.clearViewportForNewDoc(); st.addDocTab(false);
+        const auto cylinder = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "cylinder"}, {"name", "UX threaded shaft"},
+                {"params", {{"radius", 6.0}, {"height", 10.0}, {"centered", true}}}}}}
+        }));
+        s.unthreadedMass = uxMass(st);
+        if (!uxCheck("thread_unthreaded_baseline", cylinder.ok && uxSolid(s.unthreadedMass),
+                     {{"mass", s.unthreadedMass}, {"status", cylinder.feature_status}})) return;
+        nlohmann::json face;
+        for (int i = 1; i <= 12; ++i) {
+            const auto raw = st.docMirror.resolvePick(st.worker, 1, "face", i, error);
+            const auto candidate = nlohmann::json::parse(raw, nullptr, false);
+            if (candidate.is_object() && candidate.value("surf", "") == "cylinder") {
+                face = candidate; break;
+            }
+        }
+        if (!uxCheck("thread_cylindrical_face", cylinder.ok && face.is_object(),
+                     {{"status", cylinder.feature_status}, {"selector", face}, {"error", error}})) return;
+        const auto thread = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "thread"}, {"name", "UX thread"},
+                {"params", {{"size", "M12"}, {"mode", "cut"}, {"style", "external"},
+                            {"turns", "3"}, {"preview", true}}},
+                {"refs", {{"target_face", face}}}}}}
+        }));
+        s.feature = thread.id_map.is_object() ? thread.id_map.value("$0", std::string()) : "";
+        const bool loaded = thread.ok && !thread.aicm_path.empty() &&
+                            st.loadDocMesh(thread.aicm_path, error);
+        s.previewMass = uxMass(st);
+        if (!uxCheck("thread_real_preview_fixture", loaded && uxSolid(s.previewMass) &&
+                     !s.feature.empty() && pm()->openForEdit(st, s.feature),
+                     {{"feature", current()}, {"mass", s.previewMass},
+                      {"status", thread.feature_status}, {"error", thread.error_message}})) return;
+        uxNext(122); return;
+    }
+    case 122:
+        if (uxFieldClick("thread", "custom_size", "##chk")) uxNext(123, 0);
+        return;
+    case 123: {
+        if (!idle()) return;
+        const auto f = current();
+        const auto params = f.value("params", nlohmann::json::object());
+        if (!uxCheck("thread_custom_clears_standard_during_real_preview",
+                     pm()->active() && !params.contains("size") && params.value("preview", false),
+                     {{"feature", f}, {"status", st.docMirror.featureStatus()},
+                      {"error", pm()->previewError()}})) return;
+        uxNext(1231); return;
+    }
+    case 1231:
+        if (uxEnsureGroup("Advanced")) uxNext(1233);
+        return;
+    case 1233:
+        if (uxClearText("thread", "turns")) uxNext(1232, 0);
+        return;
+    case 1232: {
+        if (!idle()) return;
+        const auto f = current();
+        const auto params = f.value("params", nlohmann::json::object());
+        if (!uxCheck("thread_cleared_optional_turns",
+                     pm()->active() && !params.contains("turns") && !params.contains("size") &&
+                     params.value("preview", false),
+                     {{"feature", f}, {"status", st.docMirror.featureStatus()},
+                      {"error", pm()->previewError()}})) return;
+        s.previewMass = uxMass(st);
+        s.sawAcceptPending = s.sawPreviewPending = s.sawPendingTogether = false;
+        uxNext(124, 0); return;
+    }
+    case 124:
+        if (clickOk()) uxNext(125, 0);
+        return;
+    case 125: {
+        if (!idle()) return;
+        const auto f = current();
+        const auto params = f.value("params", nlohmann::json::object());
+        const auto mass = uxMass(st);
+        const auto status = uxStatus(st.docMirror.featureStatus(), s.feature);
+        const double volume = mass.value("volume_mm3", 0.0);
+        const double previewVolume = s.previewMass.value("volume_mm3", 0.0);
+        const double unthreadedVolume = s.unthreadedMass.value("volume_mm3", 0.0);
+        const std::string warning = status.is_object() && status.contains("warning") &&
+                                    status["warning"].is_string()
+            ? status["warning"].get<std::string>() : std::string();
+        if (!uxCheck("thread_final_replaces_proxy_with_geometry",
+                     !pm()->active() && s.sawAcceptPending && s.sawPendingTogether &&
+                     !params.contains("preview") &&
+                     !params.contains("size") && uxSolid(mass) && status.is_object() &&
+                     status.value("ok", false) &&
+                     std::abs(volume - previewVolume) > 1e-4 && uxSolid(s.unthreadedMass) &&
+                     volume < unthreadedVolume - 1e-4 &&
+                     warning.find("left the body unthreaded") == std::string::npos &&
+                     warning.find("thread: degenerate size") == std::string::npos,
+                     {{"feature", f}, {"final_mass", mass}, {"preview_mass", s.previewMass},
+                      {"unthreaded_mass", s.unthreadedMass}, {"warning", warning},
+                      {"status", status}, {"pending_observed", s.sawAcceptPending},
+                      {"active_accept_and_rebuild_observed", s.sawPendingTogether}})) return;
+        if (s.regressionCase == "hole_thread") {
+            uxRegressionDone("hole_thread", 200); return;
+        }
+        shoot("thread_final"); uxNext(200); return;
+    }
+    case 199:
+        st.shotWorkspacePin = -1;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.settings.units = Units::MMGS;
+        st.workspaceDir = std::filesystem::absolute(s.dir).string();
+        if (!uxNewBox(st, "Command availability part")) return;
+        s.partTab = st.activeTab;
+        s.part = st.docMirror.docId();
+        uxNext(200); return;
+    case 200: {
+        st.shotWorkspacePin = -1;
+        st.activeWorkspace = AppState::Workspace::Model;
+        const bool created = st.docMirror.newPart(st.worker, error);
+        if (!uxCheck("empty_part_created", created, {{"error", error}}))
+            return;
+        st.clearViewportForNewDoc(); st.addDocTab(false);
+        s.secondary = st.docMirror.docId();
+        st.ribbonTab = AppState::RT_Sketch;
+        uxNext(201, 8); return;
+    }
+    case 201:
+        if (!uxContext(st, "empty_part", {{"sketch_new", true}, {"sk_line", false},
+                {"sketch_exit", false}, {"asm_insert", false}, {"sim_new_motion", false},
+                {"sm_flat_pattern", false}, {"sm_export_flat_dxf", false}})) return;
+        s.revision = st.docMirror.revision();
+        shoot("empty_sketch_disabled"); uxNext(202); return;
+    case 202:
+        if (uxClickItem("sk_line", "##RibbonBar", [&]() { return uxRibbonItem("sk_line"); })) uxNext(203);
+        return;
+    case 203: {
+        if (!uxCheck("ribbon_disabled_sketch_tool_refuses_click",
+                     !st.sketchMode->active() && st.docMirror.revision() == s.revision &&
+                     !st.propertyManager->active(),
+                     {{"revision", st.docMirror.revision()}, {"items", ui::audit::observedItems()}}))
+            return;
+        const auto center = ui::commandAvailability("sk_rect_center", ui::commandContext(st));
+        const auto shown = ui::ribbonCommandAvailability("sk_rect_center");
+        const auto* face = uxRibbonItem("sk_rect_corner");
+        const auto* drop = uxRibbonDropItem("sk_rect_corner");
+        if (!uxCheck("split_disabled_face_and_caret_rendered",
+                     center.visible && !center.enabled && center.reason &&
+                     shown.visible && !shown.enabled && face && drop &&
+                     face->value("visible", false) && drop->value("visible", false),
+                     {{"reason", center.reason ? center.reason : ""},
+                      {"face", face ? *face : nlohmann::json()},
+                      {"caret", drop ? *drop : nlohmann::json()}})) return;
+        // The guarded dispatcher emits this reason if a disabled face is sent to it.
+        // Enable real toast collection briefly so no-dispatch is observable too.
+        s.baseline = {{"tree", st.docMirror.tree()}, {"doc_id", st.docMirror.docId()},
+                      {"face_reason", center.reason}, {"suppress_toasts", st.suppressToasts},
+                      {"face_toasts_before", uxReasonToastCount(st, center.reason)}};
+        st.suppressToasts = false;
+        uxNext(2031, 0); return;
+    }
+    case 2031:
+        if (uxClickOwned("split_disabled_face_press_owned", "sk_rect_corner_face", "##RibbonBar",
+                         [&]() { return uxRibbonItem("sk_rect_corner"); })) uxNext(2032);
+        return;
+    case 2032: {
+        const int toasts = uxReasonToastCount(st, s.baseline["face_reason"].get<std::string>());
+        st.suppressToasts = s.baseline["suppress_toasts"].get<bool>();
+        if (!uxCheck("split_disabled_face_refuses_click",
+                     toasts == s.baseline["face_toasts_before"] &&
+                     st.docMirror.docId() == s.secondary && st.docMirror.revision() == s.revision &&
+                     st.docMirror.tree() == s.baseline["tree"] && !st.sketchMode->active() &&
+                     !st.sketchPlanePickActive && !pm()->active(),
+                     {{"revision", st.docMirror.revision()}, {"tree", st.docMirror.tree()},
+                      {"reason_toasts_before", s.baseline["face_toasts_before"]},
+                      {"reason_toasts_after", toasts}})) return;
+        if (!uxCheck("split_escape_pm_open",
+                     pm()->openForCommand(st, "extrude_boss") && pm()->active(),
+                     {{"revision", st.docMirror.revision()}})) return;
+        uxNext(2033, 8); return;
+    }
+    case 2033:
+        if (uxClickOwned("split_caret_press_owned", "sk_rect_corner_caret", "##RibbonBar",
+                         [&]() { return uxRibbonDropItem("sk_rect_corner"); })) uxNext(2034);
+        return;
+    case 2034: {
+        const auto* centerRow = uxRibbonPopupRow("sk_rect_center", "##fr");
+        const nlohmann::json center = centerRow ? *centerRow : nlohmann::json();
+        const auto* cornerRow = uxRibbonPopupRow("sk_rect_corner", "##fr");
+        const nlohmann::json corner = cornerRow ? *cornerRow : nlohmann::json();
+        const auto availability = ui::commandAvailability("sk_rect_corner", ui::commandContext(st));
+        if (!uxCheck("split_disabled_face_caret_opens_real_variants",
+                     center.is_object() && center.value("visible", false) &&
+                     corner.is_object() && corner.value("visible", false) &&
+                     availability.visible && !availability.enabled && availability.reason &&
+                     pm()->active() && pm()->activeFormType() == "extrude",
+                     {{"center", center}, {"corner", corner},
+                      {"reason", availability.reason ? availability.reason : ""}})) return;
+        s.baseline["hover_item"] = corner;
+        s.baseline["hover_reason"] = availability.reason;
+        s.baseline["hover_frames"] = 0;
+        uxNext(2035, 0); return;
+    }
+    case 2035:
+        if (uxHoverUnavailable("split_disabled_variant_hover_reason")) {
+            shoot("split_disabled_variant"); uxNext(2036, 0);
+        }
+        return;
+    case 2036:
+        if (uxClickOwned("split_disabled_variant_press_owned", "sk_rect_corner_variant", "##Popup_",
+                         [&]() { return uxRibbonPopupRow("sk_rect_corner", "##fr"); })) uxNext(2037);
+        return;
+    case 2037:
+        if (!uxCheck("split_disabled_variant_refuses_click",
+                     uxRibbonPopupRow("sk_rect_corner", "##fr") &&
+                     st.docMirror.docId() == s.secondary && st.docMirror.revision() == s.revision &&
+                     st.docMirror.tree() == s.baseline["tree"] && !st.sketchMode->active() &&
+                     !st.sketchPlanePickActive && pm()->active() && pm()->activeFormType() == "extrude",
+                     {{"revision", st.docMirror.revision()}, {"tree", st.docMirror.tree()}})) return;
+        uxNext(2038, 0); return;
+    case 2038:
+        if (s.input.key(ImGuiKey_Escape)) uxNext(2039);
+        return;
+    case 2039: {
+        if (!uxCheck("split_popup_escape_closes",
+                     !uxRibbonPopupRow("sk_rect_corner", "##fr") && pm()->active() &&
+                     pm()->activeFormType() == "extrude" &&
+                     st.docMirror.revision() == s.revision &&
+                     st.docMirror.tree() == s.baseline["tree"],
+                     {{"pm_active", pm()->active()}, {"revision", st.docMirror.revision()}}))
+            return;
+        shoot("split_escape_keeps_form"); uxNext(20391, 0); return;
+    }
+    case 20391:
+        if (s.input.key(ImGuiKey_Escape)) uxNext(20392, 4);
+        return;
+    case 20392: {
+        if (!idle()) return;
+        if (!uxCheck("split_second_escape_cancels_form",
+                     !pm()->active() && st.docMirror.revision() == s.revision &&
+                     st.docMirror.tree() == s.baseline["tree"],
+                     {{"pm_active", pm()->active()}, {"revision", st.docMirror.revision()}})) return;
+        int width = 0, height = 0;
+        glfwGetWindowSize(st.win, &width, &height);
+        if (!uxCheck("overflow_window_size_available", width > 0 && height > 0,
+                     {{"width", width}, {"height", height}})) return;
+        const int narrow = std::max(320, static_cast<int>(480.0f * ui::uiScale));
+        s.baseline["window_width"] = width;
+        s.baseline["window_height"] = height;
+        s.baseline["narrow_width"] = narrow;
+        glfwSetWindowSize(st.win, narrow, height);
+        uxNext(2040, 12); return;
+    }
+    case 2040: {
+        int width = 0, height = 0;
+        glfwGetWindowSize(st.win, &width, &height);
+        const auto* chevron = shotItem("##chev", true, "##RibbonBar");
+        if (!uxCheck("overflow_narrow_window_reflows_real_ribbon",
+                     width == s.baseline["narrow_width"] &&
+                     static_cast<int>(ImGui::GetIO().DisplaySize.x) == width &&
+                     !uxRibbonItem("sk_line") && chevron,
+                     {{"width", width}, {"height", height},
+                      {"display_width", ImGui::GetIO().DisplaySize.x},
+                      {"chevron", chevron ? *chevron : nlohmann::json()}})) return;
+        uxNext(2041, 0); return;
+    }
+    case 2041:
+        if (uxClickOwned("overflow_chevron_press_owned", "##chev", "##RibbonBar",
+                         [&]() { return shotItem("##chev", true, "##RibbonBar"); })) uxNext(2042);
+        return;
+    case 2042: {
+        const auto* row = uxRibbonPopupRow("sk_line", "##ovrow");
+        if (!row || !row->value("visible", false)) {
+            shotScrollTo("sk_line", "##Popup_", true, row); return;
+        }
+        const auto availability = ui::commandAvailability("sk_line", ui::commandContext(st));
+        const auto shown = ui::ribbonCommandAvailability("sk_line");
+        if (!uxCheck("overflow_disabled_row_rendered",
+                     availability.visible && !availability.enabled && availability.reason &&
+                     shown.visible && !shown.enabled,
+                     {{"row", *row}, {"reason", availability.reason ? availability.reason : ""}}))
+            return;
+        s.baseline["hover_item"] = *row;
+        s.baseline["hover_reason"] = availability.reason;
+        s.baseline["hover_frames"] = 0;
+        uxNext(2043, 0); return;
+    }
+    case 2043:
+        if (uxHoverUnavailable("overflow_disabled_row_hover_reason")) {
+            shoot("overflow_disabled_row"); uxNext(2044, 0);
+        }
+        return;
+    case 2044:
+        if (uxClickOwned("overflow_disabled_row_press_owned", "sk_line_overflow", "##Popup_",
+                         [&]() { return uxRibbonPopupRow("sk_line", "##ovrow"); })) uxNext(2045);
+        return;
+    case 2045:
+        if (!uxCheck("overflow_disabled_click_no_mutation",
+                     uxRibbonPopupRow("sk_line", "##ovrow") &&
+                     st.docMirror.docId() == s.secondary && st.docMirror.revision() == s.revision &&
+                     st.docMirror.tree() == s.baseline["tree"] && !st.sketchMode->active() &&
+                     !st.sketchPlanePickActive && !pm()->active(),
+                     {{"revision", st.docMirror.revision()}, {"tree", st.docMirror.tree()}})) return;
+        uxNext(2046, 0); return;
+    case 2046:
+        if (s.input.key(ImGuiKey_Escape)) uxNext(2047);
+        return;
+    case 2047:
+        if (!uxCheck("overflow_popup_escape_closes", !uxRibbonPopupRow("sk_line", "##ovrow"), {}))
+            return;
+        glfwSetWindowSize(st.win, s.baseline["window_width"].get<int>(),
+                          s.baseline["window_height"].get<int>());
+        uxNext(2048, 12); return;
+    case 2048: {
+        int width = 0, height = 0;
+        glfwGetWindowSize(st.win, &width, &height);
+        if (!uxCheck("overflow_restores_window",
+                     width == s.baseline["window_width"] && height == s.baseline["window_height"] &&
+                     static_cast<int>(ImGui::GetIO().DisplaySize.x) == width,
+                     {{"width", width}, {"height", height}})) return;
+        st.showCommandSearch = true;
+        uxNext(204, 5); return;
+    }
+    case 204:
+        if (!shotItem("##csq")) return;
+        ImGui::GetIO().AddInputCharactersUTF8("Exit Sketch");
+        uxNext(205); return;
+    case 205:
+        if (s.input.key(ImGuiKey_Enter)) uxNext(206);
+        return;
+    case 206: {
+        const auto availability = ui::commandAvailability("sketch_exit", ui::commandContext(st));
+        if (!uxCheck("search_enter_refuses_disabled_command",
+                     st.showCommandSearch && !st.sketchMode->active() &&
+                     st.docMirror.revision() == s.revision && !availability.enabled &&
+                     availability.reason && shotItem(availability.reason, true, "Search##CommandSearch"),
+                     {{"reason", availability.reason ? availability.reason : ""},
+                      {"items", ui::audit::observedItems()}, {"revision", st.docMirror.revision()}}))
+            return;
+        shoot("search_disabled"); uxNext(207); return;
+    }
+    case 207:
+        if (s.input.key(ImGuiKey_Escape)) uxNext(2071);
+        return;
+    case 2071: {
+        if (!uxCheck("search_closed", !st.showCommandSearch, {})) return;
+        st.selection.clear();
+        st.selectedFeatureId.clear();
+        ImVec2 lo, hi;
+        if (!uxCheck("model_viewport_for_shortcut", ui::viewportClearRect(lo, hi), {})) return;
+        s.input.point = ImVec2((lo.x + hi.x) * 0.5f, (lo.y + hi.y) * 0.5f);
+        ImGui::GetIO().AddMousePosEvent(s.input.point.x, s.input.point.y);
+        uxNext(2072); return;
+    }
+    case 2072:
+        if (s.input.key(ImGuiKey_S)) uxNext(20721);
+        return;
+    case 20721: {
+        if (!uxCheckShortcutRendered(st, "shortcut_model_bar_rendered", 0, "sketch_new"))
+            return;
+        shoot("shortcut_model_bar"); uxNext(2073, 0); return;
+    }
+    case 2073:
+        if (uxClickShortcut(0, "model")) uxNext(2074);
+        return;
+    case 2074:
+        if (!uxCheck("shortcut_model_opens_real_sketch_plane_picker",
+                     st.sketchPlanePickActive && !st.sketchMode->active() &&
+                     st.docMirror.revision() == s.revision,
+                     {{"plane_pick_active", st.sketchPlanePickActive},
+                      {"revision", st.docMirror.revision()}, {"items", ui::audit::observedItems()}}))
+            return;
+        shoot("shortcut_model_plane_picker"); uxNext(2075); return;
+    case 2075:
+        if (s.input.key(ImGuiKey_Escape)) uxNext(2076);
+        return;
+    case 2076:
+        if (!uxCheck("shortcut_model_plane_picker_cancelled", !st.sketchPlanePickActive &&
+                     !st.sketchMode->active() && st.docMirror.revision() == s.revision,
+                     {{"revision", st.docMirror.revision()}})) return;
+        uxNext(208); return;
+    case 208: {
+        const auto fid = st.sketchMode->createSketchOnPlane(st, "plane.top");
+        if (!uxCheck("enter_actual_2d_sketch", !fid.empty() && st.sketchMode->active(),
+                     {{"sketch", fid}, {"tree", st.docMirror.tree()}})) return;
+        uxNext(209, 8); return;
+    }
+    case 209:
+        if (!uxContext(st, "sketch2d", {{"sketch_new", false}, {"sk_line", true},
+                {"sk_fix", false}, {"sk_construction", false}, {"sk_convert_ent", true},
+                {"sk3d_line", false}})) return;
+        {
+            ImVec2 lo, hi;
+            if (!uxCheck("sketch_viewport_for_shortcut", ui::viewportClearRect(lo, hi), {})) return;
+            s.input.point = ImVec2((lo.x + hi.x) * 0.5f, (lo.y + hi.y) * 0.5f);
+            ImGui::GetIO().AddMousePosEvent(s.input.point.x, s.input.point.y);
+        }
+        uxNext(210); return;
+    case 210:
+        if (s.input.key(ImGuiKey_S)) uxNext(2101);
+        return;
+    case 2101: {
+        if (!uxCheckShortcutRendered(st, "shortcut_2d_bar_rendered", 0, "sk_line"))
+            return;
+        shoot("shortcut_2d_bar"); uxNext(211, 0); return;
+    }
+    case 211:
+        if (uxClickShortcut(0, "2d")) uxNext(212);
+        return;
+    case 212:
+        if (!uxCheck("shortcut_2d_activates_real_line_tool",
+                     st.sketchMode->active() &&
+                     std::string(st.sketchMode->activeToolCmd()) == "sk_line",
+                     {{"active_tool", st.sketchMode->activeToolCmd()},
+                      {"items", ui::audit::observedItems()}})) return;
+        shoot("shortcut_2d_line"); uxNext(2121); return;
+    case 2121:
+        if (uxClickOwned("finish_split_caret_press_owned", "sketch_exit_caret", "##RibbonBar",
+                         [&]() { return uxRibbonDropItem("sketch_exit"); })) uxNext(2122);
+        return;
+    case 2122: {
+        const auto* row = shotItem("##fr", true, "##Popup_");
+        if (!uxCheck("finish_split_popup_over_active_tool",
+                     row && st.sketchMode->active() &&
+                     std::string(st.sketchMode->activeToolCmd()) == "sk_line",
+                     {{"row", row ? *row : nlohmann::json()},
+                      {"active_tool", st.sketchMode->activeToolCmd()}})) return;
+        s.baseline["sketch_tree"] = st.docMirror.tree();
+        s.baseline["sketch_revision"] = st.docMirror.revision();
+        uxNext(2123, 0); return;
+    }
+    case 2123:
+        if (s.input.key(ImGuiKey_Escape)) uxNext(2124);
+        return;
+    case 2124:
+        if (!uxCheck("finish_split_escape_preserves_active_tool",
+                     !shotItem("##fr", true, "##Popup_") && st.sketchMode->active() &&
+                     std::string(st.sketchMode->activeToolCmd()) == "sk_line" &&
+                     st.docMirror.revision() == s.baseline["sketch_revision"] &&
+                     st.docMirror.tree() == s.baseline["sketch_tree"],
+                     {{"active_tool", st.sketchMode->activeToolCmd()},
+                      {"revision", st.docMirror.revision()}})) return;
+        st.sketchMode->exitSketch(st, true);
+        uxNext(213, 8); return;
+    case 213:
+        if (!uxCheck("enter_actual_3d_sketch", st.sketch3dMode &&
+                     st.sketch3dMode->enterNew(st), {{"tree", st.docMirror.tree()}})) return;
+        uxNext(214, 8); return;
+    case 214:
+        if (!uxContext(st, "sketch3d", {{"sk3d_line", true}, {"sketch3d_exit", true},
+                {"sk3d_fix", false}, {"sk3d_delete", false}, {"sk_line", false}})) return;
+        {
+            ImVec2 lo, hi;
+            if (!uxCheck("sketch3d_viewport_for_shortcut", ui::viewportClearRect(lo, hi), {})) return;
+            s.input.point = ImVec2((lo.x + hi.x) * 0.5f, (lo.y + hi.y) * 0.5f);
+            ImGui::GetIO().AddMousePosEvent(s.input.point.x, s.input.point.y);
+        }
+        uxNext(215); return;
+    case 215:
+        if (s.input.key(ImGuiKey_S)) uxNext(2151);
+        return;
+    case 2151: {
+        if (!uxCheckShortcutRendered(st, "shortcut_3d_bar_rendered", 4, "sketch3d_exit"))
+            return;
+        shoot("shortcut_3d_bar"); uxNext(216, 0); return;
+    }
+    case 216:
+        if (uxClickShortcut(4, "3d")) uxNext(217);
+        return;
+    case 217: {
+        if (!uxCheck("shortcut_3d_finishes_actual_sketch", !st.sketch3dMode->active(),
+                     {{"tree", st.docMirror.tree()}, {"items", ui::audit::observedItems()}})) return;
+        const bool created = st.docMirror.newAssembly(st.worker, error);
+        if (!uxCheck("assembly_fixture", created, {{"error", error}}))
+            return;
+        st.clearViewportForNewDoc(); st.addDocTab(true);
+        st.ribbonTab = AppState::RT_Features;
+        uxNext(218, 8); return;
+    }
+    case 218:
+        if (!uxContext(st, "assembly", {{"asm_insert", true}, {"asm_mate", true},
+                {"sim_new_motion", true}, {"sketch_new", false}})) return;
+        shoot("assembly_availability"); uxNext(2182); return;
+    case 2182: {
+        // A presented mirror starts with the legacy Part tab kind; hydration binds the
+        // real assembly snapshot while leaving that enum unchanged.
+        const auto snapshot = st.docMirror.snapshot();
+        auto& tab = st.docTabs[st.activeTab];
+        tab.kind = AppState::DocTab::TabKind::Part;
+        tab.aiHandoff = true;
+        tab.handoffDocId = tab.docId;
+        const bool restored = st.docMirror.restoreSnapshot(snapshot);
+        // Exercise the interval before syncActiveTabTitle has updated the cached
+        // boolean too: the matching mirror schema is the authoritative kind.
+        tab.isAssembly = false;
+        if (!uxCheck("presented_assembly_snapshot_hydrated",
+                     restored && snapshot.valid() && tab.docId == snapshot.docId &&
+                     tab.docId == st.docMirror.docId() && !tab.isAssembly &&
+                     st.docMirror.tree().is_object() &&
+                     st.docMirror.tree().value("schema", std::string()) == "aicad.asm/1" &&
+                     tab.kind == AppState::DocTab::TabKind::Part,
+                     {{"snapshot_doc_id", snapshot.docId}, {"snapshot_revision", snapshot.revision},
+                      {"tab_doc_id", tab.docId}, {"tab_kind", static_cast<int>(tab.kind)},
+                      {"tab_is_assembly", tab.isAssembly}, {"presented_mirror", tab.aiHandoff},
+                      {"mirror_doc_id", st.docMirror.docId()}, {"tree", st.docMirror.tree()}}))
+            return;
+        uxNext(2183, 8); return;
+    }
+    case 2183: {
+        if (!uxContext(st, "presented_assembly_before_title_sync", {{"asm_insert", true}, {"asm_mate", true},
+                {"sim_new_motion", true}, {"sketch_new", false}})) return;
+        st.syncActiveTabTitle();
+        uxNext(21831, 8); return;
+    }
+    case 21831: {
+        if (!uxContext(st, "presented_assembly_snapshot", {{"asm_insert", true}, {"asm_mate", true},
+                {"sim_new_motion", true}, {"sketch_new", false}})) return;
+        const auto* insert = uxRibbonItem("asm_insert");
+        if (!uxCheck("presented_assembly_insert_rendered", insert && insert->value("visible", false),
+                     {{"item", insert ? *insert : nlohmann::json()}})) return;
+        shoot("presented_assembly_availability"); uxNext(2184); return;
+    }
+    case 2184:
+        if (uxClickItem("asm_insert", "##RibbonBar", [&]() { return uxRibbonItem("asm_insert"); }))
+            uxNext(2185);
+        return;
+    case 2185:
+        if (!uxCheck("presented_assembly_insert_opens_real_form",
+                     pm()->guestActive() && shotItem("Browse from disk\xe2\x80\xa6", false,
+                                                     "FeatureManager"),
+                     {{"guest_active", pm()->guestActive()}, {"items", ui::audit::observedItems()}}))
+            return;
+        shoot("presented_assembly_insert"); uxNext(2186); return;
+    case 2186:
+        if (clickCancel()) uxNext(2187);
+        return;
+    case 2187:
+        if (!uxCheck("presented_assembly_insert_cancelled", !pm()->active(),
+                     {{"mirror_doc_id", st.docMirror.docId()}})) return;
+        uxNext(2181); return;
+    case 2181:
+        st.switchToTab(s.partTab); uxNext(219, 12); return;
+    case 219:
+        if (st.activeTab != s.partTab || st.rpc.busy()) return;
+        if (!uxContext(st, "part_with_background_assembly", {{"asm_insert", false},
+                {"sim_new_motion", false}, {"asm_parts_library", true}, {"sketch_new", true}})) return;
+        st.makeDrawing();
+        uxNext(220, 12); return;
+    case 220:
+        if (!st.activeTabIsDrawing()) return;
+        if (!uxContext(st, "drawing", {{"dwg_note", true}, {"dwg_scale_1_1", false},
+                {"asm_insert", false}})) return;
+        shoot("drawing_availability"); uxNext(2201); return;
+    case 2201:
+        st.switchToTab(s.partTab);
+        st.shotWorkspacePin = -1;
+        st.activeWorkspace = AppState::Workspace::Simulate;
+        uxNext(221, 12); return;
+    case 221:
+        if (st.activeTab != s.partTab || st.rpc.busy()) return;
+        if (!uxContext(st, "simulation_no_study", {{"ref_plane", false},
+                {"sim_modal_options", false}, {"sim_fatigue_setup", false},
+                {"sim_flow_bc", false}, {"sim_new_motion", false}})) return;
+        shoot("simulation_availability"); uxNext(2211); return;
+    case 2211:
+        if (st.rpc.busy()) return;
+        if (!uxCheck("modal_study_dispatch_available", st.simManager && st.ribbonDispatch, {})) return;
+        st.ribbonDispatch("sim_new_modal");
+        uxNext(22111, 0); return;
+    case 22111: {
+        if (st.rpc.busy()) return;
+        const int count = st.simManager ? st.simManager->studyCount() : 0;
+        if (!uxCheck("modal_study_fixture", count > 0, {{"count", count}, {"status", st.status}}))
+            return;
+        st.ribbonTab = 13;  // Static tab; New Study is the fixed picker/shortcut split.
+        uxNext(2212, 8); return;
+    }
+    case 2212: {
+        const auto context = ui::commandContext(st);
+        if (st.rpc.busy() || context.studyListPending || context.simCreationPending ||
+            !context.studyFactsCurrent) return;
+        const auto staticChoice = ui::commandAvailability("sim_new_static", context);
+        const auto motionChoice = ui::commandAvailability("sim_new_motion", context);
+        const auto staticShown = ui::ribbonCommandAvailability("sim_new_static");
+        const auto motionShown = ui::ribbonCommandAvailability("sim_new_motion");
+        const auto* face = uxRibbonItem("sim_new_picker");
+        const auto* caret = uxRibbonDropItem("sim_new_picker");
+        if (!uxCheck("study_split_part_variants_have_independent_policy",
+                     st.simManager && st.docMirror.docId() == s.part &&
+                     staticChoice.visible && staticChoice.enabled &&
+                     staticShown.visible && staticShown.enabled &&
+                     motionChoice.visible && !motionChoice.enabled && motionChoice.reason &&
+                     motionShown.visible && !motionShown.enabled &&
+                     face && face->value("visible", false) &&
+                     caret && caret->value("visible", false),
+                     {{"static_enabled", staticChoice.enabled}, {"motion_enabled", motionChoice.enabled},
+                      {"motion_reason", motionChoice.reason ? motionChoice.reason : ""},
+                      {"face", face ? *face : nlohmann::json()},
+                      {"caret", caret ? *caret : nlohmann::json()}})) return;
+        s.baseline = {{"doc_id", st.docMirror.docId()}, {"revision", st.docMirror.revision()},
+                      {"tree", st.docMirror.tree()}, {"study_count", st.simManager->studyCount()},
+                      {"study_id", st.simManager->activeStudyId()},
+                      {"study_definition", st.simManager->activeStudyDefinition()}};
+        uxNext(22122, 0); return;
+    }
+    case 22122:
+        if (uxClickOwned("study_split_caret_press_owned", "sim_new_picker_caret", "##RibbonBar",
+                         [&]() { return uxRibbonDropItem("sim_new_picker"); })) uxNext(22123);
+        return;
+    case 22123: {
+        const auto* staticRow = uxRibbonPopupRow("sim_new_static", "##fr");
+        const nlohmann::json staticItem = staticRow ? *staticRow : nlohmann::json();
+        const auto* motionRow = uxRibbonPopupRow("sim_new_motion", "##fr");
+        const nlohmann::json motionItem = motionRow ? *motionRow : nlohmann::json();
+        const auto motion = ui::commandAvailability("sim_new_motion", ui::commandContext(st));
+        if (!uxCheck("study_split_real_variant_rows",
+                     staticItem.is_object() && staticItem.value("visible", false) &&
+                     motionItem.is_object() && motionItem.value("visible", false) &&
+                     motion.visible && !motion.enabled && motion.reason,
+                     {{"static", staticItem}, {"motion", motionItem},
+                      {"reason", motion.reason ? motion.reason : ""}})) return;
+        s.baseline["hover_item"] = motionItem;
+        s.baseline["hover_reason"] = motion.reason;
+        s.baseline["hover_frames"] = 0;
+        uxNext(22124, 0); return;
+    }
+    case 22124:
+        if (uxHoverUnavailable("study_split_disabled_motion_hover_reason")) {
+            shoot("study_split_motion_disabled"); uxNext(22125, 0);
+        }
+        return;
+    case 22125:
+        if (uxClickOwned("study_split_motion_press_owned", "sim_new_motion_variant", "##Popup_",
+                         [&]() { return uxRibbonPopupRow("sim_new_motion", "##fr"); })) uxNext(22126);
+        return;
+    case 22126: {
+        const auto context = ui::commandContext(st);
+        if (st.rpc.busy() || context.studyListPending || context.simCreationPending ||
+            !context.studyFactsCurrent) return;
+        if (!uxCheck("study_split_disabled_motion_no_mutation",
+                     uxRibbonPopupRow("sim_new_motion", "##fr") && st.simManager &&
+                     st.docMirror.docId() == s.baseline["doc_id"] &&
+                     st.docMirror.revision() == s.baseline["revision"] &&
+                     st.docMirror.tree() == s.baseline["tree"] &&
+                     st.simManager->studyCount() == s.baseline["study_count"] &&
+                     st.simManager->activeStudyId() == s.baseline["study_id"] &&
+                     st.simManager->activeStudyDefinition() == s.baseline["study_definition"],
+                     {{"study_count", st.simManager ? st.simManager->studyCount() : -1},
+                      {"study_id", st.simManager ? st.simManager->activeStudyId() : ""},
+                      {"revision", st.docMirror.revision()}})) return;
+        uxNext(22127, 0); return;
+    }
+    case 22127:
+        if (uxClickOwned("study_split_static_press_owned", "sim_new_static_variant", "##Popup_",
+                         [&]() { return uxRibbonPopupRow("sim_new_static", "##fr"); })) uxNext(22121, 0);
+        return;
+    case 22121: {
+        if (st.rpc.busy()) return;
+        const int count = st.simManager ? st.simManager->studyCount() : 0;
+        const auto definition = st.simManager ? st.simManager->activeStudyDefinition() : nlohmann::json();
+        if (!uxCheck("static_study_fixture", count == s.baseline["study_count"].get<int>() + 1 &&
+                     definition.is_object() && definition.value("type", std::string()) == "static",
+                     {{"count", count}, {"study", definition}, {"status", st.status}}))
+            return;
+        uxNext(2213, 8); return;
+    }
+    case 2213:
+        if (!uxContext(st, "simulation_existing_modal", {{"sim_modal_options", true},
+                {"ref_plane", false}, {"sim_fatigue_setup", false}})) return;
+        shoot("simulation_existing_modal"); uxNext(2214); return;
+    case 2214:
+        st.activeWorkspace = AppState::Workspace::Manufacture;
+        st.ribbonTab = AppState::RT_Manufacture;
+        uxNext(222, 10); return;
+    case 222:
+        if (!uxContext(st, "cam_no_job", {{"cam_generate", false}, {"cam_simulate", false},
+                {"cam_post", false}, {"cam_op_face", false}})) return;
+        shoot("cam_availability"); uxNext(2221); return;
+    case 2221:
+        st.shotWorkspacePin = -1;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.ribbonTab = AppState::RT_SheetMetal;
+        uxNext(223, 8); return;
+    case 223:
+        if (!uxContext(st, "ordinary_part_sheetmetal", {{"sm_flat_pattern", false},
+                {"sm_export_flat_dxf", false}, {"sm_base_flange", true}})) return;
+        shoot("sheetmetal_availability"); uxNext(2231); return;
+    case 2231:
+        {
+            nlohmann::json result;
+            const auto dir = std::filesystem::path(s.dir) /
+                ("kicad-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+            const bool called = st.worker.call("ecad_new_project",
+                {{"dir", dir.string()}, {"name", "UX"}}, result, error, 20000);
+            if (!uxCheck("kicad_project_fixture", called && result.is_object() &&
+                         !result.contains("code") && result.contains("sch") &&
+                         result["sch"].is_object() && result.contains("pcb") && result["pcb"].is_object(),
+                         {{"result", result}, {"error", error}})) return;
+            s.background["ecad_project"] = result;
+            const auto& sch = result["sch"];
+            st.addEcadTab("sch", sch.value("doc_id", std::string()),
+                          sch.value("revision", 0), "UX.kicad_sch");
+            st.docTabs[st.activeTab].path = sch.value("path", std::string());
+            st.docTabs[st.activeTab].ecadProjectPath = result.value("project", std::string());
+            st.syncEcadProjectFiles(st.docTabs[st.activeTab].ecadProjectPath);
+            ui::ecadPrimeActiveApp(st);
+            ui::ecadEditorMirror().setDocId(st.ecadDocId);
+            ui::ecadEditorLoadResponse(sch);
+        }
+        st.activeWorkspace = AppState::Workspace::Electronics;
+        uxNext(224, 10); return;
+    case 224:
+        if (!uxContext(st, "schematic", {{"ecad_run_erc", st.ecadKicadStatusKnown &&
+                st.ecadKicadStatus.value("found", false)}, {"ecad_run_drc", false},
+                {"pcb_update_from_sch", false}})) return;
+        shoot("schematic_availability"); uxNext(2241); return;
+    case 2241:
+        {
+            const auto& result = s.background["ecad_project"];
+            const auto& pcb = result["pcb"];
+            st.addEcadTab("pcb", pcb.value("doc_id", std::string()),
+                          pcb.value("revision", 0), "UX.kicad_pcb");
+            st.docTabs[st.activeTab].path = pcb.value("path", std::string());
+            st.docTabs[st.activeTab].ecadProjectPath = result.value("project", std::string());
+            st.syncEcadProjectFiles(st.docTabs[st.activeTab].ecadProjectPath);
+            ui::ecadPrimeActiveApp(st);
+            ui::ecadEditorMirror().setDocId(st.ecadDocId);
+            ui::ecadEditorLoadResponse(pcb);
+        }
+        uxNext(225, 10); return;
+    case 225:
+        if (!uxContext(st, "pcb_with_schematic", {{"ecad_run_erc", false},
+                {"ecad_run_drc", st.ecadKicadStatusKnown && st.ecadKicadStatus.value("found", false)},
+                {"pcb_update_from_sch", true}})) return;
+        if (s.regressionCase == "commands") {
+            uxRegressionDone("commands", 3000); return;
+        }
+        shoot("pcb_final"); uxNext(3000, 0); return;
+    case 3000:
+        st.shotWorkspacePin = -1;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.settings.units = Units::MMGS;
+        st.workspaceDir = std::filesystem::absolute(s.dir).string();
+        if (!uxNewBox(st, "Numeric escape fixture")) return;
+        s.feature = s.box; s.baseline = current();
+        if (!uxCheck("numeric_escape_editor", pm()->openForEdit(st, s.feature), {})) return;
+        uxNext(3001); return;
+    case 3001:
+        if (uxTypeNumeric("box", "length", "12")) uxNext(3002, 0);
+        return;
+    case 3002:
+        if (s.input.key(ImGuiKey_Escape)) uxNext(3003, 4);
+        return;
+    case 3003:
+        if (!idle()) return;
+        if (!uxCheck("numeric_escape_cancels_temporary_edit",
+                     pm()->active() && std::abs(value("length") - 40.0) < 1e-6 &&
+                     current() == s.baseline,
+                     {{"before", s.baseline}, {"after", current()},
+                      {"preview_error", pm()->previewError()}})) return;
+        shoot("numeric_escape_form"); uxNext(3004); return;
+    case 3004:
+        if (clickOk()) uxNext(3005, 0);
+        return;
+    case 3005:
+        if (!idle()) return;
+        if (!uxCheck("numeric_escape_ok_keeps_original", !pm()->active() &&
+                     std::abs(value("length") - 40.0) < 1e-6 && uxSolid(uxMass(st)),
+                     {{"feature", current()}, {"status", st.docMirror.featureStatus()}})) return;
+        uxRegressionDone("numeric_escape", 3100); return;
+
+    case 3100:
+        st.shotWorkspacePin = -1;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.settings.units = Units::MMGS;
+        st.workspaceDir = std::filesystem::absolute(s.dir).string();
+        if (!uxNewBox(st, "Unit blur fixture")) return;
+        s.feature = s.box;
+        if (!uxCheck("unit_blur_editor", pm()->openForEdit(st, s.feature), {})) return;
+        uxNext(3101); return;
+    case 3101:
+        if (uxTypeDim("box", "length", "2", true)) {
+            // Toggle the real document setting while the MMGS text input owns its buffer.
+            st.toggleUnits();
+            uxNext(3102, 3);
+        }
+        return;
+    case 3102:
+        if (uxFieldClick("box", "width", "=##dim_txt")) uxNext(3103, 0);
+        return;
+    case 3103:
+        if (!idle()) return;
+        if (!uxCheck("unit_blur_commits_original_mm", pm()->active() && st.ips() &&
+                     std::abs(value("length") - 2.0) < 1e-6,
+                     {{"feature", current()}, {"preview_error", pm()->previewError()}})) return;
+        uxNext(3104); return;
+    case 3104:
+        if (uxFieldClick("box", "length", "=##dim_txt")) uxNext(3105);
+        return;
+    case 3105:
+        if (uxFieldClick("box", "length", "##dim")) uxNext(3106, 0);
+        return;
+    case 3106: {
+        const auto* item = uxField("box", "length", "##dim");
+        const ImGuiID id = item ? item->value("id", ImGuiID(0)) : 0;
+        const auto* state = id ? ImGui::GetInputTextState(id) : nullptr;
+        const std::string text = state && state->TextA.Data ? state->TextA.Data : "";
+        double mm = 0.0;
+        std::string parseError;
+        const bool parsed = ui::pmParseDim(text, mm, parseError, false, 25.4);
+        if (!uxCheck("unit_blur_reentered_text_matches_geometry",
+                     item && id == ImGui::GetCurrentContext()->ActiveId && parsed &&
+                     std::abs(mm - 2.0) < 0.002,
+                     {{"text", text}, {"parsed_mm", mm}, {"error", parseError},
+                      {"item", item ? *item : nlohmann::json()}, {"feature", current()}})) return;
+        shoot("unit_blur_reentered"); uxNext(3107); return;
+    }
+    case 3107:
+        if (s.input.key(ImGuiKey_End)) uxNext(3108, 0);
+        return;
+    case 3108:
+        ImGui::GetIO().AddInputCharactersUTF8(" ");
+        s.report["actions"].push_back({{"action", "append space to reentered dimension"}});
+        uxNext(3109, 0); return;
+    case 3109:
+        if (clickOk()) uxNext(3110, 0);
+        return;
+    case 3110:
+        if (!idle()) return;
+        if (!uxCheck("unit_blur_reedit_does_not_reinterpret", !pm()->active() &&
+                     std::abs(value("length") - 2.0) < 0.002 && uxSolid(uxMass(st)),
+                     {{"feature", current()}, {"status", st.docMirror.featureStatus()}})) return;
+        uxRegressionDone("units_blur", 3200); return;
+
+    case 3200: {
+        st.shotWorkspacePin = -1;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.settings.units = Units::MMGS;
+        st.workspaceDir = std::filesystem::absolute(s.dir).string();
+        const bool created = st.docMirror.newPart(st.worker, error);
+        if (!uxCheck("atomic_cancel_empty_part", created, {{"error", error}})) return;
+        st.clearViewportForNewDoc(); st.addDocTab(false);
+        s.part = st.docMirror.docId();
+        if (!uxCheck("atomic_cancel_new_box_editor", pm()->openForCommand(st, "box"), {})) return;
+        uxNext(3201); return;
+    }
+    case 3201:
+        if (uxTypeDim("box", "length", "=ux_missing_variable", true)) uxNext(3202, 0);
+        return;
+    case 3202:
+        if (clickOk()) uxNext(3203, 0);
+        return;
+    case 3203:
+        if (st.rpc.busy() || st.rebuildsInFlight || pm()->acceptPending() ||
+            (pm()->previewPending() && pm()->previewError().empty())) return;
+        if (!uxCheck("atomic_cancel_first_preview_rejected",
+                     pm()->active() && !pm()->previewError().empty() &&
+                     st.docMirror.docId() == s.part,
+                     {{"error", pm()->previewError()}, {"tree", st.docMirror.tree()},
+                      {"status", st.docMirror.featureStatus()}})) return;
+        shoot("atomic_cancel_rejected"); uxNext(3204); return;
+    case 3204:
+        if (uxTypeDim("box", "length", "12mm", false)) uxNext(3205, 0);
+        return;
+    case 3205:
+        if (s.input.key(ImGuiKey_Enter)) uxNext(3206, 0);
+        return;
+    case 3206:
+        if (!idle()) return;
+        s.feature = pm()->targetId();
+        if (!uxCheck("atomic_cancel_corrected_preview",
+                     pm()->active() && pm()->previewError().empty() && !s.feature.empty() &&
+                     std::abs(value("length") - 12.0) < 1e-6 && uxSolid(uxMass(st)),
+                     {{"feature", current()}, {"error", pm()->previewError()},
+                      {"status", st.docMirror.featureStatus()}})) return;
+        uxNext(3207); return;
+    case 3207:
+        if (clickCancel()) uxNext(3208, 0);
+        return;
+    case 3208: {
+        if (!idle()) return;
+        const auto& tree = st.docMirror.tree();
+        const bool noFeatures = tree.is_object() && (!tree.contains("features") ||
+            (tree["features"].is_array() && tree["features"].empty()));
+        if (!uxCheck("atomic_cancel_restores_empty_new_part",
+                     !pm()->active() && st.docMirror.docId() == s.part && noFeatures,
+                     {{"tree", tree}, {"status", st.docMirror.featureStatus()}})) return;
+        uxNext(3210, 0); return;
+    }
+    case 3210:
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.settings.units = Units::MMGS;
+        if (!uxNewBox(st, "Pending result edit")) return;
+        s.part = st.docMirror.docId();
+        s.feature = s.box;
+        if (!uxCheck("pending_result_editor_open", pm()->openForEdit(st, s.feature),
+                     {{"feature", current()}})) return;
+        uxNext(3211); return;
+    case 3211:
+        if (!idle()) return;
+        if (!uxEnsurePmStatus("pending_result_initial_status", "Preview up to date")) return;
+        s.background = {{"base_revision", st.docMirror.revision()}, {"barrier", nullptr}};
+        uxNext(3212, 0); return;
+    case 3212:
+        if (uxTypeDim("box", "length", "48mm", true)) {
+            // This real read is deliberately queued ahead of the actual edit. The debounce
+            // holds the worker FIFO without inventing a response or touching PM state.
+            st.rpc.callCoalesced("doc_tree", {{"doc_id", s.part}},
+                [&s](const core::RpcResult& result) {
+                    s.background["barrier"] = {{"ok", result.ok}, {"result", result.result},
+                                                {"error", result.err}};
+                }, "uxquality-pending-result-barrier", 15000, 12000);
+            uxNext(3213, 0);
+        }
+        return;
+    case 3213:
+        if (clickOk()) uxNext(3214, 0);
+        return;
+    case 3214:
+        if (!uxCheck("pending_result_real_apply_queued",
+                     pm()->active() && pm()->acceptPending() && st.rebuildsInFlight > 0 &&
+                     st.rpc.interactionBusy() && s.background["barrier"].is_null() &&
+                     st.docMirror.revision() == s.background["base_revision"],
+                     {{"accept_pending", pm()->acceptPending()}, {"rebuilds_queued", st.rebuildsInFlight},
+                      {"interaction_busy", st.rpc.interactionBusy()}, {"fixture", s.background}})) return;
+        if (!uxEnsurePmStatus("pending_result_applying_rendered",
+                              "Applying final result\xe2\x80\xa6")) return;
+        uxNext(3215, 0); return;
+    case 3215:
+        if (!uxCheck("pending_result_barrier_still_held",
+                     s.background["barrier"].is_null() && st.rebuildsInFlight > 0,
+                     {{"fixture", s.background}, {"rebuilds_queued", st.rebuildsInFlight}})) return;
+        uxNext(3216, 0); return;
+    case 3216:
+        if (uxTypeDim("box", "length", "not-a-dimension", true)) uxNext(3217, 0);
+        return;
+    case 3217:
+        if (s.input.key(ImGuiKey_Enter)) uxNext(32171, 0);
+        return;
+    case 32171:
+        if (uxFieldClick("box", "length", "##dim")) uxNext(3218, 0);
+        return;
+    case 3218:
+        if (!uxCheck("pending_result_new_invalid_edit_precedes_callback",
+                     pm()->active() && pm()->acceptPending() && uxInlineError() &&
+                     s.background["barrier"].is_null() && st.rebuildsInFlight > 0 &&
+                     st.docMirror.revision() == s.background["base_revision"],
+                     {{"fixture", s.background}, {"items", ui::audit::observedItems()},
+                      {"rebuilds_queued", st.rebuildsInFlight}})) return;
+        if (!uxTypedDimension("box", "length", "not-a-dimension", false)) return;
+        uxNext(3219, 0); return;
+    case 3219: {
+        if (st.rpc.busy() || st.rebuildsInFlight) return;
+        const auto* field = uxField("box", "length", "##dim");
+        const ImGuiID id = field ? field->value("id", ImGuiID(0)) : 0;
+        const auto* input = id ? ImGui::GetInputTextState(id) : nullptr;
+        const std::string buffer = input && input->TextA.Data ? input->TextA.Data : "";
+        const auto mass = uxMass(st);
+        if (!uxCheck("pending_result_preserves_new_invalid_edit",
+                     s.background["barrier"].is_object() &&
+                     s.background["barrier"].value("ok", false) &&
+                     st.docMirror.revision() == s.background["base_revision"].get<int>() + 1 &&
+                     std::abs(value("length") - 48.0) < 1e-6 && uxSolid(mass) &&
+                     std::abs(mass.value("volume_mm3", 0.0) - 28800.0) < 0.01 &&
+                     pm()->active() && pm()->acceptPending() && pm()->previewError().empty() &&
+                     uxInlineError() && id && ImGui::GetCurrentContext()->ActiveId == id &&
+                     buffer == "not-a-dimension",
+                     {{"fixture", s.background}, {"feature", current()}, {"mass", mass},
+                      {"input", buffer}, {"active_id", ImGui::GetCurrentContext()->ActiveId},
+                      {"field", field ? *field : nlohmann::json()},
+                      {"items", ui::audit::observedItems()}})) return;
+        uxNext(3223, 0); return;
+    }
+    case 3223:
+        if (!uxEnsurePmStatus("pending_result_editing_rendered",
+                              "Editing\xe2\x80\xa6 (live preview)")) return;
+        uxNext(3220, 0); return;
+    case 3220:
+        if (uxTypeDim("box", "length", "52mm", false)) uxNext(3221, 0);
+        return;
+    case 3221:
+        if (clickOk()) uxNext(3222, 0);
+        return;
+    case 3222: {
+        if (!idle()) return;
+        const auto mass = uxMass(st);
+        if (!uxCheck("pending_result_corrected_edit_committed",
+                     !pm()->active() && std::abs(value("length") - 52.0) < 1e-6 &&
+                     uxSolid(mass) && std::abs(mass.value("volume_mm3", 0.0) - 31200.0) < 0.01,
+                     {{"feature", current()}, {"mass", mass}})) return;
+        uxRegressionDone("cancel_atomic", 3300); return;
+    }
+    case 3300:
+        if (!uxExtrudeFixture(st, false)) return;
+        s.baseline = current(); uxNext(3301); return;
+    case 3301:
+        if (uxTypeDim("extrude", "depth", "12mm", true)) uxNext(3302, 0);
+        return;
+    case 3302:
+        if (clickOk()) uxNext(3303, 0);
+        return;
+    case 3303: {
+        if (!idle()) return;
+        const auto f = current();
+        const auto p = f.value("params", nlohmann::json::object());
+        if (!uxCheck("inward_draft_survives_depth_edit",
+                     !pm()->active() && p.contains("depth") &&
+                     std::abs(uxNumber(p["depth"]) - 12.0) < 1e-6 &&
+                     p.contains("draft") && std::abs(uxNumber(p["draft"]) - 5.0) < 1e-6 &&
+                     p.contains("draft_outward") && !p.value("draft_outward", true) &&
+                     uxSolid(uxMass(st)),
+                     {{"before", s.baseline}, {"after", f}, {"status", st.docMirror.featureStatus()}}))
+            return;
+        uxRegressionDone("inward_draft", 3400); return;
+    }
+
+    case 3400: {
+        st.shotWorkspacePin = -1;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.settings.units = Units::MMGS;
+        st.workspaceDir = std::filesystem::absolute(s.dir).string();
+        if (!uxNewBox(st, "Legacy variable fixture")) return;
+        const auto equation = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "eq_set"}, {"name", "UXEndRadius"}, {"expr", "3"}}
+        }));
+        const auto blend = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "fillet"}, {"name", "Legacy variable"},
+                {"params", {{"radius", 2.0}, {"radius2", {{"value", 2.0}, {"expr", "UXEndRadius"}}}}},
+                {"refs", {{"edges", {{"of", "edge"}, {"parallel", "z"}}}}}}}}
+        }));
+        s.feature = blend.id_map.is_object() ? blend.id_map.value("$0", std::string()) : "";
+        const bool loaded = blend.ok && !blend.aicm_path.empty() &&
+                            st.loadDocMesh(blend.aicm_path, error);
+        const auto fixtureStatus = uxStatus(blend.feature_status, s.feature);
+        const auto requested = fixtureStatus.is_object()
+            ? fixtureStatus.value("data", nlohmann::json::object())
+                  .value("fillet", nlohmann::json::object()).value("requested", nlohmann::json::object())
+            : nlohmann::json::object();
+        const auto fixtureParams = current().value("params", nlohmann::json::object());
+        if (!uxCheck("legacy_variable_fixture", equation.ok && loaded && !s.feature.empty() &&
+                     !fixtureParams.contains("type") && fixtureParams.contains("radius2") &&
+                     uxNumber(fixtureParams["radius2"]) == 2.0 &&
+                     std::abs(uxNumber(requested.value("radius2", nlohmann::json())) - 3.0) < 1e-6 &&
+                     pm()->openForEdit(st, s.feature),
+                     {{"status", blend.feature_status}, {"tree", blend.tree},
+                      {"error", blend.error_message}, {"mesh_error", error}})) return;
+        uxNext(3401); return;
+    }
+    case 3401: {
+        const auto* endpoint = uxField("fillet", "radius2", "##dim");
+        if (!uxCheck("legacy_variable_endpoint_rendered",
+                     endpoint && endpoint->value("visible", false),
+                     {{"feature", current()}, {"item", endpoint ? *endpoint : nlohmann::json()}}))
+            return;
+        shoot("legacy_variable_endpoint"); uxNext(3402); return;
+    }
+    case 3402:
+        if (uxTypeDim("fillet", "radius", "2.5mm", true)) uxNext(3403, 0);
+        return;
+    case 3403:
+        if (clickOk()) uxNext(3404, 0);
+        return;
+    case 3404: {
+        if (!idle()) return;
+        const auto f = current();
+        const auto p = f.value("params", nlohmann::json::object());
+        const auto endpoint = p.value("radius2", nlohmann::json());
+        const auto status = uxStatus(st.docMirror.featureStatus(), s.feature);
+        if (!uxCheck("legacy_variable_expression_endpoint_preserved",
+                     !pm()->active() && !p.contains("type") &&
+                     std::abs(uxNumber(p.value("radius", nlohmann::json())) - 2.5) < 1e-6 &&
+                     endpoint.is_object() && endpoint.value("expr", std::string()) == "UXEndRadius" &&
+                     status.is_object() && status.value("ok", false) &&
+                     std::abs(uxNumber(status.value("data", nlohmann::json::object())
+                         .value("fillet", nlohmann::json::object())
+                         .value("requested", nlohmann::json::object())
+                         .value("radius2", nlohmann::json())) - 3.0) < 1e-6 && uxSolid(uxMass(st)),
+                     {{"feature", f}, {"status", status}})) return;
+        uxRegressionDone("legacy_variable", 3410); return;
+    }
+
+    case 3410: {
+        st.shotWorkspacePin = -1;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.settings.units = Units::MMGS;
+        st.workspaceDir = std::filesystem::absolute(s.dir).string();
+        if (!uxNewBox(st, "Legacy equal expression fixture")) return;
+        const auto equation = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "eq_set"}, {"name", "UXEqualRadius"}, {"expr", "2"}}
+        }));
+        const auto blend = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "fillet"}, {"name", "Legacy equal"},
+                {"params", {{"radius", 2.0}, {"radius2", {{"value", 7.0}, {"expr", "UXEqualRadius"}}}}},
+                {"refs", {{"edges", {{"of", "edge"}, {"parallel", "z"}}}}}}}}
+        }));
+        s.feature = blend.id_map.is_object() ? blend.id_map.value("$0", std::string()) : "";
+        const auto status = uxStatus(blend.feature_status, s.feature);
+        const auto requested = status.is_object()
+            ? status.value("data", nlohmann::json::object())
+                  .value("fillet", nlohmann::json::object()).value("requested", nlohmann::json::object())
+            : nlohmann::json::object();
+        const auto p = current().value("params", nlohmann::json::object());
+        const bool loaded = blend.ok && !blend.aicm_path.empty() &&
+                            st.loadDocMesh(blend.aicm_path, error);
+        if (!uxCheck("legacy_equal_expression_fixture", equation.ok && loaded &&
+                     !s.feature.empty() && !p.contains("type") && p.contains("radius2") &&
+                     uxNumber(p["radius2"]) == 7.0 && requested.contains("radius2") &&
+                     requested["radius2"].is_null() && pm()->openForEdit(st, s.feature),
+                     {{"feature", current()}, {"status", status}, {"error", blend.error_message}}))
+            return;
+        uxNext(3411); return;
+    }
+    case 3411:
+        if (uxTypeDim("fillet", "radius", "2.5mm", true)) uxNext(3412, 0);
+        return;
+    case 3412:
+        if (clickOk()) uxNext(3413, 0);
+        return;
+    case 3413: {
+        if (!idle()) return;
+        const auto f = current();
+        const auto p = f.value("params", nlohmann::json::object());
+        const auto endpoint = p.value("radius2", nlohmann::json());
+        const auto status = uxStatus(st.docMirror.featureStatus(), s.feature);
+        const auto requested = status.is_object()
+            ? status.value("data", nlohmann::json::object())
+                  .value("fillet", nlohmann::json::object()).value("requested", nlohmann::json::object())
+            : nlohmann::json::object();
+        if (!uxCheck("legacy_equal_expression_keeps_binding",
+                     !pm()->active() && !p.contains("type") && endpoint.is_object() &&
+                     endpoint.value("expr", std::string()) == "UXEqualRadius" &&
+                     std::abs(uxNumber(p.value("radius", nlohmann::json())) - 2.5) < 1e-6 &&
+                     status.is_object() && status.value("ok", false) &&
+                     std::abs(uxNumber(requested.value("radius2", nlohmann::json())) - 2.0) < 1e-6 &&
+                     uxSolid(uxMass(st)),
+                     {{"feature", f}, {"status", status}})) return;
+        uxRegressionDone("legacy_equal_expression", 3500); return;
+    }
+
+    case 3500: {
+        st.shotWorkspacePin = -1;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.settings.units = Units::MMGS;
+        st.workspaceDir = std::filesystem::absolute(s.dir).string();
+        if (!uxNewBox(st, "Expression reopen fixture")) return;
+        const auto equation = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "eq_set"}, {"name", "UXRadius"}, {"expr", "100"}}
+        }));
+        const auto blend = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "fillet"}, {"name", "Expression fillet"},
+                {"params", {{"type", "constant"}, {"radius", {{"value", 100.0}, {"expr", "UXRadius"}}}}},
+                {"refs", {{"edges", {{"of", "edge"}, {"parallel", "z"}}}}}}}}
+        }));
+        s.feature = blend.id_map.is_object() ? blend.id_map.value("$0", std::string()) : "";
+        const auto status = uxStatus(blend.feature_status, s.feature);
+        const auto data = status.is_object() && status.contains("data") && status["data"].is_object()
+            ? status["data"].value("fillet", nlohmann::json()) : nlohmann::json();
+        const double effective = data.is_object() && data.contains("effective") &&
+                                 data["effective"].is_object()
+            ? data["effective"].value("radius", -1.0) : -1.0;
+        if (!uxCheck("reopen_expression_corrected_fixture", equation.ok && blend.ok &&
+                     !s.feature.empty() && effective > 0.0 && effective < 100.0 &&
+                     data.value("covered_edges", 0) == 4,
+                     {{"status", status}, {"tree", blend.tree}, {"error", blend.error_message}}))
+            return;
+        s.baseline = {{"effective", effective}};
+        const std::string path = (std::filesystem::absolute(s.dir) / "reopen_expression.step+").string();
+        s.baseline["path"] = path;
+        const bool saved = st.docMirror.save(st.worker, path, error);
+        const bool opened = saved && st.docMirror.open(st.worker, path, error);
+        if (!uxCheck("reopen_expression_saved", opened && uxFeature(st, s.feature),
+                     {{"path", path}, {"error", error}, {"tree", st.docMirror.tree()}})) return;
+        st.addDocTab(false);
+        if (!st.docMirror.lastOpenedAicm().empty() &&
+            !uxCheck("reopen_expression_mesh", st.loadDocMesh(st.docMirror.lastOpenedAicm(), error),
+                     {{"error", error}})) return;
+        s.baseline["reopened_revision"] = st.docMirror.revision();
+        if (!uxCheck("reopen_expression_editor", pm()->openForEdit(st, s.feature),
+                     {{"feature", current()}})) return;
+        uxNext(3501); return;
+    }
+    case 3501: {
+        const auto f = current();
+        const auto p = f.value("params", nlohmann::json::object());
+        const auto radius = p.value("radius", nlohmann::json());
+        const auto* item = uxField("fillet", "radius", "##dim");
+        if (!uxCheck("reopened_expression_stays_bound",
+                     radius.is_object() && radius.value("expr", std::string()) == "UXRadius" &&
+                     uxNumber(radius) == 100.0 && item && item->value("visible", false),
+                     {{"feature", f}, {"item", item ? *item : nlohmann::json()}})) return;
+        shoot("reopened_expression"); uxNext(3502); return;
+    }
+    case 35011:
+        if (uxFieldClick("fillet", "type", "##combo")) uxNext(35012);
+        return;
+    case 35012:
+        if (uxClick("Constant Size", "##Combo")) uxNext(35013, 0);
+        return;
+    case 35013: {
+        if (!idle()) return;
+        const auto f = current();
+        const auto radius = f.value("params", nlohmann::json::object()).value("radius", nlohmann::json());
+        if (!uxCheck("reopened_expression_survives_unrelated_form_edit",
+                     pm()->active() && st.docMirror.revision() > s.baseline.value("reopened_revision", -1) &&
+                     radius.is_object() && radius.value("expr", std::string()) == "UXRadius" &&
+                     uxNumber(radius) == 100.0,
+                     {{"feature", f}, {"revision", st.docMirror.revision()},
+                      {"status", st.docMirror.featureStatus()}})) return;
+        uxNext(35014); return;
+    }
+    case 3502: {
+        // Mouse release has been rendered, but no later preview has been admitted.
+        // Inspect the editor on that very next tick, before finishing the gesture.
+        if (s.input.phase == 3) {
+            std::string displayed;
+            for (const auto& item : pm()->calloutItems(st))
+                if (item.label == "Radius") displayed = item.value;
+            const double effective = s.baseline.value("effective", -1.0);
+            const double shown = std::strtod(displayed.c_str(), nullptr);
+            const auto authored = current().value("params", nlohmann::json::object())
+                                         .value("radius", nlohmann::json());
+            if (!uxCheck("reopened_expression_unbind_keeps_effective_radius",
+                         pm()->active() && st.docMirror.revision() ==
+                             s.baseline.value("reopened_revision", -1) &&
+                         authored.is_object() && authored.value("expr", std::string()) == "UXRadius" &&
+                         !displayed.empty() && displayed[0] != '=' &&
+                         std::abs(shown - effective) < 0.02,
+                         {{"displayed", displayed}, {"effective", effective}, {"feature", current()},
+                          {"revision", st.docMirror.revision()}, {"status", st.docMirror.featureStatus()}}))
+                return;
+            s.baseline["unbound_before_preview"] = true;
+            shoot("reopened_expression_unbound");
+        }
+        if (uxFieldClick("fillet", "radius", "=##dim_txt")) {
+            if (!uxCheck("reopened_unbind_observed_before_preview",
+                         s.baseline.value("unbound_before_preview", false), {})) return;
+            uxNext(3504, 0);
+        }
+        return;
+    }
+    case 3504:
+        if (clickOk()) uxNext(3505, 0);
+        return;
+    case 3505:
+        if (!idle()) return;
+        if (!uxCheck("unbound_expression_commits_effective_radius",
+                     !pm()->active() && std::abs(value("radius") - s.baseline.value("effective", -1.0)) < 0.02 &&
+                     uxSolid(uxMass(st)), {{"feature", current()}, {"status", st.docMirror.featureStatus()}}))
+            return;
+        if (!uxCheck("reopen_expression_again",
+                     st.docMirror.open(st.worker, s.baseline.value("path", std::string()), error),
+                     {{"error", error}})) return;
+        st.addDocTab(false);
+        if (!st.docMirror.lastOpenedAicm().empty() &&
+            !uxCheck("reopen_expression_again_mesh", st.loadDocMesh(st.docMirror.lastOpenedAicm(), error),
+                     {{"error", error}})) return;
+        s.baseline["reopened_revision"] = st.docMirror.revision();
+        if (!uxCheck("reopen_expression_again_editor", pm()->openForEdit(st, s.feature),
+                     {{"feature", current()}})) return;
+        uxNext(35011); return;
+    case 35014:
+        if (clickCancel()) uxNext(35015, 0);
+        return;
+    case 35015:
+        if (!idle()) return;
+        uxRegressionDone("fillet_reopen", 3600); return;
+
+    case 3600: {
+        st.shotWorkspacePin = -1;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.settings.units = Units::MMGS;
+        st.workspaceDir = std::filesystem::absolute(s.dir).string();
+        if (!uxCheck("thread_autosize_new_part", st.docMirror.newPart(st.worker, error),
+                     {{"error", error}})) return;
+        st.clearViewportForNewDoc(); st.addDocTab(false);
+        const auto shaft = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "cylinder"}, {"name", "M12 shaft"},
+                {"params", {{"radius", 6.0}, {"height", 10.0}, {"centered", true}}}}}}
+        }));
+        nlohmann::json face;
+        for (int i = 1; i <= 12; ++i) {
+            const auto candidate = nlohmann::json::parse(
+                st.docMirror.resolvePick(st.worker, 1, "face", i, error), nullptr, false);
+            if (candidate.is_object() && candidate.value("surf", "") == "cylinder" &&
+                candidate.contains("radius") && candidate["radius"].is_number() &&
+                std::abs(candidate["radius"].get<double>() - 6.0) < 1e-6) {
+                face = candidate; break;
+            }
+        }
+        if (!uxCheck("thread_autosize_real_cylindrical_face", shaft.ok && face.is_object(),
+                     {{"selector", face}, {"status", shaft.feature_status}, {"error", error}}))
+            return;
+        s.baseline = face;
+        const auto thread = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "thread"}, {"name", "M14 legacy size"},
+                {"params", {{"size", "M14"}, {"mode", "cosmetic"}, {"style", "external"}}},
+                {"refs", {{"target_face", face}}}}}}
+        }));
+        s.feature = thread.id_map.is_object() ? thread.id_map.value("$0", std::string()) : "";
+        const bool loaded = thread.ok && !thread.aicm_path.empty() &&
+                            st.loadDocMesh(thread.aicm_path, error);
+        if (!uxCheck("thread_autosize_unsupported_fixture", loaded && !s.feature.empty() &&
+                     pm()->openForEdit(st, s.feature),
+                     {{"feature", current()}, {"status", thread.feature_status},
+                      {"error", thread.error_message}, {"mesh_error", error}})) return;
+        uxNext(3601); return;
+    }
+    case 3601: {
+        const auto* combo = uxField("thread", "size", "##combo");
+        if (!uxCheck("thread_autosize_unsupported_control",
+                     combo && combo->value("visible", false) &&
+                     current().value("params", nlohmann::json::object()).value("size", "") == "M14",
+                     {{"feature", current()}, {"item", combo ? *combo : nlohmann::json()}})) return;
+        shoot("thread_autosize_unsupported"); uxNext(3602); return;
+    }
+    case 3602:
+        if (uxClick("##well", "FeatureManager")) uxNext(3603, 0);
+        return;
+    case 3603: {
+        // Re-pick the actual M12 shaft face: the first delivery removes the existing
+        // identical reference, the second uses the ordinary viewport selection route.
+        const bool removed = pm()->routePick(s.baseline, static_cast<int>(render::PickKind::Face), 1, 0);
+        const bool picked = pm()->routePick(s.baseline, static_cast<int>(render::PickKind::Face), 1, 0);
+        if (!uxCheck("thread_autosize_real_face_pick", removed && picked,
+                     {{"selector", s.baseline}, {"removed", removed}, {"picked", picked}})) return;
+        uxNext(3604, 0); return;
+    }
+    case 3604:
+        if (clickOk()) uxNext(3605, 4);
+        return;
+    case 3605: {
+        if (st.rpc.busy() || st.rebuildsInFlight || pm()->acceptPending() ||
+            (pm()->previewPending() && pm()->previewError().empty())) return;
+        const auto f = current();
+        const auto p = f.value("params", nlohmann::json::object());
+        if (!uxCheck("thread_autosize_clears_unsupported_size",
+                     !pm()->active() && p.value("size", std::string()) == "M12",
+                     {{"feature", f}, {"error", pm()->previewError()},
+                      {"status", st.docMirror.featureStatus()}, {"selector", s.baseline}})) return;
+        uxRegressionDone("thread_autosize", 3700); return;
+    }
+
+    case 3700:
+        if (!uxExtrudeFixture(st, true)) return;
+        uxNext(3701); return;
+    case 3701:
+        if (uxFieldClick("surf_extrude", "end", "##combo")) uxNext(3702);
+        return;
+    case 3702:
+        if (uxClick("Through All", "##Combo")) uxNext(3703);
+        return;
+    case 3703:
+        if (clickOk()) uxNext(3704, 0);
+        return;
+    case 3704: {
+        if (st.rpc.busy() || st.rebuildsInFlight || pm()->acceptPending() ||
+            (pm()->previewPending() && pm()->previewError().empty())) return;
+        const auto f = current();
+        const auto p = f.value("params", nlohmann::json::object());
+        const auto status = uxStatus(st.docMirror.featureStatus(), s.feature);
+        if (!uxCheck("surface_through_all_commits",
+                     !pm()->active() && p.value("end", std::string()) == "through_all" &&
+                     status.is_object() && status.value("ok", false) && st.hasDocMesh,
+                     {{"feature", f}, {"status", status}, {"preview_error", pm()->previewError()}}))
+            return;
+        uxRegressionDone("surface_through_all", 3800); return;
+    }
+    case 3800: {
+        st.shotWorkspacePin = -1;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.workspaceDir = std::filesystem::absolute(s.dir).string();
+        const std::string basePath = (std::filesystem::absolute(s.dir) / "motion_base.step+").string();
+        const std::string armPath = (std::filesystem::absolute(s.dir) / "motion_arm.step+").string();
+        auto savePart = [&](const char* name, const std::string& path, double length,
+                            double width, double height) {
+            if (!uxNewBox(st, name)) return false;
+            const auto edited = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                {{"op", "edit_feature"}, {"id", s.box},
+                 {"params", {{"length", length}, {"width", width}, {"height", height}}}}
+            }));
+            const bool saved = edited.ok && st.docMirror.save(st.worker, path, error);
+            return uxCheck("presented_motion_part_saved", saved,
+                           {{"path", path}, {"status", edited.feature_status},
+                            {"error", edited.error_message}, {"save_error", error}});
+        };
+        if (!savePart("Motion ground", basePath, 60.0, 40.0, 10.0) ||
+            !savePart("Motion arm", armPath, 10.0, 10.0, 50.0)) return;
+        if (!uxCheck("presented_motion_new_assembly", st.docMirror.newAssembly(st.worker, error),
+                     {{"error", error}})) return;
+        st.clearViewportForNewDoc(); st.addDocTab(true);
+        const auto inserted = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "asm_insert_component"}, {"source", {{"path", basePath}}},
+             {"name", "Ground"}, {"fixed", true}},
+            {{"op", "asm_insert_component"}, {"source", {{"path", armPath}}},
+             {"name", "Arm"}, {"fixed", false},
+             {"transform", {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 60, 0, 0, 0, 1}}}
+        }));
+        const std::string ground = inserted.id_map.is_object()
+            ? inserted.id_map.value("$0", std::string()) : "";
+        const std::string arm = inserted.id_map.is_object()
+            ? inserted.id_map.value("$1", std::string()) : "";
+        if (!uxCheck("presented_motion_components", inserted.ok && !ground.empty() && !arm.empty(),
+                     {{"tree", inserted.tree}, {"status", inserted.feature_status},
+                      {"error", inserted.error_message}})) return;
+        const auto mate = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "asm_add_mate"}, {"mate", {{"type", "distance"}, {"value", {{"value", 60.0}, {"expr", nullptr}}},
+                {"align", "aligned"}, {"suppressed", false},
+                {"refs", nlohmann::json::array({
+                    {{"component", ground}, {"selector", {{"kind", "face"}, {"centroid", {0, 0, 5}}}}},
+                    {{"component", arm}, {"selector", {{"kind", "face"}, {"centroid", {0, 0, 25}}}}}
+                })}}}}
+        }));
+        const bool mesh = mate.ok && !mate.aicm_path.empty() && st.loadDocMesh(mate.aicm_path, error);
+        if (!uxCheck("presented_motion_drivable_mate", mesh && mate.id_map.is_object() &&
+                     !mate.id_map.value("$0", std::string()).empty(),
+                     {{"tree", mate.tree}, {"status", mate.feature_status},
+                      {"error", mate.error_message}, {"mesh_error", error}})) return;
+        st.ribbonTab = AppState::RT_Features;
+        const auto snapshot = st.docMirror.snapshot();
+        auto& tab = st.docTabs[st.activeTab];
+        tab.kind = AppState::DocTab::TabKind::Part;
+        tab.aiHandoff = true;
+        tab.handoffDocId = tab.docId;
+        const bool restored = st.docMirror.restoreSnapshot(snapshot);
+        tab.isAssembly = false;
+        if (!uxCheck("presented_motion_hydrated_snapshot",
+                     restored && snapshot.valid() && tab.docId == snapshot.docId &&
+                     tab.docId == st.docMirror.docId() &&
+                     st.docMirror.tree().value("schema", std::string()) == "aicad.asm/1",
+                     {{"tab_doc_id", tab.docId}, {"snapshot_doc_id", snapshot.docId},
+                      {"tree", st.docMirror.tree()}})) return;
+        uxNext(3801, 8); return;
+    }
+    case 3801: {
+        if (st.rpc.busy()) return;
+        const auto& tab = st.docTabs[st.activeTab];
+        if (!uxCheck("presented_motion_legacy_identity", st.simManager && st.ribbonDispatch &&
+                     tab.kind == AppState::DocTab::TabKind::Part &&
+                     tab.docId == st.docMirror.docId() &&
+                     st.docMirror.tree().value("schema", std::string()) == "aicad.asm/1",
+                     {{"tab_kind", static_cast<int>(tab.kind)}, {"tab_doc_id", tab.docId},
+                      {"mirror_doc_id", st.docMirror.docId()}})) return;
+        if (!uxContext(st, "presented_motion_consumer", {{"sim_motion_study", true}})) return;
+        st.ribbonDispatch("sim_motion_study");
+        uxNext(3802, 8); return;
+    }
+    case 3802: {
+        if (st.rpc.busy()) return;
+        nlohmann::json actual;
+        const bool listed = st.worker.call("sim_study_list", {{"doc_id", st.docMirror.docId()}},
+                                           actual, error, 15000);
+        const auto definition = st.simManager ? st.simManager->activeStudyDefinition() : nlohmann::json();
+        const std::string selected = st.simManager ? st.simManager->activeStudyId() : "";
+        bool found = false;
+        if (actual.is_object() && actual.contains("studies") && actual["studies"].is_array())
+            for (const auto& study : actual["studies"])
+                found = found || (study.is_object() && study.value("id", "") == selected &&
+                                  study.value("type", "") == "motion");
+        if (!uxCheck("presented_motion_opens_real_study",
+                     listed && !selected.empty() && found && definition.is_object() &&
+                     definition.value("id", "") == selected && definition.value("type", "") == "motion",
+                     {{"selected", selected}, {"definition", definition}, {"native", actual},
+                      {"error", error}, {"tab_kind", static_cast<int>(st.docTabs[st.activeTab].kind)}}))
+            return;
+        st.simManager->configureActiveMotion(st, 60.0f, 100.0f, 8);
+        uxNext(3803, 0); return;
+    }
+    case 3803:
+        if (st.rpc.busy()) return;
+        if (!uxCheck("presented_motion_run_dispatch", st.simManager && st.ribbonDispatch &&
+                     st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Part,
+                     {{"status", st.status}, {"tree", st.docMirror.tree()}})) return;
+        st.ribbonDispatch("sim_run");
+        uxNext(3804, 8); return;
+    case 3804:
+        if (st.rpc.busy() || (st.simManager && st.simManager->runUi().running)) return;
+        if (!uxCheck("presented_motion_real_trajectory",
+                     st.simManager && st.simManager->motionHasResult() &&
+                     st.simManager->motionFrameCount() > 1 &&
+                     st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Part,
+                     {{"status", st.status}, {"frames", st.simManager ? st.simManager->motionFrameCount() : 0},
+                      {"study", st.simManager ? st.simManager->activeStudyDefinition() : nlohmann::json()}}))
+            return;
+        uxRegressionDone("presented_motion", 3900); return;
+    case 3900: {
+        st.shotWorkspacePin = -1;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.workspaceDir = std::filesystem::absolute(s.dir).string();
+        st.suppressToasts = false;
+        if (!uxCheck("sketch2d_cancel_new_part", st.docMirror.newPart(st.worker, error),
+                     {{"error", error}})) return;
+        st.clearViewportForNewDoc(); st.addDocTab(false);
+        const auto built = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "sketch"}, {"name", "Profile"},
+                {"refs", {{"plane", "plane.top"}}},
+                {"params", {{"entities", nlohmann::json::array({
+                    {{"id", "e1"}, {"type", "circle"}, {"center", {0, 0}}, {"radius", 4.0},
+                     {"construction", false}},
+                    {{"id", "e2"}, {"type", "point"}, {"p", {8, 8}}, {"construction", false}}
+                })}, {"constraints", nlohmann::json::array()}}}}}},
+            {{"op", "add_feature"}, {"feature", {{"type", "extrude"}, {"name", "Downstream solid"},
+                {"params", {{"mode", "boss"}, {"end", "blind"}, {"depth", 5.0}}},
+                {"refs", {{"profile", nlohmann::json::array({{{"kind", "region"}, {"sketch", "$0"}}})}}}}}}
+        }));
+        s.secondary = built.id_map.is_object() ? built.id_map.value("$0", std::string()) : "";
+        s.feature = built.id_map.is_object() ? built.id_map.value("$1", std::string()) : "";
+        const bool loaded = built.ok && !built.aicm_path.empty() && st.loadDocMesh(built.aicm_path, error);
+        s.baseline = {{"tree", st.docMirror.tree()}, {"mass", uxMass(st)}};
+        if (!uxCheck("sketch2d_cancel_fixture", loaded && !s.secondary.empty() && !s.feature.empty() &&
+                     uxSolid(s.baseline["mass"]) && st.sketchMode->enterForFeature(st, s.secondary),
+                     {{"tree", built.tree}, {"status", built.feature_status},
+                      {"error", built.error_message}, {"mesh_error", error}})) return;
+        uxNext(3901, 4); return;
+    }
+    case 3901: {
+        st.sketchMode->selectEntities({"e2"});
+        const bool handled = st.sketchMode->onRibbonCommand(st, "sk_construction");
+        s.baseline["accepted_tree"] = st.docMirror.tree();
+        s.baseline["accepted_revision"] = st.docMirror.revision();
+        const auto* sketch = uxFeature(st, s.secondary);
+        bool constructionPoint = false;
+        if (sketch && sketch->contains("params") && (*sketch)["params"].contains("entities"))
+            for (const auto& entity : (*sketch)["params"]["entities"])
+                if (entity.is_object() && entity.value("id", "") == "e2")
+                    constructionPoint = entity.value("construction", false);
+        if (!uxCheck("sketch2d_accepted_edit", handled && constructionPoint,
+                     {{"tree", st.docMirror.tree()}, {"revision", st.docMirror.revision()}})) return;
+        const auto refused = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "sketch_toggle_construction"}, {"sketch", s.secondary}, {"id", "e1"}}
+        }));
+        if (!uxCheck("sketch2d_native_atomic_refusal", !refused.ok && refused.rejected &&
+                     refused.unchanged && st.docMirror.revision() == s.baseline["accepted_revision"] &&
+                     st.docMirror.tree() == s.baseline["accepted_tree"],
+                     {{"error", refused.error_message}, {"status", refused.feature_status},
+                      {"revision", st.docMirror.revision()}})) return;
+        uxNext(3902, 0); return;
+    }
+    case 3902: {
+        st.sketchMode->selectEntities({"e1"});
+        const bool handled = st.sketchMode->onRibbonCommand(st, "sk_construction");
+        nlohmann::json toasts = nlohmann::json::array();
+        {
+            std::lock_guard<std::mutex> lock(st.toastsMtx);
+            for (const auto& toast : st.toasts)
+                if (toast.msg.find("Construction:") != std::string::npos)
+                    toasts.push_back(toast.msg);
+        }
+        if (!uxCheck("sketch2d_editor_refusal_keeps_live_state",
+                     handled && st.sketchMode->active() && !toasts.empty() &&
+                     st.docMirror.revision() == s.baseline["accepted_revision"] &&
+                     st.docMirror.tree() == s.baseline["accepted_tree"],
+                     {{"toasts", toasts}, {"tree", st.docMirror.tree()},
+                      {"revision", st.docMirror.revision()}})) return;
+        shoot("sketch2d_refusal"); uxNext(3903); return;
+    }
+    case 3903:
+        if (!uxCheck("sketch2d_cancel_command", st.sketchMode->onRibbonCommand(st, "sketch_cancel"), {}))
+            return;
+        uxNext(3904, 4); return;
+    case 3904: {
+        const auto& tree = st.docMirror.tree();
+        const auto mass = uxMass(st);
+        if (!uxCheck("sketch2d_cancel_restores_checkpoint",
+                     !st.sketchMode->active() && tree.is_object() && tree.contains("features") &&
+                     s.baseline["tree"].contains("features") &&
+                     tree["features"] == s.baseline["tree"]["features"] && uxSolid(mass) &&
+                     std::abs(mass.value("volume_mm3", 0.0) -
+                              s.baseline["mass"].value("volume_mm3", 0.0)) < 1e-6,
+                     {{"before", s.baseline["tree"]}, {"after", tree},
+                      {"before_mass", s.baseline["mass"]}, {"after_mass", mass}})) return;
+        uxRegressionDone("sketch2d_cancel", 4000); return;
+    }
+    case 4000: {
+        st.shotWorkspacePin = -1;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.workspaceDir = std::filesystem::absolute(s.dir).string();
+        st.suppressToasts = false;
+        if (!uxCheck("equation_rejection_new_part", st.docMirror.newPart(st.worker, error),
+                     {{"error", error}})) return;
+        st.clearViewportForNewDoc(); st.addDocTab(false);
+        const auto built = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "eq_set"}, {"name", "UXBoxLength"}, {"expr", "10"}},
+            {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Equation box"},
+                {"params", {{"length", {{"value", 10.0}, {"expr", "UXBoxLength"}}},
+                            {"width", 20.0}, {"height", 20.0}, {"centered", true}}}}}}
+        }));
+        s.feature = built.id_map.is_object() ? built.id_map.value("$1", std::string()) : "";
+        const bool loaded = built.ok && !built.aicm_path.empty() && st.loadDocMesh(built.aicm_path, error);
+        s.baseline = {{"tree", st.docMirror.tree()}, {"revision", st.docMirror.revision()},
+                      {"mass", uxMass(st)}};
+        if (!uxCheck("equation_rejection_fixture", loaded && !s.feature.empty() &&
+                     uxSolid(s.baseline["mass"]),
+                     {{"tree", built.tree}, {"status", built.feature_status},
+                      {"error", built.error_message}, {"mesh_error", error}})) return;
+        const auto rejected = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "eq_set"}, {"name", "UXBoxLength"}, {"expr", "0"}}
+        }));
+        if (!uxCheck("equation_native_atomic_refusal", !rejected.ok && rejected.rejected &&
+                     rejected.unchanged && !rejected.error_message.empty() &&
+                     st.docMirror.tree() == s.baseline["tree"] &&
+                     st.docMirror.revision() == s.baseline["revision"],
+                     {{"error", rejected.error_message}, {"status", rejected.feature_status},
+                      {"revision", st.docMirror.revision()}})) return;
+        s.baseline["rejection"] = rejected.error_message;
+        st.showEquations = true;
+        uxNext(4001); return;
+    }
+    case 4001:
+        if (uxClick("##expr", "Equations")) uxNext(4002, 0);
+        return;
+    case 4002:
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, true);
+        ImGui::GetIO().AddKeyEvent(ImGuiKey_A, true);
+        uxNext(4003, 0); return;
+    case 4003:
+        ImGui::GetIO().AddKeyEvent(ImGuiKey_A, false);
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false);
+        uxNext(4004, 0); return;
+    case 4004:
+        ImGui::GetIO().AddInputCharactersUTF8("0");
+        uxNext(4005, 0); return;
+    case 4005: {
+        const auto* item = shotItem("##expr", true, "Equations");
+        const ImGuiID id = item ? item->value("id", ImGuiID(0)) : 0;
+        const auto* input = id ? ImGui::GetInputTextState(id) : nullptr;
+        const std::string text = input && input->TextA.Data ? input->TextA.Data : "";
+        if (!uxCheck("equation_rejection_live_input",
+                     id && id == ImGui::GetCurrentContext()->ActiveId && text == "0",
+                     {{"text", text}, {"item", item ? *item : nlohmann::json()}})) return;
+        uxNext(4006, 0); return;
+    }
+    case 4006:
+        if (s.input.key(ImGuiKey_Enter)) uxNext(4007, 3);
+        return;
+    case 4007: {
+        if (st.rpc.busy() || st.rebuildsInFlight) return;
+        nlohmann::json feedback = nlohmann::json::array();
+        {
+            std::lock_guard<std::mutex> lock(st.toastsMtx);
+            for (const auto& toast : st.toasts)
+                if (toast.msg.find("Edit equation:") != std::string::npos)
+                    feedback.push_back(toast.msg);
+        }
+        const auto mass = uxMass(st);
+        bool hasNativeReason = false;
+        const std::string reason = s.baseline.value("rejection", std::string());
+        for (const auto& message : feedback)
+            hasNativeReason = hasNativeReason || message.get<std::string>().find(reason) != std::string::npos;
+        if (!uxCheck("equation_rejection_visible_without_mutation",
+                     !reason.empty() && hasNativeReason && st.docMirror.tree() == s.baseline["tree"] &&
+                     st.docMirror.revision() == s.baseline["revision"] && uxSolid(mass),
+                     {{"feedback", feedback}, {"native_reason", reason}, {"tree", st.docMirror.tree()},
+                      {"revision", st.docMirror.revision()}, {"mass", mass}})) return;
+        shoot("equation_rejection_feedback"); uxNext(4008); return;
+    }
+    case 4008:
+        st.showEquations = false;
+        uxRegressionDone("equation_rejection", 4100); return;
+    case 4100:
+        st.shotWorkspacePin = -1;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.workspaceDir = std::filesystem::absolute(s.dir).string();
+        if (!uxNewBox(st, "Study identity fixture")) return;
+        st.activeWorkspace = AppState::Workspace::Simulate;
+        st.leftPaneTab = AppState::LP_Simulation;
+        s.part = st.docMirror.docId();
+        uxNext(4101, 8); return;
+    case 4101: {
+        if (st.rpc.busy() || !st.simManager) return;
+        nlohmann::json replies = nlohmann::json::array();
+        for (const auto& entry : std::array<std::pair<const char*, const char*>, 3>{{
+                 {"static", "Identity A"}, {"modal", "Identity B"}, {"static", "Identity C"}}}) {
+            nlohmann::json result;
+            const bool added = st.worker.call("sim_study_add",
+                {{"doc_id", s.part}, {"study", {{"type", entry.first}, {"name", entry.second}}}},
+                result, error, 15000);
+            if (!uxCheck("study_identity_native_add", added && result.is_object() &&
+                         !result.contains("code") && !result.value("study_id", std::string()).empty(),
+                         {{"response", result}, {"error", error}})) return;
+            replies.push_back(result);
+        }
+        s.baseline = {{"a", replies[0]["study_id"]}, {"b", replies[1]["study_id"]},
+                      {"c", replies[2]["study_id"]}, {"adds", replies}};
+        st.simManager->markStudiesStale();
+        st.simManager->refresh(st);
+        uxNext(4102, 0); return;
+    }
+    case 4102: {
+        if (st.rpc.busy()) return;
+        auto* sm = st.simManager;
+        const std::string a = s.baseline.value("a", std::string());
+        const std::string b = s.baseline.value("b", std::string());
+        const std::string c = s.baseline.value("c", std::string());
+        if (!uxCheck("study_identity_initial_list", sm && sm->studyCount() == 3 &&
+                     sm->selectStudyById(st, c) && sm->activeStudyId() == c,
+                     {{"count", sm ? sm->studyCount() : -1}, {"a", a}, {"b", b}, {"c", c}}))
+            return;
+        nlohmann::json deleted;
+        const bool removed = st.worker.call("sim_study_delete", {{"doc_id", s.part}, {"study_id", a}},
+                                            deleted, error, 15000);
+        if (!uxCheck("study_identity_native_delete", removed && deleted.is_object() &&
+                     !deleted.contains("code") && deleted.contains("studies") &&
+                     deleted["studies"].is_array() && deleted["studies"].size() == 2,
+                     {{"response", deleted}, {"error", error}})) return;
+        s.baseline["delete"] = deleted;
+        // A real non-interaction metadata request holds the FIFO, making the
+        // study-list callback outstanding while the real selected row changes.
+        st.rpc.callCoalesced("sim_caps", nlohmann::json::object(),
+            [&s](const core::RpcResult& result) {
+                s.baseline["barrier"] = {{"ok", result.ok}, {"result", result.result}, {"error", result.err}};
+            }, "uxquality-study-identity-barrier", 15000, 1500);
+        sm->refresh(st);
+        const bool pending = st.rpc.busy() && st.rpc.interactionBusy();
+        const bool selected = sm->selectStudyById(st, b);
+        if (!uxCheck("study_identity_selection_changes_while_list_outstanding",
+                     pending && selected && sm->activeStudyId() == b,
+                     {{"pending", pending}, {"selected", sm->activeStudyId()},
+                      {"from", c}, {"to", b}, {"native_delete", deleted}})) return;
+        uxNext(4103, 0); return;
+    }
+    case 4103: {
+        if (st.rpc.busy()) return;
+        nlohmann::json actual;
+        const bool listed = st.worker.call("sim_study_list", {{"doc_id", s.part}}, actual, error, 15000);
+        auto* sm = st.simManager;
+        const auto definition = sm ? sm->activeStudyDefinition() : nlohmann::json();
+        const auto barrier = s.baseline.value("barrier", nlohmann::json::object());
+        const std::string b = s.baseline.value("b", std::string());
+        const std::string c = s.baseline.value("c", std::string());
+        const bool correctOrder = actual.is_object() && actual.contains("studies") &&
+            actual["studies"].is_array() && actual["studies"].size() == 2 &&
+            actual["studies"][0].value("id", "") == b && actual["studies"][1].value("id", "") == c;
+        if (!uxCheck("study_identity_preserved_after_refresh",
+                     listed && barrier.value("ok", false) && correctOrder && sm && sm->studyCount() == 2 &&
+                     sm->activeStudyId() == b && definition.is_object() &&
+                     definition.value("id", "") == b,
+                     {{"native", actual}, {"barrier", barrier}, {"definition", definition},
+                      {"selected", sm ? sm->activeStudyId() : ""}, {"error", error}})) return;
+        sm->configureActive(st, 0.73f, "");
+        uxNext(4104, 0); return;
+    }
+    case 4104: {
+        if (st.rpc.busy()) return;
+        nlohmann::json actual;
+        const bool listed = st.worker.call("sim_study_list", {{"doc_id", s.part}}, actual, error, 15000);
+        const std::string b = s.baseline.value("b", std::string());
+        const std::string c = s.baseline.value("c", std::string());
+        nlohmann::json selected, other;
+        if (actual.is_object() && actual.contains("studies") && actual["studies"].is_array())
+            for (const auto& study : actual["studies"]) {
+                if (study.is_object() && study.value("id", "") == b) selected = study;
+                if (study.is_object() && study.value("id", "") == c) other = study;
+            }
+        if (!uxCheck("study_identity_edit_targets_selected_study",
+                     listed && selected.is_object() && other.is_object() &&
+                     selected.contains("mesh_fineness") && selected["mesh_fineness"].is_number() &&
+                     std::abs(selected["mesh_fineness"].get<double>() - 0.73) < 1e-5 &&
+                     other == s.baseline["delete"]["studies"][1] &&
+                     st.simManager && st.simManager->activeStudyId() == b,
+                     {{"native", actual}, {"selected", b}, {"other", c}, {"error", error}})) return;
+        uxRegressionDone("study_identity", 4200); return;
+    }
+    case 4200: {
+        st.shotWorkspacePin = -1;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.workspaceDir = std::filesystem::absolute(s.dir).string();
+        st.suppressToasts = false;
+        if (!uxCheck("sketch3d_cancel_new_part", st.docMirror.newPart(st.worker, error),
+                     {{"error", error}})) return;
+        st.clearViewportForNewDoc(); st.addDocTab(false);
+        const auto built = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "sketch"}, {"name", "Sweep profile"},
+                {"refs", {{"plane", "plane.top"}}},
+                {"params", {{"entities", nlohmann::json::array({
+                    {{"id", "e1"}, {"type", "circle"}, {"center", {0, 0}}, {"radius", 2.0},
+                     {"construction", false}}
+                })}, {"constraints", nlohmann::json::array()}}}}}},
+            {{"op", "add_feature"}, {"feature", {{"type", "sketch3d"}, {"name", "Sweep path"},
+                {"params", {{"entities", nlohmann::json::array({
+                    {{"id", "e1"}, {"type", "line"}, {"p1", {0, 0, 0}}, {"p2", {0, 0, 15}},
+                     {"construction", false}}
+                })}, {"constraints", nlohmann::json::array()}}}}}},
+            {{"op", "add_feature"}, {"feature", {{"type", "sweep"}, {"name", "Downstream sweep"},
+                {"params", {{"mode", "boss"}}},
+                {"refs", {{"profile", nlohmann::json::array({{{"kind", "region"}, {"sketch", "$0"}}})},
+                          {"path", "$1"}}}}}}
+        }));
+        s.box = built.id_map.is_object() ? built.id_map.value("$0", std::string()) : "";
+        s.secondary = built.id_map.is_object() ? built.id_map.value("$1", std::string()) : "";
+        s.feature = built.id_map.is_object() ? built.id_map.value("$2", std::string()) : "";
+        const bool loaded = built.ok && !built.aicm_path.empty() && st.loadDocMesh(built.aicm_path, error);
+        s.baseline = {{"tree", st.docMirror.tree()}, {"mass", uxMass(st)}};
+        if (!uxCheck("sketch3d_cancel_fixture", loaded && !s.box.empty() && !s.secondary.empty() &&
+                     !s.feature.empty() && uxSolid(s.baseline["mass"]) &&
+                     st.sketch3dMode->enterForFeature(st, s.secondary),
+                     {{"tree", built.tree}, {"status", built.feature_status},
+                      {"error", built.error_message}, {"mesh_error", error}})) return;
+        s.baseline["framing_wheels"] = 0;
+        s.baseline["framing_ticks"] = 0;
+        uxNext(42001, 8); return;
+    }
+    case 42001: {
+        if (ui::cameraAnimating()) return;
+        ImVec2 lo, hi;
+        if (!ui::viewportClearRect(lo, hi)) return;
+        const float targets[][3] = {{8, 7, 0}, {8, -7, 0}, {-8, -7, 0},
+                                    {8, -4, 0}, {11, -4, 0}};
+        bool visible = true;
+        for (const auto& target : targets) {
+            ImVec2 point;
+            visible = sceneShotPoint(st, target, point) && visible;
+        }
+        const int wheels = s.baseline.value("framing_wheels", 0);
+        if (visible || wheels >= 32) {
+            if (!uxCheck("sketch3d_fixture_gestures_in_view", visible,
+                         {{"wheel_events", wheels}, {"zoom", st.zoom},
+                          {"clear_rect", {lo.x, lo.y, hi.x, hi.y}}})) return;
+            uxNext(4201, 2); return;
+        }
+        // Hover the viewport before each real wheel event, away from the sketch status overlay.
+        auto& io = ImGui::GetIO();
+        io.AddMousePosEvent((lo.x + hi.x) * 0.5f, lo.y + (hi.y - lo.y) * 0.55f);
+        const int ticks = s.baseline.value("framing_ticks", 0);
+        s.baseline["framing_ticks"] = ticks + 1;
+        if (ticks % 5 == 2) {
+            io.AddMouseWheelEvent(0.0f, -1.0f);
+            s.baseline["framing_wheels"] = wheels + 1;
+        }
+        return;
+    }
+    case 4201:
+        if (!uxCheck("sketch3d_point_tool_armed",
+                     st.sketch3dMode->onRibbonCommand(st, "sk3d_construction") &&
+                     st.sketch3dMode->onRibbonCommand(st, "sk3d_point"), {})) return;
+        uxNext(4202, 0); return;
+    case 4202: {
+        if (s.input.phase) {
+            if (s.input.click(s.input.point)) uxNext(4203, 3);
+            return;
+        }
+        const float world[3] = {8.0f, 7.0f, 0.0f};
+        ImVec2 point;
+        if (!uxCheck("sketch3d_point_visible", sceneShotPoint(st, world, point),
+                     {{"world", {world[0], world[1], world[2]}}})) return;
+        if (s.input.click(point)) uxNext(4203, 3);
+        return;
+    }
+    case 4203: {
+        const auto* sketch = uxFeature(st, s.secondary);
+        const auto entities = sketch && sketch->contains("params")
+            ? (*sketch)["params"].value("entities", nlohmann::json::array()) : nlohmann::json::array();
+        bool point = false;
+        if (entities.is_array())
+            for (const auto& entity : entities)
+                point = point || (entity.is_object() && entity.value("type", "") == "point" &&
+                                  entity.value("construction", false));
+        if (!uxCheck("sketch3d_accepted_viewport_edit", point && entities.size() == 2,
+                     {{"feature", sketch ? *sketch : nlohmann::json()},
+                      {"revision", st.docMirror.revision()}})) return;
+        s.baseline["accepted_tree"] = st.docMirror.tree();
+        s.baseline["accepted_revision"] = st.docMirror.revision();
+        if (s.sketchForeign) { uxNext(4251, 0); return; }
+        uxNext(4204, 0); return;
+    }
+    case 4204:
+        if (!uxCheck("sketch3d_line_tool_armed",
+                     st.sketch3dMode->onRibbonCommand(st, "sk3d_construction") &&
+                     st.sketch3dMode->onRibbonCommand(st, "sk3d_line"), {})) return;
+        uxNext(4205, 0); return;
+    case 4205:
+    case 4206: {
+        if (s.input.phase) {
+            if (s.input.click(s.input.point)) uxNext(s.step == 4205 ? 4206 : 4207, 0);
+            return;
+        }
+        const float first[3] = {8.0f, -4.0f, 0.0f};
+        const float second[3] = {11.0f, -4.0f, 0.0f};
+        const float* world = s.step == 4205 ? first : second;
+        ImVec2 point;
+        if (!uxCheck(s.step == 4205 ? "sketch3d_line_start_visible" : "sketch3d_line_end_visible",
+                     sceneShotPoint(st, world, point), {{"world", {world[0], world[1], world[2]}}}))
+            return;
+        if (s.input.click(point)) uxNext(s.step == 4205 ? 4206 : 4207, 0);
+        return;
+    }
+    case 4207: {
+        nlohmann::json toasts = nlohmann::json::array();
+        {
+            std::lock_guard<std::mutex> lock(st.toastsMtx);
+            for (const auto& toast : st.toasts)
+                if (toast.msg.find("WARNING:") != std::string::npos &&
+                    toast.msg.find(s.feature) != std::string::npos) toasts.push_back(toast.msg);
+        }
+        const auto& tree = st.docMirror.tree();
+        if (!uxCheck("sketch3d_editor_keeps_change_and_rolls_back",
+                     st.sketch3dMode->active() && !toasts.empty() &&
+                     st.docMirror.revision() == s.baseline["accepted_revision"].get<int>() + 1 &&
+                     tree.value("rollback_after", std::string()) == s.secondary &&
+                     uxFeature(st, s.feature) != nullptr,
+                     {{"toasts", toasts}, {"tree", tree},
+                      {"revision", st.docMirror.revision()}})) return;
+        shoot("sketch3d_auto_rollback"); uxNext(4208); return;
+    }
+    case 4208:
+        if (!uxCheck("sketch3d_cancel_command",
+                     st.sketch3dMode->onRibbonCommand(st, "sketch3d_cancel"), {})) return;
+        uxNext(4209, 4); return;
+    case 4209: {
+        const auto& tree = st.docMirror.tree();
+        const auto mass = uxMass(st);
+        if (!uxCheck("sketch3d_cancel_restores_checkpoint",
+                     !st.sketch3dMode->active() && tree.is_object() && tree.contains("features") &&
+                     s.baseline["tree"].contains("features") &&
+                     tree["features"] == s.baseline["tree"]["features"] && uxSolid(mass) &&
+                     std::abs(mass.value("volume_mm3", 0.0) -
+                              s.baseline["mass"].value("volume_mm3", 0.0)) < 1e-6,
+                     {{"before", s.baseline["tree"]}, {"after", tree},
+                      {"before_mass", s.baseline["mass"]}, {"after_mass", mass}})) return;
+        uxRegressionDone("sketch3d_cancel", 4250); return;
+    }
+    case 4250:
+        s.sketchForeign = true;
+        uxNext(4200, 0); return;
+    case 4251: {
+        const int before = st.docMirror.revision();
+        nlohmann::json foreign;
+        const bool applied = st.worker.call("doc_apply_ops",
+            {{"doc_id", st.docMirror.docId()}, {"base_revision", before},
+             {"ops", nlohmann::json::array({
+                {{"op", "edit_feature"}, {"id", s.box},
+                 {"params", {{"entities", nlohmann::json::array({
+                     {{"id", "e1"}, {"type", "circle"}, {"center", {0, 0}},
+                      {"radius", 2.5}, {"construction", false}}
+                 })}}}}
+             })}}, foreign, error, 60000);
+        if (!uxCheck("sketch3d_foreign_real_edit", applied && foreign.is_object() &&
+                     !foreign.contains("code") && !foreign.contains("rejected_tree") &&
+                     foreign.value("revision", -1) == before + 1 &&
+                     st.docMirror.revision() == before,
+                     {{"response", foreign}, {"mirror_revision", st.docMirror.revision()},
+                      {"error", error}})) return;
+        s.baseline["foreign_revision"] = foreign["revision"];
+        s.baseline["foreign_tree"] = foreign.value("tree", nlohmann::json::object());
+        uxNext(4252, 0); return;
+    }
+    case 4252: {
+        if (s.input.phase) {
+            if (s.input.click(s.input.point)) uxNext(4253, 3);
+            return;
+        }
+        const float world[3] = {8.0f, -7.0f, 0.0f};
+        ImVec2 point;
+        if (!uxCheck("sketch3d_foreign_stale_point_visible", sceneShotPoint(st, world, point),
+                     {{"world", {world[0], world[1], world[2]}}})) return;
+        s.input.click(point); return;
+    }
+    case 4253: {
+        const auto* profile = uxFeature(st, s.box);
+        nlohmann::json toasts = nlohmann::json::array();
+        {
+            std::lock_guard<std::mutex> lock(st.toastsMtx);
+            for (const auto& toast : st.toasts)
+                if (toast.msg.find("changed externally") != std::string::npos ||
+                    toast.msg.find("Add entity:") != std::string::npos)
+                    toasts.push_back(toast.msg);
+        }
+        if (!uxCheck("sketch3d_foreign_stale_edit_refused",
+                     st.sketch3dMode->active() && !toasts.empty() && profile &&
+                     st.docMirror.revision() == s.baseline["foreign_revision"] &&
+                     st.docMirror.tree().value("features", nlohmann::json()) ==
+                         s.baseline["foreign_tree"].value("features", nlohmann::json()),
+                     {{"toasts", toasts}, {"tree", st.docMirror.tree()},
+                      {"foreign_tree", s.baseline["foreign_tree"]}})) return;
+        if (!uxCheck("sketch3d_foreign_fresh_point_tool",
+                     st.sketch3dMode->onRibbonCommand(st, "sk3d_point"), {})) return;
+        uxNext(4254, 0); return;
+    }
+    case 4254: {
+        if (s.input.phase) {
+            if (s.input.click(s.input.point)) uxNext(4255, 3);
+            return;
+        }
+        const float world[3] = {-8.0f, -7.0f, 0.0f};
+        ImVec2 point;
+        if (!uxCheck("sketch3d_foreign_fresh_point_visible", sceneShotPoint(st, world, point),
+                     {{"world", {world[0], world[1], world[2]}}})) return;
+        s.input.click(point); return;
+    }
+    case 4255: {
+        const auto* sketch = uxFeature(st, s.secondary);
+        const auto entities = sketch && sketch->contains("params")
+            ? (*sketch)["params"].value("entities", nlohmann::json::array()) : nlohmann::json::array();
+        int points = 0;
+        if (entities.is_array())
+            for (const auto& entity : entities)
+                if (entity.is_object() && entity.value("type", "") == "point") ++points;
+        if (!uxCheck("sketch3d_foreign_fresh_edit_accepted", points == 2 &&
+                     st.docMirror.revision() > s.baseline["foreign_revision"],
+                     {{"feature", sketch ? *sketch : nlohmann::json()},
+                      {"revision", st.docMirror.revision()}})) return;
+        s.baseline["after_fresh"] = st.docMirror.tree();
+        s.baseline["fresh_revision"] = st.docMirror.revision();
+        if (!uxCheck("sketch3d_foreign_later_line_tool",
+                     st.sketch3dMode->onRibbonCommand(st, "sk3d_construction") &&
+                     st.sketch3dMode->onRibbonCommand(st, "sk3d_line"), {})) return;
+        uxNext(42551, 0); return;
+    }
+    case 42551:
+    case 42552: {
+        if (s.input.phase) {
+            if (s.input.click(s.input.point)) uxNext(s.step == 42551 ? 42552 : 42553, 0);
+            return;
+        }
+        const float first[3] = {8.0f, -4.0f, 0.0f};
+        const float second[3] = {11.0f, -4.0f, 0.0f};
+        const float* world = s.step == 42551 ? first : second;
+        ImVec2 point;
+        if (!uxCheck(s.step == 42551 ? "foreign_line_start_visible" : "foreign_line_end_visible",
+                     sceneShotPoint(st, world, point), {{"world", {world[0], world[1], world[2]}}}))
+            return;
+        s.input.click(point); return;
+    }
+    case 42553: {
+        const auto& current = st.docMirror.tree();
+        nlohmann::json feedback = nlohmann::json::array();
+        {
+            std::lock_guard<std::mutex> lock(st.toastsMtx);
+            for (const auto& toast : st.toasts)
+                if (toast.msg.find("WARNING:") != std::string::npos &&
+                    toast.msg.find(s.feature) != std::string::npos) feedback.push_back(toast.msg);
+        }
+        if (!uxCheck("sketch3d_foreign_later_auto_rollback",
+                     !feedback.empty() &&
+                     st.docMirror.revision() == s.baseline["fresh_revision"].get<int>() + 1 &&
+                     current.value("rollback_after", std::string()) == s.secondary &&
+                     uxFeature(st, s.feature) != nullptr,
+                     {{"feedback", feedback}, {"tree", current}})) return;
+        s.baseline["after_rollback"] = current;
+        if (!uxCheck("sketch3d_foreign_cancel_command",
+                     st.sketch3dMode->onRibbonCommand(st, "sketch3d_cancel"), {})) return;
+        uxNext(4256, 4); return;
+    }
+    case 4256: {
+        const auto& tree = st.docMirror.tree();
+        if (!uxCheck("sketch3d_foreign_cancel_keeps_both_writers",
+                     !st.sketch3dMode->active() && tree.is_object() && tree.contains("features") &&
+                     tree == s.baseline["after_rollback"],
+                     {{"tree", tree}, {"foreign", s.baseline["foreign_tree"]},
+                      {"after_rollback", s.baseline["after_rollback"]}})) return;
+        uxRegressionDone("sketch3d_foreign", 4300); return;
+    }
+    case 4300:
+        st.shotWorkspacePin = -1;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.workspaceDir = std::filesystem::absolute(s.dir).string();
+        if (!uxNewBox(st, "Study lifecycle fixture")) return;
+        s.part = st.docMirror.docId();
+        st.activeWorkspace = AppState::Workspace::Simulate;
+        st.leftPaneTab = AppState::LP_Simulation;
+        st.ribbonTab = AppState::RT_Simulation;
+        uxNext(4301, 8); return;
+    case 4301: {
+        if (st.rpc.busy() || !st.simManager) return;
+        const auto available = ui::commandAvailability("sim_new_static", ui::commandContext(st));
+        if (!uxCheck("study_metadata_initial_availability", available.enabled && st.ribbonDispatch,
+                     {{"reason", available.reason ? available.reason : ""}})) return;
+        st.rpc.callCoalesced("sim_caps", nlohmann::json::object(),
+            [&s](const core::RpcResult& result) {
+                s.baseline["metadata"] = {{"ok", result.ok}, {"result", result.result}, {"error", result.err}};
+            }, "uxquality-study-metadata-barrier", 15000, 1800);
+        const auto during = ui::commandAvailability("sim_new_static", ui::commandContext(st));
+        if (!uxCheck("study_metadata_remains_nonblocking",
+                     st.rpc.busy() && !st.rpc.interactionBusy() && during.enabled,
+                     {{"reason", during.reason ? during.reason : ""}})) return;
+        st.ribbonDispatch("sim_new_static");
+        if (!uxCheck("study_metadata_real_creation_queued", st.rpc.interactionBusy(),
+                     {{"rpc_busy", st.rpc.busy()}, {"interaction_busy", st.rpc.interactionBusy()}}))
+            return;
+        uxNext(43011, 0); return;
+    }
+    case 43011: {
+        if (st.rpc.busy()) return;
+        nlohmann::json actual;
+        const bool listed = st.worker.call("sim_study_list", {{"doc_id", s.part}}, actual, error, 15000);
+        if (!uxCheck("study_metadata_real_creation", listed && actual.is_object() &&
+                     actual.contains("studies") && actual["studies"].is_array() &&
+                     actual["studies"].size() == 1 && actual["studies"][0].value("type", "") == "static",
+                     {{"native", actual}, {"error", error}})) return;
+        s.baseline["static"] = actual["studies"][0];
+        uxNext(4302, 0); return;
+    }
+    case 4302:
+        if (st.rpc.busy()) return;
+        if (uxClickRail("##sim_tabstrip", "simE")) uxNext(43021, 4);
+        return;
+    case 43021: {
+        if (!uxCheck("study_real_explorer_selected",
+                     st.simSidebarTab == 0 && shotItem("##fx_search", true, "##sim_body") != nullptr,
+                     {{"windows", ui::audit::observedWindows()}})) return;
+        s.baseline["selected_before_external"] = st.simManager->activeStudyId();
+        if (!uxCheck("study_external_discovery_starts_on_static",
+                     s.baseline["selected_before_external"] == s.baseline["static"]["id"],
+                     {{"selected", s.baseline["selected_before_external"]},
+                      {"static", s.baseline["static"]}})) return;
+        nlohmann::json added;
+        const bool ok = st.worker.call("sim_study_add",
+            {{"doc_id", s.part}, {"study", {{"type", "modal"}, {"name", "External modal"}}}},
+            added, error, 15000);
+        if (!uxCheck("study_external_modal_added", ok && added.is_object() &&
+                     !added.contains("code") && !added.value("study_id", std::string()).empty(),
+                     {{"response", added}, {"error", error}})) return;
+        s.baseline["modal"] = added["study_id"];
+        s.baseline["native_after_add"] = added["studies"];
+        st.rpc.callCoalesced("sim_caps", nlohmann::json::object(),
+            [&s](const core::RpcResult& result) {
+                s.baseline["list_barrier"] = {{"ok", result.ok}, {"result", result.result}, {"error", result.err}};
+            }, "uxquality-study-list-barrier", 15000, 5000);
+        st.simManager->markStudiesStale();
+        const auto modal = ui::commandAvailability("sim_modal_options", ui::commandContext(st));
+        if (!uxCheck("study_stale_is_unknown_not_absent",
+                     !modal.enabled && modal.reason &&
+                     std::string(modal.reason) != "Create a modal study first.",
+                     {{"reason", modal.reason ? modal.reason : ""}, {"native", added},
+                      {"explorer_visible", shotItem("##fx_search", true, "##sim_body") != nullptr}})) return;
+        uxNext(4303, 8); return;
+    }
+    case 4303: {
+        const auto create = ui::commandAvailability("sim_new_static", ui::commandContext(st));
+        if (!uxCheck("study_hidden_refresh_and_pending_availability",
+                     shotItem("##fx_search", true, "##sim_body") && st.rpc.busy() &&
+                     st.rpc.interactionBusy() && !create.enabled && create.reason,
+                     {{"rpc_busy", st.rpc.busy()}, {"interaction_busy", st.rpc.interactionBusy()},
+                      {"reason", create.reason ? create.reason : ""}})) return;
+        st.ribbonDispatch("sim_new_picker");
+        uxNext(4304, 5); return;
+    }
+    case 4304: {
+        if (!uxCheck("study_pending_picker_stays_open", st.rpc.interactionBusy() &&
+                     ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel),
+                     {{"windows", ui::audit::observedWindows()}})) return;
+        bool found = false;
+        for (const auto& observed : ui::audit::observedWindows()) {
+            const std::string name = observed.value("window", std::string());
+            if (name.find("##kit_picker_list") == std::string::npos) continue;
+            ImGuiWindow* window = ImGui::FindWindowByName(name.c_str());
+            if (!window) continue;
+            const int group = 0, item = 0; // Structural -> Static in the real picker order.
+            ImGuiID id = ImHashData(&group, sizeof(group), window->ID);
+            id = ImHashData(&item, sizeof(item), id);
+            id = ImHashStr("row", 0, id);
+            id = ImHashStr("##kit_rowhit", 0, id);
+            if (ui::audit::observedItemById(id, name, s.fieldObservation)) { found = true; break; }
+        }
+        if (!uxCheck("study_pending_static_picker_row_disabled", found &&
+                     s.fieldObservation.value("visible", false) &&
+                     !s.fieldObservation.value("enabled", true),
+                     {{"item", found ? s.fieldObservation : nlohmann::json()},
+                      {"windows", ui::audit::observedWindows()}})) return;
+        shoot("study_pending_disabled_picker"); uxNext(4305, 0); return;
+    }
+    case 4305:
+        if (uxTryActivate("disabled-study-picker", "Static", nullptr,
+                          [&]() { return &s.fieldObservation; }, true, false, 0,
+                          "click disabled study picker row")) uxNext(4306, 0);
+        return;
+    case 4306: {
+        nlohmann::json actual;
+        const bool listed = st.worker.call("sim_study_list", {{"doc_id", s.part}}, actual, error, 15000);
+        st.ribbonDispatch("sim_new_static");
+        nlohmann::json afterDispatch;
+        const bool listedAfter = st.worker.call("sim_study_list", {{"doc_id", s.part}},
+                                                afterDispatch, error, 15000);
+        const bool pickerOpen = ImGui::IsPopupOpen(nullptr,
+            ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
+        if (!uxCheck("study_pending_disabled_gestures_do_not_create",
+                     listed && listedAfter && pickerOpen && actual.is_object() && afterDispatch.is_object() &&
+                     actual.value("studies", nlohmann::json()) == s.baseline["native_after_add"] &&
+                     afterDispatch.value("studies", nlohmann::json()) == s.baseline["native_after_add"],
+                     {{"after_pointer", actual}, {"after_dispatch", afterDispatch},
+                      {"picker_open", pickerOpen}, {"error", error}}))
+            return;
+        uxNext(4307, 0); return;
+    }
+    case 4307:
+        if (st.rpc.busy()) return;
+        // The disabled picker remains open after its real row click. Dismiss it as a
+        // user would before selecting the Explorer rail; otherwise ImGui consumes the
+        // outside click solely to close the popup.
+        if (s.input.key(ImGuiKey_Escape)) uxNext(43071, 0);
+        return;
+    case 43071:
+        if (!uxCheck("study_picker_escape_dismissed",
+                     !ImGui::IsPopupOpen(nullptr,
+                         ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel),
+                     {{"windows", ui::audit::observedWindows()}})) return;
+        uxNext(43072, 0); return;
+    case 43072:
+        if (uxClickRail("##sim_tabstrip", "simE")) uxNext(4308, 8);
+        return;
+    case 4308: {
+        const auto modal = ui::commandAvailability("sim_modal_options", ui::commandContext(st));
+        const std::string selected = st.simManager ? st.simManager->activeStudyId() : "";
+        if (!uxCheck("study_external_modal_usable_with_manager_hidden",
+                     st.simSidebarTab == 0 && shotItem("##fx_search", true, "##sim_body") &&
+                     modal.enabled && selected == s.baseline["selected_before_external"] &&
+                     s.baseline.value("list_barrier", nlohmann::json::object()).value("ok", false),
+                     {{"modal", s.baseline["modal"]}, {"selected", selected},
+                      {"sidebar", st.simSidebarTab}, {"reason", modal.reason ? modal.reason : ""},
+                      {"barrier", s.baseline["list_barrier"]}})) return;
+        uxNext(43081, 0); return;
+    }
+    case 43081:
+        if (uxClick("Modal", "##RibbonBar")) uxNext(43082, 4);
+        return;
+    case 43082: {
+        const auto modal = ui::commandAvailability("sim_modal_options", ui::commandContext(st));
+        const auto* item = uxRibbonItem("sim_modal_options");
+        if (!uxCheck("study_external_modal_real_control",
+                     st.simSidebarTab == 0 && st.simManager &&
+                     st.simManager->activeStudyId() == s.baseline["selected_before_external"] &&
+                     modal.visible && modal.enabled && item && item->value("visible", false),
+                     {{"reason", modal.reason ? modal.reason : ""},
+                      {"item", item ? *item : nlohmann::json()}})) return;
+        uxNext(43083, 0); return;
+    }
+    case 43083:
+        if (uxClickItem("sim_modal_options", "##RibbonBar",
+                        [&]() { return uxRibbonItem("sim_modal_options"); }))
+            uxNext(43084, 8);
+        return;
+    case 43084: {
+        const auto definition = st.simManager ? st.simManager->activeStudyDefinition() : nlohmann::json();
+        const auto* modes = uxModalModesItem();
+        if (!uxCheck("study_external_modal_setup_targets_discovered_study",
+                     st.simSidebarTab == 1 && st.simManager &&
+                     st.simManager->activeStudyId() == s.baseline["modal"] &&
+                     definition.is_object() && definition.value("id", std::string()) == s.baseline["modal"] &&
+                     definition.value("type", std::string()) == "modal" &&
+                     modes && modes->value("visible", false) && modes->value("enabled", false),
+                     {{"definition", definition}, {"sidebar", st.simSidebarTab},
+                      {"field", modes ? *modes : nlohmann::json()}})) return;
+        uxRegressionDone("study_lifecycle", 4400); return;
+    }
+    case 4400: {
+        if (!uxSheetFixture(st, false)) return;
+        const auto refused = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "set_suppressed"}, {"id", s.box}, {"value", true}}
+        }));
+        if (!uxCheck("feature_native_atomic_refusal", !refused.ok && refused.rejected &&
+                     refused.unchanged && !refused.error_message.empty() &&
+                     st.docMirror.tree() == s.baseline["tree"] &&
+                     st.docMirror.revision() == s.baseline["revision"],
+                     {{"error", refused.error_message}, {"candidate_status", refused.feature_status},
+                      {"tree", st.docMirror.tree()}})) return;
+        s.baseline["rejection"] = refused.error_message;
+        st.selectedFeatureId = s.box;
+        st.treeScrollToSelection = true;
+        st.leftPaneTab = AppState::LP_FeatureManager;
+        uxNext(4401, 8); return;
+    }
+    case 4401:
+        if (uxRightClickFeatureRow("Base")) uxNext(4402, 0);
+        return;
+    case 4402:
+        if (uxClick("Suppress")) uxNext(4403, 3);
+        return;
+    case 4403: {
+        if (st.rpc.busy() || st.rebuildsInFlight) return;
+        nlohmann::json feedback = nlohmann::json::array();
+        const std::string reason = s.baseline.value("rejection", std::string());
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lock(st.toastsMtx);
+            for (const auto& toast : st.toasts)
+                if (toast.msg.find("suppress failed:") != std::string::npos) {
+                    feedback.push_back(toast.msg);
+                    found = found || (!reason.empty() && toast.msg.find(reason) != std::string::npos);
+                }
+        }
+        const auto mass = uxMass(st);
+        if (!uxCheck("feature_rejection_visible_without_mutation", found &&
+                     st.docMirror.tree() == s.baseline["tree"] &&
+                     st.docMirror.revision() == s.baseline["revision"] &&
+                     st.docMirror.featureStatus() == s.baseline["status"] && st.hasDocMesh &&
+                     uxSolid(mass) && std::abs(mass.value("volume_mm3", 0.0) -
+                                               s.baseline["mass"].value("volume_mm3", 0.0)) < 1e-6,
+                     {{"feedback", feedback}, {"native_reason", reason}, {"tree", st.docMirror.tree()},
+                      {"status", st.docMirror.featureStatus()}, {"mass", mass}})) return;
+        shoot("feature_rejection_feedback"); uxNext(4404); return;
+    }
+    case 4404:
+        uxRegressionDone("feature_rejection", 4500); return;
+
+    case 4500: {
+        if (!uxSheetFixture(st, true)) return;
+        const auto refused = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "sm_flat_pattern"},
+                {"name", "Flat-Pattern"}, {"params", nlohmann::json::object()}}}}
+        }));
+        if (!uxCheck("flatten_native_atomic_refusal", !refused.ok && refused.rejected &&
+                     refused.unchanged && !refused.error_message.empty() &&
+                     st.docMirror.tree() == s.baseline["tree"] &&
+                     st.docMirror.revision() == s.baseline["revision"],
+                     {{"error", refused.error_message}, {"candidate_status", refused.feature_status},
+                      {"tree", st.docMirror.tree()}})) return;
+        s.baseline["rejection"] = refused.error_message;
+        st.ribbonTab = AppState::RT_SheetMetal;
+        uxNext(4501, 8); return;
+    }
+    case 4501:
+        if (!uxContext(st, "flatten_candidate_enabled", {{"sm_flat_pattern", true}})) return;
+        if (!uxCheck("flatten_real_ribbon_control",
+                     uxRibbonItem("sm_flat_pattern") &&
+                     uxRibbonItem("sm_flat_pattern")->value("visible", false),
+                     {{"item", uxRibbonItem("sm_flat_pattern") ? *uxRibbonItem("sm_flat_pattern")
+                                                               : nlohmann::json()}})) return;
+        uxNext(4502, 0); return;
+    case 4502:
+        if (uxClickItem("sm_flat_pattern", "##RibbonBar",
+                        [&]() { return uxRibbonItem("sm_flat_pattern"); }))
+            uxNext(4503, 3);
+        return;
+    case 4503: {
+        if (st.rpc.busy() || st.rebuildsInFlight) return;
+        nlohmann::json feedback = nlohmann::json::array();
+        const std::string reason = s.baseline.value("rejection", std::string());
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lock(st.toastsMtx);
+            for (const auto& toast : st.toasts)
+                if (!reason.empty() && toast.msg.find(reason) != std::string::npos) {
+                    feedback.push_back(toast.msg); found = true;
+                }
+        }
+        const auto mass = uxMass(st);
+        if (!uxCheck("flatten_rejection_visible_without_mutation",
+                     found && st.docMirror.tree() == s.baseline["tree"] &&
+                     st.docMirror.revision() == s.baseline["revision"] &&
+                     st.docMirror.featureStatus() == s.baseline["status"] && st.hasDocMesh &&
+                     mass.is_object() && std::abs(mass.value("volume_mm3", 0.0) -
+                                                  s.baseline["mass"].value("volume_mm3", 0.0)) < 1e-6,
+                     {{"feedback", feedback}, {"native_reason", reason}, {"tree", st.docMirror.tree()},
+                      {"status", st.docMirror.featureStatus()}, {"mass", mass}})) return;
+        shoot("flatten_rejection_feedback"); uxNext(4504); return;
+    }
+    case 4504:
+        uxRegressionDone("flatten_rejection", 4600); return;
+    case 4600: {
+        st.shotWorkspacePin = -1;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.workspaceDir = std::filesystem::absolute(s.dir).string();
+        if (!uxNewBox(st, "Assembly source")) return;
+        const std::string path = (std::filesystem::absolute(s.dir) / "assembly_source.step+").string();
+        if (!uxCheck("assembly_partial_source_saved", st.docMirror.save(st.worker, path, error),
+                     {{"path", path}, {"error", error}})) return;
+        if (!uxCheck("assembly_partial_new_assembly", st.docMirror.newAssembly(st.worker, error),
+                     {{"error", error}})) return;
+        st.clearViewportForNewDoc(); st.addDocTab(true);
+        s.part = st.docMirror.docId();
+        const auto valid = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "asm_insert_component"}, {"source", {{"path", path}}}, {"fixed", true}}
+        }));
+        const std::string component = valid.id_map.is_object() ? valid.id_map.value("$0", std::string()) : "";
+        const bool loaded = valid.ok && !valid.aicm_path.empty() && st.loadDocMesh(valid.aicm_path, error);
+        if (!uxCheck("assembly_partial_valid_sibling", loaded && !component.empty(),
+                     {{"component", component}, {"tree", valid.tree},
+                      {"status", valid.feature_status}, {"error", valid.error_message}})) return;
+        s.baseline = {{"component", component}, {"revision", st.docMirror.revision()}};
+        const auto partial = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "asm_insert_component"}, {"source", {{"embedded", "missing-part"}}},
+             {"name", "Unavailable component"}}
+        }));
+        const std::string missing = partial.id_map.is_object() ? partial.id_map.value("$0", std::string()) : "";
+        const auto missingStatus = uxStatus(partial.feature_status, missing);
+        nlohmann::json native;
+        const bool listed = st.worker.call("doc_tree", {{"doc_id", s.part}}, native, error, 15000);
+        if (!uxCheck("assembly_failed_component_is_committed",
+                     partial.ok && !partial.rejected && !missing.empty() && missingStatus.is_object() &&
+                     !missingStatus.value("ok", true) &&
+                     partial.revision == s.baseline["revision"].get<int>() + 1 &&
+                     st.docMirror.revision() == partial.revision && listed && native.is_object() &&
+                     native.value("revision", -1) == partial.revision &&
+                     native.value("tree", nlohmann::json()) == st.docMirror.tree() &&
+                     st.docMirror.featureStatus() == partial.feature_status,
+                     {{"missing", missing}, {"response_tree", partial.tree},
+                      {"response_status", partial.feature_status}, {"native", native},
+                      {"error", partial.error_message}})) return;
+        s.baseline["embedded"] = missing;
+        s.baseline["after_embedded"] = st.docMirror.revision();
+        uxNext(4601, 3); return;
+    }
+    case 4601: {
+        if (st.rpc.busy() || st.rebuildsInFlight) return;
+        std::string mesh;
+        const std::string path = (std::filesystem::absolute(s.dir) / "no-such-component.step+").string();
+        const bool queued = st.asmPanels && st.asmPanels->insertComponent(
+            st, path, nullptr, mesh,
+            [&s](ui::AsmPanels::InsertOutcome outcome, const std::string& detail) {
+                s.baseline["insert_callback"] = {
+                    {"ok", outcome == ui::AsmPanels::InsertOutcome::Success},
+                    {"superseded", outcome == ui::AsmPanels::InsertOutcome::Superseded},
+                    {"detail", detail}};
+            }, s.part);
+        if (!uxCheck("assembly_partial_real_ui_insert_queued", queued,
+                     {{"path", path}, {"doc_id", s.part}})) return;
+        uxNext(4602, 0); return;
+    }
+    case 4602: {
+        if (st.rpc.busy() || st.rebuildsInFlight) return;
+        nlohmann::json active;
+        const bool activated = st.worker.call("doc_activate", {{"doc_id", s.part}}, active, error, 60000);
+        const auto callback = s.baseline.value("insert_callback", nlohmann::json::object());
+        const auto rebuild = active.is_object() ? active.value("rebuild", nlohmann::json::object())
+                                                : nlohmann::json::object();
+        const auto components = rebuild.value("components", nlohmann::json::array());
+        const auto bodies = active.is_object() && active.contains("tess") && active["tess"].is_object()
+            ? active["tess"].value("bodies", nlohmann::json::array()) : nlohmann::json::array();
+        if (!uxCheck("assembly_failed_ui_insert_adopted",
+                     activated && callback.value("ok", false) && components.is_array() &&
+                     components.size() == 3 && components[0].value("ok", false) &&
+                     !components[1].value("ok", true) && !components[2].value("ok", true) &&
+                     active.value("revision", -1) == st.docMirror.revision() &&
+                     st.docMirror.revision() == s.baseline["after_embedded"].get<int>() + 1 &&
+                     active.value("tree", nlohmann::json()) == st.docMirror.tree() &&
+                     rebuild.value("feature_status", nlohmann::json()) == st.docMirror.featureStatus() &&
+                     bodies.is_array() && bodies.size() == 1 && st.hasDocMesh,
+                     {{"callback", callback}, {"native", active}, {"mirror_tree", st.docMirror.tree()},
+                      {"mirror_status", st.docMirror.featureStatus()}, {"error", error}})) return;
+        uxRegressionDone("assembly_failed_component", 4700); return;
+    }
+    case 4700: {
+        st.shotWorkspacePin = -1;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.workspaceDir = std::filesystem::absolute(s.dir).string();
+        if (!uxNewBox(st, "Copy source")) return;
+        const std::string source = (std::filesystem::absolute(s.dir) / "copy_source.step+").string();
+        const std::string failed = (std::filesystem::absolute(s.dir) / "copy_failed_history.step+").string();
+        if (!uxCheck("copy_source_saved", st.docMirror.save(st.worker, source, error),
+                     {{"path", source}, {"error", error}}) || !uxWriteFailedHistory(source, failed)) return;
+        if (!uxCheck("copy_failed_history_open", st.docMirror.open(st.worker, failed, error),
+                     {{"path", failed}, {"error", error}})) return;
+        st.clearViewportForNewDoc(); st.addDocTab(false);
+        if (!st.docMirror.lastOpenedAicm().empty())
+            st.loadDocMesh(st.docMirror.lastOpenedAicm(), error);
+        const auto broken = uxStatus(st.docMirror.featureStatus(), "fixture_broken");
+        if (!uxCheck("copy_failed_history_native_status", uxFeature(st, s.box) && broken.is_object() &&
+                     !broken.value("ok", true),
+                     {{"tree", st.docMirror.tree()}, {"status", st.docMirror.featureStatus()}})) return;
+        s.baseline = {{"tree", st.docMirror.tree()}, {"revision", st.docMirror.revision()},
+                      {"status", st.docMirror.featureStatus()},
+                      {"dirty", st.docTabs[st.activeTab].dirty}};
+        st.selectedFeatureId = s.box;
+        const bool copied = ui::featureCopySelection(st);
+        nlohmann::json actual;
+        const bool listed = st.worker.call("doc_tree", {{"doc_id", st.docMirror.docId()}}, actual, error, 15000);
+        if (!uxCheck("copy_failed_history_preserves_bundle",
+                     copied && st.clipboard.kind == AppState::Clipboard::Kind::Feature &&
+                     st.clipboard.payloads.size() == 1 && st.clipboard.payloads[0].is_object() &&
+                     st.clipboard.payloads[0].contains("root") &&
+                     st.docMirror.tree() == s.baseline["tree"] &&
+                     st.docMirror.featureStatus() == s.baseline["status"] &&
+                     st.docMirror.revision() == s.baseline["revision"] &&
+                     st.docTabs[st.activeTab].dirty == s.baseline["dirty"] &&
+                     listed && actual.value("tree", nlohmann::json()) == s.baseline["tree"] &&
+                     actual.value("revision", -1) == s.baseline["revision"],
+                     {{"copied", copied}, {"payloads", st.clipboard.payloads},
+                      {"native", actual}, {"status", st.docMirror.featureStatus()}, {"error", error}}))
+            return;
+        uxRegressionDone("copy_failed_history", 4800); return;
+    }
+    case 4800: {
+        st.shotWorkspacePin = -1;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.workspaceDir = std::filesystem::absolute(s.dir).string();
+        if (!uxNewBox(st, "Copy race source")) return;
+        const std::string path = (std::filesystem::absolute(s.dir) / "copy_race.step+").string();
+        if (!uxCheck("copy_race_saved", st.docMirror.save(st.worker, path, error),
+                     {{"path", path}, {"error", error}})) return;
+        s.part = st.docMirror.docId();
+        s.baseline = {{"revision", st.docMirror.revision()}, {"tree", st.docMirror.tree()},
+                      {"status", st.docMirror.featureStatus()},
+                      {"dirty", st.docTabs[st.activeTab].dirty}};
+        st.docMirror.applyOpsAsync(st.rpc, st.worker, nlohmann::json::array({
+            {{"op", "edit_feature"}, {"id", s.box}, {"params", {{"length", 42.0}}}}
+        }), [&st, &s](const core::OpsResponse& result, bool currentResponse) {
+            s.baseline["async"] = {{"current", currentResponse}, {"ok", result.ok},
+                                    {"revision", result.revision}, {"mesh", result.aicm_path},
+                                    {"error", result.error_message}};
+            if (currentResponse && result.ok && st.isActiveMirrorDoc() && !result.aicm_path.empty())
+                st.loadDocMeshAsync(result.aicm_path);
+        });
+        nlohmann::json native;
+        bool committed = false;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        do {
+            if (!st.worker.call("doc_tree", {{"doc_id", s.part}}, native, error, 15000)) break;
+            const auto tree = native.value("tree", nlohmann::json::object());
+            if (native.value("revision", -1) == s.baseline["revision"].get<int>() + 1 &&
+                tree.is_object() && tree.contains("features") && tree["features"].is_array()) {
+                for (const auto& feature : tree["features"])
+                    if (feature.is_object() && feature.value("id", "") == s.box &&
+                        std::abs(uxNumber(feature.value("params", nlohmann::json::object())
+                                          .value("length", nlohmann::json())) - 42.0) < 1e-6)
+                        committed = true;
+            }
+            if (!committed) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        } while (!committed && std::chrono::steady_clock::now() < deadline);
+        if (!uxCheck("copy_race_real_edit_committed_before_callback",
+                     committed && st.docMirror.revision() == s.baseline["revision"] &&
+                     !s.baseline.contains("async"),
+                     {{"native", native}, {"mirror_revision", st.docMirror.revision()},
+                      {"error", error}})) return;
+        st.selectedFeatureId = s.box;
+        const bool copied = ui::featureCopySelection(st);
+        s.baseline["copy_result"] = copied;
+        s.baseline["resynced_revision"] = st.docMirror.revision();
+        const auto* resyncedFeature = uxFeature(st, s.box);
+        if (!uxCheck("copy_race_tree_only_resync", st.docMirror.revision() ==
+                     s.baseline["revision"].get<int>() + 1 &&
+                     resyncedFeature && std::abs(uxNumber(resyncedFeature->value("params", nlohmann::json::object())
+                                      .value("length", nlohmann::json())) - 42.0) < 1e-6,
+                     {{"copy_result", copied}, {"native", native}, {"tree", st.docMirror.tree()}})) return;
+        uxNext(4801, 0); return;
+    }
+    case 4801: {
+        if (st.rpc.busy() || !s.baseline.contains("async")) return;
+        const auto async = s.baseline["async"];
+        bool geometryCurrent = false;
+        nlohmann::json boxes = nlohmann::json::array();
+        for (const auto& item : st.bodyBBoxCache) {
+            const auto& box = item.second;
+            boxes.push_back({{"body", item.first}, {"bounds", box}});
+            geometryCurrent = geometryCurrent || std::abs((box[3] - box[0]) - 42.0f) < 0.02f;
+        }
+        if (!geometryCurrent && pipingNow() - s.stepStart < 3.0) return;
+        const auto mass = uxMass(st);
+        if (!uxCheck("copy_race_adopts_current_geometry_and_status",
+                     async.value("ok", false) && async.value("current", false) &&
+                     async.value("revision", -1) == st.docMirror.revision() &&
+                     st.docMirror.featureStatusCurrent() && st.docMirror.solidPresenceKnown() &&
+                     st.docMirror.hasSolidBody() && st.hasDocMesh && geometryCurrent && uxSolid(mass) &&
+                     st.docTabs[st.activeTab].dirty,
+                     {{"async", async}, {"tree", st.docMirror.tree()},
+                      {"status", st.docMirror.featureStatus()}, {"bbox", boxes}, {"mass", mass},
+                      {"dirty", st.docTabs[st.activeTab].dirty}, {"before", s.baseline}})) return;
+        uxRegressionDone("copy_resync_race", 4900); return;
+    }
+    case 4900: {
+        st.shotWorkspacePin = -1;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.workspaceDir = std::filesystem::absolute(s.dir).string();
+        if (!uxNewBox(st, "Background destination")) return;
+        s.partTab = st.activeTab;
+        s.background = {{"doc_id", st.docMirror.docId()}, {"tree", st.docMirror.tree()},
+                        {"revision", st.docMirror.revision()}, {"status", st.docMirror.featureStatus()},
+                        {"switched", false}};
+        if (!uxSheetFixture(st, false)) return;
+        const auto refused = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "set_suppressed"}, {"id", s.box}, {"value", true}}
+        }));
+        if (!uxCheck("obsolete_rejection_native_fixture", !refused.ok && refused.rejected &&
+                     refused.unchanged && !refused.error_message.empty(),
+                     {{"error", refused.error_message}, {"candidate_status", refused.feature_status}}))
+            return;
+        s.background["reason"] = refused.error_message;
+        int logs = 0;
+        {
+            std::lock_guard<std::mutex> lock(st.logMtx);
+            for (const auto& line : st.log)
+                if (line.find("[err] suppress:") != std::string::npos &&
+                    line.find(refused.error_message) != std::string::npos) ++logs;
+        }
+        s.background["existing_error_logs"] = logs;
+        st.selectedFeatureId = s.box;
+        st.treeScrollToSelection = true;
+        st.leftPaneTab = AppState::LP_FeatureManager;
+        uxNext(4901, 8); return;
+    }
+    case 4901:
+        if (uxRightClickFeatureRow("Base")) uxNext(4902, 0);
+        return;
+    case 4902:
+        if (uxClick("Suppress")) uxNext(4903, 0);
+        return;
+    case 4903: {
+        if (!s.background.value("switched", false) || st.rpc.busy() || st.rebuildsInFlight) return;
+        int logs = 0;
+        const std::string reason = s.background.value("reason", std::string());
+        {
+            std::lock_guard<std::mutex> lock(st.logMtx);
+            for (const auto& line : st.log)
+                if (line.find("[err] suppress:") != std::string::npos &&
+                    line.find(reason) != std::string::npos) ++logs;
+        }
+        bool expectedGeometry = false;
+        nlohmann::json boxes = nlohmann::json::array();
+        for (const auto& item : st.bodyBBoxCache) {
+            boxes.push_back({{"body", item.first}, {"bounds", item.second}});
+            expectedGeometry = expectedGeometry || std::abs((item.second[3] - item.second[0]) - 40.0f) < 0.02f;
+        }
+        if (!expectedGeometry && pipingNow() - s.stepStart < 3.0) return;
+        const auto mass = uxMass(st);
+        if (!uxCheck("obsolete_rejection_does_not_touch_destination",
+                     st.activeTab == s.partTab && st.docMirror.docId() == s.background["doc_id"] &&
+                     st.docMirror.revision() == s.background["revision"] &&
+                     st.docMirror.tree() == s.background["tree"] &&
+                     st.docMirror.featureStatus() == s.background["status"] &&
+                     logs == s.background["existing_error_logs"] && st.hasDocMesh &&
+                     expectedGeometry && uxSolid(mass),
+                     {{"destination", s.background}, {"tree", st.docMirror.tree()},
+                      {"status", st.docMirror.featureStatus()}, {"bbox", boxes}, {"mass", mass},
+                      {"matching_error_logs", logs}})) return;
+        uxRegressionDone("obsolete_rejection", 5000); return;
+    }
+    case 5000: {
+        st.shotWorkspacePin = -1;
+        st.activeWorkspace = AppState::Workspace::Electronics;
+        st.workspaceDir = std::filesystem::absolute(s.dir).string();
+        st.suppressToasts = false;
+        nlohmann::json a, b;
+        const bool createdA = st.worker.call("ecad_design",
+            {{"request", "RC low-pass filter with 1000 Hz cutoff"}, {"name", "Origin A"}},
+            a, error, 60000);
+        const bool createdB = st.worker.call("ecad_new", {{"kind", "sch"}}, b, error, 15000);
+        if (!uxCheck("ecad_origin_real_schematics", createdA && createdB && a.is_object() && b.is_object() &&
+                     !a.contains("code") && !b.contains("code") &&
+                     !a.value("doc_id", std::string()).empty() &&
+                     !b.value("doc_id", std::string()).empty() && a["doc_id"] != b["doc_id"],
+                     {{"a", a}, {"b", b}, {"error", error}})) return;
+        const std::string aId = a.value("doc_id", std::string());
+        const std::string bId = b.value("doc_id", std::string());
+        nlohmann::json study = {{"analyses", {{{"type", "tran"}, {"tstep", 5e-5}, {"tstop", 5e-3}}}}};
+        nlohmann::json aControl, bControl;
+        const bool ranA = st.worker.call("ecad_simulate", {{"doc_id", aId}, {"study", study}},
+                                         aControl, error, 60000);
+        const bool ranB = st.worker.call("ecad_simulate", {{"doc_id", bId}, {"study", study}},
+                                         bControl, error, 60000);
+        if (!uxCheck("ecad_origin_distinct_native_controls", ranA && ranB && aControl.is_object() &&
+                     aControl.value("ok", false) && bControl.is_object() &&
+                     !bControl.value("ok", true) &&
+                     bControl.value("error", std::string()).find("no simulatable devices") != std::string::npos,
+                     {{"a", aControl}, {"b", bControl}, {"error", error}})) return;
+        s.baseline = {{"a_id", aId}, {"b_id", bId}, {"a_control", aControl}, {"b_control", bControl}};
+        st.addEcadTab("sch", aId, a.value("revision", 0), "Origin A");
+        s.partTab = st.activeTab;
+        st.addEcadTab("sch", bId, b.value("revision", 0), "Origin B");
+        s.baseline["b_tab"] = st.activeTab;
+        st.switchToTab(s.partTab);
+        st.ecadSimAnalysis = 0;
+        uxNext(5001, 8); return;
+    }
+    case 5001:
+        if (st.rpc.busy()) return;
+        if (!uxCheck("ecad_origin_a_active", st.activeTab == s.partTab &&
+                     st.ecadDocId == s.baseline["a_id"],
+                     {{"active", st.ecadDocId}, {"a", s.baseline["a_id"]}})) return;
+        if (uxClickRail("##ecad_tabstrip", "ecadM")) uxNext(5002, 4);
+        return;
+    case 5002: {
+        const auto* button = shotItem("Simulate", true, "##ecad_body");
+        if (!button) { shotScrollTo("Simulate", "##ecad_body", true); return; }
+        int starts = 0, wrong = 0;
+        {
+            std::lock_guard<std::mutex> lock(st.logMtx);
+            for (const auto& line : st.log) {
+                if (line.find("[ecad] simulate ") != std::string::npos &&
+                    line.find(" started (") != std::string::npos) ++starts;
+                if (line.find("[err] [ecad] simulate ") != std::string::npos &&
+                    line.find("no simulatable devices") != std::string::npos) ++wrong;
+            }
+        }
+        s.baseline["starts_before"] = starts;
+        s.baseline["wrong_before"] = wrong;
+        shoot("ecad_origin_a_panel"); uxNext(5003, 0); return;
+    }
+    case 5003: {
+        if (s.input.phase == 3 && !s.baseline.value("switched", false)) {
+            // The panel's release has run; switch before the next frame consumes
+            // a deferred ecadSimGo. A correctly ordered handler may already have
+            // launched A, which is equally observable through the real result/log.
+            s.baseline["pending_before_switch"] = st.ecadSimGo;
+            s.baseline["status_before_switch"] = st.status;
+            st.switchToTab(s.baseline["b_tab"].get<int>());
+            s.baseline["switched"] = true;
+        }
+        if (uxClick("Simulate", "##ecad_body")) uxNext(5004, 0);
+        return;
+    }
+    case 5004: {
+        if (st.rpc.busy()) return;
+        int starts = 0, wrong = 0;
+        nlohmann::json logs = nlohmann::json::array();
+        {
+            std::lock_guard<std::mutex> lock(st.logMtx);
+            for (const auto& line : st.log) {
+                if (line.find("[ecad] simulate ") != std::string::npos &&
+                    line.find(" started (") != std::string::npos) ++starts;
+                if (line.find("[err] [ecad] simulate ") != std::string::npos &&
+                    line.find("no simulatable devices") != std::string::npos) ++wrong;
+                if (line.find("[ecad]") != std::string::npos) logs.push_back(line);
+            }
+        }
+        if (!uxCheck("ecad_panel_action_preserves_origin",
+                     s.baseline.value("switched", false) &&
+                     st.activeTab == s.baseline["b_tab"].get<int>() &&
+                     st.ecadDocId == s.baseline["b_id"] &&
+                     starts > s.baseline["starts_before"].get<int>() &&
+                     wrong == s.baseline["wrong_before"].get<int>(),
+                     {{"fixture", s.baseline}, {"logs", logs}, {"status", st.status},
+                      {"active_doc", st.ecadDocId}, {"results", st.ecadSimResults}})) return;
+        uxRegressionDone("ecad_queued_origin", 5100); return;
+    }
+    case 5100: {
+        st.shotWorkspacePin = -1;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.workspaceDir = std::filesystem::absolute(s.dir).string();
+        if (!uxNewBox(st, "Parked A")) return;
+        s.partTab = st.activeTab;
+        s.part = st.docMirror.docId();
+        s.feature = s.box;
+        const std::string path = (std::filesystem::absolute(s.dir) / "parked_a.step+").string();
+        if (!uxCheck("parked_a_saved", st.docMirror.save(st.worker, path, error),
+                     {{"path", path}, {"error", error}})) return;
+        st.markSaved(st.docMirror.docId(), st.docMirror.revision(), path);
+        const int revision = st.docMirror.revision();
+        nlohmann::json schematic;
+        const bool created = st.worker.call("ecad_new", {{"kind", "sch"}}, schematic, error, 15000);
+        if (!uxCheck("parked_b_real_schematic", created && schematic.is_object() &&
+                     !schematic.contains("code") && !schematic.value("doc_id", std::string()).empty(),
+                     {{"response", schematic}, {"error", error}})) return;
+        s.baseline = {{"a_id", s.part}, {"a_revision", revision},
+                      {"b_id", schematic["doc_id"]}, {"a_dirty_before", st.docTabs[s.partTab].dirty}};
+        st.addEcadTab("sch", schematic.value("doc_id", std::string()),
+                      schematic.value("revision", 0), "Parked B schematic");
+        s.baseline["b_tab"] = st.activeTab;
+        st.switchToTab(s.partTab);
+        uxNext(5101, 8); return;
+    }
+    case 5101: {
+        if (st.rpc.busy()) return;
+        bool oldGeometry = false;
+        nlohmann::json boxes = nlohmann::json::array();
+        for (const auto& item : st.bodyBBoxCache) {
+            boxes.push_back({{"body", item.first}, {"bounds", item.second}});
+            oldGeometry = oldGeometry || std::abs((item.second[3] - item.second[0]) - 40.0f) < 0.02f;
+        }
+        if (!uxCheck("parked_a_original_mesh", st.activeTab == s.partTab &&
+                     st.docMirror.docId() == s.part && !st.docTabs[s.partTab].dirty &&
+                     st.hasDocMesh && oldGeometry,
+                     {{"tree", st.docMirror.tree()}, {"bbox", boxes},
+                      {"dirty", st.docTabs[s.partTab].dirty}})) return;
+        shoot("parked_a_before"); uxNext(5102, 0); return;
+    }
+    case 5102:
+        st.docMirror.applyOpsAsync(st.rpc, st.worker, nlohmann::json::array({
+            {{"op", "edit_feature"}, {"id", s.box}, {"params", {{"length", 42.0}}}}
+        }), [&st, &s](const core::OpsResponse& result, bool current) {
+            s.baseline["callback"] = {{"ok", result.ok}, {"current", current},
+                                      {"revision", result.revision}, {"mesh", result.aicm_path},
+                                      {"error", result.error_message}};
+            if (current && result.ok && st.isActiveMirrorDoc() && !result.aicm_path.empty())
+                st.loadDocMeshAsync(result.aicm_path);
+        });
+        st.switchToTab(s.baseline["b_tab"].get<int>());
+        s.baseline["b_mesh_gen"] = st.meshGen();
+        s.baseline["b_visible"] = st.bodyVisible;
+        s.baseline["b_show_viewport"] = st.showViewport;
+        s.baseline["b_dirty"] = st.docTabs[st.activeTab].dirty;
+        if (!uxCheck("parked_switch_precedes_real_callback",
+                     st.activeTab == s.baseline["b_tab"].get<int>() &&
+                     st.activeWorkspace == AppState::Workspace::Electronics &&
+                     st.ecadDocId == s.baseline["b_id"] && st.docMirror.docId() == s.part &&
+                     !s.baseline.contains("callback"),
+                     {{"active_tab", st.activeTab}, {"ecad_doc", st.ecadDocId},
+                      {"mirror_doc", st.docMirror.docId()}, {"fixture", s.baseline}})) return;
+        shoot("parked_b_before_callback"); uxNext(5103, 0); return;
+    case 5103: {
+        if (st.rpc.busy() || !s.baseline.contains("callback")) return;
+        const auto& tab = st.docTabs[s.partTab];
+        const auto* session = tab.session.get();
+        const bool cachedGeometry = session && uxCachedMeshWidth(session->cachedDocMesh, 42.0f);
+        if (!cachedGeometry && pipingNow() - s.stepStart < 3.0) return;
+        const auto snap = session ? session->cachedMirror : core::DocMirrorSnapshot{};
+        const auto tree = snap.valid() ? snap.tree() : nlohmann::json::object();
+        double length = std::numeric_limits<double>::quiet_NaN();
+        if (tree.is_object() && tree.contains("features") && tree["features"].is_array())
+            for (const auto& feature : tree["features"])
+                if (feature.is_object() && feature.value("id", "") == s.box)
+                    length = uxNumber(feature.value("params", nlohmann::json::object())
+                                      .value("length", nlohmann::json()));
+        const auto callback = s.baseline["callback"];
+        if (!uxCheck("parked_mutation_updates_hidden_a_without_stealing_b",
+                     callback.value("ok", false) && session && snap.valid() &&
+                     snap.docId == s.part && snap.revision == s.baseline["a_revision"].get<int>() + 1 &&
+                     session->cachedRevision == snap.revision && std::abs(length - 42.0) < 1e-6 &&
+                     !session->cachedAicmPath.empty() && cachedGeometry && tab.dirty &&
+                     st.activeTab == s.baseline["b_tab"].get<int>() &&
+                     st.activeWorkspace == AppState::Workspace::Electronics &&
+                     st.ecadDocId == s.baseline["b_id"] &&
+                     st.docTabs[st.activeTab].dirty == s.baseline["b_dirty"] &&
+                     st.showViewport == s.baseline["b_show_viewport"] &&
+                     st.bodyVisible == s.baseline["b_visible"].get<std::vector<uint8_t>>() &&
+                     st.meshGen() == s.baseline["b_mesh_gen"].get<uint64_t>(),
+                     {{"callback", callback}, {"parked_tree", tree},
+                      {"parked_revision", snap.revision}, {"parked_dirty", tab.dirty},
+                      {"cached_geometry_current", cachedGeometry},
+                      {"active_tab", st.activeTab}, {"active_ecad", st.ecadDocId},
+                      {"mesh_gen", st.meshGen()}, {"fixture", s.baseline}})) return;
+        shoot("parked_b_after_callback"); uxNext(5104, 0); return;
+    }
+    case 5104:
+        st.switchToTab(s.partTab);
+        uxNext(5105, 8); return;
+    case 5105: {
+        if (st.rpc.busy()) return;
+        bool currentGeometry = false;
+        nlohmann::json boxes = nlohmann::json::array();
+        for (const auto& item : st.bodyBBoxCache) {
+            boxes.push_back({{"body", item.first}, {"bounds", item.second}});
+            currentGeometry = currentGeometry || std::abs((item.second[3] - item.second[0]) - 42.0f) < 0.02f;
+        }
+        if (!currentGeometry && pipingNow() - s.stepStart < 3.0) return;
+        const auto mass = uxMass(st);
+        if (!uxCheck("parked_return_restores_updated_geometry",
+                     st.activeTab == s.partTab && st.docMirror.docId() == s.part &&
+                     st.docMirror.revision() == s.baseline["a_revision"].get<int>() + 1 &&
+                     st.docTabs[s.partTab].dirty && st.hasDocMesh && currentGeometry &&
+                     uxSolid(mass) && std::abs(mass.value("volume_mm3", 0.0) - 25200.0) < 0.01,
+                     {{"tree", st.docMirror.tree()}, {"bbox", boxes}, {"mass", mass},
+                      {"active_tab", st.activeTab}, {"fixture", s.baseline}})) return;
+        uxRegressionDone("parked_mutation", 5200); return;
+    }
+    case 5200: {
+        st.shotWorkspacePin = -1;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.workspaceDir = std::filesystem::absolute(s.dir).string();
+        if (!uxNewBox(st, "Mechanical A")) return;
+        s.partTab = st.activeTab;
+        s.part = st.docMirror.docId();
+        s.feature = s.box;
+        const std::string aPath = (std::filesystem::absolute(s.dir) / "parked_mechanical_a.step+").string();
+        if (!uxCheck("parked_mechanical_a_saved", st.docMirror.save(st.worker, aPath, error),
+                     {{"error", error}})) return;
+        st.markSaved(st.docMirror.docId(), st.docMirror.revision(), aPath);
+        const int aRevision = st.docMirror.revision();
+        if (!uxNewBox(st, "Mechanical B")) return;
+        const std::string bFeature = s.box;
+        const auto edited = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "edit_feature"}, {"id", bFeature},
+             {"params", {{"length", 30.0}, {"width", 20.0}, {"height", 10.0}}}}
+        }));
+        const std::string bPath = (std::filesystem::absolute(s.dir) / "parked_mechanical_b.step+").string();
+        const bool loaded = edited.ok && !edited.aicm_path.empty() &&
+                            st.loadDocMesh(edited.aicm_path, error);
+        const bool saved = loaded && st.docMirror.save(st.worker, bPath, error);
+        if (!uxCheck("parked_mechanical_b_fixture", saved, {{"status", edited.feature_status},
+                     {"error", edited.error_message}, {"detail", error}})) return;
+        st.markSaved(st.docMirror.docId(), st.docMirror.revision(), bPath);
+        s.baseline = {{"a_id", s.part}, {"a_feature", s.feature}, {"a_revision", aRevision},
+                      {"b_id", st.docMirror.docId()}, {"b_feature", bFeature}, {"b_tab", st.activeTab},
+                      {"b_tree", st.docMirror.tree()}, {"b_revision", st.docMirror.revision()},
+                      {"b_status", st.docMirror.featureStatus()}};
+        st.leftPaneTab = AppState::LP_FeatureManager;
+        uxNext(5201, 8); return;
+    }
+    case 5201:
+        if (uxClickFeatureRow("Mechanical B")) uxNext(5202, 0);
+        return;
+    case 5202:
+        if (!uxCheck("parked_mechanical_b_real_selection",
+                     st.selectedFeatureId == s.baseline["b_feature"],
+                     {{"selected", st.selectedFeatureId}, {"feature", s.baseline["b_feature"]}})) return;
+        st.switchToTab(s.partTab);
+        uxNext(5203, 8); return;
+    case 5203: {
+        if (st.rpc.busy()) return;
+        bool oldGeometry = false;
+        for (const auto& item : st.bodyBBoxCache)
+            oldGeometry = oldGeometry || std::abs((item.second[3] - item.second[0]) - 40.0f) < 0.02f;
+        if (!uxCheck("parked_mechanical_a_original", st.activeTab == s.partTab &&
+                     st.docMirror.docId() == s.part && oldGeometry && !st.docTabs[s.partTab].dirty,
+                     {{"tree", st.docMirror.tree()}, {"dirty", st.docTabs[s.partTab].dirty}})) return;
+        const std::string aFeature = s.baseline.value("a_feature", std::string());
+        st.docMirror.applyOpsAsync(st.rpc, st.worker, nlohmann::json::array({
+            {{"op", "edit_feature"}, {"id", aFeature}, {"params", {{"length", 42.0}}}}
+        }), [&st, &s](const core::OpsResponse& result, bool current) {
+            s.baseline["callback"] = {{"ok", result.ok}, {"current", current},
+                                      {"revision", result.revision}, {"mesh", result.aicm_path},
+                                      {"error", result.error_message}};
+            if (current && result.ok && st.isActiveMirrorDoc() && !result.aicm_path.empty())
+                st.loadDocMeshAsync(result.aicm_path);
+        });
+        st.switchToTab(s.baseline["b_tab"].get<int>());
+        s.baseline["b_mesh_gen"] = st.meshGen();
+        s.baseline["b_visible"] = st.bodyVisible;
+        bool bGeometry = false;
+        for (const auto& item : st.bodyBBoxCache)
+            bGeometry = bGeometry || std::abs((item.second[3] - item.second[0]) - 30.0f) < 0.02f;
+        if (!uxCheck("parked_mechanical_b_warm_before_callback",
+                     st.activeTab == s.baseline["b_tab"].get<int>() &&
+                     st.docMirror.docId() == s.baseline["b_id"] && bGeometry &&
+                     st.selectedFeatureId == s.baseline["b_feature"] && !s.baseline.contains("callback"),
+                     {{"tree", st.docMirror.tree()}, {"selection", st.selectedFeatureId},
+                      {"fixture", s.baseline}})) return;
+        shoot("parked_mechanical_b_before_callback"); uxNext(5204, 0); return;
+    }
+    case 5204: {
+        if (st.rpc.busy() || !s.baseline.contains("callback")) return;
+        const auto& tab = st.docTabs[s.partTab];
+        const auto* session = tab.session.get();
+        const bool cachedGeometry = session && uxCachedMeshWidth(session->cachedDocMesh, 42.0f);
+        if (!cachedGeometry && pipingNow() - s.stepStart < 3.0) return;
+        const auto snap = session ? session->cachedMirror : core::DocMirrorSnapshot{};
+        const auto tree = snap.valid() ? snap.tree() : nlohmann::json::object();
+        double length = std::numeric_limits<double>::quiet_NaN();
+        if (tree.is_object() && tree.contains("features") && tree["features"].is_array())
+            for (const auto& feature : tree["features"])
+                if (feature.is_object() && feature.value("id", "") == s.baseline["a_feature"])
+                    length = uxNumber(feature.value("params", nlohmann::json::object())
+                                      .value("length", nlohmann::json()));
+        bool bGeometry = false;
+        nlohmann::json boxes = nlohmann::json::array();
+        for (const auto& item : st.bodyBBoxCache) {
+            boxes.push_back({{"body", item.first}, {"bounds", item.second}});
+            bGeometry = bGeometry || std::abs((item.second[3] - item.second[0]) - 30.0f) < 0.02f;
+        }
+        const auto callback = s.baseline["callback"];
+        if (!uxCheck("parked_mechanical_a_cached_b_unchanged",
+                     callback.value("ok", false) && session && snap.valid() &&
+                     snap.docId == s.part && snap.revision == s.baseline["a_revision"].get<int>() + 1 &&
+                     session->cachedRevision == snap.revision && std::abs(length - 42.0) < 1e-6 &&
+                     !session->cachedAicmPath.empty() && cachedGeometry && tab.dirty &&
+                     st.activeTab == s.baseline["b_tab"].get<int>() &&
+                     st.docMirror.docId() == s.baseline["b_id"] &&
+                     st.docMirror.revision() == s.baseline["b_revision"] &&
+                     st.docMirror.tree() == s.baseline["b_tree"] &&
+                     st.docMirror.featureStatus() == s.baseline["b_status"] &&
+                     st.selectedFeatureId == s.baseline["b_feature"] && bGeometry &&
+                     st.bodyVisible == s.baseline["b_visible"].get<std::vector<uint8_t>>() &&
+                     st.meshGen() == s.baseline["b_mesh_gen"].get<uint64_t>(),
+                     {{"callback", callback}, {"parked_tree", tree}, {"parked_revision", snap.revision},
+                      {"cached_geometry_current", cachedGeometry}, {"b_tree", st.docMirror.tree()},
+                      {"b_selection", st.selectedFeatureId}, {"b_bbox", boxes}, {"fixture", s.baseline}}))
+            return;
+        shoot("parked_mechanical_b_after_callback"); uxNext(5205, 0); return;
+    }
+    case 5205:
+        st.switchToTab(s.partTab);
+        s.baseline["return_without_rpc"] = !st.rpc.busy();
+        uxNext(5206, 8); return;
+    case 5206: {
+        if (st.rpc.busy()) return;
+        bool geometry = false;
+        nlohmann::json boxes = nlohmann::json::array();
+        for (const auto& item : st.bodyBBoxCache) {
+            boxes.push_back({{"body", item.first}, {"bounds", item.second}});
+            geometry = geometry || std::abs((item.second[3] - item.second[0]) - 42.0f) < 0.02f;
+        }
+        if (!geometry && pipingNow() - s.stepStart < 3.0) return;
+        const auto mass = uxMass(st);
+        if (!uxCheck("parked_mechanical_return_uses_updated_cache",
+                     s.baseline.value("return_without_rpc", false) && st.activeTab == s.partTab &&
+                     st.docMirror.docId() == s.part &&
+                     st.docMirror.revision() == s.baseline["a_revision"].get<int>() + 1 &&
+                     st.docTabs[s.partTab].dirty && geometry && uxSolid(mass) &&
+                     std::abs(mass.value("volume_mm3", 0.0) - 25200.0) < 0.01,
+                     {{"tree", st.docMirror.tree()}, {"bbox", boxes}, {"mass", mass},
+                      {"fixture", s.baseline}})) return;
+        uxNext(5210, 0); return;
+    }
+    case 5210:
+        st.switchToTab(s.baseline["b_tab"].get<int>());
+        uxNext(5211, 8); return;
+    case 5211: {
+        if (st.rpc.busy()) return;
+        const auto blend = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "fillet"}, {"name", "Parked draft fillet"},
+                {"params", {{"type", "constant"}, {"radius", 2.0}}},
+                {"refs", {{"edges", {{"of", "edge"}, {"parallel", "z"}}}}}}}}
+        }));
+        s.secondary = blend.id_map.is_object() ? blend.id_map.value("$0", std::string()) : "";
+        const auto status = uxStatus(blend.feature_status, s.secondary);
+        const bool loaded = blend.ok && !blend.aicm_path.empty() &&
+                            st.loadDocMesh(blend.aicm_path, error);
+        const auto mass = uxMass(st);
+        if (!uxCheck("parked_pm_b_fixture",
+                     loaded && !s.secondary.empty() && status.is_object() && status.value("ok", false) &&
+                     uxSolid(mass) && mass.value("volume_mm3", 0.0) < 6000.0 &&
+                     st.docTabs[st.activeTab].dirty,
+                     {{"tree", st.docMirror.tree()}, {"status", status}, {"mass", mass},
+                      {"error", blend.error_message}, {"mesh_error", error}})) return;
+        uxNext(5212); return;
+    }
+    case 5212:
+        // B's box was selected by the earlier real tree click and restored on this tab.
+        // A second click on that same row would be a real deselect.
+        if (!uxCheck("parked_pm_b_restored_selection",
+                     st.selectedFeatureId == s.baseline["b_feature"],
+                     {{"selection", st.selectedFeatureId}, {"feature", s.baseline["b_feature"]}})) return;
+        uxNext(52121, 0); return;
+    case 52121:
+        if (uxRightClickFeatureRow("Parked draft fillet")) uxNext(52122, 0);
+        return;
+    case 52122:
+        if (uxClick("Edit", "##Popup_")) uxNext(5213, 0);
+        return;
+    case 5213:
+        if (!uxCheck("parked_pm_b_open",
+                     st.selectedFeatureId == s.baseline["b_feature"] &&
+                     pm()->active() && pm()->activeFormType() == "fillet" &&
+                     pm()->targetId() == s.secondary,
+                     {{"selection", st.selectedFeatureId}, {"fixture_fillet", s.secondary},
+                      {"form", pm()->activeFormType()}, {"target", pm()->targetId()}})) return;
+        uxNext(5214); return;
+    case 5214:
+        if (!idle()) return;
+        if (uxTypeDim("fillet", "radius", "not-a-dimension", true)) uxNext(5215, 0);
+        return;
+    case 5215:
+        if (s.input.key(ImGuiKey_Enter)) uxNext(52151, 0);
+        return;
+    case 52151:
+        if (uxFieldClick("fillet", "radius", "##dim")) uxNext(5216, 0);
+        return;
+    case 5216:
+        if (!uxTypedDimension("fillet", "radius", "not-a-dimension", false)) return;
+        if (!uxCheck("parked_pm_b_invalid_draft",
+                     pm()->active() && pm()->activeFormType() == "fillet" &&
+                     pm()->targetId() == s.secondary && pm()->previewError().empty() &&
+                     uxInlineError() && st.docTabs[st.activeTab].dirty &&
+                     st.selectedFeatureId == s.baseline["b_feature"],
+                     {{"form", pm()->activeFormType()}, {"target", pm()->targetId()},
+                      {"tree", st.docMirror.tree()}, {"items", ui::audit::observedItems()}})) return;
+        s.background = {{"b_tree", st.docMirror.tree()}, {"b_status", st.docMirror.featureStatus()},
+                        {"b_revision", st.docMirror.revision()}, {"b_dirty", st.docTabs[st.activeTab].dirty},
+                        {"b_selection", st.selectedFeatureId}, {"b_bounds", uxVisibleBounds(st)},
+                        {"b_visibility", st.bodyVisible}, {"b_target", pm()->targetId()},
+                        {"b_pm", static_cast<uint64_t>(reinterpret_cast<uintptr_t>(pm()))},
+                        {"barrier", nullptr}};
+        st.switchToTab(s.partTab);
+        uxNext(5217, 8); return;
+    case 5217:
+        if (st.rpc.busy()) return;
+        if (!uxCheck("parked_pm_a_origin", st.docMirror.docId() == s.part &&
+                     uxFeature(st, s.feature),
+                     {{"tree", st.docMirror.tree()}, {"feature", s.feature}})) return;
+        uxNext(52171, 0); return;
+    case 52171:
+        if (uxRightClickFeatureRow("Mechanical A")) uxNext(52172, 0);
+        return;
+    case 52172:
+        if (uxClick("Edit", "##Popup_")) uxNext(52173, 0);
+        return;
+    case 52173:
+        if (!uxCheck("parked_pm_a_open",
+                     st.docMirror.docId() == s.part && pm()->active() &&
+                     pm()->activeFormType() == "box" && pm()->targetId() == s.feature,
+                     {{"tree", st.docMirror.tree()}, {"feature", s.feature},
+                      {"form", pm()->activeFormType()}, {"target", pm()->targetId()}})) return;
+        uxNext(5218); return;
+    case 5218:
+        if (!idle()) return;
+        if (uxTypeDim("box", "length", "48mm", true)) {
+            s.background["a_revision"] = st.docMirror.revision();
+            st.rpc.callCoalesced("doc_tree", {{"doc_id", s.part}},
+                [&s](const core::RpcResult& result) {
+                    s.background["barrier"] = {{"ok", result.ok}, {"result", result.result},
+                                                {"error", result.err}};
+                }, "uxquality-parked-pm-barrier", 15000, 12000);
+            uxNext(5219, 0);
+        }
+        return;
+    case 5219:
+        if (clickOk()) uxNext(5220, 0);
+        return;
+    case 5220:
+        if (!uxCheck("parked_pm_a_real_apply_queued",
+                     pm()->active() && pm()->acceptPending() && st.rebuildsInFlight > 0 &&
+                     st.rpc.interactionBusy() && s.background["barrier"].is_null() &&
+                     st.docMirror.revision() == s.background["a_revision"],
+                     {{"accept_pending", pm()->acceptPending()}, {"rebuilds_queued", st.rebuildsInFlight},
+                      {"fixture", s.background}})) return;
+        st.switchToTab(s.baseline["b_tab"].get<int>());
+        uxNext(5221, 4); return;
+    case 5221:
+        if (uxFieldClick("fillet", "radius", "##dim")) uxNext(5222, 0);
+        return;
+    case 5222:
+        if (!uxTypedDimension("fillet", "radius", "not-a-dimension", false)) return;
+        if (!uxCheck("parked_pm_b_restored_before_a_callback",
+                     s.background["barrier"].is_null() && st.rebuildsInFlight > 0 &&
+                     st.activeTab == s.baseline["b_tab"].get<int>() &&
+                     st.docMirror.docId() == s.baseline["b_id"] &&
+                     st.docMirror.revision() == s.background["b_revision"] &&
+                     st.docMirror.tree() == s.background["b_tree"] &&
+                     st.docMirror.featureStatus() == s.background["b_status"] &&
+                     st.docTabs[st.activeTab].dirty == s.background["b_dirty"] &&
+                     st.selectedFeatureId == s.background["b_selection"] &&
+                     st.hasDocMesh && uxVisibleBounds(st) == s.background["b_bounds"] &&
+                     st.bodyVisible == s.background["b_visibility"].get<std::vector<uint8_t>>() &&
+                     static_cast<uint64_t>(reinterpret_cast<uintptr_t>(pm())) ==
+                         s.background["b_pm"].get<uint64_t>() &&
+                     pm()->active() && pm()->activeFormType() == "fillet" &&
+                     pm()->targetId() == s.background["b_target"].get<std::string>() &&
+                     pm()->previewError().empty() && uxInlineError(),
+                     {{"fixture", s.background}, {"tree", st.docMirror.tree()},
+                      {"bounds", uxVisibleBounds(st)}, {"items", ui::audit::observedItems()}})) return;
+        s.background["b_mesh_gen"] = st.meshGen();
+        uxNext(5223, 0); return;
+    case 5223: {
+        if (st.rpc.busy() || st.rebuildsInFlight) return;
+        const double now = pipingNow();
+        // The 12-second FIFO barrier precedes this response; start the prewarm deadline
+        // only after the callback drained and its background mesh parse was scheduled.
+        if (!s.background.contains("cache_wait_started")) s.background["cache_wait_started"] = now;
+        const auto& tab = st.docTabs[s.partTab];
+        const auto* session = tab.session.get();
+        const auto snap = session ? session->cachedMirror : core::DocMirrorSnapshot{};
+        const bool cachedGeometry = session && uxCachedMeshWidth(session->cachedDocMesh, 48.0f);
+        const bool cacheReady = session && snap.valid() && session->cachedRevision == snap.revision &&
+                                !session->cachedAicmPath.empty() && !tab.meshCacheInvalidated &&
+                                cachedGeometry;
+        if (!cacheReady && now - s.background["cache_wait_started"].get<double>() < 3.0) return;
+        const auto cachedTree = snap.valid() ? snap.tree() : nlohmann::json::object();
+        nlohmann::json native;
+        const bool readNative = st.worker.call("doc_tree", {{"doc_id", s.part}}, native, error, 15000);
+        const auto nativeTree = native.is_object() ? native.value("tree", nlohmann::json()) : nlohmann::json();
+        auto lengthIn = [&](const nlohmann::json& tree) {
+            if (tree.is_object() && tree.contains("features") && tree["features"].is_array())
+                for (const auto& feature : tree["features"])
+                    if (feature.is_object() && feature.value("id", std::string()) == s.feature)
+                        return uxNumber(feature.value("params", nlohmann::json::object())
+                                            .value("length", nlohmann::json()));
+            return std::numeric_limits<double>::quiet_NaN();
+        };
+        const auto* field = uxField("fillet", "radius", "##dim");
+        const ImGuiID id = field ? field->value("id", ImGuiID(0)) : 0;
+        const auto* input = id ? ImGui::GetInputTextState(id) : nullptr;
+        const std::string buffer = input && input->TextA.Data ? input->TextA.Data : "";
+        if (!uxCheck("parked_pm_callback_preserves_b_and_updates_a",
+                     s.background["barrier"].is_object() && s.background["barrier"].value("ok", false) &&
+                     session && snap.valid() && snap.docId == s.part &&
+                     snap.revision == s.background["a_revision"].get<int>() + 1 &&
+                     session->cachedRevision == snap.revision && cacheReady &&
+                     std::abs(lengthIn(cachedTree) - 48.0) < 1e-6 &&
+                     readNative && native.value("revision", -1) == snap.revision &&
+                     std::abs(lengthIn(nativeTree) - 48.0) < 1e-6 &&
+                     st.activeTab == s.baseline["b_tab"].get<int>() &&
+                     st.docMirror.docId() == s.baseline["b_id"] &&
+                     st.docMirror.revision() == s.background["b_revision"] &&
+                     st.docMirror.tree() == s.background["b_tree"] &&
+                     st.docMirror.featureStatus() == s.background["b_status"] &&
+                     st.docTabs[st.activeTab].dirty == s.background["b_dirty"] &&
+                     st.selectedFeatureId == s.background["b_selection"] &&
+                     st.hasDocMesh && uxVisibleBounds(st) == s.background["b_bounds"] &&
+                     st.bodyVisible == s.background["b_visibility"].get<std::vector<uint8_t>>() &&
+                     st.meshGen() == s.background["b_mesh_gen"].get<uint64_t>() &&
+                     static_cast<uint64_t>(reinterpret_cast<uintptr_t>(pm())) ==
+                         s.background["b_pm"].get<uint64_t>() &&
+                     pm()->active() && pm()->activeFormType() == "fillet" &&
+                     pm()->targetId() == s.background["b_target"].get<std::string>() &&
+                     pm()->previewError().empty() &&
+                     !pm()->acceptPending() && uxInlineError() &&
+                     id && ImGui::GetCurrentContext()->ActiveId == id && buffer == "not-a-dimension",
+                     {{"fixture", s.background}, {"cached_tree", cachedTree}, {"native", native},
+                      {"native_error", error}, {"cached_geometry", cachedGeometry},
+                      {"cache_ready", cacheReady}, {"cache_invalidated", tab.meshCacheInvalidated},
+                      {"cache_revision", session ? session->cachedRevision : -1},
+                      {"cached_path", session ? session->cachedAicmPath : ""},
+                      {"cache_wait_seconds", now - s.background["cache_wait_started"].get<double>()},
+                      {"b_tree", st.docMirror.tree()}, {"b_bounds", uxVisibleBounds(st)},
+                      {"b_input", buffer}, {"items", ui::audit::observedItems()}})) return;
+        shoot("parked_pm_b_after_callback"); uxNext(5224, 0); return;
+    }
+    case 5224:
+        if (clickCancel()) uxNext(5225, 0);
+        return;
+    case 5225:
+        if (!idle() || pm()->active()) return;
+        if (!uxCheck("parked_pm_b_cancel_keeps_document",
+                     st.docMirror.tree() == s.background["b_tree"] &&
+                     st.docMirror.revision() == s.background["b_revision"] &&
+                     st.docTabs[st.activeTab].dirty == s.background["b_dirty"],
+                     {{"tree", st.docMirror.tree()}, {"fixture", s.background}})) return;
+        uxRegressionDone("parked_mechanical", 5300); return;
+    case 5300: {
+        st.shotWorkspacePin = -1;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.workspaceDir = std::filesystem::absolute(s.dir).string();
+        if (!uxNewBox(st, "Piping footer part")) return;
+        s.partTab = st.activeTab;
+        s.part = st.docMirror.docId();
+        nlohmann::json list, schematic, partTree;
+        const bool listed = st.worker.call("sim_study_list", {{"doc_id", s.part}}, list, error, 15000);
+        const bool readPart = st.worker.call("doc_tree", {{"doc_id", s.part}}, partTree, error, 15000);
+        const bool created = st.worker.call("ecad_new", {{"kind", "sch"}}, schematic, error, 15000);
+        if (!uxCheck("piping_footer_real_empty_documents",
+                     listed && list.is_object() &&
+                     list.value("studies", nlohmann::json()).is_array() && list["studies"].empty() &&
+                     readPart && partTree.is_object() && partTree.value("tree", nlohmann::json()).is_object() &&
+                     partTree.value("revision", -1) == st.docMirror.revision() &&
+                     created && schematic.is_object() && !schematic.contains("code") &&
+                     !schematic.value("doc_id", std::string()).empty() &&
+                     schematic.value("tree", nlohmann::json()).is_object() &&
+                     schematic.value("revision", -1) >= 0,
+                     {{"studies", list}, {"part", partTree}, {"schematic", schematic}, {"error", error}})) return;
+        s.baseline = {{"schematic", schematic["doc_id"]}, {"schematic_tree", schematic["tree"]},
+                      {"schematic_revision", schematic["revision"]}, {"studies_before", list},
+                      {"part_tree", partTree["tree"]}, {"part_revision", partTree["revision"]}};
+        s.background = nlohmann::json::object();
+        st.addEcadTab("sch", schematic.value("doc_id", std::string()),
+                      schematic.value("revision", 0), "Piping footer schematic");
+        s.baseline["ecad_tab"] = st.activeTab;
+        // Let the new tab's genuine ECAD focus request finish before navigating away.
+        uxNext(53001, 8); return;
+    }
+    case 53001:
+        if (uxClick("##ws_2", "##MainMenuBar",
+                    st.wantFocusEcad <= 0 && st.activeWorkspace == AppState::Workspace::Electronics))
+            uxNext(53002, 8);
+        return;
+    case 53002:
+        if (uxClick("Piping", "##RibbonBar")) uxNext(53003, 4);
+        return;
+    case 53003: {
+        const auto availability = ui::commandAvailability("sim_piping_solve", ui::commandContext(st));
+        const auto* item = uxRibbonItem("sim_piping_solve");
+        if (!uxCheck("piping_footer_open_panel_action", st.simManager &&
+                     st.activeWorkspace == AppState::Workspace::Simulate &&
+                     st.activeTab == s.baseline["ecad_tab"] && st.ecadDocId == s.baseline["schematic"] &&
+                     availability.visible && availability.enabled && item && item->value("visible", false) &&
+                     item->value("enabled", true),
+                     {{"reason", availability.reason ? availability.reason : ""},
+                      {"item", item ? *item : nlohmann::json()}})) return;
+        uxNext(53004, 0); return;
+    }
+    case 53004:
+        if (uxClickItem("sim_piping_solve", "##RibbonBar",
+                        [&]() { return uxRibbonItem("sim_piping_solve"); }))
+            uxNext(53005, 8);
+        return;
+    case 53005:
+        if (!uxCheck("piping_footer_panel_open_in_invalid_context",
+                     st.simManager && st.simManager->piping().isOpen() &&
+                     st.activeWorkspace == AppState::Workspace::Simulate &&
+                     st.activeTab == s.baseline["ecad_tab"] &&
+                     st.ecadDocId == s.baseline["schematic"],
+                     {{"sidebar", st.simSidebarTab}})) return;
+        uxNext(st.simSidebarTab == 1 ? 5301 : 53006, 0); return;
+    case 53006:
+        if (uxClickRail("##sim_tabstrip", "simM")) uxNext(5301, 4);
+        return;
+    case 5301:
+        if (uxClickPipingNetworkTab()) uxNext(5302, 8);
+        return;
+    case 5302: {
+        const auto availability = ui::commandAvailability("sim_piping_new", ui::commandContext(st));
+        const nlohmann::json* button = nullptr;
+        for (const auto& item : ui::audit::observedItems())
+            if (shotLabel(item, "New network") && item.value("visible", false) &&
+                !item.value("text_only", true) && !item.value("enabled", true)) {
+                button = &item; break;
+            }
+        if (!uxCheck("piping_footer_invalid_context_disabled",
+                     st.simManager && st.simManager->piping().isOpen() &&
+                     !st.simManager->piping().network().is_object() &&
+                     st.activeTab == s.baseline["ecad_tab"] && st.ecadDocId == s.baseline["schematic"] &&
+                     availability.visible && !availability.enabled &&
+                     availability.reason && availability.reason[0] && button,
+                     {{"reason", availability.reason ? availability.reason : ""},
+                      {"button", button ? *button : nlohmann::json()},
+                      {"items", ui::audit::observedItems()}})) return;
+        s.baseline["reason"] = availability.reason;
+        s.baseline["disabled_button"] = *button;
+        s.baseline["reason_hover_frames"] = 0;
+        uxNext(5303, 0); return;
+    }
+    case 5303: {
+        const ImVec2 point = shotPoint(s.baseline["disabled_button"]);
+        ImGui::GetIO().AddMousePosEvent(point.x, point.y);
+        const int frames = s.baseline.value("reason_hover_frames", 0);
+        s.baseline["reason_hover_frames"] = frames + 1;
+        if (frames < 4) return;
+        const int textVertices = uxTooltipTextVertices();
+        const bool reasonRendered = uxTooltipContains(s.baseline["reason"].get<std::string>());
+        if (!uxCheck("piping_footer_disabled_reason_visible", reasonRendered && textVertices >= 4,
+                     {{"reason", s.baseline["reason"]}, {"rendered_reason", reasonRendered},
+                      {"tooltip_text_vertices", textVertices}, {"windows", ui::audit::observedWindows()}})) return;
+        uxNext(5304, 0); return;
+    }
+    case 5304:
+        if (uxTryActivate("disabled-piping-footer", "New network", nullptr,
+                          [&]() { return &s.baseline["disabled_button"]; }, true, false, 0,
+                          "click disabled footer")) uxNext(5305, 8);
+        return;
+    case 5305: {
+        if (st.rpc.busy()) return;
+        nlohmann::json list, partTree, schematic;
+        const bool listed = st.worker.call("sim_study_list", {{"doc_id", s.part}}, list, error, 15000);
+        const bool readPart = st.worker.call("doc_tree", {{"doc_id", s.part}}, partTree, error, 15000);
+        const bool readSchematic = st.worker.call("ecad_tree", {{"doc_id", s.baseline["schematic"]}},
+                                                  schematic, error, 15000);
+        if (!uxCheck("piping_footer_disabled_click_no_mutation",
+                     listed && list == s.baseline["studies_before"] &&
+                     readPart && partTree.is_object() &&
+                     partTree.value("tree", nlohmann::json()) == s.baseline["part_tree"] &&
+                     partTree.value("revision", -1) == s.baseline["part_revision"] &&
+                     readSchematic && schematic.is_object() &&
+                     schematic.value("tree", nlohmann::json()) == s.baseline["schematic_tree"] &&
+                     schematic.value("revision", -1) == s.baseline["schematic_revision"] &&
+                     st.activeTab == s.baseline["ecad_tab"] &&
+                     st.ecadDocId == s.baseline["schematic"] &&
+                     st.simManager && !st.simManager->piping().network().is_object(),
+                     {{"studies", list}, {"part", partTree}, {"schematic", schematic}, {"error", error}})) return;
+        st.switchToTab(s.partTab);
+        uxNext(53051, 8); return;
+    }
+    case 53051:
+        if (uxClickItem("sim_piping_solve", "##RibbonBar",
+                        [&]() { return uxRibbonItem("sim_piping_solve"); },
+                        !st.rpc.busy() && st.activeTab == s.partTab && st.docMirror.docId() == s.part))
+            uxNext(5306, 8);
+        return;
+    case 5306:
+        if (uxClickPipingNetworkTab()) uxNext(5307, 8);
+        return;
+    case 5307: {
+        if (st.rpc.busy()) return;
+        const auto availability = ui::commandAvailability("sim_piping_new", ui::commandContext(st));
+        if (!availability.enabled) return; // normal manager tick refreshes the active part's list
+        if (!uxCheck("piping_footer_valid_empty_context",
+                     st.activeTab == s.partTab && st.docMirror.docId() == s.part &&
+                     st.simManager && !st.simManager->piping().network().is_object() &&
+                     shotItem("New network") != nullptr,
+                     {{"items", ui::audit::observedItems()}})) return;
+        uxNext(5308, 0); return;
+    }
+    case 5308:
+        if (uxClick("New network")) uxNext(5309, 8);
+        return;
+    case 5309: {
+        if (st.rpc.busy()) return;
+        nlohmann::json list, schematic;
+        const bool listed = st.worker.call("sim_study_list", {{"doc_id", s.part}}, list, error, 15000);
+        const bool readSchematic = st.worker.call("ecad_tree", {{"doc_id", s.baseline["schematic"]}},
+                                                  schematic, error, 15000);
+        nlohmann::json found;
+        if (list.is_object())
+            for (const auto& item : list.value("studies", nlohmann::json::array()))
+                if (item.is_object() && item.value("type", std::string()) == "piping_network") found = item;
+        const auto params = found.is_object() ? found.value("params", nlohmann::json::object())
+                                              : nlohmann::json::object();
+        const auto network = params.is_object() ? params.value("piping", nlohmann::json())
+                                                : nlohmann::json();
+        if (!uxCheck("piping_footer_created_in_origin_without_stealing_view",
+                     listed && list.is_object() &&
+                     list.value("studies", nlohmann::json()).is_array() && list["studies"].size() == 1 &&
+                     found.is_object() && !found.value("id", std::string()).empty() &&
+                     network.is_object() && network.value("schema", std::string()) == "aicad.piping/1" &&
+                     !network.value("id", std::string()).empty() &&
+                     network.value("runs", nlohmann::json()).is_array() && network["runs"].empty() &&
+                     network.value("fittings", nlohmann::json()).is_array() && network["fittings"].empty() &&
+                     readSchematic && schematic.is_object() &&
+                     schematic.value("tree", nlohmann::json()) == s.baseline["schematic_tree"] &&
+                     schematic.value("revision", -1) == s.baseline["schematic_revision"] &&
+                     s.background.value("switched", false) &&
+                     s.background.value("interaction_busy_after_click", false) && !st.rpc.interactionBusy() &&
+                     st.activeTab == s.baseline["ecad_tab"] && st.ecadDocId == s.baseline["schematic"],
+                     {{"studies", list}, {"schematic", schematic}, {"error", error},
+                      {"fixture", s.baseline}, {"background", s.background}})) return;
+        s.baseline["network_id"] = found["id"];
+        s.baseline["network"] = network;
+        st.switchToTab(s.partTab);
+        uxNext(5310, 8); return;
+    }
+    case 5310: {
+        if (st.rpc.busy() || st.activeTab != s.partTab || st.docMirror.docId() != s.part) return;
+        const std::string path = (std::filesystem::absolute(s.dir) / "piping_footer.step+").string();
+        nlohmann::json opened, list;
+        const bool saved = st.docMirror.save(st.worker, path, error);
+        const bool reopened = saved && st.worker.call("doc_open", {{"path", path}}, opened, error, 15000);
+        const std::string doc = opened.is_object() ? opened.value("doc_id", std::string()) : "";
+        const bool listed = !doc.empty() && st.worker.call("sim_study_list", {{"doc_id", doc}}, list, error, 15000);
+        nlohmann::json found;
+        if (list.is_object())
+            for (const auto& item : list.value("studies", nlohmann::json::array()))
+                if (item.is_object() && item.value("id", std::string()) == s.baseline["network_id"])
+                    found = item;
+        if (!uxCheck("piping_footer_saved_network_roundtrip",
+                     listed && doc != s.part && found.is_object() &&
+                     found.value("type", std::string()) == "piping_network" &&
+                     found.value("params", nlohmann::json::object()).is_object() &&
+                     found["params"].value("piping", nlohmann::json()) == s.baseline["network"] &&
+                     st.activeTab == s.partTab && st.docMirror.docId() == s.part,
+                     {{"opened", opened}, {"studies", list}, {"error", error}})) return;
+        uxRegressionDone("piping_footer", 0); return;
+    }
+    default:
+        uxCheck("unexpected_step", false, {{"step", s.step}});
+        return;
+    }
+}
+
+bool uxQualityEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, bool& done) {
+    auto& s = g_ux;
+    if (!s.want) return false;
+    ++st.frame;
+    // Switch after the real tree action submitted its RPC, but before the next
+    // frame's normal callback drain. No worker reply or currentness is injected.
+    if (s.step == 4902 && !s.background.value("switched", false) && st.rebuildsInFlight > 0) {
+        s.background["submitted_doc"] = st.docMirror.docId();
+        st.switchToTab(s.partTab);
+        s.background["switched"] = true;
+        s.background["active_after_switch"] = st.activeTab;
+        s.background["mirror_after_switch"] = st.docMirror.docId();
+    }
+    // Preserve the real footer gesture and park its origin after submission, before
+    // the next frame drains the network-creation callback.
+    if (s.step == 5308 && s.input.phase >= 3 &&
+        !s.background.value("switched", false) && st.rpc.interactionBusy()) {
+        s.background["interaction_busy_after_click"] = true;
+        st.switchToTab(s.baseline["ecad_tab"].get<int>());
+        s.background["switched"] = true;
+    }
+    if (st.propertyManager && st.propertyManager->active()) {
+        s.sawAcceptPending = s.sawAcceptPending || st.propertyManager->acceptPending();
+        s.sawPreviewPending = s.sawPreviewPending || st.propertyManager->previewPending();
+        s.sawPendingTogether = s.sawPendingTogether ||
+            (st.propertyManager->acceptPending() && st.propertyManager->previewPending());
+    }
+    if (!s.capture.empty()) {
+        const std::string path = s.capture;
+        const bool wrote = writeBackbufferPng(path.c_str(), dw, dh, s.done ? screenshotPath : nullptr);
+        s.capture.clear();
+        if (wrote) s.report["captures"].push_back(path);
+        else {
+            s.failed = s.done = true;
+            s.report["ok"] = false;
+            s.report["failure"] = {{"name", "capture_write"}, {"path", path}, {"step", s.step}};
+        }
+    }
+    swapScenarioFrame(st.win);
+    done = s.done;
+    if (done) {
+        std::ofstream out(s.dir + "/report.json", std::ios::trunc);
+        out << s.report.dump(2) << '\n';
+        out.close();
+        if (!out || s.failed) {
+            core::framestats::flushReport();
+            std::fflush(nullptr);
+            std::_Exit(EXIT_FAILURE);
+        }
+    }
+    return true;
+}
+
+// Real OpenSCAD renderer + editor actions; this scenario never supplies synthetic geometry.
+struct ScadEditShot {
+    bool init = false, want = false, done = false, failed = false, expectUnavailable = false;
+    int step = 0, textPhase = 0, revision = -1, settle = 0, sourceTab = -1, otherTab = -1;
+    int saveResult = -1;
+    double started = 0;
+    SceneShotInput input;
+    std::string dir, path, doc, feature, otherDoc, otherFeature, datum, capture, openPath;
+    nlohmann::json report, beforeBox, nativeFeatures, otherDatums, openDocs;
+    std::size_t openTabCount = 0;
+    uint64_t openGeneration = 0;
+    std::unordered_map<uint32_t, std::array<float, 6>> otherBounds;
+};
+ScadEditShot g_scadEdit;
+
+bool scadEditCheck(const char* name, bool ok, const nlohmann::json& evidence) {
+    auto& s = g_scadEdit;
+    s.report["checks"].push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
+    if (!ok) {
+        s.failed = s.done = true;
+        s.report["failure"] = {{"name", name}, {"step", s.step},
+                               {"items", ui::audit::observedItems()},
+                               {"navigation", shotNavigationEvidence()}};
+        s.capture = s.dir + "/FAILED.png";
+    }
+    return ok;
+}
+
+void scadEditTick(AppState& st) {
+    auto& s = g_scadEdit;
+    if (!s.init) {
+        s.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        s.want = st.shot && mode && std::strcmp(mode, "scad_edit") == 0;
+        if (!s.want) return;
+        const char* out = std::getenv("CHUDWARE_SCAD_EDIT_OUT");
+        s.dir = out ? out : "scratch/scad_edit";
+        std::error_code ec;
+        std::filesystem::create_directories(s.dir, ec);
+        s.path = (std::filesystem::absolute(s.dir) / "source.step+").string();
+        const char* missing = std::getenv("CHUDWARE_SCAD_EXPECT_UNAVAILABLE");
+        s.expectUnavailable = missing && std::strcmp(missing, "1") == 0;
+        s.started = pipingNow();
+        s.report = {{"scenario", "scad_edit"}, {"ok", false},
+                    {"checks", nlohmann::json::array()}, {"captures", nlohmann::json::array()}};
+        if (ec) { scadEditCheck("output_directory", false, {{"error", ec.message()}}); return; }
+    }
+    if (!s.want || s.done) return;
+    ui::audit::observedItems();
+    if (pipingNow() - s.started > 300) {
+        scadEditCheck("timeout", false, {{"step", s.step}}); return;
+    }
+    if (!st.workerStarted || st.frame < 5 || !s.capture.empty()) return;
+    if (s.settle > 0) { --s.settle; return; }
+    auto advance = [&](int step) { s.step = step; s.settle = 8; };
+    auto click = [&](const char* label) {
+        if (s.input.phase) return s.input.click(s.input.point);
+        const auto* item = shotItem(label, true, "SCAD Editor");
+        if (!item) { shotScrollTo(label, "SCAD Editor", true); return false; }
+        return s.input.click(shotPoint(*item));
+    };
+    auto scoped = [&](const char* outer, const char* field, const char* primitive) -> const nlohmann::json* {
+        const auto* w = ImGui::FindWindowByName("SCAD Editor");
+        if (!w) return nullptr;
+        ImGuiID id = w->ID;
+        if (outer) id = ImHashStr(outer, 0, id);
+        id = ImHashStr(field, 0, id);
+        id = ImHashStr(primitive, 0, id);
+        for (const auto& item : ui::audit::observedItems())
+            if (item.value("id", ImGuiID(0)) == id &&
+                item.value("window", std::string()) == "SCAD Editor" &&
+                item.value("enabled", true)) return &item;
+        return nullptr;
+    };
+    auto clickScoped = [&](const char* outer, const char* field, const char* primitive) {
+        if (s.input.phase) return s.input.click(s.input.point);
+        const auto* item = scoped(outer, field, primitive);
+        if (!item || !item->value("visible", false)) {
+            const char* seek = outer ? outer : "mm per source unit";
+            shotScrollTo(item ? primitive : seek, "SCAD Editor", true, item); return false;
+        }
+        return s.input.click(shotPoint(*item));
+    };
+    auto clickAny = [&](const char* label) {
+        if (s.input.phase) return s.input.click(s.input.point);
+        const auto* item = shotItem(label);
+        return item && s.input.click(shotPoint(*item));
+    };
+    auto number = [&](const char* outer, const char* field, const char* text) {
+        auto& io = ImGui::GetIO();
+        if (s.textPhase == 0) {
+            if (!clickScoped(outer, field, "##v")) return false;
+            s.textPhase = 1; return false;
+        }
+        if (s.textPhase == 1) { io.AddKeyEvent(ImGuiMod_Ctrl, true); io.AddKeyEvent(ImGuiKey_A, true); }
+        if (s.textPhase == 2) { io.AddKeyEvent(ImGuiKey_A, false); io.AddKeyEvent(ImGuiMod_Ctrl, false); }
+        if (s.textPhase == 3) io.AddInputCharactersUTF8(text);
+        if (s.textPhase == 4) io.AddKeyEvent(ImGuiKey_Enter, true);
+        if (s.textPhase == 5) io.AddKeyEvent(ImGuiKey_Enter, false);
+        if (++s.textPhase < 7) return false;
+        s.textPhase = 0; return true;
+    };
+    auto type = [&](const char* label, const char* text) {
+        ImGuiIO& io = ImGui::GetIO();
+        if (s.textPhase == 0) {
+            if (!click(label)) return false;
+            s.textPhase = 1; return false;
+        }
+        if (s.textPhase == 1) { io.AddKeyEvent(ImGuiMod_Ctrl, true); io.AddKeyEvent(ImGuiKey_A, true); }
+        if (s.textPhase == 2) { io.AddKeyEvent(ImGuiKey_A, false); io.AddKeyEvent(ImGuiMod_Ctrl, false); }
+        if (s.textPhase == 3) io.AddInputCharactersUTF8(text);
+        if (++s.textPhase < 5) return false;
+        s.textPhase = 0; return true;
+    };
+    auto params = [&]() -> nlohmann::json {
+        const auto& tree = st.docMirror.tree();
+        if (tree.contains("features") && tree["features"].is_array())
+            for (const auto& f : tree["features"])
+                if (f.value("id", std::string()) == s.feature) return f.value("params", nlohmann::json::object());
+        return nlohmann::json::object();
+    };
+    auto bbox = [&](const std::string& doc) {
+        nlohmann::json r; std::string error;
+        if (!st.worker.call("doc_bbox", {{"doc_id", doc}}, r, error, 60000))
+            return nlohmann::json{{"error", error}};
+        return r;
+    };
+    auto boxIs = [](const nlohmann::json& b, double xmin, double xmax, double ymax, double zmax) {
+        if (!b.contains("min") || !b.contains("max") || !b["min"].is_array() ||
+            !b["max"].is_array() || b["min"].size() != 3 || b["max"].size() != 3) return false;
+        return std::fabs(b["min"][0].get<double>() - xmin) < 0.05 &&
+               std::fabs(b["max"][0].get<double>() - xmax) < 0.05 &&
+               std::fabs(b["max"][1].get<double>() - ymax) < 0.05 &&
+               std::fabs(b["max"][2].get<double>() - zmax) < 0.05;
+    };
+    const char* original = "size=10;\ninclude <shape.scad>\ndifference() { union() { for(i=[0:1]) translate([0,i*10,0]) plate(size); } translate([2,2,-1]) cube([2,2,6]); }\n";
+    const char* changed = "size=10;\ninclude <shape.scad>\ntranslate([2,0,0]) difference() { union() { for(i=[0:1]) translate([0,i*10,0]) plate(size); } translate([2,2,-1]) cube([2,2,6]); }\n";
+    // Real renderer work with many boolean cuts keeps the operation in flight across the tab switch.
+    const char* slow = "size=10;\ninclude <shape.scad>\ndifference() { union() { for(i=[0:1]) translate([0,i*10,0]) plate(size); } for(i=[0:31]) translate([1+i*0.35,2,-1]) cylinder(r=0.1,h=6,$fn=24); }\n";
+    std::string err;
+    switch (s.step) {
+    case 0: {
+        if (st.rpc.busy()) return;
+        nlohmann::json capability;
+        const bool capOk = st.worker.call("scad_status", nlohmann::json::object(), capability, err, 60000);
+        s.report["renderer_capability"] = capOk ? capability : nlohmann::json{{"error", err}};
+        if (!scadEditCheck("capability_query", capOk, s.report["renderer_capability"])) return;
+        if (s.expectUnavailable) {
+            if (!scadEditCheck("renderer_really_missing", !capability.value("renderer_available", true) &&
+                               !capability.value("available", true) &&
+                               !capability.value("error", std::string()).empty(), capability)) return;
+            if (!scadEditCheck("missing_renderer_baseline_part", st.docMirror.newPart(st.worker, err),
+                               {{"error", err}})) return;
+            st.clearViewportForNewDoc(); st.addDocTab(false);
+            s.otherDoc = st.docMirror.docId(); s.otherTab = st.activeTab;
+            const auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+                {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Selected box"},
+                    {"params", {{"length", 12.0}, {"width", 9.0}, {"height", 6.0}, {"centered", true}}}}}}}));
+            s.otherFeature = r.id_map.value("$0", std::string());
+            if (!scadEditCheck("missing_renderer_baseline_box", r.ok && !s.otherFeature.empty() &&
+                               !r.aicm_path.empty(), {{"error", r.error_message}})) return;
+            st.loadDocMeshAsync(r.aicm_path, false, true, true);
+            advance(181); return;
+        }
+        if (!scadEditCheck("new_part", st.docMirror.newPart(st.worker, err), {{"error", err}})) return;
+        st.clearViewportForNewDoc(); st.addDocTab(false); s.doc = st.docMirror.docId(); s.sourceTab = st.activeTab;
+        ui::openNewScadEditor(st);
+        advance(90); return;
+    }
+    case 90: {
+        if (st.rpc.busy()) return;
+        if (!scadEditCheck("new_editor_visible", shotItem("##scad_source", false, "SCAD Editor") != nullptr,
+                           {{"items", ui::audit::observedItems()}})) return;
+        s.capture = s.dir + "/00_new_editor.png"; advance(91); return;
+    }
+    case 91: {
+        if (st.rpc.busy()) return;
+        nlohmann::json p = {{"source", original}, {"files", nlohmann::json::array({
+            {{"path", "shape.scad"}, {"data_b64", "bW9kdWxlIHBsYXRlKHcpIHsgbGluZWFyX2V4dHJ1ZGUoaGVpZ2h0PTQpIHNxdWFyZShbdywgMTBdKTsgfQo="}}})},
+            {"parameters", nlohmann::json::object()},
+            {"parameter_schema", nlohmann::json::array({{{"name", "size"}, {"kind", "length"}}})},
+            {"mm_per_source_unit", 2.0}};
+        const auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "scad"}, {"name", "SCAD fixture"},
+                {"params", p}, {"refs", nlohmann::json::object()}}}}}));
+        s.feature = r.id_map.value("$0", std::string());
+        const auto b = bbox(s.doc);
+        if (!scadEditCheck("real_renderer_fixture", r.ok && !s.feature.empty() &&
+                !r.aicm_path.empty() && r.revision > 0 && boxIs(b, 0, 20, 40, 8),
+                {{"status", r.feature_status}, {"error", r.error_message}, {"bbox", b}})) return;
+        st.loadDocMeshAsync(r.aicm_path, false, true, true);
+        st.selectedFeatureId = s.feature;
+        ui::openScadEditor(st, s.doc, s.feature);
+        advance(100); return;
+    }
+    case 100:
+        if (st.rpc.busy()) return;
+        s.capture = s.dir + "/01_source.png"; advance(109); return;
+    case 109:
+        if (click("Renderer availability and installation")) advance(110);
+        return;
+    case 110:
+        if (click("Recheck renderer")) advance(101);
+        return;
+    case 101:
+        if (clickScoped(nullptr, "source_unit", "##combo")) advance(102);
+        return;
+    case 102:
+        if (clickAny("cm")) advance(103);
+        return;
+    case 103:
+        if (st.rpc.busy()) return;
+        if (number(nullptr, "source_factor", "2")) advance(104);
+        return;
+    case 104:
+        if (st.rpc.busy()) return;
+        if (click("Refresh parameter controls")) advance(105);
+        return;
+    case 105:
+        if (st.rpc.busy()) return;
+        if (shotItem("Number", false, "SCAD Editor")) {
+            if (click("Number")) advance(107);
+        } else if (clickScoped("size", "kind", "##combo")) advance(106);
+        return;
+    case 106:
+        if (clickAny("Number")) advance(107);
+        return;
+    case 107:
+        if (st.rpc.busy()) return;
+        if (shotItem("Length (mm)", false, "SCAD Editor")) {
+            if (click("Length (mm)")) advance(1);
+        } else if (clickScoped("size", "kind", "##combo")) advance(108);
+        return;
+    case 108:
+        if (clickAny("Length (mm)")) advance(1);
+        return;
+    case 1:
+        if (st.rpc.busy()) return;
+        if (type("##scad_source", changed)) advance(2);
+        return;
+    case 2:
+        if (click("Apply / Rebuild")) advance(3);
+        return;
+    case 3: {
+        if (st.rpc.busy() || st.rebuildsInFlight) return;
+        const auto b = bbox(s.doc);
+        if (!scadEditCheck("source_edit_same_feature", params().value("source", std::string()) == changed &&
+                st.selectedFeatureId == s.feature && boxIs(b, 4, 24, 40, 8),
+                {{"params", params()}, {"feature", st.selectedFeatureId}, {"bbox", b}})) return;
+        s.capture = s.dir + "/02_source_applied.png"; advance(4); return;
+    }
+    case 4: {
+        // Resolve the exact size/value/##v ID, not the last numeric field on screen.
+        if (number("size", "value", "30")) advance(5);
+        return;
+    }
+    case 5:
+        if (click("Apply / Rebuild")) advance(6);
+        return;
+    case 6: {
+        if (st.rpc.busy() || st.rebuildsInFlight) return;
+        const auto b = bbox(s.doc);
+        if (!scadEditCheck("typed_length_same_feature",
+                params().value("parameters", nlohmann::json::object()).value("size", 0.0) == 30.0 &&
+                st.selectedFeatureId == s.feature && boxIs(b, 4, 34, 40, 8),
+                {{"params", params()}, {"feature", st.selectedFeatureId}, {"bbox", b}})) return;
+        s.revision = st.docMirror.revision(); s.beforeBox = b;
+        s.capture = s.dir + "/03_parameter_applied.png"; advance(7); return;
+    }
+    case 7:
+        if (type("##scad_source", "this is invalid SCAD {{{")) advance(8);
+        return;
+    case 8:
+        if (click("Apply / Rebuild")) advance(9);
+        return;
+    case 9: {
+        if (st.rpc.busy() || st.rebuildsInFlight) return;
+        const nlohmann::json* diagnostic = nullptr;
+        for (const auto& item : ui::audit::observedItems())
+            if (item.value("window", std::string()) == "SCAD Editor" &&
+                item.value("text_only", false) &&
+                item.value("label", std::string()).find("Rebuild rejected") != std::string::npos) {
+                diagnostic = &item; break;
+            }
+        // Observations are from the previous rendered frame; the async completion can
+        // arrive after that frame. Wait for the actual rejection, bounded by scenario timeout.
+        if (!diagnostic) return;
+        if (diagnostic && (!diagnostic->value("visible", false) ||
+            (*diagnostic)["full_rect"][1].get<float>() < (*diagnostic)["clip"][1].get<float>() ||
+            (*diagnostic)["full_rect"][1].get<float>() + ImGui::GetTextLineHeight() >
+                (*diagnostic)["clip"][3].get<float>())) {
+            shotScrollTo("Diagnostics", "SCAD Editor", false, diagnostic); return;
+        }
+        const auto b = bbox(s.doc);
+        if (!scadEditCheck("invalid_source_preserves_model", st.docMirror.revision() == s.revision &&
+                params().value("source", std::string()) == changed && b == s.beforeBox && diagnostic,
+                {{"revision", st.docMirror.revision()}, {"params", params()}, {"bbox", b},
+                 {"rendered_items", ui::audit::observedItems()}})) return;
+        s.capture = s.dir + "/04_diagnostics.png"; advance(10); return;
+    }
+    case 10:
+        if (click("Revert draft")) advance(11);
+        return;
+    case 11: {
+        if (st.rpc.busy()) return;
+        st.docTabs[st.activeTab].path = s.path;
+        s.saveResult = -1;
+        s.step = 111;
+        ui::saveDocTab(st, st.activeTab, false, [&s](ui::TabSaveResult result) {
+            s.saveResult = static_cast<int>(result);
+        });
+        return;
+    }
+    case 111: {
+        if (st.rpc.busy() || s.saveResult < 0) return;
+        if (!scadEditCheck("save_native", s.saveResult == static_cast<int>(ui::TabSaveResult::Saved),
+                           {{"path", s.path}, {"result", s.saveResult}})) return;
+        if (!scadEditCheck("reopen_native", st.docMirror.open(st.worker, s.path, err),
+                           {{"error", err}})) return;
+        st.addDocTab(false); s.doc = st.docMirror.docId(); s.sourceTab = st.activeTab;
+        const auto b = bbox(s.doc);
+        if (!scadEditCheck("source_and_scale_restored",
+                params().value("source", std::string()) == changed &&
+                params().value("mm_per_source_unit", 0.0) == 2.0 &&
+                params().value("parameters", nlohmann::json::object()).value("size", 0.0) == 30.0 &&
+                params().value("files", nlohmann::json::array()).size() == 1 &&
+                st.docMirror.lastOpenedCacheHit() && st.docMirror.lastOpenedWarm() && boxIs(b, 4, 34, 40, 8),
+                {{"params", params()}, {"cache_hit", st.docMirror.lastOpenedCacheHit()},
+                 {"warm", st.docMirror.lastOpenedWarm()}, {"bbox", b}})) return;
+        s.revision = st.docMirror.revision();
+        ui::openScadEditor(st, s.doc, s.feature);
+        s.capture = s.dir + "/05_reopened.png"; advance(12); return;
+    }
+    case 12:
+        if (st.rpc.busy()) return;
+        if (click("Convert managed code to native")) advance(13);
+        return;
+    case 13: {
+        if (st.rpc.busy() || st.rebuildsInFlight) return;
+        const nlohmann::json* rejection = nullptr;
+        for (const auto& item : ui::audit::observedItems())
+            if (item.value("window", std::string()) == "SCAD Editor" &&
+                item.value("text_only", false) &&
+                item.value("label", std::string()).find("managed native graph cannot be restored") != std::string::npos) {
+                rejection = &item; break;
+            }
+        // The RPC callback precedes the next rendered observation.
+        if (!rejection) return;
+        if (!rejection->value("visible", false)) {
+            shotScrollTo("Diagnostic", "SCAD Editor", false, rejection); return;
+        }
+        const auto b = bbox(s.doc);
+        if (!scadEditCheck("unmanaged_conversion_rejected",
+                st.docMirror.revision() == s.revision &&
+                params().value("source", std::string()) == changed && boxIs(b, 4, 34, 40, 8),
+                {{"params", params()}, {"bbox", b}, {"diagnostic", *rejection}})) return;
+        s.capture = s.dir + "/05b_unmanaged_conversion_rejected.png"; advance(14); return;
+    }
+    case 14: {
+        if (st.rpc.busy()) return;
+        if (!scadEditCheck("other_new_part", st.docMirror.newPart(st.worker, err), {{"error", err}})) return;
+        st.clearViewportForNewDoc(); st.addDocTab(false); s.otherDoc = st.docMirror.docId(); s.otherTab = st.activeTab;
+        const auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Selected box"},
+                {"params", {{"length", {{"value", 12.0}, {"expr", nullptr}}},
+                            {"width", {{"value", 9.0}, {"expr", nullptr}}},
+                            {"height", {{"value", 6.0}, {"expr", nullptr}}}, {"centered", true}}}}}}}));
+        s.otherFeature = r.id_map.value("$0", std::string());
+        if (!scadEditCheck("other_box", r.ok && !s.otherFeature.empty() && !r.aicm_path.empty(),
+                           {{"status", r.feature_status}, {"error", r.error_message}})) return;
+        s.nativeFeatures = st.docMirror.tree().value("features", nlohmann::json::array());
+        st.loadDocMeshAsync(r.aicm_path, false, true, true);
+        st.selectedFeatureId = s.otherFeature;
+        ui::openScadConversion(st);
+        advance(15); return;
+    }
+    case 15:
+        if (st.rpc.busy()) return;
+        if (click("Convert native to code")) advance(16);
+        return;
+    case 16: {
+        if (st.rpc.busy() || st.rebuildsInFlight) return;
+        const auto tree = st.docMirror.tree();
+        std::string projected;
+        if (tree.contains("features") && tree["features"].is_array())
+            for (const auto& f : tree["features"])
+                if (f.value("type", std::string()) == "scad") projected = f.value("id", std::string());
+        if (!scadEditCheck("native_to_managed_code", !projected.empty(),
+                           {{"tree", tree}, {"bbox", bbox(s.otherDoc)}})) return;
+        ui::openScadEditor(st, s.otherDoc, projected);
+        s.capture = s.dir + "/06_managed_projection.png"; advance(17); return;
+    }
+    case 17:
+        if (st.rpc.busy()) return;
+        if (click("Convert managed code to native")) advance(18);
+        return;
+    case 18: {
+        if (st.rpc.busy() || st.rebuildsInFlight) return;
+        const auto tree = st.docMirror.tree();
+        bool restored = false;
+        if (tree.contains("features") && tree["features"].is_array())
+            for (const auto& f : tree["features"])
+                if (f.value("id", std::string()) == s.otherFeature && f.value("type", std::string()) == "box")
+                    restored = true;
+        if (!scadEditCheck("managed_code_to_native", restored &&
+                           tree.value("features", nlohmann::json::array()) == s.nativeFeatures,
+                           {{"tree", tree}, {"bbox", bbox(s.otherDoc)}})) return;
+        advance(181); return;
+    }
+    case 181: {
+        if (st.rpc.busy()) return;
+        const auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "plane"}, {"name", "Selected datum"},
+                {"params", {{"method", "offset"}, {"offset", 17.0}}},
+                {"refs", {{"base", "plane.top"}}}}}}}));
+        s.datum = r.id_map.value("$0", std::string());
+        const auto datums = st.docMirror.refDatums();
+        bool found = false;
+        if (datums.is_array()) for (const auto& d : datums)
+            if (d.is_object() && d.value("id", std::string()) == s.datum) found = true;
+        if (!scadEditCheck("selected_datum_created", r.ok && !s.datum.empty() && found,
+                           {{"status", r.feature_status}, {"error", r.error_message}, {"datums", datums}})) return;
+        if (!r.aicm_path.empty()) st.loadDocMeshAsync(r.aicm_path, false, true, true);
+        st.selectedFeatureId = s.datum;
+        advance(180); return;
+    }
+    case 180:
+        if (!st.hasDocMesh || st.bodyBBoxCache.empty()) return;
+        s.otherBounds = st.bodyBBoxCache;
+        s.otherDatums = st.docMirror.refDatums();
+        if (s.expectUnavailable) { advance(23); return; }
+        st.switchToTab(s.sourceTab); advance(19); return;
+    case 19:
+        if (st.rpc.busy()) return;
+        ui::openScadEditor(st, s.doc, s.feature);
+        advance(20); return;
+    case 20:
+        if (st.rpc.busy()) return;
+        if (type("##scad_source", slow)) advance(21);
+        return;
+    case 21:
+        if (s.input.phase == 3 && st.rebuildsInFlight > 0) {
+            // Switch after the real button release, while the mutation is still in flight.
+            s.input.phase = 0;
+            st.switchToTab(s.otherTab); advance(22); return;
+        }
+        click("Apply / Rebuild");
+        return;
+    case 22: {
+        if (st.rpc.busy() || st.rebuildsInFlight) return;
+        const auto b = bbox(s.doc);
+        if (!scadEditCheck("background_completion_keeps_selection",
+                st.docMirror.docId() == s.otherDoc && st.activeTab == s.otherTab &&
+                st.selectedFeatureId == s.datum && st.hasDocMesh &&
+                st.docMirror.refDatums() == s.otherDatums &&
+                st.bodyBBoxCache == s.otherBounds && boxIs(b, 0, 30, 40, 8),
+                {{"active_doc", st.docMirror.docId()}, {"expected_doc", s.otherDoc},
+                 {"selected_feature", st.selectedFeatureId}, {"expected_feature", s.datum},
+                 {"datums", st.docMirror.refDatums()}, {"expected_datums", s.otherDatums},
+                 {"visible_mesh_unchanged", st.bodyBBoxCache == s.otherBounds}, {"background_bbox", b}})) return;
+        s.capture = s.dir + "/07_background_selection.png"; advance(23); return;
+    }
+    case 23: {
+        if (st.rpc.busy() || st.rebuildsInFlight) return;
+        const auto docs = st.docMirror.list(st.worker, err);
+        if (!scadEditCheck("snapshot_before_failed_open", err.empty() && docs.is_array() &&
+                           st.docMirror.docId() == s.otherDoc && st.selectedFeatureId == s.datum &&
+                           st.docMirror.refDatums() == s.otherDatums,
+                           {{"error", err}, {"doc", st.docMirror.docId()}})) return;
+        std::set<std::string> ids;
+        for (const auto& d : docs) if (d.is_object()) ids.insert(d.value("doc_id", std::string()));
+        s.openDocs = ids;
+        s.openTabCount = st.docTabs.size();
+        s.openGeneration = st.docMirror.mutationGen();
+        const char* name = s.expectUnavailable ? "missing_renderer.scad" : "invalid_source.scad";
+        s.openPath = (std::filesystem::absolute(s.dir) / name).string();
+        std::ofstream fixture(s.openPath, std::ios::binary | std::ios::trunc);
+        fixture << (s.expectUnavailable ? "cube([10, 10, 10]);\n" : "this is invalid SCAD {{{\n");
+        fixture.close();
+        if (!scadEditCheck("write_failed_open_fixture", bool(fixture), {{"path", s.openPath}})) return;
+        if (!scadEditCheck("failed_open_started", ui::featureTreeOpenPath(st, s.openPath),
+                           {{"path", s.openPath}})) return;
+        advance(24); return;
+    }
+    case 24: {
+        if (st.rpc.busy() || st.rebuildsInFlight) return;
+        std::string failure;
+        const std::string name = std::filesystem::path(s.openPath).filename().string();
+        {
+            std::lock_guard<std::mutex> lock(st.logMtx);
+            for (const auto& line : st.log)
+                if (line.find("[err] open: Open failed: " + name) != std::string::npos) failure = line;
+        }
+        if (failure.empty()) return;
+        const auto docs = st.docMirror.list(st.worker, err);
+        std::set<std::string> ids;
+        for (const auto& d : docs) if (d.is_object()) ids.insert(d.value("doc_id", std::string()));
+        if (!scadEditCheck(s.expectUnavailable ? "missing_renderer_open_is_atomic" : "invalid_scad_open_is_atomic",
+                           err.empty() && (!s.expectUnavailable || failure.find("OpenSCAD") != std::string::npos) &&
+                           nlohmann::json(ids) == s.openDocs &&
+                           st.docTabs.size() == s.openTabCount && st.activeTab == s.otherTab &&
+                           st.docMirror.docId() == s.otherDoc && st.selectedFeatureId == s.datum &&
+                           st.docMirror.mutationGen() == s.openGeneration &&
+                           st.docMirror.refDatums() == s.otherDatums && st.hasDocMesh &&
+                           st.bodyBBoxCache == s.otherBounds,
+                           {{"error", failure}, {"list_error", err}, {"docs_before", s.openDocs},
+                            {"docs_after", ids}, {"tabs_before", s.openTabCount},
+                            {"tabs_after", st.docTabs.size()}, {"active_doc", st.docMirror.docId()},
+                            {"generation_before", s.openGeneration}, {"generation_after", st.docMirror.mutationGen()},
+                            {"selected_feature", st.selectedFeatureId}, {"datums", st.docMirror.refDatums()},
+                            {"visible_mesh_unchanged", st.bodyBBoxCache == s.otherBounds}})) return;
+        s.capture = s.dir + "/08_failed_open.png";
+        s.report["ok"] = true; s.done = true; return;
+    }
+    }
+}
+
+bool scadEditEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, bool& done) {
+    auto& s = g_scadEdit;
+    if (!s.want) return false;
+    ++st.frame;
+    if (!s.capture.empty()) {
+        const bool saved = writeBackbufferPng(s.capture.c_str(), dw, dh, s.done ? screenshotPath : nullptr);
+        s.report["captures"].push_back({{"path", s.capture}, {"written", saved}});
+        if (!saved) {
+            s.failed = s.done = true;
+            s.report["ok"] = false;
+            s.report["failure"] = {{"name", "screenshot_write"}, {"path", s.capture}};
+        }
+        s.capture.clear();
+    }
+    swapScenarioFrame(st.win);
+    done = s.done;
+    if (done) {
+        std::ofstream out(s.dir + "/report.json", std::ios::trunc);
+        out << s.report.dump(2) << '\n'; out.close();
+        if (s.failed || !out) {
+            core::framestats::flushReport(); std::fflush(nullptr); std::_Exit(EXIT_FAILURE);
+        }
     }
     return true;
 }
@@ -3547,7 +12430,7 @@ struct SimAuditShot {
     bool init = false, want = false, done = false, failed = false, motionOk = false;
     int setup = 0, stage = 0, settle = 0, sub = 0, captureWait = 0, idleFrames = 0, shotNo = 0;
     int lastRibbonTab = -1, auditFrames = 4, maxFrames = 240, totalConflicts = 0, totalOverflows = 0;
-    int motionStudiesBefore = 0;
+    int studyBefore = 0;
     double waitStart = 0.0, subStart = 0.0, t0 = 0.0;
     size_t idx = 0;
     std::string dir, capture, queued, note, asmDoc;
@@ -4080,10 +12963,21 @@ void saBuildSteps(SimAuditShot& A) {
             A.subStart = pipingNow();
             return SaEnter::Again;
         }
-        if (sm.topologyCapabilities().state == State::Loading && pipingNow() - A.subStart < 30.0)
+        if (A.sub == 1) {
+            if (sm.topologyCapabilities().state == State::Loading && pipingNow() - A.subStart < 30.0)
+                return SaEnter::Again;
+            if (st.rpc.busy() && pipingNow() - A.subStart < 30.0) return SaEnter::Again;
+            A.studyBefore = sm.studyCount();
+            saRun(st, sm, topoTab, "sim_new_topology");
+            A.sub = 2;
+            A.subStart = pipingNow();
             return SaEnter::Again;
-        if (st.rpc.busy() && pipingNow() - A.subStart < 30.0) return SaEnter::Again;
-        saRun(st, sm, topoTab, "sim_new_topology");
+        }
+        if (st.rpc.busy() && pipingNow() - A.subStart < kSaIdleTimeoutS) return SaEnter::Again;
+        if (st.rpc.busy() || sm.studyCount() != A.studyBefore + 1) {
+            A.note = "topology study not created: " + st.status;
+            return SaEnter::Done;
+        }
         A.topoStructId = sm.activeStudyId();
         if (sm.topologyCapabilities().state != State::Ready)
             A.note = "topology capabilities not ready: " + sm.topologyCapabilities().error;
@@ -4102,9 +12996,15 @@ void saBuildSteps(SimAuditShot& A) {
             saRun(st, sm, topoTab, "sim_topology_boundaries");
             return SaEnter::Done;
         }
-        const int before = sm.studyCount();
-        saRun(st, sm, topoTab, "sim_new_topology");
-        if (sm.studyCount() != before + 1 ||
+        if (A.sub == 0) {
+            A.studyBefore = sm.studyCount();
+            saRun(st, sm, topoTab, "sim_new_topology");
+            A.sub = 1;
+            A.subStart = pipingNow();
+            return SaEnter::Again;
+        }
+        if (st.rpc.busy() && pipingNow() - A.subStart < kSaIdleTimeoutS) return SaEnter::Again;
+        if (st.rpc.busy() || sm.studyCount() != A.studyBefore + 1 ||
             !sm.configureActiveTopology(st, {{"name", "Heat spreader topology"}, {"topology", cfg}})) {
             A.note = "thermal topology study not created: " + st.status;
             return SaEnter::Done;
@@ -4378,13 +13278,19 @@ void saBuildSteps(SimAuditShot& A) {
             A.subStart = pipingNow();
             return SaEnter::Again;
         }
-        // The assembly's own SimManager must be seated and the engine idle before newStudy.
-        if ((st.docMirror.docId() != A.asmDoc || &sm == A.partSm || st.rpc.busy()) &&
-            pipingNow() - A.subStart < kSaIdleTimeoutS)
+        if (A.sub == 1) {
+            // The assembly's own SimManager must be seated and the engine idle before newStudy.
+            if ((st.docMirror.docId() != A.asmDoc || &sm == A.partSm || st.rpc.busy()) &&
+                pipingNow() - A.subStart < kSaIdleTimeoutS)
+                return SaEnter::Again;
+            A.studyBefore = sm.studyCount();
+            saRun(st, sm, kSaTabMotion, "sim_new_motion");
+            A.sub = 2;
+            A.subStart = pipingNow();
             return SaEnter::Again;
-        const int before = sm.studyCount();
-        saRun(st, sm, kSaTabMotion, "sim_new_motion");
-        A.motionOk = sm.studyCount() == before + 1;
+        }
+        if (st.rpc.busy() && pipingNow() - A.subStart < kSaIdleTimeoutS) return SaEnter::Again;
+        A.motionOk = !st.rpc.busy() && sm.studyCount() == A.studyBefore + 1;
         if (!A.motionOk) A.note = "Motion study was not created: " + st.status;
         else sm.configureActiveMotion(st, 60.0f, 100.0f, 24);
         return SaEnter::Done;
@@ -4668,7 +13574,7 @@ bool simAuditEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, 
         A.capture.clear();
         A.captureWait = 0;
     }
-    glfwSwapBuffers(st.win);
+    swapScenarioFrame(st.win);
     breakLoop = false;
     if (A.done && A.capture.empty() && A.queued.empty()) {
         if (A.failed) A.report["ok"] = false;
@@ -4680,6 +13586,7 @@ bool simAuditEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, 
         const int idConflicts = ui::audit::idAuditFinish();  // CHUDWARE_IDAUDIT summary (0 when off)
         if (A.failed || A.totalConflicts > 0 || A.totalOverflows > 0 || idConflicts > 0) {
             std::fflush(nullptr);
+            core::framestats::flushReport();
             std::_Exit(EXIT_FAILURE);
         }
         breakLoop = true;
@@ -4696,6 +13603,7 @@ struct StudyShot {
     double stepStart = 0.0;  // start of the current bounded wait
     double lastTry = 0.0;    // last sim_run attempt
     double idleSince = 0.0;  // first moment the run was seen not running without a result (0 = n/a)
+    int studyBefore = 0;
     bool failed = false;
 };
 StudyShot g_feaShot, g_flowShot;
@@ -4711,6 +13619,7 @@ void studyShotExit(const StudyShot& S) {
     if (!S.failed) return;
     ui::audit::idAuditFinish();
     std::fflush(nullptr);
+    core::framestats::flushReport();
     std::_Exit(EXIT_FAILURE);
 }
 
@@ -5277,12 +14186,14 @@ void simInteractiveTick(AppState& st) {
     }
     case 1:
         st.simManager->handleCommand(st, "sim_new_static");
+        siGo(30001); break;
+    case 30001:
         I.study = st.simManager->activeStudyId();
         if (I.study.empty()) { siFail("new_study", st.status); return; }
         st.simManager->configureActive(st, 0.25f, "steel_1018");
         st.selection.clear();
         st.simManager->handleCommand(st, "sim_fixture");
-        siNext(); break;
+        siGo(2); break;
     case 2:
         if (st.simManager->wantsViewportFacePick(st)) {
             if (!siSeek("Picking\xe2\x80\xa6", p)) return;
@@ -5457,11 +14368,14 @@ void simInteractiveTick(AppState& st) {
         I.fidelityCase = 0;
         siGo(120); break;
     }
-    case 120: {
+    case 120:
         if (I.fidelityCase == 1) {
             st.simManager->handleCommand(st, "sim_new_fatigue");
-            I.study = st.simManager->activeStudyId();
+            siGo(30002); break;
         }
+        [[fallthrough]];
+    case 30002: {
+        if (I.fidelityCase == 1) I.study = st.simManager->activeStudyId();
         I.before = st.simManager->activeStudyDefinition();
         I.edited = I.before;
         if (I.fidelityCase == 0) I.edited["material"] = "alu_6061";
@@ -5472,7 +14386,7 @@ void simInteractiveTick(AppState& st) {
                 I.edited["fatigue"]["load_ratio"] = I.fidelityCase == 3 ? 0.2 : -0.4;
         }
         st.simManager->handleCommand(st, "sim_parameters");
-        siNext(); break;
+        siGo(121); break;
     }
     case 121:
         if (siWriteText(ui::SimManager::parameterEditorView(I.edited).dump(2))) siNext();
@@ -5512,21 +14426,24 @@ void simInteractiveTick(AppState& st) {
         if (++I.fidelityCase < 5) siGo(120);
         else {
             st.simManager->handleCommand(st, "sim_new_static");
-            I.study = st.simManager->activeStudyId();
-            I.before = st.simManager->activeStudyDefinition();
-            I.edited = I.before;
-            I.edited.erase("order");
-            I.edited["mesh_order"] = 1;
-            std::string error;
-            if (!st.simManager->configureActiveStudy(st, I.edited, error)) { siFail("alias_baseline", error); return; }
-            I.before = st.simManager->activeStudyDefinition();
-            I.edited = I.before;
-            I.edited["mesh_order"] = 2;
-            I.edited["order"] = 1; // independently added alias conflicts with edited canonical key
-            st.simManager->handleCommand(st, "sim_parameters");
-            siGo(125);
+            siGo(30003);
         }
         break;
+    }
+    case 30003: {
+        I.study = st.simManager->activeStudyId();
+        I.before = st.simManager->activeStudyDefinition();
+        I.edited = I.before;
+        I.edited.erase("order");
+        I.edited["mesh_order"] = 1;
+        std::string error;
+        if (!st.simManager->configureActiveStudy(st, I.edited, error)) { siFail("alias_baseline", error); return; }
+        I.before = st.simManager->activeStudyDefinition();
+        I.edited = I.before;
+        I.edited["mesh_order"] = 2;
+        I.edited["order"] = 1;
+        st.simManager->handleCommand(st, "sim_parameters");
+        siGo(125); break;
     }
     case 125:
         if (siWriteText(ui::SimManager::parameterEditorView(I.edited).dump(2))) siNext();
@@ -5581,6 +14498,10 @@ void simInteractiveTick(AppState& st) {
         }
         st.simManager->handleCommand(st, thermal ? "sim_new_thermal_fea" :
                                             modal ? "sim_new_modal" : "sim_new_static");
+        siGo(30009); break;
+    }
+    case 30009: {
+        const bool modal = I.fidelityCase <= 2 || I.fidelityCase == 5, thermal = I.fidelityCase == 7;
         I.study = st.simManager->activeStudyId();
         I.edited = st.simManager->activeStudyDefinition();
         I.edited["mesh_order"] = modal ? 2 : 1;
@@ -5638,7 +14559,7 @@ void simInteractiveTick(AppState& st) {
         if (!thermal) I.edited[I.fidelityCase == 1 || I.fidelityCase == 3 ? "order" : "mesh_order"] = modal ? 1 : 2;
         else I.edited["loads"][0]["ambient_c"] = 75.0;
         st.simManager->handleCommand(st, "sim_parameters");
-        siNext(); break;
+        siGo(141); break;
     }
     case 141:
         if (siWriteText(I.edited.dump(2))) siNext();
@@ -5766,6 +14687,8 @@ void simInteractiveTick(AppState& st) {
     }
     case 150:
         st.simManager->handleCommand(st, "sim_new_static");
+        siGo(30004); break;
+    case 30004:
         I.study = st.simManager->activeStudyId();
         I.edited = st.simManager->activeStudyDefinition();
         I.edited["material"] = I.staticSetup["material"];
@@ -5783,7 +14706,7 @@ void simInteractiveTick(AppState& st) {
         else
             I.edited["loads"][0]["faces"] = nlohmann::json::array({{{"facesets", {I.terminalLoad}}, {"tol_mm", 1.0}}});
         st.simManager->handleCommand(st, "sim_parameters");
-        siNext(); break;
+        siGo(151); break;
     case 151:
         if (siWriteText(I.edited.dump(2))) siNext();
         break;
@@ -6658,8 +15581,12 @@ void simInteractiveTick(AppState& st) {
         if (!check("circuit_probe_duplicate_safe", st.simManager->electronicsSetup() == I.before,
                    st.simManager->electronicsSetup())) return;
         I.capture = I.dir + "/07_native_circuit_probe.png";
-        I.afterCapture = [&I](AppState& st) {
-        st.simManager->handleCommand(st, "sim_new_thermal_fea");
+        I.afterCapture = [](AppState& state) {
+            state.simManager->handleCommand(state, "sim_new_thermal_fea");
+            siGo(30005);
+        };
+        siNext(); break;
+    case 30005:
         I.study = st.simManager->activeStudyId();
         I.edited = st.simManager->activeStudyDefinition();
         I.edited["material"] = {{"k_w_mk", 160.0}, {"cp_j_kgk", 900.0}, {"density_g_cm3", 2.7}};
@@ -6671,8 +15598,7 @@ void simInteractiveTick(AppState& st) {
         I.edited["fineness"] = 0.2;
         I.edited["mesh_order"] = 1;
         st.simManager->handleCommand(st, "sim_parameters");
-        };
-        siNext(); break;
+        siGo(31); break;
     case 31:
         if (siWriteText(I.edited.dump(2))) siNext();
         break;
@@ -6735,14 +15661,17 @@ void simInteractiveTick(AppState& st) {
                    {{"pulsed_final_max_temp_c", I.pulsedFinalC},
                     {"continuous_final_max_temp_c", continuous}, {"native_result", result}})) return;
         I.capture = I.dir + "/09_continuous_thermal_result.png";
-        I.afterCapture = [&I](AppState& st) {
-        st.simManager->handleCommand(st, "sim_new_flow");
-        st.simManager->configureActiveFlow(st, 0, 7.0f, 3.0f, 0);
-        st.simManager->handleCommand(st, "sim_flow_bc");
-        I.before = st.simManager->activeStudyDefinition();
+        I.afterCapture = [](AppState& state) {
+            state.simManager->handleCommand(state, "sim_new_flow");
+            siGo(30006);
         };
         siNext(); break;
     }
+    case 30006:
+        st.simManager->configureActiveFlow(st, 0, 7.0f, 3.0f, 0);
+        st.simManager->handleCommand(st, "sim_flow_bc");
+        I.before = st.simManager->activeStudyDefinition();
+        siGo(41); break;
     case 41:
         if (!siDragItems("-Y", "Drop direction preset", "Drop incoming-flow direction while retaining exact angles")) return;
         siNext(); break;
@@ -6752,12 +15681,15 @@ void simInteractiveTick(AppState& st) {
                    definition["flow"]["aoa"] == I.before["flow"]["aoa"] &&
                    definition["flow"]["sideslip"] == I.before["flow"]["sideslip"], definition)) return;
         I.capture = I.dir + "/10_flow_direction.png";
-        I.afterCapture = [](AppState& st) {
-        st.simManager->handleCommand(st, "sim_new_topology");
-        st.simManager->handleCommand(st, "sim_fixture");
+        I.afterCapture = [](AppState& state) {
+            state.simManager->handleCommand(state, "sim_new_topology");
+            siGo(30007);
         };
         siNext(); break;
     }
+    case 30007:
+        st.simManager->handleCommand(st, "sim_fixture");
+        siGo(43); break;
     case 43:
         if (st.simManager->wantsViewportFacePick(st)) {
             if (!siSeek("Picking\xe2\x80\xa6", p)) return;
@@ -6824,8 +15756,10 @@ void simInteractiveTick(AppState& st) {
         };
         siNext(); break;
     }
-    case 48: {
+    case 48:
         st.simManager->handleCommand(st, "sim_new_motion");
+        siGo(30008); break;
+    case 30008: {
         I.study = st.simManager->activeStudyId();
         auto definition = st.simManager->activeStudyDefinition();
         definition["motion"]["drivers"] = nlohmann::json::array({
@@ -6835,7 +15769,7 @@ void simInteractiveTick(AppState& st) {
         if (!st.simManager->configureActiveStudy(st, definition, error)) { siFail("motion_setup", error); return; }
         I.before = st.simManager->activeStudyDefinition();
         st.simManager->handleCommand(st, "sim_motion_setup");
-        siNext(); break;
+        siGo(49); break;
     }
     case 49:
         if (!siDragItems("Move Driver 2", "Move Driver 1", "Reorder second real assembly driver before first")) return;
@@ -6870,9 +15804,13 @@ bool simInteractiveEndFrame(AppState& st, int dw, int dh, const char* screenshot
     std::ofstream out(I.dir + "/report.json", std::ios::trunc);
     out << I.report.dump(2) << '\n';
     out.close();
-    glfwSwapBuffers(st.win);
+    swapScenarioFrame(st.win);
     done = I.done;
-    if (done && I.failed) { std::fflush(nullptr); std::_Exit(EXIT_FAILURE); }
+    if (done && I.failed) {
+        core::framestats::flushReport();
+        std::fflush(nullptr);
+        std::_Exit(EXIT_FAILURE);
+    }
     return true;
 }
 
@@ -7406,10 +16344,12 @@ bool pipeDrawEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, 
     }
     std::ofstream out(P.dir + "/pipedraw_report.json", std::ios::trunc);
     out << P.report.dump(2) << '\n'; out.close();
-    glfwSwapBuffers(st.win);
+    swapScenarioFrame(st.win);
     done = P.done;
     if (!out || (done && (P.failed || !P.report.value("ok", false)))) {
-        std::fflush(nullptr); std::_Exit(EXIT_FAILURE);
+        core::framestats::flushReport();
+        std::fflush(nullptr);
+        std::_Exit(EXIT_FAILURE);
     }
     return true;
 }
@@ -7776,11 +16716,3934 @@ bool copilotUiEndFrame(AppState& st, int dw, int dh, const char* screenshotPath,
         P.report["captures"].push_back(P.capture); P.capture.clear();
     }
     std::ofstream out(P.dir + "/report.json", std::ios::trunc); out << P.report.dump(2) << '\n';
-    glfwSwapBuffers(st.win);
+    swapScenarioFrame(st.win);
     done = P.done;
-    if (!out || (done && P.failed)) { std::fflush(nullptr); std::_Exit(EXIT_FAILURE); }
+    if (!out || (done && P.failed)) {
+        core::framestats::flushReport();
+        std::fflush(nullptr);
+        std::_Exit(EXIT_FAILURE);
+    }
     return true;
 }
+
+// CHUDWARE_SHOT=copilot_showcase: offline, self-checking tour of the Copilot column surfaces
+// (transcript rows, pinned queued messages, Artifacts, Sessions, Quick settings) at the default
+// and ~320 px widths and, when the theme is not fixed by CHUDWARE_THEME, in the light theme.
+// Same machinery as copilot_ui: every capture first runs the ui audit and fails on conflicts or
+// overflows in Copilot windows; report.json is rewritten whenever a check/audit/capture lands and
+// any failure exits non-zero. Nothing here talks to a network, provider or agent: the transcript
+// is built through the real event folds (feedTurnActivity / feedAskEvent), the "live" run is a
+// JobState no worker ever services, and every artifact is a real file under <out>/assets.
+struct CopilotShowcaseShot {
+    bool init = false, want = false, done = false, failed = false, began = false, dirty = false;
+    bool hold = false, popups = false, seeded = false, checked = false, lightPass = false;
+    int step = 0, settle = 0, auditStage = 0, tries = 0;
+    size_t seedCount = 0;
+    double started = 0, stepStarted = 0, holdUntil = 0;
+    float narrowWindowW = 0.0f;
+    std::string dir, assets, capture, auditName, waiting, originalTheme, deferred;
+    std::vector<std::string> files;   // iso.png, front.png, .step, bom.csv, drawing.pdf, drawing.dxf
+    ImVec2 holdPoint{0.0f, 0.0f};     // pointer parked here every frame while `hold` is set
+    SceneShotInput input;
+    nlohmann::json report = {{"scenario", "copilot_showcase"}, {"ok", false},
+                             {"checks", nlohmann::json::array()}, {"audits", nlohmann::json::array()},
+                             {"captures", nlohmann::json::array()}, {"notes", nlohmann::json::array()}};
+} g_csc;
+
+constexpr const char* kCscQueued0 = "Then export the drawing as PDF and DXF and attach the bill of materials.";
+constexpr const char* kCscQueued1 =
+    "After that, check every flange edge against the 3 mm wall minimum before anything goes to the printer.";
+
+bool cscCheck(const char* name, bool ok, const nlohmann::json& evidence = nlohmann::json::object()) {
+    auto& P = g_csc;
+    P.report["checks"].push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
+    P.dirty = true;
+    std::printf("copilot_showcase: %s %s\n", ok ? "PASS" : "FAIL", name);
+    std::fflush(stdout);
+    if (!ok) {
+        P.report["failure"] = name;
+        P.failed = P.done = true;
+        P.capture = P.dir + "/FAILED.png";
+    }
+    return ok;
+}
+
+// A check whose failure must not cost the remaining captures: it is recorded and printed now and
+// fails the run once every capture has been taken.
+bool cscDeferred(const char* name, bool ok, const nlohmann::json& evidence) {
+    auto& P = g_csc;
+    P.report["checks"].push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
+    P.dirty = true;
+    std::printf("copilot_showcase: %s %s%s\n", ok ? "PASS" : "FAIL", name, ok ? "" : " (fails the run at the end)");
+    std::fflush(stdout);
+    if (!ok && P.deferred.empty()) P.deferred = name;
+    return ok;
+}
+
+// A recorded observation that never fails the run (the report lists it under "observations").
+void cscObserve(const char* name, bool ok, const nlohmann::json& evidence) {
+    auto& P = g_csc;
+    if (!P.report.contains("observations")) P.report["observations"] = nlohmann::json::array();
+    P.report["observations"].push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
+    P.dirty = true;
+    std::printf("copilot_showcase: %s %s (observation)\n", ok ? "PASS" : "NOTE", name);
+    std::fflush(stdout);
+}
+
+bool cscRelated(const nlohmann::json& finding) {
+    const auto name = finding.value("window", std::string());
+    return name.find("Copilot") != std::string::npos || name.find("##ai_ws") != std::string::npos ||
+           name.find("##ask") != std::string::npos ||
+           (g_csc.popups && name.find("##Popup") != std::string::npos);
+}
+
+// Audit the next frames, then capture `name`.png. `keepPointer` leaves the pointer parked on
+// holdPoint (hover and open-menu captures); otherwise it leaves the window so no hover state
+// bleeds into the picture. `seconds` of ImGui time must pass first: tweens, entrance staggers and
+// async thumbnail decodes all run on it.
+void cscAudit(const char* name, bool keepPointer = false, double seconds = 0.6) {
+    auto& P = g_csc;
+    P.auditName = name;
+    P.auditStage = 1;
+    P.settle = std::max(P.settle, 6);
+    P.holdUntil = std::max(P.holdUntil, ImGui::GetTime() + seconds);
+    P.hold = keepPointer;
+    if (!keepPointer) ImGui::GetIO().AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+}
+
+// Labelled Copilot/popup items, for the report when a step cannot be completed.
+nlohmann::json cscEvidence() {
+    nlohmann::json out = nlohmann::json::array();
+    for (const auto& item : ui::audit::observedItems()) {
+        if (out.size() >= 200) break;
+        const auto window = item.value("window", std::string());
+        if (window.find("Copilot") == std::string::npos && window.find("##Popup") == std::string::npos)
+            continue;
+        out.push_back({{"label", item["label"]}, {"window", item["window"]}, {"visible", item["visible"]},
+                       {"enabled", item["enabled"]}, {"rect", item["full_rect"]}});
+    }
+    return out;
+}
+
+// Observed items called `label` (optionally inside windows whose name contains `window`), top to
+// bottom. `anyEnabled` keeps disabled controls: offline pickers are legitimately unavailable.
+std::vector<const nlohmann::json*> cscItems(const char* label, const char* window = nullptr,
+                                            bool visibleOnly = true, bool anyEnabled = false) {
+    std::vector<const nlohmann::json*> out;
+    for (const auto& item : ui::audit::observedItems()) {
+        if (!anyEnabled && !item.value("enabled", true)) continue;
+        if (!shotLabel(item, label)) continue;
+        if (window && item["window"].get_ref<const std::string&>().find(window) == std::string::npos)
+            continue;
+        if (visibleOnly) {
+            if (!item.value("visible", false)) continue;
+            const auto& r = item["rect"];
+            if (r[2].get<float>() - r[0].get<float>() < 6.0f || r[3].get<float>() - r[1].get<float>() < 6.0f)
+                continue;
+        }
+        out.push_back(&item);
+    }
+    std::stable_sort(out.begin(), out.end(), [](const nlohmann::json* a, const nlohmann::json* b) {
+        const auto& ra = (*a)["rect"];
+        const auto& rb = (*b)["rect"];
+        if (ra[1].get<float>() != rb[1].get<float>()) return ra[1].get<float>() < rb[1].get<float>();
+        return ra[0].get<float>() < rb[0].get<float>();
+    });
+    return out;
+}
+
+const nlohmann::json* cscItem(const char* label, const char* window = nullptr, size_t nth = 0,
+                              bool visibleOnly = true, bool anyEnabled = false) {
+    const auto items = cscItems(label, window, visibleOnly, anyEnabled);
+    return items.size() > nth ? items[nth] : nullptr;
+}
+
+// Click the nth visible `label` through the real pointer path (move, press, release, settle).
+bool cscClick(const char* label, const char* window = nullptr, size_t nth = 0) {
+    auto& P = g_csc;
+    if (P.input.phase > 0) return P.input.click(P.input.point);
+    const nlohmann::json* item = cscItem(label, window, nth);
+    if (!item) return false;
+    P.hold = false;
+    return P.input.click(shotPoint(*item));
+}
+
+bool cscInside(const nlohmann::json& item) {
+    const auto& r = item["full_rect"];
+    const auto& c = item["clip"];
+    return r[0].get<float>() >= c[0].get<float>() - 1.0f && r[1].get<float>() >= c[1].get<float>() - 1.0f &&
+           r[2].get<float>() <= c[2].get<float>() + 1.0f && r[3].get<float>() <= c[3].get<float>() + 1.0f;
+}
+
+bool cscApart(const nlohmann::json& a, const nlohmann::json& b) {
+    const auto& ra = a["full_rect"];
+    const auto& rb = b["full_rect"];
+    return ra[2].get<float>() <= rb[0].get<float>() + 0.5f || rb[2].get<float>() <= ra[0].get<float>() + 0.5f ||
+           ra[3].get<float>() <= rb[1].get<float>() + 0.5f || rb[3].get<float>() <= ra[1].get<float>() + 0.5f;
+}
+
+// The scrolling child of a Copilot view (the window whose name ends in `fragment` + its id).
+const nlohmann::json* cscPane(const char* fragment) {
+    const size_t length = std::strlen(fragment);
+    for (const auto& w : ui::audit::observedWindows()) {
+        const auto& name = w["window"].get_ref<const std::string&>();
+        const size_t at = name.find(fragment);
+        if (at != std::string::npos && name.find('/', at + length) == std::string::npos) return &w;
+    }
+    return nullptr;
+}
+
+// Real wheel input over the scrolling child named `fragment`, reversing at either end.
+void cscScan(const char* fragment) {
+    static int frames = 0;
+    static float direction = -1.0f;
+    const nlohmann::json* pane = cscPane(fragment);
+    if (!pane || !pane->value("wheel_enabled", false)) return;
+    const auto& p = (*pane)["wheel_point"];
+    auto& io = ImGui::GetIO();
+    io.AddMousePosEvent(p[0].get<float>(), p[1].get<float>());
+    if (pane->value("scroll_y", 0.0f) <= 0.5f) direction = -1.0f;
+    else if (pane->value("scroll_y", 0.0f) >= pane->value("scroll_max_y", 0.0f) - 0.5f) direction = 1.0f;
+    if (frames++ % 4 == 1) io.AddMouseWheelEvent(0.0f, direction);
+}
+
+// Wheel the transcript to its first row (top) or its tail; true once it sits there.
+bool cscChatWheel(bool top) {
+    const nlohmann::json* pane = cscPane("/cp_chat_");
+    if (!pane || !pane->value("wheel_enabled", false)) return false;
+    const float y = pane->value("scroll_y", 0.0f), maxY = pane->value("scroll_max_y", 0.0f);
+    if (top ? y <= 0.5f : y >= maxY - 0.5f) return true;
+    static int frames = 0;
+    const auto& p = (*pane)["wheel_point"];
+    auto& io = ImGui::GetIO();
+    io.AddMousePosEvent(p[0].get<float>(), p[1].get<float>());
+    if (frames++ % 4 == 1) io.AddMouseWheelEvent(0.0f, top ? 2.0f : -2.0f);
+    return false;
+}
+
+// The answered-question summary card is on screen (same detector as copilot_ui).
+bool cscAskSummaryVisible() {
+    for (const auto& w : ui::audit::observedWindows()) {
+        if (w.value("window", std::string()).find("##ask_done") == std::string::npos) continue;
+        const auto& r = w["rect"];
+        if (r[3].get<float>() - r[1].get<float>() > ImGui::GetTextLineHeight() * 4.0f) return true;
+    }
+    return false;
+}
+
+bool cscAskSummaryReady() {
+    if (cscAskSummaryVisible()) return true;
+    cpuiScrollTo("##ask_done");
+    return false;
+}
+
+// Visible Copilot items whose label is a status glyph (the transcript rows' check/cross marks
+// were removed; the status now lives in the row's colour and wording).
+nlohmann::json cscStatusGlyphItems() {
+    static const char* const kGlyphs[] = {"\xe2\x9c\x93", "\xe2\x9c\x94", "\xe2\x9c\x97", "\xe2\x9c\x98",
+                                          "\xe2\x9c\x95", "\xe2\x9c\x96", "\xe2\x9c\x85", "\xe2\x9d\x8c"};
+    nlohmann::json out = nlohmann::json::array();
+    for (const auto& item : ui::audit::observedItems()) {
+        if (!item.value("visible", false) ||
+            item.value("window", std::string()).find("Copilot") == std::string::npos) continue;
+        bool found = false;
+        for (const char* key : {"label", "native_label"}) {
+            const std::string text = item.value(key, std::string());
+            for (const char* glyph : kGlyphs) found = found || text.find(glyph) != std::string::npos;
+        }
+        if (found) out.push_back(item);
+    }
+    return out;
+}
+
+bool cscWriteRenderPng(const std::string& path, int w, int h, int variant) {
+    std::vector<unsigned char> px(static_cast<size_t>(w) * static_cast<size_t>(h) * 4u);
+    const float holeX[4] = {0.27f, 0.73f, 0.27f, 0.73f};
+    const float holeY[4] = {0.37f, 0.37f, 0.63f, 0.63f};
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const float u = (static_cast<float>(x) + 0.5f) / static_cast<float>(w);
+            const float v = (static_cast<float>(y) + 0.5f) / static_cast<float>(h);
+            float r = 0.10f + 0.10f * v, g = 0.13f + 0.11f * v, b = 0.18f + 0.14f * v;
+            if (variant) { r += 0.10f; g += 0.04f; b -= 0.04f; }
+            if (u > 0.16f && u < 0.84f && v > 0.28f && v < 0.72f) {
+                const float s = 0.82f - 0.28f * (v - 0.28f) / 0.44f;
+                r = s; g = s; b = s * (variant ? 0.88f : 1.0f);
+                for (int k = 0; k < 4; ++k) {
+                    const float dx = (u - holeX[k]) * static_cast<float>(w);
+                    const float dy = (v - holeY[k]) * static_cast<float>(h);
+                    if (dx * dx + dy * dy < 49.0f) r = g = b = 0.09f;
+                }
+                if (u > 0.40f && u < 0.60f && v > 0.38f && v < 0.62f) { r = 0.15f; g = 0.17f; b = 0.22f; }
+            }
+            const size_t i = (static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x)) * 4u;
+            px[i + 0] = static_cast<unsigned char>(std::clamp(r, 0.0f, 1.0f) * 255.0f);
+            px[i + 1] = static_cast<unsigned char>(std::clamp(g, 0.0f, 1.0f) * 255.0f);
+            px[i + 2] = static_cast<unsigned char>(std::clamp(b, 0.0f, 1.0f) * 255.0f);
+            px[i + 3] = 255;
+        }
+    }
+    return stbi_write_png(path.c_str(), w, h, 4, px.data(), w * 4) != 0;
+}
+
+// Real files in a private directory under the output root, so the Artifacts view stats real
+// sizes/ages and the image tiles decode a real PNG.
+bool cscWriteAssets() {
+    namespace fs = std::filesystem;
+    auto& P = g_csc;
+    std::error_code ec;
+    fs::remove_all(P.assets, ec);
+    fs::create_directories(P.assets, ec);
+    if (ec) return false;
+    P.files = {P.assets + "/servo_bracket_iso.png", P.assets + "/servo_bracket_front.png",
+               P.assets + "/servo_bracket.step", P.assets + "/servo_bracket_bom.csv",
+               P.assets + "/servo_bracket_drawing.pdf", P.assets + "/servo_bracket_drawing.dxf"};
+    bool ok = cscWriteRenderPng(P.files[0], 192, 144, 0);
+    ok = cscWriteRenderPng(P.files[1], 192, 144, 1) && ok;
+    const auto text = [](const std::string& path, const char* body) {
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        f << body;
+        f.flush();
+        return static_cast<bool>(f);
+    };
+    ok = text(P.files[2], "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('copilot showcase stub'),'2;1');\n"
+                          "FILE_NAME('servo_bracket.step','2026-11-04T00:00:00',(''),(''),'','','');\n"
+                          "FILE_SCHEMA(('AUTOMOTIVE_DESIGN'));\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n") && ok;
+    ok = text(P.files[3], "item,qty,material\nbracket,1,PETG\nM3x8 screw,4,steel\nM3 nut,4,steel\n") && ok;
+    ok = text(P.files[4], "%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+                          "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
+                          "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] >>\nendobj\n"
+                          "trailer\n<< /Root 1 0 R >>\n%%EOF\n") && ok;
+    ok = text(P.files[5], "0\nSECTION\n2\nENTITIES\n0\nENDSEC\n0\nEOF\n") && ok;
+    return ok;
+}
+
+// A finished assistant turn through the real feed folds: finished tool rows, one failed row with
+// its cause, a Thinking row with detail, an answered question batch and closing prose.
+void cscSeedTranscript(AppState& st) {
+    auto& P = g_csc;
+    st.chat.clear();
+    st.designStarted = true;
+    const double now = chatNowEpoch();
+    ChatMsg user;
+    user.fromUser = true;
+    user.ts = now - 420.0;
+    user.text = "Design a bracket for the MG996R servo with four M3 holes and 3 mm walls, then give me "
+                "the drawing and the bill of materials.";
+    st.chat.push_back(std::move(user));
+    ChatMsg turn;
+    turn.ts = now - 400.0;
+    st.chat.push_back(std::move(turn));
+    ChatMsg& A = st.chat.back();
+    const nlohmann::json none = nullptr;
+    const auto tool = [&](const char* id, const char* name, const char* target, const char* args, int ms,
+                          bool ok, const char* error, const nlohmann::json& artifacts) {
+        nlohmann::json ev = {{"id", id}, {"tool_name", name}, {"target", target},
+                             {"args_preview", args}, {"latency_ms", ms}, {"ok", ok}};
+        if (error && *error) ev["error_preview"] = error;
+        if (artifacts.is_array()) ev["artifacts"] = artifacts;
+        ::feedTurnActivity(A, "agent.tool_call", ev);
+    };
+    ::feedTurnActivity(A, "agent.thought", {{"parent_id", "th-1"},
+        {"text", "The MG996R body is 40.7 x 19.7 x 42.9 mm and its mounting ears sit 10 mm off the shaft "
+                 "axis. The bracket needs a 3 mm base with four M3 clearance holes on the 49.5 mm ear "
+                 "pattern and an asymmetric flange for the horn. I will read the servo reference first, "
+                 "then build the base and the flange as separate features so the hole pattern stays "
+                 "editable."}});
+    for (ActivityItem& row : A.activity)
+        if (row.rowKind == 2) { row.userToggled = true; row.expanded = true; }
+    tool("t-read", "read", "servo_mg996r.step+", "{\"path\": \"servo_mg996r.step+\"}", 84, true, "", none);
+    tool("t-bash", "bash", "exports/", "{\"command\": \"ls -1 exports/\"}", 31, true, "", none);
+    tool("t-eval", "eval", "bracket parameters",
+         "base = (40.7, 19.7, 3.0)\nears = 49.5\nprint(base, ears)", 212, true, "", none);
+    tool("t-base", "add_features", "bracket_base",
+         "{\"features\": [\"base_plate\", \"m3_hole_pattern\"]}", 640, true, "", none);
+    tool("t-verify", "verify_battery", "bracket_base", "{\"checks\": [\"interface\", \"wall\"]}", 1180, false,
+         "interface_check failed: M3 hole 2 intersects the servo ear by 0.35 mm "
+         "(wall 2.65 mm, minimum 3 mm).", none);
+    ::feedAskEvent(st.chat, &A, "agent.question", {{"batch_id", "showcase-ask-1"},
+        {"questions", nlohmann::json::array({
+            {{"id", "layout"}, {"kind", "choice"}, {"required", true}, {"suggested", "ear"},
+             {"prompt", "Hole 2 hits the servo ear. Which layout should the bracket keep?"},
+             {"options", nlohmann::json::array({
+                 {{"value", "ear"}, {"label", "Clamp the mounting ears and move the pattern 0.5 mm out"}},
+                 {{"value", "base"}, {"label", "Mount through the base plate instead"}}})}},
+            {{"id", "keep"}, {"kind", "approval"},
+             {"prompt", "Keep the original M3 fastener pattern?"},
+             {"proposal", "The pattern stays on the 49.5 mm ear spacing; only the flange geometry changes."}}
+        })}});
+    tool("t-flange", "add_features", "flange and hole pattern",
+         "{\"features\": [\"flange\", \"m3_hole_pattern\"]}", 710, true, "", none);
+    {
+        nlohmann::json ev = {{"id", "t-render"}, {"tool_name", "render_part"}, {"target", "iso and front views"},
+                             {"args_preview", "{\"views\": [\"iso\", \"front\"]}"}, {"latency_ms", 1420},
+                             {"ok", true}, {"image_caption", "Iso and front renders of servo_bracket."},
+                             {"artifacts", nlohmann::json::array({{{"path", P.files[0]}, {"kind", "image"}},
+                                                                  {{"path", P.files[1]}, {"kind", "image"}}})}};
+        ::feedTurnActivity(A, "agent.tool_call", ev);
+    }
+    tool("t-step", "export_part", "servo_bracket.step", "{\"format\": \"step\"}", 380, true, "",
+         nlohmann::json::array({{{"path", P.files[2]}, {"kind", "file"}}}));
+    tool("t-drawing", "export_drawing", "servo_bracket_drawing", "{\"formats\": [\"pdf\", \"dxf\"]}", 930, true, "",
+         nlohmann::json::array({{{"path", P.files[4]}, {"kind", "file"}},
+                                {{"path", P.files[5]}, {"kind", "file"}},
+                                {{"path", P.files[3]}, {"kind", "file"}}}));
+    ::feedAskEvent(st.chat, nullptr, "agent.answer", {{"batch_id", "showcase-ask-1"}, {"source", "user"},
+        {"answers", {{"layout", "ear"}, {"keep", true}}}});
+    A.text = "Built the servo bracket: a 3 mm PETG base with four M3 clearance holes on the 49.5 mm ear "
+             "pattern and an asymmetric flange that clears the horn. The first verification failed on hole 2 "
+             "(0.35 mm into the ear); after you chose the ear-clamp layout I moved the pattern 0.5 mm outward "
+             "and it passes. The STEP export, a PDF and DXF drawing and the bill of materials are saved next to "
+             "the part.";
+    P.seedCount = st.chat.size();
+    markChatHistoryDirty();
+}
+
+// At least four sessions spanning Today / Yesterday / Earlier, one with a raw "[Image #1]" title,
+// re-asserted every frame once seeded (the panel's own sync can drop parked demo rows).
+void cscSeedSessions(AppState& st) {
+    ui::ensureConversations(st);
+    const std::string project = ui::convProjectDir(st);
+    if (st.activeConv >= 0 && st.activeConv < static_cast<int>(st.conversations.size())) {
+        Conversation& active = st.conversations[static_cast<size_t>(st.activeConv)];
+        active.title = "MG996R servo bracket";
+        active.projectDir = project;
+    }
+    const double now = chatNowEpoch();
+    double midnight = now - 3.0 * 3600.0;
+    std::tm local{};
+    if (chudware::util::localTime(static_cast<std::time_t>(now), local)) {
+        local.tm_hour = local.tm_min = local.tm_sec = 0;
+        local.tm_isdst = -1;
+        midnight = static_cast<double>(std::mktime(&local));
+    }
+    struct Seed { const char* title; double ts; int messages; };
+    const Seed seeds[] = {
+        {"[Image #1]modify this part so it fits the Bracket + FEA study",
+         std::min(now - 1.0, std::max(midnight + 5.0, now - 3.0 * 3600.0)), 6},
+        {"Gearbox housing revision", midnight - 12.0 * 3600.0, 14},
+        {"Knurled hex standoff", midnight - 4.0 * 86400.0 + 10.0 * 3600.0, 8},
+        {"Camera gimbal sensor mount, rev C with the cable strain relief", midnight - 12.0 * 86400.0 + 14.0 * 3600.0, 22},
+        {"Reverse-engineer the legacy actuator housing from the scanned point cloud and rebuild it as "
+         "editable parametric features", midnight - 40.0 * 86400.0 + 8.0 * 3600.0, 3},
+    };
+    for (const Seed& seed : seeds) {
+        auto it = std::find_if(st.conversations.begin(), st.conversations.end(),
+                               [&](const Conversation& c) { return c.title == seed.title; });
+        if (it != st.conversations.end()) {
+            it->projectDir = project;
+            continue;
+        }
+        Conversation c;
+        c.id = ui::newConvId(st);
+        c.title = seed.title;
+        c.projectDir = project;
+        for (int m = 0; m < seed.messages; ++m) {
+            ChatMsg msg;
+            msg.fromUser = (m % 2) == 0;
+            msg.text = msg.fromUser ? "Showcase prompt." : "Showcase reply.";
+            msg.ts = seed.ts - static_cast<double>(seed.messages - 1 - m) * 60.0;
+            c.msgs.push_back(std::move(msg));
+        }
+        st.conversations.push_back(std::move(c));
+    }
+}
+
+// Sessions rows: stacked without overlap, each kebab beside (never over) its row button.
+bool cscSessionsGeometry(nlohmann::json& evidence) {
+    const auto picks = cscItems("##pick", "cp_sessions");
+    const auto mores = cscItems("##more", "cp_sessions");
+    bool ok = picks.size() >= 4 && picks.size() == mores.size();
+    nlohmann::json rows = nlohmann::json::array();
+    for (size_t i = 0; ok && i < picks.size(); ++i) {
+        const auto& p = (*picks[i])["full_rect"];
+        const auto& m = (*mores[i])["full_rect"];
+        const bool stacked = i == 0 || p[1].get<float>() >= (*picks[i - 1])["full_rect"][3].get<float>() - 0.5f;
+        const bool kebab = m[1].get<float>() >= p[1].get<float>() - 0.5f &&
+                           m[3].get<float>() <= p[3].get<float>() + 0.5f &&
+                           m[0].get<float>() >= p[2].get<float>() - 0.5f;
+        const bool usable = p[2].get<float>() - p[0].get<float>() >= ui::metrics::px(40.0f);
+        rows.push_back({{"pick", p}, {"more", m}, {"stacked", stacked}, {"kebab_beside_row_button", kebab},
+                        {"usable", usable}});
+        ok = stacked && kebab && usable;
+    }
+    evidence = {{"rows", rows}, {"picks", picks.size()}, {"kebabs", mores.size()}};
+    return ok;
+}
+
+// No "[Image #N]" text anywhere a title is observable, while the raw marker really is in a title
+// and the title formatter removes it (row titles are painted straight onto the draw list).
+bool cscSessionTitlesClean(AppState& st, nlohmann::json& evidence) {
+    nlohmann::json offenders = nlohmann::json::array();
+    for (const auto& item : ui::audit::observedItems())
+        for (const char* key : {"label", "native_label"})
+            if (item.value(key, std::string()).find("[Image #") != std::string::npos) offenders.push_back(item);
+    bool rawMarker = false, stripped = true;
+    for (const Conversation& c : st.conversations) {
+        rawMarker = rawMarker || c.title.find("[Image #") != std::string::npos;
+        const std::string shown = ui::copilot::stripInlineImageMarkers(c.title);
+        stripped = stripped && !shown.empty() && shown.find("[Image #") == std::string::npos;
+    }
+    evidence = {{"observed_items_with_marker", offenders}, {"a_raw_title_carries_the_marker", rawMarker},
+                {"formatted_titles_clean", stripped}};
+    return offenders.empty() && rawMarker && stripped;
+}
+
+nlohmann::json cscWindowSize(float scale = 1.0f) {
+    const ImGuiWindow* column = ImGui::FindWindowByName("Copilot###AI");
+    return {{"width", column ? column->Size.x / scale : 0.0f}, {"height", column ? column->Size.y / scale : 0.0f}};
+}
+
+void copilotShowcaseTick(AppState& st) {
+    auto& P = g_csc;
+    if (!P.init) {
+        P.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        P.want = st.shot && mode && std::strcmp(mode, "copilot_showcase") == 0;
+        if (!P.want) return;
+        const char* dir = std::getenv("CHUDWARE_COPILOT_SHOWCASE_OUT");
+        P.dir = dir && *dir ? dir : "scratch/copilot_showcase_shots";
+        std::error_code ec;
+        std::filesystem::create_directories(P.dir, ec);
+        P.assets = std::filesystem::absolute(std::filesystem::path(P.dir) / "assets", ec).lexically_normal().string();
+        P.started = P.stepStarted = pipingNow();
+        P.originalTheme = ui::activeTheme == ui::Theme::Light ? "light" : "dark";
+        P.report["theme"] = P.originalTheme;
+        P.report["theme_fixed_by_env"] = std::getenv("CHUDWARE_THEME") != nullptr;
+        P.report["assets_dir"] = P.assets;
+    }
+    if (!P.want || P.done) return;
+    ui::audit::observedItems();
+    ImGuiIO& io = ImGui::GetIO();
+    if (P.hold) io.AddMousePosEvent(P.holdPoint.x, P.holdPoint.y);
+    if (pipingNow() - P.started > 900) {
+        cscCheck("timeout", false, {{"step", P.step}, {"waiting_for", P.waiting}, {"items", cscEvidence()}});
+        return;
+    }
+    if (!st.workerStarted || st.frame < 5) return;
+    if (!P.began) { P.began = true; P.stepStarted = pipingNow(); }
+    if (pipingNow() - P.stepStarted > 120) {
+        cscCheck(("step_" + std::to_string(P.step) + "_completes").c_str(), false,
+                 {{"step", P.step}, {"waiting_for", P.waiting}, {"items", cscEvidence()},
+                  {"windows", ui::audit::observedWindows()}});
+        return;
+    }
+    if (!P.capture.empty()) return;
+    st.activeWorkspace = AppState::Workspace::Model;
+    st.showAIPanel = true;
+    if (P.seeded) cscSeedSessions(st);
+    if (P.settle > 0) { --P.settle; return; }
+    if (ImGui::GetTime() < P.holdUntil) return;
+    if (P.auditStage == 1) {
+        ui::audit::AuditOptions opt; opt.regions = ui::audit::RegionAll;
+        if (!ui::audit::begin(P.auditName, opt)) return;
+        P.auditStage = 2; return;
+    }
+    if (P.auditStage == 2) {
+        if (ui::audit::active()) return;
+        const auto result = ui::audit::lastResult();
+        P.report["audits"].push_back(result);
+        nlohmann::json related = nlohmann::json::array();
+        for (const char* kind : {"conflicts", "overflows"})
+            for (const auto& f : result[kind]) if (cscRelated(f)) related.push_back(f);
+        if (!cscCheck(P.auditName.c_str(), related.empty(), related)) return;
+        P.capture = P.dir + "/" + P.auditName + ".png";
+        P.auditStage = 0; return;
+    }
+    const float px1 = ui::metrics::px(1.0f);
+    auto next = [&](int step, int settle = 4, double hold = 0.0) {
+        P.step = step;
+        P.settle = std::max(P.settle, settle);
+        if (hold > 0.0) P.holdUntil = std::max(P.holdUntil, ImGui::GetTime() + hold);
+        P.stepStarted = pipingNow();
+        P.checked = false;
+        P.tries = 0;
+    };
+    // The header view toggles (the same flags cpSetTab drives) after a header click.
+    const auto onlyView = [&](bool chat, bool arts, bool sess, bool settings) {
+        return st.showArtifacts == arts && st.showSessionsPicker == sess && st.showAISettingsOverlay == settings &&
+               !st.showTaskList && (!chat || (!arts && !sess && !settings));
+    };
+    switch (P.step) {
+    case 0: {
+        P.waiting = "assets and synthetic transcript";
+        glfwSetWindowSize(st.win, static_cast<int>(ui::metrics::px(1280.0f)),
+                          static_cast<int>(ui::metrics::px(1100.0f)));
+        const bool assetsWritten = cscWriteAssets();   // fills P.files before the evidence is built
+        if (!cscCheck("assets_written", assetsWritten, {{"dir", P.assets}, {"files", P.files}})) return;
+        cscSeedTranscript(st);
+        ui::chatLogJumpToBottom("copilot.panel");
+        next(1, 12, 1.0);
+        break;
+    }
+    case 1: {
+        P.waiting = "seeded transcript";
+        int tools = 0, failed = 0, thoughts = 0, markers = 0;
+        bool cause = false, detail = false;
+        const ChatMsg* turn = st.chat.size() == 2 ? &st.chat[1] : nullptr;
+        if (turn)
+            for (const ActivityItem& a : turn->activity) {
+                if (a.rowKind == 3) {
+                    ++tools;
+                    if (a.status == "fail") {
+                        ++failed;
+                        cause = cause || a.detail.find("intersects the servo ear by 0.35 mm") != std::string::npos;
+                    }
+                }
+                if (a.rowKind == 2 && a.title == "Thinking") { ++thoughts; detail = detail || !a.detail.empty(); }
+                if (a.rowKind == 20) ++markers;
+            }
+        const nlohmann::json counts = {{"tool_rows", tools}, {"failed_rows", failed}, {"thinking_rows", thoughts},
+                                       {"ask_markers", markers}, {"failure_cause_in_row", cause},
+                                       {"thinking_detail", detail}, {"messages", st.chat.size()}};
+        if (!cscCheck("turn_has_finished_rows_one_failed_with_cause_and_thinking_detail",
+                      turn && tools >= 9 && failed == 1 && cause && thoughts == 1 && detail && markers == 1,
+                      counts)) return;
+        const bool answered = turn->asks.size() == 1 && turn->asks[0].status == AskStatus::Answered;
+        if (!cscCheck("ask_batch_is_answered", answered && !turn->running && !turn->text.empty(),
+                      {{"asks", turn->asks.size()}, {"running", turn->running}})) return;
+        next(2, 4, 0.6);
+        break;
+    }
+    case 2: {
+        P.waiting = "answered question summary in view";
+        if (!cscAskSummaryReady()) return;
+        const nlohmann::json glyphs = cscStatusGlyphItems();
+        if (!cscCheck("transcript_has_no_status_glyph_items", glyphs.empty(), glyphs)) return;
+        cscAudit("01_transcript");
+        next(3);
+        break;
+    }
+    case 3:
+        P.waiting = "transcript scrolled to its first row";
+        if (!cscChatWheel(true)) return;
+        cscAudit("01b_transcript_top");
+        next(4);
+        break;
+    case 4: {
+        P.waiting = "queued messages under a live turn";
+        // A turn is live (a JobState nothing services, so the queue never drains) with two
+        // messages waiting: the first carries an attachment draft.
+        const double now = chatNowEpoch();
+        ChatMsg user;
+        user.fromUser = true;
+        user.ts = now - 20.0;
+        user.text = "Now round the flange edges with a 2 mm fillet and re-run the verification battery.";
+        st.chat.push_back(std::move(user));
+        ChatMsg live;
+        live.running = true;
+        live.ts = now - 15.0;
+        live.liveStatus = "Running add_features";
+        ::feedTurnActivity(live, "agent.tool_call", {{"id", "t-live"}, {"tool_name", "describe_part"},
+                           {"target", "servo_bracket"}, {"args_preview", "{}"}, {"latency_ms", 120}, {"ok", true}});
+        live.lastEventTs = now - 1.0;
+        st.chat.push_back(std::move(live));
+        auto run = st.activeRun();
+        run->convId = st.activeConvId();
+        run->docKey = st.chatDocKey;
+        run->runId.clear();
+        run->error.clear();
+        run->errorDetail.clear();
+        run->stopReason.clear();
+        run->stopRequested = false;
+        run->ready = false;
+        run->running = true;
+        st.queuedPrompts.clear();
+        st.queuedPromptDrafts.clear();
+        st.queuedPrompts.push_back(kCscQueued0);
+        st.queuedPromptDrafts.push_back({{"attachments", nlohmann::json::array({P.files[0]})},
+                                         {"inline_images", nlohmann::json::array()},
+                                         {"context_refs", nlohmann::json::array()}});
+        st.queuedPrompts.push_back(kCscQueued1);
+        st.queuedPromptDrafts.push_back({{"attachments", nlohmann::json::array()},
+                                         {"inline_images", nlohmann::json::array()},
+                                         {"context_refs", nlohmann::json::array()}});
+        markChatHistoryDirty();
+        ui::chatLogJumpToBottom("copilot.panel");
+        next(5, 10, 1.0);
+        break;
+    }
+    case 5: {
+        P.waiting = "two queued bubbles pinned inside the chat clip";
+        const auto captions = cscItems("##caption", "/cp_chat_");
+        if (captions.size() < 2 || !ui::chatLogAtBottom("copilot.panel")) return;
+        const nlohmann::json* prompt = nullptr;
+        for (const auto& item : ui::audit::observedItems())
+            if (item.value("label", std::string()).find("##aiprompt") == 0 && item.value("visible", false)) {
+                prompt = &item;
+                break;
+            }
+        bool inside = true, clear = true;
+        nlohmann::json rects = nlohmann::json::array();
+        for (const auto* caption : captions) {
+            inside = inside && cscInside(*caption);
+            clear = clear && prompt && (*caption)["full_rect"][3].get<float>() <= (*prompt)["full_rect"][1].get<float>() + 1.0f;
+            rects.push_back({{"caption", (*caption)["full_rect"]}, {"clip", (*caption)["clip"]}});
+        }
+        if (!cscCheck("pinned_queue_is_visible_inside_chat_clip_above_composer",
+                      st.queuedPrompts.size() == 2 && ui::aiTurnActive(st) && captions.size() == 2 && inside && clear,
+                      {{"queued", st.queuedPrompts.size()}, {"turn_active", ui::aiTurnActive(st)},
+                       {"captions", rects}, {"composer", prompt ? (*prompt)["full_rect"] : nlohmann::json()}})) return;
+        cscAudit("02_queued_stack");
+        next(6, 4, 0.2);
+        break;
+    }
+    case 6: {
+        P.waiting = "hover on the first queued bubble";
+        const nlohmann::json* caption = cscItem("##caption", "/cp_chat_");
+        if (!caption) return;
+        P.holdPoint = shotPoint(*caption);
+        P.hold = true;
+        next(7, 6, 0.4);
+        break;
+    }
+    case 7:
+        P.waiting = "Cancel action on the hovered queued bubble";
+        if (P.input.phase == 0 && !cscItem("##cancel", "/cp_chat_")) return;
+        if (cscClick("##cancel", "/cp_chat_")) next(8, 6, 0.6);
+        break;
+    case 8: {
+        P.waiting = "cancelled message back in the composer";
+        const std::string composed = ui::composerText(st);
+        const bool shrank = st.queuedPrompts.size() == 1 && st.queuedPromptDrafts.size() == 1 &&
+                            st.queuedPrompts[0] == kCscQueued1;
+        const bool attached = std::find(st.pendingAttachments.begin(), st.pendingAttachments.end(), P.files[0]) !=
+                              st.pendingAttachments.end();
+        if (!cscCheck("cancel_returns_queued_text_and_attachment_to_composer_and_shrinks_queue",
+                      shrank && composed == kCscQueued0 && attached,
+                      {{"composer", composed}, {"queued", st.queuedPrompts}, {"attachments", st.pendingAttachments}}))
+            return;
+        cscAudit("03_queue_cancelled");
+        next(9);
+        break;
+    }
+    case 9: {
+        P.waiting = "fake run ended";
+        // Nothing may drain or launch: empty the queue and composer first, then end the run.
+        st.queuedPrompts.clear();
+        st.queuedPromptDrafts.clear();
+        ui::composerSetText(st, std::string());
+        st.pendingAttachments.clear();
+        st.pendingInlineImagePaths.clear();
+        st.pendingContextRefs.clear();
+        if (JobState* run = st.runIfExists(st.activeConvId())) {
+            run->running = false;
+            run->ready = false;
+        }
+        if (st.chat.size() > P.seedCount)
+            st.chat.erase(st.chat.begin() + static_cast<std::ptrdiff_t>(P.seedCount), st.chat.end());
+        markChatHistoryDirty();
+        if (!cscCheck("fake_run_ended_cleanly",
+                      !ui::aiTurnActive(st) && st.queuedPrompts.empty() && ui::composerText(st).empty() &&
+                          st.chat.size() == P.seedCount,
+                      {{"turn_active", ui::aiTurnActive(st)}, {"messages", st.chat.size()}})) return;
+        next(10, 8, 0.4);
+        break;
+    }
+    case 10:
+        P.waiting = "Artifacts header tab";
+        if (cscClick("##hdr_arts")) next(11, 6, 1.8);
+        break;
+    case 11: {
+        P.waiting = "artifact rows and tiles";
+        if (!P.checked) {
+            if (!cscCheck("header_artifacts_opens_its_view", onlyView(false, true, false, false),
+                          {{"artifacts", st.showArtifacts}, {"sessions", st.showSessionsPicker}})) return;
+            P.checked = true;
+        }
+        const auto rows = cscItems("##hit", "cp_artifacts");
+        const auto tiles = cscItems("##tile", "cp_artifacts");
+        if (rows.size() + tiles.size() < P.files.size()) return;
+        std::vector<const nlohmann::json*> all(rows);
+        all.insert(all.end(), tiles.begin(), tiles.end());
+        bool apart = true, exist = true;
+        for (size_t i = 0; i < all.size(); ++i)
+            for (size_t j = i + 1; j < all.size(); ++j) apart = apart && cscApart(*all[i], *all[j]);
+        for (const std::string& file : P.files) exist = exist && std::filesystem::exists(file);
+        if (!cscCheck("artifacts_view_lists_every_produced_file_without_overlap",
+                      apart && exist && !cscItem("Clear filters"),
+                      {{"rows", rows.size()}, {"tiles", tiles.size()}, {"files", P.files},
+                       {"files_exist", exist}, {"non_overlapping", apart}})) return;
+        // Each produced file is exactly one row or tile: a parser that mistakes the ART blob's
+        // trailing META lines for paths lists phantom files here.
+        cscDeferred("artifacts_view_lists_no_rows_beyond_the_produced_files",
+                    rows.size() + tiles.size() == P.files.size(),
+                    {{"rows", rows.size()}, {"tiles", tiles.size()}, {"expected", P.files.size()}});
+        cscAudit("04_artifacts", false, 0.6);
+        next(12);
+        break;
+    }
+    case 12:
+        P.waiting = "Sessions header tab";
+        P.seeded = true;
+        cscSeedSessions(st);
+        if (cscClick("##hdr_sess")) next(13, 6, 1.0);
+        break;
+    case 13: {
+        P.waiting = "session rows";
+        if (!P.checked) {
+            if (!cscCheck("header_sessions_opens_its_view", onlyView(false, false, true, false),
+                          {{"artifacts", st.showArtifacts}, {"sessions", st.showSessionsPicker}})) return;
+            P.checked = true;
+        }
+        if (cscItems("##pick", "cp_sessions").size() < 4) return;
+        nlohmann::json rows, titles;
+        if (!cscCheck("session_rows_stack_without_overlap_kebabs_beside", cscSessionsGeometry(rows), rows)) return;
+        if (!cscCheck("image_marker_title_renders_without_the_marker", cscSessionTitlesClean(st, titles), titles))
+            return;
+        cscAudit("05_sessions");
+        next(14);
+        break;
+    }
+    case 14: {
+        P.waiting = "second session row";
+        const nlohmann::json* row = cscItem("##pick", "cp_sessions", 1);
+        if (!row) return;
+        P.holdPoint = shotPoint(*row);
+        P.hold = true;
+        next(15, 6, 0.5);
+        break;
+    }
+    case 15:
+        P.waiting = "kebab beside the hovered row";
+        if (!cscItem("##more", "cp_sessions", 1)) return;
+        cscAudit("06_sessions_hover", true);
+        next(16);
+        break;
+    case 16:
+        P.waiting = "kebab of the hovered row";
+        if (cscClick("##more", "cp_sessions", 1)) {
+            P.holdPoint = P.input.point;
+            P.hold = true;
+            next(17, 6, 0.5);
+        }
+        break;
+    case 17: {
+        P.waiting = "session actions menu";
+        const nlohmann::json* rename = cscItem("Rename");
+        const nlohmann::json* fork = cscItem("Fork");
+        const nlohmann::json* del = cscItem("Delete", nullptr, 0, true, true);
+        if (!rename || !fork || !del) return;
+        if (!cscCheck("kebab_menu_lists_actions_inside_its_popup",
+                      cscInside(*rename) && cscInside(*fork) && cscInside(*del),
+                      {{"rename", *rename}, {"fork", *fork}, {"delete", *del}})) return;
+        P.popups = true;
+        cscAudit("07_sessions_menu", true);
+        next(18);
+        break;
+    }
+    case 18:
+        P.waiting = "Escape closes the menu";
+        P.hold = false;
+        if (P.input.key(ImGuiKey_Escape)) next(19, 6, 0.4);
+        break;
+    case 19:
+        P.waiting = "menu closed, Quick settings tab";
+        P.popups = false;
+        if (!P.checked) {
+            // The main viewport runs without ImGui keyboard navigation, which is what closes a
+            // popup on Escape: record whether the menu really went away, and close it directly
+            // when it did not so the rest of the tour is unaffected.
+            const bool closed = !cscItem("Rename") && !cscItem("Fork");
+            cscObserve("escape_closes_the_kebab_menu", closed, cscEvidence());
+            if (!closed) ImGui::ClosePopupToLevel(0, true);
+            P.checked = true;
+            P.settle = std::max(P.settle, 6);
+            break;
+        }
+        if (cscClick("##hdr_gear")) next(20, 6, 0.8);
+        break;
+    case 20: {
+        P.waiting = "Model sizes card framed in the Quick settings view";
+        if (!P.checked) {
+            if (!cscCheck("header_settings_opens_its_view", onlyView(false, false, false, true),
+                          {{"settings", st.showAISettingsOverlay}, {"sessions", st.showSessionsPicker}})) return;
+            P.checked = true;
+        }
+        const nlohmann::json* pane = cscPane("/cp_settings_");
+        const nlohmann::json* smallRow = cscItem("Small", "cp_settings", 0, false, true);
+        const nlohmann::json* mediumRow = cscItem("Medium", "cp_settings", 0, false, true);
+        const nlohmann::json* largeRow = cscItem("Large", "cp_settings", 0, false, true);
+        if (!pane) return;
+        if (!smallRow || !mediumRow || !largeRow) { cscScan("/cp_settings_"); return; }
+        const float lineH = ImGui::GetTextLineHeight();
+        const auto& view = (*pane)["rect"];
+        const float top = (*smallRow)["full_rect"][1].get<float>(), bottom = (*largeRow)["full_rect"][3].get<float>();
+        const bool atBottom = pane->value("scroll_y", 0.0f) >= pane->value("scroll_max_y", 0.0f) - 0.5f;
+        const bool framed = top >= view[1].get<float>() + 3.0f * lineH && bottom <= view[3].get<float>() - 0.5f * lineH;
+        const bool fits = top >= view[1].get<float>() && bottom <= view[3].get<float>();
+        if (!framed && !(atBottom && fits)) {
+            shotScrollTo("Small", "cp_settings", true, smallRow);
+            return;
+        }
+        if (!cscCheck("model_sizes_rows_framed_in_quick_settings", true,
+                      {{"small", *smallRow}, {"medium", *mediumRow}, {"large", *largeRow}, {"view", view}})) return;
+        cscAudit("08_quick_settings");
+        next(21);
+        break;
+    }
+    case 21:
+        P.waiting = "Chat header tab";
+        if (cscClick("##hdr_chat")) next(22, 6, 0.8);
+        break;
+    case 22:
+        P.waiting = "narrow window";
+        if (!cscCheck("header_chat_returns_to_the_transcript", onlyView(true, false, false, false),
+                      {{"settings", st.showAISettingsOverlay}, {"sessions", st.showSessionsPicker}})) return;
+        P.narrowWindowW = ui::metrics::px(640.0f);
+        glfwSetWindowSize(st.win, static_cast<int>(P.narrowWindowW), static_cast<int>(ui::metrics::px(1100.0f)));
+        next(23, 14, 0.8);
+        break;
+    case 23: {
+        P.waiting = "~320 px copilot column and answered summary";
+        const ImGuiWindow* column = ImGui::FindWindowByName("Copilot###AI");
+        const float width = column ? column->Size.x : 0.0f;
+        const float target = ui::metrics::px(320.0f);
+        if (!P.checked && std::fabs(width - target) > ui::metrics::px(8.0f)) {
+            // The column is half the window until it reaches its own width: re-aim the window.
+            if (++P.tries > 4) {
+                cscCheck("copilot_column_reaches_about_320px", false,
+                         {{"column", cscWindowSize(px1)}, {"window_width", P.narrowWindowW / px1}});
+                return;
+            }
+            P.narrowWindowW = std::clamp(P.narrowWindowW + 2.0f * (target - width), ui::metrics::px(420.0f),
+                                         ui::metrics::px(1280.0f));
+            glfwSetWindowSize(st.win, static_cast<int>(P.narrowWindowW),
+                              static_cast<int>(ui::metrics::px(1100.0f)));
+            P.settle = std::max(P.settle, 14);
+            P.holdUntil = std::max(P.holdUntil, ImGui::GetTime() + 0.8);
+            break;
+        }
+        if (!P.checked) {
+            if (!cscCheck("copilot_column_is_about_320px", true,
+                          {{"column", cscWindowSize(px1)}, {"window_width", P.narrowWindowW / px1}})) return;
+            P.checked = true;
+        }
+        if (!cscAskSummaryReady()) return;
+        cscAudit("11_transcript_narrow");
+        next(24);
+        break;
+    }
+    case 24:
+        P.waiting = "Artifacts header tab (narrow)";
+        if (cscClick("##hdr_arts")) next(25, 6, 1.8);
+        break;
+    case 25: {
+        P.waiting = "artifact rows and tiles (narrow)";
+        if (!P.checked) {
+            if (!cscCheck("header_artifacts_opens_its_view_narrow", onlyView(false, true, false, false),
+                          {{"artifacts", st.showArtifacts}})) return;
+            P.checked = true;
+        }
+        const auto rows = cscItems("##hit", "cp_artifacts");
+        const auto tiles = cscItems("##tile", "cp_artifacts");
+        if (rows.size() + tiles.size() < P.files.size()) return;
+        std::vector<const nlohmann::json*> all(rows);
+        all.insert(all.end(), tiles.begin(), tiles.end());
+        bool apart = true;
+        for (size_t i = 0; i < all.size(); ++i)
+            for (size_t j = i + 1; j < all.size(); ++j) apart = apart && cscApart(*all[i], *all[j]);
+        if (!cscCheck("artifacts_narrow_lists_every_file_without_overlap", apart,
+                      {{"rows", rows.size()}, {"tiles", tiles.size()}, {"column", cscWindowSize(px1)}})) return;
+        cscDeferred("artifacts_narrow_lists_no_rows_beyond_the_produced_files",
+                    rows.size() + tiles.size() == P.files.size(),
+                    {{"rows", rows.size()}, {"tiles", tiles.size()}, {"expected", P.files.size()}});
+        cscAudit("14_artifacts_narrow");
+        next(26);
+        break;
+    }
+    case 26:
+        P.waiting = "Sessions header tab (narrow)";
+        if (cscClick("##hdr_sess")) next(27, 6, 1.0);
+        break;
+    case 27: {
+        P.waiting = "session rows (narrow)";
+        if (!P.checked) {
+            if (!cscCheck("header_sessions_opens_its_view_narrow", onlyView(false, false, true, false),
+                          {{"sessions", st.showSessionsPicker}})) return;
+            P.checked = true;
+        }
+        if (cscItems("##pick", "cp_sessions").size() < 4) return;
+        nlohmann::json rows, titles;
+        if (!cscCheck("session_rows_narrow_stack_without_overlap", cscSessionsGeometry(rows), rows)) return;
+        if (!cscCheck("image_marker_title_clean_narrow", cscSessionTitlesClean(st, titles), titles)) return;
+        cscAudit("15_sessions_narrow");
+        next(28);
+        break;
+    }
+    case 28:
+        P.waiting = "default column width restored";
+        ui::resetOverlayColumns();
+        glfwSetWindowSize(st.win, static_cast<int>(ui::metrics::px(1280.0f)),
+                          static_cast<int>(ui::metrics::px(1100.0f)));
+        next(29, 16, 1.0);
+        break;
+    case 29: {
+        P.waiting = "light theme";
+        const ImGuiWindow* column = ImGui::FindWindowByName("Copilot###AI");
+        const float width = column ? column->Size.x : 0.0f;
+        if (!cscCheck("default_column_width_restored", width >= ui::metrics::px(330.0f),
+                      {{"column", cscWindowSize(px1)}})) return;
+        P.lightPass = std::getenv("CHUDWARE_THEME") == nullptr && ui::activeTheme == ui::Theme::Dark;
+        if (!P.lightPass) {
+            P.report["notes"].push_back(
+                "light pass skipped: the theme is fixed by CHUDWARE_THEME (or already light); run the scenario "
+                "once per CHUDWARE_THEME value instead");
+            next(99);
+            break;
+        }
+        ui::applyTheme(ui::Theme::Light, st.scale);
+        st.settings.theme = "light";
+        next(30, 10, 1.0);
+        break;
+    }
+    case 30: {
+        P.waiting = "session rows (light)";
+        if (cscItems("##pick", "cp_sessions").size() < 4) return;
+        nlohmann::json rows;
+        if (!cscCheck("light_theme_is_active", ui::activeTheme == ui::Theme::Light, nlohmann::json::object()))
+            return;
+        if (!cscCheck("session_rows_light_stack_without_overlap", cscSessionsGeometry(rows), rows)) return;
+        cscAudit("21_sessions_light");
+        next(31);
+        break;
+    }
+    case 31:
+        P.waiting = "Artifacts header tab (light)";
+        if (cscClick("##hdr_arts")) next(32, 6, 1.8);
+        break;
+    case 32: {
+        P.waiting = "artifact rows and tiles (light)";
+        const auto rows = cscItems("##hit", "cp_artifacts");
+        const auto tiles = cscItems("##tile", "cp_artifacts");
+        if (rows.size() + tiles.size() < P.files.size()) return;
+        cscAudit("24_artifacts_light");
+        next(33);
+        break;
+    }
+    case 33:
+        P.waiting = "Chat header tab (light)";
+        if (cscClick("##hdr_chat")) next(34, 6, 0.8);
+        break;
+    case 34:
+        P.waiting = "answered summary in view (light)";
+        if (!cscAskSummaryReady()) return;
+        cscAudit("22_transcript_light");
+        next(35);
+        break;
+    case 35:
+        P.waiting = "dark theme restored";
+        ui::applyTheme(ui::Theme::Dark, st.scale);
+        st.settings.theme = P.originalTheme;
+        next(99, 8, 0.6);
+        break;
+    case 99:
+        if (P.deferred.empty()) P.report["ok"] = true;
+        else P.report["failure"] = P.deferred;
+        P.failed = !P.deferred.empty();
+        P.done = true;
+        P.capture = P.dir + "/final.png";
+        break;
+    }
+}
+
+bool copilotShowcaseEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, bool& done) {
+    auto& P = g_csc;
+    if (!P.want) return false;
+    ++st.frame;
+    if (!P.capture.empty()) {
+        writeBackbufferPng(P.capture.c_str(), dw, dh, P.done ? screenshotPath : nullptr);
+        P.report["captures"].push_back(P.capture);
+        P.capture.clear();
+        P.dirty = true;
+    }
+    bool wrote = true;
+    if (P.dirty || P.done) {
+        std::ofstream out(P.dir + "/report.json", std::ios::trunc);
+        out << P.report.dump(2) << '\n';
+        out.flush();
+        wrote = static_cast<bool>(out);
+        P.dirty = false;
+    }
+    swapScenarioFrame(st.win);
+    done = P.done;
+    if (!wrote || (done && P.failed)) {
+        core::framestats::flushReport();
+        std::fflush(nullptr);
+        std::_Exit(EXIT_FAILURE);
+    }
+    return true;
+}
+
+// Real Copilot prose, header and metadata over a shaded mesh, with same-frame framebuffer
+// references. Replays suppress only the targeted native font quads, leaving fills, geometry
+// and other UI primitives intact. Black/white replays measure actual font coverage.
+constexpr const char* kContrastProse =
+    "The model preserves the W-shaped face and its critical dimensions as the camera moves. "
+    "Every feature remains editable for review.";
+constexpr const char* kContrastModel = "fixture";
+
+struct ContrastGlyph {
+    int vertex = 0;
+    ImRect rect;
+    bool wide = false;
+    float alpha = 1.0f;
+    unsigned int codepoint = 0;
+};
+
+struct ContrastTarget {
+    ImGuiWindow* window = nullptr;
+    std::vector<ContrastGlyph> glyphs;
+};
+
+struct ContrastFrame {
+    int w = 0, h = 0, sceneW = 0, sceneH = 0;
+    ImVec2 displayPos, scale, sceneMin, sceneMax;
+    ImRect clip;
+    std::vector<unsigned char> actual, background, black, white, scene;
+    std::vector<ContrastGlyph> glyphs;
+};
+
+struct TextContrastShot {
+    bool init = false, want = false, done = false, failed = false;
+    int step = 0, capture = 0;
+    double started = 0;
+    std::string dir;
+    ImGuiID inputId = 0;
+    ImVec2 click;
+    ImRect target;
+    SceneShotInput input;
+    ContrastFrame first, moved;
+    nlohmann::json report = {{"scenario", "text_contrast"}, {"ok", false},
+                             {"checks", nlohmann::json::array()},
+                             {"captures", nlohmann::json::array()}};
+} g_textContrast;
+
+bool contrastCheck(const char* name, bool ok, const nlohmann::json& evidence) {
+    auto& p = g_textContrast;
+    p.report["checks"].push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
+    std::printf("text_contrast: %s %s\n", ok ? "PASS" : "FAIL", name);
+    std::fflush(stdout);
+    if (!ok) {
+        p.failed = p.done = true;
+        p.report["failure"] = {{"name", name}, {"step", p.step}, {"evidence", evidence}};
+    }
+    return ok;
+}
+
+ImGuiWindow* contrastProseWindow() {
+    ImGuiContext* g = ImGui::GetCurrentContext();
+    if (!g) return nullptr;
+    for (ImGuiWindow* window : g->Windows) {
+        if (window->Active && !window->Hidden && window->DrawList &&
+            std::strstr(window->Name, "Copilot") &&
+            std::strstr(window->Name, "/##prose_sel_"))
+            return window;
+    }
+    return nullptr;
+}
+
+std::vector<ContrastGlyph> contrastGlyphs(ImGuiWindow* child) {
+    std::vector<ContrastGlyph> out;
+    if (!child || !child->DrawList) return out;
+    ImDrawList* dl = child->DrawList;
+    ImFontAtlas* atlas = ImGui::GetIO().Fonts;
+    for (int i = 0; i + 3 < dl->VtxBuffer.Size; ++i) {
+        const auto& a = dl->VtxBuffer[i];
+        const auto& b = dl->VtxBuffer[i + 1];
+        const auto& c = dl->VtxBuffer[i + 2];
+        const auto& d = dl->VtxBuffer[i + 3];
+        if (!(a.uv.x < c.uv.x && a.uv.y < c.uv.y &&
+              a.uv.y == b.uv.y && b.uv.x == c.uv.x &&
+              c.uv.y == d.uv.y && d.uv.x == a.uv.x &&
+              a.pos.x < c.pos.x && a.pos.y < c.pos.y))
+            continue;
+        const ImFontGlyph* match = nullptr;
+        for (ImFont* font : atlas->Fonts) {
+            for (const ImFontGlyph& glyph : font->Glyphs) {
+                if (glyph.Visible && a.uv.x == glyph.U0 && a.uv.y == glyph.V0 &&
+                    c.uv.x == glyph.U1 && c.uv.y == glyph.V1) {
+                    match = &glyph;
+                    break;
+                }
+            }
+            if (match) break;
+        }
+        if (!match) continue;  // excludes the atlas white-pixel selection/caret rectangles
+        out.push_back({i, ImRect(a.pos, c.pos), match->Codepoint == 'W',
+                       float((a.col >> IM_COL32_A_SHIFT) & 0xff) / 255.0f, match->Codepoint});
+        i += 3;
+    }
+    return out;
+}
+
+// Match the actual consecutive native font quads for a known rendered label, not a
+// presumed pixel rectangle. The header paints its hits and fills in the same owner list.
+std::vector<ContrastGlyph> contrastTextRun(ImGuiWindow* owner, const char* text) {
+    const auto glyphs = contrastGlyphs(owner);
+    const size_t count = std::strlen(text);
+    std::vector<ContrastGlyph> found;
+    for (size_t i = 0; count && i + count <= glyphs.size(); ++i) {
+        bool match = true;
+        for (size_t j = 0; j < count; ++j) {
+            if (glyphs[i + j].codepoint != static_cast<unsigned char>(text[j]) ||
+                (j && glyphs[i + j].vertex != glyphs[i + j - 1].vertex + 4)) {
+                match = false;
+                break;
+            }
+        }
+        if (match && (found.empty() || glyphs[i].rect.Min.y < found.front().rect.Min.y))
+            found.assign(glyphs.begin() + i, glyphs.begin() + i + count);
+    }
+    return found;
+}
+
+void contrastBox(Renderer& renderer) {
+    Renderer::PartMesh part;
+    part.body_id = 1;
+    part.color[0] = part.color[1] = part.color[2] = 0.025f;
+    part.roughness = 0.5f;
+    auto& m = part.mesh;
+    auto face = [&](const std::array<std::array<float, 3>, 4>& p,
+                    const std::array<float, 3>& normal) {
+        const uint32_t base = static_cast<uint32_t>(m.positions.size() / 3);
+        for (const auto& v : p) {
+            m.positions.insert(m.positions.end(), v.begin(), v.end());
+            m.normals.insert(m.normals.end(), normal.begin(), normal.end());
+        }
+        m.indices.insert(m.indices.end(), {base, base + 1, base + 2, base, base + 2, base + 3});
+    };
+    face({{{-50,-50,5}, {50,-50,5}, {50,50,5}, {-50,50,5}}}, {0,0,1});
+    face({{{-50,50,-5}, {50,50,-5}, {50,-50,-5}, {-50,-50,-5}}}, {0,0,-1});
+    face({{{-50,-50,-5}, {50,-50,-5}, {50,-50,5}, {-50,-50,5}}}, {0,-1,0});
+    face({{{50,50,-5}, {-50,50,-5}, {-50,50,5}, {50,50,5}}}, {0,1,0});
+    face({{{-50,50,-5}, {-50,-50,-5}, {-50,-50,5}, {-50,50,5}}}, {-1,0,0});
+    face({{{50,-50,-5}, {50,50,-5}, {50,50,5}, {50,-50,5}}}, {1,0,0});
+    m.bbMin = Vec3(-50, -50, -5);
+    m.bbMax = Vec3(50, 50, 5);
+    m.center = Vec3(0, 0, 0);
+    m.radius = std::sqrt(5025.0f);
+    std::vector<Renderer::PartMesh> parts;
+    parts.push_back(std::move(part));
+    renderer.setMeshes(std::move(parts));
+}
+
+bool contrastReadPixels(int w, int h, bool scene, AppState& st,
+                        std::vector<unsigned char>& pixels) {
+    if (w <= 0 || h <= 0 || (scene && !st.renderer)) return false;
+    pixels.resize(static_cast<size_t>(w) * h * 4);
+    GLint oldReadFbo = 0, oldDrawFbo = 0, oldReadBuffer = 0, oldPackBuffer = 0;
+    GLint oldAlignment = 0, oldRowLength = 0, oldSkipRows = 0, oldSkipPixels = 0, viewport[4];
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &oldReadFbo);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &oldDrawFbo);
+    glGetIntegerv(GL_READ_BUFFER, &oldReadBuffer);
+    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &oldPackBuffer);
+    glGetIntegerv(GL_PACK_ALIGNMENT, &oldAlignment);
+    glGetIntegerv(GL_PACK_ROW_LENGTH, &oldRowLength);
+    glGetIntegerv(GL_PACK_SKIP_ROWS, &oldSkipRows);
+    glGetIntegerv(GL_PACK_SKIP_PIXELS, &oldSkipPixels);
+    glGetIntegerv(GL_VIEWPORT, viewport);
+    const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST), cull = glIsEnabled(GL_CULL_FACE);
+    if (scene) {
+        st.renderer->beginOverlay();
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+    } else {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        glReadBuffer(GL_BACK);
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_PACK_SKIP_ROWS, 0);
+    glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    if (scene) st.renderer->endOverlay(false);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, oldDrawFbo);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, oldReadFbo);
+    glReadBuffer(oldReadBuffer);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, oldPackBuffer);
+    glPixelStorei(GL_PACK_ALIGNMENT, oldAlignment);
+    glPixelStorei(GL_PACK_ROW_LENGTH, oldRowLength);
+    glPixelStorei(GL_PACK_SKIP_ROWS, oldSkipRows);
+    glPixelStorei(GL_PACK_SKIP_PIXELS, oldSkipPixels);
+    glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+    if (scissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+    if (cull) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
+    return true;
+}
+
+bool contrastWritePng(const std::string& path, const std::vector<unsigned char>& pixels,
+                      int w, int h) {
+    if (w <= 0 || h <= 0 || pixels.size() != static_cast<size_t>(w) * h * 4) return false;
+    std::vector<unsigned char> flipped(pixels.size());
+    for (int y = 0; y < h; ++y)
+        std::memcpy(flipped.data() + static_cast<size_t>(h - 1 - y) * w * 4,
+                    pixels.data() + static_cast<size_t>(y) * w * 4, static_cast<size_t>(w) * 4);
+    return stbi_write_png(path.c_str(), w, h, 4, flipped.data(), w * 4) != 0;
+}
+
+void contrastReplay(int w, int h) {
+    GLint drawFbo = 0, viewport[4];
+    GLfloat clear[4];
+    GLboolean colorMask[4];
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFbo);
+    glGetIntegerv(GL_VIEWPORT, viewport);
+    glGetFloatv(GL_COLOR_CLEAR_VALUE, clear);
+    glGetBooleanv(GL_COLOR_WRITEMASK, colorMask);
+    const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glViewport(0, 0, w, h);
+    glClearColor(ui::palette.windowBg[0], ui::palette.windowBg[1], ui::palette.windowBg[2], 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, drawFbo);
+    glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+    glClearColor(clear[0], clear[1], clear[2], clear[3]);
+    glColorMask(colorMask[0], colorMask[1], colorMask[2], colorMask[3]);
+    if (scissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+}
+
+bool contrastCapture(AppState& st, ImGuiWindow* child, int w, int h, ContrastFrame& f,
+                     const std::vector<ContrastTarget>& extra) {
+    if (!child || !ImGui::GetDrawData()) return false;
+    ui::simscene::ViewportCtx vp;
+    if (!sceneShotViewport(st, vp)) return false;
+    f.w = w; f.h = h;
+    f.sceneW = vp.cam.ssWidth; f.sceneH = vp.cam.ssHeight;
+    f.sceneMin = vp.imgMin; f.sceneMax = vp.imgMax;
+    f.displayPos = ImGui::GetDrawData()->DisplayPos;
+    f.scale = ImVec2(w / ImGui::GetDrawData()->DisplaySize.x,
+                     h / ImGui::GetDrawData()->DisplaySize.y);
+    f.clip = child->InnerClipRect;
+    f.glyphs = contrastGlyphs(child);
+    if (f.glyphs.empty() || f.sceneMax.x <= f.sceneMin.x || f.sceneMax.y <= f.sceneMin.y ||
+        !contrastReadPixels(w, h, false, st, f.actual) ||
+        !contrastReadPixels(f.sceneW, f.sceneH, true, st, f.scene))
+        return false;
+
+    struct ReferenceList {
+        ImDrawList* dl = nullptr;
+        const std::vector<ContrastGlyph>* glyphs = nullptr;
+        std::vector<ImU32> colors;
+        std::vector<ImDrawCallback> callbacks;
+    };
+    std::vector<ReferenceList> lists;
+    lists.reserve(extra.size() + 1);
+    lists.push_back({child->DrawList, &f.glyphs, {}, {}});
+    for (const auto& target : extra) {
+        if (!target.window || !target.window->DrawList || target.glyphs.empty()) return false;
+        for (const auto& list : lists)
+            if (list.dl == target.window->DrawList) return false;
+        lists.push_back({target.window->DrawList, &target.glyphs, {}, {}});
+    }
+    for (auto& list : lists) {
+        list.colors.reserve(list.glyphs->size() * 4);
+        for (const auto& q : *list.glyphs)
+            for (int k = 0; k < 4; ++k) list.colors.push_back(list.dl->VtxBuffer[q.vertex + k].col);
+        list.callbacks.reserve(list.dl->CmdBuffer.Size);
+        for (ImDrawCmd& cmd : list.dl->CmdBuffer) {
+            list.callbacks.push_back(cmd.UserCallback);
+            if (cmd.UserCallback) cmd.UserCallback = ImDrawCallback_ResetRenderState;
+        }
+    }
+    auto renderReference = [&](int mode, std::vector<unsigned char>& pixels) {
+        for (auto& list : lists) {
+            size_t n = 0;
+            for (const auto& q : *list.glyphs) for (int k = 0; k < 4; ++k) {
+                const ImU32 original = list.colors[n++];
+                list.dl->VtxBuffer[q.vertex + k].col = mode == 0 ? (original & ~IM_COL32_A_MASK)
+                    : (mode == 1 ? IM_COL32(0, 0, 0, 255) : IM_COL32(255, 255, 255, 255));  // gui-lint: allow font-coverage reference endpoints, not UI colors
+            }
+        }
+        contrastReplay(w, h);
+        return contrastReadPixels(w, h, false, st, pixels);
+    };
+    const bool ok = renderReference(0, f.background) && renderReference(1, f.black) &&
+                    renderReference(2, f.white);
+    for (auto& list : lists) {
+        size_t n = 0;
+        for (const auto& q : *list.glyphs)
+            for (int k = 0; k < 4; ++k) list.dl->VtxBuffer[q.vertex + k].col = list.colors[n++];
+        for (int i = 0; i < list.dl->CmdBuffer.Size; ++i)
+            list.dl->CmdBuffer[i].UserCallback = list.callbacks[i];
+    }
+    // Leave the live backbuffer in the actual state, not the white-mask reference.
+    contrastReplay(w, h);
+    return ok;
+}
+
+double contrastLinear(double s) {
+    s = std::clamp(s, 0.0, 1.0);
+    return s <= 0.04045 ? s / 12.92 : std::pow((s + 0.055) / 1.055, 2.4);
+}
+
+double contrastLuminance(const double rgb[3]) {
+    return 0.2126 * contrastLinear(rgb[0]) + 0.7152 * contrastLinear(rgb[1]) +
+           0.0722 * contrastLinear(rgb[2]);
+}
+
+double contrastRatio(double a, double b) {
+    return (std::max(a, b) + 0.05) / (std::min(a, b) + 0.05);
+}
+
+const unsigned char* contrastPixel(const std::vector<unsigned char>& pixels,
+                                   int w, int h, int x, int y) {
+    if (x < 0 || x >= w || y < 0 || y >= h) return nullptr;
+    return pixels.data() + (static_cast<size_t>(h - 1 - y) * w + x) * 4;
+}
+
+struct ContrastSample {
+    bool valid = false, light = false, readable = false;
+    double sceneLum = 0, backgroundLum = 0, inkLum = 0, ratio = 0, coverage = 0;
+    std::array<int, 3> scene{}, background{}, actual{};
+};
+
+ContrastSample contrastSample(const ContrastFrame& f, int x, int y, float vertexAlpha,
+                              const ImRect* clip = nullptr) {
+    ContrastSample s;
+    const auto* a = contrastPixel(f.actual, f.w, f.h, x, y);
+    const auto* b = contrastPixel(f.background, f.w, f.h, x, y);
+    const auto* black = contrastPixel(f.black, f.w, f.h, x, y);
+    const auto* white = contrastPixel(f.white, f.w, f.h, x, y);
+    if (!a || !b || !black || !white) return s;
+    s.coverage = (double(white[0]) - black[0]) / 255.0 * vertexAlpha;
+    if (s.coverage < 0.72) return s;
+    const float sx = f.displayPos.x + (x + 0.5f) / f.scale.x;
+    const float sy = f.displayPos.y + (y + 0.5f) / f.scale.y;
+    if (!(clip ? *clip : f.clip).Contains(ImVec2(sx, sy))) return s;
+    const int ix = static_cast<int>((sx - f.sceneMin.x) * f.sceneW / (f.sceneMax.x - f.sceneMin.x));
+    const int iy = static_cast<int>((sy - f.sceneMin.y) * f.sceneH / (f.sceneMax.y - f.sceneMin.y));
+    const auto* scene = contrastPixel(f.scene, f.sceneW, f.sceneH, ix, iy);
+    if (!scene) return s;
+    double bg[3], raw[3], ink[3];
+    for (int c = 0; c < 3; ++c) {
+        s.scene[c] = scene[c]; s.background[c] = b[c]; s.actual[c] = a[c];
+        raw[c] = scene[c] / 255.0;
+        bg[c] = b[c] / 255.0;
+        ink[c] = std::clamp((a[c] / 255.0 - bg[c] * (1.0 - s.coverage)) / s.coverage, 0.0, 1.0);
+    }
+    s.sceneLum = contrastLuminance(raw);
+    s.backgroundLum = contrastLuminance(bg);
+    s.inkLum = contrastLuminance(ink);
+    const ImVec4 light = ui::adaptiveSurface(0.0f).textPrimary;
+    const ImVec4 dark = ui::adaptiveSurface(1.0f).textPrimary;
+    const double lightRgb[3] = {light.x, light.y, light.z}, darkRgb[3] = {dark.x, dark.y, dark.z};
+    s.light = contrastRatio(s.backgroundLum, contrastLuminance(lightRgb)) >
+              contrastRatio(s.backgroundLum, contrastLuminance(darkRgb));
+    s.ratio = contrastRatio(s.backgroundLum, s.inkLum);
+    s.readable = s.ratio >= 4.0 && (s.light ? s.inkLum > s.backgroundLum : s.inkLum < s.backgroundLum);
+    s.valid = true;
+    return s;
+}
+
+nlohmann::json contrastSampleJson(const ContrastSample& s, int x, int y) {
+    return {{"pixel", {x, y}}, {"scene_rgb", s.scene}, {"background_rgb", s.background},
+            {"actual_rgb", s.actual}, {"scene_linear_luminance", s.sceneLum},
+            {"background_linear_luminance", s.backgroundLum}, {"ink_linear_luminance", s.inkLum},
+            {"ink_contrast", s.ratio}, {"coverage", s.coverage}, {"expected_light", s.light},
+            {"readable", s.readable}};
+}
+
+bool contrastMeasureLabel(const ContrastFrame& f, ImGuiWindow* owner,
+                          const std::vector<ContrastGlyph>& glyphs,
+                          const char* label, const char* checkName) {
+    if (!owner || glyphs.size() != std::strlen(label))
+        return contrastCheck(checkName, false, {{"label", label}, {"glyphs", glyphs.size()},
+                                               {"owner", owner ? owner->Name : "(missing)"}});
+    const ImRect clip(owner->Pos, ImVec2(owner->Pos.x + owner->Size.x, owner->Pos.y + owner->Size.y));
+    int darkPixels = 0, lightChoice = 0, readable = 0, otherPixels = 0;
+    nlohmann::json examples = nlohmann::json::array(), failures = nlohmann::json::array();
+    for (const auto& q : glyphs) {
+        const int x0 = std::max(0, int(std::floor((q.rect.Min.x - f.displayPos.x) * f.scale.x)));
+        const int x1 = std::min(f.w, int(std::ceil((q.rect.Max.x - f.displayPos.x) * f.scale.x)));
+        const int y0 = std::max(0, int(std::floor((q.rect.Min.y - f.displayPos.y) * f.scale.y)));
+        const int y1 = std::min(f.h, int(std::ceil((q.rect.Max.y - f.displayPos.y) * f.scale.y)));
+        for (int y = y0; y < y1; ++y) for (int x = x0; x < x1; ++x) {
+            const auto sample = contrastSample(f, x, y, q.alpha, &clip);
+            if (!sample.valid) continue;
+            if (sample.sceneLum >= 0.12) { ++otherPixels; continue; }
+            ++darkPixels;
+            lightChoice += sample.light;
+            readable += sample.readable;
+            if (examples.size() < 4) examples.push_back(contrastSampleJson(sample, x, y));
+            if (!sample.readable && failures.size() < 4)
+                failures.push_back(contrastSampleJson(sample, x, y));
+        }
+    }
+    return contrastCheck(checkName,
+        darkPixels >= 8 && readable * 10 >= darkPixels * 9 && lightChoice * 10 >= darkPixels * 9,
+        {{"label", label}, {"owner", owner->Name}, {"glyph_quads", glyphs.size()},
+         {"dark_scene_pixels", darkPixels}, {"other_scene_pixels", otherPixels},
+         {"dark_pixels_choosing_light", lightChoice}, {"readable_dark_pixels", readable},
+         {"examples", examples}, {"failures", failures}});
+}
+
+struct ContrastCounts {
+    int dark = 0, darkGood = 0, bright = 0, brightGood = 0;
+    int darkLight = 0, brightLight = 0, splitDark = 0, splitBright = 0;
+    int splitDarkGood = 0, splitBrightGood = 0;
+    int candidatePixels = 0, coveragePixels = 0, validPixels = 0, intermediatePixels = 0;
+    double maximumCoverage = 0.0;
+    nlohmann::json maximumCoverageSample = nullptr;
+    nlohmann::json examples = nlohmann::json::array();
+};
+
+ContrastCounts contrastMeasure(const ContrastFrame& f, const ImRect& target) {
+    ContrastCounts n;
+    for (const auto& q : f.glyphs) {
+        const int x0 = std::max(0, int(std::floor((q.rect.Min.x - f.displayPos.x) * f.scale.x)));
+        const int x1 = std::min(f.w, int(std::ceil((q.rect.Max.x - f.displayPos.x) * f.scale.x)));
+        const int y0 = std::max(0, int(std::floor((q.rect.Min.y - f.displayPos.y) * f.scale.y)));
+        const int y1 = std::min(f.h, int(std::ceil((q.rect.Max.y - f.displayPos.y) * f.scale.y)));
+        const bool split = q.wide && std::fabs(q.rect.Min.x - target.Min.x) < 1.0f &&
+                           std::fabs(q.rect.Min.y - target.Min.y) < 1.0f;
+        for (int y = y0; y < y1; ++y) for (int x = x0; x < x1; ++x) {
+            const auto* black = contrastPixel(f.black, f.w, f.h, x, y);
+            const auto* white = contrastPixel(f.white, f.w, f.h, x, y);
+            if (black && white) {
+                ++n.candidatePixels;
+                const double coverage = (double(white[0]) - black[0]) / 255.0 * q.alpha;
+                if (coverage >= 0.72) ++n.coveragePixels;
+                if (coverage > n.maximumCoverage) {
+                    n.maximumCoverage = coverage;
+                    n.maximumCoverageSample = {{"pixel", {x, y}}, {"vertex_alpha", q.alpha},
+                        {"black", {black[0], black[1], black[2]}},
+                        {"white", {white[0], white[1], white[2]}}};
+                }
+            }
+            const auto s = contrastSample(f, x, y, q.alpha);
+            if (!s.valid) continue;
+            ++n.validPixels;
+            if (s.sceneLum >= 0.12 && s.sceneLum <= 0.40) { ++n.intermediatePixels; continue; }
+            if (s.sceneLum < 0.12) {
+                ++n.dark; n.darkGood += s.readable; n.darkLight += s.light;
+                if (split) { ++n.splitDark; n.splitDarkGood += s.readable; }
+            } else {
+                ++n.bright; n.brightGood += s.readable; n.brightLight += s.light;
+                if (split) { ++n.splitBright; n.splitBrightGood += s.readable; }
+            }
+            if (n.examples.size() < 8 && (split || !s.readable))
+                n.examples.push_back(contrastSampleJson(s, x, y));
+        }
+    }
+    return n;
+}
+
+bool contrastMeasureFrame(const ContrastFrame& f, const char* phase, const ImRect& target) {
+    const auto n = contrastMeasure(f, target);
+    const bool darkTheme = ui::activeTheme == ui::Theme::Dark;
+    const nlohmann::json evidence = {
+        {"phase", phase}, {"glyph_quads", f.glyphs.size()}, {"scene_dark_pixels", n.dark},
+        {"scene_bright_pixels", n.bright}, {"scene_dark_readable", n.darkGood},
+        {"scene_bright_readable", n.brightGood}, {"dark_pixels_choosing_light", n.darkLight},
+        {"bright_pixels_choosing_light", n.brightLight},
+        {"target_W_scene_dark_pixels", n.splitDark}, {"target_W_scene_bright_pixels", n.splitBright},
+        {"target_W_dark_readable", n.splitDarkGood}, {"target_W_bright_readable", n.splitBrightGood},
+        {"coverage_method", n.splitDark && n.splitBright ? "split_glyph" : "precise_dark_light_pixels"},
+        {"candidate_pixels", n.candidatePixels}, {"coverage_pixels", n.coveragePixels},
+        {"valid_pixels", n.validPixels}, {"intermediate_scene_pixels", n.intermediatePixels},
+        {"maximum_coverage", n.maximumCoverage}, {"maximum_coverage_sample", n.maximumCoverageSample},
+        {"framebuffer", {f.w, f.h}}, {"scene_framebuffer", {f.sceneW, f.sceneH}},
+        {"clip", {f.clip.Min.x, f.clip.Min.y, f.clip.Max.x, f.clip.Max.y}},
+        {"examples", n.examples}};
+    const bool enough = f.glyphs.size() >= 20 && n.dark >= 12 && n.bright >= 12;
+    const bool readable = n.darkGood * 10 >= n.dark * 9 && n.brightGood * 10 >= n.bright * 9;
+    const bool splitCovered = std::strcmp(phase, "split") != 0 || (n.splitDark > 0 && n.splitBright > 0);
+    const bool splitReadable = !n.splitDark || !n.splitBright ||
+        (n.splitDarkGood * 10 >= n.splitDark * 9 && n.splitBrightGood * 10 >= n.splitBright * 9);
+    // Dark theme's real pinned slab deliberately darkens even the bright studio. The
+    // composited background, not the unoccluded scene FBO, determines the right ink.
+    const bool choices = darkTheme ? n.brightLight * 10 >= n.bright * 9
+                                   : n.darkLight * 10 >= n.dark * 9 && n.brightLight * 10 <= n.bright;
+    const std::string name = std::string(phase) + "_local_pixel_contrast";
+    return contrastCheck(name.c_str(), enough && readable && splitCovered && splitReadable && choices, evidence);
+}
+
+bool contrastMeasureMotion(const ContrastFrame& before, const ContrastFrame& after) {
+    int transitioned = 0, readable = 0, compositedChoice = 0;
+    nlohmann::json examples = nlohmann::json::array();
+    if (before.w != after.w || before.h != after.h)
+        return contrastCheck("same_frame_camera_response", false, {{"reason", "framebuffer_resized"}});
+    bool sameLayout = before.glyphs.size() == after.glyphs.size();
+    for (size_t i = 0; sameLayout && i < before.glyphs.size(); ++i) {
+        const auto& a = before.glyphs[i].rect;
+        const auto& b = after.glyphs[i].rect;
+        sameLayout = std::fabs(a.Min.x - b.Min.x) < 0.1f && std::fabs(a.Min.y - b.Min.y) < 0.1f &&
+                     std::fabs(a.Max.x - b.Max.x) < 0.1f && std::fabs(a.Max.y - b.Max.y) < 0.1f;
+    }
+    if (!sameLayout)
+        return contrastCheck("same_frame_camera_response", false,
+                             {{"reason", "prose_layout_changed"}, {"before_glyphs", before.glyphs.size()},
+                              {"after_glyphs", after.glyphs.size()}});
+    for (const auto& q : before.glyphs) {
+        const int x0 = std::max(0, int(std::floor((q.rect.Min.x - before.displayPos.x) * before.scale.x)));
+        const int x1 = std::min(before.w, int(std::ceil((q.rect.Max.x - before.displayPos.x) * before.scale.x)));
+        const int y0 = std::max(0, int(std::floor((q.rect.Min.y - before.displayPos.y) * before.scale.y)));
+        const int y1 = std::min(before.h, int(std::ceil((q.rect.Max.y - before.displayPos.y) * before.scale.y)));
+        for (int y = y0; y < y1; ++y) for (int x = x0; x < x1; ++x) {
+            const auto a = contrastSample(before, x, y, q.alpha);
+            const auto b = contrastSample(after, x, y, q.alpha);
+            if (!a.valid || !b.valid || a.sceneLum <= 0.40 || b.sceneLum >= 0.12) continue;
+            ++transitioned;
+            readable += a.readable && b.readable;
+            compositedChoice += ui::activeTheme == ui::Theme::Dark
+                ? a.light && b.light : !a.light && b.light;
+            if (examples.size() < 5)
+                examples.push_back({{"before", contrastSampleJson(a, x, y)},
+                                    {"after", contrastSampleJson(b, x, y)}});
+        }
+    }
+    return contrastCheck("same_frame_camera_response",
+                         transitioned >= 8 && readable * 10 >= transitioned * 9 &&
+                             compositedChoice * 10 >= transitioned * 9,
+                         {{"scene_bright_to_dark_pixels", transitioned}, {"readable_both", readable},
+                          {"composited_choices_correct", compositedChoice}, {"examples", examples}});
+}
+
+void textContrastTick(AppState& st) {
+    auto& p = g_textContrast;
+    if (!p.init) {
+        p.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        p.want = st.shot && mode && std::strcmp(mode, "text_contrast") == 0;
+        if (!p.want) return;
+        const char* dir = std::getenv("CHUDWARE_TEXT_CONTRAST_OUT");
+        p.dir = dir && *dir ? dir : "scratch/text_contrast_shots";
+        p.started = pipingNow();
+        std::error_code ec;
+        std::filesystem::create_directories(p.dir, ec);
+        if (ec) {
+            contrastCheck("output_directory", false, {{"path", p.dir}, {"error", ec.message()}});
+            return;
+        }
+        // An explicit session override is accepted only within the scenario's private output
+        // root. Without one, the normal per-CHUDWARE_SHOT private session store is used.
+        const char* session = std::getenv("CHUDWARE_SESSIONS_DIR");
+        if (session && *session) {
+            auto root = std::filesystem::weakly_canonical(p.dir, ec);
+            if (ec) {
+                contrastCheck("private_session_root", false, {{"error", ec.message()}});
+                return;
+            }
+            auto store = std::filesystem::weakly_canonical(session, ec);
+            if (ec || store == root ||
+                std::mismatch(root.begin(), root.end(), store.begin(), store.end()).first != root.end()) {
+                contrastCheck("private_session_root", false, {{"output_root", root.string()},
+                              {"session_dir", session}, {"error", ec.message()}});
+                return;
+            }
+        }
+        p.report["session_store"] = session && *session ? session : "per-shot private store";
+    }
+    if (!p.want || p.done) return;
+    if (pipingNow() - p.started > 120.0) {
+        contrastCheck("timeout", false, {{"step", p.step}, {"worker_started", st.workerStarted},
+                                        {"prose_window", contrastProseWindow() != nullptr}});
+        return;
+    }
+    if (!st.workerStarted || st.frame < 5 || p.capture) return;
+    st.activeWorkspace = AppState::Workspace::Model;
+    st.shotWorkspacePin = static_cast<int>(AppState::Workspace::Model);
+    st.showAIPanel = true;
+    auto& io = ImGui::GetIO();
+    if (p.step < 5) io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+    switch (p.step) {
+    case 0: {
+        if (!contrastCheck("renderer_available", st.renderer != nullptr, {})) return;
+        glfwSetWindowSize(st.win, static_cast<int>(ui::metrics::px(1280.0f)),
+                          static_cast<int>(ui::metrics::px(1000.0f)));
+        st.showFeatureTree = false;
+        st.settings.copilotCollapsed = false;
+        st.showSessionsPicker = st.showAISettingsOverlay = st.showTaskList = st.showArtifacts = false;
+        st.designStarted = true;
+        st.chat.clear();
+        ChatMsg m;
+        // A restored message is already past the native entrance fade; retain a real timestamp
+        // for the metadata row without making the pixel gate depend on rendering speed.
+        m.ts = chatNowEpoch() - 60.0;
+        m.model = kContrastModel;
+        m.text = kContrastProse;
+        st.chat.push_back(std::move(m));
+        st.displayStyle = 0;
+        st.orthographic = true;
+        st.showGroundShadow = false;
+        st.showRealView = false;
+        st.showTriad = false;
+        st.showPlane[0] = st.showPlane[1] = st.showPlane[2] = false;
+        st.planesUserToggled = true;
+        st.animActive = false;
+        ui::cancelCameraAnimation();
+        st.yaw = 0.0f; st.pitch = 90.0f; st.zoom = 2.0f;
+        st.pan[0] = st.pan[1] = st.pan[2] = 0.0f;
+        contrastBox(*st.renderer);
+        p.report["mesh"] = {{"kind", "shaded_closed_box"}, {"triangles", 12},
+                            {"dimensions", {100, 100, 10}}, {"material_rgb", {0.025, 0.025, 0.025}}};
+        p.report["theme"] = ui::activeTheme == ui::Theme::Dark ? "dark" : "light";
+        p.report["ui_scale"] = ui::uiScale;
+        p.step = 1;
+        break;
+    }
+    case 1: {
+        ImGuiWindow* child = contrastProseWindow();
+        ui::simscene::ViewportCtx vp;
+        if (!child || !sceneShotViewport(st, vp)) return;
+        const auto glyphs = contrastGlyphs(child);
+        const auto wide = std::find_if(glyphs.begin(), glyphs.end(), [](const auto& q) { return q.wide; });
+        if (wide == glyphs.end()) return;
+        const float edge[3] = {50.0f, 0.0f, 5.0f};
+        ImVec2 projected;
+        if (!ui::simscene::worldToScreen(vp, edge, projected)) return;
+        const ImVec2 target((wide->rect.Min.x + wide->rect.Max.x) * 0.5f,
+                            (child->InnerClipRect.Min.y + child->InnerClipRect.Max.y) * 0.5f);
+        const float dx = projected.x - target.x, dy = target.y - projected.y;
+        if (std::fabs(dx) > 0.75f || std::fabs(dy) > 0.75f) {
+            const float worldPerPixel = 2.0f * vp.cam.halfHeight / (vp.imgMax.y - vp.imgMin.y);
+            st.pan[0] += (vp.cam.right.x * dx + vp.cam.up.x * dy) * worldPerPixel;
+            st.pan[1] += (vp.cam.right.y * dx + vp.cam.up.y * dy) * worldPerPixel;
+            st.pan[2] += (vp.cam.right.z * dx + vp.cam.up.z * dy) * worldPerPixel;
+            return;
+        }
+        p.target = wide->rect;
+        p.inputId = child->ChildId;
+        p.click = ImVec2((wide->rect.Min.x + wide->rect.Max.x) * 0.5f,
+                         (wide->rect.Min.y + wide->rect.Max.y) * 0.5f);
+        p.report["target_glyph"] = {{"character", "W"},
+            {"rect", {p.target.Min.x, p.target.Min.y, p.target.Max.x, p.target.Max.y}},
+            {"projected_edge", {projected.x, projected.y}}, {"alignment_error", {dx, dy}}};
+        p.capture = 1; p.step = 2;
+        break;
+    }
+    case 3: {
+        const auto& cam = st.renderer->camera();
+        const auto backdrop = ui::viewportBackdrop();
+        if (!backdrop.valid()) return;
+        // Translate the real camera by 48 logical pixels so previously bright pixels of the
+        // SAME glyphs are covered by the box on the next rendered frame.
+        const float worldPerPixel = 2.0f * cam.halfHeight / (backdrop.screenMax.y - backdrop.screenMin.y);
+        const float shift = ui::metrics::px(48.0f) * worldPerPixel;
+        st.pan[0] -= cam.right.x * shift;
+        st.pan[1] -= cam.right.y * shift;
+        st.pan[2] -= cam.right.z * shift;
+        p.report["camera_shift_logical_pixels"] = ui::metrics::px(48.0f);
+        p.capture = 2; p.step = 4;
+        break;
+    }
+    case 5:
+        if (p.input.click(p.click)) p.step = 6;
+        break;
+    case 6:
+        if (!contrastCheck("native_prose_focus", ImGui::GetInputTextState(p.inputId) != nullptr &&
+                           ImGui::GetCurrentContext()->ActiveId == p.inputId,
+                           {{"item_id", p.inputId}, {"active_id", ImGui::GetCurrentContext()->ActiveId}})) return;
+        io.AddKeyEvent(ImGuiMod_Ctrl, true);
+        io.AddKeyEvent(ImGuiKey_A, true);
+        p.step = 7;
+        break;
+    case 7:
+        io.AddKeyEvent(ImGuiKey_A, false);
+        io.AddKeyEvent(ImGuiMod_Ctrl, false);
+        p.step = 8;
+        break;
+    case 8: {
+        const std::string selected = chatInputSelection(p.inputId);
+        if (!contrastCheck("native_select_all", selected == kContrastProse, {{"selection", selected}})) return;
+        io.AddKeyEvent(ImGuiMod_Ctrl, true);
+        io.AddKeyEvent(ImGuiKey_C, true);
+        p.step = 9;
+        break;
+    }
+    case 9:
+        io.AddKeyEvent(ImGuiKey_C, false);
+        io.AddKeyEvent(ImGuiMod_Ctrl, false);
+        p.step = 10;
+        break;
+    case 10: {
+        const char* clipboard = ImGui::GetClipboardText();
+        const std::string copied = clipboard ? clipboard : "";
+        if (!contrastCheck("native_copy_plain_prose", copied == kContrastProse, {{"clipboard", copied}})) return;
+        p.capture = 3; p.step = 11;
+        break;
+    }
+    default: break;
+    }
+}
+
+bool textContrastEndFrame(AppState& st, int w, int h, const char* screenshotPath, bool& done) {
+    auto& p = g_textContrast;
+    if (!p.want) return false;
+    ++st.frame;
+    if (p.capture == 1 || p.capture == 2) {
+        const int capture = p.capture;
+        p.capture = 0;
+        ImGuiWindow* child = contrastProseWindow();
+        ImGuiWindow* header = nullptr;
+        ImGuiWindow* metadata = nullptr;
+        std::vector<ContrastGlyph> chatGlyphs, sessionsGlyphs, modelGlyphs;
+        std::vector<ContrastTarget> extra;
+        bool targetsReady = true;
+        if (capture == 1) {
+            header = ImGui::FindWindowByName("Copilot###AI");
+            metadata = child ? child->ParentWindow : nullptr;
+            chatGlyphs = contrastTextRun(header, "Chat");
+            sessionsGlyphs = contrastTextRun(header, "Sessions");
+            modelGlyphs = contrastTextRun(metadata, kContrastModel);
+            targetsReady = contrastCheck("native_header_metadata_glyph_runs",
+                header && metadata && chatGlyphs.size() == std::strlen("Chat") &&
+                    sessionsGlyphs.size() == std::strlen("Sessions") &&
+                    modelGlyphs.size() == std::strlen(kContrastModel),
+                {{"header", header ? header->Name : "(missing)"},
+                 {"metadata_owner", metadata ? metadata->Name : "(missing)"},
+                 {"chat_glyphs", chatGlyphs.size()}, {"sessions_glyphs", sessionsGlyphs.size()},
+                 {"metadata_glyphs", modelGlyphs.size()}});
+            if (targetsReady) {
+                std::vector<ContrastGlyph> headerGlyphs = chatGlyphs;
+                headerGlyphs.insert(headerGlyphs.end(), sessionsGlyphs.begin(), sessionsGlyphs.end());
+                extra.push_back({header, std::move(headerGlyphs)});
+                extra.push_back({metadata, modelGlyphs});
+            }
+        }
+        ContrastFrame f;
+        if (targetsReady && !contrastCheck("capture_real_prose_and_scene",
+                child && child->ChildId == p.inputId && contrastCapture(st, child, w, h, f, extra),
+                {{"phase", capture}, {"window", child ? child->Name : "(missing)"},
+                 {"expected_id", p.inputId}, {"actual_id", child ? child->ChildId : 0}})) {
+            // The failure is reported and captured below.
+        } else if (targetsReady) {
+            const std::string prefix = p.dir + (capture == 1 ? "/01_split" : "/02_moved");
+            const bool written = contrastWritePng(prefix + ".png", f.actual, w, h) &&
+                                 contrastWritePng(prefix + "_background.png", f.background, w, h) &&
+                                 (capture != 2 || !screenshotPath ||
+                                  contrastWritePng(screenshotPath, f.actual, w, h));
+            if (contrastCheck("capture_written", written, {{"prefix", prefix}})) {
+                p.report["captures"].push_back(prefix + ".png");
+                p.report["captures"].push_back(prefix + "_background.png");
+                if (contrastMeasureFrame(f, capture == 1 ? "split" : "moved", p.target) &&
+                    (capture != 1 ||
+                     (contrastMeasureLabel(f, header, chatGlyphs, "Chat", "header_chat_dark_contrast") &&
+                      contrastMeasureLabel(f, header, sessionsGlyphs, "Sessions", "header_sessions_dark_contrast") &&
+                      contrastMeasureLabel(f, metadata, modelGlyphs, kContrastModel,
+                                           "assistant_metadata_dark_contrast")))) {
+                    if (capture == 1) {
+                        p.first = std::move(f);
+                        p.step = 3;
+                    } else if (contrastMeasureMotion(p.first, f)) {
+                        p.moved = std::move(f);
+                        p.step = 5;
+                    }
+                }
+            }
+        }
+    } else if (p.capture == 3) {
+        p.capture = 0;
+        std::vector<unsigned char> pixels;
+        bool read = contrastReadPixels(w, h, false, st, pixels);
+        int changed = 0;
+        if (read && w == p.moved.w && h == p.moved.h) {
+            for (const auto& q : p.moved.glyphs) {
+                const int x0 = std::max(0, int(std::floor((q.rect.Min.x - p.moved.displayPos.x) * p.moved.scale.x)));
+                const int x1 = std::min(w, int(std::ceil((q.rect.Max.x - p.moved.displayPos.x) * p.moved.scale.x)));
+                const int y0 = std::max(0, int(std::floor((q.rect.Min.y - p.moved.displayPos.y) * p.moved.scale.y)));
+                const int y1 = std::min(h, int(std::ceil((q.rect.Max.y - p.moved.displayPos.y) * p.moved.scale.y)));
+                for (int y = y0; y < y1; ++y) for (int x = x0; x < x1; ++x) {
+                    const auto* black = contrastPixel(p.moved.black, w, h, x, y);
+                    const auto* white = contrastPixel(p.moved.white, w, h, x, y);
+                    const auto* bg = contrastPixel(p.moved.background, w, h, x, y);
+                    const auto* now = contrastPixel(pixels, w, h, x, y);
+                    if (black && white && bg && now && std::abs(int(white[0]) - int(black[0])) < 8 &&
+                        std::max({std::abs(int(now[0]) - int(bg[0])),
+                                  std::abs(int(now[1]) - int(bg[1])),
+                                  std::abs(int(now[2]) - int(bg[2]))}) >= 10)
+                        ++changed;
+                }
+            }
+        }
+        const std::string path = p.dir + "/03_native_selection.png";
+        const bool written = read && contrastWritePng(path, pixels, w, h);
+        if (contrastCheck("native_selection_fill_visible", written && changed >= 20,
+                          {{"non_glyph_pixels_changed", changed}, {"capture", path}})) {
+            p.report["captures"].push_back(path);
+            p.report["ok"] = true;
+            p.done = true;
+        }
+    }
+    if (p.done) {
+        if (p.failed) {
+            const std::string failure = p.dir + "/FAILED.png";
+            if (writeBackbufferPng(failure.c_str(), w, h))
+                p.report["captures"].push_back(failure);
+        }
+        p.report["seconds"] = pipingNow() - p.started;
+        const std::string reportPath = p.dir + "/report.json";
+        std::ofstream out(reportPath, std::ios::trunc);
+        out << p.report.dump(2) << '\n';
+        out.close();
+        std::printf("text_contrast: report -> %s ok=%d\n", reportPath.c_str(),
+                    int(p.report.value("ok", false)));
+        std::fflush(stdout);
+        swapScenarioFrame(st.win);
+        done = true;
+        if (p.failed || !out) {
+            core::framestats::flushReport();
+            std::fflush(nullptr);
+            std::_Exit(EXIT_FAILURE);
+        }
+        return true;
+    }
+    swapScenarioFrame(st.win);
+    done = false;
+    return true;
+}
+// Exercise real command-search and quick-settings gestures, then inspect the rendered section
+// windows rather than merely checking the requested route value.
+struct SettingsRouteShot {
+    bool init = false, want = false, done = false, failed = false;
+    int step = 0, settle = 0, route = 0, scrollTicks = 0;
+    double started = 0;
+    SceneShotInput input;
+    nlohmann::json checks = nlohmann::json::array();
+} g_settingsRoute;
+
+void settingsRouteTick(AppState& st) {
+    auto& p = g_settingsRoute;
+    if (!p.init) {
+        p.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        p.want = st.shot && mode && std::strcmp(mode, "settings_routes") == 0;
+        if (!p.want) return;
+        std::filesystem::create_directories("scratch/settings_routes_shots");
+        p.started = pipingNow();
+    }
+    if (!p.want || p.done) return;
+    ui::audit::observedItems();
+    auto fail = [&](const char* name) {
+        p.checks.push_back({{"name", name}, {"ok", false}, {"step", p.step},
+                            {"route", p.route}, {"items", ui::audit::observedItems()},
+                            {"windows", ui::audit::observedWindows()}});
+        p.failed = p.done = true;
+    };
+    if (pipingNow() - p.started > 180.0) { fail("timeout"); return; }
+    if (!st.workerStarted || st.frame < 5) return;
+    if (p.settle > 0) { --p.settle; return; }
+    auto next = [&](int step, int settle = 5) { p.step = step; p.settle = settle; };
+    auto hasWindow = [](const char* fragment) {
+        for (const auto& w : ui::audit::observedWindows())
+            if (w.value("window", std::string()).find(fragment) != std::string::npos) return true;
+        return false;
+    };
+    auto click = [&](const char* label, const char* window) {
+        if (p.input.phase) return p.input.click(p.input.point);
+        const auto* item = shotItem(label, true, window);
+        if (!item) {
+            if (shotItem(label, false, window)) {
+                shotScrollTo(label, window, true);
+            } else if (!window) {
+                for (const auto& w : ui::audit::observedWindows()) {
+                    if (w.value("window", std::string()).find("cp_settings") == std::string::npos ||
+                        !w.value("wheel_enabled", false)) continue;
+                    const auto& pos = w["wheel_point"];
+                    auto& io = ImGui::GetIO();
+                    io.AddMousePosEvent(pos[0].get<float>(), pos[1].get<float>());
+                    if (p.scrollTicks++ % 4 == 1) io.AddMouseWheelEvent(0.0f, -1.0f);
+                    break;
+                }
+            }
+            return false;
+        }
+        return p.input.click(shotPoint(*item));
+    };
+    static const char* queries[] = {"Session knobs", "Model roles", "Role prompts",
+        "Skill editor", "Rule triggers", "Artifact validity", "Tool families", "Prompt assembly",
+        "AI provider"};
+    static const char* windows[] = {"##ai_harness_session", "##ai_model_roles", "##roleeditor",
+        "##set_skill_list", "##set_trig_list", "##bench_artifact",
+        "##ai_tools_global", "##ai_dev_preview", "##tab_providers"};
+    switch (p.step) {
+    case 0:
+        st.showAIPanel = true;
+        st.settings.copilotCollapsed = false;
+        st.showAISettingsOverlay = true;
+        next(1, 12);
+        break;
+    case 1:
+        if (click("Prompts##q_open_prompts", nullptr)) next(2);
+        break;
+    case 2:
+        if (!hasWindow("##roleeditor") || st.showAISettingsOverlay) {
+            fail("quick_prompts_opens_prompt_editor"); return;
+        }
+        p.checks.push_back({{"name", "quick_prompts_opens_prompt_editor"}, {"ok", true}});
+        next(3);
+        break;
+    case 3:
+        if (p.route == static_cast<int>(sizeof(queries) / sizeof(queries[0]))) { p.done = true; break; }
+        st.showCommandSearch = true;
+        next(4);
+        break;
+    case 4:
+        ImGui::GetIO().AddInputCharactersUTF8(queries[p.route]);
+        next(5);
+        break;
+    case 5:
+        // Exercise both search activation paths.
+        if (p.route % 2 == 0) {
+            if (p.input.key(ImGuiKey_Enter)) next(6);
+        } else if (click("##row", "CommandSearch")) {
+            next(6);
+        }
+        break;
+    case 6:
+        if (st.showCommandSearch || !hasWindow(windows[p.route])) {
+            fail(queries[p.route]); return;
+        }
+        p.checks.push_back({{"name", queries[p.route]}, {"ok", true},
+                            {"activation", p.route % 2 == 0 ? "enter" : "click"},
+                            {"section_window", windows[p.route]}});
+        ++p.route;
+        next(3);
+        break;
+    }
+}
+
+bool settingsRouteEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, bool& done) {
+    auto& p = g_settingsRoute;
+    if (!p.want) return false;
+    ++st.frame;
+    if (p.done)
+        writeBackbufferPng("scratch/settings_routes_shots/final.png", dw, dh, screenshotPath);
+    std::ofstream out("scratch/settings_routes_shots/report.json", std::ios::trunc);
+    out << nlohmann::json({{"ok", p.done && !p.failed}, {"checks", p.checks}}).dump(2) << '\n';
+    out.close();
+    swapScenarioFrame(st.win);
+    done = p.done;
+    if (!out || (p.done && p.failed)) {
+        core::framestats::flushReport();
+        std::fflush(nullptr);
+        std::_Exit(EXIT_FAILURE);
+    }
+    return true;
+}
+// Exercises persisted model assignments with an isolated APPDATA and the real picker/RPC.
+struct ModelSettingsShot {
+    bool init = false, want = false, done = false, failed = false;
+    bool queryPending = false, queryReady = false, noProviders = false;
+    int step = 0, settle = 0, popupAttempts = 0, scrollTicks = 0;
+    double started = 0, reloadAt = 0;
+    SceneShotInput input;
+    nlohmann::json reply, checks = nlohmann::json::array(), baseline,
+                   captures = nlohmann::json::array();
+    std::filesystem::path lockPath;
+    std::filesystem::perms lockPermissions = std::filesystem::perms::unknown;
+    bool lockRestricted = false;
+    std::string capture;
+} g_modelSettings;
+
+bool modelSettingsRestoreLock() {
+    auto& p = g_modelSettings;
+    if (!p.lockRestricted) return true;
+    std::error_code ec;
+    std::filesystem::permissions(p.lockPath, p.lockPermissions,
+                                 std::filesystem::perm_options::replace, ec);
+    if (!ec) p.lockRestricted = false;
+    return !ec;
+}
+
+bool modelSettingsRestrictLock(std::string& error) {
+    auto& p = g_modelSettings;
+    namespace fs = std::filesystem;
+    const fs::path root = fs::absolute("scratch/model_settings_private").lexically_normal();
+    const fs::path config = root / "Chudware" / "config.json";
+    const fs::path lock = root / "Chudware" / "config.json.lock";
+    std::error_code ec;
+    if (p.lockRestricted || fs::canonical(root, ec) != root || ec) {
+        error = "Private APPDATA must be a real, non-symlink directory.";
+        return false;
+    }
+    const auto configStatus = fs::symlink_status(config, ec);
+    if (ec || !fs::is_regular_file(configStatus) || fs::canonical(config, ec) != config || ec) {
+        error = "Private config.json is missing or is not a regular, non-symlink file.";
+        return false;
+    }
+    const auto lockStatus = fs::symlink_status(lock, ec);
+    if (ec || !fs::is_regular_file(lockStatus) || fs::canonical(lock, ec) != lock || ec ||
+        (lockStatus.permissions() & fs::perms::owner_write) == fs::perms::none) {
+        error = "Private config lock is missing, not writable, or not a regular non-symlink file.";
+        return false;
+    }
+    if (!flushConfigWrites()) {
+        error = "Could not flush private GUI config writes before restricting the lock.";
+        return false;
+    }
+    p.lockPath = lock;
+    p.lockPermissions = lockStatus.permissions();
+    fs::permissions(lock, fs::perms::owner_write | fs::perms::group_write |
+                           fs::perms::others_write, fs::perm_options::remove, ec);
+    if (ec) { error = ec.message(); return false; }
+    p.lockRestricted = true;
+    // Privileged users or ACLs can bypass mode bits; refuse rather than claim a failure was tested.
+    std::fstream probe(lock, std::ios::in | std::ios::out | std::ios::app);
+    if (probe.is_open()) {
+        probe.close();
+        error = "Private config lock remains writable despite the permission restriction.";
+        modelSettingsRestoreLock();
+        return false;
+    }
+    return true;
+}
+
+void modelSettingsTick(AppState& st) {
+    auto& p = g_modelSettings;
+    if (!p.init) {
+        p.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        p.want = st.shot && mode && std::strcmp(mode, "model_settings") == 0;
+        if (!p.want) return;
+        std::filesystem::create_directories("scratch/model_settings_shots");
+        p.started = pipingNow();
+        const char* data = std::getenv("APPDATA");
+        const auto expected = std::filesystem::absolute("scratch/model_settings_private").lexically_normal();
+        if (!data || std::filesystem::path(data).lexically_normal() != expected) {
+            p.checks.push_back({{"name", "isolated_appdata_required"}, {"ok", false},
+                                {"expected", expected.string()}});
+            p.failed = p.done = true;
+            return;
+        }
+        std::error_code pathError;
+        const auto scratch = expected.parent_path();
+        if (std::filesystem::canonical(scratch, pathError) != scratch || pathError) {
+            p.checks.push_back({{"name", "private_scratch_must_not_be_symlinked"}, {"ok", false}});
+            p.failed = p.done = true;
+            return;
+        }
+        std::filesystem::create_directories(expected, pathError);
+        const auto privateConfig = expected / "Chudware" / "config.json";
+        const auto privateLock = expected / "Chudware" / "config.json.lock";
+        if (pathError || std::filesystem::canonical(expected, pathError) != expected || pathError ||
+            std::filesystem::weakly_canonical(privateConfig, pathError) != privateConfig || pathError ||
+            std::filesystem::weakly_canonical(privateLock, pathError) != privateLock || pathError) {
+            p.checks.push_back({{"name", "private_config_must_not_be_symlinked"}, {"ok", false}});
+            p.failed = p.done = true;
+            return;
+        }
+        const char* sessions = std::getenv("CHUDWARE_SESSIONS_DIR");
+        const char* daemon = std::getenv("CHUDWARE_ENGINE_DAEMON");
+        if (!sessions || std::filesystem::path(sessions).lexically_normal() != expected / "sessions" ||
+            !daemon || std::strcmp(daemon, "0") != 0) {
+            p.checks.push_back({{"name", "isolated_sessions_and_daemon_required"}, {"ok", false}});
+            p.failed = p.done = true;
+            return;
+        }
+        if (std::getenv("CHUDWARE_THEME")) {
+            p.checks.push_back({{"name", "theme_override_must_be_unset"}, {"ok", false}});
+            p.failed = p.done = true;
+            return;
+        }
+        // Test metadata is intentionally synthetic; it tests routing and filtering,
+        // not whether any model exists or a real account can use it.
+        std::vector<ui::BridgeModelMeta> models;
+        auto addFixture = [&](const char* provider, const char* id, const char* name,
+                              std::vector<std::string> efforts, bool vision) {
+            ui::BridgeModelMeta m;
+            m.provider = provider; m.id = id; m.name = name;
+            m.reasoningEffortsKnown = true; m.reasoningEfforts = std::move(efforts);
+            m.visionKnown = true; m.vision = vision;
+            models.push_back(std::move(m));
+        };
+        addFixture("openai-codex", "fixture-terra", "Fixture Terra", {"low", "high"}, false);
+        addFixture("openai-codex", "fixture-sol", "Fixture Sol", {"off", "minimal", "xhigh"}, true);
+        addFixture("anthropic", "fixture-claude", "Fixture Claude", {"low", "medium"}, true);
+        addFixture("zenmux", "fixture-zenmux", "Fixture ZenMux", {}, false);
+        addFixture("google", "fixture-disabled", "Fixture Disabled", {}, false);
+        // Extra synthetic entries exercise a scrollable catalog without asserting real availability.
+        for (int i = 0; i < 16; ++i) {
+            const std::string id = "fixture-scroll-" + std::to_string(i);
+            const std::string name = "Fixture scroll " + std::to_string(i);
+            addFixture("openai-codex", id.c_str(), name.c_str(), {}, false);
+        }
+        ui::setModelSettingsScenarioCatalog(st, std::move(models));
+        st.settings.showAdvanced = false;
+        st.settings.composerFollowRoles = true;
+    }
+    if (!p.want || p.done) return;
+    ui::audit::observedItems();
+    auto check = [&](const char* name, bool ok, const nlohmann::json& evidence) {
+        p.checks.push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
+        if (!ok) {
+            if (!modelSettingsRestoreLock())
+                p.checks.push_back({{"name", "restore_private_lock_permissions"}, {"ok", false},
+                                    {"path", p.lockPath.string()}});
+            p.failed = p.done = true;
+            p.capture = "scratch/model_settings_shots/failed.png";
+        }
+        return ok;
+    };
+    if (pipingNow() - p.started > 180.0) {
+        check("timeout", false, {{"step", p.step}, {"items", ui::audit::observedItems()}});
+        return;
+    }
+    if (!st.workerStarted || st.frame < 5 || !p.capture.empty()) return;
+    // These are synthetic rows, not a claim about provider credentials or entitlement.
+    st.signedInBridgeProviders.clear();
+    if (!p.noProviders) {
+        st.signedInBridgeProviders.insert("openai-codex");
+        st.signedInBridgeProviders.insert("anthropic");
+    }
+    st.signedInBridgeProviders.insert("google");
+    st.settings.disabledProviders.insert("google");
+    if (p.settle > 0) { --p.settle; return; }
+    auto next = [&](int step, int settle = 8) { p.step = step; p.settle = settle; };
+    auto click = [&](const char* label, const char* window = nullptr) {
+        if (p.input.phase) return p.input.click(p.input.point);
+        const auto* item = shotItem(label, true, window);
+        if (!item) { shotScrollTo(label, window, true); return false; }
+        return p.input.click(shotPoint(*item));
+    };
+    auto byIndex = [&](const char* native, int index) -> const nlohmann::json* {
+        for (const auto& item : ui::audit::observedItems()) {
+            if (item.value("window", std::string()).find("##ai_basic_models") == std::string::npos ||
+                item.value("native_label", std::string()) != native || !item.value("enabled", false)) continue;
+            if (index-- == 0) return &item;
+        }
+        return nullptr;
+    };
+    auto clickIndex = [&](const char* native, int index, const char* seek) {
+        if (p.input.phase) return p.input.click(p.input.point);
+        const auto* item = byIndex(native, index);
+        if (!item || !item->value("visible", false)) {
+            shotScrollTo(item ? native : seek, "##ai_basic_models", true, item); return false;
+        }
+        return p.input.click(shotPoint(*item));
+    };
+    auto clickNative = [&](const char* native, const char* window, const char* seek) {
+        if (p.input.phase) return p.input.click(p.input.point);
+        const nlohmann::json* target = nullptr;
+        for (const auto& item : ui::audit::observedItems())
+            if (item.value("window", std::string()).find(window) != std::string::npos &&
+                item.value("native_label", std::string()) == native && item.value("enabled", false)) {
+                target = &item; break;
+            }
+        if (!target || !target->value("visible", false)) {
+            shotScrollTo(target ? native : seek, window, true, target); return false;
+        }
+        return p.input.click(shotPoint(*target));
+    };
+    auto query = [&](const char* method = "ai_roles_get", nlohmann::json args = nlohmann::json::object()) {
+        if (p.queryPending || p.queryReady) return;
+        p.queryPending = true;
+        st.rpc.call(method, args, [](const core::RpcResult& r) {
+            auto& q = g_modelSettings;
+            q.reply = r.ok ? r.result : nlohmann::json{{"rpc_error", r.err}};
+            q.queryPending = false;
+            q.queryReady = true;
+        });
+    };
+    auto draftVisible = [&]() {
+        return shotItem("Unsaved model assignment. Retry or discard this change.", false,
+                        "##ai_basic_models") &&
+               shotItem("Retry save", false, "##ai_basic_models") &&
+               shotItem("Discard change", false, "##ai_basic_models");
+    };
+    auto draftPresent = [&]() {
+        return shotItem("Unsaved model assignment. Retry or discard this change.", false,
+                        "##ai_basic_models") ||
+               shotItem("Saving model assignment...", false, "##ai_basic_models");
+    };
+    auto fullyVisible = [](const nlohmann::json* item) {
+        if (!item || !item->value("visible", false)) return false;
+        const auto& rect = (*item)["full_rect"];
+        const auto& clip = (*item)["clip"];
+        return rect[0].get<float>() >= clip[0].get<float>() - 1.0f &&
+               rect[1].get<float>() >= clip[1].get<float>() - 1.0f &&
+               rect[2].get<float>() <= clip[2].get<float>() + 1.0f &&
+               rect[3].get<float>() <= clip[3].get<float>() + 1.0f;
+    };
+    auto frameDraft = [&]() {
+        const char* status = "Unsaved model assignment. Retry or discard this change.";
+        const auto* draft = shotItem(status, false, "##ai_basic_models");
+        const auto* retry = shotItem("Retry save", false, "##ai_basic_models");
+        const auto* discard = shotItem("Discard change", false, "##ai_basic_models");
+        if (!draft) return false;  // The save may still be in flight.
+        if (fullyVisible(draft) && fullyVisible(retry) && fullyVisible(discard)) return true;
+        shotScrollTo(status, "##ai_basic_models", true, draft);
+        return false;
+    };
+    auto verticallyOrdered = [](const nlohmann::json* upper, const nlohmann::json* lower) {
+        return upper && lower && (*upper)["full_rect"][3].get<float>() <=
+                                 (*lower)["full_rect"][1].get<float>() + 1.0f;
+    };
+    auto popupStatus = []() -> const nlohmann::json* {
+        for (const auto& item : ui::audit::observedItems()) {
+            const auto window = item.value("window", std::string());
+            if (item.value("text_only", false) &&
+                window.find("##Combo") != std::string::npos &&
+                window.find("##model_results") == std::string::npos)
+                return &item;
+        }
+        return nullptr;
+    };
+    const char* terra = "openai-codex \xc2\xb7 Fixture Terra";
+    const char* sol = "openai-codex \xc2\xb7 Fixture Sol";
+    const char* claude = "anthropic \xc2\xb7 Fixture Claude";
+    switch (p.step) {
+    case 0:
+        // Seed only isolated synthetic assignments; no model, provider or session is invoked.
+        query("ai_roles_set", {
+            {"advanced_overrides", true},
+            {"chat_assignment", {{"mode", "fixed"}, {"provider", "openai-codex"}, {"model", "fixture-terra"}}},
+            {"model_sizes", {{"small", {{"mode", "fixed"}, {"provider", "missing-provider"}, {"model", "missing-model"}}},
+                             {"medium", {{"mode", "default"}}}, {"large", {{"mode", "default"}}}}},
+            {"roles", {{"advisor", {{"mode", "fixed"}, {"provider", "openai-codex"}, {"model", "fixture-terra"}, {"thinking", "max"}}},
+                       {"task", {{"mode", "fixed"}, {"provider", "anthropic"}, {"model", "fixture-claude"}, {"thinking", "medium"}}}}}
+        });
+        if (!p.queryReady) break;
+        if (!check("fixture_assignments_seeded", p.reply.value("ok", false), p.reply)) return;
+        p.baseline = p.reply; p.queryReady = false;
+        st.showCommandSearch = true; next(1); break;
+    case 1:
+        ImGui::GetIO().AddInputCharactersUTF8("Harness");
+        next(2); break;
+    case 2:
+        if (p.input.key(ImGuiKey_Enter)) next(3, 30);
+        break;
+    case 3: {
+        // A settings-search jump intentionally enables the global Advanced disclosure;
+        // turn it off with the real checkbox before checking Basic.
+        if (st.settings.showAdvanced || p.input.phase) {
+            if (click("##kit_check", "##settings_nav")) next(3, 8);
+            break;
+        }
+        const auto* chat = byIndex("##role_pick", 0);
+        const auto* small = byIndex("##role_pick", 1);
+        const auto* medium = byIndex("##role_pick", 2);
+        const auto* large = byIndex("##role_pick", 3);
+        if (!chat || !small || !medium || !large) break;
+        if (!check("basic_chat_and_three_sizes", !st.settings.showAdvanced &&
+                   shotItem("Chat model", false, "##ai_basic_models") &&
+                   shotItem("Small", false, "##ai_basic_models") &&
+                   shotItem("Medium", false, "##ai_basic_models") &&
+                   shotItem("Large", false, "##ai_basic_models"),
+                   {{"chat", *chat}, {"small", *small}, {"medium", *medium}, {"large", *large},
+                    {"advanced", st.settings.showAdvanced}, {"items", ui::audit::observedItems()}})) return;
+        if (!check("unavailable_exact_saved_identity_visible",
+                   small->value("label", std::string()).find("missing-provider") != std::string::npos &&
+                   small->value("label", std::string()).find("missing-model") != std::string::npos &&
+                   small->value("label", std::string()).find("unavailable") != std::string::npos,
+                   *small)) return;
+        ui::applyTheme(ui::Theme::Dark, st.scale); st.settings.theme = "dark";
+        p.capture = "scratch/model_settings_shots/01_basic_dark.png"; next(4); break;
+    }
+    case 4:
+        ui::applyTheme(ui::Theme::Light, st.scale); st.settings.theme = "light";
+        p.capture = "scratch/model_settings_shots/02_basic_light.png"; next(5); break;
+    case 5:
+        if (clickIndex("##role_pick", 3, "Large")) next(6);
+        break;
+    case 6: {
+        const auto* filter = shotItem("##role_filt", false, "##Combo");
+        const auto* fallback = shotItem("Use chat model", false, "##Combo");
+        const auto* first = shotItem(terra, false, "##Combo");
+        const auto* second = shotItem(sol, false, "##Combo");
+        if (!check("picker_rows_and_filter_fit_without_overlap",
+                   fullyVisible(filter) && fullyVisible(fallback) && fullyVisible(first) &&
+                   fullyVisible(second) && verticallyOrdered(filter, fallback) &&
+                   verticallyOrdered(fallback, first) && verticallyOrdered(first, second) &&
+                   (*first)["full_rect"][3].get<float>() - (*first)["full_rect"][1].get<float>() >=
+                       ImGui::GetFrameHeight() - 1.0f,
+                   {{"filter", filter ? *filter : nlohmann::json()},
+                    {"fallback", fallback ? *fallback : nlohmann::json()},
+                    {"first", first ? *first : nlohmann::json()},
+                    {"second", second ? *second : nlohmann::json()}})) return;
+        if (!check("only_fixture_available_models_in_picker",
+                   first && second && shotItem(claude, false, "##Combo") &&
+                   !shotItem("zenmux \xc2\xb7 Fixture ZenMux", false, "##Combo") &&
+                   !shotItem("google \xc2\xb7 Fixture Disabled", false, "##Combo"),
+                   {{"items", ui::audit::observedItems()}})) return;
+        p.capture = "scratch/model_settings_shots/03_picker.png"; next(600); break;
+    }
+    case 600: {
+        const nlohmann::json* list = nullptr;
+        for (const auto& window : ui::audit::observedWindows()) {
+            const auto name = window.value("window", std::string());
+            if (name.find("##Combo") != std::string::npos &&
+                name.find("##model_results") != std::string::npos) {
+                list = &window; break;
+            }
+        }
+        if (!check("large_catalog_has_bounded_scroll", list &&
+                   list->value("scroll_max_y", 0.0f) > 0.0f,
+                   {{"list", list ? *list : nlohmann::json()}})) return;
+        if (list->value("scroll_y", 0.0f) > 1.0f) {
+            if (!check("filter_remains_visible_after_list_scroll",
+                       fullyVisible(shotItem("##role_filt", false, "##Combo")), *list)) return;
+            p.capture = "scratch/model_settings_shots/03_picker_scrolled.png"; next(7); break;
+        }
+        const auto& point = (*list)["wheel_point"];
+        ImGui::GetIO().AddMousePosEvent(point[0].get<float>(), point[1].get<float>());
+        if (p.scrollTicks++ % 4 == 1) ImGui::GetIO().AddMouseWheelEvent(0.0f, -1.0f);
+        break;
+    }
+    case 7:
+        if (click("##role_filt", "##Combo")) {
+            ImGui::GetIO().AddInputCharactersUTF8("no-such-fixture");
+            next(701);
+        }
+        break;
+    case 701: {
+        const auto* filter = shotItem("##role_filt", false, "##Combo");
+        const auto* status = popupStatus();
+        if (!check("empty_filter_status_fits_popup",
+                   !shotItem(sol, false, "##Combo") && !shotItem(terra, false, "##Combo") &&
+                   fullyVisible(filter) && fullyVisible(status) && verticallyOrdered(filter, status),
+                   {{"filter", filter ? *filter : nlohmann::json()},
+                    {"status", status ? *status : nlohmann::json()}})) return;
+        p.capture = "scratch/model_settings_shots/03_picker_empty.png"; next(702); break;
+    }
+    case 702:
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, true);
+        if (p.input.key(ImGuiKey_A)) {
+            ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false);
+            ImGui::GetIO().AddInputCharactersUTF8("Sol");
+            next(8);
+        }
+        break;
+    case 8:
+        if (!check("catalog_search_filters_actual_rows",
+                   shotItem(sol, false, "##Combo") &&
+                   !shotItem(terra, false, "##Combo") && !shotItem(claude, false, "##Combo"),
+                   {{"items", ui::audit::observedItems()}})) return;
+        next(801); break;
+    case 801:
+        if (p.input.key(ImGuiKey_DownArrow)) next(802);
+        break;
+    case 802:
+        if (p.input.key(ImGuiKey_Enter)) next(9, 25);
+        break;
+    case 9:
+        query();
+        if (!p.queryReady) break;
+        if (!check("large_change_preserves_explicit_chat",
+                   p.reply.value("ok", false) &&
+                   p.reply.value("chat_assignment", nlohmann::json::object()) == p.baseline["chat_assignment"] &&
+                   p.reply.value("model_sizes", nlohmann::json::object()).value("large", nlohmann::json::object())
+                       .value("model", std::string()) == "fixture-sol" &&
+                   p.reply["model_sizes"]["small"] == p.baseline["model_sizes"]["small"], p.reply)) return;
+        p.baseline = p.reply; p.queryReady = false; next(10); break;
+    case 10:
+        if (click("Advanced overrides", "##ai_basic_models")) next(11);
+        break;
+    case 11: {
+        query();
+        if (!p.queryReady) break;
+        if (!check("expansion_does_not_change_routing",
+                   p.reply.value("chat_assignment", nlohmann::json::object()) == p.baseline["chat_assignment"] &&
+                   p.reply.value("model_sizes", nlohmann::json::object()) == p.baseline["model_sizes"] &&
+                   p.reply.value("roles", nlohmann::json::object()) == p.baseline["roles"] &&
+                   p.reply.value("active_role_overrides", nlohmann::json::array()) == p.baseline["active_role_overrides"],
+                   p.reply)) return;
+        p.queryReady = false;
+        next(110, 0); break;
+    }
+    case 110: {
+        // The settings poll can temporarily disable controls while the RPC settles;
+        // disabled items still provide evidence of the rendered saved value.
+        const auto effort = p.baseline["roles"]["advisor"].value("thinking", std::string());
+        const nlohmann::json* advisorEffort = nullptr;
+        for (const auto& item : ui::audit::observedItems()) {
+            if (item.value("window", std::string()).find("##ai_basic_models") != std::string::npos &&
+                item.value("native_label", std::string()) == "##role_think") {
+                advisorEffort = &item;
+                break;
+            }
+        }
+        // At larger UI scales the expanded role grid starts below the viewport. Scroll the
+        // real Settings body until the entire control is visible before checking or capturing it.
+        if (!fullyVisible(advisorEffort)) {
+            shotScrollTo(advisorEffort ? "##role_think" : "Advisor", "##ai_basic_models",
+                         true, advisorEffort);
+            break;
+        }
+        if (!check("saved_effort_rendered",
+                   !effort.empty() && fullyVisible(advisorEffort) &&
+                   advisorEffort->value("label", std::string()).compare(0, effort.size(), effort) == 0,
+                   {{"saved_effort", effort},
+                    {"control", advisorEffort ? *advisorEffort : nlohmann::json()}})) return;
+        p.capture = "scratch/model_settings_shots/04_advanced_unsupported.png"; next(12); break;
+    }
+    case 12:
+        if (clickIndex("##role_think", 0, "Advisor")) next(13);
+        break;
+    case 13:
+        if (!check("terra_exact_effort_ladder", shotItem("Runtime default", false, "##Combo") &&
+                   shotItem("low", false, "##Combo") && shotItem("high", false, "##Combo") &&
+                   !shotItem("minimal", false, "##Combo") && !shotItem("xhigh", false, "##Combo") &&
+                   !shotItem("max", false, "##Combo"),
+                   {{"items", ui::audit::observedItems()}})) return;
+        p.capture = "scratch/model_settings_shots/05_terra_efforts.png"; next(14); break;
+    case 14:
+        if (p.input.key(ImGuiKey_Escape)) next(15);
+        break;
+    case 15:
+        if (clickIndex("##role_pick", 4, "Advisor")) next(16);
+        break;
+    case 16:
+        // A completed mouse gesture does not guarantee that ImGui opened the popup.
+        // Reacquire the real picker if the previous popup was still closing, and
+        // bound the retries so a broken transition remains an observable failure.
+        if (!p.input.phase && !shotItem("##role_filt", false, "##Combo")) {
+            if (++p.popupAttempts > 3) {
+                check("advisor_picker_opened", false, {{"items", ui::audit::observedItems()}});
+                return;
+            }
+            next(15);
+            break;
+        }
+        {
+            // A per-role override offers tiers first and never "follow the chat model".
+            static bool tiersChecked = false;
+            if (!tiersChecked && !p.input.phase) {
+                tiersChecked = true;
+                if (!check("override_picker_offers_tiers_not_chat_model",
+                           shotItem("Small tier", false, "##Combo") &&
+                           shotItem("Medium tier", false, "##Combo") &&
+                           shotItem("Large tier", false, "##Combo") &&
+                           !shotItem("Use chat model", false, "##Combo"),
+                           {{"items", ui::audit::observedItems()}})) return;
+            }
+        }
+        if (click(sol, "##Combo")) { p.popupAttempts = 0; next(17, 25); }
+        break;
+    case 17:
+        query();
+        if (!p.queryReady) break;
+        if (!check("single_override_preserves_unrelated_routes",
+                   p.reply.value("roles", nlohmann::json::object()).value("advisor", nlohmann::json::object())
+                       .value("model", std::string()) == "fixture-sol" &&
+                   p.reply["roles"]["advisor"].value("thinking", std::string()) == "max" &&
+                   p.reply["roles"]["task"] == p.baseline["roles"]["task"] &&
+                   p.reply["model_sizes"] == p.baseline["model_sizes"] &&
+                   p.reply["chat_assignment"] == p.baseline["chat_assignment"], p.reply)) return;
+        p.baseline = p.reply; p.queryReady = false; next(18); break;
+    case 18:
+        if (clickIndex("##role_think", 0, "Advisor")) next(19);
+        break;
+    case 19:
+        if (!check("sol_exact_effort_ladder", shotItem("Runtime default", false, "##Combo") &&
+                   shotItem("off", false, "##Combo") && shotItem("minimal", false, "##Combo") &&
+                   shotItem("xhigh", false, "##Combo") && !shotItem("low", false, "##Combo") &&
+                   !shotItem("high", false, "##Combo") && !shotItem("max", false, "##Combo"),
+                   {{"items", ui::audit::observedItems()}})) return;
+        p.capture = "scratch/model_settings_shots/06_sol_efforts.png"; next(20); break;
+    case 20:
+        if (click("xhigh", "##Combo")) next(200, 25);
+        break;
+    case 200:
+        query();
+        if (!p.queryReady) break;
+        if (!check("effort_choice_preserves_exact_model_and_other_assignments",
+                   p.reply["roles"]["advisor"].value("provider", std::string()) == "openai-codex" &&
+                   p.reply["roles"]["advisor"].value("model", std::string()) == "fixture-sol" &&
+                   p.reply["roles"]["advisor"].value("thinking", std::string()) == "xhigh" &&
+                   p.reply["roles"]["task"] == p.baseline["roles"]["task"] &&
+                   p.reply["model_sizes"] == p.baseline["model_sizes"] &&
+                   p.reply["chat_assignment"] == p.baseline["chat_assignment"], p.reply)) return;
+        p.baseline = p.reply; p.queryReady = false; next(21); break;
+    case 21:
+        if (click("Advanced overrides", "##ai_basic_models")) next(220);
+        break;
+    case 220:
+        if (click("##kit_check", "##settings_nav")) next(221);
+        break;
+    case 221:
+        query();
+        if (!p.queryReady) break;
+        if (!check("advanced_disclosure_preserves_assignments",
+                   st.settings.showAdvanced &&
+                   p.reply["assignment_mode"] == p.baseline["assignment_mode"] &&
+                   p.reply["chat_assignment"] == p.baseline["chat_assignment"] &&
+                   p.reply["model_sizes"] == p.baseline["model_sizes"] &&
+                   p.reply["roles"] == p.baseline["roles"] &&
+                   p.reply["active_role_overrides"] == p.baseline["active_role_overrides"], p.reply)) return;
+        p.queryReady = false;
+        p.capture = "scratch/model_settings_shots/06_advanced_disclosure.png"; next(222); break;
+    case 222:
+        if (click("##kit_check", "##settings_nav")) next(223);
+        break;
+    case 223:
+        query();
+        if (!p.queryReady) break;
+        if (!check("basic_disclosure_restores_same_assignments",
+                   !st.settings.showAdvanced &&
+                   p.reply["assignment_mode"] == p.baseline["assignment_mode"] &&
+                   p.reply["chat_assignment"] == p.baseline["chat_assignment"] &&
+                   p.reply["model_sizes"] == p.baseline["model_sizes"] &&
+                   p.reply["roles"] == p.baseline["roles"] &&
+                   p.reply["active_role_overrides"] == p.baseline["active_role_overrides"], p.reply)) return;
+        p.queryReady = false; p.noProviders = true; next(224, 20); break;
+    case 224: {
+        const auto* large = byIndex("##role_pick", 3);
+        if (!large) break;
+        query();
+        if (!p.queryReady) break;
+        if (!check("signout_preserves_unavailable_identity",
+                   large->value("label", std::string()).find("fixture-sol") != std::string::npos &&
+                   large->value("label", std::string()).find("unavailable") != std::string::npos &&
+                   p.reply["model_sizes"] == p.baseline["model_sizes"] &&
+                   p.reply["roles"] == p.baseline["roles"], {{"picker", *large}, {"response", p.reply}})) return;
+        p.queryReady = false; next(225); break;
+    }
+    case 225:
+        if (clickIndex("##role_pick", 3, "Large")) next(226);
+        break;
+    case 226: {
+        const auto* filter = shotItem("##role_filt", false, "##Combo");
+        const auto* fallback = shotItem("Use chat model", false, "##Combo");
+        const auto* status = popupStatus();
+        const auto* manage = shotItem("Manage providers", false, "##Combo");
+        if (!check("one_row_popup_has_visible_filter_status_and_navigation",
+                   fullyVisible(filter) && fullyVisible(fallback) && fullyVisible(status) &&
+                   fullyVisible(manage) && verticallyOrdered(filter, fallback) &&
+                   verticallyOrdered(fallback, status) && verticallyOrdered(status, manage) &&
+                   !shotItem(terra, false, "##Combo") && !shotItem(sol, false, "##Combo") &&
+                   !shotItem(claude, false, "##Combo"),
+                   {{"filter", filter ? *filter : nlohmann::json()},
+                    {"fallback", fallback ? *fallback : nlohmann::json()},
+                    {"status", status ? *status : nlohmann::json()},
+                    {"manage", manage ? *manage : nlohmann::json()}})) return;
+        p.capture = "scratch/model_settings_shots/06_one_row_popup.png"; next(227); break;
+    }
+    case 227:
+        if (click("Manage providers", "##Combo")) next(228);
+        break;
+    case 228: {
+        bool providerWindow = false;
+        for (const auto& window : ui::audit::observedWindows())
+            if (window.value("window", std::string()).find("##tab_providers") != std::string::npos)
+                providerWindow = true;
+        if (!check("empty_picker_opens_provider_settings", providerWindow,
+                   {{"windows", ui::audit::observedWindows()}})) return;
+        p.noProviders = false;
+        st.showCommandSearch = true; next(229); break;
+    }
+    case 229:
+        ImGui::GetIO().AddInputCharactersUTF8("Harness");
+        next(230); break;
+    case 230:
+        if (p.input.key(ImGuiKey_Enter)) next(231, 30);
+        break;
+    case 231: {
+        if (st.settings.showAdvanced || p.input.phase) {
+            if (click("##kit_check", "##settings_nav")) next(231);
+            break;
+        }
+        const auto* large = byIndex("##role_pick", 3);
+        if (!large) break;
+        query();
+        if (!p.queryReady) break;
+        if (!check("return_to_models_retains_exact_assignments",
+                   large->value("label", std::string()) == sol &&
+                   p.reply["model_sizes"] == p.baseline["model_sizes"] &&
+                   p.reply["roles"] == p.baseline["roles"] &&
+                   p.reply["chat_assignment"] == p.baseline["chat_assignment"],
+                   {{"picker", *large}, {"response", p.reply}})) return;
+        p.queryReady = false; next(22); break;
+    }
+    case 22: {
+        std::string error;
+        const bool restricted = modelSettingsRestrictLock(error);
+        if (!check("restrict_private_config_lock", restricted, {{"error", error}})) return;
+        next(23); break;
+    }
+    case 23:
+        if (clickIndex("##role_pick", 3, "Large")) next(24);
+        break;
+    case 24:
+        if (!p.input.phase && !shotItem("##role_filt", false, "##Combo")) {
+            if (++p.popupAttempts > 3) {
+                check("large_picker_opened", false, {{"items", ui::audit::observedItems()}});
+                return;
+            }
+            next(23);
+            break;
+        }
+        if (click(claude, "##Combo")) { p.popupAttempts = 0; next(25, 25); }
+        break;
+    case 25: {
+        if (!frameDraft()) break;
+        const auto* draft = shotItem("Unsaved model assignment. Retry or discard this change.",
+                                     false, "##ai_basic_models");
+        const nlohmann::json* error = nullptr;
+        for (const auto& item : ui::audit::observedItems()) {
+            if (item.value("window", std::string()).find("##ai_basic_models") == std::string::npos ||
+                !item.value("text_only", false)) continue;
+            const float bottom = item["full_rect"][3].get<float>();
+            const float statusTop = (*draft)["full_rect"][1].get<float>();
+            if (bottom <= statusTop + 1.0f &&
+                statusTop - bottom <= 2.0f * ImGui::GetTextLineHeightWithSpacing()) {
+                error = &item; break;
+            }
+        }
+        if (error && !fullyVisible(error)) {
+            shotScrollTo("Unsaved model assignment. Retry or discard this change.",
+                         "##ai_basic_models", true, draft);
+            break;
+        }
+        if (!check("failed_save_exposes_error_and_controls", fullyVisible(error) && draftVisible(),
+                   {{"error", error ? *error : nlohmann::json()}, {"draft", *draft}})) return;
+        p.capture = "scratch/model_settings_shots/07_unsaved_error.png"; next(250); break;
+    }
+    case 250: {
+        const nlohmann::json* pending = nullptr;
+        for (const auto& item : ui::audit::observedItems()) {
+            if (item.value("window", std::string()).find("##ai_basic_models") != std::string::npos &&
+                item.value("native_label", std::string()) == "##role_pick" &&
+                item.value("label", std::string()) == claude) {
+                pending = &item; break;
+            }
+        }
+        if (!fullyVisible(pending)) {
+            shotScrollTo(pending ? "##role_pick" : "Large", "##ai_basic_models", true, pending);
+            break;
+        }
+        if (!check("failed_save_exposes_pending_choice",
+                   !pending->value("enabled", true), {{"picker", *pending}})) return;
+        p.reloadAt = pipingNow();
+        p.capture = "scratch/model_settings_shots/07_unsaved.png"; next(26); break;
+    }
+    case 26:
+        if (pipingNow() - p.reloadAt < 6.0) break;
+        if (!frameDraft()) break;
+        query();
+        if (!p.queryReady) break;
+        if (!check("failed_save_keeps_confirmed_and_draft",
+                   p.reply.value("model_sizes", nlohmann::json::object()) == p.baseline["model_sizes"] &&
+                   draftVisible(), {{"response", p.reply}, {"items", ui::audit::observedItems()}})) return;
+        p.queryReady = false;
+        if (!check("restore_lock_before_retry", modelSettingsRestoreLock(), nlohmann::json::object())) return;
+        next(27); break;
+    case 27:
+        if (click("Retry save", "##ai_basic_models")) next(28, 25);
+        break;
+    case 28:
+        query();
+        if (!p.queryReady) break;
+        if (!check("retry_persists_only_after_ack", p.reply.value("model_sizes", nlohmann::json::object())
+                   .value("large", nlohmann::json::object()).value("model", std::string()) == "fixture-claude" &&
+                   !draftPresent(), p.reply)) return;
+        p.baseline = p.reply; p.queryReady = false; next(29); break;
+    case 29: {
+        std::string error;
+        if (!check("restrict_lock_for_discard", modelSettingsRestrictLock(error), {{"error", error}})) return;
+        next(30); break;
+    }
+    case 30:
+        if (clickIndex("##role_pick", 3, "Large")) next(31);
+        break;
+    case 31:
+        if (click(sol, "##Combo")) next(32, 25);
+        break;
+    case 32:
+        if (!frameDraft()) break;
+        query();
+        if (!p.queryReady) break;
+        if (!check("discard_draft_not_confirmed", p.reply["model_sizes"] == p.baseline["model_sizes"],
+                   {{"response", p.reply}, {"items", ui::audit::observedItems()}})) return;
+        p.queryReady = false;
+        if (!check("restore_lock_before_discard", modelSettingsRestoreLock(), nlohmann::json::object())) return;
+        next(33); break;
+    case 33:
+        if (click("Discard change", "##ai_basic_models")) next(34, 25);
+        break;
+    case 34:
+        query();
+        if (!p.queryReady) break;
+        if (!check("discard_restores_confirmed_assignment",
+                   p.reply["model_sizes"] == p.baseline["model_sizes"] && !draftPresent(), p.reply)) return;
+        p.queryReady = false; next(35); break;
+    case 35:
+        if (clickNative("##comp_mode", "##ai_memory", "Compaction (next turn)")) next(36);
+        break;
+    case 36:
+        if (click("Snapcompact", "##Combo")) next(37, 20);
+        break;
+    case 37: {
+        const auto config = readConfigJson();
+        const auto strategy = config.value("agent", nlohmann::json::object())
+                                    .value("compaction_strategy", std::string());
+        if (!check("snapcompact_preserved_for_text_only_chat",
+                   strategy == "snapcompact" &&
+                   shotItem("Unavailable for this model: image input required. The selection is preserved.",
+                            false, "##ai_memory") &&
+                   shotItem("Compaction (next turn)", false, "##ai_memory") &&
+                   shotItem("Project memory", false, "##ai_memory") &&
+                   shotItem("No live agent session. Session controls are unavailable.", false, "##ai_memory") &&
+                   shotItem("Policy saved for future sessions; no live application reported.", false, "##ai_memory"),
+                   {{"strategy", strategy}, {"items", ui::audit::observedItems()}})) return;
+        p.capture = "scratch/model_settings_shots/08_compaction_pending.png"; next(38); break;
+    }
+    case 38:
+        glfwSetWindowSize(st.win, 1000, 720);
+        next(39, 20); break;
+    case 39: {
+        const auto* small = byIndex("##role_pick", 1);
+        if (!small || !small->value("visible", false)) {
+            shotScrollTo(small ? "##role_pick" : "Small", "##ai_basic_models", true, small); break;
+        }
+        const nlohmann::json* caption = nullptr;
+        for (const auto& item : ui::audit::observedItems())
+            if (item.value("text_only", false) &&
+                item.value("window", std::string()).find("##ai_basic_models") != std::string::npos &&
+                item.value("label", std::string()).find("missing-provider") != std::string::npos &&
+                item.value("label", std::string()).find("missing-model") != std::string::npos) {
+                caption = &item; break;
+            }
+        if (!caption || !caption->value("visible", false) ||
+            (*caption)["full_rect"][1].get<float>() < (*caption)["clip"][1].get<float>() - 1 ||
+            (*caption)["full_rect"][3].get<float>() > (*caption)["clip"][3].get<float>() + 1) {
+            shotScrollTo("Small", "##ai_basic_models", true, caption ? caption : small); break;
+        }
+        const auto& full = (*caption)["full_rect"];
+        const auto& clip = (*caption)["clip"];
+        if (!check("narrow_full_unavailable_identity_visible",
+                   full[0].get<float>() >= clip[0].get<float>() - 1 &&
+                   full[1].get<float>() >= clip[1].get<float>() - 1 &&
+                   full[2].get<float>() <= clip[2].get<float>() + 1 &&
+                   full[3].get<float>() <= clip[3].get<float>() + 1, *caption)) return;
+        p.capture = "scratch/model_settings_shots/09_narrow.png";
+        ui::audit::AuditOptions opt;
+        opt.regions = ui::audit::RegionFloating; opt.frames = 3; opt.maxFrames = 80;
+        if (!ui::audit::begin("model_settings_narrow", opt)) break;
+        next(40, 0); break;
+    }
+    case 40: {
+        if (ui::audit::active()) break;
+        const auto audit = ui::audit::lastResult();
+        nlohmann::json findings = nlohmann::json::array();
+        for (const char* field : {"conflicts", "overflows"})
+            for (const auto& finding : audit.value(field, nlohmann::json::array()))
+                if (finding.value("window", std::string()).find("Settings") != std::string::npos)
+                    findings.push_back(finding);
+        if (!check("narrow_settings_no_clipping_or_id_conflicts",
+                   !audit.value("truncated", true) && findings.empty(),
+                   {{"content_scale", st.scale},
+                    {"findings", findings}})) return;
+        const auto payload = ui::composerTurnPayload(st.settings, nlohmann::json::object());
+        const auto route = buildAgentJobRpcRoute("example", "", "scenario", false, payload, false);
+        if (!check("composer_follow_routes_without_pin", st.settings.composerFollowRoles &&
+                   !route.params.contains("provider") &&
+                   !route.params.contains("model"), route.params)) return;
+        const auto explicitPayload = ui::composerTurnPayload(st.settings,
+            {{"provider", "anthropic"}, {"model", "explicit-test"}});
+        if (!check("composer_explicit_override_wins",
+                   explicitPayload.value("provider", std::string()) == "anthropic" &&
+                   explicitPayload.value("model", std::string()) == "explicit-test", explicitPayload)) return;
+        p.done = true; p.capture = "scratch/model_settings_shots/10_final.png"; break;
+    }
+    }
+}
+
+bool modelSettingsEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, bool& done) {
+    auto& p = g_modelSettings;
+    if (!p.want) return false;
+    if (p.done && !modelSettingsRestoreLock()) {
+        p.failed = true;
+        p.checks.push_back({{"name", "restore_private_lock_permissions"}, {"ok", false},
+                            {"path", p.lockPath.string()}});
+    }
+    ++st.frame;
+    if (!p.capture.empty()) {
+        const bool saved = writeBackbufferPng(p.capture.c_str(), dw, dh, p.done ? screenshotPath : nullptr);
+        p.captures.push_back({{"path", p.capture}, {"written", saved}});
+        if (!saved) {
+            p.failed = p.done = true;
+            p.checks.push_back({{"name", "screenshot_write"}, {"ok", false}, {"path", p.capture}});
+        }
+        p.capture.clear();
+    }
+    std::ofstream out("scratch/model_settings_shots/report.json", std::ios::trunc);
+    out << nlohmann::json({{"ok", p.done && !p.failed}, {"checks", p.checks},
+                           {"step", p.step}, {"query_pending", p.queryPending},
+                           {"query_ready", p.queryReady}, {"command_search_open", st.showCommandSearch},
+                           {"captures", p.captures}, {"catalog", "synthetic fixture; not provider availability"},
+                           {"policy_apply", "synthetic no-live-session acknowledgement; no runtime request"}}).dump(2) << '\n';
+    out.close();
+    swapScenarioFrame(st.win);
+    done = p.done;
+    if (!out || (p.done && p.failed)) {
+        core::framestats::flushReport();
+        std::fflush(nullptr);
+        std::_Exit(EXIT_FAILURE);
+    }
+    return true;
+}
+
+// A pre-ingested, privately generated catalog fixture; no catalog data or geometry is faked.
+// The fixture must contain one box feature named "Catalog fixture block" with length 20 mm.
+struct PartsCatalogShot {
+    bool init = false, want = false, done = false, failed = false, overflow = false;
+    int step = 0, settle = 0;
+    int saveResult = -1;
+    double started = 0, stepStart = 0;
+    std::string dir, query, partId, feature, doc, capture, saved;
+    SceneShotInput input;
+    nlohmann::json report;
+} g_partsCatalog;
+
+void partsCatalogFail(const std::string& name, const nlohmann::json& evidence) {
+    auto& p = g_partsCatalog;
+    p.failed = p.done = true;
+    p.report["failure"] = {{"name", name}, {"step", p.step}, {"evidence", evidence}};
+    ImGui::GetIO().AddMouseButtonEvent(0, false);
+    p.capture = p.dir + "/FAILED.png";
+}
+
+bool partsCatalogCheck(const char* name, bool ok, const nlohmann::json& evidence) {
+    auto& p = g_partsCatalog;
+    p.report["checks"].push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
+    if (!ok) partsCatalogFail(name, evidence);
+    return ok;
+}
+
+void partsCatalogTick(AppState& st) {
+    auto& p = g_partsCatalog;
+    if (!p.init) {
+        p.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        p.want = st.shot && mode && std::strcmp(mode, "parts_catalog") == 0;
+        if (!p.want) return;
+        const char* dir = std::getenv("CHUDWARE_PARTS_SHOT_OUT");
+        const char* query = std::getenv("CHUDWARE_PARTS_SHOT_QUERY");
+        const char* id = std::getenv("CHUDWARE_PARTS_SHOT_ID");
+        p.dir = dir ? dir : "";
+        p.query = query ? query : "";
+        p.partId = id ? id : "";
+        p.report = {{"scenario", "parts_catalog"}, {"ok", false},
+                    {"checks", nlohmann::json::array()}, {"captures", nlohmann::json::array()}};
+        p.started = p.stepStart = pipingNow();
+        if (p.dir.empty() || p.query.empty() || p.partId.empty()) {
+            p.dir = p.dir.empty() ? "." : p.dir;
+            partsCatalogFail("fixture_environment", "Set CHUDWARE_PARTS_SHOT_OUT, CHUDWARE_PARTS_SHOT_QUERY and CHUDWARE_PARTS_SHOT_ID.");
+            return;
+        }
+        std::error_code ec;
+        std::filesystem::create_directories(p.dir, ec);
+        if (ec) { partsCatalogFail("output_directory", ec.message()); return; }
+        p.saved = (std::filesystem::absolute(p.dir) / "catalog-instance.step+").string();
+    }
+    if (!p.want || p.done) return;
+    ui::audit::observedItems();
+    if (pipingNow() - p.started > 300 || pipingNow() - p.stepStart > 90) {
+        partsCatalogFail("timeout", {{"search_error", ui::parts::S().searchErr},
+                         {"insert_note", ui::parts::S().insertNote},
+                         {"items", ui::audit::observedItems()}});
+        return;
+    }
+    if (!st.workerStarted || st.frame < 5 || !p.capture.empty()) return;
+    if (p.settle > 0) { --p.settle; return; }
+    auto next = [&](int step, int settle = 4) {
+        p.step = step; p.settle = settle; p.stepStart = pipingNow();
+    };
+    auto click = [&](const char* label) {
+        if (p.input.phase) return p.input.click(p.input.point);
+        const auto* item = shotItem(label);
+        if (!item) return false;
+        return p.input.click(shotPoint(*item));
+    };
+    auto feature = [&]() -> nlohmann::json {
+        const auto tree = st.docMirror.tree();
+        for (const auto& f : tree.value("features", nlohmann::json::array()))
+            if (f.value("name", std::string()) == "Catalog fixture block" &&
+                f.value("type", std::string()) == "box") return f;
+        return nullptr;
+    };
+    auto length = [&](const nlohmann::json& f) -> double {
+        if (!f.is_object() || !f.contains("params") || !f["params"].contains("length")) return -1;
+        const auto& v = f["params"]["length"];
+        if (v.is_number()) return v.get<double>();
+        if (v.is_object() && v.value("value", nlohmann::json()).is_number())
+            return v["value"].get<double>();
+        return -1;
+    };
+    switch (p.step) {
+    case 0:
+        st.activeWorkspace = AppState::Workspace::PartsLibrary;
+        // Keep the private fixture search local; it must not fan out to live vendor services.
+        ui::parts::S().sourceFilter = 1;
+        next(1, 12); return;
+    case 1:
+        if (click("##parts_q")) next(2); return;
+    case 2:
+        ImGui::GetIO().AddInputCharactersUTF8(p.query.c_str());
+        next(3); return;
+    case 3:
+        if (click("##parts_go")) next(4, 8); return;
+    case 4: {
+        auto& s = ui::parts::S();
+        if (s.searching || !s.searchDone) return;
+        if (!s.searchErr.empty()) { partsCatalogFail("search", s.searchErr); return; }
+        if (s.results.size() != 1 || s.results[0].id != p.partId) return;
+        const auto& item = s.results[0];
+        if (!partsCatalogCheck("real_search_row", true,
+                {{"id", item.id}, {"name", item.name}, {"downloaded", item.downloaded},
+                 {"downloadable", item.downloadable}, {"placeable", item.placeable}})) return;
+        p.capture = p.dir + "/01_search.png";
+        next(item.downloaded || item.placeable ? 7 : 5); return;
+    }
+    case 5:
+    case 7: {
+        const char* action = p.step == 5 ? "Download" : "Insert";
+        if (p.input.phase) {
+            if (p.input.click(p.input.point))
+                next(p.overflow ? (p.step == 5 ? 50 : 70) : (p.step == 5 ? 6 : 8), 8);
+            return;
+        }
+        const auto* target = shotItem(action);
+        p.overflow = false;
+        if (!target) {
+            target = shotItem("\xe2\x80\xa6##rowmore");
+            p.overflow = target != nullptr;
+        }
+        if (target) {
+            p.input.click(shotPoint(*target));
+        } else if (const auto* row = shotItem("##row")) {
+            // The list reveals its direct or overflow actions on row hover.
+            const ImVec2 point = shotPoint(*row);
+            ImGui::GetIO().AddMousePosEvent(point.x, point.y);
+        }
+        return;
+    }
+    case 50:
+    case 70: {
+        const char* action = p.step == 50 ? "Download" : "Insert";
+        if (click(action)) next(p.step == 50 ? 6 : 8, 8);
+        return;
+    }
+    case 6: {
+        auto& s = ui::parts::S();
+        if (s.searching || !s.searchDone) return;
+        if (s.results.size() == 1 && s.results[0].id == p.partId &&
+            s.results[0].downloaded && s.results[0].placeable) {
+            if (!partsCatalogCheck("gui_download_acquired", true, {{"id", p.partId}})) return;
+            p.capture = p.dir + "/02_acquired.png"; next(7); return;
+        }
+        return;
+    }
+    case 8: {
+        auto& s = ui::parts::S();
+        if (s.insertBusy) return;
+        if (s.insertError) { partsCatalogFail("gui_insert", s.insertNote); return; }
+        if (st.activeWorkspace != AppState::Workspace::Model || !st.hasDocMesh) return;
+        p.doc = st.docMirror.docId();
+        const auto f = feature();
+        p.feature = f.is_object() ? f.value("id", std::string()) : "";
+        const auto rows = dwgTreeRows();
+        if (!partsCatalogCheck("gui_insert_opened_editable_history",
+                !p.doc.empty() && !p.feature.empty() && std::abs(length(f) - 20.0) < 1e-6 &&
+                shotItem("Catalog fixture block", false) != nullptr,
+                {{"document", p.doc}, {"feature", f}, {"tree_rows", rows},
+                 {"has_mesh", st.hasDocMesh}, {"insert_note", s.insertNote}})) return;
+        const bool activeTabMatches = st.activeTab >= 0 &&
+            st.activeTab < static_cast<int>(st.docTabs.size()) &&
+            st.docTabs[st.activeTab].docId == p.doc;
+        const std::string initialPath = activeTabMatches ? st.docTabs[st.activeTab].path : "";
+        if (!partsCatalogCheck("gui_insert_instance_unbound",
+                               activeTabMatches && initialPath.empty(),
+                               {{"document", p.doc}, {"active_tab_matches", activeTabMatches},
+                                {"path", initialPath}})) return;
+        p.capture = p.dir + "/03_placed.png"; next(9); return;
+    }
+    case 9: {
+        const bool opened = st.propertyManager && st.propertyManager->openForEdit(st, p.feature);
+        if (!partsCatalogCheck("native_feature_editor", opened, {{"feature", p.feature}})) return;
+        p.capture = p.dir + "/04_editor.png"; next(10); return;
+    }
+    case 10: {
+        ImVec2 lo, hi;
+        if (!ui::viewportClearRect(lo, hi)) return;
+        if (!p.input.click(ImVec2(lo.x + (hi.x - lo.x) * 0.02f,
+                                  lo.y + (hi.y - lo.y) * 0.12f))) return;
+        if (!partsCatalogCheck("dimension_drag_accepted",
+                               st.propertyManager->dragSetDim("length", 25.0),
+                               {{"feature", p.feature}})) return;
+        next(101); return;
+    }
+    case 101: {
+        const auto f = feature();
+        if (std::abs(length(f) - 25.0) >= 1e-6) return;
+        if (!partsCatalogCheck("native_dimension_edit", true, {{"feature", f}})) return;
+        st.propertyManager->closeIfActive();
+        p.capture = p.dir + "/05_edited.png"; next(11, 12); return;
+    }
+    case 11: {
+        if (st.activeTab < 0 || st.activeTab >= static_cast<int>(st.docTabs.size())) {
+            partsCatalogFail("active_tab", st.activeTab); return;
+        }
+        st.docTabs[st.activeTab].path = p.saved;
+        p.saveResult = -1;
+        p.step = 111;
+        ui::saveDocTab(st, st.activeTab, false, [&p](ui::TabSaveResult result) {
+            p.saveResult = static_cast<int>(result);
+        });
+        return;
+    }
+    case 111: {
+        if (st.rpc.busy() || p.saveResult < 0) return;
+        if (!partsCatalogCheck("save_instance", p.saveResult == static_cast<int>(ui::TabSaveResult::Saved),
+                               {{"path", p.saved}, {"result", p.saveResult}})) return;
+        std::string error;
+        const bool opened = st.docMirror.open(st.worker, p.saved, error);
+        if (!partsCatalogCheck("reopen_instance", opened && std::abs(length(feature()) - 25.0) < 1e-6,
+                               {{"error", error}, {"feature", feature()}})) return;
+        st.addDocTab(false);
+        st.docTabs[st.activeTab].path = p.saved;
+        const auto aicm = st.docMirror.lastOpenedAicm();
+        if (!partsCatalogCheck("reopen_mesh", !aicm.empty() && st.loadDocMesh(aicm, error),
+                               {{"error", error}, {"aicm", aicm}})) return;
+        next(12, 15); return;
+    }
+    case 12:
+        p.report["ok"] = true; p.done = true; p.capture = p.dir + "/06_reopened.png"; return;
+    }
+}
+
+bool partsCatalogEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, bool& done) {
+    auto& p = g_partsCatalog;
+    if (!p.want) return false;
+    ++st.frame;
+    if (!p.capture.empty()) {
+        if (p.done && !p.failed) {
+            // The top face can be nearly the same color as the studio background.
+            // Probe the box center and all four side-face centers, so a visibly shaded
+            // side can establish foreground without relying on a particular orbit.
+            const auto pixels = sceneShotPixels(st, {
+                {12.5f, 5.0f, 2.5f},
+                {0.0f, 5.0f, 2.5f}, {25.0f, 5.0f, 2.5f},
+                {12.5f, 0.0f, 2.5f}, {12.5f, 10.0f, 2.5f}}, true);
+            if (!partsCatalogCheck("reopened_geometry_visible", st.hasDocMesh && pixels.value("ok", false),
+                                   {{"pixels", pixels}, {"has_mesh", st.hasDocMesh}}))
+                p.report["ok"] = false;
+        }
+        const bool saved = writeBackbufferPng(p.capture.c_str(), dw, dh, p.done ? screenshotPath : nullptr);
+        p.report["captures"].push_back(p.capture);
+        p.capture.clear();
+        if (!saved) { p.failed = p.done = true; p.report["ok"] = false; }
+    }
+    std::ofstream out(p.dir + "/report.json", std::ios::trunc);
+    out << p.report.dump(2) << '\n';
+    out.close();
+    swapScenarioFrame(st.win);
+    done = p.done;
+    if (!out || (p.done && p.failed)) {
+        core::framestats::flushReport(); std::fflush(nullptr); std::_Exit(EXIT_FAILURE);
+    }
+    return true;
+}
+
+// Native, unsaved scratch part; all report reads and mutations come from the real panel/worker.
+struct ModelHistoryShot {
+    bool init = false, want = false, done = false, failed = false;
+    bool captureExtension = false, captureSurface = false, finishAfterCapture = false;
+    int step = 0, settle = 0, reportRevision = -1, externalRevision = -1, editRevision = -1;
+    int captureRevision = -1;
+    double started = 0, boxLength = 40.0, captureLength = 40.0;
+    std::string dir, capture, captureDocId, docId, box, datum;
+    nlohmann::json foreignTree, surfaceTree;
+    SceneShotInput input;
+    nlohmann::json report = {{"scenario", "model_history"}, {"ok", false},
+                             {"checks", nlohmann::json::array()}, {"captures", nlohmann::json::array()}};
+};
+ModelHistoryShot g_modelHistory;
+
+bool modelHistoryCheck(const char* name, bool ok, const nlohmann::json& evidence) {
+    auto& s = g_modelHistory;
+    s.report["checks"].push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
+    if (!ok) {
+        s.failed = s.done = true;
+        s.report["failure"] = {{"name", name}, {"step", s.step}, {"evidence", evidence},
+                               {"items", ui::audit::observedItems()},
+                               {"navigation", shotNavigationEvidence()}};
+        s.capture = s.dir + "/FAILED.png";
+        ImGui::GetIO().AddMouseButtonEvent(0, false);
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Ctrl, false);
+        ImGui::GetIO().AddKeyEvent(ImGuiMod_Shift, false);
+    }
+    return ok;
+}
+
+const nlohmann::json* modelHistoryItem(const char* label, bool enabled) {
+    for (const auto& item : ui::audit::observedItems()) {
+        if (item.value("window", std::string()).find("###eval_model_history") == std::string::npos ||
+            !item.value("visible", false) || item.value("enabled", true) != enabled ||
+            !shotLabel(item, label)) continue;
+        return &item;
+    }
+    return nullptr;
+}
+
+// The session cache is populated in the same GL-thread commit that uploads the
+// active mesh and picking bounds. A current tree/report alone is not enough.
+bool modelHistoryMeshCurrent(AppState& st, const std::string& doc, int revision) {
+    if (!st.renderer || !st.hasDocMesh || st.renderer->bodyCount() != 1 ||
+        st.docMirror.docId() != doc || st.docMirror.revision() != revision ||
+        st.activeTab < 0 || st.activeTab >= static_cast<int>(st.docTabs.size()) ||
+        st.docTabs[st.activeTab].docId != doc) return false;
+    const DocSession* session = st.activeSession();
+    return session && session->cachedRevision == revision && session->cachedDocMesh &&
+           !session->cachedAicmPath.empty() && session->cachedMirror.valid() &&
+           session->cachedMirror.docId == doc && session->cachedMirror.revision == revision;
+}
+
+nlohmann::json modelHistoryMeshEvidence(AppState& st) {
+    const DocSession* session = st.activeSession();
+    nlohmann::json bounds = nlohmann::json::array();
+    for (const auto& entry : st.bodyBBoxCache)
+        bounds.push_back({{"body", entry.first}, {"bbox", entry.second}});
+    return {{"doc_id", st.docMirror.docId()}, {"revision", st.docMirror.revision()},
+            {"cached_doc_id", session ? session->cachedMirror.docId : std::string()},
+            {"cached_revision", session ? session->cachedRevision : -1},
+            {"has_doc_mesh", st.hasDocMesh}, {"bounds", bounds}};
+}
+
+bool modelHistoryBoundsMatch(AppState& st, double length, double width, double height) {
+    if (st.bodyBBoxCache.size() != 1) return false;
+    const auto& b = st.bodyBBoxCache.begin()->second;
+    return std::fabs((b[3] - b[0]) - length) < 0.02 &&
+           std::fabs((b[4] - b[1]) - width) < 0.02 &&
+           std::fabs((b[5] - b[2]) - height) < 0.02;
+}
+
+void modelHistoryCapture(AppState& st, const char* name, bool extension = false,
+                         bool surface = false, bool finish = false) {
+    auto& s = g_modelHistory;
+    s.capture = s.dir + "/" + name;
+    s.captureDocId = st.docMirror.docId();
+    s.captureRevision = st.docMirror.revision();
+    s.captureLength = s.boxLength;
+    s.captureExtension = extension;
+    s.captureSurface = surface;
+    s.finishAfterCapture = finish;
+}
+
+// Project a grid over the actual fixture faces, excluding the panel and the
+// same-row background reference if either would cover a 17px sample patch.
+// Requiring the same patch in both the scene and composited backbuffer prevents
+// ordinary UI chrome from masquerading as model geometry.
+nlohmann::json modelHistoryPixels(AppState& st, double length, bool surface, bool extension) {
+    ui::simscene::ViewportCtx vp;
+    ImVec2 lo, hi;
+    const ImGuiWindow* panel = ImGui::FindWindowByName("Model History###eval_model_history");
+    if (!panel || !panel->Active || !sceneShotViewport(st, vp) || !ui::viewportClearRect(lo, hi))
+        return {{"ok", false}, {"reason", "missing_panel_or_viewport"}};
+    const float left = panel->Pos.x, top = panel->Pos.y;
+    const float right = left + panel->Size.x, bottom = top + panel->Size.y;
+    std::vector<ImRect> occluders{ImRect(panel->Pos, ImVec2(right, bottom))};
+    for (const ImGuiWindow* window : ImGui::GetCurrentContext()->Windows) {
+        if (!window->Active || window->Hidden || window->RootWindow != window || window == panel ||
+            !(window->Flags & (ImGuiWindowFlags_Popup | ImGuiWindowFlags_Modal | ImGuiWindowFlags_Tooltip)))
+            continue;
+        occluders.emplace_back(window->Pos, ImVec2(window->Pos.x + window->Size.x,
+                                                   window->Pos.y + window->Size.y));
+    }
+    auto clearOfPanels = [&](float x, float y) {
+        for (const auto& rect : occluders)
+            if (!(x + 9 < rect.Min.x || x - 9 > rect.Max.x ||
+                  y + 9 < rect.Min.y || y - 9 > rect.Max.y)) return false;
+        return true;
+    };
+    float oldLeft = std::numeric_limits<float>::max(), oldRight = -oldLeft;
+    float oldTop = oldLeft, oldBottom = -oldLeft;
+    if (extension) {
+        // No point inside the old box's projected screen bounding rectangle can
+        // prove that a foreign geometric extension reached the displayed mesh.
+        for (int x : {-1, 1}) for (int y : {-1, 1}) for (int z : {-1, 1}) {
+            const float p[3] = {20.0f * x, 15.0f * y, 10.0f * z};
+            ImVec2 screen;
+            if (!ui::simscene::worldToScreen(vp, p, screen))
+                return {{"ok", false}, {"reason", "old_box_not_projectable"}};
+            oldLeft = std::min(oldLeft, screen.x); oldRight = std::max(oldRight, screen.x);
+            oldTop = std::min(oldTop, screen.y); oldBottom = std::max(oldBottom, screen.y);
+        }
+    }
+    std::vector<std::array<float, 3>> points;
+    auto add = [&](float x, float y, float z) {
+        const std::array<float, 3> p{x, y, z};
+        ImVec2 screen;
+        if (!sceneShotPoint(st, p.data(), screen) ||
+            !clearOfPanels(screen.x, screen.y) || !clearOfPanels(lo.x + 4, screen.y)) return;
+        if (extension && !(screen.x + 9 < oldLeft || screen.x - 9 > oldRight ||
+                           screen.y + 9 < oldTop || screen.y - 9 > oldBottom)) return;
+        points.push_back(p);
+    };
+    const float halfLength = static_cast<float>(surface ? 20.0 : length / 2.0);
+    for (int ix = 0; ix < 10; ++ix) {
+        const float x = -halfLength + (2 * halfLength) * (ix + 0.5f) / 10;
+        if (!surface) for (int iy = 0; iy < 7; ++iy) {
+            const float y = -15.0f + 30.0f * (iy + 0.5f) / 7;
+            add(x, y, 10.0f);
+            if (!extension) add(x, y, -10.0f);
+        }
+        for (int iz = 0; iz < 5; ++iz) {
+            const float z = (surface ? 0.0f : -10.0f) + 20.0f * (iz + 0.5f) / 5;
+            if (extension && z < 2.0f) continue;
+            add(x, -15.0f, z); add(x, 15.0f, z);
+        }
+    }
+    for (int iy = 0; iy < 7; ++iy) for (int iz = 0; iz < 5; ++iz) {
+        const float y = -15.0f + 30.0f * (iy + 0.5f) / 7;
+        const float z = (surface ? 0.0f : -10.0f) + 20.0f * (iz + 0.5f) / 5;
+        if (extension && z < 2.0f) continue;
+        add(-halfLength, y, z); add(halfLength, y, z);
+    }
+    std::vector<size_t> composedIndices, sceneIndices;
+    const auto composed = sceneShotPixels(st, points, true, &composedIndices);
+    const auto scene = sceneShotPixels(st, points, false, &sceneIndices);
+    nlohmann::json matchingPatch = nullptr;
+    for (const auto index : composedIndices)
+        if (std::find(sceneIndices.begin(), sceneIndices.end(), index) != sceneIndices.end()) {
+            ImVec2 screen;
+            if (ui::simscene::worldToScreen(vp, points[index].data(), screen))
+                matchingPatch = {{"world", points[index]}, {"screen", {screen.x, screen.y}}};
+            if (!matchingPatch.is_null()) break;
+        }
+    return {{"ok", composed.value("ok", false) && scene.value("ok", false) && !matchingPatch.is_null()},
+            {"composited", composed}, {"scene", scene}, {"matching_patch", matchingPatch},
+            {"eligible_points", points.size()}, {"panel_rect", {left, top, right, bottom}},
+            {"occluder_count", occluders.size()},
+            {"extension_only", extension},
+            {"old_screen_bounds", extension ? nlohmann::json::array({oldLeft, oldTop, oldRight, oldBottom})
+                                             : nlohmann::json(nullptr)}};
+}
+
+void modelHistoryTick(AppState& st) {
+    auto& s = g_modelHistory;
+    if (!s.init) {
+        s.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        s.want = st.shot && mode && std::strcmp(mode, "model_history") == 0;
+        if (!s.want) return;
+        const char* overrideDir = std::getenv("CHUDWARE_MODEL_HISTORY_OUT");
+        const char* repo = std::getenv("CHUDWARE_REPO");
+        s.dir = overrideDir && *overrideDir ? overrideDir :
+                std::string(repo && *repo ? repo : ".") + "/scratch/model_history_shots";
+        std::error_code ec;
+        std::filesystem::create_directories(s.dir, ec);
+        s.started = pipingNow();
+        if (ec) { modelHistoryCheck("output_directory", false, {{"error", ec.message()}}); return; }
+    }
+    if (!s.want || s.done) return;
+    ui::audit::observedItems();
+    if (pipingNow() - s.started > 240.0) {
+        modelHistoryCheck("timeout", false, {{"step", s.step}, {"doc", st.docMirror.docId()},
+                                            {"revision", st.docMirror.revision()},
+                                            {"capture", s.capture}, {"mesh", modelHistoryMeshEvidence(st)}});
+        return;
+    }
+    if (!st.workerStarted || st.frame < 5 || !s.capture.empty()) return;
+    if (s.settle > 0) { --s.settle; return; }
+    st.activeWorkspace = AppState::Workspace::Model;
+    st.shotWorkspacePin = static_cast<int>(AppState::Workspace::Model);
+    auto next = [&](int step, int settle = 3) { s.step = step; s.settle = settle; };
+    auto feature = [&](const std::string& id) -> nlohmann::json {
+        const auto& tree = st.docMirror.tree();
+        if (tree.contains("features") && tree["features"].is_array())
+            for (const auto& f : tree["features"])
+                if (f.is_object() && f.value("id", std::string()) == id) return f;
+        return nullptr;
+    };
+    auto click = [&](const std::string& label) {
+        if (s.input.phase) return s.input.click(s.input.point);
+        const auto* item = shotItem(label.c_str(), true, "###eval_model_history");
+        if (!item) {
+            shotScrollTo(label.c_str(), "###eval_model_history", true);
+            return false;
+        }
+        s.report["last_control"] = *item;
+        return s.input.click(shotPoint(*item));
+    };
+    auto reportReady = [&]() {
+        if (!st.evaluateDialogs || st.rpc.busy() || st.rebuildsInFlight ||
+            st.evaluateDialogs->analysisPending()) return false;
+        if (!st.evaluateDialogs->analysisError().empty()) {
+            modelHistoryCheck("report_error", false, {{"error", st.evaluateDialogs->analysisError()}});
+            return false;
+        }
+        const auto& report = st.evaluateDialogs->analysisResult();
+        return report.is_object() && report.value("doc_id", std::string()) == st.docMirror.docId() &&
+               report.contains("revision") && report["revision"].is_number_integer() &&
+               report["revision"].get<int>() == st.docMirror.revision();
+    };
+    auto key = [&](bool shift) {
+        ImGuiIO& io = ImGui::GetIO();
+        io.AddKeyEvent(ImGuiMod_Ctrl, true);
+        io.AddKeyEvent(ImGuiMod_Shift, shift);
+        if (!s.input.key(ImGuiKey_Z)) return false;
+        io.AddKeyEvent(ImGuiMod_Ctrl, false);
+        io.AddKeyEvent(ImGuiMod_Shift, false);
+        return true;
+    };
+    switch (s.step) {
+    case 0: {
+        if (st.rpc.busy()) return;
+        std::string error;
+        if (!modelHistoryCheck("new_scratch_part", st.docMirror.newPart(st.worker, error),
+                               {{"error", error}})) return;
+        st.clearViewportForNewDoc();
+        st.addDocTab(false);
+        const auto ops = nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {
+                {"type", "box"}, {"name", "History fixture block"},
+                {"params", {{"length", 40.0}, {"width", 30.0}, {"height", 20.0}, {"centered", true}}}}}},
+            {{"op", "add_feature"}, {"feature", {
+                {"type", "plane"}, {"name", "Unused history datum"},
+                {"params", {{"method", "offset"}, {"offset", 10.0}}},
+                {"refs", {{"base", "plane.top"}}}}}}
+        });
+        const auto response = st.docMirror.applyOps(st.worker, ops);
+        s.box = response.id_map.is_object() ? response.id_map.value("$0", std::string()) : std::string();
+        s.datum = response.id_map.is_object() ? response.id_map.value("$1", std::string()) : std::string();
+        s.docId = st.docMirror.docId();
+        const bool loaded = response.ok && !response.aicm_path.empty() &&
+                            st.loadDocMesh(response.aicm_path, error);
+        if (!modelHistoryCheck("fixture_built", loaded && !s.box.empty() && !s.datum.empty() &&
+                               modelHistoryBoundsMatch(st, 40.0, 30.0, 20.0),
+                               {{"error", error}, {"response_error", response.error_message},
+                                {"box", s.box}, {"datum", s.datum}, {"tree", st.docMirror.tree()},
+                                {"mesh", modelHistoryMeshEvidence(st)}})) return;
+        st.showRibbon = true;
+        st.ribbonTab = AppState::RT_Evaluate;
+        st.showFeatureTree = true;
+        st.leftPaneTab = AppState::LP_FeatureManager;
+        st.yaw = 35; st.pitch = 30; st.zoom = 1.0f;
+        next(1, 8); return;
+    }
+    case 1:
+    case 20: {
+        if (s.input.phase) {
+            if (s.input.click(s.input.point)) next(s.step == 1 ? 2 : 21);
+            return;
+        }
+        const nlohmann::json* target = nullptr;
+        for (const auto& item : ui::audit::observedItems()) {
+            const auto window = item.value("window", std::string());
+            if (window.find("##RibbonBody") == std::string::npos || !item.value("visible", false)) continue;
+            ImGuiWindow* w = ImGui::FindWindowByName(window.c_str());
+            if (!w) continue;
+            const ImGuiID scope = ImHashStr("eval_model_history", 0, w->ID);
+            const ImGuiID actual = item.value("id", ImGuiID(0));
+            if (actual == ImHashStr("##main", 0, scope) ||
+                actual == ImHashStr("##msm", 0, scope) ||
+                actual == ImHashStr("##sm", 0, scope)) {
+                target = &item;
+                break;
+            }
+        }
+        if (!target) return;
+        s.report["ribbon_control"] = *target;
+        s.input.click(shotPoint(*target));
+        return;
+    }
+    case 2: {
+        if (!reportReady()) return;
+        const auto& result = st.evaluateDialogs->analysisResult();
+        bool warning = false, preview = false;
+        if (result.contains("findings") && result["findings"].is_array())
+            for (const auto& f : result["findings"])
+                if (f.is_object() && f.value("code", std::string()) == "unused_datum" &&
+                    f.value("severity", std::string()) == "warning" &&
+                    f.value("auto_fixable", false) &&
+                    f.contains("feature_ids") && f["feature_ids"].is_array())
+                    for (const auto& id : f["feature_ids"]) warning |= id == s.datum;
+        if (result.contains("safe_fixes") && result["safe_fixes"].is_array())
+            for (const auto& fix : result["safe_fixes"])
+                if (fix.is_object() && fix.contains("feature_ids") && fix["feature_ids"].is_array())
+                    for (const auto& id : fix["feature_ids"]) preview |= id == s.datum;
+        const auto* simplify = modelHistoryItem("Simplify history", true);
+        const std::string datumLabel = "Unused history datum (" + s.datum + ")";
+        const auto* row = shotItem(datumLabel.c_str(), true, "###eval_model_history");
+        if (!simplify || !row) return;
+        s.reportRevision = result["revision"].get<int>();
+        s.report["initial_report"] = result;
+        if (!modelHistoryCheck("native_warning_and_rendered_preview",
+                result.value("complete", false) && warning && preview &&
+                st.evaluateDialogs->openWindowKind() == "model_history",
+                {{"report", result}, {"preview_control", *row}, {"simplify_control", *simplify}})) return;
+        next(3); return;
+    }
+    case 3: {
+        const std::string label = "Unused history datum (" + s.datum + ")";
+        if (!click(label)) return;
+        next(4); return;
+    }
+    case 4:
+        if (!modelHistoryCheck("finding_selects_real_tree_feature",
+                               st.selectedFeatureId == s.datum && st.showFeatureTree &&
+                               st.leftPaneTab == AppState::LP_FeatureManager,
+                               {{"selected", st.selectedFeatureId}, {"expected", s.datum}})) return;
+        modelHistoryCapture(st, "00_preview_selection.png"); next(5); return;
+    case 5: {
+        const char* label = "warning - unused_datum";
+        const auto* visible = shotItem(label, true, "###eval_model_history");
+        if (!visible) { shotScrollTo(label, "###eval_model_history", true); return; }
+        if (!modelHistoryCheck("warning_visibly_rendered", true, {{"item", *visible}})) return;
+        modelHistoryCapture(st, "01_warning.png"); next(6); return;
+    }
+    case 6: {
+        // Advance the native document behind the panel with a genuine shape edit.
+        nlohmann::json response;
+        std::string error;
+        const auto op = nlohmann::json::array({
+            {{"op", "edit_feature"}, {"id", s.box}, {"params", {{"length", 70.0}}}}
+        });
+        const bool called = st.worker.call("doc_apply_ops",
+            {{"doc_id", s.docId}, {"base_revision", s.reportRevision}, {"ops", op}},
+            response, error, 60000);
+        s.externalRevision = response.is_object() ? response.value("revision", -1) : -1;
+        s.foreignTree = response.is_object() ? response.value("tree", nlohmann::json()) : nlohmann::json();
+        if (!modelHistoryCheck("foreign_edit_advanced_native_only",
+                called && response.is_object() && !response.contains("code") &&
+                !response.contains("rejected_tree") && s.foreignTree.is_object() &&
+                s.externalRevision > s.reportRevision && st.docMirror.revision() == s.reportRevision &&
+                modelHistoryBoundsMatch(st, 40.0, 30.0, 20.0),
+                {{"error", error}, {"response", response}, {"mirror_revision", st.docMirror.revision()},
+                 {"old_mesh", modelHistoryMeshEvidence(st)}})) return;
+        next(7); return;
+    }
+    case 7:
+        if (click("Simplify history")) next(8, 8);
+        return;
+    case 8: {
+        if (!reportReady()) return;
+        const nlohmann::json* notice = nullptr;
+        for (const auto& item : ui::audit::observedItems())
+            if (item.value("window", std::string()).find("###eval_model_history") != std::string::npos &&
+                item.value("label", std::string()).find("Simplify history failed (stale_revision)") == 0) {
+                notice = &item; break;
+            }
+        if (!notice || !notice->value("visible", false)) {
+            shotScrollTo("Refresh report", "###eval_model_history", true, notice);
+            return;
+        }
+        if (st.docMirror.docId() != s.docId || st.docMirror.revision() != s.externalRevision) {
+            modelHistoryCheck("stale_cleanup_no_retry", false,
+                              {{"expected_revision", s.externalRevision},
+                               {"mesh", modelHistoryMeshEvidence(st)}, {"tree", st.docMirror.tree()}});
+            return;
+        }
+        if (!modelHistoryMeshCurrent(st, s.docId, s.externalRevision)) return;
+        nlohmann::json nativeTree;
+        std::string error;
+        const bool readNative = st.worker.call("doc_tree", {{"doc_id", s.docId}}, nativeTree, error, 15000);
+        const auto box = feature(s.box);
+        const auto params = box.is_object() ? box.value("params", nlohmann::json::object())
+                                            : nlohmann::json::object();
+        if (!modelHistoryCheck("stale_cleanup_rejected_and_resynced",
+                st.docMirror.revision() == s.externalRevision && !feature(s.datum).is_null() &&
+                st.docMirror.featureStatusCurrent() && params.is_object() &&
+                params.value("length", 0.0) == 70.0 && st.docMirror.tree() == s.foreignTree &&
+                readNative && nativeTree.is_object() && !nativeTree.contains("code") &&
+                nativeTree.value("revision", -1) == s.externalRevision &&
+                nativeTree.value("tree", nlohmann::json()) == s.foreignTree &&
+                modelHistoryBoundsMatch(st, 70.0, 30.0, 20.0),
+                {{"notice", *notice}, {"error", error}, {"tree", st.docMirror.tree()},
+                 {"native_tree", nativeTree}, {"mesh", modelHistoryMeshEvidence(st)},
+                 {"feature_status_current", st.docMirror.featureStatusCurrent()}})) return;
+        s.boxLength = 70.0;
+        modelHistoryCapture(st, "02_stale_rejected.png", true); next(9); return;
+    }
+    case 9:
+        if (click("Simplify history")) next(10, 8);
+        return;
+    case 10: {
+        if (!reportReady()) return;
+        const auto& report = st.evaluateDialogs->analysisResult();
+        const auto* disabled = modelHistoryItem("Simplify history", false);
+        if (!disabled) return;
+        s.editRevision = st.docMirror.revision();
+        if (!modelHistoryCheck("cleanup_is_one_real_edit_and_now_disabled",
+                s.editRevision == s.externalRevision + 1 && feature(s.datum).is_null() &&
+                report.contains("safe_fixes") && report["safe_fixes"].is_array() &&
+                report["safe_fixes"].empty() && st.hasDocMesh,
+                {{"tree", st.docMirror.tree()}, {"report", report}, {"disabled_control", *disabled}})) return;
+        modelHistoryCapture(st, "03_cleaned.png"); next(11); return;
+    }
+    case 11:
+        if (key(false)) next(12, 8);
+        return;
+    case 12: {
+        if (!reportReady()) return;
+        if (!modelHistoryCheck("undo_restores_cleanup",
+                st.docMirror.revision() > s.editRevision && !feature(s.datum).is_null(),
+                {{"tree", st.docMirror.tree()}, {"revision", st.docMirror.revision()}})) return;
+        modelHistoryCapture(st, "04_cleanup_undo.png"); next(13); return;
+    }
+    case 13:
+        if (click("Refine representation")) next(14, 8);
+        return;
+    case 14: {
+        if (!reportReady()) return;
+        nlohmann::json refined, status;
+        for (const auto& f : st.docMirror.tree().value("features", nlohmann::json::array()))
+            if (f.is_object() && f.value("type", std::string()) == "refine") refined = f;
+        const std::string id = refined.is_object() ? refined.value("id", std::string()) : std::string();
+        if (st.docMirror.featureStatus().is_array())
+            for (const auto& row : st.docMirror.featureStatus())
+                if (row.is_object() && row.value("id", std::string()) == id) status = row;
+        const bool attempted = status.is_object() && status.contains("data") && status["data"].is_object() &&
+                               status["data"].value("attempted", false);
+        if (!modelHistoryCheck("refine_appends_editable_real_feature",
+                !id.empty() && st.docMirror.featureStatusCurrent() && status.is_object() &&
+                status.value("ok", false) && attempted && st.hasDocMesh,
+                {{"feature", refined}, {"native_status", status}})) return;
+        s.report["refine_feature"] = refined;
+        s.report["refine_status"] = status;
+        s.editRevision = st.docMirror.revision();
+        modelHistoryCapture(st, "05_refined.png"); next(15); return;
+    }
+    case 15:
+        if (key(false)) next(16, 8);
+        return;
+    case 16: {
+        if (!reportReady()) return;
+        const auto id = s.report["refine_feature"].value("id", std::string());
+        if (!modelHistoryCheck("refine_undo_removes_feature",
+                st.docMirror.revision() > s.editRevision && feature(id).is_null(),
+                {{"tree", st.docMirror.tree()}})) return;
+        s.editRevision = st.docMirror.revision();
+        next(17); return;
+    }
+    case 17:
+        if (key(true)) next(18, 8);
+        return;
+    case 18: {
+        if (!reportReady()) return;
+        const auto id = s.report["refine_feature"].value("id", std::string());
+        if (!modelHistoryCheck("refine_redo_restores_feature",
+                st.docMirror.revision() > s.editRevision && !feature(id).is_null(),
+                {{"tree", st.docMirror.tree()}})) return;
+        modelHistoryCapture(st, "06_refine_redo.png"); next(19); return;
+    }
+    case 19: {
+        // A real surf_extrude open wall has one renderable body but no solid. This
+        // distinguishes the unsupported case from a merely empty document.
+        if (st.rpc.busy()) return;
+        std::string error;
+        if (!modelHistoryCheck("new_surface_scratch_part", st.docMirror.newPart(st.worker, error),
+                               {{"error", error}})) return;
+        st.clearViewportForNewDoc();
+        st.addDocTab(false);
+        s.docId = st.docMirror.docId();
+        const auto ops = nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {
+                {"type", "sketch"}, {"name", "Surface boundary"},
+                {"params", {{"entities", nlohmann::json::array()},
+                            {"constraints", nlohmann::json::array()}}},
+                {"refs", {{"plane", "plane.top"}}}}}},
+            {{"op", "sketch_add_entity"}, {"sketch", "$0"},
+             {"entity", {{"type", "line"}, {"p1", {-20, -15}}, {"p2", {20, -15}}}}},
+            {{"op", "sketch_add_entity"}, {"sketch", "$0"},
+             {"entity", {{"type", "line"}, {"p1", {20, -15}}, {"p2", {20, 15}}}}},
+            {{"op", "sketch_add_entity"}, {"sketch", "$0"},
+             {"entity", {{"type", "line"}, {"p1", {20, 15}}, {"p2", {-20, 15}}}}},
+            {{"op", "sketch_add_entity"}, {"sketch", "$0"},
+             {"entity", {{"type", "line"}, {"p1", {-20, 15}}, {"p2", {-20, -15}}}}},
+            {{"op", "add_feature"}, {"feature", {
+                {"type", "surf_extrude"}, {"name", "Surface-only fixture"},
+                {"params", {{"end", "blind"}, {"depth", {{"value", 20.0}, {"expr", nullptr}}}}},
+                {"refs", {{"profile", nlohmann::json::array({
+                    {{"kind", "region"}, {"sketch", "$0"}, {"centroid", {0, 0}}, {"hint_index", 0}}
+                })}}}}}}
+        });
+        const auto response = st.docMirror.applyOps(st.worker, ops);
+        const bool loaded = response.ok && !response.aicm_path.empty() &&
+                            st.loadDocMesh(response.aicm_path, error);
+        bool statusesOk = response.feature_status.is_array() && !response.feature_status.empty();
+        if (statusesOk) for (const auto& status : response.feature_status)
+            statusesOk &= status.is_object() && status.value("ok", false);
+        if (!modelHistoryCheck("real_surface_only_fixture",
+                loaded && statusesOk && st.docMirror.featureStatusCurrent() &&
+                st.docMirror.solidPresenceKnown() && !st.docMirror.hasSolidBody() &&
+                st.docBodyIds.size() == 1 && modelHistoryBoundsMatch(st, 40.0, 30.0, 20.0),
+                {{"error", error}, {"response_error", response.error_message},
+                 {"statuses", response.feature_status}, {"tree", st.docMirror.tree()},
+                 {"solid_known", st.docMirror.solidPresenceKnown()}, {"has_solid", st.docMirror.hasSolidBody()},
+                 {"body_count", st.docBodyIds.size()}, {"mesh", modelHistoryMeshEvidence(st)}})) return;
+        st.yaw = 35; st.pitch = 30; st.zoom = 1.0f;
+        st.showRibbon = true; st.ribbonTab = AppState::RT_Evaluate;
+        next(20, 8); return;
+    }
+    case 21: {
+        if (s.input.phase) {
+            if (s.input.click(s.input.point)) next(22, 8);
+            return;
+        }
+        if (!reportReady() || !modelHistoryMeshCurrent(st, s.docId, st.docMirror.revision())) return;
+        const auto* disabled = modelHistoryItem("Refine representation", false);
+        const auto* enabled = modelHistoryItem("Refine representation", true);
+        if (!disabled && !enabled) return;
+        if (!modelHistoryCheck("surface_only_refine_is_disabled",
+                disabled && !enabled && st.docMirror.solidPresenceKnown() &&
+                !st.docMirror.hasSolidBody() && !st.docBodyIds.empty(),
+                {{"disabled_control", disabled ? *disabled : nlohmann::json()},
+                 {"enabled_control", enabled ? *enabled : nlohmann::json()},
+                 {"report", st.evaluateDialogs->analysisResult()},
+                 {"solid_known", st.docMirror.solidPresenceKnown()}, {"has_solid", st.docMirror.hasSolidBody()},
+                 {"body_count", st.docBodyIds.size()}})) return;
+        s.editRevision = st.docMirror.revision();
+        s.surfaceTree = st.docMirror.tree();
+        s.input.click(shotPoint(*disabled));  // A real pointer press on the disabled control.
+        return;
+    }
+    case 22: {
+        if (!reportReady()) return;
+        nlohmann::json nativeTree;
+        std::string error;
+        const bool readNative = st.worker.call("doc_tree", {{"doc_id", s.docId}}, nativeTree, error, 15000);
+        if (!modelHistoryCheck("disabled_surface_refine_does_not_mutate",
+                st.docMirror.revision() == s.editRevision && st.docMirror.tree() == s.surfaceTree &&
+                readNative && nativeTree.is_object() && !nativeTree.contains("code") &&
+                nativeTree.value("revision", -1) == s.editRevision &&
+                nativeTree.value("tree", nlohmann::json()) == s.surfaceTree,
+                {{"error", error}, {"tree", st.docMirror.tree()}, {"native_tree", nativeTree},
+                 {"revision", st.docMirror.revision()}})) return;
+        modelHistoryCapture(st, "07_surface_refine_disabled.png", false, true, true);
+        return;
+    }
+    }
+}
+
+bool modelHistoryEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, bool& done) {
+    auto& s = g_modelHistory;
+    if (!s.want) return false;
+    ++st.frame;
+    if (!s.capture.empty() && !s.failed) {
+        if (st.docMirror.docId() != s.captureDocId || st.docMirror.revision() != s.captureRevision) {
+            modelHistoryCheck("capture_document_changed", false,
+                              {{"expected_doc", s.captureDocId}, {"expected_revision", s.captureRevision},
+                               {"mesh", modelHistoryMeshEvidence(st)}});
+        } else if (!modelHistoryMeshCurrent(st, s.captureDocId, s.captureRevision)) {
+            // The last-good mesh may remain visible until the async upload lands.
+            // Keep the capture pending; the scenario deadline reports a failed load.
+            swapScenarioFrame(st.win);
+            done = false;
+            return true;
+        } else {
+            const auto pixels = modelHistoryPixels(st, s.captureLength, s.captureSurface, s.captureExtension);
+            const bool boundsMatch = modelHistoryBoundsMatch(st, s.captureSurface ? 40.0 : s.captureLength,
+                                                            30.0, 20.0);
+            modelHistoryCheck("capture_current_geometry_visible", boundsMatch && pixels.value("ok", false),
+                              {{"capture", s.capture}, {"mesh", modelHistoryMeshEvidence(st)},
+                               {"pixels", pixels}, {"bounds_match", boundsMatch}});
+        }
+    }
+    if (!s.capture.empty()) {
+        const bool finalCapture = s.finishAfterCapture && !s.failed;
+        if (!writeBackbufferPng(s.capture.c_str(), dw, dh, finalCapture ? screenshotPath : nullptr)) {
+            s.failed = s.done = true;
+            s.report["ok"] = false;
+            s.report["capture_error"] = s.capture;
+        } else {
+            s.report["captures"].push_back(s.capture);
+            if (finalCapture) { s.report["ok"] = true; s.done = true; }
+        }
+        s.capture.clear();
+    }
+    if (s.done) {
+        std::ofstream out(s.dir + "/report.json", std::ios::trunc);
+        out << s.report.dump(2) << '\n';
+        out.close();
+        if (s.failed || !out) {
+            core::framestats::flushReport();
+            std::fflush(nullptr);
+            std::_Exit(EXIT_FAILURE);
+        }
+    }
+    swapScenarioFrame(st.win);
+    done = s.done;
+    return true;
+}
+
+// Real part + embedded scan, including a reopen after the source file is removed.
+struct MeshReferenceShot {
+    bool init = false, want = false, done = false, failed = false;
+    int step = 0, settle = 0;
+    double started = 0.0;
+    std::string dir, part, reopened, source, doc, id;
+    nlohmann::json report = {{"scenario", "mesh_reference"}, {"ok", false},
+                             {"checks", nlohmann::json::array()}};
+} g_meshReference;
+
+bool meshReferenceCheck(const char* name, bool ok, const nlohmann::json& evidence = {}) {
+    auto& s = g_meshReference;
+    s.report["checks"].push_back({{"name", name}, {"ok", ok}, {"evidence", evidence}});
+    if (!ok) {
+        s.report["failure"] = name;
+        s.failed = s.done = true;
+        std::fprintf(stderr, "mesh_reference: FAILED %s: %s\n", name, evidence.dump().c_str());
+    }
+    return ok;
+}
+
+void meshReferenceShotTick(AppState& st) {
+    auto& s = g_meshReference;
+    if (!s.init) {
+        s.init = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        s.want = st.shot && mode && std::strcmp(mode, "mesh_reference") == 0;
+        if (!s.want) return;
+        const char* out = std::getenv("CHUDWARE_MESH_REFERENCE_OUT");
+        s.dir = std::filesystem::absolute(out && *out ? out : "scratch/mesh_reference_shots").string();
+        std::error_code ec;
+        std::filesystem::create_directories(s.dir, ec);
+        if (!meshReferenceCheck("output_directory", !ec, {{"error", ec.message()}})) return;
+        const char* repo = std::getenv("CHUDWARE_REPO");
+        const auto fixture = std::filesystem::absolute(
+            std::filesystem::path(repo && *repo ? repo : ".") / "host/tests/fixtures/mesh_reference.ply");
+        s.source = (std::filesystem::path(s.dir) / "scan.ply").string();
+        std::filesystem::copy_file(fixture, s.source, std::filesystem::copy_options::overwrite_existing, ec);
+        if (!meshReferenceCheck("copy_scan", !ec, {{"error", ec.message()}, {"fixture", fixture.string()}})) return;
+        s.part = (std::filesystem::path(s.dir) / "base.step+").string();
+        s.reopened = (std::filesystem::path(s.dir) / "reopened.step+").string();
+        s.started = pipingNow();
+    }
+    if (!s.want || s.done) return;
+    if (pipingNow() - s.started > 180.0) {
+        meshReferenceCheck("timeout", false, {{"step", s.step}, {"doc", st.docMirror.docId()},
+                                             {"error", ui::meshReferenceView().error}});
+        return;
+    }
+    if (!st.workerStarted || st.frame < 5) return;
+    if (s.settle > 0) { --s.settle; return; }
+    const auto& view = ui::meshReferenceView();
+    std::string error;
+    switch (s.step) {
+    case 0: {
+        if (st.rpc.busy()) return;
+        st.activeWorkspace = AppState::Workspace::Model;
+        if (!meshReferenceCheck("new_part", st.docMirror.newPart(st.worker, error), {{"error", error}})) return;
+        st.clearViewportForNewDoc();
+        st.addDocTab(false);
+        const auto box = st.docMirror.applyOps(st.worker, nlohmann::json::array({
+            {{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Part"},
+                {"params", {{"length", 60.0}, {"width", 40.0}, {"height", 10.0},
+                            {"centered", true}}}}}}
+        }));
+        if (!meshReferenceCheck("build_part", box.ok && !box.aicm_path.empty(),
+                                {{"error", box.error_message}})) return;
+        if (!meshReferenceCheck("load_part", st.loadDocMesh(box.aicm_path, error), {{"error", error}})) return;
+        nlohmann::json saved;
+        const bool savedOk = st.worker.call("doc_save", {{"doc_id", st.docMirror.docId()}, {"path", s.part}},
+                                             saved, error, 60000) && !saved.contains("code") &&
+                             saved.value("ok", true);
+        if (!meshReferenceCheck("save_part", savedOk, {{"error", error}, {"result", saved}})) return;
+        st.requestOpenPath = s.part;
+        st.yaw = 35; st.pitch = 28; st.zoom = 0.85f;
+        ++s.step;
+        return;
+    }
+    case 1:
+        if (!st.requestOpenPath.empty() || st.rebuildsInFlight || st.rpc.busy() ||
+            !st.isActiveMirrorDoc() || st.activeTab < 0 || st.docTabs[st.activeTab].path != s.part ||
+            !st.hasDocMesh) return;
+        s.doc = st.docMirror.docId();
+        ui::mutateMeshReference(st, "doc_mesh_ref_add",
+            {{"name", "Scanned enclosure"}, {"path", s.source}, {"opacity", 0.30},
+             {"color", {0.18, 0.55, 0.95}}, {"approximate", true},
+             {"transform", {{"mm_per_unit", 1.0},
+                            {"rotation", {{1,0,0}, {0,1,0}, {0,0,1}}},
+                            {"translation_mm", {0,0,0}}}}});
+        ++s.step;
+        return;
+    case 2:
+        if (!view.error.empty()) { meshReferenceCheck("load_reference", false, {{"error", view.error}}); return; }
+        if (view.docId != s.doc || view.writing || view.loading || view.refs.empty()) return;
+        s.id = view.refs[0].value("id", std::string());
+        if (s.id.empty() || !ui::meshReferenceLoaded(s.id)) return;
+        if (!meshReferenceCheck("reference_and_body", st.renderer && st.renderer->bodyCount() == 1 &&
+                                st.renderer->meshReferenceCount() == 1 &&
+                                view.refs[0].value("triangles", 0) == 12,
+                                {{"refs", view.refs}, {"body_count", st.renderer ? st.renderer->bodyCount() : 0}}))
+            return;
+        ui::mutateMeshReference(st, "doc_mesh_ref_update", {{"id", s.id}, {"visible", false}});
+        ++s.step;
+        return;
+    case 3:
+        if (view.writing || view.loading || view.refs.empty() ||
+            view.refs[0].value("visible", true)) return;
+        ui::mutateMeshReference(st, "doc_mesh_ref_update", {{"id", s.id}, {"visible", true}});
+        ++s.step;
+        return;
+    case 4: {
+        if (view.writing || view.loading || view.refs.empty() ||
+            !view.refs[0].value("visible", false)) return;
+        nlohmann::json saved;
+        const std::string savedPath = (std::filesystem::path(s.dir) / "with_reference.step+").string();
+        const bool savedOk = st.worker.call("doc_save", {{"doc_id", s.doc}, {"path", savedPath}},
+                                             saved, error, 60000) && !saved.contains("code") &&
+                             saved.value("ok", true);
+        if (!meshReferenceCheck("save_embedded_reference", savedOk,
+                                {{"error", error}, {"result", saved}})) return;
+        std::error_code ec;
+        std::filesystem::copy_file(savedPath, s.reopened,
+                                   std::filesystem::copy_options::overwrite_existing, ec);
+        if (!meshReferenceCheck("copy_for_fresh_open", !ec, {{"error", ec.message()}})) return;
+        const bool removed = std::filesystem::remove(s.source, ec);
+        if (!meshReferenceCheck("remove_scan_source", removed && !ec, {{"error", ec.message()}})) return;
+        st.requestOpenPath = s.reopened;
+        ++s.step;
+        return;
+    }
+    case 5: {
+        if (!st.requestOpenPath.empty() || st.rebuildsInFlight || st.rpc.busy() ||
+            !st.isActiveMirrorDoc() || st.activeTab < 0 ||
+            st.docTabs[st.activeTab].path != s.reopened || !st.hasDocMesh ||
+            view.docId != st.docMirror.docId() || view.loading || view.refs.empty()) return;
+        const std::string reopenedId = view.refs[0].value("id", std::string());
+        if (reopenedId.empty() || !ui::meshReferenceLoaded(reopenedId)) return;
+        nlohmann::json mesh;
+        const bool meshOk = st.worker.call("doc_mesh_ref_mesh",
+            {{"doc_id", st.docMirror.docId()}, {"id", reopenedId}, {"offset_tris", 0}, {"max_tris", 10000}},
+            mesh, error, 60000) && mesh.value("ok", false);
+        if (!meshReferenceCheck("reopen_without_source", meshOk &&
+                                mesh.value("indices", nlohmann::json::array()).size() == 36 &&
+                                st.renderer && st.renderer->bodyCount() == 1 &&
+                                st.renderer->meshReferenceCount() == 1,
+                                {{"error", error}, {"doc", st.docMirror.docId()}})) return;
+        s.settle = 8;
+        ++s.step;
+        return;
+    }
+    default:
+        s.report["ok"] = true;
+        s.done = true;
+    }
+}
+
+bool meshReferenceShotEndFrame(AppState& st, int dw, int dh, const char* screenshotPath, bool& done) {
+    auto& s = g_meshReference;
+    if (!s.want) return false;
+    ++st.frame;
+    if (s.done) {
+        const std::string capture = (std::filesystem::path(s.dir) / "mesh_reference.png").string();
+        if (!writeBackbufferPng(capture.c_str(), dw, dh, screenshotPath)) {
+            s.failed = true;
+            s.report["ok"] = false;
+            s.report["failure"] = "capture";
+        }
+        s.report["capture"] = capture;
+        std::ofstream out(std::filesystem::path(s.dir) / "report.json");
+        out << s.report.dump(2) << '\n';
+        out.close();
+        if (s.failed || !out) {
+            core::framestats::flushReport();
+            std::fflush(nullptr);
+            std::_Exit(EXIT_FAILURE);
+        }
+    }
+    swapScenarioFrame(st.win);
+    done = s.done;
+    return true;
+}
+
 }  // namespace
 
 namespace ui {
@@ -7815,12 +20678,13 @@ void ScenarioRunner::tick(AppState& st) {
     // (remove top face) -> edit Fillet r=8 (cached rebuild assertion) -> save + reopen.
     // The capture itself happens in endFrame() when m1Capture is non-empty.
     if (st.wantM1 && st.workerStarted && !st.m1ShotDone) {
-        // Resolve repo-relative scratch dir for screenshots.
+        // Use a private output override when requested; the default stays repo-relative.
         if (!m1DirReady) {
             m1DirReady = true;
             const char* repo = std::getenv("CHUDWARE_REPO");
             std::string base = repo ? std::string(repo) : std::string(".");
-            m1SavePath = base + "/scratch/m1_shots";
+            const char* out = std::getenv("CHUDWARE_M1_SHOT_OUT");
+            m1SavePath = out && *out ? std::string(out) : base + "/scratch/m1_shots";
             // W1-B (item 12): create the output dir robustly. The old code left a dead `mk`
             // variable and never actually created the dir, so captures silently failed when it
             // was missing; an earlier ad-hoc string join also produced the malformed stray dir
@@ -7833,6 +20697,7 @@ void ScenarioRunner::tick(AppState& st) {
                 std::fprintf(stderr, "m1: mesh load failed: %s %s\n",
                              r.error_message.c_str(), error.c_str());
                 std::fflush(nullptr);
+                core::framestats::flushReport();
                 std::_Exit(EXIT_FAILURE);
             }
         };
@@ -8025,10 +20890,10 @@ void ScenarioRunner::tick(AppState& st) {
                         std::fprintf(stderr, "m1: cached reopen failed: %s %s\n",
                                      serr.c_str(), meshError.c_str());
                         std::fflush(nullptr);
+                        core::framestats::flushReport();
                         std::_Exit(EXIT_FAILURE);
                     }
-                    st.docTabs[st.activeTab].path = sp;
-                    st.docTabs[st.activeTab].dirty = false;
+                    st.markSaved(st.docMirror.docId(), st.docMirror.revision(), sp);
                     st.applyDocDrivenVisibility(st.docMirror.tree());
                     const int openedTab = st.activeTab;
                     const auto openedDoc = st.docMirror.docId();
@@ -8039,6 +20904,7 @@ void ScenarioRunner::tick(AppState& st) {
                         st.docMirror.docId() != openedDoc || st.docTabs.size() != tabCount) {
                         std::fprintf(stderr, "m1: canonical reopen did not reuse the open document\n");
                         std::fflush(nullptr);
+                        core::framestats::flushReport();
                         std::_Exit(EXIT_FAILURE);
                     }
                     std::printf("m1: cached mesh restored; canonical reopen reused the active document\n");
@@ -8474,29 +21340,56 @@ void ScenarioRunner::tick(AppState& st) {
                 std::fflush(stdout);
                 asmSettle = 2; ++asmStep; break;
             }
-            case 1: {  // new assembly + insert both (peg offset away from the hole)
+            case 1: {  // new assembly (inserts follow in case 2)
                 std::string err;
                 if (!st.docMirror.newAssembly(st.worker, err)) {
                     std::printf("asm: new_assembly FAILED: %s\n", err.c_str()); std::fflush(stdout);
                     st.asmShotDone = true; break;
                 }
                 asmDoc = st.docMirror.docId();
-                std::string aicm;
-                ap->insertComponent(st, asmBasePath, nullptr, aicm);
-                nlohmann::json off = nlohmann::json::array({1,0,0,30, 0,1,0,25, 0,0,1,18, 0,0,0,1});
-                ap->insertComponent(st, asmPegPath, off, aicm);
-                // identify the peg component id (k2 = second component)
+                st.yaw = 28; st.pitch = 22; st.zoom = 1.0f;
+                ++asmStep; break;
+            }
+            case 2: {  // insert base, then peg (offset away from the hole), then resolve k2
+                // insertComponent is applyOpsAsync against the current base revision, so the
+                // peg is submitted only after the base insert completed.
+                if (asmInsertsFailed == 0 && asmInsertsSubmitted == asmInsertsDone &&
+                    asmInsertsSubmitted < 2) {
+                    int* done = &asmInsertsDone;
+                    int* failed = &asmInsertsFailed;
+                    auto onInserted = [done, failed](ui::AsmPanels::InsertOutcome outcome,
+                                                     const std::string& error) {
+                        ++*done;
+                        if (outcome != ui::AsmPanels::InsertOutcome::Success) {
+                            ++*failed;
+                            std::printf(outcome == ui::AsmPanels::InsertOutcome::Superseded
+                                            ? "asm: insert superseded: %s\n" : "asm: insert FAILED: %s\n",
+                                        error.c_str());
+                            std::fflush(stdout);
+                        }
+                    };
+                    std::string aicm;
+                    if (asmInsertsSubmitted == 0) {
+                        ap->insertComponent(st, asmBasePath, nullptr, aicm, onInserted);
+                    } else {
+                        nlohmann::json off = nlohmann::json::array({1,0,0,30, 0,1,0,25, 0,0,1,18, 0,0,0,1});
+                        ap->insertComponent(st, asmPegPath, off, aicm, onInserted);
+                    }
+                    ++asmInsertsSubmitted;
+                    break;
+                }
                 const auto& tr = st.docMirror.tree();
-                if (tr.contains("components") && tr["components"].is_array() &&
-                    tr["components"].size() >= 2)
-                    asmK2 = tr["components"][1].value("id", std::string());
+                const bool landed = asmInsertsDone >= 2 && st.rebuildsInFlight == 0 &&
+                                    tr.contains("components") && tr["components"].is_array() &&
+                                    tr["components"].size() >= 2;
+                if (!landed && asmInsertsFailed == 0 && ++asmInsertWaitFrames < 3600) break;
+                if (landed) asmK2 = tr["components"][1].value("id", std::string());
                 std::printf("asm: assembly %s inserted base+peg (peg=%s)\n",
                             asmDoc.c_str(), asmK2.c_str());
                 std::fflush(stdout);
-                st.yaw = 28; st.pitch = 22; st.zoom = 1.0f;
                 asmSettle = kSettle; ++asmStep; break;
             }
-            case 2: {  // concentric + coincident(anti) mates -> peg seats at z=15
+            case 3: {  // concentric + coincident(anti) mates -> peg seats at z=15
                 // Resolve the mate selectors via the asm pick path (component-body ordinals).
                 auto resolveAsm = [&](int bodyId, const char* kind, int topo,
                                       std::string& comp) -> nlohmann::json {
@@ -8574,7 +21467,7 @@ void ScenarioRunner::tick(AppState& st) {
                 std::fflush(stdout);
                 asmCapture = asmSavePath + "/asm_01_seated.png"; asmSettle = kSettle; ++asmStep; break;
             }
-            case 3: {  // explode factor 1.0
+            case 4: {  // explode factor 1.0
                 ap->closeMateForm();
                 // Define an explode step for the peg (lift it +Z 40mm) so the slider has
                 // something to act on, then activate the exploded view at factor 1.0.
@@ -8590,7 +21483,7 @@ void ScenarioRunner::tick(AppState& st) {
                 std::printf("asm: explode factor=1.0 (peg +40mm)\n"); std::fflush(stdout);
                 asmCapture = asmSavePath + "/asm_02_explode.png"; asmSettle = kSettle; ++asmStep; break;
             }
-            case 4: {  // interference window
+            case 5: {  // interference window
                 ap->setExplode(st, false, 0.0f);  // collapse before checking real fit
                 ap->closeExplode();               // dismiss the explode window so it isn't on top
                 ap->openInterference(st);
@@ -8640,9 +21533,18 @@ void ScenarioRunner::tick(AppState& st) {
                 st.showRibbon = true;
                 st.showSimulationTools = true;
                 st.ribbonTab = kSaTabStatic;
-                const int before = sm.studyCount();
+                F.studyBefore = sm.studyCount();
                 sm.handleCommand(st, "sim_new_static");
-                if (sm.studyCount() != before + 1) {
+                F.stepStart = pipingNow();
+                feaStep = 101; break;
+            }
+            case 101: {
+                if (!studyShotReady(st, F, "fea", kReadyTimeoutS)) {
+                    if (F.failed) feaStep = 99;
+                    break;
+                }
+                ui::SimManager& sm = *st.simManager;
+                if (sm.studyCount() != F.studyBefore + 1) {
                     studyShotFail(F, "fea", "study_not_created",
                                   "sim_new_static added no study (status: " + st.status + ")");
                     feaStep = 99; break;
@@ -8688,7 +21590,7 @@ void ScenarioRunner::tick(AppState& st) {
                 std::fflush(stdout);
                 F.stepStart = pipingNow();
                 F.lastTry = 0.0;
-                feaSettle = 2; ++feaStep; break;
+                feaSettle = 2; feaStep = 2; break;
             }
             case 2: {  // Run (retried while the engine finishes the setup saves)
                 if (st.docMirror.docId() != F.docId || !st.simManager) {
@@ -8800,8 +21702,8 @@ void ScenarioRunner::tick(AppState& st) {
     }
 
     // ---------- CAM native-viewport scenario (CHUDWARE_SHOT=cam) ----------
-    // new part -> box 80x60x15 + 4 corner through-holes -> run the copilot CAM fast-path
-    // (agent_run options.cam) -> adopt the built job exactly as the app drain does -> load
+    // new part -> box 80x60x15 + 4 corner through-holes -> build the CAM job (cam_program) ->
+    // adopt the built job exactly as the app drain does -> load
     // toolpaths + framed material removal at mid-cycle. The capture exercises the real
     // Manufacture workspace: native viewport geometry/HUD plus the integrated left controls.
     if (st.wantCam && st.workerStarted && !st.camShotDone && st.frame >= 5) {
@@ -8829,8 +21731,8 @@ void ScenarioRunner::tick(AppState& st) {
                     (int)!r.aicm_path.empty());
         std::fflush(stdout);
         if (r.ok && !r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
-        // Drive the same core recipe the copilot CAM fast-path calls (cam_program_from_part);
-        // cam_* routes straight to the C++ core, so no agent provider is needed.
+        // Drive the core CAM recipe (cam_program); cam_* routes straight to the C++ core, so no
+        // agent provider is needed.
         nlohmann::json res; std::string e2;
         bool ok = st.worker.call("cam_program",
                        {{"doc_id", st.docMirror.docId()}, {"post", "fanuc"}}, res, e2);
@@ -8904,10 +21806,19 @@ void ScenarioRunner::tick(AppState& st) {
                 st.showRibbon = true;
                 st.showSimulationTools = true;
                 st.ribbonTab = kSaTabFlow;
-                const int before = sm.studyCount();
+                F.studyBefore = sm.studyCount();
                 sm.handleCommand(st, "sim_new_flow");
+                F.stepStart = pipingNow();
+                flowStep = 101; break;
+            }
+            case 101: {
+                if (!studyShotReady(st, F, "flow", kReadyTimeoutS)) {
+                    if (F.failed) flowStep = 99;
+                    break;
+                }
+                ui::SimManager& sm = *st.simManager;
                 st.ribbonTab = kSaTabFlow;
-                if (sm.studyCount() != before + 1) {
+                if (sm.studyCount() != F.studyBefore + 1) {
                     studyShotFail(F, "flow", "study_not_created",
                                   "sim_new_flow added no study (status: " + st.status + ")");
                     flowStep = 99; break;
@@ -8918,7 +21829,7 @@ void ScenarioRunner::tick(AppState& st) {
                 std::fflush(stdout);
                 F.stepStart = pipingNow();
                 F.lastTry = 0.0;
-                flowSettle = 2; ++flowStep; break;
+                flowSettle = 2; flowStep = 2; break;
             }
             case 2: {  // Run (retried while the engine finishes the setup save)
                 if (st.docMirror.docId() != F.docId || !st.simManager) {
@@ -9014,6 +21925,7 @@ void ScenarioRunner::tick(AppState& st) {
 
     // ---------- tab-switch perf scenario (CHUDWARE_SHOT=tabperf) ----------
     runTabPerf(st);
+    runFramePerf(st);
 
     // ---------- W17 engineering-drawing scenario (CHUDWARE_SHOT=drawing) ----------
     runDrawing(st);
@@ -9042,12 +21954,18 @@ void ScenarioRunner::tick(AppState& st) {
     // ---------- piping / industrial scenario (CHUDWARE_SHOT=piping) ----------
     pipingShotTick(st);
     pipeDrawTick(st);
+    thicknessShotTick(st);
+    modelHistoryTick(st);
+    meshReferenceShotTick(st);
 
     // ---------- hydraulic circuit scenario (CHUDWARE_SHOT=hydraulics) ----------
     hydraulicsShotTick(st);
 
     // ---------- saved-demo review (CHUDWARE_SHOT=demoreview) ----------
     demoReviewTick(st);
+
+    // ---------- exploded-view GPU slide + bake (CHUDWARE_SHOT=explode) ----------
+    explodeTick(st);
 
     // ---------- CAD-file open smoke (CHUDWARE_SHOT=dwgopen) ----------
     dwgOpenTick(st);
@@ -9057,12 +21975,24 @@ void ScenarioRunner::tick(AppState& st) {
 
     // ---------- mid-run message delivery captions (CHUDWARE_SHOT=steerstatus) ----------
     steerStatusTick(st);
+    compactUiTick(st);
     chatInlineTick(st);
+    composerSpellTick(st);
     copilotUiTick(st);
+    copilotShowcaseTick(st);
+    textContrastTick(st);
+    settingsRouteTick(st);
+    modelSettingsTick(st);
 
     // ---------- live document editing lock / keep-exit / takeover (CHUDWARE_SHOT=agentlock) ----------
     agentLockTick(st);
+    assemblyRefreshTick(st);
+    presentationTick(st);
+    ompGuiTick(st);
     featureStateTick(st);
+    uxQualityTick(st);
+    scadEditTick(st);
+    partsCatalogTick(st);
 
     // ---------- simulation UI audit (CHUDWARE_SHOT=simaudit) ----------
     simAuditTick(st);
@@ -9505,6 +22435,7 @@ void ScenarioRunner::runRevengSplat(AppState& st) {
     // after a loader/shader/FBO/readback failure.
     if (!passed || !diagnosticsWritten) {
         std::fflush(nullptr);
+        core::framestats::flushReport();
         std::_Exit(EXIT_FAILURE);
     }
 }
@@ -9942,6 +22873,195 @@ void ScenarioRunner::runTabPerf(AppState& st) {
     }
 }
 
+// Frame-driven GUI cost harness. Geometry goes through DocMirror; camera requests and injected
+// mouse positions feed the same viewport render/hover paths as interactive navigation.
+void ScenarioRunner::runFramePerf(AppState& st) {
+    namespace FS = core::framestats;
+    if (!fpInit) {
+        fpInit = true;
+        const char* mode = std::getenv("CHUDWARE_SHOT");
+        fpWant = st.shot && mode && std::strcmp(mode, "frameperf") == 0;
+        if (!fpWant) return;
+        FS::setPhase("setup");
+        fpStarted = pipingNow();
+        st.showRibbon = true;
+        st.showFeatureTree = true;
+        st.showAIPanel = false;
+        st.settings.copilotCollapsed = false;
+        st.activeWorkspace = AppState::Workspace::Model;
+        st.shotWorkspacePin = static_cast<int>(AppState::Workspace::Model);
+    }
+    if (!fpWant || fpDone) return;
+    ui::anim::requestFrames();
+    auto fail = [&](const std::string& why) {
+        std::fprintf(stderr, "frameperf: FAILED step=%d: %s\n", fpStep, why.c_str());
+        FS::setPhase("failed");
+        fpDone = fpFailed = true;
+    };
+    if (pipingNow() - fpStarted > 300.0) {
+        fail("timed out waiting for the frame-driven scenario");
+        return;
+    }
+    if (!st.workerStarted || st.frame < 5) return;
+    auto loadMesh = [&](const core::OpsResponse& r) {
+        std::string err;
+        if (!r.ok || r.aicm_path.empty() || !st.loadDocMesh(r.aicm_path, err)) {
+            fail(r.error_message + (err.empty() ? "" : ": " + err));
+            return false;
+        }
+        return true;
+    };
+    auto dim = [](double value) {
+        return nlohmann::json{{"value", value}, {"expr", nullptr}};
+    };
+    switch (fpStep) {
+    case 0: {
+        std::string err;
+        if (!st.docMirror.newPart(st.worker, err)) { fail("new part: " + err); return; }
+        st.clearViewportForNewDoc();
+        st.addDocTab(/*isAssembly=*/false);
+        ++fpStep;
+        return;
+    }
+    case 1: {
+        const auto ops = nlohmann::json::array({{{"op", "add_feature"}, {"feature", {
+            {"type", "box"}, {"name", "Frame performance plate"}, {"params", {
+                {"length", dim(90)}, {"width", dim(65)}, {"height", dim(18)},
+                {"centered", true}}}}}}});
+        if (loadMesh(st.docMirror.applyOps(st.worker, ops))) ++fpStep;
+        return;
+    }
+    case 2: {
+        nlohmann::json edges = nlohmann::json::array();
+        for (int tid = 1; tid <= 12 && edges.size() < 4; ++tid) {
+            std::string err;
+            const std::string selector = st.docMirror.resolvePick(st.worker, 1, "edge", tid, err);
+            auto edge = nlohmann::json::parse(selector, nullptr, false);
+            if (edge.is_object() && edge.contains("axis") && edge["axis"].is_array() &&
+                edge["axis"].size() == 3 && edge["axis"][2].is_number() &&
+                std::fabs(edge["axis"][2].get<double>()) > 0.9)
+                edges.push_back(std::move(edge));
+        }
+        if (edges.size() != 4) { fail("could not resolve the four vertical box edges"); return; }
+        const auto ops = nlohmann::json::array({{{"op", "add_feature"}, {"feature", {
+            {"type", "fillet"}, {"name", "Corner rounds"},
+            {"params", {{"radius", dim(4)}}}, {"refs", {{"edges", edges}}}}}}});
+        if (loadMesh(st.docMirror.applyOps(st.worker, ops))) ++fpStep;
+        return;
+    }
+    case 3: {
+        nlohmann::json positions = nlohmann::json::array();
+        for (int y = -1; y <= 1; ++y)
+            for (int x = -1; x <= 1; ++x)
+                positions.push_back({x * 26.0, y * 18.0});
+        const auto ops = nlohmann::json::array({{{"op", "add_feature"}, {"feature", {
+            {"type", "hole"}, {"name", "Nine through bores"}, {"params", {
+                {"style", "simple"}, {"standard", "custom"}, {"diameter", dim(7)},
+                {"end", "through_all"}, {"positions", positions}}},
+            {"refs", {{"face", {{"of", "face"}, {"side", "top"}}}}}}}}});
+        if (!loadMesh(st.docMirror.applyOps(st.worker, ops))) return;
+        ui::cancelCameraAnimation();
+        st.animActive = false;
+        st.yaw = 35; st.pitch = 28; st.zoom = 1.0f;
+        fpIdleFrames = 0;
+        ++fpStep;
+        return;
+    }
+    case 4:
+        if (st.rpc.busy() || st.rebuildsInFlight > 0 ||
+            (st.simClient && st.simClient->busy()) || !st.hasDocMesh) {
+            fpIdleFrames = 0;
+            return;
+        }
+        if (++fpIdleFrames >= 12) { ++fpStep; fpFrames = 0; }
+        return;
+    case 5:
+        FS::setPhase("orbit");
+        ImGui::GetIO().AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+        // Zero-duration requests land on the exact next yaw when the viewport calls
+        // tickCameraAnimation, then its ordinary renderOrbit draws once (not a second render).
+        st.animDur = 0.0f;
+        ui::requestCameraAnimation(st, 35.0f + (fpFrames + 1) * 1.2f, 28.0f, 1.0f);
+        if (++fpFrames == 300) { ++fpStep; fpFrames = 0; }
+        return;
+    case 6: {
+        FS::setPhase("hover");
+        if (fpFrames > 0 && st.pickReady) ++fpHoverPicks;
+        ImVec2 lo, hi;
+        if (!ui::viewportClearRect(lo, hi) || hi.x - lo.x < 40 || hi.y - lo.y < 40) {
+            fail("no usable viewport rectangle for the hover sweep");
+            return;
+        }
+        const float x = (fpFrames % 30 + 0.5f) / 30.0f;
+        const float y = (fpFrames / 30 + 0.5f) / 10.0f;
+        ImGui::GetIO().AddMousePosEvent(lo.x + (hi.x - lo.x) * (0.15f + x * 0.7f),
+                                     lo.y + (hi.y - lo.y) * (0.15f + y * 0.7f));
+        if (++fpFrames == 300) { ++fpStep; fpFrames = 0; }
+        return;
+    }
+    case 7: {
+        if (st.pickReady) ++fpHoverPicks; // include the last rendered hover frame
+        if (fpHoverPicks < 250) {
+            fail("the synthetic mouse did not exercise viewport ID picking (" +
+                 std::to_string(fpHoverPicks) + "/300 frames)");
+            return;
+        }
+        FS::setPhase("copilot_setup");
+        ImGui::GetIO().AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+        ui::ensureConversations(st);
+        ui::syncChatToDoc(st);
+        st.chat.clear();
+        st.chat.reserve(160);
+        for (int i = 0; i < 160; ++i) {
+            ChatMsg message;
+            message.fromUser = i % 2 == 0;
+            message.ts = 1.7e9 + i;
+            message.text = message.fromUser
+                ? "Review the mounting plate's corner radii, nine-hole spacing and machining "
+                  "access. Keep the dimensions editable and preserve the bolt interfaces."
+                : "### Plate review " + std::to_string(i / 2 + 1) +
+                  "\nThe feature history retains the box, four corner rounds and nine through "
+                  "bores. Check the hole-to-edge clearance and the cutter access from both sides."
+                  "\n\n| Parameter | Value |\n|---|---|\n| Plate | 90 x 65 x 18 mm |"
+                  "\n| Corner radius | 4 mm |\n| Bore diameter | 7 mm |"
+                  "\n\n```text\nFeature order: base -> corner rounds -> bores\n```";
+            st.chat.push_back(std::move(message));
+        }
+        st.designStarted = true;
+        st.showAIPanel = true;
+        st.showTaskList = st.showArtifacts = st.showSessionsPicker = st.showAISettingsOverlay = false;
+        ++fpStep;
+        return;
+    }
+    case 8:
+        FS::setPhase("copilot");
+        if (++fpFrames == 300) { ++fpStep; fpFrames = 0; }
+        return;
+    case 9: {
+        using WS = AppState::Workspace;
+        static constexpr struct { WS workspace; const char* phase; } kWorkspaces[] = {
+            {WS::Model, "workspace_model"}, {WS::Drawing, "workspace_drawing"},
+            {WS::Simulate, "workspace_simulate"}, {WS::Electronics, "workspace_electronics"},
+            {WS::Manufacture, "workspace_manufacture"}, {WS::PLM, "workspace_plm"},
+            {WS::PartsLibrary, "workspace_parts_library"}, {WS::AI, "workspace_ai"},
+        };
+        const auto& entry = kWorkspaces[fpFrames / 40];
+        FS::setPhase(entry.phase);
+        st.activeWorkspace = entry.workspace; // same workspace switch as runWorkspaces
+        st.shotWorkspacePin = static_cast<int>(entry.workspace);
+        if (++fpFrames == 8 * 40) ++fpStep;
+        return;
+    }
+    default:
+        FS::setPhase("final_capture");
+        fpDone = true;
+        std::printf("frameperf: complete; orbit=300 hover=300 picks=%d copilot=300 workspaces=8x40\n",
+                    fpHoverPicks);
+        std::fflush(stdout);
+        return;
+    }
+}
+
 // Engineering-drawing scenario (CHUDWARE_SHOT=drawing). Build a plate with a Ø12 bore and a 4-hole
 // pattern, Make Drawing (one drawing_make: ISO frame + title block, third-angle layout at one
 // standard scale, auto-dimensions, centre marks/lines), fill the title block, tolerance a dim,
@@ -10100,19 +23220,6 @@ void ScenarioRunner::runDrawing(AppState& st) {
                             ec ? 0ull : (unsigned long long)bytes,
                             (ok && !ec && bytes > 200) ? "PASS" : "CHECK");
             }
-            // In-app copilot trigger: a chat "make an engineering drawing of this part" is
-            // intercepted by the agent fast-path (no provider needed) and builds a drawing.
-            {
-                nlohmann::json r7;
-                bool ok7 = st.worker.call(
-                    "agent_run_v2",
-                    {{"request", "make an engineering drawing of this part"},
-                     {"doc_id", tab.sourceDocId}},
-                    r7, err);
-                bool made = ok7 && r7.is_object() && r7.value("created_drawing", false);
-                std::printf("drawing: agent fast-path created_drawing=%d %s\n", (int)made,
-                            made ? "PASS" : "CHECK");
-            }
             std::fflush(stdout);
             dwgCapture = dwgSavePath + "/drawing_01_third_angle.png"; dwgSettle = kSettle; ++dwgStep;
             break;
@@ -10151,6 +23258,17 @@ void ScenarioRunner::runDrawing(AppState& st) {
 
 ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int dh,
                                                      const char* screenshotPath) {
+    if (fpWant) {
+        ++st.frame;
+        if (fpDone) writeBackbufferPng(screenshotPath, dw, dh);
+        swapScenarioFrame(st.win);
+        if (fpDone && (!core::framestats::flushReport() || fpFailed)) {
+            std::fflush(nullptr);
+            std::_Exit(EXIT_FAILURE);
+        }
+        return fpDone ? FrameAction::Break : FrameAction::Continue;
+    }
+
     // C17 M1 scenario: per-step captures. When the step machine set m1Capture, write the
     // current backbuffer to it (this frame already drew the post-op state) and clear it.
     // The scenario drives its own lifetime; we exit when m1ShotDone is latched AND no capture
@@ -10168,7 +23286,7 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
             std::fflush(stdout);
             m1Capture.clear();
         }
-        glfwSwapBuffers(st.win);
+        swapScenarioFrame(st.win);
         return st.m1ShotDone ? FrameAction::Break : FrameAction::Continue;
     }
 
@@ -10183,7 +23301,7 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
             std::fflush(stdout);
             sketchCapture.clear();
         }
-        glfwSwapBuffers(st.win);
+        swapScenarioFrame(st.win);
         return st.sketchShotDone ? FrameAction::Break : FrameAction::Continue;
     }
 
@@ -10198,7 +23316,7 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
             std::fflush(stdout);
             s3Capture.clear();
         }
-        glfwSwapBuffers(st.win);
+        swapScenarioFrame(st.win);
         return st.sketch3dShotDone ? FrameAction::Break : FrameAction::Continue;
     }
 
@@ -10215,7 +23333,7 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
             std::fflush(stdout);
             asmCapture.clear();
         }
-        glfwSwapBuffers(st.win);
+        swapScenarioFrame(st.win);
         return st.asmShotDone ? FrameAction::Break : FrameAction::Continue;
     }
 
@@ -10228,10 +23346,10 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
                         screenshotPath ? screenshotPath : "(none)", dw, dh);
             std::fflush(stdout);
             studyShotExit(g_feaShot);  // a failed scenario exits non-zero after its capture
-            glfwSwapBuffers(st.win);
+            swapScenarioFrame(st.win);
             return FrameAction::Break;
         }
-        glfwSwapBuffers(st.win);
+        swapScenarioFrame(st.win);
         return FrameAction::Continue;
     }
     if (st.wantFlow) {
@@ -10242,10 +23360,10 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
                         screenshotPath ? screenshotPath : "(none)", dw, dh);
             std::fflush(stdout);
             studyShotExit(g_flowShot);
-            glfwSwapBuffers(st.win);
+            swapScenarioFrame(st.win);
             return FrameAction::Break;
         }
-        glfwSwapBuffers(st.win);
+        swapScenarioFrame(st.win);
         return FrameAction::Continue;
     }
 
@@ -10259,7 +23377,7 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
             std::fflush(stdout);
             dwgCapture.clear();
         }
-        glfwSwapBuffers(st.win);
+        swapScenarioFrame(st.win);
         return st.drawingShotDone ? FrameAction::Break : FrameAction::Continue;
     }
     if (st.wantEvalMass) {
@@ -10270,10 +23388,10 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
             std::printf("evalmass screenshot -> %s (%dx%d)\n",
                         screenshotPath ? screenshotPath : "(none)", dw, dh);
             std::fflush(stdout);
-            glfwSwapBuffers(st.win);
+            swapScenarioFrame(st.win);
             return FrameAction::Break;
         }
-        glfwSwapBuffers(st.win);
+        swapScenarioFrame(st.win);
         return FrameAction::Continue;
     }
 
@@ -10289,7 +23407,7 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
             std::fflush(stdout);
             apCapture.clear();
         }
-        glfwSwapBuffers(st.win);
+        swapScenarioFrame(st.win);
         return apDone ? FrameAction::Break : FrameAction::Continue;
     }
 
@@ -10308,7 +23426,7 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
             std::fflush(stdout);
             obCapture.clear();
         }
-        glfwSwapBuffers(st.win);
+        swapScenarioFrame(st.win);
         return obDone ? FrameAction::Break : FrameAction::Continue;
     }
 
@@ -10335,7 +23453,7 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
             std::fflush(stdout);
             mdCapture.clear();
         }
-        glfwSwapBuffers(st.win);
+        swapScenarioFrame(st.win);
         return st.multidocShotDone ? FrameAction::Break : FrameAction::Continue;
     }
 
@@ -10343,7 +23461,7 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
     // hammer finishes, then break so the process exits and stderr can be harvested.
     if (st.wantTabPerf) {
         ++st.frame;
-        glfwSwapBuffers(st.win);
+        swapScenarioFrame(st.win);
         return st.tabPerfShotDone ? FrameAction::Break : FrameAction::Continue;
     }
 
@@ -10359,7 +23477,7 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
             std::fflush(stdout);
             wsCapture.clear();
         }
-        glfwSwapBuffers(st.win);
+        swapScenarioFrame(st.win);
         return st.workspaceShotDone ? FrameAction::Break : FrameAction::Continue;
     }
 
@@ -10373,7 +23491,7 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
             std::fflush(stdout);
             mtCapture.clear();
         }
-        glfwSwapBuffers(st.win);
+        swapScenarioFrame(st.win);
         return st.motionShotDone ? FrameAction::Break : FrameAction::Continue;
     }
 
@@ -10391,11 +23509,12 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
             topoCapture.clear();
             topoCaptureWait = 0;
         }
-        glfwSwapBuffers(st.win);
+        swapScenarioFrame(st.win);
         if (topoDone && topoCapture.empty()) {
             topoWriteReport();
             if (topoFailed) {
                 std::fflush(nullptr);
+                core::framestats::flushReport();
                 std::_Exit(EXIT_FAILURE);
             }
             return FrameAction::Break;
@@ -10412,10 +23531,26 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
     if (pipingShotEndFrame(st, dw, dh, screenshotPath, pipingBreak))
         return pipingBreak ? FrameAction::Break : FrameAction::Continue;
 
+    bool thicknessBreak = false;
+    if (thicknessShotEndFrame(st, dw, dh, screenshotPath, thicknessBreak))
+        return thicknessBreak ? FrameAction::Break : FrameAction::Continue;
+
+    bool modelHistoryBreak = false;
+    if (modelHistoryEndFrame(st, dw, dh, screenshotPath, modelHistoryBreak))
+        return modelHistoryBreak ? FrameAction::Break : FrameAction::Continue;
+    bool meshReferenceBreak = false;
+    if (meshReferenceShotEndFrame(st, dw, dh, screenshotPath, meshReferenceBreak))
+        return meshReferenceBreak ? FrameAction::Break : FrameAction::Continue;
+
     // hydraulics scenario: same per-step capture + report contract.
     bool hydBreak = false;
     if (hydraulicsShotEndFrame(st, dw, dh, screenshotPath, hydBreak))
         return hydBreak ? FrameAction::Break : FrameAction::Continue;
+
+    // explode: exploded-view captures + report; exits non-zero on failure.
+    bool explodeBreak = false;
+    if (explodeEndFrame(st, dw, dh, screenshotPath, explodeBreak))
+        return explodeBreak ? FrameAction::Break : FrameAction::Continue;
 
     // demoreview: saved-study captures + report; exits non-zero on failure.
     bool demoBreak = false;
@@ -10437,21 +23572,65 @@ ScenarioRunner::FrameAction ScenarioRunner::endFrame(AppState& st, int dw, int d
     if (steerStatusEndFrame(st, dw, dh, screenshotPath, steerBreak))
         return steerBreak ? FrameAction::Break : FrameAction::Continue;
 
+    bool compactUiBreak = false;
+    if (compactUiEndFrame(st, dw, dh, screenshotPath, compactUiBreak))
+        return compactUiBreak ? FrameAction::Break : FrameAction::Continue;
+
     bool chatInlineBreak = false;
     if (chatInlineEndFrame(st, dw, dh, screenshotPath, chatInlineBreak))
         return chatInlineBreak ? FrameAction::Break : FrameAction::Continue;
+
+    bool composerSpellBreak = false;
+    if (composerSpellEndFrame(st, dw, dh, screenshotPath, composerSpellBreak))
+        return composerSpellBreak ? FrameAction::Break : FrameAction::Continue;
 
     bool copilotUiBreak = false;
     if (copilotUiEndFrame(st, dw, dh, screenshotPath, copilotUiBreak))
         return copilotUiBreak ? FrameAction::Break : FrameAction::Continue;
 
+    bool copilotShowcaseBreak = false;
+    if (copilotShowcaseEndFrame(st, dw, dh, screenshotPath, copilotShowcaseBreak))
+        return copilotShowcaseBreak ? FrameAction::Break : FrameAction::Continue;
+
+    bool textContrastBreak = false;
+    if (textContrastEndFrame(st, dw, dh, screenshotPath, textContrastBreak))
+        return textContrastBreak ? FrameAction::Break : FrameAction::Continue;
+
+    bool settingsRouteBreak = false;
+    if (settingsRouteEndFrame(st, dw, dh, screenshotPath, settingsRouteBreak))
+        return settingsRouteBreak ? FrameAction::Break : FrameAction::Continue;
+
+    bool modelSettingsBreak = false;
+    if (modelSettingsEndFrame(st, dw, dh, screenshotPath, modelSettingsBreak))
+        return modelSettingsBreak ? FrameAction::Break : FrameAction::Continue;
+
     bool agentLockBreak = false;
     if (agentLockEndFrame(st, dw, dh, screenshotPath, agentLockBreak))
         return agentLockBreak ? FrameAction::Break : FrameAction::Continue;
+    bool assemblyRefreshBreak = false;
+    if (assemblyRefreshEndFrame(st, dw, dh, screenshotPath, assemblyRefreshBreak))
+        return assemblyRefreshBreak ? FrameAction::Break : FrameAction::Continue;
+
+    bool presentationBreak = false;
+    if (presentationEndFrame(st, dw, dh, screenshotPath, presentationBreak))
+        return presentationBreak ? FrameAction::Break : FrameAction::Continue;
+    bool ompGuiBreak = false;
+    if (ompGuiEndFrame(st, dw, dh, screenshotPath, ompGuiBreak))
+        return ompGuiBreak ? FrameAction::Break : FrameAction::Continue;
+
 
     bool featureStateBreak = false;
     if (featureStateEndFrame(st, dw, dh, screenshotPath, featureStateBreak))
         return featureStateBreak ? FrameAction::Break : FrameAction::Continue;
+    bool uxQualityBreak = false;
+    if (uxQualityEndFrame(st, dw, dh, screenshotPath, uxQualityBreak))
+        return uxQualityBreak ? FrameAction::Break : FrameAction::Continue;
+    bool scadEditBreak = false;
+    if (scadEditEndFrame(st, dw, dh, screenshotPath, scadEditBreak))
+        return scadEditBreak ? FrameAction::Break : FrameAction::Continue;
+    bool partsCatalogBreak = false;
+    if (partsCatalogEndFrame(st, dw, dh, screenshotPath, partsCatalogBreak))
+        return partsCatalogBreak ? FrameAction::Break : FrameAction::Continue;
 
     // simaudit: per-state captures + report; exits non-zero on any ID conflict.
     bool saBreak = false;
@@ -10697,9 +23876,13 @@ void ScenarioRunner::runMotion(AppState& st) {
             }
             st.activeWorkspace = AppState::Workspace::Simulate;
             st.leftPaneTab     = AppState::LP_Simulation;
-            const int studiesBefore = st.simManager->studyCount();
+            mtStudiesBefore = st.simManager->studyCount();
             st.simManager->handleCommand(st, "sim_new_motion");
-            if (st.simManager->studyCount() != studiesBefore + 1) {
+            mtStep = 31; break;
+        }
+        case 31: {
+            if (st.rpc.busy()) return;
+            if (!st.simManager || st.simManager->studyCount() != mtStudiesBefore + 1) {
                 std::printf("motion: FAILED — Motion study was not created: %s\n",
                             st.status.c_str());
                 std::fflush(stdout);
@@ -10709,7 +23892,7 @@ void ScenarioRunner::runMotion(AppState& st) {
             st.simManager->configureActiveMotion(st, 60.0f, 100.0f, 24);
             std::printf("motion: Motion study created\n"); std::fflush(stdout);
             mtCapture = mtSavePath + "/motion_t0.png";
-            mtSettle  = kSettle; ++mtStep; break;
+            mtSettle = kSettle; mtStep = 4; break;
         }
         case 4: {
             // Dispatch once; the following step waits for the async result.
@@ -11310,9 +24493,14 @@ void ScenarioRunner::runTopology(AppState& st) {
             SimManager* sm = st.simManager;
             sm->shotForcePicker = false;
             if (st.rpc.busy()) return;
-            const int before = sm->studyCount();
+            topoStudiesBefore = sm->studyCount();
             sm->handleCommand(st, "sim_new_topology");
-            if (sm->studyCount() != before + 1 || !sm->activeTopologyStudy().is_object()) {
+            topoStep = 31; return;
+        }
+        case 31: {
+            SimManager* sm = st.simManager;
+            if (st.rpc.busy()) return;
+            if (sm->studyCount() != topoStudiesBefore + 1 || !sm->activeTopologyStudy().is_object()) {
                 topoFail("new_study", "sim_new_topology created no topology study: " + st.status);
                 return;
             }
@@ -11328,7 +24516,7 @@ void ScenarioRunner::runTopology(AppState& st) {
             std::printf("topology: study %s created; fixture/load/preserve faces picked\n",
                         topoStudyId.c_str());
             std::fflush(stdout);
-            topoSettle = 4; ++topoStep;
+            topoSettle = 4; topoStep = 4;
             return;
         }
         case 4: {  // physical setup through the shared study contract
@@ -11620,12 +24808,17 @@ void ScenarioRunner::runTopology(AppState& st) {
         case 15: {  // thermal boundary editor on a real conduction setup (inspected, not run)
             SimManager* sm = st.simManager;
             if (st.rpc.busy()) return;
+            topoStudiesBefore = sm->studyCount();
+            sm->handleCommand(st, "sim_new_topology");
+            topoStep = 151; return;
+        }
+        case 151: {
+            SimManager* sm = st.simManager;
+            if (st.rpc.busy()) return;
             const topo::Capabilities& caps = sm->topologyCapabilities();
             nlohmann::json cfg = topo::newTopologyConfig(caps, "thermal");
             if (cfg.empty()) { topoFail("thermal_unsupported", "no method supports thermal"); return; }
-            const int before = sm->studyCount();
-            sm->handleCommand(st, "sim_new_topology");
-            if (sm->studyCount() != before + 1) {
+            if (sm->studyCount() != topoStudiesBefore + 1) {
                 topoFail("thermal_study", "sim_new_topology created no study: " + st.status);
                 return;
             }
@@ -11669,18 +24862,23 @@ void ScenarioRunner::runTopology(AppState& st) {
             std::printf("topology: thermal study: 25 C fixture (-X), 20 W (+X), h=15 convection (top)\n");
             std::fflush(stdout);
             shoot("topology_10_thermal_boundaries.png", kSettle * 2);
-            ++topoStep;
+            topoStep = 16;
             return;
         }
         case 16: {  // flow boundary editor on a real low-Re channel setup (inspected, not run)
             SimManager* sm = st.simManager;
             if (st.rpc.busy()) return;
+            topoStudiesBefore = sm->studyCount();
+            sm->handleCommand(st, "sim_new_topology");
+            topoStep = 161; return;
+        }
+        case 161: {
+            SimManager* sm = st.simManager;
+            if (st.rpc.busy()) return;
             const topo::Capabilities& caps = sm->topologyCapabilities();
             nlohmann::json cfg = topo::newTopologyConfig(caps, "flow");
             if (cfg.empty()) { topoFail("flow_unsupported", "no method supports flow"); return; }
-            const int before = sm->studyCount();
-            sm->handleCommand(st, "sim_new_topology");
-            if (sm->studyCount() != before + 1) {
+            if (sm->studyCount() != topoStudiesBefore + 1) {
                 topoFail("flow_study", "sim_new_topology created no study: " + st.status);
                 return;
             }
@@ -11714,7 +24912,7 @@ void ScenarioRunner::runTopology(AppState& st) {
             std::printf("topology: flow study: 1 mm/s inlet (-X), 0 Pa outlet (+X), wall (top)\n");
             std::fflush(stdout);
             shoot("topology_11_flow_boundaries.png", kSettle * 2);
-            ++topoStep;
+            topoStep = 17;
             return;
         }
         case 17: {  // back to the optimized bracket's comparison

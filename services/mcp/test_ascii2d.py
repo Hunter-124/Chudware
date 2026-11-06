@@ -13,6 +13,9 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
+from services.mcp.ascii2d import _err
 from services.mcp.ascii2d import (
     READBACK_MAX_H,
     READBACK_MAX_W,
@@ -155,14 +158,18 @@ def _divider_schematic() -> dict:
              "pos": [20.0, 10.0], "angle": 0.0, "sheet": "sh1"},
             {"id": "s2", "libid": "Device:R", "ref": "R2", "value": "10k",
              "pos": [40.0, 10.0], "angle": 0.0, "sheet": "sh1"},
-            {"id": "s3", "libid": "Simulation_SPICE:V_source", "ref": "V1",
+            {"id": "s3", "libid": "Simulation_SPICE:VDC", "ref": "V1",
              "value": "5", "pos": [0.0, 10.0], "angle": 0.0, "sheet": "sh1"},
         ],
         "wires": [
             {"id": "w1", "sheet": "sh1",
-             "pts": [[5.0, 10.0], [15.0, 10.0]], "bus": False},
+             "pts": [[0.0, 15.08], [20.0, 15.08], [20.0, 13.81]], "bus": False},
             {"id": "w2", "sheet": "sh1",
-             "pts": [[25.0, 10.0], [35.0, 10.0]], "bus": False},
+             "pts": [[20.0, 6.19], [30.0, 6.19], [30.0, 13.81], [40.0, 13.81]],
+             "bus": False},
+            {"id": "w3", "sheet": "sh1",
+             "pts": [[40.0, 6.19], [45.0, 6.19], [45.0, -2.0], [0.0, -2.0],
+                     [0.0, 4.92]], "bus": False},
         ],
         "junctions": [],
         "labels": [
@@ -170,8 +177,8 @@ def _divider_schematic() -> dict:
              "pos": [30.0, 10.0], "sheet": "sh1"},
         ],
         "power": [
-            {"id": "pw1", "net": "GND", "pos": [45.0, 5.0], "sheet": "sh1"},
-            {"id": "pw2", "net": "+5V", "pos": [0.0, 15.0], "sheet": "sh1"},
+            {"id": "pw1", "net": "GND", "pos": [40.0, 6.19], "sheet": "sh1"},
+            {"id": "pw2", "net": "+5V", "pos": [0.0, 15.08], "sheet": "sh1"},
         ],
         "buses": [],
         "no_connect": [],
@@ -206,7 +213,7 @@ def _open_sketch() -> dict:
                 "material_regions": 0,
             },
             "statuses": {"e1": "under", "e2": "under", "e3": "under"},
-            "schedule": [
+            "hints": [
                 {"order": 1, "kind": "relation", "action": "coincident",
                  "handles": ["e1.end", "e3.end"], "why": "close the profile"},
             ],
@@ -215,6 +222,15 @@ def _open_sketch() -> dict:
 
 
 # --------------------------------------------------------------------------- unit
+
+def test_error_envelope_is_compact_and_does_not_invent_a_hint():
+    serialized = _err("bad_input", experimental=True)
+    assert "\n" not in serialized
+    assert json.loads(serialized) == {
+        "ok": False, "error": "bad_input", "code": "bad_input", "experimental": True}
+    assert json.loads(_err("invalid sketch", hint="Provide a sketch id")) == {
+        "ok": False, "error": "invalid sketch", "code": "error", "hint": "Provide a sketch id"}
+
 
 
 def test_segments_cross_detects_proper_intersection():
@@ -271,7 +287,9 @@ def test_open_profile_sketch_flagged():
     assert "open_profile" in codes, report["findings"]
     # health-driven under-dimensioned
     assert "under_dimensioned" in codes, report["findings"]
-    assert "OPEN" in report["summary"] or "dangling" in report["summary"].lower()
+    # No consumer is known, so open endpoints are informational — named, not alarmed.
+    assert "open chain (informational" in report["summary"]
+    assert "Profile: OPEN" not in report["summary"]
 
 
 def test_open_profile_geometry_only():
@@ -677,6 +695,97 @@ def test_apply_ascii_edits_dry_run():
     assert out.get("dry_run") is True
     assert out.get("applied") is False
     assert any(o["op"] == "sch_edit_symbol" for o in out["ops"])
+
+
+@pytest.mark.parametrize("kind", ["pcb", "schematic"])
+def test_kicad_path_readback_edits_and_lock(tmp_path, kind):
+    """ASCII edits target the bound KiCad file, survive reopen, and respect its lock."""
+    from services.mcp import core_bridge as cb
+    from services.mcp.ecad_common import ecad_session
+
+    if not cb.available():
+        pytest.skip("libchudware not available")
+    is_pcb = kind == "pcb"
+    suffix = ".kicad_pcb" if is_pcb else ".kicad_sch"
+    path = tmp_path / ("ascii" + suffix)
+    session = ecad_session.new_session("pcb" if is_pcb else "sch",
+                                       "ascii", path=str(path))
+    op = ({"op": "pcb_add_footprint", "fpid": "Resistor_SMD:R_0603_1608Metric",
+           "ref": "R1", "value": "10k", "pos": [10, 10]}
+          if is_pcb else
+          {"op": "sch_add_symbol", "libid": "Device:R",
+           "ref": "R1", "value": "10k", "pos": [10, 10]})
+    ecad_session.apply_ops(session, session.revision, [op])
+    ecad_session.close_session(session.doc_id)
+
+    mcp = _StubMCP()
+    register_ascii2d_tools(mcp)
+    render = "render_board_ascii" if is_pcb else "render_schematic_ascii"
+    readback = json.loads(mcp.tools[render](doc_id=str(path)))
+    assert readback["ok"] and "R1" in json.dumps(readback), readback
+
+    edits = [{"op": "move", "ref": "R1", "to": [20, 15]}]
+    dry = apply_ascii_edits(kind, edits, doc_id=str(path), dry_run=True, apply_live=False)
+    assert dry["ok"] and not dry["applied"] and len(dry["ops"]) == 1, dry
+    result = apply_ascii_edits(kind, edits, doc_id=str(path))
+    assert result["ok"] and result["applied"] and result.get("ascii_readback"), result
+    assert path.read_text(encoding="utf-8").lstrip().startswith(
+        "(kicad_pcb" if is_pcb else "(kicad_sch")
+
+    ecad_session.close_session(result["doc_id"])
+    reopened = ecad_session.open_path(str(path))
+    objects = reopened.doc["footprints" if is_pcb else "symbols"]
+    assert next(obj for obj in objects if obj["ref"] == "R1")["pos"] == [20, 15]
+
+    # A KiCad-side save must be reflected when the same open session is read again.
+    source = path.read_text(encoding="utf-8")
+    assert '"R1"' in source
+    path.write_text(source.replace('"R1"', '"R99"'), encoding="utf-8")
+    refreshed = json.loads(mcp.tools[render](doc_id=reopened.doc_id))
+    assert refreshed["ok"] and "R99" in json.dumps(refreshed), refreshed
+
+    before = path.read_bytes()
+    lock = path.with_name("~" + path.name + ".lck")
+    lock.write_text("KiCad lock", encoding="utf-8")
+    try:
+        blocked = apply_ascii_edits(kind, [{"op": "move", "ref": "R99", "to": [25, 15]}],
+                                    doc_id=reopened.doc_id)
+        assert blocked["ok"] is False and blocked["applied"] is False, blocked
+        assert blocked["code"] == "kicad_locked", blocked
+        assert path.read_bytes() == before
+    finally:
+        lock.unlink()
+        ecad_session.close_session(reopened.doc_id)
+
+
+def test_ascii_edit_reports_accepted_but_unsaved_mutation(tmp_path, monkeypatch):
+    """A save failure after native acceptance must not be reported as an unapplied edit."""
+    from services.mcp import core_bridge as cb
+    from services.mcp.ecad_common import OpError, ecad_session
+
+    if not cb.available():
+        pytest.skip("libchudware not available")
+    path = tmp_path / "failure.kicad_pcb"
+    session = ecad_session.new_session("pcb", "failure", path=str(path))
+    ecad_session.apply_ops(session, session.revision, [
+        {"op": "pcb_add_footprint", "fpid": "Resistor_SMD:R_0603_1608Metric",
+         "ref": "R1", "value": "10k", "pos": [10, 10]},
+    ])
+    before = path.read_bytes()
+
+    def fail_save(*args, **kwargs):
+        raise OpError("io_error", "save failed", {})
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ecad_session, "save", fail_save)
+        patch.setattr(ecad_session, "_autosave", lambda _session: False)
+        result = apply_ascii_edits("pcb", [{"op": "move", "ref": "R1", "to": [20, 15]}],
+                                   doc_id=session.doc_id)
+    assert result["ok"] is False and result["applied"] is True, result
+    assert result["code"] == "io_error" and result["detail"]["applied"] is True, result
+    assert result["revision"] == session.revision and path.read_bytes() == before
+    assert next(fp for fp in session.doc["footprints"] if fp["ref"] == "R1")["pos"] == [20, 15]
+    ecad_session.close_session(session.doc_id)
 
 
 def test_sim_ascii_stable():

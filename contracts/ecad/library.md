@@ -86,3 +86,15 @@ nlohmann::json load_kicad_sym_file(const std::string& path);  // {ok, added:[lib
 
 **RPC:** `ecad_symbols {query?, limit?} -> {ok, symbols:[...], count}` (empty query returns the
 catalog) and `ecad_load_symbol_library {path} -> {ok, added, warnings}`.
+
+## 7. Installed KiCad libraries — contract revision v2
+
+This revision supersedes the conflicting lookup order above. KiCad 10 is detected using
+`CHUDWARE_KICAD_CLI` / `CHUDWARE_KICAD_DIR`, PATH and platform defaults. Symbol and
+footprint resolution consults the installed KiCad libraries first, falling back to the
+first-party starter library when KiCad is absent. Project library tables alongside the
+document and user KiCad 10 tables are used; the installed template tables are the user
+table fallback. `${KICAD10_*_DIR}`, `${KIPRJMOD}` and environment variables are expanded.
+Library indexes are lazy and cached by file mtime. `ecad_symbols`, `ecad_footprints`,
+and `ecad_kicad_libraries` expose discovery (see `ecad_rpc.md` v2). Libraries are read
+from the user's installation, never bundled.

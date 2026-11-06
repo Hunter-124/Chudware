@@ -1,32 +1,7 @@
-"""services/browser/adapters/digikey_web.py — DigiKey WEBSITE source adapter.
+"""DigiKey official keyword search with a typed public-website fallback.
 
-The browser fallback for DigiKey (digikey.com) parts search — DISTINCT from
-the native sourcing API path in ``core/sourcing/``, which is the
-preferred route when API credentials exist. This adapter browses the public
-website under the user's own saved browser session instead: search returns
-part cards with price/stock; `acquire` returns a structured price/stock
-record plus datasheet + ECAD (symbol/footprint) links for ecad_find_part.
-
-NOTE (live-verified 2026-07-07, fetch of
-``/en/products/result?keywords=resistor``): DigiKey's results page is a
-Next.js app that embeds its data in
-``<script id="__NEXT_DATA__" type="application/json">``. The verified live
-shape is ``props.pageProps.envelope.data.topResults`` — for a broad/ambiguous
-keyword this is a list of ~22 CATEGORY tiles
-(``categoryName``/``categoryUrl``/``parentCategory``/``productCount``/``id``),
-i.e. a disambiguation page, NOT product cards. There are no manufacturer /
-DigiKey part-number / price fields anywhere in the JSON for this page; the old
-speculative CSS-class regexes (``product-title``, ``digikey-part-number``,
-``price``) never matched the live DOM ("no hits parsed" bug). ``search`` now
-parses the embedded JSON and returns those tiles as typed ``kind="category"``
-results (honest: navigable catalog sections to drill into, not purchasable
-SKUs) — mirroring the McMaster adapter's identical category-navigation case.
-
-Narrow MPN queries (e.g. ``LM317T``) land on a product-results envelope that
-carries actual SKUs under ``envelope.data.products`` (or a single product
-detail under ``envelope.data.product``). Those are returned as
-``kind="product"`` hits with title/url/mpn/price/datasheet when present.
-``acquire`` remains best-effort detail-page shape.
+The captured Next.js result envelope contains product records and/or category
+tiles. Category tiles remain navigable categories, not purchasable SKUs.
 """
 from __future__ import annotations
 
@@ -34,10 +9,11 @@ import html
 import json
 import re
 from typing import Any
-from urllib.parse import quote
-
 from .. import session as _session
-from . import is_login_wall, login_required, provenance_envelope, register
+from ..challenge import classify_challenge, is_login_page
+from . import abs_url, fail, is_login_wall, login_required, make_hit, quote_query, register, source_failure
+from . import _vendor_api
+from ._retail import find_datasheet_url
 
 SITE = "digikey"
 BASE_URL = "https://www.digikey.com"
@@ -52,41 +28,31 @@ LICENSE_NOTE = (
     "See contracts/license_debt.md."
 )
 
-_LOGIN_WALL_MARKERS = ('Sign In', 'id="signInName"', 'class="login-form"')
+_LOGIN_WALL_MARKERS = ('id="signInName"', 'class="login-form"')
 # Live-verified 2026-07-07: DigiKey embeds its results data in a Next.js
 # __NEXT_DATA__ JSON blob. Extract the raw JSON here, then read
 # props.pageProps.envelope.data.topResults from it (see module docstring).
 _NEXT_DATA_RE = re.compile(
-    r'<script id="__NEXT_DATA__"[^>]*>(?P<json>.*?)</script>', re.DOTALL)
-# --- acquire() detail-page markers (best-effort, unchanged / not rewritten) ---
-_DKPN_RE = re.compile(
-    r'<span[^>]*class="[^"]*digikey-part-number[^"]*"[^>]*>(?P<dkpn>[^<]+)</span>', re.IGNORECASE)
-_PRICE_RE = re.compile(r'<span[^>]*class="[^"]*price[^"]*"[^>]*>\$(?P<price>[0-9,.]+)</span>',
-                       re.IGNORECASE)
-_STOCK_RE = re.compile(
-    r'<span[^>]*class="[^"]*stock[^"]*"[^>]*>(?P<stock>[0-9,]+)\s*(?:in stock)?</span>',
-    re.IGNORECASE)
-_DATASHEET_RE = re.compile(r'href="(?P<href>[^"]+\.pdf(?:\?[^"]*)?)"', re.IGNORECASE)
-_ECAD_RE = re.compile(
-    r'href="(?P<href>https?://(?:www\.)?(?:snapeda|ultralibrarian)\.com/[^"]+)"', re.IGNORECASE)
+    r"""<script\b(?=[^>]*\bid\s*=\s*["']__NEXT_DATA__["'])[^>]*>(?P<json>.*?)</script>""",
+    re.IGNORECASE | re.DOTALL)
+_BLOCK_MARKERS = ("access denied", "access to this page has been denied")
+_SKU_RE = re.compile(r"""<span\b[^>]*class=["'][^"']*digikey-part-number[^"']*["'][^>]*>([^<]+)</span>""",
+                     re.IGNORECASE)
 
 
 def _strip_tags(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text).strip()
 
 
-def _abs_url(rel: str | None) -> str:
-    if not rel:
-        return ""
-    rel = str(rel).strip()
-    if not rel:
-        return ""
-    if rel.startswith("//"):
-        return "https:" + rel
-    if rel.startswith("/"):
-        return BASE_URL + rel
-    return rel
-
+def _wall(content: str, op: str, url: str) -> dict | None:
+    challenge = classify_challenge(content, url)
+    if challenge == "captcha":
+        return fail(SITE, op, "captcha", "DigiKey returned a CAPTCHA challenge.", url=url)
+    if any(marker in content.lower() for marker in _BLOCK_MARKERS):
+        return fail(SITE, op, "blocked", "DigiKey blocked the browser request.", url=url)
+    if challenge == "2fa" or is_login_page(content, url) or is_login_wall(content, _LOGIN_WALL_MARKERS):
+        return {**login_required(SITE, url), "site": SITE, "op": op, "url": url}
+    return None
 
 def _pick(d: dict, *keys: str) -> Any:
     for k in keys:
@@ -113,71 +79,11 @@ def _looks_like_product(entry: dict) -> bool:
 
 
 def _product_hit(entry: dict) -> dict | None:
-    """Map a product-shaped NEXT_DATA entry to a search hit, or None if unusable."""
     if not isinstance(entry, dict) or not _looks_like_product(entry):
         return None
-
-    mpn = _pick(entry, "manufacturerProductNumber", "ManufacturerProductNumber",
-                "manufacturerPartNumber", "ManufacturerPartNumber")
-    dkpn = _pick(entry, "digiKeyProductNumber", "DigiKeyProductNumber",
-                 "digiKeyPartNumber", "DigiKeyPartNumber")
-    desc = _pick(entry, "productDescription", "ProductDescription",
-                 "detailedDescription", "DetailedDescription", "description", "Description")
-    manufacturer = _pick(entry, "manufacturerName", "ManufacturerName")
-    mfr_obj = _pick(entry, "manufacturer", "Manufacturer")
-    if not manufacturer and isinstance(mfr_obj, dict):
-        manufacturer = _pick(mfr_obj, "name", "Name")
-    elif not manufacturer and isinstance(mfr_obj, str):
-        manufacturer = mfr_obj
-
-    title_bits = [str(x).strip() for x in (manufacturer, mpn or dkpn, desc) if x]
-    # Prefer "MFR MPN — description" when we have pieces; fall back sensibly.
-    if manufacturer and (mpn or dkpn) and desc:
-        title = f"{manufacturer} {mpn or dkpn} — {_strip_tags(str(desc))}"
-    elif title_bits:
-        title = " ".join(title_bits[:2]) if len(title_bits) > 1 else title_bits[0]
-        title = _strip_tags(str(title))
-    else:
-        return None
-
-    url = _abs_url(str(_pick(entry, "productUrl", "ProductUrl", "detailUrl", "DetailUrl",
-                             "url", "Url") or ""))
-    if not url and dkpn:
-        # Detail-page path when only the DKPN is known (common on result rows).
-        url = f"{BASE_URL}/en/products/detail/{quote(str(dkpn), safe='')}"
-    if not url:
-        return None
-
-    hit: dict[str, Any] = {
-        "title": html.unescape(title).strip(),
-        "url": url,
-        "site": SITE,
-        "kind": "product",
-    }
-    if mpn:
-        hit["mpn"] = str(mpn).strip()
-    if dkpn:
-        hit["digikey_pn"] = str(dkpn).strip()
-    if manufacturer:
-        hit["manufacturer"] = str(manufacturer).strip()
-
-    price = _pick(entry, "unitPrice", "UnitPrice", "price", "Price")
-    if price is not None:
-        try:
-            hit["price"] = f"${float(str(price).replace('$', '').replace(',', '')):.4g}"
-        except (TypeError, ValueError):
-            ps = str(price).strip()
-            if ps:
-                hit["price"] = ps if ps.startswith("$") else f"${ps}"
-
-    stock = _pick(entry, "quantityAvailable", "QuantityAvailable", "stock", "Stock")
-    if stock is not None:
-        hit["stock"] = str(stock).strip()
-
-    datasheet = _pick(entry, "datasheetUrl", "DatasheetUrl", "dataSheetUrl", "DataSheetUrl")
-    if datasheet:
-        hit["datasheet"] = _abs_url(str(datasheet))
-
+    hit = _vendor_api.digikey_hit(entry)
+    if hit:
+        hit["title"] = html.unescape(_strip_tags(hit["title"]))
     return hit
 
 
@@ -201,7 +107,7 @@ def _extract_products(data_root: Any) -> list[dict]:
 
     # Preferred explicit product collections on result pages.
     for key in ("products", "Products", "productResults", "ProductResults",
-                "productsList", "ProductsList", "items", "Items"):
+                "productsList", "ProductsList", "items", "Items", "topResults", "TopResults"):
         val = data_root.get(key)
         if isinstance(val, list):
             for entry in val:
@@ -240,93 +146,90 @@ def _extract_categories(data_root: Any) -> list[dict]:
         name = entry.get("categoryName")
         if not rel or not name:
             continue
-        hits.append({
-            "title": html.unescape(name).strip(),
-            "url": BASE_URL + rel if str(rel).startswith("/") else rel,
-            "site": SITE,
-            "kind": "category",   # navigable catalog section, not a purchasable SKU
-            "parent_category": entry.get("parentCategory"),
-            "product_count": entry.get("productCount"),
-            "category_id": entry.get("id"),
-        })
+        url = abs_url(BASE_URL, str(rel))
+        if not url:
+            continue
+        hits.append(make_hit(
+            SITE, title=html.unescape(str(name)).strip(), url=url, kind="category",
+            thumbnail=_vendor_api._image(url, entry.get("imageUrl")),
+            extra={"parent_category": entry.get("parentCategory"),
+                   "product_count": entry.get("productCount"),
+                   "category_id": entry.get("id")},
+        ))
     return hits
 
 
 class DigiKeyWebAdapter:
     key = SITE
+    hosts = ("digikey.com",)
+    result_kinds = ("product", "category")
+    cad_acquisition = False
+    login_required = False
+    api = True
 
     def search(self, query: str) -> list[dict]:
-        url = SEARCH_URL_TMPL.format(query=query.replace(" ", "+"))
+        creds = _vendor_api.credentials("digikey_api")
+        if creds:
+            return _vendor_api.search(SITE, query, creds)
+        url = SEARCH_URL_TMPL.format(query=quote_query(query))
         result = _session.browser_fetch(url, SITE)
         if not result.get("ok"):
-            return [result]
+            return [source_failure(SITE, "search", result, url=url)]
         content = result.get("content", "")
-        if is_login_wall(content, _LOGIN_WALL_MARKERS):
-            return [login_required(SITE, url)]
-
-        # Live-verified shape: results live in the embedded __NEXT_DATA__ JSON at
-        # props.pageProps.envelope.data. Parse products first (narrow MPN), then
-        # fall back to category tiles (broad keyword disambiguation). No
-        # speculative CSS-class regex. Empty is honest.
-        m = _NEXT_DATA_RE.search(content)
-        if not m:
-            return []
+        wall = _wall(content, "search", result.get("final_url") or url)
+        if wall:
+            return [wall]
+        match = _NEXT_DATA_RE.search(content)
+        if not match:
+            if re.search(r"\b(?:no results|no products found|0 results)\b", content, re.I):
+                return []
+            return [fail(SITE, "search", "parse_failed", "No recognizable DigiKey results on the page.", url=url)]
         try:
-            data = json.loads(m.group("json"))
-        except (ValueError, TypeError):
-            return []
-        data_root = (
-            data.get("props", {})
-            .get("pageProps", {})
-            .get("envelope", {})
-            .get("data", {})
-        )
+            data = json.loads(match.group("json"))
+            data_root = data["props"]["pageProps"]["envelope"]["data"]
+        except (ValueError, TypeError, KeyError):
+            return [fail(SITE, "search", "parse_failed", "The DigiKey result data was invalid.", url=url)]
+        if not isinstance(data_root, dict):
+            return [fail(SITE, "search", "parse_failed", "The DigiKey result structure was invalid.", url=url)]
         products = _extract_products(data_root)
         if products:
             return products
-        return _extract_categories(data_root)
+        categories = _extract_categories(data_root)
+        if categories:
+            return categories
+        keys = ("topResults", "TopResults", "products", "Products", "productResults", "ProductResults",
+                "productsList", "ProductsList", "items", "Items")
+        count = _vendor_api._integer(data_root.get("productCount"))
+        collections = [data_root[key] for key in keys if key in data_root]
+        if (count == 0 or (collections and all(value == [] for value in collections))) and not count:
+            return []
+        return [fail(SITE, "search", "parse_failed", "No usable DigiKey results could be parsed.", url=url)]
 
     def acquire(self, result: dict) -> dict:
         url = result.get("url", "")
         if not url:
-            return {"ok": False, "reason": "bad_result", "hint": "result has no 'url'"}
-
+            return fail(SITE, "acquire", "not_found", "The result has no product URL.")
+        if result.get("kind") not in (None, "product"):
+            return fail(SITE, "acquire", "unsupported", "Select a specific product first.", url=url)
+        if result.get("datasheet_url") or result.get("datasheet"):
+            return _vendor_api.acquire_datasheet(SITE, result, LICENSE_NOTE)
         page = _session.browser_fetch(url, SITE)
         if not page.get("ok"):
-            return page
+            return source_failure(SITE, "acquire", page, url=url)
         content = page.get("content", "")
-        if is_login_wall(content, _LOGIN_WALL_MARKERS):
-            return login_required(SITE, url)
-
-        dkpn_match = _DKPN_RE.search(content)
-        price_match = _PRICE_RE.search(content)
-        stock_match = _STOCK_RE.search(content)
-
-        datasheet_url = None
-        ds_match = _DATASHEET_RE.search(content)
-        if ds_match:
-            datasheet_url = ds_match.group("href")
-            if datasheet_url.startswith("/"):
-                datasheet_url = BASE_URL + datasheet_url
-        # Prefer datasheet already parsed on the search hit when the detail page
-        # does not expose a PDF link in static HTML.
-        if not datasheet_url:
-            datasheet_url = result.get("datasheet")
-        ecad_match = _ECAD_RE.search(content)
-
-        return provenance_envelope(
-            source_url=url,
-            session_profile_used=page.get("session_profile_used", SITE),
-            license_note=LICENSE_NOTE,
-            artifact_path=None,
-            title=result.get("title", ""),
-            digikey_pn=dkpn_match.group("dkpn").strip() if dkpn_match else result.get("digikey_pn"),
-            mpn=result.get("mpn"),
-            price=("$" + price_match.group("price")) if price_match else result.get("price"),
-            stock=stock_match.group("stock") if stock_match else result.get("stock"),
-            datasheet_url=datasheet_url,
-            ecad_url=ecad_match.group("href") if ecad_match else None,
-        )
+        wall = _wall(content, "acquire", page.get("final_url") or url)
+        if wall:
+            return wall
+        sku = result.get("sku") or result.get("digikey_pn")
+        displayed_sku = _SKU_RE.search(content)
+        if sku and displayed_sku and str(sku).strip().casefold() != html.unescape(
+                displayed_sku.group(1)).strip().casefold():
+            return fail(SITE, "acquire", "unsupported",
+                        "The detail page identifies a different SKU; select the intended product.", url=url)
+        datasheet = find_datasheet_url(content, page.get("final_url") or url)
+        if not datasheet:
+            return fail(SITE, "acquire", "unsupported", "No product datasheet was found.", url=url)
+        return _vendor_api.acquire_datasheet(SITE, {**result, "datasheet_url": datasheet}, LICENSE_NOTE)
 
 
 ADAPTER = register(DigiKeyWebAdapter())

@@ -241,14 +241,13 @@ bool blankRest(std::string_view s) {
     return true;
 }
 
-// Can `t` hold a non-prose region at all? (No backtick, '<' or tilde fence = all prose.)
+}  // namespace
+
 bool mayHoldNonProse(std::string_view t) {
     return t.find('`') != std::string_view::npos || t.find('<') != std::string_view::npos ||
            t.find("~~~") != std::string_view::npos;
 }
 
-// Length-preserving copy with every byte inside a non-prose region turned into a space
-// (newlines kept), so a boundary test run against it never lands inside code or markup.
 std::string maskNonProse(std::string_view t) {
     std::string out(t);
     const std::size_t n = t.size();
@@ -311,8 +310,6 @@ std::string maskNonProse(std::string_view t) {
         if (masked[p] && out[p] != '\n') out[p] = ' ';
     return out;
 }
-
-}  // namespace
 
 std::vector<KeywordRange> magicKeywordRanges(std::string_view utf8) {
     std::vector<KeywordRange> ranges;

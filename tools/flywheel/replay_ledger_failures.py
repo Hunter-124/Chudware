@@ -79,7 +79,7 @@ _STATEFUL_ARGS = ("run_id", "mission_id", "node_id", "card", "checkpoint", "job_
 # measures the harness stub, not the fix.
 _STATEFUL_TOOLS = frozenset({
     "ledger_get", "ledger_note", "ledger_close", "mission_start", "mission_status",
-    "delegate", "kill_delegation_tree", "delegation_budget", "council_convene",
+    "delegate",
     "workspace_status", "dag_status", "dag_replan", "buildgraph_status",
     "get_job", "ask_user",
 })

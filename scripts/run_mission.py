@@ -8,7 +8,7 @@ printing a compact human progress line, and exits non-zero unless the turn came 
 ``ok`` with a terminal ``agent_end``.
 
 Single-turn by construction. A follow-up turn is a NEW invocation that passes
-``--resume <chudcode_session_file>`` (printed at the end of the previous run) plus
+``--resume <omp_session_file>`` (printed at the end of the previous run) plus
 ``--session-id`` so the conversation continues instead of starting over. There is no
 ``--steer`` flag: steering belongs to a live GUI/control client, and this driver owns
 its worker for exactly one turn. Ctrl-C sends ``agent_cancel`` through the private
@@ -211,34 +211,6 @@ def _short(value: Any, limit: int = PREVIEW) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def _session_provider_error(session_file: Any) -> str:
-    """Last provider-side error recorded in a Chudcode session JSONL, if any.
-
-    Chudcode records a failed provider call as an assistant message with
-    ``stopReason: "error"`` and closes the run normally, so this is the only place
-    a 400/auth failure is visible after the fact.
-    """
-    if not isinstance(session_file, str) or not session_file:
-        return ""
-    path = Path(session_file)
-    if not path.is_file():
-        return ""
-    found = ""
-    try:
-        with path.open(encoding="utf-8") as handle:
-            for line in handle:
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                message = entry.get("message")
-                if not isinstance(message, dict):
-                    continue
-                if message.get("stopReason") == "error":
-                    found = str(message.get("errorMessage") or "provider error")
-    except OSError:
-        return ""
-    return _short(found, 600)
 
 
 
@@ -359,11 +331,11 @@ def main(argv: list[str] | None = None) -> int:
         description="Run one headless agent_admin_turn against the services worker.",
         epilog=(
             "Single-turn by design. For a follow-up, invoke again with "
-            "--resume <chudcode_session_file> --session-id <same id> and a new prompt."
+            "--resume <omp_session_file> --session-id <same id> and a new prompt."
         ),
     )
     parser.add_argument("--workspace", required=True, help="project/workspace directory")
-    parser.add_argument("--sessions-dir", required=True, help="Chudcode session dir")
+    parser.add_argument("--sessions-dir", required=True, help="OMP session dir")
     parser.add_argument("--prompt-file", required=True, help="file holding the prompt")
     parser.add_argument("--role", default="general_agent")
     # A headless mission has nobody to check with: the interactive `work_style` preference
@@ -371,7 +343,7 @@ def main(argv: list[str] | None = None) -> int:
     # produced nothing but blocked_by_mode refusals when it did (2026-09-07).
     parser.add_argument("--mode", default="agent", choices=("agent", "plan", "ask"),
                         help="copilot mode for this turn (headless default: agent)")
-    parser.add_argument("--resume", default="", help="chudcode_session_file to resume")
+    parser.add_argument("--resume", default="", help="omp_session_file to resume")
     parser.add_argument("--session-id", default="", help="Chudware conversation id")
     parser.add_argument("--provider", default="", help="override the configured provider")
     parser.add_argument("--model", default="", help="override the configured model")
@@ -382,7 +354,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--instance-key", default="")
     parser.add_argument("--hostd-bin", default="")
     parser.add_argument(
-        "--timeout-s", type=float, default=3600.0,
+        "--timeout-s", type=float, default=0.0,
         help="turn budget in seconds; the run is aborted when it expires. 0 = no budget "
              "(the turn ends at its own finish, Ctrl-C, or worker death)",
     )
@@ -473,7 +445,7 @@ def main(argv: list[str] | None = None) -> int:
         previous = signal.getsignal(signal.SIGINT)
         signal.signal(signal.SIGINT, on_sigint)
 
-        # `timeout` is the host's turn budget (chudcode_host aborts the run when it
+        # `timeout` is an explicit host turn budget (omp_host aborts the run when it
         # expires and reports stop_reason "turn_budget"). The RPC wait below is the same
         # number plus slack, so the host always reports first. With --timeout-s 0 neither
         # is sent: the turn has no wall-clock stop and Ctrl-C (cancel over the control
@@ -496,7 +468,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.reasoning_effort:
             params["reasoning_effort"] = args.reasoning_effort
         if args.resume:
-            params["chudcode_session_file"] = str(
+            params["omp_session_file"] = str(
                 Path(args.resume).expanduser().resolve()
             )
 
@@ -519,7 +491,11 @@ def main(argv: list[str] | None = None) -> int:
         turn = result.get("turn") if isinstance(result.get("turn"), dict) else {}
         terminal = bool(turn.get("terminal"))
         verdict, verdict_detail = "ok", ""
-        provider_detail = ""
+        provider_detail = (
+            str(result.get("reason") or turn.get("reason") or "")
+            if (result.get("stop_reason") or turn.get("stop_reason")) == "provider_error"
+            else ""
+        )
         if failure:
             verdict, verdict_detail = "driver_failure", failure
             print(f"FAILED: {failure}")
@@ -531,8 +507,8 @@ def main(argv: list[str] | None = None) -> int:
             verdict_detail = str(result.get("reason") or "turn returned ok=false")
             print(f"FAILED: {verdict_detail}")
         elif not terminal:
-            verdict, verdict_detail = "not_terminal", "turn ended without a terminal agent_end"
-            print("FAILED: turn ended without a terminal agent_end")
+            verdict, verdict_detail = "not_terminal", "turn ended without session settlement"
+            print("FAILED: turn ended without session settlement")
         elif turn.get("cancelled"):
             verdict, verdict_detail = "cancelled", str(turn.get("stop_reason") or "")
             print(f"CANCELLED: stop_reason={turn.get('stop_reason')}")
@@ -540,9 +516,6 @@ def main(argv: list[str] | None = None) -> int:
             verdict, verdict_detail = "run_failed", progress.failed
             print(f"FAILED: {progress.failed}")
         elif not (progress.saw_output or str(turn.get("result") or "").strip()):
-            # A provider 400/auth failure can still close the run cleanly with an
-            # empty assistant message; a mission that produced nothing is not a pass.
-            provider_detail = _session_provider_error(turn.get("chudcode_session_file"))
             verdict, verdict_detail = "no_output", "the turn produced no assistant output"
             print("FAILED: the turn produced no assistant output")
             if provider_detail:
@@ -556,14 +529,14 @@ def main(argv: list[str] | None = None) -> int:
             if text:
                 print(f"\nfinal text:\n{text}\n")
             print(f"stop_reason           {turn.get('stop_reason')}")
-            print(f"chudcode_session_id   {turn.get('chudcode_session_id')}")
-            print(f"chudcode_session_file {turn.get('chudcode_session_file')}")
-            if turn.get("chudcode_session_file"):
+            print(f"omp_session_id       {turn.get('omp_session_id')}")
+            print(f"omp_session_file     {turn.get('omp_session_file')}")
+            if turn.get("omp_session_file"):
                 print(
                     "\nfollow-up:\n"
                     f"  {sys.argv[0]} --workspace {workspace} "
                     f"--sessions-dir {sessions_dir} --session-id {session_id} "
-                    f"--resume {turn.get('chudcode_session_file')} --prompt-file <next.txt>"
+                    f"--resume {turn.get('omp_session_file')} --prompt-file <next.txt>"
                 )
         print(f"\nevent log: {log_path}")
         worker.shutdown()

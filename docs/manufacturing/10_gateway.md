@@ -1,22 +1,7 @@
 # Manufacturing Gateway — Final Design (DoD v4)
 
-Owner: `GatewayArchitecture`. Status: **closed**. Design-only: this document specifies the
-gateway; it records no implementation change by itself.
-
-Inputs read for this document: `services/mcp/tool_registry.py`, `services/worker/worker_client.h`,
-`services/worker/worker_client.cpp`, `contracts/worker_rpc.md`, the agent-control and
-controller-ecosystem audits, the printer-monitoring research (summarized in
-`90_research_printers.md`), `00_decisions.md` and `01_definition_of_done.md`.
-
-**Amendment pass (this revision).** The architecture plan review returned NO-GO for W1.1 with
-sixteen blocking findings. This revision closes every gateway-owned one in place — B1, B2, B3, B4
-(gateway half), B5, B10, B11, B12 (gateway half), B13, B14/B15 ownership, C1's reservation table, C7
-and C10 — and publishes the two registers the review asked the gateway to own: **§25** the stable
-rule ids, **§26** the finding-by-finding closure table, which names for every finding not closed here
-the document and owner that closes it. No product scope changed and no rule was invented: every
-change reconciles two statements already inside the accepted corpus, or one statement against DoD
-v4. The one repository file read as additional evidence for this pass was `services/agent/config.py`
-(§17).
+Design proposal for the gateway. See the [as-built map](README.md#as-built-map)
+for the implemented subset and process-boundary deviations.
 
 ## 0. Bindings absorbed (all prior rulings, restated as constraints on this design)
 
@@ -65,12 +50,8 @@ v4. The one repository file read as additional evidence for this pass was `servi
 | metrology | `mfg_metrology_*` | `mfg.metrology.*` | `metrology.*` | — |
 | perception | `mfg_perception_*` | `mfg.perception.*` | `perception.*` | — |
 
-    Three spellings are normalized by this table rather than granted an exception, because §0.9 fixes
-    the wire prefix as `mfg_*`/`mfg.*` and nine of ten domains already comply: additive's `print_*`
-    methods and `mfg.print.*` events are reserved here as **`mfg_print_*`**, and metrology's
-    `mfg.metrology_*` and perception's `mfg.perception_*` event spellings are reserved in the dotted
-    **`mfg.metrology.*`** / **`mfg.perception.*`** form every other domain uses. Renaming those in the
-    owning documents is recorded in §26 (C1); nothing else in the batch depends on the old spellings.
+    The reserved wire prefixes are `mfg_*` for RPC and `mfg.*` for events; additive uses
+    `mfg_print_*`, metrology uses `mfg.metrology.*`, and perception uses `mfg.perception.*`.
 
 ## 1. Process and ownership boundaries
 
@@ -153,45 +134,13 @@ host/src/ui/manufacture/approval_dialog.h|.cpp     approval authoring (renders f
 fixtures/mfg/gateway/**                     golden Grbl/Moonraker/OctoPrint transcripts, journals
 ```
 
-Existing files touched, **append-only, maintainer-owned**. Every row names exactly one owning wave and
-one owning slice, and a file in this table is edited by no other domain in that wave; §2.1 carries the
-batch-wide ownership assignments, including the two shared files this document does not itself edit:
+### 2.1 Shared contracts
 
-| file | owner / wave | seam | size |
-|---|---|---|---|
-| `services/agent/config.py` | **Gateway, W1.1** (`MFG-FAM-1`) | add `"manufacture"` to `DEFAULT_TOOL_FAMILIES` (`:589-593`) **and** add `DEFAULT_OFF_TOOL_FAMILIES = ("manufacture",)`, consulted in the `get_tool_families` fallback branch (`:1002-1005`), so the family resolves **off** both when `agent.role_tools` is absent and when it is present with no role listing it | ~6 lines |
-| `services/worker/worker_client.cpp` | Gateway, W4.1 | `mfg_` early-`false` in the four `route*ToCpp` fns + `engineBound` predicate | ~5 lines |
-| `services/mcp/tool_registry.py` | **Gateway, W4.3 — sole owner** (`MFG-MOTION-1`, `MFG-OWN-1`) | add `RISK_MOTION`/`RISK_SAFETY` to `RISKS`, `_MOTION_TOOLS`/`_SAFETY_TOOLS` explicit-membership sets, one `deny_reason` clause; every peer's risk-override row lands as data handed to this owner (§2.1) | ~25 lines |
-| `contracts/worker_rpc.md` | Gateway, W1.1 (`MFG-SECT-1`, `MFG-OBS-1`) | new append-only `## 7. Manufacturing gateway (mfg_*)` section pointing at `contracts/manufacturing_gateway.md`, the §2.1 per-domain section allocation, and the `observer` client kind in §5.1 | doc |
-| `contracts/events.md` | Gateway, W1.1 (`MFG-SUB-1`) | append `mfg.*` event kinds **and** amend §5 so an accepted `*_subscribe` lane may emit events after the final response line for the life of the subscription | doc |
-| `core/CMakeLists.txt` | Gateway, per wave | `add_executable(test_grbl_protocol tests/test_grbl_protocol.cpp)` etc., doctest include, same pattern as line 458 | ~30 lines |
-| `scripts/gate.sh` | Gateway, per wave | append the gateway test/smoke block; **zero** new SKIP conditions (§24.4) | ~20 lines |
-| `docs/manufacturing/README.md` as-built map | the wave's owner | one update per wave (DoD 20) | doc |
-
-One further new, gateway-owned file, added by `MFG-FAM-1` in W1.1:
-
-```
-services/agent/test_manufacture_family_default_off.py   the family resolves off with no config, with
-                                                        role_tools present, and with an empty
-                                                        tool_families map; enabling it is config-only
-```
-
-Non-created, explicitly: no `services/mfg/**`, no `host/src/ui/mfg/**`, no new GUI canvas, no
-`core/twin/**` file (Twin owns those), no `contracts/cam.md` rewrite.
-
-### 2.1 Shared-file ownership across the batch (`MFG-OWN-1`)
-
-One owner per shared file per wave. **This table is the authority; a coordination note inside a domain
-document is not.** Every other claimant either hands its rows to the owner as data, applied in that one
-edit, or lands in a strictly later wave.
-
-| shared file / line | single owner | wave | how every other claimant lands | shared acceptance check |
-|---|---|---|---|---|
-| `services/mcp/tool_registry.py` — risk classes, `_MOTION_TOOLS`/`_SAFETY_TOOLS`, the `deny_reason` clause | **Gateway** | W4.3 | robot's append-after-`:69`, PnP's three `_RISK_OVERRIDES` rows (`run_pnp_harness`→`RISK_EXTERNAL`, `pnp_simulate_job`→`RISK_WRITE`, `pnp_define_panel`→`RISK_WRITE`), additive's rows and perception's ≤3-line family/risk row are submitted to the owner as data and applied in this single edit — five concurrent appenders were each able to break the others' unchanged-`classify_risk` assertion | `services/mcp/test_mfg_tools.py`: `classify_risk` output for every pre-existing tool byte-for-byte unchanged (§20 test 12) — the shared check for all five claimants |
-| `services/agent/config.py` — family default-off | **Gateway** | W1.1 | `RobotArchitecture` found the default-on `else` branch and keeps the analysis credit; it does not keep the edit, because its wave is not first and any earlier MCP wave would ship the surface enabled | `services/agent/test_manufacture_family_default_off.py` (§20 test 13) |
-| `contracts/worker_rpc.md` — section numbering | **Gateway** | W1.1 | the allocation table below; no domain picks its own number (gateway and monitoring both drafted `## 7`) | `test_contract_parity.py`: every domain's methods documented in its allocated section; no duplicate section number |
-| `contracts/events.md` §5 subscription lane + §5.1 `observer` client kind | **Gateway** | W1.1 | monitoring's stated dependency is discharged here instead of degrading its wave 2 to poll-only; the gateway's own two subscribe methods are non-conformant without it | `test_contract_parity.py`: an accepted `*_subscribe` may emit after the final response line; an `observer` client kind reaches no write dispatch path |
-| `core/cam/post.cpp:487` — the shared footer line | **TurningArchitecture** | the CAM post wave | turning **deletes** the `!g.lathe` condition while cut only **adjusts** the laser condition, so turning owns the line and cut consumes the result. Cut's "the seams are disjoint by line region and by branch" is false for this one line and is corrected in cut's own document | the CAM post regression suite shows both the lathe footer and the laser footer emitted from the single edited line |
+The shared tool registry defines manufacturing risk classes; the `manufacture` family
+is disabled by default as described in §17. `contracts/worker_rpc.md` allocates domain
+sections and defines the read-only `observer` client. The post-response event exception
+in `contracts/events.md` §5.1 applies to `mfg_device_subscribe` and
+`mfg_event_subscribe`, not to every proposed subscription.
 
 **`contracts/worker_rpc.md` section allocation (`MFG-SECT-1`), published in W1.1** — append-only, one
 section per domain, in this order:
@@ -706,8 +655,8 @@ guard demonstrably can pass for some producer output and fail for some input. Th
 evidence directly, per guard, so **guard**-level liveness needs no machine and no emulator at all.
 
 **Gate-level liveness is scoped by machine class (`MFG-EMU-1`), because a hardware-free source set
-cannot honestly drive a physical machine's required set to pass.** The three statements that used to
-disagree — the emulator boundary, this section, and §22 row 8 — now say one thing:
+cannot honestly drive a physical machine's required set to pass.** The source sets have
+different scope:
 
 | source set | drives to **pass** | drives to **refusal** |
 |---|---|---|
@@ -722,7 +671,7 @@ which is what §12's provenance rule (`MFG-SRC-2`) and twin §9.5 ("since every 
 emulator-sourced by construction, no twin value can ever pass Stage-1 admission for an execute-side
 subject") already require. Nothing about a virtual or emulated pass raises a level on a physical device
 (`MFG-CEIL-2`): **E4-E6 is the only source set that drives a physical required set to pass
-end-to-end**, and §22 row 8 records both halves against this section.
+end-to-end**.
 
 Deliberately absent guards (`safety_integration` on the open-frame and `emulated` classes) and the
 machine-class omissions are documented in `contracts/manufacturing_gateway.md` §Guards with the reason.
@@ -962,15 +911,13 @@ override, or writes controller settings — those verbs do not exist in this sur
 caller.
 
 **Subscription lane (`MFG-SUB-1`) and the durable-row publication rule (`MFG-FRESH-3`).**
-`mfg_device_subscribe` and `mfg_event_subscribe` emit worker `event` lines *after* the final response
-line of the accepting call, for as long as the subscription lives. `contracts/events.md` §5 forbids that
-today, so these two methods are non-conformant with the contract they cite until it is amended: the
-amendment is **gateway-owned**, and its text lands in **W1.1** together with the section allocation
-(§2.1) rather than with the W4.1 implementation, because it is prose with no daemon dependency and
-monitoring's read-only stream ships in its own wave 2 — absent the rule that wave would degrade to
-poll-only. The `observer` client kind in `contracts/worker_rpc.md` §5.1 (`MFG-OBS-1`), which §7's
-observer/commander split depends on, is gateway-owned on the same schedule. And one ruling for every
-domain that journals (`MFG-FRESH-3`): a durable authored or derived row is journaled **and** published
+`contracts/events.md` §5.1 permits `mfg_device_subscribe` and `mfg_event_subscribe` to emit
+worker `event` lines after the accepting call's final response for the life of the subscription.
+`contracts/worker_rpc.md` §7 and `contracts/events.md` §5.1 define the read-only `observer`
+client kind (`MFG-OBS-1`). Other proposed subscription methods require their own contract
+exception before emitting after a final response.
+
+For every domain that journals (`MFG-FRESH-3`), a durable authored or derived row is journaled **and** published
 wrapped in `FreshValue<T>`, with `ttl_ms:null` and `state:"ok"` for a row that does not decay — "no
 wall-clock TTL" is the distinction, not "no envelope". The two meanings of a null TTL are separated by
 rule rather than by comment: on a **durable authored row** `ttl_ms:null` means *this row does not
@@ -1013,31 +960,10 @@ by the existing `get_tool_options` toggles exactly as every domain already uses.
 `mfg_*` / `mfg.*` (§0.10); MCP *tool* names are a separate namespace and need not carry it. The
 user-facing and config family id is the existing product term **Manufacture**, not `mfg`.
 
-**The family is OFF by default by mechanism — gateway-owned, landing in W1.1 (`MFG-FAM-1`).** Omission
-does **not** achieve it, and an earlier draft of this section asserted the property as already true when
-it was false. Read from `services/agent/config.py`: `DEFAULT_TOOL_FAMILIES` (`:589-593`) does not contain
-`manufacture`; `get_tool_families` only populates keys it iterates out of that tuple (`:999`), so an
-unlisted family never appears in the map; and `is_tool_family_enabled` defaults a family missing from the
-map to `True` (`:1016-1017`). An unlisted family is therefore default-**ON**. Two edits, both
-gateway-owned, both in **W1.1**, ahead of every MCP-registration wave in this batch:
-
-1. add `"manufacture"` to `DEFAULT_TOOL_FAMILIES` (`:589-593`), so it is a known key rather than an
-   unknown one that defaults on;
-2. add `DEFAULT_OFF_TOOL_FAMILIES = ("manufacture",)` and consult it in the `get_tool_families` fallback
-   branch (`:1002-1005`): the `role_union` branch already resolves `manufacture` to `False` when
-   `agent.role_tools` is configured, since no harness role lists it, and the no-`role_tools` branch
-   changes from `out[fam] = True` to `out[fam] = fam not in DEFAULT_OFF_TOOL_FAMILIES`.
-
-Enabling `manufacture` is then a human settings act — an explicit `agent.tool_families.manufacture =
-true`, or a role assignment — and the self-enable path (`enable_tools`) cannot silently add motion
-surface, because a default-off family is not something a model can grant itself.
-The robot design identified this gap; the gateway owns the fix because its wave is first
-(§2.1). `services/agent/test_manufacture_family_default_off.py` asserts the
-property three ways and is, with the two edits, a **hard predecessor of W4.3 and of every peer's
-MCP-registration wave** (§19). Without it, the whole Manufacture surface — including the three
-motion-class tools below — would ship enabled by default the moment any MCP wave landed, and the only
-surviving mitigation would be `_motion_membership_allows`, which lives in the same shared file family
-(§2.1).
+**The `manufacture` family is off by default (`MFG-FAM-1`).**
+`services/agent/config.py` lists it in `DEFAULT_TOOL_FAMILIES` and
+`DEFAULT_OFF_TOOL_FAMILIES`. It remains disabled even when a role lists the family;
+enabling it requires an explicit `agent.tool_families.manufacture = true` setting.
 
 Optional sidecars (ROS, OpenPnP, twin binary) are **opt-in qualification only** and add **no
 normal-gate SKIP**: the gateway's E0-E3 suites are hardware-free by construction and
@@ -1137,35 +1063,12 @@ unlocked by no emulator stage, for any class (`MFG-SAFETY-1`). `emulator_stage_a
 enforces the whole table at runtime and `test_mfg_capability.cpp` asserts no code path can advertise
 above the recorded stage for the recorded class.
 
-## 19. Wave plan and dependencies
+## 19. Integration prerequisites
 
-| wave | slice | depends on | deliverable |
-|---|---|---|---|
-| W0 | land the existing dirty tree in coherent units | — | baseline (already the plan's Wave 0) |
-| W1.1 | `contracts/manufacturing_gateway.md` (**including the total durable-result-kind + `<domain>.capability` table**, §24.3(iii)) + `core/device/{device_id,controller_snapshot,capability,transport}.h` + `core/manufacturing/fresh_value.h` + `services/agent/config.py` family default-off and its test (`MFG-FAM-1`) + the `contracts/worker_rpc.md` section allocation (`MFG-SECT-1`) + the `contracts/events.md` §5 subscription-lane and `observer` amendments (`MFG-SUB-1`, `MFG-OBS-1`) | W0 | **unblocks all nine peer workstreams** — Twin, UX, Additive, Monitor, Cut, Turn, Robot, PnP, Metrology, Perception — schedule first |
-| W1.2 | `journal` + `result_registry` + `invalidation` (E2) | W1.1 | durable seq, epoch sweep, at_seq scoping |
-| W2.1 | `grbl_protocol` (E0) | W1.1 | pure parser; Twin links it here |
-| W2.2 | `grbl_adapter` (E1) + `emulator_transport` | W2.1 | hardware-free device lane |
-| W3.1 | `tier0` + `policy` | W1.2 | construction refusals, machine-class table |
-| W3.2 | `gates` (Stage 1 + Stage 2 + waivers) | W1.2, W3.1 | gate report, liveness fixtures |
-| W3.3 | `approval` + `lease` + `arbiter` (E3) | W2.2, W3.2 | full authorization path on emulator |
-| W4.1 | `chudware-mfgd` (`main`, `rpc_server`) + `worker_client.cpp` `mfg_` seam | W3.3 | process boundary live |
-| W4.2 | `services/manufacturing/rpc/gateway_rpc.py` bridge | W4.1 | `mfg_*` reachable from host + MCP |
-| W4.3 | `services/mcp/mfg_tools.py` + `tool_registry` motion/safety classes (sole owner, §2.1) | W4.2, **W1.1 `MFG-FAM-1`** | agent surface; the family is already off by default from W1.1, so this wave opens no default-on window |
-| W5.1 | `transport_serial` / `transport_tcp` / `transport_ws` | W4.1 | real transports (E4 gated) |
-| W5.2 | `adapter_moonraker` | W4.1 | printer lane, virtual-qualified |
-| W5.3 | `adapter_octoprint` | W5.2 | second printer lane + virtual-printer fixture |
-| W5.4 | `adapter_prusalink` (probe-only) | W5.3 | capability-probed third |
-| W6 | `host/src/ui/manufacture/{device_panel,run_panel,approval_dialog}` | W4.2 | operator surfaces (UX-owned rendering rules) |
-| W7 | E4→E6 pilot campaign, then `execute` advertisement | W5.1, W6 | hardware capability, gated |
-
-W1.1 is the critical path for **all nine** peer workstreams; W2.1 is Twin's link point. Nothing in
-W5.1/W7 may land ahead of W3.3 — a transport without the arbiter would be a command path without
-authorization. Two hard predecessor rules are added by the review-closure pass: (a) `MFG-FAM-1` (W1.1)
-precedes W4.3 **and every peer's MCP-registration wave**, so no wave can open a default-on Manufacture
-surface; (b) the total durable-result-kind and `<domain>.capability` table (`MFG-KIND-3`,
-`MFG-CAPKIND-1`) is part of W1.1's **exit criteria**, so no domain's W1.x slice can be called
-independently green while its appends would still be refused `mfg_unregistered_result_kind`.
+The `manufacture` family must be disabled by default before registering its tools. Durable
+result and capability kinds must be registered before producers append them or advertise
+their capability. A machine-command transport must not bypass the deterministic arbiter;
+physical execution additionally requires the attended hardware qualification in §18.
 
 ## 20. Tests and smokes (exact files, exact assertions)
 
@@ -1232,17 +1135,11 @@ Python (`engine/doc/test_*.py` convention):
     synthesized device state; every result it relays carries `result_seq` and `epoch`.
 12. `services/mcp/test_mfg_tools.py` — the absent-verb list (§17) has no registered tool; the three
     motion tools carry `risk=="motion"` and are denied under default-open; `_SAFETY_TOOLS` is empty;
-    `classify_risk` output for every pre-existing tool is unchanged (the shared acceptance check for all
-    five `tool_registry.py` claimants, §2.1); and every manufacturing tool in the batch — gateway,
-    monitor, cut, turn, PnP, robot, twin, print, metrology, perception — registers under family
-    `"manufacture"`, with no second manufacturing family id anywhere in the tree (`MFG-FAM-2`).
+    `classify_risk` output for pre-existing tools is unchanged; all proposed manufacturing
+    tools register under the shared `"manufacture"` family (`MFG-FAM-2`).
 13. `services/agent/test_manufacture_family_default_off.py` (`MFG-FAM-1`) —
-    `is_tool_family_enabled("manufacture")` is `False` with no config at all, with `agent.role_tools`
-    configured and no role listing it, and with an `agent.tool_families` map present but empty; `True`
-    only after an explicit `agent.tool_families.manufacture = true` or a role assignment; every
-    pre-existing family's resolved value is unchanged in all four cases; and `DEFAULT_OFF_TOOL_FAMILIES`
-    is honoured by both `get_tool_families` and `is_tool_family_enabled`, so neither path leaves a
-    default-on hole.
+    the family is disabled by default, including when listed in role tools, and enabled
+    only by an explicit `agent.tool_families.manufacture = true` setting.
 
 Contract tests as policy boundaries (DoD 19), `core/tests/test_mfg_contracts.cpp` +
 `services/manufacturing/rpc/test_contract_parity.py`: the Tier-0 register, the guard source table with
@@ -1303,30 +1200,7 @@ binary degrades fixture richness, not coverage.
     machine in the GUI.
 12. No continuous recording: short rolling buffers and event-centric evidence clips only.
 
-## 22. DoD v4 checklist — explicit acceptance of every gateway obligation
-
-| # | criterion | gateway obligation | accepted | where |
-|---|---|---|---|---|
-| 1 | `gate.sh` green, documented SKIPs only | E0-E3 + printer-virtual + ABI + license smokes; no gateway suite may SKIP | **yes** | §20 |
-| 2 | explicit truth levels; `assumed` disables like absent and names the missing level | `CapabilityReport` with 9 levels, `missing_level`, refusal parity | **yes** | §3.3, test 9 |
-| 3 | no verdict without the complete check set; computed, revision/artifact bound; unknown on edit; Live reads the frozen binding | gate report `required_set` + `verdict`; `mfg_approval_describe` is the Live source | **yes** | §8, §10.3 |
-| 4 | sole external shape is `FreshValue<T>`; `v` null unless ok; last-good display-only; gaps → unknown; twin tick-domain internally, publisher stamps | one encoder in `core/manufacturing/fresh_value.h`; `TelemetryValue` deleted; republisher stamps and sets `src:"simulated"` | **yes** | §0.2, §3.2, test 12/contract |
-| 5 | two-stage gates; Stage 1 admits only; advisory/simulated/assumed/declared fail closed; `unsupported→not_applicable` only with independent same-epoch corroboration | `admit()` with exactly two admission classes (`probed_evidence`, scoped `procedural_fact` — `MFG-ADMIT-1`/`MFG-ADMIT-2`) + `corroborate()` over two separate axes, binding and independence (`MFG-CORROB-1`); `src` derived from `(transport_kind, endpoint_is_physical)` so emulator **and** virtual/recorded endpoints are forced `simulated` (`MFG-SRC-1`/`MFG-SRC-2`); one declared, contract-bounded exception — the `emulated` machine class admits its own `EmulatorTransport`'s `simulated` values for its own subjects only, never for an approval on any other class (`MFG-EMU-1`) | **yes** | §3.2, §10.1, §12, §14 |
-| 6 | Tier-0 construction refusal, artifact-dependent, rendered at the entry point; guard is defense-in-depth; missing evidence fails | Tier-0 register + `tier0::classify` + UI-rendered `why`/`remedy` | **yes** | §9, test 8 |
-| 7 | Stage 2 `pass|fail|not_applicable`; no unknown; not-applicable only a missing corroborating sub-condition; class-irrelevant checks omitted; durable waivers + visible rates | guard table with `omitted`, waiver rows `{by,reason,at_seq}`, `waiver_rates` in `mfg_event_query` | **yes** | §10.2, §10.3, test 6 |
-| 8 | guard/gate liveness; approval-path owners drive every gate to pass; waived-on-every-run visible; absent guards documented | pass+fail fixture per guard by direct evidence injection (no machine required); the E0-E3 source set drives the **`emulated`** class's declared required set to pass and drives the physical router and printer classes to a **named refusal**; **E4-E6 is the only source set that drives a physical required set to pass end-to-end**; documented absences | **yes — with the source set stated per machine class** | §10.5, §14, §18, §20 test 6, `mfg-e0e3` |
-| 9 | invalidation envelope; falsified clears, superseded retains and points forward; every result carries establishing `seq`; notices apply to `seq<=at_seq`; producers push | §5 envelope; journal-stamped seq on every row; push table | **yes** | §4.1, §5, §16, test 5 |
-| 10 | **gateway owns durable seq stamping and lane-epoch/process-start reconciliation for every durable result a UI may paint, not only telemetry; corroborators independently fresh and subject/config-bound** | journal is the sole seq authority; `ResultRegistry` sweep covers all kinds with a fail-closed default; `corroborate()` enforces independence | **yes — explicitly owned, not inferred** | §4.1, §4.2, §10.1, tests 3/4 |
-| 11 | approval binds machine/fingerprint, artifact hash, job/setup revision, tool/fixture/WCS, preflight, approver, expiry, `exercisable_by`, one-shot nonce, `max_starts=1`; fingerprint or bound-input change falsifies; initiator + approval id visible | full `ApprovalBinding`; falsification list; UI shows initiator/approval id | **yes** | §8, §8.1, §8.2 |
-| 12 | approved-job autonomy: AI may request start only with an active human approval permitting agent exercise; arbiter revalidates, starts, burns nonce, logs; AI may request hold/abort; never self-approve, resume, jog, home, zero, override, unlock, bypass, or issue safety commands | `exercisable_by`; arbiter `start()` order; absent-verb list in MCP | **yes** | §8.1, §11, §17 |
-| 13 | no transparent resume after reset/alarm/hard limit/disconnect/power loss; only a new authored run | terminal states with no return edge; five-condition resume rule; non-terminal run at crash → `abandoned` | **yes** | §6.2, §4.2, test 7 |
-| 14 | simulation/perception never satisfy execute-side gates; simulated conclusions are context; gating on procedural facts allowed | `kind()==emulator` **and** any endpoint recorded `endpoint_is_physical:false` → `src:"simulated"` (`MFG-SRC-2`); `procedural_fact` is a first-class Stage-1 admission class for the five offline levels and can never satisfy an execute-side subject or an approval-bound device guard (`MFG-ADMIT-1`/`MFG-ADMIT-2`, `MFG-PFFLIP-1`); the `emulated` class is not a physical execute-side subject and binds to no physical approval (`MFG-EMU-1`) | **yes** | §3.2, §10.1, §12, §14, §24.3(i) |
-| 15 | one command owner per device; approval validation only in the arbiter; motion/safety risk explicit-membership; safety has no model allow path | lease + static observer/write separation (the `observer` client kind is gateway-owned, W1.1 — `MFG-OBS-1`); arbiter-only validation; `_MOTION_TOOLS`/`_SAFETY_TOOLS` (safety empty) with `services/mcp/tool_registry.py` single-owned (§2.1); and the `manufacture` family is off by default **by mechanism** in `services/agent/config.py`, gateway-owned, landing in W1.1 ahead of every MCP wave (`MFG-FAM-1`) | **yes — mechanism named, owned and waved, not asserted** | §2, §2.1, §7, §11, §17, §19 |
-| 16 | public `libchudware` C ABI carries no `mfg_*`; gateway is a separate service/process | `chudware-mfgd`; `mfg_` early-`false` routing seam; `mfg-abi` smoke | **yes** | §1, §2, §20 |
-| 17 | no GPL/AGPL/non-commercial code, weights, or datasets in the permissively licensed core; fast gate rejects in-process libslic3r/CuraEngine; sidecars carry matching source/hashes/scripts/notices/URL | printer adapters are HTTP/WS clients over public APIs only (Moonraker/Klipper GPLv3, OctoPrint AGPLv3, PrusaLink freeware — none linked or bundled); `mfg-license` smoke | **yes** | §13, §20 |
-| 18 | emulator progression capability-gated: E0-E3 in normal gates, pilot E6 before `execute`; no level exceeds the highest passed stage | stage table with an explicit machine-class ceiling axis; virtual qualification is a precondition for *attempting* E4 and raises no level on any physical class (`MFG-CEIL-2`); `emulator_stage_at_least` guard; `safety_integration` unlocked by no stage for any class (`MFG-SAFETY-1`) | **yes** | §13, §18, test 9 |
-| 19 | Tier-0 registers, guard source tables, prerequisite/corroborating/artifact-dependent columns, invalidation events, durable schemas are contract-tested as policy boundaries | `test_mfg_contracts.cpp` + `test_contract_parity.py` | **yes** | §20 |
-| 20 | major waves record their change summary and update the relevant developer documentation in the same green commit | one change summary per wave in §19; the as-built map in `docs/manufacturing/README.md` + `contracts/README.md` updated in the same commit | **yes** | §2, §19 |
+## 22. Durable result maintenance
 
 Standing rule for future state additions, accepted: any new durable result kind must land with a
 `ResultRegistry` policy row, a contract row, and a reconciliation test in the same commit; absent a
@@ -1756,9 +1630,6 @@ follow, `cam.cut.post`/`parse`/`sim`/`emulate`/`plasma.replay` and `pnp.job_arti
 `gate_row` do. The contract test asserts (1)-(4) and that every kind's choice is declared, not that
 every domain chose the same way.
 
-That was the last open item from the design wave. §§1-24 stand **as amended by the W1.1 review-closure
-pass recorded in §26**; that pass changed no product scope and added no rule that was not already
-implied by two statements inside the accepted corpus.
 
 ### 24.10 One label to correct: `monitor_condition` is `falsify + retain_as_last_ok`, not `reestablish`
 
@@ -1846,9 +1717,8 @@ rule change; an id never changes meaning, and retiring one requires a row here n
 | rule id | rule | here |
 |---|---|---|
 | `MFG-PREFIX-1` | prefix/name reservation register, total over ten domains; an unreserved prefix is a contract-test failure | §0.10 |
-| `MFG-OWN-1` | one owner per shared file per wave; the §2.1 table is the authority over any domain's coordination note | §2.1 |
 | `MFG-SECT-1` | `contracts/worker_rpc.md` section allocation, one section per domain, gateway-published | §2.1 |
-| `MFG-SUB-1` | `contracts/events.md` §5 amendment: an accepted `*_subscribe` lane may emit events after the final response line | §2.1, §15 |
+| `MFG-SUB-1` | `contracts/events.md` §5.1 permits accepted `mfg_device_subscribe` and `mfg_event_subscribe` lanes to emit after the final response | §2.1, §15 |
 | `MFG-OBS-1` | `observer` client kind; an observer socket reaches no write dispatch path | §2.1, §7 |
 | `MFG-FRESH-1` | sole external freshness shape `FreshValue<T>`, one encoder repo-wide | §0.2, §3.2 |
 | `MFG-FRESH-2` | every numeric or enum field a UI paints is published wrapped in `FreshValue<T>` | §15 |
@@ -1882,54 +1752,8 @@ rule change; an id never changes meaning, and retiring one requires a row here n
 | `MFG-CEIL-2` | virtual qualification is a precondition for *attempting* E4 and raises **no** level on any physical class; physical `execute` requires E6 | §13, §18 |
 | `MFG-SAFETY-1` | `safety_integration` is unlocked by no emulator stage for any class; the `emulated` class reports it `unsupported` with a `why`, never `not_applicable` | §14, §18 |
 | `MFG-SKIP-1` | zero new normal-gate SKIPs: an absent optional prerequisite is **excluded** into an opt-in qualification script (with an asserting test that `gate.sh` never invokes it) and pins the capability level at `assumed` with the missing level named — a SKIP advertises a hole in the normal gate, exclusion does not | §20, §24.4, §24.10 |
-| `MFG-FAM-1` | the `manufacture` family is off by default **by mechanism** in `services/agent/config.py`; gateway-owned, W1.1, hard predecessor of every MCP-registration wave | §2, §2.1, §17, §19 |
+| `MFG-FAM-1` | the `manufacture` family is off by default in `services/agent/config.py` and requires explicit enablement | §17, §19 |
 | `MFG-FAM-2` | one shared family id `"manufacture"` for all ten domains; no second family and no unnamed family | §17 |
 | `MFG-MOTION-1` | motion/safety risk is explicit-membership, never lexical; `_SAFETY_TOOLS` is empty and safety has no model allow path | §17 |
 | `MFG-RULEID-1` | tests and domain documents cite rule ids, never section numbers | §20, §25 |
 
-Peer citations to repair mechanically against this table: cut §6.1 and its test 32, turning §14, and
-robot §6.1/§6.4 cite §24.4/§24.6 for what is `MFG-PFFLIP-1`; monitoring §2.1 cites §24.1 for what is
-`MFG-ROTRANSPORT-1`; turning §13.6 cites §24.10 for what is `MFG-SUBJNS-1`.
-
-## 26. Review closure table — every named finding in the architecture plan review
-
-`closed here` = the corrected text is in this document, in this revision. `owned elsewhere` = by the
-review's own assignment the correction belongs to a peer document; the gateway-side half, where one
-exists, is closed here and named. Nothing is deferred: every row names a document and an owner.
-
-| finding | sev | disposition | where |
-|---|---|---|---|
-| B1 Stage 1 has no `procedural_fact` admission class | P0 | **closed here** — two named admission classes with declared scopes; `procedural_fact` is admissible wherever a guard's `accepts.admission` lists it, so the cut, turning, PnP and robot release gates are fireable, and it can never satisfy an execute-side subject | §10.1 (`MFG-ADMIT-1`, `MFG-ADMIT-2`), §20 test 6 |
-| B2 corroboration rule self-contradictory | P0 | **closed here** — binding and independence separated into two axes; same-epoch binding is required, same-source/lane forbidden; §20 test 6 now reads correctly exactly as written | §10.1, §23.1 (`MFG-CORROB-1`) |
-| B3 E0-E3 cannot drive an approval-path gate to pass | P0 | **closed here** via the review's option (a), narrowed: the E3 source set drives the **`emulated`** class's declared required set to pass, and drives the physical router and printer classes to a **named refusal** that `mfg-e0e3` asserts; E4-E6 remains the only source set that drives a physical required set to pass | §10.5, §14, §18, §22 row 8, `mfg-e0e3` (`MFG-EMU-1`) |
-| B4 printer `execute` specified three incompatible ways | P1 | **gateway half closed here** — virtual qualification raises nothing; a handshake yields `transport` evidence under the E4-E5 ceiling; printer `execute` stays `assumed` with `missing_level:"execute"` until E6 on a pilot printer. Additive §10's "probed after a successful handshake" is struck by this text and must be removed in additive's own document | §13, §18 (`MFG-CEIL-2`); additive §10 → additive owner |
-| B5 provenance laundering by the virtual-printer fixture | P0 | **closed here** — `src` derives from `(transport_kind, endpoint_is_physical)`; every virtual, recorded or loopback endpoint is `simulated`; §24.5(2)'s widening is qualified; the flag is bound to monitoring's existing `origin` field so exactly one mechanism exists | §3.2, §12, §24.5(2), §20 test 9 (`MFG-SRC-1`, `MFG-SRC-2`) |
-| B6 additive claims `src:"probed"` for a computed preflight report | P1 | **owned elsewhere**; the gateway mechanism it needs is closed here — those rows are `admission:"procedural_fact"` with gateway-derived `src` (`declared` for profile inputs) | §24 rule 3 (`MFG-SRC-3`), §10.1; additive §8.2 → additive owner |
-| B7 additive/metrology re-declare `CapabilityTruth` | P1 | **owned elsewhere**; the single definition and its consumption rules are restated here for verbatim adoption | §23.1; additive §10, metrology §1 → their owners |
-| B8 additive mints its own durable `seq` | P1 | **owned elsewhere**; `MFG-SEQ-1` is unchanged and additive's kind table — with the file-local ordinal renamed `record_index` — is now a W1.1 exit criterion | §24 rule 1, §24.3(iii); additive §3.6/§8.4 → additive owner |
-| B9 metrology computes its own closure and keeps a second store | P1 | **owned elsewhere**; `MFG-CLOSURE-1` and the mirror-only status of a domain ledger are unchanged here | §24.1, §24.2; metrology §6.3 → metrology owner |
-| B10 four domains' durable kinds absent from the W1.1 table | P0 | **closed here** — the table is total over ten domains: turning's six `cam.turn.*` plus `cam.turn.capability` accepted as submitted, and metrology, additive and perception must submit both-column tables plus a capability kind before W1.1 closes. W1.1 does not close until totality holds | §24.3(iii), §24.11(1) (`MFG-KIND-3`, `MFG-CAPKIND-1`) |
-| B11 family-off-by-default has no owner and no wave | P0 | **closed here** — the two `services/agent/config.py` edits plus `test_manufacture_family_default_off.py` are gateway-owned, listed in §2 as a shared seam, land in **W1.1**, and are a hard predecessor of W4.3 and of every peer's MCP-registration wave; robot keeps the analysis credit, not the ownership | §2, §2.1, §17, §19, §20 test 13 (`MFG-FAM-1`) |
-| B12 second/unnamed MCP families | P1 | **gateway half closed here** — §17's ruling enumeration is now total over ten domains and states plainly that a separate or unnamed family ships **enabled**; perception, additive and metrology register through `view(mcp, "manufacture")` in their own documents, and §20 test 12 asserts no second manufacturing family id exists | §17 (`MFG-FAM-2`), §20 test 12; perception §4.7/§10.2, additive §5.3, metrology §10 → their owners |
-| B13 `worker_rpc.md` §7 claimed twice; events amendment unowned | P1 | **closed here** — one section per domain allocated and published (gateway §7, monitoring §8, then cut, turn, PnP, robot, twin, additive, metrology, perception); the `contracts/events.md` §5 subscription-lane rule and the `observer` client kind are gateway-owned, and their **text lands in W1.1** so monitoring's W2 stream is never degraded to poll-only, with the streaming implementations still in W4.1 | §2, §2.1, §15, §19 (`MFG-SECT-1`, `MFG-SUB-1`, `MFG-OBS-1`) |
-| B14 `tool_registry.py` has five claimants | P1 | **closed here** — Gateway is sole owner for the risk-class change in one wave; the other four claimants' rows land as data supplied to that owner or in a strictly later wave; the unchanged-`classify_risk` assertion is the shared acceptance check for all five | §2, §2.1, §20 test 12 (`MFG-OWN-1`) |
-| B15 `core/cam/post.cpp:487` needs a joint edit | P1 | **ownership closed here** — the shared footer line is assigned to **turning** (it *deletes* the `!g.lathe` condition; cut only *adjusts* the laser condition) and recorded in the batch ownership table rather than in one document's coordination note; cut's "the seams are disjoint" claim is false for that line and is corrected in cut's own document | §2.1 (`MFG-OWN-1`); cut §3.2 → cutting owner |
-| B16 UX slice frozen by summary | P1 | **owned elsewhere** — UX's run-approval row set, the 8-row Tier-0 register, the downgradable/non-downgradable register and the 12 named existing files must be recovered into a checked-in document before W1.1 closes, or the run-approval bullet-(ii) audit reassigned to Gateway in writing. The gateway's own half of the DoD-8 obligation is discharged by B3's closure above | §10.5, §22 row 8; UX recovery → UX owner |
-| C1 additive path/prefix divergence; §0.10 incomplete | P2 | **reservation table closed here** — total over ten domains plus `mfg_tier0_*`/`mfg_result_*`, reserving additive's spellings as `mfg_print_*`/`mfg.print.*` and normalizing the `mfg.metrology.*`/`mfg.perception.*` event forms. Additive's `host/src/ui/print/**`, `print_*` and `services/gateway/**` spellings are non-conformances in additive's own document | §0.10 (`MFG-PREFIX-1`); additive §0/§2/§5/§9/§11/§12 → additive owner |
-| C2 DoD-16 ABI gate is lexical | P2 | **owned elsewhere**; recorded against §20 for the additive slice to mechanize — `mfg-abi` asserts the C ABI carries no transport, lease, run, approval or device-command entry point **regardless of prefix** | §20; additive §5.1 → additive owner |
-| C3 invalidation dispatch specified five ways | P2 | **owned elsewhere** — one `mfg.<domain>.invalidated` per domain, consumers branching on `class`; the gateway's `mfg.result.falsified`/`.superseded` pair is the single ratified exception and §16 already documents it as such | §5, §16; additive §8.2.1, perception §4.1, metrology §6.1 → their owners |
-| C4 monitoring §11.2 says E1/E2 are gate-skippable | P2 | **owned elsewhere**; §24.4's zero-SKIP tally and the exclusion-with-an-asserting-test pattern are unchanged here | §24.4; monitoring §11.2 → monitoring owner |
-| C5 twin SKIP contradiction | P2 | **owned elsewhere**; §20's DoD-1 five and "the gateway suites themselves never SKIP" are unchanged | §20, §24.4; twin §11/§14 → twin owner |
-| C6 twin's prohibited-word grep fails on twin's own corpus | P2 | **owned elsewhere** — no gateway text is involved | twin §7 → twin owner |
-| C7 `emulated` claims `safety_integration: not_applicable` | P2 | **closed here** — `unsupported` with `why:"emulated class has no interlock circuit"`, the shape every no-device-path domain uses. The old value was unreachable: a forever-`simulated` class can have no admissible corroborator, and DoD 7 forbids `not_applicable` for a whole action prerequisite | §14, §18, §20 test 9 (`MFG-SAFETY-1`) |
-| C8 capability rows FreshValue-wrapped vs never-wrapped | P2 | **owned elsewhere**; the one gateway ruling is now stated explicitly and split from `MFG-FRESH-2` so the two null-TTL meanings are distinguishable by rule — a durable authored row is journaled **and** published wrapped, `ttl_ms:null` + `state:"ok"` when it does not decay, so PnP's prose narrows from "no envelope" to "no wall-clock TTL" | §15 (`MFG-FRESH-3`); PnP §4.1 → PnP owner |
-| C9 turning's fixtures outside `fixtures/mfg/**` | P3 | **owned elsewhere** — `fixtures/mfg/turn/**` | turning §16.3 → turning owner |
-| C10 cross-reference drift on the two most load-bearing §24 rules | P3 | **closed here** — the stable rule-id register, the instruction that every document and every test cites ids rather than sections, and the explicit list of the four drifted peer citations with what each should read | §20, §25 (`MFG-RULEID-1`) |
-| P1-P9 verified-clean properties | — | **preserved**; nothing in this amendment touches them. The one property this pass could plausibly have regressed — a single `FreshValue<T>` definition — is intact: `endpoint_is_physical` is a field of the **endpoint manifest**, not of the envelope, and `CapabilityTruth` gains no field | §3.2, §23.1 |
-
-Go/no-go, restated for the gateway's own slice. The three findings that made **W1.1 itself** non-green
-were B10, B11 and B13; all three are closed above with an owner, a wave and an exit criterion. The five
-that gate the arbiter/gates slices were B1, B2, B3, B5 and B16; four are closed here, and B16's
-gateway-side half is discharged by B3's closure — leaving the UX run-approval row-set recovery as the
-one item outside this document that W1.1 still waits on. Every remaining row is owned by a named peer
-document, and none of them blocks W1.1.

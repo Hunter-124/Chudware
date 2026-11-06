@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import uuid
 from typing import Any, Callable, Optional
 
 from services.mcp.tool_registry import model_selectors
@@ -351,14 +352,13 @@ class MissionDispatch:
             "auto" ask_user accepts suggested defaults (contract §4).
         graph: the compiled aicad.dag/1 mission graph, when the caller has it
             (dag_plan renders its summary).
-        delegation_tree: a live DelegationTree, when the mission runs the 1.3 org
-            layer; without it ``delegate`` returns a structured refusal.
+        delegation_tree: a live DelegationTree; without it ``delegate`` returns a
+            structured refusal.
         doc_id: default doc context for tools that accept one.
     """
 
     #: The run-scoped tool families this layer serves (core mission tools + the
-    #: Parts Library V2 sourcing surface) + coordination board
-    #: + corporate org mode (aicad.corporate/1).
+    #: Parts Library V2 sourcing surface) + coordination board.
     TOOLS = (
         "ledger_get",
         "ledger_note",
@@ -381,14 +381,6 @@ class MissionDispatch:
         "coordinate_release",
         "coordinate_progress",
         "coordinate_board",
-        # Corporate org mode channels / meetings / head spawn
-        "corporate_channel_post",
-        "corporate_channel_read",
-        "corporate_chart",
-        "corporate_spawn_worker",
-        "corporate_hold_meeting",
-        "corporate_record_completion",
-        "corporate_activate",
     )
 
     def __init__(
@@ -407,11 +399,8 @@ class MissionDispatch:
         phase: str | None = None,
         task_class: str | None = None,
         coordination_board=None,
-        org_chart=None,
-        corporate_agent_id: str | None = None,
         options: dict | None = None,
         mode: str | None = None,
-        corporate_force: bool | None = None,
         plan_only: bool | None = None,
         advisor: bool | None = None,
     ) -> None:
@@ -421,7 +410,7 @@ class MissionDispatch:
         self.graph = graph
         self.delegation_tree = delegation_tree
         self.doc_id = doc_id
-        # Online delegated turns execute through Chudcode and never consume this
+        # Online delegated turns execute through OMP and never consume this
         # object.  ``provider`` survives only as an injected deterministic local
         # provider for an explicit ``options={"offline": True}`` run.
         self.provider = provider
@@ -441,30 +430,22 @@ class MissionDispatch:
                 self.coordination_board = get_board(run_id) if run_id else None
             except Exception:  # noqa: BLE001
                 self.coordination_board = None
-        # Corporate org chart (aicad.corporate/1) — optional; activated when
-        # agent.corporate_mode is on and the mission has ≥2 departments.
-        self.org_chart = org_chart
-        # Identity of the agent currently using this dispatch (for corporate
-        # channel posts / spawn authority). Root/director when unset.
-        self.corporate_agent_id = corporate_agent_id
-        # Preserve non-mode execution context (parent Chudcode session,
+        # Preserve non-mode execution context (parent OMP session,
         # explicit offline provider, settings, workspace and attachments).
         # mode_options_from_mapping intentionally returns only UI mode fields.
         self.execution_options = dict(options) if isinstance(options, dict) else {}
-        # Copilot mode overhaul: options.mode / corporate_force / plan_only /
-        # advisor threaded from host/core so tool + org policy can honor them.
+        # Copilot mode overhaul: options.mode / plan_only / advisor threaded from
+        # host/core so tool policy can honor them.
         try:
             from services.agent.copilot_mode_tools import (  # noqa: PLC0415
                 mode_options_from_mapping,
             )
 
             # Merge explicit kwargs into options BEFORE normalize so
-            # mode==swarm → corporate_force and mode==plan → plan_only couple.
+            # mode==plan → plan_only couple.
             _raw = dict(self.execution_options)
             if mode is not None:
                 _raw["mode"] = mode
-            if corporate_force is not None:
-                _raw["corporate_force"] = bool(corporate_force)
             if plan_only is not None:
                 _raw["plan_only"] = bool(plan_only)
             if advisor is not None:
@@ -472,15 +453,11 @@ class MissionDispatch:
             _opts = mode_options_from_mapping(_raw)
             self.options = _opts
             self.mode = _opts["mode"]
-            self.corporate_force = bool(_opts["corporate_force"])
             self.plan_only = bool(_opts["plan_only"])
             self.advisor = bool(_opts.get("advisor", True))
         except Exception:  # noqa: BLE001 — never break dispatch construction
             self.options = {}
             self.mode = mode or "agent"
-            self.corporate_force = (
-                bool(corporate_force) if corporate_force is not None else False
-            )
             self.plan_only = bool(plan_only) if plan_only is not None else False
             self.advisor = True if advisor is None else bool(advisor)
         self._handlers: dict[str, Callable[..., Any]] = {
@@ -504,13 +481,6 @@ class MissionDispatch:
             "coordinate_release": self.coordinate_release,
             "coordinate_progress": self.coordinate_progress,
             "coordinate_board": self.coordinate_board_snapshot,
-            "corporate_channel_post": self.corporate_channel_post,
-            "corporate_channel_read": self.corporate_channel_read,
-            "corporate_chart": self.corporate_chart_snapshot,
-            "corporate_spawn_worker": self.corporate_spawn_worker,
-            "corporate_hold_meeting": self.corporate_hold_meeting,
-            "corporate_record_completion": self.corporate_record_completion,
-            "corporate_activate": self.corporate_activate,
         }
 
     # ------------------------------------------------------------------ resolve
@@ -942,7 +912,7 @@ class MissionDispatch:
         without form answers and are reported as such — never as defaults.
         """
         from services.agent import interaction
-        from services.agent.chudcode_questions import QuestionUnavailable
+        from services.agent.omp_questions import QuestionUnavailable
 
         outcome: dict[str, Any] = {}
 
@@ -1041,25 +1011,17 @@ class MissionDispatch:
         kind: str = "worker",
         parent_id: str | None = None,
         docs: list | None = None,
+        thinking: str | None = None,
+        reasoning_effort: str | None = None,
+        effort: str | None = None,
         **_ignored: Any,
     ) -> dict:
-        """Spawn a sub-agent role with an isolated brief and token budget (§12).
+        """Run a specialist on a scoped brief with a token budget.
 
-        A mission that reaches this call with no delegation tree gets one bound
-        on the spot.  Online execution needs no Python provider: Chudcode owns
-        provider construction and the persistent child session.  An explicit
-        offline mission may use only the injected offline-safe local provider.
-
-        WS4: spawn-depth policy (max_spawn_depth from capability / config) is
-        checked before the tree spawn; deeper spawns require decreasing
-        difficulty for auto model assignment.
-
-        mega-5: overlong briefs are soft-truncated for the RECORDED node row
-        (≤500 chars, contract §12) instead of burning a turn on a hard reject —
-        but the child EXECUTES on the full brief, because the cap describes the
-        audit row, not the assignment. Invented role names (part_fixer, …) map
-        onto loadable cards so the child is not a bare sub-agent without
-        new_part/add_features.
+        Include task, context, interfaces and deliverables in brief. docs scopes
+        document access; parent_id defaults to the current delegate. Optional
+        thinking/reasoning_effort/effort requests a reasoning level subject to
+        role settings and model support. Returns the result or a refusal.
         """
         role_raw = str(role or "").strip()
         role_key = role_raw.lower()
@@ -1121,9 +1083,9 @@ class MissionDispatch:
 
         if self.delegation_tree is None:
             # Every advertised delegate must have a real, budgeted tree.  Online
-            # Chudcode execution does not require a Python provider, so bind the
+            # OMP execution does not require a Python provider, so bind the
             # tree unconditionally; explicit offline safety is checked later by
-            # chudcode_roles.run_role_turn before the local loop can run.
+            # omp_roles.run_role_turn before the local loop can run.
             try:
                 from services.agent.delegation import (  # noqa: PLC0415
                     DelegationTree as _DelegationTree,
@@ -1221,7 +1183,6 @@ class MissionDispatch:
             policy = check_spawn_depth_policy(
                 depth,
                 letter=letter,
-                task_class=self.task_class,
             )
             if not policy.get("ok"):
                 return {
@@ -1231,10 +1192,8 @@ class MissionDispatch:
                     "error": policy.get("reason") or "spawn depth policy refused",
                     "spawn_depth_policy": policy,
                 }
-            # Stash for _run_subagent auto model pick (decreasing difficulty).
-            self._last_spawn_policy = policy
         except Exception:  # noqa: BLE001 — policy is best-effort; never block spawn
-            self._last_spawn_policy = None
+            pass
 
         try:
             from services.agent.delegation import delegate as _delegate
@@ -1271,7 +1230,7 @@ class MissionDispatch:
             # Observable, not silent: this mission had no tree until this call.
             node["delegation_tree_autobound"] = True
 
-        # Approved children run synchronously.  Online Chudcode needs no bound
+        # Approved children run synchronously.  Online OMP needs no bound
         # Python provider; explicit offline safety is enforced by run_role_turn.
         if not isinstance(node, dict) or node.get("status") != "approved":
             if isinstance(node, dict):
@@ -1295,6 +1254,9 @@ class MissionDispatch:
             node["brief_len_original"] = len(brief_raw)
             node["brief"] = brief
             node["brief_executed_in_full"] = len(exec_brief) == len(brief_raw)
+        for key, value in (("thinking", thinking), ("reasoning_effort", reasoning_effort), ("effort", effort)):
+            if value is not None:
+                node[key] = value
         node.update(self._run_subagent(node, exec_brief))
         # `executed` was set OPTIMISTICALLY above, before the child ran, and nothing used to
         # take it back. Live 2026-07-29 (firmware pass 2c) a delegate returned
@@ -1392,19 +1354,19 @@ class MissionDispatch:
                 pass
 
     def _run_subagent_turn(self, node: dict, brief: str) -> dict:
-        """Run one persistent delegated role turn through Chudcode.
+        """Run one persistent delegated role turn through OMP.
 
         The delegation tree remains Chudware's authority for depth, credits,
-        approvals, lineage and terminal state.  Chudcode owns the online model
+        approvals, lineage and terminal state.  OMP owns the online model
         loop, provider construction, retry and persistent child transcript.
         Only an explicit ``options.offline`` request reaches the deterministic
-        local loop, through ``chudcode_roles.run_role_turn``'s offline-safe gate.
+        local loop, through ``omp_roles.run_role_turn``'s offline-safe gate.
         """
         node_id = str(node.get("id") or "")
         role = str(node.get("role") or "subagent")
         try:
             from services.agent import subagent_registry as _sreg
-            from services.agent.chudcode_roles import run_role_turn
+            from services.agent.omp_roles import run_role_turn
 
             try:
                 _sreg.append_transcript(
@@ -1423,7 +1385,7 @@ class MissionDispatch:
             except Exception:  # noqa: BLE001 - run_role_turn returns invalid_role
                 card = None
 
-            # Finalize one effective tool scope before Chudcode renders schemas
+            # Finalize one effective tool scope before OMP renders schemas
             # and registers host dispatch.  None is never used here: delegated
             # children are deliberately restricted to their role + shared floor.
             allowed = list(getattr(card, "concrete_tools", None) or [])
@@ -1449,35 +1411,6 @@ class MissionDispatch:
             ):
                 if tool not in allowed:
                     allowed.append(tool)
-
-            # Corporate seats retain their scoped channel/meeting tools and
-            # identity.  The mission-scoped dispatcher remains the governance
-            # authority when Chudcode calls those host tools.
-            org = getattr(self, "org_chart", None)
-            corporate_agent = (
-                str(node.get("corporate_agent_id") or "")
-                or node_id
-                or str(getattr(self, "corporate_agent_id", None) or "")
-            )
-            if org is not None and getattr(org, "active", False):
-                try:
-                    seat = org.seat_for(corporate_agent) if corporate_agent else None
-                    if seat is None:
-                        for candidate in org.seats.values():
-                            if candidate.role == role and candidate.rank != "director":
-                                seat = candidate
-                                corporate_agent = candidate.agent_id
-                                break
-                    if seat is not None:
-                        for tool in org.tools_for(seat.agent_id):
-                            if tool not in allowed:
-                                allowed.append(tool)
-                        self.corporate_agent_id = seat.agent_id
-                        node["corporate_agent_id"] = seat.agent_id
-                        node["corporate_rank"] = seat.rank
-                        node["corporate_dept"] = seat.dept_id
-                except Exception:  # noqa: BLE001 - inactive org must not block work
-                    pass
 
             if role in (
                 "feature_modeler",
@@ -1549,16 +1482,9 @@ class MissionDispatch:
                 depth = int(node.get("depth") or 0)
             except (TypeError, ValueError):
                 depth = 0
-            policy = getattr(self, "_last_spawn_policy", None) or {}
-            min_rank = policy.get("min_rank")
-            try:
-                min_rank_i = int(min_rank) if min_rank is not None else None
-            except (TypeError, ValueError):
-                min_rank_i = None
-            risk = "low" if str(node.get("kind") or "") == "ponder" else None
 
             # CAD still chooses the governed provider/model/effort assignment,
-            # but online code passes identifiers to Chudcode rather than
+            # but online code passes identifiers to OMP rather than
             # constructing a Python provider.
             assignment = None
             cfg: dict[str, Any] = {}
@@ -1566,55 +1492,41 @@ class MissionDispatch:
             try:
                 from services.agent import config as agent_config  # noqa: PLC0415
                 from services.agent.role_models import (  # noqa: PLC0415
+                    RoleModelError,
                     clamp_subagent_effort,
                     cost_tier_for,
-                    harness_role_for_mission_role,
-                    resolve_for_node,
+                    mission_role_key,
                     resolve_role_model,
                     resolve_role_thinking,
                     role_for_copilot_mode,
                 )
 
+                cfg = dict(agent_config.load_config() or {})
                 mode = getattr(self, "mode", None) or options.get("mode") or "agent"
                 harness_role = (
                     role_for_copilot_mode(mode)
                     if mode in ("plan", "edit")
-                    else harness_role_for_mission_role(role)
+                    else mission_role_key(role, cfg)
                 )
-                cfg = dict(agent_config.load_config() or {})
+                from services.agent.role_models import (
+                    active_role_overrides,
+                    legacy_mission_worker_fallback,
+                )
+
+                # The legacy worker fallback is an override feature: with
+                # advanced_overrides off dispatch is pure tier dispatch.
+                if (legacy_mission_worker_fallback(cfg)
+                        and harness_role not in ("private", "redaction", "chat")
+                        and harness_role not in active_role_overrides(cfg)
+                        and harness_role not in (cfg.get("legacy_mission_worker_fallback_exclusions") or ())):
+                    harness_role = "worker"
                 from services.agent.preferences import resolve_turn_preferences
 
                 child_preferences = resolve_turn_preferences(brief, cfg=cfg)
-                # Existing Advanced rows remain authoritative during Phase 1.
-                # Unpinned leaves inherit the worker seat rather than a task alias.
-                if harness_role not in (cfg.get("ai_roles") or {}):
-                    harness_role = "worker"
-                context = {
-                    "task_class": self.task_class,
-                    "depth": depth,
-                    "risk": risk,
-                    "node_inputs": {
-                        "task_class": self.task_class,
-                        "depth": depth,
-                    },
-                }
-                assignment = (None if harness_role == "worker"
-                              else resolve_for_node(harness_role, context, cfg=cfg))
-                if assignment is None or min_rank_i is not None:
-                    depth_assignment = resolve_role_model(
-                        harness_role,
-                        cfg,
-                        task_class=self.task_class,
-                        node_depth=depth,
-                        risk=risk,
-                        min_rank=min_rank_i,
-                        request=brief,
-                        turn_preferences=child_preferences,
-                    )
-                    if depth_assignment is not None:
-                        assignment = depth_assignment
+                assignment = resolve_role_model(
+                    harness_role, cfg, turn_preferences=child_preferences
+                )
                 if assignment is not None:
-                    rank = int(assignment.rank or (min_rank_i or 3))
                     dispatch_effort = (
                         node.get("thinking")
                         or node.get("reasoning_effort")
@@ -1622,44 +1534,39 @@ class MissionDispatch:
                         or (node.get("role_model") or {}).get("reasoning_effort")
                     )
                     try:
-                        if harness_role == "worker":
-                            resolved_effort = child_preferences.thinking
-                        else:
-                            resolved_effort = resolve_role_thinking(
-                                harness_role,
-                                cfg,
-                                request=brief,
-                                task_class=self.task_class,
-                                node_depth=depth,
-                                risk=risk,
-                                min_rank=min_rank_i,
-                                dispatch_effort=(
-                                    str(dispatch_effort) if dispatch_effort else None
-                                ),
-                                rank=rank,
-                            )
-                    except Exception:  # noqa: BLE001 - assignment itself remains valid
-                        resolved_effort = (
-                            "low" if rank <= 2 else "medium" if rank <= 3 else None
+                        resolved_effort = resolve_role_thinking(
+                            harness_role,
+                            cfg,
+                            dispatch_effort=(
+                                str(dispatch_effort) if dispatch_effort else None
+                            ),
                         )
+                    except Exception:  # noqa: BLE001 - leave the runtime default unchanged
+                        resolved_effort = None
                     if resolved_effort:
                         settings["reasoning_effort"] = clamp_subagent_effort(
                             resolved_effort
                         )
-                    if not assignment.is_session_default:
-                        if assignment.provider:
-                            settings["provider"] = assignment.provider
-                        if assignment.model:
-                            settings["model"] = assignment.model
+                    if assignment.is_session_default:
+                        for key in ("provider", "model"):
+                            settings.pop(key, None)
+                            options.pop(key, None)
+                    else:
+                        for key in ("provider", "model"):
+                            value = getattr(assignment, key)
+                            if value:
+                                settings[key] = value
+                                options[key] = value
                     node["role_model"] = {
                         **assignment.to_dict(),
-                        "min_rank": min_rank_i,
                         "cost_tier": cost_tier_for(
                             assignment.provider, assignment.model
                         ),
                         "reasoning_effort": settings.get("reasoning_effort"),
                     }
-            except Exception:  # noqa: BLE001 - assignment fallback stays in Chudcode
+            except RoleModelError:
+                raise
+            except Exception:  # noqa: BLE001 - assignment fallback stays in OMP
                 assignment = None
 
             if assignment is not None:
@@ -1667,17 +1574,14 @@ class MissionDispatch:
                     from services.agent import agent_events as _ae  # noqa: PLC0415
                     from services.agent.role_models import cost_tier_for  # noqa: PLC0415
 
-                    emit_min = min_rank_i if min_rank_i is not None else assignment.rank
                     event_kind, event_payload = _ae.model_assignment_event(
                         node_id or role,
                         depth=depth,
                         task_class=self.task_class,
-                        min_rank=(int(emit_min) if emit_min is not None else None),
                         picked_model=assignment.model,
                         picked_provider=assignment.provider,
                         cost_tier=cost_tier_for(assignment.provider, assignment.model),
                         mode=assignment.mode,
-                        rank=assignment.rank,
                         reason=assignment.reason,
                         subagent_id=node_id or None,
                         role=role,
@@ -1703,12 +1607,10 @@ class MissionDispatch:
                                     for key in (
                                         "depth",
                                         "task_class",
-                                        "min_rank",
                                         "picked_model",
                                         "picked_provider",
                                         "cost_tier",
                                         "mode",
-                                        "rank",
                                         "reason",
                                         "role",
                                         "subagent_id",
@@ -1754,7 +1656,7 @@ class MissionDispatch:
                 )
             else:
                 # A caller-supplied provider belongs only to the explicit local
-                # fallback.  Never leak it into the online Chudcode service.
+                # fallback.  Never leak it into the online OMP service.
                 options.pop("offline_provider", None)
 
             from services.agent.online_turn import current_tool_session_id
@@ -1869,8 +1771,8 @@ class MissionDispatch:
                 "tokens_used_estimate": tokens_used_estimate,
                 "provider_usage_recorded": bool(turn.get("provider_usage_recorded")),
                 "session_id": turn.get("session_id"),
-                "chudcode_session_id": turn.get("chudcode_session_id"),
-                "chudcode_session_file": turn.get("chudcode_session_file"),
+                "omp_session_id": turn.get("omp_session_id"),
+                "omp_session_file": turn.get("omp_session_file"),
                 "allowed_tools": turn.get("allowed_tools") or allowed,
             }
             if node.get("role_model") is not None:
@@ -1922,7 +1824,10 @@ class MissionDispatch:
         price_max: float = 0.0,
         vendors: str = "",
         in_stock: bool = False,
-        **_ignored: Any,
+        detail: str = "summary",
+        include_live: bool = True,
+        previews: bool = True,
+        **kwargs: Any,
     ) -> dict:
         """Search the standard-parts library with taxonomy routing + facet filters.
 
@@ -1933,12 +1838,11 @@ class MissionDispatch:
         vendors (CSV) / in_stock post-filter the result set. Returns results +
         facet_summary (top param values in THIS result set) + applied filters.
         """
-        if not query:
-            return {"ok": False, "error": "part_search needs a query string"}
         try:
+            from services.mcp import result_serving as rs  # noqa: PLC0415
             from services.mcp.parts_tools import search_parts_v2  # noqa: PLC0415
 
-            return search_parts_v2(
+            out = search_parts_v2(
                 query,
                 domain=domain,
                 limit=limit,
@@ -1947,7 +1851,53 @@ class MissionDispatch:
                 price_max=price_max,
                 vendors=vendors,
                 in_stock=in_stock,
+                detail=detail,
+                include_live=include_live,
+                **kwargs,
             )
+            if not out.get("ok"):
+                return out
+            # The in-process agent has an 8000-character text limit. Keep the
+            # rows within that limit before creating a sheet or image reference.
+            body = json.loads(rs.serve(out, rs.ServeOpts(detail=detail, budget_tokens=1100)))
+            body["notices"] = out.get("notices", [])
+            meta = body["meta"]
+            meta["omitted_keys"] = [key for key in meta["omitted_keys"] if key != "notices"]
+            trimmed = False
+            while body.get("results") and len(json.dumps(body)) > 6000:
+                body["results"].pop()
+                trimmed = True
+            if trimmed:
+                meta["omitted_keys"].append("results[mission_text_budget]")
+            try:
+                from services.parts.contact_sheet import present_search  # noqa: PLC0415
+                body, png = present_search(body, previews=previews, allow_network=bool(include_live))
+            except Exception as exc:  # noqa: BLE001 — a missing preview must not fail search
+                rows = body.get("results") or []
+                for row in rows:
+                    row["preview"] = {"provenance": "", "reason": "preview_unavailable"}
+                body["preview_sheet"] = {"pictured": [], "omitted": [r["index"] for r in rows],
+                                         "reason": f"composition_failed: {exc}"}
+                png = None
+            if png is not None:
+                try:
+                    from services.agent.tool_images import materialize  # noqa: PLC0415
+                    body["images"] = [{"kind": "image", "path": materialize(png, "image/png"),
+                                       "mime": "image/png"}]
+                    if len(json.dumps(body)) > 7950:
+                        body.pop("images", None)
+                        body["preview_sheet"] = {
+                            "pictured": [], "omitted": [row["index"] for row in body["results"]],
+                            "reason": "mission_text_budget",
+                        }
+                except Exception as exc:  # noqa: BLE001 — preserve the search on cache failure
+                    body["preview_sheet"] = {
+                        "pictured": [], "omitted": [row["index"] for row in body["results"]],
+                        "reason": f"image_unavailable: {exc}",
+                    }
+            meta["tokens"] = rs.count_tokens(body)
+            meta["truncated"] = bool(meta["omitted_keys"]) or meta["tokens"] > 1100
+            return body
         except Exception as exc:  # noqa: BLE001 — error is data for the model
             return {
                 "ok": False,
@@ -1976,7 +1926,8 @@ class MissionDispatch:
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"parts_taxonomy failed: {exc}"}
 
-    def part_get(self, part_id: str = "", **_ignored: Any) -> dict:
+    def part_get(self, part_id: str = "", include_live: bool = True,
+                 acquire: bool = False, **_ignored: Any) -> dict:
         """Fetch one full PartRecord by stable part_id (inspect params +
         geometry_ref before placing).
 
@@ -1985,9 +1936,12 @@ class MissionDispatch:
         if not part_id:
             return {"ok": False, "error": "part_get needs a part_id"}
         try:
+            from services.agent.request_context import in_cell  # noqa: PLC0415
+            if acquire and in_cell():
+                return {"ok": False, "reason": "Use part_acquire to acquire geometry in a cell."}
             from services.parts import get as _get  # noqa: PLC0415
 
-            rec = _get(part_id)
+            rec = _get(part_id, include_live=include_live, acquire=acquire)
             if rec is None:
                 return {
                     "ok": False,
@@ -2193,9 +2147,14 @@ class MissionDispatch:
 
     # ---------------------------------------------------------- coordination
     def _coord_agent_id(self, agent_id: str | None = None) -> str:
-        """Resolve the claiming agent id (explicit > subagent node > run)."""
+        """Resolve work-board identity (explicit > bound subagent > run)."""
         if agent_id and str(agent_id).strip():
             return str(agent_id).strip()
+        from services.mcp.core_bridge import CURRENT_AGENT
+
+        bound = CURRENT_AGENT.get()
+        if isinstance(bound, tuple) and len(bound) == 2 and bound[1]:
+            return str(bound[1])
         return str(self.run_id or "mission")
 
     def _board_or_error(self) -> tuple[Any, dict | None]:
@@ -2214,11 +2173,11 @@ class MissionDispatch:
         agent_id: str | None = None,
         **_ignored: Any,
     ) -> dict:
-        """Claim exclusive ownership of resources (doc/feature/file ids).
+        """Publish non-exclusive work intent for doc/feature/file ids.
 
-        Returns ok+claims on success, or status=CONFLICT with holder+intent when
-        another agent already holds a resource. Never hard-deadlocks — narrow
-        scope or wait for the holder to call coordinate_release.
+        Peers can work on the same resources without waiting or transferring
+        custody. coordinate_release removes only your intent; neither tool
+        grants edit permission or locks geometry. Use coordinate_progress for handoffs.
         """
         board, err = self._board_or_error()
         if err is not None:
@@ -2229,14 +2188,7 @@ class MissionDispatch:
             if isinstance(resources, list)
             else ([resources] if resources else [])
         )
-        out = board.register_claim(aid, res, intent)
-        # Surface conflicts as spawn-side warnings without blocking siblings.
-        if isinstance(out, dict) and out.get("status") == "CONFLICT":
-            out.setdefault(
-                "warning",
-                "claim conflict — wait or narrow scope; do not hard-deadlock",
-            )
-        return out
+        return board.register_claim(aid, res, intent)
 
     def coordinate_release(
         self,
@@ -2245,7 +2197,7 @@ class MissionDispatch:
         claim_ids: list | None = None,
         **_ignored: Any,
     ) -> dict:
-        """Release claims held by this agent (all, or listed resources/claim_ids)."""
+        """Remove this agent's work intents (all, or listed resources/claim_ids)."""
         board, err = self._board_or_error()
         if err is not None:
             return err
@@ -2253,7 +2205,7 @@ class MissionDispatch:
         res = (
             resources
             if isinstance(resources, list)
-            else ([resources] if resources else None)
+            else ([resources] if resources is not None else None)
         )
         return board.release_claim(aid, res, claim_ids=claim_ids)
 
@@ -2271,367 +2223,17 @@ class MissionDispatch:
         return board.post_progress(aid, note)
 
     def coordinate_board_snapshot(self, **_ignored: Any) -> dict:
-        """Return active claims + recent progress notes for this run."""
+        """Return non-exclusive work intents and recent progress for this run."""
         board, err = self._board_or_error()
         if err is not None:
             return err
         snap = board.board_snapshot()
         return {"ok": True, **snap}
 
-    # ---------------------------------------------------------- corporate org
-    def _org_or_error(self) -> tuple[Any, dict | None]:
-        org = getattr(self, "org_chart", None)
-        if org is None:
-            return None, {
-                "ok": False,
-                "error": "no corporate org chart bound to this mission run",
-                "hint": (
-                    "Call corporate_activate with the mission task list when "
-                    "agent.corporate_mode is on, or bind org_chart on MissionDispatch."
-                ),
-            }
-        return org, None
-
-    def _corporate_caller(self, agent_id: str | None = None) -> str:
-        if agent_id and str(agent_id).strip():
-            return str(agent_id).strip()
-        if self.corporate_agent_id and str(self.corporate_agent_id).strip():
-            return str(self.corporate_agent_id).strip()
-        org = getattr(self, "org_chart", None)
-        if org is not None:
-            return str(getattr(org, "director_id", "") or self.run_id or "mission")
-        return str(self.run_id or "mission")
-
-    def corporate_activate(
-        self,
-        tasks: list | None = None,
-        mission_goals: list | None = None,
-        force: bool | None = None,
-        seat_heads: bool = True,
-        **_ignored: Any,
-    ) -> dict:
-        """Build/activate the corporate org chart for this run from *tasks*.
-
-        No-ops (active=False) when corporate_mode is off or tasks span <2
-        departments — flat delegation remains unchanged. When active, seats
-        department heads as live subagents (if a delegation tree is bound).
-        """
-        try:
-            from services.agent.corporate import build_corporate_org  # noqa: PLC0415
-            from services.agent import config as agent_config  # noqa: PLC0415
-
-            cfg = agent_config.load_config()
-            goals = mission_goals
-            if not goals and isinstance(self.graph, dict):
-                brief = self.graph.get("brief") or self.graph.get("goal") or ""
-                if brief:
-                    goals = [str(brief)]
-
-            def _delegate(**kwargs: Any) -> Any:
-                return self.delegate(**kwargs)
-
-            result = build_corporate_org(
-                self.run_id,
-                tasks or [],
-                cfg=cfg,
-                board=self.coordination_board,
-                mission_goals=list(goals or []) or None,
-                force=force,
-                on_event=self.on_event,
-                session_id=str(self.execution_options.get("session_id") or ""),
-                seat_heads=bool(seat_heads),
-                delegate_fn=_delegate if self.delegation_tree is not None else None,
-            )
-            if result.get("active") and result.get("chart"):
-                from services.agent.corporate import get_org_chart  # noqa: PLC0415
-
-                self.org_chart = get_org_chart(
-                    self.run_id,
-                    create=False,
-                    on_event=self.on_event,
-                    session_id=str(self.execution_options.get("session_id") or ""),
-                )
-                if self.org_chart is not None:
-                    if self.org_chart.on_event is None:
-                        self.org_chart.on_event = self.on_event
-                    if not self.corporate_agent_id:
-                        self.corporate_agent_id = self.org_chart.director_id
-            if self.ledger is not None:
-                try:
-                    self.ledger.append(
-                        "agent",
-                        "artifact",
-                        {
-                            "event": "corporate_org",
-                            "active": bool(result.get("active")),
-                            "reason": result.get("reason"),
-                            "departments_found": result.get("departments_found"),
-                        },
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
-            return result
-        except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "error": f"corporate_activate failed: {exc}"}
-
-    def maybe_auto_activate_corporate(
-        self,
-        tasks: list | None = None,
-        mission_goals: list | None = None,
-        force: bool | None = None,
-        **_ignored: Any,
-    ) -> dict:
-        """Mission-start hook: auto-activate when mode on and ≥2 departments.
-
-        When ``self.corporate_force`` / mode==swarm, *force* defaults True so
-        Swarm mode activates the org even if config.corporate_mode is off.
-        Single-dept missions still stay flat (dept-count gate in corporate).
-        """
-        try:
-            from services.agent.corporate import auto_activate_corporate  # noqa: PLC0415
-            from services.agent import config as agent_config  # noqa: PLC0415
-
-            cfg = agent_config.load_config()
-            goals = mission_goals
-            if not goals and isinstance(self.graph, dict):
-                brief = self.graph.get("brief") or self.graph.get("goal") or ""
-                if brief:
-                    goals = [str(brief)]
-
-            def _delegate(**kwargs: Any) -> Any:
-                return self.delegate(**kwargs)
-
-            # Swarm / options.corporate_force → force org activation path.
-            force_flag = force
-            if force_flag is None:
-                force_flag = True if getattr(self, "corporate_force", False) else None
-            if force_flag is True:
-                result = self.corporate_activate(
-                    tasks=tasks or [],
-                    mission_goals=list(goals or []) or None,
-                    force=True,
-                    seat_heads=True,
-                )
-            else:
-                result = auto_activate_corporate(
-                    self.run_id,
-                    tasks or [],
-                    cfg=cfg,
-                    board=self.coordination_board,
-                    mission_goals=list(goals or []) or None,
-                    on_event=self.on_event,
-                    session_id=str(self.execution_options.get("session_id") or ""),
-                    delegate_fn=_delegate if self.delegation_tree is not None else None,
-                    seat_heads=True,
-                )
-            if result.get("active"):
-                from services.agent.corporate import get_org_chart  # noqa: PLC0415
-
-                self.org_chart = get_org_chart(
-                    self.run_id,
-                    create=False,
-                    on_event=self.on_event,
-                    session_id=str(self.execution_options.get("session_id") or ""),
-                )
-                if self.org_chart is not None and not self.corporate_agent_id:
-                    self.corporate_agent_id = self.org_chart.director_id
-            return result
-        except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "error": f"auto_activate failed: {exc}"}
-
-    def corporate_wind_down(
-        self,
-        success: bool = True,
-        summary: str = "",
-        **_ignored: Any,
-    ) -> dict:
-        """Tear down the corporate org at run finish (success or failure)."""
-        try:
-            from services.agent.corporate import wind_down_corporate  # noqa: PLC0415
-
-            out = wind_down_corporate(
-                self.run_id,
-                success=bool(success),
-                summary=str(summary or ""),
-            )
-            self.org_chart = None
-            return out
-        except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "error": f"corporate_wind_down failed: {exc}"}
-
-    def corporate_chart_snapshot(self, **_ignored: Any) -> dict:
-        """Return the corporate org chart snapshot for this run."""
-        org, err = self._org_or_error()
-        if err is not None:
-            return err
-        snap = org.snapshot()
-        return {"ok": True, **snap}
-
-    def corporate_channel_post(
-        self,
-        channel: str = "",
-        body: str = "",
-        kind: str = "info",
-        agent_id: str | None = None,
-        meta: dict | None = None,
-        **_ignored: Any,
-    ) -> dict:
-        """Post to a corporate channel (membership + rank rules enforced).
-
-        Workers may only post to their dept channel; worker→director is rejected.
-        """
-        org, err = self._org_or_error()
-        if err is not None:
-            return err
-        aid = self._corporate_caller(agent_id)
-        return org.post_message(aid, channel, body, kind=kind, meta=meta)
-
-    def corporate_channel_read(
-        self,
-        channel: str = "",
-        agent_id: str | None = None,
-        limit: int = 50,
-        **_ignored: Any,
-    ) -> dict:
-        """Read recent messages on a corporate channel (membership enforced)."""
-        org, err = self._org_or_error()
-        if err is not None:
-            return err
-        aid = self._corporate_caller(agent_id)
-        return org.read_channel(channel, agent_id=aid, limit=limit)
-
-    def corporate_spawn_worker(
-        self,
-        role: str = "",
-        brief: str = "",
-        head_id: str | None = None,
-        budget_tokens: int = 0,
-        as_team_lead: bool = False,
-        **_ignored: Any,
-    ) -> dict:
-        """Department head spawns a worker seat (within max_subagent_depth).
-
-        Also requests a delegation node when a tree is bound. Workers get
-        coordinate_* + dept channel tools via _run_subagent.
-        """
-        org, err = self._org_or_error()
-        if err is not None:
-            return err
-        if not getattr(org, "active", False):
-            return {
-                "ok": False,
-                "error": "corporate org is not active on this run",
-            }
-        caller = self._corporate_caller(head_id)
-        seat = org.seat_for(caller)
-        if seat is None or seat.rank not in ("head", "team_lead"):
-            return {
-                "ok": False,
-                "status": "rejected",
-                "error": (
-                    f"only department heads/team leads may spawn workers; "
-                    f"caller={caller!r} rank="
-                    f"{getattr(seat, 'rank', None)!r}"
-                ),
-            }
-        # Seat on the org chart first (depth check).
-        seated = org.spawn_worker(
-            head_id=caller,
-            role=role,
-            brief=brief,
-            as_team_lead=bool(as_team_lead),
-        )
-        if not seated.get("ok"):
-            return seated
-
-        # Optional live delegation + execution through the existing path.
-        node_out: dict[str, Any] | None = None
-        if self.delegation_tree is not None and role:
-            parent_node = seat.delegation_node
-            try:
-                node_out = self.delegate(
-                    role=role,
-                    brief=brief or f"corporate worker in dept {seat.dept_id}",
-                    budget_tokens=budget_tokens or 4000,
-                    kind="worker",
-                    parent_id=parent_node,
-                )
-                if isinstance(node_out, dict) and node_out.get("id"):
-                    # Bind delegation node id onto the corporate seat.
-                    worker_seat = org.seat_for(seated["seat"]["agent_id"])
-                    if worker_seat is not None:
-                        worker_seat.delegation_node = str(node_out.get("id"))
-                        # Tag node so _run_subagent finds the corporate seat.
-                        node_out["corporate_agent_id"] = worker_seat.agent_id
-                        node_out["corporate_rank"] = worker_seat.rank
-                        node_out["corporate_dept"] = worker_seat.dept_id
-            except Exception as exc:  # noqa: BLE001
-                seated["delegation_error"] = str(exc)
-
-        seated["delegation"] = node_out
-        return seated
-
-    def corporate_hold_meeting(
-        self,
-        dept_id: str = "",
-        done: list | None = None,
-        in_progress: list | None = None,
-        blocked: list | None = None,
-        risks: list | None = None,
-        trigger: str = "manual",
-        **_ignored: Any,
-    ) -> dict:
-        """Department head posts a structured status digest to the heads channel."""
-        org, err = self._org_or_error()
-        if err is not None:
-            return err
-        did = str(dept_id or "").strip()
-        if not did:
-            caller = self._corporate_caller()
-            seat = org.seat_for(caller)
-            if seat is not None and seat.dept_id:
-                did = seat.dept_id
-        if not did:
-            return {"ok": False, "error": "dept_id required for hold_meeting"}
-        return org.hold_meeting(
-            did,
-            done=done,
-            in_progress=in_progress,
-            blocked=blocked,
-            risks=risks,
-            trigger=trigger or "manual",
-        )
-
-    def corporate_record_completion(
-        self,
-        dept_id: str = "",
-        summary: str = "",
-        blocked: bool = False,
-        agent_id: str | None = None,
-        **_ignored: Any,
-    ) -> dict:
-        """Record a worker task completion; may trigger a cadence meeting."""
-        org, err = self._org_or_error()
-        if err is not None:
-            return err
-        aid = self._corporate_caller(agent_id)
-        seat = org.seat_for(aid)
-        did = str(dept_id or "").strip()
-        if not did and seat is not None:
-            did = seat.dept_id or ""
-        if not did:
-            return {"ok": False, "error": "dept_id required (or call as a dept seat)"}
-        return org.record_worker_completion(
-            did,
-            worker_id=aid,
-            summary=summary,
-            blocked=bool(blocked),
-        )
-
 
 # Explicit offline role turns still need enough output room for a complete
 # terminal directive; the local legacy loop's default 2048-token completion cap
-# can truncate one mid-envelope. Online turns use Chudcode and do not enter this
+# can truncate one mid-envelope. Online turns use OMP and do not enter this
 # loop.
 LINEAR_ROLE_MAX_OUTPUT_TOKENS = 8192
 
@@ -2639,12 +2241,9 @@ LINEAR_ROLE_MAX_OUTPUT_TOKENS = 8192
 def linear_role_allowed_tools(card: Any) -> list[str]:
     """Return the universal main-chat loadout used by live turns and previews.
 
-    The interactive lane is not a capped DAG-node role: it gets the broad
-    :data:`tool_categories.MAIN_CHAT_CORE_TOOLS` core with schemas up front, plus
-    the card's own seats, the contract fs floor and the bug-report floor. Every
-    other registered tool is listed by name in the prompt menu appended by
-    :func:`_apply_session_preferences` and loads on demand — nothing is hidden,
-    and ``run_shell`` deliberately stays off the automatic floor.
+    The interactive lane starts with a compact orientation and filesystem
+    bootstrap, the card's seats, and the configured bug-report floor. Remaining
+    tools are discoverable and load their schemas and guidance on demand.
     """
     from services.agent.copilot_mode_tools import (  # noqa: PLC0415
         MAIN_CHAT_DEFAULT_TOOLS,
@@ -2687,10 +2286,16 @@ def _apply_session_preferences(
     allowed: list[str],
     system_prompt: str,
     preferences: Any | None = None,
+    *,
+    include_skills: bool = False,
 ) -> tuple[list[str], str]:
-    """Compose the same derived preference policy for live turns and previews."""
+    """Compose the derived preference policy for the explicit-offline lane.
+
+    The online (OMP) lane never calls this: its system prompt and tool array are
+    session-stable, and per-turn preference guidance rides the user message tail.
+    """
     if role != "general_agent":
-        return allowed, system_prompt
+        return allowed, _append_skills_catalog(system_prompt) if include_skills else system_prompt
     from services.agent.preferences import resolve_turn_preferences
     from services.agent.copilot_mode_tools import apply_mode_tools
     from services.agent.tool_categories import render_tool_menu
@@ -2698,12 +2303,15 @@ def _apply_session_preferences(
     preferences = preferences or resolve_turn_preferences("", task_kind="modelling")
     if preferences.task_list:
         allowed = sorted(set(allowed) | {"task_list"})
-    allowed = apply_mode_tools(preferences.mode, allowed,
-                               preferences=preferences) or []
-    system_prompt = system_prompt.rstrip() + "\n\n" + preferences.prompt_guidance()
+    bootstrap = set(allowed)
+    allowed = [name for name in (apply_mode_tools(
+        preferences.mode, allowed, preferences=preferences) or []) if name in bootstrap]
     menu = render_tool_menu(allowed)
     if menu:
-        system_prompt += "\n\n" + menu
+        system_prompt = system_prompt.rstrip() + "\n\n" + menu
+    if include_skills:
+        system_prompt = _append_skills_catalog(system_prompt)
+    system_prompt = system_prompt.rstrip() + "\n\n" + preferences.prompt_guidance()
     return allowed, system_prompt
 
 
@@ -2767,19 +2375,13 @@ def _tools_render_idents(
     return tuple(out)
 
 
-def _compose_role_prompt(
-    role: str,
-    *,
-    card: Any | None,
-    capability: Any | None,
-    preferences: Any | None,
-) -> tuple[str, list[str], str]:
-    """``(system_prompt, allowed, cache_witness)`` — the one role composition.
+def _role_base_prompt(
+    role: str, *, card: Any | None, capability: Any | None,
+) -> tuple[list[str], str]:
+    """``(allowed, system_prompt)``: main-chat loadout, role prose, capability assembly.
 
-    Role prose (Settings override applied) → capability assembly → session
-    preferences (mode/scope tool policy, preference guidance, MORE TOOLS menu) →
-    skills catalog. ``cache_witness`` is the prompt before the skills catalog,
-    which is exactly what ``prompt_cache.compose`` produces for the offline lane.
+    Everything here is session-stable: the role card, the Settings system-prompt
+    override, the capability tier and the persisted bug-report floor.
     """
     if card is None:
         from services.agent.roles import load_role  # noqa: PLC0415
@@ -2801,27 +2403,42 @@ def _compose_role_prompt(
         )
     except Exception:  # noqa: BLE001
         system_prompt = base_system_prompt
-    # Preferences BEFORE any tool surface is derived from ``allowed``: a dropped
-    # tool must also vanish from the schemas, or the model is shown a tool every
-    # call to which will be refused.
-    allowed, system_prompt = _apply_session_preferences(role, allowed, system_prompt, preferences)
+    return allowed, system_prompt
 
-    # The skills catalog. Role-card prose used to say "full procedure:
-    # skill://assembly-merge" while the only skill:// resolver in the online
-    # model's reach is Chudcode's own, which answers "Unknown skill" for every CAD
-    # pack (live, mission-18d24905b774203f). One line per pack plus the cad_skill
-    # fetch instruction, capped at `skills.SKILL_CATALOG_CHAR_LIMIT` — metadata
-    # only, bodies load on demand.
-    cache_witness = system_prompt
+
+def _append_skills_catalog(system_prompt: str) -> str:
+    # Metadata only; bodies load on demand via cad_skill.
     try:
         from services.agent import skills as _skills  # noqa: PLC0415
 
         _catalog = _skills.catalog_block()
         if _catalog:
-            system_prompt = system_prompt.rstrip() + "\n\n" + _catalog
+            return system_prompt.rstrip() + "\n\n" + _catalog
     except Exception:  # noqa: BLE001 — a broken skills dir never fails a turn
         pass
-    return system_prompt, allowed, cache_witness
+    return system_prompt
+
+
+def _compose_role_prompt(
+    role: str,
+    *,
+    card: Any | None,
+    capability: Any | None,
+    preferences: Any | None,
+) -> tuple[str, list[str], str]:
+    """``(system_prompt, allowed, cache_witness)`` — the explicit-offline composition.
+
+    Role prose → capability assembly → toolbox → skills → preferences.
+    ``cache_witness`` omits skills, matching ``prompt_cache.compose``.
+    """
+    allowed, base = _role_base_prompt(role, card=card, capability=capability)
+    # Resolve policy before rendering tool surfaces. The cache witness uses the
+    # same assembly without the skill catalog as the offline prompt cache.
+    _, witness = _apply_session_preferences(role, allowed, base, preferences)
+    allowed, system_prompt = _apply_session_preferences(
+        role, allowed, base, preferences, include_skills=True,
+    )
+    return system_prompt, allowed, witness
 
 
 def role_prompt(
@@ -2829,22 +2446,32 @@ def role_prompt(
     *,
     card: Any | None = None,
     capability: Any | None = None,
-    preferences: Any | None = None,
 ) -> tuple[str, list[str]]:
-    """``(system_prompt, allowed)`` for one ONLINE (Chudcode) role turn.
+    """``(system_prompt, allowed)`` for one ONLINE (OMP) role turn.
 
     The main chat (``worker_rpc._agent_admin_turn``), delegated roles
-    (``chudcode_roles._assemble_role_runtime``) and the online prompt
+    (``omp_roles._assemble_role_runtime``) and the online prompt
     preview/baseline (``prompt_cache.online_prompt``) all compose here. The
-    system prompt is appended to Chudcode's own; ``allowed`` feeds
-    ``chudcode_tools.build_host_tools``, which hands the tools to Chudcode as
+    system prompt is appended to OMP's own; ``allowed`` feeds
+    ``omp_tools.build_host_tools``, which hands the tools to OMP as
     native host-tool definitions — so no text tools slot is rendered for this
     lane.
+
+    Prefix-cache invariant: both results depend only on session-stable inputs
+    (role card, Settings, capability tier, registry, skills catalog) — never on the
+    request, the Copilot mode or derived preferences — so a relaunched or resumed
+    conversation reproduces the cached system prompt byte for byte. Per-turn policy
+    is appended to the user message instead (``TurnPreferences.turn_notice``)
+    and enforced at dispatch (``omp_tools._turn_policy_refusal``).
     """
-    system_prompt, allowed, _witness = _compose_role_prompt(
-        role, card=card, capability=capability, preferences=preferences
-    )
-    return system_prompt, allowed
+    allowed, system_prompt = _role_base_prompt(role, card=card, capability=capability)
+    if role == "general_agent":
+        from services.agent.tool_categories import render_tool_menu  # noqa: PLC0415
+
+        menu = render_tool_menu(allowed)
+        if menu:
+            system_prompt = system_prompt.rstrip() + "\n\n" + menu
+    return _append_skills_catalog(system_prompt), allowed
 
 
 def linear_role_prompt(
@@ -2977,13 +2604,17 @@ def run_linear_role_turn(
     """Run one bounded explicit-offline legacy role turn.
 
     Online role execution goes through
-    :func:`services.agent.chudcode_roles.run_role_turn`. This local loop remains
+    :func:`services.agent.omp_roles.run_role_turn`. This local loop remains
     only for deterministic/loopback providers after that helper has enforced
     offline safety. It preserves the CAD role card, governed tool scope, ledger,
     events and delegation tree for offline modeling.
     """
     from services.agent import agent_turn as _at
     from services.agent.roles import load_role
+
+    # A caller without an ID still owns a distinct turn. Never sweep the
+    # standalone MCP slot or another anonymous linear turn's pending work.
+    run_id = run_id or f"linear-{uuid.uuid4().hex}"
 
     # Loaded here (not lazily): an unknown role must fail the turn exactly as it
     # always did, and the card is the fallback when the prompt cache cannot
@@ -2995,9 +2626,6 @@ def run_linear_role_turn(
     # so a bare linear turn gets a run-scoped dispatcher of its own.
     if mission_dispatch is None and tool_dispatch is None:
         try:
-            import uuid as _uuid  # noqa: PLC0415
-
-            _rid = run_id or f"linear-{_uuid.uuid4().hex[:8]}"
             # Bind a real delegation tree so `delegate` — which every role card on
             # this path advertises — actually spawns and RUNS a sub-agent instead of
             # returning a refusal. The provider is already bound below, which is the
@@ -3010,12 +2638,12 @@ def run_linear_role_turn(
                 )
 
                 tree = _DelegationTree(
-                    run_id=_rid, ledger=ledger, tier=tier, on_event=on_event
+                    run_id=run_id, ledger=ledger, tier=tier, on_event=on_event
                 )
             except Exception:  # noqa: BLE001 — degrade to the old no-delegation turn
                 tree = None
             mission_dispatch = MissionDispatch(
-                run_id=_rid,
+                run_id=run_id,
                 ledger=ledger,
                 provider=provider,
                 on_event=on_event,
@@ -3038,16 +2666,38 @@ def run_linear_role_turn(
     # Role prose, allowlist and the tool-schema slot: served from the
     # fingerprinted prompt cache when it renders these exact bytes, composed
     # live (and memoized) when the mission-scoped meta tools make it not.
+    #
+    # The preferences feeding the SYSTEM PROMPT and the tool list are resolved
+    # from an EMPTY prompt: they must not depend on this turn's request text, or
+    # the prefix a local server cached for the conversation changes whenever the
+    # user words a request differently. What the request itself changes (an
+    # explicit ask to delegate) is told to the model at the tail of the user
+    # message instead.
     from services.agent.preferences import resolve_turn_preferences
 
+    stable_preferences = resolve_turn_preferences("", task_kind="modelling", headless=True)
     system_prompt, allowed, tools_text = linear_role_prompt(
         role,
         resolver=_at.resolver_for(mission_dispatch),
         card=card,
         capability=capability,
         tier=tier or getattr(mission_dispatch, "tier", None),
-        preferences=resolve_turn_preferences(request, task_kind="modelling", headless=True),
+        preferences=stable_preferences,
     )
+    run_options = options
+    request_preferences = resolve_turn_preferences(
+        request, task_kind="modelling", headless=True
+    )
+    if request_preferences.delegation_depth > stable_preferences.delegation_depth:
+        run_options = {
+            **(options or {}),
+            "turn_notice": (
+                "[turn policy] The user asked for delegation this turn "
+                f"(depth limit {request_preferences.delegation_depth}). Use "
+                "`delegate` for independent sub-tasks; if it is not in your tool "
+                "list, call enable_tools(categories=['delegate']) first."
+            ),
+        }
     explicit_allowed = isinstance(options, dict) and "allowed_tools" in options
     if explicit_allowed:
         raw_allowed = options.get("allowed_tools")
@@ -3072,23 +2722,10 @@ def run_linear_role_turn(
             except Exception:  # noqa: BLE001
                 tools_text = None
 
-    # The process-global org MCP closures need the same run-scoped provider and
-    # ledger that agent_turn receives. Bind only for the duration of this turn;
-    # outside it council_convene must remain an honest no_mission_context refusal.
-    from types import SimpleNamespace as _SimpleNamespace  # noqa: PLC0415
-    from services.mcp import org_tools as _org_tools  # noqa: PLC0415
-
-    _org_tools.bind_mission_context(
-        _SimpleNamespace(
-            provider=provider,
-            ledger=ledger,
-            dissents_registry=getattr(mission_dispatch, "dissents_registry", None),
-            stage=getattr(mission_dispatch, "phase", None),
-            tier=tier or getattr(mission_dispatch, "tier", None),
-            providers=getattr(mission_dispatch, "providers", None),
-            org_state=getattr(mission_dispatch, "org_state", None),
-        )
-    )
+    from services.mcp import core_bridge as _core_bridge  # noqa: PLC0415
+    _doc_scope_token = _core_bridge.CURRENT_AGENT.set((run_id, role))
+    from services.mcp import tool_registry as _tool_registry  # noqa: PLC0415
+    _policy_token = _tool_registry.bind_run_policy()
     try:
         result = _at.run_turn(
             request,
@@ -3120,7 +2757,7 @@ def run_linear_role_turn(
             ),
             capability=capability,
             tier=tier or getattr(mission_dispatch, "tier", None),
-            options=options,
+            options=run_options,
             history=history,
             attachments=attachments,
             # The interactive lane's allow-set is an on-ramp, not a scope: the model
@@ -3131,7 +2768,8 @@ def run_linear_role_turn(
             auto_enable_packs=(role == "general_agent" and not explicit_allowed),
         )
     finally:
-        _org_tools.bind_mission_context(None)
+        _tool_registry.release_run_policy(_policy_token)
+        _core_bridge.CURRENT_AGENT.reset(_doc_scope_token)
     # TERMINAL SAVE SWEEP. Nothing closes the documents a run builds (the Python
     # loop._terminal_autosave_close_docs was removed; the C++ mission path only doc_saves the doc a
     # DAG node is on), so an agent doc with no real backing file sat abandoned until the
@@ -3141,17 +2779,16 @@ def run_linear_role_turn(
     # Saving, not closing: a close would fan out doc.closed and destroy the GUI mirror
     # tab the user browses after the run, which is the very reason agent-origin docs get
     # the long GC floor. Saved + clean means hostd just closes them, leaving nothing to
-    # recover. Scoped to docs this worker built (never origin_kind=gui). With no
-    # project save dir it is a benign skip only when no authored docs are pending;
-    # otherwise save_touched_docs returns persistence_failure and delivery is partial.
+    # recover. Sweep only this run's mutations in its workspace.
     _swept: dict[str, Any] = {"saved": [], "errors": []}
     try:
         from services.mcp.cad_common import save_touched_docs  # noqa: PLC0415
 
-        _swept = save_touched_docs()
+        _swept = save_touched_docs(run_id=run_id)
         if (
             _swept.get("saved")
             or _swept.get("errors")
+            or _swept.get("warnings")
             or _swept.get("persistence_failure")
         ) and ledger is not None:
             try:
@@ -3162,6 +2799,7 @@ def run_linear_role_turn(
                         "run_id": run_id,
                         "saved": _swept.get("saved") or [],
                         "errors": _swept.get("errors") or [],
+                        "warnings": _swept.get("warnings") or [],
                         "persistence_failure": _swept.get("persistence_failure"),
                     },
                 )
@@ -3190,11 +2828,10 @@ def run_linear_role_turn(
     except Exception:  # noqa: BLE001
         pass
     # Handoff synthesis — the same rescue _run_subagent applies at its join.
-    # This is the UNIVERSAL top-level entry (every online run lands here via
-    # worker_rpc.agent_admin_turn), yet it returned run_turn's raw result: on a
-    # turn that did real tool work but emitted no formal envelope, the caller
-    # got a payload with no "handoff" key at all and had to treat a productive
-    # run as a blank failure.
+    # This explicit-offline entry returned run_turn's raw result: on a turn that
+    # did real tool work but emitted no formal envelope, the caller got a payload
+    # with no "handoff" key at all and had to treat a productive run as a blank
+    # failure. (Online turns run through OMP: omp_roles.run_role_turn.)
     res_dict = result.result if isinstance(result.result, dict) else {}
     handoff = res_dict.get("handoff")
     if not isinstance(handoff, dict) or not handoff:
@@ -3222,46 +2859,35 @@ def run_linear_role_turn(
                     ),
                 },
             }
-    persistence_errors = list(_swept.get("errors") or [])
-    persistence_failure = _swept.get("persistence_failure")
-    if isinstance(persistence_failure, dict):
-        failure_reason = str(
-            persistence_failure.get("reason") or "document_persistence_failed"
-        )
-        if failure_reason not in persistence_errors:
-            persistence_errors.append(failure_reason)
-    if persistence_errors:
-        # Saving is part of delivery, not best-effort decoration. Preserve the
-        # completed work and handoff, but never tell the user it is safely done.
+    try:
+        from services.mcp.cad_common import persistence_warning
+        persistence_warnings, notice = persistence_warning(_swept)
+    except Exception as exc:  # noqa: BLE001 — reporting cannot replace the turn outcome
+        persistence_warnings = [f"could not assess document persistence: {exc}"]
+        notice = ("\n\n**Save warning:** " + persistence_warnings[0] +
+                  ". Check the project files and Recover unsaved parts.")
+    if persistence_warnings:
         res_dict = dict(res_dict)
+        res_dict["persistence_warning"] = notice
         current_handoff = res_dict.get("handoff")
-        partial_handoff = (
-            dict(current_handoff) if isinstance(current_handoff, dict) else {}
-        )
-        partial_handoff["status"] = "partial"
-        outputs = partial_handoff.get("outputs")
-        outputs = dict(outputs) if isinstance(outputs, dict) else {}
-        outputs["persistence"] = {
-            "saved": list(_swept.get("saved") or []),
-            "errors": persistence_errors,
-        }
-        partial_handoff["outputs"] = outputs
-        if not partial_handoff.get("summary"):
-            partial_handoff["summary"] = (
-                "Work completed, but touched documents were not saved."
-            )
-        res_dict["handoff"] = partial_handoff
-        res_dict["error_detail"] = (
-            "Document persistence failed: " + "; ".join(persistence_errors)
-        )[:300]
-        result_success = False
-        result_stop_reason = "persistence_failed"
-    else:
-        result_success = result.success
-        result_stop_reason = result.stop_reason
+        if isinstance(current_handoff, dict):
+            handoff = dict(current_handoff)
+            outputs = handoff.get("outputs")
+            outputs = dict(outputs) if isinstance(outputs, dict) else {}
+            outputs["persistence"] = {"saved": list(_swept.get("saved") or []),
+                                      "warnings": persistence_warnings}
+            handoff["outputs"] = outputs
+            handoff["summary"] = str(handoff.get("summary") or "") + notice
+            res_dict["handoff"] = handoff
+        try:
+            from services.agent.agent_events import emit_event
+            emit_event("assistant_delta", {"channel": "output", "text": notice,
+                                         "run_id": run_id}, live=on_event, journal=None)
+        except Exception:  # noqa: BLE001
+            pass
     return {
-        "success": result_success,
-        "stop_reason": result_stop_reason,
+        "success": result.success,
+        "stop_reason": result.stop_reason,
         "result": res_dict or result.result,
         "role": role,
         "allowed_tools": allowed,

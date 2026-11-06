@@ -6,19 +6,14 @@ Bootstrap auto-registers all adapters:
   domain: structural_sections, piping_fittings, hydraulic_components,
           ecad_kicad (indexable)
 
-Live-vendor fallback: when the local FTS index returns no results for a
-query, any registered live-only provider (iter_records raises NotImplementedError)
-is queried directly. Results from live providers carry source:"live" and are
-NEVER indexed.
+Live-vendor fallback: weak local coverage, or an explicit request, queries
+registered live-only providers. The synchronous fan-out defaults to a 15-second
+wall budget (CHUDWARE_PARTS_LIVE_BUDGET_S) and returns partial hits with timeout
+notices. Live results carry source:"live" and are never indexed.
 
-Provider-overlap deduplication (contract-additive):
-  For standard threaded hardware (fasteners / bearings / nuts / washers), the
-  BoltsAdapter (domain="fastener") and CoreFamiliesAdapter (domain="mech_family")
-  both emit records for the same designation (e.g. "M8").  After ranking, the hub:
-  1. Groups records with the same normalised designation across these two domains.
-  2. Keeps both, but promotes fastener > mech_family (canonical row first).
-  3. Injects a ``related_ids`` additive field (list[str]) on each record pointing
-     to its sibling(s).  Contract-additive per contracts/parts.md §0.
+Provider-overlap annotation links records only when domain, standard and
+designation identify the same part. A shared nominal size alone is not proof
+of physical equivalence.
 """
 from __future__ import annotations
 
@@ -30,16 +25,23 @@ import threading
 import time
 from pathlib import Path
 from typing import Iterator
-from contextvars import copy_context
+from contextvars import ContextVar, copy_context
 from services.agent.request_context import owner_key
 
 from .registry import ProviderRegistry
 from .index import PartsIndex
+from .search_relevance import live_relevant, score_record
 
 log = logging.getLogger(__name__)
 
 _LIVE_THREADS: dict[threading.Thread, tuple[str, str] | None] = {}
 _LIVE_LOCK = threading.Lock()
+
+# Share the GUI's browser-fetch cap with synchronous agent searches. Public
+# Printables API calls do not occupy a browser slot.
+_LIVE_FETCH_CONCURRENCY = 3
+_live_fetch_slots = threading.BoundedSemaphore(_LIVE_FETCH_CONCURRENCY)
+_live_slot_held: ContextVar[bool] = ContextVar("parts_live_slot_held", default=False)
 
 
 def worker_activity() -> dict:
@@ -56,14 +58,14 @@ def worker_activity() -> dict:
 # Overall wall-clock budget for the synchronous live-vendor fan-out (seconds).
 # Override with CHUDWARE_PARTS_LIVE_BUDGET_S. Per-site budget defaults to the same
 # value (CHUDWARE_PARTS_LIVE_SITE_BUDGET_S) so one stall cannot dominate the call.
-_DEFAULT_LIVE_BUDGET_S = 4.0
+_DEFAULT_LIVE_BUDGET_S = 15.0
 
 # ── Persistent index cache ───────────────────────────────────────────────────
 
 # Bumped BY HAND whenever adapter code changes the shape/content of emitted
 # PartRecords. It is mixed into the fingerprint, so bumping it invalidates every
 # user's on-disk snapshot without touching their data files.
-_INDEX_CODE_VERSION = 2
+_INDEX_CODE_VERSION = 8
 
 # Default seconds between cheap stat-only revalidations during search().
 _DEFAULT_REVALIDATE_S = 20.0
@@ -89,6 +91,7 @@ class PartsHub:
         # Optional peer package diagnostic (browser adapters). Local FTS still
         # works when this is set; never silent-swallow on the public status API.
         self.browser_bootstrap_error: str | None = None
+        self._diagnostics: list[dict] = []
 
     # ------------------------------------------------------------------
     # Setup
@@ -155,9 +158,13 @@ class PartsHub:
             from services.browser.adapters import all_adapters
             from services.browser.adapters.parts_provider import BrowserCatalogAdapter
 
+            errors = []
             for adapter in all_adapters():
-                self.register(BrowserCatalogAdapter(adapter))
-            self.browser_bootstrap_error = None
+                try:
+                    self.register(BrowserCatalogAdapter(adapter))
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"{getattr(adapter, 'key', type(adapter).__name__)}: {exc}")
+            self.browser_bootstrap_error = "; ".join(errors) or None
         except Exception as exc:  # noqa: BLE001 — optional integration, never fatal at bootstrap
             self.browser_bootstrap_error = f"{type(exc).__name__}: {exc}"
 
@@ -182,8 +189,15 @@ class PartsHub:
         self._index_building = True
         try:
             fingerprint = self._provider_fingerprint()
+            previous_fingerprint = self._index_fingerprint
             self._index_fingerprint = fingerprint
+            self._diagnostics = []
             self._last_revalidate = time.monotonic()
+            if force or (previous_fingerprint and previous_fingerprint != fingerprint):
+                for provider in self._registry.iter_indexable():
+                    invalidate = getattr(provider, "invalidate_cache", None)
+                    if callable(invalidate):
+                        invalidate()
             if not force and fingerprint and self._index.load_if_fresh(fingerprint):
                 self._index_built = True
                 self._index_source = "cache"
@@ -191,7 +205,8 @@ class PartsHub:
             count = self._index.rebuild(self._iter_all_records())
             self._index_built = True
             self._index_source = "fresh"
-            self._index.persist(fingerprint)
+            if not self._diagnostics:
+                self._index.persist(fingerprint)
             return count
         finally:
             self._index_building = False
@@ -230,6 +245,10 @@ class PartsHub:
                 cls = type(provider)
                 pid = f"{cls.__module__}.{cls.__qualname__}"
             h.update(f"p={pid}\n".encode("utf-8", "replace"))
+            paths = getattr(provider, "fingerprint_paths", None)
+            if callable(paths):
+                for path in paths():
+                    _hash_stat(h, f"{pid}/{path}", path)
         for label, path in _fingerprint_sources():
             _hash_stat(h, label, path)
         count, max_mtime_ns, total_size, partial = _library_walk_signature(
@@ -267,6 +286,15 @@ class PartsHub:
             return
         self.revalidate()
 
+    def _provider_error(self, provider: object, operation: str, exc: Exception) -> None:
+        diagnostic = {
+            "provider": str(getattr(provider, "provider_id", type(provider).__name__)),
+            "operation": operation, "error": f"{type(exc).__name__}: {exc}",
+        }
+        if diagnostic not in self._diagnostics:
+            self._diagnostics.append(diagnostic)
+            log.warning("parts provider %s failed: %s", operation, diagnostic)
+
     def index_status(self) -> dict:
         """Snapshot of index state for the ``parts_index_status`` RPC.
 
@@ -278,7 +306,13 @@ class PartsHub:
             "building": bool(self._index_building),
             "count": int(self._index.record_count),
             "source": self._index_source,
+            "native_ecad_available": any(
+                getattr(provider, "provider_id", None) == "ecad_kicad"
+                for provider in self._registry.get_by_domain("ecad")),
             "age_s": round(max(0.0, time.time() - built_at), 3) if built_at else 0.0,
+            "diagnostics": ([{"provider": "browser", "operation": "registration",
+                              "error": self.browser_bootstrap_error}]
+                            if self.browser_bootstrap_error else []) + list(self._diagnostics),
         }
 
     def _iter_all_records(self) -> Iterator[dict]:
@@ -286,8 +320,10 @@ class PartsHub:
         for provider in self._registry.iter_indexable():
             try:
                 yield from provider.iter_records()
-            except Exception:  # noqa: BLE001 — one bad provider must not break others
-                pass
+            except NotImplementedError:
+                continue  # Live-only providers intentionally cannot be enumerated.
+            except Exception as exc:  # noqa: BLE001 — keep other providers searchable
+                self._provider_error(provider, "enumeration", exc)
 
     # ------------------------------------------------------------------
     # Search + get
@@ -298,7 +334,8 @@ class PartsHub:
                filters: dict | None = None,
                limit: int = 20,
                sites: list[str] | None = None,
-               include_live: bool = True) -> list[dict]:
+               include_live: bool = True,
+               force_live: bool = False) -> list[dict]:
         """Full-text search. Returns ranked PartRecord dicts.
 
         ``domain`` accepts a single domain string or a list of domains
@@ -310,25 +347,24 @@ class PartsHub:
         category (contracts/parts.md §6.3) — an electronics search never touches
         McMaster or a metals house, a metals search never touches DigiKey — so a
         query only ever spends a fetch against a vendor that could plausibly
-        stock it. ``None`` preserves the prior behavior (all matching providers).
+        stock it. ``None`` selects all matching providers; ``[]`` selects none.
 
-        Primary: FTS5 index over all indexable providers.
+        Primary: FTS5 index over indexable providers, merged with live local
+        KiCad library search (including project libraries).
         Fallback: local hits are checked against ``PartsIndex.term_coverage()``
-        (Contract: cheap, never raises). Local is WEAK when a meaningful
-        fraction of the query's term-groups matched nothing in the corpus, or
-        when the local hit count falls well short of ``limit`` — the proven
-        failure mode where a query like "stepper nema 17" gets zero real
-        matches on "stepper"/"nema" but the lone token "17" coincidentally
-        matches bearing designations, and its BM25 rarity makes those junk
-        rows outrank everything. When local is weak AND ``include_live`` is
+        (Contract: cheap, never raises). Local is weak when no results exist or
+        a query term-group matched nothing in the corpus. If coverage is
+        unavailable, a small hit count is used as a fallback signal. A query
+        like "stepper nema 17" can otherwise match bearings on the lone "17"
+        while missing "stepper" and "nema". When local is weak AND ``include_live`` is
         true, the live vendor fan-out still runs and its results are MERGED
         with local (never gated behind an early return) — see
-        ``_merge_local_live``. Strong local (full term coverage, plentiful
-        hits) returns immediately with no live probe, matching prior
-        behavior and latency. Live results carry source:"live" and are NEVER
-        indexed. Timed-out sites surface as notice stubs (no part_id/title)
-        so callers can render honest per-site timeout notices.
-        ``include_live=False`` does ZERO network, unconditionally.
+        ``_merge_local_live``. Strong local results normally skip the live probe.
+        ``force_live=True`` explicitly requests it even when local coverage is
+        strong. Local and live results are ranked together without a reserved
+        live quota. Live results carry source:"live" and are never indexed.
+        Timed-out sites surface as notices. ``include_live=False`` does zero
+        network, unconditionally.
 
         A stat-only revalidation runs at most every
         ``CHUDWARE_PARTS_REVALIDATE_S`` seconds (default 20, 0 disables) so a
@@ -337,21 +373,42 @@ class PartsHub:
         """
         self._maybe_revalidate()
         self._ensure_index()
-        results = self._index.search(query, domain=domain, limit=limit)
+        # Two equivalent indexed providers may contribute the same native recipe.
+        # Fetch enough candidates to collapse pairs without shortening the page.
+        candidate_limit = max(1, limit * 2)
+        results = self._index.search(query, domain=domain, limit=candidate_limit)
+        domains = ([domain] if domain else []) if isinstance(domain, str) else list(domain or [])
+        # An unscoped empty browse uses the prebuilt index. A native empty search
+        # can parse the entire installed KiCad corpus synchronously.
+        if "ecad" in domains or (not domains and query.strip()):
+            for provider in self._registry.get_by_domain("ecad"):
+                if getattr(provider, "provider_id", None) != "ecad_kicad":
+                    continue
+                try:
+                    kicad = provider.search(query, domain="ecad", filters=filters,
+                                            limit=candidate_limit)
+                except Exception as exc:  # noqa: BLE001 — the FTS index is still usable
+                    if filters and filters.get("doc_id"):
+                        raise
+                    self._provider_error(provider, "search", exc)
+                    continue
+                results = _merge_kicad_results(results, kicad, query, candidate_limit,
+                                               ecad_only=bool(domains) and set(domains) == {"ecad"})
         if results:
-            results = _dedupe_related(results)
+            results = _dedupe_related(_merge_native_duplicates(results))
+            results.sort(key=lambda rec: score_record(rec, query), reverse=True)
+        local_page = results[:limit]
         # Local-first phase: the caller wants only the instant FTS layer and will
-        # fan out to live vendors separately (Parts Library streaming search). Skip
-        # the synchronous browser fan-out so the local call returns immediately.
+        # fan out to live vendors separately (Parts Library streaming search).
         if not include_live:
-            return results
-        if not self._local_is_weak(query, results, limit):
-            return results
+            return local_page
+        if not force_live and not self._local_is_weak(query, local_page, limit):
+            return local_page
         live = self._search_live(query, domain=domain, filters=filters,
                                  limit=limit, sites=sites)
         if not live:
-            return results
-        return _merge_local_live(results, live, limit)
+            return local_page
+        return _merge_local_live(results, live, limit, query=query)
 
     def _local_is_weak(self, query: str, results: list[dict], limit: int) -> bool:
         """Weak-local test gating the live fan-out merge (Contract §Recall).
@@ -363,11 +420,9 @@ class PartsHub:
 
         A FULL-coverage query is never weak, however few rows it returns. An
         exact designation ("608zz", "as568-014 viton") legitimately matches a
-        handful of parts, and treating a small-but-precise answer as weak used
-        to spend a whole vendor fan-out re-deriving a result already sitting at
-        rank 1. The shortfall rule therefore only applies while coverage is
-        already incomplete. Cheap by contract — never raises, never touches the
-        network.
+        handful of parts. When no usable coverage signal exists, the hit-count
+        heuristic is used instead. Cheap by contract — never raises, never
+        touches the network.
         """
         if not results:
             return True
@@ -388,159 +443,246 @@ class PartsHub:
                      sites: list[str] | None) -> list[dict]:
         """Concurrent, deadline-bounded live-vendor fan-out.
 
-        Returns partial hits plus timeout/login notice stubs. Never blocks past
-        the overall wall budget even if a provider stalls. Workers are daemon
-        threads so a stall cannot keep the process (or pytest) alive after
-        return.
+        Provider discovery and worker startup count against the wall budget.
+        Return completed hits and per-site notices without waiting for a stalled
+        provider; daemon workers cannot keep the process alive after return.
         """
+        budget = _live_site_budget_s(_live_budget_s())
+        deadline = time.monotonic() + budget
         domains = [domain] if isinstance(domain, str) else list(domain or [])
-        site_allow = set(sites) if sites else None
-        providers: list[object] = []
+        site_allow = set(sites) if sites is not None else None
+        if site_allow is not None and not site_allow:
+            return []
+
+        candidates: list[tuple[object, str, bool]] = []
         for provider in self._registry.providers():
-            if not _is_live_only(provider):
-                continue
             pdomain = getattr(provider, "domain", None)
             if domains and pdomain and pdomain not in domains:
                 continue
-            if site_allow is not None:
-                psite = getattr(provider, "site", None)
-                if psite is not None and psite not in site_allow:
-                    continue
+            psite = getattr(provider, "site", None)
+            if site_allow is not None and psite not in site_allow:
+                continue
             if callable(getattr(provider, "search", None)):
-                providers.append(provider)
-        if not providers:
+                site = str(psite or getattr(provider, "provider_id", "unknown") or "unknown")
+                candidates.append((provider, site, bool(psite)))
+        if not candidates:
             return []
-
-        budget = _live_budget_s()
-        if budget <= 0:
-            return []
+        if sites is not None:
+            order = {site: index for index, site in enumerate(sites)}
+            candidates.sort(key=lambda item: order.get(item[1], len(order)))
 
         out_q: queue.Queue = queue.Queue()
+        search_owner = owner_key()
 
-        def _worker(provider: object) -> None:
-            site = str(getattr(provider, "site", None)
-                       or getattr(provider, "provider_id", "unknown")
-                       or "unknown")
+        def _start(thread: threading.Thread) -> None:
+            with _LIVE_LOCK:
+                for finished_thread in list(_LIVE_THREADS):
+                    if finished_thread.ident is not None and not finished_thread.is_alive():
+                        _LIVE_THREADS.pop(finished_thread)
+                _LIVE_THREADS[thread] = search_owner
             try:
+                thread.start()
+            except BaseException:
+                with _LIVE_LOCK:
+                    _LIVE_THREADS.pop(thread, None)
+                raise
+
+        def _worker(index: int, provider: object) -> None:
+            # A queued request never starts after its search's deadline.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            use_slot = candidates[index][1] != "printables" and not _live_slot_held.get()
+            acquired = False
+            try:
+                if use_slot:
+                    acquired = _live_fetch_slots.acquire(timeout=remaining)
+                    if not acquired or time.monotonic() >= deadline:
+                        return
                 hits = provider.search(  # type: ignore[attr-defined]
                     query, domain=domain, filters=filters)
                 if not isinstance(hits, list):
-                    out_q.put((site, [], f"search returned {type(hits).__name__}"))
+                    out_q.put(("done", index, [], f"search returned {type(hits).__name__}"))
                 else:
-                    out_q.put((site, hits, None))
+                    out_q.put(("done", index, hits, None))
             except Exception as exc:  # noqa: BLE001
-                out_q.put((site, [], str(exc) or type(exc).__name__))
+                out_q.put(("done", index, [], str(exc) or type(exc).__name__))
+            finally:
+                if acquired:
+                    _live_fetch_slots.release()
 
-        threads: list[threading.Thread] = []
-        for p in providers:
-            site = str(getattr(p, "site", None)
-                       or getattr(p, "provider_id", "x") or "x")
+        def _launch() -> None:
+            # Classify providers and start the same one-worker-per-live-provider
+            # fan-out as before. Keeping this off the caller thread also bounds
+            # a slow count()/iter_records() probe or worker startup.
+            for index, (provider, site, _) in enumerate(candidates):
+                if time.monotonic() >= deadline:
+                    return
+                try:
+                    is_live = _is_live_only(provider)
+                except Exception as exc:  # noqa: BLE001
+                    out_q.put(("done", index, [], str(exc) or type(exc).__name__))
+                    continue
+                if not is_live:
+                    out_q.put(("skip", index, [], None))
+                    continue
+                out_q.put(("live", index, [], None))
+                if time.monotonic() >= deadline:
+                    return
+                context = copy_context()
+                thread = threading.Thread(
+                    target=context.run, args=(_worker, index, provider),
+                    name=f"parts-live-{site}", daemon=True,
+                )
+                try:
+                    _start(thread)
+                except Exception as exc:  # noqa: BLE001
+                    out_q.put(("done", index, [], str(exc) or type(exc).__name__))
+
+        if time.monotonic() < deadline:
             context = copy_context()
-            t = threading.Thread(
-                target=context.run, args=(_worker, p),
-                name=f"parts-live-{site}",
-                daemon=True,
-            )
-            threads.append(t)
-            with _LIVE_LOCK:
-                for finished in list(_LIVE_THREADS):
-                    if finished.ident is not None and not finished.is_alive():
-                        _LIVE_THREADS.pop(finished)
-                _LIVE_THREADS[t] = owner_key()
-            try:
-                t.start()
-            except BaseException:
-                with _LIVE_LOCK:
-                    _LIVE_THREADS.pop(t, None)
-                raise
+            launcher = threading.Thread(target=context.run, args=(_launch,),
+                                        name="parts-live-launch", daemon=True)
+            _start(launcher)
 
-        deadline = time.monotonic() + budget
         live_results: list[dict] = []
-        finished_sites: set[str] = set()
-        n = len(threads)
-        finished = 0
-        while finished < n:
+        completed: set[int] = set()
+        confirmed_live: set[int] = set()
+
+        def _collect(message: tuple) -> None:
+            kind, index, hits, err = message
+            if kind == "live":
+                confirmed_live.add(index)
+                return
+            completed.add(index)
+            if kind == "skip":
+                return
+            if err:
+                reason = err if err in (
+                    "login_required", "no_profile", "unavailable", "timeout",
+                    "challenge_page", "blocked", "captcha", "transport_failed",
+                    "parse_failed", "policy_refused", "unsupported", "terms_required",
+                    "rate_limited", "not_found", "credentials_required", "internal_error",
+                ) else "internal_error"
+                live_results.append({
+                    "site": candidates[index][1],
+                    "reason": reason,
+                    "hint": err if reason == "internal_error" else "",
+                })
+            else:
+                live_results.extend(hits)
+
+        while len(completed) < len(candidates):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             try:
-                site, hits, err = out_q.get(timeout=remaining)
+                _collect(out_q.get(timeout=remaining))
             except queue.Empty:
                 break
-            finished += 1
-            finished_sites.add(site)
-            if err:
-                reason = err if err in (
-                    "login_required", "no_profile", "unavailable",
-                    "timeout", "challenge_page",
-                ) else "error"
-                live_results.append({
-                    "site": site,
-                    "reason": reason,
-                    "hint": err if reason == "error" else "",
-                })
-            else:
-                live_results.extend(hits)
-            if len([r for r in live_results
-                    if r.get("part_id") and r.get("title")]) >= limit:
-                break
 
-        # Non-blocking drain: anything that finished in the last moment of the
-        # budget still contributes (avoids false timeouts on race-at-deadline).
+        # Include outcomes queued at the deadline without waiting for late work.
         while True:
             try:
-                site, hits, err = out_q.get_nowait()
+                _collect(out_q.get_nowait())
             except queue.Empty:
                 break
-            finished_sites.add(site)
-            if err:
-                reason = err if err in (
-                    "login_required", "no_profile", "unavailable",
-                    "timeout", "challenge_page",
-                ) else "error"
-                live_results.append({
-                    "site": site,
-                    "reason": reason,
-                    "hint": err if reason == "error" else "",
-                })
-            else:
-                live_results.extend(hits)
 
-        # Still-running (or never-drained) providers → honest timeout notices.
-        for p in providers:
-            site = str(getattr(p, "site", None)
-                       or getattr(p, "provider_id", "unknown")
-                       or "unknown")
-            if site in finished_sites:
+        timed_out_sites: set[str] = set()
+        for index, (_, site, has_site) in enumerate(candidates):
+            if (index in completed or site in timed_out_sites
+                    or (index not in confirmed_live and not has_site)):
                 continue
+            timed_out_sites.add(site)
             live_results.append({
                 "site": site,
                 "reason": "timeout",
-                "hint": (f"live vendor '{site}' exceeded "
-                         f"{budget:g}s budget (CHUDWARE_PARTS_LIVE_BUDGET_S)"),
+                "hint": (f"live vendor '{site}' did not complete discovery or search "
+                         f"within the {budget:g}s live site budget"),
             })
-        real = [r for r in live_results
-                if r.get("part_id") and str(r.get("title") or "").strip()]
-        notices = [r for r in live_results if r not in real]
+
+        real: list[dict] = []
+        notices: list[dict] = []
+        for rec in live_results:
+            if rec.get("part_id") and str(rec.get("title") or "").strip():
+                if live_relevant(rec, query):
+                    real.append(rec)
+            else:
+                notices.append(rec)
+        real.sort(key=lambda rec: score_record(rec, query), reverse=True)
         return real[:limit] + notices
 
-    def get(self, part_id: str) -> dict | None:
-        """Retrieve a PartRecord by part_id. Returns None if not found."""
+    def get(self, part_id: str, *, include_live: bool = True) -> dict | None:
+        """Retrieve a PartRecord, including local KiCad libraries when offline."""
         self._ensure_index()
-        # Try the index first.
+        local_kicad = [p for p in self._registry.get_by_domain("ecad")
+                       if getattr(p, "provider_id", None) == "ecad_kicad"]
+        # Native KiCad must beat an indexed starter entry of the same ID, and
+        # local/project libraries must also be reachable with include_live=False.
+        for provider in local_kicad:
+            try:
+                rec = provider.get(part_id)
+                if rec is not None:
+                    return rec
+            except Exception as exc:  # noqa: BLE001
+                self._provider_error(provider, "lookup", exc)
         rec = self._index.get(part_id)
-        if rec is not None:
+        if rec is not None or not include_live:
             return rec
-        # Fall back to individual providers (handles non-indexable live providers).
         for provider in self._registry.providers():
+            if provider in local_kicad:
+                continue
             if callable(getattr(provider, "get", None)):
                 try:
                     rec = provider.get(part_id)
                     if rec is not None:
                         return rec
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    self._provider_error(provider, "lookup", exc)
         return None
+
+
+def _merge_kicad_results(indexed: list[dict], native: list[dict], query: str,
+                         limit: int, *, ecad_only: bool) -> list[dict]:
+    """Prefer current KiCad rows without starving unrelated indexed domains."""
+    native_by_id = {r["part_id"]: r for r in native if r.get("part_id")}
+    indexed = [native_by_id.get(r.get("part_id"), r) for r in indexed]
+    seen = {r.get("part_id") for r in indexed}
+    additions = [r for r in native if r.get("part_id") and r["part_id"] not in seen]
+    if ecad_only:
+        merged = list(native)
+        seen = {r.get("part_id") for r in merged}
+        merged.extend(r for r in indexed if r.get("part_id") not in seen)
+        if not str(query or "").strip():
+            merged.sort(key=lambda rec: str(rec.get("part_id") or ""))
+        return merged[:limit]
+    if not additions:
+        return indexed[:limit]
+    if not str(query or "").strip():
+        additions.sort(key=lambda rec: str(rec.get("part_id") or ""))
+        merged = []
+        extra = iter(additions)
+        for i, rec in enumerate(indexed):
+            merged.append(rec)
+            if i % 5 == 4:
+                addition = next(extra, None)
+                if addition is not None:
+                    merged.append(addition)
+            if len(merged) >= limit:
+                return merged[:limit]
+        merged.extend(extra)
+        return merged[:limit]
+    exact = str(query or "").strip().casefold()
+    exact_additions = [r for r in additions
+                       if exact and exact in (str(r.get("designation") or "").casefold(),
+                                              str(r.get("part_id") or "").casefold())]
+    other_additions = [r for r in additions if r not in exact_additions]
+    # Keep the best existing cross-domain result ahead of non-exact KiCad hits.
+    if not indexed:
+        return (exact_additions + other_additions)[:limit]
+    quota = max(0, max(1, limit // 4) - len(exact_additions))
+    return (exact_additions + indexed[:1] + other_additions[:quota]
+            + indexed[1:] + other_additions[quota:])[:limit]
 
 
 # ── Live fan-out budgets ─────────────────────────────────────────────────────
@@ -732,14 +874,67 @@ _DOMAIN_PRIORITY: dict[str, int] = {
 
 
 def _normalise_desig(desig: str | None) -> str:
-    """Canonical form for same-designation grouping (strip spaces, upper-case)."""
+    """Canonical form for standards and designations (strip spaces, upper-case)."""
     if not desig:
         return ""
     return desig.replace(" ", "").upper()
 
+def _merge_native_duplicates(results: list[dict]) -> list[dict]:
+    """Collapse catalog/core rows only when they describe the same native recipe."""
+    groups: dict[tuple[str, str], dict[str, list[tuple[int, dict]]]] = {}
+    for index, rec in enumerate(results):
+        domain = rec.get("domain")
+        ref = rec.get("geometry_ref") or {}
+        if domain not in _OVERLAP_DOMAINS or ref.get("kind") != "core_family":
+            continue
+        family, size = str(ref.get("family") or ""), str(ref.get("size") or "")
+        if not family or not size:
+            continue
+        group = groups.setdefault((family.casefold(), size.casefold()), {"catalog": [], "core": []})
+        group["core" if domain == "mech_family" else "catalog"].append((index, rec))
+
+    removed: set[int] = set()
+    replacements: dict[int, dict] = {}
+    for group in groups.values():
+        for core_index, core in group["core"]:
+            for catalog_index, catalog in group["catalog"]:
+                if catalog_index in removed or core_index in removed:
+                    continue
+                if (catalog.get("insert_params") or {}) != (core.get("insert_params") or {}):
+                    continue
+                cat_std = "".join(c for c in str(catalog.get("standard") or "").casefold() if c.isalnum())
+                core_std = "".join(c for c in str(core.get("standard") or "").casefold() if c.isalnum())
+                if cat_std and core_std and cat_std not in core_std:
+                    continue
+                cat_params, core_params = catalog.get("params") or {}, core.get("params") or {}
+                if (cat_params.get("material") and core_params.get("material") and
+                        cat_params["material"] != core_params["material"]):
+                    continue
+                merged = dict(catalog)
+                merged["geometry_ref"] = {**catalog["geometry_ref"], **core["geometry_ref"]}
+                merged["params"] = {**core_params, **cat_params}
+                if core.get("description") and not merged.get("description"):
+                    merged["description"] = core["description"]
+                merged["aliases"] = list(dict.fromkeys(
+                    [*(catalog.get("aliases") or []), *(core.get("aliases") or []),
+                     *([core["standard"]] if core.get("standard") else [])]))
+                merged["related_ids"] = list(dict.fromkeys(
+                    [*(catalog.get("related_ids") or []), *(core.get("related_ids") or []),
+                     core["part_id"]]))
+                first = min(core_index, catalog_index)
+                replacements[first] = merged
+                removed.update((core_index, catalog_index))
+                break
+    if not replacements:
+        return results
+    return [replacements[index] if index in replacements else rec
+            for index, rec in enumerate(results)
+            if index not in removed or index in replacements]
+
+
 
 def _dedupe_related(results: list[dict]) -> list[dict]:
-    """Inject ``related_ids`` on overlapping-designation records and re-rank within groups.
+    """Inject ``related_ids`` on matching physical identities and re-rank groups.
 
     Only touches records whose domain is in ``_OVERLAP_DOMAINS``.  Non-hardware
     domains (ecad, section, fitting, hydraulic) pass through unchanged.
@@ -747,89 +942,55 @@ def _dedupe_related(results: list[dict]) -> list[dict]:
     Contract-additive: ``related_ids`` is a NEW optional list[str] field on PartRecord —
     contracts/parts.md §0 permits new optional fields without a version bump.
     """
-    # Build a map: normalised_designation → list of (index, record) for overlap-domain records.
+    # A size alone (e.g. M8) does not identify a screw, nut or washer.
     from collections import defaultdict
-    desig_groups: dict[str, list[tuple[int, dict]]] = defaultdict(list)
+    desig_groups: dict[tuple[str, ...], list[tuple[int, dict]]] = defaultdict(list)
     for idx, rec in enumerate(results):
         if rec.get("domain") in _OVERLAP_DOMAINS:
-            key = _normalise_desig(rec.get("designation"))
-            if key:
+            key = _dedupe_key(rec)
+            if key and key[0] == "standard":
                 desig_groups[key].append((idx, rec))
 
-    # For each group with >1 record, wire related_ids (additive) and sort by priority.
-    # We build a reordered result list preserving non-overlap records in their original slots.
-    if not any(len(v) > 1 for v in desig_groups.values()):
-        return results  # Fast path: nothing to do.
-
-    # Collect indices that belong to a multi-record overlap group.
     overlap_indices: set[int] = set()
-    group_clusters: list[list[tuple[int, dict]]] = []
-    for grp in desig_groups.values():
-        if len(grp) > 1:
-            overlap_indices.update(i for i, _ in grp)
-            group_clusters.append(grp)
-
-    # Annotate related_ids on all records in each cluster.
-    for grp in group_clusters:
-        all_ids = [rec["part_id"] for _, rec in grp]
-        for _, rec in grp:
-            siblings = [pid for pid in all_ids if pid != rec["part_id"]]
-            # Shallow-copy the record so we don't mutate the index cache.
-            rec_copy = dict(rec)
-            rec_copy["related_ids"] = siblings
-            # Replace in results list in-place (we'll rebuild below).
-            # Find the record's original position and update it.
-            for j, orig in enumerate(results):
-                if orig is rec:
-                    results[j] = rec_copy
-                    break
-
-    # Re-sort overlap groups by domain priority (stable — preserves FTS order within tier).
-    for grp in group_clusters:
-        grp.sort(key=lambda t: _DOMAIN_PRIORITY.get(t[1].get("domain", ""), 99))
-
-    # Build a set of all indices that belong to any cluster, and a map from the minimum
-    # index of each cluster to its sorted record list.
-    cluster_by_first: dict[int, list[dict]] = {}
-    for grp in group_clusters:
-        first_idx = min(i for i, _ in grp)
-        cluster_by_first[first_idx] = [results[i] for i, _ in grp]
-
-    out: list[dict] = []
-    emitted_indices: set[int] = set()
-    for idx in range(len(results)):
-        if idx in overlap_indices:
-            if idx in cluster_by_first and idx not in emitted_indices:
-                # Emit the full sorted cluster at the first-member's position.
-                out.extend(cluster_by_first[idx])
-                # Mark all members of this cluster as emitted.
-                for grp in group_clusters:
-                    if min(i for i, _ in grp) == idx:
-                        emitted_indices.update(i for i, _ in grp)
-                        break
-            # Non-first cluster members: skip (already emitted above).
-        else:
-            out.append(results[idx])
-
+    clusters: dict[int, list[dict]] = {}
+    for group in desig_groups.values():
+        if len(group) < 2:
+            continue
+        overlap_indices.update(index for index, _ in group)
+        ids = [rec["part_id"] for _, rec in group]
+        ordered = sorted(group, key=lambda pair: _DOMAIN_PRIORITY.get(pair[1].get("domain", ""), 99))
+        clusters[min(index for index, _ in group)] = [
+            {**rec, "related_ids": [pid for pid in ids if pid != rec["part_id"]]}
+            for _, rec in ordered
+        ]
+    if not clusters:
+        return results
+    out = []
+    for index, rec in enumerate(results):
+        if index in clusters:
+            out.extend(clusters[index])
+        elif index not in overlap_indices:
+            out.append(rec)
     return out
 
 
 # ── Local/live merge & cross-boundary dedupe (weak-local fan-out) ────────────
 
-def _dedupe_key(rec: dict) -> tuple[str, str] | None:
-    """Identity key for merging the same physical part across local + live.
-
-    Designation is the strongest signal (survives vendor-specific part_ids);
-    falls back to normalised title. Notice stubs (no title/designation) get
-    no key and are therefore never merged away.
-    """
-    desig = _normalise_desig(rec.get("designation"))
-    if desig:
-        return ("d", desig)
-    title = str(rec.get("title") or "").strip().lower()
-    if title:
-        return ("t", title)
-    return None
+def _dedupe_key(rec: dict) -> tuple[str, ...] | None:
+    """Use a governing standard and designation, never a generic title or size."""
+    domain = str(rec.get("domain") or "").strip().lower()
+    standard = _normalise_desig(rec.get("standard"))
+    designation = _normalise_desig(rec.get("designation"))
+    if domain and standard and designation:
+        geometry = rec.get("geometry_ref")
+        params = rec.get("params")
+        geometry = geometry if isinstance(geometry, dict) else {}
+        params = params if isinstance(params, dict) else {}
+        length = geometry.get("length_mm", params.get("length_mm"))
+        return ("standard", domain, standard, designation,
+                "" if length is None else str(length))
+    part_id = str(rec.get("part_id") or "").strip()
+    return ("id", part_id) if part_id else None
 
 
 def _record_richness(rec: dict) -> int:
@@ -873,22 +1034,20 @@ def _record_richness(rec: dict) -> int:
     return score
 
 
-def _merge_local_live(local: list[dict], live: list[dict], limit: int) -> list[dict]:
-    """Merge weak local results with the live fan-out, deduping by physical part.
+def _merge_local_live(local: list[dict], live: list[dict], limit: int,
+                      *, query: str = "") -> list[dict]:
+    """Merge and rank local/live records, deduping only physical identities.
 
-    Local rows are added first (strong local hits stay on top), live rows
-    follow. When the same part appears on both sides, the richer record wins
-    in place — position is NOT reshuffled to "prefer live" or "prefer local",
-    only completeness decides. Notice stubs (timeouts/login-required) are
-    never deduped and always survive to the end of the result, exactly as
-    ``_search_live`` already appends them.
+    When a part appears on both sides, the richer record wins and sourcing
+    from both is retained. Stable relevance ordering keeps local results ahead
+    on equal scores. Timeout and other notice stubs always survive the limit.
     """
     real_live = [r for r in live
                  if r.get("part_id") and str(r.get("title") or "").strip()]
     notices = [r for r in live if r not in real_live]
 
     merged: list[dict] = []
-    seen: dict[tuple[str, str], int] = {}
+    seen: dict[tuple[str, ...], int] = {}
 
     def _add(rec: dict) -> None:
         key = _dedupe_key(rec)
@@ -900,8 +1059,17 @@ def _merge_local_live(local: list[dict], live: list[dict], limit: int) -> list[d
             seen[key] = len(merged)
             merged.append(rec)
             return
-        if _record_richness(rec) > _record_richness(merged[existing_idx]):
-            merged[existing_idx] = rec
+        previous = merged[existing_idx]
+        winner, other = ((rec, previous) if _record_richness(rec) > _record_richness(previous)
+                         else (previous, rec))
+        combined = dict(winner)
+        sourcing = list(winner.get("sourcing") or [])
+        for source in other.get("sourcing") or []:
+            if source not in sourcing:
+                sourcing.append(source)
+        if sourcing:
+            combined["sourcing"] = sourcing
+        merged[existing_idx] = combined
 
     for rec in local:
         _add(rec)
@@ -909,8 +1077,9 @@ def _merge_local_live(local: list[dict], live: list[dict], limit: int) -> list[d
         _add(rec)
 
     real_merged = [r for r in merged
-                   if r.get("part_id") and str(r.get("title") or "").strip()][:limit]
-    return real_merged + notices
+                   if r.get("part_id") and str(r.get("title") or "").strip()]
+    real_merged.sort(key=lambda rec: score_record(rec, query), reverse=True)
+    return real_merged[:limit] + notices
 
 
 def _is_live_only(provider: object) -> bool:

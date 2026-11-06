@@ -246,62 +246,179 @@ class TestInterferenceAdvisorRealEngine(unittest.TestCase):
 
 class TestWallThicknessAdvisor(unittest.TestCase):
 
-    def _call_fixture(self, thickness_mm: float, limit_mm: float | None,
-                      process: str = "fdm") -> list[Finding]:
-        """Simulate eval_thickness + doc_get_process via a fixture RPC."""
+    def _call_fixture(self, thickness_mm: float | None, limit_mm: float | None,
+                      process: str = "fdm", *, study: dict | None = None,
+                      bound: bool = True, calls: list | None = None) -> list[Finding]:
+        """Mirror eval_thickness and the persisted/profile RPC envelopes without an engine."""
+        params = {"min_wall_mm": limit_mm} if limit_mm is not None else {}
+        profile = {"process": process, "params": params}
+        result = {
+            "min_thickness_mm": thickness_mm,
+            "mean_thickness_mm": thickness_mm * 1.5 if thickness_mm is not None else None,
+            "max_thickness_mm": thickness_mm * 3.0 if thickness_mm is not None else None,
+            "n_sampled": 200 if thickness_mm is not None else 0,
+            "minimum_sample": {"vertex_index": 17, "at": [1, 2, 3],
+                               "opposite_at": [1, 2, 3.8], "ball_center": [1, 2, 3.4],
+                               "face_id": 12, "opposing_cos": -0.99,
+                               "wall_direction": [0, 0, 1]},
+            "measurement_basis": {"method": "inscribed_sphere", "spacing_mm": 0.25,
+                                  "requested_spacing_mm": None, "budget_limited": False,
+                                  "n_vertices": 200,
+                                  "n_unmeasured": 200 if thickness_mm is None else 0,
+                                  "wall_separation_deg": 120},
+        }
+        if limit_mm is not None:
+            regions = []
+            if thickness_mm is not None and thickness_mm < limit_mm:
+                regions = [{
+                    "min_thickness_mm": thickness_mm, "at": [1, 2, 3],
+                    "opposite_at": [1, 2, 3.8], "centroid": [1, 2, 3.4],
+                    "bbox": {"min": [0, 1, 3], "max": [2, 3, 3.8]},
+                    "area_mm2": 12.3, "face_ids": [12, 14], "kind": "wall",
+                    "opposing_cos": -0.99, "wall_direction": [0, 0, 1],
+                }]
+            result.update(min_wall_mm=limit_mm, thin_regions=regions,
+                          n_thin_regions=len(regions),
+                          thin_area_mm2=sum(r["area_mm2"] for r in regions))
+        result.update(study or {})
+
         def _call(method: str, **kwargs) -> dict:
+            if calls is not None:
+                calls.append((method, kwargs))
+            if method == "doc_get_meta":
+                return {"ok": True, "key": "process", "value": profile if bound else None}
+            if method == "dfm_get_profile":
+                return {"ok": True, "result": profile}
             if method == "eval_thickness":
-                return {
-                    "min_thickness_mm": thickness_mm,
-                    "mean_thickness_mm": thickness_mm * 1.5,
-                    "max_thickness_mm": thickness_mm * 3.0,
-                    "n_sampled": 200,
-                }
-            if method == "doc_get_process":
-                if limit_mm is not None:
-                    return {"process": process, "params": {"min_wall_mm": limit_mm}}
-                return {"process": process, "params": {}}
-            return {}
+                return result
+            raise AssertionError(f"Unexpected RPC: {method}")
+
         return adapters._check_wall_thickness("doc-fixture", _call)
 
     def test_thin_wall_emits_action_finding(self) -> None:
-        findings = self._call_fixture(0.8, 1.2, "fdm")
+        findings = self._call_fixture(0.8, 1.0)
         self.assertEqual(len(findings), 1)
         f = findings[0]
         self.assertEqual(f.kind, "wall_thickness")
         self.assertEqual(f.severity, "action")
         self.assertAlmostEqual(f.numbers["min_thickness_mm"], 0.8, places=3)
-        self.assertAlmostEqual(f.numbers["limit_mm"], 1.2, places=3)
+        self.assertAlmostEqual(f.numbers["limit_mm"], 1.0, places=3)
+        self.assertEqual(f.refs["face_ids"], [12, 14])
+        self.assertEqual(f.refs["at"], [1, 2, 3])
+        self.assertEqual(f.refs["wall_direction"], [0, 0, 1])
+        self.assertIn("fix or explicitly justify", f.finding)
 
-    def test_ok_wall_emits_info_finding(self) -> None:
-        findings = self._call_fixture(2.0, 1.2, "fdm")
+    def test_bound_minimum_is_sent_for_region_extraction(self) -> None:
+        calls = []
+        self._call_fixture(0.8, 1.4, calls=calls)
+        self.assertEqual(calls, [
+            ("doc_get_meta", {"doc_id": "doc-fixture", "key": "process"}),
+            ("eval_thickness", {"doc_id": "doc-fixture", "min_wall_mm": 1.4}),
+        ])
+
+    def test_unbound_process_uses_fdm_profile_minimum(self) -> None:
+        calls = []
+        findings = self._call_fixture(0.8, 1.0, bound=False, calls=calls)
+        self.assertIn(("dfm_get_profile", {"process": "fdm"}), calls)
+        self.assertEqual(findings[0].severity, "action")
+        self.assertEqual(findings[0].numbers["limit_mm"], 1.0)
+
+    def test_ok_wall_is_info_not_manufacturing_signoff(self) -> None:
+        findings = self._call_fixture(2.0, 1.0)
         self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].severity, "info")
+        self.assertIn("sampled locations only", findings[0].finding)
+        self.assertIn("dfm_check", findings[0].finding)
+        self.assertNotIn("manufacturable", findings[0].finding)
+
+    def test_at_minimum_preserves_nonblocking_screening(self) -> None:
+        findings = self._call_fixture(1.0, 1.0)
         self.assertEqual(findings[0].severity, "info")
 
     def test_no_process_limit_emits_info(self) -> None:
-        findings = self._call_fixture(1.0, None)
+        calls = []
+        findings = self._call_fixture(1.0, None, calls=calls)
         self.assertEqual(len(findings), 1)
         self.assertEqual(findings[0].severity, "info")
+        self.assertIn("process minimum unavailable", findings[0].finding)
+        self.assertEqual(calls[-1], ("eval_thickness", {"doc_id": "doc-fixture"}))
 
-    def test_advisory_candidate_fix_has_thicken_wall(self) -> None:
-        findings = self._call_fixture(0.8, 1.2, "fdm")
+    def test_unmeasured_is_not_a_safe_or_solid_body_verdict(self) -> None:
+        findings = self._call_fixture(None, 1.0)
+        self.assertEqual(len(findings), 1)
+        f = findings[0]
+        self.assertEqual(f.severity, "info")
+        self.assertIsNone(f.numbers["min_thickness_mm"])
+        self.assertEqual(f.numbers["n_unmeasured"], 200)
+        self.assertIn("no opposing wall found", f.finding)
+        self.assertIn("not evidence of safety", f.finding)
+        self.assertNotIn("open/sheet body", f.finding)
+        self.assertNotIn("meets", f.finding)
+
+    def test_nonfinite_minimum_is_unmeasured(self) -> None:
+        f = self._call_fixture(float("nan"), 1.0)[0]
+        self.assertIsNone(f.numbers["min_thickness_mm"])
+        self.assertIn("unmeasured", f.finding)
+        self.assertNotIn("meets", f.finding)
+
+    def test_basis_and_coverage_are_preserved(self) -> None:
+        basis = {"method": "inscribed_sphere", "spacing_mm": 0.4,
+                 "requested_spacing_mm": 0.2, "budget_limited": True,
+                 "n_vertices": 205, "n_unmeasured": 5, "wall_separation_deg": 120}
+        f = self._call_fixture(2.0, 1.0, study={"measurement_basis": basis})[0]
+        self.assertEqual(f.extra["measurement_basis"], basis)
+        self.assertEqual(f.numbers["spacing_mm"], 0.4)
+        self.assertIn("inscribed-sphere screening", f.finding)
+        self.assertIn("spacing 0.4 mm", f.finding)
+        self.assertIn("budget-limited", f.finding)
+        self.assertIn("5 sample(s) unmeasured", f.finding)
+        self.assertNotIn("ray-cast", f.finding)
+
+    def test_wall_and_taper_regions_both_need_action(self) -> None:
+        regions = [
+            {"min_thickness_mm": 0.6, "face_ids": [12], "at": [1, 2, 3],
+             "area_mm2": 10.0, "kind": "wall", "opposing_cos": -0.99},
+            {"min_thickness_mm": 0.8, "face_ids": [23, 24], "at": [4, 5, 6],
+             "area_mm2": 2.0, "kind": "taper", "opposing_cos": -0.6},
+        ]
+        findings = self._call_fixture(0.6, 1.0, study={
+            "thin_regions": regions, "n_thin_regions": 2, "thin_area_mm2": 12.0,
+        })
+        self.assertEqual([f.severity for f in findings], ["action", "action"])
+        self.assertEqual([f.refs["face_ids"] for f in findings], [[12], [23, 24]])
+        self.assertIn("taper region", findings[1].finding)
+        self.assertEqual(findings[1].extra["region"], regions[1])
+        self.assertEqual(findings[0].extra["thin_regions"], regions)
+        self.assertEqual(findings[0].numbers["n_thin_regions"], 2)
+        _assert_non_info_has_fix(_advisory_items(findings, "part_verify"), self)
+
+    def test_minimum_sample_locates_screening_without_regions(self) -> None:
+        f = self._call_fixture(0.8, 1.0, study={"thin_regions": []})[0]
+        self.assertEqual(f.severity, "action")
+        self.assertEqual(f.refs["face_ids"], [12])
+        self.assertEqual(f.refs["at"], [1, 2, 3])
+
+    def test_advisory_candidate_fix_targets_measured_faces(self) -> None:
+        findings = self._call_fixture(0.8, 1.0)
         items = _advisory_items(findings, "part_verify")
         _assert_non_info_has_fix(items, self)
-        action_items = [it for it in items if it["severity"] != "info"]
-        self.assertTrue(any(
-            fix["action"] == "thicken_wall"
-            for it in action_items for fix in it["candidate_fixes"]
-        ), f"No thicken_wall fix found in: {action_items}")
+        fixes = [fix for it in items if it["severity"] != "info"
+                 for fix in it["candidate_fixes"]]
+        self.assertTrue(fixes)
+        self.assertEqual(fixes[0]["action"], "thicken_wall")
+        self.assertEqual(fixes[0]["params"]["face_ids"], [12, 14])
+        self.assertNotIn("manufacturable", fixes[0]["predicted_effect"])
 
-    def test_fix_basis_cites_real_numbers(self) -> None:
-        findings = self._call_fixture(0.8, 1.2, "fdm")
+    def test_fix_basis_cites_real_numbers_and_measurement(self) -> None:
+        findings = self._call_fixture(0.8, 1.0)
         items = _advisory_items(findings, "part_verify")
         action_items = [it for it in items if it["severity"] != "info"]
         self.assertTrue(action_items, "No action items found")
         fix = action_items[0]["candidate_fixes"][0]
-        # Basis must mention measured value and process limit
         self.assertIn("0.800", fix["basis"])
-        self.assertIn("1.200", fix["basis"])
+        self.assertIn("1.000", fix["basis"])
+        self.assertIn("inscribed-sphere", fix["basis"])
+        self.assertNotIn("ray-cast", fix["basis"])
 
 
 # ===========================================================================

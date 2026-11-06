@@ -24,8 +24,8 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "get_reveng_deviation": {
         "prompt_note": (
-            "Post-build quality check; ref_path is required (the brep_doc_id "
-            "lane errors as not-yet-implemented). Bigger n_samples on dense scans."
+            "Post-build quality check: pass ref_path or brep_doc_id. Confirm the "
+            "metric scale first; alignment='icp' explicitly aligns surfaces rigidly."
         ),
         "timeout_s": 180,
     },
@@ -37,8 +37,8 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "import_scan_mesh": {
         "prompt_note": (
-            "Bypasses photogrammetry when a scan mesh already exists; pass "
-            "scale_mm if known, else calibrate afterwards with reveng_set_scale."
+            "Bypasses photogrammetry when a scan mesh already exists; scale_mm "
+            "is millimetres per input unit, not the size of a physical feature."
         ),
     },
     "list_reveng_dims": {
@@ -61,8 +61,8 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "reveng_add_video": {
         "prompt_note": (
-            "Alternative to reveng_add_images for an orbit video — extracts "
-            "blur-culled stills synchronously; drop max_frames on long clips."
+            "Extracts frames from an orbit video asynchronously without starting "
+            "training. Poll get_reveng_session; wait=True is for a small clip."
         ),
         "timeout_s": 300,
     },
@@ -74,8 +74,9 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "reveng_build_parametric": {
         "prompt_note": (
-            "Run after reveng_fit_primitives (fits feed the hints). Single-photo "
-            "sessions are refused unless strategy='override_approximate'; score with describe_reveng_result."
+            "Search for an existing model first with reveng_find_models. Run after "
+            "reveng_fit_primitives (fits feed the hints). Approximate surfaces are refused "
+            "unless strategy='override_approximate'; independently check critical dimensions."
         ),
         "timeout_s": 300,
     },
@@ -97,10 +98,25 @@ ENTRIES: dict[str, dict[str, Any]] = {
             "frames. Read reveng_splat_status for progress and the resulting preview."
         ),
     },
+    "reveng_find_models": {
+        "prompt_note": (
+            "Search for an existing CAD model before researching dimensions or building; "
+            "inspect candidates and their source before selecting one. The fan-out renders "
+            "~20 vendor sites and can take a minute or two."
+        ),
+        "timeout_s": 300,
+    },
+    "reveng_use_model": {
+        "prompt_note": (
+            "Use a selected existing CAD model by URL or local path in the session; "
+            "check its suitability and provenance rather than assuming it matches."
+        ),
+        "timeout_s": 180,
+    },
     "reveng_fit_primitives": {
         "prompt_note": (
-            "Needs a mesh first (reveng_reconstruct / reveng_single_photo / "
-            "import_scan_mesh) and open3d provisioned; persists fits.json for reveng_build_parametric."
+            "Needs a mesh and a confirmed scale. approximate=True allows exploratory "
+            "unscaled fitting; residuals alone do not establish dimensional uncertainty."
         ),
         "timeout_s": 300,
     },
@@ -119,27 +135,30 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "reveng_make_part_from_library": {
         "prompt_note": (
-            "One-call orchestrator for an un-modeled library part. On "
-            "model_present=false with pending_dims, confirm the fit-critical dims — re-calling never forces them."
+            "Searches for existing models before research unless force_build is set. "
+            "Inspect any candidates and use reveng_use_model when suitable. On "
+            "model_present=false with pending_dims, confirm fit-critical dimensions; "
+            "re-calling never forces them."
         ),
         "timeout_s": 300,
     },
     "reveng_print_scale_mat": {
         "prompt_note": (
-            "Print before capture when no known dimension exists — the "
-            "aruco_mat solver in reveng_set_scale defaults to exactly this mat's marker spec."
+            "Print before capture when no known dimension exists — print at 100% and check "
+            "a square against 25 mm; the aruco_mat solver defaults to exactly this ChArUco board."
         ),
     },
     "reveng_reconstruct": {
         "prompt_note": (
-            "Async: returns run_id immediately. Add images first, then poll "
-            "get_reveng_session / reveng_gate_status — the run PAUSES at the scale-confirm gate."
+            "Async: returns run_id immediately. The shared SfM dataset drives both Brush "
+            "and OpenMVS; a splat-derived fallback mesh is explicitly approximate. "
+            "Poll get_reveng_session / reveng_gate_status; scale confirmation pauses the run."
         ),
     },
     "reveng_research_source": {
         "prompt_note": (
-            "No-photo lane: needs part_number, query, or url (one required); "
-            "offline returns honest ok:false. reveng_start_session(research=...) does this in one step."
+            "Search first with reveng_find_models. No-photo lane: needs part_number, query, "
+            "or url (one required); offline returns honest ok:false."
         ),
         "timeout_s": 180,
     },
@@ -151,8 +170,48 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "reveng_set_scale": {
         "prompt_note": (
-            "aruco_mat needs a reconstruction + printed mat; two_point needs "
-            "registered-image pixels; known_dim takes your ratio with a provenance source. All leave confirmed=false."
+            "aruco_mat needs a reconstruction + printed mat; two_point needs pixels "
+            "on an undistorted dataset image and image_space='undistorted'. known_dim "
+            "needs value_mm plus recon_length or "
+            "point_a and point_b in native 3D coordinates; the ratio is value_mm/recon_length. "
+            "All leave confirmed=false."
+        ),
+    },
+    "reveng_confirm_scale": {
+        "prompt_note": "After a person verifies the solved scale, confirm it when no mission gate exists. "
+                       "For an active mission use reveng_resolve_gate instead.",
+    },
+    "reveng_align_axes": {
+        "prompt_note": (
+            "Align an arbitrary SfM gauge before deterministic rebuilding: planes uses fitted "
+            "orthogonal planes or mesh faces and falls back to PCA, pca uses mesh points, "
+            "manual accepts an absolute proper 3x3 rotation. Alignment is not a verified datum. "
+            "Alignment invalidates fits and model; fit again afterward."
+        ),
+    },
+    "reveng_import_splat": {
+        "prompt_note": "Import Gaussian PLY, .splat, .spz or .ksplat into a clean session; inspect conversion losses.",
+    },
+    "reveng_convert_splat": {
+        "prompt_note": "Convert supported splat encodings and inspect reported losses.",
+    },
+    "reveng_splat_to_mesh": {
+        "prompt_note": (
+            "Prunes the splat to its subject first (adaptive opacity, camera-orbit region, floor, "
+            "floaters) and writes points_path and pruned_splat_path, then meshes: auto uses TSDF "
+            "only with proven matching undistorted poses, otherwise Poisson with fallback_reason; "
+            "method='poisson' is explicit. No method makes Gaussian geometry a metrology-grade "
+            "measurement."
+        ),
+        "timeout_s": 300,
+    },
+    "reveng_sparse_preview": {
+        "prompt_note": (
+            "Inspect the bounded points array of [x,y,z,r,g,b] and camera frusta. "
+            "Before scale confirmation points use reconstruction units; after confirmation "
+            "they use mm. To supply native coordinates to reveng_set_scale, invert the "
+            "confirmed recon_transform: point = rotation.T @ (point_mm - translation_mm) "
+            "/ mm_per_unit."
         ),
     },
     "reveng_single_photo": {
@@ -170,8 +229,8 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "reveng_start_session": {
         "prompt_note": (
-            "First call of any RE flow; pass research= (MPN/query/URL) to "
-            "auto-populate the datasheet lane or part_ref to seed photos/datasheet from the parts hub."
+            "First call of any RE flow; search for existing models before research or "
+            "building. part_ref can seed photos/datasheet from the parts hub."
         ),
     },
     "reveng_start_splat": {
@@ -185,6 +244,12 @@ ENTRIES: dict[str, dict[str, Any]] = {
         "prompt_note": (
             "Call first — probes backends (COLMAP etc.) before promising a "
             "reconstruction; pure and offline-safe, with fix-it banners for what's missing."
+        ),
+    },
+    "reveng_install_tools": {
+        "prompt_note": (
+            "Installs a missing Brush / OpenMVS (about 210 MB) in the background; poll "
+            "reveng_status().install until running is false. Do not ask the user to run a script."
         ),
     },
 }

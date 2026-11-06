@@ -56,7 +56,7 @@ CANONICAL_H7G6 = {
     "units": "mm",
     "equation": "ISO 286-2, nominal=20mm, H7/g6",
     "inputs": {"nominal": 20, "fit": "H7/g6"},
-    "source": {"kind": "closed_form", "citation": "ISO 286-2:2010"},
+    "source": {"kind": "table", "citation": "ISO 286-2:2010"},
     "notes": [],
 }
 
@@ -216,14 +216,13 @@ def test_unparseable_side_tolerance_is_dropped_loudly_not_silently():
 
 # --------------------------------------------------------------------------- design mode
 
-def test_shaft_basis_designation_uses_the_iso_mirror_rule():
-    """`G7/h7` used to fail outright with `unsupported_hole`. ISO 286-1 §5.3 makes it
-    identical to H7/g7, so the G7 band is +0.007/+0.028 at Ø20 (the published value)."""
+def test_shaft_basis_designation_matches_iso_published_band():
+    """G7/h7 has the published +0.007/+0.028 hole band at Ø20."""
     out = _call("fit_calc", nominal=20, fit="G7/h7")
     assert out["ok"] is True
     assert out["answer"]["hole"] == [0.007, 0.028]
     assert out["answer"]["clearance"] == [0.007, 0.049]
-    assert any("mirror" in n for n in out["interpreted"])
+    assert out["source"]["kind"] == "table"
 
 
 def test_shaft_basis_press_fit_matches_its_hole_basis_twin():

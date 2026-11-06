@@ -44,6 +44,15 @@ void requestStopRunFor(AppState& state, const std::string& convId);
 // in the same transcript turn. Never infer delivery for missing/ambiguous replies or images.
 bool reconcileResolvedAskReplies(std::vector<ChatMsg>& msgs);
 
+// A steer the agent has just read marks a point of its run: close the live turn there, keep the
+// steer's bubble below it and open a fresh live turn under the bubble, so the transcript reads
+// in the order things happened. Only a DELIVERED (or duplicate) steer places; a steer still
+// pending stays in the pinned stack, a failed or withdrawn one stays below its turn. Returns true
+// when `msgs` grew, which invalidates every ChatMsg pointer into it (the event drain re-finds its
+// live message). GL thread.
+bool placeSteerInTranscript(AppState& state, std::vector<ChatMsg>& msgs,
+                            const std::string& steerId);
+
 // Shared AI settings fields (provider/model/auth, generation). Rendered by the Settings modal's
 // Providers tab as glass-grouped sections — one call per section, each inside its own glass
 // card, so the caller owns the headers. Privacy (offline mode) + assistant-thoughts live in the
@@ -64,24 +73,20 @@ bool drawFreeAiProviderCard(AppState& state);
 
 // Refresh model discovery without blocking: desktop probes the LOCAL endpoint and
 // ACTIVE cloud provider via agent_list_models, throttled per provider; the browser
-// uses the tenant's credential-free chudcode_models_list catalog instead. force=true
+// uses the tenant's credential-free omp_models_list catalog instead. force=true
 // skips the cooldown after a base-URL edit or provider switch.
 void refreshModelAvailability(AppState& state, bool force);
 
-// True when the provider has a key, signed-in subscription, host-shared account (web),
-// or reachable local endpoint — shared by the composer model picker, Settings role/Eng.Firm
-// combos, and Manage models.
-bool providerUsable(AppState& state, int provider);
 
 // The model rows the picker should show for ONE provider: that provider's live probe rows when
 // a probe succeeded (order preserved — newest first), else the static builtinModels() catalog
 // filtered to it. Cloud providers only; local/llama.cpp keep their own flat `models` path.
 std::vector<ModelInfo> providerPickerModels(AppState& state, int provider);
 
-// ---- Chudcode model catalog + session cost ------------------------------------------
+// ---- Omp model catalog + session cost ------------------------------------------
 // Cached catalog metadata (capabilities + cost) for online providers. Distinct from the
 // native agent_list_models probe above, which asks a keyed endpoint what it can serve now.
-// Consumers must tolerate an empty cache while Chudcode catalog data is unavailable.
+// Consumers must tolerate an empty cache while Omp catalog data is unavailable.
 struct BridgeModelMeta {
     std::string id;          // catalog model id (e.g. "claude-opus-4-8")
     std::string name;        // display name
@@ -90,6 +95,11 @@ struct BridgeModelMeta {
     bool tools = false;
     bool reasoning = false;
     std::vector<std::string> reasoningEfforts;  // provider effort ladder; empty = no dial
+    bool reasoningEffortsKnown = false;  // Missing metadata differs from an empty ladder.
+    bool visionKnown = false;
+    bool toolsKnown = false;
+    bool reasoningKnown = false;
+    std::string kind;
     int contextWindow = 0;   // tokens; 0 = unknown
     int maxTokens = 0;       // max output tokens; 0 = unknown
     // `priced` records pricing provenance: true only when the catalog carries a real non-zero
@@ -108,6 +118,23 @@ struct BridgeModelMeta {
 void refreshBridgeModelCatalog(AppState& state, bool force);
 // The cached catalog (empty until the first successful fetch).
 const std::vector<BridgeModelMeta>& bridgeModelCatalog();
+// Isolated native model_settings scenario only; never changes or persists runtime metadata.
+void setModelSettingsScenarioCatalog(AppState& state, std::vector<BridgeModelMeta> models);
+// Model presence alone does not prove current availability.
+bool bridgePickerModelUsable(const AppState& state, const BridgeModelMeta& model);
+bool pickerLocalModelUsable(const AppState& state, int provider, const std::string& id);
+void refreshSignedInProviders(AppState& state, bool force);
+bool modelPickerLoading();
+bool modelPickerError();
+// True while the catalog or provider list has no live answer only because a running agent turn
+// holds the service lane (hostd refuses every other agent-lane call until it ends). Not an
+// error; models saved from the last session, if any, are shown and everything refreshes after.
+bool modelPickerDeferred();
+// The provider list as last confirmed by a successful omp_provider_list in an earlier session
+// (a JSON array as text; empty when none was saved). Stands in only while a run holds the lane.
+std::string savedProviderListJson();
+// Persist a complete, successful omp_provider_list `providers` array (JSON text) for the next launch.
+void saveProviderListJson(const std::string& providersJson);
 // Exact (provider, id) lookup; providerId empty = first catalog row with that id.
 const BridgeModelMeta* bridgeModelMeta(const std::string& providerId, const std::string& modelId);
 // CAD picker lookup: map a CAD ProviderIndex (+ cloud base_url for the shared cloud slot) to
@@ -127,10 +154,6 @@ std::string bridgeModelCostDetail(const BridgeModelMeta& m);
 // catalog data is available.
 void drawSessionCostStrip(AppState& state);
 
-// Cloud OpenAI-compat / Moonshot key presence in local settings. Used by picker sections that
-// gate rows on cloudKey/moonshotKey.
-bool cloudCompatKeyPresent(AppState& state);
-bool moonshotKeyPresent(AppState& state);
 
 // Session-local "Show assistant thoughts" toggle (Copilot quick settings + Settings).
 // Not persisted — lives for the process only.
@@ -150,6 +173,12 @@ void persistChatHistory(AppState& state);
 
 // Save the latest transcript and composer draft, then drain pending writes before teardown.
 void flushChatPersistence(AppState& state);
+
+// Put a command that failed after the composer was cleared back into an empty composer.
+void composerRestoreUnsent(AppState& state, const std::string& text);
+// Restore to the owning conversation's empty draft without changing the selected chat.
+void restoreUnsentForConversation(AppState& state, const std::string& convId,
+                                  const std::string& docKey, const std::string& text);
 
 // Drain accepted answer/steer jobs while AppState and its worker are still alive.
 void shutdownAgentControl(AppState& state);

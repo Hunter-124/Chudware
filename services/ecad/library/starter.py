@@ -31,6 +31,7 @@ Public API:
 
 from __future__ import annotations
 
+import copy
 import math
 
 # ─── small helpers ────────────────────────────────────────────────────────────
@@ -287,8 +288,8 @@ def _make_symbols() -> dict:
         "Light-emitting diode",
         "led diode light",
         pins=[
-            _pin("K", "K", [2.54, 0.0], 0.0, "passive"),
-            _pin("A", "A", [-2.54, 0.0], 180.0, "passive"),
+            _pin("1", "K", [2.54, 0.0], 0.0, "passive"),
+            _pin("2", "A", [-2.54, 0.0], 180.0, "passive"),
         ],
         graphics=[
             _polyline([-1.27, -1.27], [-1.27, 1.27], [1.27, 0.0], [-1.27, -1.27]),
@@ -440,105 +441,66 @@ def _make_symbols() -> dict:
         footprint_filters=["SOT-23*", "TO-92*"],
     )
 
-    # ── Dual op-amp abstract multi-unit ──────────────────────────────────────
-    # Unit-based abstract dual op-amp for multi-unit schematic placement / SPICE
-    # OPAMP model. Pin numbers are NOT a physical package map — use
-    # Amplifier_Operational:LM358 for a datasheet-correct DIP-8/SOIC-8 pinout.
-    opamp_pins = []
-    # Unit 1: IN-, IN+, OUT
-    opamp_pins += [
-        _pin("1", "IN-", [-6.35, 1.27], 180.0, "input", unit=1),
-        _pin("2", "IN+", [-6.35, -1.27], 180.0, "input", unit=1),
-        _pin("3", "OUT", [6.35, 0.0], 0.0, "output", unit=1),
-    ]
-    # Unit 2: IN-, IN+, OUT
-    opamp_pins += [
-        _pin("5", "IN-", [-6.35, 1.27], 180.0, "input", unit=2),
-        _pin("6", "IN+", [-6.35, -1.27], 180.0, "input", unit=2),
-        _pin("7", "OUT", [6.35, 0.0], 0.0, "output", unit=2),
-    ]
-    # Power unit (unit 3)
-    opamp_pins += [
-        _pin("8", "V+", [0.0, 6.35], 90.0, "power_in", unit=3),
-        _pin("4", "V-", [0.0, -6.35], 270.0, "power_in", unit=3),
-    ]
 
-    opamp_graphics_u12 = [
-        # triangle body
-        _polyline([-6.35, 5.08], [-6.35, -5.08], [6.35, 0.0], [-6.35, 5.08]),
-        # +/- markers
-        _line(-5.08, -1.27, -3.81, -1.27),
-        _line(-4.445, -1.905, -4.445, -0.635),
-        _line(-5.08, 1.27, -3.81, 1.27),
-    ]
+    # KiCad's simulation op-amp has five physical terminals, including supplies.
+    sim_opamp = _sym(
+        "Simulation_SPICE:OPAMP", "OPAMP", "U", "OPAMP",
+        "Simulation operational amplifier", "simulation spice opamp",
+        pins=[_pin("1", "+", [-5.08, 2.54], 180.0, "input"),
+              _pin("2", "-", [-5.08, -2.54], 180.0, "input"),
+              _pin("3", "V+", [-2.54, 3.81], 90.0, "power_in", length=3.81),
+              _pin("4", "V-", [-2.54, -3.81], 270.0, "power_in", length=3.81),
+              _pin("5", "", [5.08, 0.0], 0.0, "output")],
+        graphics=[{"kind": "polyline", "pts": [[5.08, 0.0], [-5.08, 5.08],
+                                                [-5.08, -5.08], [5.08, 0.0]]}])
+    sim_opamp["fields"] = {
+        "Sim.Device": "SUBCKT", "Sim.Library": "${KICAD9_SYMBOL_DIR}/Simulation_SPICE.sp",
+        "Sim.Name": "kicad_builtin_opamp", "Sim.Pins": "1=in+ 2=in- 3=vcc 4=vee 5=out"}
+    syms["Simulation_SPICE:OPAMP"] = sim_opamp
 
-    syms["Amplifier_Operational:OPAMP_dual"] = _sym(
-        "Amplifier_Operational:OPAMP_dual", "OPAMP_dual", "U", "OPAMP_dual",
-        "Dual operational amplifier (abstract multi-unit; not a package pinout)",
-        "opamp operational amplifier dual abstract",
-        pins=opamp_pins,
-        graphics=opamp_graphics_u12,
-        units_count=3,
-        sim={"model": "OPAMP", "pin_order": ["IN+", "IN-", "OUT"]},
-        footprint_filters=["SOIC-8*", "DIP-8*"],
-    )
-
-    # ── LM358 dual op-amp (datasheet DIP-8 / SOIC-8 pinout) ─────────────────
-    # TI SLOS068 / public datasheet pin map (clean-room; not derived from KiCad):
-    #   1 OUT1, 2 IN1-, 3 IN1+, 4 V-, 5 IN2+, 6 IN2-, 7 OUT2, 8 V+
-    # Single-unit symbol so every pin is on unit 1 and matches SOIC-8/DIP-8 pads 1-8.
-    lm358_w, lm358_h = 10.16, 15.24
-    lm358_pins = [
-        _pin("1", "OUT1", [-lm358_w / 2 - 2.54, lm358_h / 2 - 1.27], 180.0, "output"),
-        _pin("2", "IN1-", [-lm358_w / 2 - 2.54, lm358_h / 2 - 1.27 - 2.54], 180.0, "input"),
-        _pin("3", "IN1+", [-lm358_w / 2 - 2.54, lm358_h / 2 - 1.27 - 2.54 * 2], 180.0, "input"),
-        _pin("4", "V-", [-lm358_w / 2 - 2.54, -lm358_h / 2 + 1.27], 180.0, "power_in"),
-        _pin("5", "IN2+", [lm358_w / 2 + 2.54, -lm358_h / 2 + 1.27], 0.0, "input"),
-        _pin("6", "IN2-", [lm358_w / 2 + 2.54, -lm358_h / 2 + 1.27 + 2.54], 0.0, "input"),
-        _pin("7", "OUT2", [lm358_w / 2 + 2.54, lm358_h / 2 - 1.27 - 2.54], 0.0, "output"),
-        _pin("8", "V+", [lm358_w / 2 + 2.54, lm358_h / 2 - 1.27], 0.0, "power_in"),
-    ]
+    # LM358 dual op-amp: KiCad's two amplifier units and separate power unit.
+    # Datasheet pins: 1=OUT1, 2=IN1-, 3=IN1+, 4=V-, 5=IN2+,
+    # 6=IN2-, 7=OUT2, 8=V+. No ideal simulation model is implied.
     syms["Amplifier_Operational:LM358"] = _sym(
         "Amplifier_Operational:LM358", "LM358", "U", "LM358",
         "LM358 dual operational amplifier (DIP-8/SOIC-8 datasheet pinout)",
         "opamp operational amplifier lm358 dual",
-        pins=lm358_pins,
-        graphics=[_rect(-lm358_w / 2, -lm358_h / 2, lm358_w / 2, lm358_h / 2)],
-        sim={"model": "OPAMP", "pin_order": ["IN1+", "IN1-", "V+", "V-", "OUT1"]},
-        footprint_filters=["SOIC-8*", "DIP-8*"],
-    )
+        pins=[_pin("1", "", [5.08, 0.0], 0.0, "output", unit=1),
+              _pin("2", "-", [-5.08, -2.54], 180.0, "input", unit=1),
+              _pin("3", "+", [-5.08, 2.54], 180.0, "input", unit=1),
+              _pin("5", "+", [-5.08, 2.54], 180.0, "input", unit=2),
+              _pin("6", "-", [-5.08, -2.54], 180.0, "input", unit=2),
+              _pin("7", "", [5.08, 0.0], 0.0, "output", unit=2),
+              _pin("4", "V-", [-2.54, -3.81], 270.0, "power_in", length=3.81, unit=3),
+              _pin("8", "V+", [-2.54, 3.81], 90.0, "power_in", length=3.81, unit=3)],
+        graphics=[{"kind": "polyline", "unit": unit,
+                   "pts": [[5.08, 0.0], [-5.08, 5.08], [-5.08, -5.08], [5.08, 0.0]]}
+                  for unit in (1, 2)],
+        units_count=3, footprint_filters=["SOIC-8*", "DIP-8*"])
 
-    # ── NE555 timer ──────────────────────────────────────────────────────────
-    # 8-pin DIP; pins labelled per datasheet
-    ne555_w = 10.16
-    ne555_h = 15.24
-    ne555_pins = [
-        _pin("1", "GND", [-ne555_w / 2 - 2.54, -ne555_h / 2 + 1.27], 180.0, "power_in"),
-        _pin("2", "TRIG", [-ne555_w / 2 - 2.54, -ne555_h / 2 + 1.27 + 2.54], 180.0, "input"),
-        _pin("3", "OUT", [ne555_w / 2 + 2.54, -ne555_h / 2 + 1.27 + 2.54 * 2], 0.0, "output"),
-        _pin("4", "RST", [ne555_w / 2 + 2.54, -ne555_h / 2 + 1.27 + 2.54 * 3], 0.0, "input"),
-        # CV sat at the SAME (x,y) as RST (both y=1.27) -> the netlist union-find silently
-        # shorted RST and CV onto one net. Drop it one grid row to its own connection point.
-        _pin("5", "CV", [ne555_w / 2 + 2.54, -ne555_h / 2 + 1.27 + 2.54], 0.0, "input"),
-        _pin("6", "THR", [-ne555_w / 2 - 2.54, ne555_h / 2 - 1.27 - 2.54], 180.0, "input"),
-        _pin("7", "DIS", [-ne555_w / 2 - 2.54, ne555_h / 2 - 1.27], 180.0, "open_collector"),
-        _pin("8", "VCC", [ne555_w / 2 + 2.54, ne555_h / 2 - 1.27], 0.0, "power_in"),
-    ]
-    ne555_graphics = [_rect(-ne555_w / 2, -ne555_h / 2, ne555_w / 2, ne555_h / 2)]
 
-    syms["Timer:NE555"] = _sym(
-        "Timer:NE555", "NE555", "U", "NE555",
-        "NE555 timer, single",
-        "timer 555 oscillator",
-        pins=ne555_pins,
-        graphics=ne555_graphics,
-        sim={
-            "model": "SUBCKT",
-            "subckt": "NE555",
-            "pin_order": ["GND", "TRIG", "OUT", "RST", "CV", "THR", "DIS", "VCC"],
-        },
-        footprint_filters=["DIP-8*", "SOIC-8*"],
-    )
+    syms["Timer:NE555D"] = _sym(
+        "Timer:NE555D", "NE555D", "U", "NE555D",
+        "NE555 timer, SOIC-8", "timer 555 oscillator",
+        pins=[_pin("1", "GND", [0.0, -7.62], 270.0, "power_in", unit=0),
+              _pin("2", "TRIG", [-7.62, -5.08], 180.0, "input"),
+              _pin("3", "OUT", [7.62, 0.0], 0.0, "output"),
+              _pin("4", "~{RST}", [-7.62, 5.08], 180.0, "input"),
+              _pin("5", "CONT", [0.0, 7.62], 90.0, "passive"),
+              _pin("6", "THRES", [-7.62, -2.54], 180.0, "input"),
+              _pin("7", "DISCH", [-7.62, 2.54], 180.0, "input"),
+              _pin("8", "VCC", [2.54, 7.62], 90.0, "power_in", unit=0)],
+        graphics=[{"kind": "rect", "pts": [[-7.62, -7.62], [7.62, 7.62]]}],
+        sim={"model": "SUBCKT", "subckt": "NE555",
+             "pin_order": [str(number) for number in range(1, 9)]},
+        footprint_filters=["SOIC-8*"])
+    syms["Timer:NE555D"]["default_footprint"] = "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm"
+    timer_p = copy.deepcopy(syms["Timer:NE555D"])
+    timer_p.update({"libid": "Timer:NE555P", "name": "NE555P", "value": "NE555P",
+                    "description": "NE555 timer, PDIP-8",
+                    "default_footprint": "Package_DIP:DIP-8_W7.62mm",
+                    "footprint_filters": ["DIP*W7.62mm*"]})
+    syms["Timer:NE555P"] = timer_p
 
     # ── 2-pin connector ─────────────────────────────────────────────────────
     syms["Connector:Conn_2"] = _sym(
@@ -676,27 +638,27 @@ def _make_symbols() -> dict:
         sim={"model": "-5V"},
     )
 
-    # ── Voltage source ─────────────────────────────────────────────────────
-    syms["Simulation_SPICE:V_source"] = _sym(
-        "Simulation_SPICE:V_source", "V_source", "V", "V",
-        "Ideal voltage source (SPICE)",
-        "voltage source spice simulation",
-        pins=[
-            _pin("+", "+", [0.0, 2.54], 90.0, "power_out"),
-            _pin("-", "-", [0.0, -2.54], 270.0, "power_out"),
-        ],
-        graphics=[
-            _circle(0.0, 0.0, 1.6),
-            _line(0.0, 1.6, 0.0, 2.54),
-            _line(0.0, -1.6, 0.0, -2.54),
-            # + marker
-            _line(-0.5, 0.8, 0.5, 0.8),
-            _line(0.0, 0.3, 0.0, 1.3),
-            # - marker
-            _line(-0.5, -0.8, 0.5, -0.8),
-        ],
-        sim={"model": "V", "pin_order": ["+", "-"]},
-    )
+    # ── KiCad voltage-source models ─────────────────────────────────────────
+    # Identifiers, pin numbers and simulation fields match KiCad 10. Geometry is
+    # clean-room; instance fields can override the waveform parameters.
+    for name, model_type, value, params in (
+            ("VDC", "DC", "1", ""),
+            ("VSIN", "SIN", "VSIN", "dc=0 ampl=1 f=1k ac=1"),
+            ("VPULSE", "PULSE", "VPULSE", "y1=0 y2=1 td=2n tr=2n tf=2n tw=50n per=100n")):
+        libid = f"Simulation_SPICE:{name}"
+        source = _sym(
+            libid, name, "V", value, f"Voltage source, {model_type}",
+            "voltage source spice simulation",
+            pins=[_pin("1", "", [0.0, 2.54], 90.0, "passive"),
+                  _pin("2", "", [0.0, -2.54], 270.0, "passive")],
+            graphics=[{"kind": "circle", "pts": [[0.0, 0.0]], "radius": 2.54},
+                      {"kind": "text", "pts": [[0.0, 1.905]], "text": "+", "size": 0.8}],
+            sim={"model": "V", "pin_order": ["1", "2"]})
+        source["fields"] = {"Sim.Device": "V", "Sim.Type": model_type,
+                            "Sim.Pins": "1=+ 2=-"}
+        if params:
+            source["fields"]["Sim.Params"] = params
+        syms[libid] = source
 
     # ── Current source ─────────────────────────────────────────────────────
     syms["Simulation_SPICE:I_source"] = _sym(
@@ -1470,7 +1432,7 @@ def _rail(name: str, vmin: float | None, vnom: float | None, vmax: float | None,
 
 _SYMBOL_ENG: dict[str, dict] = {
     # Bipolar 555: Icc 3 mA typ / 6 mA max @ Vcc=5 V; 10/15 mA @ 15 V; Vcc 4.5–16 V.
-    "Timer:NE555": {
+    "Timer:NE555P": {
         "power_w": {"typ": 0.015, "max": 0.225},   # 5 V·3 mA typ; 15 V·15 mA worst-case quiescent
         "limits_c": {"tj_max": 150.0, "ta_max": 70.0},
         "supply": {"rails": [_rail("VCC", 4.5, 5.0, 16.0, 0.003, None)],
@@ -1480,7 +1442,7 @@ _SYMBOL_ENG: dict[str, dict] = {
                     " nominal; verify against the exact device grade."],
     },
     # LM358-class dual op-amp: Icc 0.7 mA typ / 1.2 mA max (both amps); V+ 3–32 V.
-    "Amplifier_Operational:OPAMP_dual": {
+    "Amplifier_Operational:LM358": {
         "power_w": {"typ": 0.0035, "max": 0.0384},  # 5 V·0.7 mA typ; 32 V·1.2 mA max quiescent
         "limits_c": {"tj_max": 150.0, "ta_max": 85.0},
         "supply": {"rails": [_rail("V+", 3.0, 5.0, 32.0, 0.0007, None)],
@@ -1530,6 +1492,7 @@ _SYMBOL_ENG: dict[str, dict] = {
                     " (Nexperia BZT52 datasheet)."],
     },
 }
+_SYMBOL_ENG["Timer:NE555D"] = copy.deepcopy(_SYMBOL_ENG["Timer:NE555P"])
 
 def _apply_symbol_eng(syms: dict) -> None:
     for libid, eng in _SYMBOL_ENG.items():
@@ -1836,6 +1799,11 @@ def _make_footprints() -> dict:
         graphics=_silk_box(-2.0, -2.7, 2.0, 2.7) + _crtyd_box(-3.4, -3.1, 3.4, 3.1),
         description="SOIC-8",
     )
+    kicad_soic8 = "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm"
+    fps[kicad_soic8] = _fp(
+        kicad_soic8, pads=copy.deepcopy(soic8_pads),
+        graphics=_silk_box(-2.0, -2.7, 2.0, 2.7) + _crtyd_box(-3.4, -3.1, 3.4, 3.1),
+        description="SOIC-8 3.9x4.9 mm, 1.27 mm pitch")
 
     # ── SOIC-14 ──────────────────────────────────────────────────────────
     soic14_pads = []
@@ -1881,6 +1849,11 @@ def _make_footprints() -> dict:
         attr="tht",
         description="DIP-8 through-hole",
     )
+    kicad_dip8 = "Package_DIP:DIP-8_W7.62mm"
+    fps[kicad_dip8] = _fp(
+        kicad_dip8, pads=copy.deepcopy(dip8_pads),
+        graphics=_silk_box(-4.8, -5.1, 4.8, 5.1) + _crtyd_box(-5.4, -5.7, 5.4, 5.7),
+        attr="tht", description="DIP-8 through-hole, 7.62 mm row spacing")
 
     # ── DIP-14 (THT) ─────────────────────────────────────────────────────
     dip14_pads = []
@@ -1939,8 +1912,8 @@ def _make_footprints() -> dict:
     fps["LED_SMD:LED_0805"] = _fp(
         "LED_SMD:LED_0805",
         pads=[
-            _smd_pad("p1", "K", -1.0, 0.0, 1.15, 1.45, 0.25),
-            _smd_pad("p2", "A", 1.0, 0.0, 1.15, 1.45, 0.25),
+            _smd_pad("p1", "1", -1.0, 0.0, 1.15, 1.45, 0.25),
+            _smd_pad("p2", "2", 1.0, 0.0, 1.15, 1.45, 0.25),
         ],
         graphics=_silk_box(-1.2, -0.7, 1.2, 0.7) + _crtyd_box(-1.7, -1.0, 1.7, 1.0),
         description="LED 0805",
@@ -2412,6 +2385,10 @@ _FOOTPRINT_ENG: dict[str, dict] = {
     "Capacitor_THT:CP_Radial_D8.0mm_P3.50mm":
         _pkg_eng("cylinder", d_mm=8.0, h_mm=12.0, source=_JEDEC_SRC),
 }
+_FOOTPRINT_ENG["Package_SO:SOIC-8_3.9x4.9mm_P1.27mm"] = copy.deepcopy(
+    _FOOTPRINT_ENG["Package_SO:SOIC-8"])
+_FOOTPRINT_ENG["Package_DIP:DIP-8_W7.62mm"] = copy.deepcopy(
+    _FOOTPRINT_ENG["Package_DIP:DIP-8"])
 _FOOTPRINT_ENG["Connector_PinHeader_2.54mm:Header_1x4"] = \
     _FOOTPRINT_ENG["Connector_PinHeader_2.54mm:PinHeader_1x04_P2.54mm_Vertical"]
 

@@ -3,7 +3,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <functional>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <utility>
@@ -43,6 +46,10 @@ Point handle_point(const std::string& ref, const json& coords) {
     }
     if (sub == "center") return point(e.at("center"));
     if (sub == "p1" || sub == "p2") return point(e.at(sub));
+    if (type == "line" && sub == "mid") {
+        Point a = point(e.at("p1")), b = point(e.at("p2"));
+        return {(a.x + b.x) / 2, (a.y + b.y) / 2};
+    }
     if (type == "arc" && (sub == "start" || sub == "end")) {
         Point c = point(e.at("center"));
         double angle = e.at(sub).get<double>() * radians, r = e.at("radius");
@@ -163,6 +170,49 @@ std::string signature(const json& c) {
     return type + ":" + refs.dump() + ":" + c.value("axis", std::string());
 }
 
+bool dimension_type(const std::string& type) {
+    return type == "distance" || type == "length" || type == "angle" || type == "radius" ||
+           type == "diameter" || type == "arc_length" || type == "rotate_point" ||
+           type == "signed_distance";
+}
+
+std::string join_ids(const std::vector<std::string>& ids) {
+    std::string text;
+    for (std::size_t i = 0; i < ids.size(); ++i) text += (i ? ", " : "") + ids[i];
+    return text;
+}
+
+std::string format_number(double value) {
+    char buffer[32];
+    std::snprintf(buffer, sizeof buffer, "%.4g", value);
+    return buffer;
+}
+
+// "c5 (length 40)": id, type and the driving value when the constraint has one.
+std::string constraint_label(const json& c) {
+    std::string text = c.value("id", std::string("?")) + " (" + c.value("type", std::string("?"));
+    if (c.contains("value")) {
+        const auto& v = c["value"];
+        const auto& number = v.is_object() && v.contains("value") ? v["value"] : v;
+        if (number.is_number()) text += " " + format_number(number.get<double>());
+    }
+    return text + ")";
+}
+
+// Ids of the redundant constraints that are DRIVING dimensions: those over-define a sketch.
+// A redundant geometric relation does not, so it never blocks a definition pass.
+std::vector<std::string> redundant_driving_dimensions(const json& sketch, const SketchSolution& solved) {
+    std::vector<std::string> ids;
+    for (const auto& id : solved.redundant)
+        for (const auto& c : sketch.at("constraints"))
+            if (c.value("id", std::string()) == id && dimension_type(c.value("type", std::string())) &&
+                !c.value("driven", false) && !c.contains("angle_ref")) {
+                ids.push_back(id);
+                break;
+            }
+    return ids;
+}
+
 class Definer {
     const json& env_;
     const DefineOptions& opt_;
@@ -173,6 +223,9 @@ class Definer {
     std::vector<std::string> ids_;
     std::set<std::string> selected_, considered_, constraint_ids_;
     std::size_t next_id_ = 0;
+    std::set<std::string> baseline_redundant_;  // redundant geometric relations already authored
+    double slack_ = 0;    // distance accepted rounding may have moved the geometry (mm)
+    double extent_ = 1;   // sketch diagonal (mm), converts a rounded angle to a distance
 
     bool selected(const std::string& ref) const {
         return selected_.empty() || selected_.count(entity_of(ref));
@@ -232,8 +285,12 @@ class Definer {
         auto geometry = [&](int i) -> const json& { return solved_.entities.at(entity_of(refs[i])); };
         auto p = [&](int i) { return handle_point(refs[i], solved_.entities); };
         if (type == "coincident") return (p(0) - p(1)).norm() <= opt_.length_tol;
-        if (type == "horizontal") return parallel(direction(geometry(0)), {1, 0});
-        if (type == "vertical") return parallel(direction(geometry(0)), {0, 1});
+        if (type == "horizontal" || type == "vertical") {
+            if (refs.size() == 2)
+                return std::abs(type == "horizontal" ? p(0).y - p(1).y : p(0).x - p(1).x) <=
+                       opt_.length_tol;
+            return parallel(direction(geometry(0)), type == "horizontal" ? Point{1, 0} : Point{0, 1});
+        }
         if (type == "parallel" || type == "collinear") {
             if (!parallel(direction(geometry(0)), direction(geometry(1)))) return false;
             return type == "parallel" ||
@@ -255,7 +312,22 @@ class Definer {
             Point a = point(geometry(1).at("p1")), b = point(geometry(1).at("p2"));
             return (p(0) - Point{(a.x + b.x) / 2, (a.y + b.y) / 2}).norm() <= opt_.length_tol;
         }
-        if (type == "point_on") return on_curve(p(0), geometry(1));
+        if (type == "symmetric") {
+            Point a = refs[0] == entity_of(refs[0]) && round_curve(geometry(0))
+                ? point(geometry(0).at("center")) : p(0);
+            Point b = refs[1] == entity_of(refs[1]) && round_curve(geometry(1))
+                ? point(geometry(1).at("center")) : p(1);
+            Point reflected = refs[2] == "axis.v" ? Point{-a.x, a.y} : Point{a.x, -a.y};
+            return (reflected - b).norm() <= opt_.length_tol &&
+                   (refs[0] != entity_of(refs[0]) || refs[1] != entity_of(refs[1]) ||
+                    !round_curve(geometry(0)) || !round_curve(geometry(1)) ||
+                    exact(geometry(0).at("radius"), geometry(1).at("radius")));
+        }
+        if (type == "point_on") {
+            if (refs[1] == "axis.v") return std::abs(p(0).x) <= opt_.length_tol;
+            if (refs[1] == "axis.h") return std::abs(p(0).y) <= opt_.length_tol;
+            return on_curve(p(0), geometry(1));
+        }
         if (type == "tangent") {
             // Explicit arc endpoint refs select the G1 junction, not the singular
             // center-distance tangency equation at an already-coincident endpoint.
@@ -324,6 +396,13 @@ class Definer {
         merged.converged = after.converged;
         merged.conflicting = std::move(after.conflicting);
         merged.redundant = std::move(after.redundant);
+        std::set<std::string> local_ids;
+        for (const auto& c : local["constraints"])
+            local_ids.insert(c.value("id", std::string()));
+        auto& partial = merged.partial_dependencies;
+        partial.erase(std::remove_if(partial.begin(), partial.end(),
+            [&](const auto& p) { return local_ids.count(p.first) != 0; }), partial.end());
+        partial.insert(partial.end(), after.partial_dependencies.begin(), after.partial_dependencies.end());
         for (const auto& entry : after.var_map) {
             const auto& target = merged.var_map.at(entry.first);
             for (std::size_t i = 0; i < target.size(); ++i)
@@ -334,13 +413,44 @@ class Definer {
         merged.state.x = merged.x;
         return merged;
     }
-    void accept(std::vector<json> candidates) {
+    // Nearest clean increment for a measured driving value (see DefineOptions::round_dimensions).
+    double snap(double value, bool angle) const {
+        const double magnitude = std::abs(value);
+        const double step = angle ? 1.0 : magnitude >= 100 ? 1.0 : magnitude >= 10 ? 0.5
+                                        : magnitude >= 1 ? 0.1 : 0.05;
+        const double target = std::round(value / step) * step;
+        if (std::abs(target - value) <= std::min(0.1 * step, 0.005 * magnitude)) return target;
+        return std::round(value * 1e4) / 1e4;
+    }
+    // The geometry may drift from the authored shape only by what rounding was allowed to move
+    // (each coordinate by at most the snapped distance; numeric_match uses a quarter of this).
+    double move_tolerance(double extra_slack) const {
+        return opt_.length_tol + 4.0 * (slack_ + extra_slack);
+    }
+    bool introduces_redundancy(const SketchSolution& trial) const {
+        return std::any_of(trial.redundant.begin(), trial.redundant.end(),
+                           [&](const std::string& id) { return !baseline_redundant_.count(id); });
+    }
+    void accept(std::vector<json> candidates, bool allow_snap = true) {
         if (candidates.empty() || solved_.dof == 0) return;
         const auto count = sketch_["constraints"].size();
-        for (auto& c : candidates) {
+        std::vector<std::optional<double>> measured(candidates.size());
+        double batch_slack = 0;
+        bool snapped_any = false;
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            auto& c = candidates[i];
             if (c.contains("value")) {
                 auto value = measure_constraint(c, solved_.entities);
-                if (value) c["value"] = {{"value", *value}};
+                if (value) {
+                    measured[i] = *value;
+                    const bool angle = c.at("type") == "angle";
+                    const double target = allow_snap && opt_.round_dimensions ? snap(*value, angle) : *value;
+                    if (target != *value) {
+                        snapped_any = true;
+                        batch_slack += std::abs(target - *value) * (angle ? radians * extent_ : 1.0);
+                    }
+                    c["value"] = {{"value", target}};
+                }
             }
             do { c["id"] = "__fully_define_" + std::to_string(next_id_++); }
             while (constraint_ids_.count(c.at("id").get<std::string>()));
@@ -348,16 +458,44 @@ class Definer {
         }
         auto trial = solve_trial(candidates);
         sketch_["constraints"].erase(sketch_["constraints"].begin() + count, sketch_["constraints"].end());
-        const bool unchanged = geometry_matches(original_, trial.entities, opt_.length_tol);
-        if (trial.converged && trial.conflicting.empty() && trial.redundant.empty() &&
-            trial.dof <= solved_.dof - static_cast<int>(candidates.size()) && unchanged) {
-            for (auto& c : candidates) {
+        const bool unchanged = geometry_matches(original_, trial.entities, move_tolerance(batch_slack));
+        // A relation can have a dependent row while its other rows still
+        // contribute rank. Do not introduce that over-definition just because
+        // the complete relation is not safe to delete. Preserve any partial
+        // dependencies that were already present in the authored sketch.
+        const bool new_partial = std::any_of(
+            trial.partial_dependencies.begin(), trial.partial_dependencies.end(),
+            [&](const auto& p) {
+                auto before = std::find_if(solved_.partial_dependencies.begin(),
+                    solved_.partial_dependencies.end(),
+                    [&](const auto& old) { return old.first == p.first; });
+                return before == solved_.partial_dependencies.end() || p.second < before->second;
+            });
+        // Redundant relations that were already in the authored sketch do not count against a
+        // candidate; only dependency the candidate itself introduces does.
+        if (trial.converged && trial.conflicting.empty() && !introduces_redundancy(trial) &&
+            !new_partial && trial.dof <= solved_.dof - static_cast<int>(candidates.size()) && unchanged) {
+            for (std::size_t i = 0; i < candidates.size(); ++i) {
+                auto& c = candidates[i];
+                if (measured[i]) {
+                    const double delta = std::abs(c["value"]["value"].get<double>() - *measured[i]);
+                    if (delta > 6e-5) {
+                        ++result_.rounded;
+                        result_.rounded_max_delta = std::max(result_.rounded_max_delta, delta);
+                    }
+                }
                 constraint_ids_.insert(c.at("id").get<std::string>());
                 sketch_["constraints"].push_back(c);
                 c.erase("id");
                 result_.constraints.push_back(std::move(c));
             }
+            slack_ += batch_slack;
             solved_ = std::move(trial);
+            return;
+        }
+        if (candidates.size() == 1 && snapped_any) {
+            // The rounded value did not fit the sketch: retry once with the exact measurement.
+            accept(std::move(candidates), false);
             return;
         }
         if (candidates.size() == 1 ||
@@ -434,7 +572,8 @@ class Definer {
             for (std::size_t j = i + 1; j < ids_.size(); ++j) {
                 const auto& a = solved_.entities.at(ids_[i]);
                 const auto& b = solved_.entities.at(ids_[j]);
-                if (eligible(ids_[i], ids_[j]) && round_curve(a) && round_curve(b) &&
+                if (eligible(ids_[i], ids_[j]) && a.value("type", "") == "arc" &&
+                    b.value("type", "") == "arc" &&
                     exact(a["radius"], b["radius"]) && radii.join(ids_[i], ids_[j]))
                     relation(candidates, "equal", {ids_[i], ids_[j]});
             }
@@ -462,6 +601,61 @@ class Definer {
         }
         accept(std::move(candidates));
         candidates.clear();
+        // Reflection carries both the centering and alignment intent. Establish
+        // it before h/v: even one duplicated equation rejects an entire relation.
+        // Whole-circle reflection also carries equal radius; do not pre-empt it
+        // with separate equal constraints.
+        if (opt_.anchor_origin) {
+            coincident = {};
+            for (const auto& c : sketch_["constraints"])
+                if (!c.value("driven", false) && c.value("type", "") == "coincident" &&
+                    c.value("refs", json::array()).size() == 2)
+                    coincident.join(c["refs"][0], c["refs"][1]);
+            auto mirrored = [&](const Endpoint& a, const Endpoint& b, bool vertical) {
+                Point p = handle_point(a.handle, solved_.entities);
+                Point q = handle_point(b.handle, solved_.entities);
+                return coincident.root(a.handle) != coincident.root(b.handle) &&
+                       std::abs(vertical ? p.x : p.y) > opt_.length_tol &&
+                       (Point{vertical ? -p.x : p.x, vertical ? p.y : -p.y} - q).norm() <=
+                           opt_.length_tol;
+            };
+            Groups circles;
+            for (std::size_t i = 0; i < endpoints.size(); ++i) {
+                const auto& a = endpoints[i];
+                const auto ai = entity_of(a.handle);
+                if (a.handle != ai + ".center" || solved_.entities.at(ai).value("type", "") != "circle")
+                    continue;
+                for (std::size_t j = i + 1; j < endpoints.size(); ++j) {
+                    const auto& b = endpoints[j];
+                    const auto bi = entity_of(b.handle);
+                    if (b.handle != bi + ".center" || solved_.entities.at(bi).value("type", "") != "circle" ||
+                        !eligible(ai, bi) ||
+                        !exact(solved_.entities.at(ai).at("radius"), solved_.entities.at(bi).at("radius")))
+                        continue;
+                    for (bool vertical : {true, false})
+                        if (mirrored(a, b, vertical) && circles.join(ai, bi))
+                            relation(candidates, "symmetric", {ai, bi, vertical ? "axis.v" : "axis.h"});
+                }
+            }
+            accept(std::move(candidates));
+            candidates.clear();
+            // A reflection tree is enough for a rectangular pattern. Coincident
+            // aliases must not produce a second relation for the same vertex.
+            Groups reflections;
+            for (std::size_t i = 0; i < endpoints.size(); ++i)
+                for (std::size_t j = i + 1; j < endpoints.size(); ++j) {
+                    const auto& a = endpoints[i];
+                    const auto& b = endpoints[j];
+                    if (!eligible(a.handle, b.handle)) continue;
+                    for (bool vertical : {true, false})
+                        if (mirrored(a, b, vertical) &&
+                            reflections.join(coincident.root(a.handle), coincident.root(b.handle)))
+                            relation(candidates, "symmetric",
+                                     {a.handle, b.handle, vertical ? "axis.v" : "axis.h"});
+                }
+            accept(std::move(candidates));
+            candidates.clear();
+        }
         Groups collinear;
         for (std::size_t i = 0; i < ids_.size(); ++i)
             for (std::size_t j = i + 1; j < ids_.size(); ++j) {
@@ -479,6 +673,59 @@ class Definer {
             if (!selected(id) || !line_curve(e)) continue;
             if (parallel(direction(e), {1, 0})) relation(candidates, "horizontal", {id});
             else if (parallel(direction(e), {0, 1})) relation(candidates, "vertical", {id});
+        }
+        accept(std::move(candidates));
+        candidates.clear();
+        if (opt_.anchor_origin) {
+            for (const auto& ep : endpoints) {
+                const Point p = handle_point(ep.handle, solved_.entities);
+                if (!selected(ep.handle) || p.norm() <= opt_.length_tol) continue;
+                if (std::abs(p.x) <= opt_.length_tol)
+                    relation(candidates, "point_on", {ep.handle, "axis.v"});
+                if (std::abs(p.y) <= opt_.length_tol)
+                    relation(candidates, "point_on", {ep.handle, "axis.h"});
+            }
+            // An edge midpoint on an axis centers an h/v profile (a rectangle drawn
+            // about the origin) where point-pair symmetry would duplicate its h/v.
+            for (const auto& id : ids_) {
+                if (!selected(id) || !line_curve(solved_.entities.at(id))) continue;
+                const Point p = handle_point(id + ".mid", solved_.entities);
+                if (std::abs(p.x) <= opt_.length_tol)
+                    relation(candidates, "point_on", {id + ".mid", "axis.v"});
+                if (std::abs(p.y) <= opt_.length_tol)
+                    relation(candidates, "point_on", {id + ".mid", "axis.h"});
+            }
+            accept(std::move(candidates));
+            candidates.clear();
+        }
+        // Align independent centers/points before equal radii join their profiles.
+        // Separate row/column forests retain n-1 relations, not all pairings.
+        Groups rows, columns;
+        for (const auto& component : components(sketch_)) {
+            const auto first = component.at("entities").front().at("id").get<std::string>();
+            for (const auto& e : component.at("entities")) {
+                rows.join(first, e.at("id"));
+                columns.join(first, e.at("id"));
+            }
+        }
+        auto isolated = [&](const Endpoint& ep) {
+            return ep.handle == entity_of(ep.handle) ||
+                   ep.handle == entity_of(ep.handle) + ".center";
+        };
+        for (std::size_t i = 0; i < endpoints.size(); ++i) {
+            const auto& a = endpoints[i];
+            if (!isolated(a)) continue;
+            for (std::size_t j = i + 1; j < endpoints.size(); ++j) {
+                const auto& b = endpoints[j];
+                if (!isolated(b) || !eligible(a.handle, b.handle)) continue;
+                Point p = handle_point(a.handle, solved_.entities), q = handle_point(b.handle, solved_.entities);
+                if ((p - q).norm() <= opt_.length_tol) continue;  // prefer concentric
+                const auto ai = entity_of(a.handle), bi = entity_of(b.handle);
+                if (std::abs(p.y - q.y) <= opt_.length_tol && rows.join(ai, bi))
+                    relation(candidates, "horizontal", {a.handle, b.handle});
+                if (std::abs(p.x - q.x) <= opt_.length_tol && columns.join(ai, bi))
+                    relation(candidates, "vertical", {a.handle, b.handle});
+            }
         }
         accept(std::move(candidates));
         candidates.clear();
@@ -652,20 +899,51 @@ class Definer {
             }
             if (datum.empty() && !endpoints.empty()) datum = endpoints.front().handle;
         }
+        Groups coincident;
+        for (const auto& c : sketch_["constraints"])
+            if (!c.value("driven", false) && c.value("type", "") == "coincident" &&
+                c.value("refs", json::array()).size() == 2)
+                coincident.join(canonical_point_handle(c["refs"][0], solved_.entities),
+                                canonical_point_handle(c["refs"][1], solved_.entities));
+        std::map<std::string, std::string> horizontal_partner, vertical_partner;
+        for (const auto& c : sketch_["constraints"]) {
+            if (c.value("driven", false) || c.value("type", "") != "symmetric") continue;
+            const auto refs = c.at("refs").get<std::vector<std::string>>();
+            if (refs.size() != 3 || (refs[2] != "axis.v" && refs[2] != "axis.h")) continue;
+            auto handle = [&](const std::string& ref) -> std::string {
+                if (ref == entity_of(ref) && solved_.entities.contains(ref)) {
+                    const auto& e = solved_.entities.at(ref);
+                    if (round_curve(e)) return ref + ".center";
+                    if (e.value("type", "") != "point") return {};
+                }
+                return canonical_point_handle(ref, solved_.entities);
+            };
+            const auto a = handle(refs[0]), b = handle(refs[1]);
+            if (a.empty() || b.empty()) continue;
+            auto& partners = refs[2] == "axis.v" ? horizontal_partner : vertical_partner;
+            partners.emplace(coincident.root(a), b);
+            partners.emplace(coincident.root(b), a);
+        }
         auto locate = [&](const Endpoint& ep, const std::string& reference, const Freedom& loose) {
             if (reference.empty() || !selected(ep.handle) || !loose.count(entity_of(ep.handle))) return;
             // start/end and pK can name the identical spline variable pair.
             // A dimension to that same point must not anchor a floating datum.
             if (canonical_point_handle(ep.handle, solved_.entities) ==
                 canonical_point_handle(reference, solved_.entities)) return;
-            Point p = handle_point(ep.handle, solved_.entities), a = handle_point(reference, solved_.entities);
+            const Point p = handle_point(ep.handle, solved_.entities);
             const auto axes = point_freedom(ep.handle, loose);
-            if (axes.first)
-                dimension(candidates, "distance", {reference, ep.handle},
-                          {(a.x + p.x) / 2, p.y - 5}, "h");
-            if (axes.second)
-                dimension(candidates, "distance", {reference, ep.handle},
-                          {p.x + 5, (a.y + p.y) / 2}, "v");
+            const auto root = coincident.root(canonical_point_handle(ep.handle, solved_.entities));
+            auto locate_axis = [&](bool horizontal, const std::map<std::string, std::string>& partners) {
+                auto partner = partners.find(root);
+                const auto& ref = opt_.anchor_origin && reference == datum && partner != partners.end()
+                    ? partner->second : reference;
+                const Point a = handle_point(ref, solved_.entities);
+                dimension(candidates, "distance", {ref, ep.handle},
+                          horizontal ? Point{(a.x + p.x) / 2, p.y - 5} : Point{p.x + 5, (a.y + p.y) / 2},
+                          horizontal ? "h" : "v");
+            };
+            if (axes.first) locate_axis(true, horizontal_partner);
+            if (axes.second) locate_axis(false, vertical_partner);
         };
         // One location pair per connected profile avoids chains of dimensions
         // around a rectangle; independent islands can be verified in one batch.
@@ -731,18 +1009,108 @@ public:
             if (!c.value("driven", false)) considered_.insert(signature(c));
         }
     }
+    // The pass refuses only an unsound system: no convergence, conflicting constraints or a
+    // redundant DRIVING dimension (which would over-define the sketch). Redundant geometric
+    // relations are tolerated. A refusal is always explained, naming the constraint sets
+    // involved (the dependency partners come from the exact solve).
+    bool sound() {
+        const auto driving = redundant_driving_dimensions(sketch_, solved_);
+        if (solved_.converged && solved_.conflicting.empty() && driving.empty()) return true;
+        const auto exact = solve_sketch(sketch_, env_);
+        auto describe = [&](const std::string& id) {
+            for (const auto& c : sketch_["constraints"])
+                if (c.value("id", std::string()) == id) return constraint_label(c);
+            return id;
+        };
+        auto partners_of = [&](const std::string& id) {
+            std::string text;
+            for (const auto& entry : exact.dependency_partners) {
+                if (entry.first != id || entry.second.empty()) continue;
+                text = id + " duplicates or contradicts ";
+                for (std::size_t i = 0; i < entry.second.size(); ++i)
+                    text += (i ? ", " : "") + describe(entry.second[i]);
+            }
+            return text;
+        };
+        if (!solved_.converged || !solved_.conflicting.empty()) {
+            std::string why;
+            if (exact.converged && exact.conflicting.empty()) {
+                why = "the interactive solve found conflicting constraints " + join_ids(solved_.conflicting);
+            } else {
+                why = nonconvergence_reason(sketch_, exact);
+            }
+            result_.notes.push_back("Nothing was added: " + why +
+                                    " Fix the conflict (sketch_health lists the conflict sets), then define again.");
+        }
+        if (!driving.empty()) {
+            std::string detail;
+            for (const auto& id : driving) {
+                const auto text = partners_of(id);
+                if (!text.empty()) detail += (detail.empty() ? "" : "; ") + text;
+            }
+            result_.notes.push_back(
+                "Nothing was added: redundant driving dimension(s) " + join_ids(driving) +
+                " over-define the sketch" + (detail.empty() ? std::string() : " (" + detail + ")") +
+                ". Delete one, or set driven:true to keep it as a measurement, then define again.");
+        }
+        return false;
+    }
+    void note_tolerated() {
+        std::vector<std::string> geometric;
+        for (const auto& id : solved_.redundant) geometric.push_back(id);
+        if (!geometric.empty())
+            result_.notes.push_back("Redundant geometric relation(s) " + join_ids(geometric) +
+                                    " were left in place; they do not block defining. Delete them if unintended.");
+        std::size_t shown = 0;
+        for (const auto& [id, reason] : solved_.skipped) {
+            if (shown++ == 5) {
+                result_.notes.push_back("and " + std::to_string(solved_.skipped.size() - 5) +
+                                        " more constraint(s) skipped by the solver.");
+                break;
+            }
+            result_.notes.push_back("Constraint " + id + " is skipped by the solver (" + reason +
+                                    ") and does not constrain the sketch; fix or delete it.");
+        }
+    }
+    void measure_extent() {
+        double lo_x = 1e300, hi_x = -1e300, lo_y = 1e300, hi_y = -1e300;
+        auto add = [&](const json& p, double margin = 0) {
+            if (!p.is_array() || p.size() < 2 || !p[0].is_number() || !p[1].is_number()) return;
+            const auto q = point(p);
+            lo_x = std::min(lo_x, q.x - margin); hi_x = std::max(hi_x, q.x + margin);
+            lo_y = std::min(lo_y, q.y - margin); hi_y = std::max(hi_y, q.y + margin);
+        };
+        for (const auto& id : ids_) {
+            const auto& e = solved_.entities.at(id);
+            for (const char* key : {"p1", "p2", "p"})
+                if (e.contains(key)) add(e[key]);
+            if (e.contains("center"))
+                add(e["center"], e.contains("radius") && e["radius"].is_number() ? e["radius"].get<double>() : 0);
+            if (e.contains("points") && e["points"].is_array())
+                for (const auto& p : e["points"]) add(p);
+        }
+        extent_ = hi_x >= lo_x ? std::max(1.0, std::hypot(hi_x - lo_x, hi_y - lo_y)) : 1.0;
+    }
     DefineResult run() {
         solved_ = solve_sketch(sketch_, env_, std::nullopt, std::nullopt, true);
         result_.dof_before = result_.dof_after = solved_.dof;
-        if (!solved_.converged || !solved_.conflicting.empty() || !solved_.redundant.empty()) {
-            result_.notes.push_back("Resolve existing conflicting or redundant constraints before fully defining the sketch.");
+        if (!sound()) return result_;
+        baseline_redundant_.insert(solved_.redundant.begin(), solved_.redundant.end());
+        note_tolerated();
+        if (solved_.dof == 0) {
+            result_.notes.push_back("Already fully defined (0 degrees of freedom): nothing to add.");
             return result_;
         }
-        if (solved_.dof == 0) return result_;
         original_ = solved_.entities;
+        measure_extent();
         if (opt_.relations) infer_relations();
         if (opt_.dimensions && solved_.dof > 0) add_dimensions();
         result_.dof_after = solved_.dof;
+        if (result_.rounded > 0)
+            result_.notes.push_back("Rounded " + std::to_string(result_.rounded) +
+                                    " auto dimension value(s) to clean increments (largest change " +
+                                    format_number(result_.rounded_max_delta) +
+                                    "); pass round:false to keep the exact measured values.");
         if (solved_.dof > 0) {
             auto free = freedom();
             for (const auto& id : ids_) {
@@ -772,5 +1140,104 @@ public:
 
 DefineResult fully_define(const json& sketch, const json& env, const DefineOptions& opt) {
     return Definer(sketch, env, opt).run();
+}
+
+SettleAutoResult settle_auto_constraints(const json& sketch, const json& env) {
+    SettleAutoResult result{sketch, {}, {}};
+    const auto& original = sketch.at("constraints");
+    if (std::none_of(original.begin(), original.end(),
+                     [](const json& c) { return c.value("auto", false); }))
+        return result;
+
+    auto& constraints = result.sketch["constraints"];
+    constraints = json::array();
+    for (const auto& c : original)
+        if (!c.value("auto", false)) constraints.push_back(c);
+    auto solved = solve_sketch(result.sketch, env, std::nullopt, std::nullopt, true);
+    // Redundant geometric relations and skipped constraints the explicit system already has
+    // are not this pass's business: only NEW dependency or skips supersede an auto constraint.
+    const std::set<std::string> baseline_redundant(solved.redundant.begin(), solved.redundant.end());
+    std::set<std::string> baseline_skipped;
+    for (const auto& skipped : solved.skipped) baseline_skipped.insert(skipped.first);
+    auto consistent = [&](const SketchSolution& solution) {
+        return solution.converged && solution.conflicting.empty() &&
+               std::all_of(solution.redundant.begin(), solution.redundant.end(),
+                           [&](const std::string& id) { return baseline_redundant.count(id) != 0; }) &&
+               std::all_of(solution.skipped.begin(), solution.skipped.end(),
+                           [&](const auto& skipped) { return baseline_skipped.count(skipped.first) != 0; });
+    };
+    // An unsound explicit system is returned unchanged for normal conflict reporting; the
+    // auto constraints are neither re-admitted nor refilled, and the notes say so.
+    const auto driving = redundant_driving_dimensions(result.sketch, solved);
+    if (!solved.converged || !solved.conflicting.empty() || !driving.empty()) {
+        result = {sketch, {}, {}};
+        result.notes.push_back(
+            "Auto constraints were left as they were: the explicit constraints " +
+            std::string(!solved.converged || !solved.conflicting.empty()
+                            ? "do not solve (conflicting constraints)"
+                            : "contain redundant driving dimension(s) " + join_ids(driving)) +
+            ". Fix those first; sketch_health names the conflict set.");
+        return result;
+    }
+    if (!solved.redundant.empty())
+        result.notes.push_back("Existing redundant geometric relations " + join_ids(solved.redundant) +
+                               " were retained while settling auto constraints.");
+    for (const auto& [id, reason] : solved.skipped)
+        result.notes.push_back("Constraint " + id + " was skipped: " + reason);
+
+    // Re-admit prior auto constraints in order. The common case (nothing superseded)
+    // costs one solve; a rejected batch is bisected so each culprit is isolated in
+    // O(k log n) solves instead of one solve per auto constraint.
+    std::set<std::string> retained;
+    std::vector<json> pending;
+    for (const auto& c : original)
+        if (c.value("auto", false)) pending.push_back(c);
+    std::function<void(std::size_t, std::size_t)> admit = [&](std::size_t begin, std::size_t end) {
+        if (begin == end) return;
+        const auto count = constraints.size();
+        for (std::size_t i = begin; i < end; ++i) constraints.push_back(pending[i]);
+        auto trial = solve_sketch(result.sketch, env, solved.state, std::nullopt, true);
+        if (consistent(trial)) {
+            for (std::size_t i = begin; i < end; ++i)
+                retained.insert(pending[i].at("id").get<std::string>());
+            solved = std::move(trial);
+            return;
+        }
+        constraints.erase(constraints.begin() + count, constraints.end());
+        if (end - begin == 1) {
+            result.superseded.push_back(pending[begin].at("id").get<std::string>());
+            return;
+        }
+        const auto middle = begin + (end - begin) / 2;
+        admit(begin, middle);
+        admit(middle, end);
+    };
+    admit(0, pending.size());
+    // Preserve declaration order as well as ids, including interleaved explicit constraints.
+    constraints = json::array();
+    for (const auto& c : original)
+        if (!c.value("auto", false) || retained.count(c.at("id").get<std::string>()))
+            constraints.push_back(c);
+    // Use the accepted solved shape, not the original seeds, for the completion pass.
+    for (auto& entity : result.sketch["entities"]) {
+        const auto& coords = solved.entities.at(entity.at("id").get<std::string>());
+        for (auto it = coords.begin(); it != coords.end(); ++it)
+            if (it.key() != "id" && it.key() != "type" && it.key() != "construction" &&
+                it.key() != "ccw" && entity.contains(it.key()))
+                entity[it.key()] = it.value();
+    }
+    DefineOptions refill_options;
+    refill_options.round_dimensions = true;
+    auto refill = fully_define(result.sketch, env, refill_options);
+    for (auto& c : refill.constraints) {
+        c["auto"] = true;
+        constraints.push_back(std::move(c));
+    }
+    if (!result.superseded.empty())
+        result.notes.push_back("Superseded auto constraint(s) " + join_ids(result.superseded) +
+                               ": explicit intent now determines that part of the sketch.");
+    if (refill.dof_before > 0)
+        result.notes.insert(result.notes.end(), refill.notes.begin(), refill.notes.end());
+    return result;
 }
 }  // namespace chudware::sketch

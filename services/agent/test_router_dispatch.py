@@ -68,6 +68,7 @@ class TestLinearRoleTurn:
 
         provider = _ScriptedProvider([
             '```json\n{"tool": "fs_list", "args": {"path": "."}}\n```',
+            '```json\n{"tool": "enable_tools", "args": {"tools": ["plm_checkpoint"]}}\n```',
             '```json\n{"tool": "plm_checkpoint", "args": {"message": "cleanup"}}\n```',
             "Cleaned up the project and checkpointed it; nothing else to do.",
         ])
@@ -79,13 +80,13 @@ class TestLinearRoleTurn:
             tool_dispatch=_dispatch,
         )
 
-        assert turn["success"] is True
+        assert turn["success"] is True, turn
         assert turn["role"] == "general_agent"
         assert dispatched == ["fs_list", "plm_checkpoint"]
 
         # Explicit Do it permits filesystem/project work.
         allowed = turn["allowed_tools"]
-        for t in ("fs_write", "fs_edit", "plm_open", "plm_checkpoint"):
+        for t in ("fs_write", "fs_edit"):
             assert t in allowed, f"{t} missing from general_agent turn tools"
         # Security hardening 3aaee658: the contract keeps shell behind explicit
         # role/category enablement, never on the automatic main-chat floor.
@@ -95,61 +96,23 @@ class TestLinearRoleTurn:
         assert "enable_tools" in allowed
         assert "delegate" not in allowed
         assert "mission_start" not in allowed
-        # The 6-axis MG90S turn had only web tools available and researched
-        # indefinitely instead of loading library/CAD acquisition. Keep the
-        # reference path in the immediate main-chat loadout.
-        # A zero-clash transform-only arm is not a driveable mechanism; keep
-        # simulate_motion with the mate/solve tools on the loaded floor.
-        for t in ("new_part", "add_features", "asm_add_component", "asm_mate",
-                  "solve_mates", "simulate_motion", "describe_part", "measure_part",
-                  "verify_battery", "part_search", "part_get", "part_source",
-                  "match_model", "make_standard_part", "list_standard_parts",
-                  "fetch_cad_model", "import_artifact", "research_web_search",
-                  "research_fetch_page"):
-            assert t in allowed, f"{t} must be in the main-chat core loadout"
-
-    def test_main_chat_prompt_lists_every_unloaded_tool_by_name(self):
-        """Nothing is hidden: every registered tool outside the core is in the
-        MORE TOOLS menu by exact name, and nothing loaded is repeated there."""
-        from services.agent.mission_dispatch import (
-            _apply_session_preferences,
-            effective_role_system_prompt,
-            linear_role_allowed_tools,
-        )
+    def test_main_chat_toolbox_discovers_unloaded_tools(self):
+        from services.agent.agent_turn import _tool_category_catalog_result
+        from services.agent.mission_dispatch import linear_role_allowed_tools
         from services.agent.roles import load_role
-        from services.agent.tool_categories import _live_catalog, expand_menu_entry
-        from services.mcp import tool_registry
-
-        tool_registry.warm_catalog()
-        card = load_role("general_agent")
-        allowed, system = _apply_session_preferences(
-            "general_agent",
-            linear_role_allowed_tools(card),
-            effective_role_system_prompt(card),
-        )
-        # Split on the actual rendered menu header, not the role's prose
-        # mention of "MORE TOOLS": instructions can list loaded tool names too.
-        heading = "MORE TOOLS (registered, not loaded yet)."
-        assert heading in system
-        menu = system.split(heading, 1)[1]
-        listed = {
-            name
-            for line in menu.splitlines()
-            if line.startswith("  ")
-            for tok in line.split(",")
-            for name in expand_menu_entry(tok)
-        }
-        registry = set(_live_catalog())
-        unloaded = registry - set(allowed)
-        assert unloaded, "registry must be warm for this test to mean anything"
-        assert unloaded <= listed, sorted(unloaded - listed)[:20]
-        assert not (listed & set(allowed)), sorted(listed & set(allowed))[:20]
-        # The menu folds shared prefixes (`ecad_{a|b}`); a model that copies an entry
-        # verbatim into enable_tools gets exactly those tools, nothing unknown.
         from services.agent.tool_categories import resolve_tool_requests
-        folded = next(tok.strip() for line in menu.splitlines() if line.startswith("  ")
-                      for tok in line.split(",") if "{" in tok)
-        assert resolve_tool_requests([folded]) == (set(expand_menu_entry(folded)), [])
+
+        allowed = set(linear_role_allowed_tools(load_role("general_agent")))
+        assert "add_features" not in allowed
+        result = _tool_category_catalog_result(query="add_features")
+        assert result["ok"]
+        assert any(tool["name"] == "add_features" and tool["description"]
+                   for tool in result["tools"])
+        assert resolve_tool_requests(["add_features"]) == ({"add_features"}, [])
+        for name in ("cad_guide", "show_in_app"):
+            assert name not in allowed
+            result = _tool_category_catalog_result(query=name)
+            assert any(tool["name"] == name for tool in result["tools"])
 
     def test_main_chat_runs_past_old_thirty_call_limit(self):
         """The old linear budget killed a composed 31st dispatch. Main chat now

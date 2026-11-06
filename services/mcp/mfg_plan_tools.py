@@ -6,6 +6,7 @@ registered in the ``cad`` family by :mod:`services.mcp.server`.
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -43,15 +44,11 @@ def _required_text(value: Any, field: str) -> str:
 
 def _profile_snapshot(process_id: str, supplied: Any) -> dict:
     from services.agent.geometry_helpers import (  # noqa: PLC0415
-        _KNOWN_PROFILE_IDS,
         _profile,
         canonical_process_strict,
     )
     canonical = canonical_process_strict(process_id)
-    if canonical not in _KNOWN_PROFILE_IDS():
-        raise ValueError(
-            f"unknown manufacturing process {process_id!r}; a real DfM profile is required"
-        )
+    profile = _profile(str(canonical))
     if isinstance(supplied, dict) and supplied:
         snapshot = dict(supplied)
         stated = snapshot.get("process")
@@ -61,7 +58,7 @@ def _profile_snapshot(process_id: str, supplied: Any) -> dict:
             )
         snapshot.setdefault("process", canonical)
         return snapshot
-    return dict(_profile(str(canonical)))
+    return dict(profile)
 
 
 def _normalize_source(plan: dict) -> dict:
@@ -567,67 +564,41 @@ def _geometry_ref_check(ledger, plan: dict) -> dict:
     }
 
 
+def _geometry_dfm_check(doc_id: str, process: str) -> dict:
+    """Run the same geometry-backed DfM tool used outside manufacturing plans."""
+    from services.verify.battery import _get_fn  # noqa: PLC0415
+    result = _get_fn("intake", "dfm_check")(doc_id=doc_id, process=process)
+    if isinstance(result, str):
+        result = json.loads(result)
+    if not isinstance(result, dict):
+        raise ValueError("dfm_check returned no structured result")
+    return result
+
+
 def _dfm_checks(ledger, plan: dict) -> list[dict]:
-    from services.agent import geometry_helpers  # noqa: PLC0415
-    specs = {row.get("id"): row for row in ledger.geometry_specs()}
-    checks: list[dict] = []
-    for operation in plan.get("operations", []):
-        kinds: list[str] = []
-        if operation.get("geometry_kind"):
-            kinds.append(str(operation["geometry_kind"]))
-        for ref in _geometry_refs(operation):
-            for shape in specs.get(ref, {}).get("shapes", []):
-                if isinstance(shape, dict) and shape.get("kind"):
-                    kinds.append(str(shape["kind"]))
-        kind = next((candidate for candidate in kinds if geometry_helpers.binding_for(candidate)), None)
-        name = f"dfm:{operation.get('id', '?')}"
-        if not kind:
-            checks.append({
-                "check": name, "status": "not_evaluated",
-                "detail": "no geometry helper binding is available for this operation",
-            })
-            continue
-        try:
-            result = geometry_helpers.resolve_helpers(
-                kind,
-                material=plan.get("material", {}).get("key", ""),
-                process=plan.get("process", {}).get("id", ""),
-                **(operation.get("helper_inputs") or {}),
-            )
-        except Exception as exc:  # engine-less and optional calculators are supported
-            checks.append({
-                "check": name, "status": "not_evaluated",
-                "detail": f"DfM helper unavailable: {exc}", "geometry_kind": kind,
-            })
-            continue
-        if result is None or not result.ok:
-            checks.append({
-                "check": name, "status": "not_evaluated",
-                "detail": (result.note if result is not None else "no DfM helper result"),
-                "geometry_kind": kind,
-            })
-            continue
-        inputs = operation.get("helper_inputs") or {}
-        failures: list[str] = []
-        limits = result.numbers
-        comparisons = (
-            ("wall_mm", "min_wall_mm"),
-            ("feature_mm", "min_feature_mm"),
-            ("draft_deg", "process_min_draft_deg"),
-        )
-        for actual_key, limit_key in comparisons:
-            actual = inputs.get(actual_key)
-            limit = limits.get(limit_key)
-            if isinstance(actual, (int, float)) and isinstance(limit, (int, float)) and actual < limit:
-                failures.append(f"{actual_key}={actual} below {limit_key}={limit}")
-        checks.append({
-            "check": name,
-            "status": "fail" if failures else "pass",
-            "detail": "; ".join(failures) if failures else "DfM facts resolved",
-            "geometry_kind": kind,
-            "facts": result.as_dict(),
-        })
-    return checks
+    """Apply the actual source-document screening, never caller-entered helper inputs."""
+    source = plan.get("source_doc") or {}
+    doc_id = source.get("doc_id")
+    process = (plan.get("process") or {}).get("id")
+    operations = plan.get("operations") or []
+    names = [f"dfm:{operation.get('id', '?')}" for operation in operations] or ["dfm:document"]
+    try:
+        if not doc_id or not process:
+            raise ValueError("plan needs an open source document and manufacturing process")
+        result = _geometry_dfm_check(str(doc_id), str(process))
+        if not result.get("ok"):
+            raise ValueError(result.get("error") or "dfm_check failed")
+        rows = result.get("checks")
+        status = result.get("status")
+        if not isinstance(rows, list) or not rows or status not in ("pass", "fail", "not_evaluated"):
+            raise ValueError("dfm_check returned no conclusive geometry-check evidence")
+        detail = "Document-wide geometry screening; not an operation-specific tool-access analysis."
+        return [{"check": name, "status": status, "detail": detail,
+                 "source_doc_id": doc_id, "geometry_checks": rows} for name in names]
+    except Exception as exc:  # noqa: BLE001
+        return [{"check": name, "status": "not_evaluated",
+                 "source_doc_id": doc_id, "detail": f"Geometry DfM unavailable: {exc}"}
+                for name in names]
 
 
 def _check_plan(ledger, plan: dict, doc_id: str | None) -> dict:
@@ -763,7 +734,12 @@ def register_mfg_plan_tools(mcp) -> None:
         plan_id: str = "main",
         doc_id: str | None = None,
     ) -> dict:
-        """Check structure, references, DfM facts, and blocking unknowns."""
+        """Check plan structure, references, document geometry DfM, and blocking unknowns.
+
+        DfM uses dfm_check on the source document and is reported as document-wide
+        evidence, not a per-operation tool-access check. Missing geometry is
+        not_evaluated; caller-entered helper_inputs are not geometry evidence.
+        """
         from services.agent.ledger import Ledger  # noqa: PLC0415
         ledger = Ledger.load(run_id)
         plan = _find_plan(ledger, plan_id)

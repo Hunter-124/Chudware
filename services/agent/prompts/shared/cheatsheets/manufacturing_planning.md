@@ -41,6 +41,7 @@ PROCESS SELECTION
 - Treat laser/waterjet/profile cutting as a blank-making step when holes, edges, finishes, or tolerances require secondary machining.
 - Use `machining_ref_search` for cited process capability, stock/allowance, reaming/drilling, and finish ranges; retrieve the full cited row with `machining_ref_get`.
 - After modeling, call `dfm_check`; distinguish not-evaluated from passed. A process profile or empty check list is not proof of manufacturability.
+- Tap-drill DFM checks compare authored pilot diameters with the calculator's cited result; missing thread or drill-size evidence is not a pass.
 
 DATUM AND SETUP STRATEGY
 - Choose primary, secondary, and tertiary datums from functional mating or locating surfaces; constrain 3, then 2, then 1 degrees of freedom.

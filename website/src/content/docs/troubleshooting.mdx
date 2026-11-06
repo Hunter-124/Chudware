@@ -6,11 +6,17 @@ order: 100
 ---
 ## The desktop app does not start
 
-All native builds are 64-bit and need a graphics driver capable of a modern hardware-accelerated 3D context; update the GPU driver first if the app exits at launch. Reinstalling the current build from the [latest GitHub release](https://github.com/Hunter-124/Chudware/releases/latest) replaces a corrupted install.
+Native builds need a graphics driver capable of a modern hardware-accelerated 3D context; update the GPU driver first if the app exits at launch. Public desktop installers are not yet available: rebuild from your trusted source checkout or consult its packaging notes rather than assuming a runtime prerelease is an installer. See [current setup choices](/download/).
 
 ## The viewport is blank or slow
 
 Update the GPU driver, then restart Chudware. Avoid remote-desktop sessions that do not pass through hardware-accelerated 3D graphics. If the interface appears but geometry does not, switch display style and fit the view before assuming the model is empty.
+
+## The self-hosted browser app does not start
+
+Use the [self-hosting guide](/docs/self-hosting/) on a Linux x86-64 host with Docker Compose and working nested user namespaces. From the repository root, read service logs with `docker compose -f web/compose.yaml logs --tail=100 chudware`. A namespace or bubblewrap failure means the host cannot provide the required sandbox; do not disable it or switch to an unsandboxed worker. Use a compatible host configuration.
+
+The default browser address is `http://127.0.0.1:8300/app/` on the server itself. A remote machine's loopback address is not your workstation's address. Follow the deployment README's authenticated HTTPS setup before exposing it remotely. A healthy HTTP liveness response alone does not prove that CAD operations are ready.
 
 ## A feature fails
 
@@ -18,11 +24,11 @@ Return to the first failed feature in the tree. Check its sketch state and refer
 
 ## The copilot cannot run
 
-Open **Settings → Providers** and confirm that a supported provider account is connected or that your API key passes its connection test. Check the selected provider's plan, API limits, and usage. Read the concrete error in the copilot feed before retrying, and inspect the feature tree for any tool actions that completed earlier in the turn. Enter provider credentials only in Provider settings, never in chat or project notes.
+Online Copilot is not available in the browser deployment; adding provider credentials does not enable it. In a desktop build, first check that its compatible copilot runtime is configured. Then open **Settings → Providers** and confirm that your supported provider account or API key passes its connection test. Check the provider's plan, limits, and usage, read the actual copilot error, and inspect any tool actions completed earlier in the turn. Enter credentials only in Provider settings, never in chat or project notes.
 
 ## Using Chudware on macOS
 
-The macOS build is published on GitHub Releases like the others; on Apple silicon the Intel build runs through Rosetta 2. It does not include the embedded browser used on Windows and Linux, so provider and vendor sign-in opens in your system browser. Do not download an unofficial installer.
+The configured macOS release target is ARM64 for Apple silicon, but no public desktop installer is currently available. A native build does not include the embedded browser used on Windows and Linux, so provider and vendor sign-in opens in your system browser. Use your trusted source checkout's build instructions; do not download an unofficial installer.
 
 ## macOS Parts Library vendor access
 
@@ -32,4 +38,4 @@ If a vendor blocks a search on macOS, use the local catalog, or run the vendor s
 
 ## Still stuck?
 
-Search the [GitHub issues](https://github.com/Hunter-124/Chudware/issues) and open a new one if nobody has reported the problem. Include your OS, the Chudware version, what you did, and the exact error text, but never passwords, provider keys, or private project files.
+Use [GitHub issues](https://github.com/Hunter-124/Chudware/issues) in the public repository, or [contact the project](/contact/). Include your OS, version, steps, and exact error text, but never passwords, provider keys, or private project files.

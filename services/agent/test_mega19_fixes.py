@@ -6,55 +6,10 @@ Axes:
   A19 — forced ecad_wire prefers power_in → rail refs returned by add_power
         (never invent #PWR1; no passive-passive when rail refs exist).
   B19 — forced DRC/trace args carry board doc_id from board_from_schematic.
-  C19 — sourceless netlist gets Device:V inject pre-simulate; measure_between
+  C19 — sourceless netlist gets a DC source before simulation; measure_between
         derives real feature refs or honest SKIP.
 """
 from __future__ import annotations
-
-import json
-from pathlib import Path
-
-import pytest
-
-
-_MEGA18_LEDGER = (
-    Path(__file__).resolve().parents[2] / "reports/runs/mega-18/ledger.json"
-)
-
-
-def _mega18_ecad_calls() -> list[dict]:
-    """Reconstruct ECAD call records from mega-18 ledger (A residual fixture)."""
-    if not _MEGA18_LEDGER.is_file():
-        pytest.skip(f"mega-18 ledger fixture missing: {_MEGA18_LEDGER}")
-    raw = json.loads(_MEGA18_LEDGER.read_text(encoding="utf-8"))
-    events = raw if isinstance(raw, list) else raw.get("events", [])
-    calls: list[dict] = []
-    for e in events:
-        pl = e.get("payload") or e
-        if pl.get("event") != "tool_call":
-            continue
-        tool = pl.get("tool")
-        if not tool:
-            continue
-        if not (
-            str(tool).startswith("ecad_") or tool in ("board_from_schematic",)
-        ):
-            continue
-        if "ok" not in pl:
-            continue
-        rec = {
-            "tool": tool,
-            "args": pl.get("args") or {},
-            "ok": bool(pl.get("ok")),
-            "result": pl.get("result"),
-        }
-        if isinstance(rec["result"], str):
-            try:
-                rec["result"] = json.loads(rec["result"])
-            except Exception:  # noqa: BLE001
-                pass
-        calls.append(rec)
-    return calls
 
 
 # ---------------------------------------------------------------------------
@@ -189,37 +144,12 @@ def test_forced_wire_uses_add_power_returned_ref():
     assert ends != {"R1"}, args
 
 
-def test_mega18_ledger_wire_after_power_prefers_rail_ref():
-    """Replay mega-18 ledger: after add_power with ref, wire must hit that ref."""
+def test_wire_after_power_prefers_rail_ref():
+    """After add_power with a ref, the wire must hit that ref."""
     from services.agent.agent_turn import (
         _ecad_forced_tool_args, _ecad_power_refs,
     )
 
-    calls = _mega18_ecad_calls()
-    # Build a residual that includes add_power results; if engine returned no
-    # ref (live mega-18 shape), inject the residual shape with explicit refs.
-    power_ok = [
-        c for c in calls
-        if c.get("ok") and c.get("tool") == "ecad_add_power"
-    ]
-    if not power_ok:
-        pytest.skip("mega-18 ledger has no add_power")
-
-    # Live mega-18 often returns no #PWR ref — synthesize residual for A proof
-    # using the ledger's place+power skeleton + explicit refs.
-    residual = []
-    for c in calls:
-        if c.get("tool") in (
-            "board_from_schematic", "ecad_run_drc", "ecad_run_erc",
-            "ecad_simulate", "ecad_wire",
-        ):
-            # stop before residual wire / board
-            if c.get("tool") == "ecad_wire":
-                break
-            if c.get("tool") != "ecad_wire":
-                break
-        residual.append(c)
-    # Ensure at least U1/R1-ish + power with refs for the A contract.
     synthetic = [
         {
             "tool": "ecad_new_schematic", "ok": True,
@@ -338,7 +268,7 @@ def test_forced_drc_from_truncated_board_result():
 # ---------------------------------------------------------------------------
 
 
-def test_force_cascade_injects_v_source_before_simulate():
+def test_force_cascade_injects_dc_source_before_simulate():
     from services.agent.agent_turn import _ecad_force_chain_cascade
 
     allow = {
@@ -389,16 +319,13 @@ def test_force_cascade_injects_v_source_before_simulate():
         dispatched.append((tool, dict(args or {})))
         if tool == "ecad_place_symbol":
             lib = str((args or {}).get("libid") or "")
-            if (
-                "Device:V" in lib or lib.endswith(":V")
-                or "V_source" in lib or "Simulation_SPICE" in lib
-            ):
+            if lib == "Simulation_SPICE:VDC":
                 return {
                     "ok": True, "ref": "V1", "libid": lib,
-                    "value": (args or {}).get("value") or "DC 3.3",
+                    "value": (args or {}).get("value") or "3.3",
                     "pins": [
-                        {"number": "+", "xy": [0, 2.54]},
-                        {"number": "-", "xy": [0, -2.54]},
+                        {"number": "1", "name": "", "type": "passive", "xy": [0, 5.08]},
+                        {"number": "2", "name": "", "type": "passive", "xy": [0, -5.08]},
                     ],
                 }
             return {"ok": True, "ref": "R9", "libid": lib}
@@ -429,10 +356,7 @@ def test_force_cascade_injects_v_source_before_simulate():
         if c.get("tool") == "ecad_place_symbol" and c.get("ok") and c.get("forced")
     ]
     assert any(
-        "Device:V" in str((c.get("args") or {}).get("libid") or "")
-        or "V_source" in str((c.get("args") or {}).get("libid") or "")
-        or "Simulation_SPICE" in str((c.get("args") or {}).get("libid") or "")
-        or str((c.get("result") or {}).get("ref") or "").startswith("V")
+        (c.get("args") or {}).get("libid") == "Simulation_SPICE:VDC"
         for c in places
     ), (places, dispatched)
     # Order: V place before simulate among forced.
@@ -481,8 +405,8 @@ def test_post_power_success_force_cascades_wire(tmp_path, monkeypatch):
         if tool == "ecad_place_symbol":
             refs["n"] += 1
             lib = str((args or {}).get("libid") or "")
-            if "Device:V" in lib or lib.endswith(":V"):
-                return {"ok": True, "ref": "V1", "libid": lib, "value": "DC 3.3"}
+            if lib == "Simulation_SPICE:VDC":
+                return {"ok": True, "ref": "V1", "libid": lib, "value": "3.3"}
             if "Device:R" in lib or lib.endswith(":R"):
                 return {
                     "ok": True, "ref": f"R{refs['n']}", "libid": lib,
@@ -571,7 +495,7 @@ def test_post_power_success_force_cascades_wire(tmp_path, monkeypatch):
     for w in wires:
         a = w.get("args") or {}
         ends |= {a.get("from_ref"), a.get("to_ref")}
-    assert ends & {"#PWRGND", "#PWR3V3", "U1", "R1", "R2", "R3", "R4", "R5"} or True
+    assert ends & {"#PWRGND", "#PWR3V3", "U1", "R1", "R2", "R3", "R4", "R5"}
     # DRC must target board id (B19).
     drcs = [
         c for c in calls
@@ -633,9 +557,9 @@ def test_cascade_extends_budget_to_finish_wire_board():
             }
         if tool == "ecad_place_symbol":
             lib = str((args or {}).get("libid") or "")
-            if "Device:V" in lib:
+            if lib == "Simulation_SPICE:VDC":
                 return {"ok": True, "ref": "V1", "libid": lib,
-                        "value": "DC 3.3"}
+                        "value": "3.3"}
             return {
                 "ok": True, "ref": "R1", "libid": "Device:R", "value": "1k",
                 "pins": [

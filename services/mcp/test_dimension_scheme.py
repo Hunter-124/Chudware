@@ -1,8 +1,7 @@
 """Tests for suggest_dimension_scheme.
 
-Tests run in offline mode (no bridge / no live doc) using the built-in 4-hole
-plate sketch fixture.  The bridge-unavailable path returns a synthetic entity
-list and notes the offline mode.
+Most tests exercise pure planning logic with explicit fixture geometry. The entry-point
+coverage also checks the real authored document tree through an isolated engine daemon.
 
 Run:
   python -m pytest services/mcp/test_dimension_scheme.py -v
@@ -10,149 +9,25 @@ Run:
 from __future__ import annotations
 
 import json
-import sys
-import types
 import unittest
 import unittest.mock
 
-# ---------------------------------------------------------------------------
-# Stubs so imports succeed without libchudware.so or live MCP server
-# ---------------------------------------------------------------------------
-
-def _install_stubs():
-    """Install lightweight stubs so dimension_scheme_tools + deps import without libchudware.so.
-
-    Returns a `restore()` callable. The stubs are needed ONLY at import time (every test
-    here exercises pure offline logic — no bridge call at run time), so the module wraps
-    its imports in `try: … finally: restore()` below. That matters for whole-dir pytest
-    sweeps: this module used to `setdefault` a fake `services.mcp.core_bridge` / `mcp` SDK
-    and — worse — mutate the REAL `services.mcp` package's attributes, which leaked into
-    sibling test modules (test_cad_tools' volume-baseline + render-caption saw a stubbed
-    core_bridge and failed). `restore()` removes exactly the keys/attrs this installed and
-    leaves any pre-existing real module untouched, so nothing leaks past import.
-    """
-    added: list = []            # sys.modules keys we newly created
-    attr_undo: list = []        # (module, attr, had_it, original) to undo attribute writes
-
-    def _set(key: str, mod):
-        """Install `mod` at sys.modules[key] only if absent; track it for restore."""
-        if key not in sys.modules:
-            sys.modules[key] = mod
-            added.append(key)
-        return sys.modules[key]
-
-    def _setattr(mod, attr, value):
-        attr_undo.append((mod, attr, hasattr(mod, attr), getattr(mod, attr, None)))
-        setattr(mod, attr, value)
-
-    # core_bridge stub. Issue #17: cad_tools does `from .core_bridge import CoreError` at
-    # import time, so the stub must carry CoreError or a full-dir collection aborts.
-    cb = types.ModuleType("services.mcp.core_bridge")
-    cb.available = lambda: False
-    cb.call = lambda method, params=None: {}
-    cb.CoreError = type("CoreError", (Exception,), {})
-    _set("services.mcp.core_bridge", cb)
-    _set("core_bridge", cb)
-    _set("services.mcp.core_bridge", cb)
-
-    # mcp.server.fastmcp stub
-    class _FakeMCP:
-        def __init__(self): self.tools_reg = {}
-        def tool(self):
-            def decorator(fn):
-                self.tools_reg[fn.__name__] = fn
-                return fn
-            return decorator
-
-    mcp_mod = types.ModuleType("mcp")
-    server_mod = types.ModuleType("mcp.server")
-    fastmcp_mod = types.ModuleType("mcp.server.fastmcp")
-    fastmcp_mod.FastMCP = _FakeMCP
-    _set("mcp", mcp_mod)
-    _set("mcp.server", server_mod)
-    _set("mcp.server.fastmcp", fastmcp_mod)
-
-    # services.mcp.cad_tools stubs for _dumps / _err / _doc
-    ct = types.ModuleType("services.mcp.cad_tools")
-    ct._dumps = json.dumps
-    ct._err = lambda e: json.dumps({"ok": False, "error": str(e)})
-    ct._doc = lambda d: d
-    _set("services.mcp.cad_tools", ct)
-    ms = types.ModuleType("services.mcp")
-    mcp_server_pkg = _set("services.mcp", ms)
-
-    # fit_narration stub — gsl_tools imports _format_fit at module level
-    fn_mod = types.ModuleType("services.mcp.fit_narration")
-    fn_mod._format_fit = lambda fit_result: ""  # no-op for offline tests
-    _set("services.mcp.fit_narration", fn_mod)
-    # Wire submodule attributes ONLY on a services.mcp package WE created — never clobber a
-    # real, already-imported services.mcp (that leak is what broke sibling tests).
-    if "services.mcp" in added:
-        _setattr(mcp_server_pkg, "fit_narration", fn_mod)
-        _setattr(mcp_server_pkg, "cad_tools", ct)
-        _setattr(mcp_server_pkg, "core_bridge", cb)
-
-    # engine stub (for research imports in fits.py / material_lookup.py)
-    eng = types.ModuleType("engine")
-    eng_materials = types.ModuleType("engine.materials")
-    eng_materials.density = lambda name: None
-    # paths re-homed to services.paths — stub it there (sys.modules
-    # fallback covers `from services import paths`).
-    eng_paths = types.ModuleType("services.paths")
-    import pathlib
-    eng_paths.CONFIG = pathlib.Path("/nonexistent/config.json")
-    eng.materials = eng_materials
-    _set("engine", eng)
-    _set("engine.materials", eng_materials)
-    _set("services.paths", eng_paths)
-
-    def restore():
-        for key in added:
-            sys.modules.pop(key, None)
-        for mod, attr, had_it, original in attr_undo:
-            if had_it:
-                setattr(mod, attr, original)
-            else:
-                try:
-                    delattr(mod, attr)
-                except AttributeError:
-                    pass
-
-    return restore
-
-
-# Install stubs, import the offline modules-under-test, then REMOVE the stubs so a
-# whole-dir sweep never inherits a fake core_bridge / mcp SDK.
-_restore_stubs = _install_stubs()
-try:
-    from services.research.fits import fit_calc, recommend_fit  # noqa: E402
-    # Import dimension_scheme internals directly (not via MCP)
-    from services.mcp.dimension_scheme_tools import (  # noqa: E402
-        _plan_from_entities,
-        _make_fixture_sketch as _dim_fixture,
-        _make_bore_sketch,
-        _it_grade_for_process,
-        _bilateral_tolerance,
-        _find_bolt_patterns,
-        _drawing_plan_from_features,
-        _process_verdict,
-        register_dimension_scheme_tools,
-    )
-finally:
-    _restore_stubs()
+from services.research.fits import fit_calc, recommend_fit
+from services.mcp.dimension_scheme_tools import (
+    _plan_from_entities,
+    _make_fixture_sketch as _dim_fixture,
+    _make_bore_sketch,
+    _it_grade_for_process,
+    _bilateral_tolerance,
+    _find_bolt_patterns,
+    _drawing_plan_from_features,
+    _process_verdict,
+    register_dimension_scheme_tools,
+)
 
 
 def get_profile(name: str) -> dict:
-    """The DfM profile for `name`, resolved through the PRODUCT's own lookup.
-
-    Deliberately NOT bound at import time: `_install_stubs()` above registers a fake
-    `core_bridge` whose `call()` returns `{}`, so a module-level `from services.mcp import
-    core_bridge as _cb` captured that stub in a clean process and this helper handed back
-    `None`. It only ever produced a real profile when some earlier test in the same
-    process had already imported the real core_bridge — an order-dependent false green.
-    Resolving lazily via `dimension_scheme_tools._get_profile` (a) always sees the real
-    bridge and (b) raises a teaching ValueError instead of returning None.
-    """
+    """Resolve the DfM profile through the product's bridge."""
     from services.mcp.dimension_scheme_tools import _get_profile
     return _get_profile(name)
 
@@ -163,6 +38,10 @@ class TestBoltPatternRule(unittest.TestCase):
     def setUp(self):
         # 4-hole plate: 40mm spacing, 5mm holes
         self.entities = _dim_fixture(num_holes=4, bolt_spacing_mm=40.0, hole_dia_mm=5.0)
+        patch = unittest.mock.patch("services.mcp.dimension_scheme_tools._profile_params",
+                                    return_value={"hole_comp_mm": 0.0})
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def test_fixture_has_four_circles(self):
         self.assertEqual(len(self.entities), 4)
@@ -230,13 +109,11 @@ class TestBoltPatternRule(unittest.TestCase):
         self.assertTrue(all(d < c for d in datum_pri for c in ctc_pri),
                         "Datum offset must have lower priority number than centre-to-centre")
 
-    def test_tolerance_it_grade_present(self):
-        """Each item's default_tolerance carries an IT grade reference."""
+    def test_known_size_tolerances_use_process_grade(self):
         plan = _plan_from_entities(self.entities, "cnc_mill", it_grade=7)
-        for item in plan:
-            tol = item.get("default_tolerance", {})
-            self.assertIn("it_grade", tol, f"Item {item['entity_ref']} missing it_grade in tolerance")
-            self.assertEqual(tol["it_grade"], "IT7")
+        tolerances = [item["default_tolerance"] for item in plan if item.get("default_tolerance")]
+        self.assertTrue(tolerances)
+        self.assertTrue(all(tol["it_grade"] == "IT7" for tol in tolerances))
 
     def test_fdm_uses_it12(self):
         grade = _it_grade_for_process("fdm")
@@ -258,9 +135,9 @@ class TestBoltPatternRule(unittest.TestCase):
         self.assertIn("band_mm", tol)
         self.assertIn("source", tol)
         self.assertEqual(tol["it_grade"], "IT7")
-        # IT7 at 20mm = 21µm; bilateral: upper=+10µm, lower=-11µm
-        self.assertAlmostEqual(tol["upper_mm"], 0.010, places=6)
-        self.assertAlmostEqual(tol["lower_mm"], -0.011, places=6)
+        # IT7 at 20 mm is 21 µm; the bilateral tolerance is ±10.5 µm.
+        self.assertAlmostEqual(tol["upper_mm"], 0.0105, places=6)
+        self.assertAlmostEqual(tol["lower_mm"], -0.0105, places=6)
         self.assertAlmostEqual(tol["band_mm"], 0.021, places=6)
 
     def test_source_citation_present(self):
@@ -312,12 +189,16 @@ class TestProcessDifferentiation(unittest.TestCase):
     """
 
     NOMINAL_MM = 20.0
+    def setUp(self):
+        from services.mcp import core_bridge as cb
+        if not cb.available():
+            self.skipTest("libchudware is not built")
+
 
     def _bore_plan(self, process: str) -> list[dict]:
         entities = _make_bore_sketch(self.NOMINAL_MM)
         it_grade = _it_grade_for_process(process)
-        return _plan_from_entities(entities, process, it_grade,
-                                   nominal_fallback_mm=self.NOMINAL_MM)
+        return _plan_from_entities(entities, process, it_grade)
 
     # ── IT-grade differs ─────────────────────────────────────────────────────────
 
@@ -327,17 +208,12 @@ class TestProcessDifferentiation(unittest.TestCase):
         self.assertEqual(_it_grade_for_process("fdm"), 12)
 
     def test_tolerance_band_differs_by_process(self):
-        """IT7 at 20mm = 0.021 mm band; IT12 at 20mm = 0.209 mm band — a ~10× spread.
-        Values computed from ISO 286-1:2010 Table 1 via _it_value_um().
-        IT7:  mult=16, D=sqrt(18*30)≈23.2 → i≈1.307 → 16*1.307≈20.9→21µm → 0.021mm.
-        IT12: mult=160 → 160*1.307≈209µm → 0.209mm.
-        """
+        """ISO 286 Table 1: IT7 is 21 µm and IT12 is 210 µm at 20 mm."""
         tol_cnc = _bilateral_tolerance(self.NOMINAL_MM, 7)
         tol_fdm = _bilateral_tolerance(self.NOMINAL_MM, 12)
         # CNC band: IT7 at 20mm → 21µm = 0.021 mm
         self.assertAlmostEqual(tol_cnc["band_mm"], 0.021, places=6)
-        # FDM band: IT12 at 20mm → 209µm = 0.209 mm
-        self.assertAlmostEqual(tol_fdm["band_mm"], 0.209, places=6)
+        self.assertAlmostEqual(tol_fdm["band_mm"], 0.210, places=6)
         # The FDM band is materially wider — not a float-precision tie
         self.assertGreater(tol_fdm["band_mm"], tol_cnc["band_mm"] * 5)
 
@@ -438,21 +314,14 @@ class TestProcessDifferentiation(unittest.TestCase):
         """
         entities = _make_bore_sketch(self.NOMINAL_MM)
         with self.assertRaises(ValueError) as ctx:
-            _plan_from_entities(entities, "lost_wax", it_grade=9,
-                                nominal_fallback_mm=self.NOMINAL_MM)
+            _plan_from_entities(entities, "lost_wax", it_grade=9)
         self.assertIn("lost_wax", str(ctx.exception))
 
-    def test_offline_mode_still_plans_with_zero_compensation(self):
-        """With NO engine bridge the planner degrades (comp 0.0) instead of raising —
-        that offline path is this module's documented fixture mode and must survive the
-        loud-lookup change above."""
-        import services.mcp.core_bridge as cb
-        with unittest.mock.patch.object(cb, "available", lambda: False):
-            plan = _plan_from_entities(_make_bore_sketch(self.NOMINAL_MM), "fdm",
-                                       it_grade=12, nominal_fallback_mm=self.NOMINAL_MM)
-        self.assertTrue(plan, "offline mode must still emit a plan")
-        for item in plan:
-            self.assertAlmostEqual(item["hole_comp_mm"], 0.0, places=6)
+    def test_missing_profile_does_not_fabricate_compensation(self):
+        with unittest.mock.patch("services.mcp.dimension_scheme_tools._get_profile",
+                                 side_effect=ValueError("profile unavailable")):
+            with self.assertRaises(ValueError):
+                _plan_from_entities(_make_bore_sketch(self.NOMINAL_MM), "fdm", it_grade=12)
 
 
 class TestSketchHealthText(unittest.TestCase):
@@ -467,10 +336,11 @@ class TestSketchHealthText(unittest.TestCase):
                      mat_regions: int | None = None,
                      conflicting: list | None = None,
                      redundant: list | None = None,
-                     schedule: list | None = None,
+                     hints: list | None = None,
                      dof_narration: str = "") -> dict:
         closure: dict = {"open_endpoints": open_endpoints or [],
-                         "closed_chains_ok": not bool(open_endpoints)}
+                         "closed_chains_ok": not bool(open_endpoints),
+                         "usage": "closed_profile"}
         if mat_regions is not None:
             closure["material_regions"] = mat_regions
         return {
@@ -481,7 +351,7 @@ class TestSketchHealthText(unittest.TestCase):
             "closure": closure,
             "conflicting": conflicting or [],
             "redundant": redundant or [],
-            "schedule": schedule or [],
+            "hints": hints or [],
             "free_variables": [],
         }
 
@@ -503,7 +373,7 @@ class TestSketchHealthText(unittest.TestCase):
     # ── State B: open profile + underconstrained ─────────────────────────────────
 
     def test_state_b_open_underconstrained(self):
-        """State B: open profile + DOF>0 → reports dangling endpoints + DOF narration + schedule."""
+        """Open profile + DOF>0 reports dangling endpoints, narration and hints."""
         sched = [
             {"order": 1, "kind": "geometric", "action": "coincident",
              "why": "close the open chain", "handles": ["e1.p2", "e2.p1"]},
@@ -513,17 +383,18 @@ class TestSketchHealthText(unittest.TestCase):
         t = self._text(dof=3, status="under",
                        open_endpoints=["e1.p2", "e2.p1"],
                        dof_narration="line e1 x, y; line e2 x",
-                       schedule=sched)
+                       hints=sched)
         self.assertIn("OPEN", t)
         self.assertIn("e1.p2", t)
         self.assertIn("e2.p1", t)
         self.assertIn("sketch_auto_constrain", t)
         self.assertIn("DOF: 3", t)
         self.assertIn("line e1 x, y; line e2 x", t)
-        # Schedule should list both steps
-        self.assertIn("1. [geometric] coincident", t)
-        self.assertIn("2. [dimension] add driving dimension", t)
+        # Hints are suggestions, not an ordered plan.
+        self.assertIn("[geometric] coincident", t)
+        self.assertIn("[dimension] add driving dimension", t)
         self.assertIn("close the open chain", t)
+
 
     # ── State C: conflicting / over-defined ──────────────────────────────────────
 
@@ -537,19 +408,19 @@ class TestSketchHealthText(unittest.TestCase):
         self.assertIn("distance", t)
         self.assertIn("remove conflicting constraint", t)
 
-    # ── Schedule handles-vs-entity rendering ─────────────────────────────────────
+    # ── Hint handles-vs-entity rendering ─────────────────────────────────────────
 
-    def test_schedule_handles_rendered(self):
-        """Schedule step with handles list renders the handles inline."""
+    def test_hint_handles_rendered(self):
+        """A hint with handles renders them inline."""
         sched = [{"order": 1, "kind": "geometric", "action": "coincident",
                   "why": "close chain", "handles": ["e3.p2", "e4.p1"]}]
-        t = self._text(dof=1, status="under", schedule=sched)
+        t = self._text(dof=1, status="under", hints=sched)
         self.assertIn("e3.p2", t)
         self.assertIn("e4.p1", t)
 
-    def test_empty_schedule_when_fully_defined(self):
-        """No schedule emitted when DOF=0 and status=full → just says 'nothing to do'."""
-        t = self._text(dof=0, status="full", schedule=[])
+    def test_empty_hints_when_fully_defined(self):
+        """No hints when DOF=0 and status=full → just says 'nothing to do'."""
+        t = self._text(dof=0, status="full", hints=[])
         self.assertIn("nothing to do", t)
 
     def test_redundant_constraint_listed(self):
@@ -562,30 +433,24 @@ class TestSketchHealthText(unittest.TestCase):
 
     # ── Redundancy economy (live 2026-07-30) ─────────────────────────────────────
 
-    def test_all_identical_schedule_rows_collapse_to_one(self):
-        """Live 2026-07-30, 3-rectangle F profile (12 lines, dof 40): the schedule printed
-        12 rows whose kind, action and why were identical apart from the entity id —
-        ~1150 chars carrying one instruction and a list of 12 entities. It must collapse
-        into ONE row that names the count, the order SPAN and the entities, so a model
-        applying the schedule still knows it stands for steps 2..13."""
+    def test_all_identical_hint_rows_collapse_to_one(self):
+        """Similar hints for 12 entities collapse without losing their count or names."""
         sched = [{"order": i + 2, "kind": "dimension",
                   "action": "add driving dimension / geometric relation for e%d" % (i + 1),
                   "why": "e%d is under-constrained in p1 x, p1 y, p2 x, p2 y" % (i + 1),
                   "entity": "e%d" % (i + 1)}
                  for i in range(12)]
-        t = self._text(dof=40, status="under", mat_regions=1, schedule=sched)
+        t = self._text(dof=40, status="under", mat_regions=1, hints=sched)
         rows = [ln for ln in t.split("\n") if ln.startswith("  ") and "[dimension]" in ln]
         self.assertEqual(len(rows), 1, t)
         row = rows[0]
         self.assertIn("x12", row)          # the count survives
-        self.assertIn("2-13.", row)        # the order span survives
         self.assertIn("e1", row)
         self.assertIn("+4", row)           # 8 named + "… +4"
         self.assertIn("under-constrained in p1 x", row)  # the remedy survives, once
 
-    def test_distinct_schedule_remedies_are_never_merged(self):
-        """Collapsing is keyed on the remedy with the entity id factored out — two rows
-        that ask for DIFFERENT things must both survive, in order."""
+    def test_distinct_hint_remedies_are_never_merged(self):
+        """Different suggestions must both survive."""
         sched = [
             {"order": 1, "kind": "geometric", "action": "coincident",
              "why": "close the open chain", "handles": ["e1.p2", "e2.p1"]},
@@ -594,10 +459,10 @@ class TestSketchHealthText(unittest.TestCase):
             {"order": 3, "kind": "dimension", "action": "add radius dimension for e2",
              "why": "e2 has a free radius", "entity": "e2"},
         ]
-        t = self._text(dof=4, status="under", schedule=sched)
-        self.assertIn("1. [geometric] coincident", t)
-        self.assertIn("2. [dimension] add driving dimension for e1", t)
-        self.assertIn("3. [dimension] add radius dimension for e2", t)
+        t = self._text(dof=4, status="under", hints=sched)
+        self.assertIn("[geometric] coincident", t)
+        self.assertIn("[dimension] add driving dimension for e1", t)
+        self.assertIn("[dimension] add radius dimension for e2", t)
 
     def test_dof_narration_is_bounded_but_still_names_the_count(self):
         """The under-constrained signal is real and must survive — the 40-slot ENUMERATION
@@ -628,16 +493,20 @@ class TestDrawingDimensionScheme(unittest.TestCase):
         return registry.tools
 
     def test_unknown_and_omitted_process_are_refused_with_valid_list(self):
-        for process, reason in ((None, "process_required"), ("lost_wax", "unknown_process")):
-            resolved, error = _process_verdict(process, "suggest_drawing_dimension_scheme")
-            self.assertIsNone(resolved)
-            self.assertEqual(error["reason"], reason)
-            self.assertIn("cnc_mill", error["valid_processes"])
-            self.assertIn("fdm", error["valid_processes"])
+        with unittest.mock.patch("services.mcp.dimension_scheme_tools._known_processes",
+                                 return_value=["cnc_mill", "fdm"]):
+            for process, reason in ((None, "process_required"), ("lost_wax", "unknown_process")):
+                resolved, error = _process_verdict(process, "suggest_drawing_dimension_scheme")
+                self.assertIsNone(resolved)
+                self.assertEqual(error["reason"], reason)
+                self.assertIn("cnc_mill", error["valid_processes"])
+                self.assertIn("fdm", error["valid_processes"])
 
     def test_sketch_entry_point_no_longer_falls_back_to_fdm(self):
-        result = json.loads(self._tools()["suggest_dimension_scheme"](
-            doc_id="doc-1", sketch_id="sk1", process="lost_wax"))
+        with unittest.mock.patch("services.mcp.dimension_scheme_tools._known_processes",
+                                 return_value=["cnc_mill", "fdm"]):
+            result = json.loads(self._tools()["suggest_dimension_scheme"](
+                doc_id="doc-1", sketch_id="sk1", process="lost_wax"))
         self.assertFalse(result["ok"])
         self.assertEqual(result["reason"], "unknown_process")
         self.assertNotEqual(result.get("process"), "fdm")
@@ -656,6 +525,30 @@ class TestDrawingDimensionScheme(unittest.TestCase):
         self.assertEqual(plan[0]["thread"], "M6x1.0")
         self.assertEqual(plan[0]["depth"], 14.0)
 
+    def test_simple_custom_bore_plan_is_not_a_thread(self):
+        features = [{"id": "bore", "type": "hole",
+                     "params": {"style": "simple", "standard": "custom", "diameter": 5}},
+                    {"id": "tap", "type": "hole",
+                     "params": {"style": "tap", "standard": "custom", "depth": 14}}]
+        plan = _drawing_plan_from_features(features, "cnc_mill", 7)
+        bore = [row for row in plan if row["feature_ref"] == "bore"]
+        self.assertEqual(len(bore), 1)
+        self.assertEqual(bore[0]["dim_type"], "diameter_dim")
+        self.assertEqual(bore[0]["suggested_value"], 5)
+        tap = next(row for row in plan if row["feature_ref"] == "tap")
+        self.assertEqual(tap["annotation_kind"], "thread")
+        self.assertIsNone(tap["thread"])
+        self.assertTrue(tap["needs_user_confirm"])
+
+    def test_chamfer_plan_uses_native_chamfer_tool(self):
+        plan = _drawing_plan_from_features([
+            {"id": "edge-break", "type": "chamfer", "params": {"distance": 1.5}}
+        ], "cnc_mill", 7)
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0]["suggested_tool"], "add_chamfer_dimension")
+        self.assertEqual(plan[0]["feature_ref"], "edge-break")
+        self.assertFalse(plan[0]["placeable"])
+
     def test_drawing_entry_point_returns_process_specific_feature_plan(self):
         import services.mcp.core_bridge as core_bridge
 
@@ -665,11 +558,11 @@ class TestDrawingDimensionScheme(unittest.TestCase):
                     "fdm", "cnc_mill", "lathe", "sheet_metal", "laser", "injection"]}
             if method == "doc_list":
                 return {"docs": [{"doc_id": "doc-1", "name": "Plate"}]}
-            if method == "doc_list_features":
-                return {"features": [{
+            if method == "doc_tree":
+                return {"tree": {"features": [{
                     "id": "f-box", "name": "Stock", "type": "box",
                     "params": {"length": 60, "width": 40, "height": 10},
-                }]}
+                }]}}
             raise AssertionError(method)
 
         with unittest.mock.patch.object(core_bridge, "call", fake_call):
@@ -682,6 +575,207 @@ class TestDrawingDimensionScheme(unittest.TestCase):
                          {"length", "width", "height"})
         self.assertTrue(all(item["default_tolerance"]["it_grade"] == "IT7"
                             for item in result["items"]))
+
+class TestDimensionDependencies(unittest.TestCase):
+    def plan(self, entities, constraints=(), health=None):
+        with unittest.mock.patch("services.mcp.dimension_scheme_tools._profile_params",
+                                 return_value={"hole_comp_mm": 0.0}):
+            return _plan_from_entities(entities, "cnc_mill", 7,
+                                       constraints=list(constraints), health=health)
+
+    def lines(self):
+        return [{"id": "e1", "type": "line", "p1": [0, 0], "p2": [20, 0]},
+                {"id": "e2", "type": "line", "p1": [0, 8], "p2": [20, 8]}]
+
+    def test_driven_measurement_does_not_suppress_size(self):
+        plan = self.plan(self.lines()[:1], [
+            {"type": "length", "refs": ["e1"], "value": 20, "driven": True}])
+        self.assertEqual([row["dim_type"] for row in plan], ["length"])
+
+    def test_relations_precede_dimensions_and_existing_relations_are_not_repeated(self):
+        plan = self.plan(self.lines(), health={
+            "status": "under", "dof": 2,
+            "free_variables": [{"entity": "e1", "param": "p1 x"},
+                               {"entity": "e2", "param": "p1 x"}]})
+        relations = [row for row in plan if row["dim_type"] == "relation"]
+        self.assertEqual({row["constraint"]["type"] for row in relations}, {"parallel", "equal"})
+        self.assertLess(max(row["priority"] for row in relations),
+                        min(row["priority"] for row in plan if row["dim_type"] == "length"))
+        plan = self.plan(self.lines(), [{"type": "equal", "refs": ["e1", "e2"]}])
+        self.assertNotIn("equal", [row["constraint"]["type"] for row in plan
+                                   if row["dim_type"] == "relation"])
+
+    def test_arc_radius_and_nonhole_circles_are_not_compensated(self):
+        entities = [{"id": "arc", "type": "arc", "center": [0, 0], "radius": 4},
+                    {"id": "boss", "type": "circle", "center": [20, 0], "radius": 5},
+                    {"id": "bore", "type": "circle", "center": [40, 0], "radius": 5,
+                     "role": "bore"}]
+        with unittest.mock.patch("services.mcp.dimension_scheme_tools._profile_params",
+                                 return_value={"hole_comp_mm": 0.2}):
+            plan = _plan_from_entities(entities, "fdm", 12)
+        sizes = {row["entity_ref"]: row for row in plan if row["dim_type"] != "relation"}
+        self.assertEqual(sizes["arc"]["dim_type"], "radius")
+        self.assertEqual(sizes["arc"]["suggested_value"], 4)
+        self.assertFalse(sizes["arc"]["needs_user_confirm"])
+        self.assertEqual(sizes["boss"]["suggested_value"], 10)
+        self.assertEqual(sizes["boss"]["hole_comp_mm"], 0)
+        self.assertEqual(sizes["bore"]["suggested_value"], 10.2)
+        self.assertTrue(sizes["bore"]["needs_user_confirm"])
+
+    def test_pitch_tolerance_uses_pitch_and_unknown_datum_has_no_tolerance(self):
+        plan = self.plan(_dim_fixture())
+        pitch = next(row for row in plan if row["dim_type"] == "centre_to_centre")
+        self.assertEqual(pitch["suggested_value"], 40)
+        self.assertEqual(pitch["default_tolerance"]["band_mm"], 0.025)
+        self.assertIsNone(next(row for row in plan if row["dim_type"] == "datum_offset")
+                          ["default_tolerance"])
+
+    def test_native_health_suppresses_solved_entities_and_fixed_radius(self):
+        entities = self.lines()[:1] + [
+            {"id": "e2", "type": "circle", "center": [8, 0], "radius": 3}]
+        plan = self.plan(entities, health={
+            "status": "under", "dof": 2, "statuses": {"e1": "full", "e2": "under"},
+            "free_variables": [{"entity": "e2", "param": "center x"},
+                               {"entity": "e2", "param": "center y"}]})
+        self.assertEqual([row for row in plan if row["dim_type"] != "relation"], [])
+
+    def test_full_native_health_needs_no_further_dimensions(self):
+        self.assertEqual(self.plan(self.lines(), health={"status": "full", "dof": 0}), [])
+
+    def test_iso_tolerance_values_are_tabulated(self):
+        self.assertEqual(_bilateral_tolerance(8, 7)["band_mm"], 0.015)
+        self.assertEqual(_bilateral_tolerance(12, 7)["band_mm"], 0.018)
+        self.assertEqual(_bilateral_tolerance(20, 7)["source"]["kind"], "table")
+
+    def test_live_entrypoint_reads_authored_dependencies_and_native_health(self):
+        import services.mcp.dimension_scheme_tools as scheme
+        import services.mcp.core_bridge as core_bridge
+
+        calls = []
+        def call(method, params=None):
+            calls.append(method)
+            if method == "doc_sketch_overview":
+                return {"entities": self.lines()[:1]}
+            if method == "doc_tree":
+                return {"tree": {"features": [{"id": "s1", "params": {
+                    "entities": self.lines()[:1],
+                    "constraints": [{"type": "length", "refs": ["e1"], "value": 20}]}}]}}
+            if method == "sketch_health":
+                return {"status": "under", "dof": 3, "statuses": {"e1": "under"},
+                        "free_variables": [{"entity": "e1", "param": "p1 x"}]}
+            raise AssertionError(method)
+
+        registry = TestDrawingDimensionScheme.Registry()
+        register_dimension_scheme_tools(registry)
+        with (unittest.mock.patch.object(core_bridge, "call", call),
+              unittest.mock.patch.object(scheme, "_doc", lambda d: d),
+              unittest.mock.patch.object(scheme, "_known_processes", return_value=["cnc_mill"]),
+              unittest.mock.patch.object(scheme, "_profile_params", return_value=None)):
+            result = json.loads(registry.tools["suggest_dimension_scheme"](
+                doc_id="doc-1", sketch_id="s1", process="cnc_mill"))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["items"], [])
+        self.assertIn("sketch_health", calls)
+        self.assertIn("doc_tree", calls)
+
+    def test_sketch_entrypoint_refuses_unavailable_tree_without_fixture(self):
+        import services.mcp.dimension_scheme_tools as scheme
+        import services.mcp.core_bridge as core_bridge
+
+        def call(method, params=None):
+            if method == "doc_sketch_overview":
+                return {"entities": self.lines()[:1]}
+            raise RuntimeError("authored tree unavailable")
+
+        registry = TestDrawingDimensionScheme.Registry()
+        register_dimension_scheme_tools(registry)
+        with (unittest.mock.patch.object(core_bridge, "call", call),
+              unittest.mock.patch.object(scheme, "_doc", lambda d: d),
+              unittest.mock.patch.object(scheme, "_known_processes", return_value=["cnc_mill"])):
+            result = json.loads(registry.tools["suggest_dimension_scheme"](
+                doc_id="doc-1", sketch_id="s1", process="cnc_mill"))
+        self.assertFalse(result["ok"], result)
+        self.assertIn("authored tree unavailable", result["error"])
+        self.assertNotIn("items", result)
+
+    def test_sketch_entrypoint_does_not_invent_an_unavailable_size(self):
+        import services.mcp.dimension_scheme_tools as scheme
+        import services.mcp.core_bridge as core_bridge
+
+        def call(method, params=None):
+            if method == "doc_sketch_overview":
+                return {"entities": [{"id": "e1", "type": "circle", "center": [0, 0]}]}
+            if method == "doc_tree":
+                return {"tree": {"features": [{"id": "s1", "params": {
+                    "entities": [{"id": "e1", "type": "circle", "center": [0, 0]}],
+                    "constraints": []}}]}}
+            if method == "sketch_health":
+                return {"status": "under", "free_variables": [{"entity": "e1", "param": "radius"}]}
+            raise AssertionError(method)
+
+        registry = TestDrawingDimensionScheme.Registry()
+        register_dimension_scheme_tools(registry)
+        with (unittest.mock.patch.object(core_bridge, "call", call),
+              unittest.mock.patch.object(scheme, "_doc", lambda d: d),
+              unittest.mock.patch.object(scheme, "_known_processes", return_value=["cnc_mill"])):
+            result = json.loads(registry.tools["suggest_dimension_scheme"](
+                doc_id="doc-1", sketch_id="s1", process="cnc_mill"))
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["reason"], "sketch_size_unavailable")
+        self.assertEqual(result["entities"], ["e1"])
+
+
+def test_live_daemon_dimension_planners_read_authored_features():
+    import pytest
+    from services.mcp import core_bridge as cb
+
+    if not cb.available():
+        pytest.skip("libchudware is not built")
+    doc = cb.call("doc_new", {"name": "dimension_plan_live", "kind": "part"})["doc_id"]
+    try:
+        cb.call("doc_apply_ops", {"doc_id": doc, "ops": [
+            {"op": "add_feature", "feature": {
+                "type": "sketch", "name": "PlanSketch", "refs": {"plane": "plane.top"},
+                "params": {"entities": [{"id": "e1", "type": "circle",
+                                         "center": [12, 7], "radius": 3}],
+                           "constraints": []}}},
+            {"op": "add_feature", "feature": {
+                "type": "box", "name": "PlanStock",
+                "params": {"length": 60, "width": 40, "height": 10}}},
+        ]})
+        features = cb.call("doc_tree", {"doc_id": doc})["tree"]["features"]
+        sketch = next(f for f in features if f.get("name") == "PlanSketch")
+        stock = next(f for f in features if f.get("name") == "PlanStock")
+        registry = TestDrawingDimensionScheme.Registry()
+        register_dimension_scheme_tools(registry)
+        drawing = json.loads(registry.tools["suggest_drawing_dimension_scheme"](
+            doc_id=doc, process="cnc_mill"))
+        assert drawing["ok"], drawing
+        stock_items = [row for row in drawing["items"] if row["feature_ref"] == stock["id"]]
+        assert {row["source_param"] for row in stock_items} == {"length", "width", "height"}
+        sketch_plan = json.loads(registry.tools["suggest_dimension_scheme"](
+            doc_id=doc, sketch_id=sketch["id"], process="cnc_mill"))
+        assert sketch_plan["ok"], sketch_plan
+        diameter = next(row for row in sketch_plan["items"]
+                        if row["entity_ref"] == "e1" and row["dim_type"] == "diameter")
+        assert abs(diameter["suggested_value"] - 6.0) < 1e-6, sketch_plan
+        assert all("fixture" not in note.lower() for note in sketch_plan["notes"])
+    finally:
+        cb.call("doc_close", {"doc_id": doc})
+
+
+def test_drawing_scheme_does_not_report_stored_literal_as_equation_result():
+    features = [{"id": "box", "type": "box", "params": {
+        "length": {"value": 10, "expr": "width * 2"},
+        "width": {"value": 8, "expr": None},
+        "height": {"value": 4, "expr": None},
+    }}]
+    rows = _drawing_plan_from_features(features, "cnc_mill", 7)
+    length = next(row for row in rows if row.get("source_param") == "length")
+    assert length["suggested_value"] is None
+    assert length["placeable"] is False
+    assert length["needs_user_confirm"] is True
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -20,10 +20,9 @@ for, and shows the repair-runtime flow. Workers tolerate unknown OPTIONAL params
 ## 2. Doc worker (`core/api/libchudware.cpp`) — method table
 
 ### Legacy (unchanged, frozen)
-`ping` · `run_model {code, name?}` · `get_prompts` · `shutdown`
+`ping` · `run_model {code, name?}` · `shutdown`
 
-> `agent_design` was REMOVED 2026-07-22: the C++ `agent_run_v2` covers its
-> surface; the method now returns "unknown method" everywhere.
+> Native modeling-agent execution is not an engine RPC; agent turns use the OMP service.
 
 ### Documents
 | method | params → result |
@@ -35,6 +34,7 @@ for, and shows the repair-runtime flow. Workers tolerate unknown OPTIONAL params
 | `doc_list` | `{}` → `{docs:[{doc_id, name, kind, path, revision, dirty, feature_count, component_count, empty}]}` — `empty` is true when the doc has no authored content (part: zero features; assembly: zero features+components+mates). Appended 2026-07-16 (empty recovery auto-discard) |
 | `doc_list` (appended 2026-09-24) | each row also carries `reproducible_from: [abs source_path…]` — non-empty only for a never-saved part (no `path`) whose every feature is an `import` with an absolute `source_path` and whose `revision <= feature_count` (nothing authored after the imports: any edit/material/undo op empties it). Consumers treat the doc as reproducible scratch only while every listed file still exists: hostd autosave skips it and `retireDoc` closes it without an orphan; `cad_common.save_touched_docs` reports it `skipped` `reproducible_import` instead of writing it to the project |
 | `doc_list` (appended 2026-09-30) | each row also carries `native_source_path` (abs `.step+` or `null`) — the native file a `doc_open(detach_path=true)` session was loaded from (agent `import_part` of a `.step+`). While that session is unedited (`revision == 0`, not dirty) and the file exists, `reproducible_from` lists it, so the same skip/close rules apply. After edits, automatic and bare saves write back to `native_source_path` instead of minting `<project>/<name>.step+`; an explicit save path still wins, and hostd recovery-snapshot sources are never used as that destination |
+| `doc_open` (appended 2026-11-01) | `{path, detach_path: true, recovered: true}` opens a hostd recovery-tier artifact as unsaved work: the session starts `dirty` and carries no `native_source_path` (the artifact is deleted right after), so autosave, the GUI quit prompt and doc-GC retirement keep protecting it until it is saved or discarded |
 | `doc_apply_ops` | doc_ops §1 envelope → ops-response (incl. `owner_map`) |
 | `doc_undo` / `doc_redo` | `{doc_id}` → ops-response |
 | `doc_tree` | `{doc_id}` → `{revision, tree, owner_map}` (no rebuild; uses the last build) |
@@ -353,9 +353,51 @@ material: `body_materials` override, document material, assembly component sourc
 7.85 only where none resolves; `source` ∈ explicit|body_material|document_material|
 component_material|default|per_body) · `eval_section_props {doc_id, plane: Selector|datum-id}` · `eval_interference
 {doc_id}` → fit-report shape (kernel `_fit_report`) · `eval_draft {doc_id, pull:[3], angle_deg}`
-· `eval_thickness {doc_id}` · `eval_curvature {doc_id, kind: "gaussian"\|"mean"\|"max"}` ·
+· `eval_thickness {doc_id, body?, resolution?, min_wall_mm?}` (appended 2026-10-26) → inscribed-sphere wall thickness
+at every vertex of the display mesh refined to `resolution` mm (auto when absent): `{aicm_path`
+(refined body + SCLR "thickness", mm, NaN = no opposing wall)`, min/max/mean_thickness_mm,
+n_sampled, minimum_sample:{vertex_index, at, opposite_at, ball_center, wall_direction, face_id,
+opposing_cos, kind: "wall"|"taper"}, measurement_basis:{method:"inscribed_sphere", spacing_mm,
+requested_spacing_mm, budget_limited, n_vertices, n_unmeasured, wall_separation_deg}}`; with
+`min_wall_mm` > 0 also `min_wall_mm, thin_area_mm2, n_thin_regions, thin_regions:[{min_thickness_mm,
+at, opposite_at, wall_direction, centroid, bbox:{min,max}, area_mm2, face_ids, kind,
+opposing_cos}]` (thinnest first, ≤ 24) · `mesh_wall_thickness {vertices:[3N], triangles:[3M],
+points:[3Q], normals:[3Q], resolution?}` → `{ok, thickness:[Q|null], opposing_cos:[Q|null],
+wall_direction:[Q × [x,y,z]|null], spacing_mm, n_blockers}` (same measurement at caller samples of a raw mesh) ·
+`doc_render_view` / `doc_render_contact_sheet` view objects accept `thickness:{min_wall_mm,
+max_mm? (3×min), resolution?}` → bodies drawn in their thickness colours (≤ min_wall red, ramp to
+blue at max_mm, unmeasured grey), reply echoes `thickness:{min_wall_mm, max_mm,
+min_thickness_mm, spacing_mm}` · `eval_curvature {doc_id, kind: "gaussian"\|"mean"\|"max"}` ·
 `eval_check {doc_id}` → `{issues:[{kind, severity, text, ref?}]}` · `eval_symmetry {doc_id,
 plane}` → `{symmetric: bool, deviation_mm3}` · `eval_perf {doc_id}` → `{features:[{id, name, ms}]}`
+
+`eval_local_thickness {doc_id, body, face_topo, edge_topo|blend_topo, resolution?}` is
+read-only. IDs are the 1-based body-local topology IDs returned by `eval_edge_analysis`.
+For an edge, `face_topo` must bound it; for a blend it must be an adjacent face with
+exactly one shared edge. The response carries `revision`, `face_sid`, `face_topo`,
+`edge_topo`, and at most three `samples` from the actual inscribed-sphere field on that
+face. Each sample contains `at`, `edge_at` (closest point on the B-rep edge),
+`offset_mm`, and `thickness_mm`. `measurement_basis` reports actual spacing, budget
+coarsening, target and accepted offset range. Empty samples and `unavailable_reason`
+mean no usable measurement, not a safe wall. Ambiguous/missing blend boundaries are
+reported unavailable without a field study. This local geometric screen does not
+measure shoulder length or establish structural strength.
+
+### Harness routing and path checks
+`harness_route {doc_id, start:{pos:[x,y,z],dir?}, end:{pos:[x,y,z],dir?},
+od_mm, min_bend_radius_mm, clearance_mm?, keepouts?, ignore_bodies?,
+endpoint_relax_mm?, prefer_paths?, grid_mm?, max_nodes?}` plans a centreline.
+Endpoint directions point away from the connector at both ends. `keepouts` accept
+`{aabb:[[min],[max]], clearance_mm?}` or `{body:id, clearance_mm?}`;
+`prefer_paths` is a list of existing centrelines. Success includes `path`,
+`control_points`, `bends`, `length_mm`, `min_clearance_mm`, `clearance_basis`,
+`grid_mm`, `expanded_nodes` and `warnings`; failures include a code and error.
+`harness_path_check {doc_id, path, od_mm, min_bend_radius_mm, clearance_mm?,
+ignore_bodies?}` reports path length, local bend-radius estimates, and clearance
+violations with segment locations and body IDs. Lengths and clearances are in mm
+and angles in degrees. Clearance is measured against the document's world-space
+display tessellation, not exact B-rep surfaces; no obstacles means no clearance
+measurement, not a passed clearance check. Both RPCs are read-only.
 
 ### Formats (M8; minimal `doc_save`/`doc_open` for `.step+` exist from M1)
 `import_file {path, into?: doc_id}` → ops-response (adds `import` feature(s); dxf/dwg/sat record
@@ -400,13 +442,11 @@ BEND = green(3)/continuous. The flat-pattern geometry is surfaced on `CompileRes
 `ctx.datums["_sheet_metal_flat"]` side-channel, then projected to 2D using the stored `n_base`.
 
 ### AI (M9)
-`agent_run_v2 {request, doc_id, options?:{max_stage_attempts?, plan?, roles_override?, workflow?}}`
-→ streams events.md orchestrator events → `{run_id, status, stop_reason, revision}` ·
-`get_prompts` (v2 result: `{prompts:[{role, path, override_path, text, overridden}]}`) ·
-`agent_cancel {run_id}` → best-effort stop at the next stage boundary. ·
-`agent_steer {run_id, text}` → `{ok, steered}`; queues a `[User steering]` user message the
-running turn consumes at its next stage/attempt boundary (cooperative, like cancel — never
-interrupts an in-flight provider HTTP call). Unknown/finished run_id → `{ok:true, steered:false}`.
+`agent_cancel {run_id}` → best-effort stop of an online (OMP) run; no matching run →
+`{ok:true, cancelled:false, reason:"no active agent run"}`. ·
+`agent_steer {run_id, text}` → `{ok, steered}`; queues a user steering message the
+running turn consumes (cooperative, like cancel — never
+interrupts an in-flight provider HTTP call). No matching run → `{ok:true, steered:false, reason:"no active agent run"}`.
 `agent_answer {run_id, batch_id, answers:{<qid>: RAW}}` or `{run_id, batch_id, declined:true}`
 (2026-10-03) → `{ok:true, run_id, batch_id, answered:true}` | `{ok:false, reason, …}`; resolves
 the interactive `ask_user` question batch an online turn is blocked on (`agent.question` /
@@ -419,17 +459,10 @@ question"}` from hostd (never forwarded to the engine or queued on the agent lan
 is the worker control action `answer` (below), like `agent_steer`.
 
 ### AI context references (Wave 4, append-only)
-`agent_design` and `agent_run_v2` accept an OPTIONAL `context_refs?: [{kind, id, doc_id?,
+`agent_admin_turn` accepts an OPTIONAL `context_refs?: [{kind, id, doc_id?,
 label}]` array — model entities the user attached to the prompt via the composer context-cube
-picker (kind ∈ `component|body|face|edge|sketch|feature`). The host ALSO inlines the same
-refs as a plain-text "Context references:" block in `request` so the C++ `agent_run` path
-surfaces them; the structured array is the machine-readable mirror for the Python turn path
-(`loop.run_turn` / `agent_turn.run_turn`). Absent/empty = no-op; malformed entries skipped.
-
-`options.workflow`/`options.profile`: `"auto"` (default), `"micro"`/`"local"`/`"small-context"`
-to force the decomposed local-model workflow, or `"full"`/`"standard"` to force the normal v2
-machine. The micro workflow decomposes into tiny single-step executor calls and applies/validates
-after each step, which keeps limited local models auditable and recoverable.
+picker (kind ∈ `component|body|face|edge|sketch|feature`). Absent/empty = no-op; malformed
+entries skipped.
 
 `agent_ask_v2 {doc_id?, question}` → `{answer}`. Read-only help/QA against the current
 document digest; unknown or empty `doc_id` falls back to general CAD help.
@@ -1072,6 +1105,13 @@ memory or a separate file. Save, close, and reopen retain the provenance even th
 the reopened document has a fresh runtime ID. A persisted `"mate"` record takes
 precedence over later starting-pose `"transform"` notes. Missing records (including
 imported components without recorded provenance) remain `null`, never inferred.
+`doc_set_meta` may receive `member` to atomically replace one member of the
+metadata object under the document lock. An optional nonempty `preserve` object
+leaves that member unchanged when all specified fields already match. Without
+`member`, the existing whole-key replacement semantics are unchanged.
+`doc_list` exposes the runtime `metadata_revision`, which advances on metadata
+writes independently of geometry revision so crash autosave notices metadata-only edits.
+
 
 `list_world_bodies` and `describe_assembly` expose `bodies[].placement_source` from
 this persisted record; `describe_assembly` retains its placement narrative alongside
@@ -1805,7 +1845,7 @@ The explicit hostd dispatch classification (worker_main registration tables):
 
 | Lane | Registered method families and exceptions |
 | --- | --- |
-| Agent | `agent_*`, `chudcode_*`, `session_*`, `subscription_*`, `skills_*`, `triggers_*`, `packs_*`, `ai_roles_*`, `model_rankings_*`, `bench_*`, `memory_*`, `subagent_*`, `dag_*`, `ai_prompt_*`, `ai_tool_*`; exact `rule_create`, `worker_control_info`. This retains Chudcode session/process ownership, OAuth login progress, benchmark child/status, prompt-cache invalidation and warm state, and agent/subagent/DAG control with their owning worker. |
+| Agent | `agent_*`, `chudcode_*`, `session_*`, `subscription_*`, `skills_*`, `triggers_*`, `packs_*`, `ai_roles_*`, `bench_*`, `memory_*`, `subagent_*`, `dag_*`, `ai_prompt_*`, `ai_tool_*`; exact `rule_create`, `worker_control_info`. This retains Chudcode session/process ownership, OAuth login progress, benchmark child/status, prompt-cache invalidation and warm state, and agent/subagent/DAG control with their owning worker. |
 | General | All other registrations: `ping`, `run_model`, `list_editable_prompts`, `office_extract`; `plm_*`, `mfg_printer_adapter_*`, `part_*`, `parts_*`, `vendor_part_*`, `reveng_*`, `sim_*`, `em_*`, `ecad_*`, deliverables (`render_document`, `list_artifacts`) and other ordinary methods. Unknown methods also use general and retain the worker's ordinary unknown-method response. |
 
 Prefixes above describe reviewed registered method families, not a blanket
@@ -1857,6 +1897,65 @@ compares endpoints of distinct open edges (not whole-edge proximity), and
 body is one with an empty findings list for enabled checks; an incomplete
 source is never presented as a complete clean document.
 
+## Evaluate Sheet Metal Bends
+
+`eval_sheet_metal_bends {doc_id}` is a read-only part RPC returning
+`{doc_id, revision, records:[{feature_id, angle_deg, radius_mm, thickness_mm,
+bend_allowance_mm, wall_length_mm, position, start, end, axis, length_dir, fold_dir, parent_index}]}`.
+Records are the resolved frames and dimensions used when successful sheet-metal
+features were compiled, including both bends of a jog and inherited defaults.
+They are historical construction data, not evidence that later cuts, transforms,
+or flat-pattern operations preserved the recorded geometry. A display-cache-only
+session returns an unavailable error instead of triggering a full rebuild; the
+saved display cache does not contain bend records.
+
+## Evaluate Edge Analysis (2026-11-05)
+
+`eval_edge_analysis {doc_id, body?, min_dihedral_dev_deg?, kinds?, limit?, cursor?, include_ligaments?}`
+is read-only. It classifies every manifold two-face edge of each surviving solid by its
+exact signed dihedral and lists the concave blend faces (the stress-riser inventory that
+`doc_adjacency` could only approximate). `body` is a 1-based body id (default: every
+surviving body); `min_dihedral_dev_deg` in `[0,90)` (default 5) is the deviation from a flat
+180 degrees below which an edge is `smooth`; `kinds` is a nonempty subset of
+`concave|convex|smooth` (default `["concave","convex"]`); `limit` in `[1,2000]`
+(default 200) pages `edges` and `cursor` is the previous `next_cursor`.
+
+Method: outward face normals are evaluated on each face's own pcurve at five interior
+samples of the edge. The turning angle `theta` between them gives the deviation; the sign
+comes from the oriented traversal of the edge by its two faces (opposite in a valid shell),
+never a centroid heuristic. `dihedral_deg` is the interior angle through the material:
+`180 - theta` convex (a box edge is 90), `180 + theta` concave (a sharp inside corner of an
+L-bracket is 270), 180 smooth. Edges whose two faces disagree on the sign are reported in
+`unclassified_edges` (never guessed); seam, degenerate, free and non-manifold edges are not
+dihedral edges and are not listed.
+
+Result: `{doc_id,revision,complete,source_failures,min_dihedral_dev_deg,kinds,
+bodies:[{body_id,face_count,edge_count,concave_edges,convex_edges,smooth_edges,
+concave_blends,unclassified_edges}],total_edges,edges:[{sid,body,topo,kind,dihedral_deg,
+deviation_deg,deviation_min_deg,length_mm,mid,dir,faces:[sid,sid],face_topo:[a,b],curve,
+radius_mm?,axis?,mixed_sign?,owner_feature}],truncated,next_cursor,concave_blends:[{
+face_sid,body,topo,surf:"cylinder"|"torus"|"other",radius_mm,arc_deg?,axis?,axis_point?,
+major_radius_mm?,center,area_mm2,adjacent_faces,tangent_faces,adjacent_face_topo,
+owner_feature}],blends_truncated,unclassified_count,unclassified_edges}`. Edges are ordered
+concave first, then by decreasing deviation. `concave_blends` (smallest radius first, at most
+500) ride on the first page only. A concave blend is a concave cylinder/torus/sphere face
+joined G1-smoothly to a neighbour; a bore with no smooth neighbour is not a blend. `radius_mm` is the
+cylinder radius, the torus *section* radius or the sphere radius, `arc_deg` the swept section
+angle (about 90 for a corner fillet, about 180 for a slot end). `sid`/`faces`/`face_sid`
+are the same stable sids `query_geometry` returns; `topo` and `face_topo` are the 1-based
+`TopExp::MapShapes` ids of the body; `owner_feature` comes from the compile's owner map
+(null for assembly bodies).
+
+With `include_ligaments:true`, the first page additionally includes `ligaments` with
+`rows` (up to 2000 overall) and per-body `bodies` diagnostics. Rows identify two
+finite B-rep faces by topology id and query SID, closest points and minimum distance
+in mm, their owning features when available, and the measurement basis. Only complete
+inward-facing cylindrical bores are evaluated; partial or split bores are explicitly
+excluded. A boundary is a nonincident, non-bore face, not necessarily an external
+face, and the measured segment is not certified to lie in material. Diagnostic flags
+and counts disclose failures, excluded geometry, row truncation and work limits; no
+empty or incomplete scan is evidence of a safe ligament.
+
 ## Drawing Auto Balloon projection cost addendum (2026-09-24)
 
 Supersedes the component-field claim in Drawing Auto Balloon above: ordinary
@@ -1887,14 +1986,12 @@ owner; a face merged from several owners goes to the earliest in history order.
 
 ## `context_refs` element addendum (2026-09-27, composer context picker)
 
-Extends "AI context references (Wave 4)". `agent_admin_turn` (and the offline
-`agent_run_v2` / `agent_mission_v1`) accept a top-level `context_refs: [ContextRef]`.
-- Online: `worker_rpc._editor_context_block` resolves each item against the engine
+Extends "AI context references (Wave 4)". `agent_admin_turn` accepts a top-level `context_refs: [ContextRef]`.
+- `worker_rpc._editor_context_block` resolves each item against the engine
   (`doc_tree` once per doc, `doc_query {of: face|edge}` once per kind per doc to check
   sids against live geometry, `doc_resolve_pick` when no `selector` is present) and
   renders a PICKED CONTEXT block after ACTIVE DOCUMENT. The host no longer inlines the
   plain-text block on this route.
-- Offline: the host appends the plain-text "Context references:" block to `request`.
 - Steer: `agent_steer` carries the same text inside `text`.
 
 All fields optional unless noted:
@@ -2189,7 +2286,7 @@ steers that carried one); a withdrawn steer opens that conversation's next promp
 
 **Process lifetime.** Workers are forked on a daemon-lifetime thread. Linux PDEATHSIG follows the forking thread, so before this fix a worker died as soon as the client connection that triggered its spawn closed.
 
-**GUI connections.** In daemon mode each concurrent `agent_admin_turn` leases its own agent run connection (at most 8). Native `agent_run_v2` and `agent_mission_v1` still run one at a time.
+**GUI connections.** In daemon mode each concurrent `agent_admin_turn` leases its own agent run connection (at most 8).
 
 **Shared parts.**
 - Python `core_bridge` sends `doc_apply_ops` without an explicit `base_revision` as `base_revision: -1`. Batches from different writer groups then apply in arrival order under the engine's per-doc lock, each atomic and validated, with no CAS refusal.
@@ -2538,3 +2635,945 @@ print_ready:false,print_ready_reason}` or `{ok:false,code,error}`. The GUI merge
 into the finished run record of a geometry-valid GUI run and persists the study; agent run
 records are never rewritten. `print_ready` stays false: only `slice_part` G-code validation
 makes a part print-ready.
+
+## Single-operator container cell v1 (append-only, 2026-10-25)
+
+This additive deployment profile does not change the frozen tenant-cell protocol,
+the desktop daemon, or systemd cell quota admission. `CHUDWARE_WEB_CELL_BACKEND`
+accepts exactly `systemd` (the default) and `container`; any other value fails
+configuration. Only the deployment operator selects it, never a browser request.
+
+The container profile is a private, trusted, single-operator deployment, not
+hostile multi-user hosting. It has no application accounts or portable per-owner
+hard disk quotas: its persistent volumes can fill their backing filesystem.
+Every request retains the configured operator's owner grant, with
+`workspace_key="user:"+CHUDWARE_WEB_OPERATOR`, the same operator as `actor_key`,
+epoch zero, and the existing SHA-256-derived cell ID. Keep that operator identity
+stable with the data volumes. Remote access requires authentication for **all**
+HTTP and WebSocket routes at an HTTPS reverse proxy.
+
+### Boundary, admission, and persistence
+
+The supplied image's non-root PID-1 entrypoint is the outer isolation boundary.
+It requires both a real Docker/Podman boundary marker and the root-owned
+`/opt/chudware/container-runtime-v1` image marker. Running the Python entrypoint
+directly on a host, using a desktop daemon socket, or selecting `container`
+without its prepared private supervisor marker is refused. Mounting host homes,
+credentials, container-engine sockets, or privileged host namespaces is outside
+this profile.
+
+The supervisor prepares the existing private `cell.json` and owns the fixed
+`<home>/cells/<cell_id>/gw.sock` listener. It launches only `chudware-hostd --cell`
+with that inherited listener, plus one gateway worker. The gateway does not call
+systemd for this backend. It admits only the fixed operator principal and checks
+the supervisor-recorded socket device/inode, owner, private mode and no-follow
+directory walk before connecting. The trusted `hello`, authoritative
+`contracts/cell_methods.json` admission, credential-field rejection, document
+filtering and mesh grants remain unchanged. No desktop/raw forwarding fallback
+exists.
+
+The fixed persistent mount layout is:
+
+* `/data`: gateway home, cell identity and private transport metadata.
+* `/work`: saved workspace documents and hidden workspace metadata (including
+  recents/chat). Only this workspace is exposed to actor tools.
+* `/state`: private engine/actor state, recovery data, cache, logs and published
+  meshes. A durable `chudware-container-state-v1` identity record prevents
+  accidentally reusing the state volume for another operator/workspace.
+
+Engine-published `/state/mesh/<32hex>.aicm` paths resolve directly to the durable
+`/state/mesh` mount for that principal. The gateway still performs a no-follow
+walk and requires the existing per-document mesh grant. There is deliberately no
+symlink from `/data/cells/<cell_id>/state` to bypass filesystem confinement.
+Persist and back up all three volumes together. In-memory mesh grants are
+re-established on reconnect/reopen; they are not durable authorization records.
+
+### Workers, egress, and process lifetime
+
+General Python workers, including non-AI functionality, remain installed.
+Hostd's fixed adjacent worker bootstrap still enters the existing nested actor
+bubblewrap sandbox: only `/work` and that actor's private `/actor` are writable,
+with a separate network namespace and the same sanitized identity environment.
+No ambient environment, provider credentials or host authority is forwarded.
+The existing broker accepts only validated public `CONNECT hostname:443`
+destinations with DNS-address pinning and its existing bounded relay policy;
+the actor receives only its private broker socket and loopback forwarder.
+
+Startup probes the **actual** actor sandbox, worker imports, and a non-AI worker
+operation. Missing payloads/dependencies or blocked nested user namespaces,
+bubblewrap, seccomp or LSM policy fail startup with an actionable error. A failed
+sandbox never falls back to unisolated workers or silently removes non-AI
+features. The separately distributed optional agent runtime/SDK is not required for
+the native/general-worker path. Online browser Copilot remains unavailable:
+AI turns still refuse `credential_isolation_unsupported`.
+
+The supervisor retains its listener across hostd restarts and relaunches after
+both clean idle exit and failure. Closing a browser connection does not kill a
+task, and neither the supervisor nor actor tools impose an overall run lifetime
+cap. SIGTERM/SIGINT record shutdown intent; ordinary control flow forwards
+termination, waits, escalates only during shutdown, and reaps its own children.
+It never broadcasts termination to unrelated processes. Saved workspace/state
+survive container recreation; clean engine shutdown still follows the existing
+autosave contract and is not a substitute for saving documents.
+
+`runtime.py healthcheck` is bounded readiness admission: it validates the current
+supervisor/socket, complete browser/native/worker payload, native `hello` state
+`ready`, and gateway HTTP liveness. `/healthz` alone remains liveness, not proof of
+working CAD. Readiness connections can defer native idle exit; the supervisor
+must nevertheless handle idle exit whenever it occurs.
+
+## Control-plane shutdown clarification (append-only, 2026-10-25)
+
+Worker shutdown, including stdio EOF immediately after cancellation, stops admitting
+control requests before closing their transports. Already authenticated and authorized
+requests get a shared 0.5-second grace to finish their normal bounded reply, within a
+one-second total cleanup wait budget. Incomplete/unauthenticated clients are interrupted
+immediately; remaining transports (including nonreading peers) are interrupted when
+the grace expires. Named-pipe replies retain their bounded client-disconnect drain so
+shutdown does not discard an admitted reply before the client reads it.
+
+## Long POSIX control paths (append-only, 2026-10-26)
+
+The Unix control endpoint is at most 103 encoded bytes, matching the native
+client and the smallest supported `sockaddr_un::sun_path`. When the configured
+runtime directory would exceed that limit, the worker allocates a unique
+mode-0700 directory directly under `/tmp`, independent of `TMPDIR`. Its socket
+keeps the `chudcode-worker-<ppid>-<pid>.sock` name, mode 0600 and existing
+token authentication; the endpoint returned by `worker_control_info` remains
+authoritative. Windows named-pipe behavior is unchanged.
+
+Socket setup failure and normal shutdown remove only the owned socket inode and
+then the empty temporary directory, never recursively deleting other contents.
+The configured runtime directory and persistent application data are retained.
+
+## Explicit document presentation (append-only, 2026-10-28)
+
+`doc_present {doc_id}` requests presentation of an existing, non-internal live
+document in the authorized workspace. It returns
+`{ok:true, doc_id, name, revision, presented:true}` and emits
+`doc.presented {doc_id, name, revision}`. In cells, this event has the same
+workspace visibility as `doc_list`; other document events remain attachment-scoped.
+Repeated requests may emit again. `doc_list` rows
+include `presented` (false until requested, scoped to the live document).
+Presentation does not rebuild, save, acquire edit custody, or assert that a
+viewer is connected. Clients retain control of focus and dismissed tabs.
+
+## Atomic metadata members and autosave revisions (append-only, 2026-10-28)
+
+`doc_set_meta {doc_id, key, value, member?, preserve?}` replaces `meta[key]`
+when `member` is omitted or empty. With a nonempty `member`, it atomically
+updates `meta[key][member]` under the document lock. If `preserve` is a nonempty
+object and every field matches the existing object member, the replacement is
+skipped. For assembly placement provenance callers use
+`preserve: {"placement_source":"mate"}` so mate provenance takes priority.
+The successful reply remains `{ok:true, key}`.
+
+`doc_list` reports `metadata_revision` separately from the geometry `revision`.
+Successful metadata replacements advance the former without advancing the latter;
+preserved no-op updates do not. Autosave compares the pair so metadata-only
+changes are persisted.
+
+## Collaborative GUI editing (append-only, 2026-10-28)
+
+This supersedes the GUI interim lock in “Writer groups, event delivery, busy
+doc_list”. A foreign document write or an active agent run does not itself
+disable human editing, close an interactive session, or impose a cooldown.
+Actual operation guards, edit holds, per-document serialization and explicit
+revision validation remain in force.
+
+An interactive preview that uses `doc_checkpoint` and `doc_revert` supplies
+`expect_revision` for its last **own** successfully applied revision (or the
+checkpoint revision when it made no change), not a later revision observed from
+another writer. A `stale_revision` consumes the checkpoint without changing the
+document; the GUI retains the current work and must not chain another mutation
+on the assumption that rollback succeeded.
+
+`doc_push_pull` and `doc_solve_mates` accept optional `expect_revision`.
+When nonnegative, each checks it while holding the document lock, before
+planning, no-op handling, or mutation. A mismatch returns `stale_revision`
+with `detail.current_revision` and leaves the document, revision, and history
+unchanged. Omitting the field retains the unguarded behavior for other callers.
+After a preview revert, callers must use the revision returned by that revert;
+a different writer can still commit between the two RPCs.
+
+`sketch_enter` returns a positive integer `session_id` identifying its transient
+editor state and the document `revision` used to solve it. `sketch_solve` and
+`sketch_drag` accept that optional token, reject a replaced session with
+`sketch_session_changed`, and return the revision actually solved under the
+document lock. When intervening edits change the revision, these calls re-solve
+against the current document rather than reuse stale coordinates.
+
+`sketch_drag_commit` and `sketch_exit` accept optional `session_id` and
+`expect_revision`. A mismatched session fails with `sketch_session_changed`;
+a mismatched revision, or tokened cached coordinates solved at an older
+revision, fails with `stale_revision` without changing document or history.
+Legacy callers may omit both. `sketch_exit` additionally accepts
+`discard_active:true` with `session_id`: it returns `{ok:true, discarded:bool}`
+and clears only the matching transient state, without requiring the sketch
+feature to still exist or writing geometry, revision, or history. A missing
+or superseded token leaves the newer editor untouched.
+
+Full editor payloads derived from cached feature fields or 3D-sketch entity and
+constraint arrays are bound to the document revision that supplied them. If the
+mirror advances before submission, a GUI editor must not send those cached
+values against the newer revision. It reloads the current state and tells the
+user to make a fresh edit, unless it can preserve and rebase only the explicitly
+authored change without overwriting the other writer's fields.
+
+## Model assignment settings
+
+`ai_roles_get {}` and `ai_roles_set` return `roles` (the independently retained
+Advanced assignments), `known_roles`, `assignment_mode` (`simple` or `advanced`),
+`model_sizes`, and the authoritative `role_sizes` mapping. `model_sizes` contains
+`small`, `medium`, and `large` assignments, each represented as
+`{mode:"default"|"auto"|"fixed", provider:"...", model:"..."}`. `default`
+follows the chat model; its provider and model are empty. `auto` is a legacy stored
+value (ranked selection) that is retained but no longer resolved until reassigned; `fixed` requires both provider and model.
+`role_sizes` covers the cloud-capable roles and specialist aliases. Private and
+redaction seats are excluded and remain restricted to local providers.
+`chat_assignment` reports the effective root assignment in the same shape:
+Simple uses Large; Advanced uses an explicit legacy `chat` assignment if present,
+otherwise the `default` role. Root thinking follows that Advanced role as well.
+
+`ai_roles_set` accepts any combination of partial `roles`, partial `model_sizes`,
+and `assignment_mode`. All requested updates are validated before one atomic
+config write; omitted assignments are preserved. Switching modes never rewrites
+the other mode's assignments. An empty configuration starts in Simple with all
+sizes following chat. Legacy configurations with any explicit role assignments,
+including Auto, start in Advanced until the user changes mode. Simple uses automatic thinking;
+Advanced retains per-role thinking.
+Default child assignments inherit the live parent session's model, not the
+persisted chat-model fallback. Explicit legacy specialist entries take precedence
+over their canonical aliases in Advanced. A local-only policy rejects fixed cloud
+assignments rather than silently selecting another provider.
+An online turn that omits both `provider` and `model` follows the configured
+chat assignment; an explicit composer selection takes precedence. A root
+Default assignment uses the saved chat selection, or normal automatic
+selection when no saved chat model is available.
+
+## Official OMP runtime cutover (2026-10-28)
+
+This section supersedes earlier Chudcode-specific runtime names and implementation
+pointers, including the old lane prefix, rewind response keys and socket names;
+those sections remain historical records. Online sessions use the official OMP
+runtime and `omp_rpc` with the trusted per-session CAD extension. The agent lane
+routes `omp_*`, not `chudcode_*`. Current registered runtime methods are
+`omp_provider_list`, `omp_auth_state`, `omp_set_key`, `omp_remove_key`,
+`omp_logout_accounts`, `omp_logout`, `omp_login`, `omp_models_list`,
+`omp_session_stats`, `omp_export_session`, `omp_branch_session`,
+`omp_rewind_session`, `omp_close_session`, `omp_apply_compaction_policy`,
+`omp_set_auto_compaction`, `omp_set_auto_retry` and `omp_tool_state`.
+`omp_rewind_session` accepts `{session_id, user_text, occurrence, session_file?,
+workspace_dir?}` and returns `omp_session_id` and `omp_session_file` on success.
+The authoritative control endpoint is returned by `worker_control_info`; do not
+derive it from a historical socket name.
+
+Provider setup discovery is separate from the usable-model catalog; configuration
+is not credential validation. Explicit chat selection is independent of the
+small/medium/large role assignments; owning-session settings govern each turn.
+Explicit compaction selects only the requested method, never an implicit fallback.
+An ordinary turn has no overall timeout unless a caller explicitly supplies a positive
+finite timeout and is not complete until asynchronous children settle. Manual stop and
+maintenance settlement are bounded, preserve the
+session journal and report cancellation, timeout or failure truthfully. A healthy
+active session is not automatically restarted for settings changes.
+
+For one-time migration the GUI reads the persisted `chudcode` link when `omp` is
+absent, preserves its session ID and file, and writes `omp` while removing the old
+key on save. The worker parameter is `omp_session_file`. Existing
+compatible journals are opened through the runtime, never reconstructed from
+visible chat; unsupported history fails recoverably. Fork-only speech-to-text,
+repair and duplicate compact endpoints are removed, not stubbed. See
+[`docs/dev/omp-integration.md`](../docs/dev/omp-integration.md).
+
+## Procedural-model capability routing
+
+`scad_status` and `scad_inspect` are document-free native RPCs. Desktop in-process,
+daemon, and browser callers route both to `libchudware`, never to the Python
+services worker. Conversion mutates a document through the `scad_convert`
+operation in `doc_apply_ops`; it is not a separate native worker method.
+
+## Existing agent continuity during stale-binary drain (2026-10-29)
+
+A desktop daemon's soft `stale_binary` drain preserves existing agent work on the
+loaded engine. It freezes daemon-owned worker generations and conversation owners at
+drain start. On Linux with `SO_PEERPIDFD` support, fresh MCP sockets from a live
+OS-authenticated peer matching that frozen ownership may finish tool work and later
+turns of the existing conversation. Busy owners retain the existing single-flight
+queue instead of migrating the session to another worker. Client-declared PID and
+writer-group fields do not authorize this exception.
+
+Independent clients, newly created worker generations, ended generations and ownership
+transfers already underway remain refused with `daemon_draining`. Unsupported or
+unavailable generation-bound peer proof fails closed. Tenant-cell actor sockets have
+no continuity exception. Explicit hard drains supersede soft-drain eligibility;
+supervised children pin a soft drain until they end.
+
+Clients detecting a different on-disk build warn without sending `daemon_drain`,
+stopping existing sessions or replaying mutations. The daemon's own watcher performs
+the soft cutover. Local `control` connections are limited to `ping`, `daemon_status`
+and `daemon_drain`; they are not an alternate document-editing channel. See
+[`docs/reference/HOSTD.md`](../docs/reference/HOSTD.md) for platform limits and lifecycle.
+
+## Agent tool discovery queries (2026-10-29)
+
+The agent's `list_tool_categories(query?, category?, offset?, limit?)` accepts text
+phrases and space/comma-separated exact tool names, case-insensitively. Each exact
+name matches independently; repeated names do not duplicate results, and unknown
+names do not hide known matches. Category filtering remains an intersection with
+the resolved category. Results retain deterministic menu order and the existing
+`tools`, `total` and `next_offset` pagination envelope. Discovery neither activates
+tools nor changes their authorization.
+
+`cad_guide` topics `sketch_fully_define`, `sketch_add_constraint`, `sketch_set_dim`,
+`check_sketch` and `sketch_health` resolve to the existing 2D `sketch` guide.
+`sketch2d`, `2d_sketch` and `edit_sketch` are equivalent topic aliases. Guide text,
+runtime tool activation and document mutation remain separate operations.
+
+## Fillet result and part rejection semantics v2 (append-only)
+
+This amends the native fillet result and part-operation semantics while retaining
+protocol 2 and the existing method table; it introduces no new RPC method.
+A successfully **built** fillet reports
+`rebuild.feature_status[].data.fillet`, including on the unchanged-radius fast
+path. Suppressed or rollback-bar-skipped features are not built. The record is:
+
+| field | meaning |
+|---|---|
+| `requested` | `{radius:number, radius2:number\|null}`: evaluated requested radii in canonical mm; `radius2` is null for a constant fillet |
+| `effective` | `{radius:number, radius2:number\|null}`: radii actually used to build the returned geometry, in canonical mm |
+| `adjustment` | `"none"` when neither endpoint changed; `"lower"` when at least one was increased and none decreased; `"upper"` when at least one was decreased and none increased; `"both"` when one or more increased and one or more decreased |
+| `selected_edges` | number of unique resolved edges in the selection; for the implicit legacy path, the blendable edges selected by its all-edge or direction rule |
+| `covered_edges` | selected edges covered by the verified result; success requires it to equal `selected_edges` and be nonzero |
+| `tolerance_mm` | nonnegative search resolution in mm; for stabilization, the maximum reported stage resolution, not a guarantee of a global optimum |
+| `probes` | candidate probe count; for stabilization, the sum of participating stage counts without double-counting a reused prefix |
+
+For an accepted mutation, `requested` retains the original evaluated request
+while `effective` names the final stabilized geometry, even when literal
+writeback required recompilation. A later rebuild reports its own evaluated
+request; this status is a build result, not a durable history of prior requests.
+
+An adjustment also produces a human-readable `warning`; the structured record,
+not that text, is the machine-readable result. Each geometry search is bounded;
+an aggregate status may include more than one search.
+Failures such as nonfinite input, invalid or unresolved selection, unsupported
+topology, failed validation, an isolated child crash or timeout, and exhausted
+search are failures, not a successful correction or proof of a radius boundary.
+In-process execution cannot contain a native crash or impose a hard deadline
+on an in-flight call. A failed fillet has no successful `data.fillet` result. See
+[feature_params.md](feature_params.md) for the modes, selection, bounded search
+and limitations, and [doc_schema.md](doc_schema.md) for persisted derived state.
+
+`doc_apply_ops` part compile rejection returns `rejected_tree` and candidate
+`rebuild.feature_status` alongside the **restored** live `tree`, revision,
+ownership and display result; it is not a transport error and candidate
+statuses must not be installed as live statuses. The complete v2 transaction and
+undo rules, including the distinct validation error path, are in
+[doc_ops.md](doc_ops.md). A transport-successful response without checking
+`rejected_tree` is not sufficient evidence that an edit committed.
+
+The host-only `DocMirror::OpsResponse` distinguishes this from transport
+success: a rejected candidate has `ok:false`, `rejected:true` and
+`error_code:"rebuild_rejected"`, with the rejected candidate's feature
+diagnostics in `feature_status`. They do not replace live mirror statuses.
+Its `unchanged` flag is true only for a known atomic refusal at the still-current
+document and base revision: a matching `rejected_tree` rollback or a known part
+`invalid_op` validation refusal. Transport errors, stale revisions and
+superseded responses do not establish `unchanged`. These are host response
+fields, not additional worker-wire fields or methods.
+
+The same native feature status `data` is forwarded by `doc_compile_cpp` in
+`statuses[].data` and by the MCP `add_features` tool in `features[].data`;
+absent data remains null. `doc_compile_cpp` compiles the supplied tree for
+diagnostics; it does not commit corrected literals to a live session. MCP
+failure rows describe the rejected candidate, not the restored live geometry.
+`doc_apply_ops`, `doc_rebuild`, cached
+activation and open use their existing result envelopes; `data.fillet` is a
+result record, distinct from the optional persisted
+`feature.data.fillet_effective`.
+
+## Model history (append-only)
+
+`eval_model_history {doc_id}` is a read-only, revision-scoped history analysis. Its
+successful response contains `ok`, `doc_id`, `revision`, `complete`, `summary`,
+`metrics`, `findings`, `safe_fixes` and `limitations`; `complete` covers the documented
+history rule set, not geometric or engineering certification. Errors remain errors.
+The same native report is surfaced automatically in `rebuild.doc_status.model_history`
+and, where available, top-level `model_history` in rebuild/operation responses.
+
+Preview uses this read method. Explicit apply uses `doc_apply_ops` with the preview
+revision as `base_revision` and `{"op":"simplify_history","features":[...]}`;
+omitting `features` requests all eligible fixes. The engine reanalyzes under the
+document lock, refuses stale or unsafe edits, and preserves undo semantics. Refine is
+a distinct editable feature, not a flattened import. Full response fields, eligibility,
+external-reference limitations and refinement guarantees are specified in
+[model_history.md](model_history.md).
+
+## Official OMP dictation and activity v3 (append-only)
+
+This amendment supersedes the historical “Copilot voice input / OMP ASR sidecar”
+method table. The current worker does not register `agent_stt_status`,
+`agent_stt_start`, `agent_stt_stop`, or `agent_stt_cancel`; consumers must not
+advertise them or assume an SDK status/cancel operation exists. Worker wire
+framing remains protocol 2.
+
+The pinned official OMP runtime owns dictation. Its own RPC surface has
+`dictation_start` and `dictation_stop`, not dictation status or cancel RPCs.
+It emits `dictation_state` for starting, recording and transcribing,
+`dictation_transcript` previews, and a terminal `dictation_end`. Stop can
+cancel pending startup and waits for startup/transcription to settle. These
+are SDK commands and notifications, not additional worker methods. See the
+pinned [RPC types](https://raw.githubusercontent.com/can1357/oh-my-pi/413d278a87a69b453efabf8d1fedb9940385e8c6/packages/coding-agent/src/modes/rpc/rpc-types.ts)
+and [dictation bridge](https://raw.githubusercontent.com/can1357/oh-my-pi/413d278a87a69b453efabf8d1fedb9940385e8c6/packages/coding-agent/src/modes/rpc/rpc-dictation.ts).
+
+The host activity census observes existing clients; it must not start a
+session, microphone capture or dictation to determine idleness. Nonterminal
+dictation, pending requests, queued work and cancellation remain active until
+their real completion. A single-flight `get_state` request is combined with
+notifications and pending-call evidence, including events arriving while that
+request is blocked; the census excludes its own request. Incomplete evidence
+does not erase previously known work or establish idleness. An idle persistent
+SDK process alone is not a job. Implementation:
+[OMP host](../services/agent/omp_host.py) and
+[worker activity census](../services/worker_activity.py).
+
+## Feature-overlap diagnostics v2 (append-only)
+
+This amendment supersedes the material-removal interpretation of
+`eval_feature_overlap` in “Recognition & overlap” while retaining protocol 2,
+the existing method and legacy `kind` values. Each `volume_mm3` is the common
+volume of two **pre-boolean tools**; it is not a measurement of material added,
+removed, or removed twice. Through-all tools can extend beyond the stock.
+`kind:"boss_swallowed"` and its legacy `ok:false` verdict indicate tool inclusion,
+not proof that a boss was swallowed. `dead_features` means only that the feature
+owns no surviving faces; it does not establish why. Consumers must inspect actual
+geometry and feature history before concluding material was lost.
+
+The response adds `basis:"pre_boolean_tool_intersection"`, `note`, `complete`,
+`unavailable_features`, and `failed_pairs`. Each pair adds the same value in
+`volume_basis` and `tool_kind:"add_tool_overlap"|"cut_tool_overlap"|
+"add_cut_tool_overlap"`. New pattern diagnostic records contain copies but exclude
+the inherent seed instance, while retaining genuine intersections between the
+seed and other instances. Older saved pattern diagnostic records that cannot
+establish that distinction are unavailable; they are not silently presented as
+complete. `complete:false` also makes `ok:false`, and known pairs remain available.
+
+## Clearance and STL diagnostic metadata (append-only)
+
+For positive `min_clearance_mm`, `eval_interference` adds
+`clearance_tolerance_mm:0.000001` and classifies exact pair distances as
+`clearance_status:"below"|"within_tolerance"|"above"`. A gap in the tolerance
+band has warning `"within min clearance tolerance"` rather than a definitive
+below-threshold warning. A threshold-mode lower bound is classified above only
+when it exceeds the threshold plus this band.
+
+For STL `doc_export_file`, `validated:false` means that no B-rep round-trip was
+performed. `validation_stages.serialized_facet_collapse` reports the output
+facet-collapse check and `source_solid_facet_incidence_and_orientation` reports
+the per-source-solid incidence/orientation check and its solid count; this does
+not validate non-solid geometry. `validation_stages.brep_round_trip` and
+`validation_skipped` state that the B-rep round-trip was skipped. These checks
+do not imply an independent STL reimport.
+
+## Sketch diagnostic truth (append-only)
+
+`doc_sketch_health` adds `closure.usage:"closed_profile"|"open_path"|"mixed"|
+"unknown"` from existing authored consumers. A dangling endpoint alone is not
+an instruction to close a rib or sweep path, and an unused sketch has unknown
+future use. Whole-relation redundancy is based on the Jacobian rank after
+removing all residual rows for that constraint. A delete suggestion is emitted
+only after a removal trial preserves DOF and solved geometry. The additional
+`partial_dependencies` array reports constraint IDs with dependent residual
+rows whose complete removal would lose rank at the solved geometry; these are
+not safe whole-constraint deletion suggestions.
+
+## Detached part cache identity (append-only)
+
+When `doc_open` detaches a part and uniquifies its session display name, the
+saved display-cache hash is compared with the loaded authored document before
+that session-only name change. Engine-key, provenance, and authored-content
+checks remain in force. The returned tree carries the detached session name; the
+display and exact saved body state need not be re-resolved merely for that rename.
+
+## Document mesh references (append-only)
+
+These five native methods operate on an **existing part document**. A mesh
+reference is a separately displayed, non-solid triangle mesh, not a B-rep
+feature or body. It does not participate in feature compilation, booleans,
+mass properties, modeling picks, exports of solid geometry, or simulation.
+Its placement and appearance can be edited without changing the part's solid
+geometry. Parameters are flat; `doc_id` and `id` are strings.
+
+| method | params → result |
+|---|---|
+| `doc_mesh_ref_add` | `{doc_id, path, name?, transform?, opacity?, color?, approximate?, provenance?}` → `{ok:true, id, triangles, bbox_mm, revision, ...}`. Read a PLY, STL, or OBJ from `path`, embed its triangles, and add one reference. |
+| `doc_mesh_ref_list` | `{doc_id}` → `{ok:true, refs:[...], revision}`. Each row is the entity below plus `triangles` and `bbox_mm`; this is a read and does not advance the revision. |
+| `doc_mesh_ref_update` | `{doc_id, id, name?, transform?, visible?, opacity?, color?}` → `{ok:true, revision, ...}`. Change the supplied fields only; a supplied `transform` replaces the complete transform. |
+| `doc_mesh_ref_remove` | `{doc_id, id}` → `{ok:true, revision, ...}`. Remove the reference without changing solid features. |
+| `doc_mesh_ref_mesh` | `{doc_id, id, offset_tris?, max_tris?, expected_revision?}` → `{ok:true, vertices_mm, indices, revision, total_tris, offset_tris, next_offset_tris}`. Read transformed mesh triangles; does not advance the revision. |
+
+`triangles` is a triangle count. `bbox_mm` is the axis-aligned bounding box
+of transformed vertices, `{min:[x,y,z], max:[x,y,z], size:[x,y,z]}`, in mm.
+`vertices_mm` is a flat `[x,y,z,...]` array in document coordinates; `indices`
+is a flat `[i,j,k,...]` array of zero-based indices into the returned vertices.
+Paged results use page-local indices and `next_offset_tris` is the next triangle
+offset or `null` at the end. Vertices shared within a page remain shared; indices
+are remapped to that page. With neither paging parameter the full mesh is
+returned (or an error if it exceeds the mesh limit). Supplying either parameter
+requests a page: `offset_tris` defaults to 0 and may range from 0 through
+`total_tris` inclusive; `max_tris` defaults to 10000 and must be 1–10000.
+Invalid paging parameters produce `invalid_op`. Clients can follow
+`next_offset_tris` with at most 10000 triangles per page to fit the default
+gateway frame and array limits; deployments with smaller frame limits may
+request smaller pages. `expected_revision` is a non-negative integer; when
+supplied, a changed document fails with `stale_revision`. Clients should use
+the revision of their initial list or page on every later page to avoid
+combining geometry from different revisions.
+
+Each part can hold at most 1000 references. The uncompressed canonical blob
+and compressed embedded blob are each limited to 64 MiB; full-mesh replies
+are conservatively limited to 56 MiB. Exceeding a limit returns `invalid_op`;
+use paging when a full reply is too large.
+
+The session also limits retained compressed reference blobs to 192 MiB,
+counting each content hash once across the current document, undo/redo, and
+checkpoints. Unreachable blobs are pruned on pressure and when history is
+cleared; if retained blobs still exceed the limit, add fails with `invalid_op`
+rather than discarding history. Clearing undo history can reclaim space, but
+live references and checkpoints remain protected.
+
+The part tree's top-level `mesh_references` array contains these persisted
+entities; the field is omitted before the first addition. Each entity has
+this shape:
+
+```json
+{
+  "id": "<opaque id>",
+  "name": "Scan",
+  "source_path": "<source location>",
+  "sha256": "<lowercase sha256>",
+  "format": "ply",
+  "transform": {
+    "mm_per_unit": 1.0,
+    "rotation": [[1,0,0],[0,1,0],[0,0,1]],
+    "translation_mm": [0,0,0]
+  },
+  "visible": true,
+  "opacity": 0.4,
+  "color": [0.45,0.65,0.85],
+  "approximate": false,
+  "provenance": {"reveng_session": null, "method": null}
+}
+```
+
+The default name is the source filename stem. `visible`, `opacity`, `color`,
+and `approximate` default as shown; color is an RGB triple and every channel
+and opacity must be finite and in `[0,1]`. Provenance can record a
+reverse-engineering session and method. `approximate` identifies reference
+geometry that must not be presented as an exact measurement.
+`source_path` is informational (project-relative when inside the project,
+otherwise absolute), may be redacted by an access boundary, and is not needed
+to reopen the embedded mesh.
+
+The default transform is identity. A supplied transform contains all three
+fields: finite, positive `mm_per_unit`; a proper orthonormal 3×3 `rotation`
+given as three rows; and finite `translation_mm:[x,y,z]`. A source point
+`p` is displayed at `rotation * (p * mm_per_unit) + translation_mm`.
+Scale, rotation, and translation are applied exactly once; the stored
+triangle data remains in source coordinates. Bounds and `vertices_mm`
+reflect the current transform.
+
+On save, the part's `.step+` embeds compressed reference geometry, so opening
+the document does not read the original source file. The entity's `sha256`
+hashes the canonical uncompressed triangle blob: ASCII `CHMR0001`, little-endian
+`uint32` vertex and triangle counts, then `3*N` little-endian binary64 source
+coordinates and `3*M` little-endian `uint32` indices. The ZIP member
+`mesh_references/<sha256>.bin` contains `CHMZ0001`, a little-endian `uint64`
+uncompressed length, and zlib-compressed canonical bytes; the ZIP member itself
+is stored without another compression layer. References to identical canonical
+geometry share the content-addressed blob. Undo/redo retain embedded geometry
+along with the document snapshot.
+
+A part with at least one reference is authored content: `doc_list.empty` is
+false even when `feature_count` is zero, so recovery and retirement do not
+discard a reference-only part as an empty document.
+
+Add, update, and remove are document mutations, advance `revision`, and can
+also return the normal cached document snapshot fields (`tree`, `owner_map`,
+`rebuild`, `tess`). Hostd enforces the ordinary document attachment/edit-hold
+policy and publishes `doc.changed` for an advancing mutation. List and mesh
+are inspection calls permitted to read-only attachments. In a cell, the
+mutations require workspace write permission and inspections require read
+permission. The add path is subject to the cell's workspace/own-actor path
+confinement, including traversal and symlinks, before the engine reads it.
+Malformed data or transforms, unsupported or unreadable input, unknown
+documents or reference ids, and exceeded mesh limits are errors; unknown
+reference ids use `invalid_op`. Errors use the structured envelope.
+
+## Assembly mate axes (append-only)
+
+`asm_world_bodies` accepts the optional boolean `include_mate_axes` (default
+false). For an assembly, true adds `mate_axes`, an object keyed by mate id
+whose arrays contain `{ref_index, component, point, direction}` for each
+successfully resolved axial reference. The point and direction are the
+full-precision geometric axis in the source component's local frame, before
+placement or explode offsets. References that do not resolve to an axis are
+omitted; this field does not imply that a mate or the assembly converged.
+Part responses retain their existing `multibody_part` form. The call follows
+the existing `asm_world_bodies` dependency-refresh semantics and does not
+explicitly invoke `doc_solve_mates`.
+
+## Assembly source status (append-only)
+
+`asm_source_status {doc_id}` is a read-only, workspace-scoped query. It compares
+the cached assembly source fingerprints with the current live source snapshots
+without refreshing or solving the assembly. `status` is `current`, `stale`, or
+`not_built`; `matches` is respectively true, false, or null. A non-assembly
+returns `status: "not_assembly"` and `matches: null`.
+
+For assemblies, `current` and `cached` contain the recursive fingerprint arrays
+(`cached` is null before a build), and `sources` supplies corresponding `path`,
+`current`, `cached`, and `changed` rows. Direct component rows include
+`component`; other dependency rows need not. `changed` is null before a build.
+The independent `open`, `dirty`, and optional `doc_id` fields describe a live
+source and do not by themselves imply stale geometry. Fingerprint status is a
+snapshot and can change after this call.
+
+## Motion clearance uncertainty (append-only)
+
+When a sampled clearance lies within `eval_interference`'s tolerance band,
+motion does not report that pair as a definite collision or clear. The frame
+retains its measured distance, tolerance, status and component identities in
+`pair_failures` with `reason:"clearance_within_tolerance"`; the aggregate
+`interference.pair_failures` adds the sample index. Such a frame has
+`interference_complete:false` and is excluded from `frames_checked`. Its
+`interference` is `null` unless another pair is a known collision, which remains
+reported in `collisions` and `collision_detail`. Any uncertain frame makes the
+aggregate interference check incomplete, so the sweep cannot prove clearance.
+
+## Concurrent turn admission and session teardown (append-only, 2026-11-03)
+
+- `agent_cancel {run_id}` also matches an `agent_admin_turn` awaiting a worker or
+  an idle-session transfer. It marks that request cancelled and wakes its waiter;
+  the turn returns `turn.cancelled:true` without dispatching the prompt or
+  compaction. The owning worker's unrelated run is not cancelled.
+- An admitted turn's private cancel can arrive before the worker registers its
+  run. That stop is retained for the exact run and credential scope and prevents
+  runtime creation when registration occurs.
+- A worker disposing an idle session retains its closing ownership until OMP
+  process shutdown and journal flushing finish. `release` returns
+  `{ok:false, reason:"session_busy"}` while teardown is in progress or its
+  outcome is unconfirmed; a control timeout is not permission to transfer.
+  Eviction and explicit close observe the same rule.
+- In a tenant cell, actor-scoped agent events remain broadcast to the actor's
+  connections. A GUI turn consumes only events matching its issued `run_id` from
+  its turn connection and does not render the primary socket's duplicate.
+
+## Explicit offline transcript compaction (append-only, 2026-11-03)
+
+`session_compact` with `offline:true` or `standalone:true` runs only the selected
+local transform. `snapcompact` uses the local archive; `shake` returns its
+transformed transcript in `messages` as well as `kept_messages`. `off` returns
+the unchanged `kept_messages` without a replacement. `auto`, `summary`, and
+unknown strategies are refused with `{ok:false, reason:...}` rather than
+silently selecting the experimental snapcompact transform. Online compaction
+continues to use the owning `agent_admin_turn` session and its receipt.
+
+## Open GUI side connections during stale-binary drain (append-only, 2026-11-03)
+
+Amends "Existing agent continuity during stale-binary drain". On a desktop soft
+`stale_binary` drain, a fresh `gui` or `gui-background` hello is admitted when its live,
+OS-authenticated peer process (Linux `SO_PEERPIDFD`) already holds a `gui` connection to
+the daemon. This covers the GUI's side sockets for `agent_answer`, `agent_steer`,
+`agent_cancel` and background queries of an open session; that process already pins
+the drain. A GUI process with no live connection is an independent client and is
+refused with `daemon_draining`. Hard drains, tenant cells and platforms without the
+peer proof fail closed.
+
+## Hostd document persistence amendment — contract revision 2.1
+
+This amendment supersedes the document lifecycle rows in §2 where they differ. It
+versions this contract, not the unchanged wire protocol major (`ping.protocol == 2`).
+Hostd-specific registry and recovery behavior does not apply to direct in-process calls.
+
+* `doc_list` rows include `metadata_revision`, `file_stamp` (null or
+  `{size,mtime_ns,ino}`), and, through hostd, `human_dirty`, `saved_revision` and
+  `saved_metadata_revision`. The stamp is the bound file version last opened or
+  published by the session. `dirty` is not interchangeable with `human_dirty`.
+  Saved revision values may be `-1` when no corresponding save is known.
+* Hostd tracks the last human revision and metadata revision. A revision-advancing
+  GUI mutation, or advancing `doc_set_name`/`doc_set_meta`, marks human work unless
+  params contain `origin:"system"`; system-tagged changes are attributed to system.
+  Binding saves clear human dirty only when they cover both last-human revisions;
+  fresh opens and reloads initialize/reset saved state. `origin_kind` records the
+  creator, not whether current work needs a human save.
+* `doc_open {path,reuse_open?:bool}` defaults to false. For a native bound file,
+  true atomically reuses an existing non-detached session of the same file identity,
+  returning its current activation response, `doc_id` and `reused:true`; otherwise
+  it opens normally. `detach_path` excludes reuse. Hostd adds dirty/saved state to
+  the open result.
+* `doc_save {doc_id,path?,force?,overwrite_changed?,expected_disk_stamp?,
+  preserve_path?}` returns `path`, the exact `saved_revision`, `metadata_revision`,
+  `cache` build-state report and `drawing_saved_revisions`; hostd also returns
+  `human_dirty` and `saved_metadata_revision`. A binding save to a path owned by
+  another live session returns `{ok:false,code:"path_bound_to_other_doc",
+  other_doc_id}` unless `force:true`. `force` does not override disk-change checks.
+  Saving to the bound path when its stamp changed returns
+  `{ok:false,code:"disk_changed",doc_id,path,observed_stamp}`. Explicit
+  `overwrite_changed:true` permits that write only when `expected_disk_stamp`
+  matches the observed stamp; publication rechecks the stamp and can still refuse
+  if it changes again. A missing file has a null visible stamp. `preserve_path`
+  writes a nonbinding recovery snapshot, without clearing the live dirty state.
+  A verified build state is persisted where available; a part whose required build
+  state cannot be persisted fails rather than replacing the existing file.
+* `doc_reload {doc_id,expected_revision?,expected_metadata_revision?}` replaces a
+  bound session in place, keeping its id, advancing revision and metadata revision,
+  clearing undo/redo and checkpoints, and returning the cache-aware open/ops response.
+  It uses a valid saved build cache rather than re-solving. Supplied nonnegative
+  revision guards refuse with `stale_revision` if the session changed; an unbound
+  document or a file changed during reload fails. Reload intentionally discards the
+  session's current edits.
+* Hostd `doc_close` and `doc_discard` detach the caller and return
+  `{ok:true,detached:bool,note?}`; `doc_discard` additionally returns `discarded`.
+  Another attachment/lease or in-flight agent work can prevent removal. Before a
+  last-owner removal, hostd preserves dirty or otherwise undelivered authored work
+  in recovery; if preservation or safe removal fails, it remains open and the
+  operation degrades to detach. Actual document removals are logged with identity,
+  caller, reason, dirty state and preservation outcome. This supersedes the old
+  unconditional-discard description, not the direct engine's `doc_close` behavior.
+
+### Recovery and daemon identity
+
+`hello` and `daemon_status` include `daemon_pid` and `daemon_start_id`; together
+they identify a daemon incarnation (`daemon_status.pid` is also present).
+`recovery_list {scope?}` waits for prior-session migration and automatic restore;
+it retries incomplete migration and returns `recovery_unavailable` when recovery
+storage or migration is unavailable. `scope:"human"` and `"ai"` filter by
+`human_dirty`; omitted scope lists both. Each entry is
+`{id,doc_id,name,path,origin_kind,human_dirty,revision,captured_at,mtime_ms}`;
+times are milliseconds and `mtime_ms` repeats `captured_at`. Sidecars also preserve
+saved revision, metadata revision and base file stamp. Missing or invalid legacy
+human-dirty provenance is treated as human work.
+
+At startup, a valid AI-only snapshot with a bound path and a matching base stamp
+is restored by checked atomic publication. A mismatch, missing path/stamp, or
+failure retains it for agent access; snapshots are not discarded merely by age or
+count. Human recovery is presented separately. `recovery_discard {ids:[string,…]}`
+deletes only the specified nonempty ids and returns `{discarded:count}`; an `all`
+parameter is rejected. `recovery_open {id}` or `{all:true}` returns
+`{opened:[{id,doc_id,original_doc_id,origin_kind,human_dirty,disk_conflict,
+observed_stamp}]}`. It opens the artifact with `detach_path:true`; when recorded,
+the original path is rebound, with its base stamp retained only if still matching.
+It retains the orphan if a replacement session snapshot cannot be made. Rooted
+web/cell assembly recovery
+snapshots retain relative rebasing rather than desktop absolute references.
+
+In-process daemon-disabled agent persistence cannot atomically guard a save against
+a concurrent human edit; the hostd per-document mutation guard supplies that
+serialization only when the daemon is active.
+
+## Exploded view vectors (append-only, 2026-11-04)
+
+`doc_set_explode_state {doc_id, active, factor}` keeps its ops-response and adds:
+
+```json
+"explode": {"active": true, "factor": 0.5, "automatic": true,
+            "components": [{"component": "k4", "body_ids": [4],
+                            "vector": [0, 0, -63.3], "center": [14.2, 16.5, -10.4]}],
+            "bounds": {"collapsed": {"min": [3], "max": [3]},
+                       "exploded": {"min": [3], "max": [3]}}}
+```
+
+`vector` is the component's full (factor 1) world offset in mm; the display applies
+`vector * factor` while `active`. `center` is the collapsed world box center of the
+component's bodies, and `body_ids` are its AICM body ids, so a client can slide those
+bodies on the GPU between commits and draw explode lines without another call.
+Components that stay put are omitted. `bounds.collapsed` is the world box of the whole
+assembly at factor 0 and `bounds.exploded` the box containing it at every factor up to 1
+(either is `null` for an assembly without bodies).
+
+When the document's `explode` list is absent or empty, `automatic` is true and the vectors
+come from the engine's automatic plan (doc_schema.md "Automatic exploded view"); otherwise
+they are the authored steps. `asm_world_bodies {explode: true}` and the display
+tessellation use the same vectors.
+
+## KiCad ECAD integration — contract revision 2.2
+
+The `ecad_*` family uses the method shapes in `ecad/ecad_rpc.md` revision v2,
+including project open/create, reload, KiCad status/check and library discovery.
+KiCad checks and exports run as child processes on the hostd side; the worker
+wire protocol major remains 2. Desktop editor launch is a host GUI action, not
+a worker RPC; the web client does not launch desktop applications.
+
+## Chat message edit rewind removal (append-only, 2026-11-04)
+
+`omp_rewind_session`, and the historical `chudcode_rewind_session` it superseded,
+is removed. The Copilot no longer offers edit-message/rewind. The method is no
+longer registered on the agent worker lane and is not admitted by `--cell`
+(`contracts/cell_methods.json` carries no entry for it), so a call returns the
+standard unknown-method refusal like any other unregistered method. The sections
+"Chat message edit rewind" and "Official OMP runtime cutover" above remain
+historical and no longer describe a live method.
+
+`omp_branch_session` is unchanged: it still branches a live session at an
+explicit `entry_id` and returns the child handle. `plm_rollback` and
+`plm_rollback_check` are unchanged. The removal needs no protocol-major bump;
+the worker wire protocol major remains 2.
+
+## Model assignment settings: advanced overrides, size references, tier thinking (append-only, 2026-11-04)
+
+Amends "Model assignment settings" above; that text stays historical where it
+conflicts. `ai_roles_get {}` and `ai_roles_set` additionally return and accept the
+following. The worker wire protocol major remains 2.
+
+**`advanced_overrides` (boolean, `config.json` key of the same name, default `false`; a
+missing key is `false`).** It is returned by both methods and accepted by `ai_roles_set`,
+where any non-boolean value is rejected and the key alone is a valid request. While it
+is `false` every non-restricted role dispatches through its size tier (`role_sizes[role]`
+→ `model_sizes[size]`), for model and thinking alike. Overrides already stored in `roles`
+and `active_role_overrides` are retained byte-for-byte, including across any save, but are
+ignored by resolution. While it is `true`, enabled per-role overrides apply as before.
+`active_role_overrides` keeps meaning "retained overrides": the stored set, whether or not
+the switch currently applies it (a follow-chat entry is not an override and is never
+listed). `legacy_mission_worker_fallback` is reported `true`, and the mission dispatcher
+applies the legacy worker fallback, only while `advanced_overrides` is `true`; with it off
+dispatch is pure tier dispatch.
+
+**Not gated by the switch:** the restricted `redaction` and `private` seats always resolve
+from `roles`, remain loopback-only, and still reject `default` and `size`; the root `chat`
+role and `chat_assignment` are unaffected, including the `roles.chat` thinking that the
+root turn reads.
+
+**Follow-chat is no longer an override choice.** For every non-restricted role other than
+`chat`, a stored `{mode:"default"}` entry (with or without `thinking`) and the legacy string
+`"default"` resolve as no override, regardless of the switch, so the role falls to its tier
+for model and thinking. In `ai_roles_set`, `roles[role] = {mode:"default"}` (or `"default"`)
+for such a role is treated exactly like `{mode:"tier"}` and clears that role's retained
+override.
+
+**`size` override mode.** `roles[role] = {mode:"size", size:"small"|"medium"|"large",
+thinking:"auto"|<level>}` stores exactly `{mode:"size", size, thinking?}` (`thinking` is omitted
+when `auto`; any provider or model fields are dropped). `size` is required with, and valid
+only with, `mode:"size"`; the mode is rejected for `redaction`, `private` and `chat`, and in
+`model_sizes` and `chat_assignment`. While the switch is on, the role resolves through the
+current `model_sizes[size]` assignment (`source:"model_sizes"`, with the same default, fixed,
+Auto-refusal and local-only behavior as the tier path), so later edits to that size are
+followed. A partial `thinking`-only update keeps the stored size.
+
+**`model_sizes[*].thinking`.** Each size is now
+`{mode, provider, model, thinking}` with `thinking` one of `auto` (default), `off`, `minimal`,
+`low`, `medium`, `high`, `xhigh`, `max`. `ai_roles_set` accepts `thinking` inside a
+`model_sizes` entry and merges partial updates: a model change keeps the existing thinking, a
+thinking-only update keeps the model, and switching `mode` never clears it. `chat_assignment`
+keeps its three-key shape.
+
+**Effective thinking.** A role dispatched through its tier uses that tier's concrete
+thinking; `auto` passes nothing, so an explicit dispatcher effort (for example `delegate`
+`effort`) still applies and, if absent too, no effort is sent. A concrete tier effort applies
+to every role dispatched through that tier unless an enabled override for the role sets its
+own `thinking`; a size-reference override without its own `thinking` inherits the referenced
+size's. A fixed or auto override without `thinking` stays `auto`. Root `chat`, `private`
+and `redaction` never take a tier's thinking.
+
+## Service lane for session-free agent-lane calls (append-only, 2026-11-05)
+
+hostd serves a third services-worker lane, `CHUDWARE_HOSTD_WORKER_LANE=service`, for the
+session-free calls the GUI polls and the user triggers while an agent turn is running. A turn
+holds its worker's stdio for its whole length and every other call on that worker is refused
+at once with `worker_lane_busy`, so these calls used to be unavailable for as long as ANY turn
+ran on the primary worker (hours), leaving provider lists, model pickers, assignments and
+usage rings empty.
+
+**Routing (desktop daemon, `WorkerBridge::isServiceMethod`).** These go to the service worker
+and never to a turn worker; the agent and general lanes are untouched by them:
+- exact: `omp_provider_list`, `omp_auth_state`, `omp_models_list`, `omp_logout_accounts`,
+  `omp_logout`, `omp_login`, `omp_set_key`, `omp_remove_key`, `ai_roles_get`, `ai_roles_set`;
+- prefixes: `subscription_*` (the whole family: its live login progress is in-process state, so it
+  is never split across workers) and `skills_*`.
+
+Everything session-scoped (`omp_session_stats`, `omp_export_session`, `omp_close_session`,
+`omp_apply_compaction_policy`, `session_*`, `agent_*`, `memory_*`) and every other agent-lane
+family (`bench_*`, `triggers_*`, `packs_*`, `dag_*`, `ai_prompt_*`, `ai_tool_*`)
+keep their previous routing and still follow their conversation's worker.
+A method joins the service list only if it neither reads nor writes an in-memory agent session.
+Cell (web) actors keep their per-actor primary/general lanes; they gain no service lane.
+
+**Lifecycle.** The service worker is started lazily by the first service call, runs no turns,
+starts no control endpoint, reconciles no bench and does not compose the system prompt; it only
+hosts the shared no-session OMP auth/catalog process (`worker_main` lane `service`). Turn
+workers (`agent`, `agent-turn`) no longer warm that process. It is part of the activity census
+(so hostd does not idle-exit under a pending login) and stops with the daemon like every lane.
+
+**State across workers.** Credentials stay in the on-disk OMP auth store (the service client
+was already a different process from every session's runtime); `ai_roles_*` and `skills_*` read
+and write `config.json` and the skills trees, with `prompt_cache.fingerprint()` as the
+cross-process invalidation backstop (at most its 2 s revalidation window).
+
+**Interactive sign-in.** `omp_login` carries the whole browser OAuth flow in one streamed call.
+While it is in flight it holds the service worker's stdio: any other call to that worker is
+refused at once with `worker_lane_busy` and message `worker lane busy (sign-in in progress)`
+(as for a turn, instead of queueing for its whole timeout). Its idle bound is 330 s (the GUI's
+own bound is 300 s) rather than the ordinary 120 s. `worker_lane_busy` therefore stays a valid,
+transient answer for service methods; clients keep their last data and retry.
+
+## No ambient document context (append-only, 2026-11-05, superseding)
+
+Supersedes the ACTIVE DOCUMENT / `scope` behavior described in earlier `context_refs`
+and editor-context text. The model is never told, unasked, which documents the user has
+open in the GUI.
+
+- The GUI sends the active `doc_id` with `agent_admin_turn` so hostd can attribute the
+  run to that document. It does not send `options.scope` as ambient model context.
+- The worker renders only the user's picked `context_refs` chips, via
+  `worker_rpc._picked_context_text`, as a PICKED CONTEXT block at the tail of the user
+  message. There is no ACTIVE DOCUMENT block, no selected-feature / selected-geometry
+  rendering, and no `tool_context["doc_id"]` for the root turn.
+- After a confirmed daemon restart the one-time RESUMED CONVERSATION note is a constant
+  warning that previously quoted `doc_id`s may be invalid or name a different part
+  (reopen with `import_part(path=..., resume=True)` or call `list_parts()`). It makes no
+  `doc_list` call and lists no open documents.
+- A chip without `doc_id` is document-less: it is described as "no document" and is
+  never resolved against an assumed active document.
+- A stray `options.scope` does not supply ambient model context.
+
+## Assembly free motion
+
+`eval_assembly_dof {doc_id, cursor?: integer, limit?: integer}` analyses a solved
+assembly without explicitly committing the analysis pose. Like other assembly reads,
+it first refreshes stale dependencies; that refresh can change derived poses and revision.
+The component page contains world-frame pure-translation directions and rotational axes
+with points and pitch (mm/rad), projected
+from the accepted-mate Jacobian null space at the solved pose. Component freedoms can be
+coupled and their counts must not be summed as assembly degrees of freedom. Component
+pages use `next_cursor` and `truncated`; group and group-member lists are capped and
+explicitly flagged. Unsuppressed components without solved geometry and nonconverged
+assemblies produce an error rather than a free-motion verdict. Pattern instances are not
+independent mate-solver components. These infinitesimal freedoms are not a collision or
+finite-travel proof.
+
+`asm_bom_components {doc_id, cursor?, limit?}` exposes the direct open-assembly BOM
+components as `{ok,components,truncated,next_cursor}`, with pages limited to 500 rows.
+Rows carry component id, name, source and quantity, including pattern-instance counts.
+An empty list is not a verified BOM or evidence that any holes have hardware.
+
+## Assembly clearance
+
+`eval_removal_clearance {doc_id, queries:[{component, directions:[[x,y,z],...],
+distance_mm?}], distance_mm?, ignore?:[component], min_overlap_mm3?:number,
+stop_at_first_hit?:bool}` translates each requested world-placed component independently.
+Distance must be positive; directions are normalized. The swept volume includes the
+starting solid and prisms of its boundary faces, so existing overlap is an obstruction.
+It checks volumetric overlap strictly greater than the threshold (default 0.000001 mm³),
+not contact or clearance distance. The default stop-at-first behavior may omit other
+blockers and is marked `stopped_at_first_hit`. Results are per direction, with
+`clear:true|false|null`, `blockers`, `failed`, and `status`. `null` and
+`status:"not_evaluated"` indicate incomplete evidence; known blockers remain available.
+
+`eval_envelope_clearance {doc_id, solids:[{id?, box:{min,max} |
+cylinder:{origin,axis,radius,length} | frustum:{origin,axis,r0,r1,length}}],
+ignore?:[component], min_overlap_mm3?:number}` tests transient world-coordinate
+envelopes without mutating the document. Results contain `hits`, `failed`, and `status`.
+Both methods report `ok`, `complete`, `assumptions`, and `source_failures`; `ok` indicates
+evaluation completeness, not absence of hits. Boolean or sweep failures are not clear
+verdicts. Limits are 256 members/ignored IDs, 32 removal queries with 16 directions each,
+and 64 envelopes.

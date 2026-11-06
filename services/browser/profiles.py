@@ -1,14 +1,11 @@
-"""services/browser/profiles.py — local, per-site browser session profile storage.
+"""services/browser/profiles.py — local per-site Playwright profiles and metadata.
 
-A "profile" is a Playwright persistent-context user-data directory keyed by a
-site id (e.g. ``"grabcad"``, ``"traceparts"``). LOCAL ONLY: profiles live under
-the app data dir (:data:`services.paths.BROWSER_PROFILES`, mirroring the
-``vendor_parts`` convention) and are never synced or uploaded anywhere by this
-codebase.
-
-Metadata sidecars record only non-secret bookkeeping (timestamps, status) —
-credentials, cookies, and local storage live exclusively inside Playwright's
-own profile directory, which this module never reads or logs.
+Playwright uses a separate persistent directory per site. CEF headless currently
+uses its shared global request context, not these directories; the GUI has its
+own cookie store. Metadata records the site's last verified login, not proof
+that every backend is signed in. Deleting this profile does not sign out of the
+shared CEF or GUI stores. A transient cookie sidecar contains the GUI-exported
+jar until Playwright imports it; neither it nor profile data is logged.
 """
 from __future__ import annotations
 
@@ -272,17 +269,30 @@ def check_profile_status(
         if state == "logged_in":
             return persist("active")
         if state == "login_page":
+            invalidate_cache(site_slug)
             return persist("expired", clear_verified=True)
         return persist("unknown")
     finally:
         lock.release()
 
 
-def delete_profile(site: str) -> bool:
-    """Remove a site's profile, metadata, and transient cookie sidecar.
+def invalidate_cache(site: str) -> None:
+    """Invalidate content after a login state change, without crossing cell boundaries."""
+    if request_context.in_cell():
+        return
+    from . import page_cache
+    page_cache.purge(site)
+    site_slug = slug(site)
+    if site_slug != site:
+        page_cache.purge(site_slug)
 
-    The caller owns :func:`profile_lock` while deleting when profile contention
-    is possible. Returns True when any of the three artifacts existed.
+
+def delete_profile(site: str) -> bool:
+    """Remove a site's Playwright profile, metadata, staged cookies and page cache.
+
+    This does not delete cookies from the shared CEF or GUI stores. The caller
+    holds :func:`profile_lock` if contention is possible. Returns True when a
+    profile or sidecar existed.
     """
     d = _profile_storage(site, create=False)
     # Check the owner stamp before removing any profile state.
@@ -298,6 +308,7 @@ def delete_profile(site: str) -> bool:
         if sidecar.exists():
             sidecar.unlink()
             removed = True
+    invalidate_cache(site)
     return removed
 
 

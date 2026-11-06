@@ -82,16 +82,6 @@ ImU32 copperColor(int copperIndex, float a) {
     }
 }
 
-// Effective copper color for a specific layer: a per-layer override (picked in the PCB Manager's
-// layer swatch) wins over the copperIndex-derived default, so a recolored layer repaints on the board.
-ImU32 copperColorFor(const EcadMirror& doc, const std::string& layerId, int copperIndex, float a) {
-    float ov[3];
-    if (!layerId.empty() && doc.layerColor(layerId, ov)) {
-        float c[4] = {ov[0], ov[1], ov[2], a};
-        return ui::Palette::toU32(c);
-    }
-    return copperColor(copperIndex, a);
-}
 
 bool equalNoCase(char a, char b) {
     return std::tolower(static_cast<unsigned char>(a)) ==
@@ -205,28 +195,10 @@ void EcadCanvas::requestFit() { wantFit_ = true; }
 
 float EcadCanvas::zoom() const { return pxPerMm_; }
 
-void EcadCanvas::setSelection(const std::vector<std::string>& tokens) { selected_ = tokens; }
+void EcadCanvas::setSelection(const std::vector<std::string>& tokens) {
+    if (selected_ != tokens) selected_ = tokens;
+}
 void EcadCanvas::setHighlightedNet(const std::string& net) { highlightedNet_ = net; }
-void EcadCanvas::setMarquee(bool active, const EcadPt& a, const EcadPt& b) {
-    marqueeActive_ = active;
-    marqueeA_ = a;
-    marqueeB_ = b;
-}
-void EcadCanvas::setRoutePreview(const std::vector<EcadPt>& pts, bool bus) {
-    routePreview_ = pts;
-    routePreviewBus_ = bus;
-}
-void EcadCanvas::setSnapTarget(bool active, const EcadPt& w, const std::string& label) {
-    snapTargetActive_ = active;
-    snapTarget_ = w;
-    snapTargetLabel_ = label;
-}
-void EcadCanvas::setDragOffset(float dx, float dy) {
-    dragDx_ = dx;
-    dragDy_ = dy;
-}
-void EcadCanvas::setShowErcMarkers(bool on) { showErcMarkers_ = on; }
-void EcadCanvas::setShowDrcMarkers(bool on) { showDrcMarkers_ = on; }
 void EcadCanvas::setShowSheetFrame(bool on) {
     if (showSheetFrame_ != on) wantFit_ = true;
     showSheetFrame_ = on;
@@ -668,13 +640,11 @@ void EcadCanvas::drawSch(const EcadMirror& doc) {
         }
     }
 
-    auto drawSymbolBody = [&](const EcadSymbol& symbol, const EcadPt& offset, ImU32 color,
-                              float extraStroke) {
-        const EcadPt placed{symbol.pos.x + offset.x, symbol.pos.y + offset.y};
+    auto drawSymbolBody = [&](const EcadSymbol& symbol, ImU32 color, float extraStroke) {
         const float th = bodyStroke + extraStroke;
         for (const auto& g : symbol.body) {
             auto world = [&](const EcadPt& local) {
-                return EcadMirror::localToWorld(local, placed, symbol.angle, symbol.mirror);
+                return EcadMirror::localToWorld(local, symbol.pos, symbol.angle, symbol.mirror);
             };
             switch (g.kind) {
                 case EcadSymGraphic::Rect:
@@ -728,8 +698,7 @@ void EcadCanvas::drawSch(const EcadMirror& doc) {
 
     for (const auto& symbol : doc.symbols()) {
         if (!doc.onActiveSheet(symbol.sheet)) continue;
-        const bool moving = selected("sym", symbol.id);
-        const EcadPt offset = moving ? EcadPt{dragDx_, dragDy_} : EcadPt{0.0f, 0.0f};
+        const bool isSelected = selected("sym", symbol.id);
         bool symbolMatched = false;
         for (const auto& pin : symbol.pins)
             symbolMatched = symbolMatched || (netVisible(pin.net) && netMatched(pin.net));
@@ -737,13 +706,11 @@ void EcadCanvas::drawSch(const EcadMirror& doc) {
         if (symbol.dnp) bodyColor = col(p.textDim, 0.62f);
         else if (!highlightedNet_.empty() && !symbolMatched) bodyColor = col(p.sketchInk, 0.22f);
         else if (symbolMatched) bodyColor = selectionInner;
-        drawSymbolBody(symbol, offset, bodyColor, 0.0f);
+        drawSymbolBody(symbol, bodyColor, 0.0f);
 
         for (const auto& pin : symbol.pins) {
             if (!netVisible(pin.net)) continue;
-            const EcadPt root{pin.root.x + offset.x, pin.root.y + offset.y};
-            const EcadPt tip{pin.tip.x + offset.x, pin.tip.y + offset.y};
-            const ImVec2 r = toScreen(root), t = toScreen(tip);
+            const ImVec2 r = toScreen(pin.root), t = toScreen(pin.tip);
             float dx = t.x - r.x, dy = t.y - r.y;
             const float len = std::max(std::hypot(dx, dy), 1.0f);
             dx /= len;
@@ -796,7 +763,7 @@ void EcadCanvas::drawSch(const EcadMirror& doc) {
             }
         }
 
-        const ImVec2 origin = toScreen({symbol.pos.x + offset.x, symbol.pos.y + offset.y});
+        const ImVec2 origin = toScreen(symbol.pos);
         const std::string* displayRef = &symbol.ref;
         std::string unitRef;
         if (symbol.unitCount > 1) {
@@ -835,9 +802,9 @@ void EcadCanvas::drawSch(const EcadMirror& doc) {
             dl_->AddText(ImVec2(badge.x - bang.x * 0.5f, badge.y - bang.y * 0.5f),
                          col(p.windowBg), "!");
         }
-        if (moving) {
-            drawSymbolBody(symbol, offset, selectionOuter, ui::metrics::px(4.0f));
-            drawSymbolBody(symbol, offset, selectionInner, ui::metrics::px(1.0f));
+        if (isSelected) {
+            drawSymbolBody(symbol, selectionOuter, ui::metrics::px(4.0f));
+            drawSymbolBody(symbol, selectionInner, ui::metrics::px(1.0f));
         }
     }
 
@@ -985,22 +952,17 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
         }
     };
 
-    auto footprintOffset = [&](const EcadFootprint& fp) {
-        if (selected("fp", fp.id)) return EcadPt{dragDx_, dragDy_};
-        return EcadPt{0.0f, 0.0f};
-    };
     pcbOverlayKeepouts_.clear();
     for (const auto& fp : doc.footprints()) {
         if (!fp.hasCourtyard) continue;
-        const EcadPt offset = footprintOffset(fp);
         pcbOverlayKeepouts_.push_back({
-            toScreen({fp.courtyardMin.x + offset.x, fp.courtyardMax.y + offset.y}),
-            toScreen({fp.courtyardMax.x + offset.x, fp.courtyardMin.y + offset.y})});
+            toScreen({fp.courtyardMin.x, fp.courtyardMax.y}),
+            toScreen({fp.courtyardMax.x, fp.courtyardMin.y})});
     }
 
-    auto drawCourtyard = [this](const EcadFootprint& fp, const EcadPt& offset, ImU32 color) {
-        const EcadPt mn{fp.courtyardMin.x + offset.x, fp.courtyardMin.y + offset.y};
-        const EcadPt mx{fp.courtyardMax.x + offset.x, fp.courtyardMax.y + offset.y};
+    auto drawCourtyard = [this](const EcadFootprint& fp, ImU32 color) {
+        const EcadPt mn = fp.courtyardMin;
+        const EcadPt mx = fp.courtyardMax;
         const float dash = ui::metrics::U(1.0f);
         const float gap = ui::metrics::U(0.75f);
         const float th = ui::metrics::stroke(1.0f);
@@ -1074,7 +1036,7 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
                      ui::metrics::stroke(1.8f));
 
     for (const auto& zone : doc.zones()) {
-        if (!doc.layerVisible(zone.layer)) continue;
+        if (!doc.layerVisible(zone.layer) || !doc.netVisible(zone.net)) continue;
         int copperIndex = 0;
         for (const auto& layer : doc.layers())
             if (layer.id == zone.layer) {
@@ -1094,10 +1056,10 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
         dl_->AddConvexPolyFilled(
             poly.data(), static_cast<int>(poly.size()),
             matched ? col(p.selectionHighlight, 0.45f)
-                    : copperColorFor(doc, zone.layer, copperIndex, fillAlpha));
+                    : copperColor(copperIndex, fillAlpha));
         const ImU32 edge =
             matched ? col(p.selectionHighlight, 1.2f)
-                    : copperColorFor(doc, zone.layer, copperIndex, edgeAlpha);
+                    : copperColor(copperIndex, edgeAlpha);
         for (size_t i = 0; i < poly.size(); ++i)
             dl_->AddLine(poly[i], poly[(i + 1) % poly.size()], edge,
                          ui::metrics::stroke(1.2f));
@@ -1123,7 +1085,7 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
             const float alpha =
                 highlightedNet_.empty() ? 0.92f : (matched ? 0.66f : 0.16f);
             drawTrack(*track,
-                      copperColorFor(doc, layer.id, layer.copperIndex, alpha),
+                      copperColor(layer.copperIndex, alpha),
                       trackStroke(*track, 0.0f));
             if (selected("track", track->id)) {
                 drawTrack(*track, col(p.selectionHighlight, 0.58f),
@@ -1135,26 +1097,29 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
     }
 
     for (const auto& fp : doc.footprints()) {
-        const EcadPt offset = footprintOffset(fp);
-        if (fp.hasCourtyard) drawCourtyard(fp, offset, courtCol);
+        if (fp.hasCourtyard) drawCourtyard(fp, courtCol);
 
         for (const auto& pad : fp.pads) {
+            if (!doc.netVisible(pad.net)) continue;
             int copperIndex = 0;
-            std::string layerId;
-            bool foundLayer = false;
+            bool hasCopper = false, visibleCopper = false;
             for (const auto& candidate : pad.layers) {
+                if (candidate.size() < 3 ||
+                    candidate.compare(candidate.size() - 3, 3, ".Cu") != 0) continue;
+                hasCopper = true;
                 for (const auto& layer : doc.layers()) {
-                    if (layer.id == candidate && doc.layerVisible(candidate)) {
+                    if (layer.id == candidate && doc.layerVisible(layer.id)) {
                         copperIndex = layer.copperIndex;
-                        layerId = candidate;
-                        foundLayer = true;
+                        visibleCopper = true;
                         break;
                     }
                 }
-                if (foundLayer) break;
+                if (visibleCopper) break;
             }
-            if (!foundLayer && !pad.layers.empty() &&
-                !doc.layerVisible(pad.layers.front()))
+            if (hasCopper && !visibleCopper) continue;
+            if (!hasCopper && !pad.layers.empty() &&
+                std::none_of(pad.layers.begin(), pad.layers.end(),
+                             [&](const std::string& layer) { return doc.layerVisible(layer); }))
                 continue;
 
             const bool matched =
@@ -1163,13 +1128,13 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
                 highlightedNet_.empty() ? 0.95f : (matched ? 1.0f : 0.16f);
             const ImU32 fill =
                 matched ? col(p.selectionHighlight, 1.8f)
-                        : copperColorFor(doc, layerId, copperIndex, alpha);
+                        : copperColor(copperIndex, alpha);
             const bool throughHole =
                 pad.hasDrill || pad.type == "tht" || pad.type == "np_tht" ||
                 pad.type == "connector";
             const ImU32 edge =
                 col(p.text, highlightedNet_.empty() ? 0.58f : (matched ? 0.86f : 0.12f));
-            const EcadPt center{pad.pos.x + offset.x, pad.pos.y + offset.y};
+            const EcadPt center = pad.pos;
             drawPadShape(pad, center, fill, edge,
                          throughHole ? ui::metrics::stroke(1.0f) : 0.0f);
             if (selected("pad", fp.id, pad.number) || selected("pad", fp.id))
@@ -1191,6 +1156,24 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
     }
 
     for (const auto& via : doc.vias()) {
+        if (!doc.netVisible(via.net)) continue;
+        const auto& copper = doc.layers();
+        int start = -1, end = -1;
+        if (!via.layers.empty()) {
+            for (size_t i = 0; i < copper.size(); ++i) {
+                if (copper[i].id == via.layers.front()) start = static_cast<int>(i);
+                if (copper[i].id == via.layers.back()) end = static_cast<int>(i);
+            }
+        }
+        if (start < 0 || end < 0) {
+            start = 0;
+            end = static_cast<int>(copper.size()) - 1;
+        }
+        if (start > end) std::swap(start, end);
+        bool visibleLayer = copper.empty();
+        for (int i = start; i <= end && !visibleLayer; ++i)
+            visibleLayer = doc.layerVisible(copper[static_cast<size_t>(i)].id);
+        if (!visibleLayer) continue;
         const bool matched =
             !highlightedNet_.empty() && via.net == highlightedNet_;
         const ImU32 ring =
@@ -1238,12 +1221,11 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
     const ImU32 selectionInner = col(p.selectionHighlight);
     for (const auto& fp : doc.footprints()) {
         if (!selected("fp", fp.id)) continue;
-        const EcadPt offset{dragDx_, dragDy_};
         EcadPt mn, mx;
         bool haveBounds = false;
         if (fp.hasCourtyard) {
-            mn = {fp.courtyardMin.x + offset.x, fp.courtyardMin.y + offset.y};
-            mx = {fp.courtyardMax.x + offset.x, fp.courtyardMax.y + offset.y};
+            mn = fp.courtyardMin;
+            mx = fp.courtyardMax;
             haveBounds = true;
         } else {
             for (const auto& pad : fp.pads) {
@@ -1253,7 +1235,7 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
                                  std::fabs(std::sin(angle)) * halfH;
                 const float ey = std::fabs(std::sin(angle)) * halfW +
                                  std::fabs(std::cos(angle)) * halfH;
-                const EcadPt center{pad.pos.x + offset.x, pad.pos.y + offset.y};
+                const EcadPt center = pad.pos;
                 if (!haveBounds) {
                     mn = {center.x - ex, center.y - ey};
                     mx = {center.x + ex, center.y + ey};
@@ -1283,11 +1265,10 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
     const float labelPad = ui::metrics::px(2.0f);
     for (const auto& fp : doc.footprints()) {
         if (fp.ref.empty()) continue;
-        const EcadPt offset = footprintOffset(fp);
-        const ImVec2 origin = toScreen({fp.pos.x + offset.x, fp.pos.y + offset.y});
+        const ImVec2 origin = toScreen(fp.pos);
         const ImVec2 size = ImGui::CalcTextSize(fp.ref.c_str());
         const float top = fp.hasCourtyard
-            ? toScreen({fp.pos.x + offset.x, fp.courtyardMax.y + offset.y}).y
+            ? toScreen({fp.pos.x, fp.courtyardMax.y}).y
             : origin.y;
         ImVec2 pos(origin.x - size.x * 0.5f, top - labelGap - size.y);
         for (size_t attempt = 0; attempt <= pcbOverlayKeepouts_.size(); ++attempt) {
@@ -1311,10 +1292,10 @@ void EcadCanvas::drawPcb(const EcadMirror& doc) {
     }
 }
 
-void EcadCanvas::drawOverlays(const EcadMirror& doc) {
+void EcadCanvas::drawOverlays(const EcadMirror& doc, const std::vector<EcadViolation>& checks) {
     const ui::Palette& p = ui::palette;
-    if (showErcMarkers_ && doc.isSch()) {
-        for (const auto& violation : doc.erc()) {
+    if (doc.isSch()) {
+        for (const auto& violation : checks) {
             if (!violation.hasLoc) continue;
             const bool isError = violation.severity == "error";
             const ImU32 c = isError ? col(p.statusErr, 0.95f)
@@ -1324,7 +1305,7 @@ void EcadCanvas::drawOverlays(const EcadMirror& doc) {
         }
     }
 
-    if (showDrcMarkers_ && doc.isPcb()) {
+    if (doc.isPcb()) {
         // Locate every offender precisely, but place its badge outside the footprint
         // and refdes envelopes. A hairline and tiny anchor dot retain the true location.
         // Errors paint first; nearby anchors deduplicate rather than stacking badges.
@@ -1337,7 +1318,7 @@ void EcadCanvas::drawOverlays(const EcadMirror& doc) {
         const float cullMaxY = imgMin_.y + imgSize_.y + r;
         for (int pass = 0; pass < 2; ++pass) {
             const bool wantError = pass == 0;
-            for (const auto& violation : doc.drc()) {
+            for (const auto& violation : checks) {
                 if (!violation.hasLoc) continue;
                 const bool isError = violation.severity == "error";
                 if (isError != wantError) continue;
@@ -1401,56 +1382,6 @@ void EcadCanvas::drawOverlays(const EcadMirror& doc) {
         }
     }
 
-    if (marqueeActive_) {
-        const ImVec2 a = toScreen(marqueeA_), b = toScreen(marqueeB_);
-        const ImVec2 mn(std::min(a.x, b.x), std::min(a.y, b.y));
-        const ImVec2 mx(std::max(a.x, b.x), std::max(a.y, b.y));
-        const ImU32 c = col(p.selectionHighlight, 0.95f);
-        const float th = ui::metrics::stroke(1.5f);
-        const float dash = ui::metrics::U(1.2f);
-        const float gap = ui::metrics::U(0.8f);
-        drawDashedLine(dl_, mn, ImVec2(mx.x, mn.y), c, th, dash, gap);
-        drawDashedLine(dl_, ImVec2(mx.x, mn.y), mx, c, th, dash, gap);
-        drawDashedLine(dl_, mx, ImVec2(mn.x, mx.y), c, th, dash, gap);
-        drawDashedLine(dl_, ImVec2(mn.x, mx.y), mn, c, th, dash, gap);
-    }
-
-    if (routePreview_.size() >= 2) {
-        const ImU32 c = col(routePreviewBus_ ? p.sketchUnder : p.selectionHighlight, 0.95f);
-        const float th = routePreviewBus_ ? ui::metrics::stroke(3.2f)
-                                          : ui::metrics::stroke(1.8f);
-        const float dash = ui::metrics::U(1.4f);
-        const float gap = ui::metrics::U(0.8f);
-        for (size_t i = 1; i < routePreview_.size(); ++i) {
-            const EcadPt a = routePreview_[i - 1];
-            const EcadPt b = routePreview_[i];
-            if (std::fabs(a.x - b.x) < 1e-5f || std::fabs(a.y - b.y) < 1e-5f) {
-                drawDashedLine(dl_, toScreen(a), toScreen(b), c, th, dash, gap);
-            } else {
-                const EcadPt elbow{b.x, a.y};
-                drawDashedLine(dl_, toScreen(a), toScreen(elbow), c, th, dash, gap);
-                drawDashedLine(dl_, toScreen(elbow), toScreen(b), c, th, dash, gap);
-            }
-        }
-    }
-
-    if (snapTargetActive_) {
-        const ImVec2 q = toScreen(snapTarget_);
-        const ImU32 c = col(p.selectionHighlight);
-        dl_->AddCircle(q, ui::metrics::px(6.0f), c, 24, ui::metrics::stroke(2.0f));
-        dl_->AddCircleFilled(q, ui::metrics::px(1.8f), c, 10);
-        if (!snapTargetLabel_.empty()) {
-            const ImVec2 size = ImGui::CalcTextSize(snapTargetLabel_.c_str());
-            const ImVec2 pos(q.x + ui::metrics::U(1.5f), q.y - size.y - ui::metrics::U(1.0f));
-            const float xPad = ui::metrics::px(2.0f);
-            const float yPad = ui::metrics::px(1.0f);
-            dl_->AddRectFilled(ImVec2(pos.x - xPad, pos.y - yPad),
-                               ImVec2(pos.x + size.x + xPad, pos.y + size.y + yPad),
-                               col(p.windowBg, 0.88f), ui::metrics::px(2.0f));
-            dl_->AddText(pos, c, snapTargetLabel_.c_str());
-        }
-    }
-
     if (focusFrames_ > 0) {
         const ImVec2 q = toScreen(focusLoc_);
         const float phase = static_cast<float>(180 - focusFrames_);
@@ -1470,7 +1401,8 @@ void EcadCanvas::drawOverlays(const EcadMirror& doc) {
 
 // ---- main draw -----------------------------------------------------------------------------
 
-EcadCanvasIO EcadCanvas::draw(const EcadMirror& doc, const ImVec2& avail) {
+EcadCanvasIO EcadCanvas::draw(const EcadMirror& doc, const std::vector<EcadViolation>& checks,
+                              const ImVec2& avail) {
     EcadCanvasIO io;
     dl_ = ImGui::GetWindowDrawList();
     imgMin_ = ImGui::GetCursorScreenPos();
@@ -1506,35 +1438,10 @@ EcadCanvasIO EcadCanvas::draw(const EcadMirror& doc, const ImVec2& avail) {
     io.hovered = ImGui::IsItemHovered();
     io.ctrl = gio.KeyCtrl;
     io.shift = gio.KeyShift;
-    io.alt = gio.KeyAlt;
     if (io.hovered) {
         io.worldMouse = toWorld(gio.MousePos);
         io.hasWorldMouse = true;
-        io.leftDoubleClicked = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
-        io.rightClicked = ImGui::IsMouseClicked(ImGuiMouseButton_Right);
-        io.middleClicked = ImGui::IsMouseClicked(ImGuiMouseButton_Middle);
-    }
-
-    if (io.hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-        leftGestureActive_ = true;
-        leftGestureDragged_ = false;
-        leftDragStartWorld_ = toWorld(gio.MousePos);
-    }
-    if (leftGestureActive_) {
-        io.dragStartWorld = leftDragStartWorld_;
-        if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-            if (!leftGestureDragged_) {
-                leftGestureDragged_ = true;
-                io.leftDragStarted = true;
-            }
-            io.leftDragging = true;
-        }
-        if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
-            if (leftGestureDragged_) io.leftDragEnded = true;
-            else if (io.hovered) io.leftClicked = true;
-            leftGestureActive_ = false;
-            leftGestureDragged_ = false;
-        }
+        io.leftClicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
     }
 
     handleNavigation(io, avail);
@@ -1550,7 +1457,7 @@ EcadCanvasIO EcadCanvas::draw(const EcadMirror& doc, const ImVec2& avail) {
     drawGrid(doc, avail);
     if (doc.isSch()) drawSch(doc);
     else if (doc.isPcb()) drawPcb(doc);
-    drawOverlays(doc);
+    drawOverlays(doc, checks);
 
     dl_->PopClipRect();
     dl_ = nullptr;

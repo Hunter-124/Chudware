@@ -69,8 +69,10 @@ json handle(const std::string& line, bool& stop) {
         const std::string dest = p.value("dest", "");
         if (url.empty() || dest.empty()) return err("missing url/dest");
         const std::string profile = p.value("profile", warm_profile_dir());
-        const bool ok = headless_download(url, dest, profile);
-        return json{{"id", id}, {"result", {{"ok", ok}, {"dest", dest}}}};
+        const DownloadResult r = headless_download(url, dest, profile);
+        return json{{"id", id}, {"result", {{"ok", r.ok}, {"dest", dest},
+                    {"status", r.status}, {"retry_after", r.retry_after},
+                    {"final_url", r.final_url}}}};
     }
     // Inject a cookie jar exported from the interactive panel into the warm profile,
     // so a login there carries into headless fetch/download here (the panel→daemon
@@ -111,8 +113,8 @@ json handle(const std::string& line, bool& stop) {
         const int timeout = p.value("timeout_ms", 12000);
         const std::string profile = p.value("profile", warm_profile_dir());
         FetchResult r = headless_interact(url, js, sentinel, settle, timeout, profile);
-        json result = {{"ok", r.ok}, {"status", r.status}, {"final_url", r.final_url},
-                       {"html_len", r.html.size()}};
+        json result = {{"ok", r.ok}, {"status", r.status}, {"retry_after", r.retry_after},
+                       {"final_url", r.final_url}, {"html_len", r.html.size()}};
         if (r.ok) result["html"] = r.html;
         return json{{"id", id}, {"result", result}};
     }
@@ -129,8 +131,8 @@ json handle(const std::string& line, bool& stop) {
         const int postw = p.value("post_wait_ms", 12000);
         const std::string profile = p.value("profile", warm_profile_dir());
         FetchResult r = headless_login_probe(url, js, settle, postw, profile);
-        json result = {{"ok", r.ok}, {"status", r.status}, {"final_url", r.final_url},
-                       {"html_len", r.html.size()}};
+        json result = {{"ok", r.ok}, {"status", r.status}, {"retry_after", r.retry_after},
+                       {"final_url", r.final_url}, {"html_len", r.html.size()}};
         if (r.ok) result["html"] = r.html;
         return json{{"id", id}, {"result", result}};
     }
@@ -190,8 +192,9 @@ json fetch_response(int id, const FetchResult& r, const std::string& out) {
         std::ofstream f(out, std::ios::binary);
         f.write(r.html.data(), static_cast<std::streamsize>(r.html.size()));
     }
-    json result = {{"ok", r.ok}, {"status", r.status}, {"final_url", r.final_url},
-                   {"html_len", r.html.size()}};
+    json result = {{"ok", r.ok}, {"partial_load", r.partial_load},
+                   {"status", r.status}, {"retry_after", r.retry_after},
+                   {"final_url", r.final_url}, {"html_len", r.html.size()}};
     if (r.ok && out.empty()) result["html"] = r.html;  // inline when no sidecar file
     else result["out"] = out;
     return json{{"id", id}, {"result", result}};
@@ -251,7 +254,7 @@ int run_cef_daemon(const std::string& sock_path, int idle_secs) {
     // GUI and daemon must not share Chromium ProcessSingleton (same root_cache_path).
     // Mark this process before initialize() so cache_root() → cef_cache_daemon.
     cef_platform::set_daemon_process(true);
-    if (!initialize()) { std::fprintf(stderr, "[cef-daemon] CEF init failed\n"); return 1; }
+    if (!initialize(/*persistent_global=*/true)) { std::fprintf(stderr, "[cef-daemon] CEF init failed\n"); return 1; }
 
     chudware_ipc::IpcListener listener;
     std::string err;

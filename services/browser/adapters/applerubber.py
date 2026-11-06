@@ -59,6 +59,11 @@ def _strip_tags(text: str) -> str:
 
 class AppleRubberAdapter(RetailAdapter):
     key = SITE
+    hosts = ("www.applerubber.com",)
+    result_kinds = ("page",)
+    cad_acquisition = False
+    login_required = False
+    api = False
     base_url = BASE_URL
     search_url_tmpl = SEARCH_URL_TMPL
     license_note = LICENSE_NOTE

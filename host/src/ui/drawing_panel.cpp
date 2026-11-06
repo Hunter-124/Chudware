@@ -231,6 +231,12 @@ static std::string viewAtPoint(const nlohmann::json& sheet, double qx, double qy
     return hit;
 }
 
+static void recordDrawingEdit(AppState& st, const AppState::DocTab& tab,
+                              const nlohmann::json& response) {
+    const int cached = tab.drawingDoc.is_object() ? tab.drawingDoc.value("revision", 0) : 0;
+    st.markHumanEdit(tab.drawingDocId, response.value("revision", cached));
+}
+
 // Push a finished dimension to the engine (drawing_add_dim) and refresh the cached drawing_get.
 static void commitDimension(AppState& st, AppState::DocTab& tab, const std::string& viewId,
                             float ax, float ay, float bx, float by, float px, float py) {
@@ -250,7 +256,7 @@ static void commitDimension(AppState& st, AppState::DocTab& tab, const std::stri
             tab.drawingDoc = res["drawing"];      // engine returned the full re-projected drawing
         else
             st.refreshDrawingTab(st.activeTab);
-        st.markDrawingTabDirty(st.activeTab);     // unsaved until the source part is saved
+        recordDrawingEdit(st, tab, res);
         st.addLog("[draw] added " + tab.dimType + " on " + viewId);
     } else {
         std::string msg = res.is_object() && res.contains("message") ? djstr(res, "message") : err;
@@ -268,7 +274,7 @@ static void deleteAnnotation(AppState& st, AppState::DocTab& tab, const std::str
     if (st.worker.call("drawing_remove_annotation", params, res, err) && res.is_object() &&
         !res.contains("code")) {
         st.refreshDrawingTab(st.activeTab);
-        st.markDrawingTabDirty(st.activeTab);
+        recordDrawingEdit(st, tab, res);
         st.addLog("[draw] removed annotation " + annId);
     } else {
         st.addLog("[draw] drawing_remove_annotation failed: " + err);
@@ -297,7 +303,7 @@ static void commitSection(AppState& st, AppState::DocTab& tab, const std::string
     if (st.worker.call("drawing_add_section", params, res, err) && res.is_object() &&
         !res.contains("code")) {
         st.refreshDrawingTab(st.activeTab);
-        st.markDrawingTabDirty(st.activeTab);
+        recordDrawingEdit(st, tab, res);
         st.addLog("[draw] added " + mode + " section on " + parentViewId);
         tab.drawNeedFit = true;   // frame the new section view
     } else {
@@ -321,7 +327,7 @@ static void commitDetail(AppState& st, AppState::DocTab& tab, const std::string&
     if (st.worker.call("drawing_add_detail", params, res, err) && res.is_object() &&
         !res.contains("code")) {
         st.refreshDrawingTab(st.activeTab);
-        st.markDrawingTabDirty(st.activeTab);
+        recordDrawingEdit(st, tab, res);
         st.addLog("[draw] added detail on " + parentViewId);
         tab.drawNeedFit = true;
     } else {
@@ -358,7 +364,7 @@ static void absorbDrawingResult(AppState& st, AppState::DocTab& tab,
         tab.drawingDoc = res;
     else
         st.refreshDrawingTab(target);
-    st.markDrawingTabDirty(target);
+    recordDrawingEdit(st, tab, res);
 }
 
 // Call a drawing RPC; on failure log + toast and return false. `label` is the user-facing verb.
@@ -390,13 +396,18 @@ static void drawCallAsyncOn(AppState& st, int tabIdx, const char* method, nlohma
     const std::string drawingId = st.docTabs[tabIdx].drawingDocId;
     st.toast(ui::ToastLevel::Info, labelS + "\xE2\x80\xA6");
     ++st.rebuildsInFlight;
+    st.beginHumanMutation(drawingId);
     st.rpc.call(methodS, std::move(params),
-                [&st, methodS, labelS, tabIdx, drawingId, needFit,
+                [&st, methodS, labelS, drawingId, needFit,
                  then = std::move(then)](const core::RpcResult& r) {
                     --st.rebuildsInFlight;
-                    if (tabIdx < 0 || tabIdx >= (int)st.docTabs.size() ||
-                        st.docTabs[tabIdx].drawingDocId != drawingId) {
-                        st.addLog("[draw] " + methodS + " ignored — drawing tab changed");
+                    st.endHumanMutation(drawingId);
+                    int tabIdx = -1;
+                    for (int i = 0; i < (int)st.docTabs.size(); ++i)
+                        if (st.docTabs[i].kind == AppState::DocTab::TabKind::Drawing &&
+                            st.docTabs[i].drawingDocId == drawingId) { tabIdx = i; break; }
+                    if (tabIdx < 0) {
+                        st.addLog("[draw] " + methodS + " ignored — drawing tab closed");
                         return;
                     }
                     auto& tab = st.docTabs[tabIdx];
@@ -488,7 +499,7 @@ static void removeView(AppState& st, AppState::DocTab& tab, const std::string& v
     nlohmann::json params = {{"doc_id", tab.drawingDocId}, {"view_id", viewId}};
     if (drawCall(st, "drawing_remove_view", params, res, "Delete view")) {
         st.refreshDrawingTab(st.activeTab);
-        st.markDrawingTabDirty(st.activeTab);
+        recordDrawingEdit(st, tab, res);
         tab.selViewId.clear();
         st.addLog("[draw] removed view " + viewId);
     }

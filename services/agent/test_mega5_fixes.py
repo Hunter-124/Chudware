@@ -1,209 +1,24 @@
 """Mega-5 live harness-fix regressions (Fixer5).
 
 Watch-list from mega-4 deferred + mega-5 spawn_probe:
-1. All delegate-capable role prompts name budget_tokens (not just schema).
-2. Live delegate spawn emits model_assignment with min_rank / cost_tier.
-3. xAI semaphore occupancy telemetry + default concurrency 3 + read-timeout retry.
-4. Retryable provider failures map to DAG retry instead of instant escalate.
+1. Live delegate spawn emits model_assignment with cost_tier (and no invented rank).
+2. xAI semaphore occupancy telemetry + default concurrency 3 + read-timeout retry.
+3. Retryable provider failures map to DAG retry instead of instant escalate.
 """
 
 from __future__ import annotations
 
 import threading
 import time
-from pathlib import Path
-
-import pytest
 
 
 # ---------------------------------------------------------------------------
-# 1. Delegation prompt contract on every role that exposes delegate
+# 1. Model assignment events on live delegate spawn
 # ---------------------------------------------------------------------------
-
-
-def test_all_delegate_roles_use_budget_tokens_contract():
-    """mega-5 spawn_probe: layout/feature/assembly/dept prompts lacked budget_tokens."""
-    from services.agent.roles import load_role
-
-    for role_id in (
-        "orchestrator",
-        "spec_writer",
-        "layout_engineer",
-        "feature_modeler",
-        "assembly_fit_engineer",
-        "department_manager",
-    ):
-        card = load_role(role_id)
-        assert "delegate" in card.concrete_tools, role_id
-        assert "budget_tokens" in card.system_prompt, role_id
-        assert "delegate(role, brief, budget_tokens)" in card.system_prompt, role_id
-        assert "delegate(role, brief, budget)" not in card.system_prompt, role_id
-
-
-# ---------------------------------------------------------------------------
-# 2. Auto model assignment events on live delegate spawn
-# ---------------------------------------------------------------------------
-
-
-def test_delegate_emits_model_assignment_event(tmp_path, monkeypatch):
-    """Every executed spawn must emit {depth, task_class, min_rank, picked_model, cost_tier}."""
-    from services.agent.ledger import Ledger
-    from services.agent.mission_dispatch import MissionDispatch
-    from services.agent.role_models import RoleModelAssignment
-
-    monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
-    ledger = Ledger("mega5_assign", path=tmp_path / "ledger.json")
-
-    class _Tree:
-        root_id = "root"
-        _nodes = {
-            "root": type("N", (), {"depth": 0, "role": "orchestrator"})(),
-        }
-
-        def start(self, node_id):
-            return None
-
-        def complete(self, node_id, tokens_used=0):
-            return None
-
-        def fail(self, node_id, reason=""):
-            return None
-
-    events = []
-
-    def on_event(*args, **kwargs):
-        if len(args) == 2:
-            events.append((args[0], args[1]))
-        elif args and isinstance(args[0], dict):
-            events.append((args[0].get("kind"), args[0]))
-
-    md = MissionDispatch(
-        run_id="mega5_assign",
-        ledger=ledger,
-        delegation_tree=_Tree(),
-        on_event=on_event,
-        task_class="assembly",
-    )
-
-    assignment = RoleModelAssignment(
-        role="task",
-        provider="llamacpp",
-        model="local-c",
-        mode="auto",
-        rank=2,
-        source="test",
-        reason="min_rank=2 task_class=assembly depth=1",
-    )
-
-    import services.agent.delegation as dlg
-    import services.agent.role_models as rm
-    import services.agent.chudcode_roles as cr
-
-    real_delegate = dlg.delegate
-    real_resolve = rm.resolve_for_node
-    real_resolve_role = rm.resolve_role_model
-    real_run = cr.run_role_turn
-
-    def _spy_delegate(role, brief, budget_tokens, **kw):
-        return {
-            "id": "dg_test1",
-            "status": "approved",
-            "role": role,
-            "depth": 1,
-            "kind": "worker",
-            "parent": "root",
-            "budget": {"tokens_granted": int(budget_tokens)},
-        }
-
-    def _spy_resolve(role, ctx, cfg=None):
-        return assignment
-
-    def _spy_resolve_role(role, cfg, **kw):
-        # Prove min_rank from spawn policy is threaded.
-        assert kw.get("min_rank") is not None
-        return RoleModelAssignment(
-            role=role,
-            provider="llamacpp",
-            model="local-c",
-            mode="auto",
-            rank=kw.get("min_rank"),
-            source="test",
-            reason=f"min_rank={kw.get('min_rank')}",
-        )
-
-    def _spy_run(*_args, **_kwargs):
-        return {
-            "success": True,
-            "stop_reason": "completed",
-            "result": {"handoff": {"status": "done", "summary": "ok"}},
-            "session_id": "cad-role-mega5-assign",
-            "tokens_used": 100,
-            "provider_usage_recorded": True,
-            "cancelled": False,
-        }
-
-    from services.agent import config as agent_config
-
-    real_load = agent_config.load_config
-
-    def _fake_load():
-        return {
-            "ai_roles": {"task": "auto", "planning": "auto", "default": "auto"},
-            "enabled_providers": [
-                {"provider": "llamacpp", "model": "local-c"},
-            ],
-        }
-
-    dlg.delegate = _spy_delegate
-    rm.resolve_for_node = _spy_resolve
-    rm.resolve_role_model = _spy_resolve_role
-    cr.run_role_turn = _spy_run
-    agent_config.load_config = _fake_load
-    try:
-        out = md.delegate(
-            role="feature_modeler",
-            brief="model the fin spar section",
-            budget_tokens=4000,
-        )
-    finally:
-        dlg.delegate = real_delegate
-        rm.resolve_for_node = real_resolve
-        rm.resolve_role_model = real_resolve_role
-        cr.run_role_turn = real_run
-        agent_config.load_config = real_load
-
-    assert out.get("ok") is True, out
-    assert out.get("role_model"), out
-    assert out["role_model"]["model"] == "local-c"
-
-    # Live event stream
-    assign_events = [p for k, p in events if k == "agent.model_assignment"]
-    assert assign_events, f"no agent.model_assignment in {events!r}"
-    row = assign_events[0]
-    assert row.get("depth") == 1
-    assert row.get("task_class") == "assembly"
-    assert row.get("min_rank") is not None
-    assert row.get("picked_model") == "local-c"
-    assert row.get("cost_tier") is not None
-    assert (
-        int(row["cost_tier"]) <= int(row.get("min_rank") or 5) or True
-    )  # cost independent
-
-    # Ledger note mirror
-    notes = [
-        e
-        for e in ledger.events
-        if (e.get("payload") or {}).get("event") == "model_assignment"
-    ]
-    assert notes, "ledger missing model_assignment note"
-    payload = notes[0]["payload"]
-    assert payload["picked_model"] == "local-c"
-    assert payload["depth"] == 1
-    assert payload["min_rank"] is not None
 
 
 def test_delegate_assigns_without_ai_roles_config(tmp_path, monkeypatch):
-    """mega-4/5: resolve_for_node returned None when ai_roles unset → no events."""
+    """mega-4/5: an unset ai_roles config still assigns a model and emits the event."""
     from services.agent.ledger import Ledger
     from services.agent.mission_dispatch import MissionDispatch
 
@@ -240,7 +55,7 @@ def test_delegate_assigns_without_ai_roles_config(tmp_path, monkeypatch):
     )
 
     import services.agent.delegation as dlg
-    import services.agent.chudcode_roles as cr
+    import services.agent.omp_roles as cr
     from services.agent import config as agent_config
 
     real_delegate = dlg.delegate
@@ -295,8 +110,7 @@ def test_delegate_assigns_without_ai_roles_config(tmp_path, monkeypatch):
     assert out.get("role_model"), out
     assign_events = [p for k, p in events if k == "agent.model_assignment"]
     assert assign_events, events
-    assert assign_events[0]["picked_model"]
-    assert assign_events[0]["min_rank"] is not None
+    assert "rank" not in assign_events[0] and "min_rank" not in assign_events[0]
     notes = [
         e
         for e in ledger.events
@@ -312,124 +126,23 @@ def test_model_assignment_event_builder_shape():
         "parent",
         depth=2,
         task_class="simple_part",
-        min_rank=1,
         picked_model="local-c",
         picked_provider="llamacpp",
         cost_tier=0,
-        mode="auto",
-        rank=2,
-        reason="min_rank=1",
+        mode="fixed",
+        reason="Using the configured sketcher model.",
         subagent_id="dg_x",
         role="sketcher",
     )
     assert kind == "agent.model_assignment"
     assert payload["depth"] == 2
     assert payload["task_class"] == "simple_part"
-    assert payload["min_rank"] == 1
     assert payload["picked_model"] == "local-c"
     assert payload["cost_tier"] == 0
     assert payload["subagent_id"] == "dg_x"
+    assert "rank" not in payload and "min_rank" not in payload
 
 
-# ---------------------------------------------------------------------------
-# 2b. SuperGrok quota: leaf/low-difficulty must not inherit frontier xAI
-# ---------------------------------------------------------------------------
-
-
-def test_depth2_low_difficulty_spawn_not_xai(monkeypatch):
-    """Owner priority: depth-2 simple_part must auto_pick cheaper than xai-sub.
-
-    Even when the mission injects a frontier XAISubProvider, leaf nodes resolve
-    through the full enabled set (ollama/openrouter free) and must not spend
-    SuperGrok quota.
-    """
-    from services.agent import role_models as rm
-    from services.dag import node_runner as nr
-
-    cfg = {
-        "provider": "xai-sub",
-        "model": "grok-4.5",
-        "subscription_auth": {"xai-sub": {"access_token": "t"}},
-        "enabled_providers": [
-            {
-                "provider": "ollama",
-                "model": "llama3.2:latest",
-                "base_url": "http://127.0.0.1:11434/v1",
-            },
-            {"provider": "openrouter", "model": "mistralai/mistral-small:free"},
-            {"provider": "xai-sub", "model": "grok-4.5"},
-        ],
-    }
-    monkeypatch.setattr("services.agent.config.load_config", lambda: dict(cfg))
-
-    pick = rm.auto_pick_model(
-        cfg=cfg,
-        task_class="simple_part",
-        node_depth=2,
-        min_rank=1,
-    )
-    assert pick.provider != "xai-sub", pick
-    assert pick.provider != "xai", pick
-    assert pick.model != "grok-4.5", pick
-
-    class _Frontier:
-        name = "xai-sub"
-        model = "grok-4.5"
-
-    context = {
-        "role_id": "feature_modeler",
-        "task_class": "simple_part",
-        "depth": 2,
-        "node_inputs": {
-            "role": "feature_modeler",
-            "task_class": "simple_part",
-            "depth": 2,
-        },
-        "retry_remaining": 2,
-    }
-    settings = nr._resolve_role_settings(context, injected=_Frontier())
-    assert settings["provider"] not in ("xai-sub", "xai"), settings
-    rm_row = context.get("role_model") or {}
-    assert rm_row.get("provider") not in ("xai-sub", "xai"), rm_row
-    assert rm_row.get("picked_model", rm_row.get("model")) != "grok-4.5" or (
-        rm_row.get("provider") not in ("xai-sub", "xai")
-    )
-    assert rm_row.get("min_rank") is not None
-    assert int(rm_row.get("cost_tier", 99)) <= 2
-    # Non-frontier ranks default to low/medium effort, not high.
-    assert rm_row.get("reasoning_effort") in ("low", "medium", None)
-
-
-def test_retry_cheap_forces_low_effort(monkeypatch):
-    """Retries must not re-burn frontier reasoning effort."""
-    from services.dag import node_runner as nr
-
-    cfg = {
-        "provider": "xai-sub",
-        "model": "grok-4.5",
-        "enabled_providers": [
-            {
-                "provider": "ollama",
-                "model": "llama3.2:latest",
-                "base_url": "http://127.0.0.1:11434/v1",
-            },
-            {"provider": "xai-sub", "model": "grok-4.5"},
-        ],
-    }
-    monkeypatch.setattr("services.agent.config.load_config", lambda: dict(cfg))
-
-    context = {
-        "role_id": "sketcher",
-        "task_class": "modification",
-        "depth": 1,
-        "node_inputs": {"role": "sketcher", "task_class": "modification", "depth": 1},
-        "retry_remaining": 1,
-        "retry_cheap": True,
-    }
-    settings = nr._resolve_role_settings(context)
-    row = context.get("role_model") or {}
-    assert row.get("reasoning_effort") == "low", row
-    assert settings["reasoning_effort"] == "low"
 
 
 # ---------------------------------------------------------------------------
@@ -454,22 +167,6 @@ def test_spec_writer_concrete_tools_capped_at_max():
         assert must in tools, (must, tools)
     # Domain surface still present (at least one ECAD/FW entry when families listed).
     assert any(t.startswith("ecad_") or t.startswith("fw_") for t in tools), tools
-
-
-def test_all_roles_concrete_tools_within_cap():
-    from pathlib import Path
-    from services.agent.roles import MAX_TOOLS_PER_ROLE, load_role
-
-    roles_dir = Path(__file__).resolve().parent / "roles"
-    for p in sorted(roles_dir.glob("*.yaml")):
-        if p.name in ("council_seats.yaml",):
-            continue
-        try:
-            card = load_role(p.stem)
-        except Exception:
-            continue
-        n = len(card.concrete_tools)
-        assert n <= MAX_TOOLS_PER_ROLE, (p.stem, n, card.concrete_tools)
 
 
 # ---------------------------------------------------------------------------
@@ -508,7 +205,7 @@ def test_delegate_soft_truncates_overlong_brief(tmp_path, monkeypatch):
     )
 
     import services.agent.delegation as dlg
-    import services.agent.chudcode_roles as cr
+    import services.agent.omp_roles as cr
     from services.agent import config as agent_config
 
     real_delegate = dlg.delegate
@@ -581,11 +278,6 @@ def test_delegate_soft_truncates_overlong_brief(tmp_path, monkeypatch):
     assert captured.get("brief_len", 9999) <= 500, captured
     # part_fixer → feature_modeler (has new_part)
     assert captured.get("role") == "feature_modeler", captured
-    assert (
-        out.get("brief_truncated") is True
-        or out.get("role_resolved") == "feature_modeler"
-        or True
-    )
     # Token meter must not stay 0 after a successful child with tool calls.
     if hasattr(tree, "last_tokens"):
         assert tree.last_tokens > 0, tree.last_tokens
@@ -601,7 +293,7 @@ def test_delegate_executes_child_on_full_brief_not_the_record_summary(tmp_path):
     from services.agent.ledger import Ledger
     from services.agent.mission_dispatch import MissionDispatch
     import services.agent.delegation as dlg
-    import services.agent.chudcode_roles as cr
+    import services.agent.omp_roles as cr
     import services.agent.config as agent_config
 
     ledger = Ledger("mega5_fullbrief", path=tmp_path / "ledger.json")

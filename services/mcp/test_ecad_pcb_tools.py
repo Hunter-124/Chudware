@@ -20,11 +20,19 @@ from __future__ import annotations
 
 import json
 import math
+from pathlib import Path
+
+import pytest
 
 from services.mcp.ecad_common import ecad_session
 from services.mcp.ecad_tools import _ECAD, register_ecad_tools
 from services.ecad import schema
 from services.mcp import ecad_pcb_tools
+from services.mcp import ecad_common
+
+@pytest.fixture(autouse=True)
+def _isolated_project(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(tmp_path))
 
 
 class _StubMCP:
@@ -64,14 +72,20 @@ def _divider_board(tools: dict, r1_pos=(20.0, 10.0), r2_pos=(40.0, 10.0)) -> dic
     r2 = _call(tools, "ecad_place_symbol", libid="Device:R", x=40, y=5, value="10k", ref="R2")
     s = ecad_session.get_session(_ECAD["current_sch"])
     ecad_session.apply_ops(s, s.revision, [
-        {"op": "sch_edit_symbol", "id": r1["id"], "footprint": "Resistor_SMD:R_0603"},
-        {"op": "sch_edit_symbol", "id": r2["id"], "footprint": "Resistor_SMD:R_0603"},
+        {"op": "sch_edit_symbol", "id": r1["id"], "footprint": "Resistor_SMD:R_0603_1608Metric"},
+        {"op": "sch_edit_symbol", "id": r2["id"], "footprint": "Resistor_SMD:R_0603_1608Metric"},
     ])
+    symbols = {sym["ref"]: sym for sym in s.doc["symbols"]}
+    def pin_pos(ref, number):
+        sym = symbols[ref]
+        pins = s.doc["lib_cache"][sym["libid"]]["pins"]
+        pin = next(p for p in pins if str(p["number"]) == str(number))
+        return list(schema.pin_world(sym, pin))
     ecad_session.apply_ops(s, s.revision, [
-        {"op": "sch_add_power", "net": "+5V", "pos": [14.92, 5.0]},
-        {"op": "sch_add_label", "text": "MID", "pos": [25.08, 5.0], "scope": "local"},
-        {"op": "sch_add_label", "text": "MID", "pos": [34.92, 5.0], "scope": "local"},
-        {"op": "sch_add_power", "net": "GND", "pos": [45.08, 5.0]},
+        {"op": "sch_add_power", "net": "+5V", "pos": pin_pos("R1", 1)},
+        {"op": "sch_add_label", "text": "MID", "pos": pin_pos("R1", 2), "scope": "local"},
+        {"op": "sch_add_label", "text": "MID", "pos": pin_pos("R2", 1), "scope": "local"},
+        {"op": "sch_add_power", "net": "GND", "pos": pin_pos("R2", 2)},
     ])
 
     _call(tools, "ecad_new_pcb", name="manual_route_pcb")
@@ -188,7 +202,7 @@ def test_manual_trace_is_visible_to_drc() -> None:
         "fixture must put R1's other pad BETWEEN the two MID pads"
 
     clean = _call(tools, "ecad_run_drc")
-    base_errors = clean["errors"]
+    assert clean["ok"] and clean["kind"] == "drc"
 
     r = _call(tools, "ecad_route_pad_to_pad",
               from_ref="R1", from_pad=a["number"], to_ref="R2", to_pad=b["number"])
@@ -196,13 +210,14 @@ def test_manual_trace_is_visible_to_drc() -> None:
     track_id = r["segments"][0]["id"]
 
     drc = _call(tools, "ecad_run_drc")
-    assert drc["errors"] + len(drc["violations"]) > base_errors, \
-        f"DRC did not see the hand trace (before={base_errors}, after={drc})"
-    blob = json.dumps(drc)
-    assert "clearance" in blob.lower(), f"expected a clearance violation, got {drc['by_rule']}"
-    assert track_id in blob, \
-        f"the violation must name the manual track {track_id}: {drc['violations']}"
-    print(f"  [manual_trace_is_visible_to_drc] PASS  {track_id} flagged: {drc['violations'][:1]}")
+    assert drc["ok"] and drc["kind"] == "drc"
+    assert any("clearance" in v["type"].lower() or "short" in v["type"].lower()
+               for v in drc["violations"]), drc["violations"]
+    board = ecad_session.get_session(pcb.doc_id).doc
+    track = next(t for t in board["tracks"] if t["id"] == track_id)
+    assert track.get("uuid"), "saved KiCad track must have a UUID"
+    assert any(item.get("uuid") == track["uuid"]
+               for v in drc["violations"] for item in v.get("items", [])), drc
 
 
 def test_solved_net_class_width_is_used_when_width_omitted() -> None:
@@ -330,8 +345,11 @@ def test_route_diff_pair_is_registered_and_forwards_rpc(monkeypatch) -> None:
     assert "ecad_route_diff_pair" in tools
     pcb = _divider_board(tools)
     seen = {}
+    original_rpc = ecad_common._rpc
 
     def fake_rpc(method, params):
+        if method != "ecad_route_diff_pair":
+            return original_rpc(method, params)
         seen.update(method=method, params=params)
         return {
             "revision": pcb.revision + 1,
@@ -341,7 +359,7 @@ def test_route_diff_pair_is_registered_and_forwards_rpc(monkeypatch) -> None:
             },
         }
 
-    monkeypatch.setattr(ecad_pcb_tools, "_rpc", fake_rpc)
+    monkeypatch.setattr(ecad_common, "_rpc", fake_rpc)
     r = _call(tools, "ecad_route_diff_pair", net_p="USB_D+", net_n="USB_D-",
               opts={"diff_gap": 0.18, "length_tol": 0.1})
 
@@ -362,13 +380,16 @@ def test_route_diff_pair_coerces_json_string_opts(monkeypatch) -> None:
     tools = _tools()
     pcb = _divider_board(tools)
     seen = {}
+    original_rpc = ecad_common._rpc
 
     def fake_rpc(method, params):
+        if method != "ecad_route_diff_pair":
+            return original_rpc(method, params)
         seen.update(method=method, params=params)
         return {"revision": pcb.revision + 1,
                 "report": {"routed": True, "skew_mm": 0.08, "coupled_pct": 90.0}}
 
-    monkeypatch.setattr(ecad_pcb_tools, "_rpc", fake_rpc)
+    monkeypatch.setattr(ecad_common, "_rpc", fake_rpc)
     r = _call(tools, "ecad_route_diff_pair", net_p="CLK_P", net_n="CLK_N",
               opts='{"pitch": 0.15, "diff_gap": 0.2}')
 
@@ -381,14 +402,17 @@ def test_route_diff_pair_missing_or_unknown_net_teaches(monkeypatch) -> None:
     tools = _tools()
     _divider_board(tools)
     called = False
+    original_rpc = ecad_common._rpc
 
     def fake_rpc(method, params):
         nonlocal called
+        if method != "ecad_route_diff_pair":
+            return original_rpc(method, params)
         called = True
         raise ecad_pcb_tools.OpError(
             "not_found", "unknown net 'NO_SUCH_NET'", {"net": "NO_SUCH_NET"})
 
-    monkeypatch.setattr(ecad_pcb_tools, "_rpc", fake_rpc)
+    monkeypatch.setattr(ecad_common, "_rpc", fake_rpc)
     missing = _call(tools, "ecad_route_diff_pair", net_p="", net_n="USB_D-")
     assert not missing["ok"] and "required" in missing["error"].lower()
     assert not called, "a missing required net must not reach the RPC"
@@ -399,6 +423,90 @@ def test_route_diff_pair_missing_or_unknown_net_teaches(monkeypatch) -> None:
     assert "unknown net" in unknown["error"].lower()
     assert "exact" in unknown["hint"].lower()
     assert unknown["next_actions"]
+
+
+def test_kicad_bound_board_saves_and_refuses_locked_mutation(tmp_path) -> None:
+    from services.mcp import core_bridge
+
+    tools = _tools()
+    board_path = tmp_path / "board.kicad_pcb"
+    created = _call(tools, "ecad_new_pcb", name="board", path=str(board_path))
+    assert created["ok"] and created["path"] == str(board_path)
+    assert board_path.is_file() and board_path.with_suffix(".kicad_pro").is_file()
+
+    before = board_path.read_bytes()
+    lock = board_path.with_name("~" + board_path.name + ".lck")
+    lock.write_text("KiCad lock", encoding="utf-8")
+    blocked = _call(tools, "ecad_add_zone", net="GND", rect_or_polygon=[0, 0, 10, 10])
+    assert not blocked["ok"] and blocked["code"] == "kicad_locked", blocked
+    blocked_route = _call(tools, "ecad_autoroute", doc_id=created["doc_id"])
+    assert not blocked_route["ok"] and blocked_route["code"] == "kicad_locked", blocked_route
+    assert board_path.read_bytes() == before
+    lock.unlink()
+
+    zone = _call(tools, "ecad_add_zone", net="GND", rect_or_polygon=[0, 0, 10, 10])
+    assert zone["ok"], zone
+    assert board_path.read_bytes() != before
+    reopened = core_bridge.call("ecad_open", {"path": str(board_path)})
+    try:
+        assert reopened["tree"]["zones"], reopened
+    finally:
+        core_bridge.call("ecad_close", {"doc_id": reopened["doc_id"]})
+
+
+def test_kicad_external_change_conflict_is_not_overwritten(tmp_path) -> None:
+    from services.mcp import core_bridge
+
+    tools = _tools()
+    board_path = tmp_path / "conflict.kicad_pcb"
+    created = _call(tools, "ecad_new_pcb", name="conflict", path=str(board_path))
+    assert created["ok"], created
+    tree = core_bridge.call("ecad_tree", {"doc_id": created["doc_id"]})
+    core_bridge.call("ecad_apply_ops", {
+        "doc_id": created["doc_id"], "base_revision": tree["revision"],
+        "ops": [{"op": "pcb_add_zone", "net": "GND", "layer": "F.Cu",
+                 "polygon": [[0, 0], [10, 0], [10, 10], [0, 10]]}],
+    })
+    external = board_path.read_bytes() + b"\n"
+    board_path.write_bytes(external)
+    blocked = _call(tools, "ecad_add_zone", net="GND",
+                    rect_or_polygon=[20, 20, 30, 30], doc_id=created["doc_id"])
+    assert not blocked["ok"] and blocked["code"] == "external_change", blocked
+    assert board_path.read_bytes() == external
+
+
+def test_kicad_footprints_and_project_fab_outputs(tmp_path) -> None:
+    tools = _tools()
+    found = _call(tools, "ecad_find_footprint", query="R_0603_1608Metric", limit=10)
+    assert found["ok"] and any(
+        fp["fpid"] == "Resistor_SMD:R_0603_1608Metric"
+        for fp in found["footprints"]), found
+    schematic = _call(tools, "ecad_new_schematic", name="fab_board")
+    assert schematic["ok"], schematic
+    symbol = _call(tools, "ecad_place_symbol", libid="Device:R", x=10, y=10,
+                   ref="R1", value="10k", footprint="Resistor_SMD:R_0603_1608Metric")
+    assert symbol["ok"], symbol
+    created = _call(tools, "ecad_new_pcb", name="fab_board")
+    assert created["ok"], created
+    board_path = tmp_path / "fab_board" / "fab_board.kicad_pcb"
+    assert created["path"] == str(board_path)
+    pcb = ecad_session.get_session(created["doc_id"])
+    points = [[0, 0], [30, 0], [30, 20], [0, 20]]
+    ecad_session.apply_ops(pcb, pcb.revision, [{
+        "op": "pcb_set_outline", "closed": True,
+        "shapes": [{"type": "line", "p1": points[i], "p2": points[(i + 1) % 4]}
+                   for i in range(4)],
+    }, {"op": "pcb_add_footprint", "fpid": "Resistor_SMD:R_0603_1608Metric",
+         "ref": "R1", "value": "10k", "pos": [10, 10]}])
+    outputs = [_call(tools, "ecad_export", kind=kind, doc_id=pcb.doc_id)
+               for kind in ("gerber", "cpl", "bom")]
+    for output in outputs:
+        assert output["ok"] and output["paths"], output
+        assert all((tmp_path / "fab_board" / "fab") in Path(p).parents
+                   and Path(p).is_file() for p in output["paths"])
+    assert outputs[1]["path"] != outputs[2]["path"]
+    assert "R1" in Path(outputs[2]["path"]).read_text(encoding="utf-8")
+    assert not any("No sibling schematic" in w for w in outputs[2]["warnings"])
 
 
 def main() -> None:

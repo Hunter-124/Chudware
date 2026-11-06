@@ -33,7 +33,7 @@
 | Variable | Required | Meaning |
 |---|---|---|
 | `CHUDWARE_REVENG_DIR` | no | Override session storage root |
-| `OPENMVS_BIN` | for dense CPU mesh | OpenMVS `DensifyPointCloud` etc. (AGPL — subprocess ONLY) |
+| `OPENMVS_BIN` | no | Directory of OpenMVS tools (`DensifyPointCloud` etc.); default is `PATH`, then the managed install fetched by `reveng_install_tools` / the app (AGPL — subprocess ONLY) |
 | `BRUSH_BIN` | for 3DGS + mesh export | Brush trainer binary (Apache, subprocess) |
 | `MESHROOM_BIN` | no | Existing Meshroom path (unchanged from photogrammetry.py) |
 | `CHUDWARE_TEST_CAMERA` | no | `1` enables Linux webcam ctest smoke |
@@ -260,7 +260,16 @@ All tools return JSON strings. Read tools use `_dumps`; errors use `_err` per MC
 
 #### `describe_reveng_result(session_id: str) → {ok, result: {doc_id, match_pct, strategy, mesh_fallback: bool, provenance: []}}`
 
-#### `reveng_status() → {ok, capabilities: {sparse, dense, splat, single_photo, webcam, gpu}, provisioning: {colmap, openmvs, brush, triposr, vggt, docling}, banners: [str]}`
+#### `reveng_status() → {ok, capabilities: {sparse, dense, splat, single_photo, webcam, gpu}, provisioning: {colmap, openmvs, brush, triposr, vggt, docling}, banners: [str], install: {running, tool, message, done, total, installed: [str], errors: {tool: str}}}`
+
+#### `reveng_install_tools(tools?: ["brush", "openmvs"]) → {ok, install}`
+
+Starts a background download of the missing SHA-256-pinned Brush / OpenMVS releases into the
+managed tools dir (about 210 MB, Linux x86_64; other platforms return `unsupported_platform`
+and use `BRUSH_BIN` / `OPENMVS_BIN`). Idempotent while running and a no-op when nothing is
+missing; progress is `reveng_status().install`. The GUI fetches the tools automatically the
+first time it sees them missing (once per run) and offers Install / Retry in the Session panel;
+`scripts/provision_reveng.py` is only a developer CLI over `services/vision/reveng_install.py`.
 
 ### 8.2 WRITE
 
@@ -810,3 +819,255 @@ The compiled service dispatcher accepts `services.reveng.gaussian_jobs` and
 `services.vision.gaussian_pipeline` child commands; Linux packaging includes
 pycolmap. Process supervision is Linux-only. A source-dispatch smoke is not evidence
 that a Nuitka/AppImage release artifact has been built or tested.
+
+## 14. Attached model authority — v3 amendment (2026-10-30)
+
+`artifacts.doc_id` is a live document handle, never a file path. When an RE result
+has a parametric document, `reveng_attach_result` and the library orchestrator
+save a new session-owned `.step+` snapshot with `preserve_path: true`. It retains
+the editable feature history and native build-state cache without rebinding the
+live document, clearing its dirty state, or overwriting its source. The result
+sidecar records `doc_id` as provenance, `native_path` as the saved native
+artifact, and an explicit `geometry_ref` and `geometry_source` for placement.
+
+An incomplete or failed native rebuild is refused with its diagnostics before a
+new attachment is published. It is never replaced by a scan mesh as an implicit
+fallback; an earlier published attachment is left unchanged. When no parametric
+document exists, a generated STEP or a mesh-only result can be attached and sent
+to the native importer, which must explicitly reject unusable geometry. Legacy
+mesh-only sidecars remain usable when their paths meet the current placement
+boundary; a legacy live `doc_id` is not interpreted as a filename or silently
+replaced by its accompanying mesh.
+
+Cell session metadata and the native snapshot remain in actor-owned state.
+Placement references are workspace-relative: a separately and exclusively
+created workspace artifact carries the selected source without overwriting an
+existing user file. The result adapter only enumerates the requesting actor's
+session state; unusable absolute or escaping cell references are not advertised
+as models.
+
+## 15. Shared video, splat and metric reconstruction — v4 amendment (2026-10-30)
+
+`reveng_add_video(session_id, path, max_frames=120)` extracts frames only. It returns
+an asynchronous `run_id`; the run's session status and `aicad.reveng_events/1`
+capture events report progress and errors. `wait=true` runs extraction inline for a
+short clip. Video and stills form one submitted image set. The session persists the
+shared undistorted `sfm_dataset` (images, COLMAP model, source-image mapping and
+input signature); Brush and OpenMVS consume this dataset without an independent
+solve. Changed input invalidates the previous solve's arbitrary gauge and scale.
+COLMAP binary and text models are both supported.
+The extraction manifest `frames/clip_<sha256>_manifest.json` records each selected
+frame's path, source path and clip ID, frame index, relative presentation time in
+seconds, sharpness and clockwise orientation. Selection is sharpness-aware within
+temporal bins and bounded in sample count and memory. User-installed `ffmpeg` and
+`ffprobe` on PATH are optional subprocesses, not bundled dependencies.
+
+`recon_transform` is a persisted similarity, with `mm_per_unit`, proper 3×3
+row-major `rotation`, `translation_mm`, `source`, nullable `residual_mm`, and
+`confirmed`. It maps each native point `x` to
+`mm_per_unit * rotation @ x + translation_mm`. Raw gauge artifacts remain
+distinguishable from transformed artifacts through their paths, units and
+`*_transform_applied` flags. A camera's position uses this same transform; its
+directions use its rotation and its focus distance uses its scale. A known
+dimension requires its real `value_mm` and either a positive `recon_length` or
+two distinct 3D points in the native gauge. Its scale is
+`mm_per_unit = value_mm / recon_length`, never the physical dimension alone.
+`import_scan_mesh(..., scale_mm=...)` treats `scale_mm` as millimetres per source
+unit and records this transform; fitting applies it once. A dimension-critical
+fit, CAD build or millimetre deviation requires a confirmed scale.
+Two-point calibration on a shared dataset requires `image_space="undistorted"`;
+the supplied pixels must come from its undistorted image, not the distorted source.
+The source-image mapping identifies the paired registered model image.
+When there is no scan mission gate, `reveng_confirm_scale(session_id)` records a
+person's explicit approval of a solved, internally consistent scale. Active or
+paused missions must use their own `reveng_resolve_gate` instead.
+
+`reveng_import_splat` accepts Gaussian PLY, `.splat`, `.spz` and `.ksplat` and
+reports source format, count and conversion losses. `reveng_convert_splat` exports
+supported Gaussian encodings and reports losses. Imported clouds have their own
+gauge and cannot inherit unrelated session cameras or scale. `reveng_splat_to_mesh`
+extracts a surface from Gaussian centers and explicitly reports `approximate=true`;
+it is not an exact Gaussian isosurface or a metrology guarantee. OpenMVS is an
+optional subprocess (provisioned by `scripts/provision_reveng.py`); when it is unavailable, this approximate
+extraction can serve as the measurement-surface fallback. Brush exports visual
+Gaussians, not a mesh.
+
+`reveng_sparse_preview` returns bounded points, index-aligned `points_native`,
+camera frusta and an optional binary STL preview. Fitting revision 3 adds the
+unit/approximation and applied-transform state, and per-fit inlier RMS, standard
+error, calibration residual and explicit uncertainty caveats; inlier RMS is not a
+complete dimensional uncertainty. Explicit `alignment="icp"` reports a rigid
+surface alignment for deviation; world-frame boolean comparisons remain unchanged.
+Critical dimensions must be independently measured and confirmed.
+
+## 16. Browser artifact transport — v5 amendment (2026-10-31)
+
+Cell worker responses may include `artifact_refs` keyed by `splat`, `gaussian_splat`,
+`mesh`, `mesh_preview`, or `sparse_points`; each reference contains an opaque `id`,
+byte `size`, and `kind`. References are scoped to the authenticated workspace and
+actor and resolve only to owned session artifacts. The gateway streams the pinned,
+no-follow file at `/reveng/artifact/{id}`, rejects changed, unsafe or larger than
+2 GiB artifacts, and does not accept a filesystem path from the browser. Existing
+native paths remain available to desktop callers. A browser PLY open requests
+`reveng_import_splat` with `classify_ply` to inspect the server-side header before
+dispatching Gaussian versus mesh/point input. The worker bridge also accepts
+`session_id` instead of `path` when converting an owned session, keeping its handle
+distinct from a workspace path at the cell admission boundary.
+Cell bundle exports likewise confine `dest` to the workspace before creating
+directories or writing the archive; desktop destinations retain their native behavior.
+
+The browser asynchronously downloads Gaussian and binary-STL preview artifacts and
+parses them in memory; sparse preview points and camera frusta remain in the worker
+response. Cell responses sample at most 10,000 index-aligned sparse preview points
+to fit the WebSocket frame limit and report that sampling as a warning; the complete
+sparse model remains in the session. GPU devices are not exposed to browser cells,
+so Gaussian training is disabled there. Import, conversion and viewing of existing
+splats remain available.
+
+## 17. Rebuild integrity, alignment and bounded evidence — v6 amendment (2026-10-31)
+
+This amendment supersedes the duplicated `points_native` and response-sampling
+details in §§15–16. `reveng_sparse_preview` returns at most 5,000 RGB `points`,
+`total_points`, `sparse_points_path`, and bounded camera frusta. All returned points
+and frusta use the same frame: reconstruction units while scale is unconfirmed,
+millimetres after confirmation. A confirmed `recon_transform` is returned so a
+client can recover a native point as `rotation.T @ (point_mm - translation_mm) /
+mm_per_unit`. The full sparse model remains the authoritative artifact.
+
+`reveng_align_axes(session_id, method="planes", rotation=null)` writes an absolute
+proper native-to-world rotation to the persisted similarity transform without
+changing its scale or confirmation. `planes` uses dominant orthogonal fitted planes
+or mesh face normals and reports a PCA fallback; `pca` uses mesh points; `manual`
+requires a proper 3×3 rotation. The returned method, source and fallback reason
+describe the actual calculation. Estimated axes are not verified part datums.
+Mesh replacement, recalibration and alignment detach prior fits, document and
+result state and reset model/review/deliver stages without deleting previously
+published attachment snapshots. Fits carry the measurement mesh SHA-256, native
+mesh SHA-256 and full similarity transform; consumers must reject missing or
+mismatched provenance, including legacy unattached `fits.json` files.
+
+Pose-binned coverage accepts a slot only when a registered view's nearest-slot
+angular error is at most 25 degrees. It exposes each slot's nearest registered-view
+error, including missing slots. `count_proxy` remains an explicitly estimated
+image-count coverage when usable poses are unavailable.
+
+`reverse_engineer` and deterministic `reveng_build_parametric` return
+`ok:false`, `reason:"no_features_rebuilt"` for zero applied features or a bodyless
+result. No such result is built or scored, and no synthetic zero match is reported.
+`mesh_fallback` is true only with an actual mesh body. `recognition.unclaimed`
+contains at most 100 examples; `unclaimed_count` and `unclaimed_path` identify the
+complete actor-owned JSON artifact.
+
+`reveng_splat_to_mesh` defaults to `method="auto"`: it uses approximate Gaussian
+depth TSDF only with a proven same-gauge undistorted COLMAP model, and otherwise
+reports a Poisson fallback and `fallback_reason`. An imported splat or standalone
+file never inherits unrelated poses. Explicit `poisson` and `ball_pivoting` remain
+available; explicit TSDF with usable poses reports fusion failures rather than
+concealing them. Neither TSDF nor center-based extraction is a metrology guarantee:
+independently measure critical features and inspect missing or invented surfaces.
+
+`reveng_splat_to_mesh` prunes the Gaussian scene to its subject before any surface
+extraction (`services/formats/splat_prune.py`): adaptive opacity cut (`min_opacity`
+omitted; a fixed 0.5 keeps only 1-8% of a Brush splat), the sphere the registered
+cameras orbit (percentile bounds without poses), oversized and needle-like splats, the
+dominant floor plane (`remove_floor`; flat splats and floor-colored splats inside the
+band, so a subject lying on the floor survives) and k-NN floaters plus small islands.
+The result adds `prune` (per-stage counts), `points_path` (binary PLY of colored
+centers) and `pruned_splat_path` (Gaussian PLY) beside the mesh, in reconstruction units.
+
+Imported scans are stored as immutable session artifacts so a later same-named
+import cannot overwrite an earlier published attachment. In an exported bundle,
+the latest imported scan uses `mesh/<original filename>`; the archive's
+`session.json` identifies its current mesh artifacts using archive-relative
+paths. If an older session file already occupies that stable name, the bundle
+retains it under a distinct archive-history path.
+
+## 18. Video culling, per-clip cameras, snapshot retention and the ChArUco scale mat — v7 amendment (2026-11-04)
+
+This amendment refines §15's sharpness-aware selection. `reveng_add_video` and the
+Gaussian video path no longer apply the absolute 100.0 variance-of-Laplacian floor to
+video. That score scales with resolution, compression and scene texture; a 1080p HEVC
+phone orbit of a matte object scores a median near 15 and lost 593 of 600 sampled
+frames to the fixed floor. By default `services/vision/frames.py:extract_frames()`
+keeps the sharpest frame in each temporal bin and drops a bin only when that frame is
+below `RELATIVE_BLUR_FRACTION` (0.5) of the median score of every frame sampled from the
+same clip. The manifest's `blur_threshold` is the floor actually applied and
+`rejected_blurry` counts sampled frames below it. A caller-supplied `blur_threshold`
+remains an absolute floor. §12.1's `kSharpnessBlurThreshold` and
+`frames.DEFAULT_BLUR_THRESHOLD` (both 100.0) still define the live-capture and still
+coverage audit.
+
+Video frames from one extracted clip share one COLMAP camera (one lens and zoom per
+clip); stills and frames of other clips keep independent intrinsics. On a 113-frame
+iPhone orbit this registered 88 views instead of 74 with per-frame cameras.
+
+Brush snapshots: a training pass exports at most about 50 previews
+(`export_every = min(steps, max(100, steps // 50))`). Raw Brush exports are deleted once
+copied or superseded, and only the newest two published snapshots are kept; the
+previous one remains for a reader still loading it. Clients must load the
+`splat_path` of the current record rather than retain older preview paths.
+
+Scale mat: `reveng_print_scale_mat(size)` now writes the standard ChArUco mat
+(`scale_mat.MAT_BOARD`: 7×10 squares of 25 mm, `DICT_5X5_100`, 18 mm markers, the same
+175 × 250 mm board on A4 and Letter) and returns `{ok, path, preview_path, kind:"charuco",
+spec, size, dpi, page_mm, square_len_mm, print_note}`; `path` is the PDF, `preview_path` a PNG
+of the page. The board is rasterized at its exact size; the page margin is the quiet zone.
+(Previously the tool imported a nonexistent function and always answered
+`backend_not_provisioned`.) `reveng_set_scale(method="aruco_mat")` first solves the ChArUco
+board (`params.charuco` overrides the spec): every corner resolved in at least three registered
+views is triangulated, observations reprojecting worse than 2 px are dropped, and the board's
+planar layout is fitted with a similarity transform. `mm_per_unit` is the inverse fitted scale;
+`residual_pct` is the RMS fit residual relative to the RMS corner radius, and `scale.detail`
+carries `n_corners`, `rms_residual_mm`, `max_residual_mm`, `corner_span_mm` and
+`mat: {kind, ...spec}`. When no board resolves, a legacy single-marker mat (§12.3) is solved
+from its four corners, and a failure reports both causes.
+
+## 19. Existing CAD model discovery
+
+Before researching dimensions or building a replacement, start a reverse-engineering
+session and search for existing CAD with
+`reveng_find_models(session_id, query, limit=8)`. Inspect candidates for suitability
+and provenance; when a suitable model is available, select it with
+`reveng_use_model(session_id, url=...)` or `reveng_use_model(session_id, path=...)`.
+If no suitable model is available, proceed with research or reconstruction. A found
+model is not by itself proof of fit or accuracy; verify critical dimensions.
+
+`reveng_find_models` returns `{ok, session_id, query, candidates, standard_part,
+coverage, hint}` and persists the search in `session.reference` without discarding
+an already selected model. A direct URL is returned as a candidate rather than
+automatically attached; standard hardware is represented separately.
+
+`reveng_use_model` accepts exactly one of `url` or `path`. It obtains a URL's CAD
+file under the session project root without importing it into a document; a local
+path identifies an existing CAD file. It stores the selected model in
+`session.reference.model` (`path`, `format`, `source_url`, `site`, `sha256`,
+`license`, `ts`) and its path in `artifacts.reference_model_path`, completes
+capture and model stages, sets status to `done` and lane to `reference`, and
+records `use_reference_model` provenance. Success returns
+`{ok, session_id, path, format, source_url, site}`.
+
+Background search: `reveng_find_models(..., wait=false)` returns
+`{ok, session_id, query, pending: true}` at once and runs the fan-out off the request thread
+(the CAD-library sites render through a single-request browser daemon, about a minute and a
+half cold, and worker stdio dispatch is serialized). `session.reference.status` is
+`searching` until the result is stored (`done`, with `candidates`, `standard_part`,
+`coverage`, `hint`, `searched_at`) or the search fails (`failed`, with `error`). A later
+search for a different `query` supersedes a running one; its late result is dropped. The GUI
+transport pins `wait=false`; the MCP default stays `wait=true` (blocking, full result).
+
+## 20. Working-folder scoping and intake lane
+
+- `session.project_dir` (desktop only; absent in a cell): the realpath of the working folder
+  that owns the session — the explicit `project_dir` argument of `reveng_start_session`,
+  `reveng_import_splat`, `reveng_make_part_from_library` and `reveng_start_from_product`, else
+  the bound agent project root (`CHUDWARE_PROJECT_DIR`), else `null`.
+- `list_reveng_sessions(project_dir?)` returns only sessions whose `project_dir` equals the
+  given folder (else the bound project root); sessions without one are excluded from a
+  filtered list. With neither known the list is unfiltered. A cell never filters.
+- `session.lane`: `"scan"` (default) or `"reference"` (set by a research seed, a model search
+  or a chosen model). Summaries carry `project_dir` and `lane`.
+- `reveng_start_session(research=...)` and `reveng_make_part_from_library` search for an
+  existing model first; research (and, for the library flow, the build mission) runs only
+  when no `exact` / `strong` candidate or standard part was found. The library flow then
+  returns `{ok, session_id, part_ref, model_present: false, existing_models, standard_part,
+  hint}`; `force_build=true` skips the search.

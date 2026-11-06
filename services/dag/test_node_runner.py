@@ -755,7 +755,7 @@ class TestRoleCardWiring:
 class TestDefaultAgentFnSeams:
     @staticmethod
     def _capture_role_turn(monkeypatch, scripted=None):
-        from services.agent import chudcode_roles
+        from services.agent import omp_roles
 
         monkeypatch.setattr(nr, "_ADVISOR_ENABLED", False)
 
@@ -791,7 +791,7 @@ class TestDefaultAgentFnSeams:
                 }
             return reply
 
-        monkeypatch.setattr(chudcode_roles, "run_role_turn", fake_run_role_turn)
+        monkeypatch.setattr(omp_roles, "run_role_turn", fake_run_role_turn)
         return calls
 
     def test_build_and_swarm_nodes_use_chudcode_with_distinct_stable_lineage(
@@ -973,7 +973,7 @@ class TestDefaultAgentFnSeams:
         ]
         assert out["data"]["agent_result"]["tool_calls"] == 1
 
-    def test_chudcode_session_lineage_survives_executor_checkpoint(
+    def test_omp_session_lineage_survives_executor_checkpoint(
         self,
         monkeypatch,
         tmp_path,
@@ -1153,7 +1153,7 @@ class TestMissionNodeRequests:
     def test_every_mission_node_has_a_request(self):
         from services.dag.mission_template import build_mission_graph
 
-        graph = build_mission_graph(self._manifest(), graph_id="t", org_layer=True)
+        graph = build_mission_graph(self._manifest(), graph_id="t")
         for n in graph["nodes"]:
             assert n["inputs"].get("request"), f"{n['id']} has no request"
 

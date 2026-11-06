@@ -119,6 +119,37 @@ class TestBoltsAdapter:
         assert rec["designation"] == "6205"
         _validate_record(rec)
 
+    @pytest.mark.parametrize(("compact", "canonical"), [
+        ("fastener:ISO4762:M8", "fastener:ISO 4762:M8"),
+        ("bearing:ISO15:608", "bearing:ISO 15:608"),
+        ("fastener:DIN912:m8", "fastener:ISO 4762:M8"),
+    ])
+    def test_compact_and_alias_lookup_returns_canonical_record(self, compact, canonical):
+        record = self.adapter.get(canonical)
+        assert record is not None
+        assert self.adapter.get(compact) == record
+
+    def test_lookup_respects_domain_and_standard(self):
+        assert self.adapter.get("bearing:ISO4762:M8") is None
+        assert self.adapter.get("fastener:ISO15:608") is None
+        shcs = self.adapter.get("fastener:ISO4762:M8")
+        bhcs = self.adapter.get("fastener:ISO7380:M8")
+        assert shcs is not None and bhcs is not None
+        assert shcs["part_id"] != bhcs["part_id"]
+        assert shcs["geometry_ref"]["family"] != bhcs["geometry_ref"]["family"]
+
+    def test_ambiguous_alias_is_not_resolved_arbitrarily(self):
+        from services.parts.bolts_loader import Standard
+
+        self.adapter._tables = {
+            "ISO 1": Standard("ISO 1", "First", "shcs", aliases=("shared",),
+                              sizes={"M8": {"d": 8}}),
+            "ISO 2": Standard("ISO 2", "Second", "bhcs", aliases=("shared",),
+                              sizes={"M8": {"d": 8}}),
+        }
+        assert self.adapter.get("fastener:shared:M8") is None
+        assert self.adapter.get("fastener:ISO1:M8")["part_id"] == "fastener:ISO 1:M8"
+
     def test_get_unknown_returns_none(self):
         assert self.adapter.get("bearing:NONSTD:XXXXXX") is None
 
@@ -177,6 +208,22 @@ class TestCoreFamiliesAdapter:
 
     def test_get_wrong_prefix_returns_none(self):
         assert self.adapter.get("fastener:ISO 4762:M5") is None
+
+    def test_catalog_preserves_standard_and_length_choices(self):
+        self.adapter._catalog = [
+            {"key": "shcs", "description": "Socket head", "standard": "ISO 4762",
+             "sizes": ["M8"], "needs_length": True, "lengths_mm": [10.0, 16.0, 20.0]},
+            {"key": "bearing", "description": "Bearing", "standard": "ISO 15",
+             "sizes": ["608"], "needs_length": False, "lengths_mm": []},
+        ]
+        screw = self.adapter.get("mech_family:shcs:M8")
+        assert screw["standard"] == "ISO 4762"
+        assert screw["geometry_ref"]["needs_length"] is True
+        assert screw["geometry_ref"]["lengths_mm"] == [10.0, 16.0, 20.0]
+        bearing = self.adapter.get("mech_family:bearing:608")
+        assert bearing["standard"] == "ISO 15"
+        assert bearing["geometry_ref"]["needs_length"] is False
+        assert bearing["geometry_ref"]["lengths_mm"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +308,7 @@ class TestPartsHub:
 
     def test_search_bearing_6205_dod(self):
         """DoD: part_search('bearing 6205') returns the 6205 bearing PartRecord."""
-        results = self.hub.search("bearing 6205")
+        results = self.hub.search("bearing 6205", include_live=False)
         pids = [r["part_id"] for r in results]
         assert "bearing:ISO 15:6205" in pids, \
             f"DoD FAIL: bearing 6205 not found. Got pids: {pids[:10]}"
@@ -271,7 +318,7 @@ class TestPartsHub:
 
     def test_search_m8_socket_head_dod(self):
         """DoD: part_search('M8 socket head') returns fastener records for M8 shcs."""
-        results = self.hub.search("M8 socket head")
+        results = self.hub.search("M8 socket head", include_live=False)
         assert results, "DoD FAIL: no results for 'M8 socket head'"
         # At least one result must be an M8 fastener with socket head in the title.
         matching = [
@@ -286,7 +333,7 @@ class TestPartsHub:
 
     def test_search_domain_mech_family_dod(self):
         """DoD: part_search(domain='mech_family') lists core families (or empty when core absent)."""
-        results = self.hub.search("", domain="mech_family")
+        results = self.hub.search("", domain="mech_family", include_live=False)
         # May be empty if core is absent — that's acceptable. But must not raise.
         assert isinstance(results, list)
         for rec in results:
@@ -311,13 +358,13 @@ class TestPartsHub:
                    for r in self.hub.search("MG90S", domain=["ecad", "mech_family"], include_live=False))
 
     def test_get_by_part_id_bearing(self):
-        rec = self.hub.get("bearing:ISO 15:6205")
+        rec = self.hub.get("bearing:ISO 15:6205", include_live=False)
         assert rec is not None
         assert rec["part_id"] == "bearing:ISO 15:6205"
         _validate_record(rec)
 
     def test_get_unknown_returns_none(self):
-        assert self.hub.get("fastener:NONEXISTENT:X99") is None
+        assert self.hub.get("fastener:NONEXISTENT:X99", include_live=False) is None
 
     def test_rebuild_index_idempotent(self):
         count1 = self.hub.rebuild_index()
@@ -368,15 +415,20 @@ class TestPartsHub:
     def test_live_fanout_deadline_bounds_slow_provider(self, monkeypatch):
         """A stalled live provider must not hang; fast providers still land and
         the slow site surfaces as a timeout notice."""
-        import time as _time
+        import threading
+        from services.parts import hub as hub_module
 
         monkeypatch.setenv("CHUDWARE_PARTS_LIVE_BUDGET_S", "0.4")
         monkeypatch.setenv("CHUDWARE_PARTS_LIVE_SITE_BUDGET_S", "0.4")
+        release = threading.Event()
+        slow_started = threading.Event()
+        fast_site = f"pytest-fast-{id(release):x}"
+        slow_site = f"pytest-slow-{id(release):x}"
 
         class _FastLive:
             domain = "catalog"
             provider_id = "fast_live"
-            site = "fastsite"
+            site = fast_site
 
             def search(self, query, **kw):
                 return [{
@@ -400,10 +452,11 @@ class TestPartsHub:
         class _SlowLive:
             domain = "catalog"
             provider_id = "slow_live"
-            site = "slowsite"
+            site = slow_site
 
             def search(self, query, **kw):
-                _time.sleep(30.0)  # would hang forever pre-fix
+                slow_started.set()
+                release.wait()
                 return [{
                     "part_id": "catalog:slowsite::late",
                     "domain": "catalog",
@@ -425,17 +478,26 @@ class TestPartsHub:
         # Empty index → forces live fan-out.
         hub._index_built = True  # skip rebuild; index stays empty
 
-        t0 = _time.monotonic()
-        out = hub.search("zzz_no_fts_hit_xyzzy_9999", domain="catalog", limit=10)
-        elapsed = _time.monotonic() - t0
+        try:
+            t0 = time.monotonic()
+            out = hub.search("fast widget", domain="catalog", limit=10)
+            elapsed = time.monotonic() - t0
 
-        assert elapsed < 2.0, f"live fan-out hung for {elapsed:.2f}s (budget 0.4s)"
-        real = [r for r in out if r.get("part_id") and r.get("title")]
-        notices = [r for r in out if not (r.get("part_id") and r.get("title"))]
-        assert any(r.get("part_id") == "catalog:fastsite::widget" for r in real), \
-            f"fast provider result missing: {out}"
-        assert any(n.get("site") == "slowsite" and n.get("reason") == "timeout"
-                   for n in notices), f"timeout notice missing: {notices}"
+            assert slow_started.is_set(), "slow provider never started"
+            assert elapsed < 2.0, f"live fan-out hung for {elapsed:.2f}s (budget 0.4s)"
+            real = [r for r in out if r.get("part_id") and r.get("title")]
+            notices = [r for r in out if not (r.get("part_id") and r.get("title"))]
+            assert any(r.get("part_id") == "catalog:fastsite::widget" for r in real), \
+                f"fast provider result missing: {out}"
+            assert any(n.get("site") == slow_site and n.get("reason") == "timeout"
+                       for n in notices), f"timeout notice missing: {notices}"
+        finally:
+            release.set()
+            with hub_module._LIVE_LOCK:
+                threads = [t for t in hub_module._LIVE_THREADS
+                           if t.name in (f"parts-live-{fast_site}", f"parts-live-{slow_site}")]
+            for thread in threads:
+                thread.join()
 
     def test_browser_bootstrap_error_is_diagnostic(self, monkeypatch):
         """Browser adapter import failure must leave local search working and
@@ -500,7 +562,7 @@ class TestPartsMCPTools:
         assert "part_get" in self.tools, "part_get not registered"
 
     def test_part_search_bearing_6205(self):
-        result = json.loads(self.tools["part_search"]("bearing 6205"))
+        result = json.loads(self.tools["part_search"]("bearing 6205", include_live=False, previews=False))
         assert result["ok"] is True
         assert result["count"] > 0
         pids = [r["part_id"] for r in result["results"]]
@@ -508,7 +570,7 @@ class TestPartsMCPTools:
             f"bearing:ISO15:6205 not in MCP results: {pids[:5]}"
 
     def test_part_search_m8_socket_head(self):
-        result = json.loads(self.tools["part_search"]("M8 socket head"))
+        result = json.loads(self.tools["part_search"]("M8 socket head", include_live=False, previews=False))
         assert result["ok"] is True
         assert result["count"] > 0
         matching = [
@@ -519,26 +581,87 @@ class TestPartsMCPTools:
             f"No M8 fastener in MCP part_search results. Titles: {[r.get('title') for r in result['results'][:5]]}"
 
     def test_part_search_empty_no_crash(self):
-        result = json.loads(self.tools["part_search"](""))
+        result = json.loads(self.tools["part_search"]("", include_live=False))
         assert "ok" in result
 
     def test_part_search_with_domain(self):
-        result = json.loads(self.tools["part_search"]("", "fastener", 10))
+        result = json.loads(self.tools["part_search"]("", "fastener", 10, include_live=False, previews=False))
         assert result["ok"] is True
         for rec in result["results"]:
             assert rec["domain"] == "fastener"
 
     def test_part_get_bearing_6205(self):
-        result = json.loads(self.tools["part_get"]("bearing:ISO 15:6205"))
+        result = json.loads(self.tools["part_get"]("bearing:ISO 15:6205", include_live=False))
         assert result["ok"] is True
         assert result["part"]["part_id"] == "bearing:ISO 15:6205"
 
+    @pytest.mark.parametrize(("compact", "canonical"), [
+        ("fastener:ISO4762:M8", "fastener:ISO 4762:M8"),
+        ("bearing:ISO15:608", "bearing:ISO 15:608"),
+    ])
+    def test_part_get_compact_id(self, compact, canonical):
+        compact_result = json.loads(self.tools["part_get"](compact))
+        canonical_result = json.loads(self.tools["part_get"](canonical))
+        assert compact_result["ok"] is True
+        assert canonical_result["ok"] is True
+        assert compact_result["part"]["part_id"] == canonical
+        assert compact_result["part"]["params"] == canonical_result["part"]["params"]
+
     def test_part_get_unknown_returns_ok_false(self):
-        result = json.loads(self.tools["part_get"]("bearing:NONSTD:XXXXXXX"))
+        result = json.loads(self.tools["part_get"]("bearing:NONSTD:XXXXXXX", include_live=False))
         assert result["ok"] is False
         assert "reason" in result
 
     def test_part_search_limit_respected(self):
-        result = json.loads(self.tools["part_search"]("M", "", 5))
+        result = json.loads(self.tools["part_search"]("M", "", 5, include_live=False, previews=False))
         assert result["ok"] is True
         assert len(result["results"]) <= 5
+
+
+def test_synchronous_live_fanout_respects_browser_concurrency(monkeypatch):
+    import threading
+    from services.parts import hub as hub_module
+
+    monkeypatch.setattr(hub_module, "_live_fetch_slots", threading.BoundedSemaphore(3))
+    monkeypatch.setenv("CHUDWARE_PARTS_LIVE_BUDGET_S", "5")
+    lock = threading.Lock()
+    saturated = threading.Event()
+    release = threading.Event()
+    active = 0
+    maximum = 0
+
+    class Site:
+        domain = "catalog"
+        def __init__(self, site):
+            self.site = self.provider_id = site
+        def count(self):
+            raise NotImplementedError
+        def search(self, query, **kwargs):
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+                if active == 3:
+                    saturated.set()
+            release.wait(3)
+            with lock:
+                active -= 1
+            return [{"part_id": f"catalog:{self.site}::608",
+                     "domain": "catalog", "source": "live", "title": "608 bearing"}]
+
+    hub = hub_module.PartsHub()
+    sites = [f"site{i}" for i in range(6)]
+    for site in sites:
+        hub._registry.register(Site(site))
+    output = []
+    thread = threading.Thread(target=lambda: output.extend(
+        hub._search_live("608 bearing", domain="catalog", filters=None, limit=10, sites=sites)))
+    try:
+        thread.start()
+        assert saturated.wait(2)
+    finally:
+        release.set()
+        thread.join(5)
+    assert not thread.is_alive()
+    assert maximum == 3
+    assert len([r for r in output if r.get("part_id")]) == len(sites)

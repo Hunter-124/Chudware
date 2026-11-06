@@ -346,10 +346,18 @@ def test_routed_search_only_fetches_fitting_vendors(monkeypatch):
     a metals query never fetches DigiKey. We assert on which sites are actually
     FETCHED (the request that could get a user rate-limited), not on results.
     """
+    import threading
+
     import services.browser.session as bsession
-    from services import parts as parts_hub
+    from services.browser.adapters import _vendor_api
+    from services.parts import hub as hub_module
 
     fetched: list[str] = []
+    owner = ("pytest", f"taxonomy-routing-{id(fetched):x}")
+    caller = threading.current_thread()
+    real_owner_key = hub_module.owner_key
+    monkeypatch.setattr(hub_module, "owner_key",
+                        lambda: owner if threading.current_thread() is caller else real_owner_key())
 
     def _fake_fetch(url, site, **kwargs):
         fetched.append(site)
@@ -357,17 +365,38 @@ def test_routed_search_only_fetches_fitting_vendors(monkeypatch):
                 "session_profile_used": site}
 
     monkeypatch.setattr(bsession, "browser_fetch", _fake_fetch)
+    monkeypatch.setattr(_vendor_api, "credentials", lambda _provider: None)
+    # Only the real live adapters are needed here; an empty in-memory index forces
+    # both searches through fan-out regardless of the surrounding suite's catalog.
+    monkeypatch.setenv("CHUDWARE_PARTS_INDEX_CACHE", "off")
+    hub = hub_module.PartsHub()
+    hub._register_browser_catalog_adapters()
 
     # Electronics allow-list → only electronics vendors fetched.
-    fetched.clear()
-    parts_hub.search("resistor", domain="catalog", limit=20,
-                     sites=["digikey", "lcsc", "snapeda"])
+    try:
+        hub.search("resistor", domain="catalog", limit=20,
+                   sites=["digikey", "lcsc", "snapeda"], include_live=True)
+    finally:
+        with hub_module._LIVE_LOCK:
+            threads = [t for t, stored_owner in hub_module._LIVE_THREADS.items()
+                       if stored_owner == owner]
+        for thread in threads:
+            thread.join()
+    assert fetched, "electronics route did not fetch any vendor"
     assert set(fetched) <= {"digikey", "lcsc", "snapeda"}, fetched
     assert "mcmaster" not in fetched and "onlinemetals" not in fetched
 
     # Metals allow-list → only metals vendors fetched, never DigiKey.
     fetched.clear()
-    parts_hub.search("6061 tube", domain="catalog", limit=20,
-                     sites=["onlinemetals", "metalsdepot"])
+    try:
+        hub.search("6061 tube", domain="catalog", limit=20,
+                   sites=["onlinemetals", "metalsdepot"], include_live=True)
+    finally:
+        with hub_module._LIVE_LOCK:
+            threads = [t for t, stored_owner in hub_module._LIVE_THREADS.items()
+                       if stored_owner == owner]
+        for thread in threads:
+            thread.join()
+    assert fetched, "metals route did not fetch any vendor"
     assert set(fetched) <= {"onlinemetals", "metalsdepot"}, fetched
     assert "digikey" not in fetched and "lcsc" not in fetched

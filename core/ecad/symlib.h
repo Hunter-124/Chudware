@@ -10,7 +10,7 @@ namespace chudware::ecad::symlib {
 // Resolve a SymbolDef by libid ("Device:R"). Returns null json if unknown.
 nlohmann::json resolve_symbol(const std::string& libid);
 
-// Every libid in the built-in catalog, sorted.
+// Every libid in the installed and built-in catalogs, sorted.
 std::vector<std::string> symbol_libids();
 
 // [{libid,name,description,keywords:[..],prefix,pin_count,default_footprint,power:bool}] sorted by libid.

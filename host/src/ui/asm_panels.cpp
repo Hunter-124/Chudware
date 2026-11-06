@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cfloat>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,9 +15,11 @@
 
 #include <map>
 #include <string>
+#include <unordered_map>
 
 #include "imgui.h"
 
+#include "anim.h"
 #include "icons.h"
 #include "layout.h"           // setNextCommandDialogPlacement (floating dialog anchor)
 #include "metrics.h"
@@ -25,9 +28,12 @@
 
 #include "../core/app_state.h"
 #include "../core/doc_mirror.h"
+#include "../core/engine_events.h"
 #include "file_dialog.h"
 #include "toast.h"
 #include "../ui_theme.h"
+#include "../renderer.h"
+#include "../render/overlays.h"
 
 namespace ui {
 
@@ -167,6 +173,7 @@ bool AsmPanels::handleCommand(AppState& st, const std::string& cmdId) {
     if (cmdId == "asm_explode") {
         explodeOpen_ = true; explodeFocus_ = true;
         openPmGuest(st, "explode");
+        beginExplodeSession(st);
         return true;
     }
     if (cmdId == "asm_interference") {
@@ -180,12 +187,15 @@ bool AsmPanels::handleCommand(AppState& st, const std::string& cmdId) {
         if (st.docMirror.hasDoc()) {
             nlohmann::json res; std::string err;
             if (st.worker.call("doc_solve_mates", {{"doc_id", st.docMirror.docId()}}, res, err)) {
-                std::string aicm;
-                if (res.contains("tess") && res["tess"].is_object())
-                    aicm = res["tess"].value("aicm_path", std::string());
-                if (!aicm.empty()) { std::string le; st.loadDocMesh(aicm, le); }
-                st.addLog("[asm] move: re-solved mates — select a component and drag it in the "
-                          "viewport to reposition.");
+                const auto solved = st.docMirror.ingestOpsResponse(res);
+                if (!solved.ok) {
+                    st.addLog("[err] asm_move: " + solved.error_message);
+                } else {
+                    if (!solved.aicm_path.empty())
+                        st.loadDocMeshAsync(solved.aicm_path, false, true, true);
+                    st.addLog("[asm] move: re-solved mates — select a component and drag it in the "
+                              "viewport to reposition.");
+                }
             } else st.addLog("[err] asm_move: " + err);
         }
         return true;
@@ -201,6 +211,7 @@ bool AsmPanels::handleCommand(AppState& st, const std::string& cmdId) {
 namespace { bool mirrorIsAssembly(AppState& st); }
 
 void AsmPanels::draw(AppState& st) {
+    tickExplode(st);
     // Feature-tree "Edit" on a component → open + focus the Mate form for it.
     if (!st.requestEditComponentMates.empty()) {
         const std::string cid = st.requestEditComponentMates;
@@ -219,22 +230,24 @@ void AsmPanels::draw(AppState& st) {
                 targetTab = i;
                 break;
             }
-        if (targetTab < 0 || ImGui::GetTime() > pending.deadline) {
+        if (targetTab < 0 || st.activeTab != targetTab) {
             auto done = std::move(pending.onComplete);
             pending = {};
-            if (done) done(false, targetTab < 0 ? "Target assembly was closed"
-                                               : "Timed out opening the target assembly");
-        } else if (st.activeTab != targetTab ||
-                   (!pending.activationRequested && st.docMirror.docId() != pending.targetDocId)) {
+            if (done) done(InsertOutcome::Superseded, {});
+        } else if (ImGui::GetTime() > pending.deadline) {
+            auto done = std::move(pending.onComplete);
+            pending = {};
+            if (done) done(InsertOutcome::Failure, "Timed out opening the target assembly");
+        } else if (!pending.activationRequested && st.docMirror.docId() != pending.targetDocId) {
             pending.activationRequested = true;
-            st.switchToTab(targetTab);  // async activation when the target is not already bound
+            st.switchToTab(targetTab);  // finish binding the already-selected assembly
         } else if (st.docMirror.docId() == pending.targetDocId && mirrorIsAssembly(st)) {
             auto ready = std::move(pending);
             pending = {};
             std::string aicm;
             if (!insertComponent(st, ready.path, nullptr, aicm,
                                  ready.onComplete, ready.targetDocId) && ready.onComplete)
-                ready.onComplete(false, insertNote_);
+                ready.onComplete(InsertOutcome::Failure, insertNote_);
         }
     }
     // Mate/Insert/Pattern/Explode/Interference draw via PropertyManager::drawBody guest callback.
@@ -244,13 +257,9 @@ void AsmPanels::draw(AppState& st) {
 
 void AsmPanels::insertComponentWhenReady(
     AppState& st, const std::string& path, const std::string& targetDocId,
-    std::function<void(bool, const std::string&)> onComplete) {
-    if (st.docLockedByAgent(targetDocId)) {
-        insertNote_ = st.agentLockReason(targetDocId);
-        st.toast(ui::ToastLevel::Warn, insertNote_);
-        if (onComplete) onComplete(false, insertNote_);
-        return;
-    }
+    InsertCompletion onComplete) {
+    if (pendingLibraryInsert_.onComplete)
+        pendingLibraryInsert_.onComplete(InsertOutcome::Superseded, {});
     pendingLibraryInsert_ = {path, targetDocId, std::move(onComplete),
                              ImGui::GetTime() + 45.0, false};
     st.addLog("[asm] queued library component: " + path);
@@ -264,7 +273,18 @@ void AsmPanels::closeAllToolForms(AppState& st) {
     insertOpen_ = false; insertSel_ = -1; insertChosenPath_.clear(); insertNote_.clear();
     insertTargetDocId_.clear();
     patternOpen_ = false; patternComps_.clear();
+    // A tab switch/close mid-gesture lands the explode where the user left it.
+    if (explodeAnimating_) {
+        explodeAnimating_ = false;
+        explodeShown_ = explodeFactor_ = explodeAnimTo_;
+    }
+    if (st.docMirror.hasDoc() && st.docMirror.docId() == explodeDocId_ &&
+        std::fabs(explodeShown_ - explodeConfirmed_) > 1e-4f)
+        commitExplode(st, explodeShown_);
     explodeOpen_ = false;
+    // The viewport re-asserts its framing hold every frame; the document about to replace this
+    // one must not upload under the explode view's held framing before that happens.
+    if (st.renderer) st.renderer->setFramingFrozen(false);
     interferenceOpen_ = false;
     if (ownedGuest && st.propertyManager && st.propertyManager->guestActive())
         st.propertyManager->closeGuest();
@@ -337,11 +357,11 @@ void AsmPanels::openPmGuest(AppState& st, const char* which) {
                 if (insertComponent(s, insertChosenPath_, nullptr, aicm)) {
                     {
                         size_t slash = insertChosenPath_.find_last_of("/\\");
-                        insertNote_ = "Inserted " + (slash == std::string::npos
+                        insertNote_ = "Inserting " + (slash == std::string::npos
                             ? insertChosenPath_
-                            : insertChosenPath_.substr(slash + 1));
+                            : insertChosenPath_.substr(slash + 1)) + "…";
                     }
-                    s.addLog("[asm] inserted: " + insertChosenPath_);
+                    s.addLog("[asm] inserting: " + insertChosenPath_);
                 }
             } else if (std::strcmp(which, "pattern") == 0) {
                 std::string aicm, err;
@@ -510,7 +530,7 @@ static const char* kInsertFilter =
 
 bool AsmPanels::insertComponent(
     AppState& st, const std::string& path, const nlohmann::json& transform,
-    std::string& aicmOut, std::function<void(bool, const std::string&)> onComplete,
+    std::string& aicmOut, InsertCompletion onComplete,
     const std::string& targetDocId) {
     aicmOut.clear();
     if (path.empty()) {
@@ -534,42 +554,12 @@ bool AsmPanels::insertComponent(
         st.addLog("[err] insert: no target assembly");
         return false;
     }
-    if (st.docLockedByAgent(targetDoc)) {
-        insertNote_ = st.agentLockReason(targetDoc);
-        st.toast(ui::ToastLevel::Warn, insertNote_);
-        return false;
-    }
 
-    // If the live mirror is pointing at a different doc (user switched tabs), re-activate the
-    // intended assembly so the op lands on the right document — never a part or another asm.
-    if (!st.docMirror.hasDoc() || st.docMirror.docId() != targetDoc) {
-        // Prefer switchToTab so camera/session state stays coherent.
-        int tabIdx = -1;
-        for (int i = 0; i < (int)st.docTabs.size(); ++i) {
-            if (st.docTabs[i].docId == targetDoc) { tabIdx = i; break; }
-        }
-        if (tabIdx >= 0) {
-            st.switchToTab(tabIdx);
-        } else {
-            std::string aicm, err;
-            if (!st.docMirror.activate(st.worker, targetDoc, aicm, err)) {
-                insertNote_ = "Could not activate assembly: " + err;
-                st.addLog("[err] insert activate: " + err);
-                return false;
-            }
-            if (!aicm.empty()) { std::string le; st.loadDocMesh(aicm, le); }
-        }
-    }
 
-    if (!mirrorIsAssembly(st) || st.docMirror.docId() != targetDoc) {
-        insertNote_ = "Active document is not the target assembly.";
+    if (!st.isActiveMirrorDoc() || !mirrorIsAssembly(st) || st.docMirror.docId() != targetDoc) {
+        insertNote_ = "The target assembly is not the selected document.";
         st.addLog("[err] insert: active doc is not the target assembly (" +
                   st.docMirror.docId() + " vs " + targetDoc + ")");
-        return false;
-    }
-    if (st.docLockedByAgent(targetDoc)) {
-        insertNote_ = st.agentLockReason(targetDoc);
-        st.toast(ui::ToastLevel::Warn, insertNote_);
         return false;
     }
 
@@ -578,35 +568,37 @@ bool AsmPanels::insertComponent(
 
     nlohmann::json op = {{"op", "asm_insert_component"}, {"source", {{"path", path}}}};
     if (!transform.is_null()) op["transform"] = transform;
-    // Async so large component inserts don't freeze the GL thread. aicmOut is filled
-    // only on the sync path for callers that need it immediately; the mesh reloads in the
-    // drain callback either way. Capture targetDoc so a superseded completion can't load mesh
-    // into a different document.
+    // Large inserts run asynchronously; aicmOut remains empty and the current
+    // completion reloads the mesh only while the target remains selected.
     aicmOut.clear();
     ++st.rebuildsInFlight;
     st.docMirror.applyOpsAsync(st.rpc, st.worker, nlohmann::json::array({op}),
-        [&st, targetDoc, onComplete = std::move(onComplete)](
-            const core::OpsResponse& r, bool applied) {
+        [this, &st, targetDoc, path, onComplete = std::move(onComplete)](
+            const core::OpsResponse& r, bool current) {
             --st.rebuildsInFlight;
+            if (!current || !st.isActiveMirrorDoc() || st.docMirror.docId() != targetDoc) {
+                if (onComplete) onComplete(InsertOutcome::Superseded, {});
+                return;
+            }
             if (!r.ok) {
-                const std::string error = r.error_message.empty() ? "component insert failed"
-                                                                    : r.error_message;
+                const std::string error = r.error_message.empty() ?
+                    (r.error_code.empty() ? "component insert failed" : r.error_code) : r.error_message;
                 st.addLog("[err] insert: " + error);
-                if (onComplete) onComplete(false, error);
+                if (onComplete) {
+                    onComplete(InsertOutcome::Failure, error);
+                } else {
+                    if (insertOpen_ && insertTargetDocId_ == targetDoc && insertChosenPath_ == path)
+                        insertNote_ = "Insert failed: " + error;
+                    st.toast(ui::ToastLevel::Error, "Insert failed: " + error);
+                }
                 return;
             }
-            if (!applied) {
-                // The engine may have accepted the op while another tab superseded this mirror.
-                st.addLog("[asm] insert completed on " + targetDoc +
-                          " (active doc changed — mesh not reloaded here)");
-                for (auto& tab : st.docTabs)
-                    if (tab.docId == targetDoc) tab.meshCacheInvalidated = true;
-                if (onComplete) onComplete(true, {});
-                return;
+            if (!r.aicm_path.empty()) st.loadDocMeshAsync(r.aicm_path);
+            if (onComplete) {
+                onComplete(InsertOutcome::Success, {});
+            } else if (insertOpen_ && insertTargetDocId_ == targetDoc && insertChosenPath_ == path) {
+                insertNote_ = "Inserted " + pathBaseName(path);
             }
-            if (st.docMirror.docId() == targetDoc && !r.aicm_path.empty())
-                st.loadDocMeshAsync(r.aicm_path);
-            if (onComplete) onComplete(true, {});
         });
     return true;
 }
@@ -698,7 +690,7 @@ void AsmPanels::drawInsertBody(AppState& st) {
                     std::string aicm;
                     if (insertComponent(st, c.path, nullptr, aicm)) {
                         insertNote_ = "Inserting " + pathBaseName(c.path) + "\xe2\x80\xa6";
-                        st.addLog("[asm] inserted: " + c.path);
+                        st.addLog("[asm] inserting: " + c.path);
                     }
                 }
             }
@@ -801,7 +793,7 @@ void AsmPanels::drawInsertBody(AppState& st) {
                         std::string aicm;
                         if (insertComponent(st, p, nullptr, aicm)) {
                             insertNote_ = "Inserting " + label + "\xe2\x80\xa6";
-                            st.addLog("[asm] inserted: " + p);
+                            st.addLog("[asm] inserting: " + p);
                         }
                     }
                 }
@@ -888,19 +880,29 @@ bool AsmPanels::typeNeedsThirdRef(const std::string& t) {
     return t == "width" || t == "symmetric";
 }
 
+std::array<uint32_t, 3> AsmPanels::matePickedBodies() const {
+    std::array<uint32_t, 3> bodies{};
+    if (!mateOpen_) return bodies;
+    const int wellCount = typeNeedsThirdRef(selectedMateType_) ? 3 : 2;
+    for (int i = 0; i < wellCount; ++i)
+        if (picks_[i].has) bodies[i] = picks_[i].bodyId;
+    return bodies;
+}
+
 void AsmPanels::presetMateTypeForShot(const std::string& type) {
     selectedMateType_ = type;
     mateError_.clear();
 }
 
 bool AsmPanels::routeAsmPick(const nlohmann::json& selector, const std::string& component,
-                             int /*pickKind*/) {
+                             uint32_t bodyId) {
     if (!mateOpen_) return false;
     // Width / symmetric expose a 3rd well (the jaw / symmetry plane); other types only have 2.
     const int wellCount = typeNeedsThirdRef(effectiveMateType()) ? 3 : 2;
     int w = activeWell_;
     if (w >= wellCount) w = 0;
     picks_[w].has = true;
+    picks_[w].bodyId = bodyId;
     picks_[w].selector = selector;
     picks_[w].component = component;
     picks_[w].surf = classifySurf(selector);
@@ -937,11 +939,6 @@ bool AsmPanels::addMate(AppState& st, const std::string& type, const std::string
                         const nlohmann::json& refs, std::string& aicmOut) {
     aicmOut.clear();
     if (!st.docMirror.hasDoc()) return false;
-    if (st.docLockedByAgent(st.docMirror.docId())) {
-        mateError_ = st.agentLockReason(st.docMirror.docId());
-        st.toast(ui::ToastLevel::Warn, mateError_);
-        return false;
-    }
     nlohmann::json mate = {
         {"type", type}, {"align", align}, {"suppressed", false}, {"value", nullptr}, {"refs", refs}};
     // ---- value object per the engine contract (schema.py MATE_VALUE_TYPES / MATE_COUPLING_SPEC) ----
@@ -1214,11 +1211,6 @@ bool AsmPanels::addPattern(AppState& st, std::string& aicmOut, std::string& erro
     aicmOut.clear();
     errorOut.clear();
     if (!st.docMirror.hasDoc()) { errorOut = "No assembly open."; return false; }
-    if (st.docLockedByAgent(st.docMirror.docId())) {
-        errorOut = st.agentLockReason(st.docMirror.docId());
-        st.toast(ui::ToastLevel::Warn, errorOut);
-        return false;
-    }
     if (patternComps_.empty()) { errorOut = "Pick at least one seed component."; return false; }
 
     const char* dirRef = kAsmDirOpts[patternDir_].ref;
@@ -1361,13 +1353,11 @@ void AsmPanels::kickExplodeAsync(AppState& st) {
     const int gen = ++explodeGen_;
     const bool active = explodePendingActive_;
     const float factor = explodePendingFactor_;
-    // Optimistic UI: slider already owns explodeFactor_; keep active flag in step with pending.
-    explodeActive_ = active;
-    explodeFactor_ = factor;
-    nlohmann::json params = {{"doc_id", st.docMirror.docId()},
+    const std::string docId = st.docMirror.docId();
+    nlohmann::json params = {{"doc_id", docId}, {"origin", "system"},
                              {"active", active}, {"factor", factor}};
     st.rpc.call("doc_set_explode_state", std::move(params),
-                [this, &st, gen, active, factor](const core::RpcResult& r) {
+                [this, &st, gen, active, factor, docId](const core::RpcResult& r) {
                     explodeInFlight_ = false;
                     if (gen != explodeGen_) {
                         if (explodePending_) kickExplodeAsync(st);
@@ -1378,28 +1368,208 @@ void AsmPanels::kickExplodeAsync(AppState& st) {
                     } else if (r.result.is_object() && r.result.contains("code")) {
                         st.addLog("[err] explode: " +
                                   r.result.value("message", std::string()));
-                    } else {
+                    } else if (docId == explodeDocId_) {
+                        const nlohmann::json& ex = r.result.contains("explode")
+                            ? r.result["explode"] : nlohmann::json();
+                        if (ex.is_object()) {
+                            explodeAuto_ = ex.value("automatic", false);
+                            explodeComps_.clear();
+                            for (const auto& c : ex.value("components", nlohmann::json::array())) {
+                                const auto& v = c.value("vector", nlohmann::json());
+                                const auto& ctr = c.value("center", nlohmann::json());
+                                if (!v.is_array() || v.size() != 3) continue;
+                                ExplodeComp comp;
+                                for (int k = 0; k < 3; ++k) {
+                                    comp.vec[k] = v[k].get<float>();
+                                    comp.center[k] = ctr.is_array() && ctr.size() == 3
+                                        ? ctr[k].get<float>() : 0.0f;
+                                }
+                                for (const auto& id : c.value("body_ids", nlohmann::json::array()))
+                                    if (id.is_number_unsigned()) comp.bodyIds.push_back(id.get<uint32_t>());
+                                explodeComps_.push_back(std::move(comp));
+                            }
+                            explodeBoundsValid_ = false;
+                            const auto& bounds = ex.value("bounds", nlohmann::json());
+                            auto readBox = [&](const char* key, float out[6]) {
+                                const auto& b = bounds.is_object() ? bounds.value(key, nlohmann::json())
+                                                                   : nlohmann::json();
+                                if (!b.is_object()) return false;
+                                const auto& lo = b.value("min", nlohmann::json());
+                                const auto& hi = b.value("max", nlohmann::json());
+                                if (!lo.is_array() || !hi.is_array() || lo.size() != 3 || hi.size() != 3)
+                                    return false;
+                                for (int k = 0; k < 3; ++k) {
+                                    out[k] = lo[k].get<float>();
+                                    out[k + 3] = hi[k].get<float>();
+                                }
+                                return true;
+                            };
+                            explodeBoundsValid_ = readBox("collapsed", explodeCollapsedBox_) &&
+                                                  readBox("exploded", explodeExplodedBox_);
+                        }
+                        explodeConfirmed_ = active ? factor : 0.0f;
                         std::string aicm;
                         if (r.result.contains("tess") && r.result["tess"].is_object())
                             aicm = r.result["tess"].value("aicm_path", std::string());
-                        if (!aicm.empty()) { std::string le; st.loadDocMesh(aicm, le); }
-                        explodeActive_ = active;
-                        explodeFactor_ = factor;
+                        bool reload = false;
+                        if (!aicm.empty() && st.isActiveMirrorDoc() &&
+                            st.docMirror.docId() == docId &&
+                            r.result.value("revision", -1) == st.docMirror.revision()) {
+                            st.loadDocMeshAsync(aicm);
+                            reload = true;
+                        } else if (r.result.is_object() && st.isActiveMirrorDoc() &&
+                                 st.docMirror.docId() == docId &&
+                                 r.result.value("revision", -1) >= st.docMirror.revision() &&
+                                 (r.result.value("revision", -1) > st.docMirror.revision() ||
+                                  !r.result.contains("tess") || !r.result["tess"].is_object() ||
+                                  r.result["tess"].contains("mesh_error") ||
+                                  !r.result["tess"].contains("aicm_path"))) {
+                            core::requireDocMesh(docId, r.result.value("revision", 0));
+                            reload = true;
+                        }
+                        // The next active-mesh replacement carries this factor; until then the
+                        // GPU offsets keep bridging from the old bake (tickExplode).
+                        if (reload && st.renderer) {
+                            explodeAwaitMesh_ = true;
+                            explodeAwaitGen_ = st.renderer->meshGeneration();
+                        }
+                        ui::anim::requestFrames();
                     }
                     if (explodePending_) kickExplodeAsync(st);
                 }, /*timeoutMs=*/60000);
 }
 
+void AsmPanels::syncExplodeDoc(AppState& st) {
+    const std::string docId = st.docMirror.hasDoc() ? st.docMirror.docId() : std::string();
+    if (docId == explodeDocId_) return;
+    explodeDocId_ = docId;
+    explodeComps_.clear();
+    explodeBoundsValid_ = false;
+    explodeAnimating_ = false;
+    explodeAwaitMesh_ = false;
+    explodeFactor_ = explodeShown_ = explodeBaked_ = explodeConfirmed_ = 0.0f;
+}
+
+void AsmPanels::beginExplodeSession(AppState& st) {
+    if (!st.docMirror.hasDoc()) return;
+    syncExplodeDoc(st);
+    commitExplode(st, explodeShown_);
+}
+
+void AsmPanels::commitExplode(AppState& st, float factor) {
+    // Latest wins: one call in flight, the newest factor queued behind it; never blocks GL.
+    explodePendingActive_ = factor > 0.001f;
+    explodePendingFactor_ = explodePendingActive_ ? factor : 0.0f;
+    explodePending_ = true;
+    kickExplodeAsync(st);
+}
+
 bool AsmPanels::setExplode(AppState& st, bool active, float factor) {
     if (!st.docMirror.hasDoc()) return false;
-    // Coalesce rapid slider samples to latest factor; never block GL.
-    explodePendingActive_ = active;
-    explodePendingFactor_ = factor;
-    explodePending_ = true;
-    explodeFactor_ = factor;  // slider tracks immediately
-    explodeActive_ = active;
-    kickExplodeAsync(st);
+    syncExplodeDoc(st);
+    explodeAnimating_ = false;
+    explodeFactor_ = explodeShown_ = active ? std::clamp(factor, 0.0f, 1.0f) : 0.0f;
+    commitExplode(st, explodeShown_);
     return true;
+}
+
+void AsmPanels::animateExplodeTo(AppState& st, float target) {
+    const float span = std::fabs(target - explodeShown_);
+    if (span < 1e-4f) return;
+    explodeAnimFrom_ = explodeShown_;
+    explodeAnimTo_ = target;
+    explodeAnimT0_ = ImGui::GetTime();
+    explodeAnimDur_ = 0.35 + 0.55 * span;  // a full explode reads in ~0.9 s
+    explodeAnimating_ = true;
+    // The camera eases onto where the parts are heading in step with them, so an explode never
+    // flies parts out of view and a collapse closes back in on the assembly.
+    if (explodeBoundsValid_) {
+        const float* box = target < 1e-4f ? explodeCollapsedBox_ : explodeExplodedBox_;
+        for (int k = 0; k < 3; ++k) {
+            st.zoomToBBoxMin[k] = box[k];
+            st.zoomToBBoxMax[k] = box[k + 3];
+        }
+        st.zoomToBBoxRequested = true;
+    }
+    ui::anim::requestFrames();
+}
+
+void AsmPanels::previewExplode(float factor) {
+    explodeAnimating_ = false;
+    explodeFactor_ = explodeShown_ = std::clamp(factor, 0.0f, 1.0f);
+    ui::anim::requestFrames();
+}
+
+bool AsmPanels::explodeHoldsFraming(const AppState& st) const {
+    if (!st.docMirror.hasDoc() || st.docMirror.docId() != explodeDocId_) return false;
+    return explodeOpen_ || explodeAnimating_ || explodeAwaitMesh_ || explodeShown_ > 1e-4f ||
+           explodeBaked_ > 1e-4f;
+}
+
+void AsmPanels::tickExplode(AppState& st) {
+    Renderer* r = st.renderer;
+    if (!r) return;
+    if (!st.docMirror.hasDoc() || st.docMirror.docId() != explodeDocId_) {
+        if (explodeOffsetsSet_) r->setBodyOffsets({});
+        explodeOffsetsSet_ = false;
+        return;
+    }
+    if (explodeAnimating_) {
+        const double p = explodeAnimDur_ > 0.0
+            ? std::clamp((ImGui::GetTime() - explodeAnimT0_) / explodeAnimDur_, 0.0, 1.0) : 1.0;
+        const double e = p < 0.5 ? 4.0 * p * p * p : 1.0 - std::pow(-2.0 * p + 2.0, 3.0) / 2.0;
+        explodeShown_ = explodeFactor_ =
+            explodeAnimFrom_ + (explodeAnimTo_ - explodeAnimFrom_) * static_cast<float>(e);
+        if (p >= 1.0) {
+            explodeAnimating_ = false;
+            explodeShown_ = explodeFactor_ = explodeAnimTo_;
+            commitExplode(st, explodeAnimTo_);  // bake once the motion settles
+        }
+        ui::anim::requestFrames();
+    }
+    if (explodeAwaitMesh_ && r->meshGeneration() != explodeAwaitGen_) {
+        explodeBaked_ = explodeConfirmed_;
+        explodeAwaitMesh_ = false;
+    }
+    const float delta = explodeShown_ - explodeBaked_;
+    if (std::fabs(delta) < 1e-4f || explodeComps_.empty()) {
+        if (explodeOffsetsSet_) r->setBodyOffsets({});
+        explodeOffsetsSet_ = false;
+        return;
+    }
+    std::unordered_map<uint32_t, Vec3> offsets;
+    for (const ExplodeComp& c : explodeComps_) {
+        const Vec3 v(c.vec[0] * delta, c.vec[1] * delta, c.vec[2] * delta);
+        for (uint32_t id : c.bodyIds) offsets[id] = v;
+    }
+    r->setBodyOffsets(std::move(offsets));
+    explodeOffsetsSet_ = true;
+}
+
+void AsmPanels::drawExplodeLines(AppState& st) {
+    if (!explodeLines_ || !(explodeOpen_ || explodeAnimating_) || !st.overlays || !st.renderer)
+        return;
+    if (!st.docMirror.hasDoc() || st.docMirror.docId() != explodeDocId_ || explodeShown_ < 1e-3f)
+        return;
+    // Dashes sized to the scene so they read the same on a pin and on a vehicle.
+    const float dash = std::max(st.renderer->modelRadius(), 1.0f) * 0.01f;
+    explodeLineXyz_.clear();
+    for (const ExplodeComp& c : explodeComps_) {
+        const float d[3] = {c.vec[0] * explodeShown_, c.vec[1] * explodeShown_,
+                            c.vec[2] * explodeShown_};
+        const float len = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        if (len < 2.0f * dash) continue;
+        const int dashes = std::min(96, static_cast<int>(len / (2.0f * dash)));
+        for (int i = 0; i < dashes; ++i) {
+            const float t0 = (2.0f * i * dash) / len;
+            const float t1 = std::min(1.0f, ((2.0f * i + 1.0f) * dash) / len);
+            for (float t : {t0, t1})
+                for (int k = 0; k < 3; ++k) explodeLineXyz_.push_back(c.center[k] + d[k] * t);
+        }
+    }
+    const auto& pal = ui::palette;
+    const float rgba[4] = {pal.accent[0], pal.accent[1], pal.accent[2], 0.85f};
+    st.overlays->drawSegments(st.renderer->camera(), explodeLineXyz_, rgba, 1.4f, false);
 }
 
 void AsmPanels::drawExplodeBody(AppState& st) {
@@ -1408,20 +1578,27 @@ void AsmPanels::drawExplodeBody(AppState& st) {
     ImGui::TextUnformatted("Explode factor");
     ImGui::Spacing();
     ImGui::SetNextItemWidth(-1);
-    if (ImGui::SliderFloat("##explode_factor", &explodeFactor_, 0.0f, 1.0f, "%.2f")) {
-        setExplode(st, explodeFactor_ > 0.001f, explodeFactor_);
-    }
+    // Dragging slides parts on the GPU every frame; the engine bakes once on release.
+    float slider = explodeFactor_;
+    if (ImGui::SliderFloat("##explode_factor", &slider, 0.0f, 1.0f, "%.2f")) previewExplode(slider);
+    if (ImGui::IsItemDeactivatedAfterEdit()) releaseExplode(st);
     pushText(ui::palette.textDim);
-    ImGui::TextWrapped("View-only — drag to slide components apart along their explode vectors.");
+    if (explodeComps_.empty() && explodeInFlight_)
+        ImGui::TextWrapped("Planning explode…");
+    else if (explodeComps_.empty())
+        ImGui::TextWrapped("Nothing to explode: every component stays in place.");
+    else if (explodeAuto_)
+        ImGui::TextWrapped("Automatic layout: each part leaves the part it sits in along its "
+                           "mate axis or nearest open side. View-only.");
+    else
+        ImGui::TextWrapped("Authored explode steps. View-only.");
     ImGui::PopStyleColor();
     ImGui::Spacing();
-    if (ImGui::Button("Collapse", ImVec2(ui::metrics::asmBtnW(), 0))) {
-        explodeFactor_ = 0.0f; setExplode(st, false, 0.0f);
-    }
+    if (ImGui::Button("Collapse", ImVec2(ui::metrics::asmBtnW(), 0))) animateExplodeTo(st, 0.0f);
     ImGui::SameLine();
-    if (ImGui::Button("Exploded", ImVec2(ui::metrics::asmBtnW(), 0))) {
-        explodeFactor_ = 1.0f; setExplode(st, true, 1.0f);
-    }
+    if (ImGui::Button("Exploded", ImVec2(ui::metrics::asmBtnW(), 0))) animateExplodeTo(st, 1.0f);
+    ImGui::Spacing();
+    ImGui::Checkbox("Explode lines", &explodeLines_);
 }
 
 // ===========================================================================

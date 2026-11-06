@@ -1,8 +1,8 @@
 #pragma once
 
 // Private conversation persistence: one active immutable snapshot and one coalesced pending
-// snapshot. The UI never takes a lock held across storage calls. Explicit barriers wait for
-// one attempt, not forever on an unavailable filesystem; failed snapshots remain pending.
+// snapshot. JSON encoding, archive appends, and temp/fsync/rename writes all run on the writer.
+// The UI only submits; load/shutdown barriers wait for one attempt, retaining failed snapshots.
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -15,11 +15,14 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <functional>
+#include <deque>
 
 namespace ui::chat_persistence {
 using Bytes = std::shared_ptr<const std::string>;
 struct Snapshot {
     std::map<std::string, Bytes> files;
+    std::map<std::string, std::function<Bytes()>> serialized;
     std::string indexPath;
     std::string directory;
     std::set<std::string> keep;
@@ -46,6 +49,10 @@ public:
                     if (it->first != draftPath_) it = pending_.files.erase(it);
                     else ++it;
                 }
+                for (auto it = pending_.serialized.begin(); it != pending_.serialized.end();) {
+                    if (it->first != draftPath_) it = pending_.serialized.erase(it);
+                    else ++it;
+                }
                 pending_.history = true;
                 pending_.directory = std::move(snapshot.directory);
                 pending_.indexPath = std::move(snapshot.indexPath);
@@ -53,8 +60,21 @@ public:
                 pending_.owned.insert(snapshot.owned.begin(), snapshot.owned.end());
             } else if (!snapshot.files.empty()) {
                 draftPath_ = snapshot.files.begin()->first;
+            } else if (!snapshot.serialized.empty()) {
+                draftPath_ = snapshot.serialized.begin()->first;
             }
             for (auto& [path, bytes] : snapshot.files) pending_.files[path] = std::move(bytes);
+            for (auto& [path, encode] : snapshot.serialized)
+                pending_.serialized[path] = std::move(encode);
+            ++requested_;
+            retry_ = false;
+        }
+        wake_.notify_one();
+    }
+    void append(std::function<void()> record) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            raw_.push_back(std::move(record));
             ++requested_;
             retry_ = false;
         }
@@ -62,7 +82,8 @@ public:
     }
     bool flush() {
         std::unique_lock<std::mutex> lock(mutex_);
-        if (pending_.files.empty() && !active_) return error_.empty();
+        if (pending_.files.empty() && pending_.serialized.empty() && raw_.empty() && !active_)
+            return error_.empty();
         const auto target = ++requested_;
         retry_ = false;
         wake_.notify_one();
@@ -81,7 +102,10 @@ public:
         durable_.clear();
     }
 private:
-    bool write(const Snapshot& snapshot, std::string& error) {
+    bool write(Snapshot snapshot, std::string& error) {
+        for (const auto& [path, encode] : snapshot.serialized)
+            snapshot.files[path] = encode();
+        snapshot.serialized.clear();
         namespace fs = std::filesystem;
         owned_.insert(snapshot.owned.begin(), snapshot.owned.end());
         auto save = [&](const std::string& path, const Bytes& bytes) {
@@ -160,12 +184,17 @@ private:
             else wake_.wait(lock, [&] { return stopping_ || requested_ > attempted_; });
             if (stopping_) return;
             Snapshot snapshot = pending_;
+            std::deque<std::function<void()>> raw;
+            raw.swap(raw_);
             const auto generation = requested_;
             active_ = true;
             lock.unlock();
             std::string error;
             bool ok = false;
-            try { ok = write(snapshot, error); }
+            try {
+                for (auto& append : raw) append();
+                ok = write(std::move(snapshot), error);
+            }
             catch (const std::exception& e) { error = std::string("[chat] durable save failed: ") + e.what(); }
             catch (...) { error = "[chat] durable save failed (pending state retained)"; }
             lock.lock();
@@ -181,6 +210,7 @@ private:
     std::mutex mutex_;
     std::condition_variable wake_, done_;
     Snapshot pending_;
+    std::deque<std::function<void()>> raw_;
     std::map<std::string, Bytes> durable_;
     std::set<std::string> owned_, pruneNeedsSync_, needsDurable_;
     std::string draftPath_, error_, reported_;

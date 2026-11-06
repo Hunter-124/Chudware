@@ -1,218 +1,195 @@
 # Chudware
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+Chudware is open-source parametric CAD for engineers. Its native C++ application uses
+[Open CASCADE Technology](https://www.opencascade.com/) for B-rep geometry and keeps
+parts in a human-editable feature history. Build with constrained sketches and features,
+then revisit the relations and dimensions that define the design.
 
-Chudware is an open-source parametric CAD application: a native C++ desktop app with a
-ribbon UI, a feature tree, property panels, and a constraint-solver sketcher, built on the
-**OpenCASCADE** B-rep kernel. One document model sits under mechanical design, drawings,
-CAM, ECAD, and simulation. A built-in AI copilot and an **MCP server** let the same document
-be driven by hand, by the copilot, or by any external agent (Claude Code, Cursor, …).
+Agent-assisted modeling brings a team of agents together across the workspace to work on
+engineering tasks and create editable histories, using geometric relations and critical
+dimensions rather than treating the result as a disposable mesh. You can also work directly
+in the desktop interface or connect an external agent through MCP.
 
-Website: <https://chudware.com>
+![Chudware modeling workspace](docs/media/modeling.png)
 
-![Part modeling with the copilot panel](website/public/images/modeling.png)
+![Sequence of captured modeling steps in Chudware](docs/media/modeling.gif)
 
-| Simulation | Manufacturing |
-|---|---|
-| ![Static FEA results](website/public/images/fea.png) | ![CAM toolpaths](website/public/images/cam.png) |
+*The animation is a sequence of real captured modeling steps, not a continuous recording.*
 
-## Features
+![Captured static FEA visualization in Chudware](docs/media/simulation.png)
 
-- **Mechanical CAD:** sketches with a constraint solver; extrude, revolve, sweep, loft, rib,
-  shell, draft, fillet, chamfer, hole wizard, thread, patterns, mirror; surfacing; multi-body
-  operations; weldments; sheet metal.
-- **Assemblies and drawings:** mates, standard-parts library, exploded views, BOM,
-  interference checks; 2D drawings.
-- **CAM:** milling, turning, and laser/plasma/waterjet processes with toolpath simulation;
-  post-processors for GRBL, LinuxCNC, Fanuc, Haas, Mach3, Centroid, Marlin, and Siemens
-  (sample output in [docs/cam_samples/](docs/cam_samples)).
-- **ECAD and firmware:** schematic capture, PCB layout, SPICE simulation, Gerber output.
-- **Simulation:** static, modal, thermal, and fatigue FEA; motion; LBM wind tunnel and
-  OpenFOAM CFD; electromagnetics.
-- **PLM:** built-in, git-backed version history for projects.
-- **AI copilot:** chat-driven modeling and review inside the app, using your own model
-  provider credentials or offline local models; every agent edit goes through the same
-  document operations as the GUI.
-- **MCP server:** the full modeling surface exposed over stdio JSON-RPC to external agents.
-- **Interop:** STEP, IGES, BREP, STL, 3MF, OBJ, PLY, glTF, and 3DM import/export around the
-  native `.step+` document; SolidWorks import through the SolidWorks COM API where it is
-  installed.
+## What is here
+
+Chudware brings several engineering workflows into one project:
+
+- Parametric parts, assemblies and drawings, with a native `.step+` document and
+  build-dependent import/export options.
+- Manufacturing tools including CAM, and an electronics project hub using KiCad 10 for
+  schematic/PCB editing, checks and fabrication output; agents edit through ECAD operations.
+- Simulation and design tools, including structural FEA, fluid flow, piping networks and
+  industrial sizing. The generated [simulation](docs/manual/guide-simulation.md),
+  [piping](docs/manual/guide-piping.md) and [industrial](docs/manual/guide-industrial.md)
+  guides describe individual workflows and their limits.
+
+Availability depends on the build, platform, format, solver and installed external tools;
+the browser image does not provide full desktop parity. An available command or an example
+is not proof that a result is suitable for a particular engineering decision. Check its
+assumptions, convergence and applicable evidence. The
+[format reference](docs/reference/README.md#how-this-fits-into-chudwares-interop-work)
+distinguishes implemented capabilities from reference and planned work.
 
 ## Project status
 
-Chudware is under active development and has not reached 1.0; file formats and APIs can
-still change between releases. The desktop app builds on Linux, Windows, and macOS.
-Prebuilt installers are published on
-[GitHub Releases](https://github.com/Hunter-124/Chudware/releases), and the in-app updater
-installs new releases after verifying their signed update manifest. No account is required.
-On Linux, the release install script downloads and verifies the right package for your
-distribution:
+Chudware is under active development and has not reached 1.0. File formats and APIs can
+change. Existing GitHub releases are prereleases; there is no current public stable desktop
+installer or stable `/releases/latest` installation path. Build from source or use the
+experimental self-hosted browser deployment below.
+
+The optional owner-operated paid hosting offering supports the open-source project and
+covers operation and convenience; it does not unlock software features. There is no public
+checkout or promise of current availability. [Contact the project](https://chudware.com/contact)
+for hosting inquiries.
+
+## Start in your browser
+
+The experimental Compose deployment is for **one trusted operator** on a Linux x86-64 host.
+Anyone who can reach the gateway controls that operator's workspace; it is not a multi-user
+service. Online Copilot is unavailable in this deployment.
+
+The default image uses the moving `edge` development channel. If the image has been
+published and made accessible, start it with:
 
 ```bash
-curl -fsSL https://github.com/Hunter-124/Chudware/releases/latest/download/install.sh | sh
+git clone --depth 1 https://github.com/Hunter-124/Chudware.git
+cd Chudware
+docker compose -f web/compose.yaml up --pull always --no-build -d --wait
 ```
 
-It accepts `--version <V>` and `--format deb|rpm|appimage`. The browser build of the app is
-experimental (see [Self-hosted web app](#self-hosted-web-app-experimental)).
+Open <http://127.0.0.1:8300/app/>. You need Git, Docker Engine with Compose v2 2.24.4 or
+newer, and nested unprivileged user namespaces. Ubuntu 24.04+ may require the
+[AppArmor host setup](web/README.md#ubuntu-2404-apparmor-setup) before starting Compose.
+A current browser with WebAssembly, WebGL2 and cross-origin-isolated shared memory is
+required. The shallow clone can be replaced with a full clone by omitting `--depth 1`.
+
+See the [web deployment guide](web/README.md) for source builds, image pinning, the trust
+boundary, persistence, backups, authenticated HTTPS and feature limitations. A source build
+is an alternative when the image is unavailable.
 
 ## Building from source
 
-Requirements:
+The desktop build needs a C++20 toolchain, CMake 3.24+, Ninja, OCCT 7.9.x, Python 3.13
+(3.12 also works) and Git. Linux also needs the X11/Wayland/OpenGL and libcurl development
+libraries; other native dependencies are fetched at pinned versions. Internet access is
+needed for the source dependencies and Python packages. The optional online-agent SDK is
+installed by the development Python provisioning step; its executable is obtained separately.
+Install KiCad 10 separately for electronics editing, checks and exports; it is a
+recommended companion application and is not bundled with Chudware.
 
-- a C++20 toolchain (GCC or Clang on Linux, AppleClang on macOS, Visual Studio 2022 on
-  Windows), CMake 3.24+, and Ninja;
-- OCCT 7.9 (Linux: the distro development package, for example Fedora `opencascade-devel`;
-  macOS: Homebrew `opencascade`; Windows: downloaded by CMake), plus SuiteSparse, libcurl,
-  and X11/Wayland/OpenGL development headers on Linux;
-- Python 3.13 (3.12 also works) and `git` on `PATH` for the Python services: the MCP
-  server, the copilot's agent host, and the test suites.
-
-On Fedora, `sudo .github/scripts/install-fedora-deps.sh` installs the same packages CI uses
-(add `gate` for the extra tools `scripts/gate.sh` runs).
-
-Other C++ dependencies (Eigen, GLFW, Dear ImGui, nlohmann/json, Clipper2, …) are fetched at
-pinned versions by CMake. The embedded CEF browser is optional: fetch its SDK with
-`scripts/fetch_cef_posix.sh`, or configure the host with `-DCHUDWARE_ENABLE_CEF=OFF`.
+For a Fedora Linux source checkout, the following configures the OCCT engine tree consumed
+by the GUI and builds the app without the optional embedded CEF browser backend:
 
 ```bash
 git clone https://github.com/Hunter-124/Chudware.git
 cd Chudware
-
-# Python service environment (.venv-mcp); extra arguments go to pip, e.g. `pytest`
+sudo .github/scripts/install-fedora-deps.sh
 PYTHON=python3.13 scripts/provision_venv.sh pytest
-
-# Native build: core (libchudware + chudware-hostd), then the GUI, then the daemon
+cmake -S core -B core/build-occt-linux -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release -DCHUDWARE_WITH_OCCT=ON
+cmake -S host -B host/build-linux -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release -DCHUDWARE_ENABLE_CEF=OFF
 ./build.sh all
 ```
 
-`scripts/provision_venv.sh` creates `.venv-mcp`, installs `requirements.txt` from PyPI
-(`chudcode-rpc` is built from the pinned Chudcode commit, hence `git`), and runs the runtime
-dependency audit; `python3.13 -m venv .venv-mcp && .venv-mcp/bin/python -m pip install -r
-requirements.txt` is the manual equivalent. `./build.sh` is a thin wrapper over CMake; its
-header lists every mode (`app|core|daemon|wasm|all|stage|clean`), and bare `./build.sh`
-rebuilds only the GUI.
-Core-only builds can also use the CMake presets in [CMakePresets.json](CMakePresets.json)
-(`cmake --preset linux-core`). Windows builds use the `windows-*` presets from a Visual
-Studio 2022 developer prompt; see [docs/reference/BUILD_WINDOWS.md](docs/reference/BUILD_WINDOWS.md).
-On macOS the build tree is `host/build-macos-<arch>/`.
+Set `CMAKE_BUILD_PARALLEL_LEVEL=1` before `./build.sh all` to keep native builds
+single-job on memory-constrained machines.
 
-### Running
+The provisioning script creates `.venv-mcp`, installs `requirements.txt` including the
+hash-pinned official OMP SDK source, and audits runtime dependencies. To enable CEF, obtain
+its SDK with `scripts/fetch_cef_posix.sh` and configure the host accordingly. Linux and
+macOS use system OCCT; on Windows CMake provisions its pinned OCCT SDK. See the
+[Windows build guide](docs/reference/BUILD_WINDOWS.md),
+[CMake presets](CMakePresets.json) and [`build.sh`](build.sh) for other targets and build
+modes. macOS uses `host/build-macos-<arch>/`.
+
+### Optional online agent setup
+
+Native online Copilot uses the official [Oh My Pi](https://github.com/can1357/oh-my-pi)
+(OMP) runtime as a separate process. For Linux x86-64, download and verify the pinned
+executable and export the path reported by the verifier:
+
+```bash
+OMP_RESULT=$(.venv-mcp/bin/python scripts/pin_omp.py ensure --target linux-x86_64 \
+    --cache-dir "$HOME/.cache/chudware/omp") &&
+CHUDWARE_OMP_BIN=$(printf '%s\n' "$OMP_RESULT" | .venv-mcp/bin/python -c \
+    'import json, sys; print(json.load(sys.stdin)["path"])') &&
+export CHUDWARE_OMP_BIN
+```
+
+Configure your own provider credentials and model; Chudware does not sell model tokens.
+The SDK, runtime and a usable provider/model are all required for online Copilot. The
+cache directory is not itself an automatic executable discovery path. Set the variable
+before starting the app; an already-running shared daemon may retain its earlier environment.
+The [OMP integration guide](docs/dev/omp-integration.md) covers other platforms, runtime
+discovery and session lifecycle. This native setup does not enable browser online Copilot.
+
+## Running
+
+From the Linux checkout, with the service environment provisioned:
 
 ```bash
 CHUDWARE_PYTHON="$PWD/.venv-mcp/bin/python" CHUDWARE_REPO="$PWD" ./host/build-linux/bin/chudware
 ```
 
-The GUI starts the shared engine daemon `chudware-hostd` on demand and attaches to it over
-local IPC; see [docs/reference/HOSTD.md](docs/reference/HOSTD.md) for its lifecycle.
-
-The copilot's online agent runtime, [Chudcode](https://github.com/Hunter-124/chudcode), is
-a separate binary (`chud`) pinned by `vendor/chudcode/CHUDCODE_ARTIFACT.lock`; release
-packages ship it beside the bundled Python runtime. For a source build, download and verify
-the pinned release and point Chudware at it:
-
-```bash
-.venv-mcp/bin/python scripts/pin_chudcode.py ensure --target linux-x86_64 \
-    --cache-dir ~/.cache/chudware/chudcode     # prints JSON with the verified path
-export CHUDWARE_CHUDCODE_BIN=<path printed above>
-```
-
-Targets are `linux-x86_64`, `macos-x86_64`, and `windows-x86_64` (`macos-arm64` is not
-pinned yet). Without the runtime, online copilot turns are unavailable; the offline
-local-model fallback still works.
-
-### Testing
-
-```bash
-.venv-mcp/bin/python scripts/check.py                       # fast source and audit checks
-CHUDWARE_GATE_PYTHON=.venv-mcp/bin/python bash scripts/gate.sh   # full Linux gate
-.venv-mcp/bin/python -m pytest services/mcp -q              # one Python suite
-```
-
-The gate runs `check.py`, the core and GUI builds, ctest, the Python suites, and headless
-smoke tests. Environment-dependent stages (no OCCT, no `xvfb-run`, no emsdk) report SKIP
-rather than failing. [CONTRIBUTING.md](CONTRIBUTING.md) has the details.
+The GUI normally starts and connects to the shared `chudware-hostd` engine over local IPC.
+See the [daemon reference](docs/reference/HOSTD.md) for its lifecycle.
 
 ## MCP server
 
-The MCP server ([services/mcp/](services/mcp)) is a local stdio JSON-RPC server that exposes
-the full modeling surface; its `cad_guide` tool carries modeling, CAM, and ECAD guidance.
-Register it with your agent clients (Claude Code, Cursor, VS Code, opencode, …):
+The local MCP server lets compatible external agents use Chudware's available tools. To
+register it with supported clients using the provisioned environment:
 
 ```bash
-python3 services/installer/setup_mcp_clients.py            # Windows: mcp_setup.bat
-python3 services/installer/setup_mcp_clients.py --detect   # verify the registration
+.venv-mcp/bin/python services/installer/setup_mcp_clients.py --python "$PWD/.venv-mcp/bin/python" --dry-run
+.venv-mcp/bin/python services/installer/setup_mcp_clients.py --python "$PWD/.venv-mcp/bin/python"
+.venv-mcp/bin/python services/installer/setup_mcp_clients.py --detect
 ```
 
-The server id is `chudware`. Agent edits made over MCP appear live in an open GUI because
-both attach to the same `chudware-hostd` engine.
+Registration can change project and user client configuration; inspect the dry run first.
+Tool and backend availability still depend on the active build and configuration.
 
-## Architecture
+## Documentation and quality
 
-The C++ kernel **`libchudware`** ([core/](core)) is the engine. The C++ GUI ([host/](host))
-talks to the shared **`chudware-hostd`** daemon, which loads `libchudware`, over local IPC.
-Python under [services/](services) provides the MCP server, the copilot's agent host
-(online turns run in the embedded [Chudcode](https://github.com/Hunter-124/chudcode)
-runtime), the services worker, the installer, and helpers with no C++ counterpart.
-
-```
-            ┌──────────────────────────────────────────────────────┐
-            │  Chudware GUI (host/, native C++; same tree → WASM)  │
- user ─────▶│  ribbon / sketcher / viewport (GL)    copilot chat   │
-            └───────┬──────────────────────────────────────────────┘
-                    │ local IPC
-                    ▼
-            chudware-hostd ──dlopen──▶ libchudware (core C++ engine)
-                    │ stdio  ▲
-                    ▼        │
-     services.worker_main    └──── external agent via MCP server
-     (services-side methods,       (services/mcp, stdio JSON-RPC)
-      copilot agent turns)
-```
-
-[ARCHITECTURE.md](ARCHITECTURE.md) describes the components, data flow, and RPC contracts;
-[contracts/](contracts/README.md) holds the frozen interface contracts.
-
-## Self-hosted web app (experimental)
-
-The same `host/src/ui` tree compiles to WebAssembly. The browser build is served by a small
-gateway that connects each session to a `chudware-hostd` tenant cell. It is intended to
-become self-hostable; today it is experimental and not feature-complete. See
-[web/README.md](web/README.md).
-
-## Repository layout
-
-| Path | Contents |
-|------|----------|
-| [core/](core) | C++ kernel → `libchudware` (geometry, document, sketch, solver, CAM, simulation, ECAD, agent), plus the `chudware-hostd` daemon |
-| [host/](host) | The GUI (native and WASM) and its OpenGL renderer |
-| [services/](services) | Host-side C++ routing/IPC seam (`worker/`, `ipc/`) and the Python services: MCP server, agent host, services worker, installer, domain helpers |
-| [contracts/](contracts/README.md) | Frozen interface contracts between components |
-| [corpora/](corpora/README.md), [fixtures/](fixtures), [samples/](samples) | Test fixtures and sample parts |
-| [docs/](docs/README.md) | Design docs, references, and developer notes |
-| [packaging/](packaging) | Installers and release packaging for Linux, Windows, and macOS |
-| [scripts/](scripts), [tools/](tools) | Build, gate, audit, and developer tools |
-| [web/](web/README.md) | Experimental self-hosted browser app (gateway and deployment) |
-| [website/](website) | Source of the chudware.com promotional site |
-| [assets/](assets), [vendor/](vendor), [extern/](extern) | Icons and fonts, pinned vendored artifacts, vendored third-party code |
-| [benchmarks/](benchmarks) | Performance and validity benchmarks |
-
-Some persisted identifiers keep the project's earlier `aicad` prefix for data compatibility:
-the PLM vault directory `.aicadvault`, the `.aicm` mesh format, `refs/aicad/*` git refs, and
-`aicad.<x>/<n>` schema ids.
+- [Documentation index](docs/README.md) — references, design records and generated guides.
+- [Architecture](ARCHITECTURE.md) and [interface contracts](contracts/README.md) — system
+  boundaries and maintained component contracts.
+- [Running tests](CONTRIBUTING.md#running-tests) and the [CI workflow map](docs/reference/CI.md)
+  — how changes are built and checked, including environment-dependent skips.
+- [UX quality map](docs/dev/ux-quality.md) — audit ownership, acceptance criteria and
+  exercised evidence for feature inputs, command availability and document state.
+- [FEA verification report](docs/vv/FEA_VV_REPORT.md) — measured results and failures for
+  the specified historical build, not blanket evidence for every version or solver. The
+  [simulation credibility program](docs/simulation/ACCREDITATION_PROGRAM.md) is a proposed,
+  incomplete program, not an external accreditation.
 
 ## Contributing
 
-Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow, the
-checks a change must pass, and the dependency license rules, and follow the
-[Code of Conduct](CODE_OF_CONDUCT.md). Report security issues privately as described in
+Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[Code of Conduct](CODE_OF_CONDUCT.md). Report vulnerabilities privately using
 [SECURITY.md](SECURITY.md).
 
 ## License
 
-Chudware is released under the [MIT License](LICENSE). Third-party components keep their
-own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and the dependency
-ledger in [contracts/licenses.md](contracts/licenses.md). One exception lives in the tree:
-the model classes in `services/vision/cad_recode.py`, used by the optional machine-learning
-reverse-engineering backend, are derived from
-[filaPro/cad-recode](https://github.com/filaPro/cad-recode) and remain under CC-BY-NC-4.0
-(non-commercial use only), as stated in that file's header.
+Chudware's first-party code is released under the [MIT License](LICENSE), subject to
+third-party terms and documented exceptions. The model classes in
+[`services/vision/cad_recode.py`](services/vision/cad_recode.py), derived from
+[filaPro/cad-recode](https://github.com/filaPro/cad-recode), and the optional CAD-Recode
+weights are under CC-BY-NC-4.0 and restricted to non-commercial use.
+
+Optional SuiteSparse CHOLMOD is enabled by default when found and can link
+GPL-2.0-or-later code in-process. Distributing a combined binary carries GPL obligations,
+including license and corresponding-source requirements; configure with
+`-DCHUDWARE_WITH_CHOLMOD=OFF` to build without it. See the
+[third-party notices](THIRD_PARTY_NOTICES.md), authoritative
+[dependency license ledger](contracts/licenses.md) and
+[open compliance register](contracts/license_debt.md) for the applicable build-specific
+terms, distribution obligations and unresolved items.

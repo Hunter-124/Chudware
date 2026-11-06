@@ -11,6 +11,21 @@
 
 namespace ui {
 
+// ZoomFit keeps orientation; other presets keep zoom. All recenter the view.
+void applyViewPreset(AppState& st, ViewPreset preset) {
+    static const float kZeroPan[3] = {0, 0, 0};
+    switch (preset) {
+        case ViewPreset::Front:     requestCameraAnimation(st,   0.0f,   0.0f, -1.0f, kZeroPan); break;
+        case ViewPreset::Back:      requestCameraAnimation(st, 180.0f,   0.0f, -1.0f, kZeroPan); break;
+        case ViewPreset::Left:      requestCameraAnimation(st, -90.0f,   0.0f, -1.0f, kZeroPan); break;
+        case ViewPreset::Right:     requestCameraAnimation(st,  90.0f,   0.0f, -1.0f, kZeroPan); break;
+        case ViewPreset::Top:       requestCameraAnimation(st,   0.0f,  89.5f, -1.0f, kZeroPan); break;
+        case ViewPreset::Bottom:    requestCameraAnimation(st,   0.0f, -89.5f, -1.0f, kZeroPan); break;
+        case ViewPreset::Isometric: requestCameraAnimation(st,  35.0f,  30.0f, -1.0f, kZeroPan); break;
+        case ViewPreset::ZoomFit:   requestCameraAnimation(st, st.yaw, st.pitch, 1.0f, kZeroPan); break;
+    }
+}
+
 // The single AppState currently being animated (the app is single-document/single-window). Used so
 // the no-arg cameraAnimating()/cancelCameraAnimation() can reach the tween that lives on AppState.
 static AppState* s_anim = nullptr;

@@ -23,7 +23,7 @@ FINALIZE_SIGNATURE=""
 RELEASE_PUBLIC_KEY="${CHUDWARE_RELEASE_PUBLIC_KEY:-}"
 RELEASE_PYTHON="${CHUDWARE_RELEASE_PYTHON:-}"
 TRUSTED_BASE="${CHUDWARE_BASE_PYTHON:-${CHUDWARE_CI_BASE_PYTHON:-}}"
-CHUD_BIN="${CHUDWARE_CHUD_BIN:-}"
+OMP_BIN="${CHUDWARE_OMP_BIN:-}"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -32,9 +32,9 @@ while [ "$#" -gt 0 ]; do
             OUT="$2"
             shift 2
             ;;
-        --chud-bin)
-            [ "$#" -ge 2 ] || { echo "error: --chud-bin requires a file" >&2; exit 2; }
-            CHUD_BIN="$2"; shift 2 ;;
+        --omp-bin)
+            [ "$#" -ge 2 ] || { echo "error: --omp-bin requires a file" >&2; exit 2; }
+            OMP_BIN="$2"; shift 2 ;;
         --keep-app) KEEP_APP=1; shift ;;
         --prepare-signing)
             [ -z "$MODE" ] || { echo "error: choose exactly one signing mode" >&2; exit 2; }
@@ -56,7 +56,7 @@ done
 [ -n "$MODE" ] || { echo "error: --prepare-signing or --finalize-signing is required" >&2; exit 2; }
 if [ "$MODE" = prepare ]; then
     [ -n "$KEY_ID" ] || { echo "error: --key-id is required with --prepare-signing" >&2; exit 2; }
-    [ -n "$CHUD_BIN" ] || { echo "error: --chud-bin or CHUDWARE_CHUD_BIN is required" >&2; exit 2; }
+    [ -n "$OMP_BIN" ] || { echo "error: --omp-bin or CHUDWARE_OMP_BIN is required" >&2; exit 2; }
 else
     [ -f "$FINALIZE_SIGNATURE" ] && [ -s "$FINALIZE_SIGNATURE" ] || {
         echo "error: --finalize-signing must name a detached signature" >&2; exit 2;
@@ -89,18 +89,18 @@ require_production_cache() {
     }
 }
 
-stage_chudcode() {
+stage_omp() {
     local destination="$1"
-    [ -n "$CHUD_BIN" ] || {
-        echo "error: --chud-bin or CHUDWARE_CHUD_BIN is required" >&2
+    [ -n "$OMP_BIN" ] || {
+        echo "error: --omp-bin or CHUDWARE_OMP_BIN is required" >&2
         exit 1
     }
-    release_python "$REPO/scripts/pin_chudcode.py" stage \
-        --target "macos-$ARCH" --input "$CHUD_BIN" --output "$destination"
-    release_python "$REPO/scripts/pin_chudcode.py" stage-notices \
+    release_python "$REPO/scripts/pin_omp.py" stage \
+        --target "macos-$ARCH" --input "$OMP_BIN" --output "$destination"
+    release_python "$REPO/scripts/pin_omp.py" stage-notices \
         --output-dir "$(dirname "$destination")"
-    cp "$REPO/vendor/chudcode/CHUDCODE_ARTIFACT.lock" \
-        "$(dirname "$destination")/CHUDCODE_ARTIFACT.lock"
+    cp "$REPO/vendor/omp/OMP_ARTIFACT.lock" \
+        "$(dirname "$destination")/OMP_ARTIFACT.lock"
 }
 
 generate_protected_assets() {
@@ -109,10 +109,6 @@ generate_protected_assets() {
         --source-root "$REPO" --output-dir "$PROTECTED_ASSETS_OUT"
     [ -f "$PROTECTED_ASSETS_OUT/python/chudware_protected_assets.py" ] || {
         echo "error: protected Python asset table was not generated" >&2
-        exit 1
-    }
-    [ -f "$PROTECTED_ASSETS_OUT/include/chudware/protected_assets.generated.h" ] || {
-        echo "error: protected C++ asset table was not generated" >&2
         exit 1
     }
 }
@@ -219,7 +215,7 @@ build_python_sidecar() {
     # for background simulation jobs (services/sim/jobs.py), and the topology tool/study
     # modules back those jobs; forcing them fails the build if any is missing.
     local -a includes=("--include-module=chudware_protected_assets" "--include-module=services.$module"
-                       "--include-package=chudcode_rpc"
+                       "--include-package=omp_rpc"
                        "--include-module=services.sim.job_worker"
                        "--include-module=services.sim.topology"
                        "--include-module=services.mcp.topology_tools")
@@ -257,7 +253,7 @@ build_python_sidecar() {
 audit_production_payload() {
     local root="$1" bad
     bad="$(find "$root" \( -type l -o -type f \( \
-        -name '*.py' -o -name '*.pyc' -o -name '*.pyo' -o -name '*.ts' -o -name '*.tsx' \
+        -name '*.py' -o -name '*.pyc' -o -name '*.pyo' -o \( -name '*.ts' ! -path "$root/Contents/MacOS/omp_extension.ts" \) -o -name '*.tsx' \
         -o -name '*.js' -o -name '*.jsx' -o -name '*.map' -o -name '*.pdb' \
         -o -name 'test_*' -o -name '*_test.*' \) -o -type d \( \
         -name '__pycache__' -o -name 'node_modules' -o -name '.git' -o -name '.github' \
@@ -412,6 +408,13 @@ done
 cp "$ENGINE" "$FRAMEWORKS/libchudware.dylib"
 chmod u+w "$FRAMEWORKS/libchudware.dylib"
 ENGINE_DIR="$(dirname "$ENGINE")"
+SHAPE_WORKER="$ENGINE_DIR/chudware-shape-build-worker"
+[ -f "$SHAPE_WORKER" ] && [ -x "$SHAPE_WORKER" ] || {
+    echo "error: selected engine requires executable shape build worker: $SHAPE_WORKER" >&2
+    exit 1
+}
+cp "$SHAPE_WORKER" "$FRAMEWORKS/chudware-shape-build-worker"
+chmod u+wx "$FRAMEWORKS/chudware-shape-build-worker"
 for sibling in libnglib.dylib libngcore.dylib lib3mf.dylib; do
     if [ -f "$ENGINE_DIR/$sibling" ]; then
         cp "$ENGINE_DIR/$sibling" "$FRAMEWORKS/$sibling"
@@ -439,7 +442,7 @@ require_production_cache "$HOSTD_BUILD" "chudware-hostd"
 cp "$HOSTD" "$MACOS/chudware-hostd"
 chmod +x "$MACOS/chudware-hostd"
 
-# Protected services and Chudcode are compiled sidecars. No repository Python,
+# Protected services and OMP are compiled sidecars. No repository Python,
 # TypeScript, generated compiler source, source maps, or provisioning wheelhouse enters the app.
 [ -f "$REPO/services/compiled_entry.py" ] || {
     echo "error: services/compiled_entry.py is required for release sidecars" >&2
@@ -448,7 +451,9 @@ chmod +x "$MACOS/chudware-hostd"
 generate_protected_assets
 build_python_sidecar worker_main "$MACOS/chudware-worker"
 build_python_sidecar mcp.server "$MACOS/chudware-mcp"
-stage_chudcode "$MACOS/chud"
+stage_omp "$MACOS/omp"
+cp "$REPO/services/agent/omp_extension.ts" "$MACOS/omp_extension.ts"
+cp "$REPO/services/agent/prompts/omp_cad_system.md" "$MACOS/omp_cad_system.md"
 
 
 # Resolve @rpath/@loader_path entries when deciding whether a dependency belongs in the
@@ -489,6 +494,7 @@ SEEN="$TMP_QUEUE/seen"
 : > "$QUEUE"
 : > "$SEEN"
 printf '%s\n' "$MACOS/Chudware-bin" >> "$QUEUE"
+printf '%s\n' "$FRAMEWORKS/chudware-shape-build-worker" >> "$QUEUE"
 for bundled_dylib in "$FRAMEWORKS"/*.dylib; do
     [ -f "$bundled_dylib" ] && printf '%s\n' "$bundled_dylib" >> "$QUEUE"
 done
@@ -550,7 +556,7 @@ set -eu
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 export CHUDWARE_LIBCHUDWARE="$HERE/../Frameworks/libchudware.dylib"
 if [ -x "$HERE/chudware-hostd" ]; then export CHUDWARE_HOSTD_BIN="$HERE/chudware-hostd"; fi
-if [ -x "$HERE/chud" ]; then export CHUDWARE_CHUDCODE_BIN="$HERE/chud"; fi
+if [ -x "$HERE/omp" ]; then export CHUDWARE_OMP_BIN="$HERE/omp"; fi
 exec "$HERE/Chudware-bin" "$@"
 LAUNCHER
 chmod +x "$MACOS/Chudware"
@@ -559,8 +565,8 @@ chmod +x "$MACOS/Chudware"
 
 # Fail before signing if any non-system dependency still resolves outside the bundle.
 for executable in "$MACOS/Chudware-bin" "$MACOS/chudware-hostd" \
-    "$MACOS/chudware-worker" "$MACOS/chudware-mcp" "$MACOS/chud" \
-    "$FRAMEWORKS"/*.dylib; do
+    "$MACOS/chudware-worker" "$MACOS/chudware-mcp" "$MACOS/omp" \
+    "$FRAMEWORKS/chudware-shape-build-worker" "$FRAMEWORKS"/*.dylib; do
     [ -f "$executable" ] || continue
     while IFS= read -r dependency; do
         dependency_target=""
@@ -579,10 +585,10 @@ done
 
 if [ -n "$SIGN_IDENTITY" ]; then
     echo "==> signing nested Mach-O payloads with identity: $SIGN_IDENTITY"
-    echo "==> verifying release-signed Chudcode artifact without re-signing it"
-    codesign --verify --strict --verbose=2 "$MACOS/chud"
+    echo "==> verifying release-signed OMP artifact without re-signing it"
+    codesign --verify --strict --verbose=2 "$MACOS/omp"
     while IFS= read -r -d '' nested; do
-        [ "$nested" = "$MACOS/chud" ] && continue
+        [ "$nested" = "$MACOS/omp" ] && continue
         file -b "$nested" | grep -q 'Mach-O' || continue
         codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$nested"
         codesign --verify --strict --verbose=2 "$nested"
@@ -620,13 +626,13 @@ if [ -n "$NOTARIZE_PROFILE" ]; then
         echo "error: CHUDWARE_NOTARIZE_PROFILE requires CHUDWARE_SIGN_IDENTITY" >&2
         exit 1
     }
-    codesign --verify --strict --verbose=2 "$MACOS/chud"
+    codesign --verify --strict --verbose=2 "$MACOS/omp"
     echo "==> notarizing with keychain profile: $NOTARIZE_PROFILE"
     xcrun notarytool submit "$ZIP" --keychain-profile "$NOTARIZE_PROFILE" --wait
     xcrun stapler staple "$APP"
     xcrun stapler validate "$APP"
     codesign --verify --deep --strict --verbose=2 "$APP"
-    codesign --verify --strict --verbose=2 "$MACOS/chud"
+    codesign --verify --strict --verbose=2 "$MACOS/omp"
     spctl --assess --type execute --verbose=2 "$APP"
     verify_manifest_rows_unchanged "$APP"
     archive_signed_bundle "$ZIP"

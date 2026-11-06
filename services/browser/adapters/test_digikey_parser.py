@@ -19,9 +19,15 @@ mirrors the real ``props.pageProps.envelope.data.topResults`` nesting, trimmed.
 from __future__ import annotations
 
 import json
+import pytest
 
 from services.browser import session
 from services.browser.adapters import digikey_web
+
+
+@pytest.fixture(autouse=True)
+def no_api_credentials(monkeypatch):
+    monkeypatch.setattr(digikey_web._vendor_api, "credentials", lambda _: None)
 
 # --- VERBATIM real slice: two real topResults entries from the saved page ---
 _TOP_RESULTS = [
@@ -85,6 +91,7 @@ def test_digikey_search_parses_category_tiles(monkeypatch):
         "https://www.digikey.com/en/products/filter/chip-resistor-surface-mount/52")
     assert hits[0]["site"] == "digikey"
     assert hits[0]["kind"] == "category"
+    assert hits[0]["thumbnail"] == "https:" + _TOP_RESULTS[0]["imageUrl"]
     assert hits[0]["parent_category"] == "Resistors"
     assert hits[0]["product_count"] == "1,204,216"
     assert hits[0]["category_id"] == "52"
@@ -112,15 +119,16 @@ def test_digikey_search_propagates_fetch_failure(monkeypatch):
         lambda url, site: {"ok": False, "reason": "no_profile", "hint": "x"})
 
     hits = digikey_web.ADAPTER.search("resistor")
-    assert hits == [{"ok": False, "reason": "no_profile", "hint": "x"}]
+    assert hits[0]["reason"] == "no_profile"
+    assert hits[0]["site"] == "digikey" and hits[0]["op"] == "search"
 
 
-def test_digikey_search_no_next_data_returns_empty(monkeypatch):
+def test_digikey_search_no_next_data_is_parse_failure(monkeypatch):
     monkeypatch.setattr(
         session, "browser_fetch",
         lambda url, site: {"ok": True, "content": "<html><body>nope</body></html>"})
 
-    assert digikey_web.ADAPTER.search("resistor") == []
+    assert digikey_web.ADAPTER.search("resistor")[0]["reason"] == "parse_failed"
 
 
 # --- Narrow-MPN product-results fixture (synthetic but field-faithful) ---------
@@ -136,6 +144,8 @@ _PRODUCT_RESULTS = [
         "manufacturerName": "STMicroelectronics",
         "productUrl": "/en/products/detail/stmicroelectronics/LM317T/604171",
         "unitPrice": 0.63,
+        "currency": "USD",
+        "imageUrl": "//mm.digikey.com/photos/LM317T.jpg",
         "quantityAvailable": 12345,
         "datasheetUrl": "https://mm.digikey.com/Volume0/opasdata/d220001/datasheets/123/LM317T.pdf",
     },
@@ -210,7 +220,9 @@ def test_digikey_narrow_mpn_parses_kind_product_hits(monkeypatch):
     assert hits[0]["site"] == "digikey"
     assert hits[0]["url"].startswith("https://www.digikey.com/en/products/detail/")
     assert "LM317T" in hits[0]["title"]
-    assert hits[0]["price"].startswith("$")
+    assert hits[0]["price"] == 0.63 and hits[0]["currency"] == "USD"
+    assert hits[0]["thumbnail"] == "https://mm.digikey.com/photos/LM317T.jpg"
+    assert hits[0]["sku"] == "LM317TFS-ND" and hits[0]["stock"] == 12345
     assert hits[0]["datasheet"].endswith(".pdf")
     # Category tiles must NOT leak into a product-results response.
     assert all(h.get("kind") != "category" for h in hits)
@@ -225,4 +237,46 @@ def test_digikey_single_product_envelope_parses(monkeypatch):
     assert len(hits) == 1
     assert hits[0]["kind"] == "product"
     assert hits[0]["mpn"] == "LM317T"
-    assert hits[0]["price"] == "$0.63"
+    assert hits[0]["price"] == 0.63
+
+
+def test_digikey_web_encodes_reserved_query(monkeypatch):
+    seen = []
+    monkeypatch.setattr(session, "browser_fetch", lambda url, site: (
+        seen.append(url) or {"ok": True, "content": DIGIKEY_SEARCH_HTML}))
+    digikey_web.ADAPTER.search("100 kΩ & A/B#1")
+    assert seen[0].endswith("keywords=100+k%CE%A9+%26+A%2FB%231")
+
+
+def test_digikey_web_explicit_empty_and_bad_shape(monkeypatch):
+    def page(data):
+        return '<script id="__NEXT_DATA__">' + json.dumps(
+            {"props": {"pageProps": {"envelope": {"data": data}}}}) + "</script>"
+    monkeypatch.setattr(session, "browser_fetch", lambda *_: {
+        "ok": True, "content": page({"productCount": 0, "topResults": []})})
+    assert digikey_web.ADAPTER.search("nothing") == []
+    monkeypatch.setattr(session, "browser_fetch", lambda *_: {
+        "ok": True, "content": page({"topResults": [{"new_shape": True}]})})
+    assert digikey_web.ADAPTER.search("unknown")[0]["reason"] == "parse_failed"
+
+
+def test_digikey_category_is_not_acquirable(monkeypatch):
+    monkeypatch.setattr(session, "browser_fetch", lambda *_: pytest.fail("category was fetched"))
+    out = digikey_web.ADAPTER.acquire({"url": "https://www.digikey.com/filter/resistors",
+                                       "kind": "category"})
+    assert out["reason"] == "unsupported"
+
+
+def test_digikey_product_inside_top_results(monkeypatch):
+    payload = {"props": {"pageProps": {"envelope": {"data": {"topResults": [_PRODUCT_RESULTS[0]]}}}}}
+    page = "<script type='application/json' id='__NEXT_DATA__'>" + json.dumps(payload) + "</script>"
+    monkeypatch.setattr(session, "browser_fetch", lambda *_: {"ok": True, "content": page})
+    hit = digikey_web.ADAPTER.search("LM317T")[0]
+    assert hit["kind"] == "product" and hit["sku"] == "LM317TFS-ND"
+
+
+def test_digikey_rejects_mismatched_detail_sku(monkeypatch):
+    monkeypatch.setattr(session, "browser_fetch", lambda *_: {"ok": True, "content":
+        '<span class="digikey-part-number">OTHER-ND</span><a href="/x.pdf">Datasheet</a>'})
+    out = digikey_web.ADAPTER.acquire({"url": "https://www.digikey.com/product/one", "sku": "DESIRED-ND"})
+    assert out["reason"] == "unsupported"

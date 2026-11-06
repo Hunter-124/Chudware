@@ -373,8 +373,8 @@ def _fix_wall_thickness(f: Finding) -> tuple[list[dict], list[str]]:
     """Thin wall → process-specific minimum wall advisory with resize hint.
 
     Emits the measured minimum, the process minimum, and a targeted
-    param edit suggestion.  Numbers come from ``eval_thickness`` (kernel ray-cast)
-    via the adapter — never invented.
+    param edit suggestion. Numbers come from ``eval_thickness`` inscribed-sphere
+    screening via the adapter — never invented and not manufacturing sign-off.
     """
     helper = ["wall_thickness", "dfm_check", "describe_part"]
     mn = f.numbers.get("min_thickness_mm")
@@ -383,11 +383,10 @@ def _fix_wall_thickness(f: Finding) -> tuple[list[dict], list[str]]:
 
     if mn is not None and limit is not None:
         delta = round(float(limit) - float(mn), 3)
-        basis = (f"measured minimum wall {mn:.3f} mm < {process} minimum {limit:.3f} mm "
-                 f"(Δ={delta:+.3f} mm) — from eval_thickness kernel ray-cast")
+        basis = f.finding
         fix_hint = (f"increase the thinnest wall by ≥{delta:.3f} mm "
                     f"(target ≥{limit:.3f} mm for {process})")
-        pred = f"minimum wall ≥{limit:.3f} mm — {process} manufacturable"
+        pred = f"sampled wall reaches ≥{limit:.3f} mm; re-run wall_thickness and dfm_check"
         confidence = "table"  # process minimum from ProcessProfile table
     else:
         basis = f.finding
@@ -397,7 +396,8 @@ def _fix_wall_thickness(f: Finding) -> tuple[list[dict], list[str]]:
 
     return [{
         "action": "thicken_wall",
-        "params": {"hint": fix_hint, "min_thickness_mm": limit},
+        "params": {"hint": fix_hint, "min_thickness_mm": limit,
+                   **({"face_ids": f.refs["face_ids"]} if f.refs.get("face_ids") else {})},
         "basis": basis,
         "predicted_effect": pred,
         "confidence": confidence,

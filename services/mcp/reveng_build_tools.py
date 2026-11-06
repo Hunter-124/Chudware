@@ -6,6 +6,9 @@ from typing import Optional
 from pathlib import Path as _Path
 import json as _json
 import shutil as _shutil
+import os as _os
+import tempfile as _tempfile
+import math as _math
 
 from services.mcp.tool_registry import model_selectors
 
@@ -15,7 +18,13 @@ from .reveng_common import (
     _dumps,
     _err,
     _find_session_run,
+    _find_reference_models,
+    _has_reference_match,
+    _store_reference_search,
+    _fit_provenance,
+    _invalidate_downstream,
     _launch_reveng_mission,
+    _load_current_fits,
     _load_session,
     _make_pipeline_agent_fn,
     _make_session,
@@ -67,14 +76,24 @@ def _persist_build_result(session_id: str, *, strategy: str, state: str,
     if s is None:
         return {}
     payload = payload if isinstance(payload, dict) else {}
-    match_pct = _extract_match_pct(payload)
-    block = s.setdefault("result", {})
+    match_pct = _extract_match_pct(payload) if state == "built" else None
+    block = {}
+    s["result"] = block
+    if state in ("failed", "running"):
+        for key in ("doc_id", "step_path", "cadquery_path"):
+            s.setdefault("artifacts", {}).pop(key, None)
+    if state == "failed":
+        s.setdefault("stages", {})["model"] = "failed"
+    for stage in ("review", "deliver"):
+        s.setdefault("stages", {})[stage] = "idle"
     block.update({
         "strategy": strategy,
         "state": state,
         "match_pct": match_pct,
         "scored": match_pct is not None,
-        "doc_id": payload.get("doc_id") or (s.get("artifacts") or {}).get("doc_id"),
+        "doc_id": (payload.get("doc_id") or (s.get("artifacts") or {}).get("doc_id"))
+                  if state == "built" else None,
+        "mesh_fallback": bool(payload.get("mesh_fallback")) if state == "built" else False,
         "built_at": _now_iso(),
     })
     if run_id:
@@ -89,6 +108,104 @@ def _persist_build_result(session_id: str, *, strategy: str, state: str,
         block.pop("summary", None)
     _save_session(s)
     return block
+
+
+def _attach_session_result(session: dict, part_ref: str) -> tuple[str | None, dict]:
+    """Publish an explicit file reference, never a live document handle as a path."""
+    from services.agent import request_context as rc
+    from services.reveng.gaussian_jobs import _atomic
+
+    session_id = session["session_id"]
+    artifacts = session.get("artifacts") or {}
+    doc_id = artifacts.get("doc_id")
+    mesh_path = artifacts.get("mesh_path")
+    step_path = artifacts.get("step_path")
+    owned_paths = []
+    native_path = None
+    geometry_path = None
+    source_kind = None
+    try:
+        if doc_id:
+            from services.mcp import core_bridge as cb
+
+            # The doc remains live and user-owned. A nonbinding save records its
+            # complete editable history without rebinding or clearing its state.
+            # Keep a real native artifact in the session, including its cached
+            # build, for reopen and bundle export.
+            root = _session_path(session_id).resolve()
+            fd, name = _tempfile.mkstemp(prefix=".reveng-", suffix=".step+", dir=root)
+            _os.close(fd)
+            native_path = _Path(name)
+            owned_paths.append(native_path)
+            saved = cb.call("doc_save", {
+                "doc_id": doc_id, "path": str(native_path), "preserve_path": True,
+            })
+            cache = saved.get("cache") or {}
+            if (saved.get("ok") is False or saved.get("_is_error") or
+                    cache.get("skipped_reason") in {
+                        "empty_mesh", "not_converged", "component_failed",
+                        "live_sources_unsaved", "feature_failed", "unverified", "error",
+                    } or not native_path.is_file() or native_path.stat().st_size == 0):
+                raise cb.CoreError("reverse-engineered document has no complete saved geometry",
+                                   code="rebuild_failed", detail={"cache": cache})
+            geometry_path = str(native_path)
+            source_kind = "parametric"
+        elif step_path or mesh_path:
+            source = step_path or mesh_path
+            source_kind = "step" if step_path else "mesh"
+            geometry_path = str(source)
+
+        if geometry_path and rc.in_cell():
+            # PartRecord paths must be workspace-relative in a cell. Materialize
+            # an exclusively-created copy there, without replacing user files.
+            source_path = rc.cell_path(geometry_path, private=True)
+            fd, name = _tempfile.mkstemp(
+                prefix=".reveng-", suffix=source_path.suffix, dir=rc.cell_path("/work")
+            )
+            workspace_path = _Path(name)
+            owned_paths.append(workspace_path)
+            with _os.fdopen(fd, "wb") as output, source_path.open("rb") as input_file:
+                _shutil.copyfileobj(input_file, output)
+            geometry_path = workspace_path.name
+
+        session["part_ref"] = part_ref
+        session["provenance"].append({
+            "step": "attach_result", "part_ref": part_ref, "ts": _now_iso(),
+        })
+        _save_session(session)
+        built = session.get("result") or {}
+        sidecar = {
+            "schema": "aicad.reveng_result/1",
+            "session_id": session_id,
+            "part_ref": part_ref,
+            "name": session.get("name", part_ref),
+            "doc_id": doc_id,
+            "mesh_path": mesh_path,
+            "step_path": step_path,
+            "native_path": str(native_path) if native_path is not None else None,
+            "geometry_ref": (
+                {"kind": "import_file", "path": geometry_path} if geometry_path else None
+            ),
+            "geometry_source": source_kind,
+            "strategy": built.get("strategy"),
+            "match_pct": built.get("match_pct"),
+            "scored": bool(built.get("scored")),
+            "mesh_fallback": bool(built.get("mesh_fallback")) if doc_id else False,
+            "attached_at": _now_iso(),
+        }
+        _atomic(_session_path(session_id) / "reveng_result.json", sidecar)
+    except Exception:
+        for path in owned_paths:
+            path.unlink(missing_ok=True)
+        raise
+
+    try:
+        from services.parts import register_provider
+        from services.parts.adapters.reveng_result_adapter import RevengResultAdapter
+        register_provider(RevengResultAdapter())
+    except Exception:
+        pass  # the persisted sidecar remains available to the live adapter
+    return geometry_path, session
 
 def register_reveng_build_tools(mcp: FastMCP) -> None:
     """Reverse-engineering reconstruction MCP tools (split out of reveng_tools.py): reconstruct, single_photo, fit_primitives, build_parametric, attach_result, scan-mesh import, bundle export, make_part_from_library, research_source."""
@@ -166,6 +283,10 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
         ``reveng_status()`` and install COLMAP (COLMAP_BIN).
         """
         s = _load_session(session_id)
+        if quality not in ("draft", "normal", "high"):
+            return _dumps({"ok": False, "reason": "quality must be draft, normal or high"})
+        if backend not in (None, "auto", "openmvs", "brush", "splat"):
+            return _dumps({"ok": False, "reason": "backend must be auto, openmvs, brush or splat"})
         if s is None:
             return _dumps({"ok": False, "reason": f"session {session_id!r} not found"})
         try:
@@ -179,7 +300,8 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
             )
         try:
             result = _launch_reveng_mission(
-                session_id, "reveng_scan", _SCAN_NODE_STAGE, background=True,
+                session_id, "reveng_scan", _SCAN_NODE_STAGE,
+                quality=quality, backend=backend, background=True,
             )
             if result.get("ok") is False:
                 return _dumps(result)
@@ -394,19 +516,25 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
                 f"single-photo backend not available ({exc}). "
                 "Check reveng_status() for TripoSR/TRELLIS provisioning."
             )
+        mesh_dir = _session_path(session_id) / "mesh"
+        mesh_dir.mkdir(parents=True, exist_ok=True)
+        run_dir = _Path(_tempfile.mkdtemp(prefix="single-", dir=mesh_dir))
         try:
             result = reconstruct_single_photo(
                 image_path,
                 session_id,
                 quality=quality,
-                output_dir=str(_session_path(session_id) / "mesh"),
+                output_dir=str(run_dir),
             ) or {}
         except Exception as exc:  # noqa: BLE001
+            _shutil.rmtree(run_dir, ignore_errors=True)
             return _dumps({
                 "ok": False,
                 "reason": f"single_photo error: {exc}",
                 "honesty": {"approximate": True},
             })
+        if not result.get("ok"):
+            _shutil.rmtree(run_dir, ignore_errors=True)
         # Always tag honesty.approximate for single-photo
         s = _load_session(session_id) or s
         s.setdefault("honesty", {})
@@ -415,8 +543,10 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
             result.get("backend") or ("trellis" if quality == "high" else "triposr")
         )
         if result.get("ok") and result.get("mesh_path"):
-            s.setdefault("artifacts", {})
-            s["artifacts"]["mesh_path"] = result["mesh_path"]
+            _invalidate_downstream(s)
+            s.setdefault("artifacts", {}).update(
+                mesh_path=result["mesh_path"], raw_mesh_path=result["mesh_path"],
+                mesh_units="reconstruction", mesh_transform_applied=False)
             s["stages"]["reconstruct"] = "done"
         s["provenance"].append({
             "step": "reveng_single_photo",
@@ -435,7 +565,7 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
-    def reveng_fit_primitives(session_id: str) -> str:
+    def reveng_fit_primitives(session_id: str, approximate: bool = False) -> str:
         """Segment the mesh and RANSAC-fit primitive shapes (cylinder, box, cone, etc.).
 
         Returns ``aicad.reveng_fits/1`` (contracts/reveng.md §3) when the mesh is ready.
@@ -452,28 +582,50 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
                 "hint": "Run reveng_reconstruct (or reveng_single_photo) first to produce a mesh.",
             })
         try:
+            provenance = _fit_provenance(s)
+        except (OSError, ValueError) as exc:
+            return _dumps({"ok": False, "reason": f"fit provenance error: {exc}"})
+        try:
             from services.vision.segment_fit import segment_fit  # noqa: PLC0415
         except Exception as exc:  # noqa: BLE001
             return _not_provisioned(
                 f"segment_fit unavailable ({exc}). pip install open3d"
             )
         try:
-            fits = segment_fit(mesh_path, session_id=session_id) or {}
+            fits = segment_fit(mesh_path, session_id=session_id,
+                               recon_transform=s.get("recon_transform"),
+                               transform_applied=bool((s.get("artifacts") or {}).get("mesh_transform_applied")),
+                               approximate=approximate) or {}
         except Exception as exc:  # noqa: BLE001
             return _dumps({"ok": False, "reason": f"segment_fit error: {exc}"})
         if not fits.get("ok"):
             return _dumps(fits if isinstance(fits, dict) else {
                 "ok": False, "reason": "segment_fit failed",
             })
+        current = _load_session(session_id)
+        try:
+            unchanged = current is not None and _fit_provenance(current) == provenance
+        except (OSError, ValueError):
+            unchanged = False
+        if not unchanged:
+            if current is not None and _load_current_fits(current) is None:
+                _invalidate_downstream(current)
+                _save_session(current)
+            return _dumps({"ok": False, "reason": "mesh_changed_during_fit",
+                           "hint": "The mesh or calibration changed while fitting; fit again."})
+        s = current
+        fits["surface_approximate"] = bool(s.get("honesty", {}).get("approximate"))
+        fits["approximate"] = bool(fits.get("approximate") or fits["surface_approximate"])
+        fits["provenance"] = provenance
+        _invalidate_downstream(s)
         fits_path = _session_path(session_id) / "fits.json"
         try:
             fits_path.write_text(_json.dumps(fits, indent=2))
-        except Exception:  # noqa: BLE001
-            fits_path = None  # type: ignore[assignment]
-        s = _load_session(session_id) or s
+        except Exception as exc:  # noqa: BLE001
+            _save_session(s)
+            return _dumps({"ok": False, "reason": f"fits persistence error: {exc}"})
         s.setdefault("artifacts", {})
-        if fits_path is not None:
-            s["artifacts"]["fits_path"] = str(fits_path)
+        s["artifacts"]["fits_path"] = str(fits_path)
         s["stages"]["model"] = "fitting"
         s["provenance"].append({
             "step": "reveng_fit_primitives",
@@ -495,7 +647,7 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
         strategy:
           - ``deterministic`` (default) — reverse_engineer with fit hints
           - ``ml`` — CAD-Recode build_parametric (services.vision.cad_recode)
-          - ``override_approximate`` — allow parametric on single-photo meshes
+          - ``override_approximate`` — allow parametric on approximate surfaces
             (honesty gate only; rebuild strategy stays deterministic)
 
         Refuses when ``session.honesty.approximate`` is true unless
@@ -508,11 +660,11 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
         if s.get("honesty", {}).get("approximate") and strat_in != "override_approximate":
             return _dumps({
                 "ok": False,
-                "reason": "session marked approximate (single-photo tier)",
+                "reason": "session marked approximate",
                 "hint": (
-                    "Parametric modeling from a single-photo mesh is unreliable. "
-                    "Pass strategy='override_approximate' to force, or capture "
-                    "multi-view images and run reveng_reconstruct instead."
+                    "A splat-derived or single-photo surface is not an exact measured part. "
+                    "Independently verify critical features and pass "
+                    "strategy='override_approximate' to build from it."
                 ),
             })
         # Map honesty override to deterministic rebuild; ml is explicit.
@@ -568,7 +720,13 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
                 {"node_id": "n_parametric", "session_id": session_id},
             )
             payload = getattr(res, "result", None) or {}
-            ok = bool(getattr(res, "success", False))
+            if (isinstance(payload, dict) and isinstance(payload.get("features"), list)
+                    and not payload["features"]):
+                payload = {**payload, "ok": False, "reason": "no_features_rebuilt",
+                           "match_pct": None}
+                payload.setdefault("summary", "no features rebuilt — see recognition.unclaimed")
+            ok = bool(getattr(res, "success", False)) and not (
+                isinstance(payload, dict) and payload.get("ok") is False)
             out = {
                 "ok": ok,
                 "strategy": rebuild_strategy,
@@ -576,6 +734,9 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
             }
             if isinstance(payload, dict):
                 out.update(payload)
+            out["ok"] = ok
+            if not ok:
+                out["doc_id"] = None
             if not ok and "reason" not in out and "error" not in out:
                 out["reason"] = (
                     payload.get("detail") if isinstance(payload, dict)
@@ -615,45 +776,7 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
             s = _load_session(session_id)
             if s is None:
                 return _dumps({"ok": False, "reason": f"session {session_id!r} not found"})
-            s["part_ref"] = part_ref
-            s["provenance"].append({
-                "step": "attach_result",
-                "part_ref": part_ref,
-                "ts": _now_iso(),
-            })
-            _save_session(s)
-            artifacts = s.get("artifacts", {})
-            doc_id = artifacts.get("doc_id")
-            mesh_path = artifacts.get("mesh_path")
-            geometry_ref = doc_id or mesh_path  # best available geometry handle
-
-            # RE-23: write sidecar so RevengResultAdapter can serve this PartRecord.
-            # Carries the build's own verdict (strategy + boolean-compare score) so a
-            # consumer of the sidecar alone knows how trustworthy this geometry is.
-            built = s.get("result") or {}
-            sidecar = {
-                "schema": "aicad.reveng_result/1",
-                "session_id": session_id,
-                "part_ref": part_ref,
-                "name": s.get("name", part_ref),
-                "doc_id": doc_id,
-                "mesh_path": mesh_path,
-                "strategy": built.get("strategy"),
-                "match_pct": built.get("match_pct"),
-                "scored": bool(built.get("scored")),
-                "mesh_fallback": bool((s.get("honesty") or {}).get("approximate")),
-                "attached_at": _now_iso(),
-            }
-            sidecar_path = _session_path(session_id) / "reveng_result.json"
-            sidecar_path.write_text(_json.dumps(sidecar, indent=2))
-
-            # Register the live adapter into the parts-hub singleton (idempotent).
-            try:
-                from services.parts import register_provider as _reg_provider  # noqa: PLC0415
-                from services.parts.adapters.reveng_result_adapter import RevengResultAdapter  # noqa: PLC0415
-                _reg_provider(RevengResultAdapter())
-            except Exception:
-                pass  # best-effort; part_place tests that bypass hub still work
+            geometry_ref, s = _attach_session_result(s, part_ref)
 
             return _dumps({
                 "ok": True,
@@ -676,24 +799,50 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
     ) -> str:
         """Import an externally-produced scan mesh (.ply / .obj) into *session_id*.
 
-        Copies the mesh to ``<session>/mesh/`` and records scale if provided.
-        Returns ``{ok, mesh_path, session}``.
+        Copies the native mesh to ``<session>/mesh/``. ``scale_mm`` is the
+        millimetres-per-source-unit ratio, not a physical feature dimension.
+        It records the transform for fitting and later metric mesh materialization.
         """
         try:
             s = _load_session(session_id)
             if s is None:
                 return _dumps({"ok": False, "reason": f"session {session_id!r} not found"})
-            src = _Path(path).expanduser()
+            from services.agent import request_context
+            src = request_context.cell_path(path)
             if not src.is_file():
                 return _dumps({"ok": False, "reason": f"file not found: {path}"})
+            if scale_mm is not None and (not _math.isfinite(scale_mm) or scale_mm <= 0):
+                return _dumps({"ok": False, "reason": "scale_mm must be finite and positive"})
             mesh_dir = _session_path(session_id) / "mesh"
             mesh_dir.mkdir(parents=True, exist_ok=True)
-            dest = mesh_dir / src.name
-            _shutil.copy2(str(src), str(dest))
-            s["artifacts"]["mesh_path"] = str(dest)
+            fd, name = _tempfile.mkstemp(prefix="import-", suffix=src.suffix.lower(), dir=mesh_dir)
+            _os.close(fd)
+            dest = _Path(name)
+            try:
+                _shutil.copy2(str(src), str(dest))
+            except Exception:
+                dest.unlink(missing_ok=True)
+                raise
+            _invalidate_downstream(s)
+            # An unrelated imported scan cannot inherit a prior SfM gauge or splat.
+            s.pop("sfm_dataset", None)
+            s.pop("axis_alignment", None)
+            s.pop("imported_splat", None)
+            for key in ("sparse_dir", "splat_path", "raw_splat_path",
+                        "splat_units", "splat_transform_applied", "splat_dataset_dir", "fits_path"):
+                s["artifacts"].pop(key, None)
+            s["artifacts"].update(mesh_path=str(dest), raw_mesh_path=str(dest),
+                                  mesh_units="reconstruction", mesh_transform_applied=False)
             if scale_mm is not None:
-                s["scale"]["mm_per_unit"] = scale_mm
-                s["scale"]["method"] = "known_dim"
+                from services.vision.recon_transform import ReconTransform
+                transform = ReconTransform(mm_per_unit=float(scale_mm),
+                    rotation=[[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
+                    translation_mm=[0., 0., 0.], source="import_scan_mesh", confirmed=True)
+                s["recon_transform"] = transform.to_json()
+                s["scale"].update(mm_per_unit=float(scale_mm), method="import_scan_mesh", confirmed=True)
+            else:
+                s.pop("recon_transform", None)
+                s["scale"].update(mm_per_unit=None, method=None, confirmed=False)
             s["provenance"].append({
                 "step": "import_scan_mesh",
                 "source": str(src),
@@ -715,6 +864,8 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
     ) -> str:
         """Export the full RE session directory as a zip bundle to *dest*.
 
+        Current mesh artifact paths in the archive manifest are archive-relative.
+        The latest imported scan is archived under its original filename.
         Returns ``{ok, path: str}`` on success.
         """
         try:
@@ -722,13 +873,62 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
             if s is None:
                 return _dumps({"ok": False, "reason": f"session {session_id!r} not found"})
             import zipfile
-            dest_path = _Path(dest).expanduser()
+            from services.agent import request_context
+            dest_path = (request_context.cell_path(dest) if request_context.in_cell()
+                         else _Path(dest).expanduser())
             dest_path.parent.mkdir(parents=True, exist_ok=True)
-            session_root = _session_path(session_id)
+            session_root = _session_path(session_id).resolve()
+            manifest = _json.loads((session_root / "session.json").read_text())
+
+            def owned_file(value):
+                if not isinstance(value, str) or not value:
+                    return None
+                candidate = _Path(value)
+                if not candidate.is_absolute():
+                    candidate = session_root / candidate
+                candidate = candidate.resolve()
+                if candidate.is_file() and candidate.is_relative_to(session_root):
+                    return candidate.relative_to(session_root).as_posix()
+                return None
+
+            imported_rel = stable_rel = None
+            for row in reversed(manifest.get("provenance") or []):
+                if not isinstance(row, dict) or row.get("step") != "import_scan_mesh":
+                    continue
+                imported_rel = owned_file(row.get("mesh_path"))
+                source = row.get("source")
+                if imported_rel and isinstance(source, str) and _Path(source).name:
+                    stable_rel = (_Path("mesh") / _Path(source).name).as_posix()
+                    row["mesh_path"] = stable_rel
+                    break
+            for key in ("mesh_path", "raw_mesh_path"):
+                value = (manifest.get("artifacts") or {}).get(key)
+                relative = owned_file(value)
+                if relative:
+                    manifest["artifacts"][key] = (
+                        stable_rel if relative == imported_rel and stable_rel else relative)
+
             with zipfile.ZipFile(str(dest_path), "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("session.json", _json.dumps(manifest, indent=2))
                 for fpath in session_root.rglob("*"):
-                    if fpath.is_file():
-                        zf.write(str(fpath), str(fpath.relative_to(session_root)))
+                    if not fpath.is_file():
+                        continue
+                    relative = fpath.relative_to(session_root).as_posix()
+                    if relative == "session.json":
+                        continue
+                    if stable_rel and relative == imported_rel:
+                        relative = stable_rel
+                    elif stable_rel and relative == stable_rel:
+                        # Preserve an older file that already occupies this archive name.
+                        index = 1
+                        while True:
+                            alternate = (_Path("mesh") / f"_archive_previous_{index}" /
+                                         _Path(stable_rel).name).as_posix()
+                            if not (session_root / alternate).exists():
+                                relative = alternate
+                                break
+                            index += 1
+                    zf.write(str(fpath), relative)
             return _dumps({"ok": True, "path": str(dest_path)})
         except Exception as e:
             return _err(e)
@@ -746,8 +946,10 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
         part_number: Optional[str] = None,
         query: Optional[str] = None,
         auto_confirm_non_critical: bool = True,
+        project_dir: Optional[str] = None,
+        force_build: bool = False,
     ) -> str:
-        """One-call flow: seed → research → build → attach for a library part with no 3D model.
+        """Find an existing CAD model first, or research, build and attach a library part.
 
         Composes the existing RE building blocks into a single backend call that
         the GUI (RE-32) can trigger with one click:
@@ -772,6 +974,8 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
             query:                     Free-text fallback search (used when no MPN).
             auto_confirm_non_critical: Pass through to mission; does NOT affect
                                        fit-critical dim gates.
+            project_dir:               Working folder owning the session.
+            force_build:               Skip model search and build from research.
 
         Returns
         -------
@@ -786,8 +990,23 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
             # ── 1. Seed session from parts-hub entry ──────────────────────────
             sid = _new_session_id()
             label = f"RE {part_ref}"
-            session = _make_session(sid, label, part_ref)
+            session = _make_session(sid, label, part_ref, project_dir)
+            session["lane"] = "reference"
             _save_session(session)
+
+            if not force_build and (part_number or query):
+                reference = _find_reference_models(part_number or query)
+                if reference.get("ok"):
+                    _store_reference_search(session, reference)
+                    _save_session(session)
+                    if _has_reference_match(reference):
+                        return _dumps({
+                            "ok": True, "session_id": sid, "part_ref": part_ref,
+                            "model_present": False,
+                            "existing_models": reference["candidates"],
+                            "standard_part": reference["standard_part"],
+                            "hint": "Existing CAD model(s) found — call reveng_use_model(session_id, url=...) instead of building one.",
+                        })
 
             # Best-effort: copy photos / datasheet from the parts-hub record
             seeded: dict = {}
@@ -933,41 +1152,7 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
                     "part_ref": part_ref,
                 })
 
-            s2["part_ref"] = part_ref
-            s2["provenance"].append({
-                "step": "attach_result",
-                "part_ref": part_ref,
-                "ts": _now_iso(),
-            })
-            _save_session(s2)
-
-            artifacts = s2.get("artifacts", {})
-            doc_id = artifacts.get("doc_id")
-            mesh_path = artifacts.get("mesh_path")
-            geometry_ref = doc_id or mesh_path
-
-            # Write sidecar so RevengResultAdapter can serve this PartRecord
-            sidecar = {
-                "schema": "aicad.reveng_result/1",
-                "session_id": sid,
-                "part_ref": part_ref,
-                "name": s2.get("name", part_ref),
-                "doc_id": doc_id,
-                "mesh_path": mesh_path,
-                "attached_at": _now_iso(),
-            }
-            sidecar_path = _session_path(sid) / "reveng_result.json"
-            sidecar_path.write_text(_json.dumps(sidecar, indent=2))
-
-            # Register live adapter into parts-hub singleton (idempotent)
-            try:
-                from services.parts import register_provider as _reg_provider  # noqa: PLC0415
-                from services.parts.adapters.reveng_result_adapter import (  # noqa: PLC0415
-                    RevengResultAdapter,
-                )
-                _reg_provider(RevengResultAdapter())
-            except Exception:
-                pass  # best-effort
+            geometry_ref, s2 = _attach_session_result(s2, part_ref)
 
             model_present = bool(geometry_ref)
             return _dumps({
@@ -992,6 +1177,8 @@ def register_reveng_build_tools(mcp: FastMCP) -> None:
         url: Optional[str] = None,
     ) -> str:
         """Pull web / datasheet data into a session for the no-photo research lane.
+
+        Run ``reveng_find_models`` first and use an existing CAD model when available.
 
         Given a part number, a search query, or a vendor / listing URL (at least one
         required), fetches the datasheet PDF + spec data + images from the internet,

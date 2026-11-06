@@ -87,6 +87,7 @@ def freq_tool(monkeypatch):
 
     def one_mode_tool(*args, **kwargs):
         kwargs.setdefault("n_modes", 1)
+        kwargs.setdefault("material", "steel")
         return tool.fn(*args, **kwargs)
 
     return one_mode_tool

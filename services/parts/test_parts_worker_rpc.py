@@ -23,18 +23,18 @@ def _noop_emit(_):
 
 def _search(query, domain=None, limit=20):
     from services.parts.worker_rpc import _part_search
-    params = {"query": query, "limit": limit}
+    params = {"query": query, "limit": limit, "include_live": False}
     if domain:
         params["domain"] = domain
     return _part_search(params, _noop_emit)
 
 def _get(part_id):
     from services.parts.worker_rpc import _part_get
-    return _part_get({"part_id": part_id}, _noop_emit)
+    return _part_get({"part_id": part_id, "include_live": False}, _noop_emit)
 
 def _place(part_id, doc=None, extra=None):
     from services.parts.worker_rpc import _part_place
-    params = {"part_id": part_id}
+    params = {"part_id": part_id, "include_live": False}
     if doc is not None:
         params["doc"] = doc
     if extra is not None:
@@ -48,7 +48,7 @@ def _place(part_id, doc=None, extra=None):
 
 class TestWorkerRpcRegistration:
     def test_worker_methods_keys(self):
-        """WORKER_METHODS exposes exactly part_search / part_get / part_place."""
+        """WORKER_METHODS includes the core part methods."""
         from services.parts.worker_rpc import WORKER_METHODS
         assert "part_search" in WORKER_METHODS
         assert "part_get"    in WORKER_METHODS
@@ -197,7 +197,7 @@ class TestCategoryRoutedPartsSearch:
 
     def _gui_search(self, **params):
         from services.parts.gui_rpc import _parts_search
-        return _parts_search(params, _noop_emit)
+        return _parts_search({"include_live": False, **params}, _noop_emit)
 
     def test_category_routed_search(self):
         """category_id fasteners routes to fastener/mech_family domains."""
@@ -207,11 +207,11 @@ class TestCategoryRoutedPartsSearch:
             assert item["domain"] in ("fastener", "mech_family", "catalog"), \
                 f"category routing violated: {item['domain']!r}"
 
-    def test_unknown_category_id_degrades_gracefully(self):
-        """Unknown category_id must return ok:true (unrouted), never a traceback."""
+    def test_unknown_category_id_reports_error(self):
         r = self._gui_search(query="M8", category_id="no.such.category")
-        assert r.get("ok") is True
-        assert isinstance(r.get("results"), list)
+        assert r.get("ok") is False
+        assert r["reason"] == "unknown_category"
+        assert "no.such.category" in r["hint"]
 
     def test_legacy_category_param_still_works(self):
         r = self._gui_search(query="M8", category="fastener")
@@ -226,7 +226,7 @@ class TestCategoryRoutedPartsSearch:
         def _fake_search(query, *, domain=None, filters=None, limit=20, **_kw):
             def bolt(pid, length):
                 return {"part_id": f"fastener:SYN:{pid}", "domain": "fastener",
-                        "title": f"Synthetic bolt {pid}", "designation": pid,
+                        "title": f"Synthetic hex bolt {pid}", "designation": pid,
                         "params": {"thread": "M8", "length_mm": length},
                         "sourcing": [], "provenance": "test", "license": "clean-room"}
             return [bolt("M8x20", "20 mm"), bolt("M8x80", 80)]
@@ -244,7 +244,7 @@ class TestCategoryRoutedPartsSearch:
 
         def _fake_search(query, *, domain=None, filters=None, limit=20, **_kw):
             return [{"part_id": "fastener:SYN:M8", "domain": "fastener",
-                     "title": "Synthetic M8", "designation": "M8",
+                     "title": "Synthetic hex bolt M8", "designation": "M8",
                      "params": {"thread": "M8"}, "sourcing": [],
                      "provenance": "test", "license": "clean-room"}]
 
@@ -290,17 +290,71 @@ class TestCategoryRoutedPartsSearch:
 class TestVendorsHealthRpc:
     """Parts Library V2: vendors_health_check / vendors_health_status envelopes."""
 
-    def test_check_degrades_without_health_module(self):
-        """services.browser.health is another agent's module — absence must yield
-        the documented ok:false envelope (never a traceback). When it exists,
-        the call must return {ok:true, started:bool}."""
-        from services.parts.gui_rpc import _vendors_health_check
-        r = _vendors_health_check({}, _noop_emit)
-        assert "ok" in r
-        if r["ok"]:
-            assert "started" in r
-        else:
-            assert r.get("error") == "health module not available"
+    def test_check_degrades_without_health_module(self, monkeypatch):
+        import sys
+
+        import services.browser as browser
+        from services.browser import health  # noqa: F401 — ensure the package attribute exists
+        from services.parts import gui_rpc
+
+        monkeypatch.delattr(browser, "health")
+        monkeypatch.setitem(sys.modules, "services.browser.health", None)
+        r = gui_rpc._vendors_health_check({"sites": ["unregistered-test-site"]}, _noop_emit)
+        assert r.get("ok") is False
+        assert r.get("error") == "health module not available"
+
+    def test_check_reports_unregistered_site_and_finishes(self, monkeypatch, tmp_path):
+        import threading
+
+        from services.browser import embed, health
+        from services.parts import gui_rpc
+
+        site = "unregistered-health-rpc-test-site"
+        assert health.get_adapter(site) is None
+        assert not gui_rpc._health_running()
+        monkeypatch.setattr(gui_rpc, "_health_thread", None)
+        monkeypatch.setattr(gui_rpc, "_health_state",
+                            {"results": [], "started_ts": 0.0, "finished_ts": 0.0})
+        monkeypatch.setattr(health.profiles, "_profile_root", lambda: tmp_path)
+
+        class _InactiveManager:
+            def wizard_active(self):
+                return False
+
+        monkeypatch.setattr(embed, "get_manager", lambda: _InactiveManager())
+        entered = threading.Event()
+        release = threading.Event()
+        real_check = health.run_health_check
+
+        def gated_check(*, sites):
+            entered.set()
+            release.wait()
+            return real_check(sites=sites)
+
+        monkeypatch.setattr(health, "run_health_check", gated_check)
+        try:
+            r = gui_rpc._vendors_health_check({"sites": [site]}, _noop_emit)
+            assert r.get("ok") is True and r.get("started") is True
+            assert entered.wait(2.0), "health check did not start"
+            status = gui_rpc._vendors_health_status({}, _noop_emit)
+            assert status["running"] is True
+            assert status["results"] == []
+            repeated = gui_rpc._vendors_health_check({"sites": [site]}, _noop_emit)
+            assert repeated.get("ok") is True and repeated.get("already") is True
+            assert repeated.get("started") is False
+        finally:
+            thread = gui_rpc._health_thread
+            release.set()
+            if thread is not None:
+                thread.join()
+
+        status = gui_rpc._vendors_health_status({}, _noop_emit)
+        assert status["running"] is False
+        assert status["started_ts"] and status["finished_ts"]
+        assert len(status["results"]) == 1
+        result = status["results"][0]
+        assert result["site"] == site and result["ok"] is False
+        assert result["error"] == f"no adapter registered for '{site}'"
 
     def test_check_rejects_non_list_sites(self):
         from services.parts.gui_rpc import _vendors_health_check
@@ -338,7 +392,7 @@ class TestVendorResultCache:
 
         assert gui_rpc._vendor_cache_get("mcmaster", "m8", 20) is None
 
-    def test_clean_records_and_empty_searches_are_cached(self, monkeypatch, tmp_path):
+    def test_clean_records_are_cached_but_empty_results_are_not(self, monkeypatch, tmp_path):
         gui_rpc = self._isolated_cache(monkeypatch, tmp_path)
         clean = [{"part_id": "catalog:mcmaster::https://example.test/1",
                   "title": "M8 cap screw"}]
@@ -346,7 +400,7 @@ class TestVendorResultCache:
         gui_rpc._vendor_cache_put("mcmaster", "definitely-absent", 20, [])
 
         assert gui_rpc._vendor_cache_get("mcmaster", "m8", 20) == clean
-        assert gui_rpc._vendor_cache_get("mcmaster", "definitely-absent", 20) == []
+        assert gui_rpc._vendor_cache_get("mcmaster", "definitely-absent", 20) is None
 
 
 class TestLiveVendorConcurrency:
@@ -388,7 +442,7 @@ class TestLiveVendorConcurrency:
                 max_active = max(max_active, active)
                 if active == gui_rpc._LIVE_FETCH_CONCURRENCY:
                     three_running.set()
-            release_scrapes.wait(timeout=2.0)
+            release_scrapes.wait()
             with lock:
                 active -= 1
             return []
@@ -411,7 +465,8 @@ class TestLiveVendorConcurrency:
         finally:
             release_scrapes.set()
             for thread in threads:
-                thread.join(timeout=2.0)
+                if thread.ident is not None:
+                    thread.join()
 
         assert all(not thread.is_alive() for thread in threads)
         assert search_calls == 9
@@ -448,7 +503,7 @@ class TestLiveVendorConcurrency:
                 max_active = max(max_active, active)
                 if active == gui_rpc._LIVE_FETCH_CONCURRENCY:
                     slots_saturated.set()
-            release_scrapes.wait(timeout=2.0)
+            release_scrapes.wait()
             with lock:
                 active -= 1
             return []
@@ -485,9 +540,10 @@ class TestLiveVendorConcurrency:
         finally:
             release_scrapes.set()
             for thread in cold_threads:
-                thread.join(timeout=2.0)
+                if thread.ident is not None:
+                    thread.join()
             if warm_thread.ident is not None:
-                warm_thread.join(timeout=2.0)
+                warm_thread.join()
 
         assert completed_while_saturated
         assert calls_while_saturated == 3
@@ -549,7 +605,8 @@ class TestDomainListSearch:
 
     def test_hub_search_domain_list(self):
         from services.parts import search as _search
-        recs = _search("M8", domain=["fastener", "mech_family"], limit=20)
+        recs = _search("M8", domain=["fastener", "mech_family"], limit=20,
+                       include_live=False)
         for rec in recs:
             assert rec["domain"] in ("fastener", "mech_family")
 
@@ -695,8 +752,8 @@ class TestPartsThumbnail:
 
     @staticmethod
     def _thumb(part_id, tmp_path, monkeypatch, **extra):
-        from services.parts import gui_rpc
-        monkeypatch.setattr(gui_rpc, "_thumb_cache_dir", lambda: tmp_path)
+        from services.parts import gui_rpc, thumbs
+        monkeypatch.setattr(thumbs, "_cache_dir", lambda: tmp_path)
         return gui_rpc._parts_thumbnail({"item_id": part_id, **extra}, _noop_emit)
 
     def test_missing_item_id_returns_ok_false(self, tmp_path, monkeypatch):
@@ -712,15 +769,103 @@ class TestPartsThumbnail:
     def test_uncached_core_family_part_renders_png(self, tmp_path, monkeypatch):
         """A local catalog fastener carries NO vendor image_url — its preview exists only if
         the worker renders geometry_ref.kind == "core_family" through the engine."""
-        from services.parts.gui_rpc import _resolve_core_family
+        from services.mcp import core_bridge
+        from services.parts import thumbs
         part_id = "fastener:ISO 7380:M5"
-        if _resolve_core_family(part_id) is None:
+        if not core_bridge.available():
+            pytest.skip("native core unavailable")
+        record = thumbs._record_for_part(part_id)
+        if not record or not thumbs._geometry_identity(record):
             pytest.skip("hub data for the button-head catalog record not present")
         r = self._thumb(part_id, tmp_path, monkeypatch)
-        if not r.get("ok") and "core" in r.get("reason", "").lower():
-            pytest.skip(f"native core not available: {r.get('reason')}")
         assert r.get("ok") is True, \
             f"core_family part rendered nothing — the GUI card gets a bare glyph: {r}"
         raw = base64.b64decode(r["image_b64"])
         assert raw[:8] == b"\x89PNG\r\n\x1a\n", "preview is not a decodable PNG"
         assert list(tmp_path.glob("*.img")), "render was not cached — every view re-renders"
+
+
+def test_catalog_worker_search_get_acquire_and_placement(monkeypatch):
+    from services import parts
+    from services.mcp import core_bridge
+    from services.parts import parts_library, worker_rpc
+
+    record = {"part_id": "bearing:bundle:one", "geometry_ref": {"kind": "import_file", "path": "/cache/one.step"}}
+    calls = []
+    monkeypatch.setattr(parts, "search", lambda query, **kw: calls.append(("search", kw)) or [record])
+    monkeypatch.setattr(parts, "get", lambda part_id, **kw: calls.append(("get", kw)) or record)
+    monkeypatch.setattr(parts_library, "acquire_part", lambda part_id, **kw:
+                        calls.append(("acquire", kw)) or record)
+    monkeypatch.setattr(core_bridge, "call", lambda method, params:
+                        calls.append((method, params)) or {"ok": True})
+    assert worker_rpc._part_search({"query": "bearing", "include_live": False}, _noop_emit)["ok"]
+    assert calls[-1][1]["include_live"] is False
+    assert worker_rpc._part_get({"part_id": record["part_id"], "include_live": False}, _noop_emit)["part"] == record
+    assert calls[-1][1] == {"include_live": False, "acquire": False}
+    assert worker_rpc._part_acquire({"part_id": record["part_id"], "offline": True}, _noop_emit)["part"] == record
+    assert calls[-1][1]["offline"] is True
+    assert worker_rpc._part_place({"part_id": record["part_id"], "include_live": False}, _noop_emit)["ok"]
+    assert calls[-2] == ("get", {"include_live": False, "acquire": True})
+    assert calls[-1][1]["record"] == record
+    assert not worker_rpc._part_place({"part_id": record["part_id"], "target_doc_id": "doc1"}, _noop_emit)["ok"]
+
+
+def test_catalog_ingest_checks_each_path(monkeypatch, tmp_path):
+    from services.agent import request_context
+    from services.parts import parts_library, worker_rpc
+
+    seen = []
+    def guard(path):
+        seen.append(path)
+        if path == "/outside":
+            raise ValueError("cell_refused")
+        return tmp_path / path
+    monkeypatch.setattr(request_context, "cell_path", guard)
+    monkeypatch.setattr(parts_library, "ingest_manifest", lambda *args, **kwargs: {"ok": True})
+    result = worker_rpc._part_library_ingest(
+        {"manifest_path": "manifest.json", "artifact_root": "/outside"}, _noop_emit)
+    assert not result["ok"] and "cell_refused" in result["reason"]
+    assert seen == ["manifest.json", "/outside"]
+
+
+def test_public_get_acquires_only_on_request(monkeypatch):
+    from services import parts
+    from services.parts import parts_library
+
+    class Hub:
+        def get(self, part_id, *, include_live=True):
+            return {"part_id": part_id, "live": include_live}
+    monkeypatch.setattr(parts, "_hub", Hub())
+    seen = []
+    monkeypatch.setattr(parts_library, "acquire_part", lambda part_id, **kw:
+                        seen.append((part_id, kw)) or {"part_id": part_id})
+    assert parts.get("bearing:bundle:one", include_live=False)["live"] is False
+    assert seen == []
+    assert parts.get("bearing:bundle:one", include_live=False, acquire=True)["part_id"] == "bearing:bundle:one"
+    assert seen == [("bearing:bundle:one", {"offline": True})]
+
+
+def test_worker_parametric_recipe_uses_existing_builder(monkeypatch):
+    from services import parts
+    from services.mcp import parts_tools
+    from services.parts import worker_rpc
+    record = {"part_id": "mech:bundle:stepper",
+              "geometry_ref": {"kind": "parametric_stepper_motor"}}
+    monkeypatch.setattr(parts, "get", lambda *args, **kwargs: record)
+    seen = []
+    monkeypatch.setattr(parts_tools, "place_parametric_impl",
+                        lambda *args: seen.append(args) or {"ok": True, "doc_id": "doc1"})
+    result = worker_rpc._part_place({"part_id": record["part_id"], "params": {"length_mm": 20}},
+                                    _noop_emit)
+    assert result["ok"]
+    assert seen == [(record["part_id"], record, {"length_mm": 20})]
+    assert not worker_rpc._part_place({"part_id": record["part_id"], "doc": {"kind": "part"}},
+                                      _noop_emit)["ok"]
+
+
+def test_cell_get_cannot_bypass_acquire_method_admission(monkeypatch):
+    from services.agent import request_context
+    from services.parts import worker_rpc
+    monkeypatch.setattr(request_context, "in_cell", lambda: True)
+    out = worker_rpc._part_get({"part_id": "bearing:bundle:one", "acquire": True}, _noop_emit)
+    assert not out["ok"] and "part_acquire" in out["reason"]

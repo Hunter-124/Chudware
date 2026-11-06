@@ -165,7 +165,7 @@ CHECK_INTERFACE_FITMENT = "interface_fitment"
 
 
 # ---------------------------------------------------------------------------
-# Per-stage battery / helper_tools / exit_gate / playbook (contract §1)
+# Per-stage battery / helper_tools / exit_gate (contract §1)
 # ---------------------------------------------------------------------------
 #
 # ``check_battery``  : ordered read-only checks (cheap first).
@@ -173,49 +173,42 @@ CHECK_INTERFACE_FITMENT = "interface_fitment"
 # ``exit_gate``      : checks that must PASS before the orchestrator advances.
 #                      A ``blocker`` on any exit-gate check gates stage exit
 #                      (§9.3) — it does NOT block the model's next action.
-# ``playbook_default``: the playbook a role defaults to at this stage.
 
 _STAGE_SPEC: dict[str, dict] = {
     "intake": {
         "check_battery": [],
         "helper_tools": ["describe_project", "req_create"],
         "exit_gate": [],
-        "playbook_default": None,
     },
     "spec": {
         "check_battery": [],
         "helper_tools": ["fit_calc", "research_material_lookup", "research_thread_spec",
                          "resolve_process"],
         "exit_gate": [],
-        "playbook_default": None,
     },
     "layout": {
         "check_battery": [],
         "helper_tools": ["add_datum", "measure_between"],
         "exit_gate": [],
-        "playbook_default": "layout_skeleton",
     },
     "sketch": {
         "check_battery": [CHECK_SKETCH_HEALTH, CHECK_OPEN_PROFILE],
         "helper_tools": ["sketch_health", "sketch_auto_constrain",
                          "sketch_fully_define", "describe_sketch"],
         "exit_gate": [CHECK_SKETCH_HEALTH, CHECK_OPEN_PROFILE],
-        "playbook_default": "sketch_profile",
     },
     "feature": {
         "check_battery": [CHECK_REBUILD, CHECK_FEATURE_OVERLAP],
         "helper_tools": ["check_feature_overlap", "regen_diagnose", "describe_part"],
         "exit_gate": [CHECK_REBUILD, CHECK_FEATURE_OVERLAP],
-        "playbook_default": None,
     },
     "part_verify": {
-        # wall_thickness (fast ray-cast) and DFM (process gate) run at part_verify;
+        # wall_thickness (inscribed-sphere screening) and DFM run at part_verify;
         # both are advisory — they never block exit (wall_thickness → action, DFM → blocker
         # only on a hard process failure). CHECK_PART_VERIFY is the legacy verify_battery gate.
         "check_battery": [CHECK_PART_VERIFY, CHECK_WALL_THICKNESS, CHECK_DFM],
         "helper_tools": ["verify_battery", "measure_part", "wall_thickness", "dfm_check"],
         "exit_gate": [CHECK_PART_VERIFY],
-        "playbook_default": None,
     },
     "assembly": {
         # interface_fitment (hole-pattern / coaxiality / contact-plane) runs at assembly
@@ -224,7 +217,6 @@ _STAGE_SPEC: dict[str, dict] = {
         "helper_tools": ["check_interference", "fit_calc", "measure_between",
                          "solve_mates", "interface_check"],
         "exit_gate": [CHECK_INTERFERENCE],
-        "playbook_default": None,
     },
     "sim": {
         # Battery order: BC lint first (cheap deterministic), then margin/divergence
@@ -244,25 +236,21 @@ _STAGE_SPEC: dict[str, dict] = {
         # Divergence is action-level (not a blocker) so the model may acknowledge and
         # proceed; it is NOT in the exit gate per §9.3.
         "exit_gate": [CHECK_SIM_BC, CHECK_SIM_RESULTS, CHECK_SIM_MARGIN],
-        "playbook_default": None,
     },
     "cam": {
         "check_battery": [CHECK_CAM_SIM],
         "helper_tools": ["cam_simulate", "cam_generate"],
         "exit_gate": [CHECK_CAM_SIM],
-        "playbook_default": None,
     },
     "deliver": {
         "check_battery": [],
         "helper_tools": ["make_drawing", "make_report", "export_part"],
         "exit_gate": [],
-        "playbook_default": None,
     },
     FIX_STAGE: {
         "check_battery": [CHECK_REBUILD],
         "helper_tools": ["regen_diagnose", "regen_resolve"],
         "exit_gate": [],
-        "playbook_default": None,
     },
 }
 
@@ -282,10 +270,6 @@ def exit_gate(stage: str) -> list[str]:
     return list(_STAGE_SPEC.get(stage, {}).get("exit_gate", []))
 
 
-def playbook_default(stage: str) -> Optional[str]:
-    return _STAGE_SPEC.get(stage, {}).get("playbook_default")
-
-
 def next_stage(stage: str) -> Optional[str]:
     """Return the linearly-following stage, or ``None`` at the end / for ``fix``."""
     try:
@@ -293,29 +277,3 @@ def next_stage(stage: str) -> Optional[str]:
     except ValueError:
         return None
     return STAGES[i + 1] if i + 1 < len(STAGES) else None
-
-
-# ---------------------------------------------------------------------------
-# Org-layer exit-gate helper (§18)
-# ---------------------------------------------------------------------------
-
-def check_interface_change_gate(
-    org_state,   # services.agent.org.OrgState — duck-typed to avoid circular import
-    from_dept: str,
-) -> bool:
-    """Return True (BLOCKED) if *from_dept* has unacked interface_change messages.
-
-    The foreman calls this at stage exit: if blocked, the sender's stage advance
-    is gated until every recipient in the channel has acknowledged the change (§18).
-
-    ``org_state`` is the ``OrgState`` instance for the current mission; pass
-    ``None`` (or any falsy value) to skip the check — safe to call unconditionally
-    even when the org layer is disabled (``PipelineFlags.org_layer=False``).
-    """
-    if org_state is None:
-        return False
-    # Duck-typed call — works with real OrgState and any compatible mock.
-    fn = getattr(org_state, "has_unacked_interface_changes", None)
-    if fn is None:
-        return False
-    return bool(fn(from_dept))

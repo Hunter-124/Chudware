@@ -3,7 +3,7 @@
 Load-bearing conventions and invariants for non-GUI work: engine, daemon, documents,
 simulation, manufacturing, scripts and tests. Repository layout and ownership live in
 [`AGENTS.md`](../../AGENTS.md) and [`ARCHITECTURE.md`](../../ARCHITECTURE.md); the online
-agent boundary is in [chudcode-integration.md](chudcode-integration.md); GUI conventions are
+agent boundary is in [omp-integration.md](omp-integration.md); GUI conventions are
 in [gui-architecture.md](gui-architecture.md). Each rule below names the test or code that
 pins it, so the rule can be checked against the source rather than trusted.
 
@@ -26,9 +26,9 @@ pins it, so the rule can be checked against the source rather than trusted.
 
 ```bash
 ./build.sh [app|core|daemon|all|wasm|stage|clean]   # modes/env documented in build.sh; binary: host/build-linux/bin/chudware
-scripts/gate.sh                  # full gate: check.py -> core build + ctest -> host build -> pytest -> shot smoke
-python3 scripts/check.py         # source/audit gates; run with the provisioned runtime interpreter
-scripts/provision_venv.sh        # creates .venv-mcp; gate.sh resolves its python (override: CHUDWARE_GATE_PYTHON)
+scripts/testbox.py --gate        # isolated full Linux gate
+.venv-mcp/bin/python scripts/check.py   # source/audit gates
+scripts/provision_venv.sh        # creates .venv-mcp
 ./build.sh stage                 # dist is FIRST in hostd lookup: a stale dist means a stale daemon
 CHUDWARE_SHOT=<scenario> ./host/build-linux/bin/chudware --ui-screenshot scratch/smoke.png   # headless runtime smoke
 CHUDWARE_STARTUP_TRACE=1 ./host/build-linux/bin/chudware   # startup milestones on stderr, ms since main()
@@ -39,10 +39,10 @@ scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware
   MCP/hostd call, or a headless `run_mission.py` turn). For UI changes, inspect the actual
   changed surface, not only the existence of a capture.
 - Run one `./build.sh` at a time; concurrent builds race on the Ninja lock.
-- The gate reports SKIP (not failure) when OCCT or the runtime venv is absent. Scripted GUI
-  launches use `xvfb-run -a`; `CHUDWARE_SHOT_HEADED=1` shows a window.
+- See [Running tests](../../CONTRIBUTING.md#running-tests) for suites and isolation.
+  Scripted GUI launches use `xvfb-run -a`; `CHUDWARE_SHOT_HEADED=1` shows a window.
 - Gate Python coverage includes service units, scripts, assets, tools and training; the
-  packaging stage covers the whole `packaging/` suite with the same interpreter. `check.py`
+  packaging stage covers the whole `packaging/` suite. `check.py`
   also runs the shared-UI manifest/asset audit. Astro `.astro/` metadata is local state.
 - Mixed pytest collections: the root [`conftest.py`](../../conftest.py) isolates non-MCP
   engine tests per test; [`services/mcp/conftest.py`](../../services/mcp/conftest.py) opts
@@ -93,13 +93,30 @@ scripts/run_mission.py --workspace <project> --sessions-dir ~/Documents/Chudware
   non-destructive booleans share untouched sub-shapes with their arguments. OCCT
   UnifySameDomain edits its input's edges in place, so unify runs on a `BRepBuilderAPI_Copy`
   (`geom::unify_same_domain`, the `dress.cpp` join) with the copy's history recorded.
-- `core/agent/run.cpp` calls doc ops in-process; every direct `doc::doc_new`/`doc_apply_ops`
-  site invokes the `chudware_set_doc_publish_sink` callback, or its result stays invisible to
-  clients until the run ends. `internal:true` keeps propagating (preflight shadow clone).
+- Embedded BREP base64 decoding uses an unsigned rolling bit accumulator. Signed
+  overflow/left shifts are undefined in C++17 even when only the low output byte
+  is retained; preserve the unsigned accumulator when changing persistence code.
 - **Preflight is bounded advisory work.** `preflight_ops` spends at most a 10 000 ms candidate
   budget via `doc_dry_run_ops(budget_ms=...)`; the scratch rebuild runs in an expendable
   process group, never an unbounded parent fallback. Expiry reports
   `verdict:"skipped", skipped:"budget_exceeded"`, not failed geometry.
+  Explicit MCP prediction and `add_features` share `_prepare_add_features_ops`, including
+  reference normalization, placeholder shifts and sketch `auto_define` policy; automatic
+  preflight consumes the already-prepared batch and never prepares it twice.
+- **Rejected features keep their authored identity.** Build `failed_features` and the
+  human-facing error from the authoritative `rejected_tree` metadata. An atomic rejection
+  has no committed `id_map`; deriving names from that map loses the names precisely when
+  the caller needs to identify and repair the failing feature. Rejection leaves the live
+  document unchanged.
+- **Assembly operation IDs.** Component/mate edit and delete ops require nonempty string
+  `id` fields. Missing or wrong-type IDs are `invalid_op` with the failing batch index,
+  not JSON type exceptions; no earlier operation in the rejected batch is committed.
+- **Assembly pose ownership is final-state.** The MCP transform guard projects mate deletion,
+  suppression, addition and component grounding in batch order, without mutating live state.
+  A batch that frees a component and moves it is valid; a final live mate still owns its pose.
+- **Background results.** `get_job` and `wait_job` must not wrap a failed operation in
+  `ok:true`. A completed job keeps `status:"done"` and its full `result`, but propagates
+  `ok:false` and error/code/reason/detail so model helpers and agent events see failure.
 
 ## hostd and daemon lifecycle
 
@@ -126,6 +143,25 @@ Reference: [`docs/reference/HOSTD.md`](../reference/HOSTD.md); contract:
   only when checkpoint revision + 1 equals the batch revision (`doc_revert expect_revision`).
   There is no semantic conflict check by design
   (`services/mcp/test_multiagent_overlap.py::test_overlapping_edits_same_doc_both_land`).
+- **Shared metadata is per-member atomic.** Independent provenance writes update members
+  without replacing each other's metadata; `metadata_revision` lets autosave detect metadata
+  changes independently of geometry revision.
+- **Presentation is explicit.** Live shared documents need not be visible: GUI-origin,
+  intentional user-open/recovery, and explicitly presented documents are admitted.
+  `show_in_app` requests `doc_present` without saving; legacy publication is opt-in and
+  updates only presented documents. See [HOSTD](../reference/HOSTD.md#live-documents-and-presentation).
+- **Interactive previews do not acquire custody.** Human edits remain available during
+  agent runs. Preview mutation/revert uses the last locally applied revision; stale
+  cancellation preserves peer edits. Sketch session tokens identify transient solver state,
+  not document ownership, and discard never persists stale coordinates.
+- **Assembly source failures stay recoverable.** Missing file sources retain structured
+  component errors and surviving geometry. Nested unverified component caches propagate
+  trust to the root and preserve verification scope across prefetch threads; they cannot be
+  promoted or signed merely because the outer assembly was rebuilt.
+- **Concurrent modeling evidence.** Six real async jobs (three writers on one document,
+  three on their own documents) produced shared volume `1737.168146928204 mm³`, cached saves,
+  and six surviving intents. The pinned runtime 0.4.4 no-provider smoke exercises the
+  projected CAD schema; it does not measure live OpenAI/Anthropic modeling quality.
 - **Background GUI queries stay off the primary socket.** Document-free metadata queries
   from non-primary threads use per-thread `gui-background` sockets (exact allowlist in
   `services/ipc/ipc_client.cpp`, reached through `services/worker/engine_backend.cpp`).
@@ -134,27 +170,46 @@ Reference: [`docs/reference/HOSTD.md`](../reference/HOSTD.md); contract:
   tray Quit (5 s) and SIGTERM are hard stops with a deadline (`CHUDWARE_HOSTD_DRAIN_GRACE_S`,
   default 20 s). The stale-binary self-drain is soft, so a rebuild never kicks a live session.
 - **A draining daemon refuses new clients by name** (`daemon.draining` event plus a
-  `daemon_draining` hello error); `--status`/`--stop` are still admitted. No client falls back
+  `daemon_draining` hello error); `--status`/`--stop` are still admitted, and on a soft stale
+  drain so are new `gui` sockets from a GUI process that already holds a live connection
+  (its answer/steer/Stop side lanes). No client falls back
   to an in-process engine: Python raises `CoreError(code="daemon_draining")`; the GUI stays in
   daemon mode, names the drain on its unreachable chip, and reconnects to the new build.
+- **Broken daemon connections do not terminate the GUI.** Linux and macOS IPC
+  sends suppress SIGPIPE per socket/write, returning EOF to the reconnect path
+  without changing the process-wide signal disposition. The real transport
+  regression runs with SIGPIPE restored to its default fatal disposition.
 - **Doc GC** (`core/hostd/doc_registry.cpp`): `CHUDWARE_DOC_GC_GRACE_S` (90 s); agent/MCP-origin
-  docs floor at `CHUDWARE_DOC_GC_AGENT_GRACE_S` (1800 s); `CHUDWARE_DOC_GC=0` disables. The
-  grace never pins the daemon; a clean exit discards, so recovery is crash-only.
+  docs floor at `CHUDWARE_DOC_GC_AGENT_GRACE_S` (1800 s); `CHUDWARE_DOC_GC=0` disables GC.
+  A live turn holds every non-internal document it opens, attaches or reads, including
+  GUI-origin documents and read-only attaches. Tool-socket disconnects do not release
+  those holds; child tools and detached CAD jobs inherit the owning turn's scope.
+  Each turn releases only its own holds when it ends; orphan grace starts once no run or
+  client remains. Last-writer mirror notifications are deferred until the final holding
+  turn ends. Co-editing remains sequential, not exclusive.
+  Grace never pins the daemon; a deliberate exit discards, so recovery is crash-only (a
+  SIGTERM/OS-shutdown exit counts as a crash and keeps a final snapshot).
 - **Worker lanes** (`WorkerBridge::forMethod`, `core/hostd/worker_bridge.cpp`): a new stateful
   agent RPC family must join the agent-lane prefix list or it lands in a process blind to
-  Chudcode sessions. Files shared across worker processes need flocks, not threading locks.
+  OMP sessions. Files shared across worker processes need flocks, not threading locks.
+- **Service lane** (`WorkerBridge::service()`, `isServiceMethod`, worker lane `service`): the
+  session-free calls a GUI polls during a run — `omp_provider_list` / `omp_models_list` /
+  `omp_auth_state` and the key, sign-in and sign-out calls, `ai_roles_*`, `subscription_*`,
+  `skills_*` — have their own lazily started worker, so a turn on the primary can never refuse
+  them. A method joins that list only if it never touches an in-memory agent session, and a
+  family with in-process state (`subscription_*` login progress) moves as a whole. An
+  interactive `omp_login` holds only that worker; its other calls fail fast while it runs.
 - **One turn per agent worker.** `WorkerBridge::dispatch` runs each `agent_admin_turn` in a
   pool worker (cap `CHUDWARE_AGENT_WORKERS`, default 4; idle extras reaped after 10 min). A
   conversation is owned by one worker; moving it requires the owner to release its idle
-  runtime first (see [chudcode-integration.md](chudcode-integration.md#sessions-and-lifecycle)).
+  runtime first (see [omp-integration.md](omp-integration.md#sessions-and-lifecycle)).
   Worker forks run on one daemon-lifetime thread: PDEATHSIG follows the forking thread.
 - **Nothing waits behind a turn.** `WorkerBridge::stop()` cancels the active run over the
   control lane, waits up to 10 s, SIGTERMs, never respawns. A non-turn call queued behind a
-  turn fails at once with `worker_lane_busy`. hostd never replays an `agent_admin_turn` after
-  worker loss (`worker_lost_mid_turn`).
+  turn fails at once with `worker_lane_busy` (service-lane calls never meet one). hostd never
+  replays an `agent_admin_turn` after worker loss (`worker_lost_mid_turn`).
 - In daemon mode each GUI `agent_admin_turn` leases its own connection (up to 8) and takes no
-  client mutex, so turns of different chats overlap; native `agent_run_v2`/`agent_mission_v1`
-  still serialize on `WorkerClient::longRunMtx_`.
+  client mutex, so turns of different chats overlap.
 - **CEF fetch daemon** (`host/src/ui/widgets/cef/cef_daemon.cpp`): the idle watchdog is armed
   before `initialize()`; activity goes through `mark_activity()`. Spawn is single-flight with
   the pid verified (`services/browser/cef_client.py`). A CEF-off build claims and refuses
@@ -175,22 +230,35 @@ Reference: [`docs/reference/HOSTD.md`](../reference/HOSTD.md); contract:
   a miss is written back through `stepplus_write_build_state` (§17), which replaces only the
   cache members and `geometry.step`; never route that through `stepplus_save`, which rewrites
   metadata and marks the file modified.
-- **Agent mission docs are saved, never closed.** `cad_common.save_touched_docs()` runs at every
-  turn terminal and on the crash path, writing into `CHUDWARE_PROJECT_SAVE_DIR`. It never
-  touches `origin_kind=gui` docs, never writes an empty doc, and skips pristine reproducible
-  imports. Agent edits to a user-opened doc stay live (dirty, hostd-autosaved) until an
-  explicit save (`test_project_save`).
+- **Drain document work before engine teardown.** After stopping new requests, embedders call
+  `chudware_drain_background_tasks` before C++/OCCT static destruction. The drain joins
+  component writebacks, cache verification, assembly refreshes and their descendants;
+  hostd does this after final autosave, and the in-process MCP bridge does it at exit.
+- **Agent mission docs are saved, never closed.** `cad_common.save_touched_docs()` sweeps this
+  turn's mutations, including edits to GUI-origin and empty documents; it never automatically
+  saves human-dirty work. It records touched geometry and metadata revisions and verified
+  native-save receipts. A vanished doc is skipped only when its saved file or a same-daemon
+  recovery snapshot covers those revisions; an unresolved save is a visible turn warning,
+  not a failed completed turn. Recovery entries expose same-session and metadata revision
+  evidence so reused doc IDs from another daemon cannot certify stale snapshots.
 - **One design is one document; names carry no version.** A version token resumes the series
-  (`fresh=True` escapes); `sanitize_part_name` (`core/agent/run_stop.cpp`) mirrors the token
-  set and must stay in lockstep with the Python strip.
+  (`fresh=True` escapes); the token set is defined by `_strip_version_suffix` in
+  `services/mcp/cad_common.py`.
 - **Save paths.** `save_part`/`export_part` without a path go to `CHUDWARE_PROJECT_SAVE_DIR`; a
   doc already backed by a `.step+` saves in place; `save_part` refuses
   `path_open_in_user_tab`. Empty docs refuse save/export unless `allow_empty`. Relative
   destinations resolve against `CHUDWARE_PROJECT_DIR`, then `CHUDWARE_FS_ROOT`, never the worker
   cwd or an ancestor repository; absolute and `~` exports still pass credential-path checks.
-- **PLM tools.** `.step+`/`.ecad+` auto-register on save; `plm_item_add` is for non-design files
+- **Import paths.** `import_part` uses the same request-scoped workspace resolution as
+  save/export, including native documents and explicit resume. It never searches worker
+  cwd for a same-named file; no workspace means an absolute path is required.
+- **PLM tools.** `.step+` and KiCad project files auto-register on save. KiCad files
+  use `doc_type:"kicad"`, `kind:"ecad"` and raw snapshots; `ecad_diff` also reports
+  vias, zones, outline and schematic objects. `plm_item_add` is for non-design files
   (`path` is the project root, the tracked item goes in `file_path`/`folder_path`). Project
-  roots default to `CHUDWARE_PROJECT_DIR`, then `CHUDWARE_FS_ROOT`, else `project_root_unavailable`.
+  roots use request-scoped `CHUDWARE_PROJECT_DIR`, then `CHUDWARE_FS_ROOT`, else
+  `project_root_unavailable`. Never widen a selected nested workspace to an ancestor vault
+  or fall back to process cwd; explicit relative vault paths use that same workspace.
 - **Agent edit lock.** A doc written by a non-`gui` client locks every human mutation path
   (`AppState::docLockedByAgent`, banner plus Stop) while the writing run lives, or for 8 s. A
   new human mutation path must check this predicate (`CHUDWARE_SHOT=agentlock`).
@@ -241,8 +309,22 @@ Reference: [`docs/reference/HOSTD.md`](../reference/HOSTD.md); contract:
   Details: [evaluate-tools.md](evaluate-tools.md).
 - Mates: hinge-line angle mates are revolutes; a throwing residual is `mate_unresolved`, never
   converged. Native mates persist engine-owned `reference_frames`; edits never redefine zero.
+- Mate residual DOF reuses `classify_mates`' accepted rank. Do not factor a second global
+  mixed mm/radian Jacobian with a different relative cutoff: it invents freedoms on offset
+  rigid chains. Convergence, residual tolerance, unresolved refs and pose solving are separate
+  decisions and remain unchanged.
 - `compile_document(..., with_display=false)` is the assembly-only lane; its mode is part of the
   compile-cache identity.
+- **Assembly dependencies follow live edits.** Path-backed open parts publish immutable
+  committed snapshots. After source locks are released, direct and nested assembly refreshes
+  run asynchronously, coalesced per assembly, and push the updated tree and mesh without
+  delaying the source edit. An assembly read refreshes any queued source changes before
+  returning. Undo, redo, revert and discarding an unsaved source propagate too. Refreshes
+  never save the source or switch the active GUI document. Disk-only changes still refresh on
+  geometry reads, analysis, activation and saving. Persisted assembly display caches must
+  match recursive disk fingerprints; unsaved source geometry cannot be certified against
+  the older file. Unchanged component shapes and encoded display chunks are reused; the
+  flat AICM handoff still copies the complete resulting mesh for publication.
 - `add_features mode:"new"`/`merge:false` is an independent body; unknown modes refuse by name;
   `transform` moves (`copy:true` duplicates).
 
@@ -268,6 +350,21 @@ Reference: [`docs/reference/HOSTD.md`](../reference/HOSTD.md); contract:
   `inventory_token` and explicit `media_idle=True`, reads back hashes, and removes superseded
   managed toolpaths only after a verified commit. Jobs must be `print_ready` unless the user
   explicitly overrides, in which case failed checks are recorded in the media manifest.
+- **Printing never performs firmware maintenance.** `services/manufacturing/print_safety.py`
+  is shared by slice configuration checks, G-code verification, media publication and printer
+  adapter artifacts. It rejects firmware filenames, uninspectable binary payloads and known
+  firmware/EEPROM/media-write commands; printability overrides cannot bypass it. The slicer
+  also refuses `post_process` hooks and non-G-code output / non-3MF review filenames before
+  launch. Media inventory warns about possible root firmware images and publishing refuses
+  without modifying them. Regression coverage: `test_print_media.py`, slicer `test_gcode_check.py`
+  and `test_prusaslicer.py`, printer `test_adapters.py` and `test_worker_rpc.py`.
+- **Auxiliary print files must not alias firmware images.** Checked destinations reject
+  final symlinks, hardlinks and special files before final-path resolution. Python STL,
+  configuration and manifest writes use `atomic_print_output`; external slicer G-code/3MF
+  exports use private same-filesystem `.part` staging and replacement. Engine STL exports
+  are destination-checked before dispatch. Normal parent-directory aliases remain supported.
+  Media checks normalize FAT trailing dots/spaces, and recovery rejects firmware-looking
+  staged/held paths before mutation. Tests also cover unchanged firmware bytes on refusal.
 
 ## Browser tenant cells
 
@@ -277,6 +374,8 @@ admitted only if [`contracts/cell_methods.json`](../../contracts/cell_methods.js
 them `allow` for the caller's right (owner/manager/editor/viewer); unclassified methods are
 refused and `scripts/cell_methods.py` must keep the table complete. Actors run in nested
 `chudware-actor-sandbox` lanes (`web/deploy/cell/`) with server-minted handles and typed
-`not_found` for foreign, absent or malformed ids. Never add raw forwarding, unsandboxed
-fallbacks, ambient credentials or an admin bypass. Contract: the cell addendum in
-`contracts/worker_rpc.md`; tests: `web/deploy/tests/`.
+`not_found` for foreign, absent or malformed ids. Parts download selections are actor-owned
+write operations; reverse-engineering model search is an actor-owned run, and selecting a
+reference model is an actor-owned write. Viewers cannot invoke these actions. Never add raw
+forwarding, unsandboxed fallbacks, ambient credentials or an admin bypass. Contract: the cell
+addendum in `contracts/worker_rpc.md`; tests: `web/deploy/tests/`.

@@ -547,7 +547,7 @@ def _copyright(license_path: Path) -> str:
         "Upstream-Contact: Chudware contributors <167375961+Hunter-124@users.noreply.github.com>\n"
         "Source: https://github.com/Hunter-124/Chudware\n"
         "Comment: Bundled third-party components and their licenses are listed in\n"
-        " /opt/chudware/THIRD_PARTY_NOTICES.md and /opt/chudware/usr/bin/CHUDCODE-NOTICE.\n"
+        " /opt/chudware/THIRD_PARTY_NOTICES.md and /opt/chudware/usr/bin/OMP-LICENSE.\n"
         "\n"
         "Files: *\n"
         "Copyright: 2026 Hunter Edmonds and Chudware contributors\n"

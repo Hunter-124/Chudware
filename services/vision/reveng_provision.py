@@ -9,9 +9,11 @@ pure, offline-safe ``reveng_status()`` probe that reports per-capability
 availability without ever touching the network.
 
 License discipline (CONTRIBUTING.md guardrails):
-- **OpenMVS is AGPL** -> ``mode: "env"`` (discovery-only via ``OPENMVS_BIN``),
-  subprocess ONLY, NEVER bundled/linked and NEVER auto-downloaded by us. Its
-  descriptor carries no fetch URL; the user installs it themselves.
+- **OpenMVS is AGPL** -> ``mode: "download"``: the SHA-256-pinned upstream Linux
+  release is fetched on demand into the managed tools dir by
+  ``scripts/provision_reveng.py``. Chudware is MIT and the project owner has
+  decided to fetch it; it still runs as a subprocess only (never linked or
+  bundled into a Chudware binary), and ``OPENMVS_BIN`` / ``PATH`` override.
 - COLMAP's Python bindings (BSD) provide SfM; Brush (Apache-2.0) runs as a subprocess.
 - TripoSR (MIT) / TRELLIS (MIT) / VGGT weights are fetched model payloads;
   see ``license`` on each descriptor and ``licenses.md`` for the register.
@@ -41,11 +43,26 @@ BRUSH_URL = "https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/bru
 BRUSH_SHA256 = "4f0f9a8785d1951c62df26aae247c02c5bba32b00f40b06df4e1c9b867399e20"
 
 
-def brush_install_dir() -> Path:
-    """Managed tool location, shared by the installer and offline discovery."""
+OPENMVS_VERSION = "v2.4.0"
+OPENMVS_URL = "https://github.com/cdcseacave/openMVS/releases/download/v2.4.0/OpenMVS_Ubuntu_x64.zip"
+OPENMVS_SHA256 = "7104ae1ddd6ca38fbca9e0e4a70b20af59e21e0b497eb7181c864fbf38ca8d00"
+OPENMVS_TOOLS = ("InterfaceCOLMAP", "DensifyPointCloud", "ReconstructMesh", "RefineMesh", "TextureMesh")
+
+
+def _tools_root() -> Path:
     data = os.environ.get("XDG_DATA_HOME", "")
     root = Path(data) if data and Path(data).is_absolute() else Path.home() / ".local/share"
-    return root / "Chudware/tools/brush" / BRUSH_VERSION
+    return root / "Chudware/tools"
+
+
+def brush_install_dir() -> Path:
+    """Managed tool location, shared by the installer and offline discovery."""
+    return _tools_root() / "brush" / BRUSH_VERSION
+
+
+def openmvs_install_dir() -> Path:
+    """Managed OpenMVS location, shared by the installer and offline discovery."""
+    return _tools_root() / "openmvs" / OPENMVS_VERSION
 
 
 def brush_executable() -> str | None:
@@ -77,19 +94,19 @@ REVENG_DESCRIPTORS: dict[str, dict] = {
         "sha256": None,
         "note": "Sparse SfM requires importable pycolmap in the services Python runtime.",
     },
-    # --- Dense mesh: OpenMVS (AGPL-3.0 -> subprocess ONLY, never bundled) ---
+    # --- Dense mesh: OpenMVS (AGPL-3.0, subprocess-only, fetched on demand) ---
     "openmvs": {
         "kind": "binary",
         "capability": "dense",
         "license": "AGPL-3.0",
-        # AGPL: discovery-only. We must NOT ship a fetch URL for this.
-        "mode": "env",
+        "mode": "download",
         "env_var": "OPENMVS_BIN",
-        "url": None,
-        "sha256": None,  # N/A: we never fetch/verify an AGPL binary
+        "url": OPENMVS_URL,
+        "sha256": OPENMVS_SHA256,
+        "version": OPENMVS_VERSION,
         "note": (
-            "AGPL-3.0 -> subprocess ONLY, never bundled or linked. "
-            "Install OpenMVS yourself and set OPENMVS_BIN (DensifyPointCloud etc.)."
+            "Dense mesh (AGPL-3.0, run as a subprocess). Installed from the app (reveng_install_tools); "
+            "OPENMVS_BIN or PATH override."
         ),
     },
     # --- 3D Gaussian Splatting trainer: Brush (Apache-2.0, subprocess) ------
@@ -103,7 +120,7 @@ REVENG_DESCRIPTORS: dict[str, dict] = {
         "sha256": BRUSH_SHA256,
         "version": BRUSH_VERSION,
         "source_commit": BRUSH_SOURCE,
-        "note": "Gaussian trainer (no mesh export). Run python scripts/provision_reveng.py; BRUSH_BIN overrides.",
+        "note": "Gaussian trainer (no mesh export). Installed from the app (reveng_install_tools); BRUSH_BIN overrides.",
     },
     # --- Single-photo weights: TripoSR (MIT) -------------------------------
     "triposr": {
@@ -199,6 +216,13 @@ def _artifact_available(name: str) -> bool:
         return False
     if name == "brush":
         return brush_executable() is not None
+    if name == "openmvs":
+        # Lazy import avoids the Brush discovery import cycle. Probe the exact
+        # executable set used by the subprocess backend, with identical PATH /
+        # OPENMVS_BIN override semantics.
+        from services.vision.dense_backends import _openmvs_bins
+        _, missing = _openmvs_bins(check=True)
+        return not missing
     env_var = d.get("env_var")
     if env_var:
         val = os.environ.get(env_var)
@@ -290,6 +314,7 @@ def reveng_status() -> dict:
     ``missing`` is the structured list of provisioning keys whose artifact is
     absent, so callers (RE-02 / GUI) can render a fix-it list without re-deriving.
     """
+    from services.vision.reveng_install import install_state   # lazy: it imports this module
     prov = provisioning_status()
 
     colmap = prov["colmap"]["available"]
@@ -319,11 +344,11 @@ def reveng_status() -> dict:
         banners.append("Sparse reconstruction unavailable: install pycolmap in the services Python runtime.")
     if openmvs is False:
         banners.append(
-            "Dense mesh (OpenMVS) not configured. OpenMVS is AGPL-3.0 -> "
-            "install it yourself and set OPENMVS_BIN (subprocess only, never bundled)."
+            "Dense mesh (OpenMVS) not installed: use reveng_install_tools "
+            "(or add its tools to PATH / set OPENMVS_BIN)."
         )
     if not capabilities["splat"]:
-        banners.append("3D Gaussian Splatting needs pycolmap and Brush: python scripts/provision_reveng.py.")
+        banners.append("3D Gaussian Splatting needs pycolmap and Brush: use reveng_install_tools.")
     if not capabilities["single_photo"]:
         banners.append("Single-photo tier unavailable: TripoSR/TRELLIS weights not provisioned.")
     if not cad_recode:
@@ -345,5 +370,6 @@ def reveng_status() -> dict:
             "license": "CC-BY-NC-4.0",
         },
         "banners": banners,
+        "install": install_state(),
         "missing": missing,
     }

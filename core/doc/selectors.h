@@ -87,7 +87,62 @@ struct ResolveResult {
     double score = 0.0;                     // best score (lower better); +inf if no candidates
     double second_score = 0.0;              // second-best, +inf if <2 candidates
     std::optional<std::string> dangling_reason;  // nullopt iff resolved
+    // The named owner had no matching candidates, or candidate provenance was unavailable.
+    // Geometry-only fallback is held to kOwnerlessAccept rather than the usual 0.35 bound.
+    bool owner_fallback = false;
+    // Distance (mm) from the stored selector centroid to the bound candidate's centroid; 0
+    // when dangling or when the selector carries no centroid.
+    double moved_mm = 0.0;
 };
+
+// Acceptance bound for a re-bind with NO surviving owner feature (see owner_fallback).
+constexpr double kOwnerlessAccept = 0.05;
+
+// One stored reference that did NOT re-resolve to exactly the geometry it was minted on.
+// resolve() accepts a fuzzy fingerprint match (score < 0.35, margin > 0.05), so after an
+// upstream edit a ref can silently follow a face that moved; this is the evidence.
+struct RebindNote {
+    std::string kind;                    // face | edge | vertex
+    std::string ref;                     // the stored selector's sid, else "kind@[x,y,z]"
+    std::optional<std::string> owner;    // owner_feature the selector was minted under
+    double best_score = 0.0;
+    double margin = 0.0;                 // second_score - best_score (+inf when sole candidate)
+    double moved_mm = 0.0;               // stored centroid -> bound candidate's centroid
+    bool owner_fallback = false;
+};
+
+// While a RebindScope is alive on this thread, every accepted-but-inexact resolve() (and the
+// hint-fallback / edge-assignment paths in picks.cpp, through record_rebind) appends a
+// RebindNote. The compile loop opens one scope per feature, so the notes belong to exactly
+// the feature whose refs were being resolved. Outside a scope nothing is recorded and
+// nothing is computed. Scopes nest (an assembly compiling its components inside a feature).
+class RebindScope {
+public:
+    RebindScope();
+    ~RebindScope();
+    RebindScope(const RebindScope&) = delete;
+    RebindScope& operator=(const RebindScope&) = delete;
+    // The notes recorded since construction (or the previous take()), moved out.
+    std::vector<RebindNote> take();
+
+private:
+    RebindScope* prev_;
+    std::vector<RebindNote> notes_;
+    friend void record_rebind(const nlohmann::json&, const TopoInfo&, double, double, bool);
+};
+
+// Record that `selector` was bound to `bound`. No-op without an active RebindScope, and for a
+// bind that reproduces the stored centroid (1e-3 mm) and area/length (1e-4 relative).
+void record_rebind(const nlohmann::json& selector, const TopoInfo& bound, double best_score,
+                   double second_score, bool owner_fallback);
+
+// One warning sentence for a feature's notes: each ref with its moved distance, score and
+// margin, capped at a few entries ("+N more"). Empty when `notes` is empty.
+std::string format_rebind_notes(const std::vector<RebindNote>& notes);
+
+// The `sid` make_selector stamps on this descriptor (kind, surf, centroid on a 0.1 mm grid,
+// radius, concavity). Not unique and not persistent across edits — see selectors.cpp.
+std::string selector_sid(const TopoInfo& info);
 
 // --- OCCT describers (enumerate sub-shapes -> descriptors) ---
 // Geometry-based bore/boss classification shared with the query candidate path.

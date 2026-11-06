@@ -341,7 +341,7 @@ def test_datasheet_fetch_403_without_profile_degrades_unchanged(monkeypatch, fak
 
 
 def test_datasheet_fetch_propagates_a_browser_cooldown_refusal(monkeypatch, fake_pdf_extractor):
-    """A ``cooldown_active`` refusal must reach the tool boundary INTACT.
+    """A ``rate_limited`` refusal must reach the tool boundary INTACT.
 
     Flattening it into ``network`` (which is what ``raise_for_status`` did a line
     later) told the model "could not fetch: HTTP 403" — so it retried, and every
@@ -355,7 +355,7 @@ def test_datasheet_fetch_propagates_a_browser_cooldown_refusal(monkeypatch, fake
     monkeypatch.setattr(safe_http, "get", lambda *a, **k: _FakeHttpResponse(403))
 
     def _cooling(url, site, dest, **kwargs):
-        return {"ok": False, "reason": "cooldown_active", "retry_after_s": 873.4,
+        return {"ok": False, "reason": "rate_limited", "retry_after_s": 873.4,
                 "policy_refusal": True, "executed": False,
                 "hint": f"{site} is rate-limiting us; waiting inside this call is "
                         f"impossible — proceed with other sources."}
@@ -364,7 +364,7 @@ def test_datasheet_fetch_propagates_a_browser_cooldown_refusal(monkeypatch, fake
 
     out = research.datasheet_fetch("https://example-vendor.com/widget.pdf")
     assert out["ok"] is False
-    assert out["reason"] == "cooldown_active"      # NOT flattened to "network"
+    assert out["reason"] == "rate_limited"      # NOT flattened to "network"
     assert out["retry_after_s"] == 873.4
     assert "other sources" in out["hint"]
 
@@ -379,7 +379,7 @@ def test_datasheet_fetch_other_browser_failures_still_degrade_as_network(
     monkeypatch.setattr(safe_http, "get", lambda *a, **k: _FakeHttpResponse(403))
     monkeypatch.setattr(browser_session, "browser_download",
                         lambda url, site, dest, **k: {"ok": False,
-                                                      "reason": "browser_download_failed",
+                                                      "reason": "transport_failed",
                                                       "hint": "no body"})
 
     out = research.datasheet_fetch("https://example-vendor.com/widget.pdf")

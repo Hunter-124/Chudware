@@ -269,6 +269,11 @@ class TestRevengResearchSourceTool:
             },
         })
         monkeypatch.setattr(rc_mod, "_research_and_ingest", self._mock_ingest)
+        from services.mcp import reveng_session_tools
+        monkeypatch.setattr(reveng_session_tools, "_find_reference_models",
+                            lambda query, **kwargs: {
+                                "ok": True, "query": query, "candidates": [],
+                            })
 
         mcp = FastMCP("test-reveng")
         rt_mod.register_reveng_tools(mcp)

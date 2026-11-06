@@ -15,8 +15,8 @@
 - It never produces a body. It compiles to **3D wire chains** that downstream features
   reference (v1 consumer: `sweep` path + guide; loft guides reserved).
 - It participates in `doc_apply_ops` exactly like any feature: `add_feature`,
-  `edit_feature`, `delete_feature`, undo/redo, suppression, rollback bar. There are **no
-  sketch3d-specific ops** — entity/constraint edits are `edit_feature` params patches.
+  `edit_feature`, `delete_feature`, undo/redo, suppression, rollback bar. Entity/constraint
+  edits are `edit_feature` params patches; APPENDS go through the three atomic ops of §4.1b.
 - Two dedicated read-only RPCs exist: `sketch3d_health` and `sketch3d_drag` (both
   STATELESS — no enter/exit session mode; they solve from the persisted feature params on
   every call).
@@ -78,10 +78,11 @@ All entities: `id` (`"e<N>"`, unique in the sketch), `type`, `construction:bool`
 - **Creating one (GUI flow):** the host already has, from its id-pass, the picked vertex's
   `body_id` + `topo_id` (kind `"vertex"`) — the exact pair `doc_resolve_pick` takes. Either (a)
   call `doc_resolve_pick(doc_id, body_id, "vertex", topo_id)` to get the `selector`, then
-  `doc_apply_ops` `edit_feature` on the sketch3d with `params.external_refs` appended (mint the
-  next unused `"x<N>"` id, `stale:true` initially — it resolves on the next rebuild), or (b) go
-  through the MCP tool `sketch3d_ref_vertex(sketch3d_id, body_id, topo_id)` which does both
-  steps and force-rebuilds so `last_point` comes back populated immediately.
+  `doc_apply_ops` `sketch3d_add_external_ref` on the sketch3d (`ref:{source:{kind:"vertex",
+  selector}}`; the engine mints the doc-unique `"x<N>"` id, `stale:true` initially — the same
+  batch's external-ref pass resolves it), or (b) go through the MCP tool
+  `sketch3d_ref_vertex(sketch3d_id, body_id, topo_id)` which does both steps and returns
+  `last_point` populated immediately.
 - **Re-resolution:** happens automatically on every mutating `doc_apply_ops` batch and on
   `doc_rebuild` (`refresh_sketch3d_external_refs`, before compile) — the GUI does not need to
   do anything special after the initial creation; a normal edit/rebuild refreshes `last_point`/
@@ -140,7 +141,7 @@ above.
 Worker transport: same as every doc RPC (method + params JSON through the C ABI /
 worker_rpc). The sketch3d feature id travels in the `"sketch"` param (mirrors `sketch_*`).
 
-### 4.1 add / edit / delete (generic doc ops — no special ops)
+### 4.1 add / edit / delete (generic doc ops)
 
 ```json
 {"doc_id":"…","base_revision":-1,"ops":[
@@ -157,7 +158,22 @@ Edit = params patch (patch semantics: keys REPLACE; send whole arrays):
 ```json
 {"op":"edit_feature","id":"f7","params":{"entities":[ …full array… ]}}
 ```
+Use it for a deliberate wholesale rewrite (a drag commit, a clear). To ADD geometry use the
+atomic append ops (§4.1b) — a whole-array `edit_feature` read-modify-write silently drops
+whatever a concurrent writer added in between.
 Delete: `{"op":"delete_feature","id":"f7"}`.
+
+### 4.1b atomic append ops (append inside the engine, under the document lock)
+
+| op | payload | result |
+|---|---|---|
+| `sketch3d_add_entities` | `sketch`, `entities:[{type, p/p1/p2/pm/points, construction?, id?}, …]` | `e<N>` minted per sketch for entities without an `id` (continuing that sketch's highest); first id → `$<index>`, the rest → `$<index>#k` |
+| `sketch3d_add_constraints` | `sketch`, `constraints:[{type, refs, value?, axis?/dir?/plane?, …}, …]` | `c<N>` minted per sketch; numeric `value` is stored as `{value, expr:null}`; refs may be `$<i>` / `$<i>.p2` placeholders for entities minted earlier in the same batch; ids → `$<index>`, `$<index>#k` |
+| `sketch3d_add_external_ref` | `sketch`, `ref:{source:{kind:"vertex", selector}}` | `x<N>` minted doc-wide, `stale:true` until the batch's external-ref pass resolves it; id → `$<index>` |
+
+A malformed payload (non-object element, empty list, duplicate explicit id, unknown placeholder,
+schema violation caught by the end-of-batch validator) throws an `invalid_op` OpError naming the
+element and field; nothing from the batch is applied.
 
 ### 4.2 `sketch3d_health` — solve + status snapshot (read-only)
 
@@ -172,6 +188,14 @@ Request: `{"method":"sketch3d_health","params":{"doc_id":"…","sketch":"f7"}}`
   "statuses": {"e1": "full", "e2": "under"},
   "redundant": ["c9"],            // constraint ids
   "conflicting": [],              // constraint ids
+  "conflicts_with": {"c3": ["c1","c2"]},  // per conflicting id: the constraints it contradicts
+  "skipped_constraints": [{"id":"c4","type":"along_axis","reason":"along_axis: zero dir"}],
+                                  // constraints the solver could NOT use (not solved) — a sketch
+                                  // with any is never "fully defined", even at dof 0
+  "nonconvergence_reason": "…",   // ONLY when converged:false — the same text the compile error
+                                  // carries, e.g. "sketch3d did not converge: the constraints
+                                  // conflict. Conflicting constraints: c3 (distance 50) conflicts
+                                  // with c1 (fix), c2 (fix)."
   "free": [{"entity":"e2","param":"p2 x","var":9},
            {"entity":"e2","param":"p2 y","var":10},
            {"entity":"e2","param":"p2 z","var":11}],

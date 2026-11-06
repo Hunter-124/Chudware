@@ -302,7 +302,7 @@ def _validate(batch: QuestionBatch) -> None:
 # --------------------------------------------------------------------------- #
 
 def cache_root() -> Path:
-    """Resolve ``<appdata>/Chudware/cache`` the way the C++ run machine does
+    """Resolve ``<appdata>/Chudware/cache`` the way the C++ core resolves its data root
     (``core/agent/paths.cpp``): APPDATA on Windows, ``$XDG_DATA_HOME`` else
     ``~/.local/share`` on Linux/macOS. ``CHUDWARE_CACHE_ROOT`` overrides (tests)."""
     override = os.environ.get("CHUDWARE_CACHE_ROOT")
@@ -664,9 +664,9 @@ TOP_LEVEL_QUESTION_ALIASES: tuple[str, ...] = (
 def normalize_questions(raw: Any) -> list[dict]:
     """Coerce model-authored question payloads into contract-§2 question dicts.
 
-    Accepts a plain string, a dict, or a list of strings/dicts. Fills the
-    required fields a small model tends to omit (id, kind, suggested) with honest
-    defaults — a text question whose default answer is empty string.
+    Accepts a plain string, a dict, a list of strings/dicts, or a JSON-encoded
+    dict/list. Fills the required fields a small model tends to omit (id, kind,
+    suggested) with honest defaults — a text question whose default is empty string.
 
     Also accepts common aliases:
       type→kind, question/ask/text/label/… →prompt (see ``PROMPT_ALIASES``),
@@ -686,6 +686,14 @@ def normalize_questions(raw: Any) -> list[dict]:
     """
     if raw is None:
         return []
+    if isinstance(raw, str) and raw.lstrip().startswith(("{", "[")):
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError:
+            pass  # Ordinary question text may also start with a bracket.
+        else:
+            if isinstance(decoded, (dict, list)):
+                raw = decoded
     if isinstance(raw, dict) and raw and not (QUESTION_FIELDS & set(raw)):
         # {"purpose": "…?", "dims": "…?"} — an id→prompt map, not one question.
         items: list[Any] = [{"id": k, "prompt": v} for k, v in raw.items()

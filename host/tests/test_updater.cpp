@@ -40,7 +40,6 @@ std::string readFile(const fs::path& path) {
 Manifest corruptManifest() {
     Manifest value;
     value.version = "1.2.0";
-    value.minSupported = "1.0.0";
     value.platform = "linux";
     value.arch = "x86_64";
     value.keyId = "release-v1";
@@ -55,7 +54,6 @@ Manifest corruptManifest() {
 Manifest wrongKeyManifest() {
     Manifest value;
     value.version = "1.2.1";
-    value.minSupported = "1.0.0";
     value.platform = "linux";
     value.arch = "x86_64";
     value.keyId = "release-v1";
@@ -72,7 +70,6 @@ Manifest wrongKeyManifest() {
 Manifest validDomainManifest() {
     Manifest value;
     value.version = "1.2.2";
-    value.minSupported = "1.0.0";
     value.platform = "linux";
     value.arch = "x86_64";
     value.keyId = "dev-test-v1";
@@ -93,16 +90,11 @@ Manifest unknownKeyManifest() {
 
 void versionTests() {
     using chudware::update::compareVersions;
-    using chudware::update::requiresMandatoryUpdate;
     require(compareVersions("1.0.0-alpha", "1.0.0") < 0, "prerelease sorts before release");
     require(compareVersions("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0,
             "numeric prerelease sorts before text");
     require(compareVersions("1.0.0+build.1", "1.0.0+build.99") == 0,
             "build metadata does not affect precedence");
-    require(requiresMandatoryUpdate("0.0.0", "0.0.1"), "0.0.0 build hits kill switch");
-    require(requiresMandatoryUpdate("1.0.0-rc.1", "1.0.0"),
-            "prerelease build hits release kill switch");
-    require(!requiresMandatoryUpdate("1.2.0", "1.0.0"), "supported release is not killed");
     // Prerelease builds such as <base>-beta.<n> must order among themselves
     // numerically and below the release they promote into.
     require(compareVersions("0.1.0-beta.42", "0.1.0-beta.43") < 0,
@@ -111,8 +103,6 @@ void versionTests() {
             "a beta sorts below the release it promotes into");
     require(compareVersions("0.1.0-beta.9", "0.1.0-beta.10") < 0,
             "beta run numbers compare numerically, not lexically");
-    require(!requiresMandatoryUpdate("0.1.0-beta.43", "0.1.0-beta.42"),
-            "a newer beta is not killed by an older minimum");
 }
 
 // The CI signing key must be trusted by packaged builds, not only developer
@@ -334,7 +324,6 @@ void innerPayloadMismatchTest(const fs::path& root) {
     fs::permissions(artifact, fs::perms::owner_read | fs::perms::owner_write);
     Manifest outer;
     outer.version = "1.2.4";
-    outer.minSupported = "1.0.0";
     outer.platform = "linux";
     outer.arch = "x86_64";
     outer.keyId = "dev-test-v1";
@@ -441,6 +430,60 @@ void noReleaseTest(const std::string& endpoint, const fs::path& root) {
     std::cout << "check-once: no-release-404=current-quiet\n";
 }
 
+// Exercise the production manifest poller as well as the artifact verifier.
+// Legacy minimum-version metadata must not change the ordinary update state,
+// even when it is much higher than both the running and offered versions.
+void manifestMetadataTest(const std::string& kind, const std::string& endpoint,
+                          const fs::path& root) {
+    fs::remove_all(root);
+    fs::create_directories(root);
+    const fs::path running = root / "running-app";
+    const std::string original = "RUNNING APP MUST STAY UNTOUCHED\n";
+    writeFile(running, original);
+    setEnv("CHUDWARE_UPDATE_MANIFEST_URL", endpoint.c_str());
+    const State expected = kind == "invalid-signature" ? State::Error
+        : kind == "current" ? State::Current
+        : kind == "available" ? State::Available : State::Staged;
+    Updater updater;
+    updater.configure(kind == "current" ? "1.2.2" : "1.0.0", root / "data", running);
+    updater.start();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    for (;;) {
+        const auto snap = updater.snapshot();
+        if (snap.state == expected) break;
+        require(snap.state == State::Idle || snap.state == State::Checking ||
+                    (expected != State::Available &&
+                     (snap.state == State::Available || snap.state == State::Downloading)),
+                ("unexpected manifest update state: " + snap.message).c_str());
+        require(std::chrono::steady_clock::now() < deadline,
+                ("manifest update never reached the expected state: " + snap.message).c_str());
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    updater.stop();
+    const auto snap = updater.snapshot();
+    require(snap.state == expected, "manifest update state must remain nonblocking");
+    require(readFile(running) == original, "manifest check or staging modified the running app");
+    const fs::path metadata = root / "data/updates/staged.json";
+    if (expected == State::Staged) {
+        require(chudware::update::testing::stagedTransactionState(metadata) ==
+                    chudware::update::testing::StagedTransactionState::Staged,
+                "verified manifest update must persist a staged transaction");
+        require(snap.version == "1.2.2", "staged update must retain the verified version");
+        require(snap.reportSerial == 0, "valid manifest update must not report a rejection");
+    } else {
+        require(!fs::exists(metadata), "unstaged manifest update must not persist a transaction");
+        if (expected == State::Error) {
+            require(snap.reportSerial == 1, "invalid manifest artifact must report its rejection");
+            require(snap.message.find("Ed25519") != std::string::npos,
+                    "high minimum metadata must not bypass signature verification");
+            for (const auto& entry : fs::directory_iterator(root / "data/updates"))
+                require(entry.path().filename() == "reported-rejections.txt",
+                        "invalid manifest artifact must be deleted rather than staged");
+        }
+    }
+    std::cout << "manifest-metadata: " << kind << " state=nonblocking running-app=untouched\n";
+}
+
 // Release verification against a REAL published release: point the production
 // check-and-stage path at a live manifest URL (for example
 // releaseManifestUrl("linux", "x86_64")) and require that it fetches the
@@ -458,11 +501,8 @@ void liveReleaseTest(const std::string& endpoint, const std::string& currentVers
     Updater updater;
     updater.configure(currentVersion, root / "data", running);
     updater.start();
-    // A staged download is the assertion, not the reported state: once a
-    // release's min_supported outranks the running build, setStatus pins the
-    // state to Mandatory and only the message tracks check -> download ->
-    // staged. So poll for the staged transaction and, if the worker gives up
-    // first, report the message it left behind.
+    // Staged is published only after the verified artifact and transaction
+    // metadata have both been atomically persisted.
     const fs::path metadata = root / "data/updates/staged.json";
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(20);
     std::string last;
@@ -473,19 +513,11 @@ void liveReleaseTest(const std::string& endpoint, const std::string& currentVers
             std::cout << "live: [" << static_cast<int>(snap.state) << "] " << last
                       << std::endl;
         }
-        if (fs::exists(metadata)) {
-            std::cout << "live: staged " << snap.version << " over " << currentVersion
-                      << " (mandatory=" << (snap.mandatory ? "yes" : "no") << ")\n";
-            require(snap.state == State::Staged || snap.mandatory,
-                    "a staged update must read as Staged or Mandatory");
+        if (snap.state == State::Staged) {
+            std::cout << "live: staged " << snap.version << " over " << currentVersion << '\n';
+            require(fs::exists(metadata), "staged update must have persisted metadata");
             break;
         }
-        // A mandatory update pins the state, so a rejection is only visible in
-        // the message; every verification refusal names its reason.
-        for (const char* marker : {"failed", "does not match", "invalid", "unknown",
-                                   "exceeds", "not writable", "up to date"})
-            require(last.find(marker) == std::string::npos,
-                    ("live release did not stage an update: " + last).c_str());
         require(snap.state != State::Error && snap.state != State::ManualDownload &&
                     snap.state != State::Current,
                 ("live release did not stage an update: " + snap.message).c_str());
@@ -568,6 +600,8 @@ int main(int argc, char** argv) {
         servedSecurityTest(argv[2], argv[3], argv[4]);
     } else if (argc == 4 && std::string(argv[1]) == "--check-once") {
         noReleaseTest(argv[2], argv[3]);
+    } else if (argc == 5 && std::string(argv[1]) == "--manifest-metadata") {
+        manifestMetadataTest(argv[2], argv[3], argv[4]);
     } else if (argc == 5 && std::string(argv[1]) == "--live") {
         liveReleaseTest(argv[2], argv[3], argv[4]);
     } else if (argc == 4 && std::string(argv[1]) == "--apply-once") {
@@ -582,7 +616,7 @@ int main(int argc, char** argv) {
 #if defined(_WIN32)
         windowsRollbackTests(fs::temp_directory_path() / "chudware-updater-test");
 #endif
-    std::cout << "versions: semver+prerelease+beta-order+0.0.0+min-supported=ok\n";
+    std::cout << "versions: semver+prerelease+beta-order=ok\n";
     std::cout << "manifest-url: github-release-asset per platform/arch, env override=ok\n";
     std::cout << "keyring: release-v1+release-ci-v1 trusted, unknown rejected\n";
     return 0;

@@ -20,6 +20,7 @@ Activation:
 """
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
 import stat
@@ -58,7 +59,6 @@ _session_lock = threading.Lock()
 # chars/turn (~6k tokens). The aggregate covers activated bodies and reports.
 SKILL_BODY_CHAR_LIMIT = 12_000
 SKILL_INJECTION_CHAR_LIMIT = 24_000
-SKILL_CATALOG_CHAR_LIMIT = 4_000
 _OMISSION_REPORT_RESERVE = 1_024
 # Catalogs are isolated by their fully resolved project/user/builtin roots.
 _catalog_cache: dict[tuple[Path, Path, Path], "_Catalog"] = {}
@@ -127,12 +127,16 @@ class SkillTriggers:
     keywords: tuple[str, ...] = ()
     tools: tuple[str, ...] = ()
     phases: tuple[str, ...] = ()
+    #: fnmatch patterns on the op names inside a tool call's ``ops`` array
+    #: (see :func:`tool_call_ops`); fires for the call that carries a match.
+    ops: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, list[str]]:
         return {
             "keywords": list(self.keywords),
             "tools": list(self.tools),
             "phases": list(self.phases),
+            "ops": list(self.ops),
         }
 
 
@@ -342,7 +346,9 @@ def _triggers_from_fm(raw: Any) -> SkillTriggers:
         if isinstance(v, (list, tuple)):
             return tuple(str(x) for x in v if str(x).strip())
         return ()
-    return SkillTriggers(keywords=_list("keywords"), tools=_list("tools"), phases=_list("phases"))
+    return SkillTriggers(
+        keywords=_list("keywords"), tools=_list("tools"), phases=_list("phases"), ops=_list("ops"),
+    )
 
 
 def _load_diagnostic(
@@ -598,7 +604,7 @@ def _skill_load_diagnostic(
 
 
 def catalog_block(*, project_root: Path | str | None = None) -> str:
-    """Metadata catalog for system context — ~1 line per skill."""
+    """Compact metadata catalog; never truncate available skill names."""
     skills = discover_skills(project_root=project_root)
     if not skills:
         return ""
@@ -606,8 +612,18 @@ def catalog_block(*, project_root: Path | str | None = None) -> str:
         "[SKILLS] Available specialized skill packs. Metadata only — fetch a full "
         "body with cad_skill(name=\"<name>\") the moment its topic comes up:",
     ]
+    detailed = {
+        "edit-part", "edit-sketch", "edit-feature", "assess-model-state",
+        "source-parts", "design-for-manufacturability", "harness", "stress",
+    }
+    other = []
     for s in skills:
-        lines.append(s.meta_line())
+        if s.name in detailed or s.source != "builtin":
+            lines.append(s.meta_line())
+        else:
+            other.append(s.name)
+    if other:
+        lines.append("Other packs: " + ", ".join(other))
     lines.append(
         "Fetch with cad_skill(name=\"<name>\"), or cad_skill(name=\"<name>\", "
         "path=\"<file>\") for a file inside the pack. NEVER read a skill:// URL: "
@@ -615,12 +631,7 @@ def catalog_block(*, project_root: Path | str | None = None) -> str:
         "and fails. Auto-inject packs also arrive once per session when their "
         "trigger tools are first used."
     )
-    block = "\n".join(lines)
-    return _truncate_semantically(
-        block,
-        SKILL_CATALOG_CHAR_LIMIT,
-        "\n[SKILLS CATALOG TRUNCATED: additional entries omitted.]",
-    )
+    return "\n".join(lines)
 
 
 def _truncate_semantically(text: str, max_chars: int, marker: str) -> str:
@@ -762,17 +773,43 @@ def match_keyword_triggers(
     return hits
 
 
+def tool_call_ops(tool_name: str, args: Any) -> tuple[str, ...]:
+    """Op names carried by an ``add_features`` call; ``()`` for any other tool.
+
+    ``add_feature`` of ``feature.type == "sketch"`` is reported as
+    ``add_feature:sketch`` so sketch authoring is visible next to ``sketch_*`` ops.
+    """
+    if tool_name != "add_features" or not isinstance(args, dict):
+        return ()
+    ops = args.get("ops")
+    if not isinstance(ops, list):
+        return ()
+    names: list[str] = []
+    for op in ops:
+        if not isinstance(op, dict):
+            continue
+        name = str(op.get("op") or "")
+        feature = op.get("feature")
+        if name == "add_feature" and isinstance(feature, dict) and feature.get("type") == "sketch":
+            name = "add_feature:sketch"
+        if name:
+            names.append(name)
+    return tuple(names)
+
+
 def match_tool_triggers(
     tool_name: str,
     *,
+    ops: Iterable[str] = (),
     session_id: str | None = None,
     project_root: Path | str | None = None,
     role: str | None = None,
 ) -> list[Skill]:
-    """Return auto skills whose tool triggers match *tool_name* (once per session)."""
+    """Return auto skills whose tool or op triggers match this call (once per session)."""
     if not tool_name:
         return []
     t = tool_name.strip()
+    op_names = tuple(ops)
     hits: list[Skill] = []
     for skill in discover_skills(project_root=project_root):
         if skill.inject != "auto":
@@ -781,7 +818,9 @@ def match_tool_triggers(
             continue
         if already_injected(skill.name, session_id):
             continue
-        if t in skill.triggers.tools:
+        if t in skill.triggers.tools or any(
+            fnmatch.fnmatchcase(op, pat) for pat in skill.triggers.ops for op in op_names
+        ):
             hits.append(skill)
     return hits
 
@@ -849,6 +888,7 @@ def activate_for_prompt(
     project_root: Path | str | None = None,
     phase: str | None = None,
     tools_about_to_run: Iterable[str] | None = None,
+    tool_ops: Iterable[str] = (),
     role: str | None = None,
     _aggregate_char_limit: int = SKILL_INJECTION_CHAR_LIMIT,
 ) -> list[str]:
@@ -899,7 +939,7 @@ def activate_for_prompt(
     if tools_about_to_run:
         for tool in tools_about_to_run:
             for skill in match_tool_triggers(
-                tool, session_id=session_id, project_root=project_root, role=role,
+                tool, ops=tool_ops, session_id=session_id, project_root=project_root, role=role,
             ):
                 if skill.name not in seen:
                     candidates.append((skill.name, skill, "", None))
@@ -1217,7 +1257,7 @@ def skill_reference_text(
     """Model-facing text for one skill pack: its SKILL.md, or one file inside it.
 
     This is what the ``cad_skill`` host tool returns, and it is the ONLY fetch
-    path that works on the online (Chudcode) lane: there the ``skill://`` scheme
+    path that works on the online OMP lane: there the ``skill://`` scheme
     is resolved by the runtime's own ``read`` builtin against its own unrelated
     skill registry, which answers "Unknown skill" for every CAD pack. Never
     raises — an unknown name comes back as the catalog of real names, because a

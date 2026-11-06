@@ -31,11 +31,11 @@ SCHEMA = "chudware-payload-v1"
 PRODUCT = "Chudware"
 KINDS = frozenset({"executable", "library", "worker", "policy", "resource"})
 _METADATA_NAMES = frozenset({MANIFEST_NAME, SIGNATURE_NAME})
-_CHUDCODE_RESOURCE_NAMES = frozenset(
+_OMP_RESOURCE_NAMES = frozenset(
     {
-        "chudcode_artifact.lock",
-        "chudcode-notice",
-        "chudcode-third-party-notices.txt",
+        "omp_artifact.lock",
+        "omp-license",
+        "omp-third-party-notices.txt",
     }
 )
 _KEY_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
@@ -215,7 +215,11 @@ def reject_forbidden_customer_files(root: Path) -> None:
             raise PayloadManifestError(
                 f"test content is forbidden in customer payload: {relative}"
             )
-        if suffix in _SOURCE_SUFFIXES_FOLDED or any(
+        trusted_omp_extension = relative in {
+            "omp_extension.ts", "usr/bin/omp_extension.ts",
+            "Contents/MacOS/omp_extension.ts",
+        }
+        if (suffix in _SOURCE_SUFFIXES_FOLDED and not trusted_omp_extension) or any(
             part.endswith(".dsym") for part in folded_parts
         ):
             raise PayloadManifestError(
@@ -236,13 +240,14 @@ def default_kind(relative: str) -> str:
         "chudware-hostd.exe",
         "chudware-worker",
         "chudware-worker.exe",
+        "chudware-shape-build-worker",
         "chudware-mcp",
         "chudware-mcp.exe",
     }:
         return "worker"
-    if name in {"chud", "chud.exe"}:
+    if name in {"omp", "omp.exe"}:
         return "executable"
-    if name in _CHUDCODE_RESOURCE_NAMES:
+    if name in _OMP_RESOURCE_NAMES:
         return "resource"
     if suffix in {".dll", ".so", ".dylib"} or ".so." in name:
         return "library"

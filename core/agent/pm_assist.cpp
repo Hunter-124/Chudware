@@ -2,6 +2,7 @@
 #include "agent/pm_assist.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <regex>
 #include <vector>
 
@@ -42,8 +43,6 @@ std::string py_str(const ojson& v) {
     if (v.is_null()) return "None";
     if (v.is_number_integer()) return std::to_string(v.get<long long>());
     if (v.is_number_unsigned()) return std::to_string(v.get<unsigned long long>());
-    if (v.is_number_float()) return py_float_repr(v.get<double>());
-    // str(list)/str(dict) — not exercised by the oracle's str() call sites here.
     return v.dump();
 }
 
@@ -421,8 +420,8 @@ PmAssistPrompt build_pm_assist_prompt(const ojson& params, const ojson& doc,
     body["form_schema"] = form_schema;
     body["current"] = cur;
     body["selected_refs"] = selected_refs;
-    // json.dumps(body, ensure_ascii=False) — DEFAULT separators, literal non-ASCII.
-    std::string prompt = py_json_dumps_default(body, /*ensure_ascii=*/false);
+    // Compact JSON, literal non-ASCII (invalid UTF-8 is replaced, never thrown).
+    std::string prompt = body.dump(-1, ' ', /*ensure_ascii=*/false, ojson::error_handler_t::replace);
     // len(prompt) is Python code-point length.
     int n = 0;
     for (unsigned char c : prompt)

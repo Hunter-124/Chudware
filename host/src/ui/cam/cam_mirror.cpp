@@ -32,6 +32,16 @@ std::array<float, 3> jvec3(const nlohmann::json& a) {
 }
 }  // namespace
 
+void CamBackplot::clear() {
+    if (++generation == 0) ++generation;
+    rapid.clear(); cut.clear(); lead.clear(); plunge.clear(); arc.clear();
+    rapidT0.clear(); cutT0.clear(); leadT0.clear(); plungeT0.clear(); arcT0.clear();
+    rapidT.clear(); cutT.clear(); leadT.clear(); plungeT.clear(); arcT.clear();
+    rapidDir.clear(); cutDir.clear(); leadDir.clear(); plungeDir.clear(); arcDir.clear();
+    totalTime = 0;
+    minx = miny = minz = maxx = maxy = maxz = 0;
+}
+
 void CamMirror::loadTree(const nlohmann::json& resp) {
     setups_.clear();
     tools_.clear();

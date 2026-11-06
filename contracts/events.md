@@ -91,3 +91,28 @@ approval mutations. Unknown event kinds remain skippable.
 All durable seq values originate in the gateway journal. Consumers branch on invalidation `class`,
 never on the event name. Invalidation applies only to affected rows with `seq<=at_seq`; falsification
 clears, while supersession retains and points forward.
+
+## 6. Hostd document subscriptions — event contract v2.1
+
+This amendment covers hostd subscription events, which can arrive independently
+of a request's final response; §5's request-event timing rule does not describe
+the lifetime of these subscriptions. `doc.changed` carries a document snapshot
+for an advancing mutation; `doc.changed.notice` carries metadata/save notices
+without a full mesh snapshot. Their data include `doc_id`, `revision`,
+`metadata_revision`, `source_client`, `source_kind`, `method`, `human_dirty`,
+`saved_revision` and `saved_metadata_revision`; name and actor information are
+present where applicable. Snapshot payloads include the available tree and mesh
+information. Study mutations use `doc.studies_changed` instead.
+
+`doc.cache_refreshed` has the same snapshot and dirty-state fields as a cache
+refresh that does not advance the published revision. It can deliver new geometry
+at the same revision; consumers must not deduplicate it solely on revision.
+An assembly source refresh that advances the published revision instead emits
+`doc.changed` with `source_kind:"system"` and method `assembly_source_refresh`.
+
+`doc.disk_conflict {doc_id,path,observed_stamp}` reports an external change to a
+human-dirty bound document; the stamp is null or `{size,mtime_ns,ino}`. Hostd
+watches for a stable changed stamp; a clean document is reloaded and published
+as a system `doc.changed` instead. The event is a notification, not permission to
+overwrite: the save's stamp check remains authoritative. See
+[worker_rpc.md](worker_rpc.md#hostd-document-persistence-amendment--contract-revision-21).

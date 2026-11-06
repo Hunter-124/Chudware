@@ -76,15 +76,6 @@ class TestSharedLedgerReplay:
         assert replayed["value"] is True
         assert replayed["source"] == "user"
 
-    @pytest.mark.skip(
-        reason=(
-            "services/mcp shadows the installed mcp SDK as a PEP-420 namespace package "
-            "when pytest runs from repo root — 'mcp.server is not a package'. "
-            "intake_tools.py imports FastMCP at module level so the whole module is "
-            "unimportable under this runner configuration. "
-            "The _ask_via_contract logic is covered indirectly via ask_user() in §4 below."
-        )
-    )
     def test_intake_dim_written_then_visible_to_gate(self):
         """Dimension confirmed via _ask_via_contract is visible in the same ledger."""
         from services.mcp.intake_tools import _ask_via_contract  # noqa: PLC0415
@@ -113,17 +104,8 @@ class TestSharedLedgerReplay:
         replayed = ledger.answered("intake.dim.shaft.dia")
         assert replayed is not None
 
-    @pytest.mark.skip(
-        reason=(
-            "services/mcp shadows the installed mcp SDK as a PEP-420 namespace package "
-            "when pytest runs from repo root — 'mcp.server is not a package'. "
-            "intake_tools.py imports FastMCP at module level so the whole module is "
-            "unimportable under this runner configuration. "
-            "The no-re-ask contract is covered by TestAskUserReplay::test_second_ask_replays_without_transport."
-        )
-    )
     def test_no_re_ask_when_already_in_ledger(self):
-        """Second call with the same question id does NOT invoke the transport again."""
+        """Intake defaults replay without re-asking even through a blocking caller."""
         from services.mcp.intake_tools import _ask_via_contract  # noqa: PLC0415
 
         run_id = f"r_{uuid.uuid4().hex[:8]}"
@@ -143,15 +125,29 @@ class TestSharedLedgerReplay:
             "suggested": {"value": 10.0, "unit": "mm"},
             "required": False,
         }
-        _ask_via_contract([q], run_id=run_id, ledger=ledger,
-                          transport=TrackingTransport())
-        assert len(transport_calls) == 1
+        first = _ask_via_contract([q], run_id=run_id, ledger=ledger,
+                                  transport=TrackingTransport())
+        assert first[q["id"]]["source"] == "default"
+        assert ledger.answered(q["id"]) == first[q["id"]]
+        # Intake uses auto autonomy, so even an injected transport is not called.
+        assert transport_calls == []
 
-        _ask_via_contract([q], run_id=run_id, ledger=ledger,
-                          transport=TrackingTransport())
-        assert len(transport_calls) == 1, (
-            "Transport was called a second time — the ledger replay is not working"
-        )
+        second = _ask_via_contract([q], run_id=run_id, ledger=ledger,
+                                   transport=TrackingTransport())
+        assert second[q["id"]]["source"] == "resumed"
+        assert second[q["id"]]["value"] == first[q["id"]]["value"]
+
+        # A blocking contract caller would invoke the transport for a fresh
+        # question, but must replay the answer written by intake instead.
+        fresh = dict(q, id="intake.dim.control.dia")
+        ask_user([fresh], run_id=run_id, ledger=ledger,
+                 transport=TrackingTransport(), autonomy="approve")
+        assert len(transport_calls) == 1
+        replayed = ask_user([q], run_id=run_id, ledger=ledger,
+                            transport=TrackingTransport(), autonomy="approve")
+        assert replayed[q["id"]]["source"] == "resumed"
+        assert replayed[q["id"]]["value"] == first[q["id"]]["value"]
+        assert len(transport_calls) == 1
 
     def test_gate_replay_via_injected_ledger(self):
         """Gate ledger replay path: _gate_ledger returns injected ledger."""

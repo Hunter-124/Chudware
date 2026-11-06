@@ -7,7 +7,8 @@
 //
 // Feature-type names (add_feature.feature.type) live in validate.cpp FEATURE_TYPES
 // and are re-exported here via feature_type_names() so MCP/agent surfaces can
-// document both the op envelope and the type vocabulary from one query.
+// document both the op envelope and the type vocabulary from one query. The per-type
+// param vocabulary (validate.h feature_param_keys()) rides the same doc_list_ops reply.
 #pragma once
 
 #include <cstddef>
@@ -36,9 +37,10 @@ std::string unknown_doc_op_message(std::size_t idx, const std::string& k);
 std::string doc_ops_cheatsheet_snippet();
 
 // JSON payload for the doc_list_ops RPC / Python bridge:
-//   {ops:[...], feature_types:[...], example_add_feature:{...}}
-// Implemented in op_registry.cpp as nlohmann via free function in session/libchudware.
-// Declared here as a string-building helper that does not pull json headers into
-// every TU; the JSON form is assembled at the RPC boundary.
+//   {ops:[...], feature_types:[...], params:{<type>:[sorted param keys]},
+//    example_add_feature:{...}}
+// `params` comes from validate.h feature_param_keys(); a feature type ABSENT from it
+// takes open params (nothing refused). Assembled at the RPC boundary (libchudware.cpp)
+// so this header does not pull json into every TU.
 
 }  // namespace chudware::doc

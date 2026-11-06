@@ -1,29 +1,26 @@
 # Full-wave electromagnetic simulation (EM sim family)
 
-Simulation family added 2026-07-07: eigenmode/modal analysis of waveguide
-cross-sections, frequency-domain driven S-parameters, and broadband time-domain response —
+Eigenmode/modal analysis of waveguide cross-sections, frequency-domain driven S-parameters,
+and broadband time-domain response are available
 behind a pluggable solver adapter layer with openEMS (FDTD) as the primary full-wave engine.
 
 - Code: `services/sim/em/`
 - RPCs: `em_status`, `em_eigenmode`, `em_driven`, `em_timedomain` — registered by
   `services/worker_main.py` (`_register("em", "services.sim.em.worker_rpc", ...)`) and
   exposed to agents as the same-named tools
-- Tests: `python3 -m pytest services/sim/em/test_em.py` (the 2026-07-07 landing recorded
-  21 real + 1 gated live test; current count not re-verified here)
-- Planned follow-ups: FEM and Meep adapters, direct document-solid intake, open-radiation MoM
+- Tests: `services/sim/em/test_em.py`
 - License containment: `contracts/license_debt.md` row 9
 
-## Solver matrix (capability x solver x status; status column as recorded 2026-07-07)
+## Solver matrix (capability x solver)
 
-| Solver | Method | Eigenmode | Driven (S-params) | Time-domain | Linkage | License | Status on this repo |
-|--------|--------|-----------|-------------------|-------------|---------|---------|---------------------|
-| **openems** | 3-D FDTD | — (delegated to FDFD) | yes | yes | python-module (lazy, sim-worker only) | GPLv3 | **Adapter implemented, mock-proven**; openEMS has no PyPI wheel and must be installed separately |
-| **builtin-fdfd** | 2-D FDFD scalar Helmholtz (numpy/scipy) | yes (rectangular + circular hollow guides) | — | — | builtin | in-repo | **Real + validated** (WR-90 TE10 within 0.006 %) |
-| **analytic-uniform** | closed-form hollow-guide model | yes (cutoff tables) | uniform straight sections only (refuses geometry) | uniform sections via dispersive IFFT | builtin | in-repo | **Real + validated** |
-| gmsh-getdp | FEM (freq-domain, eigenmode, curved geometry) | planned | planned | — | external-process | GPL-2+ | Detection + install hint only; adapter planned |
-| meep | 3-D FDTD | — | planned | planned | python-module | GPL-2+ | Detection only; adapter planned |
-| elmer | FEM (VectorHelmholtz) | planned | planned | — | external-process | GPL-2+ (LGPL lib) | Detection only; adapter planned |
-| MoM (open radiation / antennas) | — | — | — | — | — | — | Deferred (low priority for closed waveguides) |
+| Solver | Method | Eigenmode | Driven (S-params) | Time-domain | Linkage | License | Availability |
+|--------|--------|-----------|-------------------|-------------|---------|---------|--------------|
+| **openems** | 3-D FDTD | — (delegated to FDFD) | yes | yes | python-module (lazy, sim-worker only) | GPLv3 | Installed separately |
+| **builtin-fdfd** | 2-D FDFD scalar Helmholtz (numpy/scipy) | yes (rectangular + circular hollow guides) | — | — | builtin | in-repo | Built in |
+| **analytic-uniform** | closed-form hollow-guide model | yes (cutoff tables) | uniform straight sections only (refuses geometry) | uniform sections via dispersive IFFT | builtin | in-repo | Built in |
+| gmsh-getdp | FEM | — | — | — | external-process | GPL-2+ | Detection and install hint only |
+| meep | 3-D FDTD | — | — | — | python-module | GPL-2+ | Detection only |
+| elmer | FEM | — | — | — | external-process | GPL-2+ (LGPL lib) | Detection only |
 
 Auto-selection (`solver: "auto"` or omitted): registry preference order is
 openems → builtin-fdfd → analytic-uniform → scaffolds; the first *installed* adapter
@@ -51,9 +48,10 @@ Key seams:
 
 - `OpenEmsAdapter.build_plan(spec)` is pure (spec → mesh lines / modal ports / boundaries /
   Gaussian excitation plan); plan-builder unit tests run without the solver.
-- `OpenEmsAdapter._execute(plan)` is the ONLY code importing `openEMS`/`CSXCAD` — the GPL
-  containment and the mock seam for tests. Swapping it to external-process CLI invocation
-  (if legal review requires) touches nothing else.
+- The openEMS/CSXCAD lazy imports occur in `OpenEmsAdapter.available()` and
+  `OpenEmsAdapter._execute()`, and in `antenna_bridge.openems_available()` and
+  `antenna_bridge._openems_run_antenna()`. A subprocess cutover must address the
+  availability probes and antenna bridge as well as execution.
 - Results are shaped like the existing sim results (`{"ok": ..., "solver": ..., summary
   arrays}`): S-params as `freq_ghz` + `s11_db`/`s21_db` + complex `[re, im]` pairs; mode
   tables as `{type, name, fc_ghz, kc_per_m, analytic_err_pct, field?}`; time domain as
@@ -89,7 +87,7 @@ em_timedomain { standard|waveguide, length_mm?, mode?, f0_ghz?, bw_ghz?, solver?
 
 Geometry intake v1: `geometry.stl_path` feeds openEMS as a PEC polyhedron
 (CSXCAD `AddPolyhedronReader`) — export the doc body with `export_part` first.
-Direct doc solids/tess + material assignment intake is planned.
+The adapter does not directly accept document solids or material assignments.
 
 ## Validation results (dated record, 2026-07-07 — not re-measured since)
 

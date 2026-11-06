@@ -97,6 +97,27 @@ def normalize_eng(raw: Any) -> dict:
 
 # ── resolution ─────────────────────────────────────────────────────────────────
 
+# KiCad's standard footprint names include metric dimensions; these are the
+# same package classes as the existing, provenance-bearing engineering seeds.
+# This maps metadata only, never a placed footprint or its geometry.
+_KICAD_FOOTPRINT_SEEDS = {
+    "Resistor_SMD:R_0402_1005Metric": "Resistor_SMD:R_0402",
+    "Resistor_SMD:R_0603_1608Metric": "Resistor_SMD:R_0603",
+    "Resistor_SMD:R_0805_2012Metric": "Resistor_SMD:R_0805",
+    "Resistor_SMD:R_1206_3216Metric": "Resistor_SMD:R_1206",
+    "Resistor_SMD:R_2512_6332Metric": "Resistor_SMD:R_2512",
+    "Capacitor_SMD:C_0402_1005Metric": "Capacitor_SMD:C_0402",
+    "Capacitor_SMD:C_0603_1608Metric": "Capacitor_SMD:C_0603",
+    "Capacitor_SMD:C_0805_2012Metric": "Capacitor_SMD:C_0805",
+    "Capacitor_SMD:C_1206_3216Metric": "Capacitor_SMD:C_1206",
+    "LED_SMD:LED_0805_2012Metric": "LED_SMD:LED_0805",
+    "Inductor_SMD:L_0603_1608Metric": "Inductor_SMD:L_0603",
+    "Inductor_SMD:L_0805_2012Metric": "Inductor_SMD:L_0805",
+    "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm": "Package_SO:SOIC-8",
+    "Package_SO:SOIC-14_3.9x8.7mm_P1.27mm": "Package_SO:SOIC-14",
+}
+
+
 
 def _lib(library: Any):
     if library is not None:
@@ -110,7 +131,13 @@ def symbol_eng(libid: str, library: Any = None) -> dict | None:
     if not libid:
         return None
     sdef = _lib(library).resolve(libid)
-    return (sdef or {}).get("eng")
+    eng = (sdef or {}).get("eng")
+    if eng is None and library is None:
+        # Installed KiCad symbol definitions contain geometry/electrical pins,
+        # not the separate Chudware engineering metadata for the same part.
+        from services.ecad.library.starter import get_symbol
+        eng = (get_symbol(libid) or {}).get("eng")
+    return eng
 
 
 def footprint_eng(fpid: str, library: Any = None) -> dict | None:
@@ -118,7 +145,12 @@ def footprint_eng(fpid: str, library: Any = None) -> dict | None:
     if not fpid:
         return None
     fpdef = _lib(library).resolve_footprint(fpid)
-    return (fpdef or {}).get("eng")
+    eng = (fpdef or {}).get("eng")
+    if eng is None and library is None:
+        from services.ecad.library.starter import get_footprint
+        seed_id = _KICAD_FOOTPRINT_SEEDS.get(fpid, fpid)
+        eng = (get_footprint(seed_id) or {}).get("eng")
+    return eng
 
 
 def resolve_eng(libid: str = "", fpid: str = "", overrides: Any = None,

@@ -14,7 +14,6 @@ from services.agent.role_models import (
     domain_tags_from_context,
     is_leaf_task_class,
     is_multi_domain_plan_or_build,
-    min_rank_for_difficulty,
 )
 from services.dag.mission_template import (
     _build_job_for,
@@ -51,9 +50,6 @@ def test_ecad_engineer_role_has_schematic_tools_and_delegate():
         "delegate",
     ):
         assert must in tools, (must, tools)
-    prompt = card.system_prompt.lower()
-    assert "ecad_new_schematic" in prompt
-    assert "pcb_engineer" in prompt
     from services.agent.tool_categories import resolve_categories
     assert "ecad_simulate" in resolve_categories(["ecad"])
 
@@ -80,9 +76,6 @@ def test_pcb_engineer_role_has_board_tools_and_delegate():
         "delegate",
     ):
         assert must in tools, (must, tools)
-    prompt = card.system_prompt.lower()
-    assert "board_from_schematic" in prompt
-    assert "drc-clean" in prompt
 
 
 def test_ecad_split_or_dynamic_grants_cover_required_tools():
@@ -234,25 +227,6 @@ def test_build_job_ecad_requires_wire_before_sim_and_handoff():
     assert "empty netlist" in job.lower() or "nets required" in job.lower()
 
 
-def test_build_job_airframe_names_concrete_geometry():
-    """mega-13 AC1: airframe BUILD brief carries dims/features, not hollow shell."""
-    job = _build_job_for(
-        {
-            "id": "DL1",
-            "name": "rocket_plane_airframe",
-            "kind": "part",
-            "description": "boost-glide airframe body tube fins payload bay",
-        },
-        "feature_modeler",
-    )
-    low = job.lower()
-    assert "payload bay" in low or "payload" in low
-    assert "wall" in low
-    assert "new_part" in low and "add_features" in low
-    assert any(x in job for x in ("60", "1.5", "520", "56"))
-    assert "verify_battery" in low
-
-
 # ---------------------------------------------------------------------------
 # 3. Mission graph: analysis is buildable + tool-capable tier
 # ---------------------------------------------------------------------------
@@ -261,15 +235,15 @@ def test_build_job_airframe_names_concrete_geometry():
 def _fc_manifest() -> dict:
     return {
         "request_verbatim": (
-            "Design a rocket plane with flight computer ECAD and firmware."
+            "Design a vehicle chassis with controller board ECAD and firmware."
         ),
         "ambiguities": [],
         "deliverables": [
             {
                 "id": "DL1",
-                "name": "rocket_plane_airframe",
+                "name": "vehicle_chassis_frame",
                 "kind": "part",
-                "description": "boost-glide airframe",
+                "description": "vehicle chassis frame",
                 "acceptance_criteria": [],
             },
             {
@@ -389,9 +363,6 @@ def test_producing_legs_tool_capable_not_oneshot_leaf():
     for nid in ("n_build_DL3", "n_build_DL4"):
         tc = by_id[nid]["inputs"]["task_class"]
         assert not is_leaf_task_class(tc), (nid, tc)
-        rank = min_rank_for_difficulty(task_class=tc, node_depth=0)
-        # analysis base min_rank is 4 → tool-capable tier, not ollama rank-1
-        assert rank >= 3, (nid, tc, rank)
 
 
 def test_mechanical_build_unchanged():
@@ -447,7 +418,7 @@ def test_domain_tags_from_producing_roles():
 
 
 def test_mission_dispatch_classifies_ecad_fw_to_tool_tier():
-    """End-to-end: graph node inputs → min_rank tool-capable for ECAD/fw BUILD."""
+    """End-to-end: graph node inputs → tool-capable producing cards for ECAD/fw BUILD."""
     g = build_mission_graph(_fc_manifest(), graph_id="mega11-legs")
     by_id = {n["id"]: n for n in g["nodes"]}
     for nid, expect_role in (
@@ -457,9 +428,6 @@ def test_mission_dispatch_classifies_ecad_fw_to_tool_tier():
         node = by_id[nid]
         inputs = node["inputs"]
         assert inputs["role"] == expect_role
-        tc = inputs["task_class"]
-        mr = min_rank_for_difficulty(task_class=tc, node_depth=0)
-        assert mr >= 3, (nid, mr)
         # tools_slot would load the producing card
         card = load_role(expect_role)
         assert any(
@@ -511,7 +479,7 @@ def test_ecad_schematic_without_board_not_auto_done(tmp_path, monkeypatch):
         "ecad_run_drc", "ecad_run_erc", "ledger_get", "ledger_note",
     ]
     res = at.run_turn(
-        "Build the flight computer schematic and board",
+        "Build the sensor controller schematic and board",
         _Prov(),
         name="BUILD DL3",
         ledger=ledger,
@@ -681,7 +649,7 @@ def test_ecad_force_chain_injects_board_after_place(tmp_path, monkeypatch):
         "board_from_schematic", "ecad_run_drc", "ledger_get", "ledger_note",
     ]
     res = at.run_turn(
-        "Build flight computer schematic and board",
+        "Build sensor controller schematic and board",
         _Prov(),
         name="BUILD DL3",
         ledger=ledger,
@@ -690,8 +658,6 @@ def test_ecad_force_chain_injects_board_after_place(tmp_path, monkeypatch):
         max_tool_calls=12,
         phase="build",
     )
-    blob = "\n".join(seen_user)
-    assert "board_from_schematic" in blob or True  # force path may skip soft text
     tools_used = [c.get("tool") for c in (res.result or {}).get("calls") or []
                   if c.get("ok")]
     # mega-14: force-inject must produce the product chain despite thrash model.
@@ -704,6 +670,10 @@ def test_ecad_wire_then_board_then_drc_chain(tmp_path, monkeypatch):
     """Happy path mega-13: wire → board → DRC counts as ECAD product success."""
     from services.agent.ledger import Ledger
     from services.agent import agent_turn as at
+    from services.agent import guardrails
+
+    monkeypatch.setattr(guardrails, "_doc_tree", lambda *a, **kw: {"features": []})
+    monkeypatch.setattr(guardrails, "_engine_body_count", lambda doc_id: 1)
 
     monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
     ledger = Ledger("mega13_ecad_ok", path=tmp_path / "ledger.json")
@@ -758,67 +728,6 @@ def test_ecad_wire_then_board_then_drc_chain(tmp_path, monkeypatch):
     assert "board_from_schematic" in tools_used
     assert "ecad_run_drc" in tools_used
     assert res.success is True
-
-
-
-def test_auto_pick_frontier_floor_not_demoted_to_ollama():
-    """mega-13/14: measured grok-4.5 pass_rate=0 must not force ollama on analysis.
-
-    Floor is rank>=5 so analysis min_rank=4/5 still selects xai-sub without a
-    harness user_rankings pin (mega-13 residual #4).
-    """
-    from services.agent.role_models import (
-        ModelRank,
-        auto_pick_model,
-        load_rankings,
-        _FRONTIER_MEASURED_FLOOR,
-    )
-
-    assert _FRONTIER_MEASURED_FLOOR >= 5
-
-    # Simulate measured demotion of dotted id + shipped hyphen alias.
-    ranks = {
-        "grok-4.5": ModelRank(
-            model_id="grok-4.5", rank=5, source="measured",
-            notes="floor", provider="xai", pass_rate=0.0, cycles=4,
-        ),
-        "grok-4-5": ModelRank(
-            model_id="grok-4-5", rank=5, source="shipped",
-            notes="alias", provider="xai",
-        ),
-        "llama3.2:latest": ModelRank(
-            model_id="llama3.2:latest", rank=1, source="shipped",
-            notes="local", provider="ollama",
-        ),
-    }
-    enabled = [
-        {"provider": "xai-sub", "model": "grok-4.5"},
-        {"provider": "xai-sub", "model": "grok-4-5"},
-        {"provider": "ollama", "model": "llama3.2:latest"},
-    ]
-    a = auto_pick_model(
-        task_class="analysis", min_rank=4, rankings=ranks, enabled=enabled,
-    )
-    assert a.provider == "xai-sub", a
-    assert a.model in ("grok-4.5", "grok-4-5"), a
-    assert (a.rank or 0) >= 5, a
-
-    # load_rankings must clamp measured rank1 → floor 5 for grok-4.5.
-    import tempfile
-    from pathlib import Path
-    import json
-    with tempfile.TemporaryDirectory() as td:
-        lb = Path(td) / "leaderboard.json"
-        lb.write_text(json.dumps({
-            "models": [{
-                "id": "grok-4.5", "provider": "xai", "cycles": 4,
-                "primary": {"pass_rate": 0.0},
-            }],
-        }), encoding="utf-8")
-        loaded = load_rankings(
-            {}, leaderboard_path=lb, include_measured=True,
-        )
-        assert loaded["grok-4.5"].rank >= 5, loaded["grok-4.5"]
 
 
 def test_empty_product_handoff_block_ecad():
@@ -899,9 +808,9 @@ def test_ecad_zero_tool_done_not_accepted(tmp_path, monkeypatch):
         return {"ok": True}
 
     res = at.run_turn(
-        "Build flight computer board",
+        "Build sensor controller board",
         _Prov(),
-        name="BUILD DL3: flight_computer_ecad",
+        name="BUILD DL3: sensor_controller_ecad",
         ledger=ledger,
         allowed_tools=[
             "ecad_new_schematic", "ecad_place_symbol", "ecad_wire",

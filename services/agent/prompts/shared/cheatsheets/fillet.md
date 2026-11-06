@@ -1,6 +1,10 @@
-FILLET - round off edges with a radius. params: `radius` (dim object). refs.edges names the edges.
+FILLET - round selected edges. `radius` and `radius2` are dimension parameters in mm.
+Use `params.type:"constant"` for one radius, or `params.type:"variable"` for endpoint
+radii (`radius` and `radius2`). Both explicit modes require `refs.edges`. Other fillet
+types are unsupported.
 
-BEST WAY (works on ANY part, including ones you did not build) - a geometry QUERY under refs.edges. You NAME the edges in PLAIN WORDS instead of computing selectors or face numbers:
+Select edges with a structured geometry query under `refs.edges`, or with explicit
+edge selectors; a list can combine queries and selectors:
 - {"of":"edge"}                       every edge of the body (round the whole part)
 - {"of":"edge","parallel":"z"}        the vertical edges only (the 4 corners of a block); "x"/"y" too
 - {"of":"edge","side":"top"}          the TOP edges / top rim   (bottom/left/right/front/back too)
@@ -12,31 +16,81 @@ Direction words map to the standard views: top=+Z, bottom=-Z, right=+X, left=-X,
 
 Example A - round ALL edges of the current body r=2:
 [
- {"op":"add_feature","feature":{"type":"fillet","name":"Fillet1","params":{"radius":{"value":2,"expr":null}},"refs":{"edges":{"of":"edge"}}}}
+ {"op":"add_feature","feature":{"type":"fillet","name":"Fillet1","params":{"type":"constant","radius":{"value":2,"expr":null}},"refs":{"edges":{"of":"edge"}}}}
 ]
 
 Example B - round just the 4 vertical edges of a block r=5:
 [
- {"op":"add_feature","feature":{"type":"fillet","name":"Round","params":{"radius":{"value":5,"expr":null}},"refs":{"edges":{"of":"edge","parallel":"z"}}}}
+ {"op":"add_feature","feature":{"type":"fillet","name":"Round","params":{"type":"constant","radius":{"value":5,"expr":null}},"refs":{"edges":{"of":"edge","parallel":"z"}}}}
 ]
 
 Example C - round the top rim of a round flange r=1:
 [
- {"op":"add_feature","feature":{"type":"fillet","name":"Rim","params":{"radius":{"value":1,"expr":null}},"refs":{"edges":{"of":"edge","side":"top"}}}}
+ {"op":"add_feature","feature":{"type":"fillet","name":"Rim","params":{"type":"constant","radius":{"value":1,"expr":null}},"refs":{"edges":{"of":"edge","side":"top"}}}}
 ]
 
-VARIABLE-RADIUS fillet: add `radius2` param — the fillet tapers linearly from `radius` at the
-start of each edge to `radius2` at the end. Requires explicit edge picks (not a plain direction
-query). Both radius and radius2 must be > 0.
-Example D - taper edge from 3mm to 1mm (variable):
+VARIABLE-RADIUS fillet: with `params.type:"variable"`, `radius` and `radius2` specify
+the selected edges' start and end radii; the radius law follows the contour spine.
+Orientation is determined by topology, not a world-axis convention; inspect the result
+if taper direction matters. Selected edges on a multi-edge contour are supported when
+their endpoint constraints agree at shared vertices. Unequal radii on one closed edge,
+contradictory shared-vertex radii, and variable contact joins are unsupported.
+Individually resolvable positive unequal endpoints separated by at most the kernel
+radius-difference precision (about 1e-7 mm) are refused instead of silently averaged.
+An endpoint below its local B-rep resolution bound can enter lower correction; each
+effective endpoint must exceed that bound and an unequal law must remain distinguishable.
+Direction queries such as
+`{"of":"edge","parallel":"z"}` work too; explicit picks are not required.
+Example D - taper vertical edges from 3mm to 1mm:
 [
- {"op":"add_feature","feature":{"type":"fillet","name":"TaperFillet","params":{"radius":{"value":3,"expr":null},"radius2":{"value":1,"expr":null}},"refs":{"edges":{"of":"edge","side":"top"}}}}
+ {"op":"add_feature","feature":{"type":"fillet","name":"TaperFillet","params":{"type":"variable","radius":{"value":3,"expr":null},"radius2":{"value":1,"expr":null}},"refs":{"edges":{"of":"edge","parallel":"z"}}}}
 ]
 
-3 common mistakes:
-1. The query goes under refs.edges (an OBJECT with "of"), not at the feature top level.
-2. Radius must be SMALLER than the thinnest wall it touches or the build fails (auto-clamp may shrink it).
-3. To discover what edges exist on a part you did not build, call the `doc_query` tool with {"of":"edge",...} first - it returns each edge's surf/centroid/axis.
+Omitting `params.type` keeps the legacy mode: absent `refs.edges` selects eligible
+edges, optionally filtered by `dir`; with `refs.edges`, a nonzero `radius2` unequal
+to `radius` selects a variable fillet. A negative endpoint is eligible for correction;
+absent, zero or equal `radius2` retains legacy constant behavior. Prefer an explicit
+mode and edge selection. Explicit variable mode stays variable even for equal or
+out-of-range finite endpoints; `radius2` is required.
+
+CORRECTION AND READBACK: resolvable positive requests that pass input/topology checks are
+tried unchanged first. A bounded search can correct construction or completed validation
+failures and finite nonpositive or unresolvable inputs, accepting only a valid solid
+covering EVERY selected edge. Incomplete validation stops the search, not evidence
+for reducing a radius; a previously fully validated all-edge candidate is retained
+on timeout or budget exhaustion. Variable endpoints are refined in deterministic
+order with the other endpoint held fixed; this is not a global optimum or a guarantee
+of success.
+No selected edge is silently dropped and no unchanged no-op counts as a fillet.
+Inspect the completed result, not just `ok` or a warning:
+- MCP `add_features`: `features[i].data.fillet`.
+- Native `doc_apply_ops` / `doc_rebuild`: `rebuild.feature_status[i].data.fillet`;
+  `doc_compile_cpp`: `statuses[i].data.fillet`.
+- `requested` and `effective` contain `radius` and `radius2` in canonical mm
+  (`radius2` is null for constant); `adjustment` is `none`, `lower`, `upper` or
+  `both`: `lower` means an endpoint was raised, `upper` means one was reduced, and
+  `both` means endpoints moved in both directions. `selected_edges`, `covered_edges`,
+  `tolerance_mm`, and `probes` report coverage and search. After an interrupted
+  refinement, the tolerance is conservative rather than a converged resolution.
+  A successful fillet reports this even when unchanged.
+- Corrected literal parameters are written in the accepted revision; expressions stay
+  authored. When an expression needs correction, the feature tree can additionally carry
+  `data.fillet_effective` as derived requested/effective/adjustment state, not authored
+  input. Read the effective value before relying on the final geometry.
+  The accepting edit's status retains the original requested values; a later rebuild
+  reports its current authored inputs (corrected literals or re-evaluated expressions).
+
+Invalid or dangling selectors, zero matches, nonfinite radii, unsupported topology,
+kernel crashes and a search that cannot produce a valid all-edge result are explicit
+failures. A timeout before finding a valid candidate is also a failure, not proof that
+a radius is too large. The search has finite tolerance and probes and may not find
+every feasible solution. If a part batch is rejected, its feature rows describe the
+rejected candidate, not the unchanged live geometry.
+
+Common mistakes:
+1. Put the query under `refs.edges` (an OBJECT with "of"), not at the feature top level.
+2. Do not assume the requested radius survived correction; read the effective result.
+3. To discover available edges, call `query_geometry` with {"of":"edge",...} first.
 
 The final solid must pass native B-rep, zero-area-face and self-intersection checks
 before it replaces the preceding body. A kernel build alone is not success.

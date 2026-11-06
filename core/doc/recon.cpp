@@ -616,14 +616,14 @@ std::vector<ProjectedEntity> project_edges_to_plane(const std::vector<TopoDS_Edg
 
 std::optional<json> pierce_edge_to_plane(const TopoDS_Edge& edge,
                                         const chudware::geom::SketchPlane& plane,
-                                        const std::optional<Eigen::Vector2d>& near) {
+                                        const std::optional<Eigen::Vector2d>& preferred_point) {
     Standard_Real first, last;
     Handle(Geom_Curve) curve = BRep_Tool::Curve(edge, first, last);
     if (curve.IsNull()) return std::nullopt;
     GeomAPI_IntCS intersections(new Geom_TrimmedCurve(curve, first, last), geom_plane_of(plane));
     if (!intersections.IsDone() || intersections.NbPoints() == 0) return std::nullopt;
     const auto midpoint = project2(plane, curve->Value(0.5 * (first + last)));
-    const Eigen::Vector2d target = near.value_or(Eigen::Vector2d(midpoint[0], midpoint[1]));
+    const Eigen::Vector2d target = preferred_point.value_or(Eigen::Vector2d(midpoint[0], midpoint[1]));
     double best = std::numeric_limits<double>::infinity();
     std::array<double, 2> selected{};
     for (int i = 1; i <= intersections.NbPoints(); ++i) {

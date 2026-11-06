@@ -1,16 +1,8 @@
-// Sheet-metal feature geometry (C++ port of engine/doc/features/sheetmetal.py +
-// sheetmetal_flat.py). These build REAL solids — a base sheet, bent walls (edge
-// flange), folded edges (hem), two-bend steps (jog), and the unfolded flat blank —
-// so the differential parity gate (exact BRep volume) applies directly.
+// Sheet-metal solid geometry and flat development. Bend sections use circular
+// arcs and produce analytic cylindrical faces; saved older models can retain
+// their original faceted surfaces without a rebuild.
 //
-// WHY a separate translation unit (mirrors the Python split): the bend math
-// (bend allowance / k-factor neutral fibre) and the analytic cross-section walkers
-// (_build_flange_solid / _strip_from_centerline) are sheet-metal-specific; keeping
-// them out of features.cpp matches the oracle file layout and keeps each builder a
-// clean value->shape function.
-//
-// FRAME CONVENTION (identical to the oracle so the geometry — hence the volume —
-// matches EXACTLY):
+// FRAME CONVENTION:
 //   - e_dir      : along the bend line (the prism axis).
 //   - length_dir : in the parent broad-face plane, pointing away from the body
 //                  across the thickness face (the direction the flat sheet continues).
@@ -20,6 +12,7 @@
 #pragma once
 
 #include <array>
+#include <string>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -88,9 +81,9 @@ TopoDS_Shape sm_strip_from_centerline(const Eigen::Vector3d& p_start,
                                       double start_x, double start_y);
 
 // ---- flat pattern (unfold) -------------------------------------------------
-// One stored bend record needed to develop the flat blank (the subset of the
-// oracle's bend record the flat-pattern math reads).
+// A stored folded-space bend frame and its neutral-fibre development data.
 struct BendRecord {
+    std::string feature_id;
     double angle = 0.0;
     double radius = 0.0;
     double thickness = 0.0;
@@ -101,18 +94,24 @@ struct BendRecord {
     Eigen::Vector3d p_end;       // bend-line far endpoint (edge length = |p_end-p_start|)
     Eigen::Vector3d e_dir;
     Eigen::Vector3d length_dir;
+    // Zero in older checkpoints; the fold side is recovered from the saved solid.
+    Eigen::Vector3d fold_dir = Eigen::Vector3d::Zero();
+    // -2 = infer from folded frames (also used by older checkpoints);
+    // -1 = base; otherwise the zero-based parent bend record.
+    int parent_index = -2;
 };
 
-// The flat blank PLUS the metadata a 2D flat-pattern export (export_flat_dxf) needs:
-// the base-plane normal and the FLAT-SPACE bend seam lines (where each developed strip
-// meets the base, i.e. the fold lines in the unfolded blank — NOT the folded-body bend
-// positions). `solid` is null on failure. Port basis for engine/doc/export2d.py flat layers.
+// The developed solid and flat-space seam metadata for layered 2D export.
+// `solid` is null on failure; `error` identifies the failing development step.
 struct FlatPattern {
     TopoDS_Shape solid;
+    std::string error;
     Eigen::Vector3d n_base{0.0, 0.0, 1.0};
     std::vector<std::array<Eigen::Vector3d, 2>> bend_lines;  // {p0, p1} per bend, flat space
 };
-FlatPattern sm_flat_pattern(const TopoDS_Shape& body, double thickness,
-                            const std::vector<BendRecord>& bends);
+// `base` is the original cached base-flange solid, used to bound its footprint;
+// `body` is the current folded solid with its later holes and reliefs.
+FlatPattern sm_flat_pattern(const TopoDS_Shape& body, const TopoDS_Shape& base,
+                            double thickness, const std::vector<BendRecord>& bends);
 
 }  // namespace geom

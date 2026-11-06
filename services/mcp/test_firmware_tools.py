@@ -204,6 +204,73 @@ def test_fs_write_cannot_modify_a_firmware_project(tools, tmp_path, monkeypatch)
     assert not (tmp_path / "elsewhere.txt").exists()
 
 
+def test_firmware_references_saved_kicad_board_and_schematic(tools, tmp_path, monkeypatch):
+    """Linked board paths remain usable after the originating ECAD session closes."""
+    from services.mcp.ecad_common import ecad_session
+
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(tmp_path))
+    board_path = tmp_path / "controller.kicad_pcb"
+    sch_path = tmp_path / "controller.kicad_sch"
+    board = ecad_session.new_session("pcb", "controller", path=str(board_path))
+    doc = board.doc
+    doc["nets"].extend([{"name": "PA5", "class": "default"},
+                        {"name": "VDD", "class": "default"}])
+    doc["footprints"].append({
+        "id": "fp1", "ref": "U1", "value": "STM32F407",
+        "fpid": "Package_QFP:LQFP-64", "pos": [10, 10], "angle": 0,
+        "side": "top", "attr": "smd", "graphics": [],
+        "pads": [{"id": "p1", "number": "1", "pin": "1", "pos": [0, 0],
+                  "angle": 0, "shape": "rect", "size": [1, 1], "type": "smd",
+                  "layers": ["F.Cu"], "net": "PA5"}],
+        "eng_overrides": {"supply": {"rails": [
+            {"name": "VDD", "voltage_v_nom": 3.3,
+             "current_a_active": 0.02, "current_a_sleep": 0.00001}]}},
+    })
+    ecad_session.swap_doc(board, doc)
+    ecad_session.close_session(board.doc_id)
+    schematic = ecad_session.new_session("sch", "controller", path=str(sch_path))
+    ecad_session.apply_ops(schematic, schematic.revision, [
+        {"op": "sch_add_symbol", "libid": "Device:R", "ref": "R1",
+         "value": "10k", "pos": [10, 10]},
+    ])
+    ecad_session.close_session(schematic.doc_id)
+
+    created = _call(tools, "fw_new_project", name="kicad_firmware",
+                    board_doc_ref=board_path.name)
+    assert created["project"]["mcu_family"] == "stm32f4", created
+    assert created["project"]["board_doc_ref"] == str(board_path), created
+    with open(created["pinmap_path"], encoding="utf-8") as pinmap:
+        assert "#define PIN_PA5 5" in pinmap.read()
+    pid = created["project_id"]
+    _call(tools, "fw_sources", project_id=pid,
+          write={"src/main.c": "void f(void) { digitalWrite(PIN_PA5, 1); }\n"})
+    verified = _call(tools, "fw_verify_board", project_id=pid,
+                     board_doc_ref=board_path.name, sch_doc_ref=sch_path.name)
+    assert verified["ok"] and "PA5" in verified["fw_pins"], verified
+    assert not any(f["rule"] == "fw_pin_unknown_net" for f in verified["findings"])
+
+    trace = os.path.join(os.path.dirname(__file__), "..", "..", "core", "tests", "data",
+                         "firmware", "trace_power.json")
+    linked = _call(tools, "fw_power_profile", project_id=pid, trace_path=trace)
+    assert linked["coverage"]["components_with_rails"] == 1, linked
+    assert any(rail["name"] == "VDD" for rail in linked["rails"]), linked
+    opened = ecad_session.open_path(str(board_path))
+    try:
+        by_id = _call(tools, "fw_verify_board", project_id=pid, board_doc_ref=opened.doc_id)
+        assert by_id["ok"] and "PA5" in by_id["fw_pins"], by_id
+        linked_id = _call(tools, "fw_new_project", name="linked_by_id",
+                          board_doc_ref=opened.doc_id)
+        assert linked_id["project"]["board_doc_ref"] == str(board_path), linked_id
+        explicit = _call(tools, "fw_power_profile", trace_path=trace,
+                         board_doc_ref=board_path.name)
+        assert any(rail["name"] == "VDD" for rail in explicit["rails"]), explicit
+    finally:
+        ecad_session.close_session(opened.doc_id)
+    reopened_link = _call(tools, "fw_power_profile", project_id=linked_id["project_id"],
+                          trace_path=trace)
+    assert any(rail["name"] == "VDD" for rail in reopened_link["rails"]), reopened_link
+
+
 # ------------------------------------------------------------------ simulation boundaries
 
 @pytest.fixture

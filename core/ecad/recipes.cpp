@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "ecad/ops.h"  // OpError
+#include "sim/netlist.h"
 
 namespace chudware::ecad::recipes {
 
@@ -75,14 +76,14 @@ json voltage_divider(double vin, double vout) {
         {"name", "voltage_divider"},
         {"request", "a " + trim(vin) + "V resistive divider with " + trim(vout) + "V output"},
         {"components", json::array({
-            json{{"ref", "V1"}, {"libid", "Simulation_SPICE:V_source"}, {"value", trim(vin)}},
+            json{{"ref", "V1"}, {"libid", "Simulation_SPICE:VDC"}, {"value", trim(vin)}},
             json{{"ref", "R1"}, {"libid", "Device:R"}, {"value", fmt_ohms(r1)}},
             json{{"ref", "R2"}, {"libid", "Device:R"}, {"value", fmt_ohms(r2)}},
         })},
         {"nets", json{
-            {"IN", json::array({json{{"ref", "V1"}, {"pin", "+"}}, json{{"ref", "R1"}, {"pin", "1"}}})},
+            {"IN", json::array({json{{"ref", "V1"}, {"pin", "1"}}, json{{"ref", "R1"}, {"pin", "1"}}})},
             {"VMID", json::array({json{{"ref", "R1"}, {"pin", "2"}}, json{{"ref", "R2"}, {"pin", "1"}}})},
-            {"GND", json::array({json{{"ref", "V1"}, {"pin", "-"}}, json{{"ref", "R2"}, {"pin", "2"}}})},
+            {"GND", json::array({json{{"ref", "V1"}, {"pin", "2"}}, json{{"ref", "R2"}, {"pin", "2"}}})},
         }},
         {"study", json{
             {"analysis", "op"},
@@ -101,14 +102,16 @@ json rc_lowpass(double fc) {
         {"name", "rc_lowpass"},
         {"request", "an RC low-pass filter with a " + trim(fc) + "Hz cutoff"},
         {"components", json::array({
-            json{{"ref", "V1"}, {"libid", "Simulation_SPICE:V_source"}, {"value", "0"}, {"ac_mag", 1.0}},
+            json{{"ref", "V1"}, {"libid", "Simulation_SPICE:VSIN"}, {"value", "VSIN"},
+                 {"Sim.Device", "V"}, {"Sim.Type", "SIN"}, {"Sim.Pins", "1=+ 2=-"},
+                 {"Sim.Params", "dc=0 ampl=1 f=1k ac=1"}},
             json{{"ref", "R1"}, {"libid", "Device:R"}, {"value", fmt_ohms(r)}},
             json{{"ref", "C1"}, {"libid", "Device:C"}, {"value", fmt_farads(c)}},
         })},
         {"nets", json{
-            {"IN", json::array({json{{"ref", "V1"}, {"pin", "+"}}, json{{"ref", "R1"}, {"pin", "1"}}})},
+            {"IN", json::array({json{{"ref", "V1"}, {"pin", "1"}}, json{{"ref", "R1"}, {"pin", "1"}}})},
             {"OUT", json::array({json{{"ref", "R1"}, {"pin", "2"}}, json{{"ref", "C1"}, {"pin", "1"}}})},
-            {"GND", json::array({json{{"ref", "V1"}, {"pin", "-"}}, json{{"ref", "C1"}, {"pin", "2"}}})},
+            {"GND", json::array({json{{"ref", "V1"}, {"pin", "2"}}, json{{"ref", "C1"}, {"pin", "2"}}})},
         }},
         {"study", json{
             {"analysis", "ac"},
@@ -133,17 +136,22 @@ json inverting_amp(double gain) {
         {"name", "inverting_amp"},
         {"request", "an inverting amplifier with a gain of " + trim(gain)},
         {"components", json::array({
-            json{{"ref", "V1"}, {"libid", "Simulation_SPICE:V_source"}, {"value", trim(vin)}},
+            json{{"ref", "V1"}, {"libid", "Simulation_SPICE:VDC"}, {"value", trim(vin)}},
+            json{{"ref", "V2"}, {"libid", "Simulation_SPICE:VDC"}, {"value", "12"}},
+            json{{"ref", "V3"}, {"libid", "Simulation_SPICE:VDC"}, {"value", "-12"}},
             json{{"ref", "Rin"}, {"libid", "Device:R"}, {"value", fmt_ohms(rin)}},
             json{{"ref", "Rf"}, {"libid", "Device:R"}, {"value", fmt_ohms(rf)}},
-            json{{"ref", "U1"}, {"libid", "Amplifier_Operational:OPAMP_dual"}, {"value", "OPAMP"}},
+            json{{"ref", "U1"}, {"libid", "Simulation_SPICE:OPAMP"}, {"value", "OPAMP"}},
         })},
         {"nets", json{
-            {"IN", json::array({json{{"ref", "V1"}, {"pin", "+"}}, json{{"ref", "Rin"}, {"pin", "1"}}})},
+            {"IN", json::array({json{{"ref", "V1"}, {"pin", "1"}}, json{{"ref", "Rin"}, {"pin", "1"}}})},
             {"INV", json::array({json{{"ref", "Rin"}, {"pin", "2"}}, json{{"ref", "Rf"}, {"pin", "1"}},
-                                 json{{"ref", "U1"}, {"pin", "1"}}})},
-            {"OUT", json::array({json{{"ref", "Rf"}, {"pin", "2"}}, json{{"ref", "U1"}, {"pin", "3"}}})},
-            {"GND", json::array({json{{"ref", "V1"}, {"pin", "-"}}, json{{"ref", "U1"}, {"pin", "2"}}})},
+                                 json{{"ref", "U1"}, {"pin", "2"}}})},
+            {"OUT", json::array({json{{"ref", "Rf"}, {"pin", "2"}}, json{{"ref", "U1"}, {"pin", "5"}}})},
+            {"VCC", json::array({json{{"ref", "V2"}, {"pin", "1"}}, json{{"ref", "U1"}, {"pin", "3"}}})},
+            {"VEE", json::array({json{{"ref", "V3"}, {"pin", "1"}}, json{{"ref", "U1"}, {"pin", "4"}}})},
+            {"GND", json::array({json{{"ref", "V1"}, {"pin", "2"}}, json{{"ref", "V2"}, {"pin", "2"}},
+                                 json{{"ref", "V3"}, {"pin", "2"}}, json{{"ref", "U1"}, {"pin", "1"}}})},
         }},
         {"study", json{
             {"analysis", "op"},
@@ -164,14 +172,16 @@ json led_driver(double vsupply, double vf, double current) {
         {"name", "led_driver"},
         {"request", "a " + trim(vsupply) + "V LED driver (series current-limit resistor)"},
         {"components", json::array({
-            json{{"ref", "V1"}, {"libid", "Simulation_SPICE:V_source"}, {"value", trim(vsupply)}},
+            json{{"ref", "V1"}, {"libid", "Simulation_SPICE:VDC"}, {"value", trim(vsupply)}},
             json{{"ref", "R1"}, {"libid", "Device:R"}, {"value", fmt_ohms(r)}},
-            json{{"ref", "D1"}, {"libid", "Device:LED"}, {"value", "LED"}},
+            json{{"ref", "D1"}, {"libid", "Device:LED"}, {"value", "LED"},
+                 {"Sim.Device", "D"}, {"Sim.Pins", "1=K 2=A"},
+                 {"Sim.Params", "is=2.3e-19 n=2 rs=2"}},
         })},
         {"nets", json{
-            {"VCC", json::array({json{{"ref", "V1"}, {"pin", "+"}}, json{{"ref", "R1"}, {"pin", "1"}}})},
-            {"LED_A", json::array({json{{"ref", "R1"}, {"pin", "2"}}, json{{"ref", "D1"}, {"pin", "A"}}})},
-            {"GND", json::array({json{{"ref", "D1"}, {"pin", "K"}}, json{{"ref", "V1"}, {"pin", "-"}}})},
+            {"VCC", json::array({json{{"ref", "V1"}, {"pin", "1"}}, json{{"ref", "R1"}, {"pin", "1"}}})},
+            {"LED_A", json::array({json{{"ref", "R1"}, {"pin", "2"}}, json{{"ref", "D1"}, {"pin", "2"}}})},
+            {"GND", json::array({json{{"ref", "D1"}, {"pin", "1"}}, json{{"ref", "V1"}, {"pin", "2"}}})},
         }},
         {"study", json{
             {"analysis", "op"},
@@ -193,23 +203,28 @@ json rc_555_astable(double freq) {
         {"name", "rc_555_astable"},
         {"request", "a 555 astable oscillator at about " + trim(freq) + "Hz"},
         {"components", json::array({
-            json{{"ref", "V1"}, {"libid", "Simulation_SPICE:V_source"}, {"value", "5"}},
-            json{{"ref", "U1"}, {"libid", "Timer:NE555"}, {"value", "NE555"}},
+            json{{"ref", "V1"}, {"libid", "Simulation_SPICE:VDC"}, {"value", "5"}},
+            json{{"ref", "U1"}, {"libid", "Timer:NE555D"}, {"value", "NE555D"},
+                 {"Sim.Device", "SPICE"}, {"Sim.Params", "type=\"X\" model=\"NE555\" lib=\"\""},
+                 {"Sim.Pins", "1=1 2=2 3=3 4=4 5=5 6=6 7=7 8=8"}},
             json{{"ref", "Ra"}, {"libid", "Device:R"}, {"value", fmt_ohms(r)}},
             json{{"ref", "Rb"}, {"libid", "Device:R"}, {"value", fmt_ohms(r)}},
             json{{"ref", "C1"}, {"libid", "Device:C"}, {"value", fmt_farads(c)}},
+            json{{"ref", "C2"}, {"libid", "Device:C"}, {"value", "10n"}},
         })},
         {"nets", json{
-            {"VCC", json::array({json{{"ref", "V1"}, {"pin", "+"}}, json{{"ref", "U1"}, {"pin", "8"}},
+            {"VCC", json::array({json{{"ref", "V1"}, {"pin", "1"}}, json{{"ref", "U1"}, {"pin", "8"}},
                                  json{{"ref", "U1"}, {"pin", "4"}}, json{{"ref", "Ra"}, {"pin", "1"}}})},
             {"DISCH", json::array({json{{"ref", "Ra"}, {"pin", "2"}}, json{{"ref", "Rb"}, {"pin", "1"}},
                                    json{{"ref", "U1"}, {"pin", "7"}}})},
             {"THR", json::array({json{{"ref", "Rb"}, {"pin", "2"}}, json{{"ref", "C1"}, {"pin", "1"}},
                                  json{{"ref", "U1"}, {"pin", "6"}}, json{{"ref", "U1"}, {"pin", "2"}}})},
+            {"CTRL", json::array({json{{"ref", "U1"}, {"pin", "5"}}, json{{"ref", "C2"}, {"pin", "1"}}})},
             {"OUT", json::array({json{{"ref", "U1"}, {"pin", "3"}}})},
-            {"GND", json::array({json{{"ref", "V1"}, {"pin", "-"}}, json{{"ref", "U1"}, {"pin", "1"}},
-                                 json{{"ref", "C1"}, {"pin", "2"}}})},
+            {"GND", json::array({json{{"ref", "V1"}, {"pin", "2"}}, json{{"ref", "U1"}, {"pin", "1"}},
+                                 json{{"ref", "C1"}, {"pin", "2"}}, json{{"ref", "C2"}, {"pin", "2"}}})},
         }},
+        {"spice_directives", sim::ne555_spice_model()},
         {"study", json{
             {"analysis", "tran"},
             {"params", json{{"tstep", period / 200.0}, {"tstop", period * 3.0}, {"uic", true}}},

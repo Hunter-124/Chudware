@@ -93,6 +93,45 @@ class TestAcceptedShapes:
                                    "kind": "choice", "options": ["a", "b"]}])
         assert qs[0]["suggested"] == "a"
 
+    @pytest.mark.parametrize("as_batch", [False, True], ids=["object", "array"])
+    def test_json_encoded_questions_keep_controls_and_user_answers(self, md, as_batch):
+        question = {
+            "id": "finish", "kind": "choice", "prompt": "Which finish?",
+            "options": ["Painted", "Anodized"], "suggested": "Painted", "required": True,
+        }
+        payload = [question, {"id": "notes", "kind": "text", "prompt": "Any notes?",
+                              "suggested": "", "required": False}] if as_batch else question
+
+        def answer(batch):
+            from services.agent.omp_questions import Resolution
+
+            assert [q["id"] for q in batch["questions"]] == (
+                ["finish", "notes"] if as_batch else ["finish"])
+            choice = batch["questions"][0]
+            assert choice["kind"] == "choice"
+            assert choice["prompt"] == "Which finish?"
+            assert choice["options"] == [
+                {"value": "Painted", "label": "Painted"},
+                {"value": "Anodized", "label": "Anodized"},
+            ]
+            assert choice["suggested"] == "Painted" and choice["required"] is True
+            return Resolution(source="user", answers={"finish": "Anodized", "notes": "Matte"})
+
+        out = md.ask_user(questions=json.dumps(payload), ask_human=answer)
+        assert out["ok"] is True, out
+        assert out["answers"]["finish"]["value"] == "Anodized"
+        assert out["answers"]["finish"]["source"] == "user"
+        if as_batch:
+            assert out["answers"]["notes"]["value"] == "Matte"
+
+    @pytest.mark.parametrize("prompt", [
+        "[optional] Which finish?", '{"unfinished":', '"Which finish?"', "42", "null",
+    ])
+    def test_plain_text_is_not_reinterpreted_as_json(self, prompt):
+        [question] = normalize_questions(prompt)
+        assert question["kind"] == "text"
+        assert question["prompt"] == prompt
+
     def test_end_to_end_through_mission_dispatch(self, md):
         out = md.ask_user(questions=LIVE_QUESTION_KEY_PAYLOAD)
         assert out["ok"] is True
@@ -130,6 +169,8 @@ EMPTY_SHAPES = [
     pytest.param(None, id="none"),
     pytest.param({}, id="empty-dict"),
     pytest.param([], id="empty-list"),
+    pytest.param("{}", id="json-empty-dict"),
+    pytest.param("[]", id="json-empty-list"),
     pytest.param("", id="empty-string"),
     pytest.param([""], id="list-of-empty-string"),
     pytest.param([{"id": "q1"}], id="dict-with-no-prompt-text"),
@@ -159,12 +200,12 @@ class TestBadArgumentsTeaching:
 
     def test_mcp_ask_user_empty_call(self, cache_root):
         raw = asyncio.run(_call_mcp_ask_user(questions=None, blocking=False, run_id="r-empty"))
-        assert json.loads(raw) == ask_user_bad_arguments_error()
+        assert json.loads(raw) == {**ask_user_bad_arguments_error(), "code": "error"}
 
     def test_mcp_ask_user_empty_dict_call(self, cache_root):
         """The exact recorded live failure: ask_user({}) x4 (run-56153804024698)."""
         raw = asyncio.run(_call_mcp_ask_user(questions={}, blocking=False, run_id="r-empty2"))
-        assert json.loads(raw) == ask_user_bad_arguments_error()
+        assert json.loads(raw) == {**ask_user_bad_arguments_error(), "code": "error"}
 
 
 # ---------------------------------------------------------------------------

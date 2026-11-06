@@ -9,6 +9,8 @@ import threading
 from typing import Any
 from urllib.parse import quote
 
+from ..print_safety import validate_print_filename
+
 from .base import PrinterAdapter, _MISSING, nested, number_or_missing, string_or_missing
 from .model import Artifact, EndpointConfig, ProtocolError, capability_report, operation_truth
 from .websocket import JsonWebSocket
@@ -130,6 +132,7 @@ class MoonrakerAdapter(PrinterAdapter):
         remote_path = remote_artifact.get("remote_path")
         if not isinstance(remote_path, str) or not remote_path:
             raise ProtocolError("Moonraker start requires a staged remote_path")
+        validate_print_filename(remote_path.rsplit("/", 1)[-1])
         raw = self.http.request_json("POST", "/printer/print/start?filename=" + quote(remote_path, safe="/"))
         return self._command_result("start", raw)
 

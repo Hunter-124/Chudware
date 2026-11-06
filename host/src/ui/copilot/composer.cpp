@@ -10,12 +10,14 @@
 #include "ui/provider_logos.h"   // brand mark for the model chip (same art as Settings->Providers)
 #include "ui/copilot/text_wrap.h"   // hard-break bookkeeping the rewrapper must not eat
 #include "ui/copilot/inline_image_refs.h"
+#include "ui/copilot/video_attachment.h"
 #include "ui/clipboard_image.h"          // image-kind probe / mime / clipboard->PNG capture
 #include "ui/copilot/image_lightbox.h"   // attachment thumbnail tile + full-size viewer
 #include "ui/copilot/context_estimate.h"  // transcript-size estimate behind the context meter
 #include "ui/copilot/context_chips.h"      // context-picker chips: add / reconcile / draw / focus
-#include "ui/chudcode_descriptors.h"      // ui::chudcodeCompactReplacement — compact-result guard
-#include "ui/chudcode_session_actions.h"  // per-conversation Chudcode session link (resume key)
+#include "ui/omp_descriptors.h"      // ui::ompCompactReplacement — compact-result guard
+#include "ui/omp_session_actions.h"  // per-conversation Omp session link (resume key)
+#include "ui/copilot/activity_settlement.h"
 #include "ui/file_explorer.h"             // ui::ensureWorkspaceDir — the fs_* jail every turn rides
 #include "ui/ai/plan_board.h"             // planBoardTakeEditsForTurn — idle plan edits ride the turn
 #include <climits>                        // INT_MAX saturation in activityCharsOf()
@@ -72,6 +74,14 @@ using ui::copilot::WrapState;
 using ui::copilot::seedHardBreaks;
 using ui::copilot::normalizeComposerSelection;
 using ui::copilot::noteEdit;
+uint64_t g_composerEditGeneration = 0;
+struct InputWrapMemo {
+    std::string shown;
+    float width = -1.0f, fontSize = -1.0f;
+    ImFont* font = nullptr;
+    int rows = 1, used = 0;
+};
+std::unordered_map<ImGuiID, InputWrapMemo> g_inputWrapMemo;
 struct ChatInputCb {
     float wrapW = 0.0f;
     bool  interceptHistory = false;  // slash menu open — eat Up/Down for menu nav
@@ -79,24 +89,27 @@ struct ChatInputCb {
     int*  navDelta = nullptr;        // -1 Up / +1 Down when interceptHistory
     WrapState* wrap = nullptr;       // hard-break bookkeeping for this input's buffer
     bool composer = false;
+    const std::string* completion = nullptr;  // ghost completion Tab inserts at the caret
 };
 // Keyed by the backing buffer, which every caller has (drawChatInput takes it, composerText
 // reads st.prompt). A vector reallocation just yields a fresh entry, which re-seeds below.
 std::unordered_map<const char*, WrapState> g_wrap;
 // Set by drawComposer when the slash autocomplete is open so drawChatInput routes Up/Down
-// to the menu instead of moving the caret. Clarify cards (cards.cpp) leave this false.
+// to the menu instead of moving the caret. Ask cards (cards.cpp) leave this false.
 bool g_slashMenuActive = false;
 int  g_slashNavDelta = 0;
 // Set when the slash menu fills the composer; the next InputText callback parks
 // the caret at the end of the inserted text (a fresh widget state starts at 0).
 int  g_slashCaretToEnd = 0;
-// Only the main prompt opts in; question/clarify inputs never receive image operations.
+// Only the main prompt opts in; question inputs never receive image operations.
 bool g_mainComposerInput = false;
-std::string g_imageInsert;
+// Text the next composer callback splices in: an inline image marker, or a spell correction
+// replacing the remembered selection. Applied inside the widget, so it works while active.
+std::string g_composerInsert;
 std::vector<size_t> g_imageRemovals;
 size_t g_imageRosterSize = 0;
 int g_composerCursor = 0, g_composerSelectionStart = 0, g_composerSelectionEnd = 0;
-bool g_imageUseRememberedSelection = false;
+bool g_insertAtRememberedSelection = false;
 }  // namespace
 
 
@@ -112,8 +125,22 @@ int chatInputEditCallback(ImGuiInputTextCallbackData* data) {
         // the chord is a send. Pasted newlines arrive under Ctrl/Shift and pass through.
         return (cb->rejectNewline && data->EventChar == '\n') ? 1 : 0;
     }
+    if (data->EventFlag == ImGuiInputTextFlags_CallbackCompletion) {
+        // Tab takes the ghost completion. Callback edits fire no Edit event, so do its
+        // bookkeeping (hard breaks, rewrap) here.
+        if (cb->completion && !cb->completion->empty() && !data->HasSelection()) {
+            data->InsertChars(data->CursorPos, cb->completion->c_str());
+            if (cb->composer) ++g_composerEditGeneration;
+            if (cb->wrap) noteEdit(*cb->wrap, data->Buf, data->BufTextLen, data->CursorPos);
+            if (rewrapCore(data->Buf, data->BufTextLen, cb->wrapW,
+                           cb->wrap ? &cb->wrap->hard : nullptr))
+                data->BufDirty = true;
+        }
+        return 0;
+    }
     if (data->EventFlag == ImGuiInputTextFlags_CallbackAlways && cb->composer) {
-        const bool imageChanged = !g_imageRemovals.empty() || !g_imageInsert.empty();
+        const bool draftChanged = !g_imageRemovals.empty() || !g_composerInsert.empty();
+        if (draftChanged) ++g_composerEditGeneration;
         if (!g_imageRemovals.empty()) {
             const std::string flat = normalizeComposerSelection(
                 std::string_view(data->Buf, data->BufTextLen), cb->wrap->hard,
@@ -128,8 +155,8 @@ int chatInputEditCallback(ImGuiInputTextCallbackData* data) {
             }
             g_imageRemovals.clear();
         }
-        if (!g_imageInsert.empty()) {
-            if (g_imageUseRememberedSelection) {
+        if (!g_composerInsert.empty()) {
+            if (g_insertAtRememberedSelection) {
                 data->CursorPos = std::clamp(g_composerCursor, 0, data->BufTextLen);
                 data->SelectionStart = std::clamp(g_composerSelectionStart, 0, data->BufTextLen);
                 data->SelectionEnd = std::clamp(g_composerSelectionEnd, 0, data->BufTextLen);
@@ -141,14 +168,14 @@ int chatInputEditCallback(ImGuiInputTextCallbackData* data) {
                 noteEdit(*cb->wrap, data->Buf, data->BufTextLen, begin);
             }
             const int at = begin != end ? begin : data->CursorPos;
-            data->InsertChars(at, g_imageInsert.c_str());
-            data->CursorPos = at + (int)g_imageInsert.size();
+            data->InsertChars(at, g_composerInsert.c_str());
+            data->CursorPos = at + (int)g_composerInsert.size();
             data->SelectionStart = data->SelectionEnd = data->CursorPos;
             noteEdit(*cb->wrap, data->Buf, data->BufTextLen, data->CursorPos);
-            g_imageInsert.clear();
-            g_imageUseRememberedSelection = false;
+            g_composerInsert.clear();
+            g_insertAtRememberedSelection = false;
         }
-        if (imageChanged &&
+        if (draftChanged &&
             rewrapCore(data->Buf, data->BufTextLen, cb->wrapW, &cb->wrap->hard))
             data->BufDirty = true;
         g_composerCursor = data->CursorPos;
@@ -172,6 +199,7 @@ int chatInputEditCallback(ImGuiInputTextCallbackData* data) {
         }
     }
     if (data->EventFlag == ImGuiInputTextFlags_CallbackEdit) {
+        if (cb->composer) ++g_composerEditGeneration;
         // Order matters: classify the edit against the PRE-rewrap buffer, so a newline the
         // user just typed is claimed as theirs before the wrapper is allowed to touch it.
         if (cb->wrap) noteEdit(*cb->wrap, data->Buf, data->BufTextLen, data->CursorPos);
@@ -225,7 +253,7 @@ bool drawChatInput(const char* id, std::vector<char>& buf, const char* placehold
     static std::unordered_map<ImGuiID, bool> s_activeLast;
     ImGuiID wid = ImGui::GetID(id);
     // g_wrap is keyed by the backing buffer's address, and st.prompt.resize() (draft restore,
-    // staged-edit restore, slash-autocomplete insert) can move it. Retire this widget's previous
+    // slash-autocomplete insert) can move it. Retire this widget's previous
     // key when that happens: the entry is unreachable afterwards, and leaving it behind leaked
     // one hard-break vector per relocation for the lifetime of the process.
     static std::unordered_map<ImGuiID, const char*> s_wrapKey;
@@ -234,17 +262,34 @@ bool drawChatInput(const char* id, std::vector<char>& buf, const char* placehold
     if (lastKey && lastKey != wrapKey) g_wrap.erase(lastKey);
     lastKey = wrapKey;
     WrapState& ws = g_wrap[wrapKey];
+    if (!g_inputWrapMemo.count(wid) && g_inputWrapMemo.size() >= 64) {
+        auto oldest = std::min_element(g_inputWrapMemo.begin(), g_inputWrapMemo.end(),
+            [](const auto& a, const auto& b) { return a.second.used < b.second.used; });
+        g_inputWrapMemo.erase(oldest);
+    }
+    auto& memo = g_inputWrapMemo[wid];
+    memo.used = ImGui::GetFrameCount();
     const int curLen = (int)std::strlen(buf.data());
     if (!s_activeLast[wid]) {
         // Idle: a length change can only have come from outside (chip, slash insert, clear),
         // and any newline in that text was put there deliberately — re-seed from it.
-        if (curLen != ws.lastLen) seedHardBreaks(ws, buf.data(), curLen);
-        rewrapCore(buf.data(), curLen, wrapW, &ws.hard);
+        const bool changed = curLen != ws.lastLen || memo.shown != buf.data();
+        if (changed) {
+            if (curLen != ws.lastLen) seedHardBreaks(ws, buf.data(), curLen);
+            if (g_mainComposerInput) ++g_composerEditGeneration;
+        }
+        if (changed || memo.width != wrapW || memo.font != ImGui::GetFont() ||
+            memo.fontSize != ImGui::GetFontSize()) {
+            rewrapCore(buf.data(), curLen, wrapW, &ws.hard);
+            memo.shown = buf.data();
+            memo.width = wrapW;
+            memo.font = ImGui::GetFont();
+            memo.fontSize = ImGui::GetFontSize();
+            memo.rows = 1 + (int)std::count(memo.shown.begin(), memo.shown.end(), '\n');
+        }
     }
 
-    int rows = 1;
-    for (const char* p = buf.data(); *p; ++p) if (*p == '\n') ++rows;
-    if (rows > maxLines) rows = maxLines;
+    int rows = std::min(memo.rows, maxLines);
     const float h = lineH * (float)rows + style.FramePadding.y * 2.0f;
 
     // ONE spelling of the send chord, shared by the newline filter and the submit test below:
@@ -291,10 +336,34 @@ bool drawChatInput(const char* id, std::vector<char>& buf, const char* placehold
         // Enter accepts a slash pick (handled by the menu) — don't insert a newline into the token.
         flags |= ImGuiInputTextFlags_CallbackHistory | ImGuiInputTextFlags_CtrlEnterForNewLine;
     }
-    ImGui::InputTextMultiline(id, buf.data(), buf.size(),
+    // A ghost completion is showing: Tab takes it. CallbackCompletion also claims Tab from
+    // keyboard tabbing, so focus stays in the box. The slash menu owns Tab while open.
+    if (g_mainComposerInput && !g_slashMenuActive && !composerSpellGhost().empty()) {
+        cb.completion = &composerSpellGhost();
+        flags |= ImGuiInputTextFlags_CallbackCompletion;
+    }
+    const bool edited = ImGui::InputTextMultiline(id, buf.data(), buf.size(),
         ImVec2(rightReserve > 0.0f ? -rightReserve : -1.0f, h),
         flags, chatInputEditCallback, &cb);
+    if (edited || memo.shown != buf.data()) {
+        memo.shown = buf.data();
+        memo.width = wrapW;
+        memo.font = ImGui::GetFont();
+        memo.fontSize = ImGui::GetFontSize();
+        memo.rows = 1 + (int)std::count(memo.shown.begin(), memo.shown.end(), '\n');
+    }
     paintComposerKeywords(wid, buf, ws);
+    if (g_mainComposerInput) {
+        ComposerSpellFix fix;
+        if (composerSpellPaint(wid, buf, ws.hard, !g_slashMenuActive, fix)) {
+            // Replace the word through the composer's own insert path (next frame, refocused).
+            g_composerSelectionStart = fix.begin;
+            g_composerSelectionEnd = fix.end;
+            g_composerCursor = fix.end;
+            g_composerInsert = std::move(fix.text);
+            g_insertAtRememberedSelection = true;
+        }
+    }
     if (!clipOverride.empty()) ImGui::SetClipboardText(clipOverride.c_str());
     s_activeLast[wid] = ImGui::IsItemActive();
     // A BARE Enter sends; so does Ctrl+Enter, which ImGui's multiline treats as "validate"
@@ -317,6 +386,37 @@ bool drawChatInput(const char* id, std::vector<char>& buf, const char* placehold
     return submit;
 }
 
+// Fill a chat-input buffer other than the composer's (the queued-message editor) with `text`
+// for a FRESH widget. The wrapper's hard-break bookkeeping is keyed by the buffer's address, so
+// whatever the previous fill left under it is dropped here (the widget re-seeds from the new
+// length). Roomy up front: the widget edits a fixed-size buffer and a relocation mid-edit would
+// lose the bookkeeping.
+void chatInputLoad(std::vector<char>& buf, const std::string& text) {
+    if (!buf.empty()) g_wrap.erase(buf.data());
+    buf.assign(std::max<size_t>(32768, text.size() * 2 + 4096), 0);
+    std::memcpy(buf.data(), text.data(), text.size());
+    g_wrap.erase(buf.data());
+}
+
+// What the user wrote into a chat-input buffer: the wrapper's soft newlines back to spaces, the
+// breaks they typed kept, trimmed — the same reading composerText gives the composer's box.
+std::string chatInputText(const std::vector<char>& buf) {
+    if (buf.empty()) return std::string();
+    std::string out = buf.data();
+    const auto it = g_wrap.find(buf.data());
+    const std::vector<int>* hard = it == g_wrap.end() ? nullptr : &it->second.hard;
+    for (size_t i = 0; i < out.size(); ++i) {
+        char& c = out[i];
+        if (c == '\n' && hard && std::binary_search(hard->begin(), hard->end(), (int)i)) continue;
+        if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+    }
+    const size_t begin = out.find_first_not_of(" \n");
+    if (begin == std::string::npos) return std::string();
+    out.resize(out.find_last_not_of(" \n") + 1);
+    out.erase(0, begin);
+    return out;
+}
+
 namespace ui {
 
 static bool startupComposerMetadataReady(const AppState& st) {
@@ -330,78 +430,29 @@ static bool startupComposerMetadataReady(const AppState& st) {
     return now - interactiveSince >= 1.5;
 }
 
-// ---- O1: model picker → RPC payload threading --------------------------------------------------
-// Canonical provider name sent to the long-lived worker from the GUI enum. PROV_LOCAL uses the
-// OpenAI-compatible wire family — base_url (persisted before every send) discriminates local from
-// cloud. PROV_CLOUDCOMPAT is a shared slot serving many services; agentProviderOverride refines
-// it to the selected service via ui::cloudServiceKey(base_url).
-static const char* providerWireName(int provider) {
-    switch (provider) {
-        case ui::PROV_ANTHROPIC:   return "anthropic";
-        case ui::PROV_LOCAL:       return "openai";  // base_url discriminates (loopback)
-        case ui::PROV_OPENAI:
-        case ui::PROV_CLOUDCOMPAT: return "openai";  // cloud slot refined in agentProviderOverride
-        case ui::PROV_LLAMACPP:    return "llamacpp";
-        case ui::PROV_GEMINI:      return "gemini";
-        case ui::PROV_XAI:         return "xai";  // saveSettings rewrites to xai-sub when no key
-        case ui::PROV_CURSOR:      return "cursor";
-        // Kimi Code uses the worker-facing "kimi-code" provider id; the older "kimi-sub"
-        // spelling belongs to the retired Python subscription-provider path.
-        case ui::PROV_KIMISUB:     return "kimi-code";
-        // ZenMux keeps its catalog provider id when sent to the long-lived worker.
-        case ui::PROV_ZENMUX:      return "zenmux";
-        // Free AI (FreeLLMAPI) keeps its own worker provider namespace.
-        case ui::PROV_FREELLMAPI:  return "freellmapi";
-    }
-    return "";
-}
-
-// The GUI pins provider/model/effort on every agent-turn request. Online design and mission
-// launches are centralized through jobs.cpp's `agent_admin_turn` route; explicit offline mode
-// alone retains the native core method. saveSettings still runs before each send so descriptor
-// details (base_url / api_key / model_path) match the picker, while these fields pin the selected
-// provider, model, and effort into the worker request.
-// Effort ladder for the picker's current model, Chudcode catalog first and the static family
-// ladders in model_registry.h otherwise. Returns the rung count.
+// Composer pins are sent only for a manually selected model. Following assignments omits
+// them on ordinary online turns so the worker can resolve the configured chat role.
+// Use only the exact selected model's authoritative effort metadata.
 static int composerEffortLadder(const Settings& s, const char** outLabels,
                                 const char** outValues, int maxN) {
-    ui::ModelInfo probe;
-    const ui::ModelInfo* probeP = nullptr;
-    if (const ui::BridgeModelMeta* bm = ui::bridgeModelMetaForCad(s.provider, s.model, s.baseUrl);
-        bm) {
-        probe = ui::modelInfoFromProbe(s.provider, s.model, bm->name, bm->contextWindow,
-                                       bm->maxTokens, bm->vision, bm->tools,
-                                       bm->reasoningEfforts, "catalog");
-        probeP = &probe;
+    if (s.ompProvider.empty()) return 0;
+    const ui::BridgeModelMeta* model = ui::bridgeModelMeta(s.ompProvider, s.model);
+    if (!model || !model->reasoningEffortsKnown) return 0;
+    int n = 0;
+    for (const auto& effort : model->reasoningEfforts) {
+        if (n >= maxN) break;
+        outLabels[n] = effort.c_str();
+        outValues[n++] = effort.c_str();
     }
-    return ui::reasoningEffortOptions(s.provider, s.model, outLabels, outValues, maxN, probeP);
+    return n;
 }
 
 nlohmann::json agentProviderOverride(const Settings& s) {
     nlohmann::json j = nlohmann::json::object();
-    const char* name = providerWireName(s.provider);
-    std::string wire = name ? name : "";
-    // The cloud-compat slot is shared by every base_url-keyed service (OpenRouter / DashScope /
-    // DeepSeek / Moonshot and other hosted provider ids). Pin the real provider name so
-    // Chudcode resolves the intended service rather than generic OpenAI compatibility.
-    if (s.provider == ui::PROV_CLOUDCOMPAT)
-        wire = ui::cloudServiceWireName(ui::cloudServiceKey(s.baseUrl));
-    if (!wire.empty()) j["provider"] = wire;
-    // llamacpp's Settings::model holds the gguf FILE PATH (the wire model stays "local-gguf");
-    // don't clobber the descriptor's model with a filesystem path.
-    if (s.provider != ui::PROV_LLAMACPP && s.model[0]) j["model"] = s.model;
-    if (s.reasoningEffort[0]) {
-        // Pin only a rung the model's CURRENT ladder actually offers: a stale pick inherited
-        // from another model (e.g. "medium" beside K3's low|high|max) would be rejected or
-        // mis-mapped upstream — omitting it lets the engine apply the model's default effort.
-        const char* lv[8] = {};
-        const char* vv[8] = {};
-        const int n = composerEffortLadder(s, lv, vv, 8);
-        bool valid = false;  // known model with no ladder never exposes a dial
-        for (int i = 0; i < n; ++i)
-            if (std::strcmp(s.reasoningEffort, vv[i]) == 0) valid = true;
-        if (valid) j["reasoning_effort"] = s.reasoningEffort;
-    }
+    if (!s.ompProvider.empty()) j["provider"] = s.ompProvider;
+    if (s.model[0]) j["model"] = s.model;
+    // Preserve the exact choice; unsupported choices are reported by the runtime.
+    if (s.reasoningEffort[0]) j["reasoning_effort"] = s.reasoningEffort;
     return j;
 }
 
@@ -491,6 +542,7 @@ static bool readAttachmentText(const std::string& path, std::string& out) {
 // frame the chip is on screen.
 enum class AttachState {
     PlainText,    // small, textual, JSON-safe: consumeComposerAttachments inlines it verbatim
+    Video,        // a video container rides as a path, never as text or an image part
     PathOnly,     // no extractor for this kind and not inlinable as text
     Running,      // office_extract in flight
     Ready,        // text in hand (possibly empty — a scanned PDF has none)
@@ -611,6 +663,10 @@ static bool officeExtractAbsent(const core::RpcResult& r) {
 static void ensureAttachmentContent(AppState& st, const std::string& path) {
     if (ui::isImageAttachment(path)) return;   // images ride structurally, not as text
     if (g_attachInfo.count(path)) return;      // already classified, running, or settled
+    if (ui::copilot::isVideoAttachment(path)) {
+        g_attachInfo[path].state = AttachState::Video;
+        return;
+    }
     if (!isBinaryDocument(path)) {
         std::string verbatim;
         if (readAttachmentText(path, verbatim)) {  // small, textual, JSON-safe: verbatim wins
@@ -683,6 +739,8 @@ static std::string pathOnlyNote(const AttachInfo* d) {
         case AttachState::PathOnly:
             return "path only \xE2\x80\x94 not text we can inline (binary, over the 64 KB cap, "
                    "or not UTF-8); open it from the path if you need it";
+        case AttachState::Video:
+            return "video path only; frames not inlined";
         case AttachState::PlainText:
             break;
     }
@@ -698,6 +756,7 @@ static std::string attachChipBadge(const AppState& st, const std::string& path,
         return (isExtractableDocument(path) && !st.workerStarted) ? "queued" : std::string();
     switch (d->state) {
         case AttachState::PlainText:   return {};
+        case AttachState::Video:       return "video";
         case AttachState::PathOnly:    return {};   // no badge: this is the normal, expected case
         case AttachState::Running:     return "extracting\xE2\x80\xA6";
         case AttachState::Ready:
@@ -723,6 +782,9 @@ static std::string attachChipTooltip(const AppState& st, const std::string& path
     switch (d->state) {
         case AttachState::PlainText:
             return t + "Attached \xE2\x80\x94 the file's text is inlined into your message.";
+        case AttachState::Video:
+            return t + "Video attached by path. The agent can extract frames and reconstruct it; "
+                       "the video bytes are not sent as image parts.";
         case AttachState::PathOnly:
             return t + "Attached by PATH only \xE2\x80\x94 its bytes are not text we can inline "
                        "(binary, over the 64 KB cap, or not UTF-8), so the model gets the path "
@@ -756,7 +818,7 @@ static std::string attachChipTooltip(const AppState& st, const std::string& path
 // actually receives: text files inlined verbatim, documents inlined as their extract,
 // everything else as an explicit path WITH the reason its content is absent — and (b) the
 // structured "attachments" array carried in the RPC payload, where every entry now declares
-// its "kind" ("image"|"file") and, for images, its "mime".
+// its "kind" ("image"|"video"|"file") and, for images, its "mime".
 //
 // The kinds are delivered by DIFFERENT routes, and all of them are real:
 //   TEXT files  — the inline injection below is what actually delivers their content, because
@@ -817,8 +879,18 @@ nlohmann::json consumeComposerAttachments(AppState& st, std::string& requestText
             atts.push_back(std::move(a));
             continue;
         }
-        a["kind"] = "file";
         const AttachInfo* info = attachInfoFor(path);
+        if ((info && info->state == AttachState::Video) ||
+            (!info && ui::copilot::isVideoAttachment(path))) {
+            a["kind"] = "video";
+            a["inline"] = false;
+            requestText += "\n\n[Attached file (video; path only; frames not inlined): " + path +
+                           "]\nFor reconstruction use reveng_add_video, reveng_start_splat, "
+                           "or reveng_reconstruct as appropriate.";
+            atts.push_back(std::move(a));
+            continue;
+        }
+        a["kind"] = "file";
         std::string fallback;
         if (!info && !isBinaryDocument(path) && readAttachmentText(path, fallback)) {
             // No classification yet — a send path that never drew a chip. Read it here rather
@@ -856,8 +928,8 @@ nlohmann::json consumeComposerAttachments(AppState& st, std::string& requestText
 // Wave4: take the pending context chips for THIS turn and disarm the cube. A chip whose document
 // is no longer open is dropped here (its ids could name nothing — or, after a restart, a
 // different document), with a toast so the omission is visible. The online worker resolves the
-// rest against the engine and renders them into the prompt (worker_rpc._editor_context_block);
-// lanes it does not reach inline core::contextRefsPromptText instead (offline route, steer).
+// rest against the engine and renders them into the prompt (worker_rpc._picked_context_text);
+// the control lane (a mid-run steer) inlines core::contextRefsPromptText instead.
 static std::vector<core::ContextRef> consumeContextRefs(AppState& st) {
     std::vector<core::ContextRef> refs;
     st.contextPickActive = false;
@@ -899,56 +971,12 @@ static std::vector<std::string> userImagePaths(const nlohmann::json& attachments
     return paths;
 }
 
-// Create a fresh part document if needed and launch the v2 orchestrator for `request`. The
-// current doc is replaced only when it already has features (so an empty new part is reused).
-// Centralized so both the direct Design path and the post-clarify "Build it" path share it.
-// options.history: the ACTIVE conversation's prior turns for the model, OLDEST FIRST, as
-// [{"role":"user"|"assistant","text":"..."}]. st.chat is the source of truth (already
-// persisted per-session by conversations.cpp); we only SEND it — never copy it into a
-// second store. The message being sent THIS turn is excluded: every send path appends the
-// user's bubble (then a running assistant placeholder) to st.chat BEFORE launching, so
-// after skipping running/empty/error entries the outgoing prompt is always the trailing
-// "user" entry and is dropped below. Cards.cpp's plan-approve execute path re-sends the
-// original plan-request turn — its bubble is likewise the trailing user entry. ALL caps
-// live here (the only place — the Python side does NOT re-trim): at most 12 entries and
-// 8000 total chars (drop from the FRONT; recent turns matter most), each entry clipped to
-// 1500 chars with a trailing " ...". Empty result == caller attaches NO history key, i.e.
-// exactly today's behaviour.
-static nlohmann::json chatHistoryForAgent(AppState& st) {
-    constexpr size_t kMaxEntries = 12;
-    constexpr size_t kMaxTotalChars = 8000;
-    constexpr size_t kMaxEntryChars = 1500;
-    nlohmann::json hist = nlohmann::json::array();
-    for (const ChatMsg& m : st.chat) {
-        if (m.running) continue;             // live placeholder / mid-stream turn
-        if (m.errKind != ERR_NONE) continue; // error cards are not conversation content
-        std::string t = m.text;              // text only — no images, tool cards, activity
-        if (m.fromUser && !m.contextRefs.empty())   // the chips it carried, as the model saw them
-            t += (t.empty() ? "" : "\n\n") + core::contextRefsPromptText(m.contextRefs);
-        if (t.find_first_not_of(" \t\r\n") == std::string::npos) continue;
-        if (t.size() > kMaxEntryChars) t = t.substr(0, kMaxEntryChars) + " ...";
-        hist.push_back({{"role", m.fromUser ? "user" : "assistant"}, {"text", std::move(t)}});
-    }
-    // Exclude the outgoing message (always the trailing user entry — see header comment).
-    if (!hist.empty() && hist.back().value("role", std::string()) == "user")
-        hist.erase(std::prev(hist.end()));
-    // Caps, dropping from the FRONT.
-    while (hist.size() > kMaxEntries) hist.erase(hist.begin());
-    size_t total = 0;
-    for (const auto& e : hist) total += e.value("text", std::string()).size();
-    while (!hist.empty() && total > kMaxTotalChars) {
-        total -= hist.front().value("text", std::string()).size();
-        hist.erase(hist.begin());
-    }
-    return hist;
-}
-
 // Attach the active conversation context shared by every agent-turn launch. The worker uses
 // session_id + sessions_dir to bind lossless sub-agent transcripts beside this chat session.
 // workspace_dir is the fs_* jail (CHUDWARE_FS_ROOT) and the project-save root: without it every
 // fs_list/fs_glob/fs_read in the main chat refuses with workspace_root_unavailable, so the agent
-// can never find the user's project files. The core's agent_workspace_dir() only runs on the
-// offline lane; the online route goes straight to the worker, so the GUI must send it.
+// can never find the user's project files. The online route goes straight to the worker, so the
+// GUI must send it.
 static void attachAgentConversationOptions(AppState& st, nlohmann::json& opts) {
 #ifndef __EMSCRIPTEN__
     opts["session_id"] = st.activeConvId();
@@ -962,15 +990,14 @@ static void attachAgentConversationOptions(AppState& st, nlohmann::json& opts) {
         opts["workspace_dir"] = st.workspaceDir;
         bindActiveConversationProject(st, st.workspaceDir);
     }
-    if (nlohmann::json hist = chatHistoryForAgent(st); !hist.empty())
-        opts["history"] = std::move(hist);
-    // Chudcode session continuity: a conversation whose persisted link carries a session
+    // The runtime journal is authoritative; do not reconstruct it from GUI text.
+    // Omp session continuity: a conversation whose persisted link carries a session
     // file resumes THAT service-side session (branch fork, closed runtime, app restart)
     // instead of minting a fresh one. Launching also marks the runtime live — this turn
     // creates or reattaches it — which is what arms the Sessions panel's recovery actions.
-    ChudcodeSessionLink& ccLink = chudcodeSessionLinkEnsure(st.activeConvId());
+    OmpSessionLink& ccLink = ompSessionLinkEnsure(st.activeConvId());
 #ifndef __EMSCRIPTEN__
-    if (!ccLink.sessionFile.empty()) opts["chudcode_session_file"] = ccLink.sessionFile;
+    if (!ccLink.sessionFile.empty()) opts["omp_session_file"] = ccLink.sessionFile;
 #endif
     ccLink.runtimeLive = true;
 }
@@ -985,19 +1012,49 @@ static const char* copilotModeName(int mode) {
     }
 }
 
-// ONE Chudcode general_agent turn for `request` on the active conversation. It never creates or
+static bool composerFollowsRoleForTurn(const Settings& s, const nlohmann::json& extra) {
+    const bool compaction = extra.is_object() && extra.contains("compact") &&
+                            extra["compact"].is_object();
+    return s.composerFollowRoles && !compaction;
+}
+
+nlohmann::json composerTurnPayload(const Settings& s, const nlohmann::json& extra) {
+    nlohmann::json payload = composerFollowsRoleForTurn(s, extra) ? nlohmann::json::object()
+                                                                  : agentProviderOverride(s);
+    if (extra.is_object())
+        for (auto it = extra.begin(); it != extra.end(); ++it) payload[it.key()] = it.value();
+    return payload;
+}
+
+// A /handoff conversation opens with its document as a visible seed (model "handoff"). Online,
+// history lives only in the runtime session, so the turn that creates that session carries the
+// seed after the typed text; later turns resume the session that already holds it.
+static std::string withHandoffSeed(AppState& st, const std::string& request) {
+    const OmpSessionLink& link = ompSessionLinkEnsure(st.activeConvId());
+    if (!link.sessionId.empty() || !link.sessionFile.empty()) return request;
+#ifdef __EMSCRIPTEN__
+    if (!cellAgentSessionHandle(st.activeConvId()).empty()) return request;
+#endif
+    for (const ChatMsg& m : st.chat)
+        if (!m.fromUser && m.model == "handoff" && !m.text.empty())
+            return request + "\n\n" + m.text;
+    return request;
+}
+
+// ONE Omp general_agent turn for `request` on the active conversation. It never creates or
 // replaces a document: whether to new_part or edit the open doc is the AGENT's decision, made
 // with the full CAD tool loadout, so the host must not pre-empt it with a blank part.
 // `extra` is merged on top of the provider override (attachments / context_refs / options…);
 // options.mode defaults to the composer's current mode name.
 void launchAgentTurn(AppState& st, const std::string& request, nlohmann::json extra) {
-    // Pin the picker's provider/model/effort explicitly in the worker payload so ambient provider
-    // configuration cannot beat the visible selection. Merge attachments/context refs on top.
-    nlohmann::json payload = agentProviderOverride(st.settings);
-    if (extra.is_object()) {
-        for (auto it = extra.begin(); it != extra.end(); ++it)
-            payload[it.key()] = it.value();
+    const bool compaction = extra.is_object() && extra.contains("compact") &&
+                            extra["compact"].is_object();
+    if (compaction || composerFollowsRoleForTurn(st.settings, extra)) {
+        // A Default assignment uses the saved chat model as fallback.
+        saveSettings(st.settings);
+        flushConfigWrites();
     }
+    nlohmann::json payload = composerTurnPayload(st.settings, extra);
     std::string modeName;
     {
         nlohmann::json opts = nlohmann::json::object();
@@ -1008,29 +1065,37 @@ void launchAgentTurn(AppState& st, const std::string& request, nlohmann::json ex
             opts["mode"] = copilotModeName(st.aiInteraction);
         modeName = opts["mode"].get<std::string>();
         if (!opts.contains("advisor")) opts["advisor"] = true;
-        // corporate_mode mirrors Settings → AI → Behavior (default off — no auto company).
-        opts["corporate_mode"] = st.settings.corporateMode;
         attachAgentConversationOptions(st, opts);
         payload["options"] = std::move(opts);
     }
-    // Single online agent entry: jobs.cpp flattens this payload into `agent_admin_turn`; only an
-    // explicit offline request retains the native `agent_run_v2` modeling fallback.
+    if (compaction) {
+        // Maintenance has one activity host and no user prompt/answer bubble.
+        st.activeRun()->stopRequested = false;
+        ChatMsg activity;
+        activity.running = true;
+        activity.compactionRun = true;
+        activity.liveStatus = "Compacting context\xe2\x80\xa6";
+        st.chat.push_back(std::move(activity));
+        appendChatRawMessage(st, st.chat.back());
+        st.designStarted = true;
+        chatLogResetStick();
+        ui::persistChatHistory(st);
+        st.status = "Compacting context...";
+        st.statusKind = 0;
+        st.livePhase = "Compacting context\xe2\x80\xa6";
+    }
+    // Single agent entry: jobs.cpp flattens this payload into `agent_admin_turn`.
     st.addLog("[..] agent turn (" + modeName + "): " + request);
     st.agentV2Running = true;
-    st.agentV2 = true;
-    launchAgentRunV2(st.worker, st.activeRun(), st.activeConvId(), st.chatDocKey, request,
+    launchAgentRunV2(st.worker, st.activeRun(), st.activeConvId(), st.chatDocKey,
+                     compaction ? request : withHandoffSeed(st, request),
                      st.docMirror.hasDoc() ? st.docMirror.docId() : std::string(),
                      st.ribbonTab == AppState::RT_Manufacture, payload);
 }
 
-// The inline clarify card: build-critical questions (interaction contract kinds).
-// Supports text/dimension (editable field), choice single (radio) + multi (checkbox),
-// approval (Y/N), and geometry_select (arm context-cube pick → chips). "Build it" folds
-// answers into the request; "Skip" uses suggested defaults.
-
 // ============================ session slash commands (/compact /shake /handoff /btw /prewalk) ===
-// Host owns the ChatMsg store; session_* RPCs are pure transforms (PySessionCmds). We convert
-// ChatMsg → OpenAI-style role+content messages[], call the RPC, then apply the result.
+// Online /compact is a maintenance turn. The other session_* commands
+// transform the host's ChatMsg store through OpenAI-style role+content messages[].
 
 struct BtwPanelState {
     bool open = false;
@@ -1045,7 +1110,7 @@ static BtwPanelState s_btw;
 static nlohmann::json chatMsgsToWireMessages(const std::vector<ChatMsg>& msgs) {
     nlohmann::json arr = nlohmann::json::array();
     for (const auto& m : msgs) {
-        if (m.text.empty() && m.running) continue;
+        if (m.compactionRun || (m.text.empty() && m.running)) continue;
         if (m.text.empty()) continue;
         nlohmann::json j;
         j["role"] = m.fromUser ? "user" : "assistant";
@@ -1055,9 +1120,10 @@ static nlohmann::json chatMsgsToWireMessages(const std::vector<ChatMsg>& msgs) {
     return arr;
 }
 
-static void applyWireMessagesToChat(AppState& st, const nlohmann::json& messages) {
+static void applyWireMessagesToChat(AppState& st, std::vector<ChatMsg>& target,
+                                    const nlohmann::json& messages) {
     if (!messages.is_array()) return;
-    st.chat.clear();
+    target.clear();
     for (const auto& jm : messages) {
         if (!jm.is_object()) continue;
         ChatMsg cm;
@@ -1080,11 +1146,15 @@ static void applyWireMessagesToChat(AppState& st, const nlohmann::json& messages
             }
         }
         if (cm.text.empty()) continue;
-        st.chat.push_back(std::move(cm));
-        ui::appendChatRawMessage(st, st.chat.back());
+        target.push_back(std::move(cm));
+        if (&target == &st.chat) ui::appendChatRawMessage(st, target.back());
     }
-    for (auto& m : st.chat) m.uiCachedH = -1.0f;
+    for (auto& m : target) m.uiCachedH = -1.0f;
     persistChatHistory(st);
+}
+
+static void applyWireMessagesToChat(AppState& st, const nlohmann::json& messages) {
+    applyWireMessagesToChat(st, st.chat, messages);
 }
 
 static void pushSessionNotice(AppState& st, const std::string& text) {
@@ -1128,8 +1198,11 @@ struct SlashItem {
     // Its service call shares the agent lane a running turn holds: unavailable during a run.
     bool        needsIdle = false;
     // Free-form argument syntax: /help, usage refusals, and the hint painted after `/cmd `.
+    // With `args` too, the first token may be one of them and any other text is free-form
+    // (`/compact [summary|snapcompact] [focus]`).
     const char* argHint = nullptr;
-    // Enumerated arguments: `/cmd ` opens the options menu; any other value is refused.
+    // Enumerated arguments: `/cmd ` opens the options menu; any other value is refused
+    // unless `argHint` admits free text.
     std::vector<SlashArg> args;
     // What a bare `/cmd` does (options menu header). Set = the argument is optional, so the
     // menu opens with nothing picked and Enter alone runs the command.
@@ -1264,11 +1337,10 @@ static bool tryHandleSkillsListCommand(AppState& st) {
 // notation); enumerated arguments get their own options menu with plain-word rows.
 static const SlashItem kSessionSlashItems[] = {
     {SlashKind::Session, "/compact ", "/compact",
-     "Summarize older messages to free up context", "ai_panel", true, nullptr,
+     "Summarize older messages to free up context", "ai_panel", true, "[focus]",
      {{"summary", "The model writes a summary that replaces older messages"},
-      {"snapcompact", "Archive older history as images (image-capable models only)"},
-      {"shake", "Drop recoverable heavy tool output, no model call"}},
-     "Enter alone uses your Compaction setting"},
+      {"snapcompact", "Archive older history as images (image-capable models only)"}},
+     "Enter alone uses your Compaction setting; other text tells the summary what to keep"},
     {SlashKind::Session, "/shake ", "/shake",
      "Drop bulky tool output and old images to free up context", "ai_panel", true, nullptr,
      {{"elide", "Replace bulky tool output with short placeholders"},
@@ -1314,7 +1386,8 @@ static std::string slashUsage(const SlashItem& cmd) {
             u += cmd.args[i].value;
         }
         u += cmd.noArgDetail ? "]" : ">";
-    } else if (cmd.argHint) {
+    }
+    if (cmd.argHint) {
         u += " ";
         u += cmd.argHint;
     }
@@ -1497,10 +1570,12 @@ static bool slashMenuRow(const char* iconName, const char* label, const char* de
     const float textW = slashTextWidth(rowW);
     const float rowH = slashRowHeight(detail, textW);
     ImGui::PushID(uid);
+    if (disabled) ImGui::BeginDisabled();
     const bool clicked = ImGui::Selectable("##slashrow", selected,
                                            ImGuiSelectableFlags_AllowItemOverlap |
                                                ImGuiSelectableFlags_DontClosePopups,
                                            ImVec2(rowW, rowH));
+    if (disabled) ImGui::EndDisabled();
     const bool hov = ImGui::IsItemHovered();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
@@ -1533,6 +1608,11 @@ static bool slashMenuRow(const char* iconName, const char* label, const char* de
     }
     ImGui::PopID();
     return clicked && !disabled;
+}
+
+static bool canCompactConversation(AppState& st) {
+    const auto* run = st.runIfExists(st.activeConvId());
+    return !aiTurnActive(st) && (!run || (!run->running.load() && !run->ready.load()));
 }
 
 // Draw the drop-up slash menu above the composer (its bottom sits `anchorTopY`, the top of the
@@ -1629,9 +1709,13 @@ static bool drawSlashAutocomplete(AppState& st, const ImVec2& inputMin, const Im
         (headerNote ? ImGui::CalcTextSize(headerNote, nullptr, false, headerTextW).y + rowGap
                     : 0.0f);
     const float gap = 4.0f * sc;
-    // Any run (this session's or another's) holds the agent lane these commands need.
+    // Compaction owns a conversation run slot; other service commands can still
+    // require the shared control lane.
     const bool runBusy = aiTurnActive(st) || st.anyRunActive();
-    auto rowDisabled = [runBusy](const SlashItem& it) { return runBusy && it.needsIdle; };
+    const bool compactBusy = !canCompactConversation(st);
+    auto rowDisabled = [runBusy, compactBusy](const SlashItem& it) {
+        return it.needsIdle && (it.insert.rfind("/compact ", 0) == 0 ? compactBusy : runBusy);
+    };
     // Up to 8 rows, but never taller than the space above the composer: the menu drops UP
     // and must not run off the top of the window. The list scrolls for the rest. Rows are
     // measured with the list's text width (a scrollbar's width is held back once the list
@@ -1674,6 +1758,11 @@ static bool drawSlashAutocomplete(AppState& st, const ImVec2& inputMin, const Im
         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
         ImGuiWindowFlags_NoNavFocus | ImGuiWindowFlags_NoScrollbar;
     if (ImGui::Begin("##slashautocomplete", nullptr, wflags)) {
+        // NoFocusOnAppearing keeps the caret in the composer, but it also means a click in the
+        // chat panel raises that panel above the menu, and the transcript's cards and chips
+        // then paint over the command rows. The menu is anchored to the composer, so it is
+        // always the front-most surface while open.
+        ImGui::BringWindowToDisplayFront(ImGui::GetCurrentWindow());
         ImDrawList* dl = ImGui::GetWindowDrawList();
         dl->ChannelsSplit(2);
         dl->ChannelsSetCurrent(1);
@@ -1717,13 +1806,18 @@ static bool drawSlashAutocomplete(AppState& st, const ImVec2& inputMin, const Im
         }
         ImGui::EndChild();
 
-        // Glass backdrop behind content (same family as drawing-panel popups).
+        // Opaque backdrop behind content: the menu floats over the transcript, and any
+        // translucency lets the chat text behind it read through the command rows. The fill
+        // is the adaptive scrim color at full opacity (the surface the text colors were picked
+        // against); the glass pass on top keeps the drawing-panel popup material.
         {
             ImVec2 p0 = ImGui::GetWindowPos();
             ImVec2 p1(p0.x + ImGui::GetWindowSize().x, p0.y + ImGui::GetWindowSize().y);
             dl->ChannelsSetCurrent(0);
-            // Thick glass: the menu floats over the transcript, so what is behind it must not
-            // read through the command rows.
+            ImVec4 fill = surf.tint;
+            fill.w = 1.0f;
+            dl->AddRectFilled(p0, p1, ImGui::ColorConvertFloat4ToU32(fill),
+                              ImGui::GetStyle().WindowRounding);
             ui::glassPanel(dl, ImRect(p0, p1), ui::GlassLevel::Thick,
                            ImGui::GetStyle().WindowRounding / sc, surf);
             // Subtle border so the menu reads against busy chat backdrops.
@@ -1759,6 +1853,7 @@ static bool drawSlashAutocomplete(AppState& st, const ImVec2& inputMin, const Im
 
     if (accepted && !acceptText.empty()) {
         applySlashInsert(st.prompt, acceptText);
+        ++g_composerEditGeneration;
         g_slashCaretToEnd = 1;  // park the caret after the inserted command
         s_slash.open = false;
         s_slash.matches.clear();
@@ -1822,6 +1917,65 @@ static void askBtw(AppState& st, const std::string& q) {
     }, 180000);
 }
 
+static bool s_keepCompactDraft = false;
+
+// Slash commands (/compact focus text included) leave no user bubble, so Up recall would lose
+// them; a command that fails after the box was cleared must still be one keypress away.
+// Per conversation, in send order; merged with the user bubbles by timestamp at recall time.
+struct RecallableCommand {
+    double ts;
+    std::string text;
+};
+static std::unordered_map<std::string, std::vector<RecallableCommand>> s_commandRecall;
+static void noteRecallableCommand(AppState& st, const std::string& text) {
+    if (text.empty()) return;
+    auto& list = s_commandRecall[st.activeConvId()];
+    if (!list.empty() && list.back().text == text) list.back().ts = chatNowEpoch();
+    else list.push_back({chatNowEpoch(), text});
+    constexpr size_t kMaxRecallableCommands = 64;
+    if (list.size() > kMaxRecallableCommands) list.erase(list.begin());
+}
+
+// /handoff writes its document through the conversation's own runtime. Meanwhile the
+// conversation shows the maintenance row /compact uses ("Compacting context…"), and that row
+// settles exactly once: from the result, or from Stop, which abandons the handoff (the late
+// document is dropped). Keyed by the conversation that asked; the value names the request, so
+// an abandoned handoff's late reply never settles a newer one.
+static std::unordered_map<std::string, uint64_t> s_handoffPending;
+
+static void settleHandoffRow(AppState& st, const std::string& owner, const std::string& status,
+                             std::string notice) {
+    if (std::vector<ChatMsg>* msgs = conversationMsgs(st, owner))
+        for (auto it = msgs->rbegin(); it != msgs->rend(); ++it) {
+            if (it->fromUser || !it->compactionRun || !it->running) continue;
+            ActivityItem row;
+            row.rowKind = 17;
+            row.stage = "subrun:compaction:handoff";
+            row.status = status;
+            row.title = notice;
+            it->activity.push_back(std::move(row));
+            it->running = false;
+            it->liveStatus.clear();
+            it->text = std::move(notice);
+            ++it->revision;
+            break;
+        }
+    if (owner == st.activeConvId() && st.livePhase == "Compacting context\xe2\x80\xa6") {
+        const bool done = status == "done";
+        st.livePhase.clear();
+        st.status = done ? "Handoff written." : "Handoff not completed.";
+        st.statusKind = done ? 0 : 1;
+    }
+    persistChatHistory(st);
+}
+
+static bool stopPendingHandoff(AppState& st, const std::string& convId) {
+    if (s_handoffPending.erase(convId) == 0) return false;
+    settleHandoffRow(st, convId, "cancelled", "Handoff stopped; this session was not handed off.");
+    st.addLog("[..] /handoff stopped by user");
+    return true;
+}
+
 // Returns true if `text` was a slash command (handled; do not run a normal turn).
 static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
     if (text.empty() || text[0] != '/') return false;
@@ -1848,9 +2002,11 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
     };
 
     // An argument outside a command's options is refused by name, never replaced by the
-    // default: a typo must not run a different compaction method than the one asked for.
+    // default. A command that also takes free text (argHint) reads it as that text instead:
+    // `/compact keep the bracket dims` is focus for the configured method.
     const SlashItem* spec = slashCommandFor(cmd);
-    if (spec && !spec->args.empty() && !rest.empty() && !slashArgFor(*spec, slashLower(rest))) {
+    if (spec && !spec->args.empty() && !spec->argHint && !rest.empty() &&
+        !slashArgFor(*spec, slashLower(rest))) {
         st.toast(ui::ToastLevel::Warn, "Usage: " + slashUsage(*spec));
         return true;
     }
@@ -1913,95 +2069,37 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
     }
 
     if (cmd == "/compact") {
-        if (!needIdle()) return true;
-        // No argument = the Compaction setting (Settings > AI). An explicit argument (one of
-        // the options, checked above) is sent as-is; the worker refuses one the session
-        // cannot honour rather than compacting with a different method.
-        const std::string strategy = slashLower(rest);
-        nlohmann::json params = nlohmann::json::object();
-        params["messages"] = chatMsgsToWireMessages(st.chat);
-        if (!strategy.empty()) params["strategy"] = strategy;
-        // Honor Agents-tab agent.compaction.* (defaults match shared contract).
-        int keepRecent = 20000;
-        bool supersedeReads = true;
-        bool dropUseless = true;
-        try {
-            std::ifstream in(configPath());
-            if (in) {
-                nlohmann::json j;
-                in >> j;
-                if (j.is_object()) {
-                    auto agent = j.value("agent", nlohmann::json::object());
-                    if (agent.is_object()) {
-                        auto comp = agent.value("compaction", nlohmann::json::object());
-                        if (comp.is_object()) {
-                            if (comp.contains("keep_recent_tokens") &&
-                                comp["keep_recent_tokens"].is_number_integer())
-                                keepRecent = comp["keep_recent_tokens"].get<int>();
-                            if (comp.contains("supersede_reads") &&
-                                comp["supersede_reads"].is_boolean())
-                                supersedeReads = comp["supersede_reads"].get<bool>();
-                            if (comp.contains("drop_useless") &&
-                                comp["drop_useless"].is_boolean())
-                                dropUseless = comp["drop_useless"].get<bool>();
-                        }
-                    }
-                }
-            }
-        } catch (...) {}
-        params["keep_recent_tokens"] = keepRecent;
-        params["supersede_reads"] = supersedeReads;
-        params["drop_useless"] = dropUseless;
-        // Anchor the compaction to this conversation's session: the Chudcode host owns the
-        // service-side transcript, so session_id (= conversation id, same value
-        // agent_admin_turn rides) is what lets an online compact rewrite the session it
-        // actually belongs to. Provider/model overrides pin summary rendering.
+        if (!canCompactConversation(st)) {
+            s_keepCompactDraft = true;
+            st.toast(ui::ToastLevel::Info, cmd + ": " + kAvailableAfterRun);
+            return true;
+        }
+        // `/compact [summary|snapcompact] [focus]`, as in Omp: a leading option runs that
+        // method for this compaction only; no option = the Compaction setting (Settings > AI);
+        // any other text is focus for the summary. The worker refuses a method the session
+        // cannot run rather than compacting with a different one.
+        std::string strategy, focus = rest;
         {
-            nlohmann::json pov = agentProviderOverride(st.settings);
-            for (auto& el : pov.items()) params[el.key()] = el.value();
-            if (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size() &&
-                !st.conversations[st.activeConv].id.empty()) {
-#ifdef __EMSCRIPTEN__
-                params["session_id"] = cellAgentSessionHandle(st.conversations[st.activeConv].id);
-#else
-                params["session_id"] = st.conversations[st.activeConv].id;
-#endif
+            const size_t sp = rest.find_first_of(" \t\n");
+            const std::string first = slashLower(rest.substr(0, sp));
+            if (slashArgFor(*spec, first)) {
+                strategy = first;
+                focus = sp == std::string::npos ? std::string() : rest.substr(sp + 1);
+                while (!focus.empty() && (focus[0] == ' ' || focus[0] == '\t' || focus[0] == '\n'))
+                    focus.erase(focus.begin());
             }
         }
-        st.rpc.call("session_compact", params, [&st](const core::RpcResult& r) {
-            if (slashRpcFailed(st, r, "Couldn't compact this session.")) return;
-            if (!r.result.is_object()) {
-                st.toast(ui::ToastLevel::Error, "Couldn't compact this session.");
-                return;
-            }
-            // Replace the visible chat ONLY when the result carries an explicit nonempty
-            // replacement payload (ui::chudcodeCompactReplacement: rebuilt "messages"
-            // first, legacy bare "kept_messages" tail second). Chudcode online compaction
-            // rewrites the service-side session and returns NEITHER — the visible chat
-            // must stay intact then, and a present-but-empty array must never wipe it.
-            if (const nlohmann::json* repl = ui::chudcodeCompactReplacement(r.result))
-                applyWireMessagesToChat(st, *repl);
-            std::string notice;
-            if (r.result.contains("short_summary") && r.result["short_summary"].is_string())
-                notice = r.result["short_summary"].get<std::string>();
-            else if (r.result.contains("summary") && r.result["summary"].is_string())
-                notice = r.result["summary"].get<std::string>();
-            // Name only the method the agent service reports it used (the runtime's
-            // compaction entry), never the requested or configured one.
-            const auto methodIt = r.result.find("method");
-            const std::string method = (methodIt != r.result.end() && methodIt->is_string())
-                                           ? methodIt->get<std::string>()
-                                           : std::string();
-            std::string methodLabel = method;
-            if (method == "soft") methodLabel = "summary";
-            else if (method == "remote") methodLabel = "provider-native compaction";
-            if (notice.empty())
-                notice = methodLabel.empty() ? "Compacted." : "Compacted (" + methodLabel + ").";
-            pushSessionNotice(st, notice);
-            st.addLog("[..] /compact ok" + (methodLabel.empty() ? std::string()
-                                                                : " (" + methodLabel + ")"));
-        }, 180000);
-        st.toast(ui::ToastLevel::Info, "Compacting...");
+        if (strategy == "snapcompact" && !focus.empty()) {
+            s_keepCompactDraft = true;
+            st.toast(ui::ToastLevel::Warn,
+                     "/compact snapcompact archives history without a summary, so it takes no "
+                     "focus text.");
+            return true;
+        }
+        nlohmann::json compact = nlohmann::json::object();
+        if (!strategy.empty()) compact["strategy"] = strategy;
+        if (!focus.empty()) compact["instructions"] = focus;
+        launchAgentTurn(st, text, {{"compact", std::move(compact)}});
         return true;
     }
 
@@ -2021,7 +2119,7 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
             }
             // Same replacement guard as /compact: only a nonempty explicit payload may
             // replace the visible transcript.
-            if (const nlohmann::json* repl = ui::chudcodeCompactReplacement(r.result))
+            if (const nlohmann::json* repl = ui::ompCompactReplacement(r.result))
                 applyWireMessagesToChat(st, *repl);
             std::string notice;
             if (r.result.contains("notice") && r.result["notice"].is_string())
@@ -2042,20 +2140,65 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
     }
 
     if (cmd == "/handoff") {
-        if (!needIdle()) return true;
+        // A refused /handoff keeps its text in the box, like a refused /compact.
+        if (!needIdle()) {
+            s_keepCompactDraft = true;
+            return true;
+        }
         if (st.chat.size() < 2) {
+            s_keepCompactDraft = true;
             st.toast(ui::ToastLevel::Warn, "Need at least two messages to hand off.");
             return true;
         }
         nlohmann::json params = nlohmann::json::object();
         params["messages"] = chatMsgsToWireMessages(st.chat);
         if (!rest.empty()) params["focus"] = rest;
+        // The live runtime session writes the handoff from its own (compacted) context.
+#ifdef __EMSCRIPTEN__
+        params["session_id"] = cellAgentSessionHandle(st.activeConvId());
+#else
+        params["session_id"] = st.activeConvId();
+#endif
         nlohmann::json pov = agentProviderOverride(st.settings);
         if (pov.contains("provider")) params["provider"] = pov["provider"];
         if (pov.contains("model")) params["model"] = pov["model"];
         else if (st.settings.model[0]) params["model"] = st.settings.model;
-        st.rpc.call("session_handoff", params, [&st](const core::RpcResult& r) {
-            if (slashRpcFailed(st, r, "Couldn't generate the handoff.")) return;
+        const std::string owner = st.activeConvId();
+        const std::string docKey = st.chatDocKey;
+        static uint64_t s_handoffSeq = 0;
+        const uint64_t request = ++s_handoffSeq;
+        s_handoffPending[owner] = request;
+        {
+            ChatMsg activity;
+            activity.running = true;
+            activity.compactionRun = true;
+            activity.liveStatus = "Compacting context\xe2\x80\xa6";
+            st.chat.push_back(std::move(activity));
+            appendChatRawMessage(st, st.chat.back());
+            chatLogResetStick();
+            persistChatHistory(st);
+            st.status = "Compacting context...";
+            st.statusKind = 0;
+            st.livePhase = "Compacting context\xe2\x80\xa6";
+        }
+        st.rpc.call("session_handoff", params, [&st, owner, docKey, request, command = text](
+                                                   const core::RpcResult& r) {
+            const auto pending = s_handoffPending.find(owner);
+            if (pending == s_handoffPending.end() || pending->second != request) {
+                st.addLog("[..] /handoff result discarded (stopped by user)");
+                return;
+            }
+            s_handoffPending.erase(pending);
+            // A failed handoff returns its command to the owner's composer, as /compact does.
+            const bool busy = core::workerLaneBusy(r);
+            if (slashRpcFailed(st, r, "Couldn't generate the handoff.")) {
+                settleHandoffRow(st, owner, busy ? "skipped" : "fail",
+                                 busy ? std::string("Handoff not started: ") + kAvailableAfterRun
+                                      : "Couldn't hand off this conversation: " +
+                                            userFacingRpcError(r, "The handoff did not complete."));
+                restoreUnsentForConversation(st, owner, docKey, command);
+                return;
+            }
             std::string doc;
             if (r.result.is_object()) {
                 if (r.result.contains("document") && r.result["document"].is_string())
@@ -2067,8 +2210,13 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
             }
             if (doc.empty()) {
                 st.toast(ui::ToastLevel::Error, "Handoff returned empty document.");
+                settleHandoffRow(st, owner, "fail",
+                                 "Couldn't hand off this conversation: the handoff document "
+                                 "came back empty.");
+                restoreUnsentForConversation(st, owner, docKey, command);
                 return;
             }
+            settleHandoffRow(st, owner, "done", "Handed off to a new session.");
             // New session/tab; old tab transcript left intact.
             ensureConversations(st);
             parkActiveConversation(st);
@@ -2080,6 +2228,8 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
             st.activeConv = (int)st.conversations.size() - 1;
             st.chat.clear();
             st.lastContextTokens = 0;
+            st.lastContextWindow = 0;
+            st.lastContextWindowSource.clear();
             st.queuedPrompts.clear();
             st.queuedPromptDrafts.clear();
             // Visible handoff seed wrapping the document.
@@ -2094,10 +2244,11 @@ static bool tryHandleSlashCommand(AppState& st, const std::string& text) {
             st.chat.push_back(std::move(seed));
             appendChatRawMessage(st, st.chat.back());
             persistChatHistory(st);
+            // The command that opened this session is its first Up recall.
+            noteRecallableCommand(st, command);
             st.toast(ui::ToastLevel::Success, "New session started with handoff context");
             st.addLog("[..] /handoff: new session seeded");
         }, 300000);
-        st.toast(ui::ToastLevel::Info, "Generating handoff...");
         return true;
     }
 
@@ -2163,18 +2314,43 @@ void drawBtwPanel(AppState& st) {
     s_btw.open = open;
 }
 
-// Launch the active turn for `text`: ONE Chudcode general_agent turn in the mode the USER picked
+static void queueComposerPrompt(AppState& st, const std::string& text) {
+    // Freeze this prompt's exact roster; a later draft is independent.
+    st.queuedPromptDrafts.resize(st.queuedPrompts.size(), nlohmann::json::object());
+    st.queuedPrompts.emplace_back(text);
+    st.queuedPromptDrafts.push_back({
+        {"attachments", std::move(st.pendingAttachments)},
+        {"inline_images", std::move(st.pendingInlineImagePaths)},
+        {"context_refs", core::contextRefsToJson(st.pendingContextRefs)}});
+    markChatHistoryDirty();
+    st.pendingAttachments.clear();
+    st.pendingInlineImagePaths.clear();
+    st.pendingContextRefs.clear();
+}
+
+// Launch the active turn for `text`: ONE Omp general_agent turn in the mode the USER picked
 // in the composer (Agent | Plan | Ask). The host never inspects the request text — no intent
 // sniffing, no auto-routing, no mode promotion, no CFD hijack: the agent decides for itself
 // whether to answer inline, spawn subagents or run a mission, with the tool policy its mode
 // implies. Pushes the user + live-assistant ChatMsgs, then hands off to launchAgentTurn.
 void submitTurn(AppState& st, const std::string& text) {
-    if (text.empty() && st.pendingAttachments.empty() && st.pendingContextRefs.empty()) return;
-    // A fresh turn always clears a lingering stop latch (e.g. worker never drained after cancel).
-    st.activeRun()->stopRequested = false;
-    // Slash commands: /compact /shake /handoff /btw /prewalk /skills /help — pure host+RPC,
-    // no agent turn. Skills themselves (/skill:<name>) ride a normal turn and activate in-agent.
-    if (tryHandleSlashCommand(st, text)) return;
+    if (text.empty() && st.pendingAttachments.empty() && st.pendingInlineImagePaths.empty() &&
+        st.pendingContextRefs.empty()) return;
+    const auto run = st.activeRun();
+    const bool pending = run->running.load() || run->ready.load();
+    const bool compacting = run->isCompaction && pending;
+    // Stop is cosmetic until the owning job and its result have actually settled.
+    if (pending && (compacting || run->stopRequested.load() || run->ready.load())) {
+        queueComposerPrompt(st, text);
+        return;
+    }
+    if (!pending) run->stopRequested = false;
+    // Session commands handle themselves; /compact uses a maintenance turn. Skills
+    // (/skill:<name>) ride a normal turn and activate in-agent.
+    if (tryHandleSlashCommand(st, text)) {
+        noteRecallableCommand(st, text);
+        return;
+    }
     // ONE live run per conversation. The composer normally queues a send while a turn is in
     // flight (drain at the top of drawComposer), so this only catches an out-of-band submit.
     if (st.convRunning(st.activeConvId())) {
@@ -2191,12 +2367,12 @@ void submitTurn(AppState& st, const std::string& text) {
     // in the request below. The long-lived worker therefore receives exactly what the picker
     // shows instead of re-resolving a stale endpoint or an ambient CHUDWARE_PROVIDER override.
     saveSettings(st.settings);
+    flushConfigWrites();
     // M23: fold pending attachments into THIS turn. `sendText` (what the model receives) gets
     // inlined text-file content / explicit paths appended; the chat shows a compact marker.
     // Wave4: context_refs ride as structured payload only: the online worker resolves each
-    // against the engine and renders it into the prompt; the explicit offline core route gets
-    // them inlined by buildAgentJobRpcRoute. The bubble shows them as chips (ChatMsg).
-    // Nothing else is prepended: the persistent Chudcode session already holds the conversation
+    // against the engine and renders it into the prompt. The bubble shows them as chips (ChatMsg).
+    // Nothing else is prepended: the persistent Omp session already holds the conversation
     // (options.history only seeds a fresh one), so the request is the user's own words.
     std::string sendText = text;
     std::string bubbleText;
@@ -2238,39 +2414,8 @@ void submitTurn(AppState& st, const std::string& text) {
     // first prompt (autoTitleConversation) unless the user renamed it.
     ui::persistChatHistory(st);
 
-    // The turn's "current editor context", sent in EVERY mode whenever a document is open (the
-    // CAD analogue of the active file in a code editor): the open doc, the feature the
-    // PropertyManager/tree has focused, and the viewport selection. Python renders it into the
-    // prompt; it is context, never an instruction to edit those entities.
-    auto buildTurnScope = [&]() -> nlohmann::json {
-        nlohmann::json scope = nlohmann::json::object();
-        scope["doc_id"] = st.docMirror.docId();
-        nlohmann::json fids = nlohmann::json::array();
-        if (st.propertyManager && st.propertyManager->active() &&
-            !st.propertyManager->targetId().empty()) {
-            fids.push_back(st.propertyManager->targetId());
-        } else if (!st.selectedFeatureId.empty()) {
-            fids.push_back(st.selectedFeatureId);
-        }
-        if (!fids.empty()) scope["feature_ids"] = fids;
-        nlohmann::json sels = nlohmann::json::array();
-        for (const auto& it : st.selection.items()) {
-            if (!it.selector.empty()) {
-                try {
-                    sels.push_back(nlohmann::json::parse(it.selector));
-                } catch (...) {
-                    sels.push_back(it.selector);
-                }
-            }
-        }
-        if (!sels.empty()) scope["selection"] = sels;
-        return scope;
-    };
-
     nlohmann::json opts = {{"mode", copilotModeName(mode)},
-                           {"advisor", true},
-                           {"corporate_mode", st.settings.corporateMode}};
-    if (st.docMirror.hasDoc()) opts["scope"] = buildTurnScope();
+                           {"advisor", true}};
     attachAgentConversationOptions(st, opts);
     extra["options"] = std::move(opts);
 
@@ -2284,8 +2429,8 @@ void submitTurn(AppState& st, const std::string& text) {
 // ---- runtime-not-ready banner (kept from the old Design body) ----
 void drawRuntimeBanner(AppState& st) {
     if (st.workerStarted) return;
-    // The in-process core remains sufficient for documents, simulation, and the explicit offline
-    // modeling fallback, so a loaded core does not need the Python-runtime setup banner.
+    // The in-process core remains sufficient for documents and simulation, so a loaded core does
+    // not need the Python-runtime setup banner.
     if (core::cpp_core().available()) return;
     const auto& pal = ui::palette;
     ImGui::PushStyleColor(ImGuiCol_ChildBg,
@@ -2346,19 +2491,67 @@ static std::string composerProviderLogoId(const Settings& s) {
 }
 
 // The model's real display name ("Claude Sonnet 5"). Resolution order:
-//   1. cached Chudcode catalog metadata,
+//   1. cached Omp catalog metadata,
 //   2. static builtinModels() fallback,
 //   3. shortModelName, then the raw id.
 // Never carries the provider — the brand mark says that.
 static std::string composerModelName(const Settings& s) {
     if (!s.model[0]) return "default";
-    if (const ui::BridgeModelMeta* m = ui::bridgeModelMetaForCad(s.provider, s.model, s.baseUrl))
-        if (!m->name.empty()) return m->name;
+    if (!s.ompProvider.empty())
+        if (const ui::BridgeModelMeta* m = ui::bridgeModelMeta(s.ompProvider, s.model))
+            if (!m->name.empty()) return m->name;
     for (const ui::ModelInfo& mi : ui::builtinModels())
         if (mi.provider == s.provider && mi.id == s.model && !mi.label.empty())
             return mi.label;
     const std::string shortId = ui::shortModelName(s.model);
     return shortId.empty() ? std::string(s.model) : shortId;
+}
+struct ComposerAssignmentView {
+    bool inFlight = false, valid = false;
+    double lastPoll = -1e9;
+    std::string mode, provider, model;
+};
+static ComposerAssignmentView s_composerAssignment;
+
+static void pollComposerAssignment(AppState& st) {
+    auto& view = s_composerAssignment;
+    if (view.inFlight || ImGui::GetTime() - view.lastPoll < 2.0) return;
+    view.lastPoll = ImGui::GetTime();
+    view.inFlight = true;
+    st.rpc.call("ai_roles_get", nlohmann::json::object(), [](const core::RpcResult& r) {
+        auto& v = s_composerAssignment;
+        v.inFlight = false;
+        // A running turn holds hostd's agent lane (ai_roles_* are served from it) and every
+        // other call on it is refused at once: keep the assignment last read instead of
+        // dropping it every 2 s for the length of the run.
+        if (core::workerLaneBusy(r)) return;
+        v.valid = false;
+        if (!r.ok || !r.result.is_object() || r.result.contains("code") ||
+            !r.result.value("ok", false)) return;
+        nlohmann::json entry;
+        if (r.result.contains("chat_assignment"))
+            entry = r.result["chat_assignment"];
+        else if (r.result.value("assignment_mode", std::string()) == "simple") {
+            const auto sizes = r.result.value("model_sizes", nlohmann::json::object());
+            if (sizes.is_object()) entry = sizes.value("large", nlohmann::json());
+        } else {
+            const auto roles = r.result.value("roles", nlohmann::json::object());
+            if (roles.is_object()) entry = roles.value("chat", nlohmann::json());
+        }
+        v.provider.clear();
+        v.model.clear();
+        if (entry.is_string()) {
+            v.mode = entry.get<std::string>();
+        } else if (entry.is_object()) {
+            v.mode = entry.value("mode", std::string());
+            v.provider = entry.value("provider", std::string());
+            v.model = entry.value("model", std::string());
+            if (!v.provider.empty() && !v.model.empty()) v.mode = "fixed";
+        } else {
+            return;
+        }
+        v.valid = v.mode == "default" || v.mode == "auto" || v.mode == "fixed";
+    });
 }
 
 // ---- composer gauges ---------------------------------------------------------------------
@@ -2376,19 +2569,10 @@ static ImU32 gaugeTrackColor(const ui::AdaptiveSurface& surf) {
     return ImGui::ColorConvertFloat4ToU32(c);
 }
 
-// Provenance of st.lastContextWindow — the `window_source` key the harness now stamps on every
-// agent.context event ("user" | "catalog" | "probe" | "heuristic" | ""). Deliberately a
-// file-scoped global instead of a new AppState field: st.lastContextWindow is itself ONE global
-// value feeding ONE global gauge, so an annotation of it is exactly as scoped as the thing it
-// annotates and app_state.h stays untouched. Written by the event drain in host/src/app.cpp
-// through ui::setContextWindowSource() (forward-declared at that call site). This whole file is
-// already inside `namespace ui` (opened above), so the definition needs no wrapper.
-static std::string g_ctxWindowSource;
-void setContextWindowSource(const std::string& src) { g_ctxWindowSource = src; }
-// "" and "heuristic" both mean "a rough per-provider default the harness fell back to" — the
-// least trusted answer there is, and NOT something that may outrank curated catalog data.
-static bool ctxWindowSourceTrusted() {
-    return !g_ctxWindowSource.empty() && g_ctxWindowSource != "heuristic";
+// Window provenance travels with its conversation. An absent or heuristic
+// source must never outrank the model-specific catalog.
+static bool ctxWindowSourceTrusted(const AppState& st) {
+    return !st.lastContextWindowSource.empty() && st.lastContextWindowSource != "heuristic";
 }
 
 // The window the context meter reports, in strict precedence:
@@ -2416,10 +2600,10 @@ struct CtxWindow {
 };
 static CtxWindow contextMeterWindow(const AppState& st) {
     if (st.settings.contextWindow > 0) return {st.settings.contextWindow, true};
-    if (st.lastContextWindow > 0 && ctxWindowSourceTrusted()) return {st.lastContextWindow, true};
-    if (const ui::BridgeModelMeta* bm = ui::bridgeModelMetaForCad(
-            st.settings.provider, st.settings.model, st.settings.baseUrl);
-        bm && bm->contextWindow > 0)
+    if (st.lastContextWindow > 0 && ctxWindowSourceTrusted(st)) return {st.lastContextWindow, true};
+    if (const ui::BridgeModelMeta* bm = ui::bridgeModelMeta(
+            st.settings.ompProvider, st.settings.model);
+        !st.settings.ompProvider.empty() && bm && bm->contextWindow > 0)
         return {bm->contextWindow, true};
     if (const int eff = effectiveContextWindow(st.settings); eff > 0) return {eff, false};
     return {st.lastContextWindow > 0 ? st.lastContextWindow : 0, false};
@@ -2506,46 +2690,53 @@ static int activityCharsOf(const ChatMsg& m) {
 
 // The estimated size of the transcript the user is LOOKING AT, i.e. what continuing this session
 // would cost to resend. st.chat is the active conversation's live message vector (every other
-// resident conversation parks its msgs; see conversations.cpp) — the same source
-// chatHistoryForAgent() sends — so this needs no second accessor.
+// resident conversation parks its msgs; see conversations.cpp), so this needs no second accessor.
 //
-// Error cards are skipped for the same reason chatHistoryForAgent() skips them: they are GUI
-// failure notices, not conversation content, and are not resent.
+// Error cards are skipped: they are GUI failure notices, not conversation content, and are not
+// resent.
 //
-// Memoised on (message count, length of the last message's text, active conversation id) so a
-// streaming turn and a switched session both recompute, but an idle frame over a long transcript
-// does NOT rescan it. Called from the per-frame draw path, so a full scan every frame is the
-// thing being avoided here.
+// Cache each message independently: a streamed tail never recopies/re-estimates old turns.
 static const ui::ContextEstimate& viewedTranscriptEstimate(const AppState& st) {
+    struct Row {
+        uint64_t revision = ~uint64_t(0);
+        double ts = -1.0;
+        size_t textSize = 0, activitySize = 0;
+        int error = -1;
+        ui::ContextEstimate estimate;
+    };
     struct Memo {
-        bool                valid = false;
-        size_t              count = 0, lastLen = 0;
-        std::string         convId;
-        ui::ContextEstimate est;
+        std::string convId;
+        std::vector<Row> rows;
+        ui::ContextEstimate estimate;
     };
     static Memo memo;
-    const std::string convId =
-        (st.activeConv >= 0 && st.activeConv < (int)st.conversations.size())
-            ? st.conversations[st.activeConv].id
-            : std::string();
-    const size_t count   = st.chat.size();
-    const size_t lastLen = count ? st.chat.back().text.size() : 0;
-    if (memo.valid && memo.count == count && memo.lastLen == lastLen && memo.convId == convId)
-        return memo.est;
-    std::vector<ui::TranscriptEntry> entries;
-    entries.reserve(count);
-    for (const ChatMsg& m : st.chat) {
-        if (m.errKind != ERR_NONE) continue;
-        const int actChars = activityCharsOf(m);
-        if (m.text.empty() && actChars == 0) continue;
-        entries.push_back(ui::TranscriptEntry{m.fromUser, m.text, actChars});
+    const auto& convId = st.activeConvId();
+    if (memo.convId != convId) { memo = Memo{}; memo.convId = convId; }
+    memo.rows.resize(st.chat.size());
+    int64_t tokens = 0, messages = 0;
+    bool truncated = false;
+    for (size_t i = 0; i < st.chat.size(); ++i) {
+        const auto& m = st.chat[i];
+        auto& row = memo.rows[i];
+        if (row.revision != m.revision || row.ts != m.ts || row.textSize != m.text.size() ||
+            row.activitySize != m.activity.size() || row.error != m.errKind) {
+            row.revision = m.revision; row.ts = m.ts; row.textSize = m.text.size();
+            row.activitySize = m.activity.size(); row.error = m.errKind;
+            row.estimate = {};
+            if (m.errKind == ERR_NONE && !m.compactionRun) {
+                const int chars = activityCharsOf(m);
+                if (!m.text.empty() || chars)
+                    row.estimate = ui::estimateEntries({{m.fromUser, m.text, chars}});
+            }
+        }
+        tokens += row.estimate.tokens;
+        messages += row.estimate.messages;
+        truncated |= row.estimate.truncated;
     }
-    memo.valid   = true;
-    memo.count   = count;
-    memo.lastLen = lastLen;
-    memo.convId  = convId;
-    memo.est     = ui::estimateEntries(entries);
-    return memo.est;
+    memo.estimate.tokens = (int)std::min<int64_t>(tokens, INT_MAX);
+    memo.estimate.messages = (int)std::min<int64_t>(messages, INT_MAX);
+    memo.estimate.truncated = truncated;
+    return memo.estimate;
 }
 
 // The numerator the meter shows, and what kind of number it is. A MEASURED call always wins; the
@@ -2566,6 +2757,16 @@ static CtxMeterUsage contextMeterUsage(const AppState& st) {
     if (st.lastContextTokens > 0)
         return {st.lastContextTokens, false, 0, false,
                 std::min(base, st.lastContextTokens)};
+    if (st.lastContextTokens == INT_MIN) return {};  // a measured empty context
+    // -1 means unknown after a committed compaction; <= -2 stores an OMP
+    // tokenizer estimate as -(tokens + 2). Never estimate the active context
+    // from the visible transcript, which retains the compacted-away history.
+    if (st.lastContextTokens == -1)
+        return {};
+    if (st.lastContextTokens <= -2) {
+        const int estimated = -(st.lastContextTokens + 2);
+        return {estimated, true, 0, false, std::min(base, estimated)};
+    }
     // Nothing measured: the system prompt is still genuinely spent on the next call, so it is
     // added to the transcript estimate. This is what replaces the em dash on a fresh session.
     const ui::ContextEstimate& e = viewedTranscriptEstimate(st);
@@ -2583,8 +2784,8 @@ static CtxMeterUsage contextMeterUsage(const AppState& st) {
 //                         "?", which turned the estimate into a broken-looking "?978/262k".
 //   empty transcript   -> "\xe2\x80\x94/200k": nothing measured AND nothing to count, so the
 //                         numerator is an em dash and the ring sits empty — a pure capacity hint
-//   win == 0           -> "ctx \xe2\x80\x94" with NO ring: the window is unknown, so there is no
-//                         fraction to show at all
+//   win == 0           -> "ctx N" with no ring when usage is known, otherwise "ctx \xe2\x80\x94":
+//                         an unknown capacity cannot produce a fraction
 //   win is a guess     -> "ctx 145k" with NO ring and no denominator: an id-pattern estimate
 //                         is not a capacity, so the meter stays neutral (never over-limit red)
 //                         until the catalog or the provider reports the real window
@@ -2594,12 +2795,13 @@ struct CtxMeterText {
 };
 static CtxMeterText contextMeterText(const AppState& st) {
     const CtxWindow win = contextMeterWindow(st);
-    if (win.tokens <= 0) return {std::string("\xe2\x80\x94"), false};
     const CtxMeterUsage u = contextMeterUsage(st);
-    std::string num = u.tokens <= 0  ? std::string("\xe2\x80\x94")
-                      : u.estimate   ? "~" + fmtTokens(u.tokens)
-                                     : fmtTokens(u.tokens);
-    if (!win.known) return {num, false};
+    std::string num = st.lastContextTokens == INT_MIN ? "0"
+                      : st.lastContextTokens == -2 ? "~0"
+                      : u.tokens <= 0 ? std::string("\xe2\x80\x94")
+                      : u.estimate ? "~" + fmtTokens(u.tokens)
+                                   : fmtTokens(u.tokens);
+    if (win.tokens <= 0 || !win.known) return {num, false};
     return {num + "/" + fmtTokens(win.tokens), true};
 }
 
@@ -2676,10 +2878,10 @@ static void drawContextMeter(AppState& st, float roomForMeter) {
         const char* srcTxt = nullptr;
         if (st.settings.contextWindow > 0) {
             srcTxt = "your explicit override in AI settings";
-        } else if (st.lastContextWindow > 0 && ctxWindowSourceTrusted()) {
-            srcTxt = g_ctxWindowSource == "user"
+        } else if (st.lastContextWindow > 0 && ctxWindowSourceTrusted(st)) {
+            srcTxt = st.lastContextWindowSource == "user"
                          ? "the override the harness was configured with"
-                         : g_ctxWindowSource == "catalog"
+                         : st.lastContextWindowSource == "catalog"
                                ? "the harness's curated catalog entry for the model that "
                                  "actually ran"
                                : "probed from the provider for the model that actually ran";
@@ -2687,8 +2889,14 @@ static void drawContextMeter(AppState& st, float roomForMeter) {
             srcTxt = "from the model catalog entry for the selected model";
         }
         std::string tip = "Context window usage \xe2\x80\x94 ";
-        if (used > 0 && !usage.estimate)
+        if ((used > 0 && !usage.estimate) || st.lastContextTokens == INT_MIN)
             tip += "the last model call's input tokens (" + std::to_string(used) + ").\n";
+        else if (st.lastContextTokens <= -2)
+            tip += "OMP's estimated current context after compaction (" +
+                   std::to_string(used) + " tokens); the next model call will anchor it.\n";
+        else if (st.lastContextTokens == -1)
+            tip += "the post-compaction context is not available yet; the next model call "
+                   "will report it.\n";
         else if (used > 0)
             tip += "no call measured yet this session, so this is an ESTIMATE of the "
                    + std::to_string(usage.messages) + "-message transcript on screen ("
@@ -2719,9 +2927,9 @@ static void drawContextMeter(AppState& st, float roomForMeter) {
             // Cost to continue: resending this context on the next call. Emitted ONLY when the
             // catalog row actually carries pricing — the live Anthropic rows report costIn as
             // null (hasCost == false), and a "$0.00" there would be a fabricated number.
-            const ui::BridgeModelMeta* pm = ui::bridgeModelMetaForCad(
-                st.settings.provider, st.settings.model, st.settings.baseUrl);
-            if (pm && pm->hasCost && pm->costIn > 0.0) {
+            const ui::BridgeModelMeta* pm = ui::bridgeModelMeta(
+                st.settings.ompProvider, st.settings.model);
+            if (!st.settings.ompProvider.empty() && pm && pm->hasCost && pm->costIn > 0.0) {
                 char cost[80];
                 std::snprintf(cost, sizeof(cost),
                               "Continuing costs about $%.4f in input tokens per call.\n",
@@ -2852,7 +3060,7 @@ static float measureContextMeter(AppState& st, float roomForMeter) {
 // misleading empty ring. `draw == false` measures only (emits no ImGui items) so the caller can
 // right-align the usage cluster and the context gauge as one block.
 //
-// Chudcode is authoritative for online account usage (Claude Max, ZenMux, Kimi Code, xAI,
+// Omp is authoritative for online account usage (Claude Max, ZenMux, Kimi Code, xAI,
 // Cursor). Providers without usage windows simply contribute no rings.
 //
 // `budget` is the width the rings may consume. Indicators are dropped from the END until the
@@ -2977,7 +3185,7 @@ static void drawComposerPrelude(AppState& st, bool busy) {
     // being MANAGED here, the rings just need the active account's windows to stay roughly fresh.
     ui::providerUsagePollAccounts(st, 60.0, false);
     ui::providerUsagePollUsage(st, false);
-    // Chudcode owns online account usage. Poll only the active provider on the existing
+    // Omp owns online account usage. Poll only the active provider on the existing
     // five-minute TTL.
     if (const char* bridgeUsageId = ui::bridgeProviderForCad(st.settings.provider))
         ui::providerUsagePollBridge(st, bridgeUsageId, false);
@@ -3007,7 +3215,7 @@ static void drawComposerPrelude(AppState& st, bool busy) {
 
     // Agent / Plan / Ask — drop-UP menu that propagates upward like the model picker, with an
     // atlas icon + glass row styling per entry. The mode is a pure USER choice of tool policy:
-    // every entry runs the same single Chudcode general_agent turn.
+    // every entry runs the same single Omp general_agent turn.
     static const char* modes[]     = {"Agent", "Plan", "Ask"};
     static const char* modeIcons[] = {"ai_panel", "plan_board", "ask"};
     static const char* modeTips[]  = {
@@ -3172,290 +3380,8 @@ static void drawComposerPrelude(AppState& st, bool busy) {
     // Tight gap to the prompt — prelude sits closer to the input box.
 }
 
-// ---- voice input (live Chudcode session STT) -------------------------------------------------
-enum class VoiceUiState { Idle, Listening, Processing, Error, Unavailable };
-
-struct VoiceInputUi {
-    VoiceUiState state = VoiceUiState::Unavailable;
-    bool probed = false;
-    bool rpcBusy = false;
-    bool pollQueued = false;
-    std::string reason;
-    std::string modelLabel;
-    bool modelCached = false;
-    int progress = -1;
-    std::string partial;
-    std::string committed;
-    float level = 0.0f;
-    float animT = 0.0f;
-    std::string basePrompt;
-    std::string sessionId;
-    unsigned long long requestGeneration = 0;
-    double lastPollSec = 0.0;
-    double lastProbeSec = -1e9;
-};
-
-static VoiceInputUi& voiceUi() {
-    static VoiceInputUi v;
-    return v;
-}
-
-static nlohmann::json voiceSessionParams(const VoiceInputUi& v) {
-    return nlohmann::json{{"session_id", v.sessionId}};
-}
-
-static void voiceApplyPrompt(AppState& st, const std::string& base, const std::string& committed,
-                             const std::string& partial) {
-    const std::string out = ui::composeChudcodeTranscript(base, committed, partial);
-    if (st.prompt.size() < out.size() + 1) st.prompt.resize(out.size() + 256, 0);
-    std::memcpy(st.prompt.data(), out.c_str(), out.size() + 1);
-}
-
-static bool voiceApplyStatus(AppState& st, const nlohmann::json& r) {
-    VoiceInputUi& v = voiceUi();
-    ui::ChudcodeSttResult status;
-    if (!ui::parseChudcodeSttResult(r, status)) return false;
-    v.modelLabel = status.model;
-    v.progress = status.progress;
-    if (status.progress >= 100 || status.state == "recording") v.modelCached = true;
-    if (!status.error.empty())
-        v.reason = status.error;
-    else if (status.available)
-        v.reason.clear();
-
-    if (!status.available) {
-        v.state = VoiceUiState::Unavailable;
-    } else if (status.state == "recording") {
-        v.state = VoiceUiState::Listening;
-        voiceApplyPrompt(st, v.basePrompt, v.committed, v.partial);
-    } else if (status.state == "transcribing" ||
-               (status.state == "idle" && v.rpcBusy)) {
-        v.state = VoiceUiState::Processing;
-    } else {
-        v.state = VoiceUiState::Idle;
-    }
-    return true;
-}
-
-static void voiceBindSession(AppState& st) {
-    VoiceInputUi& v = voiceUi();
-#ifdef __EMSCRIPTEN__
-    const std::string sessionId = cellAgentSessionHandle(st.activeConvId());
-#else
-    const std::string sessionId = st.activeConvId();
-#endif
-    if (v.sessionId == sessionId) return;
-    const std::string priorSession = v.sessionId;
-    const bool cancelPrior = !priorSession.empty() &&
-                             (v.state == VoiceUiState::Listening ||
-                              v.state == VoiceUiState::Processing || v.rpcBusy);
-    const auto generation = v.requestGeneration + 1;
-    v = VoiceInputUi{};
-    v.sessionId = sessionId;
-    v.requestGeneration = generation;
-    if (cancelPrior) {
-        st.rpc.call(ui::kChudcodeSttCancelMethod,
-                    nlohmann::json{{"session_id", priorSession}},
-                    [](const core::RpcResult&) {}, 15000);
-    }
-}
-
-static void voiceProbe(AppState& st) {
-    voiceBindSession(st);
-    VoiceInputUi& v = voiceUi();
-    if (v.rpcBusy || v.pollQueued || v.state == VoiceUiState::Listening ||
-        v.state == VoiceUiState::Processing) return;
-#ifdef __EMSCRIPTEN__
-    if (v.probed) return;
-    v.probed = true;
-    v.state = VoiceUiState::Unavailable;
-    v.reason = "Voice input is not available in the web build.";
-    return;
-#else
-    if (!startupComposerMetadataReady(st)) return;
-    if (v.probed && ImGui::GetTime() - v.lastProbeSec < 5.0) return;
-    v.lastProbeSec = ImGui::GetTime();
-    if (v.sessionId.empty()) {
-        v.probed = true;
-        v.state = VoiceUiState::Unavailable;
-        v.reason = "Voice input needs an active copilot session.";
-        return;
-    }
-    v.rpcBusy = true;
-    const std::string sessionId = v.sessionId;
-    const auto generation = v.requestGeneration;
-    st.rpc.call(ui::kChudcodeSttStatusMethod, voiceSessionParams(v),
-                [&st, sessionId, generation](const core::RpcResult& r) {
-                    VoiceInputUi& vv = voiceUi();
-                    if (vv.sessionId != sessionId || vv.requestGeneration != generation) return;
-                    vv.rpcBusy = false;
-                    vv.lastProbeSec = ImGui::GetTime();
-                    if (core::workerLaneBusy(r)) {
-                        // A run holds the speech service: keep the last-known mic state and
-                        // re-probe on the normal cadence. Before any answer, say when it opens.
-                        if (!vv.probed) vv.reason = kAvailableAfterRun;
-                        vv.probed = true;   // keeps the 5 s cadence instead of per-frame retries
-                        return;
-                    }
-                    vv.probed = true;
-                    if (!r.ok || !voiceApplyStatus(st, r.result)) {
-                        vv.state = VoiceUiState::Unavailable;
-                        vv.reason =
-                            userFacingRpcError(r, "Speech-to-text isn't available right now.");
-                    }
-                },
-                15000);
-#endif
-}
-
-static void voicePoll(AppState& st) {
-    VoiceInputUi& v = voiceUi();
-    if (v.state != VoiceUiState::Listening && v.state != VoiceUiState::Processing) return;
-    if (v.pollQueued || v.rpcBusy) return;
-    const double now = ImGui::GetTime();
-    if (now - v.lastPollSec < 0.20) return;
-    v.lastPollSec = now;
-    v.pollQueued = true;
-    const std::string sessionId = v.sessionId;
-    const auto generation = v.requestGeneration;
-    st.rpc.call(ui::kChudcodeSttStatusMethod, voiceSessionParams(v),
-                [&st, sessionId, generation](const core::RpcResult& r) {
-                    VoiceInputUi& vv = voiceUi();
-                    if (vv.sessionId != sessionId) return;
-                    vv.pollQueued = false;
-                    vv.lastPollSec = ImGui::GetTime();
-                    if (vv.requestGeneration != generation) return;
-                    if (r.ok) voiceApplyStatus(st, r.result);
-                },
-                10000);
-}
-
-static void voiceStart(AppState& st) {
-    VoiceInputUi& v = voiceUi();
-    if (v.rpcBusy || v.state == VoiceUiState::Unavailable) return;
-    v.basePrompt = st.prompt.data();
-    v.partial.clear();
-    v.committed.clear();
-    v.reason.clear();
-    v.progress = 0;
-    v.rpcBusy = true;
-    v.state = VoiceUiState::Processing;
-    const std::string sessionId = v.sessionId;
-    const auto generation = ++v.requestGeneration;
-    st.rpc.call(ui::kChudcodeSttStartMethod, voiceSessionParams(v),
-                [&st, sessionId, generation](const core::RpcResult& r) {
-                    VoiceInputUi& vv = voiceUi();
-                    if (vv.sessionId != sessionId || vv.requestGeneration != generation) return;
-                    vv.rpcBusy = false;
-                    if (core::workerLaneBusy(r)) {
-                        // Refused only because a run holds the speech service.
-                        vv.state = VoiceUiState::Idle;
-                        vv.reason.clear();
-                        st.toast(ui::ToastLevel::Info,
-                                 std::string("Voice input: ") + kAvailableAfterRun);
-                        return;
-                    }
-                    if (!r.ok || !voiceApplyStatus(st, r.result)) {
-                        vv.state = VoiceUiState::Error;
-                        vv.reason = userFacingRpcError(r, "Couldn't start voice input.");
-                        st.toast(ui::ToastLevel::Warn, vv.reason.c_str());
-                    }
-                },
-                300000);
-}
-
-static void voiceStop(AppState& st) {
-    VoiceInputUi& v = voiceUi();
-    if (v.rpcBusy && v.state != VoiceUiState::Listening) return;
-    v.rpcBusy = true;
-    v.state = VoiceUiState::Processing;
-    const std::string sessionId = v.sessionId;
-    const auto generation = ++v.requestGeneration;
-    st.rpc.call(ui::kChudcodeSttStopMethod, voiceSessionParams(v),
-                [&st, sessionId, generation](const core::RpcResult& r) {
-                    VoiceInputUi& vv = voiceUi();
-                    if (vv.sessionId != sessionId || vv.requestGeneration != generation) return;
-                    vv.rpcBusy = false;
-                    if (core::workerLaneBusy(r)) {
-                        // The recording is still live on the service; keep listening and say
-                        // when stopping works again.
-                        vv.state = VoiceUiState::Listening;
-                        st.toast(ui::ToastLevel::Info,
-                                 std::string("Stop dictation: ") + kAvailableAfterRun);
-                        return;
-                    }
-                    ui::ChudcodeSttResult result;
-                    if (!r.ok || !ui::parseChudcodeSttResult(r.result, result)) {
-                        vv.state = VoiceUiState::Error;
-                        vv.reason = userFacingRpcError(r, "Transcription failed.");
-                        st.toast(ui::ToastLevel::Warn, vv.reason.c_str());
-                        return;
-                    }
-                    voiceApplyPrompt(st, vv.basePrompt, result.text, "");
-                    vv.partial.clear();
-                    vv.committed = result.text;
-                    vv.state = VoiceUiState::Idle;
-                    if (result.text.empty())
-                        st.toast(ui::ToastLevel::Info, "No speech detected.");
-                },
-                120000);
-}
-
-static void voiceCancel(AppState& st) {
-    VoiceInputUi& v = voiceUi();
-    v.rpcBusy = true;
-    const std::string sessionId = v.sessionId;
-    const auto generation = ++v.requestGeneration;
-    st.rpc.call(ui::kChudcodeSttCancelMethod, voiceSessionParams(v),
-                [&st, sessionId, generation](const core::RpcResult&) {
-                    VoiceInputUi& vv = voiceUi();
-                    if (vv.sessionId != sessionId || vv.requestGeneration != generation) return;
-                    vv.rpcBusy = false;
-                    voiceApplyPrompt(st, vv.basePrompt, "", "");
-                    vv.partial.clear();
-                    vv.committed.clear();
-                    vv.state = VoiceUiState::Idle;
-                },
-                15000);
-}
-
-static void drawMicGlyph(ImDrawList* dl, ImVec2 c, float isz, ImU32 ink, float pulse,
-                         float level, bool listening) {
-    const float th = ui::metrics::stroke(1.4f);
-    constexpr float kPi = 3.14159265f;
-    // Capsule mic body
-    const float bw = isz * 0.22f;
-    const float bh = isz * 0.38f;
-    dl->AddRect(ImVec2(c.x - bw, c.y - bh), ImVec2(c.x + bw, c.y + bh * 0.15f), ink,
-                bw, 0, th);
-    // Stem + base
-    dl->AddLine(ImVec2(c.x, c.y + bh * 0.15f), ImVec2(c.x, c.y + bh * 0.55f), ink, th);
-    dl->AddLine(ImVec2(c.x - bw * 0.9f, c.y + bh * 0.55f),
-                ImVec2(c.x + bw * 0.9f, c.y + bh * 0.55f), ink, th);
-    // Arc yoke
-    dl->PathClear();
-    dl->PathArcTo(ImVec2(c.x, c.y + bh * 0.05f), bw * 1.55f, 0.15f * kPi, 0.85f * kPi);
-    dl->PathStroke(ink, 0, th);
-    if (listening) {
-        // Soft pulse ring + 3-bar waveform driven by level (not noisy).
-        const float ring = isz * (0.62f + 0.10f * pulse);
-        dl->AddCircle(c, ring, IM_COL32((ink >> IM_COL32_R_SHIFT) & 0xFF,
-                                       (ink >> IM_COL32_G_SHIFT) & 0xFF,
-                                       (ink >> IM_COL32_B_SHIFT) & 0xFF,
-                                       (int)(55 + 50 * pulse)),
-                      0, ui::metrics::stroke(1.2f));
-        const float barBase = isz * 0.12f;
-        for (int i = 0; i < 3; ++i) {
-            const float x = c.x + (i - 1) * isz * 0.18f;
-            const float h = barBase * (0.55f + level * (0.9f + 0.35f * (float)(i == 1)));
-            dl->AddLine(ImVec2(x, c.y - h), ImVec2(x, c.y + h), ink, th);
-        }
-    }
-}
-
-// Toolbar row below the prompt: [model | thinking | paperclip | mic | context-cube]
-// Five abutting, non-overlapping segments separated by painted vertical dividers. Model picker
-// takes the remaining width; thinking reserves its widest label; icon chips are square.
+// Toolbar row below the prompt: [model | thinking | paperclip | context-cube].
+// Four abutting segments; model takes remaining width and icon chips are square.
 // The send/stop control lives inside the input box (drawComposerSendStop); New chat lives in
 // the panel header.
 static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) {
@@ -3505,28 +3431,36 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
     Settings& s = st.settings;
     const char* effLabels[8] = {};
     const char* effValues[8] = {};
-    int nEff = composerEffortLadder(s, effLabels, effValues, 8);
+    const bool followsRoles = s.composerFollowRoles;
+    if (followsRoles) pollComposerAssignment(st);
+    int nEff = followsRoles ? 0 : composerEffortLadder(s, effLabels, effValues, 8);
     int effIdx = -1;
     for (int i = 0; i < nEff; ++i)
         if (std::strcmp(s.reasoningEffort, effValues[i]) == 0) effIdx = i;
-    const char* effBtn = effIdx >= 0 ? effLabels[effIdx] : "Default";
+    const char* effBtn = effIdx >= 0 ? effLabels[effIdx]
+                                    : s.reasoningEffort[0] ? s.reasoningEffort : "Default";
 
-    // Segment widths (left→right: model, thinking, paperclip, mic, cube). Icon chips are square.
+    // Segment widths (left to right: model, thinking, paperclip, cube).
     // Thinking reserves its WIDEST possible label plus padding, so "Medium"/"Default" never clip
     // and the strip does not jump when the level changes. Model takes everything left — the
     // brand mark + real display name is the one string this strip exists to show.
     const float segH = ImGui::GetFrameHeight();
     const float iconSz = segH;
     const float iconW = segH;
-    const float iconsW = iconW * 3.0f;
+    const float iconsW = iconW * 2.0f;
     const float padX = ImGui::GetStyle().FramePadding.x;
 
-    const std::string modelLogo = composerProviderLogoId(s);
+    const auto& assignment = s_composerAssignment;
+    std::string modelLogo = s.ompProvider.empty() ? composerProviderLogoId(s) : s.ompProvider;
+    if (followsRoles && assignment.valid && assignment.mode == "fixed")
+        modelLogo = assignment.provider;
+    else if (followsRoles && (!assignment.valid || assignment.mode == "auto"))
+        modelLogo.clear();
     const float logoSide    = ImGui::GetFontSize() * 1.05f;
     const float logoGap     = ui::metrics::px(6);
-    const float logoAdvance = logoSide + logoGap;
+    const float logoAdvance = modelLogo.empty() ? 0.0f : logoSide + logoGap;
 
-    float effTextW = std::max(ImGui::CalcTextSize("Default").x, ImGui::CalcTextSize("No dial").x);
+    float effTextW = std::max(ImGui::CalcTextSize("Assigned").x, ImGui::CalcTextSize("No dial").x);
     for (int i = 0; i < nEff; ++i)
         effTextW = std::max(effTextW, ImGui::CalcTextSize(effLabels[i]).x);
     const float thinkWant = std::ceil(effTextW + padX * 2.0f + ui::metrics::px(8));
@@ -3536,12 +3470,29 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
     const float thinkW = std::max(1.0f, std::min(thinkWant, availW - iconsW - minModelW));
     const float modelW = std::max(1.0f, std::floor(availW - iconsW - thinkW));
 
-    // Right edges of the first four segments — where the dividers go.
-    float divX[4] = {};
+    // Right edges of the first three segments.
+    float divX[3] = {};
     int nDiv = 0;
 
-    // ---- 1/5 model: provider brand mark + the model's REAL display name (no provider text) ----
+    // ---- 1/4 model: provider brand mark and display name ----
     std::string modelText = composerModelName(s);
+    std::string modelDetail = (s.ompProvider.empty() ? std::string("Provider unavailable") : s.ompProvider) +
+                              " \xc2\xb7 " + (s.model[0] ? s.model : "default");
+    if (followsRoles) {
+        if (!assignment.valid) {
+            modelText = "Assigned model";
+            modelDetail = "Model assignments unavailable or loading.";
+        } else if (assignment.mode == "fixed") {
+            modelText = "Assigned \xc2\xb7 " + assignment.model;
+            modelDetail = "Assigned: " + assignment.provider + " \xc2\xb7 " + assignment.model;
+        } else if (assignment.mode == "default") {
+            modelText = "Assigned \xc2\xb7 " + modelText;
+            modelDetail = "Assignment follows chat model: " + modelDetail;
+        } else {
+            modelText = "Assigned \xc2\xb7 Auto";
+            modelDetail = "Assignment selects a model automatically for each turn.";
+        }
+    }
     {
         // Ellipsize the NAME only — the mark is fixed-width and never clipped. No caret/arrow.
         const float maxTextW = modelW - logoAdvance - padX * 2.0f;
@@ -3567,28 +3518,33 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
         ImDrawList* mdl = ImGui::GetWindowDrawList();
         const float midY = (modelBtnMin.y + modelBtnMax.y) * 0.5f;
         const float x0 = modelBtnMin.x + ImGui::GetStyle().FramePadding.x;
-        ui::drawProviderLogo(mdl, ImVec2(x0, midY - logoSide * 0.5f), logoSide, modelLogo);
+        if (!modelLogo.empty())
+            ui::drawProviderLogo(mdl, ImVec2(x0, midY - logoSide * 0.5f), logoSide, modelLogo);
         mdl->AddText(ImVec2(x0 + logoAdvance, midY - ImGui::GetFontSize() * 0.5f),
                      ImGui::ColorConvertFloat4ToU32(surf.textPrimary), modelText.c_str());
     }
     // The chip shows the model; the tooltip keeps the full provider + exact id.
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("%s \xc2\xb7 %s\nModel — click to search and switch.",
-                          composerProviderName(s.provider), s.model[0] ? s.model : "default");
+        ImGui::SetTooltip("%s\nModel \xe2\x80\x94 click to search and switch.", modelDetail.c_str());
 
-    // ---- 2/5 thinking effort (level only) ----
+    // ---- 2/4 thinking effort (level only) ----
     ImGui::SameLine();
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
-    if (nEff <= 0) ImGui::BeginDisabled();
-    if (ImGui::Button(nEff > 0 ? effBtn : "No dial", ImVec2(thinkW, segH)))
+    if (followsRoles) ImGui::BeginDisabled();
+    if (ImGui::Button(followsRoles ? "Assigned" : effBtn, ImVec2(thinkW, segH)))
         ImGui::OpenPopup("##cmpeffort");
-    if (nEff <= 0) ImGui::EndDisabled();
+    if (followsRoles) ImGui::EndDisabled();
     divX[nDiv++] = ImGui::GetItemRectMax().x;
     ImGui::PopStyleColor();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-        ImGui::SetTooltip(nEff > 0 ? "Thinking effort for the selected model."
-                                  : "This model has no thinking-effort dial.");
+        ImGui::SetTooltip(followsRoles ? "Thinking follows the configured chat assignment."
+                          : nEff > 0 ? "Thinking effort for the selected model."
+                                     : "Thinking options unavailable for this model.");
     if (ImGui::BeginPopup("##cmpeffort")) {
+        if (ImGui::Selectable("Use runtime default", !s.reasoningEffort[0])) {
+            s.reasoningEffort[0] = '\0';
+            saveSettings(st.settings);
+        }
         for (int i = 0; i < nEff; ++i) {
             if (ImGui::Selectable(effLabels[i], effIdx == i)) {
                 std::strncpy(s.reasoningEffort, effValues[i], sizeof(s.reasoningEffort) - 1);
@@ -3598,7 +3554,7 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
         ImGui::EndPopup();
     }
 
-    // ---- 3/5 paperclip (icon-only, square) ----
+    // ---- 3/4 paperclip (icon-only, square) ----
     ImGui::SameLine();
     {
         const bool attachClick = ImGui::Button("##attach", ImVec2(iconW, segH));
@@ -3610,9 +3566,9 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
             } else {
                 std::string p = openFileDialog("All files (*.*)\0*.*\0");
                 if (!p.empty() && ui::isImageAttachment(p)) {
-                    g_imageInsert = ui::copilot::inlineImageMarker(st.pendingInlineImagePaths.size());
+                    g_composerInsert = ui::copilot::inlineImageMarker(st.pendingInlineImagePaths.size());
                     st.pendingInlineImagePaths.push_back(p);
-                    g_imageUseRememberedSelection = true;
+                    g_insertAtRememberedSelection = true;
                 } else if (!p.empty() &&
                            std::find(st.pendingAttachments.begin(), st.pendingAttachments.end(),
                                      p) == st.pendingAttachments.end()) {
@@ -3623,9 +3579,8 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
             }
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Attach a file — it rides your next message (text files are "
-                              "inlined; PDF/Word/Excel/PowerPoint are read to text and "
-                              "inlined; anything else is passed by path).");
+            ImGui::SetTooltip("Attach a file — text and supported documents are inlined; videos "
+                              "and other binary files are passed by path.");
         {
             ImDrawList* adl = ImGui::GetWindowDrawList();
             const ImVec2 amn = ImGui::GetItemRectMin(), amx = ImGui::GetItemRectMax();
@@ -3658,97 +3613,7 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
         }
     }
 
-    // ---- 4/5 mic (live Chudcode speech-to-text) ----
-    ImGui::SameLine();
-    {
-        voiceProbe(st);
-        voicePoll(st);
-        VoiceInputUi& v = voiceUi();
-        v.animT += ImGui::GetIO().DeltaTime;
-        const bool listening = v.state == VoiceUiState::Listening;
-        const bool processing = v.state == VoiceUiState::Processing;
-        const bool unavailable = v.state == VoiceUiState::Unavailable;
-        const bool errored = v.state == VoiceUiState::Error;
-        const bool disabled = unavailable || busy;
-        if (listening) {
-            ImGui::PushStyleColor(ImGuiCol_Button,
-                ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.28f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.40f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive,
-                ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 0.50f));
-        } else if (errored) {
-            ImGui::PushStyleColor(ImGuiCol_Button,
-                ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 0.22f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 0.34f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive,
-                ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 0.44f));
-        }
-        if (disabled) ImGui::BeginDisabled();
-        const bool micClick = ImGui::Button("##voice_mic", ImVec2(iconW, segH));
-        if (disabled) ImGui::EndDisabled();
-        divX[nDiv++] = ImGui::GetItemRectMax().x;
-        if (listening || errored) ImGui::PopStyleColor(3);
-        if (micClick) {
-            if (listening) voiceStop(st);
-            else if (processing || v.rpcBusy) voiceCancel(st);
-            else if (!unavailable) voiceStart(st);
-        }
-        // Right-click / Esc-while-hover cancels an active listen.
-        if (listening && ImGui::IsItemHovered() &&
-            (ImGui::IsMouseClicked(ImGuiMouseButton_Right) ||
-             ImGui::IsKeyPressed(ImGuiKey_Escape))) {
-            voiceCancel(st);
-        }
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-            if (unavailable) {
-                ImGui::SetTooltip("%s", v.reason.empty()
-                    ? "Voice input unavailable — no microphone or speech model found."
-                    : v.reason.c_str());
-            } else if (listening) {
-                ImGui::SetTooltip("Listening — click to stop & insert text (Esc/right-click cancels).");
-            } else if (processing) {
-                if (v.progress >= 0 && v.progress < 100)
-                    ImGui::SetTooltip("Preparing speech model — %d%%. Click to cancel.",
-                                      v.progress);
-                else
-                    ImGui::SetTooltip("Processing speech… click to cancel.");
-            } else if (errored) {
-                ImGui::SetTooltip("%s\nClick to retry.",
-                                  v.reason.empty() ? "Voice input error." : v.reason.c_str());
-            } else {
-                const char* cacheHint = v.modelCached ? "model ready" : "downloads on first use";
-                ImGui::SetTooltip(
-                    "Dictate into the composer (%s — %s).\nClick to start; click again to stop.",
-                    v.modelLabel.empty() ? "speech model" : v.modelLabel.c_str(), cacheHint);
-            }
-        }
-        {
-            ImDrawList* mdl = ImGui::GetWindowDrawList();
-            const ImVec2 mmn = ImGui::GetItemRectMin(), mmx = ImGui::GetItemRectMax();
-            const ImVec2 mc((mmn.x + mmx.x) * 0.5f, (mmn.y + mmx.y) * 0.5f);
-            const float isz = iconSz * 0.55f;
-            ImVec4 inkV = surf.textPrimary;
-            if (unavailable) inkV = surf.textTertiary;
-            else if (errored) inkV = ImVec4(pal.statusErr[0], pal.statusErr[1], pal.statusErr[2], 1.0f);
-            else if (listening) inkV = ImVec4(pal.accent[0], pal.accent[1], pal.accent[2], 1.0f);
-            const ImU32 ink = ImGui::ColorConvertFloat4ToU32(inkV);
-            const float pulse = listening
-                ? 0.5f + 0.5f * std::sin(v.animT * 4.0f)
-                : (processing ? 0.5f + 0.5f * std::sin(v.animT * 6.0f) : 0.0f);
-            drawMicGlyph(mdl, mc, isz, ink, pulse, v.level, listening || processing);
-            if (listening) {
-                mdl->AddRect(mmn, mmx,
-                             ImGui::ColorConvertFloat4ToU32(
-                                 ImVec4(pal.accent[0], pal.accent[1], pal.accent[2],
-                                        0.55f + 0.30f * pulse)),
-                             ui::metrics::rounding(4.0f), 0, ui::metrics::stroke(1.4f));
-            }
-        }
-    }
-
-    // ---- 5/5 context-cube (icon-only, square) ----
+    // ---- 4/4 context-cube (icon-only, square) ----
     ImGui::SameLine();
     {
         const bool armed = st.contextPickActive;
@@ -3810,7 +3675,7 @@ static void drawComposerToolbar(AppState& st, bool busy, bool embedded = false) 
     }
 
     // Vertical dividers at every shared segment edge, painted AFTER all fills, glyphs and state
-    // rings so hover/active/armed/listening washes and the disabled mic never occlude them.
+    // rings so hover/active/armed washes never occlude them.
     // Surface-derived ink reads on both themes and any backdrop; the vertical inset keeps them
     // reading as separators rather than cell borders.
     {
@@ -3859,8 +3724,9 @@ bool aiTurnActive(AppState& st) {
     auto* run = st.runIfExists(st.activeConvId());
     if (run && run->stopRequested.load()) return false;
     if (run && run->running.load()) return true;
-    if (!st.chat.empty()) {
-        const ChatMsg& b = st.chat.back();
+    // Pending steers trail the live turn without being part of it.
+    if (const size_t tail = pendingSteerTail(st.chat); tail > 0) {
+        const ChatMsg& b = st.chat[tail - 1];
         if (!b.fromUser && b.running) return true;
     }
     return false;
@@ -4050,10 +3916,15 @@ struct AgentControlChannel {
     }
 };
 static AgentControlChannel g_agentCtl;
+// Reserve the image worker at the same load-time boundary, never on the first image request.
+[[maybe_unused]] static const bool g_imageLoaderInitialized = [] {
+    ui::copilot::initImageLoader();
+    return true;
+}();
 
 // One `answer` outcome onto its batch. A delivered answer resolves the card; a failed call puts
 // it back to pending with the reason (retry, or reply in the chat); a refusal means the worker
-// no longer holds the question, so the card says it expired.
+// no longer holds the question, so the answers go to the agent as the next message instead.
 static void applyAnswerResult(AppState& st, const AgentControlChannel::AnswerResult& res) {
     std::vector<ChatMsg>* msgs = conversationMsgs(st, res.convId);
     if (!msgs) return;
@@ -4068,11 +3939,17 @@ static void applyAnswerResult(AppState& st, const AgentControlChannel::AnswerRes
         b->status = AskStatus::Pending;
         b->error = "Couldn't deliver your answers (" + res.transportErr +
                    "). Try again, or reply in the chat.";
+    } else if (!res.declined && res.convId == st.activeConvId()) {
+        b->status = AskStatus::Answered;
+        b->error.clear();
+        queueAskAnswersTurn(st, *b);
     } else {
         b->status = AskStatus::Expired;
         b->error = res.reason;
     }
     owner->uiCachedH = -1.0f;
+    ++owner->revision;
+    chatLogMessageChanged(*owner);
     markChatHistoryDirty();
 }
 
@@ -4084,15 +3961,25 @@ static void applySteerResult(AppState& st, const AgentControlChannel::SteerResul
     if (!msgs) return;
     if (!res.cancel) {
         if (res.state == STEER_NONE) {
+            bool changed = false;
             for (auto& m : *msgs)
                 if (m.fromUser && m.steerId == res.steerId && m.steerState == STEER_SENDING) {
                     m.steerState = STEER_NONE;
                     m.uiCachedH = -1.0f;
+                    ++m.revision;
+                    chatLogMessageChanged(m);
                     markChatHistoryDirty();
+                    changed = true;
                 }
+            // A duplicate of a message the run already holds is no longer pending: it takes its
+            // place in the transcript like a read one.
+            if (changed) placeSteerInTranscript(st, *msgs, res.steerId);
             return;
         }
-        setSteerState(*msgs, res.steerId, res.state);
+        // A control reply that says the message was read (it answered an open question) places
+        // it; the streamed delivery event does the same from the event drain.
+        if (setSteerState(*msgs, res.steerId, res.state))
+            placeSteerInTranscript(st, *msgs, res.steerId);
         return;
     }
     for (const auto& id : res.carried) setSteerState(*msgs, id, STEER_CARRIED);
@@ -4195,43 +4082,52 @@ void agentAnswerDispatch(AppState& st, const std::string& runId, const std::stri
     g_agentCtl.cv.notify_one();
 }
 
+void queueAskAnswersTurn(AppState& st, const AskBatch& b) {
+    // An empty draft: the composer's staged attachments are not part of these answers.
+    st.queuedPromptDrafts.resize(st.queuedPrompts.size(), nlohmann::json::object());
+    st.queuedPrompts.push_back(askAnswersMessage(b));
+    st.queuedPromptDrafts.push_back(nlohmann::json::object());
+    markChatHistoryDirty();
+}
+
 // Stop-finalization is cosmetic only: the JobState remains running until its real terminal,
 // so document locks cannot be released while cancellation is still unwinding.
 // Stop-finalize one turn's activity rows: streaming thought boxes collapse (unless pinned),
 // stage/tool rows leave "running" so no glyph animates a turn that is no longer live.
-static void finalizeStoppedTurnActivity(ChatMsg& m) {
+static void finalizeStoppedTurnActivity(ChatMsg& m, const char* compactionOutcome = "cancelled") {
+    m.uiActivityDirtyFrom = 0;
     for (auto& a : m.activity) {
+        ++a.revision;
         if (a.rowKind == 2 && (a.streaming || a.status == "running" || a.status.empty()))
             finalizeThoughtBox(a);
-        else if (a.streaming || a.status == "running" || a.status.empty()) {
+        else if (a.rowKind == 17 && a.status == "running") {
+            // An in-flight sub-run (e.g. a compaction) did not finish: never show it as done.
+            if (!ui::settleUnfinishedCompaction(a, compactionOutcome))
+                a.status = "cancelled";
+            a.reason = compactionOutcome;
+        } else if (a.streaming || a.status == "running" || a.status.empty()) {
             a.status = "done";
             a.streaming = false;
         }
     }
+    for (auto& item : m.planState.items)
+        if (item.status == "running") item.status = "stopped";
+    ++m.revision;
+    chatLogMessageChanged(m);
 }
 
-// A steer lands mid-run, so the transcript must read in the order things happened: the turn
-// so far, the user's message, then everything the run does after it. The event drain and the
-// result drain (app.cpp) both feed the LAST running assistant message; appending the steer
-// alone left the rest of the run, final reply included, streaming into the bubble ABOVE it
-// with nothing live below. Close the current bubble and open a fresh running one under the
-// steer instead. Append-only: AI-VC msg_idx anchors must never shift.
+// A steer lands mid-run and the agent only reads it at its next step. Until then the bubble is
+// PENDING: it sits at the tail of the message vector, under the live turn, and the chat log
+// draws it in the pinned stack instead of the flow, so the run keeps streaming above it with
+// nothing misordered. placeSteerInTranscript moves it into the flow at the point the agent
+// actually read it. Append-only: AI-VC msg_idx anchors must never shift.
 static void appendSteerToTranscript(AppState& st, const std::string& text,
                                     const nlohmann::json& attachments,
                                     std::vector<core::ContextRef> contextRefs,
                                     const std::string& steerId) {
-    ChatMsg* live = nullptr;
+    int mode = st.aiInteraction;
     for (auto it = st.chat.rbegin(); it != st.chat.rend(); ++it)
-        if (!it->fromUser && it->running) { live = &*it; break; }
-    const int mode = live ? live->copilotMode : st.aiInteraction;
-    const std::string model = live ? live->model : std::string();
-    if (live) {
-        finalizeStoppedTurnActivity(*live);
-        live->running = false;
-        live->liveStatus.clear();
-        live->steerSplit = true;
-        live->uiCachedH = -1.0f;
-    }
+        if (!it->fromUser && it->running) { mode = it->copilotMode; break; }
     ChatMsg u; u.fromUser = true; u.text = text;
     u.imagePaths = userImagePaths(attachments);
     u.contextRefs = std::move(contextRefs);
@@ -4240,21 +4136,150 @@ static void appendSteerToTranscript(AppState& st, const std::string& text,
     u.steerState = STEER_SENDING;
     st.chat.push_back(std::move(u));
     appendChatRawMessage(st, st.chat.back());
-    if (live) {
-        ChatMsg a;
-        a.running = true;
-        a.copilotMode = mode;
-        a.model = model;
-        a.liveStatus = "Thinking\xe2\x80\xa6";
-        st.chat.push_back(std::move(a));
-        appendChatRawMessage(st, st.chat.back());
-    }
     chatLogResetStick();
     markChatHistoryDirty();
     maybePersistChatHistoryDebounced(st, /*force=*/true);
 }
 
+// The transcript must read in the order things happened: the turn so far, the user's message
+// at the step where the agent read it, then everything the run does after it. The event drain
+// and the result drain (app.cpp) both feed the LAST running assistant message, so closing the
+// live turn here and opening a fresh running one under the steer is what makes the rest of the
+// run, final reply included, stream below the bubble. Insertion lands behind every earlier
+// message, so existing positions never shift; only still-pending steers after it move down.
+bool placeSteerInTranscript(AppState& st, std::vector<ChatMsg>& msgs, const std::string& steerId) {
+    if (steerId.empty()) return false;
+    size_t at = msgs.size();
+    for (size_t i = msgs.size(); i-- > 0;)
+        if (msgs[i].fromUser && msgs[i].steerId == steerId) { at = i; break; }
+    if (at == msgs.size()) return false;
+    // Only a steer the agent consumed (or a duplicate of one it already holds) marks a point of
+    // the run; a failed or withdrawn one stays below the turn it was sent under.
+    if (msgs[at].steerState != STEER_DELIVERED && msgs[at].steerState != STEER_NONE) return false;
+    // The live turn it interrupted sits right above the run of steers sent under it.
+    size_t first = at;
+    while (first > 0 && msgs[first - 1].fromUser && !msgs[first - 1].steerId.empty()) --first;
+    if (first == 0 || msgs[first - 1].fromUser || !msgs[first - 1].running) return false;
+    ChatMsg next;
+    {
+        ChatMsg& live = msgs[first - 1];
+        finalizeStoppedTurnActivity(live, "interrupted");
+        live.running = false;
+        live.liveStatus.clear();
+        live.steerSplit = true;
+        live.uiCachedH = -1.0f;
+        next.copilotMode = live.copilotMode;
+        next.model = live.model;
+    }
+    next.running = true;
+    next.liveStatus = "Thinking\xe2\x80\xa6";
+    msgs.insert(msgs.begin() + (std::ptrdiff_t)at + 1, std::move(next));
+    if (&msgs == &st.chat) appendChatRawMessage(st, msgs[at + 1]);
+    markChatHistoryDirty();
+    return true;
+}
+
+// The viewed conversation's run can take a steer: a live, non-compaction Omp turn whose run_id
+// is known and that Stop has not already claimed. Compaction (and a /handoff, which has no job)
+// is maintenance, not an answer turn: its follow-ups queue instead. A finished run keeps its
+// run_id, so liveness is checked too.
+static bool activeRunAcceptsSteer(AppState& st, std::string* runIdOut = nullptr) {
+    auto steerRun = st.activeRun();
+    std::lock_guard<std::mutex> lk(steerRun->mtx);
+    if (!steerRun->running.load() || steerRun->stopRequested.load() || steerRun->isCompaction ||
+        steerRun->runId.empty() || !st.workerStarted)
+        return false;
+    if (runIdOut) *runIdOut = steerRun->runId;
+    return true;
+}
+
+// Hand the staged payload (`text` + pendingAttachments / pendingContextRefs) to the live run as
+// a steer. The caller has checked activeRunAcceptsSteer; attachments ride with it, so a picture
+// alone is a valid follow-up.
+static void sendSteer(AppState& st, const std::string& text, const std::string& runId) {
+    std::string sendText = text;
+    std::string bubbleText;
+    nlohmann::json attachments = consumeComposerAttachments(st, sendText, &bubbleText);
+    std::vector<core::ContextRef> contextRefs = consumeContextRefs(st);
+    // The control lane carries text + images only: the chips ride inline.
+    if (const std::string ctx = core::contextRefsPromptText(contextRefs); !ctx.empty())
+        sendText += "\n\n" + ctx;
+    // Names this bubble on the control lane and in agent.steer events, so its "queued" / "read"
+    // state follows the message.
+    static unsigned s_steerSeq = 0;
+    const std::string steerId =
+        "steer-" + std::to_string((long long)(chatNowEpoch() * 1000.0)) + "-" +
+        std::to_string(++s_steerSeq);
+    appendSteerToTranscript(st, userBubbleText(bubbleText, attachments), attachments,
+                            std::move(contextRefs), steerId);
+    agentControlDispatch(st, runId, sendText, std::move(attachments), steerId);
+}
+
+static void removeQueuedPrompt(AppState& st, size_t index) {
+    if (index >= st.queuedPrompts.size()) return;
+    st.queuedPromptDrafts.resize(st.queuedPrompts.size(), nlohmann::json::object());
+    st.queuedPrompts.erase(st.queuedPrompts.begin() + (std::ptrdiff_t)index);
+    st.queuedPromptDrafts.erase(st.queuedPromptDrafts.begin() + (std::ptrdiff_t)index);
+    markChatHistoryDirty();
+}
+
+void setQueuedPromptText(AppState& st, size_t index, const std::string& text) {
+    if (index >= st.queuedPrompts.size() || st.queuedPrompts[index] == text) return;
+    st.queuedPrompts[index] = text;
+    markChatHistoryDirty();
+}
+
+// A queued message the run can take at once: not a slash command (those run as commands, never
+// as text for the agent) and the viewed run accepts a steer.
+bool queuedSendNowSteers(AppState& st, size_t index) {
+    if (index >= st.queuedPrompts.size()) return false;
+    const std::string& queued = st.queuedPrompts[index];
+    return (queued.empty() || queued[0] != '/') && activeRunAcceptsSteer(st);
+}
+
+// Send now on a queued message. A run that accepts steers takes it right away as one (the agent
+// reads it at its next step and the run keeps going); that is the closest thing to instant
+// that does not throw the turn away. Otherwise there is nothing to steer into — a compaction,
+// a Stop still unwinding, a slash command — so the message becomes the next to launch and a
+// live run is stopped, and the drain at the top of the next frame sends it. Returns true when
+// it went out as a steer.
+bool queuedPromptSendNow(AppState& st, size_t index) {
+    if (index >= st.queuedPrompts.size()) return false;
+    st.queuedPromptDrafts.resize(st.queuedPrompts.size(), nlohmann::json::object());
+    std::string runId;
+    if (!queuedSendNowSteers(st, index) || !activeRunAcceptsSteer(st, &runId)) {
+        if (index != 0) {
+            const auto at = (std::ptrdiff_t)index;
+            std::rotate(st.queuedPrompts.begin(), st.queuedPrompts.begin() + at,
+                        st.queuedPrompts.begin() + at + 1);
+            std::rotate(st.queuedPromptDrafts.begin(), st.queuedPromptDrafts.begin() + at,
+                        st.queuedPromptDrafts.begin() + at + 1);
+            markChatHistoryDirty();
+        }
+        if (aiTurnActive(st)) requestStopRun(st);
+        return false;
+    }
+    const std::string text = st.queuedPrompts[index];
+    const nlohmann::json draft = st.queuedPromptDrafts[index];
+    removeQueuedPrompt(st, index);
+    // Same snapshot discipline as the drain: the draft's own attachments and chips ride with
+    // it, and the composer's unsent ones come back untouched.
+    auto files = std::move(st.pendingAttachments);
+    auto images = std::move(st.pendingInlineImagePaths);
+    auto contexts = std::move(st.pendingContextRefs);
+    st.pendingAttachments = draft.value("attachments", std::vector<std::string>{});
+    st.pendingInlineImagePaths = draft.value("inline_images", std::vector<std::string>{});
+    st.pendingContextRefs = core::contextRefsFromJson(
+        draft.value("context_refs", nlohmann::json::array()));
+    sendSteer(st, text, runId);
+    st.pendingAttachments = std::move(files);
+    st.pendingInlineImagePaths = std::move(images);
+    st.pendingContextRefs = std::move(contexts);
+    return true;
+}
+
 void requestStopRunFor(AppState& st, const std::string& convId) {
+    if (stopPendingHandoff(st, convId)) return;
     auto* run = st.runIfExists(convId);
     if (!run || run->stopRequested.load()) return;
     auto* msgs = conversationMsgs(st, convId);
@@ -4290,6 +4315,25 @@ void requestStopRunFor(AppState& st, const std::string& convId) {
     // Only a job-based run produces a result the drain must discard. Async ask/sim runs land via
     // their own callbacks, which look for a *running* message — clearing it below makes them no-op.
     if (run->running.load() || run->ready.load()) run->stopRequested = true;
+    if (run->isCompaction && run->stopRequested.load()) {
+        // Stop requests cancellation; the maintenance receipt may still commit.
+        // Keep its status live and honest until that authoritative result arrives.
+        if (msgs) for (auto it = msgs->rbegin(); it != msgs->rend(); ++it)
+            if (it->compactionRun && it->running) {
+                it->liveStatus = "Stopping compaction\xe2\x80\xa6";
+                ++it->revision;
+                break;
+            }
+        if (convId == st.activeConvId()) {
+            st.status = "Stopping compaction...";
+            st.statusKind = 1;
+            st.livePhase = "Stopping compaction\xe2\x80\xa6";
+            st.agentV2Status.clear();
+        }
+        markChatHistoryDirty();
+        maybePersistChatHistoryDebounced(st, /*force=*/true);
+        return;
+    }
     // Stopping drops the run's remaining events, so its open questions never hear back: close
     // them here (the worker's own agent.answer {cancelled} is folded idempotently if it lands).
     if (msgs) closeOpenAsks(*msgs);
@@ -4321,8 +4365,10 @@ void requestStopRunFor(AppState& st, const std::string& convId) {
     // Cosmetic global flag: other conversations may still be running, so recompute it instead
     // of forcing it false.
     st.agentV2Running = st.anyRunActive();
-    st.status = "Stopped.";
-    st.statusKind = 1;
+    if (convId == st.activeConvId()) {
+        st.status = "Stopped.";
+        st.statusKind = 1;
+    }
     st.addLog("[..] stop requested by user");
     markChatHistoryDirty();
     s_chatHistoryLastPersist = -1e9;
@@ -4349,16 +4395,87 @@ void composerSetText(AppState& st, const std::string& text) {
     if (text.empty()) clearPromptDraft(st);
 }
 
+void composerRestoreUnsent(AppState& st, const std::string& text) {
+    if (text.empty() || !composerText(st).empty()) return;
+    composerSetText(st, text);
+    g_slashCaretToEnd = 1;
+    savePromptDraft(st, /*force=*/true);
+}
+
+// Cancel on a queued message: take it out of the queue and hand it back to the composer to
+// change, whole — its text AND the draft it was queued with (attachments, inline images, context
+// chips). Nothing the user has already staged in the composer is lost, so the two are merged:
+// the queued text goes FIRST (it was written earlier) and the composer's unsent text follows
+// after a blank line; attachments and context chips are unioned, queued ones first, duplicates
+// dropped; the composer's own inline images keep their place after the queued ones, so its
+// "[Image #N]" markers are renumbered to match. The caret lands at the end of the merged text in
+// the refocused input.
+void cancelQueuedPromptToComposer(AppState& st, size_t index) {
+    if (index >= st.queuedPrompts.size()) return;
+    st.queuedPromptDrafts.resize(st.queuedPrompts.size(), nlohmann::json::object());
+    const std::string queued = st.queuedPrompts[index];
+    const nlohmann::json draft = st.queuedPromptDrafts[index];
+    removeQueuedPrompt(st, index);
+
+    auto paths = [&draft](const char* key) {
+        std::vector<std::string> out;
+        if (draft.is_object() && draft.contains(key) && draft[key].is_array())
+            for (const auto& v : draft[key]) out.push_back(v.is_string() ? v.get<std::string>() : std::string());
+        return out;
+    };
+    std::vector<std::string> attachments = paths("attachments");
+    std::vector<std::string> images = paths("inline_images");   // the roster: order and gaps matter
+    std::vector<core::ContextRef> contexts;
+    if (draft.is_object() && draft.contains("context_refs"))
+        contexts = core::contextRefsFromJson(draft["context_refs"]);
+
+    std::string current = composerText(st);
+    if (!current.empty() && !images.empty() && !st.pendingInlineImagePaths.empty()) {
+        std::string moved;
+        size_t cursor = 0;
+        for (const auto& ref :
+             ui::copilot::inlineImageRefs(current, st.pendingInlineImagePaths.size())) {
+            moved.append(current, cursor, ref.begin - cursor);
+            moved += ui::copilot::inlineImageMarker(ref.image + images.size());
+            cursor = ref.end;
+        }
+        moved.append(current, cursor, std::string::npos);
+        current = std::move(moved);
+    }
+    std::string merged = queued;
+    while (!merged.empty() && (merged.back() == ' ' || merged.back() == '\n')) merged.pop_back();
+    if (!current.empty()) {
+        if (!merged.empty()) merged += "\n\n";
+        merged += current;
+    }
+    for (const std::string& path : st.pendingAttachments)
+        if (std::find(attachments.begin(), attachments.end(), path) == attachments.end())
+            attachments.push_back(path);
+    for (const std::string& image : st.pendingInlineImagePaths) images.push_back(image);
+    for (const core::ContextRef& ref : st.pendingContextRefs) {
+        const bool known = std::any_of(contexts.begin(), contexts.end(),
+            [&](const core::ContextRef& have) { return core::sameContextEntity(have, ref); });
+        if (!known) contexts.push_back(ref);
+    }
+    st.pendingAttachments = std::move(attachments);
+    st.pendingInlineImagePaths = std::move(images);
+    st.pendingContextRefs = std::move(contexts);
+    composerSetText(st, merged);
+    g_slashCaretToEnd = 1;   // composerSetText already refocuses; park the caret at the end
+    savePromptDraft(st, /*force=*/true);
+}
+
 void composerResetInputState(AppState& st) {
+    ++g_composerEditGeneration;
     if (!st.prompt.empty()) {
         g_wrap.erase(st.prompt.data());
         seedHardBreaks(g_wrap[st.prompt.data()], st.prompt.data(),
                        (int)std::strlen(st.prompt.data()));
     }
-    g_imageInsert.clear();
+    g_composerInsert.clear();
     g_imageRemovals.clear();
     g_composerCursor = g_composerSelectionStart = g_composerSelectionEnd = 0;
-    g_imageUseRememberedSelection = false;
+    g_insertAtRememberedSelection = false;
     ++s_composerGen;
     s_refocusComposer = true;
 }
@@ -4370,10 +4487,23 @@ void composerResetInputState(AppState& st) {
 // gates on this instead, and it doubles as the soft-break flattener on the way out — SOFT
 // only: a break the user typed with Alt/Shift+Enter is part of their message and survives
 // into the prompt, while emptiness is still judged on the text around those breaks.
-std::string composerText(const AppState& st) {
-    if (st.prompt.empty()) return {};
-    std::string out(st.prompt.data());
-    const auto it = g_wrap.find(st.prompt.data());
+const std::string& composerText(const AppState& st) {
+    static const AppState* owner = nullptr;
+    static const char* buffer = nullptr;
+    static uint64_t generation = ~uint64_t(0);
+    static int frame = -1;
+    static std::string raw, out;
+    const char* current = st.prompt.empty() ? "" : st.prompt.data();
+    if (owner == &st && buffer == current && generation == g_composerEditGeneration &&
+        (frame == ImGui::GetFrameCount() || raw == current)) {
+        frame = ImGui::GetFrameCount();
+        return out;
+    }
+    owner = &st; buffer = current; generation = g_composerEditGeneration;
+    frame = ImGui::GetFrameCount();
+    raw = current;
+    out = raw;
+    const auto it = g_wrap.find(current);
     const std::vector<int>* hard = it == g_wrap.end() ? nullptr : &it->second.hard;
     for (size_t i = 0; i < out.size(); ++i) {
         char& c = out[i];
@@ -4381,9 +4511,13 @@ std::string composerText(const AppState& st) {
             continue;
         if (c == '\n' || c == '\r' || c == '\t') c = ' ';
     }
-    const size_t b = out.find_first_not_of(" \n");
-    if (b == std::string::npos) return {};
-    return out.substr(b, out.find_last_not_of(" \n") - b + 1);
+    const size_t begin = out.find_first_not_of(" \n");
+    if (begin == std::string::npos) out.clear();
+    else {
+        out.resize(out.find_last_not_of(" \n") + 1);
+        out.erase(0, begin);
+    }
+    return out;
 }
 
 // The send/stop control, drawn INSIDE the message input box at its bottom-right (flagship
@@ -4391,8 +4525,8 @@ std::string composerText(const AppState& st) {
 // rounded accent button with an enter/return-key glyph (Enter submits). During a turn the same
 // button becomes the stop control (square glyph, statusErr fill).
 static void drawComposerSendStop(AppState& st, const ImVec2& inMin, const ImVec2& inMax,
-                                 float rightEdgeX, bool canRun, bool canStart, bool active,
-                                 bool& submit, bool& stopReq) {
+                                 float rightEdgeX, bool canSend, bool queues, bool canStart,
+                                 bool active, bool& submit, bool& stopReq) {
     const auto& pal = ui::palette;
     const float sc = ui::uiScale;
     const float sz = ImGui::GetFrameHeight();
@@ -4457,9 +4591,11 @@ static void drawComposerSendStop(AppState& st, const ImVec2& inMin, const ImVec2
         dl->AddLine(ImVec2(c.x, c.y - g), ImVec2(c.x - a, c.y - g + a), ink, th);
         dl->AddLine(ImVec2(c.x, c.y - g), ImVec2(c.x + a, c.y - g + a), ink, th);
         if (hov)
-            ImGui::SetTooltip(canStart ? "Send  (Enter)"
-                              : canRun ? "Type a message first."
-                                       : "Runtime/worker not ready yet.");
+            ImGui::SetTooltip(canStart ? (queues ? "Send  (Enter) \xe2\x80\x94 goes out once the "
+                                                   "stopped run finishes"
+                                                 : "Send  (Enter)")
+                              : canSend ? "Type a message first."
+                                        : "Runtime/worker not ready yet.");
         if (clicked && canStart) submit = true;
     }
     ImGui::SetCursorPos(keep);
@@ -4485,8 +4621,6 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
     }
     st.aiInteraction = normalizeCopilotMode(st.aiInteraction);
     st.settings.copilotMode = st.aiInteraction;
-    // Every mode is one streaming Chudcode agent turn — no one-shot RPC lane left.
-    st.agentV2 = true;
     // Screenshot hook, same spirit as CHUDWARE_CHAT_MODEMENU: seed the composer once with
     // CHUDWARE_CHAT_PROMPT (focused, so the magic-keyword shimmer is live) for headless
     // verification of the keyword presentation. No-op in normal use.
@@ -4497,7 +4631,7 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
             composerSetText(st, shotPrompt);
     }
 
-    // Esc: close slash autocomplete first, then staged edit restore, else disarm context pick.
+    // Esc: close slash autocomplete first, else disarm context pick.
     if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
         if (s_slash.open) {
             // Latch the dismissal on the current query — drawSlashAutocomplete
@@ -4508,26 +4642,21 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
             s_slash.open = false;
             s_slash.matches.clear();
             g_slashMenuActive = false;
-        } else if (editStageHoldsConversation(st.activeConvId())) {
-            cancelEditStage(st);
         } else if (st.contextPickActive) {
             st.contextPickActive = false;
         }
     }
 
-    // Staged edit transaction: start a requested edit once the run has truly settled, and
-    // launch a committed edit's single turn when its conversation is the viewed one.
-    if (canRun) editStageTick(st);
-
     // Drain the message queue: once the assistant is free, auto-send the next queued message
     // (Claude-Code-style). Done before computing `active` so the new turn shows as running now.
     // Also require the viewed conversation's run to be idle: after Stop, aiTurnActive is false
     // (stopRequested terminal) but the cancelled run may still be unwinding — don't launch a
-    // queued turn on top of it. Another conversation's run is irrelevant here. A staged edit
-    // of this conversation holds the queue: nothing may append under the edit point, and an
-    // in-flight checkpoint restore truncates the chat when it lands, so no turn starts under it.
-    if (!aiTurnActive(st) && !st.convRunning(st.activeConvId()) && !st.queuedPrompts.empty() &&
-        canRun && !s_aiVc.busy && !editStageHoldsConversation(st.activeConvId())) {
+    // queued turn on top of it. Another conversation's run is irrelevant here. A queued message
+    // the user is editing in the pinned stack holds the queue: it must not leave mid-edit.
+    auto* queuedRun = st.runIfExists(st.activeConvId());
+    const bool queueJobPending = queuedRun && (queuedRun->running.load() || queuedRun->ready.load());
+    if (!aiTurnActive(st) && !queueJobPending && !st.queuedPrompts.empty() && canRun &&
+        !queuedPromptEditHoldsDrain()) {
         const std::string next = st.queuedPrompts.front();
         // Queue snapshots never borrow attachments from a newer unsent draft.
         auto files = std::move(st.pendingAttachments);
@@ -4552,58 +4681,17 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
     }
 
     const bool active = aiTurnActive(st);
-    // A staged edit whose send is pending or being applied owns the composer: its text IS the
-    // edit, so the box is read-only and nothing else can be sent from it meanwhile.
-    const bool editFrozen = editStageHoldsConversation(st.activeConvId()) &&
-                            (editStageInFlight() || s_edit.sendRequested ||
-                             s_edit.phase == EditStage::Phase::AwaitSubmit);
-    bool canStart = canRun && (!composerText(st).empty() || !st.pendingAttachments.empty() ||
-                              !st.pendingContextRefs.empty()) && !active &&
-                    !editFrozen && !s_aiVc.busy;
+    // After Stop the conversation is no longer busy, but its job stays running until the
+    // worker confirms the abort. A follow-up sent meanwhile queues (submitTurn) and goes out
+    // from the drain above once that run settles, instead of the composer refusing it.
+    const JobState* ownRun = st.runIfExists(st.activeConvId());
+    const bool stoppedUnwinding = ownRun && ownRun->stopRequested.load() &&
+                                  (ownRun->running.load() || ownRun->ready.load());
+    const bool canSend = canRun || (st.workerStarted && stoppedUnwinding);
+    bool canStart = canSend && (!composerText(st).empty() || !st.pendingAttachments.empty() ||
+                               !st.pendingContextRefs.empty()) && !active;
     bool submit   = false;   // send / queue requested this frame
     bool stopReq  = false;   // stop requested this frame
-
-    // ---- queued messages (shown above the composer: send-now-and-interrupt, or remove) ----
-    if (!st.queuedPrompts.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, chatSurf().textSecondary);
-        for (size_t qi = 0; qi < st.queuedPrompts.size(); ++qi) {
-            ImGui::PushID((int)qi + 9000);
-            float xBtn = ImGui::GetFrameHeight();
-            std::string& q = st.queuedPrompts[qi];
-            std::string label = "Queued: " + (q.size() > 48 ? q.substr(0, 47) + "\xE2\x80\xA6" : q);
-            ImGui::TextUnformatted(label.c_str());
-            ImGui::SameLine(ImGui::GetContentRegionMax().x - xBtn);
-            if (ImGui::SmallButton("x")) {
-                st.queuedPrompts.erase(st.queuedPrompts.begin() + qi);
-                if (qi < st.queuedPromptDrafts.size())
-                    st.queuedPromptDrafts.erase(st.queuedPromptDrafts.begin() + qi);
-                markChatHistoryDirty();
-                ImGui::PopID();
-                break;
-            }
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Remove from queue");
-            // Send now: interrupt the live run so the drain at the top of the next frame
-            // launches THIS message instead of waiting for the turn to finish on its own.
-            ImGui::SameLine(ImGui::GetContentRegionMax().x - xBtn * 2.0f);
-            if (ImGui::SmallButton("\xE2\x96\xB6")) {   // ▶
-                if (qi != 0) std::rotate(st.queuedPrompts.begin(),
-                                         st.queuedPrompts.begin() + (long)qi,
-                                         st.queuedPrompts.begin() + (long)qi + 1);
-                if (qi != 0 && qi < st.queuedPromptDrafts.size())
-                    std::rotate(st.queuedPromptDrafts.begin(),
-                                st.queuedPromptDrafts.begin() + qi,
-                                st.queuedPromptDrafts.begin() + qi + 1);
-                markChatHistoryDirty();
-                if (active) requestStopRun(st);
-                ImGui::PopID();
-                break;
-            }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Send now \xE2\x80\x94 interrupts the current run");
-            ImGui::PopID();
-        }
-        ImGui::PopStyleColor();
-    }
 
     // One prune per frame, ahead of the chip row: drops document extracts whose file is no
     // longer attached, whichever path removed it (the detach ×, a send that consumed the
@@ -4821,13 +4909,6 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
     // Minimal top pad so the Design dropdown + context meter sit close to the input.
     ImGui::Dummy(ImVec2(0, ui::metrics::U(0.25f)));
-    // Staged edit of THIS conversation: say what Enter / Esc do, or what the transaction is
-    // waiting on. The box is read-only while the edit is being applied (editFrozen above).
-    if (const char* editStatus = editStageStatus(st)) {
-        ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-        ImGui::TextWrapped("%s", editStatus);
-        ImGui::PopStyleColor();
-    }
     // Reserve the in-box send button's footprint on the input's right so text never runs under it.
     const float sendSz    = ImGui::GetFrameHeight();
     const float sendInset = 6.0f * ui::uiScale;
@@ -4845,6 +4926,54 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
                             parseSlashArgQuery(st.prompt.data(), q) != nullptr;
     }
 
+    static bool s_composerInputActive = false;
+    // ---- Up/Down recall of this conversation's sent messages (shell-style) -----------------
+    // Up in an empty box loads the newest sent message; further Ups walk older, Down walks back
+    // and finally empties the box. Sent messages are the user bubbles plus the slash commands
+    // that left none (noteRecallableCommand), in send order. A recalled message is navigable only
+    // while unedited, and only with the caret on its first (Up) / last (Down) line, so arrows
+    // still move the caret inside multi-line text. A recalled command walks on even when it
+    // opens the slash menu. Runs before the widget id is formed: the recall bumps
+    // s_composerGen, so the stale widget never sees this frame's key.
+    {
+        static std::string s_histConv, s_histShown;
+        static int s_histIdx = -1;   // index into the recall list below; -1 = none
+        const std::string convId = st.activeConvId();
+        const std::string& shownNow = composerText(st);
+        const bool recalled = s_histIdx >= 0 && s_histConv == convId && shownNow == s_histShown;
+        if (!recalled) s_histIdx = -1;
+        const ImGuiIO& hio = ImGui::GetIO();
+        const bool plainKey = !hio.KeyCtrl && !hio.KeyShift && !hio.KeyAlt && !hio.KeySuper;
+        const bool up = ImGui::IsKeyPressed(ImGuiKey_UpArrow);
+        const bool down = recalled && ImGui::IsKeyPressed(ImGuiKey_DownArrow);
+        if (s_composerInputActive && (!g_slashMenuActive || recalled) &&
+            plainKey && (up || down) && (shownNow.empty() || recalled)) {
+            std::vector<std::pair<double, const std::string*>> sent;
+            for (const ChatMsg& m : st.chat)
+                if (m.fromUser && !m.text.empty()) sent.emplace_back(m.ts, &m.text);
+            if (const auto cmds = s_commandRecall.find(convId); cmds != s_commandRecall.end())
+                for (const RecallableCommand& c : cmds->second) sent.emplace_back(c.ts, &c.text);
+            std::stable_sort(sent.begin(), sent.end(),
+                             [](const auto& a, const auto& b) { return a.first < b.first; });
+            const int count = (int)sent.size();
+            const int at = recalled ? std::min(s_histIdx, count) : count;
+            const std::string_view raw(st.prompt.data());
+            const size_t caret = std::min<size_t>((size_t)std::max(g_composerCursor, 0), raw.size());
+            const bool onFirstLine = raw.find('\n') >= caret;
+            const bool onLastLine = raw.find('\n', caret) == std::string_view::npos;
+            int target = -2;   // -2 no move, -1 back to an empty box, else a `sent` index
+            if (up && onFirstLine && at > 0) target = at - 1;
+            else if (down && onLastLine) target = at + 1 < count ? at + 1 : -1;
+            if (target != -2) {
+                composerSetText(st, target >= 0 ? *sent[target].second : std::string());
+                g_slashCaretToEnd = 1;
+                s_histIdx = target;
+                s_histConv = convId;
+                s_histShown = composerText(st);
+            }
+        }
+    }
+
     // ---- Ctrl+V of an IMAGE ------------------------------------------------------------------
     // InputTextMultiline claims Ctrl+V itself (imgui_widgets.cpp: Shortcut(Ctrl+V, id) -> is_paste)
     // and pastes the clipboard's TEXT flavour, which for a copied image is empty or a stale
@@ -4857,29 +4986,28 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
     // round trip, throttled but not free — is never polled while the user is elsewhere in the app.
     char inputId[32];
     std::snprintf(inputId, sizeof(inputId), "##aiprompt%d", s_composerGen);
-    static bool s_composerInputActive = false;
     {
         const ImGuiIO& pio = ImGui::GetIO();
-        if (!editFrozen && s_composerInputActive &&
+        if (s_composerInputActive &&
             ImGui::GetActiveID() == ImGui::GetID(inputId) && (pio.KeyCtrl || pio.KeySuper) &&
             ImGui::IsKeyPressed(ImGuiKey_V, false) && ui::clipboardHasImage()) {
             // Image clipboard always owns V, even if capture fails: never paste stale text.
             ImGui::SetKeyOwner(ImGuiKey_V, ImGui::GetID("##aipromptimagepaste"));
             std::string imgPath, imgErr;
             if (ui::clipboardImageToPng(imgPath, imgErr)) {
-                g_imageInsert = ui::copilot::inlineImageMarker(st.pendingInlineImagePaths.size());
+                g_composerInsert = ui::copilot::inlineImageMarker(st.pendingInlineImagePaths.size());
                 st.pendingInlineImagePaths.push_back(imgPath);
-                g_imageUseRememberedSelection = false; // use the live caret/selection
+                g_insertAtRememberedSelection = false; // use the live caret/selection
             } else {
                 st.toast(ui::ToastLevel::Warn, imgErr);
             }
         }
     }
 
-    const bool imageDraftChanged = !g_imageInsert.empty() || !g_imageRemovals.empty();
-    if (imageDraftChanged) {
+    const bool composerDraftChanged = !g_composerInsert.empty() || !g_imageRemovals.empty();
+    if (composerDraftChanged) {
         ImGui::SetKeyboardFocusHere();
-        const size_t needed = std::strlen(st.prompt.data()) + g_imageInsert.size() + 1;
+        const size_t needed = std::strlen(st.prompt.data()) + g_composerInsert.size() + 1;
         if (needed > st.prompt.size()) {
             const auto oldWrap = g_wrap.find(st.prompt.data());
             WrapState savedWrap;
@@ -4889,16 +5017,12 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
         }
     }
     g_imageRosterSize = st.pendingInlineImagePaths.size();
-    if (editFrozen) ImGui::BeginDisabled();
+    composerSpellRefresh(st);
     g_mainComposerInput = true;
     bool submitInput = drawChatInput(inputId, st.prompt, placeholder,
                                      ui::metrics::copilotInputMaxLines(),
                                      sendSz + sendInset * 2.0f);
     g_mainComposerInput = false;
-    if (editFrozen) {
-        ImGui::EndDisabled();
-        submitInput = false;
-    }
     s_composerInputActive = ImGui::IsItemActive();
     const ImVec2 inputMin = ImGui::GetItemRectMin();
     const ImVec2 inputMax = ImGui::GetItemRectMax();
@@ -4913,12 +5037,12 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
                                                 slashFitText(argHint, room).c_str());
     }
     // Crash-safe draft: debounce-write whatever is in the box.
-    savePromptDraft(st, /*force=*/imageDraftChanged);
+    savePromptDraft(st, /*force=*/composerDraftChanged);
     ImGui::PopStyleVar(2);
     ImGui::PopStyleColor(6);
     // Send/stop rides INSIDE the input box, anchored bottom-right of the composer glass.
-    drawComposerSendStop(st, inputMin, inputMax,
-                         composerMin.x + composerW, canRun, canStart, active, submit, stopReq);
+    drawComposerSendStop(st, inputMin, inputMax, composerMin.x + composerW, canSend,
+                         stoppedUnwinding, canStart, active, submit, stopReq);
 
     // Slash autocomplete drop-up (commands + skills). Accept steals Enter from submit.
     bool slashAteEnter = false;
@@ -4936,9 +5060,7 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
     }
 
     // No usage/provider id strip above the toolbar — model lives in the toolbar chip.
-    if (editFrozen) ImGui::BeginDisabled();
     drawComposerToolbar(st, busy, true);
-    if (editFrozen) ImGui::EndDisabled();
     ImGui::PopStyleVar();
 
     const ImVec2 composerMax(composerMin.x + composerW, ImGui::GetItemRectMax().y);
@@ -4977,84 +5099,37 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
         const std::string text = composerText(st);   // flattened + trimmed; empty = no message
         const bool slash = !text.empty() && text[0] == '/';
         const SlashItem* slashCmd = slash ? slashCommandFor(text) : nullptr;
-        if (editStageHoldsConversation(st.activeConvId())) {
-            // A staged edit owns Enter: never a steer or a plain turn. The transaction (stop →
-            // runtime rewind → geometry rollback → commit → ONE turn) keeps the text in the box
-            // until it succeeds; a failure leaves it there with the original tail intact.
-            if (editFrozen || !canRun || text.empty()) {
-                // Pending/applying, or nothing to send: the status line says what is happening.
-            } else if (slash) {
-                st.toast(ui::ToastLevel::Info,
-                         "A command can't replace a message \xe2\x80\x94 press Esc to stop "
-                         "editing first.");
-            } else {
-                editStageSubmit(st, text);
-            }
-        } else if (active && slashCmd && slashCmd->needsIdle) {
+        if (active && slashCmd && slashCmd->needsIdle) {
             // Commands that need the service a run holds are refused, never steered into the
             // run; the text stays in the box so it can be sent once the run finishes.
             st.toast(ui::ToastLevel::Info, slashCmd->label + ": " + kAvailableAfterRun);
         } else if (active && slash && tryHandleSlashCommand(st, text)) {
             // Slash commands run as commands (/btw side question, /prewalk, /skills, /help)
             // rather than being steered into the live run as literal text.
+            noteRecallableCommand(st, text);
             clearComposerBox();
         } else if (active) {
-            // A turn is running — STEER it mid-run when the engine knows the run_id
-            // (agent_steer: text is folded into the live turn at its next step). Fall
-            // back to next-turn queueing only when no run_id is available (e.g. the
-            // run hasn't announced itself yet). Never both — that would double-send.
-            // Attachments ride with the steer, so a picture alone is a valid follow-up.
+            // Ordinary turns accept a steer when their run is live and its run_id is known.
+            // Compaction (and a /handoff, which has no job) is maintenance, not an answer
+            // turn: always queue its follow-ups instead. A finished run keeps its run_id, so
+            // liveness is checked too. Attachments ride with either route, so a picture alone
+            // is a valid follow-up.
             const bool hasChips = !st.pendingAttachments.empty() || !st.pendingContextRefs.empty();
             if (!text.empty() || hasChips) {
                 std::string runId;
-                {
-                    auto steerRun = st.activeRun();
-                    std::lock_guard<std::mutex> lk(steerRun->mtx);
-                    runId = steerRun->runId;
-                }
-                if (!runId.empty() && st.workerStarted) {
-                    std::string sendText = text;
-                    std::string bubbleText;
-                    nlohmann::json attachments =
-                        consumeComposerAttachments(st, sendText, &bubbleText);
-                    std::vector<core::ContextRef> contextRefs = consumeContextRefs(st);
-                    // The control lane carries text + images only: the chips ride inline.
-                    if (const std::string ctx = core::contextRefsPromptText(contextRefs);
-                        !ctx.empty())
-                        sendText += "\n\n" + ctx;
-                    // Names this bubble on the control lane and in agent.steer events, so
-                    // its "queued" / "read" state follows the message.
-                    static unsigned s_steerSeq = 0;
-                    const std::string steerId =
-                        "steer-" + std::to_string((long long)(chatNowEpoch() * 1000.0)) + "-" +
-                        std::to_string(++s_steerSeq);
-                    appendSteerToTranscript(st, userBubbleText(bubbleText, attachments),
-                                            attachments, std::move(contextRefs), steerId);
-                    agentControlDispatch(st, runId, sendText, std::move(attachments), steerId);
-                } else {
-                    // Freeze this prompt's exact roster; a later draft is independent.
-                    st.queuedPromptDrafts.resize(st.queuedPrompts.size(), nlohmann::json::object());
-                    st.queuedPrompts.emplace_back(text);
-                    st.queuedPromptDrafts.push_back({
-                        {"attachments", std::move(st.pendingAttachments)},
-                        {"inline_images", std::move(st.pendingInlineImagePaths)},
-                        {"context_refs", core::contextRefsToJson(st.pendingContextRefs)}});
-                    markChatHistoryDirty();
-                    st.pendingAttachments.clear();
-                    st.pendingInlineImagePaths.clear();
-                    st.pendingContextRefs.clear();
-                }
+                if (activeRunAcceptsSteer(st, &runId)) sendSteer(st, text, runId);
+                else queueComposerPrompt(st, text);
                 clearComposerBox();
             } else if (!st.queuedPrompts.empty()) {
-                // Enter on an EMPTY composer with something queued = "send it now": the message
-                // didn't interrupt the run (it queued instead of steering), so a second Enter
-                // stops the run and the drain at the top of the next frame launches the queued
-                // message immediately. Same action as the ▶ button on the queued row.
-                requestStopRun(st);
+                // Enter on an EMPTY composer with something queued = "send it now": the same
+                // action as Send now on the first queued bubble (steer it in, or stop the run
+                // so the drain at the top of the next frame launches it).
+                queuedPromptSendNow(st, 0);
             }
         } else if (canStart) {
+            s_keepCompactDraft = false;
             submitTurn(st, text);
-            clearComposerBox();
+            if (!s_keepCompactDraft) clearComposerBox();
         }
     }
 
@@ -5070,7 +5145,7 @@ void drawComposer(AppState& st, bool busy, bool canRun) {
 // (the height measured the last time it was really drawn at this width) instead of running its
 // full draw path. Per-frame cost is O(visible) real draws + O(total) trivial spacer loop — no
 // crash and no unbounded frame cost on large histories. Interactive/animated messages (the
-// running turn, an open clarify card) always render so nothing live is ever frozen out. Cached
+// running turn, an open question) always render so nothing live is ever frozen out. Cached
 // heights invalidate on width change (resize) and refresh every frame the message is visible
 // (expand/collapse toggles re-measure naturally). Shared by the docked Copilot column and the AI
 // workspace chat column.

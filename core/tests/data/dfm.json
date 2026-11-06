@@ -345,7 +345,7 @@
       "process": "lost_wax"
     },
     "result": {
-      "error": "Unknown process 'lost_wax'. Known processes: ['fdm', 'cnc_mill', 'lathe', 'sheet_metal', 'laser', 'injection'].",
+      "error": "Unknown process 'lost_wax'. Known processes: ['fdm', 'cnc_mill', 'lathe', 'sheet_metal', 'laser', 'injection', 'cast', 'sla', 'sls', 'mjf'].",
       "ok": false
     }
   },
@@ -361,7 +361,11 @@
         "lathe",
         "sheet_metal",
         "laser",
-        "injection"
+        "injection",
+        "cast",
+        "sla",
+        "sls",
+        "mjf"
       ]
     }
   },
@@ -421,7 +425,7 @@
       "process": "lost_wax"
     },
     "result": {
-      "error": "Unknown process 'lost_wax'. Known: ['fdm', 'cnc_mill', 'lathe', 'sheet_metal', 'laser', 'injection'].",
+      "error": "Unknown process 'lost_wax'. Known: ['fdm', 'cnc_mill', 'lathe', 'sheet_metal', 'laser', 'injection', 'cast', 'sla', 'sls', 'mjf'].",
       "ok": false
     }
   },

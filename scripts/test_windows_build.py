@@ -184,7 +184,7 @@ def _stage_inputs(repo):
     for relative in ("build/windows-occt/bin/libchudware.dll", "build/windows-occt/bin/chudware-hostd.exe",
                      "host/build-win/bin/chudware.exe", "engine/runtime.py", "services/__init__.py", "services/agent/runtime.py",
                      "services/ipc/runtime.py", "requirements.txt", "vendor/python/RUNTIME_WHEELS.lock",
-                     "vendor/chudcode/CHUDCODE_ARTIFACT.lock", "wheelhouse/fixture.whl", "assets/fixture.dat"):
+                     "vendor/omp/OMP_ARTIFACT.lock", "wheelhouse/fixture.whl", "assets/fixture.dat"):
         path = repo / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"inert developer-stage fixture; not authenticated release inputs\n")
@@ -217,7 +217,7 @@ def test_stage_accepts_all_robocopy_success_codes_and_literal_paths(native_scrip
 
 @pytest.mark.parametrize("missing", ["build/windows-occt/bin/libchudware.dll", "build/windows-occt/bin/chudware-hostd.exe",
                                      "host/build-win/bin/chudware.exe", "requirements.txt", "vendor/python/RUNTIME_WHEELS.lock",
-                                     "vendor/chudcode/CHUDCODE_ARTIFACT.lock", "wheelhouse"])
+                                     "vendor/omp/OMP_ARTIFACT.lock", "wheelhouse"])
 def test_stage_missing_prerequisite_never_mutates_retained_dist(native_scripts, missing):
     repo = native_scripts[0]
     _stage_inputs(repo)

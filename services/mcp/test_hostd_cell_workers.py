@@ -227,8 +227,16 @@ int main() {
                     sessions.erase(params.value("session_id", std::string()));
                     std::ofstream(root + "/release-" + std::to_string(getpid()) + ".json") << req;
                 }
-                result = {{"ok", owner}, {"active", matched}, {"cancelled", matched},
-                          {"ctx", ctx}, {"actor", actor}, {"pid", getpid()}};
+                if (action == "apply_compaction_policy") {
+                    json items = json::array();
+                    if (owner) for (const auto& session : sessions)
+                        items.push_back({{"session_id", session}, {"ok", true}});
+                    std::ofstream(root + "/policy-" + std::to_string(getpid())) << params;
+                    result = {{"ok", owner}, {"sessions", items}};
+                } else {
+                    result = {{"ok", owner}, {"active", matched}, {"cancelled", matched},
+                              {"ctx", ctx}, {"actor", actor}, {"pid", getpid()}};
+                }
             }
             const auto response = json{{"ok", true}, {"result", result}}.dump() + "\n";
             write(fd, response.data(), response.size()); close(fd);
@@ -270,7 +278,9 @@ int main() {
             sessions.insert(params.at("session_id"));
             std::cout << json{{"id", req["id"]}, {"event", "started"},
                 {"data", {{"kind", "run_started"}, {"run_id", active}, {"pid", getpid()}, {"ctx", ctx},
-                          {"info_ctx", infoCtx}}}}.dump() << std::endl;
+                          {"info_ctx", infoCtx},
+                          {"omp_session_file", "/actor/private.jsonl"},
+                          {"nested", {{"sessionFile", "/actor/private.jsonl"}}}}}}.dump() << std::endl;
             if (params.value("finish_file", false)) {
                 lock.unlock();
                 while (!std::filesystem::exists(root + "/finish-turn-" + std::to_string(getpid()) +
@@ -280,7 +290,7 @@ int main() {
             } else changed.wait(lock, [&] { return cancelled; });
             result = {{"pid", getpid()}, {"ctx", ctx}, {"cancelled", cancelled}, {"completed", !cancelled}};
             active.clear();
-        } else if (method == "chudcode_test_background" || method == "git_gh_auth_login") {
+        } else if (method == "omp_login" || method == "git_gh_auth_login") {
             background.fetch_add(1);
             const auto finish = root + "/finish-background-" + std::to_string(getpid());
             std::thread([&, finish] {
@@ -305,7 +315,15 @@ int main() {
         } else {
             std::lock_guard<std::mutex> lock(mutex);
             result = {{"pid", getpid()}, {"actor", actor}, {"ctx", ctx}, {"sessions", sessions},
-                      {"info_ctx", infoCtx}, {"lane", std::getenv("CHUDWARE_HOSTD_WORKER_LANE")}};
+                      {"info_ctx", infoCtx}, {"lane", std::getenv("CHUDWARE_HOSTD_WORKER_LANE")},
+                      {"omp_session_file", "/actor/private.jsonl"},
+                      {"nested", {{"session_file", "/actor/private.jsonl"},
+                                  {"omp_session_dir", "/actor/sessions"},
+                                  {"path", "/etc/passwd"},
+                                  {"exported_files", {"/work/safe/a.scad", "safe/b.scad",
+                                                      "/actor/private.scad", "../outside.scad",
+                                                      "escape/private.scad"}},
+                                  {"reused_files", {"/work/safe/b.scad", "/etc/passwd"}}}}};
         }
         std::cout << json{{"id", req["id"]}, {"ok", true}, {"result", result}}.dump() << std::endl;
     }
@@ -447,7 +465,7 @@ def context(actor, epoch=1):
 
 def inspect(cell, ctx, session=None):
     params = {} if session is None else {"session_id": session}
-    response = cell.call(op="dispatch", method="chudcode_test_inspect", ctx=ctx, params=params)
+    response = cell.call(op="dispatch", method="omp_session_stats", ctx=ctx, params=params)
     assert response["ok"], response
     return response["result"]
 
@@ -471,11 +489,12 @@ def test_actor_process_registry_context_and_minimal_environment(cell):
         assert set(env) == {
             "PATH", "LANG", "LC_ALL", "HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME",
             "XDG_RUNTIME_DIR", "XDG_CACHE_HOME", "TMPDIR", "CHUDWARE_CELL",
-            "CHUDWARE_CHUDCODE_BIN", "CHUDWARE_HOSTD_SOCKET", "CHUDWARE_NATIVE_ROOT",
+            "CHUDWARE_OMP_BIN", "CHUDWARE_HOSTD_SOCKET", "CHUDWARE_NATIVE_ROOT",
             "CHUDWARE_FS_ROOT", "CHUDWARE_PROJECT_DIR", "CHUDWARE_PROJECT_SAVE_DIR",
             "CHUDWARE_WORKSPACE_KEY", "CHUDWARE_ACTOR_KEY", "CHUDWARE_ACTOR_HEX",
             "CHUDWARE_HOSTD_WORKER_LANE"}
         assert "CHUDWARE_WORKER_BIN" not in env and "CHUDWARE_PYTHON" not in env
+        assert env["CHUDWARE_OMP_BIN"] == "/opt/chudware/bin/omp"
         assert env["CHUDWARE_HOSTD_SOCKET"] == "/actor/run/hostd.sock"
         assert env["HOME"] == "/actor/home" and "CHUDWARE_CELL_STATE" not in env
         assert env["CHUDWARE_NATIVE_ROOT"] == "/work"
@@ -543,7 +562,7 @@ def test_revoke_wakes_pool_waiters_without_respawn_and_fresh_epoch_works(cell):
     cell.receive(one)
     cell.receive(two)
     assert not cell.control(alice, "a-one", action="status")["matched"]
-    stale = cell.call(op="dispatch", method="chudcode_test_inspect", ctx=alice)
+    stale = cell.call(op="dispatch", method="omp_session_stats", ctx=alice)
     assert stale["result"]["code"] == "revoked"
     assert len(list((cell.state / "actors" / alice["actor_hex"]).glob("launch-*.json"))) == 2
     alive = cell.control(bob, "b-run", action="status")
@@ -711,6 +730,10 @@ def actual_cell_daemon(cell_payload, tmp_path, request):
     # and system runtime are exposed to this disposable test namespace, not HOME.
     # Like CellRuntime, activate clears FD_CLOEXEC on listener fd 3 before exec;
     # bubblewrap passes it through without a descriptor-preservation option.
+    # The workspace is conventionally /work, but a containerized checkout (testbox) is
+    # itself mounted there: binding the workspace over it would hide the engine library
+    # and its absolute RPATHs, so only then does the workspace take another namespace path.
+    cell_work = "/cell-work" if ROOT.is_relative_to("/work") else "/work"
     command = [bwrap, "--unshare-user", "--unshare-pid", "--die-with-parent",
                "--tmpfs", "/", "--ro-bind", "/usr", "/usr"]
     for directory in ("/lib", "/lib64", "/etc"):
@@ -719,13 +742,15 @@ def actual_cell_daemon(cell_payload, tmp_path, request):
     command += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
                 "--ro-bind", str(ROOT), str(ROOT),
                 "--ro-bind", str(payload), "/opt/chudware",
-                "--bind", str(state), "/state", "--bind", str(work), "/work"]
+                "--bind", str(state), "/state", "--bind", str(work), cell_work]
     if getattr(request, "param", False):
         command += ["--dir", "/actor"]
-        runtime = python.resolve().parent.parent
-        if not runtime.is_relative_to(ROOT) and not runtime.is_relative_to("/usr"):
-            # uv-managed venv interpreters can live outside the read-only repo.
-            command += ["--ro-bind", str(runtime), str(runtime)]
+        # The interpreter's runtime, and the venv itself when the repo's .venv-mcp is a
+        # symlink (the testbox image's), can live outside the read-only repository
+        # (uv-managed interpreters likewise).
+        for outside in dict.fromkeys((python.resolve().parent.parent, python.parent.parent.resolve())):
+            if not outside.is_relative_to(ROOT) and not outside.is_relative_to("/usr"):
+                command += ["--ro-bind", str(outside), str(outside)]
     # Respect explicit engine overrides outside the repository without exposing
     # their parent tree: the library itself gets a private read-only mount.
     library = library.resolve()
@@ -735,7 +760,7 @@ def actual_cell_daemon(cell_payload, tmp_path, request):
     else:
         engine_path = str(library)
     command += ["--", "/opt/chudware/bin/chudware-hostd", "--cell",
-                "--gateway-listen-fd", "3", "--cell-state", "/state", "--cell-work", "/work"]
+                "--gateway-listen-fd", "3", "--cell-state", "/state", "--cell-work", cell_work]
     env = {"PATH": "/usr/bin:/bin", "HOME": "/state/home", "XDG_DATA_HOME": "/state/data",
            "LANG": "C.UTF-8", "CHUDWARE_LIBCHUDWARE": engine_path,
            "LD_LIBRARY_PATH": str(library.parent),
@@ -792,7 +817,7 @@ def actual_cell_daemon(cell_payload, tmp_path, request):
                 process = start()
                 cell["process"] = process
 
-            cell = {"connect": connect, "operator": operator, "state": state,
+            cell = {"connect": connect, "operator": operator, "state": state, "work": work,
                     "process": process, "restart": restart}
             try:
                 yield cell
@@ -825,10 +850,39 @@ def test_real_worker_session_resumes_after_hostd_restart(actual_cell_daemon):
     assert foreign.get("error", {}).get("code") == "not_found", foreign
 
 
+def test_actual_cell_parts_reference_actions_enforce_actor_rights(actual_cell_daemon):
+    cell = actual_cell_daemon
+    workspace = "team:parts-reference"
+    alice = str(uuid.uuid4())
+    author = cell["connect"](alice, workspace)
+    viewer = cell["connect"](str(uuid.uuid4()), workspace, right="viewer")
+    foreign = cell["connect"](str(uuid.uuid4()), workspace)
+    manager = cell["connect"](str(uuid.uuid4()), workspace, right="manager")
+    session_id = author.call("agent_handles_new")["result"]["session_id"]
+
+    for method, params in (
+        ("parts_download_select", {"job_id": "selection-job", "member": "model.step"}),
+        ("reveng_find_models", {"session_id": session_id, "query": "model"}),
+        ("reveng_use_model", {"session_id": session_id, "path": "model.step"}),
+    ):
+        denied = viewer.call(method, params)
+        assert denied.get("error", {}).get("code") == "forbidden_right", (method, denied)
+        dispatched = author.call(method, params)
+        assert dispatched.get("result", {}).get("actor") == alice, (method, dispatched)
+        assert dispatched["result"]["ctx"]["actor_key"] == alice
+        # The hostd remembers the accepted handle; the real queue additionally checks
+        # job ownership before allowing a selection, including for unknown handles.
+        for other in (foreign, manager):
+            denied = other.call(method, params)
+            assert denied.get("error", {}).get("code") == "not_found", (method, denied)
+
+
 def test_actual_cell_revoke_streams_stop_and_preserves_other_actor(actual_cell_daemon):
     cell = actual_cell_daemon
     alice, bob = str(uuid.uuid4()), str(uuid.uuid4())
     workspace = "team:worker-integration/team"
+    (cell["work"] / "safe").mkdir()
+    (cell["work"] / "escape").symlink_to("/etc", target_is_directory=True)
     a_turn = cell["connect"](alice, workspace)
     a_monitor = cell["connect"](alice, workspace)
     b_turn = cell["connect"](bob, workspace)
@@ -846,6 +900,23 @@ def test_actual_cell_revoke_streams_stop_and_preserves_other_actor(actual_cell_d
     b_request = b_turn.send("agent_admin_turn", {**b_handles, "message": "wait"})
     b_started = b_turn.run_event("run_started", b_handles["run_id"])
     assert a_started["pid"] != b_started["pid"]
+    for event in (a_started, b_started):
+        assert "omp_session_file" not in event
+        assert "sessionFile" not in event["nested"]
+    selection = {"strategy": "shake", "compaction": {"keep_recent_tokens": 400}}
+    policy = a_monitor.call("omp_apply_compaction_policy", selection)
+    assert policy["result"]["ok"] is True
+    assert [s["session_id"] for s in policy["result"]["sessions"]] == [a_handles["session_id"]]
+    alice_root = cell["state"] / "actors" / hashlib.sha256(alice.encode()).hexdigest()[:32]
+    bob_root = cell["state"] / "actors" / hashlib.sha256(bob.encode()).hexdigest()[:32]
+    assert list(alice_root.glob("policy-*"))
+    assert json.loads(next(alice_root.glob("policy-*")).read_text()) == selection
+    for invalid in ({}, {"strategy": "other"}, {"strategy": "summary", "compaction": {
+            "keep_recent_tokens": -1}}, {"strategy": "summary", "compaction": {
+            "keep_recent_tokens": True}}, {"strategy": "summary", "unexpected": True}):
+        denied = a_monitor.call("omp_apply_compaction_policy", invalid)
+        assert denied["result"]["ok"] is False
+    assert not list(bob_root.glob("policy-*"))
     for actor, event in ((alice, a_started), (bob, b_started)):
         ctx = event["ctx"]
         assert ctx["actor_key"] == actor
@@ -856,13 +927,13 @@ def test_actual_cell_revoke_streams_stop_and_preserves_other_actor(actual_cell_d
         assert event["info_ctx"] == ctx
     cross = b_control.call("agent_cancel", {"run_id": a_handles["run_id"]})
     assert cross.get("error", {}).get("code") == "not_found", cross
-    for method in ("chudcode_session_stats", "chudcode_close_session",
+    for method in ("omp_session_stats", "omp_close_session",
                    "session_handoff", "agent_handles_new"):
         denied = b_control.call(method, {"session_id": a_handles["session_id"]})
         assert denied.get("error", {}).get("code") == "not_found", (method, denied)
         unknown = b_control.call(method, {"session_id": "absent-session"})
         assert unknown.get("error", {}).get("code") == "worker_lane_busy", (method, unknown)
-    own_busy = b_control.call("chudcode_session_stats", {"session_id": b_handles["session_id"]})
+    own_busy = b_control.call("omp_session_stats", {"session_id": b_handles["session_id"]})
     assert own_busy.get("error", {}).get("code") == "worker_lane_busy", own_busy
     revoked = b_control.call("principal_revoke", {"actor_key": alice, "epoch": 1})
     assert revoked.get("result", {}).get("ok") is True, revoked
@@ -882,7 +953,7 @@ def test_actual_cell_revoke_streams_stop_and_preserves_other_actor(actual_cell_d
     assert probe["result"]["ctx"]["actor_key"] == bob
     assert b_control.call("agent_cancel", {"run_id": b_handles["run_id"]})["result"]["cancelled"]
     assert b_turn.reply(b_request)["result"]["cancelled"]
-    stats = b_control.call("chudcode_session_stats", {"session_id": b_handles["session_id"]})
+    stats = b_control.call("omp_session_stats", {"session_id": b_handles["session_id"]})
     assert stats["result"]["pid"] == b_started["pid"]
     assert stats["result"]["sessions"] == [b_handles["session_id"]]
     assert all(event.get("data", {}).get("run_id") != a_handles["run_id"]
@@ -892,7 +963,13 @@ def test_actual_cell_revoke_streams_stop_and_preserves_other_actor(actual_cell_d
     fresh = cell["connect"](alice, workspace, epoch=2)
     assert fresh.hello.get("result", {}).get("cell") is True
     fresh_handles = fresh.call("agent_handles_new")["result"]
-    fresh_stats = fresh.call("chudcode_session_stats", {"session_id": fresh_handles["session_id"]})
+    assert "omp_session_file" not in stats["result"]
+    assert "session_file" not in stats["result"]["nested"]
+    assert "path" not in stats["result"]["nested"]
+    assert "omp_session_dir" not in stats["result"]["nested"]
+    assert stats["result"]["nested"]["exported_files"] == ["safe/a.scad", "safe/b.scad"]
+    assert stats["result"]["nested"]["reused_files"] == ["safe/b.scad"]
+    fresh_stats = fresh.call("omp_session_stats", {"session_id": fresh_handles["session_id"]})
     assert fresh_stats["result"]["pid"] != a_started["pid"]
     assert fresh_stats["result"]["sessions"] == []
     manager_actor = str(uuid.uuid4())
@@ -1006,7 +1083,7 @@ def test_idle_extra_reaper_preserves_real_background_and_unknown_lanes(cell, unk
     for run, tag in (("one", first), ("two", second)):
         assert cell.control(owner, run)["ok"]
         assert cell.receive(tag)["ok"]
-    response = cell.call(op="dispatch", method="chudcode_test_background", ctx=owner,
+    response = cell.call(op="dispatch", method="omp_login", ctx=owner,
                          params={"session_id": "two"})
     assert response["ok"]
     assert response["result"]["pid"] == second_event["pid"] != first_event["pid"]
@@ -1070,8 +1147,16 @@ def test_actual_cell_drain_keeps_turn_reply_and_background_completion(actual_cel
     # Existing admitted connection may start follow-on work; drain is not cancel.
     background = customer.call("git_gh_auth_login")["result"]["pid"]
     customer.close()
-    census = operator.call("cell_census")["result"]
-    assert census["workers"]["background"] == 1 and not census["quiescent"]
+    # A concurrent drain probe is reported as unknown, not a stale worker count.
+    deadline = time.monotonic() + 5
+    while True:
+        census = operator.call("cell_census")["result"]
+        assert not census["quiescent"], census
+        if census["complete"]:
+            assert census["workers"]["background"] == 1, census
+            break
+        assert time.monotonic() < deadline, census
+        time.sleep(0.02)
     time.sleep(2)
     assert cell["process"].poll() is None
     (root / f"finish-background-{background}").write_text("finish")

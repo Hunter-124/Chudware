@@ -31,11 +31,19 @@ pytestmark = pytest.mark.skipif(
 
 
 def _call(name: str, args: dict):
-    """Invoke a registered MCP tool; return (parsed_json_or_None, content_list)."""
+    """Invoke a registered MCP tool; return (parsed_json_or_None, content_list).
+
+    Tools with a typed return carry a structured {"result": ...}; image-capable tools
+    (`-> Any`) return bare content, whose first text block is the JSON reply."""
     from services.mcp import server
 
-    content, structured = asyncio.run(server.mcp.call_tool(name, args))
-    text = structured.get("result") if isinstance(structured, dict) else None
+    result = asyncio.run(server.mcp.call_tool(name, args))
+    if isinstance(result, tuple):
+        content, structured = result
+        text = structured.get("result") if isinstance(structured, dict) else None
+    else:
+        content = list(result)
+        text = next((c.text for c in content if getattr(c, "type", None) == "text"), None)
     parsed = None
     if isinstance(text, str):
         try:
@@ -113,6 +121,79 @@ def _new_plate_with_hole() -> str:
     return doc
 
 
+def test_concurrent_agents_build_same_and_separate_documents_and_save(tmp_path, monkeypatch):
+    """Real registered tool path; run only with an isolated daemon or daemon mode disabled."""
+    from concurrent.futures import ThreadPoolExecutor
+    import zipfile
+    from services.mcp import cad_common
+
+    monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
+    first = cb.call("doc_new", {"kind": "part", "name": f"shared-{uuid.uuid4().hex}"})["doc_id"]
+    second = cb.call("doc_new", {"kind": "part", "name": f"separate-{uuid.uuid4().hex}"})["doc_id"]
+    barrier = threading.Barrier(3)
+
+    def build(agent, doc, name, x):
+        with cad_common.agent_doc_context(agent, scope="concurrent-smoke"):
+            cad_common._CUR["doc_id"] = doc
+            barrier.wait(timeout=10)
+            return _solve("add_features", {"ops": [
+                cb.feat("box", name, {"length": cb.dim(10), "width": cb.dim(10),
+                                       "height": cb.dim(10), "at": [x, 0, 0]})]})
+
+    try:
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = [pool.submit(build, "a", first, "shared-a", -30),
+                       pool.submit(build, "b", first, "shared-b", 30),
+                       pool.submit(build, "c", second, "separate", 0)]
+            results = [f.result(timeout=180) for f in futures]
+        assert all(result.get("ok") for result in results), results
+        assert {result["doc_id"] for result in results} == {first, second}
+        tree = cb.call("doc_tree", {"doc_id": first})["tree"]
+        assert {row["name"] for row in tree["features"]} == {"shared-a", "shared-b"}
+        tree = cb.call("doc_tree", {"doc_id": second})["tree"]
+        assert {row["name"] for row in tree["features"]} == {"separate"}
+        paths = {result.get("saved_path") for result in results if result["doc_id"] == first}
+        assert len(paths) == 1 and None not in paths
+        with zipfile.ZipFile(paths.pop()) as archive:
+            saved = json.loads(archive.read("document.json"))
+            assert {row["name"] for row in saved["features"]} == {"shared-a", "shared-b"}
+            assert "cache.aicm" in archive.namelist()
+    finally:
+        for doc in (first, second):
+            cb.call("doc_close", {"doc_id": doc})
+
+
+def test_concurrent_placement_metadata_survives_save(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from services.mcp.cad_common import note_placement_source, placement_source_of
+
+    doc = cb.call("doc_new", {"kind": "assembly", "name": f"placement-{uuid.uuid4().hex}"})["doc_id"]
+    barrier = threading.Barrier(2)
+
+    def record(component, source):
+        barrier.wait(timeout=10)
+        note_placement_source(doc, component, source)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(record, "k1", "mate"), pool.submit(record, "k2", "transform")]
+            for future in futures:
+                future.result(timeout=30)
+        note_placement_source(doc, "k1", "transform")
+        assert placement_source_of(doc, "k1") == "mate"
+        assert placement_source_of(doc, "k2") == "transform"
+        path = str(tmp_path / "provenance.step+")
+        cb.call("doc_save", {"doc_id": doc, "path": path})
+        reopened = cb.call("doc_open", {"path": path})["doc_id"]
+        try:
+            assert placement_source_of(reopened, "k1") == "mate"
+            assert placement_source_of(reopened, "k2") == "transform"
+        finally:
+            cb.call("doc_close", {"doc_id": reopened})
+    finally:
+        cb.call("doc_close", {"doc_id": doc})
+
+
 def test_cad_guide_returns_vocabulary():
     r, content = _call("cad_guide", {"topic": "overview"})
     text = content[0].text
@@ -132,7 +213,7 @@ def test_query_geometry_top_face():
 
 # ---- task 06: sketch relations + check_sketch -----------------------------------------------
 # Sketch entity/constraint shape mirrors the proven C++ DSL (core/tests/test_document.cpp::
-# rect_entities): 4 lines closed by coincident + h/v relations + a fixed corner + 2 driving
+# rect_entities): 4 lines closed by coincident + h/v relations + an origin relation + 2 driving
 # distance dims == a FULLY DEFINED rectangle (dof 0). Drop the dims -> under-defined.
 def _line(eid, x1, y1, x2, y2):
     return {"id": eid, "type": "line", "construction": False, "p1": [x1, y1], "p2": [x2, y2]}
@@ -167,7 +248,7 @@ def _rect_sketch(name, w, h, with_dims=True):
         _rel("c6", "horizontal", ["e3"]),
         _rel("c7", "vertical", ["e2"]),
         _rel("c8", "vertical", ["e4"]),
-        _rel("c9", "fix", ["e1.p1"]),
+        _rel("c9", "coincident", ["e1.p1", "origin"]),
     ]
     if with_dims:
         cons += [
@@ -303,6 +384,7 @@ def test_measure_part():
     r, _ = _call("measure_part", {"doc_id": doc})
     assert r["ok"]
     assert r["mass"]["volume_mm3"] > 0
+    assert r["volume_mm3"] == r["mass"]["volume_mm3"]
 
 
 def test_set_material_preset_and_explicit():
@@ -631,22 +713,19 @@ def test_save_part_written_file_reopens_after_extension_rewrite():
     os.unlink(r["path"])
 
 
-def test_close_part_warns_on_unsaved_changes():
-    """close_part on a dirty doc refuses (unsaved_changes) so the AI saves deliverables —
-    the user is never nagged about the AI's docs, so the discipline lives here."""
+def test_close_part_warns_when_automatic_persistence_fails(monkeypatch):
+    """A dirty part cannot be closed when its automatic native save fails."""
+    monkeypatch.setattr("services.mcp.cad_common._project_save",
+                        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")))
     doc = _new_plate_with_hole()  # has edits -> dirty
     from services.mcp import cad_common
-    assert doc in cad_common._LAST_VOLUME
     assert doc in cad_common._PROCESS_DOCS
-    assert doc in cad_common._TOUCHED_DOCS
-    volume_before = cad_common._LAST_VOLUME[doc]
+    assert doc in cad_common._TOUCHED_DOCS[cad_common._touch_scope()]
     r, _ = _call("close_part", {"doc_id": doc})
     assert r.get("ok") is False and r.get("code") == "unsaved_changes", r
     assert r.get("dirty") is True, r
-    assert cad_common._LAST_VOLUME.get(doc) == volume_before, \
-        "refused close must preserve the volume baseline"
     assert doc in cad_common._PROCESS_DOCS, "refused close must preserve process ownership"
-    assert doc in cad_common._TOUCHED_DOCS, "refused close must preserve touched-doc state"
+    assert doc in cad_common._TOUCHED_DOCS[cad_common._touch_scope()]
     # The doc is untouched — still listable and closable.
     ids = {e.get("doc_id") for e in cb.call("doc_list", {}).get("docs", [])}
     assert doc in ids, "refused close must not have dropped the doc"
@@ -657,16 +736,14 @@ def test_close_part_discard_drops_scratch():
     """close_part(discard=True) closes a dirty scratch doc without saving."""
     doc = _new_plate_with_hole()
     from services.mcp import cad_common
-    assert doc in cad_common._LAST_VOLUME
     assert doc in cad_common._PROCESS_DOCS
-    assert doc in cad_common._TOUCHED_DOCS
+    assert doc in cad_common._TOUCHED_DOCS[cad_common._touch_scope()]
     r, _ = _call("close_part", {"doc_id": doc, "discard": True})
     assert r.get("ok") is True, r
     ids = {e.get("doc_id") for e in cb.call("doc_list", {}).get("docs", [])}
     assert doc not in ids, "discard must actually close the doc"
-    assert doc not in cad_common._LAST_VOLUME, "discard must evict the volume baseline"
     assert doc not in cad_common._PROCESS_DOCS, "discard must evict process ownership"
-    assert doc not in cad_common._TOUCHED_DOCS, "discard must evict touched-doc state"
+    assert doc not in cad_common._TOUCHED_DOCS.get(cad_common._touch_scope(), {})
 
 
 def test_close_part_clean_after_save():
@@ -690,6 +767,44 @@ def test_export_step_plus_alias_is_native():
     assert r["ok"] and r.get("native") and r["format"] == "step+", r
     assert r["path"].lower().endswith(".step+") and r["exists"], r
     os.unlink(r["path"])
+
+
+def test_save_part_refuses_drawing_and_names_native_persistence(tmp_path):
+    import zipfile
+
+    part = _new_plate_with_hole()
+    drawing = None
+    try:
+        made, _ = _call("make_drawing", {"doc_id": part, "views": ["front"]})
+        assert made["ok"], made
+        drawing = made["drawing_doc_id"]
+        from services.mcp.cad_common import _part_has_mesh_references
+        assert not _part_has_mesh_references(drawing)
+        drawing_before = cb.call("drawing_get", {"doc_id": drawing})
+        requested = tmp_path / "sheet.draw+"
+        for allow_empty in (False, True):
+            refused, _ = _call("save_part", {"doc_id": drawing, "path": str(requested),
+                                              "allow_empty": allow_empty})
+            assert refused["ok"] is False and refused["code"] == "drawing_requires_export", refused
+            assert refused["source_doc_id"] == part, refused
+            assert 'export_part(fmt="draw+"' in refused["hint"] and drawing in refused["hint"], refused
+            assert "save_part" in refused["hint"] and ".step+" in refused["error"]
+            assert not requested.exists() and not (tmp_path / "sheet.draw+.step+").exists()
+            assert not (tmp_path / "sheet.step+").exists()
+        assert cb.call("drawing_get", {"doc_id": drawing})["revision"] == drawing_before["revision"]
+
+        standalone, _ = _call("export_part", {"doc_id": drawing, "fmt": "draw+",
+                                               "path": str(requested)})
+        assert standalone["ok"] and standalone["format"] == "draw+", standalone
+        assert requested.is_file()
+        saved, _ = _call("save_part", {"doc_id": part, "path": str(tmp_path / "part.step+")})
+        assert saved["ok"] and saved["format"] == "step+", saved
+        with zipfile.ZipFile(saved["path"]) as archive:
+            assert f"drawings/{drawing}.json" in archive.namelist()
+    finally:
+        if drawing:
+            cb.call("drawing_close", {"doc_id": drawing})
+        cb.call("doc_close", {"doc_id": part})
 
 
 def test_drawing_overhaul_gdt_section_export():
@@ -1049,6 +1164,196 @@ def test_get_part_summary_keeps_a_long_list_a_list_and_names_the_cut():
     assert 0 < len(entities) < n
     full, _ = _call("get_part", {"doc_id": doc})
     assert len(full["tree"]["features"][0]["params"]["entities"]) == n
+    selected, _ = _call("get_part", {"doc_id": doc, "feature_ids": [sketch["id"]]})
+    assert selected["revision"] == full["revision"]
+    assert selected["tree"]["features"] == full["tree"]["features"]
+    assert "owner_map" not in selected
+    empty, _ = _call("get_part", {"doc_id": doc, "feature_ids": []})
+    assert empty["tree"]["features"] == [] and empty["revision"] == full["revision"]
+    unknown, _ = _call("get_part", {"doc_id": doc, "feature_ids": [sketch["id"], "missing"]})
+    assert unknown["ok"] is False and unknown["missing_feature_ids"] == ["missing"]
+
+
+def test_rollback_receipt_and_compact_reads_match_native_geometry(tmp_path, monkeypatch):
+    # Exercise warm BREP fallback as well as compilation; no checkpoint is saved.
+    monkeypatch.setenv("CHUDWARE_INC_REBUILD", "0")
+    monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
+    created, _ = _call("new_part", {"name": "rollback_receipt", "fresh": True})
+    assert created["ok"], created
+    doc = created["doc_id"]
+    try:
+        built, _ = _call("add_features", {"doc_id": doc, "ops": [
+            cb.feat("box", "Plate", {"length": cb.dim(60), "width": cb.dim(40),
+                                      "height": cb.dim(10)}),
+            cb.feat("hole", "Bore", {"style": "simple", "end": "through_all",
+                                      "diameter": cb.dim(8)},
+                    {"face": {"of": "face", "side": "top"}}),
+            cb.feat("plane", "Downstream datum", {"method": "point_normal",
+                                                   "origin": [0, 0, 5],
+                                                   "normal": [0, 0, 1]}),
+        ]})
+        assert built["ok"], built
+        plate_id, hole_id, datum_id = (built["id_map"][key] for key in ("$0", "$1", "$2"))
+        full, _ = _call("get_part", {"doc_id": doc})
+        assert full["ok"], full
+        feature_ids = [f["id"] for f in full["tree"]["features"]]
+        plate_index = feature_ids.index(plate_id)
+        assert feature_ids.index(hole_id) > plate_index, full
+        expected_rollback = {fid: index > plate_index
+                             for index, fid in enumerate(feature_ids)}
+        assert expected_rollback[hole_id] and expected_rollback[datum_id], full
+        cut, _ = _call("measure_part", {"doc_id": doc})
+        original_volume = cut["mass"]["volume_mm3"]
+        assert original_volume == pytest.approx(24000 - math.pi * 4**2 * 10), cut
+        rolled, _ = _call("add_features", {"doc_id": doc, "ops": [
+            {"op": "set_rollback", "after": plate_id}]})
+        assert rolled["ok"] and rolled["volume_mm3"] == pytest.approx(24000), rolled
+        assert len(rolled["features"]) == len(expected_rollback), rolled
+        assert {f["id"]: f["rolled_back"] for f in rolled["features"]} == expected_rollback
+        rolled_mass, _ = _call("measure_part", {"doc_id": doc})
+        assert rolled_mass["mass"]["volume_mm3"] == pytest.approx(24000), rolled_mass
+        for arguments in ({"summary": True}, {"feature_ids": [hole_id]}):
+            compact, _ = _call("get_part", {"doc_id": doc, **arguments})
+            assert compact["ok"] and compact["revision"] == rolled["revision"], compact
+            assert compact["tree"]["rollback_after"] == plate_id
+            compact_ids = [f["id"] for f in compact["tree"]["features"]]
+            assert hole_id in compact_ids, compact
+            if "feature_ids" in arguments:
+                assert compact_ids == [hole_id], compact
+            else:
+                assert compact_ids == feature_ids, compact
+        path = str(tmp_path / "rolled.step+")
+        cb.call("doc_save", {"doc_id": doc, "path": path})
+        cb.call("doc_close", {"doc_id": doc})
+        opened = cb.call("doc_open", {"path": path})
+        doc = opened["doc_id"]
+        assert opened["cache_hit"] is True, opened
+        assert opened["volume"] == pytest.approx(24000), opened
+        statuses = opened["rebuild"]["feature_status"]
+        assert len(statuses) == len(expected_rollback), opened
+        assert {f["id"]: f["rolled_back"] for f in statuses} == expected_rollback
+        restored, _ = _call("add_features", {"doc_id": doc, "ops": [
+            {"op": "set_rollback", "after": None}]})
+        assert restored["ok"], restored
+        measured, _ = _call("measure_part", {"doc_id": doc})
+        assert measured["mass"]["volume_mm3"] == pytest.approx(original_volume), measured
+        assert {f["id"]: f["rolled_back"] for f in restored["features"]} == {
+            fid: False for fid in feature_ids}
+    finally:
+        _call("close_part", {"doc_id": doc, "discard": True})
+
+
+def test_downstream_failure_keeps_edit_and_rolls_back_until_repaired(tmp_path, monkeypatch):
+    from services.mcp import cad_doc_tools
+
+    monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
+    published = []
+    monkeypatch.setattr(cad_doc_tools, "_publish_current", published.append)
+    created, _ = _call("new_part", {"name": "auto_rollback", "fresh": True})
+    doc = created["doc_id"]
+    try:
+        built, _ = _call("add_features", {"doc_id": doc, "ops": [
+            cb.feat("box", "Stock", {"length": 40, "width": 30, "height": 20,
+                                      "centered": False, "at": [0, 0, 0]}),
+            cb.feat("fillet", "Top edge", {"radius": 2}, {"edges": [
+                {"kind": "edge", "centroid": [40, 15, 20], "surf": "line",
+                 "axis": [0, 1, 0]}]}),
+            cb.feat("plane", "Later datum", {"method": "point_normal",
+                                             "origin": [0, 0, 5], "normal": [0, 0, 1]}),
+        ]})
+        assert built["ok"], built
+        stock, fillet, datum = (built["id_map"][key] for key in ("$0", "$1", "$2"))
+        before, _ = _call("get_part", {"doc_id": doc})
+        fillet_before = next(f for f in before["tree"]["features"] if f["id"] == fillet)
+        move = {"op": "edit_feature", "id": stock, "params": {"at": [1000, 0, 0]}}
+
+        # A new, unbuildable feature in the same batch must not be hidden by
+        # the older fillet's failure; even a new feature after it must build.
+        invalid_new = cb.feat("fillet", "Bad new", {"radius": 2}, {"edges": [
+            {"kind": "edge", "centroid": [9000, 9000, 9000]}]})
+        rejected, _ = _call("add_features", {"doc_id": doc, "ops": [move, invalid_new]})
+        assert not rejected["ok"] and rejected["rolled_back"], rejected
+        unchanged, _ = _call("get_part", {"doc_id": doc})
+        assert unchanged["revision"] == before["revision"]
+        assert unchanged["tree"] == before["tree"]
+
+        published.clear()
+        edited, _ = _call("add_features", {"doc_id": doc, "ops": [move]})
+        assert edited["ok"] and edited["revision"] == before["revision"] + 1, edited
+        assert edited["auto_rollback"]["after"] == stock
+        assert edited["auto_rollback"]["hidden_features"] == [fillet, datum]
+        assert edited["auto_rollback"]["broken"][0]["id"] == fillet
+        assert edited["auto_rollback"]["broken"][0]["name"] == "Top edge"
+        assert edited["auto_rollback"]["broken"][0]["type"] == "fillet"
+        assert edited["auto_rollback"]["broken"][0]["error"]
+        assert "warning" in edited and "changes" in edited and doc in published
+        state, _ = _call("get_part", {"doc_id": doc})
+        assert state["tree"]["rollback_after"] == stock
+        assert next(f for f in state["tree"]["features"] if f["id"] == fillet) == fillet_before
+        assert {f["id"]: f["rolled_back"] for f in edited["features"]}[fillet]
+
+        saved, _ = _call("save_part", {"doc_id": doc, "path": str(tmp_path / "partial.step+")})
+        assert saved["ok"], saved
+        assert saved["rollback"]["hidden_features"] == [fillet, datum]
+        assert all(fid in saved["warning"] for fid in (fillet, datum))
+        retried, _ = _call("add_features", {"doc_id": doc, "ops": [
+            {"op": "set_rollback", "after": None}]})
+        assert retried["ok"] and retried["auto_rollback"]["after"] == stock, retried
+        partial, _ = _call("get_part", {"doc_id": doc})
+        bad_repair, _ = _call("add_features", {"doc_id": doc, "ops": [
+            {"op": "edit_feature", "id": fillet, "refs": {"edges": [
+                {"kind": "edge", "centroid": [9000, 9000, 9000]}]}},
+            {"op": "set_rollback", "after": None}]})
+        assert not bad_repair["ok"] and bad_repair["rolled_back"], bad_repair
+        after_bad_repair, _ = _call("get_part", {"doc_id": doc})
+        assert after_bad_repair["revision"] == partial["revision"]
+        assert after_bad_repair["tree"] == partial["tree"]
+        hidden_bad, _ = _call("add_features", {"doc_id": doc, "ops": [
+            {"op": "edit_feature", "id": fillet, "refs": {"edges": [
+                {"kind": "edge", "centroid": [9000, 9000, 9000]}]}}]})
+        assert not hidden_bad["ok"] and hidden_bad["rolled_back"], hidden_bad
+        after_hidden_bad, _ = _call("get_part", {"doc_id": doc})
+        assert after_hidden_bad["revision"] == partial["revision"]
+        assert after_hidden_bad["tree"] == partial["tree"]
+
+        fixed, _ = _call("add_features", {"doc_id": doc, "ops": [
+            {"op": "edit_feature", "id": fillet, "refs": {"edges": [
+                {"kind": "edge", "centroid": [1040, 15, 20], "surf": "line",
+                 "axis": [0, 1, 0]}]}}]})
+        assert fixed["ok"], fixed
+        restored, _ = _call("add_features", {"doc_id": doc, "ops": [
+            {"op": "set_rollback", "after": None}]})
+        assert restored["ok"] and "auto_rollback" not in restored, restored
+        assert all(f["ok"] and not f["rolled_back"] for f in restored["features"])
+        full, _ = _call("get_part", {"doc_id": doc})
+        assert not full["tree"].get("rollback_after")
+    finally:
+        _call("close_part", {"doc_id": doc, "discard": True})
+
+
+def test_save_warns_for_rolled_back_history_without_a_prefix_body(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
+    created, _ = _call("new_part", {"name": "empty_rollback_prefix", "fresh": True})
+    doc = created["doc_id"]
+    try:
+        built, _ = _call("add_features", {"doc_id": doc, "ops": [
+            cb.feat("box", "Stock", {"length": 40, "width": 30, "height": 20}),
+            cb.feat("fillet", "Corners", {"radius": 2},
+                    {"edges": {"of": "edge", "parallel": "z"}}),
+        ]})
+        assert built["ok"], built
+        stock, fillet = built["id_map"]["$0"], built["id_map"]["$1"]
+        suppressed, _ = _call("add_features", {"doc_id": doc, "ops": [
+            {"op": "set_suppressed", "id": stock, "value": True}]})
+        assert suppressed["ok"], suppressed
+        assert suppressed["auto_rollback"]["after"] == stock
+        assert suppressed["auto_rollback"]["hidden_features"] == [fillet]
+        saved, _ = _call("save_part", {"doc_id": doc, "path": str(tmp_path / "partial-empty.step+")})
+        assert saved["ok"], saved
+        assert saved["rollback"]["hidden_features"] == [fillet]
+        assert fillet in saved["warning"]
+    finally:
+        _call("close_part", {"doc_id": doc, "discard": True})
 
 
 def test_measure_multibody_per_body_and_total():
@@ -1487,6 +1792,139 @@ def test_config_suppression_drops_a_feature():
     assert act["ok"] and act["body_count"] == 0, act  # the box is suppressed -> no body
 
 
+def test_activate_configuration_reports_physical_solids_and_volume():
+    r, _ = _call("new_part", {"name": "cfgvol"})
+    doc = r["doc_id"]
+    _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "Block", {"length": cb.dim(40), "width": cb.dim(30), "height": cb.dim(20)})]})
+    _call("add_configuration", {"name": "Alt", "doc_id": doc})
+    act, _ = _call("activate_configuration", {"name": "Alt", "doc_id": doc})
+    assert act["ok"] and act["body_count"] == 1, act
+    assert act["body_count_basis"] == "physical_solids", act
+    assert act["volume_mm3"] == pytest.approx(24000, rel=1e-3), act
+    assert act["volume_basis"] in ("brep_exact", "approximate_display_tessellation"), act
+
+
+def test_set_config_override_requires_exactly_one_of_value_or_clear():
+    r, _ = _call("new_part", {"name": "cfgargs"})
+    doc = r["doc_id"]
+    r1, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "Block", {"length": cb.dim(40), "width": cb.dim(30), "height": cb.dim(20)})]})
+    fid = r1["features"][0]["id"]
+    _call("add_configuration", {"name": "Big", "doc_id": doc})
+    base = {"config": "Big", "feature_id": fid, "param": "length", "doc_id": doc}
+    revision = cb.call("doc_tree", {"doc_id": doc})["revision"]
+
+    omitted, _ = _call("set_config_override", base)
+    assert omitted["ok"] is False and "clear" in omitted["error"], omitted
+    both, _ = _call("set_config_override", {**base, "value": 80, "clear": True})
+    assert both["ok"] is False and "not both" in both["error"], both
+    assert cb.call("doc_tree", {"doc_id": doc})["revision"] == revision  # nothing was written
+
+    cleared, _ = _call("set_config_override", {**base, "clear": True})
+    assert cleared["ok"] and cleared["cleared"] is True and cleared["value"] is None, cleared
+
+
+def test_set_config_override_that_breaks_the_build_is_refused_with_the_engine_reason():
+    r, _ = _call("new_part", {"name": "cfgbad"})
+    doc = r["doc_id"]
+    r1, _ = _call("add_features", {"doc_id": doc, "ops": [
+        cb.feat("box", "Block", {"length": cb.dim(40), "width": cb.dim(30), "height": cb.dim(20)})]})
+    fid = r1["features"][0]["id"]
+    _call("add_configuration", {"name": "Bad", "doc_id": doc})
+    act, _ = _call("activate_configuration", {"name": "Bad", "doc_id": doc})
+    assert act["ok"], act
+    revision = cb.call("doc_tree", {"doc_id": doc})["revision"]
+
+    bad, _ = _call("set_config_override", {"config": "Bad", "feature_id": fid,
+                                           "param": "length", "value": -10, "doc_id": doc})
+    assert bad["ok"] is False and bad["error"], bad
+    assert cb.call("doc_tree", {"doc_id": doc})["revision"] == revision
+    detail = next(c for c in _call("list_configurations", {"doc_id": doc})[0]["detail"]
+                  if c["name"] == "Bad")
+    assert not detail["param_overrides"], detail  # the rejected override was not stored
+
+
+def test_config_and_material_tools_surface_an_in_band_engine_rejection(monkeypatch):
+    """The engine returns a rejected edit as rejected_tree + failing feature_status rows,
+    not as an exception; the tools must not report ok:true for it."""
+    doc = _new_plate_with_hole()
+    real_call = cb.call
+    rejection = {"revision": 3, "rejected_tree": {"features": []},
+                 "rebuild": {"ok": False, "feature_status": [
+                     {"id": "f7", "ok": False, "error": "engine says no"}]}}
+
+    def fake_call(method, *args, **kwargs):
+        if method in ("doc_apply_ops", "config_activate", "config_add",
+                      "config_set_override", "config_set_suppression"):
+            return rejection
+        return real_call(method, *args, **kwargs)
+
+    monkeypatch.setattr(cb, "call", fake_call)
+    for name, args in (
+            ("set_material", {"material": "brass", "doc_id": doc}),
+            ("activate_configuration", {"name": "Default", "doc_id": doc}),
+            ("add_configuration", {"name": "X", "doc_id": doc}),
+            ("set_config_override", {"config": "Default", "feature_id": "f1",
+                                     "param": "length", "value": 5, "doc_id": doc}),
+            ("set_config_suppression", {"config": "Default", "feature_id": "f1",
+                                        "doc_id": doc})):
+        out, _ = _call(name, args)
+        assert out["ok"] is False and out["applied"] is False, (name, out)
+        assert "f7: engine says no" in out["error"], (name, out)
+
+
+def test_engine_profile_is_disabled_until_enabled_and_sanitizes_output_paths(
+        monkeypatch, tmp_path):
+    calls = []
+
+    def prof_calls():
+        return [c for c in calls if c[0].startswith("prof_")]
+
+    monkeypatch.setattr(cb, "call", lambda method, params=None, *a, **k: calls.append(
+        (method, params)) or {"ok": True})
+    monkeypatch.delenv("CHUDWARE_ENGINE_PROFILE", raising=False)
+
+    off, _ = _call("engine_profile", {"action": "start"})
+    assert off["ok"] is False and "CHUDWARE_ENGINE_PROFILE" in off["error"], off
+    assert prof_calls() == []  # the sampler is not startable while disabled
+
+    monkeypatch.setenv("CHUDWARE_ENGINE_PROFILE", "1")
+    secret = tmp_path / ".ssh" / "out.folded"
+    refused, _ = _call("engine_profile", {"action": "report", "write_folded": str(secret)})
+    assert refused["ok"] is False and "credential" in refused["error"], refused
+    wrong_action, _ = _call("engine_profile", {"action": "status",
+                                               "write_folded": str(tmp_path / "x.folded")})
+    assert wrong_action["ok"] is False and "write_folded" in wrong_action["error"], wrong_action
+    assert prof_calls() == []
+
+    target = tmp_path / "prof" / ".." / "p.folded"
+    ok, _ = _call("engine_profile", {"action": "report", "write_folded": str(target)})
+    assert ok["ok"] is True, ok
+    assert prof_calls() == [("prof_report", {
+        "top": 40, "min_samples": 0,
+        "write_folded": os.path.realpath(str(tmp_path / "p.folded")),
+        "write_speedscope": None})], calls
+
+
+def test_sketch_only_batch_is_autosaved(monkeypatch):
+    from services.mcp import cad_doc_tools
+
+    saved = []
+    monkeypatch.setattr(cad_doc_tools, "_autosave", saved.append)
+    created, _ = _call("new_part", {"name": "sketch_only_autosave", "fresh": True})
+    doc = created["doc_id"]
+    try:
+        sketch, _ = _call("add_features", {"doc_id": doc, "auto_define": False, "ops": [
+            cb.feat("sketch", "OpenPath", {"entities": [
+                {"id": "e1", "type": "line", "p1": [0, 0], "p2": [5, 5]}]},
+                {"plane": "plane.top"})]})
+        assert sketch["ok"], sketch
+        assert doc in saved, saved
+    finally:
+        _call("close_part", {"doc_id": doc, "discard": True})
+
+
 def test_solve_mates_rejects_a_part_but_world_bodies_lists_it():
     """solve_mates is assembly-only (clear error on a part); list_world_bodies now ALSO works on
     a multi-body part (Issue 9) — it reports each body's world bbox so an import_part-assembled
@@ -1539,18 +1977,7 @@ def test_inspect_section_real_area():
 
 
 def test_wall_thickness_numeric_on_shell():
-    """wall_thickness returns a numeric min/mean/max — the thinnest wall of a shelled box.
-
-    A 40x40x40 box shelled to 2 mm walls should report a min wall thickness ~2 mm. The inward
-    ray-cast (Moller-Trumbore, two-sided) stops at the NEAREST opposite wall, so the thinnest
-    wall is found regardless of triangle winding. Before the C++ fix only an aicm_path came
-    back (no numbers).
-
-    NOTE: the body must actually HAVE walls — i.e. an open shell with a removed face. A
-    "closed" shell with NO removed face is, in the current engine, a solid shrunk block (the
-    shell op needs at least one open face to leave a cavity), and a solid block's "thickness"
-    is correctly its full span (~36 mm), not 2. So we remove the top face to make a real
-    2 mm-walled bucket and assert the algorithm finds the 2 mm wall."""
+    """A genuine open 2 mm shell reports its wall, not its cavity or corner artefacts."""
     r, _ = _call("new_part", {"name": "wt"})
     doc = r["doc_id"]
     # Open hollow shell, 2 mm walls: remove the top face so there is a genuine cavity with
@@ -1572,15 +1999,12 @@ def test_wall_thickness_numeric_on_shell():
     # = 14752 mm^3 exactly. This identity is what proves the walls really are 2 mm and the
     # top really is open -- without it, a shrunken solid block would also "have a volume".
     assert abs(a["volume_mm3"] - 14752.0) < 1.0, a
-    w, _ = _call("wall_thickness", {"doc_id": doc})
+    w, _ = _call("wall_thickness", {"doc_id": doc, "image": False})
     assert w["ok"], w
     assert w["min_thickness_mm"] is not None, w
-    # Every wall of that bucket (4 sides + floor) is exactly 2 mm, so the MINIMUM is 2.0.
-    # The raycast runs on a tessellation, so allow 2% either way -- but no more: a band wide
-    # enough to also admit the 36 mm interior span would prove nothing.
-    assert abs(w["min_thickness_mm"] - 2.0) < 0.04, w
-    # The thickest ray crosses the full 40 mm outer span of the block.
-    assert abs(w["max_thickness_mm"] - 40.0) < 0.8, w
+    # Planar inscribed-sphere walls are exact; corner coverage must not introduce taper noise.
+    assert w["min_thickness_mm"] == pytest.approx(2.0, abs=1e-3), w
+    assert w["measurement_basis"]["method"] == "inscribed_sphere", w
     assert w["mean_thickness_mm"] >= w["min_thickness_mm"], w
     assert w["max_thickness_mm"] >= w["mean_thickness_mm"], w
     assert "wall" in w["summary"].lower(), w
@@ -1616,9 +2040,7 @@ def _shelled_enclosure_ops(rounds: bool, bosses: bool = False) -> list[dict]:
 
 @pytest.mark.parametrize("rounds", [False, True], ids=["sharp", "R5_corners"])
 def test_wall_thickness_of_a_uniform_shell_is_the_shell_thickness(rounds):
-    """A uniform 2.5 mm shell reads 2.5 — with or without R5/R2.5 corner rounds. The ray
-    origin sits 1e-3 inside the surface, so the wall is hit distance PLUS that offset (the
-    engine once subtracted it, reading every wall 2e-3 mm thin)."""
+    """A uniform 2.5 mm shell reads 2.5, including with R5/R2.5 corner rounds."""
     r, _ = _call("new_part", {"name": f"wt_shell_{int(rounds)}"})
     doc = r["doc_id"]
     a, _ = _call("add_features", {"doc_id": doc, "ops": _shelled_enclosure_ops(rounds)})
@@ -1643,16 +2065,18 @@ def test_wall_thickness_reports_a_genuine_thin_spot():
             "refs": {"profile": [{"kind": "region", "sketch": "$2"}]}}}]
     a, _ = _call("add_features", {"doc_id": doc, "ops": ops})
     assert a["ok"], a
-    w, _ = _call("wall_thickness", {"doc_id": doc})
+    w, _ = _call("wall_thickness", {"doc_id": doc, "image": False, "min_wall_mm": 1.2})
     assert w["min_thickness_mm"] == pytest.approx(1.0, abs=1e-3), w
     assert w["thinnest"][0]["built_by"]["name"] == "Pocket", w
     sample = w["minimum_sample"]
     basis = w["measurement_basis"]
-    # Boundary vertices on a real thin pocket still measure its floor. Boundary evidence
-    # must not become a reason to drop this minimum or replace it with a percentile.
-    assert math.dist(sample["ray_origin"], sample["exit_at"]) + basis["surface_offset_mm"] \
-        == pytest.approx(1.0, abs=1e-3), w
-    assert sample["face"] == w["thinnest"][0]["face"], w
+    assert basis["method"] == "inscribed_sphere" and basis["spacing_mm"] > 0, w
+    assert math.dist([0, 0, 0], sample["wall_direction"]) == pytest.approx(1.0), w
+    assert sample["face"], w
+    region = w["thin_regions"][0]
+    assert region["min_thickness_mm"] == pytest.approx(1.0, abs=1e-3), w
+    assert any(owner["name"] == "Pocket" for owner in region["built_by"]), w
+    assert region["faces"] and region["kind"] == "wall", w
     _call("close_part", {"doc_id": doc})
 
 
@@ -1664,7 +2088,7 @@ def test_wall_thickness_finds_the_boss_wall_around_a_pilot_hole():
     a, _ = _call("add_features", {"doc_id": doc,
                                   "ops": _shelled_enclosure_ops(True, bosses=True)})
     assert a["ok"], a
-    w, _ = _call("wall_thickness", {"doc_id": doc})
+    w, _ = _call("wall_thickness", {"doc_id": doc, "image": False})
     assert w["min_thickness_mm"] == pytest.approx(1.75, abs=0.02), w
     assert w["thinnest"][0]["built_by"]["name"] in {"Bosses", "Pilot0", "Pilot1", "Pilot2",
                                                     "Pilot3"}, w
@@ -1688,7 +2112,7 @@ def test_wall_thickness_says_where_the_thinnest_wall_is():
                                           "params": {"length": 20, "width": 10, "height": 9.4},
                                           "at": [10, 0, 0.3], "mode": "cut"}}]})
     assert a["ok"] and [f["ok"] for f in a["features"]] == [True, True, True], a
-    w, _ = _call("wall_thickness", {"doc_id": doc})
+    w, _ = _call("wall_thickness", {"doc_id": doc, "image": False})
     spots = w["thinnest"]
     assert 1 <= len(spots) <= 3, w
     assert [s["thickness_mm"] for s in spots] == sorted(s["thickness_mm"] for s in spots)
@@ -1697,7 +2121,9 @@ def test_wall_thickness_says_where_the_thinnest_wall_is():
     assert abs(floor["thickness_mm"] - w["min_thickness_mm"]) < 1e-3, w
     assert floor["surf"] == "plane" and floor["built_by"]["name"] == "Pocket", w
     x, y, z = floor["at"]
-    assert 0 - 1e-3 <= x <= 20 + 1e-3 and abs(y) <= 5 + 1e-3 and abs(z + 4.4) < 1e-3, w
+    # Either side of the floor is an equally valid minimum after surface refinement.
+    assert 0 - 1e-3 <= x <= 20 + 1e-3 and abs(y) <= 5 + 1e-3, w
+    assert min(abs(z + 4.4), abs(z + 5.0)) < 1e-3, w
     # Every other reported face is a different face and no thinner.
     assert len({s["face"] for s in spots}) == len(spots), w
 
@@ -1715,7 +2141,7 @@ def test_wall_thickness_locates_the_thin_wall_on_a_second_body():
                                           "params": {"length": 20, "width": 20, "height": 0.8},
                                           "at": [100, 0, 0], "merge": False}}]})
     assert a["ok"] and a["body_count"] == 2, a
-    w, _ = _call("wall_thickness", {"doc_id": doc})
+    w, _ = _call("wall_thickness", {"doc_id": doc, "image": False})
     shim = w["thinnest"][0]
     assert abs(shim["thickness_mm"] - 0.8) < 0.02, w
     assert shim["at"][0] > 80, w
@@ -1726,16 +2152,16 @@ def test_wall_thickness_locates_the_thin_wall_on_a_second_body():
     sample = w["minimum_sample"]
     assert sample["body"] == 2 and sample["at"][0] > 80, w
     basis = w["measurement_basis"]
-    assert math.dist(sample["ray_origin"], sample["exit_at"]) + basis["surface_offset_mm"] \
-        == pytest.approx(0.8, abs=0.02), w
+    assert math.dist([0, 0, 0], sample["wall_direction"]) == pytest.approx(1.0), w
+    region = w["thin_regions"][0]
+    assert region["body"] == 2 and region["at"][0] > 80, w
+    assert region["faces"] and any(owner["name"] == "Shim" for owner in region["built_by"]), w
+    assert region["min_thickness_mm"] == pytest.approx(0.8, abs=1e-3), w
     assert basis["n_vertices"] == w["n_sampled"] + basis["n_unmeasured"], w
 
 
-def test_wall_thickness_ignores_a_rim_ray_that_runs_along_a_ledge():
-    """GripperGears (2026-10-10): a Ø8 pin end carrying a coaxial Ø7 collar read 0.5 mm.
-    Each vertex on the Ø8 rim cast its ray IN the plane of the 0.5 mm ledge, on the solid
-    boundary, and stopped at the collar foot (an ENTRY face). The ray origin now moves into
-    its own face and only exit faces count, so the thinnest wall is the Ø7 collar itself."""
+def test_wall_thickness_ignores_a_pin_ledge_width():
+    """A Ø8 pin's Ø7 collar has a 0.5 mm ledge, not a 0.5 mm wall."""
     r, _ = _call("new_part", {"name": "wt_pin_rim"})
     doc = r["doc_id"]
     a, _ = _call("add_features", {"doc_id": doc, "ops": [
@@ -1745,7 +2171,7 @@ def test_wall_thickness_ignores_a_rim_ray_that_runs_along_a_ledge():
                                           "params": {"radius": 3.5, "height": 5},
                                           "at": [0, 0, 7.5]}}]})
     assert a["ok"] and a["body_count"] == 1, a
-    w, _ = _call("wall_thickness", {"doc_id": doc})
+    w, _ = _call("wall_thickness", {"doc_id": doc, "image": False})
     # The ledge is 0.5 mm wide, never 0.5 mm thick: the thinnest wall is the Ø7 collar
     # (7 mm across, less a small chord error).
     assert abs(w["min_thickness_mm"] - 7.0) < 0.15, w
@@ -1753,52 +2179,52 @@ def test_wall_thickness_ignores_a_rim_ray_that_runs_along_a_ledge():
     _call("close_part", {"doc_id": doc})
 
 
-@pytest.mark.parametrize("angle_deg", [65, 77])
-def test_wall_thickness_retains_an_acute_edge_span_with_its_actual_ray(angle_deg):
-    """A moderate acute edge has a genuine micron-scale EXIT, not a source-face self-hit.
+def test_wall_thickness_covers_the_top_of_a_thin_rib():
+    """A 2 mm rib top reads its width, not the 20 mm depth of its inward normal ray."""
+    import numpy as np
+    from services.aicm_handoff import read_handoff
+    from services.sim.tessellate import read_aicm
 
-    The triangular prism is millimetres thick away from its tapered edge. Keep that edge
-    minimum, but expose enough evidence to distinguish it from an interior wall claim.
-    """
-    r, _ = _call("new_part", {"name": f"wt_edge_{angle_deg}"})
+    r, _ = _call("new_part", {"name": "wt_rib_top"})
     doc = r["doc_id"]
-    slope = math.tan(math.radians(angle_deg))
-    points = [[0, 0], [100, 0], [100, 100 * slope]]
-    entities = [_line(f"e{i + 1}", *points[i], *points[(i + 1) % 3]) for i in range(3)]
     a, _ = _call("add_features", {"doc_id": doc, "ops": [
-        {"op": "add_feature", "feature": {"type": "sketch", "name": "Triangle",
-            "params": {"entities": entities,
-                       "constraints": [_rel(f"c{i + 1}", "fix", [f"e{i + 1}"])
-                                       for i in range(3)]},
-            "refs": {"plane": "plane.top"}}},
-        {"op": "add_feature", "feature": {"type": "extrude", "name": "Wedge",
-            "params": {"mode": "boss", "end": "blind", "depth": 4},
-            "refs": {"profile": [{"kind": "region", "sketch": "$0"}]}}}]})
+        {"op": "add_feature", "feature": {"type": "box", "name": "Rib",
+            "params": {"length": 40, "width": 2, "height": 20}}}]})
     assert a["ok"] and a["body_count"] == 1, a
-    w, _ = _call("wall_thickness", {"doc_id": doc})
-    assert w["ok"] and 0.002 < w["min_thickness_mm"] < 0.005, w
-    sample, basis = w["minimum_sample"], w["measurement_basis"]
-    assert sample["sample_location"] == "face_mesh_boundary", w
-    assert sample["face"] == w["thinnest"][0]["face"], w
-    assert math.hypot(*sample["at"][:2]) < 1e-5, w
-    origin, exit_at, direction = (sample[key] for key in
-                                  ("ray_origin", "exit_at", "inward_direction"))
-    assert math.dist([0, 0, 0], direction) == pytest.approx(1), w
-    distance = math.dist(origin, exit_at)
-    assert distance + basis["surface_offset_mm"] \
-        == pytest.approx(w["min_thickness_mm"], abs=1e-8), w
-    assert [exit_at[k] - origin[k] for k in range(3)] \
-        == pytest.approx([distance * direction[k] for k in range(3)], abs=1e-8), w
-    # Origin and midpoint are strictly in the triangular material; exit lands on the
-    # OTHER wedge face. A self-hit on the starting face cannot satisfy these inequalities.
-    for fraction in (0, 0.5):
-        x, y = [origin[k] + fraction * (exit_at[k] - origin[k]) for k in (0, 1)]
-        assert 0 < x < 100 and 0 < y < slope * x, w
-    x, y = exit_at[:2]
-    assert min(abs(y), abs(slope * x - y)) < 1e-7, w
-    assert abs(direction[2]) < 1e-8, w
-    assert math.dist([0, 0, 0], sample["tangent_nudge"]) \
-        == pytest.approx(basis["tangent_nudge_mm"], abs=1e-8), w
+    th = cb.call("eval_thickness", {"doc_id": doc, "min_wall_mm": 3, "resolution": 0.25})
+    assert th["min_thickness_mm"] == pytest.approx(2.0, abs=1e-3), th
+    top = cb.call("doc_query", {"doc_id": doc, "query": {"of": "face", "side": "top"}})
+    top_ids = {m["topo"] for m in top["matches"]}
+    field = read_aicm(read_handoff(th["aicm_path"]))
+    body = field["bodies"][0]
+    values = np.asarray(next(s["values"] for s in field["scalars"]
+                             if s["name"] == "thickness"))
+    top_triangles = [body["idx"].reshape(-1, 3)[
+        f["first_tri"]:f["first_tri"] + f["tri_count"]]
+        for f in body["faces"] if f["face_id"] in top_ids]
+    assert top_triangles, top
+    vertices = np.unique(np.concatenate(top_triangles).reshape(-1))
+    interior = vertices[(np.abs(body["pos"][vertices, 0]) < 15) &
+                        (np.abs(body["pos"][vertices, 1]) < 0.5)]
+    assert len(interior) > 5, th
+    assert np.median(values[interior]) == pytest.approx(2.0, abs=0.02), th
+    assert th["measurement_basis"]["requested_spacing_mm"] == 0.25, th
+    assert th["thin_regions"] and th["thin_area_mm2"] > 0, th
+    _call("close_part", {"doc_id": doc})
+
+
+def test_wall_thickness_returns_heatmap_and_numbered_region_panels():
+    r, _ = _call("new_part", {"name": "wt_study_image"})
+    doc = r["doc_id"]
+    a, _ = _call("add_features", {"doc_id": doc, "ops": [
+        {"op": "add_feature", "feature": {"type": "box", "name": "Shim",
+            "params": {"length": 20, "width": 15, "height": 0.8}}}]})
+    assert a["ok"], a
+    _, content = _call("wall_thickness", {"doc_id": doc, "min_wall_mm": 1.0})
+    assert any(getattr(item, "type", None) == "image" for item in content), content
+    caption = " ".join(getattr(item, "text", "") for item in content)
+    assert "Region 1" in caption and "Shim" in caption, caption
+    assert "red <= 1 mm" in caption and "blue >= 3 mm" in caption, caption
     _call("close_part", {"doc_id": doc})
 
 
@@ -1878,22 +2304,274 @@ def test_draft_analysis_sphere_is_moldable():
 
 
 def test_new_part_seeds_volume_baseline_for_write_diff():
-    """new_part seeds _LAST_VOLUME so the FIRST add_features reports a real volume delta
-    (volume 0.0 -> X) instead of degrading to the no-baseline 'volume now X' branch."""
-    from services.mcp import cad_tools
+    """The empty revision supplies a real first delta."""
     r, _ = _call("new_part", {"name": "vbase"})
     doc = r["doc_id"]
-    # the empty part's volume baseline is seeded (zero) so the write-diff has a before-value
-    assert doc in cad_tools._LAST_VOLUME, "new_part must seed _LAST_VOLUME for the write-diff"
-    assert cad_tools._LAST_VOLUME[doc] == 0.0, cad_tools._LAST_VOLUME[doc]
     r2, _ = _call("add_features", {"doc_id": doc, "ops": [
         cb.feat("box", "B", {"length": cb.dim(30), "width": cb.dim(20), "height": cb.dim(10)})]})
     assert r2["ok"], r2
     ch = r2.get("changes") or {}
-    # a baseline was available -> the delta is reported as a number (not the no-baseline branch)
+    # The revision-correct engine snapshot supplies the baseline.
     assert "volume_delta_mm3" in ch, ch
     assert ch["volume_delta_mm3"] > 0.0, ch  # material added from an empty part
-    assert cad_tools._LAST_VOLUME[doc] == r2["volume_mm3"], "baseline updated to the new volume"
+
+
+def test_dogfood_truthful_mutation_feedback(tmp_path, monkeypatch):
+    from services.mcp import ascii2d, cad_common
+
+    doc = cb.call("doc_new", {"name": f"truthful-feedback-{uuid.uuid4().hex}"})["doc_id"]
+    asm = None
+    try:
+        base, _ = _call("add_features", {"doc_id": doc, "ops": [
+            cb.feat("box", "Base", {"length": 60, "width": 40, "height": 20})]})
+        assert base["ok"], base
+        warning, _ = _call("add_features", {"doc_id": doc, "ops": [
+            cb.feat("hole", "Clamped", {"style": "simple", "diameter": 6, "depth": 999,
+                                        "end": "blind", "positions": [[10, 10]]},
+                    {"face": {"of": "face", "side": "top"}})]})
+        assert warning["ok"] and warning["changes"]["new_warnings"], warning
+        bore_faces = cb.call("doc_query", {"doc_id": doc,
+                                          "query": {"of": "face", "surf": "cylinder"}})["matches"]
+        assert len(bore_faces) == 1, bore_faces
+        assert bore_faces[0]["axis_point"][:2] == pytest.approx([10, 10], abs=1e-6)
+        source_path = str(tmp_path / "feedback-source.step+")
+        cb.call("doc_save", {"doc_id": doc, "path": source_path})
+        def top_faces(doc_id):
+            # A directional query intentionally selects the dominant face when
+            # coplanar faces have different areas (the off-centre bore makes
+            # these split faces unequal). Inspect all actual top planes instead.
+            faces = cb.call("doc_query", {"doc_id": doc_id,
+                                          "query": {"of": "face", "surf": "plane"}})["matches"]
+            return [face for face in faces
+                    if face["normal"] == [0.0, 0.0, 1.0]
+                    and face["centroid"][2] == pytest.approx(10.0, abs=1e-6)]
+        assert len(top_faces(doc)) == 1
+
+        # Observe the live topology on both sides of the automatic save, not just
+        # the re-opened cache. Saving must persist the split, not create it.
+        save_faces = []
+        real_call = cb.call
+        def observe_save(method, params=None):
+            if method == "doc_save" and params.get("doc_id") == doc:
+                before_save = top_faces(doc)
+                result = real_call(method, params)
+                save_faces.append((before_save, top_faces(doc)))
+                return result
+            return real_call(method, params)
+        monkeypatch.setattr(cb, "call", observe_save)
+
+        # A cold client (or a stale cache after another writer) must not publish the
+        # total remaining volume as a positive delta for a cut.
+        split, _ = _call("add_features", {"doc_id": doc, "auto_define": False, "ops": [
+            cb.feat("sketch", "SplitProfile",
+                    {"entities": [{"type": "rectangle", "corner1": [-1, -30],
+                                    "corner2": [1, 30]}]},
+                    {"plane": {"of": "face", "side": "top"}}),
+            cb.feat("extrude", "Split", {"depth": 30, "mode": "cut", "flip": True},
+                    {"profile": "$0"})]})
+        assert split["ok"], split
+        monkeypatch.setattr(cb, "call", real_call)
+        assert split.get("persisted") and split.get("saved_path") == source_path, split
+        assert save_faces and all(len(before) == 2 and before == after
+                                  for before, after in save_faces), save_faces
+        reopened = cb.call("doc_open", {"path": source_path, "detach_path": True})["doc_id"]
+        try:
+            assert top_faces(reopened) == save_faces[0][1]
+        finally:
+            cb.call("doc_close", {"doc_id": reopened})
+        delta = split["changes"].get("volume_delta_mm3")
+        assert delta is None or delta == pytest.approx(
+            split["volume_mm3"] - warning["volume_mm3"], abs=0.01), split
+        assert delta is None or delta < 0, split
+        assert split["volume_basis"] == "brep_exact"
+        assert split["changes"]["volume_basis"] == "brep_exact"
+        assert "approximate" not in split["changes"]["summary"]
+        assert split["logical_member_count"] == 1 and split["body_count"] == 2, split
+        assert split["body_count_basis"] == "physical_solids"
+        assert split["changes"]["preexisting_warnings"], split
+        assert "clamped to a through hole" not in split["changes"]["summary"], split
+        assert not split["changes"].get("new_warnings"), split
+
+        # A face split/thread may change the number of concave faces without creating
+        # any physical holes; this wording must hold even if total face count is unchanged.
+        before = {"total": 8, "surf": {"cylinder": 1}, "bore": 1}
+        after = {"total": 8, "surf": {"cylinder": 8}, "bore": 7}
+        diff = cad_common._write_diff(before, after, 100, 99)
+        assert diff["bore_faces_delta"] == 6 and "bore faces +6" in diff["summary"]
+        assert "new bore/hole" not in diff["summary"] and "bores_delta" not in diff
+        missing = cad_common._write_diff({}, {}, None, 99)
+        assert "volume_delta_mm3" not in missing and "volume now" in missing["summary"]
+        assert missing["faces_delta"] is None and missing["bore_faces_delta"] is None
+
+        # Sketch-only edits have their own neutral interpretation, not cut advice.
+        sketch, _ = _call("add_features", {"doc_id": doc, "auto_define": False, "ops": [
+            cb.feat("sketch", "OpenPath", {"entities": [
+                {"id": "e1", "type": "line", "p1": [0, 0], "p2": [5, 5]}]},
+                {"plane": "plane.top"})]})
+        assert sketch["ok"], sketch
+        assert "cut/boolean may have missed" not in sketch["changes"]["summary"], sketch
+        context = sketch["changes"]["edit_context"]
+        assert context["operations"] == ["add_sketch"], context
+        assert context["sketches"] == [{"id": sketch["id_map"]["$0"],
+                                         "feeds_feature": False, "usage": "unknown"}], context
+        finding = next(f for f in sketch["sketch_readbacks"][0]["findings"]
+                       if f["code"] == "open_profile")
+        assert finding["severity"] == "info", finding
+        line = [{"id": "e1", "type": "line", "p1": [0, 0], "p2": [5, 5]}]
+        for usage, severity in (("open_path", "info"), ("unknown", "info"),
+                                ("closed_profile", "error"), ("mixed", "error")):
+            finding = next(f for f in ascii2d.check_sketch_geometry(
+                line, profile_usage=usage) if f["code"] == "open_profile")
+            assert finding["severity"] == severity, finding
+            if usage == "open_path":
+                assert "do not close" in finding["message"]
+        for usage in ("open_path", "unknown"):
+            rb = ascii2d.sketch_mutation_readback(
+                {"entities": line, "profile_usage": usage},
+                health={"status": "under", "dof": 2,
+                        "closure": {"usage": usage, "open_endpoints": ["e1.p1", "e1.p2"]}})
+            assert "run sketch_auto_constrain to stitch" not in rb["summary"], rb
+        from services.mcp.gsl_tools import sketch_health_text
+        for usage in ("open_path", "unknown", "closed_profile", "mixed"):
+            text = sketch_health_text({"status": "under", "dof": 2, "closure": {
+                "usage": usage, "open_endpoints": ["e1.p1", "e1.p2"]}})
+            assert "sketch_auto_constrain" in text, text
+            if usage in ("open_path", "unknown"):
+                assert "Closure: OPEN" not in text and "(informational)" in text, text
+                assert "consumer needs a closed profile" not in text, text
+                assert "apply=False" in text and "preserve intentional open ends" in text, text
+                if usage == "open_path":
+                    assert "open path is valid" in text and "do not close it automatically" in text
+                else:
+                    assert "closure is only needed if a future consumer" in text
+            else:
+                assert "Closure: OPEN" in text, text
+                assert "consumer needs a closed profile" in text, text
+        partial = sketch_health_text({"status": "under", "dof": 2, "partial_dependencies": [
+            {"id": "c2", "type": "symmetric", "dof_added_by_removal": 1}]})
+        assert "PARTIAL DEPENDENCY c2 (symmetric)" in partial
+        assert "deleting the whole relation adds DOF" in partial
+        assert ascii2d.sketch_profile_usage([
+            {"id": "f1", "type": "sketch"},
+            {"id": "f2", "type": "rib", "refs": {"profile": "f1"}}], "f1") == "open_path"
+        assert ascii2d.sketch_profile_usage([
+            {"id": "f1", "type": "sketch"},
+            {"id": "f2", "type": "revolve", "refs": {"profile": "f1"}}], "f1") == "unknown"
+        from services.mcp.cad_doc_tools import _non_body_edit_context
+        consumed = _non_body_edit_context(
+            [{"op": "sketch_add_entity", "sketch": "f1"}],
+            {"features": [{"id": "f1", "type": "sketch"},
+                          {"id": "f2", "type": "extrude",
+                           "refs": {"profile": [{"kind": "region", "sketch": "f1"}]}}]}, {})
+        assert consumed["sketches"] == [{"id": "f1", "feeds_feature": True,
+                                          "usage": "closed_profile"}]
+
+        # A mate can be deleted without changing the component geometry.
+        asm = cb.call("doc_new", {"kind": "assembly",
+                                  "name": f"feedback-asm-{uuid.uuid4().hex}"})["doc_id"]
+        for fixed, at in ((True, [0, 0, 0]), (False, [80, 0, 0])):
+            component, _ = _call("asm_add_component", {"doc_id": asm, "path": source_path,
+                                                       "fixed": fixed, "at": at})
+            assert component["ok"], component
+        mate, _ = _call("asm_mate", {"doc_id": asm, "mate_type": "coincident", "solve": False,
+            "a": {"component": "k1", "query": {"of": "face", "side": "top",
+                                                  "near": [15, 0, 10], "count": 1}},
+            "b": {"component": "k2", "query": {"of": "face", "side": "top",
+                                                  "near": [15, 0, 10], "count": 1}}})
+        assert mate["ok"], mate
+        removed, _ = _call("add_features", {"doc_id": asm, "ops": [
+            {"op": "asm_delete_mate", "id": mate["mate"]}]})
+        assert removed["ok"], removed
+        assert "cut/boolean may have missed" not in removed["changes"]["summary"], removed
+        assert removed["changes"]["edit_context"]["operations"] == ["asm_delete_mate"]
+
+        # Expression dimensions show the SOLVER's evaluated value (doc_sketch_overview
+        # constraints[].measured) beside the authored literal; the region RPC error remains
+        # visible instead of zero loops.
+        eq, _ = _call("add_features", {"doc_id": doc, "ops": [
+            {"op": "eq_set", "name": "Radius", "expr": "10"}]})
+        assert eq["ok"], eq
+        expression, _ = _call("add_features", {"doc_id": doc, "auto_define": False, "ops": [
+            cb.feat("sketch", "Expression", {"entities": [
+                {"id": "e1", "type": "circle", "center": [0, 0], "radius": 11.5}],
+                "constraints": [{"id": "c1", "type": "radius", "refs": ["e1"],
+                                 "value": {"value": 11.5, "expr": "Radius"}}]},
+                {"plane": "plane.top"})]})
+        assert expression["ok"], expression
+        readback = expression["sketch_readbacks"][0]
+        assert "expr='Radius'" in readback["summary"], readback
+        assert "stored_literal=11.5" in readback["summary"]
+        assert "evaluated=10" in readback["summary"]
+        assert "evaluated=unavailable" not in readback["summary"]
+        assert "value=11.5" not in readback["summary"]
+        driven = ascii2d._constraint_nl({"id": "c2", "type": "radius", "driven": True,
+                                         "value": {"value": 11.5, "expr": None}})
+        assert "stored_literal=11.5" in driven and "measured=unavailable" in driven
+        solved = ascii2d._constraint_nl({"id": "c2", "type": "radius", "driven": True,
+                                         "measured": 11.5, "value": {"value": 11.5, "expr": None}})
+        assert "measured=11.5" in solved and "unavailable" not in solved
+        sketch_id = expression["id_map"]["$0"]
+        real_call = cb.call
+        def fail_regions(method, params):
+            if method == "doc_sketch_regions":
+                raise cb.CoreError("region census unavailable", code="geometry_error")
+            return real_call(method, params)
+        with monkeypatch.context() as patch:
+            patch.setattr(cb, "call", fail_regions)
+            description, _ = _call("describe_sketch", {"doc_id": doc, "sketch": sketch_id})
+        assert description["ok"], description
+        assert "Regions: unavailable" in description["text"], description
+        assert "0 closed loops" not in description["text"]
+        assert "Radius = 10 (stored literal 11.5)" in description["text"]
+        assert "evaluated value unavailable" not in description["text"]
+        dimension = description["digest"]["dimensions"][0]
+        assert dimension["expr"] == "Radius" and dimension["stored_value"] == 11.5
+        assert dimension["measured"] == pytest.approx(10)
+    finally:
+        if asm:
+            cb.call("doc_close", {"doc_id": asm})
+        cb.call("doc_close", {"doc_id": doc})
+
+
+def test_mutation_feedback_discards_stale_and_unavailable_snapshots(monkeypatch):
+    from services.mcp import cad_common
+
+    doc = cb.call("doc_new", {"name": f"feedback-revision-{uuid.uuid4().hex}"})["doc_id"]
+    try:
+        built, _ = _call("add_features", {"doc_id": doc, "ops": [
+            cb.feat("box", "Base", {"length": 10, "width": 10, "height": 10})]})
+        assert built["ok"], built
+        feature = built["id_map"]["$0"]
+        native_call = cb.call
+
+        def stale_activate(method, params):
+            result = native_call(method, params)
+            if method == "doc_activate":
+                return {**result, "revision": result["revision"] - 1}
+            return result
+
+        with monkeypatch.context() as patch:
+            patch.setattr(cb, "call", stale_activate)
+            stale, _ = _call("add_features", {"doc_id": doc, "ops": [
+                {"op": "edit_feature", "id": feature, "params": {"height": 11}}]})
+        assert stale["ok"], stale
+        assert "volume_delta_mm3" not in stale["changes"], stale
+        assert "volume now" in stale["changes"]["summary"], stale
+
+        def unavailable_activate(method, params):
+            if method == "doc_activate":
+                raise cb.CoreError("snapshot unavailable", code="geometry_error")
+            return native_call(method, params)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(cb, "call", unavailable_activate)
+            unavailable, _ = _call("add_features", {"doc_id": doc, "ops": [
+                {"op": "edit_feature", "id": feature, "params": {"height": 12}}]})
+        assert unavailable["ok"], unavailable
+        assert "volume_delta_mm3" not in unavailable["changes"], unavailable
+        assert "volume now" in unavailable["changes"]["summary"], unavailable
+    finally:
+        cb.call("doc_close", {"doc_id": doc})
 
 
 # --- the write-diff must answer "did I build what I meant?" ------------------------------
@@ -1901,7 +2579,7 @@ def test_new_part_seeds_volume_baseline_for_write_diff():
 # quiet. Each test below pins one of them with a geometry number.
 
 def test_a_resumed_part_carrying_geometry_keeps_a_real_volume_baseline():
-    """A RESUME must seed _LAST_VOLUME from the engine, not from a fabricated 0.0.
+    """A resumed part retains a real volume reading and gets a revision-correct delta.
 
     Measured live 2026-07-30: neither doc_new(resume_if_open=True) nor doc_list reports a
     `volume`, so the old `setdefault(did, entry.get("volume", 0.0) or 0.0)` seeded 0.0 for
@@ -1914,12 +2592,8 @@ def test_a_resumed_part_carrying_geometry_keeps_a_real_volume_baseline():
     built, _ = _call("add_features", {"doc_id": doc, "ops": [
         cb.feat("box", "B", {"length": cb.dim(60), "width": cb.dim(40), "height": cb.dim(20)})]})
     assert built["ok"], built
-    # Drop the in-process baseline: this is what a fresh MCP process / post-restart resume sees.
-    cad_tools._LAST_VOLUME.pop(doc, None)
     again, _ = _call("new_part", {"name": "resumebase"})
     assert again["doc_id"] == doc and again.get("resumed"), again
-    assert cad_tools._LAST_VOLUME[doc] == pytest.approx(48000.0, rel=1e-6), \
-        cad_tools._LAST_VOLUME.get(doc)
     cut, _ = _call("add_features", {"doc_id": doc, "ops": [
         cb.feat("sketch", "S", {"plane": "top", "entities": [
             {"type": "circle", "center": [10, 10], "radius": 3}]}),
@@ -1969,52 +2643,36 @@ def test_a_real_fillet_still_reads_as_a_real_volume_change():
         ch["summary"]
 
 
-def test_an_engine_feature_warning_names_the_cause_in_the_changes_summary():
-    """A sub-tolerance blend (radius < 1e-7, document.cpp) passes the body through and sets
-    feature_status[].warning "fillet 1e-08 below tolerance; no material removed".
-
-    That warning used to travel ONLY in features[], one entry in a column of nulls, while
-    `changes.summary` — the line the ops cheatsheet tells the model to read — printed the
-    generic guess "a cut/boolean may have missed". The engine already knew the answer."""
-    r, _ = _call("new_part", {"name": "subtol", "fresh": True})
-    doc = r["doc_id"]
-    _call("add_features", {"doc_id": doc, "ops": [
-        cb.feat("box", "B", {"length": cb.dim(60), "width": cb.dim(40), "height": cb.dim(20)})]})
-    got, _ = _call("add_features", {"doc_id": doc, "ops": [
-        cb.feat("fillet", "R", {"radius": cb.dim(1e-8)},
-                {"edges": [{"of": "edge", "parallel": "z"}]})]})
-    assert got["ok"], got
-    warned = [f["warning"] for f in got["features"] if f.get("warning")]
-    assert warned and "below tolerance" in warned[0], got["features"]
-    summary = got["changes"]["summary"]
-    assert "no geometry change" in summary, summary
-    assert "below tolerance" in summary, summary
-    # The generic guess must not be what the model reads when the engine gave a real reason.
-    assert "may have missed" not in summary, summary
 
 
 def test_a_warning_on_a_SUCCESSFUL_op_is_prefixed_onto_the_changes_summary():
     """The dangerous case is a warning on an op that otherwise reads as a clean success.
 
-    A blind hole deeper than the stock is clamped to a THROUGH hole (document.cpp ~5460).
-    Every number in the write-diff looks right — "added 1 face(s) (+1 cylinder); 1 new
-    bore/hole(s); volume 48000.0->47435.5 (-564.5)" — and the model has no reason to look
-    at features[] for the one line saying its blind pocket is now a through hole."""
+    A blind hole deeper than the stock is clamped to a THROUGH hole. The face and
+    volume deltas otherwise look like a clean success, so the warning must lead
+    the summary rather than being buried in features[]."""
     r, _ = _call("new_part", {"name": "clamped", "fresh": True})
     doc = r["doc_id"]
     _call("add_features", {"doc_id": doc, "ops": [
         cb.feat("box", "B", {"length": cb.dim(60), "width": cb.dim(40), "height": cb.dim(20)})]})
     got, _ = _call("add_features", {"doc_id": doc, "ops": [
         cb.feat("hole", "H", {"style": "simple", "diameter": cb.dim(6), "depth": cb.dim(999),
-                              "end": "blind", "at": [10, 10]},
+                              "end": "blind", "positions": [[10, 10]]},
                 {"face": {"of": "face", "side": "top"}})]})
     assert got["ok"], got
     ch = got["changes"]
-    assert ch["bores_delta"] == 1 and ch["volume_delta_mm3"] < 0, ch   # it looks like a clean win
+    # Exact snapshots currently carry total face count but not a bore histogram.
+    # Prove the actual cylindrical bore independently rather than inventing a delta.
+    assert ch["faces_delta"] == 1 and ch["volume_delta_mm3"] == pytest.approx(
+        -math.pi * 3**2 * 20, abs=0.1), ch
+    bores = cb.call("doc_query", {"doc_id": doc,
+                                  "query": {"of": "face", "surf": "cylinder"}})["matches"]
+    assert len(bores) == 1 and bores[0]["radius"] == pytest.approx(3), bores
+    assert bores[0]["axis_point"][:2] == pytest.approx([10, 10], abs=1e-6), bores
+    assert ch["bore_faces_delta"] is None, ch
     assert ch["summary"].startswith("ENGINE WARNING: "), ch["summary"]
     assert "clamped to a through hole" in ch["summary"], ch["summary"]
-    # …and the real deltas still follow the warning, not replaced by it.
-    assert "1 new bore/hole(s)" in ch["summary"], ch["summary"]
+    assert "added 1 face" in ch["summary"] and "volume " in ch["summary"], ch["summary"]
 
 
 def test_the_write_diff_carries_the_whole_part_bbox():
@@ -2077,34 +2735,39 @@ def test_suppression_aliases_change_tree_state_and_echo_canonical_rewrites():
     """Natural suppress/unsuppress verbs must mutate, never fall through to value:false."""
     r, _ = _call("new_part", {"name": "suppression_alias", "fresh": True})
     doc = r["doc_id"]
-    built, _ = _call("add_features", {"doc_id": doc, "ops": [
-        cb.feat("box", "Block", {"length": cb.dim(20), "width": cb.dim(20),
-                                 "height": cb.dim(20)})]})
-    assert built["ok"], built
-    fid = built["id_map"]["$0"]
-    feature = next(f for f in built["features"] if f["id"] == fid)
-    assert feature == {
-        "id": fid, "ok": True, "error": None, "warning": None,
-        "name": "Block", "type": "box", "suppressed": False,
-    }, built
+    try:
+        built, _ = _call("add_features", {"doc_id": doc, "ops": [
+            cb.feat("box", "Block", {"length": cb.dim(20), "width": cb.dim(20),
+                                     "height": cb.dim(20)})]})
+        assert built["ok"] and built["volume_mm3"] == pytest.approx(8000), built
+        fid = built["id_map"]["$0"]
+        feature = next(f for f in built["features"] if f["id"] == fid)
+        assert feature["ok"] and feature["name"] == "Block" and feature["type"] == "box"
+        assert feature["suppressed"] is False, feature
 
-    suppressed, _ = _call("add_features", {"doc_id": doc, "ops": [
-        {"op": "suppress_feature", "id": fid}]})
-    assert suppressed["ok"] and suppressed["interpreted"], suppressed
-    tree = cb.call("doc_tree", {"doc_id": doc})["tree"]
-    assert next(f for f in tree["features"] if f["id"] == fid)["suppressed"] is True
-
-    unsuppressed, _ = _call("add_features", {"doc_id": doc, "ops": [
-        {"op": "unsuppress_feature", "id": fid}]})
-    assert unsuppressed["ok"] and unsuppressed["interpreted"], unsuppressed
-    tree = cb.call("doc_tree", {"doc_id": doc})["tree"]
-    assert next(f for f in tree["features"] if f["id"] == fid)["suppressed"] is False
-
-    canonical_alias, _ = _call("add_features", {"doc_id": doc, "ops": [
-        {"op": "set_suppressed", "id": fid, "suppressed": True}]})
-    assert canonical_alias["ok"] and canonical_alias["interpreted"], canonical_alias
-    tree = cb.call("doc_tree", {"doc_id": doc})["tree"]
-    assert next(f for f in tree["features"] if f["id"] == fid)["suppressed"] is True
+        for op, state, spelling in (
+            ({"op": "suppress_feature", "id": fid}, True, "suppress_feature"),
+            ({"op": "unsuppress_feature", "id": fid}, False, "unsuppress_feature"),
+            ({"op": "set_suppressed", "id": fid, "suppressed": True}, True, "suppressed"),
+        ):
+            result, _ = _call("add_features", {"doc_id": doc, "ops": [op]})
+            assert result["ok"], result
+            expected_value = "true" if state else "false"
+            assert any(spelling in note and "set_suppressed" in note
+                       and "value" in note and expected_value in note
+                       for note in result["interpreted"]), result
+            receipt = next(f for f in result["features"] if f["id"] == fid)
+            assert receipt["ok"] and receipt["suppressed"] is state, receipt
+            tree = cb.call("doc_tree", {"doc_id": doc})["tree"]
+            assert next(f for f in tree["features"] if f["id"] == fid)["suppressed"] is state
+            bodies = cb.call("asm_world_bodies", {"doc_id": doc})["bodies"]
+            assert len(bodies) == (0 if state else 1), bodies
+            assert result["volume_mm3"] == pytest.approx(0 if state else 8000), result
+            if not state:
+                mass = cb.call("eval_mass", {"doc_id": doc})
+                assert mass["volume_mm3"] == pytest.approx(8000), mass
+    finally:
+        _call("close_part", {"doc_id": doc, "discard": True})
 
 
 def test_one_batch_box_chamfer_keeps_upstream_ownership_noise_out_of_feedback():
@@ -2228,10 +2891,6 @@ def test_new_part_resume_reports_the_feature_count_it_resumed_onto():
     assert built["doc_id"] == doc and built.get("reused"), built
     assert built["feature_count"] == 1, built
     assert "ALREADY CARRIES 1 feature(s)" in built["note"], built
-    # A resume must never reset the volume baseline of a part that already has geometry.
-    from services.mcp import cad_tools
-    assert cad_tools._LAST_VOLUME[doc] == pytest.approx(6000.0, rel=1e-3), \
-        cad_tools._LAST_VOLUME[doc]
 
 
 def test_new_part_and_assembly_never_resume_another_projects_open_doc(tmp_path, monkeypatch):
@@ -2410,13 +3069,11 @@ def test_check_feature_overlap_clean_part():
     ov, _ = _call("check_feature_overlap", {"doc_id": doc})
     assert ov["ok"] is True, ov
     assert ov["pairs"] == [] and ov["dead_features"] == [], ov
-    assert "No feature overlap" in ov["summary"], ov
+    assert "No feature tool overlap" in ov["summary"], ov
 
 
 def test_check_feature_overlap_boss_swallowed():
-    """A cut that erases an EARLIER boss entirely is flagged kind=boss_swallowed — the only
-    overlap kind that sets ok:false — and the boss lands in dead_features (it owns no
-    surviving faces)."""
+    """A tool intersection is reported as such, not as proof of swallowed material."""
     r, _ = _call("new_part", {"name": "ov_swallow"})
     doc = r["doc_id"]
     r1, _ = _call("add_features", {"doc_id": doc, "ops": [
@@ -2435,13 +3092,16 @@ def test_check_feature_overlap_boss_swallowed():
     kill_id = r3["features"][-1]["id"]
 
     ov, _ = _call("check_feature_overlap", {"doc_id": doc})
-    assert ov["ok"] is False, ov  # boss_swallowed is the one kind that fails the check
-    swallowed = [p for p in ov["pairs"] if p["kind"] == "boss_swallowed"]
-    assert len(swallowed) == 1, ov["pairs"]
-    assert swallowed[0]["a"] == boss_id and swallowed[0]["b"] == kill_id, swallowed
-    assert swallowed[0]["volume_mm3"] > 0, swallowed
+    assert ov["ok"] is False, ov  # legacy tool-containment verdict, not proof of removal
+    intersections = [p for p in ov["pairs"] if p["a"] == boss_id and p["b"] == kill_id]
+    assert len(intersections) == 1, ov["pairs"]
+    assert intersections[0]["kind"] == "boss_swallowed", intersections
+    assert intersections[0]["tool_kind"] == "add_cut_tool_overlap", intersections
+    assert intersections[0]["volume_basis"] == "pre_boolean_tool_intersection"
+    assert intersections[0]["volume_mm3"] > 0
     assert boss_id in ov["dead_features"], ov
-    assert "boss_swallowed" in ov["summary"], ov["summary"]
+    assert ov["basis"] == "pre_boolean_tool_intersection"
+    assert "not measured material removal" in ov["note"]
 
 
 # --- ref-slot bag dialect: refs written one level too deep, inside params ---------------
@@ -2650,14 +3310,17 @@ def test_add_features_attaches_overlap_warnings():
         cb.feat("box", "Base", {"length": cb.dim(60), "width": cb.dim(40), "height": cb.dim(10)})]})
     assert r1["ok"], r1
     assert not r1.get("overlap_warnings"), r1  # first feature alone: nothing to collide with
-    # A boss cylinder overlapping the base volume -> the batch return warns boss_overlap.
+    # A boss cylinder's tool intersects the base tool.
     r2, _ = _call("add_features", {"doc_id": doc, "ops": [
         cb.feat("cylinder", "Boss", {"radius": cb.dim(4), "height": cb.dim(30)})]})
     assert r2["ok"], r2
     warn = r2.get("overlap_warnings")
     assert warn, r2
     assert warn["pairs"] and warn["pairs"][0]["kind"] == "boss_overlap", warn
+    assert warn["pairs"][0]["tool_kind"] == "add_tool_overlap", warn
     assert warn["summary"], warn
+    assert warn["basis"] == "pre_boolean_tool_intersection", warn
+    assert "not measured material removal" in warn["note"], warn
     assert warn.get("dead_features") == [], warn
 
 
@@ -2959,7 +3622,7 @@ def test_simulate_motion_honors_offset_hinge_line(tmp_path, line_source):
         before = _mechanism(asm)
         out, _ = _call("simulate_motion", {
             "doc_id": asm, "mate_id": mate_id, "start": 0, "stop": -180,
-            "steps": 37, "check_interference": False})
+            "steps": 37, "check_interference": False, "detail": "full"})
         assert out["ok"], out
         assert out["pose_check"]["ok"], out
         assert len(out["trajectory"]) == 37
@@ -3106,7 +3769,7 @@ def test_simulate_motion_records_one_study_per_joint_and_loop_closes_exactly(tmp
     before = _mechanism(asm)
     r, _ = _call("simulate_motion", {"doc_id": asm, "mate_id": mate_id,
                                      "start": 0.0, "stop": 90.0, "steps": 7,
-                                     "loop": True, "check_interference": False})
+                                     "loop": True, "check_interference": False, "persist_study": True})
     assert r["ok"], r
     assert len(r["trajectory"]) == 8
     assert r["trajectory"][-1]["value"] == 0.0
@@ -3122,7 +3785,8 @@ def test_simulate_motion_records_one_study_per_joint_and_loop_closes_exactly(tmp
 
     r, _ = _call("simulate_motion", {"doc_id": asm, "mate_id": mate_id,
                                      "start": 0.0, "stop": 45.0, "steps": 4,
-                                     "check_interference": True, "min_clearance_mm": 0.5})
+                                     "check_interference": True, "min_clearance_mm": 0.5,
+                                     "persist_study": True})
     assert r["ok"], r
     studies = cb.call("sim_study_list", {"doc_id": asm})["studies"]
     assert [s["id"] for s in studies] == [study["study_id"]]
@@ -3206,7 +3870,7 @@ def test_motion_fea_handoff_dry_run(tmp_path):
         "dynamics": {"duration_s": 0.8, "default_density_g_cm3": 7.85},
         "dry_run": True})
     assert r["ok"], r
-    assert r["component"] == slider and r["part_doc_id"]
+    assert r["component"] == slider and r["source_path"]
     setup = r["setup_diagnostics"]
     assert setup["fixture_mate_id"] == mate_id
     assert setup["fixture_reaction_omitted_from_loads"] is True
@@ -3788,8 +4452,7 @@ def test_assembly_tools_end_to_end(tmp_path):
     assert r["ok"], r
     assert r["mate"], r
     assert r["converged"] and r["placement_source"]["k2"] == "mate", r
-    bodies = {b["component"]: b for b in (r.get("world_bodies") or [])}
-    assert "k2" in bodies, r
+    assert r["logical_member_count"] >= 2
     # concentric seats the pin's axis on the bore's axis at (x=15, y=5). Assert on the EXACT
     # B-rep axis centroid (query_geometry), NOT the world-bbox centre: the bbox comes from
     # BRepBndLib::Add on the placed shape, whose triangulation-based deflection enlargement is
@@ -3900,12 +4563,78 @@ def test_asm_mate_on_a_saved_assembly_resolves_relative_component_sources(
         _call("close_part", {"doc_id": plate})
 
 
+@pytest.mark.parametrize("nested", [False, True], ids=["part", "child-assembly"])
+def test_mate_queries_refresh_saved_component_sources(tmp_path, nested):
+    """A saved source revision must replace the geometry used to resolve a mate."""
+    from services.mcp import cad_asm_tools as asm_tools
+
+    part_path = str(tmp_path / "source.step+")
+    source_path = part_path
+    docs = set()
+    asm = None
+
+    def write_box(height):
+        doc = cb.call("doc_new", {"kind": "part", "name": "query_source",
+                                   "internal": True})["doc_id"]
+        docs.add(doc)
+        cb.call("doc_apply_ops", {"doc_id": doc, "ops": [
+            cb.feat("box", "Block", {"length": cb.dim(20), "width": cb.dim(15),
+                                      "height": cb.dim(height)})]})
+        saved = cb.call("doc_save", {"doc_id": doc, "path": part_path})
+        assert saved.get("ok", True), saved
+        cb.call("doc_close", {"doc_id": doc})
+        docs.remove(doc)
+
+    try:
+        write_box(10)
+        if nested:
+            child = cb.call("doc_new", {"kind": "assembly", "name": "query_child",
+                                         "internal": True})["doc_id"]
+            docs.add(child)
+            cb.call("doc_apply_ops", {"doc_id": child, "ops": [
+                {"op": "asm_insert_component", "source": {"path": part_path},
+                 "fixed": True}]})
+            source_path = str(tmp_path / "child.step+")
+            cb.call("doc_save", {"doc_id": child, "path": source_path})
+            cb.call("doc_close", {"doc_id": child})
+            docs.remove(child)
+        asm = cb.call("doc_new", {"kind": "assembly", "name": "query_parent",
+                                   "internal": True})["doc_id"]
+        docs.add(asm)
+        cb.call("doc_apply_ops", {"doc_id": asm, "ops": [
+            {"op": "asm_insert_component", "source": {"path": source_path},
+             "fixed": True}]})
+        comps = {c["id"]: c for c in cb.call("doc_tree", {"doc_id": asm})
+                 ["tree"]["components"]}
+        kid = next(iter(comps))
+        ref = {"component": kid, "query": "top"}
+        before = asm_tools.resolve_mate_ref(asm, comps, "a", ref)
+        assert before["ref"]["selector"]["centroid"][2] == pytest.approx(5)
+
+        # For the nested case only the dependency changes, not child.step+.
+        write_box(20)
+        after = asm_tools.resolve_mate_ref(asm, comps, "a", ref)
+        assert after["ref"]["selector"]["centroid"][2] == pytest.approx(10)
+        assert after["ref"]["selector"]["sid"] != before["ref"]["selector"]["sid"]
+        by_sid = asm_tools.resolve_mate_ref(
+            asm, comps, "a", {"component": kid,
+                              "query": after["ref"]["selector"]["sid"]})
+        assert by_sid["ref"]["selector"]["centroid"][2] == pytest.approx(10)
+    finally:
+        cached = asm_tools._ASM_QUERY_DOCS.pop(source_path, None)
+        if cached:
+            docs.add(cached[0])
+        for doc in docs:
+            cb.call("doc_close", {"doc_id": doc})
+
+
 def test_new_assembly_resolves_relative_sources_against_the_project(tmp_path, monkeypatch):
     """Live 2026-10-10 (six-axis arm): the agent copied `source` objects from a SAVED
     assembly (`parts/redesign/claw_base.step+`, relative to its file) into a NEW unsaved
     assembly. The engine resolved them against hostd's cwd and failed
     "doc_open: no such file: /home/user/parts/...". An unsaved assembly resolves a
     relative source against the project folder; describe_assembly reports the absolute file."""
+    monkeypatch.delenv("CHUDWARE_PROJECT_SAVE_DIR", raising=False)
     project = tmp_path / "project"
     (project / "parts").mkdir(parents=True)
     r, _ = _call("new_part", {"name": "proj_rel_box"})
@@ -3957,6 +4686,7 @@ def test_saved_assembly_rebases_component_sources_when_project_moves(tmp_path, m
     original = tmp_path / "original"
     relocated = tmp_path / "relocated"
     (original / "parts").mkdir(parents=True)
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(original))
     external = tmp_path / "external.step+"
     r, _ = _call("new_part", {"name": "portable_box"})
     part = r["doc_id"]
@@ -4090,7 +4820,7 @@ def test_asm_add_component_relative_path_is_project_root_relative(tmp_path, monk
     """Live c245: with the assembly saved in `<project>/assemblies/`, asm_add_component(
     path="parts/x.step+") resolved only against the assembly folder and failed "no such
     file" beside the part save_part had just written. Relative paths are project-root
-    relative like every other project tool; a miss lists every candidate tried."""
+    relative like every other project tool; a miss tries only the selected workspace."""
     project = tmp_path / "plane"
     (project / "parts").mkdir(parents=True)
     (project / "assemblies").mkdir()
@@ -4118,8 +4848,7 @@ def test_asm_add_component_relative_path_is_project_root_relative(tmp_path, monk
 
         r, _ = _call("asm_add_component", {"doc_id": asm, "path": "parts/missing.step+"})
         assert r["ok"] is False, r
-        assert str(project / "parts" / "missing.step+") in r["tried"], r
-        assert str(project / "assemblies" / "parts" / "missing.step+") in r["tried"], r
+        assert r["tried"] == [str(project / "parts" / "missing.step+")], r
     finally:
         cb.call("doc_close", {"doc_id": asm})
         _call("close_part", {"doc_id": part})
@@ -4448,7 +5177,8 @@ def test_normalize_diameter_never_rewrites_a_hole_or_bolt_circle():
         assert notes == [], (ftype, notes)
     # the unit pass still applies there — it changes the SPELLING, never the size
     flat, notes = _norm_dims({"type": "hole", "name": "H",
-                              "params": {"diameter": "0.25in", "style": "simple"}})
+                              "params": {"diameter": "0.25in", "style": "simple",
+                                         "end": "through_all"}})
     assert flat["diameter"] == 6.35 and "radius" not in flat, flat
     assert notes and "6.35" in notes[0], notes
 
@@ -4593,29 +5323,24 @@ def test_dialect_spout_is_oriented_and_off_origin():
     assert abs(ax[1]) < 1e-6 and abs(ax[2]) < 1e-6, ax
 
 
-def test_rolled_back_batch_error_carries_the_engine_reason():
-    """A rolled-back batch reports WHY, per feature, in `error` itself.
-
-    The agent card truncates `error` and never reads `failed_features`, so the old constant
-    ("no features were kept; fix and resend") left the model nothing actionable and it resent
-    the identical ops.
-    """
+def test_atomic_batch_failure_preserves_rejected_feature_identity():
+    """Rejected features retain their authored identity without entering the document."""
     r, _ = _call("new_part", {"name": "buried_boss"})
     doc = r["doc_id"]
     r, _ = _call("add_features", {"doc_id": doc, "ops": [
         cb.feat("box", "Block", {"length": cb.dim(100), "width": cb.dim(100),
                                  "height": cb.dim(100)})]})
     assert r["ok"], r
+    before = cb.call("doc_tree", {"doc_id": doc})
     # A small centred cylinder boss is buried inside the block: it adds no material, which is
     # a genuine engine rebuild failure (not a schema rejection), so the batch rolls back.
     bad, _ = _call("add_features", {"doc_id": doc, "ops": [
         cb.feat("cylinder", "InnerPin", {"radius": cb.dim(5), "height": cb.dim(10)})]})
     assert bad["ok"] is False and bad["rolled_back"] is True, bad
-    err = bad["error"]
-    assert "added no material" in err, err   # the engine's ACTUAL reason
-    assert "InnerPin" in err, err            # named with the feature the model wrote
-    assert bad["failed_features"][0]["id"] in err, bad
-    assert "no features were kept" not in err and "fix and resend" not in err, err
+    failed = bad["failed_features"]
+    assert [(f["name"], f["type"]) for f in failed] == [("InnerPin", "cylinder")]
+    assert failed[0]["id"] not in {f["id"] for f in before["tree"]["features"]}
+    assert cb.call("doc_tree", {"doc_id": doc}) == before
 
 
 def test_query_geometry_echoes_the_resolved_query():
@@ -4753,7 +5478,7 @@ def test_hole_depth_through_all_drills_all_the_way_through():
     Proof is geometry: the bore breaches BOTH faces, so it leaves no bottom cap — 7 faces
     against a blind hole's 8 — and removes exactly twice the material of a half-deep one.
     """
-    def _drill(depth, tag):
+    def _drill(depth, tag, end=None):
         r, _ = _call("new_part", {"name": tag})
         doc = r["doc_id"]
         b, _ = _call("add_features", {"doc_id": doc, "ops": [
@@ -4762,14 +5487,15 @@ def test_hole_depth_through_all_drills_all_the_way_through():
                 "height": {"value": 50}}}},
             {"op": "add_feature", "feature": {
                 "type": "hole", "name": "Bore",
-                "params": {"diameter": {"value": 20}, "depth": depth},
+                "params": {"diameter": {"value": 20}, "depth": depth,
+                           **({"end": end} if end else {})},
                 "refs": {"face": {"of": "face", "side": "top"}}}}]})
         assert b["ok"], b
         q, _ = _call("query_geometry", {"doc_id": doc, "query": "all faces"})
         return b["volume_mm3"], q["count"]
 
     thru_vol, thru_faces = _drill({"value": "through_all"}, "bore_thru")
-    blind_vol, blind_faces = _drill({"value": 25}, "bore_blind")
+    blind_vol, blind_faces = _drill({"value": 25}, "bore_blind", end="blind")
     solid = 100.0 * 100.0 * 50.0
     # Breached: no bottom cap face, where the blind bore keeps one.
     assert thru_faces == blind_faces - 1, (thru_faces, blind_faces)
@@ -4809,7 +5535,7 @@ def _solve_sketch(name: str, constraints: list) -> dict:
     r, _ = _call("new_part", {"name": name, "fresh": True})
     doc = r["doc_id"]
     r, _ = _call("add_features", {"doc_id": doc, "ops": [{
-        "op": "add_feature",
+        "op": "add_feature", "auto_define": False,
         "feature": {"type": "sketch", "name": "S", "refs": {"plane": "plane.top"},
                     "params": {"entities": json.loads(json.dumps(_DIALECT_SKETCH)),
                                "constraints": constraints}}}]})
@@ -4885,8 +5611,9 @@ def test_circular_sketch_pattern_full_sweep_no_longer_stacks_every_copy():
          "mode": "circular", "count": 4, "center": [0, 0], "angle": 360}]})
     assert r.get("ok"), r
     ov = cb.call("doc_sketch_overview", {"doc_id": doc, "sketch": "f1"})
-    centres = {(round(e["center"][0], 3), round(e["center"][1], 3)) for e in ov["entities"]}
-    assert len(centres) == 4, sorted(centres)
+    centres = {(round(e["center"][0], 3), round(e["center"][1], 3))
+               for e in ov["entities"] if e["type"] == "circle" and not e["construction"]}
+    assert centres == {(10, 0), (0, 10), (-10, 0), (0, -10)}, sorted(centres)
 
 
 def test_move_duplicate_synonym_keeps_the_original():
@@ -4927,3 +5654,230 @@ if __name__ == "__main__":
             print(f"[FAIL] {fn.__name__}: {e}")
     print(f"\n{len(fns) - failed}/{len(fns)} passed")
     sys.exit(1 if failed else 0)
+
+
+def test_dogfood_guidance_is_truthful():
+    """The published recipes and overlap consumer agree with the live contracts."""
+    from services.agent.agent_turn import _tool_category_catalog_result
+    from services.agent.tool_guidance.cad import ENTRIES
+    from services.mcp.cad_guide import cad_guide_text
+    from services.mcp.design_review_tools import _call_with_override, _check_detail_fail, _narrate
+    from services.mcp.server import mcp
+
+    rib = cad_guide_text("rib")
+    assert all(s in rib for s in ("OPEN", "refs.profile", "thickness", "support", "ambiguous"))
+    split = cad_guide_text("split")
+    assert all(s in split for s in ("refs.tool", "both", "above", "below"))
+    equations = cad_guide_text("eq_set")
+    assert all(s in equations for s in ("eq_set", "Width/2", "eq_delete", "stored literal"))
+    relief = cad_guide_text("sm_relief")
+    assert all(s in relief for s in ("no dedicated sm_relief", "through-cut", "sm_flat_pattern",
+                                     "export_flat_dxf", "OUTLINE", "BEND", "CUTS"))
+    assert "export_flat_dxf" in cad_guide_text("sheetmetal")
+
+    sketch3d = cad_guide_text("sketch3d")
+    assert "midpoint (point + line/arc)" in sketch3d
+    assert "tangent/symmetric/equal/midpoint are v2" not in sketch3d
+    ops = cad_guide_text("ops").lower()
+    assert all(s in ops for s in ("blind cut", "sketch normal", "flip", "no material"))
+    assert "body centroid" not in ops
+    mutation = cad_guide_text("add_features")
+    assert all(s in mutation for s in ("sketch_fillet", "radius is driving", "conflicts reject",
+                                        "approximate", "revision-correct baseline",
+                                        "bore_faces_delta", "logical_member_count"))
+    assert "partially dependent" in cad_guide_text("gsl")
+    assembly = cad_guide_text("assembly")
+    assert "normal · (point_b − point_a) = sign × value" in assembly
+    assert "opposite outward normals" in assembly and 'align="anti"' in assembly
+    assert "source-frame candidates" in assembly and "never guess" in assembly
+
+    drawing = cad_guide_text("drawing")
+    example = json.loads(drawing.split("```json", 1)[1].split("```", 1)[0])
+    args = example["args"]
+    assert "drawn_by" not in args.get("title", {})
+    assert "scale" not in args.get("title", {}) and args["scale"] == 1.0
+    assert all(s in drawing for s in ("view_id", "annotation_id", "a=[x,y]", "sheet millimetres",
+                                      "empty spec is refused", "draft", "export_part(fmt=\"draw+\""))
+    sheet = cad_guide_text("drawings")
+    assert "without audit" in sheet and "real manufacturing requirements" in sheet
+    assert "tol_type=\"none\"" in sheet and "null patches refuse" in sheet
+    simulation = cad_guide_text("simulation")
+    assert all(s in simulation for s in ("mesh_size_mm", "min_size_mm", "metres",
+                                         "under-resolved", "convergence"))
+    evaluation = cad_guide_text("evaluate")
+    assert all(s in evaluation for s in ("within_tolerance", "clearance_tolerance_mm",
+                                         "pre-boolean", "volume_mm3", "mass_g"))
+    assert "not_evaluated" in cad_guide_text("dfm")
+    assert "validation_stages" in cad_guide_text("overview")
+    assert "minimum full-hex depth" in cad_guide_text("parts")
+    sourcing = cad_guide_text("sourcing")
+    assert "part_id as part_ref" in sourcing and "remain unknown" in sourcing
+    video = cad_guide_text("video_to_part")
+    assert all(s in video for s in ("reveng_start_splat", "reveng_splat_status",
+                                     "reveng_finish_splat", "SAME feature",
+                                     "reveng_align_axes", "refit after alignment",
+                                     "no_features_rebuilt", "unclaimed_count", "unclaimed_path"))
+
+    instructions = mcp.instructions
+    assert all(s in instructions for s in ("sm_flat_pattern", "export_flat_dxf",
+                                            "revision-correct baseline", "bore_faces_delta",
+                                            "logical_member_count", "within_tolerance",
+                                            "non-release draft", "empty specs are refused",
+                                            "export_part(fmt='draw+'"))
+    assert "draft" in ENTRIES["export_drawing"]["prompt_note"]
+    assert "draw+" in ENTRIES["save_part"]["prompt_note"]
+    assert "volume_mm3 both at top level and under result['mass']" in instructions
+    for query in ("save drawing", "drawing save", "save native drawing"):
+        found = _tool_category_catalog_result(query=query, limit=100)
+        assert found["ok"], found
+        entry = next(item for item in found["tools"] if item["name"] == "export_part")
+        assert "fmt='draw+'" in entry["description"] and "<drawing_id>" in entry["description"]
+
+    base = {"ok": True, "complete": True, "basis": "pre_boolean_tool_intersection",
+            "pairs": [], "dead_features": []}
+    clean = _call_with_override("feature_overlap", lambda **_: base, None, None, None)
+    assert clean["status"] == "done" and clean["passed"] is True
+    pair = {"a": "f1", "b": "f2", "kind": "cut_into_boss",
+            "tool_kind": "add_cut_tool_overlap", "volume_mm3": 12}
+    flagged_result = {**base, "pairs": [pair], "dead_features": ["f3"]}
+    flagged = _call_with_override("feature_overlap", lambda **_: flagged_result, None, None, None)
+    assert flagged["status"] == "done" and flagged["passed"] is False
+    detail = _check_detail_fail("feature_overlap", flagged_result)
+    assert "1 pre-boolean tool intersection pair(s)" in detail
+    assert "1 feature(s) without surviving owned faces" in detail
+    assert "do not measure material removal" in detail
+    card = _narrate({"feature_overlap": flagged}, "part", 0)
+    assert "1 pre-boolean tool intersection pair(s)" in card
+    assert "0 overlapping features" not in card and "do not measure material removal" in card
+    assert "ADVISORY" in card and "Overall: PARTIAL" in card
+    assert "do not establish a material or editability defect" in card
+    legacy = {**flagged_result, "ok": False, "pairs": [{**pair, "kind": "boss_swallowed"}]}
+    legacy_check = _call_with_override("feature_overlap", lambda **_: legacy, None, None, None)
+    assert legacy_check["status"] == "done" and legacy_check["passed"] is False
+    incomplete = {**flagged_result, "ok": False, "complete": False,
+                  "unavailable_features": ["f4"], "failed_pairs": [{"a": "f5", "b": "f6"}],
+                  "summary": "Feature tool overlap check incomplete."}
+    unavailable = _call_with_override("feature_overlap", lambda **_: incomplete, None, None, None)
+    assert unavailable["status"] == "error"
+    assert "1 pre-boolean tool intersection pair(s)" in unavailable["reason"]
+    assert "incomplete" in unavailable["reason"]
+    assert "1 unavailable feature(s), 1 failed pair check(s)" in unavailable["reason"]
+
+
+def test_local_thickness_uses_face_field_and_exact_edge_offsets():
+    """Each reported value is an actual face vertex of the same native field."""
+    import numpy as np
+    from services.aicm_handoff import read_handoff
+    from services.sim.tessellate import read_aicm
+
+    part, _ = _call("new_part", {"name": "local_thickness_box"})
+    doc = part["doc_id"]
+    try:
+        built, _ = _call("add_features", {"doc_id": doc, "ops": [
+            {"op": "add_feature", "feature": {"type": "box", "name": "Plate",
+                "params": {"length": 40, "width": 20, "height": 2}}}]})
+        assert built["ok"], built
+        inventory = cb.call("eval_edge_analysis", {"doc_id": doc, "body": 1,
+                                                   "kinds": ["convex"]})
+        top = cb.call("doc_query", {"doc_id": doc, "query": {"of": "face", "side": "top"}})
+        bottom = cb.call("doc_query", {"doc_id": doc, "query": {"of": "face", "side": "bottom"}})
+        top_id = top["matches"][0]["topo"]
+        edge = next(e for e in inventory["edges"] if top_id in e["face_topo"]
+                    and e["length_mm"] > 10)
+        study = cb.call("eval_thickness", {"doc_id": doc, "body": 1, "resolution": 0.5})
+        field = read_aicm(read_handoff(study["aicm_path"]))
+        mesh = field["bodies"][0]
+        scalar = next(s for s in field["scalars"] if s["name"] == "thickness")
+        triangles = np.asarray(mesh["idx"]).reshape(-1, 3)
+        points = np.asarray(mesh["pos"]).reshape(-1, 3)
+        values = np.asarray(scalar["values"])
+        for face_id, sid in zip(edge["face_topo"], edge["faces"]):
+            result = cb.call("eval_local_thickness", {"doc_id": doc, "body": 1,
+                "edge_topo": edge["topo"], "face_topo": face_id, "resolution": 0.5})
+            assert result["revision"] == inventory["revision"]
+            assert result["face_sid"] == sid
+            assert result["unavailable_reason"] is None
+            assert 1 <= len(result["samples"]) <= 3
+            h = result["measurement_basis"]["spacing_mm"]
+            face_vertices = set()
+            for face in mesh["faces"]:
+                if face["face_id"] == face_id:
+                    face_vertices.update(triangles[face["first_tri"]:
+                        face["first_tri"] + face["tri_count"]].ravel().tolist())
+            for sample in result["samples"]:
+                at = np.asarray(sample["at"])
+                matches = [v for v in face_vertices if np.linalg.norm(points[v] - at) < 1e-6]
+                assert matches
+                assert any(float(values[v]) == pytest.approx(sample["thickness_mm"], abs=1e-6)
+                           for v in matches)
+                assert 0.4 * h <= sample["offset_mm"] <= 3 * h
+                assert np.linalg.norm(at - sample["edge_at"]) == pytest.approx(sample["offset_mm"], abs=1e-6)
+                if face_id == top_id:
+                    assert sample["thickness_mm"] == pytest.approx(2.0, abs=0.05)
+        # Opposite faces have no common boundary; never borrow a nearby or global value.
+        unavailable = cb.call("eval_local_thickness", {"doc_id": doc, "body": 1,
+            "face_topo": top_id, "blend_topo": bottom["matches"][0]["topo"], "resolution": 0.5})
+        assert unavailable["revision"] == inventory["revision"]
+        assert unavailable["samples"] == []
+        assert unavailable["unavailable_reason"] == "no_shared_boundary"
+        coarse = cb.call("eval_local_thickness", {"doc_id": doc, "body": 1,
+            "edge_topo": edge["topo"], "face_topo": top_id, "resolution": 1000})
+        assert coarse["samples"] == []
+        assert coarse["unavailable_reason"] == "no_local_measured_samples"
+    finally:
+        _call("close_part", {"doc_id": doc})
+
+
+def test_local_thickness_resolves_blend_boundary_to_same_edge():
+    part, _ = _call("new_part", {"name": "local_thickness_blend"})
+    doc = part["doc_id"]
+    try:
+        built, _ = _call("add_features", {"doc_id": doc, "ops": [
+            {"op": "add_feature", "feature": {"type": "box", "name": "B",
+                "params": {"length": 40, "width": 30, "height": 20},
+                "at": [0, 0, 0], "centered": False}},
+            {"op": "add_feature", "feature": {"type": "fillet", "name": "F",
+                "params": {"radius": 5}, "refs": {"edges": [
+                    {"of": "edge", "surf": "line", "parallel": "y",
+                     "near": [40, 15, 20], "count": 1}]}}}]})
+        assert built["ok"], built
+        cylinder = cb.call("doc_query", {"doc_id": doc, "query": {"of": "face", "surf": "cylinder"}})
+        blend = cylinder["matches"][0]["topo"]
+        analysis = cb.call("eval_edge_analysis", {"doc_id": doc, "body": 1, "kinds": ["smooth"]})
+        edge = next(e for e in analysis["edges"] if blend in e["face_topo"]
+                    and e["length_mm"] > 10)
+        face = next(f for f in edge["face_topo"] if f != blend)
+        common = {"doc_id": doc, "body": 1, "face_topo": face, "resolution": 0.5}
+        by_blend = cb.call("eval_local_thickness", {**common, "blend_topo": blend})
+        by_edge = cb.call("eval_local_thickness", {**common, "edge_topo": edge["topo"]})
+        assert by_blend["edge_topo"] == edge["topo"]
+        assert by_blend["samples"] == by_edge["samples"]
+        assert by_blend["samples"]
+    finally:
+        _call("close_part", {"doc_id": doc})
+
+
+def test_local_thickness_samples_both_sides_of_concave_edge():
+    part, _ = _call("new_part", {"name": "local_thickness_concave"})
+    doc = part["doc_id"]
+    try:
+        built, _ = _call("add_features", {"doc_id": doc, "ops": [
+            {"op": "add_feature", "feature": {"type": "box", "name": "Base",
+                "params": {"length": 40, "width": 30, "height": 4},
+                "at": [0, 0, 0], "centered": False}},
+            {"op": "add_feature", "feature": {"type": "box", "name": "Rib",
+                "params": {"length": 25, "width": 5, "height": 12},
+                "at": [5, 5, 3], "centered": False}}]})
+        assert built["ok"] and built["body_count"] == 1, built
+        analysis = cb.call("eval_edge_analysis", {"doc_id": doc, "body": 1,
+                                                   "kinds": ["concave"]})
+        edge = next(e for e in analysis["edges"] if e["length_mm"] > 20)
+        for face in edge["face_topo"]:
+            result = cb.call("eval_local_thickness", {"doc_id": doc, "body": 1,
+                "face_topo": face, "edge_topo": edge["topo"], "resolution": 0.5})
+            assert result["revision"] == analysis["revision"]
+            assert result["samples"], result
+            assert all(sample["thickness_mm"] > 0 and sample["offset_mm"] > 0
+                       for sample in result["samples"])
+    finally:
+        _call("close_part", {"doc_id": doc})

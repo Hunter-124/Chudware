@@ -85,6 +85,56 @@ struct MateResidual {
     double norm = 0.0;
 };
 
+// One first-order rotational freedom of a component at the solved pose.
+//
+// `axis` is a unit direction (world frame) and `point` is the point of the axis line
+// nearest the world origin (mm). `pitch_mm_per_rad` is the translation ALONG the axis that
+// accompanies one radian of rotation: 0 for a pure rotation (a pin, a hinge), non-zero
+// for a helical freedom (a screw). The sign of `axis` is arbitrary; rotation about -axis
+// is the same freedom.
+struct FreeRotation {
+    Eigen::Vector3d axis = Eigen::Vector3d::UnitZ();
+    Eigen::Vector3d point = Eigen::Vector3d::Zero();
+    double pitch_mm_per_rad = 0.0;
+};
+
+// First-order motion projected from the null space of the accepted-mate Jacobian.
+// Freedoms of different components may be coupled: their counts do not generally sum
+// to the assembly DOF, and another component may have to move simultaneously.
+//
+// `translations` spans the projected motions whose angular part is zero. `rotations`
+// describes a basis of projected rotational motion (see FreeRotation), with its translation
+// part orthogonal to the pure translation subspace. Both use world coordinates.
+// `free_dof` = translations.size() + rotations.size().
+//
+// `grounded` is the document's `fixed` flag. `mated` is true when the component takes part
+// in at least one mate that the solver built (an unresolved or suppressed mate does not
+// count); a component that is not grounded and not mated is a floating body.
+// `kind` is a short name derived from the motion space: "grounded", "fixed" (all mates
+// leave no freedom), "prismatic", "revolute", "cylindrical", "helical", "planar",
+// "spherical", "free" (6 DOF), or "other".
+struct ComponentFreeMotion {
+    std::string component;
+    bool grounded = false;
+    bool mated = false;
+    int free_dof = 0;
+    std::vector<Eigen::Vector3d> translations;
+    std::vector<FreeRotation> rotations;
+    std::string kind;
+};
+
+// A set of components coupled to each other (and possibly to ground) through mates.
+// `dof` is the group's own contribution to MateSolveResult::dof. A group with no grounded
+// component can move rigidly through space, which always contributes 6 of its `dof`;
+// `relative_dof` removes those 6 so it counts only motion between the group's components.
+struct MateGroup {
+    std::vector<std::string> components;
+    std::vector<std::string> mates;
+    bool grounded = false;
+    int dof = 0;
+    int relative_dof = 0;
+};
+
 struct MateSolveResult {
     std::map<std::string, std::vector<double>> transforms;  // id -> 16-float row-major
     std::map<std::string, std::pair<Eigen::Vector3d, Eigen::Vector3d>> params;  // id -> (t,w)
@@ -99,6 +149,11 @@ struct MateSolveResult {
     double tolerance = 0.0;
     bool over_defined = false;
     std::string summary;
+    // Filled only when solve_mates is called with free_motion = true: one entry per
+    // non-suppressed component (document order) and one per mate-connected group of two or
+    // more components. See ComponentFreeMotion / MateGroup.
+    std::vector<ComponentFreeMotion> free_motion;
+    std::vector<MateGroup> groups;
 };
 
 // Optional warm start: component_id -> (t, w).
@@ -133,13 +188,18 @@ using ResolvedGeometry = std::map<std::pair<std::string, int>, MateGeom>;
 // on the normal equations can amplify a near-null direction without bound: before
 // them, ONE unsatisfiable mate on one corner of an assembly threw components on
 // unrelated, fully-satisfied corners hundreds to thousands of mm out of place.
+//
+// `free_motion` additionally extracts per-component first-order free motion from the
+// Jacobian null space (MateSolveResult::free_motion / groups). It costs one more SVD per
+// mate-connected group, so the motion-sweep callers leave it off.
 MateSolveResult solve_mates(const nlohmann::json& components,
                             const nlohmann::json& mates,
                             const ResolvedGeometry& resolved_geometry,
                             const std::optional<WarmMap>& warm = std::nullopt,
                             const std::optional<Drag>& drag = std::nullopt,
                             double tol = 1e-9, int max_iter = 80,
-                            std::optional<double> time_budget_ms = std::nullopt);
+                            std::optional<double> time_budget_ms = std::nullopt,
+                            bool free_motion = false);
 
 // --- rotation helpers (exposed for the CLI / tests; match the oracle exactly) ---
 Eigen::Vector3d unit(const Eigen::Vector3d& v);
@@ -149,9 +209,17 @@ Eigen::Vector3d mat_to_rotvec(const Eigen::Matrix3d& R);
 
 // JSON-in/JSON-out convenience for the differential harness. `input` is a JSON
 // object { "components":[...], "mates":[...], "resolved_geometry":[...],
-// "warm":{...optional}, "drag":{...optional} } where resolved_geometry is a list
-// of { "mate_id":.., "ref_index":.., "geom":{kind,point,normal,direction,radius} }.
-// Returns the result as a JSON object (see mate_cli.cpp for the schema).
+// "warm":{...optional}, "drag":{...optional}, "free_motion":bool optional } where
+// resolved_geometry is a list of { "mate_id":.., "ref_index":.., "geom":{kind,point,
+// normal,direction,radius} }. Returns the result as a JSON object (see mate_cli.cpp for the
+// schema); with free_motion set it also carries `free_motion` (free_motion_to_json).
 nlohmann::json solve_mates_json(const nlohmann::json& input);
+
+// JSON form of MateSolveResult::free_motion / groups:
+//   {components:[{component, grounded, mated, free_dof, kind,
+//                 translations:[[x,y,z]...], rotations:[{axis, point, pitch_mm_per_rad}]}],
+//    groups:[{components, mates, grounded, dof, relative_dof}]}
+// Vectors are world-frame; points and pitches are mm and mm/rad.
+nlohmann::json free_motion_to_json(const MateSolveResult& result);
 
 }  // namespace chudware::mate

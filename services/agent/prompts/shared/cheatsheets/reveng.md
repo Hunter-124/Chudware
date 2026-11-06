@@ -63,19 +63,33 @@ Lane B ends in geometry, so once a session produces a solid the Lane A tools
 1. reveng_start_session(name?, part_ref?)       → session_id (every later call takes it)
 2. reveng_print_scale_mat("A4")                 print at 100%, tape flat, part stands ON it
 3. capture: reveng_add_images | reveng_add_video | reveng_ingest_datasheet
-            (or import_scan_mesh if a scan already exists)
+            (video extraction is asynchronous; poll session.run. import_scan_mesh for scans.)
    get_reveng_coverage                          re-shoot before reconstructing, not after
-4. reveng_reconstruct(session_id, quality)      sparse → dense|splat → cleanup
-   (reveng_single_photo = the approximate tier — preview only, see HONESTY RULES)
+4. reveng_reconstruct(session_id, quality)      one SfM dataset → visual Brush + OpenMVS mesh
+   Separate Brush job: reveng_start_splat → reveng_splat_status → reveng_finish_splat,
+   then poll status to completion. Brush exports no mesh. reveng_splat_to_mesh(method="auto")
+   uses TSDF only with proven matching undistorted poses, otherwise Poisson and fallback_reason;
+   explicit method="poisson" selects that fallback. Both surfaces are approximate.
+   session.sfm_dataset (get_reveng_session) pairs the undistorted sparse_dir + images_dir and
+   reports registered, points3D, mean_reprojection_error_px and cameras. Analyse only that pair.
 5. reveng_set_scale(session_id, method, ...)    aruco_mat | two_point | known_dim
+   known_dim requires value_mm and recon_length, or two 3D native-gauge points.
+   Identify corresponding endpoints of the SAME real feature in native sparse/mesh coordinates;
+   do not equate a PCA or Gaussian bounding span with a catalog length without verification.
    ===> HUMAN SCALE-CONFIRM GATE <===           a person accepts the scale. Nothing proceeds
                                                 until they do; every dimension downstream is
                                                 this number multiplied by a shape.
+   For an imported scan/splat with no mission gate, reveng_confirm_scale records explicit human approval.
+   reveng_align_axes(session_id, method="planes"|"pca"|"manual") before final fitting;
+   planes falls back to PCA, manual takes a proper native-to-world rotation. Confirm the datum.
+   Replacing a mesh or changing alignment/calibration invalidates fits and the model: refit.
 6. reveng_fit_primitives(session_id)            planes/cylinders/spheres/cones + hole-vs-boss
 7. list_reveng_dims → confirm_dimensions([{key, value_mm}])   (measure_from_photo only when a
                                                 caliper cannot reach the feature)
    ===> HUMAN DIMENSION-CONFIRM GATE <===       fit-critical dims carry a TYPED caliper value
-8. reveng_build_parametric(session_id)          → editable feature tree (or an honest mesh body)
+8. reveng_build_parametric(session_id)          attempt editable features; inspect features,
+   describe_part bodies and summary. Empty/bodyless builds fail no_features_rebuilt, not fallback.
+   recognition.unclaimed contains bounded examples; unclaimed_count and unclaimed_path retain all.
 9. re_geometry_verifier: get_reveng_deviation + compare_parts → verdict
 10. reveng_attach_result(session_id, part_ref) / export_reveng_bundle(session_id, dest)
 ```
@@ -114,8 +128,8 @@ An unconfirmed scale is an automatic **fail** regardless of match_pct.
 
 ## HONESTY RULES — ALWAYS STATE IN LEDGER
 
-- **Never claim direct scan→parametric.** The chain is scan → mesh → AI → parametric, with a
-  mesh-body fallback. When the build falls back to a mesh body, say so in the handoff.
+- **Never claim direct scan→parametric.** The chain is scan → mesh → AI → parametric.
+  Report a mesh-body fallback only when an actual mesh body exists.
 - **`approximate` is never a usable part.** Single-photo tiers (TripoSR / TRELLIS) are
   force-tagged `approximate`: reference/preview shapes with no metric scale.
   `reveng_build_parametric` refuses them unless `strategy="override_approximate"` — using that
@@ -138,7 +152,7 @@ An unconfirmed scale is an automatic **fail** regardless of match_pct.
 # Lane A — geometry you already have
 import_part(path); reverse_engineer(source); compare_parts(doc_a, doc_b)
 convert_face_to_sketch(face); project_into_sketch(sketch, refs); add_features(ops)
-describe_part(); hover(sid); verify_battery(doc_id)
+describe_part(); hover(sid); verify_battery(doc_id=doc_id)
 
 # Lane B — session READ (never mutates)
 reveng_status(); list_reveng_sessions(); get_reveng_session(sid); get_reveng_coverage(sid)
@@ -147,8 +161,11 @@ list_reveng_dims(sid); get_reveng_deviation(sid); describe_reveng_result(sid)
 # Lane B — session WRITE (pipeline order)
 reveng_start_session(name?, part_ref?); reveng_print_scale_mat(size)
 reveng_add_images(sid, paths|dir); reveng_add_video(sid, path); reveng_ingest_datasheet(sid, path)
+reveng_start_splat(sid, ...); reveng_splat_status(sid); reveng_finish_splat(sid)
+reveng_import_splat(path, session_id?); reveng_convert_splat(path, out_format, out_path?)
+reveng_splat_to_mesh(path_or_session); reveng_sparse_preview(sid)
 reveng_reconstruct(sid, quality); reveng_single_photo(sid, tier)   # tier = approximate
-reveng_set_scale(sid, method, params); reveng_fit_primitives(sid)
+reveng_set_scale(sid, method, params); reveng_align_axes(sid, method, rotation?); reveng_fit_primitives(sid)
 reveng_build_parametric(sid, strategy?); reveng_attach_result(sid, part_ref)
 
 # Dimension review (shared with intake)

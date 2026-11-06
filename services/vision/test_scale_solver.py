@@ -227,6 +227,64 @@ def test_solve_scale_aruco_synthetic_within_1pct(tmp_path):
     assert rel_err < 0.01, f"recovered {res.mm_per_unit} vs {_TRUE_MM_PER_UNIT} ({rel_err*100:.3f}%)"
 
 
+def test_solve_scale_charuco_fits_every_board_corner(tmp_path):
+    """The printed mat board, warped into posed views, recovers the true scale from all corners."""
+    from services.vision.scale_mat import MAT_BOARD
+    from services.vision.scale_solver import solve_scale_charuco
+
+    images, sparse = tmp_path / "images", tmp_path / "sparse"
+    images.mkdir()
+    sparse.mkdir()
+    px_per_mm, pad = 8.0, 120
+    board = MAT_BOARD
+    raster = board.cv_board().generateImage(
+        (int(board.width_mm * px_per_mm), int(board.height_mm * px_per_mm)), marginSize=0, borderBits=1)
+    raster = cv2.copyMakeBorder(raster, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=255)
+    h, w = raster.shape
+    src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
+    e = pad / px_per_mm
+    world = np.array([[-e, -e, 0], [board.width_mm + e, -e, 0],
+                      [board.width_mm + e, board.height_mm + e, 0],
+                      [-e, board.height_mm + e, 0]]) / _TRUE_MM_PER_UNIT
+    W, H, f = 1280, 960, 1400.0
+    K = np.array([[f, 0, W / 2], [0, f, H / 2], [0, 0, 1]])
+    centre = np.array([board.width_mm / 2, board.height_mm / 2, 0]) / _TRUE_MM_PER_UNIT
+    images_txt = ["# images"]
+    for k, offset in enumerate([(0.5, 0.3, -16), (4, -1, -15), (-4, 2, -15), (1, 5, -14), (-2, -4, -15)]):
+        R, t = _look_at(centre + np.array(offset), centre, up=(0, -1, 0))
+        proj = (K @ np.c_[R, t] @ np.c_[world, np.ones(4)].T).T
+        Hmat = cv2.getPerspectiveTransform(src, np.float32(proj[:, :2] / proj[:, 2:]))
+        cv2.imwrite(str(images / f"v{k}.png"), cv2.warpPerspective(raster, Hmat, (W, H), borderValue=255))
+        q = _rot_to_quat(R)
+        images_txt += [f"{k + 1} {q[0]} {q[1]} {q[2]} {q[3]} {t[0]} {t[1]} {t[2]} 1 v{k}.png", ""]
+    (sparse / "cameras.txt").write_text(f"1 PINHOLE {W} {H} {f} {f} {W / 2} {H / 2}\n")
+    (sparse / "images.txt").write_text("\n".join(images_txt) + "\n")
+    (sparse / "points3D.txt").write_text("")
+
+    res = solve_scale_charuco(sparse_dir=str(sparse), images_dir=str(images), board=board)
+    assert res.method == "aruco_mat" and res.n_views == 5
+    assert res.detail["n_corners"] == (board.squares_x - 1) * (board.squares_y - 1)
+    assert res.mm_per_unit == pytest.approx(_TRUE_MM_PER_UNIT, rel=2e-3)
+    assert res.residual_pct < 0.5
+
+
+def test_charuco_mat_prints_the_stated_square_pitch(tmp_path):
+    """The rendered page must carry the board at its nominal pitch (no margin shrink)."""
+    from services.vision.scale_mat import MAT_BOARD, generate_charuco_mat_pdf
+
+    info = generate_charuco_mat_pdf(out_path=str(tmp_path / "mat.pdf"), size="Letter", dpi=300)
+    assert (tmp_path / "mat.pdf").read_bytes()[:5] == b"%PDF-"
+    preview = cv2.imread(info["preview_path"], cv2.IMREAD_GRAYSCALE)  # page at dpi / 4
+    corners, ids, _, _ = cv2.aruco.CharucoDetector(MAT_BOARD.cv_board()).detectBoard(preview)
+    assert ids is not None and len(ids) >= 40
+    layout = MAT_BOARD.cv_board().getChessboardCorners()[ids.ravel()][:, :2]
+    px = corners.reshape(-1, 2)
+    i, j = np.triu_indices(len(px), 1)
+    px_per_mm = np.linalg.norm(px[i] - px[j], axis=1) / np.linalg.norm(layout[i] - layout[j], axis=1)
+    assert float(px_per_mm.mean()) == pytest.approx(300 / 25.4 / 4, rel=5e-3)
+
+
+
 def test_solve_scale_two_point_manual(tmp_path):
     # Two known sparse points 4 units apart, physically 100 mm → 25 mm/unit.
     K = np.array([[1400, 0, 640], [0, 1400, 480], [0, 0, 1]], dtype="float64")

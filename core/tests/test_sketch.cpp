@@ -1247,3 +1247,103 @@ TEST_CASE("midpoint translates a free line without changing its direction or len
     CHECK(double(e["p2"][0]) - double(e["p1"][0]) == doctest::Approx(10));
     CHECK(double(e["p2"][1]) - double(e["p1"][1]) == doctest::Approx(4));
 }
+
+TEST_CASE("invalid dimension expression is skipped instead of using literal fallback") {
+    json s{{"entities", json::array({line("e1", 0, 0, 10, 0)})},
+           {"constraints", json::array({
+               {{"id", "c1"}, {"type", "length"}, {"refs", {"e1"}},
+                {"value", {{"value", 30}, {"expr", "missing_variable + 1"}}}}
+           })}};
+    auto sol = solve_sketch(s, json::object());
+    REQUIRE(sol.skipped.size() == 1);
+    CHECK(sol.skipped[0].first == "c1");
+    CHECK_FALSE(sol.skipped[0].second.empty());
+    CHECK(sol.dof == 4);
+}
+
+TEST_CASE("conflicting dimensions identify their dependent partner") {
+    json s{{"entities", json::array({line("e1", 0, 0, 10, 0)})},
+           {"constraints", json::array({
+               {{"id", "c1"}, {"type", "length"}, {"refs", {"e1"}}, {"value", {{"value", 10}}}},
+               {{"id", "c2"}, {"type", "length"}, {"refs", {"e1"}}, {"value", {{"value", 20}}}}
+           })}};
+    const auto sol = solve_sketch(s, json::object());
+    REQUIRE_FALSE(sol.conflicting.empty());
+    const auto found = std::find_if(sol.dependency_partners.begin(), sol.dependency_partners.end(),
+        [&](const auto& entry) { return entry.first == sol.conflicting.front(); });
+    REQUIRE(found != sol.dependency_partners.end());
+    REQUIRE(found->second.size() == 1);
+    CHECK(found->second.front() != found->first);
+}
+
+TEST_CASE("rotated point constraint stays defined at and away from its pivot") {
+    double x = 0.0, y = 0.0, angle = 90.0;
+    SUBCASE("source at pivot") {}
+    SUBCASE("source moved from pivot") { x = 2.0; y = 1.0; }
+    SUBCASE("negative angle") { x = 2.0; y = 1.0; angle = -90.0; }
+    const json sketch{{"entities", json::array({point("e1", x, y), point("e2", 0, 0)})},
+                      {"constraints", json::array({
+                          rel("c1", "fix", {"e1"}),
+                          dim("c2", "rotate_point", {"e1", "e2", "origin"}, angle, "A")
+                      })}};
+    const auto solved = solve_sketch(sketch, json{{"A", angle}});
+    REQUIRE(solved.converged);
+    CHECK(solved.skipped.empty());
+    CHECK(solved.entities["e2"]["p"][0].get<double>() ==
+          doctest::Approx(angle > 0 ? -y : y).epsilon(1e-7));
+    CHECK(solved.entities["e2"]["p"][1].get<double>() ==
+          doctest::Approx(angle > 0 ? x : -x).epsilon(1e-7));
+    const auto measured = chudware::sketch::measure_constraint(sketch["constraints"][1], solved.entities);
+    if (x == 0.0 && y == 0.0) CHECK_FALSE(measured.has_value());
+    else {
+        REQUIRE(measured.has_value());
+        CHECK(*measured == doctest::Approx(angle).epsilon(1e-7));
+    }
+}
+
+TEST_CASE("rotated point constraint solves a movable pivot") {
+    const json sketch{{"entities", json::array({point("e1", 1, 0), point("e2", 1, 2),
+                                                point("e3", 0, 0)})},
+                      {"constraints", json::array({
+                          rel("c1", "fix", {"e1"}), rel("c2", "fix", {"e2"}),
+                          dim("c3", "rotate_point", {"e1", "e2", "e3"}, 90)
+                      })}};
+    const auto solved = solve_sketch(sketch, json::object());
+    REQUIRE(solved.converged);
+    CHECK(solved.skipped.empty());
+    CHECK(solved.entities["e3"]["p"][0].get<double>() == doctest::Approx(0.0).epsilon(1e-7));
+    CHECK(solved.entities["e3"]["p"][1].get<double>() == doctest::Approx(1.0).epsilon(1e-7));
+}
+
+TEST_CASE("linked rotation constraints report missing or cyclic masters") {
+    json first = dim("c1", "rotate_point", {"e1", "e2", "origin"}, 90);
+    json second = dim("c2", "rotate_point", {"e1", "e3", "origin"}, 90);
+    SUBCASE("missing") { first["angle_ref"] = "c9"; }
+    SUBCASE("cyclic") { first["angle_ref"] = "c2"; second["angle_ref"] = "c1"; }
+    const json sketch{{"entities", json::array({point("e1", 1, 0), point("e2", 0, 1),
+                                                point("e3", 0, 1)})},
+                      {"constraints", json::array({first, second})}};
+    const auto solved = solve_sketch(sketch, json::object());
+    CHECK_FALSE(solved.skipped.empty());
+}
+
+TEST_CASE("signed component and equal offset cross zero without changing branch") {
+    for (const double value : {0.0, -3.0, 4.0}) {
+        json driving = dim("c3", "signed_distance", {"e1", "e2"}, value, "D");
+        driving["axis"] = "h";
+        json linked = rel("c4", "equal_offset", {"e3", "e4", "e1", "e2"});
+        linked["axis"] = "h";
+        const json sketch{{"entities", json::array({point("e1", 0, 0), point("e2", 0, 0),
+                                                    point("e3", 2, 0), point("e4", 2, 0)})},
+                          {"constraints", json::array({rel("c1", "fix", {"e1"}),
+                                                       rel("c2", "fix", {"e3"}), driving, linked})}};
+        const auto solved = solve_sketch(sketch, json{{"D", value}});
+        REQUIRE(solved.converged);
+        CHECK(solved.skipped.empty());
+        CHECK(solved.entities["e2"]["p"][0].get<double>() == doctest::Approx(value).epsilon(1e-7));
+        CHECK(solved.entities["e4"]["p"][0].get<double>() == doctest::Approx(2 + value).epsilon(1e-7));
+        const auto measured = chudware::sketch::measure_constraint(driving, solved.entities);
+        REQUIRE(measured.has_value());
+        CHECK(*measured == doctest::Approx(value).epsilon(1e-7));
+    }
+}

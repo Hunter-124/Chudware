@@ -25,6 +25,9 @@
 // GL/GUI thread only.
 #include "kit.h"
 
+#include <array>
+#include <functional>
+#include <string_view>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -1176,7 +1179,7 @@ Tone statusTone(Status s) {
     }
 }
 
-// Ported from the copilot's drawStatusGlyph, which is the canonical one. `r` is the vector-mark
+// The canonical status mark (originally the copilot's own row glyph). `r` is the vector-mark
 // radius; the brand mark's ink box is the enclosing glyph CELL (r / 0.30), exactly the ratio the
 // original's legibility ladder was measured at — so statusGlyphInline reproduces it pixel for
 // pixel, and a caller that reserves the cell gets the same art everywhere.
@@ -1191,7 +1194,7 @@ void statusGlyph(ImDrawList* dl, ImVec2 center, float r, Status s, const Adaptiv
         case Status::Running:
             // Busy IS the brand mark in motion, so a running step, the composer and the copilot
             // header are visibly the same object. Ambient motion never settles: pump the frames.
-            anim::requestFrames();
+            anim::requestFramesAt(30.0f);
             if (box >= ui::kTesseractSpinnerMinPx) {
                 ui::drawTesseractSpinner(dl, center, box, ImGui::GetTime(), col);
             } else {
@@ -1295,7 +1298,8 @@ void progressBar(float frac, const char* caption, Tone t, float height) {
     if (!(frac >= 0.0f && frac <= 1.0f)) {
         const float segW = barW * kMarqueeFrac;
         const float span = barW + segW;
-        const float head = anim::phase() * span - segW;
+        anim::requestFramesAt(30.0f);
+        const float head = (float)std::fmod(ImGui::GetTime() / anim::kMarch, 1.0) * span - segW;
         const float a    = p0.x + ImMax(0.0f, head);
         const float b    = p0.x + ImMin(barW, head + segW);
         if (b > a) dl->AddRectFilled(ImVec2(a, by), ImVec2(b, by + barH), fill, rnd);
@@ -1314,7 +1318,7 @@ void progressBar(float frac, const char* caption, Tone t, float height) {
 }
 
 void spinner(const char* label, Tone t) {
-    anim::requestFrames();   // the mark turns off GetTime(); without this it stutters at 20 Hz
+    anim::requestFramesAt(30.0f);
     ui::busyLabel(label ? label : "", toneU32(t));
 }
 
@@ -1519,6 +1523,20 @@ void keyValueRow(const char* key, const char* value, Tone valueTone, bool copyab
 
 std::string elide(const char* text, float maxW) {
     if (!text || !text[0] || maxW <= 0.0f) return std::string();
+    struct Entry {
+        size_t hash = 0;
+        float width = 0.0f, fontSize = 0.0f;
+        ImFont* font = nullptr;
+        std::string text, shown;
+    };
+    static std::array<Entry, 512> cache;
+    const std::string_view value(text);
+    const size_t hash = std::hash<std::string_view>{}(value);
+    Entry& entry = cache[hash % cache.size()];
+    if (entry.font == ImGui::GetFont() && entry.fontSize == ImGui::GetFontSize() &&
+        entry.width == maxW && entry.hash == hash && entry.text == text)
+        return entry.shown;
+    auto compute = [&]() -> std::string {
     if (ImGui::CalcTextSize(text).x <= maxW) return std::string(text);
 
     // Three ASCII periods, NOT U+2026: the app font has no ellipsis codepoint in every atlas
@@ -1540,6 +1558,18 @@ std::string elide(const char* text, float maxW) {
     }
     if (lo == 0) return std::string(kEll);
     return s.substr(0, lo) + kEll;
+    };
+    std::string shown = compute();
+    // Bound both entry count and retained label size.
+    if (value.size() <= 4096) {
+        entry.hash = hash;
+        entry.width = maxW;
+        entry.font = ImGui::GetFont();
+        entry.fontSize = ImGui::GetFontSize();
+        entry.text = text;
+        entry.shown = shown;
+    }
+    return shown;
 }
 
 // ==================================================================================================

@@ -196,11 +196,10 @@ json liveMethodError(const json &response) {
 }
 
 // In-process live event streaming (desktop InProcCore path): bridge cpp_core's
-// thread-local C event sink to the current call's EventFn so agent-run events
-// reach the Copilot/timeline AS THEY HAPPEN instead of a batched replay after
-// the (multi-minute) run. Daemon mode streams via hostd's agent.event push
-// (engine_events) instead, so this in-proc sink is used only when
-// !daemonMode().
+// thread-local C event sink to the current call's EventFn so simulation progress
+// events reach the UI AS THEY HAPPEN instead of after the (multi-minute) solve.
+// Daemon mode streams via hostd's agent.event push (engine_events) instead, so
+// this in-proc sink is used only when !daemonMode().
 thread_local WorkerClient::EventFn t_inproc_event_sink;
 void inprocEventThunk(const char *ev_json, void *) {
   if (!t_inproc_event_sink || !ev_json)
@@ -210,34 +209,25 @@ void inprocEventThunk(const char *ev_json, void *) {
   } catch (...) {
   }
 }
-// Run an in-process agent engine::call with live streaming to onEvent.
-// `streamedLive` reports whether events fired live (so the caller skips the
-// batched replay to avoid doubles). RAII-clears the sink even if engine::call
-// throws.
-bool callAgentStreaming(const std::string &coreMethod, const json &p,
-                        json &cppResult, std::string &cerr, int timeoutMs,
-                        const WorkerClient::EventFn &onEvent,
-                        bool &streamedLive) {
+// Run an engine::call with live event streaming to onEvent (sim_run_topology).
+// RAII-clears the in-process sink even if engine::call throws.
+bool callEngineStreaming(const std::string &coreMethod, const json &p,
+                         json &cppResult, std::string &cerr, int timeoutMs,
+                         const WorkerClient::EventFn &onEvent) {
   if (engine::daemonMode()) {
     // Daemon: hostd pushes {"event":"agent.event","data":<ev>} and EngineClient
     // hands our router the PAYLOAD (`data`) live, mid-call, on this worker
-    // thread. `fired` tells us whether the daemon actually streamed (a
-    // same-build daemon does) so an OLD daemon that only returns the batched
-    // result["events"] still falls back to the caller's replay.
-    bool fired = false;
+    // thread.
     auto router = [&](const json &ev) {
-      if (onEvent && ev.is_object() && !ev.empty()) {
-        fired = true;
+      if (onEvent && ev.is_object() && !ev.empty())
         onEvent(ev);
-      }
     };
-    bool ok = engine::call(coreMethod, p, cppResult, cerr, timeoutMs, router);
-    streamedLive = fired;
-    return ok;
+    return engine::call(coreMethod, p, cppResult, cerr, timeoutMs, router);
   }
   // In-process: the cpp_core thread-local sink fires each event live ->
   // onEvent.
-  streamedLive = static_cast<bool>(onEvent) && core::cpp_core().hasEventSink();
+  const bool streamLive =
+      static_cast<bool>(onEvent) && core::cpp_core().hasEventSink();
   struct Guard {
     bool on;
     ~Guard() {
@@ -246,8 +236,8 @@ bool callAgentStreaming(const std::string &coreMethod, const json &p,
         t_inproc_event_sink = {};
       }
     }
-  } guard{streamedLive};
-  if (streamedLive) {
+  } guard{streamLive};
+  if (streamLive) {
     t_inproc_event_sink = onEvent;
     core::cpp_core().setEventSink(&inprocEventThunk, nullptr);
   }
@@ -260,7 +250,7 @@ bool callAgentStreaming(const std::string &coreMethod, const json &p,
 // prefix IS the commit-at-doc_new marker, giving an all-or-nothing-per-document
 // binding with no separate routing state. The C++ doc engine is the only
 // document backend (parity-complete since 2026-06-19), so the
-// native agent seam below drives the same doc-cpp sessions.
+// agent seam below drives the same doc-cpp sessions.
 
 // Methods that MINT a new document (vs. operate on an existing one). hostd
 // attaches a minted document rw to the connection that minted it, so callImpl
@@ -286,6 +276,9 @@ bool routeDocToCpp(const std::string &method, const json &params) {
   // mints a NEW doc-cpp part from the generator. There is no Python equivalent,
   // so always route to the core.
   if (method == "parts_catalog_list" || method == "parts_make")
+    return true;
+  // Source inspection and renderer capability are document-free native methods.
+  if (method == "scad_status" || method == "scad_inspect")
     return true;
   // doc_formats (the import/export format matrix) is C++-only
   // (core/doc/formats).
@@ -391,12 +384,12 @@ bool routeDocToCpp(const std::string &method, const json &params) {
     return true;
   }
   // Agent RPCs are owned by the AGENT seam (routeAgentToCpp), which translates
-  // the host names (agent_run_v2 -> agent_run, get_prompts_v2 ->
-  // agent_get_prompts_v2). They also carry the active doc's doc_id, so without
-  // this guard the doc seam below would greedily claim them by the doc-cpp
-  // prefix and call the C++ core with the UNtranslated name -> "unknown method:
-  // agent_run_v2". Never route agent_* / get_prompts_v2 here.
-  if (method.rfind("agent_", 0) == 0 || method == "get_prompts_v2")
+  // the host names (agent_ask_v2 -> agent_answer_question, agent_pm_assist_v1 ->
+  // agent_pm_assist). They also carry the active doc's doc_id, so without this
+  // guard the doc seam below would greedily claim them by the doc-cpp prefix and
+  // call the C++ core with the UNtranslated name -> "unknown method:
+  // agent_ask_v2". Never route agent_* here.
+  if (method.rfind("agent_", 0) == 0)
     return false;
   // A C++-backed doc carries a doc-cpp id -> EVERY call operating on it routes
   // to the C++ core for that doc's whole lifetime (even if the flag was since
@@ -456,30 +449,14 @@ bool routeDocToCpp(const std::string &method, const json &params) {
     return true;
   return false;
 }
-// --- Native offline-agent routing ------------------------------------------------
-// Online turns use agent_admin_turn/Chudcode. These methods retain deterministic native
-// fallback behavior for C++ documents, plus read-only probes and control calls.
+// --- Agent seam routing ------------------------------------------------------
+// Online turns use agent_admin_turn/OMP. The engine keeps only read-only agent
+// probes (agent_ask_v2, agent_pm_assist_v1, agent_simulate_v1, agent_list_models);
+// agent_cancel/agent_steer/agent_answer control calls reach only online runs.
 
-// Is the active document a C++-backed ("doc-cpp") session? For agent_run_v2 /
-// agent_ask_v2 the host passes the active doc_id directly in params;
-// agent_pm_assist_v1 carries it too. get_prompts_v2 has no doc and is always
-// safe to route (read-only).
-bool agentDocIsCpp(const std::string &method, const json &params) {
-  if (method == "get_prompts_v2")
-    return true; // doc-independent (prompt catalog)
-  // The pre-flight clarify gate fires on a Design-new submit BEFORE any part
-  // doc exists, so it is doc-independent like get_prompts_v2: always safe to
-  // route to C++ (it only reads the request + optional live-session context).
-  // This also loads the DLL lazily.
-  if (method == "agent_clarify_v1")
-    return true;
-  // Cancel is process-wide registry keyed by run_id — no doc needed.
-  if (method == "agent_cancel")
-    return true;
-  // Steer and the ask_user answer are the same per-run registry path as cancel
-  // — no doc needed.
-  if (method == "agent_steer" || method == "agent_answer")
-    return true;
+// Is the active document a C++-backed ("doc-cpp") session? agent_ask_v2 /
+// agent_pm_assist_v1 / agent_simulate_v1 carry the active doc_id in params.
+bool agentDocIsCpp(const json &params) {
   if (!params.is_object())
     return false;
   auto it = params.find("doc_id");
@@ -489,6 +466,12 @@ bool agentDocIsCpp(const std::string &method, const json &params) {
 }
 
 bool routeAgentToCpp(const std::string &method, const json &params) {
+  // Online-run control (cancel / steer / ask_user answer) is answered by hostd
+  // (daemon) or locally (in-process) when no worker run matched; it never needs
+  // the engine DLL.
+  if (method == "agent_cancel" || method == "agent_steer" ||
+      method == "agent_answer")
+    return true;
   // Model-availability probe is doc-independent and provider-diagnostic; route
   // it to the C++ core whenever the DLL loads (the host picker falls back to a
   // static catalog if the core is unavailable).
@@ -496,20 +479,15 @@ bool routeAgentToCpp(const std::string &method, const json &params) {
     std::string lerr;
     return engine::ensureLoaded(lerr);
   }
-  if (!(method == "agent_run_v2" || method == "agent_ask_v2" ||
-        method == "agent_clarify_v1" || method == "agent_pm_assist_v1" ||
-        method == "agent_simulate_v1" || method == "agent_mission_v1" ||
-        method == "agent_cancel" || method == "agent_steer" ||
-        method == "agent_answer" ||
-        method == "get_prompts_v2"))
+  if (!(method == "agent_ask_v2" || method == "agent_pm_assist_v1" ||
+        method == "agent_simulate_v1"))
     return false; // everything else stays Python
-  if (!agentDocIsCpp(method, params))
-    return false; // only C++-backed docs (or doc-indep)
+  if (!agentDocIsCpp(params))
+    return false; // only C++-backed docs
   // Ensure the core DLL is loadable before committing to the C++ path.
   // ensureLoaded is idempotent (loads once); if it can't load, fall through to
   // the Python worker so the agent never hard-breaks. For a doc-cpp doc the DLL
-  // is already loaded (it minted the doc); for get_prompts_v2 this triggers the
-  // lazy load on first use.
+  // is already loaded (it minted the doc).
   std::string lerr;
   return engine::ensureLoaded(lerr);
 }
@@ -589,9 +567,13 @@ bool routeEcadToCpp(const std::string &method, const json &params) {
       "ecad_close",           "ecad_describe",      "ecad_resolve_pick",
       "ecad_dfm",             "ecad_autoroute",     "ecad_route_diff_pair",
       "ecad_fill_zones",      "ecad_simulate",      "ecad_to_3d",
-      "ecad_export",          "ecad_save",          "ecad_update_from_sch"};
+      "ecad_export",          "ecad_save",          "ecad_update_from_sch",
+      "ecad_reload",          "ecad_kicad_check",   "ecad_symbols",
+      "ecad_footprints",      "ecad_kicad_libraries", "ecad_kicad_status"};
   static const char *const kDocless[] = {
       "ecad_new",             "ecad_open",          "ecad_design",
+      "ecad_new_project",     "ecad_open_project",  "ecad_kicad_status",
+      "ecad_footprints",      "ecad_kicad_libraries",
       "ecad_symbols",         "ecad_load_symbol_library",
       "ecad_schema",          "ecad_list_ops",      "ecad_recipe",
       "ecad_closest_recipe",  "ecad_impedance"};
@@ -1082,7 +1064,8 @@ bool WorkerClient::callWorkerControl(const std::string &action,
   WorkerControlInfo info;
   {
     std::lock_guard<std::mutex> lock(workerControlMtx_);
-    if (!chudware::worker::detail::matchesActiveRun(activeWorkerRunId_, runId))
+    if (action != "apply_compaction_policy" &&
+        !chudware::worker::detail::matchesActiveRun(activeWorkerRunId_, runId))
       return false;
     matched = true;
     if (workerControl_.transport ==
@@ -1488,15 +1471,14 @@ bool WorkerClient::restartPoisonedWorker(std::string &err) {
 
 void WorkerClient::abortPending() {
   abort_.store(true);
-  // Wake a blocked daemon agent_run so AsyncRpc::shutdown / app quit cannot
-  // hang on a multi-minute modeling call. In-proc path still relies on
-  // agent_cancel (libchudware cooperative flag) which requestStopRun already
-  // fired.
+  // Wake a blocked daemon agent turn so AsyncRpc::shutdown / app quit cannot
+  // hang on a multi-minute call.
   if (engine::daemonMode()) {
     if (auto *c = engine::client())
       c->abortPending();
-    // The long agent/mission run now streams on its own dedicated connection
-    // (engine_backend runClient) — abort that too, or a blocked run pins quit.
+    // Long agent turns and simulation solves stream on their own dedicated
+    // connections (engine_backend runClient) — abort those too, or a blocked
+    // run pins quit.
     engine::abortRunClient();
   }
 }
@@ -1858,6 +1840,16 @@ bool WorkerClient::callViaSideClient(const std::string &method,
 bool WorkerClient::callImpl(const std::string &method, const json &params,
                             json &result, std::string &err, int timeoutMs,
                             const EventFn &onEvent) {
+  if (method == "omp_apply_compaction_policy") {
+#ifdef __EMSCRIPTEN__
+    return engine::call(method, params, result, err, timeoutMs, onEvent);
+#else
+    if (engine::daemonMode())
+      return callViaSideClient(method, params, result, err, timeoutMs, onEvent);
+    bool matched = false;
+    return callWorkerControl("apply_compaction_policy", "", params, matched, result, err);
+#endif
+  }
   // Agent control and an in-process C++ sim_cancel must reach the engine WHILE
   // their corresponding long call is blocked on this WorkerClient. The normal
   // callMtx_ serialization makes a cancellation queued behind the work it is
@@ -1886,24 +1878,20 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
   const engine::RunLane lane = engine::runLane(method);
   const bool isLongRun = lane != engine::RunLane::None;
   // Dedicated daemon connections keep long calls off the GUI document socket.
-  // Native runs use longRunMtx_ and simulations use g_simLaneMtx, independently.
-  // Online daemon turns take neither lane mutex nor callMtx_: each leases its
-  // own agent connection and control goes through hostd by run_id.
-  // Pipe mode still holds callMtx_ because stdio carries one request at a time.
-  // Native runs whose private connection cannot open also keep callMtx_ for
-  // their shared-connection fallback.
-  const bool daemonLongRun = isLongRun && !daemonAgentTurn &&
-                             engine::daemonMode() && engine::runConnectionReady(lane);
-  std::mutex &laneMtx =
-      lane == engine::RunLane::Sim ? g_simLaneMtx : longRunMtx_;
-  std::unique_lock<std::mutex> lk(daemonLongRun ? laneMtx : callMtx_,
+  // Simulations use g_simLaneMtx. Online daemon turns take neither lane mutex nor
+  // callMtx_: each leases its own agent connection and control goes through hostd
+  // by run_id. Pipe mode still holds callMtx_ because stdio carries one request
+  // at a time.
+  const bool daemonSimRun = lane == engine::RunLane::Sim &&
+                            engine::daemonMode() && engine::simRunConnectionReady();
+  std::unique_lock<std::mutex> lk(daemonSimRun ? g_simLaneMtx : callMtx_,
                                   std::defer_lock);
   if (isCppSimCancel && engine::daemonMode()) {
     // Keep cancellation on an independent socket even if a solve's dedicated
     // connection was unavailable; it must never queue behind the work it stops.
     return callViaSideClient(method, params, result, err, timeoutMs, onEvent);
   }
-  if (daemonLongRun && lane == engine::RunLane::Sim &&
+  if (daemonSimRun &&
       engine::isSimLanePreview(method) && !lk.try_lock()) {
     // A mesh preview arrives on the GUI's single-FIFO st.rpc lane while a solve
     // (SimClient's own WorkerClient, possibly hours of topology optimization)
@@ -1917,11 +1905,11 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
     // Engine-bound call arriving while another call holds callMtx_ — e.g. a
     // slow doc_rebuild: the GUI thread makes config_list / doc_tree / pick
     // calls on normal interaction, and blocking it behind that call froze the
-    // whole app (2026-07-21 SIGABRT crash, then behind an agent_run). In daemon mode
+    // whole app (2026-07-21 SIGABRT crash, then behind a long agent call). In daemon mode
     // hostd serves each connection on its own thread, so sidestep the wait
     // with a short-lived side connection. Excluded (keep blocking on the shared
     // connection): minting calls (doc_new/doc_open/import_file,
-    // ecad_new/ecad_open — hostd attaches a minted document rw to the
+    // ecad_design, ecad_new/ecad_open and their project variants — hostd attaches minted documents rw to the
     // connection that minted it, and a side connection closes as soon as the
     // call returns), agent-seam methods (routeAgentToCpp translates host RPC
     // names to core names — agent_ask_v2→agent_answer_question etc. — which the
@@ -1931,7 +1919,8 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
         (method.rfind("cam_", 0) == 0 || routeSimToCpp(method, params) ||
          routeEcadToCpp(method, params) || routeFirmwareToCpp(method, params) ||
          (routeDocToCpp(method, params) && !isMintingMethod(method, params))) &&
-        method != "ecad_new" && method != "ecad_open";
+        method != "ecad_new" && method != "ecad_open" && method != "ecad_design" &&
+        method != "ecad_new_project" && method != "ecad_open_project";
     if (engineBound && !lk.try_lock())
       return callViaSideClient(method, params, result, err, timeoutMs, onEvent);
   }
@@ -1942,85 +1931,15 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
     err = "aborted";
     return false;
   }
-  // Native agent fallback. Online top-level turns arrive as agent_admin_turn and do not enter
-  // this block; libchudware restricts agent_run_v2 to offline-safe local providers.
+  // Retained native agent RPCs: read-only probes (agent_ask_v2,
+  // agent_pm_assist_v1, agent_simulate_v1, agent_list_models) and the online-run
+  // control calls. Online top-level turns arrive as agent_admin_turn and do not
+  // enter this block.
   if (routeAgentToCpp(method, params)) {
     std::string cerr;
     json cppResult;
     bool ok = false;
-    if (method == "agent_run_v2") {
-      // {request, doc_id, provider?, model?, reasoning_effort?, ...} ->
-      // agent_run. The C++ core resolves the provider from config.json unless
-      // the GUI pins a provider NAME (or full descriptor) + model/effort
-      // overrides (picker O1). CRITICAL: those top-level override fields MUST
-      // be forwarded — dropping them makes the picker decorative and leaves
-      // ambient config.json/env in charge.
-      json p = {{"request", params.value("request", std::string())},
-                {"doc_id", params.value("doc_id", std::string())}};
-      for (const char *k : {"provider", "model", "reasoning_effort",
-                            "attachments", "context_refs"}) {
-        auto it = params.find(k);
-        if (it != params.end())
-          p[k] = *it;
-      }
-      // Pass through any run options the host may carry
-      // (budgets/run_id/control).
-      json options = json::object();
-      for (const char *k : {"options", "budgets", "run_id", "control"}) {
-        auto it = params.find(k);
-        if (it != params.end()) {
-          if (std::string(k) == "options" && it->is_object())
-            options = *it;
-          else
-            options[k] = *it;
-        }
-      }
-      if (!options.empty())
-        p["options"] = options;
-      bool streamedLive = false;
-      ok = callAgentStreaming("agent_run", p, cppResult, cerr, timeoutMs,
-                              onEvent, streamedLive);
-      // Batched replay ONLY when events did NOT stream live (old engine w/o the
-      // sink export). When streamedLive, onEvent already fired per-event during
-      // the run — replaying the batched cppResult["events"] would double every
-      // card.
-      if (!streamedLive && ok && onEvent && cppResult.is_object() &&
-          cppResult.contains("events") && cppResult["events"].is_array()) {
-        for (const auto &ev : cppResult["events"])
-          onEvent(ev);
-      }
-    } else if (method == "agent_mission_v1") {
-      // {request, doc_id, provider?, model?, ...} -> agent_mission_v1. Same O1
-      // passthrough as agent_run_v2 so the picker beats ambient config.
-      json p = {{"request", params.value("request", std::string())},
-                {"doc_id", params.value("doc_id", std::string())}};
-      for (const char *k : {"provider", "model", "reasoning_effort",
-                            "attachments", "context_refs"}) {
-        auto it = params.find(k);
-        if (it != params.end())
-          p[k] = *it;
-      }
-      json options = json::object();
-      for (const char *k : {"options", "budgets", "run_id", "control"}) {
-        auto it = params.find(k);
-        if (it != params.end()) {
-          if (std::string(k) == "options" && it->is_object())
-            options = *it;
-          else
-            options[k] = *it;
-        }
-      }
-      if (!options.empty())
-        p["options"] = options;
-      bool streamedLive = false;
-      ok = callAgentStreaming("agent_mission_v1", p, cppResult, cerr, timeoutMs,
-                              onEvent, streamedLive);
-      if (!streamedLive && ok && onEvent && cppResult.is_object() &&
-          cppResult.contains("events") && cppResult["events"].is_array()) {
-        for (const auto &ev : cppResult["events"])
-          onEvent(ev);
-      }
-    } else if (method == "agent_ask_v2") {
+    if (method == "agent_ask_v2") {
       // {question, doc_id, provider?, model?, ...} -> agent_answer_question.
       json p = {{"question", params.value("question", std::string())},
                 {"doc_id", params.value("doc_id", std::string())}};
@@ -2030,16 +1949,6 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
           p[k] = *it;
       }
       ok = engine::call("agent_answer_question", p, cppResult, cerr, timeoutMs);
-    } else if (method == "agent_clarify_v1") {
-      // {request, doc_id, provider?, model?, ...} -> agent_clarify.
-      json p = {{"request", params.value("request", std::string())},
-                {"doc_id", params.value("doc_id", std::string())}};
-      for (const char *k : {"provider", "model", "reasoning_effort"}) {
-        auto it = params.find(k);
-        if (it != params.end())
-          p[k] = *it;
-      }
-      ok = engine::call("agent_clarify", p, cppResult, cerr, timeoutMs);
     } else if (method == "agent_pm_assist_v1") {
       // The host's PM payload (doc_id, intent, form_schema, current,
       // selected_refs) IS the params object the C++ assist expects under
@@ -2052,10 +1961,6 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
       // the same shape the Python agent_pm_assist_v1 returns.
       if (ok && cppResult.is_object() && cppResult.contains("validated"))
         cppResult = cppResult["validated"];
-    } else if (method == "get_prompts_v2") {
-      // -> agent_get_prompts_v2 {} (C++ default/env resolves the prompts dir).
-      ok = engine::call("agent_get_prompts_v2", json::object(), cppResult, cerr,
-                        timeoutMs);
     } else if (method == "agent_list_models") {
       // {provider, base_url?, api_key?} -> {ok, models:[...]} (pass-through
       // probe).
@@ -2067,14 +1972,15 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
       // the flow condition + runs LBM).
       ok =
           engine::call("agent_simulate_v1", params, cppResult, cerr, timeoutMs);
-    } else if (method == "agent_steer" || method == "agent_answer") {
-      // Mid-run steering / ask_user answer: steer queues `text` for the run to
-      // consume at the next stage/attempt boundary; answer resolves the run's
-      // pending question batch. Same transport shape as agent_cancel:
-      // in-process calls libchudware directly; daemon mode uses a SHORT-LIVED
-      // second EngineClient so the control call never queues behind the
-      // in-flight agent_run on the shared socket (hostd routes it to the
-      // active worker run's control lane).
+    } else if (isAgentControl) {
+      // Cancel / steer / ask_user answer reach only ONLINE (Python worker / OMP)
+      // runs; the engine has no run registry. callAgentCancel/Steer/Answer
+      // already tried the direct worker control socket, so a call that lands
+      // here matched no live worker run. Daemon: a SHORT-LIVED second
+      // EngineClient so the call never queues behind an in-flight turn on the
+      // shared socket; hostd routes it to the active worker run's control lane
+      // and answers the unmatched reply itself. In-process there is no hostd,
+      // so answer the same unmatched reply shape here.
       if (engine::daemonMode()) {
         chudware_ipc::EngineClient side;
         chudware_ipc::EngineClient::Options opts;
@@ -2090,39 +1996,22 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
           ok = false;
         }
       } else if (method == "agent_answer") {
-        // In-process there is no hostd to route to the worker's control lane,
-        // and libchudware has no question registry: callAgentAnswer already
-        // tried the direct worker control socket, so no live run owns it.
         cppResult = json{{"ok", false},
                          {"run_id", params.value("run_id", std::string())},
                          {"batch_id", params.value("batch_id", std::string())},
                          {"answered", false},
                          {"reason", "no active agent run for this question"}};
         ok = true;
+      } else if (method == "agent_steer") {
+        cppResult = json{{"ok", true},
+                         {"steered", false},
+                         {"reason", "no active agent run"}};
+        ok = true;
       } else {
-        ok = engine::call(method, params, cppResult, cerr, timeoutMs);
-      }
-    } else if (method == "agent_cancel") {
-      // Best-effort stop. In-process: call libchudware directly (no mutex
-      // contention with the blocked agent_run). Daemon: open a SHORT-LIVED
-      // second EngineClient so we don't queue behind the in-flight agent_run on
-      // the shared socket.
-      if (engine::daemonMode()) {
-        chudware_ipc::EngineClient side;
-        chudware_ipc::EngineClient::Options opts;
-        opts.clientKind = "gui";
-        opts.hostdBin =
-            engine::hostdBinHint(); // same instance key as the live daemon
-        opts.allowSpawn = false;    // never spawn a new hostd for cancel
-        std::string cerr2;
-        if (side.connectOrSpawn(opts, cerr2)) {
-          ok = side.call("agent_cancel", params, cppResult, cerr, 5000);
-        } else {
-          cerr = cerr2.empty() ? "cancel: daemon unreachable" : cerr2;
-          ok = false;
-        }
-      } else {
-        ok = engine::call("agent_cancel", params, cppResult, cerr, timeoutMs);
+        cppResult = json{{"ok", true},
+                         {"cancelled", false},
+                         {"reason", "no active agent run"}};
+        ok = true;
       }
     }
     if (ok) {
@@ -2137,13 +2026,13 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
       return true;
     }
     // Hard failure (a C++ throw, not a structured {code} envelope). The v2
-    // agent RPCs (agent_run_v2 / ask / clarify / pm_assist / simulate) are
-    // C++-ONLY — the Python worker deleted them (engine/worker.py: "MIGRATED TO
-    // THE C++ CORE"), so falling through to it would ALWAYS return the
-    // misleading "unknown method: agent_run_v2" and bury the real cause (e.g. a
-    // provider/config error). Surface the actual C++ error instead.
-    // (agent_list_models is the one exception: it has a host-side static
-    // catalog fallback, so we let it fall through and degrade gracefully.)
+    // agent RPCs (ask / pm_assist / simulate) are C++-ONLY — the Python worker
+    // deleted them (engine/worker.py: "MIGRATED TO THE C++ CORE"), so falling
+    // through to it would ALWAYS return a misleading "unknown method" and bury
+    // the real cause (e.g. a provider/config error). Surface the actual error
+    // instead. (agent_list_models is the one exception: it has a host-side
+    // static catalog fallback, so we let it fall through and degrade
+    // gracefully.)
     if (method != "agent_list_models") {
       err = cerr.empty() ? ("cpp-agent (" + method + ") failed") : cerr;
       if (errorSink_)
@@ -2167,9 +2056,8 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
     // existing non-streaming call.
     bool callOk = false;
     if (method == "sim_run_topology") {
-      bool streamedLive = false;
-      callOk = callAgentStreaming(method, params, cppResult, cerr, timeoutMs,
-                                  onEvent, streamedLive);
+      callOk = callEngineStreaming(method, params, cppResult, cerr, timeoutMs,
+                                   onEvent);
     } else {
       callOk = engine::call(method, params, cppResult, cerr, timeoutMs);
     }
@@ -2307,21 +2195,6 @@ bool WorkerClient::callImpl(const std::string &method, const json &params,
       return true; // structured OpError round-tripped
     }
     err = "cpp-firmware (" + method + "): " + cerr;
-    if (errorSink_)
-      errorSink_(method, err);
-    return false;
-  }
-  // agent_cap_raw remains a pure native helper. It has no Python registration,
-  // so route it directly to the loaded core and never fall back to the pipe.
-  if (method == "agent_cap_raw") {
-    std::string cerr;
-    if (engine::call(method, params, result, cerr, timeoutMs))
-      return true;
-    if (result.is_object() && result.contains("code")) {
-      err = result.value("message", std::string("agent_cap_raw error"));
-      return true;
-    }
-    err = cerr.empty() ? "agent_cap_raw failed" : cerr;
     if (errorSink_)
       errorSink_(method, err);
     return false;

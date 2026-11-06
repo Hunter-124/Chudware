@@ -12,10 +12,12 @@ a thin compatibility shim re-exporting this package's public API while
 Public API:
     register_provider(provider)   — add a CatalogProvider to the registry
     search(query, ...)            — ranked FTS search across the index
-    get(part_id)                  — retrieve a single PartRecord
+    get(part_id, include_live=True, acquire=False) — retrieve or acquire a PartRecord
     rebuild_index()               — (re)build the SQLite FTS5 index from all providers
 """
 from __future__ import annotations
+
+import threading
 
 from .registry import ProviderRegistry
 from .index import PartsIndex
@@ -23,13 +25,17 @@ from .hub import PartsHub
 
 # Module-level singleton hub (lazy-init on first call).
 _hub: PartsHub | None = None
+_hub_lock = threading.Lock()
 
 
 def _get_hub() -> PartsHub:
     global _hub
     if _hub is None:
-        _hub = PartsHub()
-        _hub.bootstrap()
+        with _hub_lock:
+            if _hub is None:
+                hub = PartsHub()
+                hub.bootstrap()
+                _hub = hub
     return _hub
 
 
@@ -43,19 +49,24 @@ def search(query: str, *,
            filters: dict | None = None,
            limit: int = 20,
            sites: list[str] | None = None,
-           include_live: bool = True) -> list[dict]:
+           include_live: bool = True,
+           force_live: bool = False) -> list[dict]:
     """Full-text search across all indexed providers. Returns ranked PartRecord dicts.
 
     ``sites`` restricts the live vendor fan-out to a category's fitting vendors
     (taxonomy routing) — see :meth:`PartsHub.search`. ``include_live=False`` returns
-    only the instant local FTS layer (no browser fan-out)."""
+    only the instant local FTS layer (no browser fan-out). ``force_live=True``
+    requests vendor discovery even when local results are strong."""
     return _get_hub().search(query, domain=domain, filters=filters, limit=limit,
-                             sites=sites, include_live=include_live)
+                             sites=sites, include_live=include_live, force_live=force_live)
 
 
-def get(part_id: str) -> dict | None:
-    """Retrieve a single PartRecord by part_id. Returns None if not found."""
-    return _get_hub().get(part_id)
+def get(part_id: str, *, include_live: bool = True, acquire: bool = False) -> dict | None:
+    """Retrieve metadata, optionally acquiring and verifying its geometry."""
+    if acquire:
+        from .parts_library import acquire_part
+        return acquire_part(part_id, offline=not include_live)
+    return _get_hub().get(part_id, include_live=include_live)
 
 
 def rebuild_index() -> int:

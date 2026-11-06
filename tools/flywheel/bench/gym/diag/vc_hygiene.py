@@ -244,7 +244,7 @@ def run_vc_hygiene(provider: Any, *, seed: int = 1) -> dict[str, Any]:
                 "detail": f"provider error: {type(exc).__name__}: {exc}",
                 "sequence": [],
                 "reply": "",
-                "error": False,
+                "error": True,
             })
             continue
         graded = grade_vc_hygiene(str(reply or ""), task)

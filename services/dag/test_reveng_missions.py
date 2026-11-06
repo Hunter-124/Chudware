@@ -402,10 +402,18 @@ class TestDenseAppliesConfirmedScale(unittest.TestCase):
         root = Path(self.tmp) / self.SESSION_ID
         (root / "images").mkdir(parents=True)
         _write_image(root / "images" / "a.jpg")
-        sparse = root / "sparse"
-        sparse.mkdir()
+        dataset = root / "dataset"
+        sparse = dataset / "sparse"
+        sparse.mkdir(parents=True)
+        (dataset / "images").mkdir()
         s = rt._make_session(self.SESSION_ID, "scale apply", None)
         s["artifacts"]["sparse_dir"] = str(sparse)
+        s["sfm_dataset"] = {
+            "dataset_dir": str(dataset),
+            "sparse_dir": str(sparse),
+            "images_dir": str(dataset / "images"),
+            "source_signature": rc._source_signature(rc._session_image_paths(self.SESSION_ID)),
+        }
         rt._save_session(s)
 
     def tearDown(self):
@@ -440,6 +448,8 @@ class TestDenseAppliesConfirmedScale(unittest.TestCase):
             self.assertAlmostEqual(actual, wanted, places=6)
 
     def _set_scale(self, mm_per_unit, confirmed: bool):
+        from services.vision.recon_transform import ReconTransform
+
         s = rt._load_session(self.SESSION_ID)
         s["scale"] = {
             "method": "aruco_mat",
@@ -447,6 +457,11 @@ class TestDenseAppliesConfirmedScale(unittest.TestCase):
             "residual_pct": 0.4,
             "confirmed": confirmed,
         }
+        s["recon_transform"] = ReconTransform(
+            mm_per_unit=mm_per_unit,
+            rotation=[[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
+            translation_mm=[0., 0., 0.], source="aruco_mat", confirmed=confirmed,
+        ).to_json()
         rt._save_session(s)
 
     def _run_dense_node(self):
@@ -496,6 +511,31 @@ class TestDenseAppliesConfirmedScale(unittest.TestCase):
         self._assert_mesh_extent(dense, (2.5, 5.0, 7.5))
         self.assertEqual(dense.result["mesh_units"], "mm")
 
+    def test_dense_rejects_a_changed_capture_set(self):
+        self._set_scale(2.5, confirmed=True)
+        image = Path(self.tmp) / self.SESSION_ID / "images" / "b.jpg"
+        _write_image(image)
+        res = self._run_dense_node()
+        self.assertFalse(res.success)
+        self.assertIn("current capture set", res.result["hint"])
+        self.assertFalse(rt._load_session(self.SESSION_ID)["artifacts"].get("mesh_path"))
+
+    def test_new_sparse_gauge_discards_old_scale_even_if_reconstruction_fails(self):
+        self._set_scale(2.5, confirmed=True)
+        _write_image(Path(self.tmp) / self.SESSION_ID / "images" / "b.jpg")
+        with mock.patch("services.vision.colmap_pipeline.run_sparse",
+                        return_value={"ok": False, "reason": "unavailable"}), \
+             mock.patch("services.vision.ffwd_sfm.run_ffwd_sfm",
+                        return_value={"ok": False, "reason": "unavailable"}):
+            agent_fn = rt._make_pipeline_agent_fn(self.SESSION_ID)
+            result = agent_fn("sparse", {"node_id": "n_sparse"})
+        self.assertFalse(result.success)
+        session = rt._load_session(self.SESSION_ID)
+        self.assertIsNone(session["scale"]["mm_per_unit"])
+        self.assertFalse(session["scale"]["confirmed"])
+        self.assertNotIn("recon_transform", session)
+        self.assertNotIn("sfm_dataset", session)
+
     def test_scale_gate_never_confirms_a_scale_that_does_not_exist(self):
         agent_fn = rt._make_pipeline_agent_fn(self.SESSION_ID)
         res = agent_fn("confirm scale", {"node_id": "n_scale_gate"})
@@ -532,16 +572,15 @@ class TestMissionGateTools(unittest.TestCase):
 
         from mcp.server.fastmcp import FastMCP
         from services.mcp.reveng_tools import register_reveng_tools
+        from services.vision.scale_solver import ScaleResult
 
         server = FastMCP("_reveng_gate_test")
         register_reveng_tools(server)
         self.tool = lambda name: server._tool_manager.get_tool(name).fn
 
-        # A session with a solved-but-unconfirmed scale: exactly the state the
-        # scale-confirm gate exists to adjudicate.
+        # A scale must be solved against the new sparse gauge, not carried from
+        # an unrelated pre-reconstruction session.
         s = rt._make_session(self.SESSION_ID, "gate tools", None)
-        s["scale"] = {"method": "known_dim", "mm_per_unit": 2.5,
-                      "residual_pct": 0.4, "confirmed": False}
         rt._save_session(s)
         images = Path(os.environ["CHUDWARE_REVENG_DIR"]) / self.SESSION_ID / "images"
         images.mkdir(parents=True, exist_ok=True)
@@ -552,6 +591,17 @@ class TestMissionGateTools(unittest.TestCase):
         # reconstruction must not consume the background run's polling deadline.
         sparse = images.parent / "sparse"
         sparse.mkdir()
+
+        def prepare_dataset(sparse_dir, image_dir, dataset_dir, *, source_image_map):
+            dataset = Path(dataset_dir)
+            (dataset / "sparse").mkdir(parents=True)
+            (dataset / "images").mkdir()
+            return {
+                "ok": True, "dataset_dir": str(dataset),
+                "sparse_dir": str(dataset / "sparse"), "images_dir": str(dataset / "images"),
+                "image_name_map": source_image_map, "registered": 1,
+            }
+
         for patcher in (
             mock.patch.object(rc, "_reveng_status", return_value={"capabilities": {}}),
             mock.patch(
@@ -560,6 +610,11 @@ class TestMissionGateTools(unittest.TestCase):
                     "ok": True, "sparse_dir": str(sparse),
                     "registered": 1, "backend": "test",
                 },
+            ),
+            mock.patch("services.vision.colmap_pipeline.prepare_dataset", prepare_dataset),
+            mock.patch(
+                "services.vision.scale_solver.solve_scale_charuco",
+                return_value=ScaleResult("aruco_mat", 2.5, 0.4, n_views=3),
             ),
         ):
             patcher.start()
@@ -665,6 +720,48 @@ class TestMissionGateTools(unittest.TestCase):
         self.assertEqual(rec["gate"]["gate_kind"], "dimension_confirm")
         status = self._call("reveng_gate_status", session_id=self.SESSION_ID)
         self.assertIn("dims", status["gate"]["pending"])
+
+    def test_approved_gate_applies_scale_to_the_mission_mesh(self):
+        o3d = pytest.importorskip("open3d")
+
+        def run_openmvs(dataset_dir, session_dir, **kwargs):
+            mesh = Path(session_dir) / "mesh" / "native.obj"
+            mesh.parent.mkdir(parents=True, exist_ok=True)
+            mesh.write_text(
+                "v 0 0 0\nv 1 0 0\nv 0 2 0\nv 0 0 3\n"
+                "f 1 3 2\nf 1 2 4\nf 1 4 3\nf 2 3 4\n"
+            )
+            return {"ok": True, "mesh_path": str(mesh), "backend": "openmvs"}
+
+        with mock.patch("services.vision.dense_backends.run_openmvs", run_openmvs), \
+             mock.patch("services.vision.gaussian_pipeline.train_splat_from_dataset",
+                        return_value={"ok": False, "reason": "not_installed"}), \
+             mock.patch("services.vision.segment_fit.segment_fit",
+                        return_value={"ok": False, "reason": "not_installed"}), \
+             mock.patch.object(rc, "_call_reverse_engineer",
+                               return_value={"ok": False, "reason": "not_installed"}):
+            self._launch()
+            self._wait_for("paused")
+            session = rt._load_session(self.SESSION_ID)
+            self.assertFalse(session["scale"]["confirmed"])
+            self.assertFalse(session["recon_transform"]["confirmed"])
+            self.assertFalse(session["artifacts"].get("mesh_path"))
+
+            out = self._call("reveng_resolve_gate", session_id=self.SESSION_ID,
+                             decision="approve")
+            self.assertTrue(out["ok"], out)
+            rec = self._wait_for("paused")
+            self.assertEqual(rec["gate"]["gate_kind"], "dimension_confirm")
+            self.assertIsNone(rc._mission_running(self.SESSION_ID))
+
+            session = rt._load_session(self.SESSION_ID)
+            self.assertTrue(session["scale"]["confirmed"])
+            self.assertTrue(session["recon_transform"]["confirmed"])
+            self.assertEqual(session["artifacts"]["mesh_units"], "mm")
+            mesh = o3d.io.read_triangle_mesh(session["artifacts"]["mesh_path"])
+            for actual, expected in zip(mesh.get_axis_aligned_bounding_box().get_extent(),
+                                        (2.5, 5.0, 7.5)):
+                self.assertAlmostEqual(actual, expected, places=6)
 
     def test_a_paused_gate_is_resolvable_the_instant_it_is_observable(self):
         """Approving must not be refused for a mission that is only waiting to be approved.

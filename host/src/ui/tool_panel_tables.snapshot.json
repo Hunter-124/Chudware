@@ -12,7 +12,6 @@
   "manufacture",
   "mission",
   "office",
-  "org",
   "parts",
   "plm",
   "recon",
@@ -43,17 +42,18 @@
    "add_features",
    "add_gdt",
    "add_hole_callout",
+   "add_mesh_reference",
    "add_ordinate_dimensions",
    "add_section_view",
    "add_surface_finish",
    "add_weld_symbol",
-   "analyze_stl_geometry",
    "arrange_drawing",
    "asm_add_component",
    "asm_mate",
+   "assembly_dof",
    "assembly_plan_review",
-   "assess_mesh_quality",
    "audit_drawing",
+   "bom_consistency_check",
    "cad_graph",
    "cad_graph_link",
    "cad_guide",
@@ -62,14 +62,15 @@
    "check_geometry_health",
    "check_interference",
    "check_metadata",
+   "check_model_history",
    "check_sketch",
    "check_sketch3d",
    "check_symmetry",
    "close_part",
    "code_check",
    "contact_sheet",
-   "design_audit",
    "design_review",
+   "disassembly_check",
    "doc_diff_tool",
    "doc_sketch_contact_sheet",
    "draft_analysis",
@@ -77,13 +78,17 @@
    "edit_drawing_annotation",
    "engine_profile",
    "engine_profile_tree",
+   "eval_curvature",
+   "eval_geometry_analysis",
    "export_drawing",
+   "export_flat_dxf",
    "export_part",
+   "fastener_check",
+   "find_stress_risers",
    "fit_cylinder_axis",
    "get_job",
    "get_part",
    "heal_body",
-   "health_check",
    "import_part",
    "inspect_feature",
    "inspect_model_integrity",
@@ -91,12 +96,12 @@
    "inspect_part",
    "inspect_section",
    "interface_check",
-   "is_watertight",
    "layout_plan",
    "layout_plan_report",
    "list_artifacts",
    "list_configurations",
    "list_drawing_sheets",
+   "list_mesh_references",
    "list_parts",
    "list_standard_parts",
    "list_world_bodies",
@@ -108,6 +113,7 @@
    "make_weldment_traveler",
    "make_work_instruction",
    "make_workbook",
+   "mate_fit_check",
    "measure",
    "measure_between",
    "measure_part",
@@ -130,10 +136,10 @@
    "query_geometry",
    "read_native_file",
    "recover_parts",
-   "redo",
    "regen_diagnose",
    "regen_resolve",
    "relocate_native_files",
+   "remove_mesh_reference",
    "render_animation",
    "render_document",
    "render_part",
@@ -147,6 +153,9 @@
    "req_verify_by_id",
    "review_drawing",
    "save_part",
+   "scad_convert",
+   "scad_inspect",
+   "scad_status",
    "set_active_drawing_sheet",
    "set_config_override",
    "set_config_suppression",
@@ -154,6 +163,7 @@
    "set_titleblock",
    "set_view",
    "show_in_app",
+   "simplify_part",
    "sketch3d_add_constraints",
    "sketch3d_add_curves",
    "sketch3d_as_sweep_guide",
@@ -172,7 +182,8 @@
    "stackup_analyze",
    "suggest_dimension_scheme",
    "suggest_drawing_dimension_scheme",
-   "undo",
+   "tool_access_check",
+   "update_mesh_reference",
    "verify_battery",
    "wait_job",
    "wall_thickness"
@@ -229,12 +240,12 @@
    "ecad_design",
    "ecad_edit_symbol",
    "ecad_export",
-   "ecad_export_kicad",
    "ecad_fill_zones",
+   "ecad_find_footprint",
    "ecad_find_part",
    "ecad_fpga_check",
-   "ecad_import_kicad",
    "ecad_junction",
+   "ecad_kicad_status",
    "ecad_label",
    "ecad_lint_schematic",
    "ecad_load_symbol_library",
@@ -245,6 +256,7 @@
    "ecad_new_schematic",
    "ecad_no_connect",
    "ecad_note",
+   "ecad_open",
    "ecad_optimize_traces",
    "ecad_place_symbol",
    "ecad_plot",
@@ -294,6 +306,22 @@
    "fw_sources",
    "fw_status",
    "fw_verify_board",
+   "harness_add_connector",
+   "harness_add_wire",
+   "harness_build_geometry",
+   "harness_bus_check",
+   "harness_cable_model",
+   "harness_check",
+   "harness_connect",
+   "harness_edit",
+   "harness_electrical_check",
+   "harness_formboard",
+   "harness_from_netlist",
+   "harness_get",
+   "harness_new",
+   "harness_report",
+   "harness_route",
+   "harness_to_bus_links",
    "heatsink_select",
    "power_budget"
   ],
@@ -324,6 +352,7 @@
    "describe_scene",
    "describe_sketch",
    "describe_toolpaths",
+   "doc_face_edges",
    "hover",
    "query_adjacency",
    "render_ascii",
@@ -333,12 +362,14 @@
    "render_sketch_ascii",
    "sketch_auto_constrain",
    "sketch_fully_define",
-   "sketch_health"
+   "sketch_health",
+   "sketch_probe"
   ],
   "intake": [
    "ask_user",
    "confirm_dimensions",
    "dfm_check",
+   "dfm_reinforce",
    "fit_report",
    "intake_status",
    "make_fit_coupon",
@@ -399,12 +430,6 @@
    "office_read_pptx",
    "office_read_xlsx"
   ],
-  "org": [
-   "channel_send",
-   "council_convene",
-   "request_raise",
-   "request_resolve"
-  ],
   "parts": [
    "bom_price",
    "bom_rollup",
@@ -416,7 +441,10 @@
    "list_spec_templates",
    "match_model",
    "match_part_number",
+   "part_acquire",
    "part_get",
+   "part_library_ingest",
+   "part_library_sync",
    "part_place",
    "part_search",
    "part_source",
@@ -465,7 +493,9 @@
   "recon": [
    "compare_parts",
    "convert_face_to_sketch",
+   "measure_mesh_reference",
    "project_into_sketch",
+   "reveng_attach_reference",
    "reverse_engineer",
    "start_capture_session",
    "stop_capture_session"
@@ -498,14 +528,20 @@
    "list_reveng_sessions",
    "reveng_add_images",
    "reveng_add_video",
+   "reveng_align_axes",
    "reveng_attach_result",
    "reveng_build_parametric",
    "reveng_cancel_splat",
+   "reveng_confirm_scale",
+   "reveng_convert_splat",
    "reveng_crop_splat",
+   "reveng_find_models",
    "reveng_finish_splat",
    "reveng_fit_primitives",
    "reveng_gate_status",
+   "reveng_import_splat",
    "reveng_ingest_datasheet",
+   "reveng_install_tools",
    "reveng_make_part_from_library",
    "reveng_print_scale_mat",
    "reveng_reconstruct",
@@ -513,10 +549,13 @@
    "reveng_resolve_gate",
    "reveng_set_scale",
    "reveng_single_photo",
+   "reveng_sparse_preview",
    "reveng_splat_status",
+   "reveng_splat_to_mesh",
    "reveng_start_session",
    "reveng_start_splat",
-   "reveng_status"
+   "reveng_status",
+   "reveng_use_model"
   ],
   "shell": [
    "run_shell"
@@ -554,6 +593,7 @@
    "civil_water_solve",
    "civil_watershed",
    "duct_size",
+   "fea_probe",
    "gear_check",
    "hydraulic_add_component",
    "hydraulic_add_hose",
@@ -632,7 +672,7 @@
  "descs": {
   "activate_configuration": "Switch the active configuration. The part rebuilds to that variant's parameters.",
   "add_balloon": "Add a BOM item balloon with a leader anchored at sheet point ``a``.",
-  "add_chamfer_dimension": "Add a native chamfer callout (default text ``length × angle°``).",
+  "add_chamfer_dimension": "Dimension a chamfer feature at its visible edge; size and angle come from the model.",
   "add_configuration": "Add a new configuration (a named parametric variant) to the current part.",
   "add_datum": "Add a datum feature symbol (triangle + boxed letter). doc_id = drawing_doc_id. label is the datum letter (\"A\"); a is the feature point, pos …",
   "add_datum_target": "Add a Y14.5 datum target. target_type is point|line|area; labels use A1, A2, ...",
@@ -641,9 +681,10 @@
   "add_drawing_sheet": "Add a sheet to a drawing and return its stable sheet id.",
   "add_drawing_table": "Add an on-sheet bom|revision|holes|notes|cutlist table.",
   "add_drawing_view": "Add one projected view. orientation is front|back|top|bottom|left|right|iso; view_type is base|projected|iso. ``show_hidden`` controls …",
-  "add_features": "Apply a list of document ops to build/edit the part (the core modeling tool).",
+  "add_features": "Apply an atomic list of document ops to build or edit a part.",
   "add_gdt": "Add an ASME Y14.5 feature-control frame, including an optional composite row.",
-  "add_hole_callout": "Add a semantic hole/thread callout at projected circle pick ``a``.",
+  "add_hole_callout": "Add a semantic hole/thread callout.",
+  "add_mesh_reference": "Embed a PLY, STL or OBJ as a non-solid reference; transform maps source units to mm.",
   "add_ordinate_dimensions": "Add native datum-origin ordinate dimensions for target sheet points.",
   "add_section_view": "Add a section with an explicit world plane or a sheet cut line.",
   "add_surface_finish": "Add a surface-finish symbol. doc_id = drawing_doc_id. ra is the roughness value (\"1.6\"); machining: any|required|prohibited. a is the …",
@@ -654,11 +695,13 @@
   "arrange_drawing": "Re-lay a drawing sheet professionally in one call (no sheet-mm math).",
   "ask_user": "Ask the human a typed batch of questions and return machine-readable answers.",
   "asm_add_component": "Insert a saved part file into the current assembly as a component.",
-  "asm_mate": "Add a MATE between two components of the current assembly (and solve it).",
+  "asm_mate": "Add a MATE between components of the current assembly (and solve it).",
+  "assembly_dof": "Report instantaneous solved-pose mate Jacobian freedoms, including disconnected groups. Per-component projected freedoms are not additive …",
   "assembly_plan_review": "Best-practice review of an assembly's structure BEFORE a large build.",
   "audit_drawing": "Audit manufacturing coverage and deterministic drawing-standard compliance.",
   "bearing_life": "ISO 281 rolling-element bearing L10 fatigue life estimate.",
   "board_from_schematic": "ONE-CALL schematic -> preliminary PCB: sync footprints, place (connectivity-aware), autoroute, then (by default) optimize traces (arc …",
+  "bom_consistency_check": "Compare live native BOM rows, placed component/pattern quantities and source identity; screen geometric bore patterns against finite screw …",
   "bom_price": "Roll up the BOM for `doc_path` AND resolve bought-line prices via the provider chain.",
   "bom_rollup": "Roll an assembly (+ any linked ECAD board) up into a unified made/bought BOM.",
   "box_status": "Box.com mirror status: whether mirroring is enabled/connected, the connected account, pending spooled projects, and — when ``path`` (or the …",
@@ -669,8 +712,8 @@
   "buildgraph_status": "Return the current node statuses of a buildgraph run.",
   "cad_graph": "Traverse the CAD project graph — dimensional links + assembly structure.",
   "cad_graph_link": "Author an AI link between two graph nodes (origin=\"ai\").",
-  "cad_guide": "Return the engine's modeling/simulation knowledge so you can drive it well. CALL FIRST.",
-  "cad_skill": "Load one CAD skill pack — the full procedure behind a name in the [SKILLS] catalog.",
+  "cad_guide": "Get modeling or simulation guidance by topic.",
+  "cad_skill": "Load a named CAD skill's procedure; path selects a resource within the pack.",
   "cam_add_operation": "Add a machining operation to a setup. type: face|contour2d|pocket2d|slot|chamfer2d| …",
   "cam_add_setup": "Add a machining setup (a stock + WCS + machine/platform). machine: mill3|mill4|mill5| router|lathe|millturn|laser|plasma|waterjet. …",
   "cam_add_tool": "Add (or replace by number) a tool in the library. type: endmill_flat|endmill_ball| …",
@@ -692,19 +735,19 @@
   "cam_save": "Save the active CAM job to a .cam+ file at *path*. Relative paths use the selected project root, never the worker or daemon cwd; without a …",
   "cam_set_stock": "Set/replace a setup's stock. stock types: box | box_offset | cylinder | cylinder_offset | from_solid | from_sim (see cad_guide('cam')). …",
   "cam_setup_sheet": "Generate the operator setup sheet as backward-compatible HTML + text.",
-  "cam_simulate": "Material-removal simulation: removed/remaining volume, machined fraction, gouge, rapid-through-stock, and holder/shank collision checks …",
+  "cam_simulate": "Material-removal simulation and cycle time per setup. Gouge comparison uses a mesh extracted from the current part in model coordinates …",
   "cam_tool_import": "Import a cutting-tool part (end mill / drill / tap from the parts library, e.g. category tools.cutting_tools.*) into the current CAM job's …",
   "cam_tool_types": "List the supported tool types and their cutting-data class.",
   "cam_undo": "Undo the last CAM edit on the active job (ops, tools, setups, stock).",
   "cam_update_operation": "Update fields on an existing operation (merge). e.g. {\"stepover\":2,\"feed\":900}.",
-  "channel_send": "Send a message on a channel between departments.",
-  "check_feature_overlap": "Intra-PART feature-vs-feature overlap — do two of THIS part's own features collide?",
+  "check_feature_overlap": "Inspect intersections between this part's pre-boolean feature tools.",
   "check_geometry_health": "Is this solid actually SOUND? Watertight / closed-manifold verdict + the counts that prove it.",
   "check_interference": "Clash/clearance check — do the bodies OVERLAP, and if not, how tight is the gap?",
   "check_metadata": "Return the full verify-battery check registry: names, cost class, platform, reward shape.",
+  "check_model_history": "Inspect a part's editable feature history without changing or rebuilding it.",
   "check_sketch": "Check whether a sketch is well-constrained (fully defined) and report what's missing.",
   "check_sketch3d": "Check whether a 3D sketch is well-constrained — the sketch3d twin of check_sketch.",
-  "check_symmetry": "Is the part mirror-symmetric about a principal datum plane? Returns the deviation.",
+  "check_symmetry": "Is the part mirror-symmetric about a plane? Returns the deviation.",
   "civil_alignment": "Create/update a highway alignment from PIs/radii/spirals or explicit horizontal segments. UNITS: SI m for stations/elevations/radii …",
   "civil_alignment_analyze": "Analyze alignment profile/design_vs_existing, sight_distance, sections or earthwork. UNITS: SI m, m², m³; speed km/h, cross-slope % …",
   "civil_buried_pipe_check": "Check buried pipe earth/live loads, Iowa deflection, buckling and flotation.",
@@ -741,7 +784,6 @@
   "confirm_dimensions": "Close fit-critical demands with TYPED caliper values (the dims we refuse to guess).",
   "contact_sheet": "Render SEVERAL labelled views tiled into ONE image — the fastest multi-angle self-check.",
   "convert_face_to_sketch": "\"Convert entities\": trace a planar face's boundary wires into a NEW editable sketch ON that face — the manual reverse-engineering primitive …",
-  "council_convene": "Convene a council (§19: build_strategy | spec_review | failure_review | ...).",
   "dag_abort": "Cancel a gate-paused DAG run by injecting decision='reject'.",
   "dag_approve": "Resume a gate-paused DAG run with decision='approve'.",
   "dag_plan": "Decompose a mission description into an aicad.dag/1 graph JSON.",
@@ -750,9 +792,9 @@
   "dag_status": "Return the current state of a DAG run.",
   "delegate": "Spawn a sub-agent role with an isolated brief and token budget.",
   "describe_assembly": "Compact narrative of an assembly (or multi-body part) — world placement, fit/clearance, and mate solve summary. Use INSTEAD of dumping …",
-  "describe_board": "Compact narrative of an ECAD schematic or PCB — component roster, net list, ERC/DRC summary, and unconnected pins. Promotes ecad_status …",
-  "describe_part": "Compact, NAMED outline of the part — use INSTEAD of dumping every face on a complex part.",
-  "describe_project": "Compact narrative of a DAG project run — nodes done/blocked, budgets, open questions. Uses the live DAG run's status, budget and …",
+  "describe_board": "Compact narrative of a KiCad schematic or PCB — component roster, net list, ERC/DRC summary, and unconnected pins.",
+  "describe_part": "Describe a part's bounding box, feature placement, patterns and topology.",
+  "describe_project": "Describe a DAG run's nodes, owners, budget and open questions.",
   "describe_results": "Compact narrative of FEA/CFD simulation results — use INSTEAD of dumping raw study JSON. Returns max von Mises stress, displacement, factor …",
   "describe_reveng_result": "Describe the reverse-engineering result for *session_id*.",
   "describe_scene": "Deterministic \"what the render would show\" per view, from B-rep face normals — the non-vision fallback for render_part / render_views / …",
@@ -761,9 +803,12 @@
   "design_recipe": "Map a natural-language intent to an ordered tool recipe (or list the catalog).",
   "design_review": "Run a comprehensive design review battery and return a narrated verdict card.",
   "dfm_check": "Evaluate DfM as pass, fail, or not_evaluated against the ProcessProfile.",
+  "dfm_reinforce": "Preview FDM wall-thickening edits verified on isolated clones, without changing the part.",
+  "disassembly_check": "Test straight removal along +/- world axes and resolved mate axes, then find a removal order from the resulting blocker graph. Tests at …",
   "doc_diff_tool": "Compute a semantic feature-level diff between two document JSON revisions.",
+  "doc_face_edges": "Page the body-local edge topo IDs bordering one face on a part.",
   "doc_sketch_contact_sheet": "Multi-view contact sheet of the whole doc INCLUDING all sketches-in-progress.",
-  "draft_analysis": "Moldability check: which faces lack enough DRAFT to release from the mold?",
+  "draft_analysis": "Draft-angle check along ONE pull direction: which faces have less than min_draft_deg of draft?",
   "drawing_bom": "Return stable item/name/quantity/source BOM rows from a drawing's source assembly.",
   "duct_size": "Size an HVAC/process duct tree (equal friction): diameters, velocities, pressure drops, fan static.",
   "ecad_add_power": "Drop a power/ground port (e.g. net='GND', 'VCC', '+5V') at ``(x, y)``.",
@@ -782,31 +827,32 @@
   "ecad_delete": "Delete any schematic entity by id, or delete a symbol by reference designator.",
   "ecad_design": "Autonomous ECAD design: natural-language request -> verified schematic + simulation.",
   "ecad_edit_symbol": "Edit a placed symbol by reference designator (``R1``) or internal id (``s1``).",
-  "ecad_export": "Export a fabrication output from the active board.",
-  "ecad_export_kicad": "Export the active schematic as a KiCad 7 ``.kicad_sch`` file.",
+  "ecad_export": "Export KiCad fabrication and visualization outputs from the active board.",
   "ecad_fill_zones": "Fill every copper pour on the active board at FULL resolution and report the result.",
+  "ecad_find_footprint": "Search installed KiCad footprint libraries by name or description.",
   "ecad_find_part": "Search the component library and return RANKED real parts so you place an actual part instead of inventing a libid.",
   "ecad_fpga_check": "Bank-aware FPGA design checks on the active schematic.",
-  "ecad_import_kicad": "Import a KiCad ``.kicad_sch`` file into the active schematic.",
   "ecad_junction": "Add an electrical junction at exact world ``(x, y)``.",
+  "ecad_kicad_status": "Report the installed KiCad tools, version, and library availability.",
   "ecad_label": "Place a net label ``text`` at ``(x, y)``. Two labels of the same text+scope on a sheet merge their nets; ``scope='global'`` merges across …",
   "ecad_lint_schematic": "GEOMETRIC self-check of the active schematic — run this BEFORE ecad_run_erc.",
   "ecad_load_symbol_library": "Load every symbol from a KiCad ``.kicad_sym`` library into the native catalog.",
   "ecad_make_board": "ONE-SHOT board flow: from the active schematic, run sync -> autoroute -> fill zones -> DRC and report every step's outcome, remaining …",
   "ecad_make_part": "CREATE a real library part — symbol + footprint — from a pinout YOU supply.",
   "ecad_netlist": "Read the compiled schematic netlist.",
-  "ecad_new_pcb": "Start a NEW PCB (board) document and make it the active one.",
-  "ecad_new_schematic": "Start a NEW schematic document and make it the active one.",
+  "ecad_new_pcb": "Create a KiCad PCB and make it the active board.",
+  "ecad_new_schematic": "Start a NEW KiCad schematic document and make it the active one.",
   "ecad_no_connect": "Mark the pin at exact world ``(x, y)`` intentionally unconnected.",
   "ecad_note": "Add non-electrical schematic text at ``(x,y)`` in mm.",
+  "ecad_open": "Open a KiCad project or electronics file and make its documents active.",
   "ecad_optimize_traces": "Post-route polish on the active board (E2): round ~90° corners to arcs, add teardrops at pad/via junctions, and retune track widths toward …",
   "ecad_place_symbol": "Place a symbol on the active schematic and return its assigned REF plus its full PIN LIST (name/number/type/world-xy) and the count of pins …",
   "ecad_plot": "Plot the schematic to vector SVG or PDF and return confirmed artifact path(s).",
   "ecad_route_diff_pair": "Route ONE differential pair without disturbing the rest of an already-routed board.",
   "ecad_route_pad_to_pad": "Route ONE copper trace between two pads by hand — the surgical complement to ecad_autoroute, and the tool autoroute's \"failed net\" report …",
   "ecad_run_dfm": "Run the Design-For-Manufacturing (DFM) check suite on the active board and return a readable summary grouped by rule (counts + worst …",
-  "ecad_run_drc": "Run the Design Rule Check on the active board and return a summary with the worst offenders (clearance, track width, via size, annular …",
-  "ecad_run_erc": "Run the Electrical Rules Check on the active schematic and return the violations as readable lines plus a one-line verdict ('N errors, M …",
+  "ecad_run_drc": "Run KiCad's authoritative design-rule check on the active board.",
+  "ecad_run_erc": "Run KiCad's authoritative electrical rules check on the active schematic.",
   "ecad_run_hostcheck": "Run the MCU/FPGA host-board rule pack on the active board — the device-level checks that brick a host board even when DRC/ERC are clean.",
   "ecad_run_pdn": "DC power-delivery (IR-drop) analysis of the active board's power-net copper.",
   "ecad_run_sicheck": "Run the high-speed / signal-integrity rule pack on the active board: length-match groups (per-net deltas vs the group median), diff-pair …",
@@ -818,34 +864,40 @@
   "ecad_symbols": "Discover native schematic symbols instead of guessing libids.",
   "ecad_tf": "Run a DC small-signal transfer function (.tf) on the active schematic's circuit.",
   "ecad_thermal_handoff": "One call from the active routed board to a solved thermal FEA study.",
-  "ecad_to_3d": "Export a 3D model (STEP) of the active board + the aicad.boardphys/1 sidecar.",
+  "ecad_to_3d": "Export a KiCad STEP with component models and a board-physics sidecar.",
   "ecad_update_from_sch": "Populate the active PCB from the active schematic (KiCad 'Update PCB from Schematic').",
   "ecad_verify_airflow": "Was the thermal handoff's film-coefficient assumption sane? Compare the preset-h FEA component temperatures against the CHT (airflow) …",
   "ecad_verify_thermal": "Verify the last (or a passed) ecad_thermal_handoff result against component temperature limits + a theta_ja hand calc.",
-  "ecad_vibe_check": "Vibration reliability screen of the ACTIVE routed board — modal solve of the mounted board+components solid, excitation-band resonance …",
+  "ecad_vibe_check": "Vibration reliability screen of a routed KiCad board — modal solve of the mounted board+components solid, excitation-band resonance …",
   "ecad_wire": "Auto-route an orthogonal wire from one pin to another (emits sch_connect) and return the RESULTING net plus the updated list of what is …",
   "edit_drawing_annotation": "Edit or delete one existing drawing annotation without rebuilding the sheet.",
   "em_driven": "Driven S-parameter sweep of a uniform guide section (analytic-uniform default).",
   "em_eigenmode": "Waveguide eigenmode cutoffs (builtin-fdfd by default).",
   "em_status": "EM solver matrix — which backends are installed and the default per analysis.",
   "em_timedomain": "Time-domain pulse through a uniform guide (analytic dispersive IFFT default).",
-  "enable_tools": "Request more tool categories mid-turn (see [TOOL CATEGORIES] menu).",
+  "enable_tools": "Load tool schemas and guidance by area or exact name.",
   "engine_profile": "Profile THIS engine process (the one your modeling RPCs run in) at runtime.",
   "engine_profile_tree": "Nested profile tree (file-tree style) — root + hot children, path drill-down.",
+  "eval_curvature": "Evaluate one body's curvature field; returns a bounded AICM handle and extrema.",
+  "eval_geometry_analysis": "Inspect B-rep geometry defects; page flattened body-local findings with offset/limit.",
   "export_drawing": "Export a 2D DRAWING document to editable vector deliverables.",
+  "export_flat_dxf": "Export a sheet-metal flat pattern, not a 3D interchange model.",
   "export_part": "Export the current part to an interchange/mesh file; returns the written path.",
   "export_reveng_bundle": "Export the full RE session directory as a zip bundle to *dest*.",
+  "fastener_check": "Discover placed standard screws and screen their current coaxial geometry. position_tolerances maps component IDs to {joint …",
+  "fea_probe": "Sample a solver VTU by point(s), CAD face SID, or 3D box/sphere region.",
   "feeds_speeds": "Compute table-driven rpm / feed / stepdown / stepover envelope for a material + tool type + operation (aicad.calc/1, contracts/advisor.md …",
   "fetch_cad_model": "Download CAD geometry from an HTTPS file URL or model page into this project.",
+  "find_stress_risers": "Screen located geometry for possible stress risers; severity is not a safety verdict.",
   "fit_calc": "ISO 286 fit maths, in DESIGN mode (what should the sizes be?) or MEASURED mode (what fit do these two real sizes actually give?) — code …",
   "fit_cylinder_axis": "Least-squares CYLINDER AXIS from the geometry around a point — works on TESSELLATED imports where there is no analytic cylindrical face to …",
   "fit_report": "The fit report to review before printing: each mating pair's modeled-vs-source dimension, the clearance applied for the process, its …",
-  "fs_edit": "Replace text in an existing file. By default *old* MUST occur exactly once (a safe, unambiguous edit); set replace_all=True to replace …",
-  "fs_glob": "Find paths matching a glob (e.g. 'src/**/*.py'). Returns matches newest-first. Capped at 1000.",
-  "fs_grep": "Regex-search files under *path* (optionally filtered by *glob*, e.g. '*.py'). Returns {file, line, text} matches, capped at 500. …",
-  "fs_list": "List a directory's entries (name, dir flag, size). Capped at 1000 entries.",
-  "fs_read": "Read a text file, directory, or document with CONTEXT-SAFE, line-numbered output.",
-  "fs_write": "Create or OVERWRITE a text file with *content*. Parent dirs are created by default. Returns {ok, path, bytes}. Risk: write.",
+  "fs_edit": "Replace old text in a file. It must occur once unless replace_all=True.",
+  "fs_glob": "Find glob matches newest-first, capped at 1000.",
+  "fs_grep": "Regex-search files, optionally filtered by glob; returns up to 500 matches.",
+  "fs_list": "List directory entries (name, directory flag, size), capped at 1000.",
+  "fs_read": "Read a paged text file, directory, extracted document or CAD preview.",
+  "fs_write": "Create or overwrite a text file; make_dirs creates parents by default.",
   "fw_avr_flash": "Flash an AVR target via avrdude and return FlashResult.",
   "fw_build": "Build a firmware project with its toolchain and return the BuildResult: ``{success, elf_path, map_path, stderr, warnings, returncode, cmd …",
   "fw_debug_gdb_halt": "Interrupt/halt an ARM target via OpenOCD + gdb/MI (``-exec-interrupt`` + ``monitor halt``); returns FlashResult. See fw_debug_gdb_reset for …",
@@ -872,10 +924,26 @@
   "fw_verify_board": "Firmware↔board co-verification: check the firmware BACK against the PCB before fab and return ERC/DRC-shaped findings.",
   "gear_check": "AGMA spur-gear tooth bending and contact (pitting) stress check.",
   "get_job": "Poll a background job started by run_cfd_flow/run_fea_*(background=True).",
-  "get_part": "Return the feature tree (features, parameters, ids) + revision for editing.",
+  "get_part": "Return a part's revision and feature tree at tree.features.",
   "get_reveng_coverage": "Return measured capture coverage against the 11-shot orbit plan.",
   "get_reveng_deviation": "Compute mesh-vs-mesh (or mesh-vs-B-Rep tessellation) deviation (RE-16).",
   "get_reveng_session": "Return the full ``aicad.reveng_session/1`` manifest for *session_id*.",
+  "harness_add_connector": "Add a connector with a world frame or attach={sid:face_sid}, optionally on an assembly component.",
+  "harness_add_wire": "Connect two connector:pin endpoints. Supply AWG or CSA and insulated OD.",
+  "harness_build_geometry": "Build separate sweep bodies in a part or a persistent harness component in an assembly.",
+  "harness_bus_check": "Check i2c, can, can_fd, rs485, uart or spi bus signal integrity.",
+  "harness_cable_model": "Estimate per-length cable R/L/C, impedance and delay with cited basis.",
+  "harness_check": "Check routed geometry, fill, exits, segregation and shield termination without writing a study.",
+  "harness_connect": "Convenience pin-to-pin connection; for full wire metadata use harness_add_wire.",
+  "harness_edit": "Edit wires/defaults, edit_segment overrides, or add_clamp on a segment.",
+  "harness_electrical_check": "Check saved harness current, voltage drop, thermal/ampacity and protection.",
+  "harness_formboard": "Write an SVG, DXF or PDF true-length formboard; reports overlap and length verification.",
+  "harness_from_netlist": "Seed wires from a schematic. Map each 'REF:pin' to an endpoint or {connector:{definition},pin:n}.",
+  "harness_get": "Read a harness, or list harnesses by passing harness_id='*'. Lists are paginated.",
+  "harness_new": "Create a named harness study in a document; multiple harnesses can coexist.",
+  "harness_report": "Read cut list, wire lengths, BOM and connector pin/from-to tables; lists are paginated.",
+  "harness_route": "Route selected wires through the engine, reusing the existing forest and splitting breakouts.",
+  "harness_to_bus_links": "Convert saved harness routes to firmware simulation bus_links.",
   "heal_body": "REPAIR a topologically broken solid, as a RECORDED feature with an escalation ladder.",
   "heatsink_select": "Pick a heatsink for a hot component: candidates re-solved to a Tj target.",
   "hover": "Expand ONE face/edge by the stable `sid` describe_part / query_geometry handed you — its full semantic card (surf, side, signed normal …",
@@ -895,7 +963,7 @@
   "hydraulic_verify_fea": "Verify step for the hydraulic→FEA coupling: recompute the mount forces independently (area × max pressure from the envelope's recorded …",
   "hydraulic_verify_piping": "Verify step for the hydraulic→piping coupling: per-hose Darcy estimate vs piping 1-D solve, per line, plus the pump-margin feedback.",
   "import_artifact": "Import acquired STEP/IGES geometry and stamp its vendor provenance on the doc.",
-  "import_part": "Import a CAD/mesh file (STEP/IGES/BREP/STL/3MF/OBJ/PLY/glTF/3DM/DXF/DWG/ STEP+/DRAW+/…) as a body, or open a native standalone drawing. …",
+  "import_part": "Import a CAD/mesh file (STEP/IGES/BREP/STL/3MF/OBJ/PLY/glTF/3DM/DXF/DWG/ STEP+/DRAW+/SCAD/…) as a body or SCAD source feature, or open a …",
   "import_scan_mesh": "Import an externally-produced scan mesh (.ply / .obj) into *session_id*.",
   "inspect_feature": "One-call feature inspection: a multi-panel EMPHASIS sheet + describe excerpt + dims.",
   "inspect_model_integrity": "Census every solid, including disconnected solids INSIDE assembly components.",
@@ -913,13 +981,14 @@
   "list_calcs": "Discover registered engineering calculators (calculator registry).",
   "list_configurations": "List the part's configurations (parametric variants) and which one is active.",
   "list_drawing_sheets": "List every drawing sheet and the active sheet id.",
-  "list_parts": "List all open part/drawing documents in this engine session.",
+  "list_mesh_references": "List embedded mesh references, their placement and bounds in millimetres.",
+  "list_parts": "List open documents in pages; cursor is a zero-based offset and limit is 1..500.",
   "list_print_profiles": "Printer / print / filament presets from the installed slicer's vendor bundles.",
   "list_reveng_dims": "Return the dimension ledger the Review stage confirms against.",
-  "list_reveng_sessions": "List all reverse engineering sessions in the session store.",
+  "list_reveng_sessions": "List sessions belonging to the requested or current project, if known.",
   "list_spec_templates": "List the parametric templates the AI spec-sheet path (`spec_sheet_match`) can fill.",
   "list_standard_parts": "List the parametric standard-parts catalog (screws, nuts, washers, bearings, ...): each family's key, sizes, and lengths. Feed a family + …",
-  "list_tool_categories": "List requestable tool category packs (name + one line).",
+  "list_tool_categories": "List areas or search their tools with descriptions and pagination.",
   "list_world_bodies": "List a doc's bodies with their WORLD-placed bounding boxes.",
   "look_around": "Multi-angle close-ups of ONE target, tiled — 'walk around' the feature.",
   "machining_ref_get": "Return one bundled machining-reference row by its stable record id.",
@@ -936,9 +1005,11 @@
   "make_workbook": "Build a spreadsheet (.xlsx) with live formulas from a JSON spec; returns its record.",
   "match_model": "Match a discrete manufactured PRODUCT (has an MPN/brand identity, no 3D model, not standard hardware, not raw stock) to a CAD model in a …",
   "match_part_number": "Match a purchased part number to a standard part + build its parametric model.",
+  "mate_fit_check": "Measure bore/shaft cylinders referenced by concentric mates in world geometry. Report measured clearance character and the nearest …",
   "measure": "Color-coded multi-element measurement with an annotated render.",
   "measure_between": "Measure a face/edge — or the distance + angle BETWEEN two of them — in plain words.",
   "measure_from_photo": "Measure ONE in-plane dimension between two pixel points against a ChArUco fiducial.",
+  "measure_mesh_reference": "Measure sampled deviation from a mesh reference to the part's B-rep in mm.",
   "measure_part": "Mass properties of the current part: volume (mm^3), mass (g), centre of mass, inertia.",
   "mfg_approval_inspect": "Inspect a frozen human approval or an unapproved proposal.",
   "mfg_approval_propose": "Propose an UNAPPROVED binding for human review.",
@@ -948,7 +1019,7 @@
   "mfg_device_list": "List manufacturing devices and their truthful current lane state.",
   "mfg_gate_report": "Read a seq-stamped Tier-0 and two-stage gate report by reference.",
   "mfg_journal_query": "Query ordered manufacturing journal records and waiver rates.",
-  "mfg_plan_check": "Check structure, references, DfM facts, and blocking unknowns.",
+  "mfg_plan_check": "Check plan structure, references, document geometry DfM, and blocking unknowns.",
   "mfg_plan_get": "Read a plan or its deterministic drawing/work-instruction projection.",
   "mfg_plan_render": "Render JSON or Markdown and record a manufacturing_plan artifact.",
   "mfg_plan_upsert": "Normalize, validate, and upsert one typed manufacturing plan.",
@@ -956,7 +1027,7 @@
   "mfg_run_describe": "Read one run's state, artifact, gate, approval, and initiator history.",
   "mfg_run_list": "List durable run history, optionally filtered by device and state.",
   "mfg_telemetry_snapshot": "Read one FreshValue-wrapped telemetry snapshot; gaps remain unknown.",
-  "mission_start": "Plan a mission: validate the deliverable manifest and compile the role-assigned mission DAG (does NOT execute — call dag_run to run it).",
+  "mission_start": "Validate a deliverable manifest and compile a mission DAG; run it with dag_run.",
   "mission_status": "Render a mission's phase state from the ledger (pure read).",
   "motion_fea_handoff": "Motion → static FEA handoff for one isolated moving component.",
   "motion_fea_handoff_sweep": "Motion -> FEA at SEVERAL mechanism positions: which pose actually governs.",
@@ -977,7 +1048,10 @@
   "office_read_pptx": "Structured slide read. Returns ``{ok, slides:[{index, title, text_runs, notes}]}``.",
   "office_read_xlsx": "Returns ``{ok, sheets:[{name, rows}]}``, or a single sheet if *sheet* is given. ``keep_vba`` is auto-detected from a ``.xlsm`` extension.",
   "optimize_print_orientation": "Rank FDM print orientations by measurement (deterministic; no slicer needed).",
+  "part_acquire": "Verify cached geometry or explicitly acquire it from a configured mirror.",
   "part_get": "Retrieve a single PartRecord by its stable part_id (aicad.parts/1).",
+  "part_library_ingest": "Register a local manifest; explicitly authorize namespace replacement if needed.",
+  "part_library_sync": "Sync a digest-pinned manifest; explicitly authorize namespace replacement if needed.",
   "part_place": "Place a standard part into a document — universal insertion across all domains.",
   "part_search": "Search the unified standard-parts library (all domains federated), with V2 taxonomy routing + faceted filtering.",
   "part_source": "Source candidate parts for a plain-language need — deterministic fan-out (no LLM inside): taxonomy match -> facet extraction -> routed …",
@@ -1011,7 +1085,7 @@
   "plm_graph_watch": "Manage the watch overlay: keywords / node ids of interest.",
   "plm_history": "Return the timeline (newest first), optionally filtered to one item. Each entry: ``{commit, kind, authored_at, author, message …",
   "plm_init": "Create a project vault at *path* (a folder), registering existing documents. Zero-config and idempotent: re-init on an existing vault just …",
-  "plm_item_add": "Track a non-design file or folder as a versioned item — a specification, report, datasheet, spreadsheet, image, simulation folder or source …",
+  "plm_item_add": "Track a file or folder as a versioned item — for example a specification, report, datasheet, spreadsheet, image, simulation folder or …",
   "plm_item_set": "Edit an item's registry entry: give it a new part number (kept unique within the project) and/or start a new revision of a released item so …",
   "plm_link_repo": "Link an external source-code repository to the project by reference (the code is never copied in — only a pointer, pinned to a version at …",
   "plm_live_join": "Join an authoritative live item session.",
@@ -1040,15 +1114,15 @@
   "project_into_sketch": "\"Convert entities\" INTO an existing sketch — SolidWorks-style edge/face projection that appends real (or construction) geometry to a sketch …",
   "publish_print_media": "Publish a project's COMPLETE verified print set to printer media; retire its old managed G-code.",
   "pump_drive_size": "Size the electric motor driving a pump (hydraulic or centrifugal): kW/hp, poles, frame, current.",
-  "query_adjacency": "The face-adjacency graph (W3): which faces touch which, and whether each shared edge is a CONVEX outside-corner or a CONCAVE …",
+  "query_adjacency": "Page the last body's face-adjacency graph, including face sid and edge between_sids.",
   "query_geometry": "Resolve a STRUCTURED face/edge query against the part — explore/confirm geometry.",
   "read_native_file": "Read a saved .step+ file's feature tree, components, mates, materials and metadata WITHOUT opening it.",
   "recommend_fit": "Map a functional description to recommended ISO 286 fit classes with rationale.",
   "recover_parts": "Reopen auto-saved parts after a server restart (recover a dropped session).",
-  "redo": "Redo the last undone edit on the current part.",
   "regen_diagnose": "Diagnose a document that FAILED TO REBUILD and return a fix-preview card the user can accept/edit/reject.",
   "regen_resolve": "Record the user's/agent's verdict on a regen fix-preview card: accept, edit, or reject.",
   "relocate_native_files": "Copy native .step+ files with metadata-only renames/rebased references; NEVER solve.",
+  "remove_mesh_reference": "Remove an embedded reference without changing solid features.",
   "render_animation": "Render a document as an ANIMATION (.gif or .mp4) — the artifact a review PLAYS.",
   "render_ascii": "[EXPERIMENTAL] Single-view silhouette ASCII of a 3D part for non-vision models.",
   "render_board_ascii": "Per-layer ASCII grid of a PCB + net connectivity summary + checks.",
@@ -1071,8 +1145,6 @@
   "request_mfg_run_start": "Request start; the arbiter alone revalidates and may refuse it.",
   "request_part_photos": "Ask the user for photos of a real part we have NO standard model for, so we can measure it.",
   "request_quote": "Request an on-demand manufacturing quote for a doc from an approved supplier API.",
-  "request_raise": "Raise a worker request to the manager, orchestrator, or overseer.",
-  "request_resolve": "Resolve a worker request explicitly.",
   "research_datasheet_fetch": "Extract a datasheet PDF (local path or http(s) URL) to markdown with provenance.",
   "research_eng_calc": "Evaluate a named deterministic engineering formula in SI (code does the maths).",
   "research_fetch_page": "Fetch a page and return clean readability->markdown `content` with provenance.",
@@ -1083,26 +1155,36 @@
   "research_web_search": "Search the web for up-to-date facts instead of recalling from memory.",
   "resolve_process": "Decide the manufacturing process from the request (FDM 3D-printing is the default).",
   "reveng_add_images": "Add still images to *session_id* for photogrammetry / multi-view reconstruction.",
-  "reveng_add_video": "Extract blur-culled stills from a video orbit and add them to *session_id*.",
+  "reveng_add_video": "Extract video frames into the session, without starting splat training.",
+  "reveng_align_axes": "Align a reconstruction's arbitrary gauge to world axes before rebuilding.",
+  "reveng_attach_reference": "Embed a reconstruction in an existing part, requiring confirmed scale unless approximate.",
   "reveng_attach_result": "Attach a parts-hub ``part_ref`` to the completed RE result for *session_id*.",
   "reveng_build_parametric": "Build an editable parametric model from the reconstructed mesh.",
   "reveng_cancel_splat": "Stop the owned Gaussian process tree, retaining the last valid preview.",
+  "reveng_confirm_scale": "Explicitly approve a solved scale when no scan mission gate is pending.",
+  "reveng_convert_splat": "Convert Gaussian .ply/.splat/.spz/.ksplat to renderer PLY or .splat.",
   "reveng_crop_splat": "Crop saved Gaussian centers in reconstruction units; null restores the original.",
+  "reveng_find_models": "Search CAD libraries (GrabCAD, TraceParts, Printables, McMaster, ...) for an existing model of a part BEFORE building one, and record the …",
   "reveng_finish_splat": "Finish live acquisition with a full-quality pass over the latest accepted frames.",
   "reveng_fit_primitives": "Segment the mesh and RANSAC-fit primitive shapes (cylinder, box, cone, etc.).",
   "reveng_gate_status": "Report a reveng mission's status and the human gate it is waiting on.",
+  "reveng_import_splat": "Import a Gaussian scene as a persistent reverse-engineering reference.",
   "reveng_ingest_datasheet": "Ingest a PDF datasheet into *session_id* via docling (RE-04).",
-  "reveng_make_part_from_library": "One-call flow: seed → research → build → attach for a library part with no 3D model.",
-  "reveng_print_scale_mat": "Generate a printable ArUco scale-mat PDF for the RE pipeline.",
+  "reveng_install_tools": "Download and install the missing Reverse Engineering tools (Brush splat trainer, OpenMVS dense mesher) into the per-user tools directory. …",
+  "reveng_make_part_from_library": "Find an existing CAD model first, or research, build and attach a library part.",
+  "reveng_print_scale_mat": "Write the printable ChArUco scale-mat PDF (and a PNG preview) for the RE pipeline.",
   "reveng_reconstruct": "Launch sparse + dense reconstruction for *session_id* — returns immediately.",
   "reveng_research_source": "Pull web / datasheet data into a session for the no-photo research lane.",
   "reveng_resolve_gate": "Answer the human gate a reveng mission is suspended on.",
   "reveng_set_scale": "Solve and record scale calibration for *session_id* (contracts/reveng.md §8.2).",
   "reveng_single_photo": "Run single-photo mesh reconstruction (TripoSR or TRELLIS tier).",
+  "reveng_sparse_preview": "Return at most 5000 sparse points and camera frusta in one coordinate frame.",
   "reveng_splat_status": "Read durable Gaussian progress and the latest immutable preview without waiting.",
+  "reveng_splat_to_mesh": "Prune a Gaussian reconstruction to its subject, then extract a point cloud and mesh.",
   "reveng_start_session": "Create a new reverse engineering session.",
   "reveng_start_splat": "Start local Gaussian reconstruction immediately, without CAD scale or mesh gates.",
   "reveng_status": "Return the RE workspace readiness probe (contracts/reveng.md §8.1).",
+  "reveng_use_model": "Use an existing CAD file or acquire a URL as this session's reference model.",
   "reverse_engineer": "Rebuild an imported solid (STEP/IGES/BREP/STL/...) as an EDITABLE parametric feature tree, verified against the source by boolean …",
   "reverse_engineer_product": "Reverse-engineer hand-off (contracts/sourcing.md §2b): when match_model finds NO confident repo match (fallback.how == \"reverse_engineer\") …",
   "review_drawing": "Render and inspect a drawing as pixels plus exact sheet-mm metadata.",
@@ -1121,6 +1203,9 @@
   "run_shell": "Run a shell command and capture combined stdout+stderr (byte-capped).",
   "run_topology_optimization": "Mutating. Run topology optimization on the active part as a persisted, GUI-visible study.",
   "save_part": "Save the part as Chudware's NATIVE .step+ — the editable, reopenable format. PREFER THIS.",
+  "scad_convert": "Convert a supported native graph to managed SCAD or restore it to native.",
+  "scad_inspect": "Inspect SCAD feature params and typed controls without rendering.",
+  "scad_status": "Report actual OpenSCAD renderer and isolation availability.",
   "scrape_enqueue": "Enqueue a vendor search + CAD-model download in the background queue.",
   "scrape_queue_status": "Return the current state of all scrape/download queue jobs.",
   "set_active_drawing_sheet": "Select the sheet targeted by subsequent view/annotation operations.",
@@ -1130,16 +1215,17 @@
   "set_process": "Bind the manufacturing ProcessProfile to the part (persisted in the .step+).",
   "set_titleblock": "Fill the drawing's title block. doc_id = drawing_doc_id. fields is a dict of any of: title, drawn_by, date, material, finish, scale, rev …",
   "set_view": "Move, rescale, reorient, and/or toggle hidden lines for a view.",
-  "show_in_app": "Make sure the OPEN Chudware desktop app can show the part to the user.",
+  "show_in_app": "Request presentation of an open document without changing the user's focus.",
   "sim_cancel": "Terminate a sim_run job's solver process (SIGTERM, then SIGKILL) and prove it died.",
   "sim_evidence_packet": "Write ONE released-result evidence packet and pre-fill the runbook checklist.",
   "sim_jobs": "List recent sim jobs (newest first) with their reconciled state and elapsed time. `jobs` are the durable sim-* registry rows; they persist …",
   "sim_results": "Collect a simulation job's results — from ANY tool that returned a job_id.",
   "sim_run": "Start an FEA solve in a SEPARATE PROCESS and return a job_id immediately.",
   "sim_status": "State of a sim job: queued|running|done|failed|cancelled, elapsed, progress.",
+  "simplify_part": "Preview or apply conservative, editable part-history simplifications.",
   "simulate_motion": "Sweep synchronized mate drivers; return sampled body poses and per-frame clash evidence.",
   "sketch3d_add_constraints": "Add constraints to a sketch3d and return the narrated solve results.",
-  "sketch3d_add_curves": "Append curve entities to a sketch3d feature (edit_feature) and report the solve.",
+  "sketch3d_add_curves": "Append curve entities to a sketch3d feature atomically and report the solve.",
   "sketch3d_as_sweep_guide": "Get the exact sweep ref syntax for using this sketch3d as the PATH or a GUIDE.",
   "sketch3d_clear": "Erase all entities + constraints from a sketch3d feature (keeps the feature id).",
   "sketch3d_get": "Read back a sketch3d feature: authored params + SOLVED geometry + health.",
@@ -1153,8 +1239,9 @@
   "sketch3d_section_at": "Cross-section the part with a plane whose ORIENTATION follows the path tangent.",
   "sketch_auto_constrain": "Stitch a sketch's near-touching endpoints closed by adding coincident constraints — the cheap way to close chains before dimensioning.",
   "sketch_fully_define": "Finish a 2D sketch with editable geometric relations and driving dimensions, never fix pins.",
-  "sketch_health": "The single narrated read of a sketch's constraint state — solve it and get back WHY it is under/over-defined plus an ordered plan to reach …",
+  "sketch_health": "The single narrated read of a sketch's constraint state — solve it and get back WHY it is under/over-defined plus unordered hints for …",
   "sketch_preview_text": "Full TEXT description of a 2D sketch — entities, constraints, DOF, regions, health.",
+  "sketch_probe": "PROBE BEFORE ADDING A DRIVING DIMENSION: dry-run exactly ONE change on a private copy of the sketch and learn whether it would over-define …",
   "slice_part": "Slice one part, or several parts on one plate, to printer-ready G-code with STOCK PrusaSlicer and prove the result.",
   "slicer_status": "Which slicer slice_part will run (PrusaSlicer, subprocess only), or how to install it.",
   "solve_mates": "Solve the mate constraints of an ASSEMBLY document (positions its components).",
@@ -1167,15 +1254,16 @@
   "struct_analyze": "Run member-force and deflection analysis on a structural document.",
   "struct_check": "Return preliminary strength and serviceability utilization by member.",
   "struct_estimate": "Estimate structural material and installation costs from a dated rate table.",
-  "submit_bug_report": "File a bug report for the user when something is broken on OUR side.",
+  "submit_bug_report": "Report a suspected Chudware bug, not an ordinary correctable call error.",
   "submit_part_photos": "Register the user's real photo FILES and/or submit the measurements you read from them.",
   "suggest_dimension_scheme": "Propose which dimensions to drive in a sketch, with process-aware tolerances.",
   "suggest_drawing_dimension_scheme": "Propose per-feature drawing dimensions, tolerances and semantic callouts.",
   "sweep_envelope": "SWEPT ENVELOPE of a moving mechanism — the volume its parts need to be given.",
   "tap_drill": "Return the standard tap drill diameter for a thread designation (aicad.calc/1, contracts/advisor.md §7).",
   "task_list": "Publish the LIVE task list shown in the copilot's Task list panel.",
+  "tool_access_check": "Discover standard screws and screen finite tool envelopes in placed assembly geometry.",
   "topology_capabilities": "Read-only. The native topology-optimization capability matrix — call FIRST.",
-  "undo": "Undo the last edit on the current part.",
+  "update_mesh_reference": "Change a reference's placement, visibility, opacity, color or name.",
   "vendor_login": "Open a HEADED browser window so the user can log into a vendor site.",
   "vendor_part_register": "Register scraped price/availability for bom_price; import_artifact handles geometry.",
   "vendor_status": "Return the login status of all registered vendor source adapters.",
@@ -1185,9 +1273,9 @@
   "verify_packet": "Check ONE evidence-packet folder for mutual consistency BEFORE citing it.",
   "vessel_size": "Size a pressure vessel to ASME VIII-1: shell + head thickness, MAWP, hydrotest, volume and masses.",
   "wait_job": "Block until a background job (get_job id) finishes or timeout_s passes — use instead of sleep/poll loops.",
-  "wall_thickness": "Sample local wall spans by inward normal rays; NOT a structural-wall safety verdict.",
+  "wall_thickness": "Study wall thickness on EVERY solid, with an actionable red-to-blue heat map.",
   "workspace_doc_events": "Return per-doc event stream entries starting at *since_seq*.",
-  "workspace_status": "Return the workspace snapshot: project directory, open documents, owners."
+  "workspace_status": "Return the project directory, open documents and workspace status."
  },
  "guidance": {
   "activate_configuration": {
@@ -1212,7 +1300,7 @@
    "prompt_note": "cx,cy,radius are the PARENT view's sheet mm — read them from review_drawing; for a cut through the whole part use add_section_view."
   },
   "add_dimension": {
-   "prompt_note": "Shop drawings should start make_drawing(model_items=False); place each ledger-driven dimension explicitly with tol_type/tol_upper/tol_lower at creation. dtype='note' takes one anchor plus required text='...'."
+   "prompt_note": "Shop drawings should start make_drawing(model_items=False); place each ledger-driven dimension explicitly with tol_type/tol_upper/tol_lower at creation. view_id must name an existing view (make_drawing's view map or add_drawing_view); read sizes from measure_part/describe_part. dtype='note' takes one anchor plus required text='...'."
   },
   "add_drawing_sheet": {
    "prompt_note": "Add a controlled sheet to an existing drawing package, then set_active_drawing_sheet before adding its views/tables/annotations."
@@ -1224,13 +1312,16 @@
    "prompt_note": "Add one base/projected view to a make_drawing doc; x/y are sheet mm. Set show_hidden deliberately and use orientation controls only when the canonical directions do not expose the specified feature."
   },
   "add_features": {
-   "prompt_note": "Batch related ops in ONE call and read the reply's interpreted, per-feature status and changes fields plus its overlap and attachment warnings (floating/overhanging features) before anything else; a heavy op may return {job_id} — poll get_job. Sketches: draw roughly, relations then functional driving dimensions, sketch_fully_define, check_sketch (dof 0, not pinned_only). Automatic definition (default on) runs after explicit intent; opt out with the auto_define=false argument or auto_define:false on feature/params/authoring op. Use origin/axis.h/axis.v refs, construction sketch_convert references, true arcs/slots and symmetric centerlines; never blanket-fix profiles. op rename relabels a FEATURE by id; no op renames the part — name it in new_part(name=…) and its file in save_part(path=…)."
+   "prompt_note": "Batch related ops in ONE call. For existing features use minimal edit_feature params/refs patches (cad_guide('edit_part')), preserving untouched values and requerying topology after geometry changes. Read the completed reply's interpreted, per-feature status, changes, overlap and attachment warnings. A status=running reply with job_id is a handoff, not final body_count; wait_job and inspect its result. For costly edits from Eval, use background=True and print job_id immediately; wait_job must be a direct call outside Eval. Cancellation of Eval is not proof the mutation stopped: recover its job or inspect the current revision before retrying. Blind cuts start along the sketch normal; params.flip reverses it. Only a simple blind cut without explicit direction/flip can retry the other side, and only when the first removes no material. A cut into the wrong side does not auto-correct. Display volume/deltas are approximate; missing revision-correct baselines omit deltas. bore_faces_delta counts faces, not holes; body_count is physical solids and logical_member_count compiled entries. sketch_fillet radius is driving and clamps to the valid corner range (op_reports requested_radius/applied_radius); clamped expressions retain the original inside min/max bounds snapshotted from the corner, which later geometry changes can invalidate. Conflicts reject atomically. Open rib/sweep paths are intentional; a revolve may close to the axis. Sketches: relations first (never `fix`), then only critical dimensions; sketch_probe before a driving dimension; auto_define (default on, auto_define=false opts out) fills the rest as auto constraints (authored_dimensions vs auto_dimensions). Use origin/axis.h/axis.v refs, construction sketch_convert references, true arcs/slots and symmetric centerlines; check_sketch (dof 0, not pinned_only) before extruding. op rename relabels a FEATURE by id; no op renames the part — name it in new_part(name=…) and its file in save_part(path=…)."
   },
   "add_gdt": {
    "prompt_note": "Declare add_datum/add_datum_target references first; row2 creates a composite frame and datum/material modifiers must match the ledger. Re-check placement with review_drawing and coverage with audit_drawing."
   },
   "add_hole_callout": {
-   "prompt_note": "Use instead of a projected tap-drill diameter: specify simple/tapped/counterbore/countersink semantics, full thread, count and THRU/depth from the ledger, then retain its annotation id for audit coverage."
+   "prompt_note": "Use a=[x,y] in sheet mm at or near a projected circle or its centre; model SIDs are not supported. Specify simple/tapped/counterbore/countersink semantics, full thread where applicable, count and THRU/depth from the ledger; retain view_id and annotation_id for audit coverage."
+  },
+  "add_mesh_reference": {
+   "prompt_note": "Embed a PLY, STL or OBJ as a persistent non-solid reference in doc_id. The transform maps source units to mm; mark uncertain geometry approximate."
   },
   "add_ordinate_dimensions": {
    "prompt_note": "Use a shared datum origin for patterns/locations that must not accumulate chain error; every ordinate value and tolerance must trace to the ledger."
@@ -1250,9 +1341,6 @@
   "advisory_dispute": {
    "prompt_note": "Contest only with concrete evidence; kernel-sourced disputes return waiver_required=true — a human must confirm the waiver."
   },
-  "analyze_stl_geometry": {
-   "prompt_note": "Alias of check_geometry_health. Takes doc_id, not a file path — import_part the mesh first, then call this on the document."
-  },
   "apply_ascii_edits": {
    "prompt_note": "Preview with dry_run=True; pass grid_json + index_json from the last render_*_ascii reply so cell coords resolve against that raster, not a re-render."
   },
@@ -1266,23 +1354,26 @@
    "prompt_note": "Places a FILE — save_part each part first; the FIRST component is fixed by default. Returns the 'k<N>' id that asm_mate refs use."
   },
   "asm_mate": {
-   "prompt_note": "Standard seat: concentric (shank↔bore) + coincident (head↔plate); each query must resolve to ONE face/edge — narrow with pick/near/count."
+   "prompt_note": "Standard seat: concentric (shank↔bore) + coincident (head↔plate); each query must resolve to ONE source-part face/edge. For planar coincident, align='aligned' requires opposite outward normals; parallel aligned requires the same direction. Planar distance obeys normal · (point_b − point_a) = sign × value, aligned=+1 and anti=-1; normal is the first planar reference's, else the second's. Inspect returned directions, residual/tolerance, new mate status and total/omitted counts. Unresolved source-frame candidates are suggestions, never automatic remaps; see cad_guide('assembly')."
+  },
+  "assembly_dof": {
+   "prompt_note": "Inspect remaining degrees of freedom and solve evidence; intended motion is not automatically a defect."
   },
   "assembly_plan_review": {
    "prompt_note": "Run at PLANNING time, before a large build — it advises subassembly grouping; deep products should be mated subassemblies, not one giant file."
   },
-  "assess_mesh_quality": {
-   "prompt_note": "Alias of check_geometry_health. We are a B-rep kernel, so this reports SOLID topology health, not triangle quality."
-  },
   "audit_drawing": {
-   "prompt_note": "Required release gate after current review_drawing: doc_id is the SOURCE part/assembly and drawing_id its DRAWING doc. When a manufacturing plan exists, pass the unchanged mfg_plan_get(view='audit_spec') result as spec. Export needs verdict=release_ready with missing_critical empty."
+   "prompt_note": "Release gate after current review_drawing: doc_id is the SOURCE part/assembly and drawing_id its DRAWING doc. Pair view_id with annotation_id. Pass real manufacturing requirements, or the unchanged mfg_plan_get(view='audit_spec') result; an empty spec is refused. Release requires verdict=release_ready with missing_critical empty. Draft export does not require a release audit."
   },
   "bearing_life": {
    "prompt_note": "Standalone hand-calc — no document needed. Set X/Y when Fa matters (defaults zero the axial term); C must come from a datasheet."
   },
   "board_from_schematic": {
-   "prompt_note": "One-call layout on the active wired schematic — pass ERC first; read residual_drc honestly, then ecad_run_dfm / ecad_run_pdn.",
+   "prompt_note": "One-call layout on the wired schematic. By default creates a sibling board file; if it already exists, ecad_open it and use ecad_update_from_sch instead. pcb_name or pcb_path selects a separate board without overwrite. Pass ERC first and inspect DRC.",
    "timeout_s": 300
+  },
+  "bom_consistency_check": {
+   "prompt_note": "Compare the assembly BOM with components, patterns, source metadata and detected hardware coverage. Undetected fasteners and repeated source lines are not proof of missing hardware or duplicate placements; inspect not_evaluated and source evidence."
   },
   "bom_price": {
    "prompt_note": "Network-bound per bought line and useless without provider credentials (Nexar/Digi-Key/Mouser) — unpriced lines come back price-unknown, never guessed. Run bom_rollup first.",
@@ -1317,10 +1408,10 @@
    "prompt_note": "Record a relationship the extractor can't see (e.g. two parts sharing a bore diameter); persisted as origin='ai' in the project overlay."
   },
   "cad_guide": {
-   "prompt_note": "Call FIRST in any modeling session — 'overview' for the op cheatsheet, a feature name ('hole', 'sweep') for its exact param shape."
+   "prompt_note": "Omit topic for the compact topic index. Request the narrow feature topic ('hole', 'sweep', 'sketch'), 'edit_part' for existing native files, 'feature_history' for insertion/reorder/rollback, or the needed domain. 2D sketch operations such as 'sketch_fully_define' resolve to 'sketch'. Hyphens and underscores are interchangeable. 'overview' and 'ops' contain the full cheatsheet; 'add_features' is the complete mutation reference. The reply is plain text; Eval's details.xdev.inner is already decoded. A truncated text reply includes its complete-result path; the JSON file decodes to the original string."
   },
   "cad_skill": {
-   "prompt_note": "Fetches a pack listed in the [SKILLS] catalog by name — the full procedure, not the one-line summary in your role card. Call it BEFORE the first tool of that workflow (cad_skill(name=\"assembly-merge\") before import_part on foreign CAD, cad_skill(name=\"simulate\") before an FEA release run). path=\"<file>\" reads a resource inside the pack."
+   "prompt_note": "Fetches a pack listed in the [SKILLS] catalog by name — the full procedure, not the one-line summary in your role card. Call it BEFORE the first tool of that workflow (cad_skill(name=\"assembly-merge\") before import_part on foreign CAD, cad_skill(name=\"simulate\") before an FEA release run). path=\"<file>\" reads a resource inside the pack. The reply is plain text; use Eval's already-decoded details.xdev.inner directly."
   },
   "cam_add_operation": {
    "prompt_note": "Get geometry from cam_extract first; omit rpm/feed in params to auto-resolve from material+tool. Call cam_generate after adding ops."
@@ -1347,7 +1438,7 @@
    "timeout_s": 180
   },
   "cam_generate": {
-   "prompt_note": "Run after all ops are added, before cam_simulate/cam_post — its warnings (e.g. tool too large for a pocket) beat simulation failures.",
+   "prompt_note": "Needs a setup with stock first (cam_add_setup, cam_set_stock). Run after all ops are added, before cam_simulate/cam_post — its warnings (e.g. tool too large for a pocket) beat simulation failures.",
    "timeout_s": 300
   },
   "cam_job_diff": {
@@ -1391,7 +1482,7 @@
    "prompt_note": "Operator-facing summary for the machine floor — needs generated toolpaths (cam_generate first) for cut lengths and times."
   },
   "cam_simulate": {
-   "prompt_note": "Needs generated toolpaths — cam_generate first. Smaller resolution = finer/slower; check_holder only flags when holder geometry is defined.",
+   "prompt_note": "Needs a current part for gouge comparison; inspect gouge_evaluated and gouge_reason before treating zero gouges as evidence. The comparison is a top-down heightfield, not a full 3D collision check. Generate toolpaths first; smaller resolution is finer/slower. check_holder needs holder geometry.",
    "timeout_s": 600
   },
   "cam_tool_import": {
@@ -1406,20 +1497,20 @@
   "cam_update_operation": {
    "prompt_note": "Merge-patch — only the keys you pass change. Edits do not regenerate toolpaths; call cam_generate afterwards."
   },
-  "channel_send": {
-   "prompt_note": "Cross-department channel post (org layer must be active); interface_change auto-acks and blocks your stage exit until acked — keep the body under 120 words."
-  },
   "check_feature_overlap": {
-   "prompt_note": "add_features already runs this per batch (overlap_warnings) — call to re-scan the whole tree or a features=[...] subset; bodies → check_interference."
+   "prompt_note": "add_features runs a subset per batch; re-scan the tree or features=[...] here. pairs are raw pre-boolean tool intersections, not measured material removal; legacy boss_swallowed does not prove material loss. dead_features means no surviving owned faces, not why. Read complete/unavailable_features/failed_pairs and inspect actual geometry. Separate bodies → check_interference."
   },
   "check_geometry_health": {
    "prompt_note": "Is this solid actually sound? Reports watertight/manifold plus the COUNTS AND SIDS that justify it (free edges, non-manifold edges, shells, solids, sliver faces, orientation). Run it before an expensive FEA mesh, a CAM toolpath or a STEP/STL export. `self_intersection` is a REAL kernel check now (BOPAlgo_CheckerSI, 20 s per-body budget): a body it flags is NOT sound; checked:false + a reason means it could not run. Body-vs-body overlap is still check_interference. `volume_mm3` is null for a body with no solid. repair/fill_holes/fix_normals/fix_winding are REFUSED here: for a body YOUR features made, fix the feature using the sids it just listed; for an IMPORTED body that arrived broken, call heal_body (a recorded ShapeFix repair)."
   },
   "check_interference": {
-   "prompt_note": "Needs 2+ bodies — solve_mates first on an assembly so placements are real; overlap INSIDE one part's features → check_feature_overlap. Read `clear` for the verdict: ok=true only means the check completed, also when bodies clash."
+   "prompt_note": "Solve mates first on an assembly so placements are real; intra-part tool overlap → check_feature_overlap. Read clear for the verdict: ok=true only means the check completed. Read clearance_status and clearance_tolerance_mm; within_tolerance (±0.000001 mm) is not a definite pass or violation."
   },
   "check_metadata": {
    "prompt_note": "Read this before verify_battery to pick check names and see cost/platform classes — it is the registry of everything the battery can run."
+  },
+  "check_model_history": {
+   "prompt_note": "Read-only advisory history inspection, not geometry or solver certification. Inspect findings, safe_fixes and blocked_fixes before cleanup. Repeated dimensions or placements do not prove a relation, pattern or redundant feature; preserve authored design intent."
   },
   "check_sketch": {
    "prompt_note": "Before consuming a profile require closed, dof == 0, pinned_only == false, no conflicts/skipped constraints. Blanket fix is not design intent; fixed external references are legitimate. Read findings/free variables, add relations then driving dimensions, sketch_fully_define, and re-check."
@@ -1428,7 +1519,7 @@
    "prompt_note": "sketch3d twin of check_sketch; a sweep-spine path needn't reach dof 0, but pinned paths survive edits. wires[k] maps to the sweep ref."
   },
   "check_symmetry": {
-   "prompt_note": "Confirms an intended mirror really is symmetric (deviation_mm3); spell the plane as axis pair ('XY') or normal ('+z') — Z-up datums."
+   "prompt_note": "Checks a body against a datum plane or custom origin/normal, optionally shifted with offset; Boolean failure is an error, not an asymmetry verdict."
   },
   "civil_alignment": {
    "prompt_note": "Supply EXACTLY ONE of pis (+radii/spiral_lengths) or explicit horizontal segments (headings in radians); vertical={pvis:[...]}, stations/elevations in m. Clears stored results. Next: civil_alignment_analyze."
@@ -1534,14 +1625,10 @@
    "prompt_note": "The only way to close fit-critical demands: typed caliper values, not photo reads. Pass run_id so DAG gates never re-ask."
   },
   "contact_sheet": {
-   "prompt_note": "Same planner 2x2 grid as render_part without a view; pass views=[...] only when you need specific named angles."
+   "prompt_note": "Same planner 2x2 grid as render_part without a view; pass views=[...] only when you need specific named angles (a name that is not a view is an error listing the valid ones). section=\"top\"|{plane,offset}|{origin,normal} cuts every tile on that plane. Failed tiles are reported in the caption."
   },
   "convert_face_to_sketch": {
    "prompt_note": "Creates a NEW sketch on one planar face; to trace into an open sketch use project_into_sketch. Get face sids from describe_part, then extrude/cut/revolve the regions."
-  },
-  "council_convene": {
-   "prompt_note": "Convenes a 2-round multi-seat deliberation (build_strategy, spec_review, failure_review, …); stage/tier default from mission context — slow, reserve for genuinely contested calls.",
-   "timeout_s": 600
   },
   "dag_abort": {
    "prompt_note": "Cancels a gate-paused run (decision=reject); omit run_id to hit this session's latest run. autonomy_default must match dag_run."
@@ -1575,7 +1662,7 @@
    "prompt_note": "Needs an open ECAD doc (ecad_new_schematic / ecad_new_pcb) first; narrates stored ERC/DRC numbers only — it never re-runs the checks."
   },
   "describe_part": {
-   "prompt_note": "Make this the first read on any part — the returned sids (faces AND edges) are the stable addresses every later hover() / query_geometry / edit call uses. Call it before naming geometry you have not confirmed exists."
+   "prompt_note": "Make this the first read on any part. Face and edge sids are revision-scoped fingerprints, not permanent unique identities; refresh after edits and resolve ambiguity before using one."
   },
   "describe_project": {
    "prompt_note": "Pass dag_status()['run'] for live status; a bare brief string is only narrated back — describe_project reports runs, dag_plan creates them."
@@ -1595,9 +1682,6 @@
   "describe_toolpaths": {
    "prompt_note": "Needs an active CAM job with results — cam_generate + cam_simulate first; audit=False skips the cam_audit summary for a shorter read."
   },
-  "design_audit": {
-   "prompt_note": "Alias of check_geometry_health — solid soundness only. It does NOT check DFM, tolerances or drawings; those are dfm_check, stackup_analyze and review_drawing."
-  },
   "design_recipe": {
    "prompt_note": "Empty query lists the recipe catalog; a natural-language query returns ordered steps with params and verify hints."
   },
@@ -1608,14 +1692,23 @@
   "dfm_check": {
    "prompt_note": "Run before export or slicing; uses the process bound by set_process unless you pass process=. For FDM it measures walls, overhangs, bridges, support (incl. trapped), holes, internal voids, bed adhesion and bed fit (printer=); rows name faces/features to fix."
   },
+  "dfm_reinforce": {
+   "prompt_note": "Preview FDM thin-wall edits on internal shadow clones. Inspect each verified fix's before/after thickness and side effects; nothing is applied automatically. No verified fix or unmeasured thickness is not evidence of safety."
+  },
+  "disassembly_check": {
+   "prompt_note": "Tests bounded straight-line directions and reports blockers and a greedy removal order. Untested paths and rotations are not proven impossible."
+  },
   "doc_diff_tool": {
    "prompt_note": "Both args are full-document JSON STRINGS (e.g. get_part output), not doc_ids; µm-level float noise is suppressed so unchanged rebuilds diff empty."
+  },
+  "doc_face_edges": {
+   "prompt_note": "Given a part body_id and face topo_id from query_geometry, page the body-local edge topology IDs bordering that face."
   },
   "doc_sketch_contact_sheet": {
    "prompt_note": "One image of the doc PLUS every in-progress sketch's health — the pre-commit check that catches under-defined sketches before an extrude fails."
   },
   "draft_analysis": {
-   "prompt_note": "Mold-release check along pull_dir — the SIGN matters (-Z ≠ +Z); flagged faces come back with centroid+area so you know where to add draft."
+   "prompt_note": "Mesh-based absolute draft threshold on the last body only; it does not check undercuts or prove moldability. Flagged faces include centroid and area."
   },
   "drawing_bom": {
    "prompt_note": "Read live assembly item/name/quantity/source rows before add_balloon or a BOM table; preserve item-number linkage instead of retyping a prose list."
@@ -1647,11 +1740,11 @@
    "prompt_note": "Run after ecad_update_from_sch and before routing; deterministic at seed 0. board_from_schematic already includes this step."
   },
   "ecad_autoroute": {
-   "prompt_note": "Needs a ratsnest — ecad_update_from_sch first. Failed nets are named; give them room or route by hand. ecad_optimize_traces polishes after.",
+   "prompt_note": "Needs a ratsnest — ecad_update_from_sch first; run ecad_run_erc before routing. Failed nets are named; check net classes and placement density, give them room or route by hand. ecad_optimize_traces polishes after.",
    "timeout_s": 180
   },
   "ecad_bom": {
-   "prompt_note": "Schematic BOM writer, not the PCB fabrication ecad_export. Exact dialect: ecad_bom(doc_id='', fmt='csv'|'json', exclude_dnp=True, path=None). path writes the full returned text client-side. Next: ecad_plot for the drawing deliverable."
+   "prompt_note": "Schematic BOM output via KiCad CLI. Exact dialect: ecad_bom(doc_id='', fmt='csv'|'json', exclude_dnp=True, path=None). Next: ecad_plot for the drawing deliverable."
   },
   "ecad_bus": {
    "prompt_note": "Create the named bus polyline. Exact dialect: ecad_bus(name='D[0..7]', points=[[x,y],[x,y],...], doc_id=''); coordinates are schematic mm. Next: ecad_bus_entry for each used member, then ecad_lint_schematic."
@@ -1676,25 +1769,25 @@
    "prompt_note": "Edit in place by ref or symbol id; omitted slots stay unchanged. Exact dialect: ecad_edit_symbol(ref_or_id, value=None, ref=None, footprint=None, dnp=None, in_bom=None, on_board=None, datasheet=None, unit=None, angle=None, mirror=None, x=None, y=None, fields=None, doc_id=''). Next: ecad_status and read the returned pin/net/ERC readback."
   },
   "ecad_export": {
-   "prompt_note": "Run ecad_fill_zones first so Gerbers carry the true pour. kind='constraints' emits FPGA XDC/LPF — pair with ecad_fpga_check."
-  },
-  "ecad_export_kicad": {
-   "prompt_note": "Write a KiCad 7 .kicad_sch artifact. Exact dialect: ecad_export_kicad(path='design.kicad_sch', doc_id=''). The write is client-side and returns confirmed bytes/path. Next: ecad_plot(fmt='pdf') for a human-readable deliverable."
+   "prompt_note": "KiCad CLI generates fabrication outputs and STEP. Use ecad_export(kind='gerber', path=..., opts=None) after checking the board; opts passes export options through to KiCad."
   },
   "ecad_fill_zones": {
-   "prompt_note": "Required before Gerber export — the post-edit preview fill is coarse and not what ships. Re-run after any copper edit."
+   "prompt_note": "Fill copper zones after routing and re-run after copper edits. KiCad's DRC also refills zones for its check."
+  },
+  "ecad_find_footprint": {
+   "prompt_note": "Search installed KiCad footprints with ecad_find_footprint(query='', limit=30); use the returned fpid rather than guessing."
   },
   "ecad_find_part": {
    "prompt_note": "Always search before placing — never invent a libid/fpid. Feed the exact libid of a hit to ecad_place_symbol."
   },
   "ecad_fpga_check": {
-   "prompt_note": "Schematic-side (not board) bank/pin checks; pass io= to declare IOSTANDARDs or VCCIO inference is a guess. Export constraints after via ecad_export."
-  },
-  "ecad_import_kicad": {
-   "prompt_note": "Import an existing .kicad_sch into the active schematic. Exact dialect: ecad_import_kicad(path, mode='merge'|'replace', doc_id=''). The source path must exist. Next: ecad_annotate, ecad_status, then ecad_lint_schematic."
+   "prompt_note": "Schematic-side (not board) bank/pin checks; pass io= to declare IOSTANDARDs or VCCIO inference is a guess."
   },
   "ecad_junction": {
    "prompt_note": "Electrically join crossing/T wires at exact world coordinates. Exact dialect: ecad_junction(x, y, doc_id=''). Do not use it for a visual crossing that should remain separate. Next: ecad_netlist to confirm membership."
+  },
+  "ecad_kicad_status": {
+   "prompt_note": "Use ecad_kicad_status() to inspect the KiCad installation and available libraries before checks or exports."
   },
   "ecad_label": {
    "prompt_note": "Same text+scope merges nets — the clean wire-free connect across a sheet (scope='global' crosses sheets). Names feed ERC, netlist, and SPICE probes."
@@ -1706,14 +1799,14 @@
    "prompt_note": "Escape hatch when the native catalog genuinely lacks a part and you were handed a vendor .kicad_sym file. Exact dialect: ecad_load_symbol_library(path). It registers every symbol in the file and reports the added libids. Do NOT reach for this to invent a part you have no file for — use ecad_make_part with a real pinout instead. Next: ecad_symbols to confirm the exact imported libid, then ecad_place_symbol."
   },
   "ecad_make_board": {
-   "prompt_note": "One-shot sync->route->fill->DRC from the active schematic (pass doc_id when several are open); hostcheck=True folds in the MCU rule pack.",
+   "prompt_note": "One-shot sync->route->fill->DRC from the active schematic. By default creates a sibling board; if it exists, ecad_open it and use ecad_update_from_sch. pcb_name or pcb_path selects a separate board without overwrite; hostcheck=True adds the MCU rule pack.",
    "timeout_s": 300
   },
   "ecad_make_part": {
    "prompt_note": "Creates a real symbol+footprint from a pinout YOU supply — this is what ecad_find_part routes to when it refuses to substitute a >3-pin part. Requires name + pins (each {number,name,type,side}) + package (chip/soic/qfn/qfp/sot/dip/header/module_castellated) with its pitch/body dims. It will NOT invent a pinout from a part name: no pins means refusal. Pin type must be the exact KiCad enum — 'power'/'vcc'/'gnd' are refused as ambiguous, use power_in or power_out. Then ecad_place_symbol by the returned libid."
   },
   "ecad_netlist": {
-   "prompt_note": "Compiled connectivity readback. Exact dialect: ecad_netlist(doc_id='', fmt='summary'|'json'|'kicad', path=None). summary is bounded names/counts; json is the full structured netlist; kicad uses the native writer and path writes the full text. Next: ecad_bom and ecad_plot."
+   "prompt_note": "Compiled connectivity readback. Exact dialect: ecad_netlist(doc_id='', fmt='summary'|'json'|'kicad', path=None). summary is bounded names/counts; json is the full structured netlist; a path produces a KiCad CLI netlist artifact."
   },
   "ecad_new_pcb": {
    "prompt_note": "Manual board path: new PCB -> footprints (fpids via ecad_find_part) -> route -> ecad_run_drc. For a schematic-driven board use board_from_schematic instead."
@@ -1726,6 +1819,9 @@
   },
   "ecad_note": {
    "prompt_note": "Add non-electrical sheet text. Exact dialect: ecad_note(x, y, text, size=1.27, doc_id=''). It does not name or connect a net; use ecad_label for that. Next: ecad_plot to verify the note in the deliverable."
+  },
+  "ecad_open": {
+   "prompt_note": "Open a KiCad project, schematic, or board with ecad_open(path). Agent edits are saved to the bound KiCad files; resolve lock or external-change errors rather than overwriting another editor."
   },
   "ecad_optimize_traces": {
    "prompt_note": "Post-route polish: run after autoroute, before fill/DRC. Pass targets={net: ohms} to retune widths; idempotent and DRC-guarded, safe to re-run.",
@@ -1747,10 +1843,10 @@
    "prompt_note": "Fab-readiness pass once DRC is clean; fix courtyard_overlap first, then drill_min. Advisory — warnings never block editing."
   },
   "ecad_run_drc": {
-   "prompt_note": "Advisory spacing/size check after routing — the by_rule grouping says widen, move, or re-space. Pair with ecad_run_dfm before export."
+   "prompt_note": "KiCad CLI runs the authoritative board DRC. Inspect its violations and pair it with ecad_run_dfm before export."
   },
   "ecad_run_erc": {
-   "prompt_note": "Schematic gate before board sync: errors (output shorts, undriven power) are real bugs; warnings are usually unwired pins. Never blocks edits."
+   "prompt_note": "KiCad CLI runs the authoritative schematic ERC before board sync. Inspect violations; unavailable is not a clean result."
   },
   "ecad_run_hostcheck": {
    "prompt_note": "Catches board-bricking MCU/FPGA issues DRC can't (decoupling, sequencing, crystal, straps); needs eng metadata — seed via sim_params.eng."
@@ -1766,7 +1862,7 @@
    "prompt_note": "THE SI-rule declaration path (params merge additively, same schema ecad_stackup_solve writes); ecad_run_sicheck reads these classes."
   },
   "ecad_simulate": {
-   "prompt_note": "Start with 'op', then tran/ac; omitting probes returns a bounded ~12-node set. ngspice unlocks vendor models but degrades honestly to mna.",
+   "prompt_note": "Start with 'op', then tran/ac; omitting probes returns a bounded ~12-node set. netlist_source='native' is the default; netlist_source='kicad' uses KiCad-exported SPICE models and includes with ngspice and never falls back to MNA. Inspect the reported netlist_source and actual backend.",
    "timeout_s": 180
   },
   "ecad_stackup_solve": {
@@ -1809,7 +1905,7 @@
    "prompt_note": "Pins accept numbers or names from ecad_place_symbol's pin list; confirm the join in the returned net_members. For rails prefer ecad_add_power."
   },
   "edit_drawing_annotation": {
-   "prompt_note": "Patch/delete by view_id + annotation_id from review_drawing; any mutation invalidates the release sequence, so review_drawing then audit_drawing again."
+   "prompt_note": "Patch/delete by view_id + annotation_id from review_drawing. To remove displayed tolerance, pass the tol_type argument as 'none'; null patches are refused atomically. Re-review after changes and re-audit before release."
   },
   "em_driven": {
    "prompt_note": "Uniform-guide default is analytic-uniform: ideal matched S21 propagation, not evidence for a discontinuity or antenna. Frequencies are GHz, length is mm. Call em_status before solver='openems'; absent openEMS returns ok:false/skipped. detail=True returns full S-parameter arrays.",
@@ -1835,14 +1931,29 @@
   "engine_profile_tree": {
    "prompt_note": "Scoped profile read — start at depth=1/top=8, drill with path=... instead of ingesting the whole report; source='phases' needs no start."
   },
+  "eval_curvature": {
+   "prompt_note": "Read-only sampled curvature field; use its reported units and bounds."
+  },
+  "eval_geometry_analysis": {
+   "prompt_note": "Read-only geometry-health findings; paged results are not a full census until all pages are read."
+  },
   "export_drawing": {
-   "prompt_note": "Final drawing artifact only: make_drawing → current review_drawing → audit_drawing(verdict=release_ready) → export. Release PDFs with editable siblings in one call via fmt='pdf', companions=['dxf','svg']; use fmt='svg' alone when only an editable illustration is needed. Use sheet='all' for the controlled multi-sheet package; 3D exchange files use export_part."
+   "prompt_note": "Review before export. A requested non-release draft may be exported without audit; label it as a draft. For release, audit_drawing against actual requirements must return release_ready with missing_critical empty; empty specs refuse. PDF supports companions=['dxf','svg']; sheet='all' exports the package. Relative paths use the selected project root; absolute paths are accepted except credential/key destinations, including companions."
+  },
+  "export_flat_dxf": {
+   "prompt_note": "Add sm_flat_pattern first, then export DXF/DWG with OUTLINE, BEND and CUTS layers (PDF is unlayered). Model reliefs as editable through-cuts; legacy display-only caches without flat metadata are refused."
   },
   "export_part": {
-   "prompt_note": "fmt='step' is standard machine-shop exchange; fmt='step+' saves the editable native ZIP. Assembly exports resolve nested path-backed children or refuse with the missing component/path; inspect components:[{name,solids,source}]. validated:true means exact B-rep round-trip solid counts; mesh/native saves do not claim that validation."
+   "prompt_note": "To save a standalone native drawing use fmt='draw+', doc_id=<drawing_id>, path='sheet.draw+'; save_part takes its open source part/assembly instead. fmt='step' is machine-shop exchange; fmt='step+' is the editable native ZIP. Assembly exports resolve nested children or refuse missing paths. STL validation_stages reports facet checks and a skipped B-rep round-trip, not an independent mesh reimport."
   },
   "export_reveng_bundle": {
    "prompt_note": "Archival/hand-off only — zips the whole session dir (images, mesh, fits); not part of the in-app flow. dest's parent dir is created."
+  },
+  "fastener_check": {
+   "prompt_note": "Inspects detected hardware and nearby bores. Distinguish measured candidate geometry from evaluated requirements; inspect not_evaluated results. Thread calculations require supplied requirements."
+  },
+  "fea_probe": {
+   "prompt_note": "Probe the saved result field at a location or face. Keep fixture-ring exclusions and mesh resolution in mind; a sharp re-entrant edge may be singular."
   },
   "feeds_speeds": {
    "prompt_note": "Look up the envelope before pinning params in cam_add_operation; pass machine= to clamp to a real machine's rpm/feed limits."
@@ -1850,6 +1961,9 @@
   "fetch_cad_model": {
    "prompt_note": "Use for a specific CAD model page or STEP/IGES URL found after checking the parts library and product matches. Returns a sourced artifact and, by default, imports it; with import_part=False pass artifact_path to import_artifact. A page is not dimensional evidence.",
    "timeout_s": 180
+  },
+  "find_stress_risers": {
+   "prompt_note": "Inspect concave corners, small blends, ligaments and thin sections along the load path. Read the measurement basis, assumptions and incompleteness; proposed changes are not strength certification. Dry-run each suggested fix before applying it."
   },
   "fit_calc": {
    "prompt_note": "Call BEFORE any hole/bore sizing decision; if the fit class is unknown, resolve function first with recommend_fit. A bare diameter alone returns a teaching error naming both modes."
@@ -1977,23 +2091,68 @@
    "prompt_note": "Poll the job_id a backgrounded heavy call returned (add_features / run_fea_* / run_cfd_flow) — never re-issue the original call."
   },
   "get_part": {
-   "prompt_note": "summary=True on big/imported docs (elides BREP blobs); the full tree is for round-trip param editing. Both forms: features at result['tree']['features']. Feature ids here feed edits and config overrides."
+   "prompt_note": "summary=True orients but elides values and refs. Use get_part(feature_ids=[...]) for complete selected feature records; recover any truncated result before use. Both forms put features at result['tree']['features']; ids feed edits. An active tree.rollback_after remains visible: later features exist but are not built."
   },
   "get_reveng_coverage": {
    "prompt_note": "Check before reveng_reconstruct: capture the `missing` shot slots first, and always surface `method` — count_proxy is an estimate until a sparse model exists."
   },
   "get_reveng_deviation": {
-   "prompt_note": "Post-build quality check; ref_path is required (the brep_doc_id lane errors as not-yet-implemented). Bigger n_samples on dense scans.",
+   "prompt_note": "Post-build quality check: pass ref_path or brep_doc_id. Confirm the metric scale first; alignment='icp' explicitly aligns surfaces rigidly.",
    "timeout_s": 180
   },
   "get_reveng_session": {
    "prompt_note": "The polling read while a mission runs — session.run mirrors run progress. Find ids with list_reveng_sessions first."
   },
+  "harness_add_connector": {
+   "prompt_note": "Specify connector identity, cavities and placement; frame origin is the wire exit and exit_dir points into free space."
+  },
+  "harness_add_wire": {
+   "prompt_note": "Each record is one conductor between one pin pair. Twisted pairs need separate grouped records and explicit cable construction geometry. Specify conductor, insulation and termination data; insulation accepts PVC, PTFE, FEP, ETFE, XLPE, silicone and TPE. Ribbon uses width and thickness, routed as a conservative circular envelope without orientation."
+  },
+  "harness_build_geometry": {
+   "prompt_note": "Build geometry from the routed harness; check the resulting model and keep the underlying harness editable."
+  },
+  "harness_bus_check": {
+   "prompt_note": "Check actual topology and cable data; inspect assumptions and paginated findings. Missing evidence is unknown, not a pass or certification."
+  },
+  "harness_cable_model": {
+   "prompt_note": "Derive a cable model from explicit construction data for bus analysis; inspect assumptions and units."
+  },
+  "harness_check": {
+   "prompt_note": "Review connectivity, geometry, segregation and shield-termination findings. Sourced bend and bundle estimates are assumptions, not certification; override with actual cable data."
+  },
+  "harness_connect": {
+   "prompt_note": "Connect the actual connector cavities; inspect the resulting connectivity before routing."
+  },
+  "harness_edit": {
+   "prompt_note": "Edit the existing harness and re-route or re-check affected derived results. add_clamp splits an interior segment; edit_segment sets or clears segment-specific OD, centerline bend radius and packing overrides."
+  },
+  "harness_electrical_check": {
+   "prompt_note": "Check conductor electrical limits using actual load, conductor and operating assumptions; review missing data and limitations."
+  },
+  "harness_formboard": {
+   "prompt_note": "Generate the flattened formboard output; drawing-sheet integration is not supported."
+  },
+  "harness_from_netlist": {
+   "prompt_note": "Seed connectivity from a netlist, then review inferred signals and supply connector placements and wire properties."
+  },
+  "harness_get": {
+   "prompt_note": "Inspect the persisted harness and its current derived state rather than reconstructing it from chat."
+  },
+  "harness_new": {
+   "prompt_note": "Create a harness study; define connectors, wires and their connections before routing."
+  },
+  "harness_report": {
+   "prompt_note": "Review connector pinout and from/to tables, wire cut lengths, materials and missing allowances; routed length is not the complete cut length."
+  },
+  "harness_route": {
+   "prompt_note": "Route against the actual assembly and keepouts. Sourced bend and bundle estimates are assumptions, not cable-specific ratings; override with actual cable data and inspect assumptions, failures, clearances and bends."
+  },
+  "harness_to_bus_links": {
+   "prompt_note": "Convert saved harness routes using complete firmware bus-link templates with explicit endpoints and topology; this produces firmware simulation bus_links, not harness_bus_check links."
+  },
   "heal_body": {
    "prompt_note": "The repair check_geometry_health refuses — use it ONLY on a body that arrived broken from an import (bad_orientation_of_subshape, not_closed, free_edge, negative volume). It appends a RECORDED `heal` feature, so never 'repair' geometry with a BREP/STL round-trip or a self-boolean instead. `target` is a feature id/name or a 1-based body number; omit for a single-body part. A bare call runs ShapeFix and clears most imports; when it does not, climb ONE rung per call and read the evidence: sew_tolerance_mm (stored edge sharing is wrong), then fix_orientation:true (flag-only, keeps every surface exactly), then rebuild_solid:true (+unify_faces) which is REQUIRED when the returned orientation.conflicts > 0 — that graph is self-contradictory and no flag repair can satisfy it. Raise tolerance_mm at most one decade at a time; above the part's real feature size it merges geometry and gets REFUSED. A heal that would cost more than max_volume_change_pct (0.5%) of the material FAILS and leaves the body untouched — read material_change_pct and bad_edges_before/after, not just `fixed`. A defect your OWN features caused must be fixed at the feature; healing over it returns on the next parameter edit."
-  },
-  "health_check": {
-   "prompt_note": "Alias of check_geometry_health for one body. For the whole-part review battery call design_review; for sketch state, sketch_health."
   },
   "heatsink_select": {
    "prompt_note": "Run ecad_thermal_handoff FIRST — this re-solves on its cached mesh, one solve per candidate. Impossible targets name the best achievable, never fake a win.",
@@ -2052,14 +2211,14 @@
    "prompt_note": "Import an acquired CAD artifact_path (from a done scrape job or fetch_cad_model(import_part=False)); afterwards reverse_engineer(source=doc_id) can recover features."
   },
   "import_part": {
-   "prompt_note": "into=doc_id adds an import feature there; omit for a NEW independent doc (resume=False default), even if the source is open. resume=True explicitly reuses that saved session. Use the returned doc_id and its feature ids. .sldprt prefers the SW tree; mesh → as_solid=True to sew a solid. Multi-body source: describe_part rosters the bodies, keep_bodies/exclude_bodies (ordinals or names) drop the ones you don't want.",
+   "prompt_note": "into=doc_id adds an import feature there; omit for a NEW independent doc (resume=False default), even if the source is open. resume=True reuses an open document or binds the existing native file for editing, preserving history. Use the returned doc_id and its feature ids. .sldprt prefers the SW tree; mesh → as_solid=True to sew a solid. Multi-body source: describe_part rosters the bodies, keep_bodies/exclude_bodies (ordinals or names) drop the ones you don't want. On a format/units error confirm the path/extension and the document units first.",
    "timeout_s": 600
   },
   "import_scan_mesh": {
-   "prompt_note": "Bypasses photogrammetry when a scan mesh already exists; pass scale_mm if known, else calibrate afterwards with reveng_set_scale."
+   "prompt_note": "Bypasses photogrammetry when a scan mesh already exists; scale_mm is millimetres per input unit, not the size of a physical feature."
   },
   "inspect_feature": {
-   "prompt_note": "Planner close-ups (hero/alt/alt2, a section for internal features) + whole-part context of one feature — only when render_part(target=...)'s grid is ambiguous."
+   "prompt_note": "Planner close-ups (hero/alt/alt2, a section for internal features) + whole-part context of one feature — only when render_part(target=...)'s grid is ambiguous. A panel that fails to render is listed in the caption; section numbers in it are for the plane the panel shows."
   },
   "inspect_model_integrity": {
    "prompt_note": "Read-only census of EVERY solid, including disconnected children inside assembly components. Inspect complete, source_failures, pair_failures, isolated_solids and nearest; ok only means the query ran. proximity_mm is a search radius, not approved clearance; a positive gap is not contact. Increase pair_budget_s (maximum60) when exact checks time out, never treat unknown evidence as clean. Geometric islands, overlaps and fixed flags do not establish fastening, mechanical capture or a load path."
@@ -2068,19 +2227,16 @@
    "prompt_note": "Inventory .step+ metadata without import/open/compile/solve. Pass absolute project-root paths and a NEW .json output_path for large inventories; full results live there, not in the bounded chat summary. document_hash is native canonical FNV, not SHA256. Unsupported dependencies and failures are evidence, not permission to unzip or hand-edit CAD containers."
   },
   "inspect_part": {
-   "prompt_note": "Single close-up = render_part(target=..., view=\"auto\") plus framing knobs (zoom_factor, margin, cutaway); same target and view vocabulary."
+   "prompt_note": "Single close-up = render_part(target=..., view=\"auto\") plus framing knobs (zoom_factor, margin, cutaway); same target and view vocabulary. section=\"top\"|{plane,offset}|{origin,normal} cuts on a plane YOU name (datum planes pass through the world origin; give origin+normal through the feature); it cannot be combined with cutaway."
   },
   "inspect_section": {
-   "prompt_note": "The cut always passes through the ORIGIN on a reserved plane — returns area/centroid/Ixx/Iyy; an offset cut belongs in a drawing (add_section_view)."
+   "prompt_note": "Section properties cover the whole plane. A named datum can be shifted by offset, or pass origin and normal for a custom plane; target_center is refused."
   },
   "intake_status": {
    "prompt_note": "Cheap orient call before any intake work: bound process, open critical-dim demands, and any pending photo request to resume."
   },
   "interface_check": {
    "prompt_note": "Catches hole-pattern/coaxiality misalignment that passes check_interference — solve_mates first, run BOTH; fastener='M6' adds a pass-through check. Read `status` (pass|fail|skip) for the verdict: a misalignment keeps ok=true."
-  },
-  "is_watertight": {
-   "prompt_note": "Alias of check_geometry_health (same tool, trimesh's name). Returns the full report, not a bare bool — read `watertight` plus free_edges/non_manifold_edges for why."
   },
   "layout_plan": {
    "prompt_note": "Intake-time, BEFORE add_features — records envelope/critical dims/interfaces as requirements so the layout_coverage gate can check them at sign-off."
@@ -2109,6 +2265,9 @@
   "list_drawing_sheets": {
    "prompt_note": "Inspect sheet ids, names and active state before set_active_drawing_sheet or export_drawing(sheet='all'); never assume the first sheet is the package."
   },
+  "list_mesh_references": {
+   "prompt_note": "List the document's embedded mesh references, including their IDs, placement and bounds in mm, before updating, measuring or removing one."
+  },
   "list_parts": {
    "prompt_note": "Open docs in this session; after a server restart this is empty — recover_parts reloads the autosaved docs (with fresh doc_ids)."
   },
@@ -2134,7 +2293,7 @@
    "prompt_note": "World-placed bboxes per body/component — read right after solve_mates to confirm where everything landed; pair with check_interference for fit."
   },
   "look_around": {
-   "prompt_note": "Tiled close-ups of ONE target (planner set, or ranked=False for an even orbit) — only when render_part(target=...)'s grid leaves the shape ambiguous."
+   "prompt_note": "Tiled close-ups of ONE target (planner set, or ranked=False for an even orbit) — only when render_part(target=...)'s grid leaves the shape ambiguous. n_views is 1-8; more is an error, not a clamp."
   },
   "machining_ref_get": {
    "prompt_note": "Fetch one curated record by stable record_id for its full conditions, units and source citation. Lookup facts are advisory; a delegate_tool record points to the canonical calculator/tool instead of duplicating its values."
@@ -2150,7 +2309,7 @@
    "prompt_note": "Search only locally indexed user PDFs and retain each hit's source_id, hash and exact pdf_page/page_index citation. Snippets are bounded evidence; fetch or inspect the cited page before turning one into a controlled plan value."
   },
   "make_drawing": {
-   "prompt_note": "Build geometry first, then start shop drawings with model_items=False and an explicit ledger-driven annotation plan. Returns drawing_doc_id + view map; refine, review_drawing, audit_drawing, then export_drawing.",
+   "prompt_note": "Build geometry first, then start shop drawings with model_items=False and a real annotation plan. Returns drawing_doc_id + view map. Set geometric scale, not just title text; refine and review_drawing. Release requires audit_drawing against real requirements, but draft export does not.",
    "timeout_s": 300
   },
   "make_fit_coupon": {
@@ -2180,17 +2339,23 @@
   "match_part_number": {
    "prompt_note": "First stop for a purchased MPN — strips vendor suffixes (-ND etc.) and runs fully offline; on matched=false fall through to match_model, never guess params."
   },
+  "mate_fit_check": {
+   "prompt_note": "Checks concentric mates and reports measured fit character and nearest ISO candidate. The candidate is not proof of the original designation or tolerance conformance; acceptance against an ISO fit requires explicit nominal_mm and fit. Ambiguity is not_evaluated."
+  },
   "measure": {
    "prompt_note": "Colour-coded multi-element probe returning image + caption; for a pure text distance/angle reading without a render use measure_between."
   },
   "measure_between": {
-   "prompt_note": "Each query must resolve to exactly ONE face/edge — narrow with pick/side or run query_geometry first; omit b_query for intrinsic area/length/radius."
+   "prompt_note": "Each side must resolve to exactly one element, including after pick/count/index. Cylinders report diameter; two cylinder axes report pitch as axis_distance."
   },
   "measure_from_photo": {
    "prompt_note": "Needs a photo_id from submit_part_photos first; px_a/px_b are FULL-RES pixel coords; low-tier reads still demand confirm_dimensions."
   },
+  "measure_mesh_reference": {
+   "prompt_note": "Measure sampled deviation in mm from an embedded mesh reference to the part's B-rep using doc_id and reference id. n_samples controls sampling; alignment defaults to world. Sampled deviation is not an exact comparison."
+  },
   "measure_part": {
-   "prompt_note": "Combined mass props over ALL bodies (per-body under mass.bodies[]); pass density_g_cm3 for non-steel; also sanity-checks the solid is closed/valid."
+   "prompt_note": "Applied materials supply density; missing or unresolved material appears in warnings. density_g_cm3 is an override (steel 7.85, not 7850). body_id selects one physical solid. Inertia is g·mm² about the centre of mass, world-aligned."
   },
   "mfg_approval_inspect": {
    "prompt_note": "Pass exactly one approval_id or proposal_id. A frozen approval read adds active/burned/revoked status; a proposal remains unapproved, and this read cannot create or validate either one."
@@ -2308,14 +2473,23 @@
   "optimize_print_orientation": {
    "prompt_note": "Measured ranking (support, time, tip risk, bed fit). Pass strength_dir for loaded parts and preserve_faces for cosmetic or precision faces; slice_part(orientation='auto') uses the same scorer."
   },
+  "part_acquire": {
+   "prompt_note": "Verify cached geometry or explicitly acquire it; offline=True forbids fetching. See cad_guide('parts')."
+  },
   "part_get": {
    "prompt_note": "Fetch the full PartRecord after a part_search hit — summary rows omit the params/specs you need before part_place or cam_tool_import."
   },
+  "part_library_ingest": {
+   "prompt_note": "Register a rights-aware local manifest; source replacement requires explicit authorization. See cad_guide('parts')."
+  },
+  "part_library_sync": {
+   "prompt_note": "Explicit HTTPS manifest sync requires a pinned SHA-256. See cad_guide('parts')."
+  },
   "part_place": {
-   "prompt_note": "doc is the document dict (or its json.dumps), NEVER a doc id; omit doc for mechanical parts — they create their own document."
+   "prompt_note": "doc is the document dict (or its json.dumps), NEVER a doc id; omit doc for mechanical parts — they create their own document. part_id comes from part_search/part_get."
   },
   "part_search": {
-   "prompt_note": "First stop for catalog/standard hardware by designation or category (e.g. MG90S, 608 bearing, M3 screw). Rows are compact — part_get for the full record."
+   "prompt_note": "First stop for catalog/standard hardware by designation or category (e.g. MG90S, 608 bearing, M3 screw). Preview sheet labels match JSON row indices; use previews to select candidates, then confirm identity and dimensions with part_get before acquiring."
   },
   "part_source": {
    "prompt_note": "Rank a plain-language product need and follow its candidate's artifact_plan (part_place / scrape_import / make_standard_part / find_model / fetch_cad_model). Confirm uncertain identities; do not re-search indefinitely."
@@ -2417,7 +2591,7 @@
    "prompt_note": "Vault-backed plm_* tools take the project root as path; omit it to use CHUDWARE_PROJECT_DIR/CHUDWARE_FS_ROOT through the shared outermost-marker resolver. plm_init is idempotent."
   },
   "plm_item_add": {
-   "prompt_note": "Only for non-design files (specs, datasheets, sim folders): use plm_item_add(path=<project root>, file_path=<file relative to it>) or folder_path for a folder. .step+/.ecad+ design documents auto-track on save; never add them by hand — call plm_checkpoint."
+   "prompt_note": "Use plm_item_add(path=<project root>, file_path=<file relative to it>) or folder_path for other files. Native .step+ and KiCad design files auto-track on save; inspect plm_status rather than registering them by hand. Call plm_checkpoint when finished."
   },
   "plm_item_set": {
    "prompt_note": "The only way to edit a released item again: start_new_rev=True opens a working rev. Calling with neither part_number nor start_new_rev errors out."
@@ -2450,7 +2624,7 @@
    "prompt_note": "list first to learn entity ids, then create/update/delete with data; update and delete need id. Entries version and restore with the project."
   },
   "plm_release": {
-   "prompt_note": "On reason='preflight_failed' read problems, fix them, or re-call with confirm=true. Released items freeze — to edit again use plm_item_set(start_new_rev=True)."
+   "prompt_note": "On reason='preflight_failed' read problems (check plm_status and plm_where_used), fix them, or re-call with confirm=true. Released items freeze — to edit again use plm_item_set(start_new_rev=True)."
   },
   "plm_restore": {
    "prompt_note": "Non-destructive — the restore is itself a new entry and can be undone. Get commit ids from plm_history; item_id scopes the restore to one item."
@@ -2493,22 +2667,22 @@
    "prompt_note": "Dry-run on a shadow clone — never mutates the live doc; a 'fail' verdict is advisory and does NOT block add_features. Cheap insurance before big edits."
   },
   "print_media_inventory": {
-   "prompt_note": "Read-only; call it the moment a USB/SD delivery is asked for, and again after publishing. Compare its printable rows with the complete job set; the printer shows no timestamps, so never pick 'current' by mtime. Pass inventory_token to publish_print_media."
+   "prompt_note": "First load cad_skill(name='design-for-manufacturability') for safe media delivery. Read-only; call it the moment a USB/SD delivery is asked for, and again after publishing. Compare its printable rows with the complete job set; the printer shows no timestamps, so never pick 'current' by mtime. Pass inventory_token to publish_print_media."
   },
   "project_into_sketch": {
    "prompt_note": "Appends to an EXISTING sketch (convert_face_to_sketch creates one). 'front'/'top'/'right' mean datum planes, not faces — use a sid or side word for solid faces."
   },
   "publish_print_media": {
-   "prompt_note": "The only way G-code goes onto printer media — never cp/fs_write it there. jobs = the COMPLETE project set of print_ready slice_part manifests; a job that is not print_ready goes on only when the user explicitly says to put it there anyway: pass that job's user_override=<their words> and report its failed checks — never refuse that instruction or hand-copy instead. media_idle=True only after the user confirms no printer is using the media. Default to raw files at drive root; layout='project' permits ONE top-level project folder, never nested delivery trees or CAD/review packets. Delete deprecated G-code, never archive it; keep only temporary rollback staging. Report returned filenames and unmanaged printables left; never call the media clean while they remain."
+   "prompt_note": "First load cad_skill(name='design-for-manufacturability') for safe media delivery. The only way G-code goes onto printer media — never cp/fs_write it there. jobs = the COMPLETE project set of print_ready slice_part manifests; a job that is not print_ready goes on only when the user explicitly says to put it there anyway: pass that job's user_override=<their words> and report its failed checks — never refuse that instruction or hand-copy instead. media_idle=True only after the user confirms no printer is using the media. Default to raw files at drive root; layout='project' permits ONE top-level project folder, never nested delivery trees or CAD/review packets. Delete deprecated G-code, never archive it; keep only temporary rollback staging. Report returned filenames and unmanaged printables left; never call the media clean while they remain."
   },
   "pump_drive_size": {
    "prompt_note": "Electric motor for a pump: kind=hydraulic (flow_lpm + pressure_bar) or centrifugal (flow_m3h + head_m). Rounds shaft power x service_factor up the IEC kW or NEMA hp ladder; quote motor_rating, poles, frame and full_load_current_a. For a solved piping network use piping_pump_drive instead."
   },
   "query_adjacency": {
-   "prompt_note": "Reach for it to reason about a shared edge — convex outside-corner vs concave pocket edge — which the flat per-face read-back never carries."
+   "prompt_note": "Paged graph for shared edges: face sid and edge between_sids identify neighbors; convex/concave classifies each shared edge. Applies to the last body."
   },
   "query_geometry": {
-   "prompt_note": "Plain-word phrases work for faces AND edges ('the vertical edges', 'the top face') — confirm a pick resolves before referencing it in a feature; zero or >1 match on a slot needing one → narrow with pick/near/count/index. Fully open-ended explore → describe_part + hover instead."
+   "prompt_note": "Plain-word phrases work for faces AND edges; confirm a pick resolves before referencing it. {of:'face',sid:'...'} is accepted only when the live SID matches that kind; contradictory kinds and extra predicates are refused. Narrow ambiguous matches with pick/near/count/index."
   },
   "read_native_file": {
    "prompt_note": "Read a saved .step+ tree (features with params/refs, components, mates, materials, appearances, meta) without opening it — use this, never unzip/jq. Narrow with sections=[...] / feature_ids / component_ids; embedded BREP and other long strings come back as '<N chars omitted>'. Read-only: to change the file, import_part it and edit the document."
@@ -2519,18 +2693,18 @@
   "recover_parts": {
    "prompt_note": "After a server restart reloads the LAST dropped session's autosaves with FRESH doc_ids (re-map your handles); all=True reaches the full history. BOUNDED to the newest 8 docs; `skipped` counts what stayed on disk. Raise limit= only if the part you want is not among them, because reopening a big pile leaves nothing able to resolve 'the part'."
   },
-  "redo": {
-   "prompt_note": "Usually denied for agents (undo_denied) — roll the doc back with plm_timeline then plm_rollback instead; if it does run, render_part to confirm the restored state."
-  },
   "regen_diagnose": {
-   "prompt_note": "For a FAILED rebuild — pass the failed doc JSON (+ last-good reference_json for a drift check); record the verdict with regen_resolve. Needs a model provider.",
+   "prompt_note": "For a failed rebuild, pass doc_id or failed document_json; supply a known-good reference_json to compare geometry. A rebuild alone is unverified.",
    "timeout_s": 300
   },
   "regen_resolve": {
    "prompt_note": "Second half of regen_diagnose: accept/edit/reject the fix card; 'edit' re-applies your edit_ops_json to the ORIGINAL broken document."
   },
   "relocate_native_files": {
-   "prompt_note": "Metadata-only COPY via the native serializer, not a geometry operation. Supply plan_path to JSON containing entries (absolute path/destination, optional document name/component_names) and an absolute old-to-new path_map. Inspect first; never rename feature labels or rebuild/solve to organize files. Sources remain unchanged and destination overwrites are refused. Relative references, including unmapped dependencies, are rebased. The unique result JSON beside the plan records every native outcome; partial failure may mean some copies exist. Read it before retrying, and never treat report failure as proof that no native files were written."
+   "prompt_note": "Metadata-only COPY via the native serializer, not a geometry operation. Supply plan_path to JSON containing entries (absolute path/destination, optional document name/component_names) and an absolute old-to-new path_map. Inspect first; never rename feature labels or rebuild/solve to organize files. Sources remain unchanged and destination overwrites are refused. Relative references, including unmapped dependencies, are rebased. Check the reply's missing required direct-reference count and preview; later-batch mappings may still be missing, and direct availability is not transitive closure. The unique result JSON beside the plan records every native outcome; partial failure may mean some copies exist. Read it before retrying; report failure does not prove that no native files were written."
+  },
+  "remove_mesh_reference": {
+   "prompt_note": "Remove the reference identified by doc_id and id without changing solid features."
   },
   "render_animation": {
    "prompt_note": "The moving deliverable — a .gif/.mp4 a review PLAYS, not a still: kind='turntable' orbits a part, 'explode' flies an assembly's components apart (factor), 'motion' films a SOLVED trajectory, 'fea' warps a solved vtu_path by field. A motion film takes exactly one drive: mate_id (+start/stop) sweeps a dimensional mate, steer={'components':[...],'axis':{'point':[..],'dir':[..]},'angle_deg':N} (+rear_steer) ramps a steer sweep 0->angle for an assembly with no drivable mate — same spec as steering_turning_radius — and poses=[{component:[16 numbers]},...] films an explicit frame list; collision samples are marked. save_path is a REQUIRED absolute .gif/.mp4 in the project; frames/fps set duration and frames_dir collects the PNG sequence for a multi-segment film. Needs ffmpeg; a single still is still render_part.",
@@ -2547,7 +2721,7 @@
    "timeout_s": 180
   },
   "render_part": {
-   "prompt_note": "Check numbers first; don't render after every mutation. One call = a 2x2 grid of the 4 most useful complementary shots (measured, SID-tagged, caption lists what each tile shows and faces no tile sees); target= the feature id to frame it; view= only for one specific single shot."
+   "prompt_note": "Check numbers first; don't render after every mutation. One call = a 2x2 grid of the 4 most useful complementary shots (measured, SID-tagged, caption lists what each tile shows and faces no tile sees); target= the feature id to frame it (emphasize= is the same thing — pass one, not both); view= only for one specific single shot (\"auto\" = planner's best camera; an unknown name is an error). section=\"top\"|{plane,offset}|{origin,normal} cuts on a plane you name."
   },
   "render_schematic_ascii": {
    "prompt_note": "Keep its grid+index output — that is the cell contract apply_ascii_edits(kind='schematic') resolves edits against."
@@ -2601,12 +2775,6 @@
    "prompt_note": "No configured API key (XOMETRY_API_KEY / JLCPCB_KEY) → ok=false without any network call. xometry takes a mechanical doc (auto-exports STEP), jlcpcb the Gerber bundle.",
    "timeout_s": 180
   },
-  "request_raise": {
-   "prompt_note": "Raise a worker request to manager/orchestrator/overseer instead of stalling on missing context, resources, or an escalation."
-  },
-  "request_resolve": {
-   "prompt_note": "Managers: every raised request MUST be explicitly resolved (grant|deny|escalate) — silent expiry is impossible."
-  },
   "research_datasheet_fetch": {
    "prompt_note": "The READ tool when the source is a PDF (local path or URL) — research_fetch_page is for HTML. Degrades to ok:false/no_pdf_tool when pdfminer.six is not installed.",
    "timeout_s": 180
@@ -2642,71 +2810,104 @@
    "prompt_note": "Supply image paths or a directory. Each image must decode; failed sources return ok:false with full failed paths while valid images are retained."
   },
   "reveng_add_video": {
-   "prompt_note": "Alternative to reveng_add_images for an orbit video — extracts blur-culled stills synchronously; drop max_frames on long clips.",
+   "prompt_note": "Extracts frames from an orbit video asynchronously without starting training. Poll get_reveng_session; wait=True is for a small clip.",
    "timeout_s": 300
+  },
+  "reveng_align_axes": {
+   "prompt_note": "Align an arbitrary SfM gauge before deterministic rebuilding: planes uses fitted orthogonal planes or mesh faces and falls back to PCA, pca uses mesh points, manual accepts an absolute proper 3x3 rotation. Alignment is not a verified datum. Alignment invalidates fits and model; fit again afterward."
+  },
+  "reveng_attach_reference": {
+   "prompt_note": "Embed a reconstruction from session_id in an existing doc_id as a non-solid reference. Confirm scale first, or explicitly set approximate=True when the reference is approximate; the reconstruction transform is applied once."
   },
   "reveng_attach_result": {
    "prompt_note": "Final step: makes the result placeable via part_place under part_ref. Run after reveng_build_parametric (or at least a mesh) exists."
   },
   "reveng_build_parametric": {
-   "prompt_note": "Run after reveng_fit_primitives (fits feed the hints). Single-photo sessions are refused unless strategy='override_approximate'; score with describe_reveng_result.",
+   "prompt_note": "Search for an existing model first with reveng_find_models. Run after reveng_fit_primitives (fits feed the hints). Approximate surfaces are refused unless strategy='override_approximate'; independently check critical dimensions.",
    "timeout_s": 300
   },
   "reveng_cancel_splat": {
    "prompt_note": "Stops the owned Gaussian process tree while retaining the last valid preview; cancellation is not completion of the reconstruction."
   },
+  "reveng_confirm_scale": {
+   "prompt_note": "After a person verifies the solved scale, confirm it when no mission gate exists. For an active mission use reveng_resolve_gate instead."
+  },
+  "reveng_convert_splat": {
+   "prompt_note": "Convert supported splat encodings and inspect reported losses."
+  },
   "reveng_crop_splat": {
    "prompt_note": "Stop training first. Bounds are [xmin,ymin,zmin,xmax,ymax,zmax] in reconstruction units, not calibrated CAD millimetres; null restores the original."
+  },
+  "reveng_find_models": {
+   "prompt_note": "Search for an existing CAD model before researching dimensions or building; inspect candidates and their source before selecting one. The fan-out renders ~20 vendor sites and can take a minute or two.",
+   "timeout_s": 300
   },
   "reveng_finish_splat": {
    "prompt_note": "Ends live acquisition by requesting a full-quality pass over accepted frames. Read reveng_splat_status for progress and the resulting preview."
   },
   "reveng_fit_primitives": {
-   "prompt_note": "Needs a mesh first (reveng_reconstruct / reveng_single_photo / import_scan_mesh) and open3d provisioned; persists fits.json for reveng_build_parametric.",
+   "prompt_note": "Needs a mesh and a confirmed scale. approximate=True allows exploratory unscaled fitting; residuals alone do not establish dimensional uncertainty.",
    "timeout_s": 300
   },
   "reveng_gate_status": {
    "prompt_note": "Poll a mission by session_id; a non-null `gate` means the run is suspended — answer it with reveng_resolve_gate, never by relaunching."
   },
+  "reveng_import_splat": {
+   "prompt_note": "Import Gaussian PLY, .splat, .spz or .ksplat into a clean session; inspect conversion losses."
+  },
   "reveng_ingest_datasheet": {
    "prompt_note": "Datasheet lane; needs docling provisioned (backend_not_provisioned otherwise). Extracted tables surface as dim candidates in list_reveng_dims.",
    "timeout_s": 300
   },
+  "reveng_install_tools": {
+   "prompt_note": "Installs a missing Brush / OpenMVS (about 210 MB) in the background; poll reveng_status().install until running is false. Do not ask the user to run a script."
+  },
   "reveng_make_part_from_library": {
-   "prompt_note": "One-call orchestrator for an un-modeled library part. On model_present=false with pending_dims, confirm the fit-critical dims — re-calling never forces them.",
+   "prompt_note": "Searches for existing models before research unless force_build is set. Inspect any candidates and use reveng_use_model when suitable. On model_present=false with pending_dims, confirm fit-critical dimensions; re-calling never forces them.",
    "timeout_s": 300
   },
   "reveng_print_scale_mat": {
-   "prompt_note": "Print before capture when no known dimension exists — the aruco_mat solver in reveng_set_scale defaults to exactly this mat's marker spec."
+   "prompt_note": "Print before capture when no known dimension exists — print at 100% and check a square against 25 mm; the aruco_mat solver defaults to exactly this ChArUco board."
   },
   "reveng_reconstruct": {
-   "prompt_note": "Async: returns run_id immediately. Add images first, then poll get_reveng_session / reveng_gate_status — the run PAUSES at the scale-confirm gate."
+   "prompt_note": "Async: returns run_id immediately. The shared SfM dataset drives both Brush and OpenMVS; a splat-derived fallback mesh is explicitly approximate. Poll get_reveng_session / reveng_gate_status; scale confirmation pauses the run."
   },
   "reveng_research_source": {
-   "prompt_note": "No-photo lane: needs part_number, query, or url (one required); offline returns honest ok:false. reveng_start_session(research=...) does this in one step.",
+   "prompt_note": "Search first with reveng_find_models. No-photo lane: needs part_number, query, or url (one required); offline returns honest ok:false.",
    "timeout_s": 180
   },
   "reveng_resolve_gate": {
    "prompt_note": "decision has no default — pass 'approve' or 'reject' explicitly. Reject stops the run but leaves it resumable from the same checkpoint."
   },
   "reveng_set_scale": {
-   "prompt_note": "aruco_mat needs a reconstruction + printed mat; two_point needs registered-image pixels; known_dim takes your ratio with a provenance source. All leave confirmed=false."
+   "prompt_note": "aruco_mat needs a reconstruction + printed mat; two_point needs pixels on an undistorted dataset image and image_space='undistorted'. known_dim needs value_mm plus recon_length or point_a and point_b in native 3D coordinates; the ratio is value_mm/recon_length. All leave confirmed=false."
   },
   "reveng_single_photo": {
    "prompt_note": "Preview tier when only one photo exists — uses the first image in images/ and force-tags the session approximate, so build_parametric will refuse without the override.",
    "timeout_s": 600
   },
+  "reveng_sparse_preview": {
+   "prompt_note": "Inspect the bounded points array of [x,y,z,r,g,b] and camera frusta. Before scale confirmation points use reconstruction units; after confirmation they use mm. To supply native coordinates to reveng_set_scale, invert the confirmed recon_transform: point = rotation.T @ (point_mm - translation_mm) / mm_per_unit."
+  },
   "reveng_splat_status": {
    "prompt_note": "Nonblocking durable job status and latest immutable Gaussian preview. A preview during training is not a finished full-quality result."
   },
+  "reveng_splat_to_mesh": {
+   "prompt_note": "Prunes the splat to its subject first (adaptive opacity, camera-orbit region, floor, floaters) and writes points_path and pruned_splat_path, then meshes: auto uses TSDF only with proven matching undistorted poses, otherwise Poisson with fallback_reason; method='poisson' is explicit. No method makes Gaussian geometry a metrology-grade measurement.",
+   "timeout_s": 300
+  },
   "reveng_start_session": {
-   "prompt_note": "First call of any RE flow; pass research= (MPN/query/URL) to auto-populate the datasheet lane or part_ref to seed photos/datasheet from the parts hub."
+   "prompt_note": "First call of any RE flow; search for existing models before research or building. part_ref can seed photos/datasheet from the parts hub."
   },
   "reveng_start_splat": {
    "prompt_note": "Starts local Gaussian reconstruction without CAD scale or mesh gates. Use live=true for arriving accepted images; object mode needs an explicit reconstruction-unit crop, not automatic segmentation."
   },
   "reveng_status": {
    "prompt_note": "Call first — probes backends (COLMAP etc.) before promising a reconstruction; pure and offline-safe, with fix-it banners for what's missing."
+  },
+  "reveng_use_model": {
+   "prompt_note": "Use a selected existing CAD model by URL or local path in the session; check its suitability and provenance rather than assuming it matches.",
+   "timeout_s": 180
   },
   "reverse_engineer": {
    "prompt_note": "Long rebuild+verify pipeline. Afterwards read rejected/candidates/unexplained, fix by hand, re-prove with compare_parts; hints come from reveng_fit_primitives.",
@@ -2717,7 +2918,7 @@
    "timeout_s": 300
   },
   "review_drawing": {
-   "prompt_note": "Inspect attached pixels plus sheet-mm JSON and clear layout/title/material warnings after the last mutation. layout_clean is necessary, not release: follow with audit_drawing against the ledger spec."
+   "prompt_note": "Inspect attached pixels plus sheet-mm JSON and clear layout/title/material warnings after the last mutation. layout_clean is not release certification; for release follow with audit_drawing against real requirements. A requested non-release draft may be exported without audit."
   },
   "run_cfd_accurate": {
    "prompt_note": "OpenFOAM external-aero RANS; the tool capability-checks first and returns ok:false, skipped:true when unavailable. Always returns job_id when started; poll get_job. Inputs are velocity m/s, aoa degrees, fluid air|water. Start preset='coarse', then refine; only quote Cd/Cl when converged is true."
@@ -2773,7 +2974,16 @@
    "prompt_note": "Mutating (writes study, jobs, artifacts). Query topology_capabilities first, then run the same persisted UI study: run_topology_optimization(study=..., doc_id=..., background=True). Poll with get_job/wait_job; stop with sim_cancel. Report computation, convergence and feasibility separately — a finished run is not a converged or feasible one. Inspect the density fields, thresholded surface, actual-domain reanalysis and manufacturing checks; the source CAD stays editable. For printing set print_process and build_plate, read DFAM, then pass print_handoff slice_part arguments with the user's printer. Geometry/DFAM alone are not print-ready: slice_part must validate the G-code."
   },
   "save_part": {
-   "prompt_note": "Native editable Chudware document only (.step+ ZIP); it is NOT ISO STEP and a machine shop cannot treat it as .step. Save it for project history, and for external manufacturing also call export_part(fmt='step', path='...step')."
+   "prompt_note": "Native editable part/assembly only (.step+ ZIP); not ISO STEP. A drawing id is refused: use export_part(fmt='draw+', doc_id=<drawing_id>, path=...) for a standalone drawing, or save its open source part to embed drawings. For external manufacturing also export_part(fmt='step', path='...step')."
+  },
+  "scad_convert": {
+   "prompt_note": "Atomic managed native/SCAD projection only; changed source and unsupported graphs refuse. See cad_guide('scad')."
+  },
+  "scad_inspect": {
+   "prompt_note": "Inspect typed SCAD controls without rendering; lengths are canonical mm. See cad_guide('scad')."
+  },
+  "scad_status": {
+   "prompt_note": "Check the real renderer and isolation prerequisites; see cad_guide('scad')."
   },
   "scrape_enqueue": {
    "prompt_note": "Returns immediately — the download runs in the background; poll scrape_queue_status, then import_artifact on done. Site must be logged in (vendor_login) first."
@@ -2822,6 +3032,9 @@
   },
   "sim_status": {
    "prompt_note": "job_id from sim_run. Reports queued/running/done/failed/cancelled and is reconciled against the OS — it never says running for a dead worker. Poll this before sim_results; call sim_jobs() if you lost the id."
+  },
+  "simplify_part": {
+   "prompt_note": "Apply only still-eligible native history cleanup candidates; the engine rechecks references, external consumers, geometry and revision atomically. Blocked or inconclusive candidates must remain. Keep editable sketches, relations and critical dimensions; do not replace the history with an import or delete features merely to reduce its length. A successful cleanup is one undo step."
   },
   "simulate_motion": {
    "prompt_note": "Kinematic sweep of one dimensional mate (mate_id/start/stop) or several at once (drivers=[{mate_id,start,stop}]). Angle ranges are degrees, distance ranges mm, steps>=2. fixtures/loads do not apply. check_interference samples each step, so refine steps near first contact. dynamics={} adds inverse-dynamics reactions but not contact dynamics.",
@@ -2878,14 +3091,17 @@
   "sketch_preview_text": {
    "prompt_note": "No-vision full text of a 2D sketch (entities/constraints/regions/DOF) — the readable alternative to render_sketch; 3D → sketch3d_preview."
   },
+  "sketch_probe": {
+   "prompt_note": "Dry-run ONE add_constraint | set_dim | delete_constraint on a sketch (never mutates it): read would_over_define, dof_delta, conflicts_with before adding a driving dimension."
+  },
   "slice_part": {
-   "prompt_note": "The only way to make G-code: never download a slicer or hand-write .ini keys. Run dfm_check and fix fails first; report print_ready and gcode_check issues honestly. copies= repeats a part; parts=[{doc_id|path, copies}] puts several parts on one plate; complete_individual_objects=True prints them one at a time (clearance-spaced, height-ordered; refusals name the objects that break it)."
+   "prompt_note": "Before slicing, load cad_skill(name='design-for-manufacturability') for the complete printing and media safety rules. The only way to make G-code: never download a slicer or hand-write .ini keys. Run dfm_check and fix fails first; report print_ready and gcode_check issues honestly. copies= repeats a part; parts=[{doc_id|path, copies}] puts several parts on one plate; complete_individual_objects=True prints them one at a time (clearance-spaced, height-ordered; refusals name the objects that break it)."
   },
   "slicer_status": {
    "prompt_note": "If no slicer is installed, give the user the returned install command (Linux: per-user flatpak) instead of improvising one."
   },
   "solve_mates": {
-   "prompt_note": "Assembly docs only ('not an assembly' on a part); asm_mate already solves by default — call after bulk edits, then list_world_bodies."
+   "prompt_note": "Assembly docs only ('not an assembly' on a part); asm_mate already solves by default — call after bulk edits, then list_world_bodies. Over- or under-constrained mates: review the mate list and run interface_check."
   },
   "spec_sheet_match": {
    "prompt_note": "Long-tail lane after match_part_number/match_model fail; run list_spec_templates first — a missing required dim returns matched=false and builds nothing. LLM call, slow.",
@@ -2923,10 +3139,10 @@
    "prompt_note": "photos= registers files (then measure_from_photo); claims= submits dims you read. Close returned open_demands via confirm_dimensions."
   },
   "suggest_dimension_scheme": {
-   "prompt_note": "Dimension plan for an existing sketch; size mating bores with fit_calc FIRST (they come back needs_user_confirm). process drives the IT grade."
+   "prompt_note": "Live authored sketch and process are required. Review proposed geometric relation rows first, apply them and re-plan from solver health before adding critical dimensions. Size mating bores with fit_calc."
   },
   "suggest_drawing_dimension_scheme": {
-   "prompt_note": "Plan explicit shop-drawing coverage from doc_id + process; it proposes a scheme but never supplies provenance or places annotations, so reconcile every row with the ledger before add_dimension/add_hole_callout."
+   "prompt_note": "Plan explicit shop-drawing coverage from live authored doc_id + process; unavailable geometry is refused, not replaced by a fixture. It proposes a scheme but never places annotations. Rows marked placeable=false require a view and resolved sheet attachment before invoking the suggested tool."
   },
   "sweep_envelope": {
    "prompt_note": "Drive a mate through its range and return the union bbox the listed components sweep; fuse=True also builds the swept solid. No dimensional mate (steering uprights on concentric kingpin mates)? Pass steer={components,axis|mate_id,angle_deg} instead and it sweeps 0..lock. This is the folded/deployed envelope evidence, not a clash check.",
@@ -2939,11 +3155,14 @@
    "max_calls_per_turn": 40,
    "prompt_note": "Publish the FULL list every call (omitted items disappear from the panel) — same order, updated statuses, after each step."
   },
+  "tool_access_check": {
+   "prompt_note": "Screens illustrative socket or hex-key envelopes. A modeled hit does not prove an actual tool is blocked; actual-tool access remains not_evaluated."
+  },
   "topology_capabilities": {
    "prompt_note": "Read-only. Call FIRST to learn supported topology methods, physics, constraints, limits and print_processes before configuring a study; never assume an unlisted method or constraint. For printing choose a preset and a build_plate bed face."
   },
-  "undo": {
-   "prompt_note": "Usually denied for agents (undo_denied) — roll the doc back with plm_timeline then plm_rollback instead; if it does run, render_part to confirm the rolled-back state."
+  "update_mesh_reference": {
+   "prompt_note": "Use the reference id and doc_id to change its transform, visibility, opacity, color or name; omitted fields remain unchanged."
   },
   "vendor_login": {
    "prompt_note": "HEADED browser that blocks up to 300s while the HUMAN logs in — tell the user before calling and never retry-loop it; check vendor_status afterwards.",
@@ -2960,7 +3179,7 @@
    "timeout_s": 180
   },
   "verify_battery": {
-   "prompt_note": "Deterministic checks for THIS doc; the default set includes feature_attachment (floating / overhanging / edge-touching features, each with its close-up call) and solid health. PASS covers only keys in scores; drawings, fits, loads, tolerances and manufacturability need their own checks."
+   "prompt_note": "Deterministic checks for THIS doc; the default set includes feature_attachment (floating / overhanging / edge-touching features, each with its close-up call) and solid health. PASS covers only keys in scores; measurements are informational. Drawings, fits, loads, tolerances and manufacturability need their own checks."
   },
   "verify_gcode": {
    "prompt_note": "Run on any G-code before it goes to a printer (slice_part already does); floating_extrusion fails mean mid-air plastic — reorient, enable supports, or redesign, never ship it."
@@ -2976,7 +3195,7 @@
    "timeout_s": 960
   },
   "wall_thickness": {
-   "prompt_note": "Headline is min_thickness_mm vs your process floor (~1 mm injection, ~0.8 mm FDM); null means an open/sheet body — confirm a solid with measure_part."
+   "prompt_note": "While modelling printed parts, run this AND dfm_check. Inspect the default RED process-minimum heat map; fix each red region at its named face/feature or explicitly justify it before export/slicing. min_wall_mm defaults to the bound process/FDM profile; resolution is optional mm spacing; image=False returns JSON. Read the inscribed-sphere basis/spacing; null is unmeasured (no opposing wall found), never evidence of safety."
   },
   "workspace_doc_events": {
    "prompt_note": "Incremental per-doc event stream — pass the count of events you already have as since_seq."

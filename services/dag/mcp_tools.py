@@ -761,10 +761,10 @@ def register_dag_tools(mcp) -> None:
             from services.agent.online_turn import current_tool_session_id
             parent_session_id = current_tool_session_id()
             if in_cell():
-                from services.agent.chudcode_host import get_default_chudcode_host
+                from services.agent.omp_host import get_default_omp_host
                 if not parent_session_id:
                     raise KeyError("not_found")
-                get_default_chudcode_host().session_launch_params(parent_session_id)
+                get_default_omp_host().session_launch_params(parent_session_id)
             state = dict(initial_state or {})
             if parent_session_id:
                 state["session_id"] = parent_session_id

@@ -22,7 +22,7 @@ gate — still apply to any future perception input.
 | file | what it is |
 |---|---|
 | `00_decisions.md` | locked product decisions (autonomy, controllers, slicer, printers, model, retention) |
-| `01_definition_of_done.md` | the 20 acceptance criteria every wave is measured against |
+| `01_definition_of_done.md` | manufacturing acceptance and safety criteria |
 | `10_gateway.md` | **foundation** — identities, `FreshValue<T>`, capability truth, journal/seq, invalidation, Tier-0, gates, approval, arbiter, lease, Grbl boundary, printer adapters, MCP risk gating, stable rule ids |
 | `11_twin.md` | deterministic engineering twin (tick clock, Grbl emulation, stock/collision, virtual sensors, replay, training wrapper) |
 | `12_metrology.md` | probing + quality: evidence classes, accuracy tiers, offsets, inspection |
@@ -49,19 +49,11 @@ gate — still apply to any future perception input.
 7. Software hold/abort is not a safety function and never substitutes for E-stop/interlocks.
 8. Zero new normal-gate SKIPs; optional hardware qualification lives in opt-in scripts.
 
-## Execution phases
+For scoped developer checks use `scripts/test_lite.py --suite <name>`; `scripts/testbox.py`
+runs the same selection in an isolated container. Suite names are declared in
+`scripts/test_suites.json`. `scripts/gate.sh` remains the authoritative full gate.
 
-Cross-domain phases. Gateway-internal wave ids (`W1.1` …) are `10_gateway.md` §19.
-
-| phase | status | contents |
-|---|---|---|
-| **P0** | landed | baseline: the pre-overhaul tree landed in coherent units |
-| **P1** | landed | `contracts/manufacturing_gateway.md`, `core/device/*.h`, `FreshValue<T>`, journal + durable seq + ten-domain result registry + invalidation, `manufacture` family default-off, contract section allocation |
-| **P2** | landed | `grbl_protocol`, twin core, additive model, slicer sidecar, metrology core, MTConnect monitor, turning, cutting, PnP, robot |
-| **P3** | landed | `tier0` + `policy`, `gates`, `approval` + `lease` + `arbiter`, `grbl_adapter` + `emulator_transport` (E1–E3) |
-| **P4** | landed | `core/hostd/mfg_lane` serving the `mfg_*` surface, `services/mcp/mfg_tools.py` + motion/safety risk classes, `host/src/ui/manufacture/**` operator surfaces |
-| **P5** | landed | serial/TCP/WebSocket transports behind a deny-by-default commissioning allowlist, Moonraker/OctoPrint/PrusaLink adapters, durable attention + notification path, and the lane transport-selection seam |
-| **P6** | blocked on hardware | E4–E6 pilot campaign, then and only then `execute` advertisement |
+## Implemented boundary
 
 **Two deliberate deviations from the design, both standing:**
 
@@ -75,11 +67,8 @@ Cross-domain phases. Gateway-internal wave ids (`W1.1` …) are `10_gateway.md` 
    its cost. The lane still owns claims, approval, durable seq and events, and strips any authority a
    worker result tries to assert.
 
-`P6` is operator-attended and hardware-gated by design: nothing before it may advertise
-`execute` on a physical machine.
-
-Phase status above records the cross-domain phase closing; it does not mean every artifact a design
-document proposed was built. The landed subset per document is below.
+Physical execution is operator-attended and hardware-gated: the required E6 pilot must
+pass before physical `execute` may be advertised. The landed subset per design is mapped below.
 
 ## Migrating obsolete serial allowlists
 
@@ -97,8 +86,8 @@ never restart active manufacturing merely to clear this diagnostic.
 
 ## As-built map
 
-Verified against the tree on 2026-10-04. "Not built" lists proposed artifacts the design documents
-name that do not exist; design docs are not rewritten to match.
+"Not built" lists proposed artifacts the design documents name that do not exist; the
+design documents describe proposals rather than guarantees of implementation.
 
 | doc | landed (where it lives) | proposed in the doc, not built |
 |---|---|---|

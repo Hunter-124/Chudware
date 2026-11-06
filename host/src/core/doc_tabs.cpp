@@ -9,7 +9,6 @@
 // and restored with the same switch so an in-progress edit resumes in the correct document.
 #include <algorithm>
 #include <chrono>
-#include <cstdio>
 #include <set>
 #include <string>
 #include <vector>
@@ -21,7 +20,6 @@
 #include "../render/aicm_loader.h"    // complete DocMesh for per-session parsed tess cache
 #include "engine_backend.h"           // Phase 4: daemon mirror tabs detach, not doc_close
 #include "engine_events.h"            // primeMirrorFromSnapshot — lock-free spectator read
-#include "ipc_client.h"               // services/ipc EngineClient (daemon detach_doc)
 #include "../ui/sketch_mode.h"        // per-document SketchMode owned by each DocSession
 #include "../ui/property_manager.h"   // per-document PropertyManager owned by each DocSession
 #include "../ui/asm_panels.h"        // disarm assembly pick routes before changing the active PM
@@ -31,14 +29,11 @@
 #include "../ui/ecad/ecad_panel.h"    // Wave 2: point the ECAD editor at the active Schematic/PCB tab
 #include "../ui/ecad/ecad_mirror.h"   // Wave 2: complete EcadMirror type for setDocId on switch
 
-// Closing a daemon mirror is a GL-thread round trip, never an unbounded wait.
-// A timeout leaves the server-side outcome unknown; do not record a confirmed detach.
-static constexpr int kMirrorCloseTimeoutMs = 10000;
 
 // ---- most-recently-active tab history ---------------------------------------------------------
-// Closing the ACTIVE tab returns to the tab the user was on before it (e.g. leaving Electronics
-// discards the auto-created PCB1 starter and must land back on the part the user came from, not
-// on whichever tab happens to sit next to PCB1 in the strip). Keys are stable per-document ids so
+// Closing the ACTIVE tab returns to the tab the user was on before it (e.g. closing a board opened
+// from a part must land back on that part, not on whichever tab happens to sit next to the board in
+// the strip). Keys are stable per-document ids so
 // they survive index shifts from erases; stale keys are skipped and pruned when looked up.
 static std::vector<std::string>& tabMru() {
     static std::vector<std::string> mru;
@@ -61,8 +56,13 @@ static bool tabMatchesMruKey(const AppState::DocTab& t, const std::string& key) 
     return false;
 }
 // Record the CURRENTLY active tab as most recent; call before any path makes a different tab active.
-static void noteLeavingTab(const AppState& st) {
+static void noteLeavingTab(AppState& st) {
     if (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size()) return;
+    auto& tab = st.docTabs[st.activeTab];
+    if (!tab.ecadDocId.empty() && tab.ecadDocId == st.ecadDocId) {
+        tab.ecadSimResults = st.ecadSimResults;
+        tab.ecadSimAnalysis = st.ecadSimAnalysis;
+    }
     std::string key = tabMruKey(st.docTabs[st.activeTab]);
     if (key.empty()) return;
     auto& mru = tabMru();
@@ -103,7 +103,14 @@ DocSession* AppState::activeSession() {
 
 void AppState::ensureTabSession(DocTab& t) {
     if (t.kind != DocTab::TabKind::Part && t.kind != DocTab::TabKind::Assembly) return;
-    if (!t.session) t.session = std::make_shared<DocSession>();
+    if (!t.session) {
+        t.session = std::make_shared<DocSession>();
+        // A new document's sketcher starts from the user's last grid / automatic-relations choice
+        // (screenshot runs keep the built-in defaults).
+        if (!shot)
+            t.session->sketch->applyPreferences(settings.sketchShowGrid,
+                                                settings.sketchAutoRelations);
+    }
 }
 
 void AppState::reseatActiveSubsystems(DocSession* s) {
@@ -156,12 +163,6 @@ static int reresolveTabIndex(AppState& st, int idx, const std::string& docId) {
 // erased in the rebuild-completion callback.
 static std::set<std::string> loadingToastInFlight;
 
-static void logTabPerf(AppState& st, const std::string& line) {
-    st.addLog(line);
-    std::fprintf(stderr, "%s\n", line.c_str());
-    std::fflush(stderr);
-}
-
 // The display title for a document: its tree "name", else a kind-appropriate default.
 static std::string docTitle(const nlohmann::json& tree, bool isAssembly) {
     std::string n = tree.is_object() ? jtab(tree, "name") : std::string();
@@ -209,6 +210,177 @@ int AppState::tabIndexForActiveDoc() const {
     return -1;
 }
 
+// A superseded completion is only a hint that the worker may have advanced. Fetch the
+// authoritative warm snapshot rather than adopting any part of the obsolete response.
+static void queueOpsCatchup(AppState& st, const std::string& docId,
+                            const std::shared_ptr<DocSession>& session) {
+    if (session->opsCatchupPending || !session->opsCatchupNeeded) return;
+    session->opsCatchupPending = true;
+    session->opsCatchupNeeded = false;
+    const uint64_t serial = session->opsCatchupSerial;
+    const bool selected = st.isActiveMirrorDoc() && st.docMirror.docId() == docId;
+    const int mirrorRevision = selected ? st.docMirror.revision() : -1;
+    const uint64_t mutation = st.docMirror.mutationGen();
+    st.rpc.call("doc_activate", {{"doc_id", docId}, {"origin", "system"}},
+        [&st, docId, session, serial, selected, mirrorRevision, mutation](
+            const core::RpcResult& r) {
+            session->opsCatchupPending = false;
+            const int idx = reresolveTabIndex(st, -1, docId);
+            if (idx < 0 || st.docTabs[idx].session != session) return;
+            if (serial != session->opsCatchupSerial) {
+                if (session->opsCatchupNeeded) queueOpsCatchup(st, docId, session);
+                return;
+            }
+
+            const auto& result = r.result;
+            const bool valid = r.ok && result.is_object() && !result.contains("code") &&
+                (!result.contains("rejected_tree") || result["rejected_tree"].is_null()) &&
+                result.contains("revision") && result["revision"].is_number_integer() &&
+                result.contains("tree") && result["tree"].is_object() &&
+                result.contains("tess") && result["tess"].is_object() &&
+                result["tess"].contains("aicm_path") && result["tess"]["aicm_path"].is_string() &&
+                (!result.contains("doc_id") || (result["doc_id"].is_string() &&
+                                                result["doc_id"] == docId));
+            if (!valid) return;
+            const int revision = result["revision"].get<int>();
+            const std::string path = result["tess"]["aicm_path"].get<std::string>();
+            if (revision < 0 || (path.empty() &&
+                (!result["tess"].contains("bodies") || !result["tess"]["bodies"].is_array() ||
+                 !result["tess"]["bodies"].empty()))) return;
+            const int liveRevision = st.docMirror.docId() == docId ? st.docMirror.revision() : -1;
+            if (revision < session->cachedRevision || revision < liveRevision) return;
+
+            core::DocMirror fetched;
+            std::string fetchedPath, error;
+            if (!fetched.adoptActivateResponse(docId, result, fetchedPath, error)) return;
+            const auto snapshot = fetched.snapshot();
+            if (!snapshot.valid() || snapshot.revision != revision) return;
+            auto& tab = st.docTabs[idx];
+            const bool sameMesh = session->cachedRevision == revision &&
+                session->cachedMirror.valid() && session->cachedAicmPath == path &&
+                session->cachedDocMesh;
+            session->cachedMirror = snapshot;
+            session->cachedRevision = revision;
+            session->cachedAicmPath = path;
+            if (!sameMesh) {
+                if (st.renderer) st.renderer->discardCachedMeshes(docId);
+                session->cachedDocMesh = path.empty() ? std::make_shared<render::DocMesh>() : nullptr;
+            }
+            session->opsCatchupUncertain = false;
+            tab.meshCacheInvalidated = !path.empty() && !sameMesh;
+
+            // A may have been selected again before the obsolete completion arrived. Only
+            // refresh that already-selected view while the exact binding is still unchanged.
+            const bool refreshSelected = selected && st.isActiveMirrorDoc() &&
+                st.docMirror.docId() == docId && st.docMirror.revision() == mirrorRevision &&
+                st.docMirror.mutationGen() == mutation && revision > mirrorRevision;
+            if (refreshSelected) {
+                std::string activePath, activeError;
+                const bool adopted = st.docMirror.adoptActivateResponse(docId, result, activePath, activeError);
+                if (adopted) {
+                    session->cachedMirror = st.docMirror.snapshot();
+                    if (!activePath.empty()) {
+                        st.loadDocMeshAsync(activePath, false, true, true);
+                    } else {
+                        st.unloadDocMesh();
+                        if (st.renderer) st.renderer->setActiveMeshIdentity(docId, revision);
+                    }
+                    return;
+                }
+            }
+            if (!sameMesh && !path.empty())
+                st.cacheBackgroundDocMeshAsync(docId, revision, path);
+        }, 120000);
+}
+
+void AppState::adoptCurrentOpsResponse(const core::OpsResponse& response, bool revisionChanged) {
+    if (!response.ok || response.revision < 0 || response.revision != docMirror.revision()) return;
+    if (revisionChanged) markHumanEdit(docMirror.docId(), response.revision);
+    const int idx = tabIndexForActiveDoc();
+    if (idx < 0) return;
+    auto& tab = docTabs[idx];
+    ensureTabSession(tab);
+    const auto session = tab.session;
+    if (!session || session->cachedRevision > response.revision) return;
+    const auto snapshot = docMirror.snapshot();
+    if (!snapshot.valid()) return;
+    const bool sameRevision = session->cachedRevision == response.revision;
+    const bool sameMesh = response.has_tess && sameRevision && session->cachedMirror.valid() &&
+        session->cachedAicmPath == response.aicm_path && session->cachedDocMesh;
+    session->cachedMirror = snapshot;
+    session->cachedRevision = response.revision;
+    if (!response.has_tess) {
+        if (!sameRevision) {
+            if (renderer) renderer->discardCachedMeshes(tab.docId);
+            session->cachedAicmPath.clear();
+            session->cachedDocMesh.reset();
+            tab.meshCacheInvalidated = true;
+            core::requireDocMesh(tab.docId, response.revision);
+        }
+        return;
+    }
+    if (session->opsCatchupPending || session->opsCatchupNeeded) {
+        ++session->opsCatchupSerial;
+        session->opsCatchupNeeded = false;
+    }
+    session->opsCatchupUncertain = false;
+    session->cachedAicmPath = response.aicm_path;
+    if (sameMesh) {
+        tab.meshCacheInvalidated = false;
+        return;
+    }
+    if (renderer) renderer->discardCachedMeshes(tab.docId);
+    if (response.aicm_path.empty()) {
+        session->cachedDocMesh = std::make_shared<render::DocMesh>();
+        tab.meshCacheInvalidated = false;
+        if (isActiveMirrorDoc()) {
+            unloadDocMesh();
+            if (renderer) renderer->setActiveMeshIdentity(tab.docId, response.revision);
+            committedMeshDocId = tab.docId;
+            committedMeshRevision = response.revision;
+        }
+        core::meshCatchupFinished(tab.docId, response.revision, true);
+    } else {
+        session->cachedDocMesh.reset();
+        tab.meshCacheInvalidated = true;
+        if (!isActiveMirrorDoc())
+            cacheBackgroundDocMeshAsync(tab.docId, response.revision, response.aicm_path);
+    }
+}
+
+void AppState::parkInactiveMirrorTree() {
+    const int idx = tabIndexForActiveDoc();
+    if (idx < 0 || idx == activeTab || docMirror.revision() < 0) return;
+    auto& tab = docTabs[idx];
+    ensureTabSession(tab);
+    const auto session = tab.session;
+    if (!session || session->cachedRevision >= docMirror.revision()) return;
+    const auto snapshot = docMirror.snapshot();
+    if (!snapshot.valid()) return;
+    if (renderer) renderer->discardCachedMeshes(tab.docId);
+    session->cachedMirror = snapshot;
+    session->cachedRevision = snapshot.revision;
+    session->cachedAicmPath.clear();
+    session->cachedDocMesh.reset();
+    tab.meshCacheInvalidated = true;
+    catchUpSupersededOps(tab.docId, snapshot.revision);
+}
+
+void AppState::catchUpSupersededOps(const std::string& docId, int baseRevision) {
+    const int idx = reresolveTabIndex(*this, -1, docId);
+    if (idx < 0) return;
+    auto& tab = docTabs[idx];
+    ensureTabSession(tab);
+    const auto session = tab.session;
+    if (!session) return;
+    ++session->opsCatchupSerial;
+    session->opsCatchupNeeded = true;
+    session->opsCatchupUncertain = true;
+    tab.meshCacheInvalidated = true;
+    core::requireDocMesh(docId, std::max(0, baseRevision));
+    queueOpsCatchup(*this, docId, session);
+}
+
 void AppState::addDocTab(bool isAssembly) {
     if (!docMirror.hasDoc()) return;
     // Any deliberate open re-arms automatic reveals for this doc (the hand-close
@@ -234,14 +406,66 @@ void AppState::addDocTab(bool isAssembly) {
     t.docId = docMirror.docId();
     t.isAssembly = isAssembly;
     t.title = docTitle(docMirror.tree(), isAssembly);
-    t.dirty = false;
     // A freshly created/opened doc's live camera becomes this tab's camera the first time the user
-    // switches away (camValid stays false until then, so the default iso view is used on return).
+    // switches away. Until then it starts framed: zoom 1 / zero pan IS Zoom-to-Fit (ViewPreset::
+    // ZoomFit) for whatever mesh lands, so the new doc never inherits the leaving tab's pan/zoom
+    // (which aims at a spot on a different part). Orientation carries over, as ZoomFit keeps it.
+    animActive = false;
+    zoom = 1.0f;
+    pan[0] = pan[1] = pan[2] = 0.0f;
     docTabs.push_back(std::move(t));
     activeTab = (int)docTabs.size() - 1;
     // Give the new tab its own editing/display session and point the active-subsystem borrows at it.
     ensureTabSession(docTabs[activeTab]);
     reseatActiveSubsystems(docTabs[activeTab].session.get());
+}
+
+// Persisted display quality -> every open part/assembly doc. The engine defaults a new doc to
+// "fine"; Settings::displayQuality survives restarts but was only ever pushed when the user
+// clicked the control, so a saved Draft/Standard rendered at Fine after relaunch (and in docs
+// opened later). Each tab remembers the tier it was last pushed; a differing tab is re-tiered once.
+void AppState::syncDisplayQuality() {
+    if (!workerStarted || workerBootPending) return;
+    for (auto& tab : docTabs) {
+        if (tab.docId.empty() || tab.displayQualityApplied == settings.displayQuality) continue;
+        if (tab.kind != DocTab::TabKind::Part && tab.kind != DocTab::TabKind::Assembly) continue;
+        // Mark first so there is exactly one request per change; a failure is logged, not retried.
+        tab.displayQualityApplied = settings.displayQuality;
+        const std::string docId = tab.docId;
+        rpc.call("doc_set_display_quality",
+                 nlohmann::json{{"doc_id", docId}, {"origin", "system"},
+                                {"quality", settings.displayQuality}},
+                 [this, docId](const core::RpcResult& r) {
+                     if (!r.ok) {
+                         addLog("[err] display quality: " + r.err);
+                         return;
+                     }
+                     if (!r.result.is_object() || r.result.contains("code")) return;
+                     const int revision = r.result.value("revision", -1);
+                     bool open = false;
+                     for (const auto& t : docTabs)
+                         if (t.docId == docId) { open = true; break; }
+                     if (!open || revision < 0) return;
+                     if (!isActiveMirrorDoc() || docMirror.docId() != docId) {
+                         core::requireDocMesh(docId, revision);
+                         return;
+                     }
+                     if (revision != docMirror.revision()) {
+                         if (revision > docMirror.revision())
+                             core::requireDocMesh(docId, revision);
+                         return;
+                     }
+                     if (!r.result.contains("tess") || !r.result["tess"].is_object() ||
+                         r.result["tess"].contains("mesh_error") ||
+                         !r.result["tess"].contains("aicm_path")) {
+                         core::requireDocMesh(docId, docMirror.revision());
+                         return;
+                     }
+                     const std::string aicm = r.result["tess"].value("aicm_path", std::string());
+                     if (!aicm.empty()) loadDocMeshAsync(aicm);
+                 },
+                 /*timeoutMs=*/120000);
+    }
 }
 
 // Multi-document: park the active CAD tab's per-doc VALUE state into its DocSession before a switch.
@@ -282,9 +506,12 @@ void AppState::addEcadTab(const std::string& kind, const std::string& ecadDocId_
                             : title;
     docTabs.push_back(std::move(t));
     activeTab = (int)docTabs.size() - 1;
+    activeWorkspace = Workspace::Electronics;
     // Keep the AppState reflection in step (app.cpp ECAD helpers read st.ecadDocId/ecadRevision).
     ecadDocId = ecadDocId_;
     ecadRevision = ecadRevision_;
+    ecadSimResults = nlohmann::json();
+    ecadSimAnalysis = 0;
     animActive = false;
     showRibbon = true;
     ribbonTab = docTabs[activeTab].kind == DocTab::TabKind::Schematic
@@ -295,6 +522,26 @@ void AppState::addEcadTab(const std::string& kind, const std::string& ecadDocId_
     // evaluateDialogs back at the fallback singletons so nothing acts on the parked part behind it.
     reseatActiveSubsystems(nullptr);
     addLog("[tabs] new ECAD " + kind + " tab '" + docTabs[activeTab].title + "' (" + ecadDocId_ + ")");
+}
+
+void AppState::syncEcadProjectFiles(const std::string& project) {
+    if (project.empty()) return;
+    std::string sch, pcb;
+    for (const auto& tab : docTabs) {
+        if (tab.ecadProjectPath != project) continue;
+        if (tab.kind == DocTab::TabKind::Schematic && !tab.path.empty()) sch = tab.path;
+        if (tab.kind == DocTab::TabKind::PCB && !tab.path.empty()) pcb = tab.path;
+    }
+    for (const auto& tab : docTabs) {
+        if (tab.ecadProjectPath != project) continue;
+        if (sch.empty()) sch = tab.ecadProjectSchPath;
+        if (pcb.empty()) pcb = tab.ecadProjectPcbPath;
+    }
+    for (auto& tab : docTabs) {
+        if (tab.ecadProjectPath != project) continue;
+        tab.ecadProjectSchPath = sch;
+        tab.ecadProjectPcbPath = pcb;
+    }
 }
 
 // Switch the active document to docTabs[idx].
@@ -379,19 +626,35 @@ void AppState::switchToTab(int idx) {
         reseatActiveSubsystems(nullptr);  // ECAD tab: CAD subsystems fall back to the singletons
         ecadDocId   = dst0.ecadDocId;     // mirror the active ECAD doc onto AppState (app.cpp helpers)
         ecadRevision = dst0.ecadRevision;
+        ecadSimResults = dst0.ecadSimResults;
+        ecadSimAnalysis = dst0.ecadSimAnalysis;
         if (!ecadDocId.empty()) {
             ui::ecadEditorMirror().setDocId(ecadDocId);
-            nlohmann::json tr;
-            std::string err;
-            if (worker.call("ecad_tree", {{"doc_id", ecadDocId}}, tr, err) &&
-                tr.is_object() && !tr.contains("code")) {
-                if (tr.contains("revision") && tr["revision"].is_number_integer())
-                    ecadRevision = tr["revision"].get<int>();
-                dst0.ecadRevision = ecadRevision;
-                ui::ecadEditorLoadResponse(tr);
-            } else if (!err.empty()) {
-                addLog("[tabs] ecad_tree on switch failed for " + ecadDocId + ": " + err);
-            }
+            const std::string id = ecadDocId;
+            rpc.call("ecad_tree", {{"doc_id", id}}, [this, id](const core::RpcResult& r) {
+                if (!r.ok || !r.result.is_object() || r.result.contains("code")) {
+                    if (!r.err.empty())
+                        addLog("[tabs] ecad_tree on switch failed for " + id + ": " + r.err);
+                    return;
+                }
+                for (auto& tab : docTabs) {
+                    if (tab.ecadDocId != id) continue;
+                    const int revision = r.result.value("revision", -1);
+                    if (revision >= 0 && revision < tab.ecadRevision) return;
+                    if (revision >= 0) tab.ecadRevision = revision;
+                    tab.ecadSessionDirty = r.result.value("dirty", tab.ecadSessionDirty);
+                    tab.ecadFileChanged = r.result.value("file_changed", false);
+                    tab.ecadKicadLocked = r.result.value("kicad_locked", false);
+                    ui::ecadSetFileState(id, tab.path, tab.dirty || tab.ecadSessionDirty,
+                                         tab.ecadFileChanged, tab.ecadKicadLocked);
+                    if (activeTab >= 0 && activeTab < (int)docTabs.size() &&
+                        docTabs[activeTab].ecadDocId == id) {
+                        ecadRevision = tab.ecadRevision;
+                        ui::ecadEditorLoadResponse(r.result);
+                    }
+                    break;
+                }
+            });
         }
         showRibbon = true;
         ribbonTab = dst0.kind == DocTab::TabKind::Schematic ? RT_Schematic : RT_PCB;
@@ -403,14 +666,28 @@ void AppState::switchToTab(int idx) {
     DocTab& dst = docTabs[idx];
     ensureTabSession(dst);   // a never-activated tab gets its session on first switch-in
 
+    // 2d) Destination camera, before ANY bind path below (gpu-cache, cached-async, pushed-async,
+    //     doc_activate): the async paths return early, and a camera applied only on the gpu-cache
+    //     path left a mirror tab bound from its parked snapshot looking through the leaving tab's
+    //     pan/zoom. A never-viewed tab (an agent-minted mirror) starts framed: zoom 1 / zero pan is
+    //     Zoom-to-Fit for whatever mesh lands, and it keeps fitting while the agent grows the part.
+    animActive = false;  // cancel any in-flight tween from the leaving doc
+    if (dst.camValid) {
+        yaw = dst.yaw; pitch = dst.pitch; zoom = dst.zoom;
+        pan[0] = dst.pan[0]; pan[1] = dst.pan[1]; pan[2] = dst.pan[2];
+    } else {
+        zoom = 1.0f;
+        pan[0] = pan[1] = pan[2] = 0.0f;
+    }
+
     // 3) Pure host-side bind for an unchanged already-open document. No WorkerClient call is made:
     //    its global call mutex is intentionally bypassed, so an agent job on another document cannot
     //    stall the UI. A pushed foreign revision binds only after its background prewarm completes.
-    suppressTabDirty = true;
     std::string aicmPath, err;
     bool useLocalCache = false;
     const bool awaitingPushedMesh =
-        cacheInvalidated && dst.session->cachedRevision >= 0 &&
+        cacheInvalidated && !dst.session->opsCatchupUncertain &&
+        dst.session->cachedRevision >= 0 &&
         dst.session->cachedMirror.valid() &&
         dst.session->cachedMirror.docId == dst.docId &&
         dst.session->cachedMirror.revision == dst.session->cachedRevision &&
@@ -444,19 +721,21 @@ void AppState::switchToTab(int idx) {
                 activeWorkspace = Workspace::Model;
             reseatActiveSubsystems(dst.session.get());
             restoreDocState(*dst.session);
-            suppressTabDirty = true;
             docMirror.restoreSnapshot(dst.session->cachedMirror);
             dst.isAssembly = docMirror.tree().is_object() &&
                              (jtab(docMirror.tree(), "schema") == "aicad.asm/1");
             dst.title = docTitle(docMirror.tree(), dst.isAssembly);
-            suppressTabDirty = false;
             ui::featureTreeResetTransient();
             zoomToBBoxRequested = false;
             unloadDocMesh();
-            loadDocMeshAsync(dst.session->cachedAicmPath);
+            selection.mutableItems() = std::move(dst.session->selItems);
+            dst.session->selItems.clear();
+            hover = dst.session->hover;
+            pickStatus = std::move(dst.session->pickStatus);
+            loadDocMeshAsync(dst.session->cachedAicmPath, false, true, true);
             const double shellMs = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - switchStarted).count();
-            logTabPerf(*this, "[perf] tab_switch doc=" + dst.docId +
+            addLog("[perf] tab_switch doc=" + dst.docId +
                        " path=cached-async shell=" + std::to_string(shellMs) + "ms");
             return;
         }
@@ -472,19 +751,21 @@ void AppState::switchToTab(int idx) {
             activeWorkspace = Workspace::Model;
         reseatActiveSubsystems(dst.session.get());
         restoreDocState(*dst.session);
-        suppressTabDirty = true;
         docMirror.restoreSnapshot(dst.session->cachedMirror);
         dst.isAssembly = docMirror.tree().is_object() &&
                          (jtab(docMirror.tree(), "schema") == "aicad.asm/1");
         dst.title = docTitle(docMirror.tree(), dst.isAssembly);
-        suppressTabDirty = false;
         ui::featureTreeResetTransient();
         zoomToBBoxRequested = false;
         unloadDocMesh();
-        loadDocMeshAsync(dst.session->cachedAicmPath);
+        selection.mutableItems() = std::move(dst.session->selItems);
+        dst.session->selItems.clear();
+        hover = dst.session->hover;
+        pickStatus = std::move(dst.session->pickStatus);
+        loadDocMeshAsync(dst.session->cachedAicmPath, false, true, true);
         const double shellMs = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - switchStarted).count();
-        logTabPerf(*this, "[perf] tab_switch doc=" + dst.docId +
+        addLog("[perf] tab_switch doc=" + dst.docId +
                    " path=pushed-async shell=" + std::to_string(shellMs) + "ms");
         return;
     }
@@ -523,7 +804,6 @@ void AppState::switchToTab(int idx) {
         restoreDocState(*dst.session);
         ui::featureTreeResetTransient();
         zoomToBBoxRequested = false;
-        suppressTabDirty = false;
         unloadDocMesh();
         // The strip shows this tab from now on, but the mirror still holds the leaving doc until
         // the activation drains: hold the selection against ensureActiveTab's per-frame
@@ -542,7 +822,7 @@ void AppState::switchToTab(int idx) {
             pendingActivateGeneration = gen;
             const double shellMs = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - switchStarted).count();
-            logTabPerf(*this, "[perf] tab_switch doc=" + rebuildDocId +
+            addLog("[perf] tab_switch doc=" + rebuildDocId +
                        " path=async-rebuild-coalesced gen=" + std::to_string(gen) +
                        " shell=" + std::to_string(shellMs) + "ms");
             return;
@@ -552,7 +832,7 @@ void AppState::switchToTab(int idx) {
         const auto rebuildQueuedAt = std::chrono::steady_clock::now();
         const double shellMs = std::chrono::duration<double, std::milli>(
             rebuildQueuedAt - switchStarted).count();
-        logTabPerf(*this, "[perf] tab_switch doc=" + rebuildDocId +
+        addLog("[perf] tab_switch doc=" + rebuildDocId +
                    " path=async-rebuild gen=" + std::to_string(gen) +
                    " shell=" + std::to_string(shellMs) + "ms");
         activateTabDocAsync(rebuildDocId, rebuildTabIdx, gen, rebuildQueuedAt);
@@ -587,7 +867,6 @@ void AppState::switchToTab(int idx) {
     const auto meshBindStarted = std::chrono::steady_clock::now();
     std::string bindErr;
     if (!bindCachedDocMesh(*dst.session, bindErr)) {
-        suppressTabDirty = false;
         unloadDocMesh();
         addLog("[tabs] local cache bind failed for " + dst.docId + ": " + bindErr);
         toast(ui::ToastLevel::Error, "Couldn't switch document: " + bindErr);
@@ -595,7 +874,6 @@ void AppState::switchToTab(int idx) {
     }
     const double meshBindMs = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - meshBindStarted).count();
-    suppressTabDirty = false;
 
     dst.isAssembly = docMirror.tree().is_object() &&
                      (jtab(docMirror.tree(), "schema") == "aicad.asm/1");
@@ -608,13 +886,6 @@ void AppState::switchToTab(int idx) {
     dst.session->selItems.clear();
     hover = dst.session->hover;
     pickStatus = std::move(dst.session->pickStatus);
-
-    // 6) Restore the destination tab's camera (or keep the fresh iso default if never saved).
-    animActive = false;  // cancel any in-flight tween from the leaving doc
-    if (dst.camValid) {
-        yaw = dst.yaw; pitch = dst.pitch; zoom = dst.zoom;
-        pan[0] = dst.pan[0]; pan[1] = dst.pan[1]; pan[2] = dst.pan[2];
-    }
 
     // 7) Contextual ribbon (Wave 2 2D): Assembly docs want the Assembly tab forward (mirrors New
     //    Assembly). A Part has no Assembly/PCB context, so coming from either (e.g. switching from a
@@ -636,7 +907,7 @@ void AppState::switchToTab(int idx) {
            ", rev " + std::to_string(docMirror.revision()) + ")");
     const double totalMs = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - switchStarted).count();
-    logTabPerf(*this, "[perf] tab_switch doc=" + dst.docId + " path=gpu-cache mesh=" +
+    addLog("[perf] tab_switch doc=" + dst.docId + " path=gpu-cache mesh=" +
                        std::to_string(meshBindMs) + "ms total=" + std::to_string(totalMs) + "ms");
 }
 
@@ -645,7 +916,7 @@ void AppState::activateTabDocAsync(const std::string& docId, int tabIdx, uint64_
     // doc_activate serves the engine's warm read-cache compile (no recompile / re-tess when
     // the doc is unchanged); a stale hostd that predates the method is handled below this
     // layer — engine::call falls back to the forced doc_rebuild on "unknown method".
-    rpc.call("doc_activate", nlohmann::json{{"doc_id", docId}},
+    rpc.call("doc_activate", nlohmann::json{{"doc_id", docId}, {"origin", "system"}},
              [this, docId, tabIdx, generation, queuedAt](const core::RpcResult& r) {
                  activationInFlight = false;
                  --rebuildsInFlight;
@@ -676,7 +947,7 @@ void AppState::activateTabDocAsync(const std::string& docId, int tabIdx, uint64_
                  }
                  const double rebuildMs = std::chrono::duration<double, std::milli>(
                      std::chrono::steady_clock::now() - queuedAt).count();
-                 logTabPerf(*this, "[perf] tab_switch_rebuild doc=" + docId +
+                 addLog("[perf] tab_switch_rebuild doc=" + docId +
                                   " gen=" + std::to_string(generation) +
                                   " total=" + std::to_string(rebuildMs) + "ms");
                  loadingToastInFlight.erase(docId);
@@ -716,14 +987,30 @@ void AppState::activateTabDocAsync(const std::string& docId, int tabIdx, uint64_
                      addLog("[tabs] async activation for " + docId + " superseded (gen " +
                             std::to_string(generation) + " < " +
                             std::to_string(activationGeneration) + ") — not adopted");
+                 // A push can advance the live mirror or its parked cache while this
+                 // activation is in flight. Generation tracks switches, not revisions.
+                 const long returnedRevision = r.result.value("revision", -1L);
+                 const bool meshAvailable = r.result.contains("tess") &&
+                     r.result["tess"].is_object() &&
+                     !r.result["tess"].contains("mesh_error") &&
+                     r.result["tess"].contains("aicm_path") &&
+                     r.result["tess"]["aicm_path"].is_string() &&
+                     (!r.result["tess"]["aicm_path"].get<std::string>().empty() ||
+                      (r.result["tess"].contains("bodies") &&
+                       r.result["tess"]["bodies"].is_array() &&
+                       r.result["tess"]["bodies"].empty()));
+                 const long liveRevision = docMirror.docId() == docId ? docMirror.revision() : -1;
+                 const long cachedRevision = docTabs[idx].session
+                     ? docTabs[idx].session->cachedRevision : -1;
+                 if (returnedRevision < std::max(liveRevision, cachedRevision)) {
+                     addLog("[tabs] stale activation ignored for " + docId);
+                     return;
+                 }
                  if (activeTab == idx && current) {
-                     suppressTabDirty = true;
                      if (!docMirror.adoptActivateResponse(docId, r.result, aicm, e2)) {
-                         suppressTabDirty = false;
                          toast(ui::ToastLevel::Error, "Couldn't switch document: " + e2);
                          return;
                      }
-                     suppressTabDirty = false;
                      DocTab& d = docTabs[idx];
                      d.isAssembly = docMirror.tree().is_object() &&
                                     (jtab(docMirror.tree(), "schema") == "aicad.asm/1");
@@ -735,26 +1022,27 @@ void AppState::activateTabDocAsync(const std::string& docId, int tabIdx, uint64_
                         // the async loader (loader pthread); drainMeshLoads() commits + fills
                         // cachedDocMesh next frame. meshGen_ latest-wins drops stale
                         // completions if the user switches again mid-load.
-                        loadDocMeshAsync(aicm);
-                     } else {
+                        loadDocMeshAsync(aicm, false, true, true);
+                     } else if (meshAvailable) {
                          unloadDocMesh();
                          if (renderer) renderer->setActiveMeshIdentity(docId, docMirror.revision());
+                         committedMeshDocId = docId;
+                         committedMeshRevision = docMirror.revision();
                          d.session->cachedDocMesh = std::make_shared<render::DocMesh>();
+                         core::meshCatchupFinished(docId, docMirror.revision(), true);
+                     } else {
+                         core::requireDocMesh(docId, docMirror.revision());
                      }
                      // Park snapshot + path now so a mid-load switch-away/back can take the
                      // cached-async path (no second doc_activate) while the mesh still loads.
                      d.session->cachedMirror = docMirror.snapshot();
                      d.session->cachedAicmPath = aicm;
                      d.session->cachedRevision = docMirror.revision();
-                     d.meshCacheInvalidated = false;
+                     d.meshCacheInvalidated = !meshAvailable || !aicm.empty();
                      selection.mutableItems() = std::move(d.session->selItems);
                      d.session->selItems.clear();
                      hover = d.session->hover;
                      pickStatus = std::move(d.session->pickStatus);
-                     if (d.camValid) {
-                         yaw = d.yaw; pitch = d.pitch; zoom = d.zoom;
-                         pan[0] = d.pan[0]; pan[1] = d.pan[1]; pan[2] = d.pan[2];
-                     }
                      if (d.isAssembly) { showRibbon = true; ribbonTab = RT_Features; }
                      else if (ribbonTab == RT_Assembly || ribbonTab == RT_PCB ||
                               ribbonTab == RT_Schematic)
@@ -765,16 +1053,25 @@ void AppState::activateTabDocAsync(const std::string& docId, int tabIdx, uint64_
                     // branch also catches the superseded case above, and a doc_activate that
                     // spent two minutes queued behind a writer comes back older than the
                     // pushed revisions the tab prewarmed while it waited.
-                    std::string aicmPark;
-                    if (r.result.contains("tess") && r.result["tess"].is_object())
-                        aicmPark = r.result["tess"].value("aicm_path", std::string());
-                    int parkRev = -1;
-                    if (r.result.contains("revision") && r.result["revision"].is_number_integer())
-                        parkRev = r.result["revision"].get<int>();
-                    if (!aicmPark.empty() && docTabs[idx].session &&
-                        parkRev >= docTabs[idx].session->cachedRevision) {
-                        docTabs[idx].session->cachedAicmPath = aicmPark;
-                        docTabs[idx].session->cachedRevision = parkRev;
+                    core::DocMirror fetched;
+                    std::string aicmPark, parkError;
+                    if (docTabs[idx].session &&
+                        fetched.adoptActivateResponse(docId, r.result, aicmPark, parkError)) {
+                        auto& session = *docTabs[idx].session;
+                        session.cachedMirror = fetched.snapshot();
+                        session.cachedRevision = fetched.revision();
+                        session.cachedAicmPath = aicmPark;
+                        if (!meshAvailable) {
+                            docTabs[idx].meshCacheInvalidated = true;
+                            core::requireDocMesh(docId, fetched.revision());
+                        } else if (!aicmPark.empty()) {
+                            docTabs[idx].meshCacheInvalidated = true;
+                            cacheBackgroundDocMeshAsync(docId, fetched.revision(), aicmPark);
+                        } else {
+                            session.cachedDocMesh = std::make_shared<render::DocMesh>();
+                            docTabs[idx].meshCacheInvalidated = false;
+                            core::meshCatchupFinished(docId, fetched.revision(), true);
+                        }
                     }
                  }
              }, 120000);
@@ -782,8 +1079,38 @@ void AppState::activateTabDocAsync(const std::string& docId, int tabIdx, uint64_
 
 void AppState::closeDocTab(int idx, bool detachOnly) {
     if (idx < 0 || idx >= (int)docTabs.size()) return;
+    const auto& closingTab = docTabs[idx];
+    const std::string pendingId = closingTab.kind == DocTab::TabKind::Drawing
+        ? closingTab.drawingDocId
+        : (closingTab.kind == DocTab::TabKind::Schematic || closingTab.kind == DocTab::TabKind::PCB)
+            ? closingTab.ecadDocId : closingTab.docId;
+    if (!pendingId.empty() && hasPendingHumanMutations(pendingId)) {
+        toast(ui::ToastLevel::Info, "Wait for the current edit to finish before closing.");
+        return;
+    }
+    if (docTabs[idx].kind == DocTab::TabKind::Part ||
+        docTabs[idx].kind == DocTab::TabKind::Assembly) {
+        const std::string docId = docTabs[idx].docId;
+        for (const auto& drawing : docTabs) {
+            if (drawing.kind == DocTab::TabKind::Drawing && drawing.sourceDocId == docId &&
+                drawing.path.empty() &&
+                (drawing.dirty || hasPendingHumanMutations(drawing.drawingDocId))) {
+                toast(ui::ToastLevel::Warn, "Save or close this part's unsaved drawings first.");
+                return;
+            }
+        }
+        const auto session = docTabs[idx].session;
+        // Even discard/detach must finish accepted edits before dropping the engine document.
+        // A failed edit still permits an explicitly requested close; its callback reports it.
+        if (session && session->sim) session->sim->flushPendingEdits(*this, docId);
+        const auto tab = std::find_if(docTabs.begin(), docTabs.end(),
+                                     [&](const DocTab& t) { return t.docId == docId; });
+        if (tab == docTabs.end()) return;
+        idx = static_cast<int>(tab - docTabs.begin());
+    }
     if (idx == activeTab && asmPanels) asmPanels->closeAllToolForms(*this);
     DocTab closing = docTabs[idx];
+    core::forgetDocMesh(closing.docId);
     // Multi-document: keep the closing tab's session alive past this erase until any async RPC its
     // PM / sketch / evaluate has in flight has drained (their completion lambdas capture `this`).
     // sweepRetiredSessions() releases it once rpc is idle. Harmless for a session with no pending
@@ -796,68 +1123,48 @@ void AppState::closeDocTab(int idx, bool detachOnly) {
     // dropped a view rather than the document: it keeps the part listed in the
     // Artifacts panel with a Reopen action, and stops openMirrorTab from re-revealing
     // the tab on the agent's very next edit. A doc that really closed records nothing.
-    auto noteSurvivingClose = [this](const DocTab& t, const nlohmann::json& res) {
-        if (!res.is_object() || !res.value("detached", false) || t.docId.empty()) return;
-        dismissedMirrorDocs[t.docId] = t.displayTitle();
-        if (res.contains("note"))
-            addLog("[tabs] " + t.docId + ": " + res.value("note", std::string("detached")));
-    };
 
     // Tell the worker to drop the document from its registry. (Best-effort: a failure still removes
     // the host tab so the UI never wedges on a doc the user asked to close.) A Drawing tab lives in
     // the separate drawing registry, so it closes via drawing_close {doc_id: <drawing id>}.
     if (closing.kind == DocTab::TabKind::Drawing) {
-        nlohmann::json res;
-        std::string err;
-        if (!closing.drawingDocId.empty() &&
-            !worker.call("drawing_close", {{"doc_id", closing.drawingDocId}}, res, err))
-            addLog("[tabs] drawing_close failed for " + closing.drawingDocId + ": " + err);
+        if (!closing.drawingDocId.empty()) {
+            const std::string id = closing.drawingDocId;
+            rpc.call("drawing_close", {{"doc_id", id}}, [this, id](const core::RpcResult& r) {
+                if (!r.ok) addLog("[tabs] drawing_close failed for " + id + ": " + r.err);
+            });
+        }
     } else if (closing.kind == DocTab::TabKind::Schematic ||
                closing.kind == DocTab::TabKind::PCB) {
         // An ECAD tab lives in the worker's separate ecad_* registry, so it closes via
         // ecad_close {doc_id: <ecad id>} (analogue of drawing_close for the drawing registry).
-        nlohmann::json res;
-        std::string err;
-        if (!closing.ecadDocId.empty() &&
-            !worker.call("ecad_close", {{"doc_id", closing.ecadDocId}}, res, err))
-            addLog("[tabs] ecad_close failed for " + closing.ecadDocId + ": " + err);
+        if (!closing.ecadDocId.empty()) {
+            const std::string id = closing.ecadDocId;
+            rpc.call("ecad_close", {{"doc_id", id}}, [this, id](const core::RpcResult& r) {
+                if (!r.ok) addLog("[tabs] ecad_close failed for " + id + ": " + r.err);
+            });
+        }
         // If this was the doc the editor is pointing at, drop the AppState reflection so a stale id
         // can't drive the panel after the tab is gone (a neighbor switch re-points it if needed).
         if (ecadDocId == closing.ecadDocId) { ecadDocId.clear(); ecadRevision = -1; }
-    } else if (closing.aiHandoff && engine::daemonMode()) {
-        // A daemon mirror tab VIEWS a doc another client (an agent) is building in the
-        // SHARED engine. Two close paths:
-        //  * detachOnly: drop ONLY our ro view (detach_doc). The doc goes unattached and the
-        //    daemon's GC/retire tier preserves it if it was dirty — so an abandoned unsaved AI
-        //    part is recoverable next launch, never silently purged. This is the data-safe
-        //    default whenever the close was not an explicit user act.
-        //  * manual X-click (detachOnly=false): an explicit "I'm done" — doc_discard drops
-        //    our view AND, if no other client still holds the doc, closes it for good so a
-        //    deliberately-closed part doesn't flood back as unsaved-recovery. If the agent
-        //    is still building it (another writer, or a live agent run owns the doc between
-        //    its per-turn worker processes), the daemon degrades this to a plain detach and
-        //    says so — the agent's work is independent of the user's viewport.
-        if (auto* c = engine::client()) {
-            nlohmann::json res;
-            std::string err;
-            const char* method = detachOnly ? "detach_doc" : "doc_discard";
-            if (c->call(method, {{"doc_id", closing.docId}}, res, err,
-                        kMirrorCloseTimeoutMs)) {
-                noteSurvivingClose(closing, res);
-            } else {
-                addLog("[tabs] " + std::string(method) + " failed for " +
-                       closing.docId + ": " + err);
-                toast(ui::ToastLevel::Warn,
-                      "Document close not confirmed — check Agent Documents");
-            }
-        }
+    } else if ((closing.aiHandoff || detachOnly) && engine::daemonMode()) {
+        // Closing a presentation releases our view, never the agent's document.
+        core::queueMirrorClose(*this, closing.docId, closing.displayTitle(), true);
     } else {
-        nlohmann::json res;
-        std::string err;
-        if (!worker.call("doc_close", {{"doc_id", closing.docId}}, res, err))
-            addLog("[tabs] doc_close failed for " + closing.docId + ": " + err);
+        const std::string id = closing.docId;
+        auto done = [this, id, title = closing.displayTitle()](const core::RpcResult& r) {
+            if (!r.ok) addLog("[tabs] doc_close failed for " + id + ": " + r.err);
+            else if (r.result.is_object() && r.result.value("detached", false) && !id.empty()) {
+                dismissedMirrorDocs[id] = title;
+                if (r.result.contains("note"))
+                    addLog("[tabs] " + id + ": " +
+                           r.result.value("note", std::string("detached")));
+            }
+        };
+        if (engine::daemonMode() && id.rfind("doc-cpp", 0) == 0)
+            rpc.callPrimary("doc_close", {{"doc_id", id}}, std::move(done));
         else
-            noteSurvivingClose(closing, res);
+            rpc.call("doc_close", {{"doc_id", id}}, std::move(done));
     }
 
     const bool closingActive = (idx == activeTab);
@@ -877,8 +1184,7 @@ void AppState::closeDocTab(int idx, bool detachOnly) {
     }
 
     if (closingActive) {
-        // Return to the tab the user was on before this one (leaving Electronics discards the PCB1
-        // starter and must land back on the part the user came from). With no usable history,
+        // Return to the tab the user was on before this one. With no usable history,
         // fall back to a neighbor: the tab now at the same index, else the new last tab.
         // switchToTab does the full re-point + viewport refresh.
         int next = mostRecentTab(*this, tabMruKey(closing));
@@ -917,7 +1223,6 @@ void AppState::discardWorkspaceStarter(Workspace leftWs) {
         switch (leftWs) {
             case Workspace::Model:       return k == K::Part || k == K::Assembly;
             case Workspace::Drawing:     return k == K::Drawing;
-            case Workspace::Electronics: return k == K::Schematic || k == K::PCB;
             default:                     return false;
         }
     };
@@ -932,52 +1237,76 @@ void AppState::discardWorkspaceStarter(Workspace leftWs) {
     }
 }
 
-void AppState::markActiveTabDirty() {
-    // Only dirty the tab that actually matches the mirror's current doc. Mid-transition (a path
-    // re-pointed the mirror but the strip hasn't reconciled yet) the active index can lag the
-    // mirror; checking the id avoids dirtying the wrong document's tab.
-    if (activeTab >= 0 && activeTab < (int)docTabs.size() &&
-        docTabs[activeTab].docId == docMirror.docId()) {
-        docTabs[activeTab].dirty = true;
-        // Local mutation re-seeds the undo stack — un-grey the toolbar after a
-        // prior doc.history_cleared (human save wiped history).
-        docTabs[activeTab].historyCleared = false;
-        // First user edit on an AI mirror tab ADOPTS it: it becomes user-owned, so it is
-        // never auto-closed when the agent finishes and IS covered by the quit warning. The
-        // agent keeps co-editing the same live doc (the mirror's ro attach silently upgraded
-        // to rw for this edit — engine_backend.cpp — so both writers coexist under the CAS).
-        if (docTabs[activeTab].aiHandoff)
-            docTabs[activeTab].userAdopted = true;
+namespace {
+bool tabMatchesDirtyId(const AppState::DocTab& tab, const std::string& id) {
+    if (id.empty()) return false;
+    if (tab.kind == AppState::DocTab::TabKind::Drawing) return tab.drawingDocId == id;
+    if (tab.kind == AppState::DocTab::TabKind::Schematic ||
+        tab.kind == AppState::DocTab::TabKind::PCB) return tab.ecadDocId == id;
+    return tab.docId == id;
+}
+}
+
+void AppState::markHumanEdit(const std::string& docId, int revision) {
+    for (auto& tab : docTabs) {
+        if (!tabMatchesDirtyId(tab, docId)) continue;
+        tab.dirty = true;
+        tab.lastHumanEditRevision = std::max(tab.lastHumanEditRevision, revision);
+        ++tab.humanEditGeneration;
+        tab.historyCleared = false;
+        if (tab.aiHandoff) tab.userAdopted = true;
+        return;
     }
 }
 
-void AppState::clearActiveTabDirty() {
-    if (activeTab >= 0 && activeTab < (int)docTabs.size())
-        docTabs[activeTab].dirty = false;
+void AppState::markSaved(const std::string& docId, int savedRevision, const std::string& path) {
+    for (auto& tab : docTabs) {
+        if (!tabMatchesDirtyId(tab, docId)) continue;
+        if (!path.empty()) tab.path = path;
+        if (savedRevision >= tab.lastHumanEditRevision && !hasPendingHumanMutations(docId)) {
+            tab.dirty = false;
+            tab.lastHumanEditRevision = -1;
+            tab.lastHumanMetadataRevision = -1;
+        }
+        return;
+    }
+}
+
+void AppState::applyHumanDirty(const std::string& docId, bool humanDirty) {
+    for (auto& tab : docTabs) {
+        if (!tabMatchesDirtyId(tab, docId)) continue;
+        if (humanDirty) {
+            tab.dirty = true;
+            tab.lastHumanEditRevision = std::max(tab.lastHumanEditRevision, 0);
+        } else if (!hasPendingHumanMutations(docId)) {
+            tab.dirty = false;
+            tab.lastHumanEditRevision = -1;
+            tab.lastHumanMetadataRevision = -1;
+        }
+        return;
+    }
+}
+
+void AppState::beginHumanMutation(const std::string& docId) {
+    if (!docId.empty()) ++pendingHumanMutations[docId];
+}
+
+void AppState::endHumanMutation(const std::string& docId) {
+    auto it = pendingHumanMutations.find(docId);
+    if (it != pendingHumanMutations.end() && --it->second == 0)
+        pendingHumanMutations.erase(it);
+}
+
+bool AppState::hasPendingHumanMutations(const std::string& docId) const {
+    return docId.empty() ? !pendingHumanMutations.empty() :
+                           pendingHumanMutations.count(docId) != 0;
 }
 
 void AppState::markEcadTabDirty(const std::string& ecadDocId) {
-    if (suppressTabDirty || ecadDocId.empty()) return;
-    for (auto& t : docTabs)
-        if ((t.kind == DocTab::TabKind::Schematic || t.kind == DocTab::TabKind::PCB) &&
-            t.ecadDocId == ecadDocId) {
-            t.dirty = true;
-            return;
-        }
+    if (ecadDocId.empty() || ecadDocId != this->ecadDocId) return;
+    markHumanEdit(ecadDocId, ecadRevision);
 }
 
-void AppState::markDrawingTabDirty(int idx) {
-    if (suppressTabDirty) return;
-    if (idx >= 0 && idx < (int)docTabs.size() && docTabs[idx].kind == DocTab::TabKind::Drawing)
-        docTabs[idx].dirty = true;
-}
-
-void AppState::clearDrawingDirtyForSource(const std::string& sourceDocId) {
-    if (sourceDocId.empty()) return;
-    for (auto& t : docTabs)
-        if (t.kind == DocTab::TabKind::Drawing && t.sourceDocId == sourceDocId)
-            t.dirty = false;
-}
 
 void AppState::ensureActiveTab() {
     // A Drawing tab is active: the mirror still points at the drawing's SOURCE part (we never
@@ -1001,11 +1330,12 @@ void AppState::ensureActiveTab() {
         // may have re-pointed the mirror without going through switchToTab) and keep its title in
         // step with the live tree (renames, agent-built names). Ensure the tab has a session and the
         // active-subsystem borrows resolve to it (idempotent when the active tab didn't change).
-        if (idx != activeTab) noteLeavingTab(*this);
+        const bool changed = idx != activeTab;
+        if (changed) noteLeavingTab(*this);
         activeTab = idx;
         ensureTabSession(docTabs[idx]);
         reseatActiveSubsystems(docTabs[idx].session.get());
-        syncActiveTabTitle();
+        if (changed) syncActiveTabTitle();
         return;
     }
     // The mirror points at a document with no tab — adopt it. We can't tell part vs assembly from
@@ -1026,9 +1356,22 @@ void AppState::syncActiveTabTitle() {
     // new tab, so activeTab can still be the previous doc while the mirror already points at the
     // new one. Refuse to rewrite the lagging tab's title from the wrong tree.
     if (t.docId != docMirror.docId()) return;
-    t.isAssembly = docMirror.tree().is_object() &&
-                   (jtab(docMirror.tree(), "schema") == "aicad.asm/1");
-    t.title = docTitle(docMirror.tree(), t.isAssembly);
+    const auto& tree = docMirror.tree();
+    if (!tree.is_object()) {
+        t.isAssembly = false;
+        if (t.title != "Part1") t.title = "Part1";
+        return;
+    }
+    const auto schema = tree.find("schema");
+    t.isAssembly = schema != tree.end() && schema->is_string() && *schema == "aicad.asm/1";
+    const auto name = tree.find("name");
+    if (name != tree.end() && name->is_string() && !name->get_ref<const std::string&>().empty()) {
+        const auto& title = name->get_ref<const std::string&>();
+        if (t.title != title) t.title = title;
+    } else {
+        const char* title = t.isAssembly ? "Assembly1" : "Part1";
+        if (t.title != title) t.title = title;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1127,6 +1470,7 @@ void AppState::makeDrawing() {
     // Model workspace may discard (that would close the drawing's source part).
     docTabs[activeTab].isStarter = false;
     docTabs.push_back(std::move(t));
+    markHumanEdit(drawingId, docTabs.back().drawingDoc.value("revision", 0));
     activeTab = (int)docTabs.size() - 1;
     reseatActiveSubsystems(nullptr);
     // Same landing as switchToTab() for a drawing tab: the sheet lives in the Drawing workspace,
@@ -1205,7 +1549,6 @@ void AppState::adoptStandaloneDrawingTab(const std::string& drawingDocId,
             tab.drawingDocId != drawingDocId)
             continue;
         tab.path = path;
-        tab.dirty = false;
         switchToTab(i);
         addLog("[draw] opened standalone drawing '" + tab.title + "' from " + path);
         return;

@@ -22,7 +22,7 @@ everything:
      then the in-process ask_user/design_recipe pair. Sees every ``@mcp.tool()``.
   3. ``MissionDispatch.resolve``    — bound METHODS on the dispatcher
      (``mission_dispatch._handlers``): ``delegate``, ``ask_user``, the
-     ``corporate_*`` / ``coordinate_*`` coordination surface, the parts
+     ``coordinate_*`` coordination surface, the parts
      passthroughs. These are NOT MCP-registered and layer 2 cannot see them, yet
      they run on every lane that binds a dispatcher — which includes the general
      lane, since ``run_linear_role_turn`` always constructs one.
@@ -85,6 +85,18 @@ def resolvable() -> set[str]:
     return out
 
 
+def test_compact_menu_omits_default_off_manufacture(monkeypatch):
+    monkeypatch.setattr(tcat, "tool_menu_groups", lambda: [
+        ("modeling", "models", ["new_part"]),
+        ("manufacture", "machines", ["machine_run"]),
+        ("inspect", "inspection", ["describe_part"]),
+    ])
+    menu = tcat.render_tool_menu()
+    assert "modeling" in menu and "inspect" in menu
+    assert "manufacture" not in menu and "machine_run" not in menu
+    assert "list_tool_categories" in menu and "enable_tools" in menu
+
+
 class TestEveryPackEntryResolves:
     def test_no_pack_advertises_an_unreachable_tool(self, resolvable):
         dead = sorted(_all_pack_names() - resolvable)
@@ -106,19 +118,32 @@ class TestEveryPackEntryResolves:
         orphan = sorted(set(tcat._CATEGORY_DESCS) - set(tcat.CATEGORY_PACKS))
         assert orphan == [], f"descriptions for packs that do not exist: {orphan}"
 
+    def test_assembly_checks_are_requestable_and_resolve(self, resolvable):
+        checks = {
+            "interface_check", "assembly_dof", "fastener_check", "tool_access_check",
+            "disassembly_check", "mate_fit_check", "bom_consistency_check",
+        }
+        assert checks <= tcat.resolve_categories(["assembly"], cap=10_000)
+        assert checks <= resolvable
+
+    def test_stress_tools_are_requestable_and_resolve(self, resolvable):
+        checks = {"find_stress_risers", "fea_probe", "eval_curvature", "eval_geometry_analysis"}
+        assert checks <= tcat.resolve_categories(["stress"], cap=10_000)
+        assert "find_stress_risers" in tcat.resolve_categories(["inspect"], cap=10_000)
+        assert {"find_stress_risers", "fea_probe"} <= tcat.resolve_categories(["sim"], cap=10_000)
+        assert checks <= resolvable
+
 
 class TestCoordinationSurfaceIsNotMcpVisible:
     """Pin the layer-3-only class so a future audit cannot mistake it for dead.
 
-    These four are MissionDispatch bound methods. ``_bind_tool`` CANNOT see them.
+    These two are MissionDispatch bound methods. ``_bind_tool`` CANNOT see them.
     If this test starts failing because they became MCP-registered, that is fine —
     update it. If it fails because they vanished from the dispatcher, the
     ``delegate`` pack is advertising dead names again.
     """
 
     NAMES = (
-        "corporate_channel_read",
-        "corporate_chart",
         "coordinate_board",
         "coordinate_progress",
     )
@@ -161,9 +186,7 @@ class TestPreviouslyUnreachableAdvertisedTools:
         ``req_verify_by_id`` each head a discipline cad_guide walks the model through
         step by step while no pack carried any of it;
       * ``vendor_status`` is what the parts guidance says to check before
-        ``scrape_enqueue``;
-      * ``request_raise`` is the worker half of a request protocol whose manager half
-        (``request_resolve``) was already reachable.
+        ``scrape_enqueue``.
     """
 
     @pytest.mark.parametrize("tool", [
@@ -182,7 +205,6 @@ class TestPreviouslyUnreachableAdvertisedTools:
         "req_verify_by_id",
         "office_edit_pdf",
         "vendor_status",
-        "request_raise",
         "fw_debug_halt",
         "struct_estimate",
         "ecad_thermal_handoff",
@@ -212,3 +234,145 @@ class TestPreviouslyUnreachableAdvertisedTools:
         resolved = tcat.resolve_categories(["ecad"])
         missing = [e for e in pack if e not in resolved]
         assert missing == [], f"ecad entries trimmed by CATEGORY_EXPAND_CAP: {missing}"
+
+
+@pytest.fixture
+def discovery_registry(monkeypatch):
+    """Small registry with overlapping menu groups and real curated pack names."""
+    from services.agent import omp_tools
+
+    catalog = {
+        "slice_part": {"family": "cam"},
+        "optimize_print_orientation": {"family": "cam"},
+        "dfm_check": {"family": "cad"},
+        "add_features": {"family": "cad"},
+        "test_family_tool": {"family": "example"},
+    }
+    monkeypatch.setattr(tcat, "_live_catalog", lambda: catalog)
+    original_expand = tcat._expand_token
+
+    def expand(token):
+        if token.startswith("family:"):
+            family = token.removeprefix("family:")
+            return {name for name, meta in catalog.items()
+                    if meta["family"] == family and name not in tcat.AGENT_DENIED_TOOLS}
+        return original_expand(token)
+
+    monkeypatch.setattr(tcat, "_expand_token", expand)
+    monkeypatch.setattr(
+        omp_tools, "_load_registry_entries",
+        lambda _context: {name: {"description": f"Description for {name}"}
+                          for name in catalog},
+    )
+    return catalog
+
+
+def _discovery_names(category):
+    from services.agent.agent_turn import _tool_category_catalog_result
+
+    names = []
+    offset = 0
+    while True:
+        result = _tool_category_catalog_result(category=category, offset=offset, limit=3)
+        assert result["ok"], result
+        assert result["total"] >= len(names) + len(result["tools"])
+        names.extend(item["name"] for item in result["tools"])
+        if result["next_offset"] is None:
+            assert result["total"] == len(names)
+            return names
+        assert result["next_offset"] == offset + len(result["tools"])
+        offset = result["next_offset"]
+
+
+def test_advertised_categories_match_enable_resolver(discovery_registry):
+    from services.agent.agent_turn import _tool_category_catalog_result
+
+    overview = _tool_category_catalog_result()
+    assert overview["ok"]
+    for item in overview["categories"]:
+        expected, unknown = tcat.resolve_tool_requests([item["name"]])
+        assert not unknown
+        names = _discovery_names(item["name"])
+        assert len(names) == len(set(names))
+        assert set(names) == expected
+
+
+@pytest.mark.parametrize("category", ["print", "sheetmetal", "family:example", "slice_part"])
+def test_resolved_category_lookup_search_and_pagination(discovery_registry, category):
+    from services.agent.agent_turn import _tool_category_catalog_result
+
+    expected, unknown = tcat.resolve_tool_requests([category])
+    assert not unknown
+    names = _discovery_names(category)
+    assert len(names) == len(set(names))
+    assert set(names) == expected
+    assert names == _discovery_names(category)
+    query = "slice"
+    result = _tool_category_catalog_result(category=category, query=query, limit=100)
+    assert result["ok"]
+    assert [item["name"] for item in result["tools"]] == [
+        name for name in names if query in name.lower()
+    ]
+    assert result["total"] == len(result["tools"])
+
+
+def test_unfiltered_search_and_out_of_range_page(discovery_registry):
+    from services.agent.agent_turn import _tool_category_catalog_result
+
+    result = _tool_category_catalog_result(query="description for slice")
+    assert result["ok"]
+    assert [item["name"] for item in result["tools"]] == ["slice_part"]
+    empty = _tool_category_catalog_result(category="print", offset=10000)
+    assert empty["ok"]
+    assert empty["tools"] == []
+    assert empty["total"] == len(_discovery_names("print"))
+    assert empty["next_offset"] is None
+
+
+def test_discovery_rejects_unknown_categories(discovery_registry):
+    from services.agent.agent_turn import _tool_category_catalog_result
+
+    for category in ("not_a_category", "family:not_a_family", "   "):
+        result = _tool_category_catalog_result(category=category)
+        assert not result["ok"]
+        assert result.get("error")
+
+
+def test_cold_registry_advertised_packs_remain_resolvable(discovery_registry):
+    from services.agent.agent_turn import _tool_category_catalog_result
+
+    discovery_registry.clear()
+    overview = _tool_category_catalog_result()
+    assert overview["ok"]
+    assert {item["name"] for item in overview["categories"]} == {
+        name for name, _description in tcat.category_catalog()
+    }
+    for item in overview["categories"]:
+        expected, unknown = tcat.resolve_tool_requests([item["name"]])
+        assert not unknown
+        names = _discovery_names(item["name"])
+        assert len(names) == len(set(names))
+        assert set(names) == expected
+
+
+@pytest.mark.parametrize("query", [
+    "slice_part dfm_check add_features slice_part not_a_tool",
+    " SLICE_PART, dfm_check,\nadd_features, slice_part, not_a_tool ",
+])
+def test_discovery_bulk_names_preserve_filtering_and_pagination(discovery_registry, query):
+    from services.agent.agent_turn import _tool_category_catalog_result
+
+    first = _tool_category_catalog_result(query=query, limit=2)
+    assert first["ok"] and first["total"] == 3
+    assert first["next_offset"] == 2
+    second = _tool_category_catalog_result(query=query, offset=first["next_offset"], limit=2)
+    assert second["ok"] and second["total"] == 3
+    assert second["next_offset"] is None
+    names = [row["name"] for row in first["tools"] + second["tools"]]
+    assert len(names) == len(set(names)) == 3
+    assert set(names) == {"slice_part", "dfm_check", "add_features"}
+
+    filtered = _tool_category_catalog_result(query=query, category="family:cam")
+    assert filtered["ok"] and filtered["total"] == 1
+    assert [row["name"] for row in filtered["tools"]] == ["slice_part"]
+    assert filtered["next_offset"] is None

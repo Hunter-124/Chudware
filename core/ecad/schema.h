@@ -5,10 +5,13 @@
 // aicad.pcb/1 (board). Connectivity passes (netlist, ERC, DRC, ratsnest, zonefill)
 // live in sibling modules and are invoked from session.cpp::compile_field. Coordinates
 // are [x, y] in mm; angles in degrees CCW. Mirrors the pattern of
-// core/doc/validate.{h,cpp}.
+// core/doc/validate.{h,cpp}. KiCad-backed documents may carry per-object
+// `uuid`, `kicad_tag`, `kicad_extra`, `kicad_original`, and root `kicad`
+// passthrough data. Structural validation deliberately leaves them intact.
 #pragma once
 
 #include <set>
+#include <string_view>
 #include <string>
 #include <vector>
 
@@ -48,6 +51,11 @@ std::string next_id(const nlohmann::json& doc, const std::string& prefix);
 // canonical ordered copper-layer ids for an N-copper stackup (F.Cu, In1.Cu, ..., B.Cu)
 std::vector<std::string> copper_layer_ids(int copper_layers);
 std::set<std::string> valid_layers(int copper_layers);
+
+// KiCad layer sets (for example *.Cu, F&B.Cu, *.Mask) against a concrete layer.
+bool layer_spec_matches(std::string_view spec, std::string_view layer);
+bool pad_has_layer(const nlohmann::json& pad, std::string_view layer);
+std::set<std::string> pad_copper_layers(const nlohmann::json& pad, int copper_layers);
 
 // geometry: world endpoint of a symbol pin (the connection tip away from the body)
 std::pair<double, double> pin_world(const nlohmann::json& symbol, const nlohmann::json& pin);

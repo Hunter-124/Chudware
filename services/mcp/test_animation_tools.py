@@ -45,6 +45,24 @@ def _engine_up() -> bool:
 
 needs_engine = pytest.mark.skipif(not _engine_up(), reason="libchudware/hostd unavailable")
 
+@needs_engine
+def test_animation_clone_captures_unbound_live_revision():
+    doc = cb.call("doc_new", {"name": "animation-live-snapshot"})["doc_id"]
+    clone = None
+    try:
+        cb.call("doc_apply_ops", {"doc_id": doc, "ops": [
+            cb.feat("box", "LiveBox", {"length": cb.dim(12), "width": cb.dim(8),
+                                       "height": cb.dim(4)})]})
+        before = cb.call("doc_tree", {"doc_id": doc})
+        clone = anim._clone_detached(doc, "explode")
+        assert cb.call("doc_tree", {"doc_id": clone})["tree"]["features"] == before["tree"]["features"]
+        assert cb.call("doc_tree", {"doc_id": doc})["revision"] == before["revision"]
+        assert cb.call("eval_mass", {"doc_id": clone})["volume_mm3"] == pytest.approx(384)
+    finally:
+        if clone:
+            cb.call("doc_close", {"doc_id": clone})
+        cb.call("doc_close", {"doc_id": doc})
+
 
 class _CaptureMCP:
     """FastMCP stand-in that just collects the @mcp.tool() registrations."""
@@ -65,6 +83,136 @@ def tools() -> dict:
     register_cad_tools(m)
     register_cad_animation_tools(m)
     return m.tools
+
+@pytest.fixture
+def animation_tool():
+    m = _CaptureMCP()
+    register_cad_animation_tools(m)
+    return m.tools["render_animation"]
+
+
+@pytest.mark.parametrize(("kind", "argument", "value"), [
+    ("turntable", "start", 0), ("explode", "stop", 1),
+    ("turntable", "steer", {}), ("explode", "poses", []),
+    ("fea", "steps", 2), ("turntable", "min_clearance_mm", 0),
+    ("turntable", "check_interference", False), ("motion", "factor", 1),
+    ("turntable", "reverse", False), ("fea", "components", []),
+    ("turntable", "field", "von_mises"), ("motion", "vtu_path", "a.vtu"),
+    ("explode", "warp_mm", 1), ("fea", "highlight", "face"),
+    ("fea", "annotate", False), ("fea", "dark", True),
+    ("fea", "display_quality", "fine"),
+])
+def test_animation_rejects_explicit_off_kind_arguments(animation_tool, kind, argument, value):
+    result = animation_tool(kind=kind, **{argument: value})
+    error = json.loads(result[0])
+    assert not error["ok"]
+    assert argument in error["error"]
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"steer": {"components": ["a"]}, "start": 0},
+    {"steer": {"components": ["a"]}, "stop": 10},
+    {"poses": [{"a": []}, {"a": []}], "steps": 2},
+    {"poses": [{"a": []}, {"a": []}], "check_interference": False},
+    {"poses": [{"a": []}, {"a": []}], "min_clearance_mm": 0},
+    {"mate_id": "m", "check_interference": False, "min_clearance_mm": 1},
+    {"mate_id": "m", "steer": {"components": ["a"]}},
+    {"rear_steer": {"components": ["a"]}},
+])
+def test_motion_rejects_ignored_drive_arguments(animation_tool, kwargs):
+    result = animation_tool(kind="motion", **kwargs)
+    assert not json.loads(result[0])["ok"]
+
+
+def _mock_animation_document(monkeypatch, tmp_path):
+    monkeypatch.setattr(anim, "_render_save_target", lambda path, **_kwargs: str(path))
+    monkeypatch.setattr(anim, "_doc", lambda _doc_id: "source")
+    monkeypatch.setattr(anim, "_handoff_doc_name", lambda _doc_id: "assembly")
+    monkeypatch.setattr(anim, "_provenance", lambda: {
+        "engine_build_id": "engine", "polymesh_commit": "mesh"})
+    monkeypatch.setattr(anim, "_components", lambda _doc_id: [
+        {"id": "a", "name": "Arm", "transform": anim._translation((0, 0, 0))},
+        {"id": "b", "name": "Base", "transform": anim._translation((10, 0, 0))}])
+    return str(tmp_path / "film.gif")
+
+
+@pytest.mark.parametrize(("drive", "enabled", "clearance"), [
+    ("mate", False, None), ("mate", True, 1.5),
+    ("steer", False, None), ("steer", True, 1.5),
+])
+def test_motion_passes_interference_settings_to_plain_sweep(
+        animation_tool, monkeypatch, tmp_path, drive, enabled, clearance):
+    path = _mock_animation_document(monkeypatch, tmp_path)
+    calls = []
+
+    def capture(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise ValueError("sweep captured")
+
+    monkeypatch.setattr(anim, "run_motion_sweep", capture)
+    monkeypatch.setattr(anim, "steer_pose_sweep", capture)
+    args = ({"mate_id": "m", "stop": 30} if drive == "mate"
+            else {"steer": {"components": ["Arm"], "angle_deg": 30}})
+    args["check_interference"] = enabled
+    if clearance is not None:
+        args["min_clearance_mm"] = clearance
+    result = animation_tool(kind="motion", save_path=path, steps=3, **args)
+    assert "sweep captured" in json.loads(result[0])["error"]
+    positional, keywords = calls[0]
+    assert positional[0] == "source"
+    assert keywords["min_clearance_mm"] == (clearance or 0)
+    if drive == "mate":
+        assert keywords["check_interference"] is enabled
+        assert keywords["persist_study"] is False
+        assert keywords["steps"] == 3
+    else:
+        assert positional[4] is enabled
+        assert positional[3] == 3
+
+
+@pytest.mark.parametrize(("components", "accepted"), [
+    (["Arm"], True), (["a"], True), (["missing"], False),
+    (["Arm", "missing"], False),
+])
+def test_explode_resolves_names_and_refuses_unknown_components(
+        animation_tool, monkeypatch, tmp_path, components, accepted):
+    path = _mock_animation_document(monkeypatch, tmp_path)
+    monkeypatch.setattr(anim, "_clone_detached", lambda *_: "clone")
+    monkeypatch.setattr(anim.cb, "call", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(anim, "_world_bodies", lambda _doc: [
+        {"component": "a", "bbox": {"min": [0, 0, 0], "max": [2, 2, 2]}},
+        {"component": "b", "bbox": {"min": [10, 0, 0], "max": [12, 2, 2]}}])
+
+    def reached(_doc):
+        raise ValueError("resolved component")
+
+    monkeypatch.setattr(anim, "_freeze_clone_poses", reached)
+    result = animation_tool(kind="explode", save_path=path, components=components)
+    error = json.loads(result[0])["error"]
+    assert ("resolved component" if accepted else "not in the assembly") in error
+
+
+@pytest.mark.parametrize("kind", ["turntable", "explode", "motion"])
+def test_display_quality_only_changes_detached_document(
+        animation_tool, monkeypatch, tmp_path, kind):
+    path = _mock_animation_document(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(anim, "_clone_detached", lambda *_: "clone")
+    monkeypatch.setattr(anim.cb, "call", lambda method, params: calls.append((method, params)))
+
+    def stop(_doc):
+        raise ValueError("world bodies reached")
+
+    monkeypatch.setattr(anim, "_world_bodies", stop)
+    args = {}
+    if kind == "motion":
+        pose = {"a": anim._translation((0, 0, 0))}
+        args["poses"] = [pose, pose]
+    result = animation_tool(kind=kind, save_path=path, display_quality="fine", **args)
+    assert "world bodies reached" in json.loads(result[0])["error"]
+    assert ("doc_set_display_quality", {"doc_id": "clone", "quality": "fine"}) in calls
+    assert not any(method == "doc_set_display_quality" and params["doc_id"] == "source"
+                   for method, params in calls)
 
 
 def _probe(path: str) -> dict:
@@ -593,19 +741,21 @@ def test_pose_framing_transports_world_bounds_and_keeps_partial_pose_state():
 @needs_ffmpeg
 @pytest.mark.parametrize("pattern", ["circular", "linear"])
 @pytest.mark.parametrize("kind", ["motion", "explode"])
-def test_pattern_film_bounds_contain_native_seed_motion(tools, tmp_path, monkeypatch,
+def test_pattern_film_bounds_contain_native_seed_motion(tools, tmp_path, monkeypatch, request,
                                                         pattern, kind):
     """Pattern WORLD placement is offset * seed_pose, not seed_delta * world_box."""
     monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
     name = f"anim_pattern_{pattern}_{kind}"
-    part = json.loads(tools["new_part"](name=name + "_cube"))["doc_id"]
+    part = json.loads(tools["new_part"](name=name + "_cube", fresh=True))["doc_id"]
+    request.addfinalizer(lambda: cb.call("doc_close", {"doc_id": part}))
     added = json.loads(tools["add_features"](doc_id=part, ops=[
         {"op": "add_feature", "feature": {"type": "box", "name": "Cube",
          "params": {"length": 10, "width": 10, "height": 10, "centered": True}}}]))
     assert added["ok"], added
     part_path = str(tmp_path / "cube.step+")
     assert json.loads(tools["save_part"](doc_id=part, path=part_path))["ok"]
-    assembly = json.loads(tools["new_assembly"](name=name))["doc_id"]
+    assembly = json.loads(tools["new_assembly"](name=name, fresh=True))["doc_id"]
+    request.addfinalizer(lambda: cb.call("doc_close", {"doc_id": assembly}))
     seed_row = json.loads(tools["asm_add_component"](
         doc_id=assembly, path=part_path, name="seed", at=[100, 0, 0]))
     fixed_row = json.loads(tools["asm_add_component"](
@@ -647,11 +797,26 @@ def test_pattern_film_bounds_contain_native_seed_motion(tools, tmp_path, monkeyp
              for cid, offset in measured["offsets_mm"].items()} for t in (0.5, 1.0)]
 
     # Measure the engine's actual poses independently of the framing calculation.
+    expected_bodies = sorted(body["component"] for body in bodies)
     probe = anim._clone_detached(assembly, kind)
     try:
+        # Hydrate the detached assembly before taking its revision: the first native
+        # rebuild may refresh a persisted assembly cache and advance that revision.
+        revision = cb.call("doc_rebuild", {"doc_id": probe})["revision"]
         for row in pose_rows:
-            anim._apply_poses(probe, row)
+            if row:
+                applied = cb.call("doc_apply_ops", {
+                    "doc_id": probe, "base_revision": revision, "with_tess": False,
+                    "ops": [{"op": "asm_edit_component", "id": cid, "transform": transform}
+                            for cid, transform in row.items()]})
+                assert applied["rebuild"]["converged"], applied
+                transforms = {component["id"]: component["transform"]
+                              for component in applied["tree"]["components"]}
+                for cid, transform in row.items():
+                    assert transforms[cid] == pytest.approx(transform), applied
+                revision = applied["revision"]
             posed = anim._world_bodies(probe)
+            assert sorted(body["component"] for body in posed) == expected_bodies
             for body in posed:
                 for axis in range(3):
                     assert bounds["min"][axis] <= body["bbox"]["min"][axis] + 1e-5

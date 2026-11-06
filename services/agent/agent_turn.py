@@ -1,8 +1,8 @@
 """Deterministic provider loop for explicit offline/local and test harnesses.
 
-Ordinary online top-level, nested and DAG turns execute through Chudcode. The
+Ordinary online top-level, nested and DAG turns execute through OMP. The
 only production entry into this module's ``run_turn`` is the explicitly offline
-role path in ``chudcode_roles``; benchmark and regression callers inject their
+role path in ``omp_roles``; benchmark and regression callers inject their
 own providers.
 
 The loop consumes the provider-neutral ``complete`` seam, parses fenced tool
@@ -115,7 +115,7 @@ def apply_context_refs(request: str, context_refs=None) -> str:
     absent/empty/malformed refs.
 
     Also no-ops when the host already inlined a Context references block into
-    the request text (C++ agent_run path; host dual-writes structured + text).
+    the request text (host dual-writes structured + text).
     """
     base = request if isinstance(request, str) else str(request or "")
     # Host (S_Composer) may already have inlined a block — don't double-inject.
@@ -620,40 +620,73 @@ def _directive_parse_error(reply: str) -> str:
     return ""
 
 
-def _tool_category_catalog_result() -> dict:
-    """The `list_tool_categories` payload — shared by the loop and the floor.
-
-    Live registry: every group with its EXACT tool names (the same names
-    ``enable_tools`` accepts, as a group or one at a time). Cold registry (unit
-    tests, early worker start): the curated pack names only.
-
-    The meta tools are executed BY the turn loop, not bound in the tool
-    registry, so dispatching them like a normal tool returns
-    `known_but_unbound / harness_bug` (live 2026-07-27: the forced opener on
-    the general lane came back as a harness gap, which is all the model ever
-    saw before answering in prose).
-    """
+def _tool_category_catalog_result(
+    query: str | None = None, category: str | None = None,
+    offset: int = 0, limit: int = 30,
+) -> dict:
+    """Discover live tools by area or text, with bounded, resumable results."""
+    if (query is not None and not isinstance(query, str)) or (
+        category is not None and not isinstance(category, str)
+    ) or type(offset) is not int or type(limit) is not int or offset < 0 or not 1 <= limit <= 100:
+        return {"ok": False, "error": "query and category must be strings; offset >= 0 and limit 1..100 must be integers"}
     try:
-        from services.agent.tool_categories import (  # noqa: PLC0415
-            category_catalog,
-            tool_menu_groups,
-        )
+        from services.agent.tool_categories import category_catalog, resolve_tool_requests, tool_menu_groups
 
         groups = tool_menu_groups()
-        if groups:
+        if not query and not category:
             return {
                 "ok": True,
                 "categories": [
-                    {"name": n, "description": d, "tools": tools}
+                    {"name": n, "description": d, "count": len(tools)}
                     for n, d, tools in groups
+                ] if groups else [
+                    {"name": n, "description": d} for n, d in category_catalog()
                 ],
             }
-        return {
-            "ok": True,
-            "categories": [
-                {"name": n, "description": d} for n, d in category_catalog()
-            ],
-        }
+        if category is not None:
+            resolved, unknown = resolve_tool_requests([category])
+            if not category.strip() or unknown:
+                return {"ok": False, "error": f"Unknown category: {category}"}
+        else:
+            resolved = {name for _group, _description, names in groups for name in names}
+        from services.agent.omp_tools import _entry_description, _load_registry_entries
+
+        entries = _load_registry_entries(None)
+        needle = (query or "").strip().lower()
+        requested_names = {term for term in re.split(r"[\s,]+", needle) if term}
+        # Keep menu ordering for registered tools; packs can also contain
+        # dispatcher-only tools, which follow in deterministic name order.
+        ordered = []
+        seen = set()
+        for group, _description, names in groups:
+            for name in names:
+                if name in resolved and name not in seen:
+                    ordered.append((name, group))
+                    seen.add(name)
+        ordered.extend((name, category.strip().lower() if category else "")
+                       for name in sorted(resolved - seen))
+        matches = []
+        for name, group in ordered:
+            entry = entries.get(name)
+            description = _entry_description(entry, None).split("\n", 1)[0].strip()
+            if name == "export_part":
+                description = (
+                    "Save drawing as standalone native .draw+: "
+                    "export_part(fmt='draw+', doc_id=<drawing_id>, path='sheet.draw+'). "
+                    + description
+                )
+            searchable = (name + " " + description).lower()
+            # Preserve exact-name lists and phrase searches; also support natural
+            # multiword queries whose terms occur separately in the description.
+            if (needle and name.lower() not in requested_names
+                    and needle not in searchable
+                    and not (requested_names and all(term in searchable for term in requested_names))):
+                continue
+            matches.append({"name": name, "category": group, "description": description[:240]})
+        page = matches[offset:offset + limit]
+        next_offset = offset + len(page)
+        return {"ok": True, "tools": page, "total": len(matches),
+                "next_offset": next_offset if next_offset < len(matches) else None}
     except Exception as exc:  # noqa: BLE001 — meta tool never crashes a turn
         return {"ok": False, "error": str(exc)}
 
@@ -783,8 +816,8 @@ def _force_first_tool(
     if tool == "enable_tools":
         # Same trap as the menu below: enable_tools is executed BY the loop, so
         # dispatching it through the registry returns known_but_unbound. Widen
-        # the allow-set through the caller's closure, which also re-renders the
-        # tools block so the model sees real schemas for what it can now call.
+        # the allow-set through the caller's closure, which also appends the
+        # new schemas as a message so the model sees what it can now call.
         newly = apply_categories(list(forced_cats)) if apply_categories else []
         result = {
             "ok": True,
@@ -1457,8 +1490,8 @@ def classify_provider_error(exc: BaseException) -> tuple[str, bool]:
     escalate/budget as ``failed``/``budget exhausted`` (mega-1 TOP-4).
 
     mega-16: spending-limit / SuperGrok tier-denied is ``provider_unavailable``
-    (non-retryable) so callers mark the provider dead and auto_pick falls through
-    rather than retry-looping xai on every hard node.
+    (non-retryable) so callers report the provider unavailable rather than
+    retry-looping xai on every hard node.
 
     Context-window overflow is a 400 too, but it is a STRUCTURAL problem the
     harness can fix: it classifies as ``context_overflow`` (retryable) so
@@ -1485,8 +1518,8 @@ def classify_provider_error(exc: BaseException) -> tuple[str, bool]:
     if _content_refusal_category(exc) is not None:
         return _PROVIDER_REFUSED, False
 
-    # mega-16: spending-limit BEFORE generic 403→provider_auth so auto_pick can
-    # fall through to openrouter paid instead of fatal-auth aborting the mission.
+    # mega-16: spending-limit BEFORE generic 403→provider_auth so the node reports
+    # provider_unavailable instead of fatal-auth aborting the mission.
     try:
         from services.agent.role_models import (  # noqa: PLC0415
             is_provider_unavailable_error,
@@ -1647,28 +1680,6 @@ _SYSTEM_BASE = (
 )
 
 
-# mega-25 / contract §20: once-per-session cache for the static skills+role
-# catalog blocks (role_catalog.harness_context_block/format_role_catalog_block
-# + skills.catalog_block) — both are static within a mission but were being
-# rebuilt and resent on EVERY main turn (~900-1000 tokens/turn, ~15-20k/mission).
-# Keyed by subagent_id (fresh per DAG-node/subagent context) else run_id
-# (shared mission); calls with neither (standalone/test calls — no session
-# identity) always inject, matching pre-fix behavior with zero pollution risk
-# across unrelated calls.
-_CATALOG_INJECTED_SESSIONS: set[str] = set()
-
-
-def _catalog_due(session_key: str | None) -> bool:
-    """True on the first call for *session_key* (consumes it); always True
-    (never marked) when *session_key* is falsy."""
-    if not session_key:
-        return True
-    if session_key in _CATALOG_INJECTED_SESSIONS:
-        return False
-    _CATALOG_INJECTED_SESSIONS.add(session_key)
-    return True
-
-
 # Contract §20 (Rules): cooldown + sequence state must OUTLIVE one run_turn()
 # call. A GUI session sends many turns; a rule with cooldown_turns=8 that
 # re-fired on every message would re-bill its pack and re-draw a transcript
@@ -1752,8 +1763,7 @@ def _maybe_inject_trigger_advisory(
 class _AssistantDeltaCoalescer:
     """Coalesce streamed provider fragments without changing their arrival order.
 
-    Mirrored by ``core/agent/run.cpp::DeltaCoalescer``.  Keep cross-channel
-    ordering and flush rules identical in both lanes.
+    Keep cross-channel ordering and flush rules identical across lanes.
 
     The provider can alternate ``thinking`` and ``text``.  A per-channel tail
     must therefore be flushed before accepting the other channel; otherwise an
@@ -2065,12 +2075,13 @@ def _run_turn_impl(
     *phase* applies HARD phase_caps (WI-4) when set.
     *task_class* feeds WI-8 reference-build novelty (when injected upstream).
 
-    *history* is the prior conversation transcript (GUI session), oldest first,
+    *history* is the prior conversation transcript, oldest first,
     as ``{"role": "user"|"assistant", "text": str}`` entries. Validated and
-    capped defensively here (<=12 entries, <=8000 chars total, dropped from the
-    FRONT, each entry clipped to 1500 chars with a trailing " …"), then seeded
-    as normal role messages BEFORE the current *request*. Absent/invalid ==
-    exactly today's behaviour. *request* is never merged into history — the
+    capped defensively here (see ``_sanitize_history``: entries clipped to 1500
+    chars with a trailing " …", at most 12 entries / 8000 chars, oldest dropped
+    in aligned chunks so the window prefix stays stable between turns), then
+    seeded as normal role messages BEFORE the current *request*. Absent/invalid
+    == exactly today's behaviour. *request* is never merged into history — the
     work-intent classifier reads only *request*.
 
     *attachments* carries the structured attachment list the GUI composer sends
@@ -2198,6 +2209,12 @@ def _run_turn_impl(
 
     restricted_tools = allowed_tools is not None
     allow = set(allowed_tools or [])
+    # What the SYSTEM PROMPT lists as allowed (only when no schema text is
+    # given): the caller's own allowlist, captured before the per-turn mode
+    # narrowing below. Mode is enforced at dispatch and told to the model at the
+    # tail of the user message; it must not rewrite the system prompt.
+    _prompt_allowed = sorted(allow)
+    _mode_notice = ""
     # Copilot mode → tools: intersect caller allowlist with mode policy.
     # Precedence: explicit arg → options key if present → mission_dispatch → default.
     try:
@@ -2229,6 +2246,16 @@ def _run_turn_impl(
             _plan_only = True
         if _mode == "plan" and _plan_only is None:
             _plan_only = True
+        if _mode == "plan" or _plan_only:
+            _mode_notice = (
+                "[turn mode: plan] Show a plan first. Tools that change "
+                "documents or files are refused this turn."
+            )
+        elif _mode == "ask":
+            _mode_notice = (
+                "[turn mode: ask] Answer and measure only. Tools that change "
+                "documents or files are refused this turn."
+            )
         # Plan keeps the planning MODEL (role_for_copilot_mode) but MUST NOT be
         # narrowed by a role tool-card — plan = agent-broad minus commit mutators.
         # Pass None so apply_mode_tools returns the broad PLAN_TOOLS denylist form.
@@ -2289,11 +2316,6 @@ def _run_turn_impl(
     except Exception:  # noqa: BLE001 — guard capability floor is best-effort
         pass
     actor = actor or name
-    # mega-25: once-per-session key for the static catalog gate below (role
-    # catalog is main-turn-only; skills catalog applies to every call). Fresh
-    # per DAG-node/subagent context (subagent_id), else per mission (run_id).
-    _catalog_session_key = subagent_id or run_id
-    _first_catalog_turn = _catalog_due(_catalog_session_key)
     # WI-8: inject reference builds into the user request for A/B specify.
     _req = request
     # Wave 4: surface GUI context_refs before scaffolds so both the model and
@@ -2359,8 +2381,8 @@ def _run_turn_impl(
     # the GUI context meter reports and the bytes this turn actually sends
     # cannot drift apart. (They used to: prompt_preview mirrored this sequence
     # by hand and injected a SAMPLE ledger/stage no real turn ever sends, so
-    # every number it reported was wrong.) Only project-memory recall depends
-    # on the request, so it is built here and spliced at its named slot.
+    # every number it reported was wrong.) Everything in the system prompt is
+    # request-independent; request-dependent context goes to the user tail.
     import os as _os  # noqa: PLC0415
 
     from services.agent.request_context import root_value
@@ -2380,6 +2402,8 @@ def _run_turn_impl(
             _pc_root = None
 
     # Project-scoped SQLite memory (token-budgeted recall). Auto-created under .plm/.
+    # Keyed on the request, so it goes to the tail of the user message (see
+    # `_tail_blocks` below), never into the system prompt.
     _mem_blk = ""
     try:
         from services.agent.config import (  # noqa: PLC0415
@@ -2431,9 +2455,8 @@ def _run_turn_impl(
     except Exception:  # noqa: BLE001 — memory never breaks a turn
         pass
 
-    # The skills block is NOT taken from the shared segment list: its catalog is
-    # interleaved with request-dependent skill ACTIVATION further down, and its
-    # gate differs (catalog-due only, not `not subagent_id`).
+    # The skills catalog is NOT taken from the shared segment list: it is
+    # appended below only when the role prompt does not already carry it.
     try:
         from services.agent import prompt_cache as _pcache  # noqa: PLC0415
 
@@ -2443,23 +2466,21 @@ def _run_turn_impl(
             project_root=_pc_root,
             role_system=(system_prompt or ""),
             tools_text=tools_text or "",
-            allowed=sorted(allow),
-            include_catalog=bool(not subagent_id and _first_catalog_turn),
+            allowed=_prompt_allowed,
+            include_catalog=not subagent_id,
             include_skills=False,
         )
-        system = _pcache.render_segments(_segs, memory_block=_mem_blk)
+        system = _pcache.render_segments(_segs)
     except Exception:  # noqa: BLE001 — never lose a turn to prompt assembly
         system = (system_prompt or "") + "\n\n" + _SYSTEM_BASE
-        if _mem_blk:
-            system = system.rstrip() + "\n\n" + _mem_blk
         if tools_text:
             system += "\n\n" + tools_text
-        elif allow:
-            system += "\nAllowed tools: " + ", ".join(sorted(allow))
+        elif _prompt_allowed:
+            system += "\nAllowed tools: " + ", ".join(_prompt_allowed)
 
-    # Conversation history (GUI session transcript): sanitize + cap, then seed
-    # BEFORE the current user request. Validated here too — worker_rpc applies
-    # the same contract, but run_turn is a public entry other callers reach.
+    # Conversation history (prior session transcript): sanitize + cap, then seed
+    # BEFORE the current user request. Validated here because run_turn is a
+    # public entry other callers reach.
     _hist_msgs: list[dict] = [
         {"role": role, "content": _parts(text)}
         for role, text in _sanitize_history(history)
@@ -2467,10 +2488,19 @@ def _run_turn_impl(
 
     _att_img = _attachment_image_parts(attachments)
 
-    messages: list[dict] = [
-        *_hist_msgs,
-        {"role": "user", "content": [*_parts(_req), *_att_img]},
-    ]
+    # Request-dependent context for THIS turn only (project-memory recall, skill
+    # bodies activated by the request). It rides at the TAIL of the current user
+    # message, after the user's own words: the system prompt and every earlier
+    # message stay byte-identical from turn to turn, so a prefix-caching local
+    # server keeps its KV cache.
+    _tail_blocks: list[str] = []
+    if _mode_notice:
+        _tail_blocks.append(_mode_notice)
+    if isinstance(options, dict) and isinstance(options.get("turn_notice"), str):
+        if options["turn_notice"].strip():
+            _tail_blocks.append(options["turn_notice"].strip())
+    if _mem_blk:
+        _tail_blocks.append(_mem_blk)
 
     # Skills catalog + activation (contracts/skills.md). Best-effort.
     try:
@@ -2481,20 +2511,16 @@ def _run_turn_impl(
         if _hits and _clean.strip():
             # Keep context_refs visible after slash-command stripping.
             _req = apply_context_refs(_clean, context_refs)
-            messages = [
-                *_hist_msgs,
-                {"role": "user", "content": [*_parts(_req), *_att_img]},
-            ]
-        _sk_parts: list[str] = []
-        if _first_catalog_turn:
-            _cat = _skills.catalog_block()
-            # A role prompt composed by `mission_dispatch.linear_role_prompt`
-            # already carries the catalog; appending a second copy would spend
-            # the budget twice.
-            if _cat and _cat not in system:
-                _sk_parts.append(_cat)
+        # The catalog is static, so it belongs in the system prompt on EVERY
+        # turn — sending it only on a session's first turn made turn 2's system
+        # prompt differ from turn 1's. A role prompt composed by
+        # `mission_dispatch.linear_role_prompt` already carries it; appending a
+        # second copy would spend the budget twice.
+        _cat = _skills.catalog_block()
+        if _cat and _cat not in system:
+            system = system.rstrip() + "\n\n" + _cat
         if request or _phase:
-            _sk_parts.extend(
+            _tail_blocks.extend(
                 _skills.activate_for_prompt(
                     request or "",
                     session_id=_sid,
@@ -2502,11 +2528,14 @@ def _run_turn_impl(
                     role=name,
                 )
             )
-        _sk = "\n\n".join(_sk_parts)
-        if _sk:
-            system = system.rstrip() + "\n\n" + _sk
     except Exception:  # noqa: BLE001
         pass
+
+    _user_text = "\n\n".join([_req, *_tail_blocks]) if _tail_blocks else _req
+    messages: list[dict] = [
+        *_hist_msgs,
+        {"role": "user", "content": [*_parts(_user_text), *_att_img]},
+    ]
 
     calls: list[dict] = []
     tool_calls_made = 0
@@ -2753,8 +2782,10 @@ def _run_turn_impl(
 
         Shared by the explicit ``enable_tools`` call and by auto-enable-on-reach
         below, so both widen the allow-set, mirror the live registry policy and
-        re-render the §9.1 tools block identically — the model must see real
-        schemas for anything it can now call, however the pack got enabled.
+        hand the model the schemas of the newly enabled tools identically — the
+        model must see real schemas for anything it can now call, however the
+        pack got enabled. They are APPENDED as a message; the system prompt is
+        never rewritten mid-turn (prefix-cache stability).
 
         TRANSACTIONAL: schemas are rendered and the registry policy applied
         against a CANDIDATE set, and the turn's own ``allow`` is only widened
@@ -2764,7 +2795,6 @@ def _run_turn_impl(
         schema at all. Returns ``None`` when activation failed — distinct from
         ``[]``, which means "succeeded, nothing new was added".
         """
-        nonlocal system, tools_text
         from services.agent.copilot_mode_tools import (  # noqa: PLC0415
             apply_meta_tool_floor,
         )
@@ -2778,14 +2808,15 @@ def _run_turn_impl(
         if floored is not None:
             candidate = set(floored)
         newly = sorted(candidate - allow)
-        # 1. Render the schemas the model would get. A pack the model cannot see
-        #    the schema for is worse than one it cannot call.
+        # 1. Render the schemas the model would get — for the NEWLY enabled
+        #    tools only, so the already-rendered system-prompt block is never
+        #    recomputed. A pack the model cannot see the schema for is worse
+        #    than one it cannot call.
         new_text = None
         try:
             from services.agent.tool_schemas import render_tools_block  # noqa: PLC0415
 
-            # The tier MUST ride along. This re-render replaces the whole tools
-            # block mid-turn, and omitting `tier` silently falls back to
+            # The tier MUST ride along: omitting `tier` silently falls back to
             # DEFAULT_TOOLS_BUDGET_TOKENS (2500, the local-24k floor) instead of
             # the caller's tier budget (frontier = 10000). Measured on
             # add_features: 12792 chars delivered at tier=frontier vs 335
@@ -2794,9 +2825,10 @@ def _run_turn_impl(
             # landed on exactly the turn where the model first needs the schema,
             # and it is the documented cause of the add_features failure cluster
             # (62 of 86 tool failures across 59 live user runs, 2026-08-04).
-            new_text, _meta = render_tools_block(
-                sorted(candidate), resolver=resolver_for(mission_dispatch), tier=tier
-            )
+            if newly:
+                new_text, _meta = render_tools_block(
+                    newly, resolver=resolver_for(mission_dispatch), tier=tier
+                )
         except Exception as exc:  # noqa: BLE001
             _log_mod.exception("enable_tools schema render failed for %s", cats)
             _log(
@@ -2814,12 +2846,7 @@ def _run_turn_impl(
         try:
             from services.mcp import tool_registry as _tr  # noqa: PLC0415
 
-            cur = _tr._current_allow()
-            if cur is not None:
-                _tr.set_policy(
-                    allow=sorted(set(cur) | candidate),
-                    deny_risk=_tr._current_deny_risk(),
-                )
+            _tr.extend_allow(candidate)
         except Exception as exc:  # noqa: BLE001
             _log_mod.exception("enable_tools registry policy failed for %s", cats)
             _log(
@@ -2836,17 +2863,18 @@ def _run_turn_impl(
         #    `allow` a local of this closure (UnboundLocalError on the read above).
         allow.update(candidate)
         if new_text:
-            if tools_text and tools_text in system:
-                system = system.replace(tools_text, new_text, 1)
-            elif "\nAllowed tools: " in system and not tools_text:
-                import re as _re  # noqa: PLC0415
-
-                system = _re.sub(
-                    r"\nAllowed tools: [^\n]*", "\n\n" + new_text, system, count=1
-                )
-            else:
-                system = system.rstrip() + "\n\n" + new_text
-            tools_text = new_text
+            # APPEND, never edit: the system prompt and every earlier message are
+            # a provider prefix cache entry, so the new schemas ride as one more
+            # message after the current tail and all earlier bytes stay put.
+            messages.append(
+                {
+                    "role": "user",
+                    "content": _parts(
+                        "[tools enabled] These tools are now callable; their "
+                        "schemas:\n" + new_text
+                    ),
+                }
+            )
         return newly
 
     _subagent_base_completion_cap = completion_cap
@@ -3251,20 +3279,15 @@ def _run_turn_impl(
                 exc,
                 traceback.format_exc(),
             )
-            # mega-16: spending-limit / tier-denied → mark provider unavailable so
-            # subsequent auto_pick falls through (no xai retry loop).
+            # mega-16: spending-limit / tier-denied → provider_unavailable stop,
+            # surfaced in the ledger (no xai retry loop).
             if stop == "provider_unavailable":
                 try:
-                    from services.agent.role_models import (  # noqa: PLC0415
-                        mark_provider_unavailable,
-                    )
-
                     pname = (
                         getattr(provider, "name", None)
                         or getattr(provider, "provider", None)
-                        or "xai-sub"
+                        or "unknown"
                     )
-                    mark_provider_unavailable(str(pname), reason=str(exc)[:300])
                     _log(
                         ledger,
                         actor,
@@ -3984,7 +4007,7 @@ def _run_turn_impl(
                 )
 
                 if tool == "list_tool_categories":
-                    meta_result = _tool_category_catalog_result()
+                    meta_result = _tool_category_catalog_result(**args) if isinstance(args, dict) else {"ok": False, "error": "Expected an object"}
                 elif not isinstance(args, dict):
                     meta_result = {
                         "ok": False,
@@ -4172,8 +4195,8 @@ def _run_turn_impl(
                         "role": "user",
                         "content": _parts(
                             f"[auto-enabled] {tool!r} needed the {_auto_pack!r} pack, so it "
-                            f"was enabled for you and the call was run — its schema is now "
-                            f"in your tools list. Enable packs up front next time."
+                            f"was enabled for you and the call was run — its schema is in the "
+                            f"[tools enabled] message above. Enable packs up front next time."
                         ),
                     }
                 )
@@ -4701,7 +4724,8 @@ def _run_turn_impl(
             from services.agent import skills as _skills_run  # noqa: PLC0415
 
             for _sk_body in _skills_run.activate_for_prompt(
-                "", session_id=_sid, tools_about_to_run=[tool], role=actor
+                "", session_id=_sid, tools_about_to_run=[tool], role=actor,
+                tool_ops=_skills_run.tool_call_ops(tool, args),
             ):
                 messages.append({"role": "user", "content": _parts(_sk_body)})
         except Exception:  # noqa: BLE001 — skill nudge never breaks the turn
@@ -6960,7 +6984,7 @@ def _reconcile_kwargs(
             unmapped.append(name)
             continue
         at = spec["ann"].get(target, "")
-        kwargs[target] = _bind_value(target, at, value)
+        kwargs[target] = _bind_value(target, at, value, tool=tool, supplied=name)
         used.add(target)
         notes.append(f"interpreted {name!r} as {target!r}")
     if unmapped:
@@ -7176,8 +7200,8 @@ def _is_internal_dispatch_fault(exc: BaseException) -> bool:
     """True when *exc* is a HARNESS/TOOL-BODY bug, not a legitimate tool
     rejection (ValueError/RuntimeError with a teaching message) and not an
     argument-binding TypeError from ``fn(**kwargs)`` with the wrong keywords
-    (that path is already taught well by ``_reconcile_kwargs`` / the
-    cleaned-kwargs retry in ``_resolve_tool_dispatch``).
+    (that path is already taught well by ``_reconcile_kwargs`` in
+    ``_dispatch_tool``).
 
     AttributeError/KeyError/IndexError/UnboundLocalError never legitimately
     come from a tool's own rejection path (those use ValueError/RuntimeError
@@ -7334,8 +7358,8 @@ def _dispatch_tool(
 
     Uses the reviewer_exec resolver (which extends battery._get_fn to the intake /
     verify modules), so ANY §16-ish tool resolves through ONE process-wide registry.
-    Applies agent.tool_options (param_defaults, max_calls_per_turn, timeout_s) and
-    appends tool_hints on failure. An unresolvable tool or an unknown argument
+    Applies agent.tool_options (param_defaults, max_calls_per_turn, timeout_s). An
+    unresolvable tool or an unknown argument
     name returns a TEACHING error payload (ok:false + the closest real names /
     the real parameter set) instead of a bare KeyError/TypeError; a genuine
     tool-side failure still raises, and the caller feeds it back to the model
@@ -7587,29 +7611,13 @@ def _dispatch_tool(
                     _charge_call(did_work=False)
                     raise
                 recovery.pending[recovery_key] = future
-    try:
-        result = (
-            recovery.wait(
-                recovery_key, future, tool=tool, timeout_s=timeout_f,
-                cancel=_cancel, started_new=not reused,
-            )
-            if future is not None else _execute()
+    result = (
+        recovery.wait(
+            recovery_key, future, tool=tool, timeout_s=timeout_f,
+            cancel=_cancel, started_new=not reused,
         )
-    except Exception as exc:  # noqa: BLE001
-        if reused:
-            # Recovery must preserve the original exception instance, including
-            # structured engine code/detail and its traceback.
-            raise
-        hint = None
-        try:
-            from services.agent.tool_hints import hint_for  # noqa: PLC0415
-
-            hint = hint_for(tool)
-        except Exception:  # noqa: BLE001
-            hint = None
-        if hint:
-            raise type(exc)(f"{exc} Hint: {hint}") from exc
-        raise
+        if future is not None else _execute()
+    )
     return result
 
 
@@ -7617,14 +7625,26 @@ def _dispatch_tool(
 # small helpers
 # ---------------------------------------------------------------------------
 
-# Conversation-history contract (options.history / run_turn history=): the GUI
-# session transcript travels as {"role": "user"|"assistant", "text": str}
-# entries, oldest first. These caps are applied at every Python layer that
-# accepts history (worker_rpc._agent_admin_turn AND agent_turn.run_turn) so a
-# direct caller cannot blow the context budget either.
+# Conversation-history contract (run_turn history=): the prior session
+# transcript travels as {"role": "user"|"assistant", "text": str} entries,
+# oldest first. The caps are applied here so a caller cannot blow the context
+# budget.
+#
+# PREFIX STABILITY. A local server (llama.cpp style) reuses its KV cache only
+# for an IDENTICAL prefix, and this lane re-sends the transcript every turn. So
+# the window must not slide by one entry per turn:
+#   * each entry is clipped to a fixed function of its own text, never of its
+#     neighbours, so an entry renders the same bytes on every turn;
+#   * while the whole transcript fits the caps it is sent entire — turn N+1
+#     only appends to turn N's history;
+#   * once it does not fit, the oldest entries are dropped in aligned chunks
+#     of ``_HISTORY_DROP_CHUNK`` (the window start is always a multiple of the
+#     chunk), so the kept prefix changes once every chunk of new entries, not
+#     every turn.
 _HISTORY_MAX_ENTRIES = 12
 _HISTORY_MAX_CHARS = 8000
 _HISTORY_CLIP_CHARS = 1500
+_HISTORY_DROP_CHUNK = 6
 
 
 def _sanitize_history(history: Any) -> list[tuple[str, str]]:
@@ -7632,7 +7652,8 @@ def _sanitize_history(history: Any) -> list[tuple[str, str]]:
 
     Drops anything that is not a dict with role in {user, assistant} and a
     non-empty string text; clips long entries; enforces the entry/char caps by
-    dropping from the FRONT (recent turns matter most). Never raises.
+    dropping from the FRONT (recent turns matter most) in aligned chunks — see
+    the prefix-stability note above. Never raises.
     """
     if not isinstance(history, list):
         return []
@@ -7646,20 +7667,30 @@ def _sanitize_history(history: Any) -> list[tuple[str, str]]:
             continue
         if not isinstance(text, str) or not text.strip():
             continue
-        cand.append((role, text.strip()))
-    cand = cand[-_HISTORY_MAX_ENTRIES:]
+        text = text.strip()
+        if len(text) > _HISTORY_CLIP_CHARS:
+            text = text[:_HISTORY_CLIP_CHARS].rstrip() + " …"
+        cand.append((role, text))
+    total = sum(len(text) for _, text in cand)
+    start = 0
+    while start < len(cand) and (
+        len(cand) - start > _HISTORY_MAX_ENTRIES or total > _HISTORY_MAX_CHARS
+    ):
+        stop = min(start + _HISTORY_DROP_CHUNK, len(cand))
+        total -= sum(len(text) for _, text in cand[start:stop])
+        start = stop
+    if start < len(cand):
+        return cand[start:]
+    # No aligned window fits (the newest chunk alone is over the char cap):
+    # keep the newest entries that fit, which busts the prefix but never
+    # sends an oversized window.
     kept: list[tuple[str, str]] = []
     total = 0
     for role, text in reversed(cand):
-        clip = (
-            text[:_HISTORY_CLIP_CHARS].rstrip() + " …"
-            if len(text) > _HISTORY_CLIP_CHARS
-            else text
-        )
-        if total + len(clip) > _HISTORY_MAX_CHARS:
-            continue  # older entries only — recent turns kept, front dropped
-        total += len(clip)
-        kept.append((role, clip))
+        if len(kept) >= _HISTORY_MAX_ENTRIES or total + len(text) > _HISTORY_MAX_CHARS:
+            break
+        total += len(text)
+        kept.append((role, text))
     kept.reverse()
     return kept
 
@@ -7996,7 +8027,7 @@ def _maybe_inject_op_vocab_cheatsheet(
     except Exception:  # noqa: BLE001
         snippet = (
             "[op vocabulary] Use op=add_feature with feature.type in "
-            "{box,cylinder,sketch,extrude,…}. Call cad_guide()."
+            "{box,cylinder,sketch,extrude,…}. Call cad_guide('add_features')."
         )
     unknown = None
     try:
@@ -8010,7 +8041,7 @@ def _maybe_inject_op_vocab_cheatsheet(
         " Do NOT invent op names. Feature types (box/cylinder/sketch/extrude) "
         "are NOT ops — wrap them: "
         '{"op":"add_feature","feature":{"type":"<type>",…}}. '
-        "No silent aliasing; re-emit the correct op. See cad_guide()."
+        "No silent aliasing; re-emit the correct op. See cad_guide('add_features')."
     )
     return head + "\n" + snippet
 
@@ -8399,6 +8430,8 @@ def _ecad_place_is_passive(call: dict) -> bool:
             "device:l",
             "device:v",
             "device:i",
+            "simulation_spice:v",
+            "simulation_spice:i",
             'libid":"r"',
             'libid":"c"',
             "device:r_",
@@ -8875,8 +8908,7 @@ def _ecad_unbonded_power_pins(
                 return True
         return False
 
-    # mega-22: Device:V / Device:I pins are SPICE sources, not power_in ports
-    # that need add_power rebond (mega-20 residual would thrash on V1 +/-).
+    # SPICE source pins are not power ports that need add_power rebond.
     source_refs: set[str] = set()
     for c in calls or []:
         if not (c.get("ok") and c.get("tool") == "ecad_place_symbol"):
@@ -8890,6 +8922,8 @@ def _ecad_unbonded_power_pins(
         if (
             "device:v" in lib
             or "device:i" in lib
+            or "simulation_spice:v" in lib
+            or "simulation_spice:i" in lib
             or lib.endswith(":v")
             or lib.endswith(":i")
             or "vsource" in lib
@@ -8984,8 +9018,7 @@ def _ecad_has_sim_source(calls: list) -> bool:
                 "vsource",
                 "isource",
                 "simulation_spice:v",
-                "v_source",
-                "i_source",
+                "simulation_spice:i",
             )
         ):
             return True
@@ -9232,7 +9265,7 @@ def _ecad_sim_topology(result: Any = None, calls: list | None = None) -> dict:
         ):
             has_load = True
 
-    # 2) Fall back to call history: Device:V + Device:R wired onto rail.
+    # 2) Fall back to call history: a voltage source + Device:R on the rail.
     if calls and (not has_source or not has_load):
         if _ecad_has_sim_source(calls):
             # Source present in schematic; check rail attachment via wires/pins.
@@ -9262,7 +9295,7 @@ def _ecad_sim_topology(result: Any = None, calls: list | None = None) -> dict:
 
 
 def _ecad_source_on_rail(calls: list, rail: str) -> bool:
-    """True when a V-source pin or wire lands on *rail*."""
+    """True when the positive voltage-source pin or wire lands on *rail*."""
     rail_u = (rail or "").upper()
     for c in calls or []:
         if not c.get("ok"):
@@ -9276,7 +9309,6 @@ def _ecad_source_on_rail(calls: list, rail: str) -> bool:
             is_v = (
                 "device:v" in lib
                 or "simulation_spice:v" in lib
-                or "v_source" in lib
                 or lib.endswith(":v")
                 or ref.upper().startswith("V")
             )
@@ -9285,19 +9317,29 @@ def _ecad_source_on_rail(calls: list, rail: str) -> bool:
             for p in res.get("pins") or []:
                 if not isinstance(p, dict):
                     continue
-                net = p.get("net")
-                if isinstance(net, str) and net.upper() == rail_u:
-                    return True
-            if isinstance(res.get("net"), str) and res["net"].upper() == rail_u:
+                if str(p.get("number") or p.get("pin") or "") == "1":
+                    net = p.get("net")
+                    if isinstance(net, str) and net.upper() == rail_u:
+                        return True
+            if (
+                not res.get("pins")
+                and isinstance(res.get("net"), str)
+                and res["net"].upper() == rail_u
+            ):
                 return True
         if tool == "ecad_wire":
             net = res.get("net")
             fr = str(args.get("from_ref") or "").upper()
             tr = str(args.get("to_ref") or "").upper()
+            fp = str(args.get("from_pin") or "")
+            tp = str(args.get("to_pin") or "")
             if (
                 isinstance(net, str)
                 and net.upper() == rail_u
-                and (fr.startswith("V") or tr.startswith("V"))
+                and (
+                    (fr.startswith("V") and fp == "1")
+                    or (tr.startswith("V") and tp == "1")
+                )
             ):
                 return True
         if tool == "ecad_add_power":
@@ -9383,7 +9425,6 @@ def _ecad_find_ref(calls: list, prefix: str) -> str | None:
         if pref == "V" and (
             "device:v" in lib
             or lib.endswith(":v")
-            or "v_source" in lib
             or "simulation_spice:v" in lib
         ):
             found = ref
@@ -9411,8 +9452,6 @@ def _ecad_passive_pin(calls: list, ref: str, prefer: str = "1") -> str:
                     nums.append(n)
         if prefer in nums:
             return prefer
-        if "+" in nums:
-            return "+"
         if nums:
             return nums[0]
     return prefer if prefer else "1"
@@ -9508,7 +9547,7 @@ def _ecad_ensure_driven_rail(
         and not (topo.get("has_source") and topo.get("has_load"))
     )
 
-    # --- place Device:V if missing ---
+    # --- place a DC voltage source if missing ---
     if (
         (not skip_place)
         and (not _ecad_has_sim_source(calls) or not topo.get("has_source"))
@@ -9520,7 +9559,7 @@ def _ecad_ensure_driven_rail(
             # mega-26 A26: schematic path uses _parse_value on the whole value
             # string — "DC 3.3" raises and stamps V with value=None → OP 0.0 V.
             # Bare "3.3" parses to 3.3 and drives the measured rail in-band.
-            "libid": "Simulation_SPICE:V_source",
+            "libid": "Simulation_SPICE:VDC",
             "value": "3.3",
             "ref": "V1",
             "x": 40.0,
@@ -9537,7 +9576,7 @@ def _ecad_ensure_driven_rail(
             ledger=ledger,
             actor=actor,
             messages=messages,
-            reason=f"{reason}:inject_v_source",
+            reason=f"{reason}:inject_dc_source",
             tool_calls_made=tool_calls_made,
             budget=budget,
         )
@@ -9634,7 +9673,7 @@ def _ecad_ensure_driven_rail(
     vref = _ecad_find_ref(calls, "V")
     rref = _ecad_find_ref(calls, "R")
     if vref and not _ecad_source_on_rail(calls, rail):
-        v_plus = _ecad_passive_pin(calls, vref, prefer="+")
+        v_plus = "1"  # KiCad SPICE source Sim.Pins: 1=+ 2=-
         if anchor:
             _wire(vref, v_plus, anchor[0], anchor[1], "wire_v_to_rail")
         elif rref:
@@ -9646,7 +9685,7 @@ def _ecad_ensure_driven_rail(
         r_pin = _ecad_passive_pin(calls, rref, prefer="1")
         # Prefer wiring load onto the now-driven rail via V+ or anchor.
         if vref and _ecad_source_on_rail(calls, rail):
-            v_plus = _ecad_passive_pin(calls, vref, prefer="+")
+            v_plus = "1"
             _wire(rref, r_pin, vref, v_plus, "wire_load_to_v")
         elif anchor:
             _wire(rref, r_pin, anchor[0], anchor[1], "wire_load_to_rail")
@@ -9680,11 +9719,7 @@ def _ecad_ensure_driven_rail(
         steps += 1
         gnd_anchor = _ecad_rail_member_endpoint(calls, "GND")
     if vref:
-        # Prefer library pin names for Simulation_SPICE:V_source (+/-).
-        v_minus = _ecad_passive_pin(calls, vref, prefer="-")
-        if v_minus not in ("-", "2", "−"):
-            # Place result may only expose numbered pins; treat second pin as minus.
-            v_minus = "-"
+        v_minus = "2"
         if gnd_anchor:
             _wire(
                 vref,
@@ -9763,7 +9798,7 @@ def _ecad_ensure_driven_rail(
             if any(
                 tag in fr
                 for tag in (
-                    "inject_v_source",
+                    "inject_dc_source",
                     "inject_load_r",
                     "wire_v_to_rail",
                     "wire_load_to_v",
@@ -10032,7 +10067,7 @@ def _ecad_forced_tool_args(need: str, calls: list) -> dict:
     + AC5 empty netlist residuals). Orphan power at (0,0) does not drive pins.
     mega-19 A: wire pairs prefer power_in → rail refs returned by add_power.
     mega-19 B: board-scoped tools carry board doc_id from board_from_schematic.
-    mega-19 C: pre-simulate place Device:V when no source present.
+    mega-19 C: pre-simulate place a DC voltage source when none is present.
     """
     pins = _ecad_place_pin_records(calls)
     refs = _ecad_last_place_refs(calls)
@@ -10047,7 +10082,7 @@ def _ecad_forced_tool_args(need: str, calls: list) -> dict:
             sch = _ecad_sch_doc_id(calls)
             args = {
                 # mega-26 A26: bare "3.3" (not "DC 3.3") — see ensure_driven_rail.
-                "libid": "Simulation_SPICE:V_source",
+                "libid": "Simulation_SPICE:VDC",
                 "value": "3.3",
                 "ref": "V1",
                 "x": 40.0,
@@ -11094,31 +11129,6 @@ def _ecad_force_chain_cascade(
     return calls, tool_calls_made
 
 
-# ---------------------------------------------------------------------------
-# mega-21 M21 — mechanical deliver gate (refuse zero-mech deliver_partial)
-# ---------------------------------------------------------------------------
-
-_MECH_FORCE_ONCE: dict[str, bool] = {}
-_MECH_PRODUCT_TOOLS = frozenset({"new_part", "add_features"})
-
-# Airframe dims from mission brief + feature_modeler role card (mega-21 M21).
-# body tube OD≈60 wall≥1.5 length class 500; payload bay ≥56×86×20.
-_AIRFRAME_DEFAULT_SPEC: dict[str, float] = {
-    "body_od_mm": 60.0,
-    "body_len_mm": 500.0,
-    "wall_mm": 2.0,
-    "bay_l_mm": 90.0,
-    "bay_w_mm": 60.0,
-    "bay_h_mm": 25.0,
-    "fin_span_mm": 80.0,
-    "fin_root_mm": 60.0,
-    "fin_thick_mm": 3.0,
-    "wing_span_mm": 200.0,
-    "wing_chord_mm": 80.0,
-    "wing_thick_mm": 4.0,
-}
-
-
 def _ledger_tool_calls(ledger) -> list[dict]:
     """Harvest tool_call records from a ledger (or already-list of calls)."""
     if ledger is None:
@@ -11142,7 +11152,7 @@ def _ledger_tool_calls(ledger) -> list[dict]:
         event = pl.get("event")
         if event and event not in ("tool_call", None):
             # Keep forced inject markers for diagnostics but not as product.
-            if event in ("mech_chain_force_inject", "ecad_chain_force_inject"):
+            if event == "ecad_chain_force_inject":
                 continue
             if tool is None:
                 continue
@@ -11158,797 +11168,6 @@ def _ledger_tool_calls(ledger) -> list[dict]:
             "forced": bool(pl.get("forced")),
         }
         out.append(rec)
-    return out
-
-
-def _mech_has_part_artifact(calls_or_ledger) -> bool:
-    """True when successful new_part + add_features produced a body (mega-21 M21).
-
-    Matches the ECAD chain floor: bootstrap openers alone are not product.
-    """
-    calls = _ledger_tool_calls(calls_or_ledger)
-    has_new = any(c.get("ok") and c.get("tool") == "new_part" for c in calls)
-    has_add = False
-    for c in calls:
-        if not (c.get("ok") and c.get("tool") == "add_features"):
-            continue
-        # Prefer results that look like geometry landed; bare ok also counts
-        # when the tool succeeded (engine may omit volume on truncated logs).
-        res = c.get("result")
-        if isinstance(res, str):
-            try:
-                res = json.loads(res)
-            except Exception:  # noqa: BLE001
-                res = {"text": res}
-        if isinstance(res, dict):
-            if res.get("ok") is False:
-                continue
-        has_add = True
-        break
-    return bool(has_new and has_add)
-
-
-def _airframe_spec_from_manifest(manifest: dict | None) -> dict[str, float]:
-    """Merge mission/manifest airframe dims onto role-card defaults."""
-    spec = dict(_AIRFRAME_DEFAULT_SPEC)
-    if not isinstance(manifest, dict):
-        return spec
-    bags: list[Any] = [
-        manifest,
-        manifest.get("request_verbatim"),
-        manifest.get("brief"),
-        manifest.get("dimensions"),
-    ]
-    for d in manifest.get("deliverables") or []:
-        if isinstance(d, dict):
-            bags.append(d.get("description"))
-            bags.append(d.get("name"))
-            bags.append(d)
-    blob = " ".join(str(b) for b in bags if b)
-    # Optional numeric overrides from free text (OD 60, length 500, bay 56x86x20).
-    m = re.search(r"OD\s*[≈~]?\s*(\d+(?:\.\d+)?)\s*mm", blob, re.I)
-    if m:
-        spec["body_od_mm"] = float(m.group(1))
-    m = re.search(
-        r"(?:length|len)\s*[≥>=~≈]?\s*(\d+(?:\.\d+)?)\s*mm",
-        blob,
-        re.I,
-    )
-    if m:
-        spec["body_len_mm"] = max(spec["body_len_mm"], float(m.group(1)))
-    m = re.search(
-        r"(?:payload\s*bay|bay)[^\d]{0,40}"
-        r"(\d+(?:\.\d+)?)\s*[×x]\s*(\d+(?:\.\d+)?)\s*[×x]\s*(\d+(?:\.\d+)?)",
-        blob,
-        re.I,
-    )
-    if m:
-        dims = sorted(
-            (float(m.group(1)), float(m.group(2)), float(m.group(3))),
-            reverse=True,
-        )
-        spec["bay_l_mm"] = max(spec["bay_l_mm"], dims[0])
-        spec["bay_w_mm"] = max(spec["bay_w_mm"], dims[1])
-        spec["bay_h_mm"] = max(spec["bay_h_mm"], dims[2])
-    return spec
-
-
-def _airframe_build_ops(spec: dict[str, float] | None = None) -> list[dict]:
-    """Concrete add_features ops for the rocket-plane airframe (role-card dims).
-
-    mega-22 rebind: place bay/wing/fins ON the body surface (not origin-centered
-    boxes buried inside the tube). Batch-reject residual was f5/f6 fins with
-    "box boss added no material".
-    """
-    s = dict(_AIRFRAME_DEFAULT_SPEC)
-    if isinstance(spec, dict):
-        s.update({k: float(v) for k, v in spec.items() if v is not None})
-    od = float(s["body_od_mm"])
-    length = float(s["body_len_mm"])
-    wall = float(s["wall_mm"])
-    bay_l = float(s["bay_l_mm"])
-    bay_w = float(s["bay_w_mm"])
-    bay_h = float(s["bay_h_mm"])
-    fin_span = float(s["fin_span_mm"])
-    fin_root = float(s["fin_root_mm"])
-    fin_t = float(s["fin_thick_mm"])
-    wing_span = float(s["wing_span_mm"])
-    wing_chord = float(s["wing_chord_mm"])
-    wing_t = float(s["wing_thick_mm"])
-    r = od / 2.0
-
-    def _dim(v: float) -> dict:
-        return {"value": float(v), "expr": None}
-
-    ops: list[dict] = [
-        {
-            "op": "add_feature",
-            "feature": {
-                "type": "cylinder",
-                "name": "body_tube",
-                "params": {
-                    "radius": _dim(r),
-                    "height": _dim(length),
-                    "centered": False,
-                },
-            },
-        },
-        {
-            "op": "add_feature",
-            "feature": {
-                "type": "box",
-                "name": "payload_bay",
-                "params": {
-                    "length": _dim(bay_l),
-                    "width": _dim(bay_w),
-                    "height": _dim(bay_h),
-                    "centered": False,
-                    # Sit on the top planar end of the body tube.
-                    "at": {"of": "face", "side": "top"},
-                },
-            },
-        },
-        {
-            "op": "add_feature",
-            "feature": {
-                "type": "box",
-                "name": "wing",
-                "params": {
-                    "length": _dim(wing_chord),
-                    "width": _dim(wing_span),
-                    "height": _dim(wing_t),
-                    "centered": True,
-                    # Mid-body span; width protrudes past the tube OD.
-                    "at": [0.0, 0.0, length * 0.45],
-                },
-            },
-        },
-        {
-            "op": "add_feature",
-            "feature": {
-                "type": "box",
-                "name": "fin_1",
-                "params": {
-                    "length": _dim(fin_root),
-                    "width": _dim(fin_t),
-                    "height": _dim(fin_span),
-                    "centered": False,
-                    "at": [r, 0.0, length * 0.08],
-                },
-            },
-        },
-        {
-            "op": "add_feature",
-            "feature": {
-                "type": "box",
-                "name": "fin_2",
-                "params": {
-                    "length": _dim(fin_root),
-                    "width": _dim(fin_t),
-                    "height": _dim(fin_span),
-                    "centered": False,
-                    "at": [-r - fin_t, 0.0, length * 0.08],
-                },
-            },
-        },
-        {
-            "op": "add_feature",
-            "feature": {
-                "type": "box",
-                "name": "fin_3",
-                "params": {
-                    "length": _dim(fin_root),
-                    "width": _dim(fin_t),
-                    "height": _dim(fin_span),
-                    "centered": False,
-                    "at": [0.0, r, length * 0.08],
-                },
-            },
-        },
-    ]
-    _ = wall
-    return ops
-
-
-def _resolve_tool_dispatch(dispatch: Callable | None = None) -> Callable | None:
-    """Return a (tool, args) -> result dispatcher for forced product chains."""
-    if callable(dispatch):
-        return dispatch
-
-    def _dispatch(tool: str, args: dict) -> Any:
-        try:
-            fn = _bind_tool(tool)
-        except Exception:  # noqa: BLE001
-            fn = None
-        if fn is None:
-            return {"ok": False, "error": f"tool {tool!r} unresolved"}
-        try:
-            import inspect  # noqa: PLC0415
-
-            sig = inspect.signature(fn)
-            accepts = set(sig.parameters)
-            has_var = any(
-                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-            )
-        except Exception:  # noqa: BLE001
-            accepts = set()
-            has_var = True
-        kwargs: dict[str, Any] = {}
-        for k, v in (args or {}).items():
-            if has_var or k in accepts:
-                kwargs[k] = v
-        try:
-            return fn(**kwargs)
-        except TypeError as te:
-            # mega-24: never silently call fn() with zero args — that mangled
-            # required kwargs (fw_sources missing project_id) into opaque
-            # failures and burned BUILD budgets. Retry once after dropping
-            # only keys the signature does not accept; otherwise surface error.
-            # A TypeError raised INSIDE the tool body (traceback depth >= 2)
-            # is an internal harness fault, not an argument-shape problem —
-            # classify it before touching the has_var/cleaned-kwargs retry,
-            # which exists only to teach genuine argument-binding errors.
-            if _is_internal_dispatch_fault(te):
-                return _internal_fault_result(te, tool)
-            if has_var:
-                return {"ok": False, "error": str(te)}
-            cleaned = {k: v for k, v in (args or {}).items() if k in accepts}
-            if cleaned != kwargs:
-                try:
-                    return fn(**cleaned)
-                except TypeError as te2:
-                    if _is_internal_dispatch_fault(te2):
-                        return _internal_fault_result(te2, tool)
-                    return {"ok": False, "error": str(te2)}
-                except Exception as exc:  # noqa: BLE001
-                    if _is_internal_dispatch_fault(exc):
-                        return _internal_fault_result(exc, tool)
-                    return {"ok": False, "error": str(exc)}
-            return {"ok": False, "error": str(te)}
-        except Exception as exc:  # noqa: BLE001
-            if _is_internal_dispatch_fault(exc):
-                return _internal_fault_result(exc, tool)
-            return {"ok": False, "error": str(exc)}
-
-    return _dispatch
-
-
-def _mech_force_build_chain(
-    ledger,
-    *,
-    manifest: dict | None = None,
-    dispatch: Callable | None = None,
-    actor: str | None = "deliver_gate",
-    reason: str = "mech_starvation",
-    run_id: str | None = None,
-) -> dict:
-    """Force-EXECUTE new_part + add_features once for the airframe leg (M21).
-
-    Cap: one forced pass per run_id. Returns a status dict:
-      {forced: bool, ok: bool, doc_id, calls, refusal: str|None}
-    """
-    rid = (
-        run_id
-        or getattr(ledger, "run_id", None)
-        or (manifest or {}).get("run_id")
-        or "default"
-    )
-    rid = str(rid)
-    out: dict[str, Any] = {
-        "forced": False,
-        "ok": False,
-        "doc_id": None,
-        "calls": [],
-        "refusal": None,
-        "reason": reason,
-        "run_id": rid,
-    }
-    if _mech_has_part_artifact(ledger):
-        out["ok"] = True
-        out["refusal"] = None
-        return out
-    if _MECH_FORCE_ONCE.get(rid):
-        out["refusal"] = (
-            "mech_leg_missing_after_force: new_part+add_features already "
-            "force-attempted once; refusing deliver with zero mech artifacts "
-            "(mega-21 M21)"
-        )
-        # mega-24: soft so terminal ECAD force / grade can proceed; forced stays
-        # False (cap already spent — mega-21 test contract).
-        out["soft_refusal"] = True
-        out["forced"] = False
-        return out
-
-    _MECH_FORCE_ONCE[rid] = True
-    out["forced"] = True
-    disp = _resolve_tool_dispatch(dispatch)
-    if disp is None:
-        out["refusal"] = "mech_force_no_dispatch"
-        return out
-
-    spec = _airframe_spec_from_manifest(manifest)
-    ops = _airframe_build_ops(spec)
-    actor_s = actor or "deliver_gate"
-
-    # 1) new_part
-    np_args = {"name": "rocket_plane_airframe"}
-    try:
-        _log(
-            ledger,
-            actor_s,
-            {
-                "event": "mech_chain_force_inject",
-                "tool": "new_part",
-                "args": np_args,
-                "reason": reason,
-            },
-        )
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        np_raw = disp("new_part", np_args)
-    except Exception as exc:  # noqa: BLE001
-        np_raw = {"ok": False, "error": str(exc)}
-    np_payload = np_raw
-    if isinstance(np_raw, str):
-        try:
-            np_payload = json.loads(np_raw)
-        except Exception:  # noqa: BLE001
-            np_payload = {"ok": False, "error": np_raw[:200]}
-    np_ok = bool(
-        isinstance(np_payload, dict)
-        and np_payload.get("ok") is not False
-        and (np_payload.get("doc_id") or np_payload.get("ok") is True)
-    )
-    doc_id = None
-    if isinstance(np_payload, dict):
-        doc_id = np_payload.get("doc_id")
-        if not doc_id and isinstance(np_payload.get("result"), dict):
-            doc_id = np_payload["result"].get("doc_id")
-    np_rec = {
-        "tool": "new_part",
-        "args": np_args,
-        "ok": np_ok,
-        "result": np_payload,
-        "forced": True,
-        "force_reason": reason,
-    }
-    out["calls"].append(np_rec)
-    try:
-        _log(
-            ledger,
-            actor_s,
-            {
-                "event": "tool_call",
-                "tool": "new_part",
-                "args": np_args,
-                "ok": np_ok,
-                "result": np_payload,
-                "forced": True,
-                "force_reason": reason,
-            },
-        )
-    except Exception:  # noqa: BLE001
-        try:
-            _log(
-                ledger,
-                actor_s,
-                {
-                    "event": "tool_call",
-                    "tool": "new_part",
-                    "args": np_args,
-                    "ok": np_ok,
-                    "result": np_payload,
-                    "forced": True,
-                    "force_reason": reason,
-                },
-            )
-        except Exception:  # noqa: BLE001
-            pass
-
-    if not np_ok or not doc_id:
-        out["refusal"] = (
-            "mech_force_new_part_failed: cannot mint airframe doc "
-            f"(result={str(np_payload)[:180]})"
-        )
-        return out
-
-    out["doc_id"] = doc_id
-    # 2) add_features with airframe body
-    af_args: dict[str, Any] = {"ops": ops, "doc_id": doc_id}
-    try:
-        _log(
-            ledger,
-            actor_s,
-            {
-                "event": "mech_chain_force_inject",
-                "tool": "add_features",
-                "args": {"doc_id": doc_id, "n_ops": len(ops), "spec": spec},
-                "reason": reason,
-            },
-        )
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        af_raw = disp("add_features", af_args)
-    except Exception as exc:  # noqa: BLE001
-        af_raw = {"ok": False, "error": str(exc)}
-    af_payload = af_raw
-    if isinstance(af_raw, str):
-        try:
-            af_payload = json.loads(af_raw)
-        except Exception:  # noqa: BLE001
-            af_payload = {"ok": False, "error": af_raw[:200]}
-    af_ok = True
-    if isinstance(af_payload, dict) and "ok" in af_payload:
-        af_ok = bool(af_payload.get("ok"))
-
-    # mega-22 rebind: batch reject (buried bosses) → retry with body-only,
-    # then body+bay. Partial land is product (AC2 volume path).
-    if not af_ok:
-        for retry_ops, tag in (
-            ([ops[0]], "body_only"),
-            (ops[:2], "body_bay"),
-            (ops[:3], "body_bay_wing"),
-        ):
-            try:
-                af_raw2 = disp("add_features", {"ops": retry_ops, "doc_id": doc_id})
-            except Exception as exc2:  # noqa: BLE001
-                af_raw2 = {"ok": False, "error": str(exc2)}
-            af_payload2 = af_raw2
-            if isinstance(af_raw2, str):
-                try:
-                    af_payload2 = json.loads(af_raw2)
-                except Exception:  # noqa: BLE001
-                    af_payload2 = {"ok": False, "error": str(af_raw2)[:200]}
-            ok2 = True
-            if isinstance(af_payload2, dict) and "ok" in af_payload2:
-                ok2 = bool(af_payload2.get("ok"))
-            try:
-                _log(
-                    ledger,
-                    actor_s,
-                    {
-                        "event": "tool_call",
-                        "tool": "add_features",
-                        "args": {
-                            "doc_id": doc_id,
-                            "n_ops": len(retry_ops),
-                            "retry": tag,
-                        },
-                        "ok": ok2,
-                        "result": af_payload2,
-                        "forced": True,
-                        "force_reason": f"{reason}:retry_{tag}",
-                    },
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            out["calls"].append(
-                {
-                    "tool": "add_features",
-                    "args": {"doc_id": doc_id, "n_ops": len(retry_ops), "retry": tag},
-                    "ok": ok2,
-                    "result": af_payload2,
-                    "forced": True,
-                    "force_reason": f"{reason}:retry_{tag}",
-                }
-            )
-            if ok2:
-                af_ok = True
-                af_payload = af_payload2
-                ops = retry_ops
-                break
-
-    af_rec = {
-        "tool": "add_features",
-        "args": {"doc_id": doc_id, "n_ops": len(ops)},
-        "ok": af_ok,
-        "result": af_payload,
-        "forced": True,
-        "force_reason": reason,
-    }
-    out["calls"].append(af_rec)
-    try:
-        _log(
-            ledger,
-            actor_s,
-            {
-                "event": "tool_call",
-                "tool": "add_features",
-                "args": {"doc_id": doc_id, "n_ops": len(ops)},
-                "ok": af_ok,
-                "result": af_payload,
-                "forced": True,
-                "force_reason": reason,
-            },
-        )
-    except Exception:  # noqa: BLE001
-        pass
-
-    out["ok"] = bool(np_ok and af_ok)
-    if not out["ok"]:
-        out["refusal"] = (
-            "mech_force_add_features_failed: airframe features did not land "
-            f"(result={str(af_payload)[:180]})"
-        )
-        # mega-22: still record typed refusal but mark soft so terminal can
-        # continue ECAD force / grading (not a hard mission abort alone).
-        out["soft_refusal"] = True
-    return out
-
-
-def mech_deliver_gate(
-    ledger,
-    *,
-    manifest: dict | None = None,
-    dispatch: Callable | None = None,
-    actor: str | None = "deliver_gate",
-    run_id: str | None = None,
-    force: bool = True,
-) -> dict:
-    """Deliver-time gate: zero mech artifacts → force BUILD chain or refuse.
-
-    mega-21 M21: treat 'mech leg has no part artifact' like the ECAD chain treats
-    an unwired schematic. One forced pass of new_part+add_features per the
-    airframe brief; if still missing, emit typed refusal for leg relaunch.
-
-    Returns:
-      {
-        allow_deliver: bool,
-        had_mech: bool,
-        forced: bool,
-        ok: bool,
-        refusal: str|None,
-        doc_id: str|None,
-        calls: list,
-      }
-    """
-    had = _mech_has_part_artifact(ledger)
-    result: dict[str, Any] = {
-        "allow_deliver": had,
-        "had_mech": had,
-        "forced": False,
-        "ok": had,
-        "refusal": None,
-        "doc_id": None,
-        "calls": [],
-    }
-    if had:
-        return result
-    if not force:
-        result["refusal"] = (
-            "mech_leg_missing: no new_part/add_features artifact on ledger; "
-            "refuse deliver_partial (mega-21 M21)"
-        )
-        result["allow_deliver"] = False
-        return result
-
-    forced = _mech_force_build_chain(
-        ledger,
-        manifest=manifest,
-        dispatch=dispatch,
-        actor=actor,
-        reason="deliver_gate_mech_starvation",
-        run_id=run_id,
-    )
-    result["forced"] = bool(forced.get("forced"))
-    result["ok"] = bool(forced.get("ok"))
-    result["doc_id"] = forced.get("doc_id")
-    result["calls"] = list(forced.get("calls") or [])
-    result["refusal"] = forced.get("refusal")
-    # Re-scan ledger (forced calls logged) OR trust force result.
-    if result["ok"] or _mech_has_part_artifact(ledger):
-        result["allow_deliver"] = True
-        result["ok"] = True
-        result["refusal"] = None
-        return result
-    # Still missing after one force → typed refusal.
-    # mega-22 rebind: when force was attempted (soft_refusal / hard fail), do
-    # NOT hard-block the whole mission before ECAD terminal force can run.
-    # allow_deliver stays False only when force never ran; soft path records
-    # refusal but allows terminal to proceed to ECAD product force + grade.
-    if not result["refusal"]:
-        result["refusal"] = (
-            "mech_leg_missing_after_force: deliver refused — relaunch airframe "
-            "BUILD leg (new_part+add_features) (mega-21 M21)"
-        )
-    soft = bool(forced.get("soft_refusal")) or bool(forced.get("forced"))
-    result["soft_refusal"] = soft
-    # allow_deliver False = mech product still missing; soft_refusal tells
-    # the mission driver NOT to hard-block before ECAD terminal force.
-    result["allow_deliver"] = False
-    try:
-        _log(
-            ledger,
-            actor or "deliver_gate",
-            {
-                "event": "mech_deliver_refusal",
-                "refusal": result["refusal"],
-                "forced": result["forced"],
-                "soft_refusal": soft,
-                "doc_id": result.get("doc_id"),
-            },
-        )
-    except Exception:  # noqa: BLE001
-        pass
-    return result
-
-
-# ---------------------------------------------------------------------------
-# mega-22 — terminal ECAD product force (P22/Q22 when BUILD starved)
-# ---------------------------------------------------------------------------
-
-
-def _ecad_has_product_artifact(calls_or_ledger) -> bool:
-    """True when schematic + (board or simulate path) produced ECAD product."""
-    calls = _ledger_tool_calls(calls_or_ledger)
-    ok = {c.get("tool") for c in calls if c.get("ok") and c.get("tool")}
-    has_sch = "ecad_new_schematic" in ok or any(
-        c.get("ok") and c.get("tool") == "ecad_place_symbol" for c in calls
-    )
-    has_board = bool(ok & {"board_from_schematic", "ecad_make_board"})
-    has_sim = "ecad_simulate" in ok
-    has_drc = "ecad_run_drc" in ok
-    return bool(has_sch and (has_board or has_sim or has_drc))
-
-
-def ecad_product_gate(
-    ledger,
-    *,
-    dispatch: Callable | None = None,
-    actor: str | None = "ecad_gate",
-    allow: set[str] | None = None,
-    budget: int = 24,
-    reason: str = "ecad_starvation",
-) -> dict:
-    """Terminal force for ECAD product when BUILD path starved (mega-22).
-
-    When the live ledger has zero schematic/board/sim tools (a1 residual:
-    n_build budget exhausted, force_n=0), force-EXECUTE the full chain:
-      new_schematic → place MCU+R → power → wire → board → optimize → drc
-      → erc → driven-rail sim.
-    Never invents success: each step is a real dispatch; DRC/sim residuals
-    remain honest FAIL when non-zero / out of band.
-    """
-    calls = _ledger_tool_calls(ledger)
-    out: dict[str, Any] = {
-        "forced": False,
-        "ok": _ecad_has_product_artifact(calls),
-        "calls": [],
-        "reason": reason,
-        "had_product": _ecad_has_product_artifact(calls),
-    }
-    if out["ok"]:
-        return out
-
-    disp = _resolve_tool_dispatch(dispatch)
-    if disp is None:
-        out["refusal"] = "ecad_force_no_dispatch"
-        return out
-
-    allow_set = set(
-        allow
-        or {
-            "ecad_new_schematic",
-            "ecad_place_symbol",
-            "ecad_add_power",
-            "ecad_wire",
-            "board_from_schematic",
-            "ecad_make_board",
-            "ecad_optimize_traces",
-            "ecad_run_drc",
-            "ecad_run_erc",
-            "ecad_simulate",
-        }
-    )
-    actor_s = actor or "ecad_gate"
-    messages: list = []
-    tool_calls_made = 0
-    out["forced"] = True
-
-    # Bootstrap schematic if missing.
-    ok_tools = {c.get("tool") for c in calls if c.get("ok") and c.get("tool")}
-    if "ecad_new_schematic" not in ok_tools:
-        calls, tool_calls_made, _rec, _ok = _ecad_dispatch_forced_step(
-            tool="ecad_new_schematic",
-            args={"name": "flight_computer"},
-            calls=calls,
-            dispatch=disp,
-            ledger=ledger,
-            actor=actor_s,
-            messages=messages,
-            reason=f"{reason}:new_schematic",
-            tool_calls_made=tool_calls_made,
-            budget=budget,
-        )
-    # Ensure at least one IC + passive for SPICE models.
-    n_place = sum(
-        1 for c in calls if c.get("ok") and c.get("tool") == "ecad_place_symbol"
-    )
-    if n_place < 1 and "ecad_place_symbol" in allow_set:
-        calls, tool_calls_made, _rec, _ok = _ecad_dispatch_forced_step(
-            tool="ecad_place_symbol",
-            args={
-                "libid": "MCU:Generic_QFP48",
-                "ref": "U1",
-                "value": "STM32F4",
-                "x": 50.0,
-                "y": 50.0,
-            },
-            calls=calls,
-            dispatch=disp,
-            ledger=ledger,
-            actor=actor_s,
-            messages=messages,
-            reason=f"{reason}:place_mcu",
-            tool_calls_made=tool_calls_made,
-            budget=budget,
-        )
-    if (
-        not any(
-            c.get("ok")
-            and c.get("tool") == "ecad_place_symbol"
-            and _ecad_place_is_passive(c)
-            for c in calls
-        )
-        and "ecad_place_symbol" in allow_set
-    ):
-        r_args = _ecad_forced_tool_args("ecad_place_symbol", calls)
-        if "Device:R" not in str(r_args.get("libid") or ""):
-            r_args = {
-                "libid": "Device:R",
-                "value": "1k",
-                "ref": "R1",
-                "x": 20.0,
-                "y": 20.0,
-            }
-            sch = _ecad_sch_doc_id(calls)
-            if sch:
-                r_args["doc_id"] = sch
-        calls, tool_calls_made, _rec, _ok = _ecad_dispatch_forced_step(
-            tool="ecad_place_symbol",
-            args=r_args,
-            calls=calls,
-            dispatch=disp,
-            ledger=ledger,
-            actor=actor_s,
-            messages=messages,
-            reason=f"{reason}:place_passive",
-            tool_calls_made=tool_calls_made,
-            budget=budget,
-        )
-
-    # Cascade remaining chain (power→wire→board→opt→drc→erc→driven sim).
-    calls, tool_calls_made = _ecad_force_chain_cascade(
-        calls=calls,
-        allow=allow_set,
-        dispatch=disp,
-        ledger=ledger,
-        actor=actor_s,
-        messages=messages,
-        tool_calls_made=tool_calls_made,
-        budget=max(budget, tool_calls_made + _ECAD_FORCE_CASCADE_MAX + 2),
-        reason=reason,
-        max_steps=_ECAD_FORCE_CASCADE_MAX,
-    )
-    out["calls"] = [c for c in calls if c.get("forced")]
-    out["ok"] = _ecad_has_product_artifact(calls)
-    out["tool_calls_made"] = tool_calls_made
-    try:
-        _log(
-            ledger,
-            actor_s,
-            {
-                "event": "ecad_product_gate",
-                "forced": True,
-                "ok": out["ok"],
-                "n_forced": len(out["calls"]),
-                "reason": reason,
-            },
-        )
-    except Exception:  # noqa: BLE001
-        pass
     return out
 
 
@@ -12077,41 +11296,44 @@ def resolve_measure_net(
                         names.append(n)
             if tool in ("ecad_place_symbol", "ecad_wire", "ecad_add_power"):
                 net = res.get("net")
-                if isinstance(net, str) and net.strip():
-                    if net not in names:
-                        names.append(net.strip())
-                    # Voltage source positive pin net is the driven rail.
+                if isinstance(net, str) and net.strip() and net not in names:
+                    names.append(net.strip())
+                if tool == "ecad_place_symbol" and harvested_source is None:
                     lib = str(
                         (c.get("args") or {}).get("libid") or res.get("libid") or ""
                     ).lower()
                     ref = str(res.get("ref") or (c.get("args") or {}).get("ref") or "")
-                    if harvested_source is None and (
-                        "v_source" in lib
+                    if (
+                        "simulation_spice:v" in lib
                         or lib.endswith(":v")
                         or "device:v" in lib
-                        or ref.upper().startswith(("V", "VIN"))
+                        or ref.upper().startswith("V")
                     ):
-                        # Prefer + pin net from pin list.
+                        # The positive terminal is physical pin 1, even when
+                        # KiCad leaves both pin names empty.
                         pins = res.get("pins") or []
-                        plus_net = None
-                        for p in pins:
-                            if not isinstance(p, dict):
-                                continue
-                            pn = str(p.get("number") or p.get("name") or "")
-                            if pn in ("+", "1", "P"):
-                                plus_net = p.get("net")
-                                break
-                        harvested_source = (
-                            str(plus_net).strip()
-                            if isinstance(plus_net, str) and plus_net.strip()
-                            else net.strip()
+                        plus_net = next(
+                            (
+                                p.get("net")
+                                for p in pins
+                                if isinstance(p, dict)
+                                and str(p.get("number") or p.get("pin") or "") == "1"
+                            ),
+                            None,
                         )
+                        if isinstance(plus_net, str) and plus_net.strip():
+                            harvested_source = plus_net.strip()
+                        elif not pins and isinstance(net, str) and net.strip():
+                            harvested_source = net.strip()
                 if tool == "ecad_wire":
-                    # Wire net is product rail when source involved.
-                    fr = str((c.get("args") or {}).get("from_ref") or "").upper()
-                    tr = str((c.get("args") or {}).get("to_ref") or "").upper()
+                    args = c.get("args") or {}
+                    fr = str(args.get("from_ref") or "").upper()
+                    tr = str(args.get("to_ref") or "").upper()
+                    fp = str(args.get("from_pin") or "")
+                    tp = str(args.get("to_pin") or "")
                     if harvested_source is None and (
-                        fr.startswith(("V", "VIN")) or tr.startswith(("V", "VIN"))
+                        (fr.startswith("V") and fp == "1")
+                        or (tr.startswith("V") and tp == "1")
                     ):
                         if isinstance(net, str) and net.strip():
                             harvested_source = net.strip()
@@ -12134,7 +11356,7 @@ def resolve_measure_net(
         # 3) explicit source_net arg
         if source_net:
             return source_net, "source_net_arg"
-        # 4) harvested source (VIN / Device:V + pin net)
+        # 4) harvested source positive-pin net
         if harvested_source:
             return harvested_source, "source_injected"
         # 5) other named rails (VIN/VCC/5V…) — not anonymous N$
@@ -12376,6 +11598,7 @@ _GEOMETRY_MUTATORS: frozenset[str] = frozenset(
         "part_place",
         "set_material",
         "regen_resolve",
+        "scad_convert",
         "asm_add_component",
         "asm_mate",
         "solve_mates",

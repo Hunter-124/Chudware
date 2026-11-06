@@ -10,6 +10,8 @@
 // unchanged from the former inline blocks; the function-local statics became members
 // (run_gui constructs one runner per call, so init-once semantics hold).
 //
+// CHUDWARE_SHOT=m1 writes staged captures and its saved part under
+// CHUDWARE_M1_SHOT_OUT when set; otherwise it uses $CHUDWARE_REPO/scratch/m1_shots.
 // CHUDWARE_SHOT=siminteractive drives real ImGui pointer/keyboard events against observed
 // item hooks and a rendered face. It checks native schema refusal, pristine/dirty draft coherence,
 // library material changes, mesh aliases, fatigue token save/reopen and original family gestures.
@@ -59,16 +61,75 @@
 // that the active chat and Sessions follow the selected root (startup, A/B/empty-root switches with a
 // parked run, outside-root document open/tab selection, explicit other-project pick) with no
 // cross-project active_by_project entry; report + captures in scratch/projectchat_shots.
-// CHUDWARE_SHOT=agentlock writes through a second MCP connection during a human sketch and
-// checks keep-exit, reserved lock chrome, mutation refusal, background-run Stop and unlock;
-// JSON report and external/in-app/stopping/unlocked captures land in scratch/agentlock_shots.
+// CHUDWARE_SHOT=agentlock writes through a second MCP connection during a human
+// sketch and verifies human edits and undo/redo while an in-app run is active.
+// It also exercises real PM cancellation with competing writes, successful and rejected delayed
+// daemon holds, retained new-form drafts and actual release of both generations' leases.
+// It then uses the real Simulation ribbon to create a Static study asynchronously, checking the
+// active origin, selected ID against the native list, and the rendered study setup.
+// JSON report and captures land beside --ui-screenshot when it has a parent directory;
+// otherwise they use $CHUDWARE_REPO/scratch/agentlock_shots. Use an isolated daemon.
+// CHUDWARE_SHOT=asm_refresh creates a real saved source and assembly, then edits the
+// source without saving and checks active/background renderer meshes, tab selection,
+// and deferred updates through a parked editor. It works with either backend; use
+// private HOME/XDG/session paths and a private daemon socket when daemon mode is on.
+// CHUDWARE_ASM_REFRESH_OUT selects the report/capture directory; failures exit non-zero.
 // CHUDWARE_SHOT=featurestate creates a canonical numeric 40/30/20 box, saves/reopens its build
 // cache, and checks real PM labels/readouts in MMGS/IPS, unchanged resync/activation/snapshot
 // cleanliness, actual drag-preview dirtiness, out-of-band native edits followed by local edits,
 // undo/redo preservation, saved wrapped dimensions and expression hydration.
-// Use private HOME/XDG/CHUDWARE_SESSIONS_DIR paths and CHUDWARE_ENGINE_DAEMON=0; override
-// CHUDWARE_FEATURESTATE_OUT for a private output root (default scratch/featurestate_shots).
+// Use private HOME/XDG/CHUDWARE_SESSIONS_DIR paths, a unique CHUDWARE_INSTANCE_KEY and
+// CHUDWARE_ENGINE_DAEMON=1: the dirty-state checks require the daemon's doc_list registry.
+// CHUDWARE_FEATURESTATE_OUT selects the private output root (default scratch/featurestate_shots).
 // Captures and report.json use that root; failures exit non-zero. No provider is involved.
+// CHUDWARE_SHOT=model_history creates an unsaved native box and unused datum, inspects the
+// rendered warning/preview and feature selection, and rejects stale cleanup after a foreign
+// box-size edit. Staged composited captures require current revision geometry, including the
+// newly extended area, then real controls and Ctrl+Z/redo exercise cleanup and refinement.
+// A separate native open surface wall verifies Refine is disabled and cannot mutate.
+// Use private HOME/APPDATA/XDG/session paths and CHUDWARE_ENGINE_DAEMON=0.
+// CHUDWARE_MODEL_HISTORY_OUT selects report.json and staged captures (default scratch/model_history_shots).
+// It exits non-zero on an observed-state or screenshot failure; no user part is opened or saved.
+// CHUDWARE_SHOT=uxquality uses real DocMirror rebuilds and rendered ImGui pointer/keyboard
+// events for fillet corrections, PM acceptance/rejection, units, datums, conditional controls,
+// Hole/Thread and command availability across document/workspace modes. Typed dimensions are
+// checked in the active ImGui buffer before OK and again against authoritative rebuilt state.
+// Pending-result and parked-document cases preserve newer invalid edits across real FIFO callbacks;
+// rendered PM status, native tree/geometry, selection and cached mesh remain independent oracles.
+// It gestures through the Model, 2D and 3D sketch S-bars, disabled ribbon/search controls,
+// split/overflow availability and Escape ownership over live forms, and an identity-matched
+// hydrated assembly snapshot on a legacy Part-kind presented tab.
+// The 3D cancellation cases frame their real viewport targets with wheel gestures. Study lifecycle
+// checks hidden discovery and typed setup; the piping footer checks the rendered disabled reason,
+// unchanged schematic and part on a refused click, and the actual network payload after save/reopen,
+// including switching away while creation is in flight. Requires CHUDWARE_ENGINE_DAEMON=0 and private
+// HOME/APPDATA/XDG/CHUDWARE_SESSIONS_DIR paths; no provider.
+// CHUDWARE_UXQUALITY_OUT selects report.json/capture root (default scratch/uxquality_shots).
+// CHU_UXQUALITY_CASE optionally runs one native regression in isolation: numeric_escape,
+// units_blur, cancel_atomic, inward_draft, legacy_variable, legacy_equal_expression,
+// fillet_reopen, thread_autosize, surface_through_all, presented_motion, sketch2d_cancel,
+// equation_rejection, study_identity, sketch3d_cancel, sketch3d_foreign, study_lifecycle,
+// feature_rejection, flatten_rejection, assembly_failed_component, copy_failed_history,
+// copy_resync_race, obsolete_rejection, ecad_queued_origin, parked_mutation,
+// parked_mechanical, piping_footer, hole_thread, or commands. Without it, all cases run
+// through the full UX sequence.
+// A named observed-state failure exits non-zero; this bounded smoke is not solver certification.
+// Example for a single case (omit CHU_UXQUALITY_CASE to run the full chain). Each concurrent run
+// needs a private directory and an explicitly assigned, unused Xvfb display number:
+//   : "${DISPLAY_BASE:?assign an unused Xvfb display number}"
+//   P=$(mktemp -d); mkdir -p "$P"/{home,data,config,cache,runtime,sessions,out}; chmod 700 "$P/runtime"
+//   HOME="$P/home" APPDATA="$P/data" XDG_DATA_HOME="$P/data" XDG_CONFIG_HOME="$P/config" \
+//   XDG_CACHE_HOME="$P/cache" XDG_RUNTIME_DIR="$P/runtime" CHUDWARE_SESSIONS_DIR="$P/sessions" \
+//   CHUDWARE_REPO="$PWD" CHUDWARE_ENGINE_DAEMON=0 CHUDWARE_SHOT=uxquality CHU_UXQUALITY_CASE=piping_footer \
+//   CHUDWARE_UXQUALITY_OUT="$P/out" xvfb-run -n "$DISPLAY_BASE" -s "-screen 0 1600x1000x24" \
+//   ./host/build-linux/bin/chudware --ui-screenshot "$P/out/final.png"
+// CHUDWARE_SHOT=parts_catalog uses an already rights-aware ingested private .step+ catalog
+// record with one non-centered 20x10x5 mm box named "Catalog fixture block". Set
+// CHUDWARE_PARTS_SHOT_ID to its part_id, CHUDWARE_PARTS_SHOT_QUERY to a unique search query,
+// and CHUDWARE_PARTS_SHOT_OUT to a private writable output directory. Use private HOME,
+// APPDATA/XDG and daemon socket/instance paths for both ingestion and the GUI. Search and
+// insert use actual controls; the PM edits the feature, saves and reopens an instance and
+// checks viewport pixels. Captures and report.json land in the output directory.
 // CHUDWARE_SHOT=chat_inline exercises real Ctrl+V/selection/caret input, ordered image payloads,
 // reference deletion/reorder, draft/history restore, edit/cancel, and full-size viewer clicks.
 // Requires xclip plus portrait.png/landscape.png in scratch/chat_inline_shots. Use isolated
@@ -82,6 +143,40 @@
 // CHUDWARE_COPILOT_UI_OUT customize the surface; default captures/report: scratch/copilot_ui_shots.
 // Parallel runs need distinct CHUDWARE_SESSIONS_DIR and display instances; the default shot
 // session store is shared by scenario name and cleared at startup.
+// CHUDWARE_SHOT=copilot_showcase is the offline visual tour of the Copilot column: a synthetic finished
+// turn (finished/failed tool rows, Thinking detail, answered question summary), two queued messages
+// pinned under a fake live run with Cancel handing one back to the composer, Artifacts (real PNG/STEP/
+// CSV/PDF/DXF files written under <out>/assets), Sessions (>=4 sessions across Today/Yesterday/Earlier,
+// a "[Image #1]" title, row hover, kebab menu), Quick settings (Model sizes), a ~320 px narrow pass and,
+// when CHUDWARE_THEME is unset, a light-theme pass. Every capture runs the ui audit and fails on
+// conflicts/overflows in Copilot windows; failures exit non-zero. No network, no provider, no agent.
+// Use private HOME/XDG/CHUDWARE_SESSIONS_DIR paths and CHUDWARE_ENGINE_DAEMON=0. Captures
+// (01_transcript, 01b_transcript_top, 02_queued_stack, 03_queue_cancelled, 04_artifacts, 05_sessions,
+// 06_sessions_hover, 07_sessions_menu, 08_quick_settings, 11_transcript_narrow, 14_artifacts_narrow,
+// 15_sessions_narrow, 21_sessions_light, 24_artifacts_light, 22_transcript_light, final) and
+// report.json land in CHUDWARE_COPILOT_SHOWCASE_OUT (default scratch/copilot_showcase_shots). With
+// CHUDWARE_THEME set the light pass is skipped (the env fixes the theme): run once per theme value.
+// Leave CHUDWARE_COPILOT_WIDTH/NARROW/COLLAPSED unset: the narrow pass sizes the window itself, and
+// the checks (column ~320 px, default width restored) fail if the column width is pinned. Use an
+// Xvfb screen of at least 1600x1200 (the tour resizes the window to 1280x1100).
+// CHUDWARE_SHOT=text_contrast aligns a shaded box edge with real selectable Copilot prose,
+// compares per-pixel contrast for the prose, header labels and model metadata against same-frame
+// text-free/font-coverage references, moves the camera, and checks native selection/copy. Dark
+// theme also checks its composited pinned slab.
+// CHUDWARE_SCALE=1/2 and CHUDWARE_THEME=light/dark are supported. Use private HOME/XDG paths
+// and CHUDWARE_ENGINE_DAEMON=0. CHUDWARE_TEXT_CONTRAST_OUT chooses the capture/report root
+// (default scratch/text_contrast_shots); an explicit CHUDWARE_SESSIONS_DIR must be inside it.
+// Without that override the per-shot private store is used; parallel runs need distinct stores
+// and displays. report.json names pixel/focus/copy failures and a failure exits non-zero.
+// CHUDWARE_SHOT=settings_routes clicks Quick Settings -> Prompts and alternates Enter/click
+// command-search activation across all eight AI sections, checking rendered section windows.
+// Use private HOME/XDG paths and CHUDWARE_ENGINE_DAEMON=0; failures exit non-zero and write
+// scratch/settings_routes_shots/report.json with observed items/windows.
+// CHUDWARE_SHOT=model_settings requires APPDATA=$PWD/scratch/model_settings_private,
+// CHUDWARE_SESSIONS_DIR=$APPDATA/sessions and CHUDWARE_ENGINE_DAEMON=0. It exercises model
+// assignments, simulated provider sign-out with explicit synthetic catalog rows, private-config
+// permission failures/retry/discard and the composer picker. See gui-architecture.md for
+// isolation and privilege requirements. Reports and captures go to scratch/model_settings_shots.
 #pragma once
 
 #include <memory>
@@ -163,6 +258,8 @@ private:
     int asmStep = 0, asmSettle = 0;
     std::string asmSavePath, asmBasePath, asmPegPath, asmDoc, asmK2;
     double asmSolvedZ = -999.0;
+    int asmInsertsSubmitted = 0, asmInsertsDone = 0, asmInsertsFailed = 0;  // async inserts
+    int asmInsertWaitFrames = 0;
     bool asmDirReady = false;
     std::string asmCapture;  // same per-step capture mechanism, separate path slot
 
@@ -258,6 +355,15 @@ private:
     int tpStep = 0, tpSettle = 0, tpSwitches = 0;
     int tpIdxA = -1, tpIdxB = -1;
     static constexpr int kTabPerfSwitches = 24;  // 12 A->B + 12 B->A
+
+    // ---------- frameperf scenario (CHUDWARE_SHOT=frameperf) ----------
+    // Builds a real filleted/drilled part, then measures orbit, real mouse-hover picking,
+    // long Copilot transcript drawing and all eight workspace routes. CHUDWARE_FRAMESTATS
+    // overrides the default CHUDWARE_REPO/scratch/frameperf/framestats.json report path.
+    void runFramePerf(AppState& st);
+    bool fpInit = false, fpWant = false, fpDone = false, fpFailed = false;
+    int fpStep = 0, fpFrames = 0, fpIdleFrames = 0, fpHoverPicks = 0;
+    double fpStarted = 0.0;
     // ---------- workspaces scenario (CHUDWARE_SHOT=workspaces) ----------
     // Cycles all 8 workspace tabs (Model, Drawing, Simulate, Electronics, Manufacture, PLM,
     // PartsLibrary, AI), capturing one screenshot per workspace. Acceptance gate for the
@@ -272,7 +378,7 @@ private:
     // playback is end-to-end live.
     void runMotion(AppState& st);
     bool mtInit = false, mtWant = false, mtDone = false;
-    int  mtStep = 0, mtSettle = 0;
+    int  mtStep = 0, mtSettle = 0, mtStudiesBefore = 0;
     bool mtDirReady = false;
     std::string mtSavePath, mtCapture;
     std::string mtBasePath, mtArmPath;   // authored part AICM paths
@@ -293,7 +399,7 @@ private:
     bool topoVerifyRun(const nlohmann::json& run, const std::string& tag, std::string& why);
     void topoWriteReport();
     bool topoInit = false, topoWant = false, topoDone = false, topoFailed = false;
-    int  topoStep = 0, topoSettle = 0, topoIdleFrames = 0, topoCaptureWait = 0;
+    int  topoStep = 0, topoSettle = 0, topoIdleFrames = 0, topoCaptureWait = 0, topoStudiesBefore = 0;
     bool topoDirReady = false, topoProgressShot = false;
     double topoWaitStart = 0.0;            // steady-clock seconds when the current wait began
     std::string topoSavePath, topoCapture;

@@ -3,7 +3,7 @@ import BaseLayout from '../../layouts/BaseLayout.astro';
 import '../../styles/product.css';
 import Icon from '../../components/Icon.astro';
 ---
-<BaseLayout title="Product" description="Dimension-driven parametric modeling, assemblies, simulation, CAM, PLM, reverse engineering, and a team of AI agents in one document. Free and open source for Windows, Linux, and macOS.">
+<BaseLayout title="Product" description="Dimension-driven modeling, assemblies, simulation, CAM, PLM, reverse engineering, and an optional desktop copilot. MIT-licensed software with experimental browser self-hosting.">
   <header class="page-hero">
     <div class="wrap">
       <p class="eyebrow">Product</p>
@@ -12,7 +12,7 @@ import Icon from '../../components/Icon.astro';
       <ul class="product-hero-meta">
         <li>Exact solids, not mesh approximations</li>
         <li>Dimension-driven models in native <code>.step+</code> files</li>
-        <li>Open-source desktop app for Windows, Linux, and macOS</li>
+        <li>MIT-licensed desktop software and experimental browser self-hosting</li>
       </ul>
     </div>
   </header>
@@ -91,7 +91,7 @@ import Icon from '../../components/Icon.astro';
           <p>Describe the outcome. A team of agents splits the job across the workspace, drives the same modeling tools you use by hand, and leaves behind a human-editable feature tree.</p>
           <ul class="fact-list">
             <li>Inspect geometry, build and edit features, run studies, prepare CAM, measure and render</li>
-            <li>Bring your own AI provider account or API key</li>
+            <li>Desktop runtime and your own AI provider account or API key required; online browser Copilot unavailable</li>
             <li>Anything that touches a physical machine waits for you</li>
           </ul>
         </article>
@@ -114,13 +114,13 @@ import Icon from '../../components/Icon.astro';
       <header class="section-heading">
         <p class="eyebrow" id="scope-title">Active development</p>
         <h2>Try it on the work you actually need to ship.</h2>
-        <p class="lede">Modeling, assemblies, simulation, CAM, PLM, reverse engineering, and the copilot are all available today. Chudware is under active development: advanced workflows are still changing, so test it on a project that looks like yours before moving production work.</p>
-        <p class="supporting-copy">Desktop builds for Windows, Linux, and macOS are on the download page, and the full source is on GitHub under the MIT License.</p>
+        <p class="lede">Chudware is under active development: advanced workflows and packaging are still changing, so test it on a project that looks like yours before moving production work. The desktop copilot is optional and online Copilot is not available in the browser deployment.</p>
+        <p class="supporting-copy">The MIT source repository is public; public desktop installers are not yet available. See <a href="/download/">setup choices</a> for source-based self-hosting, desktop targets, and optional paid hosting inquiries.</p>
       </header>
       <div class="product-note">
         <p class="eyebrow">Reviewable output</p>
         <p>Every feature the agents build is in the tree with its sketch fully defined. Study evidence, CAM setup, and revisions stay visible too. You inspect what was produced; you never have to trust a summary sentence.</p>
-        <p><a class="text-link" href="https://github.com/Hunter-124/Chudware">Read the source <Icon name="arrow-right" /></a></p>
+        <p><a class="text-link" href="/open-source/">Source, access, and licenses <Icon name="arrow-right" /></a></p>
       </div>
     </div>
   </section>
@@ -151,9 +151,9 @@ import Icon from '../../components/Icon.astro';
   <section class="section cta-band">
     <div class="wrap section-heading">
       <p class="eyebrow">Start anywhere</p>
-      <h2>Install it, or read how a part gets built first.</h2>
-      <p class="lede">Download the desktop app, or follow the first-part guide before you decide.</p>
-      <div class="actions"><a class="button" href="/download/">Download</a><a class="button button-secondary" href="/docs/first-part/">Build your first part</a></div>
+      <h2>Choose a setup, or read how a part gets built first.</h2>
+      <p class="lede">Review source access and experimental self-hosting, or follow the first-part guide before you decide.</p>
+      <div class="actions"><a class="button" href="/download/">See setup choices</a><a class="button button-secondary" href="/docs/first-part/">Build your first part</a></div>
     </div>
   </section>
 </BaseLayout>

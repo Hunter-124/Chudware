@@ -4,7 +4,7 @@ Single client-side dispatch point for every host→engine call. It routes each c
 `libchudware` (through the `chudware-hostd` daemon by default, or in-process) or to the
 services worker. Wire contract: `contracts/worker_rpc.md`. Ongoing guidance:
 - Repo rules, build and gate: `docs/dev/engineering-notes.md`.
-- Agent lane and Chudcode turns: `docs/dev/chudcode-integration.md`.
+- Agent lane and OMP turns: `docs/dev/omp-integration.md`.
 
 ## Modules (these three only)
 
@@ -15,8 +15,8 @@ services worker. Wire contract: `contracts/worker_rpc.md`. Ongoing guidance:
   - Every other method goes over the engine channel in daemon/WASM mode; hostd's
     `WorkerBridge` bridges it to its services worker. Only the legacy in-process backend
     uses the local worker child that `WorkerClient::start` launches.
-  - Also owns the long-run/control split: `longRunMtx_` vs `callMtx_`, `callViaSideClient`,
-    and `worker_control_info` cancel/steer.
+  - Also owns the long-run/control split: the simulation lane mutex vs `callMtx_`,
+    `callViaSideClient`, and `worker_control_info` cancel/steer (online runs only).
 - `engine_backend.{h,cpp}` — namespace `engine`, the backend seam.
   - Default: the daemon `EngineClient` over local IPC to `chudware-hostd`, with bounded
     connect retry (`CHUDWARE_ENGINE_DAEMON_RETRY_MS`).

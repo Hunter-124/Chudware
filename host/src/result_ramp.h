@@ -6,6 +6,17 @@
 
 namespace result_ramp {
 
+// Per-activation display policy. Other result fields retain the default low=blue auto range.
+struct Display {
+    bool reversed = false;
+    bool fixedRange = false;
+    float min = 0.0f, max = 1.0f;
+    bool operator==(const Display& other) const {
+        return reversed == other.reversed && fixedRange == other.fixedRange &&
+               min == other.min && max == other.max;
+    }
+};
+
 // Control stops (t, r, g, b) in sRGB 0..1, ascending t, first at 0 and last at 1.
 struct Stop {
     float t, r, g, b;

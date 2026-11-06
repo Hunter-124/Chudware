@@ -1,12 +1,14 @@
 #include "core/app_state.h"
 #include "core/jobs.h"
 #include "core/fs_backend.h"
+#include "ui/copilot/activity_settlement.h"
 #include "worker_client.h"
 #include "engine_backend.h"
 
 #include <iostream>
 #include <memory>
 #include <string>
+#include <utility>
 
 #include <nlohmann/json.hpp>
 
@@ -52,18 +54,16 @@ void testOnlineNormalRoute() {
         {"options",
          {{"session_id", "session-17"},
           {"sessions_dir", "/tmp/sessions"},
+          {"omp_session_file", "/original/runtime journal.jsonl"},
           {"workspace_dir", "/tmp/project"},
           {"history", history},
-          {"advisor", false},
-          {"corporate_mode", true},
-          {"scope", {{"feature_ids", nlohmann::json::array({"Pad"})}}}}}};
+          {"advisor", false}}}};
 
     const AgentJobRpcRoute route =
-        buildAgentJobRpcRoute("make the bracket", "doc-4", "conv-fallback", true, extra, false);
-    check(route.online, "normal route is online");
+        buildAgentJobRpcRoute("make the bracket", "doc-bracket", "conv-fallback", true, extra, false);
     check(route.method == "agent_admin_turn", "normal online route uses agent_admin_turn");
     check(route.params.value("request", std::string()) == "make the bracket", "request preserved");
-    check(route.params.value("doc_id", std::string()) == "doc-4", "doc id preserved");
+    check(route.params.value("doc_id", std::string()) == "doc-bracket", "document id preserved");
     check(route.params.value("provider", std::string()) == "xai", "provider flattened");
     check(route.params.value("model", std::string()) == "grok-4.5", "model flattened");
     check(route.params.value("reasoning_effort", std::string()) == "high", "effort flattened");
@@ -72,14 +72,13 @@ void testOnlineNormalRoute() {
     check(route.params.value("session_id", std::string()) == "session-17", "session id flattened");
     check(route.params.value("sessions_dir", std::string()) == "/tmp/sessions",
           "sessions directory flattened");
+    check(route.params.value("omp_session_file", std::string()) ==
+              "/original/runtime journal.jsonl", "original runtime journal path preserved");
     check(route.params.value("workspace_dir", std::string()) == "/tmp/project",
           "workspace directory flattened");
     check(route.params["history"] == history, "history flattened without request injection");
     check(route.params["attachments"] == attachments, "attachments preserved");
     check(route.params.contains("context_refs"), "context refs preserved");
-    check(route.params["options"].value("corporate_mode", false),
-          "normal corporate preference preserved");
-    check(!route.params.value("corporate_force", false), "normal route does not force company");
     check(route.params.value("run_id", std::string()).rfind("gui-", 0) == 0,
           "normal route allocates run id before call");
     check(route.params.value("request", std::string()).find("CONVERSATION HISTORY") ==
@@ -127,11 +126,6 @@ void testOnlineTurnBudget() {
     check(explicitBudget.params.value("timeout", 0.0) == 14400.0, "explicit budget preserved");
     check(agentJobWaitMs(explicitBudget) > 14400 * 1000,
           "explicit budget: client waits past it for the worker's turn_budget reply");
-
-    const AgentJobRpcRoute offline = buildAgentJobRpcRoute(
-        "local build", "doc", "conv", false, {{"options", {{"offline", true}}}}, false);
-    check(!offline.params.contains("timeout"), "offline native route gets no worker budget");
-    check(agentJobWaitMs(offline) > 0, "offline native route keeps its bounded wait");
 }
 
 // The composer's user-picked mode is authoritative for a normal (non-mission) turn: the route
@@ -163,45 +157,20 @@ void testOnlineMissionRoute() {
         {"provider", "anthropic"},
         {"attachments", nlohmann::json::array({{{"path", "/tmp/spec.txt"}}})},
         {"options",
-         {{"mode", "eng_firm"},
-          {"org", "eng_firm"},
-          {"corporate_force", false},
-          {"company_budget", 9000},
+         {{"mode", "plan"},
           {"history", nlohmann::json::array({{{"role", "user"}, {"text", "design it"}}})},
           {"session_id", "mission-session"}}}};
     const AgentJobRpcRoute route =
         buildAgentJobRpcRoute("build and verify", "doc-m", "conv-m", false, extra, true);
-    check(route.online, "mission route is online");
     check(route.method == "agent_admin_turn", "mission online route uses agent_admin_turn");
+    check(route.params.value("doc_id", std::string()) == "doc-m", "mission document id preserved");
     check(route.params.value("mode", std::string()) == "swarm", "mission mode forced to swarm");
-    check(route.params.value("corporate_force", false), "mission corporate force enabled");
     check(route.params["options"].value("mode", std::string()) == "swarm",
           "mission options mode matches top level");
-    check(route.params["options"].value("corporate_force", false),
-          "mission options corporate force matches top level");
-    check(route.params.value("org", std::string()) == "eng_firm", "firm organization preserved");
-    check(route.params.value("company_budget", 0) == 9000, "firm budget preserved");
     check(route.params.value("provider", std::string()) == "anthropic",
           "mission provider preserved");
     check(route.params.contains("history") && route.params.contains("attachments"),
           "mission history and attachments preserved");
-}
-
-void testExplicitOfflineFallbacks() {
-    const AgentJobRpcRoute normal = buildAgentJobRpcRoute(
-        "local build", "doc", "conv", false, {{"options", {{"offline", true}}}}, false);
-    check(!normal.online, "explicit offline normal is not online");
-    check(normal.method == "agent_run_v2", "explicit offline normal retains native method");
-
-    const AgentJobRpcRoute mission = buildAgentJobRpcRoute(
-        "local mission", "doc", "conv", false, {{"offline_mode", true}}, true);
-    check(!mission.online, "explicit offline mission is not online");
-    check(mission.method == "agent_mission_v1", "explicit offline mission retains native method");
-
-    const AgentJobRpcRoute localProvider = buildAgentJobRpcRoute(
-        "local endpoint", "doc", "conv", false, {{"provider", "llamacpp"}}, false);
-    check(localProvider.online && localProvider.method == "agent_admin_turn",
-          "local provider alone is not an explicit offline request");
 }
 
 void testAdminResultMapping() {
@@ -230,6 +199,12 @@ void testAdminResultMapping() {
          {"turn", {{"success", false}, {"cancelled", true}, {"stop_reason", "cancelled"}}}},
         false);
     check(cancelled.value("status", std::string()) == "cancelled", "cancel maps to cancelled");
+    const nlohmann::json skipped = normalizeAgentAdminTurnResult(
+        {{"ok", true}, {"turn", {{"success", false}, {"stop_reason", "skipped"},
+                                  {"outcome", "skipped"}}}}, false);
+    check(skipped.value("status", std::string()) != "done" &&
+              skipped.value("stop_reason", std::string()) == "skipped",
+          "skipped maintenance is not reported as committed");
 
     const nlohmann::json failed =
         normalizeAgentAdminTurnResult({{"ok", false}, {"reason", "authentication failed"}}, false);
@@ -237,8 +212,14 @@ void testAdminResultMapping() {
           "admin reason maps to legacy error");
     check(failed.value("error_detail", std::string()) == "authentication failed",
           "admin reason maps to error detail");
-    check(failed.value("stop_reason", std::string()) == "provider_error",
-          "admin failure maps to provider error stop");
+    check(failed.value("stop_reason", std::string()) == "runtime_error",
+          "unclassified admin failure maps to runtime error");
+    for (const std::string reason : {"runtime_error", "provider_error", "turn_budget"}) {
+        const auto nested = normalizeAgentAdminTurnResult(
+            {{"ok", false}, {"reason", "failed"}, {"turn", {{"stop_reason", reason}}}}, false);
+        check(nested.value("stop_reason", std::string()) == reason,
+              "admin failure preserves nested stop reason");
+    }
 }
 
 void testEventConsumption() {
@@ -260,8 +241,8 @@ void testEventConsumption() {
         check(job->events.front().kind == "orch_stage_started", "event kind keeps orch prefix");
         check(job->events.front().notes == "model > designer attempt 1...",
               "event phase note preserved");
-        check(nlohmann::json::parse(job->events.front().text).value("run_id", std::string()) ==
-                  "event-run",
+        check(job->events.front().data &&
+                  job->events.front().data->value("run_id", std::string()) == "event-run",
               "full event payload preserved");
     }
 
@@ -282,7 +263,182 @@ void testEventConsumption() {
         std::lock_guard<std::mutex> lock(job->evMtx);
         check(job->events.size() == 2, "terminal event queues exactly once");
     }
+    AgentEvent ignored;
+    while (takeAgentEvent(*job, ignored)) {}
+    consumeAgentJobEvent(job, {{"kind", "assistant_delta"}, {"channel", "text"},
+                              {"text", "first "}, {"run_id", "event-run"}}, false);
+    consumeAgentJobEvent(job, {{"kind", "assistant_delta"}, {"channel", "text"},
+                              {"text", "second"}, {"run_id", "event-run"}}, false);
+    consumeAgentJobEvent(job, {{"kind", "assistant_delta"}, {"channel", "thinking"},
+                              {"text", "next"}, {"run_id", "event-run"}}, false);
+    consumeAgentJobEvent(job, {{"kind", "stage_started"}, {"stage", "after"},
+                              {"run_id", "event-run"}}, false);
+    AgentEvent joined, boundary, after;
+    check(takeAgentEvent(*job, joined) && joined.data &&
+              joined.data->value("text", std::string()) == "first second" &&
+              takeAgentEvent(*job, boundary) && boundary.data &&
+              boundary.data->value("channel", std::string()) == "thinking" &&
+              boundary.data->value("text", std::string()) == "next" &&
+              takeAgentEvent(*job, after) && after.kind == "orch_stage_started" &&
+              !agentEventsPending(*job),
+          "adjacent deltas concatenate without crossing channel or event boundaries");
 }
+
+void testConcurrentCellEventIsolation() {
+    auto compact = std::make_shared<JobState>();
+    auto conversation = std::make_shared<JobState>();
+    compact->runId = "compact-a";
+    conversation->runId = "turn-b";
+    const nlohmann::json a = {{"kind", "sub_run"}, {"run_id", "compact-a"},
+                               {"status", "running"}, {"purpose", "compaction"}};
+    const nlohmann::json b = {{"kind", "assistant_delta"}, {"run_id", "turn-b"},
+                               {"text", "reply from B"}};
+    const nlohmann::json bFailure = {{"kind", "run_finished"}, {"run_id", "turn-b"},
+                                     {"stop_reason", "provider_error"},
+                                     {"error_detail", "B failed"}};
+    // A cell broadcasts each event to both same-actor turn connections.
+    for (const auto& event : {a, b, bFailure}) {
+        consumeAgentJobEvent(compact, event, false, true);
+        consumeAgentJobEvent(conversation, event, false, true);
+    }
+    consumeAgentJobEvent(compact, {{"kind", "assistant_delta"}, {"text", "unidentified"}}, false, true);
+    auto unbound = std::make_shared<JobState>();
+    consumeAgentJobEvent(unbound, a, false, true);
+    check(unbound->runId.empty() && !agentEventsPending(*unbound),
+          "unbound cell job never adopts another run's broadcast");
+    AgentEvent event;
+    check(takeAgentEvent(*compact, event) && event.data &&
+              event.data->value("run_id", std::string()) == "compact-a" &&
+              !agentEventsPending(*compact),
+          "background compaction sees only its own streamed activity");
+    check(compact->stopReason.empty() && compact->errorDetail.empty(),
+          "another conversation's terminal failure cannot poison compaction");
+    check(takeAgentEvent(*conversation, event) && event.data &&
+              event.data->value("text", std::string()) == "reply from B" &&
+              takeAgentEvent(*conversation, event) && event.kind == "orch_run_finished" &&
+              !agentEventsPending(*conversation) &&
+              conversation->stopReason == "provider_error",
+          "conversation receives only its own reply and failure");
+}
+void testRetiredCorporateActivityRows() {
+    ActivityItem row;
+    for (int kind : {4, 5, 6, 7, 8}) {
+        row.rowKind = kind;
+        row.stage = "legacy";
+        check(row.isRetiredCorporateRow(), "retired corporate row is not rendered as an action");
+    }
+    row.rowKind = 7;
+    row.stage = "msg:irc:message-1";
+    check(!row.isRetiredCorporateRow(), "inter-agent messages retain the shared row kind");
+    row.stage = "msg";
+    check(row.isRetiredCorporateRow(), "legacy row seven is not mistaken for a message");
+    for (int kind : {0, 1, 2, 3, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}) {
+        row.rowKind = kind;
+        row.stage = "legacy";
+        check(!row.isRetiredCorporateRow(), "ordinary activity row remains available");
+    }
+}
+
+void testCompactionTerminalSettlement() {
+    for (const auto& item : {std::pair<const char*, const char*>{"failed", "fail"},
+                            {"error", "fail"}, {"cancelled", "cancelled"},
+                            {"interrupted", "stopped"}, {"done", "stopped"}}) {
+        ActivityItem activity;
+        activity.rowKind = 17;
+        activity.stage = "subrun:compaction:run-1";
+        activity.title = "Compacting context";
+        activity.status = "running";
+        check(ui::settleUnfinishedCompaction(activity, item.first), "open compaction settles");
+        check(activity.status == item.second && activity.title != "Compacting context",
+              "terminal outcome never invents a successful compaction");
+        const auto title = activity.title;
+        check(!ui::settleUnfinishedCompaction(activity, "done") && activity.title == title,
+              "terminal compaction settlement is idempotent");
+    }
+    ActivityItem committed;
+    committed.rowKind = 17;
+    committed.stage = "subrun:compaction:run-2";
+    committed.title = "Context compacted";
+    committed.status = "done";
+    check(!ui::settleUnfinishedCompaction(committed, "failed") && committed.status == "done",
+          "confirmed compaction stays committed");
+    ChatMsg message;
+    message.running = true;
+    message.compactionRun = true;
+    message.liveStatus = "Compacting context";
+    ActivityItem open;
+    open.rowKind = 17;
+    open.stage = "subrun:compaction:run-3";
+    open.title = "Compacting context";
+    open.status = "running";
+    message.activity.push_back(open);
+    ui::settleCompactionMessage(message, "error");
+    check(!message.running && message.liveStatus.empty() &&
+              message.activity[0].status == "fail",
+          "terminal error clears owning compaction message and marks failure");
+}
+
+void testLateStopCompactionReceipt() {
+    struct ConversationMeter { std::string id; int lastContextTokens; };
+    const nlohmann::json envelope = {
+        {"ok", true},
+        {"turn", {{"success", true}, {"outcome", "committed"}, {"cancelled", false},
+                  {"stop_reason", "completed"}, {"omp_session_id", "original-session"},
+                  {"omp_session_file", "/original/journal.jsonl"},
+                  {"compaction", {{"method", "soft"}, {"tokensBefore", 100},
+                                  {"tokensAfter", 25}, {"tokensAfterEstimated", true}}}}}};
+    const auto normalized = normalizeAgentAdminTurnResult(envelope, false);
+    check(normalized.value("status", std::string()) == "done",
+          "committed receipt stays done despite a late Stop");
+    check(normalized["turn"]["omp_session_file"] == "/original/journal.jsonl" &&
+              normalized["turn"]["compaction"]["method"] == "soft",
+          "committed method and owning journal are retained");
+
+    int visible = 800;
+    std::vector<ConversationMeter> conversations = {{"viewed", 800}, {"owner", 100}};
+    ChatMsg message;
+    message.compactionRun = true;
+    message.running = false;  // Stop already finalized the bubble.
+    ActivityItem stopped;
+    stopped.rowKind = 17;
+    stopped.stage = "subrun:compaction:run";
+    stopped.status = "cancelled";
+    stopped.title = "Context compaction cancelled";
+    stopped.reason = "cancelled";
+    message.activity.push_back(stopped);
+    check(ui::applyCommittedCompactionReceipt(normalized["turn"], visible, conversations,
+                                               false, "owner", &message),
+          "authoritative receipt reconciles a stopped maintenance message");
+    check(visible == 800 && conversations[1].lastContextTokens == ui::storedContextEstimate(25),
+          "estimated post-commit usage goes to the background owner only");
+    check(message.activity[0].status == "done" &&
+              message.activity[0].title == "Context compacted" &&
+              message.activity[0].reason == "done",
+          "committed receipt replaces cosmetic cancelled activity");
+
+    auto noUsage = normalized["turn"];
+    noUsage["compaction"].erase("tokensAfter");
+    check(ui::applyCommittedCompactionReceipt(noUsage, visible, conversations, true, "viewed",
+                                               &message) && visible == -1,
+          "committed receipt with unknown occupancy invalidates the viewed meter");
+    auto measured = normalized["turn"];
+    measured["compaction"]["tokensAfterEstimated"] = false;
+    check(ui::applyCommittedCompactionReceipt(measured, visible, conversations, true, "viewed",
+                                               &message) && visible == 25,
+          "provider-anchored occupancy remains an actual measurement");
+
+    const auto cancelled = normalizeAgentAdminTurnResult(
+        {{"ok", true}, {"turn", {{"success", false}, {"outcome", "cancelled"},
+                                  {"cancelled", true}, {"stop_reason", "cancelled"}}}}, false);
+    message.activity[0] = stopped;
+    check(cancelled.value("status", std::string()) == "cancelled" &&
+              !ui::applyCommittedCompactionReceipt(cancelled["turn"], visible, conversations,
+                                                    false, "owner", &message) &&
+              conversations[1].lastContextTokens == ui::storedContextEstimate(25) &&
+              message.activity[0].status == "cancelled",
+          "precommit cancellation leaves the old meter and cancelled activity unchanged");
+}
+
 void testWorkspaceRelativePaths() {
     std::string relative, err;
     for (const std::string& root : {std::string(), std::string("."), std::string("./")}) {
@@ -308,7 +464,8 @@ void testCellHandlesAndPaths() {
     const nlohmann::json extra = {
         {"run_id", "client-run"},
         {"options", {{"session_id", "local-conversation"}, {"sessions_dir", "/idbfs/sessions"},
-                     {"chudcode_session_file", "/srv/actor/session.jsonl"},
+                     {"omp_session_file", "/srv/actor/session.jsonl"},
+                     {"omp_session_dir", "/srv/actor/private"},
                      {"workspace_dir", "./parts"}}}};
     auto route = buildAgentJobRpcRoute("go", "doc", "local-conversation", false, extra, false, true);
     check(route.cell && route.error.empty() && !route.params.contains("run_id") &&
@@ -317,7 +474,8 @@ void testCellHandlesAndPaths() {
               route.params["options"]["workspace_dir"] == "parts",
           "cell workspace selection remains relative in both envelopes");
     check(!route.params.contains("sessions_dir") &&
-              !route.params["options"].contains("chudcode_session_file"),
+              !route.params["options"].contains("omp_session_file") &&
+              !route.params["options"].contains("omp_session_dir"),
           "browser-local and runtime paths are not sent");
     const std::string run = "opaque:run/not-a-path?raw=%2f";
     const std::string session = "opaque:session/../unchanged";
@@ -337,7 +495,7 @@ void testCellHandlesAndPaths() {
           "session binding keeps the launched provider independently of the picker");
     bindCellAgentSessionHandle("local-conversation", "child-handle");
     check(cellAgentSessionProvider("local-conversation") == "anthropic",
-          "rewind handle replacement retains its credential provider");
+          "branch handle replacement retains its credential provider");
     bindCellAgentSessionHandle("other-conversation", "other-handle", "xai");
     check(cellAgentSessionProvider("other-conversation") == "xai" &&
               cellAgentSessionProvider("local-conversation") == "anthropic",
@@ -358,9 +516,6 @@ void testCellHandlesAndPaths() {
             {{"attachments", nlohmann::json::array({{{"path", path}}})}}, false, true);
         check(!attachment.error.empty(), "cell route rejects unsafe attachment paths");
     }
-    const auto offline = buildAgentJobRpcRoute("go", "doc", "chat", false,
-                                               {{"offline", true}}, false, true);
-    check(!offline.error.empty(), "cell has no native offline fallback");
     clearCellAgentSessionHandles();
 }
 
@@ -387,7 +542,7 @@ void testCellProtocolAdmission() {
         {"web_rpc_version", 2},
         {"web_rpc_methods", nlohmann::json::array(
             {"subscribe", "doc_list", "doc_open", "agent_handles_new",
-             "chudcode_models_list", "agent_admin_turn"})}};
+             "omp_models_list", "agent_admin_turn"})}};
     check(engine::webCellProtocolReady(current), "version two cell enables browser capabilities");
     check(engine::webCellMethodAllowed(current, "doc_open") &&
               engine::webCellMethodAllowed(current, "agent_handles_new"),
@@ -396,7 +551,7 @@ void testCellProtocolAdmission() {
           "unadvertised method is refused without legacy fallback");
     check(engine::webCellMethodAllowed(current, "subscribe") &&
               engine::webCellMethodAllowed(current, "doc_list") &&
-              engine::webCellMethodAllowed(current, "chudcode_models_list") &&
+              engine::webCellMethodAllowed(current, "omp_models_list") &&
               engine::webCellMethodAllowed(current, "agent_admin_turn"),
           "actual ready hello admits document bootstrap and credential-free provider chat");
     check(!engine::webCellMethodAllowed(current, "recovery_list"),
@@ -424,9 +579,12 @@ int main() {
     testOnlineTurnBudget();
     testComposerModePreserved();
     testOnlineMissionRoute();
-    testExplicitOfflineFallbacks();
     testAdminResultMapping();
     testEventConsumption();
+    testConcurrentCellEventIsolation();
+    testRetiredCorporateActivityRows();
+    testCompactionTerminalSettlement();
+    testLateStopCompactionReceipt();
     testWorkspaceRelativePaths();
     testCellHandlesAndPaths();
     testCellPendingStop();

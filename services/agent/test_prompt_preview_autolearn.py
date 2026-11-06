@@ -122,7 +122,7 @@ class TestPromptPreview(unittest.TestCase):
         self.assertFalse(out["ok"])
 
 
-    def test_check_with_me_preview_preserves_custom_prompt_without_mutators(self):
+    def test_check_with_me_preview_preserves_custom_prompt_and_stable_tool_surface(self):
         from services.agent.prompt_preview import preview_main_chat_system
 
         with mock.patch(
@@ -131,12 +131,18 @@ class TestPromptPreview(unittest.TestCase):
                           "copilot": {"work_style": "check_with_me"}},
         ):
             out = preview_main_chat_system(include_tools=True)
+        with mock.patch(
+            "services.agent.config.load_config",
+            return_value={"system_prompt": "CUSTOM GLOBAL SYSTEM",
+                          "copilot": {"work_style": "do_it"}},
+        ):
+            other = preview_main_chat_system(include_tools=True)
 
         self.assertTrue(out.get("ok"), out)
         self.assertTrue(out["system"].startswith("CUSTOM GLOBAL SYSTEM"))
-        rendered = {tool["name"] for tool in out["host_tools"]}
-        self.assertIn("describe_part", rendered)
-        self.assertFalse({"fs_write", "fs_edit", "run_shell", "undo", "new_part"} & rendered)
+        self.assertTrue(other.get("ok"), other)
+        self.assertEqual(out["host_tools"], other["host_tools"])
+        self.assertIn("describe_part", {tool["name"] for tool in out["host_tools"]})
 
     def test_tool_entry_shows_effective_defaults(self):
         from services.agent.prompt_preview import preview_tool_entry
@@ -156,6 +162,121 @@ class TestPromptPreview(unittest.TestCase):
             out = preview_tool_entry("office_read_csv")
         self.assertTrue(out.get("ok"), out)
         self.assertIn("Effective defaults when omitted: limit=500.", out["entry"])
+
+    def test_settings_matches_online_and_offline_description_dials(self):
+        from services.agent import agent_turn, config, omp_tools, tool_schemas
+        from services.agent.prompt_preview import preview_tool_entry
+        from services.agent.test_omp_tools import _context, _entry
+
+        def probe(limit=10):
+            """Original summary. Original detail."""
+            return {"limit": limit}
+
+        entries = {"probe": _entry(probe, "Original summary. Original detail.")}
+        opts = {
+            "description_override": "Custom summary. Custom detail.",
+            "schema_trim": True,
+            "param_defaults": {"limit": 23},
+            "max_calls_per_turn": 3,
+            "timeout_s": 7,
+            "prompt_note": "Use the active document.",
+        }
+        def options(_cfg, name):
+            return opts if name == "probe" else {}
+
+        with mock.patch.object(config, "get_tool_options", side_effect=options), \
+             mock.patch.object(config, "tool_max_calls_default", return_value=0), \
+             mock.patch.object(omp_tools, "_load_registry_entries", return_value=entries), \
+             mock.patch.object(agent_turn, "resolver_for", return_value=lambda name: probe if name == "probe" else None):
+            binding = next(b for b in omp_tools.build_host_tools(
+                _context(entries, categories=["probe"])) if b.name == "probe")
+            preview = preview_tool_entry("probe")
+            offline, _ = tool_schemas.render_tools_block(
+                ["probe"], resolver=lambda name: probe, budget_tokens=2000,
+                include_category_menu=False,
+            )
+            opts["schema_trim"] = False
+            full_binding = next(b for b in omp_tools.build_host_tools(
+                _context(entries, categories=["probe"])) if b.name == "probe")
+            full_preview = preview_tool_entry("probe")
+            full_offline, _ = tool_schemas.render_tools_block(
+                ["probe"], resolver=lambda name: probe, budget_tokens=2000,
+                include_category_menu=False,
+            )
+        self.assertTrue(preview["ok"], preview)
+        rendered = tool_schemas._description_block(binding.description)
+        self.assertIn(rendered, preview["entry"])
+        self.assertIn(rendered, offline)
+        self.assertNotIn("Custom detail.", binding.description)
+        self.assertNotIn("Original summary.", binding.description)
+        self.assertIn("limit=23", binding.description)
+        self.assertIn("3 call(s)", binding.description)
+        self.assertIn("7 s", binding.description)
+        full_rendered = tool_schemas._description_block(full_binding.description)
+        self.assertIn("Custom detail.", full_binding.description)
+        self.assertIn(full_rendered, full_preview["entry"])
+        self.assertIn(full_rendered, full_offline)
+
+    def test_global_defaults_and_automatic_skill_delivery(self):
+        from services.agent import agent_turn, config, omp_tools, tool_schemas
+        from services.agent.prompt_preview import preview_tool_entry
+        from services.agent.test_omp_tools import _alpha, _context, _entry
+
+        entries = {
+            "get_part": _entry(_alpha, "Inspect a part."),
+            "probe": _entry(_alpha, "Inspect a fixture."),
+        }
+        resolver = lambda name: entries[name].fn if name in entries else None
+        with mock.patch.object(config, "get_tool_options", return_value={}), \
+             mock.patch.object(config, "tool_timeout_s_default", return_value=19), \
+             mock.patch.object(config, "tool_max_calls_default", return_value=4), \
+             mock.patch.object(omp_tools, "_auto_skill_tools", return_value={
+                 "get_part": ["fixture-skill"], "probe": ["fixture-skill"],
+             }), \
+             mock.patch.object(omp_tools, "_load_registry_entries", return_value=entries), \
+             mock.patch.object(agent_turn, "resolver_for", return_value=resolver):
+            bindings = {b.name: b for b in omp_tools.build_host_tools(_context(entries))}
+            preview = preview_tool_entry("get_part")
+            deferred_preview = preview_tool_entry("probe")
+            offline, _ = tool_schemas.render_tools_block(
+                ["get_part"], resolver=resolver, include_category_menu=False,
+            )
+        active, deferred = bindings["get_part"], bindings["probe"]
+        self.assertTrue(active.active)
+        self.assertFalse(deferred.active)
+        self.assertNotIn("fixture-skill", active.description)
+        self.assertIn("fixture-skill", deferred.description)
+        self.assertIn("19 s", active.description)
+        self.assertIn("4 call(s)", active.description)
+        self.assertIn(tool_schemas._description_block(active.description), preview["entry"])
+        self.assertIn(tool_schemas._description_block(deferred.description), deferred_preview["entry"])
+        self.assertIn("19 s", offline)
+        self.assertIn("4 call(s)", offline)
+
+    def test_online_preview_and_baseline_count_only_active_bindings(self):
+        from services.agent import mission_dispatch, omp_tools, prompt_cache, roles
+        from services.agent.prompt_preview import preview_main_chat_system
+
+        active = omp_tools.HostToolBinding("active", "Active tool", {"type": "object"})
+        inactive = omp_tools.HostToolBinding(
+            "inactive", "Deferred tool", {"type": "object"}, active=False,
+        )
+        with mock.patch.object(prompt_cache, "fingerprint", return_value="fixture"), \
+             mock.patch.object(roles, "load_role", return_value=object()), \
+             mock.patch.object(mission_dispatch, "role_prompt", return_value=("system", [])), \
+             mock.patch.object(mission_dispatch, "MissionDispatch"), \
+             mock.patch.object(omp_tools, "build_host_tools", return_value=[active, inactive]):
+            composed = prompt_cache.compose_online()
+        with mock.patch.object(prompt_cache, "compose_online", return_value=composed), \
+             mock.patch.object(prompt_cache, "online_prompt", return_value=composed):
+            preview = preview_main_chat_system()
+            baseline = prompt_cache.baseline()
+        self.assertEqual([row["name"] for row in composed.host_tools], ["active"])
+        self.assertEqual(preview["meta"]["allowed_tool_count"], 1)
+        self.assertEqual(preview["meta"]["host_tool_names"], ["active"])
+        self.assertEqual(baseline["allowed_tool_count"], 1)
+        self.assertEqual(baseline["tokens"], composed.total_tokens)
+
 
     def test_tool_catalog_covers_registry_and_guidance(self):
         from services.agent.prompt_preview import tool_catalog

@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -47,6 +48,12 @@ public:
         // path, so the queue stays empty however long a call streams. Default false keeps
         // ordinary GUI/agent buffering unchanged.
         bool discardUnconsumedEvents = false;
+        // GUI startup may connect on a worker while document-free query routing
+        // must still recognize the GL thread as the primary owner.
+        std::thread::id primaryThread{};
+        // Optional terminal cancellation for this connect/spawn/hello operation.
+        // The owner keeps the flag alive until connectOrSpawn returns.
+        const std::atomic<bool>* cancelled = nullptr;
     };
 
     // Connect to the daemon for this instance key, spawning one if absent (and
@@ -95,12 +102,25 @@ public:
     // agent run streams its events instead of buffering them until the call returns. Other event
     // kinds (doc.*) still queue for drainEvents() unless Options::discardUnconsumedEvents.
     // Empty = today's buffer-only behavior.
+    // Optional terminal dispatcher cancellation survives reconnects (unlike abortPending).
+    // The flag must remain alive until call() returns.
     bool call(const std::string& method, const nlohmann::json& params,
               nlohmann::json& result, std::string& err, int timeoutMs = -1,
-              const std::function<void(const nlohmann::json&)>& onEvent = {});
+              const std::function<void(const nlohmann::json&)>& onEvent = {},
+              const std::atomic<bool>* cancelled = nullptr);
 
-    // Move any queued push events out (non-blocking; also polls the socket).
-    std::vector<nlohmann::json> drainEvents();
+    // Primary-connection call with a non-blocking mutex acquire. A contended
+    // call is not sent: deferred=true, false returned, result/err cleared.
+    // Once acquired, the normal bounded round trip runs on the calling thread.
+    bool tryCall(const std::string& method, const nlohmann::json& params,
+                 nlohmann::json& result, std::string& err, int timeoutMs,
+                 bool& deferred);
+
+    // Move queued pushes out in FIFO order without waiting for an in-flight call.
+    // GUI parsing is time-sliced; hasPendingEvents() requests another frame for
+    // the remainder. Other lanes return the full already-queued batch.
+    std::vector<nlohmann::json> drainEvents(double budgetMs = 2.0);
+    bool hasPendingEvents() const { return pendingEvents_.load(std::memory_order_acquire); }
 
     // Monotonic counter bumped on every successful reconnect (EOF/timeout drop
     // followed by a fresh connect + hello). Each reconnect lands on a NEW daemon
@@ -116,7 +136,7 @@ public:
     // call()-driven reconnect; never spawns. False when the peer is still gone or
     // refuses hello (helloError() names why; caller applies its own backoff). Bumps
     // reconnectGeneration() on success.
-    bool tryReconnect(std::string& err);
+    bool tryReconnect(std::string& err, const std::atomic<bool>* cancelled = nullptr);
 
     // Non-blocking liveness probe for the GUI frame loop. Drains any pending
     // event lines into the queue (same as drainEvents) and surfaces peer death
@@ -144,22 +164,30 @@ public:
 
 private:
     bool connectInner(const Options& opts, std::string& err);
-    bool tryConnect(std::string& err);
+    bool tryConnect(std::string& err, const std::atomic<bool>* cancelled = nullptr);
     // Close the connection the daemon closes after it refuses hello, and name the
     // refusal (code, message, hint) in err.
     void refuseHello(const nlohmann::json& error, std::string& err);
     void setHelloError(nlohmann::json error);
     // `refusal` receives the daemon's hello error object, if it answered with one.
-    bool hello(const std::string& kind, std::string& err, nlohmann::json& refusal);
+    bool hello(const std::string& kind, std::string& err, nlohmann::json& refusal,
+               const std::atomic<bool>* cancelled = nullptr);
     // Re-establish a connection invalidated by a timeout/EOF (mtx_ held by the
     // caller). Connect-only — never spawns — plus an inline hello re-handshake.
-    bool reconnectLocked(std::string& err);
+    bool reconnectLocked(std::string& err, const std::atomic<bool>* cancelled = nullptr);
     // Read lines until a response with `id` arrives; queue (or, on a discarding
     // lane, drop) event lines seen on the way. timeoutMs >= 0 bounds the whole
     // wait; on timeout the connection is closed (mid-response, unusable) and
     // false/err returned. timeoutMs < 0 waits until the response, EOF or abort.
     bool readResponse(int id, nlohmann::json& out, std::string& err, int timeoutMs,
-                      const std::function<void(const nlohmann::json&)>& onEvent = {});
+                      const std::function<void(const nlohmann::json&)>& onEvent = {},
+                      const std::atomic<bool>* cancelled = nullptr);
+    bool callLocked(const std::string& method, const nlohmann::json& params,
+                    nlohmann::json& result, std::string& err, int timeoutMs,
+                    const std::function<void(const nlohmann::json&)>& onEvent = {},
+                    const std::atomic<bool>* cancelled = nullptr);
+    void retainEventLine(std::string&& line);
+    void pollEventsLocked();
     // Queue an unconsumed push for drainEvents(), or drop it on a discarding lane.
     void retainEvent(nlohmann::json&& msg);
     EngineClient* backgroundClient();
@@ -169,7 +197,13 @@ private:
     IpcConn conn_;
     std::mutex mtx_;                     // primary round trips + event queue access
     std::mutex socketMtx_;               // socket replacement/close vs teardown shutdown
-    std::vector<nlohmann::json> events_;
+    struct PendingEvent {
+        std::string line;
+        nlohmann::json parsed;
+    };
+    std::deque<PendingEvent> events_;
+    std::atomic<bool> pendingEvents_{false};
+    bool pollLimited_ = false;
     nlohmann::json serverInfo_;
     mutable std::mutex helloErrMtx_;     // guards helloError_ only
     nlohmann::json helloError_;          // see helloError()

@@ -34,9 +34,15 @@ struct FmRowRect { ImVec2 mn, mx; };
 // ui::coloredRowWash). Pass a section/element color for color-coded rows; leave null for the
 // neutral app-accent wash every row shares. Selection (every row kind alike) is a soft accent fill
 // plus a crisp accent glow border, painted over the wash.
-FmRowRect fmRowPill(bool selected = false, const float* tint = nullptr);
+// `height` > 0 overrides the default frame-height row (taller rows, e.g. the Explorer's document
+// rows that carry a thumbnail); the pushed FramePadding is unchanged.
+FmRowRect fmRowPill(bool selected = false, const float* tint = nullptr, float height = 0.0f);
 void      fmRowPillEnd(const FmRowRect& r, bool selected = false);
+// The same frosted base + accent wash + selection/hover treatment as a row pill, for a free-standing
+// card rect (Explorer tiles). Draw-only: the caller owns the hit item and passes its hover state.
+void      fmCardPaint(ImVec2 mn, ImVec2 mx, bool selected, bool hovered, float roundingDp = 6.0f);
 void      fmRowStripeReset();
+void      fmRowStripeSkip(int count);
 
 // 16px atlas icon drawn as its own item (use before a TreeNodeEx that HAS a chevron; follow with
 // SameLine(0, 4*uiScale)). Falls back to `fallback` text when the atlas lacks the glyph.
@@ -60,6 +66,7 @@ bool fmSectionDividerAddButton(const char* label, const char* btnId, const char*
 
 // Collapsible section header: centered label + hairlines with an end-of-line chevron. The whole row
 // toggles *open (returns *open). rightClicked, if non-null, reports a right-click for a context menu.
+// open == nullptr draws the same titled rule with no chevron and no toggle (returns false).
 bool fmSectionDividerCollapse(const char* label, bool* open, bool* rightClicked = nullptr);
 
 // 24px square glass icon button (FeatureManager top-toolbar style: resting 0.22 pill, 0.38 on
@@ -162,19 +169,18 @@ bool featureSelectAll(AppState& st);
 //     asSolid=true sews a mesh import into a B-rep solid (the dialog path prompts the user for this).
 //   - featureTreeOpenDialog: native "Open..."/"Import..." dialog -> open; returns the opened path or
 //     "". For a mesh file it asks "import as solid?" first.
-//   - featureTreeSaveDoc:    Save (saveAs=false) / Save As (saveAs=true); returns the saved path or "".
 //   - featureTreeActivePath: the active doc's on-disk path ("" if never saved).
 bool        featureTreeOpenPath(AppState& st, const std::string& path, bool asSolid = false);
 std::string featureTreeOpenDialog(AppState& st);
 bool        featureTreeOpenDrawingPath(AppState& st, const std::string& path);
-std::string featureTreeSaveDoc(AppState& st, bool saveAs);
 std::string featureTreeActivePath();
-// Silent save of the active DocMirror doc to an absolute .step+ path (no dialog). Used by the
-// agent run-finish path to auto-save a freshly named part. No-op if no doc / empty path / worker
-// down. On success updates the active tab's path, clears dirty, and records Recent (async).
-// When requireNonEmpty is true, refuses (toast "Not saving: part is empty") unless the mirrored
-// tree has at least one solid feature/body — keeps zero-progress agent runs from writing empties.
-void featureTreeSaveDocToPath(AppState& st, const std::string& path, bool requireNonEmpty = false);
+// Keep the current tree path synchronized when a save of that tab completes.
+void featureTreeSetSavedPath(AppState& st, const std::string& docId, const std::string& path);
+// "Opening part.step+… 42 s" for the oldest document open still building ("" when none).
+std::string featureTreeOpenProgress();
+
+// Explicitly discard a conflicting legacy mirror and replace it with its published snapshot.
+void reloadLegacyHandoffConflict(AppState& st, const std::string& docId, const std::string& path);
 
 // Open a component's source part in a document tab. Dedups by canonical path: if a tab
 // already has that file open, switches to it; otherwise requests a new open. Used by the
@@ -182,12 +188,10 @@ void featureTreeSaveDocToPath(AppState& st, const std::string& path, bool requir
 // component context menu.
 void openComponentPart(AppState& st, const std::string& absPath);
 
-// Live MCP handoff: a separate process (the Chudware MCP server Claude drives) builds parts in
-// its OWN engine, so its docs are invisible here. It publishes the part it's working on to
-// %APPDATA%\Chudware\handoff\ (live.step + a live.json carrying a monotonically rising "rev").
-// Call this once per frame: when the rev changes it opens/refreshes a single "AI Live" tab from
-// that file so the user SEES the part the AI is building. Cheap (an mtime check most frames);
-// a no-op when the worker isn't up, an in-app run is active, or there's nothing new. Never throws.
+// Legacy in-process handoff: poll explicitly presented native documents from
+// the MCP server and keep their existing views up to date without interrupting
+// user edits. Unmarked old control files are not presentation requests.
+// No-op when the worker isn't up, an in-app run is active, or nothing changed.
 void        pollAiCadHandoff(AppState& st);
 
 }  // namespace ui

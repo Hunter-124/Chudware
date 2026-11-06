@@ -28,14 +28,14 @@ Per `docs/design/AGENT_DESIGN_PIPELINE.md` §5, this contract freezes exactly fi
    ledger, never from handoff prose** (§5). The universal rule: a value that exists
    only in a model's chat does not exist.
 3. **How the six stages nest inside `phases.py`** and reuse its gates (§6).
-4. **Effort / auto-mode hooks** — which stages / councils / helpers each scaffold level
+4. **Effort / auto-mode hooks** — which stages / helpers each scaffold level
    enables, expressed in terms of the existing `aicad.effort/1` knobs (§7).
 5. **Advisor trigger bindings** — geometry-kind → helper set, expressed as a mapping onto
    existing `aicad.trigger/1` ids (§8).
 
 Out of scope for this contract (built on top of it): the `feature_architect` /
 `geometry_designer` / `linkage_planner` roles, the overseer reroute loop, the
-diagnostic-advisor expansion, the council policy engine, delegation recursion, and the
+diagnostic-advisor expansion, delegation recursion, and the
 auto-mode classifier itself. This contract freezes the **seams** those components build
 against.
 
@@ -237,23 +237,20 @@ feature-flagged, same pattern as the existing SPECIFY/PLAN gates).
 
 ## §6 How the six stages nest inside `phases.py`
 
-The six stages refine the existing `SPECIFY → ORGANIZE → PLAN → BUILD` span (doc §2). They
-are wired as **flagged phases** — the exact ORGANIZE precedent: new `Phase`
-members inserted into `PHASE_ORDER`, skipped by `next_phase` unless the flag is on, so the
-existing pipeline is byte-for-byte unchanged when the flag is off.
+The six stages refine the existing `SPECIFY → PLAN → BUILD` span (doc §2). They
+are wired as **flagged phases**: new `Phase` members are inserted into
+`PHASE_ORDER` and skipped by `next_phase` unless the flag is on.
 
 ```
 INTAKE → [CLARIFY] → SPECIFY
            → [DECOMPOSE] → [GEOMETRY] → [LINKAGE] → [BUILDPATH]   (design-pipeline stages)
-           → [ORGANIZE] → PLAN → BUILD → VERIFY → [CORRECT ↺] → DELIVER
+           → PLAN → BUILD → VERIFY → [CORRECT ↺] → DELIVER
 ```
 
 - Flag: `PipelineFlags.design_pipeline` (env `CHUDWARE_DESIGN_PIPELINE`), **default False**.
-- When OFF: `next_phase(SPECIFY)` returns the next enabled phase exactly as today
-  (`ORGANIZE` when the org flag is on, else `PLAN`). The four new phases are `continue`d
-  over — no structural change, current phase tests stay green.
+- When OFF: `next_phase(SPECIFY)` returns `PLAN`, skipping the four new phases.
 - When ON: the machine visits DECOMPOSE → GEOMETRY → LINKAGE → BUILDPATH after SPECIFY and
-  before ORGANIZE/PLAN, each enforcing its §5 gate.
+  before PLAN, each enforcing its §5 gate.
 - Stage 0 (INTENT CAPTURE) maps to the existing INTAKE/SPECIFY phases (no new phase).
   Stage 4 (BUILD-PATH) writes `build_node` events that the existing PLAN phase compiles
   into the buildgraph; Stage 5 (EXECUTION) is the existing BUILD phase. The design-pipeline
@@ -269,22 +266,19 @@ its lowercase name into the ledger `stage_log`, so mission status stays a pure l
 
 The pipeline's depth is governed by the existing `aicad.effort/1` knobs (advisor.md §23) —
 this contract adds no new dial. The binding below says which effort level enables which
-stages / councils / helpers. **Local tiers default to the full scaffold; frontier tiers dial
+stages / helpers. **Local tiers default to the full scaffold; frontier tiers dial
 it down** (the inverted deliberation dial, §8 addendum: local=`full`, frontier=`minimal`).
 
-| effort `deliberation` | design-pipeline stages | councils (§8) | proactive helpers (§8 triggers) |
-|---|---|---|---|
-| `full` (local default) | all four stages mandatory, each gated | wide (per §22: completeness critic on Stage 1, regen-stability on Stage 3, build-strategy on Stage 4) | all trigger packs auto-injected |
-| `standard` | all four stages, gates enforced | risk-gated (council only where the council knob warrants) | triggers fire on match |
-| `minimal` (frontier default) | stages are single-pass checkpoints; a model may emit rung D directly (validators still run) | narrow / single | helpers offered, model may decline |
+| effort `deliberation` | design-pipeline stages | proactive helpers (§8 triggers) |
+|---|---|---|
+| `full` (local default) | all four stages mandatory, each gated | all trigger packs auto-injected |
+| `standard` | all four stages, gates enforced | triggers fire on match |
+| `minimal` (frontier default) | stages are single-pass checkpoints; a model may emit rung D directly (validators still run) | helpers offered, model may decline |
 
 The mapping is expressed against existing knobs — nothing new is invented:
 - **`deliberation` / `ladder`** (§22, `mandatory|optional|off`) gate whether the four
   design-pipeline stages run as discrete gated rungs or collapse to a single checkpoint.
   `design_pipeline` flag on + `ladder=mandatory` = full six-stage run.
-- **`council` / `council_seats`** (§19/§23) gate the per-stage councils (completeness /
-  regen-stability / build-strategy). The council engine is separate; this contract only
-  binds *which* stages offer a council slot.
 - **`delegation_depth` / `worker_fan_out`** (§12/§23) govern Stage 5 fan-out (workers over
   independent DAG branches) — unchanged from the existing buildgraph execution.
 
@@ -356,7 +350,7 @@ Restated from doc §6 as contract invariants every DP task must honour:
 2. Helpers (§8) are **offered, not imposed** — a frontier model may decline.
 3. **Local default = full scaffold**; frontier default = minimal; the user overrides in
    Advanced mode (§7 / §23).
-4. Council breadth (§8/§19) and delegation depth (§12) are **config, per-tier**, not
+4. Delegation depth (§12) is **config, per-tier**, not
    hard-coded in the pipeline.
 5. The pipeline **adds context and speed, never a fixed modeling path** — two models given
    the same brief may build different valid parts; the pipeline judges by the ledger + the

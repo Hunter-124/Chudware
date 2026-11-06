@@ -35,7 +35,7 @@
 #include "doc/dxf.h"
 #include "doc/pdfvec.h"
 #include "doc/svgvec.h"
-#include "doc/session.h"  // OpError, doc_live_source
+#include "doc/session.h"  // OpError, doc_flat_export_snapshot
 
 using nlohmann::json;
 
@@ -512,22 +512,17 @@ json export_drawing(const std::string& doc_id, const std::string& path,
 json export_flat_dxf(const std::string& doc_id, const std::string& path, const std::string& fmt) {
     if (fmt != "dxf" && fmt != "dwg" && fmt != "pdf")
         throw OpError("invalid_op", "format must be 'dxf', 'dwg', or 'pdf'", {{"format", fmt}});
-    // Fresh compile of the live source part (mirrors flat_pattern_for_session's fresh
-    // cache so sm_flat_pattern repopulates the flat side-channel).
-    json live = doc_live_source(doc_id);
-    if (!live.is_object() || !live.contains("tree"))
-        throw OpError("unknown_doc", "export_flat_dxf: no open document '" + doc_id + "'",
-                      {{"doc_id", doc_id}});
-    CompileResult res = compile_document(live["tree"], live.value("env", json::object()));
-    if (res.sheet_metal_flat.empty() || res.shapes.empty())
+    // Capture just the saved/current flat shape and metadata under the session
+    // lock. Recompiling from the source tree here discarded the restored build
+    // state and could take minutes after reopening a complex part.
+    TopoDS_Shape flat_shape;
+    json flat_rec;
+    doc_flat_export_snapshot(doc_id, flat_shape, flat_rec);
+    if (flat_shape.IsNull() || !flat_rec.is_object())
         throw OpError("invalid_op",
                       "export_flat_dxf: the part has no flat pattern — add a Flatten "
                       "(sm_flat_pattern) feature to a sheet-metal part first",
                       {{"reason", "no flat pattern"}, {"doc_id", doc_id}});
-    // Use the LAST flat record (most recent Flatten) — json preserves insertion order.
-    json flat_rec;
-    for (auto it = res.sheet_metal_flat.begin(); it != res.sheet_metal_flat.end(); ++it)
-        flat_rec = it.value();
     Vec3 n_base{0, 0, 1};
     if (flat_rec.contains("n_base") && flat_rec["n_base"].is_array() &&
         flat_rec["n_base"].size() == 3)
@@ -540,7 +535,7 @@ json export_flat_dxf(const std::string& doc_id, const std::string& path, const s
     // faces (the fused base block + developed strips arrive as SEPARATE coplanar faces)
     // so the broad face is the WHOLE developed blank — its outer wire is the true OUTLINE
     // and its inner wires the CUTS. (build123d's .clean() does the same in the oracle.)
-    const TopoDS_Shape flat_solid = ::geom::unify_same_domain(res.shapes.back());
+    const TopoDS_Shape flat_solid = ::geom::unify_same_domain(flat_shape);
     double flat_area = 0.0;
     TopoDS_Face bf = broad_face(flat_solid, n, flat_area);
     if (bf.IsNull())

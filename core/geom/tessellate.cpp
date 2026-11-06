@@ -16,11 +16,13 @@
 #include <GCPnts_TangentialDeflection.hxx>
 #include <GeomAbs_CurveType.hxx>
 #include <GeomAbs_SurfaceType.hxx>
+#include <IMeshTools_Parameters.hxx>
 #include <Poly_PolygonOnTriangulation.hxx>
 #include <Poly_Triangle.hxx>
 #include <Poly_Triangulation.hxx>
 #include <TopAbs.hxx>
 #include <TopExp.hxx>
+#include <TopExp_Explorer.hxx>
 #include <TopLoc_Location.hxx>
 #include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
 #include <TopTools_IndexedMapOfShape.hxx>
@@ -30,7 +32,9 @@
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
 #include <TopoDS_Vertex.hxx>
+#include <gp_Circ.hxx>
 #include <gp_Dir.hxx>
+#include <gp_Elips.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Trsf.hxx>
 
@@ -129,6 +133,48 @@ double bbox_relative_deflection(const TopoDS_Shape& shape, double rel, double fl
     return fallback;
 }
 
+// OCCT's default minimum edge size is one tenth of the linear deflection.
+// Highly segmented spline surfaces can make angular refinement repeatedly
+// split near-coincident nodes until Delaunay insertion dominates the entire
+// build. A quarter of the same deflection is still below the requested chord
+// tolerance, but avoids most of that runaway refinement.
+//
+// Leave analytic-only shapes exactly as before. On mixed/spline shapes, cap
+// the minimum to half the angular step of any circular or elliptical edge;
+// otherwise a coarse chord tolerance could visibly facet a small round detail.
+// AdjustMinSize below also lets OCCT lower it for short edges.
+double spline_mesh_min_size(const TopoDS_Shape& shape, double lin, double ang) {
+    try {
+        bool has_spline = false;
+        for (TopExp_Explorer ex(shape, TopAbs_FACE); ex.More(); ex.Next()) {
+            if (BRepAdaptor_Surface(TopoDS::Face(ex.Current())).GetType() ==
+                GeomAbs_BSplineSurface) {
+                has_spline = true;
+                break;
+            }
+        }
+        if (!has_spline) return 0.0;
+
+        double min_size = 0.25 * lin;
+        const double default_min = 0.1 * lin;
+        for (TopExp_Explorer ex(shape, TopAbs_EDGE); ex.More(); ex.Next()) {
+            const TopoDS_Edge edge = TopoDS::Edge(ex.Current());
+            if (BRep_Tool::Degenerated(edge)) continue;
+            const BRepAdaptor_Curve curve(edge);
+            const auto type = curve.GetType();
+            if (type == GeomAbs_Circle)
+                min_size = std::min(min_size, 0.5 * ang * curve.Circle().Radius());
+            else if (type == GeomAbs_Ellipse)
+                min_size = std::min(min_size, 0.5 * ang * curve.Ellipse().MinorRadius());
+            if (min_size <= default_min) return 0.0;
+        }
+        return min_size;
+    } catch (...) {
+        // Preserve the original mesher behavior for malformed/unsupported edges.
+        return 0.0;
+    }
+}
+
 }  // namespace
 
 // Size-relative default linear deflection. A fixed
@@ -199,12 +245,20 @@ DisplayDeflections mesh_body(const TopoDS_Shape& shape, double lin_deflection, d
                                : kDisplayMaxAngularDeflection;
     const double eff_lin =
         (lin_deflection > 0.0) ? lin_deflection : auto_linear_deflection(shape);
+    IMeshTools_Parameters params;
+    params.Deflection = eff_lin;
+    params.Angle = eff_ang;
+    params.InParallel = Standard_True;
+    const double min_size = spline_mesh_min_size(shape, eff_lin, eff_ang);
+    if (min_size > 0.0) {
+        params.MinSize = min_size;
+        params.AdjustMinSize = Standard_True;
+    }
     // BRepMesh is face-incremental: already matching triangulations are retained.
     // The shape-taking constructor performs the mesh; a second Perform repeats
     // topology/deflection validation even when every triangulation is reusable.
     const auto start = std::chrono::steady_clock::now();
-    BRepMesh_IncrementalMesh mesher(shape, eff_lin, Standard_False,
-                                    eff_ang, Standard_True);
+    BRepMesh_IncrementalMesh mesher(shape, params);
     g_tess_mesh_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - start).count();
     ++g_tess_bodies;

@@ -66,6 +66,34 @@ def test_fatigue_summarize_regimes():
     assert out["cycles"] == out["theories"]["goodman"]["cycles"]
 
 
+def test_kf_adjusts_alternating_equivalent_stress_after_mean_correction():
+    # Zero-based cycle: nominal sa=100, sm=100 MPa, Sut=400.
+    # Goodman gives 100/(1-100/400); Kf=1.5 applies to sa, not sm.
+    nominal = 100.0 / (1.0 - 100.0 / 400.0)
+    theories = {"goodman": {"sa_eq_mpa": nominal}}
+    base = fa.fatigue_summarize(theories, 200.0, 400.0, kf=1.0)
+    notched = fa.fatigue_summarize(theories, 200.0, 400.0, kf=1.5)
+    assert base["regime"] == "infinite"
+    assert notched["theories"]["goodman"]["sa_eq_mpa"] == pytest.approx(200.0)
+    assert notched["fos_endurance"] == pytest.approx(1.0)
+    stronger = fa.fatigue_summarize(theories, 200.0, 400.0, kf=1.8)
+    assert stronger["regime"] == "finite"
+    assert stronger["cycles"] == round(fa.sn_life(nominal * 1.8, 200.0, 400.0))
+    assert stronger["fos_endurance"] == round(200.0 / (nominal * 1.8), 4)
+    assert theories["goodman"]["sa_eq_mpa"] == nominal
+
+
+@pytest.mark.parametrize("kf", [0.0, -1.0, 0.999, float("nan"), float("inf"), True])
+def test_fatigue_summary_rejects_impossible_kf(kf):
+    with pytest.raises(ValueError, match="kf"):
+        fa.fatigue_summarize({"goodman": {"sa_eq_mpa": 100}}, 200, 400, kf=kf)
+
+
+def test_kf_does_not_report_a_fatigue_adjustment_as_static_overload():
+    result = fa.fatigue_summarize({"goodman": {"sa_eq_mpa": 250}}, 200, 400, kf=2)
+    assert result["regime"] == "finite"
+
+
 @pytest.mark.parametrize(
     "call,args",
     [(fa.marin_ka, (400.0, 9)),

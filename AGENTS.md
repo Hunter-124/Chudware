@@ -18,8 +18,8 @@ drawings, sheet metal, CAM, ECAD/firmware, FEA/CFD, and sourcing.
   `libchudware`, over local IPC through the C++ seam in `services/worker/` and
   `services/ipc/`.
 - hostd runs the persistent Python services worker (`services/worker_main.py`). Online
-  agent turns run in the embedded Chudcode runtime (`chud --mode rpc`), hosted by
-  `services/agent/chudcode_host.py`; `core/agent/run.cpp` is the offline-safe fallback.
+  agent turns run in the official OMP runtime (`omp --mode rpc`), hosted by
+  `services/agent/omp_host.py`; `core/agent/` holds only provider/auth/http/config helpers.
 
 Read [ARCHITECTURE.md](ARCHITECTURE.md) for components and data flow,
 [contracts/](contracts/README.md) for the frozen interface seams, and
@@ -31,7 +31,7 @@ Read [ARCHITECTURE.md](ARCHITECTURE.md) for components and data flow,
 |------|----------|
 | `core/` | C++ kernel → `libchudware` (geom, doc, sketch, solver, cam, sim, ecad, mate, parts, agent, util, api, tests) and `chudware-hostd` (`core/hostd/`) |
 | `host/` | GUI (native + WASM): ribbon, feature tree, property panels, sketcher, copilot chat (`host/src/ui/`), OpenGL renderer (`host/src/render/`) |
-| `services/` | C++ routing/IPC seam (`worker/`, `ipc/`, compiled into `host/`); Python: `worker_main.py`, `agent/` (Chudcode session host, host tools, roles/missions), `mcp/` (MCP server), `installer/`, domain helpers (`ecad/`, `sim/`, `structural/`, `piping/`, `formats/`, `plm/`, …). Imports use `services.*` names |
+| `services/` | C++ routing/IPC seam (`worker/`, `ipc/`, compiled into `host/`); Python: `worker_main.py`, `agent/` (OMP session host, host tools, roles/missions), `mcp/` (MCP server), `installer/`, domain helpers (`ecad/`, `sim/`, `structural/`, `piping/`, `formats/`, `plm/`, …). Imports use `services.*` names |
 | `contracts/` | Frozen, append-only interface contracts |
 | `corpora/`, `fixtures/`, `samples/` | Test fixtures (canonical `corpora/...` paths) and sample parts |
 | `docs/` | Design docs, references, developer notes, generated manual (`docs/README.md` indexes it) |
@@ -49,25 +49,29 @@ Subsystem `AGENTS.md` files exist under `services/agent/`, `services/mcp/`,
 
 ```bash
 PYTHON=python3.13 scripts/provision_venv.sh pytest              # .venv-mcp (extra args go to pip)
+cmake -S core -B core/build-occt-linux -G Ninja -DCMAKE_BUILD_TYPE=Release -DCHUDWARE_WITH_OCCT=ON
 ./build.sh all                                                   # core, GUI, daemon
 ./build.sh                                                       # GUI only → host/build-linux/bin/chudware
 .venv-mcp/bin/python scripts/check.py                            # fast source/audit gate
-CHUDWARE_GATE_PYTHON=.venv-mcp/bin/python bash scripts/gate.sh   # full Linux gate
-.venv-mcp/bin/python -X utf8 -m pytest services/agent -q         # one Python suite
-ctest --test-dir core/build-linux                                # C++ core tests (gate tree)
+scripts/testbox.py                                               # isolated change-selected tests
+scripts/testbox.py --suite agent                                 # isolated named suite
+scripts/testbox.py --gate                                        # full Linux gate
 ```
 
-- `scripts/gate.sh` is the authoritative Linux gate; its header lists the stages. A change
-  must leave it green. Environment SKIPs (no OCCT, no `xvfb-run`, no emsdk) are not
-  failures; `CHUDWARE_GATE_STRICT=1` makes them fatal.
+- Verify a change with the suite(s) for the touched area (or `scripts/testbox.py`
+  change-selected mode); run the full gate only before a release or when tracking down
+  breakage. See [Running tests](CONTRIBUTING.md#running-tests) for isolation and the
+  suite list (`geom`, `sketch`, `drawing`, `assembly`, `mesh_fea`, `sim`, `topopt`,
+  `cam_mfg`, `ecad`, `formats`, `agent`, `parts`, `platform`, `render`, `gui`, `infra`).
 - `build.sh` modes: `default|app|core|daemon|wasm|all|stage|clean` (see its header).
   Windows uses the `windows-*` CMake presets (`docs/reference/BUILD_WINDOWS.md`).
-- CMake presets (`CMakePresets.json`) build into `build/<preset>`
-  (`ctest --test-dir build/<preset>/core`). The gate, the GUI, and hostd consume
-  `core/build-linux` and `core/build-occt-linux` instead; a preset tree is not read by them.
+- CMake presets (`CMakePresets.json`) build into `build/<preset>`. The gate, GUI, and
+  hostd consume `core/build-linux` and `core/build-occt-linux` instead; a preset tree
+  is not read by them.
 - Host only: `cmake -S host -B host/build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release &&
-  ninja -C host/build-linux Chudware`. CEF defaults ON and needs the SDK under
-  `extern/cef/` (`scripts/fetch_cef_posix.sh`); `-DCHUDWARE_ENABLE_CEF=OFF` builds without it.
+  ninja -C host/build-linux Chudware`. CEF defaults ON for native Linux and Windows
+  and needs the SDK under `extern/cef/` (`scripts/fetch_cef_posix.sh`);
+  `-DCHUDWARE_ENABLE_CEF=OFF` builds without it. macOS and WASM force CEF off.
 - GUI verification: the headless screenshot harness, `CHUDWARE_SHOT=<scenario>` under
   `xvfb-run` (set `CHUDWARE_SHOT_HEADED=1` to see a real window).
 - `requirements.txt` pins the Python runtime.

@@ -56,8 +56,9 @@ a source file.
      the radius means you fitted a chamfer or two surfaces — re-aim, do not proceed)
    - `measure_between` for every seat/shoulder offset, `measure` for a colour-coded readout.
 5. **Place on those numbers.** Save each source as `.step+`, then `new_assembly` →
-   `asm_add_component(path, fixed=True)` for the frame → `asm_add_component(path, at=...,
-   rotate=..., angle=...)` for the wheel with the pose computed from the two fitted axes
+   `asm_add_component(path=saved_base_path, fixed=True, doc_id=assembly_id)` for the frame →
+   `asm_add_component(path=wheel_path, at=..., rotate=..., angle=..., doc_id=assembly_id)`
+   for the wheel with the pose computed from the two fitted axes
    (rotate `axis_dir`→`axis_dir` first, then translate `axis_point`→`axis_point`).
    Prefer `asm_mate("concentric", ...)` + `asm_mate("coincident", ...)` and let the solver own
    the pose — a mated component is stamped `placement_source: "mate"`, a raw pose
@@ -69,9 +70,10 @@ a source file.
      axis, seat face gap ≈ 0).
    - `list_world_bodies()` / `describe_assembly()` — every body's world bbox inside the
      expected envelope, and every `placement_source` accounted for.
-8. **Only then export.** `save_part()` for the editable deliverable, `export_part(fmt=...)`
-   for interchange. A `placement_unverified` warning in the reply means step 7 has not run
-   since the last change — go back, do not ship.
+8. **Only then export.** Agent edits persist automatically unless human edits are pending;
+   use `save_part(path=...)` for an explicit editable destination and `export_part(fmt=...)`
+   for interchange. A `placement_unverified` warning means step 7 has not run since the
+   last change — go back, do not ship.
 
 ## Assembled mechanism motion
 
@@ -132,3 +134,4 @@ a source file.
 - `cad_skill("edit-assembly")` (interface-first mating), `cad_skill("source-parts")`
   (catalog hardware)
 - `cad_guide('assembly')`, `cad_guide('verify')`
+

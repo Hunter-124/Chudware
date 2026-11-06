@@ -8,6 +8,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
@@ -20,6 +21,8 @@ namespace render {
 
 class Overlays {
 public:
+    // Requires a current GL context; shader programs are linked before the first frame.
+    Overlays();
     ~Overlays();
 
     // (Re)build GPU buffers from the document tessellation. Requires a current GL context.
@@ -55,8 +58,8 @@ public:
     void drawFaceWash(const Renderer::CameraXform& cam,
                       const std::vector<uint64_t>& faceKeys, const float rgba[4]);
 
-    // Wash EVERY face of one body with an explicit RGBA (interference view body tints). Iterates
-    // the face buffers whose packed key high-word == bodyId; no-op if the body isn't tessellated.
+    // Wash EVERY face of one body with an explicit RGBA (interference view body tints). Uses the
+    // body's precomputed face ranges; no-op if the body isn't tessellated.
     void drawBodyWash(const Renderer::CameraXform& cam, uint32_t bodyId, const float rgba[4]);
 
     // Draw a flat batch of world-space line segments (flat [x0,y0,z0, x1,y1,z1, …] — every 2 verts is
@@ -72,6 +75,10 @@ public:
     void drawCamSegments(const Renderer::CameraXform& cam, const std::vector<float>& xyz,
                          const std::vector<float>& endTimes, double playTime,
                          bool progressActive, const float rgba[4], float lineWidth);
+    // Scope the classified path/direction draws to a producer generation. The generation changes
+    // whenever any backplot vector is rebuilt, including in-place rebuilds at the same capacity.
+    void beginCamFrame(uint64_t generation);
+    void endCamFrame();
 
     // Fixed GPU geometry translated to the current CAM tool pose in the shader. The cutter and
     // spindle are separate opacity tiers so the marker stays legible without rebuilding triangle
@@ -89,8 +96,8 @@ public:
     // Persistent simulation geometry. beginSimulationFrame scopes the cache to the active
     // document and SimManager geometry generation; a scope/generation change releases every old
     // batch before any new draw. batchKey is a caller-stable identity for one logical source batch.
-    // sourceRevision=0 fingerprints the supplied vertices (for on-demand setup previews);
-    // non-zero revisions avoid re-scanning SimManager's already-versioned mesh/result caches.
+    // sourceRevision=0 compares an exact retained payload after a cheap pointer/size/sample check;
+    // non-zero revisions avoid scanning SimManager's already-versioned mesh/result caches.
     void beginSimulationFrame(uint64_t generation, uint64_t documentScope);
     void drawSimulationSegments(const Renderer::CameraXform& cam, uint64_t batchKey,
                                 const std::vector<float>& xyz, const float rgba[4],
@@ -113,7 +120,8 @@ public:
     // Restrict the following draws to a screen sub-rectangle of the target image, given as
     // fractions of the image (u right, v DOWN; 0..1). Used to keep scene-scale setup overlays
     // (flow tunnel planes/arrows) inside the viewport's clear region so they never streak behind
-    // the glass panes. Saves the caller's scissor state; endScreenClip() restores it. No nesting.
+    // the glass panes. Renderer::beginOverlay establishes disabled scissoring; endScreenClip()
+    // restores that baseline. No nesting.
     void beginScreenClip(const Renderer::CameraXform& cam, float u0, float v0, float u1, float v1);
     void endScreenClip();
 
@@ -123,10 +131,33 @@ private:
     // Bind prog_ + upload the per-frame camera/clip uniforms shared by every draw path.
     void bindCommon(const Renderer::CameraXform& cam);
 
-    // vbo here is NON-owning: it references the body's shared position VBO (bodyVbos_), uploaded
-    // once per body instead of once per face. vao + ebo are owned by the FaceBuf.
-    struct FaceBuf { unsigned int vao = 0, vbo = 0, ebo = 0; int idxCount = 0; };
-    struct EdgeBuf { unsigned int vao = 0, vbo = 0; int vertCount = 0; };
+    struct FaceBuf { size_t body = 0, firstIndex = 0; int idxCount = 0; };
+    struct EdgeBuf { size_t body = 0; int firstVertex = 0, vertCount = 0; };
+    struct BodyBuf {
+        unsigned int vao = 0, vbo = 0, ebo = 0;
+        std::vector<int> faceCounts;
+        std::vector<const void*> faceOffsets;
+    };
+    void appendFaceRange(const FaceBuf& face);
+    void drawFaceRanges(const BodyBuf& body, const std::vector<int>& counts,
+                        const std::vector<const void*>& offsets);
+    void flushFaceRanges(size_t body);
+
+    struct SourceStamp {
+        const float* data = nullptr;
+        size_t size = 0;
+        uint64_t sample = 0;
+        std::vector<float> snapshot;
+    };
+    static bool updateSourceStamp(SourceStamp& stamp, const std::vector<float>& values);
+    struct GeometryBuf {
+        unsigned int vao = 0, vbo = 0, primitive = 0;
+        const std::vector<float>* source = nullptr;
+        SourceStamp content;
+        uint64_t generation = 0, lastUse = 0;
+    };
+    GeometryBuf& prepareGeometryBuffer(const std::vector<float>& xyz, unsigned int primitive);
+    void clearGeometryBuffers();
 
     struct SimulationBuf {
         unsigned int vao = 0, vbo = 0, primitive = 0;
@@ -135,6 +166,7 @@ private:
         int vertCount = 0;
         uint64_t sourceRevision = 0;
         uint64_t lastFrame = 0;
+        SourceStamp positions, normals, colors;
     };
     SimulationBuf* prepareSimulationBuffer(uint64_t batchKey, unsigned int primitive,
                                            const std::vector<float>& xyz,
@@ -153,7 +185,9 @@ private:
     int uLitClipCount_ = -1, uLitClipN_ = -1, uLitClipOff_ = -1;
     unsigned int vao_ = 0, vbo_ = 0;  // scratch buffer for single-vertex point draws
     unsigned int segVao_ = 0, segVbo_ = 0;  // dynamic buffer for line batches
-    unsigned int triVao_ = 0, triVbo_ = 0;  // dynamic buffer for triangle batches
+    std::array<GeometryBuf, 16> geometryBufs_;
+    uint64_t geometryUse_ = 0, camGeneration_ = 0;
+    bool camFrameActive_ = false;
     unsigned int camMarkerVao_ = 0, camMarkerVbo_ = 0;  // fixed CAM tool/spindle geometry
     // Uniform locations, cached once after link (queried by string per draw call before).
     int uMVP_ = -1, uColor_ = -1, uOffset_ = -1;
@@ -162,7 +196,10 @@ private:
     std::unordered_map<uint64_t, FaceBuf> faces_;
     std::unordered_map<uint64_t, EdgeBuf> edges_;
     std::unordered_map<uint64_t, std::array<float, 3>> verts_;
-    std::vector<unsigned int> bodyVbos_;  // owns the per-body shared position VBOs (FaceBuf.vbo refs)
+    std::vector<BodyBuf> bodies_;
+    std::unordered_map<uint32_t, size_t> bodyIndices_;
+    std::vector<int> faceBatchCounts_;
+    std::vector<const void*> faceBatchOffsets_;
     std::unordered_map<uint64_t, SimulationBuf> simulationBufs_;
     uint64_t simulationGeneration_ = 0;
     uint64_t simulationDocumentScope_ = 0;
@@ -182,10 +219,7 @@ private:
     int clipCount_ = 0;
     float clipNormals_[3][3] = {{1,0,0},{0,1,0},{0,0,1}};
     float clipOffsets_[3] = {0,0,0};
-    // beginScreenClip/endScreenClip saved scissor state.
     bool screenClipActive_ = false;
-    bool screenClipPrevEnabled_ = false;
-    int screenClipPrevBox_[4] = {0, 0, 0, 0};
 };
 
 }  // namespace render

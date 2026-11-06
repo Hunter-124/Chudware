@@ -52,6 +52,7 @@ def test_mr_search_parses_result_anchors(mr_mod, monkeypatch):
 
     assert len(hits) == 2
     assert all(h["ok"] is True and h["site"] == "marcorubber" for h in hits)
+    assert all(h["kind"] == "page" and h["sku"] is None for h in hits)
 
     first = hits[0]
     assert first["title"] == "Viton O-ring Products - Check Stock and Buy Online"

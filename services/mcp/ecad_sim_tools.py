@@ -19,6 +19,7 @@ from .ecad_common import (
     _budget_timeout_err,
     _build_analysis,
     _default_out_dir,
+    _unique_ecad_path,
     _dumps,
     _eng,
     _erc_lines,
@@ -39,6 +40,7 @@ from .ecad_common import (
     _summarize_sweep,
     _summarize_sweep_steps,
     _summarize_tran,
+    ecad_session,
     netlist_mod,
 )
 
@@ -242,7 +244,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def ecad_simulate(analysis: str = "op", params: Optional[Union[dict, str]] = None,
                       probes: Optional[Union[list, str]] = None, doc_id: str = "",
-                      backend: str = "mna") -> str:
+                      backend: str = "mna", netlist_source: str = "native") -> str:
         """Build the netlist -> SPICE circuit -> run the simulator, and return the KEY
         results with a plain-English reading.
 
@@ -256,6 +258,10 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
                        AND ngspice is installed.
         Advanced analyses (four/mc/temp/noise) always run on the internal MNA solver.
         The result always carries ``backend`` = the solver that actually ran.
+
+        ``netlist_source='kicad'`` instead exports KiCad's SPICE deck and runs it
+        with ngspice, preserving Sim.* models and includes. This requires ngspice
+        and supports op/dc/tran/ac; it never falls back to the native mapper.
 
         ``analysis`` is one of:
           'op'    -- DC operating point (no params needed)
@@ -300,14 +306,41 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
                     raise ValueError("probes must contain non-empty strings")
         except (TypeError, ValueError) as e:
             return _err(f"invalid simulation setup: {e}")
+        source = (netlist_source or "native").lower()
+        if source not in ("native", "kicad"):
+            return _err("netlist_source must be 'native' or 'kicad'", reason="invalid_source")
+        spice_deck = None
         doc = session.doc
-        nl = netlist_mod.build_netlist(doc)
-        circuit, warns = _netlist_to_circuit(nl)  # C++ sim_netlist_to_circuit RPC
-        # tran/four honor per-symbol source waveforms (SIN/PULSE/PWL); every analysis
-        # gets transistor polarity restored (see _apply_sim_source_params).
-        _apply_sim_source_params(doc, circuit, warns,
-                                 apply_waveforms=analysis in ("tran", "four"))
-        if not circuit.get("devices"):
+        if source == "kicad":
+            if str(analysis).lower() not in ("op", "dc", "tran", "ac"):
+                return _err("KiCad SPICE supports op, dc, tran and ac analyses",
+                            reason="unsupported_analysis")
+            from .ecad_sch_tools import _export_text
+            from services.installer import ngspice_backend as ng
+            if not ng.ngspice_available():
+                return _err("KiCad SPICE simulation requires an installed ngspice binary",
+                            reason="ngspice_unavailable", netlist_source=source)
+            try:
+                spice_deck = _export_text(session, "spice")
+            except OpError as e:
+                return _err(e.message, reason=e.code, detail=e.detail, netlist_source=source)
+            except ValueError as e:
+                return _err(str(e), reason="export_failed", netlist_source=source)
+            # Only source names are needed for DC validation. Device models remain
+            # untouched in KiCad's deck and are interpreted by ngspice itself.
+            sources = []
+            for line in spice_deck.splitlines():
+                words = line.strip().split()
+                if len(words) >= 4 and words[0][0].upper() == "V":
+                    sources.append({"kind": "V", "name": words[0]})
+            circuit = {"devices": sources, "nodes": []}
+            warns = ["Using KiCad's SPICE netlist and ngspice; native MNA mapping is bypassed."]
+        else:
+            nl = netlist_mod.build_netlist(doc)
+            circuit, warns = _netlist_to_circuit(nl)
+            _apply_sim_source_params(doc, circuit, warns,
+                                     apply_waveforms=analysis in ("tran", "four"))
+        if source == "native" and not circuit.get("devices"):
             return _err("nothing to simulate — the netlist has no simulatable devices",
                         hint="Place parts with sim models (R/C/L/V/I/D/Q) and give them VALUES "
                              "(a resistor needs '1k', a source '5'); wire them into a circuit.",
@@ -320,6 +353,8 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
         nodes = [n for n in circuit.get("nodes", []) if str(n) not in ("0", "gnd", "GND")]
         if probes:
             probe_list = list(probes)
+        elif source == "kicad":
+            probe_list = []
         else:
             probe_list = _rs.select_default_probes(nodes, circuit.get("devices") or [])
 
@@ -355,7 +390,9 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
                 return _err(f"{an['type']} analysis failed: "
                             f"{type(val).__name__}: {val}",
                             analysis=an["type"])
-            return val
+            payload = json.loads(val)
+            payload["netlist_source"] = source
+            return _dumps(payload)
 
         # AC needs a small-signal stimulus. The structured netlist carries only DC
         # values, so unless a source already has an AC magnitude (an ecad_design
@@ -363,7 +400,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
         # frequency (Bug E-1). Honor an explicit ac_source/ac_mag in params; else
         # auto-drive a source with AC=1 and SAY SO, so the agent never silently
         # gets zero and has no idea why.
-        if an["type"] == "ac":
+        if an["type"] == "ac" and source == "native":
             p = params or {}
 
             def _ac_mag(d: dict) -> float:
@@ -401,7 +438,16 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
 
         study = {"analyses": [an], "probes": probe_list}
         _autosave_all_open_ecad()
-        status, result = _run_with_budget(lambda: _sim_run(circuit, study, backend=backend))
+        if source == "kicad":
+            def run_kicad():
+                result = ng.simulate_ngspice(
+                    circuit, study, netlist=spice_deck,
+                    project_dir=os.path.dirname(session.path or os.getcwd()))
+                result["backend"] = "ngspice"
+                return result
+            status, result = _run_with_budget(run_kicad)
+        else:
+            status, result = _run_with_budget(lambda: _sim_run(circuit, study, backend=backend))
         if status == "timeout":
             return _budget_timeout_err(
                 f"{an['type']} simulation",
@@ -417,14 +463,17 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
                         analysis=an["type"])
         conv = result.get("convergence", {})
         converged = bool(conv.get(an["type"], False))
+        if source == "kicad" and result.get("probes"):
+            probe_list = result["probes"]
 
         if result.get("backend_note"):
             warns.append(result["backend_note"])
         payload: dict = {
             "ok": converged, "doc_id": session.doc_id, "analysis": an["type"],
             "backend": result.get("backend", "mna"),
+            "netlist_source": source,
             "converged": converged,
-            "device_count": len(circuit["devices"]),
+            "device_count": len(circuit["devices"]) if source == "native" else None,
             "nodes": nodes, "probes": probe_list,
             "warnings": warns + ([] if converged else
                                  [f"{an['type']} did not converge — see sim_log"]),
@@ -493,9 +542,9 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
 
         Also exports the per-element I²R dissipation map as the ``pdn`` extension of the
         aicad.boardphys/1 sidecar (contracts/ecad/boardphys.md) — the trace-heating
-        input for the ECAD→thermal handoff: merged into the existing
-        ``board.step.boardphys.json`` when ecad_to_3d already wrote one, else written to
-        ``pdn.boardphys.json`` in the board's export dir.
+        input for the ECAD→thermal handoff: merged into the mapped STEP sidecar or
+        the bound board's sibling ``<stem>.step.boardphys.json`` when available;
+        otherwise a PDN-only ``pdn.boardphys.json`` is written in the cache.
         """
         try:
             session = _get_pcb(doc_id or None)
@@ -613,29 +662,39 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
         sidecar_warnings: list[str] = []
         if ok_results:
             out_dir = _default_out_dir(doc.get("name", "board"))
-            existing = os.path.join(str(out_dir), "board.step.boardphys.json")
+            mapped = (_ECAD.get("boardphys_paths") or {}).get(session.doc_id)
+            candidates = [mapped] if mapped else []
+            if session.path:
+                candidates.append(os.path.splitext(session.path)[0] + ".step.boardphys.json")
+            candidates.append(os.path.join(str(out_dir), "board.step.boardphys.json"))
             try:
                 sidecar = None
-                if os.path.exists(existing):
+                for existing in candidates:
+                    if not os.path.exists(existing):
+                        continue
                     with open(existing, encoding="utf-8") as fh:
                         candidate = json.load(fh)
                     candidate_board = candidate.get("board") if isinstance(candidate, dict) else None
-                    identity_matches = (
-                        candidate.get("schema") == "aicad.boardphys/1"
-                        and isinstance(candidate_board, dict)
-                        and candidate_board.get("id") == doc.get("id"))
+                    source_path = (candidate_board.get("source_path")
+                                   if isinstance(candidate_board, dict) else None)
+                    same_board = (bool(session.path) and bool(source_path) and
+                                  os.path.realpath(source_path) == os.path.realpath(session.path))
+                    if not source_path and isinstance(candidate_board, dict):
+                        same_board = bool(doc.get("id")) and candidate_board.get("id") == doc.get("id")
+                    identity_matches = (isinstance(candidate, dict) and
+                                        candidate.get("schema") == "aicad.boardphys/1" and same_board)
                     if identity_matches:
                         sidecar = candidate
                         sidecar_path = existing
-                    else:
-                        sidecar_warnings.append(
-                            "ignored stale board.step.boardphys.json: board id/schema "
-                            "does not match the active board")
+                        break
+                    sidecar_warnings.append(
+                        f"ignored stale {existing}: board id/schema does not match the active board")
                 if sidecar is None:
                     sidecar = {
                         "schema": "aicad.boardphys/1",
                         "generated_by": "services.ecad.pdn.solve_pdn",
                         "board": {"name": doc.get("name"), "id": doc.get("id"),
+                                  "source_path": os.path.realpath(session.path) if session.path else "",
                                   "thickness_mm": doc.get("stackup", {}).get("thickness")},
                         "components": [],
                         "note": "PDN-only sidecar — run ecad_to_3d for the full "
@@ -910,7 +969,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
         provider = None
         provider_setup_err: Exception | None = None
         try:
-            from services.agent.providers.chudcode_provider import helper_provider
+            from services.agent.providers.omp_provider import helper_provider
             provider = helper_provider("ecad_engineer", cancel=_plan_cancelled)
         except Exception as exc:  # noqa: BLE001 -- offline refusal / role resolution / module absent
             provider_setup_err = exc
@@ -1044,8 +1103,13 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
 
         # ONE build on the caller's thread with the frozen design. No provider re-entry.
         try:
+            path = _unique_ecad_path("sch", "orchestrator")
+            design_session = ecad_session.new_session("sch", "orchestrator", path)
             run = _orch.run_design(
-                request, provider=None, design=design, recipe_used=recipe_used)
+                request, provider=None, design=design, recipe_used=recipe_used,
+                session=design_session)
+        except OpError as exc:
+            return _err(exc.message, reason=exc.code, detail=exc.detail)
         except Exception as exc:  # noqa: BLE001
             return _err(f"ecad_design failed: {type(exc).__name__}: {exc}",
                         hint="Check that services.ecad_design and its deps are available.",
@@ -1157,6 +1221,7 @@ def register_ecad_sim_tools(mcp: FastMCP) -> None:
         return _dumps({
             "ok": ok,
             "doc_id": doc_id,
+            "path": design_session.path,
             "stop_reason": stop,
             "recipe_used": recipe,
             "stages": stage_names,

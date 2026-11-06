@@ -24,7 +24,7 @@ namespace {
 // Current Run roster and one docked inspector. The roster merges two sources: the project's
 // sub-agent registry (subagent_list — sub-agents with transcript, steering and pause/terminate
 // controls) and the viewed session's execution trace (every sub-agent the run's events name,
-// including Chudcode `task` sub-agents that have no registry record; those are read-only here).
+// including Omp `task` sub-agents that have no registry record; those are read-only here).
 // Registry calls are asynchronous; steering takes effect at turn boundaries. A refusal because
 // a run is holding the service keeps the last-known roster/transcript and never shows an error.
 //
@@ -698,7 +698,7 @@ static void drawTraceFacts(const AgentTraceAgent& a, bool live) {
     }
 }
 
-// A sub-agent the trace knows but the registry does not (e.g. a Chudcode `task` sub-agent):
+// A sub-agent the trace knows but the registry does not (e.g. a Omp `task` sub-agent):
 // its state only. Its steps are the trace's timeline for it.
 static void drawTraceAgentInspector(const AgentTraceAgent& a) {
     const bool live = traceLive(a);

@@ -118,7 +118,7 @@ void drawMetricsView(AppState& st) {
     // Aggregate completed, model-stamped turns from this project's conversations by default,
     // or from every conversation when All projects is enabled. The active conversation's
     // messages live in st.chat; parked conversations keep theirs in Conversation::msgs.
-    // Price each model using cached Chudcode metadata, without a worker round-trip.
+    // Price each model using cached Omp metadata, without a worker round-trip.
     // Pricing provenance is carried through with the money, exactly like the cost strip: a model
     // the catalog has no price for adds tokens but NO dollars, so every total it touches is a
     // floor and is labelled one. `hasCost` cannot make that distinction (`cost` is an object

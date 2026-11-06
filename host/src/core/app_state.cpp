@@ -42,6 +42,8 @@
 
 #include "../bootstrap.h"
 #include "cpp_core.h"  // in-process C++ core (libchudware) — the backend when no Python runtime
+#include "engine_backend.h"
+#include "engine_events.h"
 #include "../mesh.h"
 #include "../renderer.h"
 
@@ -50,7 +52,10 @@
 #include "../render/overlays.h"
 
 #include "../ui/feature_tree.h"  // W1-B: ui::featureTreeResetTransient (clear tree statics on doc change)
+#include "../ui/anim.h"
 #include "../ui/sketch_mode.h"   // ui::SketchMode::clearEntitySelection (clearSelection)
+#include "../ui/sketch3d_mode.h"
+#include "../ui/property_manager.h"
 #include "../ui/plm/plm_hub.h"   // ui::plmInvalidate (unified working-dir switch)
 
 const char* kStarterCode =
@@ -382,9 +387,24 @@ static void copyStr(char* dst, size_t cap, const std::string& v) {
 // Shared by loadSettings/saveSettings so the schema can never diverge between the two.
 static const char* kGlassGroupKey[] = {"global", "feature_manager", "copilot", "hud"};
 
+namespace {
+nlohmann::json readConfigFile() {
+    try {
+        std::ifstream in(configPath());
+        nlohmann::json config;
+        if (in) {
+            in >> config;
+            if (config.is_object()) return config;
+        }
+    } catch (...) {
+    }
+    return nlohmann::json::object();
+}
+}  // namespace
+
 void loadSettings(Settings& s) {
-    std::ifstream f(configPath());
-    if (!f) {
+    nlohmann::json j = readConfigJson();
+    if (j.empty()) {
 #ifdef __EMSCRIPTEN__
         // Web: no config yet under IDBFS — still hydrate recents from the workspace.
         std::string rerr;
@@ -394,10 +414,18 @@ void loadSettings(Settings& s) {
 #endif
         return;
     }
+    // One malformed value (a null or a string where a number is expected) used to abort the whole
+    // load, leaving every later field at its default — and the next saveSettings wrote those
+    // defaults back over the user's real values. Sections below are therefore guarded
+    // independently; `safely` guards a single scalar.
+    auto safely = [](const auto& fn) {
+        try { fn(); } catch (...) {}
+    };
     try {
-        nlohmann::json j;
-        f >> j;
-        std::string prov = j.value("provider", "zenmux");
+        s.composerFollowRoles = j.value("composer_follow_roles",
+                                        !(j.contains("provider") || j.contains("model")));
+        std::string prov = j.value("provider", std::string());
+        s.ompProvider = j.value("omp_provider", prov);
         auto oai = j.value("openai", nlohmann::json::object());
         auto llama = j.value("llamacpp", nlohmann::json::object());
         auto fla = j.value("freellmapi", nlohmann::json::object());
@@ -432,28 +460,11 @@ void loadSettings(Settings& s) {
         }
         else if (hasBase) s.provider = baseLoopback ? 2 : 5;  // 2=Local, 5=Cloud OpenAI-compatible
         else s.provider = 1;                                   // 1=OpenAI cloud (api.openai.com)
+        if (s.provider == 2 || s.provider == 3) s.ompProvider.clear();
         std::string model = j.value("model", "");
         if (s.provider == 3) model = llama.value("model_path", model);
         if (s.provider == 3 && model.empty()) model = kDefaultLlamaModelPath;
-        if (s.provider == 6 && model.empty()) model = "grok-4.5";
-        if (s.provider == 9 && model.empty()) model = "x-ai/grok-4.5-free";
         if (s.provider == 10 && model.empty()) model = fla.value("model", std::string("auto"));
-        // Stale GUI ids from prior releases → the wire ids the Kimi Code endpoint now
-        // accepts directly (k3 / k3-256k / kimi-for-coding). kimi-k2.7 keeps the user's
-        // lighter-model pick; the rest fold onto the K3 default.
-        if (s.provider == 8 && (model == "kimi-k3" || model == "kimi-for-coding" ||
-                                model == "kimi-k2.7-code"))
-            model = "k3";
-        else if (s.provider == 8 && model == "kimi-k2.7") model = "kimi-for-coding";
-        if (s.provider == 6 && model != "grok-4.5" && model.rfind("grok", 0) == 0)
-            model = "grok-4.5";
-        if (prov == "moonshot") {
-            // Moonshot direct API (provider 5). The official wire id for Kimi K2.7 is
-            // `kimi-k2.7-code` — the bare `kimi-k2.7` 404s ("Not found the model kimi-k2.7").
-            // Map the GUI id up to the valid wire id; empty/kimi-for-coding fall back to K3.
-            if (model.empty() || model == "kimi-for-coding") model = "kimi-k3";
-            else if (model == "kimi-k2.7") model = "kimi-k2.7-code";
-        }
         copyStr(s.model, sizeof(s.model), model);
         std::string activeKey = j.value("api_key", "");
         copyStr(s.apiKey, sizeof(s.apiKey), activeKey);
@@ -476,32 +487,7 @@ void loadSettings(Settings& s) {
             else if (prov == "moonshot" && !s.moonshotKey[0]) copyStr(s.moonshotKey, sizeof(s.moonshotKey), activeKey);
             else if ((prov == "xai" || prov == "xai-sub") && !s.xaiKey[0]) copyStr(s.xaiKey, sizeof(s.xaiKey), activeKey);
         }
-        // Design decision (2026-07-23): xAI/grok-4.5 was the default chat provider (and the target
-        // of the Cursor migration just above), but most installs are NOT signed into xAI — no
-        // console.x.ai API key and no completed SuperGrok/X Premium+ OAuth — so every fresh chat
-        // opened straight to "xAI not configured". ZenMux's free x-ai/grok-4.5-free tier,
-        // authenticated through Chudcode rather than config.json, is now the default;
-        // OpenRouter's ":free" models are the documented backup.
-        // Migrate a saved xAI/grok-4.5 chat provider — whether the user's own prior pick or the
-        // Cursor migration above — to ZenMux, but ONLY when the user has no xAI credential of
-        // their own: a deliberately-signed-in xAI user keeps xAI. One-time on load, persisted on
-        // the next settings write; idempotent — once migrated (or user-repicked), Settings never
-        // again satisfies "provider==xAI && model==grok-4.5" so this branch never re-fires.
-        if (s.provider == 6 && model == "grok-4.5") {
-            bool xaiSignedIn = s.xaiKey[0] != 0;
-            if (!xaiSignedIn) {
-                auto subAuth = j.value("subscription_auth", nlohmann::json::object());
-                if (subAuth.is_object() &&
-                    (subAuth.contains("xai") || subAuth.contains("xai-sub")))
-                    xaiSignedIn = true;
-            }
-            if (!xaiSignedIn) {
-                s.provider = 9;  // PROV_ZENMUX
-                model = "x-ai/grok-4.5-free";
-                copyStr(s.model, sizeof(s.model), model);
-            }
-        }
-        copyStr(s.reasoningEffort, sizeof(s.reasoningEffort), j.value("reasoning_effort", std::string("high")));
+        copyStr(s.reasoningEffort, sizeof(s.reasoningEffort), j.value("reasoning_effort", std::string()));
         if (s.provider == 3) {
             std::string lbase = llama.value("base_url", "http://127.0.0.1:1234/v1");
             std::strncpy(s.baseUrl, lbase.c_str(), sizeof(s.baseUrl) - 1);
@@ -519,6 +505,9 @@ void loadSettings(Settings& s) {
             std::string cm = j.value("compliance_mode", std::string("off"));
             std::snprintf(s.complianceMode, sizeof(s.complianceMode), "%s", cm.c_str());
         }
+    } catch (...) {
+    }
+    try {
         // Preference enums (off|option|encourage|require). Migrate legacy plan_mode bool.
         auto parsePref = [](const nlohmann::json& jn, const char* key, int def) -> int {
             if (!jn.contains(key)) return def;
@@ -558,8 +547,6 @@ void loadSettings(Settings& s) {
                 s.advisorPreference = parsePref(ag, "advisor_preference", s.advisorPreference);
             if (ag.contains("proactive_advisor"))
                 s.proactiveAdvisor = ag.value("proactive_advisor", false);
-            if (ag.contains("corporate_mode"))
-                s.corporateMode = ag.value("corporate_mode", false);
             if (ag.contains("memory_enabled"))
                 s.memoryEnabled = ag.value("memory_enabled", true);
             if (ag.contains("memory_token_budget")) {
@@ -569,14 +556,15 @@ void loadSettings(Settings& s) {
         }
         if (j.contains("proactive_advisor"))
             s.proactiveAdvisor = j.value("proactive_advisor", false);
-        if (j.contains("corporate_mode"))
-            s.corporateMode = j.value("corporate_mode", false);
         if (j.contains("memory_enabled"))
             s.memoryEnabled = j.value("memory_enabled", true);
         if (j.contains("memory_token_budget")) {
             int b = j.value("memory_token_budget", 400);
             s.memoryTokenBudget = (b < 50) ? 50 : (b > 4000 ? 4000 : b);
         }
+    } catch (...) {
+    }
+    try {
         {
             // A config from before the backend choice keeps its meaning: memory_enabled
             // false is "off"; otherwise the default backend.
@@ -587,7 +575,8 @@ void loadSettings(Settings& s) {
                      j["agent"].contains("memory_backend") &&
                      j["agent"]["memory_backend"].is_string())
                 backend = j["agent"]["memory_backend"].get<std::string>();
-            if (backend == "off" || backend == "sharpshooter" || backend == "mnemo")
+            if (backend == "mnemo") backend = "mnemopi";
+            if (!backend.empty())
                 s.memoryBackend = backend;
             else if (!s.memoryEnabled)
                 s.memoryBackend = "off";
@@ -610,23 +599,30 @@ void loadSettings(Settings& s) {
             }
             s.copilotMode = cm;
         }
-        s.maxTokens = j.value("max_output_tokens", 0);
-        s.contextWindow = j.value("context_window", 0);
-        s.systemPrompt = j.value("system_prompt", "");
-        s.theme = j.value("theme", "light");
-        s.orthographic = j.value("orthographic", true);
-        s.displayQuality = j.value("display_quality", std::string("fine"));
-        if (s.displayQuality != "draft" && s.displayQuality != "standard" &&
-            s.displayQuality != "fine")
-            s.displayQuality = "fine";
-        s.sketchDragSnapRelations = j.value("sketch_drag_snap_relations", true);
-        s.units = (j.value("units", std::string("mmgs")) == "ips") ? Units::IPS : Units::MMGS;
-        s.partsGridView = j.value("parts_grid_view", false);
-        s.partsSortMode = j.value("parts_sort_mode", 0);
+        safely([&] { s.maxTokens = j.value("max_output_tokens", 0); });
+        safely([&] { s.contextWindow = j.value("context_window", 0); });
+        safely([&] { s.systemPrompt = j.value("system_prompt", ""); });
+        safely([&] { s.theme = j.value("theme", "light"); });
+        safely([&] { s.orthographic = j.value("orthographic", true); });
+        safely([&] {
+            s.displayQuality = j.value("display_quality", std::string("fine"));
+            if (s.displayQuality != "draft" && s.displayQuality != "standard" &&
+                s.displayQuality != "fine")
+                s.displayQuality = "fine";
+        });
+        safely([&] { s.sketchDragSnapRelations = j.value("sketch_drag_snap_relations", true); });
+        safely([&] {
+            s.units = (j.value("units", std::string("mmgs")) == "ips") ? Units::IPS : Units::MMGS;
+        });
+        safely([&] { s.partsGridView = j.value("parts_grid_view", false); });
+        safely([&] { s.partsSortMode = j.value("parts_sort_mode", 0); });
         s.partsExpandedCats.clear();
         if (auto it = j.find("parts_expanded_categories"); it != j.end() && it->is_array())
             for (const auto& e : *it)
                 if (e.is_string()) s.partsExpandedCats.push_back(e.get<std::string>());
+    } catch (...) {
+    }
+    try {
         // v2.1 colored liquid glass ("appearance.glass"). Absent keys stay at their GlassStyle
         // sentinels (= inherit Global / built-in default: dynamic color ON, geometry as today),
         // so an old config.json with no "appearance" block loads to the out-of-box look.
@@ -685,13 +681,47 @@ void loadSettings(Settings& s) {
             }
         }
         // Pinned-column vertical-collapse state.
-        s.fmCollapsed = j.value("fm_collapsed", false);
-        s.copilotCollapsed = j.value("copilot_collapsed", false);
+        safely([&] { s.fmCollapsed = j.value("fm_collapsed", false); });
+        safely([&] { s.copilotCollapsed = j.value("copilot_collapsed", false); });
+        safely([&] {
+            const float cw = j.value("copilot_width", 0.0f);
+            s.copilotWidth = (cw > 0.0f && cw < 8000.0f) ? cw : 0.0f;
+        });
+        // Viewport / View-menu / sketch preferences ("view_prefs"; absent keys keep the defaults).
+        safely([&] {
+            const auto vp = j.find("view_prefs");
+            if (vp == j.end() || !vp->is_object()) return;
+            const auto flag = [&](const char* key, bool& dst) {
+                const auto it = vp->find(key);
+                if (it != vp->end() && it->is_boolean()) dst = it->get<bool>();
+            };
+            const auto ranged = [&](const char* key, int& dst, int lo, int hi) {
+                const auto it = vp->find(key);
+                if (it != vp->end() && it->is_number_integer()) {
+                    const int v = it->get<int>();
+                    if (v >= lo && v <= hi) dst = v;
+                }
+            };
+            ranged("display_style", s.viewDisplayStyle, 0, 4);
+            flag("triad", s.viewShowTriad);
+            flag("ground_shadow", s.viewShowGroundShadow);
+            flag("real_view", s.viewShowRealView);
+            ranged("drag_mode", s.viewDragMode, 0, 1);
+            flag("ribbon", s.panelRibbon);
+            flag("feature_tree", s.panelFeatureTree);
+            flag("ai_panel", s.panelAI);
+            flag("viewport", s.panelViewport);
+            flag("design_table", s.panelDesignTable);
+            flag("cut_list", s.panelCutList);
+            flag("equations", s.panelEquations);
+            flag("sketch_grid", s.sketchShowGrid);
+            flag("sketch_auto_relations", s.sketchAutoRelations);
+        });
         // Settings-modal progressive disclosure. Absent => false => the modal opens in its
         // readable basic form, which is the whole point of the default.
-        s.showAdvanced = j.value("show_advanced", false);
+        safely([&] { s.showAdvanced = j.value("show_advanced", false); });
         // Wave 3: File Explorer workspace + Recent files.
-        s.workspaceDir = j.value("workspace_dir", std::string());
+        safely([&] { s.workspaceDir = j.value("workspace_dir", std::string()); });
         s.recentFiles.clear();
         if (auto it = j.find("recent_files"); it != j.end() && it->is_array())
             for (const auto& e : *it)
@@ -700,6 +730,9 @@ void loadSettings(Settings& s) {
         if (auto it = j.find("recent_projects"); it != j.end() && it->is_array())
             for (const auto& e : *it)
                 if (e.is_string()) s.recentProjects.push_back(e.get<std::string>());
+    } catch (...) {
+    }
+    try {
         // Box.com project mirror. Only GUI-owned fields are modeled here; OAuth tokens in
         // box.auth stay on disk and are preserved by applyGuiOwnedSettings().
         auto box = j.value("box", nlohmann::json::object());
@@ -726,18 +759,20 @@ void loadSettings(Settings& s) {
 #endif
         // Chat-picker model visibility (opt-out hidden set).
         s.hiddenModels.clear();
-        // A config still carrying "model_defaults_seeded" holds the list the removed first-run
-        // seeding pass wrote (2026-07-23): it ran on the unfiltered ~2,350-row catalog, keyed
-        // hides by bare id across providers and ranked dated snapshots above undated flagships,
-        // so every model older than that day was hidden. Drop it once; saving erases the marker.
-        if (!j.value("model_defaults_seeded", false))
-            if (auto it = j.find("hidden_models"); it != j.end() && it->is_array())
-                for (const auto& e : *it)
-                    if (e.is_string()) s.hiddenModels.insert(e.get<std::string>());
+        if (auto it = j.find("hidden_models"); it != j.end() && it->is_array())
+            for (const auto& e : *it)
+                if (e.is_string()) s.hiddenModels.insert(e.get<std::string>());
+        s.shownLegacyHiddenModels.clear();
+        if (auto it = j.find("shown_legacy_hidden_models"); it != j.end() && it->is_array())
+            for (const auto& e : *it)
+                if (e.is_string()) s.shownLegacyHiddenModels.insert(e.get<std::string>());
         s.disabledProviders.clear();
         if (auto it = j.find("disabled_providers"); it != j.end() && it->is_array())
             for (const auto& e : *it)
                 if (e.is_string()) s.disabledProviders.insert(e.get<std::string>());
+    } catch (...) {
+    }
+    try {
         // Experimental AI features ("experimental" block) — all default-off.
         auto exp = j.value("experimental", nlohmann::json::object());
         if (exp.is_object()) {
@@ -805,29 +840,21 @@ private:
 #endif
 };
 
-// In-process serialization. flock is per open-file-description, so two GUI threads each
-// opening the lock file would NOT exclude one another; this mutex closes that gap and is
-// held for the whole read-modify-write.
-std::mutex& configWriteMutex() {
-    static std::mutex m;
-    return m;
-}
+std::mutex g_configWarningMutex;
 // The writer has no AppState reference (and may run on a worker thread). The UI
 // consumes this once on its frame thread rather than coupling config I/O to ImGui.
 std::string g_configCorruptionWarning;
 }  // namespace
 std::string takeConfigCorruptionWarning() {
-    std::lock_guard<std::mutex> guard(configWriteMutex());
+    std::lock_guard<std::mutex> guard(g_configWarningMutex);
     std::string warning;
     warning.swap(g_configCorruptionWarning);
     return warning;
 }
 
 
-bool updateConfigJson(const std::function<void(nlohmann::json&)>& patch) {
-    if (!patch) return false;
+static bool writeConfigJson(const std::function<void(nlohmann::json&)>& patch) {
     const std::string path = configPath();
-    std::lock_guard<std::mutex> guard(configWriteMutex());
     std::error_code ec;
     std::filesystem::create_directories(appdataAppDir(), ec);
 #if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
@@ -883,9 +910,12 @@ bool updateConfigJson(const std::function<void(nlohmann::json&)>& patch) {
             return false;  // fail closed; do not overwrite the only copy
         }
         std::fprintf(stderr, "[chudware] corrupt settings file moved to %s\n", backup.c_str());
-        if (g_configCorruptionWarning.empty())
-            g_configCorruptionWarning = "Settings file was corrupt; backup saved at " +
-                                        backup + ". Review your settings.";
+        {
+            std::lock_guard<std::mutex> guard(g_configWarningMutex);
+            if (g_configCorruptionWarning.empty())
+                g_configCorruptionWarning = "Settings file was corrupt; backup saved at " +
+                                            backup + ". Review your settings.";
+        }
         appstatePersistSync();  // persist the backup itself if a subsequent write fails (IDBFS)
     }
     try {
@@ -936,6 +966,187 @@ bool updateConfigJson(const std::function<void(nlohmann::json&)>& patch) {
     return true;
 }
 
+namespace {
+// Apply only the caller's changed leaves to the latest locked config. Object maps are
+// merged recursively so unrelated OAuth/provider keys written by another process survive.
+void mergeConfigChanges(nlohmann::json& live, const nlohmann::json& before,
+                        const nlohmann::json& after) {
+    if (before == after) return;
+    if (!after.is_object()) {
+        live = after;
+        return;
+    }
+    if (!live.is_object()) live = nlohmann::json::object();
+    if (before.is_object()) {
+        for (auto it = before.begin(); it != before.end(); ++it)
+            if (!after.contains(it.key())) live.erase(it.key());
+    }
+    for (auto it = after.begin(); it != after.end(); ++it) {
+        const auto old = before.is_object() ? before.find(it.key()) : before.end();
+        if (before.is_object() && old != before.end()) {
+            if (*old != it.value()) mergeConfigChanges(live[it.key()], *old, it.value());
+        } else {
+            mergeConfigChanges(live[it.key()], nlohmann::json(), it.value());
+        }
+    }
+}
+
+#ifndef __EMSCRIPTEN__
+class ConfigWriter {
+public:
+    ~ConfigWriter() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            requeueFailed();
+            stopping_ = true;
+        }
+        cv_.notify_all();
+        if (thread_.joinable()) thread_.join();
+    }
+
+    nlohmann::json read() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // Hold the state lock across the read so a completing rename cannot retire an
+        // in-flight patch between our disk snapshot and its read-your-writes overlay.
+        nlohmann::json live = readConfigFile();
+        if (writing_) mergeConfigChanges(live, inFlightBefore_, inFlightAfter_);
+        if (dirty_) mergeConfigChanges(live, baseline_, shadow_);
+        else if (failedBaseline_) mergeConfigChanges(live, *failedBaseline_, shadow_);
+        if (!writing_ && !dirty_ && !failedBaseline_) shadow_ = live;
+        initialized_ = true;
+        return live;
+    }
+
+    bool update(const std::function<void(nlohmann::json&)>& patch) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!initialized_ || (!dirty_ && !writing_ && !failedBaseline_)) {
+            shadow_ = readConfigFile();
+            initialized_ = true;
+        }
+        nlohmann::json next = shadow_;
+        try {
+            patch(next);  // consume reference captures before the caller returns
+        } catch (...) {
+            return false;
+        }
+        if (!next.is_object()) return false;
+        if (next == shadow_ && !failedBaseline_) return true;
+        requeueFailed();
+        if (!dirty_) baseline_ = shadow_;
+        shadow_ = std::move(next);
+        dirty_ = baseline_ != shadow_;
+        if (!dirty_) {
+            flushed_.notify_all();
+            return true;
+        }
+        if (!thread_.joinable()) thread_ = std::thread([this] { run(); });
+        cv_.notify_one();
+        return true;
+    }
+
+    bool flush() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (!thread_.joinable() || (!dirty_ && !writing_ && !failedBaseline_)) return true;
+        requeueFailed();
+        cv_.notify_one();
+        flushed_.wait(lock, [this] { return !dirty_ && !writing_; });
+        return !failedBaseline_;
+    }
+
+private:
+    void requeueFailed() {
+        if (!failedBaseline_) return;
+        if (!dirty_) {
+            baseline_ = std::move(*failedBaseline_);
+            dirty_ = true;
+        }
+        failedBaseline_.reset();
+    }
+
+    void run() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        for (;;) {
+            cv_.wait(lock, [this] { return stopping_ || dirty_; });
+            if (stopping_ && !dirty_) return;
+            inFlightBefore_ = std::move(baseline_);
+            inFlightAfter_ = shadow_;
+            dirty_ = false;
+            writing_ = true;
+            lock.unlock();
+            const bool ok = writeConfigJson([&](nlohmann::json& live) {
+                mergeConfigChanges(live, inFlightBefore_, inFlightAfter_);
+            });
+            if (!ok) {
+                std::lock_guard<std::mutex> warningLock(g_configWarningMutex);
+                g_configCorruptionWarning = "Settings could not be saved. Check the settings "
+                                            "directory's permissions and available disk space.";
+            }
+            lock.lock();
+            if (!ok) {
+                // Keep the unsaved baseline for the next edit or shutdown flush.
+                // Do not spin on an unwritable config directory.
+                if (dirty_) baseline_ = std::move(inFlightBefore_);
+                else failedBaseline_ = std::move(inFlightBefore_);
+            }
+            writing_ = false;
+            flushed_.notify_all();
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable cv_, flushed_;
+    std::thread thread_;
+    nlohmann::json shadow_ = nlohmann::json::object();
+    nlohmann::json baseline_;
+    nlohmann::json inFlightBefore_, inFlightAfter_;
+    std::optional<nlohmann::json> failedBaseline_;
+    bool dirty_ = false, writing_ = false, stopping_ = false, initialized_ = false;
+};
+
+ConfigWriter& configWriter() {
+    static ConfigWriter writer;
+    return writer;
+}
+#endif
+
+
+}  // namespace
+
+bool updateConfigJson(const std::function<void(nlohmann::json&)>& patch) {
+    if (!patch) return false;
+#ifdef __EMSCRIPTEN__
+    return writeConfigJson(patch);
+#else
+    return configWriter().update(patch);
+#endif
+}
+
+nlohmann::json readConfigJson() {
+#ifdef __EMSCRIPTEN__
+    return readConfigFile();
+#else
+    return configWriter().read();
+#endif
+}
+
+bool flushConfigWrites() {
+#ifndef __EMSCRIPTEN__
+    return configWriter().flush();
+#else
+    return true;
+#endif
+}
+
+// j[key] as a string, or `def` when the key is absent, null or not a string. nlohmann's
+// value() THROWS on a type mismatch, and a throwing patch makes ConfigWriter::update drop the
+// WHOLE save — so one hand-edited/foreign null here silently stopped every setting persisting.
+static std::string jsonStringOr(const nlohmann::json& j, const char* key,
+                                const std::string& def = std::string()) {
+    if (!j.is_object()) return def;
+    const auto it = j.find(key);
+    return (it != j.end() && it->is_string()) ? it->get<std::string>() : def;
+}
+
 // Overlay every GUI-owned key onto *j*, the live on-disk config. Merge-not-replace:
 // config.json is SHARED with the Python side (subscription_auth OAuth tokens, plm.*,
 // ai_roles, ...) — a fixed-allowlist full overwrite here silently wiped every signed-in
@@ -948,6 +1159,15 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
     // the 2026-07-14 subscription_auth wipe). Overlay GUI-owned slots onto the on-disk map.
     nlohmann::json keysOut = nlohmann::json::object();
     if (j.contains("keys") && j["keys"].is_object()) keysOut = j["keys"];
+    // A pending legacy online key is kept separate from any local endpoint credential.
+    const std::string legacyApiProvider = jsonStringOr(
+        j, "legacy_api_key_provider", jsonStringOr(j, "provider"));
+    const auto oldEndpoint = j.value("openai", nlohmann::json::object());
+    const bool oldLocalKey = !j.contains("legacy_api_key_provider") &&
+        legacyApiProvider == "openai" && oldEndpoint.is_object() &&
+        ui::baseUrlIsLoopback(jsonStringOr(oldEndpoint, "base_url"));
+    const nlohmann::json legacyApiKey = j.contains("legacy_api_key") ? j["legacy_api_key"] :
+        oldLocalKey ? nlohmann::json() : j.value("api_key", nlohmann::json());
     nlohmann::json expOut = nlohmann::json::object();
     if (j.contains("experimental") && j["experimental"].is_object()) expOut = j["experimental"];
     nlohmann::json boxOut = nlohmann::json::object();
@@ -960,7 +1180,7 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
     for (const char* k : {"provider", "model", "api_key", "openai", "llamacpp", "freellmapi",
                           "keys", "reasoning_effort", "max_output_tokens",
                           "context_window", "system_prompt", "appearance", "workspace_dir",
-                          "hidden_models", "disabled_providers", "experimental", "box",
+                          "hidden_models", "shown_legacy_hidden_models", "disabled_providers", "experimental", "box",
                           "model_defaults_seeded"})
         j.erase(k);
     if (s.provider == 4) {
@@ -973,7 +1193,7 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
         j["api_key"] = s.anthropicKey;
     } else if (s.provider == 1) {
         j["provider"] = "openai";
-        j["model"] = s.model[0] ? s.model : "gpt-4o";
+        j["model"] = s.model[0] ? s.model : "gpt-6-sol";
         j["api_key"] = s.openaiKey;
     } else if (s.provider == 2) {
         j["provider"] = "openai";
@@ -1051,6 +1271,29 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
             {"vision", s.vision}
         };
     }
+    // The online pin is independent of legacy offline provider slots.
+    if (!s.ompProvider.empty()) {
+        j["omp_provider"] = s.ompProvider;
+        if (s.provider != 2 && s.provider != 3) {
+            j["provider"] = s.ompProvider;
+            j["model"] = s.model;
+            j.erase("api_key");
+        }
+    } else {
+        j.erase("omp_provider");
+        if (s.provider != 2 && s.provider != 3 && s.ompProvider.empty()) {
+            j.erase("provider");
+            j.erase("model");
+            j.erase("api_key");
+        }
+    }
+    if (legacyApiKey.is_string() && !legacyApiKey.get_ref<const std::string&>().empty()) {
+        if (s.provider == 2 || s.provider == 3 || j.contains("legacy_api_key"))
+            j["legacy_api_key"] = legacyApiKey;
+        else
+            j["api_key"] = legacyApiKey;
+        j["legacy_api_key_provider"] = legacyApiProvider;
+    }
     // Persist every provider's key so switching providers never loses one, and the picker
     // can tell which providers are usable. Overlay onto the on-disk keys map so unknown
     // entries (e.g. keys.openrouter written by the agent harness) survive a load→save
@@ -1066,6 +1309,7 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
     // Reasoning effort applies only to reasoning-capable models; resolve_provider passes it
     // through to the provider (gemini thinkingConfig / anthropic effort).
     if (s.reasoningEffort[0]) j["reasoning_effort"] = s.reasoningEffort;
+    j["composer_follow_roles"] = s.composerFollowRoles;
         j["offline_mode"] = s.offlineMode;
         j["compliance_mode"] = s.complianceMode[0] ? s.complianceMode : "off";
     {
@@ -1083,7 +1327,7 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
         j["task_list_preference"] = prefName(s.taskListPreference);
         j["advisor_preference"] = prefName(s.advisorPreference);
         j["proactive_advisor"] = s.proactiveAdvisor;
-        j["corporate_mode"] = s.corporateMode;
+        j.erase("corporate_mode");
         j["memory_backend"] = s.memoryBackend;
         j["memory_enabled"] = s.memoryBackend != "off";
         j["memory_token_budget"] = s.memoryTokenBudget;
@@ -1091,10 +1335,10 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
         nlohmann::json agent = nlohmann::json::object();
         if (j.contains("agent") && j["agent"].is_object()) agent = j["agent"];
         agent.erase("role_adoption");
+        agent.erase("corporate_mode");
         agent["advisor"] = (s.advisorPreference != 0);
         agent["advisor_preference"] = prefName(s.advisorPreference);
         agent["proactive_advisor"] = s.proactiveAdvisor;
-        agent["corporate_mode"] = s.corporateMode;
         agent["subagent_preference"] = prefName(s.subagentPreference);
         agent["task_list_preference"] = prefName(s.taskListPreference);
         agent["memory_backend"] = s.memoryBackend;
@@ -1159,9 +1403,33 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
     // Pinned-column vertical-collapse state.
     j["fm_collapsed"] = s.fmCollapsed;
     j["copilot_collapsed"] = s.copilotCollapsed;
+    if (s.copilotWidth > 0.0f) j["copilot_width"] = s.copilotWidth;
+    else j.erase("copilot_width");
+    {
+        // Only keys that differ from their default are written, so an untouched config carries no
+        // "view_prefs" block at all.
+        nlohmann::json v = nlohmann::json::object();
+        if (s.viewDisplayStyle != 1) v["display_style"] = s.viewDisplayStyle;
+        if (!s.viewShowTriad) v["triad"] = false;
+        if (!s.viewShowGroundShadow) v["ground_shadow"] = false;
+        if (!s.viewShowRealView) v["real_view"] = false;
+        if (s.viewDragMode != 0) v["drag_mode"] = s.viewDragMode;
+        if (!s.panelRibbon) v["ribbon"] = false;
+        if (!s.panelFeatureTree) v["feature_tree"] = false;
+        if (!s.panelAI) v["ai_panel"] = false;
+        if (!s.panelViewport) v["viewport"] = false;
+        if (s.panelDesignTable) v["design_table"] = true;
+        if (s.panelCutList) v["cut_list"] = true;
+        if (s.panelEquations) v["equations"] = true;
+        if (s.sketchShowGrid) v["sketch_grid"] = true;
+        if (!s.sketchAutoRelations) v["sketch_auto_relations"] = false;
+        if (v.empty()) j.erase("view_prefs");
+        else j["view_prefs"] = std::move(v);
+    }
     // Settings-modal progressive disclosure. Omitted while false so a default config
     // carries no trace of it.
     if (s.showAdvanced) j["show_advanced"] = true;
+    else j.erase("show_advanced");  // OFF must reach disk: the writer patches the on-disk shadow
     // Wave 3: File Explorer workspace + Recent files.
     if (!s.workspaceDir.empty()) j["workspace_dir"] = s.workspaceDir;
     j["recent_files"] = s.recentFiles;
@@ -1180,22 +1448,33 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
     j["box"] = std::move(boxOut);
     if (!s.hiddenModels.empty())
         j["hidden_models"] = std::vector<std::string>(s.hiddenModels.begin(), s.hiddenModels.end());
+    if (!s.shownLegacyHiddenModels.empty())
+        j["shown_legacy_hidden_models"] = std::vector<std::string>(s.shownLegacyHiddenModels.begin(), s.shownLegacyHiddenModels.end());
     if (!s.disabledProviders.empty())
         j["disabled_providers"] =
             std::vector<std::string>(s.disabledProviders.begin(), s.disabledProviders.end());
     // Experimental AI features. Merge-overlay: keep unknown fields in the on-disk
     // experimental block; only rewrite/clear the slots the GUI models. Omit the whole
     // block when nothing remains so a default config stays clean.
-    if (s.expVisionReview) {
-        expOut["vision_review"] = {
-            {"enabled", true},
-            {"model", s.expVisionModel[0] ? s.expVisionModel : "qwen2.5-vl-7b-instruct"},
-            {"base_url", s.expVisionBaseUrl[0] ? s.expVisionBaseUrl
-                                               : "http://localhost:1234/v1"},
-            {"api_key", s.expVisionKey},
-        };
-    } else {
-        expOut.erase("vision_review");
+    // Disabled does not forget: a customized model/endpoint/key stays on disk with
+    // "enabled": false (resolve_review_provider treats that as off) so re-enabling restores the
+    // user's choice. A never-customized block is omitted so a default config stays clean.
+    {
+        const std::string vModel = s.expVisionModel[0] ? s.expVisionModel : "qwen2.5-vl-7b-instruct";
+        const std::string vBase = s.expVisionBaseUrl[0] ? s.expVisionBaseUrl
+                                                        : "http://localhost:1234/v1";
+        const bool customized = vModel != "qwen2.5-vl-7b-instruct" ||
+                                vBase != "http://localhost:1234/v1" || s.expVisionKey[0];
+        if (s.expVisionReview || customized) {
+            expOut["vision_review"] = {
+                {"enabled", s.expVisionReview},
+                {"model", vModel},
+                {"base_url", vBase},
+                {"api_key", s.expVisionKey},
+            };
+        } else {
+            expOut.erase("vision_review");
+        }
     }
     if (s.expCadSequenceMode) expOut["cad_sequence_mode"] = true;
     else expOut.erase("cad_sequence_mode");
@@ -1203,9 +1482,21 @@ static void applyGuiOwnedSettings(nlohmann::json& j, const Settings& s) {
 }
 
 void saveSettings(const Settings& s) {
-    // Locked + atomic via the shared config lock, so a concurrent Python/engine write can
-    // neither clobber us nor be clobbered by us between our read and our write.
-    updateConfigJson([&s](nlohmann::json& j) { applyGuiOwnedSettings(j, s); });
+    // The updater consumes this patch now and coalesces its owned JSON changes; disk
+    // locking, serialization and fsync run only on its writer thread.
+    if (!updateConfigJson([&s](nlohmann::json& j) { applyGuiOwnedSettings(j, s); })) {
+        // The patch was rejected or the write failed outright (it threw on a malformed config
+        // value / the web store is unwritable): nothing was queued. Say so once instead of
+        // letting every later edit vanish silently.
+        static bool s_reported = false;
+        if (!s_reported) {
+            s_reported = true;
+            std::lock_guard<std::mutex> guard(g_configWarningMutex);
+            g_configCorruptionWarning =
+                "Settings could not be saved. Check config.json (a malformed value) and the "
+                "settings directory's permissions and free space.";
+        }
+    }
 #ifdef __EMSCRIPTEN__
     // The workspace endpoint is independent of config.json/IDBFS. Only an actual recents
     // mutation should reach it; theme/provider and other settings saves stay local.
@@ -1406,35 +1697,17 @@ bool AppState::anyRunActive() const {
     return false;
 }
 
+bool AppState::anyEditingRunActive() const {
+    for (const auto& kv : runs)
+        if (kv.second && kv.second->running.load() && !kv.second->isCompaction) return true;
+    return false;
+}
+
 bool AppState::convRunning(const std::string& convId) const {
     auto it = runs.find(convId);
     return it != runs.end() && it->second && it->second->running.load();
 }
 
-bool AppState::docLockedByAgent(const std::string& docId) const {
-    if (docId.empty()) return false;
-    for (const DocTab& t : docTabs) {
-        if (t.docId != docId) continue;
-        if (t.lastForeignWriteAt == std::chrono::steady_clock::time_point{}) return false;
-        const auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration<double>(now - t.lastForeignWriteAt).count() < kAgentLockGraceS)
-            return true;
-        return anyRunActive() && t.lastForeignWriteAt >= runsIdleAt;
-    }
-    return false;
-}
-
-bool AppState::activeDocLockedByAgent() const {
-    return docLockedByAgent(docMirror.docId());
-}
-
-std::string AppState::agentLockReason(const std::string& docId) const {
-    if (!docLockedByAgent(docId)) return std::string();
-    return anyRunActive()
-               ? "An agent is editing this part. Editing is locked until it finishes (Stop it to "
-                 "take over)."
-               : "An agent just edited this part. Editing unlocks in a few seconds.";
-}
 
 std::string AppState::activeConvId() const {
     if (activeConv < 0 || activeConv >= (int)conversations.size()) return std::string();
@@ -1443,10 +1716,22 @@ std::string AppState::activeConvId() const {
 
 // ---------------- AppState methods (formerly run_gui lambdas) ----------------
 void AppState::addLog(const std::string& s) {
+    size_t lineCount = 0;
+    char last = 0;
+    for (const char* p = s.c_str(); *p; ++p) {
+        if (*p == '\r') continue;
+        if (*p == '\n') ++lineCount;
+        last = *p;
+    }
+    if (last != '\n' || lineCount == 0) ++lineCount;
     {
         std::lock_guard<std::mutex> lk(logMtx);
-        log.push_back(s);
-        if (log.size() > 500) log.erase(log.begin());
+        const size_t slot = (logHead + logSize) % kLogCapacity;
+        log[slot] = s;
+        logLineCounts[slot] = lineCount;
+        if (logSize < kLogCapacity) ++logSize;
+        else logHead = (logHead + 1) % kLogCapacity;
+        ++logGeneration;
     }
     // C40: tee to a file when CHUDWARE_LOG_FILE is set — the in-app console is hard to reach
     // when diagnosing interaction bugs (and stdout is lost for a windowed exe).
@@ -1503,6 +1788,41 @@ void AppState::pushRecentProject(const std::string& path) {
         recentProjects.resize(kRecentProjectsMax);
     settings.recentProjects = recentProjects;
     saveSettings(settings);
+}
+
+void AppState::seedViewPrefsFromSettings() {
+    displayStyle = settings.viewDisplayStyle;
+    showTriad = settings.viewShowTriad;
+    showGroundShadow = settings.viewShowGroundShadow;
+    showRealView = settings.viewShowRealView;
+    vpDragMode = settings.viewDragMode;
+    showRibbon = settings.panelRibbon;
+    showFeatureTree = settings.panelFeatureTree;
+    showAIPanel = settings.panelAI;
+    showViewport = settings.panelViewport;
+    showDesignTablePanel = settings.panelDesignTable;
+    showCutListPanel = settings.panelCutList;
+    showEquations = settings.panelEquations;
+}
+
+void AppState::persistViewPrefs() {
+    if (shot) return;  // scenario runs set these for deterministic captures — never persist them
+    bool dirty = false;
+    const auto sync = [&dirty](auto& dst, const auto& src) {
+        if (dst != src) {
+            dst = src;
+            dirty = true;
+        }
+    };
+    sync(settings.viewDisplayStyle, displayStyle);
+    sync(settings.viewShowTriad, showTriad);
+    sync(settings.viewShowGroundShadow, showGroundShadow);
+    sync(settings.viewShowRealView, showRealView);
+    sync(settings.viewDragMode, vpDragMode);
+    sync(settings.panelDesignTable, showDesignTablePanel);
+    sync(settings.panelCutList, showCutListPanel);
+    sync(settings.panelEquations, showEquations);
+    if (dirty) saveSettings(settings);
 }
 
 // Canonical text for an engine-transport outage. Every worker RPC that fails while the daemon
@@ -1565,27 +1885,18 @@ void AppState::toast(ui::ToastLevel level, std::string msg) {
 // the user is CURRENTLY viewing (active tab). Drawing/ECAD tabs leave DocMirror pointed at the
 // previous part/asm; async tab switches update activeTab before the mirror rebinds. Refuse those
 // paths so we never doc_undo/doc_redo a hidden or stale doc_id.
-static bool activeCadDocMatchesMirror(const AppState& st) {
-    if (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size()) return false;
-    const auto& t = st.docTabs[st.activeTab];
-    if (t.kind != AppState::DocTab::TabKind::Part &&
-        t.kind != AppState::DocTab::TabKind::Assembly) return false;
-    if (t.docId.empty() || !st.docMirror.hasDoc()) return false;
-    return t.docId == st.docMirror.docId();
+bool AppState::isActiveMirrorDoc() const {
+    if (activeTab < 0 || activeTab >= (int)docTabs.size()) return false;
+    const auto& t = docTabs[activeTab];
+    if (t.kind != DocTab::TabKind::Part && t.kind != DocTab::TabKind::Assembly) return false;
+    return !t.docId.empty() && docMirror.hasDoc() && t.docId == docMirror.docId();
 }
 
 core::OpsResponse AppState::docUndo() {
-    if (!activeCadDocMatchesMirror(*this)) {
+    if (!isActiveMirrorDoc()) {
         core::OpsResponse r;
         r.error_code = "no_doc";
         r.error_message = "no active CAD document";
-        return r;
-    }
-    if (docLockedByAgent(docMirror.docId())) {
-        core::OpsResponse r;
-        r.error_code = "agent_edit_locked";
-        r.error_message = agentLockReason(docMirror.docId());
-        toast(ui::ToastLevel::Warn, r.error_message);
         return r;
     }
     core::OpsResponse r = docMirror.undo(worker);
@@ -1609,17 +1920,10 @@ core::OpsResponse AppState::docUndo() {
 }
 
 core::OpsResponse AppState::docRedo() {
-    if (!activeCadDocMatchesMirror(*this)) {
+    if (!isActiveMirrorDoc()) {
         core::OpsResponse r;
         r.error_code = "no_doc";
         r.error_message = "no active CAD document";
-        return r;
-    }
-    if (docLockedByAgent(docMirror.docId())) {
-        core::OpsResponse r;
-        r.error_code = "agent_edit_locked";
-        r.error_message = agentLockReason(docMirror.docId());
-        toast(ui::ToastLevel::Warn, r.error_message);
         return r;
     }
     core::OpsResponse r = docMirror.redo(worker);
@@ -1642,6 +1946,9 @@ core::OpsResponse AppState::docRedo() {
 
 // Provision (force=false) or repair (force=true) the runtime on a background thread.
 void AppState::startSetup(bool force) {
+    // Startup owns the process/pipe lifecycle and may still publish a new child.
+    // UI repair controls are disabled too; programmatic repair must obey the same gate.
+    if (workerBootPending) return;
     if (setupRunning.exchange(true)) return;
     if (force) {
         // A repair rebuilds the venv from scratch (rmtree + recreate). The running worker
@@ -1678,30 +1985,66 @@ void AppState::tryStartWorker() {
     status = "Ready.";
     statusKind = 0;
     addLog("[ok] daemon mode (web): shared chudware-hostd is the backend");
-    return;
+#else
+    if (setupRunning.load()) return;
+    if (workerBoot.valid()) return;
+    workerBootPending = true;
+    workerBoot = std::async(std::launch::async, [this] {
+        WorkerBootResult result;
+        result.started = worker.start(result.workerError);
+        if (!result.started) {
+            result.daemonBackend = engine::daemonMode();
+            if (!result.daemonBackend)
+                result.coreLoaded = core::cpp_core().ensureLoaded(result.coreError);
+        }
+        ui::anim::wakeLoop();
+        return result;
+    });
 #endif
-    workerStarted = worker.start(werr);
+}
+
+void AppState::waitWorkerStartup() {
+#ifndef __EMSCRIPTEN__
+    if (workerBoot.valid()) workerBoot.wait();
+#endif
+}
+
+bool AppState::pollWorkerStartup() {
+#ifdef __EMSCRIPTEN__
+    if (!workerBootPending || !workerStarted) return false;
+    workerBootPending = false;
+    return true;
+#else
+    if (!workerBoot.valid() ||
+        workerBoot.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+        return false;
+    auto result = workerBoot.get();
+    workerBootPending = false;
+    workerStarted = result.started;
+    werr = std::move(result.workerError);
     if (workerStarted) {
         status = "Ready.";
         statusKind = 0;
         addLog("[ok] kernel worker ready");
-        return;
+        return true;
+    }
+    if (result.daemonBackend) {
+        // The shared daemon already won the backend verdict. Do not dlopen a
+        // second, unused OCCT core: its loader lock can stall unrelated GUI
+        // thread creation even though this boot itself runs off-thread.
+        workerStarted = true;
+        status = "Ready.";
+        statusKind = 0;
+        addLog("[ok] shared engine backend selected (managed worker unavailable)");
+        return true;
     }
     addLog("[err] worker: " + werr);
     // If the managed worker is unavailable, the in-process C++ core is the
     // cross-platform fallback (doc/agent/sim ops route through cpp_core). This
     // is also what makes a clean Windows CI checkout able to run headless shots
     // without provisioning the Python runtime first.
-    //
-    // NOTE: when CHUDWARE_ENGINE_DAEMON is unset/1 (default), engine::call goes
-    // to chudware-hostd, which dlopens its OWN libchudware. The path logged here
-    // is the GUI process's in-proc load (fallback / parity); hostd's path is in
-    // its stderr "[cpp_core] loaded ..." line and in daemon hello
-    // engine_build_id. Stale hostd holding an old library is the classic trap:
-    // stop it after a core rebuild, or wait for hostd's mtime self-drain.
     {
-        std::string lerr;
-        if (core::cpp_core().ensureLoaded(lerr)) {
+        if (result.coreLoaded) {
             // Treat the in-process C++ core as the live backend: the ~50 `workerStarted` gates
             // across the UI (FeatureManager toolbar / doc ops / panels) must pass, since RPCs
             // route to libchudware via worker_client. (worker_client's own `running_` stays false,
@@ -1715,9 +2058,9 @@ void AppState::tryStartWorker() {
                    (path.empty() ? std::string("?") : path) +
                    " abi=" + core::cpp_core().abiVersion() +
                    (bid.empty() ? std::string() : (" build_id=" + bid)));
-            return;
+            return true;
         }
-        addLog("[..] libchudware not loaded: " + lerr);
+        addLog("[..] libchudware not loaded: " + result.coreError);
     }
     if (!autoSetupTried && !setupRunning.load()) {
         autoSetupTried = true;
@@ -1727,6 +2070,8 @@ void AppState::tryStartWorker() {
         status = "Runtime needs setup";
         statusKind = 2;
     }
+    return true;
+#endif
 }
 
 void AppState::clearSelection() {
@@ -1787,55 +2132,32 @@ void AppState::showPartMesh(int sel) {
     else addLog("[err] part mesh: " + e);
 }
 
-// Convert one AICM body's tessellation to a shaded Mesh (for the studio pass + camera bounds).
-// Faithfully reuses the AICM positions/normals/indices and the per-EDGE polylines as feature
-// edges, so the shaded view matches exactly what the id pass picks.
-static Mesh meshFromBody(const render::BodyMesh& b) {
-    Mesh m;
-    m.positions = b.pos;
-    m.normals = b.nrm;
-    m.indices = b.idx;
-    // feature edges: emit every segment of every edge polyline as a line-list pair
-    for (const auto& es : b.edges) {
-        for (uint32_t i = 0; i + 1 < es.pt_count; ++i) {
-            const float* a = &b.edge_pts[(size_t)(es.first_pt + i) * 3];
-            const float* c = &b.edge_pts[(size_t)(es.first_pt + i + 1) * 3];
-            m.edgeLines.insert(m.edgeLines.end(), {a[0], a[1], a[2], c[0], c[1], c[2]});
-        }
-    }
-    // bounds from positions
-    Vec3 mn(1e30f, 1e30f, 1e30f), mx(-1e30f, -1e30f, -1e30f);
-    for (size_t i = 0; i + 2 < b.pos.size(); i += 3) {
-        float x = b.pos[i], y = b.pos[i + 1], z = b.pos[i + 2];
-        if (x < mn.x) mn.x = x; if (y < mn.y) mn.y = y; if (z < mn.z) mn.z = z;
-        if (x > mx.x) mx.x = x; if (y > mx.y) mx.y = y; if (z > mx.z) mx.z = z;
-    }
-    m.bbMin = mn; m.bbMax = mx; m.center = (mn + mx) * 0.5f;
-    m.radius = std::max(0.001f, length(mx - mn) * 0.5f);
-    return m;
-}
-
 static std::vector<Renderer::PartMesh> rendererPartsFromDoc(
-    const AppState& st, const render::DocMesh& doc) {
+    const AppState& st, render::DocMesh& doc, bool includeFields = true) {
     std::vector<Renderer::PartMesh> parts;
     parts.reserve(doc.bodies.size());
-    for (const auto& b : doc.bodies) {
+    for (auto& b : doc.bodies) {
         if (b.pos.empty()) continue;
         Renderer::PartMesh pm;
-        pm.mesh = meshFromBody(b);
+        pm.mesh = std::move(b.shadedMesh);
         pm.color[0] = b.color[0];
         pm.color[1] = b.color[1];
         pm.color[2] = b.color[2];
         pm.metallic = b.metallic;
         pm.roughness = b.roughness;
+        // Cached document consumers (thumbnails and motion) still need these regions.
         pm.appearance_regions = b.appearance_regions;
         pm.body_id = b.body_id;
         pm.faces.reserve(b.faces.size());
         for (const auto& fr : b.faces)
             pm.faces.push_back({fr.face_id, fr.first_tri, fr.tri_count});
-        const render::ScalarField* chosen = nullptr;
-        for (const auto& sc : doc.scalars) {
-            if (sc.body_id != b.body_id || sc.values.size() != b.n_verts) continue;
+        if (!includeFields) {
+            parts.push_back(std::move(pm));
+            continue;
+        }
+        render::ScalarField* chosen = nullptr;
+        for (auto& sc : doc.scalars) {
+            if (sc.body_id != b.body_id || sc.valueCount != b.n_verts) continue;
             if (sc.name == st.activeScalarField) {
                 chosen = &sc;
                 break;
@@ -1843,13 +2165,13 @@ static std::vector<Renderer::PartMesh> rendererPartsFromDoc(
             if (!chosen) chosen = &sc;
         }
         if (chosen) {
-            pm.scalar = chosen->values;
+            pm.scalar = std::move(chosen->values);
             pm.scalarMin = chosen->vmin;
             pm.scalarMax = chosen->vmax;
         }
-        for (const auto& df : doc.displacements) {
-            if (df.body_id == b.body_id && df.vec.size() == (size_t)b.n_verts * 3) {
-                pm.disp = df.vec;
+        for (auto& df : doc.displacements) {
+            if (df.body_id == b.body_id && df.vectorSize == (size_t)b.n_verts * 3) {
+                pm.disp = std::move(df.vec);
                 pm.dispScaleHint = df.scale_hint;
                 break;
             }
@@ -1875,18 +2197,28 @@ static void clearPickBuffers(render::IdPass* idPass, render::Overlays* overlays)
 // docs; it runs here. GL upload + AppState cache commit stay on the GL thread in
 // drainMeshLoads / commitDocMeshFromParsed.
 namespace {
+struct SyncMeshResult {
+    std::mutex mutex;
+    std::condition_variable ready;
+    render::DocMesh doc;
+    std::string err;
+    bool done = false, ok = false;
+};
 struct MeshLoadJob {
     uint64_t gen = 0;
     std::string path;
     bool renderOnly = false;
     bool cacheAsModel = true;
     bool cacheOnly = false;
+    bool preserveSelection = false;
+    bool deferWhileEditing = false;
     std::string docId;
     int revision = -1;
     std::chrono::steady_clock::time_point queuedAt;
     bool ok = false;
     std::string err;
     render::DocMesh doc;
+    std::shared_ptr<SyncMeshResult> sync;
 };
 std::mutex              g_meshMtx;
 std::condition_variable g_meshCv;
@@ -1914,10 +2246,24 @@ void meshLoaderMain() {
             g_meshQueue.erase(it);
         }
         job.ok = render::loadAicmFile(job.path, job.doc, job.err);
+        if (job.sync) {
+            auto result = std::move(job.sync);
+            {
+                std::lock_guard<std::mutex> lk(result->mutex);
+                result->doc = std::move(job.doc);
+                result->err = std::move(job.err);
+                result->ok = job.ok;
+                result->done = true;
+            }
+            result->ready.notify_one();
+            ui::anim::wakeLoop();
+            continue;
+        }
         {
             std::lock_guard<std::mutex> lk(g_meshMtx);
             g_meshReady.push_back(std::move(job));
         }
+        ui::anim::wakeLoop();
     }
 }
 
@@ -1943,12 +2289,37 @@ void stopMeshLoaderThread() {
         g_meshReady.clear();
     }
 }
+
+bool loadParsedMeshSync(const std::string& path, render::DocMesh& doc, std::string& err) {
+#ifdef __EMSCRIPTEN__
+    return render::loadAicmFile(path, doc, err);
+#else
+    ensureMeshLoader();
+    auto result = std::make_shared<SyncMeshResult>();
+    {
+        std::lock_guard<std::mutex> lk(g_meshMtx);
+        MeshLoadJob job;
+        job.path = path;
+        job.sync = result;
+        g_meshQueue.push_front(std::move(job));
+    }
+    g_meshCv.notify_one();
+    std::unique_lock<std::mutex> lock(result->mutex);
+    result->ready.wait(lock, [&] { return result->done; });
+    doc = std::move(result->doc);
+    err = std::move(result->err);
+    return result->ok;
+#endif
+}
 }  // namespace
 
 // Join the loader before process exit. A joinable static std::thread
 // dtor calls std::terminate ("terminate called without an active exception") —
 // seen as a full-app crash when teardown races vendor-browser / CEF exit paths.
-void AppState::stopMeshLoader() { stopMeshLoaderThread(); }
+void AppState::stopMeshLoader() {
+    stopMeshLoaderThread();
+    flushConfigWrites();
+}
 
 // Commit a parsed DocMesh onto the GL-side state (setMeshes / id-pass / pick caches).
 // Shared by the sync loadDocMesh path and drainMeshLoads. Requires GL context.
@@ -1957,26 +2328,46 @@ static bool commitDocMeshFromParsed(AppState& st, render::DocMesh& doc, std::str
 
 bool AppState::loadDocMesh(const std::string& aicmPath, std::string& err, bool renderOnly,
                           bool cacheAsModel) {
-    if (!renderer || !idPass || !overlays) { err = "render objects not initialized"; return false; }
+    const auto retryModel = [&] {
+        if (!renderOnly && cacheAsModel && tabIndexForActiveDoc() >= 0)
+            core::requireDocMesh(docMirror.docId(), docMirror.revision());
+    };
+    if (!renderer || !idPass || !overlays) {
+        err = "render objects not initialized";
+        retryModel();
+        return false;
+    }
     render::DocMesh doc;
-    if (!render::loadAicmFile(aicmPath, doc, err)) return false;
+    if (!loadParsedMeshSync(aicmPath, doc, err)) { retryModel(); return false; }
     if (!cacheAsModel) renderer->parkActiveMeshes();
-    if (!commitDocMeshFromParsed(*this, doc, err, renderOnly)) return false;
+    if (!commitDocMeshFromParsed(*this, doc, err, renderOnly)) { retryModel(); return false; }
     if (!renderOnly && cacheAsModel && docMirror.hasDoc()) {
         renderer->setActiveMeshIdentity(docMirror.docId(), docMirror.revision());
+        committedMeshDocId = docMirror.docId();
+        committedMeshRevision = docMirror.revision();
+        core::meshCatchupFinished(committedMeshDocId, committedMeshRevision, true);
         if (DocSession* s = activeSession()) {
             s->cachedAicmPath = aicmPath;
             s->cachedRevision = docMirror.revision();
             s->cachedMirror = docMirror.snapshot();
             s->cachedDocMesh = std::make_shared<render::DocMesh>(std::move(doc));
+            docMeshAnalysisOwner = s->cachedDocMesh;
         }
     }
     return true;
 }
 
-void AppState::loadDocMeshAsync(const std::string& aicmPath, bool renderOnly, bool cacheAsModel) {
+void AppState::loadDocMeshAsync(const std::string& aicmPath, bool renderOnly,
+                              bool cacheAsModel, bool preserveSelection,
+                              bool deferWhileEditing) {
     if (aicmPath.empty()) return;
-    if (!renderer || !idPass || !overlays) return;
+    if (!renderOnly && cacheAsModel && tabIndexForActiveDoc() >= 0)
+        core::meshCatchupStarted(docMirror.docId(), docMirror.revision());
+    if (!renderer || !idPass || !overlays) {
+        if (!renderOnly && cacheAsModel)
+            core::meshCatchupFinished(docMirror.docId(), docMirror.revision(), false);
+        return;
+    }
     ensureMeshLoader();
     const uint64_t gen = ++meshGen_;
     {
@@ -1984,13 +2375,24 @@ void AppState::loadDocMeshAsync(const std::string& aicmPath, bool renderOnly, bo
         // Latest visible load wins, but pushed background-cache jobs are independent.
         g_meshQueue.erase(
             std::remove_if(g_meshQueue.begin(), g_meshQueue.end(),
-                           [](const MeshLoadJob& j) { return !j.cacheOnly; }),
+                           [&](const MeshLoadJob& j) {
+                               if (j.cacheOnly) return false;
+                               if (j.docId != docMirror.docId() || j.revision != docMirror.revision())
+                                   core::meshCatchupFinished(j.docId, j.revision, false);
+                               return true;
+                           }),
             g_meshQueue.end());
         MeshLoadJob job;
         job.gen = gen;
         job.path = aicmPath;
         job.renderOnly = renderOnly;
         job.cacheAsModel = cacheAsModel;
+        job.preserveSelection = preserveSelection;
+        job.deferWhileEditing = deferWhileEditing;
+        if (!renderOnly && cacheAsModel) {
+            job.docId = docMirror.docId();
+            job.revision = docMirror.revision();
+        }
         job.queuedAt = std::chrono::steady_clock::now();
         g_meshQueue.push_back(std::move(job));
     }
@@ -1999,14 +2401,19 @@ void AppState::loadDocMeshAsync(const std::string& aicmPath, bool renderOnly, bo
 
 void AppState::cacheBackgroundDocMeshAsync(const std::string& docId, int revision,
                                            const std::string& aicmPath) {
-    if (docId.empty() || revision < 0 || aicmPath.empty() || !renderer) return;
+    if (docId.empty() || revision < 0 || aicmPath.empty()) return;
+    core::meshCatchupStarted(docId, revision);
+    if (!renderer) { core::meshCatchupFinished(docId, revision, false); return; }
     ensureMeshLoader();
     {
         std::lock_guard<std::mutex> lk(g_meshMtx);
         g_meshQueue.erase(
             std::remove_if(g_meshQueue.begin(), g_meshQueue.end(),
                            [&](const MeshLoadJob& j) {
-                               return j.cacheOnly && j.docId == docId;
+                               if (!j.cacheOnly || j.docId != docId) return false;
+                               if (j.revision != revision)
+                                   core::meshCatchupFinished(j.docId, j.revision, false);
+                               return true;
                            }),
             g_meshQueue.end());
         MeshLoadJob job;
@@ -2029,18 +2436,15 @@ void AppState::drainMeshLoads() {
         ready.swap(g_meshReady);
     }
     const uint64_t cur = meshGen_.load();
-    // Inactive pushed revisions prewarm their parsed+GPU caches without touching the viewport.
-    // Cap the GPU uploads per frame: with an AI swarm pushing revisions to dozens of mirror
-    // tabs, committing every parsed prewarm in one drain stacked that many full-mesh uploads
-    // into a single frame and visibly hitched the viewport. Deferred jobs go back to the
-    // ready queue (front, order kept) and commit on the following frames.
-    constexpr int kMaxPrewarmCommitsPerFrame = 2;
-    int prewarmCommits = 0;
+    // Prewarm at most one upload beyond the elapsed budget; a single body upload is
+    // indivisible, but a swarm's backlog must not stack arbitrary commits in one frame.
+    const auto prewarmDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(4);
     std::vector<MeshLoadJob> deferred;
     for (auto& j : ready) {
         if (!j.cacheOnly) continue;
         if (!j.ok) {
             addLog("[daemon] background mesh parse failed for " + j.docId + ": " + j.err);
+            core::meshCatchupFinished(j.docId, j.revision, false);
             continue;
         }
         DocTab* cachedTab = nullptr;
@@ -2052,54 +2456,99 @@ void AppState::drainMeshLoads() {
                 break;
             }
         }
-        if (!cachedTab) continue;  // tab closed or a newer pushed revision superseded this parse
-        if (prewarmCommits >= kMaxPrewarmCommitsPerFrame) {
+        if (!cachedTab) {
+            core::meshCatchupFinished(j.docId, j.revision, false);
+            continue;
+        }
+        if (std::chrono::steady_clock::now() >= prewarmDeadline) {
             deferred.push_back(std::move(j));
             continue;
         }
-        ++prewarmCommits;
         DocSession* session = cachedTab->session.get();
-        const auto parts = rendererPartsFromDoc(*this, j.doc);
-        renderer->cacheMeshes(j.docId, j.revision, parts);
+        auto parts = rendererPartsFromDoc(*this, j.doc);
+        renderer->cacheMeshes(j.docId, j.revision, std::move(parts));
         session->cachedDocMesh = std::make_shared<render::DocMesh>(std::move(j.doc));
         cachedTab->meshCacheInvalidated = false;
+        if (activeTab < 0 || activeTab >= (int)docTabs.size() ||
+            docTabs[activeTab].docId != j.docId)
+            core::meshCatchupFinished(j.docId, j.revision, true);
         const double ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - j.queuedAt).count();
         const std::string perf = "[perf] live_mesh_prewarm doc=" + j.docId + " rev=" +
             std::to_string(j.revision) + " total=" + std::to_string(ms) + "ms";
         addLog(perf);
-        std::fprintf(stderr, "%s\n", perf.c_str());
-        std::fflush(stderr);
     }
     if (!deferred.empty()) {
         std::lock_guard<std::mutex> lk(g_meshMtx);
         g_meshReady.insert(g_meshReady.begin(),
                            std::make_move_iterator(deferred.begin()),
                            std::make_move_iterator(deferred.end()));
+        ui::anim::requestFrames();
     }
     // Apply only the newest visible job that still matches meshGen_.
     MeshLoadJob* best = nullptr;
     for (auto& j : ready) {
         if (!j.cacheOnly && j.gen == cur) best = &j;
     }
+    for (const auto& j : ready)
+        if (!j.cacheOnly && j.gen != cur &&
+            (!best || j.docId != best->docId || j.revision != best->revision))
+            core::meshCatchupFinished(j.docId, j.revision, false);
     if (!best) return;
+    // Switching to an empty/drawing tab need not enqueue another mesh load. Do
+    // not commit the old document's completion under the new selection, or pair
+    // an older AICM with a newer mirror revision.
+    if (!best->docId.empty() &&
+        (docMirror.docId() != best->docId || docMirror.revision() != best->revision ||
+         activeTab < 0 || activeTab >= (int)docTabs.size() ||
+         docTabs[activeTab].docId != best->docId)) {
+        core::meshCatchupFinished(best->docId, best->revision, false);
+        return;
+    }
+    if (best->deferWhileEditing &&
+        ((sketchMode && sketchMode->active()) ||
+         (sketch3dMode && sketch3dMode->active()) ||
+         (propertyManager && propertyManager->active()))) {
+        core::meshCatchupFinished(best->docId, best->revision, false);
+        return;
+    }
     if (!best->ok) {
         addLog("[err] loadDocMeshAsync: " + best->err);
+        core::meshCatchupFinished(best->docId, best->revision, false);
         return;
     }
     std::string err;
     if (!best->cacheAsModel) renderer->parkActiveMeshes();
-    if (!commitDocMeshFromParsed(*this, best->doc, err, best->renderOnly)) {
+    std::vector<core::SelItem> savedSelection;
+    render::PickHit savedHover;
+    std::string savedPickStatus;
+    if (best->preserveSelection) {
+        savedSelection = std::move(selection.mutableItems());
+        savedHover = hover;
+        savedPickStatus = std::move(pickStatus);
+    }
+    const bool committed = commitDocMeshFromParsed(*this, best->doc, err, best->renderOnly);
+    if (best->preserveSelection) {
+        selection.mutableItems() = std::move(savedSelection);
+        hover = savedHover;
+        pickStatus = std::move(savedPickStatus);
+    }
+    if (!committed) {
         if (!err.empty()) addLog("[err] loadDocMeshAsync commit: " + err);
+        core::meshCatchupFinished(best->docId, best->revision, false);
         return;
     }
     if (!best->renderOnly && best->cacheAsModel && docMirror.hasDoc()) {
         renderer->setActiveMeshIdentity(docMirror.docId(), docMirror.revision());
+        committedMeshDocId = best->docId;
+        committedMeshRevision = best->revision;
+        core::meshCatchupFinished(best->docId, best->revision, true);
         if (DocSession* s = activeSession()) {
             s->cachedAicmPath = best->path;
             s->cachedRevision = docMirror.revision();
             s->cachedMirror = docMirror.snapshot();
             s->cachedDocMesh = std::make_shared<render::DocMesh>(std::move(best->doc));
+            docMeshAnalysisOwner = s->cachedDocMesh;
         }
         if (activeTab >= 0 && activeTab < (int)docTabs.size() &&
             docTabs[activeTab].docId == docMirror.docId()) {
@@ -2110,8 +2559,6 @@ void AppState::drainMeshLoads() {
         const std::string perf = "[perf] live_mesh_refresh doc=" + docMirror.docId() + " rev=" +
             std::to_string(docMirror.revision()) + " total=" + std::to_string(ms) + "ms";
         addLog(perf);
-        std::fprintf(stderr, "%s\n", perf.c_str());
-        std::fflush(stderr);
     }
 }
 
@@ -2125,23 +2572,11 @@ static bool commitDocMeshFromParsed(AppState& st, render::DocMesh& doc, std::str
         // Render-only (blend live preview): replace ONLY the shaded meshes; leave the id-pass,
         // st.overlays, pick caches, st.selection and st.hasDocMesh as the base-body load left them, so picks
         // and highlights keep resolving against the un-rounded base while the user sees the round.
-        std::vector<Renderer::PartMesh> rpms;
-        for (const auto& b : doc.bodies) {
-            if (b.pos.empty()) continue;
-            Renderer::PartMesh pm;
-            pm.mesh = meshFromBody(b);
-            pm.color[0] = b.color[0]; pm.color[1] = b.color[1]; pm.color[2] = b.color[2];
-            pm.metallic = b.metallic; pm.roughness = b.roughness;
-            pm.appearance_regions = b.appearance_regions;
-            pm.body_id = b.body_id;
-            pm.faces.reserve(b.faces.size());
-            for (const auto& fr : b.faces)
-                pm.faces.push_back({fr.face_id, fr.first_tri, fr.tri_count});
-            rpms.push_back(std::move(pm));
-        }
-        st.renderer->setMeshes(rpms);
+        auto rpms = rendererPartsFromDoc(st, doc, false);
+        st.renderer->setMeshes(std::move(rpms));
         return true;
     }
+    st.parkMeshAnalysis();
     if (doc.bodies.empty()) {
         // C48: a rebuild can legitimately produce ZERO bodies — every solid feature rolled
         // back (rollback bar), suppressed, or deleted, or a sketch-only document. That is an
@@ -2172,60 +2607,40 @@ static bool commitDocMeshFromParsed(AppState& st, render::DocMesh& doc, std::str
 
     // Shaded view: render each body with its AICM color (camera bounds come from here).
     // C19: attach any SCLR / DISP overlay arrays so the st.renderer can colormap + deform.
-    std::vector<Renderer::PartMesh> pms;
     std::vector<uint32_t> newBodyIds;  // AICM body id per st.renderer slot (parallels pms)
     st.docMeshHasScalar = false;
     st.docMeshHasDisp = false;
     for (const auto& b : doc.bodies) {
         if (b.pos.empty()) continue;
         newBodyIds.push_back(b.body_id);
-        Renderer::PartMesh pm;
-        if (!shadedAlreadyBound) {
-            pm.mesh = meshFromBody(b);
-            pm.color[0] = b.color[0]; pm.color[1] = b.color[1]; pm.color[2] = b.color[2];
-            pm.metallic = b.metallic; pm.roughness = b.roughness;
-            pm.appearance_regions = b.appearance_regions;
-            // Face runs share the unmodified body index buffer for edit-preview isolation.
-            pm.body_id = b.body_id;
-            pm.faces.reserve(b.faces.size());
-            for (const auto& fr : b.faces)
-                pm.faces.push_back({fr.face_id, fr.first_tri, fr.tri_count});
-        }
         // Prefer the selected result field; fall back to the first valid field for this body.
         const render::ScalarField* chosen = nullptr;
         for (const auto& sc : doc.scalars) {
-            if (sc.body_id != b.body_id || sc.values.size() != b.n_verts) continue;
+            if (sc.body_id != b.body_id || sc.valueCount != b.n_verts) continue;
             if (sc.name == st.activeScalarField) { chosen = &sc; break; }
             if (!chosen) chosen = &sc;
         }
         if (chosen) {
-            st.docMeshHasScalar |= !chosen->values.empty();
-            if (!shadedAlreadyBound) {
-                pm.scalar = chosen->values;
-                pm.scalarMin = chosen->vmin;
-                pm.scalarMax = chosen->vmax;
-            }
+            st.docMeshHasScalar |= chosen->valueCount != 0;
         }
         // First displacement field for this body (FEA deformed shape).
         for (const auto& df : doc.displacements) {
-            if (df.body_id == b.body_id && df.vec.size() == (size_t)b.n_verts * 3) {
-                if (!df.vec.empty()) {
+            if (df.body_id == b.body_id && df.vectorSize == (size_t)b.n_verts * 3) {
+                if (df.vectorSize != 0) {
                     st.docMeshHasDisp = true;
                     st.dispScaleHint = df.scale_hint;
-                }
-                if (!shadedAlreadyBound) {
-                    pm.disp = df.vec;
-                    pm.dispScaleHint = df.scale_hint;
                 }
                 break;
             }
         }
-        if (!shadedAlreadyBound) pms.push_back(std::move(pm));
     }
     // C48: unconditional — pms can be empty when every body has no triangles; keeping the
     // previous meshes would desync the viewport from the document (same stale-mesh bug as
     // the zero-bodies case above).
-    if (!shadedAlreadyBound) st.renderer->setMeshes(pms);
+    if (!shadedAlreadyBound) {
+        auto pms = rendererPartsFromDoc(st, doc);
+        st.renderer->setMeshes(std::move(pms));
+    }
 
 
     if (!st.idPass->setDoc(doc, err)) return false;
@@ -2240,109 +2655,10 @@ static bool commitDocMeshFromParsed(AppState& st, render::DocMesh& doc, std::str
     st.docBodyIds = std::move(newBodyIds);
     st.applyBodyVisibility();
 
-    // C26-C: build per-face normal + centroid cache while the DocMesh is still in memory.
-    // For each face, accumulate area-weighted triangle normals and centroids.
-    st.faceNormalCache.clear();
-    for (const auto& b : doc.bodies) {
-        if (b.pos.empty() || b.idx.empty() || b.faces.empty()) continue;
-        for (const auto& fr : b.faces) {
-            float nx = 0, ny = 0, nz = 0;  // accumulated area-weighted normal
-            float cx = 0, cy = 0, cz = 0;  // accumulated area-weighted centroid
-            float totalArea = 0;
-            for (uint32_t t = 0; t < fr.tri_count; ++t) {
-                size_t base = (size_t)(fr.first_tri + t) * 3;
-                if (base + 2 >= b.idx.size()) break;
-                uint32_t i0 = b.idx[base], i1 = b.idx[base + 1], i2 = b.idx[base + 2];
-                // vertex positions
-                const float* p0 = &b.pos[(size_t)i0 * 3];
-                const float* p1 = &b.pos[(size_t)i1 * 3];
-                const float* p2 = &b.pos[(size_t)i2 * 3];
-                // edge vectors
-                float e1x = p1[0]-p0[0], e1y = p1[1]-p0[1], e1z = p1[2]-p0[2];
-                float e2x = p2[0]-p0[0], e2y = p2[1]-p0[1], e2z = p2[2]-p0[2];
-                // cross product (area-weighted normal, magnitude = 2*area)
-                float crx = e1y*e2z - e1z*e2y;
-                float cry = e1z*e2x - e1x*e2z;
-                float crz = e1x*e2y - e1y*e2x;
-                float area = std::sqrt(crx*crx + cry*cry + crz*crz);
-                nx += crx; ny += cry; nz += crz;
-                float triCx = (p0[0]+p1[0]+p2[0]) * (1.0f/3.0f);
-                float triCy = (p0[1]+p1[1]+p2[1]) * (1.0f/3.0f);
-                float triCz = (p0[2]+p1[2]+p2[2]) * (1.0f/3.0f);
-                cx += triCx * area; cy += triCy * area; cz += triCz * area;
-                totalArea += area;
-            }
-            // normalize normal; normalize centroid by total area
-            float len = std::sqrt(nx*nx + ny*ny + nz*nz);
-            if (len < 1e-12f) continue;
-            nx /= len; ny /= len; nz /= len;
-            if (totalArea > 1e-12f) { cx /= totalArea; cy /= totalArea; cz /= totalArea; }
-            uint64_t key = ((uint64_t)b.body_id << 32) | (uint64_t)fr.face_id;
-            st.faceNormalCache[key] = {nx, ny, nz, cx, cy, cz};
-        }
-    }
-
-    // C27-A: per-edge centroid cache (mean of each edge's polyline points). Mirrors the face-cache
-    // keying so callout anchors can resolve PickKind::Edge topo ids -> a world point.
-    st.edgeCentroidCache.clear();
-    for (const auto& b : doc.bodies) {
-        if (b.edges.empty() || b.edge_pts.empty()) continue;
-        for (const auto& es : b.edges) {
-            if (es.pt_count == 0) continue;
-            double cx = 0, cy = 0, cz = 0;
-            uint32_t n = 0;
-            for (uint32_t p = 0; p < es.pt_count; ++p) {
-                size_t base = (size_t)(es.first_pt + p) * 3;
-                if (base + 2 >= b.edge_pts.size()) break;
-                cx += b.edge_pts[base]; cy += b.edge_pts[base + 1]; cz += b.edge_pts[base + 2];
-                ++n;
-            }
-            if (n == 0) continue;
-            uint64_t key = ((uint64_t)b.body_id << 32) | (uint64_t)es.edge_id;
-            st.edgeCentroidCache[key] = {(float)(cx / n), (float)(cy / n), (float)(cz / n)};
-        }
-    }
-
-    // W1-B (item 8): per-body and per-face axis-aligned bounding-box caches for Zoom-to-Selection.
-    // Built from the same in-memory DocMesh positions; consumed by a later wave's zoom-to-fit.
-    st.bodyBBoxCache.clear();
-    st.faceBBoxCache.clear();
-    for (const auto& b : doc.bodies) {
-        if (b.pos.empty()) continue;
-        // Body bbox: sweep all positions.
-        float bmn[3] = {1e30f, 1e30f, 1e30f}, bmx[3] = {-1e30f, -1e30f, -1e30f};
-        for (size_t i = 0; i + 2 < b.pos.size(); i += 3) {
-            for (int c = 0; c < 3; ++c) {
-                float v = b.pos[i + c];
-                if (v < bmn[c]) bmn[c] = v;
-                if (v > bmx[c]) bmx[c] = v;
-            }
-        }
-        st.bodyBBoxCache[b.body_id] = {bmn[0], bmn[1], bmn[2], bmx[0], bmx[1], bmx[2]};
-        // Per-face bbox: sweep the vertices referenced by each face's triangle range.
-        if (b.idx.empty() || b.faces.empty()) continue;
-        for (const auto& fr : b.faces) {
-            if (fr.tri_count == 0) continue;
-            float fmn[3] = {1e30f, 1e30f, 1e30f}, fmx[3] = {-1e30f, -1e30f, -1e30f};
-            bool any = false;
-            for (uint32_t t = 0; t < fr.tri_count; ++t) {
-                size_t base = (size_t)(fr.first_tri + t) * 3;
-                if (base + 2 >= b.idx.size()) break;
-                for (int k = 0; k < 3; ++k) {
-                    uint32_t vi = b.idx[base + k];
-                    const float* p = &b.pos[(size_t)vi * 3];
-                    for (int c = 0; c < 3; ++c) {
-                        if (p[c] < fmn[c]) fmn[c] = p[c];
-                        if (p[c] > fmx[c]) fmx[c] = p[c];
-                    }
-                    any = true;
-                }
-            }
-            if (!any) continue;
-            uint64_t key = ((uint64_t)b.body_id << 32) | (uint64_t)fr.face_id;
-            st.faceBBoxCache[key] = {fmn[0], fmn[1], fmn[2], fmx[0], fmx[1], fmx[2]};
-        }
-    }
+    st.faceNormalCache = std::move(doc.faceNormalCache);
+    st.edgeCentroidCache = std::move(doc.edgeCentroidCache);
+    st.bodyBBoxCache = std::move(doc.bodyBBoxCache);
+    st.faceBBoxCache = std::move(doc.faceBBoxCache);
 
     st.selection.clear();
     st.hover = render::PickHit{};
@@ -2371,12 +2687,44 @@ bool AppState::bindCachedDocMesh(DocSession& s, std::string& err) {
         return false;
     }
     const bool gpuBound = renderer->bindCachedMeshes(s.cachedMirror.docId, s.cachedRevision);
-    if (!commitDocMeshFromParsed(*this, *s.cachedDocMesh, err, false, gpuBound)) return false;
+    if (!gpuBound && !s.cachedDocMesh->bodies.empty()) {
+        if (s.cachedAicmPath.empty()) {
+            err = "cached tessellation has no reload path";
+            return false;
+        }
+        unloadDocMesh();
+        loadDocMeshAsync(s.cachedAicmPath, false, true, true);
+        return true;
+    }
+    if (!commitDocMeshFromParsed(*this, *s.cachedDocMesh, err, false, gpuBound)) {
+        core::requireDocMesh(s.cachedMirror.docId, s.cachedRevision);
+        return false;
+    }
+    docMeshAnalysisOwner = s.cachedDocMesh;
     renderer->setActiveMeshIdentity(s.cachedMirror.docId, s.cachedRevision);
+    committedMeshDocId = s.cachedMirror.docId;
+    committedMeshRevision = s.cachedRevision;
+    core::meshCatchupFinished(committedMeshDocId, committedMeshRevision, true);
     return true;
 }
 
+void AppState::parkMeshAnalysis() {
+    if (auto owner = docMeshAnalysisOwner.lock()) {
+        owner->faceNormalCache = std::move(faceNormalCache);
+        owner->edgeCentroidCache = std::move(edgeCentroidCache);
+        owner->bodyBBoxCache = std::move(bodyBBoxCache);
+        owner->faceBBoxCache = std::move(faceBBoxCache);
+    }
+    docMeshAnalysisOwner.reset();
+}
+
 void AppState::unloadDocMesh() {
+    // An older in-flight load must not resurrect geometry after an empty push
+    // or after the user switches to a tab with no model.
+    ++meshGen_;
+    committedMeshDocId.clear();
+    committedMeshRevision = -1;
+    parkMeshAnalysis();
     if (renderer) renderer->setMeshes(std::vector<Renderer::PartMesh>{});
     clearPickBuffers(idPass, overlays);
     faceNormalCache.clear();
@@ -2390,6 +2738,10 @@ void AppState::unloadDocMesh() {
 }
 
 void AppState::clearViewportForNewDoc() {
+    ++meshGen_;
+    committedMeshDocId.clear();
+    committedMeshRevision = -1;
+    parkMeshAnalysis();
     if (renderer) {
         renderer->parkActiveMeshes();
         renderer->setMeshes(std::vector<Renderer::PartMesh>{});
@@ -2400,6 +2752,7 @@ void AppState::clearViewportForNewDoc() {
     // must never leak into the next document).
     bodyVisible.clear();
     docBodyIds.clear();
+    componentHiddenOverrides.clear();
     hiddenFeatures.clear();
     autoHiddenPlanes.clear();
     datumPlanesUserToggled.clear();
@@ -2472,6 +2825,8 @@ void AppState::captureDocState(DocSession& s) {
     s.pickStatus   = std::move(pickStatus);
     s.bodyVisible  = std::move(bodyVisible);
     s.docBodyIds   = std::move(docBodyIds);
+    s.componentHiddenOverrides = std::move(componentHiddenOverrides);
+    parkMeshAnalysis();
     s.hiddenFeatures = std::move(hiddenFeatures);
     s.autoHiddenPlanes = std::move(autoHiddenPlanes);
     s.datumPlanesUserToggled = std::move(datumPlanesUserToggled);
@@ -2499,6 +2854,7 @@ void AppState::captureDocState(DocSession& s) {
 void AppState::restoreDocState(DocSession& s) {
     bodyVisible  = std::move(s.bodyVisible);
     docBodyIds   = std::move(s.docBodyIds);
+    componentHiddenOverrides = std::move(s.componentHiddenOverrides);
     hiddenFeatures = std::move(s.hiddenFeatures);
     autoHiddenPlanes = std::move(s.autoHiddenPlanes);
     datumPlanesUserToggled = std::move(s.datumPlanesUserToggled);
@@ -2607,74 +2963,66 @@ void AppState::enterComponentEdit(const std::string& componentId, const std::str
     requestOpenPath = sourceAbsPath;
 }
 
-// Exit component-edit: persist the edited component to disk, then switch back to the assembly with a
-// FORCED full rebuild so the edit actually shows.
-//
-// Why a forced rebuild (not the cheap cached switch): the assembly re-embeds each component by reading
-// its `.step+` OFF DISK, keyed by abspath:mtime (core/doc/assembly.cpp load_component → component_cache_key
-// → load_bodies). The cheap tab-switch is keyed on the ASSEMBLY doc's revision, which an in-context
-// component edit does NOT bump — so a plain switch-back would re-serve the pre-edit mesh. Two things are
-// therefore required, both only on this discrete exit action (the normal fast tab-switch path is untouched):
-//   1) SAVE the component doc to its source `.step+` first, bumping the file mtime so the assembly's
-//      abspath:mtime component cache misses and re-imports the edited geometry. The in-context edit lives
-//      only in the worker's in-memory doc until this save.
-//   2) After the save lands, invalidate every assembly-tab cache layer so switchToTab takes the
-//      asynchronous doc_rebuild path (a real re-embed + re-tessellate). doc_save is async, so the
-//      rebuild MUST be chained from the save's success callback — firing it sequentially would race
-//      the rebuild ahead of the on-disk write.
+// Exit component-edit keeps its explicit component save, but assembly updates
+// already arrive as in-memory refresh snapshots and need no forced rebuild.
 void AppState::exitComponentEdit() {
     if (!componentEdit.active) return;
-    const std::string returnDocId  = componentEdit.assemblyDocId;
-    const std::string sourcePath   = componentEdit.sourcePath;   // component's resolved abs .step+ path
-    // The component's part-doc is the ACTIVE doc at exit (we haven't switched back yet).
-    const std::string componentDocId = docMirror.docId();
-    // Reset context BEFORE the switch so any repaint during switchToTab sees us out of component-edit.
+    const std::string returnDocId = componentEdit.assemblyDocId;
+    const std::string sourcePath = componentEdit.sourcePath;
+    const std::string selectedDocId =
+        activeTab >= 0 && activeTab < (int)docTabs.size() ? docTabs[activeTab].docId : std::string();
+    std::string componentDocId;
+    std::error_code ec;
+    auto source = std::filesystem::weakly_canonical(sourcePath, ec);
+    if (ec) source = std::filesystem::path(sourcePath).lexically_normal();
+    for (const auto& tab : docTabs) {
+        if (tab.path.empty()) continue;
+        ec.clear();
+        auto path = std::filesystem::weakly_canonical(tab.path, ec);
+        if (ec) path = std::filesystem::path(tab.path).lexically_normal();
+        if (path == source) { componentDocId = tab.docId; break; }
+    }
     componentEdit = ComponentEditCtx{};
     if (renderer) renderer->clearGhost();
 
-    // Switch back to the assembly with its session cache invalidated so switchToTab forces a full
-    // async doc_rebuild (re-reads the edited component from disk). Factored so both the post-save
-    // path and the fallback (no source path / no worker) can call it.
-    auto switchBackForced = [this, returnDocId]() {
-        if (returnDocId.empty()) return;
+    auto switchBack = [this, returnDocId, selectedDocId]() {
+        // A different selection while the save was in flight is newer user intent.
+        if (componentEdit.active || activeTab < 0 || activeTab >= (int)docTabs.size() ||
+            docTabs[activeTab].docId != selectedDocId) return;
         for (int i = 0; i < (int)docTabs.size(); ++i) {
-            if (docTabs[i].docId != returnDocId) continue;
-            if (docTabs[i].session) {
-                docTabs[i].session->cachedRevision = -1;   // force needs_rebuild (see doc_mirror.cpp)
-                docTabs[i].session->cachedAicmPath.clear();
-                docTabs[i].session->cachedMirror = {};
-                docTabs[i].session->cachedDocMesh.reset();
-            }
-            if (renderer) renderer->discardCachedMeshes(returnDocId);
-            switchToTab(i);
-            break;
+            if (docTabs[i].docId == returnDocId) { switchToTab(i); break; }
         }
     };
-
-    // Save the component to disk first (bump mtime), then force the assembly rebuild in the callback.
-    // Fall back to a bare forced switch when we can't save (no anchored source path or no worker):
-    // the rebuild is still correct if the component happened to be saved by hand during the edit.
     if (!sourcePath.empty() && !componentDocId.empty() && workerStarted) {
-        const std::string savePath = sourcePath;
-        const std::string saveDocId = componentDocId;
         ++rebuildsInFlight;
-        rpc.call("doc_save",
-                 nlohmann::json{{"doc_id", saveDocId}, {"path", savePath}},
-                 [this, switchBackForced, saveDocId](const core::RpcResult& r) {
+        rpc.call("doc_save", nlohmann::json{{"doc_id", componentDocId}, {"path", sourcePath}},
+                 [this, switchBack, componentDocId](const core::RpcResult& r) {
                      --rebuildsInFlight;
                      if (!r.ok) {
                          addLog("[asm] exit-edit: component save failed: " + r.err);
-                         toast(ui::ToastLevel::Warn,
-                               "Component didn't save — assembly may show the old model");
+                         toast(ui::ToastLevel::Warn, "Component didn't save");
                      } else {
-                         addLog("[asm] exit-edit: component saved (" + saveDocId +
-                                "), forcing assembly rebuild");
+                         addLog("[asm] exit-edit: component saved (" + componentDocId + ")");
                      }
-                     switchBackForced();   // rebuild regardless — a save error shouldn't strand us
+                     switchBack();
                  }, 120000);
         return;
     }
-    switchBackForced();
+    switchBack();
+}
+
+bool AppState::componentHidden(const std::string& id, bool documentHidden) const {
+    const auto it = componentHiddenOverrides.find(id);
+    return it == componentHiddenOverrides.end() ? documentHidden : it->second;
+}
+
+void AppState::setComponentHidden(const std::string& id, bool hidden) {
+    componentHiddenOverrides[id] = hidden;
+    applyDocDrivenVisibility(docMirror.tree());
+    if (hidden) {
+        selection.clear();
+        hover = {};
+    }
 }
 
 // Solid Bodies hide/show: push the host-side visibility mask to the renderer (per-slot draw
@@ -2821,25 +3169,6 @@ static bool isReferenceOnlyFeature(const std::string& type) {
            type == "sketch" || type == "sketch3d";
 }
 
-// True when the doc has at least one solid/3D-producing feature (or assembly components).
-// Sketches and pure reference datums do NOT count — refs stay visible after the first sketch
-// and only auto-hide once a real solid feature (extrude/revolve/fillet/…) exists.
-static bool treeHasSolidContent(const nlohmann::json& tree) {
-    if (!tree.is_object()) return false;
-    auto ci = tree.find("components");
-    if (ci != tree.end() && ci->is_array() && !ci->empty()) return true;
-    auto fi = tree.find("features");
-    if (fi == tree.end() || !fi->is_array()) return false;
-    for (const auto& f : *fi) {
-        if (!f.is_object()) continue;
-        if (f.value("suppressed", false)) continue;
-        const std::string type = f.value("type", std::string());
-        if (type.empty()) continue;
-        if (!isReferenceOnlyFeature(type)) return true;
-    }
-    return false;
-}
-
 // Collect feature-id and reserved-plane references from any canonical refs value. Selector refs use
 // nested objects (feature/owner_feature/sketch), feature lists use arrays of bare ids, and the three
 // default planes are bare strings, so recursively walking only `refs` is both complete and avoids
@@ -2870,9 +3199,90 @@ void AppState::applyDocDrivenVisibility(const nlohmann::json& tree) {
     if (!tree.is_object()) return;
     const bool isAsm = tree.value("schema", std::string()) == "aicad.asm/1";
 
-    // Shared hasSolidContent signal (mirrors viewport origin/axis/plane auto-hide): a solid/3D
-    // feature or any assembly component means references should auto-hide. Sketches alone do not.
-    const bool hasSolidContent = treeHasSolidContent(tree);
+    // Cache only graph-derived facts. Visibility masks/eye flags still synchronize on
+    // every call because the same tree may be applied before and after a mesh/datum bind.
+    struct GraphCache {
+        const AppState* owner = nullptr;
+        const nlohmann::json* source = nullptr;
+        std::string docId, rollbackAfter;
+        int revision = -1;
+        nlohmann::json features;
+        std::unordered_set<std::string> userPlanes, consumedPlanes;
+        std::vector<std::string> referenceGeometry;
+        bool hasSolidFeatures = false;
+    };
+    static GraphCache cache;  // one bounded active-document graph
+    static const nlohmann::json emptyFeatures = nlohmann::json::array();
+    auto fi = tree.find("features");
+    const auto& features = fi != tree.end() && fi->is_array() ? *fi : emptyFeatures;
+    const auto rollback = tree.find("rollback_after");
+    const std::string rollbackAfter = rollback != tree.end() && rollback->is_string()
+        ? rollback->get<std::string>() : std::string();
+    const bool sameDoc = cache.owner == this && cache.docId == docMirror.docId();
+    const bool sameRevision = sameDoc && cache.source == &tree &&
+        &tree == &docMirror.tree() && cache.revision == docMirror.revision();
+    if (!sameDoc || cache.rollbackAfter != rollbackAfter ||
+        (!sameRevision && cache.features != features)) {
+        cache.features = features;
+        cache.rollbackAfter = rollbackAfter;
+        cache.userPlanes.clear();
+        cache.consumedPlanes.clear();
+        cache.referenceGeometry.clear();
+        cache.hasSolidFeatures = false;
+        std::unordered_map<std::string, const nlohmann::json*> activeFeatures;
+        activeFeatures.reserve(features.size());
+        bool pastRollback = rollbackAfter == "start";
+        for (const auto& f : features) {
+            if (!f.is_object()) continue;
+            const std::string type = f.value("type", std::string());
+            const bool suppressed = f.value("suppressed", false);
+            if (!suppressed && !type.empty() && !isReferenceOnlyFeature(type))
+                cache.hasSolidFeatures = true;
+            if (pastRollback) continue;
+            const std::string fid = f.value("id", std::string());
+            if (!fid.empty() && !suppressed) {
+                activeFeatures.emplace(fid, &f);
+                if (isDatumPlaneType(type)) cache.userPlanes.insert(fid);
+                if (type == "point" || type == "datum_point" || type == "ref_point" ||
+                    type == "csys" || type == "coordinate_system" || type == "ref_csys")
+                    cache.referenceGeometry.push_back(fid);
+            }
+            if (!rollbackAfter.empty() && fid == rollbackAfter) pastRollback = true;
+        }
+        std::unordered_set<std::string> visited;
+        visited.reserve(activeFeatures.size());
+        std::unordered_set<std::string> pending;
+        for (const auto& entry : activeFeatures) {
+            const auto& root = *entry.second;
+            if (isReferenceOnlyFeature(root.value("type", std::string()))) continue;
+            auto refs = root.find("refs");
+            if (refs != root.end())
+                collectFeatureRefs(*refs, activeFeatures, pending, cache.consumedPlanes);
+        }
+        while (!pending.empty()) {
+            auto next = pending.begin();
+            const std::string depId = *next;
+            pending.erase(next);
+            if (!visited.insert(depId).second) continue;
+            auto dep = activeFeatures.find(depId);
+            if (dep == activeFeatures.end()) continue;
+            const auto& feature = *dep->second;
+            if (isDatumPlaneType(feature.value("type", std::string())))
+                cache.consumedPlanes.insert(depId);
+            auto refs = feature.find("refs");
+            if (refs != feature.end())
+                collectFeatureRefs(*refs, activeFeatures, pending, cache.consumedPlanes);
+        }
+    }
+    cache.owner = this;
+    cache.source = &tree;
+    cache.docId = docMirror.docId();
+    cache.revision = docMirror.revision();
+    const auto& userPlanes = cache.userPlanes;
+    const auto& consumedPlanes = cache.consumedPlanes;
+    const auto components = tree.find("components");
+    const bool hasSolidContent = cache.hasSolidFeatures ||
+        (components != tree.end() && components->is_array() && !components->empty());
     // Seed the FM-eye visibility flags (planeVisEff/originVisEff) from the state computed HERE, so
     // the FeatureManager eye is correct on the very first frame after a doc loads/rebuilds — the FM
     // draws BEFORE the viewport publishes these each frame, so without this a fresh doc showed a
@@ -2885,11 +3295,10 @@ void AppState::applyDocDrivenVisibility(const nlohmann::json& tree) {
         originVisEff = originUserToggled ? (hiddenFeatures.count("point.origin") == 0)
                                          : !hasSolidContent;
     };
-    auto fi = tree.find("features");
 
     if (isAsm) {
-        // Assembly: re-derive the per-component hide mask from document.json. The engine builds one
-        // body per NON-suppressed component, 1-based ordinal == body_id (assembly.cpp).
+        // The engine builds one body per NON-suppressed component,
+        // 1-based ordinal == body_id (assembly.cpp).
         auto ci = tree.find("components");
         if (ci != tree.end() && ci->is_array()) {
             uint32_t ordinal = 0;
@@ -2897,7 +3306,8 @@ void AppState::applyDocDrivenVisibility(const nlohmann::json& tree) {
                 if (!c.is_object()) continue;
                 if (c.value("suppressed", false)) continue;
                 ++ordinal;
-                uint8_t vis = c.value("hidden", false) ? 0 : 1;
+                uint8_t vis = componentHidden(c.value("id", std::string()),
+                                              c.value("hidden", false)) ? 0 : 1;
                 for (size_t slot = 0; slot < docBodyIds.size(); ++slot)
                     if (docBodyIds[slot] == ordinal && slot < bodyVisible.size())
                         bodyVisible[slot] = vis;
@@ -2948,54 +3358,6 @@ void AppState::applyDocDrivenVisibility(const nlohmann::json& tree) {
         }
         syncEffFlags();
         return;
-    }
-
-    // Build the ACTIVE graph only: suppressed and rolled-back features do not consume anything.
-    std::unordered_map<std::string, const nlohmann::json*> activeFeatures;
-    std::unordered_set<std::string> userPlanes;
-    std::string rollbackAfter;
-    auto rollback = tree.find("rollback_after");
-    if (rollback != tree.end() && rollback->is_string())
-        rollbackAfter = rollback->get<std::string>();
-    bool pastRollback = false;
-    for (const auto& f : *fi) {
-        if (!f.is_object() || pastRollback) continue;
-        const std::string fid = f.value("id", std::string());
-        if (!fid.empty() && !f.value("suppressed", false)) {
-            activeFeatures.emplace(fid, &f);
-            if (isDatumPlaneType(f.value("type", std::string()))) userPlanes.insert(fid);
-        }
-        if (!rollbackAfter.empty() && fid == rollbackAfter) pastRollback = true;
-    }
-
-    // Start only at actual model features, then walk their feature dependencies. This is the key
-    // distinction between "a sketch/ref-plane exists" and "a downstream 3D feature consumed it".
-    std::unordered_set<std::string> consumedPlanes;
-    for (const auto& featureEntry : activeFeatures) {
-        const nlohmann::json* root = featureEntry.second;
-        if (isReferenceOnlyFeature(root->value("type", std::string()))) continue;
-
-        std::unordered_set<std::string> pending;
-        auto refs = root->find("refs");
-        if (refs != root->end())
-            collectFeatureRefs(*refs, activeFeatures, pending, consumedPlanes);
-
-        std::unordered_set<std::string> visited;
-        while (!pending.empty()) {
-            auto next = pending.begin();
-            std::string depId = *next;
-            pending.erase(next);
-            if (!visited.insert(depId).second) continue;
-
-            auto dep = activeFeatures.find(depId);
-            if (dep == activeFeatures.end()) continue;
-            const nlohmann::json& feature = *dep->second;
-            if (isDatumPlaneType(feature.value("type", std::string())))
-                consumedPlanes.insert(depId);
-            auto depRefs = feature.find("refs");
-            if (depRefs != feature.end())
-                collectFeatureRefs(*depRefs, activeFeatures, pending, consumedPlanes);
-        }
     }
 
     // Auto-managed planes follow graph consumption in both directions. A FeatureManager eye click
@@ -3058,13 +3420,7 @@ void AppState::applyDocDrivenVisibility(const nlohmann::json& tree) {
     }
     // User-created points / csys: same solid-content auto-hide as planes/axes. Sticky
     // refGeomUserToggled (set by the FM eye) keeps a forced show/hide across rebuilds.
-    for (const auto& featureEntry : activeFeatures) {
-        const nlohmann::json& f = *featureEntry.second;
-        const std::string ty = f.value("type", std::string());
-        if (ty != "point" && ty != "datum_point" && ty != "ref_point" &&
-            ty != "csys" && ty != "coordinate_system" && ty != "ref_csys")
-            continue;
-        const std::string& fid = featureEntry.first;
+    for (const std::string& fid : cache.referenceGeometry) {
         if (fid.empty() || fid == "point.origin") continue;
         if (refGeomUserToggled.count(fid)) continue;
         if (hasSolidContent) {

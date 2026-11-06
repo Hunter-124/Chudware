@@ -70,6 +70,16 @@ def _three_part_graph() -> dict:
     }
 
 
+def _stub_open_documents(monkeypatch, docs: list[dict]) -> None:
+    """Make the engine's document list ``docs`` and keep process-wide handle state local."""
+    from services.mcp import cad_common, core_bridge
+
+    monkeypatch.setattr(
+        core_bridge, "call",
+        lambda method, params=None: {"docs": docs} if method == "doc_list" else {})
+    monkeypatch.setattr(cad_common, "_PROCESS_DOCS", set())
+
+
 # ---------------------------------------------------------------------------
 # 1. Lease contention — second agent rejected with owner named
 # ---------------------------------------------------------------------------
@@ -344,10 +354,11 @@ class TestMutationGuard:
         finally:
             unbind_mutation_guard()
 
-    def test_guard_in_tool_registry_rejects_non_owner(self):
+    def test_guard_in_tool_registry_rejects_non_owner(self, monkeypatch):
         """End-to-end: _guard wraps a tool; non-owner gets a refusal."""
         from services.mcp import tool_registry as reg_mod
 
+        _stub_open_documents(monkeypatch, [{"doc_id": "doc_x", "name": "X"}])
         run_id = _run_id()
         ws_reg = LeaseRegistry(run_id=run_id)
         ws_reg.open_doc("doc_x", "agent_A", lease=LEASE_WRITE)
@@ -363,6 +374,47 @@ class TestMutationGuard:
             assert result["ok"] is False
             assert "agent_A" in result["reason"]
         finally:
+            unbind_mutation_guard()
+
+    def test_guard_checks_the_lease_on_the_canonical_doc_id(self, monkeypatch):
+        """A name, a recovery alias, a positional argument or an omitted doc_id all reach
+        the same document, so all of them meet the same write lease."""
+        from services.mcp import cad_common, tool_registry as reg_mod
+
+        _stub_open_documents(monkeypatch, [
+            {"doc_id": "doc-cpp00000001", "name": "Bracket"},
+            {"doc_id": "doc-cpp00000002", "name": "Plate"},
+        ])
+        monkeypatch.setitem(cad_common._DOC_ALIASES, "doc-cpp0000000f", "doc-cpp00000001")
+        monkeypatch.setitem(cad_common._CUR, "doc_id", "doc-cpp00000001")
+        ws_reg = LeaseRegistry(run_id=_run_id())
+        ws_reg.open_doc("doc-cpp00000001", "agent_A", lease=LEASE_WRITE)
+        bind_mutation_guard(ws_reg, "agent_B")
+        ran: list = []
+
+        def edit_part(doc_id: str | None = None, ops: list | None = None) -> dict:
+            ran.append(doc_id)
+            return {"ok": True}
+
+        reg_mod.record("edit_part", "cad")
+        guarded = reg_mod._guard(edit_part, "edit_part")
+        try:
+            for label, call in {
+                "plain name": lambda: guarded(doc_id="Bracket"),
+                "recovery alias": lambda: guarded(doc_id="doc-cpp0000000f"),
+                "positional name": lambda: guarded("Bracket"),
+                "omitted (current part)": lambda: guarded(),
+            }.items():
+                refused = call()
+                assert refused["ok"] is False, label
+                assert refused["code"] == "write_lease_held", label
+                assert refused["owner"] == "agent_A", label
+            assert ran == []
+            # A part nobody holds is still editable by name.
+            assert guarded(doc_id="Plate") == {"ok": True}
+            assert ran == ["Plate"]
+        finally:
+            reg_mod.catalog().pop("edit_part", None)
             unbind_mutation_guard()
 
     def test_guard_allows_read_tools_without_lease_check(self):

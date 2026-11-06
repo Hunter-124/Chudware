@@ -28,8 +28,8 @@ part numbers). The bare ``/<family-slug>~~/`` or the ``product-family~~<hash>``
 breadcrumb URL both render only a category-nav SHELL (~360 KB, 0 SKUs). So
 ``search`` derives ``<CATEGORY>`` from the breadcrumb and rebuilds each result
 into ``/products/<CATEGORY>/<family-slug>~~/`` — a URL ``acquire`` can fetch to a
-real SKU table. Results are typed ``kind="family"`` (a per-SKU configurable
-table, not a single final SKU), mirroring MISUMI's honest ``kind="series"``.
+real SKU table. Results are typed ``kind="series"`` (a per-SKU configurable
+table, not a single final SKU).
 
 ``acquire`` reaches an actual STEP by RESOLVING the client-generated download URL
 (2026-07-11): McMaster mints the CAD ``FilePath`` in the SPA — there is no static
@@ -40,9 +40,8 @@ browser attaches the login cookies + the ``X-Requested-With`` header the endpoin
 requires; a bare ``CefURLRequest`` 403s without it) and reads the ``"3-D STEP"``
 model's ``FilePath`` out of a sentinel div. That ``FilePath`` IS a cookie-authed
 direct download, so ``browser_download`` fetches it to disk. The concrete SKU is
-the caller's ``part_number``/``sku``, the ``/<PN>/`` URL's segment, or — for a
-``kind="family"`` table — the first configurable part number on the page. Same
-in-page-JS + capture pattern generalises to Misumi/cadenas series→SKU configurators.
+the caller's ``part_number``/``sku`` or the ``/<PN>/`` URL's segment; a family
+requires the caller to choose a specific SKU before any model is downloaded.
 The ``product-card`` regex is kept as a first pass for the rare page that renders
 SKU cards directly.
 """
@@ -52,9 +51,12 @@ import html
 import re
 import urllib.parse
 
-from .. import session as _session
-from . import (download_path, is_login_wall, login_required, provenance_envelope,
-              register, terms_confirmation_required)
+from .. import challenge, session as _session
+from ..cad_validate import validate_cad
+from . import (abs_url, download_path, fail, is_login_wall, login_required, make_hit,
+               provenance_envelope, quote_query, register, source_failure,
+               terms_confirmation_required)
+from ._retail import _price, card_image
 
 SITE = "mcmaster"
 BASE_URL = "https://www.mcmaster.com"
@@ -67,7 +69,7 @@ LICENSE_NOTE = (
     "under the user's own authenticated session. See contracts/license_debt.md."
 )
 
-_LOGIN_WALL_MARKERS = ('Sign In', 'id="SignInEmail"', 'class="sign-in-form"')
+_LOGIN_WALL_MARKERS = ('id="SignInEmail"', 'class="sign-in-form"')
 _TERMS_MARKERS = ('Accept the terms', 'class="cad-terms"', 'License agreement required')
 _TERMS_SUMMARY = (
     "McMaster gates this SKU's CAD download behind a licence/terms click-through; "
@@ -96,11 +98,15 @@ _PRODUCT_LINE_CRUMB_RE = re.compile(
 # rotates on deploys, so match only the stable "_selectable_" prefix. Only "~~/"
 # hrefs are product-family (SKU-table) pages; "~/" hrefs are subcategories.
 _RESULT_TILE_RE = re.compile(
-    r'<a[^>]+class="_selectable_[^"]*"[^>]+href="(?P<slug>[a-z0-9-]+)~~/(?P<qs>\?[^"]*)?"'
-    r'[^>]*>.*?<img[^>]+alt="(?P<title>[^"]*)"', re.IGNORECASE | re.DOTALL)
-# Legacy mega-menu department tiles (kept only as a last-resort fallback so a
-# query that somehow lands on a bare navigation grid still returns *something*
-# navigable rather than a silent empty list; these are departments, not products).
+    r'<a\b(?=[^>]*\bclass=["\'][^"\']*_selectable_[^"\']*["\'])'
+    r'(?=[^>]*\bhref=["\'](?P<slug>[a-z0-9-]+)~~/(?:\?[^"\']*)?["\'])'
+    r'[^>]*>(?P<inner>.*?)</a\s*>', re.IGNORECASE | re.DOTALL)
+_IMAGE_ALT_RE = re.compile(r'<img\b[^>]*\balt=["\'](?P<title>[^"\']+)["\']', re.IGNORECASE)
+# The persistent browse-catalog menu is navigation, not query results.
+_BROWSE_MENU_RE = re.compile(
+    r'<section\b[^>]*\bclass=["\'][^"\']*\bbrowse-catalog-menu\b[^"\']*["\'][^>]*>'
+    r'.*?</section\s*>', re.IGNORECASE | re.DOTALL)
+# Category tiles outside the persistent menu can be catalog landing results.
 _CATEGORY_TILE_RE = re.compile(
     r'<a[^>]+class="[^"]*category-tile[^"]*"[^>]+href="(?P<href>/[^"]+)"[^>]*>'
     r'(?P<inner>.*?)</a>', re.IGNORECASE | re.DOTALL)
@@ -113,17 +119,16 @@ _SKU_RE = re.compile(r'<span[^>]*class="[^"]*part-number[^"]*"[^>]*>(?P<sku>[^<]
 # keeps the provenance envelope's commercial identity populated.
 _PRICE_RE = re.compile(r'<span[^>]*class="[^"]*price[^"]*"[^>]*>\$(?P<price>[0-9,.]+)</span>',
                        re.IGNORECASE)
-# A concrete McMaster SKU part number, e.g. 90044A203 / 91290A115 (digits, a letter,
-# digits). Used to pick the first configurable row off a family table when the caller
-# didn't name a specific part number.
+# A concrete McMaster SKU part number, e.g. 90044A203 / 91290A115.
 _PART_NUMBER_RE = re.compile(r'\b(\d{3,6}[A-Z]\d{2,5})\b')
+_NO_RESULTS_RE = re.compile(r'\b(?:no results found|no results for|no matching (?:products|results)|'
+                            r'did not match any)\b', re.IGNORECASE)
 # ProductContent.aspx (the SPA's product-data endpoint) returns JSON carrying
 # cadControlData.AvailableCAD.ThreeDDownloads[] = [{DisplayName, FilePath}, …]. The
 # STEP model's FilePath (server-generated, session-scoped) is the real download URL —
 # there is no static .step href on the family/part HTML (it's minted client-side).
 # We prefer the exact "3-D STEP" (with threads), then any .STEP FilePath.
 _PRODUCT_CONTENT_PATH = "/WebParts/Navigate/ProductContent.aspx?partNumber="
-_CAD_STEP_LABEL = "3-D STEP"
 # The sentinel element browser_interact's JS publishes with the captured FilePath.
 _SENTINEL_RE = re.compile(
     r'id="__aicad_capture"[^>]*\bdata-status="(?P<status>[^"]*)"[^>]*\bdata-fp="(?P<fp>[^"]*)"',
@@ -169,7 +174,7 @@ def _cad_capture_js(part_number: str) -> str:
         # then pull its FilePath (avoids grabbing the DWG/IGES sibling's path).
         "var m=t.match(/\\{[^{}]*\"DisplayName\":\"3-D STEP\"[^{}]*\\}/);"
         "var fp=m&&(m[0].match(/\"FilePath\":\"([^\"]+)\"/)||[])[1];"
-        # Fallbacks: any .STEP FilePath, else the first CAD FilePath present.
+        # Fall back to another STEP FilePath, never a different CAD format.
         "if(!fp){var s=t.match(/\"FilePath\":\"([^\"]+\\.STEP)\"/i);fp=s&&s[1];}"
         "if(fp){pub('ok',fp);}else{pub('nofile','');}"
         "}).catch(function(e){pub('err','');});"
@@ -178,147 +183,171 @@ def _cad_capture_js(part_number: str) -> str:
     )
 
 
+def _page_failure(content: str, url: str, op: str) -> dict | None:
+    kind = challenge.classify_challenge(content, url)
+    if kind == "captcha":
+        return fail(SITE, op, "captcha", "McMaster returned a captcha challenge.", url=url)
+    if kind == "2fa" or challenge.is_login_page(content, url) or is_login_wall(content, _LOGIN_WALL_MARKERS):
+        return source_failure(SITE, op, login_required(SITE, url), url=url)
+    if re.search(r'<(?:title|h1)\b[^>]*>\s*(?:access denied|request blocked)', content, re.I):
+        return fail(SITE, op, "blocked", "McMaster blocked the request.", url=url)
+    if is_login_wall(content, _TERMS_MARKERS):
+        question = terms_confirmation_required(SITE, url, _TERMS_SUMMARY)
+        return fail(SITE, op, "terms_required", _TERMS_SUMMARY, url=url,
+                    ask_user=question.get("ask_user"))
+    return None
+
+
 class McMasterAdapter:
     key = SITE
+    hosts = ("mcmaster.com",)
+    result_kinds = ("product", "series", "category")
+    cad_acquisition = True
+    login_required = True
+    api = False
 
     def search(self, query: str) -> list[dict]:
-        url = SEARCH_URL_TMPL.format(query=query.replace(" ", "-"))
+        # McMaster's search is a path slug. quote_query encodes reserved characters;
+        # replacing its space separator with '-' preserves the vendor's slug route.
+        url = SEARCH_URL_TMPL.format(query=quote_query(query).replace("+", "-"))
         result = _session.browser_fetch(url, SITE)
         if not result.get("ok"):
-            return [result]
+            return [source_failure(SITE, "search", result, url=url)]
         content = result.get("content", "")
-        if is_login_wall(content, _LOGIN_WALL_MARKERS):
-            return [login_required(SITE, url)]
+        if issue := _page_failure(content, url, "search"):
+            return [issue]
         hits = []
-        # First pass: a page that renders SKU cards directly (rare on the SPA).
         for m in _RESULT_RE.finditer(content):
-            sku_match = _SKU_RE.search(m.group("title"))
-            hits.append({
-                "title": _strip_tags(m.group("title")),
-                "url": BASE_URL + m.group("href"),
-                "site": SITE,
-                "sku": sku_match.group("sku").strip() if sku_match else None,
-            })
+            card = m.group("title")
+            sku_match = _SKU_RE.search(card)
+            price_match = _PRICE_RE.search(card)
+            product_url = abs_url(BASE_URL, m.group("href"))
+            if not product_url:
+                continue
+            price = _price(price_match.group("price")) if price_match else None
+            hits.append(make_hit(
+                SITE, title=_strip_tags(card), url=product_url,
+                sku=sku_match.group("sku").strip() if sku_match else _part_number_from_url(product_url) or None,
+                price=price, currency="USD" if price is not None else None,
+                thumbnail=card_image(card, product_url)))
         if hits:
             return hits
 
-        # Real search-results page (live 2026-07-11): the breadcrumb carries the
-        # catalog category slug; result tiles carry the family slugs. Rebuild each
-        # family into "/products/<CATEGORY>/<family-slug>~~/" — the only URL that
-        # renders the per-SKU table headless (bare slug / breadcrumb URL render a
-        # nav shell). Emit as kind="family" (a configurable per-SKU table).
         crumb = (_PRODUCT_FAMILY_CRUMB_RE.search(content)
                  or _PRODUCT_LINE_CRUMB_RE.search(content))
+        tiles = list(_RESULT_TILE_RE.finditer(content))
         if crumb:
             category = crumb.group("category")
             seen: set[str] = set()
-            for m in _RESULT_TILE_RE.finditer(content):
+            for m in tiles:
                 slug = m.group("slug")
-                if slug in seen:
+                title = _IMAGE_ALT_RE.search(m.group("inner"))
+                if slug in seen or not title:
                     continue
                 seen.add(slug)
-                hits.append({
-                    "title": html.unescape(m.group("title").strip()),
-                    "url": f"{BASE_URL}/products/{category}/{slug}~~/",
-                    "site": SITE,
-                    # A family is a configurable per-SKU table, not one final SKU;
-                    # the concrete part number/price only exist after selecting a
-                    # size/length row on site — so no sku/part_number is invented.
-                    "kind": "family",
-                })
+                product_url = f"{BASE_URL}/products/{category}/{slug}~~/"
+                hits.append(make_hit(SITE, title=html.unescape(title.group("title").strip()),
+                                     url=product_url, kind="series",
+                                     thumbnail=card_image(m.group("inner"), product_url)))
             if hits:
                 return hits
+        if tiles:
+            return [fail(SITE, "search", "parse_failed",
+                         "McMaster family tiles lack a usable category or title.", url=url)]
 
-        # Last resort: a bare mega-menu navigation grid (departments, not
-        # products). Return the tiles as typed "category" results — honest that
-        # these are catalog sections to drill into, not SKUs — rather than [].
-        for m in _CATEGORY_TILE_RE.finditer(content):
+        for m in _CATEGORY_TILE_RE.finditer(_BROWSE_MENU_RE.sub("", content)):
             name = _CATEGORY_NAME_RE.search(m.group("inner"))
-            hits.append({
-                "title": html.unescape(name.group("name").strip()) if name
-                         else _strip_tags(m.group("inner")),
-                "url": BASE_URL + m.group("href"),
-                "site": SITE,
-                "kind": "category",   # navigable catalog section, not a purchasable SKU
-            })
-        return hits
+            title = html.unescape(name.group("name").strip()) if name else _strip_tags(m.group("inner"))
+            category_url = abs_url(BASE_URL, m.group("href"))
+            if title and category_url:
+                hits.append(make_hit(SITE, title=title, url=category_url, kind="category"))
+        if hits:
+            return hits
+        if _NO_RESULTS_RE.search(content):
+            return []
+        return [fail(SITE, "search", "parse_failed", "Could not parse McMaster search results.", url=url)]
 
     def acquire(self, result: dict) -> dict:
         url = result.get("url", "")
         if not url:
-            return {"ok": False, "reason": "bad_result", "hint": "result has no 'url'"}
+            return fail(SITE, "acquire", "unsupported", "Result has no product URL.")
 
-        # 1) Determine the concrete SKU part number to download. Caller may name one
-        #    (part_number/sku), it may be encoded in a /<PN>/ product URL, or — for a
-        #    kind="family" table — we pick the first configurable row off the page.
-        part_number = (result.get("part_number") or result.get("sku")
-                       or _part_number_from_url(url))
+        requested = result.get("sku") or result.get("part_number")
+        url_sku = _part_number_from_url(url)
+        if requested is not None and (not isinstance(requested, str) or
+                                      not re.fullmatch(r"[A-Za-z0-9-]+", requested.strip())):
+            return fail(SITE, "acquire", "unsupported", "A valid McMaster SKU is required.", url=url)
+        requested = requested.strip().upper() if requested else ""
+        if requested and url_sku and requested != url_sku.upper():
+            return fail(SITE, "acquire", "unsupported",
+                        "The requested SKU does not match the product URL.", url=url)
+        part_number = requested or url_sku
         if not part_number:
             page = _session.browser_fetch(url, SITE)
             if not page.get("ok"):
-                return page
+                return source_failure(SITE, "acquire", page, url=url)
             content = page.get("content", "")
-            if is_login_wall(content, _LOGIN_WALL_MARKERS):
-                return login_required(SITE, url)
-            if is_login_wall(content, _TERMS_MARKERS):
-                return terms_confirmation_required(SITE, url, _TERMS_SUMMARY)
-            m = _PART_NUMBER_RE.search(content)
-            if not m:
-                return {"ok": False, "reason": "no_sku",
-                        "hint": "no concrete McMaster part number found on this page — "
-                                "pass part_number (e.g. 91290A115) for a specific SKU"}
-            part_number = m.group(1)
+            if issue := _page_failure(content, url, "acquire"):
+                return issue
+            examples = list(dict.fromkeys(_PART_NUMBER_RE.findall(content)))[:5]
+            prompt = "Which exact McMaster SKU should be downloaded?"
+            if examples:
+                prompt += " Possible SKUs on this page: " + ", ".join(examples) + "."
+            question = {"id": "mcmaster.sku", "kind": "text", "prompt": prompt,
+                        "suggested": "", "required": True,
+                        "why": "Each family contains different configurable parts."}
+            return fail(SITE, "acquire", "unsupported", prompt, url=url, ask_user=question)
 
-        # 2) The STEP model URL is minted client-side — no static href exists. Drive
-        #    the page's own JS to fetch the SPA's product-data endpoint (same-origin,
-        #    the browser attaches the login cookies + XHR header) and read out the
-        #    "3-D STEP" FilePath. browser_interact returns the settled DOM with our
-        #    sentinel <div id="__aicad_capture" data-fp="…" data-status="…">.
+        # The per-SKU STEP URL is minted by the vendor's in-page product-data endpoint.
         part_url = f"{BASE_URL}/{part_number}/"
         interact = _session.browser_interact(part_url, SITE, _cad_capture_js(part_number))
         if not interact.get("ok"):
-            return interact
+            return source_failure(SITE, "acquire", interact, url=part_url)
         html_dom = interact.get("content", "")
-        if is_login_wall(html_dom, _LOGIN_WALL_MARKERS):
-            return login_required(SITE, part_url)
-        # A CAD terms/licence click-through must NEVER be accepted on the user's
-        # behalf (module docstring; same guard as traceparts/jlcpcb/pcbway) — and it
-        # must be caught BEFORE the sentinel read, because a terms page publishes no
-        # FilePath and would otherwise be misreported as "no_download_link".
-        if is_login_wall(html_dom, _TERMS_MARKERS):
-            return terms_confirmation_required(SITE, part_url, _TERMS_SUMMARY)
+        if issue := _page_failure(html_dom, part_url, "acquire"):
+            return issue
 
         cap = _SENTINEL_RE.search(html_dom)
         status = (cap.group("status") if cap else "") or ""
         file_path = html.unescape(cap.group("fp")) if cap and cap.group("fp") else ""
         if status == "login":
-            return login_required(SITE, part_url)
-        if not file_path:
-            return {"ok": False, "reason": "no_download_link",
-                    "hint": f"McMaster returned no STEP CAD file for {part_number} "
-                            f"(status={status or 'unknown'}); the part may have no 3-D "
-                            f"model or the session expired — run vendor_login('mcmaster')"}
+            return source_failure(SITE, "acquire", login_required(SITE, part_url), url=part_url)
+        if not file_path or status != "ok":
+            reason = "unsupported" if status == "nofile" else "parse_failed"
+            return fail(SITE, "acquire", reason,
+                        f"McMaster did not provide a STEP file for {part_number} (status={status or 'unknown'}).",
+                        url=part_url)
+        if not file_path.startswith("/") or file_path.startswith("//"):
+            return fail(SITE, "acquire", "parse_failed", "McMaster returned an invalid STEP path.", url=part_url)
 
-        download_url = BASE_URL + urllib.parse.quote(file_path)
-        dest, refusal = download_path(
-            SITE, download_url, default=f"{part_number}.step",
-            filename=file_path.rsplit("/", 1)[-1] or None)
+        download_url = BASE_URL + urllib.parse.quote(file_path, safe="/?=&%")
+        filename = urllib.parse.urlsplit(file_path).path.rsplit("/", 1)[-1]
+        dest, refusal = download_path(SITE, download_url, default=f"{part_number}.step", filename=filename)
         if refusal is not None:
-            return refusal
+            return source_failure(SITE, "acquire", refusal, url=download_url)
+        if not urllib.parse.urlsplit(file_path).path.lower().endswith((".step", ".stp")):
+            return fail(SITE, "acquire", "parse_failed", "McMaster returned an invalid STEP path.", url=part_url)
         outcome = _session.browser_download(download_url, SITE, dest)
         if not outcome.get("ok"):
-            return outcome
+            return source_failure(SITE, "acquire", outcome, url=download_url)
+        artifact_path = outcome.get("dest")
+        if not artifact_path:
+            return fail(SITE, "acquire", "transport_failed", "The download returned no artifact path.",
+                        url=download_url)
+        validation = validate_cad(artifact_path)
+        if not validation.get("ok"):
+            return fail(SITE, "acquire", "parse_failed",
+                        f"Downloaded CAD is invalid: {validation.get('reason', '')}", url=download_url)
 
+        price_match = _PRICE_RE.search(html_dom)
+        price = _price(price_match.group("price")) if price_match else None
         return provenance_envelope(
             source_url=part_url,
             session_profile_used=outcome.get("session_profile_used", SITE),
-            license_note=LICENSE_NOTE,
-            artifact_path=outcome["dest"],
-            title=result.get("title", "") or dest.name,
-            sku=part_number,
-            price=(f"${price_match.group('price')}"
-                   if (price_match := _PRICE_RE.search(html_dom)) else None),
-        )
+            license_note=LICENSE_NOTE, artifact_path=str(artifact_path),
+            artifact_kind="cad", format=validation["format"],
+            title=result.get("title", "") or dest.name, sku=part_number,
+            price=price, currency="USD" if price is not None else None)
 
 
 ADAPTER = register(McMasterAdapter())

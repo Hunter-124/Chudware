@@ -41,7 +41,7 @@ from pydantic import Field
 # and this module already imports the cad_tools facade that loads it — so importing it
 # here adds no dependency edge and no import cost.  A second copy (or a new shared
 # module) would be a second thing to keep correct.
-from services.mcp.cad_doc_tools import _dim_mm, _interpreted_notes
+from services.mcp.cad_doc_tools import _attach_notes, _dim_mm, _split_notes
 from services.mcp.cad_tools import _dumps, _err
 from services import research
 import services.research.calcs as _calcs  # registers all registry calculators
@@ -708,7 +708,7 @@ def _finish(env: dict, answer_extra: Optional[dict], budget, output_raw,
         _apply_output(answer, output_raw, notes)
     if notes:
         env["mode"] = mode
-        env["interpreted"] = _interpreted_notes(notes)
+        _attach_notes(env, *_split_notes(notes))
     return env
 
 
@@ -998,7 +998,7 @@ def _unknown_formula(name: str, notes: list) -> dict:
             f"arithmetic yourself in the answer; use this tool only for the formulas in "
             f"`known` (e.g. research_eng_calc('circle_area', {{'diameter_mm': 20}})).")
     if notes:
-        out["interpreted"] = _interpreted_notes(notes)
+        _attach_notes(out, *_split_notes(notes))
     return out
 
 
@@ -1162,7 +1162,7 @@ def register_research_tools(mcp: FastMCP) -> None:
                                  f"property={prop!r}")
             out = research.material_lookup(str(mat), property=str(prop) if prop else None)
             if notes and isinstance(out, dict):
-                out["interpreted"] = _interpreted_notes(notes)
+                _attach_notes(out, *_split_notes(notes))
             return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -1331,7 +1331,7 @@ def register_research_tools(mcp: FastMCP) -> None:
                         out["hint"] = f"{out['hint']} {rect}"
                         out["substitution"] = "I_mm4 = b*h**3/12 (solid rectangle)"
             if notes and isinstance(out, dict):
-                out["interpreted"] = _interpreted_notes(notes)
+                _attach_notes(out, *_split_notes(notes))
             return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -1423,10 +1423,9 @@ def register_research_tools(mcp: FastMCP) -> None:
         Spot-check values (ISO 286-2:2010): 20H7/g6 → hole 20.000–20.021, shaft
         19.980–19.993, clearance 0.007–0.041 mm, character=clearance.
         50H7/p6 → interference 0.001–0.042 mm, character=press.
-        Shaft-basis designations (G7/h7, P7/h6) are computed through their hole-basis
-        twin by the ISO 286-1 §5.3 mirror rule and say so in `interpreted`.
-        `source.kind` is "closed_form" for formula-derived deviations (g, f, e, d, h),
-        "table" for tabulated ones (k, n, p, r, s).
+        Shaft-basis designations (G7/h7, P7/h6) use the bundled ISO 286 tables where
+        available; fallback calculations use the ISO 286-1 §5.3 mirror rule.
+        `source.kind` identifies table-backed or closed-form calculations.
         """
         try:
             kwargs.pop("kwargs", None)
@@ -1497,7 +1496,7 @@ def register_research_tools(mcp: FastMCP) -> None:
                              f"recommendation (answer[].band) — no second fit_calc "
                              f"call needed")
             if notes:
-                out["interpreted"] = _interpreted_notes(notes)
+                _attach_notes(out, *_split_notes(notes))
             return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -1542,7 +1541,7 @@ def register_research_tools(mcp: FastMCP) -> None:
                 str(query or ""), topic=topic, material=material, process=process, limit=limit
             )
             if notes and isinstance(out, dict):
-                out["interpreted"] = _interpreted_notes(notes)
+                _attach_notes(out, *_split_notes(notes))
             return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -1560,7 +1559,7 @@ def register_research_tools(mcp: FastMCP) -> None:
                 notes.append(f"interpreted {key!r} as 'record_id'")
             out = _machining_ref.machining_ref_get(str(record_id or ""))
             if notes and isinstance(out, dict):
-                out["interpreted"] = _interpreted_notes(notes)
+                _attach_notes(out, *_split_notes(notes))
             return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -1591,7 +1590,7 @@ def register_research_tools(mcp: FastMCP) -> None:
                                "hint": "Provide path to a user-owned PDF."})
             out = _machining_ref.machining_ref_index_pdf(str(path), project_root=project_root)
             if notes and isinstance(out, dict):
-                out["interpreted"] = _interpreted_notes(notes)
+                _attach_notes(out, *_split_notes(notes))
             return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -1621,7 +1620,7 @@ def register_research_tools(mcp: FastMCP) -> None:
                 str(query or ""), source_id=source_id, limit=limit
             )
             if notes and isinstance(out, dict):
-                out["interpreted"] = _interpreted_notes(notes)
+                _attach_notes(out, *_split_notes(notes))
             return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)

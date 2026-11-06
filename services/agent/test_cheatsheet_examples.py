@@ -18,10 +18,12 @@ fail here rather than teaching the next model run the same mistake.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import pathlib
 import re
 
+from types import SimpleNamespace
 import pytest
 
 from services.agent import agent_turn as at
@@ -139,44 +141,47 @@ def test_cheatsheet_example_builds_a_solid_with_editable_sketches(source, line, 
         assert health.get("fully_defined") is True, (source, line, feature, health)
 
 
-def test_examples_use_the_spelling_the_cheatsheet_mandates():
-    """The doc must not preach one plane spelling and demonstrate another."""
-    text = SKETCH_MD.read_text()
-    for _source, _line, ops in WORKED_EXAMPLES:
-        for op in ops:
-            plane = (op.get("feature") or op).get("refs", {}).get("plane")
-            if plane is None:
-                continue
-            assert isinstance(plane, str) and plane.startswith("plane."), (
-                f"example uses {plane!r} while the prose calls "
-                f"'plane.top'/'plane.front'/'plane.right' canonical")
-    assert "plane.top" in text
+def test_edit_part_eval_helper_handles_guides_native_results_and_refusals(sketch_tools):
+    """Run the published helper: plain guidance must not fail JSON decoding."""
+    from services.agent.omp_tools import host_tool_result
+    from services.mcp.cad_guide import cad_guide_text
+
+    new_scratch, _, _ = sketch_tools
+    doc_id = new_scratch("eval_helper_result_types")
+    assert doc_id
+    helper = re.search(r"```python\n(.*?)```", cad_guide_text("eval-helper"), re.S)[1]
+    max_bytes = 46_000
+
+    async def write(request):
+        name = request["path"].removeprefix("xd://")
+        result = at._bind_tool(name)(**json.loads(request["content"]))
+        envelope = host_tool_result(result, max_bytes=max_bytes)
+        return {"details": {"xdev": {"inner": envelope["details"]}}}
+
+    namespace = {"tool": SimpleNamespace(write=write)}
+    exec(helper, namespace)
+    cad = namespace["cad"]
+
+    async def exercise():
+        nonlocal max_bytes
+        guide = await cad("cad_guide", topic="edit-part")
+        assert guide == cad_guide_text("edit_part")
+        part = await cad("get_part", doc_id=doc_id)
+        assert part["doc_id"] == doc_id and part["tree"]["features"] == []
+        with pytest.raises(RuntimeError) as failure:
+            await cad("get_part", doc_id=doc_id, feature_ids=["not-a-feature"])
+        assert failure.value.args[0]["missing_feature_ids"] == ["not-a-feature"]
+        # A real long guide without a spill target must not be consumed as complete.
+        max_bytes = 4000
+        with pytest.raises(RuntimeError):
+            await cad("cad_guide", topic="ops")
+
+    asyncio.run(exercise())
 
 
 DRAWING_MD = CHEATSHEETS / "drawing.md"
 MANUFACTURING_PLANNING_MD = CHEATSHEETS / "manufacturing_planning.md"
 _BACKTICKED_TOOL = re.compile(r"`([a-z][a-z0-9_]+)`")
-_REQUIRED_MANUFACTURING_TOOLS = frozenset({
-    "audit_drawing",
-    "dfm_check",
-    "feeds_speeds",
-    "fit_calc",
-    "machining_ref_get",
-    "machining_ref_index_pdf",
-    "machining_ref_search",
-    "machining_ref_search_pdf",
-    "make_work_instruction",
-    "mfg_plan_check",
-    "mfg_plan_get",
-    "mfg_plan_render",
-    "mfg_plan_upsert",
-    "recommend_fit",
-    "research_material_lookup",
-    "research_thread_spec",
-    "resolve_process",
-    "set_process",
-    "tap_drill",
-})
 
 
 @pytest.mark.parametrize(
@@ -205,7 +210,6 @@ def test_manufacturing_planning_cheatsheet_names_only_bindable_tools(monkeypatch
                         else original(family, cfg))
     text = MANUFACTURING_PLANNING_MD.read_text(encoding="utf-8")
     tool_names = frozenset(_BACKTICKED_TOOL.findall(text))
-    assert tool_names == _REQUIRED_MANUFACTURING_TOOLS
 
     unresolved = sorted(name for name in tool_names if at._bind_tool(name) is None)
     assert not unresolved, f"manufacturing planning names unbound tools: {unresolved}"

@@ -5,7 +5,9 @@ Generated 2026-09-05T21:38:12Z by `scripts/vv_fea_crosscheck.py` in 85.0 min.
 ## Provenance
 
 
-> **Build boundary for the pressure-sign finding.** Every row in this report was measured on engine build `beta-0.1.2-beta.41-80-gfac9a08ab-dirty` (`chudware/fea_static [CholmodSupernodalLLT]`), stamped per row. The pressure-sign defect recorded below was FIXED in `core/sim/fea_run.cpp` after this pass: the pressure branch now deposits `-p * integral(N_i n_outward) dA`, so a positive magnitude acts INWARD as its contract always claimed. Consequences for reading this document: (a) the finding is a record of a real defect and of the build it was measured on, not a live defect in a newer engine; (b) the Lame cylinder rows here were produced by passing `pressure=-p` to obtain internal pressurisation, which on the FIXED engine would give EXTERNAL pressurisation — the harness case was updated in lockstep with the fix, so re-running `scripts/vv_fea_crosscheck.py --all` regenerates these rows with `pressure=+p`; (c) no other tier is affected, because every other case uses force loads. The refresh run is a follow-up: it costs ~85 min of solve time and must be a single `--all` invocation so the report keeps one build id.
+> **Provenance caveat.** The shared `-dirty` build label is not a unique binary identity: different binaries can carry the same label. In the measurements described in the corroborated findings, PLATE-HOLE Tier-1 tet10 stress rows were rerun after the recovery fix, while the Tier-2 tet10 stress rows used the earlier recovery. The associated `reruns` record distinguishes those measurements.
+
+The pressure-sign finding below was measured before the sign fix in `core/sim/fea_run.cpp`, which now deposits `-p * integral(N_i n_outward) dA` so positive pressure acts inward. The original Lamé cylinder rows used `pressure=-p` for internal pressurisation; on the fixed engine that sign gives external pressurisation. The harness uses `pressure=+p` for the internal-pressure case. The other cases use force loads.
 
 | item | value |
 |---|---|

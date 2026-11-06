@@ -3,7 +3,7 @@ import BaseLayout from '../layouts/BaseLayout.astro';
 import TesseractHero from '../components/TesseractHero.astro';
 import '../styles/company.css';
 ---
-<BaseLayout title="About Chudware" description="Why Chudware combines exact parametric CAD, manufacturing, simulation, product data, reverse engineering, and an AI copilot in one open-source engineering workspace.">
+<BaseLayout title="About Chudware" description="Why Chudware combines exact parametric CAD, manufacturing, simulation, product data, reverse engineering, and an optional AI copilot in one MIT-licensed engineering workspace.">
   <header class="page-hero">
     <div class="wrap">
       <p class="eyebrow">About</p>
@@ -21,10 +21,11 @@ import '../styles/company.css';
 
         <h2>Files and delivery</h2>
         <p>The native <code>.step+</code> container keeps the neutral STEP body alongside Chudware feature, parameter, material, study, drawing, and integrity data. The STEP payload can be extracted or exported for exchange even when another system cannot read Chudware's feature history.</p>
-        <p>Desktop builds for Windows, Linux, and macOS (x86-64) are published on GitHub Releases. The <a class="text-link" href="/download/">download page</a> explains which file to pick.</p>
+        <p>Desktop packaging targets Windows and Linux x86-64 and macOS ARM64. Public desktop installers are not yet available. The <a class="text-link" href="/download/">setup page</a> explains source access, desktop builds, and experimental browser self-hosting.</p>
 
         <h2>Open source</h2>
-        <p>Chudware is open source under the MIT License. The source code, issue tracker, and release builds live in the <a class="text-link" href="https://github.com/Hunter-124/Chudware">Chudware repository on GitHub</a>. There are no Chudware accounts, license keys, or fees, and your designs stay on your machine unless you send project context to an AI provider you configured.</p>
+        <p>Chudware's code is MIT licensed, with no Chudware software fee or license key for desktop use, source builds, or self-hosting. Clone the public <a class="text-link" href="https://github.com/Hunter-124/Chudware">source repository</a> to build and run it yourself. Optional paid, owner-operated hosting supports development without being required to run the software.</p>
+        <p>Desktop documents live on your machine; browser documents and engine state live on the server you use. Hosting operators can access data on their infrastructure. AI providers receive the context you send through a configured desktop copilot; online Copilot is not available in browser deployments. See <a class="text-link" href="/legal/privacy/">privacy</a>.</p>
         <p>The project is under active development. Core workflows are usable today; advanced capabilities and packaging are still changing. Test it on representative files, studies, and CAM handoffs before relying on it for production work.</p>
 
         <h2>Open-source meshing</h2>
@@ -56,7 +57,7 @@ import '../styles/company.css';
       </header>
       <div class="co-note">
         <p class="eyebrow">Start with evidence</p>
-        <p><a class="text-link" href="/gallery/">Gallery</a> · <a class="text-link" href="/docs/">Documentation</a> · <a class="text-link" href="/changelog/">Changelog</a> · <a class="text-link" href="https://github.com/Hunter-124/Chudware">Source code</a></p>
+        <p><a class="text-link" href="/gallery/">Gallery</a> · <a class="text-link" href="/docs/">Documentation</a> · <a class="text-link" href="/changelog/">Changelog</a> · <a class="text-link" href="/open-source/">Source and licenses</a></p>
       </div>
     </div>
   </section>
@@ -64,9 +65,9 @@ import '../styles/company.css';
   <section class="section cta-band">
     <div class="wrap section-heading">
       <p class="eyebrow">Evaluate Chudware</p>
-      <h2>Install the desktop app, or build it from source.</h2>
-      <p class="lede">Free and open source under the MIT License. Test the workflows that matter to you.</p>
-      <div class="actions"><a class="button" href="/download/">Download</a><a class="button button-secondary" href="https://github.com/Hunter-124/Chudware">View on GitHub</a></div>
+      <h2>Choose where your engineering workspace runs.</h2>
+      <p class="lede">Free desktop and self-hosted software under the MIT License, with optional paid hosting to support development.</p>
+      <div class="actions"><a class="button" href="/download/">See setup choices</a><a class="button button-secondary" href="/contact/">Ask about hosting</a></div>
     </div>
   </section>
 </BaseLayout>

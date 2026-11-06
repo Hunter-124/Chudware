@@ -1,23 +1,8 @@
-"""ECAD ``part_id`` dialect — the invented ``ecad:<Library>:<Symbol>`` id (2026-07-29).
+"""ECAD part-ID and KiCad library resolution regressions.
 
-Four of the six measured failures in the pass-2c confirmation sweep (claude-sonnet-4-5,
-ecad turns) were one shape::
-
-    part_get(part_id="ecad:RF_Module:ESP32-WROOM-32")   -> "part_id not found"
-    part_get(part_id="ecad:Device:R_0603")              -> "part_id not found"
-    part_place(part_id="ecad:RF_Module:ESP32-WROOM-32") -> "unknown part_id ..."
-
-The id SHAPE is right — ``services/parts/adapters/ecad_kicad_adapter.py`` mints every ECAD
-catalogue id as ``ecad:<libid>`` — but those symbols are not in the clean-room starter
-library (0603 is a footprint size; the symbol is plain ``Device:R``).
-
-Two behaviours are pinned here, and they pull in opposite directions on purpose:
-
-  * spelling noise that CANNOT change which record you get (domain prefix, case) resolves;
-  * a near miss is REFUSED, never substituted — but the refusal now names real ids so the
-    model can retry without spending a ``part_search`` round trip.
-
-Covers services/ecad/library/partid.py, ecad_kicad_adapter.get and parts_tools._part_id_hint.
+The older Python starter-library spelling helpers are tested independently.
+Parts tools must prefer exact native KiCad IDs and never substitute a different
+symbol or pin numbering when the requested ID is absent.
 """
 from __future__ import annotations
 
@@ -100,7 +85,11 @@ def _tools() -> dict:
 
 def _call(tools: dict, name: str, **kw) -> dict:
     out = tools[name](**kw)
-    assert isinstance(out, str), f"{name} must return a JSON string, got {type(out)}"
+    if isinstance(out, list):
+        from mcp.server.fastmcp import Image
+        assert len(out) == 2 and isinstance(out[0], Image) and isinstance(out[1], str), out
+        out = out[1]
+    assert isinstance(out, str), f"{name} must return JSON text, got {type(out)}"
     return json.loads(out)
 
 
@@ -125,12 +114,12 @@ def test_a_near_miss_is_never_resolved_to_a_substitute() -> None:
     Resolving it to ``ecad:Resistor_SMD:R_0603`` would cross the symbol/footprint boundary;
     resolving it to ``ecad:Device:R`` would silently drop the 0603 the model asked for.
     """
-    for near in ("ecad:Device:R_0603", "ecad:RF_Module:ESP32-WROOM-32",
+    for near in ("ecad:Device:R_0603", "ecad:RF_Module:NO_SUCH_TEST_PART_9Z9",
                  "ecad:Device:R0603", "ecad:Resistor_SMD:R_0604"):
         assert partid.resolve(near) is None, \
             f"{near!r} must NOT resolve — got {partid.resolve(near)}"
     tools = _tools()
-    for near in ("ecad:Device:R_0603", "ecad:RF_Module:ESP32-WROOM-32"):
+    for near in ("ecad:Device:R_0603", "ecad:RF_Module:NO_SUCH_TEST_PART_9Z9"):
         got = _call(tools, "part_get", part_id=near)
         assert got["ok"] is False, f"{near!r} must fail, not return a substitute: {got}"
         assert "part" not in got, got
@@ -139,32 +128,20 @@ def test_a_near_miss_is_never_resolved_to_a_substitute() -> None:
 # ------------------------------------------------------------------ the refusal is useful
 
 
-def test_part_get_hint_names_a_real_candidate_id() -> None:
-    """The dead-end 'use part_search' hint now carries the search RESULT.
-
-    ``ecad:Resistor_SMD:R_0603`` is the real 0603 record and ``ecad:Device:R`` is the real
-    resistor symbol; both are named so the next call can be correct.
-    """
+def test_part_get_hint_points_to_native_discovery() -> None:
     got = _call(_tools(), "part_get", part_id="ecad:Device:R_0603")
     assert got["ok"] is False, got
-    hint = got["hint"]
-    assert "'ecad:Resistor_SMD:R_0603'" in hint, hint
-    assert "'ecad:Device:R'" in hint, hint
-    assert "ecad_place_symbol" in hint, "the hint must name the tool that takes a libid"
+    assert "part_search" in got["hint"]
+    assert "ecad_symbols" in got["hint"]
+    assert "ecad_find_footprint" in got["hint"]
 
 
-def test_part_place_hint_names_a_real_candidate_and_places_nothing() -> None:
-    """The measured part_place failure. It must stay a refusal AND stop being a dead end."""
-    got = _call(_tools(), "part_place", part_id="ecad:RF_Module:ESP32-WROOM-32")
-    assert got["ok"] is False, f"an unknown id must never place a substitute: {got}"
+def test_part_place_unknown_id_places_nothing() -> None:
+    got = _call(_tools(), "part_place", part_id="ecad:RF_Module:NO_SUCH_TEST_PART_9Z9")
+    assert got["ok"] is False, got
     for invented in ("doc_id", "entity_id", "domain"):
-        assert invented not in got, f"a refused placement leaked {invented}: {got}"
-    hint = got["hint"]
-    assert "'ecad:RF_Module:GPS_Castellated_1x6'" in hint, \
-        f"the hint must name a real id from the library the model asked for: {hint}"
-    assert all("ESP32" not in c["part_id"]
-               for c in partid.candidates("ecad:RF_Module:ESP32-WROOM-32")), \
-        "no candidate may be an invented ESP32 id"
+        assert invented not in got, got
+    assert "part_search" in got["hint"]
 
 
 def test_a_genuinely_unknown_id_fails_without_inventing_anything() -> None:
@@ -176,7 +153,28 @@ def test_a_genuinely_unknown_id_fails_without_inventing_anything() -> None:
     assert partid.candidates("ecad:Frobnicate:Xyzzy_9000") == [], \
         partid.candidates("ecad:Frobnicate:Xyzzy_9000")
     assert "Closest real catalogue ids" not in got["hint"], got["hint"]
-    assert "ecad_find_part" in got["hint"], got["hint"]
+    assert "ecad_symbols" in got["hint"], got["hint"]
+
+
+def test_candidate_search_ignores_numeric_only_tokens_but_keeps_related_hits(monkeypatch):
+    calls = []
+
+    def search(query):
+        calls.append(query)
+        if query == "9000":
+            return [{"libid": "Isolator:HCPL-9000", "score": 50}]
+        if query == "esp32":
+            return [{"libid": "RF_Module:ESP32-WROOM-32", "score": 50}]
+        return []
+
+    monkeypatch.setattr(partid, "_search_hits", search)
+    assert partid.candidates("ecad:Frobnicate:Xyzzy_9000") == []
+    assert "9000" not in calls
+    related = partid.candidates("ecad:RF_Module:ESP32-WROOM-32")
+    assert any(r["part_id"] == "ecad:RF_Module:ESP32-WROOM-32" for r in related)
+    assert "esp32" in calls
+    assert any(r["part_id"] == "ecad:Resistor_SMD:R_0603"
+               for r in partid.candidates("ecad:Device:R_0603"))
 
 
 def test_every_candidate_is_a_real_catalogue_id() -> None:
@@ -239,7 +237,6 @@ KICAD_IDENTITIES = [
     ("Connector_Generic:Conn_01x04", "ecad:Connector:Conn_4"),
     ("power:+3.3V", "ecad:power:+3V3"),
     ("Regulator_Linear:LM7805_TO220", "ecad:Regulator_Linear:7805"),
-    ("Timer:NE555P", "ecad:Timer:NE555"),
     ("Sensor_Motion:MPU-6050", "ecad:Sensor_Motion:MPU6050"),
     # Pin-ORDER variants: the same device under a different pin NUMBERING, carried by an
     # explicit audited permutation. The numbering itself is asserted below.
@@ -248,11 +245,17 @@ KICAD_IDENTITIES = [
     ("Device:Q_PNP_CBE", "ecad:Device:Q_PNP"),
     ("Device:Q_NMOS_DGS", "ecad:Device:NMOS"),
     ("Device:Q_PMOS_SGD", "ecad:Device:PMOS"),
-    ("Timer:LM555", "ecad:Timer:NE555"),
+    ("Timer:LM555", "ecad:Timer:NE555P"),
+    ("Timer:SA555", "ecad:Timer:NE555P"),
     ("Connector_Generic:Conn_02x03_Odd_Even", "ecad:Connector:Header_2x03"),
     ("Connector_Generic:Conn_02x03_Counter_Clockwise", "ecad:Connector:Header_2x03"),
     ("Connector_Generic:Conn_02x05_Counter_Clockwise", "ecad:Connector:Header_2x05"),
 ]
+
+# KiCad's eight physical timer pins, shared by its PDIP and SOIC variants.
+TIMER_PINS = {"1": "GND", "2": "TRIG", "3": "OUT", "4": "~{RST}",
+              "5": "CONT", "6": "THRES", "7": "DISCH", "8": "VCC"}
+TIMER_IDENTITY_REMAP = {str(i): str(i) for i in range(1, 9)}
 
 # (KiCad id, its permutation onto OUR pin numbers, the pin NAME of each KiCad pin).
 # This is the load-bearing assertion of the remap feature: not "it resolved" but "KiCad pin
@@ -268,10 +271,8 @@ KICAD_PIN_REMAPS = [
     ("Device:Q_PMOS_SGD", {"1": "2", "2": "1", "3": "3"}, {"1": "S", "2": "G", "3": "D"}),
     # The bipolar 555 under another vendor's part number: same DIP-8 datasheet pinout, and
     # all eight pins are stated so the audit is on the record rather than implied.
-    ("Timer:LM555",
-     {str(i): str(i) for i in range(1, 9)},
-     {"1": "GND", "2": "TRIG", "3": "OUT", "4": "RST",
-      "5": "CV", "6": "THR", "7": "DIS", "8": "VCC"}),
+    ("Timer:LM555", TIMER_IDENTITY_REMAP, TIMER_PINS),
+    ("Timer:SA555", TIMER_IDENTITY_REMAP, TIMER_PINS),
     # KiCad's 2xNN _Counter_Clockwise is the DIP topology (1..N down the first row, then
     # N+1..2N back UP the second); ours numbers odd-left/even-right, i.e. _Odd_Even.
     ("Connector_Generic:Conn_02x03_Counter_Clockwise",
@@ -298,35 +299,48 @@ KICAD_NON_IDENTITIES = [
 ]
 
 
-def test_kicad_standard_library_spellings_resolve_and_are_echoed() -> None:
-    """A KiCad spelling of a device we HAVE resolves to that one id, and says it did."""
-    tools = _tools()
+def test_starter_identity_table_is_independently_audited() -> None:
+    """The Python starter helper's aliases remain independent of native lookup."""
     for written, expect in KICAD_IDENTITIES:
         hit = partid.resolve(written)
-        assert hit is not None, f"{written!r} must resolve to {expect}"
-        assert hit["part_id"] == expect, \
-            f"{written!r} resolved to {hit['part_id']} instead of {expect}"
+        assert hit is not None and hit["part_id"] == expect
         assert expect in hit["note"] and "KiCad" in hit["note"], hit["note"]
-        got = _call(tools, "part_get", part_id=written)
-        assert got["ok"] and got["part"]["part_id"] == expect, got
-        echo = " ".join(got.get("interpreted") or [])
-        assert expect in echo and written in echo, \
-            f"an id rewrite must be echoed, not silent: {got.get('interpreted')}"
+
+
+def test_timer_package_ids_resolve_exactly() -> None:
+    """The PDIP and SOIC IDs must stay distinct rather than becoming aliases."""
+    from services.ecad.library.starter import SYMBOLS
+
+    tools = _tools()
+    for libid, footprint in (
+        ("Timer:NE555P", "Package_DIP:DIP-8_W7.62mm"),
+        ("Timer:NE555D", "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm"),
+    ):
+        hit = partid.resolve(libid)
+        assert hit is not None, libid
+        assert hit["part_id"] == "ecad:" + libid and hit["libid"] == libid, hit
+        assert hit["kind"] == "symbol" and hit["pin_remap"] is None and not hit["note"], hit
+        pins = partid.resolved_pins(libid)
+        assert pins is not None, libid
+        assert {pin["number"]: pin["name"] for pin in pins} == TIMER_PINS
+        assert {pin["number"]: pin["native_number"] for pin in pins} == TIMER_IDENTITY_REMAP
+        assert SYMBOLS[libid]["default_footprint"] == footprint
+
+        got = _call(tools, "part_get", part_id="ecad:" + libid, include_live=False)
+        assert got["ok"], got
+        assert got["part"]["part_id"] == "ecad:" + libid, got
+        assert got["part"]["geometry_ref"]["libid"] == libid, got
+        assert got["part"]["params"]["pin_count"] == 8, got
+        assert "pin_remap" not in got["part"], got
 
 
 def test_kicad_pin_order_and_subtype_variants_are_refused_with_a_real_candidate() -> None:
     """The deliberate NON-aliases. Binding any of these would report success on a part with
     different pins or different silicon — the worst outcome available here."""
-    tools = _tools()
     for written in KICAD_NON_IDENTITIES:
         assert partid.resolve(written) is None, \
-            f"{written!r} must NOT resolve — got {partid.resolve(written)}"
-        got = _call(tools, "part_get", part_id=written)
-        assert got["ok"] is False and "part" not in got, got
-        found = partid.candidates(written)
-        assert found, f"{written!r} refused with no candidate to retry with"
-        assert found[0]["part_id"] in got["hint"], \
-            f"the refusal must name a real id: {got['hint']}"
+            f"{written!r} must NOT resolve in the starter helper"
+        assert partid.candidates(written), f"{written!r} has no starter candidate"
 
 
 def test_kicad_identity_table_only_points_at_ids_that_exist() -> None:
@@ -391,30 +405,31 @@ def test_remapped_kicad_ids_resolve_to_the_right_pin_identities() -> None:
                  f"is {native_pins[native_num]}, not {want_names[caller]}")
 
 
-def test_a_remap_is_stated_out_loud_and_reaches_part_get() -> None:
-    """A renumbering the caller cannot see is a renumbering it cannot obey. It must be in
-    resolve()'s note, on the PartRecord, and in part_get's interpreted notes."""
-    hit = partid.resolve("Device:Q_NPN_BCE")
-    assert "PIN REMAP" in hit["note"], hit["note"]
-    assert "pin 2 (C) is pin 3" in hit["note"], hit["note"]
-    got = _call(_tools(), "part_get", part_id="ecad:Device:Q_NPN_BCE")
+def test_kicad_native_symbol_is_not_remapped_to_starter(monkeypatch) -> None:
+    from services.mcp import core_bridge
+
+    def rpc(method, params):
+        if method == "ecad_symbols":
+            return {"ok": True, "symbols": [
+                {"libid": "Device:R_Small", "name": "R_Small",
+                 "description": "Resistor", "pin_count": 2, "footprint": ""}]}
+        if method == "ecad_footprints":
+            return {"ok": True, "footprints": []}
+        raise AssertionError(method)
+
+    monkeypatch.setattr(core_bridge, "call", rpc)
+    got = _call(_tools(), "part_get", part_id="ecad:Device:R_Small", include_live=False)
     assert got["ok"], got
-    rec = got["part"]
-    assert rec["part_id"] == "ecad:Device:Q_NPN"
-    assert {p["number"]: p["native_number"] for p in rec["pin_remap"]} == \
-        {"1": "1", "2": "3", "3": "2"}, rec["pin_remap"]
-    echo = " ".join(got.get("interpreted") or [])
-    assert "PIN REMAP" in echo and "your pin 2 (C) = pin 3" in echo, got.get("interpreted")
-    # An id with NO permutation must not grow a phantom one.
-    plain = _call(_tools(), "part_get", part_id="ecad:Device:R_Small")
-    assert plain["ok"] and "pin_remap" not in plain["part"], plain["part"]
+    assert got["part"]["part_id"] == "ecad:Device:R_Small"
+    assert got["part"]["geometry_ref"]["libid"] == "Device:R_Small"
+    assert "pin_remap" not in got["part"]
 
 
 def test_a_partial_permutation_is_refused_not_identity_filled() -> None:
     """The guard the whole feature hangs on. A permutation that does not name every pin of
     the native symbol is a partial GUESS; completing it with an identity fallback would wire
     some legs right and some wrong while reporting success. It must refuse instead."""
-    entry = partid._Entry("Timer:NE555", {"1": "1", "2": "2", "3": "3"})  # 3 of 8 pins
+    entry = partid._Entry("Timer:NE555P", {"1": "1", "2": "2", "3": "3"})  # 3 of 8 pins
     problem = partid._remap_problem(entry)
     assert "covers 3 of 8 pins" in problem, problem
     for missing in ("4", "5", "6", "7", "8"):
@@ -521,6 +536,9 @@ def test_a_generated_part_becomes_fetchable_under_the_id_the_hint_promised(tmp_p
     assert got["ok"], f"a generated part must be fetchable by part_id: {got}"
     assert got["part"]["part_id"] == part_id, got["part"]
     assert got["part"]["params"]["pin_count"] == 4, got["part"]["params"]
+    searched = _call(tools, "part_search", query="TEST WROOM 9", domain="ecad",
+                     include_live=False, detail="full")
+    assert any(r["part_id"] == part_id for r in searched["results"]), searched
 
 
 def test_a_symbol_and_its_footprint_under_one_id_yield_one_placeable_record(tmp_path) -> None:
@@ -552,3 +570,161 @@ def test_a_symbol_and_its_footprint_under_one_id_yield_one_placeable_record(tmp_
         f"the SYMBOL must win the id, not the footprint: {got['part']['params']}"
     assert got["part"]["geometry_ref"]["libid"] == libid, \
         f"geometry_ref must carry the libid part_place needs: {got['part']['geometry_ref']}"
+
+
+def test_live_ecad_placement_reports_lock_errors(monkeypatch):
+    from services.mcp import ecad_common
+    from services.mcp.parts_tools import _place_ecad_part
+
+    session = ecad_common.EcadSession("sch-1", {"schema": "aicad.sch/1"}, revision=3)
+    monkeypatch.setattr(ecad_common.ecad_session, "get_session", lambda _: session)
+    monkeypatch.setattr(ecad_common.ecad_session, "bind_unbound", lambda s: s)
+
+    def locked(*_args):
+        raise ecad_common.OpError("kicad_locked", "KiCad has locked the document",
+                                  {"applied": False})
+
+    monkeypatch.setattr(ecad_common, "_apply", locked)
+    result = _place_ecad_part(
+        {"geometry_ref": {"kind": "symbol_footprint", "libid": "Device:R"}},
+        None, "sch-1", {"pos": [4, 5]})
+    assert result["ok"] is False
+    assert result["code"] == "kicad_locked"
+    assert result["detail"]["applied"] is False
+
+
+def test_shared_library_id_places_the_exact_board_footprint(monkeypatch):
+    from services.mcp import ecad_common
+    from services.mcp.parts_tools import _place_ecad_part
+
+    session = ecad_common.EcadSession("pcb-1", {
+        "schema": "aicad.pcb/1", "footprints": []}, revision=3)
+    monkeypatch.setattr(ecad_common.ecad_session, "get_session", lambda _: session)
+    bound = []
+    monkeypatch.setattr(ecad_common.ecad_session, "bind_unbound",
+                        lambda s: bound.append(s) or s)
+    applied = []
+
+    def apply(target, ops):
+        applied.extend(ops)
+        target.doc["footprints"].append({"id": "fp1", "fpid": ops[0]["fpid"],
+                                         "ref": "U1", "pos": ops[0]["pos"]})
+        return {"id_map": {"$0": "fp1"}, "revision": 4}
+
+    monkeypatch.setattr(ecad_common, "_apply", apply)
+    record = {"geometry_ref": {"kind": "symbol_footprint", "libid": "Module:X",
+                               "footprint": "Other:Default", "board_footprint": "Module:X"}}
+    out = _place_ecad_part(record, None, "pcb-1", {"pos": [2, 3]})
+    assert out["ok"], out
+    assert applied[0]["fpid"] == "Module:X"
+    assert bound == [session]
+    assert out["entity_id"] == "fp1"
+
+
+def test_kicad_library_parts_search_place_and_reopen(tmp_path):
+    """Use native KiCad libraries and verify the saved schematic and board."""
+    from services.mcp import core_bridge
+
+    try:
+        status = core_bridge.call("ecad_kicad_status", {})
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"native KiCad bridge unavailable: {exc}")
+    if not status.get("found") or not status.get("symbol_dir") or not status.get("footprint_dir"):
+        pytest.skip("KiCad and its symbol/footprint libraries are required")
+
+    sessions = []
+    try:
+        sch_path = tmp_path / "parts.kicad_sch"
+        pcb_path = tmp_path / "parts.kicad_pcb"
+        sch = core_bridge.call("ecad_new", {
+            "kind": "sch", "name": "parts", "path": str(sch_path)})
+        pcb = core_bridge.call("ecad_new", {
+            "kind": "pcb", "name": "parts", "path": str(pcb_path)})
+        sessions.extend([sch["doc_id"], pcb["doc_id"]])
+        tools = _tools()
+
+        sym_id = "ecad:RF_Module:ESP32-WROOM-32"
+        found = _call(tools, "part_search", query="ESP32-WROOM-32", domain="ecad",
+                      doc_id=sch["doc_id"], include_live=False, detail="full")
+        sym = next(r for r in found["results"] if r["part_id"] == sym_id)
+        assert sym["params"]["pin_count"] >= 30
+        assert sym["geometry_ref"]["footprint"] == "RF_Module:ESP32-WROOM-32"
+        detached = _call(tools, "part_place", part_id=sym_id, doc=sch["tree"],
+                         params={"pos": [1, 2]}, include_live=False)
+        assert detached["ok"], detached
+        assert detached["saved"] is False and detached["path"] is None
+        assert detached["doc"]["symbols"][-1]["libid"] == "RF_Module:ESP32-WROOM-32"
+        assert not sch["tree"]["symbols"]
+        placed = _call(tools, "part_place", part_id=sym_id, doc_id=sch["doc_id"],
+                       params={"pos": [10, 20], "ref": "U1"}, include_live=False)
+        assert placed["ok"], placed
+        assert placed["saved"] is True and placed["path"] == str(sch_path)
+        assert placed["entity_id"]
+        assert placed["doc"]["symbols"][-1]["libid"] == "RF_Module:ESP32-WROOM-32"
+        assert len(placed["doc"]["lib_cache"]["RF_Module:ESP32-WROOM-32"]["pins"]) >= 30
+        module_fp = _call(tools, "part_place", part_id=sym_id, doc_id=pcb["doc_id"],
+                          params={"pos": [20, 20], "ref": "U1"}, include_live=False)
+        assert module_fp["ok"], module_fp
+        assert module_fp["saved"] is True and module_fp["path"] == str(pcb_path)
+        assert module_fp["doc"]["footprints"][-1]["fpid"] == "RF_Module:ESP32-WROOM-32"
+        assert len(module_fp["doc"]["footprints"][-1]["pads"]) >= 30
+
+        fp_id = "ecad:Resistor_SMD:R_0603_1608Metric"
+        found_fp = _call(tools, "part_get", part_id=fp_id, doc_id=pcb["doc_id"],
+                         include_live=False)
+        assert found_fp["ok"], found_fp
+        assert found_fp["part"]["params"]["pad_count"] == 2
+        placed_fp = _call(tools, "part_place", part_id=fp_id, doc=pcb["doc_id"],
+                          params={"pos": [4, 6], "ref": "R1"}, include_live=False)
+        assert placed_fp["ok"], placed_fp
+        assert placed_fp["doc"]["footprints"][-1]["fpid"] == "Resistor_SMD:R_0603_1608Metric"
+        assert len(placed_fp["doc"]["footprints"][-1]["pads"]) == 2
+
+        reopened_sch = core_bridge.call("ecad_open", {"path": str(sch_path)})
+        reopened_pcb = core_bridge.call("ecad_open", {"path": str(pcb_path)})
+        sessions.extend([reopened_sch["doc_id"], reopened_pcb["doc_id"]])
+        assert any(s["libid"] == "RF_Module:ESP32-WROOM-32"
+                   for s in reopened_sch["tree"]["symbols"])
+        assert any(f["fpid"] == "Resistor_SMD:R_0603_1608Metric" and len(f["pads"]) == 2
+                   for f in reopened_pcb["tree"]["footprints"])
+    finally:
+        for session in sessions:
+            core_bridge.call("ecad_close", {"doc_id": session})
+
+
+def test_project_library_search_and_placement_use_doc_context(tmp_path):
+    from pathlib import Path
+    from services.mcp import core_bridge
+
+    try:
+        status = core_bridge.call("ecad_kicad_status", {})
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"native KiCad bridge unavailable: {exc}")
+    if not status.get("found") or not status.get("symbol_dir"):
+        pytest.skip("KiCad symbol libraries are not installed")
+
+    library = Path(status["symbol_dir"]) / "Device.kicad_sym"
+    if not library.is_file():
+        pytest.skip("KiCad Device symbol library is not installed")
+    (tmp_path / "sym-lib-table").write_text(
+        '(sym_lib_table (version 7) '
+        f'(lib (name "ProjectDevice") (type "KiCad") (uri "{library}") '
+        '(options "") (descr "")))', encoding="utf-8")
+    sch = core_bridge.call("ecad_new", {
+        "kind": "sch", "name": "project", "path": str(tmp_path / "project.kicad_sch")})
+    try:
+        tools = _tools()
+        part_id = "ecad:ProjectDevice:R_Small"
+        result = _call(tools, "part_search", query="ProjectDevice:R_Small",
+                       domain="ecad", doc_id=sch["doc_id"], include_live=False, detail="full")
+        assert any(r["part_id"] == part_id for r in result["results"]), result
+        part = _call(tools, "part_get", part_id=part_id, doc_id=sch["doc_id"],
+                     include_live=False)
+        assert part["ok"], part
+        placed = _call(tools, "part_place", part_id=part_id, doc_id=sch["doc_id"],
+                       params={"pos": [0, 0]}, include_live=False)
+        assert placed["ok"], placed
+        assert placed["doc"]["symbols"][-1]["libid"] == "ProjectDevice:R_Small"
+        assert len(placed["doc"]["lib_cache"]["ProjectDevice:R_Small"]["pins"]) == 2
+    finally:
+        core_bridge.call("ecad_close", {"doc_id": sch["doc_id"]})

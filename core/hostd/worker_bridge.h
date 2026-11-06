@@ -1,5 +1,5 @@
 // Lazily-spawned, independent services-worker stdio lanes for hostd.
-// Each lane owns a child, stdio channel, and mutex. A long Chudcode turn
+// Each lane owns a child, stdio channel, and mutex. A long OMP turn
 // cannot serialize unrelated PLM/manufacturing/parts requests.
 // Desktop GUI keeps its own WorkerClient; these lanes serve hostd only.
 #pragma once
@@ -12,6 +12,7 @@
 #include <mutex>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -24,6 +25,10 @@ namespace hostd {
 class WorkerBridge {
 public:
     static WorkerBridge& agent();
+    // Non-turn, session-free service calls (provider/catalog/auth, model assignments,
+    // subscription accounts, skills): a worker that never runs a turn, so they are served
+    // while the agent lane is held by one.
+    static WorkerBridge& service();
     static WorkerBridge& general();
     // Explicitly classify worker methods. Unknown methods use the general lane.
     static WorkerBridge& forMethod(const std::string& method);
@@ -48,7 +53,8 @@ public:
     bool call(const std::string& method, const nlohmann::json& params,
               nlohmann::json& result, std::string& err, int timeoutMs = 120000,
               const EventFn& onEvent = {},
-              const nlohmann::json& ctx = nlohmann::json::object());
+              const nlohmann::json& ctx = nlohmann::json::object(),
+              const std::function<bool()>& admitTurn = {});
 
     // Attempt cancel/steer through the authenticated worker side channel only
     // when a previously-created bridge has the exact requested run active.
@@ -60,6 +66,12 @@ public:
                                  const nlohmann::json& params, bool& matched,
                                  nlohmann::json& result, std::string& err,
                                  const nlohmann::json& ctx = nlohmann::json::object());
+
+    // Apply saved policy to already-created agent workers over their independent
+    // authenticated control endpoints. Never starts or restarts a worker.
+    static nlohmann::json applyCompactionPolicy(
+        const nlohmann::json& params,
+        const nlohmann::json& ctx = nlohmann::json::object());
 
     // Retire only this actor/workspace's generations at or below the cutoff.
     // Newer generations must survive delayed or repeated authority updates.
@@ -81,10 +93,23 @@ public:
     // Snapshot already-created lanes only. Busy/reserved lanes never wait.
     static Activity activity();
 
+    // Frozen at the start of a desktop stale-binary drain. A PID alone can be
+    // recycled; generation identifies the particular child owned by this daemon.
+    struct AgentPeer {
+        long pid;
+        std::uint64_t generation;
+        std::string sessionId;
+        std::uint64_t reservation;
+    };
+    static std::vector<AgentPeer> snapshotAgentPeers();
+    static bool ownsAgentPeer(const std::vector<AgentPeer>& snapshot, long peerPid);
+
 private:
     explicit WorkerBridge(bool agentLane, bool turnWorker = false,
-                          nlohmann::json identity = nlohmann::json::object())
-        : identity_(std::move(identity)), agentLane_(agentLane), turnWorker_(turnWorker) {}
+                          nlohmann::json identity = nlohmann::json::object(),
+                          bool serviceLane = false)
+        : identity_(std::move(identity)), agentLane_(agentLane), turnWorker_(turnWorker),
+          serviceLane_(serviceLane) {}
     ~WorkerBridge();
     WorkerBridge(const WorkerBridge&) = delete;
     WorkerBridge& operator=(const WorkerBridge&) = delete;
@@ -98,6 +123,14 @@ private:
     static std::shared_ptr<ActorLanes> actorLanes(const nlohmann::json& ctx,
                                                 bool create, std::string& err);
     static bool isAgentMethod(const std::string& method);
+    // The session-free service calls the dedicated service worker answers (see service()).
+    // Exact names and prefixes, reviewed against worker_rpc.py: each is served from disk-
+    // backed stores or the shared OMP auth service, never from a turn's in-memory session.
+    static bool isServiceMethod(const std::string& method);
+    // CHUDWARE_HOSTD_WORKER_LANE value for this worker.
+    const char* laneName() const {
+        return turnWorker_ ? "agent-turn" : agentLane_ ? "agent" : serviceLane_ ? "service" : "general";
+    }
     static void stopActorLanes(const std::shared_ptr<ActorLanes>& lanes);
     static void reapIdleExtras(AgentPool& state);
     static void releaseTurn(AgentPool& state, WorkerBridge* bridge);
@@ -143,6 +176,8 @@ private:
 #endif
     // Generation presence without the stdio lock: release must stay off busy stdio.
     std::atomic<long> livePid_{-1};
+    // Guarded by workerIdentityMutex in worker_bridge.cpp, including every reap.
+    std::uint64_t processGeneration_ = 0;
     std::string readBuf_;
     int nextId_ = 1;
     bool running_ = false;
@@ -168,6 +203,11 @@ private:
 
     const bool agentLane_;
     const bool turnWorker_;
+    const bool serviceLane_;
+    // A long interactive call (omp_login) holds this lane's stdio until the user finishes the
+    // browser step. Every other call on the lane then fails fast with worker_lane_busy, like a
+    // call behind an agent turn, instead of queueing for its whole timeout.
+    std::atomic<bool> exclusiveCall_{false};
     // Timed: a call waits for the lane no longer than its own timeout (see call()). A plain
     // lock let an agent-lane call queue behind an hours-long agent_admin_turn until hostd's
     // long-tier watchdog killed the whole daemon (2026-09-27, subscription_accounts).
@@ -176,6 +216,7 @@ private:
     std::atomic<bool> stopping_{false};
     static std::atomic<bool> agentCreated_;
     static std::atomic<bool> generalCreated_;
+    static std::atomic<bool> serviceCreated_;
 };
 
 }  // namespace hostd

@@ -93,3 +93,18 @@ per logical key (`<stem>.GTL`, `<stem>-PTH.drl`, `<stem>-bom.csv`, `<stem>.net`,
 `<stem>.kicad_sch`, `<stem>-<sheet>.svg`, `<stem>.pdf`); a file-looking `path` receives a single
 output directly. The response's `paths` lists exactly what was written and is **empty when `path`
 was omitted** — callers report from `paths`, never from the absence of an error.
+
+## 8. KiCad outputs — contract revision v2
+
+This revision supersedes conflicting native writer and proxy-export descriptions above.
+`ecad_export` invokes the installed `kicad-cli` for Gerber, drill, position (CPL),
+BOM, STEP, ODB++, IPC-2581, SVG, PDF and PNG render for boards, and netlist, BOM,
+SPICE, SVG and PDF for schematics. See `ecad_rpc.md` v2 for exact kinds and result
+envelope. `ecad_to_3d` exports STEP with KiCad's installed component models and imports
+it as a CAD part; an inline board proxy is reserved for live board-physics callers.
+The bridge uses a clean bound file or a private temporary copy and only writes an
+explicitly requested output into the user's project. KiCad is a separate process.
+
+For the KiCad STEP output, the `aicad.boardphys/1` sidecar preserves engineering
+metadata and totals, but unverified component solid labels and bodies are null;
+unknown board outline area is null. See `boardphys.md` revision 2.

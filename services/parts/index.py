@@ -22,10 +22,10 @@ parts_cache_meta (regular table):
                                        -- schema_version
 
 Ranking (contracts/parts.md §4):
-    1. Exact designation match  (+1000)
-    2. Standard prefix match    (+100)
+    1. Exact identifier in title, designation or aliases (+30000)
+    2. Exact designation / standard prefix (+1000 / +100)
     3. Coverage-aware term-quorum bonus (dominates bm25 magnitude)
-    4. FTS5 BM25 score          (-bm25, small non-zero weight on ``text``)
+    4. FTS5 BM25 score (-bm25, small non-zero weight on ``text``)
 """
 from __future__ import annotations
 
@@ -36,11 +36,13 @@ import logging
 import os
 import re
 import sqlite3
+import tempfile
 import time
 from pathlib import Path
 from typing import Iterator
 
 from services.parts.query_norm import expand_terms, normalize_query, term_tiers
+from services.parts.search_relevance import has_identifiers, identifiers_match
 
 log = logging.getLogger(__name__)
 
@@ -90,6 +92,7 @@ def _new_memory_db() -> sqlite3.Connection:
     """
     conn = sqlite3.connect(":memory:", check_same_thread=False, cached_statements=0)
     conn.row_factory = sqlite3.Row
+    conn.create_function("parts_identity_match", 2, identifiers_match, deterministic=True)
     return conn
 
 
@@ -180,10 +183,9 @@ class PartsIndex:
         """Restore the on-disk snapshot when it matches ``fingerprint``.
 
         Returns True when the live index now holds the cached records (zero
-        provider enumeration needed).  A missing file, a schema/fingerprint
-        mismatch, a corrupt db or ANY error returns False — and best-effort
-        deletes the unusable file so the next :meth:`persist` starts clean.
-        The live index is left untouched on failure.
+        provider enumeration needed). A missing file, a schema/fingerprint
+        mismatch, a corrupt db or any error returns False. The live index is
+        left untouched; the next successful persist atomically replaces the snapshot.
         """
         path = self._path
         if path is None or not fingerprint:
@@ -221,7 +223,6 @@ class PartsIndex:
             with contextlib.suppress(Exception):
                 if src is not None:
                     src.close()
-            self._discard_cache_file()
             return False
 
         with contextlib.suppress(Exception):
@@ -239,19 +240,21 @@ class PartsIndex:
     def persist(self, fingerprint: str) -> None:
         """Atomically snapshot the live index to ``path`` under ``fingerprint``.
 
-        Builds into ``<path>.tmp`` via :meth:`sqlite3.Connection.backup` then
-        ``os.replace``s it into place.  Every OSError / sqlite error is
-        swallowed: failing to write the cache must never break search.
+        Builds into a uniquely named temporary file in the destination directory
+        via :meth:`sqlite3.Connection.backup`, then atomically replaces the snapshot.
+        Cache write failures never break search.
         """
         path = self._path
         if path is None or not fingerprint:
             return
-        tmp = path.with_suffix(".tmp")
+        tmp: Path | None = None
         dest: sqlite3.Connection | None = None
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            with contextlib.suppress(OSError):
-                tmp.unlink()
+            fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp",
+                                        dir=path.parent)
+            os.close(fd)
+            tmp = Path(name)
             dest = sqlite3.connect(str(tmp))
             self._conn.backup(dest)
             with dest:
@@ -275,16 +278,10 @@ class PartsIndex:
             if dest is not None:
                 with contextlib.suppress(Exception):
                     dest.close()
-            if tmp.exists():
+            if tmp is not None and tmp.exists():
                 with contextlib.suppress(OSError):
                     tmp.unlink()
 
-    def _discard_cache_file(self) -> None:
-        """Best-effort removal of an unusable snapshot (never raises)."""
-        if self._path is None:
-            return
-        with contextlib.suppress(OSError):
-            self._path.unlink()
 
     # ------------------------------------------------------------------
     # Search
@@ -299,8 +296,8 @@ class PartsIndex:
         (SQL ``IN (...)``) — Parts Library V2 taxonomy routing passes lists.
         """
         domains = _normalize_domains(domain)
-        if not query and domains is None:
-            return self._enumerate(domain=None, limit=limit)
+        if not query.strip():
+            return self._enumerate(domain=domains, limit=limit)
 
         conn = self._conn
         norm_q = normalize_query(query)
@@ -312,10 +309,6 @@ class PartsIndex:
         # carry the whole query (see contracts/parts.md §4 accuracy bug).
         plan = _build_fts_query(query, conn)
         if not plan:
-            if not query.strip():
-                # Whitespace-only query (with a domain filter) → enumerate,
-                # same as the no-domain-and-no-query case above.
-                return self._enumerate(domain=domains, limit=limit)
             # Real query terms, but NONE of them match anything in the
             # corpus: this must be an empty result, not an arbitrary
             # enumeration of unrelated records (that was the original
@@ -327,11 +320,17 @@ class PartsIndex:
         if domains:
             domain_filter = "AND f.domain IN (%s)" % ",".join("?" * len(domains))
 
-        # Best score seen per part_id across tiers. Each tier's SQL score
-        # already embeds a large quorum bonus (quorum * _QUORUM_UNIT) that
-        # dwarfs any plausible bm25 magnitude, so merging by max-score and
-        # sorting once at the end can never place a lower-coverage row above
-        # a higher-coverage one, regardless of bm25.
+        # Exact identifiers in title, designation or aliases rank first even
+        # when a concise display title no longer contains its alternate code.
+        # Apply this in SQL before LIMIT so an alias hit cannot be cut off.
+        identity_sql = ""
+        if has_identifiers(query):
+            identity_sql = (
+                " + 30000 * parts_identity_match("
+                "coalesce(f.title, '') || ' ' || coalesce(f.designation, '') || ' ' || "
+                "coalesce(json_extract(m.record_json, '$.aliases'), ''), ?)"
+            )
+        # Best score seen per part_id across coverage tiers.
         best: dict[str, tuple[float, str]] = {}
         for match_expr, quorum in plan:
             sql = f"""
@@ -340,15 +339,19 @@ class PartsIndex:
                 f.part_id,
                 (CASE WHEN lower(f.designation) = ?  THEN 1000 ELSE 0 END
                  + CASE WHEN lower(f.standard)   LIKE ? THEN  100 ELSE 0 END
+                 {identity_sql}
                  + {int(quorum) * _QUORUM_UNIT}
                  + (-1.0 * bm25(parts_fts, 0, 3, 2, 1, 1))) AS score
             FROM parts_fts f
             JOIN parts_meta m ON f.part_id = m.part_id
             WHERE parts_fts MATCH ? {domain_filter}
-            ORDER BY score DESC
+            ORDER BY score DESC, f.part_id ASC
             LIMIT ?
             """
-            params: list = [norm_q, norm_q + "%", match_expr]
+            params: list = [norm_q, norm_q + "%"]
+            if identity_sql:
+                params.append(query)
+            params.append(match_expr)
             if domains:
                 params.extend(domains)
             params.append(limit)
@@ -370,11 +373,11 @@ class PartsIndex:
                 break
 
         if not best:
-            return self._enumerate(domain=domains, limit=limit)
+            return []
 
-        ordered = sorted(best.values(), key=lambda t: -t[0])[:limit]
+        ordered = sorted(best.items(), key=lambda item: (-item[1][0], item[0]))[:limit]
         results = []
-        for _, record_json in ordered:
+        for _, (_, record_json) in ordered:
             try:
                 results.append(json.loads(record_json))
             except Exception:  # noqa: BLE001
@@ -411,19 +414,33 @@ class PartsIndex:
         return (matched, len(groups))
 
     def _enumerate(self, *, domain: str | list[str] | None, limit: int) -> list[dict]:
-        """Return up to limit records, optionally filtered by domain(s)."""
+        """Stable browse order; unscoped results interleave domains and families."""
         domains = _normalize_domains(domain)
         if domains:
             rows = self._conn.execute(
-                "SELECT record_json FROM parts_meta WHERE domain IN (%s) LIMIT ?"
-                % ",".join("?" * len(domains)),
+                "SELECT record_json FROM parts_meta WHERE domain IN (%s) "
+                "ORDER BY domain, part_id LIMIT ?" % ",".join("?" * len(domains)),
                 (*domains, limit)
             ).fetchall()
         else:
-            rows = self._conn.execute(
-                "SELECT record_json FROM parts_meta LIMIT ?",
-                (limit,)
-            ).fetchall()
+            rows = self._conn.execute("""
+                WITH families AS (
+                    SELECT part_id, domain, record_json,
+                           COALESCE(json_extract(record_json, '$.geometry_ref.family'),
+                                    json_extract(record_json, '$.family'), '') AS family
+                    FROM parts_meta
+                ), family_rows AS (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY domain, family ORDER BY part_id
+                    ) AS family_rank FROM families
+                ), domain_rows AS (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY domain ORDER BY family_rank, family, part_id
+                    ) AS domain_rank FROM family_rows
+                )
+                SELECT record_json FROM domain_rows
+                ORDER BY domain_rank, domain, part_id LIMIT ?
+            """, (limit,)).fetchall()
         results = []
         for row in rows:
             try:
@@ -516,14 +533,20 @@ def _record_to_row(rec: dict) -> tuple | None:
     title = rec.get("title") or ""
     standard = rec.get("standard") or ""
     designation = rec.get("designation") or ""
-    # Build FTS text: title + standard + designation + aliases + param values.
+    # Build FTS text from identity, description, aliases and param values.
     # `aliases` matters: a standard's alternate designations are how buyers spell it
     # ("DIN 912" for ISO 4762, "SHCS"), and without them "DIN 912 M3" matched no
     # fastener at all and relaxed down to an O-ring whose 0.912" ID carried the "912".
     params = rec.get("params") or {}
     param_text = " ".join(str(v) for v in params.values())
     alias_text = " ".join(str(a) for a in (rec.get("aliases") or []) if a)
-    text = f"{title} {standard} {designation} {alias_text} {param_text}".strip()
+    reference_text = " ".join(
+        str(ref.get(key) or "")
+        for ref in (rec.get("references") or []) if isinstance(ref, dict)
+        for key in ("identifier", "edition")
+    )
+    text = (f"{title} {standard} {designation} {rec.get('description') or ''} "
+            f"{alias_text} {param_text} {reference_text}").strip()
     record_json = json.dumps(rec, ensure_ascii=False)
     # (rowid, part_id, domain, record_json) for parts_meta
     # (part_id, domain, title, standard, designation, text) for fts

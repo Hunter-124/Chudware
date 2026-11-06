@@ -14,7 +14,6 @@
 // reveng_, sim_, eval_, the sketch hooks, the PM form opener) fall through to later rules just
 // like the original `if (prefix && handler(...)) return;` blocks did.
 #include "app_commands.h"
-#include <string_view>
 
 #include "core/app_state.h"
 #include "ui/asm_panels.h"               // C20b assembly panels
@@ -26,7 +25,219 @@
 #include "ui/sim_manager.h"              // C19 Simulation panel
 #include "ui/sketch3d_mode.h"            // 3D free-space sketcher
 #include "ui/sketch_mode.h"              // C18 sketch mode
-#include "ui/ribbon_def.h"
+
+#include <cstdint>
+#include <unordered_map>
+
+namespace {
+
+struct CheckedDispatch {
+    const AppState* state;
+    const std::string* command;
+};
+thread_local const CheckedDispatch* currentDispatch = nullptr;
+
+struct CheckedDispatchScope {
+    CheckedDispatch current;
+    const CheckedDispatch* previous;
+    CheckedDispatchScope(const AppState& state, const std::string& command)
+        : current{&state, &command}, previous(currentDispatch) {
+        currentDispatch = &current;
+    }
+    ~CheckedDispatchScope() { currentDispatch = previous; }
+};
+
+// One bounded active-document cache. A mirror generation changes on tree/status adoption,
+// including same-revision refreshes and snapshot restores, so neither a tab switch nor a
+// rebuild can reuse facts from a different tree.
+struct CommandDocFacts {
+    const AppState* owner = nullptr;
+    std::string docId;
+    int revision = -1;
+    uint64_t generation = 0;
+    bool treeKnown = false;
+    bool solidContent = false;
+    bool base = false, bend = false, flat = false;
+    bool baseUnknown = true, bendUnknown = true, flatUnknown = true;
+};
+
+const CommandDocFacts& commandDocFacts(const AppState& st) {
+    static CommandDocFacts cache;
+    const auto& mirror = st.docMirror;
+    if (cache.owner == &st && cache.docId == mirror.docId() &&
+        cache.revision == mirror.revision() && cache.generation == mirror.generation())
+        return cache;
+
+    cache = {};
+    cache.owner = &st;
+    cache.docId = mirror.docId();
+    cache.revision = mirror.revision();
+    cache.generation = mirror.generation();
+    const auto& tree = mirror.tree();
+    if (!tree.is_object()) return cache;
+
+    const auto components = tree.find("components");
+    cache.solidContent = components != tree.end() && components->is_array() && !components->empty();
+
+    // Statuses are the compiler's evidence that a sheet-metal feature actually executed.
+    // Missing statuses are tracked separately from known failures; they are not fabricated.
+    std::unordered_map<std::string, bool> status;
+    const auto& statuses = mirror.featureStatus();
+    if (mirror.featureStatusCurrent() && statuses.is_array()) {
+        status.reserve(statuses.size());
+        for (const auto& row : statuses) {
+            if (!row.is_object()) continue;
+            const auto id = row.find("id");
+            if (id == row.end() || !id->is_string()) continue;
+            const auto ok = row.find("ok");
+            if (row.value("rolled_back", false))
+                status.emplace(id->get<std::string>(), false);
+            else if (ok != row.end() && ok->is_boolean())
+                status.emplace(id->get<std::string>(), ok->get<bool>());
+        }
+    }
+    const auto features = tree.find("features");
+    if (features == tree.end() || !features->is_array()) return cache;
+    cache.treeKnown = true;
+    cache.baseUnknown = cache.bendUnknown = cache.flatUnknown = false;
+    const auto rollbackEntry = tree.find("rollback_after");
+    const std::string rollback = rollbackEntry != tree.end() && rollbackEntry->is_string()
+                                     ? rollbackEntry->get<std::string>() : std::string();
+    bool pastRollback = false;
+    for (const auto& feature : *features) {
+        if (!feature.is_object()) continue;
+        const std::string id = feature.value("id", std::string());
+        const bool afterRollback = pastRollback;
+        if (!rollback.empty() && id == rollback) pastRollback = true;
+        if (feature.value("suppressed", false)) continue;
+        const std::string type = feature.value("type", std::string());
+        if (!type.empty() && type != "plane" && type != "datum_plane" && type != "ref_plane" &&
+            type != "axis" && type != "datum_axis" && type != "ref_axis" &&
+            type != "point" && type != "datum_point" && type != "ref_point" &&
+            type != "csys" && type != "coordinate_system" && type != "ref_csys" &&
+            type != "sketch" && type != "sketch3d")
+            cache.solidContent = true;
+        if (afterRollback) continue;
+        const bool isBase = type == "sm_base_flange";
+        const bool isBend = type == "sm_edge_flange" || type == "sm_hem" || type == "sm_jog";
+        const bool isFlat = type == "sm_flat_pattern";
+        if (!isBase && !isBend && !isFlat) continue;
+        const auto found = status.find(id);
+        if (found == status.end()) {
+            cache.baseUnknown |= isBase;
+            cache.bendUnknown |= isBend;
+            cache.flatUnknown |= isFlat;
+        } else if (found->second) {
+            cache.base |= isBase;
+            cache.bend |= isBend;
+            cache.flat |= isFlat;
+        }
+    }
+    return cache;
+}
+
+}  // namespace
+
+bool ui::commandDispatchChecked(const AppState& st, const char* cmdId) {
+    return currentDispatch && currentDispatch->state == &st && cmdId &&
+           *currentDispatch->command == cmdId;
+}
+
+ui::CommandDocKind ui::activeMechanicalDocumentKind(const AppState& st) {
+    if (st.activeTab < 0 || st.activeTab >= static_cast<int>(st.docTabs.size()))
+        return CommandDocKind::None;
+    const auto& tab = st.docTabs[st.activeTab];
+    using TabKind = AppState::DocTab::TabKind;
+    if ((tab.kind != TabKind::Part && tab.kind != TabKind::Assembly) ||
+        tab.docId.empty() || tab.docId != st.docMirror.docId())
+        return CommandDocKind::None;
+
+    // Handoff-created assemblies can retain a legacy Part tab kind. Trust the schema
+    // only after binding the active tab to its own mirror, never a background document.
+    const auto& tree = st.docMirror.tree();
+    const auto schema = tree.find("schema");
+    if (schema != tree.end() && schema->is_string()) {
+        if (*schema == "aicad.asm/1") return CommandDocKind::Assembly;
+        if (*schema == "aicad.part/1") return CommandDocKind::Part;
+    }
+    return tab.kind == TabKind::Assembly ? CommandDocKind::Assembly : CommandDocKind::Part;
+}
+
+ui::CommandContext ui::commandContext(const AppState& st) {
+    CommandContext c;
+    c.workspace = static_cast<int>(st.activeWorkspace);
+    c.inSimulation = st.inSimulation();
+    c.kicadStatusKnown = st.ecadKicadStatusKnown;
+    if (st.ecadKicadStatus.is_object()) {
+        const auto& status = st.ecadKicadStatus;
+        c.kicadAvailable = status.value("found", false);
+        c.kicadSchematicAvailable = !status.value("eeschema", std::string()).empty();
+        c.kicadPcbAvailable = !status.value("pcbnew", std::string()).empty();
+        c.kicadProjectAvailable = !status.value("kicad", std::string()).empty();
+    }
+    const std::string activeEcadProject =
+        st.activeTab >= 0 && st.activeTab < static_cast<int>(st.docTabs.size()) &&
+        !st.docTabs[st.activeTab].ecadDocId.empty()
+            ? st.docTabs[st.activeTab].ecadProjectPath : std::string();
+    for (const auto& tab : st.docTabs) {
+        if (tab.ecadDocId.empty() || tab.ecadProjectPath != activeEcadProject) continue;
+        c.hasOpenSchematic |= tab.kind == AppState::DocTab::TabKind::Schematic;
+        c.hasOpenBoard |= tab.kind == AppState::DocTab::TabKind::PCB;
+    }
+    if (st.activeTab >= 0 && st.activeTab < static_cast<int>(st.docTabs.size())) {
+        const auto& tab = st.docTabs[st.activeTab];
+        c.ecadHasPath = !tab.path.empty();
+        c.ecadHasProject = !tab.ecadProjectPath.empty();
+        switch (tab.kind) {
+        case AppState::DocTab::TabKind::Part:
+            c.activeDocKind = CommandDocKind::Part; c.activeDocId = tab.docId; break;
+        case AppState::DocTab::TabKind::Assembly:
+            c.activeDocKind = CommandDocKind::Assembly; c.activeDocId = tab.docId; break;
+        case AppState::DocTab::TabKind::Drawing:
+            c.activeDocKind = CommandDocKind::Drawing; c.activeDocId = tab.drawingDocId;
+            c.drawingViewSelected = !tab.selViewId.empty(); break;
+        case AppState::DocTab::TabKind::Schematic:
+            c.activeDocKind = CommandDocKind::Schematic; c.activeDocId = tab.ecadDocId; break;
+        case AppState::DocTab::TabKind::PCB:
+            c.activeDocKind = CommandDocKind::PCB; c.activeDocId = tab.ecadDocId; break;
+        }
+    }
+    const CommandDocKind mechanicalKind = activeMechanicalDocumentKind(st);
+    const bool mechanical = mechanicalKind != CommandDocKind::None;
+    c.activeMechanicalReady = mechanical;
+    if (mechanical) {
+        c.activeDocKind = mechanicalKind;
+        c.activeDocRevision = st.docMirror.revision();
+        if (st.sketchMode) {
+            c.sketch2dActive = st.sketchMode->active();
+            c.sketch2dHasEntitySelection = c.sketch2dHasFixSelection =
+                st.sketchMode->hasEditableSelection();
+        }
+        if (st.sketch3dMode && st.sketch3dMode->documentId() == c.activeDocId) {
+            c.sketch3dActive = st.sketch3dMode->active();
+            c.sketch3dHasSelection = st.sketch3dMode->hasSelectedEntities();
+            c.sketch3dHasFixSelection = st.sketch3dMode->hasFixableSelection();
+        }
+        const auto& facts = commandDocFacts(st);
+        if (st.docMirror.solidPresenceKnown()) {
+            c.modelSolidKnown = true;
+            c.modelHasSolid = st.docMirror.hasSolidBody();
+        } else {
+            // An empty tree with no displayed bodies proves absence. Otherwise an older or
+            // partially hydrated mirror has not established whether its content is solid.
+            c.modelSolidKnown = facts.treeKnown && !facts.solidContent && st.docBodyIds.empty();
+        }
+        c.sheetMetalHasBase = facts.base;
+        c.sheetMetalHasBends = facts.bend;
+        c.sheetMetalHasValidFlat = facts.flat;
+        c.sheetMetalBaseStatusUnknown = facts.baseUnknown;
+        c.sheetMetalBendStatusUnknown = facts.bendUnknown;
+        c.sheetMetalFlatStatusUnknown = facts.flatUnknown;
+    }
+    if (st.simManager) st.simManager->populateCommandContext(c);
+    camPopulateCommandContext(st, c);
+    return c;
+}
 
 // ---------------------------------------------------------------------------
 // CommandRouter
@@ -44,21 +255,24 @@ void CommandRouter::registerAny(Handler h) {
     rules_.push_back({Kind::Any, std::string(), std::move(h)});
 }
 
-bool CommandRouter::authorize(AppState& st, const char* cmdId) const {
-    if (ui::ribbonCommandCapability(cmdId) != ui::CommandCapability::Mutate) return true;
-    const std::string_view cmd = cmdId ? cmdId : "";
-    if (st.activeDocLockedByAgent()) {
-        // Cancel is routed to the session's keep-exit fallback while an agent owns the doc.
-        if (cmd == "sketch_exit" || cmd == "sketch3d_exit" ||
-            cmd == "sketch_cancel" || cmd == "sketch3d_cancel") return true;
-        st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
-        return false;
-    }
-    return true;
-}
 
 bool CommandRouter::dispatch(AppState& st, const char* cmdId) const {
+    return dispatch(st, cmdId, ui::commandContext(st));
+}
+
+bool CommandRouter::dispatch(AppState& st, const char* cmdId,
+                             const ui::CommandContext& context) const {
+    const ui::CommandAvailability availability = ui::commandAvailability(cmdId, context);
+    if (!availability.visible || !availability.enabled) {
+        if (availability.reason) st.toast(ui::ToastLevel::Info, availability.reason);
+        return true;  // consumed without invoking any handlers
+    }
     const std::string cmd = cmdId ? cmdId : "";
+    // A PM and a new-sketch plane pick must never remain active simultaneously.
+    if (cmd == "sketch_new" && st.propertyManager && st.propertyManager->active() &&
+        !st.propertyManager->cancelEdits(st))
+        return true;
+    const CheckedDispatchScope checked(st, cmd);
     for (const Rule& rule : rules_) {
         bool match = false;
         switch (rule.kind) {

@@ -199,6 +199,36 @@ def _call_dfm(monkeypatch, *, process: str, profile_params: dict, engine_call,
     return json.loads(structured["result"])
 
 
+def test_dfm_verify_fixes_option_controls_reinforcement_and_rows(monkeypatch):
+    from services.mcp import dfm_fix_tools, dfm_rows, intake_tools
+
+    observed = []
+    calls = []
+    monkeypatch.setattr(intake_tools, "_get", lambda *_: None)
+    monkeypatch.setattr(intake_tools, "_dfm_additive", lambda *args, **kwargs: (
+        [{"check": "min_wall", "status": "fail", "ok": False}], {}))
+    def collect(ctx):
+        observed.append(ctx.options["verify_fixes"])
+        return []
+    def reinforce(*args, **kwargs):
+        calls.append(True)
+        return {"regions": [{"verified_fixes": [{"verified": True}]}]}
+    monkeypatch.setattr(dfm_rows, "collect", collect)
+    monkeypatch.setattr(dfm_fix_tools, "reinforce", reinforce)
+    engine = lambda method, params=None: {}
+    disabled = _call_dfm(monkeypatch, process="fdm", profile_params={"min_wall_mm": 1},
+                         engine_call=engine, checks=["min_wall"], verify_fixes=False)
+    assert disabled["ok"] and disabled["checks"][0]["status"] == "fail"
+    assert disabled["checks"][0]["fix_ops"] == []
+    assert "reinforcement" not in disabled["checks"][0]
+    assert calls == [] and observed == [False]
+
+    default = _call_dfm(monkeypatch, process="fdm", profile_params={"min_wall_mm": 1},
+                        engine_call=engine, checks=["min_wall"])
+    assert default["ok"] and default["checks"][0]["fix_ops"] == [{"verified": True}]
+    assert calls == [True] and observed == [False, True]
+
+
 def _cnc_profile() -> dict:
     return {
         "min_wall_mm": 0.5,
@@ -206,6 +236,65 @@ def _cnc_profile() -> dict:
         "draft": {"required": False, "min_deg": 0.0},
         "thread": {"strategy": "tapped", "printed_ok_min": None},
     }
+
+def test_simple_custom_bore_is_not_a_thread(monkeypatch):
+    features = [
+        {"id": "bore", "type": "hole", "params": {
+            "style": "simple", "standard": "custom", "diameter": 4.2, "depth": 8}},
+        {"id": "tap", "type": "hole", "params": {
+            "style": "tapped", "standard": "M6", "diameter": 5, "depth": 8}},
+    ]
+
+    def engine(method, params=None):
+        if method == "eval_thickness":
+            return {"min_thickness_mm": 2.0}
+        if method == "doc_tree":
+            return {"tree": {"features": features}}
+        raise AssertionError((method, params))
+
+    result = _call_dfm(monkeypatch, process="cnc_mill",
+                       profile_params=_cnc_profile(), engine_call=engine)
+    row = next(c for c in result["checks"] if c["check"] == "thread_strategy")
+    assert row["status"] == "pass"
+    assert [(t["feature_id"], t["designation"], t["observed_strategy"])
+            for t in row["threads"]] == [("tap", "M6", "tapped")]
+
+
+def test_min_feature_uses_applicable_sketch_and_depth_sizes():
+    from services.mcp import intake_tools
+
+    features = [
+        {"id": "sk", "type": "sketch", "params": {"entities": [
+            {"type": "circle", "center": [0.01, 500], "radius": .3},
+            {"type": "line", "p1": [100, 100], "p2": [110, 100]},
+            {"type": "circle", "center": [0, 0], "radius": .01, "construction": True},
+        ]}},
+        {"id": "ex", "type": "extrude", "params": {"end": "blind", "depth": .4}},
+    ]
+    result = intake_tools._dfm_min_feature(features, .5)
+    assert result["status"] == "fail" and result["value_mm"] == .3
+    assert result["parameter"] == "entities[0].radius"
+    result = intake_tools._dfm_min_feature(features[1:], .5)
+    assert result["status"] == "fail" and result["parameter"] == "depth"
+    coordinates = [{"id": "sk", "type": "sketch", "params": {"entities": [
+        {"type": "point", "x": .001, "y": .002},
+        {"type": "circle", "center": [.001, .002]},
+    ]}}]
+    assert intake_tools._dfm_min_feature(coordinates, .5)["status"] == "not_evaluated"
+    assert intake_tools._dfm_min_feature(
+        [{"id": "ex", "type": "extrude", "params": {"end": "through_all", "depth": .1}}],
+        .5)["status"] == "not_evaluated"
+
+def test_min_feature_explanation_distinguishes_close_failure():
+    from services.mcp import intake_tools
+
+    result = intake_tools._dfm_min_feature(
+        [{"id": "ex", "type": "extrude", "params": {"depth": 0.7996}}], 0.8)
+    assert result["ok"] is False
+    assert result["value_mm"] == 0.7996
+    assert "0.7996mm" in result["note"] and "0.8mm" in result["note"]
+
+
 
 
 def test_dfm_empty_evaluation_is_not_evaluated_never_a_pass(monkeypatch):
@@ -229,8 +318,6 @@ def test_dfm_empty_evaluation_is_not_evaluated_never_a_pass(monkeypatch):
 
 def test_dfm_checks_min_feature_and_deep_machined_hole(monkeypatch):
     def small_deep_hole(method, params=None):
-        if method == "eval_thickness":
-            return {"min_thickness_mm": 2.0}
         if method == "doc_tree":
             return {"tree": {"features": [{
                 "id": "h1", "type": "hole",
@@ -239,18 +326,40 @@ def test_dfm_checks_min_feature_and_deep_machined_hole(monkeypatch):
                     "depth": {"value": 3.0}, "end": "blind", "thread": "M1x0.25",
                 },
             }]}}
+        if method == "doc_query":
+            return {"matches": [{"sid": "bore-face", "surf": "cylinder",
+                                 "owner_feature": "h1", "centroid": [1, 2, 3]}]}
         raise AssertionError((method, params))
 
+    profile = _cnc_profile()
+    profile["rules"] = {"hole_max_depth_to_dia_standard": 5}
+    profile["rule_sources"] = {"hole_max_depth_to_dia_standard": "test profile"}
     result = _call_dfm(
-        monkeypatch, process="cnc_mill", profile_params=_cnc_profile(),
-        engine_call=small_deep_hole,
+        monkeypatch, process="cnc_mill", profile_params=profile,
+        engine_call=small_deep_hole, checks=["min_feature", "hole_depth_diameter"],
     )
 
-    checks = {check["check"]: check for check in result["checks"]}
-    assert checks["min_feature"]["status"] == "fail", result
-    assert checks["hole_depth_diameter"]["status"] == "fail", result
-    assert checks["hole_depth_diameter"]["holes"][0]["ratio"] == 10.0, result
+    rows = [row for row in result["checks"] if row["check"] == "hole_depth_diameter"]
+    assert len(rows) == 1, result
+    assert rows[0]["status"] == "warn", result
+    assert rows[0]["regions"][0]["depth_to_diameter"] == 10.0, result
+    assert rows[0]["regions"][0]["faces"] == ["bore-face"], result
+    assert rows[0]["limits"]["depth_to_diameter_max"] == 5, result
+    assert rows[0]["fix_ops"] == [], result  # Mock engine cannot verify a proposed edit.
+    assert rows[0]["fix_verification_rejected"], result
+    assert next(row for row in result["checks"] if row["check"] == "min_feature")["status"] == "fail", result
     assert result["status"] == "fail" and result["dfm_pass"] is False, result
+
+    profile["rules"]["hole_max_depth_to_dia_standard"] = 12
+    result = _call_dfm(monkeypatch, process="cnc_mill", profile_params=profile,
+                       engine_call=small_deep_hole, checks=["hole_depth_diameter"])
+    assert result["checks"][0]["status"] == "pass", result
+
+    del profile["rules"]["hole_max_depth_to_dia_standard"]
+    result = _call_dfm(monkeypatch, process="cnc_mill", profile_params=profile,
+                       engine_call=small_deep_hole, checks=["hole_depth_diameter"])
+    assert result["checks"][0]["status"] == "not_evaluated", result
+    assert result["dfm_pass"] is None, result
 
 
 def test_dfm_rejects_printed_thread_strategy_for_machining(monkeypatch):
@@ -366,7 +475,11 @@ def test_dfm_fdm_box_on_plate_passes_and_recommends_zero_support(minted_document
     best = result["orientation"][0]
     assert best["metrics"]["support_volume_mm3"] == 0, result["orientation"]
     assert best["metrics"]["contact_area_mm2"] > 0, result["orientation"]
-    assert result["dfm_pass"] is True, result
+    # A support-free orientation does not establish pin or layer-strength evidence.
+    checks = {row["check"]: row for row in result["checks"]}
+    assert checks["min_pin"]["status"] == "not_evaluated", result
+    assert checks["layer_anisotropy"]["status"] == "not_evaluated", result
+    assert result["status"] == "not_evaluated" and result["dfm_pass"] is None, result
 
 
 def test_dfm_fdm_cantilever_support_area_and_flipped_plate(minted_documents):

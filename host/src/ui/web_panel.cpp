@@ -35,8 +35,8 @@ std::string homeUrl() {
 }
 
 // Function-local static so the page survives toggling the Web chip off and back on —
-// the backend (and its live CEF browser) is created once, on first activation, and
-// kept alive in the background while the user is modeling.
+// the backend is created once, on first activation. Its CEF browser is hidden and
+// paint-throttled when this panel isn't drawn, without losing page/session state.
 struct WebPanel {
     std::unique_ptr<ui::IWebViewBackend> web;
     bool  opened = false;   // homeUrl() has been navigated at least once
@@ -97,7 +97,7 @@ void drawWebBrowserPanel(AppState& st) {
         w.opened = true;
     }
 
-    // Background work: frame + input polling (must run every visible frame).
+    // Status updates; the backend owns CEF pumping and per-frame visibility.
     w.web->update(st);
 
     // ---- top bar (30dp): back / fwd / reload | editable URL | Home | Close ----------------
@@ -169,16 +169,7 @@ void drawWebBrowserPanel(AppState& st) {
 
     // ---- body: the embedded page ----------------------------------------------------------
     const ImVec2 avail = ImGui::GetContentRegionAvail();
-    if (w.web->starting() && !w.web->active()) {
-        ImDrawList* dl  = ImGui::GetWindowDrawList();
-        const ImVec2 p0 = ImGui::GetCursorScreenPos();
-        dl->AddRectFilled(p0, ImVec2(p0.x + avail.x, p0.y + avail.y),
-                          Palette::toU32(palette.panelBg), 6.0f * sc);
-        const char* msg = "Loading…";
-        const ImVec2 tsz = ImGui::CalcTextSize(msg);
-        dl->AddText(ImVec2(p0.x + (avail.x - tsz.x) * 0.5f, p0.y + (avail.y - tsz.y) * 0.5f),
-                    Palette::toU32(palette.textDim), msg);
-    } else if (!w.web->lastError().empty()) {
+    if (!w.web->lastError().empty()) {
         ImGui::Spacing();
         ImGui::TextWrapped("Couldn't load the page: %s", w.web->lastError().c_str());
         if (ImGui::Button("Retry")) w.web->reload(st);

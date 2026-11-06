@@ -10,6 +10,19 @@
 //     bodies}, owner_map }
 // (doc_new adds "doc_id"; doc_tree returns only revision/tree/owner_map).
 //
+// Additive part-doc fields (present on every ops_response, so doc_activate carries them too):
+//   volume   display-triangulation estimate (kept for existing consumers; NOT a delta basis).
+//   exact    {basis:"brep_exact", volume_mm3, bbox:{min,max,size}|null, face_count, solid_count}
+//            B-rep-exact solids-only volume (no triangulation), the same exact bbox doc_bbox
+//            reports, and all-body face / solid counts. Only when with_tess is true and the
+//            displayed result is ok or has shapes; computed at most once per CompileResult
+//            (CompileResult::exact_stats) so cache-served replies never recompute it. Compare
+//            before/after deltas on THIS basis: a small fillet moves it by less than the
+//            triangulated `volume` error.
+//   equation_errors  [{name, expr, error}] for each global equation that failed to evaluate
+//            (skipped from the solve env; the build still proceeds), mirrored as
+//            "equation_unevaluated: ..." strings in `warnings`.
+//
 // SCOPE (first increment): blank PART docs + the core part ops (add/edit/delete/
 // reorder feature, suppress/rename, units/material/rollback, equations) + the core
 // sketch ops (add/edit/delete entity, add/delete constraint, set_dim, toggle
@@ -17,6 +30,7 @@
 // assemblies, configurations, copy/paste, derived features, full document
 // validation, and the owner_map topology are DEFERRED (owner_map returns {}).
 #pragma once
+#include "harness/geometry.h"
 
 #include <array>
 #include <optional>
@@ -29,6 +43,8 @@
 #include <nlohmann/json.hpp>
 
 #include "geom/aicm.h"  // aicm::AicmBody (doc_tessellate_bodies)
+
+class TopoDS_Shape;
 
 namespace chudware::doc {
 
@@ -65,6 +81,10 @@ bool force_release_doc_lock();
 // remain known lower bounds. Includes cache tasks through final publication.
 bool activity_counts(std::uint64_t& cache_verification, std::uint64_t& dirty_documents);
 
+// After callers stop submitting document work, wait for all background solves,
+// verification, publication and any descendants before engine teardown.
+void drain_background_tasks();
+
 // Create a new blank document ("part"; "assembly" not yet supported). Returns the
 // ops-response + "doc_id". Registers the session in the process-global store.
 //
@@ -90,8 +110,20 @@ nlohmann::json doc_new(const std::string& kind, const std::string& name,
 // `with_tess=false` omits mesh publication/response data, retaining rebuild diagnostics.
 // A compile rejection preserves the committed tree/revision and tessellation;
 // rejected_tree and rebuild.feature_status describe the rejected candidate.
+// scad_convert (to_code/to_native) uses this same transaction and returns successful
+// conversion reports in scad_conversions; unsupported/changed projections throw OpError.
+// `reject_unknown` is enabled for agent mutations; GUI/import paths preserve legacy keys.
 nlohmann::json doc_apply_ops(const std::string& doc_id, long base_revision,
-                             const nlohmann::json& ops, bool coalesce, bool with_tess = true);
+                             const nlohmann::json& ops, bool coalesce, bool with_tess = true,
+                             bool reject_unknown = true);
+
+// Non-solid, embedded reference meshes. Mutations are document transactions but do
+// not compile features; the mesh payload is content-addressed in the native container.
+nlohmann::json doc_mesh_ref_add(const std::string& doc_id, const nlohmann::json& args);
+nlohmann::json doc_mesh_ref_list(const std::string& doc_id);
+nlohmann::json doc_mesh_ref_update(const std::string& doc_id, const nlohmann::json& args);
+nlohmann::json doc_mesh_ref_remove(const std::string& doc_id, const nlohmann::json& args);
+nlohmann::json doc_mesh_ref_mesh(const std::string& doc_id, const nlohmann::json& args);
 
 // Stateless dry-run validation (engine.doc.ops dry_run, used by the agent modeler/
 // fixer path). Copies the live tree and mutable compile-cache index into an
@@ -116,6 +148,10 @@ nlohmann::json doc_redo(const std::string& doc_id);     // bumps revision +1
 // saved baseline. Returns {"ok": true, "doc_id": ...}.
 nlohmann::json doc_clear_history(const std::string& doc_id);
 nlohmann::json doc_tree(const std::string& doc_id);     // no rebuild, no rev bump
+// Static feature-history guidance and conservative cleanup preview. No geometry
+// solve or pairwise boolean is performed; see contracts/model_history.md.
+nlohmann::json doc_eval_model_history(const std::string& doc_id,
+                                      const nlohmann::json& params = nlohmann::json::object());
 nlohmann::json doc_rebuild(const std::string& doc_id);  // forced rebuild, no rev bump
 // Cheap tab-switch activation (viewport switch perf): serve the session's read-cache
 // compile (`compiled` at `compiled_rev == revision` — kept warm by every mutating op's
@@ -145,8 +181,14 @@ nlohmann::json doc_open_embedded(const nlohmann::json& document);
 // moves beyond the solver tolerance, reference frames bind, or component geometry
 // differs) persists the solved transforms and bumps revision/dirty/undo; a no-op solve
 // leaves all three untouched. Throws OpError("invalid_op") on a non-assembly doc.
+// A nonnegative expect_revision is checked under the document lock before any work.
 nlohmann::json doc_solve_mates(const std::string& doc_id,
-                               const nlohmann::json& drag = nlohmann::json(nullptr));
+                               const nlohmann::json& drag = nlohmann::json(nullptr),
+                               long expect_revision = -1);
+// Compare cached assembly sources with live fingerprints without refreshing geometry.
+nlohmann::json doc_asm_source_status(const std::string& doc_id);
+// Read-only first-order per-component free motion from the solved mate Jacobian.
+nlohmann::json doc_eval_assembly_dof(const std::string& doc_id, const nlohmann::json& params);
 // Toggle the exploded-view state and re-tessellate (no revision bump — view-only).
 nlohmann::json doc_set_explode_state(const std::string& doc_id, bool active, double factor);
 // Set this document's DISPLAY tessellation tier ("draft"|"standard"|"fine") and
@@ -158,7 +200,10 @@ nlohmann::json doc_set_display_quality(const std::string& doc_id,
                                        const std::string& quality);
 // World-placed component bodies (name + component + world bbox) for interference / BOM /
 // drawings (`explode` applies the explode offset when the explode view is active).
-nlohmann::json doc_asm_world_bodies(const std::string& doc_id, bool explode = false);
+// `include_mate_axes` also reports exact resolved axes in each source component's
+// local frame; unresolved references are omitted.
+nlohmann::json doc_asm_world_bodies(const std::string& doc_id, bool explode = false,
+                                    bool include_mate_axes = false);
 
 // Per-real-component BOM listing of an assembly: [{component, name, source, quantity}]
 // with component-pattern instances ("<seed>#<k>") folded into their seed's quantity and
@@ -242,8 +287,9 @@ nlohmann::json doc_face_edges(const std::string& doc_id, int body_id, int face_t
 // non-drivable face returns {draggable:false, reason}; a value that would collapse the
 // body rolls back. `commit` (default false = transient preview) pushes one undo entry.
 // Port of engine/doc/instant3d.py push_pull. Throws OpError for a bad body_id/topo_id.
+// A nonnegative expect_revision is checked under the document lock before any work.
 nlohmann::json doc_push_pull(const std::string& doc_id, int body_id, int topo_id,
-                             double distance, bool commit);
+                             double distance, bool commit, long expect_revision = -1);
 
 // C19 sim bridge — produce sim INPUTS from the live doc session (port of
 // engine/sim/bridge.py via engine/worker.py _doc_export_step / _doc_face_points).
@@ -259,6 +305,9 @@ nlohmann::json doc_export_step(const std::string& doc_id, const std::string& pat
 // bodies (flat pos/idx in WORLD mm). Used by the agent CFD path (voxelize -> wind tunnel) and the
 // preview renderer. Returns an empty vector on no bodies / failure (never throws).
 std::vector<aicm::AicmBody> doc_tessellate_bodies(const std::string& doc_id);
+
+// A world-space routing snapshot; fails rather than omitting an untessellatable solid.
+chudware::harness::Scene doc_harness_scene(const std::string& doc_id);
 
 // doc_render_png: render the document's surviving solids to a small isometric shaded PNG at
 // `out_path` (a lightweight software rasterizer — no GL). Used by the agent's vision review so
@@ -337,11 +386,13 @@ nlohmann::json drawing_render_png(const std::string& doc_id, const std::string& 
 nlohmann::json doc_face_points(const std::string& doc_id, const nlohmann::json& selector,
                                int max_n = 400);
 
-// doc_query: run a semantic geometry query (doc/picks::resolve_geom_query) against the
-// LAST body so an agent can introspect a part it did not build before editing it —
-// "what faces/edges are here?". `query` is the {"of":"edge"|"face",...predicates} object.
-// Returns {"count": n, "matches": [<selector>, ...]} where each selector carries the
-// sub-shape's surf/centroid/axis/area_or_len (ready to paste into a fillet/hole/etc.).
+// Query all world-placed document bodies, or a particular 1-based body_id. With
+// fastener_geometry:true, face matches additionally carry exact cylinder axis,
+// radius and (for proven full or simple partial circular trims) axial_start/end world points,
+// kind, complete_cylinder and end adjacency/classification; unsupported evidence
+// is null/unknown. Exactly bounded circular planar annuli expose bearing_annulus.
+// Request body_id to make all face and adjacent-face topo IDs per-body. count or
+// index bounds returned matches. Selectors and SIDs are unchanged by this option.
 nlohmann::json doc_query(const std::string& doc_id, const nlohmann::json& query);
 
 // doc_adjacency (GSL W3): the face-adjacency graph the read-back never exposed. For the LAST
@@ -358,7 +409,8 @@ nlohmann::json doc_adjacency(const std::string& doc_id);
 // keys here so an MCP-built part reopens in-app with its references intact. set returns {ok,key};
 // get returns {ok, key, value|null}. Keys live under doc["meta"][<key>].
 nlohmann::json doc_set_meta(const std::string& doc_id, const std::string& key,
-                            const nlohmann::json& value);
+                            const nlohmann::json& value, const std::string& member = "",
+                            const nlohmann::json& preserve = nullptr);
 nlohmann::json doc_get_meta(const std::string& doc_id, const std::string& key);
 
 // doc_set_name: set the document display name (doc["name"]) under the doc lock so
@@ -412,6 +464,16 @@ nlohmann::json doc_eval_check(const std::string& doc_id, int body_id);
 nlohmann::json doc_eval_geometry_analysis(const std::string& doc_id,
                                           const nlohmann::json& options);
 
+// Resolved historical sheet-metal construction records; not current topology.
+nlohmann::json doc_eval_sheet_metal_bends(const std::string& doc_id);
+
+// Evaluate — exact SIGNED edge classification + concave blend faces (see
+// geom/edge_analysis.h). params {doc_id, body?, min_dihedral_dev_deg?=5, kinds?=
+// ["concave","convex"], limit?=200, cursor?}. Edges are paged (concave first, sharpest
+// first); concave_blends (smallest radius first) ride on the first page. Every row carries
+// body + 1-based topo id, the query_geometry sid(s) and the owning feature.
+nlohmann::json doc_eval_edge_analysis(const std::string& doc_id, const nlohmann::json& params);
+
 // Evaluate — SOLID HEALTH census of one or every body: the counts that justify a watertight
 // verdict, with the stable sid of every offender. Returns {bodies:[{body_id, watertight,
 // is_watertight, sound, faces, edges, vertices, shells, solids, free_edges:{count,sids},
@@ -461,7 +523,8 @@ nlohmann::json doc_eval_symmetry(const std::string& doc_id, int body_id,
 // `params` (all optional): `include_coincident` (bool, default false) additionally
 // classifies a near-zero-clearance pair (distance <= 1e-6) as a `contacts` entry instead
 // of a `clearances` one (SW-parity "coincident faces" gap); `min_clearance_mm` (default 0)
-// tags any clearance entry below it with `"warning":"below min clearance"`; `members`
+// tags definite violations below the threshold minus 1e-6 mm and marks results within
+// that tolerance band as uncertain (`clearance_status` / `clearance_tolerance_mm`); `members`
 // (array of part-name strings) restricts pairwise checks to those names (case-sensitive
 // exact match; absent/empty = all; malformed/unknown names are refused). `scope` records
 // all/member scope and selected/total counts; `complete` applies ONLY to that scope.
@@ -472,23 +535,21 @@ nlohmann::json doc_eval_symmetry(const std::string& doc_id, int body_id,
 nlohmann::json doc_eval_interference(const std::string& doc_id,
                                      const nlohmann::json& params = nlohmann::json::object());
 
-// Evaluate — pairwise FEATURE-tool overlap WITHIN one part (port of the new WS-B
-// intra-part check; no Python analogue). Pairs every unordered combination of
-// CompileResult::tool_recs (the pre-boolean tool solid each boss/cut/hole/pattern/
-// mirror feature contributed — see ToolRec in document.h) and runs BRepAlgoAPI_Common
-// to measure shared volume. `params` (all optional): `features` (array of feature-id
-// strings) restricts pairing to combinations touching at least one listed id (bounds
-// add_features' latency to new-batch x existing-tree); `min_volume_mm3` (default
-// 1e-3, mirrors interference's INTERFERENCE_EPS) floors a reportable overlap. Kind is
-// "boss_overlap" (add+add — two additive features share volume, often intentional),
-// "cut_overlap" (cut+cut — redundant removal), "cut_into_boss" (add+cut, partial), or
-// "boss_swallowed" (add+cut where the common volume is >= 99% of the additive tool's
-// volume — the cut removed the ENTIRE earlier boss, almost certainly an error).
-// Also reports `dead_features`: ok, non-suppressed features that contributed a tool
-// but own no surviving face/edge (fully consumed downstream). Returns {ok, summary,
-// pairs:[{a,b,a_name,b_name,kind,volume_mm3}] (volume desc), dead_features:[id,...]}.
-// `ok` is false ONLY when a boss_swallowed pair exists — every other kind is a
-// warning (overlapping bosses/cuts are common, intentional design).
+// World-placed removal sweeps and transient tool-envelope intersections.
+nlohmann::json doc_eval_removal_clearance(const std::string& doc_id, const nlohmann::json& params);
+nlohmann::json doc_eval_envelope_clearance(const std::string& doc_id, const nlohmann::json& params);
+
+// Pairwise intersections of per-feature pre-boolean tools within one part.
+// `features` restricts pairs to those touching a listed id; `min_volume_mm3`
+// defaults to 1e-3. `volume_mm3` is tool-space common volume, not measured
+// material addition/removal. Overshooting through-all tools can exceed stock.
+// Each pair carries `volume_basis:"pre_boolean_tool_intersection"` and
+// `tool_kind:"add_tool_overlap"|"cut_tool_overlap"|"add_cut_tool_overlap"`.
+// Legacy `kind` names and the `ok:false` boss_swallowed rule are retained for
+// existing clients, but do not prove a boss was swallowed. `dead_features`
+// lists features owning no surviving faces, without inferring why. `complete`
+// is false (and ok false) when tool records or intersection checks are missing;
+// `unavailable_features` and `failed_pairs` identify those omissions.
 nlohmann::json doc_eval_feature_overlap(const std::string& doc_id,
                                         const nlohmann::json& params = nlohmann::json::object());
 
@@ -507,7 +568,8 @@ nlohmann::json doc_eval_feature_overlap(const std::string& doc_id,
 // base_face_area_mm2?, base_face_center[3]?, base_face_normal[3]?, supported_area_mm2, supported_frac?, overhang_frac?,
 // overhang_area_mm2?, overhang_mm?, region?{min,max}, nearest_point?, nearest_point_on_part?,
 // tool_volume_mm3, kept_volume_mm3}], flagged:[ids], attached:[ids], attached_count,
-// independent:[ids], not_checked:[ids], thresholds}. `ok` is false iff anything is flagged.
+// independent:[ids], not_checked:[ids], thresholds}. `ok` is false for a flagged
+// feature or an incomplete check; `complete` is false when features were not checked.
 nlohmann::json doc_eval_feature_attachment(const std::string& doc_id,
                                            const nlohmann::json& params = nlohmann::json::object());
 
@@ -574,12 +636,23 @@ nlohmann::json doc_eval_draft(const std::string& doc_id, int body_id,
 nlohmann::json doc_eval_curvature(const std::string& doc_id, int body_id,
                                   const std::string& kind);
 
-// Evaluate FIELD — per-vertex WALL-THICKNESS field of the active body (port of evaluate.py::
-// thickness_field via worker.py::_eval_thickness). Inward-raycasts (-normal) from each vertex
-// via a Moller-Trumbore raycaster (the oracle's deterministic fallback); writes a SCLR
-// "thickness" chunk to a temp .aicm and returns {"aicm_path": <path>}. body_id 1-based, <=0 =
-// LAST. Parity is PHYSICAL (tolerance band), not bit-exact (oracle uses trimesh BVH).
-nlohmann::json doc_eval_thickness(const std::string& doc_id, int body_id);
+// Evaluate FIELD — WALL-THICKNESS study of one body (body_id 1-based, <=0 = LAST): the
+// inscribed-sphere thickness (geom/wall_thickness.h) at every vertex of the display mesh
+// refined to `resolution_mm` spacing (<= 0 = auto). Writes a SCLR "thickness" chunk on that
+// refined body and returns {aicm_path, min/max/mean_thickness_mm, minimum_sample,
+// measurement_basis}; `min_wall_mm` > 0 adds the connected thin_regions below it.
+// Contract: contracts/worker_rpc.md "eval_thickness".
+nlohmann::json doc_eval_thickness(const std::string& doc_id, int body_id,
+                                  double resolution_mm, double min_wall_mm);
+
+// Local samples from the thickness field on a face adjacent to an edge or blend.
+nlohmann::json doc_eval_local_thickness(const std::string& doc_id, const nlohmann::json& params);
+
+// mesh_wall_thickness: the same measurement at caller-supplied query samples ({points,
+// normals}) of a raw triangle mesh ({vertices, triangles}, optional `resolution`) — the
+// DFAM min_wall check. Returns {ok, thickness[], opposing_cos[], wall_direction[], spacing_mm,
+// n_blockers}.
+nlohmann::json doc_mesh_wall_thickness(const nlohmann::json& params);
 
 // Export the document's surviving solid bodies to `path` in `fmt` (step/iges/brep/stl/
 // obj/ply/3mf/gltf/glb/3dm/dxf/dwg/sat) via OCCT. For mesh formats, the tessellation quality
@@ -590,10 +663,17 @@ nlohmann::json doc_eval_thickness(const std::string& doc_id, int body_id);
 // are re-read to prove the solids survive. Returns {"path": <abs>, ...}. Throws
 // OpError("export_failed") on no bodies / an unsupported format / a writer failure, and
 // OpError("invalid_op") on `units` for another format.
+// SCAD exports the single active source feature and its confined dependency files,
+// preserving effective overrides and the explicit source-unit factor.
 nlohmann::json doc_export_file(const std::string& doc_id, const std::string& path,
                                const std::string& fmt, double lin_deflection = 0.05,
                                double ang_deflection = 0.35, bool relative = false,
                                bool ascii = false, const std::string& units = std::string());
+
+// Locked snapshot of the current flat-pattern body and its saved side-channel.
+// A legacy display-only cache without flat metadata is refused rather than rebuilt.
+void doc_flat_export_snapshot(const std::string& doc_id, TopoDS_Shape& shape,
+                              nlohmann::json& metadata);
 
 // Count the triangles/vertices a mesh export of this document would produce at the given
 // tessellation quality, without writing a file. Returns {triangles, vertices, bodies}.
@@ -604,6 +684,7 @@ nlohmann::json doc_export_estimate(const std::string& doc_id, double lin_deflect
 // Import a neutral B-rep file (step/iges/brep) as a new `import` feature. With `into`
 // (a doc id) it appends to that session; otherwise it creates a new part session.
 // Returns the ops-response + "doc_id" (engine.doc.formats import_file).
+// SCAD imports preserve source and embedded dependencies as one scad feature.
 //
 // `body_select` may carry `keep_bodies` / `exclude_bodies` (arrays of 1-based body
 // ordinals or body-name strings); they are copied verbatim onto the import feature's
@@ -632,18 +713,21 @@ nlohmann::json mesh_read_raw(const std::string& path, const std::string& fmt);
 // UI never lists a format the engine can't handle (and vice-versa). Stateless.
 nlohmann::json doc_formats();
 
-// Persist the session to `path` (or its current path if `path` is empty) as a
-// .step+ container. Clears the dirty flag, records the path. Returns {"path": ...,
-// "cache": {written, entries, skipped_reason?, checkpoints, ...}} (contracts/stepplus.md §9):
-// the build state (display cache + per-feature compile checkpoints) is saved with the file.
-// Throws OpError("io_error") if no path is available, or on a write failure.
-// preserve_path writes a nonbinding snapshot from cached scratch state: the live
-// path, dirty flag, tree and revision are unchanged, and snapshot-only relative
-// component paths are resolved against the live destination before serialization.
+// Persist to `path` (or the bound path when empty), returning the exact saved_revision,
+// metadata_revision and cache report. A destination owned by another live document is
+// refused unless force is true. A changed bound file is refused unless overwrite_changed
+// explicitly names its current {size, mtime_ns, ino} as expected_disk_stamp; publication
+// rechecks it. preserve_path writes a nonbinding recovery snapshot without rebuilding,
+// leaving the live path, revision and dirty flag alone.
+// Parts with geometry require a complete verified build. Assembly snapshots carry the
+// live source revisions used by their captured solve, with relocatable component paths.
 nlohmann::json doc_save(const std::string& doc_id, const std::string& path,
-                        bool preserve_path = false);
+                        bool preserve_path = false, bool force = false,
+                        bool overwrite_changed = false,
+                        const nlohmann::json& expected_disk_stamp = nullptr);
 
-// Open a document at `path` into a FRESH session and return the ops-response + "doc_id" +
+// Open a native document, or atomically reuse the existing bound session when reuse_open
+// is true. A fresh open returns the ops-response + "doc_id" +
 // "warnings" + "cache_hit"/"warm"/"cache_miss_reason". A valid saved cache hydrates the
 // compiled state (no feature rebuild); otherwise the tree rebuilds. A native .step+
 // container is read as a feature tree; ANY OTHER
@@ -653,8 +737,17 @@ nlohmann::json doc_save(const std::string& doc_id, const std::string& path,
 // autosave/recovery artifacts: the doc forgets `path` (so a later save can't land in the
 // autosave tier, which the recovery flow deletes right after opening) and the name is
 // re-uniqued against the open docs (recovered duplicates would otherwise all be "Part1").
+// `recovered` marks a crash survivor dirty. Its optional original path is bound
+// instead of the snapshot path; its base stamp is accepted only if still current.
 nlohmann::json doc_open(const std::string& path, bool as_solid = false,
-                        bool detach_path = false);
+                        bool detach_path = false, bool recovered = false,
+                        bool reuse_open = false,
+                        const std::string& recovery_original_path = {},
+                        const nlohmann::json& recovery_base_stamp = nullptr);
+// Replace the bound document in place from disk, advancing its revision. Optional
+// revision guards protect a snapshot followed by system-initiated reload.
+nlohmann::json doc_reload(const std::string& doc_id, long expected_revision = -1,
+                          long expected_metadata_revision = -1);
 // Called outside document locks after an unverified saved cache is re-solved.
 void set_cache_refresh_sink(
     std::function<void(const std::string&, const nlohmann::json&)> sink);
@@ -665,27 +758,36 @@ void set_cache_refresh_sink(
 //
 // sketch_enter: resolve plane, cold-solve, store warm state -> {entities, statuses,
 //   dof, plane_frame, status, conflicting, redundant, skipped_constraints,
-//   solve_rejected, constraints}.
+//   solve_rejected, constraints, session_id, revision}.
 // sketch_solve: warm re-solve the active sketch -> same shape.
 // sketch_drag: transient warm-started drag (NO revision bump) -> {entities, statuses,
-//   solve_rejected, constraints} or {ok:false, error, rejected_handles}.
+//   solve_rejected, constraints, session_id, revision} or {ok:false, error, rejected_handles}.
 // sketch_drag_commit: persist dragged coords as one undoable sketch_edit_entity batch
 //   -> the ops-response (+ constraints).
 // sketch_exit: persist last-solved coords, clear active_sketch, rebuild -> ops-response.
-// sketch_overview: read-only solved snapshot (never touches active_sketch).
-// sketch_probe: over-define pre-flight on a copy (read-only) -> {ok, status,
-//   dof_before, dof_after, converged, conflicting, redundant, would_over_define}.
+// Optional session_id binds calls to transient state; discard_active exits without
+// persisting and only clears an exactly matching session. Optional expect_revision
+// guards commit/exit against intervening document mutations.
+// sketch_overview: read-only snapshot, including measured constraints and solve_rejected
+//   (when rejected the entities and measurements describe authored seeds).
+// sketch_probe: read-only pre-flight by feature id, independent of active_sketch ->
+//   {ok, status, dof_before, dof_after, dof_delta, converged, conflicting, redundant,
+//    skipped, conflicts_with, would_over_define, probe_id}.
 // sketch_regions: read-only closed-loop region enumeration -> {plane_frame, bbox_diag,
 //   regions:[{index, centroid, area, depth, is_material, outer, holes, tris}]}.
 nlohmann::json doc_sketch_enter(const std::string& doc_id, const std::string& sketch_fid);
-nlohmann::json doc_sketch_solve(const std::string& doc_id, const std::string& sketch_fid);
+nlohmann::json doc_sketch_solve(const std::string& doc_id, const std::string& sketch_fid,
+                                std::uint64_t session_id = 0);
 nlohmann::json doc_sketch_overview(const std::string& doc_id, const std::string& sketch_fid);
 nlohmann::json doc_sketch_regions(const std::string& doc_id, const std::string& sketch_fid);
 nlohmann::json doc_sketch_drag(const std::string& doc_id, const std::string& sketch_fid,
                                const std::string& handle, const nlohmann::json& xy,
-                               const nlohmann::json& targets);
-nlohmann::json doc_sketch_drag_commit(const std::string& doc_id, const std::string& sketch_fid);
-nlohmann::json doc_sketch_exit(const std::string& doc_id, const std::string& sketch_fid);
+                               const nlohmann::json& targets, std::uint64_t session_id = 0);
+nlohmann::json doc_sketch_drag_commit(const std::string& doc_id, const std::string& sketch_fid,
+                                      long expect_revision = -1, std::uint64_t session_id = 0);
+nlohmann::json doc_sketch_exit(const std::string& doc_id, const std::string& sketch_fid,
+                               long expect_revision = -1, std::uint64_t session_id = 0,
+                               bool discard_active = false);
 nlohmann::json doc_sketch_probe(const std::string& doc_id, const std::string& sketch_fid,
                                 const nlohmann::json& action);
 
@@ -785,6 +887,12 @@ nlohmann::json doc_dep_query(const std::string& source_doc_id, const std::string
 nlohmann::json doc_dep_notify(const std::string& source_doc_id, long new_revision);
 nlohmann::json doc_dep_unregister(const std::string& dep_doc_id, const std::string& kind);
 
+// Internal publication hook: successful persistence of a part's full source
+// history in a standalone drawing makes its feature IDs externally observable.
+// Does not save the part or change its revision/dirty state. Missing or closed
+// sources are harmless; repeated calls are idempotent.
+void doc_mark_history_published(const std::string& doc_id);
+
 // Kinematic motion study: drive one angle/distance mate across [start, stop] in
 // `steps` samples, solve the assembly mate graph on an immutable document snapshot,
 // and collect per-body world transforms for every frame. Optionally checks
@@ -804,10 +912,14 @@ nlohmann::json doc_dep_unregister(const std::string& dep_doc_id, const std::stri
 // applied loads and viscous damping; per-mate reaction wrenches solved through the
 // mate constraint-Jacobian wrench bases in doc/motion_dynamics.h).
 // Keys (all optional): {duration_s (default 1.0 across the sweep),
-//   gravity:[3] m/s² (default [0,0,-9.81]), default_density_g_cm3 (default 7.85),
+//   gravity:[3] m/s² (default [0,0,-9.81]),
 //   densities:{component_id: g/cm³}, masses:{component_id: kg},
+//   default_density_g_cm3 (only for components with no applied material),
 //   loads:[{component, force_n:[3], torque_nm:[3]}],
 //   damping:{linear_ns_per_m, angular_nms_per_rad}}.
+// Density per component: masses > densities > the material applied to the component's
+// source part (registry density) > default_density_g_cm3. Missing density is an error.
+// Each `bodies[]` row names its `density_source` and `material_key`.
 // The block includes {ok,force_path_resolved,has_nonzero_reaction,dt_s,duration_s,
 //   bodies,joints,frames:[{i,t_s,force_residual_n,moment_residual_nm,balanced,
 //   reactions:[{mate_id,component_a,component_b,force_n:[3],moment_nm:[3],

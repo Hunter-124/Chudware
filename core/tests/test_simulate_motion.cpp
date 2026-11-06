@@ -759,14 +759,19 @@ TEST_CASE("doc_simulate_motion: classification keeps overlap and exact unsafe cl
     }
     const auto clearance = doc::doc_simulate_motion(did, mid, 12, 14, 3, true, 3);
     INFO(clearance.dump(2));
-    REQUIRE(clearance.at("ok").get<bool>());
+    CHECK_FALSE(clearance.at("ok").get<bool>());
     const auto& unsafe = clearance.at("trajectory").front().at("collision_detail");
     REQUIRE(unsafe.size() == 1);
     CHECK(unsafe.front().at("component_a") == "k1");
     CHECK(unsafe.front().at("component_b") == "k2");
     CHECK(unsafe.front().at("distance").get<double>() == doctest::Approx(2));
+    const auto& boundary = clearance.at("trajectory")[1];
+    CHECK(boundary.at("interference").is_null());
+    REQUIRE(boundary.at("pair_failures").size() == 1);
+    CHECK(boundary.at("pair_failures")[0].at("reason") == "clearance_within_tolerance");
     CHECK(clearance.at("trajectory").back().at("collision_detail").empty());
-    CHECK(clearance.at("interference").at("complete").get<bool>());
+    CHECK_FALSE(clearance.at("interference").at("complete").get<bool>());
+    CHECK(clearance.at("interference").at("frames_checked") == 2);
     // Single Evaluate still measures ALL three gaps, including the distant part.
     const auto exact = doc::doc_eval_interference(did, json::object());
     REQUIRE(exact.at("complete").get<bool>());
@@ -786,12 +791,16 @@ TEST_CASE("doc_simulate_motion: invariant relative placements retain exact pair 
     double first_gap = 0.25, last_gap = 0.25;
     bool multiple_solids = false;
     SUBCASE("rigidly translating pair retains its exact unsafe clearance") {}
-    SUBCASE("clearance exactly at the threshold stays safe") { first_gap = last_gap = 0.5; }
+    SUBCASE("clearance exactly at the threshold remains uncertain") { first_gap = last_gap = 0.5; }
     SUBCASE("rigidly translating overlap retains its exact volume") { first_gap = last_gap = -1; }
     SUBCASE("actual relative movement crosses the clearance boundary") { last_gap = 0.75; }
     SUBCASE("sub-tolerance relative movement must not be rounded into a cache hit") {
         first_gap = 0.5 - 1e-8;
         last_gap = 0.5 + 1e-8;
+    }
+    SUBCASE("relative movement crosses the full clearance tolerance band") {
+        first_gap = 0.5 - 2e-6;
+        last_gap = 0.5 + 2e-6;
     }
     SUBCASE("multi-solid boundaries follow changing relative placements") {
         multiple_solids = true;
@@ -807,18 +816,36 @@ TEST_CASE("doc_simulate_motion: invariant relative placements retain exact pair 
     const auto pair = make_translated_pair(path, first_gap);
     const auto result = translated_pair_sweep(pair, first_gap, last_gap);
     INFO(result.dump(2));
-    REQUIRE(result.at("ok").get<bool>());
-    CHECK(result.at("interference").at("complete").get<bool>());
-    CHECK(result.at("interference").at("frames_checked") == 3);
+    CHECK(result.at("pose_check").at("ok").get<bool>());
+    int certain_frames = 0;
     const bool invariant = first_gap == last_gap;
     for (const auto& frame : result.at("trajectory")) {
         const int i = frame.at("i").get<int>();
         const double gap = i == 0 ? first_gap : i == 2 ? last_gap : (first_gap + last_gap) / 2;
         CHECK(frame.at("pairs_checked") == 3);
         CHECK(frame.at("pairs_reused") == (invariant && i > 0 ? 1 : 0));
-        CHECK(frame.at("interference_complete").get<bool>());
-        CHECK(frame.at("interference").get<bool>() == (gap < 0.5));
-        if (gap < 0.5) {
+        const bool uncertain = std::abs(gap - 0.5) <= 1e-6;
+        const bool violation = gap < 0.5 - 1e-6;
+        CHECK(frame.at("interference_complete").get<bool>() == !uncertain);
+        if (uncertain) {
+            CHECK(frame.at("interference").is_null());
+            CHECK(frame.at("collision_detail").empty());
+            REQUIRE(frame.at("pair_failures").size() == 1);
+            const auto& evidence = frame.at("pair_failures").front();
+            CHECK(evidence.at("component_a") == "k2");
+            CHECK(evidence.at("component_b") == "k3");
+            CHECK(evidence.at("reason") == "clearance_within_tolerance");
+            CHECK(evidence.at("clearance_status") == "within_tolerance");
+            CHECK(evidence.at("distance_status") == "exact");
+            CHECK(evidence.at("clearance_tolerance_mm").get<double>() == doctest::Approx(1e-6));
+            CHECK(std::abs(evidence.at("distance").get<double>() - gap) < 1e-11);
+            CHECK(evidence.value("reused", false) == (invariant && i > 0));
+        } else {
+            ++certain_frames;
+            CHECK(frame.at("pair_failures").empty());
+            CHECK(frame.at("interference").get<bool>() == violation);
+        }
+        if (violation) {
             REQUIRE(frame.at("collision_detail").size() == 1);
             const auto& detail = frame.at("collision_detail").front();
             CHECK(detail.at("component_a") == "k2");
@@ -838,6 +865,42 @@ TEST_CASE("doc_simulate_motion: invariant relative placements retain exact pair 
             if (body.at("component") == "k3")
                 CHECK(body.at("transform").at(12).get<double>() == doctest::Approx(4.0 * i + 10 + gap));
         }
+    }
+    CHECK(result.at("ok").get<bool>() == (certain_frames == 3));
+    CHECK(result.at("interference").at("complete").get<bool>() == (certain_frames == 3));
+    CHECK(result.at("interference").at("frames_checked") == certain_frames);
+    CHECK(result.at("interference").at("pair_failures").size() == 3 - certain_frames);
+    doc::doc_close(pair.doc_id);
+    fs::remove(path);
+}
+
+TEST_CASE("doc_simulate_motion: uncertain clearance retains simultaneous definite collisions") {
+    const auto path = make_box_step("uncertain_and_collision");
+    const auto pair = make_translated_pair(path, 0.5);
+    doc::doc_apply_ops(pair.doc_id, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", path.string()}}}, {"fixed", true},
+         {"transform", {1,0,0,0, 0,1,0,40, 0,0,1,0, 0,0,0,1}}},
+        {{"op", "asm_insert_component"}, {"source", {{"path", path.string()}}}, {"fixed", true},
+         {"transform", {1,0,0,9, 0,1,0,40, 0,0,1,0, 0,0,0,1}}}
+    }), false);
+    const auto result = translated_pair_sweep(pair, 0.5, 0.5);
+    INFO(result.dump(2));
+    CHECK_FALSE(result.at("ok").get<bool>());
+    CHECK_FALSE(result.at("interference").at("complete").get<bool>());
+    CHECK(result.at("interference").at("frames_checked") == 0);
+    CHECK(result.at("interference").at("first_collision_step") == 0);
+    REQUIRE(result.at("trajectory").size() == 3);
+    for (const auto& frame : result.at("trajectory")) {
+        CHECK_FALSE(frame.at("interference_complete").get<bool>());
+        CHECK(frame.at("interference") == true);
+        REQUIRE(frame.at("pair_failures").size() == 1);
+        CHECK(frame.at("pair_failures")[0].at("reason") == "clearance_within_tolerance");
+        REQUIRE(frame.at("collision_detail").size() == 1);
+        REQUIRE(frame.at("collisions").size() == 1);
+        const auto& collision = frame.at("collision_detail")[0];
+        CHECK(collision.at("component_a") == "k4");
+        CHECK(collision.at("component_b") == "k5");
+        CHECK(collision.at("overlap_volume_mm3").get<double>() == doctest::Approx(100));
     }
     doc::doc_close(pair.doc_id);
     fs::remove(path);
@@ -876,15 +939,23 @@ TEST_CASE("doc_simulate_motion: cached hollow boundaries track moving cavity cle
     const auto mid = added.at("id_map").at("$0").get<std::string>();
     const auto result = doc::doc_simulate_motion(did, mid, -6.75, -6.25, 3, true, 0.5);
     INFO(result.dump(2));
-    REQUIRE(result.at("ok").get<bool>());
-    CHECK(result.at("interference").at("complete").get<bool>());
+    CHECK_FALSE(result.at("ok").get<bool>());
+    CHECK_FALSE(result.at("interference").at("complete").get<bool>());
+    CHECK(result.at("interference").at("frames_checked") == 2);
     REQUIRE(result.at("trajectory").size() == 3);
     for (const auto& frame : result.at("trajectory")) {
         const int i = frame.at("i").get<int>();
-        CHECK(frame.at("interference_complete").get<bool>());
+        CHECK(frame.at("interference_complete").get<bool>() == (i != 1));
         CHECK(frame.at("pairs_checked") == 1);
         CHECK(frame.at("pairs_reused") == 0);
-        CHECK(frame.at("interference").get<bool>() == (i == 0));
+        if (i == 1) {
+            CHECK(frame.at("interference").is_null());
+            REQUIRE(frame.at("pair_failures").size() == 1);
+            CHECK(frame.at("pair_failures")[0].at("reason") == "clearance_within_tolerance");
+            CHECK(frame.at("pair_failures")[0].at("distance").get<double>() == doctest::Approx(0.5));
+        } else {
+            CHECK(frame.at("interference").get<bool>() == (i == 0));
+        }
         if (i == 0) {
             REQUIRE(frame.at("collision_detail").size() == 1);
             const auto& pair = frame.at("collision_detail").front();

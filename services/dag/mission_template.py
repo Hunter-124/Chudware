@@ -12,7 +12,6 @@ Phase → node mapping:
   * INTAKE   → one ``plan`` node, role ``intake_analyst`` (produces the manifest).
   * CLARIFY  → one ``plan`` node, role ``clarifier`` (only if blocking ambiguity).
   * SPECIFY  → one ``design`` node per deliverable, role ``spec_writer``.
-  * ORGANIZE → one ``plan`` node, role ``department_manager`` (feature-flagged).
   * PLAN     → one ``plan`` node, role ``orchestrator`` (build graphs) — for
                assemblies a preceding ``design`` node, role ``layout_engineer``.
   * BUILD    → one ``design`` node per buildable deliverable, role by kind
@@ -40,7 +39,6 @@ from .graph_loader import validate_graph
 _TYPE_INTAKE = "plan"
 _TYPE_CLARIFY = "plan"
 _TYPE_SPEC = "design"
-_TYPE_ORGANIZE = "plan"
 _TYPE_LAYOUT = "design"
 _TYPE_PLAN = "plan"
 _TYPE_BUILD = "design"
@@ -71,9 +69,8 @@ _DELIVER_ROLE_BY_KIND = {
     "weldment_traveler": "general_agent",
 }
 
-# Map deliverable kind → role_models TaskClass so depth-0 leaf nodes
-# (VERIFY/DELIVER/INTAKE) can auto_pick cheap models. Without this stamp every
-# node defaults to unknown→min_rank=3→frontier and cheap-share stays 0%.
+# Map deliverable kind → TaskClass so every node carries its class (leaf/report
+# classes for VERIFY/DELIVER/INTAKE, build classes by deliverable kind).
 _KIND_TASK_CLASS = {
     "part": "multi_feature_part",
     "assembly": "assembly",
@@ -590,33 +587,7 @@ def _build_job_for(d: dict[str, Any], role: str) -> str:
             "procedure, fit-up, sequence, process variables and inspection/signoff "
             "hold points. Return the artifact path; prose alone is not done."
         )
-    # Mechanical / default BUILD — concrete airframe geometry guidance
-    name = str(d.get("name") or d.get("id") or "").lower()
-    desc = str(d.get("description") or "").lower()
-    blob = f"{name} {desc}"
-    if any(k in blob for k in (
-        "airframe", "rocket", "fuselage", "payload", "body_tube", "boost",
-    )):
-        return (
-            "BUILD the boost-glide airframe as editable CAD features (not a "
-            "hollow placeholder). Concrete geometry targets (use these dims "
-            "unless ledger DIMs override): "
-            "(1) body tube: revolve or extrude OD≈60 mm, wall≥1.5 mm, length≈520 mm "
-            "overall with nose ogive ≈90 mm; "
-            "(2) motor mount aft: tube ID≈29 mm OD≈32 mm length≈200 mm; "
-            "(3) payload bay for FC: internal clear ≥56×86×20 mm (board envelope "
-            "50×80×1.6 + component height; AC2 bay ≥ board); bay lid ≈2 mm; "
-            "4× M2 mount bosses on 44×74 mm pattern raised ≈3 mm from bay floor; "
-            "(4) wing/glide surface: span≈400 mm, root chord≈100 tip≈60, thickness≈3 mm; "
-            "(5) 3 fins aft: root≈70 tip≈35 span≈55 thickness≈2.5 mm. "
-            "Feature order: new_part → add_features solid body (revolve/extrude shell "
-            "with real wall thickness — no zero-thickness sheets) → bay pocket/cut → "
-            "fins/wing as pads or extrudes → measure_part volume. "
-            "Keep walls ≥1.5 mm, manifold closed solid, volume large enough for bay "
-            "(order 1e5 mm³ class). After solids exist run verify_battery(doc_id) and "
-            "record honest PASS/WARN/FAIL — do not declare done without battery or "
-            "check tool evidence."
-        )
+    # Mechanical / default BUILD
     return (
         "build this deliverable's geometry with the engine tools so every "
         "acceptance criterion can pass. Prefer real wall thicknesses (≥1.5 mm), "
@@ -689,7 +660,6 @@ def build_mission_graph(
     *,
     graph_id: str = "mission",
     is_assembly: Optional[bool] = None,
-    org_layer: bool = False,
     default_autonomy: str = "auto",
     tier: Optional[str] = None,
 ) -> dict[str, Any]:
@@ -704,20 +674,14 @@ def build_mission_graph(
         is_assembly:     force the assembly path (layout_engineer + assembly build).
                          When ``None``, inferred from the presence of an
                          ``assembly``-kind deliverable.
-        org_layer:       insert the ORGANIZE (department_manager) node (Phase 2.5,
-                         feature-flagged).
         default_autonomy: node autonomy floor ("auto" | "approve" | "manual").
         tier:            optional model tier (``local-24k`` / ``local-48k`` / ``mid`` /
-                         ``frontier``) recorded on EVERY node's ``inputs.tier``. This is
-                         the plumbing a caller with no in-hand Provider object uses to
-                         pin the mission to a tier (e.g. ``mission_start(tier=...)``
-                         over MCP, followed by ``dag_run``): ``services.dag.node_runner``
-                         reads ``inputs.tier`` and resolves it via
-                         ``services.agent.tiers.provider_for_tier`` — the same seam the
-                         gym bench uses — instead of silently falling through
-                         to the ambient config.json / ``CHUDWARE_PROVIDER`` default.
-                         ``None`` (the default) leaves every node's ``inputs`` exactly
-                         as before — no behaviour change for callers that don't pass it.
+                         ``frontier``) recorded on EVERY node's ``inputs.tier``.
+                         ``services.dag.node_runner`` reads it to select the tiers.yaml
+                         generation cap and the capability (A/B/C) scaffold and
+                         prompt-phrasing profile; it does not select a provider or
+                         model. ``None`` (the default) leaves every node's ``inputs``
+                         exactly as before.
 
     Returns:
         An ``aicad.dag/1`` graph dict (validated).  Raises ``GraphValidationError``
@@ -795,19 +759,6 @@ def build_mission_graph(
         edges.append({"from": sid, "to": spec_join})
     tail = spec_join
 
-    # --- Phase 2.5: ORGANIZE (feature-flagged) -----------------------------
-    if org_layer:
-        org_id = "n_organize"
-        nodes.append(_node(org_id, _TYPE_ORGANIZE, "ORGANIZE: instantiate departments",
-                           "department_manager", autonomy=default_autonomy,
-                           inputs={"request": (
-                               f"{mission_ctx}\n\nYour job on this node: group the "
-                               "mission's deliverables into departments and confirm "
-                               "each has an owner role." if mission_ctx else None),
-                                   "task_class": _LEAF_TASK_CLASS}))
-        edges.append({"from": tail, "to": org_id})
-        tail = org_id
-
     # --- Phase 3: PLAN (layout first for assemblies, then orchestrator) ----
     if is_assembly:
         layout_id = "n_layout"
@@ -837,7 +788,7 @@ def build_mission_graph(
         build_ids[did] = bid
         role = _resolve_build_role(d)
         tc = _task_class_for(d, deliverables)
-        # Domain tags help auto_pick / multi-domain gate classify producing legs.
+        # Domain tags help the multi-domain gate classify producing legs.
         domain_tags: list[str] = []
         if role == "ecad_engineer":
             domain_tags = ["ecad", "analysis"]
@@ -959,7 +910,7 @@ def build_mission_graph(
         for n in nodes:
             n.setdefault("inputs", {})["tier"] = tier
 
-    # Safety net: every node must carry task_class for auto_pick.
+    # Safety net: every node must carry task_class.
     for n in nodes:
         ni = n.setdefault("inputs", {})
         if not ni.get("task_class"):

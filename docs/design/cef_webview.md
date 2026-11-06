@@ -6,10 +6,6 @@ Status: **implemented native backend, conditional on the CEF build.**
 defaults ON for native Linux/Windows and is forced OFF for macOS/Web/WASM.
 These source facts are not a current Windows interactive-acceptance result.
 
-Original status claim: "shipping and load-bearing on Linux and Windows" for the
-in-app browser and headless fetch primitive used by "100+ Parts Library source
-adapters". Treat that as historical scope, not a verified current adapter count.
-Current native browser ownership is the factory and `cef/` implementation below.
 
 ## Why
 
@@ -35,8 +31,7 @@ host/src/ui/widgets/
   cef/                  CefWebView : IWebViewBackend
 ```
 
-`ScreencastWebView`, the former worker-side JPEG-streaming backend, was deleted
-when CEF landed on 2026-07-07. There is no runtime backend selector.
+There is no runtime backend selector.
 
 `CHUDWARE_ENABLE_CEF` defaults ON for native Linux and Windows builds and
 requires the SDK under `extern/cef/`. macOS forces the option OFF because the

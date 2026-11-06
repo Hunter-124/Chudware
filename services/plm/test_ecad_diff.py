@@ -12,16 +12,20 @@ points that route ECAD documents to it instead of the part/asm doc_diff shape:
     fallback when extraction is unavailable/fails, and untouched behavior for
     plain-text and non-office binary items
 
-Runs under the gate venv (dulwich installed). No engine C++ dependency.
+Snapshot integration tests exercise the native KiCad importer when available.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
-from services.mcp import doc_diff_tools, office_tools
+import pytest
+
+from services.mcp import core_bridge, doc_diff_tools, office_tools
 from services.plm import compare as compare_mod
 from services.plm import ecad_diff
-from services.plm.vault import Vault
+from services.plm import doctypes, snapshot, worker_rpc
+from services.plm.vault import Vault, VaultError
 
 _GIT_VOCAB = {
     "git", "commit", "repository", "repo", "branch", "merge", "rebase",
@@ -225,6 +229,266 @@ def test_semantic_compare_part_asm_still_uses_doc_diff():
     assert "5" in out["summary"]
     _no_git_vocab(out["summary"])
 
+
+
+def test_kicad_identities_survive_import_reordering():
+    a = {"schema": "aicad.pcb/1",
+         "nets": [{"name": "GND"}, {"name": "VCC"}],
+         "tracks": [{"id": "t1", "uuid": "track-a", "p1": [0, 0], "p2": [1, 0],
+                     "kicad_original": {"id": "t1"}},
+                    {"id": "t2", "uuid": "track-b", "p1": [1, 0], "p2": [2, 0]}]}
+    b = {"schema": "aicad.pcb/1",
+         "nets": [{"name": "GND"}, {"name": "SIGNAL"}],
+         "tracks": [{"id": "t1", "uuid": "track-b", "p1": [1, 0], "p2": [2, 0]},
+                    {"id": "t2", "uuid": "track-a", "p1": [0, 0], "p2": [1, 0],
+                     "kicad_original": {"id": "t2"}}]}
+    diff = ecad_diff.ecad_diff(a, b)
+    assert not diff["tracks_added"] and not diff["tracks_removed"] and not diff["tracks_changed"]
+    assert [entry["id"] for entry in diff["nets_added"]] == ["SIGNAL"]
+    assert [entry["id"] for entry in diff["nets_removed"]] == ["VCC"]
+
+
+@pytest.mark.parametrize(("path", "expected"), [
+    ("board.kicad_pcb", True), ("BOARD.KICAD_PCB", True),
+    ("sheet.KICAD_SCH", True), ("sheet.kicad_sch.backup", False),
+    ("board.kicad_pro", False),
+])
+def test_kicad_suffix_detection(path, expected):
+    assert doctypes.is_kicad_file(path) is expected
+    assert (doctypes.detect_doc_type(path) == "kicad") is expected
+
+
+def test_kicad_schematic_entities_are_semantically_compared():
+    a = {"schema": "aicad.sch/1",
+         "symbols": [{"id": "s1", "uuid": "symbol", "ref": "R1", "value": "10k"}],
+         "wires": [{"id": "w1", "uuid": "wire", "pts": [[0, 0], [1, 0]]}]}
+    b = {"schema": "aicad.sch/1",
+         "symbols": [{"id": "s2", "uuid": "symbol", "ref": "R1", "value": "20k"}],
+         "wires": [{"id": "w2", "uuid": "wire", "pts": [[0, 0], [2, 0]]}]}
+    diff = compare_mod.semantic_compare(a, b)
+    assert [item["id"] for item in diff["doc_diff"]["symbols_changed"]] == ["symbol"]
+    assert [item["id"] for item in diff["doc_diff"]["wires_changed"]] == ["wire"]
+    assert "R1" in diff["summary"]
+
+
+def test_kicad_outline_and_via_changes_are_not_lost():
+    a = {"schema": "aicad.pcb/1",
+         "outline": {"shapes": [{"uuid": "edge", "type": "line",
+                                 "p1": [0, 0], "p2": [10, 0]}]},
+         "vias": [{"id": "v1", "uuid": "via", "at": [1, 1], "diameter": 0.8}]}
+    b = {"schema": "aicad.pcb/1",
+         "outline": {"shapes": [{"uuid": "edge", "type": "line",
+                                 "p1": [0, 0], "p2": [20, 0]}]},
+         "vias": [{"id": "v1", "uuid": "via", "at": [2, 1], "diameter": 0.8}]}
+    diff = ecad_diff.ecad_diff(a, b)
+    assert [item["id"] for item in diff["outline_changed"]] == ["edge"]
+    assert [item["id"] for item in diff["vias_changed"]] == ["via"]
+
+
+def test_outline_without_uuid_still_reports_changes():
+    a = {"schema": "aicad.pcb/1",
+         "outline": {"shapes": [{"type": "line", "p1": [0, 0], "p2": [10, 0]}]}}
+    b = {"schema": "aicad.pcb/1",
+         "outline": {"shapes": [{"type": "line", "p1": [0, 0], "p2": [20, 0]}]}}
+    assert [item["id"] for item in ecad_diff.ecad_diff(a, b)["outline_changed"]] == ["outline-1"]
+
+
+def _kicad_board(end: int) -> bytes:
+    return f'''(kicad_pcb (version 20221018) (generator chudware-test)
+      (general (thickness 1.6))
+      (layers (0 "F.Cu" signal) (31 "B.Cu" signal) (44 "Edge.Cuts" user))
+      (net 0 "") (net 1 "GND")
+      (segment (start 10 10) (end {end} 10) (width 0.25) (layer "F.Cu") (net 1)
+        (uuid "10000000-0000-4000-8000-000000000001"))
+      (gr_line (start 0 0) (end 40 0) (layer "Edge.Cuts") (width 0.05)
+        (uuid "10000000-0000-4000-8000-000000000002"))
+    )'''.encode()
+
+
+def _kicad_schematic(end: int) -> bytes:
+    return f'''(kicad_sch (version 20221018) (generator chudware-test)
+      (uuid "20000000-0000-4000-8000-000000000001")
+      (lib_symbols (symbol "Device:R"
+        (symbol "R_0_1" (rectangle (start -1 -1) (end 1 1)
+          (stroke (width 0)) (fill (type none))))))
+      (symbol (lib_id "Device:R") (at 20 10 0) (unit 1)
+        (property "Reference" "R1") (property "Value" "10k")
+        (uuid "20000000-0000-4000-8000-000000000004"))
+      (wire (pts (xy 10 10) (xy {end} 10))
+        (uuid "20000000-0000-4000-8000-000000000002"))
+      (label "GND" (at 10 10 0)
+        (uuid "20000000-0000-4000-8000-000000000003"))
+    )'''.encode()
+
+
+@pytest.mark.parametrize(("name", "content", "section"), [
+    ("controller.KICAD_PCB", _kicad_board, "tracks"),
+    ("controller.KICAD_SCH", _kicad_schematic, "wires"),
+])
+def test_kicad_native_snapshots_compare_and_restore(tmp_path, name, content, section):
+    if not core_bridge.available():
+        pytest.skip("native core is required to import KiCad snapshots")
+    try:
+        from PIL import Image  # noqa: F401
+        have_pillow = True
+    except ImportError:
+        have_pillow = False
+    working = tmp_path / name
+    before, after = content(20), content(25)
+    working.write_bytes(before)
+    assert doctypes.detect_doc_type(str(working)) == "kicad"
+    vault = Vault.open(tmp_path)
+    try:
+        item = next(it for it in vault.manifest()["items"] if it["path"] == name)
+        iid = item["item_id"]
+        assert item["kind"] == "ecad" and not compare_mod.is_generic_item(vault, iid)
+        a = vault.checkpoint("before")["commit"]
+        working.write_bytes(after)
+        b = vault.checkpoint("after")["commit"]
+        prefix = snapshot.item_prefix(iid) + "file/" + name
+        assert vault._bind.read_tree(a)[prefix] == before
+        assert vault._bind.read_tree(b)[prefix] == after
+        doc_a, doc_b = compare_mod.docs_at(vault, a, b, iid)
+        semantic = compare_mod.semantic_compare(doc_a, doc_b)
+        assert len(semantic["doc_diff"][f"{section}_changed"]) == 1
+        assert not semantic["doc_diff"][f"{section}_added"]
+        assert not semantic["doc_diff"][f"{section}_removed"]
+        visual = compare_mod.visual_compare(doc_a, doc_b, tmp_path / "visual")
+        if have_pillow:
+            assert not visual["degraded"]
+            assert visual["counts"]["added"] and visual["counts"]["removed"]
+            assert Path(visual["diff_2d"]).is_file()
+        else:
+            assert visual["degraded"]
+        vault.restore(a, iid)
+        assert working.read_bytes() == before
+    finally:
+        vault.close()
+    result = worker_rpc._plm_compare(
+        {"path": str(tmp_path), "item_id": iid, "commit_a": a, "commit_b": b,
+         "visual": True, "out_dir": str(tmp_path / "worker-visual")}, None)
+    assert result["ok"], result
+    assert result["doc_diff"][f"{section}_changed"]
+    if have_pillow:
+        assert result["eval_compare"]["counts"]["added"] and result["eval_compare"]["counts"]["removed"]
+    else:
+        assert result["eval_compare"]["degraded"]
+
+
+def test_native_schematic_symbol_value_change(tmp_path):
+    if not core_bridge.available():
+        pytest.skip("native core is required to import KiCad snapshots")
+    path = tmp_path / "schematic.kicad_sch"
+    original = _kicad_schematic(20)
+    path.write_bytes(original)
+    vault = Vault.open(tmp_path)
+    try:
+        iid = vault.manifest()["items"][0]["item_id"]
+        a = vault.checkpoint("before")["commit"]
+        path.write_bytes(original.replace(b'"10k"', b'"22k"'))
+        b = vault.checkpoint("after")["commit"]
+        doc_a, doc_b = compare_mod.docs_at(vault, a, b, iid)
+        diff = compare_mod.semantic_compare(doc_a, doc_b)["doc_diff"]
+        changed = diff["symbols_changed"]
+        assert len(changed) == 1 and "R1" in changed[0]["summary"]
+        assert {"field": "value", "old": "10k", "new": "22k"} in changed[0]["changes"]
+    finally:
+        vault.close()
+
+
+@pytest.mark.parametrize(("name", "content", "section"), [
+    ("board.kicad_pcb", _kicad_board, "tracks"),
+    ("sheet.kicad_sch", _kicad_schematic, "wires"),
+])
+def test_mcp_compare_imports_kicad_history(tmp_path, name, content, section):
+    pytest.importorskip("mcp")
+    if not core_bridge.available():
+        pytest.skip("native core is required to import KiCad snapshots")
+    from services.mcp.plm_tools import register_plm_tools
+
+    captured = {}
+
+    class Capture:
+        def tool(self, *args, **kwargs):
+            def register(fn):
+                captured[fn.__name__] = fn
+                return fn
+            return register
+
+    register_plm_tools(Capture())
+    working = tmp_path / name
+    working.write_bytes(content(20))
+    vault = Vault.open(tmp_path)
+    try:
+        iid = vault.manifest()["items"][0]["item_id"]
+        a = vault.checkpoint("before")["commit"]
+        working.write_bytes(content(25))
+        b = vault.checkpoint("after")["commit"]
+    finally:
+        vault.close()
+    result = json.loads(captured["plm_compare"](
+        path=str(tmp_path), item_id=iid, commit_a=a, commit_b=b))
+    assert result["ok"], result
+    assert result["doc_diff"][f"{section}_changed"]
+    assert "text_diff" not in result
+
+
+def test_kicad_snapshots_are_registered_after_project_open(tmp_path):
+    vault = Vault.open(tmp_path)
+    try:
+        working = tmp_path / "new.kicad_pcb"
+        raw = _kicad_board(20)
+        working.write_bytes(raw)
+        _, _, untracked = vault.working_changes(vault.manifest(), kind="ecad")
+        assert untracked == [{"path": working.name, "change": "U"}]
+        commit = vault.checkpoint("new board")["commit"]
+        item = next(it for it in vault.manifest()["items"] if it["path"] == working.name)
+        assert vault._bind.read_tree(commit)[snapshot.item_prefix(item["item_id"])
+                                             + "file/" + working.name] == raw
+    finally:
+        vault.close()
+
+
+def test_snapshot_import_closes_session_when_tree_is_invalid(monkeypatch):
+    calls = []
+
+    def call(method, params):
+        calls.append((method, params))
+        if method == "ecad_open":
+            assert Path(params["path"]).suffix == ".kicad_sch"
+            assert Path(params["path"]).read_bytes() == b"(kicad_sch)"
+            return {"doc_id": "temporary", "tree": {}}
+        assert method == "ecad_close" and params == {"doc_id": "temporary"}
+        return {"closed": True}
+
+    monkeypatch.setattr(core_bridge, "call", call)
+    with pytest.raises(VaultError, match="native importer"):
+        compare_mod._import_kicad_snapshot("design.kicad_sch", b"(kicad_sch)")
+    assert [method for method, _ in calls] == ["ecad_open", "ecad_close"]
+
+
+def test_snapshot_import_closes_each_temporary_session(monkeypatch):
+    calls = []
+    paths = []
+
+    def call(method, params):
+        calls.append(method)
+        if method == "ecad_open":
+            path = Path(params["path"])
+            paths.append(path)
+            tree = {"schema": "aicad.pcb/1", "tracks": [{"id": path.read_text()}]}
+            return {"doc_id": f"temporary-{len(paths)}", "tree": tree}
+        assert method == "ecad_close"
+        assert params["doc_id"] == f"temporary-{len(paths)}"
+        return {"closed": True}
+
+    monkeypatch.setattr(core_bridge, "call", call)
+    a = {"items/i/file/board.kicad_pcb": b"old"}
+    b = {"items/i/file/board.kicad_pcb": b"new"}
+    assert compare_mod._document_at(a, "i")["tracks"][0]["id"] == "old"
+    assert compare_mod._document_at(b, "i")["tracks"][0]["id"] == "new"
+    assert calls == ["ecad_open", "ecad_close", "ecad_open", "ecad_close"]
+    assert paths[0] != paths[1] and all(not path.exists() for path in paths)
 
 # ---------------------------------------------------------------------------
 # generic_compare office_extract path

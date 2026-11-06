@@ -56,6 +56,11 @@ if os.environ.get("SIMSUITE_GUARD", "1") == "1":
         _RESGUARD_DIR = os.path.join(_ROOT, "benchmarks", "simsuite")
         if _RESGUARD_DIR not in sys.path:
             sys.path.insert(0, _RESGUARD_DIR)
+        # Chromium reserves a huge sparse virtual address range for Blink; an
+        # inherited RLIMIT_AS kills it despite modest RSS. Live tests may spawn
+        # the browser daemon, so retain the RSS watchdog but omit this backstop.
+        if "--live" in sys.argv or os.environ.get("CHUDWARE_LIVE_TESTS") == "1":
+            os.environ.setdefault("SIMSUITE_RLIMIT", "0")
         import resguard as _resguard
         _resguard.install()
     except Exception:
@@ -270,6 +275,24 @@ def pytest_addoption(parser):
 
 
 def pytest_configure(config):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_chudware_testbox_guard", os.path.join(_ROOT, "scripts", "testbox_guard.py"))
+    guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard)
+    if not guard.isolated():
+        _pytest.exit(guard.MESSAGE, returncode=3)
+
+    # pytest-xdist: the controller runs no tests and owns every worker, which install
+    # their own guard on import (each over its own worker + daemon tree). Left running,
+    # the controller's guard sums all workers into one single-process budget and aborts
+    # a healthy parallel run (measured: 6 workers over a 5.7 GB budget on a 15 GB host).
+    if config.getoption("dist", "no") != "no" and not hasattr(config, "workerinput"):
+        resguard = sys.modules.get("resguard")
+        if resguard is not None:
+            resguard.stop_watchdog()
+
     # Fixtures run after collection. Imports can already resolve paths, migrate a
     # legacy profile, or probe a backend, so isolate those roots before collection.
     import tempfile

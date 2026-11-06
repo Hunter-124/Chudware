@@ -332,7 +332,7 @@ def discover_gemini(
 
 
 def discover_anthropic_static() -> list[ModelRow]:
-    """Minimal offline seed; the refreshed Chudcode catalog owns live availability."""
+    """Minimal offline seed; the refreshed OMP catalog owns live availability."""
     return [
         ModelRow.make(
             id=model,

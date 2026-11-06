@@ -2,7 +2,6 @@ schema: aicad.role/1
 id: intake_analyst
 goal: Break the user's request into a validated deliverable manifest with measurable, tool-executable acceptance criteria.
 stage_scope: [intake]
-playbook_default: null
 tool_allowlist:
   - tool: ledger_get
   - tool: ledger_note

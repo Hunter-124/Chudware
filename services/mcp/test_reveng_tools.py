@@ -218,10 +218,10 @@ class TestRevengSessionLifecycle(_RevengTestBase):
             _write_real_video(second, 70)
             _write_real_image(still, 25)
             with patch.object(tools, "_extract_frames_safe", extract_frames_safe):
-                a = _call(self.tools, "reveng_add_video", session_id=sid, path=str(first), max_frames=3)
-                b = _call(self.tools, "reveng_add_video", session_id=sid, path=str(second), max_frames=3)
+                a = _call(self.tools, "reveng_add_video", session_id=sid, path=str(first), max_frames=3, wait=True)
+                b = _call(self.tools, "reveng_add_video", session_id=sid, path=str(second), max_frames=3, wait=True)
                 capture = _call(self.tools, "reveng_add_images", session_id=sid, paths=[str(still)])
-                repeat = _call(self.tools, "reveng_add_video", session_id=sid, path=str(first), max_frames=3)
+                repeat = _call(self.tools, "reveng_add_video", session_id=sid, path=str(first), max_frames=3, wait=True)
             self.assertTrue(a["ok"], a)
             self.assertTrue(b["ok"], b)
             self.assertTrue(capture["ok"], capture)
@@ -396,9 +396,10 @@ class TestRevengSessionLifecycle(_RevengTestBase):
         r = _call(self.tools, "reveng_set_scale",
                   session_id=sid,
                   method="known_dim",
-                  params={"feature": "hex_width", "value_mm": 13.0, "source": "datasheet"})
+                  params={"feature": "hex_width", "value_mm": 13.0,
+                          "recon_length": 6.5, "source": "datasheet"})
         self.assertTrue(r["ok"])
-        self.assertEqual(r["scale"]["mm_per_unit"], 13.0)
+        self.assertEqual(r["scale"]["mm_per_unit"], 2.0)
 
     def test_attach_result(self):
         create = _call(self.tools, "reveng_start_session", name="Bracket")

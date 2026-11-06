@@ -1,6 +1,6 @@
 // core/sim/sim_cancel.h — run/cancel registry for sim jobs.
 //
-// Mirrors core/agent/machine.cpp's agent cancel: a process-wide registry maps a job_id to a
+// A process-wide registry maps a job_id to a
 // shared atomic flag; the running job (the LBM wind tunnel) polls its token between steps
 // (lbm_run's should_cancel), and sim_cancel flips the flag. The dispatch entry (chudware_call
 // in core/api/libchudware.cpp) exposes sim_cancel(job_id) as an RPC; this header is the whole

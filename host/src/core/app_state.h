@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <future>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -79,7 +80,7 @@ enum class Units { MMGS = 0, IPS = 1 };
 
 // ---------------- settings (AI provider) -> %APPDATA%/Chudware/config.json ----------------
 // Copilot composer interaction mode (Agent | Plan | Ask) — a USER choice, never inferred from
-// the request text. Every mode runs the same Chudcode general_agent turn; the mode only sets the
+// the request text. Every mode runs the same OMP general_agent turn; the mode only sets the
 // user-chosen tool policy (Ask read-only, Plan no mutators). Integer values match
 // Settings::copilotMode / AppState::aiInteraction / ChatMsg::copilotMode for persistence.
 // Legacy Swarm(2)/Edit(3)/EngFirm(5) values are migrated to Agent on load; legacy Ask(4) to Ask.
@@ -100,13 +101,11 @@ inline int normalizeCopilotMode(int v) {
 }
 
 struct Settings {
-    int provider = 9;  // 0=Anthropic 1=OpenAI 2=Local OpenAI-compat 3=managed llama.cpp 4=Gemini
-                       // 5=Cloud OpenAI-compat 6=xAI 7=Cursor 8=Kimi Code 9=ZenMux (Chudcode)
-                       // 10=Free AI (FreeLLMAPI, always cloud-classified).
-                       // Default ZenMux x-ai/grok-4.5-free; online auth and execution are owned
-                       // by Chudcode, while explicit offline mode retains only local providers.
-    char model[512] = "x-ai/grok-4.5-free";  // frontier-free default; auto-pick still routes cheap
-                                             // work down
+    int provider = 1;  // Legacy offline provider selection; online identity is ompProvider.
+    char model[512] = "";
+    std::string ompProvider;  // Exact OMP provider id for an explicit chat selection.
+    // New configurations follow AI model assignments; legacy composer pins remain explicit.
+    bool composerFollowRoles = true;
     char apiKey[256] = "";        // active-provider key (local OpenAI-compat optional key)
     // Per-provider keys so the picker can hide providers with no key while keeping each key
     // around when another provider is active. Serialized under config.json "keys".
@@ -117,7 +116,7 @@ struct Settings {
     char moonshotKey[256] = "";    // Moonshot (Kimi) API key — keys.moonshot / MOONSHOT_API_KEY
     char xaiKey[256] = "";         // xAI (Grok) API key — console.x.ai; empty when using xai-sub OAuth
     char freellmapiKey[256] = "";  // Free AI (FreeLLMAPI) unified key — keys.freellmapi
-    char reasoningEffort[16] = "high";  // off|low|medium|high — only used by reasoning models
+    char reasoningEffort[16] = "";  // Empty uses the runtime default.
     char baseUrl[256] = "http://localhost:1234/v1";
     bool vision = true;
     bool offlineMode = false;    // C35: local-only mode — refuse any non-loopback provider (ITAR)
@@ -132,15 +131,11 @@ struct Settings {
     int advisorPreference = 2;   // default Encourage — pull advisor + tone for guidance
     bool planMode = false;       // binary: planPreference != 0 (Supervised vs Autopilot)
     bool proactiveAdvisor = false; // opt-in mid-run proactive advisor (cheap gates; not every turn)
-    // Opt-in company structure auto-route (agent.corporate_mode). Default off —
-    // Agent never auto-invokes company; enable in Settings → AI → Behavior when ready.
-    bool corporateMode = false;
-    // Agent memory, kept per project folder by Chudcode: "sharpshooter" (curated decisions
-    // injected every turn), "mnemo" (searchable recall of this project's conversations) or
-    // "off". memoryEnabled mirrors backend != off for older Python readers.
+    // Project-scoped OMP memory backend. Known legacy mnemo values migrate to mnemopi.
+    // memoryEnabled mirrors backend != off for older offline readers.
     std::string memoryBackend = "sharpshooter";
     bool memoryEnabled = true;
-    int memoryTokenBudget = 400; // legacy offline loop's .plm/memory.db recall budget
+    int memoryTokenBudget = 400; // recall budget, persisted as config.json agent.memory_token_budget
     // Copilot composer mode: Agent | Plan | Ask. Persisted as "copilot_mode" (name string).
     // Values match AppState::aiInteraction / CopilotMode.
     int copilotMode = 0;
@@ -194,6 +189,7 @@ struct Settings {
     // "Manage models" toggle in Settings → AI). Default-empty = every available model shows;
     // hiding is opt-out so the picker works out of the box. Serialized as "hidden_models".
     std::set<std::string> hiddenModels;
+    std::set<std::string> shownLegacyHiddenModels; // Exact identities overriding legacy bare hides.
     // Bulk provider on/off: category keys the user has disabled wholesale ("gemini", "anthropic",
     // "openai", "openrouter", "alibaba", "deepseek", "local"). A disabled category's models are
     // hidden from the composer's chat picker and shown collapsed/greyed in Settings → Manage models.
@@ -227,6 +223,34 @@ struct Settings {
     // "fm_collapsed" / "copilot_collapsed".
     bool fmCollapsed = false;
     bool copilotCollapsed = false;
+    // Copilot column width in LOGICAL px (device px / ui::uiScale); 0 = the default width.
+    // Serialized "copilot_width", omitted when 0. (The FeatureManager column's width lives in the
+    // ImGui ini; the Copilot column is NoResize + SetNextWindowSize every frame, so it needs this.)
+    float copilotWidth = 0.0f;
+
+    // ---- Viewport / View-menu / sketch preferences: the user's last choice, restored at launch ----
+    // Serialized under config.json "view_prefs", each key omitted while at its default. They mirror
+    // live AppState fields (displayStyle, showTriad, ... showEquations) which stay GLOBAL, not
+    // per-document: AppState::seedViewPrefsFromSettings() copies them in at startup and
+    // AppState::persistViewPrefs() writes user edits back. Defaults must equal the AppState ones.
+    int  viewDisplayStyle = 1;           // 0=Shaded 1=ShadedEdges 2=HLR 3=HLV 4=Wireframe
+    bool viewShowTriad = true;
+    bool viewShowGroundShadow = true;
+    bool viewShowRealView = true;
+    int  viewDragMode = 0;               // 0=rotate 1=pan
+    // View-menu panel visibility (the leftPaneTab is NOT persisted: workspaces and the
+    // PropertyManager drive it constantly, so a saved tab would fight them).
+    bool panelRibbon = true;
+    bool panelFeatureTree = true;
+    bool panelAI = true;
+    bool panelViewport = true;
+    bool panelDesignTable = false;
+    bool panelCutList = false;
+    bool panelEquations = false;
+    // Global sketch defaults a new document's SketchMode starts from (each document keeps its own
+    // live value afterwards). The in-sketch inference master switch has no UI, so it is not here.
+    bool sketchShowGrid = false;
+    bool sketchAutoRelations = true;
 
     // Progressive disclosure for the Settings modal (the "Advanced" switch beside the tab
     // strip). OFF by default: every tab shows only the controls a normal user plausibly
@@ -266,17 +290,18 @@ std::string appdataAppDir();
 // Default Documents workspace dir (Documents/Chudware if it exists, else Documents/Chudware).
 std::string defaultWorkspaceDir();
 std::string configPath();
-// Serialized, atomic read-modify-write of config.json. `patch` receives the parsed JSON
-// (always an object) and mutates it in place; the result is written via tmp+rename.
-//
-// config.json is SHARED with the Python worker and the C++ engine, and every writer here
-// used to do its own unsynchronized load-modify-write — so "GUI reads, Python writes, GUI
-// writes" silently reverted Python's keys (the class of bug behind the 2026-07-14 account
-// wipe). This takes the advisory lock on <config.json>.lock, the SAME file
-// core/agent/auth.cpp and services/agent/providers/sub_auth.py use, so all three
-// serialize. ALWAYS use this instead of hand-rolling ifstream/ofstream on configPath().
-// Returns false if the file could not be written (the patch is then a no-op on disk).
+// Coalesced config.json update. `patch` runs before this call returns, so reference captures
+// remain valid. The desktop writer starts immediately when idle and coalesces newer pending
+// changes during a write. Equal content does not enqueue work. No disk lock, write or fsync
+// runs on the caller. Web keeps its single-threaded IDBFS write path.
+// config.json is shared with Python/engine writers using the same <config.json>.lock.
+// Returns whether the patch was accepted; asynchronous I/O errors surface via the warning.
 bool updateConfigJson(const std::function<void(nlohmann::json&)>& patch);
+// Snapshot of the latest config file overlaid with pending and in-flight GUI changes.
+nlohmann::json readConfigJson();
+// Durability barrier for shutdown and RPC/process launches that read config.json.
+// Returns success, immediately when there is no pending/in-flight write.
+bool flushConfigWrites();
 // Consume the one-time warning emitted when updateConfigJson backs up a corrupt config.
 // The writer may run on a background thread; the GUI displays this on its frame thread.
 std::string takeConfigCorruptionWarning();
@@ -382,6 +407,7 @@ struct DocSession {
     std::string                pickStatus;
     std::vector<uint8_t>       bodyVisible;         // Solid Bodies hide/show mask (per renderer slot)
     std::vector<uint32_t>      docBodyIds;          // AICM body id per slot (keys the mask)
+    std::unordered_map<std::string, bool> componentHiddenOverrides;
     std::unordered_set<std::string> hiddenFeatures; // FeatureManager eye-toggle: fids hidden (non-body)
     std::unordered_set<std::string> autoHiddenPlanes; // consumed default/user datum plane fids
     std::unordered_set<std::string> datumPlanesUserToggled; // sticky user-plane eye overrides
@@ -414,6 +440,11 @@ struct DocSession {
     int                               cachedRevision = -1;
     core::DocMirrorSnapshot           cachedMirror;
     std::shared_ptr<render::DocMesh>  cachedDocMesh;
+    // Coalesce authoritative catch-up requests for a response superseded while this tab was parked.
+    bool                              opsCatchupPending = false;
+    bool                              opsCatchupNeeded = false;
+    bool                              opsCatchupUncertain = false;
+    uint64_t                          opsCatchupSerial = 0;
 
     DocSession();
     ~DocSession();
@@ -422,7 +453,11 @@ struct DocSession {
 };
 
 // ---------------- worker job ----------------
-struct AgentEvent;  // defined later (richer chat model)
+// Immutable parsed progress crosses threads; notes is the compact status line.
+struct AgentEvent {
+    std::string kind, notes;
+    std::shared_ptr<const nlohmann::json> data;
+};
 
 // JobState is intrinsically non-copyable (std::mutex + std::atomic members) — it MUST always be
 // held by std::shared_ptr<JobState> (never copied/moved). AppState::runs keys one JobState per
@@ -444,7 +479,7 @@ struct JobState {
     // so closing/switching a document tab or switching sessions never drops or misdelivers it.
     std::string convId;
     std::string docKey;
-    // Active agent_run_v2 / mission run_id (from run_started event or result). Used by
+    // Active agent run_id (from run_started event or result). Used by
     // requestStopRun → agent_cancel so Stop aborts the in-flight provider call.
     std::string runId;
     std::string provider;            // launched provider; browser controls never use the current picker
@@ -458,42 +493,28 @@ struct JobState {
     // Provider/loop failure detail (HTTP body excerpt, auth message, etc.). Prefer this over
     // a bare stopReason when composing the chat error card — empty on clean finishes.
     std::string errorDetail;
-    // The short actionable sentence core/agent derives from the SAME failure
+    // The short actionable sentence derived from the SAME failure
     // (humanize_provider_error) — e.g. "Provider not signed in. Open Settings > AI > Accounts."
     // Carried ALONGSIDE errorDetail, never as a fallback for it: errorDetail is the raw
     // supporting text, this is the headline the error card leads with.
     std::string errorHuman;
-    // WS3: a true-assembly design run builds the parts in their own docs and saves a fresh
-    // assembly .step+ rather than mutating the active doc. createdDocPath is that file (absolute);
-    // the drain opens it as a NEW tab via the requestOpenPath pump (assembly opens route to Python).
-    std::string createdDocPath;       // non-empty => open this file as a new tab on success
-    // W17: the agent answered a "make a drawing of this part" request by building a 2D drawing
-    // (a dwg-cpp registry id, NOT a doc_* doc). The drain opens it as a Drawing tab via
-    // adoptDrawingTab — the active part doc was NOT mutated (so the doc_rebuild is skipped).
-    std::string drawingDocId;         // non-empty => adopt this drawing as a new tab on success
-    std::string drawingName;          // display name for the drawing tab
-    std::string drawingSourceId;      // the source part doc the drawing projects from
-    // CAM: the run built a machining job (its own cam doc id) from the current part. The drain
-    // loads it into the Manufacture workspace panel; the active part doc was NOT mutated.
-    std::string camDocId;             // non-empty => load this CAM job into the panel on success
-    // Part-naming stage (ex-memory): AI-chosen display name for the built part. Set from the
-    // streamed part_named event and/or the agent_run result's part_name field. The GL drain uses
-    // it to refresh the tab title and auto-save <name>.step+ into the workspace.
+    // Part-naming stage: AI-chosen display name for the built part, set from the streamed
+    // part_named event. The GL drain uses it to refresh the tab title.
     std::string partName;
-    // File-first persistence: the core agent saved the part itself (at modeling start +
-    // milestone re-saves + memory-stage rename) and reports the final path in the run
-    // result's saved_path. Non-empty => the drain saves onto THIS path instead of
-    // unique-ifying a duplicate <name>_2.step+ next to the agent's file.
-    std::string savedPath;
-    // Final doc revision from a successful agent_run_v2 result. Host autosave gates on
-    // partName set AND finalRevision > 0 so a zero-progress / no_geometry run never writes.
+    std::string runDocId;
+    // Final doc revision from a successful agent result; the drain skips the mesh refetch when
+    // the committed mesh is already at this revision.
     int finalRevision = 0;
     // Mission orchestrator: a multi-capability run (design -> CFD -> verdict). isMission marks the
     // job so the drain uses missionVerdict (the report stage's prose) as the final chat bubble
-    // instead of the generic design summary; createdDocPath still carries any assembly tab to open.
+    // instead of the generic design summary.
     bool isMission = false;
     std::string missionVerdict;       // the report/verdict prose to show as the assistant reply
-    // General-agent lane (core/agent/run.cpp pre-flight): the turn ran tools over
+    // Manual context maintenance shares turn transport/Stop, but never produces CAD or a plan.
+    bool isCompaction = false;
+    nlohmann::json compactionTurn;  // authoritative turn envelope (method/token counts/session link)
+    std::string compactionCommand;  // the typed /compact line, returned to the composer on failure
+    // General-agent lane: the turn ran tools over
     // files/PLM/packs and never entered the geometry pipeline, so ITS handoff is the
     // only truthful reply. Non-empty => the drain prints this instead of the built-
     // geometry boilerplate, which otherwise claimed parametric features for a run
@@ -514,7 +535,7 @@ struct JobState {
     // reason/verdict, ...} so the drain can seed ChatMsg plan section + card chrome.
     std::string planReadyJson;
     std::mutex evMtx;
-    std::vector<AgentEvent> events;  // streamed agent progress, drained on the main thread
+    std::deque<AgentEvent> events;  // streamed progress, time-sliced on the main thread
 };
 
 // safe JSON accessors: tolerate missing keys AND explicit null (Python None) values.
@@ -614,32 +635,6 @@ enum SteerState {
     STEER_FAILED = 5,     // never reached the agent (run ended / transport error)
 };
 
-// ---------------- pre-flight clarify gate ----------------
-// Before a Design run, agent_clarify_v1 returns the build-critical questions (or ready=true).
-// One ClarifyQ per question; `answer` is the editable buffer shown in the inline clarify card,
-// seeded with `suggested` so the user can accept a default with one click.
-// Extended 2026-07-16 for interaction-contract kinds (choice multi/single, geometry_select).
-struct ClarifyQ {
-    std::string key, ask, unit, suggested;
-    std::vector<char> answer{std::vector<char>(256, 0)};
-    // interaction/1 kind: "text" | "dimension" | "choice" | "approval" | "geometry_select" | …
-    std::string kind = "text";
-    bool multi = false;                         // choice / geometry_select multi-select
-    std::vector<std::pair<std::string, std::string>> options;  // choice: (value, label)
-    std::vector<std::string> targets;           // geometry_select targets
-    std::vector<std::string> selectedValues;    // multi-choice selected values OR geometry ids
-    std::string selectedKind;                   // geometry: face|edge|feature|…
-    bool pickArmed = false;                     // geometry_select: context-cube armed for this Q
-};
-struct ClarifyState {
-    bool awaiting = false;   // clarify RPC in flight — the turn shows "working out what I need..."
-    bool active = false;     // questions are shown; waiting for the user to fill them + Build
-    std::string request;     // the original user request, launched once answered/skipped
-    std::vector<ClarifyQ> questions;
-    std::vector<std::string> assumptions;
-    int geometryPickQ = -1;  // index of ClarifyQ currently armed for viewport geometry pick (-1=none)
-};
-
 // ---------------- transparent activity timeline ----------------
 // One row in an assistant turn's activity timeline — a plain-language summary of one thing the
 // model did (an orchestrator stage / tool action), expandable to reveal the raw thoughts/output
@@ -664,7 +659,8 @@ struct ActivityItem {
     //     deltas arrive, collapsed-by-default once complete (M13);
     // 3 = tool call row (agent.tool_call): title=tool_name, reason=target ("what it acts on"),
     //     durationMs=latency_ms, status=done|fail from `ok` (M14).
-    // 4–8 = corporate org cards (see copilot/feed.cpp feedCorporateEvent).
+    // 4-6 and 8 are retired corporate rows; 7 also had a corporate meaning, but remains
+    // the inter-agent message line when stage is "msg:<channel>:<id>".
     // 9 = provider_call log row (aggregated, not drawn inline).
     // 10 = routing / classification card.
     // 11 = swarm_wave header (wave N/M + task titles/status).
@@ -676,6 +672,8 @@ struct ActivityItem {
     // 17 = sub_run compact card (purpose + status).
     // 18 = plan-section position marker; 19 = delegation card.
     // 20 = ask_user question-card position marker (stage "__ask__:<batch_id>").
+    // 21 = provider-request usage line (agent.usage, stage "usage:<id>"): detail is compact
+    //      JSON {in, out, cache_read, cache_write, ttft_ms, duration_ms, elapsed_ms, model}.
     int rowKind = 0;
     int ctxTokens = 0;      // rowKind 1: best-effort injected-token estimate (kept out of the
                             // turn's usage footer — it is not model I/O)
@@ -686,6 +684,17 @@ struct ActivityItem {
     double startedTs = 0.0;   // GUI-only, not persisted: epoch s this row last entered
                               // "running" — the live elapsed readout on long sub-runs
                               // (context compaction, sub-agents)
+    uint64_t revision = 0;   // GUI-only content revision, bumped by the event-fold seam.
+    // Wall clock (epoch s) the event itself happened, when the runtime stamps it: an
+    // inter-agent message's send time, a usage line's request start. Persisted; 0 = unknown.
+    double eventTs = 0.0;
+
+    // Old sessions can contain retired corporate cards. Do not confuse their former
+    // rowKind 7 with the still-supported inter-agent message line.
+    bool isRetiredCorporateRow() const {
+        return rowKind >= 4 && rowKind <= 8 &&
+               !(rowKind == 7 && stage.rfind("msg:", 0) == 0);
+    }
 };
 
 // Wall-clock epoch seconds (UTC) — stamps ChatMsg send/receive times at construction.
@@ -699,6 +708,7 @@ struct ChatMsg {
     double ts = chatNowEpoch();    // send/receive time (epoch s); 0 = legacy/unknown (no age label)
     std::string text;              // user prompt, or the assistant's final summary
     bool running = false;          // assistant turn still streaming
+    bool compactionRun = false;    // persisted maintenance activity/notice, not an answer turn
     // Assistant turn closed early because the user steered the run: the SAME run continues in
     // the next assistant message, below the steer. Its empty text is not an empty turn.
     bool steerSplit = false;
@@ -710,7 +720,7 @@ struct ChatMsg {
     int errKind = ERR_NONE;        // ERR_CAD = generated code didn't build (calm, amber);
                                    // ERR_SYSTEM = app/runtime/provider failure (red)
     // Error card fields (errKind != ERR_NONE). errorHuman is the short actionable sentence
-    // core/agent emits as error_human — rendered as the card HEADLINE. errorFull is the
+    // the run reports as error_human — rendered as the card HEADLINE. errorFull is the
     // untruncated raw failure text (the drain keeps the whole thing; only the prose in `text`
     // is shortened), shown in a code box behind the "Error details" chip.
     std::string errorHuman;
@@ -724,7 +734,6 @@ struct ChatMsg {
     std::vector<ActivityItem> activity;  // transparent "what the AI is doing" timeline (orchestrator)
     int curMissionTask = -1;       // index of the mission task currently running (-1 = not a mission);
                                    // namespaces sub-run stage keys so per-task stages don't collide
-    ClarifyState clarify;          // pre-flight clarify gate (Agent/Design) — see ClarifyState
     // User-facing plan approve gate: ONLY manual Plan mode (plan_only) or advisor escalate
     // (stop_reason needs_user_decision). Agent/Edit/Swarm/EngFirm agent-decided plans are
     // advisor-approved in-core — no card. Cleared on execute / edit-plan / cancel.
@@ -764,6 +773,8 @@ struct ChatMsg {
     std::vector<core::ContextRef> contextRefs;
     // User message: exact image paths sent to the model, never reconstructed from basenames.
     std::vector<std::string> imagePaths;
+    uint64_t revision = 0;   // GUI-only; invalidates transcript and persistence caches.
+    size_t uiActivityDirtyFrom = 0;  // first row requiring timeline-cache refresh
 };
 
 // Fold one streamed orchestrator event (kind = stage_started / agent_output / stage_result /
@@ -792,6 +803,20 @@ bool setSteerState(std::vector<ChatMsg>& msgs, const std::string& steerId, int s
 // The run ended: steers it never confirmed (SENDING/QUEUED) are now FAILED. Returns true if
 // any changed. A Stop's withdrawn steers are CARRIED by the cancel response instead.
 bool settleOpenSteers(std::vector<ChatMsg>& msgs);
+// A steer still on its way to the agent (SENDING/QUEUED). Its bubble is not part of the
+// transcript yet: the copilot pins it under the live turn until the agent reads it, and only a
+// read (or a duplicate / failure outcome) moves it into the transcript.
+inline bool isPendingSteer(const ChatMsg& m) {
+    return m.fromUser && !m.steerId.empty() &&
+           (m.steerState == STEER_SENDING || m.steerState == STEER_QUEUED);
+}
+// Index of the first message of the trailing run of pending steers (msgs.size() when there is
+// none). Everything before it is transcript; the run itself belongs to the pinned stack.
+inline size_t pendingSteerTail(const std::vector<ChatMsg>& msgs) {
+    size_t i = msgs.size();
+    while (i > 0 && isPendingSteer(msgs[i - 1])) --i;
+    return i;
+}
 
 // Resolve the LIVE message vector a conversation's ChatMsgs currently live in: AppState::chat if
 // convId is the currently VIEWED conversation, else that resident Conversation's parked msgs.
@@ -800,19 +825,6 @@ bool settleOpenSteers(std::vector<ChatMsg>& msgs);
 // completion handling (app.cpp, engine_events.cpp) to route a run's output to ITS OWN bound
 // conversation by id, never by scanning whichever conversation happens to be on screen.
 std::vector<ChatMsg>* conversationMsgs(AppState& st, const std::string& convId);
-
-// A conversation tail that a REVERT moved out of the way. Reverting is destructive by
-// nature — it rewinds the chat to an earlier point — so the discarded messages are not
-// deleted, they are parked here and persisted with the session. A mis-aimed revert is
-// therefore always recoverable, which is the whole point of being able to revert "to any
-// point": the operation must not itself be the thing that loses work.
-struct ChatBranch {
-    std::string id;                 // stable id ("b1", "b2", …) for the session file
-    std::string label;              // human line, e.g. "reverted to message 12"
-    double when = 0.0;              // epoch seconds the revert happened
-    int fromMsgIdx = -1;            // index the chat was rewound to
-    std::vector<ChatMsg> msgs;      // the discarded tail, in original order
-};
 
 // One copilot conversation = its own tab. RESIDENT: every conversation loaded this process stays
 // in AppState::conversations for the app's lifetime — sessions are FIRST-CLASS, independent of
@@ -835,25 +847,23 @@ struct Conversation {
     // Empty = a legacy session shown only in Unassigned or All projects.
     std::string projectDir;
     std::vector<ChatMsg> msgs;      // populated only while INACTIVE (active lives in AppState::chat)
-    int lastContextTokens = 0;     // per-session context meter (input tokens from last model call)
+    int lastContextTokens = 0;     // same encoded per-session context value as AppState below
+    int lastContextWindow = 0;
+    std::string lastContextWindowSource;
+    // Runtime view state is parked with the conversation, never borrowed by another chat.
+    std::string viewStatus = "Ready.";
+    int viewStatusKind = 0;
+    std::string viewLivePhase;
+    std::string viewAgentV2Status;
     std::vector<std::string> queuedPrompts;  // queued while this session's turn was active
     std::vector<nlohmann::json> queuedPromptDrafts; // attachment/context snapshots aligned with queuedPrompts
     // Archived sessions are hidden from the default Sessions list (Show archived toggle
     // reveals them) but keep their transcript/history — a soft "trash" before real deletion.
     bool archived = false;
-    // Tails moved aside by reverts, newest last. Persisted with the session so a revert
-    // stays undoable across restarts; never written to by anything except the revert path.
-    std::vector<ChatBranch> branches;
+    mutable std::string projectKeySource, projectKeyCache;
 };
 
 
-// A progress event streamed from the worker (parsed off the worker thread, applied on the
-// main/GL thread). kind = "orch_" + the run event's kind; text = the raw event JSON; notes = the
-// compact status-line summary (jobs.cpp / engine_events.cpp).
-struct AgentEvent {
-    std::string kind;
-    std::string text, notes;
-};
 
 // A small pill button that highlights when its section is expanded.
 bool toggleChip(const char* label, bool active);
@@ -871,8 +881,7 @@ void drawProseBox(const char* id, const std::string& text, float maxH, bool grow
 void drawFitReadout(const FitReport& fit, bool detailed);
 
 // Multi-shape Plan / Objectives section (tiles + todos tree + subagents).
-void drawPlanSection(const PlanState& plan, const std::vector<ActivityItem>& activity,
-                     const ui::Fonts& fonts);
+void drawPlanSection(const ChatMsg& m, const ui::Fonts& fonts);
 
 // Manufacture operator surface owns only presentation/request state. Authoritative
 // device/run/approval state lives in ui::MfgMirror and the hostd manufacturing lane.
@@ -920,7 +929,7 @@ struct AppState {
     bool treeShotDone = false; // guard so doc smoke runs exactly once
     bool wantEquations = false;   // CHUDWARE_SHOT=equations: open the Equations editor + seed two globals
     bool equationsShotDone = false; // guard so the equations seed runs exactly once
-    bool wantPartsShot = false;   // CHUDWARE_SHOT=parts: Parts Library with a seeded no-model result (RE-32)
+    bool wantPartsShot = false;   // CHUDWARE_SHOT=parts: capture real catalog browse
     // CHUDWARE_SHOT=*: the workspace the scenario selected, re-asserted every frame while
     // the capture runs. Startup doc restore calls activateTab, which pulls any workspace
     // that cannot host a 3D part back to Model (core/doc_tabs.cpp) — so a full-body
@@ -933,6 +942,8 @@ struct AppState {
     // ---- ECAD document (worker ecad_* RPCs; the editor mirror lives in ecad_panel.cpp) ----
     std::string ecadDocId;          // open ECAD doc id ("" = none)
     int         ecadRevision = -1;  // last known ECAD revision (optimistic-concurrency base)
+    nlohmann::json ecadKicadStatus; // cached async installation probe
+    bool        ecadKicadStatusKnown = false;
     bool        wantEcad = false;   // CHUDWARE_SHOT=ecad scripted scenario
     bool        ecadShotDone = false;
     int         wantFocusViewport = 0;      // frames to keep forcing the 3D Viewport tab forward
@@ -942,20 +953,18 @@ struct AppState {
     bool        ecadAiGo = false;           // one-shot: run ecad_design(ecadAiRequest) this frame
     bool        ecadAiBoardGo = false;      // one-shot: AI-design a schematic, then create+populate+
                                             // outline+autoroute a board from it (reuses ecadAiRequest)
-    int         ecadTool = 0;               // ECAD canvas tool: 0=Select 1=Place 2=Route
-    nlohmann::json ecadPendingOps;          // ops the ECAD canvas wants applied (place/route clicks)
-    bool        ecadOpsGo = false;          // one-shot: apply ecadPendingOps via ecad_apply_ops
     // Native simulator (ecad_simulate): the last result payload + a one-shot run trigger. The plot
     // panel in ecad_panel.cpp renders ecadSimResults when non-empty (transient waveforms / AC bode).
     nlohmann::json ecadSimResults;          // results object from the last ecad_simulate ({op,tran,ac,log})
     bool        ecadSimGo = false;          // one-shot: run ecadSimulate(st) this frame
     int         ecadSimAnalysis = 0;        // 0 = Transient, 1 = AC
-    bool        ecadUndoGo = false;         // one-shot: run ecadUndo(st) this frame (ecad_undo RPC)
-    bool        ecadRedoGo = false;         // one-shot: run ecadRedo(st) this frame (ecad_redo RPC)
-    // One-shot ECAD command the 2D panel wants dispatched through the same handler the ribbon uses
-    // (ecadDispatch in app.cpp): e.g. "sch_annotate", "pcb_update_from_sch". "" = nothing pending.
+    std::string ecadSimRequestedDocId;
+    int         ecadSimRequestedAnalysis = 0;
+    // One-shot project hub command routed through ecadDispatch in app.cpp.
     // Lets panel-owned toolbar buttons fire the exact ribbon actions without duplicating logic.
     std::string ecadPanelCmd;
+    std::string ecadPanelDocId;             // document at the instant a hub action was clicked
+    int         ecadPanelSimAnalysis = 0;
 
     // ---- document tabs (SolidWorks/browser-style multi-document) ----
     // The worker already keeps every open document alive in its registry (keyed by doc_id); the
@@ -979,7 +988,14 @@ struct AppState {
         std::string docId;          // worker doc id (registry key) — empty for Drawing/ECAD tabs
         std::string title;          // display name (doc "name", "Part1"/"Assembly1")
         bool        isAssembly = false;
-        bool        dirty = false;  // edits since last save (asterisk on the tab)
+        bool        dirty = false;  // outstanding human edits (asterisk on the tab)
+        int         lastHumanEditRevision = -1;
+        int         lastHumanMetadataRevision = -1;
+        uint64_t    humanEditGeneration = 0;
+        bool        diskConflict = false;
+        bool        overwriteDiskConflict = false;
+        nlohmann::json diskConflictStamp;
+        std::string conflictPath;  // legacy handoff snapshot; empty for a bound-file conflict
         // The blank "example" document the app offers on launch (the Welcome chooser's New Part /
         // New Assembly). It is disposable: opening a real file silently discards it (see
         // dropBlankStarterTabs) UNLESS the user touched it (then `dirty` is set and it is kept). A
@@ -989,20 +1005,19 @@ struct AppState {
         // Project folder that was active (convProjectDir) when this tab was first opened. Scopes
         // never-saved agent docs in the AI workspace; a saved doc is scoped by `path` instead.
         std::string projectDir;
+        // Display tessellation tier the engine doc is known to be at ("fine" = engine default for a
+        // new doc). syncDisplayQuality() pushes Settings::displayQuality to every tab that differs,
+        // so the persisted choice also applies to docs opened after launch.
+        std::string displayQualityApplied = "fine";
 
-        // Live MCP handoff mirror: this tab shows the part the external Chudware MCP engine is
-        // building (pollAiCadHandoff opens it from %APPDATA%\Chudware\handoff\live.step+ and refreshes
-        // it in place as the AI works). It is a READ-ONLY view of another process's doc — the user's
-        // own tabs are never the handoff. Flagged so the refresh can find it without path-matching,
-        // label it clearly, and avoid stealing focus / yanking an in-progress edit.
+        // A live mirror of a document explicitly presented by another client.
+        // The legacy poller refreshes native handoff files; hostd pushes shared
+        // document revisions. User-opened documents are not handoff mirrors.
         bool        aiHandoff = false;
-        // When aiHandoff is set, which MCP doc_id this mirror tab tracks. The poller keeps ONE tab
-        // per doc_id, so an AI agent opening several parts leaves them all open side by side. Empty
-        // for the legacy single-mirror path (older handoffs that only publish live.json).
+        // The MCP doc_id tracked by a legacy mirror (empty for live.json).
+        // Daemon mirrors use the same id as docId.
         std::string handoffDocId;
-        // The advertised part NAME for this mirror (from docs.json). Lets the poller collapse two
-        // mirror tabs that are the SAME part re-created under different doc_ids (the duplicate-tab
-        // bug) even when the doc_id key differs. Empty for legacy/unnamed handoffs.
+        // Advertised display name from the legacy handoff.
         std::string handoffName;
         // An AI subagent has edited this part since the user last looked at it (it is NOT the active
         // tab). The tab strip renders an animated, pulsating glow around such tabs so a swarm working
@@ -1014,18 +1029,10 @@ struct AppState {
         // event for kAgentEditPulseTimeoutS, so a finished/idle agent stops glowing on its own.
         // Timestamp-based (not a countdown timer) so nothing stacks or drifts across sleeps.
         std::chrono::steady_clock::time_point lastAgentEditAt{};
-        // Agent edit lock (issue #55 interim): steady-clock time of the last revision of this doc
-        // written by a NON-gui client (an in-app agent, its sub-agents, an external MCP agent),
-        // stamped for active and background tabs alike. Epoch = never. See docLockedByAgent.
-        std::chrono::steady_clock::time_point lastForeignWriteAt{};
         // A pushed foreign revision invalidated this tab's immutable mesh cache. The background
         // parser clears it after prewarming the matching revision; switchToTab never binds while set.
         bool        meshCacheInvalidated = false;
-        // Ownership: the user ADOPTED this AI mirror tab by editing it (first edit flips it via
-        // markActiveTabDirty). An adopted doc becomes user-owned — it is never auto-closed when
-        // the agent finishes, IS included in the unsaved-work quit warning, and drops the "AI:"
-        // label prefix. The agent keeps co-editing the same live doc (existing multi-writer CAS).
-        // Set once, never cleared (survives save). Meaningless unless aiHandoff.
+        // An AI handoff is adopted on its first human edit; presentation alone does not adopt it.
         bool        userAdopted = false;
         // The agent that was building this mirror has FINISHED (daemon sent doc.closed with
         // reason "last_writer_detached" — hostd emits it at the end of EVERY turn, so this is
@@ -1150,6 +1157,14 @@ struct AppState {
         // full layout lives in ecad_panel.cpp; lazily created on first activation of the tab.
         std::string ecadDocId;                  // worker ecad doc id (NOT a doc_* id) — ECAD tabs
         int         ecadRevision = -1;          // last known ECAD revision for this doc
+        std::string ecadProjectPath;             // companion .kicad_pro, when present
+        std::string ecadProjectSchPath;
+        std::string ecadProjectPcbPath;
+        bool        ecadFileChanged = false;
+        bool        ecadSessionDirty = false;
+        bool        ecadKicadLocked = false;
+        nlohmann::json ecadSimResults;
+        int         ecadSimAnalysis = 0;
         std::shared_ptr<ui::EcadEditorState> ecadState;  // per-document ECAD editor state
     };
     std::vector<DocTab> docTabs;
@@ -1181,10 +1196,8 @@ struct AppState {
     // no-pending-call case clears it the very next frame.
     std::vector<std::shared_ptr<DocSession>> retiredSessions;
     void sweepRetiredSessions();
-    // While true, the DocMirror listener does NOT mark the active tab dirty. Set around a tab
-    // switch / resync / fresh-doc activation (those fire the mirror's listener via doc_rebuild but
-    // are not user edits, so they must not light the unsaved-changes marker).
-    bool suppressTabDirty = false;
+    // Human mutations are keyed by stable document identity, including parked drawings.
+    std::unordered_map<std::string, unsigned> pendingHumanMutations;
     // While true, applyOpenedDoc stays SILENT (no "Opened …" / "Restored drawings" toast). Set only
     // around the live MCP-handoff refresh (pollAiCadHandoff reopens the mirror on every AI build
     // step) so watching the AI build doesn't spam a toast per step. Cleared right after the open.
@@ -1204,6 +1217,17 @@ struct AppState {
     // worker — the caller already did doc_new/doc_open and the mirror points at it). Captures the
     // current doc id from docMirror.
     void addDocTab(bool isAssembly);
+    // Push Settings::displayQuality (doc_set_display_quality) to every open part/assembly doc that
+    // is not at it yet. Idempotent and cheap: call every frame; no-op until the worker is up.
+    void syncDisplayQuality();
+    // Startup: copy the persisted viewport/panel preferences (Settings::view*, panel*) into the live
+    // fields. Not called for screenshot/automation runs, which need the built-in defaults.
+    void seedViewPrefsFromSettings();
+    // Every frame: when a USER-owned viewport toggle (display style, triad, ground shadow, RealView,
+    // drag mode) or modeless View-menu window (Design Table, Cut List, Equations) changed, mirror it
+    // into Settings and save. Ribbon / FeatureManager / AI panel / Viewport are persisted by the View
+    // menu itself, because other code legitimately forces those on or off. No-op in shot runs.
+    void persistViewPrefs();
     // Switch the active document to docTabs[idx]: safely exits any in-progress sketch/PM form,
     // saves the leaving tab's camera, re-points DocMirror at idx's doc (doc_activate → tree+mesh),
     // resets per-doc caches/selection/tree transients, reloads the mesh, restores idx's camera.
@@ -1228,29 +1252,33 @@ struct AppState {
     // opened so the blank example doesn't linger beside it. A starter the user edited (dirty) or
     // saved (has a path) is kept. No-op when there is no such tab.
     void dropBlankStarterTabs(int keepIdx);
-    // Discard the untouched auto-created "starter" document of the workspace being LEFT (an empty
-    // PCB1 on leaving Electronics, an untouched starter Part on leaving Model, etc.) so a blank
+    // Discard the untouched auto-created "starter" document of the workspace being LEFT (an
+    // untouched starter Part on leaving Model) so a blank
     // initial doc the user never added to doesn't linger. No-op unless the tab is isStarter && clean
     // && never-saved; never closes the last remaining tab (won't strand the user with zero docs).
     void discardWorkspaceStarter(Workspace leftWs);
-    // Mark the active tab dirty (on any mutation) / clear it (on save). Safe with no active tab.
-    void markActiveTabDirty();
-    void clearActiveTabDirty();
-    // Mark the ECAD (Schematic/PCB) tab carrying `ecadDocId` dirty. ECAD tabs aren't DocMirror-backed
-    // (their docId is empty), so they're matched by their ecad id, not the mirror. Honors
-    // suppressTabDirty. No-op if no such tab.
+    // CAD and drawing dirty state is attributed only to accepted human edits and
+    // cleared only by a save covering the last such revision.
+    void markHumanEdit(const std::string& docId, int revision);
+    void markSaved(const std::string& docId, int savedRevision, const std::string& path);
+    void applyHumanDirty(const std::string& docId, bool humanDirty);
+    void beginHumanMutation(const std::string& docId);
+    void endHumanMutation(const std::string& docId);
+    bool hasPendingHumanMutations(const std::string& docId = {}) const;
+    // ECAD uses a separate native session and revision stream.
     void markEcadTabDirty(const std::string& ecadDocId);
-    // Mark a Drawing tab dirty. A drawing is embedded in its source part's .step+, so its unsaved
-    // state is persisted by saving that part; the tab still carries its own marker so closing it
-    // warns. Honors suppressTabDirty. No-op if idx isn't a Drawing tab.
-    void markDrawingTabDirty(int idx);
-    // Clear the dirty marker on every Drawing tab embedded in source part `sourceDocId` — call after
-    // that part is saved (doc_save embeds all of its open drawings). No-op if none match.
-    void clearDrawingDirtyForSource(const std::string& sourceDocId);
     // Refresh the active tab's cached title from the current doc tree (after a rename, etc.).
     void syncActiveTabTitle();
     // Index of the tab whose docId matches the mirror's current doc, or -1.
     int  tabIndexForActiveDoc() const;
+    // True only when the selected mechanical tab owns the live mirror.
+    bool isActiveMirrorDoc() const;
+    // Reconcile a successfully admitted ops response with its tab's immutable cache.
+    void adoptCurrentOpsResponse(const core::OpsResponse& response, bool revisionChanged);
+    // Park a newer tree-only response without pairing it with an older mesh.
+    void parkInactiveMirrorTree();
+    // Recover an obsolete mutation from the authoritative worker, without using its stale payload.
+    void catchUpSupersededOps(const std::string& docId, int baseRevision);
 
     // ---- in-context component edit (SolidWorks "Edit Component"; app_state.cpp) ----
     // While editing a component's model in-context, the component's part-doc becomes the REAL ACTIVE
@@ -1269,9 +1297,8 @@ struct AppState {
     // switch path. sourceAbsPath must already be resolved to an absolute on-disk .step+ (the caller
     // owns resolveComponentPath). No-op if already in a component edit or sourceAbsPath is empty.
     void enterComponentEdit(const std::string& componentId, const std::string& sourceAbsPath);
-    // Exit component-edit: switch the active doc back to the assembly (its cached mesh/revision via the
-    // same cached switch path — the assembly re-reads the edited component through the existing
-    // mtime-keyed component cache), clear the renderer ghost, and reset the context. No-op if inactive.
+    // Exit component-edit: save the component, then return to the assembly's
+    // live snapshot unless the user selected another tab in the meantime.
     void exitComponentEdit();
     bool inComponentEdit() const { return componentEdit.active; }
 
@@ -1346,6 +1373,7 @@ struct AppState {
     // it. kind is "sch" (Schematic) or "pcb" (PCB).
     void addEcadTab(const std::string& kind, const std::string& ecadDocId,
                     int ecadRevision, const std::string& title);
+    void syncEcadProjectFiles(const std::string& project);
 
     // ---- topology picking (C15) — id pass + overlays owned by run_gui; AppState borrows ----
     render::IdPass* idPass = nullptr;
@@ -1364,8 +1392,8 @@ struct AppState {
     std::string selectedFeatureId;
     bool treeScrollToSelection = false;  // one-shot: tree should scroll the selected row into view
 
-    // C26-C: per-face normal + centroid cache, filled during loadDocMesh while the DocMesh is in
-    // memory. Key = (body_id << 32) | face_id (matches PickHit body_id / topo_id exactly).
+    // Loader-derived per-face normal + centroid cache. Moved with the parsed mesh, never
+    // recomputed on the GL thread. Key = (body_id << 32) | face_id.
     // Value = {nx, ny, nz, cx, cy, cz} — area-weighted average face normal + face centroid (world).
     std::unordered_map<uint64_t, std::array<float, 6>> faceNormalCache;
 
@@ -1376,12 +1404,15 @@ struct AppState {
     std::unordered_map<uint64_t, std::array<float, 3>> edgeCentroidCache;
 
     // ---- W1-B (item 8): axis-aligned bounding-box caches for Zoom-to-Selection (Wave-2). ----
-    // Filled in loadDocMesh from the same DocMesh in memory. Plain float arrays keep memory sane.
+    // Computed on the loader thread from DocMesh. Plain float arrays keep memory sane.
     // bodyBBoxCache: key body_id -> {minX,minY,minZ, maxX,maxY,maxZ} (world).
     std::unordered_map<uint32_t, std::array<float, 6>> bodyBBoxCache;
     // faceBBoxCache: key (body_id<<32)|face_id -> {minX,minY,minZ, maxX,maxY,maxZ} (world), built
     // from each face's triangle range. Empty for faces with no triangles.
     std::unordered_map<uint64_t, std::array<float, 6>> faceBBoxCache;
+    // Return live analysis to its parked model before a tab switch or temporary overlay.
+    std::weak_ptr<render::DocMesh> docMeshAnalysisOwner;
+    void parkMeshAnalysis();
 
     // ---- Solid Bodies visibility (FeatureManager "Solid Bodies" folder hide/show) ----
     // Parallel arrays indexed by the renderer body slot (the order loadDocMesh feeds setMeshes,
@@ -1393,6 +1424,10 @@ struct AppState {
     // by-ordinal hides would land on the wrong body). clearViewportForNewDoc clears both.
     std::vector<uint8_t>  bodyVisible;
     std::vector<uint32_t> docBodyIds;
+    // Session-only assembly visibility overrides, keyed by component id.
+    std::unordered_map<std::string, bool> componentHiddenOverrides;
+    bool componentHidden(const std::string& id, bool documentHidden) const;
+    void setComponentHidden(const std::string& id, bool hidden);
     // FeatureManager per-feature eye toggle (the hide/show eye on every tree row). Holds the fids of
     // features hidden via the eye that DON'T own bodies (sketches, datums) — body-owning features
     // route their eye straight to bodyVisible instead. Consulted by the sketch-ghost renderer; per-doc
@@ -1455,13 +1490,14 @@ struct AppState {
     std::vector<char> spBuf{std::vector<char>(16384, 0)};
 
     // ---- console log ----
-    // C39/stop-crash: guarded by logMtx — the worker errorSink calls addLog() from background
-    // threads (jobs.cpp agent run thread, the AgentControlChannel cancel worker, AsyncRpc
-    // dispatch) while drawConsoleBody iterates it on the GL thread. addLog() and the console
-    // reader both take the lock; a bare push_back racing the render loop corrupted the heap
-    // (intermittent SIGABRT on Stop).
+    // Background worker error sinks append under this lock; the console renders only
+    // visible entries while holding it. Head is the oldest entry, not the next write slot.
+    static constexpr size_t kLogCapacity = 500;
     std::mutex logMtx;
-    std::vector<std::string> log;
+    std::array<std::string, kLogCapacity> log;
+    std::array<size_t, kLogCapacity> logLineCounts{};
+    size_t logHead = 0, logSize = 0;
+    uint64_t logGeneration = 0;
 
     // ---- runtime + worker ----
     WorkerClient worker;
@@ -1469,6 +1505,11 @@ struct AppState {
     // FIRST (joins its thread before the client goes away). run_gui also shuts it down
     // explicitly before worker.stop() so teardown never waits out an RPC timeout.
     core::AsyncRpc rpc{worker};
+    // Interactive provider sign-in (omp_login) only. One call carries a whole browser OAuth flow
+    // and can take minutes; on `rpc`'s single FIFO it parked every other RPC — provider polls,
+    // document calls — until the user finished or the flow timed out. Same contract as `rpc`
+    // (GL-thread call/drain, shutdown before worker.stop()); its calls ride their own socket.
+    core::AsyncRpc authRpc{worker};
     std::string werr;
     bool workerStarted = false;
     std::atomic<bool> setupRunning{false}, setupDone{false}, setupOk{false};
@@ -1486,10 +1527,17 @@ struct AppState {
     bool autoSetupTried = false;    // guard so startup auto-heal runs once, not in a loop
     bool importRepairTried = false; // guard so per-job ModuleNotFoundError repair runs once
     bool starterTried = false;      // guard so the launch default-part creation runs once
-    // ITEM 15: deferred engine bootstrap. When true, tryStartWorker has not yet run on the
-    // interactive path — the first frames paint chrome, then the frame loop boots the kernel.
-    // Shot/scenario mode still boots synchronously before the loop (deterministic captures).
+    // Worker spawn/hello and fallback core loading run off the GL thread. Pending
+    // includes both deferred launch and an in-flight boot; completion is applied
+    // by pollWorkerStartup() on the GUI thread.
     bool workerBootPending = false;
+#ifndef __EMSCRIPTEN__
+    struct WorkerBootResult {
+        bool started = false, daemonBackend = false, coreLoaded = false;
+        std::string workerError, coreError;
+    };
+    std::future<WorkerBootResult> workerBoot;
+#endif
     // Human-readable stage for the left status-bar loading chip during startup/warmup
     // (e.g. "Starting engine…", "Warming up kernel…", "Opening starter part…"). Cleared
     // once the app is interactive (worker ready + starter settled / no boot pending).
@@ -1510,29 +1558,14 @@ struct AppState {
     std::shared_ptr<JobState> activeRun();
     // nullptr if no run slot exists yet for convId (never creates one) — for read-only checks.
     JobState* runIfExists(const std::string& convId);
-    // True if ANY conversation's run has running==true — for doc-mutation/global gates (undo,
-    // file open/save, provider switch) that must never race ANY in-flight run, not just the
-    // viewed one's.
+    // True if any conversation has an active run, for run lifecycle and
+    // application-wide status; it is not document-edit custody.
     bool anyRunActive() const;
+    // True if any running run can edit documents: a manual compaction run cannot.
+    bool anyEditingRunActive() const;
     // True if THAT SPECIFIC conversation's run is running — for Send/Stop/busy UI scoped to
     // whichever conversation is on screen, so an unrelated background run never blocks it.
     bool convRunning(const std::string& convId) const;
-    // Agent edit lock (interim fix for issue #55: a cancelled human sketch/PM/drag doc_revert
-    // discarded agent edits made during the session). While an agent is editing a document the
-    // human's editing controls for THAT document are locked: it is locked once an agent wrote it
-    // (DocTab::lastForeignWriteAt) and stays locked while any in-app run that was live at that
-    // write is still running, or for kAgentLockGraceS after the last agent write (external
-    // agents, writes landing as a run ends). Docs the agent never wrote stay editable. Every
-    // human mutation path checks this; open human sessions on a newly locked doc exit keeping
-    // their work (never doc_revert).
-    static constexpr double kAgentLockGraceS = 8.0;
-    bool docLockedByAgent(const std::string& docId) const;
-    bool activeDocLockedByAgent() const;
-    // "" when `docId` is not locked; otherwise one sentence for toasts / disabled tooltips.
-    std::string agentLockReason(const std::string& docId) const;
-    // Last frame on which no run was active (maintained per frame by engine_events); a foreign
-    // write stamped at or after it happened during the current run(s).
-    std::chrono::steady_clock::time_point runsIdleAt{};
     // The id of the currently viewed conversation, or "" if none (activeConv invalid).
     std::string activeConvId() const;
     std::vector<char> code{std::vector<char>(64 * 1024, 0)};
@@ -1561,7 +1594,7 @@ struct AppState {
     // ---- model picker availability (filled by the agent_list_models probe) ----
     ProviderModels providerModels[ui::PROV_COUNT];  // indexed by ui::ProviderIndex
     std::atomic<bool> modelProbeInFlight{false};
-    // Provider ids currently signed in through Chudcode, populated by the Settings poll.
+    // Provider ids currently available through OMP, populated by the Settings poll.
     // The composer uses this to hide catalog rows for accounts the user has not connected.
     // Runtime-only (not persisted).
     std::set<std::string> signedInBridgeProviders;
@@ -1597,6 +1630,8 @@ struct AppState {
     // Mesh loader generation — bumped on every loadDocMeshAsync; drain drops
     // completions whose gen != meshGen_ (latest-wins; keep-last-good on screen meanwhile).
     std::atomic<uint64_t> meshGen_{0};
+    std::string committedMeshDocId;
+    int committedMeshRevision = -1;
     std::string buildErrSummary;  // last "Build code" failure, shown under the editor
     std::string buildErrFull;     // its full traceback, behind a Details toggle
     bool showBuildErr = false;
@@ -1682,7 +1717,7 @@ struct AppState {
     bool showRealView     = true;    // C30-C: procedural environment reflections (RealView sheen)
     // Viewport left-drag mode: 0=rotate (default), 1=pan.
     int  vpDragMode = 0;
-    // One-shot flag: set by mouse_gestures right-click-without-drag hook; consumed by viewport_panel.
+    // One-shot viewport context-menu request, consumed by viewport_panel.
     bool wantContextMenu = false;
     bool layoutInit = false, resetLayout = false, openSettings = false;
     bool showViewport = true;
@@ -1753,8 +1788,9 @@ struct AppState {
     // Configurations as switchable tabs in one dock window. The PropertyManager auto-selects its
     // tab while a command form is active; closing the form returns to the FeatureManager tab.
     enum LeftPaneTab { LP_Explorer = 0, LP_FeatureManager = 1, LP_PropertyManager = 2,
-                       LP_Configurations = 3, LP_Simulation = 4 };
+                       LP_Configurations = 3, LP_Simulation = 4, LP_Changes = 6 };
     int leftPaneTab = LP_FeatureManager;
+    int simSidebarTab = 1;  // Simulate sidebar: 0 = Explorer, 1 = Simulation Manager
     // One-shot: the Simulate workspace's left rail switches to its Simulation Manager tab next
     // frame (it otherwise remembers the user's Explorer/Simulation choice). Set by commands that
     // open a study so the study is actually visible; layout.cpp consumes and clears it.
@@ -1796,6 +1832,7 @@ struct AppState {
     std::string legendTitle, legendUnits;  // legend widget labels for the active scalar
     bool legendOn = false;             // draw the viewport legend overlay
     float legendMin = 0.0f, legendMax = 1.0f;
+    float legendValueScale = 1.0f;     // raw scalar -> display units for a fixed-range field
     // Sim result rework: which named scalar chunk the overlay colormaps (von_mises / p1 / p3 /
     // max_shear / displacement_mag / disp_x|y|z / fos). loadDocMesh prefers this field by name so the
     // user can switch result fields with NO re-solve (just a renderOnly re-load of the cached overlay).
@@ -1811,7 +1848,7 @@ struct AppState {
     bool wantSimDisc = false;
     int  simDiscKind = 0;          // 0 = mech-only, 1 = with a PCB open
     bool simDiscShotDone = false;
-    bool wantCam = false;       // CHUDWARE_SHOT=cam: build a part, run the copilot CAM fast-path,
+    bool wantCam = false;       // CHUDWARE_SHOT=cam: build a part, build the CAM job (cam_program),
     bool camShotDone = false;   //   adopt the job into the Manufacture panel — runs exactly once
     bool wantFlow = false;      // CHUDWARE_SHOT=flow scripted external-flow (wind-tunnel) study scenario
     bool flowShotDone = false;  // guard so the flow scenario runs exactly once
@@ -1840,24 +1877,18 @@ struct AppState {
     bool asmShotDone = false;          // guard so the asm scenario runs once per shot
 
     // ---- C22b: prompt editor + orchestrator wiring ----
-    bool agentV2 = true;                    // "Use orchestrator (v2)" checkbox in Design panel
     std::string pendingPromptRole;          // when non-empty, Settings > Agents tab opens on this role
     // Live status line for the v2 orchestrator run, shown in the chat area
     std::string agentV2Status;              // e.g. "PLAN > planner attempt 1..."
-    bool agentV2Running = false;            // a v2 (job-based) run is in flight somewhere —
-                                             // global/cosmetic (viewport badge, Activity panel,
-                                             // doc-mutation guards); NOT a concurrency lock. See
-                                             // AppState::anyRunActive()/convRunning() for the real
-                                             // per-conversation/global run-state checks.
-    // Live context-meter telemetry. `lastContextTokens` is the most recent agent call's INPUT
-    // token count (how full the model's context is right now); `lastContextWindow` is the
-    // window the SERVER reported for the model that actually ran, which beats any client-side
-    // guess — the harness resolves it from the model catalog (services/agent/config.py sets
-    // provider.context_window), while the GUI can only pattern-match the model id. 0 means the
-    // server has not said yet, and the composer falls back to effectiveContextWindow().
-    // Both are fed from `agent.context` events and reset at run start.
+    bool agentV2Running = false;            // global run-state display (viewport / Activity)
+    // Live context-meter telemetry, owned by the conversation. A positive value is
+    // provider-anchored usage, 0 means no measurement, -1 means unknown after a
+    // compaction, INT_MIN means a measured zero, and other values <= -2 encode estimates.
+    // The encoding survives parking and persistence without recounting stale history.
+    // lastContextWindow is the reported capacity; 0 means it is not known yet.
     int lastContextTokens = 0;
     int lastContextWindow = 0;
+    std::string lastContextWindowSource;
     // --- end C22b ---
 
     // ---- Stop + message queue (modern agentic composer) ----
@@ -1888,7 +1919,7 @@ struct AppState {
     bool contextPickActive = false;
 
     // ---- C25: ribbon dispatch hook (set in app.cpp after the ribbon callback is wired) ----
-    // Allows UI widgets (shortcut bar, gesture wheel) to fire ribbon commands without
+    // Allows UI widgets (shortcut bar) to fire ribbon commands without
     // knowing about the full dispatcher capture.
     std::function<void(const char*)> ribbonDispatch;
 
@@ -2023,13 +2054,21 @@ struct AppState {
     bool wantQuitAgentConfirm = false; // raise the "agent work in progress" modal next frame
     bool quitAgentContinues   = false; // user chose Continue-in-background (diagnostic only)
     // Orphan recovery (daemon mode): set at bootstrap when the daemon reports retired docs from a
-    // previous session awaiting explicit recovery (recovery_list). >0 raises the "Recover unsaved
-    // parts?" modal next frame; the modal consumes it. "Later" just dismisses — the daemon keeps
-    // the entries, so the prompt returns on the next app start.
-    int recoveryPromptCount = 0;      // raise the orphan-recovery modal next frame (0 = none)
+    // previous session awaiting explicit recovery (recovery_list). Non-empty raises the "Recover
+    // unsaved parts?" modal next frame; the modal consumes it. "Later" just dismisses — the daemon
+    // keeps the entries, so the prompt returns on the next app start.
+    struct RecoveryEntry {
+        std::string id;    // orphan-tier entry id (recovery_open {id})
+        std::string name;  // the part's name when it was retired
+        bool humanDirty = false;
+        int revision = -1;
+        std::string path;
+    };
+    std::vector<RecoveryEntry> recoveryPrompt;  // raise the orphan-recovery modal next frame
     bool recoveryModalOpen = false;   // the orphan-recovery modal is currently showing (promoted
                                       // from a run_gui static so ensureStarterDoc can defer the
                                       // blank starter while the user is choosing recover/discard).
+    bool recoveryInFlight = false;    // "Recover" is reopening entries in the background
     // Web only: the shared daemon has connected AND its first bootstrap (doc-list mirror +
     // orphan-recovery check) has run. workerStarted is set synthetically at boot to unlock the UI,
     // so it is NOT a safe signal that daemon RPCs will succeed — gate boot-time daemon actions
@@ -2043,6 +2082,8 @@ struct AppState {
     void addLog(const std::string& s);
     void startSetup(bool force);
     void tryStartWorker();
+    bool pollWorkerStartup();
+    void waitWorkerStartup();
     void showPartMesh(int sel);
 
     // W1-B: post a transient toast. Trivially callable from any TU that includes app_state.h.
@@ -2081,8 +2122,8 @@ struct AppState {
     // without replacing the session's editable model cache; its GPU identity is not the part.
     bool loadDocMesh(const std::string& aicmPath, std::string& err, bool renderOnly = false,
                      bool cacheAsModel = true);
-    // Restore a session's immutable mirror + parsed tessellation and bind its cached renderer
-    // buffers. Rebuilds only the independent pick/overlay buffers; no worker or disk round-trip.
+    // Restore a session's mirror + parsed picking payload and bind cached renderer buffers.
+    // An evicted GPU mesh reloads its saved tessellation asynchronously, never re-resolves.
     bool bindCachedDocMesh(DocSession& session, std::string& err);
 
     // Non-blocking mesh load. Disk parse + pick-cache build run on a dedicated loader
@@ -2091,13 +2132,14 @@ struct AppState {
     // previous mesh stays on screen until a current completion commits. Safe to call from GL
     // thread; no-ops empty paths.
     void loadDocMeshAsync(const std::string& aicmPath, bool renderOnly = false,
-                          bool cacheAsModel = true);
+                          bool cacheAsModel = true, bool preserveSelection = false,
+                          bool deferWhileEditing = false);
     // Parse and upload an inactive document's pushed tessellation into its per-tab CPU/GPU cache
     // without disturbing the visible document. Newer revisions supersede queued older ones.
     void cacheBackgroundDocMeshAsync(const std::string& docId, int revision,
                                      const std::string& aicmPath);
     void drainMeshLoads();   // GL thread, once per frame
-    // Join the async mesh-loader thread (call once on run_gui teardown before exit).
+    // Join the loader and flush pending settings (run_gui teardown, before process exit).
     void stopMeshLoader();
     uint64_t meshGen() const { return meshGen_.load(); }
 

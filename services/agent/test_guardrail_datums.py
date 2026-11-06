@@ -1,9 +1,7 @@
 """The WI-15 ref guardrail must not block a datum the KERNEL resolves.
 
-This is a false-block regression, caught from a live Opus run. ``cad_guide('sketch')``
-states the sketch plane must be spelled ``"plane.top"`` / ``"plane.front"`` /
-``"plane.right"`` and that ``"XY"``/``"XZ"``/``"YZ"`` are rejected. A model obeyed
-that exactly and got:
+The kernel resolves reserved datum names, and the document tool normalizes common
+plane aliases before dispatch. The ref guard must accept both; a live run previously got:
 
     HARD guardrail: dangling feature/face refs — cannot apply. Missing: plane.top.
     Fix the refs (no waiver for kernel integrity). ... name datum planes front/top/right.
@@ -68,6 +66,17 @@ class TestReservedDatumsResolve:
         ops = [{"op": "add_feature", "type": "sketch",
                 "refs": {"plane": "plane.top"}}]
         assert check_refs_resolve_ids(ops, set(), set()) == []
+
+    @pytest.mark.parametrize("alias", [
+        "XY", "YX", "plane.xy", "plane_xy", "top_plane", "topplane",
+        "XZ", "ZX", "plane.xz", "plane_xz", "front_plane", "frontplane",
+        "YZ", "ZY", "plane.yz", "plane_yz", "right_plane", "rightplane", "side",
+    ])
+    def test_normalized_plane_aliases_resolve(self, alias):
+        ops = [{"op": "add_feature", "feature": {
+            "type": "sketch", "refs": {"plane": alias}}}]
+        assert check_refs_resolve_ids(ops, set(), set()) == []
+
 
     def test_a_genuinely_dangling_ref_is_still_blocked(self):
         """The guard must stay sharp — this is kernel integrity, not politeness."""

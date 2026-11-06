@@ -20,12 +20,12 @@ PREFERENCES = {
         ("copilot_mode", "plan_policy", "task_list", "destructive_approval")),
     "priority": Preference("auto", "Picks the model and thinking for each request.",
         ("auto", "best_results", "fastest", "lowest_cost"),
-        ("model", "thinking", "ladder", "council", "delegation_depth", "compaction", "roster_width")),
+        ("model", "thinking", "ladder", "delegation_depth", "compaction", "roster_width")),
     "location": Preference("cloud", "This computer only keeps technical data on this PC.",
         ("cloud", "this_computer_only"),
         ("offline_mode", "compliance_mode", "provider_filter", "vision_routing", "private_seat")),
     "double_check": Preference(True, "Measures and reviews before done; verification remains a floor.",
-        (True, False), ("advisor", "verify_battery", "interference", "reviewer", "council")),
+        (True, False), ("advisor", "verify_battery", "interference", "reviewer")),
 }
 
 
@@ -69,10 +69,10 @@ def resolve_preferences(cfg: Mapping[str, Any] | None = None, *,
 
 
 TASK_RULES = {
-    "chat": {"min_rank": 1, "thinking": "low", "delegation_depth": 0},
-    "modelling": {"min_rank": 3, "thinking": "medium", "delegation_depth": 0},
-    "analysis": {"min_rank": 4, "thinking": "high", "delegation_depth": 0},
-    "mission": {"min_rank": 4, "thinking": "high", "delegation_depth": 2},
+    "chat": {"thinking": "low", "delegation_depth": 0},
+    "modelling": {"thinking": "medium", "delegation_depth": 0},
+    "analysis": {"thinking": "high", "delegation_depth": 0},
+    "mission": {"thinking": "high", "delegation_depth": 2},
 }
 TASK_CLASS_KINDS = {
     "simple": "chat", "leaf": "chat",
@@ -103,20 +103,30 @@ def classify_task(prompt: str, cfg: Mapping[str, Any] | None = None) -> str:
     return local if local in TASK_RULES else keyword_task_kind(prompt)
 
 
+def _requests_delegation(prompt: str) -> bool:
+    """Recognize explicit delegation requests, not geometric parallel constraints."""
+    for clause in re.split(r"[.!?;,\n]|\b(?:and|but)\b", prompt.lower()):
+        if re.search(r"\b(?:do not|don't|never|without|avoid|no)\b", clause):
+            continue
+        if (re.search(r"\b(?:orchestrat\w*|paralleliz\w*|parallelis\w*|delegat\w*)\b", clause)
+                or re.search(r"\b(?:use|using|spawn|launch|run|dispatch|employ)\b.*\bsub[- ]?agents?\b", clause)
+                or re.search(r"\bparallel\s+(?:sub[- ]?agents?|agents?|tasks?|work)\b", clause)
+                or re.search(r"\b(?:sub[- ]?agents?|agents?|tasks?|work)\b.*\bin parallel\b|\bin parallel\b.*\b(?:sub[- ]?agents?|agents?|tasks?|work)\b", clause)):
+            return True
+    return False
+
+
 @dataclass(frozen=True)
 class TurnPreferences:
     preferences: CopilotPreferences
     task_kind: str
     thinking: str
-    min_rank: int
     delegation_depth: int
     task_list: bool
     advisor: bool
-    council: bool
     verify_battery: bool
     sim_precheck_block: bool
     schedule_compaction: bool
-    trim_tool_schemas: bool
     strong_planner: bool
     cheap_leaves: bool
 
@@ -132,27 +142,46 @@ class TurnPreferences:
     def local_only(self) -> bool:
         return self.preferences.local_only
 
-    def prompt_guidance(self) -> str:
+    def _guidance_lines(self, *, enforced_at_dispatch: bool) -> list[str]:
         lines = [f"Work style: {self.preferences.work_style}. Priority: {self.priority}."]
         if self.mode == "plan":
             lines.append("Show a plan first; ask for approval before overwriting or destructive changes.")
         if self.mode == "ask":
             lines.append("Answer and measure only. Never change documents or files.")
+        if enforced_at_dispatch and self.mode in ("plan", "ask"):
+            lines.append("Read-only turn: mutating tools are refused.")
         if self.task_list:
             lines.append("Publish and maintain a task list for this multi-step job.")
-        lines.append(f"Delegation depth limit: {self.delegation_depth}; " +
-                     ("use a strong planner and cheap independent leaves." if self.cheap_leaves else "do this work in this turn."))
+        guidance = ("use a strong planner and cheap independent leaves." if self.cheap_leaves
+                    else "delegate as appropriate." if self.delegation_depth > 0
+                    else "do this work in this turn.")
+        lines.append(f"Delegation depth limit: {self.delegation_depth}; {guidance}")
+        if enforced_at_dispatch and not self.advisor:
+            lines.append("The advisor is off this turn; advise calls are refused.")
         if self.verify_battery:
             lines.append("Run verify_battery before declaring geometry complete.")
-        if self.council:
-            lines.append("Convene a build-strategy council before building this five-or-more-feature mission.")
         if self.sim_precheck_block:
             lines.append("Simulation setup prechecks are mandatory; do not solve past a failed precheck.")
-        return "SESSION PREFERENCES (override earlier role-card defaults)\n" + "\n".join(lines)
+        return lines
+
+    def prompt_guidance(self) -> str:
+        """Preference guidance for a system prompt (the explicit-offline lane)."""
+        return ("SESSION PREFERENCES (override earlier role-card defaults)\n"
+                + "\n".join(self._guidance_lines(enforced_at_dispatch=False)))
+
+    def turn_notice(self) -> str:
+        """The online lane's per-turn policy, appended to the end of the new user message.
+
+        It never enters the system prompt or a tool definition (prefix-cache
+        invariant): every turn restates it, and dispatch refuses what it forbids.
+        """
+        return ("TURN PREFERENCES (apply to this message; they replace any earlier turn "
+                "preferences and override role-card defaults)\n"
+                + "\n".join(self._guidance_lines(enforced_at_dispatch=True)))
 
 
 def resolve_turn_preferences(prompt: str, *, cfg: Mapping[str, Any] | None = None,
-                             feature_count: int = 0, doc_count: int = 1,
+                             doc_count: int = 1,
                              context_tokens: int = 0, context_window: int = 0,
                              task_kind: str | None = None,
                              headless: bool = False) -> TurnPreferences:
@@ -167,18 +196,24 @@ def resolve_turn_preferences(prompt: str, *, cfg: Mapping[str, Any] | None = Non
     if kind not in TASK_RULES:
         raise ValueError(f"Unknown task kind: {kind}")
     rule = TASK_RULES[kind]
-    rank, thinking = rule["min_rank"], rule["thinking"]
-    if feature_count > 40:
-        rank = min(5, rank + 1)
+    thinking = rule["thinking"]
     if prefs.priority == "best_results":
-        rank, thinking = 5, "high"
+        thinking = "high"
     elif prefs.priority in ("fastest", "lowest_cost"):
         thinking = "low"
-    depth = rule["delegation_depth"] if prefs.work_style != "answer_only" else 0
+    from services.agent.config import get_max_subagent_depth
+
+    agent_cfg = cfg.get("agent")
+    explicit_depth = isinstance(agent_cfg, Mapping) and "max_subagent_depth" in agent_cfg
+    if prefs.work_style == "answer_only":
+        depth = 0
+    elif explicit_depth or _requests_delegation(prompt):
+        depth = get_max_subagent_depth(dict(cfg))
+    else:
+        depth = rule["delegation_depth"]
     crowded = context_window > 0 and context_tokens >= context_window * 0.5
-    return TurnPreferences(prefs, kind, thinking, rank, depth,
+    return TurnPreferences(prefs, kind, thinking, depth,
         kind == "mission" or (kind != "chat" and prefs.work_style == "check_with_me"),
         prefs.double_check and kind != "chat",
-        prefs.double_check and kind == "mission" and feature_count >= 5,
-        kind != "chat", kind == "analysis", crowded, crowded,
+        kind != "chat", kind == "analysis", crowded,
         kind == "mission", kind == "mission" and depth > 0)

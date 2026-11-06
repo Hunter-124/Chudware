@@ -5,12 +5,12 @@ panel.
 
 * :func:`preview_main_chat_system` defaults to the ONLINE lane every normal chat
   uses: ``prompt_cache.compose_online`` — the role prompt
-  (``mission_dispatch.role_prompt``) Chudcode receives as its appended system
+  (``mission_dispatch.role_prompt``) Omp receives as its appended system
   prompt, plus the native host-tool definitions
-  (``chudcode_tools.build_host_tools``). ``lane="offline"`` shows the explicit
+  (``omp_tools.build_host_tools``). ``lane="offline"`` shows the explicit
   local-model fallback instead: the ``prompt_cache`` static prompt that
   ``agent_turn.run_turn`` renders (harness protocol, catalogs, tools slot).
-* :func:`preview_tool_entry` shows one offline tools-slot entry with the
+* :func:`preview_tool_entry` shows the effective online tool description with
   ``agent.tool_options`` overrides applied.
 
 Token figures are ~4 chars/token estimates. The user-request slot is marked
@@ -31,25 +31,20 @@ USER_REQUEST_PLACEHOLDER = (
 
 
 def preview_tool_entry(tool_name: str, *, trim: bool | None = None) -> dict[str, Any]:
-    """Assemble the exact tools-slot entry the model sees for *tool_name*.
-
-    Returns ``{ok, tool, entry, text, meta, error?}``. ``entry`` is the single
-    ``- name(...)\n    desc…`` block; ``text`` is that entry wrapped in the
-    ``[TOOLS]`` header (same shape as ``render_tools_block`` for one tool).
-    """
+    """Assemble the effective online description for *tool_name*."""
     name = (tool_name or "").strip()
     if not name:
         return {"ok": False, "error": "tool name required", "tool": "", "entry": "", "text": ""}
     try:
         from services.agent import agent_turn as _at  # noqa: PLC0415
+        from services.agent import omp_tools  # noqa: PLC0415
         from services.agent.tool_schemas import (  # noqa: PLC0415
-            _description_line,
-            describe_callable,
-            render_tools_block,
+            _description_block, describe_callable, render_tools_block, render_tool_description,
         )
         from services.agent.config import get_tool_options  # noqa: PLC0415
+        from services.agent.mission_dispatch import MissionDispatch  # noqa: PLC0415
 
-        resolver = _at.resolver_for(None)
+        resolver = _at.resolver_for(MissionDispatch(run_id=""))
         fn = None
         try:
             fn = resolver(name)
@@ -57,15 +52,16 @@ def preview_tool_entry(tool_name: str, *, trim: bool | None = None) -> dict[str,
             fn = None
 
         opts = get_tool_options(None, name) or {}
-        use_trim = bool(trim) if trim is not None else True
-        st = opts.get("schema_trim")
-        if trim is None and st is not None:
-            use_trim = bool(st)
-
+        entries = omp_tools._load_registry_entries({})
+        entry_def = entries.get(name)
+        if fn is None:
+            fn = omp_tools._entry_value(entry_def, "fn", "handler", "callable", default=None)
+        if fn is None:
+            fn = omp_tools._meta_handler(name)
         if fn is None:
             # Same fallbacks as render_tools_block for known meta tools.
             text, meta = render_tools_block(
-                [name], resolver=resolver, trim=use_trim, include_category_menu=False,
+                [name], resolver=resolver, trim=trim, include_category_menu=False,
             )
             entry = ""
             if text:
@@ -83,26 +79,21 @@ def preview_tool_entry(tool_name: str, *, trim: bool | None = None) -> dict[str,
             }
 
         schema = describe_callable(name, fn)
-        live_desc = schema.get("description") or ""
-        override = (opts.get("description_override") or "").strip()
-        if override:
-            schema = dict(schema)
-            schema["description"] = override
-        note = (opts.get("prompt_note") or "").strip()
-        defaults = dict(opts.get("param_defaults") or {})
-        desc = _description_line(schema["description"], trim=use_trim)
+        live_desc = omp_tools._entry_description(entry_def, fn)
+        selected = name in omp_tools._bootstrap_names(
+            {"allowed_tools": None, "categories": []}, [*entries, name],
+        )
+        load_mode = omp_tools._entry_load_mode(name, entry_def) if selected else "discoverable"
+        skill_names: tuple[str, ...] = ()
+        if load_mode == "discoverable":
+            project_root, _ = omp_tools._context_roots({})
+            skill_names = tuple(omp_tools._auto_skill_tools(project_root, "general_agent").get(name, ()))
+        desc = render_tool_description(
+            name, live_desc, trim=trim, options=opts, skill_names=skill_names,
+        )
         entry = f"- {schema['signature']}"
         if desc:
-            entry += f"\n    {desc}"
-        if defaults:
-            rendered_defaults = ", ".join(
-                f"{key}={value!r}" for key, value in sorted(defaults.items())
-            )
-            entry += (
-                f"\n    Effective defaults when omitted: {rendered_defaults}."
-            )
-        if note:
-            entry += f"\n    Note: {note}"
+            entry += "\n" + _description_block(desc)
         text = "[TOOLS] Call tools with EXACTLY these kwargs:\n" + entry
         return {
             "ok": True,
@@ -110,10 +101,10 @@ def preview_tool_entry(tool_name: str, *, trim: bool | None = None) -> dict[str,
             "entry": entry,
             "text": text,
             "meta": {
-                "trimmed": use_trim,
-                "has_override": bool(override),
-                "has_note": bool(note),
-                "has_param_defaults": bool(defaults),
+                "trimmed": bool(opts.get("schema_trim") if opts.get("schema_trim") is not None else trim),
+                "has_override": bool(opts.get("description_override")),
+                "has_note": bool(opts.get("prompt_note")),
+                "has_param_defaults": bool(opts.get("param_defaults")),
             },
             "live_description": live_desc,
             "unresolved": False,
@@ -209,8 +200,8 @@ def preview_main_chat_system(
 ) -> dict[str, Any]:
     """Build the system prompt a fresh main-chat / ``general_agent`` turn gets.
 
-    *lane* ``"online"`` (default) is the Chudcode lane: ``system`` is exactly the
-    CAD system prompt appended to Chudcode's own, and with *include_tools* the
+    *lane* ``"online"`` (default) is the Omp lane: ``system`` is exactly the
+    CAD system prompt appended to Omp's own, and with *include_tools* the
     CAD host-tool definitions are returned beside it (``host_tools`` /
     ``host_tools_text``) — they are native tool definitions, not system-prompt
     text. *lane* ``"offline"`` is the explicit local-model fallback's static

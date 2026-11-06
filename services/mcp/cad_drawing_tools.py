@@ -5,12 +5,14 @@ from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
 from mcp.server.fastmcp import Image
 from pydantic import Field
 from typing import Annotated, Any, Optional
+import math
 import os
 
 from .cad_common import (
     _doc,
     _dumps,
     _err,
+    _sanitize_output_path,
     _feature_owned_matches,
     _resolve_drawing_view_id,
     _tmp,
@@ -476,6 +478,8 @@ def _param_number(params: Any, *names: str) -> Optional[float]:
     for n in names:
         v = params.get(n)
         if isinstance(v, dict):
+            if isinstance(v.get("expr"), str) and v["expr"].strip():
+                return None
             v = v.get("value")
         if isinstance(v, (int, float)) and not isinstance(v, bool):
             return float(v)
@@ -657,6 +661,97 @@ def _views_of(full: dict) -> list:
     return out
 
 
+def _target_projected_line(full: dict, source: str, view_id: str, tokens: list,
+                           interior: bool = False) -> list:
+    """Resolve one explicit model line edge to its one visible projected line."""
+    if len(tokens) != 1 or not isinstance(tokens[0], str):
+        raise ValueError("add_dimension: a line target must be one explicit edge SID")
+    sid = tokens[0]
+    entity = next((m for m in _source_entities(source)
+                   if m.get("sid") == sid and m.get("kind") == "edge"), None)
+    if not entity or entity.get("surf") != "line":
+        raise ValueError(f"add_dimension: {sid!r} is not a straight model edge SID")
+    view = _find_view(full, view_id) or {}
+    lines = []
+    for line, provenance in zip(view.get("visible") or [], view.get("visible_src") or []):
+        if (isinstance(provenance, dict) and provenance.get("sid") == sid
+                and isinstance(line, list) and len(line) == 2
+                and all(isinstance(p, list) and len(p) == 2 for p in line)):
+            lines.append(line)
+    if len(lines) != 1:
+        raise ValueError(f"add_dimension: edge {sid!r} has {len(lines)} visible straight "
+                         "projections in this view; select a view with one unambiguous line")
+    line = lines[0]
+    # Angular targets may use interior picks to avoid shared endpoints.
+    return [[line[0][i] * (1 - t) + line[1][i] * t for i in (0, 1)]
+            for t in ((0.001, 0.999) if interior else (0.0, 1.0))]
+
+
+def _target_face_distance(full: dict, source: str, view_id: str,
+                          first: str, second: str, dtype: str) -> tuple[list, list, dict]:
+    """Pick visible witnesses only when their sheet distance equals the 3D plane distance."""
+    entities = _source_entities(source)
+    faces = []
+    for sid in (first, second):
+        hits = [m for m in entities if m.get("sid") == sid and m.get("kind") == "face"
+                and m.get("surf") == "plane"]
+        if len(hits) != 1:
+            raise ValueError(f"add_dimension: {sid!r} must identify one planar model face")
+        faces.append(hits[0])
+    normals = [f.get("normal") for f in faces]
+    centers = [f.get("centroid") for f in faces]
+    if not all(isinstance(v, list) and len(v) == 3 and
+               all(isinstance(n, (int, float)) for n in v) for v in normals + centers):
+        raise ValueError("add_dimension: model face planes lack measured normals or centroids")
+    lengths = [math.sqrt(sum(x * x for x in normal)) for normal in normals]
+    if min(lengths) < 1e-9:
+        raise ValueError("add_dimension: model face has a degenerate normal")
+    n0, n1 = [[x / length for x in normal] for normal, length in zip(normals, lengths)]
+    if abs(sum(a * b for a, b in zip(n0, n1))) < 1 - 1e-6:
+        raise ValueError("add_dimension: face-distance targets must be parallel planes")
+    distance = abs(sum((b - a) * n for a, b, n in zip(centers[0], centers[1], n0)))
+    if distance < 1e-6:
+        raise ValueError("add_dimension: face-distance targets are coincident")
+    view = _find_view(full, view_id) or {}
+    witnesses = [[], []]
+    for line, provenance in zip(view.get("visible") or [], view.get("visible_src") or []):
+        if (not isinstance(provenance, dict) or not provenance.get("sid")
+                or not isinstance(line, list) or len(line) != 2
+                or any(not isinstance(p, list) or len(p) != 2 for p in line)):
+            continue
+        dx, dy = line[1][0] - line[0][0], line[1][1] - line[0][1]
+        length = math.hypot(dx, dy)
+        if length < 1e-8:
+            continue
+        for index, sid in enumerate((first, second)):
+            if sid in (provenance.get("face_sids") or []):
+                witnesses[index].append((line, provenance["sid"], (dx / length, dy / length)))
+    for line_a, edge_a, direction in witnesses[0]:
+        for line_b, edge_b, other_direction in witnesses[1]:
+            if edge_a == edge_b or abs(sum(a * b for a, b in
+                                           zip(direction, other_direction))) < 1 - 1e-6:
+                continue
+            projections = [[sum(p[i] * direction[i] for i in (0, 1)) for p in line]
+                           for line in (line_a, line_b)]
+            lo = max(min(p) for p in projections)
+            hi = min(max(p) for p in projections)
+            if hi - lo < 1e-6:
+                continue
+            at = (lo + hi) * 0.5
+            points = []
+            for line, projection in zip((line_a, line_b), projections):
+                t = (at - projection[0]) / (projection[1] - projection[0])
+                points.append([line[0][i] * (1 - t) + line[1][i] * t for i in (0, 1)])
+            dx, dy = points[1][0] - points[0][0], points[1][1] - points[0][1]
+            measured = (max(abs(dx), abs(dy)) if dtype == "linear_dim" else
+                        math.hypot(dx, dy)) / _view_scale(view)
+            if math.isclose(measured, distance, rel_tol=1e-6, abs_tol=1e-4):
+                return points[0], points[1], {"a": edge_a, "b": edge_b,
+                                              "faces": [first, second]}
+    raise ValueError("add_dimension: no visible witness lines measure the true face distance "
+                     "in this view; use an orthogonal view or aligned_dim")
+
+
 def _drawn_as_lines(view: dict, sids: set) -> bool:
     """True when *view* draws any polyline whose provenance answers to one of *sids*."""
     for key in ("visible_src", "hidden_src"):
@@ -804,6 +899,60 @@ def _canon_view_scale(value: Any) -> tuple[Optional[float], Optional[dict]]:
             "valid_scale": ["1.0", "0.5", "2", "1:2", "2:1"],
         }
     return num, None
+
+def _scale_matches(printed: float, actual: float) -> bool:
+    # Native captions are rounded to three significant figures by scale_text.
+    rounded, _ = _canon_view_scale(_scale_text(actual))
+    return (math.isclose(printed, actual, rel_tol=1e-9, abs_tol=1e-12) or
+            (rounded is not None and math.isclose(printed, rounded, rel_tol=1e-9,
+                                                   abs_tol=1e-12)))
+
+
+def _drawing_scale_findings(full: dict) -> list[dict]:
+    """Compare each sheet's printed scale with views that rely on that scale."""
+    findings = []
+    for sheet in full.get("sheets") or []:
+        if not isinstance(sheet, dict):
+            continue
+        title = sheet.get("title_block") or {}
+        printed = title.get("scale") if isinstance(title, dict) else None
+        title_scale, _ = _canon_view_scale(printed)
+        if title_scale is None or not math.isfinite(title_scale):
+            continue  # "AS SHOWN"/NTS and missing scales are not numeric claims.
+        for view in sheet.get("views") or []:
+            if not isinstance(view, dict):
+                continue
+            kind = _canon_word(view.get("type"))
+            if kind in {"table_overlay", "detail"}:
+                # Native detail captions always print their own geometric scale.
+                continue
+            actual = view.get("scale")
+            if (isinstance(actual, bool) or not isinstance(actual, (int, float)) or
+                    not math.isfinite(actual) or actual <= 0):
+                continue
+            vid = view.get("view_id") or view.get("id")
+            # ISO views may carry an independently printed SCALE caption. Check that
+            # caption against its own geometry instead of the sheet title.
+            caption = str(view.get("caption") or "").strip()
+            caption_match = _re.fullmatch(r"(?i)SCALE\s+(.+)", caption)
+            labelled, _ = _canon_view_scale(caption_match.group(1)) if caption_match else (None, None)
+            separate = ((kind == "iso" or _canon_word(view.get("orientation")) == "iso")
+                        and labelled is not None and math.isfinite(labelled))
+            claimed = labelled if separate else title_scale
+            if _scale_matches(claimed, float(actual)):
+                continue
+            label = f"view {vid} caption" if separate else "title block"
+            text = caption if separate else str(printed)
+            findings.append({
+                "sheet_id": sheet.get("sheet_id") or sheet.get("id"),
+                "view_id": vid, "printed_scale": text, "view_scale": actual,
+                "code": "view_scale_mismatch",
+                "message": (f"{label} prints scale {text!r}, but view {vid} "
+                            f"({view.get('orientation') or kind}) uses {_scale_text(actual)}"),
+                "remedy": "Correct the printed scale or use set_view/arrange_drawing to "
+                          "make the geometry agree; individually label a different-scale view.",
+            })
+    return findings
 
 
 def _scale_readback(doc_id: str, want: float, notes: list) -> tuple[list, list]:
@@ -1044,6 +1193,7 @@ def _drawing_review_summary(full: dict, render: dict,
     missing = [field for field in required if not str(title_block.get(field) or "").strip()]
     if missing:
         warnings.append("title block missing manufacturing fields: " + ", ".join(missing))
+    warnings.extend(finding["message"] for finding in _drawing_scale_findings(full))
     source_material = _source_material(full)
     printed_material = str(title_block.get("material") or "").strip()
     if source_material and printed_material and not _material_matches(source_material,
@@ -1454,10 +1604,15 @@ def _hole_feature_defaults(full: dict, feature_ref: Any) -> tuple[dict, Optional
         "csk_dia": _param_number(params, "csk_dia", "csink_d", "countersink_diameter"),
         "csk_depth": _param_number(params, "csk_depth", "csink_depth", "countersink_depth"),
         "csk_angle": _param_number(params, "csk_angle", "csink_angle", "countersink_angle"),
-        "thread": _feature_param_text(params, "thread", "tap", "standard", "thread_size"),
-        "thru": _canon_word(params.get("end") or params.get("end_condition")) in
-                {"through", "through_all", "thru"},
+        "thread": (_feature_param_text(params, "thread", "tap", "thread_size", "standard")
+                   if hole_type == "tapped" else None),
+        "thru": (True if _canon_word(params.get("end") or params.get("end_condition")) in
+                 {"through", "through_all", "thru"} else
+                 False if _canon_word(params.get("end") or params.get("end_condition")) in
+                 {"blind", "depth"} else None),
     }
+    if _canon_word(defaults.get("thread")) == "custom":
+        defaults["thread"] = None
     for key in ("positions", "world_points"):
         placed = params.get(key)
         if isinstance(placed, list) and placed:
@@ -1478,6 +1633,16 @@ def _all_annotations(full: dict) -> list[dict]:
                     "view_id": view_id,
                 })
     return out
+
+def _audit_annotation_candidates(annotations: list[dict], row: dict) -> list[dict]:
+    """Resolve a requirement's view-local annotation identity without guessing."""
+    explicit = row.get("annotation_id")
+    view_id = row.get("view_id")
+    return [
+        ann for ann in annotations
+        if (explicit is None or str(ann.get("id")) == str(explicit))
+        and (view_id is None or str(ann.get("view_id")) == str(view_id))
+    ]
 
 
 def _audit_spec_rows(spec: Any) -> tuple[list[dict], Optional[dict]]:
@@ -1625,30 +1790,39 @@ def _audit_annotation_matches(row: dict, annotation: dict) -> bool:
 
 def _audit_coverage(full: dict, rows: list[dict]) -> list[dict]:
     annotations = _all_annotations(full)
-    by_id = {str(annotation.get("id")): annotation for annotation in annotations
-             if annotation.get("id") is not None}
-    sheet = (full.get("sheets") or [{}])[0]
-    title = sheet.get("title_block") if isinstance(sheet, dict) else {}
-    title = title if isinstance(title, dict) else {}
+    sheets = [sheet for sheet in full.get("sheets") or [] if isinstance(sheet, dict)]
     coverage: list[dict] = []
     for row in rows:
         resolved_id = None
         evidence = None
+        ambiguous_views = []
+        resolved_view = None
         if row["type"] == "title_field":
             field = _canon_word(row.get("field") or row.get("name") or row.get("value"))
             expected = row.get("expected")
-            actual = title.get(field)
-            if actual is not None and str(actual).strip() and (
-                    expected is None or str(expected).strip().casefold() in
-                    str(actual).strip().casefold()):
-                resolved_id = f"title_block.{field}"
-                evidence = {"field": field, "value": actual}
+            candidates = [sheet for sheet in sheets
+                          if not row.get("sheet_id") or sheet.get("id") == row["sheet_id"]]
+            for sheet in candidates:
+                title = sheet.get("title_block") or {}
+                actual = title.get(field) if isinstance(title, dict) else None
+                if actual is not None and str(actual).strip() and (
+                        expected is None or str(expected).strip().casefold() in
+                        str(actual).strip().casefold()):
+                    resolved_id = f"title_block.{field}"
+                    evidence = {"field": field, "value": actual, "sheet_id": sheet.get("id")}
+                    break
         else:
-            explicit = row.get("annotation_id")
-            candidates = [by_id[str(explicit)]] if explicit is not None and str(explicit) in by_id \
-                else ([] if explicit is not None else annotations)
-            match = next((ann for ann in candidates if _audit_annotation_matches(row, ann)), None)
+            candidates = _audit_annotation_candidates(annotations, row)
+            # IDs are allocated within each view. Even if only one candidate matches the
+            # requested type, an explicit ID alone does not identify which one was intended.
+            if row.get("annotation_id") is not None and len(candidates) > 1:
+                ambiguous_views = [ann.get("view_id") for ann in candidates]
+                match = None
+            else:
+                match = next((ann for ann in candidates
+                              if _audit_annotation_matches(row, ann)), None)
             if match:
+                resolved_view = match.get("view_id")
                 resolved_id = match.get("id")
                 evidence = {
                     key: match.get(key) for key in
@@ -1659,10 +1833,156 @@ def _audit_coverage(full: dict, rows: list[dict]) -> list[dict]:
             "requirement_id": row["requirement_id"],
             "type": row["type"],
             "critical": bool(row.get("critical", True)),
-            "status": "covered" if resolved_id is not None else "missing",
+            "status": ("ambiguous" if ambiguous_views else
+                       "covered" if resolved_id is not None else "missing"),
             "annotation_id": resolved_id,
+            "view_id": resolved_view,
+            "candidate_view_ids": ambiguous_views,
             "evidence": evidence,
         })
+    return coverage
+
+
+def _model_drawing_coverage(full: dict, source: str) -> list[dict]:
+    """Derive feature dimensions and bore callouts from the live source, not the ledger."""
+    from .dimension_scheme_tools import _drawing_plan_from_features
+
+    source_tree = cb.call("doc_tree", {"doc_id": source})
+    tree = source_tree.get("tree") if isinstance(source_tree, dict) else None
+    if not isinstance(tree, dict):
+        raise ValueError("audit_drawing: source feature tree is unavailable")
+    assembly = tree.get("schema") == "aicad.asm/1"
+    features = [f for f in tree.get("features") or [] if isinstance(f, dict)]
+    if not assembly and not features:
+        raise ValueError("audit_drawing: source feature tree is empty")
+    query = cb.call("doc_query", {"doc_id": source, "query": {"of": "face", "surf": "cylinder"}})
+    if not isinstance(query, dict) or not isinstance(query.get("matches"), list):
+        raise ValueError("audit_drawing: source bore geometry could not be evaluated")
+    bores = [face for face in query["matches"] if isinstance(face, dict)
+             and face.get("concavity") == "bore" and isinstance(face.get("sid"), str)]
+    annotations = _all_annotations(full)
+    views = _views_of(full)
+    coverage = []
+    if assembly:
+        coverage.append({"requirement_id": "model:assembly:component_features",
+                         "type": "dimension_tolerance", "critical": True, "status": "missing",
+                         "annotation_id": None, "view_id": None, "candidate_view_ids": [],
+                         "evidence": {"reason": "component feature schemes were not evaluated"}})
+    used = set()
+    for proposal in _drawing_plan_from_features(features, "", None):
+        feature = proposal.get("feature_ref")
+        kind = proposal.get("dim_type")
+        nominal = proposal.get("suggested_value")
+        if nominal is None and proposal.get("suggested_tool") is None:
+            coverage.append({"requirement_id": f"model:{feature}:{proposal.get('source_param')}",
+                             "type": proposal["annotation_kind"], "critical": True,
+                             "status": "missing", "annotation_id": None, "view_id": None,
+                             "candidate_view_ids": [],
+                             "evidence": {"feature_ref": feature,
+                                          "source_param": proposal.get("source_param"),
+                                          "reason": "equation-driven nominal was not evaluated"}})
+            continue
+        if proposal.get("annotation_kind") == "thread":
+            thread = proposal.get("thread")
+            expected_depth = proposal.get("depth")
+            match = next((ann for ann in annotations
+                          if thread and not ann.get("stale")
+                          and ann.get("feature_ref") == feature
+                          and str(ann.get("thread") or "").casefold() == str(thread).casefold()
+                          and (expected_depth is None or
+                               (isinstance(ann.get("depth"), (int, float)) and
+                                math.isclose(ann["depth"], expected_depth, abs_tol=1e-4)))
+                          and (not proposal.get("thru") or
+                               "THRU" in str(ann.get("text") or "").upper())), None)
+            coverage.append({"requirement_id": f"model:{feature}:thread", "type": "thread",
+                             "critical": True, "status": "covered" if match else "missing",
+                             "annotation_id": match.get("id") if match else None,
+                             "view_id": match.get("view_id") if match else None,
+                             "candidate_view_ids": [], "evidence": {"feature_ref": feature,
+                             "thread": thread, "depth": expected_depth}})
+            continue
+        if proposal.get("feature_type") == "hole":
+            continue  # Holes are checked against their actual cylindrical faces below.
+        if nominal is None:
+            continue
+        matches = []
+        for ann in annotations:
+            key = (ann.get("view_id"), ann.get("id"))
+            if key in used or ann.get("stale"):
+                continue
+            akind = _canon_word(ann.get("kind") or ann.get("type"))
+            if proposal.get("annotation_kind") == "chamfer":
+                if akind != "chamfer" or ann.get("feature_ref") != feature:
+                    continue
+                actual = ann.get("length")
+            else:
+                if akind != kind:
+                    continue
+                anchors = ann.get("model_anchors") or {}
+                owners = {a.get("selector", {}).get("owner_feature")
+                          for a in anchors.values() if isinstance(a, dict)
+                          and isinstance(a.get("selector"), dict)}
+                if feature not in owners:
+                    continue
+                actual = ann.get("value")
+            if (isinstance(actual, (int, float)) and
+                    math.isclose(actual, nominal, rel_tol=1e-5, abs_tol=1e-4)):
+                matches.append(ann)
+        match = matches[0] if matches else None
+        if match:
+            used.add((match.get("view_id"), match.get("id")))
+        coverage.append({"requirement_id": f"model:{feature}:{proposal.get('source_param')}",
+                         "type": proposal.get("annotation_kind"), "critical": True,
+                         "status": "covered" if match else "missing",
+                         "annotation_id": match.get("id") if match else None,
+                         "view_id": match.get("view_id") if match else None,
+                         "candidate_view_ids": [],
+                         "evidence": {"feature_ref": feature, "nominal": nominal,
+                                      "source_param": proposal.get("source_param")}})
+    for bore in bores:
+        sid = bore["sid"]
+        match = None
+        for view in views:
+            circles = _view_circles(view, {sid})
+            owner = bore.get("owner_feature")
+            same_feature = {other["sid"] for other in bores
+                            if owner and other.get("owner_feature") == owner
+                            and isinstance(other.get("radius"), (int, float))
+                            and isinstance(bore.get("radius"), (int, float))
+                            and math.isclose(other["radius"], bore["radius"], abs_tol=1e-4)}
+            group = ([candidate for candidate in _view_circles(view, same_feature)
+                      if candidate["visible"] and isinstance(bore.get("radius"), (int, float))
+                      and math.isclose(candidate["model_radius"], bore["radius"], abs_tol=1e-4)]
+                     if same_feature else [])
+            for circle in circles:
+                if not circle["visible"]:
+                    continue
+                for ann in view.get("annotations") or []:
+                    if (not isinstance(ann, dict)
+                            or _canon_word(ann.get("kind") or ann.get("type")) != "hole_callout"
+                            or ann.get("stale") or not isinstance(ann.get("center"), list)
+                            or len(ann["center"]) != 2):
+                        continue
+                    same_center = math.dist(ann["center"], circle["center"]) < 1e-3
+                    grouped = (len(group) > 1 and ann.get("count", 0) >= len(group)
+                               and any(math.dist(ann["center"], other["center"]) < 1e-3
+                                       for other in group))
+                    if ((same_center or grouped) and
+                            isinstance(ann.get("value"), (int, float)) and
+                            math.isclose(ann["value"], 2 * circle["model_radius"], abs_tol=1e-4)):
+                        match = (view, ann)
+                        break
+                if match:
+                    break
+            if match:
+                break
+        coverage.append({"requirement_id": f"model:bore:{sid}", "type": "hole_callout",
+                         "critical": True, "status": "covered" if match else "missing",
+                         "annotation_id": match[1].get("id") if match else None,
+                         "view_id": match[0].get("view_id") if match else None,
+                         "candidate_view_ids": [], "evidence": {"face_sid": sid,
+                         "diameter": 2 * bore["radius"] if isinstance(bore.get("radius"), (int, float))
+                         else None}})
     return coverage
 
 
@@ -1692,7 +2012,7 @@ _FINISH_NOTE = _re.compile(
     _re.IGNORECASE,
 )
 _AUDIT_STANDARD_CHECKS = (
-    "title_block", "units_statement", "gdt", "thread_callout",
+    "title_block", "view_scale", "units_statement", "gdt", "thread_callout",
     "annotation_anchor", "surface_finish_note",
 )
 
@@ -1742,7 +2062,7 @@ def _audit_thread_depth_stated(record: dict) -> bool:
                            str(record.get("text") or ""), _re.IGNORECASE))
 
 
-def _audit_standards(full: dict, rows: list[dict]) -> dict:
+def _audit_standards_sheet(full: dict, rows: list[dict]) -> dict:
     """Deterministic drawing-standard checks independent of requirement coverage."""
     failures: list[dict] = []
 
@@ -1763,8 +2083,56 @@ def _audit_standards(full: dict, rows: list[dict]) -> dict:
                 f"set_titleblock(fields={{\"{field}\": \"<controlled value>\"}})",
                 field=field,
             )
+    for finding in _drawing_scale_findings(full):
+        fail("view_scale", **finding)
+
 
     annotations = _all_annotations(full)
+    for annotation in annotations:
+        if annotation.get("stale"):
+            fail("annotation_anchor", "stale_dimension",
+                 f"dimension {annotation.get('id')} cannot be re-measured: "
+                 f"{annotation.get('stale_reason') or 'model anchor unresolved'}",
+                 "Reattach or replace the dimension against the current model.",
+                 view_id=annotation.get("view_id"), annotation_id=annotation.get("id"))
+        if _canon_word(annotation.get("kind")) == "hole_callout":
+            view = _find_view(full, annotation.get("view_id")) or {}
+            center, value = annotation.get("center"), annotation.get("value")
+            measured = (isinstance(center, list) and len(center) == 2
+                        and isinstance(value, (int, float))
+                        and any(circle["visible"] and
+                                math.dist(center, circle["center"]) < 1e-3 and
+                                math.isclose(value, 2 * circle["model_radius"], abs_tol=1e-4)
+                                for circle in _view_circles(view)))
+            if not measured:
+                fail("annotation_anchor", "hole_callout_model_mismatch",
+                     f"hole callout {annotation.get('id')} no longer matches a projected model circle",
+                     "Replace the callout against the current model geometry.",
+                     view_id=annotation.get("view_id"), annotation_id=annotation.get("id"))
+        if annotation.get("overridden"):
+            text = str(annotation.get("text_override") or annotation.get("text") or "")
+            kind = _canon_word(annotation.get("kind") or annotation.get("type"))
+            numeric_text = _re.sub(r"^\s*\d+\s*[×x]\s*", "", text)
+            numbers = [float(n) for n in _re.findall(
+                r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?", numeric_text)]
+            units = (full.get("tree") or {}).get("units") or {}
+            ips = isinstance(units, dict) and units.get("system") == "IPS"
+            if kind == "chamfer":
+                measured = [annotation.get("length"), annotation.get("angle")]
+                if ips and isinstance(measured[0], (int, float)):
+                    measured[0] /= 25.4
+            else:
+                value = annotation.get("value")
+                measured = [value / 25.4 if ips and kind != "angular_dim"
+                            and isinstance(value, (int, float)) else value]
+            if any(isinstance(value, (int, float)) and
+                   not any(math.isclose(number, value, rel_tol=1e-3, abs_tol=1e-3)
+                           for number in numbers) for value in measured):
+                fail("annotation_anchor", "dimension_override_mismatch",
+                     f"dimension {annotation.get('id')} override does not state its measured value",
+                     "Clear the override or correct it to match the model measurement.",
+                     view_id=annotation.get("view_id"), annotation_id=annotation.get("id"),
+                     measured_value=annotation.get("value", annotation.get("length")), override=text)
     notes = [str(annotation.get("text") or "") for annotation in annotations
              if _canon_word(annotation.get("kind") or annotation.get("type")) == "note"]
     tolerance_text = str(_audit_title_value(title, "general_tolerance") or "")
@@ -1834,37 +2202,37 @@ def _audit_standards(full: dict, rows: list[dict]) -> dict:
                     annotation_id=annotation_id, view_id=view_id, datum=datum,
                 )
 
-    by_id = {str(annotation.get("id")): annotation for annotation in annotations
-             if annotation.get("id") is not None}
     thread_records: list[tuple[str, dict]] = [
         ("spec", row) for row in rows if row.get("type") == "thread"
     ]
-    included_annotations: set[str] = set()
+    included_annotations: set[tuple[str, str]] = set()
     for row in rows:
         if row.get("type") != "thread" or row.get("annotation_id") is None:
             continue
-        annotation = by_id.get(str(row["annotation_id"]))
-        if annotation is not None:
+        candidates = _audit_annotation_candidates(annotations, row)
+        if len(candidates) == 1:
+            annotation = candidates[0]
             thread_records.append(("annotation", annotation))
-            included_annotations.add(str(annotation.get("id")))
+            included_annotations.add((str(annotation.get("view_id")), str(annotation.get("id"))))
     for annotation in annotations:
         kind = _canon_word(annotation.get("kind") or annotation.get("type"))
         tapped = _canon_word(annotation.get("hole_type")) == "tapped"
         if kind == "hole_callout" and (
                 tapped or annotation.get("thread") or
                 _THREAD_DESIGNATION.search(str(annotation.get("text") or ""))):
-            annotation_id = str(annotation.get("id"))
-            if annotation_id not in included_annotations:
+            identity = (str(annotation.get("view_id")), str(annotation.get("id")))
+            if identity not in included_annotations:
                 thread_records.append(("annotation", annotation))
-                included_annotations.add(annotation_id)
-    seen_thread_findings: set[tuple[str, str, str]] = set()
+                included_annotations.add(identity)
+    seen_thread_findings: set[tuple[str, str, str, str]] = set()
     for source_kind, record in thread_records:
         annotation_id = record.get("id") if source_kind == "annotation" else None
         requirement_id = record.get("requirement_id") if source_kind == "spec" else None
         identity = str(annotation_id or requirement_id or "")
+        view_id = record.get("view_id") if source_kind == "annotation" else None
         designation = _audit_thread_text(record)
         if not _THREAD_DESIGNATION.search(designation):
-            key = (source_kind, identity, "thread_designation_invalid")
+            key = (source_kind, str(view_id or ""), identity, "thread_designation_invalid")
             if key not in seen_thread_findings:
                 seen_thread_findings.add(key)
                 remedy = (
@@ -1881,10 +2249,10 @@ def _audit_standards(full: dict, rows: list[dict]) -> dict:
                     f"{source_kind} thread row {identity!r} has no valid Metric/Unified "
                     f"designation: {designation!r}",
                     remedy, source=source_kind, annotation_id=annotation_id,
-                    requirement_id=requirement_id,
+                    view_id=view_id, requirement_id=requirement_id,
                 )
         if not _audit_thread_depth_stated(record):
-            key = (source_kind, identity, "thread_extent_missing")
+            key = (source_kind, str(view_id or ""), identity, "thread_extent_missing")
             if key not in seen_thread_findings:
                 seen_thread_findings.add(key)
                 fail(
@@ -1896,7 +2264,7 @@ def _audit_standards(full: dict, rows: list[dict]) -> dict:
                      if source_kind == "annotation" else
                      "mfg_plan_upsert(..., plan=<set depth or thru=true on this thread row>)"),
                     source=source_kind, annotation_id=annotation_id,
-                    requirement_id=requirement_id,
+                    view_id=view_id, requirement_id=requirement_id,
                 )
 
     view_ids = {str(view.get("view_id") or view.get("id")) for view in _views_of(full)
@@ -1938,8 +2306,9 @@ def _audit_standards(full: dict, rows: list[dict]) -> dict:
             "surface-finish symbols exist, but title block/notes state no general or "
             "specific finish requirement",
             "set_titleblock(fields={\"finish\":\"RA ...\"}) or "
-            "add_note(..., text=\"SURFACE FINISH ...\")",
-            annotation_ids=[annotation.get("id") for annotation in finish_symbols],
+            "add_dimension(..., dtype=\"note\", text=\"SURFACE FINISH ...\")",
+            annotations=[{"view_id": annotation.get("view_id"),
+                          "annotation_id": annotation.get("id")} for annotation in finish_symbols],
         )
 
     checks = []
@@ -1953,6 +2322,33 @@ def _audit_standards(full: dict, rows: list[dict]) -> dict:
         "status": "fail" if failures else "pass",
         "failure_count": len(failures), "checks": checks, "failures": failures,
     }
+
+
+def _audit_standards(full: dict, rows: list[dict]) -> dict:
+    """Audit each sheet independently so a later sheet cannot escape release checks."""
+    sheets = full.get("sheets") or []
+    failures = []
+    if not any(isinstance(sheet, dict) for sheet in sheets):
+        failures.append({"category": "standards", "check": "title_block",
+                         "code": "no_sheets", "message": "no drawing sheets were evaluated",
+                         "remedy": "Add a drawing sheet before auditing."})
+    for sheet in sheets:
+        if not isinstance(sheet, dict):
+            continue
+        sheet_id = sheet.get("id")
+        view_ids = {v.get("view_id") or v.get("id") for v in sheet.get("views") or []
+                    if isinstance(v, dict)}
+        relevant = [row for row in rows
+                    if (not row.get("sheet_id") or row.get("sheet_id") == sheet_id)
+                    and (not row.get("view_id") or row.get("view_id") in view_ids)]
+        result = _audit_standards_sheet({**full, "sheets": [sheet]}, relevant)
+        failures.extend({**finding, "sheet_id": sheet_id} for finding in result["failures"])
+    checks = [{"check": name,
+               "status": "fail" if any(f["check"] == name for f in failures) else "pass",
+               "failure_count": sum(1 for f in failures if f["check"] == name)}
+              for name in _AUDIT_STANDARD_CHECKS]
+    return {"status": "fail" if failures else "pass", "failure_count": len(failures),
+            "checks": checks, "failures": failures}
 
 
 def register_cad_drawing_tools(mcp: FastMCP) -> None:
@@ -2261,26 +2657,32 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                                 blank.append(f"view {vid} ({ori}) projected no geometry and "
                                              f"will render blank"
                                              + (f": {v['error']}" if v.get("error") else ""))
-                except Exception:  # noqa: BLE001
-                    pass
-            # Report the RESOLVED sheet + auto-dimension switch + drawing name + view scale, not
-            # just ok:true: an alias that landed in the wrong slot is otherwise invisible in the
-            # reply. `name` is the drawing document's own name as the engine stored it.
+                    blank.extend(finding["message"] for finding in _drawing_scale_findings(full))
+                except Exception:  # noqa: BLE001 — the drawing may already exist
+                    blank.append("could not read back the created drawing to verify view scales")
+            # Report actual engine outcomes, not the requested auto-dimension switch.
             out = {"ok": True, "source_doc_id": d,
                    "drawing_doc_id": drawing_doc_id, "name": drawing_name,
                    "part_name": part_name,
-                   "sheet": sheet_size, "model_items": model_items,
+                   "sheet": sheet_size,
+                   "auto_dimensions_added": r.get("auto_dimensions_added"),
+                   "sections_added": r.get("sections_added"),
                    "views": view_map or None, "view_entities": view_entities or None,
                    "next_actions": [
                        "review_drawing(drawing_doc_id)  # SEE the drawing, then refine",
                        "add_gdt / add_dimension / set_view / set_titleblock  # refine",
                        "export_drawing('pdf', drawing_doc_id)  # or 'dxf'"]}
+            if r.get("warnings"):
+                out["warnings"] = list(r["warnings"])
+            if sections and r.get("sections_added") != len(sections):
+                out.setdefault("warnings", []).append(
+                    f"requested {len(sections)} sections but created {r.get('sections_added')}")
             if want_scale is not None:
                 out["scale"] = want_scale
                 out["scale_text"] = _scale_text(want_scale)
                 out["view_scales"] = view_scales
                 if scale_warnings:
-                    out["warnings"] = scale_warnings
+                    out.setdefault("warnings", []).extend(scale_warnings)
             if blank:
                 out.setdefault("warnings", []).extend(blank)
             if notes:
@@ -2299,11 +2701,11 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
     _DRAWING_COMPANIONS = ("dxf", "dwg", "svg")
 
     def _drawing_out_path(path: str, fmt: str) -> tuple[Optional[str], Optional[dict]]:
-        """Return an absolute matching output path, or an honest extension refusal."""
-        out = os.path.abspath(os.path.expanduser(path))
+        """Resolve the final filename using the request's project and output policy."""
+        out = path
         ext = os.path.splitext(out)[1].lower().lstrip(".")
         if ext == fmt:
-            return out, None
+            return _sanitize_output_path(out), None
         if ext in _DRAWING_FORMATS:
             return None, {
                 "ok": False,
@@ -2314,7 +2716,7 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                          f"{os.path.splitext(os.path.basename(out))[0]}.{fmt}, or drop fmt and "
                          f"let the extension choose it.",
             }
-        return out + "." + fmt, None
+        return _sanitize_output_path(out + "." + fmt), None
 
     @mcp.tool()
     def export_drawing(fmt: Optional[str] = None, doc_id: Optional[str] = None,
@@ -2329,11 +2731,12 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                  paths and real text). Omitted, it is taken from the output extension, else
                  pdf. Pass the drawing_doc_id from make_drawing as doc_id. Call
                  review_drawing after the final sheet mutation first.
-        path   : the file to write (also accepted as filename= / out_path= / file_path=). An
-                 extension is appended when missing and never doubled. A path whose extension
-                 contradicts fmt is refused rather than written.
-        sheet  : omitted uses the active sheet; "all" exports every sheet; otherwise pass an
-                 exact stable sheet id such as "s2". Numeric indices are refused as ambiguous.
+        path   : the file to write (also accepted as filename= / out_path= / file_path=).
+                 Relative paths use the selected project root, not the worker's cwd; absolute
+                 paths need no root. Credential/key destinations are refused. An extension is
+                 appended when missing and never doubled; a conflicting extension is refused.
+        sheet  : omitted or "all" exports every sheet; otherwise pass an exact stable sheet id
+                 such as "s2". Numeric indices are refused as ambiguous.
         companions: only with fmt="pdf", pass any of ["dxf", "dwg", "svg"] to write editable
                  siblings beside the PDF in the same call. The result's paths lists every file.
         Returns every output path, entity/annotation counts and the fixed paper size. export_part
@@ -2387,14 +2790,14 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                              "set fmt='pdf'. Nothing was exported.",
                 })
 
-            # A caller-supplied relative path resolves against the daemon's cwd, so resolve it
-            # before the payload crosses the process boundary.
+            # Resolve every output before writing the first one; a companion may itself
+            # be a symlink into a credential location even when the primary path is safe.
             if path:
                 out_path, bad = _drawing_out_path(path, fmt)
                 if bad:
                     return _dumps(bad)
             else:
-                out_path = _tmp("." + fmt)
+                out_path = _sanitize_output_path(_tmp("." + fmt))
 
             method = "export_drawing"
             sheet_value = None
@@ -2407,8 +2810,69 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                                    "are ambiguous. Nothing was exported."})
                 sheet_value = sheet.strip().lower()
                 method = "drawing_export"
+            stem = os.path.splitext(out_path)[0]
+            companion_paths = [
+                (companion_fmt, _sanitize_output_path(stem + "." + companion_fmt))
+                for companion_fmt in companion_formats
+            ]
+            svg_outputs: list[tuple[str, str]] = []
+            if sheet_value in (None, "all") and (fmt == "svg" or "svg" in companion_formats):
+                # Both the default export RPC and sheet="all" export all sheets. Native
+                # multi-sheet SVG output derives a separate filename per sheet.
+                sheets = cb.call("drawing_list_sheets", {"doc_id": d}).get("sheets") or []
+                if not sheets:
+                    return _dumps({"ok": False, "error": "export_drawing: the sheet roster is "
+                                   "empty; no files were exported."})
+                svg_path = (out_path if fmt == "svg" else
+                            next(p for f, p in companion_paths if f == "svg"))
+                svg_stem = svg_path[:-4] if svg_path.endswith(".svg") else svg_path
+                for sheet_row in sheets:
+                    sheet_id = sheet_row.get("id")
+                    if not isinstance(sheet_id, str) or not sheet_id:
+                        return _dumps({"ok": False, "error": "export_drawing: a sheet has "
+                                       "no stable id; no files were exported."})
+                    target = (svg_path if len(sheets) == 1 else
+                              _sanitize_output_path(f"{svg_stem}_{sheet_id}.svg"))
+                    svg_outputs.append((sheet_id, target))
+
+            targets = []
+            for export_fmt, target in [(fmt, out_path), *companion_paths]:
+                if export_fmt == "svg" and svg_outputs:
+                    targets.extend(target for _, target in svg_outputs)
+                else:
+                    targets.append(target)
+            if len(set(targets)) != len(targets):
+                return _dumps({"ok": False, "error": "export_drawing: output files resolve to "
+                               "the same destination. Nothing was exported."})
+
 
             def run_export(export_fmt: str, export_path: str) -> tuple[dict, Optional[dict]]:
+                if export_fmt == "svg" and svg_outputs:
+                    # Pass one already-sanitized path and exact sheet id per RPC. The native
+                    # all-sheet SVG writer constructs filenames itself, which would otherwise
+                    # bypass the per-file check if a sheet were added after this preflight.
+                    combined = {"format": "svg", "paths": [], "sheets": [], "sheet_mm_all": [],
+                                "fixed_page": True, "page_count": 0,
+                                "visible": 0, "hidden": 0, "annotations": 0, "entities": 0}
+                    for sheet_id, target in svg_outputs:
+                        result, unsupported = _drawing_rpc("export_drawing", "drawing_export", {
+                            "doc_id": d, "path": target, "fmt": "svg", "sheet": sheet_id})
+                        if unsupported:
+                            unsupported["paths"] = combined["paths"]
+                            unsupported["partial"] = bool(combined["paths"])
+                            return {}, unsupported
+                        result = result or {}
+                        combined["paths"].extend(result.get("paths") or
+                                                 [result.get("path") or target])
+                        combined["sheets"].extend(result.get("sheets") or [sheet_id])
+                        combined["sheet_mm_all"].extend(result.get("sheet_mm_all") or [])
+                        combined["page_count"] += result.get("page_count", 1)
+                        for key in ("visible", "hidden", "annotations", "entities"):
+                            combined[key] += result.get(key, 0)
+                        if "sheet_mm" not in combined and result.get("sheet_mm") is not None:
+                            combined["sheet_mm"] = result["sheet_mm"]
+                    combined["path"] = combined["paths"][0]
+                    return combined, None
                 params = {"doc_id": d, "path": export_path, "fmt": export_fmt}
                 if sheet_value is not None:
                     params["sheet"] = sheet_value
@@ -2426,13 +2890,11 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                 return _dumps(unsupported)
             paths = result_paths(primary, out_path)
 
-            stem = os.path.splitext(out_path)[0]
-            for companion_fmt in companion_formats:
-                companion_path = stem + "." + companion_fmt
+            for companion_fmt, companion_path in companion_paths:
                 companion, unsupported = run_export(companion_fmt, companion_path)
                 if unsupported:
-                    unsupported["paths"] = paths
-                    unsupported["partial"] = bool(paths)
+                    unsupported["paths"] = paths + unsupported.get("paths", [])
+                    unsupported["partial"] = bool(unsupported["paths"])
                     return _dumps(unsupported)
                 paths.extend(result_paths(companion, companion_path))
 
@@ -2468,13 +2930,27 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
         coverage, zero standards failures, and the layout is clean.  Never release a
         nominal-only sheet from review_drawing alone.
         """
-        d = _doc(doc_id)
-        png = _tmp(".png")
-        rd = cb.call("drawing_render_png", {"doc_id": d, "out_path": png})
-        if not rd.get("ok") or not os.path.exists(png):
-            raise ValueError(f"Drawing render failed: {rd.get('reason', 'not a drawing doc?')}")
-        full = cb.call("drawing_get", {"doc_id": d})
-        return [Image(path=png), _dumps(_drawing_review_summary(full, rd, audit_result))]
+        png = None
+        try:
+            d = _doc(doc_id)
+            png = _tmp(".png")
+            rd = cb.call("drawing_render_png", {"doc_id": d, "out_path": png})
+            if not rd.get("ok") or not os.path.exists(png):
+                raise ValueError(f"Drawing render failed: {rd.get('reason', 'not a drawing doc?')}")
+            full = cb.call("drawing_get", {"doc_id": d})
+            with open(png, "rb") as image:
+                rendered = Image(data=image.read(), format="png")
+            summary = _drawing_review_summary(full, rd, audit_result)
+            os.unlink(png)
+            png = None
+            return [rendered, _dumps(summary)]
+        except Exception as exc:  # noqa: BLE001
+            if png and os.path.exists(png):
+                try:
+                    os.unlink(png)
+                except OSError as cleanup:
+                    return _err(RuntimeError(f"{exc}; temporary PNG cleanup failed: {cleanup}"))
+            return _err(exc)
 
     @mcp.tool()
     def audit_drawing(doc_id: str, drawing_id: str, spec: Any) -> str:
@@ -2482,10 +2958,11 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
 
         ``spec`` is REQUIRED and contains requirement rows (a list, or
         ``{"requirements":[...]}``).  Each row names type=dimension_tolerance|thread|finish|
-        note|gdt|datum|weld|title_field, an optional annotation_id, and critical=true by
-        default.  ``coverage_matrix`` resolves those rows; ``standards`` independently checks
-        the controlled title block/units, GD&T datum order and composite shape, thread grammar
-        and extent, dangling annotation anchors, and inverse surface-finish-note consistency.
+        note|gdt|datum|weld|title_field, optional annotation_id and view_id, and critical=true
+        by default. Annotation ids are local to a view: provide both ids, or a colliding
+        ID-only requirement is ambiguous and cannot establish coverage. ``standards`` checks
+        the controlled title block/units and view scale, GD&T, thread grammar and extent,
+        dangling annotation anchors, and inverse surface-finish-note consistency.
         release_ready requires complete critical coverage, clean layout, and zero standards
         failures.
         """
@@ -2504,7 +2981,8 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                              f"{source!r}, not doc_id={doc_id!r}. Nothing was audited.",
                 })
             coverage = _audit_coverage(full, rows)
-            missing = [row for row in coverage if row["status"] == "missing"]
+            coverage.extend(_model_drawing_coverage(full, str(source or doc_id)))
+            missing = [row for row in coverage if row["status"] != "covered"]
             missing_critical = [row for row in missing if row["critical"]]
             standards = _audit_standards(full, rows)
             standards_failures = standards["failures"]
@@ -2526,6 +3004,7 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                 "covered": len(coverage) - len(missing),
                 "total": len(coverage),
                 "missing": missing,
+                "ambiguous": [row for row in missing if row["status"] == "ambiguous"],
                 "missing_critical": missing_critical,
                 "layout_warnings": layout_warnings,
                 "layout_clean": not layout_warnings,
@@ -2759,7 +3238,13 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
             return _err(e)
 
     @mcp.tool()
-    def add_hole_callout(view_id: str, a: Any, doc_id: Optional[str] = None,
+    def add_hole_callout(
+                         view_id: str,
+                         a: Annotated[list[float], Field(
+                             min_length=2, max_length=2,
+                             description="Two sheet-mm coordinates [x,y] at/near the projected "
+                                         "circle or its center; not a model SID.")],
+                         doc_id: Optional[str] = None,
                          feature_ref: Optional[Any] = None,
                          hole_type: Optional[str] = None, thread: Optional[str] = None,
                          diameter: Optional[float] = None, depth: Optional[float] = None,
@@ -2768,12 +3253,15 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                          csk_dia: Optional[float] = None, csk_depth: Optional[float] = None,
                          csk_angle: Optional[float] = None, count: Optional[int] = None,
                          pos: Optional[Any] = None) -> str:
-        """Add a semantic hole/thread callout at projected circle pick ``a``.
+        """Add a semantic hole/thread callout.
 
-        feature_ref may be a source Hole id/name; its style, thread, depth, end condition,
-        counterbore/countersink fields and pattern count fill any omitted arguments.  Explicit
-        arguments win.  Example: thread="M6x1.0", depth=14 emits ``M6x1.0 ↧ 14`` rather than
-        the tap-drill diameter.  thru=true emits THRU.
+        ``a`` is [x,y] in sheet millimetres, at or near the projected circle or its centre.
+        The engine picks the nearest closed projected circle in ``view_id``; a model SID or
+        3D coordinate is not supported. Use review_drawing to inspect circle centres.
+
+        feature_ref must identify a source Hole feature when thread, depth, counterbore,
+        countersink, or through-hole details are requested. Explicit details must agree with
+        that feature; diameter must agree with the selected projected circle.
         """
         try:
             d = _doc(doc_id)
@@ -2799,9 +3287,35 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                 "csk_dia": csk_dia, "csk_depth": csk_depth, "csk_angle": csk_angle,
                 "count": count,
             }
+            detailed = ("thread", "depth", "thru", "cbore_dia", "cbore_depth",
+                        "csk_dia", "csk_depth", "csk_angle")
+            if feature_ref is None and any(values[key] is not None for key in detailed):
+                return _dumps({"ok": False, "error": "add_hole_callout: thread, depth and "
+                               "counterbore/countersink details require a Hole feature_ref."})
+            if count is not None and (feature_ref is None or defaults.get("count") != count):
+                return _dumps({"ok": False, "error": "add_hole_callout: count must agree with "
+                               "the explicitly positioned holes in feature_ref."})
+            if feature_ref is not None:
+                for key in detailed:
+                    supplied = values[key]
+                    if supplied is None:
+                        continue
+                    expected = defaults.get(key)
+                    equal = (math.isclose(float(supplied), float(expected), abs_tol=1e-6)
+                             if isinstance(supplied, (int, float)) and not isinstance(supplied, bool)
+                             and isinstance(expected, (int, float)) and not isinstance(expected, bool)
+                             else str(supplied).casefold() == str(expected).casefold())
+                    if expected is None or not equal:
+                        return _dumps({"ok": False, "error": f"add_hole_callout: {key} "
+                                       "does not agree with the selected Hole feature."})
             for key, value in defaults.items():
                 if values.get(key) is None:
                     values[key] = value
+            if thread is not None and hole_type is None:
+                values["hole_type"] = "tapped"
+            elif hole_type is not None and thread is None and _canon_word(hole_type) not in {
+                    "tap", "tapped", "thread"}:
+                values["thread"] = None
             style = _canon_word(values.get("hole_type") or "")
             style = {
                 "tap": "tapped", "thread": "tapped",
@@ -2821,6 +3335,16 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
             if style not in {"simple", "tapped", "counterbore", "countersink"}:
                 return _dumps({"ok": False, "error": "add_hole_callout: hole_type must be "
                                "simple|tapped|counterbore|countersink. Nothing was added."})
+            if ((feature_ref is None and style != "simple") or
+                    (feature_ref is not None and style != defaults.get("hole_type"))):
+                return _dumps({"ok": False, "error": "add_hole_callout: hole_type must agree "
+                               "with a referenced Hole feature."})
+            required = {"tapped": ("thread",), "counterbore": ("cbore_dia", "cbore_depth"),
+                        "countersink": ("csk_dia", "csk_angle")}.get(style, ())
+            missing = [key for key in required if values.get(key) is None]
+            if missing:
+                return _dumps({"ok": False, "error": "add_hole_callout: the selected feature "
+                               f"does not establish {', '.join(missing)}; no callout was added."})
             for field in ("diameter", "depth", "cbore_dia", "cbore_depth", "csk_dia",
                           "csk_depth", "csk_angle"):
                 if values[field] is not None and (
@@ -2832,13 +3356,40 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                     return _dumps({"ok": False, "error": "add_hole_callout: count must be a "
                                    "positive integer. Nothing was added."})
                 values["count"] = int(values["count"])
-            opts: dict = {"hole_type": style}
+            if feature_ref is not None:
+                view = _find_view(full, view_id) or {}
+                circles = [arc for arc in view.get("arcs") or []
+                           if isinstance(arc, dict) and arc.get("closed")
+                           and isinstance(arc.get("radius"), (int, float))
+                           and isinstance(arc.get("center"), list)
+                           and len(arc["center"]) == 2]
+                nondegenerate = [arc for arc in circles if arc["radius"] >= 0.05]
+                circles = nondegenerate or circles
+                if not circles:
+                    return _dumps({"ok": False, "error": "add_hole_callout: no projected "
+                                   "circle can be matched to the selected feature."})
+                chosen = min(circles, key=lambda arc: (
+                    round(abs(math.hypot(float(a[0]) - arc["center"][0],
+                                         float(a[1]) - arc["center"][1]) - arc["radius"]), 9),
+                    arc.get("layer") != "visible"))
+                source = full.get("source_doc_id") or full.get("source")
+                owned = {match.get("sid") for match in _feature_owned_matches(source, feature_ref)}
+                if not owned.intersection(_src_sids(chosen.get("src"))):
+                    return _dumps({"ok": False, "error": "add_hole_callout: the picked circle "
+                                   "does not belong to the selected Hole feature."})
+            opts: dict = {"hole_type": style, "count": values["count"] or 1}
+            if feature_ref is not None:
+                token = str(feature_ref).strip().casefold()
+                feature = next(f for f in _source_features(source)
+                               if token in {str(f.get("id") or "").casefold(),
+                                            str(f.get("name") or "").casefold()})
+                opts["feature_ref"] = feature["id"]
             for key in ("thread", "diameter", "depth", "cbore_dia", "cbore_depth", "csk_angle"):
-                if values[key] is not None:
+                if values[key] is not None and not (
+                        key == "depth" and style == "simple" and values["thru"]):
                     opts[key] = values[key]
             if values["csk_dia"] is not None:
-                # The established engine field is shared by counterbores and countersinks.
-                opts["cbore_dia"] = values["csk_dia"]
+                # Countersink and counterbore diameters are independent model fields.
                 opts["csk_dia"] = values["csk_dia"]
             suffixes = []
             if values["thru"]:
@@ -2859,12 +3410,6 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
             if (result or {}).get("suppressed"):
                 return _dumps({"ok": False, "reason": (result or {}).get("reason"),
                                "tool": "add_hole_callout"})
-            if values["count"] is not None and annotation.get("id"):
-                patched = cb.call("drawing_set_annotation", {
-                    "doc_id": d, "view_id": view_id, "ann_id": annotation["id"],
-                    "patch": {"count": values["count"]},
-                })
-                annotation = patched.get("annotation") or annotation
             return _dumps({
                 "ok": True, "annotation": annotation.get("id"), "view_id": view_id,
                 "text": annotation.get("text"), "hole_type": style,
@@ -2926,7 +3471,8 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                       doc_id: Optional[str] = None, text: Optional[str] = None,
                       tol_type: str = "none", tol_upper: Optional[float] = None,
                       tol_lower: Optional[float] = None,
-                      precision: Optional[int] = None) -> str:
+                      precision: Optional[int] = None, c: Optional[Any] = None,
+                      d: Optional[Any] = None) -> str:
         """Add a dimension to a view. doc_id = drawing_doc_id.
 
         a, b name WHAT to dimension, either way round:
@@ -2948,13 +3494,17 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                "radius"/"radial" -> radial_dim (it reads r). Those two are NOT synonyms.
                radial_dim / diameter_dim / center_mark are determined by the ARC alone: pass
                only `a`. A note also takes only `a`, plus text="...".
+               angular_dim takes four sheet points a,b,c,d or two visible line edge SIDs a,b.
+               linear_dim/aligned_dim also accept one straight edge SID, or two parallel
+               planar face SIDs when the view exposes their true distance.
+               A model anchor that cannot be re-resolved is reported stale, not authoritative.
         To auto-dimension a whole view instead, use make_drawing's model_items.
 
         view_id accepts a numeric id (v1, v2, …) OR an orientation string ("front", "top", …)
         matching the view labels returned by review_drawing / make_drawing.
         """
         try:
-            d = _doc(doc_id)
+            drawing_id = _doc(doc_id)
             notes: list = []
             # LIVE-DIALECT guard: the suffix-less drafting word ("diameter") used to reach the
             # engine untouched and be rejected as "not recognized" — see _canon_dim_type.
@@ -2996,6 +3546,7 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
             if bad:
                 return _dumps(bad)
             b_pt = b_target = None
+            edge_single = bool(a_target and b is None and dtype in {"linear_dim", "aligned_dim"})
             if dtype in _ARC_DETERMINED:
                 # The engine reads the nearest arc and never looks at b for these three
                 # (drawing_session.cpp:1034-1061), which is why b is optional here.
@@ -3014,23 +3565,69 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                         return _dumps(bad)
                 else:
                     b_pt = list(a_pt) if a_pt else None
-            elif b is None:
+            elif b is None and not edge_single:
                 return _dumps({
                     "ok": False,
                     "error": f"add_dimension: {dtype} measures BETWEEN two picks, so it needs "
                              f"both a and b (sheet-mm points, or model targets like "
                              f'a="F6356a7"). Only radial_dim / diameter_dim / center_mark and '
                              f"note take a alone. Nothing was added."})
-            else:
+            elif b is not None:
                 b_pt, b_target, bad = _point_or_target(b, "b")
                 if bad:
                     return _dumps(bad)
+            c_pt = d_pt = None
+            line_pair = dtype == "angular_dim" and bool(a_target and b_target)
+            if line_pair and (c is not None or d is not None):
+                return _dumps({"ok": False, "error": "add_dimension: use two line SIDs or "
+                               "four sheet points for angular_dim, not both."})
+            if dtype == "angular_dim" and not line_pair:
+                for slot, value in (("c", c), ("d", d)):
+                    point, target, bad = _point_or_target(value, slot)
+                    if bad:
+                        return _dumps(bad)
+                    if target or len(point) != 2:
+                        return _dumps({"ok": False, "error": f"add_dimension: {slot} must be "
+                                       "a [x,y] sheet point for angular_dim."})
+                    if slot == "c":
+                        c_pt = point
+                    else:
+                        d_pt = point
+            elif c is not None or d is not None:
+                return _dumps({"ok": False, "error": "add_dimension: c and d are only used "
+                               "for angular_dim."})
             # D7: resolve orientation strings ("front"/"top"/…) to numeric view ids.
-            view_id = _resolve_drawing_view_id(d, view_id)
+            view_id = _resolve_drawing_view_id(drawing_id, view_id)
             resolved: dict = {}
+            source_refs: dict = {}
+            if edge_single or line_pair:
+                full = cb.call("drawing_get", {"doc_id": drawing_id})
+                src = full.get("source_doc_id") or drawing_id
+                a_pt, b_pt = _target_projected_line(full, src, view_id, a_target,
+                                                     interior=line_pair)
+                resolved["a"] = {"from": a_target[0], "line": [a_pt, b_pt]}
+                source_refs.update({"a": a_target[0], "b": a_target[0]})
+                if line_pair:
+                    c_pt, d_pt = _target_projected_line(full, src, view_id, b_target,
+                                                         interior=True)
+                    resolved["b"] = {"from": b_target[0], "line": [c_pt, d_pt]}
+                    source_refs.update({"c": b_target[0], "d": b_target[0]})
+                a_target = b_target = None
+            if (dtype in {"linear_dim", "aligned_dim"} and a_target and b_target
+                    and len(a_target) == len(b_target) == 1):
+                full = cb.call("drawing_get", {"doc_id": drawing_id})
+                src = full.get("source_doc_id") or drawing_id
+                planar = {m.get("sid") for m in _source_entities(src)
+                          if m.get("kind") == "face" and m.get("surf") == "plane"}
+                if a_target[0] in planar and b_target[0] in planar:
+                    a_pt, b_pt, source_refs = _target_face_distance(
+                        full, src, view_id, a_target[0], b_target[0], dtype)
+                    resolved["a"] = {"from": a_target[0], "sheet_point": a_pt}
+                    resolved["b"] = {"from": b_target[0], "sheet_point": b_pt}
+                    a_target = b_target = None
             if a_target or b_target:
-                full = cb.call("drawing_get", {"doc_id": d})
-                src = full.get("source_doc_id") or d
+                full = cb.call("drawing_get", {"doc_id": drawing_id})
+                src = full.get("source_doc_id") or drawing_id
                 for slot, tokens in (("a", a_target), ("b", b_target)):
                     if not tokens:
                         continue
@@ -3074,7 +3671,7 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
             # diameter / center_mark snap to the nearest arc themselves and center_line / note
             # are construction, so none of them are checked here.
             if dtype in ("linear_dim", "aligned_dim") and a_pt and b_pt:
-                vbb = _bbox_of(_find_view(cb.call("drawing_get", {"doc_id": d}), view_id) or {})
+                vbb = _bbox_of(_find_view(cb.call("drawing_get", {"doc_id": drawing_id}), view_id) or {})
                 if vbb:
                     def _outside(p: list) -> bool:
                         return not (vbb[0] - 1e-6 <= p[0] <= vbb[2] + 1e-6
@@ -3099,9 +3696,14 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                             f"({shown} sheet mm) — the dimension was placed as asked, but "
                             f"check it is measuring the edge you meant")
             pos = require_list(pos, "pos", "a [x,y] sheet-mm point") if pos else None
-            params = {"doc_id": d, "view_id": view_id, "type": dtype, "a": a_pt}
+            params = {"doc_id": drawing_id, "view_id": view_id, "type": dtype, "a": a_pt}
+            if source_refs:
+                params["source_refs"] = source_refs
             if b_pt is not None:
                 params["b"] = b_pt
+            if c_pt is not None:
+                params["c"] = c_pt
+                params["d"] = d_pt
             if pos:
                 params["pos"] = pos
             if text is not None:
@@ -3120,14 +3722,17 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
             if patch and ann.get("id"):
                 try:
                     updated = cb.call("drawing_set_annotation", {
-                        "doc_id": d, "view_id": view_id, "ann_id": ann["id"], "patch": patch})
+                        "doc_id": drawing_id, "view_id": view_id, "ann_id": ann["id"], "patch": patch})
                     ann = updated.get("annotation") or ann
                 except Exception:
                     cb.call("drawing_remove_annotation", {
-                        "doc_id": d, "view_id": view_id, "ann_id": ann["id"]})
+                        "doc_id": drawing_id, "view_id": view_id, "ann_id": ann["id"]})
                     raise
             out = {"ok": True, "annotation": ann.get("id"), "dtype": dtype,
                    "tol_type": ann.get("tol_type", "none")}
+            for key in ("stale", "stale_reason", "overridden"):
+                if key in ann:
+                    out[key] = ann[key]
             if "value" in ann:
                 out["value"] = ann["value"]
             if ann.get("text"):
@@ -3141,27 +3746,41 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
             return _err(e)
 
     @mcp.tool()
-    def add_chamfer_dimension(view_id: str, a: Any, pos: Any, length: float,
-                              angle: float = 45.0, doc_id: Optional[str] = None,
-                              text: Optional[str] = None) -> str:
-        """Add a native chamfer callout (default text ``length × angle°``)."""
+    def add_chamfer_dimension(view_id: str, a: Any, pos: Any, feature_ref: Optional[str] = None,
+                              length: Optional[float] = None, angle: Optional[float] = None,
+                              doc_id: Optional[str] = None, text: Optional[str] = None) -> str:
+        """Dimension a chamfer feature at its visible edge; size and angle come from the model.
+
+        Pass a visible chamfer-edge SID or a [x,y] sheet point on its edge; feature_ref may
+        explicitly name the chamfer feature. Supplied length/angle must agree with the model.
+        """
         try:
             for field, value in (("length", length), ("angle", angle)):
-                if bad := _positive(value, field, "add_chamfer_dimension"):
+                if value is not None and (bad := _positive(value, field, "add_chamfer_dimension")):
                     return _dumps(bad)
-            if float(angle) >= 180.0:
-                return _dumps({"ok": False, "error": "add_chamfer_dimension: angle must be "
-                               "between 0 and 180 degrees. Nothing was added."})
             d = _doc(doc_id)
             view_id = _resolve_drawing_view_id(d, view_id)
-            a = require_list(a, "a", "a [x,y] sheet-mm attachment point")
+            point, target, bad = _point_or_target(a, "a")
+            if bad:
+                return _dumps(bad)
+            spec: dict = {}
+            if target:
+                full = cb.call("drawing_get", {"doc_id": d})
+                source = full.get("source_doc_id") or d
+                line = _target_projected_line(full, source, view_id, target, interior=True)
+                point = [(line[0][i] + line[1][i]) / 2 for i in (0, 1)]
+                spec["edge_sid"] = target[0]
             pos = require_list(pos, "pos", "a [x,y] sheet-mm text position")
-            params = {
-                "doc_id": d, "view_id": view_id, "a": a, "pos": pos,
-                "length": float(length), "angle": float(angle),
-            }
+            spec.update({"a": point, "pos": pos})
+            if feature_ref is not None:
+                spec["feature_ref"] = feature_ref
+            if length is not None:
+                spec["length"] = float(length)
+            if angle is not None:
+                spec["angle"] = float(angle)
             if text is not None:
-                params["text"] = text
+                spec["text"] = text
+            params = {"doc_id": d, "view_id": view_id, "spec": spec}
             result, unsupported = _drawing_rpc(
                 "add_chamfer_dimension", "drawing_add_chamfer_dimension", params)
             if unsupported:
@@ -3169,7 +3788,8 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
             annotation = (result or {}).get("annotation") or {}
             return _dumps({"ok": True, "annotation": annotation.get("id"),
                            "kind": annotation.get("kind", "chamfer"),
-                           "text": annotation.get("text")})
+                           "text": annotation.get("text"), "length": annotation.get("length"),
+                           "angle": annotation.get("angle"), "stale": annotation.get("stale")})
         except Exception as exc:  # noqa: BLE001
             return _err(exc)
 
@@ -3179,7 +3799,8 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                                 positions: Optional[Any] = None) -> str:
         """Add native datum-origin ordinate dimensions for target sheet points.
 
-        axis is x|y|both. ``positions`` optionally supplies one text position per target.
+        axis is x|y|both. ``positions`` supplies one [x,y] per target; for both axes,
+        use {"x": [...], "y": [...]} so the two sets of labels do not overlap.
         The engine computes model-unit deltas from the view scale; this tool never fabricates
         dimension values.
         """
@@ -3190,31 +3811,42 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                                "x|y|both. Nothing was added."})
             origin = require_list(origin, "origin", "a [x,y] sheet-mm datum origin")
             points = require_list(points, "points", "one or more [x,y] sheet-mm targets")
-            if len(origin) != 2 or not points or any(
-                    not isinstance(point, list) or len(point) != 2
-                    or not all(isinstance(value, (int, float)) for value in point)
-                    for point in points):
+            def point_ok(point):
+                return (isinstance(point, (list, tuple)) and len(point) == 2
+                        and all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                                and math.isfinite(value) for value in point))
+            if not point_ok(origin) or not points or any(not point_ok(point) for point in points):
                 return _dumps({"ok": False, "error": "add_ordinate_dimensions: origin must be "
                                "[x,y] and points must be a non-empty list of [x,y] values. "
                                "Nothing was added."})
+            positions_by_axis = {}
             if positions is not None:
-                positions = require_list(positions, "positions",
-                                         "one [x,y] text position per target")
-                if len(positions) != len(points):
-                    return _dumps({"ok": False, "error": "add_ordinate_dimensions: positions "
-                                   "must have the same length as points. Nothing was added."})
+                decoded = coerce_json_or_repr(positions) if isinstance(positions, str) else positions
+                if axis == "both":
+                    if not isinstance(decoded, dict) or set(decoded) != {"x", "y"}:
+                        return _dumps({"ok": False, "error": "add_ordinate_dimensions: axis=both "
+                                       "requires positions={'x': [...], 'y': [...]}."})
+                    positions_by_axis = decoded
+                else:
+                    positions_by_axis = {axis: decoded}
+                for one_axis, locations in positions_by_axis.items():
+                    if (not isinstance(locations, list) or len(locations) != len(points)
+                            or any(not point_ok(location) for location in locations)):
+                        return _dumps({"ok": False, "error": "add_ordinate_dimensions: positions "
+                                       f"for {one_axis} must contain one [x,y] per point."})
             d = _doc(doc_id)
             view_id = _resolve_drawing_view_id(d, view_id)
-            base_params = {"doc_id": d, "view_id": view_id, "origin": origin,
-                           "points": points}
-            if positions is not None:
-                base_params["positions"] = positions
+            base_params = {"doc_id": d, "view_id": view_id, "origin": origin}
             annotations: list = []
             try:
                 for one_axis in (("x", "y") if axis == "both" else (axis,)):
+                    locations = positions_by_axis.get(one_axis)
+                    axis_points = ([{"point": point, "pos": position}
+                                    for point, position in zip(points, locations)]
+                                   if locations is not None else points)
                     result, unsupported = _drawing_rpc(
                         "add_ordinate_dimensions", "drawing_add_ordinate_dimensions",
-                        {**base_params, "axis": one_axis})
+                        {**base_params, "points": axis_points, "axis": one_axis})
                     if unsupported:
                         for annotation in annotations:
                             if isinstance(annotation, dict) and annotation.get("id"):
@@ -3328,6 +3960,9 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
         view_id accepts a numeric id (v1, v2, …) OR an orientation string ("front"/"top"/…).
         """
         try:
+            label = str(label).strip().upper()
+            if not _re.fullmatch(r"[A-Z]", label):
+                return _dumps({"ok": False, "error": "add_datum: label must be one letter A-Z."})
             d = _doc(doc_id)
             a = require_list(a, "a", "a [x,y] sheet-mm point")
             pos = require_list(pos, "pos", "a [x,y] sheet-mm point")
@@ -3471,6 +4106,10 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
 
         view_id accepts a numeric id (v1, v2, …) OR an orientation string ("front"/"top"/…)."""
         try:
+            machining, bad = _word(machining, frozenset({"any", "required", "prohibited"}),
+                                   "machining", "add_surface_finish")
+            if bad:
+                return _dumps(bad)
             d = _doc(doc_id)
             a = require_list(a, "a", "a [x,y] sheet-mm point")
             pos = require_list(pos, "pos", "a [x,y] sheet-mm point")
@@ -3544,7 +4183,10 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                    "position": view.get("position"), "scale": view.get("scale"),
                    "orientation": view.get("orientation"),
                    "show_hidden": view.get("show_hidden")}
-            report, warnings = _layout_report(cb.call("drawing_get", {"doc_id": d}), view_id)
+            full = cb.call("drawing_get", {"doc_id": d})
+            report, warnings = _layout_report(full, view_id)
+            if scale is not None:
+                warnings.extend(finding["message"] for finding in _drawing_scale_findings(full))
             out.update(report)
             if warnings:
                 out["warnings"] = warnings
@@ -3718,6 +4360,7 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def set_titleblock(fields: Optional[dict] = None, doc_id: Optional[str] = None,
+                       sheet_id: Optional[str] = None,
                        **kwargs: Annotated[Any, Field(default=None)]) -> str:
         """Fill the drawing's title block. doc_id = drawing_doc_id. fields is a dict of any of:
         title, drawn_by, date, material, finish, scale, rev, sheet, part_number, company.
@@ -3766,11 +4409,19 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                 return _dumps(bad)
             notes.extend(folded)
             r = cb.call("drawing_set_titleblock",
-                        {"doc_id": d, "sheet_id": "s1",
+                        {"doc_id": d, "sheet_id": sheet_id or "",
                          "fields": _titleblock_payload(canon)})
             tb = r.get("title_block") or {}
-            out = {"ok": True, "sheet_id": r.get("sheet_id", "s1"),
+            out = {"ok": True, "sheet_id": r.get("sheet_id"),
                    "fields_set": sorted(canon), "title_block": tb}
+            if "scale" in canon:
+                full = r.get("drawing")
+                if isinstance(full, dict):
+                    warnings = [finding["message"] for finding in _drawing_scale_findings(full)]
+                    if warnings:
+                        out["warnings"] = warnings
+                else:
+                    out["warnings"] = ["could not read back the drawing to verify view scales"]
             if notes:
                 out["interpreted"] = notes
             return _dumps(out)
@@ -3788,6 +4439,8 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
         delete=true removes it. Otherwise pass fields (or flattened kwargs) containing any of:
         text, prefix, suffix, precision, critical, count, pos, value, tol_type, tol_upper,
         tol_lower. Empty text clears a prior verbatim override and recomposes a numeric dim.
+        Null patch values are not supported and are refused atomically; use tol_type="none"
+        to remove a displayed tolerance.
         """
         try:
             d = _doc(doc_id)
@@ -3798,7 +4451,7 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                     kwargs.setdefault(key, value)
             fields = require_mapping(fields, "fields",
                                      "an annotation patch dict") if fields else {}
-            patch = {**fields, **{k: v for k, v in kwargs.items() if v is not None}}
+            patch = {**fields, **kwargs}
             allowed = {
                 "tol_type", "tol_upper", "tol_lower", "prefix", "suffix",
                 "precision", "critical", "count", "pos", "value", "text",
@@ -3810,6 +4463,30 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                     "error": "edit_drawing_annotation: unsupported field(s) "
                              + ", ".join(unknown) + "; valid fields are "
                              + ", ".join(sorted(allowed))})
+            def valid_field(key: str, value: Any) -> bool:
+                if key in {"tol_type", "prefix", "suffix", "text"}:
+                    return isinstance(value, str)
+                if key == "critical":
+                    return isinstance(value, bool)
+                if key in {"precision", "count"}:
+                    return isinstance(value, int) and not isinstance(value, bool)
+                if key in {"tol_upper", "tol_lower", "value"}:
+                    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                            and math.isfinite(value))
+                if key == "pos":
+                    return (isinstance(value, list) and len(value) == 2
+                            and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                                    and math.isfinite(v) for v in value))
+                return False
+
+            invalid = [key for key, value in patch.items() if not valid_field(key, value)]
+            if invalid:
+                return _dumps({
+                    "ok": False, "reason": "invalid_annotation_patch",
+                    "error": "edit_drawing_annotation: invalid value or unsupported null for "
+                             + ", ".join(sorted(invalid)) + ". Nothing changed.",
+                    "invalid_fields": sorted(invalid),
+                })
             if delete and patch:
                 return _dumps({
                     "ok": False,
@@ -3839,8 +4516,24 @@ def register_cad_drawing_tools(mcp: FastMCP) -> None:
                 "doc_id": d, "view_id": view_id, "ann_id": annotation_id,
                 "patch": patch})
             annotation = result.get("annotation") or {}
-            return _dumps({
-                "ok": True, "view_id": view_id, "annotation": annotation,
-                "fields_set": sorted(patch)})
+            def applied(key: str, value: Any) -> bool:
+                if key == "text":
+                    if annotation.get("text_override") != value:
+                        return False
+                    kind = _canon_word(annotation.get("kind") or annotation.get("type"))
+                    if kind not in {"linear_dim", "aligned_dim", "radial_dim", "diameter_dim",
+                                    "angular_dim", "hole_callout", "ordinate_dim"}:
+                        return annotation.get("text") == value
+                    return True
+                return key in annotation and annotation[key] == value
+
+            fields_set = sorted(key for key, value in patch.items() if applied(key, value))
+            not_applied = sorted(set(patch) - set(fields_set))
+            out = {"ok": not not_applied, "view_id": view_id, "annotation": annotation,
+                   "fields_set": fields_set}
+            if not_applied:
+                out["fields_not_applied"] = not_applied
+                out["error"] = "The engine did not apply every field; inspect annotation readback."
+            return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _err(e)

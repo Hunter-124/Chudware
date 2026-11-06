@@ -41,12 +41,7 @@ constexpr float kCreaseDeg = 30.0f;
 const float kCreaseCos = std::cos(kCreaseDeg * 3.14159265f / 180.0f);
 }  // namespace
 
-bool loadBinarySTL(const std::string& path, Mesh& out, std::string& err) {
-    FILE* f = std::fopen(path.c_str(), "rb");
-    if (!f) {
-        err = "cannot open " + path;
-        return false;
-    }
+static bool loadBinarySTLStream(FILE* f, Mesh& out, std::string& err) {
     char header[80];
     if (std::fread(header, 1, 80, f) != 80) {
         err = "short header";
@@ -252,3 +247,27 @@ bool loadBinarySTL(const std::string& path, Mesh& out, std::string& err) {
     }
     return !out.indices.empty();
 }
+
+bool loadBinarySTL(const std::string& path, Mesh& out, std::string& err) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) {
+        err = "cannot open " + path;
+        return false;
+    }
+    return loadBinarySTLStream(f, out, err);
+}
+
+#ifdef __EMSCRIPTEN__
+bool loadBinarySTLBytes(const uint8_t* data, size_t size, Mesh& out, std::string& err) {
+    if (!data || !size) {
+        err = "empty STL";
+        return false;
+    }
+    FILE* f = fmemopen(const_cast<uint8_t*>(data), size, "rb");
+    if (!f) {
+        err = "cannot open STL memory";
+        return false;
+    }
+    return loadBinarySTLStream(f, out, err);
+}
+#endif

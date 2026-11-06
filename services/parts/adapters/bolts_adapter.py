@@ -11,6 +11,7 @@ and contracts/licenses.md. NOT BOLTS GPL data.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Iterator
 
 from services.parts import bolts_loader
@@ -49,6 +50,14 @@ class BoltsAdapter:
             self._tables = bolts_loader.load_bolts_tables(self._data_dir)
         return self._tables
 
+    def invalidate_cache(self) -> None:
+        """Reload the dimensional tables before rebuilding the index."""
+        self._tables = None
+
+    def fingerprint_paths(self) -> list[Path]:
+        root = Path(self._data_dir).expanduser() if self._data_dir else bolts_loader.DATA_DIR
+        return [root, *bolts_loader._iter_blt_files(root)]
+
     # ------------------------------------------------------------------
     # CatalogProvider protocol
     # ------------------------------------------------------------------
@@ -62,10 +71,11 @@ class BoltsAdapter:
         for rec in self.iter_records():
             if domain and rec.get("domain") != domain:
                 continue
-            title = (rec.get("title") or "").lower()
-            designation = (rec.get("designation") or "").lower()
-            standard = (rec.get("standard") or "").lower()
-            if norm in title or norm in designation or norm in standard:
+            text = " ".join([str(rec.get("title") or ""),
+                             str(rec.get("designation") or ""),
+                             str(rec.get("standard") or ""),
+                             *rec.get("aliases", [])]).lower()
+            if norm in text:
                 results.append(rec)
         return results
 
@@ -87,13 +97,22 @@ class BoltsAdapter:
             return None
         std_id, size = sub
         tables = self._get_tables()
-        std = tables.get(std_id)
-        if std is None:
+        # Prefer standard IDs over aliases, and never pick an arbitrary standard
+        # when a normalized identifier or alias names more than one table.
+        norm = lambda value: re.sub(r"[\s_-]+", "", value).casefold()
+        candidates = [std for std in tables.values()
+                      if std.kind == domain_prefix and norm(std.id) == norm(std_id)]
+        if not candidates:
+            candidates = [std for std in tables.values()
+                          if std.kind == domain_prefix
+                          and any(norm(alias) == norm(std_id) for alias in std.aliases)]
+        if len(candidates) != 1:
             return None
-        params = std.get(size)
-        if params is None:
-            return None
-        return _make_record(std, size, params)
+        std = candidates[0]
+        for canonical_size, params in std.sizes.items():
+            if canonical_size.strip().upper().replace(" ", "") == size.strip().upper().replace(" ", ""):
+                return _make_record(std, canonical_size, params)
+        return None
 
     def count(self) -> int:
         """Return the number of (standard, size) pairs."""
@@ -116,9 +135,8 @@ def _make_record(std: Standard, size: str, params: dict) -> dict:
     catalog_id = f"{std.id}:{size}"
     part_id = f"{domain}:{catalog_id}"
 
-    # Build a human title with family synonyms for search.
     synonyms = _FAMILY_SYNONYMS.get(std.family, "")
-    title = f"{std.name} {size} {synonyms}".strip()
+    title = f"{std.name} {size}".strip()
 
     # geometry_ref: all bolts/bearings go via core_family (parts_make RPC).
     geometry_ref: dict = {
@@ -138,14 +156,15 @@ def _make_record(std: Standard, size: str, params: dict) -> dict:
         # ("DIN 912" / "SHCS" for ISO 4762) — publish them so they are searchable.
         # index._record_to_row folds `aliases` into the FTS text; without it a
         # buyer's "DIN 912 M3" found no fastener in the library at all.
-        "aliases":      list(std.aliases),
+        "aliases":      [*std.aliases, *([synonyms] if synonyms else [])],
         "designation":  size,
+        "family":       std.name,
         "params":       dict(params),
         "geometry_ref": geometry_ref,
         "sourcing":     [],
         "provenance":   (
             f"ISO/DIN clean-room dimensional data; standard {std.id!r}. "
-            "Source: engine_oracle/data/bolts/ (not BOLTS GPL data). "
+            "Source: services/parts/data/bolts/ (not BOLTS GPL data). "
             "See contracts/licenses.md."
         ),
         "license":      "clean-room",

@@ -1,6 +1,6 @@
 # Commands Reference
 
-Every ribbon command (518 total), grouped by tab and ribbon group.
+Every ribbon command (506 total), grouped by tab and ribbon group.
 
 ## Annotation
 
@@ -264,6 +264,10 @@ _Available from the Evaluate ▸ Geometry Check ribbon group._
 
 _Available from the Evaluate ▸ Geometry Check ribbon group._
 
+#### Model History
+
+_Available from the Evaluate ▸ Geometry Check ribbon group._
+
 ### Measure
 
 #### Mass Props.
@@ -466,11 +470,11 @@ _Available from the Features ▸ Dress-up ribbon group._
 
 #### Fillet
 
-FILLET - round off edges with a radius. params: `radius` (dim object). refs.edges names the edges.
+FILLET - round selected edges. `radius` and `radius2` are dimension parameters in mm.
 
 #### Rib
 
-_Available from the Features ▸ Dress-up ribbon group._
+RIB — build a thin supported web from an OPEN sketch contour.
 
 #### Shell
 
@@ -484,7 +488,7 @@ _Available from the Features ▸ Hole ribbon group._
 
 #### Thread
 
-THREAD — a ONE-OP helical thread cut on a cylindrical face. This is the easy way to
+THREAD — one feature for a helical thread on a cylindrical face. Use refs.target_face
 
 ### Multi-body
 
@@ -498,7 +502,7 @@ _Available from the Features ▸ Multi-body ribbon group._
 
 #### Split
 
-_Available from the Features ▸ Multi-body ribbon group._
+SPLIT — add_feature type='split' with refs.tool='plane.right' (or a planar face selector). params.keep='both' retains both pieces; 'above' or 'below' keeps the respective side of the tool plane normal. For example, add_features(ops=[{"op":"add_feature","feature":{"type":"split","name":"Halves","params":{"keep":"both"},"refs":{"tool":"plane.right"}}}]). Inspect resulting bodies.
 
 #### Subtract
 
@@ -1066,27 +1070,11 @@ _Available from the Motion ▸ Study ribbon group._
 
 _Available from the PCB Design ▸ Board ribbon group._
 
-#### Copper Zone
-
-_Available from the PCB Design ▸ Board ribbon group._
-
 #### Fill Zones
 
 _Available from the PCB Design ▸ Board ribbon group._
 
-#### Footprint
-
-_Available from the PCB Design ▸ Board ribbon group._
-
-#### Route
-
-_Available from the PCB Design ▸ Board ribbon group._
-
 #### Update Board
-
-_Available from the PCB Design ▸ Board ribbon group._
-
-#### Via
 
 _Available from the PCB Design ▸ Board ribbon group._
 
@@ -1096,23 +1084,15 @@ _Available from the PCB Design ▸ Board ribbon group._
 
 _Available from the PCB Design ▸ Checks ribbon group._
 
-### New
+### KiCad
 
-#### AI Design
+#### KiCad
 
-_Available from the PCB Design ▸ New ribbon group._
+_Available from the PCB Design ▸ KiCad ribbon group._
 
-#### Open
+#### PCB Editor
 
-_Available from the PCB Design ▸ New ribbon group._
-
-#### PCB Layout
-
-_Available from the PCB Design ▸ New ribbon group._
-
-#### Save
-
-_Available from the PCB Design ▸ New ribbon group._
+_Available from the PCB Design ▸ KiCad ribbon group._
 
 ### Outputs
 
@@ -1124,13 +1104,31 @@ _Available from the PCB Design ▸ Outputs ribbon group._
 
 _Available from the PCB Design ▸ Outputs ribbon group._
 
-#### Drill
+#### Fabrication
 
 _Available from the PCB Design ▸ Outputs ribbon group._
 
-#### Gerbers
+#### STEP
 
 _Available from the PCB Design ▸ Outputs ribbon group._
+
+### Project
+
+#### AI Design
+
+_Available from the PCB Design ▸ Project ribbon group._
+
+#### New Project
+
+_Available from the PCB Design ▸ Project ribbon group._
+
+#### Open
+
+ECAD / KICAD WORKFLOW
+
+#### Save
+
+_Available from the PCB Design ▸ Project ribbon group._
 
 ## Piping
 
@@ -1330,23 +1328,25 @@ _Available from the Reverse Eng ▸ Sources ribbon group._
 
 _Available from the Schematic ▸ Analyze ribbon group._
 
-### New
+### Checks
 
-#### New Schematic
+#### Run ERC
 
-_Available from the Schematic ▸ New ribbon group._
+_Available from the Schematic ▸ Checks ribbon group._
+
+### KiCad
+
+#### KiCad
+
+_Available from the Schematic ▸ KiCad ribbon group._
+
+#### Schematic Editor
+
+_Available from the Schematic ▸ KiCad ribbon group._
 
 ### Outputs
 
 #### BOM
-
-_Available from the Schematic ▸ Outputs ribbon group._
-
-#### Export KiCad
-
-_Available from the Schematic ▸ Outputs ribbon group._
-
-#### Import KiCad
 
 _Available from the Schematic ▸ Outputs ribbon group._
 
@@ -1358,73 +1358,23 @@ _Available from the Schematic ▸ Outputs ribbon group._
 
 _Available from the Schematic ▸ Outputs ribbon group._
 
-#### Plot / Print
+### Project
 
-_Available from the Schematic ▸ Outputs ribbon group._
+#### AI Design
 
-#### SPICE
+_Available from the Schematic ▸ Project ribbon group._
 
-_Available from the Schematic ▸ Outputs ribbon group._
+#### New Project
 
-#### SVG
+_Available from the Schematic ▸ Project ribbon group._
 
-_Available from the Schematic ▸ Outputs ribbon group._
+#### Open
 
-### Schematic
+ECAD / KICAD WORKFLOW
 
-#### Annotate
+#### Save
 
-_Available from the Schematic ▸ Schematic ribbon group._
-
-#### Bus
-
-_Available from the Schematic ▸ Schematic ribbon group._
-
-#### Junction
-
-_Available from the Schematic ▸ Schematic ribbon group._
-
-#### Net Label
-
-_Available from the Schematic ▸ Schematic ribbon group._
-
-#### No Connect
-
-_Available from the Schematic ▸ Schematic ribbon group._
-
-#### Place Symbol
-
-_Available from the Schematic ▸ Schematic ribbon group._
-
-#### Power Port
-
-_Available from the Schematic ▸ Schematic ribbon group._
-
-#### Run ERC
-
-_Available from the Schematic ▸ Schematic ribbon group._
-
-#### Text
-
-_Available from the Schematic ▸ Schematic ribbon group._
-
-#### Wire
-
-_Available from the Schematic ▸ Schematic ribbon group._
-
-### Sheet
-
-#### New Sheet
-
-_Available from the Schematic ▸ Sheet ribbon group._
-
-#### Properties
-
-_Available from the Schematic ▸ Sheet ribbon group._
-
-#### Sheet
-
-_Available from the Schematic ▸ Sheet ribbon group._
+_Available from the Schematic ▸ Project ribbon group._
 
 ## Sheet Metal
 
@@ -1995,6 +1945,10 @@ _Available from the Static ▸ Setup ribbon group._
 ### Study
 
 #### New Study
+
+_Available from the Static ▸ Study ribbon group._
+
+#### Wall Thickness
 
 _Available from the Static ▸ Study ribbon group._
 

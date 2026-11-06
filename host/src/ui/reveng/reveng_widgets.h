@@ -136,18 +136,18 @@ void  ThumbHoverPreview(unsigned int texId, int texW, int texH,
                         const std::vector<std::string>& metaLines);
 
 // Reserves a region for a GL 3D preview (point cloud / splat / mesh / deviation heatmap) and
-// publishes its screen rect so the post-ImGui GL pass can render into it. `slot` identifies
-// which renderer draws there. Returns the reserved rect in screen space.
+// queues the GL paint for it as a draw-list callback, so the content composites in ImGui's own
+// draw order: windows drawn later (Settings, modals, popups, tooltips) cover it like any widget.
+// `slot` identifies which renderer draws there. Returns the reserved rect in screen space.
 enum class PreviewSlot { None, SparseCloud, Splat, Mesh, Deviation, Parametric };
 ImRect Viewport3DPreview(const char* id, const ImVec2& box, PreviewSlot slot,
                          const char* emptyLabel = nullptr);
 
-// Rect published by the most recent Viewport3DPreview() for `slot` this frame, plus whether it
-// was drawn at all. app.cpp's post-ImGui GL pass consumes these instead of hardcoding regions.
-bool  previewSlotRect(PreviewSlot slot, ImRect& out);
-// Visible scissor clip, separate from the full rect that defines camera projection.
-bool  previewSlotClip(PreviewSlot slot, ImRect& out);
-void  resetPreviewSlots();   // call once per frame before drawing the workspace
+// GL painter for the preview slots, run from inside ImGui's render pass with ImGui's render state
+// bound (the state is reset after it returns). `rect` defines the camera projection, `clip` is
+// its visible part; both are ImGui screen space. Installed once by app.cpp.
+using PreviewSlotPainter = void (*)(PreviewSlot slot, const ImRect& rect, const ImRect& clip);
+void  setPreviewSlotPainter(PreviewSlotPainter painter);
 
 // ---- empty / error states ------------------------------------------------------------------------
 // Centred icon + title + explanatory body + optional call-to-action. Every stage MUST render one

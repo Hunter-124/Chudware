@@ -7,6 +7,7 @@
 #include "util/expr.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <chrono>
@@ -937,35 +938,40 @@ std::map<std::string, double> env_to_map(const json& env) {
     return m;
 }
 
-// Resolve a dimension constraint's float value. Mirrors _resolve_dim in
-// sketch_solver.py EXACTLY: when `expr` is a non-null string we (1) prefer a bare
-// env lookup if the whole expr string is itself an env key, else (2) evaluate it
-// as arithmetic through the equations evaluator. Only when there is no expr do we
-// fall back to the literal `value`. The evaluate() path matches the Python
-// equations.evaluate within 1e-9 (the differential-harness coord tolerance).
+// Resolve a dimension constraint's float value. A non-empty string `expr` wins: (1) a bare
+// env lookup when the whole string is itself an env key, else (2) arithmetic through the
+// equations evaluator. With no expr the literal `value` is used. A dimension whose
+// expression does not evaluate, or that carries neither expression nor numeric value, THROWS:
+// the caller records the constraint in `skipped` with this reason. It never falls back to
+// the literal value or to 0, so a dimension the solver cannot honour is never applied silently.
 double resolve_dim(const json& c, const json& env) {
-    if (!c.contains("value")) return 0.0;
+    const std::string id = c.value("id", std::string());
+    const std::string label = c.value("type", std::string("dimension")) +
+                              (id.empty() ? std::string() : " [" + id + "]");
+    if (!c.contains("value"))
+        throw std::runtime_error(label + " has no value: give value:{\"value\":N,\"expr\":null} or an expr");
     const json& v = c["value"];
     if (v.is_number()) return v.get<double>();
     if (v.is_object()) {
         if (v.contains("expr") && v["expr"].is_string()) {
-            std::string e = v["expr"];
-            // (1) bare-variable lookup wins (matches `expr in equations_env`).
-            if (env.is_object() && env.contains(e) && env[e].is_number()) {
-                return env[e].get<double>();
-            }
-            // (2) arithmetic expression -> evaluate. On any evaluator error we
-            // fall through to the literal `value` (forward-tolerant; the Python
-            // would raise, but the host's solve path catches that the same way).
-            try {
-                return chudware::util::evaluate(e, env_to_map(env));
-            } catch (const chudware::util::ExprError&) {
-                // fall through to literal value below
+            const std::string e = v["expr"].get<std::string>();
+            if (e.find_first_not_of(" \t\r\n") != std::string::npos) {
+                // (1) bare-variable lookup wins (matches `expr in equations_env`).
+                if (env.is_object() && env.contains(e) && env[e].is_number())
+                    return env[e].get<double>();
+                // (2) arithmetic expression -> evaluate.
+                try {
+                    return chudware::util::evaluate(e, env_to_map(env));
+                } catch (const chudware::util::ExprError& err) {
+                    throw std::runtime_error(label + ": expression '" + e +
+                                             "' could not be evaluated (" + err.what() +
+                                             "); the dimension is skipped, not replaced by its literal value");
+                }
             }
         }
         if (v.contains("value") && v["value"].is_number()) return v["value"].get<double>();
     }
-    return 0.0;
+    throw std::runtime_error(label + " has no numeric value or expression");
 }
 
 bool is_line_ref(const std::string& h, const EntMap& entities) {
@@ -983,6 +989,77 @@ Eigen::RowVectorXd rowdot(const Vector2d& d, const MatrixXd& J) {
 }
 
 // ---- constraint builders ----------------------------------------------------
+
+// A directed rotation relation remains well-defined even when the source lies
+// exactly at the pivot, unlike an angle between zero-length construction lines.
+void add_rotated_point(System& sys, const std::string& cid, const std::string& source,
+                       const std::string& target, const std::string& pivot, double degrees,
+                       const EntMap& entities, const VarMap& vars) {
+    Handle a = resolve_handle(source, entities, vars);
+    Handle b = resolve_handle(target, entities, vars);
+    Handle p = resolve_handle(pivot, entities, vars);
+    const int ka = static_cast<int>(a.idx.size()), kb = static_cast<int>(b.idx.size());
+    const int kp = static_cast<int>(p.idx.size());
+    const double theta = degrees * kDeg, c = std::cos(theta), s = std::sin(theta);
+    Eigen::Matrix2d rot;
+    rot << c, -s, s, c;
+    sys.add_residual(
+        [a, b, p, ka, kb, kp, rot](const VectorXd& x) {
+            const Vector2d av = a.val(x.head(ka));
+            const Vector2d bv = b.val(x.segment(ka, kb));
+            const Vector2d pv = p.val(x.segment(ka + kb, kp));
+            return r1Vec2(bv - pv - rot * (av - pv));
+        },
+        concat(concat(a.idx, b.idx), p.idx),
+        [a, b, p, ka, kb, kp, rot](const VectorXd& x) {
+            MatrixXd jac(2, ka + kb + kp);
+            if (ka) jac.block(0, 0, 2, ka) = -rot * a.jac(x.head(ka));
+            if (kb) jac.block(0, ka, 2, kb) = b.jac(x.segment(ka, kb));
+            if (kp) jac.block(0, ka + kb, 2, kp) =
+                (rot - Eigen::Matrix2d::Identity()) * p.jac(x.segment(ka + kb, kp));
+            return jac;
+        }, cid);
+}
+
+// Directed component difference; unlike an absolute distance this remains
+// differentiable at zero and preserves its sign across a parameter change.
+void add_signed_offset(System& sys, const std::string& cid, const std::vector<std::string>& refs,
+                       int component, double value, const EntMap& entities, const VarMap& vars) {
+    std::array<Handle, 4> handles;
+    std::vector<int> indices;
+    const std::size_t count = refs.size();
+    for (std::size_t i = 0; i < count; ++i) {
+        handles[i] = resolve_handle(refs[i], entities, vars);
+        indices.insert(indices.end(), handles[i].idx.begin(), handles[i].idx.end());
+    }
+    sys.add_residual(
+        [handles, count, component, value](const VectorXd& x) {
+            double residual = -value;
+            int offset = 0;
+            for (std::size_t i = 0; i < count; ++i) {
+                const int n = static_cast<int>(handles[i].idx.size());
+                const double sign = (i == 0 || i == 3) ? -1.0 : 1.0;
+                residual += sign * handles[i].val(x.segment(offset, n))(component);
+                offset += n;
+            }
+            return r1(residual);
+        }, indices,
+        [handles, count, component](const VectorXd& x) {
+            MatrixXd jac(1, x.size());
+            int offset = 0;
+            for (std::size_t i = 0; i < count; ++i) {
+                const int n = static_cast<int>(handles[i].idx.size());
+                if (n) {
+                    const double sign = (i == 0 || i == 3) ? -1.0 : 1.0;
+                    jac.block(0, offset, 1, n) = sign * handles[i].jac(x.segment(offset, n)).row(component);
+                }
+                offset += n;
+            }
+            return jac;
+        }, cid);
+}
+
+
 
 // Per-ref arc-condition sign for a distance constraint (C50, SolidWorks min/max).
 // -1 for "min" (near rim), +1 for "max" (far rim), 0 otherwise. Honored ONLY when
@@ -2523,10 +2600,15 @@ JunctionMap tangent_junctions(const EntMap& entities, const VarMap& vars, const 
 struct ConstraintContext {
     JunctionMap junctions;
     std::set<std::string> fixed_lines;
+    std::map<std::string, const json*> angle_drivers;
 };
 
 ConstraintContext constraint_context(const EntMap& entities, const VarMap& vars, const json& constraints) {
-    ConstraintContext result{tangent_junctions(entities, vars, constraints), {}};
+    ConstraintContext result{tangent_junctions(entities, vars, constraints), {}, {}};
+    for (const auto& c : constraints)
+        if (c.is_object() && c.value("type", std::string()) == "rotate_point" &&
+            c.contains("id") && c["id"].is_string())
+            result.angle_drivers[c["id"].get<std::string>()] = &c;
     bool needs_reference = false;
     for (const auto& c : constraints)
         if (jat(c, "type") == "collinear") { needs_reference = true; break; }
@@ -2566,7 +2648,8 @@ void add_constraint(System& sys, const json& c, const EntMap& entities,
     }
     const std::string cid = c.value("id", std::string());
     if (c.value("driven", false)) return;  // reference dims measured after solve
-    std::size_t maximum = ctype == "symmetric" || ctype == "intersection" ? 3 :
+    std::size_t maximum = ctype == "equal_offset" ? 4 :
+        ctype == "symmetric" || ctype == "intersection" || ctype == "rotate_point" ? 3 :
         (ctype == "fix" || ctype == "radius" || ctype == "diameter" ||
          ctype == "length" || ctype == "arc_length" ? 1 : 2);
     if (refs.size() > maximum)
@@ -2617,6 +2700,32 @@ void add_constraint(System& sys, const json& c, const EntMap& entities,
         if (it == entities.end() || !curve_descriptor(it->second.value("type", ""), var_map.at(h)).ok)
             throw std::runtime_error(ctype + ": unsupported curve ref '" + h + "'");
     };
+    if (ctype == "signed_distance" || ctype == "equal_offset") {
+        need(ctype == "signed_distance" ? 2 : 4);
+        for (const auto& ref : refs) known_entity(ref);
+        const std::string axis = c.value("axis", std::string());
+        if (axis != "h" && axis != "v")
+            throw std::runtime_error(ctype + ": axis must be 'h' or 'v'");
+        add_signed_offset(sys, cid, refs, axis == "h" ? 0 : 1,
+                          ctype == "signed_distance" ? resolve_dim(c, env) : 0.0, entities, var_map);
+        return;
+    }
+    if (ctype == "rotate_point") {
+        need(3);
+        for (const auto& ref : refs) known_entity(ref);
+        const json* driver = &c;
+        if (c.contains("angle_ref")) {
+            if (!c["angle_ref"].is_string())
+                throw std::runtime_error("rotate_point: angle_ref must be a constraint id");
+            const auto it = context.angle_drivers.find(c["angle_ref"].get<std::string>());
+            if (it == context.angle_drivers.end() || it->second == &c ||
+                it->second->contains("angle_ref") || it->second->value("driven", false))
+                throw std::runtime_error("rotate_point: angle_ref must name an independent driving rotate_point constraint");
+            driver = it->second;
+        }
+        add_rotated_point(sys, cid, refs[0], refs[1], refs[2], resolve_dim(*driver, env), entities, var_map);
+        return;
+    }
     if (ctype == "parallel" || ctype == "perpendicular" || ctype == "collinear" || ctype == "angle") {
         need(2); require_line(refs[0]); require_line(refs[1]);
         if (ctype == "collinear")
@@ -3064,7 +3173,8 @@ std::map<std::string, std::string> compute_statuses(
 // helpers return std::nullopt where the Python returns None (dangling refs).
 
 const std::set<std::string> kDimensionalTypes = {"distance", "angle", "radius",
-                                                 "diameter", "length", "arc_length"};
+                                                 "diameter", "length", "arc_length", "rotate_point",
+                                                 "signed_distance"};
 
 // World (x, y) of a point handle against SOLVED entity coords. nullopt if it cannot
 // be resolved (dangling). Port of _handle_point.
@@ -3320,6 +3430,68 @@ SketchSolution solve_sketch_monolithic(const json& sketch, const json& env,
             x0 = base;
         }
     }
+    if (!x0 && std::any_of(constraints_list.begin(), constraints_list.end(), [](const json& c) {
+            return c.is_object() && c.value("type", std::string()) == "rotate_point" &&
+                   !c.value("driven", false);
+        })) {
+        // Seed directed rotations from their source and current angle. Without
+        // this, a cold least-squares solve can shorten an unconstrained source
+        // line while rotating its target, even though rotating it rigidly is an
+        // exact solution. Fix constraints still refer to the authored seeds.
+        std::set<int> fixed_vars;
+        for (const auto& c : constraints_list) {
+            if (!c.is_object() || c.value("type", std::string()) != "fix" ||
+                c.value("driven", false) || !c.contains("refs") ||
+                !c["refs"].is_array() || c["refs"].size() != 1 || !c["refs"][0].is_string())
+                continue;
+            const std::string ref = c["refs"][0].get<std::string>();
+            try {
+                if (ref.find('.') == std::string::npos && var_map.count(ref))
+                    fixed_vars.insert(var_map.at(ref).begin(), var_map.at(ref).end());
+                else {
+                    const auto h = resolve_handle(ref, entities, var_map);
+                    fixed_vars.insert(h.idx.begin(), h.idx.end());
+                }
+            } catch (const std::exception&) {}
+        }
+        VectorXd seed = sys.init_vector();
+        bool seeded = false;
+        for (const auto& c : constraints_list) {
+            if (!c.is_object() || c.value("type", std::string()) != "rotate_point" ||
+                c.value("driven", false) || !c.contains("refs") ||
+                !c["refs"].is_array() || c["refs"].size() != 3 ||
+                !c["refs"][0].is_string() || !c["refs"][1].is_string() ||
+                !c["refs"][2].is_string())
+                continue;
+            try {
+                const json* driver = &c;
+                if (c.contains("angle_ref")) {
+                    if (!c["angle_ref"].is_string()) continue;
+                    const auto it = context.angle_drivers.find(c["angle_ref"].get<std::string>());
+                    if (it == context.angle_drivers.end() || it->second->contains("angle_ref")) continue;
+                    driver = it->second;
+                }
+                const Handle source = resolve_handle(c["refs"][0].get<std::string>(), entities, var_map);
+                const Handle target = resolve_handle(c["refs"][1].get<std::string>(), entities, var_map);
+                const Handle pivot = resolve_handle(c["refs"][2].get<std::string>(), entities, var_map);
+                if (target.idx.size() != 2 || fixed_vars.count(target.idx[0]) ||
+                    fixed_vars.count(target.idx[1])) continue;
+                auto values = [&](const Handle& h) {
+                    VectorXd x(h.idx.size());
+                    for (std::size_t i = 0; i < h.idx.size(); ++i) x(static_cast<int>(i)) = seed(h.idx[i]);
+                    return h.val(x);
+                };
+                const Vector2d p = values(pivot), v = values(source) - p;
+                const double a = resolve_dim(*driver, env) * kDeg;
+                seed(target.idx[0]) = p.x() + std::cos(a) * v.x() - std::sin(a) * v.y();
+                seed(target.idx[1]) = p.y() + std::sin(a) * v.x() + std::cos(a) * v.y();
+                seeded = true;
+            } catch (const std::exception&) {
+                // Registration reports malformed constraints as skipped.
+            }
+        }
+        if (seeded) x0 = std::move(seed);
+    }
 
     auto res = sys.solve(x0, 1e-10, 100, time_budget_ms);
     sol.x = res.x;
@@ -3329,7 +3501,9 @@ SketchSolution solve_sketch_monolithic(const json& sketch, const json& env,
     auto analysis = sys.analyze(res.x);
     sol.dof = analysis.dof;
     sol.redundant = analysis.redundant_tags;
+    sol.partial_dependencies = std::move(analysis.partial_tags);
     sol.conflicting = analysis.conflicting_tags;
+    sol.dependency_partners = std::move(analysis.dependency_partners);
 
     sol.entities = extract_entities(res.x, entities_list, var_map);
 
@@ -3387,8 +3561,12 @@ SketchSolution merge_component_solutions(
         sol.converged = sol.converged && p.converged;
         sol.dof += p.dof;
         sol.redundant.insert(sol.redundant.end(), p.redundant.begin(), p.redundant.end());
+        sol.partial_dependencies.insert(sol.partial_dependencies.end(),
+                                        p.partial_dependencies.begin(), p.partial_dependencies.end());
         sol.conflicting.insert(sol.conflicting.end(), p.conflicting.begin(),
                                p.conflicting.end());
+        sol.dependency_partners.insert(sol.dependency_partners.end(),
+                                       p.dependency_partners.begin(), p.dependency_partners.end());
         sol.skipped.insert(sol.skipped.end(), p.skipped.begin(), p.skipped.end());
         for (auto it = p.entities.begin(); it != p.entities.end(); ++it)
             sol.entities[it.key()] = it.value();
@@ -3544,6 +3722,8 @@ SketchSolution solve_sketch(const json& sketch, const json& env,
     };
     auto earlier = [&](const std::string& a, const std::string& b) { return position(a) < position(b); };
     std::stable_sort(sol.redundant.begin(), sol.redundant.end(), earlier);
+    std::stable_sort(sol.partial_dependencies.begin(), sol.partial_dependencies.end(),
+                     [&](const auto& a, const auto& b) { return position(a.first) < position(b.first); });
     std::stable_sort(sol.conflicting.begin(), sol.conflicting.end(), earlier);
     std::stable_sort(sol.skipped.begin(), sol.skipped.end(), [&](const auto& a, const auto& b) {
         return position(a.first) < position(b.first);
@@ -3592,22 +3772,44 @@ std::string fmt_mm(double v) {
 std::string nonconvergence_reason(const json& sketch, const SketchSolution& sol) {
     const json constraints = sketch.value("constraints", json::array());
     const json entities = sketch.value("entities", json::array());
-    std::map<std::string, std::string> ctype_of;
+    std::map<std::string, const json*> constraint_of;
     if (constraints.is_array())
         for (const json& c : constraints)
             if (c.is_object() && c.contains("id") && c["id"].is_string())
-                ctype_of[c["id"].get<std::string>()] = c.value("type", std::string("?"));
+                constraint_of[c["id"].get<std::string>()] = &c;
+    // "c3 (distance 40)": id, type and the driving value or expression when it has one.
+    auto describe = [&](const std::string& id) {
+        const auto found = constraint_of.find(id);
+        if (found == constraint_of.end()) return id + " (?)";
+        const json& c = *found->second;
+        std::string text = id + " (" + c.value("type", std::string("?"));
+        if (c.contains("value")) {
+            const json& v = c["value"];
+            const json& number = v.is_object() && v.contains("value") ? v["value"] : v;
+            if (number.is_number()) text += " " + fmt_mm(number.get<double>());
+            if (v.is_object() && v.contains("expr") && v["expr"].is_string() &&
+                !v["expr"].get<std::string>().empty())
+                text += " = " + v["expr"].get<std::string>();
+        }
+        return text + ")";
+    };
 
     std::string msg = "sketch did not converge: the constraints conflict.";
     if (!sol.conflicting.empty()) {
-        msg += " Conflicting constraints:";
+        msg += " Conflicting constraints: ";
         for (std::size_t i = 0; i < sol.conflicting.size(); ++i) {
             const std::string& id = sol.conflicting[i];
-            const auto t = ctype_of.find(id);
-            msg += std::string(i ? ", " : " ") + id + " (" +
-                   (t == ctype_of.end() ? std::string("?") : t->second) + ")";
+            if (i) msg += "; ";
+            msg += describe(id);
+            const auto partners = std::find_if(sol.dependency_partners.begin(),
+                sol.dependency_partners.end(), [&](const auto& p) { return p.first == id; });
+            if (partners != sol.dependency_partners.end() && !partners->second.empty()) {
+                msg += " conflicts with ";
+                for (std::size_t k = 0; k < partners->second.size(); ++k)
+                    msg += (k ? ", " : "") + describe(partners->second[k]);
+            }
         }
-        msg += ".";
+        msg += ". Remove or change ONE of each listed set.";
     }
 
     // The usual cause: `fix` pins the AUTHORED coordinates (the seeds), and the seeds of
@@ -3937,6 +4139,27 @@ std::optional<double> measure_constraint(const json& constraint,
         }
         return std::nullopt;
     }
+    if (ctype == "signed_distance") {
+        if (refs.size() != 2) return std::nullopt;
+        const auto a = handle_point(refs[0], entity_coords);
+        const auto b = handle_point(refs[1], entity_coords);
+        const std::string axis = constraint.value("axis", std::string());
+        if (!a || !b || (axis != "h" && axis != "v")) return std::nullopt;
+        return (*b)(axis == "h" ? 0 : 1) - (*a)(axis == "h" ? 0 : 1);
+    }
+    if (ctype == "rotate_point") {
+        if (refs.size() != 3) return std::nullopt;
+        const auto a = handle_point(refs[0], entity_coords);
+        const auto b = handle_point(refs[1], entity_coords);
+        const auto p = handle_point(refs[2], entity_coords);
+        if (!a || !b || !p) return std::nullopt;
+        const Vector2d u = *a - *p, v = *b - *p;
+        // At the pivot the geometric angle is undefined; the driving expression
+        // remains available, but inventing a measured angle would be misleading.
+        if (u.squaredNorm() < 1e-24 || v.squaredNorm() < 1e-24) return std::nullopt;
+        return std::atan2(u.x() * v.y() - u.y() * v.x(), u.dot(v)) * (180.0 / kPi);
+    }
+
 
     if (ctype == "angle") {
         if (refs.size() < 2) return std::nullopt;

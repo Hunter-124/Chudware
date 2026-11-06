@@ -214,7 +214,7 @@ def _rect_sketch_op(w, h):
         _rel("c6", "horizontal", ["e3"]),
         _rel("c7", "vertical", ["e2"]),
         _rel("c8", "vertical", ["e4"]),
-        _rel("c9", "fix", ["e1.p1"]),
+        _rel("c9", "coincident", ["e1.p1", "origin"]),
         _dim_con("c10", "distance", ["e1.p1", "e1.p2"], w),
         _dim_con("c11", "distance", ["e2.p1", "e2.p2"], h),
     ]
@@ -238,8 +238,9 @@ def test_describe_sketch_entities_and_dof_verdict():
         assert f"{eid} line" in text, text
     assert "Entities (4):" in text, text
     assert "[full]" in text, text
-    # Constraint roster: grouped relations + individually-listed driving dims.
-    assert "coincident x4" in text and "driving dims:" in text, text
+    # Constraint roster: grouped relations + individually-listed dimensions, split into
+    # authored vs auto driving counts (nothing here is engine-minted, so 2 authored / 0 auto).
+    assert "coincident x5" in text and "dimensions (2 authored driving, 0 auto driving" in text, text
     assert "c10 distance=40" in text and "c11 distance=24" in text, text
     # One closed region, and the check_sketch-style DOF verdict.
     assert "Regions: 1 closed loop(s)" in text, text
@@ -400,15 +401,15 @@ def test_describe_results_static_study_exact_slots():
     # 0.004321 -> 0.004 mm (3 dp), FoS 2 dp, margin = 250.0 - 12.34567 -> 237.7 (0.1 MPa).
     assert "Max von Mises stress: 12.3 MPa  (source: run_fea_static)" in text, text
     assert "Max displacement: 0.004 mm  (source: run_fea_static)" in text, text
-    assert "Min factor of safety: 15.00" in text and "holds" in text, text
+    assert "Min factor of safety: 15.00" in text and "solver cap" in text, text
     assert "Margin: 237.7 MPa above yield" in text, text
     assert "Mesh: 3456 DOF  (mesh_fineness 0.30, tet10 elements)" in text, text
     # Sid join: the stored fixture/load queries resolve to live face sids (F...).
     assert "Fixed at: face F" in text and "on bottom" in text, text
     assert "Load applied on: face F" in text and "on top" in text, text
-    # The per-node field is not persisted — the output says so instead of guessing.
-    assert "Max-stress node location: not stored in the study record" in text, text
-    assert "Convergence note: tet10" in text, text
+    # This legacy record has no node location or convergence evidence.
+    assert "Max-stress node location: not available in this study" in text, text
+    assert "Convergence not established" in text, text
     assert ("(Source: sim_study_list — numbers narrated from the stored study, "
             "never recomputed)") in text, text
 
@@ -448,6 +449,47 @@ def test_describe_results_modal_study_and_named_lookup():
 
 
 # ---------------------------------------------------------------- describe_assembly
+
+def test_describe_assembly_reports_pre_refresh_source_fingerprints(monkeypatch, tmp_path):
+    from services.mcp import cad_asm_tools, gsl_tools
+
+    path = tmp_path / "part.step+"
+    path.write_text("source")
+    current = {"path": str(path), "doc_hash": "new"}
+    cached = {"path": str(path), "doc_hash": "old"}
+    source = {"component": "k1", "path": str(path), "current": current,
+              "cached": cached, "changed": True, "open": True, "dirty": True,
+              "doc_id": "part"}
+    calls = []
+
+    def fake_call(method, params=None):
+        calls.append(method)
+        if method == "asm_source_status":
+            return {"ok": True, "status": "stale", "matches": False, "sources": [source]}
+        if method == "asm_world_bodies":
+            return {"bodies": [{"component": "k1", "bbox": {}}]}
+        if method == "doc_solve_mates":
+            return {"ok": True, "rebuild": {}}
+        if method == "eval_interference":
+            return {"ok": True, "complete": True, "pairs_checked": 0, "pairs_total": 0}
+        raise AssertionError(method)
+
+    monkeypatch.setattr(cb, "call", fake_call)
+    monkeypatch.setattr(gsl_tools, "_component_sources", lambda _: (str(tmp_path), [
+        {"id": "k1", "name": "part", "source": {"path": str(path)},
+         "source_resolved": str(path)}]))
+    monkeypatch.setattr(cad_asm_tools, "component_source_base", lambda _: str(tmp_path))
+    monkeypatch.setattr(gsl_tools, "placement_source_of", lambda *_: None)
+    monkeypatch.setattr(gsl_tools, "placement_warnings", lambda *_: [])
+    result = json.loads(gsl_tools._describe_assembly_text("asm"))
+    assert calls[:2] == ["asm_source_status", "asm_world_bodies"]
+    assert result["source_status"]["status"] == "stale"
+    assert {s["state"] for s in result["source_states"]} == {"stale", "live_unsaved"}
+    assert result["source_states"][0]["current"] == current
+    assert result["source_states"][0]["cached"] == cached
+    source["changed"] = False
+    states = cad_asm_tools.source_states("asm", [], {"status": "current", "sources": [source]})
+    assert [s["state"] for s in states] == ["live_unsaved"]
 
 
 def _new_description_boxes(name: str, offset: float) -> str:
@@ -526,7 +568,8 @@ def test_describe_assembly_incomplete_fit_cannot_pass(monkeypatch, failure_kind)
 
     monkeypatch.setattr(cb, "call", fail_fit)
     result, _ = _call("describe_assembly", {"doc_id": doc})
-    assert result["ok"] is False and result["collision_free"] is False, result
+    assert result["ok"] is True and result["collision_free"] is False, result
+    assert result["warnings"] and result["fit"].get("complete") is not True
     assert "incomplete" in result["text"].lower(), result
     assert "no volumetric interference" not in result["text"].lower(), result
     assert "0.00 mm gap" not in result["text"], result
@@ -643,25 +686,59 @@ def test_describe_board_no_ecad_doc_graceful():
             or "not open" in err), r
 
 
-def test_describe_board_schematic_narration():
-    """describe_board on a live schematic renders the component/net roster with ERC counts
-    and the contract's attribution line."""
-    r_sch, _ = _call("ecad_new_schematic", {"name": "gsl_board_narr"})
-    if not (r_sch and r_sch.get("ok")):
-        pytest.skip(f"ecad_new_schematic not available: {r_sch}")
-    doc_id = r_sch.get("doc_id", "")
-    try:
-        _call("ecad_place_symbol", {"symbol": "Device:R", "ref": "R1", "value": "10k"})
-    except Exception:  # noqa: BLE001 — roster may stay empty; narration still must work
-        pass
-    r, _ = _call("describe_board", {"doc_id": doc_id})
-    assert r is not None and r.get("ok"), r
-    text = r.get("text", "")
-    assert "schematic" in text, text
-    assert "component(s)" in text and "net(s)" in text, text
-    assert "(source: engine.ecad.netlist)" in text, text
-    assert "(Source: engine.ecad.netlist, engine.ecad.erc" in text, text
-    assert re.search(r"\d+ component\(s\)", text), text
+def test_describe_board_schematic_narration(tmp_path):
+    """A saved KiCad schematic is narrated by both its bound session and its file path."""
+    from services.mcp.ecad_common import ecad_session
+
+    path = tmp_path / "narration.kicad_sch"
+    session = ecad_session.new_session("sch", "narration", path=str(path))
+    ecad_session.apply_ops(session, session.revision, [
+        {"op": "sch_add_symbol", "libid": "Device:R", "ref": "R1",
+         "value": "10k", "pos": [10, 10]},
+    ])
+    for ref in (session.doc_id, str(path)):
+        r, _ = _call("describe_board", {"doc_id": ref})
+        assert r is not None and r.get("ok"), r
+        text = r.get("text", "")
+        assert "schematic" in text and "R1" in text, text
+        assert "component(s)" in text and "net(s)" in text, text
+        assert "(source: native ECAD netlist)" in text, text
+        assert "(Source: native ECAD netlist, KiCad ERC" in text, text
+        assert "ERC:" in text and re.search(r"\d+ component\(s\)", text), text
+    ecad_session.close_session(session.doc_id)
+
+
+@pytest.mark.parametrize("kind", ["pcb", "sch"])
+def test_describe_board_uses_kicad_check_and_reports_unavailable(tmp_path, monkeypatch, kind):
+    """KiCad findings, not incremental op-engine checks, determine the narrated verdict."""
+    from services.mcp.ecad_common import ecad_session
+    from services.mcp.gsl_tools import _describe_board_text
+
+    path = tmp_path / f"check.kicad_{kind}"
+    session = ecad_session.new_session(kind, "check", path=str(path))
+    original = cb.call
+
+    def call_with_check(method, params=None):
+        if method == "ecad_kicad_check":
+            return {"violations": [{"severity": "error"}, {"severity": "warning"}],
+                    "counts": {"error": 1, "warning": 1}}
+        return original(method, params)
+
+    monkeypatch.setattr(cb, "call", call_with_check)
+    text = json.loads(_describe_board_text(str(path)))["text"]
+    check = "DRC" if kind == "pcb" else "ERC"
+    assert f"{check}: 1 error(s), 1 warning(s)" in text, text
+    assert f"source: KiCad {check}" in text, text
+
+    def call_unavailable(method, params=None):
+        if method == "ecad_kicad_check":
+            raise RuntimeError("KiCad unavailable")
+        return original(method, params)
+
+    monkeypatch.setattr(cb, "call", call_unavailable)
+    text = json.loads(_describe_board_text(session.doc_id))["text"]
+    assert f"{check}: not available" in text and f"{check}: clean" not in text, text
+    ecad_session.close_session(session.doc_id)
 
 
 # ---------------------------------------------------------------- describe_project
@@ -814,12 +891,12 @@ def test_dod2_auto_constrain_reduces_dof_to_zero():
     is closed but underconstrained (no fix, no dimensions — horizontal/vertical only).
     Verify: (a) sketch is underconstrained before any explicit auto_constrain call, (b) the
     explicit sketch_auto_constrain call with apply=False shows no NEW coincident proposals
-    (corner work is done), and (c) health reports the remaining DOF + a non-empty schedule
-    of dimension steps — the honest state before the driver adds dimensions.
+    (corner work is done), and (c) health reports the remaining DOF + a non-empty list of
+    dimension hints — the honest state before the driver adds dimensions.
 
     This test does NOT fabricate dimensions. It verifies the DOF narration path and that the
-    auto-coincident path has been applied. Full DOF=0 requires the driver to follow the
-    dimension schedule (which this helper produces correctly via sketch_health text=True).
+    auto-coincident path has been applied. Full DOF=0 requires the driver to act on the
+    dimension hints (which this helper produces correctly via sketch_health text=True).
     """
     r, _ = _call("new_part", {"name": "dp7_dof0"})
     doc = r["doc_id"]
@@ -844,14 +921,15 @@ def test_dod2_auto_constrain_reduces_dof_to_zero():
         f"No new coincident proposals expected (auto-coincident already ran): {ac}"
     )
 
-    # (c) health_text reports remaining DOF + a dimension schedule for the driver to follow.
+    # (c) health_text reports remaining DOF + dimension hints for the driver to consider.
     ht_resp, _ = _call("sketch_health", {"sketch": fid, "text": True, "doc_id": doc})
     assert ht_resp["ok"], ht_resp
     assert "health_text" in ht_resp, ht_resp
     ht = ht_resp["health_text"]
     assert "DOF:" in ht, ht
-    assert "Schedule" in ht, ht
-    # Schedule must list at least one dimension step (no free dimensions yet)
+    assert "Hints (unordered suggestions, not a plan)" in ht, ht
+    assert "schedule" not in ht_resp, "the engine's `schedule` was renamed `hints`"
+    # Hints must list at least one dimension suggestion (no free dimensions yet)
     assert "dimension" in ht.lower(), ht
 
 
@@ -878,11 +956,10 @@ def test_dod4_health_text_state_a_fully_defined():
 
 
 def test_dod4_health_text_state_b_open_underconstrained():
-    """DoD 4 state B — open profile + underconstrained: reports dangling endpoints + schedule.
+    """An unused open sketch reports gaps without assuming a closed-profile use.
 
-    Uses a deliberate 1.0mm gap at one corner — larger than the 1e-4mm auto-coincident
-    tolerance — so the profile remains OPEN after add_features.  The health_text must
-    report OPEN + list the dangling endpoint handles + show a geometric-first schedule.
+    Native closed-profile scheduling is also exercised in the document test
+    ``dogfood: open sketch advice follows actual profile or path usage``.
     """
     r, _ = _call("new_part", {"name": "dp7_ht_open"})
     doc = r["doc_id"]
@@ -896,11 +973,27 @@ def test_dod4_health_text_state_b_open_underconstrained():
     assert h["ok"], h
     assert "health_text" in h, h
     ht = h["health_text"]
-    assert "OPEN" in ht, ht
+    assert "Closure: open chain (informational)" in ht, ht
+    assert "OPEN" not in ht, ht      # unknown usage: open endpoints are not a defect
     assert "endpoint" in ht.lower(), ht
-    assert "Schedule" in ht, ht
-    # Should see the geometric step to close the chain
-    assert "geometric" in ht, ht
+    assert "Hints (unordered suggestions, not a plan)" in ht, ht
+    assert h["closure"]["usage"] == "unknown", h
+    assert "[geometric]" not in ht, ht
+    assert "sketch_auto_constrain" in ht, ht
+    assert "apply=False" in ht and "preserve intentional open ends" in ht, ht
+    assert "future consumer" in ht, ht
+
+    # Render a confirmed closed-profile hint list; the native document test
+    # verifies that an authored closed-profile consumer actually produces it.
+    from services.mcp.gsl_tools import sketch_health_text
+    closed_profile = dict(h)
+    closed_profile["closure"] = {**h["closure"], "usage": "closed_profile"}
+    closed_profile["hints"] = [{
+        "order": 1, "kind": "geometric", "action": "coincident",
+        "why": "close the open profile chain", "handles": h["closure"]["open_endpoints"],
+    }]
+    closed_text = sketch_health_text(closed_profile)
+    assert "[geometric]" in closed_text and "sketch_auto_constrain" in closed_text, closed_text
 
 
 def test_dod4_health_text_state_c_conflicting():
@@ -1010,6 +1103,14 @@ def test_assembly_native_roundtrip_keeps_live_geometry(tmp_path, monkeypatch):
         scoped, _ = _call("check_interference", {"doc_id": did, "members": ["Block0"]})
         assert scoped["ok"] and scoped["pairs_checked"] == 0, scoped
         assert scoped["scope"]["checked_members"] == 1, scoped
+        world = cb.call("asm_world_bodies", {"doc_id": did})["bodies"]
+        ids = [b["component"] for b in world]
+        for key in ("members", "components"):
+            scoped, _ = _call("check_interference", {"doc_id": did, key: ids})
+            assert scoped["ok"] and scoped["pairs_checked"] == 1, scoped
+            assert scoped["scope"]["checked_members"] == 2, scoped
+        unknown, _ = _call("check_interference", {"doc_id": did, "members": ["k999999"]})
+        assert unknown["ok"] is False, unknown
         path = tmp_path / "assembly.step+"
         saved, content = _call("save_part", {"doc_id": did, "path": str(path)})
         assert saved["ok"] and content, saved

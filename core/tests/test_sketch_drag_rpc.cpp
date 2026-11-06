@@ -160,6 +160,9 @@ TEST_CASE("sketch_rotate keeps an origin-anchored square rigid (sides + diagonal
     doc_apply_ops(doc_id, -1, json::array({rot}), false);
     json after = doc_sketch_enter(doc_id, fid);
     const json& ents = after.at("entities");
+    const auto anchored = p1_of(ents, "e1");
+    CHECK(anchored.first == doctest::Approx(0.0).epsilon(1e-6));
+    CHECK(anchored.second == doctest::Approx(0.0).epsilon(1e-6));
     for (const char* id : {"e1", "e2", "e3", "e4"})
         CHECK_MESSAGE(seg_len(ents, id) == doctest::Approx(80.0).epsilon(1e-3),
                       "side " << id << " length changed (distorted): " << seg_len(ents, id));
@@ -192,6 +195,27 @@ TEST_CASE("sketch_rotate 180deg keeps a horizontal relation") {
     doc_apply_ops(doc_id, -1, json::array({rotate_op(fid.c_str(), 0, 0, 180.0)}), false);
     json enter = doc_sketch_enter(doc_id, fid);
     CHECK(cons_type(enter, "c1") == "horizontal");         // axis preserved
+}
+
+TEST_CASE("axis-aligned rotation remains editable without locking its reference relation") {
+    auto [doc_id, fid] = make_hline_sketch();
+    json result = doc_apply_ops(doc_id, -1,
+        json::array({rotate_op(fid.c_str(), 0, 0, 90.0)}), false);
+    std::string rotation;
+    for (const auto& feature : result.at("tree").at("features")) {
+        if (feature.value("id", std::string()) != fid) continue;
+        for (const auto& c : feature.at("params").at("constraints"))
+            if (c.value("type", std::string()) == "rotate_point" && !c.contains("angle_ref"))
+                rotation = c.at("id").get<std::string>();
+    }
+    REQUIRE_FALSE(rotation.empty());
+    doc_apply_ops(doc_id, -1, json::array({
+        {{"op", "sketch_set_dim"}, {"sketch", fid}, {"id", rotation}, {"value", 45.0}}
+    }), false);
+    const json enter = doc_sketch_enter(doc_id, fid);
+    const json p = line_pts(enter.at("entities"), "e1");
+    CHECK(p[1][0].get<double>() == doctest::Approx(10.0 / std::sqrt(2.0)).epsilon(1e-6));
+    CHECK(p[1][1].get<double>() == doctest::Approx(10.0 / std::sqrt(2.0)).epsilon(1e-6));
 }
 
 TEST_CASE("circle rim drag resizes the radius through the doc_sketch_drag RPC") {
@@ -260,4 +284,49 @@ TEST_CASE("a failed drag preserves the sketch entities (never wipes the overlay)
                       !drag.at("entities").empty();
     REQUIRE_MESSAGE(kept,
         "a failed drag must still carry entities so the sketch is not wiped: " << drag.dump());
+}
+
+TEST_CASE("guarded sketch preview preserves foreign edits and undo history") {
+    using namespace chudware::doc;
+    const std::string doc_id = doc_new("part", "GuardedSketch").at("doc_id");
+    const json built = doc_apply_ops(doc_id, -1, json::array({
+        json{{"op", "add_feature"}, {"feature",
+            json{{"type", "sketch"}, {"name", "S"},
+                 {"params", {{"entities", json::array({circle("e1", 0, 0, 10)})},
+                             {"constraints", json::array({rel("c1", "fix", {"e1.center"})})}}},
+                 {"refs", {{"plane", "plane.top"}}}}}}
+    }), false);
+    const std::string fid = built.at("id_map").at("$0");
+    const json original = doc_tree(doc_id);
+    const json enter = doc_sketch_enter(doc_id, fid);
+    const auto token = enter.at("session_id").get<std::uint64_t>();
+    REQUIRE(token > 0);
+    const json drag = doc_sketch_drag(doc_id, fid, "e1.rim", json::array({25.0, 0.0}), json(), token);
+    REQUIRE(drag.at("revision") == enter.at("revision"));
+    const json peer = doc_apply_ops(doc_id, -1, json::array({
+        {{"op", "sketch_edit_entity"}, {"sketch", fid}, {"id", "e1"},
+         {"params", {{"radius", 15.0}}}}
+    }), false);
+    const json before = doc_tree(doc_id);
+    for (bool exit : {false, true}) {
+        try {
+            if (exit) doc_sketch_exit(doc_id, fid, drag.at("revision"), token);
+            else doc_sketch_drag_commit(doc_id, fid, drag.at("revision"), token);
+            FAIL("stale sketch commit/exit must throw");
+        } catch (const OpError& error) {
+            CHECK(error.code == "stale_revision");
+            CHECK(error.detail.at("current_revision") == peer.at("revision"));
+        }
+        CHECK(doc_tree(doc_id).at("tree") == before.at("tree"));
+        CHECK(doc_tree(doc_id).at("revision") == before.at("revision"));
+    }
+    CHECK(doc_undo(doc_id).at("tree") == original.at("tree"));
+    const json fresh = doc_sketch_solve(doc_id, fid, token);
+    const json sample = doc_sketch_drag(doc_id, fid, "e1.rim", json::array({20.0, 0.0}), json(), token);
+    CHECK(sample.at("revision") == fresh.at("revision"));
+    const json committed = doc_sketch_drag_commit(doc_id, fid, sample.at("revision"), token);
+    CHECK(committed.at("revision").get<long>() > fresh.at("revision").get<long>());
+    const json exited = doc_sketch_exit(doc_id, fid, committed.at("revision"), token);
+    CHECK(exited.contains("revision"));
+    doc_close(doc_id);
 }

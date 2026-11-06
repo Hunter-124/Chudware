@@ -1,8 +1,8 @@
-# Evaluate tools: measurement and interference
+# Evaluate tools: measurement, model history, wall thickness and interference
 
-Analysis tools that read geometry without mutating the feature tree: dimension probes, mass
-properties, interference/clearance checks and the colour-coded measurement view. The same
-engine evidence backs the agent (MCP) tools and the GUI Evaluate tab.
+Evaluate provides geometry measurements, mass properties, interference/clearance checks,
+colour-coded views and model-history diagnostics. The same engine evidence backs the agent
+(MCP) tools and the GUI Evaluate tab; explicit history cleanup is an undoable edit.
 
 ## File map
 
@@ -15,6 +15,7 @@ engine evidence backs the agent (MCP) tools and the GUI Evaluate tab.
 | `host/src/render/overlays.cpp/.h` | Face/body washes, segments and triangles used by measure and interference |
 | `host/src/core/selection.h`, `host/src/core/doc_mirror.cpp` | Async pick resolution with body ownership and explicit failures |
 | `host/src/ui_theme.cpp/.h` | Shared `evalEmphasisPalette` for reference cards and overlays |
+| `contracts/model_history.md` | Native history report, cleanup and refinement contract |
 
 ## `measure`
 
@@ -53,6 +54,71 @@ probes. Related tools: `measure_part` (mass, volume, centre of mass, inertia),
 - Collisions between features of one part belong to `check_feature_overlap`, not body-level
   interference.
 
+## Wall-thickness study
+
+Model → Evaluate → Thickness and Simulate → Static → Wall Thickness open the same
+`eval_thickness` tool. `dfm_known_processes` supplies the Process list; `dfm_get_profile`
+supplies `result.params.min_wall_mm` as an editable minimum. Update sends canonical-mm
+`min_wall_mm` and `resolution` along with `doc_id`. The engine measures inscribed-sphere
+thickness on a refined surface rather than casting rays only at display-mesh vertices.
+
+The renderer's per-activation `result_ramp::Display` fixes the range to `[T, 3T]` and reverses
+the shared ramp: **≤ T is red**, **≥ 3T is blue**, NaN is neutral grey. The legend consumes
+the renderer's direction and range; IPS labels convert mm to inches, never relabel raw mm.
+Other field activations default to the original low-blue ramp; clearing the tool resets the
+policy.
+
+The results card reports minimum measured thickness, thin area, region count and
+`measurement_basis.spacing_mm`, with an explicit `budget_limited` warning. Thin-region
+rows show wall/taper kind, thickness and area; clicking posts the existing `zoomToBBox`
+camera request using the region's world-space bounds. The result is a sampled geometry
+screen, not structural or manufacturing certification; grey areas remain unmeasured.
+
+## Model History
+
+Open **Evaluate → Model History** to request the native report for the current part.
+Select a finding to select its feature IDs, and read its evidence, suggestion and
+limitations. The report is revision-scoped; refresh it after edits. The panel previews
+safe fixes without mutation; **Simplify history** applies eligible fixes as one undoable
+edit and is unavailable when there are no safe fixes or the report is stale.
+**Refine representation** separately appends an optional normal editable feature, not a
+conversion to imported geometry. Undo restores the prior history.
+
+Agents use `check_model_history(doc_id=None)` and
+`simplify_part(doc_id=None, apply=False, refine=False)` for diagnosis and preview;
+`apply=True` explicitly commits eligible changes, while `refine=True` opts into appending
+the refine feature. Native rebuild status also includes automatic history findings;
+`add_features` can surface concise warnings. See
+[the native contract](../../contracts/model_history.md) for the response and operation details.
+
+The report analyzes the stated history rules, not engineering or geometric certification.
+Automatic cleanup is deliberately restricted to provably unreferenced datums and eligible
+literal zero in-place transforms. It does not delete sketches, patterns, copies, suppressed,
+configuration-driven or rolled-back features, cosmetic threads, or features merely
+overlapping or swallowed by others. Unknown dependencies, configurations, rollback, and
+external references can block cleanup; external consumers of saved/public documents may not
+be provably absent. Equal volume and face ownership do not establish equivalence or safe
+deletion. Structural edits, dress-up reordering and semantic feature replacements require
+human/agent judgment. Refine only unifies same-domain topology and refuses ambiguous
+references, finishes or changed geometry; it is not heal, does not flatten history, and
+does not promise to optimize every artifact.
+
+History warnings do not repair failed rebuilds. A failed part is incomplete: intermediate
+tool bodies must not be presented, measured, exported, or saved as its finished geometry.
+Failed opens and background verification must leave the saved archive and its recoverable
+solve state untouched. Any retained last-good display is explicitly unverified; repair the
+failed feature or undo the edit before saving a new complete solve. Assemblies and drawing
+projections must enforce the same source-completeness boundary.
+
+Native fillets distinguish a genuine shallow C0 crease from an already-tangent edge.
+A single straight, constant-section crease on a single solid can use an exact local
+arc sweep from its original planar/extrusion supports, with tangent, radius, containment
+and final-solid checks. Unsupported selections still fail rather than silently dropping
+edges. Previously failed tiny variable blends may retry with tighter kernel construction
+accuracy; geometric acceptance is never relaxed. A rejected candidate's output tolerance
+is not an intrinsic precision bound for the input model. These paths do not invalidate
+successful saved solves or replace an editable feature history with imported geometry.
+
 ## GUI lifecycle
 
 - `prepareFrame(st)` runs before Measure overlays are consumed; selection or revision changes
@@ -72,8 +138,9 @@ probes. Related tools: `measure_part` (mass, volume, centre of mass, inertia),
 ## Verification
 
 ```bash
-python -m pytest services/mcp/test_eval_tool_dialect.py   # measure dialect; interference exact vs threshold
+scripts/testbox.py --suite geom                         # includes measure dialect and interference tests
 CHUDWARE_SHOT=evalmass xvfb-run -a ./host/build-linux/bin/chudware --ui-screenshot scratch/evalmass.png
 CHUDWARE_SHOT=asm      xvfb-run -a ./host/build-linux/bin/chudware --ui-screenshot scratch/asm.png       # insert, mate, interference
 CHUDWARE_SHOT=multidoc xvfb-run -a ./host/build-linux/bin/chudware --ui-screenshot scratch/multidoc.png  # per-document Measure window
+CHUDWARE_ENGINE_DAEMON=0 CHUDWARE_SHOT=thickness xvfb-run -a ./host/build-linux/bin/chudware --ui-screenshot scratch/thickness.png  # 0.6 mm shell, red-thin study and region evidence
 ```

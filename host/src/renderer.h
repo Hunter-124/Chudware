@@ -3,17 +3,21 @@
 // The same color texture is displayed live in the ImGui viewport. Multi-part assemblies
 // render each body in its own color (matching the engine's contact-sheet palette).
 #pragma once
+#include <array>
 #include <cstdint>
 #include <list>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "vec_math.h"
 #include "mesh.h"
 #include "render/aicm_loader.h"
 #include "render/ref_datum_geom.h"   // render::RefDatum + the GL-free datum batch builder
+#include "result_ramp.h"
 
 // Display style for the shaded pass (SolidWorks "Display Style" toolbar).
 enum class DisplayStyle {
@@ -123,15 +127,24 @@ public:
     float viewHalfHeight() const { return cam_.halfHeight; }
 
     // Bind the studio color framebuffer + supersampled viewport so the C15 overlays can draw
-    // highlights on top of the shaded model (call right after renderOrbit, then endOverlay()).
+    // highlights on top of the shaded model. Entry/exit disable scissor/culling; exit unbinds
+    // the FBO. Pass drew=false for read-only access to the scene FBO.
     void beginOverlay();
-    void endOverlay();
+    void endOverlay(bool drew = true);
 
     ~Renderer();
     bool init(int width, int height, std::string& err);  // requires a current GL context
     void resize(int width, int height);
+    // Image mutations advance this epoch only on change; callers include their overlay inputs.
+    uint64_t contentEpoch() const;
+    // True only after a complete resolve at the current size/epoch. Reuse issues no scene,
+    // resolve, blur or luma-readback work; pending async reads may still be consumed.
+    bool reuseLastFrame();
+    // TIME_ELAPSED queries are opt-in; collecting them is reserved for the visible profiler.
+    void setGpuTimersEnabled(bool on) { gpuTimersEnabled_ = on; }
     void setMesh(const Mesh& m);                          // single body, neutral color
     void setMeshes(const std::vector<PartMesh>& parts);   // multi-body, per-part colors
+    void setMeshes(std::vector<PartMesh>&& parts);
     // Per-document GPU mesh cache. A content identity is the worker doc id + immutable revision;
     // bindCachedMeshes swaps already-uploaded VAO/VBO handles into the active slot without reading
     // AICM or issuing GL uploads. setActiveMeshIdentity marks the freshly uploaded active mesh.
@@ -139,6 +152,7 @@ public:
     bool bindCachedMeshes(const std::string& docId, int revision);
     void cacheMeshes(const std::string& docId, int revision,
                      const std::vector<PartMesh>& parts);
+    void cacheMeshes(const std::string& docId, int revision, std::vector<PartMesh>&& parts);
     void parkActiveMeshes();
     void discardCachedMeshes(const std::string& docId);
     // While framing is frozen, setMeshes() updates the geometry but PRESERVES center_/radius_,
@@ -151,7 +165,7 @@ public:
     // to its clear rect and they never read as ink across pane text. Set per frame around the
     // live render; clearDatumAxisClip() (the default) draws them unclipped.
     void setDatumAxisClip(float u0, float v0, float u1, float v1);
-    void clearDatumAxisClip() { datumAxisClip_ = false; }
+    void clearDatumAxisClip() { updateContent(datumAxisClip_, false); }
     void setBackground(float tr, float tg, float tb, float br, float bg, float bb);
     // 3-stop vertical background gradient (top / mid-band ~55% / bottom floor glow).
     void setBackground3(const float top[3], const float mid[3], const float bot[3]);
@@ -162,13 +176,16 @@ public:
     // Soft contact-shadow blob color + peak alpha (alpha falls to 0 at the blob rim).
     void setGroundShadow(float r, float g, float b, float maxAlpha);
     // C30-C: RealView-style procedural environment reflections on shaded faces (0=off, 1=on).
-    void setRealView(bool on) { realView_ = on; }
+    void setRealView(bool on) { updateContent(realView_, on); }
     // Zebra stripes: SolidWorks surface-continuity inspection mode. When on, shaded faces render
     // as if reflecting a black/white striped environment (uZebra/uZebraFreq in kFrag); the stripe
     // pattern takes precedence over the scalar LUT and RealView. `freq` is the band density along
     // the reflected-direction coordinate (typical 4..60). Default OFF.
-    void setZebra(bool on, float freq) { zebra_ = on; if (freq > 0.0f) zebraFreq_ = freq; }
-    void setDisplayStyle(DisplayStyle s) { displayStyle_ = s; }
+    void setZebra(bool on, float freq) {
+        updateContent(zebra_, on);
+        if (freq > 0.0f) updateContent(zebraFreq_, freq);
+    }
+    void setDisplayStyle(DisplayStyle s) { updateContent(displayStyle_, s); }
     DisplayStyle displayStyle() const { return displayStyle_; }
     // SolidWorks-style per-feature edit preview: while a feature's PropertyManager is open, ONLY the
     // faces owned by that feature draw translucent (a real shaded pass at `alpha`), so the in-progress
@@ -176,12 +193,20 @@ public:
     // are (body_id<<32)|face_id keys (the owner map's face set for the edited feature). Pass an empty
     // set (or alpha >= 1) to clear isolation and render everything opaque.
     void setPreviewIsolation(const std::vector<uint64_t>& editFaceKeys, float alpha);
-    void clearPreviewIsolation() { previewFaces_.clear(); previewAlpha_ = 1.0f; }
+    void clearPreviewIsolation();
     // Whole-body translucency (Mass Properties COM/I/J viewport). Unlike setPreviewIsolation this
     // tints EVERY visible body at `a` so internal markers (COM cross, axes) read through the solid.
     // 1.0 = fully opaque (default). Clamped to [0,1].
-    void setBodyAlpha(float a) { bodyAlpha_ = (a < 0.0f) ? 0.0f : (a > 1.0f ? 1.0f : a); }
+    void setBodyAlpha(float a) { updateContent(bodyAlpha_, (a < 0.0f) ? 0.0f : (a > 1.0f ? 1.0f : a)); }
     float bodyAlpha() const { return bodyAlpha_; }
+    // Active mate references are see-through in shaded modes, revealing the next component.
+    void setMateGhostBodies(const std::array<uint32_t, 3>& bodies) {
+        updateContent(mateGhostBodies_, bodies);
+    }
+    bool mateGhosting() const {
+        return (displayStyle_ == DisplayStyle::Shaded || displayStyle_ == DisplayStyle::ShadedEdges) &&
+               (mateGhostBodies_[0] || mateGhostBodies_[1] || mateGhostBodies_[2]);
+    }
 
 
     // In-context component edit (SolidWorks "Edit Component"): while a component's part-doc is the
@@ -201,13 +226,27 @@ public:
     void setAuxMesh(const Mesh& m, float alpha);
     void clearAuxMesh();
     bool hasAuxMesh() const { return showAux_ && !auxSubs_.empty(); }
-    void setGhostAlpha(float a) { ghostAlpha_ = (a < 0.0f) ? 0.0f : (a > 1.0f ? 1.0f : a); }
+    // Persisted scan overlays are independent of the solid/picking meshes.
+    struct MeshReference {
+        std::string id, key;
+        std::shared_ptr<const Mesh> mesh;
+        std::array<float, 3> color{{0.55f, 0.70f, 0.90f}};
+        std::array<float, 3> bboxMin{{0, 0, 0}}, bboxMax{{0, 0, 0}};
+        bool hasBounds = false;
+        float opacity = 0.4f;
+        bool visible = true;
+    };
+    void setMeshReferences(std::vector<MeshReference> refs);
+    size_t meshReferenceCount() const { return meshReferences_.size(); }
+    void setGhostAlpha(float a) { updateContent(ghostAlpha_, (a < 0.0f) ? 0.0f : (a > 1.0f ? 1.0f : a)); }
     // In-context component edit: relocate the ghost pass by this column-major 4x4 (applied to ghost
     // vertices BEFORE the camera). Caller passes inverse(editedComponent.placement) so the ghost's
     // copy of the edited component lands on the live part at its own modelling origin, while the rest
     // of the assembly arranges around it. Identity (the default, and the fixed/first component's
     // inverse) leaves the ghost exactly where it was baked. Reset to identity by clearGhost().
-    void setGhostTransform(const float m[16]) { for (int i = 0; i < 16; ++i) ghostXform_.m[i] = m[i]; }
+    void setGhostTransform(const float m[16]) {
+        for (int i = 0; i < 16; ++i) updateContent(ghostXform_.m[i], m[i]);
+    }
     void renderView(const std::string& view);            // "iso"|"front"|"right"|"top"
     void renderOrbit(float yawDeg, float pitchDeg, float zoom);
     // W2-D: orbit with a world-space pan offset added to the look-at target. The orbit center
@@ -220,10 +259,13 @@ public:
     // Additional world-space scene bounds enlarge framing and datum geometry without moving the
     // model/origin frame center. The radius reaches the farthest auxiliary corner from that center.
     void setAuxSceneBounds(const float lo[3], const float hi[3]);
-    void clearAuxSceneBounds() { hasAuxSceneBounds_ = false; auxSceneRadiusFloor_ = 0.0f; }
+    void clearAuxSceneBounds() {
+        updateContent(hasAuxSceneBounds_, false);
+        updateContent(auxSceneRadiusFloor_, 0.0f);
+    }
     // Authoring may retain a padded framing radius while the exact bounds change/shrink.
     // This floor never replaces the real bounds or changes the model's zoom-limit reference.
-    void setAuxSceneRadiusFloor(float radius) { auxSceneRadiusFloor_ = radius; }
+    void setAuxSceneRadiusFloor(float radius) { updateContent(auxSceneRadiusFloor_, radius); }
     // Camera and screen->world math use the model/empty radius enlarged by auxiliary bounds.
     float effectiveSceneRadius() const;
     // Preserve the model/empty scene's closest absolute view when auxiliary bounds grow; the
@@ -239,7 +281,7 @@ public:
 
     // Projection mode: orthographic is the default (CAD-standard parallel projection). Perspective
     // remains available as a toggle (View Selector / heads-up). Applied by drawCurrent + thumbnail.
-    void setOrthographic(bool on) { orthographic_ = on; }
+    void setOrthographic(bool on) { updateContent(orthographic_, on); }
     bool orthographic() const { return orthographic_; }
 
     // ---- reference planes (Front=XY, Top=XZ, Right=YZ) ----
@@ -263,10 +305,7 @@ public:
     // datum set into batched overlay geometry — one definition, aliased here so every existing
     // `Renderer::RefDatum` user keeps working. setRefDatums replaces the whole set each rebuild.
     using RefDatum = render::RefDatum;
-    void setRefDatums(std::vector<RefDatum> datums) {
-        refDatums_ = std::move(datums);
-        ++datumsRevision_;   // invalidates the cached datum batch (see drawRefDatums)
-    }
+    void setRefDatums(std::vector<RefDatum> datums);
     // Read-only view of currently injected reference datums (axes/planes/points/…). Used by
     // hit-testing / PM routing so they consume the same geometry inject already solved — never
     // re-pair planes on the pick path.
@@ -283,14 +322,24 @@ public:
     // id is in this set, so a hide takes effect immediately (no document rebuild). Applied from
     // AppState::applyDatumVisibility() on toggle / tab-switch / rebuild. Harmless to pass a superset
     // (e.g. AppState::hiddenFeatures verbatim) — only datum ids are ever matched here.
-    void setHiddenDatums(std::unordered_set<std::string> ids) { hiddenDatums_ = std::move(ids); }
+    void setHiddenDatums(std::unordered_set<std::string> ids) {
+        if (hiddenDatums_ == ids) return;
+        hiddenDatums_ = std::move(ids);
+        ++datumsRevision_;
+        ++contentEpoch_;
+    }
+    const std::unordered_set<std::string>& hiddenDatums() const { return hiddenDatums_; }
     // The feature id of the currently SELECTED datum (drawn emphasized — brighter + thicker), or
     // "" for none. Set each frame from AppState::selectedFeatureId so clicking a datum highlights it.
-    void setSelectedDatumId(const std::string& id) { selectedDatumId_ = id; }
+    void setSelectedDatumId(const std::string& id) {
+        if (updateContent(selectedDatumId_, id)) ++datumsRevision_;
+    }
     // The feature id of the datum plane currently OPEN in the PropertyManager (being created/edited).
     // Its normal arrow is drawn only while it's the active edit target — once committed the arrow is
     // dropped so created planes don't carry a persistent normal handle. "" = none.
-    void setEditingDatumId(const std::string& id) { editingDatumId_ = id; }
+    void setEditingDatumId(const std::string& id) {
+        if (updateContent(editingDatumId_, id)) ++datumsRevision_;
+    }
     // Drawn/picked half-length of a reference axis (world units). Default + user axes
     // span the origin-plane half-extent e = sceneRadius*1.25; plane-derived auto axes
     // (id prefix "axis.auto:") span the user-plane quad half-extent ps = e*0.55 so they
@@ -302,7 +351,12 @@ public:
     // sketch geometry, so an offset sketch would orbit/frame around the origin. The sketch mode sets
     // this to the sketch's geometric center so the view orbits/centres there instead. Cleared (on
     // == false) outside sketch, where center_ (the model bbox centre) is already correct.
-    void setOrbitCenterOverride(bool on, const Vec3& c) { orbitOverride_ = on; orbitCenter_ = c; }
+    void setOrbitCenterOverride(bool on, const Vec3& c) {
+        updateContent(orbitOverride_, on);
+        updateContent(orbitCenter_.x, c.x);
+        updateContent(orbitCenter_.y, c.y);
+        updateContent(orbitCenter_.z, c.z);
+    }
     // W2 full-bleed viewport: the 3D band spans the whole window behind the glass panes, so the
     // part is framed in the un-occluded CLEAR region (between the pinned columns, below the doc-tab
     // band) instead of the full image. `shiftX/shiftY` are NDC lens shifts baked into the projection
@@ -311,9 +365,9 @@ public:
     // and picking/overlays read cam_.mvp/halfHeight, so they follow automatically. Set per frame
     // from the viewport panel; (0, 0, 1) = symmetric full-image framing.
     void setFramingRegion(float shiftX, float shiftY, float scale) {
-        lensShiftX_ = shiftX;
-        lensShiftY_ = shiftY;
-        framingScale_ = scale < 1.0f ? 1.0f : scale;
+        updateContent(lensShiftX_, shiftX);
+        updateContent(lensShiftY_, shiftY);
+        updateContent(framingScale_, scale < 1.0f ? 1.0f : scale);
     }
 
     // ---- C28-C: SolidWorks-style Section View — up to 3 simultaneous clip planes ----
@@ -323,12 +377,16 @@ public:
     // count must be 1..3; clearSectionPlanes() disables all clipping.
     void setSectionPlanes(const float n[][3], const float off[], int count,
                           const float capRgb[3], bool showCap);
-    void clearSectionPlanes() { section_.count = 0; }
+    void clearSectionPlanes() { updateContent(section_.count, 0); }
     int sectionClip(float normals[3][3], float offsets[3]) const;
 
     // ---- C19 result colormap + deformation ----
     // When colormap mode is on, bodies that carry a per-vertex scalar render through the LUT.
-    void setColormapMode(bool on) { colormap_ = on; }
+    void setColormapMode(bool on, const result_ramp::Display& display = {}) {
+        updateContent(colormap_, on);
+        updateContent(scalarDisplay_, on ? display : result_ramp::Display{});
+    }
+    const result_ramp::Display& scalarDisplay() const { return scalarDisplay_; }
     // Deformation multiplier applied to the per-vertex DISP field (0 = undeformed). Setting it
     // re-uploads the displaced positions on the CPU, so call sparingly (on slider change).
     void setDeformScale(float s);
@@ -337,18 +395,18 @@ public:
     // no body carries a scalar.
     bool scalarRange(float& vmin, float& vmax) const;
 
-    // ---- C27-D: offscreen preview thumbnail (View Selector hover panel) ----
+    // ---- Offscreen thumbnail for icon capture ----
     // Render the CURRENT meshes from a candidate orientation (zoom=1 fit, no pan) into a small
     // dedicated FBO (px*px, no supersampling) and return its GL color-texture id. The texture is
-    // owned by the renderer and valid only until the next renderThumbnail() call. Cheap to call:
-    // a (yaw,pitch,meshes-revision) cache skips the re-render when nothing relevant changed, so
-    // a steady hover doesn't redraw every frame. The thumb FBO is lazily allocated on first use.
+    // owned by the renderer and valid only until the next renderThumbnail() call. A
+    // (yaw,pitch,meshes-revision) cache skips re-rendering when nothing relevant changed.
+    // The thumb FBO is lazily allocated on first use.
     // GL note: the texture origin is bottom-left (GL) — flip V when blitting with ImGui::Image.
     // ALL state the main pass relies on (bound FBO, viewport, program) is restored before return.
     // transparentBg=true (icon pipeline): clear the tile to RGBA(0,0,0,0) and SKIP the
     // studio-gradient fill, so the part is composited over transparency — the source for the
     // ribbon's photographic icon tiles. Part fragments stay opaque (uAlpha=1). Default false
-    // preserves the View-Selector preview's solid studio background.
+    // uses the solid studio background.
     unsigned int renderThumbnail(float yawDeg, float pitchDeg, int px, bool transparentBg = false);
 
     // Read back the last-rendered thumbnail FBO as px*px RGBA, flipped to top-left origin.
@@ -356,8 +414,11 @@ public:
     std::vector<unsigned char> readThumbnailRGBA(int px) const;
 
     std::vector<unsigned char> readRGBA() const;         // final w*h*4, top-left origin
-    // Final-size box-resolved texture. This is the intended on-screen presentation target.
+    // Box-resolved presentation texture, backed by bucketed storage. Crop to resolvedUvMax*
+    // (and flip V for ImGui) so resizing never displays unused capacity.
     unsigned int resolvedColorTexture() const;
+    float resolvedUvMaxX() const { return targetW_ > 0 ? float(rw_) / targetW_ : 1.0f; }
+    float resolvedUvMaxY() const { return targetH_ > 0 ? float(rh_) / targetH_ : 1.0f; }
     int width() const { return w_; }
     int height() const { return h_; }
     bool hasMesh() const { return !subs_.empty(); }
@@ -384,9 +445,22 @@ public:
         return true;
     }
 
+    // ---- view-only per-body translation (exploded-view animation) ----
+    // World-space offsets (mm) keyed by AICM body id, added to every vertex in the shaded, edge,
+    // depth and section-stencil passes, so an exploded view slides at frame rate without a mesh
+    // re-upload. Replaces the whole set (unlisted bodies return home). Every change of the active
+    // meshes clears the set and advances meshGeneration(), so an offset can never outlive the
+    // mesh it was computed against. Picking/overlays do NOT apply these: callers must hold
+    // picking off while hasBodyOffsets() is true.
+    void setBodyOffsets(std::unordered_map<uint32_t, Vec3> offsets);
+    bool hasBodyOffsets() const { return !bodyOffsets_.empty(); }
+    uint64_t meshGeneration() const { return meshGeneration_; }
+
     // ---- F1: glass backdrop + adaptive contrast (Liquid Glass v2) ----
     // Kawase-blurred copy of the resolved color buffer (updated when resolveColorTexture runs).
     ViewportBackdrop backdrop() const;
+    // Reused backdrop calls only poll pending reads; keep UI frames scheduled until consumed.
+    bool backdropReadbackPending() const;
     // Mean relative luminance (Rec.709) under the rect, top-left viewport-local px coords.
     // Returns -1 ("unknown") until the first async readback has published a grid, so contrast
     // consumers take their theme fallback instead of guessing a tone.
@@ -426,6 +500,16 @@ public:
     float frameMsEma() const { return frameMsEma_; }
 
 private:
+    template<class T> bool updateContent(T& value, const T& next) {
+        if (value == next) return false;
+        value = next;
+        ++contentEpoch_;
+        return true;
+    }
+    void updateCamera(float yaw, float pitch, float zoom, const Vec3& pan);
+    void restoreIdleGlState() const;
+    struct Sub;
+    void refreshPreviewRuns(Sub& s);
     struct MaterialSpan {
         uint32_t first_tri = 0, tri_count = 0;
         float color[3];
@@ -440,11 +524,12 @@ private:
         int idxCount = 0, edgeVerts = 0;
         uint32_t body_id = 0;                 // AICM body id (for per-feature preview isolation)
         std::vector<FaceSpan> faces;          // per-face triangle runs, sorted by first_tri
+        std::vector<FaceSpan> previewRuns[2]; // opaque/edited triangle runs, rebuilt on isolation change
         float color[3] = {0.62f, 0.70f, 0.80f};
         float metallic = 0.0f, roughness = 0.5f;  // C32-A RealView material
         // Coalesced at upload; references the existing EBO without copying geometry.
         std::vector<MaterialSpan> materials;
-        // CPU-side copies kept so the deform slider can re-upload displaced positions.
+        // Retained only for displacement-bearing bodies; static bodies keep no CPU geometry.
         std::vector<float> basePos;   // undeformed positions (3*n)
         std::vector<float> baseEdge;  // undeformed edge-line verts (3*k)
         std::vector<float> disp;      // 3*n displacement (empty = none)
@@ -454,6 +539,11 @@ private:
     };
 
     void allocTargets();
+    void warmPrograms();
+    void updateTargetSize();
+    void uploadMeshes(const std::vector<PartMesh>& parts, std::vector<PartMesh>* movable = nullptr);
+    void cacheMeshesImpl(const std::string& docId, int revision,
+                         const std::vector<PartMesh>& parts, std::vector<PartMesh>* movable);
     void drawCurrent(float yawDeg, float pitchDeg, float zoom);
     void drawSubFaces(const Sub& s, uint32_t firstTri, uint32_t triCount, int editing = -1);
     void drawSubMaterials(const Sub& s, bool isolate = false);
@@ -463,6 +553,8 @@ private:
     // axesOnly=true draws only Kind::Axis. Call axes LAST (after origin planes) so dashed axes
     // composite over translucent plane fills. selectedDatumId_ emphasizes the selected axis.
     void drawRefDatums(const Mat4& mvp, bool axesOnly);
+    void drawMeshReferences(const Mat4& mvp, const Vec3& eye, const Vec3& keyDir,
+                            const Vec3& fillDir, const Vec3& rimDir);
     void drawSectionCap(const Mat4& mvp, int planeIdx);  // C28-C: cap for one plane, clipped by others
     void planeCorners(int plane, float e, Vec3 out[4]) const;  // 4 world corners of plane quad
     void refreshDatumBatch();      // rebuild the cached datum geometry when its inputs changed
@@ -485,13 +577,24 @@ private:
     // no-op for glUniform*, exactly as before.
     struct FaceUniforms {
         int mvp = -1, keyDir = -1, fillDir = -1, rimDir = -1, camPos = -1, color = -1;
-        int useScalar = -1, scalarMin = -1, scalarMax = -1, metallic = -1, roughness = -1;
+        int useScalar = -1, scalarMin = -1, scalarMax = -1, scalarReversed = -1;
+        int metallic = -1, roughness = -1;
         int lut = -1, clipCount = -1, clipN = -1, clipOff = -1, realView = -1;
-        int zebra = -1, zebraFreq = -1, alpha = -1;
+        int zebra = -1, zebraFreq = -1, alpha = -1, offset = -1;
     } uFace_;
     struct EdgeUniforms {
-        int mvp = -1, color = -1, clipCount = -1, clipN = -1, clipOff = -1;
+        int mvp = -1, color = -1, clipCount = -1, clipN = -1, clipOff = -1, offset = -1;
     } uEdge_;
+    struct DepthUniforms {
+        int mvp = -1, clipCount = -1, clipN = -1, clipOff = -1, offset = -1;
+    } uDepth_;
+    // Per-body view offsets (setBodyOffsets) and the active-mesh generation that clears them.
+    std::unordered_map<uint32_t, Vec3> bodyOffsets_;
+    uint64_t meshGeneration_ = 0;
+    void activeMeshesReplaced();
+    // Set `loc` (a vec3 uOffset) to this sub's offset; returns true when it was non-zero so
+    // the caller resets the uniform after its loop.
+    bool applyBodyOffset(int loc, const Sub& s) const;
     struct BgUniforms { int top = -1, mid = -1, bot = -1; } uBg_;
     struct ShadowUniforms { int mvp = -1, color = -1, maxAlpha = -1; } uShadow_;
     struct PlaneUniforms { int mvp = -1, color = -1; } uPlane_;
@@ -499,14 +602,14 @@ private:
         int mvp = -1, color = -1, n = -1, keyDir = -1, clipCount = -1, clipN = -1, clipOff = -1;
         int capExclude = -1;
     } uCap_;
-    struct ResolveUniforms { int src = -1, ss = -1; } uResolve_;
-    struct DownsampleUniforms { int src = -1, invDstSize = -1; } uDown_;
-    struct KawaseUniforms { int src = -1, texel = -1, offset = -1; } uKawase_;
+    struct ResolveUniforms { int src = -1, ss = -1, dstSize = -1; } uResolve_;
+    struct DownsampleUniforms { int src = -1, scale = -1, uvMin = -1, uvMax = -1; } uDown_;
+    struct KawaseUniforms { int src = -1, texel = -1, offset = -1, uvMax = -1; } uKawase_;
 
     // ---- F1 async luminance pipeline (ported from ui/viewport/renderer.cpp) ----
     void issueLumaReadback() const;   // one glReadPixels/frame -> PBO ring + fence, or fallback
     void issueLumaPboRead(unsigned int srcFbo, int srcW, int srcH) const;  // handles resize
-    void pollLumaPbos(bool bootstrap = false) const;  // wait only to establish a new source's first grid
+    void pollLumaPbos() const;  // zero-timeout polling, including source/size changes
     void reduceLumaPbo(int slot) const;  // map -> Rec.709 reduce -> staging -> published swap
 
     // Desktop: 3x supersample + box-filter resolve for crisp edges.
@@ -520,25 +623,35 @@ private:
 #endif
     static constexpr int kBlurPasses = 4;  // 4-tap Kawase passes (GLASS_DESIGN_SPEC)
     int w_ = 0, h_ = 0;           // final (display) size
-    int rw_ = 0, rh_ = 0;         // presentation size (w_*renderScale_); targets are this big
+    int rw_ = 0, rh_ = 0;         // active presentation subrect (w_*renderScale_, device-clamped)
     int sw_ = 0, sh_ = 0;         // supersampled size (sw_==rw_ under CHUDWARE_GLES3)
+    int targetW_ = 0, targetH_ = 0; // grow-only, bucketed presentation capacity
+    int sceneW_ = 0, sceneH_ = 0; // exact supersampled attachment size (no padded per-frame clears)
+    int maxTargetSize_ = 0, allocatedMsaaRequest_ = -1;
+    mutable uint64_t contentEpoch_ = 1;
+    uint64_t drawnEpoch_ = 0;
+    bool completeFrame_ = false, reusedFrame_ = false;
+    float cameraYaw_ = 0.0f, cameraPitch_ = 0.0f, cameraZoom_ = 1.0f;
+    bool cameraInitialized_ = false;
     unsigned int fbo_ = 0, colorTex_ = 0, depthRbo_ = 0;
 #ifdef CHUDWARE_GLES3
     unsigned int colorRbo_ = 0;   // multisampled color (0 when falling back to single-sample tex)
+    unsigned int msaaResolveFbo_ = 0;  // single-sample staging target backed by colorTex_
     int msaaSamples_ = 0;        // active sample count; 0 = single-sample colorTex_ path
 #endif
     mutable unsigned int resolveFbo_ = 0, resolvedTex_ = 0;
     unsigned int resolveProg_ = 0;
-    mutable bool resolvedDirty_ = true;
+    mutable bool resolvedDirty_ = false;
     // Kawase blur chain: downsample resolved color to ¼ res, then ping-pong blur passes.
     mutable unsigned int blurDownFbo_ = 0, blurDownTex_ = 0;
     mutable unsigned int blurPingFbo_[2] = {0, 0};
     mutable unsigned int blurPingTex_[2] = {0, 0};
     unsigned int downsampleProg_ = 0, kawaseProg_ = 0;
     mutable int blurW_ = 0, blurH_ = 0;
-    mutable bool backdropDirty_ = true;
+    mutable int blurTargetW_ = 0, blurTargetH_ = 0;
+    mutable bool backdropDirty_ = false;
 
-    // ---- F1 luminance pipeline: first-source contrast bootstrap, then 3-slot async PBO ring ----
+    // ---- F1 luminance pipeline: fully asynchronous 3-slot PBO ring, preserving the last grid ----
     static constexpr int kLumaPboCount = 3;
     static constexpr int kLumaGridMaxW = 64, kLumaGridMaxH = 40;
     mutable unsigned int lumaPbo_[kLumaPboCount] = {0, 0, 0};
@@ -549,6 +662,7 @@ private:
     mutable int lumaPboNext_ = 0;              // next ring slot to issue into
     mutable int lumaSrcW_ = 0, lumaSrcH_ = 0;  // readback source size as of the last (re)spec
     mutable unsigned int lumaSrcFbo_ = 0;     // source generation (also invalidated on realloc)
+    mutable size_t lumaPboCapacity_ = 0;     // grow-only bytes per slot, bounded by target dimensions
     mutable unsigned int lumaFallbackCounter_ = 0;  // every-8th-frame direct-read fallback cadence
     mutable std::vector<float> lumaGrid_;     // published grid, top-left row order, lumaW_*lumaH_
     mutable std::vector<float> lumaStaging_;  // built off to the side, then swapped in (no tearing)
@@ -587,13 +701,14 @@ private:
     static void beginGpuTimer(GpuTimerRing& t);
     static void endGpuTimer(GpuTimerRing& t, float& outMs, bool& outValid);
     mutable GpuTimerRing sceneTimer_, blurTimer_, lumaTimer_;
+    bool gpuTimersEnabled_ = false;
     mutable float sceneMs_ = 0.f, blurMs_ = 0.f, lumaMs_ = 0.f;
     mutable bool sceneTimingValid_ = false, blurTimingValid_ = false, lumaTimingValid_ = false;
-    // C27-D: dedicated small offscreen target for the View Selector preview thumbnail. Lazily
-    // allocated on the first renderThumbnail() call; reallocated only when the requested px changes.
+    // Dedicated small offscreen thumbnail target, lazily allocated on the first
+    // renderThumbnail() call and reallocated only when the requested px changes.
     unsigned int thumbFbo_ = 0, thumbTex_ = 0, thumbDepth_ = 0;
     int thumbPx_ = 0;                                  // current thumb target size (0 = unallocated)
-    // Cache: skip the re-render while the hovered orientation and the model are unchanged.
+    // Cache: skip the re-render while the orientation and the model are unchanged.
     float thumbYaw_ = 1e30f, thumbPitch_ = 1e30f;     // last rendered orientation (deg)
     unsigned int thumbMeshRev_ = 0;                   // meshesRevision_ at last render (mismatch = dirty)
     bool thumbValid_ = false;                         // a thumbnail has been rendered at least once
@@ -601,6 +716,7 @@ private:
     unsigned int meshesRevision_ = 0;                 // bumped by setMeshes(); thumbnail cache key
     unsigned int prog_ = 0;
     unsigned int edgeProg_ = 0;
+    unsigned int depthProg_ = 0;
     unsigned int bgProg_ = 0, bgVao_ = 0;
     unsigned int shadowProg_ = 0;  // ground contact-shadow quad
     // planeProg_ draws both the origin planes and every datum overlay (flat uMVP+uColor).
@@ -617,9 +733,9 @@ private:
     unsigned int datumsRevision_ = 0;    // bumped by setRefDatums()
     unsigned int datumBatchRevision_ = 0;               // revision the batch was built from
     float datumBatchExtent_ = -1.0f;                    // e the batch was built at
-    std::string datumBatchSelected_, datumBatchEditing_;
-    std::unordered_set<std::string> datumBatchHidden_;   // hidden set the batch was built from
     render::RefDatumPalette datumBatchPalette_;          // palette roles it was built from
+    mutable render::RefDatumPalette epochPalette_;
+    mutable bool epochPaletteValid_ = false;
     std::vector<RefDatum> refDatums_;   // feature datum geometry to draw (reference overlays)
     std::unordered_set<std::string> hiddenDatums_;  // datum ids hidden via the FeatureManager eye
     std::string selectedDatumId_;       // id of the emphasized (selected) datum, "" = none
@@ -655,15 +771,20 @@ private:
     bool realView_ = true;  // C30-C: environment-reflection sheen (uRealView in kFrag)
     float previewAlpha_ = 1.0f; // < 1 ghosts the edited feature's faces (per-feature edit preview)
     float bodyAlpha_ = 1.0f;    // whole-body translucency (Mass Properties); 1 = opaque
+    std::array<uint32_t, 3> mateGhostBodies_{};
     std::unordered_set<uint64_t> previewFaces_;  // (body<<32)|face keys to ghost; empty = none
+    std::vector<uint64_t> previewKeys_; // exact caller order: unchanged preview inputs are allocation-free
     bool zebra_ = false;        // Zebra surface-continuity stripe mode (uZebra in kFrag); default OFF
     float zebraFreq_ = 18.0f;   // stripe band density along the reflected-direction coord
     DisplayStyle displayStyle_ = DisplayStyle::ShadedEdges;
     std::vector<Sub> subs_;
+    std::array<uint64_t, 2> meshesKey_{{0, 0}}, auxMeshKey_{{0, 0}};
+    bool meshesKeyValid_ = false, auxMeshKeyValid_ = false;
     struct CachedMesh {
         std::vector<Sub> subs;
         Vec3 center;
         float radius = 0.0f;
+        std::array<uint64_t, 2> key{{0, 0}};
     };
     // Parked GPU meshes keyed by "docId\\x1frev". Cap keeps the N most-recent
     // (doc,rev) entries so multi-tab sessions don't grow VAOs unbounded.
@@ -682,6 +803,12 @@ private:
     std::vector<Sub> auxSubs_;
     bool  showAux_ = false;
     float auxAlpha_ = 0.45f;
+    struct ReferenceGpu {
+        unsigned int vao = 0, positions = 0, normals = 0, indices = 0;
+        int count = 0;
+    };
+    std::vector<MeshReference> meshReferences_;
+    std::unordered_map<std::string, ReferenceGpu> referenceGpu_;
     Vec3 center_;
     Vec3 pan_;  // W2-D: world-space orbit-target offset (set by renderOrbit; added to center_)
     float lensShiftX_ = 0.0f;  // W2: horizontal NDC lens shift (proj.m[8] / ortho offset)
@@ -698,6 +825,7 @@ private:
 
     // C19 colormap / deformation state.
     bool colormap_ = false;
+    result_ramp::Display scalarDisplay_;
     float deformScale_ = 0.0f;
     bool framingFrozen_ = false;   // when true, setMeshes() keeps center_/radius_ (no re-frame)
     bool datumAxisClip_ = false;   // setDatumAxisClip(): scissor the datum-axis pass

@@ -5,7 +5,11 @@
 
 #include "ecad/library.h"
 
+#include "ecad/kicad.h"
+#include "ecad/kicad_libs.h"
+
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <map>
 #include <mutex>
@@ -391,10 +395,59 @@ const std::map<std::string, json>& footprints() {
 }  // namespace
 
 json resolve_footprint(const std::string& fpid) {
+    if (const auto node = kicad_libs::footprint_sexpr(fpid))
+        return kicad::footprint_def(*node, fpid);
     const auto& fps = footprints();
     auto it = fps.find(fpid);
     if (it == fps.end()) return json(nullptr);
     return it->second;  // returns a copy (nlohmann::json value semantics)
+}
+
+json search_footprints(const std::string& query, int limit) {
+    auto lowercase = [](std::string text) {
+        std::transform(text.begin(), text.end(), text.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return text;
+    };
+    const std::string needle = lowercase(query);
+    struct Hit { int rank; std::string id; json entry; };
+    std::map<std::string, Hit> hits;
+    auto rank = [&](const std::string& id, const std::string& description, bool tag_match) {
+        if (needle.empty()) return 1;
+        const std::string full = lowercase(id);
+        const auto colon = full.find(':');
+        const std::string name = colon == std::string::npos ? full : full.substr(colon + 1);
+        if (full == needle) return 500;
+        if (name == needle) return 450;
+        if (full.find(needle) != std::string::npos) return 400;
+        if (tag_match) return 200;
+        return lowercase(description).find(needle) != std::string::npos ? 100 : 0;
+    };
+    for (const auto& item : kicad_libs::search_footprints(query, 0)) {
+        const std::string id = item.value("fpid", std::string());
+        const std::string description = item.value("description", std::string());
+        const int normal_rank = rank(id, description, false);
+        const int score = normal_rank ? normal_rank : 200;  // KiCad tags matched.
+        hits.emplace(id, Hit{score, id, item});
+    }
+    for (const auto& [id, def] : footprints()) {
+        if (hits.count(id)) continue;
+        const std::string description = def.value("description", std::string());
+        const int score = rank(id, description, false);
+        if (!score || kicad_libs::footprint_sexpr(id)) continue;
+        hits.emplace(id, Hit{score, id, json{{"fpid", id}, {"description", description},
+                                            {"pad_count", def.value("pads", json::array()).size()}}});
+    }
+    std::vector<Hit> ordered;
+    ordered.reserve(hits.size());
+    for (auto& [id, hit] : hits) ordered.push_back(std::move(hit));
+    std::sort(ordered.begin(), ordered.end(), [](const Hit& a, const Hit& b) {
+        return a.rank != b.rank ? a.rank > b.rank : a.id < b.id;
+    });
+    if (limit > 0 && ordered.size() > static_cast<std::size_t>(limit)) ordered.resize(limit);
+    json result = json::array();
+    for (auto& hit : ordered) result.push_back(std::move(hit.entry));
+    return result;
 }
 
 }  // namespace chudware::ecad::library

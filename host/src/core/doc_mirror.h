@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <memory>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -32,32 +33,35 @@ struct Owned {
     std::vector<std::pair<uint32_t, uint32_t>> edges;   // (body_id, edge_id)
 };
 
-// Complete host-side snapshot of an already-open document mirror. Tab switching restores this
-// immutable revision locally, avoiding a serialized worker round-trip when the tab has not changed.
+struct DocMirrorPayload;
+
+// Complete host-side snapshot of an already-open document mirror. Document-sized data is
+// immutable and shared: copying/capturing/restoring never walks the tree or topology.
 struct DocMirrorSnapshot {
     std::string docId;
     int revision = -1;
-    nlohmann::json tree;
-    nlohmann::json featureStatus;
-    nlohmann::json refDatums = nlohmann::json::array();
-    std::unordered_map<std::string, Owned> ownerMap;
-    std::unordered_map<uint64_t, std::string> faceOwner;
-    std::unordered_map<uint64_t, std::string> edgeOwner;
-    std::unordered_map<uint32_t, std::vector<std::string>> bodyOwners;
-    bool valid() const { return !docId.empty() && revision >= 0; }
+    std::shared_ptr<const DocMirrorPayload> payload;
+    bool valid() const { return !docId.empty() && revision >= 0 && payload; }
+    const nlohmann::json& tree() const;
 };
 
 // Represents an ops-response (doc_apply_ops / doc_undo / doc_redo).
 // The caller should feed tess.aicm_path into AppState::loadDocMesh().
 struct OpsResponse {
-    bool ok = false;
+    bool ok = false;                 // only an accepted response, never a failed candidate
+    bool rejected = false;           // a rebuild or known validation refusal
+    bool unchanged = false;          // known atomic refusal at this request's current base revision
+    bool has_tess = false;           // usable path, or explicit empty path with empty bodies
     int  revision = -1;
-    nlohmann::json tree;              // full doc JSON (aicad.part/1 | aicad.asm/1)
-    nlohmann::json feature_status;   // [{id,ok,ms,error,dangling_refs}]
+    nlohmann::json tree;             // response tree (restored live tree on atomic rollback)
+    nlohmann::json feature_status;   // rejected candidate diagnostics when rejected, otherwise live
     nlohmann::json id_map;           // {"$0":"f9", …} batch placeholder -> assigned id (C17)
+    nlohmann::json auto_rollback;     // committed downstream failures and hidden suffix
+    std::string warning;              // non-fatal committed-state warning
     std::string aicm_path;           // tess.aicm_path (empty if no tess block)
-    std::string error_code;          // set on RPC error (stale_revision, invalid_op, …)
+    std::string error_code;          // RPC code, or rebuild_rejected for an in-band failure
     std::string error_message;       // human-readable error
+    nlohmann::json error_detail;     // structured worker error detail, if supplied
     nlohmann::json owner_map;        // W1-B: raw "owner_map" object when present (else null)
 };
 
@@ -84,6 +88,7 @@ struct PushPullResult {
 
 class DocMirror {
 public:
+    DocMirror();
     // Listener called whenever a tree/snapshot is adopted (on the calling thread).
     // revisionChanged is true only when the SAME document has a different native revision;
     // an unchanged refresh or a binding to another document is not a document mutation.
@@ -95,24 +100,55 @@ public:
     // learns their action was dropped instead of silently failing. Fired on the calling thread.
     using StaleCb = std::function<void()>;
     void setStaleResyncCallback(StaleCb cb) { staleResyncCb_ = std::move(cb); }
+    // Fired after accepted ops are ingested, before the normal listener and Done.
+    // revisionChanged compares to the submitted base (or the previous mirror revision
+    // for externally guarded ingestion), not to a prior tree-only resync.
+    using AcceptedOpsObserver = std::function<void(const OpsResponse&, bool revisionChanged)>;
+    void setAcceptedOpsObserver(AcceptedOpsObserver observer) {
+        acceptedOpsObserver_ = std::move(observer);
+    }
+    // A superseded mutation may have committed or have an uncertain transport outcome.
+    // This is an origin hint only; consumers must fetch current state rather than ingest
+    // the superseded payload into another document.
+    using SupersededOpsObserver = std::function<void(const std::string& docId, int baseRevision)>;
+    void setSupersededOpsObserver(SupersededOpsObserver observer) {
+        supersededOpsObserver_ = std::move(observer);
+    }
+    // Track pending human operations independently of the currently displayed document.
+    using PendingOpsObserver = std::function<void(const std::string& docId, bool pending)>;
+    void setPendingOpsObserver(PendingOpsObserver observer) {
+        pendingOpsObserver_ = std::move(observer);
+    }
+    // A successful response can arrive after the originating document was switched away.
+    using HumanMutationObserver = std::function<void(const std::string& docId, int revision)>;
+    void setHumanMutationObserver(HumanMutationObserver observer) {
+        humanMutationObserver_ = std::move(observer);
+    }
+
 
     // ---- accessors ----
     bool        hasDoc()   const { return !docId_.empty(); }
-    std::string docId()    const { return docId_; }
+    const std::string& docId() const { return docId_; }
     int         revision() const { return revision_; }
+    uint64_t generation() const { return generation_; }
+    // Cached from the accepted revision's body metadata or positive part volume.
+    // Unknown is distinct from a known all-surface/empty document.
+    bool solidPresenceKnown() const;
+    bool hasSolidBody() const;
 
     // Full document JSON (last known tree from the worker). Empty object until a successful
     // new/open or the first ops-response. Use this to drive the feature tree.
-    const nlohmann::json& tree() const { return tree_; }
+    const nlohmann::json& tree() const;
 
-    // Last rebuild feature_status array from the worker response.
-    const nlohmann::json& featureStatus() const { return featureStatus_; }
+    // Last rebuild feature_status array and whether it describes this revision.
+    const nlohmann::json& featureStatus() const;
+    bool featureStatusCurrent() const;
 
     // Displayable reference geometry (datum axes/planes/points/csys) from the latest response, as a
     // raw JSON array (see core/doc/session.cpp ops_response "datums" for the per-entry shape). The
     // renderer draws these as overlays — a datum produces no body, so without this it is invisible.
     // Empty for docs with no datum features (or an engine that doesn't ship the field).
-    const nlohmann::json& refDatums() const { return refDatums_; }
+    const nlohmann::json& refDatums() const;
 
     // Capture/restore an immutable local revision for instant already-open tab binds. Restore fires
     // the normal listener so every tree consumer observes the same state as a worker activation.
@@ -126,12 +162,14 @@ public:
     // open/new. Additive + tolerant: stays empty if the engine omits the field.
     const nlohmann::json& lastOpenedDrawings() const { return lastOpenedDrawings_; }
 
-    // Mesh path + body volume from the most recent doc_open's own tess block. When non-empty,
-    // the open caller can load this mesh directly instead of issuing a redundant forced
-    // doc_rebuild — on an embedded-cache open that rebuild is a FULL recompile, i.e. the
-    // double-build that made every AI-handoff refresh pay for the part twice. Reset per open;
-    // empty when the engine response had no tess block (caller falls back to doc_rebuild).
+    // Mesh path + body volume from the most recent doc_open response. The open caller can
+    // load its mesh directly; without a path it uses the warm empty result when available,
+    // otherwise requests doc_activate, which reads the warm compile cache when possible.
+    // Reset per open.
     const std::string& lastOpenedAicm() const { return lastOpenedAicm_; }
+    // True only when the engine explicitly returned a usable path, including
+    // an empty path that represents a genuinely empty model.
+    bool lastOpenedMeshUsable() const { return lastOpenedMeshUsable_; }
     double lastOpenedVolume() const { return lastOpenedVolume_; }
 
     // How the most recent doc_open was served, from the engine's response (reset per open):
@@ -156,21 +194,12 @@ public:
     // engine not (yet) sending "owner_map": the map is simply empty and the lookups return nothing.
 
     // Which feature (if any) owns this face. Empty string when unknown.
-    std::string ownerOfFace(uint32_t body_id, uint32_t face_id) const {
-        auto it = faceOwner_.find(((uint64_t)body_id << 32) | (uint64_t)face_id);
-        return it == faceOwner_.end() ? std::string() : it->second;
-    }
+    std::string ownerOfFace(uint32_t body_id, uint32_t face_id) const;
     // Which feature (if any) owns this edge. Empty string when unknown.
-    std::string ownerOfEdge(uint32_t body_id, uint32_t edge_id) const {
-        auto it = edgeOwner_.find(((uint64_t)body_id << 32) | (uint64_t)edge_id);
-        return it == edgeOwner_.end() ? std::string() : it->second;
-    }
+    std::string ownerOfEdge(uint32_t body_id, uint32_t edge_id) const;
     // Every feature that owns this body (most bodies have exactly one creator; patterns/booleans can
     // touch several). Empty vector when unknown.
-    std::vector<std::string> ownerOfBody(uint32_t body_id) const {
-        auto it = bodyOwners_.find(body_id);
-        return it == bodyOwners_.end() ? std::vector<std::string>() : it->second;
-    }
+    std::vector<std::string> ownerOfBody(uint32_t body_id) const;
     // ---- mutations (synchronous, blocking the calling thread) ----
 
     // Create a new empty part doc. Returns true + fills docId / revision on success.
@@ -198,17 +227,13 @@ public:
     // Ctrl+Z reverts the whole action.
     OpsResponse applyOps(WorkerClient& w, const nlohmann::json& ops, bool coalesce = false);
 
-    // Non-blocking applyOps. Queues doc_apply_ops on `rpc` (GL-thread AsyncRpc). The
-    // Done callback runs inside a later rpc.drain() on the GL thread so it may touch AppState /
-    // loadDocMesh freely. Mirror state (revision/tree/owner_map) is updated ONLY when this
-    // submission is still the latest for this mirror (`mutationGen`) AND the active doc_id still
-    // matches — otherwise `applied` is false and the caller must not load the mesh / learn
-    // id_map (stale/superseded). Latest-wins: a newer applyOpsAsync bumps mutationGen and
-    // drops older completions. stale_revision still auto-resyncs (sync doc_tree, short) and
-    // fires the stale-resync callback. `w` is used only for that resync path.
-    // Prefer this for PM live preview, feature-tree mutations, equations, undo/redo UX —
-    // keep the sync applyOps for scenarios / headless shots that must block.
-    using ApplyAsyncDone = std::function<void(const OpsResponse& r, bool applied)>;
+    // Non-blocking doc_apply_ops; Done runs on the GL thread in rpc.drain().
+    // `current` is true for a still-owned response, including errors and rejections.
+    // False means the completion is obsolete and must not be presented. Meshes and IDs
+    // require BOTH current and r.ok. A matching tree-only N+1 resync may reconcile an
+    // accepted response; foreign/newer or superseded document state is never overwritten.
+    // stale_revision auto-resyncs through `w` and fires the stale callback.
+    using ApplyAsyncDone = std::function<void(const OpsResponse& r, bool current)>;
     void applyOpsAsync(AsyncRpc& rpc, WorkerClient& w, const nlohmann::json& ops,
                        ApplyAsyncDone done, bool coalesce = false, int timeoutMs = 120000);
 
@@ -233,20 +258,11 @@ public:
     PushPullResult pushPull(WorkerClient& w, uint32_t body_id, uint32_t topo_id,
                             double distance, bool commit);
 
-    // GL-thread ingest of a finished doc_push_pull / doc_revert (or any ops-shaped)
-    // JSON response. Used by async latest-wins drag pipelines that issue the RPC via AsyncRpc
-    // and only touch the mirror inside drain(). Same post-conditions as the sync helpers when
-    // the response is successful; returns a filled PushPullResult / OpsResponse for the caller.
+    // GL-thread ingestion of externally guarded ops-shaped responses. A non-null
+    // rejected_tree describes a rejected candidate; otherwise feature statuses describe
+    // the committed tree, including historical failures.
     PushPullResult ingestPushPullResponse(const nlohmann::json& res);
     OpsResponse    ingestOpsResponse(const nlohmann::json& res);
-
-    // C37-F: Checkpoint / revert helpers for the PropertyManager cancel path.
-    // checkpoint() issues doc_checkpoint and returns the opaque checkpoint id string (empty on
-    // failure). revert() issues doc_revert, parses the full ops-style response (tree / revision /
-    // feature_status / owner_map), updates the mirror, fires the listener, and returns the response
-    // so the PM can refresh the mesh from aicm_path. Both are no-ops when no doc is open.
-    std::string checkpoint(WorkerClient& w);
-    OpsResponse revert(WorkerClient& w, const std::string& checkpointId);
 
     // Resolve a viewport pick to a typed selector string.
     // Returns the selector JSON string, or empty on error (err filled).
@@ -270,16 +286,14 @@ public:
     // as open() on success. Returns false if the envelope is an error or missing doc_id.
     bool adoptOpenResponse(const nlohmann::json& res, std::string& err);
 
-    // Document tabs: re-point this mirror at an ALREADY-open worker document (the worker keeps
-    // every doc alive in its registry). Issues a forced doc_rebuild for `docId` so the mirror
-    // gets the new doc's tree/revision/owner_map AND a fresh tess.aicm_path; fills *aicmPath with
-    // that mesh path (empty for an empty doc). Fires the listener so the tree repaints. Returns
-    // false (err set) if the doc id is unknown or the call fails. Used when switching tabs.
+    // Document tabs: re-point this mirror at an already-open worker document using
+    // doc_activate. The engine serves its warm compiled snapshot when available and
+    // rebuilds only on a cold cache. Returns tree/revision/owner_map and tess.aicm_path.
     bool activate(WorkerClient& w, const std::string& docId, std::string& aicmPath,
                   std::string& err);
 
 
-    // Adopt a finished doc_rebuild JSON as activate() would (GL thread / drain).
+    // Adopt a finished doc_activate JSON as activate() would (GL thread / drain).
     bool adoptActivateResponse(const std::string& docId, const nlohmann::json& res,
                                std::string& aicmPath, std::string& err);
 
@@ -330,8 +344,8 @@ public:
     // Read-only passthrough of export_file (engine/doc/formats.py:_handler_export_file): compiles
     // the document `docId`'s bodies and writes them to `path` in `format`. `format` is one of the
     // literal strings export_document accepts: "step" | "iges" | "stl" | "3mf" | "brep". Does NOT
-    // touch the mirror. Returns the written absolute path (worker echoes {path}), or "" on error
-    // (err filled). `docId` is passed explicitly so the caller controls which doc is exported.
+    // touch the mirror. Returns the written absolute path, or "" on error
+    // (err filled). When provided, result receives the complete worker response.
     // For mesh formats (stl/obj/ply/3mf/gltf/glb) the optional tessellation controls set
     // the export resolution: linDeflection (mm, or a fraction when `relative`),
     // angDeflection (radians), and `ascii` (STL container). The defaults reproduce the
@@ -339,7 +353,8 @@ public:
     std::string exportFile(WorkerClient& w, const std::string& docId,
                            const std::string& path, const std::string& format, std::string& err,
                            double linDeflection = 0.05, double angDeflection = 0.35,
-                           bool relative = false, bool ascii = false);
+                           bool relative = false, bool ascii = false,
+                           nlohmann::json* result = nullptr);
 
     // Live triangle/vertex estimate for the export dialog (export_tess_estimate RPC).
     // Returns true on success and fills tris/verts; false on error (err filled).
@@ -354,34 +369,24 @@ public:
     // open or the call fails; on success the listener fires so the tree repaints.
     bool resync(WorkerClient& w);
 
-    // Reset local state (e.g. on worker restart).
-    void reset() {
-        docId_.clear();
-        revision_ = -1;
-        notifiedDocId_.clear();
-        notifiedRevision_ = -1;
-        tree_ = {};
-        featureStatus_ = {};
-        refDatums_ = nlohmann::json::array();
-        lastOpenedDrawings_ = nlohmann::json::array();
-        lastOpenedCacheReported_ = lastOpenedCacheHit_ = lastOpenedWarm_ = false;
-        lastOpenedCacheMissReason_.clear();
-        lastOpenedWriteback_ = 0;
-        lastOpenedWritebackReason_.clear();
-        ownerMap_.clear();
-        faceOwner_.clear();
-        edgeOwner_.clear();
-        bodyOwners_.clear();
-        ++mutationGen_;  // invalidate any in-flight applyOpsAsync completions
-    }
+    // Adopt an async doc_tree response, preserving status/ownership/datums when omitted.
+    // The caller guards the active document identity before delivering the response.
+    bool ingestTreeResponse(const nlohmann::json& res);
 
-    // Owned topology for each feature (raw, as last parsed). Exposed for completeness / debugging.
-    const std::unordered_map<std::string, Owned>& ownerMap() const { return ownerMap_; }
+    // Reset local state (e.g. on worker restart).
+    void reset();
+
+    // Parsed lazily from the latest response; shared by every snapshot of that revision.
+    const std::unordered_map<std::string, Owned>& ownerMap() const;
 
 private:
-    OpsResponse parseOpsResponse(const nlohmann::json& result);
+    static OpsResponse parseOpsResponse(const nlohmann::json& result);
+    void storeResponseDatums(const nlohmann::json& result);
+    void storeSolidPresence(const nlohmann::json& result, bool sameDocument);
     bool resyncTree(WorkerClient& w);  // called on stale_revision
+    bool storeTreeResponse(const nlohmann::json& res);
     void notify() {
+        ++generation_;
         const bool revisionChanged = !docId_.empty() && docId_ == notifiedDocId_ &&
                                      revision_ != notifiedRevision_;
         if (docId_ != notifiedDocId_) notifiedDocId_ = docId_;
@@ -389,20 +394,21 @@ private:
         if (listener_) listener_(revisionChanged);
     }
 
-    // W1-B (item 6): (re)build ownerMap_ + the reverse lookups from a response's "owner_map" object.
-    // TOLERATES a missing/null/empty owner_map: in that case the maps are cleared and lookups
-    // return nothing, so the host can build and run before the engine ships the field.
+    // Retain raw topology once; parsed ownership and compact reverse indices are built lazily.
     void storeOwnerMap(const nlohmann::json& ownerMapJson);
+    void storeTree(const nlohmann::json& tree);
+    void storeFeatureStatus(const nlohmann::json& status);
+    void storeRefDatums(const nlohmann::json& datums);
 
     std::string    docId_;
     int            revision_ = -1;
     std::string    notifiedDocId_;
     int            notifiedRevision_ = -1;
-    nlohmann::json tree_;
-    nlohmann::json featureStatus_;
-    nlohmann::json refDatums_ = nlohmann::json::array();           // datum reference geometry to draw
+    std::shared_ptr<const DocMirrorPayload> payload_;
+    std::weak_ptr<const DocMirrorPayload> lastTreeOnlyPayload_;
     nlohmann::json lastOpenedDrawings_ = nlohmann::json::array();  // W12+ doc_open "drawings"
     std::string    lastOpenedAicm_;                                // doc_open tess.aicm_path
+    bool           lastOpenedMeshUsable_ = false;
     double         lastOpenedVolume_ = 1.0;                        // doc_open "volume" (flat-2D probe)
     bool           lastOpenedCacheReported_ = false;               // doc_open carried "cache_hit"
     bool           lastOpenedCacheHit_ = false;                    // doc_open "cache_hit"
@@ -412,13 +418,13 @@ private:
     std::string    lastOpenedWritebackReason_;                     // cache.writeback.reason
     Listener       listener_;
     StaleCb        staleResyncCb_;  // W1-B: fired on stale_revision auto-resync
+    AcceptedOpsObserver acceptedOpsObserver_;
+    SupersededOpsObserver supersededOpsObserver_;
+    PendingOpsObserver pendingOpsObserver_;
+    HumanMutationObserver humanMutationObserver_;
     uint64_t       mutationGen_ = 0;  // latest-wins guard for applyOpsAsync
 
-    // W1-B: parsed owner map + reverse indices (key = (body<<32)|topo for faces/edges).
-    std::unordered_map<std::string, Owned> ownerMap_;          // fid -> owned topology
-    std::unordered_map<uint64_t, std::string> faceOwner_;      // (body<<32)|face -> fid
-    std::unordered_map<uint64_t, std::string> edgeOwner_;      // (body<<32)|edge -> fid
-    std::unordered_map<uint32_t, std::vector<std::string>> bodyOwners_;  // body -> [fid...]
+    uint64_t generation_ = 0;  // includes same-revision refreshes and local snapshot restores
 };
 
 }  // namespace core

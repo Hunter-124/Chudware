@@ -1,19 +1,8 @@
 # Manufacturing Robot Architecture — ROS 2 / MoveIt Offline Planning
 
-Design-only.
-Authority: `00_decisions.md` + `01_definition_of_done.md` (v4 supersedes
-every earlier amendment). Path ruling applied: production GUI only under
-`host/src/ui/manufacture/**`; cross-domain service root `services/manufacturing/**`; domain engines
-`core/<domain>/**`; RPC/events stay `mfg_*` / `mfg.*`; `host/src/ui/cam/**` remains offline-CAM
-owner and is touched only through named seams.
-
-Evidence base actually read: `core/mate/mate.h`, `services/mcp/server.py`,
-`services/mcp/tool_registry.py`, `host/src/ui/viewport_panel.cpp`, `contracts/worker_rpc.md`,
-the twin-reuse audit and the manufacturing-breadth research. Two supporting reads were taken to make
-file/API claims exact rather than guessed: `host/src/ui/cam/cam_mirror.h`,
-`host/src/render/overlays.h` (declarations only), `contracts/cam.md`, `contracts/events.md`,
-`contracts/licenses.md` (BOM table shape). Anything not directly observed is marked
-`[INFERENCE]` or `[TO CONFIRM]`.
+Design proposal. See the [as-built map](README.md#as-built-map) for the implemented subset.
+Proposed service interfaces use the shared `manufacture` family and `mfg_*` / `mfg.*`
+wire names.
 
 ---
 
@@ -49,7 +38,7 @@ Contract tests key on these ids, not on section numbers.
 | `GW-CAP-DERIVED-FROM-EVIDENCE` | a capability row's `derived_from[]` is **every evidence row the report cites**, so no level can outlive the evidence under it |
 | `GW-FRESHVALUE-PUBLISH` | `FreshValue<T>{v,state,t_mono_ns,seq,age_ms,ttl_ms,src,why,last_ok?}` is the sole external freshness shape, and **every** field a UI paints crosses wrapped in it — including a durable authored row, which is journaled first and then published wrapped with `state:"ok"` and `ttl_ms:null` when it does not decay |
 | `GW-EMULATOR-CEILING` | no advertised level may exceed what the highest stage actually passed unlocks: E0–E3 → `monitor`, E4–E5 → `transport`, E6 → `execute`; `safety_integration` is never unlocked by any stage |
-| `GW-FAMILY-MANUFACTURE` | one shared MCP family id `"manufacture"` covers the whole overhaul and is OFF by default; the enabling mechanism (`DEFAULT_TOOL_FAMILIES` + `DEFAULT_OFF_TOOL_FAMILIES` in `services/agent/config.py`) is Gateway-owned in W1.1 and is a hard predecessor of every domain's MCP-registration wave |
+| `GW-FAMILY-MANUFACTURE` | the shared MCP family `manufacture` is off by default and requires explicit enablement in `agent.tool_families` |
 | `GW-RISK-TABLE-OWNER` | Gateway is the sole owner of the `services/mcp/tool_registry.py` risk-class edit for the batch, in one wave; every other domain's rows land as **data** the owner applies |
 | `GW-READONLY-TRANSPORT` | the monitoring/observer transport split: an `IReadTransport` has no `write()` method, so a read-only collector is provably incapable of commanding and never takes or contends for a command lease |
 | `GW-ZERO-NEW-SKIP` | the batch adds **zero** new normal-gate SKIPs; an absent optional prerequisite pins the level at `assumed` with the missing level named, or is excluded from `gate.sh` behind an opt-in qualification script — never reported as a SKIP and never read as a pass |
@@ -251,7 +240,7 @@ struct RobotBackplot {
 | `host/src/render/overlays.h` / `.cpp` | **no change** | Everything needed already exists: `drawSegments` (`:66`), the time-scrubbed prefix/suffix path `drawCamSegments` (`:72`), `drawCamToolMarker` (`:79`), `drawTriangles` (`:86`). `drawCamSegments` is a generic *time-scrubbed segment batch* — the `Cam` prefix is pre-existing naming, and reusing it costs zero churn in a shared file. Trajectory scrub is precisely a completed-prefix / pending-suffix range draw over an end-time array. |
 | `services/mcp/server.py` | **+2 lines** in the registration block: `from services.mcp.robot_tools import register_robot_tools` then `register_robot_tools(_reg.view(mcp, "manufacture"))`, placed with the other Manufacture families near the CAM registration (`:362-365`) | Exactly the established idiom used by all ~50 existing families. |
 | `services/mcp/tool_registry.py` | **not edited by robot** — the two `_RISK_OVERRIDES` rows (`:64-70`) are handed to Gateway, sole owner of this file's risk-class edit for the batch (`GW-RISK-TABLE-OWNER`) | See §5.2 — two tools persist artifacts and must be tightened to `RISK_WRITE` despite read-shaped names; five concurrent appenders would each break the others' unchanged-`classify_risk` assertion. |
-| `services/agent/config.py` | **not edited by robot.** The edit is exactly as analysed in §3.7 — **+1 entry** in `DEFAULT_TOOL_FAMILIES` (`:589-593`) and **+1 new** `DEFAULT_OFF_TOOL_FAMILIES = ("manufacture",)` consulted in the `else` branch of `get_tool_families` (`:1004-1005`) — but it is **Gateway-owned in W1.1** and lands before any MCP wave (`GW-FAMILY-MANUFACTURE`) | **Required, not cosmetic** — see the trap in §3.7. Robot's wave is not first, so robot cannot own the file that decides whether *every* domain's surface ships enabled. |
+| `services/agent/config.py` | shared family configuration, described in §3.7 | `manufacture` must remain off by default until explicitly enabled. |
 | `host/CMakeLists.txt` | **+2 source entries** (`robot_panel.cpp`, `robot_mirror.cpp`) | No new target, no new dependency, no new link, no C ABI symbol. Top-level/root CMake is untouched. |
 | `services/worker_main.py` (or the doc-worker method registry that consumes `WORKER_METHODS`) | **+1 registration line** for `services.manufacturing.robot.worker_methods.WORKER_METHODS` | Same idiom `contracts/worker_rpc.md:251` documents for `drawing.WORKER_METHODS`. `[TO CONFIRM]` the exact registration call site in `services/worker_main.py`; the pattern is contract-documented, the line number was not read for this design. |
 
@@ -280,35 +269,11 @@ not `moveit_resources`, even though several are permissively licensed. Every fix
 by `make_fixtures.py` from our own numbers. This keeps the FK closed-form oracle ours (see §7) and
 keeps the licence BOM empty of third-party robot data.
 
-### 3.7 The tool-family trap, and the two scripts
+### 3.7 Tool-family boundary
 
-The project ruling is that the shared `manufacture` family is **OFF by default until commissioning**.
-Reading `services/agent/config.py` shows that is *not* achievable by omission, and the reason is
-worth stating because getting it wrong ships an enabled manufacturing surface:
-
-- `DEFAULT_TOOL_FAMILIES` (`:589-593`) does not contain `manufacture`.
-- `is_tool_family_enabled` returns **`True` for an unknown family** (`:1013-1017`). So registering
-  tools under a family that is not in the list leaves them **silently enabled**.
-- Adding `manufacture` to the list is necessary but still not sufficient: with nothing configured,
-  `get_tool_families` falls to `else: out[fam] = True` (`:1004-1005`) — also **enabled**.
-
-Therefore two edits are required, and `test_manufacture_family_default_off.py` asserts both:
-add `"manufacture"` to `DEFAULT_TOOL_FAMILIES`, and add
-`DEFAULT_OFF_TOOL_FAMILIES = ("manufacture",)` consulted in that `else` branch.
-
-**Ownership, corrected: robot found this, Gateway owns it.** Seven domains register into the family,
-and if any MCP wave lands before the config edit the entire Manufacture surface ships **enabled by
-default** — including Gateway's three motion-class request tools. Robot's wave is not first, so the two
-`services/agent/config.py` edits and `test_manufacture_family_default_off.py` move to **Gateway in
-W1.1**, as a hard predecessor of every domain's MCP-registration wave including robot's
-(`GW-FAMILY-MANUFACTURE`). Robot keeps the analysis credit and asserts the resulting property from the
-outside (§7); it makes neither edit. The mechanism itself is unchanged — the finding was that omission
-does not achieve default-off, and that finding is what Gateway now carries. A code-level
-default-off set is chosen over shipping `agent.tool_families.manufacture = false` in the default
-config, because a stale or user-edited config file cannot silently re-enable it. When
-`agent.role_tools` is configured the existing union logic (`:1002-1003`) already yields `False`
-unless a role lists the family, so that path needs no change. Per-tool toggles keep granularity via
-the existing `get_tool_options` surface, so nothing is lost by the family being off.
+The shared `manufacture` family is off by default in `services/agent/config.py`, even
+when a role lists it. It requires explicit `agent.tool_families.manufacture = true`
+to enable. Per-tool granularity remains available through `get_tool_options`.
 
 Two new scripts, neither referenced by `gate.sh`:
 
@@ -1311,49 +1276,3 @@ content is specified so the maintainer appends rather than designs.
 
 ---
 
-## 13. Loose ends not closed within this design's read scope
-
-Marked so nobody mistakes them for verified facts.
-
-- `[TO CONFIRM]` the `services/worker_main.py` registration call site for a `WORKER_METHODS` module. The
-  idiom is contract-documented (`contracts/worker_rpc.md:251`); the exact line was not read.
-- `[TO CONFIRM]` the Manufacture ribbon group registration file, and whether a robot-specific
-  `ui::Palette` role set is preferred over reusing the CAM roles observed at
-  `viewport_panel.cpp:2567-2640`.
-- `[TO CONFIRM]` the host C++ test registration seam for `test_robot_mirror.cpp`.
-- `[INFERENCE]` the Pilz planner and `rosbag2` package licences in §9.2 — both must be verified by
-  SBOM scan of the actually installed ROS packages at integration, not accepted from this document.
-- Peer boundaries, agreed with the peer workstreams and reflected above: `GatewayDesignRecovery` owns
-  `CapabilityTruth` / `CapabilityReport`, the Tier-0 PREREQ row type and totality check,
-  `journal_client.py`, durable `seq` stamping, `src` derivation, and the `mfg_tier0_* / mfg_event_* /
-  mfg_result_*` RPCs — this design composes all of them and redefines none.
-  `MonitoringArchitecture` owns `ObservationRecord` / `MonitorSourceCapability` and the whole
-  read-only observation producer. `TurningArchitecture` owns `core/cam/turn/**`.
-  `CuttingProcessArchitecture` owns `core/cam/cut/**`. `PnpArchitecture` owns
-  `services/manufacturing/pnp/**` and its own type set. No name, file, type, event, RPC or tool in
-  this design overlaps any of them.
-- Resolved since the first draft, and worth flagging to reviewers of the earlier version: the
-  `src:"probed"` procedural-fact claim (now `ProceduralFact` + `admission:"procedural_fact"`), the
-  producer-minted `at_seq` (now journal-stamped), the `absent` truth value (now `unsupported` with a
-  `why`), the `mfg` family id (now `manufacture`), and the requested gate SKIP (now withdrawn).
-
----
-
-## 14. Review closure — architecture plan review
-
-Every row below is a change **already applied in this document**, not a plan.
-
-| finding | applies to robot? | how it is closed here | where |
-|---|---|---|---|
-| **C8** — capability rows `FreshValue`-wrapped by three domains, never-wrapped by PnP | yes, as the domain the ruling generalises **from** | §6.2 states the ruling in full: every UI-painted row publishes wrapped, a durable authored row is **journaled first and published wrapped** with `state:"ok"` and **`ttl_ms:null`**, and `robot.sidecar` is the single decaying row with a non-null `ttl_ms`. The painted-row table is completed with the durable rows the panel actually reads (`robot.cell.summary`, `robot.reach.summary`, `robot.traj.export`, `robot.mockrun`) so no painted row is left outside the envelope | §6.2, §7 |
-| **C8, identity half** | yes | wrapping explicitly does **not** move identity into the envelope: a durable robot row stays identified by `seq` + `revision` + `artifact_hash`, invalidation stays scoped by `seq <= at_seq`, and `test_freshvalue_shape.py` source-scans for any code keying, joining, superseding or invalidating on `age_ms`, `t_mono_ns` or `ttl_ms` | §6.2, §6.5, §7 |
-| **B11** — the `manufacture`-family-off-by-default mechanism has no owner and no wave | **yes — robot is the finder, and was the accidental owner** | ownership moves to **Gateway in W1.1**: the two `services/agent/config.py` edits and `test_manufacture_family_default_off.py` are Gateway's, as a hard predecessor of every domain's MCP wave including robot's. Robot keeps the analysis credit (omission does *not* achieve default-off; an unlisted family resolves enabled) and edits neither file, asserting the property from outside instead | §3.5, §3.7, §5.2, §7 |
-| **B12 / family drift** — one shared MCP family | already compliant | `register_robot_tools(_reg.view(mcp, "manufacture"))`, wire names unchanged at `mfg_robot_*` / `mfg.robot.*` | §5.2 |
-| **B14** — five claimants on `services/mcp/tool_registry.py` | yes, as one of the five | Gateway is the sole owner of that file's risk-class edit for the batch (`GW-RISK-TABLE-OWNER`); robot's two `_RISK_OVERRIDES` rows are handed over as **data**, and the shared acceptance check is `classify_risk` unchanged for every pre-existing tool | §3.5, §5.2, §7 |
-| **B10 / kind drift** — durable-result kinds must be registered, capability kinds included | already compliant | eight kinds, each declaring **both** columns plus a declared `supersede_with_parent` reason; `robot_procedural_fact` mandatory-`true` (`GW-PF-FOLLOWS-PARENT`), `robot_capability` mandatory-`false` (`GW-CAP-NO-INHERIT`), and `robot_capability.derived_from` is the full cited evidence set (`GW-CAP-DERIVED-FROM-EVIDENCE`) | §6.5 |
-| **B1** — Stage-1 admission classes | **yes — robot carried a third class** | §6.4 now names the two classes and admits only `procedural_fact`; §6.5's per-guard declaration narrows from `[procedural_fact, declared]` to `[procedural_fact]`, because `declared` is an `src` value and not an admission class. `robot.capability` and `robot.sidecar` move from the Stage-1 list to Stage-2 corroborating sub-conditions, where `not_applicable` is legitimate | §6.4, §6.5, §7 |
-| **B6/B7/B8/B9** — probed-for-computed rows, re-declared `CapabilityTruth`, self-minted `seq`, self-computed closure | not robot defects; compliance restated with rule ids | no `probed` row is producible (`GW-SRC-3`); types composed verbatim (`GW-TYPES-OWNED`); every `seq`/`at_seq` is journal-stamped (`GW-SEQ-1`); `derived_from[]` declared and `affected[]` never populated by us (`GW-CLOSURE`) | §4, §6.1, §6.2, §6.5 |
-| **Zero new normal-gate SKIP** | already compliant, now id-bound | E0–E3 hermetic; the live sidecar and the `mate_cli` rotation cross-check run only from `scripts/qualify_robot_e3.sh`, which `gate.sh` never calls; absence pins nothing higher than `assumed`/`unsupported` with the missing level named, and is never a SKIP (`GW-ZERO-NEW-SKIP`) | §2.1, §3.7, §6.1, §7 |
-| **C10 — cross-reference drift on the load-bearing gateway rules** | **yes — robot cited §24.6 for the flip scope and §24.2 for the closure, both wrong numbers** | every gateway citation now names a stable rule id bound to the rule's content and its refusal code; no `§24.x` or "§23 rule N" number is cited anywhere in this document | §Citation convention, throughout |
-| **No-execute boundary (DoD #12, #13, #15)** | unchanged by every edit above | no command path at any layer: ten reserved method names permanently unimplemented, no `RISK_MOTION` and no safety-class tool, no run/hold/abort/nonce/approval surface, `device_command_owner` `null` with a `why`, and `monitor`/`transport`/`execute`/`safety_integration` permanently `unsupported` with a `why`. Publishing a row wrapped changes what the panel reads, never what robot may do | §5.1, §5.2, §6.1, §8, §11 |
-| **Gateway `seq` authority** | unchanged by every edit above | the envelope's `seq` is the journal's stamped `seq`; publishing wrapped introduces no second ordering namespace and no domain-side stamping, and `test_seq_never_minted.py` still scans for one | §4, §6.2, §7 |

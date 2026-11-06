@@ -218,6 +218,8 @@ def test_soffice_paths_degrade_to_typed_converter_missing(tmp_path, monkeypatch)
         "ok": False,
         "reason": "converter_missing",
         "hint": "install LibreOffice",
+        "code": "converter_missing",
+        "error": "converter_missing",
     }
 
 

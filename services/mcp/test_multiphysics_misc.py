@@ -456,7 +456,10 @@ def test_hydraulic_piping_handoff_feeds_piping_solve():
     s = json.loads(ptools["piping_solve"](source_handoff=env))
     assert s["ok"] and s["converged"], s
     assert s.get("handoff_id") == env["id"], s
-    assert s["links"] and all(lk["dp_kpa"] >= 0 or True for lk in s["links"])
+    assert s["links"]
+    for link in s["links"]:
+        assert math.isfinite(link["dp_kpa"])
+        assert link["dp_kpa"] * link["flow_m3h"] >= 0
 
 
 def test_piping_verify_envelope_shape_from_mock_results():
@@ -581,7 +584,7 @@ def test_motion_dynamics_rejects_orientation_only_force_path(tmp_path):
         "doc_id": asm, "mate_id": mate_id, "start": 0.0, "stop": 60.0, "steps": 5,
         "check_interference": False,
         "dynamics": {"duration_s": 30.0, "default_density_g_cm3": 7.85,
-                     "gravity": [0, 0, -9.81]}})
+                     "densities": {arm: 7.85}, "gravity": [0, 0, -9.81]}})
     assert r["ok"] is False, r
     dyn = r.get("dynamics")
     assert dyn and dyn.get("frames"), r
@@ -589,6 +592,7 @@ def test_motion_dynamics_rejects_orientation_only_force_path(tmp_path):
     m_arm = 40.0 * 4.0 * 4.0 * 1e-3 * 7.85 * 1e-3
     masses = {b["component"]: b["mass_kg"] for b in dyn["bodies"]}
     assert math.isclose(masses[arm], m_arm, rel_tol=1e-3), masses
+    assert next(b for b in dyn["bodies"] if b["component"] == arm)["density_g_cm3"] == pytest.approx(7.85)
     frames = dyn["frames"]
     assert math.isclose(frames[-1]["t_s"], 30.0, abs_tol=1e-9), frames[-1]
     assert len(frames) == len(r["trajectory"]), (len(frames), len(r["trajectory"]))

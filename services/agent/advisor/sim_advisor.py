@@ -1628,33 +1628,31 @@ def postcheck(
         if verdict == "PASS":
             verdict = "WARN"
 
-    # --- Geometry-linked suggestion (fillet/sharp-edge Kt pattern) ---
-    max_stress_face = (study.get("results") or {}).get("max_stress_face") or {}
-    face_type = max_stress_face.get("type") or ""
-    feature_name = max_stress_face.get("feature") or ""
-    if face_type in ("fillet", "sharp_edge") and feature_name:
+    spots = results.get("hot_spots") or []
+    if spots and spots[0].get("at_sharp_edge") is True and spots[0].get("sharp_edge_warning"):
+        peak = spots[0]
         items.append({
             "schema": "aicad.advisory/1",
             "check": "sim_margin",
             "severity": "hint",
-            "finding": (
-                f"Max stress is at a {face_type} on feature '{feature_name}'. This may be a "
-                "real stress concentration or a singular idealization; refine locally and "
-                "check whether the peak converges before changing geometry."
-            ),
-            "refs": {"feature": feature_name, "face_type": face_type},
-            "numbers": {},
-            "candidate_fixes": [{
-                "action": "edit_feature_param",
-                "params": {"feature": feature_name, "param": "fillet_radius",
-                           "hint": "Only increase the radius after a local mesh-convergence check."},
-                "basis": "A larger radius often reduces a geometric concentration, but no Kt is inferred here.",
-                "predicted_effect": "Potentially lower converged peak stress; re-run to measure it.",
-                "confidence": "heuristic",
-            }],
-            "helper_tools": ["run_fea_static", "describe_results"],
-            "source": {"kind": "heuristic", "detail": "sim_advisor.postcheck (Kt pattern)"},
+            "finding": peak["sharp_edge_warning"],
+            "refs": {"face_sid": peak.get("face_sid"),
+                     "feature": peak.get("owner_feature")},
+            "numbers": {"location_mm": peak.get("location_mm"),
+                        "von_mises_mpa": peak.get("von_mises_mpa")},
+            "candidate_fixes": [],
+            "helper_tools": ["run_fea_convergence", "fea_probe"],
+            "source": {"kind": "geometry", "detail": "distance to tessellated concave edge"},
         })
+    if doc_geom and not study.get("convergence_evidence"):
+        hint = _mesh_suggestion(study, doc_geom)
+        if hint:
+            items.append({
+                "schema": "aicad.advisory/1", "check": "sim_mesh", "severity": "hint",
+                "finding": hint, "refs": {}, "numbers": doc_geom,
+                "candidate_fixes": [], "helper_tools": ["run_fea_convergence"],
+                "source": {"kind": "geometry", "detail": "measured document features"},
+            })
 
     return {
         "verdict": verdict,

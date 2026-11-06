@@ -1,5 +1,7 @@
 // RE-28: pure-CPU ctest for the 3DGS splat loader + depth sort (no GL context).
 #include "../src/render/splat_renderer.h"
+#include "../src/ui/reveng/reveng_import.h"
+#include "../src/ui/reveng/reveng_measure.h"
 
 #include <cmath>
 #include <cstdio>
@@ -7,6 +9,7 @@
 #include <limits>
 #include <vector>
 #include <string>
+#include <sstream>
 
 static int g_failures = 0;
 #define CHECK(cond, msg)                                                    \
@@ -47,6 +50,61 @@ static void rejects(const std::string& text, const char* reason) {
 int main(int argc, char** argv) {
     // Fixture path passed by CTest (WORKING_DIRECTORY = build dir); arg[1] = absolute .ply path.
     std::string ply = (argc > 1) ? argv[1] : "host/tests/fixtures/splat_tiny.ply";
+    {
+        using ui::reveng::SourceFile;
+        CHECK(ui::reveng::classifySourceFile("object.SPZ") == SourceFile::Splat,
+              "SPZ opens as a splat case-insensitively");
+        CHECK(ui::reveng::classifySourceFile("object.ksplat") == SourceFile::Splat &&
+              ui::reveng::classifySourceFile("object.splat") == SourceFile::Splat,
+              "binary splat formats route to reconstruction");
+        for (const char* path : {"clip.mp4", "clip.MOV", "clip.webm", "clip.mkv"})
+            CHECK(ui::reveng::classifySourceFile(path) == SourceFile::Video,
+                  "video format routes to reconstruction");
+        std::istringstream gaussian(header(true) + "binary payload");
+        CHECK(ui::reveng::gaussianPlyHeader(gaussian), "Gaussian PLY header is detected");
+        std::istringstream mesh(header(false, 0,
+            "element face 1\nproperty list uchar int vertex_indices\n"));
+        CHECK(!ui::reveng::gaussianPlyHeader(mesh), "face-bearing PLY stays a mesh");
+        std::istringstream points("ply\nformat ascii 1.0\nelement vertex 1\n"
+                                  "property float x\nproperty float y\nproperty float z\nend_header\n");
+        CHECK(!ui::reveng::gaussianPlyHeader(points), "ordinary point PLY is not a splat");
+        std::istringstream truncated("ply\nformat ascii 1.0\nelement vertex 1\n"
+                                    "property float opacity\nproperty float scale_0\n"
+                                    "property float rot_0\nproperty float f_dc_0\n");
+        CHECK(!ui::reveng::gaussianPlyHeader(truncated), "unterminated PLY header is rejected");
+    }
+    {
+        const std::vector<Vec3> pts{{-0.5f, 0.5f, 0.0f}, {0.5f, -0.5f, 0.0f}, {0, 0, 2}};
+        const Mat4 identity;
+        CHECK(ui::reveng::pickSparsePoint(pts, identity, 10, 20, 200, 100, 60, 45, 8) == 0,
+              "sparse picker maps NDC to top-left preview coordinates");
+        CHECK(ui::reveng::pickSparsePoint(pts, identity, 10, 20, 200, 100, 160, 95, 8) == 1,
+              "sparse picker selects the second projected point");
+        CHECK(ui::reveng::pickSparsePoint(pts, identity, 10, 20, 200, 100, 110, 70, 8) == -1,
+              "sparse picker excludes clipped points");
+        CHECK(std::fabs(ui::reveng::reconstructionDistance({1,2,3}, {4,6,3}) - 5.0) < 1e-8,
+              "known dimension span uses native three-dimensional distance");
+        CHECK(std::fabs(ui::reveng::reconstructionDistance({1e9,0,0}, {1e9 + 1,0,0}) - 1.0) < 1e-8,
+              "native coordinates retain precision at large offsets");
+        std::vector<render::Gaussian> splats(2);
+        splats[0].pos = pts[0];
+        splats[1].pos = pts[1];
+        splats[0].opacity = 0.01f;
+        CHECK(ui::reveng::pickSplatPoint(splats, identity, 10, 20, 200, 100, 60, 45, 8) == -1,
+              "nearly transparent splat centers are not picked");
+        CHECK(ui::reveng::pickSplatPoint(splats, identity, 10, 20, 200, 100, 160, 95, 8) == 1,
+              "splat center can calibrate a splat-only session");
+        const std::array<double, 9> rotation{0,-1,0, 1,0,0, 0,0,1};
+        const std::array<double, 3> translation{10,20,30};
+        const auto native = ui::reveng::inverseSimilarity({6,22,36}, 2, rotation, translation);
+        CHECK(std::fabs(native[0] - 1) < 1e-8 && std::fabs(native[1] - 2) < 1e-8 &&
+              std::fabs(native[2] - 3) < 1e-8,
+              "metric splat pick inverts scale, rotation and translation");
+        CHECK(std::strcmp(ui::reveng::scaleConfidenceTier(true, 2.0, true, false, 0.0), "low") == 0,
+              "unreported residual never produces high confidence");
+        CHECK(std::strcmp(ui::reveng::scaleConfidenceTier(true, 2.0, true, true, 0.4), "high") == 0,
+              "measured low residual retains its confidence tier");
+    }
 
     render::SplatCloud cloud;
     std::string err;

@@ -12,6 +12,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -20,17 +23,25 @@
 
 #include "doc_tabs.h"
 #include "layout.h"         // publishDocTabBandBottom — pinned columns anchor below the real band
-#include "feature_tree.h"   // featureTreeSaveDoc — save-then-close from the unsaved-changes prompt
+#include "feature_tree.h"
+#include "feature_tree_nested.h"
 #include "file_dialog.h"    // saveFileDialog — ECAD Save-As from the unsaved-changes prompt
 #include "icons.h"
+#include "sim_manager.h"   // flush accepted simulation setup edits before document saves
 #include "plm/plm_quickbar.h"  // ui::plmAutoRecordSave — auto-record on save
 #include "metrics.h"
+#include "anim.h"
 
 #include "../core/app_state.h"
 #include "../core/doc_mirror.h"
+#include "../core/engine_events.h"
 #include "../ui_theme.h"   // ui::uiScale, ui::palette
-#include "ecad/ecad_panel.h"  // Wave 2: New Schematic/PCB feed the editor mirror (ecadEditorMirror)
-#include "ecad/ecad_mirror.h" // Wave 2: complete EcadMirror type for setDocId in the chooser path
+#include "ecad/ecad_panel.h"
+#include "workspace_home.h"   // the launch starter's tab is hidden on the empty-workspace home
+
+#ifndef __EMSCRIPTEN__
+void ecadRecoverySaved(const std::string& docId, int savedRevision);
+#endif
 
 namespace ui {
 
@@ -47,7 +58,7 @@ static int  s_hoverReveal = -1;
 // Wave 2: the "+" New-Document chooser. The clicked menu item records which kind of doc to create;
 // the actual create+addTab runs after the strip is drawn (deferred, like switch/close), so it never
 // mutates docTabs mid-iteration. -1 = nothing requested this frame.
-enum class NewDocKind { None = -1, Part = 0, Assembly, Drawing, Schematic, PCB };
+enum class NewDocKind { None = -1, Part = 0, Assembly, Drawing, KicadProject };
 static NewDocKind s_newDoc = NewDocKind::None;
 // Right-click tab menu: close every OTHER tab (keep this one), or close all. Deferred + applied
 // after the strip is drawn so they never mutate docTabs mid-iteration. -1 / false = nothing asked.
@@ -61,6 +72,11 @@ struct CloseTabIdentity {
 static CloseTabIdentity s_confirmClose;
 static CloseTabIdentity s_saveClose;
 static CloseTabIdentity s_closeConfirmed;
+struct DeferredTabClose {
+    CloseTabIdentity identity;
+    bool askIfDirty = false;
+};
+static std::vector<DeferredTabClose> s_deferredCloses;
 
 static const std::string& closeTabId(const AppState::DocTab& tab) {
     using K = AppState::DocTab::TabKind;
@@ -80,6 +96,38 @@ static int resolveCloseTab(const AppState& st, const CloseTabIdentity& identity)
         if (tab.kind == identity.kind && closeTabId(tab) == identity.id) return i;
     }
     return -1;
+}
+
+static bool hasUnsavedEmbeddedDrawing(const AppState& st, const AppState::DocTab& source) {
+    if (source.docId.empty()) return false;
+    for (const auto& tab : st.docTabs)
+        if (tab.kind == AppState::DocTab::TabKind::Drawing &&
+            tab.sourceDocId == source.docId && tab.path.empty() &&
+            (tab.dirty || st.hasPendingHumanMutations(tab.drawingDocId)))
+            return true;
+    return false;
+}
+
+static void requestTabClose(AppState& st, const CloseTabIdentity& identity, bool askIfDirty) {
+    const int idx = resolveCloseTab(st, identity);
+    if (idx < 0) return;
+    const auto& tab = st.docTabs[idx];
+    if (st.hasPendingHumanMutations(identity.id)) {
+        for (const auto& pending : s_deferredCloses)
+            if (pending.identity.id == identity.id && pending.identity.kind == identity.kind) return;
+        s_deferredCloses.push_back({identity, askIfDirty});
+        return;
+    }
+    if (hasUnsavedEmbeddedDrawing(st, tab)) {
+        if (askIfDirty)
+            st.toast(ui::ToastLevel::Warn, "Save or close this part's unsaved drawings first");
+        return;
+    }
+    if (tab.dirty) {
+        if (askIfDirty) s_confirmClose = identity;
+        return;
+    }
+    st.closeDocTab(idx);
 }
 // Wave 2: set true to request the New-Document chooser popup open this frame (the "+" button click,
 // or a Ctrl+N hook from app.cpp via openNewDocChooser()). Consumed inside drawDocTabs.
@@ -222,6 +270,7 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
     // artifact). Nothing here may paint outside (p0, p1).
     const float pulsePhase = 0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 3.2f);  // ~2 Hz breath
     if (t.aiPulse && !active) {
+        if (ImGui::IsRectVisible(p0, p1)) anim::requestFramesAt(30.0f);
         const float ar = pal.accent[0], ag = pal.accent[1], ab = pal.accent[2];
         // Warm fill tint — same rounded rect the glass pill will occupy (no square fill under curves).
         dl->AddRectFilled(p0, p1,
@@ -322,11 +371,7 @@ static float drawOneTab(AppState& st, int idx, float x, float y0, float barH,
 
     // Route interactions (deferred).
     if (xClicked || middleClose) {
-        // Pure AI-authored docs (un-adopted handoff mirrors) never raise a save prompt —
-        // AI-VC auto-checkpoints handle their history; close silently even if dirty.
-        const bool aiSilent = t.aiHandoff && !t.userAdopted;
-        if (t.dirty && !aiSilent) s_confirmClose = closeTabIdentity(t);   // ask first
-        else                      s_closeIdx = idx;
+        s_closeIdx = idx;
     } else if (switchClicked) {
         s_hoverReveal = idx;  // also reveal a clipped tab that was already selected
         if (!active) s_switchTo = idx;
@@ -475,9 +520,8 @@ static bool drawOverflowChip(ImDrawList* dl, float x, float y0, float barH, floa
 }
 
 float docTabStripHeight(const AppState& st) {
-    // The strip persists even with no document open (empty start state / all tabs closed) so its
-    // "+" New-Document button stays reachable — closing the last tab must not strand the user with
-    // no way to start a new file. Only suppressed before the worker is up (nothing to host yet).
+    // Constant: drawDocTabs decides per frame whether anything shows (the workspace home hides a
+    // strip that would hold only the "+", since the home card carries the same actions).
     (void)st;
     return 26.0f * ui::uiScale;
 }
@@ -494,144 +538,321 @@ static int partTabIndexForDoc(AppState& st, const std::string& docId) {
     return -1;
 }
 
-// See doc_tabs.h. One place to save any tab kind so the close / quit / Save / Save-All flows behave
-// identically across the whole suite (CAD parts, ECAD boards, drawings).
-TabSaveResult saveDocTab(AppState& st, int idx, bool forceDialog) {
-    if (idx < 0 || idx >= (int)st.docTabs.size()) return TabSaveResult::Nothing;
-    using K = AppState::DocTab::TabKind;
-    AppState::DocTab& t = st.docTabs[idx];
+struct PendingCadSave {
+    // Callbacks include later requests waiting for this save to finish.
+    std::vector<TabSaveDone> callbacks;
+};
+static std::map<std::string, PendingCadSave> s_pendingCadSaves;
 
-    // ---- Part / Assembly → DocMirror .step+ ----
-    if (t.kind == K::Part || t.kind == K::Assembly) {
-        st.switchToTab(idx);   // DocMirror::save writes whatever doc the mirror points at
-        if (!forceDialog && !t.path.empty()) {
-            std::string err;
-            if (st.docMirror.save(st.worker, t.path, err)) {
-                t.dirty = false;
-                st.clearDrawingDirtyForSource(t.docId);   // the save embedded this part's drawings
-                st.pushRecentFile(t.path);
-                ui::plmAutoRecordSave(st, t.path);
-                ui::boxMirrorNotifySave(st, t.path);
-                return TabSaveResult::Saved;
+static TabSaveResult finishSave(TabSaveDone& done, TabSaveResult result) {
+    if (done) done(result);
+    return result;
+}
+
+static bool sameSaveDestination(const std::string& a, const std::string& b) {
+    if (a.empty() || b.empty()) return false;
+    if (a == b || ui::featureTreeCanonicalPath(a) == ui::featureTreeCanonicalPath(b)) return true;
+    std::error_code ec;
+    return std::filesystem::equivalent(std::filesystem::u8path(a), std::filesystem::u8path(b), ec) && !ec;
+}
+
+TabSaveResult saveCadDocument(AppState& st, const std::string& docId,
+                              const std::string& path, bool automatic, TabSaveDone done) {
+    if (docId.empty() || path.empty() || !st.workerStarted) {
+        st.addLog("[tabs] save failed: document, destination, or engine unavailable");
+        st.toast(ui::ToastLevel::Error, "Save failed: document or destination unavailable");
+        return finishSave(done, TabSaveResult::Failed);
+    }
+    bool overwriteChanged = false;
+    nlohmann::json expectedDiskStamp;
+    for (const auto& tab : st.docTabs) {
+        if (tab.docId != docId) continue;
+        const bool samePath = sameSaveDestination(path, tab.path) ||
+                              sameSaveDestination(path, tab.conflictPath);
+        if (tab.diskConflict && (automatic || samePath)) {
+            st.toast(ui::ToastLevel::Warn, "File changed on disk. Choose Reload or Keep mine first.");
+            return finishSave(done, TabSaveResult::Failed);
+        }
+        overwriteChanged = samePath && tab.overwriteDiskConflict;
+        if (overwriteChanged) expectedDiskStamp = tab.diskConflictStamp;
+        break;
+    }
+    auto existing = s_pendingCadSaves.find(docId);
+    if (existing != s_pendingCadSaves.end()) {
+        existing->second.callbacks.push_back(
+            [&st, docId, path, automatic, done = std::move(done)](TabSaveResult) mutable {
+                saveCadDocument(st, docId, path, automatic, std::move(done));
+            });
+        return TabSaveResult::Pending;
+    }
+    std::map<std::string, uint64_t> humanGenerations;
+    for (const auto& tab : st.docTabs) {
+        if (tab.docId == docId)
+            humanGenerations[docId] = tab.humanEditGeneration;
+        else if (tab.kind == AppState::DocTab::TabKind::Drawing &&
+                 tab.sourceDocId == docId && tab.path.empty())
+            humanGenerations[tab.drawingDocId] = tab.humanEditGeneration;
+    }
+    PendingCadSave pending;
+    if (done) pending.callbacks.push_back(std::move(done));
+    s_pendingCadSaves.emplace(docId, std::move(pending));
+    nlohmann::json params = {{"doc_id", docId}, {"path", path}};
+    if (automatic) params["if_no_human_dirty"] = true;
+    if (overwriteChanged) {
+        params["overwrite_changed"] = true;
+        params["expected_disk_stamp"] = expectedDiskStamp;
+    }
+    ++st.rebuildsInFlight;
+    st.rpc.call("doc_save", std::move(params),
+        [&st, docId, path, automatic, humanGenerations = std::move(humanGenerations)](const core::RpcResult& r) {
+            --st.rebuildsInFlight;
+            TabSaveResult outcome = TabSaveResult::Failed;
+            const bool valid = r.ok && r.result.is_object() &&
+                !r.result.contains("code") && r.result.value("ok", true) &&
+                r.result.contains("saved_revision") && r.result["saved_revision"].is_number_integer();
+            if (!valid && automatic && r.result.is_object() &&
+                r.result.value("code", std::string()) == "human_dirty") {
+                st.addLog("[tabs] automatic save skipped for " + docId + ": unsaved human edits");
+                outcome = TabSaveResult::Nothing;
+            } else if (!valid && r.result.is_object() &&
+                       r.result.value("code", std::string()) == "disk_changed") {
+                bool humanConflict = !automatic || st.hasPendingHumanMutations(docId);
+                for (auto& tab : st.docTabs) {
+                    if (tab.docId != docId) continue;
+                    humanConflict = humanConflict || tab.dirty;
+                    if (humanConflict) {
+                        tab.diskConflict = true;
+                        tab.conflictPath.clear();
+                        tab.overwriteDiskConflict = false;
+                        tab.diskConflictStamp = r.result.value("observed_stamp", nlohmann::json());
+                    }
+                    break;
+                }
+                st.addLog("[tabs] save blocked because the file changed on disk: " + path);
+                st.toast(ui::ToastLevel::Warn, humanConflict
+                    ? "File changed on disk. Choose Reload or Keep mine first."
+                    : "Automatic save could not continue because the file changed on disk.");
+            } else if (!valid) {
+                const std::string message = !r.ok ? r.err : r.result.is_object()
+                    ? r.result.value("message", r.result.value("code", std::string("Save returned no saved revision")))
+                    : "Invalid save response";
+                st.addLog("[tabs] save failed for " + docId + " (" + path + "): " + message);
+                st.toast(ui::ToastLevel::Error, "Save failed: " + message);
+            } else {
+                const int revision = r.result["saved_revision"].get<int>();
+                const std::string saved = r.result.value("path", path);
+                for (auto& tab : st.docTabs) {
+                    if (tab.docId != docId) continue;
+                    if (tab.diskConflict && !sameSaveDestination(saved, tab.path) &&
+                        !sameSaveDestination(saved, tab.conflictPath)) {
+                        if (!tab.conflictPath.empty()) tab.aiHandoff = false;
+                        tab.diskConflict = false;
+                        tab.diskConflictStamp = nullptr;
+                        tab.conflictPath.clear();
+                    }
+                    tab.overwriteDiskConflict = false;
+                    tab.path = saved;
+                    const auto generation = humanGenerations.find(docId);
+                    const bool unchanged = generation == humanGenerations.end()
+                        ? !tab.dirty : generation->second == tab.humanEditGeneration;
+                    if (r.result.value("human_dirty", false))
+                        st.applyHumanDirty(docId, true);
+                    else if (unchanged && (!automatic || !tab.dirty))
+                        st.markSaved(docId, revision, saved);
+                    break;
+                }
+                // Only drawings whose actual destination is this embedded archive
+                // are certified, and only at the exact revisions it captured.
+                const auto drawings = r.result.find("drawing_saved_revisions");
+                if (drawings != r.result.end() && drawings->is_object()) {
+                    for (const auto& tab : st.docTabs) {
+                        if (tab.kind != AppState::DocTab::TabKind::Drawing ||
+                            tab.sourceDocId != docId || !tab.path.empty()) continue;
+                        const auto item = drawings->find(tab.drawingDocId);
+                        const auto generation = humanGenerations.find(tab.drawingDocId);
+                        const bool unchanged = generation == humanGenerations.end()
+                            ? !tab.dirty : generation->second == tab.humanEditGeneration;
+                        if (item != drawings->end() && item->is_number_integer() && unchanged &&
+                            (!automatic || !tab.dirty))
+                            st.markSaved(tab.drawingDocId, item->get<int>(), {});
+                    }
+                }
+                ui::featureTreeSetSavedPath(st, docId, saved);
+                st.pushRecentFile(saved);
+                ui::plmAutoRecordSave(st, saved);
+                ui::boxMirrorNotifySave(st, saved);
+                st.addLog(std::string("[tabs] ") + (automatic ? "auto-saved " : "saved ") + saved);
+                const std::string warning = r.result.value("warning", std::string());
+                if (!warning.empty()) st.addLog("[tabs] " + warning);
+                if (!automatic) {
+                    if (!warning.empty()) st.toast(ui::ToastLevel::Warn, warning);
+                    else st.toast(ui::ToastLevel::Info, "Saved " + saved);
+                }
+#ifdef __EMSCRIPTEN__
+                if (!automatic) ui::afterFileWritten(saved);
+#endif
+                outcome = TabSaveResult::Saved;
             }
-            st.addLog("[tabs] save failed for " + t.path + ": " + err);
-            st.toast(ui::ToastLevel::Error, "Save failed: " + err);
-            return TabSaveResult::Failed;
+            auto it = s_pendingCadSaves.find(docId);
+            std::vector<TabSaveDone> callbacks;
+            if (it != s_pendingCadSaves.end()) {
+                callbacks = std::move(it->second.callbacks);
+                s_pendingCadSaves.erase(it);
+            }
+            for (auto& callback : callbacks) callback(outcome);
+        }, core::kLongEngineCallTimeoutMs);
+    return TabSaveResult::Pending;
+}
+
+TabSaveResult saveDocTab(AppState& st, int idx, bool forceDialog, TabSaveDone done) {
+    if (idx < 0 || idx >= (int)st.docTabs.size())
+        return finishSave(done, TabSaveResult::Nothing);
+    using K = AppState::DocTab::TabKind;
+    const K kind = st.docTabs[idx].kind;
+    if (kind == K::Part || kind == K::Assembly) {
+        const std::string docId = st.docTabs[idx].docId;
+        const auto session = st.docTabs[idx].session;
+        if (session && session->sim && !session->sim->flushPendingEdits(st, docId)) {
+            st.toast(ui::ToastLevel::Error, "Save failed: retry the failed simulation setup edit");
+            return finishSave(done, TabSaveResult::Failed);
         }
-        // Never saved (or forced) → Save-As (featureTreeSaveDoc records path + clears active dirty +
-        // doSaveDoc clears this part's drawing siblings).
-        std::string saved = ui::featureTreeSaveDoc(st, /*saveAs=*/forceDialog);
-        if (!saved.empty()) {
-            st.pushRecentFile(saved);
-            ui::plmAutoRecordSave(st, saved);
-            ui::boxMirrorNotifySave(st, saved);
-            return TabSaveResult::Saved;
+        idx = partTabIndexForDoc(st, docId);
+        if (idx < 0) return finishSave(done, TabSaveResult::Nothing);
+        const auto& tab = st.docTabs[idx];
+        if (tab.diskConflict && !forceDialog) {
+            st.toast(ui::ToastLevel::Warn, "File changed on disk. Choose Reload or Keep mine first.");
+            return finishSave(done, TabSaveResult::Failed);
         }
-        return TabSaveResult::Cancelled;
+        std::string path = tab.path;
+        if (forceDialog || path.empty()) {
+            if (std::getenv("CHUDWARE_NO_FILE_DIALOGS")) {
+                st.toast(ui::ToastLevel::Info, "File dialogs disabled");
+                return finishSave(done, TabSaveResult::Cancelled);
+            }
+            const std::string name = tab.displayTitle().empty() ? "Part" : tab.displayTitle();
+            path = ui::saveFileDialog(
+                "Chudware part (*.step+)\0*.step+\0All files (*.*)\0*.*\0",
+                "step+", name.c_str());
+            if (path.empty()) return finishSave(done, TabSaveResult::Cancelled);
+        }
+        return saveCadDocument(st, docId, path, false, std::move(done));
     }
 
-    // ---- Schematic / PCB → ecad_save .ecad+ ----
-    if (t.kind == K::Schematic || t.kind == K::PCB) {
-        if (t.ecadDocId.empty()) return TabSaveResult::Nothing;
-        // A tab opened FROM a KiCad file carries that file as its path. Saving a .ecad+
-        // container over it would destroy the user's source, so never offer it as the
-        // target: send no path and let the engine use the native sibling it chose at
-        // import time (core/ecad/session.cpp, ecad_open).
-        auto is_foreign = [](const std::string& p) {
-            const std::size_t dot = p.find_last_of('.');
-            if (dot == std::string::npos) return false;
-            std::string ext = p.substr(dot);
-            for (char &c : ext) c = (char)std::tolower((unsigned char)c);
-            return ext == ".kicad_sch" || ext == ".kicad_pcb";
-        };
-        std::string path = is_foreign(t.path) ? std::string() : t.path;
-        if (forceDialog || (path.empty() && !is_foreign(t.path))) {
-            std::string suggest = t.displayTitle();
+    AppState::DocTab& t = st.docTabs[idx];
+    if (kind == K::Schematic || kind == K::PCB) {
+        if (t.ecadDocId.empty()) return finishSave(done, TabSaveResult::Nothing);
+        std::string path = t.path;
+        const bool choosePath = forceDialog || path.empty();
+        if (choosePath) {
+            if (std::getenv("CHUDWARE_NO_FILE_DIALOGS"))
+                return finishSave(done, TabSaveResult::Cancelled);
+            const std::string name = std::filesystem::u8path(t.displayTitle()).stem().u8string();
+            const bool sch = kind == K::Schematic;
             path = ui::saveFileDialog(
-                "Chudware ECAD design (*.ecad+)\0*.ecad+\0All files (*.*)\0*.*\0", "ecad+",
-                suggest.empty() ? "design" : suggest.c_str());
-            if (path.empty()) return TabSaveResult::Cancelled;
+                sch ? "KiCad schematic (*.kicad_sch)\0*.kicad_sch\0"
+                    : "KiCad board (*.kicad_pcb)\0*.kicad_pcb\0",
+                sch ? "kicad_sch" : "kicad_pcb", name.empty() ? "design" : name.c_str());
+            if (path.empty()) return finishSave(done, TabSaveResult::Cancelled);
         }
-        nlohmann::json params = {{"doc_id", t.ecadDocId}};
-        if (!path.empty()) params["path"] = path;
-        nlohmann::json res;
+        const std::string id = t.ecadDocId;
+        nlohmann::json params = {{"doc_id", id}}, res;
+        if (choosePath) params["path"] = path;
         std::string err;
-        if (!st.worker.call("ecad_save", params, res, err) ||
-            (res.is_object() && res.contains("code"))) {
-            const std::string msg = err.empty() && res.is_object()
-                                        ? res.value("message", std::string("engine error")) : err;
-            st.addLog("[tabs] ecad_save failed for " + t.ecadDocId + ": " + msg);
-            st.toast(ui::ToastLevel::Error, "Save failed: " + msg);
-            return TabSaveResult::Failed;
+        if (!st.worker.call("ecad_save", params, res, err) || !res.is_object() ||
+            res.contains("code") || !res.contains("saved_revision") ||
+            !res["saved_revision"].is_number_integer()) {
+            const std::string code = res.is_object() ? res.value("code", std::string()) : std::string();
+            const std::string msg = !err.empty() ? err : res.is_object()
+                ? res.value("message", std::string("Save returned no saved revision")) : "Invalid save response";
+            st.addLog("[tabs] ecad_save failed for " + id + ": " + msg);
+            if (code == "kicad_locked")
+                st.toast(ui::ToastLevel::Warn, "KiCad has this file open. Close it there, or use Save As.");
+            else if (code == "external_change")
+                st.toast(ui::ToastLevel::Warn, "The KiCad file changed on disk. Reload it or use Save As.");
+            else if (code == "needs_path")
+                st.toast(ui::ToastLevel::Warn, "Choose a KiCad file with Save As before saving.");
+            else
+                st.toast(ui::ToastLevel::Error, "Save failed: " + msg);
+            return finishSave(done, TabSaveResult::Failed);
         }
-        // The ENGINE decides the final path (it redirects an imported source to a native
-        // sibling); trust its answer over the one we asked for.
-        const std::string saved = res.is_object() ? res.value("path", path) : path;
-        const std::string src = res.is_object() ? res.value("source_path", std::string()) : "";
-        const std::string fmt = res.is_object() ? res.value("format", std::string("ecad+")) : "ecad+";
-        t.path = saved;
-        t.dirty = false;
+        const std::string saved = res.value("path", path);
+        st.markSaved(id, res["saved_revision"].get<int>(), saved);
+        t.title = std::filesystem::u8path(saved).filename().u8string();
+        std::filesystem::path project = std::filesystem::u8path(saved);
+        project.replace_extension(".kicad_pro");
+        if (t.ecadProjectPath != project.u8string()) {
+            t.ecadProjectSchPath.clear();
+            t.ecadProjectPcbPath.clear();
+        }
+        t.ecadProjectPath = project.u8string(); // ecad_save creates the companion project
+        st.syncEcadProjectFiles(t.ecadProjectPath);
+        t.ecadFileChanged = false;
+        t.ecadSessionDirty = false;
+        t.ecadKicadLocked = false;
+        ui::ecadSetFileState(id, saved, t.dirty, false, false);
+#ifndef __EMSCRIPTEN__
+        ecadRecoverySaved(id, res["saved_revision"].get<int>());
+#endif
         st.pushRecentFile(saved);
-        st.addLog("[tabs] ecad saved -> " + saved + " (" + fmt + ")" +
-                  (src.empty() ? std::string() : "; imported source kept: " + src));
-        if (src.empty())
-            st.toast(ui::ToastLevel::Info, "Saved " + t.displayTitle());
-        else
-            st.toast(ui::ToastLevel::Info,
-                     "Saved " + t.displayTitle() + " as " + fmt +
-                         " - the imported file was left untouched");
+        st.addLog("[tabs] ecad saved -> " + saved);
         ui::plmAutoRecordSave(st, saved);
         ui::boxMirrorNotifySave(st, saved);
-        return TabSaveResult::Saved;
+        return finishSave(done, TabSaveResult::Saved);
     }
 
-    // ---- Drawing → standalone .draw+ when opened from one; otherwise save source .step+ ----
-    if (t.kind == K::Drawing) {
-        if (!t.path.empty()) {
-            std::string path = t.path;
-            if (forceDialog) {
-                std::string suggest = t.displayTitle();
-                path = ui::saveFileDialog(
-                    "Chudware drawing (*.draw+)\0*.draw+\0All files (*.*)\0*.*\0",
-                    "draw+", suggest.empty() ? "drawing" : suggest.c_str());
-                if (path.empty()) return TabSaveResult::Cancelled;
-            }
-            nlohmann::json res;
-            std::string err;
-            if (!st.worker.call("drawing_save_standalone",
-                                {{"drawing_id", t.drawingDocId}, {"path", path}},
-                                res, err) ||
-                (res.is_object() && res.contains("code"))) {
-                const std::string msg = err.empty() && res.is_object()
-                                            ? res.value("message", std::string("engine error"))
-                                            : err;
-                st.addLog("[tabs] drawing_save_standalone failed for " +
-                          t.drawingDocId + ": " + msg);
-                st.toast(ui::ToastLevel::Error, "Save failed: " + msg);
-                return TabSaveResult::Failed;
-            }
-            t.path = res.is_object() ? res.value("path", path) : path;
-            t.dirty = false;
-            st.pushRecentFile(t.path);
-            st.addLog("[tabs] drawing saved -> " + t.path);
-            st.toast(ui::ToastLevel::Info, "Saved " + t.displayTitle());
-            ui::plmAutoRecordSave(st, t.path);
-            ui::boxMirrorNotifySave(st, t.path);
-            return TabSaveResult::Saved;
+    if (kind == K::Drawing) {
+        const std::string drawingId = t.drawingDocId;
+        if (st.hasPendingHumanMutations(drawingId)) {
+            st.rpc.call("doc_list", nlohmann::json::object(),
+                [&st, drawingId, forceDialog, done = std::move(done)](const core::RpcResult& r) mutable {
+                    if (!r.ok || (r.result.is_object() && r.result.contains("code"))) {
+                        st.toast(ui::ToastLevel::Error, "Could not wait for the drawing edit before saving");
+                        finishSave(done, TabSaveResult::Failed);
+                        return;
+                    }
+                    const int current = resolveCloseTab(st, {K::Drawing, drawingId});
+                    if (current < 0) {
+                        finishSave(done, TabSaveResult::Nothing);
+                        return;
+                    }
+                    saveDocTab(st, current, forceDialog, std::move(done));
+                });
+            return TabSaveResult::Pending;
         }
-        const int src = partTabIndexForDoc(st, t.sourceDocId);
-        if (src < 0) {
-            if (!t.dirty) return TabSaveResult::Nothing;
-            const std::string reason = "Drawing '" + t.displayTitle() +
-                "' has no open source part; reopen it to save the embedded drawing";
-            st.addLog("[tabs] " + reason);
-            st.toast(ui::ToastLevel::Error, reason);
-            return TabSaveResult::Failed;
+        const int source = partTabIndexForDoc(st, t.sourceDocId);
+        if (t.path.empty() && !forceDialog && source >= 0)
+            return saveDocTab(st, source, false, std::move(done));
+        std::string path = t.path;
+        if (forceDialog || path.empty()) {
+            if (std::getenv("CHUDWARE_NO_FILE_DIALOGS"))
+                return finishSave(done, TabSaveResult::Cancelled);
+            const std::string name = t.displayTitle();
+            path = ui::saveFileDialog(
+                "Chudware drawing (*.draw+)\0*.draw+\0All files (*.*)\0*.*\0",
+                "draw+", name.empty() ? "drawing" : name.c_str());
+            if (path.empty()) return finishSave(done, TabSaveResult::Cancelled);
         }
-        return saveDocTab(st, src, forceDialog);
+        const std::string id = t.drawingDocId;
+        nlohmann::json res;
+        std::string err;
+        if (!st.worker.call("drawing_save_standalone", {{"drawing_id", id}, {"path", path}},
+                            res, err) || !res.is_object() || res.contains("code") ||
+            !res.contains("saved_revision") || !res["saved_revision"].is_number_integer()) {
+            const std::string msg = !err.empty() ? err : res.is_object()
+                ? res.value("message", std::string("Save returned no saved revision")) : "Invalid save response";
+            st.addLog("[tabs] drawing save failed for " + id + ": " + msg);
+            st.toast(ui::ToastLevel::Error, "Save failed: " + msg);
+            return finishSave(done, TabSaveResult::Failed);
+        }
+        const std::string saved = res.value("path", path);
+        st.markSaved(id, res["saved_revision"].get<int>(), saved);
+        st.pushRecentFile(saved);
+        st.addLog("[tabs] drawing saved -> " + saved);
+        ui::plmAutoRecordSave(st, saved);
+        ui::boxMirrorNotifySave(st, saved);
+        return finishSave(done, TabSaveResult::Saved);
     }
-
-    return TabSaveResult::Nothing;
+    return finishSave(done, TabSaveResult::Nothing);
 }
 
 // Draws the document tab strip at the top of the central dock area. In the app shell the strip
@@ -639,9 +860,9 @@ TabSaveResult saveDocTab(AppState& st, int idx, bool forceDialog) {
 // inline fallback draws it at the current cursor of the central document window. `availW` is the
 // content width to span. Returns the strip height (the pill row; overflow never adds height).
 float drawDocTabs(AppState& st, float availW) {
-    // The strip still draws with zero tabs (empty start state / all tabs closed) — just the band and
-    // the "+" New-Document button, so the user can always start a new file. Suppressed only before
-    // the worker is up (mirrors docTabStripHeight).
+    // The strip still draws with zero tabs outside the workspace home — just the band and the "+"
+    // New-Document button, so the user can always start a new file. On the home (Model workspace,
+    // nothing open) the card carries those actions and the bare strip is skipped.
     const auto& pal = ui::palette;
     float s = ui::uiScale;
     float barH = 26.0f * s;
@@ -653,6 +874,14 @@ float drawDocTabs(AppState& st, float availW) {
     s_saveClose = {};
     s_closeConfirmed = {};
     s_newDoc = NewDocKind::None;
+    // A close requested while an edit was in flight is re-evaluated after it
+    // settles, so a newly accepted edit still receives the save prompt.
+    for (size_t i = 0; i < s_deferredCloses.size();) {
+        const auto request = s_deferredCloses[i];
+        if (st.hasPendingHumanMutations(request.identity.id)) { ++i; continue; }
+        s_deferredCloses.erase(s_deferredCloses.begin() + i);
+        requestTabClose(st, request.identity, request.askIfDirty);
+    }
 
     // ---- pinned floating overlay window (visual-overhaul fix 2) ------------------------------------
     // The strip used to draw INLINE at the top of the central document window and reserve its own
@@ -677,11 +906,24 @@ float drawDocTabs(AppState& st, float availW) {
     const int nTabs = (int)st.docTabs.size();
     std::vector<float> tabWs((size_t)nTabs, 0.0f);
     std::vector<float> tabOff((size_t)nTabs, 0.0f);   // start x within the (unscrolled) content
+    // Workspace home (workspace_home.h): the untouched launch starter is not a document of the
+    // user's, so its tab takes no room (width 0, skipped below) until it is edited or left.
+    const bool home = workspaceHomeActive(st);
+    const bool homeHidesActive = home && st.activeTab >= 0 && st.activeTab < nTabs;
     float fullContentW = 0.0f;
     for (int i = 0; i < nTabs; ++i) {
         tabOff[i] = fullContentW;
+        if (homeHidesActive && i == st.activeTab) continue;
         tabWs[i] = measureTabW(st.docTabs[i], s);
         fullContentW += tabWs[i] + (i + 1 < nTabs ? gap : 0.0f);
+    }
+    // Home with no other tab: the home card already offers New Part / New Assembly / Open, so a
+    // lone "+" floating over the empty studio is noise; Ctrl+N still reaches the chooser. No close
+    // prompt or deferred tab action can be pending: a dirty or on-disk tab is never the hidden
+    // starter, so it would have kept the strip.
+    if (home && fullContentW <= 0.0f) {
+        if (s_openChooser) { st.wantNewDocChooser = true; s_openChooser = false; }
+        return barH;
     }
     const float contentW = fullContentW + btnSlot;
 
@@ -882,6 +1124,7 @@ float drawDocTabs(AppState& st, float availW) {
         rightTitles.clear();
         bool anyShown = false;
         for (int i = 0; i < nTabs; ++i) {
+            if (tabWs[i] <= 0.0f) continue;   // hidden starter (workspace home)
             const float x = tabsL + tabOff[i] - viewScroll;
             const float xr = x + tabWs[i];
             if (xr <= tabsL + 0.5f) {
@@ -937,6 +1180,7 @@ float drawDocTabs(AppState& st, float availW) {
     ImGui::PushClipRect(ImVec2(tabsL, y0), ImVec2(tabsR, y0 + barH), true);
     bool cutLeft = false, cutRight = false, drewAny = false;
     for (int i = 0; i < nTabs; ++i) {
+        if (tabWs[i] <= 0.0f) continue;   // hidden starter (workspace home)
         const float x = tabsL + tabOff[i] - s_scrollX;
         const float xr = x + tabWs[i];
         if (xr <= tabsL + 0.5f) continue;
@@ -1026,6 +1270,36 @@ float drawDocTabs(AppState& st, float availW) {
     // prompt + deferred mutations below run at the caller's (central window) scope.
     if (floatingWindow) ImGui::End();
 
+    if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
+        st.docTabs[st.activeTab].diskConflict) {
+        const std::string docId = st.docTabs[st.activeTab].docId;
+        ImGui::SetNextWindowPos(ImVec2(outerL, bandB + 6.0f * s), ImGuiCond_Always);
+        ImGui::SetNextWindowBgAlpha(0.95f);
+        if (ImGui::Begin("##doc_disk_conflict", nullptr,
+                         ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav)) {
+            ImGui::TextUnformatted("File changed on disk");
+            ImGui::SameLine();
+            const bool pending = st.hasPendingHumanMutations(docId);
+            if (pending) ImGui::BeginDisabled();
+            if (ImGui::Button("Reload (discard my edits)"))
+                core::reloadDiskConflict(st, docId);
+            if (pending) ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ImGui::Button("Keep mine")) {
+                const int idx = resolveCloseTab(st, {AppState::DocTab::TabKind::Part, docId});
+                const int asmIdx = resolveCloseTab(st, {AppState::DocTab::TabKind::Assembly, docId});
+                const int current = idx >= 0 ? idx : asmIdx;
+                if (current >= 0) {
+                    st.docTabs[current].diskConflict = false;
+                    st.docTabs[current].overwriteDiskConflict = true;
+                    st.docTabs[current].conflictPath.clear();
+                }
+            }
+        }
+        ImGui::End();
+    }
+
     // ---- unsaved-changes confirmation prompt ----
     const int confirmIdx = resolveCloseTab(st, s_confirmClose);
     if (!s_confirmClose.id.empty() && confirmIdx < 0) s_confirmClose = {};
@@ -1076,15 +1350,17 @@ float drawDocTabs(AppState& st, float availW) {
         const int idx = resolveCloseTab(st, chosen);
         s_saveClose = {};
         if (idx >= 0) {
-            TabSaveResult r = saveDocTab(st, idx, /*forceDialog=*/false);
-            const int currentIdx = resolveCloseTab(st, chosen);
-            if (currentIdx >= 0 && r != TabSaveResult::Cancelled && r != TabSaveResult::Failed)
-                st.closeDocTab(currentIdx);
+            saveDocTab(st, idx, /*forceDialog=*/false, [&st, chosen](TabSaveResult result) {
+                if (result != TabSaveResult::Saved) return;
+                requestTabClose(st, chosen, true);
+            });
         }
     } else if (!s_closeConfirmed.id.empty()) {
         const int idx = resolveCloseTab(st, s_closeConfirmed);
         s_closeConfirmed = {};
-        if (idx >= 0) st.closeDocTab(idx);
+        if (idx >= 0 && !st.hasPendingHumanMutations(closeTabId(st.docTabs[idx])) &&
+            !hasUnsavedEmbeddedDrawing(st, st.docTabs[idx]))
+            st.closeDocTab(idx);
     } else if (s_closeOthersIdx >= 0) {
         // Keep the clicked tab, close the rest. Make it active first so the close-index bookkeeping
         // keeps it selected; skip dirty tabs so unsaved work is never silently discarded. Iterate
@@ -1094,15 +1370,15 @@ float drawDocTabs(AppState& st, float availW) {
         if (keep < (int)st.docTabs.size()) st.switchToTab(keep);
         for (int i = (int)st.docTabs.size() - 1; i >= 0; --i) {
             if (i == keep) continue;
-            if (st.docTabs[i].dirty) continue;
-            st.closeDocTab(i);
+            requestTabClose(st, closeTabIdentity(st.docTabs[i]), false);
         }
     } else if (s_closeAll) {
         s_closeAll = false;
         for (int i = (int)st.docTabs.size() - 1; i >= 0; --i)
-            if (!st.docTabs[i].dirty) st.closeDocTab(i);
+            requestTabClose(st, closeTabIdentity(st.docTabs[i]), false);
     } else if (s_closeIdx >= 0) {
-        st.closeDocTab(s_closeIdx);
+        if (s_closeIdx < (int)st.docTabs.size())
+            requestTabClose(st, closeTabIdentity(st.docTabs[s_closeIdx]), true);
         s_closeIdx = -1;
     } else if (s_switchTo >= 0) {
         st.switchToTab(s_switchTo);
@@ -1117,11 +1393,7 @@ float drawDocTabs(AppState& st, float availW) {
     return barH;
 }
 
-// Wave 2: New-Document chooser action — create the worker doc + open a matching tab. Part/Assembly
-// go through DocMirror (with the dirty-suppress discipline) + addDocTab; Drawing reuses makeDrawing;
-// Schematic/PCB call ecad_new directly and addEcadTab, feeding the editor mirror via the public ECAD
-// API. `kind` is a NewDocKind ordinal (0=Part,1=Assembly,2=Drawing,3=Schematic,4=PCB). Kept as a free
-// function (not a static) so app.cpp's Ctrl+N hook can request it via openNewDocChooser() instead.
+// Create a document directly, or request the KiCad project name prompt.
 void createNewDoc(AppState& st, int kindOrd) {
 #ifndef __EMSCRIPTEN__
     // A deliberate New action supersedes the launch starter, even if this
@@ -1132,12 +1404,8 @@ void createNewDoc(AppState& st, int kindOrd) {
     if (kind == NewDocKind::Part || kind == NewDocKind::Assembly) {
         const bool asm_ = (kind == NewDocKind::Assembly);
         std::string err;
-        // new{Part,Assembly} fires the mirror listener (a doc change, not an edit); suppress the
-        // dirty marker so the new tab starts clean.
-        st.suppressTabDirty = true;
         bool ok = asm_ ? st.docMirror.newAssembly(st.worker, err)
                        : st.docMirror.newPart(st.worker, err);
-        st.suppressTabDirty = false;
         if (ok) {
             st.addLog(std::string("[tabs] new ") + (asm_ ? "assembly" : "part") +
                       "  rev=" + std::to_string(st.docMirror.revision()));
@@ -1155,30 +1423,10 @@ void createNewDoc(AppState& st, int kindOrd) {
         st.makeDrawing();   // guards on an active part/asm tab itself + toasts if none
         return;
     }
-    if (kind == NewDocKind::Schematic || kind == NewDocKind::PCB) {
-        const char* ek = (kind == NewDocKind::PCB) ? "pcb" : "sch";
-        nlohmann::json res;
-        std::string err;
-        if (!st.worker.call("ecad_new", {{"kind", ek}}, res, err) ||
-            (res.is_object() && res.contains("code"))) {
-            const std::string msg = err.empty() && res.is_object()
-                                        ? res.value("message", std::string("engine error")) : err;
-            st.addLog(std::string("[err] new ecad ") + ek + ": " + msg);
-            st.toast(ui::ToastLevel::Error, std::string("New ") +
-                     (kind == NewDocKind::PCB ? "PCB" : "schematic") + " failed: " + msg);
-            return;
-        }
-        const std::string id = res.value("doc_id", std::string());
-        const int rev = (res.contains("revision") && res["revision"].is_number_integer())
-                            ? res["revision"].get<int>() : 0;
-        // Open the tab FIRST so it becomes active — the ECAD editor's state() resolver then targets
-        // this tab's per-document EcadEditorState before we load the worker response into the mirror.
-        st.addEcadTab(ek, id, rev, /*title=*/std::string());
-        if (!id.empty()) ui::ecadEditorMirror().setDocId(id);
-        ui::ecadEditorLoadResponse(res);   // {revision,kind,tree,compile} -> active tab's mirror
-        st.toast(ui::ToastLevel::Info,
-                 std::string("New ECAD ") + (kind == NewDocKind::PCB ? "board" : "schematic"));
-        return;
+    if (kind == NewDocKind::KicadProject) {
+        st.activeWorkspace = AppState::Workspace::Electronics;
+        st.ecadPanelDocId.clear();
+        st.ecadPanelCmd = "ecad_new_project";
     }
 }
 

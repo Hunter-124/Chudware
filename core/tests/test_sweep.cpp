@@ -8,20 +8,33 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <vector>
 
 #include <BRepAdaptor_Curve.hxx>
+#include <BRepAdaptor_Surface.hxx>
 #include <BRepCheck_Analyzer.hxx>
+#include <BRepClass3d_SolidClassifier.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepGProp.hxx>
+#include <BRepMesh_IncrementalMesh.hxx>
+#include <BRepPrimAPI_MakeCylinder.hxx>
+#include <BRep_Builder.hxx>
+#include <BRep_Tool.hxx>
+#include <GeomAPI_Interpolate.hxx>
+#include <GeomAbs_SurfaceType.hxx>
 #include <GProp_GProps.hxx>
 #include <GProp_PrincipalProps.hxx>
+#include <Poly_Triangulation.hxx>
+#include <TColgp_HArray1OfPnt.hxx>
 #include <TopExp_Explorer.hxx>
+#include <TopLoc_Location.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Edge.hxx>
+#include <TopoDS_Compound.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
 #include <TopoDS_Wire.hxx>
@@ -29,10 +42,12 @@
 #include <gp_Circ.hxx>
 #include <gp_Dir.hxx>
 #include <gp_Pnt.hxx>
+#include <gp_Pnt2d.hxx>
 #include <gp_Vec.hxx>
 
 #include "geom/curves.h"
 #include "geom/features.h"
+#include "geom/tessellate.h"
 
 namespace {
 
@@ -206,13 +221,8 @@ TEST_CASE("make_helix rejects degenerate parameters") {
     CHECK(geom::make_helix(2.0, 10.0, 5.0, 90.0, 0.0, false).IsNull());
 }
 
-// ---------------------------------------------------------------------------
-// DEV HARNESS (temporary): drive geom::cut_thread directly on an EXAGGERATED
-// coarse thread (steep ~45° helix) so profile/alignment/boolean errors that a
-// shallow M8 hides become obvious. Run with CHUDWARE_THREAD_DEBUG=1 for a stage
-// trace. Also asserts the two invariants this guards: the swept groove exists
-// and the cut removes material to a VALID solid.
-// ---------------------------------------------------------------------------
+// Exercise full-length real cuts and raised threads, including coarse profiles.
+// A failed real construction must not be accepted as an unthreaded success.
 #include "geom/thread.h"
 #include <BRepAdaptor_CompCurve.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
@@ -220,39 +230,46 @@ TEST_CASE("make_helix rejects degenerate parameters") {
 #include <Bnd_Box.hxx>
 #include <gp_Ax2.hxx>
 
-TEST_CASE("HARNESS: coarse thread cut on a steep helix") {
+TEST_CASE("thread: full-length cut and raised coarse threads change a valid body") {
     const double R = 10.0, H = 40.0;
     gp_Ax2 ax(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1));
     TopoDS_Shape cyl = BRepPrimAPI_MakeCylinder(ax, R, H).Shape();
     const double plain = solid_volume(cyl);
     MESSAGE("plain cylinder vol = " << plain);
 
-    // Realistic + coarse pitches on a Ø20 rod (major=20). Real threads run pitch ~
-    // major/8..major/16 (M20 coarse = 2.5); 4.0 is a coarse ACME-ish case.
+    // M20 coarse and deliberately coarser variants, over the entire 40 mm.
     for (bool raised : {false, true}) {
         for (double pitch : {1.5, 2.5, 4.0}) {
+            CAPTURE(raised);
+            CAPTURE(pitch);
             geom::ThreadResult tr = geom::cut_thread(
                 cyl, gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1), R, pitch,
                 /*major*/ 2 * R, /*length*/ H, /*starts*/ 1, /*lh*/ false,
-                /*internal*/ false, raised, /*turns_cap*/ 0.0);
+                /*internal*/ false, raised, /*turns_cap*/ 32.0);
             const double v = solid_volume(tr.shape);
             MESSAGE((raised ? "RAISED" : "CUT  ") << " pitch=" << pitch
                     << " fell_back=" << tr.fell_back << " vol=" << v
                     << " (plain=" << plain << ") warn='" << tr.warning << "'");
-            // Realistic fastener pitches (1.5, 2.5) MUST cut/raise a real solid. The
-            // exaggerated 4.0 (a steep ACME-ish coarse case) is allowed to fall back
-            // gracefully: at that lead angle the groove crosses the flat end rim as a
-            // knife-edge that the un-trimmed cut boolean can choke on — the phase-2
-            // overextend-then-trim-to-end-face pass is what makes that case robust.
-            const bool exaggerated = pitch > 3.0;
+            REQUIRE_MESSAGE(tr.ok, tr.warning);
+            CHECK_FALSE(tr.fell_back);
+            REQUIRE_FALSE(tr.shape.IsNull());
             CHECK(BRepCheck_Analyzer(tr.shape).IsValid());
-            if (tr.fell_back) {
-                CHECK(exaggerated);      // only the exaggerated case may fall back
-                CHECK(v == doctest::Approx(plain));  // fall-back returns the body untouched
-            } else if (raised) {
-                CHECK(v > plain + 1.0);
-            } else {
-                CHECK(v < plain - 1.0);
+            if (raised) CHECK(v > plain + 1.0);
+            else CHECK(v < plain - 1.0);
+            CHECK(solid_volume(cyl) == doctest::Approx(plain).epsilon(1e-10));
+            // A changed total volume alone does not prove that the thread
+            // reached both ends; probe the helical centre near each end.
+            for (double z : {0.2, H - 0.2}) {
+                CAPTURE(z);
+                const double angle = 2.0 * kPi * z / pitch;
+                const double r = R + (raised ? 0.2 : -0.2) * pitch;
+                const gp_Pnt point(r * std::cos(angle), r * std::sin(angle), z);
+                bool inside = false;
+                for (TopExp_Explorer ex(tr.shape, TopAbs_SOLID); ex.More(); ex.Next()) {
+                    BRepClass3d_SolidClassifier classifier(ex.Current(), point, 1e-7);
+                    if (classifier.State() == TopAbs_IN) inside = true;
+                }
+                CHECK(inside == raised);
             }
         }
     }
@@ -263,7 +280,7 @@ TEST_CASE("HARNESS: coarse thread cut on a steep helix") {
 // overruns the material (a caller over-spec, or a thread that would run past a shoulder /
 // bolt head) can never leave threads floating in air — it trims flush to the solid, and
 // the top/bottom thread ends are flat-cut at the run boundary rather than tapering off.
-TEST_CASE("HARNESS: over-long thread run is clamped to the body (no floating threads)") {
+TEST_CASE("thread: over-long run is clamped to the body without floating geometry") {
     const double R = 6.0, H = 20.0;
     gp_Ax2 ax(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1));
     TopoDS_Shape cyl = BRepPrimAPI_MakeCylinder(ax, R, H).Shape();
@@ -278,6 +295,7 @@ TEST_CASE("HARNESS: over-long thread run is clamped to the body (no floating thr
         /*raised*/ false, /*turns_cap*/ 0.0);
     MESSAGE("clamped thread fell_back=" << tr.fell_back
             << " vol=" << solid_volume(tr.shape) << " (plain=" << plain << ")");
+    REQUIRE_MESSAGE(tr.ok, tr.warning);
     CHECK_FALSE(tr.fell_back);
     CHECK(BRepCheck_Analyzer(tr.shape).IsValid());
     CHECK(solid_volume(tr.shape) < plain - 1.0);          // material was removed
@@ -308,11 +326,96 @@ TEST_CASE("HARNESS: helix is concentric with the cylinder axis") {
     CHECK(maxz - minz == doctest::Approx(height).epsilon(0.01));
 }
 
+// A C2 interpolated harness route produces a degree-11 spline side face with
+// hundreds of poles. OCCT's default minimum size makes its angular refinement
+// explode even though the B-rep itself is small.
+TEST_CASE("spline pipe display mesh stays bounded and retains chord accuracy") {
+    const gp_Pnt route[] = {
+        {456.3, 36.1, 23.5}, {457.785, 36.1, 23.5}, {458.856, 36.071, 23.243},
+        {459.639, 35.986, 22.473}, {461.039, 35.736, 20.224},
+        {461.61, 35.634, 18.944}, {461.8, 35.6, 17.552},
+        {461.8, 35.6, 4.122}, {461.721, 35.51, 3.027},
+        {461.484, 35.239, 1.986}, {460.619, 34.251, -0.795},
+        {459.95, 33.55, -1.95}, {459.4, 33.0, -2.5},
+    };
+    constexpr int count = sizeof(route) / sizeof(route[0]);
+    Handle(TColgp_HArray1OfPnt) points = new TColgp_HArray1OfPnt(1, count);
+    for (int i = 0; i < count; ++i) points->SetValue(i + 1, route[i]);
+    GeomAPI_Interpolate interp(points, Standard_False, 1e-7);
+    interp.Perform();
+    REQUIRE(interp.IsDone());
+    TopoDS_Wire spine = BRepBuilderAPI_MakeWire(BRepBuilderAPI_MakeEdge(interp.Curve()));
+    const gp_Ax2 profile_axis(route[0], gp_Dir(1, 0, 0), gp_Dir(0, 1, 0));
+    TopoDS_Wire circle = BRepBuilderAPI_MakeWire(
+        BRepBuilderAPI_MakeEdge(gp_Circ(profile_axis, 1.9)));
+    TopoDS_Face profile = BRepBuilderAPI_MakeFace(circle);
+    TopoDS_Shape solid = geom::sweep_profile(profile, spine);
+    REQUIRE_FALSE(solid.IsNull());
+    const auto deflections = geom::display_deflections(geom::DisplayQuality::Fine, solid);
+    geom::mesh_body(solid, deflections.lin, deflections.ang);
+
+    TopoDS_Face side;
+    for (TopExp_Explorer ex(solid, TopAbs_FACE); ex.More(); ex.Next()) {
+        TopoDS_Face face = TopoDS::Face(ex.Current());
+        if (BRepAdaptor_Surface(face).GetType() == GeomAbs_BSplineSurface) {
+            side = face;
+            break;
+        }
+    }
+    REQUIRE_FALSE(side.IsNull());
+    TopLoc_Location location;
+    Handle(Poly_Triangulation) mesh = BRep_Tool::Triangulation(side, location);
+    REQUIRE_FALSE(mesh.IsNull());
+    REQUIRE(mesh->HasUVNodes());
+    CHECK(mesh->NbTriangles() > 100);
+    CHECK(mesh->NbTriangles() < 250000);
+
+    // Sample the real surface at each selected triangle's centroid and compare
+    // with its plane, independently of parameter-speed distortion.
+    const BRepAdaptor_Surface surface(side);
+    const int stride = std::max(1, mesh->NbTriangles() / 3000);
+    for (int i = 1; i <= mesh->NbTriangles(); i += stride) {
+        int a, b, c;
+        mesh->Triangle(i).Get(a, b, c);
+        const gp_Pnt p0 = mesh->Node(a).Transformed(location.Transformation());
+        const gp_Pnt p1 = mesh->Node(b).Transformed(location.Transformation());
+        const gp_Pnt p2 = mesh->Node(c).Transformed(location.Transformation());
+        const gp_Pnt2d uv0 = mesh->UVNode(a), uv1 = mesh->UVNode(b), uv2 = mesh->UVNode(c);
+        const gp_Pnt actual = surface.Value((uv0.X() + uv1.X() + uv2.X()) / 3.0,
+                                            (uv0.Y() + uv1.Y() + uv2.Y()) / 3.0);
+        const gp_Vec normal = gp_Vec(p0, p1).Crossed(gp_Vec(p0, p2));
+        if (normal.Magnitude() > 1e-12)
+            CHECK(std::abs(gp_Vec(p0, actual).Dot(normal)) / normal.Magnitude() <=
+                  deflections.lin + 1e-6);
+    }
+
+    // A small analytic detail sharing a spline-bearing shape must retain the
+    // old angular tessellation, even when the requested chord is very coarse.
+    TopoDS_Shape reference = BRepPrimAPI_MakeCylinder(1.0, 10.0).Shape();
+    BRepMesh_IncrementalMesh baseline(reference, 1.0, Standard_False, 0.1, Standard_True);
+    TopoDS_Shape detail = BRepPrimAPI_MakeCylinder(1.0, 10.0).Shape();
+    TopoDS_Compound mixed;
+    BRep_Builder builder;
+    builder.MakeCompound(mixed);
+    builder.Add(mixed, side);
+    builder.Add(mixed, detail);
+    geom::mesh_body(mixed, 1.0, 0.1);
+    auto triangles = [](const TopoDS_Shape& shape) {
+        int total = 0;
+        for (TopExp_Explorer ex(shape, TopAbs_FACE); ex.More(); ex.Next()) {
+            TopLoc_Location loc;
+            const auto tri = BRep_Tool::Triangulation(TopoDS::Face(ex.Current()), loc);
+            if (!tri.IsNull()) total += tri->NbTriangles();
+        }
+        return total;
+    };
+    CHECK(triangles(detail) == triangles(reference));
+}
+
 // EXPORT HARNESS: write threaded parts to STEP + STL for a human to open and spin.
 // Path via $THREAD_EXPORT_DIR (default scratch/threads). Set THREAD_EXPORT=1 to run.
 #include <STEPControl_Writer.hxx>
 #include <StlAPI_Writer.hxx>
-#include <BRepMesh_IncrementalMesh.hxx>
 #include <cstdlib>
 #include <string>
 
@@ -338,6 +441,9 @@ TEST_CASE("EXPORT threaded parts (STEP+STL)") {
             cyl, gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1), R, c.pitch, 2 * R, H, 1,
             false, false, c.raised, 0.0, c.form);
         MESSAGE(c.name << " fell_back=" << tr.fell_back << " vol=" << solid_volume(tr.shape));
+        REQUIRE_MESSAGE(tr.ok, c.name << ": " << tr.warning);
+        REQUIRE_FALSE(tr.shape.IsNull());
+        REQUIRE(BRepCheck_Analyzer(tr.shape).IsValid());
         const std::string base = dir + "/" + c.name;
         { STEPControl_Writer w; w.Transfer(tr.shape, STEPControl_AsIs);
           w.Write((base + ".step").c_str()); }

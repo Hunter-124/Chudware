@@ -4,6 +4,7 @@
 #include "ui/viewport/glsl_compat.h"
 
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -20,42 +21,91 @@ const char* kVertU = R"(#version 330 core
 layout(location=0) in vec3 aPos;
 layout(location=1) in uint aId;
 uniform mat4 uMVP;
+uniform float uPointSize;
 out vec3 vWorld;
 flat out uint vId;
-void main(){ vWorld = aPos; vId = aId; gl_Position = uMVP * vec4(aPos, 1.0); })";
+void main(){ vWorld = aPos; vId = aId; gl_Position = uMVP * vec4(aPos, 1.0);
+             gl_PointSize = uPointSize; })";
 
-const char* kFragU = R"(#version 330 core
+std::string fragmentSource(bool rgba8) {
+    std::string src = R"(#version 330 core
 flat in uint vId;
 uniform int uClipCount;
 uniform vec3 uClipN[3];
 uniform float uClipOff[3];
+uniform int uGuardThin;
+uniform uvec3 uPassThrough;
+uniform sampler2D uGuardDepth;
 in vec3 vWorld;
-out uint frag;
-void main(){
+layout(location=1) out vec4 depthColor;
+vec4 packUint(uint bits) {
+    return vec4(float(bits & 255u), float((bits >> 8u) & 255u),
+                float((bits >> 16u) & 255u), float((bits >> 24u) & 255u)) / 255.0;
+}
+uint unpackUint(vec4 value) {
+    uvec4 b = uvec4(round(value * 255.0));
+    return b.r | (b.g << 8u) | (b.b << 16u) | (b.a << 24u);
+}
+)";
+    src += rgba8 ? R"(
+uniform sampler2D uGuardId;
+layout(location=0) out vec4 frag;
+uint guardId(ivec2 p) { return unpackUint(texelFetch(uGuardId, p, 0)); }
+)" : R"(
+#ifdef GL_ES
+precision highp usampler2D;
+#endif
+uniform usampler2D uGuardId;
+layout(location=0) out uint frag;
+uint guardId(ivec2 p) { return texelFetch(uGuardId, p, 0).r; }
+)";
+    src += R"(
+float guardDepth(ivec2 p) {
+    return uintBitsToFloat(unpackUint(texelFetch(uGuardDepth, p, 0)));
+}
+bool passThrough(uint body) {
+    return body != 0u &&
+        (body == uPassThrough.x || body == uPassThrough.y || body == uPassThrough.z);
+}
+bool visibleThin() {
+    gl_FragDepth = gl_FragCoord.z;
+    if (uGuardThin == 0) return true;
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    uint face = guardId(p);
+    uint body = face >> 20u;
+    if (face == 0u || (uGuardThin == 1 && passThrough(body)) ||
+        (uGuardThin == 2 && !passThrough(body))) return true;
+    float front = guardDepth(p);
+    float tolerance = 4.0 / 16777215.0;
+    bool sameBody = body == (vId >> 20u);
+    if (sameBody) {
+        // A one-pixel line can land up to a pixel from its mathematical center. Permit only
+        // the face's local depth slope for this body's own coincident edges and vertices.
+        ivec2 size = textureSize(uGuardDepth, 0);
+        float slope = 0.0;
+        for (int axis = 0; axis < 2; ++axis) {
+            for (int direction = -1; direction <= 1; direction += 2) {
+                ivec2 q = p + (axis == 0 ? ivec2(direction, 0) : ivec2(0, direction));
+                if (q.x >= 0 && q.y >= 0 && q.x < size.x && q.y < size.y &&
+                    guardId(q) == face)
+                    slope = max(slope, abs(guardDepth(q) - front));
+            }
+        }
+        tolerance += slope;
+    }
+    if (gl_FragCoord.z > front + tolerance) return false;
+    if (sameBody) gl_FragDepth = min(gl_FragCoord.z, front);
+    return true;
+}
+void main() {
     for (int i = 0; i < uClipCount; ++i)
         if (dot(vWorld, uClipN[i]) > uClipOff[i]) discard;
-    frag = vId;
-})";
-
-// RGBA8 fallback: same vertex shader, pack the full 32-bit id into RGBA bytes (little-endian-ish:
-// r = low byte ... a = high byte). Readback reassembles all body/kind/topology bits.
-const char* kFragRGBA = R"(#version 330 core
-flat in uint vId;
-uniform int uClipCount;
-uniform vec3 uClipN[3];
-uniform float uClipOff[3];
-in vec3 vWorld;
-out vec4 frag;
-void main(){
-    for (int i = 0; i < uClipCount; ++i)
-        if (dot(vWorld, uClipN[i]) > uClipOff[i]) discard;
-    uint id = vId;
-    float r = float(id & 0xFFu) / 255.0;
-    float g = float((id >> 8u) & 0xFFu) / 255.0;
-    float b = float((id >> 16u) & 0xFFu) / 255.0;
-    float a = float((id >> 24u) & 0xFFu) / 255.0;
-    frag = vec4(r, g, b, a);
-})";
+    if (!visibleThin()) discard;
+)";
+    src += rgba8 ? "    frag = packUint(vId);\n" : "    frag = vId;\n";
+    src += "    depthColor = packUint(floatBitsToUint(gl_FragCoord.z));\n}\n";
+    return src;
+}
 
 unsigned int compile(unsigned int type, const char* src) {
     unsigned int s = glCreateShader(type);
@@ -90,11 +140,37 @@ unsigned int linkProgram(const char* vs, const char* fs) {
 
 }  // namespace
 
+IdPass::IdPass() {
+    const char* mode = std::getenv("CHUDWARE_IDBUF");
+#ifdef __EMSCRIPTEN__
+    rgba8_ = true;
+    (void)mode;
+#else
+    rgba8_ = mode && std::strcmp(mode, "rgba8") == 0;
+#endif
+    const std::string fs = fragmentSource(rgba8_);
+    prog_ = linkProgram(kVertU, fs.c_str());
+    mvpLoc_ = glGetUniformLocation(prog_, "uMVP");
+    pointSizeLoc_ = glGetUniformLocation(prog_, "uPointSize");
+    clipCountLoc_ = glGetUniformLocation(prog_, "uClipCount");
+    clipNormalsLoc_ = glGetUniformLocation(prog_, "uClipN");
+    clipOffsetsLoc_ = glGetUniformLocation(prog_, "uClipOff");
+    guardThinLoc_ = glGetUniformLocation(prog_, "uGuardThin");
+    guardIdLoc_ = glGetUniformLocation(prog_, "uGuardId");
+    guardDepthLoc_ = glGetUniformLocation(prog_, "uGuardDepth");
+    passThroughLoc_ = glGetUniformLocation(prog_, "uPassThrough");
+}
+
 IdPass::~IdPass() {
     destroy();
-    if (fbo_) glDeleteFramebuffers(1, &fbo_);
-    if (idTex_) glDeleteTextures(1, &idTex_);
-    if (depthRbo_) glDeleteRenderbuffers(1, &depthRbo_);
+    for (auto& target : targets_) {
+        if (target.fbo) glDeleteFramebuffers(1, &target.fbo);
+        if (target.texture) glDeleteTextures(1, &target.texture);
+        if (target.depthColor) glDeleteTextures(1, &target.depthColor);
+        if (target.depth) glDeleteRenderbuffers(1, &target.depth);
+    }
+    for (auto& read : hoverReads_)
+        if (read.pbo) glDeleteBuffers(1, &read.pbo);
     if (prog_) glDeleteProgram(prog_);
 }
 
@@ -116,14 +192,26 @@ void IdPass::setSectionClip(int count, const float normals[3][3], const float of
         clipNormals_[i][2] = normals[i][2];
         clipOffsets_[i] = offsets[i];
     }
-    haveCachedFrame_ = false;
+    invalidateFrames();
+}
+
+void IdPass::clearHoverReads() {
+    for (auto& read : hoverReads_) {
+        if (read.fence) glDeleteSync(static_cast<GLsync>(read.fence));
+        read.fence = nullptr;
+    }
+    hoverMemo_.valid = false;
+}
+
+void IdPass::invalidateFrames() {
+    for (auto& target : targets_) target.valid = false;
     pickMemo_.valid = false;
+    clearHoverReads();
 }
 
 void IdPass::destroy() {
     built_ = false;
-    haveCachedFrame_ = false;
-    pickMemo_.valid = false;
+    invalidateFrames();
     auto freeDraws = [](std::vector<BodyDraw>& v) {
         for (auto& d : v) {
             if (d.vao) glDeleteVertexArrays(1, &d.vao);
@@ -138,28 +226,36 @@ void IdPass::destroy() {
     freeDraws(vertDraws_);
 }
 
-void IdPass::allocTargets(int w, int h) {
-    if (w == w_ && h == h_ && fbo_) return;
-    w_ = w; h_ = h;
-    if (!fbo_) glGenFramebuffers(1, &fbo_);
-    if (!idTex_) glGenTextures(1, &idTex_);
-    if (!depthRbo_) glGenRenderbuffers(1, &depthRbo_);
+void IdPass::allocTarget(Target& target, int w, int h) {
+    if (w == target.w && h == target.h && target.fbo) return;
+    target.w = w; target.h = h;
+    if (!target.fbo) glGenFramebuffers(1, &target.fbo);
+    if (!target.texture) glGenTextures(1, &target.texture);
+    if (!target.depthColor) glGenTextures(1, &target.depthColor);
+    if (!target.depth) glGenRenderbuffers(1, &target.depth);
 
-    glBindTexture(GL_TEXTURE_2D, idTex_);
+    glBindTexture(GL_TEXTURE_2D, target.texture);
     if (rgba8_)
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w_, h_, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     else
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, w_, h_, 0, GL_RED_INTEGER, GL_UNSIGNED_INT,
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, w, h, 0, GL_RED_INTEGER, GL_UNSIGNED_INT,
                      nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
-    glBindRenderbuffer(GL_RENDERBUFFER, depthRbo_);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w_, h_);
+    glBindTexture(GL_TEXTURE_2D, target.depthColor);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, idTex_, 0);
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depthRbo_);
+    glBindRenderbuffer(GL_RENDERBUFFER, target.depth);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h);
+    glBindFramebuffer(GL_FRAMEBUFFER, target.fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target.texture, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, target.depthColor, 0);
+    const GLenum buffers[] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
+    glDrawBuffers(2, buffers);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, target.depth);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
@@ -167,7 +263,7 @@ bool IdPass::setDoc(const DocMesh& doc, std::string& err) {
     destroy();  // drop old per-body buffers (keep prog_ + targets)
     built_ = false;
     ++docGen_;
-    haveCachedFrame_ = false;
+    invalidateFrames();
     // The RGBA8 WebGL2 path has the same 32-bit budget as R32UI. Reject oversized IDs
     // before encoding so picking never silently aliases a different body or topology item.
     if (const char* reason = pickIdOverflow(doc)) {
@@ -178,23 +274,6 @@ bool IdPass::setDoc(const DocMesh& doc, std::string& err) {
             logged = true;
         }
         return false;
-    }
-    // Decide encoding once (env-gated fallback) and build the matching program.
-    const char* mode = std::getenv("CHUDWARE_IDBUF");
-#ifdef __EMSCRIPTEN__
-    // WebGL2 has no reliable R32UI integer color attachment — force the RGBA8 path.
-    rgba8_ = true;
-    (void)mode;
-#else
-    rgba8_ = (mode && std::strcmp(mode, "rgba8") == 0);
-#endif
-
-    if (!prog_) {
-        prog_ = linkProgram(kVertU, rgba8_ ? kFragRGBA : kFragU);
-        mvpLoc_ = glGetUniformLocation(prog_, "uMVP");
-        clipCountLoc_ = glGetUniformLocation(prog_, "uClipCount");
-        clipNormalsLoc_ = glGetUniformLocation(prog_, "uClipN");
-        clipOffsetsLoc_ = glGetUniformLocation(prog_, "uClipOff");
     }
     int linked = 0;
     glGetProgramiv(prog_, GL_LINK_STATUS, &linked);
@@ -233,14 +312,18 @@ bool IdPass::setDoc(const DocMesh& doc, std::string& err) {
         // vertex tagged with its owning face's encoded id — face node blocks are disjoint per
         // face in the tessellation) + the body's full index buffer, drawn in a single call. ----
         if (!b.pos.empty() && !b.idx.empty()) {
-            std::vector<uint32_t> faceIds(b.pos.size() / 3, 0u);
-            for (const auto& fr : b.faces) {
-                if (fr.tri_count == 0) continue;
-                uint32_t fid = encodeId(b.body_id, PickKind::Face, fr.face_id);
-                const uint32_t* base = b.idx.data() + (size_t)fr.first_tri * 3;
-                size_t n = (size_t)fr.tri_count * 3;
-                for (size_t k = 0; k < n; ++k) faceIds[base[k]] = fid;
+            std::vector<uint32_t> fallbackFaceIds;
+            if (!doc.derivedReady) {
+                fallbackFaceIds.assign(b.pos.size() / 3, 0u);
+                for (const auto& fr : b.faces) {
+                    if (fr.tri_count == 0) continue;
+                    const uint32_t fid = encodeId(b.body_id, PickKind::Face, fr.face_id);
+                    const uint32_t* base = b.idx.data() + (size_t)fr.first_tri * 3;
+                    for (size_t k = 0; k < (size_t)fr.tri_count * 3; ++k)
+                        fallbackFaceIds[base[k]] = fid;
+                }
             }
+            const auto& faceIds = doc.derivedReady ? b.faceIds : fallbackFaceIds;
             BodyDraw fd = buildVao(b.pos, faceIds, b.idx.data(), b.idx.size(), b.body_id);
             fd.count = (int)b.idx.size();
             faceDraws_.push_back(fd);
@@ -251,20 +334,24 @@ bool IdPass::setDoc(const DocMesh& doc, std::string& err) {
         {
             std::vector<float> lines;
             std::vector<uint32_t> ids;
-            for (const auto& es : b.edges) {
-                if (es.pt_count < 2) continue;
-                uint32_t eid = encodeId(b.body_id, PickKind::Edge, es.edge_id);
-                for (uint32_t i = 0; i + 1 < es.pt_count; ++i) {
-                    const float* a = &b.edge_pts[(size_t)(es.first_pt + i) * 3];
-                    const float* c = &b.edge_pts[(size_t)(es.first_pt + i + 1) * 3];
-                    lines.insert(lines.end(), {a[0], a[1], a[2], c[0], c[1], c[2]});
-                    ids.push_back(eid);
-                    ids.push_back(eid);
+            if (!doc.derivedReady) {
+                for (const auto& es : b.edges) {
+                    if (es.pt_count < 2) continue;
+                    const uint32_t eid = encodeId(b.body_id, PickKind::Edge, es.edge_id);
+                    for (uint32_t i = 0; i + 1 < es.pt_count; ++i) {
+                        const float* a = &b.edge_pts[(size_t)(es.first_pt + i) * 3];
+                        const float* c = &b.edge_pts[(size_t)(es.first_pt + i + 1) * 3];
+                        lines.insert(lines.end(), {a[0], a[1], a[2], c[0], c[1], c[2]});
+                        ids.push_back(eid);
+                        ids.push_back(eid);
+                    }
                 }
             }
-            if (!lines.empty()) {
-                BodyDraw ed = buildVao(lines, ids, nullptr, 0, b.body_id);
-                ed.count = (int)lines.size() / 3;
+            const auto& edgeLines = doc.derivedReady ? b.edgeLines : lines;
+            const auto& edgeIds = doc.derivedReady ? b.edgeIds : ids;
+            if (!edgeLines.empty()) {
+                BodyDraw ed = buildVao(edgeLines, edgeIds, nullptr, 0, b.body_id);
+                ed.count = (int)edgeLines.size() / 3;
                 edgeDraws_.push_back(ed);
             }
         }
@@ -273,13 +360,17 @@ bool IdPass::setDoc(const DocMesh& doc, std::string& err) {
         {
             std::vector<float> pts;
             std::vector<uint32_t> ids;
-            for (const auto& v : b.brep_verts) {
-                pts.insert(pts.end(), {v.xyz[0], v.xyz[1], v.xyz[2]});
-                ids.push_back(encodeId(b.body_id, PickKind::Vertex, v.vertex_id));
+            if (!doc.derivedReady) {
+                for (const auto& v : b.brep_verts) {
+                    pts.insert(pts.end(), {v.xyz[0], v.xyz[1], v.xyz[2]});
+                    ids.push_back(encodeId(b.body_id, PickKind::Vertex, v.vertex_id));
+                }
             }
-            if (!pts.empty()) {
-                BodyDraw vd = buildVao(pts, ids, nullptr, 0, b.body_id);
-                vd.count = (int)pts.size() / 3;
+            const auto& points = doc.derivedReady ? b.vertexPoints : pts;
+            const auto& pointIds = doc.derivedReady ? b.vertexIds : ids;
+            if (!points.empty()) {
+                BodyDraw vd = buildVao(points, pointIds, nullptr, 0, b.body_id);
+                vd.count = (int)points.size() / 3;
                 vertDraws_.push_back(vd);
             }
         }
@@ -290,8 +381,12 @@ bool IdPass::setDoc(const DocMesh& doc, std::string& err) {
 }
 
 bool IdPass::render(const Renderer::CameraXform& cam, bool facesOnly) {
-    if (!built_ || cam.ssWidth <= 0 || cam.ssHeight <= 0) {
-        haveCachedFrame_ = false;
+    activeTarget_ = facesOnly ? 1 : 0;
+    auto& target = targets_[activeTarget_];
+    const int finalW = cam.vpWidth > 0 ? cam.vpWidth : cam.ssWidth;
+    const int finalH = cam.vpHeight > 0 ? cam.vpHeight : cam.ssHeight;
+    if (!built_ || finalW <= 0 || finalH <= 0) {
+        target.valid = false;
         pickMemo_.valid = false;
         return false;
     }
@@ -302,8 +397,8 @@ bool IdPass::render(const Renderer::CameraXform& cam, bool facesOnly) {
     // camera, framebuffer size, topology upload, visibility, or active clip changes force a redraw.
     IdPassFrameKey key;
     std::memcpy(key.mvp, cam.mvp.m, sizeof(key.mvp));
-    key.w = cam.ssWidth;
-    key.h = cam.ssHeight;
+    key.w = finalW;
+    key.h = finalH;
     key.clipCount = clipCount_;
     for (int i = 0; i < clipCount_; ++i) {
         key.clipN[i * 3 + 0] = clipNormals_[i][0];
@@ -313,199 +408,331 @@ bool IdPass::render(const Renderer::CameraXform& cam, bool facesOnly) {
     }
     key.hiddenHash = idPassHiddenHash(hidden_);
     key.docGen = docGen_;
+    key.passThrough = passThrough_;
     key.facesOnly = facesOnly;
-    if (haveCachedFrame_ && key == lastKey_) return true;
-    haveCachedFrame_ = false;
+    if (target.valid && key == target.key) return true;
+    target.valid = false;
     pickMemo_.valid = false;
+    if (!facesOnly) clearHoverReads();
 
-    allocTargets(cam.ssWidth, cam.ssHeight);
+    // The unbiased face-only image guards thin primitives against the real frontmost surface.
+    // Its cache is independent, so face-only clients and full picks can share it.
+    if (!facesOnly) {
+        const bool faceReady = render(cam, true);
+        activeTarget_ = 0;
+        if (!faceReady) return false;
+    }
 
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
+    allocTarget(target, finalW, finalH);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, target.fbo);
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         return false;
     }
-    glViewport(0, 0, w_, h_);
+    glViewport(0, 0, finalW, finalH);
 
-    // Clear color (id = 0 == background) + depth. R32UI needs the integer clear path.
-    if (rgba8_) {
-        glClearColor(0, 0, 0, 0);
-        glClear(GL_COLOR_BUFFER_BIT);
-    } else {
-        GLuint zero[4] = {0, 0, 0, 0};
-        glClearBufferuiv(GL_COLOR, 0, zero);
-    }
-    glClear(GL_DEPTH_BUFFER_BIT);
+    // The ID pass cannot inherit depth/scissor/color state from a translucent overlay.
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_STENCIL_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_TRUE);
+    glDepthRange(0.0, 1.0);
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
     glDisable(GL_BLEND);
+    const bool dither = glIsEnabled(GL_DITHER) == GL_TRUE;
+    glDisable(GL_DITHER);
+    const GLfloat clearColor[4] = {0, 0, 0, 0};
+    const GLuint clearId[4] = {0, 0, 0, 0};
+    const GLfloat clearDepth = 1.0f;
+    if (rgba8_) glClearBufferfv(GL_COLOR, 0, clearColor);
+    else glClearBufferuiv(GL_COLOR, 0, clearId);
+    glClearBufferfv(GL_COLOR, 1, clearColor);
+    glClearBufferfv(GL_DEPTH, 0, &clearDepth);
 
     glUseProgram(prog_);
     glUniformMatrix4fv(mvpLoc_, 1, GL_FALSE, cam.mvp.m);
+    glUniform1f(pointSizeLoc_, 1.0f);
+    glUniform1i(guardThinLoc_, 0);
+    glUniform1i(guardIdLoc_, 0);
+    glUniform1i(guardDepthLoc_, 1);
+    glUniform3ui(passThroughLoc_, passThrough_[0], passThrough_[1], passThrough_[2]);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, facesOnly ? 0 : targets_[1].texture);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, facesOnly ? 0 : targets_[1].depthColor);
     glUniform1i(clipCountLoc_, clipCount_);
     if (clipCount_ > 0) {
         glUniform3fv(clipNormalsLoc_, clipCount_, clipNormals_[0]);
         glUniform1fv(clipOffsetsLoc_, clipCount_, clipOffsets_);
     }
 
-    // Faces first, pushed back so edges/verts win the depth test on coincident geometry. Each body
-    // is one draw call — the per-vertex id attribute carries the face id, hidden bodies are skipped.
-    glEnable(GL_POLYGON_OFFSET_FILL);
-    glPolygonOffset(1.0f, 1.0f);
-    for (const auto& f : faceDraws_) {
-        if (bodyHiddenId(f.body_id)) continue;  // hidden body: unpickable
-        glBindVertexArray(f.vao);
-        glDrawElements(GL_TRIANGLES, f.count, GL_UNSIGNED_INT, 0);
-    }
-    glDisable(GL_POLYGON_OFFSET_FILL);
+    // Rasterize thin targets at their actual position; the CPU search supplies the full grab
+    // radius. A wide primitive can otherwise stick out past an occluder's silhouette.
+    const auto isPassThrough = [&](uint32_t id) {
+        return id != 0 && std::find(passThrough_.begin(), passThrough_.end(), id) != passThrough_.end();
+    };
+    auto drawLayer = [&](bool transparent) {
+        // Faces are unbiased. Thin primitives are guarded against this same face image below.
+        glUniform1i(guardThinLoc_, 0);
+        glDisable(GL_POLYGON_OFFSET_FILL);
+        for (const auto& f : faceDraws_) {
+            if (bodyHiddenId(f.body_id) || isPassThrough(f.body_id) != transparent) continue;
+            glBindVertexArray(f.vao);
+            glDrawElements(GL_TRIANGLES, f.count, GL_UNSIGNED_INT, 0);
+        }
+        if (facesOnly) return;
 
-    if (!facesOnly) {
-    // Edges over faces: a fat line so they're pickable, and a small negative depth-range bias so
-    // an edge on a face surface reads as the edge. One draw call per body.
-    glDepthRange(0.0, 0.999);
-    glLineWidth(3.0f);
-    for (const auto& e : edgeDraws_) {
-        if (bodyHiddenId(e.body_id)) continue;  // hidden body: unpickable
-        glBindVertexArray(e.vao);
-        glDrawArrays(GL_LINES, 0, e.count);
-    }
-
-    // Verts win over everything: largest depth bias, fat points. One draw call per body — each
-    // point carries its own id via the attribute, so no per-point uniform churn.
-    glDepthRange(0.0, 0.998);
+        glUniform1i(guardThinLoc_, transparent ? 2 : 1);
+        glLineWidth(1.0f);
+        for (const auto& e : edgeDraws_) {
+            if (bodyHiddenId(e.body_id) || isPassThrough(e.body_id) != transparent) continue;
+            glBindVertexArray(e.vao);
+            glDrawArrays(GL_LINES, 0, e.count);
+        }
 #ifndef CHUDWARE_GLES3
-    glEnable(GL_PROGRAM_POINT_SIZE);
+        glEnable(GL_PROGRAM_POINT_SIZE);
 #ifdef GL_POINT_SPRITE
-    glEnable(GL_POINT_SPRITE);
+        glEnable(GL_POINT_SPRITE);
 #endif
-    glPointSize(6.0f);
 #endif
-    for (const auto& v : vertDraws_) {
-        if (bodyHiddenId(v.body_id)) continue;  // hidden body: unpickable
-        glBindVertexArray(v.vao);
-        glDrawArrays(GL_POINTS, 0, v.count);
+        for (const auto& v : vertDraws_) {
+            if (bodyHiddenId(v.body_id) || isPassThrough(v.body_id) != transparent) continue;
+            glBindVertexArray(v.vao);
+            glDrawArrays(GL_POINTS, 0, v.count);
+        }
+    };
+    if (passThrough_[0] || passThrough_[1] || passThrough_[2]) {
+        drawLayer(true);
+        // Preserve the transparent IDs only where no opaque geometry is drawn.
+        glClearBufferfv(GL_DEPTH, 0, &clearDepth);
     }
-    }
-
-    glDepthRange(0.0, 1.0);
+    drawLayer(false);
+    if (dither) glEnable(GL_DITHER);
+    glActiveTexture(GL_TEXTURE0);
     glBindVertexArray(0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
     // The id buffer now reflects `key`; reuse it until one of these inputs changes.
-    ++renderGen_;
-    lastKey_ = key;
-    haveCachedFrame_ = true;
+    target.generation = ++renderGen_;
+    target.key = key;
+    target.valid = true;
     return true;
 }
 
-PickHit IdPass::pickFinal(int px, int py, int finalW, int finalH) {
-    PickHit empty;
-    if (!built_ || !haveCachedFrame_ || finalW <= 0 || finalH <= 0) return empty;
-    if (px < 0 || py < 0 || px >= finalW || py >= finalH) return empty;
-    if (pickMemo_.matches(renderGen_, px, py, finalW, finalH, 0)) return pickMemo_.hit;
-
-    // Map final (top-left) pixel -> supersampled (bottom-left) pixel. Sample the SS-block center.
-    float sx = (px + 0.5f) * (float)w_ / (float)finalW;
-    float sy = (py + 0.5f) * (float)h_ / (float)finalH;
-    int gx = (int)sx;
-    int gy = h_ - 1 - (int)sy;  // flip Y to GL origin
-    if (gx < 0) gx = 0; if (gx >= w_) gx = w_ - 1;
-    if (gy < 0) gy = 0; if (gy >= h_) gy = h_ - 1;
-
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    uint32_t id = 0;
-    if (rgba8_) {
-        unsigned char rgba[4] = {0, 0, 0, 0};
-        glReadPixels(gx, gy, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
-        id = (uint32_t)rgba[0] | ((uint32_t)rgba[1] << 8) | ((uint32_t)rgba[2] << 16) |
-             ((uint32_t)rgba[3] << 24);
-    } else {
-        glReadPixels(gx, gy, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT, &id);
-    }
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    PickHit hit = decodeId(id);
-    pickMemo_ = {renderGen_, px, py, finalW, finalH, 0, hit, true};
-    return hit;
+IdPass::PickBlock IdPass::pickBlock(int px, int py, int finalW, int finalH, int radiusPx,
+                                    bool vertices) const {
+    const auto& target = targets_[activeTarget_];
+    PickBlock block;
+    block.cx = std::clamp((int)((px + 0.5f) * target.w / finalW), 0, target.w - 1);
+    block.cy = std::clamp(target.h - 1 - (int)((py + 0.5f) * target.h / finalH), 0, target.h - 1);
+    block.radius = std::max(0, (int)std::ceil((float)radiusPx * target.w / finalW));
+    block.x = std::max(0, block.cx - block.radius);
+    block.y = std::max(0, block.cy - block.radius);
+    block.w = std::min(target.w - 1, block.cx + block.radius) - block.x + 1;
+    block.h = std::min(target.h - 1, block.cy + block.radius) - block.y + 1;
+    block.vertices = vertices;
+    return block;
 }
 
-PickHit IdPass::pickFinalPreferEdge(int px, int py, int finalW, int finalH, int radiusPx) {
-    if (radiusPx <= 0) return pickFinal(px, py, finalW, finalH);
-    PickHit empty;
-    if (!built_ || !haveCachedFrame_ || finalW <= 0 || finalH <= 0) return empty;
-    if (px < 0 || py < 0 || px >= finalW || py >= finalH) return empty;
-    if (pickMemo_.matches(renderGen_, px, py, finalW, finalH, radiusPx)) return pickMemo_.hit;
-    auto remember = [&](PickHit hit) {
-        pickMemo_ = {renderGen_, px, py, finalW, finalH, radiusPx, hit, true};
-        return hit;
+PickHit IdPass::decodeBlock(const PickBlock& block, const void* pixels) const {
+    auto idAt = [&](size_t i) {
+        if (!rgba8_) return static_cast<const uint32_t*>(pixels)[i];
+        const auto* p = static_cast<const unsigned char*>(pixels) + i * 4;
+        return uint32_t(p[0]) | (uint32_t(p[1]) << 8) |
+               (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
     };
-
-    // Map the cursor + search radius into supersampled (GL bottom-left) space and read one block.
-    float sx = (px + 0.5f) * (float)w_ / (float)finalW;
-    float sy = (py + 0.5f) * (float)h_ / (float)finalH;
-    int cx = (int)sx;
-    int cy = h_ - 1 - (int)sy;  // GL origin
-    int rss = (int)std::ceil((float)radiusPx * (float)w_ / (float)finalW);
-    if (rss < 1) rss = 1;
-    int x0 = cx - rss, y0 = cy - rss;
-    int x1 = cx + rss, y1 = cy + rss;
-    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
-    if (x1 >= w_) x1 = w_ - 1; if (y1 >= h_) y1 = h_ - 1;
-    int bw = x1 - x0 + 1, bh = y1 - y0 + 1;
-    if (bw <= 0 || bh <= 0) return pickFinal(px, py, finalW, finalH);
-
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    const size_t pixelCount = (size_t)bw * bh;
-    if (readbackIds_.size() < pixelCount) readbackIds_.resize(pixelCount);
-    if (rgba8_) {
-        if (readbackRgba_.size() < pixelCount * 4) readbackRgba_.resize(pixelCount * 4);
-        glReadPixels(x0, y0, bw, bh, GL_RGBA, GL_UNSIGNED_BYTE, readbackRgba_.data());
-        for (size_t i = 0; i < pixelCount; ++i)
-            readbackIds_[i] = (uint32_t)readbackRgba_[i * 4] |
-                              ((uint32_t)readbackRgba_[i * 4 + 1] << 8) |
-                              ((uint32_t)readbackRgba_[i * 4 + 2] << 16) |
-                              ((uint32_t)readbackRgba_[i * 4 + 3] << 24);
-    } else {
-        glReadPixels(x0, y0, bw, bh, GL_RED_INTEGER, GL_UNSIGNED_INT, readbackIds_.data());
+    const size_t centerIndex = (size_t)(block.cy - block.y) * block.w + block.cx - block.x;
+    const uint32_t centerId = idAt(centerIndex);
+    const PickHit center = decodeId(centerId);
+    if (center.kind == PickKind::Edge || block.radius == 0 ||
+        (center.kind == PickKind::Vertex && block.vertices))
+        return center;
+    // Depth is encoded in a second RGBA8 attachment, including on WebGL where depth-buffer
+    // readback is unavailable. Do not snap across the silhouette to a rear component.
+    auto depthAt = [&](size_t i) {
+        const auto* p = static_cast<const unsigned char*>(pixels) +
+                        ((size_t)block.w * block.h + i) * 4;
+        const uint32_t bits = uint32_t(p[0]) | (uint32_t(p[1]) << 8) |
+                              (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
+        float depth;
+        std::memcpy(&depth, &bits, sizeof(depth));
+        return depth;
+    };
+    const bool opaqueCenter = center.valid() &&
+        std::find(passThrough_.begin(), passThrough_.end(), center.body_id) == passThrough_.end();
+    const float centerDepth = opaqueCenter ? depthAt(centerIndex) : 1.0f;
+    float slopeX = 0.0f, slopeY = 0.0f;
+    if (opaqueCenter && center.kind == PickKind::Face) {
+        const int x = block.cx - block.x, y = block.cy - block.y;
+        auto slope = [&](int nx, int ny) {
+            if (nx < 0 || nx >= block.w || ny < 0 || ny >= block.h) return 0.0f;
+            const size_t n = (size_t)ny * block.w + nx;
+            return idAt(n) == centerId ? std::fabs(depthAt(n) - centerDepth) : 0.0f;
+        };
+        slopeX = std::max(slope(x - 1, y), slope(x + 1, y));
+        slopeY = std::max(slope(x, y - 1), slope(x, y + 1));
     }
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-    // Use the very same pixel as pickFinal, including its boundary clamps. Do not let a nearby
-    // vertex replace an exact center edge: that early precedence is part of the picking contract.
-    int gx = cx, gy = cy;
-    if (gx < 0) gx = 0; if (gx >= w_) gx = w_ - 1;
-    if (gy < 0) gy = 0; if (gy >= h_) gy = h_ - 1;
-    PickHit center = decodeId(readbackIds_[(size_t)(gy - y0) * bw + (gx - x0)]);
-    if (center.kind == PickKind::Edge || center.kind == PickKind::Vertex)
-        return remember(center);
-
-    // Two-tier nearest search within the (circular) radius, skipping hidden bodies. Vertices are a
-    // smaller target than edges, which are a smaller target than faces, so precedence is strictly
-    // by KIND first, distance second: ANY vertex in range beats EVERY edge, and any edge/vertex beats
-    // the center face. Within a tier we take the pixel nearest the cursor. (A center pixel that was
-    // already Edge/Vertex returned above, unchanged — Convert Entities relies on that.)
-    long bestVD2 = (long)rss * rss + 1;
-    long bestED2 = (long)rss * rss + 1;
+    long bestVD2 = (long)block.radius * block.radius + 1;
+    long bestED2 = bestVD2;
     PickHit bestV, bestE;
-    for (int j = 0; j < bh; ++j) {
-        for (int i = 0; i < bw; ++i) {
-            uint32_t v = readbackIds_[(size_t)j * bw + i];
-            if (v == 0 || bodyHidden(v)) continue;
-            PickKind k = PickKind((v >> 18) & 0x3u);
-            if (k != PickKind::Edge && k != PickKind::Vertex) continue;
-            long dx = (long)(x0 + i) - cx, dy = (long)(y0 + j) - cy;
-            long d2 = dx * dx + dy * dy;
-            if (k == PickKind::Vertex) {
-                if (d2 < bestVD2) { bestVD2 = d2; bestV = decodeId(v); }
-            } else {  // Edge
-                if (d2 < bestED2) { bestED2 = d2; bestE = decodeId(v); }
+    for (int j = 0; j < block.h; ++j) {
+        for (int i = 0; i < block.w; ++i) {
+            const uint32_t id = idAt((size_t)j * block.w + i);
+            if (!id || bodyHidden(id)) continue;
+            const PickKind kind = PickKind((id >> 18) & 3u);
+            const long dx = block.x + i - block.cx, dy = block.y + j - block.cy;
+            const long d2 = dx * dx + dy * dy;
+            if (opaqueCenter && (id >> 20) != center.body_id) {
+                const float tolerance = 4.0f / 16777215.0f +
+                    slopeX * (float)std::abs(dx) + slopeY * (float)std::abs(dy);
+                if (depthAt((size_t)j * block.w + i) > centerDepth + tolerance) continue;
+            }
+            if (kind == PickKind::Vertex && block.vertices && d2 < bestVD2) {
+                bestVD2 = d2; bestV = decodeId(id);
+            } else if (kind == PickKind::Edge && d2 < bestED2) {
+                bestED2 = d2; bestE = decodeId(id);
             }
         }
     }
-    if (bestV.valid()) return remember(bestV);  // vertex tier wins outright
-    if (bestE.valid()) return remember(bestE);  // else nearest edge
-    return remember(center);                  // else the exact-pixel face (or background)
+    return bestV.valid() ? bestV : bestE.valid() ? bestE : center;
+}
+
+PickHit IdPass::pickFinal(int px, int py, int finalW, int finalH) {
+    return pickFinalPreferEdge(px, py, finalW, finalH, 0);
+}
+
+PickHit IdPass::pickFinalPreferEdge(int px, int py, int finalW, int finalH, int radiusPx,
+                                    bool vertices) {
+    const auto& target = targets_[activeTarget_];
+    if (!built_ || !target.valid || finalW <= 0 || finalH <= 0 ||
+        px < 0 || py < 0 || px >= finalW || py >= finalH) return {};
+    radiusPx = std::max(0, radiusPx);
+    if (pickMemo_.matches(target.generation, px, py, finalW, finalH, radiusPx, vertices))
+        return pickMemo_.hit;
+    const PickBlock block = pickBlock(px, py, finalW, finalH, radiusPx, vertices);
+    // Tool radii are small; keep reusable scratch bounded by the actual target dimensions.
+    const size_t count = (size_t)block.w * block.h;
+    readbackPixels_.resize(count * (block.radius > 0 ? 2 : 1));
+    glBindFramebuffer(GL_FRAMEBUFFER, target.fbo);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glReadPixels(block.x, block.y, block.w, block.h,
+                 rgba8_ ? GL_RGBA : GL_RED_INTEGER,
+                 rgba8_ ? GL_UNSIGNED_BYTE : GL_UNSIGNED_INT, readbackPixels_.data());
+    if (block.radius > 0) {
+        glReadBuffer(GL_COLOR_ATTACHMENT1);
+        glReadPixels(block.x, block.y, block.w, block.h, GL_RGBA, GL_UNSIGNED_BYTE,
+                     readbackPixels_.data() + count);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    const PickHit hit = decodeBlock(block, readbackPixels_.data());
+    pickMemo_ = {target.generation, px, py, finalW, finalH, radiusPx, vertices, hit, true};
+    return hit;
+}
+
+bool IdPass::hoverPickPending() const {
+    for (const auto& read : hoverReads_)
+        if (read.fence) return true;
+    return false;
+}
+
+PickHit IdPass::pickFinalPreferEdgeAsync(int px, int py, int finalW, int finalH, int radiusPx,
+                                         bool vertices) {
+#ifdef __EMSCRIPTEN__
+    // WebGL2 has no mapped PBO reads; retain synchronous browser picking.
+    return pickFinalPreferEdge(px, py, finalW, finalH, radiusPx, vertices);
+#else
+    const auto& target = targets_[activeTarget_];
+    if (!built_ || !target.valid || finalW <= 0 || finalH <= 0 ||
+        px < 0 || py < 0 || px >= finalW || py >= finalH) return {};
+    radiusPx = std::max(0, radiusPx);
+    const PickBlock wanted = pickBlock(px, py, finalW, finalH, radiusPx, vertices);
+    auto covers = [&](const HoverRead& read) {
+        return read.request.valid && read.request.generation == target.generation &&
+               read.request.finalW == finalW && read.request.finalH == finalH &&
+               read.request.radius == radiusPx && read.request.vertices == vertices &&
+               read.block.x <= wanted.x && read.block.y <= wanted.y &&
+               read.block.x + read.block.w >= wanted.x + wanted.w &&
+               read.block.y + read.block.h >= wanted.y + wanted.h;
+    };
+    HoverRead* newest = nullptr;
+    for (auto& read : hoverReads_) {
+        if (!read.fence) continue;
+        const GLenum state = glClientWaitSync(static_cast<GLsync>(read.fence), 0, 0);
+        if (state == GL_TIMEOUT_EXPIRED) continue;
+        glDeleteSync(static_cast<GLsync>(read.fence));
+        read.fence = nullptr;
+        if ((state == GL_ALREADY_SIGNALED || state == GL_CONDITION_SATISFIED) &&
+            covers(read) && read.serial > completedHoverSerial_ &&
+            (!newest || read.serial > newest->serial))
+            newest = &read;
+    }
+    bool prefetch = false;
+    if (newest) {
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, newest->pbo);
+        const void* pixels = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0,
+            (size_t)newest->block.w * newest->block.h * sizeof(uint32_t) * 2, GL_MAP_READ_BIT);
+        if (pixels) {
+            PickBlock current = newest->block;
+            current.cx = wanted.cx;
+            current.cy = wanted.cy;
+            current.radius = wanted.radius;
+            const PickHit hit = decodeBlock(current, pixels);
+            const bool valid = glUnmapBuffer(GL_PIXEL_PACK_BUFFER) == GL_TRUE;
+            if (valid) {
+                prefetch = newest->request.px != px || newest->request.py != py;
+                hoverMemo_ = {target.generation, px, py, finalW, finalH, radiusPx, vertices, hit, true};
+                completedHoverSerial_ = newest->serial;
+            }
+        }
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    }
+    const bool haveHit = hoverMemo_.matches(target.generation, px, py, finalW, finalH,
+                                            radiusPx, vertices);
+    if (haveHit && !prefetch) return hoverMemo_.hit;
+    HoverRead* freeSlot = nullptr;
+    bool alreadyPending = false;
+    for (auto& read : hoverReads_) {
+        if (!read.fence) { if (!freeSlot) freeSlot = &read; }
+        else if (covers(read)) alreadyPending = true;
+    }
+    // Never recycle a busy buffer: glBufferData on an in-flight slot may stall its driver.
+    if (!alreadyPending && freeSlot) {
+        auto& read = *freeSlot;
+        // Margin permits a completed read to be re-centered on a moving cursor without ever
+        // publishing the old cursor's potentially occluded hit.
+        read.block = pickBlock(px, py, finalW, finalH, radiusPx + 8, vertices);
+        read.request = {target.generation, px, py, finalW, finalH, radiusPx, vertices, {}, true};
+        read.serial = ++hoverSerial_;
+        if (!read.pbo) glGenBuffers(1, &read.pbo);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, read.pbo);
+        const size_t planeBytes = (size_t)read.block.w * read.block.h * sizeof(uint32_t);
+        const size_t bytes = planeBytes * 2;
+        if (read.capacity < bytes) {
+            glBufferData(GL_PIXEL_PACK_BUFFER, bytes, nullptr, GL_STREAM_READ);
+            read.capacity = bytes;
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, target.fbo);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glReadPixels(read.block.x, read.block.y, read.block.w, read.block.h,
+                     rgba8_ ? GL_RGBA : GL_RED_INTEGER,
+                     rgba8_ ? GL_UNSIGNED_BYTE : GL_UNSIGNED_INT, nullptr);
+        glReadBuffer(GL_COLOR_ATTACHMENT1);
+        glReadPixels(read.block.x, read.block.y, read.block.w, read.block.h, GL_RGBA,
+                     GL_UNSIGNED_BYTE, reinterpret_cast<void*>(planeBytes));
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        read.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+    return haveHit ? hoverMemo_.hit : PickHit{};
+#endif
 }
 
 }  // namespace render

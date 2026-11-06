@@ -1,29 +1,14 @@
 # Chat Context References — copilot "context cube" picker
 
-Status: design and implementation record (2026-07-16).
-
-This is the July design/implementation record, not current toolbar layout or visual
-acceptance. Current payload ownership is `host/src/core/context_ref.{h,cpp}` and
+Current payload ownership is `host/src/core/context_ref.{h,cpp}` and
 `host/src/ui/copilot/composer.cpp::submitTurn`; online engine-resolved context comes
-from `services/agent/worker_rpc.py::_editor_context_block` / `_picked_context_block`.
+from `services/agent/worker_rpc.py::_picked_context_text` / `_picked_context_block`.
 The explicit offline route uses `services/agent/agent_turn.py::apply_context_refs`.
-Do not restore the removed `loop.py` helper from older references. The component split and
-verification bullets below record the original implementation plan and intended smoke, not a
-claim that today's picker has been visually verified.
 
 Goal: let the user attach live model entities (parts/components, faces, edges, sketches,
 features) from the 3D viewport or the feature tree into the chat prompt as first-class
 context references, so the AI targets and reasons about exactly those entities when editing
 or explaining. A powerful, intuitive "point at what you mean" affordance.
-
-## Composer toolbar (bottom row of the copilot input)
-Row order, filling the full width, evenly aligned (uiScale-aware): 
-`[ model picker ] [ thinking effort ] ......... [ paperclip ] [ context-cube ] [ new ]`
-- Paperclip icon: REMADE (cleaner glyph) — file attachments (unchanged behavior).
-- Context-cube button (NEW): the Chudware logo cube drawn with BLACK outline lines on a
-  TRANSPARENT background. Toggles context-pick mode.
-- Buttons distribute so there is no dead gap: left group (model, thinking) left-aligned;
-  right group (paperclip, cube, new) right-aligned; spacer between.
 
 ## Interaction model (intuitive)
 1. Click the cube -> arms `AppState::contextPickActive = true`. A viewport banner/HUD hint
@@ -57,18 +42,3 @@ submitTurn serializes pendingContextRefs into the turn RPC payload under `contex
 The agent turn includes a "Context references" block so the model can resolve/measure/target
 them (feed to describe_part/query_geometry/measure_* by id). Chips clear on send.
 
-## Implementation split
-- Icons: remade paperclip glyph + new logo-cube icon (black lines, transparent bg), drawn
-  per the icon conventions and registered in `contracts/icons.md`.
-- Composer: `host/src/ui/copilot/composer.cpp` — cube button, chips row, arm/disarm, chip x,
-  submit `context_refs`, toolbar fill/align. Consumes the icon ids + app_state fields.
-- Pick capture: host/src/ui/viewport_panel.cpp + host/src/ui/feature_tree.cpp — when
-  contextPickActive, route viewport picks / tree-row clicks into pendingContextRefs; RMB
-  "Add to AI context". Uses the app_state fields.
-- Agent payload: services/agent/ — accept + surface context_refs in the agent turn.
-
-## Verification
-- Cube button renders (both themes, toolbar + no dead gap); paperclip remade.
-- Arm cube -> pick a face in viewport + a sketch in tree -> two chips appear; x removes one;
-  Esc disarms.
-- Send with chips -> payload carries context_refs; agent can reference them; chips clear.

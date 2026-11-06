@@ -6,26 +6,69 @@ from typing import Optional
 import os
 import tempfile
 import zipfile
+from services.agent.request_context import root_value
 
 from .cad_common import (
     CoreError,
     _CUR,
-    _LAST_DELIVER_REV,
-    _LAST_VOLUME,
     _autosave,
     _default_deliverable_path,
     _doc,
     _doc_revision,
     _dumps,
     _err,
+    _note_session_saved,
+    _part_has_mesh_references,
     _publish_current,
     _sanitize_output_path,
     placement_warnings,
+    resolve_agent_path,
     cb,
 )
 
 def register_cad_exchange_tools(mcp: FastMCP) -> None:
     """CAD import/export + standard-parts MCP tools (split out of cad_tools.py): export_part, import_part, list_standard_parts, make_standard_part."""
+
+    @mcp.tool()
+    def scad_status() -> str:
+        """Report actual OpenSCAD renderer and isolation availability."""
+        try:
+            return _dumps(cb.call("scad_status", {}))
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def scad_inspect(params: dict) -> str:
+        """Inspect SCAD feature params and typed controls without rendering."""
+        try:
+            return _dumps(cb.call("scad_inspect", {"params": params}))
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def scad_convert(direction: str, doc_id: Optional[str] = None,
+                     base_revision: Optional[int] = None,
+                     mm_per_source_unit: Optional[float] = None) -> str:
+        """Convert a supported native graph to managed SCAD or restore it to native.
+
+        Conversion is atomic and revision-guarded. Unsupported or modified code is
+        rejected with the native report; general SCAD does not recover native history.
+        """
+        try:
+            d = _doc(doc_id)
+            revision = base_revision if base_revision is not None else _doc_revision(d)
+            if revision is None:
+                raise ValueError("Cannot obtain document revision for SCAD conversion")
+            op = {"op": "scad_convert", "direction": direction}
+            if mm_per_source_unit is not None:
+                op["mm_per_source_unit"] = mm_per_source_unit
+            result = cb.call("doc_apply_ops", {"doc_id": d, "base_revision": revision,
+                                                "ops": [op]})
+            if result.get("ok") is not False:
+                _publish_current(d)
+            return _dumps(result)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
 
 
     @mcp.tool()
@@ -36,7 +79,7 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
 
         fmt: "draw+" (standalone native drawing) | "step+" (native part) | "step" | "stl" |
              "3mf" | "iges" | "brep" | "obj" | "ply" | "gltf" | "glb" | "3dm" | "dxf" |
-             "dwg" | "sat". If `path` is omitted, the file is named from the document in
+             "dwg" | "sat" | "scad". If `path` is omitted, the file is named from the document in
              CHUDWARE_PROJECT_SAVE_DIR; only clients with no configured project folder fall
              back to a temp file.
              STEP/IGES/BREP are exact B-rep; STL/OBJ/PLY/glTF are tessellated meshes.
@@ -61,6 +104,8 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
         list_world_bodies against the expected envelope) and export again.
         Empty geometry is refused before writing unless allow_empty=True. Use native step+
         to deliberately preserve an empty editable document.
+        STL reports passed source-solid facet checks separately from the explicitly
+        skipped B-rep round-trip in ``validation_stages``; it is not a reimport test.
         """
         try:
             d = _doc(doc_id)
@@ -77,15 +122,17 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                                "native": True, "drawing_id": d, "doc_id": d,
                                "path": written, "exists": os.path.exists(written),
                                **{k: r[k] for k in ("source_state",) if k in r}})
-            if not allow_empty and not cb.call(
-                    "asm_world_bodies", {"doc_id": d, "explode": False}).get("bodies"):
+            native_fmt = fmt in ("step+", "stepplus", "stp+", "native")
+            if fmt != "scad" and not allow_empty and not cb.call(
+                    "asm_world_bodies", {"doc_id": d, "explode": False}).get("bodies") \
+                    and not (native_fmt and _part_has_mesh_references(d)):
                 # An unresolved assembly is not an empty design: let the strict
                 # geometry census name the missing component and source path.
                 cb.call("export_tess_estimate", {"doc_id": d})
                 return _dumps({"ok": False, "reason": "no_bodies_empty_document",
                                "doc_id": d, "content": "Export refused: document has 0 bodies."})
             # The native editable container is written by doc_save, not the interchange writer.
-            if fmt in ("step+", "stepplus", "stp+", "native"):
+            if native_fmt:
                 # Resolve against the selected workspace, not either process's cwd,
                 # before forwarding the guarded absolute destination to the engine.
                 out = (_sanitize_output_path(os.path.expanduser(path)) if path
@@ -94,15 +141,24 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                     out += ".step+"
                 # A save can preserve an unfinished tree; an export cannot omit a child.
                 census = cb.call("export_tess_estimate", {"doc_id": d})
-                r = cb.call("doc_save", {"doc_id": d, "path": out})
+                try:
+                    r = cb.call("doc_save", {"doc_id": d, "path": out,
+                                             "if_no_human_dirty": True})
+                except CoreError as exc:
+                    if exc.code != "path_bound_to_other_doc":
+                        raise
+                    return _dumps({"ok": False, "code": exc.code, "detail": exc.detail,
+                                   "hint": "Import this path to attach to its bound document and edit that document instead."})
+                if r.get("ok") is False:
+                    if r.get("code") == "path_bound_to_other_doc":
+                        r["hint"] = "Import this path to attach to its bound document and edit that document instead."
+                    return _dumps(r)
                 written = r.get("path", out)
-                if os.path.exists(written):
-                    rev = _doc_revision(d)
-                    if rev is not None:
-                        _LAST_DELIVER_REV[d] = rev  # delivered: quiet close_part until further edits
+                _note_session_saved(d, written)
                 res = {"ok": os.path.exists(written), "format": "step+",
                        "native": True, "doc_id": d, "path": written,
                        "exists": os.path.exists(written)}
+                res.update({k: r[k] for k in ("saved_revision", "cache") if k in r})
                 res["validated"] = False  # native tree save is not a geometry round-trip check
                 if res["ok"] and census.get("bodies", 0):
                     with zipfile.ZipFile(written) as archive:
@@ -130,12 +186,11 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
             if units:
                 call["units"] = units
             r = cb.call("export_file", call)
+            if r.get("ok") is False:
+                return _dumps(r)
             written = r.get("path", out)
-            if os.path.exists(written):
-                rev = _doc_revision(d)
-                if rev is not None:
-                    _LAST_DELIVER_REV[d] = rev  # delivered: quiet close_part until further edits
-            res = {"ok": True, "format": fmt, "doc_id": d, "path": written,
+            # Interchange geometry is not an editable native save.
+            res = {**r, "ok": True, "format": fmt, "doc_id": d, "path": written,
                    "exists": os.path.exists(written)}
             res["content"] = f"Exported {fmt} geometry to {written}."
             for k in ("bytes", "solid_count", "valid_solids", "expected_solids", "validated",
@@ -152,26 +207,78 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
             return _err(e)
 
 
+    @mcp.tool()
+    def export_flat_dxf(path: Optional[str] = None, doc_id: Optional[str] = None,
+                        fmt: str = "dxf") -> str:
+        """Export a sheet-metal flat pattern, not a 3D interchange model.
+
+        First add an sm_flat_pattern feature. DXF/DWG output separates the
+        blank boundary, bend lines and internal cutouts onto OUTLINE, BEND and
+        CUTS layers respectively; PDF displays the same geometry without layers.
+        Paths follow the same destination rules as export_part.
+        """
+        scratch_dir = None
+
+        def cleanup_empty_scratch():
+            if scratch_dir:
+                try:
+                    os.rmdir(scratch_dir)
+                except OSError:
+                    pass
+
+        try:
+            d = _doc(doc_id)
+            fmt = fmt.lower().lstrip(".")
+            if fmt not in ("dxf", "dwg", "pdf"):
+                raise ValueError("flat-pattern format must be dxf, dwg, or pdf")
+            if path:
+                out = _sanitize_output_path(os.path.expanduser(path))
+            elif root_value("CHUDWARE_PROJECT_SAVE_DIR"):
+                out = _default_deliverable_path(d, "-flat." + fmt)
+            else:
+                # Unlike mkstemp, this does not pre-create a partial deliverable
+                # when the engine refuses a document without a flat pattern.
+                scratch_dir = tempfile.mkdtemp(prefix="chudware_flat_")
+                out = os.path.join(scratch_dir, "flat." + fmt)
+            r = cb.call("export_flat_dxf", {"doc_id": d, "path": out, "format": fmt})
+            if r.get("ok") is False:
+                cleanup_empty_scratch()
+                return _dumps(r)
+            written = r.get("path", out)
+            exists = os.path.isfile(written) and os.path.getsize(written) > 0
+            if not exists:
+                cleanup_empty_scratch()
+                return _dumps({"ok": False, "doc_id": d, "path": written,
+                               "reason": "flat_export_missing_or_empty"})
+            return _dumps({**r, "ok": True, "doc_id": d, "path": written,
+                           "format": fmt, "exists": True,
+                           "content": f"Exported sheet-metal flat pattern to {written}."})
+        except Exception as e:  # noqa: BLE001
+            cleanup_empty_scratch()
+            return _err(e)
+
+
 
     @mcp.tool()
     def import_part(path: str, into: Optional[str] = None, as_solid: bool = False,
                     resolve_features: bool = True, keep_bodies: Optional[list] = None,
-                    exclude_bodies: Optional[list] = None, resume: bool = False) -> str:
+                    exclude_bodies: Optional[list] = None, resume: bool = False,
+                    copy: bool = False) -> str:
         """Import a CAD/mesh file (STEP/IGES/BREP/STL/3MF/OBJ/PLY/glTF/3DM/DXF/DWG/
-        STEP+/DRAW+/…) as a body, or open a native standalone drawing.
+        STEP+/DRAW+/SCAD/…) as a body or SCAD source feature, or open a native standalone drawing.
         Lets you assemble components built or exported separately, or recover geometry from a file
         after a session reset. `into` = an existing doc_id to add the body to the CURRENT part
         (for assembly); omit it to open the file as a NEW part (made current). `as_solid` sews a
         mesh (STL/OBJ/…) into a solid on import; B-rep formats already import as solids.
+        Relative paths use the selected session workspace, not the worker's working
+        directory. Without a configured workspace, supply an absolute path.
 
-        Imports create a NEW document by default, even when the source file is already open.
-        `resume=True` explicitly reuses the open document at that path (reply `reused:true`).
-        `into=<doc_id>` adds geometry to that document instead of opening or resuming one.
-        A pristine native import is reproducible from its source and is not copied into
-        the project root at turn end. Authored design edits retain source-save behavior;
-        study-only scratch is saved separately. Automatic saves never replace a source
-        held by another user-opened document. Pass save_part(path=...) for an explicit
-        destination, or resume=True to edit the document the user already has open.
+        Native files attach to the live document bound to that path, or open it bound
+        if none exists. Use `copy=True` for an independent, detached document.
+        `resume` remains accepted for existing callers and has no effect.
+        `into=<doc_id>` adds geometry to that document instead of opening one.
+        Agent edits persist automatically unless human edits are pending; never ask the
+        user to save AI work.
 
         DXF/DWG (AutoCAD, any version incl. 2013-2018+ files): ACIS 3DSOLID/BODY/REGION/SURFACE
         entities import as exact B-rep bodies (`<stem>_solidN` / `<stem>_surfaceN`), including
@@ -220,49 +327,18 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
         NEVER hand-edit STEP/JSONL text to move geometry.
         """
         try:
-            # Resolve the caller-supplied path ONCE against THIS process's cwd: the worker
-            # chdir's to the project root, but the engine/daemon has a DIFFERENT working
-            # directory, so a raw relative path that resolves fine here is unfindable there.
-            # Every cb.call below gets the absolute form; `imported_from` keeps the caller's
-            # original string so run records stay readable.
-            path_abs = os.path.abspath(os.path.expanduser(path))
+            # The selected workspace is request-scoped; a shared worker cannot chdir
+            # for each caller. Resolve once before either filesystem or engine access.
+            path_abs = resolve_agent_path(path, "path")
             # K2: validate the path exists BEFORE calling the engine so we never open a
             # zombie doc.  The engine's import_file does not distinguish "file missing" from
             # "format unsupported" and may silently create an empty document.
             if not os.path.isfile(path_abs):
                 return _dumps({"ok": False, "error": f"file not found: {path}",
                                "hint": f"looked for {path_abs} — relative paths resolve "
-                                       "against the MCP server's working directory, not "
-                                       "necessarily your project folder. Run fs_list on the "
-                                       "containing directory for the exact name, or pass an "
-                                       "absolute path."})
-            # Resuming a saved session is opt-in: an import must never silently redirect
-            # subsequent edits to the source document.
-            if resume and not into:
-                try:
-                    open_docs = [e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
-                                 if isinstance(e, dict) and e.get("doc_id")]
-                except Exception:  # noqa: BLE001 — listing is an optimisation, never fatal
-                    open_docs = []
-                want = os.path.realpath(path_abs)
-                for e in open_docs:
-                    p = e.get("path")
-                    if not isinstance(p, str) or not p:
-                        continue
-                    if os.path.realpath(p) != want:
-                        continue
-                    did = e["doc_id"]
-                    _CUR["doc_id"] = did
-                    vol = e.get("volume")
-                    if isinstance(vol, (int, float)):
-                        _LAST_VOLUME.setdefault(did, vol)
-                    _publish_current(did)
-                    return _dumps({
-                        "ok": True, "doc_id": did, "imported_from": path, "reused": True,
-                        "name": e.get("name"), "revision": e.get("revision", 0),
-                        "feature_count": e.get("feature_count"),
-                        "content": f'Resumed "{os.path.basename(path_abs)}" as {did}.',
-                        "note": "Pass resume=False to import an independent document."})
+                                       "against the selected session workspace. Run fs_list "
+                                       "on the containing directory for the exact name, "
+                                       "or pass an absolute path."})
             # SolidWorks feature-tree resolution (opening as a NEW editable part/assembly).
             portable_fallback_reason: Optional[str] = None
             if resolve_features and not into and path_abs.lower().endswith((".sldprt", ".sldasm")):
@@ -313,7 +389,12 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                         cb.call("doc_apply_ops", {"doc_id": cd, "ops": c["ops"]})
                         stem = os.path.splitext(os.path.basename(key))[0]
                         cpath = os.path.join(sidecar, stem + ".step+")
-                        cb.call("doc_save", {"doc_id": cd, "path": cpath})
+                        saved = cb.call("doc_save", {"doc_id": cd, "path": cpath,
+                                                     "if_no_human_dirty": True})
+                        if saved.get("ok") is False:
+                            return _dumps({**saved, "ok": False, "doc_id": cd,
+                                           "path": cpath,
+                                           "hint": "Component save failed; its live document was retained."})
                         cb.call("doc_close", {"doc_id": cd})
                         built[key] = cpath
                     ad = cb.call("doc_new", {"name": plan["name"],
@@ -355,26 +436,19 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                                "format": "draw+", "native": True,
                                **{k: r[k] for k in ("name", "source_doc_id", "source_state")
                                   if k in r}})
-            # A3: .step+ is the engine's NATIVE format. With no `into`, route it through
-            # doc_open (the same path used by recover_parts and the host's own file-open) to
-            # open it as a fresh part. WITH `into`, the engine's import_file now extracts the
-            # container's solids and bakes them as an embedded-BREP import feature on the target
-            # doc (Issue 2 — native parts are assemblable without re-exporting to plain STEP).
+            # Native files open through the engine's atomic path-identity lookup;
+            # `into` instead embeds the source geometry in an existing part.
             if path_abs.lower().endswith(".step+") and not into:
-                r = cb.call("doc_open", {"path": path_abs, "detach_path": not resume})
+                r = cb.call("doc_open", {"path": path_abs, "detach_path": copy,
+                                         "reuse_open": not copy})
                 new_id = r.get("doc_id")
                 if new_id:
                     _CUR["doc_id"] = new_id
                     _publish_current(new_id)
-                    # Seed the write-diff baseline so the first add_features on a freshly
-                    # opened part reports a volume delta, not a volume-only "volume now X".
-                    vol = r.get("volume")
-                    if isinstance(vol, (int, float)):
-                        _LAST_VOLUME[new_id] = vol
                 return _dumps({"ok": True, "doc_id": new_id, "imported_from": path,
                                "format": "step+", "native": True,
-                               "content": f"Opened independent native document {new_id}."
-                                          if not resume else f"Opened native document {new_id}.",
+                               "reused": bool(r.get("reused", False)),
+                               "content": f"Opened {'independent ' if copy else ''}native document {new_id}.",
                                **{k: r[k] for k in ("revision", "name", "body_count")
                                   if k in r}})
             params: dict = {"path": path_abs, "as_solid": bool(as_solid)}
@@ -387,6 +461,8 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
             if exclude_bodies is not None:
                 params["exclude_bodies"] = list(exclude_bodies)
             r = cb.call("import_file", params)
+            if r.get("ok") is False:
+                return _dumps(r)
             new_id = r.get("doc_id") or into
             # An import feature that FAILS to compile (keep_bodies/exclude_bodies naming a
             # body the source does not have, an unreadable source, a filter that dropped
@@ -411,16 +487,8 @@ def register_cad_exchange_tools(mcp: FastMCP) -> None:
                 _CUR["doc_id"] = new_id
             if new_id:
                 _publish_current(new_id)
-                # Seed the write-diff baseline when the importer reports a volume, so the
-                # first add_features on an imported part shows a delta instead of "volume now X".
-                vol = r.get("volume")
-                if isinstance(vol, (int, float)):
-                    _LAST_VOLUME[new_id] = vol
-            payload = {"ok": True, "doc_id": new_id, "imported_from": path,
-                       "into": into,
-                       **{k: r[k] for k in (
-                           "revision", "name", "body_count", "import_fidelity",
-                           "feature_resolved", "editable_as", "component_names", "warning") if k in r}}
+            payload = {**r, "ok": True, "doc_id": new_id, "imported_from": path,
+                       "into": into}
             if portable_fallback_reason and r.get("import_fidelity") == "saved_display_tessellation":
                 payload["feature_fallback_reason"] = portable_fallback_reason
             return _dumps(payload)

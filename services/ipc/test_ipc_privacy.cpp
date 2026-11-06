@@ -13,10 +13,14 @@
 #include <string>
 #include <thread>
 #include <chrono>
+#include <vector>
 
 #ifndef _WIN32
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -381,6 +385,35 @@ int main(int argc, char** argv) {
     fs::create_directory_symlink(logs, root / "linked-dir");
     assert(!privateDir((root / "linked-dir").string()));
 
+    // A restarted or disconnected daemon can close a GUI socket just before
+    // its next write. Exercise the transport with the default fatal SIGPIPE
+    // disposition in a child, independently of the test runner's disposition.
+    int pair[2];
+    assert(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    assert(::close(pair[1]) == 0);
+    const pid_t writer = ::fork();
+    assert(writer >= 0);
+    if (writer == 0) {
+        struct sigaction action{};
+        action.sa_handler = SIG_DFL;
+        ::sigemptyset(&action.sa_mask);
+        if (::sigaction(SIGPIPE, &action, nullptr) != 0) ::_exit(2);
+        sigset_t signals;
+        ::sigemptyset(&signals);
+        ::sigaddset(&signals, SIGPIPE);
+        if (::sigprocmask(SIG_UNBLOCK, &signals, nullptr) != 0) ::_exit(3);
+        IpcConn conn(pair[0]);
+        if (conn.writeLine("disconnected") || !conn.eof()) ::_exit(4);
+        struct sigaction after{};
+        if (::sigaction(SIGPIPE, nullptr, &after) != 0 || after.sa_handler != SIG_DFL)
+            ::_exit(5);
+        ::_exit(0);
+    }
+    assert(::close(pair[0]) == 0);
+    int writerStatus = 0;
+    assert(::waitpid(writer, &writerStatus, 0) == writer);
+    assert(WIFEXITED(writerStatus) && WEXITSTATUS(writerStatus) == 0);
+
     const std::string endpoint = (root / "activated.sock").string();
     assert(endpoint.size() < sizeof(sockaddr_un{}.sun_path));
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
@@ -418,6 +451,31 @@ int main(int argc, char** argv) {
     fd = ::socket(AF_INET, SOCK_STREAM, 0);
     assert(!rejected.adoptListeningFd(fd, err));
     assert(::fcntl(fd, F_GETFD) == -1 && errno == EBADF);
+
+    // A daemon wedged mid-shutdown keeps its listen fd open but never accepts. Once
+    // the backlog is full a blocking connect() never returns; connectTo must time out.
+    const std::string wedged = (root / "wedged.sock").string();
+    fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    std::strcpy(address.sun_path, wedged.c_str());
+    assert(::bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof address) == 0);
+    assert(::listen(fd, 0) == 0);
+    std::vector<int> queued;
+    for (;;) {
+        const int q = ::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        if (::connect(q, reinterpret_cast<sockaddr*>(&address), sizeof address) == 0) {
+            queued.push_back(q);
+            continue;
+        }
+        assert(errno == EAGAIN);
+        ::close(q);
+        break;
+    }
+    const auto started = std::chrono::steady_clock::now();
+    assert(!connectTo(wedged, err).valid());
+    assert(err.find("timed out") != std::string::npos);
+    assert(std::chrono::steady_clock::now() - started < std::chrono::seconds(10));
+    for (int q : queued) ::close(q);
+    ::close(fd);
 #endif
     return 0;
 }

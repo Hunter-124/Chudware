@@ -35,4 +35,4 @@ Per-feature discipline for solid modeling.
 ## Deeper docs
 
 - Part workflow: `cad_skill("edit-part")`
-- `cad_guide()` op vocabulary
+- `cad_guide(feature_type)` for parameters; `cad_guide("add_features")` for batch shapes.

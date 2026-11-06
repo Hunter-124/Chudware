@@ -126,22 +126,25 @@ def _build_clean(tools: dict) -> dict:
     pin xy, the auto-router's own wire points) instead of being hardcoded — a hardcoded guess
     would make this guard pass or fail for the wrong reason.
     """
-    _call(tools, "ecad_new_schematic", name="qa_clean")
-    _call(tools, "ecad_place_symbol", libid="Device:R", x=0, y=0, ref="R1")
-    _call(tools, "ecad_place_symbol", libid="Device:R", x=20.32, y=0, ref="R2")
+    from services.mcp.ecad_common import _unique_ecad_path
+    _call(tools, "ecad_new_schematic", name="qa_clean", path=_unique_ecad_path("sch", "qa_clean"))
+    r1 = _call(tools, "ecad_place_symbol", libid="Device:R", x=0, y=0, ref="R1", angle=90)
+    r2 = _call(tools, "ecad_place_symbol", libid="Device:R", x=20.32, y=0, ref="R2", angle=90)
     c1 = _call(tools, "ecad_place_symbol", libid="Device:C", x=12.7, y=-20.32, ref="C1")
     c1_pins = {p["number"]: p["xy"] for p in c1["pins"]}
     _call(tools, "ecad_wire", from_ref="R1", from_pin="2", to_ref="R2", to_pin="1")
     _call(tools, "ecad_wire", from_ref="R2", from_pin="1", to_ref="C1", to_pin="1")
-    _call(tools, "ecad_add_power", net="VCC", x=-5.08, y=0)
-    _call(tools, "ecad_add_power", net="GND", x=25.4, y=0)
+    r1_pin = next(p["xy"] for p in r1["pins"] if p["number"] == "1")
+    r2_pin = next(p["xy"] for p in r2["pins"] if p["number"] == "2")
+    _call(tools, "ecad_add_power", net="VCC", x=r1_pin[0], y=r1_pin[1])
+    _call(tools, "ecad_add_power", net="GND", x=r2_pin[0], y=r2_pin[1])
     # Midpoint of the LAST segment the auto-router actually emitted for the R2->C1 wire, so
     # the label provably sits on a wire.
     pts = _session().doc["wires"][-1]["pts"]
     a, b = pts[-2], pts[-1]
     mid = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0]
     _call(tools, "ecad_label", text="MID", x=mid[0], y=mid[1])
-    return {"c1_pins": c1_pins, "label_pos": mid}
+    return {"c1_pins": c1_pins, "label_pos": mid, "r1_pin": r1_pin, "r2_pin": r2_pin}
 
 
 def _test_lib(libid: str, pin_pos) -> dict:
@@ -279,14 +282,15 @@ def _assert_overlap_reported(tools: dict) -> dict:
 
 
 def test_symbol_overlap_names_both_refs(tools: dict) -> None:
-    """Two resistors 0.5 mm apart: bodies (2.03 x 1.27 mm) interpenetrate."""
+    """Two real KiCad resistor bodies 0.5 mm apart interpenetrate."""
     _call(tools, "ecad_new_schematic", name="qa_overlap")
     _call(tools, "ecad_place_symbol", libid="Device:R", x=0, y=0, ref="R1")
     _call(tools, "ecad_place_symbol", libid="Device:R", x=0.5, y=0, ref="R2")
     h = _assert_overlap_reported(tools)
-    # R1 body x in [-1.016, 1.016], R2 body x in [-0.516, 1.516] -> shared x in [-0.516, 1.016]
-    assert abs(h["overlap_bbox"][0] - -0.516) < 1e-3, h
-    assert abs(h["overlap_bbox"][2] - 1.016) < 1e-3, h
+    quad = sch_qa.symbol_body_quad(_session().doc, _session().doc["symbols"][0])
+    left, right = min(p[0] for p in quad), max(p[0] for p in quad)
+    assert abs(h["overlap_bbox"][0] - (left + 0.5)) < 1e-3, h
+    assert abs(h["overlap_bbox"][2] - right) < 1e-3, h
     print("  [symbol_overlap_names_both_refs] PASS")
 
 
@@ -294,7 +298,9 @@ def test_adjacent_symbols_that_only_touch_are_not_overlapping(tools: dict) -> No
     """Bodies sharing exactly one edge is a tight layout, not a defect."""
     _call(tools, "ecad_new_schematic", name="qa_touch")
     _call(tools, "ecad_place_symbol", libid="Device:R", x=0, y=0, ref="R1")
-    _call(tools, "ecad_place_symbol", libid="Device:R", x=2.032, y=0, ref="R2")
+    quad = sch_qa.symbol_body_quad(_session().doc, _session().doc["symbols"][0])
+    width = max(p[0] for p in quad) - min(p[0] for p in quad)
+    _call(tools, "ecad_place_symbol", libid="Device:R", x=width, y=0, ref="R2")
     r = _lint(tools)
     assert _of(r, "symbol_overlap") == [], r["findings"]
     print("  [adjacent_symbols_that_only_touch_are_not_overlapping] PASS")
@@ -346,10 +352,14 @@ def test_dangling_wire_names_the_endpoint_coordinates(tools: dict) -> None:
 def test_near_miss_stub_is_dangling_and_reports_the_gap(tools: dict) -> None:
     """A wire end 0.25 mm off a pin is NOT connected (netlist snaps at 1e-6 mm) — report it
     with the measured miss distance, which is what makes it fixable."""
-    _build_clean(tools)
-    _add_wire("w91", [[-5.08, 30.0], [-5.33, 0.0]])   # R1 pin 1 tip is at (-5.08, 0)
+    info = _build_clean(tools)
+    px, py = info["r1_pin"]
+    end = [px - 0.25, py]
+    _add_wire("w91", [[px - 0.25, py + 30.0], end])
     r = _lint(tools)
-    near = [h for h in _of(r, "dangling_wire") if tuple(h["pos"]) == (-5.33, 0.0)]
+    near = [h for h in _of(r, "dangling_wire")
+            if all(abs(actual - expected) < 1e-3
+                   for actual, expected in zip(h["pos"], end))]
     assert len(near) == 1, _of(r, "dangling_wire")
     n = near[0]["nearest"]
     assert "R1.1" in n["what"], n
@@ -360,16 +370,18 @@ def test_near_miss_stub_is_dangling_and_reports_the_gap(tools: dict) -> None:
 
 def test_wire_ended_by_a_label_or_junction_is_not_dangling(tools: dict) -> None:
     """A named-net stub (wire + label on its end) and a junction both terminate a wire."""
-    _build_clean(tools)
-    _add_wire("w92", [[-5.08, 0.0], [-5.08, 12.7]])   # starts on R1.1's tip
-    _call(tools, "ecad_label", text="VIN", x=-5.08, y=12.7)
+    info = _build_clean(tools)
+    x, y = info["r1_pin"]
+    _add_wire("w92", [[x, y], [x, y + 12.7]])
+    _call(tools, "ecad_label", text="VIN", x=x, y=y + 12.7)
     r = _lint(tools)
     assert [h for h in _of(r, "dangling_wire") if h["wire_id"] == "w92"] == [], r["findings"]
     assert _of(r, "floating_label") == [], r["findings"]
 
-    _add_wire("w93", [[25.4, 0.0], [25.4, -12.7]])    # starts on the GND port
+    x, y = info["r2_pin"]
+    _add_wire("w93", [[x, y], [x, y - 12.7]])
     def edit(doc: dict) -> None:
-        doc.setdefault("junctions", []).append({"id": "j90", "pos": [25.4, -12.7],
+        doc.setdefault("junctions", []).append({"id": "j90", "pos": [x, y - 12.7],
                                                 "sheet": "sh1"})
     _mutate(edit)
     r = _lint(tools)
@@ -387,8 +399,9 @@ def _assert_crossing_reported(tools: dict) -> dict:
     h = hits[0]
     assert h["ref"] == "R1", h
     assert "R1" in h["message"], h["message"]
-    # R1's body is 2.032 mm wide; the 0.05 mm inset trims a little off each side.
-    assert 1.8 < h["inside_mm"] <= 2.032, h
+    quad = sch_qa.symbol_body_quad(_session().doc, _session().doc["symbols"][0])
+    width = max(p[0] for p in quad) - min(p[0] for p in quad)
+    assert width - 0.2 < h["inside_mm"] <= width, h
     assert h["enter"][0] < h["exit"][0], h
     return h
 
@@ -401,14 +414,14 @@ def test_wire_through_a_body_names_the_refdes_and_the_span(tools: dict) -> None:
 
 
 def test_wire_crossing_a_pin_lead_is_not_crossing_the_body(tools: dict) -> None:
-    """A pin's LEAD is not the body. Device:R draws its lead as a graphic line from the pin root
-    (x = 2.54 mm) to the body edge (x = 1.016 mm), so a wire running vertically at x = 1.905 mm
-    crosses the LEAD and nothing else. Legal — and the exact case that fires if lead graphics
-    are folded into the body box.
-    """
+    """Cross a real KiCad resistor's pin lead without entering its body."""
     _call(tools, "ecad_new_schematic", name="qa_lead")
-    _call(tools, "ecad_place_symbol", libid="Device:R", x=0, y=0, ref="R1")
-    _add_wire("w82", [[1.905, -7.62], [1.905, 7.62]])
+    result = _call(tools, "ecad_place_symbol", libid="Device:R", x=0, y=0, ref="R1", angle=90)
+    quad = sch_qa.symbol_body_quad(_session().doc, _session().doc["symbols"][0])
+    edge = max(p[0] for p in quad)
+    pin = max(p["xy"][0] for p in result["pins"])
+    lead_x = (edge + pin) / 2
+    _add_wire("w82", [[lead_x, -7.62], [lead_x, 7.62]])
     r = _lint(tools)
     assert _of(r, "wire_crosses_symbol") == [], \
         f"a wire over a pin lead must not be a body crossing: {r['findings']}"
@@ -474,21 +487,33 @@ def test_rotated_symbol_body_follows_the_transform(tools: dict) -> None:
     quad = sch_qa.symbol_body_quad(_session().doc, _session().doc["symbols"][0])
     xs = sorted(round(p[0], 3) for p in quad)
     ys = sorted(round(p[1], 3) for p in quad)
-    assert (xs[0], xs[-1]) == (-0.635, 0.635), quad   # the 1.27 mm side is now horizontal
-    assert (ys[0], ys[-1]) == (-1.016, 1.016), quad
-    _add_wire("w80", [[0.0, -12.7], [0.0, 12.7]])     # along the rotated part's long axis
-    _add_wire("w81", [[-12.7, 3.0], [12.7, 3.0]])     # clear of it
+    body = sch_qa.body_local_rect(_session().doc["lib_cache"]["Device:R"])
+    assert abs((xs[-1] - xs[0]) - (body[3] - body[1])) < 0.01, quad
+    assert abs((ys[-1] - ys[0]) - (body[2] - body[0])) < 0.01, quad
+    _add_wire("w80", [[-12.7, 0.0], [12.7, 0.0]])
+    _add_wire("w81", [[-12.7, 6.0], [12.7, 6.0]])
     hits = _of(_lint(tools), "wire_crosses_symbol")
     assert [h["wire_id"] for h in hits] == ["w80"], hits
-    assert 1.8 < hits[0]["inside_mm"] <= 2.032, hits[0]
+    assert xs[-1] - xs[0] - 0.2 < hits[0]["inside_mm"] <= xs[-1] - xs[0], hits[0]
     print("  [rotated_symbol_body_follows_the_transform] PASS")
 
 
 def test_rail_symbol_without_a_resolvable_body_is_skipped_and_named(tools: dict) -> None:
-    """power:VCC is drawn as a single bar + lead: there is no body to test. Skip it and SAY
-    so — never guess a bbox and then flag the wire that legitimately reaches its pin."""
+    """A line-only rail has no resolvable body: skip and name it, not a guessed bbox."""
     _call(tools, "ecad_new_schematic", name="qa_rail")
-    _call(tools, "ecad_place_symbol", libid="power:VCC", x=0, y=0, ref="#PWR01")
+    def add_bodyless_rail(doc: dict) -> None:
+        libid = "Test:BodylessRail"
+        definition = _test_lib(libid, (0, 0))
+        definition["power"] = True
+        definition["graphics"] = [{"type": "line", "p1": [-1, 2], "p2": [1, 2],
+                                   "layer": "F.SilkS", "width": 0.15}]
+        doc.setdefault("lib_cache", {})[libid] = definition
+        doc.setdefault("symbols", []).append({
+            "id": "s90", "ref": "#PWR01", "libid": libid, "pos": [0.0, 0.0],
+            "angle": 0.0, "mirror": "none", "unit": 1, "value": "VCC",
+            "sheet": "sh1", "fields": {}, "in_bom": False, "on_board": False, "dnp": False,
+        })
+    _mutate(add_bodyless_rail)
     _call(tools, "ecad_place_symbol", libid="Device:R", x=0, y=-10.16, ref="R1")
     r = _lint(tools)
     assert _of(r, "wire_crosses_symbol") == [], r["findings"]
@@ -504,6 +529,12 @@ def test_pin_lead_graphics_are_not_part_of_the_body() -> None:
     from services.ecad.library import starter
     assert sch_qa.body_local_rect(starter.SYMBOLS["Device:R"]) == \
         (-1.016, -0.635, 1.016, 0.635)
+    for libid in ("Simulation_SPICE:VDC", "Simulation_SPICE:VSIN",
+                  "Simulation_SPICE:VPULSE"):
+        assert sch_qa.body_local_rect(starter.SYMBOLS[libid]) == (-2.54, -2.54, 2.54, 2.54)
+    lm358 = starter.SYMBOLS["Amplifier_Operational:LM358"]
+    assert sch_qa.body_local_rect(lm358, 1) == (-5.08, -5.08, 5.08, 5.08)
+    assert sch_qa.body_local_rect(lm358, 3) is None
     no_body = [lid for lid, s in starter.SYMBOLS.items()
                if sch_qa.body_local_rect(s) is None]
     assert sorted(no_body) == ["power:+3V3", "power:+5V", "power:-5V", "power:VCC"], no_body
@@ -653,6 +684,10 @@ except ImportError:  # pragma: no cover — pytest absent when run via main()
 
 
 if pytest is not None:
+    @pytest.fixture(autouse=True)
+    def _isolated_ecad_workspace(monkeypatch, tmp_path):
+        monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(tmp_path))
+
     @pytest.fixture(scope="module")
     def tools() -> dict:
         return _register()

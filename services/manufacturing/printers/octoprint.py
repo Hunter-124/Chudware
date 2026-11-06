@@ -9,6 +9,8 @@ import re
 from typing import Any
 from urllib.parse import quote
 
+from ..print_safety import validate_print_filename
+
 from .base import PrinterAdapter, _MISSING, nested, number_or_missing, percent_fraction, string_or_missing
 from .model import Artifact, EndpointConfig, ProtocolError, capability_report, operation_truth
 
@@ -164,6 +166,7 @@ class OctoPrintAdapter(PrinterAdapter):
         self._require_authorization(authorization_token)
         self._require_operation("start")
         remote_path = _validated_remote_path(remote_artifact.get("remote_path"))
+        validate_print_filename(remote_path.rsplit("/", 1)[-1])
         selected = self.http.request_json(
             "POST",
             "/api/files/local/" + quote(remote_path, safe="/"),

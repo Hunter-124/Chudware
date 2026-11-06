@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 import json
+import math
 
 from . import stages
 from .engine import Finding, Observation
@@ -302,6 +303,10 @@ def _check_sketch(doc_id: str, call: Any, check: str) -> list[Finding]:
                 if not isinstance(closure.get("closed_chains_ok"), bool):
                     raise RuntimeError("sketch_health returned no closure verdict")
                 endpoints = closure.get("open_endpoints") or []
+                # open_path / unknown usage: open endpoints are informational, not a defect
+                # (only a closed_profile / mixed consumer needs a loop).
+                if closure.get("usage") in ("open_path", "unknown"):
+                    continue
                 if not closure["closed_chains_ok"] or endpoints:
                     out.append(Finding(
                         kind="open_profile", check=check, severity="blocker",
@@ -341,7 +346,8 @@ def _check_sketch(doc_id: str, call: Any, check: str) -> list[Finding]:
                               else "info" if severity == "info" else "action"),
                     finding=f"sketch {sketch}: {finding['message']}",
                     numbers={"dof": dof, "status": status,
-                             "driving_dimensions": intent["driving_dimensions"]},
+                             "authored_dimensions": intent["authored_dimensions"],
+                             "auto_dimensions": intent["auto_dimensions"]},
                     refs={**refs, "entities": finding.get("entities", [])},
                     source_kind="kernel", source_detail="sketch_health",
                     extra={**finding, "pinned_only": intent["pinned_only"],
@@ -382,69 +388,87 @@ def _check_rebuild(doc_id: str, call: Any) -> list[Finding]:
 # ---------------------------------------------------------------------------
 
 def _check_wall_thickness(doc_id: str, call: Any) -> list[Finding]:
-    """Run eval_thickness + resolve process minimum → thin-wall Finding.
-
-    Numbers: ``min_thickness_mm`` (kernel ray-cast), ``limit_mm`` (ProcessProfile
-    table), ``process`` (name string).  Source: kernel ray-cast — cited as such.
-    Returns an ``action`` finding when wall < limit, ``info`` when OK.
-    """
-    th = call("eval_thickness", doc_id=doc_id) or {}
-    mn = th.get("min_thickness_mm")
-    if mn is None:
-        return []  # open/sheet body — no thickness measurement
-
-    # Attempt to resolve the process minimum from the process profile bound to this doc.
+    """Screen inscribed-sphere regions against the process minimum, without gating exit."""
+    # set_process persists the resolved profile in document metadata.
+    proc_name = "fdm"
     limit: Optional[float] = None
-    proc_name: str = "process"
     try:
-        proc_info = call("doc_get_process", doc_id=doc_id) or {}
-        proc_name = proc_info.get("process") or "process"
-        params = proc_info.get("params") or {}
-        lim_val = params.get("min_wall_mm")
-        if lim_val is not None:
-            limit = float(lim_val)
+        profile = (call("doc_get_meta", doc_id=doc_id, key="process") or {}).get("value") or {}
+        proc_name = profile.get("process") or proc_name
+        limit = (profile.get("params") or {}).get("min_wall_mm")
+        if limit is None:
+            profile = (call("dfm_get_profile", process=proc_name) or {}).get("result") or {}
+            limit = (profile.get("params") or {}).get("min_wall_mm")
+        if limit is not None:
+            limit = float(limit)
+            if not math.isfinite(limit) or limit <= 0:
+                limit = None
     except Exception:  # noqa: BLE001
-        pass
+        limit = None
 
-    if limit is not None and mn < limit:
-        finding_text = (f"thinnest wall {mn:.3f} mm < {proc_name} minimum {limit:.3f} mm "
-                        f"(Δ={limit - mn:+.3f} mm) — from eval_thickness kernel ray-cast")
-        severity = "action"
-    elif limit is not None:
-        finding_text = (f"thinnest wall {mn:.3f} mm meets {proc_name} minimum {limit:.3f} mm "
-                        f"— from eval_thickness kernel ray-cast")
-        # OK wall — emit info so the advisory is available but non-blocking.
-        return [Finding(
+    th = call("eval_thickness", doc_id=doc_id,
+              **({"min_wall_mm": limit} if limit is not None else {})) or {}
+    mn = th.get("min_thickness_mm")
+    if mn is not None and not math.isfinite(mn):
+        mn = None
+    basis = th.get("measurement_basis") or {}
+    spacing = basis.get("spacing_mm")
+    source = ("eval_thickness inscribed-sphere screening"
+              if basis.get("method") == "inscribed_sphere"
+              else "eval_thickness screening (measurement basis unavailable)")
+    if spacing is not None:
+        source += f", spacing {spacing:g} mm"
+    if basis.get("budget_limited"):
+        source += " (budget-limited)"
+    unmeasured = basis.get("n_unmeasured", 0)
+    coverage_note = (f"; {unmeasured} sample(s) unmeasured, not evidence of safety"
+                     if unmeasured else "")
+    regions = th.get("thin_regions") or []
+    thin = ([region for region in regions
+             if region.get("min_thickness_mm") is not None
+             and region["min_thickness_mm"] < limit] if limit is not None else [])
+    out: list[Finding] = []
+    for region in thin or [{}]:
+        value = region.get("min_thickness_mm", mn)
+        sample = region or th.get("minimum_sample") or {}
+        face_ids = region.get("face_ids") or (
+            [sample["face_id"]] if sample.get("face_id") is not None else [])
+        label = (f"{region.get('kind', 'wall')} region on faces {face_ids}"
+                 if region else "minimum measured wall")
+        severity = "info"
+        if value is None:
+            text = "Thickness unmeasured: no opposing wall found; not evidence of safety"
+        elif limit is None:
+            text = f"{label} {value:.3f} mm; process minimum unavailable"
+        elif value < limit:
+            text = (f"{label} {value:.3f} mm < {proc_name} minimum {limit:.3f} mm "
+                    f"(Δ={limit - value:+.3f} mm); fix or explicitly justify before export/slicing")
+            severity = "action"  # Deliberate screening semantics: not a stage-exit blocker.
+        else:
+            text = (f"{label} {value:.3f} mm meets {proc_name} minimum {limit:.3f} mm "
+                    "at sampled locations only; also inspect wall_thickness() and dfm_check")
+        out.append(Finding(
             kind="wall_thickness",
             check=stages.CHECK_WALL_THICKNESS,
-            severity="info",
-            finding=finding_text,
-            numbers={"min_thickness_mm": mn, "limit_mm": limit, "process": proc_name},
-            refs={"doc_id": doc_id},
+            severity=severity,
+            finding=f"{text} — from {source}{coverage_note}",
+            numbers={"min_thickness_mm": value, "limit_mm": limit, "process": proc_name,
+                     "spacing_mm": spacing, "n_unmeasured": unmeasured,
+                     "n_thin_regions": th.get("n_thin_regions", len(regions)),
+                     "thin_area_mm2": th.get("thin_area_mm2")},
+            refs={"doc_id": doc_id, "face_ids": face_ids,
+                  **{key: sample[key] for key in ("at", "opposite_at", "wall_direction")
+                     if key in sample}},
             source_kind="kernel",
             source_detail="eval_thickness",
-            extra={},
-        )]
-    else:
-        finding_text = f"thinnest wall {mn:.3f} mm — from eval_thickness kernel ray-cast"
-        severity = "info"
-
-    return [Finding(
-        kind="wall_thickness",
-        check=stages.CHECK_WALL_THICKNESS,
-        severity=severity,
-        finding=finding_text,
-        numbers={"min_thickness_mm": mn,
-                 **({"limit_mm": limit, "process": proc_name} if limit is not None else {})},
-        refs={"doc_id": doc_id},
-        source_kind="kernel",
-        source_detail="eval_thickness",
-        extra={"process": proc_name, "limit_mm": limit},
-    )]
+            extra={"process": proc_name, "limit_mm": limit, "measurement_basis": basis,
+                   "thin_regions": regions, "region": region},
+        ))
+    return out
 
 
 def _check_dfm(doc_id: str, call: Any) -> list[Finding]:
-    """Run dfm_check (eval_thickness + eval_draft against ProcessProfile) → DFM Finding.
+    """Run dfm_check (DFAM mesh_wall_thickness for printed walls) → DFM Finding.
 
     Returns a ``blocker`` Finding when any DFM check fails (dfm_pass=False), ``info``
     otherwise.  The ``checks`` list is carried in ``extra`` so the fix provider can

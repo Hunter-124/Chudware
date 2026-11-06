@@ -1,21 +1,8 @@
-// TessCatchup: single-flight "catch the viewport up" bookkeeping for tess-less revisions.
-//
-// A doc.changed published by a `with_tess:false` writer (asm_add_component, asm_mate, the
-// animation/motion pose writers, parts_tools, the PLM live server) carries the new tree but
-// no aicm_path. The active tab keeps drawing its previous mesh, so an assembly's components
-// stayed where they were after every mate/insert/pose until some later mesh-bearing revision
-// (or the end of the turn) — on 2026-09-27 a 36-revision mate+sweep stretch showed nothing
-// for ten minutes. engine_events.cpp asks the daemon for the current tessellation instead
-// (doc_activate: warm read-cache, assembly AICM from cached local meshes) and this class
-// decides, per document, when to ask and whether the answer may be drawn:
-//   * at most ONE fetch in flight per doc; revisions that land meanwhile only raise the
-//     wanted revision (a pose sweep never queues one RPC per frame);
-//   * an answer is drawn only when it matches the tree the viewport shows (mirrorRev) and is
-//     not older than the newest tess-less revision seen; an older one refetches once;
-//   * a mesh-bearing revision, a tab switch or a failed fetch drops the want.
-// Pure and GL-free so it unit-tests without AppState (host/tests/test_tess_catchup.cpp).
+// Per-document mesh obligations. A fetched path is not complete until its mesh commits.
 #pragma once
 
+#include <algorithm>
+#include <chrono>
 #include <map>
 #include <string>
 
@@ -23,62 +10,75 @@ namespace core {
 
 class TessCatchup {
 public:
-    enum class Outcome { Commit, Refetch, Drop };
+    using Clock = std::chrono::steady_clock;
 
-    // A tess-less revision `rev` of `docId` was applied to the active view. True when the
-    // caller must issue the fetch now; false while one is already in flight for the doc.
-    bool wantMesh(const std::string& docId, long rev) {
-        State& s = docs_[docId];
-        if (rev > s.wanted) s.wanted = rev;
-        if (s.inFlight) return false;
-        s.inFlight = true;
+    void require(const std::string& docId, long revision) {
+        if (docId.empty() || revision < 0) return;
+        State& state = docs_[docId];
+        if (revision > state.wanted) {
+            state.wanted = revision;
+            state.loading = -1;
+            state.retryAt = {};
+            state.failures = 0;
+        }
+    }
+
+    bool beginFetch(const std::string& docId, Clock::time_point now = Clock::now()) {
+        auto it = docs_.find(docId);
+        if (it == docs_.end() || it->second.inFlight ||
+            it->second.loading >= it->second.wanted || now < it->second.retryAt)
+            return false;
+        it->second.inFlight = true;
         return true;
     }
 
-    // A mesh-bearing revision reached the viewport: nothing is owed any more. An in-flight
-    // fetch still completes, and onFetched() then drops it.
-    void satisfied(const std::string& docId) {
+    void fetched(const std::string& docId, bool usable, Clock::time_point now = Clock::now()) {
         auto it = docs_.find(docId);
         if (it == docs_.end()) return;
-        if (it->second.inFlight) it->second.wanted = kNone;
-        else docs_.erase(it);
+        it->second.inFlight = false;
+        if (!usable) retry(it->second, now);
     }
 
-    // The fetch for `docId` returned. `usable` = transport ok, no method error, a mesh path;
-    // `rev` = the answer's revision; `viewing` = the doc is still the active, editable view;
-    // `mirrorRev` = revision of the tree the viewport currently shows. Refetch leaves the doc
-    // in flight — the caller must issue the next fetch.
-    Outcome onFetched(const std::string& docId, bool usable, long rev, bool viewing,
-                      long mirrorRev) {
+    void loading(const std::string& docId, long revision) {
         auto it = docs_.find(docId);
-        if (it == docs_.end()) return Outcome::Drop;
-        State& s = it->second;
-        s.inFlight = false;
-        if (!usable || !viewing || s.wanted == kNone) {
+        if (it != docs_.end() && revision >= it->second.wanted)
+            it->second.loading = revision;
+    }
+
+    void finished(const std::string& docId, long revision, bool success,
+                  Clock::time_point now = Clock::now()) {
+        auto it = docs_.find(docId);
+        if (it == docs_.end()) return;
+        if (success && revision >= it->second.wanted) {
             docs_.erase(it);
-            return Outcome::Drop;
+            return;
         }
-        if (rev < s.wanted) {  // a newer tess-less revision landed while this one was served
-            s.inFlight = true;
-            return Outcome::Refetch;
+        if (it->second.loading == revision) {
+            it->second.loading = -1;
+            if (!success) retry(it->second, now);
         }
-        docs_.erase(it);
-        // rev > mirrorRev: the push for that revision is still queued; its own handling
-        // (mesh-bearing load, or a new want) takes over. rev < mirrorRev cannot be drawn.
-        return rev == mirrorRev ? Outcome::Commit : Outcome::Drop;
     }
 
-    bool inFlight(const std::string& docId) const {
+    void forget(const std::string& docId) { docs_.erase(docId); }
+    bool pending(const std::string& docId) const { return docs_.count(docId) != 0; }
+    bool empty() const { return docs_.empty(); }
+    long wanted(const std::string& docId) const {
         auto it = docs_.find(docId);
-        return it != docs_.end() && it->second.inFlight;
+        return it == docs_.end() ? -1 : it->second.wanted;
     }
 
 private:
-    static constexpr long kNone = -1;
     struct State {
-        long wanted = kNone;
+        long wanted = -1;
+        long loading = -1;
         bool inFlight = false;
+        unsigned failures = 0;
+        Clock::time_point retryAt{};
     };
+    static void retry(State& state, Clock::time_point now) {
+        const unsigned shift = std::min(state.failures++, 5u);
+        state.retryAt = now + std::chrono::milliseconds(250u << shift);
+    }
     std::map<std::string, State> docs_;
 };
 

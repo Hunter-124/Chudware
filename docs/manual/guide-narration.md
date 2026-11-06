@@ -18,9 +18,11 @@ NARRATION TOOLS — compact text summaries of every domain state:
     Returns a graceful 'no results attached' message when no study exists.
 
   describe_assembly([doc_id])
+    ok indicates narration success; incomplete fit is reported in warnings and fit.
     Queries pre-solve world-frame bounding boxes and origins, runs a live mate
     solve, then eval_interference with clearance_mode='threshold',
-    min_clearance_mm=0 and include_coincident=False. Exact clash volumes remain;
+    min_clearance_mm=0 and include_coincident=False. Clash volumes are exact
+    except fallback-marked fuzzy boolean results, which are approximate;
     clearance bounds are not measured gaps. No minimum measured gap is reported.
     Returns raw fit completeness, checked/total pairs and failures; incomplete
     or no-pair reports cannot qualify collision-free. Use INSTEAD of raw JSON.

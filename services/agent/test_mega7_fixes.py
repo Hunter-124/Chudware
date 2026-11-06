@@ -1,11 +1,8 @@
 """Mega-7 live harness-fix regressions (Fixer7 = HomelessBadger).
 
 Watch-list from mega-6 findings (owner cycle-7):
-  2. Delegation regression — mega-5: 2 calls, mega-6: 0; role prompts must still
-     prefer delegate and children route cheap (not suppress spawn).
   3. new_part empty solids — add_features must follow; thrash ≠ product success.
-  4. live cheap-share 0% — mission nodes must stamp task_class so leaf/verify/
-     deliver can auto_pick low-rank models at depth 0.
+  4. mission nodes must stamp task_class so leaf/verify/deliver carry their class.
 
 Item 1 of that list, DELIVER-phase soft-join mortality, is NOT covered here and no longer
 can be: its subject `services/agent/loop.py::_drive_phases_from_dag` was deleted
@@ -16,9 +13,6 @@ file uses it.
 """
 from __future__ import annotations
 
-import pytest
-
-
 
 # ---------------------------------------------------------------------------
 # Shared manifest fixture (used by the task_class stamping test below)
@@ -27,7 +21,7 @@ import pytest
 
 def _valid_manifest():
     return {
-        "request_verbatim": "Design a rocket plane with airframe + avionics.",
+        "request_verbatim": "Design a vehicle chassis with a controller board.",
         "ambiguities": [],
         "deliverables": [
             {
@@ -79,43 +73,6 @@ def _valid_manifest():
 # ---------------------------------------------------------------------------
 # 2. Delegation still preferred on role cards (not suppressed)
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "role_id",
-    [
-        "spec_writer",
-        "feature_modeler",
-        "layout_engineer",
-        "orchestrator",
-        "department_manager",
-        "assembly_fit_engineer",
-    ],
-)
-def test_delegate_roles_still_prefer_delegate(role_id):
-    """mega-6 regression: 0 delegate calls — prompts must still require spawn."""
-    from services.agent.roles import load_role
-
-    card = load_role(role_id)
-    tools = card.concrete_tools
-    assert "delegate" in tools, (role_id, tools)
-    prompt = card.system_prompt
-    assert "delegate" in prompt, role_id
-    assert "budget_tokens" in prompt, role_id
-    # mega-7: stronger "must spawn" language for multi-slice work
-    assert "cheap" in prompt.lower() or "MUST" in prompt or "prefer" in prompt.lower(), (
-        role_id, prompt[:200]
-    )
-
-
-def test_feature_modeler_requires_add_features_after_new_part():
-    from services.agent.roles import load_role
-
-    card = load_role("feature_modeler")
-    p = card.system_prompt
-    assert "new_part alone is NOT done" in p or "FIRST tool after" in p
-    assert "add_features" in p
-    assert "preflight" in p.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +136,10 @@ def test_new_part_then_add_features_auto_completes(tmp_path, monkeypatch):
     """Happy path: new_part → add_features is productive BUILD success."""
     from services.agent.ledger import Ledger
     from services.agent import agent_turn as at
+    from services.agent import guardrails
+
+    monkeypatch.setattr(guardrails, "_doc_tree", lambda *a, **kw: {"features": []})
+    monkeypatch.setattr(guardrails, "_engine_body_count", lambda doc_id: 1)
 
     monkeypatch.setenv("CHUDWARE_CACHE_ROOT", str(tmp_path))
     ledger = Ledger("mega7_build_ok", path=tmp_path / "ledger.json")
@@ -194,8 +155,9 @@ def test_new_part_then_add_features_auto_completes(tmp_path, monkeypatch):
                 return '```json\n{"tool":"new_part","args":{"name":"p"}}\n```'
             if seq["n"] == 2:
                 return (
-                    '```json\n{"tool":"add_features","args":{"ops":'
-                    '[{"op":"box","w":10,"h":10,"d":10}]}}\n```'
+                    '```json\n{"tool":"add_features","args":{"doc_id":"doc-ok","ops":'
+                    '[{"op":"add_feature","feature":{"type":"box","name":"box1",'
+                    '"params":{"length":10,"width":10,"height":10}}}]}}\n```'
                 )
             if seq["n"] == 3:
                 return (
@@ -208,6 +170,10 @@ def test_new_part_then_add_features_auto_completes(tmp_path, monkeypatch):
             return {"ok": True, "doc_id": "doc-ok", "name": "p"}
         if tool == "add_features":
             return {"ok": True, "features": ["box1"]}
+        if tool == "verify_battery":
+            return {"ok": True, "verdict": "pass",
+                    "coverage": {"ran": ["is_manifold"]},
+                    "scores": {"is_manifold": 1.0}, "findings": []}
         return {"ok": True}
 
     res = at.run_turn(
@@ -215,7 +181,7 @@ def test_new_part_then_add_features_auto_completes(tmp_path, monkeypatch):
         _Prov(),
         name="BUILD DL1",
         ledger=ledger,
-        allowed_tools=["new_part", "add_features", "preflight_ops"],
+        allowed_tools=["new_part", "add_features", "preflight_ops", "verify_battery"],
         tool_dispatch=_dispatch,
         max_tool_calls=3,
         phase="build",
@@ -223,9 +189,9 @@ def test_new_part_then_add_features_auto_completes(tmp_path, monkeypatch):
     tools_used = [c.get("tool") for c in (res.result or {}).get("calls") or []]
     assert "new_part" in tools_used
     assert "add_features" in tools_used
-    assert res.success is True or (
-        (res.result or {}).get("handoff") or {}
-    ).get("status") == "done"
+    assert "verify_battery" in tools_used
+    assert res.success is True, (res.stop_reason, res.result)
+    assert res.result["handoff"]["status"] == "done"
 
 
 # ---------------------------------------------------------------------------
@@ -234,10 +200,10 @@ def test_new_part_then_add_features_auto_completes(tmp_path, monkeypatch):
 
 
 def test_mission_nodes_stamp_task_class():
-    """Every mission template node must carry inputs.task_class for auto_pick."""
+    """Every mission template node must carry inputs.task_class."""
     from services.dag.mission_template import build_mission_graph
 
-    graph = build_mission_graph(_valid_manifest(), graph_id="m7_tc", org_layer=True)
+    graph = build_mission_graph(_valid_manifest(), graph_id="m7_tc")
     by_id = {n["id"]: n for n in graph["nodes"]}
     for n in graph["nodes"]:
         tc = (n.get("inputs") or {}).get("task_class")
@@ -271,47 +237,6 @@ def test_context_pack_promotes_task_class():
     assert pack.get("task_class") == "simple_part"
     assert pack.get("risk") == "low"
     assert pack.get("role_id") == "reviewer"
-
-
-def test_leaf_task_class_min_rank_is_one():
-    from services.agent.role_models import min_rank_for_difficulty
-
-    assert min_rank_for_difficulty(task_class="leaf", node_depth=0) == 1
-    assert min_rank_for_difficulty(task_class="simple_part", node_depth=0) == 1
-    assert min_rank_for_difficulty(task_class="simple", node_depth=0) == 1
-    # risk=low demotes further but floor is 1
-    assert min_rank_for_difficulty(
-        task_class="leaf", node_depth=0, risk="low"
-    ) == 1
-    # unknown still hard at depth 0
-    assert min_rank_for_difficulty(task_class=None, node_depth=0) == 3
-
-
-def test_depth0_leaf_auto_pick_not_forced_frontier(monkeypatch):
-    """With ollama+xai enabled, depth0 leaf/simple must prefer cheap ollama."""
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    from services.agent.role_models import auto_pick_model, min_rank_for_difficulty
-
-    cfg = {
-        "provider": "xai-sub",
-        "model": "grok-4.5",
-        "enabled_providers": [
-            {"provider": "ollama", "model": "llama3.2:latest",
-             "base_url": "http://127.0.0.1:11434/v1"},
-            {"provider": "xai-sub", "model": "grok-4.5"},
-        ],
-    }
-    # Sanity: leaf min_rank allows rank-1 ollama.
-    assert min_rank_for_difficulty(task_class="leaf", node_depth=0) <= 1
-    a = auto_pick_model(cfg=cfg, task_class="leaf", node_depth=0, risk="low")
-    assert a.provider != "openrouter", a
-    # Prefer non-xai when a cheap local is eligible.
-    assert a.provider == "ollama" or (
-        a.provider == "xai-sub" and a.rank is not None and a.rank >= 1
-    ), a
-    # Stronger: when min_rank=1, ollama rank1 must win over xai rank5.
-    a2 = auto_pick_model(cfg=cfg, task_class="simple_part", node_depth=0)
-    assert a2.provider == "ollama", a2
 
 
 def test_role_aliases_part_designer_and_edit_part():

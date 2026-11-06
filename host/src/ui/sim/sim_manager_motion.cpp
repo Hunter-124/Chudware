@@ -370,7 +370,7 @@ Study *SimManager::motionRunStudy(AppState &st, const std::shared_ptr<MotionRun>
       if (simOriginActive(st, this, run->docId))
         tree = &st.docMirror.tree();
       else if (tab.session->cachedMirror.valid())
-        tree = &tab.session->cachedMirror.tree;
+        tree = &tab.session->cachedMirror.tree();
       break;
     }
   for (auto &study : studies_)
@@ -398,7 +398,7 @@ std::string simmgr::motionGeometryBlocker(AppState &st) {
     return "Check that the components resolve in the viewport; the assembly has no geometry "
            "to move.";
   if (session->cachedRevision != st.docMirror.revision() &&
-      !sameMotionSource(session->cachedMirror.tree, st.docMirror.tree()))
+      !sameMotionSource(session->cachedMirror.tree(), st.docMirror.tree()))
     return "Wait for the assembly geometry to update.";
   return {};
 }
@@ -439,7 +439,7 @@ void SimManager::runMotion(AppState &st, Study &s) {
   motionRun_ = run;
   s.motionRunning = true;
   s.summary = "Preparing the assembly snapshot\xE2\x80\xA6";
-  st.rpc.call("doc_activate", {{"doc_id", run->docId}},
+  st.rpc.call("doc_activate", {{"doc_id", run->docId}, {"origin", "system"}},
               [this, &st, run](const core::RpcResult &r) {
     Study *study = motionRunStudy(st, run);
     if (!study)

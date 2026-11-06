@@ -1,22 +1,25 @@
 # Design for manufacturability pre-op (aicad.trigger/1)
 
-**When this fires:** manufacturing intent is explicit, or the model calls `set_process`,
-`resolve_process`, `dfm_check`, or `wall_thickness`.
+**When this fires:** manufacturing intent is explicit or a modeling operation completes.
+After an edit, apply the additive-specific advice only if the bound process is additive.
 
-**Key facts:**
-- `dfm_check` runs `eval_thickness` + `eval_draft` against the bound ProcessProfile
-  thresholds and returns `{dfm_pass, checks:[{check, value_mm, limit_mm, ok, note}]}`.
-- A **blocker** advisory fires when `dfm_pass=false`. The advisor names the offending
-  check, the measured value, the process minimum, and the delta to fix.
-- Apply only checks relevant to the selected process. If the process is unknown and changes
-  the design decision, resolve it or ask; do not invent a process or block on irrelevant rules.
-- Process minimums (from the ProcessProfile table in `core/dfm/process_profiles.cpp`):
-  - FDM: min wall ~1.2 mm, no draft required
-  - Injection molding: min wall ~1.0 mm, ≥1° draft required on vertical faces
-  - SLA: min wall ~0.6 mm, no draft required
-  - CNC: wall depends on tool; draft not typically required
-
-**Typical targeted fixes (advisor will compute):**
-- `thicken_wall`: increase the thinnest feature by ≥Δ mm (advisor gives exact delta).
-- `add_draft`: add draft angle to the listed faces (advisor gives face count + angle).
-- Run `dfm_check` again after geometry changes to confirm the fix cleared the blocker.
+**Do this:**
+- While modelling printed parts, run `wall_thickness()` for the process-minimum RED
+  heat map AND `dfm_check`. Fix every red region at its named face/feature or explicitly
+  justify it before export/slicing; fix DFM failures and re-run both.
+- At FDM milestones call `dfm_reinforce`: inspect sampled before/after thickness,
+  candidate ops and volume/other-region side effects. It does not apply edits. If no
+  fix verifies, inspect the driving sketch or add an appropriate constrained rib.
+- Favor wall thicknesses in whole extrusion widths, smooth internal fillets and
+  load-path gussets; orient principal loads along layers. For load-bearing parts,
+  consider topology optimization and check fit and loading separately.
+- Read the bound ProcessProfile thresholds; default FDM `min_wall_mm` is currently 1.0 mm.
+  Resolve the process if it changes the decision; do not apply irrelevant process rules.
+- For printed-part minimum walls, `dfm_check` uses DFAM's `mesh_wall_thickness`
+  inscribed-sphere measurement, not `eval_thickness`. Read its face/feature regions,
+  limits and fixes. `dfm_pass:null`/`not_evaluated` means incomplete, not a pass.
+- `wall_thickness(min_wall_mm=…, resolution=…, image=True)` uses `eval_thickness`;
+  minimum defaults to the bound process/FDM profile and resolution is optional mm spacing.
+  Use `image=False` for JSON. Read basis/spacing; null/grey is unmeasured, not safe.
+- Keep the advisor's wall screening separate from the DFM process verdict. Increase the
+  named wall or revise its feature; add draft only where the selected process requires it.

@@ -1,4 +1,4 @@
-"""C12 — mid-mission undo / checkpoint recovery.
+"""C12 — mid-mission checkpoint restore recovery.
 
 Clean pedestal part; harness injects a bad feature mid-BUILD (via
 ``challenge.inject_faults`` consumed by the runner GAP-INJECT hook). Model must
@@ -7,7 +7,7 @@ grading.
 
 Ground-truth ACs the gym grades ITSELF:
   AC1  verify_battery PASS on final
-  AC2  recovery tool_call in {undo, plm_restore, plm_checkpoint, doc_checkpoint}
+  AC2  recovery tool_call to plm_restore
   AC3  decision ``recovery`` text matches /undo|rollback|restore|checkpoint/i
        OR artifact kind checkpoint
   AC4  post-recovery dimension/feature event seq > recovery tool seq
@@ -24,9 +24,7 @@ import re
 from . import (Challenge, AcceptanceCheck, ledger_artifact,
                ledger_decision_value)
 
-_RECOVERY_TOOLS = frozenset({
-    "undo", "plm_restore", "plm_checkpoint", "doc_checkpoint",
-})
+_RECOVERY_TOOLS = frozenset({"plm_restore"})
 _RECOVERY_TEXT_RE = re.compile(r"undo|rollback|restore|checkpoint", re.I)
 _GRIND_THRESHOLD = 3
 PEDESTAL_BORE = 20.0
@@ -165,7 +163,7 @@ CHECKS = [
     AcceptanceCheck("AC1", "verify_battery PASS on final geometry", _grade_battery),
     AcceptanceCheck(
         "AC2",
-        "recovery tool_call present (undo|plm_restore|plm_checkpoint|doc_checkpoint)",
+        "recovery tool_call present (plm_restore)",
         _grade_recovery_tool,
     ),
     AcceptanceCheck(
@@ -190,7 +188,7 @@ MANIFEST = {
     "schema": "aicad.deliverables/1",
     "request_verbatim":
         "Design a simple mounting pedestal with a d20 through-bore. If a bad feature "
-        "appears mid-build, roll back via undo or a checkpoint restore and finish the "
+        "appears mid-build, restore a checkpoint and finish the "
         "pedestal cleanly.",
     "deliverables": [{
         "id": "DL1", "kind": "part", "name": "mounting pedestal",
@@ -198,8 +196,8 @@ MANIFEST = {
         "acceptance_criteria": [
             {"id": "AC1", "text": "geometry coherent after recovery",
              "check": {"tool": "verify_battery", "pass_rule": "PASS"}},
-            {"id": "AC2", "text": "recovery tool used (undo/checkpoint/restore)",
-             "check": {"tool": "undo", "pass_rule": "recovery tool called"}},
+            {"id": "AC2", "text": "checkpoint restored after the bad feature",
+             "check": {"tool": "plm_restore", "pass_rule": "restore called"}},
             {"id": "AC3", "text": "recovery decision or checkpoint artifact recorded",
              "check": {"tool": "plm_checkpoint", "pass_rule": "decision or artifact"}},
             {"id": "AC4", "text": "build progress resumes after recovery",
@@ -221,7 +219,7 @@ MANIFEST = {
 # ---- scripted agent turns (per seed) ----------------------------------------
 
 def _base_turns() -> list[dict]:
-    """Clean recovery path: build → bad feature → undo → resume → battery PASS."""
+    """Clean recovery path: build → checkpoint → bad feature → restore → resume."""
     return [
         {"_kind": "dimension", "id": "DIM1", "name": "pedestal_bore_diameter",
          "value": PEDESTAL_BORE, "unit": "mm",
@@ -232,27 +230,30 @@ def _base_turns() -> list[dict]:
         {"_kind": "tool_call", "tool": "add_features", "for_ac": "AC1", "node": "n_build_DL1",
          "args": {"op": "box", "w": 40, "d": 40, "h": 20},
          "hypothesis": "base block"},
+        {"_kind": "tool_call", "tool": "plm_checkpoint", "for_ac": "AC2",
+         "node": "n_build_DL1", "args": {"message": "before risky feature"},
+         "hypothesis": "save the last good state"},
         # harness injects bad_extrude after 2 build calls (see inject_faults); script
         # models the agent observing and recovering.
         {"_kind": "tool_call", "tool": "add_features", "for_ac": "AC1", "node": "n_build_DL1",
          "args": {"op": "extrude", "depth_mm": -999, "name": "corrupt_mid_build"},
          "hypothesis": "accidental corrupt extrude (injected fault)", "ok": False,
          "error": "incoherent geometry: depth_mm out of range"},
-        {"_kind": "tool_call", "tool": "undo", "for_ac": "AC2", "node": "n_build_DL1",
-         "args": {}, "hypothesis": "rollback the corrupt extrude"},
+        {"_kind": "tool_call", "tool": "plm_restore", "for_ac": "AC2", "node": "n_build_DL1",
+         "args": {"commit": "checkpoint_commit"}, "hypothesis": "restore the last good checkpoint"},
         {"_kind": "decision", "id": "recovery", "stage": "build", "for_ac": "AC3",
-         "text": "undo rollback of corrupt mid-build extrude; restore last good state",
-         "rationale": "injected fault detected; undo then resume",
+         "text": "restore the checkpoint after the corrupt mid-build extrude",
+         "rationale": "injected fault detected; restore then resume",
          "node": "n_build_DL1"},
-        {"_kind": "artifact", "kind": "checkpoint", "id": "cp_post_undo",
-         "stage": "build", "note": "auto/manual checkpoint after undo"},
+        {"_kind": "artifact", "kind": "checkpoint", "id": "cp_post_restore",
+         "stage": "build", "note": "restored the last good checkpoint"},
         # post-recovery progress
         {"_kind": "tool_call", "tool": "add_features", "for_ac": "AC4", "node": "n_build_DL1",
          "args": {"op": "bore", "diameter": PEDESTAL_BORE, "through": True},
          "hypothesis": "resume: d20 through-bore after recovery"},
         {"_kind": "dimension", "id": "DIM2", "name": "pedestal_bore_final",
          "value": PEDESTAL_BORE, "unit": "mm",
-         "driver": "post-recovery bore", "provenance": "measure after undo",
+         "driver": "post-recovery bore", "provenance": "measure after restore",
          "status": "confirmed"},
         {"_kind": "feature", "id": "FT_bore", "name": "through_bore",
          "op": "bore", "diameter": PEDESTAL_BORE, "stage": "build"},

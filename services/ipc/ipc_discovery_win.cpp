@@ -210,7 +210,12 @@ void SingleInstance::release() {
     sock_path_.clear();
 }
 
-bool spawnDetached(const std::string& exe, const std::string& arg, std::string& err) {
+bool spawnDetached(const std::string& exe, const std::string& arg, std::string& err,
+                   const std::atomic<bool>* cancelled) {
+    if (cancelled && cancelled->load(std::memory_order_acquire)) {
+        err = "aborted";
+        return false;
+    }
     std::wstring wexe = widen(exe);
     std::wstring cmd = L"\"" + wexe + L"\"";
     if (!arg.empty()) cmd += L" " + widen(arg);
@@ -245,6 +250,7 @@ bool spawnDetached(const std::string& exe, const std::string& arg, std::string& 
 #endif
 
     auto tryCreate = [&](DWORD flags) -> DWORD {
+        if (cancelled && cancelled->load(std::memory_order_acquire)) return ERROR_CANCELLED;
         STARTUPINFOW si{}; si.cb = sizeof si;
         PROCESS_INFORMATION pi{};
         std::vector<wchar_t> cmdline(cmd.begin(), cmd.end()); cmdline.push_back(L'\0');
@@ -272,6 +278,12 @@ bool spawnDetached(const std::string& exe, const std::string& arg, std::string& 
             return ERROR_BAD_EXE_FORMAT;
         }
 #endif
+        if (cancelled && cancelled->load(std::memory_order_acquire)) {
+            TerminateProcess(pi.hProcess, ERROR_CANCELLED);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            return ERROR_CANCELLED;
+        }
         if (ResumeThread(pi.hThread) == static_cast<DWORD>(-1)) {
             DWORD e = GetLastError(); TerminateProcess(pi.hProcess, e);
             CloseHandle(pi.hThread); CloseHandle(pi.hProcess); return e;
@@ -294,6 +306,7 @@ bool spawnDetached(const std::string& exe, const std::string& arg, std::string& 
     CloseHandle(pinned);
 #endif
     if (e == ERROR_SUCCESS) return true;
+    if (e == ERROR_CANCELLED) { err = "aborted"; return false; }
     err = "CreateProcessW " + exe + " failed (" + std::to_string(e) + ")";
     return false;
 }

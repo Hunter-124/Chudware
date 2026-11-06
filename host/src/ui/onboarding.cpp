@@ -4,7 +4,6 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
-#include <fstream>
 #include <string>
 #include <utility>
 
@@ -18,7 +17,7 @@
 #include "web_capabilities.h"
 #include "metrics.h"
 #include "widgets/kit.h"
-#include "chudcode_descriptors.h"
+#include "omp_descriptors.h"
 
 namespace ui {
 namespace {
@@ -40,7 +39,6 @@ struct WizardState {
     bool testError = false;
     std::string testReply;
     unsigned long long testGeneration = 0;
-    std::string persistError;
 };
 
 WizardState s_wizard;
@@ -128,11 +126,8 @@ std::string rpcError(const core::RpcResult& r, const char* absentExplanation) {
 }
 
 int readCompletedVersion() {
-    std::ifstream in(configPath());
-    if (!in) return 0;
     try {
-        nlohmann::json config;
-        in >> config;
+        const nlohmann::json config = readConfigJson();
         if (!config.is_object()) return 0;
         const auto onboarding = config.find("onboarding");
         if (onboarding == config.end() || !onboarding->is_object()) return 0;
@@ -161,51 +156,47 @@ bool beginCard(const char* id) {
 
 void endCard() { kit::cardEnd(); }
 
-void beginValidatedKeySave(AppState& st) {
+void finishWizard(AppState& st);
+
+void beginKeySave(AppState& st) {
     const std::string key = s_wizard.key;
     if (key.empty() || s_wizard.keyBusy) return;
     const std::string provider = kKeyProviders[s_wizard.keyProvider].id;
     s_wizard.keyBusy = true;
     s_wizard.keyError = false;
-    s_wizard.keyStatus = "Checking with " + std::string(kKeyProviders[s_wizard.keyProvider].label) + "\xe2\x80\xa6";
+    s_wizard.keyStatus = "Saving key...";
     const auto generation = ++s_wizard.keyGeneration;
-    st.rpc.call(kChudcodeValidateKeyMethod,
+    st.rpc.call(kOmpSetKeyMethod,
                 nlohmann::json{{"providerId", provider}, {"apiKey", key}},
-                [&st, provider, key, generation](const core::RpcResult& validation) {
+                [provider, generation](const core::RpcResult& saved) {
         if (generation != s_wizard.keyGeneration) return;
-        const bool valid = validation.ok &&
-                           chudcodeKeyValidationAccepted(validation.result, provider);
-        if (!valid) {
-            s_wizard.keyBusy = false;
+        s_wizard.keyBusy = false;
+        if (!saved.ok || !ompKeySaveAccepted(saved.result, provider)) {
             s_wizard.keyError = true;
-            s_wizard.keyStatus = rpcError(
-                validation, "The provider rejected the key without returning an explanation.");
+            s_wizard.keyStatus = rpcError(saved, "The key could not be stored by the authentication service.");
             return;
         }
-        st.rpc.call(kChudcodeSetKeyMethod,
-                    nlohmann::json{{"providerId", provider}, {"apiKey", key}},
-                    [provider, generation](const core::RpcResult& saved) {
-            if (generation != s_wizard.keyGeneration) return;
-            s_wizard.keyBusy = false;
-            const bool ok = saved.ok && chudcodeKeySaveAccepted(saved.result, provider);
-            if (!ok) {
-                s_wizard.keyError = true;
-                s_wizard.keyStatus = rpcError(
-                    saved, "The validated key could not be stored by the authentication service.");
-                return;
-            }
-            s_wizard.keyError = false;
-            s_wizard.keyStatus = "Key validated and saved securely.";
-            std::memset(s_wizard.key, 0, sizeof(s_wizard.key));
-        });
+        s_wizard.keyError = false;
+        s_wizard.keyStatus = "Key saved. Provider access is verified when used.";
+        std::memset(s_wizard.key, 0, sizeof(s_wizard.key));
     }, 20000);
 }
 
 void drawPowerStep(AppState& st) {
     const ExternalProviderSignInStatus oauth = pollExternalProviderSignIn(st);
 
-    ImGui::TextUnformatted("Choose how the copilot is powered");
-    dimWrapped("Bring your own AI: sign in to a subscription you already pay for, or paste a provider API key.");
+    ImGui::TextUnformatted("Start modeling locally");
+    dimWrapped("Local CAD needs no account, API key, or internet connection.");
+    if (kit::primaryButton("Start without an account", true, nullptr,
+                           ImVec2(-1, 42.0f * uiScale))) {
+        s_wizard.chosenWorkspace = 0;  // Model workspace
+        finishWizard(st);
+        return;
+    }
+    ImGui::Dummy(ImVec2(0, 8.0f * uiScale));
+    ImGui::Separator();
+    ImGui::TextUnformatted("Optional: set up Copilot");
+    dimWrapped("Connect an AI provider now, or later in Settings > Providers.");
     ImGui::Dummy(ImVec2(0, 6.0f * uiScale));
 
     if (beginCard("##onboarding_oauth")) {
@@ -272,12 +263,12 @@ void drawPowerStep(AppState& st) {
         ImGui::SetNextItemWidth(-1.0f);
         ImGui::InputTextWithHint("##onboarding_key", "Paste API key\xe2\x80\xa6", s_wizard.key,
                                  sizeof(s_wizard.key), ImGuiInputTextFlags_Password);
-        if (kit::primaryButton(s_wizard.keyBusy ? "Validating\xe2\x80\xa6###validate" : "Validate and save###validate",
+        if (kit::primaryButton(s_wizard.keyBusy ? "Saving\xe2\x80\xa6###save" : "Save key###save",
                                s_wizard.key[0] != 0 && !s_wizard.keyBusy,
-                               s_wizard.keyBusy ? "Checking the key with the provider."
+                               s_wizard.keyBusy ? "Saving the key securely."
                                                 : "Paste a key first.") &&
             s_wizard.key[0] != 0 && !s_wizard.keyBusy)
-            beginValidatedKeySave(st);
+            beginKeySave(st);
         ImGui::SameLine();
         if (kit::secondaryButton("Where do I get one?"))
             openExternalHttpUrl(kKeyProviders[s_wizard.keyProvider].consoleUrl);
@@ -397,22 +388,34 @@ void drawWorkspaceStep() {
     kit::popDensity();
 }
 
-bool finishWizard(AppState& st) {
+bool queueOnboardingCompletion(const char* startingWorkspace) {
+    const std::string workspace = startingWorkspace ? startingWorkspace : "";
+    return updateConfigJson([&workspace](nlohmann::json& config) {
+        nlohmann::json onboarding = nlohmann::json::object();
+        const auto existing = config.find("onboarding");
+        if (existing != config.end() && existing->is_object()) onboarding = *existing;
+        onboarding["completed_version"] = kOnboardingVersion;
+        if (!workspace.empty()) onboarding["starting_workspace"] = workspace;
+        config["onboarding"] = std::move(onboarding);
+    });
+}
+
+void finishWizard(AppState& st) {
     const char* workspace = s_wizard.chosenWorkspace >= 0
                                 ? kWorkspaces[s_wizard.chosenWorkspace].configName
                                 : nullptr;
-    if (!persistOnboardingCompletion(workspace)) {
-        s_wizard.persistError = "Chudware could not save setup progress. Your existing config was left unchanged.";
-        return false;
-    }
+    // Do not block entry on disk I/O. The config writer reports asynchronous failures;
+    // a rejected patch is reported here, and the welcome may reappear on the next launch.
+    if (!queueOnboardingCompletion(workspace))
+        st.toast(ToastLevel::Warn,
+                 "Setup progress could not be saved; the welcome may appear again next time.");
     if (s_wizard.chosenWorkspace >= 0)
         st.activeWorkspace = kWorkspaces[s_wizard.chosenWorkspace].workspace;
-    s_wizard.completedVersion = kOnboardingVersion;
+    s_wizard.completedVersion = kOnboardingVersion;  // This session, not a durability claim.
     s_wizard.open = false;
     s_wizard.requestOpen = false;
-    s_wizard.persistError.clear();
+    std::memset(s_wizard.key, 0, sizeof(s_wizard.key));
     ImGui::CloseCurrentPopup();
-    return true;
 }
 
 void drawFooter(AppState& st) {
@@ -435,25 +438,12 @@ void drawFooter(AppState& st) {
         if (s_wizard.step < kLastStep) ++s_wizard.step;
         else finishWizard(st);
     }
-    if (!s_wizard.persistError.empty()) {
-        ImGui::PushStyleColor(ImGuiCol_Text, Palette::toU32(palette.statusErr));
-        ImGui::TextWrapped("%s", s_wizard.persistError.c_str());
-        ImGui::PopStyleColor();
-    }
 }
 
 }  // namespace
 
 bool persistOnboardingCompletion(const char* startingWorkspace) {
-    const std::string workspace = startingWorkspace ? startingWorkspace : "";
-    return updateConfigJson([&workspace](nlohmann::json& config) {
-        nlohmann::json onboarding = nlohmann::json::object();
-        const auto existing = config.find("onboarding");
-        if (existing != config.end() && existing->is_object()) onboarding = *existing;
-        onboarding["completed_version"] = kOnboardingVersion;
-        if (!workspace.empty()) onboarding["starting_workspace"] = workspace;
-        config["onboarding"] = std::move(onboarding);
-    });
+    return queueOnboardingCompletion(startingWorkspace) && flushConfigWrites();
 }
 
 void forceOnboardingForScenario(int step) {
@@ -499,7 +489,7 @@ void drawOnboarding(AppState& st, bool appBusy) {
     }
 
     ImGui::PushStyleColor(ImGuiCol_Text, Palette::toU32(palette.accent));
-    ImGui::Text("Step %d of %d", s_wizard.step + 1, kStepCount);
+    ImGui::Text("Optional setup - step %d of %d", s_wizard.step + 1, kStepCount);
     ImGui::PopStyleColor();
     ImGui::SameLine();
     ImGui::ProgressBar((s_wizard.step + 1) / static_cast<float>(kStepCount), ImVec2(-1, 0), "");
@@ -514,7 +504,7 @@ void drawOnboarding(AppState& st, bool appBusy) {
         default: drawWorkspaceStep(); break;
     }
     ImGui::EndChild();
-    drawFooter(st);
+    if (s_wizard.open) drawFooter(st);
     ImGui::EndPopup();
 }
 

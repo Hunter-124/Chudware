@@ -11,6 +11,7 @@
 #include "ui/glyph_ranges.h"   // the atlas codepoint table (shared with agent_text + gui_lint)
 #include "ui/tesseract.h"     // drawTesseractSpinner — the brand mark doubles as the busy indicator
 #include "ui/icons.h"         // recolorIconAtlas — the baked 3D ribbon tiles track the accent pair
+#include "ui/anim.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1482,6 +1483,7 @@ void busyLabel(const char* label, ImU32 col) {
     const float box = ImGui::GetTextLineHeight();
     const ImVec2 p  = ImGui::GetCursorScreenPos();
     ImGui::Dummy(ImVec2(box, box));
+    if (ImGui::IsItemVisible()) anim::requestFramesAt(30.0f);
     // Below the legibility floor the wireframe is a smudge; a filled accent dot at least reads as
     // a state marker. Only reachable at very small font scales.
     ImDrawList* dl = ImGui::GetWindowDrawList();

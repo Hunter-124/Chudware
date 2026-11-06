@@ -4,6 +4,8 @@
 // cmd_id replaces an earlier one; ribbon_def.cpp kRetiredRows hides a row with no replacement.
 #pragma once
 
+#include <string>
+
 namespace ui {
 
 enum class CommandCapability {
@@ -11,6 +13,89 @@ enum class CommandCapability {
     Inspect,  // view/display/measure only
     Export,   // writes a copy; never mutates the open document
 };
+
+// Immutable, inexpensive snapshot used by every command surface and the dispatch boundary.
+// Document-derived facts are populated from cached state, never resolved while drawing a row.
+enum class CommandDocKind { None, Part, Assembly, Drawing, Schematic, PCB };
+
+struct CommandContext {
+    CommandDocKind activeDocKind = CommandDocKind::None;
+    std::string activeDocId;
+    int activeDocRevision = -1;  // matching mechanical mirror revision, otherwise unknown
+    bool activeMechanicalReady = true;  // false while the active tab is not bound to its mirror
+    int workspace = 0;
+    bool inSimulation = false;
+    bool sketch2dActive = false;
+    bool sketch3dActive = false;
+    bool sketch2dHasEntitySelection = false;
+    bool sketch2dHasFixSelection = false;
+    bool sketch3dHasSelection = false;
+    bool sketch3dHasFixSelection = false;
+    bool drawingViewSelected = false;
+    bool hasOpenSchematic = false;
+    bool hasOpenBoard = false;
+    bool ecadHasPath = false;
+    bool ecadHasProject = false;
+    bool kicadStatusKnown = false;
+    bool kicadAvailable = false;
+    bool kicadSchematicAvailable = false;
+    bool kicadPcbAvailable = false;
+    bool kicadProjectAvailable = false;
+    bool modelHasSolid = false;
+    bool modelSolidKnown = true;
+    bool sheetMetalHasBase = false;
+    bool sheetMetalHasBends = false;
+    bool sheetMetalHasValidFlat = false;
+    // If an older or partially hydrated mirror lacks a status, absence of evidence is not
+    // treated as a failed feature. Known-invalid and rolled-back features never set these.
+    bool sheetMetalBaseStatusUnknown = false;
+    bool sheetMetalBendStatusUnknown = false;
+    bool sheetMetalFlatStatusUnknown = false;
+
+    // Absence is meaningful only after a successful, current list. These flags describe
+    // the active document's relevant requests, not unrelated capability/metadata probes.
+    bool studyFactsCurrent = false;
+    bool studyListPending = false;
+    bool simCreationPending = false;
+    std::string selectedStudyType;
+    std::string topologyPhysics;
+    bool hasModalStudy = false;
+    bool hasBucklingStudy = false;
+    bool hasContactStudy = false;
+    bool hasFreqResponseStudy = false;
+    bool hasThermalFeaStudy = false;
+    bool hasFatigueStudy = false;
+    bool hasMotionStudy = false;
+    bool hasFlowStudy = false;
+    bool hasThermalStudy = false;
+    bool hasTopologyStudy = false;
+    bool contactCapabilityKnown = false;
+    bool contactCapabilityAvailable = false;
+    bool vibrationCapabilityKnown = false;
+    bool vibrationCapabilityAvailable = false;
+    bool emAnalysisOpen = false;
+    bool emCapabilityKnown = false;
+    bool emCapabilityProbeFailed = false;
+    bool emCapabilityAvailable = false;
+    bool thermalCfdCapabilityKnown = false;
+    bool thermalCfdCapabilityAvailable = false;
+    bool topologyCapabilityKnown = false;
+    bool topologyCapabilityAvailable = false;
+
+    bool camHasJob = false;
+    bool camHasSetup = false;
+    bool camBusy = false;
+    bool camHasSource = false;
+    bool camHasCachedExtract = false;
+};
+
+struct CommandAvailability {
+    bool visible = true;
+    bool enabled = true;
+    const char* reason = nullptr;  // static storage; never points into the snapshot
+};
+
+CommandAvailability commandAvailability(const char* cmdId, const CommandContext& context);
 
 struct RibbonCmd {
     const char* cmd_id;   // snake_case unique command identifier

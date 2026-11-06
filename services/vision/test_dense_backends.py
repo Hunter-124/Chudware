@@ -50,17 +50,21 @@ def _set_openmvs(monkeypatch, path="/fake/openmvs/bin"):
 class TestNotProvisioned:
     def test_openmvs_commands_not_provisioned(self, monkeypatch):
         _clear_bins(monkeypatch)
+        monkeypatch.setenv("PATH", "")
         result = openmvs_commands(SPARSE, SESSION)
         assert result["ok"] is False
-        assert result["reason"] == "backend_not_provisioned"
+        assert result["reason"] == "dense_backend_unavailable"
+        assert result["fallback"] == "splat_to_mesh"
         assert result["backend"] == "openmvs"
         assert "OPENMVS_BIN" in result["hint"]
 
     def test_run_openmvs_not_provisioned(self, monkeypatch):
         _clear_bins(monkeypatch)
+        monkeypatch.setenv("PATH", "")
         result = run_openmvs(SPARSE, SESSION)
         assert result["ok"] is False
-        assert result["reason"] == "backend_not_provisioned"
+        assert result["reason"] == "dense_backend_unavailable"
+        assert result["fallback"] == "splat_to_mesh"
         assert result["backend"] == "openmvs"
 
     def test_run_brush_not_provisioned(self, monkeypatch, tmp_path):
@@ -98,8 +102,8 @@ class TestOpenMVSCommands:
         cmds = openmvs_commands(SPARSE, SESSION)["commands"]
         interface = cmds[0]
         assert interface[0].endswith("InterfaceCOLMAP")
-        # --input-path points to sparse_dir
-        idx = interface.index("--input-path")
+        # --input-file is the complete undistorted dataset root.
+        idx = interface.index("--input-file")
         assert interface[idx + 1] == SPARSE
         # --output-file ends in dense.mvs inside dense/
         idx = interface.index("--output-file")
@@ -113,16 +117,16 @@ class TestOpenMVSCommands:
         # input-file is the .mvs from step 1
         in_idx = densify.index("--input-file")
         assert densify[in_idx + 1] == cmds[0][cmds[0].index("--output-file") + 1]
-        # output-file is a .ply
+        # OpenMVS requires an MVS scene; its PLY cloud is a sidecar.
         out_idx = densify.index("--output-file")
-        assert densify[out_idx + 1].endswith(".ply")
+        assert densify[out_idx + 1].endswith(".mvs")
 
     def test_reconstruct_mesh_third(self):
         cmds = openmvs_commands(SPARSE, SESSION)["commands"]
         recon = cmds[2]
         assert recon[0].endswith("ReconstructMesh")
+        # Input is the dense scene, retaining camera visibility.
         in_idx = recon.index("--input-file")
-        # input is the dense ply from densify
         assert recon[in_idx + 1] == cmds[1][cmds[1].index("--output-file") + 1]
 
     def test_refine_mesh_fourth(self):
@@ -138,7 +142,7 @@ class TestOpenMVSCommands:
         assert texture[0].endswith("TextureMesh")
         out_idx = texture.index("--output-file")
         assert texture[out_idx + 1].startswith(MESH_DIR)
-        assert texture[out_idx + 1].endswith(".obj")
+        assert texture[out_idx + 1].endswith(".mvs")
 
     def test_texture_mesh_export_type_obj(self):
         cmds = openmvs_commands(SPARSE, SESSION)["commands"]
@@ -149,13 +153,13 @@ class TestOpenMVSCommands:
     def test_working_resolution_default_zero(self):
         cmds = openmvs_commands(SPARSE, SESSION)["commands"]
         densify = cmds[1]
-        wr_idx = densify.index("--working-resolution")
+        wr_idx = densify.index("--resolution-level")
         assert densify[wr_idx + 1] == "0"
 
     def test_working_resolution_custom(self):
         cmds = openmvs_commands(SPARSE, SESSION, working_resolution=4)["commands"]
         densify = cmds[1]
-        wr_idx = densify.index("--working-resolution")
+        wr_idx = densify.index("--resolution-level")
         assert densify[wr_idx + 1] == "4"
 
     def test_all_bins_under_bin_dir(self):
@@ -170,6 +174,68 @@ class TestOpenMVSCommands:
             prev_out = cmds[i - 1][cmds[i - 1].index("--output-file") + 1]
             this_in = cmds[i][cmds[i].index("--input-file") + 1]
             assert prev_out == this_in, f"Chain broken between step {i-1} and {i}"
+
+
+def test_openmvs_uses_shared_undistorted_dataset_and_scene_handoffs(tmp_path, monkeypatch):
+    from services.vision import dense_backends
+
+    dataset = tmp_path / "shared-dataset"
+    (dataset / "images").mkdir(parents=True)
+    sparse = dataset / "sparse"
+    sparse.mkdir()
+    for name in ("cameras", "images", "points3D"):
+        (sparse / (name + ".txt")).write_text("# model\n")
+    monkeypatch.delenv("OPENMVS_BIN", raising=False)
+    monkeypatch.setattr(dense_backends.shutil, "which", lambda name: "/openmvs/" + name)
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        output = Path(command[command.index("--output-file") + 1])
+        output.write_bytes(b"scene")
+        if command[0].endswith("TextureMesh"):
+            output.with_suffix(".obj").write_text("v 0 0 0\n")
+        return True, ""
+
+    monkeypatch.setattr(dense_backends, "_run", run)
+    result = run_openmvs(str(dataset), str(tmp_path / "session"))
+    assert result["ok"], result
+    assert result["units"] == "reconstruction"
+    assert calls[0][calls[0].index("--input-file") + 1] == str(dataset)
+    assert calls[1][calls[1].index("--normalize-coordinates") + 1] == "0"
+    for previous, current in zip(calls, calls[1:]):
+        assert previous[previous.index("--output-file") + 1] == current[current.index("--input-file") + 1]
+    assert result["mesh_path"].endswith("mesh_texture.obj")
+
+
+def test_openmvs_nested_sparse_and_stale_output_are_handled(tmp_path, monkeypatch):
+    from services.vision import dense_backends
+
+    dataset = tmp_path / "dataset"
+    (dataset / "images").mkdir(parents=True)
+    model = dataset / "sparse" / "0"
+    model.mkdir(parents=True)
+    for name in ("cameras", "images", "points3D"):
+        (model / (name + ".bin")).write_bytes(b"model")
+    monkeypatch.delenv("OPENMVS_BIN", raising=False)
+    monkeypatch.setattr(dense_backends.shutil, "which", lambda name: "/openmvs/" + name)
+    session = tmp_path / "session"
+    old = session / "dense" / "scene.mvs"
+    old.parent.mkdir(parents=True)
+    old.write_bytes(b"old scene")
+    calls = []
+
+    def no_outputs(command, **kwargs):
+        calls.append(command)
+        return True, ""
+
+    monkeypatch.setattr(dense_backends, "_run", no_outputs)
+    result = run_openmvs(str(dataset), str(session))
+    assert result["reason"] == "openmvs_output_missing"
+    staged = Path(calls[0][calls[0].index("--input-file") + 1])
+    assert (staged / "sparse" / "cameras.bin").read_bytes() == b"model"
+    assert (staged / "images").is_dir()
+    assert old.read_bytes() == b"old scene"
 
 
 @pytest.fixture
@@ -204,7 +270,7 @@ def brush_process(tmp_path, monkeypatch):
         if mode == "cancel":
             pathlib.Path(os.environ["BRUSH_TEST_PID"]).write_text(str(os.getpid()))
             time.sleep(60)
-        if mode != "progress":
+        if mode not in ("progress", "series"):
             path.write_bytes(header if mode == "truncated" else header + payload)
         if mode == "failed":
             print("GPU initialization failed", flush=True)
@@ -216,6 +282,10 @@ def brush_process(tmp_path, monkeypatch):
             intermediate.write_bytes(header + payload)
             time.sleep(1.3)
             path.write_bytes(header + payload)
+        if mode == "series":
+            for step in range(1, steps + 1):
+                (out / ("export_%d.ply" % step)).write_bytes(header + payload)
+                time.sleep(1.2)
     """))
     executable.chmod(0o755)
     monkeypatch.setenv("BRUSH_BIN", str(executable))
@@ -273,6 +343,26 @@ def test_brush_publishes_complete_immutable_output(brush_dataset, brush_process,
     assert {p.name for p in snapshots} == {"export_1.ply", "export_2.ply"}
     for path, data in snapshots.items():
         assert path.read_bytes() == data
+
+
+def test_brush_retains_only_latest_snapshots(brush_dataset, brush_process, monkeypatch):
+    """A long pass must not keep every raw export and every superseded preview."""
+    model, session, dataset = brush_dataset
+    monkeypatch.setenv("BRUSH_TEST_MODE", "series")
+    published = []
+
+    def progress(stage, pct, msg, artifact=None):
+        if artifact:
+            published.append(artifact["iteration"])
+
+    result = run_brush(str(model), str(session), image_dir=str(dataset),
+                       max_steps=4, export_every=1, progress=progress)
+    assert result["ok"] is True and result["iteration"] == 4
+    assert len(set(published)) >= 3
+    run_dir = Path(result["splat_path"]).parent.parent
+    kept = {p.name for p in (run_dir / "published").glob("export_*.ply")}
+    assert "export_4.ply" in kept and len(kept) <= 2
+    assert not list((run_dir / "exports").glob("export_*.ply"))
 
 
 def test_brush_cancel_reaps_process(brush_dataset, brush_process, monkeypatch, tmp_path):

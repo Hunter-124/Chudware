@@ -16,16 +16,15 @@ import json
 from typing import Any, Optional
 
 from . import core_bridge as cb
+from ._envelopes import dumps as _envelope_dumps, error_payload
 
 
 def _dumps(payload: Any) -> str:
-    return json.dumps(payload, indent=2, default=str)
+    return _envelope_dumps(payload, default=str)
 
 
 def _err(exc: BaseException | str, **extra: Any) -> str:
-    msg = str(exc)
-    out: dict[str, Any] = {"ok": False, "error": msg, **extra}
-    return _dumps(out)
+    return _dumps(error_payload(str(exc), **extra))
 
 
 def _estimate_tokens(obj: Any) -> int:

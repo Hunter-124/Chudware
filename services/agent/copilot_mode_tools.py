@@ -2,10 +2,8 @@
 
 Contract (frozen): contracts/copilot_modes.md — the machine-readable data lives
 in contracts/copilot_modes.json (``aicad.copilot_modes/1``) and is loaded at
-import time below; this module keeps NO private copy of the sets so the Python
-(MCP/DAG) and C++ (in-app, core/agent/copilot_modes.cpp) runtimes cannot
-diverge. Parity: services/agent/test_copilot_modes_parity.py vs
-core/tests/test_copilot_modes.cpp over the same mode × tool matrix.
+import time below; this module keeps NO private copy of the sets. Parity of the
+mode × tool matrix: services/agent/test_copilot_modes_parity.py.
 
   options.mode ∈ agent|plan|swarm|edit|ask
   Mode gates the tool set applied at agent_turn.run_turn (intersected with any
@@ -20,7 +18,7 @@ Policies:
   * edit  — doc-scoped mutating tools; shared defaults still include new_part
             / close / import so edit can finish a simple part.
   * agent — full (None = unrestricted at mode layer; role card still applies)
-  * swarm — full + explicit corporate/delegate tools kept in the set
+  * swarm — full + the delegate/coordination tools kept in the set
 
 Subagents (``delegate``) stay available in services/agent/swarm/edit/plan. Ask also
 gets shared defaults (doc lifecycle + advise + web) so it never dead-ends.
@@ -76,7 +74,7 @@ ASK_TOOLS: frozenset[str] = frozenset(_CONTRACT["mode_tools"]["ask"])
 # pass role_tools=None for plan.
 PLAN_TOOLS: frozenset[str] = frozenset(_CONTRACT["mode_tools"]["plan"])
 
-# Edit: mutate current doc; no new_part / mission / corporate activate.
+# Edit: mutate current doc; no new_part / mission.
 EDIT_TOOLS: frozenset[str] = frozenset(_CONTRACT["mode_tools"]["edit"])
 
 # Explicit denylists used when intersecting open-ended role cards.
@@ -229,12 +227,12 @@ def apply_preference_tools(allowed, preferences, *, mode=None):
         tools -= set(MUTATING_TOOLS) | set(_MUTATING_TOOLS) | {
             "new_part", "new_assembly", "close_part", "save_part", "import_part",
             "export_part", "fs_write", "fs_edit", "run_shell", "mission_start",
-            "corporate_activate", "delegate", "run_dag",
+            "delegate", "run_dag",
         }
     if preferences.delegation_depth == 0:
-        tools -= {"delegate", "mission_start", "corporate_activate", "run_dag"}
+        tools -= {"delegate", "mission_start", "run_dag"}
     if not preferences.advisor:
-        tools -= {"advise", "council", "council_run"}
+        tools.discard("advise")
     if not preferences.task_list:
         tools.discard("task_list")
     if preferences.verify_battery and tools.intersection(set(MUTATING_TOOLS) | set(_MUTATING_TOOLS)):
@@ -340,7 +338,7 @@ def mode_options_from_mapping(options: Any | None) -> dict[str, Any]:
     """Normalize a host/core ``options`` mapping into mode-related fields.
 
     Keys (all optional):
-      mode, plan_only, approved_plan, execute_as, corporate_force, scope, advisor
+      mode, plan_only, approved_plan, execute_as, advisor
     """
     if not isinstance(options, dict):
         options = {}
@@ -351,17 +349,11 @@ def mode_options_from_mapping(options: Any | None) -> dict[str, Any]:
     execute_as = str(options.get("execute_as") or "").strip().lower()
     if execute_as not in ("agent", "swarm", ""):
         execute_as = ""
-    corporate_force = bool(options.get("corporate_force", False))
-    if mode == "swarm":
-        corporate_force = True
     advisor = options.get("advisor")
     if advisor is None:
         advisor = True
     else:
         advisor = bool(advisor)
-    scope = options.get("scope")
-    if scope is not None and not isinstance(scope, dict):
-        scope = None
     approved_plan = options.get("approved_plan")
     if approved_plan is not None and not isinstance(approved_plan, str):
         approved_plan = str(approved_plan)
@@ -370,7 +362,5 @@ def mode_options_from_mapping(options: Any | None) -> dict[str, Any]:
         "plan_only": plan_only,
         "approved_plan": approved_plan,
         "execute_as": execute_as or None,
-        "corporate_force": corporate_force,
-        "scope": scope,
         "advisor": advisor,
     }

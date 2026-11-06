@@ -105,6 +105,8 @@ public:
     // SimManager. A pending completion must block a new launch, otherwise launch()
     // clears job_.ready and silently discards the first study's result. A reservation closes
     // the prep-to-launch TOCTOU across document managers without pretending a solve is running.
+    // This is an ownership/launch guard, not a continuous-redraw request. The GUI uses
+    // bounded progress cadence while busy and is woken immediately for streamed results.
     bool busy() const {
         return reservationToken_.load() != 0 || cancelInFlight_.load() ||
                job_.running.load() || job_.ready.load();

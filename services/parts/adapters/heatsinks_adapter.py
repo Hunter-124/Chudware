@@ -78,16 +78,34 @@ _CATALOG: list = [
      11.00),
 ]
 
+# Display names retain the nominal dimensions and mounting/form variants from
+# the catalog; the original descriptions remain searchable as aliases.
+_DISPLAY_NAMES = {
+    "HS-TO220-CLIP-19": ("TO-220 Clip-On Heatsink 19×13×13 mm", "TO-220 Heatsink"),
+    "HS-TO220-VERT-35": ("TO-220 Vertical-Fin Heatsink 35×13×33 mm", "TO-220 Heatsink"),
+    "HS-BGA-14": ("BGA Push-Pin/Adhesive Heatsink 14×14×10 mm", "BGA Heatsink"),
+    "HS-BGA-19": ("BGA Adhesive Heatsink 19×19×11 mm", "BGA Heatsink"),
+    "HS-BGA-27": ("BGA Adhesive Heatsink 27×27×12 mm", "BGA Heatsink"),
+    "HS-EXTR-35SQ": ("Extruded Heatsink 35×35×15 mm", "Extruded Heatsink"),
+    "HS-EXTR-40SQ-20": ("Extruded Heatsink 40×40×20 mm", "Extruded Heatsink"),
+    "HS-EXTR-50SQ-25": ("Extruded Heatsink 50×50×25 mm", "Extruded Heatsink"),
+    "HS-EXTR-60X40": ("Extruded Heatsink 60×40×25 mm", "Extruded Heatsink"),
+    "HS-EXTR-100X69": ("Extruded Heatsink 100×69×36 mm", "Extruded Heatsink"),
+}
+
 
 def _make_record(designation: str, title: str, params: dict, cost_usd) -> dict:
     p = dict(params)
     p["material"] = "aluminum"
     if cost_usd is not None:
         p["cost_usd"] = cost_usd
+    display_title, family = _DISPLAY_NAMES[designation]
     return {
         "part_id":      f"{_DOMAIN}:heatsink:{designation}",
         "domain":       _DOMAIN,
-        "title":        f"{title} heatsink heat sink",
+        "title":        display_title,
+        "family":       family,
+        "aliases":      [title, "heat sink"],
         "standard":     "",
         "designation":  designation,
         "params":       p,
@@ -121,7 +139,8 @@ class HeatsinksAdapter:
         if not norm:
             return recs
         return [r for r in recs
-                if norm in r["title"].lower() or norm in r["designation"].lower()]
+                if norm in r["title"].lower() or norm in r["designation"].lower()
+                or any(norm in alias.lower() for alias in r["aliases"])]
 
     def get(self, part_id: str) -> dict | None:
         for rec in self.iter_records():

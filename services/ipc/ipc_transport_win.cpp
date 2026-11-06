@@ -116,6 +116,8 @@ PipeIoResult pipeIo(HANDLE pipe, HANDLE event, HANDLE stopped, bool write,
 }  // namespace
 
 // ------------------------------------------------------------------ IpcConn
+long IpcConn::peerPid() const { return -1; }
+
 
 IpcConn::IpcConn(void* pipeHandle) {
     if (pipeHandle == INVALID_HANDLE_VALUE) pipeHandle = nullptr;
@@ -146,6 +148,14 @@ IpcConn& IpcConn::operator=(IpcConn&& o) noexcept {
         o.readBuf_.clear();
     }
     return *this;
+}
+
+bool IpcConn::peerDisconnected() const {
+    if (!h_ || eof()) return true;
+    if (PeekNamedPipe((HANDLE)h_, nullptr, 0, nullptr, nullptr, nullptr)) return false;
+    const DWORD error = GetLastError();
+    return error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED ||
+           error == ERROR_NO_DATA || error == ERROR_INVALID_HANDLE;
 }
 
 void IpcConn::close() {
@@ -464,10 +474,15 @@ void IpcListener::close(bool /*unlink_path*/) {
 
 // ------------------------------------------------------------------ connectTo
 
-IpcConn connectTo(const std::string& path, std::string& err) {
+IpcConn connectTo(const std::string& path, std::string& err,
+                  const std::atomic<bool>* cancelled) {
     const std::wstring wpath = widen(path);
     HANDLE h = INVALID_HANDLE_VALUE;
     for (int attempt = 0; attempt < 3; ++attempt) {
+        if (cancelled && cancelled->load(std::memory_order_acquire)) {
+            err = "aborted";
+            return IpcConn();
+        }
         h = CreateFileW(wpath.c_str(), GENERIC_READ | GENERIC_WRITE,
                         /*no sharing*/ 0, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED,
                         nullptr);
@@ -479,9 +494,17 @@ IpcConn connectTo(const std::string& path, std::string& err) {
         }
         // All instances momentarily busy (unlimited instances makes this rare —
         // just the gap between accept and create-next). Wait briefly and retry.
-        if (!WaitNamedPipeW(wpath.c_str(), 1000)) {
-            err = winErr(("WaitNamedPipeW " + path).c_str(), GetLastError());
-            return IpcConn();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (!WaitNamedPipeW(wpath.c_str(), cancelled ? 50 : 1000)) {
+            const DWORD code = GetLastError();
+            if (cancelled && cancelled->load(std::memory_order_acquire)) {
+                err = "aborted";
+                return IpcConn();
+            }
+            if (code != ERROR_SEM_TIMEOUT || std::chrono::steady_clock::now() >= deadline) {
+                err = winErr(("WaitNamedPipeW " + path).c_str(), code);
+                return IpcConn();
+            }
         }
     }
     if (h == INVALID_HANDLE_VALUE) {

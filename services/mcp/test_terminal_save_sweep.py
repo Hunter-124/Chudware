@@ -14,8 +14,8 @@ tabs when he accepted the prompt.
 doc.closed and destroy the GUI mirror tab the user browses after a run, which is the very
 reason agent-origin docs get the long GC floor.
 
-These pin the scope rules that make it safe — the user's own documents are never touched,
-and no file is written for a document that holds nothing.
+The sweep persists only this turn's touched documents and never silently saves
+outstanding human edits, irrespective of which client opened the document.
 
 Run:  python3 -m pytest services/mcp/test_terminal_save_sweep.py -q -p no:randomly
 """
@@ -98,14 +98,38 @@ def sweep(monkeypatch, tmp_path):
     def _install(docs, *, touched=(), project_dir=save_dir, studies=None):
         fake = _FakeEngine(docs, passthrough=real_call, studies=studies)
         monkeypatch.setattr(C.cb, "call", fake.call)
-        monkeypatch.setattr(C, "_TOUCHED_DOCS", list(touched))
         if project_dir is None:
             monkeypatch.delenv("CHUDWARE_PROJECT_SAVE_DIR", raising=False)
         else:
             monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(project_dir))
+        monkeypatch.setattr(C, "_TOUCHED_DOCS", {})
+        for did in touched:
+            C.note_touched_doc(did, row=next((row for row in fake.docs
+                                              if row.get("doc_id") == did), None))
         return fake
 
     return _install
+
+
+def test_terminal_rollback_warnings_use_current_touched_tree(sweep, monkeypatch):
+    sweep([], touched=["partial", "complete"])
+    trees = {
+        "partial": {"rollback_after": "f1", "features": [
+            {"id": "f1"}, {"id": "f7"}, {"id": "f8"}]},
+        "complete": {"rollback_after": "f3", "features": [{"id": "f3"}]},
+    }
+    monkeypatch.setattr(C.cb, "call", lambda method, args: {"tree": trees[args["doc_id"]]})
+    warnings = C.touched_rollback_warnings()
+    assert len(warnings) == 1
+    assert warnings[0]["doc_id"] == "partial"
+    assert warnings[0]["after"] == "f1"
+    assert warnings[0]["hidden_features"] == ["f7", "f8"]
+    assert all(fid in warnings[0]["warning"] for fid in ("f1", "f7", "f8"))
+    trees["partial"]["rollback_after"] = "start"
+    warnings = C.touched_rollback_warnings()
+    assert warnings[0]["after"] == "start"
+    assert warnings[0]["hidden_features"] == ["f1", "f7", "f8"]
+
 
 
 def test_an_unsaved_agent_part_is_written_to_the_project_folder(sweep, tmp_path):
@@ -139,6 +163,8 @@ def test_a_doc_already_in_a_real_clean_file_is_left_alone(sweep, tmp_path):
     """Idempotence: the sweep runs on every turn AND in the crash path, so a document
     that hostd would not retire must not be rewritten."""
     existing = tmp_path / "Projects" / "Testing" / "bracket.step+"
+    existing.parent.mkdir(parents=True)
+    existing.write_text("saved")
     fake = sweep(
         [
             {
@@ -185,9 +211,8 @@ def test_the_users_own_document_is_never_touched(sweep):
     assert out["saved"] == []
 
 
-def test_a_touched_doc_that_the_gui_adopted_is_still_left_alone(sweep):
-    """Adoption transfers ownership: once origin is gui the user's save decisions win,
-    even for a document this worker created earlier in the run."""
+def test_a_touched_doc_with_human_edits_is_left_for_the_human(sweep):
+    """An agent must not silently commit a human's unsaved changes."""
     fake = sweep(
         [
             {
@@ -196,6 +221,7 @@ def test_a_touched_doc_that_the_gui_adopted_is_still_left_alone(sweep):
                 "kind": "part",
                 "feature_count": 5,
                 "dirty": True,
+                "human_dirty": True,
                 "path": "",
                 "origin_kind": "gui",
             }
@@ -206,11 +232,17 @@ def test_a_touched_doc_that_the_gui_adopted_is_still_left_alone(sweep):
 
     assert fake.saves == []
     assert out["saved"] == []
+    assert out["skipped_human_edits"] == [{"doc_id": "d1", "name": "holster"}]
+    assert out["persistence_failure"]["reason"] == "skipped_human_edits"
+    assert "d1" in C._TOUCHED_DOCS[C._touch_scope()]
+    fake.docs[0]["human_dirty"] = False
+    retry = C.save_touched_docs()
+    assert [row["doc_id"] for row in retry["saved"]] == ["d1"]
+    assert "d1" not in C._TOUCHED_DOCS.get(C._touch_scope(), {})
 
 
-def test_an_empty_doc_never_becomes_a_file(sweep):
-    """hostd purges empty docs instead of retiring them, so there is nothing to rescue —
-    and a stub .step+ in the user's project folder is exactly the clutter being fixed."""
+def test_an_empty_touched_doc_is_saved(sweep):
+    """A created document is authored work even before geometry is added."""
     fake = sweep(
         [
             {
@@ -228,8 +260,8 @@ def test_an_empty_doc_never_becomes_a_file(sweep):
     )
     out = C.save_touched_docs()
 
-    assert fake.saves == []
-    assert out["saved"] == []
+    assert [s[0] for s in fake.saves] == ["d1"]
+    assert out["saved"][0]["doc_id"] == "d1"
 
 
 def test_a_study_only_doc_is_saved(sweep, tmp_path):
@@ -306,14 +338,8 @@ def test_an_assembly_is_swept_on_its_component_count(sweep):
     assert out["saved"][0]["name"] == "motor_mount"
 
 
-def test_a_pristine_import_of_an_existing_file_is_not_written_to_the_project(
-    sweep, tmp_path
-):
-    """An agent's body-roster probe (`import_part(..., keep_bodies=[...])`) was written
-    into the project root as `_frame624_2026-09-07.step+` beside the STEP it came from
-    (2026-09-24). A doc that is only an unmodified import of a file still on disk is
-    reproducible scratch; hostd closes it at GC without a recovery row for the same
-    reason. Authored content after the import, or a vanished source, is real work."""
+def test_a_touched_import_is_persisted_even_when_source_is_reproducible(sweep, tmp_path):
+    """A source file does not prove that later metadata or other edits are persisted."""
     source = tmp_path / "depricated" / "_frame624_2026-09-07.step"
     source.parent.mkdir(parents=True)
     source.write_text("ISO-10303-21;\n")
@@ -333,11 +359,8 @@ def test_a_pristine_import_of_an_existing_file_is_not_written_to_the_project(
     )
     out = C.save_touched_docs()
 
-    assert [s[0] for s in fake.saves] == ["d-placed", "d-orphaned"]
-    assert out["skipped"] == [
-        {"doc_id": "d-probe", "name": "_frame624_2026-09-07",
-         "reason": "reproducible_import", "source_paths": [str(source)]}
-    ]
+    assert [s[0] for s in fake.saves] == ["d-probe", "d-placed", "d-orphaned"]
+    assert out["skipped"] == []
     assert out["persistence_failure"] is None
 
 
@@ -399,7 +422,7 @@ def test_detached_recovery_snapshot_still_gets_a_real_deliverable(
         "feature_count": 2, "revision": 0, "dirty": False, "path": None,
         "native_source_path": str(source), "reproducible_from": [str(source)],
         "origin_kind": "agent",
-    }])
+    }], touched=["d-recovered"])
     out = C.save_touched_docs()
     assert out["saved"][0]["doc_id"] == "d-recovered"
     assert fake.saves == [("d-recovered", str(
@@ -408,10 +431,8 @@ def test_detached_recovery_snapshot_still_gets_a_real_deliverable(
 
 
 
-def test_an_agent_origin_doc_this_process_never_touched_is_still_swept(sweep):
-    """A doc left by an earlier worker is absent from this process's registry.
-    Agent attribution still covers it when no other writer holds it, so abandoned
-    unsaved docs do not get stranded."""
+def test_an_untouched_agent_origin_doc_is_not_swept(sweep):
+    """A different turn's work must never be assigned this turn's workspace."""
     fake = sweep(
         [
             {
@@ -428,7 +449,8 @@ def test_an_agent_origin_doc_this_process_never_touched_is_still_swept(sweep):
     )
     out = C.save_touched_docs()
 
-    assert [s[0] for s in fake.saves] == ["d-earlier"]
+    assert fake.saves == []
+    assert out["saved"] == []
 
 
 def test_sweep_skips_untouched_docs_held_by_another_writer(sweep, monkeypatch, tmp_path):
@@ -461,7 +483,7 @@ def test_sweep_skips_untouched_docs_held_by_another_writer(sweep, monkeypatch, t
     monkeypatch.setattr(C, "_project_save", project_save)
     out = C.save_touched_docs()
 
-    assert saved == ["d-unclaimed", "d-touched"]
+    assert saved == ["d-touched"]
     assert [row["doc_id"] for row in out["saved"]] == saved
     assert out["errors"] == []
     assert out["persistence_failure"] is None
@@ -495,6 +517,184 @@ def test_a_touched_dirty_doc_without_a_project_folder_is_a_persistence_failure(s
     }
 
 
+def test_touched_bound_file_saves_without_project_directory(sweep, tmp_path):
+    destination = tmp_path / "opened.step+"
+    destination.write_text("old")
+    fake = sweep([{"doc_id": "d1", "name": "opened", "dirty": True,
+                   "path": str(destination), "origin_kind": "gui"}],
+                 touched=["d1"], project_dir=None)
+    out = C.save_touched_docs()
+    assert fake.saves == [("d1", str(destination))]
+    assert out["saved"][0]["path"] == str(destination)
+    assert out["persistence_failure"] is None
+
+
+@pytest.mark.parametrize("reopened", [False, True])
+def test_missing_saved_document_uses_revision_receipt(sweep, monkeypatch, tmp_path, reopened):
+    path = tmp_path / "bracket.step+"
+    path.write_text("old")
+    row = {"doc_id": "old", "name": "bracket", "path": str(path), "dirty": True,
+           "revision": 5, "metadata_revision": 2}
+    fake = sweep([row], touched=["old"])
+    path.write_text("saved revision five")
+    stamp = C._file_stamp(str(path))
+    fake.docs[0].update(dirty=False, saved_revision=5, saved_metadata_revision=2,
+                        file_stamp=stamp)
+    monkeypatch.setattr(C.cb, "_document_row", lambda _doc: dict(fake.docs[0]))
+    C.note_document_saved("old", {"path": str(path), "saved_revision": 5,
+                                  "metadata_revision": 2})
+    fake.docs = ([{"doc_id": "new", "name": "bracket", "path": str(path),
+                   "file_stamp": stamp}] if reopened else [])
+
+    out = C.save_touched_docs()
+
+    assert out["errors"] == [] and out["warnings"] == []
+    assert out["skipped"][0]["reason"] == ("reopened" if reopened else "already_saved")
+    assert out["skipped"][0]["path"] == str(path)
+    if reopened:
+        assert out["skipped"][0]["open_doc_id"] == "new"
+    assert "old" not in C._TOUCHED_DOCS.get(C._touch_scope(), {})
+
+
+def test_missing_already_saved_revision_is_not_reported_lost(sweep, tmp_path):
+    path = tmp_path / "already-saved.step+"
+    path.write_text("saved")
+    row = {"doc_id": "old", "name": "bracket", "path": str(path), "dirty": False,
+           "revision": 4, "metadata_revision": 2, "saved_revision": 4,
+           "saved_metadata_revision": 2, "file_stamp": C._file_stamp(str(path))}
+    fake = sweep([row], touched=["old"])
+    fake.docs = []
+    out = C.save_touched_docs()
+    assert out["skipped"][0]["reason"] == "already_saved"
+    assert out["errors"] == [] and out["warnings"] == []
+
+
+@pytest.mark.parametrize(("same_session", "revision", "metadata_revision", "preserved"), [
+    (True, 5, 2, True),
+    (False, 5, 2, False),
+    (True, 4, 2, False),
+    (True, 5, 1, False),
+])
+def test_missing_document_requires_current_recovery_snapshot(
+        sweep, monkeypatch, same_session, revision, metadata_revision, preserved):
+    row = {"doc_id": "old", "name": "bracket", "dirty": True,
+           "revision": 5, "metadata_revision": 2}
+    fake = sweep([row], touched=["old"])
+    fake.docs = []
+    entry = {"id": "snapshot-1", "doc_id": "old", "same_session": same_session,
+             "revision": revision, "metadata_revision": metadata_revision}
+    engine_call = fake.call
+    monkeypatch.setattr(C.cb, "active_daemon_mode", lambda: True)
+    monkeypatch.setattr(C.cb, "call", lambda method, params=None:
+                        {"entries": [entry]} if method == "recovery_list"
+                        else engine_call(method, params))
+
+    out = C.save_touched_docs()
+
+    assert out["errors"] == []
+    if preserved:
+        assert out["skipped"][0]["reason"] == "preserved_in_recovery"
+        assert out["skipped"][0]["recovery_id"] == "snapshot-1"
+        assert out["warnings"] == []
+    else:
+        assert out["skipped"] == []
+        assert out["warnings"][0]["reason"] == "missing_unverified"
+        assert "old" in C._TOUCHED_DOCS[C._touch_scope()]
+
+
+def test_reopened_path_without_a_saved_revision_is_not_proof(sweep, monkeypatch, tmp_path):
+    path = tmp_path / "bracket.step+"
+    path.write_text("old version")
+    row = {"doc_id": "old", "path": str(path), "dirty": True,
+           "revision": 5, "metadata_revision": 2}
+    fake = sweep([row], touched=["old"])
+    fake.docs = [{"doc_id": "new", "path": str(path), "file_stamp": C._file_stamp(str(path))}]
+    monkeypatch.setattr(C.cb, "active_daemon_mode", lambda: False)
+    out = C.save_touched_docs()
+    assert out["skipped"] == [] and out["errors"] == []
+    assert out["warnings"][0]["reason"] == "missing_unverified"
+    assert out["warnings"][0]["path"] == str(path)
+
+
+def test_reopened_replaced_file_does_not_certify_the_old_revision(sweep, monkeypatch, tmp_path):
+    path = tmp_path / "bracket.step+"
+    path.write_text("saved old revision")
+    row = {"doc_id": "old", "path": str(path), "dirty": False,
+           "revision": 5, "metadata_revision": 2, "saved_revision": 5,
+           "saved_metadata_revision": 2, "file_stamp": C._file_stamp(str(path))}
+    fake = sweep([row], touched=["old"])
+    path.write_text("unrelated replacement contents")
+    fake.docs = [{"doc_id": "new", "path": str(path), "file_stamp": C._file_stamp(str(path))}]
+    monkeypatch.setattr(C.cb, "active_daemon_mode", lambda: False)
+    out = C.save_touched_docs()
+    assert out["skipped"] == [] and out["errors"] == []
+    assert out["warnings"][0]["reason"] == "missing_unverified"
+
+
+def test_later_mutation_invalidates_saved_receipt(sweep, monkeypatch, tmp_path):
+    path = tmp_path / "bracket.step+"
+    path.write_text("saved")
+    row = {"doc_id": "old", "path": str(path), "dirty": False, "revision": 5,
+           "metadata_revision": 2, "saved_revision": 5, "saved_metadata_revision": 2,
+           "file_stamp": C._file_stamp(str(path))}
+    fake = sweep([row], touched=["old"])
+    C.note_touched_doc("old", row={**row, "dirty": True, "revision": 6})
+    fake.docs = []
+    monkeypatch.setattr(C.cb, "active_daemon_mode", lambda: False)
+    out = C.save_touched_docs()
+    assert out["skipped"] == [] and out["errors"] == []
+    assert out["warnings"][0]["reason"] == "missing_unverified"
+
+
+def test_out_of_order_touch_reports_keep_newest_revisions(sweep, monkeypatch, tmp_path):
+    path = tmp_path / "bracket.step+"
+    path.write_text("revision five")
+    row = {"doc_id": "old", "path": str(path), "dirty": False, "revision": 5,
+           "metadata_revision": 2, "saved_revision": 5, "saved_metadata_revision": 2,
+           "file_stamp": C._file_stamp(str(path))}
+    fake = sweep([row], touched=[])
+    C.note_touched_doc("old", row={**row, "dirty": True, "revision": 6,
+                                  "metadata_revision": 3})
+    C.note_touched_doc("old", row=row)  # a delayed result from an older concurrent call
+    fake.docs = []
+    monkeypatch.setattr(C.cb, "active_daemon_mode", lambda: False)
+    out = C.save_touched_docs()
+    assert out["skipped"] == [] and out["errors"] == []
+    assert out["warnings"][0]["reason"] == "missing_unverified"
+
+
+def test_sweep_does_not_retire_a_newer_mutation(sweep, monkeypatch, tmp_path):
+    row = {"doc_id": "old", "name": "bracket", "dirty": True,
+           "revision": 5, "metadata_revision": 2}
+    sweep([row], touched=["old"])
+    def save(_doc, _name):
+        C.note_touched_doc("old", row={**row, "revision": 6})
+        return str(tmp_path / "bracket.step+")
+    monkeypatch.setattr(C, "_project_save", save)
+    C.save_touched_docs()
+    assert C._TOUCHED_DOCS[C._touch_scope()]["old"]["revision"] == 6
+
+
+def test_document_retired_during_sweep_uses_its_recovery_snapshot(sweep, monkeypatch):
+    row = {"doc_id": "old", "name": "bracket", "dirty": True,
+           "revision": 5, "metadata_revision": 2}
+    fake = sweep([row], touched=["old"])
+    engine_call = fake.call
+    entry = {"id": "snapshot", "doc_id": "old", "same_session": True,
+             "revision": 5, "metadata_revision": 2}
+    monkeypatch.setattr(C.cb, "active_daemon_mode", lambda: True)
+    monkeypatch.setattr(C.cb, "call", lambda method, params=None:
+                        {"entries": [entry]} if method == "recovery_list"
+                        else engine_call(method, params))
+    def disappear(_doc, _name):
+        fake.docs = []
+        raise C.CoreError("document is gone", code="document_not_found")
+    monkeypatch.setattr(C, "_project_save", disappear)
+    out = C.save_touched_docs()
+    assert out["errors"] == [] and out["warnings"] == []
+    assert out["skipped"][0]["reason"] == "preserved_in_recovery"
+
+
 def test_a_doc_list_failure_is_reported_not_raised(sweep):
     """The sweep runs in a `finally` on the crash path. Raising there would replace the
     real failure with this one."""
@@ -507,17 +707,22 @@ def test_a_doc_list_failure_is_reported_not_raised(sweep):
     out = C.save_touched_docs()
 
     assert out["saved"] == []
-    assert out["errors"] and "daemon gone" in out["errors"][0]
+    assert out["errors"] == []
+    assert out["warnings"][0]["reason"] == "doc_list_unavailable"
+    assert "daemon gone" in out["warnings"][0]["error"]
 
 
-def test_the_box_mirror_is_started_never_awaited(sweep, monkeypatch):
+def test_the_box_mirror_is_started_never_awaited(sweep, monkeypatch, tmp_path):
     """A cloud upload must never sit between the model's last word and the turn's
     return. It used to: the sweep drained the Box spool with `block=True,
     budget_s=90`, so with a backlogged spool every chat message stayed at
     "Thinking…" for 90 s after the agent had finished (measured 5.5 s turn +
     90.2 s drain). The persistent services worker keeps a daemon drain alive, and
     worker_main drains what is left at shutdown."""
-    sweep([], touched=[])
+    existing = tmp_path / "existing.step+"
+    existing.write_text("saved")
+    sweep([{"doc_id": "d1", "name": "part", "dirty": False,
+            "path": str(existing)}], touched=["d1"])
     from services.plm import box_mirror
 
     calls: list = []
@@ -536,14 +741,14 @@ def test_the_box_mirror_is_started_never_awaited(sweep, monkeypatch):
 
 
 def test_note_touched_doc_keeps_build_order_and_dedupes(monkeypatch):
-    monkeypatch.setattr(C, "_TOUCHED_DOCS", [])
+    monkeypatch.setattr(C, "_TOUCHED_DOCS", {})
     C.note_touched_doc("d2")
     C.note_touched_doc("d1")
     C.note_touched_doc("d2")
     C.note_touched_doc(None)
     C.note_touched_doc("")
 
-    assert C._TOUCHED_DOCS == ["d2", "d1"]
+    assert list(C._TOUCHED_DOCS[C._touch_scope()]) == ["d2", "d1"]
 
 
 def test_agent_admin_turn_rejects_explicit_invalid_workspace_before_provider(
@@ -585,7 +790,7 @@ def test_crash_save_runs_and_surfaces_all_finalization_faults(monkeypatch):
 
     monkeypatch.setattr(
         worker_rpc,
-        "chudcode_agent_turn",
+        "omp_agent_turn",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("turn crashed")),
     )
 
@@ -604,7 +809,7 @@ def test_crash_save_runs_and_surfaces_all_finalization_faults(monkeypatch):
     monkeypatch.setattr(
         C,
         "save_touched_docs",
-        lambda: sweeps.append("save") or persistence,
+        lambda **kwargs: sweeps.append("save") or persistence,
     )
 
     # Select a model explicitly: Auto's live catalog/auth discovery is unrelated
@@ -645,12 +850,11 @@ def test_a_discarded_doc_the_daemon_kept_alive_is_not_swept_over_its_file(
     engine_call = fake.call
 
     def call(method, params=None):
-        if method == "doc_close":
+        if method in ("doc_close", "doc_discard"):
             return {"detached": True, "note": "an agent run still owns this doc"}
         return engine_call(method, params)
 
     monkeypatch.setattr(C.cb, "call", call)
-    monkeypatch.setattr(C, "_DISCARDED_DOCS", {})
     from services.agent.agent_turn import _bind_tool
 
     closed = _bind_tool("close_part")(doc_id="doc-stale", discard=True)
@@ -660,4 +864,244 @@ def test_a_discarded_doc_the_daemon_kept_alive_is_not_swept_over_its_file(
 
     assert fake.saves == []
     assert target.read_text() == "rebuilt"
-    assert {"doc_id": "doc-stale", "name": "Wheel End", "reason": "discarded"} in out["skipped"]
+    assert not any(row["doc_id"] == "doc-stale" for row in out["saved"])
+
+
+def test_sweeps_are_isolated_by_turn_and_workspace(sweep, tmp_path):
+    from services.agent.request_context import bind_roots
+
+    project_a, project_b = tmp_path / "a", tmp_path / "b"
+    docs = [{"doc_id": did, "name": did, "dirty": True, "path": "",
+             "feature_count": 1, "origin_kind": "gui"} for did in ("a", "b", "c")]
+    fake = sweep(docs, touched=[], project_dir=project_a)
+    with bind_roots(str(project_a)), C.agent_doc_context("agent", scope="turn-a"):
+        C.note_touched_doc("a")
+    with bind_roots(str(project_a)), C.agent_doc_context("agent", scope="turn-b"):
+        C.note_touched_doc("b")
+    with bind_roots(str(project_b)), C.agent_doc_context("agent", scope="turn-a"):
+        C.note_touched_doc("c")
+    with bind_roots(str(project_a)):
+        out = C.save_touched_docs(run_id="turn-a")
+    assert [row["doc_id"] for row in out["saved"]] == ["a"]
+    assert fake.saves == [("a", str(project_a / "a.step+"))]
+    with bind_roots(str(project_b)):
+        out = C.save_touched_docs(run_id="turn-a")
+    assert [row["doc_id"] for row in out["saved"]] == ["c"]
+    with bind_roots(str(project_a)):
+        out = C.save_touched_docs(run_id="turn-b")
+    assert [row["doc_id"] for row in out["saved"]] == ["b"]
+
+
+def test_same_save_root_does_not_merge_distinct_workspaces(monkeypatch, tmp_path):
+    from services.agent.request_context import bind_roots
+
+    monkeypatch.setattr(C, "_TOUCHED_DOCS", {})
+    shared = str(tmp_path / "shared")
+    with bind_roots(str(tmp_path / "workspace-a"), shared), C.agent_doc_context("a", scope="run"):
+        C.note_touched_doc("a")
+        scope_a = C._touch_scope()
+    with bind_roots(str(tmp_path / "workspace-b"), shared), C.agent_doc_context("b", scope="run"):
+        C.note_touched_doc("b")
+        scope_b = C._touch_scope()
+    assert scope_a != scope_b
+    assert list(C._TOUCHED_DOCS[scope_a]) == ["a"]
+    assert list(C._TOUCHED_DOCS[scope_b]) == ["b"]
+
+
+def test_bridge_records_all_revision_and_metadata_advances_once(monkeypatch, tmp_path):
+    from services.agent.request_context import bind_roots
+    from services.mcp import core_bridge
+
+    monkeypatch.setattr(C, "_TOUCHED_DOCS", {})
+    monkeypatch.setattr(core_bridge, "active_daemon_mode", lambda: False)
+    row = {"doc_id": "d1", "revision": 0, "metadata_revision": 0}
+
+    def dispatch(method, params=None):
+        if method == "doc_list":
+            return {"docs": [dict(row)]}
+        if method == "doc_set_meta":
+            row["metadata_revision"] += 1
+            return {"ok": True}
+        if method in {"doc_apply_ops", "config_add", "sim_study_add"}:
+            row["revision"] += 1
+            return {"ok": True, "revision": row["revision"]}
+        return {"ok": False}
+
+    monkeypatch.setattr(core_bridge, "_dispatch_call", dispatch)
+    with bind_roots(str(tmp_path)), C.agent_doc_context("agent", scope="run-1"):
+        for method in ("doc_apply_ops", "config_add", "sim_study_add", "doc_set_meta"):
+            core_bridge.call(method, {"doc_id": "d1"})
+        before = C._TOUCHED_DOCS[C._touch_scope()]["d1"]["sequence"]
+        core_bridge.call("doc_apply_ops", {"doc_id": "d1"})
+        assert C._TOUCHED_DOCS[C._touch_scope()]["d1"]["sequence"] > before
+        before = C._TOUCHED_DOCS[C._touch_scope()]["d1"]
+        core_bridge.call("unknown_failure", {"doc_id": "d1"})
+        assert C._TOUCHED_DOCS[C._touch_scope()]["d1"] == before
+
+
+@pytest.mark.parametrize("preserve_path", [False, True])
+def test_bridge_records_only_real_saves_for_touched_revisions(
+        monkeypatch, tmp_path, preserve_path):
+    from services.agent.request_context import bind_roots
+    from services.mcp import core_bridge
+
+    monkeypatch.setattr(C, "_TOUCHED_DOCS", {})
+    monkeypatch.setattr(core_bridge, "active_daemon_mode", lambda: False)
+    path = tmp_path / "bracket.step+"
+    path.write_text("old")
+    row = {"doc_id": "d1", "name": "bracket", "path": str(path), "dirty": False,
+           "revision": 0, "metadata_revision": 0}
+    docs = [row]
+
+    def dispatch(method, params=None):
+        if method == "doc_list":
+            return {"docs": [dict(doc) for doc in docs]}
+        if method == "doc_apply_ops":
+            row.update(revision=1, metadata_revision=1, dirty=True)
+            return {"ok": True, "revision": 1}
+        if method == "doc_save":
+            path.write_text("snapshot" if preserve_path else "saved")
+            if not preserve_path:
+                row.update(dirty=False, saved_revision=1, saved_metadata_revision=1,
+                           file_stamp=C._file_stamp(str(path)))
+            return {"ok": True, "path": str(path), "saved_revision": 1,
+                    "metadata_revision": 1}
+        return {"ok": False}
+
+    monkeypatch.setattr(core_bridge, "_dispatch_call", dispatch)
+    with bind_roots(str(tmp_path)), C.agent_doc_context("agent", scope="run-1"):
+        core_bridge.call("doc_apply_ops", {"doc_id": "d1"})
+        core_bridge.call("doc_save", {"doc_id": "d1", "path": str(path),
+                                      "preserve_path": preserve_path})
+        docs.clear()
+        out = C.save_touched_docs(run_id="run-1")
+    if preserve_path:
+        assert out["skipped"] == []
+        assert out["warnings"][0]["reason"] == "missing_unverified"
+    else:
+        assert out["warnings"] == []
+        assert out["skipped"][0]["reason"] == "already_saved"
+
+
+def test_read_lease_upgrades_for_later_mutation(monkeypatch):
+    from services.mcp import core_bridge, daemon_bridge
+
+    class Connection:
+        pass
+
+    connection = Connection()
+    calls = []
+    monkeypatch.setattr(C, "_TOUCHED_DOCS", {})
+    monkeypatch.setattr(core_bridge, "active_daemon_mode", lambda: True)
+    monkeypatch.setattr(daemon_bridge, "client", lambda: connection)
+
+    def dispatch(method, params=None):
+        calls.append((method, dict(params or {})))
+        if method == "doc_list":
+            return {"docs": [{"doc_id": "d1", "revision": 0, "metadata_revision": 0}]}
+        if method == "attach_doc":
+            return {"ok": True, "mode": params["mode"]}
+        return {"ok": True}
+
+    monkeypatch.setattr(core_bridge, "_dispatch_call", dispatch)
+    with C.agent_doc_context("agent", scope="run"):
+        core_bridge.lease_document("d1")
+        core_bridge.lease_document("d1")
+        core_bridge.call("doc_apply_ops", {"doc_id": "d1"})
+    assert [(m, p["mode"]) for m, p in calls if m == "attach_doc"] == [
+        ("attach_doc", "ro"), ("attach_doc", "rw")]
+
+
+@pytest.mark.parametrize("tracked", [True, False])
+def test_read_lease_upgrades_before_guardrail_checkpoint_and_mutation(monkeypatch, tracked):
+    from services.agent import guardrails
+    from services.mcp import core_bridge, daemon_bridge
+
+    class Connection:
+        pass
+
+    class Ledger:
+        def __init__(self):
+            self.events = []
+
+        def append(self, actor, kind, payload):
+            self.events.append((kind, payload))
+
+    connection = Connection()
+    ledger = Ledger()
+    calls = []
+    mode = None if tracked else "ro"
+    checkpointed = False
+    monkeypatch.setattr(C, "_TOUCHED_DOCS", {})
+    monkeypatch.setattr(core_bridge, "active_daemon_mode", lambda: True)
+    monkeypatch.setattr(daemon_bridge, "client", lambda: connection)
+
+    def dispatch(method, params=None):
+        nonlocal mode, checkpointed
+        calls.append(method)
+        if method == "attach_doc":
+            mode = params["mode"]
+            return {"ok": True, "mode": mode}
+        if method == "doc_list":
+            return {"docs": [{"doc_id": "d1", "revision": 0}]}
+        if method == "doc_checkpoint":
+            assert mode == "rw"
+            checkpointed = True
+            return {"checkpoint": "before"}
+        if method == "doc_apply_ops":
+            assert mode == "rw" and checkpointed
+            return {"ok": True}
+        raise AssertionError(method)
+
+    monkeypatch.setattr(core_bridge, "_dispatch_call", dispatch)
+    args = {"doc_id": "d1", "ops": [{"feature": {"type": "shell"}}]}
+    with C.agent_doc_context("agent", scope="run"):
+        if tracked:
+            core_bridge.lease_document("d1")
+        verdict = guardrails.pre_dispatch_checkpoint(
+            "add_features", args, ledger=ledger,
+            cfg={"hard_guardrails": {"auto_checkpoint": True}},
+        )
+        assert verdict is None
+        assert core_bridge.call("doc_apply_ops", args)["ok"]
+    assert calls.index("doc_checkpoint") < calls.index("doc_apply_ops")
+    assert calls.count("attach_doc") == (2 if tracked else 1)
+    assert any(kind == "auto_checkpoint" and payload["checkpoint"] == "before"
+               for kind, payload in ledger.events)
+    assert not any(kind == "hard_guardrail" and payload["outcome"] == "blocked"
+                   for kind, payload in ledger.events)
+
+
+def test_workspace_and_part_reads_lease_returned_documents(monkeypatch):
+    from services.agent.agent_turn import _bind_tool
+    from services.mcp import workspace_tools
+
+    rows = [{"doc_id": "d1", "name": "part", "origin_kind": "gui"}]
+    leased = []
+
+    def engine(method, params=None):
+        if method == "doc_list":
+            return {"docs": rows}
+        if method == "doc_tree":
+            return {"doc_id": "d1", "revision": 0, "tree": {"features": []}}
+        return {}
+
+    monkeypatch.setattr(C.cb, "call", engine)
+    monkeypatch.setattr(C.cb, "lease_document", leased.append)
+    with C.agent_doc_context("agent", scope="turn"):
+        assert json.loads(_bind_tool("get_part")(doc_id="d1"))["ok"]
+        assert json.loads(_bind_tool("list_parts")())["docs"] == rows
+        assert workspace_tools._turn_snapshot("now")["ok"]
+    assert leased == ["d1", "d1", "d1"]
+
+
+def test_workspace_snapshot_does_not_return_unleased_handles(monkeypatch):
+    from services.mcp import workspace_tools
+
+    monkeypatch.setattr(C.cb, "call", lambda *args: {"docs": [{"doc_id": "gone"}]})
+    monkeypatch.setattr(C.cb, "lease_documents",
+                        lambda rows: (_ for _ in ()).throw(RuntimeError("document closed")))
+    result = workspace_tools._turn_snapshot("now")
+    assert result["ok"] is False
+    assert result["reason"] == "document_lease_failed"
+    assert "docs" not in result

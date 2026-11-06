@@ -30,7 +30,7 @@ export PYTHONPATH=$PWD
 # optional:
 #   CHUDWARE_SENSOR_DEMO_OUT=scratch/sensor_node_demo
 #   CHUDWARE_SENSOR_DEMO_THERMAL_DRY=1   # skip live mesh/solve
-~/.local/share/Chudware/mcp-venv/bin/python scripts/demo_sensor_node.py
+.venv-mcp/bin/python scripts/demo_sensor_node.py
 ```
 
 Exit 0 iff every leg is PASS or SKIP (no FAIL). Markers land under

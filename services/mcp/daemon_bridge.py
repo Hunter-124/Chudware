@@ -17,17 +17,24 @@ Semantics preserved vs the legacy in-process ctypes path:
     explicit call reconnects; callers must recover document identity explicitly.
   * Daemon push events (doc.changed etc., Phase 3) buffer in-process; MCP tool
     layers drain them via poll_events() to surface _foreign_edits notes.
-  * A draining hostd (engine rebuilt on disk, or a stop) refuses new clients with a
-    daemon_draining hello error -> DaemonDraining. One daemon serves each binary
+  * A draining hostd (engine rebuilt on disk, or a stop) refuses independent new
+    clients with a daemon_draining hello error -> DaemonDraining. One daemon serves each binary
     path, so no successor can start beside it; core_bridge never falls back to an
     in-process engine on this refusal.
 
-Discovery mirrors ipc_discovery.cpp / ipc_discovery_win.cpp — keep them in sync:
+Discovery mirrors ipc_discovery.cpp / ipc_discovery_win.cpp and engine_backend.cpp's
+hostdBinHint() — keep them in sync:
+  binary = $CHUDWARE_HOSTD_BIN, else the first existing candidate of
+           resolve_hostd_bin(): the hostd beside the GUI executable (the staged
+           $CHUDWARE_DIST payload, then a dev host build dir) before the core dev
+           trees the C++ client walks up to. Every client of one machine must name
+           the SAME binary, or its key below differs and a second daemon starts.
   key    = $CHUDWARE_INSTANCE_KEY or fnv1a64(realpath(hostd binary))
            (Windows: fnv1a64 of the resolved path LOWERCASED — NTFS is
            case-insensitive and the C++ side lowercases before hashing)
   POSIX  = $CHUDWARE_HOSTD_SOCKET or $XDG_RUNTIME_DIR/chudware/hostd-<key>.sock
-           (fallback /tmp/chudware-<uid>/hostd-<key>.sock)
+           (without XDG_RUNTIME_DIR: /run/user/<uid>/chudware/ when it is ours, else
+           /tmp/chudware-<uid>/)
   win32  = $CHUDWARE_HOSTD_PIPE/$CHUDWARE_HOSTD_SOCKET or
            \\\\.\\pipe\\chudware-hostd-<SID>-<key>
 
@@ -46,8 +53,10 @@ ERROR_PIPE_BUSY storms) that open() cannot express.
 from __future__ import annotations
 
 import contextlib
+from contextvars import ContextVar
 import json
 import os
+import platform
 import socket
 import stat
 import subprocess
@@ -62,6 +71,22 @@ from typing import Iterator, Optional
 
 class DaemonError(RuntimeError):
     """Transport-level daemon failure (connect/spawn/protocol)."""
+
+
+class DaemonCancelled(DaemonError):
+    """The tool call was stopped before a connection existed.
+
+    A Stop says nothing about whether hostd is up, so core_bridge raises it as CoreError
+    ``cancelled`` and never treats it as a reason to start a private in-process engine.
+    """
+
+
+class DaemonSpawnBlocked(DaemonError):
+    """An earlier spawn of hostd failed and its retry cooldown is still running.
+
+    No new connect was attempted, so this is not fresh evidence about hostd; core_bridge
+    reports it without demoting to a private in-process engine.
+    """
 
 
 class DaemonSessionLost(DaemonError):
@@ -166,25 +191,41 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent.parent
 
 
-def resolve_hostd_bin() -> Optional[Path]:
-    """Locate the chudware-hostd binary. Mirrors the libchudware candidate order in
-    core_bridge (env -> dist -> full OCCT build -> slim build)."""
-    if p := os.environ.get("CHUDWARE_HOSTD_BIN"):
-        return Path(p)
+def _hostd_candidates() -> list[Path]:
+    """Ordered hostd locations, mirroring the C++ client.
+
+    engine_backend.cpp hostdBinHint() takes the hostd BESIDE the GUI executable first
+    (the installed payload; a dev host build that carries its own daemon), and only then
+    walks up from the executable to the dev tree ``core/build-occt-linux`` (per-platform
+    name below). ``$CHUDWARE_DIST`` is the staged payload directory. ``core/build-linux``
+    is the gate/CI build target, which the C++ client never selects; it ranks last.
+    """
     exe = "chudware-hostd.exe" if sys.platform == "win32" else "chudware-hostd"
     root = _repo_root()
+    out: list[Path] = []
+    if dist := os.environ.get("CHUDWARE_DIST"):
+        out.append(Path(dist) / exe)
     if sys.platform == "win32":
-        cands = (
-            Path(os.environ.get("CHUDWARE_DIST") or "nonexistent") / exe,
-            root / "core" / "build" / "bin" / exe,  # build.bat / MSVC preset dir
-        )
+        out.append(root / "host" / "build-win" / "bin" / exe)
+        out.append(root / "core" / "build" / "bin" / exe)  # build.bat / MSVC preset dir
+    elif sys.platform == "darwin":
+        arch = "arm64" if platform.machine() in ("arm64", "aarch64") else "x86_64"
+        # engine_backend.cpp hostdBinHint(): build.sh names the mac dev tree by architecture.
+        out.append(root / "core" / f"build-occt-macos-{arch}" / "bin" / exe)
     else:
-        cands = (
-            Path(os.environ.get("CHUDWARE_DIST") or "nonexistent") / exe,
-            root / "core" / "build-occt-linux" / "bin" / exe,
-            root / "core" / "build-linux" / "bin" / exe,
-        )
-    for cand in cands:
+        out.append(root / "host" / "build-linux" / "bin" / exe)
+        out.append(root / "host" / "build-cef" / "bin" / exe)
+        out.append(root / "core" / "build-occt-linux" / "bin" / exe)
+        out.append(root / "core" / "build-linux" / "bin" / exe)
+    return out
+
+
+def resolve_hostd_bin() -> Optional[Path]:
+    """Locate the chudware-hostd binary: ``$CHUDWARE_HOSTD_BIN``, else the first existing
+    executable of :func:`_hostd_candidates`."""
+    if p := os.environ.get("CHUDWARE_HOSTD_BIN"):
+        return Path(p)
+    for cand in _hostd_candidates():
         if cand.is_file() and os.access(cand, os.X_OK):
             return cand
     return None
@@ -254,14 +295,16 @@ def _pid_alive(pid: int) -> bool:
 
 
 _DISK_BUILD_ID_CACHE: dict = {}  # str(path) -> (mtime_ns, build_id)
+_STALE_WARNING_LOCK = threading.Lock()
+_LAST_STALE_WARNING: tuple[str, str] | None = None
 
 
 def _disk_build_id(hostd: Optional[Path]) -> str:
     """Build id of the hostd binary ON DISK (`chudware-hostd --version` prints
     "chudware-hostd <git-describe id>"). Cached per (path, mtime) so the subprocess
     runs once per binary change per process — steady-state connects are free.
-    Returns "" on any failure (treated as not-stale). Client half of the version
-    drain-replace: compared against hello.git_rev, the RUNNING daemon's id."""
+    Returns "" on any failure (treated as not-stale). Compared against
+    hello.git_rev, the RUNNING daemon's id, for a non-destructive warning."""
     if not hostd:
         return ""
     try:
@@ -368,10 +411,13 @@ class DaemonClient:
     SPAWN_COOLDOWN_S = 5.0
     SPAWN_COOLDOWN_MAX_S = 60.0
 
-    def __init__(self, *, writer_group: str = "") -> None:
+    def __init__(self, *, writer_group: str = "", agent_run_scope: str = "") -> None:
         self.writer_group = writer_group
+        self.agent_run_scope = agent_run_scope
         self.owner = owner_key()
         self._lock = threading.Lock()
+        self._socket_guard = threading.Lock()
+        self._aborted = False
         # AF_UNIX socket on POSIX, _PipeIO on win32 (same sendall/recv/close shape).
         self._sock: Optional[object] = None
         self._buf = bytearray()
@@ -381,7 +427,6 @@ class DaemonClient:
         self._events: list[dict] = []
         self.server_info: dict = {}
         self._sock_path: Optional[str] = None
-        self._stale_retry_done = False  # one drain-replace attempt per client
         self._spawn_block_until = 0.0  # monotonic deadline; 0 = spawning allowed
         self._spawn_fail_streak = 0
         self._session_established = False
@@ -402,6 +447,8 @@ class DaemonClient:
                 self.writer_group == _WRITER_GROUP and _group_session_established.is_set()
             ):
                 raise DaemonSessionLost(str(e), "connect", "not_dispatched") from e
+            if isinstance(e, (DaemonCancelled, DaemonSpawnBlocked)):
+                raise  # core_bridge must see the cause, not a generic startup failure
             raise DaemonError(str(e)) from e
 
     def _connect(self, spawn: bool, budget_s: float) -> None:
@@ -424,16 +471,23 @@ class DaemonClient:
         spawn_tried = False
         try:
             while True:
+                with self._socket_guard:
+                    if self._aborted:
+                        raise DaemonCancelled("CAD tool cancelled")
                 try:
                     if sys.platform == "win32":
                         # FileNotFoundError = no server instance yet (spawn/retry);
                         # ERROR_PIPE_BUSY surfaces as OSError and is retried the same
                         # way — the daemon creates the next instance right after each
                         # accept, so busy is a sub-millisecond window.
-                        self._sock = _PipeIO(self._sock_path)
+                        s = _PipeIO(self._sock_path)
                     else:
                         s = socket.socket(socket.AF_UNIX)
                         s.connect(self._sock_path)
+                    with self._socket_guard:
+                        if self._aborted:
+                            s.close()
+                            raise DaemonCancelled("CAD tool cancelled")
                         self._sock = s
                     self._buf.clear()
                     self._buf_start = self._buf_scan = 0
@@ -452,7 +506,7 @@ class DaemonClient:
                         # is only reached when the plain connect already failed.
                         left = self._spawn_block_until - time.monotonic()
                         if left > 0:
-                            raise DaemonError(
+                            raise DaemonSpawnBlocked(
                                 f"chudware-hostd failed to start "
                                 f"{self._spawn_fail_streak}x; not retrying for another "
                                 f"{left:.0f}s ({e}). See "
@@ -490,6 +544,8 @@ class DaemonClient:
                         raise DaemonError(f"hostd spawn timed out ({e})") from e
                     time.sleep(backoff)
                     backoff = min(backoff * 2, 0.5)
+        except DaemonCancelled:
+            raise  # a Stop is not evidence that hostd failed to start: never arm the cooldown
         except DaemonError:
             # Only a cycle that actually forked a daemon arms the cooldown. An
             # attach-only failure (spawn=False, no binary, or the gate itself)
@@ -507,7 +563,7 @@ class DaemonClient:
         self._session_established = True
         if self.writer_group == _WRITER_GROUP:
             _group_session_established.set()
-        self._drain_replace_if_stale(hostd, spawn)
+        self._warn_if_stale(hostd, spawn)
 
     def _hello(self) -> dict:
         """Send hello; a draining daemon answers with a ``daemon_draining`` refusal.
@@ -524,6 +580,8 @@ class DaemonClient:
                 params["writer_group"] = repr(owner_key())
             if self.writer_group and not ctx.get("cell"):
                 params["writer_group"] = self.writer_group
+            if self.agent_run_scope:
+                params["agent_run_scope"] = self.agent_run_scope
             info = self._call_raw("hello", params)
         except DaemonError:
             event = self._draining_event()
@@ -576,49 +634,24 @@ class DaemonClient:
             file=sys.stderr,
         )
 
-    def _drain_replace_if_stale(self, hostd: Optional[Path], spawn: bool) -> None:
-        """Version drain-replace (Phase 8): the running daemon predates the hostd
-        binary on disk (dev rebuild / installer upgrade) -> ask it to drain
-        (autosaves + exits), wait for the old pid to die, then respawn/reconnect
-        so everyone lands on the new build. A mission_active refusal is
-        warn-and-continue: never kill running agent work from a connect."""
-        if not spawn or self._stale_retry_done:
+    def _warn_if_stale(self, hostd: Optional[Path], spawn: bool) -> None:
+        """Leave stale-engine cutover to hostd's soft watch, never stop live work."""
+        if not spawn:
             return
         running = str(self.server_info.get("git_rev") or "")
         disk = _disk_build_id(hostd)
         if not running or not disk or "unknown" in (running, disk) or running == disk:
             return
-        self._stale_retry_done = True  # one attempt per connection, never a loop
-        r = self._call_raw("daemon_drain", {})
-        if r.get("_is_error"):
+        global _LAST_STALE_WARNING
+        with _STALE_WARNING_LOCK:
+            if _LAST_STALE_WARNING == (running, disk):
+                return
+            _LAST_STALE_WARNING = (running, disk)
             print(
-                f"[daemon_bridge] WARNING: hostd on disk is {disk} but the running "
-                f"daemon is {running}; drain refused ({r.get('code')}) — continuing "
-                "on the old daemon.",
+                f"[daemon_bridge] hostd on disk is {disk}, running {running}; "
+                "continuing existing work until the daemon's soft stale-binary drain.",
                 file=sys.stderr,
             )
-            return
-        print(
-            f"[daemon_bridge] hostd stale (running {running}, on disk {disk}) — "
-            "drained; respawning the new build.",
-            file=sys.stderr,
-        )
-        old_pid = int(self.server_info.get("daemon_pid") or 0)
-        if self._sock:
-            self._sock.close()
-            self._sock = None
-        deadline = time.monotonic() + 30.0
-        while old_pid > 0 and time.monotonic() < deadline:
-            if sys.platform == "win32":
-                # os.kill(pid, 0) is NOT a liveness probe on Windows; the pipe
-                # name existing exactly while a server listens is.
-                if not (self._sock_path and os.path.exists(self._sock_path)):
-                    break
-            else:
-                if not _pid_alive(old_pid):
-                    break
-            time.sleep(0.1)
-        self.connect()
 
     def connected(self) -> bool:
         return self._sock is not None
@@ -627,14 +660,29 @@ class DaemonClient:
         with self._lock:
             self._disconnect()
 
+    def abort(self) -> None:
+        """Interrupt this lease without waiting for the RPC's held call lock."""
+        with self._socket_guard:
+            self._aborted = True
+            sock = self._sock
+            if sock is not None:
+                try:
+                    if isinstance(sock, socket.socket):
+                        sock.shutdown(socket.SHUT_RDWR)
+                    else:
+                        sock.close()
+                except OSError:
+                    pass
+
     def _disconnect(self) -> None:
         """Drop a failed connection while retaining its established-session history."""
-        if self._sock is not None:
+        with self._socket_guard:
+            sock, self._sock = self._sock, None
+        if sock is not None:
             try:
-                self._sock.close()
+                sock.close()
             except OSError:
                 pass
-            self._sock = None
         self._buf.clear()
         self._buf_start = self._buf_scan = 0
         self._events.clear()
@@ -871,6 +919,7 @@ _WRITER_GROUP = f"py-{os.getpid()}-{uuid.uuid4().hex}"
 _group_session_established = threading.Event()
 _clients = threading.local()
 _call_connections = threading.local()
+_agent_run_scope: ContextVar[str] = ContextVar("chudware_agent_run_scope", default="")
 
 
 class TurnConnections:
@@ -881,10 +930,12 @@ class TurnConnections:
     Idle sockets are reused, so storage is bounded by peak concurrent CAD calls.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, agent_run_scope: str = "") -> None:
         self.owner = owner_key()
+        self.agent_run_scope = agent_run_scope
         self._lock = threading.Lock()
         self._idle: list[DaemonClient] = []
+        self._active: set[DaemonClient] = set()
         self._closed = False
 
     def acquire(self) -> DaemonClient:
@@ -893,16 +944,29 @@ class TurnConnections:
         with self._lock:
             if self._closed:
                 raise DaemonSessionLost("agent turn has ended", "connect", "not_dispatched")
-            if self._idle:
-                return self._idle.pop()
-        return DaemonClient(writer_group=_WRITER_GROUP)
+            connection = self._idle.pop() if self._idle else DaemonClient(
+                writer_group=_WRITER_GROUP, agent_run_scope=self.agent_run_scope)
+            self._active.add(connection)
+            return connection
 
     def release(self, connection: DaemonClient) -> None:
         with self._lock:
-            if not self._closed:
+            self._active.discard(connection)
+            if not self._closed and not getattr(connection, "_aborted", False):
                 self._idle.append(connection)
                 return
         connection.close()
+
+    def abort_active(self) -> None:
+        """Retire this turn and interrupt its active calls without affecting other turns."""
+        with self._lock:
+            self._closed = True
+            idle, self._idle = self._idle, []
+            active = tuple(self._active)
+            for connection in active:
+                connection.abort()
+        for connection in idle:
+            connection.close()
 
     def close(self) -> None:
         # Never interrupt an in-flight mutation. Active leases close when their
@@ -915,20 +979,40 @@ class TurnConnections:
 
 
 @contextlib.contextmanager
-def turn_connection_scope(pool: TurnConnections | None):
-    """Install a lazy call lease, preserving nested dispatch on this thread."""
+def turn_connection_scope(pool: TurnConnections | None, cancellation=None):
+    """Install a lazy, independently cancellable call lease."""
     previous = getattr(_call_connections, "lease", None)
     if pool is None or (previous is not None and previous[0] is pool):
         yield
         return
-    lease = [pool, None]
+    lease = [pool, None, cancellation]
     _call_connections.lease = lease
+    scope_token = _agent_run_scope.set(pool.agent_run_scope)
     try:
         yield
     finally:
+        _agent_run_scope.reset(scope_token)
         _call_connections.lease = previous
         if lease[1] is not None:
+            if callable(getattr(cancellation, "detach_connection", None)):
+                cancellation.detach_connection(lease[1])
             pool.release(lease[1])
+
+
+def current_turn_lease():
+    """Capture the current thread's pool and cancellation for a child worker."""
+    lease = getattr(_call_connections, "lease", None)
+    return (lease[0], lease[2]) if lease is not None else None
+
+
+def current_agent_run_scope() -> str:
+    return _agent_run_scope.get()
+
+
+def agent_turn_active() -> bool:
+    """True inside an agent turn's connection lease (``turn_connection_scope``) or a hostd
+    cell. Such a call must never be served by a private in-process engine."""
+    return in_cell() or getattr(_call_connections, "lease", None) is not None
 
 
 class _ThreadClient:
@@ -936,9 +1020,16 @@ class _ThreadClient:
 
     def __init__(self) -> None:
         self.owner = owner_key()
-        self.value = DaemonClient(writer_group=_WRITER_GROUP)
+        self.agent_run_scope = current_agent_run_scope()
+        self.value = DaemonClient(writer_group=_WRITER_GROUP,
+                                  agent_run_scope=self.agent_run_scope)
 
     def __del__(self) -> None:
+        # Interpreter finalization clears hung daemon threads' locals too; their
+        # client lock can be held by a thread that will never run again, so a
+        # blocking close() here deadlocked worker exit. The OS closes the fd.
+        if sys.is_finalizing():
+            return
         self.value.close()
 
 
@@ -948,9 +1039,12 @@ def client() -> DaemonClient:
     if lease is not None:
         if lease[1] is None:
             lease[1] = lease[0].acquire()
+            if callable(getattr(lease[2], "attach_connection", None)):
+                lease[2].attach_connection(lease[1])
         return lease[1]
     holder = getattr(_clients, "holder", None)
-    if holder is None or holder.owner != owner_key():
+    if (holder is None or holder.owner != owner_key() or
+            holder.agent_run_scope != current_agent_run_scope()):
         if holder is not None:
             holder.value.close()
         holder = _clients.holder = _ThreadClient()

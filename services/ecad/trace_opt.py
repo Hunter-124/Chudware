@@ -9,8 +9,7 @@ input. Every geometry/width change is DRC-guarded and reverted on a new clearanc
 (or other error-severity) violation. Designed to be deterministic and idempotent —
 a second call on the result reports zero changes.
 
-Track dict shapes match :mod:`services.ecad.schema`, ``core/ecad/ops.cpp`` and
-:mod:`services.ecad.fab.gerber`::
+Track dict shapes match :mod:`services.ecad.schema` and ``core/ecad/ops.cpp``::
 
     segment: {id, net, layer, width, kind:'segment', p1, p2}
     arc:     {id, net, layer, width, kind:'arc', p1, p2, center, a0, a1, radius?}

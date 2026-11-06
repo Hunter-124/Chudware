@@ -1,12 +1,5 @@
-// Parts Library — vendors (GUI V2 phase B): the old full right pane is gone. This TU owns
-//   * drawVendorStrip  — compact fixed footer of the filters pane: status dots + "N/M signed
-//     in", health summary, "Connect vendor accounts", "Vendors…" (popup) and "Test vendors".
-//     ALL background polling (login watch, download queue, health) lives here so it keeps
-//     running whether or not the popup is open.
-//   * drawVendorsPopup — floating glass window with the vendor sign-in list, API-provider
-//     credential editors, download queue and health-check results table.
-//   * startHealthCheck/pollHealthStatus — vendors_health_check/_status flow (single-flight,
-//     2 s backoff while running).
+// Parts Library vendor status, account management, download queue and health checks.
+// The compact footer keeps polling while the Sources popup is closed.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -14,14 +7,20 @@
 #include <cstring>
 #include <initializer_list>
 #include <string>
+#include <memory>
+#include <utility>
+#include <vector>
 
 #include "imgui.h"
 
 #include "core/app_state.h"
 #include "ui_theme.h"
-#include "ui/icons.h"      // hasIconSdf/getIcon/drawIconGlass — the CTA pill draws its own glyph
-#include "ui/metrics.h"    // ui::metrics::partsPadX — the ONE horizontal inset of this workspace
-#include "ui/widgets/kit.h" // ui::kit::elide — CTA / status lines fit a narrow filters pane
+#include "ui/metrics.h"
+#include "ui/widgets/kit.h"
+#ifdef CHUDWARE_ENABLE_CEF
+#include "ui/widgets/cef/cef_rpc_bridge.h"
+#include "ui/widgets/cef/cef_web_view.h"
+#endif
 
 #include "parts_internal.h"
 #include "parts_widgets.h"
@@ -40,6 +39,34 @@ namespace parts {
 //         rejects the in-panel OSR CEF); it used to be duplicated inline here.
 std::string jstr(const nlohmann::json& j, const char* key, const std::string& dflt);
 bool sitePrefersDesktopLogin(const std::string& site);
+
+#ifdef CHUDWARE_ENABLE_CEF
+// Resolve the same login URLs used by the wizard, then export the matching
+// domains from its panel profile without opening or navigating a browser.
+void restoreVendorSessions(AppState& st) {
+    struct Pending {
+        size_t remaining = 0;
+        std::vector<std::pair<std::string, std::vector<std::string>>> sites;
+    };
+    auto pending = std::make_shared<Pending>();
+    for (const auto& vendor : S().vendors)
+        if (vendor.loggedIn && !vendor.id.empty())
+            ++pending->remaining;
+    if (!pending->remaining) return;
+    for (const auto& vendor : S().vendors) {
+        if (!vendor.loggedIn || vendor.id.empty()) continue;
+        const std::string site = vendor.id;
+        cef::rpc_start_url(st, site,
+            [&st, pending, site](bool ok, const std::string& url,
+                                 const std::string&, const std::vector<std::string>& domains,
+                                 const std::string&) {
+                if (ok && !url.empty() && !domains.empty()) pending->sites.emplace_back(site, domains);
+                if (--pending->remaining == 0)
+                    CefWebView::restoreVendorSessions(st, pending->sites);
+            });
+    }
+}
+#endif
 
 // ---- health check flow -------------------------------------------------------------
 
@@ -128,53 +155,10 @@ void textRole(const float role[4], const char* s) {
     ImGui::PopStyleColor();
 }
 
-// borderRow paints its own label straight into the draw list with palette.text, so
-// ImGui::BeginDisabled's alpha never reaches it. Wash the row that was just submitted
-// with the pane colour so a gated action visibly reads as disabled, and hang the
-// reason off it: a live-looking button whose click the callee silently swallows is
-// exactly what made this strip feel broken. Call right AFTER ImGui::EndDisabled().
-void gatedRowFeedback(bool gated, const char* why) {
-    if (!gated) return;
-    const float wash[4] = {palette.panelBg[0], palette.panelBg[1], palette.panelBg[2], 0.55f};
-    ImGui::GetWindowDrawList()->AddRectFilled(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
-                                              Palette::toU32(wash), 6.0f * ui::uiScale);
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-        ImGui::SetTooltip("%s", why);
-}
-
-// Footer geometry, shared by the strip and vendorStripHeight() so the height the filters pane
-// reserves is always the height the strip lays out.
-//
-// kBandInset pulls the band 2 px inside the pane gutter so it reads as a CARD sitting in the
-// pane instead of a full-bleed slab wedged against the pane border; kCtrlInset keeps the
-// full-width controls 4 px inside that card edge — the CTA pill used to be exactly as wide as
-// the band, so its border WAS the band's border.
-float stripBandInset() { return 2.0f * ui::uiScale; }
-float stripCtrlInset() { return stripBandInset() + 4.0f * ui::uiScale; }
-float stripRowGap()    { return 4.0f * ui::uiScale; }   // the footer's one vertical gap
-float stripPairGap()   { return 4.0f * ui::uiScale; }   // between the two secondary buttons
-float stripRowH()      { return 20.0f * ui::uiScale; }  // one secondary button row
-
-// Secondary actions ("Vendors…" / "Test vendors") share one row only while BOTH labels fit
-// their half; a narrow pane (1.5x, copilot docked) stacks them instead of centre-clipping
-// both ends of the words. Measured against the widest label either button can carry, so the
-// layout does not flip when "Test vendors" turns into "Testing…".
-bool stripPairStacked(float contentW) {
-    const float half = (contentW - 2.0f * stripCtrlInset() - stripPairGap()) * 0.5f;
-    float labelW = 0.0f;
-    for (const char* l : {"Vendors\xe2\x80\xa6", "Test vendors", "Testing\xe2\x80\xa6"})
-        labelW = std::max(labelW, ImGui::CalcTextSize(l).x);
-    return half < labelW + 2.0f * ui::metrics::partsPadX();
-}
-
 }  // namespace
 
-float vendorStripHeight(float contentW) {
-    // 118: the strip's four stacked rows measure ~98*sc under its own tightened spacing, and
-    // the footer band is this height minus ItemSpacing.y — the rest is a real ~9*sc bottom
-    // margin. A stacked secondary pair adds one button row and its gap.
-    return 118.0f * ui::uiScale +
-           (stripPairStacked(contentW) ? stripRowH() + stripRowGap() : 0.0f);
+float vendorStripHeight(float) {
+    return ImGui::GetFrameHeight() + 8.0f * ui::uiScale;
 }
 
 // ---- compact strip (fixed footer of the filters pane) --------------------------------
@@ -182,10 +166,15 @@ float vendorStripHeight(float contentW) {
 void drawVendorStrip(AppState& st, float paneW) {
     const float sc = ui::uiScale;
     (void)paneW;
-    // Measured BEFORE anything indents: the same width vendorStripHeight() was given.
-    const float contentW = ImGui::GetContentRegionAvail().x;
 
     // -- background polling (always runs while the parts workspace is visible) --------
+#ifdef CHUDWARE_ENABLE_CEF
+    static bool sessionsRestored = false;
+    if (!sessionsRestored && S().vendorsLoaded && S().vendorsError.empty()) {
+        sessionsRestored = true;
+        restoreVendorSessions(st);
+    }
+#endif
     bool anyLoginBusy = false;
     int  signedIn     = 0;
     for (auto& v : S().vendors) {
@@ -206,323 +195,62 @@ void drawVendorStrip(AppState& st, float paneW) {
         ImGui::GetTime() - S().lastHealthPoll > 2.0)
         pollHealthStatus(st);
 
-    // Liquid-glass band behind the WHOLE footer. A bare 1px border rule used to sit here and
-    // the strip read as a loose stack of controls dropped under a grey line. The footer is ONE
-    // section, so it gets one tinted surface in the app's shared glass language (accent hue,
-    // low alpha) closed by an accent hairline as its section edge. Painted before the footer's
-    // widgets so it stays behind them.
-    const float kBandInset = stripBandInset();
-    const float kCtrlInset = stripCtrlInset();
-    {
-        ImDrawList*  dl    = ImGui::GetWindowDrawList();
-        const ImVec2 p0    = ImGui::GetCursorScreenPos();
-        const ImVec2 avail = ImGui::GetContentRegionAvail();
-        const float  bx0   = p0.x + kBandInset;
-        const float  bx1   = p0.x + avail.x - kBandInset;
-        if (avail.y > 1.0f)
-            ui::glassCardWash(dl, ImVec2(bx0, p0.y), ImVec2(bx1, p0.y + avail.y), 8.0f,
-                              palette.accent, 0.14f);
-        float edge[4];
-        Palette::withAlpha(palette.accent, edge, 0.35f);
-        dl->AddLine(ImVec2(bx0, p0.y + 0.5f), ImVec2(bx1, p0.y + 0.5f),
-                    Palette::toU32(edge), 1.0f);
+    const float rowW = ImGui::GetContentRegionAvail().x;
+    const float buttonW = ImGui::CalcTextSize("Sources…").x +
+                          2.0f * ImGui::GetStyle().FramePadding.x;
+    const float gap = 6.0f * sc;
+    const float statusW = std::max(0.0f, rowW - buttonW - gap);
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float rowH = ImGui::GetFrameHeight();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    int active = 0, failed = 0;
+    for (const auto& job : S().queue) {
+        if (job.status == "pending" || job.status == "running") ++active;
+        else if (job.status == "error") ++failed;
     }
-    // The footer's own vertical rhythm. Under the theme's 9 px paragraph spacing the four
-    // stacked rows measured ~122 px against a ~99 px band and the bottom button hung out of
-    // the card entirely. 4 px is this footer's one gap — and it is also the clearance above
-    // and below the CTA pill. Popped at the very end (this function has no early returns).
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
-                        ImVec2(ImGui::GetStyle().ItemSpacing.x, stripRowGap()));
-    ImGui::Dummy(ImVec2(0.0f, 2.0f * sc));   // 2 + 4 spacing = 6 px of band-top clearance
+    std::string status;
+    if (!S().vendorsError.empty()) status = "Sources offline";
+    else if (!S().vendorsLoaded && S().vendors.empty()) status = "Checking sources…";
+    else status = std::to_string(signedIn) + "/" + std::to_string(S().vendors.size()) +
+                  " signed in";
+    if (!S().queueError.empty()) status = "Queue error · " + status;
+    else if (active || failed)
+        status = "Q " + std::to_string(active) + "/" + std::to_string(failed) +
+                 " failed · " + status;
 
-    // -- status logo/dot row + "N/M signed in" + health summary ------------------------
-    // One inset scope: the logos, the count and the health line are plain content, so they
-    // sit on the pane's TEXT line with the filter labels and the section header above them.
-    // The glass band above and the borderRows below stay full-bleed on the pane gutter.
-    {
-        ContentInset inset;
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        ImVec2 p = ImGui::GetCursorScreenPos();
-        // Real vendor favicons wherever the prefetch has landed (S().thumbs["vendorlogo:"+id],
-        // filled by another TU — this file never REQUESTS one, it only draws what is resident).
-        // ONE cell size drives both the fit arithmetic below and the draw, so the run stays
-        // homogeneous: sizing the layout on the 7 px dot while drawing 14 px images is exactly
-        // what would overflow the pane again. The moment any logo is resident the whole row
-        // switches to the wide cell; vendors still without one keep their 7 px pip centred in
-        // it.
-        bool anyLogoCached = false;
-        for (auto& lv : S().vendors) {
-            auto it = S().thumbs.find("vendorlogo:" + lv.id);
-            if (it != S().thumbs.end() && it->second.tex) { anyLogoCached = true; break; }
-        }
-        const float cell = anyLogoCached ? 14.0f * sc : 7.0f * sc;
-        const float dotD = 7.0f * sc;          // the pip itself never grows with the cell
-        const float gap  = 4.0f * sc;
-        const float step = cell + gap;
-        const float cy   = p.y + 5.0f * sc + cell * 0.5f;
-
-        // How many cells FIT. One cell per vendor ran straight off the pane and wrapped into
-        // a second ragged row that collided with the count text; the run is now clipped to
-        // the space left beside the count and the remainder collapses into a dim "+N".
-        const int total = (int)S().vendors.size();
-        char countNum[32];
-        std::snprintf(countNum, sizeof(countNum), "%d/%d", signedIn, total);
-        const char* const countTail = " signed in";
-        // An empty vendor list has three distinct meanings; "no vendors" conflated them. The
-        // status call may still be in flight, it may have failed, or this build may ship no
-        // signed-in vendor sources at all (browser vendors need the in-app browser) — in which
-        // case the library still searches local standards and public CAD, as the search
-        // notice says for the same condition.
-        const bool vendorsPending = !S().vendorsLoaded || S().vendorsLoading;
-        const char* emptyText = vendorsPending              ? "checking vendors\xe2\x80\xa6"
-                              : !S().vendorsError.empty()   ? "vendors offline"
-                                                            : "local standards only";
-        const float countW = total > 0
-            ? ImGui::CalcTextSize(countNum).x + ImGui::CalcTextSize(countTail).x
-            : ImGui::CalcTextSize(emptyText).x;
-        // kCtrlInset is reserved on the right so the count text stops short of the band's
-        // inset edge instead of running onto (or past) it.
-        const float budget =
-            ImGui::GetContentRegionAvail().x - countW - 8.0f * sc - kCtrlInset;
-        auto fitCount = [&](float b) {
-            if (b < cell) return 0;
-            const int n = (int)((b + gap) / step);
-            return n > total ? total : n;
-        };
-        int shown = fitCount(budget);
-        char overflow[16];
-        overflow[0] = '\0';
-        if (shown < total) {
-            // Second pass: the "+N" badge needs room of its own, or the badge itself
-            // becomes the thing that pushes the count off the pane edge.
-            std::snprintf(overflow, sizeof(overflow), "+%d", total - shown);
-            shown = fitCount(budget - ImGui::CalcTextSize(overflow).x - gap);
-            std::snprintf(overflow, sizeof(overflow), "+%d", total - shown);
-            if (shown >= total) overflow[0] = '\0';
-        }
-
-        float x = p.x;   // left edge of the next cell
-        const double now = ImGui::GetTime();
-        for (int i = 0; i < shown; ++i) {
-            auto& v = S().vendors[(size_t)i];
-            const float* role = v.loggedIn ? palette.statusOk : palette.textDisabled;
-            if (!v.loginError.empty()) role = palette.statusErr;
-            auto lg = S().thumbs.find("vendorlogo:" + v.id);
-            if (lg != S().thumbs.end() && lg->second.tex) {
-                lg->second.lastUse = now;   // LRU: keep on-screen logos resident
-                dl->AddImage((ImTextureID)(intptr_t)lg->second.tex,
-                             ImVec2(x, cy - cell * 0.5f),
-                             ImVec2(x + cell, cy + cell * 0.5f));
-                // Status ring around the favicon, in the SAME role the pip carried, so the
-                // row still reads signed-in / failed / idle at a glance once it shows brands.
-                dl->AddCircle(ImVec2(x + cell * 0.5f, cy), 9.0f * sc, Palette::toU32(role),
-                              0, 1.5f * sc);
-            } else {
-                // Soft glow ring under the filled dot: a signed-in vendor reads as LIT instead
-                // of as a flat 7px pip lost in the band.
-                float glow[4];
-                Palette::withAlpha(role, glow, 0.28f);
-                dl->AddCircle(ImVec2(x + cell * 0.5f, cy), dotD * 0.5f * 1.6f,
-                              Palette::toU32(glow), 0, 1.5f * sc);
-                dl->AddCircleFilled(ImVec2(x + cell * 0.5f, cy), dotD * 0.5f,
-                                    Palette::toU32(role));
-            }
-            // Invisible hover target per cell for the tooltip.
-            ImGui::SetCursorScreenPos(ImVec2(x, cy - cell * 0.5f));
-            ImGui::PushID(i);
-            ImGui::InvisibleButton("##dot", ImVec2(cell, cell));
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s — %s", v.label.c_str(),
-                                  !v.loginError.empty() ? v.loginError.c_str()
-                                  : v.loggedIn          ? "signed in"
-                                                        : "not signed in");
-            ImGui::PopID();
-            x += step;
-        }
-        float runEnd = shown > 0 ? x - gap : p.x;
-        if (overflow[0]) {
-            const ImVec2 ts = ImGui::CalcTextSize(overflow);
-            dl->AddText(ImVec2(runEnd + gap, cy - ts.y * 0.5f),
-                        Palette::toU32(palette.textDisabled), overflow);
-            runEnd += gap + ts.x;
-        }
-
-        ImGui::SetCursorScreenPos(ImVec2(runEnd + (runEnd > p.x ? 6.0f * sc : 0.0f),
-                                         p.y + 3.0f * sc));
-        if (total > 0) {
-            // The count is this line's real information: the numbers carry full text
-            // weight and only the word after them stays dim.
-            textRole(palette.text, countNum);
-            ImGui::SameLine(0.0f, 0.0f);
-            textRole(palette.textDim, countTail);
-        } else {
-            ImGui::TextDisabled("%s", emptyText);
-            if (!vendorsPending && ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", !S().vendorsError.empty()
-                    ? S().vendorsError.c_str()
-                    : "No vendor sources are available in this build. Local standard parts "
-                      "and public CAD search still work.");
-        }
-
-        // Every status line fits the band (kCtrlInset short of its right edge): a narrow
-        // filters pane at 1.5x used to run these straight off the card.
-        const float lineW = ImGui::GetContentRegionAvail().x - kCtrlInset;
-        if (!S().healthSupported) {
-            const char* const msg = "Health check unavailable (update the worker)";
-            if (ImGui::CalcTextSize(msg).x <= lineW) {
-                ImGui::TextDisabled("%s", msg);
-            } else {
-                ImGui::TextDisabled("%s", ui::kit::elide(msg, std::max(1.0f, lineW)).c_str());
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", msg);
-            }
-        } else if (S().healthStarting || (S().healthRunning && S().healthResults.empty())) {
-            spinner("Testing vendors");
-        } else if (S().healthChecked && !S().healthResults.empty()) {
-            int ok = 0, needLogin = 0, failing = 0;
-            for (auto& h : S().healthResults) {
-                if (h.ok) ++ok;
-                else if (h.expected) ++needLogin;
-                else ++failing;
-            }
-            // Coloured tokens. The whole summary used to be one dim sentence, so a failing
-            // vendor read exactly like the inert labels around it. Degrades in two steps when
-            // the line is narrower than the full sentence: the "Health:" lead goes first, then
-            // the words shorten — the coloured counts always survive.
-            const float numGap = 5.0f * sc, wordGap = 4.0f * sc;
-            char nums[3][16];
-            std::snprintf(nums[0], sizeof(nums[0]), "%d", ok);
-            std::snprintf(nums[1], sizeof(nums[1]), "%d", needLogin);
-            std::snprintf(nums[2], sizeof(nums[2]), "%d", failing);
-            const int nTok = failing > 0 ? 3 : 2;
-            auto lineWidth = [&](bool lead, const char* const* words) {
-                float w = lead ? ImGui::CalcTextSize("Health:").x : -numGap;
-                for (int i = 0; i < nTok; ++i) {
-                    if (i > 0) w += numGap + ImGui::CalcTextSize("·").x;
-                    w += numGap + ImGui::CalcTextSize(nums[i]).x + wordGap +
-                         ImGui::CalcTextSize(words[i]).x;
-                }
-                return w;
-            };
-            static const char* const kLong[3]  = {"ok", "need sign-in", "failing"};
-            static const char* const kShort[3] = {"ok", "sign-in", "fail"};
-            const bool lead = lineWidth(true, kLong) <= lineW;
-            const char* const* words =
-                lead || lineWidth(false, kLong) <= lineW ? kLong : kShort;
-            const float* roles[3] = {palette.statusOk, palette.statusWarn, palette.statusErr};
-            if (lead) textRole(palette.textDim, "Health:");
-            for (int i = 0; i < nTok; ++i) {
-                if (i > 0) {
-                    ImGui::SameLine(0.0f, numGap);
-                    textRole(palette.textDisabled, "·");
-                }
-                if (lead || i > 0) ImGui::SameLine(0.0f, numGap);
-                textRole(roles[i], nums[i]);
-                ImGui::SameLine(0.0f, wordGap);
-                textRole(palette.textDim, words[i]);
-            }
-        } else {
-            ImGui::TextDisabled(" ");
-        }
+    const float dotD = 6.0f * sc, dotGap = 3.0f * sc;
+    const int dots = std::min((int)S().vendors.size(),
+        statusW >= 100.0f * sc ? 2 : (statusW >= 45.0f * sc ? 1 : 0));
+    float x = p.x;
+    for (int i = 0; i < dots; ++i) {
+        const auto& v = S().vendors[(size_t)i];
+        const float* role = !v.loginError.empty() ? palette.statusErr
+                           : v.loggedIn ? palette.statusOk : palette.textDisabled;
+        dl->AddCircleFilled(ImVec2(x + dotD * 0.5f, p.y + rowH * 0.5f),
+                            dotD * 0.5f, Palette::toU32(role));
+        x += dotD + dotGap;
     }
-
-    // -- buttons -------------------------------------------------------------------------
-    // Anything the callee would refuse is drawn disabled and says why.
+    const float textW = std::max(0.0f, statusW - (x - p.x));
+    const std::string visible = ui::kit::elide(status.c_str(), textW);
+    dl->AddText(ImVec2(x, p.y + (rowH - ImGui::GetTextLineHeight()) * 0.5f),
+                Palette::toU32(!S().queueError.empty() || failed ? palette.statusErr
+                                                                  : palette.textDim),
+                visible.c_str());
+    ImGui::Dummy(ImVec2(statusW, rowH));
+    if (ImGui::IsItemHovered()) {
+        if (!S().queueError.empty())
+            ImGui::SetTooltip("%s\nQueue status: %s", status.c_str(), S().queueError.c_str());
+        else
+            ImGui::SetTooltip("%s\nQueue: %d active, %d failed", status.c_str(), active, failed);
+    }
+    ImGui::SameLine(0.0f, gap);
     const bool wizardOpen = browserPanelActive();
-    // Primary CTA — accent gradient pill. borderRow paints hover/selection treatment only,
-    // so this used to be a flat accentSoft rect that was pixel-identical to the two
-    // secondary buttons below it and the pane had no visible primary action. Same
-    // InvisibleButton click contract, same startLoginWizard(st) action, same wizard gating.
-    {
-        ImGui::Indent(kCtrlInset);
-        ImDrawList*  dl = ImGui::GetWindowDrawList();
-        const ImVec2 c0 = ImGui::GetCursorScreenPos();
-        const float  w  = ImGui::GetContentRegionAvail().x - kCtrlInset;
-        const float  h  = 22.0f * sc;
-        const ImVec2 c1(c0.x + w, c0.y + h);
-
-        ImGui::BeginDisabled(wizardOpen);
-        const bool clicked = ImGui::InvisibleButton("##connect_vendors", ImVec2(w, h));
-        const bool hovered = ImGui::IsItemHovered();
-        ImGui::EndDisabled();
-
-        ui::glassCardWash(dl, c0, c1, 7.0f, palette.accent, hovered ? 0.42f : 0.30f);
-        float brd[4];
-        Palette::withAlpha(palette.accent, brd, hovered ? 0.95f : 0.70f);
-        dl->AddRect(ImVec2(c0.x + 0.5f, c0.y + 0.5f), ImVec2(c1.x - 0.5f, c1.y - 0.5f),
-                    Palette::toU32(brd), 7.0f * sc, 0, 1.0f * sc);
-
-        // Icon + centred label, laid out exactly like borderRow(centerText=true). The label
-        // steps down instead of clipping when the pane is narrow: full text + icon, then the
-        // short text + icon, then the short text alone, then that ellipsized. The icon used to
-        // be placed LEFT of the pill once the text outgrew it.
-        const char*  icon     = "browser_panel";
-        const char*  kFull    = "Connect vendor accounts";
-        const char*  kShort   = "Connect vendors";
-        const float  iconSz   = 18.0f * sc;
-        const float  iconGap  = 6.0f * sc;
-        const float  textRoom = w - 2.0f * ui::metrics::partsPadX();
-        const float  iconAdv  = iconSz + iconGap;
-        bool haveIcon = ui::hasIconSdf(icon) || ui::getIcon(icon).valid;
-        const char*  label = kFull;
-        std::string  elided;
-        if (ImGui::CalcTextSize(kFull).x + (haveIcon ? iconAdv : 0.0f) > textRoom) {
-            label = kShort;
-            const float shortW = ImGui::CalcTextSize(kShort).x;
-            if (shortW + (haveIcon ? iconAdv : 0.0f) > textRoom) haveIcon = false;
-            if (shortW > textRoom) {
-                elided = ui::kit::elide(kShort, std::max(1.0f, textRoom));
-                label  = elided.c_str();
-            }
-        }
-        if (label != kFull && hovered) ImGui::SetTooltip("%s", kFull);
-        const ImVec2 ts = ImGui::CalcTextSize(label);
-        float x = c0.x + (w - (ts.x + (haveIcon ? iconAdv : 0.0f))) * 0.5f;
-        if (haveIcon) {
-            const ImU32 icol =
-                ui::hasIconSdf(icon)
-                    ? Palette::toU32(palette.text)
-                    : IM_COL32(255, 255, 255, 255);  // gui-lint: allow identity tint, not a color — raster atlas glyphs keep their own pixels
-            ui::drawIconGlass(dl, icon, ImVec2(x + iconSz * 0.5f, c0.y + h * 0.5f), iconSz,
-                              icol, 0);
-            x += iconAdv;
-        }
-        dl->PushClipRect(c0, c1, true);
-        dl->AddText(ImVec2(x, c0.y + (h - ts.y) * 0.5f), Palette::toU32(palette.text), label);
-        dl->PopClipRect();
-
-        if (clicked) startLoginWizard(st);
-        ImGui::Unindent(kCtrlInset);
-    }
-    gatedRowFeedback(wizardOpen, "The sign-in wizard is already open.");
-
-    // Secondary pair: side by side while both labels fit their half, else one full-width
-    // row each (vendorStripHeight reserved the extra row for exactly this case).
-    ImGui::Indent(kCtrlInset);
-    const bool  stacked = stripPairStacked(contentW);
-    const float fullW   = ImGui::GetContentRegionAvail().x - kCtrlInset;
-    const float pairW   = stacked ? fullW : (fullW - stripPairGap()) * 0.5f;
     ImGui::BeginDisabled(wizardOpen);
-    if (borderRow("##vendors_popup", "Vendors…", nullptr, S().vendorsPopupOpen,
-                  ImVec2(pairW, stripRowH()), /*centerText=*/true))
+    if (ImGui::Button("Sources…", ImVec2(buttonW, rowH)))
         S().vendorsPopupOpen = !S().vendorsPopupOpen;
     ImGui::EndDisabled();
-    gatedRowFeedback(wizardOpen, "Vendor Accounts stays hidden while the sign-in "
-                                 "wizard owns the results column.");
-    if (!stacked) ImGui::SameLine(0.0f, stripPairGap());
-    const bool healthBusy  = S().healthStarting || S().healthRunning;
-    const bool healthGated = healthBusy || wizardOpen || !S().healthSupported;
-    ImGui::BeginDisabled(healthGated);
-    if (borderRow("##test_vendors", healthBusy ? "Testing…" : "Test vendors", nullptr,
-                  /*selected=*/false, ImVec2(pairW, stripRowH()), /*centerText=*/true))
-        startHealthCheck(st);
-    ImGui::EndDisabled();
-    gatedRowFeedback(healthGated,
-                     !S().healthSupported ? "Health check unavailable — update the worker."
-                     : healthBusy         ? "A health check is already running."
-                                          : "Paused while the sign-in wizard is open — its "
-                                            "browser sweeps would starve the check.");
-    ImGui::Unindent(kCtrlInset);
-    ImGui::PopStyleVar();   // footer ItemSpacing
+    if (wizardOpen && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Close the sign-in wizard to manage sources.");
 }
 
 // ---- floating "Vendor Accounts" popup ------------------------------------------------
@@ -718,13 +446,18 @@ void drawDownloadQueue(AppState& st) {
     ImGui::Separator();
     ImGui::Spacing();
     sectionHeader("Download Queue", /*firstInPane=*/false, "save");
+    if (!S().queueError.empty()) {
+        ContentInset inset;
+        textRole(palette.statusErr, ("Queue status unavailable: " + S().queueError).c_str());
+    }
 
     if (S().queue.empty()) {
         ContentInset inset;
         ImGui::PushStyleColor(ImGuiCol_Text,
             ImVec4(palette.textDisabled[0], palette.textDisabled[1],
                    palette.textDisabled[2], 1.0f));
-        ImGui::TextUnformatted("No downloads pending.");
+        ImGui::TextUnformatted(S().queueError.empty() ? "No downloads pending."
+                                                       : "Queue status is unavailable.");
         ImGui::PopStyleColor();
         if (ImGui::SmallButton("Refresh"))
             pollQueue(st);
@@ -758,13 +491,19 @@ void drawDownloadQueue(AppState& st) {
         ImGui::TextDisabled("%s", q.site.c_str());
         if (q.status == "done") {
             textRole(palette.statusOk, "  Done");
-            if (!q.artifactPath.empty()) {
+            if (!q.artifactPath.empty() && q.artifactKind == "cad" && q.cadValidated) {
                 ImGui::SameLine();
                 if (q.importing) {
                     spinner("Importing");
                 } else if (ImGui::SmallButton("Import into doc")) {
                     importQueuedArtifact(st, q.id, q.artifactPath);
                 }
+            } else if (!q.artifactPath.empty() && q.artifactKind == "cad" &&
+                       !q.cadValidated) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("Import unavailable");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("This CAD file has not passed import validation.");
             }
         } else if (q.status == "error") {
             textRole(palette.statusErr, "  Failed");
@@ -784,6 +523,34 @@ void drawDownloadQueue(AppState& st) {
             ImGui::PopStyleColor();
         }
         ImGui::EndGroup();
+        if (q.status == "error" && (!q.askUser.empty() || !q.candidates.empty())) {
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x);
+            if (!q.askUser.empty()) ImGui::TextUnformatted(q.askUser.c_str());
+            if (q.importing) ImGui::TextDisabled("Selecting…");
+            ImGui::BeginDisabled(q.importing);
+            ImGui::BeginDisabled(!q.canSelect);
+            for (size_t i = 0; i < q.candidates.size(); ++i) {
+                const auto& candidate = q.candidates[i];
+                ImGui::PushID((int)i);
+                const auto it = q.candidateLabels.find(candidate);
+                const std::string& fullLabel =
+                    it == q.candidateLabels.end() ? candidate : it->second;
+                const std::string label = ui::kit::elide(
+                    fullLabel.c_str(), ImGui::GetContentRegionAvail().x);
+                if (ImGui::Selectable(label.c_str()))
+                    selectQueuedArtifact(st, q.id, candidate);
+                if (!q.canSelect && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("The original search result is unavailable");
+                else if (label != fullLabel && ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", fullLabel.c_str());
+                ImGui::PopID();
+            }
+            ImGui::EndDisabled();
+            if (!q.candidates.empty() && ImGui::Button("Do not download"))
+                dismissQueuedChoice(q.id);
+            ImGui::EndDisabled();
+            ImGui::PopTextWrapPos();
+        }
         ImGui::Spacing();
         ImGui::PopID();
     }
@@ -866,6 +633,8 @@ void drawVendorsPopup(AppState& st) {
     ui::pushGlassWindowStyle();
     if (ImGui::Begin("Vendor Accounts##parts_vendors_popup", &S().vendorsPopupOpen,
                      ImGuiWindowFlags_NoCollapse)) {
+        if (ImGui::Button("Connect accounts"))
+            startLoginWizard(st);
         drawVendorSignInList(st);
         drawApiProviders(st);
         drawDownloadQueue(st);

@@ -97,7 +97,10 @@ def test_search_passes_through_ask_user_errors(provider_mods):
 
     hits = provider.search("widget")
 
-    assert hits == [{"ok": False, "reason": "login_required", "ask_user": {"kind": "approval"}}]
+    assert hits[0]["ok"] is False
+    assert hits[0]["site"] == "fakesite"
+    assert hits[0]["reason"] == "login_required"
+    assert hits[0]["ask_user"] == {"kind": "approval"}
 
 
 def test_get_without_profile_reaches_adapter(provider_mods):
@@ -121,10 +124,13 @@ def test_get_returns_none_for_other_site_part_id(provider_mods):
     assert provider.get("catalog:othersite::https://x") is None
 
 
-def test_get_acquires_and_builds_full_record(provider_mods):
+def test_get_acquires_and_builds_full_record(provider_mods, tmp_path):
     profiles, parts_provider = provider_mods
     profiles.profile_dir("fakesite").mkdir(parents=True)
     src = _FakeSourceAdapter()
+    artifact = tmp_path / "widget.step"
+    artifact.write_bytes(b"ISO-10303-21;\nHEADER;\nENDSEC;\n")
+    src.acquire_return["artifact_path"] = str(artifact)
     provider = parts_provider.BrowserCatalogAdapter(src)
     provider.search("widget")  # populate the cache with title
 
@@ -134,7 +140,7 @@ def test_get_acquires_and_builds_full_record(provider_mods):
     assert rec["ok"] if "ok" in rec else True
     assert rec["part_id"] == part_id
     assert rec["title"] == "Widget"
-    assert rec["geometry_ref"] == {"kind": "import_file", "path": "/tmp/widget.step"}
+    assert rec["geometry_ref"] == {"kind": "import_file", "path": str(artifact)}
     assert rec["license_note"] == "test license note"
     assert src.acquire_calls == [{"title": "Widget", "url": "https://fakesite.example/widget", "site": "fakesite"}]
 
@@ -175,16 +181,18 @@ def test_get_propagates_and_enriches_acquire_failure(provider_mods):
     assert rec["source_url"] == "https://fakesite.example/widget"
 
 
-def test_get_folds_vendor_extras_into_params(provider_mods):
+def test_get_folds_vendor_extras_into_params(provider_mods, tmp_path):
     """Acquire-envelope extras (e.g. McMaster sku + price) land in params
     alongside site/url/fetched_ts, so vendor/SKU/URL/fetched-at ride on the part record."""
     profiles, parts_provider = provider_mods
     profiles.profile_dir("fakesite").mkdir(parents=True)
     src = _FakeSourceAdapter()
+    artifact = tmp_path / "widget.step"
+    artifact.write_bytes(b"ISO-10303-21;\nHEADER;\nENDSEC;\n")
     src.acquire_return = {
         "ok": True, "source_url": "https://fakesite.example/widget",
         "fetched_ts": "2026-07-04T00:00:00Z", "session_profile_used": "fakesite",
-        "license_note": "n", "artifact_path": "/tmp/widget.step",
+        "license_note": "n", "artifact_path": str(artifact),
         "sku": "91290A115", "price": "$12.34",
     }
     provider = parts_provider.BrowserCatalogAdapter(src)
@@ -194,7 +202,7 @@ def test_get_folds_vendor_extras_into_params(provider_mods):
     assert rec["params"]["fetched_ts"] == "2026-07-04T00:00:00Z"
     assert rec["params"]["sku"] == "91290A115"
     assert rec["params"]["price"] == "$12.34"
-    assert rec["geometry_ref"] == {"kind": "import_file", "path": "/tmp/widget.step"}
+    assert rec["geometry_ref"] == {"kind": "import_file", "path": str(artifact)}
 
 
 def test_get_no_cad_vendor_has_null_geometry_and_price_in_params(provider_mods):
@@ -333,3 +341,89 @@ def test_health_row_shape_on_login_required(monkeypatch):
     assert r["error"] in ("login_required", "needs_human_login")
     assert r.get("expected") is True
     assert r["logged_in"] is False
+
+
+def test_search_preserves_source_fields_and_mixed_domains(provider_mods):
+    _, parts_provider = provider_mods
+    src = _FakeSourceAdapter()
+    src.search_return = [{
+        "title": "Bearing", "url": "https://fakesite.example/bearing", "sku": "SKU1",
+        "mpn": "MPN1", "manufacturer": "Maker", "material": "Steel", "kind": "product",
+        "price": 2.5, "currency": "EUR", "stock": 0, "thumbnail": "/bearing.jpg",
+        "model": {"available": False, "formats": ["step"]}, "license": "CC0",
+        "datasheet_url": "/spec.pdf",
+    }]
+    provider = parts_provider.BrowserCatalogAdapter(src)
+    rec = provider.search("bearing", domain=["catalog", "ecad"])[0]
+    for key, value in {"sku": "SKU1", "mpn": "MPN1", "manufacturer": "Maker",
+                       "material": "Steel", "kind": "product", "stock": 0,
+                       "model_available": False, "model_formats": ["step"], "license": "CC0",
+                       "thumbnail": "https://fakesite.example/bearing.jpg",
+                       "datasheet_url": "https://fakesite.example/spec.pdf"}.items():
+        assert rec["params"][key] == value
+    assert rec["sourcing"] == [{"vendor": "Fakesite", "price": 2.5, "currency": "EUR",
+                                "stock": 0, "url": "https://fakesite.example/bearing"}]
+
+
+def test_document_and_invalid_cad_never_become_geometry(provider_mods, tmp_path):
+    _, parts_provider = provider_mods
+    src = _FakeSourceAdapter()
+    provider = parts_provider.BrowserCatalogAdapter(src)
+    part_id = "catalog:fakesite::https://fakesite.example/widget"
+    pdf = tmp_path / "spec.pdf"
+    pdf.write_bytes(b"%PDF-1.7\ntest")
+    src.acquire_return.update(artifact_path=str(pdf), artifact_kind="document", format="pdf")
+    record = provider.get(part_id)
+    assert record["geometry_ref"] is None
+    assert record["params"]["datasheet_path"] == str(pdf)
+    bogus = tmp_path / "model.step"
+    bogus.write_bytes(b"<html>login</html>")
+    src.acquire_return.update(artifact_path=str(bogus), artifact_kind="cad", format="step")
+    failure = provider.get(part_id)
+    assert failure["ok"] is False and failure["site"] == "fakesite"
+
+
+def test_stock_is_preserved_without_a_price(provider_mods):
+    _, parts_provider = provider_mods
+    src = _FakeSourceAdapter()
+    src.search_return[0]["stock"] = 4
+    rec = parts_provider.BrowserCatalogAdapter(src).search("widget")[0]
+    assert rec["params"]["stock"] == 4
+    assert rec["sourcing"] == []
+
+
+def test_ambiguous_zip_requires_member_selection(provider_mods, tmp_path):
+    import zipfile
+    from pathlib import Path
+    _, parts_provider = provider_mods
+    src = _FakeSourceAdapter()
+    provider = parts_provider.BrowserCatalogAdapter(src)
+    part_id = "catalog:fakesite::https://fakesite.example/widget"
+    archive = tmp_path / "models.zip"
+    step = b"ISO-10303-21;\nHEADER;\nENDSEC;\n"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("a.step", step)
+        bundle.writestr("b.step", step)
+    src.acquire_return["artifact_path"] = str(archive)
+    record = provider.get(part_id)
+    assert record["ok"] is False and record["reason"] == "unsupported"
+    assert record["candidates"] == ["a.step", "b.step"]
+    assert record["ask_user"]["kind"] == "choice"
+    src.acquire_return.update(artifact_kind="cad", format="step", member="b.step")
+    selected = provider.get(part_id)
+    assert Path(selected["geometry_ref"]["path"]).read_bytes() == step
+    assert selected["params"]["archive_path"] == str(archive)
+
+
+def test_freecad_document_is_downloaded_but_not_offered_as_native_geometry(provider_mods, tmp_path):
+    import zipfile
+    _, parts_provider = provider_mods
+    src = _FakeSourceAdapter()
+    path = tmp_path / "part.FCStd"
+    with zipfile.ZipFile(path, "w") as bundle:
+        bundle.writestr("Document.xml", '<Document><Objects Count="0"/></Document>')
+    src.acquire_return.update(artifact_path=str(path), artifact_kind="cad", format="fcstd")
+    record = parts_provider.BrowserCatalogAdapter(src).get("catalog:fakesite::https://fakesite.example/widget")
+    assert record["geometry_ref"] is None
+    assert record["params"]["artifact_path"] == str(path)
+    assert record["params"]["import_supported"] is False

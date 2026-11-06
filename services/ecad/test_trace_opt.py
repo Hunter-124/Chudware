@@ -6,14 +6,14 @@ Run::
 """
 from __future__ import annotations
 
-import os
+import json
+from pathlib import Path
 import tempfile
 import time
 
 
 from services.ecad import schema
 from services.ecad.drc import run_drc
-from services.ecad.fab import write_gerber_layer, write_gerbers
 from services.ecad.impedance import track_impedance
 from services.ecad.trace_opt import optimize_traces
 
@@ -282,42 +282,27 @@ def test_idempotent_second_pass():
 
 
 def test_arc_survives_gerber_export():
-    t0 = time.perf_counter()
-    board = _board_with_corner_and_z0()
-    res = optimize_traces(board, opts={"targets": {"SIG": 50.0}})
-    doc = res["doc"]
-    arcs = [t for t in doc["tracks"] if t.get("kind") == "arc"]
-    assert arcs, "need at least one arc for gerber round-trip"
+    from services.mcp.ecad_common import _rpc
 
-    # Layer-level export (in-memory) plus full write_gerbers to a temp dir.
-    body = write_gerber_layer(doc, "F.Cu")
-    assert isinstance(body, str) and len(body) > 50
-    assert ("D01" in body) or ("G01" in body) or ("X" in body)
+    board = _board_with_corner_and_z0()
+    doc = optimize_traces(board, opts={"targets": {"SIG": 50.0}})["doc"]
+    assert any(t.get("kind") == "arc" for t in doc["tracks"])
 
     with tempfile.TemporaryDirectory() as td:
-        files = write_gerbers(doc, td)
-        assert isinstance(files, dict) and files, f"write_gerbers returned empty: {files!r}"
-        # Paths exist and front copper is non-empty.
-        for path in files.values():
-            assert os.path.isfile(path), path
-        fcu = None
-        for k, path in files.items():
-            if "F.Cu" in str(k) or str(path).endswith(".gtl") or "F_Cu" in str(path):
-                with open(path, "r", encoding="utf-8") as fh:
-                    fcu = fh.read()
-                break
-        if fcu is None:
-            # Any written file is fine as long as gerbers were produced.
-            path = next(iter(files.values()))
-            with open(path, "r", encoding="utf-8") as fh:
-                fcu = fh.read()
-        assert len(fcu) > 50
-
-    ms = (time.perf_counter() - t0) * 1000.0
-    print(f"  gerber round-trip wall-time: {ms:.2f} ms")
-    print(f"  gerber layers: {list(files.keys())}")
-    print(f"  arcs exported: {len(arcs)}")
-    print("  [gate e gerber arc round-trip] PASS")
+        source = Path(td) / "optimized.json"
+        source.write_text(json.dumps(doc), encoding="utf-8")
+        opened = _rpc("ecad_open", {"path": str(source)})
+        doc_id = opened["doc_id"]
+        try:
+            exported = _rpc("ecad_export", {
+                "doc_id": doc_id, "kind": "gerber", "path": str(Path(td) / "fab"),
+            })
+            paths = [Path(path) for path in exported["paths"]]
+            front = next(path for path in paths if "F_Cu" in path.name or path.suffix.lower() == ".gtl")
+            body = front.read_text(encoding="utf-8")
+            assert "G02" in body or "G03" in body, "optimized arc missing from front copper Gerber"
+        finally:
+            _rpc("ecad_close", {"doc_id": doc_id})
 
 def test_pure_no_mutate_and_signature():
     board = _board_with_corner_and_z0()

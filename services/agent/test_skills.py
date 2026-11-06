@@ -10,7 +10,83 @@ from pathlib import Path
 import pytest
 
 from services.agent import skills as sk
+from services.mcp.cad_guide import cad_guide_text
 
+def test_edit_part_helper_recovers_spilled_text(tmp_path):
+    import asyncio
+    import json
+    from types import SimpleNamespace
+
+    code = cad_guide_text("eval-helper").split("```python\n", 1)[1].split("\n```", 1)[0]
+    saved = tmp_path / 'reply "quoted".json'
+    saved.write_text(json.dumps("complete guide"), encoding="utf-8")
+    notice = ("\n\n[TRUNCATED: original text is 100 UTF-8 bytes; full_result="
+              + json.dumps(str(saved)) + "; load the complete JSON string]")
+    async def write(_):
+        return {"details": {"xdev": {"inner": "prefix" + notice}}}
+    namespace = {"tool": SimpleNamespace(write=write)}
+    exec(code, namespace)
+    assert asyncio.run(namespace["cad"]("cad_guide", topic="edit_part")) == "complete guide"
+
+
+def test_edit_part_helper_returns_auto_backgrounded_receipt():
+    import asyncio
+    import json
+    from types import SimpleNamespace
+
+    code = cad_guide_text("eval-helper").split("```python\n", 1)[1].split("\n```", 1)[0]
+    receipt = {"ok": True, "auto_backgrounded": True, "job_id": "job-1", "status": "running"}
+    calls = []
+
+    async def write(request):
+        calls.append((request["path"], json.loads(request["content"])))
+        return {"details": {"xdev": {"inner": receipt}}}
+
+    namespace = {"tool": SimpleNamespace(write=write)}
+    exec(code, namespace)
+    assert asyncio.run(namespace["cad"]("add_features", name="part")) == receipt
+    assert calls == [("xd://add_features", {"name": "part"})]
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_edit_part_helper_checks_spilled_structured_result(tmp_path, failed):
+    import asyncio
+    import json
+    from types import SimpleNamespace
+
+    code = cad_guide_text("eval-helper").split("```python\n", 1)[1].split("\n```", 1)[0]
+    result = {"ok": not failed, "error": "batch rejected"} if failed else {"ok": True, "features": [{"id": "f1"}]}
+    saved = tmp_path / "result.json"
+    saved.write_text(json.dumps(result), encoding="utf-8")
+
+    async def write(_):
+        return {"details": {"xdev": {"inner": {"_truncated": {"full_result": str(saved)}}}}}
+
+    namespace = {"tool": SimpleNamespace(write=write)}
+    exec(code, namespace)
+    if failed:
+        with pytest.raises(RuntimeError) as exc:
+            asyncio.run(namespace["cad"]("add_features"))
+        assert exc.value.args[0] == result
+    else:
+        assert asyncio.run(namespace["cad"]("add_features")) == result
+
+
+def test_edit_part_helper_raises_failed_reply():
+    import asyncio
+    from types import SimpleNamespace
+
+    code = cad_guide_text("eval-helper").split("```python\n", 1)[1].split("\n```", 1)[0]
+    failure = {"ok": False, "status": "done", "result": {"ok": False, "error": "batch rejected"}}
+
+    async def write(request):
+        return {"details": {"xdev": {"inner": failure}}}
+
+    namespace = {"tool": SimpleNamespace(write=write)}
+    exec(code, namespace)
+    with pytest.raises(RuntimeError) as exc:
+        asyncio.run(namespace["cad"]("add_features"))
+    assert exc.value.args[0] == failure
 
 # --------------------------------------------------------------------------- fixtures
 
@@ -76,25 +152,14 @@ def test_discover_builtins_from_repo():
     sk.clear_cache()
     skills = sk.discover_skills(force=True)
     names = {s.name for s in skills if s.source == "builtin"}
-    expected = {
-        "edit-part", "edit-assembly", "edit-sketch", "edit-feature",
-        "simulate", "assess-model-state", "source-parts", "ecad-board",
-        "skill-creator",
-        "make-drawing", "cam-job", "sheet-metal", "reverse-engineer", "plm-workflow",
-        "surface-modeling", "weldment-frame", "design-for-manufacturability",
-    }
+    expected = {p.name for p in (Path(__file__).parent / "skills" / "builtin").iterdir()
+                if p.is_dir() and (p / "SKILL.md").is_file()}
     assert expected <= names, f"missing builtins: {expected - names}"
     # skills_list shape
     listing = sk.list_skills()
     assert len([e for e in listing if e["name"] in expected]) == len(expected)
 
 
-def test_skill_creator_teaches_only_agent_reachable_write_surface():
-    creator = sk.get_skill("skill-creator")
-    assert creator is not None
-    assert "fs_write" in creator.body
-    assert "skills_save" not in creator.body
-    assert "skills_list" not in creator.body
 
 
 def test_precedence_project_over_user_over_builtin(skill_roots):
@@ -359,14 +424,17 @@ def test_skill_uri_resolve_and_traversal(skill_roots):
 # --------------------------------------------------------------------------- catalog + CRUD
 
 
-def test_catalog_block_lists_skills(skill_roots):
-    _write_skill(skill_roots["builtin"], "a", "desc a")
-    _write_skill(skill_roots["builtin"], "b", "desc b")
+def test_catalog_preserves_all_names_and_custom_descriptions(skill_roots):
+    _write_skill(skill_roots["builtin"], "edit-part", "part details")
+    for i in range(500):
+        _write_skill(skill_roots["builtin"], f"domain-{i:04}", "domain details")
+    _write_skill(skill_roots["user"], "custom", "custom details")
     sk.clear_cache()
     block = sk.catalog_block()
-    assert "[SKILLS]" in block
-    assert "- a: desc a" in block
-    assert "- b: desc b" in block
+    assert "part details" in block and "custom details" in block
+    assert "domain details" not in block
+    assert all(f"domain-{i:04}" in block for i in range(500))
+    assert len(block) > 4000
 
 
 def test_save_and_delete_user_skill(skill_roots):
@@ -383,8 +451,8 @@ def test_save_and_delete_user_skill(skill_roots):
     assert sk.get_skill("my-user") is None
 
 
-def test_skills_rpc_list_nine_builtins():
-    """RPC list returns the v1 + domain builtins when no overrides hide them."""
+def test_skills_rpc_list_builtins():
+    """RPC list returns the shipped builtins when no overrides hide them."""
     import os
     for k in ("CHUDWARE_SKILLS_PROJECT_DIR", "CHUDWARE_SKILLS_USER_DIR", "CHUDWARE_SKILLS_BUILTIN_DIR"):
         os.environ.pop(k, None)
@@ -393,13 +461,8 @@ def test_skills_rpc_list_nine_builtins():
     out = SKILLS_METHODS["skills_list"]({}, lambda *a, **k: None)
     assert out["ok"] is True
     names = {e["name"] for e in out["skills"]}
-    expected = {
-        "edit-part", "edit-assembly", "edit-sketch", "edit-feature",
-        "simulate", "assess-model-state", "source-parts", "ecad-board",
-        "skill-creator",
-        "make-drawing", "cam-job", "sheet-metal", "reverse-engineer", "plm-workflow",
-        "surface-modeling", "weldment-frame", "design-for-manufacturability",
-    }
+    expected = {p.name for p in (Path(__file__).parent / "skills" / "builtin").iterdir()
+                if p.is_dir() and (p / "SKILL.md").is_file()}
     assert expected <= names
     assert out["count"] >= len(expected)
 
@@ -482,6 +545,10 @@ def _fires(text: str, session_id: str) -> set[str]:
     return {s.name for s in sk.match_keyword_triggers(text, session_id=session_id)}
 
 
+def _activated_names(bodies: list[str]) -> set[str]:
+    return {body.split(" ", 2)[1] for body in bodies if body.startswith("[SKILL: ")}
+
+
 @pytest.mark.parametrize("text", [
     "make me a mudbucket for oil drilling and rigging",
     "build me a bracket",
@@ -528,6 +595,46 @@ def test_builtin_assembly_and_sketch_build_phrasings(real_builtins):
     assert "edit-sketch" in _fires("draw me a hex outline", "kwskt2")
 
 
+def _tool_fires(tool: str, args: dict, session_id: str) -> set[str]:
+    sk.reset_session(session_id)
+    bodies = sk.activate_for_prompt(
+        "", session_id=session_id, tools_about_to_run=[tool],
+        tool_ops=sk.tool_call_ops(tool, args),
+    )
+    return _activated_names(bodies)
+
+
+def test_builtin_edit_sketch_loads_on_sketch_ops_and_new_part(real_builtins):
+    sketch_ops = {"ops": [{"op": "add_feature", "feature": {"type": "box"}},
+                          {"op": "sketch_add_entity", "sketch": "f1", "entity": {}}]}
+    sketch_feature = {"ops": [{"op": "add_feature", "feature": {"type": "sketch"}}]}
+    box_only = {"ops": [{"op": "add_feature", "feature": {"type": "box"}},
+                        {"op": "set_material", "material": "al6061"}]}
+    assert "edit-sketch" in _tool_fires("add_features", sketch_ops, "opsk1")
+    assert "edit-sketch" in _tool_fires("add_features", sketch_feature, "opsk2")
+    assert "edit-sketch" in _tool_fires("new_part", {"name": "p"}, "opsk3")
+    assert "edit-sketch" not in _tool_fires("add_features", box_only, "opsk4")
+    assert "edit-sketch" not in _tool_fires("add_features", {}, "opsk5")
+
+
+def test_op_triggers_parse_and_fire_once_per_session(skill_roots):
+    d = skill_roots["builtin"] / "ops-skill"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(
+        "---\nname: ops-skill\ndescription: d\ninject: auto\ntriggers:\n"
+        "  ops: [\"sketch_*\"]\n---\n\nOPS BODY\n", encoding="utf-8",
+    )
+    sk.clear_cache()
+    skill = sk.get_skill("ops-skill")
+    assert skill is not None and skill.triggers.ops == ("sketch_*",)
+    ops = sk.tool_call_ops("add_features", {"ops": [{"op": "sketch_trim"}]})
+    sk.reset_session("opsonce")
+    assert len(sk.activate_for_prompt("", session_id="opsonce",
+                                      tools_about_to_run=["add_features"], tool_ops=ops)) == 1
+    assert sk.activate_for_prompt("", session_id="opsonce",
+                                  tools_about_to_run=["add_features"], tool_ops=ops) == []
+
+
 @pytest.mark.parametrize("text", ["add a fillet to the top edge", "add a hole through the boss",
                                   "add a chamfer on that edge"])
 def test_builtin_edit_feature_already_catches_add_phrasings(real_builtins, text):
@@ -538,13 +645,13 @@ def test_builtin_edit_feature_already_catches_add_phrasings(real_builtins, text)
 def test_builtin_build_phrasing_injects_once_per_session(real_builtins):
     sk.reset_session("kwonce")
     first = sk.activate_for_prompt("make me a mudbucket for oil drilling", session_id="kwonce")
-    assert any("# Edit Part" in b for b in first)
+    assert "edit-part" in _activated_names(first)
     again = sk.activate_for_prompt("build me a bracket too", session_id="kwonce")
-    assert not any("# Edit Part" in b for b in again)
+    assert "edit-part" not in _activated_names(again)
     # A different session still gets it.
     sk.reset_session("kwonce2")
     other = sk.activate_for_prompt("build me a bracket", session_id="kwonce2")
-    assert any("# Edit Part" in b for b in other)
+    assert "edit-part" in _activated_names(other)
 
 
 # ------------------------------- measured coverage gaps (28-prompt matrix)
@@ -614,33 +721,21 @@ def test_phrase_keyword_matches_across_whitespace_runs(real_builtins):
     assert "ecad-board" in _fires("please route  the  board next", "kwws2")
 
 
-def test_mid_session_turn_still_keyword_activates_while_catalog_is_suppressed(real_builtins):
-    """The static skills catalog is sent once per session (agent_turn
-    ~900-1000 tokens/turn saving), but keyword activation is a sibling branch,
-    not gated on it: a LATER user turn ("now make a drawing of it") must still
-    pull make-drawing in. Pins both halves so the saving cannot be widened to
-    swallow activation.
+def test_mid_session_turn_still_keyword_activates_each_skill_once(real_builtins):
+    """Keyword activation is per turn: a LATER user turn ("now make a drawing of
+    it") must still pull make-drawing in, while the once-per-session guard keeps
+    the earlier skill from resending.
     """
-    from services.agent import agent_turn as at
-
     sid = "midsession-kw"
-    key = "midsession-catalog-key"
     sk.reset_session(sid)
-    at._CATALOG_INJECTED_SESSIONS.discard(key)
     try:
-        # Turn 1: catalog is due, and the build phrasing pulls edit-part.
-        assert at._catalog_due(key) is True
         first = sk.activate_for_prompt("make me a bracket 50mm long", session_id=sid)
-        assert any("# Edit Part" in b for b in first)
+        assert "edit-part" in _activated_names(first)
 
-        # Turn 2, same session: catalog suppressed, keyword activation still live.
-        assert at._catalog_due(key) is False
         second = sk.activate_for_prompt("now make a 2D drawing of it", session_id=sid)
-        assert any("# Make Drawing" in b for b in second)
-        # ...and the once-per-session guard keeps the earlier skill from resending.
-        assert not any("# Edit Part" in b for b in second)
+        assert "make-drawing" in _activated_names(second)
+        assert "edit-part" not in _activated_names(second)
     finally:
-        at._CATALOG_INJECTED_SESSIONS.discard(key)
         sk.reset_session(sid)
 
 
@@ -653,7 +748,7 @@ def test_plain_3d_printing_does_not_activate_reverse_engineering():
     sk.reset_session("print-not-re")
     bodies = sk.activate_for_prompt(
         "Design a new enclosure for FDM 3D printing", session_id="print-not-re")
-    assert not any("# Reverse Engineer" in body for body in bodies)
+    assert "reverse-engineer" not in _activated_names(bodies)
 
 
 def test_new_domain_skills_activate_on_specific_intent():
@@ -663,11 +758,10 @@ def test_new_domain_skills_activate_on_specific_intent():
         os.environ.pop(key, None)
     sk.clear_cache()
     cases = [
-        ("surface", "build a boundary surface and thicken it", "# Surface Modeling"),
-        ("weld", "make a square tube welded frame", "# Weldment Frame"),
-        ("dfm", "run a design for manufacturability review", "# Design for Manufacturability"),
+        ("surface", "build a boundary surface and thicken it", "surface-modeling"),
+        ("weld", "make a square tube welded frame", "weldment-frame"),
+        ("dfm", "run a design for manufacturability review", "design-for-manufacturability"),
     ]
-    for session, prompt, heading in cases:
+    for session, prompt, name in cases:
         sk.reset_session(session)
-        assert any(heading in body for body in
-                   sk.activate_for_prompt(prompt, session_id=session))
+        assert name in _activated_names(sk.activate_for_prompt(prompt, session_id=session))

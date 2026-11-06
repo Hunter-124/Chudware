@@ -7,7 +7,7 @@
 //   ✓ a chip written by ANOTHER process forgets its doc id and pick ids (hostd doc ids are
 //     sequential per daemon and get reused) but keeps its path and geometry for rebinding
 //   ✓ re-picking an entity detaches it — also after its provisional id became the engine sid
-//   ✓ the inline prompt text (offline route / steer) names the sid, owner and geometry,
+//   ✓ the inline prompt text (steer) names the sid, owner and geometry,
 //     including a straight edge's endpoints
 
 #include "core/context_ref.h"

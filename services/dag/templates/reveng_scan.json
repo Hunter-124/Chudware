@@ -25,12 +25,12 @@
       "type": "plan",
       "name": "Sparse reconstruction (SfM)",
       "inputs": {
-        "request": "Run sparse SfM (pycolmap/GLOMAP, feed-forward fallback on weak registration), then attempt the ArUco-mat scale solve against the new sparse model.",
+        "request": "Run sparse SfM on the union of stills and video frames, persist a shared undistorted dataset and attempt the ArUco scale solve.",
         "session_id": "$inputs.session_id",
         "tools": ["reveng_reconstruct", "reveng_set_scale", "reveng_status", "mission_status"]
       },
       "tools": ["reveng_reconstruct", "reveng_set_scale", "reveng_status", "mission_status"],
-      "end_condition": "A registered COLMAP sparse model exists in the session dir.",
+      "end_condition": "A registered COLMAP dataset and source mapping exist in the session.",
       "verify": null,
       "on_fail": "pause",
       "autonomy": "auto"
@@ -56,11 +56,11 @@
       "type": "plan",
       "name": "Dense + splat + mesh cleanup",
       "inputs": {
-        "request": "Run dense MVS (OpenMVS) and/or Brush splat from the sparse model, then clean the mesh applying the confirmed mm_per_unit.",
+        "request": "Use the same SfM dataset for Brush and OpenMVS. If OpenMVS is unavailable, extract an explicitly approximate mesh from Gaussian centers. Apply the confirmed similarity transform consistently.",
         "session_id": "$inputs.session_id",
-        "tools": ["reveng_reconstruct", "reveng_status", "mission_status"]
+        "tools": ["reveng_reconstruct", "reveng_splat_to_mesh", "reveng_status", "mission_status"]
       },
-      "tools": ["reveng_reconstruct", "reveng_status", "mission_status"],
+      "tools": ["reveng_reconstruct", "reveng_splat_to_mesh", "reveng_status", "mission_status"],
       "end_condition": "Cleaned mesh artifact available in session dir with an honest mesh_units tag.",
       "verify": null,
       "on_fail": "pause",

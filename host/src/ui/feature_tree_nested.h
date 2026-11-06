@@ -1,13 +1,20 @@
 #pragma once
 
+#include <cstdint>
+#include <memory>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
+namespace core { struct DocMirrorSnapshot; }
+
 namespace ui {
 
 enum class NestedDocumentState {
+    Loading,
     Ready,
     Missing,
     Unreadable,
@@ -19,6 +26,7 @@ struct NestedFeature {
     std::string name;
     std::string type;
     std::string folder;
+    std::string popupId;
     nlohmann::json raw;
 };
 
@@ -42,16 +50,26 @@ struct NestedDocument {
     std::string error;
     std::vector<NestedFeature> features;
     std::vector<NestedComponent> components;
+    // Derived once with the immutable document, not once per visible component instance.
+    std::unordered_map<std::string, size_t> featureById;
+    std::unordered_map<std::string, std::vector<size_t>> childrenOf;
+    std::unordered_set<std::string> nestedSketches;
+    std::vector<size_t> references;
+    std::unordered_map<std::string, std::string> folderIds;
 };
 
-// Cached native-document metadata for an assembly component. The cache is keyed by normalized
-// absolute path and invalidated by file mtime/size, so expanding a component is allocation-free on
-// steady frames while a save from an in-context edit is picked up immediately.
-const NestedDocument& featureTreeNestedDocument(const std::string& absPath);
+// Canonicalization is memoized by input string (bounded cache shared with tree grouping).
+std::string featureTreeCanonicalPath(const std::string& path);
 
-// Drop a path from the nested-document cache (or the whole cache when absPath is empty). Call after
-// an out-of-band save of a component .step+ so the next tree draw re-reads material/features even if
-// the filesystem mtime granularity would otherwise keep the prior slot for one more frame.
+// Stat checks and native-document parsing run on one background worker, at most once a second
+// per path. An immutable handle keeps existing rows alive during refresh and cache eviction.
+std::shared_ptr<const NestedDocument> featureTreeNestedDocument(const std::string& absPath);
+// Prefer the live open document's immutable snapshot to the on-disk archive.
+std::shared_ptr<const NestedDocument> featureTreeNestedDocument(
+    const std::string& absPath, const core::DocMirrorSnapshot& snapshot);
+
+// Force the next asynchronous refresh after an in-app save, retaining the last complete rows.
+// Empty path refreshes all cached documents; obsolete in-flight results are discarded.
 void invalidateFeatureTreeNestedDocument(const std::string& absPath = {});
 
 }  // namespace ui

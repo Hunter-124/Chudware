@@ -17,6 +17,8 @@
 //          Collinear p1/pm/p2 is degenerate and fails edge compile downstream.)
 //   spline {points:[[x,y,z],…]}                              3·N vars (cubic
 //          interpolation through every point, like the 2D `spline`)
+//   eq_curve3d {xt,yt,zt,t1,t2}                              equation-driven curve; rigid
+//          (0 DOF), endpoints p1=P(t1) / p2=P(t2) are fixed coincident/point_on targets
 // All entities carry construction:bool (construction geometry never joins wires).
 //
 // HANDLES: "e3" whole entity; "e3.p" (point); "e3.p1"/"e3.p2" (line + arc
@@ -58,6 +60,9 @@ struct Sketch3DSolution {
     std::vector<std::string> redundant;    // constraint ids
     std::vector<std::string> conflicting;  // constraint ids
     std::vector<std::pair<std::string, std::string>> skipped; // (constraint id, reason)
+    // Per dependent (redundant or conflicting) constraint tag: the tags of the independent
+    // constraints it duplicates or contradicts (Analysis::dependency_partners; exact solve only).
+    std::vector<std::pair<std::string, std::vector<std::string>>> dependency_partners;
     bool converged = false;
     SolveState3 state;  // warm-start state for the next solve / drag
 };
@@ -68,6 +73,12 @@ struct Sketch3DSolution {
 // prior SolveState3 for per-entity warm-starting, gated on the entity's JSON
 // signature exactly like the 2D solver.
 Sketch3DSolution solve_sketch3d(const nlohmann::json& sketch, const nlohmann::json& env);
+
+// Why a solve did not converge, for the compile error and sketch3d_health: names each
+// conflicting constraint with its type and driving value, and the constraints it conflicts
+// with ("c3 (distance 40) conflicts with c1 (distance 30), c2 (parallel)"), plus any skipped
+// constraints. `sketch` is the input given to solve_sketch3d.
+std::string nonconvergence_reason(const nlohmann::json& sketch, const Sketch3DSolution& sol);
 Sketch3DSolution solve_sketch3d(const nlohmann::json& sketch, const nlohmann::json& env,
                                 const std::optional<SolveState3>& warm);
 

@@ -30,7 +30,8 @@ bool agentDocInProject(const std::string& path, const std::string& originProject
                        const std::string& activeProjectDir);
 
 // Feed one drained orchestrator event (kind with "orch_" already stripped). GL-thread only.
-void activeWorkFeedEvent(const std::string& kind, const nlohmann::json& data);
+void activeWorkFeedEvent(const std::string& conversationId, const std::string& kind,
+                         const nlohmann::json& data);
 
 // Once per frame from the AI workspace: observes per-doc revision deltas, renders at most one
 // pending preview texture, collects/starts at most one background AICM parse, and frees the

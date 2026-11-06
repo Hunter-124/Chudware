@@ -111,6 +111,85 @@ TEST_CASE("analysis properties use net catalog and hollow geometry") {
     CHECK_THROWS_AS(section_properties("RHS100x50x30", "steel"), std::invalid_argument);
 }
 
+TEST_CASE("dimensional raw stock sections use physical geometry and exact materials") {
+    constexpr double pi = 3.14159265358979323846;
+    const auto round = section_properties("ROUND 25.4", "6061-T6");
+    const double d2 = 25.4 * 25.4;
+    const double circle_i = pi * d2 * d2 / 64.0;
+    CHECK(round.E == 69000.0);
+    CHECK(round.G == 26000.0);
+    CHECK(round.nu == 0.33);
+    CHECK(round.A == doctest::Approx(pi * d2 / 4.0));
+    CHECK(round.Iy == doctest::Approx(circle_i));
+    CHECK(round.Iz == doctest::Approx(circle_i));
+    CHECK(round.J == doctest::Approx(2.0 * circle_i));
+    CHECK(round.S_major == doctest::Approx(2.0 * circle_i / 25.4));
+    CHECK(round.S_minor == doctest::Approx(round.S_major));
+    CHECK(material_properties("alu_6061").E == 69000.0);
+    CHECK(material_properties("7075-T6").E == 71700.0);
+    CHECK(material_properties("1018").nu == 0.29);
+    CHECK(material_properties("304").E == 193000.0);
+    CHECK(material_properties("360-brass").E == 97000.0);
+    CHECK(material_properties("acrylic").E == 3200.0);
+    CHECK(material_properties("polycarbonate").E == 2300.0);
+
+    const auto hex = section_properties("HEX 20", "6061-T6");
+    const double hex_i = 5.0 * std::sqrt(3.0) * 20.0 * 20.0 * 20.0 * 20.0 / 144.0;
+    CHECK(hex.A == doctest::Approx(std::sqrt(3.0) * 200.0));
+    CHECK(hex.Iy == doctest::Approx(hex_i));
+    CHECK(hex.Iz == doctest::Approx(hex_i));
+    CHECK(hex.S_major == doctest::Approx(hex_i / 10.0));
+    CHECK(hex.S_minor == doctest::Approx(hex_i * std::sqrt(3.0) / 20.0));
+    CHECK(hex.J == doctest::Approx(0.1152 * 20.0 * 20.0 * 20.0 * 20.0).epsilon(0.001));
+    CHECK(hex.J < hex.Iy + hex.Iz);
+
+    const auto rect = section_properties("RECT 40x10", "1018");
+    const auto legacy_rect = section_properties("40x10", "steel");
+    CHECK(rect.A == doctest::Approx(400.0));
+    CHECK(rect.Iz == doctest::Approx(40.0 * 1000.0 / 12.0));
+    CHECK(rect.Iy == doctest::Approx(10.0 * 64000.0 / 12.0));
+    CHECK(rect.S_major == doctest::Approx(rect.Iz / 5.0));
+    CHECK(rect.S_minor == doctest::Approx(rect.Iy / 20.0));
+    CHECK(rect.J == doctest::Approx(legacy_rect.J));
+    const auto tube = section_properties("CHS 25.4x1.5", "6061-T6");
+    CHECK(tube.A == doctest::Approx(pi * (d2 - 22.4 * 22.4) / 4.0));
+    CHECK(tube.J == doctest::Approx(2.0 * tube.Iz));
+    CHECK(tube.A == doctest::Approx(section_properties("PIPE25.4x1.5", "6061-T6").A));
+}
+
+TEST_CASE("stock dimensions and unsupported exact materials fail closed") {
+    for (const char* section : {"ROUND", "ROUND -10", "ROUND 0", "ROUND 10x2",
+                                "HEX", "HEX -20", "RECT 10", "RECT 10x0",
+                                "RECT 10x-2", "CHS 25", "CHS 25x12.5",
+                                "6061-T6", "PLATE 6061-T6", "10x2junk",
+                                "ROUND 1e999"}) {
+        INFO("section=" << section);
+        CHECK_THROWS_AS(section_properties(section, "6061-T6"), std::invalid_argument);
+    }
+    for (const char* material : {"4140", "316", "acetal", "hdpe", "ptfe",
+                                 "steel_4140", "aluminum_9999"}) {
+        INFO("material=" << material);
+        CHECK_THROWS_AS(section_properties("ROUND 10", material), std::invalid_argument);
+    }
+}
+
+TEST_CASE("structural analysis consumes dimensional 6061 round bar") {
+    json doc = load_fixture("cantilever.json");
+    doc["elements"][0]["section_name"] = "ROUND 25.4";
+    doc["elements"][0]["material"] = "6061-T6";
+    const StructureDoc parsed = structure_doc_from_dict(doc);
+    CHECK(parsed.elements[0].section_name == "ROUND 25.4");
+    CHECK(parsed.elements[0].material == "6061-T6");
+    const json out = rpc("struct_analyze", {{"doc", doc}, {"load_combo", "DEAD_LIVE"}});
+    const json* r = row_for(out["results"], "beam1");
+    REQUIRE(r != nullptr);
+    constexpr double pi = 3.14159265358979323846;
+    const double d2 = 25.4 * 25.4;
+    const double I = pi * d2 * d2 / 64.0;
+    const double expected = 600.0 * 3000.0 * 3000.0 * 3000.0 / (3.0 * 69000.0 * I);
+    CHECK(std::abs((*r)["deflection_mm"].get<double>()) == doctest::Approx(expected).epsilon(0.02));
+}
+
 TEST_CASE("load combo presets") {
     CHECK(get_combo("dead_live").name == "DEAD_LIVE");
     CHECK(get_combo("DEAD_LIVE_WIND").wind == 0.5);

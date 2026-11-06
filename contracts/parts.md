@@ -280,3 +280,199 @@ Nine site keys join the §6.3 browser-catalog vocabulary (labels in
 `gui_rpc._SITE_LABELS`); adapters land separately and absent adapters degrade to
 "never matches": `grainger`, `fastenal`, `homedepot`, `lowes`, `acehardware`,
 `harborfreight`, `tractorsupply`, `onlinemetals`, `metalsdepot`.
+
+## 8. Portable rights-aware libraries — `aicad.parts-library/1` (append-only)
+
+`services.parts.parts_library` publishes and ingests portable batches into the existing
+parts registry and search index; it is not a second catalog or a deployed storage service.
+A publisher may host the resulting files on an optional static HTTPS mirror.
+
+The manifest has `schema`, `library_id`, nonempty string `revision`, and `records`.
+Each record has a stable `part_id` of `<domain>:<library_id>:<local_id>`; each
+component uses letters, digits, `_`, `.` or `-`. IDs must not collide with bundled or
+unrelated records. Preserve `standard`, `designation`, `aliases`, `params`, `sourcing`,
+`provenance` and `license` when known. `units` (nonempty string or object),
+`geometry_quality` (nonempty description), `references` (array), and `rights` are
+required. Each reference has `identifier` and `kind` (`dimensional` or `identifier`);
+include edition, URL and locator when available. An identifier-only reference does
+not establish dimensions or standard compliance. State geometry fidelity and evidence
+honestly; a standard designation alone is not certification.
+
+Example metadata-only record, using the producer's field names:
+
+```json
+{
+  "schema": "aicad.parts-library/1",
+  "library_id": "example",
+  "revision": "r1",
+  "records": [{
+    "part_id": "fastener:example:bolt", "domain": "fastener",
+    "title": "Example Bolt", "standard": "ISO 4762", "designation": "M8",
+    "aliases": ["specialbolt"], "params": {"length_mm": 20}, "sourcing": [],
+    "provenance": "Publisher data", "license": "CC-BY-4.0", "units": "mm",
+    "geometry_quality": "nominal",
+    "references": [{"identifier": "ISO 4762", "kind": "identifier"}],
+    "rights": {"redistribute": true, "license_expression": "CC-BY-4.0",
+               "attribution": "Example Publisher"}
+  }]
+}
+```
+
+Metadata-only records are searchable but cannot be placed without geometry. A
+record may instead supply a supported portable non-file `geometry_ref` recipe, or
+an `artifact` (not both). An artifact has a confined relative `path`, supported
+`format`, exact positive `size_bytes`, lowercase `sha256`, separate `rights`, and
+optional text `notice`. Artifact rights are independent: metadata permission never
+authorizes model redistribution. Portable metadata must not contain absolute local
+paths, file URLs or credential-bearing URLs.
+
+`publish_library(manifest_path, artifact_root, output_dir)` validates the manifest,
+checks exact artifact bytes and affirmative redistribution rights for both metadata
+and artifacts, and emits deterministic `manifest.json`, objects and `notices/NOTICE.txt`
+to a separate empty directory. Publication accepts the producer's known license
+allowlist and requires nonempty attribution. Do not publish vendor models without
+their own redistribution rights. `ingest_manifest` can register a local manifest,
+optionally verifying and caching objects from `artifact_root`; `sync_manifest` explicitly
+fetches a credential-free HTTPS manifest pinned by SHA-256. Mirrors are optional
+credential-free HTTPS bases; ordinary search/get does not sync the library.
+
+A namespace is bound to its approved source identity: the resolved local manifest path
+or the sync URL. A different source is refused unless the caller explicitly authorizes
+`replace_namespace=True`. This changes the approved source for that namespace; it is
+not permission to redistribute content. MCP exposes `part_library_ingest`,
+`part_library_sync`, and `part_acquire` (not `part_library_acquire`).
+`part_acquire(part_id, offline=True)` verifies cached size and digest without a network
+fetch and fails on missing or corrupt objects; online acquisition fetches only explicitly
+and verifies before publication to cache. `include_live=False` enables offline lookup.
+
+Mechanical placement produces a detached native document from the selected record,
+retaining its identity, provenance, rights and artifact hash where available. Later
+registry updates do not mutate that placed copy; save the native part in the project
+before referencing it in an assembly. In a cell, a verified manifest artifact is
+materialized as a read-only, content-addressed project-local reference at
+`.chudware/catalog/<sha256>/model.<format>`; an existing object must be immutable
+and match the recorded digest and size. Cell paths remain subject to admission;
+use `part_acquire` rather than `part_get(acquire=True)` inside a cell.
+
+## 9. Parts Library contract revision 2 — browse, previews and source acquisition
+
+This revision supersedes conflicting historical statements in §§3–7, including
+§4 ranking and §7.4 unknown-category handling; the `aicad.parts/1` PartRecord
+schema identifier is unchanged. Earlier text remains as the frozen v1 history.
+Current producers are `services/parts/` (hub, index and adapters) and
+`services/browser/adapters/`; native part generation and placement live in
+`core/parts/`. `services/mcp/parts_tools.py` exposes search, get, placement,
+sourcing, acquisition and library tools, not only the two tools listed in §5.
+Section, fitting, hydraulic and ECAD adapters and `part_place` are implemented;
+their older descriptions as reserved seams are historical.
+
+### Search and browse
+
+`PartsIndex.search` builds coverage-aware FTS tiers, dropping term groups absent
+from the corpus and relaxing quorum when needed. Each tier scores an exact
+normalized designation +1000, standard prefix +100, a large quorum bonus and
+weighted negative BM25; the best score per part is retained and ties sort by
+part ID. A real query with no matches returns no records, not arbitrary browse
+results. GUI search applies additional relevance scoring and filters.
+
+`parts_search` accepts nonnegative `offset` (default 0) and `limit` (default
+50, capped at 200). Category, facets, price, material, vendor and source
+filters and sorting precede pagination. Empty unscoped browsing uses stable,
+diverse category/family ordering. The response includes `count` for the page,
+`offset`, `total` for matching collected candidates, `total_exact`, and
+`has_more` within those candidates. `total_exact=false` warns of incomplete
+coverage, including the 20,000 candidate cap, live search, deferred native
+ECAD browsing or provider failures; it is not a promise of a complete count.
+Unknown `category_id` returns `ok:false`, `reason:"unknown_category"` and a
+hint, rather than silently broadening the search.
+
+GUI result items include `price` (0.0 when unknown), `currency` (empty when
+unknown), USD-only `price_usd`, `kind`, `thumbnail_url`, `mpn`, `manufacturer`,
+`stock` (-1 when unknown), `model_formats`, `family` and `designation`.
+Unknown strings are empty, formats are an empty list, and an unknown library
+vendor is empty rather than “Library”. Display names are concise human titles;
+search aliases are not appended to them.
+
+### Preview pipeline
+
+`parts_thumbnail` and `parts_thumbnails` return preview provenance `cad_render`
+for a native render or `product_image` for a vendor product photo. Logos and
+favicons are not part previews. Missing previews return an unsuccessful entry
+with a reason; batches are chunked rather than truncated.
+`services.parts.thumbs.resolve_previews(items, budget_s=20.0, allow_network=True)`
+accepts `{item_id, image_url}` requests and returns one ordered result per
+request: `{item_id, ok, data, mime, provenance, reason}`. It uses bounded,
+cached rendering and image fetching; `data` is bytes or `None`.
+
+`part_search` defaults to `previews=True`. Its result rows have `index` labels
+matching a PNG contact sheet of up to 16 rows, with title, vendor, designation
+and either an aspect-preserved image tagged CAD render/Product photo or “No
+preview”. `preview_sheet` carries `pictured`, `omitted` and `reason`; pictured
+indices include tiles with no image. `previews=False` omits the image. Sheet
+generation never acquires a model; preview appearance is not proof of identity
+or dimensions.
+
+### Browser source records and artifacts
+
+`make_hit` normalizes source search hits to `site`, `title`, `url`, `kind`,
+`sku`, `mpn`, `manufacturer`, `price`, `currency`, `stock`, `material`,
+`thumbnail`, `model:{available,formats}` and `license`, plus optional source
+fields. Kinds are `product`, `series`, `category`, `document`, `model`,
+`project`, `page`. Unknown scalar values are null. Thumbnail URLs are absolute
+HTTP(S) product/model images, not logos. The parts provider preserves known
+metadata in `params` and creates sourcing entries when price is known.
+
+Failures use `{ok:false, site, op, reason, hint, url, status, retry_after_s,
+ask_user}`; unknown optional values are null. `FAIL_REASONS` comprises
+`blocked`, `captcha`, `login_required`, `not_found`, `parse_failed`, `timeout`,
+`transport_failed`, `policy_refused`, `unsupported`, `terms_required`,
+`rate_limited`, `credentials_required` and `internal_error`. Enriched failures
+may retain an original reason and other details. `credentials_required`
+indicates missing API credentials, not browser sign-in. Search failures are
+returned as notice entries, not disguised as successful hits.
+
+Successful acquisition identifies `artifact_path`, `artifact_kind` (`cad`,
+`document`, `ecad` or `archive`), `format` and provenance. Only validated CAD
+can become import geometry; documents remain datasheets. `validate_cad` checks
+file content, including STEP, IGES and STL, and safely inspects supported ZIP
+members; it rejects empty, HTML and PDF masquerading as CAD. The validator also
+supports other formats listed in `services/browser/cad_validate.py`.
+
+DigiKey, Mouser and Nexar have official API search integrations configured
+with the user's credentials in Settings. DigiKey and Mouser can fall back to
+their public site when credentials are absent; Nexar reports
+`credentials_required`. Source results and model availability depend on the
+provider and access, not on an assumed CAD download.
+
+## 10. Standalone section, fitting and seal placement (additive)
+
+AS568 seal records use the `oring_as568` core family and an `AS568-xxx` size.
+Their nominal inch dimensions are converted to millimetres without rounding,
+and the resulting part is a circular sketch revolved into an editable torus.
+
+With no target document, `section_profile` and `fitting_id` can create new
+editable mechanical part documents. AISC and dressed-lumber sections use a
+sketch and extrusion; `length_mm` is editable and defaults to three times the
+section depth. The curated AISC table lacks rolled fillet radii and flange
+taper, so generated steel profiles use sharp corners and parallel flanges, and
+the idealized profile area need not equal the catalog's rolled-section area.
+
+The curated AISC section table has been checked against the
+[AISC Shapes Database v16.0](https://www.aisc.org/aisc/publications/steel-construction-manual/aisc-shapes-database-v160/).
+Its corrected dimensional **and analysis** properties can change results
+relative to older catalogs; rerun affected structural analyses.
+
+Fitting geometry resolves the precise catalog ID against the native B16 table.
+Elbow, tee, reducer and flange models use the catalog dimensions and pipe
+schedule tables. When no schedule is supplied they use schedule 40, recorded
+as an assumption. These are nominal generated models, not certification of
+rolled, welded, threaded or sealing-face details. Missing catalog or geometry
+data returns a failure; it must not substitute a different fitting or size.
+
+Passing a structural or piping schema document retains the existing schema
+placement path. Structural lookup and takeoff accept the catalog's `AISC360:`
+and `NDS:` section-name prefixes; an NDS placement defaults to lumber material
+unless a material is supplied. Fitting identity, including reducer secondary
+NPS and flange class, comes from the catalog ID; conflicting overrides fail. Hydraulic schema
+placement likewise uses the ISO 1219 component identity, rather than defaulting
+an unspecified component type to a pump.

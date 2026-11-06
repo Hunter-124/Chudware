@@ -68,6 +68,8 @@ def _block(name: str) -> str:
                                                      "height": 20}}}]))
     if not r2.get("ok"):
         pytest.skip(f"add_features failed: {r2}")
+    assigned = json.loads(bind_tool("set_material")(doc_id=doc_id, material="steel"))
+    assert assigned.get("ok"), assigned
     return doc_id
 
 
@@ -204,11 +206,120 @@ def test_fatigue_accepts_the_polar_plural_load(bc_doc):
     out = json.loads(_dispatch()("run_fea_fatigue")(
         fixtures=["bottom"],
         loads=[{"faces": ["top"], "magnitude": 2000, "direction": [0, 0, -1]}],
-        mesh_fineness="coarse", doc_id=bc_doc))
+        mesh_fineness="coarse", doc_id=bc_doc, material="steel", kf=1, stress_basis="resolved"))
     if out.get("skipped"):
         pytest.skip(f"fatigue backend unavailable: {out.get('reason')}")
     assert out.get("ok") is True, out
     assert float(out["fos_endurance"]) > 0.0, out
+
+
+@pytest.mark.parametrize(
+    "extra, message",
+    [({}, "explicit kf"), ({"kf": 0.9}, "kf must be >= 1"),
+     ({"kf": 2}, "stress_basis='nominal'"),
+     ({"kf": 2, "stress_basis": "resolved"}, "double-counts"),
+     ({"hot_spot": "node-1"}, "location-specific")])
+def test_fatigue_refuses_missing_or_inappropriate_notch_information(bc_doc, extra, message):
+    out = json.loads(_dispatch()("run_fea_fatigue")(
+        doc_id=bc_doc, fixtures=["bottom"],
+        loads=[{"face": "top", "force": [0, 0, -2000]}], material="steel", **extra))
+    assert out["ok"] is False, out
+    assert message in out["error"], out
+    assert "job_id" not in out
+
+
+@pytest.mark.parametrize("background", [False, True])
+def test_fatigue_nominal_kf_reaches_job_metadata_without_changing_marin(
+        bc_doc, monkeypatch, background):
+    seen = []
+    def capture(kind, stage, payload, meta, **kwargs):
+        seen.append((kind, payload, meta, kwargs))
+        return {"ok": True}
+    monkeypatch.setattr(sim_tools, "_run_solve", capture)
+    monkeypatch.setattr(sim_tools, "_autosave_all_open", lambda: None)
+    out = json.loads(_dispatch()("run_fea_fatigue")(
+        doc_id=bc_doc, fixtures=["bottom"],
+        loads=[{"face": "top", "force": [0, 0, -2000]}],
+        material="steel", kf=1.8, stress_basis="nominal", background=background))
+    assert out["ok"] is True
+    kind, payload, meta, kwargs = seen[0]
+    assert kind == "fea_fatigue" and kwargs["background"] is background
+    assert meta["kf"] == 1.8 and meta["stress_basis"] == "nominal"
+    assert payload["params"]["study"]["fatigue"]["se_corrected_mpa"] == \
+        meta["marin"]["se_corrected_mpa"]
+
+
+@pytest.mark.parametrize("applied,explicit,expected_ultimate", [
+    ("alu_6061", None, 310),
+    ("alu_6061", "steel", 400),
+])
+def test_fatigue_material_default_and_explicit_override(
+        bc_doc, monkeypatch, applied, explicit, expected_ultimate):
+    from services.verify import battery
+
+    queries = []
+    def lookup(doc):
+        queries.append(doc)
+        return applied, None
+    monkeypatch.setattr(battery, "_applied_material_key", lookup)
+    seen = []
+    def capture(kind, stage, payload, meta, **kwargs):
+        seen.append((payload, meta))
+        return {"ok": True}
+    monkeypatch.setattr(sim_tools, "_run_solve", capture)
+    monkeypatch.setattr(sim_tools, "_autosave_all_open", lambda: None)
+    kwargs = {} if explicit is None else {"material": explicit}
+    out = json.loads(_dispatch()("run_fea_fatigue")(
+        doc_id=bc_doc, fixtures=["bottom"],
+        loads=[{"face": "top", "force": [0, 0, -2000]}], kf=1, **kwargs))
+    assert out["ok"] is True, out
+    payload, meta = seen[0]
+    assert payload["params"]["study"]["fatigue"]["ultimate_mpa"] == expected_ultimate
+    assert meta["material"]["ultimate_mpa"] == expected_ultimate
+    assert queries == ([bc_doc] if explicit is None else [])
+
+
+def test_fatigue_refuses_missing_applied_material(bc_doc, monkeypatch):
+    from services.verify import battery
+
+    monkeypatch.setattr(battery, "_applied_material_key", lambda doc: (None, None))
+    out = json.loads(_dispatch()("run_fea_fatigue")(
+        doc_id=bc_doc, fixtures=["bottom"],
+        loads=[{"face": "top", "force": [0, 0, -2000]}], kf=1))
+    assert out["ok"] is False
+    assert "material" in out["error"].lower()
+    assert "job_id" not in out
+
+
+def test_fatigue_refuses_unresolved_applied_material(bc_doc, monkeypatch):
+    from services.verify import battery
+
+    monkeypatch.setattr(battery, "_applied_material_key",
+                        lambda doc: (None, "mixed document materials"))
+    out = json.loads(_dispatch()("run_fea_fatigue")(
+        doc_id=bc_doc, fixtures=["bottom"],
+        loads=[{"face": "top", "force": [0, 0, -2000]}], kf=1))
+    assert out["ok"] is False
+    assert "mixed document materials" in out["error"]
+
+
+def test_fatigue_collector_applies_and_persists_kf(monkeypatch):
+    saved = []
+    monkeypatch.setattr(sim_tools, "_persist_study",
+                        lambda doc, study: saved.append(study) or "study")
+    meta = {"doc": "doc", "theory": "goodman", "marin": {"se_corrected_mpa": 200},
+            "ultimate_mpa": 400, "kf": 1.8, "stress_basis": "nominal"}
+    raw = {"ok": True, "summary": {"theories": {"goodman": {"sa_eq_mpa": 100}}}}
+    result = sim_tools._collect_job_fatigue({"meta": meta}, raw)
+    assert result["ok"] is True
+    assert result["kf"] == 1.8
+    assert result["fos_endurance"] == pytest.approx(200 / 180, abs=0.0001)
+    assert saved[0]["kf"] == 1.8 and saved[0]["stress_basis"] == "nominal"
+
+    missing = sim_tools._collect_job_fatigue({"meta": {k: v for k, v in meta.items()
+                                                       if k != "kf"}}, raw)
+    assert missing["ok"] is False
+    assert "kf" in missing["error"]
 
 
 def test_transient_thermal_accepts_plural_hot_and_cold_faces(bc_doc):
@@ -236,6 +347,8 @@ def buckling_column_doc():
         }},
     ]))
     assert out.get("ok"), out
+    assigned = json.loads(bind_tool("set_material")(doc_id=doc_id, material="steel"))
+    assert assigned.get("ok"), assigned
     return doc_id
 
 
@@ -1081,7 +1194,7 @@ def test_the_async_lane_refuses_the_zero_load_study_before_starting_a_job(bc_doc
 def test_fatigue_with_no_load_no_longer_reports_infinite_life(bc_doc):
     """The most dangerous instance: ok:true, regime "infinite" == "this part never fails"."""
     out = json.loads(_dispatch()("run_fea_fatigue")(doc_id=bc_doc, fixtures=["bottom"],
-                                                    loads=[]))
+                                                    loads=[], material="steel"))
     assert out["ok"] is False, out
     assert "no non-zero load" in out["error"], out
     assert out.get("regime") is None, out
@@ -1789,7 +1902,7 @@ def test_legacy_kinds_keep_their_sim_status_and_sim_results_semantics(
     simjobs._set(failed, state=simjobs.FAILED, error="the solver process exited")
     status = json.loads(tools["sim_status"](job_id=failed))
     assert status["state"] == simjobs.FAILED and "meta" not in status, status
-    assert "code" not in status and "detail" not in status, status
+    assert status["code"] == "error" and "detail" not in status, status
     out = json.loads(tools["sim_results"](job_id=failed))
     assert out["ok"] is False and out["state"] == simjobs.FAILED, out
     assert out["solver_error"] == "mesh rejected", out

@@ -14,9 +14,9 @@ class _FakeHost:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []
         self.responses: dict[str, dict] = {
-            "memory_remember": {"ok": True, "id": "mem-17"},
-            "memory_recall": {"ok": True, "hits": []},
-            "memory_stats": {"ok": True, "count": 0, "exists": False},
+            "memory_save": {"ok": True, "ids": ["mem-17"], "stored": 1},
+            "memory_search": {"ok": True, "items": []},
+            "memory_status": {"ok": True, "backend": "local", "active": True},
         }
         self.error: Exception | None = None
 
@@ -33,7 +33,7 @@ class TestProjectMemoryOffline(unittest.TestCase):
         self._host = mock.patch.object(
             pm,
             "_default_host",
-            side_effect=AssertionError("offline memory called Chudcode"),
+            side_effect=AssertionError("offline memory called Omp"),
         )
         self._host.start()
         self.root = Path(self._tmp.name)
@@ -123,25 +123,23 @@ class TestProjectMemoryOnline(unittest.TestCase):
         mid = pm.remember(
             self.root,
             "  Anodize   after tapping  ",
-            kind="finish",
             source="reviewer",
             importance=2.0,
         )
-        self.assertEqual(mid, pm._stable_int_id("mem-17"))
+        self.assertEqual(mid, "mem-17")
         self.assertEqual(len(self.host.calls), 1)
         command, payload = self.host.calls[0]
-        self.assertEqual(command, "memory_remember")
+        self.assertEqual(command, "memory_save")
         self.assertEqual(payload["root"], str(self.root.resolve()))
         self.assertEqual(payload["content"], "Anodize after tapping")
-        self.assertEqual(payload["kind"], "finish")
         self.assertEqual(payload["source"], "reviewer")
         self.assertEqual(payload["importance"], 1.0)
         self.assertFalse(pm.memory_db_path(self.root).exists())
 
     def test_online_recall_forwards_scope_and_reapplies_bounds(self) -> None:
-        self.host.responses["memory_recall"] = {
+        self.host.responses["memory_search"] = {
             "ok": True,
-            "hits": [
+            "items": [
                 {
                     "id": f"m-{i}",
                     "content": f"note {i}: " + ("bracket fillet detail " * 30),
@@ -159,32 +157,32 @@ class TestProjectMemoryOnline(unittest.TestCase):
             "bracket fillet",
             limit=7,
             token_budget=80,
-            kind="decision",
         )
         command, payload = self.host.calls[0]
-        self.assertEqual(command, "memory_recall")
+        self.assertEqual(command, "memory_search")
         self.assertEqual(payload["root"], str(self.root.resolve()))
         self.assertEqual(payload["limit"], 7)
-        self.assertEqual(payload["tokenBudget"], 80)
-        self.assertEqual(payload["kind"], "decision")
         self.assertGreaterEqual(len(hits), 1)
         self.assertLessEqual(len(hits), 7)
         self.assertLessEqual(sum(int(hit["tokens"]) for hit in hits), 80)
         for hit in hits:
             self.assertEqual(hit["tokens"], pm.estimate_tokens(hit["content"]))
 
-    def test_online_stats_keeps_plm_path_convention(self) -> None:
-        self.host.responses["memory_stats"] = {
-            "ok": True,
-            "path": "/private/chudcode/store.db",
-            "count": 3,
-            "exists": True,
-            "kinds": {"decision": 3},
+    def test_online_stats_returns_actual_runtime_status(self) -> None:
+        self.host.responses["memory_status"] = {
+            "ok": True, "backend": "local", "active": True,
+            "database": "/private/omp/store.db",
         }
         result = pm.stats(self.root)
-        self.assertEqual(result["path"], str(pm.memory_db_path(self.root)))
-        self.assertEqual(result["count"], 3)
-        self.assertEqual(result["kinds"], {"decision": 3})
+        self.assertEqual(result["database"], "/private/omp/store.db")
+        self.assertEqual(result["backend"], "local")
+
+    def test_online_kind_filter_is_explicitly_unsupported(self) -> None:
+        with self.assertRaisesRegex(pm.ProjectMemoryUnavailable, "kind filter"):
+            pm.recall(self.root, "anything", kind="decision")
+        with self.assertRaisesRegex(pm.ProjectMemoryUnavailable, "kind"):
+            pm.remember(self.root, "anything", kind="decision")
+        self.assertEqual(self.host.calls, [])
 
     def test_online_unavailable_is_honest_and_never_falls_back(self) -> None:
         self.host.error = RuntimeError("worker stopped")
@@ -193,11 +191,11 @@ class TestProjectMemoryOnline(unittest.TestCase):
         self.assertFalse(pm.memory_db_path(self.root).exists())
 
     def test_online_failure_result_is_honest(self) -> None:
-        self.host.responses["memory_recall"] = {
+        self.host.responses["memory_search"] = {
             "ok": False,
-            "reason": "no live Chudcode service",
+            "reason": "no live Omp service",
         }
-        with self.assertRaisesRegex(pm.ProjectMemoryUnavailable, "no live Chudcode"):
+        with self.assertRaisesRegex(pm.ProjectMemoryUnavailable, "no live Omp"):
             pm.recall(self.root, "anything")
 
 

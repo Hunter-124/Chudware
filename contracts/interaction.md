@@ -90,8 +90,8 @@ Every asked question and every answer persists **before** the answer is returned
 caller, so a resumed or handed-off agent NEVER re-asks a resolved question.
 
 - **`scope: run`** → append to `<cache>/runs/<run_id>/interaction.jsonl`, one JSON record
-  per line: `{"t": "question"|"answer", <object>}`. `<cache>` is resolved the same way the
-  C++ run machine resolves it (`core/agent/paths.cpp` — `%APPDATA%/Chudware/cache` on Windows,
+  per line: `{"t": "question"|"answer", <object>}`. `<cache>` is `cache_root()` in
+  `services/agent/interaction.py` (`%APPDATA%/Chudware/cache` on Windows,
   `$XDG_DATA_HOME|~/.local/share`/`Chudware/cache` on Linux/macOS).
 - **`scope: doc`** → the document's intake ledger (`IntakeState`,
   `services/intake/intake.py`), round-tripped as JSON into the `.step+` record like
@@ -118,7 +118,7 @@ never silently coerced.
 ## 7. Events
 
 Q/A ride the existing `events.jsonl` envelope (`events.md`) with two new kinds, under the
-persist-then-callback ordering contract (`core/agent/events.cpp`): the record is written to
+persist-then-callback ordering contract (`services/agent/interaction.py`): the record is written to
 `interaction.jsonl` **before** the event callback fires.
 
 | kind | data |
@@ -258,3 +258,7 @@ These rules bind role prompts and `ask_user` call sites; they do not change the 
   steer. Every resolution emits `agent.answer` with `source` `user` | `reply` | `declined` |
   `cancelled`; only `user` produces §4 answers (`source: "user"`). Live batches persist to the
   run ledger but never replay by id (models reuse `q1`). Headless turns keep the default path.
+
+- **v1.3 (2026-10-28, append-only):** the current online producer is
+  `services/agent/omp_questions.TurnQuestions`, replacing the historical module
+  pointer in v1.2. The question and answer wire contract remains unchanged.

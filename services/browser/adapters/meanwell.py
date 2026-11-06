@@ -1,10 +1,9 @@
 """services/browser/adapters/meanwell.py — MEAN WELL source adapter (Parts Library V2).
 
 MEAN WELL (meanwell.com): switching power supplies, DC-DC converters, and LED
-drivers. Each model page carries a datasheet PDF, so ``acquire`` uses the
-inherited default ``extract_params`` — :func:`~._retail.find_datasheet_url`
-grabs the datasheet/spec PDF. Challenge/login pages degrade to
-``login_required`` — never solved.
+drivers. Search returns series, not configured products. The inherited retail
+acquisition can fetch a linked datasheet as a document, not CAD. Access
+challenges are reported and never solved.
 
 Live-verified 2026-07-10: the real search is
 ``/productSearch.aspx?pkeywords=<q>`` (HTTP 200; the old ``/search?q=`` guess
@@ -22,9 +21,10 @@ marker and is dropped.
 from __future__ import annotations
 
 import re
-from urllib.parse import urljoin
+from html import unescape
+from urllib.parse import unquote
 
-from . import register
+from . import abs_url, fail, make_hit, register
 from ._retail import RetailAdapter
 
 SITE = "meanwell"
@@ -39,41 +39,68 @@ LICENSE_NOTE = (
     "engineering reference. See contracts/license_debt.md."
 )
 
-# The public catalog needs no login; the header "Sign In"/"Log In" widget rides
-# every page, so it is NOT a wall marker here.
-_LOGIN_WALL_MARKERS: tuple[str, ...] = ()
-_CHALLENGE_MARKERS = ("Access Denied", "Pardon Our Interruption")
+# The public header has sign-in links; only explicit access-gate copy counts.
+_LOGIN_WALL_MARKERS = ("Please sign in to continue", "You must be logged in")
+_CHALLENGE_MARKERS = (
+    "Access Denied", "Pardon Our Interruption", "Verify you are human",
+    "verify you are human", "<h1>CAPTCHA</h1>", "Please complete the CAPTCHA",
+)
 
 # Each result row's PDF-browse anchor carries the series/model in `prod=<MODEL>`.
 _CARD_RE = re.compile(
-    r'<a href="(?P<href>/webapp/product/search\.aspx\?prod=(?P<model>[^"&]+))"',
+    r'''<a\b[^>]*\bhref=["'](?P<href>/webapp/product/search\.aspx\?prod=(?P<model>[^"'&]+))["']''',
     re.IGNORECASE)
+_EMPTY_RESULTS_RE = re.compile(
+    r'''<div\b[^>]*\bid=["']productSearch["'][^>]*>\s*
+        <div\b[^>]*\bclass=["'][^"']*\bheader\b[^"']*["'][^>]*>\s*
+        <h2\b[^>]*>\s*Search\s+Results\s*</h2>\s*</div>\s*</div>''',
+    re.IGNORECASE | re.VERBOSE,
+)
 
 
 class MeanWellAdapter(RetailAdapter):
     key = SITE
+    hosts = ("meanwell.com",)
+    result_kinds = ("series",)
+    cad_acquisition = False
+    login_required = False
+    api = False
     base_url = BASE_URL
     search_url_tmpl = SEARCH_URL_TMPL
     license_note = LICENSE_NOTE
     login_wall_markers = _LOGIN_WALL_MARKERS
     challenge_markers = _CHALLENGE_MARKERS
 
+    def is_no_results(self, content: str) -> bool:
+        # The live site renders just this header when there are no matches.
+        # A table or any other content in the results container is not proof
+        # of an empty search and must still be parsed.
+        return bool(_EMPTY_RESULTS_RE.search(content)) or super().is_no_results(content)
+
+    def search(self, query: str) -> list[dict]:
+        hits = super().search(query)
+        if not hits:
+            return [fail(
+                self.key, "search", "not_found",
+                "No MEAN WELL series matched. Search by a series or model token "
+                "(for example, LRS or RSP-320); free-text product descriptions may not match.",
+                url=self.search_url(query),
+            )]
+        return hits
+
     def parse_search(self, content: str) -> list[dict]:
         hits: list[dict] = []
         seen: set[str] = set()
         for m in _CARD_RE.finditer(content):
-            model = m.group("model").strip()
-            if not model or model in seen:
+            model = unquote(unescape(m.group("model"))).strip()
+            url = abs_url(self.base_url, unescape(m.group("href")))
+            if not model or not url or model in seen:
                 continue
             seen.add(model)
-            hits.append({
-                "ok": True,
-                "title": model,
-                "url": urljoin(self.base_url, m.group("href")),
-                "site": SITE,
-                "part_number": model,
-                "kind": "series",
-            })
+            hits.append(make_hit(
+                self.key, title=model, url=url, kind="series", manufacturer="MEAN WELL",
+                extra={"ok": True},
+            ))
         return hits
 
 

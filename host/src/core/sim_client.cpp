@@ -13,6 +13,7 @@
 #include "app_state.h"  // jstr/jint/jnum/jbool safe JSON accessors
 #include "cpp_core.h"   // in-process C++ core (libchudware) — the sim backend when no Python worker
 #include "engine_backend.h"  // daemonMode — WASM/desktop hostd path (no child sim worker)
+#include "../ui/anim.h"
 
 namespace core {
 
@@ -284,6 +285,7 @@ void SimClient::startCancelLocked(bool allowSettled) {
             }
             if (!accepted) cancelRequested_ = false;
             cancelInFlight_ = false;
+            ui::anim::wakeLoop();
         });
     } catch (const std::exception&) {
         cancelInFlight_ = false;
@@ -494,15 +496,18 @@ bool SimClient::launch(const std::string& method, nlohmann::json params,
                         if (!ev.text.empty()) progLog_ = ev.text;
                         if (ev.hasIteration) recordIterationLocked(ev.iteration);
                     }
-                    std::lock_guard<std::mutex> lk(job_.evMtx);
-                    // An owner that is not drawing never drains: drop the oldest quarter rather
-                    // than grow for the whole solve (iterations survive in iterations_).
-                    if (job_.events.size() >= SimJobResult::kMaxQueuedEvents)
-                        job_.events.erase(
-                            job_.events.begin(),
-                            job_.events.begin() + static_cast<std::ptrdiff_t>(
-                                                      SimJobResult::kMaxQueuedEvents / 4));
-                    job_.events.push_back(std::move(ev));
+                    {
+                        std::lock_guard<std::mutex> lk(job_.evMtx);
+                        // An owner that is not drawing never drains: drop the oldest quarter rather
+                        // than grow for the whole solve (iterations survive in iterations_).
+                        if (job_.events.size() >= SimJobResult::kMaxQueuedEvents)
+                            job_.events.erase(
+                                job_.events.begin(),
+                                job_.events.begin() + static_cast<std::ptrdiff_t>(
+                                                          SimJobResult::kMaxQueuedEvents / 4));
+                        job_.events.push_back(std::move(ev));
+                    }
+                    ui::anim::wakeLoop();
                 };
 
                 nlohmann::json result;
@@ -594,6 +599,7 @@ bool SimClient::launch(const std::string& method, nlohmann::json params,
                 }
                 job_.ready = true;
                 job_.running = false;
+                ui::anim::wakeLoop();
             });
     } catch (const std::exception& ex) {
         launchNs_ = 0LL;

@@ -100,15 +100,15 @@ def test_worker_mint_and_control_hide_other_actor(tmp_path, monkeypatch):
     from services.agent import worker_rpc
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
     calls = []
-    monkeypatch.setattr(worker_rpc, "get_default_chudcode_host", lambda: SimpleNamespace(
+    monkeypatch.setattr(worker_rpc, "get_default_omp_host", lambda: SimpleNamespace(
         cancel=lambda run_id, **kw: calls.append(run_id) or {"ok": True}))
     with rc.bind_context(principal()):
         handles = worker_rpc._agent_handles_new({}, lambda event: None)
         assert handles["ok"]
-        assert worker_rpc.chudcode_control("cancel", {"run_id": handles["run_id"]})["ok"]
+        assert worker_rpc.omp_control("cancel", {"run_id": handles["run_id"]})["ok"]
     with rc.bind_context(principal("bob")):
-        missing = worker_rpc.chudcode_control("cancel", {"run_id": "absent"})
-        assert worker_rpc.chudcode_control("cancel", {"run_id": handles["run_id"]}) == missing
+        missing = worker_rpc.omp_control("cancel", {"run_id": "absent"})
+        assert worker_rpc.omp_control("cancel", {"run_id": handles["run_id"]}) == missing
         assert worker_rpc._agent_handles_new({"session_id": handles["session_id"]}, lambda event: None) == missing
     assert calls == [handles["run_id"]]
 
@@ -119,7 +119,7 @@ def test_history_seed_scope_does_not_collide(tmp_path, monkeypatch):
     try:
         for actor in ("alice", "bob"):
             with rc.bind_context(principal(actor)):
-                assert worker_rpc._claim_history_seed("same", [{"role": "user", "text": actor}], resumed=False)[1]
+                assert worker_rpc._claim_history_seed("same", [], resumed=False)[1]
                 assert not worker_rpc._claim_history_seed("same", [], resumed=False)[1]
     finally:
         worker_rpc._HISTORY_SEEDED_SESSIONS.clear()
@@ -277,35 +277,31 @@ def test_delegated_stop_is_trusted_cancel_only_without_provider_secret(monkeypat
 @pytest.mark.parametrize(("method", "extra"), [
     ("session_handoff", {}),
     ("session_btw", {"question": "What changed?"}),
-    ("session_compact", {}),
-    ("chudcode_export_session", {}),
-    ("chudcode_branch_session", {"entry_id": "entry"}),
-    ("chudcode_rewind_session", {"user_text": "prompt", "occurrence": 0}),
-    ("chudcode_repair_session", {}),
-    ("chudcode_close_session", {}),
-    ("chudcode_session_stats", {}),
-    ("chudcode_compact", {}),
-    ("chudcode_set_auto_compaction", {"enabled": True}),
-    ("chudcode_set_auto_retry", {"enabled": True}),
-    ("chudcode_tool_state", {}),
+    ("omp_export_session", {}),
+    ("omp_branch_session", {"entry_id": "entry"}),
+    ("omp_close_session", {}),
+    ("omp_session_stats", {}),
+    ("omp_set_auto_compaction", {"enabled": True}),
+    ("omp_set_auto_retry", {"enabled": True}),
+    ("omp_tool_state", {}),
 ])
 def test_session_rpc_foreign_and_absent_have_identical_typed_failure(
     method, extra, tmp_path, monkeypatch,
 ):
-    from services.agent import chudcode_host, config, session_cmds, worker_rpc
+    from services.agent import omp_host, config, session_cmds, worker_rpc
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
     monkeypatch.delenv("CHUDWARE_ACTOR_SANDBOX", raising=False)
     monkeypatch.setattr(session_cmds, "_offline_enabled", lambda: False)
     monkeypatch.setattr(config, "online_compaction_settings", lambda: ("summary", {}))
-    host = chudcode_host.ChudcodeSessionHost(
+    host = omp_host.OmpSessionHost(
         client_factory=lambda **kwargs: pytest.fail("boundary failure launched a client"),
     )
-    monkeypatch.setattr(chudcode_host, "get_default_chudcode_host", lambda: host)
-    monkeypatch.setattr(worker_rpc, "get_default_chudcode_host", lambda: host)
+    monkeypatch.setattr(omp_host, "get_default_omp_host", lambda: host)
+    monkeypatch.setattr(worker_rpc, "get_default_omp_host", lambda: host)
     with rc.bind_context(principal()):
         session_id = rc.mint_handle("session")
         key = rc.scoped_key(session_id)
-        session = chudcode_host._Session(
+        session = omp_host._Session(
             session_id=session_id, client=object(), resume_file=None,
             workspace_dir="/work", registry_key=key,
             launch_params={"provider": "fixture"},

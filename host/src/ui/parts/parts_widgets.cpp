@@ -516,14 +516,9 @@ void borderCardRect(ImDrawList* dl, ImVec2 p0, ImVec2 p1, bool selected, bool ho
 // Part thumbnails and vendor logos ride ONE texture cache (S().thumbs) and ONE AsyncRpc
 // dispatch thread, so they share a single request budget here.
 //
-// Cost model, measured against the live worker: an uncached standard part is RENDERED on
-// demand (services/parts/gui_rpc.py::_render_local_part_png — parts_make → material/threads →
-// doc_render_png) and takes 2-4 s; a vendor image is an HTTP fetch of a few hundred ms; every
-// later request for that id is a disk-cache hit at ~0 ms. AsyncRpc dispatches FIFO on a SINGLE
-// thread, and drawResultsList/drawResultsGrid call requestThumb for every row every frame (no
-// clipper), so one round trip PER IMAGE meant a 100-row search paid 100 serialized round trips
-// four at a time: minutes of queue in which the queue/live-search/taxonomy polls behind them
-// never ran and most cards never got their image.
+// Uncached standard-part previews render actual selectable geometry through
+// services/parts/thumbs.py; vendor product images are fetched and cached separately.
+// Visible rows and a small surrounding margin are requested first.
 //
 // So requests are BATCHED. requestThumb / requestVendorLogo no longer dispatch: they push onto
 // a pending queue, and a flush drains up to kThumbBatch of them into ONE `parts_thumbnails`
@@ -555,11 +550,11 @@ constexpr size_t kThumbPendingCap = 4096;
 // has latched off against a worker that predates the plural method.
 constexpr size_t kMaxThumbInFlight = 4;
 
-// A transport failure (worker still booting, socket EOF, timeout) is NOT an answer, so it must
-// never reach thumbFailed — a startup race would blank that card for the whole session. Retry
-// it a bounded number of times with a widening gap, then stop.
+// Transient failures get a few quick retries, then a cooldown matching the
+// worker's short-lived negative cache. Only no_preview is definitive.
 constexpr int    kThumbTransportRetries = 3;
 constexpr double kThumbRetryBackoffSec  = 2.0;
+constexpr double kThumbFailureCooldownSec = 65.0;
 
 // Safety net for the budgets above: AsyncRpc::shutdown() drops queued and undrained callbacks
 // unrun, so an id can sit in thumbBusy with no callback ever arriving — and a wedged batch slot
@@ -646,21 +641,23 @@ static bool retryVendorLogoAlternate(const std::string& id) {
     return true;
 }
 
-// A failed thumbnail is a permanent property of the record for this session — a part with no
-// vendor image and no renderable geometry has nothing to show — so thumbFailed is a suppression
-// list, not a cache. It must never be mass-cleared: dropping every id at once makes the next
-// scroll re-fire a burst of RPCs that are all doomed to fail again. Bound it by refusing new
-// entries once the cap is reached; the cap is set where a realistic session will never reach it.
-// ONLY a definitive answer reaches here — transport failures retry, see the callbacks below.
-static void markThumbFailed(const std::string& id) {
-    // The ONE place every definitive failure funnels through (worker ok:false, empty payload,
-    // undecodable bytes, retry budget exhausted), so it is the one place the vendor-logo
-    // second provider needs to hook.
+// Keep definitive misses suppressed; expose transient failures until their cooldown
+// expires, then let a visible row request them again.
+static void markThumbFailed(const std::string& id, const std::string& reason = "preview_failed") {
+    // All failures pass here, including undecodable payloads and exhausted retries.
+    // A vendor logo gets one alternate provider before its failure is recorded.
     if (retryVendorLogoAlternate(id)) return;
     constexpr size_t kFailedCap = 65536;
     if (S().thumbFailed.size() < kFailedCap) {
         S().thumbFailed.insert(id);
-        gThumbReq.erase(id);   // suppressed for good — no retry bookkeeping left to keep
+        S().thumbErrors[id] = reason;
+        if (reason == "no_preview") {
+            gThumbReq.erase(id);
+        } else {
+            ThumbReq& request = gThumbReq[id];
+            request.attempts = 0;
+            request.retryAt = ImGui::GetTime() + kThumbFailureCooldownSec;
+        }
     } else {
         // Cap reached: the id cannot be recorded, so park it on a long backoff instead.
         // Suppression by other means; never a per-frame re-request storm.
@@ -668,11 +665,22 @@ static void markThumbFailed(const std::string& id) {
     }
 }
 
-void storeThumb(const std::string& id, const std::vector<unsigned char>& bytes) {
+static void releaseRetryableFailure(const std::string& id) {
+    if (!S().thumbFailed.count(id)) return;
+    const auto request = gThumbReq.find(id);
+    if (request == gThumbReq.end() || request->second.retryAt > ImGui::GetTime()) return;
+    S().thumbFailed.erase(id);
+    S().thumbErrors.erase(id);
+    gThumbReq.erase(request);
+}
+
+void storeThumb(const std::string& id, const std::vector<unsigned char>& bytes,
+                const std::string& provenance) {
     int w = 0, h = 0, n = 0;
     unsigned char* px = stbi_load_from_memory(bytes.data(), (int)bytes.size(), &w, &h, &n, 4);
     if (!px) { markThumbFailed(id); return; }
     Thumb t;
+    t.provenance = provenance;
     t.w = w; t.h = h;
     glGenTextures(1, &t.tex);
     glBindTexture(GL_TEXTURE_2D, t.tex);
@@ -760,24 +768,26 @@ static void issueThumbRequest(AppState& st, const std::string& id, const std::st
         // FIRST on every path: the in-flight slot is released whatever happens below.
         S().thumbBusy.erase(id);
         if (!r.ok) {
-            // Transport-level failure — the worker never answered. Permanent only when it says
-            // it has no such method (it will not grow one mid-session; same signal
-            // parts_vendors.cpp reads for healthSupported). Everything else is retryable.
+            // A missing singular method cannot use the quick transport retry path;
+            // other transport failures get the bounded short retries first.
             if (r.err.find("unknown method") != std::string::npos) {
                 markThumbFailed(id);
                 return;
             }
             ThumbReq& q = gThumbReq[id];
-            if (++q.attempts >= kThumbTransportRetries) { markThumbFailed(id); return; }
+            if (++q.attempts >= kThumbTransportRetries) { markThumbFailed(id, "transport_failed"); return; }
             q.retryAt = ImGui::GetTime() + kThumbRetryBackoffSec * q.attempts;
             return;
         }
-        // The worker answered: ok:false means it looked and there is nothing to show.
-        if (!r.result.is_object() || !r.result.value("ok", false)) { markThumbFailed(id); return; }
+        if (!r.result.is_object() || !r.result.value("ok", false)) {
+            markThumbFailed(id, r.result.is_object()
+                ? r.result.value("reason", std::string("preview_failed")) : "preview_failed");
+            return;
+        }
         const std::string b64 = r.result.value("image_b64", "");
         if (b64.empty()) { markThumbFailed(id); return; }
-        storeThumb(id, b64decode(b64));   // marks failed itself if the bytes will not decode
-        gThumbReq.erase(id);
+        storeThumb(id, b64decode(b64), r.result.value("provenance", std::string()));
+        if (S().thumbs.count(id)) gThumbReq.erase(id);
     });
 }
 
@@ -799,6 +809,7 @@ static void enqueueThumb(const std::string& id, const std::string& url) {
     // Blank or whitespace-only can never be answered — the worker replies ok:false
     // "item_id required", which is definitive. Never pay a batch slot for it.
     if (trimmedId(id).empty()) return;
+    releaseRetryableFailure(id);
     if (S().thumbs.count(id) || S().thumbBusy.count(id) || S().thumbFailed.count(id)) return;
     if (gPendingIds.count(id)) return;
     if (gPending.size() >= kThumbPendingCap) return;
@@ -865,10 +876,12 @@ static bool issueBatch(AppState& st, double now) {
                 for (size_t i = 0; i < ids.size(); ++i) enqueueThumb(ids[i], urls[i]);
                 return;
             }
-            // Transport failure — not an answer. Bounded retries per id, then give up.
+            // Transport failure — quick retries, then a retryable cooldown.
             for (size_t i = 0; i < ids.size(); ++i) {
                 ThumbReq& q = gThumbReq[ids[i]];
-                if (++q.attempts >= kThumbTransportRetries) { markThumbFailed(ids[i]); continue; }
+                if (++q.attempts >= kThumbTransportRetries) {
+                    markThumbFailed(ids[i], "transport_failed"); continue;
+                }
                 q.retryAt = now2 + kThumbRetryBackoffSec * q.attempts;
                 enqueueThumb(ids[i], urls[i]);
             }
@@ -889,12 +902,8 @@ static bool issueBatch(AppState& st, double now) {
             return;
         }
 
-        // Per-entry: ok:false here IS a definitive answer (the worker looked and found
-        // nothing) — with ONE exception, reason "timeout". The worker cuts a batch loose at
-        // CHUDWARE_THUMB_BATCH_BUDGET_S and reports the unfinished entries that way WITHOUT
-        // negatively caching them, so neither may we: suppressing one would permanently blank
-        // a card whose render is merely slow. Retried on the same bounded budget as a
-        // transport failure.
+        // no_preview is definitive. Timeouts get quick retries; other failures
+        // remain visible during a cooldown before the next request.
         //
         // Entries are matched by item_id, NOT by array position: the worker's ordering is a
         // guarantee this code deliberately does not lean on. The echoed item_id is the
@@ -924,18 +933,18 @@ static bool issueBatch(AppState& st, double now) {
             if (!e.value("ok", false)) {
                 if (e.value("reason", std::string()) == "timeout") {
                     ThumbReq& q = gThumbReq[id];
-                    if (++q.attempts >= kThumbTransportRetries) { markThumbFailed(id); continue; }
+                    if (++q.attempts >= kThumbTransportRetries) { markThumbFailed(id, "timeout"); continue; }
                     q.retryAt = now2 + kThumbRetryBackoffSec * q.attempts;
                     enqueueThumb(id, urls[slot]);
                     continue;
                 }
-                markThumbFailed(id);
+                markThumbFailed(id, e.value("reason", std::string("preview_failed")));
                 continue;
             }
             const std::string b64 = e.value("image_b64", std::string());
             if (b64.empty()) { markThumbFailed(id); continue; }
-            storeThumb(id, b64decode(b64));   // marks failed itself if the bytes will not decode
-            gThumbReq.erase(id);
+            storeThumb(id, b64decode(b64), e.value("provenance", std::string()));
+            if (S().thumbs.count(id)) gThumbReq.erase(id);
         }
         // Partial response: an id we asked about that came back in no entry is NOT an answer.
         // Treat it exactly like a transport failure so a truncating worker can neither blank
@@ -943,7 +952,9 @@ static bool issueBatch(AppState& st, double now) {
         for (size_t i = 0; i < ids.size(); ++i) {
             if (answered.count(ids[i])) continue;
             ThumbReq& q = gThumbReq[ids[i]];
-            if (++q.attempts >= kThumbTransportRetries) { markThumbFailed(ids[i]); continue; }
+            if (++q.attempts >= kThumbTransportRetries) {
+                markThumbFailed(ids[i], "transport_failed"); continue;
+            }
             q.retryAt = now2 + kThumbRetryBackoffSec * q.attempts;
             enqueueThumb(ids[i], urls[i]);
         }
@@ -1012,22 +1023,21 @@ static void maybeAutoFlush(AppState& st) {
 
 void requestThumb(AppState& st, const PartsItem& item) {
     maybeAutoFlush(st);                 // time-based flush, no caller cooperation required
+    releaseRetryableFailure(item.id);
     if (S().thumbs.count(item.id) || S().thumbBusy.count(item.id) ||
         S().thumbFailed.count(item.id))
         return;
-    // What the worker can actually answer for, verified against gui_rpc.py::_parts_thumbnail
-    // and _resolve_core_family: (a) any record carrying a vendor image_url — fetched; (b) a
-    // LOCAL record whose hub entry has geometry_ref.kind == "core_family" — RENDERED from its
-    // own 3D model, no image_url required. `placeable` is precisely "geometry_ref is not None"
-    // (gui_rpc.py:222) so it is the necessary condition for (b), and _resolve_core_family
-    // refuses "catalog:" / live ids outright. Local ISO fastener rows arrive placeable + local
-    // with an EMPTY image_url and do go to the worker — those are the rendered ones. Anything
-    // else has no image on either side: record it once instead of paying an RPC per row for a
-    // guaranteed ok:false. Either way the caller still paints partIconDraw's glyph, never a hole.
-    const bool localRenderable = item.placeable && (item.source == "local" || item.source.empty());
-    if (item.imageUrl.empty() && !localRenderable) { markThumbFailed(item.id); return; }
+    // The resolver can use cached images or render geometry even when the
+    // search row itself carries no URL; only it can decide no_preview.
     enqueueThumb(item.id, item.imageUrl);
     maybeAutoFlush(st);                 // full-batch flush: never hold 16 ready images back
+}
+
+void retryThumb(AppState& st, const PartsItem& item) {
+    S().thumbFailed.erase(item.id);
+    S().thumbErrors.erase(item.id);
+    gThumbReq.erase(item.id);
+    requestThumb(st, item);
 }
 
 void requestVendorLogo(AppState& st, const std::string& site, const std::string& domain) {

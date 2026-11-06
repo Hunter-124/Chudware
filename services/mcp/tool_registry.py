@@ -16,10 +16,14 @@ Default policy = everything allowed (no behavior change vs. today). The DAG node
 """
 from __future__ import annotations
 
+import contextlib
 import inspect
 import logging
 import os
+from contextvars import ContextVar
 from functools import wraps
+from typing import NamedTuple
+
 from services.agent.request_context import current_context, in_cell, owner_key
 
 _LOG = logging.getLogger(__name__)
@@ -75,7 +79,7 @@ _READ_EXACT = {"hover", "cad_guide", "intake_status", "ecad_status", "cam_job_tr
               # Observation-only CAD file/job tools whose names match no read prefix:
               # without these they defaulted to WRITE, which also made the progress
               # watchdog count a file listing or a job wait as modeling progress.
-              "browse_models", "read_native_file", "wait_job",
+              "browse_models", "read_native_file", "wait_job", "scad_inspect",
               # Topology capability discovery is a pure catalog query; run_topology_optimization
               # writes study/jobs/artifacts and stays unclassified -> RISK_WRITE.
               "topology_capabilities",
@@ -89,11 +93,22 @@ _READ_EXACT = {"hover", "cad_guide", "intake_status", "ecad_status", "cam_job_tr
               "research_web_search", "research_fetch_page",
               # Deterministic printability / G-code analysis (print_tools.py, dfm_check):
               # they measure a part or a file and touch no document.
-              "dfm_check", "optimize_print_orientation", "verify_gcode",
+              "dfm_check", "dfm_reinforce", "optimize_print_orientation", "verify_gcode",
               # Printer-media inventory hashes the files on a mounted stick and changes
               # nothing. Its twin publish_print_media writes/retires files on the media
               # and stays unclassified -> RISK_WRITE.
-              "print_media_inventory"}
+              "print_media_inventory",
+              # Read-only analyses; conditional writes are evaluated by the dispatch guard.
+              "interface_check", "stackup_analyze", "verify_battery", "design_review",
+              "assembly_dof", "fastener_check", "tool_access_check", "disassembly_check",
+              "mate_fit_check", "bom_consistency_check",
+              "measure", "recommend_fit", "cam_audit", "piping_spec_check",
+              "ecad_run_drc", "ecad_run_erc", "ecad_run_dfm", "ecad_run_sicheck",
+              "gear_check", "bearing_life", "find_stress_risers", "fea_probe",
+              "eval_curvature", "eval_geometry_analysis", "doc_face_edges",
+              "harness_get", "harness_check", "harness_report",
+              "harness_electrical_check", "harness_bus_check", "harness_cable_model",
+              "harness_to_bus_links"}
 
 # Explicit overrides for names the classifier would mislabel. name -> risk.
 _RISK_OVERRIDES: dict[str, str] = {
@@ -106,11 +121,33 @@ _RISK_OVERRIDES: dict[str, str] = {
     # matches no external prefix/suffix, so the WRITE default would let
     # offline/local-only policies run it. box_status stays read via "_status".
     "box_sync": RISK_EXTERNAL,
+    "part_library_sync": RISK_EXTERNAL,
+    "part_acquire": RISK_EXTERNAL,
     # browser_profiles is a mixed list/refresh/delete surface. Keep the whole
     # tool behind write policy even though action="list" alone is read-only.
     "browser_profiles": RISK_WRITE,
     # Every successful animation writes a film and poster; it is never observation-only.
     "render_animation": RISK_WRITE,
+    # inspect_native_files is named like a read but writes its summary to output_path.
+    "inspect_native_files": RISK_WRITE,
+}
+
+
+# Arguments that turn an otherwise read-classified call into a write. When one is supplied
+# (not None / empty) the guard treats THAT call as RISK_WRITE for the viewer-right check,
+# the deny-risk policy and the workspace write lease.
+_WRITES_WHEN: dict[str, frozenset[str]] = {
+    # save_path writes the PNG into the project; display_quality persists on the document.
+    "render_part": frozenset({"save_path", "display_quality"}),
+    "render_views": frozenset({"save_path"}),
+    "contact_sheet": frozenset({"save_path"}),
+    "render_study_setup": frozenset({"save_path"}),
+    # The verdict is written back into the requirements doc for each req_id.
+    "design_review": frozenset({"req_ids"}),
+    # With a doc_id the check is saved into the network's piping_network study.
+    "piping_spec_check": frozenset({"doc_id"}),
+    # Explicit checks can invoke solvers that persist studies or modify assemblies.
+    "verify_battery": frozenset({"checks"}),
 }
 
 # Motion and safety classifications are explicit membership only. A newly added
@@ -168,6 +205,14 @@ def context_doc_unless(*names: str):
     return declare
 
 
+def result_contract(text: str):
+    """Declare concise result guidance on the producer, below ``@mcp.tool()``."""
+    def declare(fn):
+        fn._cad_result_contract = text
+        return fn
+    return declare
+
+
 # --------------------------------------------------------------------------- catalog
 # Process-wide tag catalog: tool name -> {"family": str, "risk": str}.
 _CATALOG: dict[str, dict] = {}
@@ -197,16 +242,6 @@ _WARM_IMPORT_TRIED = False
 # catalog looks plausible (415 of 487 tools) while ~70 real tools read as nonexistent.
 # Callers that must distinguish "no tools" from "some tools" ask for this.
 _WARM_IMPORT_ERROR: BaseException | None = None
-
-
-class _NullMCP:
-    """Throwaway stand-in for FastMCP when warming lazily-registered families
-    outside a server process (``register_*_tools`` only needs ``.tool()``)."""
-
-    def tool(self, *args, **kwargs):
-        def deco(fn):
-            return fn
-        return deco
 
 
 def mark_warm_baseline() -> None:
@@ -260,16 +295,6 @@ def warm_catalog() -> None:
     if _WARM_BASELINE:
         for name, meta in _WARM_BASELINE.items():
             _CATALOG.setdefault(name, dict(meta))
-    else:
-        # server.py unavailable (no `mcp` SDK in this interpreter). The org family is
-        # pure-Python and role cards reference it, so register it directly rather than
-        # leaving family:org unresolvable.
-        try:
-            from services.mcp.org_tools import register_org_tools
-
-            register_org_tools(view(_NullMCP(), "org"))
-        except Exception:  # noqa: BLE001 — best-effort, same contract as above
-            pass
     _WARM_APPLIED = True
 
 
@@ -322,60 +347,95 @@ def ensure_meta_tools() -> None:
 
 
 # --------------------------------------------------------------------------- policy
-# Active allow-list policy. ``None`` for either field means "fall back to env"; an
-# allow-list of ``None`` (after env) means EVERYTHING is allowed (default).
-_ACTIVE_ALLOW: set[str] | None = None
-_ACTIVE_DENY_RISK: set[str] | None = None
-_POLICY_SET = False
+# The explicit policy is held in a ContextVar and bound per run: every concurrent role
+# agent runs in its own context, so one agent's allow-list (or its enable_tools widening)
+# can never overwrite another's. A context with no explicit policy falls back to the
+# environment (CHUDWARE_TOOLS_ALLOW / CHUDWARE_TOOLS_DENY_RISK); an allow-list of ``None``
+# after that means EVERYTHING is allowed (default).
+class _Policy(NamedTuple):
+    allow: frozenset[str] | None
+    deny_risk: frozenset[str] | None
+
+
+_POLICY: ContextVar[_Policy | None] = ContextVar("chudware_tool_policy", default=None)
 
 
 def set_policy(allow=None, deny_risk=None) -> None:
-    """Set the active allow-list policy explicitly (DAG node / tests).
+    """Bind an explicit allow-list policy to the current run's context (DAG node / tests).
 
     *allow*: iterable of tool names and/or ``"family:<name>"`` tokens, or ``None`` = allow
     all. *deny_risk*: iterable of risk-class names to deny wholesale, or ``None`` = deny none.
+    The explicit policy replaces the environment's for this context only.
     """
-    global _ACTIVE_ALLOW, _ACTIVE_DENY_RISK, _POLICY_SET
-    _ACTIVE_ALLOW = set(allow) if allow is not None else None
-    _ACTIVE_DENY_RISK = set(deny_risk) if deny_risk is not None else None
-    _POLICY_SET = True
+    _POLICY.set(_Policy(
+        frozenset(allow) if allow is not None else None,
+        frozenset(deny_risk) if deny_risk is not None else None,
+    ))
 
 
 def reset_policy() -> None:
-    """Drop the explicit policy and fall back to environment (tests)."""
-    global _ACTIVE_ALLOW, _ACTIVE_DENY_RISK, _POLICY_SET
-    _ACTIVE_ALLOW = _ACTIVE_DENY_RISK = None
-    _POLICY_SET = False
+    """Drop the current context's explicit policy and fall back to environment (tests)."""
+    _POLICY.set(None)
 
 
-def _env_allow() -> set[str] | None:
+def extend_allow(names) -> None:
+    """Union *names* into the current run's allow-list (``enable_tools``).
+
+    A run with no allow-list is unrestricted, so there is nothing to widen. The widened
+    list is bound to this context only; other runs keep theirs.
+    """
+    current = _current_allow()
+    if current is not None:
+        set_policy(allow=current | frozenset(names), deny_risk=_current_deny_risk())
+
+
+def bind_run_policy():
+    """Give the calling run a private copy of the current policy; return the release token.
+
+    ``set_policy`` / ``extend_allow`` calls made until :func:`release_run_policy` are
+    discarded at release, so a turn that narrows or widens its tools cannot leak that into
+    the next turn on the same thread.
+    """
+    return _POLICY.set(_POLICY.get())
+
+
+def release_run_policy(token) -> None:
+    """Drop everything the run bound since :func:`bind_run_policy` returned *token*."""
+    _POLICY.reset(token)
+
+
+@contextlib.contextmanager
+def policy_scope():
+    """:func:`bind_run_policy` / :func:`release_run_policy` as a ``with`` block."""
+    token = bind_run_policy()
+    try:
+        yield
+    finally:
+        release_run_policy(token)
+
+
+def _env_allow() -> frozenset[str] | None:
     raw = os.environ.get("CHUDWARE_TOOLS_ALLOW", "").strip()
     if not raw:
         return None
-    return {t.strip() for t in raw.split(",") if t.strip()}
+    return frozenset(t.strip() for t in raw.split(",") if t.strip())
 
 
-def _env_deny_risk() -> set[str] | None:
+def _env_deny_risk() -> frozenset[str] | None:
     raw = os.environ.get("CHUDWARE_TOOLS_DENY_RISK", "").strip()
     if not raw:
         return None
-    return {t.strip().lower() for t in raw.split(",") if t.strip()}
+    return frozenset(t.strip().lower() for t in raw.split(",") if t.strip())
 
 
-def _current_allow() -> set[str] | None:
-    if _POLICY_SET and _ACTIVE_ALLOW is not None:
-        return _ACTIVE_ALLOW
-    if _POLICY_SET and _ACTIVE_ALLOW is None:
-        return None
-    return _env_allow()
+def _current_allow() -> frozenset[str] | None:
+    policy = _POLICY.get()
+    return policy.allow if policy is not None else _env_allow()
 
 
-def _current_deny_risk() -> set[str] | None:
-    if _POLICY_SET and _ACTIVE_DENY_RISK is not None:
-        return _ACTIVE_DENY_RISK
-    if _POLICY_SET and _ACTIVE_DENY_RISK is None:
-        return None
-    return _env_deny_risk()
+def _current_deny_risk() -> frozenset[str] | None:
+    policy = _POLICY.get()
+    return policy.deny_risk if policy is not None else _env_deny_risk()
 
 
 def is_risk_denied(risk: str) -> bool:
@@ -391,6 +451,7 @@ def is_allowed(name: str) -> bool:
 
 # Marker shared by deny_reason and refusal: the policy itself could not be evaluated.
 _POLICY_FAILURE = "tool policy could not be evaluated"
+_META_TOOL_NAMES = ("enable_tools", "list_tool_categories", "design_recipe")
 
 
 def _policy_failure(name: str, source: str, exc: BaseException) -> str:
@@ -401,96 +462,123 @@ def _policy_failure(name: str, source: str, exc: BaseException) -> str:
             f"({source}: {type(exc).__name__}: {exc})")
 
 
-def deny_reason(name: str) -> str | None:
-    """None if allowed; else a human reason string for the refusal.
+def _risk_of(name: str) -> str:
+    return (_CATALOG.get(name) or {}).get("risk") or classify_risk(name)
+
+
+def _denial(name: str, risk: str | None = None) -> tuple[str, str] | None:
+    """``(code, reason)`` when *name* may not be dispatched, else None.
+
+    *risk* is this call's risk class and defaults to the catalog's; the guard passes WRITE
+    for a call that supplies a writing argument (see _WRITES_WHEN). The catalog entry, the
+    risk, the policy and the config are each read once per dispatch.
 
     A Settings or family policy that raises refuses the call (fail closed): a broken
     config read must never re-enable a tool the user switched off.
     """
+    entry = _CATALOG.get(name) or {}
+    risk = risk or entry.get("risk") or classify_risk(name)
+    fam = entry.get("family")
     if in_cell():
         owner_key()
-        if current_context().get("right") == "viewer" and classify_risk(name) != RISK_READ:
-            return "forbidden_right"
+        if current_context().get("right") == "viewer" and risk != RISK_READ:
+            return "forbidden_right", "forbidden_right"
     # Meta-tools are always permitted (request more surface / list packs / recipes).
-    if name in ("enable_tools", "list_tool_categories", "design_recipe"):
+    if name in _META_TOOL_NAMES:
         return None
     # Per-tool enabled flag (Settings → AI → Tools options).
     try:
-        from services.agent.config import get_tool_options  # lazy
-        tool_enabled = get_tool_options(None, name).get("enabled", True)
+        from services.agent import config  # lazy: avoid import cycles
+        cfg = config.load_config()  # one config read, shared by the tool and family lookups
+        tool_enabled = config.get_tool_options(cfg, name).get("enabled", True)
     except Exception as exc:  # noqa: BLE001 — fail closed; the reason names the error
-        return _policy_failure(name, "per-tool settings", exc)
+        return "policy_unevaluable", _policy_failure(name, "per-tool settings", exc)
     if not tool_enabled:
-        return f"tool '{name}' disabled in Settings → AI → Tools"
+        return "tool_disabled", f"tool '{name}' disabled in Settings → AI → Tools"
+    allow = _current_allow()
     # Config agent.tool_families — disabled families blocked unless env/policy allow
-    # list is active (CHUDWARE_TOOLS_ALLOW still wins via _current_allow below).
-    fam = (_CATALOG.get(name) or {}).get("family")
+    # list is active (CHUDWARE_TOOLS_ALLOW still wins via the allow-list below).
     if fam:
         try:
-            from services.agent.config import is_tool_family_enabled  # lazy: avoid import cycles
-            family_enabled = is_tool_family_enabled(str(fam))
+            family_enabled = config.is_tool_family_enabled(str(fam), cfg)
         except Exception as exc:  # noqa: BLE001 — fail closed; the reason names the error
-            return _policy_failure(name, "tool-family settings", exc)
-        if not family_enabled:
-            # If an explicit allow-list is active, family filter still applies unless
-            # the tool/family token is in the allow set (checked later). When allow is
-            # None (default open), family disable is enough to deny.
-            allow = _current_allow()
-            if allow is None or (name not in allow and f"family:{fam}" not in allow):
-                return (f"tool {name!r} family {fam!r} is disabled in "
-                        f"config agent.tool_families")
+            return "policy_unevaluable", _policy_failure(name, "tool-family settings", exc)
+        # If an explicit allow-list is active, the family filter still applies unless the
+        # tool/family token is in the allow set. With no allow-list (default open), a
+        # disabled family is enough to deny.
+        if not family_enabled and (
+                allow is None or (name not in allow and f"family:{fam}" not in allow)):
+            return "family_disabled", (f"tool {name!r} family {fam!r} is disabled in "
+                                       f"config agent.tool_families")
     if name in _SAFETY_TOOLS:
-        return f"tool {name!r} is safety-class: no model dispatch path exists"
-    if name in _MOTION_TOOLS:
-        motion_allow = _current_allow()
-        if motion_allow is None or name not in motion_allow:
-            return (f"tool {name!r} is motion-class and requires explicit membership "
-                    f"(CHUDWARE_TOOLS_ALLOW / DAG tools list); default-open does not apply")
-    risk = (_CATALOG.get(name) or {}).get("risk") or classify_risk(name)
+        return "safety_class", f"tool {name!r} is safety-class: no model dispatch path exists"
+    if name in _MOTION_TOOLS and (allow is None or name not in allow):
+        return "motion_class", (f"tool {name!r} is motion-class and requires explicit membership "
+                                f"(CHUDWARE_TOOLS_ALLOW / DAG tools list); default-open does not apply")
     deny_risk = _current_deny_risk()
     if deny_risk and risk in deny_risk:
-        return (f"tool {name!r} is risk-class {risk!r}, which is denied by the active "
-                f"policy (CHUDWARE_TOOLS_DENY_RISK)")
-    allow = _current_allow()
+        return "risk_denied", (f"tool {name!r} is risk-class {risk!r}, which is denied by the "
+                               f"active policy (CHUDWARE_TOOLS_DENY_RISK)")
     if allow is None:
         return None  # default: everything allowed
-    family = (_CATALOG.get(name) or {}).get("family")
-    if name in allow or (family and f"family:{family}" in allow):
+    if name in allow or (fam and f"family:{fam}" in allow):
         return None
-    return (f"tool {name!r} is not in the active allow-list "
-            f"(set CHUDWARE_TOOLS_ALLOW or the DAG node tools: list to permit it)")
+    return "not_allowed", (f"tool {name!r} is not in the active allow-list "
+                           f"(set CHUDWARE_TOOLS_ALLOW or the DAG node tools: list to permit it)")
+
+
+def deny_reason(name: str, risk: str | None = None) -> str | None:
+    """None if allowed; else a human reason string for the refusal.
+
+    *risk* overrides the catalog risk class for this one call (see :func:`_denial`).
+    """
+    denial = _denial(name, risk)
+    return denial[1] if denial is not None else None
 
 
 def _family_of(name: str) -> str:
     return str((_CATALOG.get(name) or {}).get("family") or "")
 
 
-def refusal(name: str) -> dict:
+_REFUSAL_HINTS = {
+    "policy_unevaluable": (
+        "The tool policy (Settings -> AI -> Tools / config.json agent.tool_options, "
+        "agent.tool_families) raised while being evaluated, so the call was refused "
+        "instead of running unchecked. Report the error in `error`; retrying will "
+        "not help until that configuration error is fixed."),
+    "forbidden_right": (
+        "This session holds the viewer right, which runs read-class tools only. Ask the "
+        "document owner for edit rights; retrying this call will fail identically."),
+}
+
+
+def refusal(name: str, denial: tuple[str, str] | None = None) -> dict:
     """The contract-shaped refusal payload for a disallowed dispatch (contract §6.1).
 
-    Always machine-readable: ``ok``/``reason``/``family``/``hint``. When the block came
-    from the per-family Settings toggle the hint names the family and the exact place to
-    turn it back on, because that is the only refusal a *user* (not a DAG node) causes.
+    Always machine-readable: ``ok``/``error``/``code``/``hint``/``family``, with ``reason``
+    kept as an alias of ``error``. When the block came from the per-family Settings toggle
+    the hint names the family and the exact place to turn it back on, because that is the
+    only refusal a *user* (not a DAG node) causes.
+
+    *denial* is the ``(code, reason)`` verdict the caller already reached for this dispatch;
+    omit it to evaluate the policy here.
     """
-    reason = deny_reason(name) or f"tool {name!r} is not permitted"
+    code, reason = denial or _denial(name) or ("not_permitted", f"tool {name!r} is not permitted")
     fam = _family_of(name)
-    if _POLICY_FAILURE in reason:
-        hint = ("The tool policy (Settings -> AI -> Tools / config.json agent.tool_options, "
-                "agent.tool_families) raised while being evaluated, so the call was refused "
-                "instead of running unchecked. Report the error in `reason`; retrying will "
-                "not help until that configuration error is fixed.")
-    elif "agent.tool_families" in reason and fam:
+    if code == "family_disabled":
         hint = (f"Tool family {fam!r} is turned OFF. Re-enable it in the app under "
                 f"Settings -> AI -> Tools (or set agent.tool_families.{fam} = true in "
                 f"config.json), then retry the same call. No other tool in family "
                 f"{fam!r} will run until then — do not retry it in a loop.")
-    elif "Settings -> AI -> Tools" in reason or "Settings → AI → Tools" in reason:
+    elif code == "tool_disabled":
         hint = (f"Tool {name!r} is switched off per-tool. Re-enable it in the app under "
                 f"Settings -> AI -> Tools, then retry the same call.")
+    elif code in _REFUSAL_HINTS:
+        hint = _REFUSAL_HINTS[code]
     else:
         hint = ("This tool is gated by the per-context allow-list. Permit it via the DAG "
                 "node's tools: list, or CHUDWARE_TOOLS_ALLOW / CHUDWARE_TOOLS_DENY_RISK.")
-    out = {"ok": False, "reason": reason, "hint": hint}
+    out = {"ok": False, "error": reason, "code": code, "reason": reason, "hint": hint}
     if fam:
         out["family"] = fam
     return out
@@ -568,35 +656,124 @@ def _tool_error(message: str) -> Exception:
 
 
 # --------------------------------------------------------------------------- guard + view
-def _workspace_lease_refusal(doc_id: str, name: str) -> dict | None:
-    """Check write-lease for a mutating doc_id-bearing tool call.
+# Families whose ``doc_id`` names a CAD part, so an omitted one means "the current part" (the
+# rule cad_common._doc applies). ECAD/CAM tools resolve an omitted id against their own
+# session, which the lease registry does not track.
+_CURRENT_DOC_FAMILIES = frozenset({"cad", "sim"})
 
-    Returns None to proceed, or a contract-shaped refusal dict if another
-    agent holds the write lease — or if the lease check itself raised: an
-    unverifiable lease refuses the mutation (fail closed) rather than letting
-    it run unchecked.  Import is deferred to avoid circular imports
-    (workspace.py imports from interaction.py, not from tool_registry.py).
 
-    Read tools (RISK_READ) are never checked — this is the hot path for reads
-    and the check is gated on risk class first so there is zero overhead for
-    read-only calls.
+class _CallShape:
+    """What the guard reads from a tool's call arguments, resolved once at registration."""
+
+    __slots__ = ("signature", "doc_index", "has_doc_id", "writers", "name")
+
+    def __init__(self, fn, name: str):
+        self.name = name
+        try:
+            self.signature = inspect.signature(fn)
+        except (TypeError, ValueError):
+            self.signature = None
+        params = list(self.signature.parameters.values()) if self.signature else []
+        self.has_doc_id = any(p.name == "doc_id" for p in params)
+        self.doc_index = next(
+            (i for i, p in enumerate(params)
+             if p.name == "doc_id" and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)),
+            None)
+        self.writers = _WRITES_WHEN.get(name, frozenset())
+
+    def doc_argument(self, args, kwargs):
+        """``(raw doc_id, applies)``: the caller's doc_id however it was passed, and whether
+        this tool takes a doc_id at all (an omitted one then means the current document)."""
+        if "doc_id" in kwargs:
+            return kwargs["doc_id"], True
+        if self.doc_index is not None and self.doc_index < len(args):
+            return args[self.doc_index], True
+        return None, self.has_doc_id
+
+    def escalates(self, args, kwargs) -> bool:
+        """Whether this call supplies an argument that makes it a write (_WRITES_WHEN)."""
+        if not self.writers or self.signature is None:
+            return False
+        try:
+            given = self.signature.bind_partial(*args, **kwargs).arguments
+        except TypeError:
+            return False  # malformed call: the tool reports that itself
+        if self.name == "verify_battery":
+            checks = given.get("checks") or ()
+            return any(
+                isinstance(check, str) and (
+                    check.startswith(("run_fea_", "run_cfd_")) or
+                    check in {"solve_mates", "cam_simulate", "ecad_simulate"}
+                ) for check in checks
+            )
+        return any(given.get(p) not in (None, "", [], {}) for p in self.writers)
+
+
+def _lease_doc_id(name: str, raw) -> str | None:
+    """The canonical doc_id a call targets — the key the lease registry uses.
+
+    A call may name its document by id, recovery alias or plain name, or omit it for the
+    current part. Only cad_common._doc knows all of those, so the lease is checked on its
+    answer, never on the raw argument. When nothing resolves (the tool then fails with its
+    own teaching error) the raw spelling is still checked, so an id the registry knows but
+    the engine no longer lists cannot slip through.
     """
-    if classify_risk(name) == RISK_READ:
-        return None  # read tools never need a lease check
+    if raw in (None, "") and _family_of(name) not in _CURRENT_DOC_FAMILIES:
+        return None
+    from services.mcp import cad_common  # deferred: heavy, needed only under a workspace guard
     try:
-        from services.agent.workspace import check_write_lease  # deferred import
-        return check_write_lease(doc_id, name)  # None or refusal dict
+        return cad_common._doc(raw or None)
+    except cad_common.DocRefError:
+        return str(raw) if raw else None
+
+
+def _workspace_lease_refusal(name: str, raw_doc_id) -> dict | None:
+    """Check the write lease for a mutating doc_id-bearing tool call.
+
+    Returns None to proceed, or a contract-shaped refusal dict if another agent holds the
+    write lease on the document the call resolves to — or if the lease check itself raised:
+    an unverifiable lease refuses the mutation (fail closed) rather than letting it run
+    unchecked. Imports are deferred to avoid circular imports (workspace.py imports from
+    interaction.py, not from tool_registry.py). Without a bound workspace guard there is
+    nothing to enforce, so no document is resolved.
+    """
+    try:
+        from services.agent import workspace  # deferred import
+        if not workspace.write_guard_active():
+            return None
+        doc_id = _lease_doc_id(name, raw_doc_id)
+        return workspace.check_write_lease(doc_id, name) if doc_id else None
     except Exception as exc:  # noqa: BLE001 — refuse in-shape; never crash dispatch
         _LOG.error("write-lease check failed for %r on doc %r: %s: %s; refusing the call",
-                   name, doc_id, type(exc).__name__, exc)
+                   name, raw_doc_id, type(exc).__name__, exc)
+        reason = (f"doc {raw_doc_id!r} write-lease check failed for tool {name!r} "
+                  f"({type(exc).__name__}: {exc}); the mutation was refused "
+                  f"rather than run unchecked.")
         return {
             "ok": False,
-            "reason": (f"doc {doc_id!r} write-lease check failed for tool {name!r} "
-                       f"({type(exc).__name__}: {exc}); the mutation was refused "
-                       f"rather than run unchecked."),
+            "error": reason,
+            "code": "write_lease_unverifiable",
+            "reason": reason,
             "hint": ("Call workspace_status(run_id=...) to inspect the lease registry. "
                      "This call cannot run until the write-lease check succeeds."),
         }
+
+
+def _admit(name: str, call: _CallShape, args, kwargs) -> dict | None:
+    """The refusal payload for this call, or None to run it.
+
+    The call's risk is resolved once — the catalog's, or WRITE when the call supplies an
+    argument that writes — and feeds both the policy verdict and the lease check.
+    """
+    risk = RISK_WRITE if call.escalates(args, kwargs) else _risk_of(name)
+    denial = _denial(name, risk)
+    if denial is not None:
+        return refusal(name, denial)
+    if risk != RISK_READ:
+        raw, applies = call.doc_argument(args, kwargs)
+        if applies:
+            return _workspace_lease_refusal(name, raw)
+    return None
 
 
 def _guard(fn, name):
@@ -611,36 +788,36 @@ def _guard(fn, name):
     declared it returns, so FastMCP's output-schema validation can never turn a refusal
     into a ``ToolError: 1 validation error`` crash (see _refusal_shaper).
 
-    Workspace extension: mutating tools that carry a ``doc_id`` keyword argument are also
-    checked against the active workspace lease registry.  Read tools are never checked
-    (classify_risk fast-path).  If no workspace session is active the check is a no-op.
+    Workspace extension: a non-read call to a tool that takes a ``doc_id`` is checked against
+    the active workspace lease registry on the CANONICAL id the call resolves to (name,
+    alias, positional or omitted included). Read calls are never checked. If no workspace
+    session is active the check is a no-op.
     """
     shape = _refusal_shaper(fn)
+    call = _CallShape(fn, name)
 
     if inspect.iscoroutinefunction(fn):
         @wraps(fn)
         async def aguard(*args, **kwargs):
-            if not is_allowed(name):
-                return shape(refusal(name))
-            doc_id = kwargs.get("doc_id")
-            if doc_id:
-                denial = _workspace_lease_refusal(doc_id, name)
-                if denial is not None:
-                    return shape(denial)
-            return await fn(*args, **kwargs)
+            from .core_bridge import agent_tool_scope
+            from ._envelopes import tool_reply
+            with agent_tool_scope():
+                refused = _admit(name, call, args, kwargs)
+                if refused is not None:
+                    return shape(refused)
+                return tool_reply(await fn(*args, **kwargs))
         aguard._refusal_shaper = shape  # type: ignore[attr-defined]  # tests/introspection
         return aguard
 
     @wraps(fn)
     def guard(*args, **kwargs):
-        if not is_allowed(name):
-            return shape(refusal(name))
-        doc_id = kwargs.get("doc_id")
-        if doc_id:
-            denial = _workspace_lease_refusal(doc_id, name)
-            if denial is not None:
-                return shape(denial)
-        return fn(*args, **kwargs)
+        from .core_bridge import agent_tool_scope
+        from ._envelopes import tool_reply
+        with agent_tool_scope():
+            refused = _admit(name, call, args, kwargs)
+            if refused is not None:
+                return shape(refused)
+            return tool_reply(fn(*args, **kwargs))
     guard._refusal_shaper = shape  # type: ignore[attr-defined]  # tests/introspection
     return guard
 
@@ -656,13 +833,15 @@ class _FamilyView:
         self._mcp = mcp
         self._family = family
 
-    def tool(self, *t_args, **t_kwargs):
+    def tool(self, *t_args, risk=None, **t_kwargs):
+        if risk is not None and risk not in RISKS:
+            raise ValueError(f"unknown tool risk: {risk!r}")
         inner = self._mcp.tool(*t_args, **t_kwargs)
         family = self._family
 
         def deco(fn):
             name = t_kwargs.get("name") or getattr(fn, "__name__", "?")
-            record(name, family)
+            record(name, family, risk)
             guarded = _guard(fn, name)
             # A description given only as a registration kwarg must also travel on the
             # callable: on-demand host-tool loads read inspect.getdoc(fn), and Chudcode

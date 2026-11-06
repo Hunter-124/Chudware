@@ -47,6 +47,26 @@ These files are shared by many features; change them deliberately and keep edits
 - Streaming logs stick to the bottom via `ui::chatLogStickToBottom("<region id>")` with a
   unique id per surface (two surfaces sharing an id fight over the flag).
 
+## Account-optional startup
+
+Local CAD does not require a Chudware account, AI-provider credentials or internet access.
+The welcome's primary **Start without an account** action enters Model immediately;
+Copilot sign-in remains optional and is available later in Settings → Providers.
+Completion queues a merge-preserving config write without waiting for disk I/O on the UI
+thread. A failed write warns but does not block modeling; the welcome can reappear after
+restart if the completion was not saved.
+
+Deferred viewport focus must wait while any popup is open: ImGui window focus can dismiss
+the first-run or recovery modal. Verify a normal fresh-profile launch as well as the
+`onboarding` capture scenario, which deliberately reopens its modal every frame.
+
+PropertyManager field parsing, validation, hydration and serialization live in
+`ui/property_manager_fields.inl`, included once by the desktop implementation and once by
+its headless regression executable. Keep desktop lifecycle/worker/rendering dependencies
+out of this fragment; the regression must link on MSVC without relying on ELF section
+garbage collection or desktop-symbol stubs.
+
+
 ## Verification: lint and the scenario harness
 
 ```bash
@@ -56,19 +76,228 @@ CHUDWARE_SHOT=<scenario> xvfb-run -a ./host/build-linux/bin/chudware --ui-screen
 ```
 
 The ninja target is `Chudware`; the binary is lowercase `chudware`. `CHUDWARE_SHOT` runs a
-scripted scenario from `host/src/ui/scenarios.cpp` headlessly through the real engine and
+scripted native scenario from `host/src/ui/scenarios.cpp` headlessly through the real engine and
 writes a capture; drop `xvfb-run -a` and set `CHUDWARE_SHOT_HEADED=1` for a visible window.
+The browser build does not include this harness: its entry point skips the desktop screenshot
+CLI and launches the ordinary GUI. Browser checks exercise the web client separately.
 Common scenarios: `m1` (part build, edit, undo: viewport, tree, PropertyManager), `sketch`,
 `sketch3d`, `appearance` (theme/glass), `workspaces`, `manufacture`, `topology`, `iconpipe`,
-`reveng_splat`. `CHUDWARE_IDAUDIT=1` adds the ImGui duplicate-ID/clipping audit to any
-scenario.
+`reveng_splat`, `presentation`, `settings_routes`, `model_settings`, `text_contrast`.
+`CHUDWARE_IDAUDIT=1` adds the ImGui duplicate-ID/clipping audit to any scenario.
 
 A scenario is the functional gate: it drives the changed path end to end. A capture's
 existence is not visual proof; inspect the changed surface. Self-checking scenarios (for
 example `topology`, `pipedraw`, `simaudit`) write reports and exit non-zero on failure. When
 a workspace gains a major new flow, add a scenario for it.
 
+`text_contrast` places real selectable Copilot prose across the edge of a shaded mesh,
+checks dark/light portions of a single glyph, header labels and model metadata against
+same-frame text-free/font-coverage references, then moves the camera and exercises native
+selection and clipboard copying. Run with private HOME/XDG paths and
+`CHUDWARE_ENGINE_DAEMON=0`; `CHUDWARE_THEME=light|dark` and `CHUDWARE_SCALE=1|2` cover the
+theme/DPI matrix. `CHUDWARE_TEXT_CONTRAST_OUT` selects the report/capture directory (default
+`scratch/text_contrast_shots`); an explicit `CHUDWARE_SESSIONS_DIR` must live inside it.
+
+`presentation` uses a real daemon and a second MCP seat to exercise hidden, explicitly
+presented and user-opened live documents; use an isolated daemon instance and private
+paths. `settings_routes` uses private HOME/XDG paths and `CHUDWARE_ENGINE_DAEMON=0`;
+it exercises Quick Settings → Prompts and keyboard/click search navigation across the
+eight AI sections, reporting to `scratch/settings_routes_shots/report.json`.
+
+`asm_refresh` exercises unsaved component edits through the actual active/background
+assembly meshes, selection preservation and editor deferral. Run both
+`CHUDWARE_ENGINE_DAEMON=1` and `0` with private HOME/XDG/session paths and a private daemon
+socket. `CHUDWARE_ASM_REFRESH_OUT` selects its captures and `report.json`.
+
+The Simple, Advanced and composer model pickers share the runtime catalog and
+authenticated provider state. Catalog presence alone does not enable a provider; hidden
+models, disabled providers and unloaded local models are excluded. Claude older than 5.1 and
+OpenAI models older than GPT-6 (including codex variants and the o-series) are never offered
+on any provider route (`ui::isLegacyGenerationModel`, `host/src/ui/model_registry.h`, applied
+in `bridgePickerModelUsable`, `providerPickerModels` and Settings -> Providers -> Models); a
+saved selection of one still displays as the current value. An existing fixed
+assignment remains visible by provider/model ID if it becomes unavailable, and is not silently
+replaced. Online role assignments preserve the runtime provider ID even when multiple
+providers share a composer slot. Legacy native-only engineering-firm model assignments
+have no online consumer and are not exposed as GUI model controls.
+Model assignment controls remain usable with the last confirmed state during a background
+refresh. A save supersedes any in-flight refresh response; an initial load, an unavailable
+assignment service, or an unsaved/in-flight write still protects the controls from edits.
+Failed saves retain their draft until retried or discarded.
+Provider and model discovery (`omp_provider_list`, `omp_models_list`), sign-in/out and key
+save, `ai_roles_*`, `subscription_*` and `skills_*` are served by hostd's own service worker, so
+they answer live during an agent run. A refusal with `worker_lane_busy` can still happen — an
+interactive sign-in holds that worker, or the daemon is an older build whose agent lane takes
+them — and it is a deferral, not a failure: no error state is set, the last data
+stays, and the 5 s poll asks again until the lane is free. A complete live read of the catalog
+(`model_catalog_cache.json`) and of the provider list (`provider_list_cache.json`, beside
+`config.json`) is kept on disk; only while a run defers the live read does the next launch
+show those saved copies (labelled "last session", `modelPickerDeferred()`), so the picker and
+Settings -> Providers are not blank. Otherwise availability still needs a live confirmation.
+Provider detail (`omp_auth_state`) retries every 3 s until it loads, then every 60 s; a busy
+lane keeps the loaded detail instead of replacing it with an empty one. Model assignments
+(`ai_roles_get` / `ai_roles_set`) are agent-lane calls too: a busy lane keeps the loaded
+assignments (a status line says they refresh after the run), and a refused save keeps its draft
+for Retry / Discard. Every reply must carry an explicit `ok: true` to count as a read — a
+refusal envelope has no `ok`, and reading that as success used to blank the assignments. The
+catalog lists only signed-in providers, so it is re-read within 5 s when the signed-in set
+changes (sign-in, key, logout from any surface), not on the 5-minute timer.
+Model popups are one compact popover shared by the chat model, the Small / Medium / Large
+tiers, per-role overrides and Copilot Quick settings: search on top, a list bounded to about
+ten rows that scrolls inside the popover (tier choices first, then models grouped under
+provider headers, the current choice highlighted and scrolled into view), and
+refresh/provider actions outside the list, with an opaque background and keyboard navigation.
+Each tier also carries a thinking effort (Auto, or a level the tier's model reports) in both
+surfaces. Per-role overrides are off by default (Settings -> AI -> Models -> Advanced
+overrides -> "Use per-role overrides"): while off every role dispatches through its tier and
+saved overrides are kept but ignored; an override picks a tier (Small / Medium / Large) or a
+concrete model, never "follow the chat model". Generic local endpoint probes are
+offline choices, not invented online OMP provider identities.
+
+`model_settings` exercises Simple/Advanced switching, authenticated catalog model choices,
+sign-out removal, disabled/hidden models, exact provider/model assignment round trips, the
+Large model picker, scrolling/filtering, keyboard selection, provider navigation, and the
+composer choice between a manual pin and following the chat assignment. Its isolated
+process uses synthetic provider-auth state and explicitly synthetic
+catalog rows for Claude, Codex, ZenMux and other providers. These fixtures verify UI filtering
+and exact provider/model round trips, not real model availability; validate runtime catalog
+identities separately using credential-free metadata or an isolated runtime profile.
+It checks RPC, reloaded state, the actual turn payload, and save-failure retry/discard through
+the private config lock's real permissions. It restores the original lock permissions before
+exit and requires an unprivileged user whose mode restrictions actually deny writes. It also
+captures both themes. The Default assignment follows the last manual chat model; a manually
+chosen model remains an explicit override. Run it with an isolated data directory and daemon:
+
+```bash
+APPDATA="$PWD/scratch/model_settings_private" HOME="$PWD/scratch/model_settings_private/home" \
+XDG_DATA_HOME="$PWD/scratch/model_settings_private/xdg" \
+CHUDWARE_SESSIONS_DIR="$PWD/scratch/model_settings_private/sessions" \
+CHUDWARE_ENGINE_DAEMON=0 CHUDWARE_SHOT=model_settings \
+env -u CHUDWARE_THEME xvfb-run -a ./host/build-linux/bin/chudware --ui-screenshot scratch/model_settings.png
+```
+
+
+Settings deep-link routes 8–15 are Harness, Roles, Prompts, Skills, Rules, Benchmarks,
+Tools and Dev Preview, respectively (`host/src/ui/settings_modal.h`).
+
 Run build commands one at a time; parallel `./build.sh`/`ninja` runs race on the Ninja lock.
+
+### GUI frame statistics
+
+`host/src/core/frame_stats.*` records a fixed 1024-frame history of steady-clock wall,
+event-wait, CPU-work and swap times. CPU work excludes both the idle event wait and
+`glfwSwapBuffers`; these are CPU-side timings, not GPU timer queries. Sections are exclusive
+(nested scopes do not double-count), with unattributed work reported as `other`.
+The Performance window shows presented FPS over the last second, work-time p50/p99,
+the idle-throttle state, a work-time plot and a section table alongside the sampling profiler.
+
+Set `CHUDWARE_FRAMESTATS=/absolute/path/report.json` to export full-run and per-phase
+percentiles on exit, plus the last 64 work-time spikes and their top three sections.
+The normal closed-profiler path uses fixed storage without per-frame allocations; optional
+full-run export retains the additional samples needed for exact whole-run percentiles.
+A spike exceeds both twice the preceding rolling work-time median and 8 ms.
+
+`workspace_transition` separates disposable-starter cleanup from panel drawing. Entering
+Electronics presents the KiCad project hub without creating a document. Tab timing breadcrumbs use `AppState::addLog` (the in-app console and
+explicit `CHUDWARE_LOG_FILE` tee), not unconditional stderr writes/flushes on the GUI thread:
+slow redirected output can stall a Windows tab change even when its cached mesh bind is fast.
+
+`CHUDWARE_SHOT=frameperf` builds a real box with four corner fillets and nine through-holes,
+waits for idle, then measures 300 orbit frames, 300 mouse-hover/picking frames, 300 frames
+with a 160-message Copilot transcript and 40 frames in each of the eight standard workspace
+routes. Setup and final capture have separate phase labels. It needs no AI provider.
+By default its JSON is written to `CHUDWARE_REPO/scratch/frameperf/framestats.json`;
+`CHUDWARE_FRAMESTATS` overrides that path. Isolate both application state and the working
+directory, as `scripts/gate.sh` does:
+
+```bash
+REPO="$PWD"
+STATE="$(mktemp -d /tmp/chudware-frameperf.XXXXXX)"
+mkdir -p "$STATE/home" "$STATE/work"
+(
+  cd "$STATE/work"
+  xvfb-run -a env HOME="$STATE/home" APPDATA="$STATE/data" XDG_DATA_HOME="$STATE/data" \
+    CHUDWARE_NO_FILE_DIALOGS=1 CHUDWARE_INSTANCE_KEY="frameperf-$$" CHUDWARE_REPO="$REPO" \
+    CHUDWARE_SHOT=frameperf CHUDWARE_FRAMESTATS="$REPO/scratch/frameperf/framestats.json" \
+    "$REPO/host/build-linux/bin/chudware" --ui-screenshot /tmp/x.png
+)
+```
+
+For automated tests, use the isolated suites described in
+[Running tests](../../CONTRIBUTING.md#running-tests).
+
+As with the gate, set `CHUDWARE_PYTHON` and `CHUDWARE_LIBCHUDWARE` when the runtime or
+libchudware build cannot be discovered automatically.
+
+The JSON root is a summary plus `phases`, an object mapping phase names to the same summary
+shape (without another `phases` field). A summary contains `frame_count`, `busy_frames`,
+`idle_frames`, `spike_count`, `frame_ms`, `work_ms`, `wait_ms`, `swap_ms`, `sections` and
+`spikes`. Every `*_ms` distribution contains numeric `p50`, `p95`, `p99`, `max` and `mean`
+in milliseconds. `sections` maps static section names to those same distribution fields
+plus `frame_count` (frames entering that section, summing repeated invocations per frame).
+`spikes` retains up to the last 64 entries in chronological order, each with zero-based
+`frame_idx`, numeric `work_ms`, string `phase` and up to three `top_sections` objects
+containing `name` and `ms`. Per-phase summaries retain their own last 64 spikes.
+
+Viewport sub-sections distinguish target allocation, background, faces, edges, datums,
+shadow, resolve, backdrop blur and luminance readback. These are CPU submission timings:
+first-use driver compilation may be charged to a draw, not to shader linking. Native
+startup warms draw-state/sampler variants in an offscreen target and warms the ImGui
+backend without swapping; neither warm-up geometry nor luminance reaches the UI.
+
+### Frame pacing and redraw rules
+
+The loop renders on demand. It idles in `glfwWaitEventsTimeout` (50 ms floor, 250 ms while
+iconified/hidden) unless something declares work; presented FPS therefore varies with
+activity by design. Judge performance by work-time ms, not by FPS.
+
+- Interactive tweens call `ui::anim::requestFrames()` while moving. Decorative motion (brand
+  marks, spinners, shimmer, pulses, fades) calls `ui::anim::requestFramesAt(30)`, which bounds
+  the wait without pinning the loop to vsync. Never animate from `ImGui::GetTime()` without one
+  of the two: the motion then steps at whatever cadence other work happens to produce.
+- Input queues add three settle frames so popups, tooltips and auto-sized windows finish
+  their measuring frames immediately.
+- Worker threads (engine connection/bootstrap, AsyncRpc completion, mesh loader, SimClient,
+  CEF, background file and image loaders) call the thread-safe `ui::anim::wakeLoop()` when
+  results land; nothing polls for them.
+- The busy gate uses `AsyncRpc::interactionBusy()`. Background/metadata polls are classified in
+  `host/src/core/async_rpc.cpp`; add a new periodic poll's method there, or it holds the loop at
+  vsync while in flight. `callPrimary` keeps primary-connection identity (attach/subscribe/
+  detach) on the FIFO; `callCoalesced` replaces a queued same-key call in place (debounce is
+  capped at twice its value so it cannot stall the queue).
+- GL-thread code never makes a blocking engine call per frame, per drag step or per event; use
+  `st.rpc`. `EngineClient::call` holds the connection mutex for the whole round trip.
+  Native `engine::GuiConnection` owns initial discovery/spawn/hello and proactive reconnect
+  on a persistent worker, retaining the final daemon-vs-inproc verdict, drain refusal and
+  reconnect/respawn backoff. Until that verdict, GUI `daemonMode()` reports daemon intent
+  and `client()` is null; background callers still wait for the final backend choice.
+  Synchronous GUI RPCs fail promptly with `engine_starting` until publication; daemon
+  intent is never proof that a client exists. Shutdown cancels startup/reconnect waits
+  and aborts their transport before joining. The version probe and drain RPC are bounded,
+  and cancellation terminates only an owned probe/spawn helper, never the shared daemon.
+  Managed-worker launch waits for that choice so its backend pin cannot diverge, then
+  spawn/hello and fallback core loading run asynchronously too. Bootstrap RPC completions
+  remain on the GUI callback drain; initial connection and startup never block a frame.
+  When daemon mode wins, a missing managed worker does not dlopen a redundant private
+  OCCT core: the shared engine already serves C++ RPCs, and the dynamic-loader lock can
+  otherwise block unrelated GUI thread creation.
+  Core availability release/acquire-publishes immutable metadata after loading. Runtime
+  repair is disabled/rejected while worker boot is pending, so it cannot stop or replace
+  a child still being started. Readiness-dependent shot actions run once at or after their
+  earliest frame, rather than requiring boot to finish on an exact frame number.
+- Viewport frame reuse: `viewport_panel.cpp` skips the scene, overlays, resolve and backdrop
+  when `Renderer::contentEpoch()` and its overlay-input signature are unchanged. Renderer
+  setters must bump the epoch only on an actual change. A new overlay input drawn between
+  `beginOverlay`/`endOverlay` must be added to that signature, or the state must be excluded
+  from reuse; otherwise the viewport shows a stale frame.
+- Config writes (`saveSettings`, `updateConfigJson`) run on a background writer with
+  read-your-writes via `readConfigJson`. Call `flushConfigWrites()` before an RPC or process
+  launch that reads the file; it returns immediately when nothing is pending.
+- Chat persistence serializes and fsyncs on the writer thread; only shutdown and history load
+  wait for it. The raw JSONL archive keeps full thinking rows but coalesces streaming
+  checkpoints until their detail has doubled; the completed row is always written. A crash
+  can therefore leave the archive at an earlier checkpoint, while the more frequent bounded
+  session snapshot remains the normal reload source.
 
 ## Ribbon, feature tree and command routing
 
@@ -89,12 +318,17 @@ Run build commands one at a time; parallel `./build.sh`/`ninja` runs race on the
 ones. `capability` is fail-closed: unclassified ids are `Mutate`, which read-only mode blocks.
 Mark a row `Inspect` or `Export` only when it strictly never mutates the open document.
 
-**Command flow.** Ribbon click (or shortcut bar / gesture wheel) → `dispatchCmd` in `app.cpp`
+**Command flow.** Ribbon click (or shortcut bar) → `dispatchCmd` in `app.cpp`
 → `CommandRouter::authorize` → `CommandRouter::dispatch` walks rules in order until a handler
 consumes the id (a module entry point such as `SketchMode::onRibbonCommand`,
 `PropertyManager::openForCommand`, `AsmPanels::handleCommand`, or an app-level hook) → engine
 RPC over `WorkerClient` → `chudware-hostd` executes in libchudware → `doc.changed` events
-drained per frame → `AppState`/`DocTab` update → tree and viewport repaint.
+drained per frame → admitted `AppState`/`DocTab` update → tree and viewport repaint.
+Shared engine documents are not automatically tabs: admission is limited to GUI-origin,
+intentional user-open/recovery, or explicitly presented documents. `show_in_app` requests
+`doc_present`, without saving; a native user-open reuses the live document and keeps its
+selection and updates. Dismissed tabs remain dismissed. See
+[`HOSTD.md`](../reference/HOSTD.md#live-documents-and-presentation).
 
 **Adding a command.**
 
@@ -120,6 +354,38 @@ as soon as a pick is added, never gated on the `doc_resolve_pick` reply. Part do
 the owner-map feature; assemblies (which have no engine owner map) use the resolve reply's
 `owner_feature` through `featureTreeNoteAssemblyPick`.
 
+## Document edits, saves and recovery
+
+Dirty state is keyed by document identity, not the selected tab or the document's
+creator. `AppState::markHumanEdit(docId, revision)` records a human edit;
+`markSaved` clears it only when the saved revision covers the human edit, and
+`applyHumanDirty` incorporates hostd's document-scoped attribution. Metadata has
+its own revision so an older save or notification cannot erase a newer human
+metadata edit. AI/system-only edits do not create a human save prompt. Drawing
+and ECAD tabs use their own document identities as well.
+
+Human mutations maintain per-document pending barriers (`beginHumanMutation` /
+`endHumanMutation`). Close, quit, save and conflict handling must not treat an
+unsettled human request as safely saved or discardable. Saves complete
+asynchronously against the captured document id and revision, not whichever tab
+is active when the response arrives; later edits remain dirty. Agent automatic
+saves skip human-dirty documents. In-process daemon-disabled fallback cannot
+atomically guard agent saves against concurrent human edits.
+
+For an external disk change hostd reloads a clean document; a human-dirty tab
+instead shows **File changed on disk** with **Reload (discard my edits)** and
+**Keep mine**. Reload waits for pending human mutations; Keep mine authorizes a
+subsequent overwrite only against the observed stamp, which is checked again at
+publication. Recovery prompts list human work; AI-only recovery is handled by
+hostd when its original file still matches the snapshot's base stamp. Legacy
+snapshots without human-dirty provenance are treated as human work.
+
+Document events must refresh active and parked tabs without opening or focusing
+unrequested documents. A same-revision `doc.cache_refreshed` can carry a new
+mesh and must not be discarded merely because the revision is unchanged.
+Invalidate stale parked mesh identities and update dependent assemblies as
+source geometry changes; a tab switch must not restore an older mesh or tree.
+
 ## Viewport
 
 | File | Role |
@@ -139,6 +405,10 @@ feature ops consume it. Background tabs keep their parsed mesh on `DocSession::c
 
 - **Picking is ID-based** (topology IDs from libchudware's tessellation), never a raycast
   against triangles. Anything pickable needs an ID-pass representation.
+  Thin targets use depth-tested single-pixel geometry plus a screen-space search radius; the
+  search rejects rear components behind the opaque surface under the cursor. Hidden bodies are
+  skipped. Active mate references are drawn translucent and picked behind opaque components,
+  while their unobstructed geometry remains selectable.
 - The transparent thumbnail path in `renderer.cpp` is used by the icon pipeline; changing its
   background/alpha behavior breaks icon generation.
 - **Framing.** The 3D image is full-bleed behind the glass panes. `viewport_panel.cpp` computes
@@ -160,7 +430,8 @@ feature ops consume it. Background tabs keep their parsed mesh on `DocSession::c
 - **In-context component edit.** Edit Model makes the component's part document active and draws
   the assembly as a translucent ghost (`captureCurrentAsGhost()` reuses the uploaded GL
   buffers; `setGhostTransform` receives the inverse component placement). The ghost is
-  excluded from picking. Exit does an asynchronous save-then-rebuild of the assembly.
+  excluded from picking. Part edits push new assembly snapshots without saving. Exit saves
+  the component asynchronously and returns to the assembly without forcing a second rebuild.
 - **Gaussian splats.** The loader accepts validated PLY (log scales, wxyz quaternions, opacity
   logits, SH degree 0-3), projects full anisotropic covariance, and caps at 2 000 000 Gaussians
   and 2 GiB input. Camera motion updates only sorted indices. Image-plane NDC is clamped to

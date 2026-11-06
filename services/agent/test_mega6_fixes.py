@@ -1,7 +1,6 @@
 """Mega-6 live harness-fix regressions (Fixer6 = StaticOwl).
 
-Watch-list from mega-5 findings + mega-6 attempt-1 openrouter auth wipe:
-  1. keyless openrouter never auto_picked
+Watch-list from mega-5 findings:
   2. child join handoff not null when child had tools / success
   3. provider token usage recorded into turn result + ledger
   4. BUILD geometry roles keep new_part/add_features + tool floor ≥8
@@ -9,70 +8,6 @@ Watch-list from mega-5 findings + mega-6 attempt-1 openrouter auth wipe:
 """
 
 from __future__ import annotations
-
-# ---------------------------------------------------------------------------
-# 1. Keyless openrouter must not be offered
-# ---------------------------------------------------------------------------
-
-
-def test_keyless_openrouter_excluded_from_enabled_providers(monkeypatch):
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    from services.agent.role_models import _enabled_providers
-
-    en = _enabled_providers({"provider": "xai-sub", "model": "grok-4.5"})
-    assert not any(e.get("provider") == "openrouter" for e in en), en
-    assert any(e.get("provider") == "xai-sub" for e in en), en
-    assert any(e.get("provider") == "ollama" for e in en), en
-
-
-def test_keyless_openrouter_excluded_from_explicit_list(monkeypatch):
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    from services.agent.role_models import _enabled_providers
-
-    en = _enabled_providers(
-        {
-            "enabled_providers": [
-                {"provider": "openrouter", "model": "nvidia/nemotron-ultra:free"},
-                {
-                    "provider": "ollama",
-                    "model": "llama3.2:latest",
-                    "base_url": "http://127.0.0.1:11434/v1",
-                },
-                {"provider": "xai-sub", "model": "grok-4.5"},
-            ],
-        }
-    )
-    assert not any(e.get("provider") == "openrouter" for e in en), en
-    assert any(e.get("provider") == "xai-sub" for e in en), en
-
-
-def test_auto_pick_depth0_without_openrouter_key_picks_xai(monkeypatch):
-    """mega-6 attempt-1: depth0 min_rank=3 picked nemotron free → 401 wipe."""
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    from services.agent.role_models import auto_pick_model
-
-    a = auto_pick_model(
-        cfg={"provider": "xai-sub", "model": "grok-4.5"},
-        task_class="unknown",
-        node_depth=0,
-    )
-    assert a.provider != "openrouter", a
-    assert a.provider == "xai-sub", a
-
-
-def test_openrouter_enabled_when_key_present(monkeypatch):
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    from services.agent.role_models import _enabled_providers
-
-    en = _enabled_providers(
-        {
-            "provider": "xai-sub",
-            "model": "grok-4.5",
-            "openrouter": {"api_key": "sk-test"},
-        }
-    )
-    assert any(e.get("provider") == "openrouter" for e in en), en
-
 
 # ---------------------------------------------------------------------------
 # 2. Join handoff plumbing
@@ -111,7 +46,7 @@ def test_join_synthesises_handoff_when_child_omits_envelope(tmp_path, monkeypatc
     )
 
     import services.agent.delegation as dlg
-    import services.agent.chudcode_roles as cr
+    import services.agent.omp_roles as cr
     from services.agent import config as agent_config
 
     real_delegate = dlg.delegate
@@ -306,7 +241,7 @@ def test_build_role_tool_floor_at_least_eight(tmp_path, monkeypatch):
     )
 
     import services.agent.delegation as dlg
-    import services.agent.chudcode_roles as cr
+    import services.agent.omp_roles as cr
     from services.agent import config as agent_config
 
     captured = {}
@@ -382,11 +317,6 @@ def test_role_settings_resolution_failure_falls_back_to_injected_identity(monkey
 
     monkeypatch.setattr(
         rm,
-        "resolve_for_node",
-        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("assignment unavailable")),
-    )
-    monkeypatch.setattr(
-        rm,
         "resolve_role_model",
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("assignment unavailable")),
     )
@@ -422,14 +352,12 @@ def test_role_settings_emits_model_assignment_event(monkeypatch):
             role="task",
             provider="xai-sub",
             model="grok-4.5",
-            mode="auto",
-            rank=5,
+            mode="fixed",
             source="test",
             reason="test pick",
         )
 
     monkeypatch.setattr(rm, "resolve_role_model", _fake_pick)
-    monkeypatch.setattr(rm, "resolve_for_node", lambda *a, **k: None)
     monkeypatch.setattr(
         agent_config,
         "load_config",
@@ -457,6 +385,7 @@ def test_role_settings_emits_model_assignment_event(monkeypatch):
     settings = nr._resolve_role_settings(pack)
     assert settings["provider"] == "xai-sub"
     assert pack.get("role_model", {}).get("provider") == "xai-sub"
+    assert "rank" not in pack["role_model"] and "min_rank" not in pack["role_model"]
     assert any((note[2] or {}).get("event") == "model_assignment" for note in led.notes)
     assert events and events[0][0] == "agent.model_assignment"
 

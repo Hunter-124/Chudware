@@ -11,7 +11,6 @@ Registered onto the FastMCP instance by ``register_cam_tools(mcp)``.
 from __future__ import annotations
 
 import html
-import json
 import os
 import re
 import tempfile
@@ -20,6 +19,7 @@ from typing import Any, Optional
 from mcp.server.fastmcp import FastMCP
 
 from . import core_bridge as cb
+from ._envelopes import dumps as _dumps, error_payload
 from .core_bridge import CoreError
 from .cad_common import (  # engine-side registry env default + model-dialect guards
     _describe_type, _sanitize_output_path, _wire_materials_registry,
@@ -61,14 +61,10 @@ def _resolve_cam_material(material: str) -> tuple[str, Optional[str]]:
     return m, None
 
 
-def _dumps(obj: Any) -> str:
-    return json.dumps(obj, indent=2)
-
-
 def _err(e: Exception) -> str:
     if isinstance(e, CoreError):
-        return _dumps({"ok": False, "error": str(e), "detail": getattr(e, "detail", None)})
-    return _dumps({"ok": False, "error": f"{type(e).__name__}: {e}"})
+        return _dumps(error_payload(str(e), code=e.code, detail=e.detail))
+    return _dumps(error_payload(f"{type(e).__name__}: {e}"))
 
 
 def _job_stats(tree: Optional[dict]) -> Optional[dict]:
@@ -938,16 +934,48 @@ def register_cam_tools(mcp: FastMCP) -> None:
     def cam_simulate(setup_id: Optional[str] = None, resolution: float = 0.5,
                      check_gouge: bool = True, check_rapid: bool = True,
                      check_holder: bool = False) -> str:
-        """Material-removal simulation: removed/remaining volume, machined fraction, gouge,
-        rapid-through-stock, and holder/shank collision checks, and estimated cycle time per
-        setup. check_holder is off by default (needs tool shank/holder geometry to flag)."""
+        """Material-removal simulation and cycle time per setup. Gouge comparison uses a
+        mesh extracted from the current part in model coordinates; inspect gouge_evaluated
+        and gouge_reason before interpreting counts. The engine uses a top-down heightfield,
+        not a complete 3D collision test. check_holder requires holder/shank geometry."""
         try:
             params: dict = {"doc_id": _job(),
                             "options": {"resolution": resolution, "check_gouge": check_gouge,
                                         "check_rapid": check_rapid, "check_holder": check_holder}}
             if setup_id:
                 params["setup_id"] = setup_id
-            return _dumps(cb.call("cam_simulate", params))
+            reason = None
+            if check_gouge:
+                try:
+                    path = _current_part_step()
+                    if not path:
+                        raise ValueError("no current part document")
+                    extracted = cb.call("cam_extract", {"path": path, "kind": "mesh",
+                                                         "deflection": 0.1})
+                    if not isinstance(extracted, dict):
+                        raise ValueError("mesh extraction returned no result")
+                    if extracted.get("error"):
+                        raise ValueError(str(extracted["error"]))
+                    mesh = extracted.get("mesh")
+                    if not isinstance(mesh, dict) or not mesh.get("verts") or not mesh.get("tris"):
+                        raise ValueError("mesh extraction returned no triangles")
+                    params["part_mesh"] = mesh
+                except Exception as e:  # noqa: BLE001
+                    reason = f"part mesh unavailable: {e}"
+            else:
+                reason = "check_gouge disabled"
+            result = cb.call("cam_simulate", params)
+            for row in result.get("results", []):
+                if reason:
+                    row["gouge_evaluated"] = False
+                    row["gouge_reason"] = reason
+                elif "gouge_evaluated" not in row:
+                    row["gouge_evaluated"] = False
+                    row["gouge_reason"] = "engine did not report gouge comparison evidence"
+                if not row["gouge_evaluated"]:
+                    row["gouges"] = None
+                    row["max_gouge_mm"] = None
+            return _dumps(result)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 

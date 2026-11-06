@@ -106,18 +106,168 @@ def test_independent_writers_apply_interleaved_atomic_batches(writers):
     assert after["tree"] == before["tree"]
 
 
-def test_raw_hostd_still_injects_cas_for_implicit_batches(writers):
+def test_raw_hostd_serializes_implicit_batches_and_honors_explicit_cas(writers):
     a, b, doc = writers
-    committed = a.call("doc_apply_ops", {
-        "doc_id": doc, "base_revision": -1, "ops": _box_ops(0),
-    })
+    committed = a.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops(0)})
     assert committed["revision"] == 1, committed
-    stale = b.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops(1)})
+    second = b.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops(1)})
+    assert not second.get("_is_error") and second["revision"] == 2, second
+    stale = a.call("doc_apply_ops", {
+        "doc_id": doc, "base_revision": 1, "ops": _box_ops(2),
+    })
     assert stale.get("_is_error") is True, stale
     assert stale.get("code") == "stale_revision", stale
     after = a.call("doc_tree", {"doc_id": doc})
-    assert after["revision"] == 1
-    assert len(after["tree"]["features"]) == 1
+    assert after["revision"] == 2
+    assert {f["name"] for f in after["tree"]["features"]} == {"WriterBox0", "WriterBox1"}
+    current = a.call("doc_apply_ops", {
+        "doc_id": doc, "base_revision": 2, "ops": _box_ops(2),
+    })
+    assert not current.get("_is_error") and current["revision"] == 3, current
+
+
+def test_push_pull_refuses_foreign_edit_after_own_revert(writers):
+    a, b, doc = writers
+    built = a.call("doc_apply_ops", {
+        "doc_id": doc, "base_revision": -1, "ops": _box_ops(0)})
+    checkpoint = a.call("doc_checkpoint", {"doc_id": doc})
+    reverted = a.call("doc_revert", {
+        "doc_id": doc, "checkpoint": checkpoint["checkpoint"],
+        "expect_revision": built["revision"]})
+    assert not reverted.get("_is_error"), reverted
+    foreign = b.call("doc_apply_ops", {
+        "doc_id": doc, "base_revision": -1, "ops": _box_ops(1)})
+    assert not foreign.get("_is_error"), foreign
+    before = a.call("doc_tree", {"doc_id": doc})
+    for distance, commit in ((0, False), (2, False), (2, True)):
+        refused = a.call("doc_push_pull", {
+            "doc_id": doc, "body_id": 1, "topo_id": 1, "distance": distance,
+            "commit": commit, "expect_revision": reverted["revision"]})
+        assert refused.get("code") == "stale_revision", refused
+        assert refused.get("detail", {}).get("current_revision") == before["revision"]
+        after = a.call("doc_tree", {"doc_id": doc})
+        assert after["revision"] == before["revision"]
+        assert after["tree"] == before["tree"]
+    # Both the explicitly current and legacy unguarded no-op forms remain usable.
+    params = {"doc_id": doc, "body_id": 1, "topo_id": 1, "distance": 0}
+    assert not a.call("doc_push_pull", {**params, "expect_revision": before["revision"]}).get("_is_error")
+    assert not a.call("doc_push_pull", params).get("_is_error")
+
+
+def test_solve_mates_refuses_foreign_edit_after_own_revert(writers, tmp_path):
+    a, b, source = writers
+    built = a.call("doc_apply_ops", {
+        "doc_id": source, "base_revision": -1, "ops": _box_ops(0)})
+    assert not built.get("_is_error"), built
+    path = str(tmp_path / "component.step+")
+    assert not a.call("doc_save", {"doc_id": source, "path": path}).get("_is_error")
+    doc = a.call("doc_new", {"kind": "assembly", "name": "GuardedPreviewAssembly"})["doc_id"]
+    checkpoint = a.call("doc_checkpoint", {"doc_id": doc})
+    reverted = a.call("doc_revert", {
+        "doc_id": doc, "checkpoint": checkpoint["checkpoint"],
+        "expect_revision": checkpoint["revision"]})
+    assert not reverted.get("_is_error"), reverted
+    foreign = b.call("doc_apply_ops", {
+        "doc_id": doc, "base_revision": -1, "ops": [
+            {"op": "asm_insert_component", "source": {"path": path}, "name": "Peer"}]})
+    assert not foreign.get("_is_error"), foreign
+    before = a.call("doc_tree", {"doc_id": doc})
+    for drag in (None, {"component": "k1", "target": [100, 0, 0]}):
+        refused = a.call("doc_solve_mates", {
+            "doc_id": doc, "drag": drag, "expect_revision": reverted["revision"]})
+        assert refused.get("code") == "stale_revision", refused
+        assert refused.get("detail", {}).get("current_revision") == before["revision"]
+        after = a.call("doc_tree", {"doc_id": doc})
+        assert after["revision"] == before["revision"]
+        assert after["tree"] == before["tree"]
+    current = a.call("doc_solve_mates", {"doc_id": doc, "expect_revision": before["revision"]})
+    assert not current.get("_is_error"), current
+    legacy = a.call("doc_solve_mates", {"doc_id": doc})
+    assert not legacy.get("_is_error"), legacy
+
+
+def test_sketch_preview_guards_peer_edits_and_newer_editor(writers):
+    a, b, doc = writers
+    built = a.call("doc_apply_ops", {"doc_id": doc, "base_revision": -1, "ops": [
+        {"op": "add_feature", "feature": {
+            "type": "sketch", "name": "Circle", "refs": {"plane": "plane.top"},
+            "params": {"entities": [{"id": "e1", "type": "circle",
+                                      "center": [0, 0], "radius": 10}],
+                       "constraints": [{"id": "c1", "type": "fix", "refs": ["e1.center"]}]}}}]})
+    sketch = built["id_map"]["$0"]
+    first = a.call("sketch_enter", {"doc_id": doc, "sketch": sketch})
+    token = first["session_id"]
+    assert token > 0 and first["revision"] == built["revision"]
+    dragged = a.call("sketch_drag", {"doc_id": doc, "sketch": sketch,
+                                      "session_id": token, "handle": "e1.rim",
+                                      "xy": [25, 0]})
+    assert dragged["revision"] == first["revision"]
+    foreign = b.call("doc_apply_ops", {"doc_id": doc, "base_revision": -1, "ops": [
+        {"op": "sketch_edit_entity", "sketch": sketch, "id": "e1", "params": {"radius": 15}}]})
+    assert not foreign.get("_is_error"), foreign
+    before = a.call("doc_tree", {"doc_id": doc})
+    for method in ("sketch_drag_commit", "sketch_exit"):
+        stale = a.call(method, {"doc_id": doc, "sketch": sketch,
+                                "session_id": token, "expect_revision": dragged["revision"]})
+        assert stale.get("code") == "stale_revision", stale
+        after = a.call("doc_tree", {"doc_id": doc})
+        assert after["revision"] == before["revision"] and after["tree"] == before["tree"]
+
+    newer = b.call("sketch_enter", {"doc_id": doc, "sketch": sketch})
+    assert newer["session_id"] != token
+    discarded = a.call("sketch_exit", {"doc_id": doc, "sketch": sketch,
+                                        "session_id": token, "discard_active": True})
+    assert discarded.get("discarded") is False, discarded
+    for method, extra in (("sketch_solve", {}), ("sketch_drag", {
+            "handle": "e1.rim", "xy": [30, 0]}), ("sketch_drag_commit", {}),
+            ("sketch_exit", {})):
+        refused = a.call(method, {"doc_id": doc, "sketch": sketch, "session_id": token, **extra})
+        assert refused.get("code") == "sketch_session_changed", refused
+    fresh = b.call("sketch_solve", {"doc_id": doc, "sketch": sketch,
+                                     "session_id": newer["session_id"]})
+    assert fresh["revision"] == before["revision"]
+    sample = b.call("sketch_drag", {"doc_id": doc, "sketch": sketch,
+                                      "session_id": newer["session_id"],
+                                      "handle": "e1.rim", "xy": [20, 0]})
+    assert sample["revision"] == fresh["revision"]
+    committed = b.call("sketch_drag_commit", {"doc_id": doc, "sketch": sketch,
+                                               "session_id": newer["session_id"],
+                                               "expect_revision": sample["revision"]})
+    assert not committed.get("_is_error"), committed
+    assert committed["revision"] > before["revision"]
+    done = b.call("sketch_exit", {"doc_id": doc, "sketch": sketch,
+                                  "session_id": newer["session_id"], "discard_active": True})
+    assert done.get("discarded") is True, done
+
+
+def test_sketch_discard_does_not_clear_different_editor_and_survives_deletion(writers):
+    a, b, doc = writers
+    def sketch(name):
+        return {"op": "add_feature", "feature": {
+            "type": "sketch", "name": name, "refs": {"plane": "plane.top"},
+            "params": {"entities": [{"id": "e1", "type": "circle",
+                                      "center": [0, 0], "radius": 10}], "constraints": []}}}
+
+    built = a.call("doc_apply_ops", {"doc_id": doc, "base_revision": -1,
+                                     "ops": [sketch("First"), sketch("Second")]})
+    one, two = built["id_map"]["$0"], built["id_map"]["$1"]
+    old = a.call("sketch_enter", {"doc_id": doc, "sketch": one})
+    newer = b.call("sketch_enter", {"doc_id": doc, "sketch": two})
+    result = a.call("sketch_exit", {"doc_id": doc, "sketch": one,
+                                     "session_id": old["session_id"], "discard_active": True})
+    assert result.get("discarded") is False, result
+    solved = b.call("sketch_solve", {"doc_id": doc, "sketch": two,
+                                      "session_id": newer["session_id"]})
+    assert not solved.get("_is_error"), solved
+    deleted = a.call("doc_apply_ops", {"doc_id": doc, "base_revision": -1,
+                                       "ops": [{"op": "delete_feature", "id": two}]})
+    assert not deleted.get("_is_error"), deleted
+    before = b.call("doc_tree", {"doc_id": doc})
+    done = b.call("sketch_exit", {"doc_id": doc, "sketch": two,
+                                  "session_id": newer["session_id"], "discard_active": True})
+    assert done.get("discarded") is True, done
+    after = b.call("doc_tree", {"doc_id": doc})
+    assert after["tree"] == before["tree"] and after["revision"] == before["revision"]
 
 
 @pytest.mark.parametrize("checkpoint,applied_revision", [

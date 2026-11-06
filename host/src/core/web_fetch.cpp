@@ -1,6 +1,8 @@
 #include "web_fetch.h"
 
 #include <string>
+#include <memory>
+#include <utility>
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten/fetch.h>
@@ -55,12 +57,83 @@ std::vector<uint8_t> webFetch(const std::string& url, std::string& err) {
     return out;
 }
 
+namespace {
+struct AsyncFetch {
+    WebFetchComplete complete;
+    WebFetchProgress progress;
+};
+
+void asyncProgress(emscripten_fetch_t* fetch) {
+    auto* request = static_cast<AsyncFetch*>(fetch->userData);
+    if (request->progress) {
+        const float fraction = fetch->totalBytes
+            ? static_cast<float>(fetch->dataOffset + fetch->numBytes) /
+              static_cast<float>(fetch->totalBytes) : -1.0f;
+        request->progress(fraction);
+    }
+}
+
+void asyncComplete(emscripten_fetch_t* fetch) {
+    std::unique_ptr<AsyncFetch> request(static_cast<AsyncFetch*>(fetch->userData));
+    std::vector<uint8_t> bytes;
+    std::string error;
+    const int status = fetch->status;
+    if (status < 200 || status >= 300) {
+        error = "HTTP " + std::to_string(status) + " fetching artifact";
+    } else if (fetch->numBytes == 0) {
+        error = "Empty artifact response";
+    } else {
+        const size_t heap = emscripten_get_heap_size();
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(fetch->data);
+        if (!fetch->data || fetch->dataOffset != 0 ||
+            (fetch->totalBytes && fetch->numBytes != fetch->totalBytes) ||
+            begin > heap || fetch->numBytes > heap - begin ||
+            fetch->numBytes > bytes.max_size() ||
+            fetch->numBytes > static_cast<uint64_t>(std::numeric_limits<std::ptrdiff_t>::max())) {
+            error = "Invalid or oversized artifact response";
+        } else {
+            const auto* data = reinterpret_cast<const uint8_t*>(fetch->data);
+            bytes.assign(data, data + static_cast<size_t>(fetch->numBytes));
+        }
+    }
+    emscripten_fetch_close(fetch);
+    request->complete(std::move(bytes), std::move(error));
+}
+
+void asyncError(emscripten_fetch_t* fetch) {
+    std::unique_ptr<AsyncFetch> request(static_cast<AsyncFetch*>(fetch->userData));
+    const int status = fetch->status;
+    emscripten_fetch_close(fetch);
+    request->complete({}, status ? "HTTP " + std::to_string(status) + " fetching artifact"
+                                 : "Network error fetching artifact");
+}
+}  // namespace
+
+bool webFetchAsync(const std::string& url, WebFetchComplete complete, WebFetchProgress progress) {
+    auto request = std::make_unique<AsyncFetch>(AsyncFetch{std::move(complete), std::move(progress)});
+    emscripten_fetch_attr_t attr;
+    emscripten_fetch_attr_init(&attr);
+    std::strcpy(attr.requestMethod, "GET");
+    attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY;
+    attr.userData = request.get();
+    attr.onsuccess = asyncComplete;
+    attr.onerror = asyncError;
+    attr.onprogress = asyncProgress;
+    if (!emscripten_fetch(&attr, url.c_str())) return false;
+    request.release();
+    return true;
+}
+
 #else  // !__EMSCRIPTEN__
 
 std::vector<uint8_t> webFetch(const std::string& url, std::string& err) {
     (void)url;
     err = "webFetch is only available in the web build";
     return {};
+}
+
+bool webFetchAsync(const std::string&, WebFetchComplete, WebFetchProgress) {
+    return false;
 }
 
 #endif

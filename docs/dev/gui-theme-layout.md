@@ -15,6 +15,7 @@ individual panels contain is covered in [gui-architecture.md](gui-architecture.m
 | `host/src/ui/anim.h/.cpp` | `ui::anim`: duration tokens, easings, per-id tweens, frame pump |
 | `host/src/ui/metrics.h` | DPI-aware fonts and spacing; every GUI dimension scales through it |
 | `host/src/ui/layout.cpp/.h` | Dockspace, pinned glass columns, overlay band, `resetOverlayColumns()` |
+| `host/src/render/backdrop_text.cpp/.h` | Same-frame, per-fragment contrast for Copilot and shared AI-chat text |
 | `host/src/ui/settings_modal.cpp` | Settings dialog (theme toggle, AI provider, units, glass knobs) |
 | `host/src/ui/file_dialog.cpp`, `equations_dialog.cpp`, `profiler_window.cpp` | App-level modals |
 | `host/src/ui/toast.cpp`, `cursors.cpp` | Notifications, cursor set |
@@ -101,11 +102,42 @@ legitimate case can be suppressed with a trailing `// gui-lint: allow <reason>` 
 - No hardcoded colors outside `ui_theme.*` (lint-enforced, above).
 - `CHUDWARE_SHOT=appearance` live-previews glass knobs headlessly.
 
+## Copilot text contrast
+
+Panel-average blurred luminance chooses glass material tones, not the final ink of Copilot
+text. `ui::adaptCopilotTextToBackdrop()` runs after `ImGui::Render()` and before the OpenGL3
+backend, partitioning font-atlas glyph runs from fills, selection rectangles, lines and images.
+Each glyph run samples a tight, same-frame GPU snapshot **after preceding UI fills**. The
+shader therefore sees the rendered geometry and the actual composited glass/control surface,
+including a dark-theme slab, rather than a delayed or blurred approximation.
+
+The fragment shader preserves readable original colors. Where contrast is insufficient, it
+chooses the higher-contrast light/dark vibrancy ink in linear-light contrast space, accounting
+for glyph coverage and text alpha. A geometry boundary can split the color inside one glyph.
+Clipping, font alpha, native selection/copy, images and non-text primitives remain unchanged.
+The snapshot is a GPU framebuffer blit, not a CPU readback or per-character raycast. Projection
+and capture bounds honor `DisplayPos` and `FramebufferScale`; shader/texture/FBO resources are
+released by `shutdownBackdropText()` before the GL context is destroyed.
+
 ## Layout system (`layout.cpp`)
 
 - One central ImGui dockspace node with no splits; panels are not conventional docked windows.
 - **Pinned overlay columns:** the FeatureManager (left) and Copilot (right) draw over the
   viewport as glass columns. Collapse rolls a column up to a header row plus chevron.
+- **Copilot header:** navigation and utility actions use the kit's compact density, chip
+  rounding and shared `controlFace()` chrome. Selected tabs have an accent wash and rounded
+  outline; hover never paints a native `Selectable` rectangle underneath. Submit hit zones
+  first, then paint the resolved selection so a click updates every highlight in one frame.
+  Measured text/icon widths keep Sessions and New chat on the first row when they fit,
+  otherwise both move to a second row. Narrow panes drop the task count before replacing
+  tab labels with named, tooltipped icons. Font-derived sizes are already DPI-scaled.
+- **Copilot Sessions list:** rows are one fixed height (padding + medium-weight title + one meta
+  line: age · message count [· project] and an inline document chip) with every element placed
+  from the row rect, so content is centred and title/meta clip before a constant right-hand action
+  zone. All actions live in one overflow menu (right-click works too); Delete asks inline before
+  acting. Titles drop inline-image markers (`[Image #N]`). Sessions sort by last message time and
+  group Today / Yesterday / Earlier when more than one group is present; only on-screen rows are
+  submitted, and rows holding an open card, rename, delete prompt or menu are always submitted.
 - **Overlay band:** a screen-space rectangle between the ribbon and the status bar, published
   every frame; floating dialogs (Measure, BOM, ...) anchor inside it.
 - `setNextCommandDialogPlacement(windowName, preferredSizePx, minimumSizePx)` takes
@@ -116,6 +148,10 @@ legitimate case can be suppressed with a trailing `// gui-lint: allow <reason>` 
 - "Reset layout" calls `resetOverlayColumns()` to restore default widths.
 - Frame-loop draw order lives in `run_gui()` in `host/src/app.cpp`: title bar, left pane tabs,
   viewport, console, status bar, ribbon dispatch, modals.
+- The status bar keeps opening progress as a single elapsed-time message. Rebuild activity is
+  shown separately only when it is not already represented by that opening message; previous
+  feature statuses are not a live rebuild progress counter. Long status messages expose their
+  full text on hover.
 - **Reserved chrome, not overlays.** Strips that must never cover geometry (for example the
   Manufacture Offline/Live mode bar) report their height, which `app.cpp` folds into `dockTopY`
   before `setOverlayBand()`, and then paint at the reserved position.

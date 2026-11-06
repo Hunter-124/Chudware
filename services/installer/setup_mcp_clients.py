@@ -462,7 +462,8 @@ def main(argv: list[str]) -> int:
     if compiled_mcp and not Path(compiled_mcp).is_file() and not args.unregister:
         ap.error(f"compiled MCP executable not found: {compiled_mcp}")
 
-    py = str(Path(args.python).resolve())
+    # Preserve venv symlinks: resolving to the base binary loses pyvenv.cfg discovery.
+    py = str(Path(args.python).absolute())
     repo = str(Path(args.repo).resolve())
     profile = args.profile
 

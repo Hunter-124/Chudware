@@ -12,7 +12,6 @@
 #include "../dragdrop.h"
 
 #include "../file_dialog.h"    // openFileDialog — optional driven-sweep geometry STL
-#include "../widgets/ribbon.h" // setRibbonDisabledPrefix — EM tab gating
 #include "imgui_internal.h"    // ImGuiWindow — field-level landing scrolls the pane body
 
 namespace ui {
@@ -107,10 +106,6 @@ void SimManager::probeEmStatus(AppState &st) {
             }
         }
         emStatus_ = available ? 1 : -1;
-        if (emStatus_ < 0)
-          ui::setRibbonDisabledPrefix("sim_em_run", "EM solver not installed");
-        else
-          ui::setRibbonDisabledPrefix("", "");
       },
       5000);
 }

@@ -166,7 +166,9 @@ def test_pinned_tls_download_verifies_hostname_and_exact_payload(tls_fixture, tm
     fixture = tls_fixture
     destination = tmp_path / "model.step"
     response = http.download(fixture.url + "/model.step", destination,
-                             schemes=("https",), idle_timeout=3)
+                             schemes=("https",), idle_timeout=3,
+                             expected_sha256=hashlib.sha256(STEP).hexdigest(),
+                             expected_size=len(STEP))
     assert response.status_code == 200
     assert response.bytes_written == len(STEP)
     assert destination.read_bytes() == STEP

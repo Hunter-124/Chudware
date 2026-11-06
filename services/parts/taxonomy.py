@@ -232,6 +232,64 @@ def route(category_id: str) -> dict:
     return out
 
 
+def general_model_sites() -> list[str]:
+    """General CAD sources, as distinct from the retailers in the CAD category."""
+    node = get_node("vendors.cad_models") or {}
+    sites = node.get("general_model_sites")
+    if not isinstance(sites, list):
+        return ["grabcad", "traceparts", "3dcontentcentral", "printables", "makerworld"]
+    return list(dict.fromkeys(site for site in sites if isinstance(site, str) and site))
+
+
+def infer_category(query: str) -> str:
+    """Find the most specific taxonomy query hint present in unscoped text.
+
+    Hints are alternatives, not extra words to append to the vendor's query.
+    Longer phrases win over a broad single-word match; depth breaks ties.
+    """
+    query = str(query or "").casefold()
+    if not query:
+        return ""
+    best: tuple[int, int, int] = (0, 0, 0)
+    category = ""
+
+    def walk(node: dict, depth: int) -> None:
+        nonlocal best, category
+        for hint in node.get("query_terms") or []:
+            words = re.findall(r"[a-z0-9]+", str(hint).casefold())
+            if not words:
+                continue
+            pattern = r"[\W_]+".join(re.escape(word) for word in words)
+            if re.search(rf"(?<![a-z0-9]){pattern}(?:s|es)?(?![a-z0-9])", query):
+                rank = (len(words), sum(map(len, words)), depth)
+                if rank > best:
+                    best, category = rank, node["id"]
+        for child in node.get("children") or []:
+            walk(child, depth + 1)
+
+    for root in load_taxonomy().get("categories", []):
+        walk(root, 0)
+    return category
+
+
+def prioritize_sites(vendors: list[str]) -> list[str]:
+    """Start category-fitting CAD suppliers before broad marketplaces."""
+    general = general_model_sites()
+    cad_suppliers = route("vendors.cad_models")["sites"]
+    preferred = [site for site in general if site in vendors]
+    preferred.extend(site for site in cad_suppliers if site in vendors and site not in preferred)
+    if not preferred:
+        preferred = vendors[:3]
+    return list(dict.fromkeys([*preferred, *general, *vendors]))
+
+
+def sites_for_query(query: str) -> list[str]:
+    """Route an unscoped search to matching category vendors and general models."""
+    category_id = infer_category(query)
+    vendors = route(category_id)["sites"] if category_id else []
+    return prioritize_sites(vendors)
+
+
 # ---------------------------------------------------------------------------
 # Facet matching
 # ---------------------------------------------------------------------------

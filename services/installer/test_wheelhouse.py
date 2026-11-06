@@ -1,7 +1,7 @@
 """Consumer-visible offline provisioning checks, using only inert fixture wheels.
 
 The pip smoke creates a temporary venv, serves a synthetic public candidate on
-loopback, and never invokes a build backend or installs the real chudcode-rpc SDK.
+loopback, and never invokes a build backend or installs the real omp-rpc SDK.
 Run in a disposable network-disabled environment; loopback must remain available.
 """
 from __future__ import annotations
@@ -22,12 +22,22 @@ import pytest
 
 from services.installer import provision
 from services.installer.wheelhouse import (
-    CHUDCODE_REPOSITORY, WheelhouseError, _packaging, install_command, pip_environment,
+    OMP_REPOSITORY, WheelhouseError, _packaging, install_command, pip_environment,
     target_key, verified_wheelhouse,
 )
 
 
-def fixture_wheel(directory, name="chudcode-rpc", version="0.3.1", dependencies=(),
+SDK_COMMIT = "413d278a87a69b453efabf8d1fedb9940385e8c6"
+SDK_RUNTIME_VERSION = "18.13.3"
+SDK_ARCHIVE_SHA256 = "56cddfedb6784a4fdd4e43070fee29bfc4c04351f378a32f9fca0c9a3c8596d4"
+SDK_ARCHIVE = (
+    "https://codeload.github.com/can1357/oh-my-pi/tar.gz/"
+    f"{SDK_COMMIT}"
+    f"#sha256={SDK_ARCHIVE_SHA256}&subdirectory=sdk/python/omp-rpc"
+)
+
+
+def fixture_wheel(directory, name="omp-rpc", version="0.1.0", dependencies=(),
                   module_value="approved fixture", tag="py3-none-any", requires_python=">=3.11",
                   extra_files=None):
     normalized = name.replace("-", "_")
@@ -55,12 +65,12 @@ def fixture_wheel(directory, name="chudcode-rpc", version="0.3.1", dependencies=
 @pytest.fixture
 def reviewed(tmp_path):
     requirements = tmp_path / "requirements.txt"
-    requirements.write_text("--no-index\n--only-binary=:all:\nchudcode-rpc==0.3.1\n")
-    source = {"repository": CHUDCODE_REPOSITORY, "repository_commit": "1" * 40}
-    native = tmp_path / "CHUDCODE_ARTIFACT.lock"
-    native.write_text(json.dumps(source))
+    requirements.write_text("--no-index\n--only-binary=:all:\nomp-rpc==0.1.0\n")
+    source = {"repository": OMP_REPOSITORY, "repository_commit": SDK_COMMIT}
+    native = tmp_path / "OMP_ARTIFACT.lock"
+    native.write_text(json.dumps({**source, "version": SDK_RUNTIME_VERSION}))
     wheelhouse = tmp_path / "wheelhouse"
-    vendored = {"chudcode_rpc/_vendor/inert_child.dist-info/INSTALLER": "reviewed vendored metadata\n"}
+    vendored = {"omp_rpc/_vendor/inert_child.dist-info/INSTALLER": "reviewed vendored metadata\n"}
     sdk = fixture_wheel(wheelhouse, dependencies=("inert-dependency==1.0",),
                         extra_files=vendored)
     dependency = fixture_wheel(wheelhouse, "inert-dependency", "1.0")
@@ -69,16 +79,16 @@ def reviewed(tmp_path):
     lock = tmp_path / "RUNTIME_WHEELS.lock"
     document = {"schema": "chudware-runtime-wheels-v1",
                 "requirements_sha256": hashlib.sha256(requirements.read_bytes()).hexdigest(),
-                "chudcode_source": source,
+                "omp_source": source,
                 "targets": {target_key(environment): {"wheels": [sdk, dependency]}}}
     lock.write_text(json.dumps(document))
     return {"wheelhouse": wheelhouse, "requirements": requirements, "lock_path": lock,
-            "chudcode_lock": native, "document": document, "environment": environment}
+            "omp_lock": native, "document": document, "environment": environment}
 
 
 def verify(inputs):
     return verified_wheelhouse(**{key: inputs[key] for key in
-                                 ("wheelhouse", "requirements", "lock_path", "chudcode_lock")})
+                                 ("wheelhouse", "requirements", "lock_path", "omp_lock")})
 
 
 def rewrite_lock(inputs):
@@ -91,29 +101,119 @@ def _declare(inputs, text):
     rewrite_lock(inputs)
 
 
-def test_sdk_direct_reference_to_the_reviewed_commit_is_satisfied_by_the_reviewed_wheel(reviewed):
-    _declare(reviewed, f"chudcode-rpc @ git+{CHUDCODE_REPOSITORY}@{'1' * 40}"
-                       "#subdirectory=python/chudcode-rpc  # developer source build\n")
+@pytest.mark.parametrize("suffix", [
+    "  # developer source build\n",
+    ' ; python_version >= "3.0"  # active marker and URL hash survive comment stripping\n',
+])
+def test_sdk_archive_reference_is_satisfied_by_the_reviewed_wheel(reviewed, suffix):
+    _declare(reviewed, f"omp-rpc @ {SDK_ARCHIVE}{suffix}")
     with verify(reviewed) as identity:
-        assert identity["packages"]["chudcode-rpc"] == "0.3.1"
+        assert identity["packages"]["omp-rpc"] == "0.1.0"
+        assert SDK_ARCHIVE not in identity["requirements"].read_text()
+
+
+@pytest.mark.parametrize(("original", "replacement"), [
+    pytest.param(SDK_COMMIT, "2" * 40, id="wrong-commit"),
+    pytest.param("/tar.gz/", "/tar/", id="other-archive-path"),
+    pytest.param("https://codeload.github.com/", "https://example.invalid/", id="wrong-host"),
+    pytest.param("https://codeload.github.com/", "https://codeload.github.com.example.invalid/", id="host-suffix"),
+    pytest.param("https://codeload.github.com/", "https://codeload.github.com@example.invalid/", id="userinfo-host"),
+    pytest.param("https://codeload.github.com/", "https://user:secret@codeload.github.com/", id="credentials"),
+    pytest.param("https://", "http://", id="insecure-scheme"),
+    pytest.param("/can1357/oh-my-pi/", "/other/oh-my-pi/", id="wrong-repository"),
+    pytest.param("#sha256=", "?download=1#sha256=", id="query"),
+    pytest.param(f"sha256={SDK_ARCHIVE_SHA256}&", "", id="missing-hash"),
+    pytest.param(SDK_ARCHIVE_SHA256, "0" * 64, id="wrong-hash"),
+    pytest.param(SDK_ARCHIVE_SHA256, SDK_ARCHIVE_SHA256[:-1], id="short-hash"),
+    pytest.param("sha256=", "sha512=", id="other-hash-algorithm"),
+    pytest.param("&subdirectory=sdk/python/omp-rpc", "", id="missing-subdirectory"),
+    pytest.param("subdirectory=sdk/python/omp-rpc", "subdirectory=python", id="wrong-subdirectory"),
+    pytest.param("subdirectory=sdk/python/omp-rpc", "subdirectory=sdk/python/omp-rpc/../other",
+                 id="subdirectory-traversal"),
+    pytest.param("subdirectory=sdk/python/omp-rpc", "subdirectory=python%2Fomp-rpc",
+                 id="encoded-subdirectory"),
+    pytest.param("subdirectory=sdk/python/omp-rpc", "subdirectory=sdk/python/omp-rpc&subdirectory=other",
+                 id="duplicate-subdirectory"),
+    pytest.param(f"sha256={SDK_ARCHIVE_SHA256}", f"sha256={SDK_ARCHIVE_SHA256}&sha256={'0' * 64}",
+                 id="duplicate-hash"),
+    pytest.param(f"sha256={SDK_ARCHIVE_SHA256}&subdirectory=sdk/python/omp-rpc",
+                 f"subdirectory=sdk/python/omp-rpc&sha256={SDK_ARCHIVE_SHA256}",
+                 id="noncanonical-fragment"),
+])
+def test_sdk_archive_reference_rejects_provenance_boundary_changes(reviewed, original, replacement):
+    _declare(reviewed, f"omp-rpc @ {SDK_ARCHIVE.replace(original, replacement)}\n")
+    with pytest.raises(WheelhouseError):
+        with verify(reviewed):
+            pass
 
 
 @pytest.mark.parametrize("declaration", [
-    f"chudcode-rpc @ git+{CHUDCODE_REPOSITORY}@{'2' * 40}#subdirectory=python/chudcode-rpc\n",
-    "chudcode-rpc @ git+https://example.invalid/chudcode.git@" + "1" * 40 + "\n",
-    f"inert-dependency @ git+{CHUDCODE_REPOSITORY}@{'1' * 40}\n",
+    f"omp-rpc @ git+{OMP_REPOSITORY}@{SDK_COMMIT}#subdirectory=sdk/python/omp-rpc\n",
+    f"omp-rpc @ git+{OMP_REPOSITORY}@main#subdirectory=sdk/python/omp-rpc\n",
+    f"omp-rpc @ git+{OMP_REPOSITORY}@v0.4.4#subdirectory=sdk/python/omp-rpc\n",
+    "omp-rpc @ https://example.invalid/omp_rpc-0.1.0-py3-none-any.whl\n",
+    "omp-rpc @ file:///tmp/omp-source.tar.gz\n",
+    f"inert-dependency @ {SDK_ARCHIVE}\n",
+    f'omp-rpc @ {SDK_ARCHIVE.replace(SDK_COMMIT, "2" * 40)} ; python_version < "3.0"\n',
 ])
-def test_other_direct_references_are_unreviewed(reviewed, declaration):
+def test_other_direct_references_are_unreviewed_even_with_inactive_markers(reviewed, declaration):
     _declare(reviewed, declaration)
-    with pytest.raises(WheelhouseError, match="unreviewed direct URLs"):
+    with pytest.raises(WheelhouseError):
         with verify(reviewed):
             pass
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("version", "0.4.5"), ("version", None), ("version", ""),
+    ("version", "0.4.4/../other"), ("repository_commit", "2" * 40),
+])
+def test_sdk_archive_must_match_native_runtime_release_and_commit(reviewed, field, value):
+    native = json.loads(reviewed["omp_lock"].read_text())
+    native[field] = value
+    reviewed["omp_lock"].write_text(json.dumps(native))
+    if field == "repository_commit":
+        reviewed["document"]["omp_source"][field] = value
+    _declare(reviewed, f"omp-rpc @ {SDK_ARCHIVE}\n")
+    with pytest.raises(WheelhouseError):
+        with verify(reviewed):
+            pass
+
+
+@pytest.mark.parametrize("active", [True, False])
+def test_sdk_archive_preserves_extras_and_environment_markers(reviewed, active):
+    marker = 'python_version >= "3.0"' if active else 'python_version < "3.0"'
+    _declare(reviewed, f"omp-rpc[feature] @ {SDK_ARCHIVE} ; {marker}\n")
+    target = reviewed["document"]["targets"][target_key(reviewed["environment"])]
+    target["wheels"][0] = fixture_wheel(reviewed["wheelhouse"],
+                                      dependencies=('absent-extra==1.0; extra == "feature"',))
+    rewrite_lock(reviewed)
+    if active:
+        with pytest.raises(WheelhouseError, match="absent-extra"):
+            with verify(reviewed):
+                pass
+    else:
+        with verify(reviewed) as identity:
+            assert identity["packages"]["omp-rpc"] == "0.1.0"
+
+
+def test_additional_declarations_apply_the_same_archive_provenance_rules(reviewed, tmp_path):
+    additional = tmp_path / "additional.txt"
+    additional.write_text(f"omp-rpc @ {SDK_ARCHIVE}\n")
+    inputs = {key: reviewed[key] for key in ("wheelhouse", "requirements", "lock_path", "omp_lock")}
+    with verified_wheelhouse(**inputs, additional_requirements=additional) as identity:
+        assert identity["packages"]["omp-rpc"] == "0.1.0"
+    additional.write_text(f"omp-rpc @ {SDK_ARCHIVE.split('#', 1)[0]}\n")
+    with pytest.raises(WheelhouseError):
+        with verified_wheelhouse(**inputs, additional_requirements=additional):
+            pass
+
+
 
 
 def bind_provisioner(monkeypatch, inputs):
     monkeypatch.setattr(provision, "REQUIREMENTS", inputs["requirements"])
     monkeypatch.setattr(provision, "WHEEL_LOCK", inputs["lock_path"])
-    monkeypatch.setattr(provision, "CHUDCODE_LOCK", inputs["chudcode_lock"])
+    monkeypatch.setattr(provision, "OMP_LOCK", inputs["omp_lock"])
 
 
 @contextmanager
@@ -239,9 +339,9 @@ def test_incomplete_or_mismatched_managed_inputs_are_rejected(reviewed, failure)
     if failure == "missing-transitive":
         target["wheels"].pop()
     elif failure == "changed-declarations":
-        reviewed["requirements"].write_text("chudcode-rpc==0.3.1\nnew-runtime-dependency==1.0\n")
+        reviewed["requirements"].write_text("omp-rpc==0.1.0\nnew-runtime-dependency==1.0\n")
     elif failure == "source-mismatch":
-        reviewed["document"]["chudcode_source"]["repository_commit"] = "2" * 40
+        reviewed["document"]["omp_source"]["repository_commit"] = "2" * 40
     elif failure == "unsupported-target":
         reviewed["document"]["targets"] = {}
     elif failure == "metadata-mismatch":
@@ -251,7 +351,7 @@ def test_incomplete_or_mismatched_managed_inputs_are_rejected(reviewed, failure)
             members = {name: archive.read(name) for name in archive.namelist()}
         for name in members:
             if name.endswith("/METADATA"):
-                members[name] = members[name].replace(b"Name: chudcode-rpc", b"Name: other-package")
+                members[name] = members[name].replace(b"Name: omp-rpc", b"Name: other-package")
         with zipfile.ZipFile(path, "w") as archive:
             for name, content in members.items():
                 archive.writestr(name, content)
@@ -271,7 +371,7 @@ def test_incomplete_or_mismatched_managed_inputs_are_rejected(reviewed, failure)
 
 
 def test_selected_extras_dependency_closure_is_required(reviewed):
-    reviewed["requirements"].write_text("chudcode-rpc[feature]==0.3.1\n")
+    reviewed["requirements"].write_text("omp-rpc[feature]==0.1.0\n")
     reviewed["document"]["requirements_sha256"] = hashlib.sha256(reviewed["requirements"].read_bytes()).hexdigest()
     target = reviewed["document"]["targets"][target_key(reviewed["environment"])]
     target["wheels"][0] = fixture_wheel(reviewed["wheelhouse"], dependencies=(
@@ -314,7 +414,7 @@ def test_real_pip_installs_approved_fixture_offline_and_rejects_public_candidate
             phase["name"] = "installed-identity"
             assert provision._installed_identity_ok(python, identity)
             phase["name"] = "fixture-import"
-            result = subprocess.run([str(python), "-I", "-c", "import chudcode_rpc; print(chudcode_rpc.IDENTITY)"],
+            result = subprocess.run([str(python), "-I", "-c", "import omp_rpc; print(omp_rpc.IDENTITY)"],
                                     check=True, capture_output=True, text=True, env=pip_environment())
             assert result.stdout.strip() == "approved fixture"
             # Installed source bytes cannot spoof authenticity with copied PEP 610 metadata.
@@ -322,7 +422,7 @@ def test_real_pip_installs_approved_fixture_offline_and_rejects_public_candidate
             site = subprocess.run([str(python), "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
                                   check=True, capture_output=True, text=True).stdout.strip()
             phase["name"] = "identity-tamper-refusals"
-            module = Path(site) / "chudcode_rpc" / "__init__.py"
+            module = Path(site) / "omp_rpc" / "__init__.py"
             approved = module.read_bytes()
             vendored_metadata = module.parent / "_vendor/inert_child.dist-info/INSTALLER"
             vendored_metadata.write_text("unapproved substituted metadata\n")
@@ -365,7 +465,7 @@ def test_real_pip_installs_approved_fixture_offline_and_rejects_public_candidate
             assert not marker.exists()
             customization.unlink()
             # A bare matching version with editable provenance is rejected.
-            origin = next(Path(site).glob("chudcode_rpc-*.dist-info")) / "direct_url.json"
+            origin = next(Path(site).glob("omp_rpc-*.dist-info")) / "direct_url.json"
             origin.write_text(json.dumps({"url": "file:///synthetic-editable", "dir_info": {"editable": True}}))
             assert not provision._installed_identity_ok(python, identity)
         assert requests == []
@@ -389,7 +489,7 @@ def test_real_pip_hash_gate_cannot_fall_back_to_synthetic_public_index(reviewed,
     python = venv / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
     with synthetic_public_index(tmp_path) as (index, requests, phase):
         with verify(reviewed) as identity:
-            snapshot = identity["requirements"].parent / "chudcode_rpc-0.3.1-py3-none-any.whl"
+            snapshot = identity["requirements"].parent / "omp_rpc-0.1.0-py3-none-any.whl"
             if failure == "absent":
                 snapshot.unlink()
             else:
@@ -405,7 +505,7 @@ def test_real_pip_hash_gate_cannot_fall_back_to_synthetic_public_index(reviewed,
 def test_compiler_tool_requirements_must_be_in_reviewed_complete_target(reviewed, tmp_path):
     additional = tmp_path / "compiler-requirements.txt"
     additional.write_text("inert-dependency==1.0\n")
-    inputs = {key: reviewed[key] for key in ("wheelhouse", "requirements", "lock_path", "chudcode_lock")}
+    inputs = {key: reviewed[key] for key in ("wheelhouse", "requirements", "lock_path", "omp_lock")}
     with verified_wheelhouse(**inputs, additional_requirements=additional) as identity:
         assert identity["packages"]["inert-dependency"] == "1.0"
     additional.write_text("unreviewed-compiler==1.0\n")
@@ -505,11 +605,11 @@ def test_linux_builder_rejects_runtime_before_asset_generation_or_compilation(re
             shutil.copyfile(source, destination)
     shutil.copyfile(reviewed["requirements"], root / "requirements.txt")
     for relative, source in (("vendor/python/RUNTIME_WHEELS.lock", reviewed["lock_path"]),
-                             ("vendor/chudcode/CHUDCODE_ARTIFACT.lock", reviewed["chudcode_lock"])):
+                             ("vendor/omp/OMP_ARTIFACT.lock", reviewed["omp_lock"])):
         destination = root / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, destination)
-    (root / "packaging/requirements-release.txt").write_text("chudcode-rpc==0.3.1\n")
+    (root / "packaging/requirements-release.txt").write_text("omp-rpc==0.1.0\n")
     directory = tmp_path / "compiler-runtime"
     candidate = _temporary_venv(directory)
     with verify(reviewed) as identity:
@@ -546,7 +646,7 @@ def test_linux_builder_rejects_runtime_before_asset_generation_or_compilation(re
         "HOME": str(tmp_path / "home"), "XDG_DATA_HOME": str(tmp_path / "data"),
     })
     result = subprocess.run(["bash", str(root / "packaging/linux/build_appimage.sh"), "--prepare-signing",
-                             "--key-id", "fixture", "--chud-bin", str(host), "--host-bin", str(host),
+                             "--key-id", "fixture", "--omp-bin", str(host), "--host-bin", str(host),
                              "--hostd-bin", str(host), "--protected-assets-dir", str(root / "generated"),
                              "--out", str(output)], env=environment, capture_output=True, text=True)
     assert result.returncode != 0

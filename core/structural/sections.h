@@ -25,14 +25,14 @@ struct LumberShape {
     double b_actual_mm, d_actual_mm, A_mm2, Ix_mm4, Sx_mm3, Iy_mm4, Sy_mm3;
 };
 
-// AISC shape lookup — case-insensitive, internal spaces ignored (mirrors
-// get_aisc_section). Returns the property dict {A, d, bf, tf, tw, Ix, Sx, Zx,
-// Iy, Sy, Zy, J, Cw} or std::nullopt when the designation is not in the table.
+// AISC lookup — case-insensitive, spaces ignored; accepts the AISC360: or
+// AISC: prefix used in structural placements. Returns the property dict
+// {A, d, bf, tf, tw, Ix, Sx, Zx, Iy, Sy, Zy, J, Cw}, or nullopt if unknown.
 std::optional<nlohmann::json> get_aisc_section(const std::string& name);
 
-// Dressed-lumber lookup — case-insensitive, internal spaces ignored (mirrors
-// get_lumber_section). Returns {b_actual_mm, d_actual_mm, A, Ix, Sx, Iy, Sy}
-// or std::nullopt when the nominal size is not in the table.
+// Dressed-lumber lookup — case-insensitive, spaces ignored; accepts the NDS:
+// prefix used in structural placements. Returns {b_actual_mm, d_actual_mm,
+// A, Ix, Sx, Iy, Sy} or nullopt when the nominal size is not in the table.
 std::optional<nlohmann::json> get_lumber_section(const std::string& nominal);
 
 }  // namespace chudware::structural

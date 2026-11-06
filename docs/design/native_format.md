@@ -2,7 +2,7 @@
 
 Status: **design proposal** (implementation-oriented).  
 Scope: one container family covering **parts, assemblies, drawings, and FEA/simulation results**.  
-Out of scope for embedding: **ECAD** (stays `.ecad+`).  
+Out of scope for embedding: **ECAD** (separate KiCad project files).
 Interop: foreign standards (STEP/IGES/STL/…) remain **import/export around** the native format.
 
 **Authority scope:** this remains a proposal, not an implementation acceptance record.
@@ -38,7 +38,7 @@ This document extends what already ships. It does **not** invent a greenfield fo
 
 - Contract: `aicad.step+/1` (`contracts/stepplus.md`).
 - Implementation: `chudware::doc::stepplus_save` / `stepplus_open` via **miniz** (`core/doc/stepplus.cpp`).
-- Atomic save: write `<path>.tmp` → rename.
+- Atomic save: publish an exclusively created file from an owner-private staging directory; see [`contracts/stepplus.md` §3](../../contracts/stepplus.md#3-rules).
 - Forward-compat rule: **unknown ZIP entries are preserved** on resave.
 
 ### 1.2 ZIP layout (v1, as contracted + implemented)
@@ -54,7 +54,7 @@ This document extends what already ships. It does **not** invent a greenfield fo
 | `studies/<id>.json` | no | Study definitions (also mirrored / primarily stored as top-level `studies[]` in the doc JSON) |
 | `studies/<id>/results.npz` | no | Cached FEA/CFD solve payload (**AICRES1** blob, **20 MB cap** per study) |
 | `studies/<id>/overlay.aicm` | no | Instant result overlay for reopen |
-| `cache.json` + `cache.aicm` + `cache.brep` + `cache.ckpt` | no | Display/build acceleration only (2026-07-12 additive; `cache.ckpt` build checkpoints 2026-10-05, `contracts/stepplus.md` §9) |
+| `cache.json` + `cache.aicm` + `cache.brep` + `cache.ckpt` + `cache.provenance` | no | Derived display/build acceleration and provenance; [container contract §§4, 9, 19](../../contracts/stepplus.md) |
 | `ai/memory.json` | no | Design intent / decisions digests |
 | unknown entries | — | Preserved verbatim |
 
@@ -74,20 +74,48 @@ Canonical `document.json` rules (`doc_schema.md` Appendix A):
 | Studies | FEA/CFD setups | Opaque JSON in `doc["studies"]` (session RPCs); results in ZIP under `studies/` |
 | CAM / requirements | `aicad.cam/*`, `aicad.req/*` | PLM infers kind from schema (`services/plm/vault.py` `_SCHEMA_KIND`) when the same container family is used |
 
-**ECAD is intentionally separate:** `.ecad+` ZIP with its own session/RPC surface (`contracts/ecad/*`, `ecad_save`). PLM versions both suffixes: `_CONTAINER_SUFFIXES = (".step+", ".ecad+")`.
+**ECAD is intentionally separate:** KiCad project, schematic and board files use the ECAD session/RPC surface (`contracts/ecad/*`); legacy `.ecad+` files are open-only migration inputs.
 
-### 1.4 Load order (normative today)
+### 1.4 Open and cache branches (implementation baseline)
 
-1. Read `meta.json`; reject unknown **major** container version.
-2. Parse `document.json` → full rebuild (`compile_document` / assembly solve).
-3. If rebuild fails: offer `geometry.step` as frozen import (when present); leave broken JSON on disk.
-4. `studies/*` load **lazily** when Simulation opens; overlays tagged “cached — re-run to refresh.”
-5. Optional: if `cache.json` engine key + `doc_hash` (+ asm component fingerprints) match → skip rebuild and show `cache.aicm` immediately. Parts also hydrate the session's compile (from `cache.ckpt`, else `cache.brep`), so the first activate/pick/measure/save executes no feature, and restore the per-feature checkpoints from `cache.ckpt`, so the **first edit executes only the edited tail** (not the whole tree). Every miss/skip is named in the `doc_open` result (`cache_miss_reason`, `cache`; `contracts/stepplus.md` §9).
+This is a summary, not a replacement for the [container contract](../../contracts/stepplus.md)
+or the [reader](../../core/doc/stepplus.cpp) and [session open path](../../core/doc/session.cpp).
+The contract's original §2 describes a rebuild and frozen-import recovery; its later cache
+amendments and the current implementation have the following branches:
+
+1. Read the container and `document.json`, rejecting an unsupported major version. `doc_open`
+   handles part and assembly schemas; other document kinds have their own paths.
+2. **Before rebuilding**, check the derived display cache against the engine key, document
+   hash, solved state, display tier and available mesh; assembly caches also check component
+   fingerprints. A hit can display saved geometry immediately. For parts, an available full
+   checkpoint or B-rep can hydrate the session; individually matching checkpoints may also
+   support a later incremental edit. Which entries restored is reported, not guaranteed.
+   On edit, unchanged 3D sketches, literal point-normal planes, datum-plane sketches and
+   `mode=new` sweeps can also reuse their checkpoints after a changed prefix when their
+   explicit inputs still match; duplicate-name warnings are updated. Other feature types
+   rebuild normally.
+   A restored full result indexes its saved AICM body chunks by exact shape, appearance and
+   display tier, so unchanged surviving bodies need not be tessellated on the first edit.
+3. On a miss, reuse any valid checkpoint prefix or saved B-rep where applicable, and compile,
+   re-mesh or solve the remaining work. `doc_open` reports `cache_hit`, `warm`, miss reason
+   and cache diagnostics. A successful rebuild may write derived build state back under the
+   file-stamp and document-hash guards in contract §17, without editing authored entries.
+4. An otherwise usable cache without a valid local provenance MAC may be displayed and
+   hydrated while a background scratch rebuild verifies it. `cache_trust` and verification
+   fields distinguish this state; a verified cache does not require that background solve.
+   See contract §19 for the publication and write-back rules.
+5. The original contract's `geometry.step` frozen-import recovery is **not wired into open**;
+   a failing rebuild reports its diagnostics rather than presenting that fallback. The
+   proposed lazy study/section-loading policy remains a design goal, not proof that open
+   performs a lazy ZIP extraction; editable open currently collects non-owned extras.
+
+The §2 recovery requirement and implementation gap must be reconciled through the
+repository's append-only contract process, not by treating this proposal as a contract change.
 
 ### 1.5 What works well
 
 - **Parametric round-trip is faithful**: deterministic rebuild from JSON; no op-log required for persistence (`doc_ops.md` ops are session-transient).
-- **Display cache** already solves the dominant cold-open cost (tess + BREP for assembly components).
+- **Display/build cache** can avoid repeated work for matching, usable entries; cache misses, trust, hydration and incremental reuse remain conditional on the reported diagnostics.
 - **Self-contained imports**: `embedded_brep` on import features so saves do not depend on external source files surviving (Bug N-8).
 - **PLM-friendly explode**: vault stores canonical JSON + thumbnail, not opaque ZIP blobs (`services/plm/snapshot.py`).
 - **AI-VC** already content-addresses delta chains for agent-authored docs without bloating the working tree (`services/plm/ai_vc.py`).
@@ -98,8 +126,8 @@ Canonical `document.json` rules (`doc_schema.md` Appendix A):
 |---|---|
 | **Not one user mental model** | Drawings ride inside the source part’s ZIP; there is no first-class standalone `.step+` drawing file UX. Assemblies are multi-file by default (external component paths). |
 | **Sim results are second-class** | 20 MB drop-on-save; no section index for partial load of large result sets; study defs dual-homed (doc JSON vs `studies/*.json` entries). |
-| **geometry.step fallback not wired into open** | The writer is live (`stepplus_geometry_step_bytes`, entry written right after `document.json`), but §2 step 3 — offering the embedded snapshot as a frozen `import` feature when a rebuild fails — is not implemented: `editable_container_open` treats `geometry.step` as an owned entry and drops it from `extra`, so the bytes never reach the loader |
-| **No section index** | Open always scans/extracts all non-owned entries into `extra_entries` (memory); no random-access “load only drawings” API. |
+| **geometry.step fallback not wired into open** | The writer is live (`stepplus_geometry_step_bytes`), but the original contract §2 frozen-import recovery is not implemented: `editable_container_open` treats `geometry.step` as an owned entry and does not pass it to the normal loader. |
+| **No section index** | Editable open scans and extracts eligible non-owned entries into `extra_entries`, subject to reader limits; no random-access “load only drawings” API. |
 | **ZIP is git-hostile** | Already solved *around* the file by PLM explode — but the working file itself remains a monolithic ZIP (diff noise, whole-file rewrite). |
 | **Assembly graph not self-describing for lazy load** | Component fingerprints live only in `cache.json` when cached; no formal `index.json` of external refs for partial project open. |
 | **CAM / multi-body deliverables** | Schema kinds exist in PLM; container layout is still “whatever is in document.json + extras,” not a declared section map. |
@@ -140,7 +168,7 @@ flowchart LR
 1. **One container family** for mechanical docs: part / assembly / drawing / sim-bearing docs — same ZIP mechanics, same PLM explode path.
 2. **`document.json` remains source of truth** for authored state; binary caches remain **derived, hash-gated, droppable**.
 3. **Sectioned layout** so open can be **partial / lazy** without rewriting the doc model.
-4. **ECAD stays external** (`.ecad+`); assemblies/projects **reference** boards, never embed KiCad-scale graphs into `.step+`.
+4. **ECAD stays external** (KiCad files); assemblies/projects **reference** boards, never embed KiCad-scale graphs into `.step+`.
 5. **Extend `aicad.step+/1` additively** where possible; bump to `aicad.step+/2` only when major load rules change.
 6. **PLM + AI-VC stay the history engines** — do not stuff full git history into the working file.
 
@@ -160,7 +188,7 @@ Stay on ZIP (miniz today; same as contract):
 
 - **Central directory** already provides O(log n) locate by name — treat entry names as the **section key space**.
 - **STORED** for large binary (mesh, BREP, results); **DEFLATE** for JSON.
-- **Atomic tmp+rename** unchanged.
+- **Atomic staged publish** unchanged; follow the secure staging rules in the current contract.
 - Add a small **section index** entry so readers need not `stat` every member to decide lazy policy:
 
 ```
@@ -177,7 +205,7 @@ index.json   (optional in v1.x readers; required for writers of aicad.step+/2)
   ],
   "externals": [
     {"role": "component", "path": "base.step+", "item_id": "i0a1b2c3"},
-    {"role": "ecad_board", "path": "Controller.ecad+", "item_id": "i9f8e7d6"}
+    {"role": "ecad_board", "path": "Controller.kicad_pcb", "item_id": "i9f8e7d6"}
   ]
 }
 ```
@@ -295,7 +323,7 @@ Rules (extend existing):
 
 ### 2.9 ECAD reference (not embed)
 
-- Project folder may contain `Controller.ecad+` next to `MainAssembly.step+`.
+- Project folder may contain `Controller.kicad_pcb` next to `MainAssembly.step+`.
 - Mechanical docs reference ECAD only via:
   - `index.externals` `{role:"ecad_board", path}`, and/or
   - optional `doc.meta.ecad_links[]` (opaque meta already supported by `doc_set_meta`).
@@ -337,13 +365,13 @@ stepplus_open(path, flags) -> StepPlusDoc
   flags: NeedDocument | NeedCache | NeedDrawings | NeedStudies | NeedAllExtras
 ```
 
-Default `doc_open` = Document + Cache (validate) + preserve entry names for unknown roles without loading heavy results until requested.
+**Proposed** default `doc_open` = Document + Cache (validate) + preserve entry names for unknown roles without loading heavy results until requested. This flags-based interface and lazy extraction are not the current API.
 
 ### 3.3 Cached tessellation / mesh
 
 - Keep **AICM v1** as the only viewport binary (`contracts/mesh_format.md`).
 - `cache.aicm` STORED + extract with `MZ_ZIP_FLAG_COMPRESSED_DATA` (already; skips inflate + CRC).
-- Optional **mmap path** later: if entire archive is STORED for that entry and OS allows, map file range — only after index records local header offsets (ZIP64-aware). Phase 3+.
+- Optional **mmap path**: if the archive entry is STORED and the OS allows it, map the file range only after the index records ZIP64-aware local header offsets.
 
 ### 3.4 Feature-tree vs full replay
 
@@ -352,7 +380,7 @@ Default `doc_open` = Document + Cache (validate) + preserve entry names for unkn
 | Store only ops log, replay always | high | perfect history | small | no |
 | Store tree snapshot, rebuild geometry | medium | perfect (deterministic compile) | small | **yes (today)** |
 | Store tree + BREP/tess cache | low | first edit rebuilds whole tree | medium | superseded |
-| Store tree + incremental feature cache (`cache.ckpt`) | lowest | first edit executes only the edited tail; content-addressed per feature | high | **yes (today, 2026-10-05)** |
+| Store tree + incremental feature cache (`cache.ckpt`) | lowest when reusable | reuse the matching prefix and eligible independent downstream features, when checkpoints restore | high | **supported today, subject to validation and limits** |
 
 Do **not** introduce a persistent op log for load performance; PLM + AI-VC already version snapshots.
 
@@ -363,11 +391,11 @@ Do **not** introduce a persistent op log for load performance; PLM + AI-VC alrea
 | Feature tree | authored | — |
 | Solved sketch coords | last solved in tree | re-solve on edit |
 | B-rep bodies | `cache.brep` + `cache.ckpt` | compile_document from the deepest valid checkpoint on miss/edit |
-| Tessellation | `cache.aicm` | tessellate on miss/edit (a display-tier change re-meshes only) |
+| Tessellation | `cache.aicm` | reuse matching saved body chunks; tessellate changed bodies or on a cache/tier miss |
 | Mate solves | optional in asm cache response | solve_mates on edit |
 | HLR drawing curves | optional later | every drawing_get |
 | FEA results | if &lt; cap | re-run study |
-| `geometry.step` | on successful rebuild / release | import fallback only |
+| `geometry.step` | on successful rebuild / release | proposed import fallback; not wired into current open |
 | PLM `summary.txt` | on vault commit | — |
 
 ### 3.6 mmap-ability notes
@@ -376,7 +404,7 @@ ZIP + DEFLATE is not mmap-friendly for JSON. Practical path:
 
 1. Keep JSON small (canonical tree).
 2. Keep big payloads STORED.
-3. For Phase 3, optional `payloads/` multi-file pack is unnecessary if STORED zip offsets are published in `index.json` (`offset`, `size`).
+3. An optional `payloads/` multi-file pack is unnecessary if STORED zip offsets are published in `index.json` (`offset`, `size`).
 
 ---
 
@@ -435,7 +463,6 @@ When adding sections, update explode rules:
 | `geometry.step` | release only | release |
 | `index.json` | omit or regenerate | no |
 
-**Change for `snapshot.py`:** treat `cache.json` / `cache.aicm` / `cache.brep` as **known-derived** (like `netlist.json` comment in snapshot docstring) — strip on explode so history stays small. Today they ride under `extra/` and **do** bloat commits; that is a concrete fix in Phase 1.
 
 ### 4.5 Release freeze (unchanged semantics)
 
@@ -483,8 +510,8 @@ MyProject/
   Bracket.step+          # part
   MainAssembly.step+     # asm refs Bracket.step+
   Bracket-Drawing.step+  # optional standalone drawing (future)
-  Controller.ecad+       # separate
-  .aicadvault/           # versions both container types
+  Controller.kicad_pcb   # separate KiCad board
+  .aicadvault/           # project history
 ```
 
 ### 5.4 Compatibility matrix
@@ -510,57 +537,6 @@ Writers MUST continue to preserve unknown entries (existing rule).
 7. **Cross-platform mtime fingerprints** in asm cache — known fragility; prefer content `doc_hash` of components when component is `.step+`.
 8. **Container brand string** — keep `aicad.step+/N` vs rename to `chudware.step+/N` (compat alias).
 
----
-
-## 7. Phased implementation plan
-
-### Phase 0 — Document & inventory (this doc)
-
-- Freeze intent; no wire changes.
-- Cite contracts; list derived entries PLM should strip.
-
-### Phase 1 — Correctness & vault hygiene (small, high leverage)
-
-1. ~~Implement **`geometry.step` write** on fully-ok rebuild (close contract gap) in `stepplus_save` / `doc_save`.~~ **Done** — `stepplus_geometry_step_bytes` (AP214/mm) is written by `doc_save` behind the same fully-ok gate and erase-first discipline as `cache.*`; covered by `core/tests/test_export_assembly.cpp` (part volume parity, assembly flattening, and the never-rebuilt omission). Still open: the §2 step-3 *reader* fallback (see §1.6).
-2. **PLM explode**: drop `cache.json`, `cache.aicm`, `cache.brep`, and large `studies/*/results.*` from shadow commits (recomputable).
-3. Single-home studies: stop dual-writing defs if both `document.studies` and `studies/*.json` diverge; document the winner (`document.json`).
-4. Tests: open v1 file, save, open; PLM checkpoint size does not include AICM.
-
-### Phase 2 — Section index + lazy open
-
-1. Emit `index.json` on save; `container` → `aicad.step+/2` (or stay `/1` with optional index if we must avoid major bump — prefer `/2` for honest major).
-2. `stepplus_open` flags: skip loading `studies/*/results*` and optional drawings until requested.
-3. `externals[]` populated for assemblies; used by project hub / stale-ref.
-4. Drawing workspace: open drawings from index without touching sim blobs.
-
-### Phase 3 — Pack-and-go + standalone drawings
-
-1. Export: embed components → single `.step+`.
-2. Save drawing as standalone `.step+` with `aicad.drawing/1` + path source.
-3. Optional HLR cache entry hash-gated on source.
-
-### Phase 4 — Large sim & mmap
-
-1. `aicad.sim_result_ref/1` sidecars for &gt; cap results.
-2. Index local offsets + optional mmap for STORED payloads.
-3. CAM toolpath cache section if profiles show need.
-
-### Phase 5 — Polish
-
-1. Optional `.chudware` alias.
-2. File-dialog preview via thumbnail only.
-3. Docs/manual update; `contracts/stepplus.md` append-only revision (maintainer).
-
-### Suggested ownership
-
-| Phase | Primary code | Contract touch |
-|---|---|---|
-| 1 | `core/doc/stepplus.cpp`, `session.cpp`, `services/plm/snapshot.py` | append `stepplus.md` geometry.step writer note; plm explode note |
-| 2 | `stepplus.*`, `doc_open` | `stepplus.md` § index |
-| 3 | drawing session, assembly pack | `doc_schema` only if source object form |
-| 4 | `sim_cache`, stepplus study helpers | stepplus studies § |
-
----
 
 ## 8. Concrete section-format sketches
 
@@ -635,7 +611,7 @@ studies/<study_id>/results.npz
 | Source of truth | Canonical `document.json` | `doc_schema.md` Appendix A |
 | Derived caches | Hash-gated, droppable | `stepplus.md` §4, `session.cpp` doc_save |
 | History | External PLM + AI-VC | `plm.md`, `ai_vc.md` |
-| ECAD | Separate `.ecad+`, reference only | `vault.py` suffixes, ecad contracts |
+| ECAD | Separate KiCad project files, reference only | ecad contracts |
 | Unification strategy | Section index + lazy load + pack-and-go on **existing** ZIP | extend, don’t replace |
 | Ops log | Not persisted | `doc_ops.md` + PLM plan §3.1 |
 

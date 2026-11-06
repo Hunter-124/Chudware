@@ -2,19 +2,19 @@
 #include <tuple>
 #include <map>
 #include <memory>
+#include <functional>
 
 namespace ui::chat_persistence {
-// Exact comparisons, not event counters or sampled hashes: same-size edits, late answers,
-// parked runs and branch edits must all invalidate the cached wire object. Exclude only
-// render-only state. Keep this paired with rawMessageToJson and serializeMsgs.
+// Exact fallback for mutations outside the event seam (late answers, render toggles).
+// Revisions reject event-mutated messages before this comparison.
 inline bool sameMessage(const ChatMsg& a, const ChatMsg& b, bool activity = true) {
-    if (std::tie(a.fromUser, a.ts, a.text, a.imagePaths, a.running, a.steerSplit,
+    if (std::tie(a.fromUser, a.ts, a.text, a.imagePaths, a.running, a.compactionRun, a.steerSplit,
                  a.steerId, a.steerState, a.model, a.errKind, a.errorHuman, a.errorFull,
                  a.errFullOpen, a.liveStatus, a.curMissionTask, a.planApprovePending,
                  a.planApproveRequest, a.planApproveExtras, a.planApproveReason,
                  a.resultPartial, a.copilotMode, a.cacheReadTok, a.cacheReadTotTok,
                  a.cacheReadCalls) !=
-        std::tie(b.fromUser, b.ts, b.text, b.imagePaths, b.running, b.steerSplit,
+        std::tie(b.fromUser, b.ts, b.text, b.imagePaths, b.running, b.compactionRun, b.steerSplit,
                  b.steerId, b.steerState, b.model, b.errKind, b.errorHuman, b.errorFull,
                  b.errFullOpen, b.liveStatus, b.curMissionTask, b.planApprovePending,
                  b.planApproveRequest, b.planApproveExtras, b.planApproveReason,
@@ -42,21 +42,17 @@ inline bool sameMessage(const ChatMsg& a, const ChatMsg& b, bool activity = true
     for (size_t i = 0; i < a.planState.edges.size(); ++i)
         if (std::tie(a.planState.edges[i].from, a.planState.edges[i].to) !=
             std::tie(b.planState.edges[i].from, b.planState.edges[i].to)) return false;
-    if (std::tie(a.clarify.awaiting, a.clarify.active, a.clarify.request,
-                 a.clarify.assumptions, a.clarify.geometryPickQ) !=
-        std::tie(b.clarify.awaiting, b.clarify.active, b.clarify.request,
-                 b.clarify.assumptions, b.clarify.geometryPickQ) ||
-        a.clarify.questions.size() != b.clarify.questions.size()) return false;
-    for (size_t i = 0; i < a.clarify.questions.size(); ++i) {
-        const auto& x = a.clarify.questions[i]; const auto& y = b.clarify.questions[i];
-        if (std::tie(x.key, x.ask, x.unit, x.suggested, x.answer, x.kind, x.multi,
-                     x.options, x.targets, x.selectedValues, x.selectedKind, x.pickArmed) !=
-            std::tie(y.key, y.ask, y.unit, y.suggested, y.answer, y.kind, y.multi,
-                     y.options, y.targets, y.selectedValues, y.selectedKind, y.pickArmed)) return false;
-    }
     if (a.asks.size() != b.asks.size() || a.contextRefs.size() != b.contextRefs.size()) return false;
-    for (size_t i = 0; i < a.asks.size(); ++i)
-        if (askBatchToJson(a.asks[i]) != askBatchToJson(b.asks[i])) return false;
+    for (size_t i = 0; i < a.asks.size(); ++i) {
+        const auto& x = a.asks[i]; const auto& y = b.asks[i];
+        if (std::tie(x.batchId, x.runId, x.sessionId, x.nodeId, x.agentId, x.prompt,
+                     x.status, x.error, x.answers, x.reply) !=
+            std::tie(y.batchId, y.runId, y.sessionId, y.nodeId, y.agentId, y.prompt,
+                     y.status, y.error, y.answers, y.reply) ||
+            x.questions.size() != y.questions.size()) return false;
+        for (size_t qi = 0; qi < x.questions.size(); ++qi)
+            if (x.questions[qi].src != y.questions[qi].src) return false;
+    }
     for (size_t i = 0; i < a.contextRefs.size(); ++i) {
         const auto& x = a.contextRefs[i]; const auto& y = b.contextRefs[i];
         if (std::tie(x.kind, x.id, x.docId, x.docName, x.docPath, x.label, x.type,
@@ -79,15 +75,19 @@ inline bool sameMessage(const ChatMsg& a, const ChatMsg& b, bool activity = true
     }
     return true;
 }
+// Sources are immutable after publication; only the ordered writer fills wire bytes.
 struct MessageSnapshot {
-    ChatMsg source;
-    nlohmann::json wire;
+    explicit MessageSnapshot(const ChatMsg& message) : source(message) {}
+    const ChatMsg source;
+    mutable std::shared_ptr<const std::string> bytes;
+};
+struct JsonFragment {
+    std::function<nlohmann::json()> encode;
+    mutable std::shared_ptr<const std::string> bytes;
 };
 struct SessionSnapshot {
-    std::map<std::string, std::vector<MessageSnapshot>> messages;
-    nlohmann::json metadata;
-    nlohmann::json wire;
-    std::shared_ptr<const std::string> bytes;
-    bool durable = false;  // WASM's synchronous local write may need retry.
+    std::vector<std::shared_ptr<MessageSnapshot>> messages;
+    uint64_t dagRevision = ~uint64_t(0);
+    std::shared_ptr<JsonFragment> dag;
 };
 }  // namespace ui::chat_persistence

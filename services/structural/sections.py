@@ -7,9 +7,8 @@ Provides two lookups:
 Data sources
 ------------
 ``services/structural/data/aisc_shapes/aisc_shapes_curated.json``
-    Curated table of common AISC shapes.  Property values are dimensional facts (re-stated from
-    widely published engineering references — Salmon & Johnson *Steel Structures*, NSAI, CISC
-    Handbook) rather than a bulk copy of the AISC database compilation.  See
+    Curated dimensional facts checked against AISC Shapes Database v16.0.
+    The selected properties are not a bulk copy of the database compilation. See
     ``contracts/licenses.md`` for the licensing posture.
 
 ``services/structural/data/lumber_table.json``
@@ -60,7 +59,7 @@ def get_aisc_section(name: str) -> dict:
     Parameters
     ----------
     name:
-        AISC designation, e.g. ``"W8X31"``, ``"W8x31"``, ``"w8x31"``.
+        AISC designation, e.g. ``"W8X31"`` or ``"AISC360:W8x31"``.
         The look-up is case-insensitive and ignores internal spaces.
 
     Returns
@@ -76,6 +75,8 @@ def get_aisc_section(name: str) -> dict:
     """
     db = _load_aisc_db()
     key = name.strip().upper().replace(" ", "")
+    if key.startswith(("AISC360:", "AISC:")):
+        key = key.split(":", 1)[1]
     if key not in db:
         available = ", ".join(sorted(db.keys()))
         raise KeyError(
@@ -94,7 +95,7 @@ def get_lumber_section(nominal: str) -> dict:
     Parameters
     ----------
     nominal:
-        Nominal size string, e.g. ``"2x4"``, ``"2X4"``, ``"4x6"``.
+        Nominal size string, e.g. ``"2x4"`` or ``"NDS:2x4"``.
         Case-insensitive.  Spaces are stripped.
 
     Returns
@@ -113,8 +114,9 @@ def get_lumber_section(nominal: str) -> dict:
     """
     db = _load_lumber_db()
     key = nominal.strip().upper().replace(" ", "")
-    # Accept both "2X4" and "2x4"
-    key_lower = nominal.strip().lower().replace(" ", "")
+    if key.startswith("NDS:"):
+        key = key[4:]
+    key_lower = key.lower()
     if key_lower in db:
         row = db[key_lower]
     elif key in db:

@@ -13,9 +13,11 @@
 //                        coincident/parallel/distance, cyl+cyl -> concentric). An Align (Aligned /
 //                        Anti-Aligned) flip toggle, SolidWorks-labelled. A distance/angle DimField
 //                        for the dimension mates. "Add" emits asm_add_mate then doc_solve_mates.
-//   - Exploded View:     a factor slider (doc_set_explode_state {active, factor}); view-only, the
-//                        engine re-tessellates IN PLACE, so we reload the SAME aicm path after each
-//                        call.
+//   - Exploded View:     a factor slider + Collapse/Exploded (eased) buttons. The engine returns
+//                        each moving component's factor-1 vector (authored steps, else its
+//                        automatic plan); the viewport slides bodies on the GPU at frame rate and
+//                        commits doc_set_explode_state once per gesture. Dashed explode lines
+//                        run from each part's home to its current position.
 //   - Interference:      eval_interference -> a window listing pairs; red statusErr rows on overlap,
 //                        clearance rows otherwise.
 //   - BOM:               components from the doc tree (name, source path, qty rollup by source,
@@ -25,6 +27,8 @@
 // on mouse release (the simplest correct path; see asm_panels.cpp Move-Component note).
 #pragma once
 
+#include <array>
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
@@ -40,6 +44,9 @@ enum class MateSurfKind { None, Plane, Cylinder, Other };
 
 class AsmPanels {
 public:
+    enum class InsertOutcome { Success, Failure, Superseded };
+    using InsertCompletion = std::function<void(InsertOutcome, const std::string&)>;
+
     // Ribbon dispatch for the Assembly tab (and File > New Assembly). Returns true if consumed.
     // cmdId: "asm_insert" | "asm_parts_library" | "asm_mate" | "asm_move" | "asm_pattern" |
     //        "asm_explode" | "asm_bom" | "asm_interference" | "new_assembly".
@@ -60,7 +67,7 @@ public:
     void closeAllToolForms(AppState& st);
     // Feed a resolved assembly pick into the active mate well. Called from the selection observer
     // when the Mate form is open. Returns true if a well consumed the pick.
-    bool routeAsmPick(const nlohmann::json& selector, const std::string& component, int pickKind);
+    bool routeAsmPick(const nlohmann::json& selector, const std::string& component, uint32_t bodyId);
 
     // Feed a picked COMPONENT id into the active Component Pattern form's component list (toggles
     // membership). Called from the selection observer when the Pattern form is open. Returns true
@@ -69,6 +76,8 @@ public:
 
     // True while the Mate form is open (the selection observer routes picks to it then).
     bool mateFormActive() const { return mateOpen_; }
+    // Bodies already in the active mate wells are shown translucent and can be picked through.
+    std::array<uint32_t, 3> matePickedBodies() const;
     // True while the Component Pattern form is open (the selection observer routes component picks).
     bool patternFormActive() const { return patternOpen_; }
 
@@ -81,28 +90,44 @@ public:
     // is unknown; the mate form must already be open.
     void presetMateTypeForShot(const std::string& type);
     void openInterference(AppState& st) { handleCommand(st, "asm_interference"); }
-    // Async completion reports the actual engine outcome; targetDocId overrides the
-    // insert dialog's sticky target for callers such as the Parts Library.
+    // Async completion distinguishes an engine failure from an obsolete presentation.
+    // targetDocId overrides the insert dialog's sticky target for Parts Library.
     bool insertComponent(AppState& st, const std::string& path,
                          const nlohmann::json& transform, std::string& aicmOut,
-                         std::function<void(bool, const std::string&)> onComplete = {},
+                         InsertCompletion onComplete = {},
                          const std::string& targetDocId = {});
-    // The Parts Library may finish saving while another tab is active. Queue until the
-    // target tab's async activation has bound its mirror, then use insertComponent.
+    // Wait for the selected target assembly's mirror to bind. Switching away supersedes
+    // the presentation rather than selecting that assembly on the user's behalf.
     void insertComponentWhenReady(AppState& st, const std::string& path,
                                   const std::string& targetDocId,
-                                  std::function<void(bool, const std::string&)> onComplete);
+                                  InsertCompletion onComplete);
     // Add a mate directly (scenario). type/align per doc_schema; refs already shaped
     // [{component, selector}, ...]. Solves after. Returns the solved aicm path.
     bool addMate(AppState& st, const std::string& type, const std::string& align,
                  const nlohmann::json& refs, std::string& aicmOut);
-    // Set the explode factor (0..1); reloads the re-tessellated mesh in place.
+    // Jump the explode view to `factor` (0..1; collapsed when !active) and commit it.
     bool setExplode(AppState& st, bool active, float factor);
     // Close transient windows (scenario housekeeping so only the intended window is on top).
     void closeInsert()  {
         insertOpen_ = false; insertSel_ = -1; insertChosenPath_.clear(); insertNote_.clear();
     }
     void closeExplode() { explodeOpen_ = false; }
+    // Ease the explode view to `target` (the Collapse/Exploded buttons), framing the camera on
+    // where the parts are heading while they move; bakes when it settles.
+    void animateExplodeTo(AppState& st, float target);
+    // Slider drag: show `factor` on the GPU without an engine call; releaseExplode bakes it.
+    void previewExplode(float factor);
+    void releaseExplode(AppState& st) { commitExplode(st, explodeShown_); }
+    bool explodeAnimating() const { return explodeAnimating_; }
+    size_t explodeComponentCount() const { return explodeComps_.size(); }
+    // Per frame (from draw): advance the explode animation, track which factor the uploaded mesh
+    // carries, and feed the renderer the GPU offsets that bridge it to the factor on screen.
+    void tickExplode(AppState& st);
+    // Dashed explode lines (home -> current position) into the bound overlay FBO.
+    void drawExplodeLines(AppState& st);
+    // The viewport holds auto-framing while this document's explode view is open or exploded,
+    // so the camera never jumps when the baked exploded mesh replaces the GPU-offset frame.
+    bool explodeHoldsFraming(const AppState& st) const;
 
     // Close the mate form (public so scripted scenarios can dismiss it before other shots).
     void closeMateForm();
@@ -134,7 +159,7 @@ private:
     int  insertSel_ = -1;                 // selected row in the open/recent chooser (-1 = none)
     struct PendingLibraryInsert {
         std::string path, targetDocId;
-        std::function<void(bool, const std::string&)> onComplete;
+        InsertCompletion onComplete;
         double deadline = 0.0;
         bool activationRequested = false;
     };
@@ -150,6 +175,7 @@ private:
     int  activeWell_ = 0;                 // 0..2 — which well receives the next pick (2 = width/symmetric 3rd ref)
     struct MatePick {
         bool has = false;
+        uint32_t bodyId = 0;
         nlohmann::json selector;
         std::string component;            // component k-id
         std::string label;                // chip text ("base · Face")
@@ -190,15 +216,42 @@ private:
 
     // ---- Explode ----
     bool explodeOpen_ = false, explodeFocus_ = false;
-    bool explodeActive_ = false;
-    float explodeFactor_ = 0.0f;
-    // Latest-wins async doc_set_explode_state (slider never blocks GL)
+    float explodeFactor_ = 0.0f;     // slider / target factor (what the user asked for)
+    float explodeShown_ = 0.0f;      // factor currently on screen
+    float explodeBaked_ = 0.0f;      // factor the uploaded mesh carries (engine-baked)
+    float explodeConfirmed_ = 0.0f;  // engine factor after the last successful commit
+    bool explodeAwaitMesh_ = false;  // confirmed factor's mesh not yet uploaded
+    uint64_t explodeAwaitGen_ = 0;   // renderer meshGeneration() when the commit returned
+    bool explodeOffsetsSet_ = false; // this panel owns the renderer's current body offsets
+    bool explodeAuto_ = false;       // vectors come from the automatic plan, not authored steps
+    bool explodeLines_ = true;
+    std::string explodeDocId_;       // document the vectors/bake state below belong to
+    struct ExplodeComp {
+        std::vector<uint32_t> bodyIds;
+        float vec[3] = {0, 0, 0};     // factor-1 offset (mm)
+        float center[3] = {0, 0, 0};  // collapsed world box center
+    };
+    std::vector<ExplodeComp> explodeComps_;
+    std::vector<float> explodeLineXyz_;  // reused dashed-line scratch
+    // World boxes of the assembly collapsed and fully exploded (engine-reported), for framing.
+    bool explodeBoundsValid_ = false;
+    float explodeCollapsedBox_[6] = {0, 0, 0, 0, 0, 0};  // min xyz, max xyz
+    float explodeExplodedBox_[6] = {0, 0, 0, 0, 0, 0};
+    bool explodeAnimating_ = false;
+    float explodeAnimFrom_ = 0.0f, explodeAnimTo_ = 0.0f;
+    double explodeAnimT0_ = 0.0, explodeAnimDur_ = 0.0;
+    // Latest-wins async doc_set_explode_state (never blocks GL)
     int  explodeGen_ = 0;
     bool explodeInFlight_ = false;
     bool explodePending_ = false;
     bool explodePendingActive_ = false;
     float explodePendingFactor_ = 0.0f;
     void kickExplodeAsync(AppState& st);
+    void commitExplode(AppState& st, float factor);
+    // Bind the explode state to the active document (resetting it for a different one) and
+    // fetch that document's vectors without moving anything.
+    void beginExplodeSession(AppState& st);
+    void syncExplodeDoc(AppState& st);
 
     // ---- Interference ----
     bool interferenceOpen_ = false, interferenceFocus_ = false;

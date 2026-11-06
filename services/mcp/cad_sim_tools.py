@@ -6,6 +6,7 @@ from mcp.server.fastmcp import FastMCP  # noqa: F401 — register signature
 from typing import Optional
 from typing import Union
 import copy
+import json
 import math
 import os
 import re
@@ -20,8 +21,7 @@ from .cad_common import (
     resolve_agent_path,
     _autosave_all_open,
     _canonical_material_keys,
-    _default_conductivity,
-    _default_specific_heat,
+    material_thermal_props,
     _doc,
     _dumps,
     _err,
@@ -373,8 +373,23 @@ def _canonical_thermal_material_keys(material: dict) -> dict:
     return out
 
 
+def _material_for_doc(material, doc_id: str, notes: list):
+    """Use the applied document material when no explicit material was supplied."""
+    if material is not None:
+        return material
+    from services.verify.battery import _applied_material_key
+    key, why = _applied_material_key(doc_id)
+    if why:
+        raise ValueError(why)
+    if key is None:
+        raise ValueError("No material is applied to the document. Assign a material or "
+                         "pass material= explicitly before running FEA.")
+    return key
+
+
 def _resolve_study_material(
-    material, analysis: str, *, conductivity_w_mk=None, specific_heat_j_kgk=None
+    material, analysis: str, *, conductivity_w_mk=None, specific_heat_j_kgk=None,
+    assumptions=None,
 ) -> dict:
     """Resolve a material and enforce only the properties the selected physics consumes."""
     raw = coerce_json_or_repr(material)
@@ -456,15 +471,21 @@ def _resolve_study_material(
     if thermal:
         resolved = raw if explicit else _resolve_material_name(raw)
         mat = _canonical_thermal_material_keys(resolved)
+        props, inferred = material_thermal_props(mat.get("name") or raw) if not explicit else ({}, [])
+        used = set()
         if conductivity_w_mk is not None:
             mat["conductivity_w_mk"] = conductivity_w_mk
         elif not explicit and mat.get("conductivity_w_mk") is None:
-            mat["conductivity_w_mk"] = _default_conductivity(mat, raw)
+            mat["conductivity_w_mk"] = props.get("conductivity_w_mk")
+            used.add("conductivity_w_mk")
         if analysis == "thermal_transient":
             if specific_heat_j_kgk is not None:
                 mat["cp_j_kgk"] = specific_heat_j_kgk
             elif not explicit and mat.get("cp_j_kgk") is None:
-                mat["cp_j_kgk"] = _default_specific_heat(mat, raw)
+                mat["cp_j_kgk"] = props.get("cp_j_kgk")
+                used.add("cp_j_kgk")
+        if assumptions is not None:
+            assumptions.extend(item for item in inferred if item["property"] in used)
     else:
         mat = _resolve_material(raw)
 
@@ -1596,6 +1617,7 @@ def _build_static_study(
     min_size_mm = _norm_min_size_mm(min_size_mm, target_size_mm)
     vtu_path = _norm_vtu_path(vtu_path)
     export_system_path = _norm_abs_out_path(export_system_path, "export_system_path")
+    material = _material_for_doc(material, d, notes)
     mat = _resolve_study_material(material, material_analysis)
     plasticity = _norm_plasticity(plasticity, mat)
     if plasticity is not None:
@@ -1972,6 +1994,7 @@ def _build_modal_study(
     fixtures = _norm_bc_list(fixtures, "fixtures", unwrap_query=True, notes=notes)
     mesh_fineness = _norm_fineness(mesh_fineness)
     vtu_path = _norm_vtu_path(vtu_path)
+    material = _material_for_doc(material, d, notes)
     mat = _resolve_study_material(material, "modal")
     advisor = _advisor_params(learned_advisor, advisor_max_dof)
     fixture_sets: list = []
@@ -2130,6 +2153,36 @@ def _collect_static(
     advisor = res.get("advisor")
     advisor_record = {"advisor": advisor} if isinstance(advisor, dict) else {}
     evidence = _evidence_fields(res)
+    wall = ((res.get("mesh_quality") or {}).get("underresolved_wall") or {}).get("min_wall_mm")
+    if isinstance(wall, (int, float)) and math.isfinite(wall) and wall > 0:
+        evidence["doc_geom"] = {"min_wall_mm": wall}
+    spots = copy.deepcopy(res.get("hot_spots") or [])
+    low_fos = copy.deepcopy(res.get("low_fos_regions") or [])
+    if spots:
+        try:
+            from .fea_probe import attribute_hot_spots
+            combined, edge_data = attribute_hot_spots(
+                d, spots + low_fos, res.get("hot_spot_cluster_radius_mm") or 0.0)
+            spots, low_fos = combined[:len(spots)], combined[len(spots):]
+            if edge_data.get("error") or edge_data.get("truncated"):
+                evidence["sharp_edge_assessment_incomplete"] = (
+                    edge_data.get("error") or "edge analysis was truncated")
+            radii = [b.get("radius_mm") for b in edge_data.get("concave_blends", [])
+                     if isinstance(b.get("radius_mm"), (int, float)) and b["radius_mm"] > 0]
+            if radii:
+                evidence.setdefault("doc_geom", {})["min_fillet_radius_mm"] = min(radii)
+        except Exception as exc:  # Geometry attribution is not the solve.
+            evidence["hot_spot_attribution_unavailable"] = str(exc)
+        summary["hot_spots"] = spots
+        summary["hot_spot_cluster_radius_mm"] = res.get("hot_spot_cluster_radius_mm")
+        summary["hot_spot_note"] = ("Unmasked nodal peaks separated by one delivered mesh size; "
+                                    "FoS may be capped at 15 and peaks may be singular.")
+    if "low_fos_regions" in res:
+        summary["low_fos_regions"] = low_fos
+        summary["low_fos_note"] = ("Lowest unmasked nodal FoS regions; the solver caps "
+                                   "FoS at 15. A missing field is not a pass.")
+    if "median_von_mises_mpa" in res:
+        summary["median_von_mises_mpa"] = res["median_von_mises_mpa"]
     # Persist setup+results into the doc so they save inside the .step+.
     study_record = {
         "type": study_type,
@@ -2177,6 +2230,7 @@ def _collect_static(
         "n_nodes": counts["n_nodes"],
         "mesh": res.get("mesh_type_used"),
         "saved_to_study": bool(sid),
+        "study_id": sid,
         **evidence,
     }
     if res.get("solver_notes"):
@@ -2486,18 +2540,23 @@ def _collect_job_fatigue(st: dict, raw: dict) -> dict:
     try:
         se = _finite_float(corr.get("se_corrected_mpa"), "marin.se_corrected_mpa")
         sut = _finite_float(meta.get("ultimate_mpa"), "material.ultimate_mpa")
+        kf = _finite_float(meta.get("kf"), "kf")
+        if kf < 1.0:
+            raise ValueError("kf must be >= 1")
+        life = fa.fatigue_summarize(theories, se, sut, theory=theory, kf=kf)
     except ValueError as exc:
         return {
             "ok": False,
             "doc_id": d,
-            "error": f"fatigue setup metadata is incomplete: {exc}",
+            "error": f"fatigue setup or post-processing failed: {exc}",
         }
-    life = fa.fatigue_summarize(theories, se, sut, theory=theory)
     life.update(
         {
             "ok": True,
             "doc_id": d,
             "marin": corr,
+            "kf": kf,
+            "stress_basis": meta.get("stress_basis"),
             "material": mat.get("name", meta.get("material_arg")),
         }
     )
@@ -2510,6 +2569,8 @@ def _collect_job_fatigue(st: dict, raw: dict) -> dict:
             "material": mat,
             "fixtures": meta.get("fixtures"),
             "loads": meta.get("loads"),
+            "kf": kf,
+            "stress_basis": meta.get("stress_basis"),
             "results": {
                 "theories": life["theories"],
                 "regime": life["regime"],
@@ -2883,13 +2944,41 @@ def _started(job: dict, doc_id) -> dict:
     }
 
 
+def _fill_guard_advice(value):
+    """Retain the native refusal while mapping its CLI advice to the MCP surface."""
+    if isinstance(value, str) and "geometry fill-stage guard failed" in value:
+        return (value + " MCP retry: set a smaller mesh_size_mm (the native -h values "
+                "are in metres; mesh_size_mm is in millimetres), and lower min_size_mm "
+                "if its floor would prevent refinement. Do not combine mesh_size_mm "
+                "with a non-default mesh_fineness. The native --max-elems/--max-dof "
+                "flags are not MCP arguments. A retry is still potentially under-resolved; "
+                "check mesh quality and convergence before relying on it.")
+    if isinstance(value, dict):
+        return {k: _fill_guard_advice(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_fill_guard_advice(v) for v in value]
+    return value
+
+
+def _guard_error(exc: Exception) -> str:
+    """Apply advice to the structured error, whether the renderer returns JSON or a mapping."""
+    payload = _err(exc)
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (ValueError, TypeError):
+            return payload
+    return _dumps(_fill_guard_advice(payload))
+
+
 def _run_solve(
     kind: str, stage: str, payload: dict, meta: dict, *, background: bool, doc_id
 ) -> dict:
     """Start one durable solve, and either hand back its id or wait out the sync budget."""
     if background:
         return _started(simjobs.start(kind, stage, payload, meta), doc_id)
-    return solve_durable_or_handoff(kind, stage, payload, meta)
+    result = solve_durable_or_handoff(kind, stage, payload, meta)
+    return _fill_guard_advice(result) if kind in ("fea_static", "fea_contact") else result
 
 
 # ---------------------------------------------- in-process (thread) jobs behind the sim_* tools
@@ -3545,6 +3634,8 @@ def _convergence_row(step: dict, out: dict, monitor: str, prev: Optional[float])
     row["max_von_mises_mpa"] = summary.get("max_von_mises_mpa")
     row["max_disp_mm"] = summary.get("max_disp_mm")
     row["min_fos"] = summary.get("min_fos")
+    if out.get("study_id"):
+        row["study_id"] = out["study_id"]
     # The ladder row is what a released packet quotes, and max_von_mises_mpa is a
     # fixture-ring-MASKED reduction: carrying it without its reduction label and its
     # unmasked twin is how a packet came to report 105.98 MPa as "the peak at the
@@ -3581,7 +3672,25 @@ def _convergence_row(step: dict, out: dict, monitor: str, prev: Optional[float])
         # The engine's own admission that it did not mesh at the size we asked for. Without
         # it on the row, a collapsed ladder looks like a well-behaved one.
         row["mesh_governor_notes"] = governor
-    value = summary.get(monitor)
+    if monitor == "local_von_mises_mpa":
+        row["monitor_point_mm"] = step.get("monitor_point_mm")
+        row["monitor_face_sid"] = step.get("monitor_face_sid")
+        row["monitor_hot_spot_id"] = step.get("monitor_hot_spot_id")
+        try:
+            from .fea_probe import probe_region, probe_vtu
+            if step.get("monitor_face_sid"):
+                sample = probe_region(vtu, doc_id=step["doc_id"], face_sid=step["monitor_face_sid"])
+                value = sample["fields"]["von_mises_mpa"]["max"]
+                row["sampled_nodes"] = sample["n_nodes"]
+            else:
+                sample = probe_vtu(vtu, step["monitor_point_mm"])
+                value = sample["fields"]["von_mises_mpa"]
+            value = _finite_float(value, "local von Mises stress")
+        except Exception as exc:
+            row["error"] = f"local convergence probe failed: {exc}"
+            value = None
+    else:
+        value = summary.get(monitor)
     row["monitored_value"] = value
     # A zero previous value has no percentage change (division by zero is not "0% drift"),
     # so the delta is honestly absent and the tolerance check cannot pass on it. An
@@ -3646,6 +3755,17 @@ def _convergence_envelope(
         and isinstance(last_delta, (int, float))
         and abs(last_delta) < tol_pct
     )
+    values = [r.get("monitored_value") for r in rows]
+    if converged:
+        trend = "stable_at_tolerance"
+    elif (monitor in ("local_von_mises_mpa", "max_von_mises_mpa")
+          and not failed and not skipped and not degenerate and not implausible
+          and len(values) >= 3 and all(isinstance(v, (int, float)) for v in values)
+          and all(b > a for a, b in zip(values, values[1:]))
+          and isinstance(last_delta, (int, float)) and last_delta >= tol_pct):
+        trend = "growing_possible_singularity"
+    else:
+        trend = "unresolved"
     out = {
         "ok": not failed and not skipped,
         "doc_id": doc_id,
@@ -3654,6 +3774,7 @@ def _convergence_envelope(
         "table": rows,
         "n_meshes": len(rows),
         "converged": converged,
+        "trend": trend,
         "degenerate_ladder": bool(degenerate),
         # Requested vs delivered element size per solved leg, beside the degeneracy
         # verdict because it is usually the CAUSE of one: legs the governor collapsed
@@ -3664,7 +3785,7 @@ def _convergence_envelope(
         "resources": _resources_line(rows),
         "note": (
             "converged is |delta of the FINEST leg| < tol_pct on the monitored value; "
-            "a peak that keeps growing with refinement is a singularity, not strength."
+            "a peak that keeps growing with refinement may indicate a singularity; investigate."
         ),
     }
     released = _released_leg(rows)
@@ -3747,6 +3868,26 @@ def _convergence_envelope(
             f"{len(skipped)} of {len(rows)} convergence legs were skipped (rows "
             f"{skipped}); a partial ladder is NOT a convergence statement."
         )
+    if rows and rows[-1].get("study_id"):
+        try:
+            studies = cb.call("sim_study_list", {"doc_id": doc_id}).get("studies", [])
+            study = next(s for s in studies if s.get("id") == rows[-1]["study_id"])
+            study["convergence_evidence"] = {
+                "monitor": monitor, "tolerance_pct": tol_pct, "table": rows,
+                "converged": converged, "degenerate_ladder": bool(degenerate),
+                "trend": trend,
+            }
+            if converged and monitor == "max_von_mises_mpa":
+                study["mesh_convergence"] = {
+                    "values": [rows[-2]["monitored_value"], rows[-1]["monitored_value"]],
+                    "tolerance_pct": tol_pct,
+                }
+            else:
+                study.pop("mesh_convergence", None)
+            out["saved_to_study"] = bool(_persist_study(doc_id, study))
+        except Exception as exc:
+            out["saved_to_study"] = False
+            out["study_not_saved_reason"] = str(exc)
     return _interpreted(out, notes)
 
 
@@ -4050,7 +4191,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
     def run_fea_static(
         fixtures: Union[list, str],
         loads: Union[list, str],
-        material: Union[str, dict] = "steel",
+        material: Optional[Union[str, dict]] = None,
         mesh_fineness: Union[float, str] = _DEFAULT_FINENESS,
         mesh_size_mm: Optional[float] = None,
         min_size_mm: Optional[float] = None,
@@ -4079,6 +4220,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                    SID from describe_part / query_geometry ("F58db6d") — a FEATURE id is not a face.
         material : a name ("steel","aluminum","titanium","stainless","brass","abs","pla") or an
                    explicit dict {E_mpa, nu, density_g_cm3, yield_mpa, ...}.
+                   Omitted uses the applied document material; no assigned material or
+                   mixed unresolved materials requires an explicit material.
                    Or {per_body: {"1": name_or_dict, ...}, default: name_or_dict} for
                    heterogeneous bodies; ordinals are one-based STEP solid ordinals.
                    default is optional when every body has an explicit assignment.
@@ -4240,7 +4383,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 interfaces=interfaces,
                 bond_gap_mm=bond_gap_mm,
             )
-            _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
+            _autosave_all_open()
             return _dumps(
                 _run_solve(
                     "fea_static",
@@ -4254,13 +4397,13 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         except _StudyRefusal as r:
             return _dumps(r.payload)
         except Exception as e:  # noqa: BLE001
-            return _err(e)
+            return _guard_error(e)
 
     @mcp.tool()
     def run_fea_adaptive(
         fixtures: Union[list, str],
         loads: Union[list, str],
-        material: Union[str, dict] = "steel",
+        material: Optional[Union[str, dict]] = None,
         mesh_fineness: Union[float, str] = 0.5,
         max_passes: int = 3,
         eta_target: float = 0.05,
@@ -4332,7 +4475,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
     def run_fea_convergence(
         fixtures: Optional[Union[list, str]] = None,
         loads: Optional[Union[list, str]] = None,
-        material: Union[str, dict] = "steel",
+        material: Optional[Union[str, dict]] = None,
         sizes_mm: Optional[Union[list, str]] = None,
         fineness: Optional[Union[list, str]] = None,
         min_size_mm: Optional[float] = None,
@@ -4344,12 +4487,24 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         background: bool = False,
         continue_on_fail: bool = False,
         job_ids: Optional[Union[list, str]] = None,
+        monitor_point_mm: Optional[list] = None,
+        monitor_hot_spot_id: Optional[str] = None,
+        monitor_face_sid: Optional[str] = None,
+        monitor_study: Optional[str] = None,
     ) -> str:
         """Mesh-convergence study: ONE static setup solved at N stated discretizations.
 
         This is the release gate a single mesh cannot pass — a coarse mesh under-reports
         peak stress, which reads as a passing factor of safety. State the ladder BEFORE
         you solve, then report the table.
+        monitor_point_mm : fixed world XYZ in mm for local von Mises monitoring.
+                   Requires vtu_dir. Each field is interpolated at the same point;
+                   local convergence does not establish global peak convergence.
+        monitor_hot_spot_id : id from a stored study's hot_spots; resolved to its
+                   original location. monitor_study optionally selects that study.
+        monitor_face_sid : monitor maximum VTU nodal stress on the tessellated face.
+                   Select only one point, hot spot, or face; requires vtu_dir.
+
 
         fixtures / loads / material : exactly the run_fea_static dialect. The setup is
                    resolved ONCE (one STEP export, one set of fixture/load point sets) and
@@ -4460,13 +4615,42 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             tol_pct = _finite_float(tol_pct, "tol_pct")
             if tol_pct <= 0.0:
                 raise ValueError("tol_pct must be > 0.")
-            if monitor is None:
+            choices = sum(x is not None for x in (monitor_point_mm, monitor_hot_spot_id, monitor_face_sid))
+            if choices > 1:
+                raise ValueError("Select only one monitor_point_mm, monitor_hot_spot_id, or monitor_face_sid.")
+            if monitor_study is not None and monitor_hot_spot_id is None:
+                raise ValueError("monitor_study applies only to monitor_hot_spot_id.")
+            if monitor_hot_spot_id is not None:
+                d = _doc(doc_id)
+                studies = (cb.call("sim_study_list", {"doc_id": d}) or {}).get("studies") or []
+                if monitor_study is not None:
+                    studies = [s for s in studies if s.get("id") == monitor_study or s.get("name") == monitor_study]
+                    if len(studies) != 1:
+                        raise ValueError("monitor_study must identify one stored study.")
+                matches = [h for s in reversed(studies)
+                           for h in ((s.get("results") or {}).get("hot_spots") or [])
+                           if h.get("id") == monitor_hot_spot_id]
+                if not matches:
+                    raise ValueError("Hot spot id not found in the selected stored study; run static FEA first.")
+                monitor_point_mm = matches[0].get("location_mm")
+                if monitor_point_mm is None:
+                    raise ValueError("The selected stored hot spot has no location; run static FEA again.")
+            if monitor_point_mm is not None:
+                if not isinstance(monitor_point_mm, (list, tuple)) or len(monitor_point_mm) != 3:
+                    raise ValueError("monitor_point_mm must contain three coordinates in mm.")
+                monitor_point_mm = [_finite_float(x, "monitor_point_mm") for x in monitor_point_mm]
+            if choices:
+                if monitor not in (None, "local_von_mises_mpa"):
+                    raise ValueError("A local selector requires monitor='local_von_mises_mpa'.")
+                monitor = "local_von_mises_mpa"
+                if not vtu_dir and job_ids is None:
+                    raise ValueError("local monitoring requires vtu_dir to write each field.")
+            elif monitor is None:
                 monitor = "max_von_mises_mpa"
-            if monitor not in _MONITORABLE:
-                raise ValueError(
-                    f"monitor={monitor!r} is not a convergence-monitorable summary "
-                    f"scalar; choose one of {list(_MONITORABLE)}."
-                )
+            if monitor not in (*_MONITORABLE, "local_von_mises_mpa"):
+                raise ValueError(f"unsupported convergence monitor {monitor!r}.")
+            if monitor == "local_von_mises_mpa" and not choices and job_ids is None:
+                raise ValueError("local_von_mises_mpa requires a point, hot spot id, or face sid.")
             vtu_dir = _norm_abs_out_path(vtu_dir, "vtu_dir")
             if job_ids is not None:
                 if vtu_dir:
@@ -4511,7 +4695,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 bc_notes,
                 min_size_mm=min_size_mm,
             )
-            _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
+            _autosave_all_open()
             plan: list = []
             for i, value in enumerate(ladder):
                 study = {**ctx["study"], "mesh_order": mesh_order, key: value}
@@ -4521,6 +4705,10 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                     "target_size_mm": value if key == "target_size_mm" else None,
                     "min_size_mm": min_size_mm,
                     "fineness": study["fineness"],
+                    "monitor_point_mm": monitor_point_mm,
+                    "monitor_hot_spot_id": monitor_hot_spot_id,
+                    "monitor_face_sid": monitor_face_sid,
+                    "doc_id": ctx["doc"],
                 }
                 # The leg's own discretization, so the study this leg persists names the
                 # mesh it was solved on rather than the base context's placeholder.
@@ -4566,7 +4754,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def run_fea_modal(
         fixtures: Union[list, str],
-        material: Union[str, dict] = "steel",
+        material: Optional[Union[str, dict]] = None,
         n_modes: int = 6,
         mesh_fineness: Union[float, str] = 0.5,
         learned_advisor: bool = False,
@@ -4615,7 +4803,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             # wrong mode numbering. Both live in the SOLVE stage (jobs._stage_modal_rpc) so
             # the synchronous and background answers cannot drift apart.
             free_free = ctx["free_free"]
-            _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
+            _autosave_all_open()
             return _dumps(
                 _run_solve(
                     "fea_modal",
@@ -4645,7 +4833,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         analysis: str = "fea_static",
         fixtures: Optional[Union[list, str]] = None,
         loads: Optional[Union[list, str]] = None,
-        material: Union[str, dict] = "steel",
+        material: Optional[Union[str, dict]] = None,
         mesh_fineness: Union[float, str] = 0.5,
         learned_advisor: bool = False,
         advisor_max_dof: int = 0,
@@ -4732,7 +4920,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                     "solve_n": _modal_solve_n(n_modes, ctx["free_free"]),
                     "widen_free_free": ctx["free_free"],
                 }
-            _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
+            _autosave_all_open()
             meta = _job_meta(ctx, notes, {"label": label} if label else None)
             job = simjobs.start(kind, stage, payload, meta)
             return _dumps(
@@ -4805,7 +4993,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                     "Cancel for lack of progress only when progress.stalled is true, "
                     "not for a healthy long probe."
                 )
-            return _dumps(st)
+            return _dumps(_fill_guard_advice(st) if st.get("kind") in
+                          ("fea_static", "fea_contact") else st)
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -4921,7 +5110,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                     out.setdefault("error", st.get("error") or f"solve {state}")
                     if st.get("progress"):
                         out["progress"] = st["progress"]
-                    return _dumps(out)
+                    return _dumps(_fill_guard_advice(out) if st.get("kind") in
+                                  ("fea_static", "fea_contact") else out)
             if state != "done":
                 out = {
                     "ok": False,
@@ -4953,7 +5143,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                                 out[key] = refusal[key]
                         if refusal.get("error"):
                             out["solver_error"] = refusal["error"]
-                return _dumps(out)
+                return _dumps(_fill_guard_advice(out) if st.get("kind") in
+                              ("fea_static", "fea_contact") else out)
             out = dict(collect_durable(job_id, st))
             # A collector that reports its own convergence (topology: ok yet iteration-
             # limited) keeps it; other kinds converge exactly when they collected ok.
@@ -5023,7 +5214,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         psd_breakpoints: Optional[Union[list, str]] = None,
         vibration_spec: Optional[Union[dict, str]] = None,
         n_modes: int = 6,
-        material: Union[str, dict] = "steel",
+        material: Optional[Union[str, dict]] = None,
         mesh_fineness: Union[float, str] = 0.5,
         doc_id: Optional[str] = None,
         background: bool = False,
@@ -5141,6 +5332,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                     if limit < 0.0:
                         raise ValueError(f"vibration_spec.{key} must be >= 0.")
                     vibration_spec[key] = limit
+            material = _material_for_doc(material, d, bc_notes)
             mat = _resolve_study_material(material, "frequency_response")
             fixture_sets: list = []
             for q in fixtures:
@@ -5192,7 +5384,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 "vibration_spec": vibration_spec,
                 "total_mass_kg": total_mass_kg,
             }
-            _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
+            _autosave_all_open()
             return _dumps(
                 _run_solve(
                     "fea_frequency_response",
@@ -5287,7 +5479,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 "n_steps": n_steps,
                 "step_path": step,
             }
-            _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
+            _autosave_all_open()
             return _dumps(
                 _run_solve(
                     "cfd_flow",
@@ -5478,7 +5670,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
     def run_fea_fatigue(
         fixtures: Union[list, str],
         loads: Union[list, str],
-        material: Union[str, dict] = "steel",
+        material: Optional[Union[str, dict]] = None,
         load_type: str = "reversed",
         load_ratio: float = -1.0,
         surface: str = "machined",
@@ -5489,6 +5681,9 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         doc_id: Optional[str] = None,
         background: bool = False,
         load_case: str = "bending",
+        kf: Optional[float] = None,
+        stress_basis: Optional[str] = None,
+        hot_spot: Optional[str] = None,
     ) -> str:
         """High-cycle fatigue life (S-N) on the current part — reuses the linear-static
         stress field, then applies mean-stress theory + Marin correction + Basquin life.
@@ -5497,14 +5692,15 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         engine (`sim_run_fatigue`) evaluates every mean-stress theory (Goodman/Gerber/
         Soderberg/ASME/Morrow) node-by-node and returns each theory's max equivalent
         fully-reversed amplitude sa_eq. This tool then applies the Marin endurance
-        correction + reliability + the Shigley S-N life line (mirrors the desktop app's
-        fatigue math exactly) to report cycles-to-failure + a factor of safety.
+        correction + reliability + Kf on alternating stress and the Shigley S-N
+        life line to report cycles-to-failure + a factor of safety.
 
         fixtures/loads : SAME shapes as run_fea_static — including the polar
                          {"magnitude": N, "direction": [dx,dy,dz]} load form, plural
                          "faces": [q1, q2], and a face SID ("F58db6d") as a query.
-        material       : name or dict (needs ultimate_mpa + endurance_mpa; the built-in
-                         materials all carry them).
+        material       : name or dict (needs ultimate_mpa + endurance_mpa); omitted
+                         uses the document's applied material; if none is applied,
+                         an explicit material is required.
         load_type      : "reversed" (R=-1, default) | "zero_based" (R=0) | "ratio" (use
                          load_ratio) — the cyclic load spectrum on the static result.
         surface        : "ground"|"machined"|"hot_rolled"|"as_forged" (Marin ka).
@@ -5513,6 +5709,21 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         load_case      : "bending" (default), "axial", or "torsion" for Marin kb/kc.
                          Rectangular bending/torsion uses d_e=0.808*sqrt(b*h) from the
                          two smaller bounding-box spans; axial uses kb=1.
+        kf             : required explicit fatigue stress concentration factor >= 1.
+                         It applies to the alternating nominal stress only.
+        stress_basis   : "nominal" required for kf > 1: the FEA field must not
+                         already resolve the notch represented by Kf. "resolved"
+                         may be used with kf=1. Results are global worst-node
+                         estimates, not a selected location's fatigue life.
+                         For a meshed fillet use the resolved FE peak directly
+                         with kf=1; do not apply its notch factor a second time.
+                         Optional notch-sensitivity relief requires independent
+                         user-supplied analysis and is not applied by this tool.
+                         Sharp singular edges have mesh-dependent peak stresses:
+                         add a physical fillet and rerun with a suitable mesh.
+        hot_spot       : location-specific fatigue is not supported by this engine;
+                         a hot spot identifier is refused rather than substituted
+                         with the global maximum or an invented Kf.
 
         Returns {ok, regime: infinite|finite|static_overload, cycles, fos_endurance,
         se_corrected_mpa, theories{...}}. regime="infinite" ⇒ >1e6 cycles (runout).
@@ -5536,6 +5747,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
             )
             loads = _norm_bc_list(loads, "loads", notes=bc_notes)
             mesh_fineness = _norm_fineness(mesh_fineness)
+            material = _material_for_doc(material, d, bc_notes)
             mat = _resolve_study_material(material, "fatigue")
             Sut = _finite_float(mat["ultimate_mpa"], "material.ultimate_mpa")
             Se_base = _finite_float(mat["endurance_mpa"], "material.endurance_mpa")
@@ -5599,6 +5811,26 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 )
             load_specs = _build_load_specs(d, loads, "fatigue")
             _reject_fully_constrained_loads(fixture_sets, load_specs, "fatigue FEA")
+            if hot_spot is not None:
+                raise ValueError(
+                    "hot_spot fatigue requires a location-specific Kf and stress; "
+                    "the current fatigue solver only returns global maxima and static "
+                    "hot spots do not provide Kf."
+                )
+            if kf is None:
+                raise ValueError("explicit kf is required; no notch factor is assumed")
+            kf = _finite_float(kf, "kf")
+            if kf < 1.0:
+                raise ValueError("kf must be >= 1")
+            if stress_basis is not None:
+                stress_basis = str(stress_basis).strip().lower()
+                if stress_basis not in ("nominal", "resolved"):
+                    raise ValueError("stress_basis must be 'nominal' or 'resolved'")
+            if kf > 1.0 and stress_basis != "nominal":
+                raise ValueError(
+                    "kf > 1 requires stress_basis='nominal' and a notch not resolved "
+                    "by the FEA mesh; applying Kf to a resolved notch double-counts it"
+                )
             _, b, h = _part_bbox_dims(d)
             diameter_mm = 0.808 * math.sqrt(b * h)
             corr = fa.corrected_endurance(
@@ -5649,6 +5881,8 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 "theory": theory,
                 "marin": corr,
                 "ultimate_mpa": Sut,
+                "kf": kf,
+                "stress_basis": stress_basis,
                 "load_type": load_type,
             }
             _autosave_all_open()
@@ -5705,7 +5939,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
     def run_fea_thermal(
         hot_faces: Union[list, str],
         cold_faces: Union[list, str],
-        material: Union[str, dict] = "steel",
+        material: Optional[Union[str, dict]] = None,
         conductivity_w_mk: Optional[float] = None,
         transient: Optional[Union[dict, str]] = None,
         loads: Optional[Union[list, str]] = None,
@@ -5856,11 +6090,14 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
 
             d = _doc(doc_id)
             _require_sim_geometry(d)
+            material = _material_for_doc(material, d, bc_notes)
+            thermal_assumptions: list = []
             mat = _resolve_study_material(
                 material,
                 "thermal_transient" if transient is not None else "thermal_steady",
                 conductivity_w_mk=conductivity_w_mk,
                 specific_heat_j_kgk=specific_heat_j_kgk,
+                assumptions=thermal_assumptions,
             )
             k_cond = mat["conductivity_w_mk"]
             cp = mat.get("cp_j_kgk")
@@ -6007,6 +6244,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                     "solver": "C++ core steady conduction",
                     "material": mat.get("name", material),
                     "conductivity_w_mk": k_cond,
+                    "material_assumptions": thermal_assumptions,
                     **{key: res[key] for key in (
                         "summary", "temperature_max_c", "temperature_min_c",
                         "flux_max_w_m2", "n_nodes", "n_elems")},
@@ -6018,6 +6256,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 sid = _persist_study(d, {
                     "type": "fea_thermal", "name": f"Thermal ({mat.get('name', material)})",
                     "engine": "cpp", "material": mat, **advisor,
+                    "material_assumptions": thermal_assumptions,
                     **_evidence_fields(res), "results": res,
                 })
                 out["saved_to_study"] = bool(sid)
@@ -6046,6 +6285,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 "material": mat.get("name", material),
                 "conductivity_w_mk": k_cond,
                 "specific_heat_j_kgk": cp,
+                "material_assumptions": thermal_assumptions,
                 "summary": summary,
                 "n_steps": counts["n_steps"],
                 "n_nodes": counts["n_nodes"],
@@ -6070,6 +6310,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                     "name": f"Transient thermal ({mat.get('name', material)})",
                     "engine": "cpp",
                     "material": {**mat, "k_w_mk": k_cond, "cp_j_kgk": cp},
+                    "material_assumptions": thermal_assumptions,
                     "transient": study["transient"],
                     **advisor,
                     **advisor_record,
@@ -6092,7 +6333,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
     def run_fea_buckling(
         fixtures: Union[list, str],
         load: Union[list, str],
-        material: Union[str, dict] = "steel",
+        material: Optional[Union[str, dict]] = None,
         n_modes: int = 4,
         doc_id: Optional[str] = None,
         size_mm: float = 8.0,
@@ -6165,7 +6406,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
     def run_fea_contact(
         fixtures: Union[list, str],
         load: Union[list, str, dict],
-        material: Union[str, dict] = "steel",
+        material: Optional[Union[str, dict]] = None,
         max_gap_mm: float = 0.5,
         max_iterations: int = 25,
         mesh_size_mm: Optional[float] = None,
@@ -6436,7 +6677,7 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
                 closed_fit=closed_fit,
                 closed_fit_gap_mm=closed_fit_gap_mm,
             )
-            _autosave_all_open()  # R-1 guard: protect every open doc before the solve starts
+            _autosave_all_open()
             return _dumps(
                 _run_solve(
                     "fea_contact",
@@ -6450,6 +6691,6 @@ def register_cad_sim_tools(mcp: FastMCP) -> None:
         except _StudyRefusal as r:
             return _dumps(r.payload)
         except CoreError as e:
-            return _err(e)
+            return _guard_error(e)
         except Exception as e:  # noqa: BLE001
-            return _err(e)
+            return _guard_error(e)

@@ -35,6 +35,8 @@ CATEGORY_PACKS: dict[str, list[str]] = {
     "modeling": [
         "family:cad",
         "add_features",
+        "check_model_history",
+        "simplify_part",
         # Schema vocabulary must be callable where schema failures happen. In live run
         # run-135571474839343 (2026-08-04), modeling+sketch resolved add_features but
         # not this zero-risk guide, so the model could not inspect the canonical shape.
@@ -42,11 +44,15 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "new_part",
         "new_assembly",
         "save_part",
+        "show_in_app",
         "close_part",
         "import_part",
         "export_part",
         "inspect_native_files",
         "read_native_file",
+        "scad_status",
+        "scad_inspect",
+        "scad_convert",
         "browse_models",
         "relocate_native_files",
         "set_material",
@@ -73,6 +79,7 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "describe_sketch",
         "check_sketch",
         "sketch_health",
+        "sketch_probe",
         "sketch_auto_constrain",
         "sketch_fully_define",
         "sketch_preview_text",
@@ -113,6 +120,7 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "measure_from_photo",
         "query_geometry",
         "query_adjacency",
+        "doc_face_edges",
         "hover",
         "wall_thickness",
     ],
@@ -126,9 +134,14 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "render_views",
         "render_ascii",
         "wall_thickness",
+        "find_stress_risers",
+        "eval_curvature",
+        "eval_geometry_analysis",
         "draft_analysis",
         "check_interference",
         "inspect_model_integrity",
+        "check_model_history",
+        "simplify_part",
         "check_symmetry",
         "check_feature_overlap",
         "check_metadata",
@@ -184,13 +197,31 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "resolve_process",
         "set_process",
         "dfm_check",
+        "dfm_reinforce",
         "fit_calc",
         "recommend_fit",
         "machining_ref_search",
         "tap_drill",
         "feeds_speeds",
     ],
+    "stress": [
+        "find_stress_risers",
+        "wall_thickness",
+        "query_geometry",
+        "query_adjacency",
+        "eval_curvature",
+        "eval_geometry_analysis",
+        "fea_probe",
+        "run_fea_static",
+        "run_fea_convergence",
+        "run_fea_adaptive",
+        "run_fea_fatigue",
+        "research_eng_calc",
+        "cad_guide",
+    ],
     "sim": [
+        "find_stress_risers",
+        "fea_probe",
         "run_fea_static",
         "run_fea_modal",
         "run_fea_frequency_response",
@@ -241,6 +272,8 @@ CATEGORY_PACKS: dict[str, list[str]] = {
     ],
     "cam": [
         "family:cam",
+        "dfm_check",
+        "dfm_reinforce",
         "cam_new_job",
         "cam_job_tree",
         "cam_add_tool",
@@ -261,6 +294,7 @@ CATEGORY_PACKS: dict[str, list[str]] = {
     # PrusaSlicer, vendor presets) plus the deterministic checks around it.
     "print": [
         "dfm_check",
+        "dfm_reinforce",
         "optimize_print_orientation",
         "slice_part",
         "verify_gcode",
@@ -300,11 +334,10 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "ecad_design",
         "ecad_edit_symbol",
         "ecad_export",
-        "ecad_export_kicad",
         "ecad_fill_zones",
         "ecad_find_part",
+        "ecad_find_footprint",
         "ecad_fpga_check",
-        "ecad_import_kicad",
         "ecad_junction",
         "ecad_label",
         "ecad_load_symbol_library",
@@ -317,6 +350,7 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "ecad_no_connect",
         "ecad_note",
         "ecad_optimize_traces",
+        "ecad_open",
         "ecad_place_symbol",
         "ecad_plot",
         "ecad_route_diff_pair",
@@ -344,6 +378,18 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "heatsink_select",
         "power_budget",
         "render_schematic_ascii",
+    ],
+    "harness": [
+        "harness_new", "harness_add_connector", "harness_add_wire", "harness_connect",
+        "harness_from_netlist", "harness_route", "harness_check", "harness_build_geometry",
+        "harness_report", "harness_formboard", "harness_get", "harness_edit",
+        "harness_electrical_check", "harness_bus_check", "harness_cable_model",
+        "harness_to_bus_links", "cad_guide",
+    ],
+    "kicad": [
+        "ecad_open",
+        "ecad_kicad_status",
+        "ecad_find_footprint",
     ],
     "firmware": [
         "fw_status",
@@ -377,7 +423,15 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "asm_mate",
         "solve_mates",
         "describe_assembly",
+        "list_world_bodies",
         "check_interference",
+        "interface_check",
+        "assembly_dof",
+        "fastener_check",
+        "tool_access_check",
+        "disassembly_check",
+        "mate_fit_check",
+        "bom_consistency_check",
         "inspect_model_integrity",
         "fit_cylinder_axis",
         "stackup_analyze",
@@ -421,6 +475,9 @@ CATEGORY_PACKS: dict[str, list[str]] = {
     "sourcing": [
         "part_search",
         "part_get",
+        "part_library_ingest",
+        "part_library_sync",
+        "part_acquire",
         "part_source",
         "parts_taxonomy",
         "match_model",
@@ -499,13 +556,24 @@ CATEGORY_PACKS: dict[str, list[str]] = {
     # bind via agent_turn._bind_tool; the `reveng_`-prefixed spellings of the
     # verb-first tools do NOT exist, so do not "tidy" these into a prefix.
     "reveng": [
+        "add_mesh_reference",
+        "list_mesh_references",
+        "update_mesh_reference",
+        "remove_mesh_reference",
+        "reveng_attach_reference",
+        "measure_mesh_reference",
         # Session lifecycle + evidence intake.
         "reveng_status",
+        "reveng_install_tools",
         "reveng_start_session",
+        "reveng_find_models",
+        "reveng_use_model",
         "reveng_add_images",
         "reveng_add_video",
         "reveng_ingest_datasheet",
         "reveng_set_scale",
+        "reveng_confirm_scale",
+        "reveng_align_axes",
         "reveng_print_scale_mat",
         "list_reveng_sessions",
         "get_reveng_session",
@@ -515,6 +583,10 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "reveng_finish_splat",
         "reveng_cancel_splat",
         "reveng_crop_splat",
+        "reveng_import_splat",
+        "reveng_convert_splat",
+        "reveng_splat_to_mesh",
+        "reveng_sparse_preview",
         # Reconstruction gate + build.
         "reveng_gate_status",
         "reveng_resolve_gate",
@@ -568,27 +640,12 @@ CATEGORY_PACKS: dict[str, list[str]] = {
         "ledger_note",
         "buildgraph_plan",
         "buildgraph_status",
-        # Corporate/coordination surface. These are NOT MCP-registered tools —
-        # they are MissionDispatch bound methods resolved through
-        # MissionDispatch.resolve (mission_dispatch.py `_handlers`), which is a
-        # dispatch layer agent_turn._bind_tool never consults. A `_bind_tool`
-        # probe therefore reports them unbindable and they are NOT: on any lane
-        # that binds a dispatcher (including the general lane, which
-        # run_linear_role_turn always gives one — mission_dispatch.py:2189-2210)
-        # they resolve and run. They were briefly deleted from this pack on that
-        # false-negative reading; if you are auditing pack entries, probe
-        # MissionDispatch.resolve AND _bind_tool before calling anything dead.
-        "corporate_channel_read",
-        "corporate_chart",
+        # Coordination-board tools: MissionDispatch bound methods (mission_dispatch.py
+        # `_handlers`), not MCP-registered tools. agent_turn._bind_tool never
+        # consults that dispatch layer, so a `_bind_tool` probe reports them
+        # unbindable; on any lane that binds a dispatcher they resolve and run.
         "coordinate_board",
         "coordinate_progress",
-        # The WORKER half of the org request protocol. `request_resolve` (the
-        # manager half) sits in department_manager.yaml, but no role card and no
-        # pack carried `request_raise` — managers could resolve requests that
-        # nothing in the harness was able to raise. Registered in the `org` family,
-        # which has no family: token anywhere, so this explicit entry is its only
-        # route (advertised_tool_audit, 2026-07-30).
-        "request_raise",
         # Mission/ledger read surface named by the mission guidance notes
         # (mission_status for progress, replan_request for a scope change,
         # ledger_events for the raw stream) and carried by no pack.
@@ -723,6 +780,7 @@ CATEGORY_PACKS: dict[str, list[str]] = {
     ],
     "sheetmetal": [
         "add_features",  # sm_base_flange / sm_edge_flange / sm_flat_pattern via ops
+        "export_flat_dxf",
         "set_process",
         "research_eng_calc",  # bend_allowance
         "dfm_check",
@@ -775,9 +833,12 @@ _CATEGORY_DESCS: dict[str, str] = {
     "measure": "Mass props, wall thickness, distances, geometry queries, hover",
     "inspect": "Visual inspect/render, DFM, interference, design review",
     "research": "Web search, materials, standards, eng calcs, datasheets",
+    "stress": "Stress risers, notch factors, wall thickness, FEA probing and convergence",
     "sim": "FEA/CFD/motion and EM analysis jobs",
     "cam": "CAM jobs, ops, generate/post, feeds & speeds",
     "ecad": "Schematic/PCB place-wire-board and ERC/DRC/sim",
+    "harness": "Wiring harness design: connectors, routing, electrical and bus checks, geometry and formboards",
+    "kicad": "Open KiCad projects, inspect the installation, and discover footprints",
     "firmware": "Embedded firmware: scaffold/build/emulate, board co-verify, flash & serial",
     "assembly": "Components, mates, stackup and fit calcs",
     "intake": "Photo intake of real parts: measure, confirm dims, prove first-try fit",
@@ -787,7 +848,7 @@ _CATEGORY_DESCS: dict[str, str] = {
     "mfgplan": "Manufacturing plan scratchpad: process, datums, critical dims, DfM, references",
     "reveng": "Reverse engineering: scan/photo/datasheet intake, reconstruct, verify deviation",
     "advisor": "Stage advisory checks and dispute",
-    "delegate": "Subagents, ask_user, ledger/dag/buildgraph, mission + org coordination",
+    "delegate": "Subagents, ask_user, ledger/dag/buildgraph, mission coordination",
     "plm": "Item lifecycle, checkpoints/rollback, release, product-graph queries",
     "fluid": ("Hydraulic circuits (build, size pumps/motors/cylinders and drives, transient "
               "simulate), piping networks (route/solve/B31.3 check/BOM, pipe-bore CFD) and "
@@ -878,144 +939,28 @@ def resolve_categories(
     return set(kept_explicit) | set(kept_family)
 
 
-# --------------------------------------------------------------------------- main chat
-#
-# The interactive main chat (``general_agent``) is NOT a capped DAG-node role. It
-# runs with one Chudcode turn per message and the model decides everything —
-# inline work, a subagent, or a mission. Two things bound its surface:
-#
-#   * :data:`MAIN_CHAT_CORE_TOOLS` — always advertised with full schemas. Picked so
-#     ordinary part/assembly/drawing/PLM/file work never needs a load step.
-#   * :func:`render_tool_menu` — EVERY other registered tool, by exact name, grouped,
-#     rendered into the system prompt (names only, ~2k tokens). Nothing is hidden:
-#     the model loads any tool with ``enable_tools(tools=[...])`` or a whole group
-#     with ``enable_tools(categories=[...])`` and its schema arrives mid-turn.
-#
-# The full catalog (~460 tools) is ~150k tokens of schema, which is why the menu
-# carries names and the schemas load on demand.
-
+# Main chat starts with orientation and coordination, not the CAD catalog.
+# Domain schemas and their guidance arrive only when explicitly enabled.
 MAIN_CHAT_CORE_TOOLS: tuple[str, ...] = (
-    # conversation / harness
     "ask_user",
     "task_list",
     "delegate",
     "mission_start",
     "enable_tools",
     "list_tool_categories",
-    "design_recipe",
-    "cad_guide",
-    # The fetch half of the [SKILLS] catalog every online role prompt now carries.
-    # The catalog names each pack in one line and instructs the model to call this
-    # for the body, so a turn that reaches assembly work or a simulation needs it
-    # THAT turn — an enable_tools round-trip to reach a read-only text lookup is
-    # exactly the wasted turn the catalog exists to prevent. Its schema is two
-    # string params, so it costs the prompt almost nothing.
     "cad_skill",
     "advise",
-    # files (project jail)
     "fs_read",
     "fs_glob",
     "fs_grep",
     "fs_list",
-    # The model-facing thumbnail explorer: every CAD file's card + ASCII preview.
-    "browse_models",
     "fs_write",
     "fs_edit",
-    # documents
-    "new_part",
-    "new_assembly",
-    "list_parts",
     "get_part",
     "describe_part",
-    "describe_assembly",
     "describe_project",
     "workspace_status",
-    "save_part",
-    "export_part",
-    "close_part",
-    "import_part",
-    "set_material",
-    # Saved .step+ files read without opening them. c211-c233 agents shelled out to
-    # `unzip -p X.step+ document.json | jq` ~40 times for features/import params/
-    # components/mates/materials; inspect_native_files was enable_tools-loaded in 5
-    # of the 19 sessions.
-    "inspect_native_files",
-    "read_native_file",
-    # background jobs: a heavy call hands back a job_id; wait_job replaces the
-    # `sleep 600; ps -p <pid>` loops agents wrote in bash.
-    "get_job",
-    "wait_job",
-    # modeling
-    "add_features",
-    "preflight_ops",
-    "verify_battery",
-    "regen_diagnose",
-    # sketch
-    "describe_sketch",
-    "check_sketch",
-    "render_sketch",
-    # measure / inspect
-    "measure_part",
-    "measure_between",
-    "query_geometry",
-    "wall_thickness",
-    "render_part",
-    "inspect_part",
-    "inspect_feature",
-    "inspect_section",
-    "check_geometry_health",
-    "check_interference",
-    # Printability: every "optimize for 3D printing" turn loaded these on demand. Slicing
-    # is part of the main chat because "print this for my Ender 3" is an ordinary ask.
-    "dfm_check",
-    "analyze_stl_geometry",
-    "optimize_print_orientation",
-    "slice_part",
-    "verify_gcode",
-    # Delivering G-code to a printer stick is part of "print this": without these in the
-    # core the agent shell-copied revisions next to stale ones the printer shows with no
-    # timestamps. Inventory is read-only; publish is mutating (Ask/Plan refuse it).
-    "print_media_inventory",
-    "publish_print_media",
-    # assembly
-    "asm_add_component",
-    "asm_mate",
-    "solve_mates",
-    # Per-solid assembly census and fit checks; the two most-loaded on-demand
-    # tools across the c211-c233 sessions (7 and 4 sessions).
-    "list_world_bodies",
-    "interface_check",
-    # Motion must be callable alongside mates so mechanisms stay driveable,
-    # not just positioned by fixed component transforms.
-    "simulate_motion",
-    "render_animation",
-    # drawing
-    "make_drawing",
-    "export_drawing",
-    # plm
-    "plm_open",
-    "plm_save",
-    "plm_checkpoint",
-    "plm_item_add",
-    "plm_status",
-    "plm_history",
-    "plm_timeline",
-    "plm_rollback",
-    # reference / sourcing
-    "part_search",
-    "part_get",
-    "part_source",
-    "match_model",
-    "make_standard_part",
-    "list_standard_parts",
-    "fetch_cad_model",
-    "import_artifact",
-    # research
-    # Chudcode owns its builtin web_search/read; the distinctly named CAD
-    # research tools coexist with them (we do not hide Chudcode's builtins).
-    "research_web_search",
-    "research_fetch_page",
-    "research_material_lookup",
+    "list_parts",
 )
 
 
@@ -1052,13 +997,16 @@ class _MenuGroup:
 
 
 _MENU_GROUPS: tuple[_MenuGroup, ...] = (
-    _MenuGroup("harness", ("workspace", "shell"), (),
+    _MenuGroup("session", ("workspace", "shell"), (),
                "Session helpers, task list, bug report, run_shell, live doc events"),
+    _MenuGroup("harness", ("ecad",), ("harness_",),
+               "Wire harness connectivity, routing, checks, electrical analysis and formboard"),
     _MenuGroup("files", ("files",), (),
                "Project-jailed file read/search/write/edit"),
     _MenuGroup("files", ("cad",),
-               ("inspect_native_files", "read_native_file", "relocate_native_files"),
-               "Native STEP+ metadata/tree reads and copy/rename plans without geometry evaluation"),
+               ("inspect_native_files", "read_native_file", "relocate_native_files",
+                "scad_status", "scad_inspect", "scad_convert"),
+               "Native and OpenSCAD metadata, conversion, and file operations"),
     _MenuGroup("sketch", ("cad", "gsl"),
                ("sketch_", "sketch3d_", "check_sketch", "check_sketch3d", "render_sketch",
                 "render_sketch_ascii", "describe_sketch", "doc_sketch_contact_sheet",
@@ -1067,7 +1015,9 @@ _MENU_GROUPS: tuple[_MenuGroup, ...] = (
     _MenuGroup("assembly", ("cad",),
                ("asm_", "new_assembly", "solve_mates", "stackup_analyze", "interface_check",
                 "check_interference", "assembly_plan_review", "describe_assembly",
-                "list_world_bodies", "inspect_model_integrity"),
+                "list_world_bodies", "inspect_model_integrity", "assembly_dof",
+                "fastener_check", "tool_access_check", "disassembly_check",
+                "mate_fit_check", "bom_consistency_check"),
                "Components, mates, per-solid integrity, stackups and interface/fit checks"),
     _MenuGroup("drawing", ("cad",),
                ("add_balloon", "add_chamfer_dimension", "add_datum", "add_datum_target",
@@ -1088,14 +1038,13 @@ _MENU_GROUPS: tuple[_MenuGroup, ...] = (
     _MenuGroup("requirements", ("cad",), ("req_", "layout_plan", "layout_plan_report"),
                "Requirements capture/verification and layout plans"),
     _MenuGroup("measure", ("cad", "gsl"),
-               ("measure", "measure_", "query_", "wall_thickness", "hover", "is_watertight",
+               ("measure", "measure_", "query_", "wall_thickness", "hover",
                 "fit_cylinder_axis"),
                "Mass properties, distances, wall thickness, geometry/adjacency queries"),
     _MenuGroup("inspect", ("cad", "gsl"),
                ("check_", "inspect_", "render_", "look_around", "contact_sheet",
-                "design_review", "design_audit", "draft_analysis", "verify_battery",
+                "design_review", "draft_analysis", "verify_battery",
                 "doc_diff_tool", "engine_profile", "engine_profile_tree",
-                "assess_mesh_quality", "analyze_stl_geometry", "health_check",
                 "describe_", "apply_ascii_edits", "show_in_app", "get_job", "wait_job",
                 "list_artifacts"),
                "Render/inspect views, health/DFM/overlap checks, describers, ASCII views"),
@@ -1103,9 +1052,9 @@ _MENU_GROUPS: tuple[_MenuGroup, ...] = (
                "Vault items, checkpoints/rollback, release, product graph, live collab, Box"),
     _MenuGroup("plm", ("plm",), (), ""),
     _MenuGroup("modeling", ("cad",), (),
-               "Part geometry beyond add_features: configurations, standard parts, regen repair"),
-    _MenuGroup("coordination", ("mission", "ledger", "org", "advisor"), (),
-               "Missions/DAG, ledger, org requests, advisory checks"),
+               "Part geometry: new_part, add_features, save_part, cad_guide and configurations"),
+    _MenuGroup("coordination", ("mission", "ledger", "advisor"), (),
+               "Missions/DAG, ledger, advisory checks"),
     _MenuGroup("intake", ("intake",), (),
                "Photo intake of real parts: measure, confirm dims, fit coupons"),
     _MenuGroup("research", ("research",), (),
@@ -1140,14 +1089,6 @@ def _live_catalog() -> dict[str, dict]:
         return {}
 
 
-def loadable_tool_names(advertised: Iterable[str]) -> list[str]:
-    """Every live catalog tool that is not in *advertised*, sorted.
-
-    ``enable_tools`` can load each of these names. Chudcode uses the list to answer
-    ``xd://<name>`` for an unloaded tool with the load step.
-    """
-    mounted = set(advertised)
-    return sorted(name for name in _live_catalog() if name and name not in mounted)
 
 
 def tool_menu_groups() -> list[tuple[str, str, list[str]]]:
@@ -1220,30 +1161,15 @@ def expand_menu_entry(entry: str) -> list[str]:
 
 
 def render_tool_menu(loaded: Iterable[str] | None = None) -> str:
-    """The prompt block that makes the WHOLE catalog visible to the main chat.
-
-    *loaded* names are already advertised with schemas this turn and are left out
-    of the listing; a group with nothing left is omitted. Returns "" when the
-    registry is cold (unit tests) so the prompt simply has no menu.
-    """
-    skip = {str(t) for t in (loaded or ()) if t}
-    lines: list[str] = []
-    for name, desc, tools in tool_menu_groups():
-        rest = [t for t in tools if t not in skip]
-        if not rest:
-            continue
-        lines.append(f"- {name} ({len(rest)}) — {desc}:")
-        lines.append("  " + _compact_names(rest))
-    if not lines:
+    """A stable category overview; exact names and descriptions are discoverable."""
+    groups = [name for name, _desc, _tools in tool_menu_groups() if name != "manufacture"]
+    if not groups:
         return ""
-    head = (
-        "MORE TOOLS (registered, not loaded yet). Load exact names with "
-        "enable_tools(tools=[...]) or a whole group with "
-        "enable_tools(categories=[<group>]); the schemas arrive for the rest of "
-        "the turn. `pre_{a|b}` means pre_a and pre_b. Every tool below is "
-        "available to you — nothing else exists."
+    return (
+        "TOOLBOX: " + ", ".join(groups) + ".\n"
+        "Find tools with list_tool_categories(query=...); load names or areas "
+        "with enable_tools(tools=[...]) or enable_tools(categories=[...])."
     )
-    return head + "\n" + "\n".join(lines)
 
 
 def resolve_tool_requests(tokens: Iterable[str] | None) -> tuple[set[str], list[str]]:

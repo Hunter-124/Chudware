@@ -133,8 +133,6 @@ void ConfigPanel::drawBody(AppState& st) {
     ImGui::TextColored(dimCol, "(%d)", (int)names_.size());
 
     // ---- toolbar: Add / Delete / Activate ----
-    const bool busy = st.anyRunActive() || st.agentV2Running;
-    if (busy) ImGui::BeginDisabled();
     if (ImGui::Button("Add...")) {
         addPromptOpen_ = true;
         addNameBuf_[0] = 0;
@@ -165,8 +163,6 @@ void ConfigPanel::drawBody(AppState& st) {
         }
         if (!canActivate) ImGui::EndDisabled();
     }
-    if (busy) ImGui::EndDisabled();
-    if (busy) { ImGui::SameLine(); ImGui::TextColored(dimCol, "busy..."); }
 
     // ---- add-config inline prompt ----
     if (addPromptOpen_) {
@@ -226,7 +222,7 @@ void ConfigPanel::drawBody(AppState& st) {
         if (clicked) {
             selected_ = i;
             // Double-click activates (SolidWorks: double-click a config to switch to it).
-            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && !isActive && !busy)
+            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && !isActive)
                 runConfigOp(st, "config_activate", {{"name", name}});
         }
         if (isActive) {

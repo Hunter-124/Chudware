@@ -5,10 +5,16 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 OPERATOR_RE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
+
+
+class CellBackend(str, Enum):
+    SYSTEMD = "systemd"
+    CONTAINER = "container"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -36,6 +42,9 @@ class Settings:
     # The single local operator every request acts as. It names the operator's
     # workspace and cell; it is not a credential.
     operator: str = field(default_factory=lambda: _env("CHUDWARE_WEB_OPERATOR", "operator"))
+    # Only deployment configuration selects the outer isolation boundary.
+    cell_backend: CellBackend = field(default_factory=lambda: _env(
+        "CHUDWARE_WEB_CELL_BACKEND", CellBackend.SYSTEMD.value))
     # Host header values the gateway answers to. Anything else is refused so a
     # DNS-rebinding page cannot reach a loopback listener under its own name.
     allowed_hosts: list[str] = field(default_factory=lambda: [
@@ -66,6 +75,10 @@ class Settings:
     )
 
     def __post_init__(self) -> None:
+        try:
+            self.cell_backend = CellBackend(self.cell_backend)
+        except ValueError:
+            raise ValueError("CHUDWARE_WEB_CELL_BACKEND must be systemd or container") from None
         if not OPERATOR_RE.fullmatch(self.operator):
             raise ValueError("CHUDWARE_WEB_OPERATOR must be 1-64 characters of A-Z a-z 0-9 _ -")
         if not self.allowed_hosts:

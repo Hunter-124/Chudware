@@ -25,7 +25,7 @@ against it. The model's prose, tool previews and the event log are never graded.
 ```
 
 `--model` is `provider:model[:effort]`, with provider/model ids from the runtime catalog
-(Settings → AI, or Chudcode's model list) — not legacy defaults. Effort is one of
+(Settings → AI, or OMP's model list) — not legacy defaults. Effort is one of
 `minimal|low|medium|high|xhigh|max`; omit it to use the turn policy's effort.
 
 Each trial is `runs/<tag>/<task>/<model>/<rep>/` (git-ignored):
@@ -34,7 +34,7 @@ Each trial is `runs/<tag>/<task>/<model>/<rep>/` (git-ignored):
 |---|---|
 | `prompt.txt` | the model-visible prompt (task notes/oracles never enter the workspace) |
 | `work/` | the trial workspace as the turn left it (bundled after the turn; fixtures were copied in before it) |
-| `sessions/` | the Chudcode session of this trial only |
+| `sessions/` | the OMP session of this trial only |
 | `events.jsonl` | the executor's worker event stream |
 | `result.json` | `run_mission.py --result-json`: driver verdict + raw `agent_admin_turn` response (ok, reason, stop_reason, turn, usage, persistence) |
 | `driver.log` | executor stdout/stderr |
@@ -129,8 +129,8 @@ dirty flag and dirty fingerprint (hash of `git status` + `git diff HEAD`); hostd
 sha256/mtime and newer core sources; grader engine library sha256; timestamps and wall
 time; decoded turn (status, reason, stop_reason, terminal text, persistence,
 finalization errors); usage: the worker's token accumulator (`null` when it saw no
-provider usage — unknown, never 0), token totals summed from the trial's Chudcode session
-files (main + subagents), and `cost_usd` = Chudcode's per-message API-rate price estimate
+provider usage — unknown, never 0), token totals summed from the trial's OMP session
+files (main + subagents), and `cost_usd` = per-message API-rate price estimate
 (`null` if any message lacks a price; subscription billing differs); event digest (tool
 calls, failures, runtime models); artifact sha256/size/mtime; every workspace file
 (diagnostic only); every check result; verdict.
@@ -145,8 +145,9 @@ Graders are tested against REAL parts/studies built by calling the tools directl
 (`conftest.py`: `cad_tools`, `build_part`), with adversarial deliverables (wrong
 dimension/location/face, missing study, wrong units, empty/missing/stale files, untouched
 fixture). `test_runner.py` runs the whole trial pipeline with a stand-in executor that
-receives the exact run_mission argument list; `test_scoring.py` decodes a recorded
-current-format worker event log and terminal record.
+receives the exact run_mission argument list. `test_scoring.py` uses historical recorded
+events and a result fixture whose session binding keys were migrated to the current OMP
+names; the original run was not an OMP execution.
 
 ## Limits
 

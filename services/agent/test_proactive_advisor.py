@@ -315,7 +315,6 @@ def test_proactive_uses_bounded_one_shot_role_turn(monkeypatch):
         lambda role, config: SimpleNamespace(
             provider="mock",
             model="mock-model",
-            rank=2,
         ),
     )
     monkeypatch.setattr(

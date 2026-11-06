@@ -179,34 +179,17 @@ Expose texture ID + UV transform on `IViewport::backdrop()`.
 
 - Full modal: `mat.thick` + blocking dim scrim (0.45 alpha black).
 
----
 
-## 7. Known shortcomings
+## 7. Acceptance criteria
 
-Shortcomings recorded before the restyle; all had to be cleared for acceptance:
-
-| ID | Issue | Status (liquid-glass v2, 2026-07) |
-|----|-------|-----------------------------------|
-| G1 | Row pills vs full-panel washes inconsistent | RESOLVED — one UltraThin adaptive surface per pane + rowWash-constant pills |
-| G2 | HUD idle fade too aggressive | RESOLVED — floor 0.25, ~120 ms hover ramp (viewport.cpp) |
-| G3 | Chat contrast poor on bright bleed | RESOLVED — hysteretic adaptive vibrancy + contrast scrim |
-| G4 | Dock splitter lines invisible | VERIFIED — 1px `line` hairlines in layout.cpp unchanged |
-| G5 | Doc-tab band opacity | RESOLVED — adaptive thin glass band + tabs (doc_tabs.cpp) |
-| G6 | Empty dock transparency | VERIFIED — DockingEmptyBg transparent (application.cpp) |
-
----
-
-## 8. Acceptance criteria
-
-The restyle is done when all of the following hold:
+The following criteria apply:
 
 1. **Screenshot spot-check** — `tree`, `chat`, `pick`, `multidoc` scenarios: glass reads as
    frosted over viewport (blur visible on model edges through panels).
-2. **Lint** — `python3 scripts/check.py gui_lint theme` PASS (zero hardcoded colors in `host/src/ui/**`).
-3. **Shortcomings table** — all six IDs in §7 resolved.
-4. **Contrast** — body text ≥ 4.5:1 effective contrast on both dark-model and bright-floor viewport samples (visual review).
-5. **HUD** — toolbar fades to ≤0.25 opacity idle; full opacity within 120ms of hover.
-6. **No regressions** — FM undo/redo, dock resize, and doc-tab switching still work.
+2. **Lint** — `python3 scripts/gui_lint.py --rule color` checks literal colors that bypass palette roles.
+3. **Contrast** — body text ≥ 4.5:1 effective contrast on both dark-model and bright-floor viewport samples (visual review).
+4. **HUD** — toolbar fades to ≤0.25 opacity idle; full opacity within 120ms of hover.
+5. **No regressions** — FM undo/redo, dock resize, and doc-tab switching still work.
 
 ---
 

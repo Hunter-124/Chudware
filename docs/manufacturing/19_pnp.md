@@ -1,9 +1,6 @@
 # Pick-and-Place (OpenPnP virtual / job-interchange) — Implementation-Ready Architecture
 
-Track owner: `PnpArchitecture`. Design-only.
-Sources read: `services/mcp/server.py`, `services/mcp/tool_registry.py`, `host/src/ui/cam/cam_panel.h`,
-`core/cam/model.h`, `contracts/worker_rpc.md`, the manufacturing-breadth research,
-`00_decisions.md`, `01_definition_of_done.md`.
+Design proposal. See the [as-built map](README.md#as-built-map) for the implemented subset.
 
 Path ruling adopted: production GUI only under `host/src/ui/manufacture/**`; cross-domain
 service root `services/manufacturing/**`; RPC/events `mfg_*` / `mfg.*`; `host/src/ui/cam/**` untouched.
@@ -42,7 +39,7 @@ Contract tests key on these ids, not on section numbers.
 | `GW-CAP-DERIVED-FROM-EVIDENCE` | a capability row's `derived_from[]` is **every evidence row the report cites**, so no level can outlive the evidence under it |
 | `GW-FRESHVALUE-PUBLISH` | `FreshValue<T>{v,state,t_mono_ns,seq,age_ms,ttl_ms,src,why,last_ok?}` is the sole external freshness shape, and **every** field a UI paints crosses wrapped in it — including a durable authored row, which is journaled first and then published wrapped with `state:"ok"` and `ttl_ms:null` when it does not decay |
 | `GW-EMULATOR-CEILING` | no advertised level may exceed what the highest stage actually passed unlocks: E0–E3 → `monitor`, E4–E5 → `transport`, E6 → `execute`; `safety_integration` is never unlocked by any stage |
-| `GW-FAMILY-MANUFACTURE` | one shared MCP family id `"manufacture"` covers the whole overhaul and is OFF by default; the enabling mechanism (`DEFAULT_TOOL_FAMILIES` + `DEFAULT_OFF_TOOL_FAMILIES` in `services/agent/config.py`) is Gateway-owned in W1.1 and is a hard predecessor of every domain's MCP-registration wave |
+| `GW-FAMILY-MANUFACTURE` | the shared MCP family `manufacture` is off by default and requires explicit enablement in `agent.tool_families` |
 | `GW-RISK-TABLE-OWNER` | Gateway is the sole owner of the `services/mcp/tool_registry.py` risk-class edit for the batch, in one wave; every other domain's rows land as **data** the owner applies |
 | `GW-ZERO-NEW-SKIP` | the batch adds **zero** new normal-gate SKIPs; an absent optional prerequisite pins the level at `assumed` with the missing level named, or is excluded from `gate.sh` behind an opt-in qualification script — never reported as a SKIP and never read as a pass |
 
@@ -725,18 +722,11 @@ journal-stamped one returned by the append, never a locally chosen number.
 
 ### 9.2 MCP tools — shared family `"manufacture"`
 
-Per the final project ruling, the entire manufacturing overhaul registers under **one** shared family id
-`"manufacture"` — the product term, not the `mfg` wire prefix — and that family is **OFF by default in
-`agent.tool_families`** until commissioning, so `enable_tools` cannot silently self-add manufacturing
-surface. Default-off is **not** achieved by omission: an unlisted family resolves *enabled*, so the
-mechanism is the `DEFAULT_TOOL_FAMILIES` + `DEFAULT_OFF_TOOL_FAMILIES` pair in
-`services/agent/config.py`. That file and `test_manufacture_family_default_off.py` are **Gateway-owned
-in W1.1** and are a hard predecessor of this registration (`GW-FAMILY-MANUFACTURE`); PnP edits neither
-and asserts the resulting property from the outside (§11, `test_mcp_registration.py`). Per-tool toggles retain granularity via the existing `get_tool_options` path, so nothing is
-lost by collapsing the family. The earlier per-domain family `"pnp"` is withdrawn. Registered via
-`register_pnp_tools(_reg.view(mcp, "manufacture"))`. Risk classes are chosen so
-`tool_registry.classify_risk` yields the intended value from the name alone, with three explicit
-overrides where it would not:
+The proposed PnP tools use the shared `manufacture` family, which is off by default in
+`services/agent/config.py` even when a role lists it. Enabling it requires an explicit
+`agent.tool_families.manufacture = true` setting. Per-tool toggles remain available via
+`get_tool_options`. Proposed registration uses `register_pnp_tools(_reg.view(mcp,
+"manufacture"))`. The proposed risk classes are:
 
 | Tool | Risk | How |
 |---|---|---|
@@ -954,22 +944,3 @@ reason it was worth reporting the error rather than quietly fixing the prose.
 
 ---
 
-## 14. Review closure — architecture plan review
-
-Every row below is a change **already applied in this document**, not a plan.
-
-| finding | applies to PnP? | how it is closed here | where |
-|---|---|---|---|
-| **C8** — capability rows `FreshValue`-wrapped by three domains, never-wrapped by PnP | **yes — PnP is the named divergence** | §4.1 rewritten to the ruling: a durable authored row is **journaled first, then published wrapped**, `state:"ok"` + `ttl_ms:null` for rows that do not decay; the old "not a freshness envelope" prose narrows to **"no wall-clock TTL and no envelope-derived identity"**; persistence identity stays `seq` + `revision` + `artifact_hash` and nothing keys on `age_ms`/`t_mono_ns`/`ttl_ms`. `contracts/mfg_pnp.md` states both directions (never wall-clock-TTL'd, never painted unwrapped). `test_freshvalue.py` inverts from "durable artifacts are not wrapped" to enumerating the panel read set and failing on any unwrapped field | §4.1, §9.1, §9.4, §11 |
-| **C8 consequence** — `pnp.capability` is a durable row the GUI paints | yes | it is the eleventh registered kind (§4.2) **and** a wrapped published row (§9.4); it can therefore be neither an unjournaled UI truth surface nor an unwrapped one | §4.2, §8.1, §9.4 |
-| **B10 / kind drift** — the durable-result-kind table must be total over every appending domain | already compliant, restated as a hard prerequisite | eleven `pnp.*` kinds, each declaring **both** columns (`GW-KIND-COLUMNS`), `derived_from[]`, and a one-line declared `supersede_with_parent` reason (`GW-KIND-REASON`); `pnp.q1_procedural_fact` sets it `true` (`GW-PF-FOLLOWS-PARENT`) and `pnp.capability` must not (`GW-CAP-NO-INHERIT`); an unregistered kind is refused `mfg_unregistered_result_kind` (`GW-KIND-2`) | §4.2, §2 item 6 |
-| **B11** — the `manufacture`-family-off-by-default mechanism has no owner | yes, as a **consumer** | §9.2 now states that default-off is not achievable by omission, that the `DEFAULT_TOOL_FAMILIES` + `DEFAULT_OFF_TOOL_FAMILIES` pair in `services/agent/config.py` is **Gateway-owned in W1.1** and a hard predecessor of PnP's MCP registration, and that PnP edits neither that file nor its test — it asserts the resulting property from outside | §9.2, §11 |
-| **B12 / family drift** — one shared MCP family | already compliant | `register_pnp_tools(_reg.view(mcp, "manufacture"))`; the earlier per-domain `"pnp"` family stays withdrawn; granularity via `get_tool_options` per-tool toggles | §9.2 |
-| **B14** — five claimants on `services/mcp/tool_registry.py` | yes, as one of the five | PnP's three `_RISK_OVERRIDES` rows are **data handed to Gateway**, the single owner of that file for the batch (`GW-RISK-TABLE-OWNER`); PnP appends nothing to it, and the shared acceptance check is `classify_risk` unchanged for every pre-existing tool | §2 item 3, §9.2, §11 |
-| **B1** — Stage-1 admission classes | yes, as a consumer | §8.3 names the two classes explicitly: PnP emits **no** `probed_evidence`, its whole Stage-1 set is `procedural_fact` rows admissible only because every guard lists the class in `accepts.admission`, and **no PnP subject is execute-side** | §8.3 |
-| **B6/B7/B8/B9** — probed-for-computed-report, re-declared `CapabilityTruth`, self-minted `seq`, self-computed closure | not PnP defects; compliance restated with rule ids | `src`/`admission` gateway-computed (`GW-SRC-3`); `CapabilityTruth`/`CapabilityReport` composed verbatim, `probed` never used as a truth value (`GW-TYPES-OWNED`); `mfg_event_append` is the only source of a PnP `seq` (`GW-SEQ-1`); PnP supplies `derived_from[]` and never populates `affected[]` (`GW-CLOSURE`) | §4.2, §4.3, §8.1 |
-| **Zero new normal-gate SKIP** | already compliant, now id-bound | Q1 runs only from `scripts/qualify_pnp_q1.sh`, never from `gate.sh`; absence of `CHUDWARE_OPENPNP_BIN` is a Tier-0 refusal naming the prerequisite, never a SKIP and never a pass (`GW-ZERO-NEW-SKIP`) | §7, §8.2, §13.9 |
-| **C9 — fixtures root** | already compliant | `fixtures/mfg/pnp/**` | §10 |
-| **C10 — cross-reference drift on the load-bearing gateway rules** | yes | **every** gateway citation in this document now names a stable rule id bound to the rule's content and its refusal code; no `§24.x` or "ruling N" number is cited anywhere | §Citation convention, throughout |
-| **No-execute boundary (DoD #12, #15)** | unchanged by every edit above | no device path at any layer; no `RISK_MOTION` member, no `request_mfg_*` tool, no safety-class tool; `monitor`/`transport`/`execute`/`safety_integration` stay `unsupported` **with a `why`**; `device_command_owner` is an explicit `null` with a reason; wrapping a capability row changes what a panel *reads*, never what PnP may *do* | §0, §8.1, §9.2, §13 |
-| **Gateway `seq` authority** | unchanged by every edit above | the envelope's `seq` is the journal's stamped `seq`; publishing wrapped adds no second ordering namespace and no domain-side stamping (`GW-SEQ-1`) | §4.1, §4.2 |

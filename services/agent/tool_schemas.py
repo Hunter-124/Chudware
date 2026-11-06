@@ -13,8 +13,8 @@ Honesty rules:
     kwarg the dispatch layer would reject.
   * A tool that cannot be resolved is listed name-only and reported in the meta —
     never a fabricated signature.
-  * Token cost is MEASURED (repo-wide 4-chars/token heuristic, the same measuring
-    stick as tiers.TurnAssembler) and returned in the meta so callers can record it.
+  * Token cost is MEASURED (repo-wide 4-chars/token heuristic, tiers._count_tokens)
+    and returned in the meta so callers can record it.
 
 The trim dial is the tier's ``tool_schema_trim`` (tiers.trim_tool_schema — first
 sentence of the description only); untrimmed tiers get the first paragraph.
@@ -64,13 +64,13 @@ _SKIP_PARAMS = frozenset({"self", "ctx", "context", "ask_human"})
 # mission_dispatch.MissionDispatch.delegate).
 _FALLBACK_SCHEMAS: dict[str, str] = {
     "enable_tools": (
-        "- enable_tools(categories: list[str])\n"
-        "    Request more tool categories mid-turn "
-        "(see [TOOL CATEGORIES] menu)."
+        "- enable_tools(categories: list[str], tools: list[str])\n"
+        "    Load tool schemas and guidance by area or exact name."
     ),
     "list_tool_categories": (
-        "- list_tool_categories()\n"
-        "    List requestable tool category packs (name + one line)."
+        "- list_tool_categories(query: str = None, category: str = None, "
+        "offset: int = 0, limit: int = 30)\n"
+        "    List areas or search their tools with descriptions and pagination."
     ),
     "design_recipe": (
         "- design_recipe(query: str, max_results: int = 3)\n"
@@ -153,6 +153,54 @@ def _description_block(desc: str) -> str:
     return "\n".join(out)
 
 
+def render_tool_description(
+    name: str, description: str, *, trim: bool | None = None,
+    options: dict[str, Any] | None = None, skill_names: tuple[str, ...] = (),
+) -> str:
+    """Render the effective model-visible description shared by both lanes.
+
+    ``trim=None`` keeps the full description unless a per-tool trim is enabled;
+    explicit True/False selects the sentence/paragraph offline floor.
+    """
+    from services.agent.config import (
+        effective_tool_call_cap, get_tool_options, tool_timeout_s_default,
+    )
+
+    opts = get_tool_options(None, name) if options is None else options
+    opts = opts or {}
+    body = str(opts.get("description_override") or "").strip() or description.strip()
+    configured_trim = opts.get("schema_trim")
+    if configured_trim is True:
+        trim = True
+    elif configured_trim is False and trim is not None:
+        trim = False
+    if trim is not None:
+        body = _description_line(body, trim=trim)
+    sections = [body] if body else []
+    defaults = opts.get("param_defaults") or {}
+    if defaults:
+        rendered = ", ".join(f"{key}={value!r}" for key, value in sorted(defaults.items()))
+        sections.append(f"Effective defaults when omitted: {rendered}.")
+    cap = effective_tool_call_cap(name, opts=opts)
+    if cap:
+        sections.append(f"Per-turn limit: at most {cap} call(s) to this tool per turn.")
+    timeout = opts.get("timeout_s")
+    if timeout is None:
+        timeout = tool_timeout_s_default()
+    if timeout:
+        sections.append(f"Wait timeout: {timeout} s per invocation.")
+    note = str(opts.get("prompt_note") or "").strip()
+    if note:
+        sections.append(f"Note: {note}")
+    if skill_names:
+        import json
+
+        sections.append("Skill packs: " + "; ".join(
+            f"cad_skill(name={json.dumps(skill)})" for skill in skill_names
+        ))
+    return "\n\n".join(sections)
+
+
 def render_tools_block(
     allowed_tools: list[str],
     *,
@@ -222,74 +270,34 @@ def render_tools_block(
             fn = resolver(tool)
         except Exception:  # noqa: BLE001 — a broken resolver entry is unresolved
             fn = None
+        from services.agent.config import get_tool_options
+
+        opts = get_tool_options(None, tool) or {}
+        if opts.get("enabled") is False:
+            disabled.append(tool)
+            continue
         full: str | None = None
         compact: str | None = None
         if fn is None:
-            # Built-in meta-tool schemas when no live callable is registered yet.
-            entry = _FALLBACK_SCHEMAS.get(tool) or f"- {tool}(…)  # schema unavailable"
+            fallback = _FALLBACK_SCHEMAS.get(tool)
+            if fallback:
+                head, _, description = fallback.partition("\n")
+                description = description.strip()
+            else:
+                head, description = f"- {tool}(…)  # schema unavailable", ""
         else:
             schema = describe_callable(tool, fn)
-            # Per-tool agent.tool_options may override the included tool context
-            # (description) and the tier's schema_trim dial.
-            use_trim = trim
-            note = ""
-            defaults: dict[str, Any] = {}
-            call_cap: int | None = None
-            try:
-                from services.agent.config import (  # noqa: PLC0415
-                    effective_tool_call_cap,
-                    get_tool_options,
-                )
-                opts = get_tool_options(None, tool) or {}
-                if opts.get("enabled") is False:
-                    # A tool switched OFF in Settings → AI → Tools can only be
-                    # refused at dispatch, so advertising it spends a completion
-                    # on a call that cannot run. Drop it from the slot entirely.
-                    disabled.append(tool)
-                    continue
-                override = (opts.get("description_override") or "").strip()
-                if override:
-                    schema = dict(schema)
-                    schema["description"] = override
-                st = opts.get("schema_trim")
-                if st is not None:
-                    use_trim = bool(st)
-                note = (opts.get("prompt_note") or "").strip()
-                defaults = dict(opts.get("param_defaults") or {})
-                call_cap = effective_tool_call_cap(tool, opts=opts)
-            except Exception:  # noqa: BLE001
-                pass
-            desc = _description_line(schema["description"], trim=use_trim)
-            compact_desc = _description_line(schema["description"], trim=True)
-            head = f"- {schema['signature']}"
-            default_note = ""
-            if defaults:
-                rendered_defaults = ", ".join(
-                    f"{key}={value!r}" for key, value in sorted(defaults.items())
-                )
-                default_note = (
-                    f"\n    Effective defaults when omitted: {rendered_defaults}."
-                )
-            # An UNDISCLOSED cap is a guardrail the model cannot plan around: it
-            # budgets for the work it intends, then a mid-chain call is refused
-            # with no warning (live 2026-08-26: research_web_search, cap 3).
-            # Same resolver the dispatcher enforces with, so this number is true.
-            cap_note = (
-                f"\n    Per-turn limit: at most {call_cap} call(s) to this tool "
-                f"per turn — plan the calls you need."
-                if call_cap else ""
-            )
-            prompt_note = f"\n    Note: {note}" if note else ""
-            tail = default_note + cap_note + prompt_note
-            entry = head + (f"\n    {desc}" if desc else "") + tail
-            compact = head + (
-                f"\n    {compact_desc}" if compact_desc else ""
-            ) + tail
-            body = (schema["description"] or "").strip()
-            block = _description_block(body) if body else ""
-            # Only worth an upgrade when there is genuinely more to say.
-            if block and block != f"    {desc}":
-                full = f"{head}\n{block}{tail}"
+            head, description = f"- {schema['signature']}", schema["description"]
+        if fn is None and tool not in _FALLBACK_SCHEMAS:
+            entry = head
+        else:
+            floor_desc = render_tool_description(tool, description, trim=trim, options=opts)
+            compact_desc = render_tool_description(tool, description, trim=True, options=opts)
+            full_desc = render_tool_description(tool, description, options=opts)
+            entry = head + ("\n" + _description_block(floor_desc) if floor_desc else "")
+            compact = head + ("\n" + _description_block(compact_desc) if compact_desc else "")
+            if full_desc != floor_desc:
+                full = head + "\n" + _description_block(full_desc)
         cost = _count_tokens(entry)
         if used + cost > budget:
             omitted.append(tool)

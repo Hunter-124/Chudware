@@ -5,7 +5,7 @@ motion robotics ecosystems — channel, brackets, hubs, shafts, gearmotors, serv
 and a key student-robotics (FTC/FRC) structural + motion sourcing site. This
 adapter treats ServoCity as a commerce + reference source (price/link-out record
 with provenance), not a CAD-model source. Open catalog — no login for search.
-Challenge pages degrade to ``login_required`` — never solved.
+Challenge pages are reported, never solved.
 
 INVESTIGATION (search "gearmotor", HTTP 200, ~568KB static HTML): ServoCity is a
 BigCommerce (Stencil) store whose search box is skinned by the Searchanise
@@ -39,7 +39,7 @@ from __future__ import annotations
 import re
 from urllib.parse import urljoin
 
-from ._retail import RetailAdapter, _strip_tags
+from ._retail import RetailAdapter, _strip_tags, card_image
 from . import register
 
 SITE = "servocity"
@@ -79,6 +79,7 @@ _CARD_TITLE_RE = re.compile(r'card-title[^>]*>(.*?)</', re.IGNORECASE | re.DOTAL
 
 class ServocityAdapter(RetailAdapter):
     key = SITE
+    currency = "USD"
     base_url = BASE_URL
     search_url_tmpl = SEARCH_URL_TMPL
     license_note = LICENSE_NOTE
@@ -120,7 +121,8 @@ class ServocityAdapter(RetailAdapter):
                 continue
             seen.add(key)
 
-            hit: dict = {"ok": True, "title": title, "url": url, "site": self.key}
+            hit: dict = {"ok": True, "title": title, "url": url, "site": self.key,
+                         "thumbnail": card_image(block, self.base_url)}
             pm = _PRICE_RE.search(block)
             if pm:
                 price = _strip_tags(pm.group(1))

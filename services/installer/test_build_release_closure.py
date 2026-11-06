@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from services.installer import build_release, payload_manifest
-from scripts import pin_chudcode
+from scripts import pin_omp
 from services.installer.payload_manifest import build_manifest
 
 
@@ -35,7 +35,7 @@ def _sidecars(tmp_path: Path) -> dict[str, Path]:
         path = tmp_path / f"{arg}.exe"
         path.write_bytes(arg.encode())
         result[arg] = path
-    chud = tmp_path / "input-chud.exe"
+    chud = tmp_path / "input-omp.exe"
     image = bytearray(256)
     image[:2] = b"MZ"
     image[0x3C:0x40] = (128).to_bytes(4, "little")
@@ -45,23 +45,23 @@ def _sidecars(tmp_path: Path) -> dict[str, Path]:
     digest = hashlib.sha256(image).hexdigest()
     artifacts = {
         target: {
-            "filename": pin_chudcode.CANONICAL_NAMES[target],
+            "filename": pin_omp.CANONICAL_NAMES[target],
             "sha256": digest,
-            "url": f"https://release.invalid/{target}/{pin_chudcode.CANONICAL_NAMES[target]}",
+            "url": f"https://release.invalid/{target}/{pin_omp.CANONICAL_NAMES[target]}",
         }
-        for target in pin_chudcode.SUPPORTED_TARGETS
+        for target in pin_omp.SUPPORTED_TARGETS
     }
     notice_bytes = {
-        "CHUDCODE-NOTICE": b"Chudcode notice\n",
-        "CHUDCODE-THIRD-PARTY-NOTICES.txt": b"third parties\n",
+        "OMP-LICENSE": b"OMP notice\n",
+        "OMP-THIRD-PARTY-NOTICES.txt": b"third parties\n",
     }
     notice_dir = tmp_path / "notices"
     notice_dir.mkdir()
     for name, content in notice_bytes.items():
         (notice_dir / name).write_bytes(content)
-    lock = tmp_path / "CHUDCODE_ARTIFACT.lock"
+    lock = tmp_path / "OMP_ARTIFACT.lock"
     lock.write_bytes(
-        pin_chudcode._canonical_json(
+        pin_omp._canonical_json(
             {
                 "artifacts": artifacts,
                 "engine_version": "18.0.8",
@@ -69,24 +69,24 @@ def _sidecars(tmp_path: Path) -> dict[str, Path]:
                     "files": {
                         name: {
                             "sha256": hashlib.sha256(content).hexdigest(),
-                            "source": pin_chudcode.NOTICE_FILES[name],
+                            "source": pin_omp.NOTICE_FILES[name],
                         }
                         for name, content in notice_bytes.items()
                     },
                     "repository_commit": "1" * 40,
                 },
-                "repository": "https://github.com/Hunter-124/chudcode.git",
+                "repository": "https://github.com/can1357/oh-my-pi.git",
                 "repository_commit": "1" * 40,
                 "rpc_protocol": 2,
-                "schema": pin_chudcode.SCHEMA,
+                "schema": pin_omp.SCHEMA,
                 "version": "0.2.0",
             }
         )
     )
-    pin_chudcode.DEFAULT_LOCK = lock
-    pin_chudcode.DEFAULT_NOTICE_DIR = notice_dir
-    pin_chudcode._verify_executable_version = lambda *_args: "Chudcode v0.2.0"
-    result["chud_bin"] = chud
+    pin_omp.DEFAULT_LOCK = lock
+    pin_omp.DEFAULT_NOTICE_DIR = notice_dir
+    pin_omp._verify_executable_version = lambda *_args: "omp/0.2.0"
+    result["omp_bin"] = chud
     return result
 
 
@@ -107,10 +107,11 @@ def test_windows_stage_and_manifest_own_complete_runtime_closure(
         "chudware-hostd.exe",
         "chudware-worker.exe",
         "chudware-mcp.exe",
-        "chud.exe",
-        "CHUDCODE_ARTIFACT.lock",
-        "CHUDCODE-NOTICE",
-        "CHUDCODE-THIRD-PARTY-NOTICES.txt",
+        "omp.exe",
+        "omp_extension.ts",
+        "OMP_ARTIFACT.lock",
+        "OMP-LICENSE",
+        "OMP-THIRD-PARTY-NOTICES.txt",
         "chudware-uninstall-helper.exe",
         "LICENSE",
         "THIRD_PARTY_NOTICES.md",
@@ -122,22 +123,37 @@ def test_windows_stage_and_manifest_own_complete_runtime_closure(
     )
     assert {row["path"] for row in manifest["files"]} == expected
     by_path = {row["path"]: row for row in manifest["files"]}
-    assert by_path["chud.exe"]["kind"] == "executable"
-    assert by_path["CHUDCODE_ARTIFACT.lock"]["kind"] == "resource"
-    assert by_path["CHUDCODE-NOTICE"]["kind"] == "resource"
-    assert by_path["CHUDCODE-THIRD-PARTY-NOTICES.txt"]["kind"] == "resource"
-    (dst / "CHUDCODE-NOTICE").write_bytes(b"tampered notice")
+    assert by_path["omp.exe"]["kind"] == "executable"
+    assert by_path["OMP_ARTIFACT.lock"]["kind"] == "resource"
+    assert by_path["OMP-LICENSE"]["kind"] == "resource"
+    assert by_path["OMP-THIRD-PARTY-NOTICES.txt"]["kind"] == "resource"
+    (dst / "OMP-LICENSE").write_bytes(b"tampered notice")
     with pytest.raises(payload_manifest.PayloadManifestError, match="do not match"):
         payload_manifest.verify_manifest_payload(dst, canonical)
 
 
-def test_windows_stage_requires_verified_chudcode_artifact(tmp_path: Path) -> None:
+@pytest.mark.parametrize("extension", [
+    "omp_extension.ts", "usr/bin/omp_extension.ts", "Contents/MacOS/omp_extension.ts",
+])
+def test_only_signed_payload_extension_paths_allow_typescript(tmp_path: Path, extension: str) -> None:
+    allowed = tmp_path / extension
+    allowed.parent.mkdir(parents=True, exist_ok=True)
+    allowed.write_text("trusted extension fixture")
+    payload_manifest.reject_forbidden_customer_files(tmp_path)
+    other = tmp_path / "other" / "omp_extension.ts"
+    other.parent.mkdir()
+    other.write_text("untrusted source fixture")
+    with pytest.raises(payload_manifest.PayloadManifestError, match="source/debug artifact"):
+        payload_manifest.reject_forbidden_customer_files(tmp_path)
+
+
+def test_windows_stage_requires_verified_omp_artifact(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
     sidecars = _sidecars(tmp_path)
-    sidecars["chud_bin"] = None
+    sidecars["omp_bin"] = None
     dst = tmp_path / "payload"
     dst.mkdir()
-    with pytest.raises(RuntimeError, match="required compiled Chudcode artifact"):
+    with pytest.raises(RuntimeError, match="required compiled OMP artifact"):
         build_release.stage_compiled_payload(
             dst, host_bin=runtime / "chudware.exe", **sidecars
         )

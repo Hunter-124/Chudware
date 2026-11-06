@@ -208,3 +208,24 @@ Field semantics (per net entry):
   double-counted in `cells`).
 - Model scope (v1): DC resistive only; arc tracks ignored; one net per entry (the
   return path is its own entry, typically `GND`).
+
+## 4. KiCad STEP sidecar — contract revision 2
+
+This revision supersedes conflicting STEP-producer and geometry-mapping claims in §2.
+`ecad_to_3d` exports the board using `kicad-cli` and
+`services.ecad.threed.boardphys_for_kicad_step` writes its `aicad.boardphys/1`
+sidecar. It preserves component engineering metadata and power totals; it does not
+claim a component-to-STEP-solid mapping without verification. `solid_label` and
+`body` are null when that mapping is unverified, and `board.outline_area_mm2` is
+null when the area has not been established. Consumers must handle unknown geometry
+as unknown, not treat it as zero or as an invented proxy. The retained schema identifier
+is `aicad.boardphys/1`; this revision makes the nullable area explicit for the KiCad
+producer.
+
+The optional `board.source_path` identifies the canonical bound `.kicad_pcb` file.
+Consumers prefer this stable identity because a board document's `id` can change
+when reopened; older sidecars without `source_path` fall back to `board.id`.
+
+Engineering metadata resolution retains the provenance-bearing starter seeds for
+exact matching KiCad symbol IDs and explicitly equivalent KiCad footprint package
+IDs. This metadata enrichment does not replace native KiCad library geometry.

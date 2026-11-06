@@ -324,15 +324,14 @@ _kicad("power:+3V3", "power:+3.3V")
 _kicad("Regulator_Linear:7805", "Regulator_Linear:L7805", "Regulator_Linear:LM7805",
        "Regulator_Linear:LM7805_TO220", "Regulator_Linear:LM7805_TO263",
        "Regulator_Linear:7805_TO220")
-_kicad("Timer:NE555", "Timer:NE555P", "Timer:NE555D", "Timer:NE555N")
-# LM555 (TI/National, datasheet SNAS548) and SA555 (TI SLFS022, the same datasheet as our
-# NE555 seed in starter.py) are the BIPOLAR 555 — the same device as NE555 from another
-# vendor, exactly like the L7805/LM7805 rows above — and the datasheet DIP-8/SOIC-8 pinout is
-# identical: 1=GND, 2=TRIG, 3=OUT, 4=RESET, 5=CONT, 6=THRES, 7=DISCH, 8=VCC, which is
-# starter.py's Timer:NE555 numbering pin for pin. The permutation is spelled out anyway
-# rather than left absent, so the audit records that all EIGHT pins were checked. The CMOS
-# 555s (ICM7555/TLC555/LMC555) are different silicon and stay refused.
-_kicad("Timer:NE555", "Timer:LM555", "Timer:SA555",
+_kicad("Timer:NE555P", "Timer:NE555N")
+# LM555 (TI/National, datasheet SNAS548) and SA555 (TI SLFS022) are the
+# bipolar 555 with the same datasheet DIP-8/SOIC-8 pinout as NE555:
+# 1=GND, 2=TRIG, 3=OUT, 4=RESET, 5=CONT, 6=THRES, 7=DISCH, 8=VCC.
+# The permutation is spelled out so the audit records that all EIGHT pins
+# match the Timer:NE555P fallback, rather than leaving it implicit.
+# CMOS 555s (ICM7555/TLC555/LMC555) are different silicon and stay refused.
+_kicad("Timer:NE555P", "Timer:LM555", "Timer:SA555",
        pins={str(i): str(i) for i in range(1, 9)})
 _kicad("Sensor_Motion:MPU6050", "Sensor_Motion:MPU-6050")
 _kicad("Sensor_Pressure:BMP280", "Sensor_Pressure:BMP-280")
@@ -432,10 +431,12 @@ def resolved_pins(part_id: Any) -> list[dict] | None:
 def _tokens(libid: str) -> list[str]:
     """Searchable words in a libid: ``'RF_Module:ESP32-WROOM-32'`` -> ``['esp32', 'wroom']``.
 
-    Stopwords and fragments under 3 characters are dropped — a bare ``'32'`` or ``'rf'``
-    matches half the catalogue on substring score and would bury the real candidates."""
+    Stopwords, short fragments, and purely numeric tokens are dropped: a
+    package number alone can match unrelated manufacturers' parts. Exact
+    name matches are considered separately before keyword suggestions.
+    """
     words = [w.lower() for w in re.split(r"[^A-Za-z0-9]+", libid) if w]
-    return [w for w in words if len(w) >= 3 and w not in _STOPWORDS]
+    return [w for w in words if len(w) >= 3 and not w.isdecimal() and w not in _STOPWORDS]
 
 
 def _search_hits(query: str) -> list[dict]:

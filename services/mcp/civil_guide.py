@@ -119,10 +119,13 @@ WORKFLOWS:
      pressure and verified soil/joint data. Live water pressure is not surge.
      civil_pipe_supports(piping=..., ...) converts piping mm geometry and returns
      beam-based spacing, support reactions and rack loads with user allowables.
-     civil_fea_handoff(source='thrust'|'buried', target_doc_id, face_selector, site)
-     makes a civil_to_fea envelope, NOT an executed FEA study. Bind bearing/crown
-     faces, real material/restraints and explicit load direction/selection, then
-     execute and review static FEA. Loads are N/Pa; 1 kPa = 1000 Pa. Beam support
+     civil_fea_handoff(source='thrust'|'buried', target_doc_id=...,
+     face_selector=..., site=...) makes a civil_to_fea envelope, NOT an executed
+     FEA study. Translate each selected condition to run_fea_static loads: preserve
+     force vectors in N, divide pressure in Pa by 1,000,000 for MPa, and select the
+     bearing/crown face and appropriate sign (+ pressure acts inward, - outward).
+     Supply real material and restraints; run_fea_static has no source_handoff
+     parameter. Execute and review static FEA. 1 kPa = 1000 Pa. Beam support
      screening is not ASME sustained/expansion acceptance or a full rack analysis.
 
   7. PLANT TIE-IN COUPLING WITH PROCESS PIPING

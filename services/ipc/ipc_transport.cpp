@@ -18,6 +18,11 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#if defined(__linux__) && !defined(SO_PEERPIDFD)
+// Stable Linux UAPI value; older running kernels reject the option.
+#define SO_PEERPIDFD 77
+#endif
+
 namespace chudware_ipc {
 // SOCK_CLOEXEC and accept4() are Linux extensions; Darwin has neither. Descriptors
 // must still be close-on-exec — hostd forks agent workers, the python worker and
@@ -76,6 +81,47 @@ IpcConn& IpcConn::operator=(IpcConn&& o) noexcept {
     }
     return *this;
 }
+long IpcConn::peerPid() const {
+#if defined(__linux__)
+    if (fd_ < 0) return -1;
+    int peerFd = -1;
+    socklen_t size = sizeof(peerFd);
+    if (::getsockopt(fd_, SOL_SOCKET, SO_PEERPIDFD, &peerFd, &size) != 0 ||
+        size != sizeof(peerFd) || peerFd < 0) {
+        if (peerFd >= 0) ::close(peerFd);
+        return -1;
+    }
+    // SO_PEERCRED alone names a PID at connect time, even if that process has
+    // since died and its PID was reused. The peer pidfd refers to that original
+    // process; a readable pidfd means it is no longer alive.
+    struct pollfd pfd {peerFd, POLLIN, 0};
+    const int exited = ::poll(&pfd, 1, 0);
+    ::close(peerFd);
+    if (exited != 0) return -1;
+    struct ucred peer {};
+    size = sizeof(peer);
+    if (::getsockopt(fd_, SOL_SOCKET, SO_PEERCRED, &peer, &size) == 0 &&
+        size == sizeof(peer) && peer.pid > 0)
+        return static_cast<long>(peer.pid);
+#endif
+    return -1;
+}
+
+bool IpcConn::peerDisconnected() const {
+    if (fd_ < 0 || eof()) return true;
+    short events = 0;
+#ifdef POLLRDHUP
+    events |= POLLRDHUP;
+#endif
+    pollfd p{fd_, events, 0};
+    if (::poll(&p, 1, 0) <= 0) return false;
+    short closed = POLLHUP | POLLERR | POLLNVAL;
+#ifdef POLLRDHUP
+    closed |= POLLRDHUP;
+#endif
+    return (p.revents & closed) != 0;
+}
+
 
 void IpcConn::close() {
     if (fd_ >= 0) {
@@ -143,11 +189,26 @@ bool IpcConn::readLine(std::string& line, int timeoutMs) {
 
 bool IpcConn::writeLine(const std::string& line) {
     if (fd_ < 0) return false;
+    // The GUI does not ignore SIGPIPE like hostd does. A daemon socket can
+    // close between any liveness check and this write; report that as EOF
+    // instead of terminating the whole GUI and all of its conversations.
+#if defined(MSG_NOSIGNAL)
+    constexpr int sendFlags = MSG_NOSIGNAL;
+#elif defined(SO_NOSIGPIPE)
+    const int noSigPipe = 1;
+    if (::setsockopt(fd_, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, sizeof noSigPipe) != 0) {
+        eof_.store(true, std::memory_order_release);
+        return false;
+    }
+    constexpr int sendFlags = 0;
+#else
+    constexpr int sendFlags = 0;
+#endif
     std::string out = line;
     out.push_back('\n');
     size_t off = 0;
     while (off < out.size()) {
-        ssize_t n = ::write(fd_, out.data() + off, out.size() - off);
+        ssize_t n = ::send(fd_, out.data() + off, out.size() - off, sendFlags);
         if (n > 0) {
             off += (size_t)n;
         } else if (errno == EINTR) {
@@ -308,7 +369,8 @@ void IpcListener::close(bool unlink_path) {
     path_.clear();
 }
 
-IpcConn connectTo(const std::string& path, std::string& err) {
+IpcConn connectTo(const std::string& path, std::string& err,
+                  const std::atomic<bool>* cancelled) {
     int fd = cloexecSocket();
     if (fd < 0) {
         err = std::string("socket: ") + std::strerror(errno);
@@ -317,12 +379,41 @@ IpcConn connectTo(const std::string& path, std::string& err) {
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
     std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
-    if (::connect(fd, (sockaddr*)&addr, sizeof addr) != 0) {
-        err = "connect " + path + ": " + std::strerror(errno);
+    // Always non-blocking: a blocking AF_UNIX connect() sleeps forever once the
+    // listener's accept backlog is full (a daemon wedged mid-shutdown keeps its
+    // listen fd open), and callers hold client mutexes across this call.
+    const int flags = ::fcntl(fd, F_GETFL);
+    if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        err = std::string("fcntl: ") + std::strerror(errno);
         ::close(fd);
         return IpcConn();
     }
-    return IpcConn(fd);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    for (;;) {
+        if (cancelled && cancelled->load(std::memory_order_acquire)) {
+            err = "aborted";
+            ::close(fd);
+            return IpcConn();
+        }
+        if (::connect(fd, (sockaddr*)&addr, sizeof addr) == 0 || errno == EISCONN) {
+            ::fcntl(fd, F_SETFL, flags);
+            return IpcConn(fd);
+        }
+        if (errno != EAGAIN && errno != EINPROGRESS && errno != EALREADY &&
+            errno != EINTR) {
+            err = "connect " + path + ": " + std::strerror(errno);
+            ::close(fd);
+            return IpcConn();
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            err = "connect " + path + ": timed out";
+            ::close(fd);
+            return IpcConn();
+        }
+        // AF_UNIX returns EAGAIN when the accept backlog is full; retry the
+        // connect rather than mistaking writable for a completed handshake.
+        ::poll(nullptr, 0, 20);
+    }
 }
 
 }  // namespace chudware_ipc

@@ -872,6 +872,80 @@ TEST_CASE("stepplus native relocation preserves models and rebases mapped and re
     CHECK(chudware::doc::stepplus_open(new_assembly.string()).extra.at("future/payload.bin") == unknown);
 }
 
+TEST_CASE("native relocation reports direct reference availability after the batch") {
+    using chudware::doc::native_file_operations;
+    NativeFileFixture fixture;
+    const auto assembly_path = fixture.root / "assembly.step+";
+    const auto part_path = fixture.root / "part.step+";
+    const auto destination = fixture.root / "archive" / "assembly.step+";
+    const auto part_destination = fixture.root / "archive" / "part.step+";
+    const auto future_destination = fixture.root / "archive" / "future.step+";
+    const json assembly{
+        {"schema", "aicad.asm/1"}, {"name", "Neutral"},
+        {"components", json::array({
+            {{"id", "k1"}, {"source", {{"path", "part.step+"}}}},
+            {{"id", "k2"}, {"source", {{"path", "missing.step"}}}}})},
+        {"features", json::array({
+            {{"id", "f1"}, {"type", "import"},
+             {"params", {{"source_path", "historical.step"}, {"embedded_brep", "embedded"}}}}})},
+        {"meta", {{"source_path", "documentary.step"}}}};
+    chudware::doc::stepplus_save(assembly, assembly_path.string(), {});
+    const auto original = native_file_bytes(assembly_path);
+    json entries = json::array({{{"path", assembly_path.string()}, {"destination", destination.string()}}});
+    json path_map = json::object();
+    std::size_t expected_missing = 2;
+    bool first_source_exists = false;
+    SUBCASE("two missing references do not prevent the copy") {}
+    SUBCASE("a target published by a later entry is available") {
+        const json part{{"schema", "aicad.part/1"}, {"name", "Part"}, {"features", json::array()}};
+        chudware::doc::stepplus_save(part, part_path.string(), {});
+        entries.push_back({{"path", part_path.string()}, {"destination", part_destination.string()}});
+        first_source_exists = true;
+        expected_missing = 1;
+    }
+    SUBCASE("a mapping for a later batch is not a published target") {
+        const json part{{"schema", "aicad.part/1"}, {"name", "Part"}, {"features", json::array()}};
+        chudware::doc::stepplus_save(part, part_path.string(), {});
+        path_map[part_path.string()] = future_destination.string();
+        first_source_exists = true;
+    }
+    const auto result = native_file_operations(
+        {{"action", "relocate"}, {"entries", entries}, {"path_map", path_map}});
+    REQUIRE_MESSAGE(result.value("ok", false), result.dump());
+    CHECK(fs::exists(destination));
+    CHECK(native_file_bytes(assembly_path) == original);
+    const auto& availability = result.at("direct_reference_availability");
+    CHECK(availability["required_count"] == 2);
+    CHECK(availability["missing_count"] == expected_missing);
+    CHECK(availability["unknown_count"] == 0);
+    CHECK(result.contains("direct_reference_warning"));
+    const auto& rewrites = result["files"][0]["dependency_rewrites"];
+    REQUIRE(rewrites.size() == 3);
+    CHECK(rewrites[0]["exists"] == first_source_exists);
+    CHECK(rewrites[0]["destination_exists"] == (expected_missing == 1));
+    CHECK(rewrites[1]["destination_exists"] == false);
+    CHECK(rewrites[2]["required"] == false);
+    CHECK(rewrites[2]["destination_exists"] == false);
+}
+
+TEST_CASE("native relocation does not require embedded or documentary provenance") {
+    NativeFileFixture fixture;
+    const auto source = fixture.root / "source.step+";
+    const auto destination = fixture.root / "copy.step+";
+    const json part{{"schema", "aicad.part/1"}, {"name", "Neutral"},
+        {"features", json::array({{{"id", "f1"}, {"type", "import"},
+            {"params", {{"source_path", "missing.step"}, {"embedded_brep", "embedded"}}}}})},
+        {"meta", {{"source_path", "old-history.step"}}}};
+    chudware::doc::stepplus_save(part, source.string(), {});
+    const auto result = chudware::doc::native_file_operations(
+        {{"action", "relocate"},
+         {"entries", json::array({{{"path", source.string()}, {"destination", destination.string()}}})}});
+    REQUIRE_MESSAGE(result.value("ok", false), result.dump());
+    CHECK(result["direct_reference_availability"]["required_count"] == 0);
+    CHECK(result["direct_reference_availability"]["missing_count"] == 0);
+    CHECK_FALSE(result.contains("direct_reference_warning"));
+}
+
 TEST_CASE("stepplus relocation preserves Unicode paths despite unrelated Unicode siblings") {
     using namespace chudware::doc;
     using native_policy::path_utf8;

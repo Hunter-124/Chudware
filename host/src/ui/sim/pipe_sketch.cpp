@@ -536,7 +536,7 @@ bool SketchTool::handle(AppState& st,PipingPanel& panel,MeshCache& mesh,const si
                     points_.push_back(cursor_); numeric_=false; numberLength_=0; number_[0]='\0';
                 }
             } else {
-                const bool finishKey=ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsMouseClicked(ImGuiMouseButton_Right);
+                const bool finishKey=ImGui::IsKeyPressed(ImGuiKey_Enter) || ui::rightClickReleased();
                 if(finishKey) finish(st,panel);
                 else if(click && haveCursor_) {
                     consumed=true;

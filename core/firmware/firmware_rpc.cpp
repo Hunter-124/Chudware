@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include "ecad/session.h"
 
 #include "firmware/coverify.h"
 #include "firmware/emulator.h"
@@ -52,11 +53,22 @@ nlohmann::json rpc_new_project(const nlohmann::json& params) {
     std::string toolchain = jstr(params, "toolchain");
     if (toolchain.empty()) toolchain = "cmake";
     std::string board_ref = jstr(params, "board_doc_ref");
+    std::string persistent_board_ref = board_ref;
+    if (board_ref.rfind("ecadcpp", 0) == 0) {
+        try {
+            const auto info = chudware::ecad::session_file_info(board_ref, false);
+            const std::string path = info.value("path", std::string());
+            if (!info.value("dirty", false) && !path.empty())
+                persistent_board_ref = fs::absolute(fs::u8path(path)).lexically_normal().u8string();
+        } catch (const chudware::ecad::OpError&) {
+            // Leave unknown, dirty, and unbound sessions as live references.
+        }
+    }
 
     Project project;
     try {
-        project = new_project(board_ref.empty() ? std::optional<std::string>()
-                                                : std::optional<std::string>(board_ref),
+        project = new_project(persistent_board_ref.empty() ? std::optional<std::string>()
+                                       : std::optional<std::string>(persistent_board_ref),
                               mcu, toolchain, name);
     } catch (const std::invalid_argument& e) {
         return err_env("invalid_request", e.what());

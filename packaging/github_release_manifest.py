@@ -11,8 +11,8 @@ SHA-256 and the Ed25519 signature over
 
     chudware-artifact-v1 \\0 key_id \\0 version \\0 platform \\0 arch \\0 sha256
 
-against the public keys in core/security/release_keys.h. ``min_supported`` and
-``notes_url`` are not covered by the signature.
+against the public keys in core/security/release_keys.h. ``notes_url`` is not
+covered by the signature.
 
 The signing seed is read from CHUDWARE_RELEASE_SIGNING_KEY, the same canonical
 base64 32-byte Ed25519 seed packaging/ci_sign.py consumes. The produced signature
@@ -65,7 +65,6 @@ def manifest_name(platform: str, arch: str) -> str:
 def _validate(args: argparse.Namespace) -> None:
     try:
         split_version(args.version)
-        split_version(args.min_supported)
     except ValueError as exc:
         raise SigningError(str(exc)) from exc
     if not _REPO_RE.fullmatch(args.repo):
@@ -115,7 +114,6 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
     tag = urllib.parse.quote(args.tag, safe="")
     return {
         "version": args.version,
-        "min_supported": args.min_supported,
         "platform": args.platform,
         "arch": args.arch,
         "key_id": args.key_id,
@@ -147,8 +145,6 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--tag", required=True, help="GitHub release tag the asset is attached to")
     ap.add_argument("--repo", default=DEFAULT_REPO, help=f"OWNER/REPO (default {DEFAULT_REPO})")
     ap.add_argument("--key-id", default=DEFAULT_KEY_ID, help=f"release key id (default {DEFAULT_KEY_ID})")
-    ap.add_argument("--min-supported", default="0.0.0",
-                    help="oldest version allowed to keep running without updating (default 0.0.0)")
     ap.add_argument("--notes-url", help="release notes URL (default: the release page)")
     ap.add_argument("--output-dir", type=Path, help="default: the artifact's directory")
     return ap

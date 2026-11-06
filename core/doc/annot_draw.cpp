@@ -1403,13 +1403,14 @@ json compile_hatch(const json& polygon, const json& style) {
             ts.reserve(poly.size());
             for (size_t i = 0; i < poly.size(); ++i) {
                 P2 q0 = poly[i], q1 = poly[(i + 1) % poly.size()];
-                P2 edge = sub(q1, q0);
-                double den = dir[0] * (-edge[1]) - dir[1] * (-edge[0]);
-                if (std::fabs(den) < 1e-12) continue;
-                P2 rhs = sub(q0, base);
-                double t = (rhs[0] * (-edge[1]) - rhs[1] * (-edge[0])) / den;
-                double edge_t = (dir[0] * rhs[1] - dir[1] * rhs[0]) / den;
-                if (edge_t >= -1e-9 && edge_t <= 1.0 + 1e-9) ts.push_back(t);
+                const double c0 = dot(q0, nrm), c1 = dot(q1, nrm);
+                // Count a shared vertex once, not once for each incident edge.
+                // This also handles the coincident, oppositely directed bridges
+                // that encode a section face's inner wires in its polygon.
+                if (!((c0 <= off && off < c1) || (c1 <= off && off < c0)))
+                    continue;
+                const double fraction = (off - c0) / (c1 - c0);
+                ts.push_back(dot(q0, dir) + fraction * dot(sub(q1, q0), dir));
             }
             std::sort(ts.begin(), ts.end());
             for (size_t i = 0; i + 1 < ts.size(); i += 2)

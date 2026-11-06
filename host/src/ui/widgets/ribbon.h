@@ -4,10 +4,17 @@
 #pragma once
 
 #include "imgui.h"
+#include "../ribbon_def.h"
 #include <functional>
 #include <string>
 
 namespace ui {
+
+// Updated once before rendering; dispatch must construct a fresh context before acting.
+void setRibbonCommandContext(const CommandContext& context);
+void setRibbonCommandContext(CommandContext&& context);
+CommandAvailability ribbonCommandAvailability(const char* cmdId);
+
 
 // Register the command-dispatch callback (called once at startup).
 // Default handler logs "[ribbon] <cmd_id>" to stdout.
@@ -37,24 +44,6 @@ void setRibbonSketch3DActive(bool active);
 // call-site in app.cpp; ribbon.cpp defaults to Model so the band builds without the wire.
 void setRibbonWorkspace(int workspace);
 
-// sim-gui: dynamically disable every command whose cmd_id starts with `prefix` — the buttons
-// render in the disabled ghost state and their tooltip shows `reason` (instead of the static
-// "Coming soon"). Pass ""/nullptr as prefix to clear. Used by SimManager to grey the EM tab's
-// tools while the em_* electromagnetics solver backend is not installed. Sticky until changed.
-void setRibbonDisabledPrefix(const char* prefix, const char* reason);
-
-// Human mutation commands are disabled while an agent edits the active document.
-// Refresh before drawRibbon each frame; pass "" to clear. Keep-style session exits remain enabled.
-void setRibbonAgentLockReason(const char* reason);
-
-// Simulate study context: the SELECTED study's type key (SimManager's studyTypeKey: "static",
-// "modal", "buckling", "contact", "freq_response", "fatigue", "thermal", "thermal_fea", "flow",
-// "motion", "topology"), or "" when no study is selected. Call every frame (SimManager::tick);
-// the context expires when it is not refreshed (no CAD document active). The study tabs then
-// grey the commands that do not apply to that study (tooltip says why) and show the setup rows
-// of study types that share a tab (Buckling / Contact on Static, Vibration on Modal) only while
-// such a study is selected. See ribbonStudyGate (ribbon_def.h).
-void setRibbonStudyContext(const char* studyTypeKey);
 
 // --- Ribbon layout helpers --------------------------------------------------
 

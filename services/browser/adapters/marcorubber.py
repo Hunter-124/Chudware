@@ -52,6 +52,11 @@ _CARD_RE = re.compile(
 
 class MarcoRubberAdapter(RetailAdapter):
     key = SITE
+    hosts = ("www.marcorubber.com",)
+    result_kinds = ("page",)
+    cad_acquisition = False
+    login_required = False
+    api = False
     base_url = BASE_URL
     search_url_tmpl = SEARCH_URL_TMPL
     license_note = LICENSE_NOTE
@@ -69,7 +74,7 @@ class MarcoRubberAdapter(RetailAdapter):
             if not title:
                 continue
             seen.add(url)
-            hits.append({"ok": True, "title": title, "url": url, "site": SITE})
+            hits.append({"ok": True, "title": title, "url": url, "site": SITE, "kind": "page"})
         return hits
 
 

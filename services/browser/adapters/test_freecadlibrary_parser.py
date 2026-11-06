@@ -14,7 +14,9 @@ Offline style mirrors test_cui_parser.py: session.browser_fetch monkeypatched.
 """
 from __future__ import annotations
 
-import importlib
+import json
+import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -60,19 +62,12 @@ FCL_TREE_HTML = r"""<html><head></head><body><pre>{
 
 @pytest.fixture()
 def fcl_mod(tmp_path, monkeypatch):
-    monkeypatch.setenv("APPDATA", str(tmp_path))
-    from services import paths as engine_paths
-    importlib.reload(engine_paths)
-    from services.browser import profiles, session
-    importlib.reload(profiles)
-    importlib.reload(session)
-    from services.browser import adapters as adapters_pkg
-    importlib.reload(adapters_pkg)
+    from services import paths
+    from services.browser import session
     from services.browser.adapters import freecadlibrary
-    importlib.reload(freecadlibrary)
-    yield session, freecadlibrary
-    monkeypatch.delenv("APPDATA", raising=False)
-    importlib.reload(engine_paths)
+
+    monkeypatch.setattr(paths, "BROWSER_DOWNLOADS", tmp_path / "downloads")
+    return session, freecadlibrary
 
 
 def test_fcl_search_filters_tree_by_filename(fcl_mod, monkeypatch):
@@ -84,7 +79,9 @@ def test_fcl_search_filters_tree_by_filename(fcl_mod, monkeypatch):
 
     # Two .step screws match; the .FCStd sink and the tree dir are excluded.
     assert len(hits) == 2
-    assert all(h["ok"] is True and h["site"] == "freecadlibrary" for h in hits)
+    assert all(h["kind"] == "model" and h["site"] == "freecadlibrary" for h in hits)
+    assert all(h["model"] == {"available": True, "formats": ["step"]} for h in hits)
+    assert all(h["thumbnail"] is None and h["price"] is None for h in hits)
 
     first = hits[0]
     assert first["title"] == "servo-screw-1.7x6.2mm.step"
@@ -112,3 +109,99 @@ def test_fcl_search_no_match_is_honest(fcl_mod, monkeypatch):
     monkeypatch.setattr(session, "browser_fetch",
                         lambda url, s: {"ok": True, "content": FCL_TREE_HTML})
     assert fcl.ADAPTER.search("nonexistentwidget") == []
+
+
+def test_fcl_search_previews_are_associated_by_exact_basename(fcl_mod, monkeypatch):
+    session, fcl = fcl_mod
+    # Paths observed in the live recursive GitHub tree; only the first has a preview.
+    folder = "Architectural Parts/Living room/"
+    paths = [folder + "FCBL_table_parametric.FCStd", folder + "FCBL_table_parametric.png",
+             folder + "FCBL_table_other.FCStd"]
+    payload = {"tree": [{"type": "blob", "path": path} for path in paths], "truncated": False}
+    monkeypatch.setattr(session, "browser_fetch",
+                        lambda *_: {"ok": True, "content": json.dumps(payload)})
+    hits = fcl.ADAPTER.search("table")
+    assert len(hits) == 2
+    assert hits[0]["thumbnail"] == (
+        "https://raw.githubusercontent.com/FreeCAD/FreeCAD-library/master/"
+        "Architectural%20Parts/Living%20room/FCBL_table_parametric.png")
+    assert hits[0]["model"]["formats"] == ["fcstd"]
+    assert hits[1]["thumbnail"] is None
+
+
+def test_fcl_recovers_from_truncated_tree(fcl_mod, monkeypatch):
+    session, fcl = fcl_mod
+    first_sha, nested_sha = "a" * 40, "b" * 40
+    responses = {
+        fcl.SEARCH_URL_TMPL: {"tree": [], "truncated": True},
+        fcl._TREE_URL + "master": {
+            "tree": [{"type": "tree", "path": "Mechanical Parts", "sha": first_sha}],
+            "truncated": False},
+        fcl._TREE_URL + first_sha + "?recursive=1": {"tree": [], "truncated": True},
+        fcl._TREE_URL + first_sha: {
+            "tree": [{"type": "tree", "path": "Screws", "sha": nested_sha}], "truncated": False},
+        fcl._TREE_URL + nested_sha + "?recursive=1": {
+            "tree": [{"type": "blob", "path": "part.step"},
+                     {"type": "blob", "path": "part.png"}], "truncated": False},
+    }
+    calls = []
+
+    def fetch(url, site):
+        calls.append(url)
+        return {"ok": True, "content": json.dumps(responses[url])}
+
+    monkeypatch.setattr(session, "browser_fetch", fetch)
+    hits = fcl.ADAPTER.search("part")
+    assert len(hits) == 1 and hits[0]["path"] == "Mechanical Parts/Screws/part.step"
+    assert hits[0]["thumbnail"].endswith("/Mechanical%20Parts/Screws/part.png")
+    assert calls == list(responses)
+
+
+def test_fcl_failed_subtree_never_looks_like_empty_search(fcl_mod, monkeypatch):
+    session, fcl = fcl_mod
+    failure = {"ok": False, "site": fcl.SITE, "op": "fetch", "reason": "rate_limited"}
+
+    def fetch(url, site):
+        if url == fcl.SEARCH_URL_TMPL:
+            return {"ok": True, "content": '{"tree":[],"truncated":true}'}
+        return failure
+
+    monkeypatch.setattr(session, "browser_fetch", fetch)
+    assert fcl.ADAPTER.search("anything") == [failure]
+    monkeypatch.setattr(session, "browser_fetch", lambda *_: {"ok": True, "content": "not JSON"})
+    assert fcl.ADAPTER.search("anything")[0]["reason"] == "parse_failed"
+
+
+def test_fcl_validates_and_preserves_existing_cad_on_bad_download(fcl_mod, monkeypatch):
+    session, fcl = fcl_mod
+    url = fcl._blob_url("Electrical Parts/Servos/example.step")
+    content = [b"ISO-10303-21;\nHEADER;\nENDSEC;\nEND-ISO-10303-21;\n"]
+
+    def download(raw_url, site, dest):
+        dest.write_bytes(content[0])
+        return {"ok": True, "dest": str(dest), "session_profile_used": site}
+
+    monkeypatch.setattr(session, "browser_download", download)
+    acquired = fcl.ADAPTER.acquire({"url": url})
+    assert acquired["ok"] and acquired["artifact_kind"] == "cad" and acquired["format"] == "step"
+    saved = Path(acquired["artifact_path"])
+    assert saved.read_bytes() == content[0]
+    content[0] = b"<html>not a model</html>"
+    assert fcl.ADAPTER.acquire({"url": url})["reason"] == "parse_failed"
+    assert saved.read_bytes().startswith(b"ISO-10303-21;")
+    assert fcl.ADAPTER.acquire({"url": url, "format": "iges"})["reason"] == "unsupported"
+    assert fcl.ADAPTER.acquire({"raw_url": "https://evil.example/part.step"})["reason"] == "unsupported"
+
+
+def test_fcl_validates_native_freecad_files(fcl_mod, monkeypatch):
+    session, fcl = fcl_mod
+
+    def download(url, site, dest):
+        with zipfile.ZipFile(dest, "w") as archive:
+            archive.writestr("Document.xml", "<Document><Objects/></Document>")
+        return {"ok": True, "dest": str(dest)}
+
+    monkeypatch.setattr(session, "browser_download", download)
+    acquired = fcl.ADAPTER.acquire({"url": fcl._blob_url("sample.FCStd")})
+    assert acquired["ok"] and acquired["artifact_kind"] == "cad" and acquired["format"] == "fcstd"
+    assert zipfile.is_zipfile(acquired["artifact_path"])

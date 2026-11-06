@@ -4,7 +4,7 @@ Each browser frame is parsed as one strict JSON-RPC object, admitted only if
 contracts/cell_methods.json allows the method for the principal's right, and
 forwarded to the cell's hostd as one newline-delimited line. Replies and events
 from the cell are re-validated before they reach the browser; document events
-are forwarded only for documents this connection opened.
+require an opened document except explicit workspace-visible presentation requests.
 """
 from __future__ import annotations
 
@@ -40,8 +40,8 @@ _MESH_GRANT_TTL = 24 * 60 * 60
 _MESH_GRANT_LIMIT = 8192
 _mesh_grants_lock = threading.Lock()
 _mesh_grants: OrderedDict[tuple[str, str], tuple[float, Path | None, str]] = OrderedDict()
-_DOC_EVENTS = frozenset({"doc.opened", "doc.changed", "doc.closed", "doc.lease_change",
-                         "doc.studies_changed", "doc.history_cleared"})
+_DOC_EVENTS = frozenset({"doc.opened", "doc.changed", "doc.presented", "doc.closed",
+                         "doc.lease_change", "doc.studies_changed", "doc.history_cleared"})
 _ACTOR_EVENTS = frozenset({"agent.event", "agent.message", "agent.tool_call", "agent.context",
                           "agent.question", "agent.answer", "agent.steer", "agent.provider_usage",
                           "agent.session", "agent.spawn", "agent.model_assignment",
@@ -172,7 +172,7 @@ def _mesh_location(principal, path):
     if not isinstance(path, str):
         return None, ""
     if re.fullmatch(r"/state/mesh/[0-9a-f]{32}\.aicm", path):
-        return settings.cells_root / principal.cell_id / "state" / "mesh", Path(path).name
+        return cells.state_root(principal) / "mesh", Path(path).name
     relative = path[len("/work/"):] if path.startswith("/work/") else path
     if relative.startswith("/") or "\\" in relative or any(p in {"", ".", ".."} for p in relative.split("/")):
         return None, ""
@@ -327,7 +327,11 @@ async def engine_ws(ws: WebSocket):
                 inherited_doc = ""
                 if "event" in reply:
                     data = reply["data"]
-                    if reply["event"] in _DOC_EVENTS and data["doc_id"] not in docs:
+                    # The cell is already bound to this authenticated workspace.
+                    # Presentation, like doc_list, may reveal a workspace document
+                    # before it is opened; all other doc events require an open doc.
+                    if (reply["event"] in _DOC_EVENTS and reply["event"] != "doc.presented"
+                            and data["doc_id"] not in docs):
                         continue
                     if reply["event"] in _ACTOR_EVENTS and data.get("actor_key", principal.actor_key) != principal.actor_key:
                         continue

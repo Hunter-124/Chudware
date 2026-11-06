@@ -262,3 +262,47 @@ Accepted `mfg_device_subscribe` and `mfg_event_subscribe` calls establish subscr
 normal worker request, that lane may emit event lines after the accepting call's final response, for
 its lifetime. A client declaring `client:"observer"` can subscribe/read but reaches no write dispatch
 path and can never own a command lease.
+
+## 12. Print-only delivery safety amendment (2026-10-28)
+
+`services/manufacturing/print_safety.py` defines the shared print-file boundary for slicer
+configuration, G-code verification, removable-media publication and printer adapter uploads.
+Only inspectable UTF-8 text `.gcode`, `.gco` and `.g` files are admitted. Firmware image
+filenames and binary G-code are not print jobs. Known built-in firmware-update, persistent
+settings and media-write commands are refused, including `M28`, `M29`, `M500`, `M502`, `M559`,
+`M560`, `M993`, `M994`, `M997`, `SAVE_CONFIG`, `FIRMWARE_RESTART` and `UPDATE_FIRMWARE`.
+This is not certification of arbitrary user-defined macros or pre-existing remote file contents.
+
+Refusals use the existing failure envelopes: `unsafe_print_file` for G-code checks/source
+jobs, and `UnsafePrintFile` (`ValueError`) at the adapter boundary, translated by worker RPC.
+`user_override` applies only to printability findings, never to firmware maintenance.
+Slicing refuses nonempty `post_process` hooks (`unsafe_post_process`) and unsafe output
+filenames before launching PrusaSlicer.
+
+Media inventory reports `firmware_files_present` for root-level `.bin`, `.hex`, `.elf`, `.uf2`
+and `.dfu` entries, independently of pagination. Such media is not reconciled; publication
+refuses before recovery or file replacement. These entries are never automatically removed.
+Printer start requests reject non-text-G-code remote filenames. Separate explicit firmware
+development APIs are unchanged; a printing request does not authorize using them.
+
+## 13. Print artifact alias safety amendment (2026-10-28)
+
+The print-only boundary includes auxiliary artifacts, not just selectable G-code.
+`validate_output_path` checks the final entry before resolving its parent: final symlinks,
+multiply-linked regular files and special files are refused. Existing directories are
+allowed for work-directory validation; ordinary parent-directory aliases remain supported.
+`atomic_print_output` writes a same-directory `.part` temporary, checks the destination
+again, then replaces it without opening the final path for writing. It removes its temporary
+on failure. This is not a guarantee against concurrent replacement of parent directories.
+
+Slicer configuration, Python-written slicing meshes and print manifests use that writer.
+Native engine STL-export destinations are checked before dispatch. G-code, 3MF, workdir,
+datadir and Windows log destinations are checked before the external slicer launches.
+External slicer G-code/3MF exports write private same-filesystem `.part` files and publish
+by replacement, never by opening the requested final path.
+
+Root firmware-image detection removes trailing spaces/dots before checking suffixes, so
+FAT aliases such as `UPDATE.BIN. ` are also `firmware_files_present`. Journal validation
+rejects firmware-looking paths, including staged and held artifacts, before recovery.
+Recovery checks staged path components for symlinks before mutation. Unknown media files
+remain untouched; harmless JSON/TXT metadata and `.part` staging are not firmware images.

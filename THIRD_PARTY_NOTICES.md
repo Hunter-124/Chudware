@@ -29,9 +29,10 @@ tracked in [`contracts/license_debt.md`](contracts/license_debt.md).
 | [`LICENSE`](LICENSE) | Chudware (MIT) |
 | [`assets/fonts/OFL.txt`](assets/fonts/OFL.txt) | Rubik and JetBrains Mono (also the copies in `website/public/fonts/`) |
 | [`assets/fonts/LICENSE-DejaVu.txt`](assets/fonts/LICENSE-DejaVu.txt) | `assets/fonts/CADSymbols.ttf` (DejaVu, Bitstream Vera and Arev notices) |
+| [`assets/dict/LICENSE-SCOWL.txt`](assets/dict/LICENSE-SCOWL.txt) | `assets/dict/en_US.txt` (SCOWL and the sources it incorporates) |
 | [`extern/glad/LICENSE`](extern/glad/LICENSE) | glad-generated OpenGL loader and `KHR/khrplatform.h` |
 | [`host/extern/mapbox/LICENSE`](host/extern/mapbox/LICENSE) | `earcut.hpp` |
-| [`vendor/chudcode/CHUDCODE-NOTICE`](vendor/chudcode/CHUDCODE-NOTICE), [`vendor/chudcode/CHUDCODE-THIRD-PARTY-NOTICES.txt`](vendor/chudcode/CHUDCODE-THIRD-PARTY-NOTICES.txt) | The Chudcode agent runtime binary and everything it embeds (Bun runtime, bundled packages, fonts, native GUI and speech components) |
+| [`vendor/omp/OMP-LICENSE`](vendor/omp/OMP-LICENSE), [`vendor/omp/OMP-THIRD-PARTY-NOTICES.txt`](vendor/omp/OMP-THIRD-PARTY-NOTICES.txt) | Official OMP agent runtime and its bundled dependencies |
 | `core/firmware/renode/TimedSTM32CAN.cs`, `core/firmware/templates_embedded.cpp` | Renode-derived material (MIT text inline) |
 | `services/civil/data/epanet_net1.inp` | EPANET, WNTR and NumPy notices (inline) |
 | [License texts for adapted code](#license-texts-for-adapted-code) (below) | NumPy, PCG64, Julia and ezdxf code adapted into first-party files |
@@ -69,21 +70,23 @@ tracked in [`contracts/license_debt.md`](contracts/license_debt.md).
 | Chromium (inside CEF) | 149.0.7827.201 | BSD-3-Clause, plus the licenses listed in the CEF distribution's `CREDITS.html` | prebuilt, fetched at build with CEF | https://www.chromium.org/ |
 | coi-serviceworker | 0.1.7 | MIT | vendored (`host/wasm/coi-serviceworker.js`) | https://github.com/gzuidhof/coi-serviceworker |
 | libcurl | build-host version | curl | system library | https://curl.se/ |
+| libzstd | system version | BSD-3-Clause | optional system shared library, loaded through Python ctypes for SPZ v4 | https://github.com/facebook/zstd |
 | Linux runtime libraries (libstdc++, libgcc, libgomp, X11/Wayland client libraries, zlib, and the rest of the dependency closure) | build-host versions | per distribution package (libstdc++, libgcc, libgomp: GPL-3.0-or-later WITH GCC-exception-3.1) | system libraries bundled in the Linux AppImage | the build host's distribution |
-| Emscripten runtime (musl libc, libc++, libc++abi, compiler-rt) | the building developer's `emsdk` | MIT OR NCSA (Emscripten); MIT (musl); Apache-2.0 WITH LLVM-exception (LLVM runtimes) | linked into the experimental WASM web client | https://emscripten.org/ |
+| Emscripten runtime (musl libc, libc++, libc++abi, compiler-rt) | 6.0.3 in the browser container; otherwise the building developer's `emsdk` | MIT OR NCSA (Emscripten); MIT (musl); Apache-2.0 WITH LLVM-exception (LLVM runtimes) | linked into the experimental WASM web client; toolchain image `emscripten/emsdk:6.0.3` is build-only | https://emscripten.org/ |
 
-## 2. Agent runtime (Chudcode)
+## 2. Agent runtime (Oh My Pi)
 
-Chudcode is a public, MIT-licensed agent runtime that Chudware runs as a separate process.
-Its notices are hash-locked by `vendor/chudcode/CHUDCODE_ARTIFACT.lock` and shipped with every
-desktop and web payload.
+The optional native online-agent runtime is the official MIT-licensed Oh My Pi,
+run as a separate process. Source revision, native binary URLs and SHA-256 digests,
+and notice digests are recorded in `vendor/omp/OMP_ARTIFACT.lock`. Preserve both
+locked notices with any payload containing the runtime. The recommended browser
+container ships neither the binary nor the optional SDK.
 
 | Component | Version | License (SPDX) | How incorporated | Upstream |
 |---|---|---|---|---|
-| Chudcode (`chud` binary) | 0.4.3, commit `2eaba2f4606984172f31f108459d9529d4ee5e38` | MIT | prebuilt binary downloaded from the project's GitHub releases at packaging/provisioning time, SHA-256 verified; subprocess over RPC | repository and release URLs recorded in `vendor/chudcode/CHUDCODE_ARTIFACT.lock` |
-| Oh My Pi (modified by Chudcode) | as included in Chudcode 0.4.3 | MIT | inside the Chudcode binary | https://github.com/can1357/oh-my-pi |
-| Bun runtime, bundled packages and fonts | as included in Chudcode 0.4.3 | see `vendor/chudcode/CHUDCODE-THIRD-PARTY-NOTICES.txt` | inside the Chudcode binary | see the notices file |
-| chudcode-rpc | 0.3.1 | MIT | Python runtime package, built from the Chudcode repository at the locked commit | same lock file |
+| Oh My Pi (`omp`) | 18.13.3, commit `413d278a87a69b453efabf8d1fedb9940385e8c6` | MIT | pinned prebuilt executable, separate RPC subprocess | https://github.com/can1357/oh-my-pi |
+| Bundled runtime and packages | as included in OMP 18.13.3 | see `vendor/omp/OMP-THIRD-PARTY-NOTICES.txt` | inside the executable | see locked notices |
+| omp-rpc | 0.1.0 | MIT | Python SDK built from the immutable hash-pinned upstream source archive in `requirements.txt` | https://github.com/can1357/oh-my-pi |
 
 ## 3. Python runtime packages (`requirements.txt`)
 
@@ -92,6 +95,10 @@ confirmed: *metadata* = read from the installed package's metadata in a developm
 (the inspected version may differ slightly from the pin); *PyPI* = the PyPI metadata for the pinned
 version; *repository* = the upstream source repository; *requirements* = only stated in a
 `requirements.txt` comment and not otherwise verified.
+
+The browser container installs these requirements except the optional
+`omp-rpc` source-archive dependency. Their presence does not imply that optional external
+programs, separately installed models or browser-incompatible features are provided.
 
 | Package | Version | License (SPDX) | Basis | Notes |
 |---|---|---|---|---|
@@ -112,7 +119,7 @@ version; *repository* = the upstream source repository; *requirements* = only st
 | opencv-python-headless | 5.0.0.93 | Apache-2.0 | metadata | Wheels bundle FFmpeg under LGPL-2.1-or-later (per upstream) |
 | pycolmap | 3.13.0 | BSD-3-Clause | PyPI | |
 | mcp | 1.28.1 | MIT | metadata | |
-| chudcode-rpc | 0.3.1 | MIT | metadata | See section 2 |
+| omp-rpc | 0.1.0 | MIT | requirements | SHA-256-pinned upstream source archive; see section 2 |
 | anthropic | 0.107.1 | MIT | PyPI | |
 | openai | 2.41.0 | Apache-2.0 | metadata | |
 | httpx | 0.28.1 | BSD-3-Clause | metadata | |
@@ -147,10 +154,11 @@ version; *repository* = the upstream source repository; *requirements* = only st
 | setuptools | 83.0.0 | MIT | PyPI | |
 | Werkzeug | 3.1.9 | BSD-3-Clause | PyPI | |
 
-Optional packages that Chudware imports only when the user has installed them (pdfminer.six,
-cairosvg, CoolProp, open3d, docling, torch, transformers, huggingface_hub, pytorch3d, the vggt
-and mapanything packages, and the openEMS/CSXCAD modules) are listed with their postures in
-`contracts/licenses.md`; they are not installed or distributed by Chudware.
+Optional packages (pdfminer.six, cairosvg, CoolProp, open3d, docling, torch, transformers,
+huggingface_hub, pytorch3d, the vggt and mapanything packages, and the openEMS/CSXCAD
+modules) are listed with their postures in `contracts/licenses.md`. They are not bundled
+or installed by default. An explicit `python -m tools.provision_em --install` can build
+and install openEMS/CSXCAD into the user's environment.
 
 ## 4. Build, packaging and deployment tooling
 
@@ -161,11 +169,18 @@ and mapanything packages, and the openEMS/CSXCAD modules) are listed with their 
 | zstandard | 0.25.0 | BSD-3-Clause | release-build tool | https://github.com/indygreg/python-zstandard |
 | PyYAML, cryptography | 6.0.3, 50.0.0 | MIT; Apache-2.0 OR BSD-3-Clause | release-build tools | see section 3 |
 | patchelf | 0.17.2.4 | GPL-3.0-or-later | Linux release-build tool; never shipped | https://github.com/NixOS/patchelf |
+| pytest-xdist, execnet | 3.8.0, 2.1.2 | MIT | test-only tooling in the test container image (`tools/testbox/Containerfile`); never shipped | https://github.com/pytest-dev/pytest-xdist |
 | fastapi, uvicorn[standard], websockets, httpx, python-multipart, anyio | per `web/gateway/requirements.txt` | MIT; BSD-3-Clause; BSD-3-Clause; BSD-3-Clause; Apache-2.0; MIT | Python packages of the experimental self-hosted web gateway (`web/gateway/`); not part of the desktop application | PyPI |
 | astro, @astrojs/mdx | 7.3.8, 7.0.5 | MIT | website build (`website/package-lock.json`) | https://astro.build/ |
 | pagefind | 1.5.2 | MIT | website build; its search UI is part of the generated site | https://pagefind.app/ |
 | wrangler | 4.149.0 | MIT OR Apache-2.0 | website deployment tool | https://github.com/cloudflare/workers-sdk |
 | sharp, @img/sharp-libvips | 0.35.5, 1.3.4 | Apache-2.0; LGPL-3.0-or-later | website build-time image processing; nothing from it is served | https://sharp.pixelplumbing.com/ |
+| Docker Engine (Moby), Docker Compose v2 | user-installed; Compose 2.24.4+ for the HTTPS override | Apache-2.0; Docker Desktop has separate product terms | host-side tooling for the self-hosted container build/orchestration; not part of the Chudware application image | https://github.com/moby/moby ; https://github.com/docker/compose |
+| Fedora container OS packages | Fedora 44; installed versions in the image RPM inventory | per-package licenses, including LGPL libraries and GPL OS tools | build/runtime environment for `web/deploy/container/Dockerfile`; package metadata and `/usr/share/licenses` retain upstream notices; image redistribution must meet the packages' own source/license obligations | https://packages.fedoraproject.org/ |
+| bubblewrap | Fedora package version in the image | LGPL-2.0-or-later | separate OS executable for actor/worker isolation, installed in the browser container; never linked or imported into Chudware; user-installed for the advanced systemd path | https://github.com/containers/bubblewrap ; https://github.com/containers/bubblewrap/blob/main/COPYING |
+| Caddy | 2.10.2 (`caddy:2.10.2-alpine`) | Apache-2.0; Alpine OS packages retain their own licenses | optional separate upstream TLS/authentication proxy image selected by `web/compose.https.yaml`; not part of the Chudware or desktop process | https://github.com/caddyserver/caddy ; https://github.com/caddyserver/caddy-docker |
+| AppArmor parser | host-installed 4.x | GPL-2.0-only; host dependencies retain their own licenses | optional host-side subprocess loading the named container profile on Ubuntu 24.04+ and other namespace-restricting AppArmor hosts; not linked, imported or bundled in the Chudware image | https://gitlab.com/apparmor/apparmor |
+| OpenSCAD | user-installed | GPL-2.0-or-later | optional separate executable for SCAD rendering/import, not linked or bundled; redistribution of the program has its own license obligations | https://openscad.org/ |
 
 ## 5. Fonts and data
 
@@ -174,6 +189,7 @@ and mapanything packages, and the openEMS/CSXCAD modules) are listed with their 
 | Rubik | as committed | OFL-1.1 | vendored (`assets/fonts/`, `website/public/fonts/`); text in `assets/fonts/OFL.txt` | https://github.com/googlefonts/rubik |
 | JetBrains Mono | as committed | OFL-1.1 | vendored (`assets/fonts/`, `website/public/fonts/`); text in `assets/fonts/OFL.txt` | https://github.com/JetBrains/JetBrainsMono |
 | `CADSymbols.ttf` (renamed nine-glyph subset of DejaVu Sans) | DejaVu Sans 2.35 | Bitstream-Vera; Arev Fonts license; DejaVu changes public domain | vendored (`assets/fonts/`); text in `assets/fonts/LICENSE-DejaVu.txt` | https://dejavu-fonts.github.io/ |
+| SCOWL word lists (size 60, en_US), ordered by Moby Words II FREQ/FREQ-INT | SCOWL 2020.12.07; Moby Words II (Gutenberg #3201) | LicenseRef-SCOWL; Moby public domain | generated data (`assets/dict/en_US.txt`, by `scripts/build_spell_dictionary.py`); text in `assets/dict/LICENSE-SCOWL.txt` | http://wordlist.aspell.net/ |
 | EPANET Net1 example network | EPANET 2.2 | MIT | vendored test data (`services/civil/data/epanet_net1.inp`, notice inline) | https://github.com/OpenWaterAnalytics/EPANET |
 | WNTR-generated reference results | WNTR 1.5 | BSD-3-Clause (notice inline, with the NumPy notice) | vendored test data (`services/civil/data/`) | https://github.com/USEPA/WNTR |
 | NRCS NEH/TR-55 and FHWA HDS-5 coefficient tables, NOAA Atlas 14 sample | — | US-government public domain | vendored test data (`services/civil/data/`) | the issuing agencies |
@@ -191,6 +207,8 @@ the notices below, which the originals require. The full texts are in
 | ezdxf SAB tag table and DXF SAT decryption rule | MIT | `core/doc/acis_read.cpp` |
 | Jeffrey Walton's SHA-NI SHA-256 (`sha256-x86.c`) | public domain | `core/util/sha256.h` |
 | Renode platform descriptions and STM32 bxCAN register conventions (Antmicro) | MIT | `core/firmware/templates_embedded.cpp`, `core/firmware/renode/TimedSTM32CAN.cs` (MIT text inline in both) |
+| GaussianSplats3D KSplat format algorithms (Mark Kellogg), https://github.com/mkkellogg/GaussianSplats3D | MIT | `services/formats/_splat_ksplat.py` |
+| Niantic SPZ (`affd0ecea7fbb4c265ee119475af7ee5b2997482`), https://github.com/nianticlabs/spz | MIT | `services/formats/_splat_spz.py` |
 
 ### Code under a non-MIT license
 
@@ -202,20 +220,22 @@ One first-party file contains code that is **not** covered by Chudware's MIT Lic
 
 ## 7. Subprocess-only optional tools
 
-Chudware can drive the following programs when the user has installed them. They are not
-distributed with Chudware, not linked into it, and not imported into its processes; Chudware
-exchanges files, command-line arguments and standard streams with them. Each program is governed by
-its own license, and copyleft obligations (GPL source offers, the AGPL network clause) apply to
-whoever distributes or hosts that program. Licenses below are as published upstream.
+Chudware drives the following separate programs through files, command-line arguments,
+standard streams or local sockets; it never links or imports them into its processes.
+They are user-installed unless a row explicitly notes a container OS package. The
+browser image installs ngspice as a separate Fedora executable, not in a Chudware
+binary. Each program retains its own license; copyleft obligations (GPL source offers,
+the AGPL network clause) apply to whoever distributes or hosts that program. Licenses
+below are as published upstream.
 
 | Tool | License (SPDX) | How it is obtained |
 |---|---|---|
 | PrusaSlicer 2.9.6 | AGPL-3.0-or-later | user install (Flathub per-user install on Linux); vendor profiles are read from the installed copy |
-| OpenMVS | AGPL-3.0 | user install, path through `OPENMVS_BIN`; never downloaded by Chudware |
+| OpenMVS v2.4.0 | AGPL-3.0 | downloaded at runtime by `scripts/provision_reveng.py` from the upstream release (SHA-256 pinned), run as a subprocess; `OPENMVS_BIN` overrides |
 | CalculiX (`ccx`) | GPL-2.0-or-later | user install, `PATH` or `CHUDWARE_CCX` |
 | OpenFOAM | GPL-3.0-or-later | user install, or `tools/provision_openfoam.py --install` creates a conda-forge environment for the user |
 | LibreDWG `dwg2dxf` | GPL-3.0-or-later | `PATH`, or `scripts/provision_libredwg.py` builds the SHA-256-pinned 0.14 release on the user's machine |
-| ngspice | BSD-3-Clause with GPL-licensed parts | user install, `PATH` or `CHUDWARE_NGSPICE` |
+| ngspice | BSD-3-Clause with GPL-licensed parts | user install for desktop (`PATH` or `CHUDWARE_NGSPICE`); separate Fedora OS package in the browser image, with its package notices and source obligations |
 | pandoc | GPL-2.0-or-later | user install |
 | LibreOffice (headless) | MPL-2.0 | user install |
 | ODA File Converter | proprietary freeware | user install |
@@ -233,6 +253,7 @@ whoever distributes or hosts that program. Licenses below are as published upstr
 | COLMAP | BSD-3-Clause | user install, `COLMAP_BIN` |
 | Meshroom / AliceVision | MPL-2.0 | user install, `MESHROOM_BIN` |
 | Brush v0.3.0 | Apache-2.0 | downloaded at runtime by `scripts/provision_reveng.py` from the upstream release (SHA-256 and source commit pinned) |
+| FFmpeg / ffprobe | LGPL-2.1-or-later or GPL, depending on build and codecs | optional user-installed executable on `PATH` for video metadata and decoding; not downloaded or bundled by this adapter |
 | llama.cpp `llama-server` | MIT | user install or user-provided runtime folder; Chudware does not download it |
 | Gmsh + GetDP, Elmer, Meep | GPL-2.0-or-later | detected only; no execution path exists yet |
 
@@ -261,6 +282,34 @@ under each provider's terms of service; only the client SDKs listed in section 3
 Chudware.
 
 ## License texts for adapted code
+
+### GaussianSplats3D and Niantic SPZ (`services/formats/_splat_ksplat.py`, `_splat_spz.py`)
+
+```
+Copyright (c) 2023 Mark Kellogg
+Copyright (c) 2024 Niantic Labs
+Copyright (c) 2025 Niantic Labs
+Copyright (c) 2025 Adobe Inc.
+Copyright (c) 2026 Adobe Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
 
 ### NumPy (`core/sim/numpy_rng.cpp`)
 

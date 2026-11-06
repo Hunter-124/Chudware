@@ -15,6 +15,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -31,6 +33,7 @@
 #include "ui/metrics.h"      // ui::metrics::U — the search input's last-resort floor
 #include "ui/widgets/kit.h"  // ui::kit::elide — the search hint's last-resort fit
 #include "core/async_rpc.h"  // core::RpcResult — load-failure reasons
+#include "ui/reveng/reveng_workspace.h"  // revengProjectDir — RE sessions belong to the working folder
 
 #include "parts_internal.h"
 #include "parts_widgets.h"
@@ -69,12 +72,7 @@ static bool   g_indexStatusSupported = true;
 // chunk of perceived latency in a live search — so the poll bursts first, then settles.
 static double g_liveStartedAt = 0.0;
 
-// ---- vendor logo (favicon) prefetch ---------------------------------------------
-// The vendor logos used to be requested from ONE place — applyLiveVendors(), which only runs
-// while a live fan-out is in flight. So a logo's first request went out at the exact moment
-// the transient progress strip that displays it was about to disappear, and at no other time:
-// the user never saw a single one. They are now prefetched as soon as the vendor list lands
-// and drawn persistently (drawResultSourcesRow).
+// Vendor favicon requests wait behind visible part previews on the shared RPC lane.
 namespace {
 
 // Registrable domain per site key, feeding the favicon URL in requestVendorLogo.
@@ -146,6 +144,23 @@ static std::string catalogFailText(AppState& st, const char* method, const core:
               (raw.empty() ? std::string("no result") : raw));
     return r.ok ? "The parts catalog could not be read."
                 : "The parts service did not respond.";
+}
+
+static std::string rpcProblem(const core::RpcResult& r, const char* fallback) {
+    if (r.ok && r.result.is_object()) {
+        const auto reason = r.result.find("reason");
+        if (reason != r.result.end() && reason->is_string() &&
+            reason->get<std::string>() == "credentials_required")
+            return "Configure API keys in Settings";
+        for (const char* key : {"hint", "reason"}) {
+            const auto it = r.result.find(key);
+            if (it != r.result.end() && it->is_string()) {
+                const std::string text = it->get<std::string>();
+                if (!text.empty()) return text;
+            }
+        }
+    }
+    return r.err.empty() ? fallback : r.err;
 }
 
 void loadCategories(AppState& st) {
@@ -291,18 +306,23 @@ void loadVendors(AppState& st, bool force) {
     });
 }
 
-// One queued vendor favicon per frame, and only while the shared 4-slot thumbnail budget is
-// mostly idle — part thumbnails are what the user is looking at and always win the slots.
-// Called from the workspace body once the worker is known to be up.
+// Vendor logos share the worker lane with real part previews. Wait until search
+// and the visible previews settle before using spare capacity for favicons.
 static void pumpVendorLogos(AppState& st) {
-    if (g_logoQueue.empty()) return;
-    if (S().thumbBusy.size() >= 2) return;   // budget in use — try again next frame
+    if (g_logoQueue.empty() || !S().searchDone || S().searching || S().liveStarting) return;
+    if (!S().results.empty() && S().visibleThumbs.empty()) return;
+    for (const auto& id : S().visibleThumbs)
+        if (!S().thumbs.count(id) && !S().thumbFailed.count(id)) return;
+    if (S().thumbBusy.size() >= 2) return;
     while (!g_logoQueue.empty()) {
         const std::string site = g_logoQueue.front();
         g_logoQueue.erase(g_logoQueue.begin());
         const std::string key = "vendorlogo:" + site;
         if (S().thumbs.count(key) || S().thumbFailed.count(key)) continue;  // already resolved
-        requestVendorLogo(st, site, vendorDomain(site));
+        std::string domain = vendorDomain(site);
+        for (const auto& live : S().liveVendors)
+            if (live.site == site && !live.domain.empty()) { domain = live.domain; break; }
+        requestVendorLogo(st, site, domain);
         return;                                                            // exactly one/frame
     }
 }
@@ -318,34 +338,6 @@ static void wantVendorLogo(const std::string& site) {
     g_logoQueue.push_back(site);
 }
 
-// Shared by the instant local results and streamed CAD candidates. Relevance (0)
-// keeps insertable standards before community models, then uses backend identity
-// scores; ties retain local/index/vendor order.
-static void applyResultSort() {
-    auto& v = S().results;
-    switch (S().sortMode) {
-        case 0: std::stable_sort(v.begin(), v.end(),
-                    [](const PartsItem& a, const PartsItem& b) {
-                        const bool standardA = a.source == "local" && a.placeable;
-                        const bool standardB = b.source == "local" && b.placeable;
-                        if (standardA != standardB) return standardA;
-                        return a.score > b.score;
-                    });
-                break;
-        case 1: std::stable_sort(v.begin(), v.end(),
-                    [](const PartsItem& a, const PartsItem& b) {
-                        if ((a.priceUsd > 0) != (b.priceUsd > 0)) return a.priceUsd > 0;
-                        return a.priceUsd < b.priceUsd; });
-                break;
-        case 2: std::stable_sort(v.begin(), v.end(),
-                    [](const PartsItem& a, const PartsItem& b) { return a.priceUsd > b.priceUsd; });
-                break;
-        case 3: std::stable_sort(v.begin(), v.end(),
-                    [](const PartsItem& a, const PartsItem& b) { return a.name < b.name; });
-                break;
-        default: break;
-    }
-}
 
 // Fill a PartsItem from a backend result object (shared by local + live paths).
 static PartsItem itemFromJson(const nlohmann::json& it) {
@@ -364,6 +356,17 @@ static PartsItem itemFromJson(const nlohmann::json& it) {
     item.datasheet   = it.value("datasheet",   "");
     item.imageUrl    = it.value("image_url",   "");
     item.license     = it.value("license",     "");
+    item.currency    = it.value("currency",    "");
+    item.kind        = it.value("kind",        "");
+    item.mpn         = it.value("mpn",         "");
+    item.manufacturer = it.value("manufacturer", "");
+    item.family      = it.value("family",      "");
+    item.designation = it.value("designation", "");
+    const std::string thumbnail = it.value("thumbnail_url", "");
+    if (!thumbnail.empty()) item.imageUrl = thumbnail;
+    if (it.contains("model_formats") && it["model_formats"].is_array())
+        for (const auto& format : it["model_formats"])
+            if (format.is_string()) item.modelFormats.push_back(format.get<std::string>());
     if (it.contains("sizes") && it["sizes"].is_array())
         for (const auto& size : it["sizes"])
             if (size.is_string()) item.sizes.push_back(size.get<std::string>());
@@ -371,7 +374,10 @@ static PartsItem itemFromJson(const nlohmann::json& it) {
     if (it.contains("insert_params") && it["insert_params"].is_object())
         item.lengthMm = it["insert_params"].value("length_mm", 0.0);
     item.priceUsd    = it.value("price_usd",   0.0);
+    item.price       = it.value("price", item.priceUsd);
+    item.stock       = it.value("stock", -1);
     item.downloaded  = it.value("downloaded",  false);
+    item.downloadable = it.value("downloadable", false);
     item.placeable   = it.value("placeable",   false);
     return item;
 }
@@ -383,6 +389,7 @@ static void collectNotices(const nlohmann::json& res) {
             nt.site   = n.value("site",   "");
             nt.reason = n.value("reason", "");
             nt.hint   = n.value("hint",   "");
+            if (nt.reason == "credentials_required") nt.hint = "Configure API keys in Settings";
             // De-dupe against notices already shown (live polls re-send the full set).
             bool dup = false;
             for (const auto& e : S().notices)
@@ -396,7 +403,7 @@ static void collectNotices(const nlohmann::json& res) {
 // fan-out resolves, so two queries in quick succession overlap and the loser must drop its
 // payload instead of hijacking the winner's list.
 static unsigned g_searchGen = 0;
-static bool g_searchPending = false;
+static nlohmann::json g_searchParams;
 
 // The one search-parameter serializer, shared by the fast local `parts_search` and the slow
 // `parts_search_live_start` fan-out: query + category + global filters + facets. Single code
@@ -409,6 +416,8 @@ static bool g_searchPending = false;
 static void fillSearchParams(nlohmann::json& p) {
     p["query"] = S().searchBuf;
     p["limit"] = 100;
+    static const char* sortModes[] = {"relevance", "price_asc", "price_desc", "name"};
+    p["sort"] = sortModes[std::clamp(S().sortMode, 0, 3)];
     // Tree mode → taxonomy category_id (incl. vendors.*.<site> leaves = browse that vendor);
     // fallback flat mode keeps the legacy "category" param.
     if (S().taxonomyIsTree) p["category_id"] = S().selectedCategory;
@@ -443,72 +452,95 @@ static void fillSearchParams(nlohmann::json& p) {
 }
 
 void doSearch(AppState& st) {
-    // Category/search clicks can arrive before the previous local query lands.
-    // Coalesce them, then run the latest visible selection instead of dropping it.
-    if (S().searching) {
-        g_searchPending = true;
-        S().liveSearching = false;
-        S().liveToken.clear();
-        return;
-    }
-    g_searchPending = false;
-    S().searching  = true;
+    const unsigned gen = ++g_searchGen;
+    S().searching = true;
     S().searchDone = false;
     S().searchErr.clear();
+    S().moreError.clear();
     S().results.clear();
-    // A fresh query invalidates any in-flight live job (stale polls are dropped) and
-    // supersedes every async callback still carrying an older generation.
-    S().liveSearching = false;
+    S().notices.clear();
+    S().localLoaded = S().localVisible = S().localTotal = 0;
+    S().totalExact = S().hasMore = S().loadingMore = false;
+    S().hasLive = S().liveStarting = S().liveSearching = S().livePolling = false;
     S().liveToken.clear();
     S().liveCursor = 0;
-    const unsigned gen = ++g_searchGen;
     nlohmann::json p;
     fillSearchParams(p);
-    p["live"] = false;   // instant local layer only; live vendors stream separately
+    p["offset"] = 0;
+    p["live"] = false;
+    g_searchParams = p;
     st.rpc.call("parts_search", p, [gen, &st](const core::RpcResult& r) {
-        S().searching  = false;
-        // Superseded by a newer query while this one was in flight — drop its rows.
         if (gen != g_searchGen) return;
-        if (g_searchPending) {
-            doSearch(st);
-            return;
-        }
+        S().searching = false;
         S().searchDone = true;
-        if (!r.ok) { S().searchErr = r.err; return; }
-        if (!r.result.is_object()) return;
-        // Catalog index build (additive fields; absent on an older worker → false/0). While
-        // the index builds these rows are only a prefix of the catalog, so arm an automatic
-        // re-search: the user should never have to press Search twice for a cold cache.
+        if (!r.ok) { S().searchErr = r.err.empty() ? "Parts service unavailable" : r.err; return; }
+        if (!r.result.is_object()) { S().searchErr = "Invalid search response"; return; }
         g_indexBuilding = g_indexStatusSupported && r.result.value("index_building", false);
-        g_indexCount    = r.result.value("index_count", 0);
+        g_indexCount = r.result.value("index_count", 0);
         if (g_indexBuilding) g_researchOnIndexReady = true;
         if (!r.result.value("ok", false)) {
-            S().searchErr = r.result.value("reason", "search failed");
+            S().searchErr = rpcProblem(r, "Search failed");
             return;
         }
-        S().hasLive = r.result.value("has_live", false);
-        S().results.clear();
-        // Per-site skip notices (login_required stubs) — shown as a hint line under the
-        // results header instead of blank rows.
-        S().notices.clear();
         collectNotices(r.result);
-        if (r.result.contains("results"))
-            for (auto& it : r.result["results"])
+        if (r.result.contains("results") && r.result["results"].is_array())
+            for (const auto& it : r.result["results"])
                 S().results.push_back(itemFromJson(it));
-        // Client-side sort: relevance by score, 1 = price low→high (zero last),
-        // 2 = price high→low, 3 = name.
-        applyResultSort();
-        // Local results are up — now stream live vendor hits in the background so the
-        // slow browser fan-out never blocks the initial paint. Skipped when the user
-        // has filtered to Local-only.
-        if (S().sourceFilter != 1)
-            startLiveSearch(st);
+        S().localLoaded = S().localVisible = static_cast<int>(S().results.size());
+        S().localTotal = r.result.value("total", S().localLoaded);
+        S().totalExact = r.result.value("total_exact", false);
+        S().hasMore = r.result.value("has_more", false);
+        if (S().sourceFilter != 1) startLiveSearch(st);
     });
 }
 
-// Update S().liveVendors from a live-search start/poll payload's "vendors" array and kick a live
-// logo (favicon) fetch for each. Replaces the list each poll so per-vendor status stays current.
-static void applyLiveVendors(AppState& st, const nlohmann::json& res) {
+void loadMoreParts(AppState& st) {
+    if (!S().hasMore || S().searching || S().loadingMore) return;
+    S().loadingMore = true;
+    S().moreError.clear();
+    const unsigned gen = g_searchGen;
+    const int offset = S().localLoaded;
+    nlohmann::json p = g_searchParams;
+    p["offset"] = offset;
+    st.rpc.call("parts_search", p, [gen, offset](const core::RpcResult& r) {
+        if (gen != g_searchGen) return;
+        S().loadingMore = false;
+        if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) {
+            S().moreError = rpcProblem(r, "Could not load more parts");
+            return;
+        }
+        if (r.result.value("offset", offset) != offset) {
+            S().moreError = "The parts service returned an unexpected page; retry.";
+            return;
+        }
+        int received = 0;
+        if (r.result.contains("results") && r.result["results"].is_array()) {
+            for (const auto& entry : r.result["results"]) {
+                ++received;
+                PartsItem item = itemFromJson(entry);
+                auto found = std::find_if(S().results.begin(), S().results.end(),
+                    [&item](const PartsItem& existing) { return existing.id == item.id; });
+                if (found != S().results.end()) {
+                    if (found - S().results.begin() < S().localVisible) continue;
+                    S().results.erase(found);
+                }
+                S().results.insert(S().results.begin() + S().localVisible, std::move(item));
+                ++S().localVisible;
+            }
+        }
+        S().hasLive = static_cast<int>(S().results.size()) > S().localVisible;
+        S().localLoaded = offset + received;
+        S().localTotal = r.result.value("total", S().localTotal);
+        S().totalExact = r.result.value("total_exact", false);
+        if (received == 0 && r.result.value("has_more", false))
+            S().moreError = "Additional results are unavailable; refine the search.";
+        S().hasMore = r.result.value("has_more", false) && received > 0;
+        collectNotices(r.result);
+    });
+}
+
+// Update the live vendor progress and queue favicons behind visible part previews.
+static void applyLiveVendors(const nlohmann::json& res) {
     if (!res.contains("vendors") || !res["vendors"].is_array()) return;
     std::vector<LiveVendor> next;
     next.reserve(res["vendors"].size());
@@ -519,7 +551,7 @@ static void applyLiveVendors(AppState& st, const nlohmann::json& res) {
         lv.label  = v.value("label", lv.site);
         lv.domain = v.value("domain", "");
         lv.status = v.value("status", std::string("queued"));
-        requestVendorLogo(st, lv.site, lv.domain);
+        wantVendorLogo(lv.site);
         next.push_back(std::move(lv));
     }
     if (!next.empty()) S().liveVendors = std::move(next);
@@ -642,13 +674,7 @@ static std::string vendorLabelFor(const std::string& site) {
     return site;
 }
 
-// Persistent "Sources" row — the vendors that actually contributed rows to the CURRENT result
-// set, with their real logos. drawLiveVendorStrip above is deliberately transient (it is the
-// in-flight progress readout and vanishes with the fan-out), which is why the user never saw
-// a vendor logo outside the couple of seconds a live search was running. Drawn under the
-// "Parts" header; skipped entirely when nothing on screen came from a live catalog.
-// Needs no AppState: pending fetches go through wantVendorLogo/g_logoQueue, which the
-// workspace body drains one per frame.
+// Show the sources that contributed live results; queued favicons use spare capacity.
 static void drawResultSourcesRow() {
     if (S().results.empty()) return;
     // Live catalog ids are "catalog:<site>::<url>". First-appearance order, capped at 8.
@@ -700,11 +726,16 @@ static void drawResultSourcesRow() {
             dl->AddText(ImVec2(x + (logo - ts.x) * 0.5f, y + (logo - ts.y) * 0.5f),
                         ui::Palette::toU32(pal.text), L);
         }
-        ImGui::SetCursorScreenPos(l0);
-        ImGui::InvisibleButton((std::string("##src_") + site).c_str(), ImVec2(logo, logo));
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", vendorLabelFor(site).c_str());
-        x += logo + gap;
+        const std::string label = vendorLabelFor(site);
+        const float textX = x + logo + gap;
+        const float textRoom = rightB - textX;
+        if (textRoom > 12.0f * s) {
+            const std::string shown = ui::kit::elide(label.c_str(), textRoom);
+            dl->AddText(ImVec2(textX, start.y), ui::Palette::toU32(pal.textDim), shown.c_str());
+            x = textX + ImGui::CalcTextSize(shown.c_str()).x + 12.0f * s;
+        } else {
+            x += logo + gap;
+        }
     }
     // Close the line at its natural height so the results list flows below it.
     ImGui::SetCursorScreenPos(start);
@@ -714,23 +745,35 @@ static void drawResultSourcesRow() {
 void startLiveSearch(AppState& st) {
     S().liveVendors.clear();       // fresh fan-out — drop the previous search's vendor strip
     g_liveStartedAt = ImGui::GetTime();   // burst-poll window for the first vendor's rows
-    nlohmann::json p;
-    fillSearchParams(p);
+    S().liveStarting = true;
+    nlohmann::json p = g_searchParams;
+    p.erase("live");
+    p.erase("offset");
+    p["client"] = "parts-workspace-" +
+        std::to_string(reinterpret_cast<std::uintptr_t>(&S()));
     // The local layer returns long before this fan-out resolves, so S().searching is already
     // clear and a newer query may have started meanwhile: pin the generation and let the
     // loser drop its token instead of hijacking the newer search.
     const unsigned gen = g_searchGen;
-    st.rpc.call("parts_search_live_start", p, [gen, &st](const core::RpcResult& r) {
-        if (gen != g_searchGen || g_searchPending) return;   // superseded query
-        if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) return;
+    st.rpc.call("parts_search_live_start", p, [gen](const core::RpcResult& r) {
+        if (gen != g_searchGen) return;
+        S().liveStarting = false;
+        if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) {
+            Notice n;
+            n.site = "Web sources";
+            n.reason = "unavailable";
+            n.hint = rpcProblem(r, "Web search unavailable");
+            S().notices.push_back(std::move(n));
+            return;
+        }
         collectNotices(r.result);
         std::string token = r.result.value("token", "");
-        if (token.empty() || r.result.value("done", false)) return;
+        if (token.empty()) return;
         S().liveToken     = token;
         S().liveCursor    = 0;
         S().liveSearching = true;
         S().lastLivePoll  = 0.0;   // poll on the next tick
-        applyLiveVendors(st, r.result);
+        applyLiveVendors(r.result);
     });
 }
 
@@ -742,15 +785,20 @@ void pollLiveSearch(AppState& st) {
     p["token"]  = S().liveToken;
     p["cursor"] = S().liveCursor;
     const std::string token = S().liveToken;
-    st.rpc.call("parts_search_live_poll", p, [token, &st](const core::RpcResult& r) {
-        S().livePolling = false;
-        // Drop results from a superseded job (a newer query changed the token).
+    st.rpc.call("parts_search_live_poll", p, [token](const core::RpcResult& r) {
+        // Drop results from a superseded job without altering the current poll.
         if (token != S().liveToken) return;
+        S().livePolling = false;
         if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) {
-            S().liveSearching = false;   // give up quietly; local results stay
+            S().liveSearching = false;
+            Notice n;
+            n.site = "Web sources";
+            n.reason = "unavailable";
+            n.hint = rpcProblem(r, "Web search unavailable");
+            S().notices.push_back(std::move(n));
+            S().liveToken.clear();
             return;
         }
-        bool appended = false;
         if (r.result.contains("results"))
             for (auto& it : r.result["results"]) {
                 PartsItem item = itemFromJson(it);
@@ -758,13 +806,11 @@ void pollLiveSearch(AppState& st) {
                                  [&item](const PartsItem& existing) { return existing.id == item.id; })) {
                     S().results.push_back(std::move(item));
                     S().hasLive = true;
-                    appended = true;
                 }
             }
         collectNotices(r.result);
-        applyLiveVendors(st, r.result);
+        applyLiveVendors(r.result);
         S().liveCursor = r.result.value("cursor", S().liveCursor);
-        if (appended) applyResultSort();
         if (r.result.value("done", false)) {
             S().liveSearching = false;
             S().liveToken.clear();
@@ -777,16 +823,13 @@ void pollLiveSearch(AppState& st) {
 // silently created in the worker with no tab in the user's workspace.
 static void activatePartDocument(AppState& st, const std::string& doc,
                                  const std::string& name, bool standardInsert) {
-    st.rpc.call("doc_activate", {{"doc_id", doc}},
+    st.rpc.call("doc_activate", {{"doc_id", doc}, {"origin", "system"}},
         [&st, name, doc, standardInsert](const core::RpcResult& response) {
             if (standardInsert) S().insertBusy = false;
             if (st.asmPanels) st.asmPanels->closeAllToolForms(st);
             std::string aicm, err;
-            const bool wasSuppressing = st.suppressTabDirty;
-            st.suppressTabDirty = true;
             const bool activated = response.ok && response.result.is_object() &&
                 st.docMirror.adoptActivateResponse(doc, response.result, aicm, err);
-            st.suppressTabDirty = wasSuppressing;
             if (!activated) {
                 if (!response.ok) err = response.err;
                 S().insertNote = "Created " + name + " (" + doc +
@@ -820,11 +863,36 @@ static void activatePartDocument(AppState& st, const std::string& doc,
         });
 }
 
+static void updateJobOperation(const std::string& jobId, const std::string& status,
+                               const std::string& error, bool busy) {
+    for (auto& entry : S().itemOperations) {
+        auto& op = entry.second;
+        if (op.jobId != jobId || jobId.empty()) continue;
+        op.status = status;
+        op.error = error;
+        op.busy = busy;
+    }
+}
+static void finishJobOperation(const std::string& jobId, const std::string& status,
+                               const std::string& error) {
+    updateJobOperation(jobId, status, error, false);
+    for (auto& entry : S().itemOperations)
+        if (entry.second.jobId == jobId) entry.second.jobId.clear();
+}
+
+
 void importQueuedArtifact(AppState& st, const std::string& id, const std::string& artifactPath) {
+    updateJobOperation(id, "Importing CAD model…", "", true);
     S().autoImportJobs.erase(id);
-    for (auto& job : S().queue)
-        if (job.id == id) job.importing = true;
-    st.rpc.call("parts_import_artifact", {{"artifact_path", artifactPath}},
+    nlohmann::json params = {{"artifact_path", artifactPath}};
+    for (auto& job : S().queue) {
+        if (job.id != id) continue;
+        job.importing = true;
+        if (!job.artifactMember.empty()) params["member"] = job.artifactMember;
+        if (!job.artifactFormat.empty()) params["format"] = job.artifactFormat;
+        break;
+    }
+    st.rpc.call("parts_import_artifact", params,
         [&st, id](const core::RpcResult& r) {
             std::string label = "CAD model";
             for (auto& job : S().queue)
@@ -836,14 +904,17 @@ void importQueuedArtifact(AppState& st, const std::string& id, const std::string
             if (!ok) {
                 const std::string why = r.ok && r.result.is_object()
                     ? r.result.value("reason", std::string("import failed")) : r.err;
+                finishJobOperation(id, "Import failed", why);
                 st.toast(ui::ToastLevel::Error, "Import failed: " + why);
                 return;
             }
             const std::string doc = r.result.value("doc_id", std::string());
             if (doc.empty()) {
+                finishJobOperation(id, "Import failed", "No editable document returned");
                 st.toast(ui::ToastLevel::Error, "Import returned no editable document");
                 return;
             }
+            finishJobOperation(id, "Downloaded and imported CAD model", "");
             activatePartDocument(st, doc, label, false);
         });
 }
@@ -854,7 +925,13 @@ void pollQueue(AppState& st) {
     S().lastQueuePoll = ImGui::GetTime();
     st.rpc.call("parts_queue_status", {}, [&st](const core::RpcResult& r) {
         S().queuePolling = false;
-        if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) return;
+        if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) {
+            S().queueError = r.ok && r.result.is_object()
+                ? r.result.value("reason", std::string("Queue unavailable"))
+                : (r.err.empty() ? "Queue unavailable" : r.err);
+            return;
+        }
+        S().queueError.clear();
         // Preserve per-job "importing" spinners across refreshes.
         std::set<std::string> importing;
         for (auto& j : S().queue)
@@ -869,7 +946,51 @@ void pollQueue(AppState& st) {
                 q.query        = j.value("query", "");
                 q.status       = j.value("status", "");
                 q.artifactPath = j.value("artifact_path", "");
-                q.error        = j.value("error", "");
+                if (j.contains("error")) {
+                    const auto& e = j["error"];
+                    if (e.is_string()) q.error = e.get<std::string>();
+                    else if (e.is_object()) {
+                        q.error = e.value("hint", std::string());
+                        if (q.error.empty()) q.error = e.value("reason", std::string("Download failed"));
+                        if (e.value("reason", std::string()) == "credentials_required")
+                            q.error = "Configure API keys in Settings";
+                        if (e.contains("ask_user")) {
+                            const auto& question = e["ask_user"];
+                            if (question.is_string()) q.askUser = question.get<std::string>();
+                            else if (question.is_object()) {
+                                q.askUser = question.value("prompt", std::string());
+                                if (question.contains("options") && question["options"].is_array())
+                                    for (const auto& option : question["options"]) {
+                                        if (!option.is_object()) continue;
+                                        const std::string value = option.value("value", std::string());
+                                        if (value.empty() || value == "cancel") continue;
+                                        q.candidates.push_back(value);
+                                        const std::string label = option.value("label", std::string());
+                                        q.candidateLabels[value] = label.empty() ? value : label;
+                                    }
+                            }
+                        }
+                        if (q.candidates.empty() && e.contains("candidates") && e["candidates"].is_array())
+                            for (const auto& candidate : e["candidates"])
+                                if (candidate.is_string()) q.candidates.push_back(candidate.get<std::string>());
+                        if (q.artifactPath.empty() && e.contains("artifact_path") && e["artifact_path"].is_string())
+                            q.artifactPath = e["artifact_path"].get<std::string>();
+                        q.canSelect = e.contains("hit") && e["hit"].is_object();
+                    }
+                }
+                if (j.contains("spec_data") && j["spec_data"].is_object()) {
+                    q.artifactKind = j["spec_data"].value("artifact_kind", std::string());
+                    q.artifactFormat = j["spec_data"].value("format", std::string());
+                    q.artifactMember = j["spec_data"].value("member", std::string());
+                    q.cadValidated = j["spec_data"].value("cad_validated", false);
+                }
+                if (j.contains("can_select_member") && j["can_select_member"].is_boolean())
+                    q.canSelect = j["can_select_member"].get<bool>();
+                if (S().resolvedChoiceJobs.count(q.id)) {
+                    q.askUser.clear();
+                    q.candidates.clear();
+                    q.candidateLabels.clear();
+                }
                 q.importing    = importing.count(q.id) > 0;
                 if (q.status == "pending" || q.status == "running") active = true;
                 jobs.push_back(std::move(q));
@@ -877,37 +998,123 @@ void pollQueue(AppState& st) {
         S().queue       = std::move(jobs);
         S().queueActive = active;
         for (const auto& job : S().queue) {
-            if (!S().autoImportJobs.count(job.id)) continue;
-            if (job.status == "done" && !job.artifactPath.empty())
-                importQueuedArtifact(st, job.id, job.artifactPath);
+            if (job.importing) continue;
+            if (job.status == "pending" || job.status == "running")
+                updateJobOperation(job.id, job.status == "pending" ? "Download queued" :
+                                   "Downloading…", "", true);
+            else if (job.status == "done") {
+                const std::string status = job.artifactKind == "cad" && !job.cadValidated
+                    ? "Downloaded CAD; this format cannot be imported"
+                    : (job.artifactKind.empty() ? "Download complete" : "Downloaded " + job.artifactKind);
+                updateJobOperation(job.id, status, "", false);
+            }
             else if (job.status == "error" || job.status == "cancelled")
+                updateJobOperation(job.id, "Download " + job.status, job.error, false);
+        }
+        for (const auto& job : S().queue) {
+            if (!S().autoImportJobs.count(job.id)) continue;
+            if (job.status == "done") {
+                if (job.artifactKind == "cad" && job.cadValidated && !job.artifactPath.empty())
+                    importQueuedArtifact(st, job.id, job.artifactPath);
+                else
+                    S().autoImportJobs.erase(job.id);
+            } else if (job.status == "cancelled" ||
+                       (job.status == "error" && job.candidates.empty()))
                 S().autoImportJobs.erase(job.id);
         }
     });
 }
 
+void dismissQueuedChoice(const std::string& jobId) {
+    auto job = std::find_if(S().queue.begin(), S().queue.end(),
+        [&jobId](const QueueJob& q) { return q.id == jobId; });
+    if (job == S().queue.end() || job->importing) return;
+    job->askUser.clear();
+    job->candidates.clear();
+    job->candidateLabels.clear();
+    S().resolvedChoiceJobs.insert(jobId);
+    S().autoImportJobs.erase(jobId);
+    finishJobOperation(jobId, "Download cancelled", "");
+}
+
+void selectQueuedArtifact(AppState& st, const std::string& jobId, const std::string& member) {
+    auto job = std::find_if(S().queue.begin(), S().queue.end(),
+        [&jobId](const QueueJob& q) { return q.id == jobId; });
+    if (job == S().queue.end() || job->importing || !job->canSelect ||
+        std::find(job->candidates.begin(), job->candidates.end(), member) == job->candidates.end())
+        return;
+    job->importing = true;
+    updateJobOperation(jobId, "Selecting model…", "", true);
+    st.rpc.call("parts_download_select", {{"job_id", jobId}, {"member", member}},
+        [&st, jobId](const core::RpcResult& r) {
+            for (auto& q : S().queue)
+                if (q.id == jobId) q.importing = false;
+            const bool ok = r.ok && r.result.is_object() && r.result.value("ok", false);
+            const std::string nextId = ok ? r.result.value("id", std::string()) : std::string();
+            if (!ok || nextId.empty()) {
+                const std::string why = ok ? "No download job was returned" :
+                    rpcProblem(r, "Could not select model");
+                updateJobOperation(jobId, "Selection failed", why, false);
+                for (auto& q : S().queue)
+                    if (q.id == jobId) q.error = why;
+                st.toast(ui::ToastLevel::Error, "Selection failed: " + why);
+                return;
+            }
+            S().resolvedChoiceJobs.insert(jobId);
+            if (S().autoImportJobs.erase(jobId)) S().autoImportJobs.insert(nextId);
+            for (auto& entry : S().itemOperations) {
+                auto& op = entry.second;
+                if (op.jobId != jobId) continue;
+                op.jobId = nextId;
+                op.status = "Download queued";
+                op.error.clear();
+                op.busy = true;
+            }
+            for (auto& q : S().queue) {
+                if (q.id != jobId) continue;
+                q.askUser.clear();
+                q.candidates.clear();
+                q.candidateLabels.clear();
+            }
+            S().queueActive = true;
+            pollQueue(st);
+        });
+}
+
 void queueDownload(AppState& st, const PartsItem& item) {
+    auto& operation = S().itemOperations[item.id];
+    if (operation.busy) return;
+    operation = {};
+    operation.status = "Submitting download…";
+    operation.busy = true;
     nlohmann::json p;
     p["item_id"] = item.id;
     p["name"]    = item.name;
-    st.rpc.call("parts_download", p, [&st, name = item.name, community =
+    st.rpc.call("parts_download", p, [&st, name = item.name, itemId = item.id, community =
         item.id.rfind("catalog:printables::", 0) == 0 ||
         item.id.rfind("catalog:makerworld::", 0) == 0](const core::RpcResult& r) {
+        auto& op = S().itemOperations[itemId];
         bool ok = r.ok && r.result.is_object() && r.result.value("ok", false);
         if (ok && r.result.value("downloaded", false)) {
+            op.busy = false;
+            op.status = "Downloaded";
             st.toast(ui::ToastLevel::Info, name + ": local library part — use Insert to place it");
+            doSearch(st);
             return;
         }
-        if (ok) {
-            if (community) {
-                const std::string id = r.result.value("id", std::string());
-                if (!id.empty()) S().autoImportJobs.insert(id);
-            }
-            st.toast(ui::ToastLevel::Success, "Queued download: " + name);
+        const std::string jobId = ok ? r.result.value("id", std::string()) : std::string();
+        if (ok && !jobId.empty()) {
+            op.jobId = jobId;
+            op.status = "Download queued";
+            if (community) S().autoImportJobs.insert(jobId);
+            st.toast(ui::ToastLevel::Info, "Queued download: " + name);
             S().queueActive = true;
             pollQueue(st);
         } else {
-            std::string why = r.ok ? r.result.value("reason", "download failed") : r.err;
+            std::string why = !ok ? rpcProblem(r, "Download failed") : "No download job was returned";
+            op.busy = false;
+            op.status = "Download failed";
+            op.error = why;
             st.toast(ui::ToastLevel::Error, "Download failed: " + why);
         }
     });
@@ -915,6 +1122,7 @@ void queueDownload(AppState& st, const PartsItem& item) {
 
 void insertItem(AppState& st, const PartsItem& item) {
     if (S().insertBusy) return;
+    S().insertItemId = item.id;
     const bool intoAssembly = st.activeTab >= 0 &&
         st.activeTab < static_cast<int>(st.docTabs.size()) &&
         st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Assembly;
@@ -938,6 +1146,14 @@ void insertItem(AppState& st, const PartsItem& item) {
         p["project_dir"] = projectDir;
         st.rpc.call("parts_prepare_for_assembly", p,
             [&st, name = item.name, assemblyDoc](const core::RpcResult& r) {
+                if (st.activeTab < 0 || st.activeTab >= static_cast<int>(st.docTabs.size()) ||
+                    st.docTabs[st.activeTab].docId != assemblyDoc) {
+                    S().insertBusy = false;
+                    S().insertError = true;
+                    S().insertNote = "Insertion cancelled: the active assembly changed.";
+                    st.toast(ui::ToastLevel::Warn, S().insertNote);
+                    return;
+                }
                 if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) {
                     const std::string why = r.ok && r.result.is_object()
                         ? r.result.value("reason", std::string("could not save part"))
@@ -960,20 +1176,22 @@ void insertItem(AppState& st, const PartsItem& item) {
                 st.toast(ui::ToastLevel::Info, S().insertNote);
                 st.asmPanels->insertComponentWhenReady(
                     st, path, assemblyDoc,
-                    [&st, name, assemblyDoc](bool inserted, const std::string& error) {
+                    [&st, name](ui::AsmPanels::InsertOutcome outcome, const std::string& error) {
                         S().insertBusy = false;
-                        S().insertError = !inserted;
-                        if (!inserted) {
+                        if (outcome == ui::AsmPanels::InsertOutcome::Superseded) {
+                            S().insertError = true;
+                            S().insertNote = "Insertion cancelled or superseded.";
+                            st.toast(ui::ToastLevel::Warn, S().insertNote);
+                            return;
+                        }
+                        S().insertError = outcome == ui::AsmPanels::InsertOutcome::Failure;
+                        if (S().insertError) {
                             S().insertNote = "Insert failed: " + error;
                             st.toast(ui::ToastLevel::Error, S().insertNote);
                             return;
                         }
-                        for (int i = 0; i < static_cast<int>(st.docTabs.size()); ++i)
-                            if (st.docTabs[i].docId == assemblyDoc) {
-                                st.switchToTab(i);
-                                break;
-                            }
-                        st.activeWorkspace = AppState::Workspace::Model;
+                        if (st.activeWorkspace == AppState::Workspace::PartsLibrary)
+                            st.activeWorkspace = AppState::Workspace::Model;
                         S().insertNote = "Inserted " + name + " into the assembly";
                         st.toast(ui::ToastLevel::Success, S().insertNote);
                     });
@@ -1017,6 +1235,11 @@ void insertItem(AppState& st, const PartsItem& item) {
 // seed (vendor URL → part number → name) drives RE-29's datasheet/web lane so the
 // session is populated with no further clicks.
 void sendToReverseEngineering(AppState& st, const PartsItem& item) {
+    auto& operation = S().itemOperations[item.id];
+    if (operation.busy) return;
+    operation = {};
+    operation.status = "Starting Reverse Engineering…";
+    operation.busy = true;
     nlohmann::json p;
     p["name"]     = item.name.empty() ? std::string("Reverse-engineer part") : item.name;
     p["part_ref"] = item.id;   // best-effort seed of on-part assets; harmless if not a hub record
@@ -1028,20 +1251,23 @@ void sendToReverseEngineering(AppState& st, const PartsItem& item) {
     else if (!item.partNumber.empty()) research = item.partNumber;
     else                               research = item.name;
     if (!research.empty()) p["research"] = research;
+    if (const std::string project = reveng::revengProjectDir(st); !project.empty())
+        p["project_dir"] = project;
 
-    st.rpc.call("reveng_start_session", p, [&st, name = item.name](const core::RpcResult& r) {
+    st.rpc.call("reveng_start_session", p, [&st, name = item.name, id = item.id](const core::RpcResult& r) {
+        auto& op = S().itemOperations[id];
+        op.busy = false;
         bool ok = r.ok && r.result.is_object() && r.result.value("ok", false);
         if (ok) {
+            op.status = "Reverse Engineering session started";
             st.pendingRevengSessionId = r.result.value("session_id", "");
             st.activeWorkspace = AppState::Workspace::ReverseEng;   // jump to the RE tab
             st.toast(ui::ToastLevel::Success, "Sent to Reverse Engineering: " + name);
         } else {
-            std::string why = r.ok
-                ? r.result.value("reason", std::string("could not start session"))
-                : r.err;
-            std::string hint = r.ok ? r.result.value("hint", "") : "";
-            st.toast(ui::ToastLevel::Error,
-                     "Reverse-engineer failed: " + why + (hint.empty() ? "" : ("  (" + hint + ")")));
+            const std::string why = rpcProblem(r, "Could not start session");
+            op.status = "Reverse Engineering failed";
+            op.error = why;
+            st.toast(ui::ToastLevel::Error, "Reverse-engineer failed: " + why);
         }
     });
 }
@@ -1052,6 +1278,11 @@ void sendToReverseEngineering(AppState& st, const PartsItem& item) {
 // workspace so the seeded session is visible immediately. NEVER a sync call in
 // a draw path (GL-freeze history). Hidden for parts that already have a model.
 void generateModelFromLibrary(AppState& st, const PartsItem& item) {
+    auto& operation = S().itemOperations[item.id];
+    if (operation.busy) return;
+    operation = {};
+    operation.status = "Requesting a 3D model…";
+    operation.busy = true;
     nlohmann::json p;
     p["part_ref"] = item.id;
     if (!item.partNumber.empty())  p["part_number"] = item.partNumber;
@@ -1062,22 +1293,32 @@ void generateModelFromLibrary(AppState& st, const PartsItem& item) {
     else if (!item.partNumber.empty()) query = item.partNumber;
     else                               query = item.name;
     if (!query.empty()) p["query"] = query;
+    if (const std::string project = reveng::revengProjectDir(st); !project.empty())
+        p["project_dir"] = project;
 
     st.rpc.call("reveng_make_part_from_library", p,
-                [&st, name = item.name](const core::RpcResult& r) {
+                [&st, name = item.name, id = item.id](const core::RpcResult& r) {
+        auto& op = S().itemOperations[id];
+        op.busy = false;
         bool ok = r.ok && r.result.is_object() && r.result.value("ok", false);
         if (ok) {
             st.pendingRevengSessionId = r.result.value("session_id", "");
             st.activeWorkspace = AppState::Workspace::ReverseEng;
-            st.toast(ui::ToastLevel::Success, "Generating 3D model for " + name + "…");
+            // The backend searches CAD libraries before building anything; when it found models
+            // the session holds them and nothing is being generated.
+            const auto found = r.result.find("existing_models");
+            op.status = found != r.result.end() && found->is_array() && !found->empty()
+                ? "Existing models found" : "Generation started in Reverse Engineering";
+            if (found != r.result.end() && found->is_array() && !found->empty())
+                st.toast(ui::ToastLevel::Success, "Existing CAD models found for " + name +
+                                                      " \xe2\x80\x94 pick one in Reverse Engineering.");
+            else
+                st.toast(ui::ToastLevel::Success, "Generating 3D model for " + name + "…");
         } else {
-            std::string why = r.ok
-                ? r.result.value("reason", std::string("generate failed"))
-                : r.err;
-            std::string hint = r.ok ? r.result.value("hint", "") : "";
-            st.toast(ui::ToastLevel::Error,
-                     "Generate model failed: " + why +
-                         (hint.empty() ? "" : ("  (" + hint + ")")));
+            const std::string why = rpcProblem(r, "Could not generate model");
+            op.status = "Generate model failed";
+            op.error = why;
+            st.toast(ui::ToastLevel::Error, "Generate model failed: " + why);
         }
     });
     // Optimistically switch to RE workspace so the user sees the session rail
@@ -1150,10 +1391,19 @@ bool partsLibrarySettled(const AppState& st) {
         (S().taxonomyIsTree || !S().categories.empty() ||
          S().taxonomyAttempts >= kTaxonomyMaxAttempts);
     const bool vendorsSettled = S().vendorsLoaded && !S().vendorsLoading;
-    const bool resultsSettled = S().searchDone && !S().searching && !g_searchPending &&
-                                !g_indexBuilding && !g_indexPolling &&
+    const bool resultsSettled = S().searchDone && !S().searching && !S().loadingMore &&
+                                !g_indexBuilding && !g_indexPolling && !S().liveStarting &&
                                 !S().liveSearching && !S().livePolling;
-    return catsSettled && vendorsSettled && resultsSettled;
+    static double previewWaitSince = 0.0;
+    if (!(catsSettled && vendorsSettled && resultsSettled)) {
+        previewWaitSince = 0.0;
+        return false;
+    }
+    if (previewWaitSince == 0.0) previewWaitSince = ImGui::GetTime();
+    bool previewsSettled = S().results.empty() || !S().visibleThumbs.empty();
+    for (const auto& id : S().visibleThumbs)
+        if (!S().thumbs.count(id) && !S().thumbFailed.count(id)) previewsSettled = false;
+    return previewsSettled || ImGui::GetTime() - previewWaitSince >= 15.0;
 }
 
 void drawPartsLibraryWorkspace(AppState& st) {
@@ -1165,6 +1415,18 @@ void drawPartsLibraryWorkspace(AppState& st) {
     if (S().firstFrame) {
         S().firstFrame = false;
         S().gridView = st.settings.partsGridView;
+        if (st.wantPartsShot) {
+            if (const char* view = std::getenv("CHUDWARE_PARTS_SHOT_VIEW")) {
+                if (std::strcmp(view, "grid") == 0) S().gridView = true;
+                else if (std::strcmp(view, "list") == 0) S().gridView = false;
+            }
+            if (const char* select = std::getenv("CHUDWARE_PARTS_SHOT_SELECT")) {
+                char* end = nullptr;
+                const long index = std::strtol(select, &end, 10);
+                if (end != select && *end == '\0' && index >= 0 && index < 1000000)
+                    S().shotSelectIndex = static_cast<int>(index);
+            }
+        }
         S().sortMode = st.settings.partsSortMode;    // persisted like gridView
         S().expandedCats.clear();
         for (const auto& c : st.settings.partsExpandedCats) S().expandedCats.insert(c);
@@ -1246,6 +1508,10 @@ void drawPartsLibraryWorkspace(AppState& st) {
                    "The Chudware worker service is not running.");
         return;
     }
+    // Queue progress must continue even when the filter pane is hidden or replaced by details.
+    if (S().queueActive && !S().queuePolling && ImGui::GetTime() - S().lastQueuePoll > 2.5)
+        pollQueue(st);
+
 
     // Vendor favicons: one queued request per frame, budget permitting (see g_logoQueue).
     pumpVendorLogos(st);
@@ -1275,14 +1541,23 @@ void drawPartsLibraryWorkspace(AppState& st) {
             }
         });
     }
+    if (S().shotSelectIndex >= 0 && !S().shotSelectApplied && S().searchDone &&
+        !S().searching && !g_indexBuilding) {
+        if (S().shotSelectIndex < static_cast<int>(S().results.size())) {
+            S().selectedId = S().results[S().shotSelectIndex].id;
+            S().scrollToSelected = true;
+            S().shotSelectApplied = true;
+        } else if (S().hasMore && !S().loadingMore && S().moreError.empty()) {
+            loadMoreParts(st);
+        }
+    }
+    S().visibleThumbs.clear();
 
-    // Layout: [taxonomy tree 240px] | [results flex] | [filters + vendor strip 260px].
-    // The docked AI Copilot column can squeeze this workspace well below the three columns'
-    // natural width, and ImGui reads a negative child width as "available minus |w|" — a
-    // silently wrong layout rather than an error. So the columns degrade instead: results
-    // are the primary content and keep a hard floor, the two side panes shrink
-    // proportionally, and once even a 60 %-width side pane will not fit they drop out.
-    const float totalW     = ImGui::GetContentRegionAvail().x;
+
+    // Side panes remain available as toolbar drawers when the workspace is narrow.
+    const ImVec2 bodyPos = ImGui::GetCursorScreenPos();
+    const float bodyH = ImGui::GetContentRegionAvail().y;
+    const float totalW = ImGui::GetContentRegionAvail().x;
     const float catFullW   = 240.0f * sc;
     const float filtFullW  = 260.0f * sc;
     // The two SameLine gaps between the columns. MUST match 2 x style ItemSpacing.x (10 px
@@ -1300,7 +1575,9 @@ void drawPartsLibraryWorkspace(AppState& st) {
         else                 { catW = filtW = 0.0f; }
     }
     const bool  sides = catW > 0.0f;
-    const float midW  = std::max(minMidW, totalW - catW - filtW - (sides ? gapsW : 0.0f));
+    if (sides && !S().selectedId.empty())
+        filtW = std::min(ui::metrics::partsDetailWidth(), totalW - catW - gapsW - minMidW);
+    const float midW = std::max(1.0f, totalW - catW - filtW - (sides ? gapsW : 0.0f));
 
     // ---- three-column body (full height — the search bar lives INSIDE the middle
     // column so Categories/Filters start flush at the top, no dead space) ---------
@@ -1346,17 +1623,20 @@ void drawPartsLibraryWorkspace(AppState& st) {
             sortFullW = std::max(sortFullW, ImGui::CalcTextSize(it).x);
         sortFullW += fpX * 2.0f + frameH;
 
-        // Row budget, MEASURED from the widgets that actually share the line. The sort combo
-        // is either whole — sized to its widest label, so no option is ever cut to "Releva…"
-        // — or, when that would squeeze the input below a readable minimum, just its arrow
-        // with the active sort named in its tooltip. The input takes everything else. Search
-        // and the view switch stay whole: each is one click the row cannot lose.
-        const float inputMin = 120.0f * sc;
-        const float room = ImGui::GetContentRegionAvail().x -
-                           (gapW * 3.0f + searchW + segW * 2.0f);
-        const float sortW = room - sortFullW >= inputMin ? sortFullW : frameH;
-        const bool  sortArrowOnly = sortW <= frameH;
-        const float inputW = std::max(ui::metrics::U(4), room - sortW);
+        // Keep the scrollbar lane clear, and move sort/view to a second row rather
+        // than collapsing the search field at narrow widths.
+        const float toolbarW = std::max(1.0f, ImGui::GetContentRegionAvail().x -
+                                              ui::metrics::px(ui::kChatScrollbarLane));
+        const float room = toolbarW - (gapW * 3.0f + searchW + segW * 2.0f);
+        const bool splitToolbar = room - frameH < 80.0f * sc;
+        const float sortRoom = splitToolbar ? toolbarW - segW * 2.0f - gapW : room;
+        const float sortW = splitToolbar
+            ? std::max(frameH, std::min(sortFullW, sortRoom))
+            : (room - sortFullW >= 120.0f * sc ? sortFullW : frameH);
+        const bool sortArrowOnly = sortW < sortFullW;
+        const float inputW = splitToolbar
+            ? std::max(1.0f, toolbarW - searchW - gapW)
+            : std::max(1.0f, room - sortW);
 
         const ImVec2 qOrigin = ImGui::GetCursorScreenPos();
         const ImVec2 xCenter(qOrigin.x + inputW - 15.0f * sc, qOrigin.y + frameH * 0.5f);
@@ -1454,7 +1734,7 @@ void drawPartsLibraryWorkspace(AppState& st) {
             dl->AddText(ImVec2(p0.x + (searchW - ts.x) * 0.5f, p0.y + (frameH - ts.y) * 0.5f),
                         Palette::toU32(palette.text), "Search");
         }
-        ImGui::SameLine();
+        if (!splitToolbar) ImGui::SameLine();
         // A one-cell table bounds the kit field to the measured toolbar slot;
         // fieldEnum takes its width from the content region, not SetNextItemWidth.
         const char* sortLabel = kSortItems[std::clamp(S().sortMode, 0,
@@ -1476,9 +1756,9 @@ void drawPartsLibraryWorkspace(AppState& st) {
         if (sortChanged) {
             st.settings.partsSortMode = S().sortMode;
             saveSettings(st.settings);
-            applyResultSort();   // cosmetic — never re-run the local + vendor fan-out
+            doSearch(st);   // the worker sorts the complete filtered set before pagination
         }
-        ImGui::SameLine();
+        if (!splitToolbar || toolbarW >= frameH + segW * 2.0f + gapW) ImGui::SameLine();
 
         // Two-segment view switch. The old single button was labelled with the mode you were
         // NOT in, so the toolbar never said which view was live; now both affordances are
@@ -1549,21 +1829,63 @@ void drawPartsLibraryWorkspace(AppState& st) {
 
         if (hit || go)
             doSearch(st);
+        if (!sides) {
+            if (chipToggle("##show_categories", "Categories", false))
+                ImGui::OpenPopup("##categories_drawer");
+            char filtersLabel[48];
+            const int active = activeFilterCount();
+            if (active) std::snprintf(filtersLabel, sizeof(filtersLabel), "Filters (%d)", active);
+            else std::snprintf(filtersLabel, sizeof(filtersLabel), "Filters");
+            if (chipWidth("Categories") + chipWidth(filtersLabel) +
+                ImGui::GetStyle().ItemSpacing.x <= toolbarW) ImGui::SameLine();
+            if (chipToggle("##show_filters", filtersLabel, active > 0))
+                ImGui::OpenPopup("##filters_drawer");
+            const ImVec2 drawerSize(std::max(1.0f, std::min(320.0f * sc, totalW - 20.0f * sc)),
+                                    std::max(1.0f, std::min(600.0f * sc, bodyH - 20.0f * sc)));
+            ImGui::SetNextWindowSize(drawerSize, ImGuiCond_Appearing);
+            if (ImGui::BeginPopup("##categories_drawer")) {
+                drawTaxonomyPane(st, ImGui::GetContentRegionAvail().x);
+                ImGui::EndPopup();
+            }
+            ImGui::SetNextWindowSize(drawerSize, ImGuiCond_Appearing);
+            if (ImGui::BeginPopup("##filters_drawer")) {
+                drawFiltersBlock(st, ImGui::GetContentRegionAvail().x);
+                ImGui::EndPopup();
+            }
+        }
+        handlePartsSelectionKeys(st);
 
         ImGui::Spacing();
         ImGui::Dummy(ImVec2(0.0f, 3.0f * sc));   // unweld the header from the toolbar
         {
-            // The count rides in the header's trailing slot, not baked into its label — a
-            // "Parts  (128)" label makes the count compete with the title for the eye.
-            char countBuf[64];
-            const char* trailing = nullptr;
-            if (!S().results.empty()) {
-                std::snprintf(countBuf, sizeof(countBuf), "%d result%s%s",
-                              (int)S().results.size(), S().results.size() == 1 ? "" : "s",
-                              S().hasLive ? " · incl. live" : "");
-                trailing = countBuf;
+            char countBuf[96];
+            const int live = std::max(0, static_cast<int>(S().results.size()) - S().localVisible);
+            if (S().totalExact)
+                std::snprintf(countBuf, sizeof(countBuf), "%d of %d", S().localVisible, S().localTotal);
+            else
+                std::snprintf(countBuf, sizeof(countBuf), "%d of %d+", S().localVisible, S().localTotal);
+            if (live > 0) {
+                const size_t len = std::strlen(countBuf);
+                std::snprintf(countBuf + len, sizeof(countBuf) - len, " Library · %d web", live);
             }
-            sectionHeader("Parts", /*firstInPane=*/true, "parts_all", trailing);
+            const float headerW = std::max(1.0f, ImGui::GetContentRegionAvail().x -
+                                                   ui::metrics::px(ui::kChatScrollbarLane));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+            ImGui::BeginChild("##parts_header", ImVec2(headerW, 0),
+                              ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysAutoResize,
+                              ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+            const bool showCount = S().searchDone && S().searchErr.empty();
+            const bool sameLine = ImGui::CalcTextSize(countBuf).x + 100.0f * sc < headerW;
+            sectionHeader("Parts", /*firstInPane=*/true, "parts_all",
+                          showCount && sameLine ? countBuf : nullptr);
+            if (showCount && !sameLine) {
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
+                ImGui::TextWrapped("%s", countBuf);
+                ImGui::PopStyleColor();
+            }
+            ImGui::EndChild();
+            ImGui::PopStyleVar();
         }
         // While the background vendor fan-out is still running, show each vendor being searched
         // (its live logo + a per-vendor progress bar) inline under the "Parts" header. Once it
@@ -1571,11 +1893,16 @@ void drawPartsLibraryWorkspace(AppState& st) {
         // of the vendors that actually contributed rows on screen.
         if (S().liveSearching && !S().liveVendors.empty()) {
             drawLiveVendorStrip(st);
-        } else if (S().liveSearching && !S().results.empty()) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("· loading more from vendors…");
+        } else if ((S().liveStarting || S().liveSearching) && !S().results.empty()) {
+            ImGui::TextDisabled("Searching web sources…");
         } else {
             drawResultSourcesRow();
+        }
+        if (S().hasLive) {
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + std::max(1.0f,
+                ImGui::GetContentRegionAvail().x - ui::metrics::px(ui::kChatScrollbarLane)));
+            ImGui::TextDisabled("Library sorted by %s; web results arrive separately.", sortLabel);
+            ImGui::PopTextWrapPos();
         }
         // Cold catalog: the rows below are only what is indexed so far. Say so with an
         // indeterminate bar — an index build has no honest percentage — and note that the
@@ -1583,7 +1910,8 @@ void drawPartsLibraryWorkspace(AppState& st) {
         if (g_indexBuilding) {
             ContentInset inset;
             ImDrawList*  dl   = ImGui::GetWindowDrawList();
-            const float  barW = ImGui::GetContentRegionAvail().x;
+            const float  barW = std::max(1.0f, ImGui::GetContentRegionAvail().x -
+                                                ui::metrics::px(ui::kChatScrollbarLane));
             const float  barH = 2.0f * sc;
             const ImVec2 b0   = ImGui::GetCursorScreenPos();
             const ImVec2 b1(b0.x + barW, b0.y + barH);
@@ -1611,15 +1939,25 @@ void drawPartsLibraryWorkspace(AppState& st) {
             if (S().fonts && S().fonts->body) ImGui::PopFont();
         }
         if (!S().notices.empty()) {
-            int unavailable = 0, signIn = 0, other = 0;
+            int unavailable = 0, signIn = 0, credentials = 0, other = 0;
+            bool kicadDeferred = false;
             for (const auto& n : S().notices) {
                 if (n.reason == "cef_unavailable") ++unavailable;
                 else if (n.reason == "login_required") ++signIn;
+                else if (n.reason == "credentials_required") ++credentials;
+                else if (n.reason == "native_browse_deferred") kicadDeferred = true;
                 else ++other;
             }
-            if (unavailable) ImGui::TextDisabled("Browser vendors unavailable in this build · public CAD search still works");
+            if (unavailable) ImGui::TextDisabled("Some browser sources are unavailable");
             if (signIn) ImGui::TextDisabled("%d vendor%s require sign-in · see Vendors",
                                            signIn, signIn == 1 ? "" : "s");
+            if (credentials) ImGui::TextDisabled("Configure API keys in Settings");
+            if (kicadDeferred) {
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    ImVec4(palette.textDim[0], palette.textDim[1], palette.textDim[2], 1.0f));
+                ImGui::TextWrapped("Select Electronics or search to include installed KiCad parts.");
+                ImGui::PopStyleColor();
+            }
             if (other) ImGui::TextDisabled("%d source%s could not be searched",
                                           other, other == 1 ? "" : "s");
             if (ImGui::IsItemHovered()) {
@@ -1639,6 +1977,15 @@ void drawPartsLibraryWorkspace(AppState& st) {
         }
         if (S().gridView) drawResultsGrid(st);
         else              drawResultsList(st);
+        if (!S().moreError.empty()) ImGui::TextWrapped("Could not load more: %s", S().moreError.c_str());
+        if (S().hasMore) {
+            ImGui::BeginDisabled(S().loadingMore);
+            if (ImGui::Button(S().loadingMore ? "Loading…" : "Load more")) loadMoreParts(st);
+            ImGui::EndDisabled();
+        }
+        if (S().searchDone && S().searchErr.empty() && !S().totalExact && !S().hasMore)
+            ImGui::TextWrapped("Library results may be incomplete; refine the search to narrow them.");
+        flushThumbRequests(st);
     }
     // App pill scrollbar on the results column's right edge (no-op unless it overflows).
     // Outside the if/else so the embedded browser panel gets the same bar.
@@ -1654,7 +2001,22 @@ void drawPartsLibraryWorkspace(AppState& st) {
 
     if (sides) {
         ImGui::SameLine();
-        drawFiltersBlock(st, filtW);   // right pane: filters + facets + vendor strip footer
+        if (S().selectedId.empty()) {
+            drawFiltersBlock(st, filtW);
+        } else {
+            ImGui::BeginChild("##part_details", ImVec2(filtW, 0), ImGuiChildFlags_Borders);
+            drawPartDetails(st);
+            ImGui::EndChild();
+        }
+    }
+    if (!sides && !S().selectedId.empty() && !browserPanelActive()) {
+        const float width = std::min(ui::metrics::partsDetailWidth(), totalW);
+        ImGui::SetNextWindowPos(ImVec2(bodyPos.x + totalW - width, bodyPos.y), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(width, std::max(1.0f, bodyH)), ImGuiCond_Always);
+        const ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse;
+        if (ImGui::Begin("##parts_detail_drawer", nullptr, flags)) drawPartDetails(st);
+        ImGui::End();
     }
 
     drawVendorsPopup(st);          // floating "Vendor Accounts" window (no-op when closed)

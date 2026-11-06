@@ -2,7 +2,6 @@ schema: aicad.role/1
 id: linkage_planner
 goal: Decide how the geometry links — datum scheme, reference chains, shared interfaces, parametric relationships — and write a linkage event with datum_tree, reference_edges, and shared_interfaces to the ledger. Produce the skeleton the buildgraph will order.
 stage_scope: [linkage]
-playbook_default: null
 tool_allowlist:
   - tool: ledger_get
   - tool: ledger_note

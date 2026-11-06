@@ -4,16 +4,16 @@ geometry that replaces the flat 68-face dump.
   describe_part(doc_id)         -> the part OUTLINE: bbox, feature groups WITH a placement
                                    narrative (which face each feature sits on, offsets from the
                                    part bbox, what it touches), detected symmetry/instances,
-                                   addressable handles (bores/caps/round faces) with stable ids.
+                                   addressable handles (bores/caps/round faces) with revision-scoped ids.
   query_adjacency(doc_id)       -> the face-adjacency graph (W3): which faces touch, convex/concave.
-  hover(sid, doc_id)            -> expand ONE face/edge by the stable id describe_part gave.
+  hover(sid, doc_id)            -> expand ONE face/edge by the current id describe_part gave.
   describe_sketch(sketch, ...)  -> a sketch's plane, entity roster, constraints, regions and DOF
                                    verdict as text — the non-vision equivalent of looking at it.
   describe_scene(views, ...)    -> deterministic "what the render would show" per view, from
                                    B-rep face normals — the non-vision fallback for render_part.
 
-These let the model pull a small, named view and address geometry by a STABLE handle instead of
-re-reading the whole B-rep after every edit.
+These let the model pull a small, named view and address geometry by revision-scoped handles.
+Refresh handles after edits; collisions require disambiguation.
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ from services.mcp import core_bridge as cb
 from services.mcp.cad_common import (_NON_BODY_FEATURE_TYPES, _face_attribution,
                                    _solid_feature_order, coerce_json_or_repr,
                                    placement_source_of, placement_warnings, require_list)
-from services.mcp.cad_asm_tools import resolve_component_source
+from services.mcp.cad_asm_tools import resolve_component_source, source_states
 from services.mcp.cad_tools import _doc, _dumps, _err
 from services.mcp.fit_narration import _format_fit  # single home; loop.py shares it
 
@@ -502,7 +502,8 @@ def _outline_text(d: dict) -> str:
 
 
 # ---------------------------------------------------------------- A1: describe_sketch
-_DIM_CONSTRAINT_TYPES = {"distance", "length", "angle", "radius", "diameter", "arc_length"}
+_DIM_CONSTRAINT_TYPES = {"distance", "signed_distance", "length", "angle", "radius", "diameter",
+                         "arc_length", "rotate_point"}
 
 
 def _sketch_authored_params(feat: Optional[dict]) -> dict:
@@ -567,18 +568,40 @@ def _sketch_digest(sketch: str, overview: dict, regions_resp: dict,
                          "status": statuses.get(eid, "?"),
                          "construction": bool(e.get("construction"))})
 
+    # Solver-measured values per constraint (doc_sketch_overview constraints[].measured).
+    overview_rows = {r.get("id"): r for r in (overview.get("constraints") or [])
+                     if isinstance(r, dict) and r.get("id") is not None}
     by_kind: dict = defaultdict(list)
+    auto_by_kind: dict = defaultdict(int)
     dims = []
+    linked_rotations = []
     for c in authored.get("constraints") or []:
         if not isinstance(c, dict):
             continue
         ctype = c.get("type", "?")
-        by_kind[ctype].append(c.get("id"))
-        if ctype in _DIM_CONSTRAINT_TYPES:
+        auto = bool(c.get("auto") or (overview_rows.get(c.get("id")) or {}).get("auto"))
+        angle_ref = c.get("angle_ref") or (overview_rows.get(c.get("id")) or {}).get("angle_ref")
+        if ctype == "rotate_point" and angle_ref:
+            by_kind["rotate_point (linked)"].append(c.get("id"))
+            linked_rotations.append({"id": c.get("id"), "angle_ref": angle_ref,
+                                     "refs": c.get("refs") or []})
+            if auto:
+                auto_by_kind["rotate_point (linked)"] += 1
+        elif ctype in _DIM_CONSTRAINT_TYPES:
+            by_kind[ctype].append(c.get("id"))
             val = c.get("value") or {}
-            dims.append({"id": c.get("id"), "type": ctype, "value": val.get("value"),
-                        "expr": val.get("expr"), "driven": bool(c.get("driven"))})
+            expr = val.get("expr")
+            dims.append({"id": c.get("id"), "type": ctype,
+                        "stored_value": val.get("value"), "expr": expr,
+                        "measured": (overview_rows.get(c.get("id")) or {}).get("measured"),
+                        "axis": c.get("axis") or (overview_rows.get(c.get("id")) or {}).get("axis"),
+                        "driven": bool(c.get("driven")), "auto": auto})
+        else:
+            by_kind[ctype].append(c.get("id"))
+            if auto:
+                auto_by_kind[ctype] += 1
     relation_counts = {k: len(v) for k, v in by_kind.items() if k not in _DIM_CONSTRAINT_TYPES}
+    relation_auto_counts = dict(auto_by_kind)
 
     regions = []
     for r in regions_resp.get("regions") or []:
@@ -597,20 +620,29 @@ def _sketch_digest(sketch: str, overview: dict, regions_resp: dict,
     dof = overview.get("dof", 0)
     over_ids = [k for k, v in statuses.items() if v == "over"]
     skipped = overview.get("skipped_constraints") or []
+    conflicting = overview.get("conflicting") or []
+    solve_rejected = bool(overview.get("solve_rejected"))
     from services.mcp.ascii2d import sketch_design_intent
     intent = sketch_design_intent(
         authored.get("entities") or [], authored.get("constraints") or [],
         health={**overview, "external_refs": authored.get("external_refs") or []})
-    if status == "over" or over_ids:
+    if solve_rejected:
+        verdict = ("SOLVE REJECTED — the solver refused this sketch's constraints, so the entity "
+                   "coordinates listed are the AUTHORED seed geometry, NOT a solved shape; "
+                   "measured values describe those seeds, not a solved shape"
+                   + (f"; conflicting constraints {conflicting}" if conflicting else "")
+                   + ". Run sketch_health for the conflict set, remove or fix one, then re-read.")
+        fully_defined = False
+    elif status == "over" or over_ids or conflicting:
         verdict = "Over-defined" + (f': conflicting entities {over_ids} — remove one constraint.'
                                     if over_ids else ' — remove a conflicting constraint.')
         fully_defined = False
-    elif intent["pinned_only"]:
-        verdict = ("Pinned instead of constrained — replace profile fix pins with "
-                   "relations/driving dimensions, then sketch_fully_define.")
+    elif intent["pinned_entities"]:
+        verdict = (f"Pinned instead of constrained — fix pins on {intent['pinned_entities']}; "
+                   "replace them with relations/driving dimensions, then sketch_fully_define.")
         fully_defined = False
-    elif dof == 0 and not skipped:
-        verdict = "Fully defined (dof 0) — constrained parametrically, not pinned_only."
+    elif dof == 0 and status == "full" and not skipped:
+        verdict = "Fully defined (dof 0) — constrained parametrically, nothing fix-pinned."
         fully_defined = True
     else:
         verdict = (f'Under-defined: {dof} degree(s) of freedom remain — add geometric relations '
@@ -628,17 +660,27 @@ def _sketch_digest(sketch: str, overview: dict, regions_resp: dict,
                 "normal": [round(frame[2], 3), round(frame[6], 3), round(frame[10], 3)]}
     plane_ref = (feat.get("refs") or {}).get("plane") if feat else None
     plane_name = (plane_ref if isinstance(plane_ref, str)
-                 else plane_ref.get("kind") if isinstance(plane_ref, dict) else None)
+                 else (plane_ref.get("kind") or plane_ref.get("of"))
+                 if isinstance(plane_ref, dict) else None)
 
+    region_error = (regions_resp.get("error") or "region computation failed"
+                    if regions_resp.get("ok") is False else None)
     return {"sketch": sketch, "plane": plane, "plane_ref": plane_name,
-           "entities": entities, "relation_counts": relation_counts, "dimensions": dims,
-           "regions": regions, "status": status, "dof": dof,
+           "entities": entities, "relation_counts": relation_counts,
+           "relation_auto_counts": relation_auto_counts, "dimensions": dims,
+           "linked_rotations": linked_rotations,
+           "regions": None if region_error else regions, "region_error": region_error,
+           "status": status, "dof": dof, "solve_rejected": solve_rejected,
            "fully_defined": fully_defined, "skipped_constraints": skipped, "verdict": verdict,
            **intent}
 
 
 def _sketch_text(d: dict) -> str:
     lines = []
+    if d.get("solve_rejected"):
+        lines.append("!! SOLVE REJECTED: the entity coordinates below are the AUTHORED seed "
+                     "geometry, NOT a solved shape; any measured values describe those seeds "
+                     "until the conflict is fixed (sketch_health names it).")
     p = d.get("plane")
     if p:
         named = f' on {d["plane_ref"]}' if d.get("plane_ref") else ""
@@ -657,22 +699,52 @@ def _sketch_text(d: dict) -> str:
         lines.append("  (none)")
 
     rel = d.get("relation_counts") or {}
+    rel_auto = d.get("relation_auto_counts") or {}
     dims = d.get("dimensions") or []
     lines.append("Constraints:")
     if rel:
-        lines.append("  relations: " + "; ".join(f'{k} x{v}' for k, v in sorted(rel.items())))
+        lines.append("  relations: " + "; ".join(
+            f'{k} x{v}' + (f' [{rel_auto[k]} auto]' if rel_auto.get(k) else "")
+            for k, v in sorted(rel.items())))
+    for linked in d.get("linked_rotations") or []:
+        lines.append(f"  {linked['id']} rotate_point linked to angle_ref={linked['angle_ref']}"
+                     " (edit the master dimension)")
     if dims:
+        def _num(x) -> str:
+            return f"{x:.6g}" if isinstance(x, (int, float)) and not isinstance(x, bool) else str(x)
+
         dim_txt = []
         for c in dims:
-            v = c.get("value")
-            vt = "?" if v is None else (f'{v} ({c["expr"]})' if c.get("expr") else f'{v}')
-            dim_txt.append(f'{c["id"]} {c["type"]}={vt}' + (' [ref]' if c.get("driven") else ""))
-        lines.append("  driving dims: " + "; ".join(dim_txt))
+            v = c.get("stored_value")
+            m = c.get("measured")
+            has_m = isinstance(m, (int, float)) and not isinstance(m, bool)
+            if c.get("expr"):
+                vt = (f'{c["expr"]} = {_num(m)}' if has_m else f'{c["expr"]} (no solver value)')
+                if v is not None and not (has_m and v == m):
+                    vt += f' (stored literal {v})'
+            elif c.get("driven"):
+                vt = (f'measured {_num(m)}' if has_m
+                      else 'no solver value (constraint skipped or solve rejected)')
+            else:
+                vt = "?" if v is None else str(v)
+                if has_m and isinstance(v, (int, float)) and not math.isclose(
+                        float(v), float(m), rel_tol=1e-6, abs_tol=1e-6):
+                    vt += f' (solved {_num(m)})'
+            dim_txt.append(f'{c["id"]} {c["type"]}={vt}'
+                           + (f' [axis {c["axis"]}]' if c.get("axis") else "")
+                           + (' [ref]' if c.get("driven") else "")
+                           + (' [auto]' if c.get("auto") else ""))
+        lines.append(f'  dimensions ({d.get("authored_dimensions", 0)} authored driving, '
+                     f'{d.get("auto_dimensions", 0)} auto driving, '
+                     f'{sum(1 for c in dims if c.get("driven"))} reference): '
+                     + "; ".join(dim_txt))
     if not rel and not dims:
         lines.append("  (none)")
 
     regs = d.get("regions") or []
-    if regs:
+    if d.get("region_error"):
+        lines.append(f'Regions: unavailable ({d["region_error"]})')
+    elif regs:
         parts = []
         for r in regs:
             kind = "region" if r.get("is_material", True) else "void"
@@ -1086,8 +1158,17 @@ def _describe_results_text(doc_id: str, study_name: Optional[str] = None) -> str
         if bc["loaded"]:
             lines.append(f'  Load applied on: {", ".join(bc["loaded"][:4])}  (sid join of the '
                          'stored load queries)')
-        lines.append('  Max-stress node location: not stored in the study record — the study '
-                     'persists summary scalars only; re-run run_fea_static for the live field.')
+        spots = results.get("hot_spots") or []
+        if spots:
+            peak = spots[0]
+            lines.append(f'  Unmasked peak node: {peak.get("location_mm")} mm, '
+                         f'{peak.get("von_mises_mpa")} MPa; face {peak.get("face_sid")}, '
+                         f'owner {peak.get("owner_feature")}, FoS {peak.get("factor_of_safety")}. '
+                         'Face attribution is approximate; FoS may be capped at 15.')
+            if peak.get("sharp_edge_warning"):
+                lines.append(f'  Warning: {peak["sharp_edge_warning"]}')
+        else:
+            lines.append('  Max-stress node location: not available in this study.')
 
         if disp is not None:
             lines.append(f'  Max displacement: {disp:.3f} mm  (source: run_fea_static)')
@@ -1095,9 +1176,9 @@ def _describe_results_text(doc_id: str, study_name: Optional[str] = None) -> str
             lines.append('  Max displacement: not available')
 
         if fos is not None:
-            verdict = "holds" if fos >= 1.0 else "FAILS"
-            lines.append(f'  Min factor of safety: {fos:.2f}  '
-                         f'(yield / max stress; >1 means holds — {verdict})')
+            cap = " (solver cap; actual value may be higher)" if fos >= 15 else ""
+            lines.append(f'  Min factor of safety: {fos:.2f}{cap}; '
+                         'a single-mesh yield ratio is not a strength verdict.')
             if yield_mpa is not None and vm is not None:
                 margin = yield_mpa - vm
                 direction = "above" if margin >= 0 else "below"
@@ -1108,8 +1189,13 @@ def _describe_results_text(doc_id: str, study_name: Optional[str] = None) -> str
         if n_dof is not None:
             lines.append(f'  Mesh: {n_dof} DOF  (mesh_fineness {mesh_fine:.2f}, tet10 elements)')
 
-        lines.append('\nConvergence note: tet10 (2nd-order) elements used; re-run with finer mesh '
-                     '(mesh_fineness → 0.8) to verify convergence for final design.')
+        convergence = study.get("convergence_evidence")
+        if convergence:
+            lines.append(f'\nConvergence: monitor {convergence.get("monitor")}, '
+                         f'converged={convergence.get("converged")}; '
+                         'see stored convergence_evidence for the complete ladder.')
+        else:
+            lines.append('\nConvergence not established; run a mesh-convergence study.')
 
     elif stype == "fea_modal":
         freqs = results.get("freqs_hz", [])
@@ -1139,7 +1225,7 @@ def _describe_results_text(doc_id: str, study_name: Optional[str] = None) -> str
     if stype == "fea_static":
         try:
             from services.agent.advisor.sim_advisor import postcheck, narrate_postcheck  # noqa: PLC0415
-            pc = postcheck(study)
+            pc = postcheck(study, doc_geom=study.get("doc_geom"))
             verdict_text = narrate_postcheck(pc)
             if verdict_text:
                 lines.append(verdict_text)
@@ -1181,15 +1267,20 @@ def _component_sources(doc_id: str) -> tuple:
 def _describe_assembly_text(doc_id: str) -> str:
     """Narrate world placement, the mate-solve verdict, and collision-only fit.
 
-    Calls asm_world_bodies, then doc_solve_mates for the verdict (status, dof), then
-    eval_interference in zero-clearance threshold mode. A re-solve that moves nothing
+    Captures assembly source status before asm_world_bodies can refresh it, then calls
+    doc_solve_mates for the verdict (status, dof) and eval_interference in
+    zero-clearance threshold mode. A re-solve that moves nothing
     is not an edit (core/doc/session.cpp::doc_solve_mates), so describing a solved
     assembly never bumps its revision or marks it dirty. The native fit check
-    evaluates geometry and exact overlap volumes, not minimum measured gaps.
+    evaluates geometry and overlap volumes (marked approximate on fuzzy fallback),
+    not minimum measured gaps.
     Preserve the raw fit evidence in the reply.
     """
-    # 1. World-placed bodies
+    # Capture before world-body access, which may refresh the assembly.
     try:
+        source_status = cb.call("asm_source_status", {"doc_id": doc_id})
+        if source_status.get("ok") is False:
+            return _dumps(source_status)
         wb_r = cb.call("asm_world_bodies", {"doc_id": doc_id, "explode": False})
     except Exception as e:  # noqa: BLE001
         return _err(e)
@@ -1202,7 +1293,8 @@ def _describe_assembly_text(doc_id: str) -> str:
     n = len(bodies)
 
     if n == 0:
-        return _dumps({"ok": False, "collision_free": False, "bodies": bodies, "text":
+        return _dumps({"ok": False, "collision_free": False, "bodies": bodies,
+                       "source_status": source_status, "text":
                        "No bodies found in this document — "
                        "add components (assembly) or features (part) first. "
                        "No collision qualification is possible without checked body pairs."})
@@ -1251,6 +1343,12 @@ def _describe_assembly_text(doc_id: str) -> str:
         for c in unresolved:
             lines.append(f"  WARNING {c['name'] or c['id']}: the relative source "
                          f"{c['source']['path']!r} has no base folder. Give an absolute path.")
+    states = source_states(doc_id, components, source_status) if not is_multi else []
+    if not is_multi:
+        lines.append(f"\nAssembly source status before refresh: {source_status.get('status')}")
+    for state in states:
+        lines.append(f"\nComponent source {state['component']}: {state['state']} "
+                     f"({state['source']})")
 
     # 3. Solve/DOF summary, including solved-pose freedom beside mechanism mobility.
     try:
@@ -1323,11 +1421,18 @@ def _describe_assembly_text(doc_id: str) -> str:
 
     lines.append("\n(Source: asm_world_bodies pre-solve placement snapshot; doc_solve_mates "
                  "live solve; eval_interference live threshold classification and overlap volumes)")
-    return _dumps({"ok": complete, "text": "\n".join(lines), "bodies": bodies,
-                   "components": components, "component_source_base": source_base,
-                   "fit": if_r,
-                   "collision_free": complete and checked > 0 and if_r.get("ok") is True
-                   and not if_r.get("interferences")})
+    out = {"ok": True, "text": "\n".join(lines), "bodies": bodies,
+           "components": components, "component_source_base": source_base,
+           "fit": if_r,
+           "collision_free": complete and checked > 0 and if_r.get("ok") is True
+           and not if_r.get("interferences")}
+    if not is_multi:
+        out["source_status"] = source_status
+    if states:
+        out["source_states"] = states
+    if not complete:
+        out["warnings"] = ["Interference check incomplete; collision-free status is not established."]
+    return _dumps(out)
 
 
 def _board_power_lines(engs: list, label: str) -> list:
@@ -1364,39 +1469,33 @@ def _board_power_lines(engs: list, label: str) -> list:
                      f"  ({totals['n_missing_power']} component(s) without power data)")
     else:
         lines.append(f"  {label} total: unknown (no component carries power metadata)")
-    lines.append("  (source: engine.ecad.metadata — seeds carry datasheet source notes)")
+    lines.append("  (source: services.ecad.metadata — seeds carry datasheet source notes)")
     return lines
 
 
+def _kicad_check_counts(doc_id: str) -> tuple[int, int]:
+    """Read the authoritative KiCad ERC/DRC counts, never treating an unavailable check as clean."""
+    result = cb.call("ecad_kicad_check", {"doc_id": doc_id})
+    violations = result.get("violations")
+    if not isinstance(violations, list):
+        raise ValueError("KiCad check did not return violations")
+    counts = result.get("counts") or {}
+    return (counts.get("error", sum(v.get("severity") == "error" for v in violations)),
+            counts.get("warning", sum(v.get("severity") == "warning" for v in violations)))
+
+
 def _describe_board_text(doc_id: str) -> str:
-    """Narrate a PCB or schematic board's status as GSL text.
-
-    Promotes ecad_status data into the narration contract layer. Reads directly from
-    the ecad Python modules (same sources ecad_status uses) and reformats as narration
-    text following contracts/narration.md section order.
-
-    Data sources:
-    1. ecad_session.get_session → kind (sch|pcb), component list, netlist
-    2. engine.ecad.netlist.build_netlist → components, nets
-    3. engine.ecad.erc.run_erc → ERC/DRC violation summary
-    """
-    # The session/netlist facades route to the C++ core via core_bridge RPCs.
+    """Narrate a live PCB or schematic using the native netlist and KiCad checks."""
     from services.mcp.ecad_common import (  # noqa: PLC0415
-        _ECAD, _compile_of, _unconnected_pins, ecad_session, netlist_mod,
+        _resolve_ecad_session, _unconnected_pins, netlist_mod,
     )
 
-    did = (doc_id or _ECAD["current"] or _ECAD["current_sch"]
-           or _ECAD["current_pcb"])
-    if not did:
-        return _dumps({"ok": False,
-                       "error": "No active ECAD document — open one with "
-                                "ecad_new_schematic or ecad_new_pcb first."})
     try:
-        session = ecad_session.get_session(did)
+        session = _resolve_ecad_session(doc_id or None)
     except Exception as e:  # noqa: BLE001
         return _dumps({"ok": False,
                        "error": f"No active ECAD document: {e} — "
-                                "open one with ecad_new_schematic or ecad_new_pcb first."})
+                                "open a KiCad file with ecad_open first."})
 
     doc = session.doc
     kind = session.kind  # "sch" or "pcb"
@@ -1413,25 +1512,22 @@ def _describe_board_text(doc_id: str) -> str:
             f'Board "{doc_name}" — PCB layout',
             f'  {len(fps)} footprint(s), {len(nets)} net(s), '
             f'{len(tracks)} track(s), {len(vias)} via(s)  '
-            f'(source: ecad_session)',
+            f'(source: ECAD session)',
         ]
         if has_outline:
-            lines.append("  Board outline: defined  (source: ecad_session)")
+            lines.append("  Board outline: defined  (source: ECAD session)")
         else:
             lines.append("  Board outline: NOT defined — set one with a pcb_set_outline op")
 
-        # DRC summary (best-effort)
+        # KiCad is authoritative; the incremental compile is not a DRC verdict.
         n_err = 0
         try:
-            res = _compile_of(session).get("drc", [])  # C++ compile runs engine.ecad.drc
-            viols = res if isinstance(res, list) else res.get("violations", [])
-            n_err = sum(1 for v in viols if v.get("severity") == "error")
-            n_warn = sum(1 for v in viols if v.get("severity") == "warning")
+            n_err, n_warn = _kicad_check_counts(session.doc_id)
             if n_err:
                 lines.append(f"\nDRC: {n_err} error(s), {n_warn} warning(s) — fix errors before "
-                              "fabrication  (source: engine.ecad.drc)")
+                             "fabrication  (source: KiCad DRC)")
             else:
-                lines.append(f"\nDRC: clean — {n_warn} warning(s)  (source: engine.ecad.drc)")
+                lines.append(f"\nDRC: clean — {n_warn} warning(s)  (source: KiCad DRC)")
         except Exception:  # noqa: BLE001
             lines.append("\nDRC: not available")
 
@@ -1454,7 +1550,7 @@ def _describe_board_text(doc_id: str) -> str:
             lines.append("\nCaveats:")
             for c in caveats:
                 lines.append(f"  - {c}")
-        lines.append("\n(Source: ecad_session, engine.ecad.drc — numbers narrated, never recomputed)")
+        lines.append("\n(Source: ECAD session, KiCad DRC — numbers narrated, never recomputed)")
         return _dumps({"ok": True, "text": "\n".join(lines)})
 
     # ---- schematic ----
@@ -1466,7 +1562,7 @@ def _describe_board_text(doc_id: str) -> str:
     lines = [
         f'Board "{doc_name}" — schematic',
         f'  {len(components)} component(s), {len(net_list)} net(s)  '
-        f'(source: engine.ecad.netlist)',
+        f'(source: native ECAD netlist)',
     ]
 
     # Component roster
@@ -1506,17 +1602,15 @@ def _describe_board_text(doc_id: str) -> str:
     else:
         lines.append("\nNo nets — wire pins with ecad_wire.")
 
-    # ERC summary
+    # ERC is the KiCad check, not the incremental op-engine compile.
     n_erc_err = 0
     try:
-        violations = _compile_of(session).get("erc", []) or []  # C++ compile runs engine.ecad.erc
-        n_erc_err = sum(1 for v in violations if v.get("severity") == "error")
-        n_erc_warn = sum(1 for v in violations if v.get("severity") == "warning")
+        n_erc_err, n_erc_warn = _kicad_check_counts(session.doc_id)
         if n_erc_err:
             lines.append(f"\nERC: {n_erc_err} error(s), {n_erc_warn} warning(s)  "
-                         "(source: engine.ecad.erc)")
+                         "(source: KiCad ERC)")
         else:
-            lines.append(f"\nERC: clean — {n_erc_warn} warning(s)  (source: engine.ecad.erc)")
+            lines.append(f"\nERC: clean — {n_erc_warn} warning(s)  (source: KiCad ERC)")
     except Exception:  # noqa: BLE001
         lines.append("\nERC: not available")
 
@@ -1545,7 +1639,7 @@ def _describe_board_text(doc_id: str) -> str:
         for c in caveats:
             lines.append(f"  - {c}")
 
-    lines.append("\n(Source: engine.ecad.netlist, engine.ecad.erc — "
+    lines.append("\n(Source: native ECAD netlist, KiCad ERC — "
                  "numbers narrated, never recomputed)")
     return _dumps({"ok": True, "text": "\n".join(lines)})
 
@@ -1677,37 +1771,35 @@ def _bounded_clauses(text: str, limit: int = _HEALTH_SAMPLE) -> str:
     return "; ".join(clauses[:limit]) + f"; … +{len(clauses) - limit} more"
 
 
-def _schedule_lines(schedule: list) -> list[str]:
-    """Schedule rows, collapsing runs that differ only by which entity they name.
+def _hint_lines(hints: list) -> list[str]:
+    """Hint rows, collapsing runs that differ only by which entity they name.
 
-    A 12-row schedule whose every row says "add driving dimension / geometric relation
-    for eN — eN is under-constrained in p1 x, p1 y, p2 x, p2 y" carries exactly one
-    instruction and a list of 12 entities. Emit it that way; keep distinct remedies
-    verbatim and in order."""
+    sketch_health ``hints`` are unordered suggestions (the engine renamed its old
+    ``schedule``), not a plan to execute in sequence. A 12-row list whose every row says
+    "add driving dimension / geometric relation for eN — eN is under-constrained in p1 x,
+    p1 y, p2 x, p2 y" carries exactly one suggestion and a list of 12 entities. Emit it
+    that way; keep distinct suggestions verbatim."""
     groups: list[tuple[str, str, str, list[str], dict]] = []
-    for step in schedule:
+    for step in hints:
         if not isinstance(step, dict):
             continue
         kind = str(step.get("kind", "?"))
         action = str(step.get("action", "?"))
         why = str(step.get("why", ""))
         entity = str(step.get("entity", "") or "")
-        # Signature of the remedy with the entity id factored out, so "…for e7 — e7 is
-        # under-constrained in p1 x…" and the e8 row hash to the same instruction.
+        # Signature of the suggestion with the entity id factored out, so "…for e7 — e7 is
+        # under-constrained in p1 x…" and the e8 row hash to the same text.
         if entity:
             sig = (kind, action.replace(entity, "$E"), why.replace(entity, "$E"))
         else:
             sig = (kind, action, why)
         if groups and groups[-1][:3] == sig:
             groups[-1][3].append(entity)
-            groups[-1][5].append(step.get("order"))
         else:
-            groups.append((sig[0], sig[1], sig[2], [entity], step,
-                           [step.get("order")]))
+            groups.append((sig[0], sig[1], sig[2], [entity], step))
 
     out: list[str] = []
-    for kind, action_sig, why_sig, ents, first, orders in groups:
-        order = first.get("order", "?")
+    for kind, action_sig, why_sig, ents, first in groups:
         action = str(first.get("action", "?"))
         why = str(first.get("why", ""))
         handles = first.get("handles") or []
@@ -1715,35 +1807,49 @@ def _schedule_lines(schedule: list) -> list[str]:
         if len(named) > 1:
             shown = ", ".join(named[:8])
             more = f" … +{len(named) - 8}" if len(named) > 8 else ""
-            # Restate the remedy once with the entity slot generic, then name the set.
-            # The order SPAN is kept so a model applying the schedule still knows the
-            # collapsed row stands for steps 2..13, not for step 2 alone.
-            nums = [o for o in orders if isinstance(o, int)]
-            span = f"{min(nums)}-{max(nums)}" if len(nums) > 1 else str(order)
+            # Restate the suggestion once with the entity slot generic, then name the set.
             generic_action = action_sig.replace("$E", "each entity")
             generic_why = why_sig.replace("$E", "each")
-            out.append(f"  {span}. [{kind}] x{len(named)}: {generic_action}"
+            out.append(f"  - [{kind}] x{len(named)}: {generic_action}"
                        f" — {generic_why} — entities: {shown}{more}")
             continue
         if handles:
             h_str = ", ".join(str(h) for h in handles[:6])
             more_h = f" … +{len(handles) - 6}" if len(handles) > 6 else ""
-            out.append(f"  {order}. [{kind}] {action} at {h_str}{more_h} — {why}")
+            out.append(f"  - [{kind}] {action} at {h_str}{more_h} — {why}")
         elif named:
-            out.append(f"  {order}. [{kind}] {action} for {named[0]} — {why}")
+            out.append(f"  - [{kind}] {action} for {named[0]} — {why}")
         else:
-            out.append(f"  {order}. [{kind}] {action} — {why}")
+            out.append(f"  - [{kind}] {action} — {why}")
     return out
+
+
+def _constraint_label(row: dict) -> str:
+    """``c3 (distance 40) [auto]`` — id, type, driving value, auto/driven tags."""
+    value = row.get("value")
+    if isinstance(value, dict):
+        value = value.get("value")
+    text = f"{row.get('id', '?')} ({row.get('type', '?')}" \
+           + (f" {value:.6g}" if isinstance(value, (int, float)) and not isinstance(value, bool)
+              else "") + ")"
+    if row.get("auto"):
+        text += " [auto]"
+    if row.get("driven"):
+        text += " [reference]"
+    return text
 
 
 def sketch_health_text(d: dict) -> str:
     """Render a ``doc_sketch_health`` result dict as plain English text for no-vision models.
 
-    Returns a multi-line string with four sections:
-      1. Closure: "CLOSED (N material regions)" or "OPEN: N dangling endpoints at: [handles]"
-      2. Remaining DOF in plain words (from dof_narration).
-      3. Conflicts and redundant constraints (if any).
-      4. Ordered relations-then-dimensions schedule.
+    Returns a multi-line string with these sections:
+      1. Closure: "CLOSED (N material regions)"; open endpoints are a DEFECT only when a
+         consumer needs a closed profile (usage closed_profile/mixed) and informational for
+         open_path / unknown usage.
+      2. Solver problems (not converged, skipped constraints) and remaining DOF in plain words.
+      3. Dimension provenance (authored vs auto) when the caller enriched the result.
+      4. Conflicts (with the minimal conflicting set) and redundant constraints.
+      5. Hints: unordered suggestions, not a plan.
 
     This is the feedback channel that lets a no-vision local model SEE its work
     and know what to do next.
@@ -1754,6 +1860,8 @@ def sketch_health_text(d: dict) -> str:
     closure = d.get("closure") or {}
     open_eps = closure.get("open_endpoints") or []
     mat_regions = closure.get("material_regions")
+    usage = closure.get("usage", "unknown")
+    needs_closed = usage in ("closed_profile", "mixed")
     if not open_eps:
         region_txt = f" ({mat_regions} material region{'s' if mat_regions != 1 else ''})" \
             if mat_regions is not None else ""
@@ -1761,49 +1869,250 @@ def sketch_health_text(d: dict) -> str:
     else:
         handles_str = ", ".join(str(h) for h in open_eps[:8])
         more = f" … and {len(open_eps) - 8} more" if len(open_eps) > 8 else ""
-        lines.append(f"Closure: OPEN — {len(open_eps)} dangling endpoint(s) at: "
-                     f"{handles_str}{more}")
-        lines.append("  → run sketch_auto_constrain to stitch near-touching endpoints")
+        if needs_closed:
+            lines.append(f"Closure: OPEN — {len(open_eps)} dangling endpoint(s) at: "
+                         f"{handles_str}{more}")
+            lines.append("  → a consumer needs a closed profile; inspect gaps and use "
+                         "sketch_auto_constrain for near-touching endpoints")
+        elif usage == "open_path":
+            lines.append(f"Closure: open path (informational) — {len(open_eps)} endpoint(s) at: "
+                         f"{handles_str}{more}")
+            lines.append("  → an open path is valid for its consumer; do not close it automatically")
+        else:
+            lines.append(f"Closure: open chain (informational) — {len(open_eps)} endpoint(s) at: "
+                         f"{handles_str}{more}")
+            lines.append("  → closure is only needed if a future consumer requires a closed profile")
 
-    # ── 2. DOF / free variables ──────────────────────────────────────────────────
-    dof = d.get("dof", 0)
+    # ── 2. Solver problems, DOF / free variables ─────────────────────────────────
+    dof = d.get("dof")
+    dof_known = isinstance(dof, (int, float)) and not isinstance(dof, bool)
+    if not dof_known:
+        dof = 0
     status = d.get("status", "unknown")
     narration = d.get("dof_narration") or ""
-    if d.get("pinned_only"):
-        lines.append(f"DOF: {dof} — profile pinned instead of constrained; replace fix pins "
-                     "with relations/driving dimensions, then sketch_fully_define")
+    skipped = d.get("skipped_constraints") or []
+    not_converged = d.get("converged") is False
+    if not_converged:
+        lines.append("Solver: DID NOT CONVERGE — the dof/status below describe a failed solve, "
+                     "not a definition state; fix the conflicts or skipped constraints first")
+    if skipped:
+        shown = "; ".join(
+            f"{row.get('id', '?')} ({row.get('reason', 'no reason reported')})"
+            if isinstance(row, dict) else str(row) for row in skipped[:6])
+        lines.append(f"Skipped constraints ({len(skipped)}) — NOT applied by the solver: {shown}"
+                     + (f" … +{len(skipped) - 6} more" if len(skipped) > 6 else ""))
+    pinned = d.get("pinned_entities") or []
+    if not dof_known:
+        lines.append("DOF: unknown — the solver reported no degree-of-freedom count")
+    elif d.get("pinned_only") or (pinned and dof <= 0 and status == "full"):
+        lines.append(f"DOF: {dof} — profile pinned instead of constrained"
+                     + (f" (fix on {', '.join(map(str, pinned[:8]))})" if pinned else "")
+                     + "; replace fix pins with relations/driving dimensions, then "
+                       "sketch_fully_define")
+    elif dof <= 0 and status == "full" and (not_converged or skipped):
+        lines.append(f"DOF: {dof} — the solver reports no free variables, but it is NOT fully "
+                     "defined (see the solver problems above)")
     elif dof <= 0 and status == "full":
-        lines.append("DOF: 0 — fully constrained, not pinned_only")
+        lines.append("DOF: 0 — fully constrained, nothing fix-pinned")
     elif dof < 0 or status == "over":
         lines.append(f"DOF: {dof} — OVER-CONSTRAINED (conflicting constraints, see below)")
     else:
         lines.append(f"DOF: {dof} free — {_bounded_clauses(narration)}")
+        if dof > 0 and open_eps and not needs_closed:
+            lines.append("  → preview sketch_auto_constrain with apply=False for intended "
+                         "near-touching endpoint relations; preserve intentional open ends. "
+                         "Add other geometric relations before critical driving dimensions.")
 
-    # ── 3. Conflicts and redundants ──────────────────────────────────────────────
+    # ── 3. Dimension provenance ──────────────────────────────────────────────────
+    if "authored_dimensions" in d:
+        authored = d.get("authored_dimensions") or 0
+        auto = d.get("auto_dimensions") or 0
+        ratio = d.get("relation_dimension_ratio")
+        lines.append(f"Dimensions: {authored} authored, {auto} auto"
+                     + (f"; relation:dimension {ratio}" if ratio is not None else ""))
+
+    # ── 4. Conflicts and redundants ──────────────────────────────────────────────
     conflicting = d.get("conflicting") or []
     redundant = d.get("redundant") or []
     if conflicting:
         lines.append(f"Conflicts ({len(conflicting)}):")
         for c in conflicting:
-            lines.append(f"  CONFLICT {c.get('id','?')} ({c.get('type','?')})"
-                         f" — {c.get('suggestion','remove it')}")
+            cset = [row for row in c.get("conflict_set") or [] if isinstance(row, dict)]
+            partners = [row for row in cset if row.get("id") != c.get("id")]
+            own = next((row for row in cset if row.get("id") == c.get("id")), None)
+            label = _constraint_label(own) if own else f"{c.get('id', '?')} ({c.get('type', '?')})"
+            if partners:
+                lines.append(f"  CONFLICT {label} conflicts with "
+                             + ", ".join(_constraint_label(row) for row in partners)
+                             + f" — {c.get('suggestion', 'remove or edit one of them')}")
+            elif c.get("conflicts_with"):
+                lines.append(f"  CONFLICT {label} conflicts with "
+                             + ", ".join(map(str, c["conflicts_with"]))
+                             + f" — {c.get('suggestion', 'remove or edit one of them')}")
+            else:
+                lines.append(f"  CONFLICT {label} — {c.get('suggestion', 'inspect it')}")
     if redundant:
         lines.append(f"Redundant ({len(redundant)}):")
         for r in redundant:
-            lines.append(f"  REDUNDANT {r.get('id','?')} ({r.get('type','?')})"
-                         f" — {r.get('suggestion','remove it')}")
+            implied = ((" is implied by " + ", ".join(map(str, r["redundant_with"])))
+                       if r.get("redundant_with") else "")
+            lines.append(f"  REDUNDANT {r.get('id','?')} ({r.get('type','?')}){implied}"
+                         f" — {r.get('suggestion','inspect it')}")
+    for partial in d.get("partial_dependencies") or []:
+        lines.append(f"  PARTIAL DEPENDENCY {partial.get('id','?')} ({partial.get('type','?')})"
+                     " — deleting the whole relation adds DOF")
 
-    # ── 4. Schedule ──────────────────────────────────────────────────────────────
-    schedule = d.get("schedule") or []
-    if schedule:
-        lines.append("Schedule (apply in order):")
-        lines.extend(_schedule_lines(schedule))
-    elif dof == 0 and status == "full" and not d.get("pinned_only"):
-        lines.append("Schedule: (nothing to do — sketch is fully constrained)")
+    # ── 5. Hints (suggestions, not an ordered plan) ──────────────────────────────
+    hints = d.get("hints") or []
+    if hints:
+        lines.append("Hints (unordered suggestions, not a plan):")
+        lines.extend(_hint_lines(hints))
+    elif (dof_known and dof == 0 and status == "full" and not pinned and not not_converged
+            and not skipped):
+        lines.append("Hints: none — nothing to do, the sketch is fully constrained")
     for finding in d.get("findings") or []:
         lines.append(f"Intent: {finding.get('message', '')}")
 
     return "\n".join(lines)
+
+
+# ------------------------------------------------------------------- sketch_probe helpers
+_PROBE_KINDS = ("add_constraint", "set_dim", "delete_constraint")
+# Spellings the model reaches for instead of the three canonical action keys. Every rewrite
+# is echoed in `interpreted`; a value for an unrelated key is refused, never dropped.
+_PROBE_ALIASES = {
+    "add_constraint": ("constraint", "add", "new_constraint", "add_relation", "add_dimension"),
+    "set_dim": ("set_dimension", "edit_dim", "change_dim", "retune_dim"),
+    "delete_constraint": ("remove_constraint", "delete", "remove", "drop_constraint"),
+}
+_PROBE_SET_DIM_KEYS = ("id", "value", "expr", "placement", "driven")
+
+
+def _probe_request(sketch: str, add_constraint: Any, set_dim: Any, delete_constraint: Any,
+                   kwargs: dict) -> tuple[str, dict, list]:
+    """Validate a sketch_probe call -> (kind, engine `action` object, interpreted notes).
+
+    Exactly ONE of add_constraint / set_dim / delete_constraint. Raises ValueError with a
+    short teaching message for zero, several, or malformed actions. The constraint and the
+    dimension edit go through the same dialect normalisers add_features uses, so a probe
+    accepts exactly the spelling the real op accepts (and the engine sees the same shape)."""
+    from services.mcp.cad_doc_tools import (  # noqa: PLC0415
+        _normalize_constraint_op, _normalize_sketch_edit_op)
+
+    notes: list = []
+    given = {"add_constraint": add_constraint, "set_dim": set_dim,
+             "delete_constraint": delete_constraint}
+    for canon, aliases in _PROBE_ALIASES.items():
+        for alias in aliases:
+            value = kwargs.pop(alias, None)
+            if value is None:
+                continue
+            if given[canon] is not None:
+                raise ValueError(f"sketch_probe got both {canon}= and {alias}= (the same "
+                                 "action); pass exactly one action")
+            given[canon] = value
+            notes.append(f"read {alias}= as {canon}=")
+    leftover = sorted(k for k, v in kwargs.items() if v is not None)
+    if leftover:
+        raise ValueError(
+            f"sketch_probe does not take {', '.join(leftover)}. It takes sketch= and EXACTLY "
+            "ONE of add_constraint={constraint object} | set_dim={id, value|expr|placement|"
+            "driven} | delete_constraint=<constraint id>, plus doc_id=.")
+    chosen = [kind for kind in _PROBE_KINDS if given[kind] is not None]
+    if len(chosen) != 1:
+        raise ValueError(
+            ("sketch_probe needs exactly one action; got none. " if not chosen else
+             f"sketch_probe dry-runs ONE change at a time; got {', '.join(chosen)}. ")
+            + "Pass add_constraint={\"type\":\"distance\",\"refs\":[\"e1.p1\",\"e1.p2\"],"
+              "\"value\":30} OR set_dim={\"id\":\"c3\",\"value\":40} OR delete_constraint=\"c3\".")
+    kind = chosen[0]
+    payload = given[kind]
+    if isinstance(payload, str) and payload.strip()[:1] in ("{", "["):
+        payload = coerce_json_or_repr(payload)
+
+    if kind == "add_constraint":
+        if not isinstance(payload, dict) or not payload:
+            raise ValueError("add_constraint must be ONE non-empty constraint object, e.g. "
+                             '{"type":"distance","refs":["e1.p1","e1.p2"],"value":30}')
+        op = _normalize_constraint_op(
+            {"op": "sketch_add_constraint", "sketch": sketch, "constraint": payload}, notes)
+        return kind, {"add_constraint": op["constraint"]}, notes
+
+    if kind == "set_dim":
+        if not isinstance(payload, dict) or not payload:
+            raise ValueError('set_dim must be an object like {"id":"c3","value":40} '
+                             "(id of an EXISTING dimension plus value, expr, placement or driven)")
+        op = _normalize_sketch_edit_op(
+            {"op": "sketch_set_dim", "sketch": sketch, **payload}, notes)
+        unknown = sorted(k for k in op if k not in ("op", "sketch") + _PROBE_SET_DIM_KEYS)
+        if unknown:
+            raise ValueError(f"set_dim does not take {', '.join(unknown)}; it takes id plus one "
+                             "of value, expr, placement, driven")
+        action = {k: op[k] for k in _PROBE_SET_DIM_KEYS if k in op}
+        if isinstance(action.get("value"), dict):
+            inner = action.pop("value")
+            action["value"] = inner.get("value")
+            if inner.get("expr") and "expr" not in action:
+                action["expr"] = inner["expr"]
+            notes.append('set_dim value:{"value":N,...} -> value:N (the dry-run takes the number)')
+        if not isinstance(action.get("id"), str):
+            raise ValueError('set_dim needs "id": the constraint id of an existing dimension')
+        if not any(action.get(k) is not None for k in _PROBE_SET_DIM_KEYS[1:]):
+            raise ValueError("set_dim needs one of value, expr, placement or driven to change")
+        return kind, {"set_dim": action}, notes
+
+    cid = payload
+    if isinstance(payload, dict):
+        keys = [k for k in ("id", "constraint", "constraint_id", "cid") if k in payload]
+        if len(keys) != 1 or len(payload) != 1:
+            raise ValueError("delete_constraint takes exactly one constraint id")
+        cid = payload[keys[0]]
+    if not isinstance(cid, str) or not cid.strip():
+        raise ValueError('delete_constraint takes the constraint id, e.g. "c3"')
+    return kind, {"delete_constraint": {"id": cid.strip()}}, notes
+
+
+def _probe_verdict(kind: str, r: dict) -> str:
+    """One line saying whether the probed change is safe, from the engine's probe result."""
+    pid = r.get("probe_id") or "__probe__"
+
+    def name(cid) -> str:
+        return "the proposed constraint" if cid == pid else str(cid)
+
+    subject = {"add_constraint": "the proposed constraint", "set_dim": "the edited dimension",
+               "delete_constraint": "the deletion"}[kind]
+    skipped = [row for row in r.get("skipped") or [] if isinstance(row, dict)]
+    mine = next((row for row in skipped if row.get("id") == pid), None)
+    conflicts_with = r.get("conflicts_with") if isinstance(r.get("conflicts_with"), dict) else {}
+    partners = list(conflicts_with.get(pid) or [])
+    if not partners:
+        partners = sorted({str(p) for ids in conflicts_with.values() for p in ids})
+    if not partners:
+        partners = [c for c in r.get("conflicting") or [] if c != pid]
+    if r.get("converged") is False:
+        return ("DO NOT APPLY — the solver would not converge with this change"
+                + (f" (conflicts: {', '.join(name(p) for p in partners)})" if partners else "")
+                + ".")
+    if mine is not None:
+        return (f"DO NOT APPLY — {subject} would be skipped by the solver: "
+                f"{mine.get('reason', 'no reason reported')}.")
+    if r.get("would_over_define"):
+        return (f"WOULD OVER-DEFINE — {subject} conflicts with "
+                + (", ".join(name(p) for p in partners) or "existing constraints")
+                + "; express the intent with a relation or edit/delete one of those instead.")
+    if skipped or r.get("conflicting") or r.get("converged") is not True:
+        return "CAUTION — the probe has skipped constraints, conflicts, or no confirmed convergence; inspect the result."
+    before, after, delta = r.get("dof_before"), r.get("dof_after"), r.get("dof_delta")
+    if pid in (r.get("redundant") or []):
+        return (f"REDUNDANT — {subject} is already implied by existing constraints; it would "
+                f"remove no freedom (dof stays {after}). Skip it, or use a relation.")
+    if not isinstance(delta, (int, float)):
+        return "Probe ran but the engine reported no dof change; read dof_before/dof_after."
+    if delta == 0:
+        return f"SAFE but changes nothing — dof stays {after}."
+    if delta < 0:
+        return f"SAFE — dof {before} -> {after} ({int(delta)}); no conflict, nothing over-defined."
+    return f"SAFE — frees {int(delta)} degree(s) of freedom (dof {before} -> {after})."
 
 
 # ------------------------------------------------------- accepted input dialect (describe_*)
@@ -2038,31 +2347,13 @@ def register_gsl_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def describe_part(doc_id: Optional[str] = None,
                       **kwargs: Annotated[Any, Field(default=None)]) -> str:
-        """Compact, NAMED outline of the part — use INSTEAD of dumping every face on a complex part.
+        """Describe a part's bounding box, feature placement, patterns and topology.
 
-        Returns the bounding box, the feature groups WITH a placement narrative (the side of the
-        part each feature sits on, the EARLIER, larger feature it sits on — a boss is on its
-        plate, never the plate on its boss — and its offset from the part bbox on the two
-        perpendicular axes), any detected symmetry/instanced patterns (e.g. "6-fold rotational
-        about +Z" with the blade faces collapsed to one line), the bores/holes and flat faces by
-        side, and a stable `sid` for every addressable face/edge. A feature that owns no surviving
-        faces (fully consumed by a later boolean) is called out explicitly. Face counts are the
-        faces a feature can be shown to have CREATED: the kernel credits every face a boolean
-        regenerated to the feature that ran it — both the faces a CUT merely pierced and the ones
-        a FUSE merely landed on — so a face outside a feature's own tool is re-credited to the
-        earlier feature that authored the surface, and the raw kernel count stays visible as
-        `attributed_faces`.
-        Token cost scales with the number of DISTINCT feature roles, not the raw face count — a
-        68-face impeller describes in a few hundred tokens. Drill into one entity with hover(sid).
-
-        doc_id: a doc id ("doc-cpp0000001c") or an open part's NAME ("bracket"). Omit it for the
-        current part. ALSO ACCEPTED for the same thing: part=, part_name=, part_id=, name=,
-        target=, document=, document_id=, model=. attributes=/parameters=/fields=/detail= are
-        accepted and ignored — describe_part has no filtered view, and the whole outline is
-        already the answer. Anything rewritten or ignored is listed in `interpreted` on the
-        response; a plain describe_part(doc_id=...) carries no such key.
-        A document with no solid body yet answers ok with `empty: true` and the add_features call
-        to make one — that is an empty part, not a tool failure.
+        Includes bores and flat faces by side, stable face/edge sids, consumed
+        features and attributed_faces (raw kernel attribution). Use hover(sid)
+        for an entity. doc_id may be an open part's id or name; omit for current.
+        Aliases and ignored filters are reported in interpreted. A part without
+        a solid returns ok with empty=true.
         """
         _unwrap_var_kw(kwargs)
         try:
@@ -2087,16 +2378,62 @@ def register_gsl_tools(mcp: FastMCP) -> None:
             return _err(e)
 
     @mcp.tool()
-    def query_adjacency(doc_id: Optional[str] = None) -> str:
-        """The face-adjacency graph (W3): which faces touch which, and whether each shared edge is
-        a CONVEX outside-corner or a CONCAVE inside-corner/pocket edge.
+    def query_adjacency(doc_id: Optional[str] = None, offset: int = 0,
+                        page_size: int = 100) -> str:
+        """Page the last body's face-adjacency graph, including face sid and edge between_sids.
 
-        Returns {faces:[{ord, surf, side, neighbors:[ord,...]}], edges:[{between:[fa,fb], convex,
-        length}]}. This is what lets you reason about "the edge between the top and front face" or
-        "the faces this pocket cut into" — relationships the flat per-face read-back never carried.
+        Faces retain response-local ord and neighbors; edges retain between ordinals, convex,
+        surf and length. SIDs can collide. offset pages both lists independently; totals and
+        next_offset describe continuation. Neighbor lists are capped at 100, with their total;
+        page the edges for complete connectivity. page_size is 1..100.
         """
         try:
-            return _dumps(cb.call("doc_adjacency", {"doc_id": _doc(doc_id)}))
+            if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+                raise ValueError("offset must be a nonnegative integer.")
+            if isinstance(page_size, bool) or not isinstance(page_size, int) or not 1 <= page_size <= 100:
+                raise ValueError("page_size must be an integer from 1 to 100.")
+            result = cb.call("doc_adjacency", {"doc_id": _doc(doc_id)})
+            faces, edges = result.get("faces") or [], result.get("edges") or []
+            page = []
+            for face in faces[offset:offset + page_size]:
+                item = dict(face)
+                neighbors = item.get("neighbors") or []
+                item["neighbor_count"] = len(neighbors)
+                item["neighbors"] = neighbors[:100]
+                item["neighbors_truncated"] = len(neighbors) > 100
+                page.append(item)
+            return _dumps({**result, "faces": page, "edges": edges[offset:offset + page_size],
+                           "total_faces": len(faces), "total_edges": len(edges),
+                           "offset": offset, "page_size": page_size,
+                           "next_offset": (offset + page_size
+                                           if offset + page_size < max(len(faces), len(edges))
+                                           else None)})
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
+    def doc_face_edges(body_id: int, topo_id: int, doc_id: Optional[str] = None,
+                       offset: int = 0, page_size: int = 100) -> str:
+        """Page the body-local edge topo IDs bordering one face on a part.
+
+        body_id and topo_id are the 1-based body and face topo returned by query_geometry.
+        These IDs are revision-scoped, not SIDs. Assemblies are unsupported.
+        """
+        try:
+            for name, value, minimum in (("body_id", body_id, 1), ("topo_id", topo_id, 1),
+                                         ("offset", offset, 0), ("page_size", page_size, 1)):
+                if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                    raise ValueError(f"{name} must be an integer >= {minimum}.")
+            if page_size > 100:
+                raise ValueError("page_size must be at most 100.")
+            d = _doc(doc_id)
+            result = cb.call("doc_face_edges", {"doc_id": d, "body_id": body_id,
+                                                "topo_id": topo_id})
+            edges = result.get("edges") or []
+            return _dumps({"ok": True, "doc_id": d, "body_id": body_id, "topo_id": topo_id,
+                           "edges": edges[offset:offset + page_size], "total_count": len(edges),
+                           "offset": offset, "page_size": page_size,
+                           "next_offset": offset + page_size if offset + page_size < len(edges) else None})
         except Exception as e:  # noqa: BLE001
             return _err(e)
 
@@ -2163,10 +2500,12 @@ def register_gsl_tools(mcp: FastMCP) -> None:
                                    "error": f"no sketch {sketch!r} in {d}. "
                                             + _sketch_roster(d)})
                 raise
+            if overview.get("ok") is False:
+                return _dumps(overview)
             try:
                 regions_resp = cb.call("doc_sketch_regions", {"doc_id": d, "sketch": sketch})
-            except Exception:  # noqa: BLE001
-                regions_resp = {}
+            except Exception as e:  # noqa: BLE001
+                regions_resp = {"ok": False, "error": str(e) or type(e).__name__}
             feat = None
             try:
                 tree = cb.call("doc_tree", {"doc_id": d})
@@ -2186,41 +2525,70 @@ def register_gsl_tools(mcp: FastMCP) -> None:
     def sketch_health(sketch: str, text: bool = False,
                       doc_id: Optional[str] = None) -> str:
         """The single narrated read of a sketch's constraint state — solve it and get back WHY it
-        is under/over-defined plus an ordered plan to reach fully-constrained.
+        is under/over-defined plus unordered hints for reaching fully-constrained.
 
         sketch: the sketch feature id (e.g. "s1"). Returns {ok, sketch, status, dof, converged, ...}
         where the narrated fields are:
-          closure       {open_endpoints, closed_chains_ok, material_regions?} — open_endpoints names
-                        the dangling endpoint handles where chains fail to close (feed these to
-                        sketch_auto_constrain to stitch them coincident).
+          closure       {open_endpoints, closed_chains_ok, material_regions?, usage} — usage
+                        distinguishes closed-profile consumers, open paths, mixed use and unknown
+                        future use. Open endpoints are a defect ONLY when usage is closed_profile
+                        or mixed; for open_path / unknown they are informational — only close
+                        endpoints when the intended consumer needs a loop.
           dof_narration plain words for the remaining free variables, e.g. "circle C1 radius;
                         line L4 end x/y" — read this instead of counting dof yourself.
           free_variables the same, structured: [{entity, param, var}].
           statuses      per-entity id -> "under" | "full" | "over".
-          redundant     [{id, type, suggestion}] — constraints implied by the others, with a removal
-                        suggestion (a redundant DRIVING dimension over-defines — drop it).
-          conflicting   [{id, type, suggestion}] — constraints that contradict each other; the
-                        suggestion says which to remove.
-          schedule      ordered [{order, kind, action, why, ...}] to reach dof 0 — geometric
-                        RELATIONS first, then DRIVING dimensions, mirroring how a person constrains.
+          redundant     [{id, type, suggestion, removal_preserves_dof_and_geometry,
+                        redundant_with}] — whole relations and the constraints that already imply
+                        them; deletion is suggested only after a successful removal trial.
+          partial_dependencies  multi-row relations with dependent rows that still constrain DOF.
+          conflicting   [{id, type, suggestion, conflicts_with, conflict_set}] — conflict_set lists
+                        the row's own constraint first, then its partners, each with its driving
+                        value, so you can see WHICH values contradict (e.g. c3 distance 40 vs c1
+                        distance 30) and edit or delete the right one.
+          skipped_constraints  [{id, reason}] — constraints the solver did NOT apply.
+          hints         [{order, kind, action, why, ...}] — UNORDERED suggestions for reaching
+                        dof 0 (geometric relations before driving dimensions). They are not a
+                        plan to execute in sequence: re-read health after each change.
           advisory      [aicad.advisory/1 items] — emittable straight to the advisor layer.
+          authored_dimensions / auto_dimensions   driving dimensions YOU authored vs engine-minted
+                        auto dimensions (sketch_fully_define, tagged auto:true, measured from
+                        rough coordinates). relation_count and relation_dimension_ratio show how
+                        much intent rides on relations; findings all_dimensions_auto and
+                        dimension_heavy say when to confirm/replace auto values with the critical
+                        dimensions or to swap redundant dimensions for relations.
+          fully_defined solver truth AND-ed with: converged, no conflicts, no skipped constraints,
+                        and nothing fix-pinned (pinned_entities empty).
 
         text: when True, also includes a "health_text" key with a plain-English multi-line
-          summary (closure status, DOF in words, conflicts/redundants, ordered schedule) —
-          the feedback channel for no-vision local models. See sketch_health_text().
+          summary (closure status, DOF in words, conflicts with their partner constraints,
+          redundants, hints) — the feedback channel for no-vision local models. See
+          sketch_health_text().
 
-        Sketch loop: draw roughly -> relations -> driving dimensions -> sketch_fully_define
-        -> check_sketch: dof 0 and not pinned_only. Fix-pinned profile entities are findings,
-        not design intent; fixed external construction references are legitimate.
+        Sketch loop: draw roughly -> relations -> sketch_probe then add only critical driving
+        dimensions -> sketch_fully_define -> check_sketch: dof 0, converged, nothing pinned.
+        Fix-pinned profile entities are findings, not design intent; fixed external construction
+        references are legitimate.
         """
         try:
             d = _doc(doc_id)
+            snapshot = cb.call("doc_tree", {"doc_id": d})
             result = cb.call("sketch_health", {"doc_id": d, "sketch": sketch})
+            if result.get("ok") is False:
+                return _dumps(result)
             from services.mcp.ascii2d import live_sketch_design_intent
-            result.update(live_sketch_design_intent(d, sketch, result))
+            result.update(live_sketch_design_intent(d, sketch, result, snapshot=snapshot))
+            revision_before = snapshot.get("revision")
+            revision_after = cb.call("doc_tree", {"doc_id": d}).get("revision")
+            if type(revision_before) is int and type(revision_after) is int and revision_before == revision_after:
+                result["revision"] = revision_before
+            else:
+                result.pop("revision", None)
+                result["revision_stale"] = True
             result["fully_defined"] = (
-                result.get("dof") == 0 and result.get("status") != "over"
-                and not result.get("conflicting") and not result.get("pinned_only")
+                result.get("dof") == 0 and result.get("status") == "full"
+                and result.get("converged") is True
+                and not result.get("conflicting") and not result.get("pinned_entities")
                 and not result.get("skipped_constraints"))
             if text and result.get("ok"):
                 result["health_text"] = sketch_health_text(result)
@@ -2229,8 +2597,75 @@ def register_gsl_tools(mcp: FastMCP) -> None:
             return _err(e)
 
     @mcp.tool()
+    def sketch_probe(sketch: Optional[str] = None,
+                     add_constraint: Optional[Union[dict, str]] = None,
+                     set_dim: Optional[Union[dict, str]] = None,
+                     delete_constraint: Optional[Union[str, dict]] = None,
+                     doc_id: Optional[str] = None,
+                     **kwargs: Annotated[Any, Field(default=None)]) -> str:
+        """PROBE BEFORE ADDING A DRIVING DIMENSION: dry-run exactly ONE change on a private copy
+        of the sketch and learn whether it would over-define it, how many DOF it removes, and
+        which existing constraints it fights — without touching the sketch, the open session
+        or the document.
+
+        sketch: the sketch feature id (e.g. "s1"; also sketch_id=). Give EXACTLY ONE action:
+          add_constraint  one constraint object, spelled as in add_features, e.g.
+                          {"type":"distance","refs":["e1.p1","e1.p2"],"value":30} or
+                          {"type":"parallel","refs":["e2","e4"]}. A dimension probes as DRIVING.
+          set_dim         {"id":"c3","value":40} | {"id":"c3","expr":"width/2"} |
+                          {"id":"c3","placement":[u,v]} | {"id":"c3","driven":true} — retune an
+                          EXISTING dimension (an auto one is promoted to authored).
+          delete_constraint  the constraint id, e.g. "c3".
+        Zero or several actions are refused.
+
+        Returns {ok, sketch, action, would_over_define, dof_before, dof_after, dof_delta,
+        converged, status, conflicting, redundant, conflicts_with, skipped, verdict, interpreted?}.
+        The proposed constraint is named `__probe__` in the id lists. `verdict` is one line:
+        SAFE / SAFE but changes nothing / REDUNDANT / WOULD OVER-DEFINE / DO NOT APPLY. Add the
+        dimension for real (add_features op sketch_add_constraint, or sketch_set_dim) only when
+        would_over_define is false, conflicts_with is empty and `skipped` does not name it.
+        Prefer a geometric relation when the probe says the dimension is redundant.
+        """
+        try:
+            _unwrap_var_kw(kwargs)
+            notes: list = []
+            for alias in ("sketch_id", "sketch_name", "feature", "feature_id"):
+                value = kwargs.pop(alias, None)
+                if value is not None and not sketch:
+                    sketch = str(value)
+                    notes.append(f"read {alias}= as sketch=")
+            if not sketch:
+                raise ValueError('sketch_probe needs sketch= — the sketch feature id, e.g. "s1"')
+            kind, action, more = _probe_request(sketch, add_constraint, set_dim,
+                                                delete_constraint, kwargs)
+            notes.extend(more)
+            d = _doc(doc_id)
+            r = cb.call("sketch_probe", {"doc_id": d, "sketch": sketch, "action": action})
+            if not isinstance(r, dict) or r.get("ok") is False:
+                out = {"ok": False, "doc_id": d, "sketch": sketch, "action": kind,
+                       "error": (r.get("error") if isinstance(r, dict) else None)
+                                or "sketch_probe returned no result"}
+            else:
+                conflicting = list(r.get("conflicting") or [])
+                out = {"ok": True, "doc_id": d, "sketch": sketch, "action": kind,
+                       "would_over_define": bool(r.get("would_over_define")),
+                       "dof_before": r.get("dof_before"), "dof_after": r.get("dof_after"),
+                       "dof_delta": r.get("dof_delta"), "converged": r.get("converged"),
+                       "status": r.get("status"), "conflicting": conflicting,
+                       "redundant": list(r.get("redundant") or []),
+                       "conflicts_with": r.get("conflicts_with") or {},
+                       "skipped": list(r.get("skipped") or []),
+                       "verdict": _probe_verdict(kind, r)}
+            if notes:
+                out["interpreted"] = notes
+            return _dumps(out)
+        except Exception as e:  # noqa: BLE001
+            return _err(e)
+
+    @mcp.tool()
     def sketch_fully_define(sketch: str, relations: bool = True, dimensions: bool = True,
                              anchor: str = "origin", entities: Optional[list[str]] = None,
+                             round: bool = True,  # noqa: A002 — mirrors the engine op key
                              doc_id: Optional[str] = None) -> str:
         """Finish a 2D sketch with editable geometric relations and driving dimensions, never fix pins.
 
@@ -2238,10 +2673,17 @@ def register_gsl_tools(mcp: FastMCP) -> None:
         then critical dimensions); this engine op defines remaining freedom at the current
         shape. relations/dimensions enable each pass; anchor="origin" adds positional intent,
         anchor="none" leaves free placement. entities optionally limits the entity ids.
-        Returns exact relations_added/dimensions_added and solver health (dof/pinned_only).
-        A partial result is honest: inspect findings and remaining DOF instead of assuming
-        every curve can be fully defined. add_features already runs this after new sketches
-        and sketch_add_entity batches unless auto_define:false.
+        Returns exact relations_added/dimensions_added, the engine's own notes (what it refused
+        or left free), dof_before/dof_after, rounded (how many auto values were snapped to a
+        clean increment and by how much at most) and solver health (dof/pinned_only).
+        round=False keeps the exact measured values instead of snapping them.
+        A partial result is honest: inspect notes, findings and remaining DOF instead of
+        assuming every curve can be fully defined. add_features already runs this after new
+        sketches and sketch_add_entity batches unless auto_define:false.
+        Generated constraints are soft (auto:true), still driving but superseded by explicit
+        relations/dimensions added later. Their dimension values were MEASURED from your rough
+        coordinates: confirm them or retune the critical ones with sketch_set_dim (which
+        promotes them to authored). Add intent dimensions without first deleting auto ones.
         """
         try:
             d = _doc(doc_id)
@@ -2249,6 +2691,8 @@ def register_gsl_tools(mcp: FastMCP) -> None:
                   "dimensions": dimensions, "anchor": anchor}
             if entities is not None:
                 op["entities"] = entities
+            if round is False:
+                op["round"] = False
             result = cb.call("doc_apply_ops", {"doc_id": d, "ops": [op]})
             health = cb.call("sketch_health", {"doc_id": d, "sketch": sketch})
             from services.mcp.ascii2d import live_sketch_design_intent, sketch_define_additions
@@ -2259,10 +2703,16 @@ def register_gsl_tools(mcp: FastMCP) -> None:
             constraints = (feature.get("params") or {}).get("constraints") or []
             failed = [row for row in (result.get("rebuild") or {}).get("feature_status") or []
                       if not row.get("ok")]
+            report = next((row for row in result.get("op_reports") or []
+                           if isinstance(row, dict) and row.get("op") == "sketch_fully_define"),
+                          {})
             return _dumps({"ok": not failed, "doc_id": d, "sketch": sketch,
                            "revision": result.get("revision"), "health": health,
-                           "dof": health.get("dof"), "pinned_only": health["pinned_only"],
+                           "dof": health.get("dof"), "pinned_only": health.get("pinned_only"),
                            **sketch_define_additions(result.get("id_map") or {}, 0, constraints),
+                           **{key: report[key] for key in
+                              ("relations_added", "dimensions_added", "dof_before", "dof_after",
+                               "notes", "rounded") if key in report},
                            **({"failed_features": failed} if failed else {})})
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -2397,11 +2847,14 @@ def register_gsl_tools(mcp: FastMCP) -> None:
         Read-only on a solved assembly: queries world-frame bounding boxes/origins, reads
         the mate-solve verdict (status, dof) without editing, dirtying or re-revisioning
         the document, then evaluates collision-only fit with clearance_mode='threshold',
-        min_clearance_mm=0 and include_coincident=False. Overlap volumes remain exact;
-        clearance lower bounds are not measured gaps and no tightest measured gap is
+        min_clearance_mm=0 and include_coincident=False. Fuzzy-fallback overlap volumes
+        are approximate and marked on the pair; other overlap volumes remain exact.
+        Clearance lower bounds are not measured gaps and no tightest measured gap is
         reported. Returns raw fit completeness, pair coverage and failures; no-pair or
         incomplete results cannot qualify collision-free. Works on assembly docs and
         multi-body parts. To re-seat components after edits, use solve_mates.
+        ok reports successful narration, not fit completeness; incomplete fit is separately
+        reported in warnings and fit, and never qualifies collision_free.
 
         On an assembly, `components` lists each component with its stored `source` and
         `source_resolved`, the absolute path of the file the engine opens. A relative stored
@@ -2415,14 +2868,13 @@ def register_gsl_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def describe_board(doc_id: str = "") -> str:
-        """Compact narrative of an ECAD schematic or PCB — component roster, net list, ERC/DRC
-        summary, and unconnected pins. Promotes ecad_status into the GSL narration layer.
+        """Compact narrative of a KiCad schematic or PCB — component roster, net list, ERC/DRC
+        summary, and unconnected pins.
 
         Returns the component count and list (ref, value, footprint), net count and per-net
-        members (capped at 20 nets), ERC error/warning counts for schematics or DRC status for
-        PCBs, and a list of unconnected pins. Narrates existing numbers only — never recomputes.
-        Returns a graceful message when no ECAD document is active. Open a schematic first with
-        ecad_new_schematic or ecad_new_pcb.
+        members (capped at 20 nets), KiCad ERC error/warning counts for schematics or KiCad DRC
+        status for PCBs, and unconnected pins. Pass an open doc_id or KiCad file path; omit
+        it for the current ECAD document. An unavailable KiCad check is reported as unavailable.
         """
         try:
             return _describe_board_text(doc_id)
@@ -2432,28 +2884,13 @@ def register_gsl_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def describe_project(run: Optional[Union[dict, str]] = None,
                          **kwargs: Annotated[Any, Field(default=None)]) -> str:
-        """Compact narrative of a DAG project run — nodes done/blocked, budgets, open questions.
-        Uses the live DAG run's status, budget and open-question data.
+        """Describe a DAG run's nodes, owners, budget and open questions.
 
-        run: a dag_run dict matching contracts/dag_schema.md — pass dag_status()['run'] or your
-        executor's run record. When omitted, returns a 'no run supplied' explanation.
-
-        ALSO ACCEPTED, because a run dict is rarely what a caller has to hand:
-          * a run ID string — run="<id>", run_id="<id>", id="<id>". The persisted DAG run is
-            loaded from disk when it exists (per-node status is not persisted, so its nodes read
-            as pending); an unknown id is narrated as the bare id, with how to start a real run.
-          * a project name — project=, project_name=, mission=, title=.
-          * a free-form description — mission_request=, mission_spec=, brief=, deliverables=,
-            components=, constraints=, requirements=, scope=. These are narrated straight back
-            under "Supplied project description": describe_project reports on a run, it does not
-            plan one — dag_plan(brief=...) is what turns a description into a run.
-          * run-record fields given loose — nodes=, budget=, open_questions=, status=.
-        Every rewrite is listed in `interpreted` on the response; a plain describe_project() or
-        describe_project(run={...}) carries no such key.
-
-        Returns node status counts (done/doing/blocked/pending), per-node titles and owners,
-        budget usage (tokens spent vs cap), and open questions by task id. Narrates the dag_run
-        dict only — never queries the engine. See contracts/dag_schema.md for the run shape.
+        Pass dag_status()['run'] or a run ID. Persisted runs have pending node
+        statuses because per-node status is not persisted. Project names, loose
+        run fields and free-form descriptions are also accepted; descriptions
+        are narrated, not planned. Rewrites appear in interpreted. This tool does
+        not query the engine; omit run for a no-run explanation.
         """
         _unwrap_var_kw(kwargs)
         try:

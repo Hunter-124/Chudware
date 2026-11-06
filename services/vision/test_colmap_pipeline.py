@@ -132,3 +132,84 @@ def test_sparse_reconstruction_on_fixture(tmp_path):
                   list(sparse_dir.rglob("cameras.txt")) + \
                   list(sparse_dir.rglob("images.txt"))
     assert model_files, "No COLMAP model files (cameras.bin/txt) found in sparse_dir"
+
+
+@pytest.mark.skipif(not PYCOLMAP_AVAILABLE, reason="pycolmap not installed")
+def test_camera_groups_share_intrinsics_and_other_images_stay_independent(tmp_path):
+    """Each video clip is one lens: its frames share a camera; loose stills do not."""
+    import shutil
+
+    import pycolmap
+    from services.vision.colmap_pipeline import _extract_features
+    from services.vision.frames import clip_camera_groups
+
+    renders = sorted(FIXTURE_DIR.glob("render_*.png"))
+    if len(renders) < 5:
+        pytest.skip("bracket_fixture renders unavailable")
+    images = tmp_path / "images"
+    images.mkdir()
+    clip_a, clip_b = "a" * 64, "b" * 64
+    sources = {}
+    for index, render in enumerate(renders[:5]):
+        name = f"{index:06d}.png"
+        shutil.copyfile(render, images / name)
+        clip = clip_a if index < 2 else clip_b if index < 4 else None
+        sources[name] = (f"/session/frames/clip_{clip}_frame_{index:09d}.jpg" if clip
+                         else f"/session/images/still_{index}.jpg")
+    database = str(tmp_path / "colmap.db")
+    _extract_features(pycolmap, database, str(images), "SIMPLE_RADIAL", False,
+                      clip_camera_groups(sources))
+    db = pycolmap.Database.open(database)
+    camera = {image.name: image.camera_id for image in db.read_all_images()}
+    db.close()
+    assert camera["000000.png"] == camera["000001.png"]
+    assert camera["000002.png"] == camera["000003.png"]
+    assert len({camera["000000.png"], camera["000002.png"], camera["000004.png"]}) == 3
+
+
+def test_binary_and_text_models_match_and_scale_two_point(tmp_path):
+    """Both encodings of a real pycolmap model yield one metric scale."""
+    pycolmap = pytest.importorskip("pycolmap")
+    np = pytest.importorskip("numpy")
+    from services.vision.colmap_pipeline import read_model
+    from services.vision.scale_solver import read_colmap_sparse, solve_scale_two_point
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "cameras.txt").write_text("1 PINHOLE 640 480 100 100 320 240\n")
+    (source / "images.txt").write_text(
+        "1 1 0 0 0 0 0 0 1 a.png\n320 240 1 360 240 2\n"
+        "2 1 0 0 0 -1 0 0 1 b.png\n300 240 1 340 240 2\n")
+    (source / "points3D.txt").write_text(
+        "1 0 0 5 255 0 0 0 1 0 2 0\n"
+        "2 2 0 5 0 255 0 0 1 1 2 1\n")
+    reconstruction = pycolmap.Reconstruction(str(source))
+    binary, text = tmp_path / "binary", tmp_path / "text"
+    binary.mkdir()
+    text.mkdir()
+    reconstruction.write(str(binary))
+    reconstruction.write_text(str(text))
+
+    binary_model = read_model(binary)
+    assert binary_model == read_model(text)
+    for root in (binary, text):
+        cameras = read_colmap_sparse(str(root))
+        points = np.asarray([point.xyz for point in read_model(root)[2].values()])
+        scale = solve_scale_two_point(cameras=list(cameras.values()), points3d=points,
+                                      p1=[320, 240], p2=[360, 240], distance_mm=50,
+                                      image_name="a.png")
+        assert scale.mm_per_unit == pytest.approx(25)
+        assert scale.detail["dist_units"] == pytest.approx(2)
+
+
+def test_text_model_keeps_empty_observations_and_optional_points(tmp_path):
+    from services.vision.colmap_pipeline import read_model
+
+    (tmp_path / "cameras.txt").write_text("1 SIMPLE_PINHOLE 640 480 100 320 240\n")
+    (tmp_path / "images.txt").write_text(
+        "# poses\n1 1 0 0 0 0 0 0 1 image one.png\n\n"
+        "2 1 0 0 0 1 0 0 1 image two.png\n\n")
+    cameras, images, points = read_model(tmp_path)
+    assert cameras[1].model == "SIMPLE_PINHOLE"
+    assert [image.name for image in images.values()] == ["image one.png", "image two.png"]
+    assert points == {}

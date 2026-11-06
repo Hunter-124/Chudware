@@ -62,6 +62,7 @@ struct Agent {
 
 struct TraceStore {
     std::string runId;
+    uint64_t revision = 0;
     std::vector<Agent> agents;
     std::unordered_map<std::string, int> agentIdx;
     std::unordered_map<std::string, std::string> spanAgent;  // step span id -> agent id
@@ -75,6 +76,7 @@ struct TraceStore {
 
     TraceStore() { reset(std::string()); }
     void reset(const std::string& rid) {
+        ++revision;
         runId = rid;
         agents.clear(); agentIdx.clear(); spanAgent.clear();
         thoughtCount = ctxCount = 0;
@@ -114,7 +116,7 @@ static bool genericAgentName(const std::string& s) {
 }
 
 static bool readableTaskId(const std::string& id) {
-    // Chudcode's task handles are readable identifiers, including dotted nesting.
+    // Omp's task handles are readable identifiers, including dotted nesting.
     // Never replace a human label with an opaque legacy span id.
     return !id.empty() && id[0] >= 'A' && id[0] <= 'Z' &&
         std::all_of(id.begin(), id.end(), [](unsigned char c) {
@@ -144,7 +146,9 @@ static bool stoppedReason(const std::string& reason) {
 static bool turnWasStopped(const ChatMsg& m) {
     return m.resultPartial ||
         std::any_of(m.activity.begin(), m.activity.end(), [](const ActivityItem& a) {
-            return a.stage == "__stop_meta__" && stoppedReason(a.title);
+            return (a.stage == "__stop_meta__" && stoppedReason(a.title)) ||
+                   (a.rowKind == 17 && a.stage.find("compaction:") != std::string::npos &&
+                    (a.status == "cancelled" || a.status == "stopped"));
         });
 }
 static bool terminalStatus(const std::string& s) {
@@ -379,6 +383,7 @@ static void subagentLifecycle(TraceStore& t, const nlohmann::json& d, const std:
 // (Stop, transport loss, crash recovery). Its last recorded event is the cutoff, never wall now.
 static void settleTrace(TraceStore& t) {
     if (t.settled) return;
+    ++t.revision;
     double end = t.lastEventTs;
     for (const Agent& a : t.agents) {
         end = std::max(end, a.endTs);
@@ -438,6 +443,7 @@ void feedAgentDagEvent(const std::string& convId, const std::string& kind,
                        const nlohmann::json& data) {
     if (!data.is_object()) return;
     TraceStore& t = s_traces[convId];
+    ++t.revision;
     const double now = chatNowEpoch();
     t.settled = false;
     t.lastEventTs = std::max(t.lastEventTs, now);
@@ -683,7 +689,7 @@ void feedAgentDagEvent(const std::string& convId, const std::string& kind,
         s.detail = jstr(data, "verdict_summary");
         s.target = foldToAtlasGlyphs(s.detail);
     } else if (kind == "agent.message") {
-        // Inter-agent traffic: a Note on the SENDER when the trace knows it (Chudcode sub-agent
+        // Inter-agent traffic: a Note on the SENDER when the trace knows it (Omp sub-agent
         // ids are their names), else on the event's owner.
         const std::string from = jstr(data, "from");
         int ai = findAgent(t, from);
@@ -702,10 +708,8 @@ void feedAgentDagEvent(const std::string& convId, const std::string& kind,
 // Serialize one conversation's trace: every agent and its newest persisted steps. Null when the
 // conversation never ran. "nodes" is the flat step list (conversations.cpp saves only when it is
 // non-empty).
-nlohmann::json agentDagToJson(const std::string& convId) {
-    auto sit = s_traces.find(convId);
-    if (sit == s_traces.end() || !sit->second.hasContent()) return nlohmann::json();
-    const TraceStore& t = sit->second;
+static nlohmann::json serializeTrace(const TraceStore& t) {
+    if (!t.hasContent()) return nlohmann::json();
     nlohmann::json j;
     j["v"] = 2;
     j["runId"] = t.runId;
@@ -739,6 +743,58 @@ nlohmann::json agentDagToJson(const std::string& convId) {
     j["agents"] = std::move(agents);
     j["nodes"] = std::move(nodes);
     return j;
+}
+
+nlohmann::json agentDagToJson(const std::string& convId) {
+    const auto it = s_traces.find(convId);
+    return it == s_traces.end() ? nlohmann::json() : serializeTrace(it->second);
+}
+
+uint64_t agentDagRevision(const std::string& convId) {
+    const auto it = s_traces.find(convId);
+    return it == s_traces.end() ? 0 : it->second.revision;
+}
+
+std::function<nlohmann::json()> agentDagSnapshot(const std::string& convId) {
+    const auto it = s_traces.find(convId);
+    if (it == s_traces.end()) return [] { return nlohmann::json(); };
+    const auto& source = it->second;
+    TraceStore trace;
+    trace.runId = source.runId;
+    trace.uidCtr = source.uidCtr;
+    trace.userSyncTs = source.userSyncTs;
+    trace.userSeeded = source.userSeeded;
+    trace.lastEventTs = source.lastEventTs;
+    trace.thoughtCount = source.thoughtCount;
+    trace.ctxCount = source.ctxCount;
+    trace.agents.clear();
+    trace.agentIdx.clear();
+    trace.agents.reserve(source.agents.size());
+    for (const auto& agent : source.agents) {
+        Agent saved;
+        saved.id = agent.id; saved.parent = agent.parent; saved.name = agent.name;
+        saved.named = agent.named; saved.status = agent.status; saved.model = agent.model;
+        saved.brief = capText(agent.brief, kPersistText);
+        saved.note = capText(agent.note, kPersistText);
+        saved.startTs = agent.startTs; saved.endTs = agent.endTs;
+        saved.toolCount = agent.toolCount; saved.failCount = agent.failCount;
+        const size_t skip = agent.steps.size() > kPersistStepsPerAgent
+            ? agent.steps.size() - kPersistStepsPerAgent : 0;
+        saved.dropped = agent.dropped + (long long)skip;
+        for (size_t i = skip; i < agent.steps.size(); ++i) {
+            const auto& step = agent.steps[i];
+            Step row;
+            row.uid = step.uid; row.kind = step.kind; row.spanId = step.spanId;
+            row.title = capText(step.title, kPersistText);
+            row.target = capText(step.target, kPersistText);
+            row.detail = capText(step.detail, kPersistText);
+            row.error = capText(step.error, kPersistText);
+            row.status = step.status; row.durationMs = step.durationMs; row.ts = step.ts;
+            saved.steps.push_back(std::move(row));
+        }
+        trace.agents.push_back(std::move(saved));
+    }
+    return [trace = std::move(trace)] { return serializeTrace(trace); };
 }
 
 // Restore agentDagToJson output. Pre-v2 graph records are ignored: the transcript fallback
@@ -880,6 +936,7 @@ static void syncUserMarkers(AppState& st, const std::string& convId, TraceStore&
     const double runStart = t.agents[0].startTs;
     if (!t.userSeeded) {
         t.userSeeded = true;
+        ++t.revision;
         const ChatMsg* seed = nullptr;
         for (const ChatMsg& m : *msgs)
             if (m.fromUser && m.ts > 0.0 && (runStart <= 0.0 || m.ts <= runStart + 2.0)) seed = &m;
@@ -894,6 +951,7 @@ static void syncUserMarkers(AppState& st, const std::string& convId, TraceStore&
         const ChatMsg& m = (*msgs)[i];
         if (!m.fromUser || blankText(m.text)) continue;
         insertUserStep(t, m, StepKind::Steer);
+        ++t.revision;
         t.userSyncTs = std::max(t.userSyncTs, m.ts);
     }
 }
@@ -971,7 +1029,8 @@ static void buildFallback(const std::vector<ChatMsg>& msgs, TraceStore& t) {
             }
             case 17: {
                 StepKind k = StepKind::Event;
-                if (a.title.rfind("Compact", 0) == 0) k = StepKind::Compaction;
+                if (a.stage.find("compaction:") != std::string::npos ||
+                    a.title.rfind("Compact", 0) == 0) k = StepKind::Compaction;
                 else if (a.title.rfind("Retry", 0) == 0 || a.title.rfind("Fallback", 0) == 0)
                     k = StepKind::Retry;
                 Step& s = pushStep(t, 0, k, m.ts);
@@ -979,7 +1038,7 @@ static void buildFallback(const std::vector<ChatMsg>& msgs, TraceStore& t) {
                 s.target = a.reason;
                 s.status = rowStatus(a);
                 if (s.status == "running" && !m.running) s.status = "stopped";
-                if (s.status == "failed") s.error = a.detail;
+                if (s.status == "failed") s.error = m.compactionRun ? m.text : a.detail;
                 break;
             }
             case 19: {
@@ -1022,14 +1081,19 @@ static void buildFallback(const std::vector<ChatMsg>& msgs, TraceStore& t) {
                 break;
             }
         }
-        if (!timelineHasInlineProse(m) && !blankText(m.text)) {
+        if (!m.compactionRun && !timelineHasInlineProse(m) && !blankText(m.text)) {
             Step& s = pushStep(t, 0, StepKind::Reply, m.ts);
             s.detail = capText(m.text, kMaxStepText);
         }
-        failed = m.errKind != ERR_NONE && m.errKind != ERR_PARTIAL;
+        failed = m.compactionRun
+            ? std::any_of(m.activity.begin(), m.activity.end(), [](const ActivityItem& a) {
+                  return a.rowKind == 17 && a.stage.find("compaction:") != std::string::npos &&
+                         (a.status == "fail" || a.status == "failed" || a.status == "error");
+              })
+            : m.errKind != ERR_NONE && m.errKind != ERR_PARTIAL;
         const bool stopped = turnWasStopped(m);
         if (stopped) failed = false;
-        if (failed) {
+        if (failed && !m.compactionRun) {
             Step& s = pushStep(t, 0, StepKind::Error, m.ts);
             s.title = m.errorHuman.empty() ? std::string("Run failed") : m.errorHuman;
             s.error = m.errorFull.empty() ? m.text : m.errorFull;
@@ -1071,7 +1135,8 @@ static TraceStore* activeTrace(AppState& st, const std::string& convId, bool* fr
     FallbackTrace& fb = s_fallback[convId];
     const size_t sig = transcriptSig(*msgs);
     const double now = ImGui::GetTime();
-    const bool live = !msgs->empty() && msgs->back().running;
+    const size_t liveTail = pendingSteerTail(*msgs);   // pending steers trail the live turn
+    const bool live = liveTail > 0 && (*msgs)[liveTail - 1].running;
     if (!fb.built || fb.sig != sig || (live && now - fb.builtAt > 1.0)) {
         buildFallback(*msgs, fb.store);
         fb.sig = sig;

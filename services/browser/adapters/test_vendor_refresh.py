@@ -52,7 +52,7 @@ from services.browser import session
             '<td class="mytxt"><a>Hexagon socket head cap screws</a></td>',
             "GB/T 70.1-2008 — Hexagon socket head cap screws",
             "http://openstd.samr.gov.cn/bzgk/gb/newGbInfo?hcno=A1B2C3",
-            "/std_list?p.p2=GB/T+70.1",
+            "/std_list?p.p2=GB%2FT+70.1",
         ),
         (
             "pcbway",
@@ -69,7 +69,7 @@ from services.browser import session
             '<a href="/AcrylicSheet?campaign=search" class="standLink">Acrylic Sheet</a>',
             "Acrylic Sheet",
             "https://www.professionalplastics.com/AcrylicSheet",
-            "/cgi-bin/pp.pl?pgm=co_search&func=process&strfnbr=3&terms=acrylic%20sheet&type=1",
+            "/cgi-bin/pp.pl?pgm=co_search&func=process&strfnbr=3&terms=acrylic+sheet&type=1",
         ),
     ],
 )
@@ -113,15 +113,12 @@ def test_futureelectronics_uses_same_origin_autocomplete(monkeypatch):
     assert requested == [
         "https://www.futureelectronics.com/search/autocomplete/SearchBox_GC?term=atmega328p"
     ]
-    assert hits == [
-        {
-            "ok": True,
-            "title": "ATMEGA328P-AU",
-            "sku": "ATMEGA328P-AU",
-            "url": "https://www.futureelectronics.com/search?text=ATMEGA328P-AU",
-            "site": "futureelectronics",
-        }
-    ]
+    assert len(hits) == 1
+    assert hits[0]["title"] == "ATMEGA328P-AU"
+    assert hits[0]["kind"] == "page"
+    assert hits[0]["sku"] is None
+    assert hits[0]["url"] == "https://www.futureelectronics.com/search?text=ATMEGA328P-AU"
+    assert hits[0]["site"] == "futureelectronics"
 
 
 def test_hiwin_filters_cached_public_sitemap(monkeypatch):
@@ -143,12 +140,12 @@ def test_hiwin_filters_cached_public_sitemap(monkeypatch):
 
     hits = adapter.search("linear guide")
 
-    assert requested == ["https://hiwin.com/page-sitemap.xml"]
-    assert hits == [
-        {
-            "title": "Linear Guideways",
-            "url": "https://hiwin.com/products/linear-guideways/",
-            "site": "hiwin",
-            "manufacturer": "HIWIN",
-        }
-    ]
+    assert requested == ["https://hiwin.com/page-sitemap.xml",
+                         "https://hiwin.com/product_series-sitemap.xml"]
+    assert len(hits) == 1
+    assert hits[0]["title"] == "Linear Guideways"
+    assert hits[0]["url"] == "https://hiwin.com/products/linear-guideways/"
+    assert hits[0]["site"] == "hiwin"
+    assert hits[0]["kind"] == "category"
+    assert hits[0]["manufacturer"] == "HIWIN"
+    assert hits[0]["thumbnail"] is None and hits[0]["price"] is None

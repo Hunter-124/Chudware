@@ -44,12 +44,29 @@ def _hg(ledger, name=None):
     return out
 
 
+def _mock_single_body_doc(monkeypatch):
+    """Keep offline turn tests isolated from the live daemon."""
+    from services.mcp import core_bridge
+
+    def call(method, args):
+        assert args["doc_id"] == "d1"
+        if method == "doc_tree":
+            return {"tree": {"schema": "aicad.part/1", "features": []}}
+        if method == "asm_world_bodies":
+            return {"bodies": [{}]}
+        raise AssertionError(f"unexpected RPC: {method}")
+
+    monkeypatch.setattr(core_bridge, "call", call)
+
+
 # ===========================================================================
 # WI-12 — classifier + auto-checkpoint
 # ===========================================================================
 
 def test_destructive_ops_classifier():
-    assert gr.is_destructive_tool("delete_feature", {})
+    assert gr.is_destructive_tool("add_features", {
+        "ops": [{"op": "delete_feature", "id": "f1"}],
+    })
     assert gr.is_destructive_tool("add_features", {
         "ops": [{"op": "add_feature", "feature": {"type": "shell"}}],
     })
@@ -62,6 +79,10 @@ def test_destructive_ops_classifier():
     assert gr.is_destructive_tool("add_features", {
         "ops": [{"feature": {"type": "pattern"}}],
     })
+    for kind in ("suppress_feature", "unsuppress_feature"):
+        assert gr.is_destructive_tool("add_features", {
+            "ops": [{"op": kind, "id": "f1"}],
+        })
     # non-destructive
     assert not gr.is_destructive_tool("measure_part", {})
     assert not gr.is_destructive_tool("add_features", {
@@ -99,16 +120,17 @@ def test_auto_checkpoint_before_destructive_passes_and_emits():
         return {"ok": True, "checkpoint": "ck1"}
 
     v = gr.pre_dispatch(
-        "delete_feature",
-        {"doc_id": "d1", "id": "f9"},
+        "add_features",
+        {"doc_id": "d1", "ops": [{"op": "delete_feature", "id": "f9"}]},
         ledger=ledger, actor="t",
         checkpoint_fn=_ckpt,
+        known=({"f9"}, set()),
     )
     assert v is None  # proceed
-    assert seen == ["delete_feature"]
+    assert seen == ["add_features"]
     ac = _kinds(ledger, "auto_checkpoint")
     assert len(ac) == 1
-    assert ac[0]["payload"]["trigger_tool"] == "delete_feature"
+    assert ac[0]["payload"]["trigger_tool"] == "add_features"
     assert any(e["payload"]["outcome"] == "passed" for e in _hg(ledger, "auto_checkpoint"))
 
 
@@ -121,11 +143,12 @@ def test_auto_checkpoint_kill_switch():
         return {"ok": True}
 
     v = gr.pre_dispatch(
-        "delete_feature",
-        {"doc_id": "d1"},
+        "add_features",
+        {"doc_id": "d1", "ops": [{"op": "delete_feature", "id": "f9"}]},
         ledger=ledger, actor="t",
         checkpoint_fn=_ckpt,
         cfg={"hard_guardrails": {"auto_checkpoint": False}},
+        known=({"f9"}, set()),
     )
     assert v is None
     assert called == []  # never checkpointed
@@ -198,6 +221,26 @@ def test_refs_resolve_ignores_geom_queries_and_pending():
     )
     assert missing == []
 
+def test_topology_sid_deferral_is_limited_to_resolvable_ref_members():
+    sid = "E48bed5"
+    for op in (
+        {"op": "add_feature", "feature": {"type": "fillet", "refs": {"edges": [sid]}}},
+        {"op": "add_feature", "type": "fillet", "refs": {"edges": [sid]}},
+        {"op": "edit_feature", "id": "f1", "refs": {"edges": [sid]}},
+        {"op": "edit_feature", "feature": {"id": "f1", "refs": {"edges": [sid]}}},
+    ):
+        assert gr.check_refs_resolve_ids([op], {"f1"}) == []
+
+    for op in (
+        {"op": "edit_feature", "id": sid},
+        {"op": "edit_feature", "id": "missing", "refs": {"edges": [sid]}},
+        {"op": "add_feature", "feature": {"refs": {"profile": sid}}},
+        {"op": "add_feature", "feature": {"refs": {"edges": [{"id": sid}, sid]}}},
+        {"op": "add_feature", "feature": {"refs": {"edges": ["E48bedZ"]}}},
+    ):
+        assert gr.check_refs_resolve_ids([op], {"f1"})
+
+
 
 def test_refs_resolve_destructive_target_cannot_dodge_via_geom_word():
     """WI-15: a destructive op's target id must resolve even when it collides
@@ -207,10 +250,13 @@ def test_refs_resolve_destructive_target_cannot_dodge_via_geom_word():
         known_ids={"f1"},
     )
     assert missing == ["top"]
-    for kind in ("remove_feature", "suppress_feature"):
+    for kind in ("remove_feature", "suppress_feature", "unsuppress_feature"):
         assert gr.check_refs_resolve_ids(
             [{"op": kind, "id": "face"}], known_ids={"f1"},
         ) == ["face"], f"{kind} target ids must not dodge WI-15 via dictionary words"
+        assert gr.check_refs_resolve_ids(
+            [{"op": kind, "id": "face"}], known_ids={"face"},
+        ) == []
 
 
 def test_refs_resolve_non_destructive_id_still_bypasses_geom_words():
@@ -289,6 +335,32 @@ def test_refs_no_waiver():
     assert v is not None and not v.ok
 
 
+def test_done_discloses_every_feature_hidden_by_rollback():
+    tree = {"rollback_after": "f2", "features": [
+        {"id": "f1"}, {"id": "f2"}, {"id": "f7"}, {"id": "f70"}]}
+    skip = {"verify_battery", "check_interference", "orphan_sketch", "sketch_quality"}
+    ledger = ListLedger()
+    blocked = gr.check_done({"summary": "Finished"}, doc_id="d1", tree=tree,
+                            ledger=ledger, skip=skip)
+    assert not blocked.ok and blocked.name == "active_rollback"
+    assert all(text in blocked.message for text in ("f2", "f7", "f70", "WARNING"))
+    # f70 must not satisfy f7 and mentioning IDs without the rollback is not disclosure.
+    assert not gr.check_done({"summary": "f70 rolled back"}, doc_id="d1", tree=tree,
+                             skip=skip).ok
+    assert not gr.check_done({"summary": "f7 f70 complete"}, doc_id="d1", tree=tree,
+                             skip=skip).ok
+    disclosed = gr.check_done(
+        {"summary": "Incomplete: rolled back after f2; f7 and f70 are unbuilt."},
+        doc_id="d1", tree=tree, ledger=ledger, skip=skip)
+    assert disclosed.ok
+    assert any(e["payload"]["outcome"] == "waived" for e in _hg(ledger, "active_rollback"))
+    assert gr.check_done({}, doc_id="d1", tree={**tree, "rollback_after": "f70"},
+                         skip=skip).ok
+    top = gr.check_done({}, doc_id="d1", tree={**tree, "rollback_after": "start"}, skip=skip)
+    assert not top.ok
+    assert all(fid in top.message for fid in ("f1", "f2", "f7", "f70"))
+
+
 # ===========================================================================
 # WI-11 — verify_battery before done
 # ===========================================================================
@@ -297,7 +369,7 @@ def test_done_blocks_without_battery_after_mutation():
     ledger = ListLedger()
     calls = [{"tool": "add_features", "ok": True, "args": {"doc_id": "d1"},
               "result": {"ok": True}}]
-    v = gr.check_done({}, ledger=ledger, calls=calls, actor="t",
+    v = gr.check_done({}, ledger=ledger, calls=calls, actor="t", tree={"features": []},
                       skip={"check_interference", "orphan_sketch"})
     assert not v.ok
     assert v.name == "verify_battery"
@@ -305,12 +377,24 @@ def test_done_blocks_without_battery_after_mutation():
     assert any(e["payload"]["outcome"] == "blocked" for e in _hg(ledger, "verify_battery"))
 
 
+def test_scad_conversion_requires_fresh_battery_evidence():
+    calls = [
+        {"tool": "verify_battery", "ok": True,
+         "result": {"verdict": "pass", "coverage": {"ran": ["is_manifold"]},
+                    "scores": {"is_manifold": 1.0}, "findings": []}},
+        {"tool": "scad_convert", "ok": True, "result": {"ok": True}},
+    ]
+    assert gr.is_mutating_tool("scad_convert")
+    assert not gr.check_verify_battery_before_done({}, calls=calls).ok
+
+
 def test_done_passes_with_battery_evidence():
     ledger = ListLedger()
     calls = [
         {"tool": "add_features", "ok": True, "args": {}, "result": {"ok": True}},
         {"tool": "verify_battery", "ok": True, "args": {},
-         "result": {"scores": {"is_manifold": 1.0}, "findings": []}},
+         "result": {"verdict": "pass", "coverage": {"ran": ["is_manifold"]},
+                    "scores": {"is_manifold": 1.0}, "findings": []}},
     ]
     v = gr.check_done({}, ledger=ledger, calls=calls, actor="t",
                       skip={"check_interference", "orphan_sketch"})
@@ -320,7 +404,8 @@ def test_done_passes_with_battery_evidence():
 def test_battery_evidence_before_last_mutation_is_stale():
     calls = [
         {"tool": "verify_battery", "ok": True,
-         "result": {"scores": {"is_manifold": 1.0}, "findings": []}},
+         "result": {"verdict": "pass", "coverage": {"ran": ["is_manifold"]},
+                    "scores": {"is_manifold": 1.0}, "findings": []}},
         {"tool": "add_features", "ok": True, "result": {"ok": True}},
     ]
     verdict = gr.check_verify_battery_before_done({}, calls=calls)
@@ -334,6 +419,25 @@ def test_missing_battery_result_is_not_pass_evidence():
     ]
     verdict = gr.check_verify_battery_before_done({}, calls=calls)
     assert verdict.ok is False
+
+
+def test_battery_evidence_requires_passing_verdict_and_real_coverage():
+    valid = {"verdict": "pass", "coverage": {"ran": ["is_manifold"]},
+             "scores": {"is_manifold": 1.0}, "findings": []}
+    mutation = {"tool": "add_features", "ok": True, "result": {"ok": True}}
+    def done(result):
+        return gr.check_verify_battery_before_done({}, calls=[
+            mutation, {"tool": "verify_battery", "ok": True, "result": result}])
+
+    assert done(valid).ok
+    assert not done({**valid, "coverage": {"ran": []}}).ok
+    assert not done({**valid, "verdict": "no_checks_ran"}).ok
+    assert not done({**valid, "verdict": "fail"}).ok
+    assert not done({**valid, "scores": {"is_manifold": 0.5}}).ok
+    assert not done({**valid, "findings": [{"ok": False}]}).ok
+    assert not done({"scores": {"is_manifold": 1.0}, "findings": []}).ok
+
+
 def test_done_waives_battery_with_reason():
     ledger = ListLedger()
     calls = [{"tool": "add_features", "ok": True, "args": {}, "result": {}}]
@@ -371,7 +475,8 @@ def test_assembly_done_blocks_without_interference():
     calls = [
         {"tool": "add_features", "ok": True, "args": {}, "result": {}},
         {"tool": "verify_battery", "ok": True, "args": {},
-         "result": {"scores": {}, "findings": []}},
+         "result": {"verdict": "pass", "coverage": {"ran": ["is_manifold"]},
+                    "scores": {"is_manifold": 1.0}, "findings": []}},
     ]
     v = gr.check_done(
         {"doc_kind": "assembly"}, ledger=ledger, calls=calls, actor="t",
@@ -475,6 +580,50 @@ def test_orphan_sketch_cleared_when_consumed():
     assert v.ok
 
 
+def test_orphan_sketch_refs_match_whole_ids_and_names_only():
+    tree = {"features": [
+        {"id": "f1", "name": "Profile", "type": "sketch"},
+        {"id": "f10", "name": "Profile 10", "type": "sketch"},
+        {"id": "f11", "type": "extrude", "refs": {"profile": "f10"}},
+    ]}
+    assert gr.list_orphan_sketches(None, tree=tree) == ["f1"]
+    assert not gr.check_no_orphan_sketch_at_done({}, tree=tree).ok
+    tree["features"][2]["refs"]["profile"] = "Profile"
+    assert gr.list_orphan_sketches(None, tree=tree) == ["f10"]
+
+
+def test_unreadable_tree_blocks_orphan_and_rollback_gates():
+    def unavailable(_doc):
+        raise RuntimeError("tree offline")
+
+    for check in (gr.check_no_orphan_sketch_at_done, gr.check_rollback_before_done):
+        verdict = check({}, doc_id="d1", tree_provider=unavailable)
+        assert not verdict.ok
+        assert "tree offline" in verdict.message
+
+
+def test_tree_rpc_error_and_unknown_doc_block_done_gate(monkeypatch):
+    from services.mcp import core_bridge
+
+    monkeypatch.setattr(core_bridge, "call", lambda method, args: {
+        "ok": False, "code": "internal_error", "error": "tree unavailable"})
+    verdict = gr.check_no_orphan_sketch_at_done({}, doc_id="d1")
+    assert not verdict.ok and "tree unavailable" in verdict.message
+
+    monkeypatch.setattr(core_bridge, "call", lambda method, args: {
+        "ok": False, "code": "unknown_doc", "error": "unknown document"})
+    verdict = gr.check_no_orphan_sketch_at_done({}, doc_id="closed")
+    assert not verdict.ok and "unknown document" in verdict.message
+
+    def raise_unknown(method, args):
+        raise core_bridge.CoreError("unknown document", code="unknown_doc")
+
+    monkeypatch.setattr(core_bridge, "call", raise_unknown)
+    verdict = gr.check_rollback_before_done({}, doc_id="closed")
+    assert not verdict.ok and "unknown document" in verdict.message
+
+
+
 def test_orphan_sketch_waived_per_id():
     ledger = ListLedger()
     handoff = {"waivers": [
@@ -573,7 +722,8 @@ def test_gate_verify_still_fails_on_ac_fail():
 # agent_turn integration (mocked dispatch)
 # ===========================================================================
 
-def test_agent_turn_blocks_done_without_battery_after_mutation():
+def test_agent_turn_blocks_done_without_battery_after_mutation(monkeypatch):
+    _mock_single_body_doc(monkeypatch)
     provider = ScriptedProvider([
         '```json\n{"tool":"add_features","args":{"doc_id":"d1","ops":[{"feature":{"type":"box"}}]}}\n```',
         '```json\n{"done":true,"handoff":{"summary":"built"}}\n```',
@@ -604,7 +754,7 @@ def test_agent_turn_blocks_done_without_battery_after_mutation():
 
 def test_agent_turn_blocks_destructive_when_checkpoint_fails():
     provider = ScriptedProvider([
-        '```json\n{"tool":"delete_feature","args":{"doc_id":"d1","id":"f1"}}\n```',
+        '```json\n{"tool":"add_features","args":{"doc_id":"d1","ops":[{"op":"delete_feature","id":"f1"}]}}\n```',
         '```json\n{"done":true,"handoff":{}}\n```',
     ])
     ledger = ListLedger()
@@ -620,6 +770,7 @@ def test_agent_turn_blocks_destructive_when_checkpoint_fails():
             verdict = gr.pre_dispatch(
                 tool, args or {}, ledger=ledger, actor=actor or "agent_turn",
                 checkpoint_fn=lambda d, t: {"ok": False, "error": "ckpt boom"},
+                known=({"f1"}, set()),
             )
             if verdict is None or verdict.ok:
                 return None
@@ -631,7 +782,7 @@ def test_agent_turn_blocks_destructive_when_checkpoint_fails():
     try:
         res = agent_turn.run_turn(
             "delete it", provider,
-            allowed_tools=["delete_feature"],
+            allowed_tools=["add_features"],
             tool_dispatch=_dispatch, ledger=ledger, actor="t",
         )
     finally:
@@ -642,8 +793,9 @@ def test_agent_turn_blocks_destructive_when_checkpoint_fails():
     assert "ckpt boom" in str(res.result["calls"][0]["result"])
 
 
-def test_agent_turn_measure_only_done_still_works():
+def test_agent_turn_measure_only_done_still_works(monkeypatch):
     """Existing canary path: measure then done with no mutation must not block."""
+    _mock_single_body_doc(monkeypatch)
     provider = ScriptedProvider([
         '```json\n{"tool":"measure_part","args":{"doc_id":"d1"}}\n```',
         '```json\n{"done":true,"handoff":{"summary":"measured"}}\n```',
@@ -678,3 +830,15 @@ def test_destructive_ops_frozenset_exported():
     assert isinstance(gr.DESTRUCTIVE_OPS, frozenset)
     assert "shell" in gr.DESTRUCTIVE_OPS
     assert "boolean_cut" in gr.DESTRUCTIVE_OPS or "cut" in gr.DESTRUCTIVE_OPS
+
+
+def test_mutating_tool_names_are_registered_in_live_catalog():
+    from services.mcp.server import mcp
+
+    registered = set(mcp._tool_manager._tools)
+    missing = gr.MUTATING_TOOLS - registered
+    assert not missing, f"unregistered mutating tools: {sorted(missing)}"
+    assert all(gr.is_mutating_tool(name) for name in gr.MUTATING_TOOLS)
+    # The native RPC is not an advertised tool but still invalidates evidence.
+    assert "doc_apply_ops" not in gr.MUTATING_TOOLS
+    assert gr.is_mutating_tool("doc_apply_ops")

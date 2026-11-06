@@ -32,7 +32,7 @@ covers every requested feature, reply with EXACTLY:
 ```json
 {"done": true, "issues": []}
 ```
-That `{"done": true}` token is what the review loop treats as pass (core/agent/run.cpp). Prefer
+That `{"done": true}` token is what the review loop treats as pass. Prefer
 it over hedging or asking for more evidence that is already in the MEASURED block.
 
 Otherwise reply with EXACTLY one ```json block, no prose outside it:

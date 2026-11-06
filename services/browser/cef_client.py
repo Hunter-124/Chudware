@@ -7,10 +7,9 @@ The daemon and headless implementation live in ``host/src/ui/widgets/cef/cef_dae
 and ``host/src/ui/widgets/cef/cef_headless.cpp``. Residual Python embed/login paths
 still use the Playwright-compatible driver selected by :mod:`services.browser.driver`.
 
-Lifecycle: the daemon is lazily spawned on the first request if nothing is
-listening, owns the shared *warm* profile (so a login in the interactive CEF panel
-carries into headless fetch), and idle-exits when unused — CEF/Chromium is not
-resident when parts search is not running.
+Lifecycle: the daemon is lazily spawned on the first request and idle-exits when
+unused. The empty profile sent by normal vendor calls selects CEF's shared
+global request context; GUI cookies are imported into that same context.
 
 Transport mirrors services/mcp/daemon_bridge.py: connect-or-spawn against a
 per-binary socket key, newline-delimited JSON-RPC, one request per connection.
@@ -294,18 +293,17 @@ class CefDaemon:
             return False
 
     def fetch(self, url: str, *, settle_ms: int = 1200, profile: str = "") -> dict:
-        """Load ``url`` in CEF and return {ok, status, final_url, html}. ``profile``
-        empty = the shared warm profile (the authenticated-session jar)."""
+        """Return {ok, status, retry_after, final_url, html}; empty profile is global."""
         return self._call("fetch", {"url": url, "settle_ms": settle_ms, "profile": profile})
 
     def download(self, url: str, dest: str, *, profile: str = "") -> dict:
-        """Fetch ``url``'s bytes into ``dest`` under the profile's cookies."""
+        """Fetch bytes and report status, Retry-After and final URL when available."""
         return self._call("download", {"url": url, "dest": dest, "profile": profile})
 
     def interact(self, url: str, script: str, *, sentinel: str = "__aicad_capture",
                  settle_ms: int = 4000, timeout_ms: int = 12000, profile: str = "",
                  timeout_s: float = 90.0) -> dict:
-        """Load ``url`` under the warm session, run ``script`` in the page, and wait
+        """Load ``url`` under the selected context, run ``script``, and wait
         for a sentinel DOM element (id ``sentinel``) to publish a result. Returns
         {ok, status, final_url, html} — the caller extracts the sentinel's contents.
 
@@ -321,11 +319,11 @@ class CefDaemon:
 
     def import_session(self, cookies: list[dict], *, profile: str = "",
                        timeout_s: float = 60.0) -> dict:
-        """Inject a cookie jar (exported from the interactive CEF panel) into the
-        daemon's warm profile so a login there carries into headless fetch/download.
-        ``profile`` empty = the warm profile. Returns {ok, count}. The panel and
-        daemon own SEPARATE on-disk profiles (never the same store concurrently), so
-        the session crosses via this cookie re-injection, not by sharing a dir."""
+        """Import panel cookies into the global context when ``profile`` is empty.
+
+        The panel and daemon own separate stores; cookies cross by re-injection,
+        not by sharing a directory. Returns {ok, count}.
+        """
         return self._call("import_session", {"cookies": cookies, "profile": profile},
                           timeout_s=timeout_s)
 

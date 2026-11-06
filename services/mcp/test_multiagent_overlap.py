@@ -193,16 +193,21 @@ def test_handoff_fragment_merge_unions_live_drops_dead(tmp_path, monkeypatch):
     alive_pid = ct._HANDOFF_PID
     dead_pid = 999999  # far above pid_max defaults; os.kill -> ProcessLookupError
 
-    def frag(session, pid, docs):
+    def frag(session, pid, docs, presented=True):
         return {"rev": 1, "active": None, "session": session, "pid": pid,
                 "updated_at": __import__("time").time(),
                 "docs": [{"doc_id": f"{session}-{d}", "step": f"/tmp/{d}.step+",
-                          "rev": 1, "name": n} for d, n in docs]}
+                          "rev": 1, "name": n, "presented": presented} for d, n in docs]}
 
     (tmp_path / "docs-aaaa.json").write_text(
         json.dumps(frag("aaaa", alive_pid, [("doc1", "PartA")])))
     (tmp_path / "docs-bbbb.json").write_text(
         json.dumps(frag("bbbb", alive_pid, [("doc1", "PartB")])))  # same raw doc_id, other proc
+    (tmp_path / "docs-hidden.json").write_text(
+        json.dumps(frag("hidden", alive_pid, [("doc2", "Hidden")], presented=False)))
+    legacy = frag("legacy", alive_pid, [("doc3", "Legacy")])
+    legacy["docs"][0].pop("presented")
+    (tmp_path / "docs-legacy.json").write_text(json.dumps(legacy))
     (tmp_path / "docs-dead.json").write_text(
         json.dumps(frag("dead", dead_pid, [("doc9", "Ghost")])))
 
@@ -214,6 +219,8 @@ def test_handoff_fragment_merge_unions_live_drops_dead(tmp_path, monkeypatch):
     ids = {e["doc_id"] for e in merged["docs"]}
     assert ids == {"aaaa-doc1", "bbbb-doc1"}  # session-prefixed => distinct tabs
     assert "Ghost" not in json.dumps(merged)
+    assert "Hidden" not in json.dumps(merged)
+    assert "Legacy" not in json.dumps(merged)
     assert not (tmp_path / "docs-dead.json").exists()  # dead fragment cleaned up
 
 
@@ -296,8 +303,8 @@ def test_publish_revision_skip_and_burst_coalescing(tmp_path, monkeypatch):
         # --- revision-skip (interval disabled so coalescing can't mask it) ---
         monkeypatch.setattr(ct, "_PUBLISH_MIN_INTERVAL_S", 0.0)
         ct._PUB_THROTTLE.pop(did, None)
-        r1 = ct._publish_current(did)
-        assert r1 and r1["shown_in_app"]
+        r1 = ct._publish_current(did, _present=True)
+        assert r1 and r1["presentation_requested"]
         step = tmp_path / f"live-{ct._SESSION_ID}-{ct._handoff_key(did)}.step+"
         assert step.exists()
         mt1 = step.stat().st_mtime_ns
@@ -363,7 +370,7 @@ def test_thread_clients_overlap_share_writer_group_and_close_on_exit(monkeypatch
     results, errors = [], []
 
     class FakeClient:
-        def __init__(self, *, writer_group):
+        def __init__(self, *, writer_group, agent_run_scope=""):
             self.writer_group = writer_group
             self.closed = False
             self._lock = threading.Lock()

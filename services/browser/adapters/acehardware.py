@@ -2,7 +2,7 @@
 
 Commerce-only (see amazon.py): link-out + a copied-with-provenance price/spec
 record. Parse strategy: JSON-LD Product records on both search and product
-pages. Challenge pages degrade to ``login_required`` — never solved.
+pages. Challenges are reported without attempting to solve them.
 """
 from __future__ import annotations
 

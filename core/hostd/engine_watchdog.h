@@ -8,7 +8,7 @@
 // Restart=on-failure) and docs recover from autosave (explicit, user-gated, so no auto-replay
 // loop).
 //
-// Two disjoint engine-call tiers. Agent/chudcode calls have their own transport
+// Two disjoint engine-call tiers. Agent/OMP calls have their own transport
 // silence/absolute limits, so elapsed wall time cannot diagnose a stuck turn.
 //   * FAST: bounded non-modeling engine calls (~90 s).
 //   * LONG: modeling/rebuild mutations (~60 min), including shadow preflight
@@ -27,7 +27,7 @@ inline bool engineMethodWatchdogged(std::string_view m) {
 }
 
 inline bool engineMethodTurn(std::string_view m) {
-    return m.substr(0, 6) == "agent_" || m.substr(0, 9) == "chudcode_";
+    return m.substr(0, 6) == "agent_" || m.substr(0, 4) == "omp_";
 }
 
 // True when a watchdogged call has run past the ceiling. ceilingMs <= 0 disables the watchdog.

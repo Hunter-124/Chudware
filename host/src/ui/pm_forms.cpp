@@ -20,13 +20,11 @@ static PMFieldDef Dim(const char* key, const char* label, const char* group, dou
 // applied at form open by property_manager.cpp (applyIpsNativeDefaults). Do NOT convert
 // these mm values for display; the dual-default path picks a separate imperial number.
 
-// Dim that is enabled only when a sibling Combo (named enableKey) holds one of enableVals.
-// omit=true => the param is dropped from the op entirely while disabled (so the engine's
-// table/defaults drive it) rather than emitted-and-ignored.
+// A conditional Dim is hidden/omitted whenever its sibling controller does not match.
 static PMFieldDef DimIf(const char* key, const char* label, const char* group, double def,
-                        const char* enableKey, const char* enableVals, bool omit = false) {
+                        const char* enableKey, const char* enableVals) {
     PMFieldDef f = Dim(key, label, group, def);
-    f.enableKey = enableKey; f.enableVals = enableVals; f.omitWhenDisabled = omit; return f;
+    f.enableKey = enableKey; f.enableVals = enableVals; return f;
 }
 static PMFieldDef Well(const char* key, const char* label, const char* group,
                        PMSelKinds kinds, bool multi) {
@@ -51,8 +49,7 @@ static PMFieldDef ComboL(const char* key, const char* label, const char* group,
     PMFieldDef f = Combo(key, label, group, options);
     f.comboLabels = labels; return f;
 }
-// ComboL enabled only when a sibling field (named enableKey) holds one of enableVals — works
-// against a sibling combo OR a checkbox ("true"/"false"), via fieldEnabled/enableSourceValue.
+// ComboL enabled only when a sibling combo or checkbox holds one of enableVals.
 static PMFieldDef ComboLIf(const char* key, const char* label, const char* group,
                            const char* options, const char* labels,
                            const char* enableKey, const char* enableVals) {
@@ -73,7 +70,7 @@ static PMFieldDef Int(const char* key, const char* label, const char* group, dou
     PMFieldDef f; f.kind = PMFieldKind::Int; f.key = key; f.label = label;
     f.group = group; f.dimDefault = def; f.unitLabel = ""; return f;
 }
-// Free-form text param (e.g. pattern instances-to-skip "2:1, 3:0"). Emitted only when non-empty.
+// Free-form text param (e.g. the optional thread turns cap).
 static PMFieldDef Text(const char* key, const char* label, const char* group,
                        const char* placeholder = nullptr) {
     PMFieldDef f; f.kind = PMFieldKind::Text; f.key = key; f.label = label;
@@ -87,13 +84,11 @@ static PMFieldDef DimU(const char* key, const char* label, const char* group, do
 static PMFieldDef Angle(const char* key, const char* label, const char* group, double def) {
     PMFieldDef f = Dim(key, label, group, def); f.unitLabel = " [deg]"; return f;
 }
-// Angle dim enabled only when a sibling field (named enableKey) holds one of enableVals.
-// omit=true drops the param entirely while disabled (so it can't drive an engine code path —
-// e.g. a stale chamfer angle must NOT force the distance-angle path on a symmetric chamfer).
+// Conditional angles use the same hidden/omitted semantics as other dependent fields.
 static PMFieldDef AngleIf(const char* key, const char* label, const char* group, double def,
-                          const char* enableKey, const char* enableVals, bool omit = false) {
+                          const char* enableKey, const char* enableVals) {
     PMFieldDef f = Angle(key, label, group, def);
-    f.enableKey = enableKey; f.enableVals = enableVals; f.omitWhenDisabled = omit; return f;
+    f.enableKey = enableKey; f.enableVals = enableVals; return f;
 }
 // Attach a bounded range (canonical mm/deg) to a Dim/Angle/DimU — the PM renders it as a slider
 // with the unit in the value text (CTRL+click still types an exact number). step 0 = kind default.
@@ -176,10 +171,8 @@ static const std::vector<PMFormDef>& forms() {
             Dim   ("height",   "Height",   "Cylinder", 20.0),
             Check ("centered", "Centered", "Cylinder", true),
         }},
-        // --- extrude ---  mode/end/depth/flip/draft/draft_outward/merge ; profile[]
-        //   Direction 2: end2 / depth2. Geometry-driven ends (up_to_surface/offset_from_surface/
-        //   up_to_body/up_to_vertex) read a face/vertex/body target from refs.up_to(2) — the
-        //   "Up To" well (K_FACEVERT) gated on those ends; offset_from_surface adds an Offset dim.
+        // --- extrude --- mode/end/depth/flip/draft/draft_outward/merge ; profile[]
+        // Direction 2 currently supports only none, blind and through-all in the compiler.
         //   Thin Feature (params.thin/thin_thickness/thin_side) extrudes a wall instead of a solid.
         { "extrude", "Extrude", "extrude_boss", {
             Well      ("profile",  "Profile",         "From",        K_FACE, true),
@@ -189,46 +182,33 @@ static const std::vector<PMFormDef>& forms() {
             WellIf    ("start_ref","Start Reference", "From",        K_FACEPLANE, false,
                        "start", "from_reference|offset_from_reference"),
             Signed    (DimIf ("start_offset", "Start Offset","From", 0.0,
-                       "start", "offset|offset_from_reference", true)),
+                       "start", "offset|offset_from_reference")),
             Seg       (ComboL("mode",     "Type",            "Direction 1", "boss|cut",
                                                                      "Boss|Cut")),
             ComboL    ("end",      "End Condition",   "Direction 1",
-                       "blind|mid_plane|through_all|up_to_next|up_to_surface|offset_from_surface|up_to_body|up_to_vertex|up_to_reference|offset_from_reference",
-                       "Blind|Mid Plane|Through All|Up To Next|Up To Plane/Surface|Offset Plane/Surf.|Up To Body|Up To Vertex|Up To Ref.|Offset Ref."),
+                       "blind|mid_plane|through_all|up_to_surface|offset_from_surface|up_to_vertex|up_to_reference|offset_from_reference",
+                       "Blind|Mid Plane|Through All|Up To Plane/Surface|Offset Plane/Surf.|Up To Vertex|Up To Ref.|Offset Ref."),
             DimIf     ("depth",    "Depth",           "Direction 1", 10.0,
-                       "end", "blind|mid_plane", true),
+                       "end", "blind|mid_plane"),
             WellIf    ("up_to",    "Up To Reference", "Direction 1", K_FACEVERTPLANE, false,
-                       "end", "up_to_surface|offset_from_surface|up_to_body|up_to_vertex"),
+                       "end", "up_to_surface|offset_from_surface|up_to_vertex"),
             Signed    (DimIf ("offset",   "Offset",          "Direction 1", 0.0,
-                       "end", "offset_from_surface", true)),
+                       "end", "offset_from_surface")),
             WellIf    ("end_ref",  "End Reference",   "Direction 1", K_FACEPLANE, false,
                        "end", "up_to_reference|offset_from_reference"),
             Signed    (DimIf ("end_offset","End Offset",      "Direction 1", 0.0,
-                       "end", "offset_from_reference", true)),
+                       "end", "offset_from_reference")),
             Check     ("flip",     "Reverse direction","Direction 1", false),
-            // Issue #32: "Draft outward" is the enable toggle. The angle field (and its in-viewport
-            // handle/callout, which follow fieldVisible) stay hidden until it's checked, so a plain
-            // extrude isn't cluttered by a draft control the user didn't ask for. The checkbox is
-            // only offered for blind/mid-plane ends where draft is meaningful. (omitWhenDisabled on
-            // the angle => it's hidden, not greyed.) Inward draft remains available via the
-            // standalone Draft feature.
+            // The angle enables draft; this check selects its direction. An unchecked check
+            // is a valid inward taper, not a request to discard the angle.
             CheckIf   ("draft_outward", "Draft outward","Direction 1", false,
                        "end", "blind|mid_plane"),
             Range     (AngleIf("draft",    "Draft angle",     "Direction 1", 0.0,
-                       "draft_outward", "true", true), 0.0, 89.0),
+                       "end", "blind|mid_plane"), 0.0, 89.0),
             ComboL    ("end2",     "End Condition",   "Direction 2",
-                       "none|blind|through_all|up_to_next|up_to_surface|offset_from_surface|up_to_body|up_to_vertex|up_to_reference|offset_from_reference",
-                       "None|Blind|Through All|Up To Next|Up To Plane/Surface|Offset Plane/Surf.|Up To Body|Up To Vertex|Up To Ref.|Offset Ref."),
-            WellIf    ("up_to2",   "Up To Reference", "Direction 2", K_FACEVERTPLANE, false,
-                       "end2", "up_to_surface|offset_from_surface|up_to_body|up_to_vertex"),
-            Signed    (DimIf ("offset2",  "Offset",          "Direction 2", 0.0,
-                       "end2", "offset_from_surface", true)),
-            WellIf    ("end2_ref", "End Reference",   "Direction 2", K_FACEPLANE, false,
-                       "end2", "up_to_reference|offset_from_reference"),
-            Signed    (DimIf ("end2_offset","End Offset",     "Direction 2", 0.0,
-                       "end2", "offset_from_reference", true)),
+                       "none|blind|through_all", "None|Blind|Through All"),
             DimIf     ("depth2",   "Depth",           "Direction 2", 10.0,
-                       "end2", "blind", true),
+                       "end2", "blind"),
             Check     ("thin",         "Thin Feature",  "Thin Feature", false),
             DimIf     ("thin_thickness","Wall thickness","Thin Feature", 2.0,
                        "thin", "true"),
@@ -239,8 +219,8 @@ static const std::vector<PMFormDef>& forms() {
         }},
         // --- revolve ---  mode/end/angle/flip/dir2/angle2/thin ; profile[]/axis
         //   Engine (revolve.py): end one_direction|mid_plane|up_to_surface (up_to auto-trims to the
-        //   body, no target ref); Dir2 (params.dir2 + angle2 — angle2 omitWhenDisabled so it can't
-        //   force dir2 on); Thin Feature (thin/thin_thickness/thin_side inside|outside|both).
+        //   body, no target ref); Dir2 omits angle2 while disabled; Thin Feature uses
+        //   thin/thin_thickness/thin_side inside|outside|both.
         { "revolve", "Revolve", "revolve_boss", {
             Well   ("profile",  "Profile",        "From",        K_FACE, true),
             Well   ("axis",     "Axis",           "From",        K_EDGEAXIS, false),
@@ -253,7 +233,7 @@ static const std::vector<PMFormDef>& forms() {
             Check  ("flip",     "Reverse direction", "Direction 1", false),
             Check  ("dir2",     "Direction 2",    "Direction 2", false),
             Range  (AngleIf("angle2",   "Angle",          "Direction 2", 360.0,
-                    "dir2", "true", /*omit=*/true), 0.0, 360.0),
+                    "dir2", "true"), 0.0, 360.0),
             Check  ("thin",         "Thin Feature",  "Thin Feature", false),
             DimIf  ("thin_thickness","Wall thickness","Thin Feature", 2.0,
                     "thin", "true"),
@@ -319,9 +299,9 @@ static const std::vector<PMFormDef>& forms() {
                      "Distance (Symmetric)|Distance (Asymmetric)|Angle-Distance|Vertex"),
             Dim     ("length",   "Distance",         "Chamfer Parameters", 1.0),
             DimIf   ("length2",  "Distance 2",       "Chamfer Parameters", 1.0,
-                     "type", "asymmetric", /*omit=*/true),
+                     "type", "asymmetric"),
             Range   (AngleIf("angle",    "Angle",            "Chamfer Parameters", 45.0,
-                     "type", "distance_angle", /*omit=*/true), 1.0, 89.0),
+                     "type", "distance_angle"), 1.0, 89.0),
             WellIf  ("reference_face","Reference Face","Chamfer Parameters", K_FACE, false,
                      "type", "distance_angle"),
         }},
@@ -334,7 +314,7 @@ static const std::vector<PMFormDef>& forms() {
         // --- hole (Hole Wizard) ---  full SolidWorks Hole Wizard over features/hole.py.
         //   style simple|cbore|csink|tap; standard M2..M12 drives diameter + cbore/csink dims from
         //   the ISO table (features/hole.py _STD_TABLE), "custom" reveals an explicit Diameter.
-        //   CRITICAL: diameter is OMITTED while a non-custom standard is chosen (omitWhenDisabled),
+        //   CRITICAL: diameter is OMITTED while a non-custom standard is chosen,
         //   so the table — not a form default — sets it. cbore/csink dims are left to the engine
         //   table + proportional defaults (exposing them as overrides would shadow the table).
         //   Multi-position (SolidWorks Hole Wizard's Positions tab): a rectangular grid (nx×ny at
@@ -351,7 +331,7 @@ static const std::vector<PMFormDef>& forms() {
                      "M2|M2.5|M3|M4|M5|M6|M8|M10|M12|"
                      "#4-40 UNC|#6-32 UNC|#8-32 UNC|#10-24 UNC|#10-32 UNF|1/4-20 UNC|1/4-28 UNF|"
                      "5/16-18 UNC|3/8-16 UNC|1/2-13 UNC|NPT 1/8|NPT 1/4|NPT 1/2|Custom"),
-            DimIf   ("diameter", "Diameter",         "Hole Type", 6.6, "standard", "custom", true),
+            DimIf   ("diameter", "Diameter",         "Hole Type", 6.6, "standard", "custom"),
             Range   (AngleIf("csink_angle", "C'Sink Angle",  "Hole Type", 90.0,
                      "style", "csink"), 60.0, 150.0),
             ComboL  ("end",      "End Condition",    "End Condition",
@@ -382,12 +362,12 @@ static const std::vector<PMFormDef>& forms() {
                      "M3|M4|M5|M6|M8|M10|M12|M16|M20|M24|M8x1 (fine)|M10x1.25 (fine)|M12x1.5 (fine)|"
                      "#10-24 UNC|#10-32 UNF|1/4-20 UNC|5/16-18 UNC|3/8-16 UNC|1/2-13 UNC",
                      "custom_size", "false"),
-            DimIf   ("major_dia", "Major Dia.", "Thread", 12.0,  "custom_size", "true", /*omit=*/true),
-            DimIf   ("pitch",     "Pitch",      "Thread", 1.75,  "custom_size", "true", /*omit=*/true),
+            DimIf   ("major_dia", "Major Dia.", "Thread", 12.0,  "custom_size", "true"),
+            DimIf   ("pitch",     "Pitch",      "Thread", 1.75,  "custom_size", "true"),
             // Full length by default: `full_length` checked OMITS `length` so the engine
             // spans the whole cylindrical face. Uncheck to reveal an explicit Length field.
             Check   ("full_length", "Full length", "Thread", true),
-            DimIf   ("length",    "Length",     "Thread", 12.0,  "full_length", "false", /*omit=*/true),
+            DimIf   ("length",    "Length",     "Thread", 12.0,  "full_length", "false"),
             // Start reference: a vertex / edge / face the thread starts FROM (default: the
             // lower face end). Flip runs it toward the other end — use it when the picked
             // reference isn't already an auto-termination end of the thread.
@@ -439,8 +419,6 @@ static const std::vector<PMFormDef>& forms() {
             Int      ("count2",   "Instances",    "Direction 2", 1),
             Dim      ("spacing2", "Spacing",      "Direction 2", 20.0),
             FeatWell ("features", "Features to Pattern", "Features to Pattern"),
-            Text     ("skip",     "Instances to skip", "Instances to Skip",
-                      "grid cells i:j or indices, e.g. 2:1, 3:0"),
         }},
         // --- circular_pattern ---  axis + count/angle + equal_spacing, features[]
         //   Engine (pattern.py compile_circular_pattern): count instances about the axis; equal
@@ -453,8 +431,6 @@ static const std::vector<PMFormDef>& forms() {
             Range    (Angle("angle",    "Angle",        "Parameters", 360.0), 0.0, 360.0),
             Check    ("equal_spacing", "Equal spacing", "Parameters", true),
             FeatWell ("features", "Features to Pattern", "Features to Pattern"),
-            Text     ("skip",     "Instances to skip", "Instances to Skip",
-                      "ring indices (0=seed), e.g. 1, 3, 5"),
         }},
         // --- draft --- neutral-plane taper on the selected faces.
         { "draft", "Draft", "draft", {
@@ -614,8 +590,8 @@ static const std::vector<PMFormDef>& forms() {
         //   library profile along the segments of ONE path sketch (refs.sketch = a single sketch
         //   feature-id STRING, not an array — FeatWell1 single-emit). segments are OMITTED here so the
         //   engine defaults to ALL sketch segments. The profile combo picks one of six library shapes;
-        //   each shape's dim keys are gated on that combo with omit=true so only the active profile's
-        //   dims are emitted (the engine's per-profile defaults drive the rest). thickness applies to
+        //   each shape's dim keys are gated on that combo so only the active profile's dimensions
+        //   are emitted (the engine's per-profile defaults drive the rest). thickness applies to
         //   every profile. angle rotates the section; justify centres vs corner-aligns it to the path;
         //   trim_corners miters where members meet.
         { "weld_member", "Structural Member", "weld_member", {
@@ -623,11 +599,11 @@ static const std::vector<PMFormDef>& forms() {
             ComboL    ("profile", "Profile",       "Profile",
                        "square_tube|rect_tube|round_tube|angle_L|flat_bar|c_channel",
                        "Square Tube|Rect Tube|Round Tube|Angle (L)|Flat Bar|C-Channel"),
-            DimIf     ("size",    "Size",          "Profile", 20.0, "profile", "square_tube",          true),
-            DimIf     ("w",       "Width",         "Profile", 40.0, "profile", "rect_tube|c_channel|flat_bar", true),
-            DimIf     ("h",       "Height",        "Profile", 20.0, "profile", "rect_tube|c_channel",  true),
-            DimIf     ("od",      "Outer Dia.",    "Profile", 25.0, "profile", "round_tube",           true),
-            DimIf     ("leg",     "Leg",           "Profile", 25.0, "profile", "angle_L",              true),
+            DimIf     ("size",    "Size",          "Profile", 20.0, "profile", "square_tube"),
+            DimIf     ("w",       "Width",         "Profile", 40.0, "profile", "rect_tube|c_channel|flat_bar"),
+            DimIf     ("h",       "Height",        "Profile", 20.0, "profile", "rect_tube|c_channel"),
+            DimIf     ("od",      "Outer Dia.",    "Profile", 25.0, "profile", "round_tube"),
+            DimIf     ("leg",     "Leg",           "Profile", 25.0, "profile", "angle_L"),
             Dim       ("thickness","Thickness",    "Profile", 2.0),
             Range     (Angle("angle",   "Rotation",      "Settings", 0.0), 0.0, 360.0),
             Seg       (ComboL("justify", "Justify",       "Settings", "center|corner",
@@ -701,8 +677,8 @@ static const std::vector<PMFormDef>& forms() {
         { "surf_extrude", "Extruded Surface", "extrude_boss", {
             Well   ("profile", "Profile",       "Profile",   K_FACE, true),
             ComboL ("end",     "End Condition", "Direction",
-                    "blind|mid_plane|through_all|up_to_next",
-                    "Blind|Mid Plane|Through All|Up To Next"),
+                    "blind|mid_plane|through_all",
+                    "Blind|Mid Plane|Through All"),
             DimIf  ("depth",   "Distance",      "Direction", 10.0, "end", "blind|mid_plane"),
         }},
         // --- surf_revolve --- refs.profile[]/axis; params angle.
@@ -711,17 +687,14 @@ static const std::vector<PMFormDef>& forms() {
             Well  ("axis",    "Axis",    "Revolve", K_EDGEAXIS, false),  // K_EDGEAXIS (not K_EDGE) so a datum axis is accepted — mirrors solid revolve
             Range (Angle("angle",   "Angle",   "Revolve", 360.0), 0.0, 360.0),
         }},
-        // --- surf_sweep --- refs.profile[]/path/guides[]; no params.
+        // --- surf_sweep --- refs.profile[]/path; no params.
         { "surf_sweep", "Swept Surface", "sweep", {
             Well ("profile", "Profile",      "Profile and Path", K_FACE, true),
             Well ("path",    "Path",         "Profile and Path", K_EDGE, false),
-            Well ("guides",  "Guide Curves", "Guide Curves",     K_EDGE, true),
         }},
-        // --- surf_loft --- refs.sections[]/guides[]/centerline; no params.
+        // --- surf_loft --- refs.sections[]; no params.
         { "surf_loft", "Lofted Surface", "loft", {
             Well ("sections",   "Profiles",     "Profiles",     K_FACE, true),
-            Well ("guides",     "Guide Curves", "Guide Curves", K_EDGE, true),
-            Well ("centerline", "Centerline",   "Centerline",   K_EDGE, false),
         }},
         // --- surf_planar --- refs.profile[]; no params. A planar surface filling a
         //   closed sketch contour or bounded by closed edges.

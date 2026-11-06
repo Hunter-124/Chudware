@@ -382,10 +382,70 @@ def test_bailey_search_parses_bigcommerce_cards(bailey_mod, monkeypatch):
     assert first["url"] == (
         "https://www.baileyhydraulics.com/"
         "CYLINDER-WELDED-3-X-42-1.50-ROD-CHIEF-WX-3000-PSI/")
-    assert first["sku"] == "950"
-    assert first["price"] == "$608.18"
+    assert first["sku"] == "207454" and first["product_id"] == "950"
+    assert first["manufacturer"] == "Chief"
+    assert first["price"] == 608.18 and first["currency"] == "USD" and first["stock"] == 54
+    assert first["kind"] == "product" and first["model"] == {"available": None, "formats": []}
+    assert first["thumbnail"] == (
+        "https://cdn11.bigcommerce.com/s-xyc0gzbo80/images/stencil/500x659/"
+        "products/950/25345/chief-wx-welded-hydraulic-cylinder__24804.1738166441.jpg?c=1")
+    second = hits[1]
+    assert second["sku"] == "207484" and second["product_id"] == "957"
+    assert second["price"] == 751.14 and second["stock"] == 1
+    assert second["thumbnail"] == (
+        "https://cdn11.bigcommerce.com/s-xyc0gzbo80/images/stencil/500x659/"
+        "products/957/25423/chief-wx-welded-hydraulic-cylinder__25005.1738166480.jpg?c=1")
 
 
 def test_bailey_search_url_is_bigcommerce_endpoint():
     from services.browser.adapters import baileyhydraulics
     assert "search.php?search_query=" in baileyhydraulics.SEARCH_URL_TMPL
+    assert "%26" in baileyhydraulics.ADAPTER.search_url("cylinder & pump")
+
+
+def test_bailey_does_not_borrow_image_or_specification_id(bailey_mod, monkeypatch):
+    session, baileyhydraulics = bailey_mod
+    page = """
+    <article class="card"><div class="card-img-container"><img src="/logo.png"></div>
+      <h4 class="card-title"><a href="/one">One</a></h4>
+      <th data-product-id="8236">Bore</th>
+    </article>
+    <article class="card"><div class="card-img-container"><img data-src="/two.jpg"></div>
+      <h4 class="card-title"><a href="/two">Two</a></h4>
+    </article><img src="/footer.jpg">
+    """
+    monkeypatch.setattr(session, "browser_fetch", lambda *_: {"ok": True, "content": page})
+    first, second = baileyhydraulics.ADAPTER.search("cylinder")
+    assert first["thumbnail"] is None and first["sku"] is None and "product_id" not in first
+    assert second["thumbnail"] == baileyhydraulics.BASE_URL + "/two.jpg"
+
+
+@pytest.mark.parametrize(("content", "reason"), [
+    ("<html>unexpected markup</html>", "parse_failed"),
+    ("Access Denied", "blocked"),
+    ("Access Denied: CAPTCHA", "captcha"),
+    ("<main>Verify you are human</main>", "captcha"),
+])
+def test_bailey_reports_failures(bailey_mod, monkeypatch, content, reason):
+    session, baileyhydraulics = bailey_mod
+    monkeypatch.setattr(session, "browser_fetch", lambda *_: {"ok": True, "content": content})
+    failure = baileyhydraulics.ADAPTER.search("cylinder")[0]
+    assert (failure["ok"], failure["site"], failure["op"], failure["reason"]) == (
+        False, "baileyhydraulics", "search", reason)
+
+
+def test_bailey_transport_failure_preserves_details(bailey_mod, monkeypatch):
+    session, baileyhydraulics = bailey_mod
+    monkeypatch.setattr(session, "browser_fetch", lambda *_: {
+        "ok": False, "reason": "rate_limited", "status": 429, "retry_after_s": 30})
+    failure = baileyhydraulics.ADAPTER.search("cylinder")[0]
+    assert failure["reason"] == "rate_limited" and failure["status"] == 429
+    assert failure["retry_after_s"] == 30 and failure["site"] == "baileyhydraulics"
+    assert failure["op"] == "search"
+
+
+def test_bailey_capabilities(bailey_mod):
+    _, baileyhydraulics = bailey_mod
+    assert baileyhydraulics.ADAPTER.result_kinds == ("product",)
+    assert not baileyhydraulics.ADAPTER.cad_acquisition and not baileyhydraulics.ADAPTER.login_required
+    assert not baileyhydraulics.ADAPTER.api and "baileyhydraulics.com" in baileyhydraulics.ADAPTER.hosts

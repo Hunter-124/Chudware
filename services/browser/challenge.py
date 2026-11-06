@@ -24,6 +24,9 @@ Pure functions over page HTML + URL — no browser import, no I/O — so they un
 """
 from __future__ import annotations
 
+import re
+from urllib.parse import urlsplit
+
 # Distinctive captcha service markers / challenge-page phrases (substring,
 # case-insensitive). Kept specific enough not to fire on ordinary pages.
 #
@@ -149,6 +152,11 @@ def classify_challenge(html: str | None, url: str = "") -> str | None:
     if not html:
         return None
     hay = html.lower()
+    # AWS WAF's integration script can be passive. Require its active challenge
+    # container as well, rather than treating every page loading the script as a wall.
+    if ("challenge-container" in hay
+            and ("awswafintegration" in hay or "awswafcookiedomainlist" in hay)):
+        return "captcha"
 
     hit_markers = [m for m in _CAPTCHA_MARKERS if m in hay]
     # SnapEDA home can include recaptcha widget markup after a successful login
@@ -207,12 +215,17 @@ def classify_challenge(html: str | None, url: str = "") -> str | None:
             if "acehardware.com" in u and ("/login" in u or "/user/login" in u):
                 return None
         return "captcha"
-    iframe_hits = [s for s in _CAPTCHA_IFRAME_SRC if s in hay]
-    if "<iframe" in hay and iframe_hits:
+    iframe_sources = [
+        next((value for value in match.groups() if value is not None), "")
+        for match in re.finditer(
+            r"""<iframe\b[^>]*\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""",
+            hay, re.IGNORECASE)
+    ]
+    if any(marker in src for src in iframe_sources for marker in _CAPTCHA_IFRAME_SRC):
         return "captcha"
-    # reCAPTCHA anchor iframe: a visible checkbox is a challenge; the v3 badge's
-    # size=invisible anchor on an ordinary page is not.
-    if "recaptcha/api2/anchor" in hay and "size=invisible" not in hay:
+    # A visible reCAPTCHA anchor is active; an invisible badge is not.
+    if any("recaptcha/api2/anchor" in src and "size=invisible" not in src
+           for src in iframe_sources):
         return "captcha"
     tf_hits = [m for m in _TWO_FACTOR_MARKERS if m in hay]
     if tf_hits:
@@ -233,3 +246,25 @@ def classify_challenge(html: str | None, url: str = "") -> str | None:
 def is_challenge(html: str | None, url: str = "") -> bool:
     """True when the page appears to present a captcha or 2FA challenge."""
     return classify_challenge(html, url) is not None
+
+
+def is_login_page(html: str | None, url: str = "") -> bool:
+    """Conservatively recognize sign-in destinations or password forms."""
+    try:
+        path = urlsplit(url).path.lower()
+    except ValueError:
+        path = ""
+    if _is_auth_url(path):
+        return True
+    text = html or ""
+    return bool(re.search(
+        r"<form\b[^>]*>[\s\S]{0,20000}?<input\b[^>]*\btype\s*=\s*['\"]?password\b",
+        text, re.IGNORECASE))
+
+
+def is_error_page(html: str | None) -> bool:
+    """Recognize common full-page error titles in otherwise successful responses."""
+    return bool(re.search(
+        r"<(?:title|h1)\b[^>]*>\s*(?:access denied|403 forbidden|404 not found|"
+        r"page not found|500 internal server error|502 bad gateway|503 service unavailable)\b",
+        html or "", re.IGNORECASE))

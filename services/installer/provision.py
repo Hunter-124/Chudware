@@ -77,7 +77,7 @@ def _find_repo() -> Path:
 REPO = _find_repo()
 REQUIREMENTS = REPO / "requirements.txt"
 WHEEL_LOCK = REPO / "vendor" / "python" / "RUNTIME_WHEELS.lock"
-CHUDCODE_LOCK = REPO / "vendor" / "chudcode" / "CHUDCODE_ARTIFACT.lock"
+OMP_LOCK = REPO / "vendor" / "omp" / "OMP_ARTIFACT.lock"
 # Top-level packages under the staged app/ directory.
 APP_PACKAGES = ("engine",)
 # Canonical ``services.X`` packages used by the worker and packaged tools.
@@ -117,7 +117,7 @@ def _imports_ok(py: Path) -> bool:
     probe = ("import build123d, pyvista, mcp, anthropic, openai; "
              "import pptx, docx, openpyxl, matplotlib, reportlab, pypdfium2, pypdf; "
              "import office_oxide; "
-             "import playwright, dulwich, chudcode_rpc")
+             "import playwright, dulwich, omp_rpc")
     r = subprocess.run([str(py), "-I", "-c", probe], capture_output=True, text=True,
                        env=pip_environment())
     return r.returncode == 0
@@ -148,12 +148,13 @@ def converters_status() -> dict:
 # RE-ANCHOR(reveng): Reverse Engineering download-on-demand descriptors (RE-06).
 # The heavy RE toolchain (COLMAP/OpenMVS/Brush binaries, TripoSR/TRELLIS/VGGT
 # weights) is NEVER part of the base runtime venv above — it is provisioned on
-# demand or discovered from user-provided binaries. The SHA-pinned descriptor
-# table + offline readiness probe live in services/vision/reveng_provision.py
-# (kept there so services/mcp/reveng_tools.reveng_status() can consume it without
-# importing the installer). OpenMVS is AGPL -> subprocess-only via OPENMVS_BIN,
-# never bundled/linked/auto-downloaded. This installer-facing wrapper reports
-# availability for --check; it installs nothing and never touches the network.
+# demand (scripts/provision_reveng.py) or discovered from user-provided binaries.
+# The SHA-pinned descriptor table + offline readiness probe live in
+# services/vision/reveng_provision.py (kept there so
+# services/mcp/reveng_tools.reveng_status() can consume it without importing the
+# installer). OpenMVS is AGPL but fetched on demand and run subprocess-only. This
+# installer-facing wrapper reports availability for --check; it installs nothing
+# and never touches the network.
 def reveng_provisioning_status() -> dict:
     """Offline readiness of the Reverse Engineering toolchain (contract §8.1).
 
@@ -352,7 +353,7 @@ def is_ready(wheelhouse: Path | None = None, venv_dir: Path | None = None,
         base = _trusted_base_path(base_python, py.absolute().parent.parent)
         context = _target_context(base)
         with verified_wheelhouse(wheelhouse or REPO / "wheelhouse", REQUIREMENTS,
-                                 WHEEL_LOCK, CHUDCODE_LOCK, context["environment"],
+                                 WHEEL_LOCK, OMP_LOCK, context["environment"],
                                  set(context["tags"])) as identity:
             return (_stamp_matches(stamp, identity)
                     and _installed_identity_ok(py, identity, base) and _imports_ok(py))
@@ -400,7 +401,7 @@ def ensure_app_code(src: Path = REPO) -> Path:
                 shutil.copy2(s, services_dst / mod)
     if REQUIREMENTS.exists():
         shutil.copy2(REQUIREMENTS, app / "requirements.txt")
-    for identity in (WHEEL_LOCK, CHUDCODE_LOCK):
+    for identity in (WHEEL_LOCK, OMP_LOCK):
         if identity.is_file():
             destination = app / identity.relative_to(REPO)
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -421,7 +422,7 @@ def ensure_runtime(base_python: str | None = None, wheelhouse: Path | None = Non
     base = _trusted_base_path(base_python, directory)
     context = _target_context(base)
     with verified_wheelhouse(wheelhouse or REPO / "wheelhouse", REQUIREMENTS,
-                             WHEEL_LOCK, CHUDCODE_LOCK, context["environment"],
+                             WHEEL_LOCK, OMP_LOCK, context["environment"],
                              set(context["tags"])) as identity:
         if (not force and _stamp_matches(stamp, identity)
                 and _installed_identity_ok(py, identity, base) and _imports_ok(py)):
@@ -488,7 +489,7 @@ def main(argv: list[str]) -> int:
             base = _trusted_base_path(args.base_python, args.venv_dir)
             context = _target_context(base)
             with verified_wheelhouse(args.wheelhouse or REPO / "wheelhouse", REQUIREMENTS,
-                                     WHEEL_LOCK, CHUDCODE_LOCK, context["environment"], set(context["tags"]),
+                                     WHEEL_LOCK, OMP_LOCK, context["environment"], set(context["tags"]),
                                      additional_requirements=REPO / "packaging/requirements-release.txt") as identity:
                 _, py, stamp = _runtime_location(args.venv_dir)
                 if not _stamp_matches(stamp, identity) or not _installed_identity_ok(py, identity, base):

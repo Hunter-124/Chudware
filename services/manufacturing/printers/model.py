@@ -9,6 +9,8 @@ import time
 from typing import Any, Iterable, Literal, Mapping
 from urllib.parse import urlsplit
 
+from ..print_safety import validate_print_bytes, validate_print_filename
+
 CAPABILITY_LEVELS = (
     "plan",
     "generate",
@@ -195,9 +197,11 @@ class Artifact:
     sha256: str | None = None
 
     def __post_init__(self) -> None:
+        validate_print_filename(self.original_name)
         digest = hashlib.sha256(self.data).hexdigest()
         if self.sha256 is not None and self.sha256.lower() != digest:
             raise ConfigurationError("artifact sha256 does not match its bytes")
+        validate_print_bytes(self.data)
         object.__setattr__(self, "sha256", digest)
 
     @property

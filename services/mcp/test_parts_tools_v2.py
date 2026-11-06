@@ -86,7 +86,7 @@ def hub_search(monkeypatch):
     calls: list[dict] = []
 
     def _search(query, domain=None, limit=20, **kw):
-        calls.append({"query": query, "domain": domain, "limit": limit})
+        calls.append({"query": query, "domain": domain, "limit": limit, **kw})
         if domain == "catalog":
             return [r for r in _BEARINGS if r["domain"] == "catalog"]
         return list(_BEARINGS)
@@ -109,6 +109,13 @@ class TestSearchPartsV2:
         pt.search_parts_v2("bearing",
                            category_id="bearings_motion.ball_bearings.deep_groove")
         assert hub_search[0]["domain"] == ["bearing"]  # taxonomy-routed
+
+    def test_offline_category_search_skips_secondary_live_merge(self, hub_search):
+        out = pt.search_parts_v2("bearing", category_id="bearings_motion.ball_bearings.deep_groove",
+                                 include_live=False)
+        assert out["ok"] is True
+        assert len(hub_search) == 1
+        assert hub_search[0]["include_live"] is False
 
     def test_facet_filter_with_alias_tolerance(self, hub_search):
         out = pt.search_parts_v2(
@@ -368,7 +375,8 @@ class TestRegistration:
         pt.register_parts_tools(m)
         for name in ("part_search", "parts_taxonomy", "part_source",
                      "vendors_health", "cam_tool_import", "part_get",
-                     "part_place", "vendor_status", "vendor_login",
+                     "part_place", "part_library_ingest", "part_library_sync", "part_acquire",
+                     "vendor_status", "vendor_login",
                      "browser_profiles", "match_model",
                      "reverse_engineer_product", "scrape_enqueue",
                      "scrape_queue_status", "import_artifact",
@@ -376,7 +384,8 @@ class TestRegistration:
             assert name in m.tools, name
         out = json.loads(m.tools["parts_taxonomy"]())
         assert out["ok"] is True
-        out = json.loads(m.tools["part_search"]("bearing", facets='{"bore_mm": 12}'))
+        out = json.loads(m.tools["part_search"]("bearing", facets='{"bore_mm": 12}',
+                                                include_live=False, previews=False))
         assert out["ok"] is True and out["count"] == 1
 
 
@@ -385,6 +394,105 @@ def registered_parts_tools():
     mcp = _FakeMCP()
     pt.register_parts_tools(mcp)
     return mcp.tools
+
+def test_catalog_mcp_get_acquire_and_operations(monkeypatch, registered_parts_tools, tmp_path):
+    from services import parts
+    from services.parts import parts_library
+    calls = []
+    record = {"part_id": "bearing:example:6205", "geometry_ref": None}
+    monkeypatch.setattr(parts, "get", lambda part_id, **kw: calls.append((part_id, kw)) or record)
+    monkeypatch.setattr(parts_library, "acquire_part", lambda part_id, **kw:
+                        calls.append((part_id, kw)) or record)
+    monkeypatch.setattr(parts_library, "ingest_manifest", lambda path, **kw:
+                        calls.append((path, kw)) or {"ok": True, "count": 1})
+    monkeypatch.setattr(parts_library, "sync_manifest", lambda url, **kw:
+                        calls.append((url, kw)) or {"ok": True, "count": 1})
+    tools = registered_parts_tools
+    assert json.loads(tools["part_get"](record["part_id"], include_live=False))["part"] == record
+    assert calls[-1][1] == {"include_live": False, "acquire": False}
+    assert json.loads(tools["part_get"](record["part_id"], acquire=True))["ok"]
+    assert calls[-1][1]["acquire"] is True
+    assert json.loads(tools["part_acquire"](record["part_id"], offline=True))["ok"]
+    assert calls[-1][1] == {"offline": True}
+    manifest = tmp_path / "manifest.json"
+    assert json.loads(tools["part_library_ingest"](str(manifest), str(tmp_path)))["ok"]
+    assert calls[-1][0] == str(manifest)
+    assert calls[-1][1]["replace_namespace"] is False
+    assert json.loads(tools["part_library_ingest"](
+        str(manifest), replace_namespace=True))["ok"]
+    assert calls[-1][1]["replace_namespace"] is True
+    assert json.loads(tools["part_library_sync"]("https://example.org/manifest", "a" * 64))["ok"]
+    assert calls[-1][1]["expected_sha256"] == "a" * 64
+    assert calls[-1][1]["replace_namespace"] is False
+    assert json.loads(tools["part_library_sync"](
+        "https://example.org/manifest", "a" * 64, replace_namespace=True))["ok"]
+    assert calls[-1][1]["replace_namespace"] is True
+
+
+def test_indirect_acquisition_obeys_external_policy_and_reuses_verified_cache(
+        monkeypatch, registered_parts_tools, tmp_path):
+    from services import parts
+    from services.mcp import core_bridge, tool_registry
+    from services.parts import parts_library, vendor_parts, worker_rpc
+    from services.parts.test_parts_library import _bundle
+
+    registry_dir = tmp_path / "vendor_parts"
+    monkeypatch.setattr(vendor_parts.paths, "VENDOR_PARTS", registry_dir)
+    monkeypatch.setattr(vendor_parts, "INDEX", registry_dir / "index.json")
+    monkeypatch.setattr(vendor_parts, "_rebuild_parts_index", lambda: None)
+
+    class EmptyHub:
+        def get(self, part_id, *, include_live=True):
+            return None
+
+    monkeypatch.setattr(parts, "_hub", EmptyHub())
+    manifest, root, data = _bundle(tmp_path)
+    part_id = data["records"][0]["part_id"]
+    parts_library.ingest_manifest(str(manifest), mirrors=["https://parts.example/"])
+    monkeypatch.setattr("services.net.safe_http.download",
+                        lambda *a, **kw: pytest.fail("external policy allowed a network download"))
+    placements = []
+    monkeypatch.setattr(core_bridge, "call", lambda method, params:
+                        placements.append((method, params)) or {"ok": True, "doc_id": "doc1"})
+    tools = registered_parts_tools
+    tool_registry.set_policy(deny_risk=["external"])
+    try:
+        for result in (
+            json.loads(tools["part_get"](part_id, acquire=True)),
+            json.loads(tools["part_place"](part_id)),
+            worker_rpc._part_get({"part_id": part_id, "acquire": True}, lambda *_: None),
+            worker_rpc._part_place({"part_id": part_id}, lambda *_: None),
+        ):
+            assert not result["ok"] and "external" in result["reason"]
+        assert not placements
+
+        parts_library.ingest_manifest(str(manifest), artifact_root=str(root))
+        result = json.loads(tools["part_get"](part_id, acquire=True))
+        assert result["ok"] and result["part"]["geometry_ref"]["kind"] == "import_file"
+        assert json.loads(tools["part_place"](part_id))["ok"]
+        assert worker_rpc._part_get({"part_id": part_id, "acquire": True}, lambda *_: None)["ok"]
+        assert worker_rpc._part_place({"part_id": part_id}, lambda *_: None)["ok"]
+        assert len(placements) == 2
+        assert all(call[1]["record"]["geometry_ref"]["kind"] == "import_file"
+                   for call in placements)
+    finally:
+        tool_registry.reset_policy()
+
+
+def test_mcp_place_acquires_before_native_dispatch(monkeypatch, registered_parts_tools):
+    from services import parts
+    from services.mcp import core_bridge
+    record = {"part_id": "bearing:bundle:one",
+              "geometry_ref": {"kind": "import_file", "path": "/cache/model.step"}}
+    calls = []
+    monkeypatch.setattr(parts, "get", lambda part_id, **kw:
+                        calls.append(("get", part_id, kw)) or record)
+    monkeypatch.setattr(core_bridge, "call", lambda method, params:
+                        calls.append((method, params)) or {"ok": True, "doc_id": "doc1"})
+    result = json.loads(registered_parts_tools["part_place"](record["part_id"], include_live=False))
+    assert result["ok"]
+    assert calls[0] == ("get", record["part_id"], {"include_live": False, "acquire": True})
+    assert calls[1][0] == "part_place" and calls[1][1]["record"] == record
 
 
 class TestBrowserProfiles:
@@ -487,7 +595,9 @@ class TestBrowserProfiles:
         out = json.loads(registered_parts_tools["browser_profiles"](
             action="delete", site="Alpha"))
 
-        assert out == {"ok": True, "site": "alpha", "deleted": True}
+        assert out["ok"] is True and out["site"] == "alpha" and out["deleted"] is True
+        assert out["shared_cef_cookies_removed"] is False and out["gui_cookies_removed"] is False
+        assert "does not sign out" in out["hint"]
         assert events == [
             ("lock", "alpha"), ("acquire", False),
             ("delete", "alpha"), ("release",),
@@ -556,7 +666,7 @@ class TestVendorAcquisitionBridge:
     def test_import_resolves_done_queue_source_and_stamps_doc(
             self, monkeypatch, tmp_path, registered_parts_tools):
         artifact = tmp_path / "part.step"
-        artifact.write_text("STEP")
+        artifact.write_text("ISO-10303-21;\nHEADER;\nENDSEC;\n")
         queued_path = tmp_path / "queued.step"
         queued_path.symlink_to(artifact)
 
@@ -594,7 +704,7 @@ class TestVendorAcquisitionBridge:
     def test_import_without_matching_job_skips_metadata(
             self, monkeypatch, tmp_path, registered_parts_tools):
         artifact = tmp_path / "part.step"
-        artifact.write_text("STEP")
+        artifact.write_text("ISO-10303-21;\nHEADER;\nENDSEC;\n")
         from services.browser import queue
         monkeypatch.setattr(queue, "queue_status", lambda: _queue_job(
             str(tmp_path / "different.step"), sku="OTHER"))
@@ -617,7 +727,7 @@ class TestVendorAcquisitionBridge:
     def test_metadata_failure_warns_but_preserves_import_success(
             self, monkeypatch, tmp_path, registered_parts_tools):
         artifact = tmp_path / "part.step"
-        artifact.write_text("STEP")
+        artifact.write_text("ISO-10303-21;\nHEADER;\nENDSEC;\n")
         from services.browser import queue
         monkeypatch.setattr(queue, "queue_status", lambda: _queue_job(
             str(artifact), sku="91290A115"))
@@ -1027,3 +1137,237 @@ class TestPlaceParametric:
                          {"bore_mm": 12.0, "od_mm": 27.6}))
         assert out["ok"] is False and not ops
         assert "width_mm" in out["reason"] and "width_mm" in out["hint"]
+
+
+def test_search_filters_before_limit_and_keeps_notices(monkeypatch):
+    import services.parts as parts
+
+    records = [
+        {"part_id": f"p{i}", "title": f"Part {i}", "params": {"bore_mm": i}}
+        for i in range(8)
+    ]
+    notice = {"ok": False, "site": "vendor", "reason": "rate_limited",
+              "hint": "Wait", "ask_user": "Try later", "retry_after_s": 42}
+    calls = []
+
+    def search(query, **kwargs):
+        calls.append(kwargs)
+        return records[:kwargs["limit"]] + [notice]
+
+    monkeypatch.setattr(parts, "search", search)
+    out = pt.search_parts_v2("", facets={"bore_mm": 7}, limit=1, include_live=False)
+    assert out["ok"] and [r["part_id"] for r in out["results"]] == ["p7"]
+    assert calls[0]["limit"] > 1 and calls[0]["include_live"] is False
+    assert out["notices"] == [{k: notice[k] for k in
+                               ("site", "reason", "hint", "ask_user", "retry_after_s")}]
+
+
+def test_search_scopes_and_thumbnail_projection(hub_search, monkeypatch):
+    import services.parts as parts
+    records = [{"part_id": "vendor:p", "title": "Part", "domain": "catalog",
+                "params": {"thumbnail": "https://example.test/p.png", "sku": "X12"}}]
+    monkeypatch.setattr(parts, "search", lambda query, **kwargs: records)
+    for scope in ({"domain": "catalog"}, {"facets": {"sku": "X12"}},
+                  {"category_id": "bearings_motion.ball_bearings.deep_groove"}):
+        out = pt.search_parts_v2("", include_live=False, **scope)
+        assert out["ok"] and out["results"]
+        row = out["results"][0]
+        assert row["index"] == 0 and row["thumbnail_url"] == "https://example.test/p.png"
+        assert row["designation"] == "X12"
+
+
+def test_mcp_search_returns_sheet_for_final_budgeted_rows(monkeypatch, registered_parts_tools):
+    import io
+    from PIL import Image
+    import services.parts as parts
+    from services.parts import thumbs
+
+    icon = io.BytesIO()
+    Image.new("RGB", (24, 24), "red").save(icon, format="PNG")
+    items = [{"part_id": f"p{i}", "title": f"Product {i} " + "description " * 10,
+              "params": {"thumbnail": f"https://example.test/{i}.png"}}
+             for i in range(40)]
+    monkeypatch.setattr(parts, "search", lambda query, **kwargs: items)
+    calls = []
+
+    def previews(requests, **kwargs):
+        calls.append((requests, kwargs))
+        return [{"ok": True, "data": icon.getvalue(), "provenance": "product_image"}
+                for _ in requests]
+
+    monkeypatch.setattr(thumbs, "resolve_previews", previews)
+    result = registered_parts_tools["part_search"]("product", limit=40, include_live=False)
+    assert isinstance(result, list) and len(result) == 2
+    image, text = result
+    body = json.loads(text)
+    rows = body["results"]
+    assert rows and len(rows) < len(items)
+    assert body["preview_sheet"]["pictured"] == [row["index"] for row in rows[:16]]
+    assert body["preview_sheet"]["omitted"] == [row["index"] for row in rows[16:]]
+    assert all(row["part_id"] == f"p{row['index']}" for row in rows)
+    assert calls[0][0][0]["image_url"] == "https://example.test/0.png"
+    assert calls[0][1]["allow_network"] is False
+    with Image.open(io.BytesIO(image.data)) as sheet:
+        assert sheet.format == "PNG" and max(sheet.size) <= 1568
+    assert rows[0]["preview"]["provenance"] == "product_image"
+    from mcp.server.fastmcp.utilities.func_metadata import func_metadata
+    metadata = func_metadata(registered_parts_tools["part_search"])
+    assert metadata.output_schema is None
+    content = metadata.convert_result(result)
+    assert [block.type for block in content] == ["image", "text"]
+    assert json.loads(content[1].text)["preview_sheet"] == body["preview_sheet"]
+
+
+def test_mcp_search_preview_opt_out_and_composition_failure(monkeypatch, registered_parts_tools, hub_search):
+    from services.parts import contact_sheet, thumbs
+    monkeypatch.setattr(thumbs, "resolve_previews", lambda items, **kw: [])
+    disabled = json.loads(registered_parts_tools["part_search"]("bearing", previews=False))
+    assert disabled["preview_sheet"]["reason"] == "previews_disabled"
+    monkeypatch.setattr(contact_sheet, "compose_contact_sheet",
+                        lambda tiles: (_ for _ in ()).throw(ValueError("broken")))
+    failed = json.loads(registered_parts_tools["part_search"]("bearing"))
+    assert failed["ok"] and failed["preview_sheet"]["pictured"] == []
+    assert "composition_failed" in failed["preview_sheet"]["reason"]
+
+
+@pytest.mark.parametrize(("query", "expected", "excluded"), [
+    ("608 bearing", {"mcmaster", "misumi", "traceparts", "grabcad", "printables"},
+     {"digikey", "rockwest", "meanwell"}),
+    ("M3 socket head cap screw", {"mcmaster", "fastenal", "grabcad", "printables"},
+     {"digikey", "rockwest", "meanwell"}),
+    ("STM32 microcontroller", {"digikey", "lcsc", "snapeda", "grabcad", "printables"},
+     {"mcmaster", "rockwest", "meanwell"}),
+    ("NEMA 17 stepper", {"orientalmotor", "pololu", "grabcad", "printables"},
+     {"rockwest", "meanwell"}),
+    ("qzxunclassified", {"grabcad", "traceparts", "printables"},
+     {"mcmaster", "digikey", "rockwest"}),
+])
+def test_agent_and_gui_share_unscoped_routes(monkeypatch, query, expected, excluded):
+    from services import parts
+    from services.parts.gui_rpc import _compute_routing
+
+    calls = []
+    monkeypatch.setattr(parts, "search",
+                        lambda text, **kw: calls.append((text, kw)) or [])
+    out = pt.search_parts_v2(query)
+    assert out["ok"]
+    sites = set(out["applied"]["sites"])
+    assert sites == set(_compute_routing({"query": query})["route_sites"])
+    assert expected <= sites and not sites.intersection(excluded)
+    assert len(calls) == 2 and calls[0][1]["include_live"] is False
+    assert calls[1][0] == query and set(calls[1][1]["sites"]) == sites
+
+
+@pytest.mark.parametrize(("query", "title", "matches"), [
+    ("608 bearing", "608 2RS Standard Ball Bearings", True),
+    ("608 bearing", "608ZZ bearing", True),
+    ("608 bearing", "1608 bearing", False),
+    ("608 bearing", "6080 bearing", False),
+    ("608 bearing", "608/1000 bearing", False),
+    ("608 bearing", "608.5 bearing", False),
+    ("608 bearing", "608 drill stand", False),
+    ("608 bearing", "Wire Straightener", False),
+    ("608 bearing", "Testing stand with 608 bearing", False),
+    ("608 bearing", "608 bearing with shields", True),
+    ("stand with 608 bearing", "Testing stand with 608 bearing", True),
+    ("M3 socket head cap screw", "M3 x 10 socket head cap screw", True),
+    ("M3 socket head cap screw", "M30 socket head cap screw", False),
+    ("M3 socket head cap screw", "M3.5 socket head cap screw", False),
+    ("NEMA 17 stepper", "NEMA17 stepper motor", True),
+    ("NEMA 17 stepper", "NEMA 170 stepper motor", False),
+    ("NEMA 17 stepper", "NEMA 23 stepper motor, 17 mm shaft", False),
+])
+def test_live_relevance_requires_designation_tokens(query, title, matches):
+    from services.parts.search_relevance import live_relevant
+    from services.parts.gui_rpc import _live_relevant
+    record = {"title": title, "domain": "catalog", "source": "live", "params": {}}
+    assert live_relevant(record, query) is matches
+    assert _live_relevant(record, query) is matches
+
+
+def test_model_accessories_are_not_mistaken_for_the_requested_component():
+    from services.parts.search_relevance import live_relevant
+    spacer = {"part_id": "catalog:printables::spacer", "title": "NEMA 17 stepper spacer",
+              "domain": "catalog", "source": "live", "params": {"site": "printables"}}
+    assert not live_relevant(spacer, "NEMA 17 stepper")
+    assert live_relevant(spacer, "NEMA 17 stepper spacer")
+
+
+def test_agent_ranks_exact_local_and_vendor_above_neighbor_and_filters_live(monkeypatch):
+    from services import parts
+
+    local = [
+        {"part_id": "bearing:6000", "title": "6000 bearing", "designation": "6000",
+         "domain": "bearing"},
+        {"part_id": "bearing:608", "title": "608 bearing", "designation": "608",
+         "domain": "bearing"},
+        {"part_id": "other:608", "title": "608 mounting plate", "designation": "608",
+         "domain": "bearing"},
+    ]
+    live = [
+        {"part_id": "catalog:grabcad::bad", "title": "Wimshurst Machine",
+         "domain": "catalog", "source": "live"},
+        {"part_id": "catalog:traceparts::neighbor", "title": "1608 bearing",
+         "domain": "catalog", "source": "live"},
+        {"part_id": "catalog:printables::model", "title": "608 bearing",
+         "domain": "catalog", "source": "live"},
+        {"part_id": "catalog:traceparts::match", "title": "608 2RS ball bearing",
+         "domain": "catalog", "source": "live", "params": {"sku": "608 2RS"}},
+    ]
+    monkeypatch.setattr(parts, "search",
+                        lambda query, **kw: live if kw.get("domain") == "catalog" else local)
+    out = pt.search_parts_v2("608 bearing", limit=4)
+    assert out["ok"]
+    assert [row["part_id"] for row in out["results"]] == [
+        "bearing:608", "catalog:traceparts::match", "catalog:printables::model", "bearing:6000"]
+
+
+def test_agent_timeout_keeps_partial_hits_and_one_structured_notice(monkeypatch):
+    import threading
+    import time
+    from services import parts
+    from services.parts.hub import PartsHub
+
+    release = threading.Event()
+    class Index:
+        def search(self, query, *, domain=None, limit=20):
+            return [] if domain == "catalog" else [
+                {"part_id": "bearing:6000", "title": "6000 bearing",
+                 "designation": "6000", "domain": "bearing"}]
+        def term_coverage(self, query):
+            return 0, 2
+
+    class Provider:
+        domain = "catalog"
+        def __init__(self, site, slow=False):
+            self.site, self.slow, self.provider_id = site, slow, site
+        def count(self):
+            raise NotImplementedError
+        def iter_records(self):
+            raise NotImplementedError
+        def search(self, query, **kwargs):
+            if self.slow:
+                release.wait(2)
+                return []
+            return [{"part_id": "catalog:traceparts::608", "title": "608 ball bearing",
+                     "domain": "catalog", "source": "live"}]
+
+    hub = PartsHub()
+    hub._index = Index()
+    hub._ensure_index = lambda: None
+    hub._maybe_revalidate = lambda: None
+    for provider in (Provider("traceparts"), Provider("mcmaster", True), Provider("misumi", True)):
+        hub._registry.register(provider)
+    monkeypatch.setattr(parts, "search", hub.search)
+    monkeypatch.setenv("CHUDWARE_PARTS_LIVE_BUDGET_S", "0.2")
+    try:
+        started = time.monotonic()
+        out = pt.search_parts_v2("608 bearing", limit=3)
+        elapsed = time.monotonic() - started
+        assert out["ok"] and elapsed < 1.0
+        assert out["results"][0]["part_id"] == "catalog:traceparts::608"
+        timeouts = [n for n in out["notices"] if n["reason"] == "timeout"]
+        assert len(timeouts) == 1
+        assert {n["site"] for n in timeouts[0]["sites"]} == {"mcmaster", "misumi"}
+    finally:
+        release.set()

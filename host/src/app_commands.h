@@ -8,16 +8,27 @@
 // declines still reaching PropertyManager::openForCommand, a sim_* command SimManager declines
 // reaching the stub log) behave exactly as before.
 //
-// Deliberately a plain handler table — no framework, no view-model layer. App-level policy
-// (prof_toggle, the Simulation lockout, PM-cancel-on-sketch_new, the unhandled-stub log) stays in
-// app.cpp's dispatchCmd and runs before/after the router.
+// Availability is checked from a fresh context before routing. Profiler and the unhandled-command
+// log remain in app.cpp; cancellation of an open PM before a new sketch is handled by the router.
 #pragma once
 
 #include <functional>
 #include <string>
 #include <vector>
 
+#include "ui/ribbon_def.h"
+
 struct AppState;
+
+namespace ui {
+// Part/assembly only when the active tab's nonempty ID matches the mirror. A known
+// mirror schema wins over a legacy tab kind; never consults a background mirror.
+CommandDocKind activeMechanicalDocumentKind(const AppState& st);
+CommandContext commandContext(const AppState& st);
+// True only for the same command already checked by the router on this activation. Direct family
+// entry points still obtain and check their own fresh context when this is false.
+bool commandDispatchChecked(const AppState& st, const char* cmdId);
+}
 
 using CommandHandler = std::function<bool(AppState&, const std::string&)>;
 
@@ -33,13 +44,12 @@ public:
     void registerPrefix(const char* prefix, Handler h); // matches cmd starting with prefix
     void registerAny(Handler h);                        // matches every command (try-first hooks)
 
-    // Agent-lock choke point shared by ribbon, shortcut bar, and gesture wheel: mutating
-    // commands are refused while an agent owns the active document. Unknown commands
-    // classify as mutating and therefore fail closed.
-    bool authorize(AppState& st, const char* cmdId) const;
 
-    // Walks rules in registration order; returns true when a rule consumed the command.
+    // Walks rules in registration order; disabled commands are consumed without invoking handlers.
+    // The first form snapshots live state; the second accepts a context freshly created by the
+    // caller for this activation (e.g. the app's presentation/dispatch boundary).
     bool dispatch(AppState& st, const char* cmdId) const;
+    bool dispatch(AppState& st, const char* cmdId, const ui::CommandContext& context) const;
 
 private:
     enum class Kind { Exact, Prefix, Any };

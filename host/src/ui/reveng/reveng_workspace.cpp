@@ -1,12 +1,13 @@
 // Reverse Engineering workspace — full-viewport shell for the "Reverse Eng" title-bar tab.
 // Honest scan -> mesh -> AI -> parametric pipeline (contracts/reveng.md).
 //
-// RE-40 overhaul. Layout, top to bottom / left to right:
-//   left   : session rail — rich session cards (thumbnail, status chip, honesty tag, stage
-//            progress), a substring filter, and the New-session card.
-//   center : source-lane SegmentedControl, then THE STAGE STEPPER (kit::StepTrack) pinned at
-//            the TOP where a wizard's progress indicator belongs, then the active stage body.
-//   right  : properties column with three tabs — Details / Capabilities / Provenance.
+// Layout, top to bottom / left to right:
+//   left   : session rail — the sessions of the CURRENT working folder only (top-left selector;
+//            sessions carry project_dir), a substring filter, and the New-session card.
+//   center : intake selector (Scan / From reference), then THE STAGE STEPPER (kit::StepTrack)
+//            pinned at the TOP where a wizard's progress indicator belongs, then the stage body.
+//   right  : Session column — what the session is, how far it got, how far its numbers can be
+//            trusted, and (only when something is missing) the tools this lane still needs.
 // Both side columns collapse to a header strip + chevron (see below).
 //
 // Why the stepper moved: it used to live at the BOTTOM of the workspace, below the stage body,
@@ -58,6 +59,14 @@
 #include "image_gallery.h"
 #include "sources_panel.h"   // RE-30: drawSourcesPanel
 #include "stage_panels.h"    // Scale / Model / Deliver stage panels
+#include "../file_dialog.h"
+#include "../file_explorer.h"   // ensureWorkspaceDir — sessions are scoped to the working folder
+#include "reveng_import.h"
+
+#ifdef __EMSCRIPTEN__
+#include "core/web_fetch.h"
+#include "../feature_tree.h"
+#endif
 
 namespace ui {
 namespace reveng {
@@ -103,6 +112,7 @@ struct ShellState {
     bool gaussianPollPending = false, gaussianHydrated = false;
     double gaussianPollT = -100.0;
     uint64_t splatRevisionTried = 0;
+    std::string splatTransformTried;
     std::string splatLoadError;
     Vec3 gaussianCenter;
     float gaussianRadius = 1.0f, gaussianYaw = 0.6f, gaussianPitch = 0.25f;
@@ -113,13 +123,48 @@ struct ShellState {
     bool gaussianCaptureProjection = false;
     uint64_t gaussianActionSerial = 0;
     std::unordered_map<std::string, std::shared_ptr<GaussianRunControl>> gaussianRuns;
-    std::string gaussianArtifactDirectory;
+    std::string gaussianArtifactDirectory, displayedSplatPath, displayedSplatTransformKey;
+    std::string pendingSourceSession, pendingSourcePath, pendingSplatPath;
+    SourceFile pendingSourceKind = SourceFile::Other;
+    uint64_t sourceRequestSerial = 0;
+    bool splatActionPending = false, splatActionError = false;
+    int splatExportFormat = 0;
+    float splatMinOpacity = 0.5f;
+    bool splatAutoOpacity = true;
+    bool splatRemoveFloor = true;
+    std::string splatActionMsg;
+    std::string previewTransformKey, previewRequestKey, previewTriedKey;
+    std::string sparsePreviewWarnings;
+    bool previewPending = false;
+#ifdef __EMSCRIPTEN__
+    std::string splatArtifactId, gaussianArtifactId, splatRefTried, splatRefDisplayed;
+    std::string splatFetchKey, meshArtifactId, meshFetchKey;
+    uint64_t splatFetchSerial = 0, meshFetchSerial = 0;
+    uint64_t splatFetchEpoch = 0, meshFetchEpoch = 0;
+    bool splatFetchPending = false, meshFetchPending = false;
+    float splatFetchProgress = -1.0f, meshFetchProgress = -1.0f;
+#endif
+    struct MeshLoad {
+        std::shared_ptr<render::DocMesh> doc;
+        std::string path, key, error;
+        uint64_t epoch = 0;
+    };
+    std::future<MeshLoad> meshLoad, parametricLoad;
+    std::string meshLoadPath, meshSourcePath, meshSourceKey;
+    std::string parametricLoadPath, parametricSourcePath, parametricSourceKey, parametricDocId;
+    bool parametricPollPending = false;
+    double parametricPollT = -100.0;
     struct SplatLoad {
         render::SplatCloud cloud;
         std::string error, path;
         uint64_t epoch = 0;
         uint64_t revision = 0;
         GaussianViewCamera viewCamera;
+        SplatPreviewTransform transform;
+#ifdef __EMSCRIPTEN__
+        std::string artifactId;
+#endif
+        std::string transformKey;
     };
     std::future<SplatLoad> splatLoad;
 };
@@ -227,6 +272,22 @@ GaussianViewCamera readViewCamera(const nlohmann::json& j) {
     return camera;
 }
 
+#ifdef __EMSCRIPTEN__
+std::string artifactRefId(const nlohmann::json& response, const char* name) {
+    const auto refs = response.find("artifact_refs");
+    if (refs == response.end() || !refs->is_object()) return {};
+    const auto ref = refs->find(name);
+    if (ref == refs->end() || !ref->is_object()) return {};
+    const auto id = ref->find("id");
+    if (id == ref->end() || !id->is_string()) return {};
+    const auto value = id->get<std::string>();
+    if (value.size() != 64 || !std::all_of(value.begin(), value.end(), [](char c) {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        })) return {};
+    return value;
+}
+#endif
+
 void mirrorGaussian(const nlohmann::json& j, bool restoreOptions) {
     if (!j.is_object()) return;
     auto& g = S().gaussian;
@@ -246,6 +307,10 @@ void mirrorGaussian(const nlohmann::json& j, bool restoreOptions) {
     g.registered = j.value("registered", g.registered);
     g.iteration = j.value("iteration", g.iteration);
     g.totalIterations = j.value("total_iterations", g.totalIterations);
+#ifdef __EMSCRIPTEN__
+    if (j.contains("artifact_refs"))
+        SH().gaussianArtifactId = artifactRefId(j, "splat");
+#endif
     if (j.contains("splat_path") && j["splat_path"].is_string() &&
         !j["splat_path"].get_ref<const std::string&>().empty()) {
         const auto path = j["splat_path"].get<std::string>();
@@ -345,8 +410,9 @@ const char* stageManifestKey(Stage s) {
 const char* stageBlurb(Stage stg) {
     switch (stg) {
         case Stage::Source:
-            return "Choose a source lane: scan photos/video/webcam, ingest a datasheet, look up a "
-                   "part number on the web, or seed from the parts library.";
+            return "Scan the part (photos, video, webcam), or start from a reference: a part "
+                   "number, product name, URL or datasheet — an existing CAD model is searched "
+                   "for first.";
         case Stage::Scale:
             return "Set real-world scale from an ArUco mat, two picked points, or a known "
                    "dimension. Without scale the model has shape but no size.";
@@ -360,7 +426,8 @@ const char* stageBlurb(Stage stg) {
             return "Deviation heat-map (mesh vs. B-rep) plus the dimension-confirm table, to "
                    "prove the model matches the real part within tolerance.";
         case Stage::Deliver:
-            return "Attach the result to the parts hub, export a bundle, or print a scale mat.";
+            return "Insert the scan as a reference in a part, attach a result to the parts hub, "
+                   "export a bundle, or print a scale mat.";
     }
     return "";
 }
@@ -389,9 +456,11 @@ const char* stageGateReason(Stage stg, bool scanLane) {
         case Stage::Reconstruct: return "Source needs captured images before a reconstruction can run";
         case Stage::Model:       return scanLane
                                           ? "run Reconstruct first so there is geometry to fit"
-                                          : "ingest a datasheet or research a part number in Source first";
+                                          : "pick an existing model, or add a datasheet or specs in Source first";
         case Stage::Review:      return "build a model in the Model stage first";
-        case Stage::Deliver:     return "build a model in the Model stage first";
+        case Stage::Deliver:     return scanLane
+                                          ? "reconstruct a surface mesh or build a model first"
+                                          : "build a model in the Model stage first";
     }
     return "an earlier stage is not finished";
 }
@@ -413,8 +482,8 @@ kit::Level statusLevel(const std::string& status) {
     return kit::Level::Neutral;
 }
 
-// Returns the ordered stage list for the current source lane. Doc lanes (Datasheet, Web,
-// FromLibrary) skip Scale + Reconstruct — there is nothing to scale or reconstruct.
+// Returns the ordered stage list for the current intake lane. The reference lane skips Scale +
+// Reconstruct — there is nothing to scale or reconstruct.
 std::vector<Stage> activeStagePipeline(SourceMode mode) {
     if (mode == SourceMode::Scan) {
         return { Stage::Source, Stage::Scale, Stage::Reconstruct,
@@ -430,30 +499,113 @@ void clampStageToPipeline(RevEngState& s) {
     s.stage = pipeline.front();
 }
 
-// How far a session got, as a 0..1 fraction of the six canonical stages. Prefers the real
-// per-stage badge mirror (only available for the selected session); falls back to the summary
-// status, which is a real backend field rather than a guess.
-float sessionProgress(const RevEngState& s, int idx) {
-    if (idx == s.selected && s.detailSessionId == s.sessions[idx].session_id) {
-        int done = 0;
-        for (int i = 0; i < kStageCount; ++i)
-            if (badgeLevel(s.stages[i].badge) == kit::Level::Ok) ++done;
-        return (float)done / (float)kStageCount;
-    }
-    const std::string& st = s.sessions[idx].status;
-    if (st == "done")           return 1.0f;
-    if (st == "review")         return 5.0f / (float)kStageCount;
-    if (st == "modeling")       return 4.0f / (float)kStageCount;
-    if (st == "reconstructing") return 3.0f / (float)kStageCount;
-    if (st == "capturing")      return s.sessions[idx].images > 0 ? 1.0f / (float)kStageCount : 0.0f;
-    return 0.0f;
-}
-
 }  // namespace
 
 RevEngState& S() {
     static RevEngState s;
     return s;
+}
+
+std::string revengProjectDir(AppState& st) {
+#ifdef __EMSCRIPTEN__
+    (void)st;
+    return {};
+#else
+    ui::ensureWorkspaceDir(st);
+    return st.workspaceDir;
+#endif
+}
+
+static void openClassifiedSourceFile(AppState& st, const std::string& path, SourceFile kind) {
+    if (kind == SourceFile::Other) return;
+    if (!st.workerStarted) {
+        st.toast(ui::ToastLevel::Error, "Open failed: worker not started");
+        return;
+    }
+    st.activeWorkspace = AppState::Workspace::ReverseEng;
+    auto& s = S();
+    s.sourceMode = SourceMode::Scan;
+    const uint64_t serial = ++SH().sourceRequestSerial;
+    if (!SH().pendingSourceSession.empty() && st.pendingRevengSessionId == SH().pendingSourceSession)
+        st.pendingRevengSessionId.clear();
+    SH().pendingSourceSession.clear();
+    SH().pendingSourcePath.clear();
+    SH().pendingSplatPath.clear();
+    SH().pendingSourceKind = SourceFile::Other;
+    if (kind == SourceFile::Video && s.selected >= 0 && s.selected < (int)s.sessions.size()) {
+        s.sourceVideoPath = path;
+        s.stage = Stage::Source;
+        s.sourceFocus = SourceFocus::Video;
+        return;
+    }
+    const char* method = kind == SourceFile::Splat ? "reveng_import_splat" : "reveng_start_session";
+    nlohmann::json params = kind == SourceFile::Splat
+        ? nlohmann::json{{"path", path}}
+        : nlohmann::json{{"name", std::filesystem::path(path).filename().string()}};
+    if (const std::string project = revengProjectDir(st); !project.empty())
+        params["project_dir"] = project;
+    st.toast(ui::ToastLevel::Info, kind == SourceFile::Splat
+        ? "Importing Gaussian splat..." : "Creating video capture session...");
+    st.rpc.call(method, std::move(params), [&st, path, kind, serial](const core::RpcResult& r) {
+        if (serial != SH().sourceRequestSerial) return;
+        if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) {
+            const std::string reason = r.ok && r.result.is_object()
+                ? r.result.value("reason", std::string("Reverse Engineering import failed"))
+                : (r.err.empty() ? std::string("Worker unavailable") : r.err);
+            st.toast(ui::ToastLevel::Error, reason);
+            return;
+        }
+        const std::string sid = r.result.value("session_id", std::string());
+        const std::string splat = r.result.value("gaussian_ply", std::string());
+        if (sid.empty() || (kind == SourceFile::Splat && splat.empty())) {
+            st.toast(ui::ToastLevel::Error, "Import returned no session or Gaussian preview.");
+            return;
+        }
+        SH().pendingSourceSession = sid;
+        SH().pendingSourcePath = path;
+        SH().pendingSplatPath = splat;
+        SH().pendingSourceKind = kind;
+        st.pendingRevengSessionId = sid;
+        S().lastListT = -100.0;
+    }, core::kLongEngineCallTimeoutMs);
+}
+
+void openSourceFile(AppState& st, const std::string& path) {
+    const SourceFile kind = classifySourceFile(path);
+#ifdef __EMSCRIPTEN__
+    if (kind == SourceFile::Ply) {
+        if (!st.workerStarted) {
+            st.toast(ui::ToastLevel::Error, "Open failed: worker not started");
+            return;
+        }
+        const auto serial = ++SH().sourceRequestSerial;
+        st.toast(ui::ToastLevel::Info, "Inspecting PLY...");
+        st.rpc.call("reveng_import_splat", {{"classify_ply", path}},
+                    [&st, path, serial](const core::RpcResult& r) {
+            if (serial != SH().sourceRequestSerial) return;
+            if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) {
+                const std::string reason = r.ok && r.result.is_object()
+                    ? r.result.value("reason", std::string("Unable to inspect PLY"))
+                    : (r.err.empty() ? std::string("Worker unavailable") : r.err);
+                st.toast(ui::ToastLevel::Error, reason);
+                return;
+            }
+            if (r.result.value("kind", std::string()) == "gaussian") {
+                openClassifiedSourceFile(st, path, SourceFile::Splat);
+            } else {
+                const int choice = ui::promptImportMeshAsSolid();
+                if (choice < 0) return;
+                struct Bypass {
+                    Bypass() { bypassPlyClassification() = true; }
+                    ~Bypass() { bypassPlyClassification() = false; }
+                } bypass;
+                ui::featureTreeOpenPath(st, path, choice == 1);
+            }
+        }, core::kLongEngineCallTimeoutMs);
+        return;
+    }
+#endif
+    openClassifiedSourceFile(st, path, kind);
 }
 
 // Chip geometry mirrors ui::kit (chipGeom: padX 1.5U, dot 2x0.75U + 1U gap; valueChip: padX 1.5U,
@@ -596,17 +748,46 @@ unsigned int railThumb(const SessionSummary& ss, int* outW, int* outH) {
 
 void resetForSessionChange(RevEngState& s);
 
-void loadSessions(AppState& st, bool force = false) {
+// `manual` marks a user-requested refresh: only that shows the Refresh button as busy, so the
+// background 4 s poll never makes it flash.
+void loadSessions(AppState& st, bool force = false, bool manual = false) {
     if (!st.workerStarted) return;
     RevEngState& s = S();
-    if (s.listPending) return;
+    const std::string project = revengProjectDir(st);
+    if (s.listedProject.empty() && !project.empty()) {
+        // First bind: whatever is listed already belongs to this folder (or to a screenshot
+        // scenario that seeded the rail and blocked reloads); only an unlisted rail fetches now.
+        s.listedProject = project;
+        if (!s.listedOnce) force = true;
+    } else if (project != s.listedProject) {
+        // The working folder changed: drop the old folder's sessions now, not after the reply.
+        s.listedProject = project;
+        s.listedOnce = false;
+        s.listErr.clear();
+        if (!s.sessions.empty()) {
+            s.sessions.clear();
+            s.selected = -1;
+            s.stage = Stage::Source;
+            resetForSessionChange(s);
+        }
+        force = true;
+    }
+    if (s.listPending) {
+        if (manual) s.listManual = true;   // the in-flight reply answers this click too
+        return;
+    }
     const double now = ImGui::GetTime();
     if (!force && s.listedOnce && now - s.lastListT < 4.0) return;
     s.listPending = true;
+    s.listManual = manual;
     s.lastListT = now;
-    st.rpc.call("list_reveng_sessions", nlohmann::json::object(), [](const core::RpcResult& r) {
+    nlohmann::json params = nlohmann::json::object();
+    if (!project.empty()) params["project_dir"] = project;
+    st.rpc.call("list_reveng_sessions", params, [project](const core::RpcResult& r) {
         RevEngState& st2 = S();
         st2.listPending = false;
+        st2.listManual = false;
+        if (project != st2.listedProject) return;   // reply for a folder we already left
         st2.listedOnce = true;
         if (!r.ok) {
             st2.listErr = r.err.empty() ? "worker unreachable" : r.err;
@@ -632,6 +813,7 @@ void loadSessions(AppState& st, bool force = false) {
                 ss.name = j.value("name", std::string("(unnamed)"));
                 ss.status = j.value("status", std::string());
                 ss.images = j.value("images", 0);
+                ss.lane = j.value("lane", std::string());
                 if (j.contains("gaussian") && j["gaussian"].is_object()) {
                     const auto& gaussian = j["gaussian"];
                     ss.hasGaussian = true;
@@ -667,28 +849,8 @@ void loadSessions(AppState& st, bool force = false) {
     });
 }
 
-// Flatten a provenance record's non-structural fields into one "k=v · k=v" line.
-std::string flattenProvenance(const nlohmann::json& j) {
-    std::string out;
-    for (auto it = j.begin(); it != j.end(); ++it) {
-        const std::string& k = it.key();
-        if (k == "step" || k == "ts") continue;
-        std::string v;
-        if (it->is_string())            v = it->get<std::string>();
-        else if (it->is_boolean())      v = it->get<bool>() ? "yes" : "no";
-        else if (it->is_null())         v = "\xe2\x80\x94";
-        else                            v = it->dump();
-        if (v.size() > 96) v = v.substr(0, 93) + "...";
-        if (!out.empty()) out += "  \xc2\xb7  ";
-        out += k;
-        out += "=";
-        out += v;
-    }
-    return out;
-}
-
 // Async: pull the full session manifest — artifact paths, scale, stage badges, honesty tags and
-// the provenance timeline. Everything the properties column and Reconstruct stage mirror.
+// the reference-model search. Everything the Session column and the stages mirror.
 void loadSessionDetail(AppState& st, bool force = false) {
     if (!st.workerStarted) return;
     RevEngState& s = S();
@@ -722,12 +884,30 @@ void loadSessionDetail(AppState& st, bool force = false) {
         st2.artifactSplatPath.clear();
         st2.artifactMeshPath.clear();
         st2.artifactSparseDir.clear();
+        st2.splatUntransformed = false;
+        st2.splatArtifactTransform = {};
         for (int i = 0; i < kStageCount; ++i) st2.stages[i].badge = "idle";
-        st2.provenance.clear();
         st2.honestyPipeline.clear();
         st2.honestyTier.clear();
         if (!r.result.contains("session") || !r.result["session"].is_object()) return;
         const auto& sess = r.result["session"];
+#ifdef __EMSCRIPTEN__
+        SH().splatArtifactId = artifactRefId(r.result, "splat");
+        SH().gaussianArtifactId = artifactRefId(r.result, "gaussian_splat");
+#endif
+        SH().previewTransformKey = sess.contains("recon_transform")
+            ? sess["recon_transform"].dump() : std::string();
+        st2.artifactIsImportedSplat = sess.contains("imported_splat") &&
+                                     sess["imported_splat"].is_object();
+        st2.splatImportLoss.clear();
+        if (st2.artifactIsImportedSplat && sess["imported_splat"].contains("lossy") &&
+            sess["imported_splat"]["lossy"].is_array()) {
+            for (const auto& loss : sess["imported_splat"]["lossy"])
+                if (loss.is_string()) {
+                    if (!st2.splatImportLoss.empty()) st2.splatImportLoss += "; ";
+                    st2.splatImportLoss += loss.get<std::string>();
+                }
+        }
         if (sess.contains("gaussian") && sess["gaussian"].is_object() &&
             !SH().gaussianHydrated && !st2.gaussian.pending) {
             mirrorGaussian(sess["gaussian"], true);
@@ -758,10 +938,13 @@ void loadSessionDetail(AppState& st, bool force = false) {
         if (sess.contains("scale") && sess["scale"].is_object()) {
             const auto& sj = sess["scale"];
             ScaleState& sc = st2.scale;
-            sc.mirrored    = true;
-            sc.curMethod   = sj.value("method", std::string());
-            sc.mmPerUnit   = sj.value("mm_per_unit", 0.0);
-            sc.residualPct = sj.value("residual_pct", 0.0);
+            sc.mirrored = sj.contains("mm_per_unit") && sj["mm_per_unit"].is_number();
+            sc.curMethod = sj.contains("method") && sj["method"].is_string()
+                ? sj["method"].get<std::string>() : std::string();
+            sc.mmPerUnit = sc.mirrored ? sj["mm_per_unit"].get<double>() : 0.0;
+            sc.hasResidual = sj.contains("residual_pct") && sj["residual_pct"].is_number();
+            sc.residualPct = sc.hasResidual ? sj["residual_pct"].get<double>() : 0.0;
+            sc.hasResidual = sc.hasResidual && std::isfinite(sc.residualPct) && sc.residualPct >= 0.0;
             sc.confirmed   = sj.value("confirmed", false);
         }
 
@@ -785,6 +968,62 @@ void loadSessionDetail(AppState& st, bool force = false) {
             if (!splat.empty())  st2.artifactSplatPath = resolveSessionPath(sid, splat);
             if (!mesh.empty())   st2.artifactMeshPath  = resolveSessionPath(sid, mesh);
             if (!sparse.empty()) st2.artifactSparseDir = resolveSessionPath(sid, sparse);
+            st2.splatArtifactTransform = {};
+            auto& transform = st2.splatArtifactTransform;
+            transform.metric = art.contains("splat_transform_applied") &&
+                art["splat_transform_applied"].is_boolean() &&
+                art["splat_transform_applied"].get<bool>();
+            if (transform.metric) {
+                const auto t = sess.find("recon_transform");
+                transform.valid = t != sess.end() && t->is_object() &&
+                    t->contains("mm_per_unit") && (*t)["mm_per_unit"].is_number() &&
+                    t->contains("rotation") && (*t)["rotation"].is_array() &&
+                    (*t)["rotation"].size() == 3 && t->contains("translation_mm") &&
+                    (*t)["translation_mm"].is_array() && (*t)["translation_mm"].size() == 3;
+                if (transform.valid) {
+                    transform.mmPerUnit = (*t)["mm_per_unit"].get<double>();
+                    transform.valid = std::isfinite(transform.mmPerUnit) && transform.mmPerUnit > 0.0;
+                    for (int row = 0; row < 3 && transform.valid; ++row) {
+                        const auto& rot = (*t)["rotation"][row];
+                        if (!rot.is_array() || rot.size() != 3 || !(*t)["translation_mm"][row].is_number()) {
+                            transform.valid = false; break;
+                        }
+                        transform.translation[row] = (*t)["translation_mm"][row].get<double>();
+                        transform.valid = std::isfinite(transform.translation[row]);
+                        for (int col = 0; col < 3 && transform.valid; ++col) {
+                            if (!rot[col].is_number()) { transform.valid = false; break; }
+                            transform.rotation[row * 3 + col] = rot[col].get<double>();
+                            transform.valid = std::isfinite(transform.rotation[row * 3 + col]);
+                        }
+                    }
+                }
+            }
+            const bool metric = sess.contains("recon_transform") && sess["recon_transform"].is_object() &&
+                sess["recon_transform"].value("source", std::string("identity")) != "identity";
+            st2.splatUntransformed = metric && !splat.empty() &&
+                take("splat_units") == "reconstruction" &&
+                (!art.contains("splat_transform_applied") ||
+                 !art["splat_transform_applied"].is_boolean() ||
+                 !art["splat_transform_applied"].get<bool>());
+        }
+        const auto stamp = [](const std::string& path) {
+            if (path.empty()) return std::string();
+            std::error_code ec;
+            const auto time = std::filesystem::last_write_time(path, ec);
+            return ec ? std::string()
+                      : std::to_string(static_cast<long long>(time.time_since_epoch().count()));
+        };
+        if (st2.artifactSparseDir.empty() && st2.artifactMeshPath.empty()) {
+            SH().previewRequestKey.clear();
+        } else {
+            const auto sparse = std::filesystem::path(st2.artifactSparseDir);
+            SH().previewRequestKey = st2.artifactSparseDir + "|" + st2.artifactMeshPath + "|" +
+                SH().previewTransformKey + "|" + stamp((sparse / "points3D.bin").string()) +
+                "|" + stamp((sparse / "points3D.txt").string()) + "|" + stamp(st2.artifactMeshPath);
+#ifdef __EMSCRIPTEN__
+            SH().previewRequestKey += "|" + artifactRefId(r.result, "mesh") +
+                                      "|" + artifactRefId(r.result, "sparse_points");
+#endif
         }
 
         // session.stages (§2) — the TOP stepper's per-step colour + reachability.
@@ -803,16 +1042,22 @@ void loadSessionDetail(AppState& st, bool force = false) {
             }
         }
 
-        // session.provenance[] (§2) — the audit trail, newest last in the manifest.
-        if (sess.contains("provenance") && sess["provenance"].is_array()) {
-            for (const auto& p : sess["provenance"]) {
-                if (!p.is_object()) continue;
-                ProvenanceRecord rec;
-                rec.step   = p.value("step", std::string("(step)"));
-                rec.ts     = p.value("ts", std::string());
-                rec.detail = flattenProvenance(p);
-                st2.provenance.push_back(std::move(rec));
-            }
+        // session.reference (§2) — the last existing-model search and the chosen model.
+        if (sess.contains("reference") && sess["reference"].is_object())
+            mirrorReference(sess["reference"]);
+
+        // Pick the intake lane ONCE per session from session.lane, so reopening a reference
+        // session lands on its search, but the user's own lane switch is never overridden by
+        // the next poll. Older sessions without a lane: a researched / datasheet-only session
+        // is a reference session.
+        if (st2.laneChosenFor != sid) {
+            st2.laneChosenFor = sid;
+            const std::string lane = sess.value("lane", std::string());
+            const bool docOnly = sess.contains("stages") && sess["stages"].is_object() &&
+                                 sess["stages"].value("datasheet", std::string()) == "done";
+            const bool reference = lane == "reference" ||
+                                   (lane.empty() && (docOnly || sess.contains("reference")));
+            st2.sourceMode = reference ? SourceMode::Reference : SourceMode::Scan;
         }
 
         const std::string status = sess.value("status", std::string());
@@ -831,29 +1076,34 @@ const char* const kProvKeys[] = { "colmap", "openmvs", "brush", "triposr", "vggt
 // provisioning_detail{env_var,note}; this is the fallback when it does not.
 const char* provFallbackHint(const std::string& key) {
     if (key == "colmap")  return "install COLMAP and set COLMAP_BIN \xe2\x80\x94 required for sparse reconstruction";
-    if (key == "openmvs") return "install OpenMVS (AGPL-3.0, never bundled) and set OPENMVS_BIN \xe2\x80\x94 dense mesh";
-    if (key == "brush")   return "provision the Brush binary and set BRUSH_BIN \xe2\x80\x94 3D Gaussian splatting";
+    if (key == "openmvs") return "installs from the app (Install missing tools) \xe2\x80\x94 dense mesh";
+    if (key == "brush")   return "installs from the app (Install missing tools) \xe2\x80\x94 3D Gaussian splatting";
     if (key == "triposr") return "provision TripoSR weights \xe2\x80\x94 single-photo tier";
     if (key == "vggt")    return "provision VGGT weights \xe2\x80\x94 feed-forward sparse alternative to COLMAP";
     if (key == "docling") return "install docling \xe2\x80\x94 datasheet ingest";
     return "not provisioned";
 }
+void kickInstallTools(AppState& st);
 
-// Async: reveng_status() capability + provisioning probe. Throttled; Refresh forces it.
+
+// Async: reveng_status() capability + provisioning probe. Throttled; "Re-check" forces it.
 // This is what lets the Reconstruct stage disable Run with a real reason instead of letting the
-// user click through into a backend_not_provisioned failure.
-void loadCapabilities(AppState& st, bool force = false) {
+// user click through into a backend_not_provisioned failure. Only a `manual` re-check shows as
+// busy in the UI; the 30 s background probe is silent.
+void loadCapabilities(AppState& st, bool force = false, bool manual = false) {
     if (!st.workerStarted) return;
     CapabilityState& c = S().caps;
     if (c.pending) return;
     const double now = ImGui::GetTime();
-    const double throttle = c.loaded ? 30.0 : 6.0;
+    const double throttle = c.installRunning ? 1.0 : c.loaded ? 30.0 : 6.0;
     if (!force && now - c.lastT < throttle) return;
     c.pending = true;
+    c.manual = manual;
     c.lastT = now;
-    st.rpc.call("reveng_status", nlohmann::json::object(), [](const core::RpcResult& r) {
+    st.rpc.call("reveng_status", nlohmann::json::object(), [&st](const core::RpcResult& r) {
         CapabilityState& c2 = S().caps;
         c2.pending = false;
+        c2.manual = false;
         if (!r.ok) {
             c2.err = r.err.empty() ? "reveng_status unreachable" : r.err;
             return;
@@ -913,37 +1163,109 @@ void loadCapabilities(AppState& st, bool force = false) {
         if (r.result.contains("banners") && r.result["banners"].is_array())
             for (const auto& b : r.result["banners"])
                 if (b.is_string()) c2.banners.push_back(b.get<std::string>());
+        // Background install progress (reveng_install_tools).
+        if (r.result.contains("install") && r.result["install"].is_object()) {
+            const auto& ij = r.result["install"];
+            c2.installRunning = ij.value("running", false);
+            c2.installTool    = ij.value("tool", std::string());
+            c2.installMsg     = ij.value("message", std::string());
+            c2.installDone    = ij.value("done", 0.0);
+            c2.installTotal   = ij.value("total", 0.0);
+            if (ij.contains("errors") && ij["errors"].is_object() && !ij["errors"].empty()) {
+                const auto first = ij["errors"].begin();
+                c2.installErr = first.key() + ": " +
+                                (first.value().is_string() ? first.value().get<std::string>()
+                                                           : std::string("install failed"));
+            } else if (!c2.installRunning && !c2.installPending) {
+                c2.installErr.clear();
+            }
+        }
+        // First time the app sees Brush / OpenMVS missing, fetch them: nobody should have to run
+        // a provisioning script. One automatic attempt per run; the card offers Retry after it.
+        bool toolMissing = false;
+        for (const auto& a : c2.artifacts)
+            toolMissing = toolMissing || ((a.key == "brush" || a.key == "openmvs") && !a.present);
+        if (toolMissing && !c2.installAutoTried && !c2.installRunning && !c2.installPending) {
+            c2.installAutoTried = true;
+            kickInstallTools(st);
+        }
+    });
+}
+
+// Async: reveng_install_tools — the worker downloads Brush / OpenMVS on a background thread and
+// reports progress through reveng_status().install, which loadCapabilities polls at 1 Hz.
+void kickInstallTools(AppState& st) {
+    if (!st.workerStarted) return;
+    CapabilityState& c = S().caps;
+    if (c.installPending || c.installRunning) return;
+    c.installPending = true;
+    c.installErr.clear();
+    st.rpc.call("reveng_install_tools", nlohmann::json::object(), [&st](const core::RpcResult& r) {
+        CapabilityState& c2 = S().caps;
+        c2.installPending = false;
+        if (!r.ok) {
+            c2.installErr = r.err.empty() ? "reveng_install_tools unreachable" : r.err;
+        } else if (r.result.is_object() && !r.result.value("ok", false)) {
+            c2.installErr = r.result.value("hint", r.result.value("reason", std::string("install refused")));
+        } else if (r.result.is_object() && r.result.contains("install") && r.result["install"].is_object()) {
+            c2.installRunning = r.result["install"].value("running", false);
+        }
+        loadCapabilities(st, /*force=*/true);
     });
 }
 
 // Publish only a successfully parsed cloud; a failed refresh never destroys the last preview.
 void ensureSplatForSession(RevEngState& s) {
     auto& sh = SH();
-    std::string want = s.gaussian.splatPath.empty() ? s.artifactSplatPath : s.gaussian.splatPath;
-    if (want.empty() && s.recon.done && std::getenv("CHUDWARE_SHOT")) {
+    s.splatPreviewCurrent = false;
+    const std::string* wantPath = s.artifactSplatPath.empty() ? &s.gaussian.splatPath : &s.artifactSplatPath;
+    std::string fixturePath;
+    if (wantPath->empty() && s.recon.done && std::getenv("CHUDWARE_SHOT")) {
         const char* repo = std::getenv("CHUDWARE_REPO");
-        want = std::string(repo ? repo : ".") + "/host/tests/fixtures/splat_tiny.ply";
+        fixturePath = std::string(repo ? repo : ".") + "/host/tests/fixtures/splat_tiny.ply";
+        wantPath = &fixturePath;
     }
+    const std::string& want = *wantPath;
+    const auto transform = want == s.artifactSplatPath ? s.splatArtifactTransform : SplatPreviewTransform{};
+    static const std::string rawKey = "raw";
+    const std::string& transformKey = transform.metric ? sh.previewTransformKey : rawKey;
+#ifdef __EMSCRIPTEN__
+    const std::string ref = !s.artifactSplatPath.empty() ? sh.splatArtifactId : sh.gaussianArtifactId;
+    const std::string fetchKey = want + "|" + ref + "|" + transformKey + "|" +
+                                 std::to_string(s.gaussian.artifactRevision);
+    if (sh.splatFetchPending &&
+        (sh.splatFetchEpoch != sh.sessionEpoch || sh.splatFetchKey != fetchKey)) {
+        sh.splatFetchPending = false;
+        ++sh.splatFetchSerial;
+    }
+#endif
     if (sh.splatLoad.valid()) {
         if (sh.splatLoad.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
         auto loaded = sh.splatLoad.get();
-        if (loaded.epoch == sh.sessionEpoch && loaded.path == want &&
-            loaded.revision == s.gaussian.artifactRevision) {
+        bool sameArtifact = true;
+#ifdef __EMSCRIPTEN__
+        sameArtifact = loaded.artifactId == ref;
+#endif
+        if (sameArtifact && loaded.epoch == sh.sessionEpoch && loaded.path == want &&
+            loaded.transformKey == transformKey && loaded.revision == s.gaussian.artifactRevision) {
             if (!loaded.error.empty() || loaded.cloud.empty()) {
                 sh.splatLoadError = "Cannot load Gaussian preview: " +
                     (loaded.error.empty() ? std::string("empty artifact") : loaded.error);
             } else {
                 s.splat.setCloud(std::move(loaded.cloud));
                 s.splatLoaded = true;
+                s.splatDisplayedTransform = loaded.transform;
+                s.splatPickMarks.setCloud({});
+                ++s.splatPreviewRevision;
                 sh.splatLoadError.clear();
-                s.artifactSplatPath = loaded.path;
                 const std::string directory = std::filesystem::path(loaded.path).parent_path().string();
                 const bool newGauge = loaded.viewCamera.id != sh.loadedViewCamera.id;
                 sh.loadedViewCamera = std::move(loaded.viewCamera);
                 if (!sh.loadedViewCamera.id.empty()) {
                     if (newGauge || !sh.gaussianCameraFitted) restoreGaussianCaptureCamera();
                 } else if (newGauge || !sh.gaussianCameraFitted ||
-                           sh.gaussianArtifactDirectory != directory) {
+                           sh.gaussianArtifactDirectory != directory || sh.displayedSplatPath != loaded.path ||
+                           sh.displayedSplatTransformKey != loaded.transformKey) {
                     sh.gaussianRight = {1, 0, 0};
                     sh.gaussianUp = {0, 1, 0};
                     sh.gaussianBack = {0, 0, 1};
@@ -952,22 +1274,91 @@ void ensureSplatForSession(RevEngState& s) {
                     fitGaussianCamera();
                 }
                 sh.gaussianArtifactDirectory = directory;
+                sh.displayedSplatPath = loaded.path;
+                sh.displayedSplatTransformKey = loaded.transformKey;
+#ifdef __EMSCRIPTEN__
+                sh.splatRefDisplayed = loaded.artifactId;
+#endif
             }
         }
     }
     if (want.empty()) return;
-    if (s.splatPathTried == want && sh.splatRevisionTried == s.gaussian.artifactRevision) return;
+    if (s.splatPathTried == want && sh.splatRevisionTried == s.gaussian.artifactRevision &&
+        sh.splatTransformTried == transformKey
+#ifdef __EMSCRIPTEN__
+        && sh.splatRefTried == ref
+#endif
+        ) {
+        s.splatPreviewCurrent = s.splatLoaded && sh.splatLoadError.empty() &&
+            sh.displayedSplatPath == want && sh.displayedSplatTransformKey == transformKey
+#ifdef __EMSCRIPTEN__
+            && sh.splatRefDisplayed == ref && !ref.empty()
+#endif
+            ;
+        return;
+    }
     s.splatPathTried = want;
     sh.splatRevisionTried = s.gaussian.artifactRevision;
+    sh.splatTransformTried = transformKey;
     const auto epoch = sh.sessionEpoch;
     const auto revision = s.gaussian.artifactRevision;
-    const auto viewCamera = want == s.gaussian.splatPath ? s.gaussian.viewCamera : GaussianViewCamera{};
-    sh.splatLoad = std::async(std::launch::async, [want, epoch, revision, viewCamera] {
+    const auto viewCamera = want == s.gaussian.splatPath && !s.artifactIsImportedSplat && !transform.metric
+        ? s.gaussian.viewCamera : GaussianViewCamera{};
+#ifdef __EMSCRIPTEN__
+    sh.splatRefTried = ref;
+    if (ref.empty()) {
+        sh.splatLoadError = "The worker did not provide an authorized Gaussian artifact.";
+        return;
+    }
+    sh.splatFetchPending = true;
+    sh.splatFetchEpoch = epoch;
+    sh.splatFetchKey = fetchKey;
+    sh.splatFetchProgress = -1.0f;
+    sh.splatLoadError.clear();
+    const auto ticket = ++sh.splatFetchSerial;
+    const bool started = chudware::webFetchAsync("/reveng/artifact/" + ref,
+        [want, epoch, revision, viewCamera, transform, transformKey, ref, ticket]
+        (std::vector<uint8_t> bytes, std::string error) mutable {
+            auto& state = SH();
+            if (state.splatFetchSerial != ticket || state.sessionEpoch != epoch) return;
+            state.splatFetchPending = false;
+            if (!error.empty()) {
+                state.splatLoadError = "Cannot fetch Gaussian preview: " + error;
+                return;
+            }
+            state.splatLoad = std::async(std::launch::async,
+                [want, epoch, revision, viewCamera, transform, transformKey, ref,
+                 bytes = std::move(bytes)]() mutable {
+                    ShellState::SplatLoad result;
+                    result.path = want; result.epoch = epoch; result.revision = revision;
+                    result.viewCamera = viewCamera; result.transform = transform;
+                    result.transformKey = transformKey; result.artifactId = ref;
+                    try {
+                        if (!render::parseSplatPly(reinterpret_cast<const char*>(bytes.data()),
+                                                   bytes.size(), result.cloud, result.error) &&
+                            result.error.empty()) result.error = "Invalid Gaussian PLY";
+                    } catch (const std::exception& e) {
+                        result.error = e.what();
+                    }
+                    return result;
+                });
+        },
+        [ticket](float fraction) {
+            if (SH().splatFetchSerial == ticket) SH().splatFetchProgress = fraction;
+        });
+    if (!started) {
+        sh.splatFetchPending = false;
+        sh.splatLoadError = "Cannot start Gaussian artifact download.";
+    }
+#else
+    sh.splatLoad = std::async(std::launch::async, [want, epoch, revision, viewCamera, transform, transformKey] {
         ShellState::SplatLoad result;
         result.path = want;
         result.epoch = epoch;
         result.revision = revision;
         result.viewCamera = viewCamera;
+        result.transform = transform;
+        result.transformKey = transformKey;
         try {
             if (!render::loadSplatPly(want, result.cloud, result.error) && result.error.empty())
                 result.error = "Invalid Gaussian PLY";
@@ -976,6 +1367,361 @@ void ensureSplatForSession(RevEngState& s) {
         }
         return result;
     });
+#endif
+}
+
+// Decode the shared COLMAP model in the worker; derive native calibration points
+// from the display-space preview without requesting a second point array.
+void ensureSparseAndMeshPreview(AppState& st) {
+    auto& s = S();
+    auto& sh = SH();
+    if (!st.workerStarted || s.selected < 0 || s.selected >= (int)s.sessions.size()) return;
+    const std::string& key = sh.previewRequestKey;
+    if (key.empty() && !sh.previewTriedKey.empty()) {
+        sh.previewTriedKey.clear();
+        sh.meshSourcePath.clear();
+        sh.sparsePreviewWarnings.clear();
+        sh.meshSourceKey.clear();
+        s.sparsePoints.clear();
+        s.sparseNativePoints.clear();
+        s.rePoints.setCloud({});
+        s.rePoints.setFrusta({});
+        s.meshPreview.reset();
+        s.sparsePreviewError.clear();
+        s.meshPreviewError.clear();
+        ++s.sparsePreviewRevision;
+        ++s.meshPreviewRevision;
+    }
+    if (!key.empty() && key != sh.previewTriedKey && !sh.previewPending) {
+        sh.previewPending = true;
+        sh.previewTriedKey = key;
+        sh.meshSourcePath.clear();
+        sh.meshSourceKey.clear();
+        sh.meshLoadPath.clear();
+        sh.sparsePreviewWarnings.clear();
+        s.sparsePreviewError.clear();
+        s.meshPreviewError.clear();
+        s.sparsePoints.clear();
+        s.sparseNativePoints.clear();
+        s.rePoints.setCloud({});
+        s.rePoints.setFrusta({});
+        ++s.sparsePreviewRevision;
+        s.meshPreview.reset();
+        ++s.meshPreviewRevision;
+        const auto sid = s.sessions[s.selected].session_id;
+        const auto epoch = sh.sessionEpoch;
+        st.rpc.call("reveng_sparse_preview", {{"session_id", sid}},
+                    [sid, epoch, key](const core::RpcResult& r) {
+            if (!selectedSession(sid) || SH().sessionEpoch != epoch) return;
+            auto& sh2 = SH();
+            auto& s2 = S();
+            sh2.previewPending = false;
+            if (key != sh2.previewRequestKey) return;
+            if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) {
+                s2.sparsePreviewError = r.ok && r.result.is_object()
+                    ? r.result.value("reason", std::string("Sparse preview unavailable"))
+                    : (r.err.empty() ? std::string("Sparse preview unavailable") : r.err);
+                return;
+            }
+            s2.sparsePreviewError.clear();
+            if (r.result.contains("warnings") && r.result["warnings"].is_array()) {
+                for (const auto& warning : r.result["warnings"]) {
+                    if (!warning.is_string()) continue;
+                    if (!sh2.sparsePreviewWarnings.empty()) sh2.sparsePreviewWarnings += " ";
+                    sh2.sparsePreviewWarnings += warning.get<std::string>();
+                }
+            }
+            auto readRow = [](const nlohmann::json& row, size_t n, float* out) {
+                if (!row.is_array() || row.size() < n) return false;
+                for (size_t i = 0; i < n; ++i) {
+                    if (!row[i].is_number()) return false;
+                    const double v = row[i].get<double>();
+                    if (!std::isfinite(v) || std::fabs(v) > std::numeric_limits<float>::max()) return false;
+                    out[i] = float(v);
+                }
+                return true;
+            };
+            Vec3 lo{std::numeric_limits<float>::max(), std::numeric_limits<float>::max(),
+                    std::numeric_limits<float>::max()};
+            Vec3 hi{-lo.x, -lo.y, -lo.z};
+            bool haveBounds = false;
+            auto extend = [&](float x, float y, float z) {
+                lo.x = std::min(lo.x, x); lo.y = std::min(lo.y, y); lo.z = std::min(lo.z, z);
+                hi.x = std::max(hi.x, x); hi.y = std::max(hi.y, y); hi.z = std::max(hi.z, z);
+                haveBounds = true;
+            };
+            const auto points = r.result.find("points");
+            const auto units = r.result.find("units");
+            const bool reconstruction = units != r.result.end() && units->is_string() &&
+                                        *units == "reconstruction";
+            const bool metric = units != r.result.end() && units->is_string() && *units == "mm";
+            double scale = 1.0;
+            std::array<double, 9> rotation{};
+            std::array<double, 3> translation{};
+            bool nativeAvailable = reconstruction;
+            const auto transform = r.result.find("recon_transform");
+            if (metric && transform != r.result.end() && transform->is_object()) {
+                const auto s = transform->find("mm_per_unit");
+                const auto r = transform->find("rotation");
+                const auto t = transform->find("translation_mm");
+                nativeAvailable = s != transform->end() && s->is_number() &&
+                    r != transform->end() && r->is_array() && r->size() == 3 &&
+                    t != transform->end() && t->is_array() && t->size() == 3;
+                if (nativeAvailable) {
+                    scale = s->get<double>();
+                    nativeAvailable = std::isfinite(scale) && scale > 0.0;
+                    for (size_t row = 0; row < 3 && nativeAvailable; ++row) {
+                        if (!(*r)[row].is_array() || (*r)[row].size() != 3 ||
+                            !(*t)[row].is_number()) {
+                            nativeAvailable = false;
+                            break;
+                        }
+                        translation[row] = (*t)[row].get<double>();
+                        nativeAvailable = std::isfinite(translation[row]);
+                        for (size_t col = 0; col < 3 && nativeAvailable; ++col) {
+                            if (!(*r)[row][col].is_number()) {
+                                nativeAvailable = false;
+                                break;
+                            }
+                            rotation[row * 3 + col] = (*r)[row][col].get<double>();
+                            nativeAvailable = std::isfinite(rotation[row * 3 + col]);
+                        }
+                    }
+                    // The transpose is an inverse only for a proper rotation.
+                    for (size_t a = 0; a < 3 && nativeAvailable; ++a) {
+                        for (size_t b = 0; b < 3 && nativeAvailable; ++b) {
+                            double dot = 0.0;
+                            for (size_t k = 0; k < 3; ++k)
+                                dot += rotation[k * 3 + a] * rotation[k * 3 + b];
+                            nativeAvailable = std::isfinite(dot) &&
+                                std::fabs(dot - (a == b ? 1.0 : 0.0)) <= 1e-6;
+                        }
+                    }
+                    if (nativeAvailable) {
+                        const double det = rotation[0] * (rotation[4] * rotation[8] - rotation[5] * rotation[7])
+                            - rotation[1] * (rotation[3] * rotation[8] - rotation[5] * rotation[6])
+                            + rotation[2] * (rotation[3] * rotation[7] - rotation[4] * rotation[6]);
+                        nativeAvailable = std::isfinite(det) && std::fabs(det - 1.0) <= 1e-6;
+                    }
+                }
+            }
+            if (points != r.result.end() && points->is_array()) {
+                for (const auto& row : *points) {
+                    float p[6];
+                    if (!readRow(row, 6, p)) continue;
+                    s2.sparsePoints.push_back({p[0], p[1], p[2], uint8_t(std::clamp(p[3], 0.0f, 255.0f)),
+                                               uint8_t(std::clamp(p[4], 0.0f, 255.0f)),
+                                               uint8_t(std::clamp(p[5], 0.0f, 255.0f))});
+                    if (nativeAvailable) {
+                        std::array<double, 3> n{};
+                        for (size_t col = 0; col < 3; ++col) {
+                            if (metric) {
+                                for (size_t k = 0; k < 3; ++k)
+                                    n[col] += rotation[k * 3 + col] *
+                                        (row[k].get<double>() - translation[k]);
+                                n[col] /= scale;
+                            } else {
+                                n[col] = row[col].get<double>();
+                            }
+                            if (!std::isfinite(n[col])) nativeAvailable = false;
+                        }
+                        if (nativeAvailable) s2.sparseNativePoints.push_back(n);
+                        else s2.sparseNativePoints.clear();
+                    }
+                    extend(p[0], p[1], p[2]);
+                }
+            }
+            std::vector<render::CameraFrustum> frusta;
+            const auto cameras = r.result.find("frusta");
+            if (cameras != r.result.end() && cameras->is_array()) {
+                for (const auto& row : *cameras) {
+                    float p[15];
+                    if (!readRow(row, 15, p)) continue;
+                    frusta.push_back({p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8],
+                                      p[9], p[10], p[11], p[12], p[13], p[14]});
+                    extend(p[0], p[1], p[2]);
+                }
+            }
+            if (haveBounds) {
+                s2.sparseCenter = (lo + hi) * 0.5f;
+                s2.sparseRadius = std::max(length(hi - lo) * 0.5f, 1e-6f);
+            }
+            s2.rePoints.setCloud(s2.sparsePoints);
+            s2.rePoints.setFrusta(frusta);
+            ++s2.sparsePreviewRevision;
+            if (r.result.contains("mesh_preview_path") && r.result["mesh_preview_path"].is_string()) {
+                sh2.meshSourcePath = r.result["mesh_preview_path"].get<std::string>();
+                if (!sh2.meshSourcePath.empty()) {
+                    sh2.meshSourceKey = key + "|" + sh2.meshSourcePath;
+#ifdef __EMSCRIPTEN__
+                    sh2.meshArtifactId = artifactRefId(r.result, "mesh_preview");
+                    sh2.meshSourceKey += "|" + sh2.meshArtifactId;
+#endif
+                }
+            } else if (!s2.artifactMeshPath.empty()) {
+                s2.meshPreviewError = "The worker returned no mesh preview artifact.";
+            }
+        }, core::kLongEngineCallTimeoutMs);
+    }
+    if (sh.meshLoad.valid() && sh.meshLoad.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        auto loaded = sh.meshLoad.get();
+        if (loaded.epoch == sh.sessionEpoch && loaded.key == sh.meshSourceKey) {
+            s.meshPreview = std::move(loaded.doc);
+            s.meshPreviewError = loaded.error;
+            ++s.meshPreviewRevision;
+        }
+    }
+#ifdef __EMSCRIPTEN__
+    if (sh.meshFetchPending &&
+        (sh.meshFetchEpoch != sh.sessionEpoch || sh.meshFetchKey != sh.meshSourceKey)) {
+        sh.meshFetchPending = false;
+        ++sh.meshFetchSerial;
+    }
+    if (!sh.meshLoad.valid() && !sh.meshFetchPending && !sh.meshSourceKey.empty() &&
+        sh.meshLoadPath != sh.meshSourceKey) {
+        sh.meshLoadPath = sh.meshSourceKey;
+        const auto path = sh.meshSourcePath, sourceKey = sh.meshSourceKey;
+        const auto epoch = sh.sessionEpoch;
+        if (sh.meshArtifactId.empty()) {
+            s.meshPreviewError = "The worker did not provide an authorized mesh preview.";
+        } else {
+            sh.meshFetchPending = true;
+            sh.meshFetchEpoch = epoch;
+            sh.meshFetchKey = sourceKey;
+            sh.meshFetchProgress = -1.0f;
+            s.meshPreviewError.clear();
+            const auto ticket = ++sh.meshFetchSerial;
+            const bool started = chudware::webFetchAsync("/reveng/artifact/" + sh.meshArtifactId,
+                [path, sourceKey, epoch, ticket](std::vector<uint8_t> bytes, std::string error) mutable {
+                    auto& state = SH();
+                    if (state.meshFetchSerial != ticket || state.sessionEpoch != epoch) return;
+                    state.meshFetchPending = false;
+                    if (!error.empty()) {
+                        S().meshPreviewError = "Cannot fetch mesh preview: " + error;
+                        return;
+                    }
+                    state.meshLoad = std::async(std::launch::async,
+                        [path, sourceKey, epoch, bytes = std::move(bytes)]() mutable {
+                            ShellState::MeshLoad out;
+                            out.path = path; out.key = sourceKey; out.epoch = epoch;
+                            Mesh mesh;
+                            try {
+                                if (loadBinarySTLBytes(bytes.data(), bytes.size(), mesh, out.error) &&
+                                    !mesh.empty()) {
+                                    out.doc = std::make_shared<render::DocMesh>();
+                                    render::BodyMesh body;
+                                    body.pos = std::move(mesh.positions);
+                                    body.nrm = std::move(mesh.normals);
+                                    body.idx = std::move(mesh.indices);
+                                    body.n_verts = uint32_t(body.pos.size() / 3);
+                                    body.n_tris = uint32_t(body.idx.size() / 3);
+                                    out.doc->bodies.push_back(std::move(body));
+                                } else if (out.error.empty()) {
+                                    out.error = "Mesh preview contains no triangles.";
+                                }
+                            } catch (const std::exception& e) {
+                                out.error = e.what();
+                            }
+                            return out;
+                        });
+                },
+                [ticket](float fraction) {
+                    if (SH().meshFetchSerial == ticket) SH().meshFetchProgress = fraction;
+                });
+            if (!started) {
+                sh.meshFetchPending = false;
+                s.meshPreviewError = "Cannot start mesh artifact download.";
+            }
+        }
+    }
+#else
+    if (!sh.meshLoad.valid() && !sh.meshSourceKey.empty() && sh.meshLoadPath != sh.meshSourceKey) {
+        sh.meshLoadPath = sh.meshSourceKey;
+        const auto path = sh.meshSourcePath, sourceKey = sh.meshSourceKey;
+        const auto epoch = sh.sessionEpoch;
+        sh.meshLoad = std::async(std::launch::async, [path, sourceKey, epoch] {
+            ShellState::MeshLoad out;
+            out.path = path; out.key = sourceKey; out.epoch = epoch;
+            Mesh mesh;
+            if (loadBinarySTL(path, mesh, out.error) && !mesh.empty()) {
+                out.doc = std::make_shared<render::DocMesh>();
+                render::BodyMesh body;
+                body.pos = std::move(mesh.positions);
+                body.nrm = std::move(mesh.normals);
+                body.idx = std::move(mesh.indices);
+                body.n_verts = uint32_t(body.pos.size() / 3);
+                body.n_tris = uint32_t(body.idx.size() / 3);
+                out.doc->bodies.push_back(std::move(body));
+            } else if (out.error.empty()) out.error = "Mesh preview contains no triangles.";
+            return out;
+        });
+    }
+#endif
+}
+
+// Snapshot is a lock-free, read-only view of an existing document. Never activate
+// the built part or disturb the document the user is currently editing.
+void ensureParametricPreview(AppState& st) {
+    auto& s = S();
+    auto& sh = SH();
+    const std::string& docId = s.model.descDocId;
+    if (docId != sh.parametricDocId) {
+        sh.parametricDocId = docId;
+        sh.parametricSourcePath.clear();
+        sh.parametricSourceKey.clear();
+        sh.parametricLoadPath.clear();
+        sh.parametricPollPending = false;
+        sh.parametricPollT = -100.0;
+        s.parametricPreview.reset();
+        s.parametricPreviewError.clear();
+        ++s.parametricPreviewRevision;
+    }
+    if (!docId.empty() && st.workerStarted && !sh.parametricPollPending &&
+        ImGui::GetTime() - sh.parametricPollT >= 5.0) {
+        sh.parametricPollPending = true;
+        sh.parametricPollT = ImGui::GetTime();
+        const auto epoch = sh.sessionEpoch;
+        st.rpc.call("doc_snapshot", {{"doc_id", docId}}, [docId, epoch](const core::RpcResult& r) {
+            if (epoch != SH().sessionEpoch || docId != SH().parametricDocId) return;
+            SH().parametricPollPending = false;
+            if (!r.ok || !r.result.is_object() || !r.result.value("has_snapshot", false)) {
+                S().parametricPreviewError = "Built document preview is not available from the document snapshot.";
+                return;
+            }
+            const std::string path = r.result.value("aicm_path", std::string());
+            if (path.empty()) {
+                S().parametricPreviewError = "The built document has no tessellated preview yet.";
+                return;
+            }
+            SH().parametricSourcePath = path;
+            SH().parametricSourceKey = docId + "|" + path + "|" +
+                std::to_string(r.result.value("revision", -1));
+            S().parametricPreviewError.clear();
+        }, 15000);
+    }
+    if (sh.parametricLoad.valid() &&
+        sh.parametricLoad.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        auto loaded = sh.parametricLoad.get();
+        if (loaded.epoch == sh.sessionEpoch && loaded.key == sh.parametricSourceKey) {
+            s.parametricPreview = std::move(loaded.doc);
+            s.parametricPreviewError = loaded.error;
+            ++s.parametricPreviewRevision;
+        }
+    }
+    if (!sh.parametricLoad.valid() && !sh.parametricSourceKey.empty() &&
+        sh.parametricLoadPath != sh.parametricSourceKey) {
+        sh.parametricLoadPath = sh.parametricSourceKey;
+        const auto path = sh.parametricSourcePath, key = sh.parametricSourceKey;
+        const auto epoch = sh.sessionEpoch;
+        sh.parametricLoad = std::async(std::launch::async, [path, key, epoch] {
+            ShellState::MeshLoad out;
+            out.path = path; out.key = key; out.epoch = epoch;
+            auto doc = std::make_shared<render::DocMesh>();
+            if (render::loadAicmFile(path, *doc, out.error) && !doc->empty()) out.doc = std::move(doc);
+            else if (out.error.empty()) out.error = "Built document preview contains no geometry.";
+            return out;
+        });
+    }
 }
 
 void pollGaussian(AppState& st) {
@@ -1134,9 +1880,37 @@ Renderer::CameraXform gaussianPreviewCamera(int width, int height) {
     return cam;
 }
 
+Renderer::CameraXform sparsePreviewCamera(int width, int height) {
+    const auto& s = S();
+    Renderer::CameraXform cam;
+    cam.vpWidth = cam.ssWidth = std::max(width, 1);
+    cam.vpHeight = cam.ssHeight = std::max(height, 1);
+    const float aspect = float(cam.vpWidth) / float(cam.vpHeight);
+    const float halfFov = Renderer::kFovDeg * 0.00872664626f;
+    const float limitingFov = std::atan(std::tan(halfFov) * std::min(aspect, 1.0f));
+    cam.center = s.sparseCenter;
+    cam.radius = std::max(s.sparseRadius, 1e-6f);
+    cam.dist = cam.radius * 1.2f / std::sin(limitingFov);
+    cam.dir = normalize(Vec3{22.0f, 18.0f, 30.5f});
+    cam.eye = cam.center + cam.dir * cam.dist;
+    cam.right = normalize(cross(Vec3{0.0f, 0.0f, 1.0f}, cam.dir));
+    cam.up = cross(cam.dir, cam.right);
+    cam.view = lookAt(cam.eye, cam.center, cam.up);
+    cam.proj = perspective(2.0f * halfFov, aspect, cam.radius * 0.001f,
+                           cam.dist + cam.radius * 3.0f);
+    cam.mvp = mul(cam.proj, cam.view);
+    cam.halfHeight = cam.dist * std::tan(halfFov);
+    cam.orthographic = false;
+    return cam;
+}
+
 void startGaussian(AppState& st, const std::string& sid, bool live,
                    const std::string& videoPath) {
     if (!selectedSession(sid)) return;
+#ifdef __EMSCRIPTEN__
+    S().gaussian.error = "Splat training requires a GPU, which the browser server sandbox does not expose.";
+    return;
+#endif
     auto& g = S().gaussian;
     if (g.pending || gaussianRunning(g) || S().recon.active || S().recon.kickPending ||
         (g.control && (g.control->pending || g.control->pendingIngest != 0 ||
@@ -1200,8 +1974,6 @@ void drawGaussianPanel(AppState& st) {
     auto& sh = SH();
     if (s.selected < 0 || s.selected >= (int)s.sessions.size()) return;
     const auto sid = s.sessions[s.selected].session_id;
-    pollGaussian(st);
-    ensureSplatForSession(s);
     const bool running = gaussianRunning(g);
     const bool busy = running || g.pending;
     const kit::Level level = !g.error.empty() || g.status == "failed" ? kit::Level::Error
@@ -1209,9 +1981,19 @@ void drawGaussianPanel(AppState& st) {
                            : g.status == "done" ? kit::Level::Ok
                            : g.status == "interrupted" || g.status == "cancelled" ? kit::Level::Warn
                            : kit::Level::Neutral;
-    if (kit::CardBegin("##gaussian_job", "3D Gaussian splatting", "display_shaded")) {
+    // A finished splat is something to look at, not to configure: shut the training card (once per
+    // session / state change) so the preview below it is the first thing on screen.
+    static bool trainOpen = true;
+    static std::string trainSettled;
+    const bool finished = !busy && g.status == "done";
+    const std::string trainKey = sid + (finished ? "|done" : "|open");
+    if (trainKey != trainSettled) { trainSettled = trainKey; trainOpen = !finished; }
+    char trainTitle[96];
+    std::snprintf(trainTitle, sizeof(trainTitle), "%s",
+                  finished ? "3D Gaussian splat - trained (retrain settings)" : "3D Gaussian splatting");
+    if (kit::CardBegin("##gaussian_job", trainTitle, "display_shaded", true, &trainOpen)) {
         kit::StatusChip(g.pending ? "Sending request" : g.status.empty() ? "Ready" : g.status.c_str(), level);
-        kit::InlineStatus("Local photo reconstruction in reconstruction units — not a scaled CAD model.",
+        kit::InlineStatus("Gaussian splats are visual references, not measured CAD surfaces.",
                           kit::Level::Neutral);
         static const char* modes[] = {"Environment", "Stationary object"};
         static const char* qualities[] = {"Draft", "Normal", "High"};
@@ -1253,10 +2035,17 @@ void drawGaussianPanel(AppState& st) {
         if (kit::SecondaryButton("Re-check local dependencies", !s.caps.pending))
             loadCapabilities(st, true);
         kit::GapControl();
-        if (kit::PrimaryButton("Start Gaussian splat", !busy && st.workerStarted &&
+#ifdef __EMSCRIPTEN__
+        kit::InlineStatus("Splat training requires a GPU, which the browser server sandbox does not expose.",
+                          kit::Level::Warn);
+        kit::PrimaryButton("Start Gaussian splat", false,
+                           "The browser server sandbox does not expose a GPU.");
+#else
+        if (kit::PrimaryButton(finished ? "Retrain Gaussian splat" : "Start Gaussian splat", !busy && st.workerStarted &&
                                !s.recon.active && !s.recon.kickPending,
                                "Select an idle session with accepted photos or use live camera capture."))
             startGaussian(st, sid, false);
+#endif
         if (g.control && g.control->requested != GaussianRunControl::Action::None) {
             const bool cancelling = g.control->requested == GaussianRunControl::Action::Cancel;
             const bool sent = cancelling ? g.control->cancelSent : g.control->finishSent;
@@ -1279,6 +2068,11 @@ void drawGaussianPanel(AppState& st) {
     kit::CardEnd();
     kit::GapCards();
     if (kit::CardBegin("##gaussian_preview_card", "Gaussian preview", "display_shaded")) {
+        if (s.splatUntransformed)
+            kit::InlineStatus("This splat is still in reconstruction coordinates; its placement "
+                              "and scale do not match the calibrated mesh and cameras.", kit::Level::Warn);
+        if (!s.splatImportLoss.empty())
+            kit::InlineStatus(s.splatImportLoss.c_str(), kit::Level::Warn);
         const bool have = s.splatLoaded && s.splat.hasSplats();
         const ImVec2 box(ImGui::GetContentRegionAvail().x, M::reThumbLg());
         const ImRect rect = kit::Viewport3DPreview("##gaussian_preview", box,
@@ -1320,6 +2114,10 @@ void drawGaussianPanel(AppState& st) {
             if (std::getenv("CHUDWARE_SHOT") && s.splatPathTried.find("splat_tiny.ply") != std::string::npos)
                 kit::InlineStatus("Screenshot fixture — not reconstructed session data.", kit::Level::Warn);
         }
+#ifdef __EMSCRIPTEN__
+        if (sh.splatFetchPending)
+            kit::ProgressBar(sh.splatFetchProgress, "Downloading Gaussian artifact", kit::Level::Busy);
+#endif
         if (sh.splatLoad.valid())
             kit::InlineStatus("Loading complete Gaussian export in the background…", kit::Level::Busy);
         kit::InlineStatus(sh.splatLoadError.c_str(), kit::Level::Error);
@@ -1354,6 +2152,98 @@ void drawGaussianPanel(AppState& st) {
             kit::InlineStatus("Crop keeps Gaussian centers inside this box and preserves the original source. A new reconstruction clears the crop because its coordinates change. No semantic segmentation.",
                               kit::Level::Neutral);
         }
+    }
+    kit::CardEnd();
+    kit::GapCards();
+    if (kit::CardBegin("##splat_convert", "Splat conversion and approximate mesh", "mesh")) {
+        const bool haveArtifact = !s.artifactSplatPath.empty() || !g.splatPath.empty();
+        const bool canRun = st.workerStarted && haveArtifact && !busy &&
+                            !sh.splatActionPending && !s.recon.active && !s.recon.kickPending;
+        kit::InlineStatus("Pruning keeps the subject (haze, background, floor and floaters are "
+                          "removed), then extracts a point cloud and an approximate mesh. Hidden or "
+                          "poorly captured surfaces are not recovered; verify dimensions independently.",
+                          kit::Level::Warn);
+        ImGui::Checkbox("Automatic opacity cut (recommended)", &sh.splatAutoOpacity);
+        ImGui::Checkbox("Remove floor / support surface", &sh.splatRemoveFloor);
+        kit::FieldLabel("Minimum opacity");
+        ImGui::BeginDisabled(sh.splatAutoOpacity);
+        ImGui::SliderFloat("##splat_min_opacity", &sh.splatMinOpacity, 0.0f, 1.0f, "%.2f");
+        ImGui::EndDisabled();
+        if (kit::PrimaryButton("Prune and extract point cloud + mesh", canRun,
+                               "Load a splat and wait for active jobs to finish.")) {
+            sh.splatActionPending = true;
+            sh.splatActionError = false;
+            sh.splatActionMsg = "Extracting an approximate mesh...";
+            const auto epoch = sh.sessionEpoch;
+            nlohmann::json meshParams = {{"path_or_session", sid}, {"method", "auto"},
+                                         {"remove_floor", sh.splatRemoveFloor}};
+            if (!sh.splatAutoOpacity) meshParams["min_opacity"] = sh.splatMinOpacity;
+            st.rpc.call("reveng_splat_to_mesh", meshParams,
+                [sid, epoch](const core::RpcResult& r) {
+                    if (!selectedSession(sid) || SH().sessionEpoch != epoch) return;
+                    auto& sh2 = SH();
+                    sh2.splatActionPending = false;
+                    if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) {
+                        sh2.splatActionError = true;
+                        sh2.splatActionMsg = r.ok && r.result.is_object()
+                            ? r.result.value("reason", std::string("Mesh extraction failed."))
+                            : (r.err.empty() ? std::string("Mesh extraction failed.") : r.err);
+                        return;
+                    }
+                    sh2.splatActionMsg = "Pruned point cloud saved: " +
+                        r.result.value("points_path", std::string()) + "  Approximate mesh: " +
+                        r.result.value("mesh_path", std::string());
+                    S().lastDetailT = -100.0;
+                    S().lastListT = -100.0;
+                }, core::kLongEngineCallTimeoutMs);
+        }
+        static const char* formats[] = {"Gaussian PLY", ".splat"};
+        kit::FieldLabel("Convert to");
+        kit::SegmentedControl("##splat_export_format", formats, 2, &sh.splatExportFormat, M::reFieldW());
+        if (sh.splatExportFormat == 1)
+            kit::InlineStatus(".splat quantizes color, opacity and rotation and drops higher-order spherical harmonics.",
+                              kit::Level::Warn);
+        if (kit::SecondaryButton("Convert and save...", canRun,
+                                 "Load a splat and wait for active jobs to finish.")) {
+            const bool ply = sh.splatExportFormat == 0;
+            const std::string dest = ui::saveFileDialog(
+                ply ? "Gaussian PLY (*.ply)\0*.ply\0" : "Gaussian splat (*.splat)\0*.splat\0",
+                ply ? "ply" : "splat", ply ? "splat.ply" : "splat.splat");
+            if (!dest.empty()) {
+                sh.splatActionPending = true;
+                sh.splatActionError = false;
+                sh.splatActionMsg = "Converting splat...";
+                const auto epoch = sh.sessionEpoch;
+                nlohmann::json params = {{"out_format", ply ? "ply" : "splat"}, {"out_path", dest}};
+#ifdef __EMSCRIPTEN__
+                params["session_id"] = sid;
+#else
+                params["path"] = sid;
+#endif
+                st.rpc.call("reveng_convert_splat", std::move(params),
+                    [sid, epoch, dest](const core::RpcResult& r) {
+                        if (!selectedSession(sid) || SH().sessionEpoch != epoch) return;
+                        auto& sh2 = SH();
+                        sh2.splatActionPending = false;
+                        if (!r.ok || !r.result.is_object() || !r.result.value("ok", false)) {
+                            sh2.splatActionError = true;
+                            sh2.splatActionMsg = r.ok && r.result.is_object()
+                                ? r.result.value("reason", std::string("Conversion failed."))
+                                : (r.err.empty() ? std::string("Conversion failed.") : r.err);
+                            return;
+                        }
+                        sh2.splatActionMsg = "Saved " + dest;
+                        if (r.result.contains("lossy") && r.result["lossy"].is_array()) {
+                            for (const auto& loss : r.result["lossy"])
+                                if (loss.is_string()) sh2.splatActionMsg += " \xe2\x80\x94 " + loss.get<std::string>();
+                        }
+                        ui::afterFileWritten(dest);
+                    }, core::kLongEngineCallTimeoutMs);
+            }
+        }
+        kit::InlineStatus(sh.splatActionMsg.c_str(),
+                          sh.splatActionPending ? kit::Level::Busy :
+                          sh.splatActionError ? kit::Level::Error : kit::Level::Neutral);
     }
     kit::CardEnd();
 }
@@ -1446,7 +2336,7 @@ bool handleRevEngCommand(AppState& st, const char* cmd) {
     if (c == "reveng_add_photos")   { toSource(SourceFocus::Photos); return true; }
     if (c == "reveng_add_video")    { toSource(SourceFocus::Video);  return true; }
     if (c == "reveng_webcam")       { toSource(SourceFocus::Webcam); return true; }
-    if (c == "reveng_datasheet")    { toStage(Stage::Source); s.sourceMode = SourceMode::Datasheet;
+    if (c == "reveng_datasheet")    { toStage(Stage::Source); s.sourceMode = SourceMode::Reference;
                                       s.sourceFocus = SourceFocus::None; return true; }
     if (c == "reveng_scale_aruco")  { toStage(Stage::Scale); s.scale.method = 0; return true; }
     if (c == "reveng_scale_points") { toStage(Stage::Scale); s.scale.method = 1; return true; }
@@ -1492,7 +2382,7 @@ ReconGate reconPreflight(const AppState& st, const RevEngState& s) {
         g.reason = "No sparse-reconstruction backend is provisioned. Structure-from-motion needs "
                    "either COLMAP or the VGGT feed-forward model, and neither was found.";
         g.hint   = "Install COLMAP and set COLMAP_BIN (or provision VGGT weights), then press "
-                   "Refresh on the Capabilities tab.";
+                   "Re-check below.";
         return g;
     }
     if (s.selected < 0 || s.selected >= (int)s.sessions.size()) {
@@ -1508,13 +2398,12 @@ ReconGate reconPreflight(const AppState& st, const RevEngState& s) {
 
     g.canRun = true;
     if (s.caps.loaded && !s.caps.dense) {
-        g.warn = "OpenMVS is not configured, so this run produces a SPARSE point cloud only \xe2\x80\x94 "
-                 "no dense mesh. Install OpenMVS (AGPL-3.0, never bundled) and set OPENMVS_BIN for "
+        g.warn = "OpenMVS is not installed, so this run produces a SPARSE point cloud only \xe2\x80\x94 "
+                 "no dense mesh. Use \"Install missing tools\" in the Session panel for "
                  "a watertight mesh.";
     }
     if (!s.caps.loaded) {
-        g.warn = "Backend availability has not been probed yet \xe2\x80\x94 open the Capabilities tab "
-                 "to check before a long run.";
+        g.warn = "Checking which reconstruction tools are installed\xe2\x80\xa6";
     } else if (s.scale.mirrored && !s.scale.confirmed) {
         g.warn = "Scale is not confirmed yet. That is fine here: ArUco scaling needs a sparse model, "
                  "so reconstructing first is the normal order \xe2\x80\x94 just confirm scale before "
@@ -1572,29 +2461,48 @@ kit::PreviewSlot reconSlot(const RevEngState& s) {
     return kit::PreviewSlot::SparseCloud;
 }
 
-// Inline 3D preview of whatever the reconstruction produced. The GL pass that fills this region
-// runs post-ImGui from app.cpp; it reads the rect back via kit::previewSlotRect(slot).
+// Inline 3D preview of whatever the reconstruction produced. app.cpp's preview-slot painter fills
+// this region from inside ImGui's draw pass (kit::Viewport3DPreview queues it).
 void drawReconPreview(RevEngState& s) {
     const kit::PreviewSlot slot = reconSlot(s);
     // The canned sparse fixture deliberately does NOT count as an artifact: it is demo scaffolding,
     // and treating it as content is exactly how "it worked, trust me" sneaks back in.
-    const bool haveArtifact = (slot == kit::PreviewSlot::Mesh) || !s.artifactSparseDir.empty();
-
-    const char* emptyLabel = haveArtifact ? nullptr
-                                          : "No reconstruction yet \xe2\x80\x94 run one to see the "
-                                            "point cloud and camera poses here";
+    const bool haveArtifact = slot == kit::PreviewSlot::Mesh ? bool(s.meshPreview)
+        : (!s.artifactSparseDir.empty() && (s.rePoints.hasPoints() || s.rePoints.hasFrusta()));
+    const bool artifactPending = slot == kit::PreviewSlot::Mesh ? !s.artifactMeshPath.empty()
+        : !s.artifactSparseDir.empty();
+    const char* emptyLabel = haveArtifact ? nullptr : artifactPending
+        ? "Loading preview, or see the error below."
+        : "No reconstruction yet — run one to see the point cloud and camera poses here";
     const ImVec2 box(ImGui::GetContentRegionAvail().x, M::reThumbLg());
     kit::Viewport3DPreview("##recon_preview", box, slot, emptyLabel);
 
     // Always say WHAT is on screen and whether it is this session's data.
     if (slot == kit::PreviewSlot::Mesh) {
-        kit::ValueChip("mesh", "ready", kit::Level::Ok, s.artifactMeshPath.c_str());
+        kit::ValueChip("mesh", haveArtifact ? "ready" : s.meshPreviewError.empty() ? "loading" : "error",
+                       haveArtifact ? kit::Level::Ok :
+                       s.meshPreviewError.empty() ? kit::Level::Busy : kit::Level::Error,
+                       s.artifactMeshPath.c_str());
     } else if (!s.artifactSparseDir.empty()) {
-        kit::ValueChip("sparse model", "ready", kit::Level::Ok, s.artifactSparseDir.c_str());
+        kit::ValueChip("sparse model", haveArtifact ? "ready" :
+                       s.sparsePreviewError.empty() ? "loading" : "error",
+                       haveArtifact ? kit::Level::Ok :
+                       s.sparsePreviewError.empty() ? kit::Level::Busy : kit::Level::Error,
+                       s.artifactSparseDir.c_str());
     } else if (s.recon.done) {
         kit::InlineStatus("Reconstruction reported done but returned no artifact path \xe2\x80\x94 "
                           "nothing to preview.", kit::Level::Warn);
     }
+#ifdef __EMSCRIPTEN__
+    if (SH().meshFetchPending)
+        kit::ProgressBar(SH().meshFetchProgress, "Downloading mesh preview", kit::Level::Busy);
+#endif
+    kit::InlineStatus(SH().sparsePreviewWarnings.c_str(), kit::Level::Warn);
+    kit::InlineStatus(s.sparsePreviewError.c_str(), kit::Level::Error);
+    kit::InlineStatus(s.meshPreviewError.c_str(), kit::Level::Error);
+    if ((!s.sparsePreviewError.empty() || !s.meshPreviewError.empty()) &&
+        !SH().previewPending && kit::SecondaryButton("Retry preview"))
+        SH().previewTriedKey.clear();
 }
 
 void drawReconProgress(const RevEngState& s) {
@@ -1666,25 +2574,29 @@ void drawReconstructStage(AppState& st) {
     kit::GapCards();
 
     // Fixtures are strictly screenshot-only; an ordinary empty session stays empty.
-    if (!s.cannedFixtureLoaded && std::getenv("CHUDWARE_SHOT")) {
+    if (!s.cannedFixtureLoaded && s.artifactSparseDir.empty() && std::getenv("CHUDWARE_SHOT")) {
         s.cannedFixtureLoaded = true;
         std::vector<render::SparsePoint>   pts;
         std::vector<render::CameraFrustum> frusta;
         render::buildCannedSparseFixture(pts, frusta);
         s.rePoints.setCloud(pts);
         s.rePoints.setFrusta(frusta);
+        s.sparseCenter = {0.0f, 0.0f, 7.5f};
+        s.sparseRadius = 20.0f;
     }
-    // GL-safe: SplatRenderer::load() is CPU-only (GL resources are created on first draw()).
-    ensureSplatForSession(s);
 
     const ReconGate gate = reconPreflight(st, s);
 
     if (gate.hardBlock) {
+        if (!s.artifactMeshPath.empty() || !s.artifactSparseDir.empty()) {
+            if (kit::CardBegin("##recon_preview_blocked", "CAD reconstruction preview", "display_shaded"))
+                drawReconPreview(s);
+            kit::CardEnd();
+            kit::GapCards();
+        }
         if (kit::BlockedState("CAD reconstruction unavailable", gate.reason.c_str(), gate.hint.c_str(),
-                              "Re-check backends")) {
-            loadCapabilities(st, /*force=*/true);
-            S().propsTab = 1;
-            revealColumn(/*rail=*/false);
+                              "Re-check")) {
+            loadCapabilities(st, /*force=*/true, /*manual=*/true);
         }
         return;
     }
@@ -1784,45 +2696,32 @@ void drawSessionCard(AppState& st, RevEngState& s, int i) {
                     (ss.gaussianStatus.empty() ? std::string("idle") : ss.gaussianStatus);
                 kit::StatusChip(fitChip(label).c_str(), level,
                                 "Gaussian reference in reconstruction units, not completed CAD.");
-                char frameTxt[24];
-                std::snprintf(frameTxt, sizeof(frameTxt), "%d", ss.gaussianFrames);
-                kit::ValueChip("frames", frameTxt, kit::Level::Neutral,
-                               "Frames accepted by the Gaussian job, including imported video.");
-                if (!ss.gaussianMode.empty())
-                    kit::KeyValueRow("Mode", ss.gaussianMode.c_str());
-                char registeredTxt[48];
-                std::snprintf(registeredTxt, sizeof(registeredTxt), "%d/%d",
-                              ss.gaussianRegistered, ss.gaussianFrames);
-                kit::KeyValueRow("Registered", registeredTxt);
-                char progressTxt[96];
-                std::snprintf(progressTxt, sizeof(progressTxt), "%s %d%%",
-                              ss.gaussianStage.empty() ? "Gaussian" : ss.gaussianStage.c_str(),
-                              std::clamp(ss.gaussianPct, 0, 100));
-                kit::ProgressBar(std::clamp(ss.gaussianPct, 0, 100) / 100.0f, progressTxt, level);
+                if (level == kit::Level::Busy) {
+                    char progressTxt[96];
+                    std::snprintf(progressTxt, sizeof(progressTxt), "%s %d%%",
+                                  ss.gaussianStage.empty() ? "Gaussian" : ss.gaussianStage.c_str(),
+                                  std::clamp(ss.gaussianPct, 0, 100));
+                    kit::ProgressBar(std::clamp(ss.gaussianPct, 0, 100) / 100.0f, progressTxt, level);
+                }
             } else {
-                kit::StatusChip(fitChip(ss.status.empty() ? "new" : ss.status).c_str(),
-                                statusLevel(ss.status));
-                char imgTxt[24];
-                std::snprintf(imgTxt, sizeof(imgTxt), "%d", ss.images);
-                flowSameLine(rightX, valueChipW("img", imgTxt), gap);
-                kit::ValueChip("img", imgTxt, ss.images > 0 ? kit::Level::Ok : kit::Level::Neutral,
-                               "Images captured or imported into this session.");
+                // "capturing" with nothing captured yet is just a new session.
+                const std::string label = ss.status.empty() ||
+                                                  (ss.status == "capturing" && ss.images == 0)
+                                              ? std::string("new") : ss.status;
+                kit::StatusChip(fitChip(label).c_str(),
+                                label == "new" ? kit::Level::Neutral : statusLevel(ss.status));
             }
             if (ss.approximate) {
                 flowSameLine(rightX, statusChipW("approximate"), gap);
                 kit::HonestyTag("approximate",
-                                "This session's pipeline is flagged approximate \xe2\x80\x94 reference/preview "
-                                "geometry only, not a measured model.");
+                                "Reference/preview geometry only \xe2\x80\x94 not a measured model.");
             }
-
-            if (!ss.hasGaussian) {
-                const float frac = sessionProgress(s, i);
-                char stageTxt[32];
-                std::snprintf(stageTxt, sizeof(stageTxt), "%d/%d stages",
-                              (int)(frac * kStageCount + 0.5f), kStageCount);
-                kit::ProgressBar(frac, stageTxt,
-                                 frac >= 1.0f ? kit::Level::Ok : kit::Level::Neutral);
-            }
+            char meta[48];
+            if (ss.lane == "reference")
+                std::snprintf(meta, sizeof(meta), "from reference");
+            else
+                std::snprintf(meta, sizeof(meta), "%d image%s", ss.images, ss.images == 1 ? "" : "s");
+            ImGui::TextDisabled("%s", meta);
         }
         ImGui::EndGroup();
 
@@ -1847,7 +2746,7 @@ void drawNewSessionCard(AppState& st, RevEngState& s) {
             ImGui::SetKeyboardFocusHere();
             s.focusNewName = false;
         }
-        const std::string hint = ui::kit::elide("Environment / object name (optional)", textW);
+        const std::string hint = ui::kit::elide("Part or object name (optional)", textW);
         ImGui::InputTextWithHint("##reveng_new_name", hint.c_str(), s.newNameBuf,
                                  sizeof(s.newNameBuf));
         kit::GapControl();
@@ -1864,6 +2763,8 @@ void drawNewSessionCard(AppState& st, RevEngState& s) {
             s.newSessionErr.clear();
             nlohmann::json params = nlohmann::json::object();
             if (s.newNameBuf[0] != '\0') params["name"] = std::string(s.newNameBuf);
+            if (const std::string project = revengProjectDir(st); !project.empty())
+                params["project_dir"] = project;
             st.rpc.call("reveng_start_session", params, [&st](const core::RpcResult& r) {
                 RevEngState& s2 = S();
                 s2.newSessionPending = false;
@@ -1878,6 +2779,8 @@ void drawNewSessionCard(AppState& st, RevEngState& s) {
                 s2.stage = Stage::Source;   // land on Source so the entry widgets show
                 s2.lastListT = -100.0;      // expire the throttle -> refresh now
                 st.pendingRevengSessionId = r.result.value("session_id", std::string());
+                // Keep the lane the user created it from; the first detail poll must not flip it.
+                s2.laneChosenFor = st.pendingRevengSessionId;
             });
         }
         if (s.newSessionPending)
@@ -1916,11 +2819,23 @@ void drawSessionRailBody(AppState& st) {
                              sizeof(s.railFilterBuf));
     if (oneLine) ImGui::SameLine(0.0f, style.ItemSpacing.x);
     else         kit::GapControl();
-    if (kit::SecondaryButton(fitLabel(s.listPending ? "\xe2\x80\xa6" : "Refresh", "re_rail_refresh",
+    // Busy only for a refresh the user asked for — the background poll must not flash it.
+    if (kit::SecondaryButton(fitLabel(s.listManual ? "\xe2\x80\xa6" : "Refresh", "re_rail_refresh",
                                       refreshW).c_str(),
-                             !s.listPending, "A refresh is already in flight.",
+                             !s.listManual, "A refresh is already in flight.",
                              ImVec2(refreshW, 0.0f)))
-        loadSessions(st, /*force=*/true);
+        loadSessions(st, /*force=*/true, /*manual=*/true);
+
+    // Sessions are scoped to the working folder; say which one so an empty list is not a mystery.
+    if (!s.listedProject.empty()) {
+        const std::string folder = std::filesystem::path(s.listedProject).filename().string();
+        const std::string label = ui::kit::elide(
+            ("In " + (folder.empty() ? s.listedProject : folder)).c_str(),
+            ImGui::GetContentRegionAvail().x);
+        ImGui::TextDisabled("%s", label.c_str());
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Sessions of the working folder\n%s", s.listedProject.c_str());
+    }
 
     kit::GapControl();
 
@@ -1937,7 +2852,7 @@ void drawSessionRailBody(AppState& st) {
         if (kit::BlockedState("Sessions unavailable", s.listErr.c_str(),
                               "The Reverse Engineering tools may not be registered in this build.",
                               "Retry"))
-            loadSessions(st, /*force=*/true);
+            loadSessions(st, /*force=*/true, /*manual=*/true);
         return;
     }
     if (s.sessions.empty()) {
@@ -1945,9 +2860,9 @@ void drawSessionRailBody(AppState& st) {
             kit::InlineStatus("Loading sessions\xe2\x80\xa6", kit::Level::Busy);
             return;
         }
-        if (kit::EmptyState("part", "No sessions yet",
-                            "Capture an environment or object with a live camera, video or photos. "
-                            "Gaussian references use reconstruction units; measured CAD needs scale and review.",
+        if (kit::EmptyState("part", "No sessions in this folder",
+                            "Sessions belong to the working folder chosen at the top left. Create "
+                            "one to scan a part or to start from a part number, URL or datasheet.",
                             "New session")) {
             s.focusNewName = true;
         }
@@ -1970,251 +2885,189 @@ void drawSessionRailBody(AppState& st) {
 }
 
 // ================================================================================
-// Properties column
+// Session column
 // ================================================================================
+//
+// One scrolling column, no tabs. In order it answers: what is this session, how far can its
+// numbers be trusted, and — only when something is actually missing — which tools this intake
+// lane still needs. It replaced a Details / Capabilities / Provenance tab strip whose raw backend
+// probe and step log read as noise.
 
-void drawPropsDetails(AppState& st, RevEngState& s) {
-    if (s.selected < 0 || s.selected >= (int)s.sessions.size()) {
-        kit::EmptyState("part", "No session selected",
-                        "Pick a session in the rail to see its manifest, scale and artifacts.",
-                        nullptr, false);
+// The accuracy the session's geometry has earned, with the reason in plain words. DERIVED, never
+// assumed: a scan only earns "high" once its scale is confirmed with a low residual.
+void drawAccuracyTag(const RevEngState& s, const SessionSummary& ss) {
+    if (s.sourceMode == SourceMode::Reference) {
+        if (!s.ref.modelPath.empty())
+            kit::HonestyTag("high", "An existing CAD model \xe2\x80\x94 check it against the real "
+                                    "part before fit-critical use.");
+        else
+            kit::HonestyTag("medium", "Datasheet / catalogue values are nominal, often without "
+                                      "tolerances. Confirm fit-critical dimensions on the part.");
         return;
     }
-    const SessionSummary& ss = s.sessions[s.selected];
-
-    // Visual anchor: whichever contact-sheet image is selected (falls back to the first).
-    if (kit::CardBegin("##props_hero", "Selected image", "sketch")) {
-        const int idx = (s.selectedImage >= 0 && s.selectedImage < (int)s.galleryImages.size())
-                            ? s.selectedImage
-                            : (s.galleryImages.empty() ? -1 : 0);
-        const ImVec2 box(ImGui::GetContentRegionAvail().x, M::reThumbLg());
-        if (idx >= 0) {
-            const GalleryImage& g = s.galleryImages[idx];
-            char cap[128];
-            std::snprintf(cap, sizeof(cap), "%d / %d  \xc2\xb7  %s", idx + 1,
-                          (int)s.galleryImages.size(),
-                          g.quality.empty() ? "ok" : g.quality.c_str());
-            kit::HeroPreview("##props_hero_img", g.texId, g.thumbW, g.thumbH, box, cap, nullptr);
-        } else {
-            kit::HeroPreview("##props_hero_img", 0, 0, 0, box, nullptr,
-                             "No images in this session yet");
-        }
+    if (ss.approximate) {
+        kit::HonestyTag("approximate", "Preview geometry only \xe2\x80\x94 do not machine or mate "
+                                       "from these dimensions without measuring the real part.");
+    } else if (!s.honestyTier.empty()) {
+        kit::HonestyTag(s.honestyTier.c_str(), "Single-photo reconstruction tier.");
+    } else if (!s.scale.mirrored) {
+        kit::HonestyTag("approximate", "No scale yet: the shape is right, the size is not.");
+    } else if (!s.scale.confirmed) {
+        kit::HonestyTag("low", "Scale solved but not confirmed. Confirm it in the Scale stage "
+                               "before trusting any dimension.");
+    } else if (!s.scale.hasResidual || s.scale.residualPct > 1.0) {
+        kit::HonestyTag("medium", "Scale confirmed, but its fit error is unknown or above 1% "
+                                  "\xe2\x80\x94 expect roughly \xc2\xb1""5%.");
+    } else {
+        kit::HonestyTag("high", "Confirmed, low-error scale \xe2\x80\x94 about \xc2\xb1""2%.");
     }
-    kit::CardEnd();
-    kit::GapCards();
-
-    if (kit::CardBegin("##props_session", "Session", "part")) {
-        kit::KeyValueRow("Name", ss.name.c_str());
-        kit::KeyValueRow("Session id", ss.session_id.c_str());
-        kit::KeyValueRow("Status", ss.status.empty() ? "(unknown)" : ss.status.c_str(),
-                         statusLevel(ss.status));
-        char imgTxt[24];
-        std::snprintf(imgTxt, sizeof(imgTxt), "%d", ss.images);
-        kit::KeyValueRow("Images", imgTxt,
-                         ss.images > 0 ? kit::Level::Ok : kit::Level::Warn);
-        if (!ss.createdAt.empty()) kit::KeyValueRow("Created", ss.createdAt.c_str());
-        if (!ss.updatedAt.empty()) kit::KeyValueRow("Updated", ss.updatedAt.c_str());
-        if (!ss.partRef.empty())   kit::KeyValueRow("Part ref", ss.partRef.c_str());
-
-        kit::GapControl();
-        kit::KeyValueRow("Pipeline", s.honestyPipeline.empty() ? "scan -> mesh -> AI -> parametric"
-                                                               : s.honestyPipeline.c_str());
-        // Tier is DERIVED, never assumed. A multi-view scan only earns "high" once its scale is
-        // confirmed; without a scale the geometry has shape but no size, which is "approximate".
-        if (ss.approximate) {
-            kit::HonestyTag("approximate",
-                            "Reference/preview geometry only \xe2\x80\x94 do not machine or mate "
-                            "from these dimensions without measuring the real part.");
-        } else if (!s.honestyTier.empty()) {
-            kit::HonestyTag(s.honestyTier.c_str(),
-                            "Single-photo reconstruction tier reported by the backend.");
-        } else if (!s.scale.mirrored) {
-            kit::HonestyTag("approximate",
-                            "No scale has been solved yet, so nothing here is a real-world "
-                            "measurement.");
-        } else if (!s.scale.confirmed) {
-            kit::HonestyTag("low",
-                            "A scale was solved but not confirmed. Confirm it in the Scale stage "
-                            "before trusting any dimension.");
-        } else if (s.scale.residualPct > 1.0) {
-            kit::HonestyTag("medium",
-                            "Scale is confirmed but its residual is above 1%, so expect roughly "
-                            "\xc2\xb1""5%.");
-        } else {
-            kit::HonestyTag("high",
-                            "Multi-view scan with a confirmed, low-residual scale \xe2\x80\x94 "
-                            "about \xc2\xb1""2%.");
-        }
-        kit::InlineStatus(s.detailErr.c_str(), kit::Level::Error);
-        if (s.detailPending) kit::InlineStatus("Refreshing manifest\xe2\x80\xa6", kit::Level::Busy);
-    }
-    kit::CardEnd();
-    kit::GapCards();
-
-    if (kit::CardBegin("##props_scale", "Scale", "measure")) {
-        if (!s.scale.mirrored) {
-            kit::InlineStatus("No scale set yet \xe2\x80\x94 the model will have shape but no size.",
-                              kit::Level::Warn);
-        } else {
-            kit::KeyValueRow("Method", s.scale.curMethod.empty() ? "(pending)" : s.scale.curMethod.c_str());
-            char mmTxt[48];
-            std::snprintf(mmTxt, sizeof(mmTxt), "%.4g mm / unit", s.scale.mmPerUnit);
-            kit::KeyValueRow("Scale factor", mmTxt);
-            kit::KeyValueRow("Residual", kit::fmtPct(s.scale.residualPct / 100.0, 2).c_str(),
-                             s.scale.residualPct <= 1.0 ? kit::Level::Ok : kit::Level::Warn);
-            kit::KeyValueRow("Confirmed", s.scale.confirmed ? "yes" : "no",
-                             s.scale.confirmed ? kit::Level::Ok : kit::Level::Warn);
-        }
-        if (kit::SecondaryButton("Open Scale stage", true, nullptr,
-                                 ImVec2(ImGui::GetContentRegionAvail().x, 0.0f))) {
-            s.stage = Stage::Scale;
-            clampStageToPipeline(s);
-        }
-    }
-    kit::CardEnd();
-    kit::GapCards();
-
-    if (kit::CardBegin("##props_artifacts", "Artifacts", "results")) {
-        auto artifactRow = [](const char* label, const std::string& path) {
-            kit::StatusChip(label, path.empty() ? kit::Level::Neutral : kit::Level::Ok,
-                            path.empty() ? "Not produced yet." : path.c_str());
-        };
-        artifactRow("sparse", s.artifactSparseDir);
-        ImGui::SameLine(0.0f, M::reCtlGap());
-        artifactRow("mesh", s.artifactMeshPath);
-        ImGui::SameLine(0.0f, M::reCtlGap());
-        artifactRow("splat", s.artifactSplatPath);
-        if (s.artifactSparseDir.empty() && s.artifactMeshPath.empty() && s.artifactSplatPath.empty())
-            kit::InlineStatus("Nothing reconstructed yet.", kit::Level::Neutral);
-    }
-    kit::CardEnd();
-    (void)st;
 }
 
-void drawPropsCapabilities(AppState& st, RevEngState& s) {
-    CapabilityState& c = s.caps;
-
-    if (kit::CardBegin("##caps_head", "What this machine can do", "health_check")) {
-        const float btnW = M::reBtnW();
-        kit::CardHeaderRight(btnW);
-        if (kit::SecondaryButton(c.pending ? "\xe2\x80\xa6" : "Refresh", !c.pending,
-                                 "A probe is already in flight.", ImVec2(btnW, 0.0f)))
-            loadCapabilities(st, /*force=*/true);
-
-        if (!st.workerStarted) {
-            kit::BlockedState("Worker not running",
-                              "reveng_status() cannot be reached, so backend availability is unknown.",
-                              "Start the Chudware worker and press Refresh.");
-            kit::CardEnd();
-            return;
+void drawSessionSummary(AppState& st, RevEngState& s) {
+    const SessionSummary& ss = s.sessions[s.selected];
+    const bool reference = s.sourceMode == SourceMode::Reference;
+    if (kit::CardBegin("##re_sess_summary", "Session", "part")) {
+        kit::KeyValueRow("Name", ss.name.c_str());
+        const std::string status = ss.status.empty() ||
+                                           (ss.status == "capturing" && ss.images == 0)
+                                       ? std::string("new") : ss.status;
+        kit::KeyValueRow("Status", status.c_str(),
+                         status == "new" ? kit::Level::Neutral : statusLevel(ss.status));
+        kit::KeyValueRow("Intake", reference ? "From reference" : "Scan");
+        if (!reference) {
+            char imgTxt[24];
+            std::snprintf(imgTxt, sizeof(imgTxt), "%d", ss.images);
+            kit::KeyValueRow("Images", imgTxt);
         }
-        if (!c.err.empty()) {
-            if (kit::BlockedState("Capability probe failed", c.err.c_str(),
-                                  "The reveng tools may not be registered in this worker build.",
-                                  "Retry"))
-                loadCapabilities(st, /*force=*/true);
-            kit::CardEnd();
-            return;
-        }
-        if (!c.loaded) {
-            kit::InlineStatus("Probing backends\xe2\x80\xa6", kit::Level::Busy);
-            kit::CardEnd();
-            return;
-        }
-
-        kit::CapabilityRow("Sparse reconstruction", c.sparse,
-                           c.sparse ? "COLMAP or VGGT is available."
-                                    : "Install COLMAP (COLMAP_BIN) or provision VGGT weights.");
-        kit::CapabilityRow("Dense mesh", c.dense,
-                           c.dense ? "OpenMVS is available."
-                                   : "Needs COLMAP plus OpenMVS (OPENMVS_BIN). Without it a run "
-                                     "yields a sparse cloud only.");
-        kit::CapabilityRow("3D Gaussian splat", c.splat,
-                           c.splat ? "Brush is available."
-                                   : "Provision the Brush binary (BRUSH_BIN) for splat previews.");
-        kit::CapabilityRow("Single photo", c.singlePhoto,
-                           c.singlePhoto ? "TripoSR / TRELLIS weights present."
-                                         : "Provision TripoSR or TRELLIS weights. Single-photo output "
-                                           "is approximate by definition.");
-        kit::CapabilityRow("Webcam capture", c.webcam,
-                           c.webcam ? "A camera device was found."
-                                    : "No camera device found \xe2\x80\x94 plug one in, or import photos "
-                                      "from disk instead.");
-        kit::CapabilityRow("GPU", c.gpu,
-                           c.gpu ? "CUDA-capable GPU detected."
-                                 : "CPU only: reconstruction still works but is far slower, and "
-                                   "splat training is impractical.");
-    }
-    kit::CardEnd();
-    if (!c.loaded) return;
-    kit::GapCards();
-
-    if (kit::CardBegin("##caps_artifacts", "Backends found", "settings")) {
-        if (c.artifacts.empty()) {
-            kit::InlineStatus("reveng_status() returned no provisioning block.", kit::Level::Warn);
-        } else {
-            for (const CapabilityState::Artifact& a : c.artifacts)
-                kit::CapabilityRow(a.key.c_str(), a.present, a.hint.c_str());
-        }
+        if (!ss.partRef.empty()) kit::KeyValueRow("Library part", ss.partRef.c_str());
+        if (!ss.updatedAt.empty()) kit::KeyValueRow("Updated", ss.updatedAt.c_str());
+        kit::GapControl();
+        kit::FieldLabel("Accuracy");
+        ImGui::SameLine(0.0f, M::reCtlGap());
+        drawAccuracyTag(s, ss);
+        kit::InlineStatus(s.detailErr.c_str(), kit::Level::Error);
     }
     kit::CardEnd();
 
-    if (!c.banners.empty()) {
+    if (reference && !s.ref.modelPath.empty()) {
         kit::GapCards();
-        if (kit::CardBegin("##caps_banners", "Notices", "warning_badge")) {
-            for (const std::string& b : c.banners)
-                kit::InlineStatus(b.c_str(), kit::Level::Warn);
+        if (kit::CardBegin("##re_sess_model", "Model", "part")) {
+            const std::string file = std::filesystem::path(s.ref.modelPath).filename().string();
+            kit::KeyValueRow("File", file.c_str());
+            if (!s.ref.modelSource.empty()) kit::KeyValueRow("From", s.ref.modelSource.c_str());
+            if (kit::SecondaryButton("Open model", true, nullptr,
+                                     ImVec2(ImGui::GetContentRegionAvail().x, 0.0f)))
+                st.requestOpenPath = s.ref.modelPath;
+        }
+        kit::CardEnd();
+    }
+
+    if (!reference) {
+        kit::GapCards();
+        if (kit::CardBegin("##re_sess_scale", "Scale", "measure")) {
+            if (!s.scale.mirrored) {
+                kit::KeyValueRow("Scale", "not set", kit::Level::Warn);
+            } else {
+                char mmTxt[48];
+                std::snprintf(mmTxt, sizeof(mmTxt), "%.4g mm / unit", s.scale.mmPerUnit);
+                kit::KeyValueRow("Scale", mmTxt);
+                kit::KeyValueRow("Confirmed", s.scale.confirmed ? "yes" : "no",
+                                 s.scale.confirmed ? kit::Level::Ok : kit::Level::Warn);
+            }
+            if (!s.scale.confirmed &&
+                kit::SecondaryButton("Open Scale stage", true, nullptr,
+                                     ImVec2(ImGui::GetContentRegionAvail().x, 0.0f))) {
+                s.stage = Stage::Scale;
+                clampStageToPipeline(s);
+            }
         }
         kit::CardEnd();
     }
 }
 
-void drawPropsProvenance(RevEngState& s) {
-    if (s.selected < 0 || s.selected >= (int)s.sessions.size()) {
-        kit::EmptyState("history", "No session selected",
-                        "The provenance log records every pipeline step that touched a session.",
-                        nullptr, false);
-        return;
-    }
-    if (s.provenance.empty()) {
-        kit::EmptyState("history", "Nothing recorded yet",
-                        "Each capture, scale solve, reconstruction and model build appends a "
-                        "record here. It is what makes a photo-derived dimension defensible.",
-                        nullptr, false);
-        return;
-    }
-    if (kit::CardBegin("##props_prov", "Provenance", "history")) {
-        // Newest first: the last thing that happened is what you are asking about.
-        for (int i = (int)s.provenance.size() - 1; i >= 0; --i) {
-            const ProvenanceRecord& p = s.provenance[i];
-            ImGui::PushID(i);
-            kit::KeyValueRow(p.step.c_str(), p.ts.empty() ? "" : p.ts.c_str());
-            if (!p.detail.empty()) {
-                const float* d = ui::palette.textDisabled;
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(d[0], d[1], d[2], d[3]));
-                ImGui::TextWrapped("%s", p.detail.c_str());
-                ImGui::PopStyleColor();
-            }
-            if (i > 0) kit::Rule();
-            ImGui::PopID();
+// Tools the CURRENT lane needs that this machine does not have. Draws nothing when everything is
+// installed (or before the first probe lands): a wall of green "available" rows is not information.
+void drawMissingTools(AppState& st, RevEngState& s) {
+    CapabilityState& c = s.caps;
+    if (!st.workerStarted || (!c.loaded && c.err.empty())) return;
+
+    struct Missing { const char* name; std::string hint; };
+    std::vector<Missing> missing;
+    if (c.loaded) {
+        auto hintFor = [&](const char* key, const char* fallback) {
+            for (const CapabilityState::Artifact& a : c.artifacts)
+                if (a.key == key && !a.hint.empty()) return a.hint;
+            return std::string(fallback);
+        };
+        if (s.sourceMode == SourceMode::Scan) {
+            if (!c.sparse)
+                missing.push_back({"Reconstruction (COLMAP)",
+                                   hintFor("colmap", "Install COLMAP and set COLMAP_BIN.")});
+            if (!c.dense)
+                missing.push_back({"Dense mesh (OpenMVS)",
+                                   hintFor("openmvs", "Without it a reconstruction yields a sparse "
+                                                      "point cloud only.")});
+            if (!c.splat)
+                missing.push_back({"Gaussian splat (Brush)",
+                                   hintFor("brush", "Installs from the app for splat previews.")});
+        } else {
+            for (const CapabilityState::Artifact& a : c.artifacts)
+                if (a.key == "docling" && !a.present)
+                    missing.push_back({"Datasheet reader (docling)", a.hint});
         }
+    }
+    bool needsInstall = false;
+    for (const CapabilityState::Artifact& a : c.artifacts)
+        needsInstall = needsInstall || ((a.key == "brush" || a.key == "openmvs") && !a.present);
+    if (missing.empty() && c.err.empty() && !c.installRunning && c.installErr.empty()) return;
+
+    kit::GapCards();
+    if (kit::CardBegin("##re_sess_tools", c.installRunning ? "Installing tools" : "Missing tools",
+                       "warning_badge")) {
+        if (!c.err.empty())
+            kit::InlineStatus(("Could not check installed tools: " + c.err).c_str(), kit::Level::Warn);
+        for (const Missing& m : missing) kit::CapabilityRow(m.name, false, m.hint.c_str());
+        if (c.installRunning || c.installPending) {
+            char label[160];
+            const char* what = c.installMsg.empty() ? "Starting" : c.installMsg.c_str();
+            if (c.installTotal > 0.0)
+                std::snprintf(label, sizeof(label), "%s  %.0f / %.0f MB", what,
+                              c.installDone / 1048576.0, c.installTotal / 1048576.0);
+            else
+                std::snprintf(label, sizeof(label), "%s", what);
+            kit::ProgressBar(c.installTotal > 0.0 ? (float)(c.installDone / c.installTotal) : -1.0f,
+                             label, kit::Level::Busy);
+        } else if (!c.installErr.empty()) {
+            kit::InlineStatus(("Install failed - " + c.installErr).c_str(), kit::Level::Error);
+        }
+        kit::GapControl();
+        const bool installing = c.installRunning || c.installPending;
+        if (needsInstall && !installing) {
+            if (kit::PrimaryButton(c.installErr.empty() ? "Install missing tools (~210 MB)###re_tools_install"
+                                                        : "Retry install###re_tools_install",
+                                   true, nullptr, ImVec2(ImGui::GetContentRegionAvail().x, 0.0f)))
+                kickInstallTools(st);
+            kit::GapControl();
+        }
+        if (kit::SecondaryButton(c.manual ? "Checking\xe2\x80\xa6###re_tools_recheck"
+                                          : "Re-check###re_tools_recheck",
+                                 !c.manual, "A check is already running.",
+                                 ImVec2(ImGui::GetContentRegionAvail().x, 0.0f)))
+            loadCapabilities(st, /*force=*/true, /*manual=*/true);
     }
     kit::CardEnd();
 }
 
-void drawPropertiesBody(AppState& st) {
+void drawSessionColumnBody(AppState& st) {
     RevEngState& s = S();
-    static const char* kTabs[] = { "Details", "Capabilities", "Provenance" };
-    kit::SegmentedControl("##re_props_tabs", kTabs, 3, &s.propsTab,
-                          ImGui::GetContentRegionAvail().x);
-    kit::GapControl();
-
     ImGui::BeginChild("##re_props_body", ImVec2(0.0f, 0.0f), ImGuiChildFlags_None);
-    switch (s.propsTab) {
-        case 1:  drawPropsCapabilities(st, s); break;
-        case 2:  drawPropsProvenance(s);       break;
-        default: drawPropsDetails(st, s);      break;
+    if (s.selected < 0 || s.selected >= (int)s.sessions.size()) {
+        kit::EmptyState("part", "No session selected",
+                        "Pick a session on the left, or create one.", nullptr, false);
+    } else {
+        drawSessionSummary(st, s);
     }
+    drawMissingTools(st, s);
     ImGui::EndChild();
 }
 
@@ -2272,22 +3125,23 @@ bool drawColumnHeader(const char* title) {
 // Lane selector + TOP stage stepper
 // ================================================================================
 
-// RE-30: source lane. Doc lanes drop Scale + Reconstruct from the stepper entirely, which is why
-// this sits ABOVE the stepper: changing the lane changes which steps exist.
+// Intake lane. The reference lane drops Scale + Reconstruct from the stepper entirely, which is
+// why this sits ABOVE the stepper: changing the lane changes which steps exist.
 bool drawSourceLane(RevEngState& s) {
-    static const char* kLaneLabels[] = { "Scan", "Datasheet", "Web / Part#", "From Library" };
+    static const char* kLaneLabels[] = { "Scan", "From reference" };
     static const char* kLaneTips[] = {
-        "Photos / video / webcam -> Scale -> Reconstruct -> Model",
-        "Local PDF or spec sheet -> Model  (no Scale / Reconstruct)",
-        "Part number or URL -> Research -> Model",
-        "Seeded from the Parts Library \xe2\x80\x94 auto-routed to the right lane",
+        "Capture the real part with a webcam, photos, video or your phone, then scale and "
+        "reconstruct it.",
+        "Start from a part number, product name, URL, datasheet or library part. Existing CAD "
+        "models (GrabCAD, TraceParts, Printables, ...) are searched first; a model is only built "
+        "from documents when none fits.",
     };
     int lane = (int)s.sourceMode;
 
-    kit::FieldLabel("Source lane");
+    kit::FieldLabel("Intake");
     ImGui::SameLine(0.0f, M::reCtlGap());
-    kit::HelpMarker(kLaneTips[std::clamp(lane, 0, 3)]);
-    const bool changed = kit::SegmentedControl("##re_lane", kLaneLabels, 4, &lane,
+    kit::HelpMarker(kLaneTips[std::clamp(lane, 0, 1)]);
+    const bool changed = kit::SegmentedControl("##re_lane", kLaneLabels, 2, &lane,
                                                ImGui::GetContentRegionAvail().x);
     if (changed && lane != (int)s.sourceMode) {
         s.sourceMode = (SourceMode)lane;
@@ -2337,7 +3191,8 @@ void drawStageStepper(AppState& st, RevEngState& s) {
             // Doc lanes have no Reconstruct step: fall back to the step before this one.
             if (prereqIdx < 0) prereqIdx = i - 1;
             const bool prereqDone = prereqIdx < 0 || states[prereqIdx] == kit::Level::Ok;
-            reach[i] = prereqDone || states[i] != kit::Level::Neutral || pipeline[i] == s.stage;
+            reach[i] = prereqDone || states[i] != kit::Level::Neutral || pipeline[i] == s.stage ||
+                       (pipeline[i] == Stage::Deliver && !s.artifactMeshPath.empty());
         }
     }
 
@@ -2382,12 +3237,15 @@ void drawStageStepper(AppState& st, RevEngState& s) {
 
 void drawStageBody(AppState& st, RevEngState& s) {
     if (s.selected < 0 || s.selected >= (int)s.sessions.size()) {
-        if (kit::EmptyState("part", "Capture an environment or object",
-                            "Use live camera capture, imported video or photos to build a Gaussian "
-                            "reference in reconstruction units — not a dimensionally-correct CAD model.\n\n"
-                            "Measured, editable CAD is a separate workflow requiring scale references "
-                            "and dimension review. Arbitrary photos do not guarantee accurate dimensions.\n\n"
-                            "Select a session in the rail, or create one to begin.",
+        const bool reference = s.sourceMode == SourceMode::Reference;
+        if (kit::EmptyState("part", reference ? "Start from a reference" : "Scan a part",
+                            reference
+                                ? "Give a part number, product name, URL or datasheet. Existing CAD "
+                                  "models are searched for first; one is only built from documents "
+                                  "when nothing fits.\n\nSelect a session on the left, or create one."
+                                : "Capture the real part with a webcam, photos, video or your phone. "
+                                  "Scale it, reconstruct it, then fit an editable model.\n\n"
+                                  "Select a session on the left, or create one.",
                             "New session")) {
             s.focusNewName = true;
             revealColumn(/*rail=*/true);
@@ -2420,6 +3278,22 @@ void consumePendingSession(AppState& st, RevEngState& s) {
             s.stage = Stage::Source;
             resetForSessionChange(s);
         }
+        if (SH().pendingSourceSession == s.sessions[i].session_id) {
+            if (SH().pendingSourceKind == SourceFile::Video) {
+                s.sourceVideoPath = SH().pendingSourcePath;
+                s.sourceFocus = SourceFocus::Video;
+                s.stage = Stage::Source;
+            } else if (SH().pendingSourceKind == SourceFile::Splat) {
+                s.artifactSplatPath = SH().pendingSplatPath;
+                s.artifactIsImportedSplat = true;
+                s.stage = Stage::Reconstruct;
+            }
+            s.sourceMode = SourceMode::Scan;
+            SH().pendingSourceSession.clear();
+            SH().pendingSourcePath.clear();
+            SH().pendingSplatPath.clear();
+            SH().pendingSourceKind = SourceFile::Other;
+        }
         return;
     }
     // Keep the intended SID until a refresh includes it; never consume it against the old list.
@@ -2430,22 +3304,69 @@ void consumePendingSession(AppState& st, RevEngState& s) {
 void resetForSessionChange(RevEngState& s) {
     webcamCaptureShutdown();
     ++SH().sessionEpoch;
+#ifdef __EMSCRIPTEN__
+    SH().splatArtifactId.clear();
+    SH().gaussianArtifactId.clear();
+    SH().splatRefTried.clear();
+    SH().splatRefDisplayed.clear();
+    SH().meshArtifactId.clear();
+    SH().splatFetchPending = false;
+    SH().meshFetchPending = false;
+    ++SH().splatFetchSerial;
+    ++SH().meshFetchSerial;
+#endif
     SH().gaussianPollPending = false;
     SH().gaussianHydrated = false;
     SH().gaussianPollT = -100.0;
     SH().splatRevisionTried = 0;
+    SH().splatTransformTried.clear();
     SH().splatLoadError.clear();
     SH().gaussianCameraFitted = false;
     SH().loadedViewCamera = {};
     SH().gaussianCaptureProjection = false;
     SH().gaussianArtifactDirectory.clear();
+    SH().displayedSplatPath.clear();
+    SH().displayedSplatTransformKey.clear();
+    SH().splatActionPending = false;
+    SH().splatActionError = false;
+    SH().splatActionMsg.clear();
     SH().gaussianRight = {1, 0, 0};
     SH().gaussianUp = {0, 1, 0};
     SH().gaussianBack = {0, 0, 1};
     SH().gaussianYaw = 0.6f;
     SH().gaussianPitch = 0.25f;
     SH().cropDirty = false;
+    SH().previewTransformKey.clear();
+    SH().previewRequestKey.clear();
+    SH().previewTriedKey.clear();
+    SH().sparsePreviewWarnings.clear();
+    SH().previewPending = false;
+    SH().meshSourcePath.clear();
+    SH().meshSourceKey.clear();
+    SH().meshLoadPath.clear();
+    SH().parametricDocId.clear();
+    SH().parametricSourcePath.clear();
+    SH().parametricSourceKey.clear();
+    SH().parametricLoadPath.clear();
+    SH().parametricPollPending = false;
+    SH().parametricPollT = -100.0;
+    s.sparsePoints.clear();
+    s.sparseNativePoints.clear();
+    s.sparseCenter = {};
+    s.sparseRadius = 1.0f;
+    s.sparsePreviewError.clear();
+    s.meshPreview.reset();
+    s.parametricPreview.reset();
+    s.meshPreviewError.clear();
+    s.parametricPreviewError.clear();
+    ++s.meshPreviewRevision;
+    ++s.parametricPreviewRevision;
+    ++s.sparsePreviewRevision;
     s.splat.setCloud(render::SplatCloud{});
+    s.splatPickMarks.setCloud({});
+    s.splatArtifactTransform = {};
+    s.splatDisplayedTransform = {};
+    ++s.splatPreviewRevision;
     s.rePoints.setCloud({});
     s.rePoints.setFrusta({});
     s.cannedFixtureLoaded = false;
@@ -2454,16 +3375,26 @@ void resetForSessionChange(RevEngState& s) {
     s.galleryImages.clear();
     s.gallerySession = s.selected;
     s.selectedImage = -1;
+    s.sourceVideoPath.clear();
 
     s.splatLoaded = false;
     s.splatPathTried.clear();
     s.artifactSplatPath.clear();
     s.artifactMeshPath.clear();
     s.artifactSparseDir.clear();
+    s.artifactIsImportedSplat = false;
+    s.splatImportLoss.clear();
+    s.splatUntransformed = false;
     s.detailSessionId.clear();
     s.lastDetailT = -100.0;
     s.detailErr.clear();
-    s.provenance.clear();
+    s.ref = ReferenceState{};
+    s.researchResult.clear();
+    s.researchErr.clear();
+    s.researchPending = false;
+    s.datasheetPath.clear();
+    s.datasheetErr.clear();
+    s.datasheetPending = false;
     s.honestyPipeline.clear();
     s.honestyTier.clear();
     for (int i = 0; i < kStageCount; ++i) s.stages[i].badge = "idle";
@@ -2504,9 +3435,6 @@ void revengWorkspaceTeardown() {
 // ---- entry point ---------------------------------------------------------------
 
 void drawRevEngWorkspace(AppState& st) {
-    // MUST be first: every Viewport3DPreview this frame republishes into a cleared slot table.
-    kit::resetPreviewSlots();
-
     ShellState& sh = SH();
     const int frame = ImGui::GetFrameCount();
     // We stopped being drawn at some point => the user left the RE tab. app.cpp has no teardown
@@ -2522,6 +3450,9 @@ void drawRevEngWorkspace(AppState& st) {
 
     if (s.selected != s.gallerySession) resetForSessionChange(s);
     if (s.selected >= 0 && s.selected < (int)s.sessions.size()) loadSessionDetail(st);
+    ensureSplatForSession(s);
+    ensureSparseAndMeshPreview(st);
+    ensureParametricPreview(st);
     pollGaussian(st);
     clampStageToPipeline(s);
 
@@ -2597,14 +3528,18 @@ void drawRevEngWorkspace(AppState& st) {
 
         ImGui::BeginChild("##reveng_stage_body", ImVec2(0.0f, 0.0f), ImGuiChildFlags_None);
         drawStageBody(st, s);
+        if (s.stage == Stage::Model || s.stage == Stage::Deliver) {
+            kit::InlineStatus(s.meshPreviewError.c_str(), kit::Level::Error);
+            kit::InlineStatus(s.parametricPreviewError.c_str(), kit::Level::Error);
+        }
         ImGui::EndChild();
     }
     ImGui::EndChild();
 
-    // ---- right: properties ---------------------------------------------------
+    // ---- right: session summary ----------------------------------------------
     ImGui::SameLine(0.0f, gutter);
     if (propFold && drawPropW <= stripW + M::reCardGap()) {
-        if (drawCollapsedStrip("##reveng_props_strip", "DETAILS", propAutoFolded, drawPropW))
+        if (drawCollapsedStrip("##reveng_props_strip", "SUMMARY", propAutoFolded, drawPropW))
             revealColumn(/*rail=*/false);
     } else {
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(M::reCardPadX(), M::reCardPadY()));
@@ -2612,8 +3547,8 @@ void drawRevEngWorkspace(AppState& st) {
         ImGui::BeginChild("##reveng_props", ImVec2(drawPropW, 0.0f), ImGuiChildFlags_Border);
         ui::popGlassChildStyle();
         ImGui::PopStyleVar();
-        if (drawColumnHeader("Properties")) s.propsIntent = ColumnIntent::Collapsed;
-        drawPropertiesBody(st);
+        if (drawColumnHeader("Summary")) s.propsIntent = ColumnIntent::Collapsed;
+        drawSessionColumnBody(st);
         ImGui::EndChild();
     }
 }

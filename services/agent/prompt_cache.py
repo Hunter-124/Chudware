@@ -2,14 +2,14 @@
 
 Two lanes, two different prompts — never mirrored into each other:
 
-* **Online (Chudcode, every normal chat).** ``worker_rpc._agent_admin_turn``
+* **Online (Omp, every normal chat).** ``worker_rpc._agent_admin_turn``
   composes the role prompt with ``mission_dispatch.role_prompt`` and hands it to
-  Chudcode as ``append_system_prompt``; the CAD tools travel separately as
-  native host-tool definitions from ``chudcode_tools.build_host_tools``.
+  Omp as ``append_system_prompt``; the CAD tools travel separately as
+  native host-tool definitions from ``omp_tools.build_host_tools``.
   :func:`online_prompt` runs those same two calls for the main-chat defaults.
   :func:`baseline` (the GUI context meter) and ``prompt_preview`` report it, and
   :func:`warm` composes it ahead of the first message, which also pays the MCP
-  registry import the first turn would otherwise wait on. Chudcode adds its own
+  registry import the first turn would otherwise wait on. Omp adds its own
   system prompt and builtin tools, and may defer host-tool schemas, so every
   online figure here is an ESTIMATE of what CAD contributes, never a claim
   about the exact upstream token count.
@@ -47,11 +47,6 @@ from typing import Any
 
 from services import paths
 
-#: Name of the segment slot AFTER which request-dependent project-memory recall
-#: is spliced by ``run_turn``. Named rather than positional so the ordering can
-#: be re-arranged here without silently moving the memory block.
-MEMORY_SLOT = "role_catalog"
-
 #: Cache schema version. Bump when the meaning of a stored field changes; an
 #: entry written by an older version is discarded rather than misread.
 CACHE_VERSION = 3
@@ -79,8 +74,8 @@ _fp_cache: tuple[float, str] | None = None
 class Segment:
     """One labelled block of the static system prompt.
 
-    ``label`` is a stable id (used by :data:`MEMORY_SLOT` and by the GUI meter
-    tooltip); ``title`` is the human string the tooltip shows.
+    ``label`` is a stable id (used by the GUI meter tooltip); ``title`` is the
+    human string the tooltip shows.
     """
 
     label: str
@@ -112,9 +107,9 @@ class StaticPrompt:
     warnings: list[str] = field(default_factory=list)
 
     # -- composition ------------------------------------------------------
-    def render(self, *, memory_block: str = "") -> str:
-        """Assemble the full system prompt, splicing *memory_block* at its slot."""
-        return render_segments(self.segments, memory_block=memory_block)
+    def render(self) -> str:
+        """Assemble the full system prompt."""
+        return render_segments(self.segments)
 
     # -- reporting --------------------------------------------------------
     def breakdown(self) -> list[dict[str, Any]]:
@@ -307,19 +302,19 @@ def static_segments(
 ) -> tuple[list[Segment], list[str]]:
     """THE ordering definition for the static system prompt.
 
-    Returns ``(segments, warnings)``. Every block here is request-independent;
-    ``run_turn`` splices request-dependent project memory after the segment
-    named :data:`MEMORY_SLOT` and appends skill activation / Rules advisories
-    afterwards.
+    Returns ``(segments, warnings)``. Every block here is request-independent,
+    and so is everything ``run_turn`` appends to the system prompt afterwards
+    (the skills catalog): the system prompt of one conversation must be
+    byte-identical on every turn so a prefix-caching provider keeps its cache.
+    Request-dependent material — project-memory recall, skill activation — rides
+    at the tail of the current user message instead.
 
-    *include_catalog* mirrors ``run_turn``'s once-per-session behaviour: the
-    harness + role-catalog blocks are static within a session and are sent on
-    its FIRST turn only.
+    *include_catalog* selects the harness + role-catalog blocks (the main chat
+    gets them, sub-agents do not).
 
     *include_skills* controls the skills CATALOG block, defaulting to
-    *include_catalog*. ``run_turn`` passes ``False`` and emits it itself,
-    because there the catalog is interleaved with request-dependent skill
-    ACTIVATION and is gated on catalog-due alone (a subagent still gets it).
+    *include_catalog*. ``run_turn`` passes ``False`` and appends it itself,
+    because a role prompt composed by ``mission_dispatch`` may already carry it.
     Callers that want the whole static prompt — the cache, the meter baseline —
     leave it defaulted.
     """
@@ -351,15 +346,9 @@ def static_segments(
                 harness_context_block,
             )
             _add("harness", "Harness context", harness_context_block())
-            _add(MEMORY_SLOT, "Role catalog", format_role_catalog_block())
+            _add("role_catalog", "Role catalog", format_role_catalog_block())
         except Exception as exc:  # noqa: BLE001
             warn.append(f"role_catalog: {type(exc).__name__}: {exc}")
-
-    # The memory slot must exist even when the catalog blocks are suppressed,
-    # otherwise a non-first turn would silently drop the memory block instead
-    # of splicing it. An empty placeholder carries the slot without bytes.
-    if not any(s.label == MEMORY_SLOT for s in segs):
-        segs.append(Segment(MEMORY_SLOT, "Role catalog", ""))
 
     try:
         from services.agent.project_context import project_context_block  # noqa: PLC0415
@@ -392,8 +381,8 @@ def static_segments(
     return segs, warn
 
 
-def render_segments(segments: list[Segment], *, memory_block: str = "") -> str:
-    """Join *segments* into a system prompt, splicing *memory_block* at its slot.
+def render_segments(segments: list[Segment]) -> str:
+    """Join *segments* into a system prompt.
 
     The join rules are the live path's, reproduced deliberately rather than
     tidied, because ``run_turn`` calls this and the composed bytes must not
@@ -412,8 +401,6 @@ def render_segments(segments: list[Segment], *, memory_block: str = "") -> str:
                 out = out + seg.sep + seg.text
             else:
                 out = out.rstrip() + seg.sep + seg.text
-        if seg.label == MEMORY_SLOT and memory_block:
-            out = (out.rstrip() + "\n\n" + memory_block) if out else memory_block
     return out
 
 
@@ -463,11 +450,19 @@ def compose(
     # Session preferences BEFORE the tools render: a preference that drops a
     # tool must also drop its schema, or the model is shown a tool every call
     # to which will be refused.
+    composed_role_system = role_system
+    role_has_skills = False
     try:
         from services.agent.mission_dispatch import (  # noqa: PLC0415
             _apply_session_preferences,
         )
-        allowed, role_system = _apply_session_preferences(role, allowed, role_system)
+        original_allowed = allowed
+        allowed, witness = _apply_session_preferences(role, original_allowed, role_system)
+        _, composed_role_system = _apply_session_preferences(
+            role, original_allowed, role_system, include_skills=True,
+        )
+        role_system = witness
+        role_has_skills = True
     except Exception as exc:  # noqa: BLE001
         warn.append(f"session_preferences: {type(exc).__name__}: {exc}")
 
@@ -483,7 +478,8 @@ def compose(
 
     segs, seg_warn = static_segments(
         role=role, capability=capability, project_root=project_root,
-        role_system=role_system, tools_text=tools_text, allowed=allowed,
+        role_system=composed_role_system, tools_text=tools_text, allowed=allowed,
+        include_skills=False if role_has_skills else None,
     )
     return StaticPrompt(
         role=role,
@@ -578,11 +574,11 @@ _ONLINE_COMPOSE_RUN_ID = "prompt-baseline"
 
 @dataclass
 class OnlinePrompt:
-    """What CAD hands Chudcode for a fresh main-chat turn, before the request.
+    """What CAD hands Omp for a fresh main-chat turn, before the request.
 
     ``system`` is the ``append_system_prompt`` text; ``host_tools`` are the
     host-tool definitions (``name``/``description``/``parameters``) exactly as
-    ``chudcode_tools.build_host_tools`` produces them for ``set_custom_tools``.
+    ``omp_tools.build_host_tools`` produces them for ``set_custom_tools``.
     """
 
     role: str
@@ -626,18 +622,17 @@ def compose_online(*, role: str = "general_agent") -> OnlinePrompt:
     """Compose the online main-chat prompt and host tools for Settings defaults.
 
     The same calls ``worker_rpc._agent_admin_turn`` makes — env tier/capability,
-    ``mission_dispatch.role_prompt`` (Settings system-prompt override, mode/scope
-    tool policy, preference guidance, MORE TOOLS menu, skills catalog) and
-    ``chudcode_tools.build_host_tools`` — with the preferences an empty request
-    resolves to under the saved Settings. Per-turn inputs (picked mode, open
-    document, enabled categories) are not known here. Raises on failure.
+    ``mission_dispatch.role_prompt`` (Settings system-prompt override, MORE TOOLS
+    menu, skills catalog) and ``omp_tools.build_host_tools``. Both results are
+    session-stable, so this is the exact prefix of every turn that has not enabled
+    extra categories; per-turn policy rides the user message and is not known here.
+    Raises on failure.
     """
-    from services.agent.chudcode_tools import build_host_tools  # noqa: PLC0415
+    from services.agent.omp_tools import build_host_tools  # noqa: PLC0415
     from services.agent.mission_dispatch import (  # noqa: PLC0415
         MissionDispatch,
         role_prompt,
     )
-    from services.agent.preferences import resolve_turn_preferences  # noqa: PLC0415
     from services.agent.roles import load_role  # noqa: PLC0415
 
     warn: list[str] = []
@@ -656,22 +651,13 @@ def compose_online(*, role: str = "general_agent") -> OnlinePrompt:
         warn.append(f"capability: {type(exc).__name__}: {exc}")
 
     card = load_role(role)
-    preferences = resolve_turn_preferences("")
-    system, allowed = role_prompt(
-        role, card=card, capability=capability, preferences=preferences
-    )
-    options = {
-        "mode": preferences.mode,
-        "advisor": preferences.advisor,
-        "max_subagent_depth": preferences.delegation_depth,
-    }
+    system, allowed = role_prompt(role, card=card, capability=capability)
     mission_dispatch = MissionDispatch(
         run_id=_ONLINE_COMPOSE_RUN_ID,
         provider=None,
         on_event=None,
         capability=capability,
         tier=tier,
-        options=options,
     )
     bindings = build_host_tools({
         "role_card": card,
@@ -681,14 +667,13 @@ def compose_online(*, role: str = "general_agent") -> OnlinePrompt:
         "tier": tier,
         "actor": role,
         "run_id": _ONLINE_COMPOSE_RUN_ID,
-        "options": options,
-        "mode": options["mode"],
-        "turn_preferences": preferences,
         "categories": [],
         "enabled_categories": [],
     })
     host_tools = []
     for binding in bindings:
+        if not binding.active:
+            continue
         definition = binding.as_dict()
         host_tools.append({
             "name": definition["name"],
@@ -766,8 +751,8 @@ def baseline(*, role: str = "general_agent") -> dict[str, Any]:
     """Estimated CAD contribution to a fresh online chat, for the context meter.
 
     ``tokens`` estimates the online system prompt plus the host-tool
-    definitions CAD hands Chudcode (``estimate: true``, ~4 chars/token).
-    Chudcode's own system prompt and builtin tools come on top, and it may
+    definitions CAD hands Omp (``estimate: true``, ~4 chars/token).
+    Omp's own system prompt and builtin tools come on top, and it may
     defer host-tool schemas, so this is not the provider's exact prompt count.
     ``segments`` is the per-block breakdown the tooltip renders.
     """
@@ -785,7 +770,7 @@ def baseline(*, role: str = "general_agent") -> dict[str, Any]:
             "segments": op.breakdown(),
             "warnings": op.warnings,
             "note": ("Estimate of what CAD adds to a fresh online chat: its system "
-                     "prompt and host-tool definitions. Chudcode's own system "
+                     "prompt and host-tool definitions. Omp's own system "
                      "prompt and builtin tools are not included."),
         }
     except Exception as exc:  # noqa: BLE001

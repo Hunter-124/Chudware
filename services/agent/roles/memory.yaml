@@ -5,7 +5,6 @@ goal: >
   and brief notes — into project memory so later turns recall facts instead of re-deriving
   them. Never invent geometry or numbers.
 stage_scope: [deliver]
-playbook_default: null
 tool_allowlist:
   - tool: ledger_get
   - tool: ledger_note

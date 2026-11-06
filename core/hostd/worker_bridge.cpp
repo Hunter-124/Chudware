@@ -22,19 +22,43 @@ namespace hostd {
 
 std::atomic<bool> WorkerBridge::agentCreated_{false};
 std::atomic<bool> WorkerBridge::generalCreated_{false};
+std::atomic<bool> WorkerBridge::serviceCreated_{false};
+
+namespace {
+// Serializes child identity snapshots with reaping and generation publication.
+// A peer PID cannot be recycled until its old child has been reaped.
+std::mutex workerIdentityMutex;
+std::uint64_t nextWorkerGeneration = 0;
+}
 
 struct WorkerBridge::AgentPool {
     struct Slot {
         bool reserved = false;
         bool reaping = false;
         std::string sessionId;
+        std::uint64_t reservation = 0;
         std::chrono::steady_clock::time_point lastEnded = std::chrono::steady_clock::now();
+    };
+    struct PendingTurn {
+        const nlohmann::json* params;
+        nlohmann::json delegate;
+        bool cancelled = false;
+        bool started = false;
+    };
+    struct FrozenOwner {
+        WorkerBridge* bridge;
+        long pid;
+        std::uint64_t generation;
     };
     std::mutex mutex;
     std::condition_variable changed;
     std::vector<WorkerBridge*> extras;
     std::unordered_map<WorkerBridge*, Slot> slots;
     std::unordered_map<std::string, WorkerBridge*> owners;
+    std::unordered_map<std::string, std::shared_ptr<PendingTurn>> pendingTurns;
+    // Once a desktop soft drain starts, these sessions must not migrate to a
+    // different worker whose new MCP sockets cannot be admitted.
+    std::unordered_map<std::string, FrozenOwner> drainOwners;
     bool stopping = false;
     const int cap = [] {
         const char* value = std::getenv("CHUDWARE_AGENT_WORKERS");
@@ -52,6 +76,57 @@ struct WorkerBridge::AgentPool {
 WorkerBridge::AgentPool& WorkerBridge::pool() {
     static AgentPool state;
     return state;
+}
+
+std::vector<WorkerBridge::AgentPeer> WorkerBridge::snapshotAgentPeers() {
+    std::vector<AgentPeer> peers;
+    auto& state = pool();
+    std::lock_guard<std::mutex> poolLock(state.mutex);
+    std::lock_guard<std::mutex> identityLock(workerIdentityMutex);
+    state.drainOwners.clear();
+    for (const auto& [session, bridge] : state.owners) {
+        const auto slot = state.slots.find(bridge);
+        if (slot == state.slots.end() || slot->second.reaping) continue;
+        const long pid = bridge->livePid_.load(std::memory_order_acquire);
+        if (pid > 0 && bridge->processGeneration_ != 0) {
+            peers.push_back({pid, bridge->processGeneration_, session, 0});
+            state.drainOwners.emplace(session, AgentPool::FrozenOwner{
+                bridge, pid, bridge->processGeneration_});
+        }
+    }
+    // Anonymous turns have no durable owner entry, but their active reservation
+    // must still be able to finish. It ceases to authorize when the turn ends.
+    for (const auto& [bridge, slot] : state.slots) {
+        if (!slot.reserved || slot.reaping || !slot.sessionId.empty()) continue;
+        const long pid = bridge->livePid_.load(std::memory_order_acquire);
+        if (pid > 0 && bridge->processGeneration_ != 0)
+            peers.push_back({pid, bridge->processGeneration_, {}, slot.reservation});
+    }
+    state.changed.notify_all();
+    return peers;
+}
+
+bool WorkerBridge::ownsAgentPeer(const std::vector<AgentPeer>& snapshot, long peerPid) {
+    if (peerPid <= 0) return false;
+    auto& state = pool();
+    std::lock_guard<std::mutex> poolLock(state.mutex);
+    std::lock_guard<std::mutex> identityLock(workerIdentityMutex);
+    for (const AgentPeer& peer : snapshot) {
+        if (peer.pid != peerPid) continue;
+        for (const auto& [bridge, slot] : state.slots) {
+            if (slot.reaping || bridge->processGeneration_ != peer.generation ||
+                bridge->livePid_.load(std::memory_order_acquire) != peerPid)
+                continue;
+            if (peer.sessionId.empty()) {
+                if (slot.reserved && slot.sessionId.empty() &&
+                    slot.reservation == peer.reservation) return true;
+            } else {
+                const auto owner = state.owners.find(peer.sessionId);
+                if (owner != state.owners.end() && owner->second == bridge) return true;
+            }
+        }
+    }
+    return false;
 }
 
 // Registry lifetime is independent of request threads. A request holds its generation
@@ -193,6 +268,12 @@ WorkerBridge& WorkerBridge::agent() {
     return bridge;
 }
 
+WorkerBridge& WorkerBridge::service() {
+    static WorkerBridge bridge(false, false, nlohmann::json::object(), /*serviceLane=*/true);
+    serviceCreated_.store(true, std::memory_order_release);
+    return bridge;
+}
+
 WorkerBridge& WorkerBridge::general() {
     static WorkerBridge bridge(false);
     generalCreated_.store(true, std::memory_order_release);
@@ -201,14 +282,16 @@ WorkerBridge& WorkerBridge::general() {
 
 bool WorkerBridge::isAgentMethod(const std::string& method) {
     // Reviewed against worker_main._METHODS registrations. These families share
-    // Chudcode sessions, the agent prompt cache, subscription login progress,
+    // OMP sessions, the agent prompt cache, subscription login progress,
     // benchmark subprocesses, or agent/subagent/DAG control state. The only
     // non-family exceptions are the control endpoint and trigger rule creation.
+    // (isServiceMethod carves the session-free calls out for the desktop; actor cells keep
+    // every method here, on their own primary.)
     // office_extract and all other registered worker families (PLM, printer,
     // parts, reveng, sim, deliverables, run_model, prompts) use general.
     static constexpr const char* agentPrefixes[] = {
-        "agent_", "chudcode_", "session_", "subscription_", "skills_",
-        "triggers_", "packs_", "ai_roles_", "model_rankings_", "bench_",
+        "agent_", "omp_", "session_", "subscription_", "skills_",
+        "triggers_", "packs_", "ai_roles_", "bench_",
         "memory_", "subagent_", "dag_", "ai_prompt_", "ai_tool_",
     };
     if (method == "worker_control_info" || method == "rule_create")
@@ -234,7 +317,37 @@ bool WorkerBridge::isAgentMethod(const std::string& method) {
     return false;
 }
 
+bool WorkerBridge::isServiceMethod(const std::string& method) {
+    // Calls the GUI polls and the user triggers while an agent turn holds the agent lane
+    // (provider and model discovery, sign-in/out and key save, model assignments, subscription
+    // accounts and usage, skills). A turn occupies its worker's stdio for hours, and every
+    // other call on that worker is refused at once, so these must not share it.
+    //
+    // Invariant that makes the move safe: none of them reads or writes an in-memory agent
+    // session. The OMP auth/catalog calls go to the shared no-session OMP service process
+    // (a separate process from every session's runtime, so credentials already cross processes
+    // through the on-disk auth store); ai_roles_* and skills_* read and write config.json and
+    // the skills trees (prompt_cache.fingerprint is the cross-process invalidation backstop);
+    // subscription_* keeps its live login progress in ONE worker, so EVERY subscription_*
+    // method must be listed together — never split the family. Methods that touch a session
+    // (omp_session_stats, omp_export_session, session_*, agent_*) stay on the agent lane and
+    // follow their conversation's worker. Keep this list explicit: a new method joins it only
+    // if it keeps the invariant.
+    static constexpr const char* exactNames[] = {
+        "omp_provider_list", "omp_auth_state", "omp_set_key", "omp_remove_key",
+        "omp_logout_accounts", "omp_logout", "omp_login", "omp_models_list",
+        "ai_roles_get", "ai_roles_set",
+    };
+    for (const char* name : exactNames)
+        if (method == name) return true;
+    static constexpr const char* prefixes[] = {"subscription_", "skills_"};
+    for (const char* prefix : prefixes)
+        if (method.compare(0, std::strlen(prefix), prefix) == 0) return true;
+    return false;
+}
+
 WorkerBridge& WorkerBridge::forMethod(const std::string& method) {
+    if (isServiceMethod(method)) return service();
     return isAgentMethod(method) ? agent() : general();
 }
 
@@ -261,6 +374,7 @@ void WorkerBridge::shutdownIfCreated() {
     for (auto* bridge : extras) stops.emplace_back([bridge] { bridge->stop(); });
     if (agentCreated_.load(std::memory_order_acquire)) agent().stop();
     if (generalCreated_.load(std::memory_order_acquire)) general().stop();
+    if (serviceCreated_.load(std::memory_order_acquire)) service().stop();
     for (auto& thread : stops) thread.join();
 }
 
@@ -312,6 +426,7 @@ WorkerBridge::Activity WorkerBridge::activity() {
     }
     if (agentCreated_.load(std::memory_order_acquire)) visit(&agent(), &pool());
     if (generalCreated_.load(std::memory_order_acquire)) visit(&general(), nullptr);
+    if (serviceCreated_.load(std::memory_order_acquire)) visit(&service(), nullptr);
     std::vector<WorkerBridge*> extras;
     {
         auto& state = pool();
@@ -334,6 +449,10 @@ void WorkerBridge::reapIdleExtras(AgentPool& state) {
             const auto now = std::chrono::steady_clock::now();
             for (auto* bridge : state.extras) {
                 auto& slot = state.slots.at(bridge);
+                const bool drainOwner = std::any_of(
+                    state.drainOwners.begin(), state.drainOwners.end(),
+                    [bridge](const auto& entry) { return entry.second.bridge == bridge; });
+                if (drainOwner) continue;
                 if (slot.reserved || slot.reaping ||
                     now - slot.lastEnded <= std::chrono::minutes(10))
                     continue;
@@ -347,7 +466,7 @@ void WorkerBridge::reapIdleExtras(AgentPool& state) {
         }
         if (!idle) return;
         // Its conversations stay owned until the child has exited: the stopping worker's
-        // Chudcode processes write their session files on the way out, and another worker
+        // OMP processes write their session files on the way out, and another worker
         // resuming one of them before that write would fork its history.
         std::uint64_t active = 0;
         bool safe = !idle->running_;
@@ -414,16 +533,53 @@ bool WorkerBridge::dispatch(const std::string& method, const nlohmann::json& par
         }
         return bridge->call(method, params, result, err, timeoutMs, onEvent, ctx);
     }
+    const auto rid = params.find("run_id");
+    if (rid == params.end() || !rid->is_string() || rid->get_ref<const std::string&>().empty()) {
+        err = "agent_admin_turn requires a non-empty run_id";
+        return false;
+    }
+    const std::string runId = rid->get<std::string>();
+    auto pending = std::make_shared<AgentPool::PendingTurn>();
+    pending->params = &params;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (!state.pendingTurns.emplace(runId, pending).second) {
+            err = "agent run_id is already active";
+            result = {{"code", "run_id_busy"}, {"message", err}};
+            return false;
+        }
+    }
+    struct PendingGuard {
+        AgentPool& state;
+        const std::string& id;
+        ~PendingGuard() {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.pendingTurns.erase(id);
+        }
+    } pendingGuard{state, runId};
+    const auto cancelledBeforeStart = [&] {
+        result = {{"ok", true}, {"turn", {{"success", false}, {"cancelled", true},
+                  {"outcome", "cancelled"}, {"stop_reason", "cancelled"},
+                  {"run_id", runId}, {"session_id", sid}}}};
+        if (pending->delegate.is_object()) {
+            result["turn"]["reason"] = "manager_stop";
+            result["turn"]["stop_reason"] = "manager_stop";
+            result["turn"]["control_delegate"] = pending->delegate;
+        }
+        return true;
+    };
 
+    const bool maintenance = params.contains("compact") && params["compact"].is_object();
     if (timeoutMs == 0) timeoutMs = lanes ? -1 : 120000;
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(timeoutMs < 0 ? 0 : timeoutMs);
     reapIdleExtras(state);
     WorkerBridge* chosen = nullptr;
-    // A conversation's live Chudcode runtime must exist in ONE worker. When its owner is busy
+    // A conversation's live OMP runtime must exist in ONE worker. When its owner is busy
     // with another conversation, the turn moves to a free worker only after the owner has
     // released (disposed) its idle runtime; otherwise both would append to one session file
-    // from different leaves and fork the history. Owner unreachable -> wait for the owner.
+    // from different leaves and fork the history. Owner unreachable -> wait for ordinary
+    // turns, but refuse maintenance before queueing it behind an unbounded run.
     bool ownerOnly = false;
     for (;;) {
         WorkerBridge* previousOwner = nullptr;
@@ -431,6 +587,7 @@ bool WorkerBridge::dispatch(const std::string& method, const nlohmann::json& par
             std::unique_lock<std::mutex> lock(state.mutex);
             state.slots.try_emplace(&primary);
             for (;;) {
+                if (pending->cancelled) return cancelledBeforeStart();
                 if (state.stopping) {
                     err = "worker bridge stopping";
                     return false;
@@ -439,10 +596,28 @@ bool WorkerBridge::dispatch(const std::string& method, const nlohmann::json& par
                 previousOwner = nullptr;
                 bool waitForOwner = false;
                 const auto owner = sid.empty() ? state.owners.end() : state.owners.find(sid);
+                const auto frozen = state.drainOwners.find(sid);
+                if (frozen != state.drainOwners.end()) {
+                    if (owner == state.owners.end() || owner->second != frozen->second.bridge) {
+                        err = "agent session changed worker during a stale-binary drain";
+                        result = {{"code", "daemon_draining"}, {"reason", "stale_binary"},
+                                  {"message", err}};
+                        return false;
+                    }
+                    std::lock_guard<std::mutex> identityLock(workerIdentityMutex);
+                    if (owner->second->livePid_.load(std::memory_order_acquire) != frozen->second.pid ||
+                        owner->second->processGeneration_ != frozen->second.generation) {
+                        err = "agent session's worker ended during a stale-binary drain";
+                        result = {{"code", "daemon_draining"}, {"reason", "stale_binary"},
+                                  {"message", err}};
+                        return false;
+                    }
+                }
                 if (owner != state.owners.end()) {
                     const auto& slot = state.slots.at(owner->second);
                     if (!slot.reserved && !slot.reaping) chosen = owner->second;
-                    else waitForOwner = ownerOnly || slot.reaping || slot.sessionId == sid;
+                    else waitForOwner = frozen != state.drainOwners.end() ||
+                                        ownerOnly || slot.reaping || slot.sessionId == sid;
                     if (!chosen && !waitForOwner) previousOwner = owner->second;
                 }
                 if (!chosen && !waitForOwner) {
@@ -468,9 +643,19 @@ bool WorkerBridge::dispatch(const std::string& method, const nlohmann::json& par
                 if (chosen) {
                     auto& slot = state.slots.at(chosen);
                     slot.reserved = true;
+                    if (++slot.reservation == 0) ++slot.reservation;
                     slot.sessionId = sid;
                     if (!sid.empty()) state.owners[sid] = chosen;
                     break;
+                }
+                if (maintenance) {
+                    err = waitForOwner
+                              ? "Compaction not started: this conversation's agent is busy. "
+                                "Let its current run finish or stop it before compacting."
+                              : "Compaction not started: all agent workers are busy. "
+                                "Try again after a run finishes.";
+                    result = nlohmann::json{{"code", "worker_lane_busy"}, {"message", err}};
+                    return false;
                 }
                 if (timeoutMs < 0) state.changed.wait(lock);
                 else if (state.changed.wait_until(lock, deadline) == std::cv_status::timeout) {
@@ -500,7 +685,22 @@ bool WorkerBridge::dispatch(const std::string& method, const nlohmann::json& par
         WorkerBridge* bridge;
         ~TurnReservation() { WorkerBridge::releaseTurn(state, bridge); }
     } reservation{state, chosen};
-    return chosen->call(method, params, result, err, timeoutMs, onEvent, ctx);
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (pending->cancelled) return cancelledBeforeStart();
+    }
+    auto admitTurn = [&] {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (pending->cancelled) return false;
+        pending->started = true;
+        return true;
+    };
+    const bool called = chosen->call(method, params, result, err, timeoutMs, onEvent, ctx, admitTurn);
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (pending->cancelled && !pending->started) return cancelledBeforeStart();
+    }
+    return called;
 }
 
 }  // namespace hostd
@@ -615,7 +815,7 @@ bool sameCanonicalPath(const std::string& left, const std::string& right) {
 constexpr size_t kControlRequestLimit = 64 * 1024;
 constexpr size_t kControlResponseLimit = 256 * 1024;
 constexpr auto kControlTimeout = std::chrono::milliseconds(2500);
-// release stops a live Chudcode process, which flushes its session file before exiting.
+// release stops a live OMP process, which flushes its session file before exiting.
 constexpr auto kReleaseTimeout = std::chrono::milliseconds(15000);
 
 void wipeString(std::string& value) {
@@ -659,8 +859,10 @@ bool validControlInfo(const std::string& transport, const std::string& endpoint,
 }
 
 #ifndef _WIN32
-// The caller owns the cell lane and is the sole waitpid owner.
-void terminateCellProcess(pid_t pid) {
+// The caller owns the worker's lane and is the sole waitpid owner. Every worker leads its
+// own process group (spawn setpgid). Bounded: a worker wedged in interpreter finalization
+// ignores SIGTERM, and an unbounded waitpid there wedged hostd's drain exit (2026-10-26).
+void terminateWorkerProcess(pid_t pid) {
     ::kill(-pid, SIGTERM);
     ::kill(pid, SIGTERM);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -705,7 +907,7 @@ bool sendControlRequest(const std::string& transport, const std::string& endpoin
     err.clear();
     if (!validControlInfo(transport, endpoint, token) ||
         (action != "cancel" && action != "steer" && action != "answer" &&
-         action != "status" && action != "release") ||
+         action != "status" && action != "release" && action != "apply_compaction_policy") ||
         !params.is_object()) {
         err = "worker control information is invalid";
         return false;
@@ -908,6 +1110,40 @@ bool WorkerBridge::controlActiveRun(const std::string& action, const json& param
     auto& state = lanes ? lanes->state : pool();
     {
         std::lock_guard<std::mutex> lock(state.mutex);
+        if (action == "cancel" && params.is_object()) {
+            const auto run = params.find("run_id");
+            if (run != params.end() && run->is_string()) {
+                const auto found = state.pendingTurns.find(run->get_ref<const std::string&>());
+                if (found != state.pendingTurns.end() && !found->second->started) {
+                    const auto key = params.find("byok_key");
+                    if (key != params.end()) {
+                        for (const char* field : {"byok_key", "byok_provider", "byok_tenant"}) {
+                            const auto supplied = params.find(field);
+                            const auto original = found->second->params->find(field);
+                            if ((supplied == params.end()) != (original == found->second->params->end()) ||
+                                (supplied != params.end() && *supplied != *original)) {
+                                matched = true;
+                                err = "not_found";
+                                return false;
+                            }
+                        }
+                    }
+                    if (!found->second->cancelled && ctx.is_object() &&
+                        ctx.contains("control_delegate") && ctx["control_delegate"].is_object())
+                        found->second->delegate = ctx["control_delegate"];
+                    found->second->cancelled = true;
+                    matched = true;
+                    result = {{"ok", true}, {"run_id", *run}, {"cancelled", true}, {"active", false}};
+                    if (found->second->delegate.is_object()) {
+                        result["reason"] = "manager_stop";
+                        result["stop_reason"] = "manager_stop";
+                        result["control_delegate"] = found->second->delegate;
+                    }
+                    state.changed.notify_all();
+                    return true;
+                }
+            }
+        }
         if (lanes) bridges.push_back(lanes->primary);
         else if (agentCreated_.load(std::memory_order_acquire)) bridges.push_back(&agent());
         bridges.insert(bridges.end(), state.extras.begin(), state.extras.end());
@@ -919,10 +1155,122 @@ bool WorkerBridge::controlActiveRun(const std::string& action, const json& param
     return false;
 }
 
+json WorkerBridge::applyCompactionPolicy(const json& params, const json& ctx) {
+    std::string lookupError;
+    std::shared_ptr<ActorLanes> lanes;
+    if (ctx.is_object() && ctx.value("cell", false)) {
+        lanes = actorLanes(ctx, false, lookupError);
+        if (!lanes && !lookupError.empty())
+            return {{"ok", false}, {"sessions", json::array()}, {"workers", json::array()},
+                    {"reason", lookupError}};
+        if (!lanes)
+            return {{"ok", true}, {"sessions", json::array()}, {"workers", json::array()}};
+    }
+    auto& state = lanes ? lanes->state : pool();
+    struct Target {
+        WorkerBridge* bridge;
+        std::string activeSession;
+        std::vector<std::string> sessions;
+    };
+    std::vector<Target> targets;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (state.stopping)
+            return {{"ok", false}, {"sessions", json::array()}, {"workers", json::array()},
+                    {"reason", "worker bridge stopping"}};
+        std::vector<WorkerBridge*> bridges;
+        if (lanes) bridges.push_back(lanes->primary);
+        else if (agentCreated_.load(std::memory_order_acquire)) bridges.push_back(&agent());
+        bridges.insert(bridges.end(), state.extras.begin(), state.extras.end());
+        for (auto* bridge : bridges) {
+            const auto slot = state.slots.find(bridge);
+            const bool reserved = slot != state.slots.end() &&
+                                  (slot->second.reserved || slot->second.reaping);
+            if (!reserved && bridge->livePid_.load(std::memory_order_acquire) <= 0) continue;
+            Target target{bridge, slot != state.slots.end() && slot->second.reserved
+                                     ? slot->second.sessionId : std::string(), {}};
+            for (const auto& owner : state.owners)
+                if (owner.second == bridge) target.sessions.push_back(owner.first);
+            targets.push_back(std::move(target));
+        }
+    }
+    std::vector<json> reports(targets.size());
+    std::vector<std::thread> calls;
+    calls.reserve(targets.size());
+    for (size_t i = 0; i < targets.size(); ++i) {
+        calls.emplace_back([&, i] {
+            auto* bridge = targets[i].bridge;
+            ControlInfo info;
+            {
+                std::lock_guard<std::mutex> lock(bridge->controlMtx_);
+                info = bridge->control_;
+            }
+            struct Wipe { ControlInfo& info; ~Wipe() { wipeString(info.token); } } wipe{info};
+            json response;
+            std::string err;
+            if (info.token.empty()) err = "worker control endpoint unavailable";
+            else if (!sendControlRequest(info.transport, info.endpoint, info.token,
+                                         "apply_compaction_policy", params,
+                                         response, err, ctx)) {}
+            else if (!response.is_object() || !response.contains("ok") ||
+                     !response["ok"].is_boolean())
+                err = "worker returned invalid policy acknowledgement";
+            else if (!response.contains("sessions") || !response["sessions"].is_array()) {
+                if (!response["ok"].get<bool>() && response.value("reason", json()).is_string())
+                    err = response["reason"].get<std::string>();
+                if (err.empty())
+                    err = "worker returned invalid policy acknowledgement";
+            }
+            if (!err.empty()) {
+                json pending = json::array();
+                for (const auto& session : targets[i].sessions)
+                    pending.push_back({{"session_id", session}, {"ok", false},
+                                       {"status", "pending"}, {"reason", err}});
+                reports[i] = {{"ok", false}, {"status", "pending"}, {"reason", err},
+                              {"sessions", std::move(pending)}};
+            } else {
+                // A reserved turn may not yet have registered its runtime when
+                // this snapshot is taken. Do not acknowledge it as applied.
+                if (!targets[i].activeSession.empty()) {
+                    bool found = false;
+                    for (const auto& session : response["sessions"])
+                        if (session.is_object() &&
+                            session.value("session_id", std::string()) == targets[i].activeSession)
+                            found = true;
+                    if (!found) {
+                        response["ok"] = false;
+                        response["sessions"].push_back({
+                            {"session_id", targets[i].activeSession}, {"ok", false},
+                            {"status", "pending"}, {"reason", "session not yet registered"}});
+                    }
+                }
+                reports[i] = std::move(response);
+            }
+        });
+    }
+    for (auto& call : calls) call.join();
+    json workers = json::array(), sessions = json::array();
+    bool allApplied = true;
+    for (size_t i = 0; i < reports.size(); ++i) {
+        auto& report = reports[i];
+        const bool valid = report.value("ok", false);
+        allApplied = allApplied && valid;
+        for (auto session : report["sessions"]) {
+            if (!session.is_object() || !session.contains("ok") || !session["ok"].is_boolean() ||
+                !session["ok"].get<bool>()) allApplied = false;
+            if (session.is_object()) session["worker"] = i;
+            sessions.push_back(std::move(session));
+        }
+        report["worker"] = i;
+        workers.push_back(std::move(report));
+    }
+    return {{"ok", allApplied}, {"sessions", std::move(sessions)}, {"workers", std::move(workers)}};
+}
+
 bool WorkerBridge::releaseSession(const std::string& sessionId, std::string& err,
                                   const json& ctx) {
     err.clear();
-    // No child: its Chudcode processes died with it, nothing is live to release.
+    // No child: its OMP processes died with it, nothing is live to release.
     if (livePid_.load(std::memory_order_acquire) <= 0) return true;
     // Copied out: releasing can take seconds, and Stop for this worker's own running turn
     // must not wait behind it on controlMtx_.
@@ -1041,6 +1389,10 @@ void WorkerBridge::stop() {
 
 void WorkerBridge::stopChildLocked() {
     clearControlState();
+    {
+        std::lock_guard<std::mutex> lock(workerIdentityMutex);
+        livePid_.store(-1, std::memory_order_release);
+    }
 #ifdef _WIN32
     if (childStdinWr_) {
         // EOF runs worker_main's shutdown/finally without risking a blocking
@@ -1074,13 +1426,7 @@ void WorkerBridge::stopChildLocked() {
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        if (!reaped) {
-            if (!identity_.empty()) terminateCellProcess(process_);
-            else {
-                ::kill(process_, SIGTERM);
-                waitpid(process_, nullptr, 0);
-            }
-        }
+        if (!reaped) terminateWorkerProcess(process_);
         process_ = -1;
         livePid_.store(-1, std::memory_order_release);
     }
@@ -1096,6 +1442,11 @@ void WorkerBridge::stopChildLocked() {
 void WorkerBridge::reap() {
     // Caller holds mtx_. Tear down without the graceful shutdown write (child
     // already dead or pipe broken).
+    {
+        // Invalidate before any wait/handle close can permit PID reuse.
+        std::lock_guard<std::mutex> lock(workerIdentityMutex);
+        livePid_.store(-1, std::memory_order_release);
+    }
 #ifdef _WIN32
     // Closing the noninherited job also kills straggling grandchildren after an
     // ordinary worker exit; no RPC process may survive its owning generation.
@@ -1128,11 +1479,7 @@ void WorkerBridge::reap() {
         int status = 0;
         pid_t r = waitpid(process_, &status, WNOHANG);
         if (r == 0) {
-            if (!identity_.empty()) terminateCellProcess(process_);
-            else {
-                ::kill(process_, SIGTERM);
-                waitpid(process_, nullptr, 0);
-            }
+            terminateWorkerProcess(process_);
         } else if (r < 0 && errno != ECHILD) {
             // best-effort
             ::kill(process_, SIGKILL);
@@ -1160,6 +1507,7 @@ bool WorkerBridge::childAlive() {
     return process_ && WaitForSingleObject(process_, 0) == WAIT_TIMEOUT;
 #else
     if (process_ < 0) return false;
+    std::lock_guard<std::mutex> identityLock(workerIdentityMutex);
     const pid_t reaped = ::waitpid(process_, nullptr, WNOHANG);
     if (reaped == process_ || (reaped < 0 && errno == ECHILD)) {
         process_ = -1;
@@ -1292,7 +1640,7 @@ std::string windowsPython() {
 // exits, not the process. hostd serves every connection on its own thread, so a worker
 // forked while serving a short-lived connection was SIGKILLed the moment that client
 // disconnected (2026-10-12: every agent worker died right after its turn's client
-// closed, and the next turn paid a respawn and lost its live Chudcode sessions). All
+// closed, and the next turn paid a respawn and lost its live OMP sessions). All
 // worker forks therefore run on one thread that lives as long as hostd (the same handoff
 // ChildSupervisor::reaperLoop uses). The child body runs in the forked copy of this
 // process, where the caller's stack is still mapped.
@@ -1473,7 +1821,9 @@ bool WorkerBridge::spawn(std::string& err) {
     std::wstring command = L"\"" + launcher + L"\"" +
         (compiledWorker_ ? L" --module worker" : L" -m services.worker_main");
     const auto directory = std::filesystem::u8path(repo_).wstring();
-    auto environment = workerEnvironment(turnWorker_ ? L"agent-turn" : agentLane_ ? L"agent" : L"general");
+    const std::string laneAscii = laneName();
+    const std::wstring laneWide(laneAscii.begin(), laneAscii.end());
+    auto environment = workerEnvironment(laneWide.c_str());
     PROCESS_INFORMATION created{};
     // CREATE_NO_WINDOW still allocates a conhost child. Explicit private stdio
     // needs no console; detaching avoids that idle resource and unknown census entry.
@@ -1497,10 +1847,13 @@ bool WorkerBridge::spawn(std::string& err) {
         return false;
     }
     {
+        std::lock_guard<std::mutex> identityLock(workerIdentityMutex);
         std::lock_guard<std::mutex> lock(nativeMtx_);
         process_ = process.release();
         childJob_ = job.release();
         livePid_.store(static_cast<long>(created.dwProcessId), std::memory_order_release);
+        if (++nextWorkerGeneration == 0) ++nextWorkerGeneration;
+        processGeneration_ = nextWorkerGeneration;
     }
     childStdoutRd_ = outRead.release();
     childStdinWr_ = inWrite.release();
@@ -1531,7 +1884,7 @@ bool WorkerBridge::spawn(std::string& err) {
         cellEnv = {
             "PATH=/opt/chudware/bin:/usr/bin:/bin", "LANG=C.UTF-8", "LC_ALL=C.UTF-8",
             "HOME=/actor/home", "XDG_DATA_HOME=/actor/data", "XDG_CONFIG_HOME=/actor/config",
-            "XDG_RUNTIME_DIR=/actor/run", "CHUDWARE_CHUDCODE_BIN=/opt/chudware/bin/chud",
+            "XDG_RUNTIME_DIR=/actor/run", "CHUDWARE_OMP_BIN=/opt/chudware/bin/omp",
             "XDG_CACHE_HOME=/actor/cache", "TMPDIR=/tmp", "CHUDWARE_CELL=1",
             "CHUDWARE_HOSTD_SOCKET=/actor/run/hostd.sock",
             "CHUDWARE_NATIVE_ROOT=/work", "CHUDWARE_FS_ROOT=/work",
@@ -1539,8 +1892,7 @@ bool WorkerBridge::spawn(std::string& err) {
             "CHUDWARE_WORKSPACE_KEY=" + identity_["workspace_key"].get<std::string>(),
             "CHUDWARE_ACTOR_KEY=" + identity_["actor_key"].get<std::string>(),
             "CHUDWARE_ACTOR_HEX=" + actorHex,
-            std::string("CHUDWARE_HOSTD_WORKER_LANE=") +
-                (turnWorker_ ? "agent-turn" : agentLane_ ? "agent" : "general")};
+            std::string("CHUDWARE_HOSTD_WORKER_LANE=") + laneName()};
         for (auto& value : cellEnv) cellEnvp.push_back(value.data());
         cellEnvp.push_back(nullptr);
         cellArgv = {const_cast<char*>(actorLauncher), actorHex.data(),
@@ -1579,8 +1931,7 @@ bool WorkerBridge::spawn(std::string& err) {
         }
         // This role belongs to the spawned child, not the hostd environment:
         // desktop/standalone workers continue to start with their full lifecycle.
-        if (::setenv("CHUDWARE_HOSTD_WORKER_LANE",
-                     turnWorker_ ? "agent-turn" : agentLane_ ? "agent" : "general", 1) != 0)
+        if (::setenv("CHUDWARE_HOSTD_WORKER_LANE", laneName(), 1) != 0)
             _exit(127);
         if (compiledWorker_)
             execlp(workerBin_.c_str(), workerBin_.c_str(), "--module", "worker", (char*)nullptr);
@@ -1606,8 +1957,13 @@ bool WorkerBridge::spawn(std::string& err) {
     ::close(inPipe[0]);
     ::close(outPipe[1]);
     fcntl(outPipe[0], F_SETFL, O_NONBLOCK);
-    process_ = pid;
-    livePid_.store(pid, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> identityLock(workerIdentityMutex);
+        process_ = pid;
+        livePid_.store(pid, std::memory_order_release);
+        if (++nextWorkerGeneration == 0) ++nextWorkerGeneration;
+        processGeneration_ = nextWorkerGeneration;
+    }
     childStdoutRd_ = outPipe[0];
     childStdinWr_ = inPipe[1];
     #endif
@@ -1616,7 +1972,7 @@ bool WorkerBridge::spawn(std::string& err) {
     discardingLine_ = false;
     running_ = true;
     log().line("worker_bridge: spawned %s services.worker_main pid=%d launcher=%s repo=%s",
-               agentLane_ ? "agent" : "general", static_cast<int>(pid),
+               laneName(), static_cast<int>(pid),
                workerBin_.c_str(), repo_.c_str());
     return true;
 }
@@ -1739,11 +2095,18 @@ bool WorkerBridge::readLine(std::string& line, int timeoutMs, bool* malformed, s
             return false;
         }
         if (pr == 0) {
-            int status = 0;
-            pid_t r = (process_ >= 0) ? waitpid(process_, &status, WNOHANG) : -1;
-            if (r == process_ || (r < 0 && errno == ECHILD)) {
-                process_ = -1;
-                livePid_.store(-1, std::memory_order_release);
+            bool dead = false;
+            {
+                std::lock_guard<std::mutex> identityLock(workerIdentityMutex);
+                int status = 0;
+                pid_t r = (process_ >= 0) ? waitpid(process_, &status, WNOHANG) : -1;
+                dead = r == process_ || (r < 0 && errno == ECHILD);
+                if (dead) {
+                    process_ = -1;
+                    livePid_.store(-1, std::memory_order_release);
+                }
+            }
+            if (dead) {
                 char chunk[4096];
                 ssize_t got = ::read(childStdoutRd_, chunk, sizeof(chunk));
                 if (got > 0) {
@@ -1995,7 +2358,7 @@ bool WorkerBridge::callOnce(const std::string& method, const json& params, json&
 
 bool WorkerBridge::call(const std::string& method, const json& params, json& result,
                         std::string& err, int timeoutMs, const EventFn& onEvent,
-                        const json& ctx) {
+                        const json& ctx, const std::function<bool()>& admitTurn) {
 #ifdef _WIN32
     if (!identity_.empty() || (ctx.is_object() && ctx.value("cell", false))) {
         err = "cell workers are unsupported on Windows";
@@ -2026,14 +2389,19 @@ bool WorkerBridge::call(const std::string& method, const json& params, json& res
             std::lock_guard<std::mutex> controlLock(controlMtx_);
             turnActive = !activeWorkerRunId_.empty();
         }
+        // An interactive sign-in (omp_login) occupies the service worker until the user
+        // finishes the browser step. Like a turn, it is a hold of unknown length: refuse at
+        // once rather than let every provider poll queue for its whole timeout behind it.
+        const bool signInActive = exclusiveCall_.load(std::memory_order_acquire);
         if (stopping_.load(std::memory_order_acquire)) {
             err = "worker bridge stopping";
             return false;
         }
-        if ((turnActive && !longAgentTurn) ||
+        if (((turnActive || signInActive) && !longAgentTurn) ||
             (!unbounded && std::chrono::steady_clock::now() >= laneDeadline)) {
             err = turnActive ? "worker lane busy (agent turn in progress)"
-                             : "worker lane busy";
+                  : signInActive ? "worker lane busy (sign-in in progress)"
+                                 : "worker lane busy";
             result = json{{"code", "worker_lane_busy"}, {"message", err}};
             return false;
         }
@@ -2044,6 +2412,12 @@ bool WorkerBridge::call(const std::string& method, const json& params, json& res
         err = "worker bridge stopping";
         return false;
     }
+    struct ExclusiveCall {
+        std::atomic<bool>& flag;
+        bool held;
+        ~ExclusiveCall() { if (held) flag.store(false, std::memory_order_release); }
+    } exclusiveCall{exclusiveCall_, serviceLane_ && method == "omp_login"};
+    if (exclusiveCall.held) exclusiveCall_.store(true, std::memory_order_release);
 
     std::string runId;
     if (longAgentTurn && params.is_object()) {
@@ -2058,7 +2432,7 @@ bool WorkerBridge::call(const std::string& method, const json& params, json& res
     // Child died (write fail/EOF) → reap + respawn once, then fail.
     // Timeouts and method-level errors do NOT respawn, and neither does an agent turn
     // the worker had already received: a turn is not idempotent. Replaying it on the
-    // fresh worker started the same prompt as a SECOND run in a new Chudcode session
+    // fresh worker started the same prompt as a SECOND run in a new OMP session
     // with no GUI attached (2026-09-27, c221: the app went away mid-turn, the replay
     // ran 23 min unwatched, edited the user's firmware repo and pushed it; the GUI
     // later listed it as an "external" conversation, c223). The conversation resumes
@@ -2088,6 +2462,10 @@ bool WorkerBridge::call(const std::string& method, const json& params, json& res
             std::lock_guard<std::mutex> controlLock(controlMtx_);
             activeWorkerRunId_ = runId;
             activeCtx_ = ctx;
+        }
+        if (longAgentTurn && admitTurn && !admitTurn()) {
+            clearActiveRun();
+            return true;
         }
         const bool ok =
             callOnce(method, params, result, attemptErr, timeoutMs, onEvent, ctx);

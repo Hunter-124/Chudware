@@ -55,6 +55,10 @@ def _nudges(p: _ScriptedProvider, marker: str) -> int:
 def _dispatch_ok(tool, args):
     if tool == "ledger_get":
         return {"ok": True, "rendered": "[LEDGER] brief", "event_count": 1}
+    if tool == "verify_battery":
+        return {"ok": True, "verdict": "pass",
+                "coverage": {"ran": ["is_manifold"]},
+                "scores": {"is_manifold": 1.0}, "findings": []}
     return {"ok": True}
 
 
@@ -267,9 +271,17 @@ def test_truncated_directive_recovers_when_model_re_emits():
     assert "workspace_status" in tools, tools
     assert _nudges(p, _NUDGE) == 1, _flat(p)
 
-def test_closed_malformed_live_add_features_is_reemitted_and_runs():
+def test_closed_malformed_live_add_features_is_reemitted_and_runs(monkeypatch):
     """run-77308371568450 must retry the dropped call, not confirm the prose."""
     from services.agent import agent_turn as at
+    from services.agent import guardrails
+    monkeypatch.setattr(guardrails, "_doc_tree", lambda *a, **kw: {
+        "features": [{"id": "gap_profile", "type": "sketch"},
+                     {"id": "SnapGap", "type": "extrude",
+                      "refs": {"profile": "gap_profile"}}]})
+    monkeypatch.setattr(guardrails, "_engine_body_count", lambda doc_id: 1)
+    monkeypatch.setattr(guardrails, "take_auto_checkpoint",
+                        lambda *a, **kw: (True, "checkpoint saved"))
 
     p = _ScriptedProvider([
         _CALL % "describe_project",
@@ -281,7 +293,7 @@ def test_closed_malformed_live_add_features_is_reemitted_and_runs():
     res = at.run_turn(
         "open the imported ring into a printable C-clip",
         p,
-        allowed_tools=[*_GENERAL_ALLOW, "add_features"],
+        allowed_tools=[*_GENERAL_ALLOW, "add_features", "verify_battery"],
         max_tool_calls=8,
         tool_dispatch=_dispatch_ok,
         actor="general_agent",
@@ -314,7 +326,7 @@ def test_complete_directive_and_prose_finish_unaffected():
     assert _NUDGE not in _flat(p)
 
 
-def test_stray_closer_directive_dispatches_without_a_nudge():
+def test_stray_closer_directive_dispatches_without_a_nudge(monkeypatch):
     """run-135571474839343: one miscounted `}` must not cost the run.
 
     The model's intent was complete — 4 sketch entities, the right tool, the
@@ -323,24 +335,45 @@ def test_stray_closer_directive_dispatches_without_a_nudge():
     identical, and ended the turn `no_code` with nothing built.
     """
     from services.agent import agent_turn as at
+    from services.agent import guardrails
+    features = []
+    monkeypatch.setattr(guardrails, "_doc_tree",
+                        lambda *a, **kw: {"features": features})
+    monkeypatch.setattr(guardrails, "_engine_body_count", lambda doc_id: 1)
+
+    def dispatch(tool, args):
+        if tool == "add_features":
+            feature = args["ops"][0]["feature"]
+            if feature["type"] == "sketch":
+                features.append({"id": "HolsterOutline", "type": "sketch"})
+            else:
+                features.append({"id": "HolsterBody", "type": "extrude",
+                                 "refs": {"profile": "HolsterOutline"}})
+        return _dispatch_ok(tool, args)
 
     p = _ScriptedProvider([
         _STRAY_BRACE_ADD_FEATURES,
+        '```json\n{"tool":"add_features","args":{"doc_id":"doc-cpp00000002",'
+        '"ops":[{"op":"add_feature","feature":{"type":"extrude","name":"HolsterBody",'
+        '"refs":{"profile":"HolsterOutline"},"params":{"distance":10}}}]}}\n```',
         _CALL % "verify_battery",
-        "Done - the holster outline sketch is in.",
+        "Done - the holster outline is extruded.",
     ])
     res = at.run_turn(
         "build me a printable IWB holster",
         p,
-        allowed_tools=[*_GENERAL_ALLOW, "add_features"],
+        allowed_tools=[*_GENERAL_ALLOW, "add_features", "verify_battery"],
         max_tool_calls=8,
-        tool_dispatch=_dispatch_ok,
+        tool_dispatch=dispatch,
         actor="general_agent",
         run_id="run-135571474839343-replay",
     )
     assert res.success is True, (res.stop_reason, res.result)
     calls = (res.result or {}).get("calls") or []
-    assert [c.get("tool") for c in calls].count("add_features") == 1, calls
+    add_calls = [c for c in calls if c.get("tool") == "add_features"]
+    assert len(add_calls) == 2, calls
+    assert [c["args"]["ops"][0]["feature"]["type"] for c in add_calls] == [
+        "sketch", "extrude"]
     # No correction round-trip was needed: the model never saw a nudge.
     assert _NUDGE not in _flat(p)
 

@@ -81,6 +81,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 from services.agent.request_context import in_cell, root_value, sandbox_argv
+from services.mcp._envelopes import reason_err
 
 # --------------------------------------------------------------------------- scoping
 
@@ -213,7 +214,7 @@ def _root_block(raw_path: str) -> Optional[dict]:
 # --------------------------------------------------------------------------- envelope
 
 def _err(reason: str, hint: str = "") -> dict:
-    return {"ok": False, "reason": reason, "hint": hint}
+    return reason_err(reason, hint)
 
 
 def _ok(**fields: Any) -> dict:
@@ -324,7 +325,7 @@ HARD_MAX_LINES = 4000            # ceiling the caller cannot exceed in one call
 MAX_LINE_COLUMNS = 2000          # per-line character cap (wide/minified lines are clipped)
 #: Budget for the text of one fs_read page, in UTF-8 bytes of its JSON-escaped form (the
 #: form the text takes inside the tool result). The online agent's host-tool envelope caps
-#: a result's text at 46 000 bytes (``chudcode_tools._RESULT_TEXT_BYTES``) and shortens
+#: a result's text at 46 000 bytes (``omp_tools._RESULT_TEXT_BYTES``) and shortens
 #: anything larger, which cut c250's raw JSON read mid-string. A page of this size plus the
 #: other result fields stays under that cap, so fs_read pages and is never cut.
 READ_PAGE_BYTES = 32 * 1024
@@ -1085,44 +1086,20 @@ def register_fs_tools(mcp) -> None:
     @mcp.tool()
     def fs_read(path: str, offset: int = 0, limit: int = 0, raw: bool = False,
                 byte_offset: Optional[int] = None) -> dict:
-        """Read a text file, directory, or document with CONTEXT-SAFE, line-numbered output.
+        """Read a paged text file, directory, extracted document or CAD preview.
 
-        Never dumps unbounded text. Each call returns one page of at most about 32 KB of
-        text. Text input is streamed under a 64 MiB scan budget; larger or changing files
-        refuse with read_budget_exceeded/file_changed instead of an incomplete success.
-        A successful page says the file's real length and how to page on.
+        path accepts line selectors :50, :50-200, :50+150, :5-16,960-973,
+        and :raw. Without a selector, offset is a 1-based line; limit defaults
+        to 400 (maximum 4000). raw=True removes line numbers and clipping.
+        CAD files return a preview; use import_part and describe_part/measure_part/
+        inspect_part for the model. raw=True can read plain-text CAD formats.
 
-        path        : file/dir path; may carry a trailing selector — ':50' (from line 50),
-                      ':50-200' (inclusive), ':50+150' (150 lines from 50), ':5-16,960-973'
-                      (multi-range), ':raw' (verbatim, no line numbers). A directory lists
-                      its entries. A document (.pdf/.docx/.doc/.odt/.pptx/.ppt/.odp/.xlsx/
-                      .xlsm/.xls/.ods/.csv) is extracted to text (via office_extract) and
-                      paginated the same way. A CAD/geometry
-                      file (.draw+/.step+/.step/.stp/.iges/.stl/.3mf/.obj/…) is NOT dumped —
-                      you get its preview card (kind, features, bbox) and a labelled render,
-                      both read from the file; open it with import_part(path=...) and read
-                      the model via describe_part / measure_part / inspect_part (plain-text
-                      formats honour raw=True as an explicit escape).
-        offset      : 1-indexed start line when no selector is given (default: from the top).
-        limit       : max lines to return (default 400, hard cap 4000; 4000 when
-                      byte_offset is set).
-        raw         : return the text verbatim: no line numbers, no column clip, no footer.
-        byte_offset : start a raw page at this UTF-8 byte of the text (0 = start). Sets
-                      raw=True. Do not use it with offset or a line selector.
-
-        Returns {ok, path, kind, text, offset, total_lines, shown_lines, truncated,
-        next_offset?}. A raw read also returns byte_offset, bytes and total_bytes; when
-        truncated, it also returns next_byte_offset and hint. A page ends at a line end,
-        but a line longer than a page is split: then only next_byte_offset continues it.
-
-        To read a whole file (for example, to json.loads it), call with raw=True and
-        byte_offset=0. While truncated is true, call again with
-        byte_offset=next_byte_offset. Join the text of all pages. Do not parse one page
-        of a larger file.
-
-        A result that is still too large for the tool budget is shortened. Each cut string
-        then ends with a "…[cut: …]" marker, and _truncated.full_result names a JSON file
-        that holds the full result.
+        Pages are about 32 KB; use next_offset while truncated. To read complete
+        text for parsing, start with raw=True, byte_offset=0 and join pages using
+        next_byte_offset. byte_offset implies raw and cannot be combined with a
+        line offset or selector; a long split line requires byte pagination.
+        Reads beyond the scan budget or of changing files fail explicitly.
+        Oversized results may be cut, with the full JSON at _truncated.full_result.
         """
         if byte_offset is not None:
             if byte_offset < 0:
@@ -1156,12 +1133,9 @@ def register_fs_tools(mcp) -> None:
 
     @mcp.tool()
     def fs_list(path: str = ".", show_hidden: bool = False) -> dict:
-        """List a directory's entries (name, dir flag, size). Capped at 1000 entries.
+        """List directory entries (name, directory flag, size), capped at 1000.
 
-        A CAD/geometry file (.step+/.step/.stl/.dxf/…) is tagged ``open_with:
-        "import_part"`` and summarised in ``note`` — those are NOT readable with fs_read;
-        call import_part(path=...) for a doc_id and read the model with describe_part /
-        measure_part / inspect_part. Risk: read.
+        CAD files identify import_part as their opener; fs_read returns a preview.
         """
         p, blocked = _canonical_target(path, read=True)
         if blocked:
@@ -1173,11 +1147,9 @@ def register_fs_tools(mcp) -> None:
 
     @mcp.tool()
     def fs_glob(pattern: str, path: str = ".", limit: int = 0) -> dict:
-        """Find paths matching a glob (e.g. 'src/**/*.py'). Returns matches newest-first.
-        Capped at 1000.
+        """Find glob matches newest-first, capped at 1000.
 
-        Any CAD/geometry match is also listed under ``open_with_import_part`` — read those
-        with import_part(path=...), never fs_read. Risk: read.
+        CAD matches are also listed under open_with_import_part.
         """
         base, blocked = _canonical_target(path, read=True)
         if blocked:
@@ -1293,11 +1265,11 @@ def register_fs_tools(mcp) -> None:
     @mcp.tool()
     def fs_grep(pattern: str, path: str = ".", glob: str = "", ignore_case: bool = False,
                 max_matches: int = 0) -> dict:
-        """Regex-search files under *path* (optionally filtered by *glob*, e.g. '*.py').
-        Returns {file, line, text} matches, capped at 500. Compilation/search runs in a
-        killable readonly child with a two-second per-tool deadline. Input scans (64 MiB,
-        5000 files), traversal and 32 KiB responses refuse explicitly when exhausted.
-        Files initially over 8 MiB are skipped. Risk: read."""
+        """Regex-search files, optionally filtered by glob; returns up to 500 matches.
+
+        Search has a two-second deadline and bounded traversal, scans and response.
+        Files initially over 8 MiB are skipped; exhausted budgets fail explicitly.
+        """
         base, blocked = _canonical_target(path, read=True)
         if blocked:
             return blocked
@@ -1344,8 +1316,7 @@ def register_fs_tools(mcp) -> None:
 
     @mcp.tool()
     def fs_write(path: str, content: str, make_dirs: bool = True) -> dict:
-        """Create or OVERWRITE a text file with *content*. Parent dirs are created by
-        default. Returns {ok, path, bytes}. Risk: write."""
+        """Create or overwrite a text file; make_dirs creates parents by default."""
         p, blocked = _canonical_target(path, allow_missing=True)
         if blocked:
             return blocked
@@ -1365,9 +1336,7 @@ def register_fs_tools(mcp) -> None:
 
     @mcp.tool()
     def fs_edit(path: str, old: str, new: str, replace_all: bool = False) -> dict:
-        """Replace text in an existing file. By default *old* MUST occur exactly once
-        (a safe, unambiguous edit); set replace_all=True to replace every occurrence.
-        Returns {ok, path, replacements}. Risk: write."""
+        """Replace old text in a file. It must occur once unless replace_all=True."""
         p, blocked = _canonical_target(path)
         if blocked:
             return blocked

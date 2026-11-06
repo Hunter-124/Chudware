@@ -21,6 +21,19 @@ WEB_DIR = Path(__file__).resolve().parents[2]
 if str(WEB_DIR) not in sys.path:
     sys.path.insert(0, str(WEB_DIR))
 
+
+def pytest_configure(config):
+    # Tests run only in a container or on CI (scripts/testbox_guard.py).
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_chudware_testbox_guard", WEB_DIR.parent / "scripts" / "testbox_guard.py")
+    guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard)
+    if not guard.isolated():
+        pytest.exit(guard.MESSAGE, returncode=3)
+
+
 _IMPORT_HOME = tempfile.mkdtemp(prefix="cw-gw-import-")
 os.environ["CHUDWARE_WEB_HOME"] = _IMPORT_HOME
 os.environ["CHUDWARE_WEB_ALLOWED_HOSTS"] = "testserver,localhost,127.0.0.1"

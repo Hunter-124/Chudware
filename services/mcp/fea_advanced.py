@@ -396,14 +396,16 @@ def corrected_endurance(Se_base: float, Sut: float, *, surface: int = 1,
 
 
 def fatigue_summarize(theories: dict, Se: float, Sut: float,
-                      theory: str = "goodman") -> dict:
-    """Turn the engine's per-theory sa_eq (equivalent fully-reversed amplitude) into a
-    life + factor-of-safety for the requested mean-stress theory. Life via `sn_life`
-    (host mirror). Returns per-theory {sa_eq_mpa, cycles, regime, fos} plus the
-    selected `theory` echoed at the top level.
+                      theory: str = "goodman", *, kf: float = 1.0) -> dict:
+    """Turn engine equivalent amplitudes into Basquin life and endurance safety.
 
-    theories : {name: {"sa_eq_mpa": float}} exactly as `sim_run_fatigue` returns
-               under summary.theories.
+    ``kf`` applies to the alternating nominal stress, not mean stress. Since the
+    engine's mean-stress corrections are linear in alternating stress, multiply
+    their equivalent amplitude by Kf before using the Marin-corrected endurance
+    and S-N curve. Do not use Kf > 1 on a stress field resolving that notch.
+    The default is for callers explicitly analyzing the unmodified engine field.
+
+    theories : {name: {"sa_eq_mpa": float}} from sim_run_fatigue.
     """
     if not isinstance(theories, dict) or not theories:
         raise ValueError("theories must be a non-empty result mapping")
@@ -413,6 +415,9 @@ def fatigue_summarize(theories: dict, Se: float, Sut: float,
         raise ValueError("Se and Sut must be > 0 MPa")
     if theory not in theories:
         raise ValueError(f"requested theory {theory!r} is absent")
+    kf = _finite(kf, "kf")
+    if kf < 1.0:
+        raise ValueError("kf must be >= 1")
     out: dict = {"selected_theory": theory, "se_corrected_mpa": round(Se, 3),
                  "ultimate_mpa": round(Sut, 3), "theories": {}}
     for name, tv in theories.items():
@@ -421,9 +426,13 @@ def fatigue_summarize(theories: dict, Se: float, Sut: float,
         sa_eq = _finite(tv["sa_eq_mpa"], f"theories.{name}.sa_eq_mpa")
         if sa_eq <= 0.0:
             raise ValueError(f"theory {name!r} returned non-positive equivalent stress")
+        nominal_sa_eq = sa_eq
+        sa_eq *= kf
+        if not math.isfinite(sa_eq):
+            raise ValueError(f"theory {name!r} Kf-adjusted stress is not finite")
         N = sn_life(sa_eq, Se, Sut)
         regime = "infinite" if (sa_eq <= Se or N >= 1e6) else (
-            "static_overload" if sa_eq >= Sut else "finite")
+            "static_overload" if nominal_sa_eq >= Sut else "finite")
         fos = round(Se / sa_eq, 4) if sa_eq > 0 else None
         out["theories"][name] = {
             "sa_eq_mpa": round(sa_eq, 3),

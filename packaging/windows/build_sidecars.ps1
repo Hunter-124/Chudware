@@ -1,7 +1,7 @@
 # Build protected production sidecars into a builder-owned output directory. Configure host and
 # hostd with -DCHUDWARE_DEVELOPER_BUILD=OFF first, and generate protected assets under
 # host/build-win/generated/protected-assets. Pass outputs via --worker-bin/--mcp-bin/
-# --chud-bin before hashing the immutable Windows payload.
+# --omp-bin before hashing the immutable Windows payload.
 # -Python / CHUDWARE_RELEASE_PYTHON is the release compiler venv interpreter (requirements.txt +
 # packaging/requirements-release.txt). When CHUDWARE_WHEELHOUSE names a reviewed offline
 # wheelhouse, -BasePython / CHUDWARE_BASE_PYTHON authenticates that venv against it first.
@@ -15,7 +15,7 @@ param(
     # Engine library whose advisor closure is carried into the GUI runtime root. Defaults to
     # the first libchudware.dll found beside the host/hostd binaries or in the core build trees.
     [string]$EngineBinary = "",
-    [string]$ChudBinary = $env:CHUDWARE_CHUD_BIN
+    [string]$OmpBinary = $env:CHUDWARE_OMP_BIN
 )
 
 $ErrorActionPreference = "Stop"
@@ -94,25 +94,25 @@ function Get-VerifiedBinaryBuildDir([string]$Binary, [string]$Label) {
     return $buildDir
 }
 
-function Stage-Chudcode([string]$Destination) {
-    if (-not $ChudBinary) {
-        throw "CHUDWARE_CHUD_BIN or -ChudBinary is required"
+function Stage-OMP([string]$Destination) {
+    if (-not $OmpBinary) {
+        throw "CHUDWARE_OMP_BIN or -OmpBinary is required"
     }
     Invoke-ReleasePython @(
-        (Join-Path $Root "scripts\pin_chudcode.py"),
+        (Join-Path $Root "scripts\pin_omp.py"),
         "stage",
         "--target", "windows-x86_64",
-        "--input", $ChudBinary,
+        "--input", $OmpBinary,
         "--output", $Destination
     )
     $destinationDir = Split-Path -Parent $Destination
     Invoke-ReleasePython @(
-        (Join-Path $Root "scripts\pin_chudcode.py"),
+        (Join-Path $Root "scripts\pin_omp.py"),
         "stage-notices",
         "--output-dir", $destinationDir
     )
-    Copy-Item -LiteralPath (Join-Path $Root "vendor\chudcode\CHUDCODE_ARTIFACT.lock") `
-        -Destination (Join-Path $destinationDir "CHUDCODE_ARTIFACT.lock") -Force
+    Copy-Item -LiteralPath (Join-Path $Root "vendor\omp\OMP_ARTIFACT.lock") `
+        -Destination (Join-Path $destinationDir "OMP_ARTIFACT.lock") -Force
 }
 
 function Generate-ProtectedAssets {
@@ -122,13 +122,9 @@ function Generate-ProtectedAssets {
         "--source-root", $Root,
         "--output-dir", $ProtectedAssetsOut
     )
-    foreach ($required in @(
-        (Join-Path $ProtectedAssetsOut "python\chudware_protected_assets.py"),
-        (Join-Path $ProtectedAssetsOut "include\chudware\protected_assets.generated.h")
-    )) {
-        if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
-            throw "protected asset generator did not produce $required"
-        }
+    $required = Join-Path $ProtectedAssetsOut "python\chudware_protected_assets.py"
+    if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+        throw "protected asset generator did not produce $required"
     }
 }
 
@@ -144,7 +140,7 @@ function Build-PythonSidecar([string]$Module, [string]$Name) {
     # for background simulation jobs (services\sim\jobs.py), and the topology tool/study
     # modules back those jobs; forcing them fails the build if any is missing.
     $includes = @("--include-module=chudware_protected_assets", "--include-module=services.$Module",
-                  "--include-package=chudcode_rpc",
+                  "--include-package=omp_rpc",
                   "--include-package=pycolmap",
                   "--include-module=services.sim.job_worker",
                   "--include-module=services.sim.topology",
@@ -204,6 +200,7 @@ function Assert-SourceFreePayload([string]$RootPath) {
             }
             continue
         }
+        if ($item.FullName -eq (Join-Path $RootPath "omp_extension.ts")) { continue }
         if (($forbiddenExtensions -contains $item.Extension.ToLowerInvariant()) -or
             $item.Name.StartsWith("test_", [StringComparison]::OrdinalIgnoreCase) -or
             $item.Name -match "_test\.[^.]+$") {
@@ -306,7 +303,9 @@ Stage-AdvisorRuntime $Engine (Split-Path -Parent ([IO.Path]::GetFullPath($HostBi
 Generate-ProtectedAssets
 Build-PythonSidecar "worker_main" "chudware-worker"
 Build-PythonSidecar "mcp.server" "chudware-mcp"
-Stage-Chudcode (Join-Path $OutputDir "chud.exe")
+Stage-OMP (Join-Path $OutputDir "omp.exe")
+Copy-Item -LiteralPath (Join-Path $Root "services\agent\omp_extension.ts") -Destination (Join-Path $OutputDir "omp_extension.ts") -Force
+Copy-Item -LiteralPath (Join-Path $Root "services\agent\prompts\omp_cad_system.md") -Destination (Join-Path $OutputDir "omp_cad_system.md") -Force
 Assert-SourceFreePayload $OutputDir
 
 Write-Host "==> built compiled release sidecars in $OutputDir"

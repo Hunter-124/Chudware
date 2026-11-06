@@ -224,6 +224,7 @@ def register_preflight_tools(mcp: FastMCP) -> None:
         ops: list,
         doc_id: Optional[str] = None,
         tool: str = "add_features",
+        auto_define: bool = True,
     ) -> str:
         """Dry-run planned ops in cached native scratch state.
 
@@ -242,6 +243,10 @@ def register_preflight_tools(mcp: FastMCP) -> None:
 
         **Read-only**: this tool NEVER mutates the live document.  It is safe to
         call speculatively before any destructive edit.
+        For ``add_features``, the same dialect normalization, reference resolution
+        and sketch auto-definition policy are used as for the actual edit. Pass
+        ``auto_define=False`` here and to ``add_features`` to opt out of automatic
+        sketch constraints.
         Existing history is not cold-replayed. One cumulative 10 s candidate budget
         covers every native geometry probe and response serialization/transfer.
         POSIX runs the rebuild in a private child, kills and reaps it on timeout,
@@ -292,8 +297,32 @@ def register_preflight_tools(mcp: FastMCP) -> None:
             return json.dumps({"error": str(e)})
 
         try:
+            if tool == "add_features":
+                from .cad_doc_tools import _decode_embedded_structures, _prepare_add_features_ops, _slug
+
+                notes: list = []
+                ops = _decode_embedded_structures(list(ops), notes)
+                # A leading new_part can create or switch documents when no explicit
+                # target was supplied. A read-only prediction must not do either.
+                while ops and isinstance(ops[0], dict) and _slug(
+                        ops[0].get("op") if ops[0].get("op") is not None
+                        else ops[0].get("type")) == "new_part":
+                    if not doc_id:
+                        raise ValueError(
+                            "preflight cannot create or switch documents; pass an existing "
+                            "doc_id or create the part before predicting this batch")
+                    ops.pop(0)
+                ops, _ = _prepare_add_features_ops(ops, d, auto_define, notes)
+                from .cad_doc_tools import _split_notes
+                notes, assumptions = _split_notes(notes)
+            else:
+                notes, assumptions = [], []
             from services.agent.advisor.preflight import run_preflight
             result = run_preflight(d, tool, ops)
+            if notes:
+                result["interpreted"] = notes
+            if assumptions:
+                result["assumptions"] = assumptions
             return json.dumps(result, ensure_ascii=False)
         except Exception as exc:  # noqa: BLE001
             return json.dumps({"error": str(exc)})

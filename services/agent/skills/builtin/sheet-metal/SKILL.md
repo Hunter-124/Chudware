@@ -12,6 +12,9 @@ triggers:
 
 ## Sequence
 
+If unavailable, call `enable_tools(tools=["add_features", "query_geometry", "wall_thickness", "describe_part", "render_part"])`.
+The `sm_*` names below are feature types supplied to `add_features`, not standalone tools.
+
 1. **Base first** — `sm_base_flange` on a closed sketch region (marks the body sheet-metal).
 2. **Bend inputs** — resolve process, thickness, radius, and K-factor before critical dimensions; record assumptions instead of inventing them.
 3. **Walls** — `sm_edge_flange` / `sm_hem` / `sm_jog` on RESOLVED straight thickness-face edges (query_geometry first).

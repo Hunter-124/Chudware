@@ -165,21 +165,6 @@ def scale_from_corner_edges(corners_3d, marker_len_mm: float) -> ScaleResult:
 # ---------------------------------------------------------------------------------- COLMAP reader
 
 
-def _read_colmap_cameras_txt(path: str) -> dict[int, Any]:
-    """Parse COLMAP ``cameras.txt`` → {camera_id: (model, w, h, params[])}. Text format only."""
-    out: dict[int, Any] = {}
-    with open(path, "r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split()
-            cam_id = int(parts[0])
-            model = parts[1]
-            w, h = int(parts[2]), int(parts[3])
-            params = [float(v) for v in parts[4:]]
-            out[cam_id] = (model, w, h, params)
-    return out
 
 
 def _intrinsic_matrix(model: str, params: Sequence[float]):
@@ -210,43 +195,23 @@ def _quat_to_rot(qw: float, qx: float, qy: float, qz: float):
 
 
 def read_colmap_sparse(sparse_dir: str) -> dict[str, ColmapCamera]:
-    """Read a COLMAP text sparse model (``cameras.txt`` + ``images.txt``) → {image_name: ColmapCamera}.
+    """Read registered cameras and poses from a COLMAP binary or text model."""
+    from .colmap_pipeline import read_model
 
-    Only the text export is supported (binary ``.bin`` is out of scope for v1); a session that only
-    has ``.bin`` should be re-exported with ``colmap model_converter``. Raises ``FileNotFoundError``
-    with a clear message the adapter can wrap.
-    """
     _require_np()
-    cameras_txt = os.path.join(sparse_dir, "cameras.txt")
-    images_txt = os.path.join(sparse_dir, "images.txt")
-    if not os.path.isfile(cameras_txt) or not os.path.isfile(images_txt):
-        raise FileNotFoundError(
-            f"COLMAP text model not found in {sparse_dir} (need cameras.txt + images.txt; "
-            f"run `colmap model_converter --output_type TXT` if you only have .bin)"
+    cameras, images, _points = read_model(sparse_dir)
+    result = {}
+    for image in images.values():
+        camera = cameras[image.camera_id]
+        result[image.name] = ColmapCamera(
+            image_name=image.name,
+            K=_intrinsic_matrix(camera.model, camera.params),
+            R=_quat_to_rot(*image.qvec),
+            t=np.array(image.tvec, dtype="float64"),
+            width=camera.width,
+            height=camera.height,
         )
-    intr = _read_colmap_cameras_txt(cameras_txt)
-    out: dict[str, ColmapCamera] = {}
-    with open(images_txt, "r", encoding="utf-8") as fh:
-        lines = [ln for ln in fh if ln.strip() and not ln.startswith("#")]
-    # images.txt: pose line then a POINTS2D line, alternating. We only need the pose lines.
-    for i in range(0, len(lines), 2):
-        parts = lines[i].split()
-        if len(parts) < 10:
-            continue
-        qw, qx, qy, qz = (float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4]))
-        tx, ty, tz = (float(parts[5]), float(parts[6]), float(parts[7]))
-        cam_id = int(parts[8])
-        name = parts[9]
-        model, w, h, params = intr[cam_id]
-        out[name] = ColmapCamera(
-            image_name=name,
-            K=_intrinsic_matrix(model, params),
-            R=_quat_to_rot(qw, qx, qy, qz),
-            t=np.array([tx, ty, tz], dtype="float64"),
-            width=w,
-            height=h,
-        )
-    return out
+    return result
 
 
 # ---------------------------------------------------------------------------------- image front-end
@@ -271,6 +236,104 @@ def _detect_marker_corners(image, dict_name: str, marker_id: Optional[int]):
     return found
 
 
+def _registered_images(cams: dict[str, ColmapCamera], images_dir: str):
+    """Yield ``(camera, grayscale image)`` for every registered view whose image is on disk."""
+    cv2 = require_cv2()
+    for name, cam in cams.items():
+        img_path = os.path.join(images_dir, name)
+        if not os.path.isfile(img_path):
+            # COLMAP may store a subdir-qualified name; try a basename glob.
+            hits = glob.glob(os.path.join(images_dir, "**", os.path.basename(name)), recursive=True)
+            if not hits:
+                continue
+            img_path = hits[0]
+        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        if img is not None:
+            yield cam, img
+
+
+def _similarity_fit(src, dst):
+    """Umeyama least squares ``dst ≈ s·R·src + t`` (proper rotation). Returns ``(s, R, t)``."""
+    npy = _require_np()
+    mu_s, mu_d = src.mean(0), dst.mean(0)
+    a, b = src - mu_s, dst - mu_d
+    U, S, Vt = npy.linalg.svd(b.T @ a / len(src))
+    E = npy.eye(3)
+    E[2, 2] = npy.sign(npy.linalg.det(U @ Vt)) or 1.0
+    R = U @ E @ Vt
+    s = float(npy.trace(npy.diag(S) @ E) / ((a ** 2).sum() / len(src)))
+    return s, R, mu_d - s * R @ mu_s
+
+
+def _reprojection_px(cam: ColmapCamera, X, px) -> float:
+    npy = _require_np()
+    p = cam.K @ (cam.R @ X + cam.t)
+    return float(npy.hypot(p[0] / p[2] - px[0], p[1] / p[2] - px[1]))
+
+
+def solve_scale_charuco(*, sparse_dir: str, images_dir: str, board,
+                        min_views: int = 3, max_reprojection_px: float = 2.0) -> ScaleResult:
+    """Scale a COLMAP reconstruction from a printed ChArUco board (``calib_sheet.BoardSpec``).
+
+    Every chessboard corner the detector resolves in at least ``min_views`` registered images is
+    triangulated; observations reprojecting worse than ``max_reprojection_px`` are dropped and the
+    corner re-triangulated. The board's known planar corner layout (mm) is then fitted to the
+    triangulated corners with a similarity transform: ``mm_per_unit`` is the inverse fitted scale
+    and ``residual_pct`` the RMS fit residual relative to the RMS corner radius about the centroid,
+    so it reflects board flatness, triangulation noise and pose error together.
+    """
+    if not HAVE_CV2:
+        raise VisionUnavailable()
+    npy = _require_np()
+    cv2 = require_cv2()
+    cv_board = board.cv_board()
+    detector = cv2.aruco.CharucoDetector(cv_board)
+    layout = npy.asarray(cv_board.getChessboardCorners(), dtype="float64").reshape(-1, 3)
+    observations: dict[int, list] = {}
+    n_views = 0
+    for cam, img in _registered_images(read_colmap_sparse(sparse_dir), images_dir):
+        corners, ids, _markers, _marker_ids = detector.detectBoard(img)
+        if ids is None or len(ids) < 4:
+            continue
+        n_views += 1
+        for cid, px in zip(ids.ravel(), npy.asarray(corners, dtype="float64").reshape(-1, 2)):
+            observations.setdefault(int(cid), []).append((cam, px))
+    board_mm, recon = [], []
+    for cid, rows in observations.items():
+        if len(rows) < min_views:
+            continue
+        X = triangulate_point([c for c, _ in rows], [p for _, p in rows])
+        good = [(c, p) for c, p in rows if _reprojection_px(c, X, p) <= max_reprojection_px]
+        if len(good) < min_views:
+            continue
+        if len(good) < len(rows):
+            X = triangulate_point([c for c, _ in good], [p for _, p in good])
+        board_mm.append(layout[cid])
+        recon.append(X)
+    if len(recon) < 6:
+        raise ValueError(
+            f"need >=6 ChArUco corners triangulated from >={min_views} registered views each "
+            f"(got {len(recon)} from {n_views} views with the board); keep the printed mat flat "
+            "and in frame for a longer part of the capture"
+        )
+    board_mm, recon = npy.asarray(board_mm), npy.asarray(recon)
+    s, R, t = _similarity_fit(board_mm, recon)
+    mm_per_unit = 1.0 / s
+    residual_mm = npy.linalg.norm(recon - (s * board_mm @ R.T + t), axis=1) * mm_per_unit
+    rms_mm = float(npy.sqrt((residual_mm ** 2).mean()))
+    radius_mm = float(npy.sqrt(((board_mm - board_mm.mean(0)) ** 2).sum(1).mean()))
+    span_mm = float(max(npy.linalg.norm(a - b) for a in board_mm for b in board_mm))
+    return ScaleResult(
+        method="aruco_mat",
+        mm_per_unit=mm_per_unit,
+        residual_pct=100.0 * rms_mm / radius_mm,
+        n_views=n_views,
+        detail={"board": board.to_dict(), "n_corners": len(recon), "rms_residual_mm": rms_mm,
+                "max_residual_mm": float(residual_mm.max()), "corner_span_mm": span_mm},
+    )
+
+
+
 def solve_scale_aruco(*, sparse_dir: str, images_dir: str, marker_len_mm: float,
                       dict_name: str = "DICT_5X5_100", marker_id: Optional[int] = 0) -> ScaleResult:
     """Auto-scale a COLMAP reconstruction from a known-size marker in the scene (meyerls-style).
@@ -283,24 +346,13 @@ def solve_scale_aruco(*, sparse_dir: str, images_dir: str, marker_len_mm: float,
     if not HAVE_CV2:
         raise VisionUnavailable()
     npy = _require_np()
-    cv2 = require_cv2()
     cams = read_colmap_sparse(sparse_dir)
 
     # Gather per-corner (camera, pixel) observations across all images that saw the marker.
     per_corner_cams: list[list[ColmapCamera]] = [[] for _ in range(4)]
     per_corner_px: list[list[Any]] = [[] for _ in range(4)]
     n_views = 0
-    for name, cam in cams.items():
-        img_path = os.path.join(images_dir, name)
-        if not os.path.isfile(img_path):
-            # COLMAP may store a subdir-qualified name; try a basename glob.
-            hits = glob.glob(os.path.join(images_dir, "**", os.path.basename(name)), recursive=True)
-            if not hits:
-                continue
-            img_path = hits[0]
-        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            continue
+    for cam, img in _registered_images(cams, images_dir):
         found = _detect_marker_corners(img, dict_name, marker_id)
         target = marker_id if marker_id is not None else (next(iter(found)) if found else None)
         if target is None or target not in found:

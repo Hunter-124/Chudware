@@ -1,8 +1,8 @@
 """services/browser/adapters/lowes.py — Lowe's source adapter (Parts Library V2).
 
 Commerce-only (see amazon.py). Lowe's runs Akamai + PerimeterX bot protection:
-"Access Denied" / "Reference #" / PX captcha markers degrade to
-``login_required`` — never solved or bypassed.
+"Access Denied" / "Reference #" and captcha markers are reported distinctly,
+never solved or bypassed.
 
 Parse strategy: JSON-LD Products first; when the SEO layer is absent the
 search page usually embeds a ``window.__PRELOADED_STATE__`` JSON blob with the
@@ -30,7 +30,7 @@ LICENSE_NOTE = (
 )
 
 _LOGIN_WALL_MARKERS = ("Sign In to Your Account", 'id="email-input"')
-# Akamai / PerimeterX walls — never bypass, treat exactly like a login wall.
+# Akamai / PerimeterX walls — never bypass.
 _CHALLENGE_MARKERS = ("Access Denied", "Reference #", "px-captcha",
                       "Please verify you are a human")
 
@@ -43,6 +43,7 @@ _URL_KEYS = ("pdURL", "productLink", "pdpURL", "url")
 
 class LowesAdapter(RetailAdapter):
     key = SITE
+    currency = "USD"
     base_url = BASE_URL
     search_url_tmpl = SEARCH_URL_TMPL
     license_note = LICENSE_NOTE

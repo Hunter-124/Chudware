@@ -86,6 +86,13 @@ def test_provenance_less_numeric_critical_row_is_refused(tools):
     assert "provenance" in result["error"]
 
 
+def test_unknown_process_with_supplied_profile_is_refused(tools):
+    plan = _plan()
+    plan["process"] = {"id": "unknown_process", "profile_snapshot": {"process": "unknown_process"}}
+    result = _upsert(tools, plan)
+    assert result["ok"] is False
+
+
 def test_revision_updates_same_plan_in_place(tools):
     first = _upsert(tools, _plan(revision="A"))
     second = _upsert(tools, _plan(revision="B"))
@@ -125,19 +132,68 @@ def test_work_instruction_projection_matches_template_contract(tools):
     _validate_document(resolved["blocks"])
 
 
-def test_check_uses_three_states_when_helper_unavailable(tools, monkeypatch):
+def test_check_uses_not_evaluated_when_geometry_unavailable(tools, monkeypatch):
+    from services.agent import geometry_helpers
+    from services.mcp import mfg_plan_tools
+    monkeypatch.setattr(geometry_helpers, "_profile", lambda process: {"params": {}})
+    monkeypatch.setattr(mfg_plan_tools, "_geometry_dfm_check",
+                        lambda *args: (_ for _ in ()).throw(RuntimeError("engine offline")))
     assert _upsert(tools, _plan())["ok"]
     Ledger.load("run-1").add_geometry_spec(
-        "geometry_designer", "G1", ["FT1"], [{"kind": "mating_bore"}],
-        "fit_calc(20,H7/g6)",
-    )
-    from services.agent import geometry_helpers
-    monkeypatch.setattr(geometry_helpers, "resolve_helpers",
-                        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("engine offline")))
+        "geometry_designer", "G1", ["FT1"], [{"kind": "mating_bore"}], "drawing")
     checked = tools["mfg_plan_check"]("run-1", "main")
     dfm = next(row for row in checked["checks"] if row["check"] == "dfm:OP10")
     assert dfm["status"] == "not_evaluated"
     assert checked["status"] == "not_evaluated"
+
+
+@pytest.mark.parametrize("status", ["pass", "fail", "not_evaluated"])
+def test_dfm_uses_document_geometry_not_helper_inputs(tools, monkeypatch, status):
+    from services.agent import geometry_helpers
+    from services.mcp import mfg_plan_tools
+    monkeypatch.setattr(geometry_helpers, "_profile", lambda process: {"params": {}})
+    calls = []
+    def check(doc_id, process):
+        calls.append((doc_id, process))
+        return {"ok": True, "status": status, "checks": [{"check": "min_wall", "status": status}]}
+    monkeypatch.setattr(mfg_plan_tools, "_geometry_dfm_check", check)
+    plan = _plan()
+    plan["operations"][0]["helper_inputs"] = {"wall_mm": 99999}
+    assert _upsert(tools, plan)["ok"]
+    Ledger.load("run-1").add_geometry_spec(
+        "geometry_designer", "G1", ["FT1"], [{"kind": "mating_bore"}], "drawing")
+    checked = tools["mfg_plan_check"]("run-1", "main")
+    dfm = next(row for row in checked["checks"] if row["check"] == "dfm:OP10")
+    assert dfm["status"] == status
+    assert dfm["geometry_checks"][0]["check"] == "min_wall"
+    assert checked["status"] == status
+    assert calls == [("doc-1", "cnc_mill")]
+
+
+@pytest.mark.parametrize(("doc_id", "status"), [
+    ("omitted", "pass"), (None, "pass"), ("doc-1", "pass"), ("other-doc", "fail"),
+])
+def test_check_optional_document_id_only_rejects_mismatch(tools, monkeypatch, doc_id, status):
+    from services.agent import geometry_helpers
+
+    monkeypatch.setattr(geometry_helpers, "_profile", lambda process: {"params": {}})
+    from services.mcp import mfg_plan_tools
+    monkeypatch.setattr(mfg_plan_tools, "_geometry_dfm_check",
+                        lambda *args: {"ok": True, "status": "pass",
+                                       "checks": [{"check": "min_wall", "status": "pass"}]})
+    plan = _plan()
+    plan["operations"][0]["helper_inputs"]["wall_mm"] = 2.0
+    assert _upsert(tools, plan)["ok"]
+    Ledger.load("run-1").add_geometry_spec(
+        "geometry_designer", "G1", ["FT1"], [{"kind": "mating_bore"}], "drawing",
+    )
+    check = tools["mfg_plan_check"]
+    checked = check("run-1", "main") if doc_id == "omitted" else check("run-1", "main", doc_id)
+    structure = next(row for row in checked["checks"] if row["check"] == "structure")
+    assert structure["status"] == status
+    assert checked["status"] == status
+    if status == "fail":
+        assert "other-doc" in structure["detail"] and "doc-1" in structure["detail"]
 
 
 def test_geometry_reference_failure_and_open_question_block(tools):

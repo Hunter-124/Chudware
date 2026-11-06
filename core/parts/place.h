@@ -8,24 +8,21 @@
 //   core_family      → parts_make seam (libchudware wires doc_new + parts::build)
 //   generate_model   → build_model seam (bolts match → STEP) → import_file leg
 //   symbol_footprint → ecad sch_add_symbol op via chudware::ecad::apply_ops (in-core)
-//   section_profile  → append StructuralElement dict to an aicad.structure/1 doc
-//   fitting_id       → chudware::piping::new_fitting into an aicad.piping/1 doc
+//   section_profile  → standalone mechanical part, or element in a structural doc
+//   fitting_id       → standalone mechanical part, or fitting in a piping doc
 //   fmu_component    → chudware::hydraulic::new_component into an aicad.hydraulic/1 doc
 //   import_file      → import_file seam (browser-acquired STEP/IGES)
 //
 // The PartRecord lookup (services/parts hub) and the two doc-creating RPCs are
 // NOT core concerns, so — exactly like core/sourcing — they are Seams
 // injections: libchudware.cpp supplies the production defaults and tests stub
-// them. Every placer returns a PlacementResult dict mirroring the oracle
-// byte-for-byte:
+// them. Every placer returns a PlacementResult envelope:
 //
 //   {ok, domain, doc_id, entity_id, editable, detail, reason, hint}
 //
-// Doc-mutating legs (symbol_footprint / section_profile / fitting_id /
-// fmu_component) additionally carry the updated document under result["doc"]
-// (the oracle mutates the caller's dict in place; across an RPC boundary the
-// updated doc must be handed back explicitly — additive key, oracle results
-// are unaffected). Error contract: always a result dict, never throws.
+// Schema placements additionally carry the updated document under result["doc"].
+// A standalone section or fitting instead returns its new native doc_id as both
+// doc_id and entity_id. Error contract: always a result dict, never throws.
 #pragma once
 
 #include <functional>
@@ -52,6 +49,11 @@ struct PlaceSeams {
     // spec_sheet_matcher.generate_model: bolts `match` dict -> saved model
     // path ("" when not buildable). Same shape as sourcing::Seams::build_model.
     std::function<std::string(const json& match)> build_model;
+    // Persist catalog identity and generated specifications in the native document.
+    std::function<void(const std::string& doc_id, const json& metadata)> set_catalog_meta;
+    // Transform every imported body with editable features and return its posed bounds/datum.
+    std::function<json(const std::string& doc_id, const json& import_result,
+                       const json& params)> pose_import;
 };
 
 // Dispatch one placement method. Returns false when `method` is not a ported

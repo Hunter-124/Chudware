@@ -1,8 +1,7 @@
 """services/browser/adapters/tractorsupply.py — Tractor Supply source adapter (Parts Library V2).
 
 Commerce-only (see amazon.py): link-out + a copied-with-provenance price/spec
-record. Parse strategy: JSON-LD Product records. Challenge pages degrade to
-``login_required`` — never solved.
+record. Parse strategy: JSON-LD Product records. Challenges are reported, never solved.
 """
 from __future__ import annotations
 
@@ -20,7 +19,7 @@ LICENSE_NOTE = (
     "See contracts/license_debt.md."
 )
 
-_LOGIN_WALL_MARKERS = ("Sign In", 'id="logonId"')
+_LOGIN_WALL_MARKERS = ('id="logonId"', "Please sign in to view")
 _CHALLENGE_MARKERS = ("Access Denied", "Reference #", "Pardon Our Interruption")
 
 

@@ -1,8 +1,8 @@
-"""Project-scoped memory backed by Chudcode online and SQLite offline.
+"""Project-scoped OMP memory online and SQLite memory offline.
 
-Both authorities are rooted at ``{project_root}/.plm/memory.db``. Public recall
-always enforces the caller's result count and token budget, and metadata fields
-retain the same stable Chudware shape.
+OMP chooses its own backend storage under the selected project scope. Search
+results retain native IDs; local recall enforces the requested token budget.
+Unsupported online kind filters fail explicitly.
 """
 
 from __future__ import annotations
@@ -113,11 +113,11 @@ def close_all() -> None:
         _conns.clear()
 
 
-# --------------------------------------------------------------------------- Chudcode / offline backends
+# --------------------------------------------------------------------------- Omp / offline backends
 
 
 class ProjectMemoryUnavailable(RuntimeError):
-    """The online Chudcode memory service could not serve the request."""
+    """The online Omp memory service could not serve the request."""
 
 
 def _offline_memory(cfg: dict | None = None) -> bool:
@@ -131,13 +131,13 @@ def _offline_memory(cfg: dict | None = None) -> bool:
 
 
 def _default_host():
-    from services.agent.chudcode_host import get_default_chudcode_host  # noqa: PLC0415
+    from services.agent.omp_host import get_default_omp_host  # noqa: PLC0415
 
-    return get_default_chudcode_host()
+    return get_default_omp_host()
 
 
 def _memory_call(command: str, params: dict[str, Any]) -> dict[str, Any]:
-    """Call the process-global Chudcode service without silently changing authority."""
+    """Call the process-global Omp service without silently changing authority."""
     try:
         result = _default_host().memory_call(command, params)
     except Exception as exc:  # noqa: BLE001 - host/process boundary
@@ -159,15 +159,6 @@ def _project_root(project_root: str | Path) -> str:
     return str(Path(project_root).expanduser().resolve())
 
 
-def _stable_int_id(raw_id: Any) -> int:
-    """Map an opaque Chudcode memory id onto the public integer id shape."""
-    if isinstance(raw_id, int):
-        return raw_id
-    if isinstance(raw_id, str) and raw_id.isdigit():
-        return int(raw_id)
-    digest = hashlib.sha256(str(raw_id).encode("utf-8")).digest()[:8]
-    return int.from_bytes(digest, "big")
-
 
 def _host_remember(
     project_root: str | Path,
@@ -175,19 +166,20 @@ def _host_remember(
     kind: str,
     source: str,
     importance: float,
-) -> int | None:
+) -> str | None:
+    if kind != "note":
+        raise ProjectMemoryUnavailable("OMP memory save does not support a kind")
     result = _memory_call(
-        "memory_remember",
+        "memory_save",
         {
             "root": _project_root(project_root),
             "content": text,
-            "kind": kind,
             "source": source,
             "importance": importance,
         },
     )
-    raw_id = result.get("id", result.get("value"))
-    return None if raw_id is None else _stable_int_id(raw_id)
+    ids = result.get("ids")
+    return ids[0] if isinstance(ids, list) and ids and isinstance(ids[0], str) else None
 
 
 def _apply_token_budget(
@@ -228,69 +220,33 @@ def _host_recall(
     token_budget: int,
     kind: str | None,
 ) -> list[dict[str, Any]]:
-    """Recall ranked Chudcode memories and enforce Chudware's context budget."""
+    """Recall ranked Omp memories and enforce Chudware's context budget."""
+    if kind:
+        raise ProjectMemoryUnavailable("OMP memory search does not support a kind filter")
     params: dict[str, Any] = {
         "root": _project_root(project_root),
         "query": query,
         "limit": limit,
-        "tokenBudget": token_budget,
     }
-    if kind:
-        params["kind"] = kind
-    result = _memory_call("memory_recall", params)
-    hits = result.get("hits", result.get("value"))
+    result = _memory_call("memory_search", params)
+    hits = result.get("items")
     if not isinstance(hits, list):
-        return []
+        raise ProjectMemoryUnavailable("OMP memory search returned no items list")
     out: list[dict[str, Any]] = []
     for hit in hits[:limit]:
         if not isinstance(hit, Mapping):
             continue
         content = str(hit.get("content") or "")
-        try:
-            importance = float(hit.get("importance") or 0.5)
-        except (TypeError, ValueError):
-            importance = 0.5
-        try:
-            score = float(hit.get("score") or 0.0)
-        except (TypeError, ValueError):
-            score = 0.0
-        raw_id = hit.get("id")
-        out.append(
-            {
-                "id": _stable_int_id(raw_id) if raw_id is not None else 0,
-                "content": content,
-                "kind": str(
-                    hit.get("kind")
-                    or hit.get("memory_type")
-                    or hit.get("memoryType")
-                    or "note"
-                ),
-                "source": str(hit.get("source") or ""),
-                "importance": importance,
-                "score": score,
-                "tokens": estimate_tokens(content),
-            }
-        )
+        item = {key: hit[key] for key in ("id", "content", "source", "timestamp", "score")
+                if key in hit}
+        item["content"] = content
+        item["tokens"] = estimate_tokens(content)
+        out.append(item)
     return _apply_token_budget(out, limit, token_budget)
 
 
 def _host_stats(project_root: str | Path) -> dict[str, Any]:
-    result = _memory_call("memory_stats", {"root": _project_root(project_root)})
-    try:
-        count = int(result.get("count", result.get("total_memories", 0)) or 0)
-    except (TypeError, ValueError):
-        count = 0
-    exists_value = result.get("exists")
-    exists = bool(exists_value) if exists_value is not None else count > 0
-    out: dict[str, Any] = {
-        "path": str(memory_db_path(project_root)),
-        "count": count,
-        "exists": exists,
-    }
-    if exists:
-        kinds = result.get("kinds")
-        out["kinds"] = dict(kinds) if isinstance(kinds, Mapping) else {}
-    return out
+    return _memory_call("memory_status", {"root": _project_root(project_root)})
 
 
 def remember(
@@ -300,10 +256,10 @@ def remember(
     kind: str = "note",
     source: str = "",
     importance: float = 0.5,
-) -> int | None:
-    """Insert a project memory, returning a stable integer id (or None if empty).
+) -> int | str | None:
+    """Insert a project memory, returning its backend ID (or None if empty).
 
-    Online calls have one authority: the process-global Chudcode service.
+    Online calls have one authority: the process-global Omp service.
     Explicit offline mode uses the deterministic project-local SQLite store.
     """
     text = _normalize_content(content)
@@ -464,7 +420,7 @@ def format_for_context(
 
 
 def stats(project_root: str | Path) -> dict[str, Any]:
-    """Return project-scoped counts from Chudcode or the explicit offline store."""
+    """Return project-scoped counts from Omp or the explicit offline store."""
     if not _offline_memory():
         return _host_stats(project_root)
     path = memory_db_path(project_root)

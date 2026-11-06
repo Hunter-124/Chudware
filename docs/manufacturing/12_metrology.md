@@ -1,18 +1,9 @@
 # Probing & Quality Architecture — Chudware Manufacture Overhaul
 
-Owner: MetrologyArchitecture. Design-only: this document specifies probing and quality; it
-records no implementation change by itself. Snapshot 2026-08-08.
-
-Bound to the accepted ownership rulings: Gateway owns the controller wire/state vocabulary and the
-Grbl parse seam; Twin owns deterministic emulation state under `core/twin/`; Metrology owns
-measurement/probe result schemas and offset proposals; UX owns `FreshValue<T>` and every
-GUI file; wave slicing and the append-only integration seams are owned by the execution plan.
-
-**Gateway rules are cited by stable id, never by gateway section number** (review C10, which
-found three of five §24 cross-references pointing at unrelated rules). Every id below names a
-rule already ratified in `10_gateway.md`; `test_metrology_*` and
-`contracts/manufacturing_metrology.md` key on the id, so a gateway renumbering cannot turn one
-of metrology's assertions into a wrong one.
+Design proposal. See the [as-built map](README.md#as-built-map) for the implemented subset.
+The gateway defines the controller vocabulary and durable `seq`; the twin supplies emulation
+state, metrology defines measurement schemas and offset proposals, and `FreshValue<T>` is
+the external freshness shape. The gateway rules below are cited by stable id.
 
 | Stable id | Rule as ratified |
 |---|---|
@@ -1552,31 +1543,6 @@ alarm/disconnect/reset, jog, home, zero, override, unlock, or issue a safety com
 
 ---
 
-## 11. Migration order
-
-```mermaid
-graph LR
-  W1[Wave 1 fail-open fixes a/b/c] --> M7[M7 camera station + advisory]
-  M1[M1 frames + observation] --> M2[M2 probe + fit + cycles]
-  M2 --> M3[M3 twin virtual probe]
-  M2 --> M4[M4 post + gateway execute]
-  M4 --> M5[M5 offsets]
-  M3 --> M5
-  M5 --> M6[M6 inspection]
-  M1 --> M7
-  M2 --> M8[M8 registration]
-  M7 --> M8
-  M6 --> M9[M9 MCP + GUI wiring]
-  M8 --> M9
-```
-
-M1 is the gate — nothing else compiles without frames and observations. **M7 goes wide in
-Wave 2 alongside M1/M2** (Planner's slicing) on a disjoint file set
-(`services/vision/*.py`, `host/src/platform/camera.*`) from M2–M6 (`core/metrology/*`,
-`core/cam/*`). M3 needs Twin; M4 needs Gateway. §5.2's exhaustive-switch work ships **with**
-the `MoveKind` change in M2, never after.
-
----
 
 ## 12. Non-goals
 
@@ -1604,25 +1570,3 @@ Deliberate, each for a reason.
 - **No safety function of any kind.** Probe overtravel protection is the hardware's and the
   controller's job. Nothing here substitutes for E-stop or interlocks.
 
----
-
-## 13. Review closure — B7, B9, B10 (metrology), B12, C3, C8
-
-Each row is a reconciliation of this document against the ratified gateway text or DoD v4. No
-product scope changed: the tiers, guard set, Tier-0 rows, workflows and non-goals are the same
-ones already accepted.
-
-| Finding | Required correction (review) | Where applied here | Result |
-|---|---|---|---|
-| **B7** — metrology re-declares `CapabilityTruth`, using `probed` as a truth value | Adopt `CapabilityTruth` verbatim from `core/device/capability.h`; `{source, freshness}` survives only inside the uncertainty budget | §1 rewritten (verbatim type, `V*`/`U` reachability table, three `why` texts); §2's stage-1 clause now reads `truth=="verified"`; §3.5's deleted-guard row now reads `truth` | The per-level `{source, freshness}` shape is withdrawn; `probed` appears only as an observation `src`. One capability definition batch-wide |
-| **B9a** — metrology computes its own invalidation closure | Supply `derived_from[]` on every append, name only the root subject, let the gateway emit the closure and per-dependent notices | §6.3 "Roots only — the gateway computes the closure" (four-point division of labour); §6.4 declares `derived_from` per kind; §7 Gateway dependency list | "The producer walks the graph" and the per-dependent `cascade_from` events are withdrawn; `affected[]` is quoted from the gateway, never computed |
-| **B9b** — a second durable store outside the single-writer journal | Keep the ledger only as a tamper-evidence mirror quoting the gateway's `seq`/`at_seq`, never read as truth | §6.3 "Audit ledger — a never-read mirror", with two contract-tested consequences; `test_metrology_ledger` (§9) | The ledger mints nothing, orders nothing, and no production path reads it — exactly the status `GW-DOMAIN-MIRROR` grants a domain mirror |
-| **B10** (metrology's quarter) — durable kinds absent from the W1.1 table, so appends and capability are refused | Submit a kind table carrying both reconciliation columns plus a `<domain>.capability` kind before W1.1 closes | §6.4: 15 `metrology.*` kinds, each with (a) epoch policy, (b) runtime triggers, `derived_from` roots and `supersede_with_parent`; §5.6 seam row into `contracts/manufacturing_gateway.md` | Includes `metrology.capability` (`supersede_with_parent:false`, mandatory) and `metrology.procedural_fact` (`true`, mandatory). Every row is `epoch_invariant`, with the no-probed-transport reason stated |
-| **B12** (metrology's third) — no MCP family named, so the surface would ship enabled | Register through `view(mcp, "manufacture")`, keeping granularity via `get_tool_options` | §10 Agent section; §5.5 and §5.6 `tool_registry.py` rows (data, applied by Gateway); `test_metrology_tools.py` (§9) | Shared family, off by default, no second family id, no file-ownership collision |
-| **C3** — invalidation dispatch specified five different ways | One invalidation event per domain carrying the DoD-9 envelope; `class` carries alarm-vs-quiet, `reason` the per-trigger distinction | §6 event list; §6.1 rewritten to one event plus two closed `reason` enums; call sites in §3.2, §3.6, §6.2 and §6.2a updated | 18 event names → 1 event (`mfg.metrology.invalidated`) + 27 reason codes. No dependent reason codes exist, because dependents arrive through the closure |
-| **C8** — capability/durable rows wrapped by some domains, never-wrapped by another | A durable authored row is journaled **and** published wrapped, `ttl_ms:null` and `state:"ok"` for rows that do not decay | §3 durable-rows paragraph; §1's capability row; §6.1's `published` block and the envelope-vs-payload split | Painted values stay `FreshValue`-wrapped; the notice fields themselves stay plain scalars, so nobody can ask whether a retraction is stale |
-
-**Still open and owned elsewhere:** B16. The "Guard audit" (ii) bullet assigns the whole-source-set
-unsatisfiability audit for run-approval rows to the approval-path owner, and UX's row set is not
-readable in the corpus. That obligation stays open against UX (or against Gateway, if it is
-reassigned in writing); nothing in this document can discharge it.

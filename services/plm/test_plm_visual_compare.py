@@ -335,16 +335,17 @@ def test_plm_release_succeeds_without_engine(monkeypatch, tmp_path):
 # services/parts/test_x3_browser_catalog.py.
 
 def _live_part(with_boss: bool) -> dict:
-    """A recipe the engine can actually build. Rev B adds a boss and drills a hole."""
+    """A recipe the engine can actually build. Rev B drills a hole and adds a boss."""
     feats = [{"id": "f1", "type": "box",
               "params": {"length": 40, "width": 30, "height": 10}}]
     if with_boss:
         feats += [
-            {"id": "f2", "type": "box",
-             "params": {"length": 10, "width": 10, "height": 12, "center": [12, 0, 5]}},
-            {"id": "f3", "type": "hole",
+            {"id": "f2", "type": "hole",
              "params": {"style": "simple", "end": "through_all", "diameter": 8,
-                        "face": {"of": "face", "side": "top"}, "positions": [[-12, 0]]}},
+                        "world_points": [[-12, 0, 5]]},
+             "refs": {"face": {"of": "face", "side": "top"}}},
+            {"id": "f3", "type": "box",
+             "params": {"length": 10, "width": 10, "height": 12, "at": [12, 0, 5]}},
         ]
     return {"schema": "aicad.part/1", "id": "uuid-live-1", "name": "Plate",
             "features": feats}

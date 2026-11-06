@@ -31,6 +31,8 @@ jobs:
     runs-on: ubuntu-24.04
     container:
       image: fedora:44
+      # Reap orphaned subprocesses when timeout/process-group tests terminate parents.
+      options: --init
       # Large preinstalled SDKs on the host that this job never uses. They are
       # mounted only so the first step can delete them and free disk space.
       volumes:
@@ -54,6 +56,9 @@ jobs:
           persist-credentials: false
           # gate.sh generates the version header from `git describe --tags`.
           fetch-depth: 0
+
+      - name: Initialize private state and checkout trust
+        run: bash .github/scripts/prepare-linux-ci.sh
 
       - name: Install system dependencies
         run: bash .github/scripts/install-fedora-deps.sh gate

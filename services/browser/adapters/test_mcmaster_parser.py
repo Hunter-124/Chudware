@@ -74,7 +74,7 @@ def test_mcmaster_search_yields_product_family_urls(mcmaster_mods, monkeypatch):
 
     # Only the three "~~/" family tiles — the "~/" subcategory is not emitted.
     assert len(hits) == 3
-    assert all(h["kind"] == "family" for h in hits)
+    assert all(h["kind"] == "series" for h in hits)
     assert all(h["site"] == "mcmaster" for h in hits)
 
     # URLs are real product-family SKU-TABLE pages (rebuilt with the CATEGORY
@@ -90,8 +90,10 @@ def test_mcmaster_search_yields_product_family_urls(mcmaster_mods, monkeypatch):
 
     # Honest: a family is a configurable per-SKU table — no single sku/part_number
     # is invented at the search level.
-    assert "sku" not in hits[0]
-    assert "part_number" not in hits[0]
+    assert hits[0]["sku"] is None
+    assert hits[0]["thumbnail"] == (
+        "https://www.mcmaster.com/mvC/Contents/gfx/ImageCache/912/91290A432_x@100p.png")
+    assert hits[1]["thumbnail"] is None
 
     # None of the emitted URLs is a bare department landing page.
     assert not any(h["url"].rstrip("/").endswith("fastening-and-joining") for h in hits)
@@ -117,14 +119,13 @@ def test_mcmaster_search_uses_product_line_crumb_when_no_family(mcmaster_mods, m
     hits = mcmaster.ADAPTER.search("ball bearing")
 
     assert len(hits) == 1
-    assert hits[0]["kind"] == "family"
+    assert hits[0]["kind"] == "series"
     assert hits[0]["title"] == "Ball Bearings"
     assert hits[0]["url"] == "https://www.mcmaster.com/products/bearings/ball-bearings-2~~/"
 
 
-def test_mcmaster_search_no_breadcrumb_returns_empty(mcmaster_mods, monkeypatch):
-    # Result tiles but no product-family breadcrumb → no category to build a
-    # renderable URL from → honest empty (never a speculative URL).
+def test_mcmaster_search_no_breadcrumb_reports_parse_failure(mcmaster_mods, monkeypatch):
+    # Without the breadcrumb there is no reliable family URL to construct.
     mcmaster, session = mcmaster_mods
     tiles_only = (
         '<div><a class="_selectable_srkjh_1" href="steel-socket-head-screws~~/?s=x">'
@@ -133,7 +134,7 @@ def test_mcmaster_search_no_breadcrumb_returns_empty(mcmaster_mods, monkeypatch)
     monkeypatch.setattr(session, "browser_fetch",
                         lambda url, site: {"ok": True, "content": tiles_only})
 
-    assert mcmaster.ADAPTER.search("x") == []
+    assert mcmaster.ADAPTER.search("x")[0]["reason"] == "parse_failed"
 
 
 def test_mcmaster_search_login_wall_surfaces_ask_user(mcmaster_mods, monkeypatch):
@@ -171,6 +172,7 @@ def test_mcmaster_acquire_downloads_client_generated_step(mcmaster_mods, monkeyp
 
     def fake_download(url, site, dest, **kw):
         seen["download_url"] = url
+        dest.write_bytes(b"ISO-10303-21;\nHEADER;\nENDSEC;\nEND-ISO-10303-21;")
         return {"ok": True, "dest": str(dest), "session_profile_used": "mcmaster"}
 
     monkeypatch.setattr(session, "browser_interact", fake_interact)
@@ -178,7 +180,7 @@ def test_mcmaster_acquire_downloads_client_generated_step(mcmaster_mods, monkeyp
 
     out = mcmaster.ADAPTER.acquire({
         "url": "https://www.mcmaster.com/products/socket-head-screws/steel-socket-head-screws~~/",
-        "title": "Steel Socket Head Screws", "kind": "family",
+        "title": "Steel Socket Head Screws", "kind": "series",
         "part_number": "91290A115"})
 
     assert out["ok"] is True
@@ -191,6 +193,8 @@ def test_mcmaster_acquire_downloads_client_generated_step(mcmaster_mods, monkeyp
     assert seen["download_url"].startswith("https://www.mcmaster.com/mvC/Library/CAD2/")
     assert seen["download_url"].endswith(".STEP")
     assert out["artifact_path"].endswith(".STEP")
+    assert out["artifact_kind"] == "cad"
+    assert out["format"] == "step"
 
 
 def test_mcmaster_acquire_derives_part_number_from_url(mcmaster_mods, monkeypatch):
@@ -200,9 +204,10 @@ def test_mcmaster_acquire_derives_part_number_from_url(mcmaster_mods, monkeypatc
     monkeypatch.setattr(session, "browser_interact",
                         lambda url, site, script, **kw: {
                             "ok": True, "content": _sentinel_dom("ok", fp), "final_url": url})
-    monkeypatch.setattr(session, "browser_download",
-                        lambda url, site, dest, **kw: {
-                            "ok": True, "dest": str(dest), "session_profile_used": "mcmaster"})
+    def fake_download(url, site, dest, **kw):
+        dest.write_bytes(b"ISO-10303-21;\nHEADER;\nENDSEC;\nEND-ISO-10303-21;")
+        return {"ok": True, "dest": str(dest), "session_profile_used": "mcmaster"}
+    monkeypatch.setattr(session, "browser_download", fake_download)
 
     out = mcmaster.ADAPTER.acquire({"url": "https://www.mcmaster.com/90044A203/"})
     assert out["ok"] is True
@@ -222,7 +227,7 @@ def test_mcmaster_acquire_login_status_degrades(mcmaster_mods, monkeypatch):
 
 
 def test_mcmaster_acquire_no_step_model_is_honest(mcmaster_mods, monkeypatch):
-    # A part with no 3-D model → data-status="nofile", no FilePath → no_download_link.
+    # A part with no 3-D model reports an unavailable CAD format.
     mcmaster, session = mcmaster_mods
     monkeypatch.setattr(session, "browser_interact",
                         lambda url, site, script, **kw: {
@@ -230,26 +235,101 @@ def test_mcmaster_acquire_no_step_model_is_honest(mcmaster_mods, monkeypatch):
 
     out = mcmaster.ADAPTER.acquire({"url": "https://www.mcmaster.com/91290A115/"})
     assert out["ok"] is False
-    assert out["reason"] == "no_download_link"
+    assert out["reason"] == "unsupported"
 
 
-def test_mcmaster_acquire_picks_first_sku_from_family_table(mcmaster_mods, monkeypatch):
-    # No part_number and a family URL (not a /<PN>/ page): fetch the table and pick
-    # the first concrete part number off it.
+def test_mcmaster_family_requires_explicit_sku(mcmaster_mods, monkeypatch):
     mcmaster, session = mcmaster_mods
     table = '<table><span class="part-number">91251A051</span> more 91251A052</table>'
-    fp = "/mvC/Library/CAD2/x/91251A051_Screw.STEP"
     monkeypatch.setattr(session, "browser_fetch",
                         lambda url, site: {"ok": True, "content": table})
     monkeypatch.setattr(session, "browser_interact",
-                        lambda url, site, script, **kw: {
-                            "ok": True, "content": _sentinel_dom("ok", fp), "final_url": url})
+                        lambda *a, **kw: pytest.fail("no SKU was selected"))
     monkeypatch.setattr(session, "browser_download",
-                        lambda url, site, dest, **kw: {
-                            "ok": True, "dest": str(dest), "session_profile_used": "mcmaster"})
-
+                        lambda *a, **kw: pytest.fail("no SKU was selected"))
     out = mcmaster.ADAPTER.acquire({
         "url": "https://www.mcmaster.com/products/socket-head-screws/steel-socket-head-screws~~/",
-        "kind": "family"})
-    assert out["ok"] is True
-    assert out["sku"] == "91251A051"
+        "kind": "series"})
+    assert out["reason"] == "unsupported"
+    assert out["ask_user"]["required"] is True
+    assert "91251A051" in out["ask_user"]["prompt"]
+    assert "91251A052" in out["ask_user"]["prompt"]
+
+
+def test_mcmaster_search_encodes_query_and_preserves_product_data(mcmaster_mods, monkeypatch):
+    mcmaster, session = mcmaster_mods
+    seen = {}
+    card = ('<a class="product-card" href="/91290A115/">Screw '
+            '<img data-src="/images/screw.jpg"><span class="part-number">91290A115</span>'
+            '<span class="price">$1,234.50</span></a>')
+    def fetch(url, site):
+        seen["url"] = url
+        return {"ok": True, "content": card}
+    monkeypatch.setattr(session, "browser_fetch", fetch)
+    hit = mcmaster.ADAPTER.search("1/4 bolt & nut +")[0]
+    assert seen["url"].endswith("/1%2F4-bolt-%26-nut-%2B/")
+    assert hit["kind"] == "product"
+    assert hit["sku"] == "91290A115"
+    assert hit["thumbnail"] == "https://www.mcmaster.com/images/screw.jpg"
+    assert (hit["price"], hit["currency"]) == (1234.50, "USD")
+
+
+@pytest.mark.parametrize(("content", "reason"), [
+    ("<title>Access Denied</title>", "blocked"),
+    ("<html>Please complete the security check</html>", "captcha"),
+    ("<html>unknown search layout</html>", "parse_failed"),
+])
+def test_mcmaster_search_distinguishes_unusable_pages(mcmaster_mods, monkeypatch, content, reason):
+    mcmaster, session = mcmaster_mods
+    monkeypatch.setattr(session, "browser_fetch", lambda *a: {"ok": True, "content": content})
+    failure = mcmaster.ADAPTER.search("bolt")[0]
+    assert (failure["site"], failure["op"], failure["reason"]) == ("mcmaster", "search", reason)
+
+
+def test_mcmaster_initial_live_shell_is_not_a_confirmed_empty_search(mcmaster_mods, monkeypatch):
+    # Trimmed from the 2026-11-04 raw HTTP response: the browse-catalog
+    # navigation is present in the SPA shell but is not a search result.
+    shell = ('<title>McMaster-Carr</title><base href="/" />'
+             '<section class="browse-catalog-menu"><ul class="category-list"><li>'
+             '<a id="catg0_Abrading-Polishing" class="category-tile" '
+             'href="/products/abrading-and-polishing/" tabIndex="-1">'
+             '<span class="category-name">Abrading &amp; Polishing</span>'
+             '</a></li></ul></section>')
+    mcmaster, session = mcmaster_mods
+    monkeypatch.setattr(session, "browser_fetch", lambda *a: {"ok": True, "content": shell})
+    assert mcmaster.ADAPTER.search("ball bearings")[0]["reason"] == "parse_failed"
+
+
+def test_mcmaster_confirmed_empty_search(mcmaster_mods, monkeypatch):
+    mcmaster, session = mcmaster_mods
+    monkeypatch.setattr(session, "browser_fetch",
+                        lambda *a: {"ok": True, "content": "<p>No results found</p>"})
+    assert mcmaster.ADAPTER.search("obscure") == []
+
+
+def test_mcmaster_preserves_unsupported_interaction_backend(mcmaster_mods, monkeypatch):
+    mcmaster, session = mcmaster_mods
+    monkeypatch.setattr(session, "browser_interact",
+                        lambda *a, **kw: {"ok": False, "reason": "unsupported",
+                                         "hint": "Selected backend cannot interact"})
+    out = mcmaster.ADAPTER.acquire({"url": "https://www.mcmaster.com/91290A115/"})
+    assert out["reason"] == "unsupported"
+    assert out["site"] == "mcmaster" and out["op"] == "acquire"
+    assert "backend" in out["hint"]
+
+
+def test_mcmaster_rejects_invalid_cad_and_conflicting_sku(mcmaster_mods, monkeypatch):
+    mcmaster, session = mcmaster_mods
+    fp = "/models/91290A115.STEP"
+    monkeypatch.setattr(session, "browser_interact",
+                        lambda *a, **kw: {"ok": True, "content": _sentinel_dom("ok", fp)})
+    def download(url, site, dest):
+        dest.write_bytes(b"<html>Sign in</html>")
+        return {"ok": True, "dest": str(dest)}
+    monkeypatch.setattr(session, "browser_download", download)
+    out = mcmaster.ADAPTER.acquire({"url": "https://www.mcmaster.com/91290A115/"})
+    assert out["ok"] is False and out["reason"] == "parse_failed"
+    assert "artifact_path" not in out
+    conflict = mcmaster.ADAPTER.acquire({"url": "https://www.mcmaster.com/91290A115/",
+                                          "sku": "91290A116"})
+    assert conflict["reason"] == "unsupported"

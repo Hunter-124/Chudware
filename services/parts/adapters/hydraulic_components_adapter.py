@@ -34,6 +34,30 @@ _TITLES: dict[str, str] = {
     "heat_exchanger":       "Hydraulic oil cooler / heat exchanger (ISO 1219)",
 }
 
+_DISPLAY_NAMES = {
+    "pump": "Hydraulic Pump",
+    "cylinder_linear": "Linear Hydraulic Cylinder",
+    "cylinder_rotary": "Rotary Hydraulic Cylinder",
+    "valve_directional": "Directional Control Valve",
+    "valve_check": "Check Valve",
+    "valve_relief": "Relief Valve",
+    "valve_flow_control": "Flow Control Valve",
+    "accumulator": "Hydraulic Accumulator",
+    "reservoir": "Hydraulic Reservoir",
+    "motor_hydraulic": "Hydraulic Motor",
+    "filter": "Hydraulic Filter",
+    "heat_exchanger": "Hydraulic Heat Exchanger",
+}
+
+_ALIASES = {
+    "cylinder_linear": ["linear hydraulic actuator"],
+    "cylinder_rotary": ["rotary hydraulic actuator"],
+    "valve_relief": ["pressure-limiting valve"],
+    "reservoir": ["hydraulic tank"],
+    "filter": ["hydraulic strainer"],
+    "heat_exchanger": ["hydraulic oil cooler"],
+}
+
 # Pump sub-type vocabulary (informational — carried in params)
 _PUMP_TYPES = ("gear", "vane", "piston_axial", "piston_radial", "screw")
 # Actuator sub-types
@@ -73,7 +97,8 @@ class HydraulicComponentsAdapter:
         for rec in self.iter_records():
             title = (rec.get("title") or "").lower()
             designation = (rec.get("designation") or "").lower()
-            if norm in title or norm in designation:
+            if (norm in title or norm in designation
+                    or any(norm in alias.lower() for alias in rec["aliases"])):
                 results.append(rec)
         return results
 
@@ -104,8 +129,9 @@ class HydraulicComponentsAdapter:
 # ---------------------------------------------------------------------------
 
 def _make_record(component_type: str) -> dict:
-    title = _TITLES.get(component_type,
-                        f"Hydraulic component: {component_type} (ISO 1219)")
+    family = _DISPLAY_NAMES.get(component_type, f"Hydraulic component: {component_type}")
+    title = f"{family} (ISO 1219)"
+    aliases = [_TITLES.get(component_type, title), *_ALIASES.get(component_type, [])]
     designation = component_type
 
     params: dict = {
@@ -124,6 +150,8 @@ def _make_record(component_type: str) -> dict:
         "part_id":      f"hydraulic:ISO1219:{component_type}",
         "domain":       "hydraulic",
         "title":        title,
+        "family":       family,
+        "aliases":      aliases,
         "standard":     "ISO 1219",
         "designation":  designation,
         "params":       params,

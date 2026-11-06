@@ -93,24 +93,13 @@ def test_live_ledger_aliases_and_criterion_result_section(tmp_path):
     assert mission_brief["ok"] and mission_brief["section"] == "brief"
 
 
-def test_delegating_roles_use_dispatch_budget_tokens_contract():
-    """Role guidance must name the same kwarg exposed by MissionDispatch."""
-    from services.agent.roles import load_role
-
-    for role_id in ("orchestrator", "spec_writer"):
-        card = load_role(role_id)
-        assert "delegate" in card.concrete_tools
-        assert "delegate(role, brief, budget_tokens)" in card.system_prompt
-        assert "delegate(role, brief, budget)" not in card.system_prompt
-
-
 def test_buildgraph_plan_accepts_live_compact_buildgraph_shape():
     """Mega-3/4 planner output with format/title/deps must not become nodes=[]."""
     from services.agent.buildgraph.planner import build_graph
 
     payload = {
         "format": "aicad.buildgraph/1",
-        "mission": "mega-4-fc-rocket-20260714",
+        "mission": "mega-4-fc-chassis-20260714",
         "nodes": [
             {
                 "id": "N01_architecture",
@@ -137,7 +126,7 @@ def test_buildgraph_plan_accepts_live_compact_buildgraph_shape():
         ],
     }
 
-    graph, advisories = build_graph(payload, mission="mega-4-fc-rocket-20260714")
+    graph, advisories = build_graph(payload, mission="mega-4-fc-chassis-20260714")
 
     assert graph["schema"] == "aicad.buildgraph/1"
     assert len(graph["nodes"]) == 3

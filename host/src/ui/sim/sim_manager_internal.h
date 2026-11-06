@@ -19,6 +19,7 @@
 
 #include "imgui.h"
 
+#include "../../app_commands.h"
 #include "../../core/app_state.h"
 #include "../../ui_theme.h"
 #include "../appearance_common.h" // materialAppearance / kPhysicalMaterials — set_material recolour
@@ -34,10 +35,6 @@ using namespace simmgr;
 
 namespace simmgr {
 
-inline bool activeDocIsAssembly(const AppState &st) {
-  return st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
-         st.docTabs[st.activeTab].kind == AppState::DocTab::TabKind::Assembly;
-}
 
 // ---- liquid-glass v2: shared FeatureManager-column surface (host contract
 // §H4) ---------------- The Simulation tree body is drawn EMBEDDED inside
@@ -351,11 +348,6 @@ inline bool applyPartMaterialNow(AppState &st, Study &s, const std::string &key,
     error = "Cannot update the part material without an open engine document.";
     return false;
   }
-  if (st.docLockedByAgent(st.docMirror.docId())) {
-    error = st.agentLockReason(st.docMirror.docId());
-    st.toast(ui::ToastLevel::Warn, error);
-    return false;
-  }
   const auto response = st.docMirror.applyOps(st.worker, partMaterialOps(st, key));
   if (!response.ok) {
     error = "Could not update the part material: " +
@@ -364,37 +356,30 @@ inline bool applyPartMaterialNow(AppState &st, Study &s, const std::string &key,
   }
   s.materialKey = key;
   if (!response.aicm_path.empty()) st.loadDocMeshAsync(response.aicm_path);
-  st.markActiveTabDirty();
   return true;
 }
 
 // Normal material-combo edits stay non-blocking; canonical Apply uses the completed path above.
 inline bool applyPartMaterial(AppState &st, Study &s, const std::string &key) {
-  if (st.docLockedByAgent(st.docMirror.docId())) {
-    st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
-    return false;
-  }
   s.materialKey = key;
   if (!st.docMirror.hasDoc() || !st.workerStarted) return true;
   ++st.rebuildsInFlight;
   st.docMirror.applyOpsAsync(
       st.rpc, st.worker, partMaterialOps(st, key),
-      [&st](const core::OpsResponse &resp, bool applied) {
+      [&st](const core::OpsResponse &resp, bool current) {
         --st.rebuildsInFlight;
-        if (!applied)
+        if (!current)
           return;
-        if (resp.ok && !resp.aicm_path.empty()) {
-          st.loadDocMeshAsync(resp.aicm_path);
-        } else if (!resp.ok) {
-          st.addLog(std::string("[err] set_material: ") + resp.error_message);
-          if (resp.error_code != "transport")
-            st.toast(ui::ToastLevel::Error,
-                     std::string("set_material failed: ") +
-                         (resp.error_message.empty() ? resp.error_code
-                                                     : resp.error_message));
+        if (!resp.ok) {
+          const std::string detail = resp.error_message.empty() ? resp.error_code
+                                                                : resp.error_message;
+          st.addLog(std::string("[err] set_material: ") + detail);
+          if (st.isActiveMirrorDoc())
+            st.toast(ui::ToastLevel::Error, std::string("set_material failed: ") + detail);
+          return;
         }
-        if (resp.ok)
-          st.markActiveTabDirty();
+        if (st.isActiveMirrorDoc() && !resp.aicm_path.empty())
+          st.loadDocMeshAsync(resp.aicm_path);
       });
   return true;
 }

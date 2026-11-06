@@ -101,7 +101,8 @@ std::optional<int> python_int(const std::string& s) {
 
 // Parse "4x4"-style nominal → (thickness_nom_in, width_nom_in).
 std::optional<std::pair<int, int>> parse_nominal_lumber(const std::string& section_name) {
-    const std::string name = upper_strip(section_name);
+    std::string name = upper_strip(section_name);
+    if (name.rfind("NDS:", 0) == 0) name.erase(0, 4);
     const auto pos = name.find('X');
     if (pos == std::string::npos) return std::nullopt;
     const auto t = python_int(name.substr(0, pos));
@@ -222,7 +223,9 @@ double board_feet(const StructuralElement& el) {
 }
 
 double steel_weight_lbs(const StructuralElement& el) {
-    const std::string key = upper_strip(el.section_name);
+    std::string key = upper_strip(el.section_name);
+    if (key.rfind("AISC360:", 0) == 0) key.erase(0, 8);
+    else if (key.rfind("AISC:", 0) == 0) key.erase(0, 5);
     for (const auto& [name, lbs] : kAiscLbsPerFt) {
         if (key == name) return lbs * length_ft(el);
     }

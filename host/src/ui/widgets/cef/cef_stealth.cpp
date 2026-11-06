@@ -266,9 +266,21 @@ CefRefPtr<CefRegistration> apply_stealth(CefRefPtr<CefBrowser> browser) {
                               "." + std::to_string(CHROME_VERSION_PATCH);
     // Reduced UA (Chrome/<major>.0.0.0) — matches what modern Chrome actually sends
     // and can't drift from the real build.
-    const std::string reducedUa =
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/" + major + ".0.0.0 Safari/537.36";
+#if defined(_WIN32)
+    constexpr const char* osUa = "Windows NT 10.0; Win64; x64";
+    constexpr const char* osPlatform = "Windows";
+    constexpr const char* navigatorPlatform = "Win32";
+#elif defined(__APPLE__)
+    constexpr const char* osUa = "Macintosh; Intel Mac OS X 10_15_7";
+    constexpr const char* osPlatform = "macOS";
+    constexpr const char* navigatorPlatform = "MacIntel";
+#else
+    constexpr const char* osUa = "X11; Linux x86_64";
+    constexpr const char* osPlatform = "Linux";
+    constexpr const char* navigatorPlatform = "Linux x86_64";
+#endif
+    const std::string reducedUa = std::string("Mozilla/5.0 (") + osUa +
+        ") AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + major + ".0.0.0 Safari/537.36";
 
     CefRefPtr<CefListValue> brands = CefListValue::Create();
     brands->SetDictionary(0, brand("Chromium", major));
@@ -283,7 +295,7 @@ CefRefPtr<CefRegistration> apply_stealth(CefRefPtr<CefBrowser> browser) {
     meta->SetList("brands", brands);
     meta->SetList("fullVersionList", fullList);
     meta->SetString("fullVersion", full);
-    meta->SetString("platform", "Linux");
+    meta->SetString("platform", osPlatform);
     meta->SetString("platformVersion", "");
     meta->SetString("architecture", "x86");
     meta->SetString("model", "");
@@ -294,7 +306,7 @@ CefRefPtr<CefRegistration> apply_stealth(CefRefPtr<CefBrowser> browser) {
     CefRefPtr<CefDictionaryValue> params = CefDictionaryValue::Create();
     params->SetString("userAgent", reducedUa);
     params->SetString("acceptLanguage", "en-US,en");  // CDP re-weights; no explicit q
-    params->SetString("platform", "Linux x86_64");
+    params->SetString("platform", navigatorPlatform);
     params->SetDictionary("userAgentMetadata", meta);
     // In-process only — no remote-debugging port, no Runtime.enable (see header).
     browser->GetHost()->ExecuteDevToolsMethod(0, "Network.setUserAgentOverride", params);

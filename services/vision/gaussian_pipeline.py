@@ -318,6 +318,23 @@ def _view_camera(model, batch_id: str) -> dict | None:
     return None
 
 
+def train_splat_from_dataset(dataset_dir, out_dir, *, iterations=2000, export_every=None,
+                             mode="environment", crop_bounds=None,
+                             supervised_process_group=False):
+    """Train from an existing undistorted dataset, without re-solving its poses.
+
+    ``dataset_dir`` contains ``images/`` and ``sparse/`` (or ``sparse/0``),
+    optionally with ``image_name_map.json``. Progress and results are written
+    under ``out_dir`` in the same format as a supervised Gaussian job.
+    """
+    request = {"dataset_dir": str(dataset_dir), "work_dir": str(out_dir),
+               "session_dir": str(out_dir), "iterations": iterations, "mode": mode,
+               "crop_bounds": crop_bounds}
+    if export_every is not None:
+        request["export_every"] = export_every
+    return run(request, supervised_process_group=supervised_process_group)
+
+
 def run(request: dict, *, supervised_process_group: bool = False) -> dict:
     """Execute one frozen snapshot. The caller allocates a fresh work directory."""
     work = Path(request["work_dir"]).expanduser().resolve()
@@ -339,68 +356,112 @@ def run(request: dict, *, supervised_process_group: bool = False) -> dict:
         session = Path(request["session_dir"]).expanduser().resolve()
         progress.update(total_iterations=iterations, mode=mode, crop_bounds=crop,
                         max_splats=2_000_000)
-        paths = list(request.get("images", []))
-        if request.get("video_path"):
-            from .frames import extract_frames
-            progress.update(stage="extracting", msg="Extracting sharp video frames")
-            extraction = extract_frames(request["video_path"], str(session / "frames"))
-            paths.extend(frame.path for frame in extraction.frames)
-            progress.update(video_extraction=extraction.to_dict())
-        images = work / "input_images"
-        images.mkdir(exist_ok=False)
-        # Hash the source identity, not the basename: phone folders commonly
-        # contain different IMG_0001.jpg files. Copies freeze concurrent capture.
-        seen = set()
-        for raw_path in paths:
-            src = Path(raw_path).expanduser().resolve()
-            if str(src) in seen:
-                continue
-            seen.add(str(src))
-            before = _signature(src.stat())
-            name = hashlib.sha256(os.fsencode(src)).hexdigest() + src.suffix.lower()
-            shutil.copyfile(src, images / name)
-            if _signature(src.stat()) != before:
-                raise ValueError("input image changed during snapshot: " + str(src))
-        progress.update(frames=len(seen))
-        if len(seen) < 3:
-            return progress.finish(ok=False, status="failed", stage="failed",
-                                   reason="no_images_registered", msg="At least three overlapping images are required",
-                                   hint="Capture textured, sharp, overlapping views with camera translation.")
         from . import colmap_pipeline
         pycolmap = colmap_pipeline._import_pycolmap()
         if pycolmap is None:
             return progress.finish(ok=False, status="failed", stage="failed",
                                    reason="backend_not_provisioned", msg="pycolmap is unavailable",
                                    hint="Install pycolmap==3.13.0 in the Chudware Python environment.")
-        progress.update(status="sparse", stage="sparse", pct=5, msg="Estimating cameras and sparse structure")
-        sparse = colmap_pipeline.run_sparse(str(images), str(work), single_camera=False)
-        if not sparse.get("ok"):
-            return progress.finish(ok=False, status="failed", stage="failed",
-                                   reason=sparse.get("reason", "sfm_failed"),
-                                   hint=sparse.get("hint", ""), msg="Sparse reconstruction failed")
-        registered = int(sparse["registered"])
-        reconstruction = pycolmap.Reconstruction(sparse["sparse_dir"])
-        points = int(reconstruction.num_points3D())
-        progress.update(registered=registered, sparse_dir=sparse["sparse_dir"],
-                        unregistered=max(0, len(seen) - registered))
-        if registered < 3 or points == 0:
-            return progress.finish(ok=False, status="failed", stage="failed",
-                                   reason="no_images_registered", msg="Insufficient connected camera registration",
-                                   hint="Capture at least three overlapping translated views of textured surfaces.")
-        # Disconnected components have unrelated coordinate systems. run_sparse
-        # selects the largest component; never concatenate their camera poses.
-        dataset = work / "dataset"
-        progress.update(stage="undistorting", pct=20,
-                        msg=f"Undistorting {registered}/{len(seen)} connected registered views")
-        pycolmap.undistort_images(output_path=str(dataset), input_path=sparse["sparse_dir"],
-                                 image_path=str(images), output_type="COLMAP", copy_policy="copy")
-        model = pycolmap.Reconstruction(str(dataset / "sparse"))
-        if model.num_reg_images() != registered or model.num_points3D() == 0:
-            raise ValueError("undistorted reconstruction is incomplete")
+
+        if request.get("dataset_dir"):
+            # The caller owns this immutable dataset and its gauge. Never re-solve it.
+            dataset = Path(request["dataset_dir"]).expanduser().resolve()
+            model_dir = dataset / "sparse"
+            if not any((model_dir / f"cameras{ext}").is_file() for ext in (".bin", ".txt")):
+                model_dir = model_dir / "0"
+            model = pycolmap.Reconstruction(str(model_dir))
+            mapping_path = dataset / "image_name_map.json"
+            if mapping_path.is_file():
+                mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+                if not isinstance(mapping, dict) or not all(
+                        isinstance(k, str) and isinstance(v, str) for k, v in mapping.items()):
+                    raise ValueError("image_name_map.json must map model names to source names")
+            else:
+                mapping = {model.images[i].name: model.images[i].name for i in model.reg_image_ids()}
+            frame_count = len(mapping)
+        else:
+            paths = list(request.get("images", []))
+            if request.get("video_path"):
+                from .frames import extract_frames
+                progress.update(stage="extracting", msg="Extracting sharp video frames")
+                extraction = extract_frames(request["video_path"], str(session / "frames"))
+                paths.extend(frame.path for frame in extraction.frames)
+                progress.update(video_extraction=extraction.to_dict())
+            images = work / "input_images"
+            images.mkdir(exist_ok=False)
+            # Hash full source identities so equal basenames do not collide.
+            # Keep the reverse map even for images that do not register.
+            batch_map, seen = {}, set()
+            for raw_path in paths:
+                src = Path(raw_path).expanduser().resolve()
+                if str(src) in seen:
+                    continue
+                seen.add(str(src))
+                before = _signature(src.stat())
+                name = hashlib.sha256(os.fsencode(src)).hexdigest() + src.suffix.lower()
+                shutil.copyfile(src, images / name)
+                if _signature(src.stat()) != before:
+                    raise ValueError("input image changed during snapshot: " + str(src))
+                try:
+                    batch_map[name] = src.relative_to(session).as_posix()
+                except ValueError:
+                    batch_map[name] = str(src)
+            batch_path = work / "batch_image_map.json"
+            _atomic_json(batch_path, batch_map)
+            frame_count = len(seen)
+            progress.update(frames=frame_count, batch_image_map_path=str(batch_path))
+            if frame_count < 3:
+                return progress.finish(ok=False, status="failed", stage="failed",
+                                       reason="no_images_registered", msg="At least three overlapping images are required",
+                                       hint="Capture textured, sharp, overlapping views with camera translation.")
+            progress.update(status="sparse", stage="sparse", pct=5, msg="Estimating cameras and sparse structure")
+            from .frames import clip_camera_groups
+            sparse = colmap_pipeline.run_sparse(str(images), str(work), single_camera=False,
+                                                camera_groups=clip_camera_groups(batch_map))
+            if not sparse.get("ok"):
+                return progress.finish(ok=False, status="failed", stage="failed",
+                                       reason=sparse.get("reason", "sfm_failed"),
+                                       hint=sparse.get("hint", ""), msg="Sparse reconstruction failed")
+            registered = int(sparse["registered"])
+            reconstruction = pycolmap.Reconstruction(sparse["sparse_dir"])
+            if registered < 3 or reconstruction.num_points3D() == 0:
+                return progress.finish(ok=False, status="failed", stage="failed",
+                                       reason="no_images_registered", msg="Insufficient connected camera registration",
+                                       hint="Capture at least three overlapping translated views of textured surfaces.")
+            dataset = work / "dataset"
+            progress.update(stage="undistorting", pct=20,
+                            msg=f"Undistorting {registered}/{frame_count} connected registered views")
+            prepared = colmap_pipeline.prepare_dataset(sparse["sparse_dir"], str(images), str(dataset),
+                                                       source_image_map=batch_map)
+            if not prepared.get("ok"):
+                return progress.finish(ok=False, status="failed", stage="failed",
+                                       reason=prepared.get("reason", "dataset_preparation_failed"),
+                                       hint=prepared.get("hint", ""), msg="Could not prepare the shared dataset")
+            model_dir = Path(prepared["sparse_dir"])
+            mapping_path = Path(prepared["image_name_map_path"])
+            mapping = prepared["image_name_map"]
+            model = pycolmap.Reconstruction(str(model_dir))
+            if model.num_reg_images() != registered:
+                raise ValueError("undistortion changed the set of registered cameras")
+
+        registered = int(model.num_reg_images())
+        if registered < 3 or model.num_points3D() == 0:
+            raise ValueError("dataset needs at least three registered images and sparse points")
         for image_id in model.reg_image_ids():
-            image_file = dataset / "images" / model.images[image_id].name
+            name = model.images[image_id].name
+            image_file = dataset / "images" / name
+            if name not in mapping:
+                raise ValueError("source-image mapping missing for " + name)
             if not image_file.is_file() or image_file.stat().st_size == 0:
                 raise ValueError("missing undistorted image: " + str(image_file))
+        if not mapping_path.is_file():
+            mapping_path = work / "image_name_map.json"
+            _atomic_json(mapping_path, mapping)
+        progress.update(frames=frame_count, registered=registered,
+                        unregistered=max(0, frame_count - registered),
+                        dataset_dir=str(dataset), sparse_dir=str(model_dir),
+                        images_dir=str(dataset / "images"), image_name_map=mapping,
+                        image_name_map_path=str(mapping_path))
         view_camera = _view_camera(model, str(work))
         published = {}
 
@@ -433,7 +494,7 @@ def run(request: dict, *, supervised_process_group: bool = False) -> dict:
 
         from .dense_backends import run_brush
         progress.update(status="training", stage="training", pct=25, msg="Training Gaussian splats")
-        result = run_brush(str(dataset / "sparse"), str(work), image_dir=str(dataset),
+        result = run_brush(str(model_dir), str(work), image_dir=str(dataset),
                            max_steps=iterations, export_mesh=False,
                            export_every=min(every, iterations), progress=on_brush,
                            own_process_group=not supervised_process_group)
@@ -450,7 +511,7 @@ def run(request: dict, *, supervised_process_group: bool = False) -> dict:
                                    source_splat_path=str(artifact["splat_path"]))
         return progress.finish(**final, ok=True, status="done", stage="done", pct=100,
                                reason="", hint="",
-                               msg=f"Gaussian reconstruction complete ({registered}/{len(seen)} registered views)")
+                               msg=f"Gaussian reconstruction complete ({registered}/{frame_count} registered views)")
     except Exception as exc:
         return progress.finish(ok=False, status="failed", stage="failed",
                                reason="gaussian_pipeline_failed", hint=str(exc), msg=str(exc))

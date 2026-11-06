@@ -30,7 +30,7 @@ static void failJobFromEscapedException(const std::shared_ptr<JobState>& job, co
     job->errorDetail = job->error;
     job->errorIsCad = false;
     job->converged = false;
-    if (job->stopReason.empty()) job->stopReason = "provider_error";
+    if (job->stopReason.empty()) job->stopReason = "runtime_error";
     job->ready = true;
     job->running = false;
 }
@@ -52,7 +52,7 @@ bool opaqueHandle(const nlohmann::json& value) {
 
 bool mintCellAgentHandles(WorkerClient& worker, const std::shared_ptr<JobState>& job,
                           AgentJobRpcRoute& route, std::string& err) {
-    if (!route.cell || !route.online) return true;
+    if (!route.cell) return true;
     nlohmann::json request = nlohmann::json::object(), reply;
     const auto session = route.params.find("session_id");
     if (session != route.params.end()) request["session_id"] = *session;
@@ -79,20 +79,6 @@ bool mintCellAgentHandles(WorkerClient& worker, const std::shared_ptr<JobState>&
     return true;
 }
 
-bool explicitOffline(const nlohmann::json& extra, const nlohmann::json& options) {
-    auto enabled = [](const nlohmann::json& value, const char* key) {
-        return value.is_object() && value.contains(key) && value[key].is_boolean() &&
-               value[key].get<bool>();
-    };
-    if (enabled(extra, "offline") || enabled(extra, "offline_mode") ||
-        enabled(options, "offline") || enabled(options, "offline_mode"))
-        return true;
-    const auto modeIsOffline = [](const nlohmann::json& value) {
-        return value.is_object() && value.contains("mode") && value["mode"].is_string() &&
-               value["mode"].get<std::string>() == "offline";
-    };
-    return modeIsOffline(extra) || modeIsOffline(options);
-}
 
 std::string nextAgentRunId() {
     static std::atomic<unsigned long long> sequence{0};
@@ -105,13 +91,12 @@ std::string nextAgentRunId() {
 
 
 // The online turn budget is the caller's: an explicit positive `timeout` (seconds) rides to
-// agent_admin_turn and bounds chudcode_host's wait (abort + stop_reason "turn_budget" when it
+// agent_admin_turn and bounds omp_host's wait (abort + stop_reason "turn_budget" when it
 // expires); the client wait is that budget plus slack so the worker's structured reply arrives
 // first. An ordinary GUI turn sends NO budget and has no wall-clock stop: the old fixed
 // 900 000 ms client deadline (2026-09-24), then the 7200 s default, both ended healthy turns
 // mid-build. Stop, worker/daemon loss and app teardown still end an unbudgeted wait.
 constexpr int kOnlineTurnSlackS = 120;
-constexpr int kOfflineRunWaitMs = 900000;
 // WorkerClient/engine_backend: a negative timeout waits for the response itself.
 constexpr int kWaitForResponseMs = -1;
 
@@ -123,10 +108,11 @@ bool positiveTurnBudget(const nlohmann::json& value) {
 
 // A client-side wait expiring is not a provider failure: name it for what it is.
 std::string transportStopReason(const std::string& err) {
-    return err.rfind("engine call timed out", 0) == 0 ? "client_timeout" : "provider_error";
+    return err.rfind("engine call timed out", 0) == 0 ? "client_timeout" : "runtime_error";
 }
 
 }  // namespace
+
 std::string cellAgentSessionHandle(const std::string& convId) {
     std::lock_guard<std::mutex> lock(cellHandlesMutex);
     const auto it = cellSessions.find(convId);
@@ -182,7 +168,6 @@ std::string publishCellAgentRunHandle(JobState& job, const std::string& handle) 
 }
 
 int agentJobWaitMs(const AgentJobRpcRoute& route) {
-    if (!route.online) return kOfflineRunWaitMs;
     const auto it = route.params.find("timeout");
     if (it == route.params.end() || !positiveTurnBudget(*it)) return kWaitForResponseMs;
     const double ms = (it->get<double>() + kOnlineTurnSlackS) * 1000.0;
@@ -191,7 +176,8 @@ int agentJobWaitMs(const AgentJobRpcRoute& route) {
 
 AgentJobRpcRoute buildAgentJobRpcRoute(const std::string& request, const std::string& docId,
                                       const std::string& convId, bool cam,
-                                      const nlohmann::json& extra, bool mission, bool cell) {
+                                      const nlohmann::json& extra, bool mission,
+                                      bool cell) {
     nlohmann::json options = nlohmann::json::object();
     options["advisor"] = true;
     if (!mission) options["cam"] = cam;
@@ -202,9 +188,7 @@ AgentJobRpcRoute buildAgentJobRpcRoute(const std::string& request, const std::st
 
     AgentJobRpcRoute route;
     route.cell = cell;
-    route.online = !explicitOffline(extra, options);
-    route.method = route.online ? "agent_admin_turn"
-                                : (mission ? "agent_mission_v1" : "agent_run_v2");
+    route.method = "agent_admin_turn";
     route.params = {{"request", request}, {"doc_id", docId}, {"options", options}};
     if (extra.is_object()) {
         for (auto it = extra.begin(); it != extra.end(); ++it) {
@@ -212,23 +196,9 @@ AgentJobRpcRoute buildAgentJobRpcRoute(const std::string& request, const std::st
                 route.params[it.key()] = it.value();
         }
     }
-    if (cell && !route.online) {
-        route.error = "Offline agent execution is unavailable in browser cells";
-        return route;
-    }
-    if (!route.online) {
-        // The native core agent reads only the request text: the picked context rides inline.
-        // (Online, the worker resolves context_refs against the engine and renders them itself.)
-        if (extra.is_object() && extra.contains("context_refs")) {
-            const std::string ctx =
-                core::contextRefsPromptText(core::contextRefsFromJson(extra["context_refs"]));
-            if (!ctx.empty()) route.params["request"] = request + "\n\n" + ctx;
-        }
-        return route;
-    }
 
     // agent_admin_turn consumes these values at the top level. Keep the options object too:
-    // host-tool context and the explicit offline core fallback still use its full shape.
+    // host-tool context still uses its full shape.
     for (auto it = options.begin(); it != options.end(); ++it)
         if (!route.params.contains(it.key())) route.params[it.key()] = it.value();
     // The composer's user-picked mode (options.mode: "agent"|"plan"|"ask") is authoritative —
@@ -237,15 +207,12 @@ AgentJobRpcRoute buildAgentJobRpcRoute(const std::string& request, const std::st
     route.params["mode"] = mission ? std::string("swarm")
                                    : (optionMode.empty() ? std::string("agent") : optionMode);
     route.params["options"]["mode"] = route.params["mode"];
-    if (mission) {
-        route.params["corporate_force"] = true;
-        route.params["options"]["corporate_force"] = true;
-    }
 
     if (cell) {
         // Discard local conversation/run IDs and IDBFS/runtime paths. A resumed
         // session can only come from the binding created by a cell reply.
-        for (const char* key : {"run_id", "session_id", "sessions_dir", "chudcode_session_file"}) {
+        for (const char* key : {"run_id", "session_id", "sessions_dir", "omp_session_file",
+                                "omp_session_dir", "omp_session_id"}) {
             route.params.erase(key);
             route.params["options"].erase(key);
         }
@@ -312,7 +279,12 @@ nlohmann::json normalizeAgentAdminTurnResult(const nlohmann::json& result, bool 
             mapped["error"] = reason;
             mapped["error_detail"] = reason;
         }
-        if (!mapped.contains("stop_reason")) mapped["stop_reason"] = "provider_error";
+        if (!mapped.contains("stop_reason")) {
+            const auto turn = result.find("turn");
+            mapped["stop_reason"] = turn != result.end() && turn->is_object()
+                ? turn->value("stop_reason", std::string("runtime_error"))
+                : "runtime_error";
+        }
         return mapped;
     }
     if (!result.contains("turn") || !result["turn"].is_object()) return mapped;
@@ -323,7 +295,7 @@ nlohmann::json normalizeAgentAdminTurnResult(const nlohmann::json& result, bool 
     const bool success = turn.value("success", !cancelled);
     mapped["status"] = cancelled ? "cancelled" : (success ? "done" : "failed");
     mapped["stop_reason"] =
-        turn.value("stop_reason", std::string(success ? "completed" : "provider_error"));
+        turn.value("stop_reason", std::string(success ? "completed" : "runtime_error"));
     const std::string runId = turn.value("run_id", std::string());
     if (!runId.empty()) mapped["run_id"] = runId;
     const std::string text = turn.value("result", std::string());
@@ -337,18 +309,20 @@ nlohmann::json normalizeAgentAdminTurnResult(const nlohmann::json& result, bool 
 }
 
 void consumeAgentJobEvent(const std::shared_ptr<JobState>& job, const nlohmann::json& data,
-                          bool mission) {
+                          bool mission, bool actorBroadcast) {
+    std::string runId = jstr(data, "run_id");
+    {
+        std::lock_guard<std::mutex> lock(job->mtx);
+        // The cell broadcasts all of this actor's events to every connection,
+        // including each concurrent turn's callback. Its handle was published
+        // before dispatch; never guess, bind, or accept another run's event.
+        if (actorBroadcast && (runId.empty() || runId != job->runId)) return;
+        if (job->runId.empty() && !runId.empty()) job->runId = std::move(runId);
+    }
     AgentEvent event;
     const std::string kind = jstr(data, "kind");
     event.kind = "orch_" + kind;
-    event.text = data.dump();
-    {
-        std::string runId = jstr(data, "run_id");
-        if (!runId.empty()) {
-            std::lock_guard<std::mutex> lock(job->mtx);
-            if (job->runId.empty()) job->runId = std::move(runId);
-        }
-    }
+    event.data = std::make_shared<const nlohmann::json>(data);
 
     const std::string stage = jstr(data, "stage");
     const std::string role = jstr(data, "role");
@@ -417,8 +391,55 @@ void consumeAgentJobEvent(const std::shared_ptr<JobState>& job, const nlohmann::
     job->events.push_back(std::move(event));
 }
 
-// Online agent launcher. `buildAgentJobRpcRoute` selects the long-lived worker entry or the
-// explicit offline core fallback; both keep the established streamed-event and JobState drain.
+bool agentEventsPending(JobState& job) {
+    std::lock_guard<std::mutex> lock(job.evMtx);
+    return !job.events.empty();
+}
+
+bool takeAgentEvent(JobState& job, AgentEvent& event) {
+    std::lock_guard<std::mutex> lock(job.evMtx);
+    if (job.events.empty()) return false;
+    event = std::move(job.events.front());
+    job.events.pop_front();
+    if (event.kind != "orch_assistant_delta" || !event.data || !event.data->is_object())
+        return true;
+    const auto text = event.data->find("text");
+    if (text == event.data->end() || !text->is_string() || text->get_ref<const std::string&>().empty())
+        return true;  // empty flushes retain their own stream-boundary semantics
+    std::shared_ptr<nlohmann::json> merged;
+    for (size_t n = 1; n < 128 && !job.events.empty(); ++n) {
+        const AgentEvent& next = job.events.front();
+        if (next.kind != event.kind || !next.data || !next.data->is_object()) break;
+        const auto& a = *event.data;
+        const auto& b = *next.data;
+        const auto bt = b.find("text");
+        if (bt == b.end() || !bt->is_string() || bt->get_ref<const std::string&>().empty()) break;
+        bool same = true;
+        const auto equivalent = [&](const nlohmann::json& left, const nlohmann::json& right) {
+            for (auto it = left.begin(); it != left.end(); ++it) {
+                if (it.key() == "text" || it.key() == "ts" || it.key() == "timestamp") continue;
+                const auto other = right.find(it.key());
+                if (other == right.end() || *other != *it) return false;
+            }
+            return true;
+        };
+        same = equivalent(a, b) && equivalent(b, a);
+        if (!same) break;  // includes channel, run, agent, span and unknown metadata
+        const size_t bytes = merged ? (*merged)["text"].get_ref<const std::string&>().size()
+                                    : text->get_ref<const std::string&>().size();
+        if (bytes + bt->get_ref<const std::string&>().size() > 65536) break;
+        if (!merged) merged = std::make_shared<nlohmann::json>(a);
+        (*merged)["text"].get_ref<std::string&>() += bt->get_ref<const std::string&>();
+        for (const char* key : {"ts", "timestamp"})
+            if (b.contains(key)) (*merged)[key] = b[key];
+        job.events.pop_front();
+    }
+    if (merged) event.data = std::move(merged);
+    return true;
+}
+
+// Agent launcher. `buildAgentJobRpcRoute` selects the long-lived worker entry (`agent_admin_turn`);
+// the streamed-event and JobState drain are shared with missions.
 void launchAgentRunV2(WorkerClient& w, std::shared_ptr<JobState> job,
                       const std::string& convId, const std::string& docKey,
                       const std::string& request, const std::string& docId, bool cam,
@@ -433,21 +454,22 @@ void launchAgentRunV2(WorkerClient& w, std::shared_ptr<JobState> job,
         job->converged = true; job->stopReason.clear(); job->errorDetail.clear();
         job->errorHuman.clear();
         job->isMission = false; job->missionVerdict.clear();
+        job->isCompaction = extra.is_object() && extra.contains("compact") &&
+                            extra["compact"].is_object();
+        job->compactionTurn = nullptr;
+        job->compactionCommand = job->isCompaction ? request : std::string();
         job->generalLane = false; job->agentSummary.clear();
         job->missionPartial = false;
         job->missionTasksCompleted = 0;
         job->missionTasksFailed = 0;
         job->missionTasksTotal = 0;
         job->planReady = false; job->planReadyJson.clear();
-        job->createdDocPath.clear();
-        job->drawingDocId.clear(); job->drawingName.clear(); job->drawingSourceId.clear();
-        job->camDocId.clear();
         job->partName.clear();
-        job->savedPath.clear();
         job->finalRevision = 0;
         job->runId.clear();
         job->convId = convId;
         job->docKey = docKey;
+        job->runDocId = docId;
     }
     { std::lock_guard<std::mutex> lk(job->evMtx); job->events.clear(); }
     AgentJobRpcRoute route =
@@ -456,7 +478,7 @@ void launchAgentRunV2(WorkerClient& w, std::shared_ptr<JobState> job,
         failJobFromEscapedException(job, route.error);
         return;
     }
-    if (route.online) {
+    {
         std::lock_guard<std::mutex> lock(job->mtx);
         job->runId = route.params.value("run_id", std::string());
 #ifdef __EMSCRIPTEN__
@@ -475,12 +497,12 @@ void launchAgentRunV2(WorkerClient& w, std::shared_ptr<JobState> job,
             return;
         }
 
-        WorkerClient::EventFn onEvent = [&job](const nlohmann::json& data) {
-            consumeAgentJobEvent(job, data, /*mission=*/false);
+        WorkerClient::EventFn onEvent = [&job, cell = route.cell](const nlohmann::json& data) {
+            consumeAgentJobEvent(job, data, /*mission=*/false, cell);
         };
         const bool ok =
             w.call(route.method, route.params, result, err, agentJobWaitMs(route), onEvent);
-        if (ok && route.online) result = normalizeAgentAdminTurnResult(result, /*mission=*/false);
+        if (ok) result = normalizeAgentAdminTurnResult(result, /*mission=*/false);
         // Transport loss (timeout/closed) orphans the daemon-side run: hostd keeps
         // executing — and billing — with no client attached. A user resubmit then
         // burns quota twice. Best-effort auto-cancel the orphan BEFORE taking job->mtx:
@@ -508,13 +530,32 @@ void launchAgentRunV2(WorkerClient& w, std::shared_ptr<JobState> job,
             if (job->errorDetail.empty()) job->errorDetail = err;
             if (orphanCancelled)
                 job->errorDetail += " (orphaned run auto-cancelled after transport loss)";
+        } else if (job->isCompaction) {
+            // Maintenance has no answer prose, plan gate, or geometry result to interpret.
+            if (result.contains("turn") && result["turn"].is_object())
+                job->compactionTurn = std::move(result["turn"]);
+            job->converged = jstr(result, "status") == "done";
+            job->stopReason = jstr(result, "stop_reason");
+            if (!job->converged && job->stopReason != "cancelled" &&
+                job->stopReason != "skipped") {
+                job->errorDetail = jstr(result, "error_detail");
+                if (job->errorDetail.empty()) job->errorDetail = jstr(result, "error");
+                if (job->errorDetail.empty()) job->errorDetail = jstr(result, "reason");
+                if (job->errorDetail.empty())
+                    job->errorDetail = job->stopReason.empty()
+                                           ? "Compaction failed" : job->stopReason;
+                job->error = job->errorDetail;
+            }
         } else {
             // Online agent_admin_turn results are normalized above to the legacy JobState shape;
-            // explicit offline core results already use it. Both may return {ok:false,error}.
+            // both may return {ok:false,error}.
+            if (result.contains("revision") && result["revision"].is_number_integer())
+                job->finalRevision = result["revision"].get<int>();
             const bool preRunFail = result.contains("ok") && result["ok"].is_boolean() &&
                                     !result["ok"].get<bool>();
             if (preRunFail) {
-                std::string detail = result.value("error_detail", std::string());
+                std::string detail = job->errorDetail;
+                if (detail.empty()) detail = result.value("error_detail", std::string());
                 if (detail.empty()) detail = result.value("error", std::string());
                 if (detail.empty()) detail = err.empty() ? (route.method + " failed") : err;
                 job->error = detail;
@@ -591,41 +632,11 @@ void launchAgentRunV2(WorkerClient& w, std::shared_ptr<JobState> job,
                                           job->stopReason == "model_failed" ||
                                           job->stopReason == "decompose_failed");
                     }
-                    // WS3 true-assembly: the run created a SEPARATE assembly document saved to its own
-                    // .step+ (it did not mutate the active doc). Carry the absolute path so the GL-thread
-                    // drain opens it as a new tab (via requestOpenPath). Only on a clean assembly.
-                    if (result.value("created_doc", false) && status == "done")
-                        job->createdDocPath = result.value("asm_path", std::string());
-                    // W17: the run answered a drawing request by building a 2D drawing (its own dwg-cpp
-                    // id). The drain adopts it as a Drawing tab; the active part doc was untouched.
-                    if (result.value("created_drawing", false) && status == "done") {
-                        job->drawingDocId = result.value("drawing_doc_id", std::string());
-                        job->drawingName = result.value("drawing_name", std::string());
-                        job->drawingSourceId = result.value("source_doc_id", std::string());
-                    }
-                    // CAM fast-path: the run built a machining job from the current part (its own cam
-                    // doc id). The drain loads it into the Manufacture workspace; the part was untouched.
-                    if (result.value("created_cam", false) && status == "done")
-                        job->camDocId = result.value("cam_doc_id", std::string());
                     // Part-naming stage: AI-chosen display name for the built part.
                     {
                         std::string pn = result.value("part_name", std::string());
                         if (!pn.empty()) job->partName = std::move(pn);
                     }
-                    // File-first persistence: the core agent already saved the part itself
-                    // (at modeling start + milestone re-saves + memory-stage rename). Carry
-                    // its path so the GL drain saves onto it instead of writing a duplicate
-                    // <name>_2.step+ next to the agent's file.
-                    {
-                        std::string sp = result.value("saved_path", std::string());
-                        if (!sp.empty()) job->savedPath = std::move(sp);
-                    }
-                    // Final doc revision (0 when the run produced no geometry / never advanced).
-                    // Host autosave gates on this so empty/no_geometry runs never write a file.
-                    if (result.contains("revision") && result["revision"].is_number_integer())
-                        job->finalRevision = result["revision"].get<int>();
-                    else
-                        job->finalRevision = result.value("revision", 0);
                 }
                 }  // end !cancelled
             }
@@ -640,8 +651,8 @@ void launchAgentRunV2(WorkerClient& w, std::shared_ptr<JobState> job,
     }).detach();
 }
 
-// Mission launcher: same online `agent_admin_turn` entry and event drain as a normal run, with
-// swarm/corporate_force routing. Explicit offline missions retain the native mission method.
+// Mission launcher: same `agent_admin_turn` entry and event drain as a normal run, with
+// swarm routing.
 void launchMissionRun(WorkerClient& w, std::shared_ptr<JobState> job,
                       const std::string& convId, const std::string& docKey,
                       const std::string& request, const std::string& docId,
@@ -655,8 +666,8 @@ void launchMissionRun(WorkerClient& w, std::shared_ptr<JobState> job,
         job->errorIsCad = false;
         job->converged = true; job->stopReason.clear(); job->errorDetail.clear();
         job->errorHuman.clear();
-        job->createdDocPath.clear();
         job->isMission = true; job->missionVerdict.clear();
+        job->isCompaction = false; job->compactionTurn = nullptr;
         job->generalLane = false; job->agentSummary.clear();
         job->missionPartial = false;
         job->missionTasksCompleted = 0;
@@ -664,11 +675,11 @@ void launchMissionRun(WorkerClient& w, std::shared_ptr<JobState> job,
         job->missionTasksTotal = 0;
         job->planReady = false; job->planReadyJson.clear();
         job->partName.clear();
-        job->savedPath.clear();
         job->finalRevision = 0;
         job->runId.clear();
         job->convId = convId;
         job->docKey = docKey;
+        job->runDocId = docId;
     }
     { std::lock_guard<std::mutex> lk(job->evMtx); job->events.clear(); }
     AgentJobRpcRoute route =
@@ -677,7 +688,7 @@ void launchMissionRun(WorkerClient& w, std::shared_ptr<JobState> job,
         failJobFromEscapedException(job, route.error);
         return;
     }
-    if (route.online) {
+    {
         std::lock_guard<std::mutex> lock(job->mtx);
         job->runId = route.params.value("run_id", std::string());
 #ifdef __EMSCRIPTEN__
@@ -695,12 +706,12 @@ void launchMissionRun(WorkerClient& w, std::shared_ptr<JobState> job,
             return;
         }
 
-        WorkerClient::EventFn onEvent = [&job](const nlohmann::json& data) {
-            consumeAgentJobEvent(job, data, /*mission=*/true);
+        WorkerClient::EventFn onEvent = [&job, cell = route.cell](const nlohmann::json& data) {
+            consumeAgentJobEvent(job, data, /*mission=*/true, cell);
         };
         const bool ok =
             w.call(route.method, route.params, result, err, agentJobWaitMs(route), onEvent);
-        if (ok && route.online) result = normalizeAgentAdminTurnResult(result, /*mission=*/true);
+        if (ok) result = normalizeAgentAdminTurnResult(result, /*mission=*/true);
         std::lock_guard<std::mutex> lk(job->mtx);
         if (!ok) {
             job->error = err;
@@ -710,7 +721,9 @@ void launchMissionRun(WorkerClient& w, std::shared_ptr<JobState> job,
             if (job->errorDetail.empty()) job->errorDetail = err;
         } else {
             // Online agent_admin_turn results are normalized above to the legacy mission shape;
-            // explicit offline core results already use it. Both may return {ok:false,error}.
+            // both may return {ok:false,error}.
+            if (result.contains("revision") && result["revision"].is_number_integer())
+                job->finalRevision = result["revision"].get<int>();
             const bool preRunFail = result.contains("ok") && result["ok"].is_boolean() &&
                                     !result["ok"].get<bool>();
             if (preRunFail) {
@@ -830,9 +843,6 @@ void launchMissionRun(WorkerClient& w, std::shared_ptr<JobState> job,
                         v += failReason;
                     }
                     job->missionVerdict = std::move(v);
-                    // Keep any assembly/doc that was built.
-                    if (result.value("created_doc", false))
-                        job->createdDocPath = result.value("asm_path", std::string());
                 } else {
                     job->converged = (status == "done");
                     if (!sr.empty()) job->stopReason = sr;
@@ -859,8 +869,6 @@ void launchMissionRun(WorkerClient& w, std::shared_ptr<JobState> job,
                         }
                     }
                     job->missionVerdict = result.value("verdict", std::string());
-                    if (result.value("created_doc", false))
-                        job->createdDocPath = result.value("asm_path", std::string());
                 }
             }
         }

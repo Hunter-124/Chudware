@@ -12,6 +12,9 @@ triggers:
 
 ## Sequence
 
+If unavailable, call `enable_tools(tools=["add_features", "query_geometry", "describe_part", "render_part"])`.
+The `surf_*` names below are feature types supplied to `add_features`, not standalone tools.
+
 1. Choose surfaces only when a solid feature cannot express the intended wall or transition cleanly.
 2. Build `surf_*` features from solved profiles, paths, guide curves, or resolved body edges/faces.
 3. Keep reference kinds exact: profiles are region lists; surface bodies use `{kind: body, owner_feature: ...}`; face operations require resolved face selectors.

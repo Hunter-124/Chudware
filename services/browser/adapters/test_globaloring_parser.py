@@ -105,6 +105,10 @@ def test_globaloring_search_parses_woocommerce_rows(globaloring_mod, monkeypatch
     assert first["title"] == "E3.00X019UL"
     assert first["part_number"] == "E3.00X019UL"
     assert first["url"] == "https://www.globaloring.com/product/e3-00x019ul/"
+    assert first["sku"] == "E3.00X019UL"
+    assert first["kind"] == "product" and first["stock"] == 0
+    assert first["material"] == "EPDM"
+    assert first["price"] is None and first["thumbnail"] is None
 
 
 def test_globaloring_search_url_is_woocommerce_endpoint():

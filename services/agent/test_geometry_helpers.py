@@ -216,11 +216,6 @@ class TestGeometryDesignerRole(unittest.TestCase):
                 ["geometry_specs"]["items"])
         self.assertIn("provenance", item["required"])
 
-    def test_handoff_schema_compiles_to_gbnf(self):
-        c = roles.load_role("geometry_designer")
-        g = roles.schema_to_gbnf(c.handoff_schema)
-        self.assertIn("root ::=", g)
-
     def test_role_validates_clean(self):
         c = roles.load_role("geometry_designer")
         errs = [f for f in roles.validate_role(c) if f.level == "error"]
@@ -296,11 +291,7 @@ def test_canonical_process_strict_maps_the_words_models_use():
 
 
 def test_canonical_process_strict_passes_unknowns_through():
-    """Unlike canonical_process, an unknown word must NOT become 'fdm'.
-
-    Silently manufacturing for the wrong process is worse than refusing: the
-    caller's "Unknown process 'x'. Known processes: [...]" error has to survive.
-    """
+    """Unknown words must not silently select an unrelated process."""
     from services.agent.geometry_helpers import (
         canonical_process,
         canonical_process_strict,
@@ -308,11 +299,37 @@ def test_canonical_process_strict_passes_unknowns_through():
     assert canonical_process_strict("bogus_process") == "bogus_process"
     assert canonical_process_strict(None) is None
     assert canonical_process_strict("") == ""
-    # the lenient variant still defaults, which is why the strict one exists
-    assert canonical_process("bogus_process") == "fdm"
+    assert canonical_process("bogus_process") == "bogus_process"
+    assert canonical_process("waterjet") == "waterjet"
+    assert canonical_process(None) == "fdm"
 
 
 def test_canonical_ids_are_idempotent():
     from services.agent.geometry_helpers import canonical_process_strict as c
-    for pid in ("fdm", "cnc_mill", "lathe", "sheet_metal", "laser", "injection"):
+    for pid in ("fdm", "cnc_mill", "lathe", "sheet_metal", "laser", "injection",
+                "cast", "sla", "sls", "mjf"):
         assert c(pid) == pid, pid
+
+
+def test_additive_and_cast_aliases_are_distinct():
+    for alias, process in (("SLA", "sla"), ("stereolithography", "sla"),
+                           ("sls", "sls"), ("multi jet fusion", "mjf"),
+                           ("sand casting", "cast")):
+        assert gh.canonical_process(alias) == process
+        assert gh.canonical_process_strict(alias) == process
+
+
+def test_offline_profile_and_unknown_process_errors(monkeypatch):
+    from services.mcp import core_bridge
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("core unavailable")
+
+    monkeypatch.setattr(core_bridge, "call", unavailable)
+    assert gh.resolve_wall(process="sla").numbers["min_wall_mm"] == 0.2
+    assert gh.resolve_wall(process="sls").numbers["min_wall_mm"] == 0.6
+    assert gh.resolve_draft(process="cast").numbers["process_min_draft_deg"] == 1.0
+    with unittest.TestCase().assertRaises(ValueError):
+        gh.resolve_wall(process="waterjet")
+    with unittest.TestCase().assertRaises(ValueError):
+        gh.resolve_wall(process="unknown_process")

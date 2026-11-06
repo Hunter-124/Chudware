@@ -414,41 +414,6 @@ def test_delegate_names_what_to_do_instead_when_no_tree_can_be_built(monkeypatch
     assert out["do_instead"]
 
 
-def test_mcp_delegate_spawns_when_a_tree_is_bound():
-    from services.mcp import delegation_tools as dt
-
-    class _Node:
-        def to_dict(self):
-            return {"id": "dg_1", "status": "approved", "role": "sketcher"}
-
-    class _Tree:
-        def request_delegation(self, role, brief, budget, **_k):
-            return _Node()
-
-    mcp = _StubMCP()
-    dt.register_delegation_tools(mcp)
-    dt.bind_delegation_tree(_Tree())
-    try:
-        out = mcp.tools["delegate"](role="sketcher", brief="b", budget_tokens=100)
-    finally:
-        dt.bind_delegation_tree(None)
-
-    assert out["status"] == "approved"
-
-
-def test_mcp_delegate_without_a_tree_is_honest_and_actionable():
-    from services.mcp import delegation_tools as dt
-
-    mcp = _StubMCP()
-    dt.register_delegation_tools(mcp)
-
-    out = mcp.tools["delegate"](role="sketcher", brief="b", budget_tokens=100)
-
-    assert out["ok"] is False and out["status"] == "unavailable"
-    assert "Do NOT retry delegate" in out["error"]
-    assert out["do_instead"]
-
-
 # ---------------------------------------------------------------------------
 # 4b. workspace_status — a named-but-unknown run must be actionable
 # ---------------------------------------------------------------------------

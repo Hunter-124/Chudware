@@ -158,6 +158,8 @@ def _make_appdir(root: Path, version: str) -> Path:
     os.chmod(root / "usr/bin/chudware", 0o755)
     (root / "usr/bin/chudware-hostd").write_bytes(binary)
     os.chmod(root / "usr/bin/chudware-hostd", 0o755)
+    (root / "usr/lib/chudware-shape-build-worker").write_bytes(binary)
+    os.chmod(root / "usr/lib/chudware-shape-build-worker", 0o755)
     # Bundled beside the engine: its soname must be subtracted from the external set.
     library = _elf64_dynamic_object(BUNDLED_SONAME, [HOST_SONAME], ["GLIBC_2.17"])
     (root / f"usr/lib/{BUNDLED_SONAME}").write_bytes(library)

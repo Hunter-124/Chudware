@@ -17,6 +17,7 @@ from ..research.fits import (
     fit_calc,
     tolerance_band,
     recommend_fit,
+    iso273_clearance_hole,
     _find_range,
     _fit_recs,
 )
@@ -88,13 +89,15 @@ class TestToleranceBand:
         assert ans["lower_mm"] == pytest.approx(-0.020, abs=1e-6), \
             f"20g6 ei should be -0.020, got {ans['lower_mm']}"
 
-    def test_H7_source_is_closed_form(self):
+    def test_H7_source_is_table(self):
+        """H7 band width is the tabulated IT7 value."""
         result = tolerance_band(20.0, "7", "H")
-        assert result["source"]["kind"] == "closed_form"
+        assert result["source"]["kind"] == "table"
 
-    def test_g6_source_is_closed_form(self):
+    def test_g6_source_is_table(self):
+        """g6 band width is the tabulated IT6 value."""
         result = tolerance_band(20.0, "6", "g")
-        assert result["source"]["kind"] == "closed_form"
+        assert result["source"]["kind"] == "table"
 
     def test_p6_source_is_table(self):
         """p shaft deviation is tabulated."""
@@ -133,18 +136,101 @@ class TestToleranceBand:
         assert ans["lower_mm"] == pytest.approx(-0.013, abs=1e-6)
 
     def test_js_symmetric(self):
-        """js7 at 20mm: IT7=21µm, so floor(21/2)=10µm upper, ceil(21/2)=11µm lower."""
+        """An odd tolerance remains symmetric, including half micrometres."""
         result = tolerance_band(20.0, "7", "js")
         assert result["ok"] is True
         ans = result["answer"]
-        assert ans["upper_mm"] == pytest.approx(0.010, abs=1e-6)
-        assert ans["lower_mm"] == pytest.approx(-0.011, abs=1e-6)
+        assert ans["upper_mm"] == pytest.approx(0.0105)
+        assert ans["lower_mm"] == pytest.approx(-0.0105)
 
     def test_unsupported_hole_degrades(self):
-        """Unsupported holes (K, N, P...) should degrade (return ok=False), not raise."""
-        result = tolerance_band(20.0, "7", "K")
+        result = tolerance_band(20.0, "7", "W")
         assert result["ok"] is False
         assert result["reason"] == "unsupported_hole"
+
+    @pytest.mark.parametrize("nominal,letter,grade,lower,upper", [
+        (20, "A", "7", .300, .321),
+        (20, "CD", "7", .085, .106),
+        (20, "EF", "7", .028, .049),
+        (20, "FG", "7", .012, .033),
+        (20, "D", "7", .065, .086),
+        (20, "E", "7", .040, .061),
+        (20, "F", "7", .020, .041),
+        (20, "G", "7", .007, .028),
+        (20, "J", "7", -.009, .012),
+        (20, "K", "6", -.011, .002),
+        (20, "K", "7", -.015, .006),
+        (20, "K", "8", -.023, .010),
+        (20, "K", "9", -.052, 0),
+        (20, "M", "6", -.017, -.004),
+        (20, "M", "7", -.021, 0),
+        (20, "M", "8", -.029, .004),
+        (20, "N", "6", -.024, -.011),
+        (20, "N", "7", -.028, -.007),
+        (20, "N", "8", -.036, -.003),
+        (20, "N", "9", -.052, 0),
+        (20, "P", "6", -.031, -.018),
+        (20, "P", "7", -.035, -.014),
+        (20, "P", "8", -.055, -.022),
+        (65, "R", "7", -.060, -.030),
+        (65.01, "R", "7", -.062, -.032),
+        (80, "S", "7", -.078, -.048),
+        (40, "U", "6", -.071, -.055),
+        (20, "ZC", "7", -.201, -.180),
+        (300, "M", "6", -.041, -.009),
+        (3, "N", "7", -.014, -.004),
+    ])
+    def test_published_hole_deviations(self, nominal, letter, grade, lower, upper):
+        # ISO 286 hole-limit table:
+        # https://roymech.org/Useful_Tables/ISO_Tolerances/ISO_286_2H.html
+        result = tolerance_band(nominal, grade, letter)
+        assert result["ok"], result
+        assert result["answer"]["lower_mm"] == pytest.approx(lower)
+        assert result["answer"]["upper_mm"] == pytest.approx(upper)
+
+    @pytest.mark.parametrize("nominal,letter,grade,lower,upper", [
+        (20, "d", "6", -.078, -.065),
+        (20, "k", "6", .002, .015),
+        (20, "k", "8", 0, .033),
+        (20, "m", "7", .008, .029),
+        (20, "n", "6", .015, .028),
+        (20, "p", "6", .022, .035),
+        (65, "r", "6", .041, .060),
+        (65.01, "r", "6", .043, .062),
+        (80, "s", "6", .059, .078),
+        (40, "u", "6", .060, .076),
+    ])
+    def test_published_shaft_deviations(self, nominal, letter, grade, lower, upper):
+        # https://roymech.org/Useful_Tables/ISO_Tolerances/ISO_286_2s.html
+        answer = tolerance_band(nominal, grade, letter)["answer"]
+        assert answer["lower_mm"] == pytest.approx(lower)
+        assert answer["upper_mm"] == pytest.approx(upper)
+
+    def test_special_rule_uses_it4_and_refuses_missing_it3(self):
+        assert tolerance_band(20, "5", "K")["answer"] == {
+            "lower_mm": -.008, "upper_mm": .001}
+        assert tolerance_band(20, "4", "K")["reason"] == "unsupported_grade"
+
+    def test_standard_exclusions_and_missing_rows_refuse(self):
+        assert not tolerance_band(1, "7", "A")["ok"]
+        assert not tolerance_band(1, "9", "N")["ok"]
+        assert not tolerance_band(4, "7", "T")["ok"]
+        assert not tolerance_band(51, "7", "CD")["ok"]
+
+    def test_combined_shaft_basis(self):
+        result = fit_calc(20, "P7/h6")
+        assert result["answer"]["hole"] == pytest.approx([-.035, -.014])
+        assert result["answer"]["fit_character"] == "press"
+
+    @pytest.mark.parametrize("series,diameter", [("fine", 8.4), ("normal", 9), ("coarse", 10)])
+    def test_iso273_series(self, series, diameter):
+        result = iso273_clearance_hole(8, series)
+        assert result["ok"] and result["diameter_mm"] == diameter
+        assert "ISO 273" in result["citation"]
+
+    def test_iso273_refuses_unknown_sizes_and_series(self):
+        assert not iso273_clearance_hole(8.1)["ok"]
+        assert not iso273_clearance_hole(8, "invented")["ok"]
 
     def test_schema_citation(self):
         result = tolerance_band(20.0, "7", "H")
@@ -283,10 +369,9 @@ class TestFitCalc:
         result = fit_calc(50.0, "H7/p6")
         assert result["source"]["kind"] == "table"
 
-    def test_source_kind_closed_form_for_g_shaft(self):
-        """g shaft uses formula -> source.kind=closed_form."""
+    def test_source_kind_table_for_g_shaft(self):
         result = fit_calc(20.0, "H7/g6")
-        assert result["source"]["kind"] == "closed_form"
+        assert result["source"]["kind"] == "table"
 
 
 # ──────────────────────────────────────────────────── recommend_fit tests ─────

@@ -1,5 +1,92 @@
 #include "win_chrome.h"
 
+#define GLFW_INCLUDE_NONE
+#include <GLFW/glfw3.h>
+
+namespace chrome {
+namespace {
+struct WindowState {
+    GLFWwindow* win = nullptr;
+    bool maximized = false;
+    bool iconified = false;
+    bool leftDown = false;
+    double cursorX = 0.0, cursorY = 0.0;
+    int width = 0, height = 0;
+    GLFWwindowmaximizefun prevMaximize = nullptr;
+    GLFWwindowiconifyfun prevIconify = nullptr;
+    GLFWwindowsizefun prevSize = nullptr;
+    GLFWwindowposfun prevPos = nullptr;
+    GLFWmousebuttonfun prevMouseButton = nullptr;
+    GLFWcursorposfun prevCursorPos = nullptr;
+} g_window;
+
+void onMaximize(GLFWwindow* win, int maximized) {
+    if (win == g_window.win) {
+        g_window.maximized = maximized != 0;
+        glfwGetCursorPos(win, &g_window.cursorX, &g_window.cursorY);
+    }
+    if (g_window.prevMaximize) g_window.prevMaximize(win, maximized);
+}
+
+void onIconify(GLFWwindow* win, int iconified) {
+    if (win == g_window.win) g_window.iconified = iconified != 0;
+    if (g_window.prevIconify) g_window.prevIconify(win, iconified);
+}
+
+void onSize(GLFWwindow* win, int width, int height) {
+    if (win == g_window.win) {
+        g_window.width = width;
+        g_window.height = height;
+        glfwGetCursorPos(win, &g_window.cursorX, &g_window.cursorY);
+    }
+    if (g_window.prevSize) g_window.prevSize(win, width, height);
+}
+
+void onPos(GLFWwindow* win, int x, int y) {
+    if (win == g_window.win)
+        glfwGetCursorPos(win, &g_window.cursorX, &g_window.cursorY);
+    if (g_window.prevPos) g_window.prevPos(win, x, y);
+}
+
+void onMouseButton(GLFWwindow* win, int button, int action, int mods) {
+    if (win == g_window.win && button == GLFW_MOUSE_BUTTON_LEFT) {
+        g_window.leftDown = action != GLFW_RELEASE;
+        // Geometry can move beneath a stationary pointer without a cursor event.
+        if (action == GLFW_PRESS)
+            glfwGetCursorPos(win, &g_window.cursorX, &g_window.cursorY);
+    }
+    if (g_window.prevMouseButton) g_window.prevMouseButton(win, button, action, mods);
+}
+
+void onCursorPos(GLFWwindow* win, double x, double y) {
+    if (win == g_window.win) {
+        g_window.cursorX = x;
+        g_window.cursorY = y;
+    }
+    if (g_window.prevCursorPos) g_window.prevCursorPos(win, x, y);
+}
+
+void trackWindow(GLFWwindow* win) {
+    g_window = {};
+    g_window.win = win;
+    g_window.maximized = glfwGetWindowAttrib(win, GLFW_MAXIMIZED) != 0;
+    g_window.iconified = glfwGetWindowAttrib(win, GLFW_ICONIFIED) != 0;
+    g_window.leftDown = glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+    glfwGetCursorPos(win, &g_window.cursorX, &g_window.cursorY);
+    glfwGetWindowSize(win, &g_window.width, &g_window.height);
+    g_window.prevMaximize = glfwSetWindowMaximizeCallback(win, onMaximize);
+    g_window.prevIconify = glfwSetWindowIconifyCallback(win, onIconify);
+    g_window.prevSize = glfwSetWindowSizeCallback(win, onSize);
+    g_window.prevPos = glfwSetWindowPosCallback(win, onPos);
+    g_window.prevMouseButton = glfwSetMouseButtonCallback(win, onMouseButton);
+    g_window.prevCursorPos = glfwSetCursorPosCallback(win, onCursorPos);
+}
+}  // namespace
+
+bool maximized(GLFWwindow* win) { return win == g_window.win && g_window.maximized; }
+bool iconified(GLFWwindow* win) { return win == g_window.win && g_window.iconified; }
+}  // namespace chrome
+
 #ifdef _WIN32
 
 #define GLFW_INCLUDE_NONE
@@ -89,6 +176,7 @@ LRESULT CALLBACK proc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }  // namespace
 
 void install(GLFWwindow* win, HitLayout* layout) {
+    trackWindow(win);
     g_layout = layout;
     HWND hwnd = glfwGetWin32Window(win);
     if (!hwnd) return;
@@ -148,7 +236,6 @@ Window g_xWindow = 0;
 Atom g_moveResizeAtom = 0;
 #endif
 
-bool maximized(GLFWwindow* w) { return glfwGetWindowAttrib(w, GLFW_MAXIMIZED) != 0; }
 
 // Screen-space cursor tracking used only by the manual fallback. The relative term
 // compensates as the window moves under a held-still cursor.
@@ -222,6 +309,7 @@ bool beginWmMoveResize(GLFWwindow* w, int direction, double cx, double cy) {
 }  // namespace
 
 void install(GLFWwindow* win, HitLayout* layout) {
+    trackWindow(win);
     (void)layout;
     // The creation hint is the reliable path; keep this as a safeguard if a WM ignored it.
     glfwSetWindowAttrib(win, GLFW_DECORATED, GLFW_FALSE);
@@ -244,11 +332,17 @@ void install(GLFWwindow* win, HitLayout* layout) {
 
 void tick(GLFWwindow* win, HitLayout* layout) {
     if (!win || !layout) return;
-    const bool down = glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
-    double cx, cy;
-    glfwGetCursorPos(win, &cx, &cy);
-    int ww, wh;
-    glfwGetWindowSize(win, &ww, &wh);
+    const bool down = g_window.leftDown;
+    if (!down) {
+        g_mode = Mode::None;
+        g_maxedPending = false;
+        g_prevDown = false;
+        return;
+    }
+    // Callback state is current immediately after event dispatch, before ImGui::NewFrame.
+    if (g_prevDown && g_mode == Mode::None) return;
+    const double cx = g_window.cursorX, cy = g_window.cursorY;
+    const int ww = g_window.width, wh = g_window.height;
     const int H = layout->titleBarHeight;
     const int B = layout->resizeBorder > 0 ? layout->resizeBorder : 6;
     const bool maxed = maximized(win);
@@ -358,10 +452,6 @@ void tick(GLFWwindow* win, HitLayout* layout) {
         }
     }
 
-    if (!down) {
-        g_mode = Mode::None;
-        g_maxedPending = false;
-    }
     g_prevDown = down;
 }
 

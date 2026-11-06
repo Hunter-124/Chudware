@@ -30,6 +30,8 @@ namespace {
 
 inline void markDirty() { S().filterDirtyAt = ImGui::GetTime(); }
 
+}  // namespace
+
 // fieldLabel and the facet chip used to be file-local here; both now come from
 // parts_widgets.h. That is the whole point of the move: the chip is sized from its own text
 // by chipWidth(), and the wrap arithmetic below measures with that SAME call. The old local
@@ -50,6 +52,17 @@ int activeFilterCount() {
         if (kv.second.active()) ++n;
     return n;
 }
+
+void clearPartFilters() {
+    S().priceMin = S().priceMax = 0.0f;
+    S().materialBuf[0] = 0;
+    S().vendorBuf[0] = 0;
+    S().sourceFilter = 0;
+    S().facetValues.clear();
+    markDirty();
+}
+
+namespace {
 
 // `tint` is the pane hue (see drawFiltersBlock) — every framed facet widget wears it, so a
 // facet group and the global block above it read as one coloured surface.
@@ -162,9 +175,7 @@ void drawFiltersBlock(AppState& st, float paneW) {
     ImGui::BeginChild("##parts_filters", ImVec2(paneW, 0), ImGuiChildFlags_None);
     ImGui::PopStyleVar();
 
-    // Scrollable filter body above the fixed vendor-strip footer. The footer's height depends
-    // on the pane width (its secondary buttons stack in a narrow pane), so it is asked for
-    // rather than hard-coded; the width is measured here, where the strip will start.
+    // Scrollable filter body above the fixed vendor-strip footer.
     const float stripH = vendorStripHeight(ImGui::GetContentRegionAvail().x);
     // WindowPadding 0: a nested child re-applies the DEFAULT style padding (15 px), which
     // pushed every filter widget 15 px right of the vendor-strip footer drawn below in the
@@ -344,21 +355,22 @@ void drawFiltersBlock(AppState& st, float paneW) {
     ImGui::Dummy(ImVec2(0, gapField));
     fieldLabel("Source");
     ImGui::Dummy(ImVec2(0, gapLabel));
-    static const char* const sources[] = {"All", "Local library", "Live vendors"};
-    bool srcChanged = false;
-    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(0, 0));
-    if (ImGui::BeginTable("##source_layout", 1,
-                         ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoPadOuterX |
-                         ImGuiTableFlags_NoPadInnerX,
-                         ImVec2(ImGui::GetContentRegionAvail().x - laneW, 0))) {
-        ImGui::TableNextColumn();
-        srcChanged = ui::kit::fieldEnum(
-            "##fsrc", "", &S().sourceFilter, sources, IM_ARRAYSIZE(sources),
-            ui::kit::FieldOpts().withEnumStyle(ui::kit::EnumStyle::Combo));
-        ImGui::EndTable();
+    static const char* const sources[] = {"All", "Library", "Web"};
+    const float right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - laneW;
+    for (int i = 0; i < IM_ARRAYSIZE(sources); ++i) {
+        if (i > 0) {
+            ImGui::SameLine(0.0f, 5.0f * sc);
+            if (ImGui::GetCursorPosX() + chipWidth(sources[i]) > right)
+                ImGui::NewLine();
+        }
+        ImGui::PushID(i);
+        if (chipToggle("##source", sources[i], S().sourceFilter == i) &&
+            S().sourceFilter != i) {
+            S().sourceFilter = i;
+            markDirty();
+        }
+        ImGui::PopID();
     }
-    ImGui::PopStyleVar();
-    if (srcChanged) markDirty();
 
     ImGui::Dummy(ImVec2(0, gapField));
     // Right-aligned clear, dead until something is actually set. SmallButton clipped its own
@@ -377,14 +389,8 @@ void drawFiltersBlock(AppState& st, float paneW) {
         clearDl->ChannelsSetCurrent(1);
     }
     ImGui::BeginDisabled(activeCount == 0);
-    if (chipToggle("##reset", "Clear all", /*active=*/false)) {
-        S().priceMin = S().priceMax = 0.0f;
-        S().materialBuf[0] = 0;
-        S().vendorBuf[0]   = 0;
-        S().sourceFilter   = 0;
-        S().facetValues.clear();
-        markDirty();
-    }
+    if (chipToggle("##reset", "Clear all", /*active=*/false))
+        clearPartFilters();
     ImGui::EndDisabled();
     const ImVec2 c0 = ImGui::GetItemRectMin(), c1 = ImGui::GetItemRectMax();
     if (clearLive) {
@@ -413,37 +419,14 @@ void drawFiltersBlock(AppState& st, float paneW) {
             drewFacets = true;
         }
     }
-    // No facet region left the bottom two thirds of the pane as a blank slab above the vendor
-    // strip — the pane looked broken rather than empty. Say what would go there instead. Held
-    // back while the taxonomy is still in flight (the region is about to be filled) and while
-    // a stale facet value is still narrowing the search, since claiming "no extra filters"
-    // while one is active would be a lie.
-    // Drawn through the shared empty-state painter: ui::kit::emptyState centres a line that
-    // FITS and wraps one that does not, which is the defect that forced a local copy here
-    // (the sub-line used to be clipped at both ends at this pane width). The lane-width child
-    // is the one thing the kit cannot know — it reserves the pill scrollbar's gutter so the
-    // wrapped paragraph stops short of the bar. The height guard stays: below one hint's
-    // worth of room there is no dead zone to fill and the leading Dummy would go negative.
-    if (!drewFacets && !S().taxonomyLoading &&
-        ImGui::GetContentRegionAvail().y > 96.0f * sc) {
-        bool anyFacetValue = false;
-        for (const auto& kv : S().facetValues)
-            if (kv.second.active()) { anyFacetValue = true; break; }
-        if (!anyFacetValue) {
-            const float hintW = ImGui::GetContentRegionAvail().x - laneW;
-            ImGui::Dummy(ImVec2(0, ImGui::GetContentRegionAvail().y * 0.25f));
-            // A plain child would paint ImGuiCol_ChildBg (panelBg) as a slab behind the hint.
-            float clear[4];
-            Palette::withAlpha(palette.panelBg, clear, 0.0f);
-            ImGui::PushStyleColor(ImGuiCol_ChildBg,
-                                  ImVec4(clear[0], clear[1], clear[2], clear[3]));
-            ImGui::BeginChild("##nofacets", ImVec2(hintW, 0), ImGuiChildFlags_AutoResizeY,
-                              ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-            ui::kit::emptyState("filter_funnel", "No extra filters here",
-                                "Pick a category to filter by its own specs.");
-            ImGui::EndChild();
-            ImGui::PopStyleColor();
-        }
+    if (!drewFacets && !S().taxonomyLoading) {
+        const char* hint = S().selectedCategory.empty()
+            ? "Choose a category for more filters."
+            : "No additional filters for this category.";
+        const std::string visible = ui::kit::elide(
+            hint, std::max(0.0f, ImGui::GetContentRegionAvail().x - laneW));
+        ImGui::TextDisabled("%s", visible.c_str());
+        if (visible != hint && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", hint);
     }
 
     // The scroll child ends flush against the fixed vendor-strip footer, so the last facet

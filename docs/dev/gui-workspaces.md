@@ -17,8 +17,8 @@ have their own scenarios.
 | Parts Library | `host/src/ui/parts/` | Local parametric standards sort first; live CAD search results show file and license. Data: `contracts/parts.md` |
 | Assembly | `host/src/ui/asm_panels.cpp/.h` | Mates, component insertion, BOM, exploded view |
 | CAM | `host/src/ui/cam/cam_panel.cpp/.h`, `cam_mirror.cpp/.h` | Explorer / Job Manager / NC Output rail; all previews render in the native viewport |
-| ECAD | `host/src/ui/ecad/` | Schematic/PCB 2D canvas editor; schemas in `contracts/ecad/` |
-| PLM | `host/src/ui/plm/`, `host/src/ui/file_explorer.cpp` | Versioning, releases, document control (`contracts/plm.md`); Explorer's Changes strip and row badges surface vault status |
+| ECAD | `host/src/ui/ecad/` | KiCad project hub with read-only schematic/PCB preview; edit in desktop KiCad, schemas in `contracts/ecad/` |
+| PLM | `host/src/ui/plm/`, `host/src/ui/file_explorer.cpp` | Versioning, releases, document control (`contracts/plm.md`); the left column's Changes tab and Explorer change dots surface vault status |
 | Reverse Engineering | `host/src/ui/reveng/` | Gaussian reconstruction plus the measured-CAD wizard (`contracts/reveng.md`) |
 | AI / Activity | `host/src/ui/ai/`, `host/src/ui/copilot/` | Current Run, Sub-agents, Plan, Activity, Sessions, Insights; events per `contracts/agent_events.md` |
 | Drawing | `host/src/ui/drawing_panel.cpp/.h` | Renders only the core-compiled drawing contract (sheet frame, views, annotations) with ISO 128 paper-space weights; never host-drawn borders or title blocks. PDF/SVG/DXF export |
@@ -29,14 +29,39 @@ have their own scenarios.
 
 ## Shared rules
 
+The Explorer tree reserves a lane for its scrollbar so file rows and revision badges do not
+overlap the drag target. The left-pane tabs are Explorer, Feature Manager and Changes (the
+working folder's uncheckpointed vault changes grouped by kind, preview cards, and the checkpoint
+composer; the tab carries the last scan's count); the project graph remains available in the PLM
+workspace. Explorer rows mark an uncheckpointed change with a tone dot (the tooltip names it), and
+the tiles breadcrumb ends in a Back button (also Backspace and the mouse Back button). Opening a part or assembly from the Explorer
+switches the pane to its Feature Manager once the tab is active; tab bodies slide/fade in over
+`anim::kBase` (`layout.cpp`, an alpha pass over that frame's body vertices only while it runs).
+
+Workspace home (`workspace_home.cpp`): in Model with no tab, or only the untouched launch
+starter, the left and Copilot columns widen (`workspaceHomeBlend`, user widths restored after),
+the Explorer shows tiles, the starter's tab takes no room in the strip, and the viewport draws no
+datums or triad: it is frosted behind a card with the agent's status, any
+open in flight, and New Part / New Assembly / Open. Leaving home (a real document active, the
+starter edited, a command or sketch started) returns the pane to the Feature Manager.
+
+Assembly Feature Manager order: document header (folds only when the assembly has equations),
+Mates, Components, Reference. Material and the Add Folder control are part-only.
+
 - Per-document state lives on `AppState::DocTab`; global state on `AppState`.
 - Panels render from `AppState`; engine data arrives through the per-frame drain in
   `host/src/core/engine_events.cpp`.
 - Workspace kits (`ui::reveng::kit`, `plm_hub.h`, `parts_widgets.h`) are thin wrappers over
   `ui::kit`; panels use them and size from `ui::metrics` density tokens.
-- During an agent run every agent-lane worker call returns `worker_lane_busy`. The UI detects
-  it with `core::workerLaneBusy` and phrases refusals via `ui::userFacingRpcError`; raw
-  worker/lane/RPC text is never shown.
+- During an agent run every call that stays on the agent lane returns `worker_lane_busy`; the
+  session-free provider/model discovery, sign-in/out and key calls, `ai_roles_*`,
+  `subscription_*` and `skills_*` do not — hostd serves them from a separate service worker
+  (`contracts/worker_rpc.md`, "Service lane"), so they work live during a run. The UI still
+  detects a refusal with `core::workerLaneBusy` and phrases it via `ui::userFacingRpcError`;
+  raw worker/lane/RPC text is never shown. A busy lane (a run, or an interactive sign-in
+  holding the service worker) is a wait, never a failure: callers keep what they last showed,
+  set no error state and ask again at their normal cadence (see `core::workerMethodAbsent`
+  for the strict absent-method test that latched polls must use).
 - Optional-backend absence keeps setup editable and blocks Run with an explanation; physics is
   never substituted.
 
@@ -44,7 +69,7 @@ have their own scenarios.
 
 - `ai_workspace.cpp` draws the shell; `agent_dag.cpp` owns per-conversation traces (an agent
   tree plus each agent's step timeline, capped at 2000 steps). `current_run_view.cpp` owns a
-  single docked inspector and a roster that merges registry sub-agents with Chudcode `task`
+  single docked inspector and a roster that merges registry sub-agents with OMP `task`
   sub-agents (read-only).
 - Activity, Plan and Sessions scope to the active project (`convProjectDir(st)`), whose
   authority is `AppState::workspaceDir`. Usage the backend does not report is labelled
@@ -55,12 +80,24 @@ have their own scenarios.
 - Pasted images insert `[Image #N]` at the caret; sent images render at their reference
   positions. Tool-returned images render at the tool's completion position in the chat.
 - Magic keywords are matched only by `ui/copilot/magic_keywords.h` (standalone prose, never in
-  code spans); Chudcode applies their meaning, the GUI only presents them.
+  code spans); OMP applies their meaning, the GUI only presents them.
+- Composer spell check and completion: word logic is GL-free in `ui/copilot/spell_check.*`
+  (code spans, paths, identifiers and ALLCAPS are never checked); `composer_spell.cpp` draws
+  the squiggles, the ghost completion (Tab accepts) and the right-click correction menu.
+  Word lists live in `assets/dict/`: `en_US.txt` is generated by
+  `scripts/build_spell_dictionary.py` (SCOWL + Moby frequency tiers), `engineering.txt` is
+  hand-maintained, and "Add to dictionary" appends to `<appdata>/spell_words.txt`.
 - `ask_user` batches (`ui/copilot/ask_answers.*`) render as cards at the point they were
   asked. "Jump to latest" is a layout footer with a constant reserved height, never an overlay.
-- Scenarios: `copilot_ui`, `chat_inline`, `chat_evidence`, `projectchat`, `steerstatus`. Run
-  them with `CHUDWARE_ENGINE_DAEMON=0` and isolated `HOME`/XDG paths; parallel runs need
-  distinct `CHUDWARE_SESSIONS_DIR` values and displays.
+- Scenarios: `copilot_ui`, `copilot_showcase`, `chat_inline`, `chat_evidence`, `composer_spell`,
+  `projectchat`, `steerstatus`. Run them with `CHUDWARE_ENGINE_DAEMON=0` and isolated
+  `HOME`/XDG paths; parallel runs need distinct `CHUDWARE_SESSIONS_DIR` values and displays.
+- `copilot_showcase` is the offline visual tour of the column (transcript rows, pinned queued
+  messages, Artifacts, Sessions, Quick settings, a ~320 px pass and a light-theme pass). Every
+  capture runs the ui audit and fails on conflicts/overflows in Copilot windows; captures and
+  `report.json` land in `CHUDWARE_COPILOT_SHOWCASE_OUT` (default
+  `scratch/copilot_showcase_shots`, artifact files under `assets/`). The light pass needs
+  `CHUDWARE_THEME` unset (the env otherwise fixes the theme): run once per theme value.
 
 ## CAM and Manufacture
 
@@ -80,11 +117,19 @@ have their own scenarios.
 
 ## Reverse Engineering
 
-- `reveng_workspace.cpp` is the shell: session rail, centre column with the source-lane
-  selector and the stage stepper pinned at the top, and a Details / Capabilities / Provenance
-  column fed by an async `reveng_status()` probe. Missing COLMAP/VGGT backends disable Run and
-  name the required setting before the click. Columns fold responsively; user intent
-  (`railIntent`/`propsIntent`) is never overwritten by the fold.
+- `reveng_workspace.cpp` is the shell: session rail, centre column with the intake selector
+  (Scan / From reference) and the stage stepper pinned at the top, and a Summary column
+  (session, accuracy, scale or chosen model, and a Missing tools card only when the current
+  lane lacks a backend). Missing COLMAP/VGGT backends disable Run and name the required setting
+  before the click. Columns fold responsively; user intent (`railIntent`/`propsIntent`) is
+  never overwritten by the fold. Background polls never change the Refresh / Re-check buttons;
+  only a user-requested refresh shows busy.
+- Sessions belong to the working folder (`st.workspaceDir`): every list/create call sends
+  `project_dir` (`revengProjectDir`), and a folder change drops the rail and re-lists.
+- The reference lane searches CAD libraries first (`reveng_find_models`, run in the background
+  on the worker; the result arrives through `session.reference`) and adopts a model with
+  `reveng_use_model`, which downloads into `<project>/reference/` and opens it. Building from
+  documents (`reveng_research_source`, `reveng_ingest_datasheet`) sits below as the fallback.
 - **Every RE panel draws with `ui::reveng::kit`** (`reveng_widgets.h`), sizes from
   `ui::metrics::re*()`, shows Busy/Ok/Warn/Error for every async action, and shows every
   produced artifact. `HonestyTag` marks approximate, photo-derived values.
@@ -103,7 +148,7 @@ have their own scenarios.
 - Transport: the RE worker RPC table in `services/reveng/worker_rpc.py` is a thin adapter over
   the reveng MCP tool registry, so a new reveng tool reaches both agents and the GUI. Failure
   envelopes are `{ok:false, reason, hint}`; surface both fields.
-- Scenarios: `reveng`, `reveng_capture`, `reveng_scale`, `reveng_recon`, `reveng_review`,
+- Scenarios: `reveng`, `reveng_capture`, `reveng_reference`, `reveng_scale`, `reveng_recon`, `reveng_review`,
   `reveng_model`, `reveng_deliver`, `reveng_splat`. Demo rows are gated on `CHUDWARE_SHOT` so
   they can never reach a real session.
 
@@ -155,9 +200,20 @@ harness).
 
 Explorer rendering uses non-blocking `FsBackend::pollDirectory/pollStat/pollDefaultRoot`, never
 blocking calls (required on the web build). A non-empty filter runs a bounded incremental
-search (4000 entries, depth 12). Scenario: `explorer`.
+search (4000 entries, depth 12). Native `.step+` rows/tiles show previews from `file_thumbs.cpp`:
+parts render their `cache.aicm`, assemblies compose component meshes by saved transform, one
+background parse at a time and one GL render per frame, only for rows drawn this frame; nothing
+is written to disk and there is no worker round-trip (desktop only; the web keeps icons). Recent
+and Changes rows use the same cards. Folder tiles are a vector-drawn folder (not the atlas icon)
+with up to three previews of the `.step+` documents inside it, searched two folder levels deep.
+Scenario: `explorer` (`CHUDWARE_EXPLORER_SHOT_VIEW=tiles|tree`, `_TILEDIR`, `_STRIPS=recent`,
+`_PANE=changes`, `_OPEN=<rel path>` waits for that document to open; the capture waits for
+previews).
 
 ## Verification
+
+For automated tests use the isolated suites in
+[Running tests](../../CONTRIBUTING.md#running-tests).
 
 ```bash
 CHUDWARE_SHOT=<asm|fea|flow|drawing|cam|manufacture|topology|workspaces|motion|firmware|reveng> \

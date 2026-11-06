@@ -23,16 +23,12 @@ MockProvider it is fully unit-testable without credentials or the C++ core.
 from __future__ import annotations
 
 import json
-import logging
 import os
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .providers.base import Provider, text_part, user
-
-_LOG = logging.getLogger(__name__)
 
 # Selector kinds the doc schema accepts (kept in lockstep with the regen_fix bench detector).
 VALID_SELECTOR_KINDS = ("face", "edge", "vertex", "body", "datum", "region", "plane")
@@ -409,7 +405,6 @@ class Diagnosis:
     raw_reply: str = ""
     artifact_id: Optional[str] = None   # the IP-18 ai_artifact this fix belongs to (for action
     run_id: Optional[str] = None        # events to correlate against; from the logged emit)
-    council_record: Optional[dict] = None  # fix-stage council record (None if skipped)
 
 
 def _parse_reply(reply: str) -> tuple[str, list[dict]]:
@@ -433,24 +428,12 @@ def diagnose(document: dict, provider: Provider, *,
              consent_fn: Optional[Callable[[], str]] = None,
              run_id: Optional[str] = None,
              wrap_logging: bool = True,
-             max_tokens: int = 2000,
-             council_tier: Optional[str] = None,
-             council_providers: Optional[list] = None,
-             ledger: Optional[Any] = None,
-             registry: Optional[Any] = None) -> Diagnosis:
+             max_tokens: int = 2000) -> Diagnosis:
     """Diagnose a failed-rebuild ``document`` and return a candidate fix.
 
     ``provider`` is an explicitly bound Provider: the tool-free compiled-runtime adapter
     online, or an offline-safe provider offline. Unless ``wrap_logging`` is False,
     LoggingProvider records the IP-18 correction trace without owning model requests.
-
-    When ``council_tier`` is provided, a council is convened at the ``fix`` stage
-    after diagnosis to deliberate on the proposed fix_ops — giving multi-angle validation
-    before the fix is applied.  The council policy (breadth / diverse-model selection) is
-    resolved from ``council_policy.yaml`` for (stage="fix", tier=council_tier).
-    When the policy is disabled for this tier (e.g. frontier minimal dial), the council
-    call is skipped silently.  Council results are attached to the returned Diagnosis as
-    ``council_record`` (None if skipped).
     """
     failures = diagnostic_failures(document)
     prompt = build_diagnosis_prompt(document, failures, engine_error=engine_error)
@@ -482,120 +465,8 @@ def diagnose(document: dict, provider: Provider, *,
     diagnosis_text, fix_ops = _parse_reply(reply)
     fixed_doc, n_applied = apply_fix_ops(document, fix_ops)
 
-    # Optional fix-stage council — deliberates on proposed fix_ops.
-    council_record: Optional[dict] = None
-    if council_tier is not None:
-        council_record = _maybe_convene_fix_council(
-            diagnosis_text=diagnosis_text,
-            fix_ops=fix_ops,
-            failures=[f.to_dict() for f in failures],
-            provider=provider,
-            tier=council_tier,
-            providers=council_providers,
-            ledger=ledger,
-            registry=registry,
-        )
-
     return Diagnosis(
         diagnosis=diagnosis_text, fix_ops=fix_ops, fixed_document=fixed_doc,
         n_applied=n_applied, failures=[f.to_dict() for f in failures], raw_reply=reply,
         artifact_id=captured["artifact_id"], run_id=captured["run_id"],
-        council_record=council_record,
     )
-
-
-def _maybe_convene_fix_council(
-    *,
-    diagnosis_text: str,
-    fix_ops: list[dict],
-    failures: list[dict],
-    provider: Provider,
-    tier: str,
-    providers: Optional[list] = None,
-    ledger: Optional[Any] = None,
-    registry: Optional[Any] = None,
-) -> Optional[dict]:
-    """Convene a fix-stage council when the policy is enabled for this tier.
-
-    Returns None only when policy disables the council. Once execution starts,
-    failures return an explicit incomplete record and are logged with traceback.
-    """
-    try:
-        from .councils import council_convene, resolve_policy
-        policy = resolve_policy("fix", tier)
-        if not policy.enabled:
-            return None
-
-        topic = (
-            f"Error diagnosis review: {len(failures)} failure(s) detected. "
-            f"Proposed fix: {fix_ops[0].get('op', 'unknown') if fix_ops else 'none'}. "
-            "Deliberate on whether the proposed fix_ops are correct and complete."
-        )
-        inputs: dict = {
-            "diagnosis": diagnosis_text[:800],   # cap at 800 chars to fit all tiers
-            "fix_ops": fix_ops[:5],              # first 5 ops; enough context for seats
-            "failures": failures[:3],            # first 3 failures
-        }
-        return council_convene(
-            kind="failure_review",
-            topic=topic,
-            inputs=inputs,
-            provider=provider,
-            ledger=ledger,
-            registry=registry,
-            providers=providers,
-            stage="fix",
-            tier=tier,
-        )
-    except Exception as exc:  # noqa: BLE001 — diagnosis survives, failure stays visible
-        _LOG.exception("Fix-stage council failed after execution began")
-        partial = getattr(exc, "council_record", None)
-        if not isinstance(partial, dict):
-            partial = {
-                "schema": "aicad.council/1",
-                "id": f"cn_{uuid.uuid4().hex[:10]}",
-                "kind": "failure_review",
-                "topic": "Error diagnosis review",
-                "inputs": {
-                    "diagnosis": diagnosis_text[:800],
-                    "fix_ops": fix_ops[:5],
-                    "failures": failures[:3],
-                },
-                "seats": [],
-                "rounds": 2,
-                "positions": [],
-                "synthesis": {
-                    "decision": "",
-                    "rationale": "",
-                    "rejected_alternatives": [],
-                },
-                "dissents": [],
-                "chair": "department_manager",
-                "seat_outcomes": [],
-                "diagnostics": {},
-            }
-        partial["status"] = "incomplete"
-        partial["complete"] = False
-        partial.setdefault("seat_outcomes", [])
-        partial.setdefault("diagnostics", {})["council_exception"] = {
-            "status": "failed",
-            "outcome_kind": "internal_error",
-            "executed": False,
-            "error": str(exc),
-        }
-        if ledger is not None:
-            try:
-                ledger.append("council", "artifact", {
-                    "id": partial["id"],
-                    "kind": "council",
-                    "council": partial,
-                })
-            except Exception as persist_exc:  # noqa: BLE001 — keep diagnosis alive
-                _LOG.exception("Could not persist incomplete fix-stage council")
-                partial["diagnostics"]["persistence_error"] = {
-                    "status": "failed",
-                    "outcome_kind": "internal_error",
-                    "executed": False,
-                    "error": str(persist_exc),
-                }
-        return partial

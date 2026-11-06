@@ -1,9 +1,13 @@
 # 3D printing (FDM) — design, orient, slice, prove
 
 ## Workflow
-1. While modelling each part: `dfm_check(printer="<make model>")`. Every fail/warn row names
-   face sids, the feature that built them, a model-frame centroid and fixes. Fix fails in CAD,
-   re-run. Compare `estimate` (material g, time h, support share) between revisions.
+1. While modelling each part, run `wall_thickness()` AND `dfm_check(printer="<make model>")`.
+   Inspect the process-minimum RED heat map; fix every red region at its named face/feature
+   or explicitly justify it before export/slicing. Fix DFM failures in CAD and re-run both.
+   `wall_thickness(min_wall_mm=…, resolution=…, image=False)` returns JSON instead of the
+   default image: minimum defaults to the bound process or FDM profile (currently 1.0 mm);
+   resolution is optional sample spacing in mm. Read the inscribed-sphere basis and spacing;
+   null/grey is unmeasured, not safe. Compare DFM `estimate` between revisions.
 2. `optimize_print_orientation` when the part is loaded or has cosmetic/precision faces
    (`strength_dir=[x,y,z]` keeps the load in the layer plane; `preserve_faces=[sid…]` keeps
    supports and the bed off those faces). `slice_part(orientation="auto")` uses the same scorer.
@@ -36,9 +40,48 @@
 - NEVER download/extract a slicer, write slicer `.ini` keys by hand, or reuse a design-time
   build direction nobody measured. That combination produced collapsed support towers.
 
+## Paths and result shapes
+- Caller-supplied relative mesh/G-code paths, media roots, manifest paths and explicit
+  job `gcode_path` overrides use the selected workspace, not the server's cwd.
+  Without a workspace, supply absolute paths. A relative G-code path stored *inside*
+  a manifest remains relative to that manifest; media `retire_paths` stay media-relative.
+- Keep the absolute `gcode_path` returned by `slice_part`; use it for `verify_gcode`.
+- `slice_part` completion (`ok:true`) is not a printability verdict: inspect `print_ready`.
+  `printability` and `gcode_check` are objects `{status, issues:[...]}`, not lists.
+  Read `result["printability"]["issues"]` / `result["gcode_check"]["issues"]`;
+  rows contain `check`, `status`, `note` and optional `fix`. Only fail/warn/not_evaluated
+  checks appear here. Do not slice the object itself.
+- Slicer measurements are `stats["print_time_s"]` (seconds), `stats["filament_g"]`,
+  `stats["layers"]` and `stats["support_share"]`. `stats` is an object, not a list.
+- Standalone `verify_gcode` returns all rows in a `checks` **list**, with `check`,
+  `status`, `ok`, `note`, `metrics`, `limits`, `regions` and `fix`.
+  `ok:false,status:"fail",checks:[...]` is a completed failed validation; inspect the
+  findings, do not call it safe or rerun slicing merely to recover the report.
+  `{ok:false,error:...}` instead indicates an input/access/execution error.
+
 ## Delivering to printer media (USB stick / SD card)
 The printer lists file NAMES only, no dates: a stale revision beside the current one is
-indistinguishable on its screen. The media must hold exactly the current set.
+indistinguishable on its screen. The requested project must have only its current set.
+Print delivery is not firmware maintenance. Never create, copy, download, select or flash
+firmware images (`.bin`, `.hex`, `.elf`, `.uf2`, `.dfu`) to prepare a print, and never use
+`fw_flash`, raw serial or shell commands as a delivery workaround. Some printers
+automatically flash root-level `.bin` files at boot. Inventory flags possible root
+firmware images as `firmware_files_present`; publishing refuses until they have been
+reviewed and moved off the media. Never delete or relocate an unknown image without the
+user's approval, or insert suspect media into the printer.
+
+Only UTF-8 text `.gcode`/`.gco`/`.g` can be published or uploaded. Binary G-code is refused
+because this path cannot inspect its commands. Known firmware/EEPROM/media-write commands
+(including `M28`/`M29`, `M500`/`M502`, `M993`/`M994`, `M997` and `SAVE_CONFIG`) are refused
+even with `user_override`; that override covers printability, not firmware maintenance.
+Slicer `post_process` scripts are also refused, not executed or silently stripped.
+The filename rule covers auxiliary files and interrupted publishes too: never use a
+firmware extension for scratch data, configuration, meshes, review projects or transaction
+staging. Output symlink/hardlink aliases are refused rather than followed; slicer exports
+and Chudware-written artifacts use `.part` staging and replacement. Firmware checks also
+recognize FAT-style trailing spaces/dots (`UPDATE.BIN. `). A refusal is not permission to
+rename the same bytes or use a shell copy.
+
 1. The moment a flashdrive/SD delivery is asked for:
    `print_media_inventory(root=<mount, e.g. /run/media/<user>/<LABEL>>)`. Read every page
    (`total`/`truncated`): printable rows, duplicate groups, managed status
@@ -49,7 +92,7 @@ indistinguishable on its screen. The media must hold exactly the current set.
    printer, so `media_idle=True` is that confirmation — never assume it.
 3. `publish_print_media(root=…, project="<name>", jobs=[{"part_id": "upper_arm",
    "manifest_path": "<…>.print.json"}, …], expected_inventory=<inventory_token>,
-   media_idle=True)`. `jobs` is the whole project set: a part left out is deleted. Every job
+   media_idle=True, retire_paths=[<identified stale project paths>])`. `jobs` is the whole project set: a part left out is deleted. Every job
    must match the manifest's `gcode_sha256` (pass `gcode_path` only for a saved G-code that
    moved) and be `print_ready: true`, except a job the user explicitly told you to put on
    the media anyway: add `"user_override": "<the user's words>"` to that job. It publishes
@@ -57,8 +100,9 @@ indistinguishable on its screen. The media must hold exactly the current set.
    `published_not_print_ready` warning you report. The tool never reslices or relaxes a
    check on its own: without an override, a refusal means fix the part and run `slice_part`
    again. Same content set and layout = no new revision.
-   Unmanaged/hand-copied printables are never touched unless the user reviewed them and you
-   pass their relative paths in `retire_paths`.
+   Identify stale or duplicate unmanaged/hand-copied printables belonging to this project
+   from the inventory and pass their media-relative paths in `retire_paths`. Preserve
+   unrelated or ambiguous files; surface uncertainty instead of deleting them blindly.
    Deprecated G-code is permanently deleted after verified publication, NEVER archived
    on the drive or host. Temporary rollback staging is removed after commit. Obsolete
    managed archives are deleted too; unrelated files and other projects are untouched.
@@ -81,9 +125,9 @@ indistinguishable on its screen. The media must hold exactly the current set.
   [--layout project] [--retire-path RELPATH …]`.
 
 ## Geometry rules (0.4 mm nozzle, 0.2 mm layers; scale with nozzle)
-- Walls: ≥ 1.2 mm (3 lines) structural, never < 0.8 mm; size in line-width multiples
-  (0.45 mm: 0.9 / 1.35 / 1.8 / 2.25) — in-between values print as slow gap fill.
-  Horizontal skins ≥ 0.8 mm (4 layers). A wall thinner than the nozzle disappears.
+- Walls/skins: use the bound ProcessProfile minimum, not a recalled nozzle-based floor.
+  Size functional walls above that minimum in line-width multiples; set skins in whole
+  layers. Use `wall_thickness()` and `dfm_check` to inspect thin regions and process limits.
 - Overhangs: ≤ 45° from vertical print unsupported. Bottom edges touching the bed: 45° chamfer,
   not a fillet (a fillet's lower arc is a 90° overhang). Ceilings: bridge ≤ ~5–10 mm between
   two anchored walls; one-sided shelves need support or a 45° gusset.
@@ -112,9 +156,12 @@ indistinguishable on its screen. The media must hold exactly the current set.
 
 ## Reading verify_gcode
 - `floating_extrusion` fail: plastic laid more than a line width away from anything below —
-  spaghetti. Reorient, enable supports, or redesign; never ship it.
-- `heat_before_extrude`, `temperatures`, `bounds`, `max_height`, `homing_before_motion` are hard
-  stops. Warnings on retraction/fan are advice tied to the printer type.
+  spaghetti. Recommend reorienting, enabling supports, or redesigning; explain the risk and
+  follow the explicit user-override flow above if the user still requests media delivery.
+- `heat_before_extrude`, `temperatures`, `bounds`, `max_height`, `homing_before_motion` failures
+  require explaining the specific risk and recommending repair; use that same explicit
+  override flow if requested. Warnings on retraction/fan are advice tied to the printer type.
 - `sequential_clearance` fail (Complete individual objects): a later move runs the hotend
   inside the clearance radius of, or the gantry below the top of, a finished object;
-  `regions` name it. Re-plan the plate; never print it.
+  `regions` name it. Recommend replanning the plate, explain the collision risk, and follow
+  the explicit user-override flow above if the user still requests media delivery.

@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -24,6 +25,7 @@
 #include "autosave.h"
 #include "child_supervisor.h"
 #include "doc_registry.h"
+#include "worker_bridge.h"
 #include "engine_watchdog.h"
 
 namespace hostd {
@@ -37,6 +39,9 @@ struct ClientConn {
     std::string userId;
     std::string userDisplay;
     long pid = 0;
+    // OS-authenticated PID of a desktop `gui` hello (IpcConn::peerPid), else -1. A soft
+    // stale-binary drain admits further `gui` connections from that live process.
+    std::atomic<long> guiPeerPid{-1};
     bool gateway = false;
     bool helloDone = false;
     std::atomic<bool> controlOnly{false};
@@ -69,7 +74,7 @@ public:
         std::atomic<long long> lastActivityMs{0};  // monotonic ms of last disconnect/RPC
     };
 
-    Server(chudware_ipc::IpcListener listener, std::string buildId);
+    Server(chudware_ipc::IpcListener listener, std::string buildId, std::string daemonStartId);
     ~Server();
 
     // Close the listen fd without unlinking the sock, and return the
@@ -84,16 +89,26 @@ public:
     // to honour it or a clone lands in the user's "Recover?" prompt.
     void setAutosave(Autosave* a) {
         autosave_ = a;
-        if (a) a->setInternalFilter([this](const std::string& id) { return registry_.isInternal(id); });
+        if (a) {
+            a->setInternalFilter([this](const std::string& id) { return registry_.isInternal(id); });
+            a->setRegistryAnnotator([this](nlohmann::json& rows) { registry_.annotateDocList(rows, -1); });
+            a->setCaptureGuard([this](const std::string& id, const std::function<void()>& capture) {
+                auto guard = registry_.lockMutation(id);
+                capture();
+            });
+        }
     }
     DocRegistry& registry() { return registry_; }
     // Phase 5: supervised agent children (agent_spawn/agent_stop/agent_list).
     ChildSupervisor& children() { return children_; }
     // Phase 8: stale-binary self-drain backstop. The accept-loop tick stats the
     // hostd binary itself + the loaded libchudware every CHUDWARE_HOSTD_STALECHECK_S
-    // (default 60 s); an mtime change (dev rebuild, installer upgrade) flips the
-    // daemon to draining so the next client respawns the new build.
-    void setSelfBinary(std::string path) { selfBinary_ = std::move(path); }
+    // (default 60 s); an mtime change starts a soft drain so the new build
+    // takes over once existing sessions finish.
+    void setSelfBinary(std::string path) {
+        selfBinary_ = std::move(path);
+        staleBinaryTick(true);  // baseline before the accept loop and async engine load
+    }
     // Must be configured before run(); the gateway fd is the sole principal authority.
     bool configureCell(std::string state, std::string work,
                        const std::string& policyPath, std::string& err);
@@ -108,11 +123,10 @@ public:
     // Begin a wind-down. `deadlineSecs > 0` makes it a HARD stop: new connects are refused
     // and, once the deadline passes, whatever is still connected is disconnected and the
     // daemon exits regardless. That deadline is what makes `--stop` / the tray's Quit /
-    // SIGTERM terminal; a soft drain (deadlineSecs == 0, used by the stale-binary watch)
-    // only refuses new connects and waits for the current work to finish on its own.
-    // `reason` names the cause in every refusal and in daemon_status: "stale_binary"
-    // (`changedPath` = the file that changed), "stop_requested" (daemon_drain / --stop),
-    // "quit" (tray Quit). A later drain replaces the reason; a changed path is kept.
+    // SIGTERM terminal; a soft stale-binary drain waits for current work and
+    // admits only new MCP sockets from agent worker generations which already
+    // owned a session when the drain began. `reason` names the cause in every
+    // refusal and in daemon_status; a hard stop supersedes a soft drain.
     void beginDrain(int deadlineSecs, std::string reason, std::string changedPath = {});
     // Drain cause as passed to beginDrain ("" while not draining). Any thread.
     std::string drainReason() const;
@@ -125,33 +139,28 @@ public:
     void setGuiExitGrace(int secs) { guiExitGraceSecs_ = std::max(1, secs); }
 
     Status& status() { return status_; }
-    // Count of engine-side calls only (agent_run / doc_* via beginInflight).
+    // Count of engine-side calls only (agent_admin_turn / doc_* via beginInflight).
     // Distinct from Status::inflight which counts every RPC including hello/status
     // and makes the tray show a permanent "1 in-flight" while any client polls.
     int engineInflightCount() const;
 
-    // True while any client has an agent_* RPC on the wire. Agent-origin docs are
-    // protected from user-initiated purges (doc_close/doc_discard) while this holds,
-    // so an agent's in-flight work is independent of the user's viewport tabs.
-    bool agentWorkInFlight() const;
 
 private:
-    // `firstLine` is a request already read off the socket before the loop started (the
-    // hello of a control client admitted during a drain); empty = none.
+    // `firstLine` is a request already read before the loop started (a hello
+    // admitted during a drain); empty = none.
     void clientLoop(std::shared_ptr<ClientConn> c, std::string firstLine);
     nlohmann::json dispatch(ClientConn& c, const std::string& method,
                             const nlohmann::json& params, bool& isError);
-    // A connect that arrives while the daemon drains. Reads the first request (bounded)
-    // and admits only an operator control client (`--status`, `--stop`), returning its
-    // request in `firstLine`. Every other client gets drainRefusal() as the answer to its
-    // first request, then the connection closes. The client sees a named reason, never a
-    // bare reset (ECONNRESET came from closing a socket with an unread hello).
-    bool admitWhileDraining(chudware_ipc::IpcConn& conn, std::string& firstLine);
+    // Admit control, a previously-owned desktop agent worker, or another connection
+    // of an already-connected GUI process on a soft stale drain. Other clients
+    // receive a structured refusal before EOF.
+    bool admitWhileDraining(chudware_ipc::IpcConn& conn, std::string& firstLine,
+                            bool allowControl);
     // The structured `daemon_draining` error a refused client receives.
     nlohmann::json drainRefusal();
     void touch();
     bool idleExpired(int lingerSecs);
-    void staleBinaryTick();
+    void staleBinaryTick(bool initial = false);
     // How many connected clients are a REASON to stay up, as opposed to merely connected.
     //
     // WHY this is not `status_.clients`: a client that connected, said hello and then went
@@ -173,13 +182,11 @@ private:
     void beginInflight(int clientId, const std::string& method);
     void endInflight(int clientId);
     void watchdogLoop();
-    // DISCARD an abandoned doc: close it in the engine and purge its autosave
-    // artifacts (onDocClosed) so it never resurrects. Used by doc-GC (grace
-    // expired, reason "gc") and explicit user discard (reason "discarded") —
-    // neither is a crash, so nothing is preserved for recovery. Returns true once
-    // registry state is dropped (false = still attached / engine loading).
-    // `reason` labels the doc.closed event. See DocRegistry::tick + isReapable.
-    bool gcCloseDoc(const std::string& docId, const char* reason = "gc");
+    // Preserve authored abandoned work before closing, except on explicit
+    // discard. Recheck attachment generation atomically before removal.
+    bool gcCloseDoc(const std::string& docId, const char* reason = "gc",
+                    int clientId = 0, const std::string& clientKind = "daemon",
+                    const char* method = "gc");
     void sendEventTo(int clientId, const std::string& line);
     void sendEventToAll(const std::string& line);
     // Live agent-event streaming (transparency): push one emitted run event to a client as a
@@ -187,11 +194,6 @@ private:
     // with the engine (chudware_set_event_sink); its `ud` is a StreamCtx{this, clientId}.
     void sendAgentEvent(int clientId, const char* eventJson);
     static void streamThunk(const char* eventJson, void* ud);
-    // Direct doc_new/doc_apply_ops calls nested inside an opaque agent RPC arrive here only
-    // after the engine operation returns. Feed them through DocRegistry::postCall so the normal
-    // lock-free snapshot + doc.opened/doc.changed fanout path remains the single implementation.
-    static void docPublishThunk(const char* method, const char* paramsJson,
-                                const char* resultJson, void* ud);
     static void cacheRefreshThunk(const char* docId, const char* responseJson, void* ud);
     struct CellActor {
         std::string key, hex, right;
@@ -224,9 +226,22 @@ private:
                       const std::string& actor = {}, bool operatorListener = false);
     void rememberCellHandles(const ClientConn& c, const nlohmann::json& params,
                              const nlohmann::json& result);
+    // Desktop agent_admin_turn calls in flight, by run_id. A turn streams only to its
+    // requester; supersedeOrphanedTurns stops a conversation's turns whose requester is gone.
+    // `requester` stays valid while its entry exists: the entry is erased on the requester's
+    // own dispatch thread before that call returns.
+    struct LiveTurn {
+        std::string sessionId;
+        ClientConn* requester = nullptr;
+        nlohmann::json credentials;  // byok_* fields the worker's cancel matches against
+    };
+    std::mutex liveTurnsMtx_;
+    std::map<std::string, LiveTurn> liveTurns_;
+    void supersedeOrphanedTurns(const std::string& sessionId);
 
     chudware_ipc::IpcListener listener_;
     std::string buildId_;
+    std::string daemonStartId_;
     Status status_;
     std::atomic<bool> stopping_{false};
     // True once the last "gui" client has detached (reset when a gui hello
@@ -242,6 +257,8 @@ private:
     mutable std::mutex drainMtx_;
     std::string drainReason_;
     std::string drainChangedPath_;
+    // Pre-drain, daemon-owned desktop worker generations; protected by drainMtx_.
+    std::vector<WorkerBridge::AgentPeer> drainAgentPeers_;
     std::mutex clientsMtx_;
     // Connection registration and maintenance closure share this authority.
     bool cellAdmissionClosed_ = false, cellExitWhenQuiescent_ = false, cellExiting_ = false;
@@ -254,6 +271,7 @@ private:
     std::map<int, std::shared_ptr<ClientConn>> clients_;
     int nextClientId_ = 1;
     DocRegistry registry_;
+    std::atomic<std::uint64_t> nextAgentRunScope_{0};
     ChildSupervisor children_;
     Autosave* autosave_ = nullptr;
     // Stale-binary watch state (accept-loop thread only — no locking needed).

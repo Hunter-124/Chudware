@@ -18,7 +18,7 @@ def tools():
     mcp = FastMCP("native-read-wait-test")
     cad_doc_tools.register_cad_doc_tools(mcp)
     return {name: mcp._tool_manager._tools[name].fn
-            for name in ("read_native_file", "wait_job", "get_job")}
+            for name in ("read_native_file", "wait_job", "get_job", "add_features")}
 
 
 @pytest.fixture()
@@ -258,3 +258,119 @@ def test_wait_job_unknown_id_does_not_wait(tools):
     assert time.monotonic() - start < 0.5
     assert unknown.pop("waited_s") < 0.5
     assert unknown == original
+
+
+def test_rejected_background_edit_reports_failure_without_mutating_document(tools):
+    from services.agent.omp_events import map_rpc_frame
+    from services.agent.omp_tools import host_tool_result
+
+    cb = cad_common.cb
+    doc = cb.call("doc_new", {"kind": "part", "name": "BackgroundAudit"})["doc_id"]
+    try:
+        cb.call("doc_apply_ops", {"doc_id": doc, "ops": [
+            cb.feat("box", "Block", {"length": cb.dim(100), "width": cb.dim(100),
+                                     "height": cb.dim(100)})]})
+        before = cb.call("doc_tree", {"doc_id": doc})
+        started = json.loads(tools["add_features"](
+            doc_id=doc, background=True,
+            ops=[cb.feat("cylinder", "BuriedBoss",
+                         {"radius": cb.dim(5), "height": cb.dim(10)})]))
+        assert started["ok"], started
+        jid = started["job_id"]
+        waited = json.loads(tools["wait_job"](jid, timeout_s=5, poll_s=0.5))
+        polled = json.loads(tools["get_job"](jid))
+
+        for result in (waited, polled):
+            assert result["status"] == "done"
+            assert result["ok"] is False
+            assert result["result"]["rolled_back"] is True
+            assert result["result"]["failed_features"][0]["id"] in result["error"]
+            assert result["error"] == result["result"]["error"]
+            assert result["result"]["ok"] is False
+        assert cb.call("doc_tree", {"doc_id": doc}) == before
+
+        events = map_rpc_frame({
+            "type": "tool_execution_end", "toolCallId": "job-audit",
+            "toolName": "wait_job", "result": host_tool_result(waited),
+            "isError": False,
+        }, {"run_id": "audit", "session_id": "audit"})
+        card = next(payload for kind, payload in events if kind == "agent.tool_call")
+        assert card["ok"] is False
+        assert card["error_preview"] == waited["error"]
+    finally:
+        cb.call("doc_close", {"doc_id": doc})
+
+
+def test_background_refusal_without_error_preserves_reason_and_details(tools):
+    refusal = {"ok": False, "reason": "input_unavailable", "detail": {"field": "source"},
+               "partial": {"checked": ["metadata"], "pending": ["contents"]}}
+    jid = cad_common._start_job("read-audit", lambda: refusal)
+
+    result = json.loads(tools["wait_job"](jid, timeout_s=5, poll_s=0.5))
+
+    assert result["status"] == "done"
+    assert result["ok"] is False
+    assert result["error"] == result["reason"] == "input_unavailable"
+    assert result["detail"] == {"field": "source"}
+    assert result["result"] == refusal
+
+
+def test_native_relocation_reply_keeps_direct_reference_diagnostics(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(tmp_path))
+    source = tmp_path / "assembly.step+"
+    destination = tmp_path / "archive" / "assembly.step+"
+    source.write_text("source retained")
+    plan = tmp_path / "plan.json"
+    plan.write_text(json.dumps({"entries": [{"path": str(source), "destination": str(destination)}],
+                                "path_map": {}}))
+    refs = [{"json_pointer": f"/components/{i}/source/path", "required": True,
+             "exists": i != 0, "destination_exists": False,
+             "destination_resolved_path": str(tmp_path / f"missing-{i}.step")}
+            for i in range(7)]
+    refs.append({"json_pointer": "/features/0/params/source_path", "required": False,
+                 "exists": False, "destination_exists": False,
+                 "destination_resolved_path": str(tmp_path / "history.step")})
+    result = {"ok": True, "action": "relocate", "failures": [],
+              "files": [{"ok": True, "status": "written", "path": str(source),
+                         "destination": str(destination), "dependency_rewrites": refs}],
+              "direct_reference_availability": {"required_count": 7, "missing_count": 7,
+                                                "unknown_count": 0,
+                                                "scope": "direct_references_in_written_files"},
+              "direct_reference_warning": "Required direct references are missing."}
+    monkeypatch.setattr(cad_doc_tools.cb, "call", lambda method, params: result)
+    mcp = FastMCP("native-relocation-test")
+    cad_doc_tools.register_cad_doc_tools(mcp)
+    relocate = mcp._tool_manager._tools["relocate_native_files"].fn
+    reply = json.loads(relocate(str(plan)))
+    assert reply["ok"] is True
+    assert reply["succeeded_count"] == 1
+    assert reply["failure_count"] == 0
+    assert reply["direct_reference_availability"]["missing_count"] == 7
+    assert len(reply["missing_direct_references_preview"]) == 5
+    assert reply["missing_direct_references_omitted"] == 2
+    assert reply["missing_direct_references_preview"][0]["source_exists"] is False
+    assert reply["missing_direct_references_preview"][1]["source_exists"] is True
+    assert reply["direct_reference_warning"]
+    assert json.loads(Path(reply["output_path"]).read_text()) == result
+    assert source.read_text() == "source retained"
+
+    def fail_report(_path):
+        raise OSError("report unavailable")
+
+    monkeypatch.setattr(cad_doc_tools, "_native_report_path", fail_report)
+    failed_report = json.loads(cad_doc_tools._native_file_reply(result, str(tmp_path / "report.json")))
+    assert failed_report["ok"] is False
+    assert failed_report["native_ok"] is True
+    assert failed_report["succeeded_count"] == 1
+    assert failed_report["direct_reference_availability"]["missing_count"] == 7
+    assert len(failed_report["missing_direct_references_preview"]) == 5
+    assert "report unavailable" in failed_report["report_error"]
+
+
+def test_native_relocation_inline_reply_retains_warning():
+    result = {"ok": True, "action": "relocate", "files": [], "failures": [],
+              "direct_reference_availability": {"required_count": 2, "missing_count": 2,
+                                                "unknown_count": 0,
+                                                "scope": "direct_references_in_written_files"},
+              "direct_reference_warning": "Required direct references are missing."}
+    assert json.loads(cad_doc_tools._native_file_reply(result)) == result

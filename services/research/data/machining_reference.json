@@ -242,6 +242,16 @@
       "notes": "Drive recess and head height differ by series; use the exact purchased fastener geometry for flushness-critical work."
     },
     {
+      "id": "iso-10642-legacy-head-envelope",
+      "topic": "metric countersunk socket head screw maximum head diameter",
+      "process": "drilling",
+      "conditions": "Legacy BS EN ISO 10642:1998 dimensional reference, nominal metric hexagon socket countersunk screws; confirm purchased fastener and current standard",
+      "table": {"columns": ["thread", "max_head_diameter_mm", "included_angle_deg"], "rows": [["M3", 6.0, 90], ["M4", 8.0, 90], ["M5", 10.0, 90], ["M6", 12.0, 90], ["M8", 16.0, 90], ["M10", 20.0, 90], ["M12", 24.0, 90], ["M16", 32.0, 90], ["M20", 40.0, 90]]},
+      "unit": "mm, degree",
+      "source": {"standard": "BS EN ISO 10642:1998 legacy reference", "section": "RoyMech Hexagon Socket Countersunk Head Screws, Head diameter A max; https://www.roymech.co.uk/Useful_Tables/Screws/cap_screws.htm"},
+      "notes": "Historical planning data, not an assertion about current ISO 10642:2026 acceptance limits; use the purchased head and assembly clearances."
+    },
+    {
       "id": "thread-engagement-material-class",
       "topic": "minimum thread engagement length guidance by internal material class",
       "conditions": "Steel fastener into fully formed internal threads; L is engagement and d is nominal diameter",
@@ -249,6 +259,16 @@
       "unit": "L/d",
       "source": {"standard": "ISO 965-1:2013 / ISO 898-1:2013", "section": "ISO 965-1 §6 engagement groups; ISO 898-1 mechanical-property classes"},
       "notes": "Planning screen only. Use research_eng_calc(thread_engagement) with actual material allowables, pitch, class, and load for strength."
+    },
+    {
+      "id": "nord-lock-thread-engagement",
+      "topic": "tapped hole approximate minimum thread engagement",
+      "process": "drilling",
+      "conditions": "Approximate guidance for tapped steel and aluminium components; actual bolt, thread strengths and load must be checked",
+      "table": {"columns": ["internal_material_class", "engagement_ratio_L_over_d"], "rows": [["steel", 1.0], ["aluminum", 2.0]]},
+      "unit": "L/d",
+      "source": {"standard": "Nord-Lock The Experts: Thread engagement in a tapped hole", "section": "Recommended thread engagement; https://www.nord-lock.com/learnings/bolting-tips/2015/the-experts-thread-engagement-in-a-tapped-hole/"},
+      "notes": "Approximate planning guidance, not a thread strength calculation or proof of actual assembled engagement."
     },
     {
       "id": "metric-keyway-keyseat",

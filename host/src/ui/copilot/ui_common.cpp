@@ -6,6 +6,8 @@
 // copilot_internal.h.
 
 #include <algorithm>
+#include <list>
+#include <memory>
 
 #include "copilot_internal.h"
 #include "ui/tesseract.h"  // ui::drawTesseractSpinner — the brand mark doubles as the busy art
@@ -13,7 +15,7 @@
 // ============================ shared small-UI helpers ============================
 // These three are declared in core/app_state.h and called from the copilot module, the settings
 // modal and the workspaces, so they are app-wide API with a copilot-local home. The BODIES now
-// forward to ui::kit (same style as drawStatusGlyph below) — one accent-button, one section
+// forward to ui::kit (same style as drawBusyMark below) — one accent-button, one section
 // caption and one filter chip for the whole product. Deliberately NO pushDensity here: an
 // app-wide entry point must inherit the density its host pushed, not impose one.
 bool primaryButton(const char* label, const ImVec2& size) {
@@ -95,7 +97,7 @@ void drawCodeBox(const char* id, const std::string& code, ImFont* mono, float ma
         if (b <= a) return {};
         return std::string(st->TextA.Data + a, st->TextA.Data + b);
     }();
-    chatCopyContext(boxRect, (std::string(id) + "_copy").c_str(), code, code, sel);
+    chatCopyContext(boxRect, (std::string(id) + "_copy").c_str(), [&] { return code; }, {}, sel);
     ImGui::PopStyleColor(2);
     if (mono) ImGui::PopFont();
 }
@@ -233,7 +235,8 @@ void cpMenuHint(const char* text) {
 const ui::AdaptiveSurface& chatSurf() {
     ImVec2 mn = ImGui::GetWindowPos();
     ImVec2 mx(mn.x + ImGui::GetWindowSize().x, mn.y + ImGui::GetWindowSize().y);
-    return ui::adaptivePanel(ui::panelId("host_agent_glass"), ImRect(mn, mx),
+    static const auto id = ui::panelId("host_agent_glass");
+    return ui::adaptivePanel(id, ImRect(mn, mx),
                              ui::GlassGroup::Copilot);
 }
 
@@ -337,23 +340,6 @@ ui::kit::Status chatRowStatus(const std::string& status) {
     if (status == "skipped" || status == "stopped" || status == "interrupted" ||
         status == "cancelled" || status == "abandoned") return ui::kit::Status::Skipped;
     return ui::kit::Status::Pending;
-}
-
-// Draw a run-status glyph (the turning brand mark while running / check / cross / retry ring /
-// "skipped" dash / pending hollow dot) centered in a `box`-wide cell at the cursor, then advance
-// past it. Shared by the plan checklist, the action cards and the timeline spine.
-//
-// This WAS the canonical implementation; ui::kit::statusGlyph is the port of it, and the app now
-// has exactly one status painter. The wrapper survives because ~seven call sites spell the status
-// as the harness's raw string and pass a cell size — translating that at every site would buy
-// nothing. chatSurf() is the ink source: the copilot's cached adaptive surface, which the kit's
-// own ink-derived surface cannot see from inside a PushStyleColor'd card.
-void drawStatusGlyph(const std::string& status, float box) {
-    const ImVec2 p0 = ImGui::GetCursorScreenPos();
-    ui::kit::statusGlyph(ImGui::GetWindowDrawList(),
-                         ImVec2(p0.x + box * 0.5f, p0.y + box * 0.5f),
-                         box * kStatusGlyphRadiusFrac, chatRowStatus(status), chatSurf());
-    ImGui::Dummy(ImVec2(box, box));
 }
 
 // The "AI is working" busy affordance for the chat column: the brand mark turning in place, so
@@ -545,13 +531,134 @@ static std::string chatSoftWrap(const std::string& in, float wrapW, std::vector<
 // the way rewrapCore measures (one CalcTextSize per byte, each rounded up by ImGui), which runs
 // wider than CalcTextSize of the whole line — sizing a bubble from the whole-line width wrapped
 // a short message's last word onto a second line.
-float chatSoftWrapNaturalWidth(const std::string& text) {
-    float widest = 0.0f, line = 0.0f;
-    for (size_t i = 0; i < text.size(); ++i) {
-        if (text[i] == '\n') { widest = std::max(widest, line); line = 0.0f; continue; }
-        line += ImGui::CalcTextSize(text.data() + i, text.data() + i + 1).x;
+namespace {
+struct WrapKey {
+    size_t hash = 0, length = 0;
+    ImGuiID owner = 0;
+    ImFont* font = nullptr;
+    float size = 0, padX = 0, padY = 0;
+    int width = 0;
+    bool operator==(const WrapKey& b) const {
+        return hash == b.hash && length == b.length && owner == b.owner && font == b.font &&
+               size == b.size && padX == b.padX && padY == b.padY && width == b.width;
     }
-    return std::max(widest, line);
+};
+struct WrapHash {
+    size_t operator()(const WrapKey& k) const {
+        size_t h = k.hash;
+        auto add = [&](size_t v) { h ^= v + 0x9e3779b9u + (h << 6) + (h >> 2); };
+        add(k.length); add(k.owner); add(std::hash<ImFont*>{}(k.font)); add(k.width);
+        add(std::hash<float>{}(k.size)); add(std::hash<float>{}(k.padX));
+        add(std::hash<float>{}(k.padY));
+        return h;
+    }
+};
+struct WrappedText {
+    WrapKey key;
+    std::string plain, soft;
+    std::vector<int> inserted;
+    std::vector<char> buffer;
+    int lines = 1;
+    float natural = -1;
+    size_t stablePlain = 0, stableSoft = 0, stableInserted = 0;
+    size_t bytes() const {
+        return plain.size() + soft.size() + buffer.size() + inserted.size() * sizeof(int);
+    }
+};
+using WrapList = std::list<std::shared_ptr<WrappedText>>;
+WrapList s_wrapLru;
+std::unordered_map<WrapKey, WrapList::iterator, WrapHash> s_wrapIndex;
+size_t s_wrapBytes = 0;
+
+std::shared_ptr<WrappedText> wrappedText(const std::string& plain, float width, ImGuiID owner) {
+    const ImGuiStyle& style = ImGui::GetStyle();
+    // Round DOWN to a 1/64 px bucket: layout never exceeds the available width.
+    const WrapKey key{std::hash<std::string>{}(plain), plain.size(), owner, ImGui::GetFont(),
+                      ImGui::GetFontSize(), style.FramePadding.x, style.FramePadding.y,
+                      (int)std::floor(width * 64.0f)};
+    auto hit = s_wrapIndex.find(key);
+    if (hit != s_wrapIndex.end() && (*hit->second)->plain == plain) {
+        s_wrapLru.splice(s_wrapLru.begin(), s_wrapLru, hit->second);
+        return s_wrapLru.front();
+    }
+    auto result = std::make_shared<WrappedText>();
+    result->key = key;
+    size_t tail = 0;
+    if (owner && width > 0) {
+        for (const auto& previous : s_wrapLru) {
+            const WrapKey& old = previous->key;
+            if (old.owner != owner || old.font != key.font || old.size != key.size ||
+                old.width != key.width || old.padX != key.padX || old.padY != key.padY)
+                continue;
+            if (plain.size() >= previous->plain.size() &&
+                plain.compare(0, previous->plain.size(), previous->plain) == 0) {
+                tail = previous->stablePlain;
+                result->soft.assign(previous->soft, 0, previous->stableSoft);
+                result->inserted.assign(previous->inserted.begin(),
+                    previous->inserted.begin() + (std::ptrdiff_t)previous->stableInserted);
+            }
+            break;
+        }
+    }
+    result->plain = plain;
+    if (width > 0) {
+        std::vector<int> inserted;
+        std::string soft;
+        if (tail) soft = chatSoftWrap(plain.substr(tail), key.width / 64.0f, inserted);
+        else soft = chatSoftWrap(plain, key.width / 64.0f, inserted);
+        if (tail) {
+            const int offset = (int)result->soft.size();
+            result->soft += soft;
+            for (int at : inserted) result->inserted.push_back(offset + at);
+        } else {
+            result->soft = std::move(soft);
+            result->inserted = std::move(inserted);
+        }
+        result->lines += (int)std::count(result->soft.begin(), result->soft.end(), '\n');
+        result->buffer.assign(result->soft.begin(), result->soft.end());
+        result->buffer.push_back('\0');
+        const size_t hard = plain.rfind('\n');
+        result->stablePlain = hard == std::string::npos ? 0 : hard + 1;
+        result->stableSoft = result->stablePlain;
+        for (size_t i = 0; i < result->inserted.size(); ++i) {
+            if ((size_t)result->inserted[i] - i >= result->stablePlain) break;
+            ++result->stableSoft;
+            ++result->stableInserted;
+        }
+    }
+    // A hash collision must not leave an unreachable LRU node behind.
+    if (hit != s_wrapIndex.end()) {
+        s_wrapBytes -= (*hit->second)->bytes();
+        s_wrapLru.erase(hit->second);
+        s_wrapIndex.erase(hit);
+    }
+    constexpr size_t kMaxBytes = 16 * 1024 * 1024;
+    while (!s_wrapLru.empty() &&
+           (s_wrapLru.size() >= 256 || s_wrapBytes + result->bytes() > kMaxBytes)) {
+        s_wrapBytes -= s_wrapLru.back()->bytes();
+        s_wrapIndex.erase(s_wrapLru.back()->key);
+        s_wrapLru.pop_back();
+    }
+    if (result->bytes() <= kMaxBytes) {
+        s_wrapLru.push_front(result);
+        s_wrapIndex.emplace(key, s_wrapLru.begin());
+        s_wrapBytes += result->bytes();
+    }
+    return result;
+}
+}  // namespace
+
+float chatSoftWrapNaturalWidth(const std::string& text) {
+    const auto cached = wrappedText(text, 0, 0);
+    if (cached->natural < 0) {
+        float widest = 0.0f, line = 0.0f;
+        for (size_t i = 0; i < text.size(); ++i) {
+            if (text[i] == '\n') { widest = std::max(widest, line); line = 0.0f; continue; }
+            line += ImGui::CalcTextSize(text.data() + i, text.data() + i + 1).x;
+        }
+        cached->natural = std::max(widest, line);
+    }
+    return cached->natural;
 }
 
 // The soft-wrapped buffer chatDrawSelectableText hands InputText is the plain text with ' '
@@ -564,8 +671,7 @@ float chatSoftWrapNaturalWidth(const std::string& text) {
 namespace {
 struct SelectablePlain {
     ImGuiID          id = 0;
-    std::string      plain;
-    std::vector<int> inserted;   // soft-buffer indices of chatSoftWrap's inserted '\n' bytes
+    std::shared_ptr<WrappedText> text;
 };
 SelectablePlain s_selPlain;
 
@@ -587,20 +693,20 @@ std::string chatInputSelection(ImGuiID id) {
     if (a < 0) a = 0;
     if (b > state->TextLen) b = state->TextLen;
     if (b <= a) return {};
-    if (s_selPlain.id == id &&
-        s_selPlain.plain.size() + s_selPlain.inserted.size() == (size_t)state->TextLen) {
-        const int pa = softToPlain(s_selPlain.inserted, a);
-        const int pb = softToPlain(s_selPlain.inserted, b);
-        return s_selPlain.plain.substr((size_t)pa, (size_t)(pb - pa));
+    if (s_selPlain.id == id && s_selPlain.text &&
+        s_selPlain.text->soft.size() == (size_t)state->TextLen) {
+        const int pa = softToPlain(s_selPlain.text->inserted, a);
+        const int pb = softToPlain(s_selPlain.text->inserted, b);
+        return s_selPlain.text->plain.substr((size_t)pa, (size_t)(pb - pa));
     }
     return std::string(state->TextA.Data + a, state->TextA.Data + b);
 }
 
-// Context menu attached to the last item AND/OR an explicit rect. Submit BeginPopup every
-// frame (never gate it). Uses AllowWhenBlockedByActiveItem so a focused selectable InputText
-// does not swallow the right-click that should open the menu on the bubble.
+// Context menu on the last item and/or an explicit rect. Keep submitting an open popup, but
+// build its payload and style only while it is open. AllowWhenBlockedByActiveItem lets a
+// focused selectable InputText keep the bubble's right-click menu reachable.
 void chatCopyContext(const ImRect& rect, const char* popupId,
-                            const std::string& copyText,
+                            const std::function<std::string()>& copyText,
                             const std::string& copyAll,
                             const std::string& selText) {
     const ImGuiHoveredFlags hovFlags =
@@ -610,10 +716,12 @@ void chatCopyContext(const ImRect& rect, const char* popupId,
     const bool overRect = ImGui::IsMouseHoveringRect(rect.Min, rect.Max, /*clip=*/false);
     if ((overItem || overRect) && ImGui::IsMouseReleased(ImGuiMouseButton_Right))
         ImGui::OpenPopup(popupId);
+    if (!ImGui::IsPopupOpen(popupId)) return;
 
     ui::pushContextMenuStyle();
     if (ImGui::BeginPopup(popupId)) {
-        const std::string& all = copyAll.empty() ? copyText : copyAll;
+        const std::string text = copyText ? copyText() : std::string();
+        const std::string& all = copyAll.empty() ? text : copyAll;
         auto copyRow = [](const char* label, const std::string& text) {
             if (ImGui::MenuItem(label, nullptr, false, !text.empty()))
                 chatCopyToClipboard(text);
@@ -622,7 +730,7 @@ void chatCopyContext(const ImRect& rect, const char* popupId,
             copyRow("Copy", selText);
             ImGui::Separator();
         }
-        copyRow("Copy text", copyText);
+        copyRow("Copy text", text);
         copyRow("Copy all", all);
         ImGui::EndPopup();
     }
@@ -639,22 +747,16 @@ ImGuiID chatDrawSelectableText(const char* id, const std::string& plain, const I
     const ImGuiStyle& style = ImGui::GetStyle();
     float wrapW = ImGui::GetContentRegionAvail().x - style.FramePadding.x * 2.0f;
     if (wrapW < 1.0f) wrapW = 1.0f;
-    static std::vector<int> s_inserted;   // GL-thread scratch; copied only for the state owner
-    const std::string soft = chatSoftWrap(plain, wrapW, s_inserted);
-    int lines = 1;
-    for (char c : soft) if (c == '\n') ++lines;
+    const auto cached = wrappedText(plain, wrapW, ImGui::GetID(id));
+    const std::string& soft = cached->soft;
+    const std::vector<int>& s_inserted = cached->inserted;
+    const int lines = cached->lines;
     const float lh = ImGui::GetTextLineHeight();
     // Match TextWrapped visual density: no extra frame padding beyond a hairline.
     const float padY = 1.0f * ui::uiScale;
     float h = lh * (float)lines + padY * 2.0f;
     if (h < lh + padY * 2.0f) h = lh + padY * 2.0f;
 
-    // Mutable buffer for InputText (contents are read-only via flags). While the widget is
-    // active ImGui keeps its own TextA copy, so a stack buffer is fine frame-to-frame.
-    std::vector<char> buf(soft.size() + 1);
-    if (!soft.empty())
-        std::memcpy(buf.data(), soft.data(), soft.size());
-    buf[soft.size()] = '\0';
 
     ImGui::PushStyleColor(ImGuiCol_FrameBg,        ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0, 0, 0, 0));
@@ -664,7 +766,7 @@ ImGuiID chatDrawSelectableText(const char* id, const std::string& plain, const I
     ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.0f, padY));
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
-    ImGui::InputTextMultiline(id, buf.data(), buf.size(), ImVec2(-1.0f, h),
+    ImGui::InputTextMultiline(id, cached->buffer.data(), cached->buffer.size(), ImVec2(-1.0f, h),
                               ImGuiInputTextFlags_ReadOnly | ImGuiInputTextFlags_NoUndoRedo |
                               ImGuiInputTextFlags_NoHorizontalScroll);
 
@@ -672,12 +774,8 @@ ImGuiID chatDrawSelectableText(const char* id, const std::string& plain, const I
     // This item owns ImGui's InputTextState (active, or the last one deactivated with a live
     // selection): remember its plain text so selection copies map back through it.
     if (ImGui::GetInputTextState(itemId)) {
-        if (s_selPlain.id != itemId || s_selPlain.plain != plain ||
-            s_selPlain.inserted != s_inserted) {
-            s_selPlain.id = itemId;
-            s_selPlain.plain = plain;
-            s_selPlain.inserted = s_inserted;
-        }
+        s_selPlain.id = itemId;
+        s_selPlain.text = cached;
     }
     // Ctrl+C — InputText already put the WRAPPED selection on the clipboard; replace it with
     // the plain bytes and light the toast.
@@ -874,7 +972,9 @@ void chatShimmerText(const char* text, const ImVec4& base, const ImVec4& glint, 
     const int v1 = dl->VtxBuffer.Size;
     // The band starts left of the text and leaves right of it, so each pass reads as one sweep
     // with a short rest rather than a strobe.
-    const float center = -0.35f + 1.7f * ui::anim::phase(period);
+    ui::anim::requestFramesAt(30);
+    const float phase = period > 0 ? (float)std::fmod(ImGui::GetTime() / period, 1.0) : 0.0f;
+    const float center = -0.35f + 1.7f * phase;
     const float w = std::max(size.x, 1.0f);
     const float alphaMul = ImGui::GetStyle().Alpha;
     for (int i = v0; i < v1; ++i) {
@@ -889,8 +989,7 @@ void chatShimmerText(const char* text, const ImVec4& base, const ImVec4& glint, 
 }
 
 // Tiny top-right "copy" glyph on hover of assistant/error bubbles (cheap, no atlas dependency).
-void chatHoverCopyGlyph(const ImRect& rect, const std::string& text) {
-    if (text.empty()) return;
+void chatHoverCopyGlyph(const ImRect& rect, const std::function<std::string()>& text) {
     if (!ImGui::IsMouseHoveringRect(rect.Min, rect.Max, /*clip=*/false)) return;
     const float sc = ui::uiScale;
     const float sz = 14.0f * sc;
@@ -924,8 +1023,12 @@ void chatHoverCopyGlyph(const ImRect& rect, const std::string& text) {
                 ImVec2(mx.x - inset - 1.2f * sc, mx.y - inset + 0.8f * sc), col, r, 0,
                 ui::metrics::stroke(1.1f));
     if (hov) ImGui::SetTooltip("Copy");
-    if (clk) chatCopyToClipboard(text);
+    if (clk && text) chatCopyToClipboard(text());
     ImGui::SetCursorScreenPos(saved);
+}
+
+void chatHoverCopyGlyph(const ImRect& rect, const std::string& text) {
+    if (!text.empty()) chatHoverCopyGlyph(rect, [&] { return text; });
 }
 
 // Compose a flat copy string for an activity / tool card. Tool/artifact rows pack

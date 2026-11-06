@@ -8,6 +8,7 @@
 
 #include "solver/nsolve.h"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <vector>
@@ -342,4 +343,21 @@ TEST_CASE("constrained drag keeps the hard constraint, follows the cursor") {
     auto res = s.solve(std::nullopt, 1e-10, 50, /*time_budget_ms=*/50.0);
     CHECK(res.x(0) == doctest::Approx(7.0).epsilon(0.02));  // followed cursor in x
     CHECK(std::abs(res.x(1)) < 1e-6);                       // hard constraint held
+}
+
+TEST_CASE("conflicting row dependency identifies only its independent partners") {
+    System s;
+    auto vars = s.add_vars(2, {0.0, 0.0});
+    s.add_residual(fix_r(10.0), {vars[0]}, fix_j(), "x1");
+    s.add_residual(fix_r(3.0), {vars[1]}, fix_j(), "y");
+    s.add_residual(fix_r(20.0), {vars[0]}, fix_j(), "x2");
+    const auto solved = s.solve();
+    const auto analysis = s.analyze(solved.x);
+    REQUIRE_FALSE(analysis.conflicting_tags.empty());
+    const auto it = std::find_if(analysis.dependency_partners.begin(),
+        analysis.dependency_partners.end(),
+        [](const auto& entry) { return entry.first == "x2"; });
+    REQUIRE(it != analysis.dependency_partners.end());
+    REQUIRE(it->second.size() == 1);
+    CHECK(it->second[0] == "x1");
 }

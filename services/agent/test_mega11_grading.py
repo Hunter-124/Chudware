@@ -826,7 +826,7 @@ def test_ac1_per_check_diagnosis_on_battery_payload():
     bat = {
         "verdict": "FAIL",
         "ok": False,
-        "doc_id": "doc-airframe",
+        "doc_id": "doc-enclosure",
         "detail": "soft zeros",
         "checks": [
             {"name": "is_manifold", "verdict": "PASS", "score": 1.0},
@@ -852,7 +852,7 @@ def test_ac1_per_check_diagnosis_on_battery_payload():
                 },
                 {
                     "name": "ecad_run_erc",
-                    "message": "no open ECAD document 'doc-airframe'",
+                    "message": "no open ECAD document 'doc-enclosure'",
                 },
             ],
         },
@@ -871,7 +871,7 @@ def test_ac1_per_check_diagnosis_on_battery_payload():
     # End-to-end AC1 criterion_result carries diagnosis fields.
     manifest = {
         "deliverables": [{
-            "id": "airframe",
+            "id": "enclosure",
             "acceptance_criteria": [{
                 "id": "AC1",
                 "text": "battery",
@@ -881,7 +881,7 @@ def test_ac1_per_check_diagnosis_on_battery_payload():
     }
     led = _Led()
     results = re.run_acceptance_checks(
-        manifest, led, doc_id="doc-airframe", battery_payload=bat)
+        manifest, led, doc_id="doc-enclosure", battery_payload=bat)
     assert results["AC1"] in (re.FAIL, "WARN", re.PASS)
     ac1 = next(
         e["payload"] for e in led.events

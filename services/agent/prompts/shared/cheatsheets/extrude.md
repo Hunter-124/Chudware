@@ -14,6 +14,11 @@ Example B - cut a pocket 5mm deep through the existing body:
  {"op":"add_feature","feature":{"type":"extrude","name":"Pocket1","params":{"mode":"cut","end":"blind","depth":{"value":5,"expr":null}},"refs":{"profile":[{"kind":"region","sketch":"f2","centroid":[0,0],"hint_index":0}]}}}
 ]
 
+Blind cuts start along the sketch normal; use `params.flip:true` for the opposite direction.
+For a simple blind cut without an explicit direction or flip, the engine retries the other side
+only if the first removes no material. If both sides have material, a cut on the wrong side will
+not auto-correct; inspect the resulting geometry.
+
 3 common mistakes:
 1. `sketch` in the region selector must be the sketch FEATURE ID (e.g. "f1" or "$0" if in same array), not its name.
 2. `depth` is a dim OBJECT {"value":n,"expr":null}, not a bare number.

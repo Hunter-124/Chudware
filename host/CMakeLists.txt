@@ -145,15 +145,16 @@ set(CHUDWARE_CORE_SOURCES
   src/main.cpp
   src/app.cpp
   src/app_commands.cpp   # ribbon command router + family handlers (extracted from app.cpp)
-  src/ui/scenarios.cpp   # scripted screenshot/test scenarios (extracted from app.cpp)
+  src/platform/kicad_launch.cpp
   src/core/app_state.cpp
+  src/core/frame_stats.cpp  # GUI frame wall/work/wait/swap timing + phase reports
   src/core/jobs.cpp
   src/core/context_ref.cpp  # context-picker chip record + wire/prompt forms (GL-free; unit-tested)
   # --- AI Copilot (one chat impl, two hosts) ---
   src/ui/copilot/ui_common.cpp          # glass/bubble toolkit + shared small-UI helpers
   src/ui/copilot/chat_log.cpp           # message list rendering + stick-to-bottom
   src/ui/copilot/activity_timeline.cpp  # per-turn typed-block activity timeline
-  src/ui/copilot/cards.cpp              # plan/clarify/corporate/swarm cards + AI-VC
+  src/ui/copilot/cards.cpp              # plan/swarm cards + AI-VC
   src/ui/copilot/feed.cpp               # feedTurnActivity stream-event folding
   src/ui/copilot/agent_overview.cpp     # live sub-agent roster + todo checklist above the composer
   src/ui/copilot/conversations.cpp      # conversation tabs + chat-history persistence
@@ -164,19 +165,22 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/copilot/stream_rows.cpp        # streamed-delta row routing/order (GL-free; unit-tested)
   src/ui/copilot/ask_answers.cpp        # ask_user question batches: prefill/answers/persist (GL-free; unit-tested)
   src/ui/copilot/magic_keywords.cpp     # magic-keyword matcher (standalone prose words; GL-free; unit-tested)
+  src/ui/copilot/spell_check.cpp        # composer spell check + completion word logic (GL-free; unit-tested)
   src/ui/clipboard_image.cpp            # system clipboard -> PNG on disk (paste-an-image)
   src/ui/copilot/image_lightbox.cpp     # attachment thumbnails + full-size image viewer
   src/ui/copilot/context_estimate.cpp   # transcript token/cost estimate (GL-free; unit-tested)
   src/ui/copilot/settings.cpp           # AI settings sections + model dropdown
   src/ui/copilot/composer.cpp           # chat input + send path + composer chrome
+  src/ui/copilot/composer_spell.cpp     # composer squiggles, ghost completion, correction menu
   src/ui/copilot/context_chips.cpp      # context-picker chips: add/resolve, draw, focus in viewport
+  src/ui/copilot/pending_stack.cpp      # pinned stack under the live turn: pending steers + queued messages
   src/ui/copilot/panel.cpp              # drawAIPanel host + ai_workspace reuse hooks
   src/ui/settings_modal.cpp
   src/ui/onboarding.cpp       # first-run account/provider/test/workspace wizard
   src/ui/provider_logos.cpp             # provider brand color + badge (Settings -> Providers)
   src/ui/provider_usage.cpp             # shared subscription usage poll (Settings + composer rings)
-  src/ui/chudcode_descriptors.cpp       # Chudcode worker payload parsing (GL-free; unit-tested)
-  src/ui/chudcode_session_actions.cpp   # Chudcode session recovery actions + link (GL-free; unit-tested)
+  src/ui/omp_descriptors.cpp           # OMP worker payload parsing (GL-free; unit-tested)
+  src/ui/omp_session_actions.cpp       # OMP session recovery actions + link (GL-free; unit-tested)
   src/ui/oauth_capture.cpp  # in-app xAI multi-account CEF OAuth (Settings → Accounts)
   src/ui/web_capabilities.cpp  # WASM-build gap table (ui::webBuild / ui::webGapReason)
   src/ui/console_panel.cpp
@@ -192,6 +196,7 @@ set(CHUDWARE_CORE_SOURCES
   src/mesh.cpp
   src/renderer.cpp
   # --- C15: AICM loader + ID-buffer picking + overlays + selection ---
+  src/render/backdrop_text.cpp
   src/render/aicm_loader.cpp
   ../core/util/aicm_handoff.cpp   # aicm-shm:// map for loadAicmFile
   src/render/id_pass.cpp
@@ -212,6 +217,8 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/component_features.cpp  # assembly tree: cached read of a component `.step+` feature list
   src/ui/file_dialog.cpp   # C41: native Win32 Save/Open dialogs
   src/ui/file_explorer.cpp # Wave 3: File Explorer panel (workspace browser + recent)
+  src/ui/file_thumbs.cpp   # Explorer previews of native .step+ documents (saved tessellation)
+  src/ui/workspace_home.cpp # empty-workspace home: wider columns, Explorer tiles, viewport card
   # --- end C16 ---
   # --- document tabs (multi-document strip + per-tab switching) ---
   src/core/doc_tabs.cpp
@@ -276,6 +283,7 @@ set(CHUDWARE_CORE_SOURCES
   # --- end C20b ---
   # --- Equations / Global Variables editor ---
   src/ui/equations_dialog.cpp
+  src/ui/scad_editor.cpp
   src/ui/profiler_window.cpp   # in-app sampling-profiler window (text report + flamegraph)
   src/ui/command_search.cpp    # unified settings + modeling-tools search popup
   # --- ECAD 2D GUI (schematic / PCB editor) ---
@@ -295,8 +303,7 @@ set(CHUDWARE_CORE_SOURCES
   src/ui/manufacture/approval_dialog.cpp
   src/ui/manufacture/attention_panel.cpp
   # --- end Manufacture ---
-  # --- C25: mouse gesture wheel + S shortcut bar ---
-  src/ui/mouse_gestures.cpp
+  # --- C25: S shortcut bar and camera presets ---
   src/ui/camera_anim.cpp   # C25 W2-D: eased camera tween (presets / Normal-To / zoom-to-fit)
   src/ui/shortcut_bar.cpp
   src/ui/view_selector.cpp
@@ -396,6 +403,11 @@ set_property(SOURCE
   src/ui/widgets/kit_panel.cpp
   src/ui/widgets/kit_form.cpp
   src/ui/copilot/cards.cpp
+  src/ui/copilot/chat_log.cpp
+  src/ui/copilot/settings.cpp
+  src/ui/settings_modal.cpp
+  src/ui/property_manager.cpp
+  src/ui/command_search.cpp
   src/ui/sim/sim_manager_forms.cpp
   src/ui/sim/sim_manager_flow.cpp
   src/ui/sim/sim_manager_motion.cpp
@@ -420,6 +432,7 @@ if(EMSCRIPTEN)
 else()
   set(CHUDWARE_NATIVE_SOURCES ${CHUDWARE_CORE_SOURCES})
   list(APPEND CHUDWARE_NATIVE_SOURCES
+    src/ui/scenarios.cpp   # native screenshot/test scenarios
     ../core/util/randombytes.cpp
     ../core/util/tweetnacl.c
     ../core/security/integrity.cpp
@@ -530,6 +543,7 @@ if(EMSCRIPTEN)
     "SHELL:--preload-file=${_WASM_ASSETS}/logo_icon.png@/assets/logo_icon.png"
     "SHELL:--preload-file=${_WASM_ASSETS}/logo_wordmark.png@/assets/logo_wordmark.png"
     "SHELL:--preload-file=${_WASM_ASSETS}/logo_wordmark_dark.png@/assets/logo_wordmark_dark.png"
+    "SHELL:--preload-file=${_WASM_ASSETS}/dict@/assets/dict"
   )
   # Keep expensive runtime diagnostics for debug builds, not the MinSizeRel
   # bundle staged by ./build.sh wasm. Emscripten defaults vary by build type;
@@ -621,6 +635,8 @@ if(WIN32)
   # speed bump against casual patching, not an anti-tamper claim.
   if(MSVC)
     target_link_options(Chudware PRIVATE $<$<CONFIG:Release>:/OPT:REF /OPT:ICF>)
+    # The real-UI scenarios instantiate enough JSON code to exceed COFF's section limit.
+    set_source_files_properties(src/ui/scenarios.cpp PROPERTIES COMPILE_OPTIONS /bigobj)
     # MSVC 14.51 (VS 2026): UCRT <cmath> is missing C99 float math declarations in the
     # global namespace; force-include the shim on C++ TUs only (see extern/fix_math.h).
     # Do NOT quote the path inside /FI — under Ninja+MSVC the quotes become part of the
@@ -687,6 +703,26 @@ endif()
 set_target_properties(test_agent_job_routing PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME test_agent_job_routing COMMAND test_agent_job_routing)
+
+add_executable(test_active_work_feed tests/test_active_work_feed.cpp)
+target_include_directories(test_active_work_feed PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_active_work_feed PRIVATE nlohmann_json::nlohmann_json)
+set_target_properties(test_active_work_feed PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_active_work_feed COMMAND test_active_work_feed)
+
+# PM field validation, readiness, serialization and unit transitions use the shared
+# field implementation without desktop lifecycle/rendering dependencies.
+add_executable(test_property_manager
+  tests/test_property_manager.cpp
+  src/ui/pm_forms.cpp)
+target_include_directories(test_property_manager PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${imgui_SOURCE_DIR})
+target_link_libraries(test_property_manager PRIVATE nlohmann_json::nlohmann_json)
+set_target_properties(test_property_manager PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_property_manager COMMAND test_property_manager)
 
 add_executable(test_command_capability
   tests/test_command_capability.cpp
@@ -817,6 +853,15 @@ add_test(NAME test_ref_datum_geom
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end datum batch ---
 
+# The viewport's bounded reference-page assembly is GL-free and shared with this test.
+add_executable(test_mesh_reference_data tests/test_mesh_reference_data.cpp)
+target_include_directories(test_mesh_reference_data PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_mesh_reference_data PRIVATE nlohmann_json::nlohmann_json)
+set_target_properties(test_mesh_reference_data PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_mesh_reference_data COMMAND test_mesh_reference_data
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+
 # --- copilot session-id allocation: links the REAL conv_ids.cpp (no GL / imgui / AppState).
 # Guards the restart-collision data loss: convCounter restarted at 0 every launch and
 # re-issued c1, c2, c3… over the transcripts already on disk.
@@ -874,6 +919,21 @@ add_test(NAME test_magic_keywords
   COMMAND test_magic_keywords
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 
+# --- composer spell check: links the REAL spell_check.cpp (+ magic_keywords.cpp for the code
+# masking). Covers which words get checked, dictionary lookups, correction ranking, completion
+# picks and the shipped en_US/engineering word lists (passed the assets dir).
+add_executable(test_spell_check
+  src/ui/copilot/spell_check.cpp
+  src/ui/copilot/magic_keywords.cpp
+  tests/test_spell_check.cpp)
+target_include_directories(test_spell_check PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set_target_properties(test_spell_check PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_spell_check
+  COMMAND test_spell_check "${CMAKE_CURRENT_SOURCE_DIR}/../assets"
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+
 # --- viewport catch-up after tess-less revisions: header-only core/tess_catchup.h (no GL /
 # imgui / AppState). Guards the frozen-assembly bug: asm_mate / asm_add_component / pose
 # sweeps publish without a mesh and the active viewport never redrew until the turn ended.
@@ -887,41 +947,52 @@ add_test(NAME test_tess_catchup
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end viewport catch-up ---
 
-# --- Chudcode worker payload parsing: links the REAL chudcode_descriptors.cpp (no GL /
-# imgui / AppState). Guards the sanitized provider-descriptor spellings, the usable-state
-# whitelist, streamed chudcode_login open_url normalization, session-stats provenance
-# (hasCost vs fabricated $0), tool-state rows, and the /compact chat-replacement guard
-# (Chudcode online compaction omits messages — the visible chat must never be wiped).
-add_executable(test_chudcode_descriptors
-  src/ui/chudcode_descriptors.cpp
-  tests/test_chudcode_descriptors.cpp)
-target_include_directories(test_chudcode_descriptors PRIVATE
+# --- OMP worker payload parsing: links the REAL omp_descriptors.cpp (no GL /
+# imgui / AppState). Guards sanitized provider descriptors, streamed login URLs,
+# session-stats provenance, tool-state rows, and the /compact chat-replacement guard
+# (online compaction omits messages — the visible chat must never be wiped).
+add_executable(test_omp_descriptors
+  src/ui/omp_descriptors.cpp
+  tests/test_omp_descriptors.cpp)
+target_include_directories(test_omp_descriptors PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(test_chudcode_descriptors PRIVATE nlohmann_json::nlohmann_json)
-set_target_properties(test_chudcode_descriptors PROPERTIES
+target_link_libraries(test_omp_descriptors PRIVATE nlohmann_json::nlohmann_json)
+set_target_properties(test_omp_descriptors PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-add_test(NAME test_chudcode_descriptors
-  COMMAND test_chudcode_descriptors
+add_test(NAME test_omp_descriptors
+  COMMAND test_omp_descriptors
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
-# --- end Chudcode payload parsing ---
+# --- end OMP payload parsing ---
 
-# --- Chudcode session recovery: links the REAL chudcode_session_actions.cpp (no GL /
-# imgui / AppState). Guards the four contract-frozen worker methods (export / branch /
-# repair / close): request params, tolerant response parsers, refusal + session_not_live
+# --- model registry policy: header-only ui::isLegacyGenerationModel (Claude < 5.1 / GPT < 6
+# never offered in a picker). No GL / imgui / AppState.
+add_executable(test_model_registry tests/test_model_registry.cpp)
+target_include_directories(test_model_registry PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set_target_properties(test_model_registry PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_model_registry
+  COMMAND test_model_registry
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+# --- end model registry policy ---
+
+# --- OMP session recovery: links the REAL omp_session_actions.cpp (no GL /
+# imgui / AppState). Guards export / branch / close request params, tolerant
+# response parsers, refusal + session_not_live
 # triage, and the per-conversation link's JSON round-trip (id/file/health only — the link
 # must never duplicate a transcript).
-add_executable(test_chudcode_session_actions
-  src/ui/chudcode_session_actions.cpp
-  tests/test_chudcode_session_actions.cpp)
-target_include_directories(test_chudcode_session_actions PRIVATE
+add_executable(test_omp_session_actions
+  src/ui/omp_session_actions.cpp
+  tests/test_omp_session_actions.cpp)
+target_include_directories(test_omp_session_actions PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(test_chudcode_session_actions PRIVATE nlohmann_json::nlohmann_json)
-set_target_properties(test_chudcode_session_actions PROPERTIES
+target_link_libraries(test_omp_session_actions PRIVATE nlohmann_json::nlohmann_json)
+set_target_properties(test_omp_session_actions PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-add_test(NAME test_chudcode_session_actions
-  COMMAND test_chudcode_session_actions
+add_test(NAME test_omp_session_actions
+  COMMAND test_omp_session_actions
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
-# --- end Chudcode session recovery ---
+# --- end OMP session recovery ---
 
 # --- AsyncRpc streamed-event channel: links the REAL async_rpc.cpp against a stub
 # WorkerClient defined inside the test TU (call/abortPending/dtor only), so the queueing
@@ -930,9 +1001,11 @@ add_test(NAME test_chudcode_session_actions
 # shutdown() drops undelivered callbacks.
 add_executable(test_async_rpc
   src/core/async_rpc.cpp
+  src/core/doc_mirror.cpp
   tests/test_async_rpc.cpp)
 target_include_directories(test_async_rpc PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../services/worker)
 target_link_libraries(test_async_rpc PRIVATE nlohmann_json::nlohmann_json)
 find_package(Threads REQUIRED)
 target_link_libraries(test_async_rpc PRIVATE Threads::Threads)
@@ -1134,6 +1207,20 @@ add_test(NAME test_text_wrap
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 # --- end composer hard-break tracking ---
 
+# --- inline-image marker helpers (GL-free, header-only) ---
+# The Sessions list and the session-title derivation share stripInlineImageMarkers(): a raw
+# "[Image #1]" in a title is a placeholder, not words. Pure string logic, pinned here.
+add_executable(test_inline_image_refs
+  tests/test_inline_image_refs.cpp)
+target_include_directories(test_inline_image_refs PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set_target_properties(test_inline_image_refs PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME test_inline_image_refs
+  COMMAND test_inline_image_refs
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+# --- end inline-image marker helpers ---
+
 # --- tool-call human phrasing + grouping (GL-free) ---
 # The chat transcript used to print the raw MCP symbol ("Doing . add_features") and stack one
 # card per call, so a repair loop read as a wall of identical rows. tool_phrase.cpp turns a
@@ -1234,6 +1321,10 @@ set_target_properties(test_sim_topology PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME test_sim_topology COMMAND test_sim_topology
   WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+
+# Label native tests and create suite-specific build targets.
+include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/ChudwareTestSuites.cmake)
+chudware_apply_test_suites(host)
 
 # Real-GL picking profiler; hidden context, deterministic geometry, no engine session.
 add_executable(profile_viewport

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from services.agent import task_list
-from services.agent.chudcode_events import map_rpc_frame
+from services.agent.omp_events import map_rpc_frame
 from services.agent.coordination import CoordinationBoard, clear_boards, get_board
 
 CTX = {"run_id": "run-7", "session_id": "session-2", "node_id": "root-node"}
@@ -37,6 +37,8 @@ def test_relay_between_subagents_is_one_agent_message():
     assert (row["channel"], row["from"], row["to"]) == ("irc", "SubA", "SubB")
     assert row["text"] == "Bore is 22 mm.\nUse H7."
     assert row["run_id"] == "run-7" and row["id"]
+    # The runtime's send time drives the card's age, not the GUI's arrival time.
+    assert row["timestamp"] == 1760000000000
 
 
 def test_incoming_message_is_addressed_to_main_with_its_body_only():

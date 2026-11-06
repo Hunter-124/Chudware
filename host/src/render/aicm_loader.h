@@ -6,10 +6,14 @@
 // render/overlays build the GPU buffers from these arrays.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <cstddef>
+#include <unordered_map>
 #include <string>
 #include <vector>
+
+#include "../mesh.h"
 
 namespace render {
 
@@ -65,6 +69,15 @@ struct BodyMesh {
     std::vector<EdgeSegment> edges;
     std::vector<float> edge_pts;  // 3*total_pts (polyline vertices referenced by EdgeSegment)
     std::vector<BrepVertex> brep_verts;
+
+    // Loader-derived upload payloads. Keep raw topology above for cached tab picking;
+    // the shaded copy transfers ownership to Renderer once, without GL-thread analysis.
+    std::vector<uint32_t> faceIds;
+    std::vector<float> edgeLines;
+    std::vector<uint32_t> edgeIds;
+    std::vector<float> vertexPoints;
+    std::vector<uint32_t> vertexIds;
+    Mesh shadedMesh;
 };
 
 // Per-vertex scalar overlay (Evaluate / FEA results). Stored, exposed for C16/C19; minimal use now.
@@ -73,6 +86,7 @@ struct ScalarField {
     std::string name;
     float vmin = 0, vmax = 0;
     std::vector<float> values;  // n == that body's n_verts (NaN = no data)
+    size_t valueCount = 0;     // retained when values moves into Renderer
 };
 
 // Per-vertex displacement overlay (deformed FEA shape).
@@ -80,6 +94,7 @@ struct DispField {
     uint32_t body_id = 0;
     float scale_hint = 1.0f;
     std::vector<float> vec;  // 3*n
+    size_t vectorSize = 0;     // retained when vec moves into Renderer
 };
 
 // A polyline set (streamlines / section curves), optionally with a per-point scalar.
@@ -98,6 +113,11 @@ struct DocMesh {
     std::vector<ScalarField> scalars;
     std::vector<DispField> displacements;
     std::vector<LineSet> lines;
+    bool derivedReady = false;
+    std::unordered_map<uint64_t, std::array<float, 6>> faceNormalCache;
+    std::unordered_map<uint64_t, std::array<float, 3>> edgeCentroidCache;
+    std::unordered_map<uint32_t, std::array<float, 6>> bodyBBoxCache;
+    std::unordered_map<uint64_t, std::array<float, 6>> faceBBoxCache;
 
     bool empty() const { return bodies.empty(); }
 };

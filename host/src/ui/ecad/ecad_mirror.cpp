@@ -55,6 +55,46 @@ std::vector<std::string> jstrList(const nlohmann::json& v) {
     return out;
 }
 
+// Expand KiCad layer-set names once while loading the preview. The editable document keeps the
+// original layer specs; only the read-only mirror needs concrete names for visibility controls.
+std::vector<std::string> padLayers(const nlohmann::json& specs, const std::string& type,
+                                   const std::vector<std::string>& copper) {
+    std::vector<std::string> result;
+    auto add = [&](const std::string& layer) {
+        if (std::find(result.begin(), result.end(), layer) == result.end())
+            result.push_back(layer);
+    };
+    bool explicitCopperSet = false;
+    for (const auto& item : specs)
+        if (item.is_string() && (item == "*.Cu" || item == "F&B.Cu"))
+            explicitCopperSet = true;
+    // Match the native model's legacy convention for through-hole pads without a KiCad set.
+    if (!explicitCopperSet && (type == "tht" || type == "np_tht" || type == "connector"))
+        for (const auto& layer : copper) add(layer);
+    for (const auto& item : specs) {
+        if (!item.is_string()) continue;
+        const std::string& spec = item.get_ref<const std::string&>();
+        const bool wildcard = spec.size() > 2 && spec.compare(0, 2, "*.") == 0;
+        const bool bothSides = spec.size() > 4 && spec.compare(0, 4, "F&B.") == 0;
+        if (!wildcard && !bothSides) {
+            add(spec);
+            continue;
+        }
+        const size_t suffix = wildcard ? 2 : 4;
+        if (spec.compare(suffix, std::string::npos, "Cu") == 0) {
+            for (const auto& layer : copper)
+                if (wildcard || layer == "F.Cu" || layer == "B.Cu") add(layer);
+        } else {
+            std::string layer("F.");
+            layer.append(spec, suffix, std::string::npos);
+            add(layer);
+            layer[0] = 'B';
+            add(layer);
+        }
+    }
+    return result;
+}
+
 }  // namespace
 
 // ---- transform port of engine/ecad/schema.py::local_to_world ----
@@ -73,7 +113,7 @@ EcadPt EcadMirror::localToWorld(const EcadPt& p, const EcadPt& pos, float angleD
 }
 
 void EcadMirror::loadFromTree(const nlohmann::json& resp) {
-    // Clear parsed geometry but keep caller-owned visibility/color state and the active schematic
+    // Clear parsed geometry but keep caller-owned visibility state and the active schematic
     // sheet candidate across rebuilds. parseSch() keeps that sheet only when it still exists.
     revision_ = -1;
     name_.clear();
@@ -432,10 +472,6 @@ void EcadMirror::parseSch(const nlohmann::json& tree, const nlohmann::json& comp
 
 void EcadMirror::parsePcb(const nlohmann::json& tree, const nlohmann::json& compile) {
     (void)compile;
-    hasBoardContent_ = !jarr(jobj(tree, "outline"), "shapes").empty();
-    for (const char* key : {"footprints", "tracks", "vias", "zones", "graphics", "nets"})
-        hasBoardContent_ = hasBoardContent_ || !jarr(tree, key).empty();
-
     // Stackup -> ordered copper layer list (F.Cu … B.Cu). Mirrors schema.py::copper_layer_ids.
     const nlohmann::json& stackup = jobj(tree, "stackup");
     int nCu = (int)jnum(stackup, "copper_layers", 2);
@@ -512,7 +548,7 @@ void EcadMirror::parsePcb(const nlohmann::json& tree, const nlohmann::json& comp
             ep.w = size.x; ep.h = size.y;
             ep.roundrectRatio = (float)jnum(pad, "roundrect_ratio");
             ep.type   = jstr(pad, "type", "smd");
-            ep.layers = jstrList(jarr(pad, "layers"));
+            ep.layers = padLayers(jarr(pad, "layers"), ep.type, copperIds);
             ep.net    = jstr(pad, "net");
             auto drillIt = pad.find("drill");
             if (drillIt != pad.end() && drillIt->is_object()) {
@@ -680,18 +716,6 @@ void EcadMirror::setNetVisible(const std::string& net, bool vis) {
     if (!net.empty()) netVis_[net] = vis;
 }
 
-bool EcadMirror::layerColor(const std::string& layerId, float out[3]) const {
-    auto it = layerColor_.find(layerId);
-    if (it == layerColor_.end()) return false;
-    out[0] = it->second[0];
-    out[1] = it->second[1];
-    out[2] = it->second[2];
-    return true;
-}
-
-void EcadMirror::setLayerColor(const std::string& layerId, float r, float g, float b) {
-    if (!layerId.empty()) layerColor_[layerId] = {r, g, b};
-}
 
 bool EcadMirror::worldBounds(EcadPt& outMin, EcadPt& outMax) const {
     bool have = false;

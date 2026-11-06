@@ -69,6 +69,7 @@ def _register_tools() -> dict:
         "ecad_simulate", "ecad_run_drc", "ecad_export", "ecad_to_3d",
         "ecad_update_from_sch", "ecad_autoroute", "ecad_add_zone", "ecad_fill_zones",
         "ecad_sweep", "ecad_design",
+        "ecad_open", "ecad_kicad_status",
         # new tools
         "ecad_check_impedance", "ecad_tf", "ecad_make_board",
         # DFM / diff-pair tools
@@ -92,6 +93,123 @@ def test_register() -> None:
     _register_tools()
 
 
+def _pin_xy(ref: str, pin: str) -> tuple[float, float]:
+    from services.mcp.ecad_common import _ECAD, _placed_pins, _sym_by_ref, ecad_session
+    session = ecad_session.get_session(_ECAD["current_sch"])
+    symbol = _sym_by_ref(session.doc, ref)
+    match = next(p for p in _placed_pins(session.doc, symbol)
+                 if p["number"] == pin or p["name"] == pin)
+    return tuple(match["xy"])
+
+
+def test_kicad_schematic_persistence_and_conflicts(tools, tmp_path) -> None:
+    from services.mcp.ecad_common import ecad_session, _rpc
+    target = tmp_path / "project" / "control.kicad_sch"
+    created = _call(tools, "ecad_new_schematic", name="control", path=str(target))
+    assert created["ok"] and target.is_file(), created
+    placed = _call(tools, "ecad_place_symbol", libid="Device:R", ref="R9",
+                   x=0, y=0, value="4k7", doc_id=created["doc_id"])
+    assert placed["ok"] and "R9" in target.read_text()
+    assert ecad_session.close_session(created["doc_id"])
+    opened = _call(tools, "ecad_open", path=str(target))
+    assert opened["ok"] and opened["path"] == str(target), opened
+    assert any(s["ref"] == "R9" for s in ecad_session.get_session(opened["doc_id"]).doc["symbols"])
+
+    lock = target.with_name("~" + target.name + ".lck")
+    lock.write_text("KiCad owns this file")
+    locked = _call(tools, "ecad_label", text="LOCKED", doc_id=opened["doc_id"])
+    assert not locked["ok"] and locked["reason"] == "kicad_locked", locked
+    lock.unlink()
+
+    state = ecad_session.get_session(opened["doc_id"])
+    _rpc("ecad_apply_ops", {"doc_id": state.doc_id, "base_revision": state.revision,
+                            "ops": [{"op": "sch_add_label", "text": "DIRTY",
+                                     "pos": [0, 0], "scope": "local"}]})
+    with target.open("a") as output:
+        output.write("\n")
+    external = target.read_bytes()
+    conflict = _call(tools, "ecad_label", text="CONFLICT", doc_id=state.doc_id)
+    assert not conflict["ok"] and conflict["reason"] == "external_change", conflict
+    assert target.read_bytes() == external
+
+
+def test_kicad_schematic_outputs(tools, tmp_path) -> None:
+    import shutil
+    if not shutil.which("kicad-cli"):
+        pytest.skip("kicad-cli is required for authoritative outputs")
+    created = _call(tools, "ecad_new_schematic", name="outputs",
+                    path=str(tmp_path / "outputs.kicad_sch"))
+    assert created["ok"], created
+    placed = _call(tools, "ecad_place_symbol", doc_id=created["doc_id"],
+                   libid="Device:R", ref="R1", x=0, y=0, value="1k")
+    assert placed["ok"], placed
+    status = _call(tools, "ecad_kicad_status")
+    assert status["found"] and status["cli"], status
+    for tool, arguments, filename in (
+            ("ecad_bom", {"fmt": "csv"}, "parts.csv"),
+            ("ecad_netlist", {"fmt": "kicad"}, "board.net"),
+            ("ecad_netlist", {"fmt": "json"}, "board.json"),
+            ("ecad_plot", {"fmt": "svg"}, "drawing.svg"),
+            ("ecad_plot", {"fmt": "pdf"}, "drawing.pdf")):
+        target = tmp_path / filename
+        result = _call(tools, tool, doc_id=created["doc_id"], path=str(target), **arguments)
+        assert result["ok"] and target.is_file() and target.stat().st_size > 0, result
+    parsed = json.loads((tmp_path / "board.json").read_text())
+    assert any(comp["ref"] == "R1" for comp in parsed["components"]), parsed
+    project = _call(tools, "ecad_open", path=str(tmp_path / "outputs.kicad_pro"))
+    assert project["ok"] and project["sch"]["path"] == str(tmp_path / "outputs.kicad_sch")
+
+
+def test_standalone_new_documents_choose_unique_paths(tools, tmp_path, monkeypatch) -> None:
+    """Repeated defaults never overwrite, while an explicit existing file is refused."""
+    from pathlib import Path
+
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(tmp_path))
+    for tool, name, extension in (("ecad_new_schematic", "Schematic1", "kicad_sch"),
+                                  ("ecad_new_pcb", "Board1", "kicad_pcb")):
+        first = _call(tools, tool)
+        assert first["ok"], first
+        original = Path(first["path"])
+        before = original.read_bytes()
+        second = _call(tools, tool)
+        third = _call(tools, tool)
+        assert second["ok"] and third["ok"], (second, third)
+        assert original == tmp_path / name / f"{name}.{extension}"
+        assert Path(second["path"]) == tmp_path / f"{name}-2" / f"{name}-2.{extension}"
+        assert Path(third["path"]) == tmp_path / f"{name}-3" / f"{name}-3.{extension}"
+        assert original.read_bytes() == before
+        assert Path(second["path"]).is_file() and Path(third["path"]).is_file()
+        refused = _call(tools, tool, path=str(original))
+        assert not refused["ok"] and "ecad_open" in refused["error"], refused
+        assert "ecad_open" in refused["hint"] and original.read_bytes() == before
+
+    reserved = tmp_path / "Reserved"
+    reserved.mkdir()
+    (reserved / "keep.txt").write_text("keep")
+    (reserved / "Reserved.kicad_sch").write_text("existing schematic")
+    created = _call(tools, "ecad_new_schematic", name="Reserved")
+    assert created["ok"] and Path(created["path"]).parent.name == "Reserved-2", created
+    assert (reserved / "keep.txt").read_text() == "keep"
+    assert (reserved / "Reserved.kicad_sch").read_text() == "existing schematic"
+    schematic = _call(tools, "ecad_new_schematic", name="Shared")
+    board = _call(tools, "ecad_new_pcb", name="Shared")
+    assert schematic["ok"] and board["ok"], (schematic, board)
+    assert Path(schematic["path"]).parent == Path(board["path"]).parent == tmp_path / "Shared"
+
+
+def test_concurrent_standalone_new_documents_are_distinct(tools, tmp_path, monkeypatch) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from pathlib import Path
+
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(tmp_path))
+    with ThreadPoolExecutor(max_workers=4) as workers:
+        results = list(workers.map(lambda _: _call(tools, "ecad_new_schematic", name="Concurrent"),
+                                   range(4)))
+    assert all(result["ok"] for result in results), results
+    paths = {result["path"] for result in results}
+    assert len(paths) == len(results) and all(Path(path).is_file() for path in paths), results
+
+
 def test_find_part(tools: dict) -> None:
     _call(tools, "ecad_new_schematic", name="divider")
     p = _call(tools, "ecad_find_part", query="resistor")
@@ -104,9 +222,86 @@ def test_find_part(tools: dict) -> None:
     print(f"  find_part('resistor') -> top hits {libids[:4]}, Device:R pins={rhit['pin_count']}")
     # the source, too
     v = _call(tools, "ecad_find_part", query="voltage")
-    assert any(h.get("libid") == "Simulation_SPICE:V_source" for h in v["hits"]), \
-        "voltage source not findable"
+    source = next((h for h in v["hits"] if h.get("libid") == "Simulation_SPICE:VDC"), None)
+    assert source and source["simulatable"], f"KiCad DC source not findable/simulatable: {v}"
     print("  [find_part] PASS")
+
+
+def test_find_part_kicad_source_simulates(tools: dict, tmp_path) -> None:
+    """A discovered installed KiCad Sim.* source must actually drive a native solve."""
+    from services.mcp.ecad_common import _ECAD, ecad_session, netlist_mod
+
+    previous_sch, previous = _ECAD["current_sch"], _ECAD["current"]
+    target = tmp_path / "source.kicad_sch"
+    try:
+        created = _call(tools, "ecad_new_schematic", name="source", path=str(target))
+        sid = created["doc_id"]
+        source = _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:VDC",
+                       ref="V1", x=0, y=20, value="5", doc_id=sid)
+        resistor = _call(tools, "ecad_place_symbol", libid="Device:R",
+                         ref="R1", x=25, y=20, value="1k", doc_id=sid)
+        assert source["ok"] and resistor["ok"], (source, resistor)
+        for model_pin, resistor_pin, number in (("+", "1", "1"), ("-", "2", "2")):
+            wired = _call(tools, "ecad_wire", from_ref=f"V1.{model_pin}",
+                          to_ref=f"R1.{resistor_pin}", doc_id=sid)
+            assert wired["ok"] and {f"V1.{number}", f"R1.{resistor_pin}"} <= set(
+                wired["net_members"]), wired
+        negative = next(pin["xy"] for pin in source["pins"] if pin["number"] == "2")
+        assert _call(tools, "ecad_add_power", net="GND", x=negative[0], y=negative[1],
+                     doc_id=sid)["ok"]
+        component = next(comp for comp in netlist_mod.build_netlist(
+            ecad_session.get_session(sid).doc)["components"] if comp["ref"] == "V1")
+        assert component["fields"]["Sim.Device"] == "V"
+        assert component["fields"]["Sim.Type"] == "DC"
+        assert component["fields"]["Sim.Pins"] == "1=+ 2=-"
+        result = _call(tools, "ecad_simulate", analysis="op", doc_id=sid)
+        assert result["ok"], result
+        voltages = [v for k, v in result["op"].items()
+                    if k.startswith("V(") and isinstance(v, (int, float))]
+        assert any(abs(v - 5.0) < 1e-4 for v in voltages), result
+        assert target.is_file() and "Simulation_SPICE:VDC" in target.read_text()
+    finally:
+        _ECAD["current_sch"], _ECAD["current"] = previous_sch, previous
+
+
+def test_wire_pin_number_name_and_model_alias_precedence(tools: dict, tmp_path, monkeypatch) -> None:
+    """Numbers beat names, names beat Sim.Pins, and instance model mappings override defaults."""
+    import copy
+    from services.ecad.library import resolve
+    from services.mcp.ecad_common import _ECAD, ecad_session
+    monkeypatch.setitem(_ECAD, "current_sch", _ECAD["current_sch"])
+    monkeypatch.setitem(_ECAD, "current", _ECAD["current"])
+
+    created = _call(tools, "ecad_new_schematic", name="pin_precedence",
+                    path=str(tmp_path / "pin_precedence.kicad_sch"))
+    sid = created["doc_id"]
+    session = ecad_session.get_session(sid)
+    definition = copy.deepcopy(resolve("Simulation_SPICE:VDC"))
+    definition["libid"] = "Test:PinPrecedence"
+    definition["pins"][0]["name"] = "2"
+    definition["pins"][1]["name"] = "MODEL"
+    definition["fields"]["Sim.Pins"] = '1=MODEL 2 = "+"'
+    ops = []
+    for index in range(1, 5):
+        source = {"op": "sch_add_symbol", "libid": definition["libid"],
+                  "ref": f"V{index}", "pos": [0, 40.0 * index]}
+        if index == 1:
+            source["def"] = definition
+        if index == 4:
+            source["fields"] = {"Sim.Pins": '1 = "+" 2=OTHER'}
+        ops.append(source)
+        ops.append({"op": "sch_add_symbol", "libid": "Device:R",
+                    "ref": f"R{index}", "value": "1k", "pos": [25, 40.0 * index]})
+    ecad_session.apply_ops(session, session.revision, ops)
+    for index, requested, number in ((1, "2", "2"), (2, "MODEL", "2"),
+                                     (3, "+", "2"), (4, "+", "1")):
+        wired = _call(tools, "ecad_wire", from_ref=f"V{index}.{requested}",
+                      to_ref=f"R{index}.1", doc_id=sid)
+        assert wired["ok"] and {f"V{index}.{number}", f"R{index}.1"} <= set(
+            wired["net_members"]), wired
+    before = ecad_session.get_session(sid).revision
+    bad = _call(tools, "ecad_wire", from_ref="V1.NOT_A_PIN", to_ref="R1.2", doc_id=sid)
+    assert not bad["ok"] and ecad_session.get_session(sid).revision == before, bad
 
 
 def _build_divider(tools: dict) -> None:
@@ -122,14 +317,14 @@ def _build_divider(tools: dict) -> None:
       OUT net: R1.1  — R2.2
       GND net: R2.1  — V1.-  (+ a GND power port -> node 0)
     """
-    _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:V_source", x=0, y=20, value="10")
+    _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:VDC", x=0, y=20, value="10")
     _call(tools, "ecad_place_symbol", libid="Device:R", x=20, y=20, value="1k", angle=90)
     _call(tools, "ecad_place_symbol", libid="Device:R", x=20, y=0, value="2k", angle=90)
     _call(tools, "ecad_wire", from_ref="V1", from_pin="+", to_ref="R1", to_pin="2")
     _call(tools, "ecad_wire", from_ref="R1", from_pin="1", to_ref="R2", to_pin="2")
     _call(tools, "ecad_wire", from_ref="R2", from_pin="1", to_ref="V1", to_pin="-")
-    # GND power port at V1.- world xy (0, 14.92) -> names the bottom net 'GND' -> node 0.
-    _call(tools, "ecad_add_power", net="GND", x=0, y=14.92)
+    x, y = _pin_xy("V1", "2")
+    _call(tools, "ecad_add_power", net="GND", x=x, y=y)
 
 
 def test_place_and_wire(tools: dict) -> None:
@@ -145,12 +340,12 @@ def test_place_and_wire(tools: dict) -> None:
 
     r2 = _call(tools, "ecad_place_symbol", libid="Device:R", x=20, y=0, value="2k", angle=90)
     assert r2["ref"] == "R2", f"second resistor should be R2, got {r2.get('ref')}"
-    v1 = _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:V_source",
+    v1 = _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:VDC",
                x=0, y=20, value="10")
     assert v1["ok"], "voltage source placement failed"
     print(f"  placed {v1['ref']} (10V), {r2['ref']} (2k)")
 
-    # Wire the divider. Resistor pins are '1'/'2'; V source pins are '+'/'-'.
+    # VDC's numbered pins 1/2 also accept the Sim.Pins '+'/'-' model aliases.
     w_in = _call(tools, "ecad_wire", from_ref="V1", from_pin="+", to_ref="R1", to_pin="2")
     _assert_context(w_in, "ecad_wire")
     assert w_in["ok"], f"wire V1.+->R1.2 failed: {w_in.get('error')}"
@@ -165,7 +360,8 @@ def test_place_and_wire(tools: dict) -> None:
     assert w_gnd["ok"], f"wire R2.1->V1.- failed: {w_gnd.get('error')}"
     print(f"  wired R2.1 <-> V1.-  net={w_gnd['net']} members={w_gnd['net_members']}")
 
-    gp = _call(tools, "ecad_add_power", net="GND", x=0, y=14.92)
+    x, y = _pin_xy("V1", "2")
+    gp = _call(tools, "ecad_add_power", net="GND", x=x, y=y)
     _assert_context(gp, "ecad_add_power")
     assert gp["net_size"] >= 2, f"GND port should bond to >=2 pins, got {gp['net_size']}"
     print(f"  GND port bonded {gp['net_size']} pins: {gp['net_members']}")
@@ -218,15 +414,14 @@ def test_run_erc(tools: dict) -> None:
 
     erc = _call(tools, "ecad_run_erc")
     _assert_context(erc, "ecad_run_erc")
-    assert erc["ok"], "run_erc failed"
+    assert erc["ok"] == (erc["errors"] == 0), erc
     assert "errors" in erc and "warnings" in erc
     assert isinstance(erc["violations"], list)
     # The verdict line must read like the contract: "N error(s), M warning(s)..."
     assert "error(s)" in erc["verdict"] and "warning(s)" in erc["verdict"], erc["verdict"]
-    # missing_footprint warnings are expected (no footprints assigned).
-    rules = {g["rule"] for g in erc["by_rule"]}
-    print(f"  erc verdict: {erc['verdict']}")
-    print(f"  erc rules hit: {sorted(rules)} ({erc['errors']} err, {erc['warnings']} warn)")
+    assert erc["source"] == "kicad-cli"
+    assert erc["errors"] == erc["counts"]["error"]
+    assert erc["warnings"] == erc["counts"]["warning"]
     print("  [run_erc] PASS")
 
 
@@ -283,13 +478,14 @@ def test_sweep(tools: dict) -> None:
     """A parameter sweep over R1 must move the divider midpoint monotonically + read in English."""
     # Fresh footprint-free divider (sim only): V1=10, R1 swept, R2=2k.
     _call(tools, "ecad_new_schematic", name="sweep")
-    _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:V_source", x=0, y=20, value="10")
+    _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:VDC", x=0, y=20, value="10")
     _call(tools, "ecad_place_symbol", libid="Device:R", x=20, y=20, value="1k", angle=90)
     _call(tools, "ecad_place_symbol", libid="Device:R", x=20, y=0, value="2k", angle=90)
     _call(tools, "ecad_wire", from_ref="V1", from_pin="+", to_ref="R1", to_pin="2")
     _call(tools, "ecad_wire", from_ref="R1", from_pin="1", to_ref="R2", to_pin="2")
     _call(tools, "ecad_wire", from_ref="R2", from_pin="1", to_ref="V1", to_pin="-")
-    _call(tools, "ecad_add_power", net="GND", x=0, y=14.92)
+    x, y = _pin_xy("V1", "2")
+    _call(tools, "ecad_add_power", net="GND", x=x, y=y)
 
     sw = _call(tools, "ecad_sweep", param="R1", values=[1000, 2000, 5000], analysis="op")
     _assert_context(sw, "ecad_sweep")
@@ -320,27 +516,28 @@ def test_sweep_guard(tools: dict) -> None:
 
 def _build_footprinted_divider(tools: dict) -> None:
     """Build a divider whose resistors carry a real footprint, so sync places them on the board."""
-    from services.mcp.ecad_common import ecad_session
+    from services.mcp.ecad_common import ecad_session, _unique_ecad_path
     from services.mcp.ecad_tools import _ECAD
 
-    _call(tools, "ecad_new_schematic", name="sync_div")
-    v1 = _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:V_source",
+    _call(tools, "ecad_new_schematic", name="sync_div",
+          path=_unique_ecad_path("sch", "sync_div"))
+    v1 = _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:VDC",
                x=0, y=0, value="5", ref="V1")
     r1 = _call(tools, "ecad_place_symbol", libid="Device:R", x=20, y=5, value="10k", ref="R1")
     r2 = _call(tools, "ecad_place_symbol", libid="Device:R", x=40, y=5, value="10k", ref="R2")
     # Assign footprints via the session ops (the MCP layer has no footprint setter for symbols).
     s = ecad_session.get_session(_ECAD["current_sch"])
     ecad_session.apply_ops(s, s.revision, [
-        {"op": "sch_edit_symbol", "id": r1["id"], "footprint": "Resistor_SMD:R_0603"},
-        {"op": "sch_edit_symbol", "id": r2["id"], "footprint": "Resistor_SMD:R_0603"},
+        {"op": "sch_edit_symbol", "id": r1["id"], "footprint": "Resistor_SMD:R_0603_1608Metric"},
+        {"op": "sch_edit_symbol", "id": r2["id"], "footprint": "Resistor_SMD:R_0603_1608Metric"},
     ])
     # Connectivity by net name (robust): +5V, MID, GND.
     ecad_session.apply_ops(s, s.revision, [
-        {"op": "sch_add_power", "net": "+5V", "pos": [0.0, 5.08]},
-        {"op": "sch_add_power", "net": "+5V", "pos": [14.92, 5.0]},
-        {"op": "sch_add_label", "text": "MID", "pos": [25.08, 5.0], "scope": "local"},
-        {"op": "sch_add_label", "text": "MID", "pos": [34.92, 5.0], "scope": "local"},
-        {"op": "sch_add_power", "net": "GND", "pos": [45.08, 5.0]},
+        {"op": "sch_add_power", "net": "+5V", "pos": list(_pin_xy("V1", "1"))},
+        {"op": "sch_add_power", "net": "+5V", "pos": list(_pin_xy("R1", "1"))},
+        {"op": "sch_add_label", "text": "MID", "pos": list(_pin_xy("R1", "2")), "scope": "local"},
+        {"op": "sch_add_label", "text": "MID", "pos": list(_pin_xy("R2", "1")), "scope": "local"},
+        {"op": "sch_add_power", "net": "GND", "pos": list(_pin_xy("R2", "2"))},
     ])
 
 
@@ -400,14 +597,16 @@ def test_sync_autoroute_zone_flow(tools: dict) -> None:
 
 
 def test_export_fab_outputs(tools: dict) -> None:
-    """ecad_export('gerber'/'drill'/'bom'/'placement') must resolve a relative path against
-    THIS process's cwd, and confirm every written file actually landed on disk with a size
-    (not just echo the intended path back)."""
+    """KiCad fab outputs resolve explicit paths and report the written files."""
     import os
     import tempfile
+    from services.mcp.ecad_common import ecad_session
+    from services.mcp.ecad_tools import _ECAD
 
     _build_footprinted_divider(tools)
-    _call(tools, "ecad_new_pcb", name="export_board")
+    sch = ecad_session.get_session(_ECAD["current_sch"])
+    _call(tools, "ecad_new_pcb", name="export_board",
+          path=os.path.splitext(sch.path)[0] + ".kicad_pcb")
     _call(tools, "ecad_update_from_sch")
     _call(tools, "ecad_autoroute")
 
@@ -420,11 +619,11 @@ def test_export_fab_outputs(tools: dict) -> None:
             f"relative path must resolve against cwd, got {gb['dir']!r}"
         assert gb["exists"], "gerber export must confirm files exist on disk"
         assert gb["total_bytes"] > 0, "gerber export must report nonzero bytes written"
-        assert gb["layer_count"] == len(gb["files"]), "layer_count must match files written"
-        for layer, p in gb["files"].items():
-            assert os.path.isabs(p) and os.path.exists(p), f"gerber layer {layer} not on disk"
-            assert gb["file_bytes"][layer] == os.path.getsize(p)
-        print(f"  export(gerber): {gb['layer_count']} layer(s), {gb['total_bytes']} bytes @ {gb['dir']}")
+        assert len(gb["paths"]) == len(gb["files"])
+        for p in gb["paths"]:
+            assert os.path.isabs(p) and os.path.isfile(p), p
+            assert gb["file_bytes"][p] == os.path.getsize(p)
+        print(f"  export(gerber): {len(gb['paths'])} files, {gb['total_bytes']} bytes @ {gb['dir']}")
 
         bom_path = os.path.join(rel, "out.csv")
         bm = _call(tools, "ecad_export", kind="bom", path=bom_path)
@@ -433,15 +632,15 @@ def test_export_fab_outputs(tools: dict) -> None:
         assert bm["path"] == os.path.abspath(bom_path), \
             f"bom path must resolve to an absolute path, got {bm['path']!r}"
         assert bm["bytes"] > 0 and bm["bytes"] == os.path.getsize(bm["path"])
-        print(f"  export(bom): {bm['rows']} row(s), {bm['bytes']} bytes @ {bm['path']}")
+        print(f"  export(bom): {bm['bytes']} bytes @ {bm['path']}")
 
         place_path = os.path.join(td, "place.csv")
-        pl = _call(tools, "ecad_export", kind="placement", path=place_path)
-        _assert_context(pl, "ecad_export(placement)")
+        pl = _call(tools, "ecad_export", kind="cpl", path=place_path)
+        _assert_context(pl, "ecad_export(cpl)")
         assert pl["ok"] and pl["exists"]
         assert pl["path"] == os.path.abspath(place_path)
         assert pl["bytes"] > 0
-        print(f"  export(placement): {pl['rows']} row(s), {pl['bytes']} bytes")
+        print(f"  export(cpl): {pl['bytes']} bytes")
     print("  [export_fab_outputs] PASS")
 
 
@@ -510,13 +709,14 @@ def test_ecad_design(tools: dict) -> None:
 def _build_divider_schematic(tools: dict, name: str = "divider_tf") -> None:
     """Build a 10V / 1k+2k divider on a fresh schematic (helper for advanced tests)."""
     _call(tools, "ecad_new_schematic", name=name)
-    _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:V_source", x=0, y=20, value="10")
+    _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:VDC", x=0, y=20, value="10")
     _call(tools, "ecad_place_symbol", libid="Device:R", x=20, y=20, value="1k", angle=90)
     _call(tools, "ecad_place_symbol", libid="Device:R", x=20, y=0, value="2k", angle=90)
     _call(tools, "ecad_wire", from_ref="V1", from_pin="+", to_ref="R1", to_pin="2")
     _call(tools, "ecad_wire", from_ref="R1", from_pin="1", to_ref="R2", to_pin="2")
     _call(tools, "ecad_wire", from_ref="R2", from_pin="1", to_ref="V1", to_pin="-")
-    _call(tools, "ecad_add_power", net="GND", x=0, y=14.92)
+    x, y = _pin_xy("V1", "2")
+    _call(tools, "ecad_add_power", net="GND", x=x, y=y)
 
 
 def test_tf(tools: dict) -> None:
@@ -550,23 +750,26 @@ def test_simulate_four(tools: dict) -> None:
     """ecad_simulate('four') on an RC circuit must return a THD% + reading."""
     # Build a simple 1kHz sine-driven RC: V_AC -> R -> C -> GND
     _call(tools, "ecad_new_schematic", name="four_rc")
-    _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:V_source", x=0, y=10,
+    _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:VSIN", x=0, y=20,
           value="1", ref="V1")
-    _call(tools, "ecad_place_symbol", libid="Device:R", x=10, y=10, value="1k",
+    _call(tools, "ecad_place_symbol", libid="Device:R", x=20, y=20, value="1k",
           angle=90, ref="R1")
-    _call(tools, "ecad_place_symbol", libid="Device:C", x=10, y=0, value="100n",
+    _call(tools, "ecad_place_symbol", libid="Device:C", x=20, y=0, value="100n",
           angle=90, ref="C1")
     _call(tools, "ecad_wire", from_ref="V1", from_pin="+", to_ref="R1", to_pin="2")
     _call(tools, "ecad_wire", from_ref="R1", from_pin="1", to_ref="C1", to_pin="1")
     _call(tools, "ecad_wire", from_ref="C1", from_pin="2", to_ref="V1", to_pin="-")
-    _call(tools, "ecad_add_power", net="GND", x=0, y=3)
+    x, y = _pin_xy("V1", "2")
+    _call(tools, "ecad_add_power", net="GND", x=x, y=y)
     # Sine source: set waveform to SIN so the tran has something to analyze.
     from services.mcp.ecad_common import ecad_session
     from services.mcp.ecad_tools import _ECAD
     s = ecad_session.get_session(_ECAD["current_sch"])
     v_sym = next(sym for sym in s.doc.get("symbols", []) if sym.get("ref") == "V1")
+    fields = dict(v_sym.get("fields") or {})
+    fields["Sim.Params"] = "dc=0 ampl=0 f=1k ac=0"
     ecad_session.apply_ops(s, s.revision, [
-        {"op": "sch_edit_symbol", "id": v_sym["id"],
+        {"op": "sch_edit_symbol", "id": v_sym["id"], "fields": fields,
          "sim_params": {"waveform": "SIN", "amplitude": "1", "freq": "1000"}},
     ])
 
@@ -956,7 +1159,9 @@ def test_e2_led_driver_recipe(tools: dict) -> None:
     libids = {c["libid"] for c in st.get("components", [])}
     assert "Device:LED" in libids, f"LED driver must contain an LED, got {libids}"
     assert "Device:R" in libids, f"LED driver must contain a current-limit resistor, got {libids}"
-    assert "Amplifier_Operational:OPAMP_dual" not in libids, "LED driver must NOT be an op-amp"
+    assert not any(libid.startswith("Amplifier_Operational:") or libid == "Simulation_SPICE:OPAMP"
+                   for libid in libids), \
+        "LED driver must NOT be an op-amp"
     print(f"  E2: led_driver components={sorted(libids)} sim={d.get('sim', {}).get('got')}")
     print("  [e2_led_driver_recipe] PASS")
 
@@ -964,28 +1169,37 @@ def test_e2_led_driver_recipe(tools: dict) -> None:
 def test_e3_opamp_noninverting_gain(tools: dict) -> None:
     """E3: a non-inverting op-amp (Rf=10k,Rin=1k,Vin=1V) must simulate to V(OUT)~=11V, not 0."""
     from services.mcp.ecad_common import schema as ecad_schema
-    from services.mcp.ecad_common import ecad_session
+    from services.mcp.ecad_common import ecad_session, netlist_mod
 
     s = _call(tools, "ecad_new_schematic", name="E3_noninv")
     sid = s["doc_id"]
-    _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:V_source",
+    _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:VDC",
           x=0, y=0, value="1", ref="V1", doc_id=sid)
+    _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:VDC",
+          x=0, y=30, value="12", ref="V2", doc_id=sid)
+    _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:VDC",
+          x=0, y=-30, value="-12", ref="V3", doc_id=sid)
     _call(tools, "ecad_place_symbol", libid="Device:R", x=30, y=0, value="1k",
           ref="Rin", doc_id=sid)
     _call(tools, "ecad_place_symbol", libid="Device:R", x=60, y=0, value="10k",
           ref="Rf", doc_id=sid)
-    _call(tools, "ecad_place_symbol", libid="Amplifier_Operational:OPAMP_dual",
+    _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:OPAMP",
           x=90, y=0, value="OPAMP", ref="U1", doc_id=sid)
 
     # Connectivity by net labels at each pin's world coordinate (robust by-name nets).
     sess = ecad_session.get_session(sid)
-    pw = {(sym.get("ref"), str(pin.get("number"))): [round(w[0], 6), round(w[1], 6)]
-          for sym, pin, w in ecad_schema.iter_placed_pins(sess.doc)}
+    pw = {}
+    for sym, pin, world in ecad_schema.iter_placed_pins(sess.doc):
+        xy = [round(world[0], 6), round(world[1], 6)]
+        pw[(sym.get("ref"), str(pin.get("number")))] = xy
+        pw.setdefault((sym.get("ref"), str(pin.get("name"))), xy)
     nets = {
-        "IN":  [("V1", "+"), ("U1", "2")],            # V+ drives the op-amp IN+ (pin 2)
-        "INV": [("Rin", "1"), ("Rf", "1"), ("U1", "1")],  # IN- summing node (pin 1)
-        "OUT": [("Rf", "2"), ("U1", "3")],            # feedback + output (pin 3)
-        "GND": [("V1", "-"), ("Rin", "2")],
+        "IN":  [("V1", "1"), ("U1", "1")],              # non-inverting input
+        "INV": [("Rin", "1"), ("Rf", "1"), ("U1", "2")],  # inverting input
+        "OUT": [("Rf", "2"), ("U1", "5")],              # feedback + output
+        "VCC": [("V2", "1"), ("U1", "3")],              # +12 V
+        "VEE": [("V3", "1"), ("U1", "4")],              # -12 V
+        "GND": [("V1", "2"), ("V2", "2"), ("V3", "2"), ("Rin", "2")],
     }
     conn = []
     for net, members in nets.items():
@@ -993,12 +1207,24 @@ def test_e3_opamp_noninverting_gain(tools: dict) -> None:
             conn.append({"op": "sch_add_label", "text": net, "pos": pw[(ref, pin)],
                          "scope": "global"})
         if net == "GND":
-            conn.append({"op": "sch_add_power", "net": "GND", "pos": pw[("V1", "-")],
+            conn.append({"op": "sch_add_power", "net": "GND", "pos": pw[("V1", "2")],
                          "symbol": "GND"})
     ecad_session.apply_ops(sess, sess.revision, conn)
 
-    r = _call(tools, "ecad_simulate", analysis="op", probes=["V(OUT)"], doc_id=sid)
-    vout = (r.get("op", {}) or {}).get("V(OUT)")
+    # Assert the compiled physical-pin nets, not just the requested label operations.
+    components = {c["ref"]: c for c in netlist_mod.build_netlist(sess.doc)["components"]}
+    for net, members in nets.items():
+        for ref, pin in members:
+            assert components[ref]["pins"][pin] == net, (ref, pin, net, components[ref])
+
+    r = _call(tools, "ecad_simulate", analysis="op",
+              probes=["V(OUT)", "V(VCC)", "V(VEE)"], doc_id=sid)
+    assert r["ok"] and r["converged"], r
+    op = r.get("op", {}) or {}
+    for net, expected in (("VCC", 12.0), ("VEE", -12.0)):
+        voltage = op.get(f"V({net})")
+        assert voltage is not None and abs(voltage - expected) < 1e-4, (net, voltage, r)
+    vout = op.get("V(OUT)")
     assert vout is not None, f"V(OUT) missing — op-amp sim broke: {r.get('reading')!r}"
     assert abs(vout - 11.0) < 0.5, \
         f"non-inverting amp gain wrong: V(OUT)={vout} (expected ~11V for 1+Rf/Rin=11)"
@@ -1191,8 +1417,8 @@ def test_eng_metadata_roundtrip(tools: dict) -> None:
     ecad_status per-component power_w and the board power totals."""
     s = _call(tools, "ecad_new_schematic", name="ENG_meta")
     sid = s["doc_id"]
-    # NE555 carries seeded power (typ 15 mW / max 225 mW) from the starter library.
-    _call(tools, "ecad_place_symbol", libid="Timer:NE555", x=0, y=0, doc_id=sid)
+    # The DIP NE555P carries seeded power (typ 15 mW / max 225 mW).
+    _call(tools, "ecad_place_symbol", libid="Timer:NE555P", x=0, y=0, doc_id=sid)
     # Resistor with a per-instance override: measured operating dissipation 20 mW typ.
     r = _call(tools, "ecad_place_symbol", libid="Device:R", x=40, y=0, value="1k",
               footprint="Resistor_SMD:R_0805", doc_id=sid,
@@ -1202,8 +1428,9 @@ def test_eng_metadata_roundtrip(tools: dict) -> None:
     assert st["ok"] and "power" in st, "status must carry the board power rollup"
     by_ref = {c["ref"]: c for c in st["components"]}
     u1 = by_ref["U1"]
-    assert abs(u1["power_w"]["typ"] - 0.015) < 1e-9, f"NE555 seed typ: {u1['power_w']}"
-    assert abs(u1["power_w"]["max"] - 0.225) < 1e-9, f"NE555 seed max: {u1['power_w']}"
+    assert u1["libid"] == "Timer:NE555P", u1
+    assert abs(u1["power_w"]["typ"] - 0.015) < 1e-9, f"NE555P seed typ: {u1['power_w']}"
+    assert abs(u1["power_w"]["max"] - 0.225) < 1e-9, f"NE555P seed max: {u1['power_w']}"
     r1 = by_ref["R1"]
     assert abs(r1["power_w"]["typ"] - 0.02) < 1e-9, \
         f"sim_params.eng override must win: {r1['power_w']}"
@@ -1239,56 +1466,65 @@ def test_eng_missing_metadata_degrades(tools: dict) -> None:
 
 
 def test_to_3d_boardphys_sidecar(tools: dict) -> None:
-    """ecad_to_3d places component bodies from package dims and writes the
-    aicad.boardphys/1 sidecar mapping each solid to power/thermal metadata."""
-    try:
-        import build123d  # noqa: F401
-    except ImportError:
-        print("  ENG: build123d not installed — skipping to_3d sidecar test")
-        return
+    """KiCad exports the board STEP; physics metadata never invents solid labels."""
     import os
-    import tempfile
 
     s = _call(tools, "ecad_new_schematic", name="ENG_3d")
     sid = s["doc_id"]
-    _call(tools, "ecad_place_symbol", libid="Timer:NE555", x=0, y=0,
-          footprint="Package_SO:SOIC-8", doc_id=sid)
+    _call(tools, "ecad_place_symbol", libid="Timer:NE555D", x=0, y=0,
+          footprint="Package_SO:SOIC-8_3.9x4.9mm_P1.27mm", doc_id=sid)
     _call(tools, "ecad_place_symbol", libid="Device:R", x=40, y=0, value="1k",
-          footprint="Resistor_SMD:R_0805", doc_id=sid)
+          footprint="Resistor_SMD:R_0805_2012Metric", doc_id=sid)
     _call(tools, "ecad_wire", from_ref="U1", from_pin="8", to_ref="R1", to_pin="1", doc_id=sid)
     mb = _call(tools, "ecad_make_board", pcb_name="ENG_board", doc_id=sid)
     # DRC errors on this throwaway 2-part board are fine — we only need a synced board
     # with a closed outline for the 3D export.
     assert mb.get("doc_id") and mb.get("footprints_placed", 0) >= 2, \
         f"make_board did not produce a populated board: {mb.get('reading')!r}"
-    out = os.path.join(tempfile.mkdtemp(prefix="eng_"), "board.step")
-    r = _call(tools, "ecad_to_3d", path=out, doc_id=mb["doc_id"])
-    if not r.get("ok") and "still" in str(r.get("error", "")).lower():
-        r = _call(tools, "ecad_to_3d", path=out, doc_id=mb["doc_id"])  # kernel warm now
+    r = _call(tools, "ecad_to_3d", doc_id=mb["doc_id"])
+    if r.get("status") == "running":
+        from services.mcp.cad_doc_tools import register_cad_doc_tools
+        jobs = _StubMCP()
+        register_cad_doc_tools(jobs)
+        import time
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            job = json.loads(jobs.tools["get_job"](job_id=r["job_id"]))
+            if job.get("status") != "running":
+                r = job.get("result") or job
+                if isinstance(r, str):
+                    r = json.loads(r)
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError("KiCad STEP background job did not finish")
     assert r["ok"], f"ecad_to_3d failed: {r.get('error')!r}"
     assert r["exists"] and r["bytes"] > 0, \
         f"ecad_to_3d must confirm the STEP file exists with a size: {r}"
     assert r["bytes"] == os.path.getsize(r["step_path"]), "reported bytes must match on disk"
-    assert r["n_components"] >= 2, f"expected component bodies, got {r['n_components']}"
+    assert r["step_path"] == os.path.splitext(mb["path"])[0] + ".step"
+    assert r.get("part_doc_id"), f"KiCad STEP was not imported into a part: {r}"
     sidecar = r.get("boardphys_path")
     assert sidecar and os.path.isfile(sidecar), f"sidecar not written: {sidecar!r}"
     with open(sidecar, encoding="utf-8") as fh:
         phys = json.load(fh)
     assert phys["schema"] == "aicad.boardphys/1", phys["schema"]
     assert phys["step_path"] == r["step_path"]
+    assert phys["board"]["source_path"] == os.path.realpath(mb["path"])
     comps = {c["ref"]: c for c in phys["components"]}
     assert "U1" in comps and "R1" in comps, f"sidecar refs: {sorted(comps)}"
     u1 = comps["U1"]
-    assert u1["solid_label"] == "U1", "sidecar must map to the placed solid label"
-    assert u1["body"]["source"] == "package_lib", \
-        f"SOIC-8 must place a library package body, got {u1['body']}"
-    assert abs(u1["body"]["l_mm"] - 4.9) < 1e-9 and abs(u1["body"]["h_mm"] - 1.75) < 1e-9
+    assert u1["libid"] == "Timer:NE555D"
+    assert u1["fpid"] == "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm"
+    assert u1["solid_label"] is None and u1["body"] is None
     assert abs(u1["power_w"]["typ"] - 0.015) < 1e-9
     assert u1["theta_c_per_w"]["ja"] is not None and u1["theta_c_per_w"]["jc"] is None, \
         "theta_jc unknown for SOIC-8 seed -> must be null"
     assert u1["limits_c"]["tj_max"] == 150.0
     assert u1["supply"]["rails"] and u1["supply"]["rails"][0]["name"] == "VCC"
     assert u1["sources"], "seeded values must carry source notes"
+    assert comps["R1"]["power_w"]["max"] == 0.125
+    assert comps["R1"]["sources"], "KiCad footprint metadata must retain its provenance"
     tot = phys["totals"]
     assert tot["power_w_typ"] is not None and tot["n_components"] == len(phys["components"])
     assert r.get("power"), "to_3d response must surface the power totals"
@@ -1429,13 +1665,13 @@ def test_fpga_check_and_constraints(tools: dict) -> None:
 
 def _disable_live_provider():
     """Pin the actual helper resolver to the deterministic, no-model recipe path."""
-    from services.agent.providers import chudcode_provider
+    from services.agent.providers import omp_provider
 
-    original = chudcode_provider.helper_provider
-    chudcode_provider.helper_provider = lambda *a, **k: None
+    original = omp_provider.helper_provider
+    omp_provider.helper_provider = lambda *a, **k: None
 
     def restore():
-        chudcode_provider.helper_provider = original
+        omp_provider.helper_provider = original
 
     return restore
 
@@ -1457,11 +1693,18 @@ if pytest is not None:
     # test silently planned against the developer's REAL configured provider (a live model),
     # which is exactly the non-determinism _disable_live_provider() exists to prevent.
     @pytest.fixture(scope="module", autouse=True)
-    def _no_live_provider():
-        """Pin the helper resolver to None for every test in this module."""
+    def _no_live_provider(tmp_path_factory):
+        """Pin the provider and keep KiCad files in an isolated workspace."""
+        import os
+        previous = os.environ.get("CHUDWARE_PROJECT_DIR")
+        os.environ["CHUDWARE_PROJECT_DIR"] = str(tmp_path_factory.mktemp("ecad-workspace"))
         restore = _disable_live_provider()
         yield
         restore()
+        if previous is None:
+            os.environ.pop("CHUDWARE_PROJECT_DIR", None)
+        else:
+            os.environ["CHUDWARE_PROJECT_DIR"] = previous
 
     @pytest.fixture(scope="module")
     def tools(_no_live_provider):
@@ -2021,9 +2264,11 @@ def test_heatsink_select() -> None:
 
 def _build_large_schematic(tools: dict, n_pairs: int = 16) -> str:
     """Place >=30 components (n_pairs*2 resistors + 1 voltage source) on a fresh sch."""
-    s = _call(tools, "ecad_new_schematic", name=f"size_{n_pairs}")
+    from services.mcp.ecad_common import _unique_ecad_path
+    name = f"size_{n_pairs}"
+    s = _call(tools, "ecad_new_schematic", name=name, path=_unique_ecad_path("sch", name))
     doc_id = s["doc_id"]
-    _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:V_source", x=0, y=0,
+    _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:VDC", x=0, y=0,
           value="5", doc_id=doc_id)
     for i in range(n_pairs):
         x = 20 + (i % 8) * 15
@@ -2471,7 +2716,7 @@ def test_dialect_place_symbol_batch(tools: dict) -> None:
     b = _call(tools, "ecad_place_symbol", libid=[
         {"libid": "Device:R", "x": 20, "y": 20, "value": "1k", "angle": 90},
         {"part": "Device:R", "at": [20, 0], "val": "2k", "rotation": 90},
-        {"libid": "Simulation_SPICE:V_source", "pos": [0, 20], "value": "10"},
+        {"libid": "Simulation_SPICE:VDC", "pos": [0, 20], "value": "10"},
     ])
     _assert_context(b, "ecad_place_symbol/batch")
     assert b["ok"] and b["count"] == 3, f"batch placement failed: {b}"
@@ -2511,7 +2756,7 @@ def _dialect_divider_parts(tools: dict, name: str) -> None:
     """The _build_divider layout, placed in ONE batch call (dialect under test)."""
     _call(tools, "ecad_new_schematic", name=name)
     b = _call(tools, "ecad_place_symbol", libid={"ops": [
-        {"libid": "Simulation_SPICE:V_source", "pos": [0, 20], "value": "10"},
+        {"libid": "Simulation_SPICE:VDC", "pos": [0, 20], "value": "10"},
         {"libid": "Device:R", "pos": [20, 20], "value": "1k", "angle": 90},
         {"libid": "Device:R", "pos": [20, 0], "value": "2k", "angle": 90},
     ]})
@@ -2525,13 +2770,18 @@ def test_dialect_wire_endpoint_shapes(tools: dict) -> None:
     w1 = _call(tools, "ecad_wire", from_ref="V1.+", to_ref="R1.2")
     _assert_context(w1, "ecad_wire/dotted")
     assert w1["ok"] and w1["net_size"] >= 2, f"dotted endpoints rejected: {w1}"
-    assert set(w1["net_members"]) >= {"V1.+", "R1.2"}, f"wrong pins joined: {w1['net_members']}"
+    assert set(w1["net_members"]) >= {"V1.1", "R1.2"}, f"wrong pins joined: {w1['net_members']}"
     w2 = _call(tools, "ecad_wire", from_ref={"ref": "R1", "pin": "1"},
                to_ref={"sym": "R2", "number": "2"})
     assert w2["ok"] and set(w2["net_members"]) >= {"R1.1", "R2.2"}, f"endpoint dicts: {w2}"
     w3 = _call(tools, "ecad_wire", from_ref={"from": "R2.1", "to": "V1.-"})
-    assert w3["ok"] and set(w3["net_members"]) >= {"R2.1", "V1.-"}, f"connection dict: {w3}"
+    assert w3["ok"] and set(w3["net_members"]) >= {"R2.1", "V1.2"}, f"connection dict: {w3}"
     assert w3["total_unconnected"] == 0, f"divider must be fully wired: {w3}"
+    extra = _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:VDC",
+                  ref="V2", x=50, y=20, value="10")
+    assert extra["ok"], extra
+    aliases = _call(tools, "ecad_wire", from_ref="V1.+", to_ref="V2.+")
+    assert aliases["ok"] and set(aliases["net_members"]) >= {"V1.1", "V2.1"}, aliases
     print(f"  dialect wire nets: {w1['net']}, {w2['net']}, {w3['net']}")
     print("  [dialect_wire_endpoint_shapes] PASS")
 
@@ -2550,7 +2800,8 @@ def test_dialect_wire_batch_solves(tools: dict) -> None:
     assert len(w["wires"]) == 3 and all(x["net"] for x in w["wires"]), \
         f"each batch wire must report its net: {w['wires']}"
     assert w["total_unconnected"] == 0, f"batch must wire every pin: {w}"
-    _call(tools, "ecad_add_power", net="GND", x=0, y=14.92)
+    x, y = _pin_xy("V1", "2")
+    _call(tools, "ecad_add_power", net="GND", x=x, y=y)
     sim = _call(tools, "ecad_simulate", analysis="op")
     assert sim["ok"], f"sim of the dialect-built divider failed: {sim.get('error')}"
     vvals = {k: v for k, v in sim["op"].items() if k.startswith("V(") and v is not None}
@@ -2593,11 +2844,8 @@ def test_dialect_malformed_still_teaches(tools: dict) -> None:
 
 
 # ----------------------------------------------------------- library substitution (measured)
-# A live general-lane run asked for a "3V3 buck regulator schematic with an ESP32-S3 and a
-# TPS62840" and burned FOUR consecutive ecad_find_part calls (ESP32-S3-WROOM / ESP32 / TPS62840 /
-# ESP32-S3), every one "no library parts match", before manually placing MCU:Generic_QFP48. The
-# library is a clean-room GENERIC set; models always ask for real part numbers. find_part now
-# answers with the closest generic BY FUNCTION, flagged loudly.
+# Installed KiCad libraries provide real manufacturer symbols. Generic substitution
+# remains a deliberately flagged fallback only when there is no real catalog hit.
 
 
 def test_library_exact_hit_is_not_substituted(tools: dict) -> None:
@@ -2609,6 +2857,9 @@ def test_library_exact_hit_is_not_substituted(tools: dict) -> None:
     assert p.get("exact_match") is True, p
     assert not p["warnings"], f"an exact hit must carry no substitution warning: {p['warnings']}"
     assert "Device:R" in [h.get("libid") for h in p["hits"]], p["hits"]
+    real = _call(tools, "ecad_find_part", query="1N4148")
+    assert real["ok"] and not real["substituted"], real
+    assert any("1n4148" in (h.get("libid") or "").lower() for h in real["hits"]), real
     print("  [library_exact_hit_is_not_substituted] PASS")
 
 
@@ -2621,9 +2872,9 @@ def test_library_substitutes_passives_and_discretes(tools: dict) -> None:
     part, so the substitution stopped being the least-bad option.)
     """
     cases = {
-        "1N4148": ("Device:D", 2),
-        "BSS138": ("Device:NMOS", 3),
-        "MMBT3904": ("Device:Q_NPN", 3),
+        "1N4148_FAKE_NOT_A_PART": ("Device:D", 2),
+        "BSS138_FAKE_NOT_A_PART": ("Device:NMOS", 3),
+        "MMBT3904_FAKE_NOT_A_PART": ("Device:Q_NPN", 3),
     }
     for query, (want_libid, want_pins) in cases.items():
         p = _call(tools, "ecad_find_part", query=query)
@@ -2658,10 +2909,10 @@ def test_library_refuses_multipin_substitution(tools: dict) -> None:
     part from a supplied pinout, the honest refusal is actionable, so it refuses and routes.
     """
     for query, closest, closest_pins in (
-            ("TPS62840", "Regulator_Switching:Buck_3V3", 6),
-            ("ESP32-S3", "MCU:Generic_QFP48", 48),
-            ("ESP32-S3-WROOM", "MCU:Generic_QFP48", 48),
-            ("ESP32", "MCU:Generic_QFP48", 48)):
+            ("TPS62840_FAKE_NOT_A_PART", "Regulator_Switching:Buck_3V3", 6),
+            ("ESP32-S3_FAKE_NOT_A_PART", "MCU:Generic_QFP48", 48),
+            ("ESP32-S3-WROOM_FAKE_NOT_A_PART", "MCU:Generic_QFP48", 48),
+            ("ESP32_FAKE_NOT_A_PART", "MCU:Generic_QFP48", 48)):
         p = _call(tools, "ecad_find_part", query=query)
         _assert_context(p, f"ecad_find_part({query!r})")
         assert not p["ok"], f"{query}: a {closest_pins}-pin substitute must be refused: {p}"
@@ -2686,8 +2937,8 @@ def test_library_substitute_is_actually_placeable(tools: dict) -> None:
     _call(tools, "ecad_new_schematic", name="sub_proof")
     before = _call(tools, "ecad_status")["component_count"]
 
-    diode = _call(tools, "ecad_find_part", query="1N4148")
-    fet = _call(tools, "ecad_find_part", query="BSS138")
+    diode = _call(tools, "ecad_find_part", query="1N4148_FAKE_NOT_A_PART")
+    fet = _call(tools, "ecad_find_part", query="BSS138_FAKE_NOT_A_PART")
     p1 = _call(tools, "ecad_place_symbol", libid=diode["substitute_libid"],
                x=0, y=0, value="1N4148")
     p2 = _call(tools, "ecad_place_symbol", libid=fet["substitute_libid"],
@@ -2712,8 +2963,7 @@ def test_library_unmatchable_still_fails_honestly(tools: dict) -> None:
     assert not p["ok"], f"a meaningless query must NOT be substituted: {p}"
     assert p.get("substituted") is False, p
     assert not p.get("hits"), p
-    assert "Regulator_Switching" in p["hint"] and "MCU" in p["hint"], \
-        f"the miss must name the families that actually exist: {p['hint']}"
+    assert "installed libraries" in p["hint"], p["hint"]
     assert "ecad_find_part('list')" in " ".join(p["next_actions"]), p["next_actions"]
     print("  [library_unmatchable_still_fails_honestly] PASS")
 
@@ -2733,7 +2983,7 @@ def test_library_list_and_category(tools: dict) -> None:
 
     bad = _call(tools, "ecad_find_part", query="resistor", category="Nonsense")
     assert not bad["ok"] and "Nonsense" in bad["error"], bad
-    assert "Regulator_Linear" in bad["hint"], f"must list valid categories: {bad['hint']}"
+    assert "installed libraries" in bad["hint"], bad["hint"]
     print(f"  find_part('list') -> {idx['count']} parts in {len(idx['families'])} families")
     print("  [library_list_and_category] PASS")
 
@@ -2792,16 +3042,26 @@ def test_place_duplicate_ref_in_one_batch(tools: dict) -> None:
 def test_place_sim_params_kv_reaches_the_solver(tools: dict) -> None:
     """'waveform=SIN,amplitude=5,freq=1000' must drive a real transient, not DC."""
     def _run(sim_params) -> dict:
-        _call(tools, "ecad_new_schematic", name="kvsim")
+        _call(tools, "ecad_new_schematic", name="kvsim_driven" if sim_params else "kvsim_zero")
         kw = {"sim_params": sim_params} if sim_params else {}
-        v = _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:V_source",
-                  x=0, y=20, angle=90, value="0", **kw)
+        v = _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:VSIN",
+                  x=0, y=20, value="0", **kw)
         assert v["ok"], v
+        # The installed VSIN defaults to a 1 V sine; neutralize it so only the
+        # sim_params argument under test can drive the transient.
+        from services.mcp.ecad_common import _ECAD, ecad_session
+        session = ecad_session.get_session(_ECAD["current_sch"])
+        symbol = next(sym for sym in session.doc["symbols"] if sym["id"] == v["id"])
+        fields = dict(symbol.get("fields") or {})
+        fields["Sim.Params"] = "dc=0 ampl=0 f=1k ac=0"
+        ecad_session.apply_ops(session, session.revision, [
+            {"op": "sch_edit_symbol", "id": symbol["id"], "fields": fields}])
         r = _call(tools, "ecad_place_symbol", libid="Device:R", x=20, y=20,
-                  angle=90, value="1k")
+                  value="1k")
         _call(tools, "ecad_wire", from_ref=v["ref"], from_pin="1", to_ref=r["ref"], to_pin="1")
         _call(tools, "ecad_wire", from_ref=v["ref"], from_pin="2", to_ref=r["ref"], to_pin="2")
-        _call(tools, "ecad_add_power", net="GND", x=0, y=14.92)
+        x, y = _pin_xy(v["ref"], "2")
+        _call(tools, "ecad_add_power", net="GND", x=x, y=y)
         return _call(tools, "ecad_simulate", analysis="tran",
                      params={"tstep": 2e-5, "tstop": 2e-3})
 
@@ -3086,7 +3346,7 @@ def test_make_part_castellated_module_geometry(tools: dict) -> None:
 
     # Place it and read the pin NAMES back off the placed symbol: a scrambled pin map
     # (right count, wrong assignment) fails here even though the counts still match.
-    _call(tools, "ecad_new_schematic", name="esp32_gen")
+    created = _call(tools, "ecad_new_schematic", name="esp32_gen")
     p = _call(tools, "ecad_place_symbol", libid=libid, x=0, y=0, value="ESP32-WROOM-32")
     assert p["ok"], p
     assert len(p["pins"]) == 38, f"placed with {len(p['pins'])} pins"
@@ -3098,9 +3358,43 @@ def test_make_part_castellated_module_geometry(tools: dict) -> None:
                  if placed.get(k) != supplied[k]}))
     types = {str(q["number"]): q["type"] for q in p["pins"]}
     assert types["1"] == "power_in" and types["3"] == "input", types
+    # A global KiCad part has the same libid; the generated pinout must survive
+    # serialization and reopening, not just the current in-memory session.
+    from services.mcp.ecad_common import ecad_session, schema
+    assert ecad_session.close_session(created["doc_id"])
+    reopened = _call(tools, "ecad_open", path=created["path"])
+    assert reopened["ok"], reopened
+    restored = schema.symbol_def(ecad_session.get_session(reopened["doc_id"]).doc, libid)
+    assert {str(pin["number"]): pin["name"] for pin in restored["pins"]} == supplied
     print(f"  ecad_make_part -> {libid}: 38 pins / 38 pads, pad1={at['1']} "
           f"pad16={at['16']}, placed pin map matches the supplied one")
     print("  [make_part_castellated_module_geometry] PASS")
+
+
+def test_generated_footprint_shadows_installed_and_reopens(tools: dict, tmp_path) -> None:
+    """A generated footprint sharing an installed ID keeps its own geometry on disk."""
+    from services.mcp.ecad_common import _apply, ecad_session
+    from services.ecad.library import resolve_footprint
+
+    fpid = "RF_Module:ESP32-WROOM-32D"
+    generated = _make_esp32(tools, "Generated:FootprintPriorityProbe",
+                            fpid=fpid, overwrite=True)
+    assert generated["ok"] and generated["pad_count"] == 38, generated
+    assert len(resolve_footprint(fpid)["pads"]) == 38
+    target = tmp_path / "footprint_priority.kicad_pcb"
+    created = _call(tools, "ecad_new_pcb", name="footprint_priority", path=str(target))
+    board = ecad_session.get_session(created["doc_id"])
+    _apply(board, [{"op": "pcb_add_footprint", "fpid": fpid, "ref": "U1",
+                    "pos": [20.0, 20.0]}])
+    assert len(board.doc["footprints"][0]["pads"]) == 38
+    assert target.is_file() and ecad_session.close_session(created["doc_id"])
+    reopened = _call(tools, "ecad_open", path=str(target))
+    assert reopened["ok"], reopened
+    restored = ecad_session.get_session(reopened["doc_id"]).doc["footprints"][0]
+    assert len(restored["pads"]) == 38
+    positions = {str(p["number"]): [round(float(v), 3) for v in p["pos"]]
+                 for p in restored["pads"]}
+    assert positions["1"] == [-8.0, 8.89] and positions["16"] == [-4.445, -11.75]
 
 
 def test_make_part_accepts_full_pin_type_enum(tools: dict) -> None:

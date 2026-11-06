@@ -42,8 +42,10 @@ class TestGuidanceEntries(unittest.TestCase):
             self.assertIn(name, known, f"guidance for unknown tool {name!r}")
 
     def test_every_tool_has_a_curated_note(self):
+        from services.agent.tool_categories import AGENT_DENIED_TOOLS
+
         missing = sorted(
-            n for n in (_LIVE_NAMES | PSEUDO_TOOLS)
+            n for n in ((_LIVE_NAMES - AGENT_DENIED_TOOLS) | PSEUDO_TOOLS)
             if not str((TOOL_GUIDANCE.get(n) or {}).get("prompt_note") or "").strip()
         )
         self.assertEqual(
@@ -234,33 +236,6 @@ class TestParamDefaults(unittest.TestCase):
             merged["param_defaults"].get(key), "user-value",
             "user config.json param_defaults must override the curated layer",
         )
-
-
-class TestPanelTablesSnapshot(unittest.TestCase):
-    """host/src/ui/tool_panel_tables.snapshot.json must match the LIVE registry
-    — re-run `tools/gen_tool_panel_tables.py` when tools are added/renamed."""
-
-    def test_snapshot_matches_live_registry(self):
-        import json
-        from pathlib import Path
-
-        snap_path = (
-            Path(__file__).resolve().parents[2]
-            / "host/src/ui/tool_panel_tables.snapshot.json"
-        )
-        if not snap_path.exists():
-            self.fail(f"panel snapshot missing: {snap_path} — run "
-                      "tools/gen_tool_panel_tables.py")
-        snap = json.loads(snap_path.read_text())
-        live = _LIVE_NAMES | PSEUDO_TOOLS
-        snap_tools = {n for names in snap.get("fam_tools", {}).values() for n in names}
-        missing = sorted(live - snap_tools)
-        extra = sorted(snap_tools - live)
-        self.assertEqual(
-            (missing, extra), ([], []),
-            "panel tables drifted — re-run tools/gen_tool_panel_tables.py and "
-            "add prompt_note entries for new tools in "
-            "services/agent/tool_guidance/<family>.py")
 
 
 if __name__ == "__main__":

@@ -1,9 +1,6 @@
-"""Mega-21 fixes — M21 mech deliver-gate force, N21 AC5 net resolution.
+"""Mega-21 fixes — N21 AC5 net resolution.
 
-Axes:
-  M21 — deliver with zero mech artifacts is impossible: forced mech chain
-        executes new_part+add_features per the airframe brief, or typed
-        refusal with leg relaunch. Replay mega-20 ledger as fixture.
+Axis:
   N21 — AC5: finite V on a resolved rail net (prefer 3V3-class, else source
         net); net name recorded in criterion evidence. Fixture from mega-20
         netlist shape (VIN path → N$2).
@@ -12,31 +9,27 @@ Regression: mega-11 legs/grading + mega-16..20 fixes hold.
 """
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from typing import Any
 
-import pytest
-
-
-_MEGA20_LEDGER = (
-    Path(__file__).resolve().parents[2] / "reports/runs/mega-20/ledger.json"
-)
-_MEGA20_MANIFEST = (
-    Path(__file__).resolve().parents[2] / "reports/runs/mega-20/manifest.json"
-)
 
 
 def _load_mega20_ledger() -> dict:
-    if not _MEGA20_LEDGER.is_file():
-        pytest.skip(f"mega-20 ledger fixture missing: {_MEGA20_LEDGER}")
-    return json.loads(_MEGA20_LEDGER.read_text(encoding="utf-8"))
-
-
-def _load_mega20_manifest() -> dict:
-    if not _MEGA20_MANIFEST.is_file():
-        pytest.skip(f"mega-20 manifest fixture missing: {_MEGA20_MANIFEST}")
-    return json.loads(_MEGA20_MANIFEST.read_text(encoding="utf-8"))
+    calls = [
+        {"tool": "ecad_place_symbol", "ok": True,
+         "args": {"libid": "Simulation_SPICE:VDC", "ref": "VIN", "value": "7.4"},
+         "result": {"ok": True, "ref": "VIN", "libid": "Simulation_SPICE:VDC",
+                    "pins": [{"number": "1", "name": "", "net": "N$2"},
+                             {"number": "2", "name": "", "net": "GND"}]}},
+        {"tool": "ecad_wire", "ok": True,
+         "args": {"from_ref": "VIN", "from_pin": "1", "to_ref": "R1", "to_pin": "1"},
+         "result": {"ok": True, "net": "N$2", "net_members": ["R1.1", "VIN.1"],
+                    "net_size": 2}},
+        {"tool": "ecad_simulate", "ok": True,
+         "result": {"ok": True, "nodes": ["N$2", "N$3", "N$1"],
+                    "op": {"V(3V3)": None}}},
+    ]
+    return {"events": [{"kind": "agent_turn", "payload": {"event": "tool_call", **c}}
+                       for c in calls]}
 
 
 class _FakeLedger:
@@ -66,203 +59,6 @@ class _FakeLedger:
 
 
 # ---------------------------------------------------------------------------
-# M21 — mech deliver gate
-# ---------------------------------------------------------------------------
-
-
-def test_mega20_ledger_has_zero_mech_artifacts():
-    """Fixture fingerprint: mega-20 primary starved the airframe leg."""
-    from services.agent.agent_turn import _mech_has_part_artifact
-
-    raw = _load_mega20_ledger()
-    assert _mech_has_part_artifact(raw) is False
-    # Sanity: ECAD product did run (not a total empty mission).
-    tools = set()
-    for e in raw.get("events") or []:
-        pl = e.get("payload") or {}
-        if pl.get("tool"):
-            tools.add(pl["tool"])
-    assert "ecad_wire" in tools or "board_from_schematic" in tools
-
-
-def test_mech_deliver_gate_fires_on_mega20_ledger(monkeypatch):
-    """Replay mega-20 ledger: gate must force new_part+add_features."""
-    from services.agent import agent_turn as at
-
-    raw = _load_mega20_ledger()
-    man = _load_mega20_manifest()
-    # Isolate force-once map.
-    at._MECH_FORCE_ONCE.clear()
-
-    calls_made: list[tuple[str, dict]] = []
-    docs = {"n": 0}
-
-    def fake_dispatch(tool: str, args: dict):
-        calls_made.append((tool, dict(args or {})))
-        if tool == "new_part":
-            docs["n"] += 1
-            return {
-                "ok": True,
-                "doc_id": f"doc-airframe-{docs['n']:04d}",
-                "name": (args or {}).get("name") or "part",
-            }
-        if tool == "add_features":
-            assert args.get("doc_id"), args
-            assert isinstance(args.get("ops"), list) and args["ops"], args
-            # Airframe body must include body tube / bay class features.
-            types = [
-                (op.get("feature") or {}).get("type")
-                for op in args["ops"]
-                if isinstance(op, dict)
-            ]
-            assert "cylinder" in types or "box" in types, types
-            return {"ok": True, "doc_id": args.get("doc_id"), "n_ops": len(args["ops"])}
-        return {"ok": False, "error": f"unexpected tool {tool}"}
-
-    led = _FakeLedger(events=list(raw.get("events") or []), run_id="mega20-replay")
-    gate = at.mech_deliver_gate(
-        led,
-        manifest=man,
-        dispatch=fake_dispatch,
-        actor="test",
-        run_id="mega20-replay",
-        force=True,
-    )
-    assert gate["forced"] is True, gate
-    assert gate["ok"] is True, gate
-    assert gate["allow_deliver"] is True, gate
-    assert gate["refusal"] is None, gate
-    tools = [t for t, _ in calls_made]
-    assert tools[:2] == ["new_part", "add_features"], tools
-    assert gate["doc_id"] and str(gate["doc_id"]).startswith("doc-airframe-")
-
-    # Logged force inject + tool_call events on ledger.
-    events = [e.get("payload", {}).get("event") for e in led.events]
-    assert "mech_chain_force_inject" in events
-    forced_tools = [
-        e["payload"]["tool"]
-        for e in led.events
-        if e.get("payload", {}).get("event") == "tool_call"
-        and e.get("payload", {}).get("forced")
-    ]
-    assert "new_part" in forced_tools and "add_features" in forced_tools
-
-
-def test_mech_deliver_gate_caps_one_force_then_refuses():
-    """Second deliver with still-zero mech → typed refusal (no infinite force)."""
-    from services.agent import agent_turn as at
-
-    at._MECH_FORCE_ONCE.clear()
-    rid = "mega21-cap-test"
-
-    def boom_dispatch(tool: str, args: dict):
-        # Force path runs but add_features fails → still missing after force.
-        if tool == "new_part":
-            return {"ok": True, "doc_id": "doc-x"}
-        if tool == "add_features":
-            return {"ok": False, "error": "engine refused"}
-        return {"ok": False, "error": "nope"}
-
-    led = _FakeLedger(run_id=rid)
-    g1 = at.mech_deliver_gate(
-        led, dispatch=boom_dispatch, run_id=rid, force=True,
-    )
-    assert g1["forced"] is True
-    assert g1["allow_deliver"] is False
-    assert g1["refusal"] and "mech" in g1["refusal"].lower()
-
-    # Second call: force already spent → refusal without re-dispatch.
-    calls = {"n": 0}
-
-    def count_dispatch(tool, args):
-        calls["n"] += 1
-        return {"ok": False, "error": "should not run"}
-
-    g2 = at.mech_deliver_gate(
-        led, dispatch=count_dispatch, run_id=rid, force=True,
-    )
-    assert g2["forced"] is False
-    assert g2["allow_deliver"] is False
-    assert g2["refusal"] and "after_force" in g2["refusal"]
-    assert calls["n"] == 0
-
-
-def test_mech_deliver_gate_noop_when_mech_present():
-    """Existing new_part+add_features → allow deliver, no force."""
-    from services.agent import agent_turn as at
-
-    at._MECH_FORCE_ONCE.clear()
-    led = _FakeLedger(events=[
-        {
-            "kind": "agent_turn",
-            "payload": {
-                "event": "tool_call",
-                "tool": "new_part",
-                "ok": True,
-                "args": {"name": "airframe"},
-                "result": {"ok": True, "doc_id": "d1"},
-            },
-        },
-        {
-            "kind": "agent_turn",
-            "payload": {
-                "event": "tool_call",
-                "tool": "add_features",
-                "ok": True,
-                "args": {"doc_id": "d1", "ops": [{"op": "add_feature"}]},
-                "result": {"ok": True, "doc_id": "d1"},
-            },
-        },
-    ], run_id="has-mech")
-    calls = {"n": 0}
-
-    def disp(tool, args):
-        calls["n"] += 1
-        return {"ok": True}
-
-    g = at.mech_deliver_gate(led, dispatch=disp, run_id="has-mech", force=True)
-    assert g["had_mech"] is True
-    assert g["allow_deliver"] is True
-    assert g["forced"] is False
-    assert calls["n"] == 0
-
-
-def test_airframe_ops_cover_brief_dims():
-    """Forced ops encode body tube / bay / fins / wing from role-card dims."""
-    from services.agent.agent_turn import (
-        _airframe_build_ops, _airframe_spec_from_manifest,
-    )
-
-    man = _load_mega20_manifest()
-    spec = _airframe_spec_from_manifest(man)
-    assert spec["body_od_mm"] >= 40.0
-    assert spec["body_len_mm"] >= 300.0
-    assert spec["bay_l_mm"] >= 50.0
-    ops = _airframe_build_ops(spec)
-    names = [
-        (op.get("feature") or {}).get("name")
-        for op in ops if isinstance(op, dict)
-    ]
-    assert "body_tube" in names
-    assert "payload_bay" in names
-    assert "wing" in names
-    assert sum(1 for n in names if n and n.startswith("fin_")) >= 3
-
-
-# The mech deliver gate's own contract is covered three times above
-# (test_mech_deliver_gate_fires_on_mega20_ledger / _caps_one_force_then_refuses /
-# _noop_when_mech_present) and once in test_mega22_fixes. A fourth test,
-# `test_loop_deliver_gate_blocks_zero_mech`, claimed to cover the loop's terminal status
-# MAPPING and was removed 2026-08-05: its subject
-# (`services/agent/loop.py::_drive_phases_from_dag`) was deleted with the Python loop, and what it
-# actually asserted was a tautology — it monkeypatched `mech_deliver_gate` to return
-# allow_deliver=False, re-implemented the status mapping inside the test body
-# (`status = "blocked"`), then asserted `status == "blocked"`. It imported `loop`,
-# `PhaseMachine`, a graph, a dag_result and a `fake_phase_completion` and used none of
-# them, so no plausible bug in any product code could have failed it.
-
-
-# ---------------------------------------------------------------------------
 # N21 — AC5 net resolution
 # ---------------------------------------------------------------------------
 
@@ -288,17 +84,17 @@ def test_resolve_measure_net_falls_to_source_vin_path():
             "tool": "ecad_place_symbol",
             "ok": True,
             "args": {
-                "libid": "Simulation_SPICE:V_source",
+                "libid": "Simulation_SPICE:VDC",
                 "ref": "VIN",
                 "value": "7.4",
             },
             "result": {
                 "ok": True,
                 "ref": "VIN",
-                "libid": "Simulation_SPICE:V_source",
+                "libid": "Simulation_SPICE:VDC",
                 "pins": [
-                    {"number": "+", "name": "+", "net": "N$2"},
-                    {"number": "-", "name": "-", "net": "GND"},
+                    {"number": "1", "name": "", "net": "N$2"},
+                    {"number": "2", "name": "", "net": "GND"},
                 ],
             },
         },
@@ -306,13 +102,13 @@ def test_resolve_measure_net_falls_to_source_vin_path():
             "tool": "ecad_wire",
             "ok": True,
             "args": {
-                "from_ref": "VIN", "from_pin": "+",
+                "from_ref": "VIN", "from_pin": "1",
                 "to_ref": "R1", "to_pin": "1",
             },
             "result": {
                 "ok": True,
                 "net": "N$2",
-                "net_members": ["R1.1", "VIN.+"],
+                "net_members": ["R1.1", "VIN.1"],
                 "net_size": 2,
             },
         },
@@ -338,8 +134,48 @@ def test_resolve_measure_net_falls_to_source_vin_path():
     assert r["source"] in ("source_injected", "source_net_arg", "first_nongnd"), r
 
 
+def test_resolve_measure_net_uses_numbered_positive_pin_without_top_level_net():
+    from services.agent.agent_turn import resolve_measure_net
+
+    for libid in ("Simulation_SPICE:VDC", "Simulation_SPICE:VSIN", "Simulation_SPICE:VPULSE"):
+        calls = [{
+            "tool": "ecad_place_symbol", "ok": True,
+            "args": {"libid": libid, "ref": "X1"},
+            "result": {
+                "ref": "X1", "libid": libid,
+                "pins": [
+                    {"number": "2", "name": "", "net": "GND"},
+                    {"number": "1", "name": "", "net": "N$2"},
+                ],
+            },
+        }]
+        result = resolve_measure_net(calls=calls)
+        assert result["net"] == "N$2", (libid, result)
+        assert result["source"] == "source_injected", (libid, result)
+
+
+def test_resolve_measure_net_ignores_source_return_wire():
+    from services.agent.agent_turn import resolve_measure_net
+
+    calls = [
+        {
+            "tool": "ecad_wire", "ok": True,
+            "args": {"from_ref": "V1", "from_pin": "1", "to_ref": "R1", "to_pin": "1"},
+            "result": {"net": "N$2"},
+        },
+        {
+            "tool": "ecad_wire", "ok": True,
+            "args": {"from_ref": "V1", "from_pin": "2", "to_ref": "R1", "to_pin": "2"},
+            "result": {"net": "GND"},
+        },
+    ]
+    result = resolve_measure_net(calls=calls)
+    assert result["net"] == "N$2", result
+    assert result["source"] == "source_injected", result
+
+
 def test_resolve_from_mega20_ledger_fixture():
-    """Live mega-20 ledger → resolved net is source/VIN path, not bare 3V3."""
+    """Resolve a source/VIN residual to its net, not bare 3V3."""
     from services.agent.agent_turn import resolve_measure_net_from_ledger
 
     raw = _load_mega20_ledger()
@@ -367,21 +203,21 @@ def test_forced_simulate_args_use_resolved_probe():
         {
             "tool": "ecad_place_symbol",
             "ok": True,
-            "args": {"libid": "Device:V", "ref": "V1", "value": "DC 3.3"},
+            "args": {"libid": "Simulation_SPICE:VDC", "ref": "V1", "value": "3.3"},
             "result": {
                 "ok": True,
                 "ref": "V1",
-                "libid": "Device:V",
+                "libid": "Simulation_SPICE:VDC",
                 "pins": [
-                    {"number": "+", "net": "VIN"},
-                    {"number": "-", "net": "GND"},
+                    {"number": "1", "name": "", "net": "VIN"},
+                    {"number": "2", "name": "", "net": "GND"},
                 ],
             },
         },
         {
             "tool": "ecad_wire",
             "ok": True,
-            "args": {"from_ref": "V1", "from_pin": "+", "to_ref": "R1", "to_pin": "1"},
+            "args": {"from_ref": "V1", "from_pin": "1", "to_ref": "R1", "to_pin": "1"},
             "result": {"ok": True, "net": "VIN", "net_size": 2},
         },
     ]
@@ -469,12 +305,13 @@ def test_ac5_evidence_carries_resolved_net(monkeypatch):
         "event": "tool_call",
         "tool": "ecad_place_symbol",
         "ok": True,
-        "args": {"libid": "Device:V", "ref": "V1"},
+        "args": {"libid": "Simulation_SPICE:VDC", "ref": "V1"},
         "result": {
             "ok": True,
             "ref": "V1",
-            "libid": "Device:V",
-            "pins": [{"number": "+", "net": "VIN"}, {"number": "-", "net": "GND"}],
+            "libid": "Simulation_SPICE:VDC",
+            "pins": [{"number": "1", "name": "", "net": "VIN"},
+                     {"number": "2", "name": "", "net": "GND"}],
         },
     })
 
@@ -510,25 +347,3 @@ def test_ac5_evidence_carries_resolved_net(monkeypatch):
     assert "vin" in str(evidence.get("resolved_net")).lower() or evidence.get(
         "resolved_net"
     )
-
-
-# ---------------------------------------------------------------------------
-# Airframe ops pure unit (no engine)
-# ---------------------------------------------------------------------------
-
-
-def test_mech_has_part_requires_both_tools():
-    from services.agent.agent_turn import _mech_has_part_artifact
-
-    assert _mech_has_part_artifact([]) is False
-    assert _mech_has_part_artifact([
-        {"tool": "new_part", "ok": True, "result": {"doc_id": "d"}},
-    ]) is False
-    assert _mech_has_part_artifact([
-        {"tool": "new_part", "ok": True, "result": {"doc_id": "d"}},
-        {"tool": "add_features", "ok": True, "result": {"ok": True}},
-    ]) is True
-    assert _mech_has_part_artifact([
-        {"tool": "new_part", "ok": True, "result": {"doc_id": "d"}},
-        {"tool": "add_features", "ok": False, "result": {"ok": False}},
-    ]) is False

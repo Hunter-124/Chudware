@@ -21,7 +21,7 @@ def exchange_daemon():
         scratch = Path(directory)
         with pytest.MonkeyPatch.context() as patch:
             patch.setenv("CHUDWARE_ENGINE_DAEMON", "1")
-            patch.setenv("CHUDWARE_CHUDCODE_BIN", str(scratch / "no-model-runtime"))
+            patch.setenv("CHUDWARE_OMP_BIN", str(scratch / "no-model-runtime"))
             spawned = private_hostd.spawn_private_daemon(scratch)
             assert spawned is not None, private_hostd.last_failure
             process, socket_path, key = spawned
@@ -32,10 +32,9 @@ def exchange_daemon():
             # socket environment alone would leave existing thread clients attached
             # to the package daemon and its unrelated documents.
             patch.setattr(daemon_bridge, "client", lambda: connection)
-            patch.setattr(C, "_TOUCHED_DOCS", [])
+            patch.setattr(C, "_TOUCHED_DOCS", {})
             patch.setattr(C, "_PROCESS_DOCS", set())
             patch.setattr(C, "_DOC_ALIASES", {})
-            patch.setattr(C, "_DISCARDED_DOCS", {})
             patch.setattr(C, "_HARNESS_SAVED_PATHS", {})
             patch.setattr(cb, "_FOREIGN_EDITS_PENDING", {})
             try:
@@ -122,17 +121,47 @@ def test_nested_reference_export_is_complete_or_refuses(tmp_path, docs):
     # A descendant disappears WITHOUT editing the parent. No old cache may certify it.
     leaf_path.unlink()
     for fmt in ("step", "step+"):
+        destination = tmp_path / ("incomplete." + fmt)
         refused, _ = _call("export_part", {"doc_id": parent, "fmt": fmt,
-                                             "path": str(tmp_path / ("incomplete." + fmt))})
+                                             "path": str(destination)})
         assert refused.get("ok") is False, refused
         assert "wheel-module" in json.dumps(refused)
         assert str(child_path) in json.dumps(refused)
         assert not refused.get("validated")
+        assert not destination.exists()
     target = new_doc(docs)
     open_ids = {d["doc_id"] for d in cb.call("doc_list", {})["docs"]}
     refused, _ = _call("import_part", {"path": str(child_path), "into": target})
     assert refused["ok"] is False
     assert {d["doc_id"] for d in cb.call("doc_list", {})["docs"]} == open_ids
+
+
+@pytest.mark.parametrize("kind", ["part", "assembly"])
+def test_empty_document_save_and_native_export_only_query_part_references(
+        tmp_path, docs, monkeypatch, kind):
+    did = new_doc(docs, kind)
+    real_call = cb.call
+    reference_calls = []
+
+    def tracking_call(method, params=None):
+        if method == "doc_mesh_ref_list":
+            reference_calls.append(params["doc_id"])
+            assert kind == "part", "assembly save/export must not call the part-only RPC"
+        return real_call(method, params)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cb, "call", tracking_call)
+        destination = tmp_path / f"empty-{kind}-saved.step+"
+        saved, _ = _call("save_part", {"doc_id": did, "path": str(destination)})
+        assert saved["ok"] is False and saved["reason"] == "no_bodies_empty_document", saved
+        assert not destination.exists()
+        for fmt in ("step+", "stepplus", "stp+", "native"):
+            destination = tmp_path / f"empty-{kind}-{fmt}.step+"
+            exported, _ = _call("export_part", {"doc_id": did, "fmt": fmt,
+                                                  "path": str(destination)})
+            assert exported["ok"] is False and exported["reason"] == "no_bodies_empty_document", exported
+            assert not destination.exists()
+    assert reference_calls == ([did] * 5 if kind == "part" else [])
 
 
 def test_owner_map_complete_and_identical_across_five_reads(docs):
@@ -152,14 +181,14 @@ def test_owner_map_complete_and_identical_across_five_reads(docs):
         assert len(entry["edges"]) == 12
 
 
-def test_native_imports_are_independent_and_resume_is_explicit(tmp_path, docs):
+def test_native_imports_are_independent_when_copy_requested(tmp_path, docs):
     source = new_doc(docs)
     box(source)
     path = tmp_path / "source.step+"
     cb.call("doc_save", {"doc_id": source, "path": str(path)})
     imports = []
     for _ in range(2):
-        result, _ = _call("import_part", {"path": str(path)})
+        result, _ = _call("import_part", {"path": str(path), "copy": True})
         assert result["ok"], result
         imports.append(result["doc_id"])
         docs.append(result["doc_id"])
@@ -226,7 +255,7 @@ def test_cyclic_native_references_refuse_without_waiting_on_the_cache(tmp_path, 
     assert not (tmp_path / "cycle.step").exists()
 
 
-def test_detached_native_import_is_reproducible_and_saves_edits_in_place(
+def test_detached_native_import_is_reproducible_and_edits_save_separately(
         tmp_path, docs, monkeypatch):
     from services.mcp import cad_common as C
 
@@ -242,10 +271,10 @@ def test_detached_native_import_is_reproducible_and_saves_edits_in_place(
     cb.call("doc_close", {"doc_id": source})
     docs.remove(source)
 
-    imported, _ = _call("import_part", {"path": str(destination)})
+    imported, _ = _call("import_part", {"path": str(destination), "copy": True})
     did = imported["doc_id"]
     docs.append(did)
-    monkeypatch.setattr(C, "_TOUCHED_DOCS", [did])
+    monkeypatch.setattr(C, "_TOUCHED_DOCS", {})
     before = destination.read_bytes()
     cb.call("eval_mass", {"doc_id": did})
     _call("verify_battery", {"doc_id": did})
@@ -255,8 +284,8 @@ def test_detached_native_import_is_reproducible_and_saves_edits_in_place(
     assert row["native_source_edited"] is False
     assert row["reproducible_from"] == [str(destination)]
     swept = C.save_touched_docs()
-    assert any(e["doc_id"] == did and e["reason"] == "reproducible_import"
-               for e in swept["skipped"])
+    assert swept["saved"] == []
+    assert swept["errors"] == []
     assert destination.read_bytes() == before
     assert not list(tmp_path.glob("*.step+"))
     # Unedited provenance is reproducible scratch, not source-overwrite authority.
@@ -267,19 +296,34 @@ def test_detached_native_import_is_reproducible_and_saves_edits_in_place(
     assert detached_path.is_file()
     assert destination.read_bytes() == before
 
-    # Non-study authored changes retain automatic source-save behavior.
-    again, _ = _call("import_part", {"path": str(destination)})
+    # Authoring a detached import creates another file; provenance remains read-only.
+    again, _ = _call("import_part", {"path": str(destination), "copy": True})
     edited = again["doc_id"]
     docs.append(edited)
     original_com = cb.call("eval_mass", {"doc_id": edited})["com"]
     moved, _ = _call("add_features", {"doc_id": edited, "ops": [
         {"type": "transform", "body": "f1", "translate": [40, 0, 0]}]})
     assert moved["ok"], moved
-    assert moved["saved_path"] == str(destination)
-    assert list(tmp_path.glob("*.step+")) == [detached_path]
-    reopened = cb.call("doc_open", {"path": str(destination)})["doc_id"]
+    authored_path = Path(moved["saved_path"])
+    assert authored_path != destination
+    assert authored_path != detached_path
+    assert destination.read_bytes() == before
+    reopened = cb.call("doc_open", {"path": str(authored_path)})["doc_id"]
     docs.append(reopened)
     assert cb.call("eval_mass", {"doc_id": reopened})["com"] == pytest.approx(
+        [original_com[0] + 40, *original_com[1:]])
+
+    # Explicitly resuming the original binds it for intentional in-place edits.
+    resumed, _ = _call("import_part", {"path": str(destination), "resume": True})
+    bound = resumed["doc_id"]
+    docs.append(bound)
+    moved_bound, _ = _call("add_features", {"doc_id": bound, "ops": [
+        {"type": "transform", "body": "f1", "translate": [40, 0, 0]}]})
+    assert moved_bound["ok"], moved_bound
+    assert moved_bound["saved_path"] == str(destination)
+    reopened_bound = cb.call("doc_open", {"path": str(destination)})["doc_id"]
+    docs.append(reopened_bound)
+    assert cb.call("eval_mass", {"doc_id": reopened_bound})["com"] == pytest.approx(
         [original_com[0] + 40, *original_com[1:]])
 
 

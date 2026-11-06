@@ -18,7 +18,7 @@ LANE A — YOU ALREADY HAVE GEOMETRY
 Turn an imported STEP/mesh body into an EDITABLE parametric feature tree, verified against the
 source solid by boolean comparison. Deterministic recognition first; a learned model is
 considered only after a measured residual (GEOMETRY_LLM_REPRESENTATION_REVIEW §3.4/§3.6) — and
-the heuristics NEVER hide evidence: unclaimed source faces are always listed.
+the heuristics NEVER hide evidence: unclaimed source faces are saved in a complete artifact.
 
 THE ONE-CALL PATH
   reverse_engineer(source) — source is a file path (STEP/IGES/BREP/STL/OBJ/…) or the doc_id of
@@ -58,7 +58,8 @@ READING THE RESULT
   unexplained   missing_mm3 (source material the rebuild lacks), extra_mm3 (rebuild material
                 the source never had), and up to 10 residual REGIONS with centers — go look
                 exactly there.
-  recognition.unclaimed  source faces no pass claimed — hover(sid) them on the ref doc.
+  recognition.unclaimed        up to 100 example source faces; hover(sid) on the ref doc.
+  recognition.unclaimed_count  total unclaimed faces; recognition.unclaimed_path holds all records.
 
 MANUAL PRIMITIVES (when the one-call path is not enough)
   compare_parts(doc_a, doc_b)          the same boolean verdict for ANY two docs. doc_a is the
@@ -164,7 +165,10 @@ STEP 3 — CAPTURE
     Flip the part and shoot a second set for the underside.
   Feeding the session:
   reveng_add_images(session_id, paths=[...] | dir=...)     stills from any source, incl. webcam
-  reveng_add_video(session_id, path, max_frames=120)       a slow orbit video, decimated
+  reveng_add_video(session_id, path, max_frames=120)       asynchronous frame extraction; poll session.run
+  reveng_import_splat(path, session_id?)                   import Gaussian PLY / .splat / .spz / .ksplat
+  reveng_convert_splat(path, out_format, out_path?)        convert supported encodings; inspect losses
+  reveng_splat_to_mesh(path_or_session)                    approximate surface, never a metrology guarantee
   reveng_ingest_datasheet(session_id, path)                PDF/image datasheet → tables + crops
                                                            (the fastest lane when the part is a
                                                            catalog item — no photogrammetry)
@@ -180,19 +184,24 @@ STEP 3 — CAPTURE
 
 STEP 4 — RECONSTRUCT
   reveng_reconstruct(session_id, quality="draft"|"normal"|"high", backend?) → run_id
+  For the separate Gaussian job: reveng_start_splat(session_id, mode="object", live=False),
+  poll reveng_splat_status(session_id), then reveng_finish_splat(session_id) to request the
+  final pass and continue polling until done or failed. Brush exports splats, not a mesh.
+  reveng_splat_to_mesh(session_id, method="auto") uses Gaussian-depth TSDF only when matching
+  undistorted training poses are proven; without them it returns a Poisson fallback and
+  fallback_reason. method="poisson" explicitly selects the center-based method. Both are
+  approximate: examine the mesh for sheets/holes and independently measure critical features.
   What the stages mean:
   * SPARSE — structure-from-motion (COLMAP). Solves where each camera was and produces a sparse
-    point cloud. This is the step that decides whether the whole session is usable: if fewer
-    than 60% of your images register, the pipeline falls back to a feed-forward model
-    (VGGT / MapAnything) which recovers a pose+point estimate from hard image sets.
-    Persistently low registration = go re-shoot with more overlap, not more compute.
-  * DENSE — OpenMVS turns the posed sparse model into a dense point cloud and a watertight,
-    textured mesh. This is the surface you will actually fit primitives to.
-  * SPLAT — Brush trains a 3D Gaussian Splat instead, then exports a mesh. Better on shiny and
-    thin/fine detail; heavier, needs a GPU. Alternative to DENSE, not a step after it.
-  * CLEANUP — outlier removal, hole filling and decimation on whichever mesh came out.
-  Neither dense nor splat is available unless you provisioned the backend — reveng_status()
-  first, and expect an honest `backend_not_provisioned` envelope rather than a fake mesh.
+    point cloud. If fewer than 60% register, a feed-forward fallback is attempted but only
+    accepted when it provides a usable COLMAP point cloud as well as poses. Poses alone cannot
+    train the splat or reconstruct a surface. Persistently low registration means re-shoot.
+  * DENSE — OpenMVS turns the posed model into a measurement mesh when installed.
+  * SPLAT — Brush trains a visual Gaussian cloud on the SAME SfM dataset; it does not export a
+    mesh. The TSDF or Poisson splat-derived surface is approximate and can differ substantially
+    from the real object, especially on unseen or reflective surfaces.
+  * CLEANUP — remove mesh defects and apply the same persisted similarity transform used for
+    the splat, sparse points and cameras. Scale and feature accuracy still require verification.
 
   SINGLE-PHOTO TIER — reveng_single_photo(session_id, tier="triposr"|"trellis")
   One image → a plausible-looking mesh. It is force-tagged `approximate`. It is a REFERENCE /
@@ -205,20 +214,31 @@ STEP 5 — SET AND CONFIRM SCALE  ← the step that decides if the CAD is real
   reveng_set_scale(session_id, method, params)
     "aruco_mat"  params {images?: [...], board?: "A4"|"Letter"}   preferred: triangulates the
                  printed markers across the posed views.
-    "two_point"  params {image, p1:[x,y], p2:[x,y], distance_mm}  one caliper measurement you
-                 took between two points you can click in one image.
-    "known_dim"  params {feature, value_mm, source}               a dimension you know for
-                 certain (a bearing bore, a standard thread OD).
+    "two_point"  params {image, p1:[x,y], p2:[x,y], distance_mm, image_space:"undistorted"}
+                 — click the paired undistorted dataset image, not the original distorted frame.
+    "known_dim"  params {feature, value_mm, recon_length, source} — the real feature length
+                 divided by its length in reconstruction units. Alternatively pass point_a
+                 and point_b as 3D reconstruction coordinates. A physical mm value by itself
+                 is not a scale factor.
+                 Choose two independently identifiable observations of the SAME physical
+                 feature endpoints in the sparse/mesh native gauge, not a PCA span or bounding
+                 box guessed from noisy Gaussian centers. Use reveng_sparse_preview before
+                 confirmation (points are native); after confirmation invert its recon_transform.
+                 If corresponding endpoints cannot be identified, do not invent a scale.
   HUMAN SCALE-CONFIRM GATE. The session will not proceed until a person accepts the scale.
   Do not wave it through: every downstream dimension is this number multiplied by a shape.
   Sanity-check it against a caliper reading on a feature you did NOT use to set it.
+  Before fitting/rebuilding, call reveng_align_axes(session_id, method="planes"|"pca"|"manual").
+  Planes uses orthogonal fit hints or mesh faces and falls back to PCA; manual rotation is a
+  proper 3×3 native-to-world matrix. These axes are suggestions, not verified part datums.
+  Alignment, remeshing or recalibration invalidates old fits and model: fit again afterward.
 
 STEP 6 — FIT PRIMITIVES
-  reveng_fit_primitives(session_id) → fits
-  RANSAC over the mesh: planes, cylinders, spheres and cones, plus cross-sections, and a
-  hole-vs-boss role for every cylinder (is this a bore you drill, or a spigot you turn?).
-  Read the fits before you build — a cylinder classified as a boss when it is really a
-  counterbore produces a solid model with material in the wrong place.
+  reveng_fit_primitives(session_id, approximate=False) → fits. Confirm scale first; exploratory
+  unscaled fits require approximate=True and cannot be interpreted as millimetres.
+  RANSAC reports per-fit residuals, uncertainty caveats, planes, cylinders, spheres and cones.
+  Read the fits before you build — a bore classified as a boss produces the wrong solid.
+  Independently measure critical features; inlier RMS is not dimensional uncertainty.
 
 STEP 7 — REVIEW THE DIMENSIONS
   list_reveng_dims(session_id)                the dimensions the pipeline wants you to confirm
@@ -235,10 +255,10 @@ STEP 7 — REVIEW THE DIMENSIONS
   A ±5% dimension on a 20 mm bore is ±1 mm. That is not a press fit. Confirm it.
 
 STEP 8 — BUILD THE PARAMETRIC MODEL
-  reveng_build_parametric(session_id, strategy?) → run_id
-  Turns the fitted primitives + confirmed dimensions into a real feature tree (sketches,
-  extrudes, revolves, holes, patterns) — editable CAD, not a decorated mesh. If it cannot
-  explain the shape it falls back to a mesh body and says so; it does not fake features.
+  reveng_build_parametric(session_id, strategy?) attempts editable features from the fits.
+  Inspect `features` and `describe_part` actual bodies, plus `summary` and unclaimed records;
+  never infer a valid model from ok/state/scored alone. No rebuilt feature or no body returns
+  ok:false, reason:"no_features_rebuilt", and no score; it is not a mesh fallback.
 
 STEP 9 — VERIFY
   get_reveng_deviation(session_id)     modeled-vs-scan deviation: where and by how much the
@@ -273,9 +293,9 @@ REQUIREMENTS / AVAILABILITY — LANE B ONLY
   are ABSENT in a stock install. They are discovered at call time from env vars (or PATH):
     COLMAP_BIN     sparse SfM (COLMAP). Also found as `colmap` on PATH. Without it: no sparse,
                    therefore no dense and no splat.
-    OPENMVS_BIN    dense point cloud + mesh (OpenMVS). AGPL-3.0 — install it yourself; we run it
-                   as a subprocess only and never bundle or link it.
-    BRUSH_BIN      3D Gaussian Splatting trainer + mesh export (Brush).
+    OPENMVS_BIN    dense point cloud + mesh (OpenMVS, AGPL-3.0, run as a subprocess). Installed by
+                   `python scripts/provision_reveng.py`; the env var / PATH override the managed copy.
+    BRUSH_BIN      3D Gaussian Splatting trainer (Brush); visual PLY only, not a mesh exporter.
     MESHROOM_BIN   an existing Meshroom install, used by the legacy photogrammetry path.
     VGGT_WEIGHTS   feed-forward pose/geometry fallback for hard image sets.
     TRIPOSR_WEIGHTS / TRELLIS_WEIGHTS   single-photo tier (approximate — see STEP 4).
@@ -309,7 +329,7 @@ LANE A (files / docs — nothing to install)
   project_into_sketch(sketch, refs)    append projected wires to an EXISTING sketch (one-shot).
   add_features(ops)                    hand-model a residual, or apply a recognizer candidate.
   describe_part() / hover(sid)         read the geometry as text (cad_guide('gsl')).
-  verify_battery(doc_id)               the done gate before you report a rebuild finished.
+  verify_battery(doc_id=doc_id)        the done gate before you report a rebuild finished.
 
 LANE B — READ (never mutates a session; safe to call any time)
   reveng_status()                      capabilities + provisioned backends. CALL THIS FIRST.
@@ -325,10 +345,12 @@ LANE B — WRITE (pipeline order)
   reveng_print_scale_mat(size)                    ArUco mat PDF — print at 100%, tape it flat.
   reveng_add_images(session_id, paths|dir)        stills from webcam / phone / camera.
   reveng_add_video(session_id, path, max_frames?) a slow orbit video, decimated to frames.
+  reveng_start_splat(session_id, ...); reveng_splat_status(session_id); reveng_finish_splat(session_id)
   reveng_ingest_datasheet(session_id, path)       PDF/image datasheet → tables + crops.
   reveng_reconstruct(session_id, quality, ...)    sparse → dense | splat → cleanup.
   reveng_single_photo(session_id, tier)           APPROXIMATE tier — preview shape only.
   reveng_set_scale(session_id, method, params)    aruco_mat | two_point | known_dim → SCALE GATE.
+  reveng_align_axes(session_id, method="planes"|"pca"|"manual", rotation?)  align before fitting.
   reveng_fit_primitives(session_id)               RANSAC planes/cylinders/spheres/cones + roles.
   reveng_build_parametric(session_id, strategy?)  fits + confirmed dims → editable feature tree.
   reveng_attach_result(session_id, part_ref)      register the model on a parts-hub entry.

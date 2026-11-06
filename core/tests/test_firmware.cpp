@@ -9,9 +9,12 @@
 // and when the tool IS present we skip the live leg instead of faking a pass.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "environment_test_support.h"
+#include "ecad/session.h"
 #include "firmware/bus_models.h"
 #include "firmware/emulator.h"
+#include "firmware/eng_rails.h"
 #include "firmware/firmware_rpc.h"
+#include "firmware/mcu_pinouts.h"
 #include "firmware/pinmap.h"
 #include "firmware/platform_db.h"
 #include "firmware/powerprofile.h"
@@ -97,7 +100,9 @@ bool emulator_timed_out(const json& r) {
 struct FirmwareRootGuard {
     fs::path dir;
     FirmwareRootGuard() {
-        dir = fs::temp_directory_path() /
+        // Resolve the OS-selected temp base before enforcing the no-symlink policy;
+        // on Darwin, TMPDIR commonly starts with the /var -> /private/var alias.
+        dir = fs::canonical(fs::temp_directory_path()) /
               ("chudware-fwtest-" + std::to_string(static_cast<long long>(
                    std::chrono::system_clock::now().time_since_epoch().count())));
         chudware::firmware::private_directory(dir);
@@ -155,6 +160,17 @@ json electrical_uart_scenario() {
 }
 
 }  // namespace
+
+TEST_CASE("KiCad timer and amplifier package variants retain engineering supply rails") {
+    for (const char* id : {"Timer:NE555D", "Timer:NE555P", "Amplifier_Operational:LM358"}) {
+        const auto rails = chudware::firmware::eng_supply_rails(json{{"libid", id}});
+        INFO(id);
+        REQUIRE(rails.size() == 1);
+        CHECK(rails[0]["name"] == (std::string(id).find("LM358") != std::string::npos ? "V+" : "VCC"));
+        CHECK(rails[0]["voltage_v_nom"] == 5.0);
+        CHECK(rails[0]["current_a_active"].is_number());
+    }
+}
 
 TEST_CASE("dispatch: unknown methods fall through") {
     json result;
@@ -302,6 +318,55 @@ TEST_CASE("fw_verify_board: clean demo board passes") {
     CHECK(r["fw_pins"]["PA5"].value("writes", 0) >= 1);
 }
 
+TEST_CASE("firmware resolves KiCad board and schematic paths after reopening") {
+    FirmwareRootGuard guard;
+    const auto board = guard.dir / "design.kicad_pcb";
+    const auto sch = guard.dir / "design.kicad_sch";
+    for (const auto& [fixture, target] :
+         {std::pair<fs::path, fs::path>{kData / "board_demo.json", board},
+          std::pair<fs::path, fs::path>{kData / "sch_clash.json", sch}}) {
+        const auto opened = chudware::ecad::ecad_open(fixture.string());
+        const auto id = opened["doc_id"].get<std::string>();
+        chudware::ecad::ecad_save(id, target.string());
+        chudware::ecad::ecad_close(id);
+    }
+    const auto resolved_board = chudware::firmware::resolve_board_doc(board.string());
+    const auto resolved_sch = chudware::firmware::resolve_board_doc(sch.string());
+    REQUIRE(resolved_board.is_object());
+    REQUIRE(resolved_sch.is_object());
+    CHECK(resolved_board["schema"] == "aicad.pcb/1");
+    CHECK(resolved_sch["schema"] == "aicad.sch/1");
+    CHECK_FALSE(resolved_board["footprints"].empty());
+    CHECK_FALSE(resolved_sch["symbols"].empty());
+    const auto result = call("fw_verify_board", {{"board_doc_ref", board.string()},
+                                                 {"sch_doc_ref", sch.string()},
+                                                 {"sources", kBlinkSrc}});
+    CHECK(result.value("ok", false));
+
+    const auto live = chudware::ecad::ecad_open(board.string());
+    const auto live_id = live["doc_id"].get<std::string>();
+    const auto project = call("fw_new_project", {{"name", "linked"},
+                                                  {"mcu_family", "stm32f4"},
+                                                  {"board_doc_ref", live_id}});
+    REQUIRE(project.contains("project_id"));
+    CHECK(project["project"]["board_doc_ref"] == fs::absolute(board).lexically_normal().string());
+    chudware::ecad::ecad_close(live_id);
+    const auto loaded = chudware::firmware::load(project["project_id"].get<std::string>());
+    REQUIRE(loaded.board_doc_ref);
+    CHECK(chudware::firmware::resolve_board_doc(*loaded.board_doc_ref).is_object());
+
+    const auto dirty = chudware::ecad::ecad_open(board.string());
+    const auto dirty_id = dirty["doc_id"].get<std::string>();
+    auto changed = dirty["tree"];
+    changed["name"] = "Unsaved board";
+    chudware::ecad::ecad_swap_doc(dirty_id, changed, -1, json::array());
+    const auto dirty_project = call("fw_new_project", {{"name", "dirty"},
+                                                        {"mcu_family", "stm32f4"},
+                                                        {"board_doc_ref", dirty_id}});
+    CHECK(dirty_project["project"]["board_doc_ref"] == dirty_id);
+    chudware::ecad::ecad_close(dirty_id);
+}
+
 TEST_CASE("fw_verify_board: unknown net, strap repurpose, missing decouple") {
     json src = {
         {"src/main.c",
@@ -351,6 +416,28 @@ TEST_CASE("fw_verify_board: direction clash needs the schematic pin types") {
     });
     auto rules = rules_of(r["findings"]);
     CHECK(rules.count("fw_direction_clash") == 1);
+}
+
+TEST_CASE("fw_verify_board uses linked KiCad schematic pin types") {
+    FirmwareRootGuard guard;
+    const auto board = guard.dir / "clash.kicad_pcb";
+    const auto sch = guard.dir / "clash.kicad_sch";
+    for (const auto& [fixture, target] :
+         {std::pair<fs::path, fs::path>{kData / "board_clash.json", board},
+          std::pair<fs::path, fs::path>{kData / "sch_clash.json", sch}}) {
+        const auto opened = chudware::ecad::ecad_open(fixture.string());
+        const auto id = opened["doc_id"].get<std::string>();
+        chudware::ecad::ecad_save(id, target.string());
+        chudware::ecad::ecad_close(id);
+    }
+    const json src = {{"src/main.c", "void f(void) { digitalWrite(PIN_PA0, 1); }\n"}};
+    auto result = call("fw_verify_board", {{"board_doc_ref", board.string()}, {"sources", src}});
+    REQUIRE(result.value("ok", false));
+    CHECK(rules_of(result["findings"]).count("fw_direction_clash") == 0);
+    result = call("fw_verify_board", {{"board_doc_ref", board.string()},
+                                       {"sch_doc_ref", sch.string()}, {"sources", src}});
+    REQUIRE(result.value("ok", false));
+    CHECK(rules_of(result["findings"]).count("fw_direction_clash") == 1);
 }
 
 TEST_CASE("fw_verify_board: dynamic pass over a trace artifact") {
@@ -767,8 +854,8 @@ TEST_CASE("Renode refuses unavailable timestamped GPIO observation") {
 
 TEST_CASE("backend process faults cannot become successful simulation") {
 #ifndef _WIN32
-    fs::path dir = fs::temp_directory_path() / "chudware-fault-emulator";
-    fs::create_directories(dir);
+    FirmwareRootGuard root;
+    const auto& dir = root.dir;
     fs::path qemu = dir / "qemu-system-arm";
     {
         std::ofstream script(qemu, std::ios::binary | std::ios::trunc);
@@ -804,11 +891,10 @@ TEST_CASE("backend process faults cannot become successful simulation") {
     else
         chudware::test::unsetEnvironment("PATH");
 
+    INFO(result.uart_log);
     CHECK(result.passed == false);
     CHECK(result.uart_log.find("emulator_fault: qemu-system-arm exited with code 7") == 0);
     CHECK(result.uart_log.find("synthetic-emulator-fault") != std::string::npos);
-    std::error_code ec;
-    fs::remove_all(dir, ec);
 #else
     CHECK(true);
 #endif

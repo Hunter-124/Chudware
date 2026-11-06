@@ -127,13 +127,16 @@ class TestWeakLocalTriggersLiveMerge:
 
     def test_no_local_results_triggers_live(self):
         index = FakeIndex([], coverage=(0, 2))
-        live = FakeLiveProvider("mcmaster", hits=[_live_stepper_hit("mcmaster")])
+        live = FakeLiveProvider("mcmaster", hits=[{
+            "part_id": "catalog:mcmaster::2-014", "domain": "catalog",
+            "title": "O-Ring 2-014", "source": "live",
+        }])
         hub = _make_hub(index, providers=[live])
 
         out = hub.search("o-ring 2-014", limit=20)
 
         assert live.calls, "live provider must run when local has zero hits"
-        assert any(r.get("part_id") == "catalog:mcmaster::nema17" for r in out)
+        assert any(r.get("part_id") == "catalog:mcmaster::2-014" for r in out)
 
 
 # ---------------------------------------------------------------------------
@@ -207,13 +210,13 @@ class TestCrossBoundaryDedupe:
     def test_richer_live_record_wins_over_sparse_local(self):
         sparse_local = {
             "part_id": "catalog:local::nema17", "domain": "catalog",
-            "title": "NEMA 17 Stepper Motor", "designation": "NEMA17",
+            "title": "NEMA 17 Stepper Motor", "designation": "NEMA17", "standard": "NEMA 17",
             "params": {}, "geometry_ref": None, "sourcing": [],
             "provenance": "test", "license": "test",
         }
         rich_live = {
             "part_id": "catalog:automationdirect::nema17", "domain": "catalog",
-            "title": "NEMA 17 Stepper Motor", "designation": "NEMA17",
+            "title": "NEMA 17 Stepper Motor", "designation": "NEMA17", "standard": "NEMA 17",
             "source": "live", "params": {},
             "geometry_ref": {"kind": "import_file", "path": "nema17.step"},
             "sourcing": [{"unit_price": 14.0, "product_url": "https://x/nema17",
@@ -242,7 +245,7 @@ class TestCrossBoundaryDedupe:
         }
         sparse_live = {
             "part_id": "catalog:mcmaster::6203", "domain": "bearing",
-            "title": "Deep-Groove Ball Bearing", "designation": "6203",
+            "title": "Deep-Groove Ball Bearing", "designation": "6203", "standard": "ISO 15",
             "source": "live", "params": {}, "geometry_ref": None, "sourcing": [],
             "provenance": "test", "license": "test",
         }
@@ -293,3 +296,64 @@ class TestNoticeStubsSurviveMerge:
         assert notice in out
         assert out[-1] == notice
         assert any(r["part_id"] == junk_local[0]["part_id"] for r in out)
+
+    def test_same_size_different_hardware_survives_notice(self):
+        rows = [
+            {"part_id": f"fastener:{standard}:M8", "domain": "fastener",
+             "title": title, "standard": standard, "designation": "M8",
+             "sourcing": []}
+            for standard, title in [
+                ("ISO 4762", "Socket screw"),
+                ("ISO 4032", "Hex nut"),
+                ("ISO 7089", "Washer"),
+            ]
+        ]
+        hub = _make_hub(FakeIndex(rows, coverage=(0, 2)))
+        notice = {"site": "slow", "reason": "timeout"}
+        hub._search_live = lambda *a, **kw: [notice]  # type: ignore[method-assign]
+
+        out = hub.search("M8 uncommon", limit=20)
+        assert [r["part_id"] for r in out[:-1]] == [r["part_id"] for r in rows]
+        assert all(not r.get("related_ids") for r in out[:-1])
+        assert out[-1] == notice
+
+    def test_equivalent_sources_are_preserved(self):
+        local = {"part_id": "fastener:ISO4762:M8", "domain": "fastener",
+                 "title": "Screw", "standard": "ISO 4762", "designation": "M8",
+                 "sourcing": [{"product_url": "https://local.invalid/screw"}]}
+        live = {"part_id": "fastener:vendor:M8", "domain": "fastener",
+                "title": "Screw", "standard": "ISO4762", "designation": "M8",
+                "sourcing": [{"product_url": "https://vendor.invalid/screw"}]}
+        hub = _make_hub(FakeIndex([local], coverage=(0, 2)))
+        hub._search_live = lambda *a, **kw: [live]  # type: ignore[method-assign]
+
+        out = hub.search("M8 uncommon", limit=20)
+        assert len(out) == 1
+        assert out[0]["sourcing"] == local["sourcing"] + live["sourcing"]
+
+    def test_related_ids_link_only_matching_standard_and_size(self):
+        first = {"part_id": "fastener:a", "domain": "fastener", "title": "Screw",
+                 "standard": "ISO 4762", "designation": "M8"}
+        second = {"part_id": "fastener:b", "domain": "fastener", "title": "Screw",
+                  "standard": "ISO4762", "designation": "M8"}
+        nut = {"part_id": "fastener:nut", "domain": "fastener", "title": "Nut",
+               "standard": "ISO 4032", "designation": "M8"}
+        hub = _make_hub(FakeIndex([first, second, nut], coverage=(1, 1)))
+
+        out = hub.search("M8", include_live=False)
+        by_id = {r["part_id"]: r for r in out}
+        assert by_id["fastener:a"]["related_ids"] == ["fastener:b"]
+        assert by_id["fastener:b"]["related_ids"] == ["fastener:a"]
+        assert not by_id["fastener:nut"].get("related_ids")
+
+    def test_offline_unknown_get_never_calls_live_provider(self):
+        calls = []
+
+        class LiveWithGet(FakeLiveProvider):
+            def get(self, part_id):
+                calls.append(part_id)
+                return None
+
+        hub = _make_hub(FakeIndex([], coverage=(0, 1)), [LiveWithGet("vendor")])
+        assert hub.get("catalog:vendor::unknown", include_live=False) is None
+        assert calls == []

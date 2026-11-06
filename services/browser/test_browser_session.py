@@ -188,6 +188,17 @@ def test_backoff_escalates_on_429_and_resets_on_ok(browser_mods):
     assert ratelimit.seconds_until_ready("siteB", min_interval=0.0) == 0.0
 
 
+def test_missing_status_does_not_clear_active_backoff(browser_mods):
+    profiles, ratelimit, _session = browser_mods
+    ratelimit.note_result("vendor", 429, retry_after_s=90)
+    before = profiles.load_meta("vendor")
+    ratelimit.note_result("vendor", None)
+    after = profiles.load_meta("vendor")
+    assert after["rl_cooldown_until"] == before["rl_cooldown_until"]
+    assert after["rl_consecutive_fails"] == before["rl_consecutive_fails"]
+    assert ratelimit.seconds_until_ready("vendor", min_interval=0) > 0
+
+
 def test_backoff_is_capped(browser_mods):
     _profiles, ratelimit, _session = browser_mods
     for _ in range(20):
@@ -349,7 +360,7 @@ def test_browser_fetch_surfaces_bot_wall_status(browser_mods):
     result = session.browser_fetch("https://example.com/part", "grabcad",
                                    _cef=_FakeCef(html="<html>Access Denied</html>", status=403))
     assert result["ok"] is False
-    assert result["reason"] == "bot_walled"
+    assert result["reason"] == "blocked"
 
 def test_browser_fetch_preserves_backend_bot_wall_reason(browser_mods):
     profiles, _ratelimit, session = browser_mods
@@ -357,7 +368,7 @@ def test_browser_fetch_preserves_backend_bot_wall_reason(browser_mods):
 
     class _BotWall:
         def fetch(self, *_args, **_kwargs):
-            return {"ok": False, "reason": "bot_walled", "status": 200}
+            return {"ok": False, "reason": "blocked", "status": 200}
 
     result = session.browser_fetch(
         "https://8020.net/catalogsearch/result/?q=bracket",
@@ -367,7 +378,7 @@ def test_browser_fetch_preserves_backend_bot_wall_reason(browser_mods):
         no_cache=True,
     )
     assert result["ok"] is False
-    assert result["reason"] == "bot_walled"
+    assert result["reason"] == "blocked"
 
 
 def test_browser_fetch_uses_driver_headless_client(browser_mods, monkeypatch):
@@ -406,7 +417,7 @@ def test_browser_fetch_returns_envelope_when_profile_exists(browser_mods):
     assert result["ok"] is True
     assert result["status"] == 200
     assert result["content"] == "<html>part page</html>"
-    assert result["session_profile_used"] == "grabcad"
+    assert result["session_profile_used"] == "cef_global"
     assert "fetched_ts" in result
     assert cef.fetched[-1] == "https://grabcad.com/part/1"
     # Rate-limit hit was recorded even though this call itself didn't need to wait.
@@ -448,17 +459,19 @@ def test_browser_interact_never_raises_on_daemon_error(browser_mods):
 
     class _Boom:
         def interact(self, *a, **k):
-            raise RuntimeError("daemon down")
+            raise ConnectionError("daemon down")
 
     result = session.browser_interact("https://www.mcmaster.com/91290A115/", "mcmaster",
                                       "js();", _cef=_Boom(), min_interval=0.0)
     assert result["ok"] is False
-    assert result["reason"] == "browser_interact_failed"
+    assert result["reason"] == "transport_failed"
 
 
-def test_browser_fetch_never_raises_on_navigation_error(browser_mods):
-    profiles, _ratelimit, session = browser_mods
+def test_browser_fetch_never_raises_on_navigation_error(browser_mods, monkeypatch):
+    profiles, ratelimit, session = browser_mods
     profiles.profile_dir("grabcad").mkdir(parents=True)
+    monkeypatch.setattr(ratelimit, "wait", lambda *a, **k: 0)
+    monkeypatch.setattr(session.time, "sleep", lambda _: None)
 
     class _Boom:
         def fetch(self, *a, **k):
@@ -467,7 +480,32 @@ def test_browser_fetch_never_raises_on_navigation_error(browser_mods):
     result = session.browser_fetch("https://grabcad.com/part/1", "grabcad",
                                    _cef=_Boom(), min_interval=0.0)
     assert result["ok"] is False
-    assert result["reason"] == "browser_fetch_failed"
+    assert result["reason"] == "transport_failed"
+
+
+def test_unexpected_backend_exception_is_not_reported_as_outage(browser_mods):
+    _profiles, _ratelimit, session = browser_mods
+    class Backend:
+        def fetch(self, *_args, **_kwargs):
+            raise ValueError("bad internal state")
+    result = session.browser_fetch("https://vendor.example/p", "vendor", _cef=Backend(),
+                                   no_cache=True, min_interval=0)
+    assert result["reason"] == "internal_error"
+    assert "bad internal state" in result["hint"]
+
+
+def test_public_network_policy_refusal_is_not_retried(browser_mods):
+    _profiles, _ratelimit, session = browser_mods
+    from services.net.safe_http import OutboundPolicyError
+    class Backend:
+        calls = 0
+        def fetch(self, *_args, **_kwargs):
+            self.calls += 1
+            raise OutboundPolicyError("destination is private")
+    backend = Backend()
+    result = session.browser_fetch("https://vendor.example/p", "vendor", _cef=backend,
+                                   no_cache=True, min_interval=0)
+    assert result["reason"] == "policy_refused" and backend.calls == 1
 
 
 def test_browser_fetch_rate_limits_between_calls(browser_mods, monkeypatch):
@@ -518,7 +556,7 @@ def test_browser_download_refuses_a_far_future_cooldown_promptly(browser_mods, t
 
     assert elapsed < _PROMPT_S, f"blocked for {elapsed:.1f}s instead of refusing"
     assert result["ok"] is False
-    assert result["reason"] == "cooldown_active"
+    assert result["reason"] == "rate_limited"
     assert result["policy_refusal"] is True and result["executed"] is False
     # retry_after_s is the real remaining cooldown, not a placeholder.
     assert _FAR_FUTURE_COOLDOWN_S - 5.0 < result["retry_after_s"] <= _FAR_FUTURE_COOLDOWN_S
@@ -548,14 +586,15 @@ def test_browser_fetch_and_interact_refuse_the_same_cooldown(browser_mods):
 
     assert elapsed < _PROMPT_S * 2, f"blocked for {elapsed:.1f}s instead of refusing"
     for result in (fetched, interacted):
-        assert result["ok"] is False and result["reason"] == "cooldown_active"
+        assert result["ok"] is False and result["reason"] == "rate_limited"
         assert result["retry_after_s"] > 0.0
 
 
-def test_ordinary_spacing_is_not_a_cooldown_refusal(browser_mods, tmp_path):
+def test_ordinary_spacing_is_not_a_cooldown_refusal(browser_mods, tmp_path, monkeypatch):
     """A plain inter-request window under the budget still fetches — the refusal is
     scoped to punishment cooldowns, so normal pacing is unchanged."""
-    _profiles, _ratelimit, session = browser_mods
+    _profiles, ratelimit, session = browser_mods
+    monkeypatch.setattr(ratelimit, "_fetch_robots_crawl_delay", lambda _origin: None)
     cef = _FakeCef()
     first = session.browser_download("https://grabcad.com/a.pdf", "grabcad",
                                      tmp_path / "dl" / "a.pdf", _cef=cef,
@@ -565,3 +604,163 @@ def test_ordinary_spacing_is_not_a_cooldown_refusal(browser_mods, tmp_path):
                                       min_interval=0.0)
     assert first["ok"] is True and second["ok"] is True
     assert len(cef.downloaded) == 2
+
+
+@pytest.mark.parametrize("op", ["fetch", "download"])
+@pytest.mark.parametrize("status,reason", [(429, "rate_limited"), (403, "blocked"),
+                                          (404, "not_found"), (401, "login_required")])
+def test_failures_preserve_http_status_and_retry_after(browser_mods, tmp_path, op, status, reason):
+    _profiles, _ratelimit, session = browser_mods
+    url = "https://vendor.example/part"
+    final = "https://vendor.example/redirect"
+
+    class Backend:
+        def fetch(self, *_args, **_kwargs):
+            return {"ok": False, "status": status, "retry_after": "75", "final_url": final}
+        download = fetch
+
+    if op == "fetch":
+        result = session.browser_fetch(url, "vendor", _cef=Backend(), no_cache=True, min_interval=0)
+    else:
+        result = session.browser_download(url, "vendor", tmp_path / "part.step",
+                                          _cef=Backend(), min_interval=0)
+    assert result == {"ok": False, "site": "vendor", "op": op, "reason": reason,
+                      "hint": result["hint"], "url": final, "status": status,
+                      "retry_after_s": 75.0, "ask_user": None}
+
+
+def test_structured_upstream_failure_retains_selection_details(browser_mods):
+    _profiles, _ratelimit, session = browser_mods
+    class Backend:
+        def fetch(self, *_args, **_kwargs):
+            return {"ok": False, "reason": "unsupported", "hint": "Select a member.",
+                    "candidates": ["one.step", "two.step"], "ask_user": "Which member?"}
+    result = session.browser_fetch("https://vendor.example/parts", "vendor", _cef=Backend(),
+                                   min_interval=0, no_cache=True)
+    assert result["reason"] == "unsupported"
+    assert result["candidates"] == ["one.step", "two.step"]
+    assert result["ask_user"] == "Which member?"
+
+
+@pytest.mark.parametrize("op", ["fetch", "download"])
+def test_transient_retries_are_bounded_and_back_off(browser_mods, monkeypatch, tmp_path, op):
+    _profiles, ratelimit, session = browser_mods
+    waits = []
+    monkeypatch.setattr(ratelimit, "wait", lambda *a, **k: 0)
+    monkeypatch.setattr(session.time, "sleep", waits.append)
+
+    class Backend:
+        calls = 0
+        def fetch(self, *_args, **_kwargs):
+            self.calls += 1
+            return {"ok": False, "status": 500}
+        download = fetch
+
+    backend = Backend()
+    url = "https://vendor.example/part"
+    if op == "fetch":
+        result = session.browser_fetch(url, "vendor", _cef=backend, no_cache=True, min_interval=0)
+    else:
+        result = session.browser_download(url, "vendor", tmp_path / "part.step",
+                                          _cef=backend, min_interval=0)
+    assert result["reason"] == "transport_failed" and result["status"] == 500
+    assert backend.calls == 3 and waits == [0.25, 0.5]
+
+
+def test_server_retry_after_survives_longer_local_cooldown(browser_mods, monkeypatch):
+    _profiles, ratelimit, session = browser_mods
+    waits = iter([0, session.COOLDOWN_WAIT_BUDGET_S + 5])
+    monkeypatch.setattr(ratelimit, "wait", lambda *a, **k: next(waits))
+    monkeypatch.setattr(session.time, "sleep", lambda _: None)
+    class Backend:
+        calls = 0
+        def fetch(self, *_args, **_kwargs):
+            self.calls += 1
+            return {"ok": False, "status": 503, "retry_after": "5"}
+    backend = Backend()
+    result = session.browser_fetch("https://vendor.example/p", "vendor", _cef=backend,
+                                   no_cache=True, min_interval=0)
+    assert result["status"] == 503 and result["retry_after_s"] == 5
+    assert result["cooldown_remaining_s"] == session.COOLDOWN_WAIT_BUDGET_S + 5
+    assert backend.calls == 1
+
+
+def test_transient_download_succeeds_on_retry(browser_mods, monkeypatch, tmp_path):
+    _profiles, ratelimit, session = browser_mods
+    monkeypatch.setattr(ratelimit, "wait", lambda *a, **k: 0)
+    monkeypatch.setattr(session.time, "sleep", lambda _: None)
+    class Backend:
+        calls = 0
+        def download(self, _url, dest):
+            from pathlib import Path
+            self.calls += 1
+            if self.calls == 1:
+                raise ConnectionResetError("connection reset")
+            Path(dest).write_bytes(b"real artifact")
+            return {"ok": True, "status": 200}
+    backend = Backend()
+    dest = tmp_path / "part.step"
+    result = session.browser_download("https://vendor.example/part.step", "vendor",
+                                      dest, _cef=backend, min_interval=0)
+    assert result["ok"] and backend.calls == 2
+    assert dest.read_bytes() == b"real artifact"
+
+
+@pytest.mark.parametrize("reason", ["captcha", "blocked", "policy_refused", "unsupported"])
+def test_challenge_and_policy_failures_are_never_retried(browser_mods, monkeypatch, reason):
+    _profiles, ratelimit, session = browser_mods
+    monkeypatch.setattr(ratelimit, "wait", lambda *a, **k: 0)
+    class Backend:
+        calls = 0
+        def fetch(self, *_args, **_kwargs):
+            self.calls += 1
+            return {"ok": False, "status": 503, "reason": reason}
+    backend = Backend()
+    result = session.browser_fetch("https://vendor.example/p", "vendor", _cef=backend,
+                                   no_cache=True, min_interval=0)
+    assert result["reason"] == reason and result["status"] == 503
+    assert backend.calls == 1
+
+
+def test_interact_routes_through_selected_backend_or_reports_unsupported(browser_mods, monkeypatch):
+    _profiles, _ratelimit, session = browser_mods
+    from services.browser import driver
+    selected = []
+    backend = _FakeCef()
+    monkeypatch.setattr(driver, "headless_client",
+                        lambda *, profile: selected.append(profile) or backend)
+    result = session.browser_interact("https://vendor.example/p", "vendor", "capture()",
+                                      min_interval=0)
+    assert result["ok"] and selected == ["vendor"] and backend.fetched
+
+    monkeypatch.setattr(driver, "headless_client", lambda *, profile: object())
+    result = session.browser_interact("https://other.example/p", "other", "capture()",
+                                      min_interval=0)
+    assert result["reason"] == "unsupported" and result["op"] == "interact"
+
+
+def test_interact_preserves_script_error_with_actual_dom(browser_mods):
+    _profiles, _ratelimit, session = browser_mods
+    class Backend:
+        def interact(self, *_args, **_kwargs):
+            return {"ok": True, "status": 200, "html": "<html>current DOM</html>",
+                    "script_error": "script failed"}
+    result = session.browser_interact("https://vendor.example/p", "vendor", "capture()",
+                                      _cef=Backend(), min_interval=0)
+    assert result["ok"] and result["content"] == "<html>current DOM</html>"
+    assert result["script_error"] == "script failed"
+
+
+def test_failed_download_keeps_existing_artifact(browser_mods, tmp_path):
+    _profiles, _ratelimit, session = browser_mods
+    dest = tmp_path / "part.step"
+    dest.write_bytes(b"old model")
+    class Backend:
+        def download(self, url, dest):
+            from pathlib import Path
+            Path(dest).write_bytes(b"new partial")
+            return {"ok": False, "status": 404}
+    result = session.browser_download("https://vendor.example/part.step", "vendor",
+                                      dest, _cef=Backend(), min_interval=0)
+    assert result["reason"] == "not_found"
+    assert dest.read_bytes() == b"old model"

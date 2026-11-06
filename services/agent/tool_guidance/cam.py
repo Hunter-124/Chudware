@@ -83,7 +83,8 @@ ENTRIES: dict[str, dict[str, Any]] = {
     # ------------------------------------------------------------------ generate / sim / post
     "cam_generate": {
         "prompt_note": (
-            "Run after all ops are added, before cam_simulate/cam_post — its "
+            "Needs a setup with stock first (cam_add_setup, cam_set_stock). Run after "
+            "all ops are added, before cam_simulate/cam_post — its "
             "warnings (e.g. tool too large for a pocket) beat simulation "
             "failures."
         ),
@@ -91,9 +92,10 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "cam_simulate": {
         "prompt_note": (
-            "Needs generated toolpaths — cam_generate first. Smaller "
-            "resolution = finer/slower; check_holder only flags when "
-            "holder geometry is defined."
+            "Needs a current part for gouge comparison; inspect gouge_evaluated and "
+            "gouge_reason before treating zero gouges as evidence. The comparison is a "
+            "top-down heightfield, not a full 3D collision check. Generate toolpaths first; "
+            "smaller resolution is finer/slower. check_holder needs holder geometry."
         ),
         "timeout_s": 600,
     },
@@ -184,6 +186,8 @@ ENTRIES: dict[str, dict[str, Any]] = {
     # ------------------------------------------------------------------ additive (3D print)
     "slice_part": {
         "prompt_note": (
+            "Before slicing, load cad_skill(name='design-for-manufacturability') "
+            "for the complete printing and media safety rules. "
             "The only way to make G-code: never download a slicer or hand-write "
             ".ini keys. Run dfm_check and fix fails first; report print_ready and "
             "gcode_check issues honestly. copies= repeats a part; parts=[{doc_id|path, "
@@ -220,6 +224,7 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "print_media_inventory": {
         "prompt_note": (
+            "First load cad_skill(name='design-for-manufacturability') for safe media delivery. "
             "Read-only; call it the moment a USB/SD delivery is asked for, and again after "
             "publishing. Compare its printable rows with the complete job set; the printer "
             "shows no timestamps, so never pick 'current' by mtime. Pass inventory_token to "
@@ -228,6 +233,7 @@ ENTRIES: dict[str, dict[str, Any]] = {
     },
     "publish_print_media": {
         "prompt_note": (
+            "First load cad_skill(name='design-for-manufacturability') for safe media delivery. "
             "The only way G-code goes onto printer media — never cp/fs_write it there. "
             "jobs = the COMPLETE project set of print_ready slice_part manifests; a job that "
             "is not print_ready goes on only when the user explicitly says to put it there "

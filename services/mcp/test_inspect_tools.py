@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -488,50 +489,6 @@ class TestCameraAndCrop:
         d = ct._camera_dir_for_target([], {"dir": [3, 0, 0]})
         assert d[0] == pytest.approx(1.0)
 
-    def test_crop_rect_frames_target(self, part_bbox):
-        # Target sits on the +Z top-front-left corner of the part.
-        target = {
-            "min": [-20.0, -15.0, 8.0],
-            "max": [-10.0, -5.0, 10.0],
-            "center": [-15.0, -10.0, 9.0],
-            "size": [10.0, 10.0, 2.0],
-        }
-        vd = (0.0, 0.0, 1.0)  # top view
-        rect = ct._crop_rect_for_target(part_bbox, target, vd,
-                                       margin=0.15, zoom_factor=1.5)
-        assert rect["method"] == "crop"
-        assert 0 <= rect["x0"] < rect["x1"] <= 512
-        assert 0 <= rect["y0"] < rect["y1"] <= 400
-        # Crop should be smaller than the full image (true close-up).
-        assert (rect["x1"] - rect["x0"]) < 512
-        assert (rect["y1"] - rect["y0"]) < 400
-        # Higher zoom → smaller crop window.
-        loose = ct._crop_rect_for_target(part_bbox, target, vd,
-                                        margin=0.15, zoom_factor=1.0)
-        tight = ct._crop_rect_for_target(part_bbox, target, vd,
-                                        margin=0.15, zoom_factor=3.0)
-        assert (tight["x1"] - tight["x0"]) <= (loose["x1"] - loose["x0"])
-        assert (tight["y1"] - tight["y0"]) <= (loose["y1"] - loose["y0"])
-
-    def test_crop_png_upscales(self, tmp_path):
-        src = str(tmp_path / "full.png")
-        _fake_png(src, size=(512, 400), color=(10, 20, 30))
-        # Paint a bright block in the crop region so we can assert content survived.
-        from PIL import Image as PILImage, ImageDraw
-        with PILImage.open(src) as im:
-            draw = ImageDraw.Draw(im)
-            draw.rectangle([100, 100, 150, 150], fill=(255, 0, 0))
-            im.save(src)
-        rect = {"x0": 100, "y0": 100, "x1": 150, "y1": 150, "method": "crop"}
-        out = str(tmp_path / "crop.png")
-        ct._crop_png_to_rect(src, rect, out, out_size=(512, 400))
-        assert os.path.exists(out)
-        with PILImage.open(out) as im:
-            assert im.size == (512, 400)
-            # Center of upscaled crop should be near the bright red fill.
-            px = im.getpixel((256, 200))
-            assert px[0] > 200 and px[1] < 50 and px[2] < 50
-
     def test_orbit_dirs_count_and_unit(self):
         dirs = ct._orbit_view_dirs((0.0, 0.0, 1.0), n=4)
         assert len(dirs) == 4
@@ -563,9 +520,8 @@ class TestCaption:
             "size": [40, 30, 0.5], "center": [0, 0, 10],
         }
         cap = ct._inspect_caption("doc-1", resolved, target_bb,
-                                 (0.0, 0.0, 1.0), method="crop", n_matches=1)
+                                 (0.0, 0.0, 1.0), method="focus", n_matches=1)
         assert "Close-up of 'top'" in cap
-        assert "CROP" in cap or "crop" in cap.lower()
         assert "1200" in cap or "area=" in cap
         assert "scene" in cap.lower() or "camera" in cap.lower()
 
@@ -822,14 +778,269 @@ class TestInspectToolsE2E:
         assert palette["entries"][0]["key"]
 
 
-class TestEmphasisHelpers:
-    def test_stable_color_deterministic(self):
-        a = ct._stable_color_for_key("Ftop")
-        b = ct._stable_color_for_key("Ftop")
-        c = ct._stable_color_for_key("Fother")
-        assert a == b
-        assert a != c
+class TestRenderToolHardening:
+    """Bad views and ambiguous arguments are errors, an explicit section= reaches the engine
+    on exactly the plane the caption describes, and tiles that fail are reported."""
 
+    _install_seams = TestInspectToolsE2E._install_seams
+    _tool = TestInspectToolsE2E._tool
+
+    @staticmethod
+    def _refuse_renders(monkeypatch, which):
+        """Make the engine refuse doc_render_view calls for which `which(params)` is true."""
+        inner = ct.cb.call
+
+        def call(method, params):
+            if method == "doc_render_view" and which(params):
+                return {"ok": False, "reason": "mesh refused"}
+            return inner(method, params)
+
+        monkeypatch.setattr(ct.cb, "call", call)
+
+    @pytest.mark.parametrize("kwargs", [{}, {"annotate": False}])
+    def test_contact_sheet_unknown_view_errors_before_rendering(
+            self, monkeypatch, top_face_match, part_bbox, tmp_path, kwargs):
+        calls = self._install_seams(monkeypatch, [top_face_match], part_bbox, tmp_path)
+        with pytest.raises(ValueError, match="Did you mean 'front'") as err:
+            self._tool("contact_sheet")(doc_id="doc-test", views=["front", "frnt"], **kwargs)
+        assert "iso" in str(err.value) and "azimuth" in str(err.value)
+        assert not any(m in ("doc_render_view", "doc_render_contact_sheet") for m, _ in calls)
+
+    @pytest.mark.parametrize("extra", [{}, {"target": "top"}])
+    def test_render_part_unknown_view_errors(
+            self, monkeypatch, top_face_match, part_bbox, tmp_path, extra):
+        calls = self._install_seams(monkeypatch, [top_face_match], part_bbox, tmp_path)
+        with pytest.raises(ValueError, match="Did you mean 'front'"):
+            self._tool("render_part")(doc_id="doc-test", view="frnt", annotate=False, **extra)
+        assert not any(m == "doc_render_view" for m, _ in calls)
+
+    def test_render_views_unknown_view_errors(
+            self, monkeypatch, top_face_match, part_bbox, tmp_path):
+        calls = self._install_seams(monkeypatch, [top_face_match], part_bbox, tmp_path)
+        with pytest.raises(ValueError, match="'sideways' is not a view"):
+            self._tool("render_views")(doc_id="doc-test", views=["top", "sideways"],
+                                       target="top")
+        assert not any(m == "doc_render_view" for m, _ in calls)
+
+    def test_auto_view_without_a_target_is_refused_in_a_view_list(
+            self, monkeypatch, top_face_match, part_bbox, tmp_path):
+        self._install_seams(monkeypatch, [top_face_match], part_bbox, tmp_path)
+        with pytest.raises(ValueError, match="no such target"):
+            self._tool("contact_sheet")(doc_id="doc-test", views=["front", "auto"])
+
+    def test_emphasize_and_target_together_is_an_error(
+            self, monkeypatch, top_face_match, part_bbox, tmp_path):
+        calls = self._install_seams(monkeypatch, [top_face_match], part_bbox, tmp_path)
+        with pytest.raises(ValueError, match=r"target= OR emphasize=") as err:
+            self._tool("render_part")(doc_id="doc-test", target="top", emphasize="top")
+        assert "highlight=" in str(err.value)
+        assert calls == []
+
+    @pytest.mark.parametrize("n_views", [0, -1, 9, True])
+    def test_look_around_n_views_outside_the_cap_is_an_error(
+            self, monkeypatch, top_face_match, part_bbox, tmp_path, n_views):
+        calls = self._install_seams(monkeypatch, [top_face_match], part_bbox, tmp_path)
+        with pytest.raises(ValueError, match=r"1 to 8"):
+            self._tool("look_around")(target="top", doc_id="doc-test", n_views=n_views)
+        assert calls == []
+
+    @pytest.mark.parametrize("bad, fragment", [
+        ("diagonal", "reserved datum plane"),
+        ({"plane": "top", "origin": [0, 0, 0]}, "not both"),
+        ({"origin": [0, 0, 0]}, "BOTH origin"),
+        ({"origin": [0, 0, 0], "normal": [0, 0, 0]}, "zero length"),
+        ({"origin": [0, 0], "normal": [0, 0, 1]}, "three finite numbers"),
+        ({"plane": "top", "bogus": 1}, "unknown key"),
+        ({"plane": "top", "flip": "yes"}, "flip"),
+        ({"plane": "top", "offset": float("nan")}, "offset"),
+        ([1, 2, 3], "not a plane"),
+    ])
+    def test_section_validation_teaches(self, bad, fragment):
+        with pytest.raises(ValueError, match=fragment):
+            ct_render._parse_section(bad, tool="render_part")
+
+    def test_bad_section_is_refused_before_any_engine_work(
+            self, monkeypatch, top_face_match, part_bbox, tmp_path):
+        calls = self._install_seams(monkeypatch, [top_face_match], part_bbox, tmp_path)
+        for name, kw in (("render_part", {}), ("contact_sheet", {}),
+                         ("inspect_part", {"target": "top"})):
+            with pytest.raises(ValueError, match="reserved datum plane"):
+                self._tool(name)(doc_id="doc-test", section="diagonal", **kw)
+        assert calls == []
+
+    def test_section_vocabulary_matches_inspect_section(self):
+        parse = ct_render._parse_section
+        assert parse("XY", tool="t")[0] == {"point": [0.0, 0.0, 0.0], "normal": [0.0, 0.0, 1.0]}
+        assert parse({"plane": "front", "offset": 5}, tool="t")[0] == {
+            "point": [0.0, -5.0, 0.0], "normal": [0.0, -1.0, 0.0]}
+        assert parse({"plane": "right", "flip": True}, tool="t")[0]["normal"] == [-1.0, 0.0, 0.0]
+        assert parse('{"plane": "top"}', tool="t")[0]["normal"] == [0.0, 0.0, 1.0]
+        custom, desc = parse({"origin": [1, 2, 3], "normal": [0, 0, 4], "offset": 2}, tool="t")
+        assert custom == {"point": [1.0, 2.0, 5.0], "normal": [0.0, 0.0, 1.0]}
+        assert "custom plane" in desc
+        assert parse(None, tool="t") == (None, "")
+
+    def test_render_part_section_reaches_the_engine_and_the_caption_is_on_that_plane(
+            self, monkeypatch, top_face_match, part_bbox, tmp_path):
+        calls = self._install_seams(monkeypatch, [top_face_match], part_bbox, tmp_path)
+        seen = []
+        original = ct_render._render_view_png
+
+        def spy(*args, **kwargs):
+            seen.append(kwargs.get("section"))
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(ct_render, "_render_view_png", spy)
+        _img, caption = self._tool("render_part")(
+            doc_id="doc-test", view="front", annotate=False,
+            section={"plane": "top", "offset": 5})
+        assert seen == [{"point": [0.0, 0.0, 5.0], "normal": [0.0, 0.0, 1.0]}]
+        sent = [p for m, p in calls if m == "doc_render_view"][0]["view"]["section"]
+        assert sent["point"] == [0.0, 0.0, 5.0] and sent["normal"] == [0.0, 0.0, 1.0]
+        assert sent["ghost"] and sent["hatch"]
+        props = [p for m, p in calls if m == "eval_section_props"]
+        assert props == [{"doc_id": "doc-test",
+                          "plane": {"origin": [0.0, 0.0, 5.0], "normal": [0.0, 0.0, 1.0]}}]
+        assert "datum plane 'top'" in caption and "shifted 5 mm" in caption
+        assert "area 120" in caption
+        # A camera edge-on to the cut cannot show the hatched face — the caption says so.
+        assert "WARNING" in caption
+
+    def test_render_part_section_without_a_view_pins_every_grid_tile_to_the_cut(
+            self, monkeypatch, top_face_match, part_bbox, tmp_path):
+        self._install_seams(monkeypatch, [top_face_match], part_bbox, tmp_path)
+        captured = {}
+
+        def stop(doc_id, **kwargs):
+            captured.update(kwargs)
+            raise RuntimeError("planned")
+
+        monkeypatch.setattr(ct_render._sp, "plan_shots", stop)
+        with pytest.raises(RuntimeError, match="planned"):
+            self._tool("render_part")(doc_id="doc-test", section="top")
+        pins = captured["pinned"]
+        assert captured["k"] == 4 and len(pins) == 4
+        for pin in pins:
+            assert pin["section"] == {"point": [0.0, 0.0, 0.0], "normal": [0.0, 0.0, 1.0]}
+            assert pin["dir"][2] > 0.5          # camera on the removed (+normal) side
+        assert len({tuple(round(c, 6) for c in pin["dir"]) for pin in pins}) == 4
+
+    def test_contact_sheet_section_cuts_every_tile(
+            self, monkeypatch, top_face_match, part_bbox, tmp_path):
+        calls = self._install_seams(monkeypatch, [top_face_match], part_bbox, tmp_path)
+        _img, caption = self._tool("contact_sheet")(
+            doc_id="doc-test", views=["front", "top"], annotate=False, section="front")
+        assert not any(m == "doc_render_contact_sheet" for m, _ in calls)
+        cuts = [p["view"]["section"] for m, p in calls if m == "doc_render_view"]
+        assert len(cuts) == 2
+        assert all(c["point"] == [0.0, 0.0, 0.0] and c["normal"] == [0.0, -1.0, 0.0]
+                   for c in cuts)
+        assert "datum plane 'front'" in caption
+
+    def test_inspect_part_section_reaches_closeup_and_refuses_cutaway(
+            self, monkeypatch, top_face_match, part_bbox, tmp_path):
+        calls = self._install_seams(monkeypatch, [top_face_match], part_bbox, tmp_path)
+        seen = []
+        original = ct_render._closeup
+
+        def spy(*args, **kwargs):
+            seen.append(kwargs.get("section"))
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(ct_render, "_closeup", spy)
+        tool = self._tool("inspect_part")
+        _img, caption = tool(target="top", doc_id="doc-test",
+                             section={"origin": [0, 0, 5], "normal": [0, 0, 2]})
+        assert seen == [{"point": [0.0, 0.0, 5.0], "normal": [0.0, 0.0, 1.0]}]
+        cut = [p for m, p in calls if m == "doc_render_view"][-1]["view"]["section"]
+        props = [p["plane"] for m, p in calls if m == "eval_section_props"]
+        assert props == [{"origin": [0.0, 0.0, 5.0], "normal": [0.0, 0.0, 1.0]}]
+        assert cut["point"] == props[0]["origin"] and cut["normal"] == props[0]["normal"]
+        assert "custom plane" in caption
+        with pytest.raises(ValueError, match="cutaway"):
+            tool(target="top", doc_id="doc-test", section="top", cutaway=False)
+
+    def test_planner_section_caption_numbers_are_on_the_rendered_plane(
+            self, monkeypatch, top_face_match, part_bbox, tmp_path):
+        """Audit #4: the 'Auto-section' numbers came from a datum plane at the world origin
+        while the image showed a cut through the target."""
+        calls = self._install_seams(monkeypatch, [top_face_match], part_bbox, tmp_path)
+        plane = {"point": [1.0, 2.0, 3.0], "normal": [1.0, 0.0, 0.0]}
+        monkeypatch.setattr(ct_render, "_auto_view",
+                            lambda *a, **k: ((0.0, -1.0, 0.0), "cut", None, dict(plane)))
+        self._tool("inspect_part")(target="top", doc_id="doc-test")
+        props = [p["plane"] for m, p in calls if m == "eval_section_props"]
+        assert props == [{"origin": [1.0, 2.0, 3.0], "normal": [1.0, 0.0, 0.0]}]
+        rendered = [p for m, p in calls if m == "doc_render_view"][-1]["view"]["section"]
+        assert rendered["point"] == props[0]["origin"]
+        assert rendered["normal"] == props[0]["normal"]
+
+    def test_render_part_auto_view_uses_the_planners_best_camera(
+            self, monkeypatch, top_face_match, part_bbox, tmp_path):
+        calls = self._install_seams(monkeypatch, [top_face_match], part_bbox, tmp_path)
+        asked = []
+
+        def plan(doc_id, **kwargs):
+            asked.append(kwargs)
+            return {"views": [{"dir": [1.0, 0.0, 0.0], "label": "best side"}]}
+
+        monkeypatch.setattr(ct_render._sp, "plan_shots", plan)
+        _img, caption = self._tool("render_part")(doc_id="doc-test", view="auto",
+                                                  annotate=False)
+        assert asked and asked[0]["k"] == 1 and asked[0].get("target") is None
+        sent = [p for m, p in calls if m == "doc_render_view"]
+        assert len(sent) == 1 and sent[0]["view"]["dir"] == [1.0, 0.0, 0.0]
+        assert not any(m == "doc_render_png" for m, _ in calls)
+        assert "best side" in caption
+
+    def test_contact_sheet_reports_the_tiles_that_failed(
+            self, monkeypatch, top_face_match, part_bbox, tmp_path):
+        self._install_seams(monkeypatch, [top_face_match], part_bbox, tmp_path)
+        self._refuse_renders(monkeypatch, lambda p: p["view"]["name"] == "TOP")
+        _img, caption = self._tool("contact_sheet")(
+            doc_id="doc-test", views=["front", "top", "iso"], annotate=False, section="front")
+        assert "1 of 3 views FAILED" in caption
+        assert "top: Render failed: mesh refused" in caption
+        assert "2 tiles: front, iso" in caption
+
+    def test_contact_sheet_errors_with_every_reason_when_all_tiles_fail(
+            self, monkeypatch, top_face_match, part_bbox, tmp_path):
+        self._install_seams(monkeypatch, [top_face_match], part_bbox, tmp_path)
+        self._refuse_renders(monkeypatch, lambda p: True)
+        with pytest.raises(ValueError, match="all 2 views failed") as err:
+            self._tool("contact_sheet")(doc_id="doc-test", views=["front", "top"],
+                                        annotate=False, section="front")
+        assert "front: Render failed: mesh refused" in str(err.value)
+        assert "top: Render failed: mesh refused" in str(err.value)
+
+    def test_look_around_reports_the_close_ups_that_failed(
+            self, monkeypatch, top_face_match, part_bbox, tmp_path):
+        self._install_seams(monkeypatch, [top_face_match], part_bbox, tmp_path)
+        count = {"n": 0}
+
+        def second(_params):
+            count["n"] += 1
+            return count["n"] == 2
+
+        self._refuse_renders(monkeypatch, second)
+        _img, caption = self._tool("look_around")(target="top", doc_id="doc-test", n_views=4)
+        assert "1 of 4 close-ups FAILED" in caption and "mesh refused" in caption
+
+    def test_inspect_feature_reports_the_panels_that_failed(
+            self, monkeypatch, top_face_match, part_bbox, tmp_path):
+        self._install_seams(monkeypatch, [top_face_match], part_bbox, tmp_path)
+        count = {"n": 0}
+
+        def first(_params):
+            count["n"] += 1
+            return count["n"] == 1
+
+        self._refuse_renders(monkeypatch, first)
+        _img, caption = self._tool("inspect_feature")(target="top", doc_id="doc-test")
+        assert re.search(r"1 of \d panels FAILED", caption) and "HERO: Render failed" in caption
+
+
+class TestEmphasisHelpers:
     def test_normalize_view_list_default(self):
         v = ct._normalize_view_list(None)
         assert v == list(ct._STANDARD_ORTHO_VIEWS)
@@ -858,34 +1069,70 @@ class TestEmphasisHelpers:
             assert im.size[1] >= 48
 
 
-class TestGuideMentions:
-    def test_review_guide_matches_cpp_review_stage(self):
-        # reviewer.md is the C++ review-stage prompt (slimmed in f81fcc1c: the reviewer
-        # has NO tools there — it judges the feature tree + MEASURED block and answers
-        # with the done-token). Assert the real contract, not the retired tool mentions.
-        text = ct.cad_guide_text("review")
-        assert "MEASURED" in text
-        assert '{"done": true' in text
+class TestGuideTopics:
+    def test_default_guide_is_compact_topic_index(self):
+        index = ct.cad_guide_text()
+        assert index == ct.cad_guide_text("") == ct.cad_guide_text("   ")
+        assert len(index.encode()) < len(ct.cad_guide_text("overview").encode()) / 2
+        assert ct.cad_guide_text("overview") == ct.cad_guide_text("ops")
 
-    def test_gsl_guide_mentions_inspect(self):
-        text = ct.cad_guide_text("gsl")
-        assert "inspect_part" in text
-        assert "inspect_feature" in text
-        assert "render_views" in text
+    def test_guide_topic_normalization_and_history_aliases(self):
+        assert ct.cad_guide_text("  EDIT-PART ") == ct.cad_guide_text("edit_part")
+        assert ct.cad_guide_text("g-code") == ct.cad_guide_text("cam")
+        assert ct.cad_guide_text("sign-off") == ct.cad_guide_text("verify")
+        history = ct.cad_guide_text("feature_history")
+        assert all(ct.cad_guide_text(topic) == history for topic in (
+            "feature-history", "insert_feature", "insertion", "reorder_feature",
+            "reorder", "set_rollback", "rollback"))
+        assert len(history) < len(ct.cad_guide_text("add_features"))
 
-    def test_overview_mentions_render_views(self):
-        text = ct.cad_guide_text("")  # default/overview
-        assert "render_views" in text or "inspect_feature" in text
+    def test_unknown_guide_recovery_is_bounded(self):
+        unknown = ct.cad_guide_text("not-a-real-guide-" + "x" * 1000)
+        assert len(unknown) < 200
+        assert unknown != ct.cad_guide_text()
 
-    def test_add_features_mentions_verify_loop(self):
-        from mcp.server.fastmcp import FastMCP
-        mcp = FastMCP("test-inspect")
-        ct.register_cad_tools(mcp)
-        mgr = getattr(mcp, "_tool_manager", None)
-        tools = getattr(mgr, "_tools", {}) if mgr else {}
-        desc = tools["add_features"].description or ""
-        assert "VERIFY LOOP" in desc
-        assert "render_part" in desc or "render_views" in desc
+
+
+def test_get_part_feature_selection_preserves_complete_records(monkeypatch):
+    from mcp.server.fastmcp import FastMCP
+    from services.mcp import cad_doc_tools as doc_tools
+
+    long_text = "width/2+" + "1+" * 1500 + "1"
+    features = [
+        {"id": "f1", "type": "box", "params": {"width": 10}},
+        {"id": "f2", "type": "sketch", "refs": {"plane": "plane.top",
+            "references": [{"id": f"r{i}", "expression": long_text} for i in range(70)]},
+         "params": {"entities": [{"id": f"e{i}"} for i in range(70)],
+                    "constraints": [{"id": f"c{i}", "expr": long_text} for i in range(70)]}},
+        {"id": "f3", "type": "extrude", "params": {"depth": 5}},
+    ]
+    native = {"revision": 42, "tree": {"features": features, "material": "steel"},
+              "owner_map": {"f1": ["face"]}}
+    monkeypatch.setattr(doc_tools, "_doc", lambda doc_id: doc_id or "doc-1")
+    monkeypatch.setattr(doc_tools.cb, "call", lambda method, args: native)
+    mcp = FastMCP("test-get-part-selection")
+    doc_tools.register_cad_doc_tools(mcp)
+    get_part = mcp._tool_manager._tools["get_part"].fn
+
+    default = json.loads(get_part(doc_id="doc-1"))
+    assert default == {"ok": True, "doc_id": "doc-1", **native,
+                       "feature_page": {"cursor": 0, "limit": 100, "next_cursor": None, "total": 3}}
+    selected = json.loads(get_part(doc_id="doc-1", feature_ids=["f3", "f2", "f2"]))
+    assert selected == {"ok": True, "doc_id": "doc-1", "revision": 42,
+                        "tree": {"features": [features[1], features[2]]},
+                        "feature_page": {"cursor": 0, "limit": 100, "next_cursor": None, "total": 2}}
+    summary = json.loads(get_part(doc_id="doc-1", summary=True, feature_ids=["f2"]))
+    assert summary["summary"] is True and summary["feature_count"] == 1
+    assert summary["tree"]["features"][0]["truncated_lists"]["params.constraints"]["total"] == 70
+    assert "refs" not in summary["tree"]["features"][0]
+    empty = json.loads(get_part(doc_id="doc-1", feature_ids=[]))
+    assert empty == {"ok": True, "doc_id": "doc-1", "revision": 42, "tree": {"features": []},
+                     "feature_page": {"cursor": 0, "limit": 100, "next_cursor": None, "total": 0}}
+    empty_summary = json.loads(get_part(doc_id="doc-1", summary=True, feature_ids=[]))
+    assert empty_summary["feature_count"] == 0 and empty_summary["tree"]["features"] == []
+    unknown = json.loads(get_part(doc_id="doc-1", feature_ids=["f2", "missing", "absent", "missing"]))
+    assert unknown["ok"] is False and unknown["missing_feature_ids"] == ["missing", "absent"]
+    assert "tree" not in unknown
 
 
 # --------------------------------------------------------------------------- save_path + study setup (O-16)
@@ -998,6 +1245,20 @@ class TestRenderSavePath:
         assert f"saved: {out}" in caption
         assert f"({len(saved)} B, sha256 " in caption
         assert hashlib.sha256(saved).hexdigest()[:12] in caption
+
+    def test_render_save_uses_bound_root_without_environment(self, monkeypatch, tmp_path):
+        from services.agent.request_context import bind_roots
+
+        self._seams(monkeypatch, tmp_path)
+        for key in ("CHUDWARE_PROJECT_SAVE_DIR", "CHUDWARE_PROJECT_DIR",
+                    "CHUDWARE_FS_ROOT", "CHUDWARE_RENDER_SAVE_ANYWHERE"):
+            monkeypatch.delenv(key, raising=False)
+        with bind_roots(str(tmp_path)):
+            img, caption = self._tool("render_part")(
+                doc_id="doc-test", save_path="figures/box.png")
+        out = tmp_path / "figures" / "box.png"
+        assert out.read_bytes() == open(getattr(img, "path", img), "rb").read()
+        assert f"saved: {out}" in caption
 
     def test_relative_save_path_is_project_root_relative(self, monkeypatch, tmp_path):
         """A relative save_path resolves against the project root, as in save_part and

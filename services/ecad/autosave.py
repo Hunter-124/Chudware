@@ -1,40 +1,23 @@
-"""Best-effort crash-recovery snapshots for ECAD sessions.
+"""Crash-recovery snapshots for native ECAD sessions.
 
-The live document/session state is native (``core/ecad/session.cpp``), accessed
-through :mod:`services.mcp.ecad_common`. This module persists document JSON to
-``<autosave_dir>/<doc_id>.json``; :func:`autosave_dir` honours
-``CHUDWARE_ECAD_AUTOSAVE_DIR``, otherwise uses ``APPDATA`` or the temporary directory.
-The MCP facade saves snapshots on its mutation paths and before heavy operations,
-and recovery reopens them as fresh native sessions at server startup.
-These snapshots are crash recovery, not a substitute for saving user documents.
-
-Design constraints:
-  * DOCUMENT SNAPSHOTS — writes use the session's document JSON; recovery lazily
-    imports the native-session facade in :mod:`services.mcp.ecad_common`.
-  * BEST-EFFORT — a write/read failure is swallowed; autosave must never break the op that succeeded.
-  * DISABLED BY DEFAULT — unit tests don't touch disk. The MCP server calls :func:`enable` at
-    startup; tests enable() with an env-overridden directory (``CHUDWARE_ECAD_AUTOSAVE_DIR``).
-  * ATOMIC writes (tmp + os.replace) so a kill mid-write can't leave a half-written JSON that fails
-    to reload.
+Snapshots are private to a process session and committed durably before an older
+recovery copy is removed. They are not a substitute for saving user documents.
 """
 from __future__ import annotations
 
 import json
 import os
 import tempfile
+import threading
 import time
+import hashlib
+import uuid
 from pathlib import Path
 from typing import Optional
 
-# Module state: whether autosave is armed + this process's session id (so recovery can tell our own
-# fresh autosaves apart from a prior crashed session's, exactly like cad_tools._SESSION_ID does).
-_STATE: dict = {"enabled": False, "session_id": None}
-
-# Autosaves older than this are pruned on recovery so the directory can't grow forever.
-try:
-    _MAX_AGE_DAYS = float(os.environ.get("CHUDWARE_ECAD_AUTOSAVE_MAX_AGE_DAYS", "") or 7.0)
-except (TypeError, ValueError):
-    _MAX_AGE_DAYS = 7.0
+_STATE: dict = {"enabled": False, "session_id": None, "namespace": uuid.uuid4().hex,
+                "snapshots": {}}
+_WRITE_LOCK = threading.Lock()
 
 
 def enable(session_id: Optional[str] = None) -> None:
@@ -43,6 +26,10 @@ def enable(session_id: Optional[str] = None) -> None:
     _STATE["enabled"] = True
     if session_id is not None:
         _STATE["session_id"] = session_id
+        _STATE["namespace"] = uuid.uuid4().hex
+        _STATE["snapshots"] = {}
+    elif _STATE["session_id"] is None:
+        _STATE["session_id"] = uuid.uuid4().hex
 
 
 def disable() -> None:
@@ -70,99 +57,37 @@ def autosave_dir() -> Path:
     return d
 
 
-def save_doc(doc_id: Optional[str], doc: dict, *, kind: Optional[str] = None,
-             name: Optional[str] = None, revision: Optional[int] = None,
-             path: Optional[str] = None) -> None:
-    """Persist one ECAD document (atomically) to ``<doc_id>.json``. No-op when disabled. Never
-    raises — a persistence failure must not break the mutating op that already succeeded."""
-    if not _STATE["enabled"] or not doc_id or not isinstance(doc, dict):
-        return
-    try:
-        d = autosave_dir()
-        payload = {
-            "session": _STATE["session_id"],
-            "doc_id": doc_id,
-            "kind": kind,
-            "name": name,
-            "revision": revision,
-            "path": path,
-            "saved_at": time.time(),
-            "doc": doc,
-        }
-        tmp = d / f".{doc_id}.json.tmp"
-        final = d / f"{doc_id}.json"
-        tmp.write_text(json.dumps(payload), encoding="utf-8")
-        os.replace(tmp, final)  # atomic on POSIX + Windows
-    except Exception:  # noqa: BLE001 - best-effort
-        pass
+def _snapshot_path(doc_id: str, kind: str = "sch", token: str = "") -> Path:
+    identity = hashlib.sha256(doc_id.encode("utf-8")).hexdigest()
+    suffix = f"-{token}" if token else ""
+    return autosave_dir() / f"{os.getpid()}-{_STATE['namespace']}-{identity}{suffix}.kicad_{kind}"
 
 
-def autosave_session(session) -> None:
-    """Persist a :class:`services.mcp.ecad_common.EcadSession` snapshot.
-    Called by the MCP facade on mutation, pre-heavy-operation and recovery paths.
-    No-op when disabled."""
-    if not _STATE["enabled"]:
-        return
+def autosave_session(session) -> bool:
+    """Persist a private KiCad recovery snapshot without rebinding the live session."""
+    if not _STATE["enabled"] or not session.doc_id or session.kind not in ("sch", "pcb"):
+        return False
+    from services.mcp.ecad_common import _ECAD_OPERATION_LOCK, _rpc
+    metadata = {
+        "origin": "agent", "session": _STATE["session_id"], "pid": os.getpid(),
+        "doc_id": session.doc_id, "kind": session.kind, "name": session.doc.get("name", ""),
+        "path": session.path or "", "saved_at": time.time(),
+        "recovery_dir": str(autosave_dir().resolve()),
+    }
+    snapshot = _snapshot_path(session.doc_id, session.kind, uuid.uuid4().hex)
     try:
-        save_doc(session.doc_id, session.doc, kind=session.kind,
-                 name=session.doc.get("name"), revision=session.revision, path=session.path)
+        with _ECAD_OPERATION_LOCK, _WRITE_LOCK:
+            _rpc("ecad_save", {"doc_id": session.doc_id, "path": str(snapshot),
+                               "recovery": metadata})
+            previous = _STATE["snapshots"].get(session.doc_id)
+            _STATE["snapshots"][session.doc_id] = snapshot
+            if previous and previous != snapshot:
+                Path(str(previous) + ".recovery.json").unlink(missing_ok=True)
+                previous.unlink(missing_ok=True)
+        return True
     except Exception:  # noqa: BLE001
-        pass
+        return False
 
-
-def remove(doc_id: Optional[str]) -> None:
-    """Delete a doc's autosave (called when a session is deliberately closed, so a closed doc is
-    never resurrected on the next restart). Best-effort."""
-    if not doc_id:
-        return
-    try:
-        (autosave_dir() / f"{doc_id}.json").unlink(missing_ok=True)
-    except Exception:  # noqa: BLE001
-        pass
-
-
-# Hard cap on the number of autosave files kept, regardless of age. Recovery reopens prior-session
-# docs under FRESH ids and re-saves them, so without a cap the directory grows by ~N docs every
-# restart and old-session files (younger than the age cutoff) never get cleaned. Keep only the most
-# recent few dozen by mtime.
-try:
-    _MAX_FILES = int(os.environ.get("CHUDWARE_ECAD_AUTOSAVE_MAX_FILES", "") or 40)
-except (TypeError, ValueError):
-    _MAX_FILES = 40
-if _MAX_FILES < 1:
-    _MAX_FILES = 40
-
-
-def prune(max_age_days: float = _MAX_AGE_DAYS, max_files: int = _MAX_FILES) -> int:
-    """Delete autosaves older than ``max_age_days`` (by mtime), then cap the directory to the
-    ``max_files`` most-recent files. Returns the count removed."""
-    n = 0
-    cutoff = time.time() - max_age_days * 86400.0
-    try:
-        survivors: list = []
-        for p in autosave_dir().glob("*.json"):
-            try:
-                mt = p.stat().st_mtime
-            except OSError:
-                continue
-            if mt < cutoff:
-                p.unlink(missing_ok=True)
-                n += 1
-            else:
-                survivors.append((mt, p))
-        # Count-cap: drop the oldest survivors beyond the limit so the dir can't grow unbounded
-        # across restarts (the recovery-churn fix).
-        if max_files and len(survivors) > max_files:
-            survivors.sort(key=lambda t: t[0], reverse=True)
-            for _mt, p in survivors[max_files:]:
-                try:
-                    p.unlink(missing_ok=True)
-                    n += 1
-                except OSError:
-                    continue
-    except Exception:  # noqa: BLE001
-        pass
-    return n
 
 
 def recover_ecad_autosaved(scope: str = "recent") -> list:
@@ -170,15 +95,11 @@ def recover_ecad_autosaved(scope: str = "recent") -> list:
     ``[{doc_id, kind, name, original_doc_id}]`` for each that reloaded (with a FRESH doc_id, exactly
     like cad_tools.recover_autosaved gives reopened C++ parts).
 
-    ``scope="recent"`` (default): only the SINGLE most-recent PRIOR session's docs — the crash we
-    are recovering from — never the whole history. ``scope="all"``: every autosave on disk. Prunes
-    stale autosaves first. Best-effort: a bad/partial file is skipped, never fatal.
+    ``scope="recent"`` selects the most recent prior session; ``scope="all"``
+    includes all prior snapshots. Invalid files are retained.
     """
-    # Keep the native-session facade import lazy; recovery runs after startup wiring.
-    from services.mcp.ecad_common import schema as _schema
     from services.mcp.ecad_common import ecad_session as _sess
 
-    prune()
     out: list = []
     try:
         files = sorted(autosave_dir().glob("*.json"))
@@ -193,6 +114,21 @@ def recover_ecad_autosaved(scope: str = "recent") -> list:
             continue
         if not isinstance(payload, dict):
             continue
+        is_recovery = p.name.endswith(".recovery.json")
+        if is_recovery and payload.get("origin") != "agent":
+            continue
+        if not is_recovery and not isinstance(payload.get("doc"), dict):
+            continue
+        pid = payload.get("pid")
+        if isinstance(pid, int) and pid > 0 and pid != os.getpid():
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                continue
+            else:
+                continue
         try:
             ts = float(payload.get("saved_at", p.stat().st_mtime))
         except Exception:  # noqa: BLE001
@@ -213,26 +149,23 @@ def recover_ecad_autosaved(scope: str = "recent") -> list:
             info = []
 
     for p, payload, _tag, _ts in info:
-        doc = payload.get("doc")
-        if not isinstance(doc, dict):
-            continue
-        if not (_schema.is_schematic(doc) or _schema.is_board(doc)):
-            continue
         try:
-            session = _sess.open_session(doc, path=payload.get("path"))
+            if p.name.endswith(".recovery.json"):
+                snapshot = Path(str(p)[:-len(".recovery.json")])
+                if not snapshot.is_file():
+                    continue
+                session = _sess.open_path(str(snapshot))
+            else:
+                # Legacy JSON recovery files remain readable but are never written again.
+                doc = payload["doc"]
+                session = _sess.open_session(doc)
             out.append({"doc_id": session.doc_id, "kind": session.kind,
-                        "name": doc.get("name", ""),
+                        "name": session.doc.get("name", ""),
                         "original_doc_id": payload.get("doc_id")})
-            # MIGRATE the file: persist the reopened doc under its NEW id (current session tag) and
-            # delete the stale prior-session source. Without this, every restart leaves the old file
-            # behind AND writes a new one, so the directory grows by ~N docs per restart forever.
-            try:
-                if _STATE["enabled"]:
-                    autosave_session(session)  # write the doc under its new id (current session)
-                    if p.name != f"{session.doc_id}.json":
-                        p.unlink(missing_ok=True)  # only after the new file is safely written
-            except Exception:  # noqa: BLE001 — migration is best-effort; never fail recovery
-                pass
+            if autosave_session(session):
+                p.unlink(missing_ok=True)
+                if p.name.endswith(".recovery.json"):
+                    snapshot.unlink(missing_ok=True)
         except Exception:  # noqa: BLE001
             continue
     return out

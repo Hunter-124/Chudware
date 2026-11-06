@@ -1,11 +1,15 @@
-"""services.ecad.library — Python ECAD symbol/footprint/3D library system.
+"""ECAD library resolution across installed KiCad and custom Python catalogs.
 
 Public API re-exported at module level for Python service callers::
 
     from services.ecad import library
     library.resolve("Device:R")
-    library.resolve_footprint("Resistor_SMD:R_0603")
+    library.resolve_footprint("Resistor_SMD:R_0603_1608Metric")
     library.search("resistor")
+
+Configured project/generated libraries take precedence over KiCad's native
+symbol and footprint libraries, which in turn take precedence over starters.
+Explicit KiCad file importers remain available for additional library files.
 
 Sub-modules:
   sexpr      — S-expression parser/writer (dependency-free)

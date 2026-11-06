@@ -1,4 +1,4 @@
-"""Model tier profiles — loader, budget enforcer, and provider tier detection.
+"""Model tier profiles — loader, tier-to-provider resolution, and tool-schema trim.
 
 Contract: contracts/advisor.md §8 (tier budgets).
 Spec: docs/design/ADVISOR_ARCHITECTURE.md §2.9.
@@ -9,51 +9,24 @@ What this module provides
   Load and validate tier profiles from ``services/agent/tiers.yaml``.
 
 * ``TierProfile`` dataclass
-  Carries all per-tier dials: budgets, enforcement, structured-output mode,
-  verbosity and tool-schema-trim flag.
+  Per-tier dials: context/generation budgets, tool-schema-trim flag and the
+  capability profile letter.
 
-* ``detect_tier(context_length)`` / ``detect_tier_from_env()``
-  Map a model's context length to a tier (CHUDWARE_TIER env override honoured).
-
-* ``TurnAssembler``
-  Assembles one model turn slot-by-slot in §9.1 order, applying the budget
-  from the tier profile.  Overflow policy (per contract §8):
-    1. shrink history first  (never below floor=0)
-    2. then shrink state     (never below STATE_FLOOR)
-    never shrink system or advisory below their floors.
-
-  Reuses the ``_CHARS_PER_TOKEN = 4`` heuristic from ledger.py / advisor/render.py
-  (repo-wide constant — only one measuring stick).
+* ``detect_tier_from_env()``
+  Tier name from the ``CHUDWARE_TIER`` env var (``None`` when unset).
 
 * ``trim_tool_schema(schema)``
   Strip tool description to first sentence for local tiers.
 
-* ``grammar_for_tier(tier, handoff_schema)``
-  Return the GBNF grammar string for local tiers (via roles.schema_to_gbnf),
-  or ``None`` for non-GBNF tiers.
-
-Provider tier auto-detection
------------------------------
-``detect_tier(context_length)`` maps context window → tier name using the
-thresholds defined in ``CONTEXT_LENGTH_TIER_MAP``. Providers should call:
-
-    tier_name = detect_tier_from_env() or detect_tier(model_context_length)
-    profile   = load_tier(tier_name)
-
-Grammar pass-through (llama.cpp / LM Studio)
----------------------------------------------
-For ``structured_output: gbnf`` tiers, callers pass ``grammar=<gbnf_string>``
-to ``Provider.complete_ex``.  The OpenAI-compatible providers (LM Studio /
-llama.cpp) accept this as ``extra_body={"grammar": ...}`` (llama.cpp server)
-or ``response_format={"type": "json_schema", "json_schema": {...}}`` (LM Studio
-json_schema fallback when grammar is not supported).  See
-``services/agent/providers/openai_provider.py`` for the call site.
+* ``provider_for_tier`` / ``MissionAuthError`` / ``parse_*_tier`` /
+  ``load_local_models``
+  Tier-to-provider resolution used by the gym/bench harness.
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -68,22 +41,8 @@ _TIERS_PATH = Path(__file__).resolve().parent / "tiers.yaml"
 # Repo-wide token-counting heuristic (matches ledger.py and advisor/render.py).
 _CHARS_PER_TOKEN = 4
 
-# Overflow guard floors — slots never shrunk below these (tokens).
-# system and advisory are NEVER shrunk (floor = their full budget as loaded).
-STATE_FLOOR_TOKENS = 200  # minimum stage-state tokens to keep
-HISTORY_FLOOR_TOKENS = 0  # history can be emptied entirely if needed
-
 # Env override for manual tier selection (e.g. CHUDWARE_TIER=frontier).
 TIER_ENV_VAR = "CHUDWARE_TIER"
-
-# Context-length thresholds → tier name.  Checked in order; first match wins.
-# A model with context_length < 32768 → local-24k (treated conservatively).
-CONTEXT_LENGTH_TIER_MAP: list[tuple[int, str]] = [
-    (32_768, "local-24k"),  # ≤ 32k → local-24k
-    (65_536, "local-48k"),  # ≤ 64k → local-48k
-    (150_000, "mid"),  # ≤ 150k → mid
-]
-FRONTIER_TIER = "frontier"
 
 
 # --------------------------------------------------------------------------- errors
@@ -118,18 +77,6 @@ class SlotBudgets:
             + self.history
         )
 
-    def __iter__(self):
-        return iter(
-            (
-                ("system", self.system),
-                ("ledger", self.ledger),
-                ("state", self.state),
-                ("advisory", self.advisory),
-                ("tools", self.tools),
-                ("history", self.history),
-            )
-        )
-
 
 @dataclass(frozen=True)
 class TierProfile:
@@ -139,10 +86,6 @@ class TierProfile:
     context_tokens: int
     generation_headroom: int
     budgets: SlotBudgets
-    playbook_enforcement: str  # step_locked | checklist | off
-    structured_output: str  # gbnf | json_mode | free
-    advisory_verbosity: str  # full | compact
-    max_tools_per_role: int
     tool_schema_trim: bool
     # Coercion level A/B/C — independent of turn priority. A = scaffold hard,
     # B = soft gates, C = freedom + HARD floors only. See capability.py.
@@ -156,14 +99,6 @@ class TierProfile:
     def budget_ok(self) -> bool:
         """Verify slot sum ≤ available_tokens (the §8 invariant)."""
         return self.budgets.total <= self.available_tokens
-
-    @property
-    def uses_gbnf(self) -> bool:
-        return self.structured_output == "gbnf"
-
-    @property
-    def uses_json_mode(self) -> bool:
-        return self.structured_output == "json_mode"
 
 
 # --------------------------------------------------------------------------- loading
@@ -182,10 +117,6 @@ def _profile_from_dict(name: str, raw: dict, source: str) -> TierProfile:
         "context_tokens",
         "generation_headroom",
         "budgets",
-        "playbook_enforcement",
-        "structured_output",
-        "advisory_verbosity",
-        "max_tools_per_role",
         "tool_schema_trim",
     )
     missing = [k for k in required if k not in raw]
@@ -205,10 +136,6 @@ def _profile_from_dict(name: str, raw: dict, source: str) -> TierProfile:
         context_tokens=int(raw["context_tokens"]),
         generation_headroom=int(raw["generation_headroom"]),
         budgets=budgets,
-        playbook_enforcement=str(raw["playbook_enforcement"]),
-        structured_output=str(raw["structured_output"]),
-        advisory_verbosity=str(raw["advisory_verbosity"]),
-        max_tools_per_role=int(raw["max_tools_per_role"]),
         tool_schema_trim=bool(raw["tool_schema_trim"]),
         capability_profile=str(cap),
     )
@@ -342,12 +269,10 @@ def profile_tier_for(tier: str | None) -> str | None:
 
 
 class MissionAuthError(RuntimeError):
-    """Provider credentials missing/invalid — fail closed BEFORE the DAG launches.
+    """Provider credentials missing/invalid — fail closed before a run starts.
 
     Raised by :func:`provider_for_tier` when an ``xai:*`` tier has neither a
     stored SuperGrok subscription token nor an ``XAI_API_KEY`` / config api_key.
-    Callers (``run_mission``) must surface this as ``stop_reason=provider_auth``
-    rather than letting N parallel nodes burn budget on opaque 400s (mega-1).
     """
 
     def __init__(
@@ -376,14 +301,9 @@ class MissionAuthError(RuntimeError):
 def provider_for_tier(tier: str | None, cfg: Optional[dict] = None):
     """Resolve the :class:`Provider` a *tier* should run on.
 
-    This is the SINGLE tier->provider resolution seam shared by the DAG node
-    runner (``services.dag.node_runner``) and the gym bench (its
-    ``_provider_for_tier``) — both used to carry their own copy of this logic,
-    which is exactly how the node_runner half of the bug went unfixed: the
-    gym worked around it locally for gym cells only, while every OTHER caller
-    of missions (mission_start/dag_run, or run_mission called directly) kept
-    silently leaking internal DAG nodes to the ambient config.json /
-    CHUDWARE_PROVIDER default.
+    The gym/bench harness (``tools/flywheel/bench/gym/runner.py``) is the only
+    production caller. DAG nodes run through ``omp_roles.run_role_turn`` and
+    never resolve a provider here.
 
     A ``local-*`` tier (``local-24k`` / ``local-48k``) MUST run on the bundled
     local model (tiers.yaml ``local_models.fanout``, currently ``qwen3-4b``)
@@ -393,9 +313,9 @@ def provider_for_tier(tier: str | None, cfg: Optional[dict] = None):
     specific bundled model instead of the fanout default — this is the
     local-model benchmark's per-model tier matrix.
 
-    Parameterized paid tiers remain a benchmark-harness surface. Ordinary online
-    Chudware turns do not enter this factory; Chudcode owns their provider and
-    model selection.
+    Parameterized paid tiers remain a benchmark-harness surface. Online
+    Chudware turns and DAG nodes do not enter this factory; the OMP host owns
+    their provider and model selection.
 
     Parameterized xAI tiers use ``xai:<model-id>`` (e.g. ``xai:grok-4.5`` /
     ``xai:grok-4-5``). They prefer the SuperGrok subscription provider
@@ -529,29 +449,17 @@ def provider_for_tier(tier: str | None, cfg: Optional[dict] = None):
         "model": model_id,
     }
     # llamacpp (not openai) so structured-output nodes get GBNF grammars, which
-    # the local-24k/local-48k tiers require (tiers.yaml structured_output: gbnf).
+    # the bundled local tiers rely on.
     return _config.get_provider("llamacpp", cfg=merged_cfg)
 
 
 # --------------------------------------------------------------------------- tier detection
 
 
-def detect_tier(context_length: int) -> str:
-    """Map a model's context window length to a tier name.
-
-    Uses ``CONTEXT_LENGTH_TIER_MAP`` thresholds (≤ threshold → tier).
-    Falls back to ``frontier`` for very large contexts.
-    """
-    for threshold, tier_name in CONTEXT_LENGTH_TIER_MAP:
-        if context_length <= threshold:
-            return tier_name
-    return FRONTIER_TIER
-
-
 def detect_tier_from_env() -> Optional[str]:
     """Return the tier name from ``CHUDWARE_TIER`` env var, or ``None`` if unset.
 
-    The env var always wins over auto-detection (manual override).
+    Manual tier selection; ``None`` means no tier was pinned.
     """
     val = os.environ.get(TIER_ENV_VAR, "").strip()
     return val if val else None
@@ -599,223 +507,9 @@ def trim_tool_schema(schema: dict[str, Any]) -> dict[str, Any]:
     return schema
 
 
-# --------------------------------------------------------------------------- grammar helper
-
-
-def grammar_for_tier(
-    profile: TierProfile,
-    handoff_schema: dict[str, Any],
-) -> Optional[str]:
-    """Return the GBNF grammar string for the handoff schema, or ``None``.
-
-    Only produces a grammar for ``structured_output: gbnf`` tiers (local-24k,
-    local-48k).  The grammar is built by ``roles.schema_to_gbnf``
-    and passed to the provider as ``grammar=``.
-
-    Import is deferred to avoid a circular import (roles → tiers → roles).
-    """
-    if not profile.uses_gbnf:
-        return None
-    from .roles import schema_to_gbnf  # deferred — tiers is imported by roles in tests
-
-    return schema_to_gbnf(handoff_schema)
-
-
-
-# --------------------------------------------------------------------------- turn assembler
+# --------------------------------------------------------------------------- token counting
 
 
 def _count_tokens(text: str) -> int:
     """Estimate token count using the repo-wide 4-chars/token heuristic."""
     return (len(text) + _CHARS_PER_TOKEN - 1) // _CHARS_PER_TOKEN
-
-
-def _compact_messages(messages: list[dict], level: int) -> list[dict]:
-    """Compact a message list in place (mirrors loop.py _apply_compaction).
-
-    Level 1: drop image parts.
-    Level 2: also truncate text parts to 1200 chars.
-    Level 3: also truncate text parts to 600 chars.
-
-    Returns a new list (non-destructive — the assembler works on a copy).
-    """
-    import copy
-
-    msgs = copy.deepcopy(messages)
-    for msg in msgs:
-        content = msg.get("content", [])
-        if not isinstance(content, list):
-            continue
-        if level >= 1:
-            msg["content"] = [p for p in content if p.get("type") != "image"]
-            content = msg["content"]
-        limit = None
-        if level >= 3:
-            limit = 600
-        elif level >= 2:
-            limit = 1200
-        if limit is not None:
-            for p in content:
-                if p.get("type") == "text" and len(p["text"]) > limit:
-                    p["text"] = p["text"][:limit] + "\n...[truncated]"
-    return msgs
-
-
-def _render_messages(messages: list[dict]) -> str:
-    """Render a message list to a plain-text history string for token counting.
-
-    Format mirrors what most providers see: alternating role: content lines.
-    Used only for budget estimation — not the wire format.
-    """
-    lines: list[str] = []
-    for msg in messages:
-        role = msg.get("role", "")
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            text = "\n".join(p["text"] for p in content if p.get("type") == "text")
-        else:
-            text = str(content)
-        lines.append(f"{role}: {text}")
-    return "\n".join(lines)
-
-
-@dataclass
-class AssembledTurn:
-    """Result of ``TurnAssembler.assemble()``."""
-
-    text: str  # the full assembled context string
-    slot_tokens: dict[str, int]  # per-slot token counts (post-compaction)
-    total_tokens: int  # sum of slot_tokens
-    overflow_applied: bool  # True if shrink was needed
-    compaction_level: int  # 0 = no compaction, 1-3 = loop.py levels
-
-
-class TurnAssembler:
-    """Assemble one model turn's context in §9.1 slot order, within the tier budget.
-
-    Usage::
-
-        profile = load_tier("local-24k")
-        assembler = TurnAssembler(profile)
-        result = assembler.assemble(
-            system=card.system_prompt,
-            ledger_text=ledger_render(ledger, profile.budgets.ledger),
-            state_text=render_stage_state(card, describer=describer),
-            advisory_text=render_advisory(advisory, profile.budgets.advisory),
-            tools_text="",          # rendered tool schemas, if applicable
-            history_messages=[...], # raw message dicts from the session
-        )
-        # result.text is what goes into Provider.complete_ex(system=..., messages=[...])
-        # For local tiers, split result.text back into system + history at the seam.
-
-    Overflow policy (§8):
-      1. Shrink history first (compact message list, levels 1→3, then empty entirely).
-      2. Shrink state (down to STATE_FLOOR_TOKENS).
-      3. Never shrink system or advisory below their allocated budgets.
-
-    Note: the renderers (ledger_render, render_advisory) already truncate to their
-    slot budgets.  The assembler's job is to count the assembled total, detect
-    overflow against ``available_tokens``, and apply the residual guard.
-    """
-
-    def __init__(self, profile: TierProfile) -> None:
-        self.profile = profile
-
-    def assemble(
-        self,
-        *,
-        system: str = "",
-        ledger_text: str = "",
-        state_text: str = "",
-        advisory_text: str = "",
-        tools_text: str = "",
-        history_messages: list[dict] | None = None,
-    ) -> AssembledTurn:
-        """Assemble the turn context.  Returns ``AssembledTurn``."""
-        profile = self.profile
-        budget = profile.budgets
-        available = profile.available_tokens
-
-        # ---- Slot 1-5: fixed (system, ledger, state, advisory, tools) -----
-        # These are pre-rendered by their owners to their slot budgets.
-        # We count them as-is; overflow must come from history or state.
-        slots_fixed = {
-            "system": system,
-            "ledger": ledger_text,
-            "state": state_text,
-            "advisory": advisory_text,
-            "tools": tools_text,
-        }
-        fixed_tokens = sum(_count_tokens(v) for v in slots_fixed.values())
-
-        # ---- Slot 6: history — compaction loop ----------------------------
-        msgs = list(history_messages or [])
-        overflow_applied = False
-        compaction_level = 0
-
-        history_budget = available - fixed_tokens
-        if history_budget < 0:
-            # Fixed slots already exceed budget; compaction cannot help here —
-            # mark overflow but don't touch history (the individual renderers
-            # are responsible for their slot budgets).
-            overflow_applied = True
-            history_text = _render_messages(msgs)
-        else:
-            history_text = _render_messages(msgs)
-            history_tokens = _count_tokens(history_text)
-
-            if history_tokens > history_budget:
-                overflow_applied = True
-                # Try compaction levels 1 → 3 until we fit.
-                for level in (1, 2, 3):
-                    msgs = _compact_messages(list(history_messages or []), level)
-                    history_text = _render_messages(msgs)
-                    history_tokens = _count_tokens(history_text)
-                    compaction_level = level
-                    if history_tokens <= history_budget:
-                        break
-                # If still over, truncate to budget_chars directly.
-                if history_tokens > history_budget:
-                    limit_chars = history_budget * _CHARS_PER_TOKEN
-                    history_text = (
-                        history_text[:limit_chars]
-                        + "\n...[history truncated for budget]"
-                    )
-                    compaction_level = 3
-
-        # ---- State shrink (second resort) ----------------------------------
-        # If fixed_tokens (including state) still exceed available after history
-        # compaction, shrink state down to STATE_FLOOR_TOKENS.
-        state_tokens = _count_tokens(state_text)
-        if fixed_tokens + _count_tokens(history_text) > available:
-            state_floor_chars = STATE_FLOOR_TOKENS * _CHARS_PER_TOKEN
-            if len(state_text) > state_floor_chars:
-                state_text = (
-                    state_text[:state_floor_chars] + "\n...[state truncated for budget]"
-                )
-                slots_fixed["state"] = state_text
-                overflow_applied = True
-
-        # ---- Assemble final text in §9.1 order ----------------------------
-        ordered = [
-            slots_fixed["system"],
-            slots_fixed["ledger"],
-            slots_fixed["state"],
-            slots_fixed["advisory"],
-            slots_fixed["tools"],
-            history_text,
-        ]
-        assembled = "\n\n".join(s.strip() for s in ordered if s.strip())
-
-        # ---- Slot token counts (for transparency / ledger logging) --------
-        slot_tokens = {name: _count_tokens(v) for name, v in slots_fixed.items()}
-        slot_tokens["history"] = _count_tokens(history_text)
-        total_tokens = sum(slot_tokens.values())
-
-        return AssembledTurn(
-            text=assembled,
-            slot_tokens=slot_tokens,
-            total_tokens=total_tokens,
-            overflow_applied=overflow_applied,
-            compaction_level=compaction_level,
-        )

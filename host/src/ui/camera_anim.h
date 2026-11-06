@@ -1,8 +1,8 @@
 #pragma once
 // Chudware camera animation (W2-D).
 //
-// Smoothly tweens the orbit camera (yaw / pitch / zoom / pan) between view states so HUD presets,
-// the gesture wheel, Normal-To and zoom-to-fit ease into place instead of snapping. The tween's
+// Smoothly tweens the orbit camera (yaw / pitch / zoom / pan) between view states so presets,
+// Normal-To and zoom-to-fit ease into place instead of snapping. The tween's
 // from/to snapshots + clock live on AppState (see the camera-animation fields in app_state.h); the
 // app has a single AppState, so cameraAnimating()/cancelCameraAnimation() reach it via a file-local
 // back-pointer set on the last requestCameraAnimation.
@@ -14,6 +14,9 @@
 struct AppState;
 
 namespace ui {
+
+enum class ViewPreset { Front, Back, Left, Right, Top, Bottom, Isometric, ZoomFit };
+void applyViewPreset(AppState& st, ViewPreset preset);
 
 // Begin a tween from the current camera to the given target. zoom < 0 keeps the current zoom; a
 // null pan keeps the current pan. Replaces any in-flight animation. Safe to call every frame from a

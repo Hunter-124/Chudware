@@ -6,10 +6,24 @@
 // is NOT mirrored here.
 #include "sourcing/sourcing.h"
 
+#include <algorithm>
+#include <cstdlib>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <mutex>
+#include <vector>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -17,6 +31,116 @@ namespace chudware {
 namespace sourcing {
 
 namespace {
+// Shared with services.parts.vendor_parts: index.json.lock, byte 0 on Windows.
+class RegistryLock {
+public:
+    explicit RegistryLock(const fs::path& index) : guard_(mutex_) {
+        fs::create_directories(index.parent_path());
+        fs::path path = index;
+        path += ".lock";
+#ifdef _WIN32
+        handle_ = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle_ == INVALID_HANDLE_VALUE) throw ProviderError("cannot open vendor registry lock");
+        OVERLAPPED position{};
+        if (!LockFileEx(handle_, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &position)) {
+            CloseHandle(handle_);
+            handle_ = INVALID_HANDLE_VALUE;
+            throw ProviderError("cannot lock vendor registry");
+        }
+        LARGE_INTEGER size{};
+        if (!GetFileSizeEx(handle_, &size)) {
+            UnlockFileEx(handle_, 0, 1, 0, &position);
+            CloseHandle(handle_);
+            handle_ = INVALID_HANDLE_VALUE;
+            throw ProviderError("cannot inspect vendor registry lock");
+        }
+        if (size.QuadPart == 0) {
+            DWORD written = 0;
+            const char byte = 0;
+            if (!WriteFile(handle_, &byte, 1, &written, nullptr) || written != 1) {
+                UnlockFileEx(handle_, 0, 1, 0, &position);
+                CloseHandle(handle_);
+                handle_ = INVALID_HANDLE_VALUE;
+                throw ProviderError("cannot initialize vendor registry lock");
+            }
+        }
+#else
+        fd_ = ::open(path.c_str(), O_CREAT | O_RDWR, 0600);
+        if (fd_ < 0) throw ProviderError("cannot open vendor registry lock");
+        if (::flock(fd_, LOCK_EX) != 0) {
+            ::close(fd_);
+            fd_ = -1;
+            throw ProviderError("cannot lock vendor registry");
+        }
+#endif
+    }
+    ~RegistryLock() {
+#ifdef _WIN32
+        if (handle_ != INVALID_HANDLE_VALUE) {
+            OVERLAPPED position{};
+            UnlockFileEx(handle_, 0, 1, 0, &position);
+            CloseHandle(handle_);
+        }
+#else
+        if (fd_ >= 0) { ::flock(fd_, LOCK_UN); ::close(fd_); }
+#endif
+    }
+    RegistryLock(const RegistryLock&) = delete;
+    RegistryLock& operator=(const RegistryLock&) = delete;
+private:
+    static std::mutex mutex_;
+    std::lock_guard<std::mutex> guard_;
+#ifdef _WIN32
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+#else
+    int fd_ = -1;
+#endif
+};
+std::mutex RegistryLock::mutex_;
+
+void write_index_atomic(const fs::path& index, const std::string& payload) {
+#ifdef _WIN32
+    wchar_t temp[MAX_PATH];
+    if (!GetTempFileNameW(index.parent_path().c_str(), L"vnd", 0, temp))
+        throw ProviderError("cannot create vendor registry staging file");
+    HANDLE file = CreateFileW(temp, GENERIC_WRITE, 0, nullptr, TRUNCATE_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    bool ok = file != INVALID_HANDLE_VALUE;
+    size_t offset = 0;
+    while (ok && offset < payload.size()) {
+        DWORD n = 0;
+        DWORD amount = static_cast<DWORD>((std::min)(payload.size() - offset, size_t(1 << 20)));
+        ok = WriteFile(file, payload.data() + offset, amount, &n, nullptr) && n;
+        offset += n;
+    }
+    if (ok) ok = FlushFileBuffers(file);
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    if (ok) ok = MoveFileExW(temp, index.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    if (!ok) { DeleteFileW(temp); throw ProviderError("cannot write vendor registry"); }
+#else
+    std::string pattern = (index.parent_path() / ".vendor-index-XXXXXX").string();
+    std::vector<char> name(pattern.begin(), pattern.end());
+    name.push_back('\0');
+    int fd = ::mkstemp(name.data());
+    if (fd < 0) throw ProviderError("cannot create vendor registry staging file");
+    size_t offset = 0;
+    bool ok = true;
+    while (offset < payload.size()) {
+        auto n = ::write(fd, payload.data() + offset, payload.size() - offset);
+        if (n <= 0) { ok = false; break; }
+        offset += static_cast<size_t>(n);
+    }
+    if (ok) ok = ::fsync(fd) == 0;
+    if (::close(fd) != 0) ok = false;
+    if (ok) ok = ::rename(name.data(), index.c_str()) == 0;
+    if (!ok) { ::unlink(name.data()); throw ProviderError("cannot write vendor registry"); }
+    int dir = ::open(index.parent_path().c_str(), O_RDONLY);
+    if (dir >= 0) { ::fsync(dir); ::close(dir); }
+#endif
+}
+
 
 double file_mtime_epoch(const fs::path& p) {
     std::error_code ec;
@@ -40,6 +164,7 @@ std::string detect_format(const fs::path& p) {
     std::string ext = p.extension().string();
     for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     if (ext == ".step" || ext == ".stp") return "step";
+    if (ext == ".step+") return "step+";
     if (ext == ".igs" || ext == ".iges") return "iges";
     if (ext == ".brep") return "brep";
     if (ext == ".stl") return "stl";
@@ -49,14 +174,14 @@ std::string detect_format(const fs::path& p) {
 json load_index(const fs::path& index) {
     std::error_code ec;
     if (!fs::exists(index, ec)) return json::object();
+    std::ifstream in(index);
+    if (!in) throw ProviderError("cannot read vendor registry");
     try {
-        std::ifstream in(index);
-        std::stringstream ss;
-        ss << in.rdbuf();
-        json data = json::parse(ss.str());
-        return data.is_object() ? data : json::object();
-    } catch (...) {
-        return json::object();
+        json data = json::parse(in);
+        if (!data.is_object()) throw ProviderError("vendor registry must be a JSON object");
+        return data;
+    } catch (const json::exception&) {
+        throw ProviderError("invalid vendor registry JSON");
     }
 }
 
@@ -117,10 +242,14 @@ json register_local_cad(const std::string& supplier, const std::string& part_num
 
     const fs::path root = vendor_parts_dir();
     const fs::path index = root / "index.json";
+    RegistryLock lock(index);
     json idx = load_index(index);
     const std::string key = vendor_slug(supplier) + "::" + vendor_slug(part_number);
     const bool creating = !idx.contains(key) || !idx[key].is_object();
     json rec = creating ? json::object() : idx[key];
+    if (!creating && (rec.value("supplier", std::string()) != supplier ||
+                      rec.value("part_number", std::string()) != part_number))
+        throw ProviderError("vendor registry key collision: " + key);
     const double write_ts = now_epoch();
 
     rec["supplier"] = supplier;
@@ -182,11 +311,7 @@ json register_local_cad(const std::string& supplier, const std::string& part_num
 
     rec["updated_ts"] = write_ts;
     idx[key] = rec;
-    std::error_code ec;
-    fs::create_directories(root, ec);
-    std::ofstream out(index);
-    if (!out) throw ProviderError("cannot write vendor index: " + index.string());
-    out << idx.dump(2);  // object keys sort lexicographically, matching sort_keys=True
+    write_index_atomic(index, idx.dump(2));
     return rec;
 }
 

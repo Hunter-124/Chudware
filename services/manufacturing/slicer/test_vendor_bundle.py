@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from ..print_safety import UnsafePrintFile
 from .vendor_bundle import ProfileCatalog, evaluate_condition, write_ini
 
 
@@ -88,6 +89,20 @@ def test_resolve_defaults_and_layer_height_quality_ties(catalog, tmp_path):
     assert 'start_gcode = G28\\nM109 S220\n' in ini.read_text()
     assert 'inherits =' not in ini.read_text()
     assert 'compatible_printers_condition =' not in ini.read_text()
+
+
+@pytest.mark.parametrize('alias_kind', ['symlink', 'hardlink'])
+def test_write_ini_refuses_firmware_alias(tmp_path, alias_kind):
+    firmware = tmp_path / 'firmware.bin'
+    firmware.write_bytes(b'original firmware')
+    ini = tmp_path / 'config.ini'
+    if alias_kind == 'symlink':
+        ini.symlink_to(firmware)
+    else:
+        ini.hardlink_to(firmware)
+    with pytest.raises(UnsafePrintFile):
+        write_ini({'layer_height': '0.2'}, ini)
+    assert firmware.read_bytes() == b'original firmware'
 
 
 @pytest.mark.parametrize('expression, expected', [

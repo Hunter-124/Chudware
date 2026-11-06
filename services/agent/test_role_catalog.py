@@ -13,6 +13,22 @@ def test_catalog_includes_model3d_sketch2d():
     assert "delegate" in blk.lower()
 
 
+def test_catalog_uses_live_role_goals_and_excludes_unknown_roles(monkeypatch):
+    from types import SimpleNamespace
+    from services.agent import roles
+
+    monkeypatch.setattr(roles, "load_all_roles", lambda: {
+        "custom": SimpleNamespace(goal="Design a custom interface."),
+        "reviewer": SimpleNamespace(goal="Check measured evidence."),
+    })
+    block = format_role_catalog_block(max_roles=None)
+    assert "- **custom**: Design a custom interface." in block
+    assert "- **reviewer**: Check measured evidence." in block
+    assert "model3d" not in block.split("Catalog:", 1)[1]
+    selected = format_role_catalog_block(role_ids=["custom", "missing"], include_header=False)
+    assert selected == "- **custom**: Design a custom interface."
+
+
 def test_harness_context():
     h = harness_context_block()
     assert "OpenCASCADE" in h or "B-rep" in h

@@ -1,4 +1,4 @@
-"""Phase-3 hostd doc-registry tests: attach modes, edit-holds, overlap CAS,
+"""Hostd doc-registry tests: attach modes, edit-holds, sequential writers,
 event bus, _foreign_edits piggyback, daemon-side autosave + recovery.
 
 Each test uses a scratch CHUDWARE_INSTANCE_KEY (its own daemon, its own
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import tempfile
 import threading
@@ -161,10 +162,10 @@ def test_doc_list_other_writer_distinguishes_writer_groups(scratch_daemon):
         for client in (owner, sibling, outsider, plain):
             client.close()
 
-# -------------------------------------------------------------- overlap CAS
+# ------------------------------------------------------- sequential writers
 
 
-def test_two_writer_cas_stale_revision(scratch_daemon):
+def test_two_writers_serialize_without_implicit_cas(scratch_daemon):
     a, b = DaemonClient(), DaemonClient()
     a.connect()
     scratch_daemon.append(_pid(a))
@@ -173,19 +174,12 @@ def test_two_writer_cas_stale_revision(scratch_daemon):
     # B becomes the second writer at revision 0.
     assert b.call("attach_doc", {"doc_id": doc, "mode": "rw"}).get("ok") is True
 
-    # A edits -> revision 1. B's next apply WITHOUT base_revision gets B's
-    # last-seen (0) injected by the daemon -> engine stale_revision CAS fires.
-    r_a = a.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})
-    assert r_a.get("revision") == 1
-    r_b = b.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops("b2")})
-    assert r_b.get("_is_error") is True
-    assert r_b.get("code") == "stale_revision"
-
-    # CAS-retry path: B re-reads (advancing its last-seen) and the retry lands.
-    b.call("doc_tree", {"doc_id": doc})
-    r_b2 = b.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops("b3")})
-    assert r_b2.get("_is_error") is None
-    assert r_b2.get("revision") == 2
+    assert a.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})["revision"] == 1
+    # Explicit revision guards still work, but the daemon never invents one.
+    stale = b.call("doc_apply_ops", {"doc_id": doc, "base_revision": 0, "ops": _box_ops("b2")})
+    assert stale.get("_is_error") is True and stale.get("code") == "stale_revision"
+    accepted = b.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops("b3")})
+    assert accepted.get("_is_error") is None and accepted.get("revision") == 2
 
 
 def test_single_writer_no_cas_injection(scratch_daemon):
@@ -270,7 +264,7 @@ def test_writer_group_is_one_writer_and_keeps_connection_fanout(scratch_daemon):
     assert not _events(b, "doc.changed")
 
 
-def test_writer_group_shares_cas_revision_but_not_with_outsider(scratch_daemon):
+def test_writer_group_and_outsider_edits_are_sequential(scratch_daemon):
     a = DaemonClient(writer_group="g1")
     b = DaemonClient(writer_group="g1")
     c = DaemonClient(writer_group="")
@@ -283,21 +277,16 @@ def test_writer_group_shares_cas_revision_but_not_with_outsider(scratch_daemon):
     outsider = c.call("attach_doc", {"doc_id": doc, "mode": "rw"})
     assert "another writer" in (outsider.get("warning") or ""), outsider
     assert a.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})["revision"] == 1
-    # With TWO logical writers, CAS is enabled, but B shares A's latest revision.
+    # Group members share attribution but all writers may submit sequentially.
     edited = b.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops("group-cas-b")})
     assert edited.get("_is_error") is None, edited
     assert edited["revision"] == 2
     assert "_foreign_edits" not in edited, edited
-    stale = c.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops("group-cas-c")})
-    assert stale.get("_is_error") is True, stale
-    assert stale.get("code") == "stale_revision", stale
-    foreign = c.call("doc_tree", {"doc_id": doc})
+    foreign = c.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops("group-cas-c")})
+    assert foreign.get("_is_error") is None and foreign["revision"] == 3, foreign
     assert foreign["_foreign_edits"][0]["revision"] == 2, foreign
-    assert c.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops("outsider")})[
-        "revision"
-    ] == 3
 
-    # One group member's READ catches up the entire group for the next CAS write.
+    # A group member's read still catches up attribution for the entire group.
     assert a.call("doc_tree", {"doc_id": doc})["_foreign_edits"][0]["revision"] == 3
     caught_up = b.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops("group-retry")})
     assert caught_up.get("_is_error") is None, caught_up
@@ -470,6 +459,162 @@ def test_doc_changed_event_reaches_subscriber(scratch_daemon):
     assert not _events(a, "doc.changed")
 
 
+def test_human_dirty_tracks_revision_and_guarded_saves(scratch_daemon, tmp_path):
+    gui = _gui_client(scratch_daemon)
+    agent = DaemonClient()
+    agent.connect()
+    gui.call("subscribe", {"doc_ids": "*"})
+    doc = gui.call("doc_new", {"name": "dirty-provenance"})["doc_id"]
+    changed = agent.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})
+    assert changed["revision"] == 1
+    event = _events(gui, "doc.changed")[-1]["data"]
+    assert event["source_kind"] == "mcp" and event["human_dirty"] is False
+    row = next(row for row in gui.call("doc_list")["docs"] if row["doc_id"] == doc)
+    assert row["origin_kind"] == "gui" and row["human_dirty"] is False
+    assert row["saved_revision"] == -1
+    agent.call("detach_doc", {"doc_id": doc})
+    gui.call("doc_tree", {"doc_id": doc})
+    human = gui.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops("human")})
+    assert human["revision"] == 2
+    row = next(row for row in gui.call("doc_list")["docs"] if row["doc_id"] == doc)
+    assert row["human_dirty"] is True
+    skipped = agent.call("doc_save", {"doc_id": doc, "path": str(tmp_path / "guarded.step+"),
+                                      "if_no_human_dirty": True})
+    assert skipped.get("code") == "human_dirty", skipped
+    snapshot = gui.call("doc_save", {"doc_id": doc, "path": str(tmp_path / "snapshot.step+"),
+                                      "preserve_path": True})
+    assert snapshot["human_dirty"] is True and snapshot["saved_revision"] == 2
+    row = next(row for row in gui.call("doc_list")["docs"] if row["doc_id"] == doc)
+    assert row["human_dirty"] is True and row["saved_revision"] == -1
+    saved = gui.call("doc_save", {"doc_id": doc, "path": str(tmp_path / "saved.step+")})
+    assert saved["saved_revision"] == 2 and saved["human_dirty"] is False
+    gui.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops("derived"), "origin": "system"})
+    row = next(row for row in gui.call("doc_list")["docs"] if row["doc_id"] == doc)
+    assert row["human_dirty"] is False and row["saved_revision"] == 2
+
+
+def test_metadata_only_human_edit_stays_dirty_until_saved(scratch_daemon, tmp_path):
+    gui = _gui_client(scratch_daemon)
+    observer = DaemonClient()
+    observer.connect()
+    observer.call("subscribe", {"doc_ids": "*"})
+    doc = gui.call("doc_new", {"name": "metadata-only"})["doc_id"]
+    gui.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})
+    saved = gui.call("doc_save", {"doc_id": doc, "path": str(tmp_path / "metadata.step+")})
+    _events(observer, "doc.changed.notice")
+    edit = gui.call("doc_set_meta", {"doc_id": doc, "key": "inspection", "value": {"x": 1}})
+    assert edit["revision"] == saved["saved_revision"]
+    assert edit["metadata_revision"] > saved["metadata_revision"]
+    notices = _events(observer, "doc.changed.notice")
+    notice = next(event["data"] for event in notices if event["data"].get("doc_id") == doc)
+    assert notice["method"] == "doc_set_meta" and notice["human_dirty"] is True
+    assert notice["metadata_revision"] == edit["metadata_revision"]
+    row = next(row for row in gui.call("doc_list")["docs"] if row["doc_id"] == doc)
+    assert row["human_dirty"] is True and row["saved_metadata_revision"] == saved["metadata_revision"]
+    saved_again = gui.call("doc_save", {"doc_id": doc})
+    assert saved_again["metadata_revision"] == edit["metadata_revision"]
+    assert saved_again["human_dirty"] is False
+    same_name = gui.call("doc_set_name", {"doc_id": doc, "name": "metadata-only"})
+    assert same_name["metadata_revision"] == edit["metadata_revision"]
+    row = next(row for row in gui.call("doc_list")["docs"] if row["doc_id"] == doc)
+    assert row["human_dirty"] is False
+    renamed = gui.call("doc_set_name", {"doc_id": doc, "name": "renamed"})
+    assert renamed["revision"] == saved["saved_revision"]
+    assert renamed["metadata_revision"] > saved_again["metadata_revision"]
+    row = next(row for row in gui.call("doc_list")["docs"] if row["doc_id"] == doc)
+    assert row["human_dirty"] is True
+    assert gui.call("doc_snapshot", {"doc_id": doc})["tree"]["name"] == "renamed"
+
+
+def test_external_rewrite_reloads_clean_doc_and_conflicts_with_human_edits(
+    scratch_daemon, tmp_path
+):
+    gui = _gui_client(scratch_daemon)
+    gui.call("subscribe", {"doc_ids": "*"})
+    target = tmp_path / "watched.step+"
+    doc = gui.call("doc_new", {"name": "watched"})["doc_id"]
+    gui.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})
+    assert gui.call("doc_save", {"doc_id": doc, "path": str(target)})["human_dirty"] is False
+    source = DaemonClient()
+    source.connect()
+    replacement_doc = source.call("doc_new", {"name": "replacement"})["doc_id"]
+    source.call("doc_apply_ops", {"doc_id": replacement_doc, "ops": _box_ops("external")})
+    replacement = tmp_path / "replacement.step+"
+    source.call("doc_save", {"doc_id": replacement_doc, "path": str(replacement)})
+    backup = tmp_path / "backup.step+"
+    shutil.copyfile(replacement, backup)
+    _events(gui, "doc.changed")
+    os.replace(replacement, target)
+
+    deadline = time.monotonic() + 20
+    reloaded = None
+    while time.monotonic() < deadline and reloaded is None:
+        for event in _events(gui, "doc.changed"):
+            data = event["data"]
+            if data.get("doc_id") == doc and data.get("method") == "doc_reload":
+                reloaded = data
+                break
+        if reloaded is None:
+            time.sleep(0.2)
+    assert reloaded is not None, "external stable rewrite did not reload"
+    assert reloaded["source_kind"] == "system" and reloaded["human_dirty"] is False
+    assert reloaded["tree"]["name"] == "replacement"
+
+    local = gui.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops("local")})
+    assert local["revision"] > reloaded["revision"]
+    staging = tmp_path / "external-again.step+"
+    shutil.copyfile(backup, staging)
+    os.replace(staging, target)
+    deadline = time.monotonic() + 20
+    conflicts = []
+    while time.monotonic() < deadline and not conflicts:
+        conflicts = [event for event in _events(gui, "doc.disk_conflict")
+                     if event["data"].get("doc_id") == doc]
+        if not conflicts:
+            time.sleep(0.2)
+    assert len(conflicts) == 1 and conflicts[0]["data"]["path"] == str(target)
+    stamp = conflicts[0]["data"]["observed_stamp"]
+    assert set(stamp) == {"size", "mtime_ns", "ino"}
+    time.sleep(5)
+    assert not _events(gui, "doc.disk_conflict"), "one disk stamp must not repeatedly notify"
+    row = next(row for row in gui.call("doc_list")["docs"] if row["doc_id"] == doc)
+    assert row["human_dirty"] is True and row["revision"] == local["revision"]
+
+
+def test_external_rewrite_preserves_unsaved_agent_revision(scratch_daemon, tmp_path):
+    gui = _gui_client(scratch_daemon)
+    gui.call("subscribe", {"doc_ids": "*"})
+    path = tmp_path / "agent-work.step+"
+    doc = gui.call("doc_new", {"name": "agent-work"})["doc_id"]
+    gui.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})
+    gui.call("doc_save", {"doc_id": doc, "path": str(path)})
+    agent = DaemonClient()
+    agent.connect()
+    edited = agent.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops("unsaved-agent")})
+    assert edited["revision"] == 2
+    row = next(row for row in gui.call("doc_list")["docs"] if row["doc_id"] == doc)
+    assert row["dirty"] is True and row["human_dirty"] is False
+
+    replacement = tmp_path / "incoming.step+"
+    incoming = agent.call("doc_new", {"name": "incoming"})["doc_id"]
+    agent.call("doc_apply_ops", {"doc_id": incoming, "ops": _box_ops("incoming")})
+    agent.call("doc_save", {"doc_id": incoming, "path": str(replacement)})
+    _events(gui, "doc.changed")
+    os.replace(replacement, path)
+    deadline = time.monotonic() + 20
+    reloaded = None
+    while time.monotonic() < deadline and reloaded is None:
+        reloaded = next((event["data"] for event in _events(gui, "doc.changed")
+                         if event["data"].get("doc_id") == doc and
+                         event["data"].get("method") == "doc_reload"), None)
+        if reloaded is None:
+            time.sleep(0.2)
+    assert reloaded is not None and reloaded["tree"]["name"] == "incoming"
+    entries = gui.call("recovery_list", {"scope": "ai"})["entries"]
+    assert any(entry.get("doc_id") == doc and entry.get("revision") == 2 and
+               entry.get("human_dirty") is False for entry in entries), entries
+
+
 def test_study_mutation_announces_studies_changed(scratch_daemon):
     """An agent's persisted study (FEA results, a simulate_motion sweep) bumps the revision
     with no tree, so it must arrive as doc.studies_changed — never as a doc.changed the GUI
@@ -565,300 +710,6 @@ def test_doc_snapshot_mint_seed_yields_to_real_geometry(scratch_daemon):
     assert live["aicm_path"] != seed["aicm_path"]
 
 
-def _configure_full_mock_agent(monkeypatch, tmp_path) -> None:
-    """Keep agent_run_v2 on the full in-process run.cpp path, never the micro lane."""
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
-    cfg_dir = tmp_path / "Chudware"
-    cfg_dir.mkdir(parents=True, exist_ok=True)
-    (cfg_dir / "config.json").write_text(
-        json.dumps({"micro_mode": False}), encoding="utf-8"
-    )
-
-
-def _agent_assembly_provider(assembly_name: str) -> dict:
-    # Child runs intentionally receive an unparseable modeler reply. They remain at revision 0,
-    # giving the spectator a stable mint-time snapshot to inspect after the opaque RPC returns.
-    plan = {
-        "assembly": True,
-        "name": assembly_name,
-        "parts": [
-            {
-                "name": assembly_name + "_A",
-                "purpose": "probe child A",
-                "dimensions": {},
-                "features": ["box"],
-                "placement": {"pos": [0, 0, 0], "rot": [0, 0, 0]},
-            },
-            {
-                "name": assembly_name + "_B",
-                "purpose": "probe child B",
-                "dimensions": {},
-                "features": ["box"],
-                "placement": {"pos": [20, 0, 0], "rot": [0, 0, 0]},
-            },
-        ],
-    }
-    return {
-        "name": "mock",
-        "replies": {
-            "intake": [
-                json.dumps(
-                    {
-                        "object": "two-part assembly",
-                        "key_dims": {"span": 40},
-                        "features": ["two child parts"],
-                    }
-                )
-            ],
-            "planner": [json.dumps(plan)],
-            "modeler": ["not-json"],
-        },
-    }
-
-
-def _run_agent_assembly(
-    runner: DaemonClient, assembly_name: str, *, internal: bool = False
-) -> dict:
-    seed = runner.call("doc_new", {"name": "RegistrySeed" + uuid.uuid4().hex[:8]})[
-        "doc_id"
-    ]
-    return runner.call(
-        "agent_run_v2",
-        {
-            "request": "Build a two-part mechanical assembly with separate child parts",
-            "doc_id": seed,
-            "provider": _agent_assembly_provider(assembly_name),
-            "options": {
-                "offline": True,
-                "complexity": "complex",
-                "advisor": False,
-                "internal": internal,
-                "run_id": "registry-" + uuid.uuid4().hex[:8],
-            },
-        },
-    )
-
-
-def _agent_spectator(scratch_daemon) -> tuple[DaemonClient, DaemonClient]:
-    runner, spectator = DaemonClient(), DaemonClient()
-    runner.connect()
-    scratch_daemon.append(_pid(runner))
-    runner.call("subscribe", {"doc_ids": "*"})
-    spectator.connect()
-    spectator.call("subscribe", {"doc_ids": "*"})
-    return runner, spectator
-
-
-def _drain_all(c: DaemonClient) -> list:
-    c.call("ping")
-    return c.poll_events()
-
-
-def test_inprocess_agent_mint_reaches_spectator(scratch_daemon, monkeypatch, tmp_path):
-    """A child doc created inside opaque agent_run_v2 is announced before its first mutation."""
-    _configure_full_mock_agent(monkeypatch, tmp_path)
-    runner, spectator = _agent_spectator(scratch_daemon)
-    name = "AgentMint" + uuid.uuid4().hex[:6]
-    _run_agent_assembly(runner, name)
-    time.sleep(0.2)
-    events = _drain_all(spectator)
-
-    child = name + "_A"
-    opened_at = next(
-        i
-        for i, e in enumerate(events)
-        if e.get("event") == "doc.opened" and e.get("data", {}).get("name") == child
-    )
-    child_doc = events[opened_at]["data"]["doc_id"]
-    changed_at = [
-        i
-        for i, e in enumerate(events)
-        if e.get("event") == "doc.changed"
-        and e.get("data", {}).get("doc_id") == child_doc
-    ]
-    assert not changed_at or opened_at < changed_at[0], events
-    assert events[opened_at]["data"]["source_kind"] == "agent"
-    assert events[opened_at]["data"]["revision"] == 0
-    source_events = _drain_all(runner)
-    assert any(
-        e.get("event") == "doc.opened" and e.get("data", {}).get("doc_id") == child_doc
-        for e in source_events
-    ), source_events
-
-
-def test_inprocess_agent_mint_seeds_revision_zero_snapshot(
-    scratch_daemon, monkeypatch, tmp_path
-):
-    """The bare child remains spectatable at revision 0 without taking its engine lock."""
-    _configure_full_mock_agent(monkeypatch, tmp_path)
-    runner, spectator = _agent_spectator(scratch_daemon)
-    name = "AgentSnap" + uuid.uuid4().hex[:6]
-    _run_agent_assembly(runner, name)
-    time.sleep(0.2)
-    events = _drain_all(spectator)
-    opened = next(
-        e
-        for e in events
-        if e.get("event") == "doc.opened"
-        and e.get("data", {}).get("name") == name + "_A"
-    )
-
-    snap = spectator.call("doc_snapshot", {"doc_id": opened["data"]["doc_id"]})
-    assert snap.get("has_snapshot") is True, snap
-    assert snap["revision"] == 0
-    assert snap["method"] == "doc_new"
-    assert snap["source_kind"] == "agent"
-    assert snap["tree"]["features"] == []
-    assert snap["tree"]["name"] == name + "_A"
-
-
-def test_inprocess_agent_apply_publishes_each_feature_batch(
-    scratch_daemon, monkeypatch, tmp_path
-):
-    """Two modeler commits are two live doc.changed pushes, not one terminal resync."""
-    _configure_full_mock_agent(monkeypatch, tmp_path)
-    runner, spectator = _agent_spectator(scratch_daemon)
-    doc = runner.call("doc_new", {"name": "AgentBatches"})["doc_id"]
-    time.sleep(0.1)
-    _drain_all(spectator)  # discard the ordinary socket-level mint
-
-    first = [
-        {
-            "op": "add_feature",
-            "feature": {
-                "type": "box",
-                "name": "Base",
-                "params": {"length": 10, "width": 10, "height": 10},
-                "refs": {},
-            },
-        }
-    ]
-    second = [
-        {
-            "op": "add_feature",
-            "feature": {
-                "type": "box",
-                "name": "Second",
-                "params": {"length": 5, "width": 5, "height": 5, "at": [20, 0, 0]},
-                "refs": {},
-            },
-        }
-    ]
-    provider = {
-        "name": "mock",
-        "replies": {
-            "intake": [
-                json.dumps(
-                    {
-                        "object": "two-box probe",
-                        "key_dims": {"size": 10},
-                        "features": ["base", "second box"],
-                    }
-                )
-            ],
-            "planner": [
-                json.dumps(
-                    {
-                        "parts": [
-                            {
-                                "name": "probe",
-                                "purpose": "registry publication",
-                                "dimensions": {"base": 10},
-                                "features": ["add the second box"],
-                            }
-                        ]
-                    }
-                )
-            ],
-            "modeler": [json.dumps(first), json.dumps(second)],
-            "reviewer": [json.dumps({"done": True, "issues": []})],
-            "memory": [
-                json.dumps(
-                    {
-                        "name": "Agent Batch Probe",
-                        "summary": "two-box registry probe",
-                        "decisions": [],
-                        "open_issues": [],
-                    }
-                )
-            ],
-        },
-    }
-    result = runner.call(
-        "agent_run_design",
-        {
-            "request": "Build a simple two-box probe",
-            "doc_id": doc,
-            "provider": provider,
-            "options": {
-                "offline": True,
-                "complexity": "standard",
-                "advisor": False,
-                "run_id": "registry-batches-" + uuid.uuid4().hex[:6],
-            },
-        },
-    )
-    assert result.get("_is_error") is None, result
-    time.sleep(0.2)
-    changed = [
-        e
-        for e in _drain_all(spectator)
-        if e.get("event") == "doc.changed" and e.get("data", {}).get("doc_id") == doc
-    ]
-    snap = spectator.call("doc_snapshot", {"doc_id": doc})
-    assert [e["data"]["revision"] for e in changed] == [1, 2], {
-        "changed": changed,
-        "result": result,
-        "snapshot": snap,
-        "tree": spectator.call("doc_tree", {"doc_id": doc}),
-    }
-    assert all(e["data"]["method"] == "doc_apply_ops" for e in changed)
-    assert [len(e["data"]["tree"]["features"]) for e in changed] == [1, 2]
-
-
-def test_inprocess_internal_agent_docs_are_registered_but_silent(
-    scratch_daemon, monkeypatch, tmp_path
-):
-    """The preflight-style internal flag keeps nested mints out of every subscriber feed."""
-    _configure_full_mock_agent(monkeypatch, tmp_path)
-    runner, spectator = _agent_spectator(scratch_daemon)
-    name = "AgentShadow" + uuid.uuid4().hex[:6]
-    result = _run_agent_assembly(runner, name, internal=True)
-    runner_events = _drain_all(runner)
-    child_run_prefix = str(result["run_id"]) + "-p"
-    internal_docs = {
-        e["data"]["doc_id"]
-        for e in runner_events
-        if e.get("event") == "agent.event"
-        and e.get("data", {}).get("kind") == "run_started"
-        and str(e["data"].get("run_id", "")).startswith(child_run_prefix)
-    }
-    assert len(internal_docs) == 2, runner_events
-
-    time.sleep(0.2)
-    events = _drain_all(spectator)
-    assert not [
-        e
-        for e in events
-        if e.get("event") in {"doc.opened", "doc.changed"}
-        and (
-            e.get("data", {}).get("doc_id") in internal_docs
-            or str(e.get("data", {}).get("name", "")).startswith(name)
-        )
-    ], events
-
-    # Internal registration is observable by ABSENCE from doc_list: annotateDocList filters a
-    # document only when DocRegistry::postCall recorded DocState::internal. If the nested hook is
-    # reverted, the engine still holds these child parts but the registry first sees them as
-    # normal docs, so they leak into this list and the control fails.
-    listed = {d["doc_id"] for d in spectator.call("doc_list", {})["docs"]}
-    assert internal_docs.isdisjoint(listed), {
-        "result": result,
-        "internal_docs": sorted(internal_docs),
-        "listed": sorted(listed),
-    }
-
-
 def test_doc_snapshot_skips_internal_doc(scratch_daemon):
     """A doc minted {"internal": true} (the agent's preflight shadow clone) is never
     announced, so it must not become spectatable through the snapshot seed either."""
@@ -867,6 +718,9 @@ def test_doc_snapshot_skips_internal_doc(scratch_daemon):
     scratch_daemon.append(_pid(a))
     b.connect()
     doc = a.call("doc_new", {"name": "shadow", "internal": True})["doc_id"]
+    assert b.call("doc_snapshot", {"doc_id": doc}).get("has_snapshot") is False
+    edited = a.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})
+    assert not edited.get("_is_error"), edited
     assert b.call("doc_snapshot", {"doc_id": doc}).get("has_snapshot") is False
 
 
@@ -940,9 +794,7 @@ def test_disconnect_emits_last_writer_detached(scratch_daemon):
 
 
 def test_doc_close_degrades_to_detach_with_other_writer(scratch_daemon):
-    """A co-edited doc must not be destroyed by one client's doc_close: it degrades
-    to a detach unless force:true. Protects a user-adopted doc from an agent's
-    close_part (and vice versa)."""
+    """Every other attachment blocks close, even when force is requested."""
     a, b = DaemonClient(), DaemonClient()
     a.connect()
     scratch_daemon.append(_pid(a))
@@ -961,12 +813,9 @@ def test_doc_close_degrades_to_detach_with_other_writer(scratch_daemon):
         is None
     )
 
-    # A can still FORCE the close even though B holds rw (explicit override).
-    assert a.call("doc_close", {"doc_id": doc, "force": True}).get("_is_error") is None
-    time.sleep(0.1)
-    assert all(e.get("doc_id") != doc for e in b.call("doc_list", {})["docs"]), (
-        "doc gone"
-    )
+    # Force cannot destroy another client's live document.
+    assert a.call("doc_close", {"doc_id": doc, "force": True}).get("detached") is True
+    assert any(e.get("doc_id") == doc for e in b.call("doc_list", {})["docs"])
 
 
 def test_gc_retires_only_undelivered_docs(scratch_daemon, monkeypatch, tmp_path):
@@ -1046,14 +895,8 @@ def test_gc_purges_internal_docs_instead_of_retiring_them(scratch_daemon, monkey
     assert not any((n or "").endswith("_pf") for n in names), names
 
 
-def test_gc_closes_a_pristine_import_without_a_recovery_row(
-    scratch_daemon, monkeypatch, tmp_path
-):
-    """A doc that is only an unmodified import of a file still on disk is reproducible
-    scratch — an agent's body-roster probe import. The terminal save sweep no longer
-    writes it into the project (2026-09-24), so hostd must not retire it either, or the
-    litter just moves into the "Recover unsaved parts?" prompt. The same import with an
-    authored feature on top is the control: still retired."""
+def test_gc_preserves_imports_even_when_source_exists(scratch_daemon, monkeypatch, tmp_path):
+    """The source file alone does not prove an imported document is reproducible."""
     monkeypatch.setenv("CHUDWARE_DOC_GC_GRACE_S", "1")
     monkeypatch.setenv("CHUDWARE_DOC_GC_AGENT_GRACE_S", "1")
     keep = DaemonClient()
@@ -1082,11 +925,11 @@ def test_gc_closes_a_pristine_import_without_a_recovery_row(
         time.sleep(0.5)
         ids = {e.get("doc_id") for e in keep.call("recovery_list").get("entries", [])}
         open_ids = {d.get("doc_id") for d in keep.call("doc_list", {}).get("docs", [])}
-        if placed in ids and probe not in open_ids:
+        if placed in ids and probe in ids and probe not in open_ids:
             break
-    assert placed in ids, "control: an import with authored work MUST still be retired"
-    assert probe not in open_ids, "GC must still close the reproducible doc"
-    assert probe not in ids, "a pristine import of an existing file must not be recovered"
+    assert placed in ids, "an import with authored work must be retired"
+    assert probe not in open_ids, "GC must close the abandoned import"
+    assert probe in ids, "the source path does not prove its imported state was delivered"
 
 
 # ------------------------------------------------------------ foreign edits
@@ -1110,9 +953,8 @@ def test_foreign_edits_piggyback(scratch_daemon):
     assert "_foreign_edits" not in b.call("doc_tree", {"doc_id": doc})
 
 
-def test_foreign_edits_surface_in_tool_note(scratch_daemon, monkeypatch):
-    """core_bridge strips _foreign_edits into a buffer; cad_tools._dumps appends
-    the human-readable note."""
+def test_foreign_edits_surface_in_tool_json(scratch_daemon, monkeypatch):
+    """Foreign-edit records remain structured and the response is valid JSON."""
     monkeypatch.setenv("CHUDWARE_ENGINE_DAEMON", "1")
     monkeypatch.setattr(daemon_bridge, "_clients", threading.local())
     monkeypatch.setattr(daemon_bridge, "_group_session_established", threading.Event())
@@ -1127,26 +969,30 @@ def test_foreign_edits_surface_in_tool_note(scratch_daemon, monkeypatch):
 
     r = core_bridge.call("doc_tree", {"doc_id": doc})
     assert "_foreign_edits" not in r, "bridge must strip the marker from results"
-    note = cad_tools._dumps({"ok": True})
-    assert "edited part" in note and doc in note, note
-    # Consumed: the next output is clean.
-    assert "edited part" not in cad_tools._dumps({"ok": True})
+    payload = json.loads(cad_tools._dumps({"ok": True}))
+    assert payload["foreign_edits"][0]["doc_id"] == doc
+    assert "foreign_edits" not in json.loads(cad_tools._dumps({"ok": True}))
 
 
 # ------------------------------------------------------- autosave + recovery
 
 
 def test_crash_recovery_prompts_via_orphan_tier(scratch_daemon):
-    """A hard CRASH is the only path that feeds the recovery tier. The survivor is
-    NOT auto-opened (that silently resurrected zombie parts) — it waits in
-    recovery_list until an explicit recovery_open, which mints a fresh id, carries
-    both doc_id + original_doc_id, and rebinds the old handle in hello."""
+    """A crash survivor without a bound path waits for explicit recovery_open."""
     a = DaemonClient()
     a.connect()
     pid = _pid(a)
     doc = a.call("doc_new", {"name": "recover-me"})["doc_id"]
     a.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})
     time.sleep(2.5)  # CHUDWARE_AUTOSAVE_INTERVAL_S=1 -> at least one tick saved it
+    # A metadata-only change leaves the geometry revision unchanged but must be
+    # present in the next crash snapshot.
+    rev = next(row["revision"] for row in a.call("doc_list", {})["docs"]
+               if row["doc_id"] == doc)
+    a.call("doc_set_meta", {"doc_id": doc, "key": "fixture", "value": {"note": "after autosave"}})
+    assert next(row["revision"] for row in a.call("doc_list", {})["docs"]
+                if row["doc_id"] == doc) == rev
+    time.sleep(2.5)
 
     os.kill(pid, signal.SIGKILL)  # hard crash: no final save, autosave is all we have
     time.sleep(0.3)
@@ -1182,8 +1028,99 @@ def test_crash_recovery_prompts_via_orphan_tier(scratch_daemon):
     assert docs[new_id]["name"] == "recover-me"
     tree = b.call("doc_tree", {"doc_id": new_id})
     assert "b1" in str(tree.get("tree")), "recovered doc lost its geometry"
+    assert b.call("doc_get_meta", {"doc_id": new_id, "key": "fixture"})["value"] == {
+        "note": "after autosave"}
     # Consumed: a second recovery_open must not duplicate it.
     assert b.call("recovery_list", {}).get("entries") == []
+
+
+def _reference_only_part(client, tmp_path, name):
+    source = tmp_path / (name + ".ply")
+    source.write_text("ply\nformat ascii 1.0\nelement vertex 3\n"
+                      "property float x\nproperty float y\nproperty float z\n"
+                      "element face 1\nproperty list uchar int vertex_indices\nend_header\n"
+                      "0 0 0\n1 0 0\n0 1 0\n3 0 1 2\n")
+    doc = client.call("doc_new", {"kind": "part", "name": name})["doc_id"]
+    added = client.call("doc_mesh_ref_add", {"doc_id": doc, "path": str(source)})
+    assert added.get("ok") is True and added["triangles"] == 1, added
+    summary = next(row for row in client.call("doc_list", {})["docs"] if row["doc_id"] == doc)
+    assert summary["feature_count"] == 0 and summary["empty"] is False
+    source.unlink()  # Both recovery paths must use the embedded mesh, not this file.
+    return doc, added["id"]
+
+
+def _assert_recovered_reference(client, entries, old_doc, ref):
+    entry = next((row for row in entries if row.get("doc_id") == old_doc), None)
+    assert entry is not None, entries
+    opened = client.call("recovery_open", {"id": entry["id"]}).get("opened") or []
+    recovered = next((row for row in opened if row.get("original_doc_id") == old_doc), None)
+    assert recovered is not None, opened
+    new_doc = recovered["doc_id"]
+    refs = client.call("doc_mesh_ref_list", {"doc_id": new_doc})
+    assert len(refs["refs"]) == 1 and refs["refs"][0]["id"] == ref
+    mesh = client.call("doc_mesh_ref_mesh", {"doc_id": new_doc, "id": ref})
+    assert mesh["ok"] and len(mesh["vertices_mm"]) == 9 and len(mesh["indices"]) == 3
+
+
+def test_reference_only_part_survives_daemon_crash_recovery(scratch_daemon, monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "state"))
+    monkeypatch.delenv("CHUDWARE_NATIVE_ROOT", raising=False)
+    a = DaemonClient()
+    a.connect()
+    pid = _pid(a)
+    scratch_daemon.append(pid)
+    doc, ref = _reference_only_part(a, tmp_path, "reference-crash")
+    autosave = tmp_path / "state" / "Chudware" / "hostd_autosave" / os.environ["CHUDWARE_INSTANCE_KEY"]
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        # A committed snapshot and its sidecar have the same generation stem.
+        if any(p.with_suffix(".step+").exists() and json.loads(p.read_text()).get("doc_id") == doc
+               for p in autosave.glob("*/*.json")):
+            break
+        time.sleep(0.2)
+    else:
+        pytest.fail("reference-only part was not autosaved")
+
+    os.kill(pid, signal.SIGKILL)
+    time.sleep(0.3)
+    b = DaemonClient()
+    b.connect()
+    scratch_daemon.append(_pid(b))
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        if b.call("daemon_status").get("recovery") == "done":
+            break
+        time.sleep(0.2)
+    else:
+        pytest.fail("daemon recovery did not complete")
+    entries = b.call("recovery_list", {}).get("entries") or []
+    entry = next(row for row in entries if row.get("doc_id") == doc)
+    assert entry["same_session"] is False
+    assert isinstance(entry["metadata_revision"], int)
+    _assert_recovered_reference(b, entries, doc, ref)
+
+
+def test_reference_only_part_survives_gc_retirement(scratch_daemon, monkeypatch, tmp_path):
+    monkeypatch.delenv("CHUDWARE_NATIVE_ROOT", raising=False)
+    monkeypatch.setenv("CHUDWARE_DOC_GC_GRACE_S", "1")
+    monkeypatch.setenv("CHUDWARE_DOC_GC_AGENT_GRACE_S", "1")
+    keep, author = DaemonClient(), DaemonClient()
+    keep.connect()
+    scratch_daemon.append(_pid(keep))
+    author.connect()
+    doc, ref = _reference_only_part(author, tmp_path, "reference-gc")
+    author.close()
+    deadline = time.monotonic() + 20
+    entries = []
+    while time.monotonic() < deadline:
+        entries = keep.call("recovery_list", {}).get("entries") or []
+        if any(row.get("doc_id") == doc for row in entries):
+            break
+        time.sleep(0.2)
+    entry = next(row for row in entries if row.get("doc_id") == doc)
+    assert entry["same_session"] is True
+    assert isinstance(entry["metadata_revision"], int)
+    _assert_recovered_reference(keep, entries, doc, ref)
 
 
 def test_recover_autosaved_uses_daemon_remap(scratch_daemon, monkeypatch):
@@ -1286,10 +1223,8 @@ def test_drain_exits_on_its_deadline_despite_a_stuck_client(
     assert _wait_daemon_gone(pid, timeout=25), "drain never reached its deadline"
 
 
-def test_clean_shutdown_discards_docs(scratch_daemon):
-    """A CLEAN shutdown discards unsaved work — recovery is crash-only. The doc
-    must not auto-open AND must not land in the recovery tier on the next start
-    (the GUI's quit warning is the front-line guard against data loss)."""
+def test_clean_shutdown_preserves_docs(scratch_daemon):
+    """A normal drain preserves uncommitted work without opening a tab."""
     a = DaemonClient()
     a.connect()
     pid = _pid(a)
@@ -1298,7 +1233,7 @@ def test_clean_shutdown_discards_docs(scratch_daemon):
     a.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})
 
     assert a.call("daemon_drain", {}).get("ok") is True
-    a.close()  # last client gone -> drained daemon exits cleanly, discarding
+    a.close()  # last client gone -> drained daemon exits cleanly
     assert _wait_daemon_gone(pid), "drained daemon did not exit"
 
     b = DaemonClient()
@@ -1312,18 +1247,86 @@ def test_clean_shutdown_discards_docs(scratch_daemon):
             break
         time.sleep(0.2)
 
-    # Clean shutdown is not a crash: nothing auto-opens AND nothing is recoverable.
+    # Nothing is auto-opened, but unbound work remains available to agents.
     info = b.call("hello", {"client": "test", "pid": os.getpid(), "proto": 1})
     assert not (info.get("id_remap") or {}), info.get("id_remap")
     names = [d["name"] for d in b.call("doc_list", {})["docs"]]
     assert "discard-on-quit" not in names, names
     entries = b.call("recovery_list", {}).get("entries") or []
-    assert not any(e.get("name") == "discard-on-quit" for e in entries), entries
+    entry = next(e for e in entries if e.get("name") == "discard-on-quit")
+    assert entry["human_dirty"] is False
 
 
-def test_doc_close_kills_autosave_artifact(scratch_daemon):
-    """Explicitly closed docs stay closed: even a hard crash right after
-    doc_close must not resurrect the doc (its autosave artifact is deleted)."""
+def _recovered_daemon(scratch_daemon, old_pid: int) -> DaemonClient:
+    # A killed daemon's exiting children can briefly hold the old socket; retry the
+    # respawn like the GUI's reconnect loop does.
+    deadline = time.monotonic() + 30
+    while True:
+        c = DaemonClient()
+        try:
+            c.connect()  # respawns a fresh daemon
+            break
+        except daemon_bridge.DaemonError:
+            c.close()
+            assert time.monotonic() < deadline, "no fresh daemon after the old one died"
+            time.sleep(0.3)
+    pid = _pid(c)
+    assert pid != old_pid
+    scratch_daemon.append(pid)
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        if c.call("daemon_status").get("recovery") == "done":
+            return c
+        time.sleep(0.2)
+    pytest.fail("daemon recovery did not complete")
+
+
+def test_recovered_work_survives_sigterm_and_a_second_crash(scratch_daemon, monkeypatch):
+    """Live 2026-11-01: the GPU fell off the bus, the session teardown SIGTERMed hostd,
+    and the 28 parts the user had just recovered were gone. Termination from outside
+    (SIGTERM) is not the user discarding their work: unsaved docs stay recoverable. And
+    a recovered doc is unsaved work again — dirty, snapshotted before its orphan
+    artifact is deleted — so a crash right after Recover cannot lose it."""
+    # No periodic tick can rescue either step: only the SIGTERM final snapshot and the
+    # recovery_open snapshot put the doc on disk.
+    monkeypatch.setenv("CHUDWARE_AUTOSAVE_INTERVAL_S", "600")
+    a = DaemonClient()
+    a.connect()
+    pid = _pid(a)
+    scratch_daemon.append(pid)
+    deadline = time.monotonic() + 60
+    while a.call("daemon_status").get("recovery") != "done":
+        assert time.monotonic() < deadline, "daemon recovery did not complete"
+        time.sleep(0.2)
+    doc = a.call("doc_new", {"name": "survive-sigterm"})["doc_id"]
+    a.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})
+
+    os.kill(pid, signal.SIGTERM)
+    assert _wait_daemon_gone(pid), "SIGTERMed daemon did not exit"
+    a.close()
+
+    b = _recovered_daemon(scratch_daemon, pid)
+    entries = b.call("recovery_list", {}).get("entries") or []
+    entry = next((e for e in entries if e.get("name") == "survive-sigterm"), None)
+    assert entry is not None, entries
+    opened = b.call("recovery_open", {"id": entry["id"]}).get("opened") or []
+    assert len(opened) == 1, opened
+    row = next(d for d in b.call("doc_list", {})["docs"] if d["doc_id"] == opened[0]["doc_id"])
+    assert row["dirty"] is True, row  # unsaved work: quit prompt + autosave + GC retire
+    assert row["native_source_path"] is None, row  # never a save destination in the tier
+
+    pid_b = _pid(b)
+    os.kill(pid_b, signal.SIGKILL)  # crash immediately after Recover
+    assert _wait_daemon_gone(pid_b)
+    b.close()
+
+    c = _recovered_daemon(scratch_daemon, pid_b)
+    entries = c.call("recovery_list", {}).get("entries") or []
+    assert any(e.get("name") == "survive-sigterm" for e in entries), entries
+
+
+def test_doc_close_preserves_dirty_autosave(scratch_daemon):
+    """Closing a dirty document retains its authored revision across a crash."""
     a = DaemonClient()
     a.connect()
     pid = _pid(a)
@@ -1349,14 +1352,12 @@ def test_doc_close_kills_autosave_artifact(scratch_daemon):
     names = [d["name"] for d in b.call("doc_list", {})["docs"]]
     assert "closed-for-good" not in names, names
     entries = b.call("recovery_list", {}).get("entries") or []
-    assert not any(e.get("name") == "closed-for-good" for e in entries), entries
+    entry = next(e for e in entries if e.get("name") == "closed-for-good")
+    assert entry["human_dirty"] is False
 
 
 def test_doc_gc_retires_abandoned_docs(scratch_daemon, monkeypatch):
-    """A doc whose every client vanished WITHOUT discarding it (an app/agent crash)
-    is RETIRED to the recovery tier after the GC grace, then closed to free memory
-    — the work stays recoverable. (A clean app quit sends doc_discard first, so
-    only crash-abandoned docs reach this path.)"""
+    """An abandoned document is retired after the GC grace and then closed."""
     monkeypatch.setenv("CHUDWARE_DOC_GC_GRACE_S", "1")
     monkeypatch.setenv("CHUDWARE_DOC_GC_AGENT_GRACE_S", "1")
     a, b = DaemonClient(), DaemonClient()
@@ -1390,10 +1391,8 @@ def test_doc_gc_retires_abandoned_docs(scratch_daemon, monkeypatch):
     assert any(e.get("name") == "abandoned" for e in entries), entries
 
 
-def test_doc_discard_then_gc_leaves_no_recovery(scratch_daemon, monkeypatch):
-    """The clean-exit path: a client that doc_discards its doc before leaving must
-    NOT leave a recovery entry — that is what keeps a normal app quit from flooding
-    the recovery prompt (contrast the crash path above)."""
+def test_doc_discard_then_gc_preserves_dirty_work(scratch_daemon, monkeypatch):
+    """Discarding an agent presentation never discards its authored work."""
     monkeypatch.setenv("CHUDWARE_DOC_GC_GRACE_S", "1")
     monkeypatch.setenv("CHUDWARE_DOC_GC_AGENT_GRACE_S", "1")
     a, b = DaemonClient(), DaemonClient()
@@ -1406,13 +1405,12 @@ def test_doc_discard_then_gc_leaves_no_recovery(scratch_daemon, monkeypatch):
     a.call("doc_discard", {"doc_id": doc})  # the app quitting cleanly
     a.close()
     time.sleep(3)  # well past the GC grace
-    assert b.call("recovery_list", {}).get("entries") == []
+    entries = b.call("recovery_list", {}).get("entries") or []
+    assert any(e.get("doc_id") == doc and not e["human_dirty"] for e in entries)
 
 
-def test_doc_discard_closes_abandoned_doc_no_recovery(scratch_daemon):
-    """Explicit discard (GUI closing a tab) of a doc no other client holds closes
-    it for good — NOT retired to the orphan tier. A deliberately-closed part must
-    never flood back as unsaved-recovery on the next launch."""
+def test_doc_discard_retains_dirty_work(scratch_daemon):
+    """Closing the final dirty view retires the document rather than losing it."""
     a = DaemonClient()
     a.connect()
     scratch_daemon.append(_pid(a))
@@ -1424,7 +1422,8 @@ def test_doc_discard_closes_abandoned_doc_no_recovery(scratch_daemon):
     assert r.get("discarded") is True, r
     names = [d["name"] for d in a.call("doc_list", {})["docs"]]
     assert "discard-me" not in names, names
-    assert a.call("recovery_list", {}).get("entries") == []
+    entries = a.call("recovery_list", {}).get("entries") or []
+    assert any(e.get("doc_id") == doc and not e["human_dirty"] for e in entries)
 
 
 def test_doc_discard_keeps_doc_with_other_holder(scratch_daemon):
@@ -1627,24 +1626,322 @@ def test_abandoned_agent_doc_still_queryable(scratch_daemon):
     assert tree.get("revision") == 1, tree
 
 
-def test_explicit_doc_close_really_removes_the_doc(scratch_daemon):
-    """Contrast case that keeps the GUI's REMAINING close path honest: an explicit
-    doc_close does destroy the doc, and announces a reason OTHER than
-    last_writer_detached. host/src/core/engine_events.cpp must still tear the tab
-    down here — if this reason ever collapsed into last_writer_detached the GUI
-    would leak tabs for genuinely dead documents."""
+def test_explicit_doc_close_waits_for_read_only_holder(scratch_daemon):
+    """A read-only attachment keeps the document alive when its writer closes."""
     gui = _gui_client(scratch_daemon)
     gui.call("subscribe", {"doc_ids": "*"})
     agent = DaemonClient()
     agent.connect()
     doc = agent.call("doc_new", {"name": "really-closed"})["doc_id"]
     assert gui.call("attach_doc", {"doc_id": doc, "mode": "ro"}).get("ok") is True
-    assert agent.call("doc_close", {"doc_id": doc}).get("_is_error") is None
-    time.sleep(0.3)
+    assert agent.call("doc_close", {"doc_id": doc}).get("detached") is True
+    assert gui.call("doc_tree", {"doc_id": doc}).get("_is_error") is None
+    assert any(e.get("doc_id") == doc for e in gui.call("doc_list", {})["docs"])
 
-    closed = [e for e in _events(gui, "doc.closed") if e["data"].get("doc_id") == doc]
-    assert closed, "no doc.closed for an explicit close"
-    assert closed[-1]["data"].get("reason") != "last_writer_detached", closed[-1]
-    assert all(e.get("doc_id") != doc for e in gui.call("doc_list", {})["docs"]), (
-        "explicitly closed doc must be gone"
-    )
+
+def test_explicit_presentation_tracks_live_document_without_edit_custody(scratch_daemon, tmp_path):
+    owner, peer, viewer = DaemonClient(), DaemonClient(), DaemonClient()
+    owner.connect()
+    scratch_daemon.append(_pid(owner))
+    peer.connect()
+    viewer.connect()
+    try:
+        viewer.call("subscribe", {"doc_ids": "*"})
+        doc = owner.call("doc_new", {"name": "presentation"})["doc_id"]
+        hidden = owner.call("doc_new", {"name": "hidden"})["doc_id"]
+        internal = owner.call("doc_new", {"name": "shadow", "internal": True})["doc_id"]
+
+        def row(did):
+            return next(r for r in viewer.call("doc_list")["docs"] if r["doc_id"] == did)
+
+        assert row(doc)["presented"] is False
+        assert row(hidden)["presented"] is False
+        assert owner.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})["revision"] == 1
+        assert row(doc)["presented"] is False
+        assert not _events(viewer, "doc.presented")
+        path = tmp_path / "source.step+"
+        assert owner.call("doc_save", {"doc_id": doc, "path": str(path)}).get("_is_error") is None
+        before = path.read_bytes()
+        assert row(doc)["presented"] is False
+
+        # Another writer (or ro observer) can present the explicit id without a hold.
+        assert peer.call("attach_doc", {"doc_id": doc, "mode": "ro"})["ok"]
+        for _ in range(2):
+            result = peer.call("doc_present", {"doc_id": doc})
+            assert result == {"ok": True, "doc_id": doc, "name": "presentation",
+                              "revision": 1, "presented": True}
+        events = _events(viewer, "doc.presented")
+        assert [e["data"] for e in events] == [
+            {"doc_id": doc, "name": "presentation", "revision": 1}
+        ] * 2
+        assert row(doc)["presented"] is True
+        assert row(hidden)["presented"] is False
+        assert path.read_bytes() == before
+        for bad in ("doc-cppffffffff", internal):
+            assert peer.call("doc_present", {"doc_id": bad}).get("_is_error") is True
+        assert peer.call("doc_present", {}).get("_is_error") is True
+    finally:
+        for client in (owner, peer, viewer):
+            client.close()
+
+
+def _wait_for_snapshot(root, doc_id, revision):
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        for sidecar in root.glob("*/*.json"):
+            if not sidecar.with_suffix(".step+").exists():
+                continue
+            meta = json.loads(sidecar.read_text())
+            if meta.get("doc_id") == doc_id and meta.get("revision") == revision:
+                return meta
+        time.sleep(0.1)
+    pytest.fail(f"no durable snapshot for {doc_id} at revision {revision}")
+
+
+def test_recovery_exact_discard_and_human_scope(scratch_daemon):
+    gui = _gui_client(scratch_daemon)
+    agent = DaemonClient()
+    agent.connect()
+    human = gui.call("doc_new", {"name": "human-recovery"})["doc_id"]
+    gui.call("doc_apply_ops", {"doc_id": human, "ops": BOX_OPS})
+    ai = agent.call("doc_new", {"name": "ai-recovery"})["doc_id"]
+    agent.call("doc_apply_ops", {"doc_id": ai, "ops": _box_ops("ai")})
+    assert gui.call("doc_close", {"doc_id": human}).get("detached") is False
+    assert agent.call("doc_discard", {"doc_id": ai}).get("discarded") is True
+
+    entries = gui.call("recovery_list", {})["entries"]
+    h = next(e for e in entries if e["doc_id"] == human)
+    a = next(e for e in entries if e["doc_id"] == ai)
+    assert h["human_dirty"] is True and h["origin_kind"] == "gui"
+    assert a["human_dirty"] is False and a["origin_kind"] == "mcp"
+    assert {"id", "name", "path", "origin_kind", "human_dirty",
+            "revision", "captured_at"} <= h.keys()
+    assert {e["id"] for e in agent.call("recovery_list", {"scope": "ai"})["entries"]} == {a["id"]}
+    assert gui.call("recovery_discard", {"all": True}).get("_is_error") is True
+    assert gui.call("recovery_discard", {"ids": [h["id"]]})["discarded"] == 1
+    assert [e["id"] for e in gui.call("recovery_list", {})["entries"]] == [a["id"]]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="test uses POSIX symlink permissions")
+@pytest.mark.parametrize("finish", ["save", "discard"])
+def test_retained_recovery_source_is_superseded_after_save_or_discard(
+    scratch_daemon, monkeypatch, tmp_path, finish
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("CHUDWARE_AUTOSAVE_INTERVAL_S", "600")
+    a = DaemonClient()
+    a.connect()
+    scratch_daemon.append(_pid(a))
+
+    # A successful first recovery creates this daemon's private snapshot directory.
+    warm = a.call("doc_new", {"name": "warm-recovery"})["doc_id"]
+    a.call("doc_apply_ops", {"doc_id": warm, "ops": BOX_OPS})
+    assert not a.call("doc_close", {"doc_id": warm})["detached"]
+    entry = next(e for e in a.call("recovery_list", {})["entries"] if e["doc_id"] == warm)
+    warm = a.call("recovery_open", {"id": entry["id"]})["opened"][0]["doc_id"]
+    root = tmp_path / "state" / "Chudware" / "hostd_autosave" / os.environ["CHUDWARE_INSTANCE_KEY"]
+    sidecar = next(p for p in root.glob("*/*.json")
+                   if p.with_suffix(".step+").exists() and json.loads(p.read_text()).get("doc_id") == warm)
+    session = sidecar.parent
+
+    doc = a.call("doc_new", {"name": "retained-source"})["doc_id"]
+    a.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops("retained")})
+    assert not a.call("doc_close", {"doc_id": doc})["detached"]
+    source = next(e for e in a.call("recovery_list", {})["entries"] if e["doc_id"] == doc)
+
+    # Reject the replacement snapshot while keeping the original orphan intact.
+    session.rename(session.with_name(session.name + "-parked"))
+    external = tmp_path / "external"
+    external.mkdir()
+    session.symlink_to(external, target_is_directory=True)
+    recovered = a.call("recovery_open", {"id": source["id"]})["opened"][0]["doc_id"]
+    assert any(e["id"] == source["id"] for e in a.call("recovery_list", {})["entries"])
+    if finish == "save":
+        result = a.call("doc_save", {"doc_id": recovered, "path": str(tmp_path / "saved.step+")})
+        assert result.get("_is_error") is None
+    else:
+        assert a.call("doc_discard", {"doc_id": recovered})["discarded"] is True
+    entries = a.call("recovery_list", {})["entries"]
+    assert all(e["id"] != source["id"] for e in entries)
+    if finish == "discard":
+        assert any(e["doc_id"] == recovered for e in entries)
+
+
+def test_gui_doc_close_preserves_agent_read_lease(scratch_daemon):
+    gui = _gui_client(scratch_daemon)
+    agent = DaemonClient()
+    agent.connect()
+    doc = gui.call("doc_new", {"name": "agent-reading-human-part"})["doc_id"]
+    gui.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})
+    assert agent.call("attach_doc", {"doc_id": doc, "mode": "ro"})["ok"]
+    assert gui.call("doc_close", {"doc_id": doc})["detached"] is True
+    assert agent.call("doc_tree", {"doc_id": doc}).get("_is_error") is None
+    assert agent.call("doc_close", {"doc_id": doc})["detached"] is False
+    entry = next(e for e in agent.call("recovery_list", {})["entries"] if e["doc_id"] == doc)
+    assert entry["human_dirty"] is True and entry["origin_kind"] == "gui"
+
+
+def test_metadata_only_human_work_is_recoverable(scratch_daemon):
+    gui = _gui_client(scratch_daemon)
+    doc = gui.call("doc_new", {"name": "metadata-only"})["doc_id"]
+    assert gui.call("doc_set_meta", {"doc_id": doc, "key": "note",
+                                     "value": "keep this"}).get("_is_error") is None
+    assert gui.call("doc_close", {"doc_id": doc})["detached"] is False
+    entry = next(e for e in gui.call("recovery_list", {})["entries"] if e["doc_id"] == doc)
+    assert entry["human_dirty"] is True
+    opened = gui.call("recovery_open", {"id": entry["id"]})["opened"][0]["doc_id"]
+    assert gui.call("doc_get_meta", {"doc_id": opened, "key": "note"})["value"] == "keep this"
+
+
+@pytest.mark.parametrize("changed_on_disk", [False, True])
+def test_ai_recovery_restores_only_matching_base_stamp(
+    scratch_daemon, monkeypatch, tmp_path, changed_on_disk
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "state"))
+    a = DaemonClient()
+    a.connect()
+    pid = _pid(a)
+    scratch_daemon.append(pid)
+    doc = a.call("doc_new", {"name": "restore-ai"})["doc_id"]
+    a.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})
+    path = tmp_path / "deliverable.step+"
+    assert a.call("doc_save", {"doc_id": doc, "path": str(path)}).get("_is_error") is None
+    revision = a.call("doc_apply_ops", {"doc_id": doc, "ops": _box_ops("second")})["revision"]
+    root = tmp_path / "state" / "Chudware" / "hostd_autosave" / os.environ["CHUDWARE_INSTANCE_KEY"]
+    meta = _wait_for_snapshot(root, doc, revision)
+    assert meta["human_dirty"] is False and meta["file_stamp"]
+    os.kill(pid, signal.SIGKILL)
+    assert _wait_daemon_gone(pid)
+    a.close()
+    if changed_on_disk:
+        st = path.stat()
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    b = _recovered_daemon(scratch_daemon, pid)
+    entries = b.call("recovery_list", {"scope": "ai"})["entries"]
+    matching = [e for e in entries if e["doc_id"] == doc]
+    if changed_on_disk:
+        assert matching and matching[0]["path"] == str(path)
+        opened = b.call("recovery_open", {"id": matching[0]["id"]})["opened"][0]
+        assert opened["disk_conflict"] is True
+        row = next(d for d in b.call("doc_list", {})["docs"] if d["doc_id"] == opened["doc_id"])
+        assert row["path"] == str(path) and row["human_dirty"] is False
+    else:
+        assert not matching, entries
+        reopened = b.call("doc_open", {"path": str(path)})["doc_id"]
+        assert "second" in str(b.call("doc_tree", {"doc_id": reopened})["tree"])
+
+
+def test_saved_revision_supersedes_session_snapshot(scratch_daemon, monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "state"))
+    a = DaemonClient()
+    a.connect()
+    pid = _pid(a)
+    scratch_daemon.append(pid)
+    doc = a.call("doc_new", {"name": "saved-before-crash"})["doc_id"]
+    revision = a.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})["revision"]
+    root = tmp_path / "state" / "Chudware" / "hostd_autosave" / os.environ["CHUDWARE_INSTANCE_KEY"]
+    _wait_for_snapshot(root, doc, revision)
+    result = a.call("doc_save", {"doc_id": doc, "path": str(tmp_path / "saved.step+")})
+    assert result["saved_revision"] == revision
+    os.kill(pid, signal.SIGKILL)
+    assert _wait_daemon_gone(pid)
+    a.close()
+    b = _recovered_daemon(scratch_daemon, pid)
+    assert all(e["doc_id"] != doc for e in b.call("recovery_list", {})["entries"])
+
+
+@pytest.mark.skipif(os.name == "nt", reason="test uses POSIX symlink permissions")
+def test_failed_migration_keeps_source_until_retry(scratch_daemon, monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "state"))
+    a = DaemonClient()
+    a.connect()
+    pid = _pid(a)
+    scratch_daemon.append(pid)
+    doc = a.call("doc_new", {"name": "migration-seed"})["doc_id"]
+    a.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})
+    seed = tmp_path / "seed.step+"
+    a.call("doc_save", {"doc_id": doc, "path": str(seed)})
+    assert a.call("daemon_drain", {})["ok"]
+    a.close()
+    assert _wait_daemon_gone(pid)
+    root = tmp_path / "state" / "Chudware" / "hostd_autosave" / os.environ["CHUDWARE_INSTANCE_KEY"]
+    session = root / "000-failed"
+    session.mkdir(parents=True)
+    source = session / "survivor.step+"
+    shutil.copyfile(seed, source)
+    (session / "survivor.json").write_text(json.dumps({
+        "doc_id": "survivor", "name": "survivor", "human_dirty": True,
+        "origin_kind": "gui", "revision": 1, "saved_revision": -1,
+    }))
+    orphan = root / "orphaned"
+    saved_orphan = root / "saved-orphan-directory"
+    orphan.rename(saved_orphan)
+    external = tmp_path / "external"
+    external.mkdir()
+    orphan.symlink_to(external, target_is_directory=True)
+    b = _recovered_daemon(scratch_daemon, pid)
+    assert b.call("recovery_list", {}).get("code") == "recovery_unavailable"
+    assert source.exists() and (session / "survivor.json").exists()
+    pid_b = _pid(b)
+    os.kill(pid_b, signal.SIGKILL)
+    assert _wait_daemon_gone(pid_b)
+    b.close()
+    orphan.unlink()
+    saved_orphan.rename(orphan)
+    c = _recovered_daemon(scratch_daemon, pid_b)
+    assert any(e["name"] == "survivor" for e in c.call("recovery_list", {})["entries"])
+
+
+def test_migration_keeps_all_sessions_and_quarantines_corruption(
+    scratch_daemon, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("CHUDWARE_ORPHAN_KEEP", "0")
+    a = DaemonClient()
+    a.connect()
+    pid = _pid(a)
+    scratch_daemon.append(pid)
+    doc = a.call("doc_new", {"name": "seed"})["doc_id"]
+    a.call("doc_apply_ops", {"doc_id": doc, "ops": BOX_OPS})
+    seed = tmp_path / "seed.step+"
+    a.call("doc_save", {"doc_id": doc, "path": str(seed)})
+    assert a.call("daemon_drain", {})["ok"]
+    a.close()
+    assert _wait_daemon_gone(pid)
+    root = tmp_path / "state" / "Chudware" / "hostd_autosave" / os.environ["CHUDWARE_INSTANCE_KEY"]
+    for session, name in (("000-old", "older-survivor"), ("001-new", "newer-survivor")):
+        directory = root / session
+        directory.mkdir(parents=True)
+        shutil.copyfile(seed, directory / "doc.step+")
+        (directory / "doc.json").write_text(json.dumps({
+            "doc_id": name, "name": name, "human_dirty": True,
+            "origin_kind": "gui", "revision": 1, "saved_revision": -1,
+        }))
+    corrupt = root / "002-corrupt"
+    corrupt.mkdir()
+    (corrupt / "broken.step+").write_bytes(b"not a zip")
+    bad_meta = root / "003-corrupt-meta"
+    bad_meta.mkdir()
+    shutil.copyfile(seed, bad_meta / "doc.step+")
+    (bad_meta / "doc.json").write_text("{broken")
+    b = _recovered_daemon(scratch_daemon, pid)
+    names = {e["name"] for e in b.call("recovery_list", {})["entries"]}
+    assert {"older-survivor", "newer-survivor"} <= names
+    assert (corrupt / "quarantine" / "broken.step+").read_bytes() == b"not a zip"
+    assert (bad_meta / "quarantine" / "doc.step+").read_bytes() == seed.read_bytes()
+    assert (bad_meta / "quarantine" / "doc.json").read_text() == "{broken"
+
+
+def test_daemon_start_identity_changes_on_restart(scratch_daemon):
+    a = DaemonClient()
+    a.connect()
+    old = a.call("daemon_status", {})
+    scratch_daemon.append(old["pid"])
+    hello = a.call("hello", {"client": "test", "pid": os.getpid(), "proto": 1})
+    assert hello["daemon_pid"] == old["daemon_pid"] == old["pid"]
+    assert hello["daemon_start_id"] == old["daemon_start_id"]
+    assert a.call("daemon_drain", {})["ok"]
+    a.close()
+    assert _wait_daemon_gone(old["pid"])
+    b = _recovered_daemon(scratch_daemon, old["pid"])
+    assert b.call("daemon_status", {})["daemon_start_id"] != old["daemon_start_id"]

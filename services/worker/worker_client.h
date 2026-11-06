@@ -133,7 +133,7 @@ inline bool buildControlFrame(const std::string& token,
                               const nlohmann::json& params,
                               std::string& frame, std::string& err) {
     if (action != "cancel" && action != "steer" && action != "answer" &&
-        action != "status") {
+        action != "status" && action != "apply_compaction_policy") {
         err = "unsupported worker control action";
         return false;
     }
@@ -258,8 +258,11 @@ public:
               const EventFn& onEvent = {});
 
     // Best-effort agent_cancel {run_id, provider?} → {ok, cancelled, carried_steer_ids?}.
-    // Native controls bypass the call mutex / use a daemon side socket. Browser controls
-    // use cell admission and the provider captured at launch, never the current picker.
+    // Controls reach only online (worker/OMP) runs: they try the direct worker control
+    // socket first, bypass the call mutex, and otherwise use a daemon side socket (hostd
+    // answers {ok:true, cancelled:false, reason} when no run matches; in-process answers it
+    // locally). Browser controls use cell admission and the provider captured at launch,
+    // never the current picker.
     // carried_steer_ids: steers Stop withdrew before the agent read them.
     bool callAgentCancel(const std::string& runId, nlohmann::json& result, std::string& err,
                          const std::string& provider = {});
@@ -267,7 +270,7 @@ public:
     // Mid-run steering: agent_steer {run_id, text, attachments?, steer_id?} → {ok, steered,
     // steer_id}. Same mutex-bypass / side-channel transport as cancel — a steer that queued
     // behind the in-flight run would only land after the run finished, i.e. never.
-    // `attachments` is the composer's attachment array (images ride to Chudcode as image
+    // `attachments` is the composer's attachment array (images ride to OMP as image
     // parts); empty = text-only. `steerId` correlates the agent.steer delivery events.
     bool callAgentSteer(const std::string& runId, const std::string& text,
                         const nlohmann::json& attachments, const std::string& steerId,
@@ -287,7 +290,7 @@ public:
     // C39: one-way teardown abort — makes a blocked (and any future) call() fail fast with
     // err "aborted" instead of running out its timeout. Set at app exit (AsyncRpc::shutdown)
     // so a long in-flight RPC can't hang the close. The errorSink is NOT fired for aborts.
-    // Also aborts the daemon EngineClient socket so agent_run_v2 mid-flight does not pin quit.
+    // Also aborts the daemon EngineClient socket so an in-flight agent turn does not pin quit.
     void abortPending();
 
 private:
@@ -356,11 +359,6 @@ private:
     // Local stdio and primary document calls serialize here. Allowlisted GUI
     // background queries bypass it and use EngineClient's private per-thread sockets.
     std::mutex callMtx_;
-    // Native daemon agent runs serialize here, off callMtx_, so worker-routed
-    // GUI requests stay responsive. Online daemon turns take neither mutex:
-    // hostd gives each its own worker and engine_backend leases a connection.
-    // Pipe mode keeps callMtx_ for its single local worker.
-    std::mutex longRunMtx_;
     ErrorSink errorSink_;            // W1-B: transport-error notification (optional)
     std::atomic<bool> abort_{false}; // C39: teardown abort (one-way; see abortPending)
     // Independent from callMtx_: cancel/steer must snapshot the authenticated

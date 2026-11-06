@@ -97,13 +97,15 @@ def test_amazon_search_parses_real_cards(amazon_mod, monkeypatch):
     assert hits[0]["site"] == "amazon"
     assert hits[0]["sku"] == "B0G7HV64L6"
     assert hits[0]["asin"] == "B0G7HV64L6"
-    assert hits[0]["price"] == "$8.99"
+    assert hits[0]["price"] == 8.99
+    assert hits[0]["currency"] == "USD"
+    assert hits[0]["kind"] == "product"
 
     # Card 2 — organic.
     assert "380 Pcs M3 Black Flat Head Machine Screws" in hits[1]["title"]
     assert hits[1]["url"] == "https://www.amazon.com/dp/B0FD9SD33X"
     assert hits[1]["sku"] == "B0FD9SD33X"
-    assert hits[1]["price"] == "$6.49"
+    assert hits[1]["price"] == 6.49
 
     # Card 3 — no price span: must be None, NOT borrowed from card 2.
     assert hits[2]["sku"] == "B0FQ3XXN8F"
@@ -117,4 +119,24 @@ def test_amazon_search_propagates_fetch_failure(amazon_mod, monkeypatch):
 
     hits = amazon.ADAPTER.search("m3 screw")
 
-    assert hits == [failure]
+    assert hits[0]["reason"] == failure["reason"]
+    assert hits[0]["site"] == "amazon"
+    assert hits[0]["op"] == "search"
+
+
+def test_image_encoding_and_challenges(amazon_mod, monkeypatch):
+    amazon, session = amazon_mod
+    urls = []
+    content = AMAZON_SEARCH_HTML.replace(
+        '<span class="a-price"', '<img data-src="/images/product.jpg"><span class="a-price"', 1)
+    monkeypatch.setattr(session, "browser_fetch",
+                        lambda url, site: urls.append(url) or {"ok": True, "content": content})
+    assert amazon.ADAPTER.search("M3 & #1")[0]["thumbnail"] == "https://www.amazon.com/images/product.jpg"
+    assert urls[0].endswith("M3+%26+%231")
+    monkeypatch.setattr(session, "browser_fetch",
+                        lambda url, site: {"ok": True, "content": "Robot Check"})
+    assert amazon.ADAPTER.search("bolt")[0]["reason"] == "captcha"
+    assert amazon.ADAPTER.acquire({"url": "https://www.amazon.com/dp/X"})["reason"] == "captcha"
+    monkeypatch.setattr(session, "browser_fetch",
+                        lambda url, site: {"ok": True, "content": "<html>unknown</html>"})
+    assert amazon.ADAPTER.search("bolt")[0]["reason"] == "parse_failed"

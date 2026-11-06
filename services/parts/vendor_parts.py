@@ -7,12 +7,13 @@ The first supported workflow is intentionally compliance-friendly:
 * expose compact records that a small local model can reason over without re-reading catalogs;
 * insert cached CAD into a document as normal `import` features.
 
-McMaster-Carr publishes CAD downloads and an approved Product Information API for authorized
-customers. This module does not scrape their website. API adapters can populate the same records
-once credentials/certificates are configured.
+Supplier website integrations and authorized APIs live in services.browser; this module
+only manages the resulting local registry and imported CAD files.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+import threading
 import json
 import os
 import re
@@ -26,9 +27,32 @@ from typing import Any, Callable
 from services import paths
 
 
-CAD_EXTS = {".step": "step", ".stp": "step", ".igs": "iges", ".iges": "iges", ".brep": "brep",
-            ".stl": "stl"}
+CAD_EXTS = {".step": "step", ".step+": "step+", ".stp": "step", ".igs": "iges",
+            ".iges": "iges", ".brep": "brep", ".stl": "stl", ".scad": "scad"}
 INDEX = paths.VENDOR_PARTS / "index.json"
+_INDEX_LOCK = threading.RLock()
+
+
+@contextmanager
+def _registry_lock():
+    """Serialize read/modify/write transactions with cooperating registry writers."""
+    INDEX.parent.mkdir(parents=True, exist_ok=True)
+    with _INDEX_LOCK, open(str(INDEX) + ".lock", "a+b") as lock:
+        if os.name == "nt":
+            import msvcrt
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 @dataclass
@@ -69,11 +93,10 @@ def slug(value: str) -> str:
 def _load_index() -> dict[str, dict]:
     if not INDEX.exists():
         return {}
-    try:
-        data = json.loads(INDEX.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
-        return {}
-    return data if isinstance(data, dict) else {}
+    data = json.loads(INDEX.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("vendor registry must be a JSON object")
+    return data
 
 
 def _write_index(data: dict[str, dict]) -> None:
@@ -90,6 +113,12 @@ def _write_index(data: dict[str, dict]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, INDEX)
+        if os.name != "nt":
+            directory = os.open(INDEX.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
     finally:
         if tmp is not None:
             tmp.unlink(missing_ok=True)
@@ -114,7 +143,7 @@ def _prepare_local_cad(*, supplier: str, part_number: str, cad_path: str,
                        description: str = "", product_url: str = "",
                        specs: dict | None = None, source: str = "manual",
                        copy_file: bool = True,
-                       source_mtime: float | None = None) -> tuple[str, dict]:
+                       source_mtime: float | None = None) -> tuple[str, dict, Path | None]:
     if not part_number:
         raise ValueError("part_number is required")
     src = Path(os.path.expandvars(os.path.expanduser(cad_path))).resolve()
@@ -126,14 +155,9 @@ def _prepare_local_cad(*, supplier: str, part_number: str, cad_path: str,
                                          else src.stat().st_mtime))
     part.cad_format = _detect_format(src)
     dest_dir = _part_dir(part)
-    dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / src.name
-    if copy_file:
-        shutil.copy2(src, dest)
-        part.cad_path = str(dest)
-    else:
-        part.cad_path = str(src)
-    return part.key, asdict(part)
+    part.cad_path = str(dest if copy_file else src)
+    return part.key, asdict(part), src if copy_file else None
 
 
 def _rebuild_parts_index() -> None:
@@ -146,22 +170,84 @@ def _rebuild_parts_index() -> None:
 
 
 def register_local_cads(registrations: list[dict[str, Any]], *,
-                        index: dict[str, dict] | None = None) -> list[dict]:
+                        index: dict[str, dict] | None = None,
+                        reconcile_root: Path | None = None) -> list[dict]:
     """Register a batch with one vendor-index write and one PartsHub rebuild.
 
     ``index`` may supply an already-loaded registry snapshot so a scanner can use the same
     read for change detection and registration. Records are fully prepared before the snapshot
     is changed, and the snapshot is atomically replaced before the best-effort hub refresh.
+    When scanning a folder, missing files under that root are removed in the same transaction.
     """
-    if not registrations:
+    if not registrations and reconcile_root is None:
         return []
     prepared = [_prepare_local_cad(**registration) for registration in registrations]
-    current = _load_index() if index is None else index
-    for key, rec in prepared:
-        current[key] = rec
-    _write_index(current)
+    paths.VENDOR_PARTS.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".registration-", dir=paths.VENDOR_PARTS) as staging:
+        staged = []
+        for number, (key, rec, src) in enumerate(prepared):
+            temp = None
+            if src is not None:
+                temp = Path(staging) / str(number)
+                shutil.copy2(src, temp)
+            staged.append((key, rec, temp))
+        with _registry_lock():
+            current = _load_index()
+            removed = False
+            if reconcile_root is not None:
+                root = reconcile_root.resolve()
+                for key, row in list(current.items()):
+                    cad_path = row.get("cad_path")
+                    if not cad_path:
+                        continue
+                    try:
+                        path = Path(cad_path).resolve()
+                        if path.is_relative_to(root) and not path.is_file():
+                            del current[key]
+                            removed = True
+                    except OSError:
+                        continue
+            if not staged and not removed:
+                return []
+            result = []
+            destinations = {}
+            for key, rec, temp in staged:
+                old = current.get(key, {})
+                if old and (old.get("supplier") != rec["supplier"] or
+                            old.get("part_number") != rec["part_number"]):
+                    raise ValueError(f"vendor registry key collision: {key}")
+                if (old and rec.get("source") == "library" and old.get("cad_path")
+                        and Path(old["cad_path"]).resolve() != Path(rec["cad_path"]).resolve()):
+                    raise ValueError(f"vendor registry path collision: {key}")
+                if temp is not None:
+                    dest = Path(rec["cad_path"]).resolve()
+                    owner = destinations.setdefault(dest, key)
+                    if owner != key or any(
+                        other_key != key and row.get("cad_path")
+                        and Path(row["cad_path"]).resolve() == dest
+                        for other_key, row in current.items()
+                    ):
+                        raise ValueError(f"vendor registry path collision: {key}")
+                merged = dict(old)
+                for field, value in rec.items():
+                    if field in {"unit_price", "currency", "price_breaks", "stock",
+                                 "lead_time_days", "moq", "fetched_ts", "added_ts"} and field in old:
+                        continue
+                    if field == "specs":
+                        value = {**(old.get("specs") or {}), **value}
+                    if field in {"description", "product_url"} and not value and old.get(field):
+                        continue
+                    merged[field] = value
+                current[key] = merged
+                result.append(merged)
+            for _, rec, temp in staged:
+                if temp is not None:
+                    dest = Path(rec["cad_path"])
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(temp, dest)
+            _write_index(current)
     _rebuild_parts_index()
-    return [rec for _, rec in prepared]
+    return result
 
 
 def register_local_cad(*, supplier: str, part_number: str, cad_path: str,

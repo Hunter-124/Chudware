@@ -8,7 +8,7 @@ a free mirror of ``buildgraph.mcp_tools.register_buildgraph_tools`` but is NOT w
 into ``services/mcp/server.py``.
 
 Both functions load the run ledger and active build graph, then execute the
-``overseer`` role through Chudcode.  A caller may request the deterministic local
+``overseer`` role through OMP.  A caller may request the deterministic local
 fallback only with ``offline=True`` and an offline-safe provider.
 """
 

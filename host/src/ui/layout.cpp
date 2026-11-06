@@ -18,7 +18,6 @@
 #include "file_explorer.h"      // Wave 3: drawFileExplorerBody (Explorer tab)
 #include "property_manager.h"   // PropertyManager::drawBody
 #include "config_panel.h"       // ConfigPanel::drawEmbedded (live Configurations tab)
-#include "plm/graph_tab.h"      // plmGraphFocus / plmGraphAvailable (Graph tab jump)
 #include "plm/plm_hub.h"         // g_plmHub, PlmPage
 #include "sim_manager.h"        // SimManager::drawTreeBody (live Simulation tab)
 #include "cam/cam_panel.h"      // drawCamTreeBody (the Manufacture workspace's left tree)
@@ -30,6 +29,7 @@
 #include "metrics.h"            // logical dp scaling
 #include "panel_collapse.h"     // ui::PanelCollapseAnim — shared vertical-collapse animation
 #include "widgets/kit.h"         // ui::kit::elide
+#include "workspace_home.h"     // the empty-workspace home layout (wider column, Explorer tiles)
 
 #include <filesystem>
 #include <algorithm>
@@ -348,7 +348,8 @@ static bool drawManagerTabButton(const char* id,
                                  ImU32 halo,
                                  float btn,
                                  float glyph,
-                                 bool useTreeGlyph) {
+                                 bool useTreeGlyph,
+                                 int badgeCount = 0) {
     const auto& pal = ui::palette;
     const float S = ui::uiScale;
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -391,6 +392,19 @@ static bool drawManagerTabButton(const char* id,
         float r = 3.0f * S;
         dl->AddCircleFilled(ImVec2(p1.x - 6.0f * S, p0.y + 6.0f * S), r,
                             ui::Palette::toU32(pal.statusWarn));
+    }
+    if (badgeCount > 0) {   // a small count pill on the top-right corner (Changes)
+        char num[8];
+        if (badgeCount > 99) std::snprintf(num, sizeof(num), "99+");
+        else std::snprintf(num, sizeof(num), "%d", badgeCount);
+        ImFont* font = ImGui::GetFont();
+        const float fsz = ImGui::GetFontSize() * 0.72f;
+        const ImVec2 ts = font->CalcTextSizeA(fsz, FLT_MAX, 0.0f, num);
+        const float ph = fsz + 2.0f * S, pw = std::max(ph, ts.x + 6.0f * S);
+        const ImVec2 b(p1.x - 1.0f * S, p0.y - 2.0f * S + ph), a(b.x - pw, p0.y - 2.0f * S);
+        dl->AddRectFilled(a, b, ui::Palette::toU32(pal.statusWarn), ph * 0.5f);
+        dl->AddText(font, fsz, ImVec2(a.x + (pw - ts.x) * 0.5f, a.y + (ph - ts.y) * 0.5f),
+                    IM_COL32(255, 255, 255, 255), num);
     }
 
     if (hovered) ImGui::SetTooltip("%s", tip);
@@ -440,15 +454,24 @@ void drawConfigurationsBody(AppState& st) {
 
 // ---- the SolidWorks-faithful tabbed left pane -----------------------------
 
+// Scale the alpha of everything `window` and its child windows drew this frame. The bodies paint
+// most of their ink with explicit colours (adaptive surfaces), which ImGuiStyleVar_Alpha would
+// miss; their draw lists are rebuilt every frame, so every vertex in them is this frame's.
+static void fadeWindowTree(ImGuiWindow* window, float k) {
+    for (ImDrawVert& v : window->DrawList->VtxBuffer) {
+        const ImU32 a = (v.col >> IM_COL32_A_SHIFT) & 0xFF;
+        v.col = (v.col & ~IM_COL32_A_MASK) | ((ImU32)((float)a * k) << IM_COL32_A_SHIFT);
+    }
+    for (ImGuiWindow* child : window->DC.ChildWindows) fadeWindowTree(child, k);
+}
+
 void drawLeftPane(AppState& st,
                   const std::function<void(const std::string& featureId)>& editCallback) {
     PropertyManager* pm = st.propertyManager;
 
-    // [sim-gui rework] The simulation setup tree exists ONLY in the Simulate
-    // workspace. SimManager::handleCommand parks st.leftPaneTab on LP_Simulation; if the user
-    // then switches to Model/Drawing (or any non-Simulate workspace) clamp it back to the
-    // FeatureManager so no Simulation pane state leaks into the modeling views (the inverse of
-    // the Simulate-side takeover below, which ignores the tab strip entirely).
+    // The simulation setup tree exists only in the Simulate workspace. Clamp the legacy
+    // left-pane selection back to FeatureManager on exit; Simulate's Explorer/Manager rail
+    // below has its own selection in simSidebarTab.
     if (st.activeWorkspace != AppState::Workspace::Simulate &&
         st.leftPaneTab == kLeftPaneSimulation)
         st.leftPaneTab = kLeftPaneFeatureManager;
@@ -471,6 +494,19 @@ void drawLeftPane(AppState& st,
         s_collapsed = false;
     }
     s_pmWasActive = pmActive;
+
+    // Workspace home (workspace_home.h): arriving there shows the Explorer, and leaving it because
+    // a document of the user's became active shows that document's FeatureManager.
+    static int s_wasHome = -1;
+    const bool home = workspaceHomeActive(st);
+    if (s_wasHome != (int)home) {
+        if (home && st.leftPaneTab == kLeftPaneFeatureManager && !pmActive)
+            st.leftPaneTab = kLeftPaneExplorer;
+        else if (!home && s_wasHome == 1 && st.activeWorkspace == AppState::Workspace::Model &&
+                 st.leftPaneTab == kLeftPaneExplorer)
+            st.leftPaneTab = kLeftPaneFeatureManager;
+        s_wasHome = (int)home;
+    }
 
     const auto& pal = ui::palette;
     const float S = ui::uiScale;
@@ -531,7 +567,7 @@ void drawLeftPane(AppState& st,
     // branch above always fires) — the persisted collapse setting can't survive that on its own.
     // CHUDWARE_FM_COLLAPSED forces the collapsed capture the same way CHUDWARE_COPILOT_NARROW forces
     // a pane width; no effect outside a screenshot run.
-    const bool forceCollapsed = std::getenv("CHUDWARE_FM_COLLAPSED") != nullptr;
+    static const bool forceCollapsed = std::getenv("CHUDWARE_FM_COLLAPSED") != nullptr;
     if (forceCollapsed) s_collapsed = true;
     const bool collapsedHere = s_collapsed && !railWs;
     // Snap (no roll animation) when the effective state flips because the workspace changed, and
@@ -591,10 +627,31 @@ void drawLeftPane(AppState& st,
                                         std::min(560.0f * panelSc, (band.maxX - band.minX) * 0.42f));
     const float animatedH = s_anim.tick(collapsedHere, colH);
     const float winH = mobile ? std::min(animatedH, colH) : animatedH;
+    // Workspace home widens the Model column toward ~a third of the band (Explorer tiles), then
+    // eases back to the user's own width (restored exactly on the frame the blend ends); that
+    // width is sampled only while home is fully off.
+    const bool homeColumn = !(mobile || railWs || simWs);
+    const float homeBlend = homeColumn ? workspaceHomeBlend(st) : 0.0f;
+    static float s_userW = -1.0f;
+    static bool s_widened = false;
+    float homeTargetW = 0.0f;
+    const float baseW = s_userW > 0.0f ? s_userW : defW;
+    if (homeBlend > 0.0f) {
+        const float homeW = std::clamp((band.maxX - band.minX) * 0.34f, defW, 640.0f * panelSc);
+        homeTargetW = baseW + std::max(0.0f, homeW - baseW) * homeBlend;
+        s_widened = true;
+    } else if (s_widened && homeColumn) {
+        homeTargetW = baseW;
+        s_widened = false;
+    }
     ImGui::SetNextWindowPos(ImVec2(colX, colY), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(defW, winH),
-                             (mobile || resetWidth || ecadWs) ? ImGuiCond_Always : ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSizeConstraints(ImVec2(minW, winH), ImVec2(maxW, winH));
+    if (homeTargetW > 0.0f)
+        ImGui::SetNextWindowSize(ImVec2(homeTargetW, winH), ImGuiCond_Always);
+    else
+        ImGui::SetNextWindowSize(ImVec2(defW, winH),
+                                 (mobile || resetWidth || ecadWs) ? ImGuiCond_Always : ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(minW, winH),
+                                        ImVec2(std::max(maxW, homeTargetW), winH));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, bubbleDp * S);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
     // ImGui's own edge/corner resize is off (NoResize below): columnResizeEdge right after Begin
@@ -630,8 +687,9 @@ void drawLeftPane(AppState& st,
     // SizeFull, clamped by the constraints above; ini marked dirty so it persists).
     {
         const float curW = ImGui::GetWindowWidth();
+        if (homeBlend <= 0.0f && !home && !railWs && !mobile) s_userW = curW;
         const ColumnResizeResult rz = columnResizeEdge("##lp_resize", /*rightEdge=*/true, curW,
-                                                       !mobile && !ecadWs);
+                                                       !mobile && !ecadWs && homeBlend <= 0.0f);
         if (rz.resetRequested)
             ImGui::SetWindowSize(ImVec2(defW, ImGui::GetWindowHeight()));
         else if (rz.active)
@@ -662,16 +720,12 @@ void drawLeftPane(AppState& st,
         : 0;
     ImGui::PushStyleColor(ImGuiCol_Text, surf.textPrimary);
 
-    // [workspace-tabs seam] Simulate workspace: show ONLY the simulation setup tree.
-    // Requirement: no feature/model tree, no Explorer/Configurations tabs.
-    // Entire tab strip + normal body is suppressed; only SimManager::drawTreeBody runs,
-    // styled to fill the full column width with the same glass row discipline.
+    // Simulate replaces the normal model tabs with its Explorer/Simulation Manager rail.
     if (st.activeWorkspace == AppState::Workspace::Simulate && st.simManager) {
         const float S = ui::uiScale;
         // Explorer + Simulation Manager two-button rail — same chrome as the Electronics rail so
         // every workspace column shares one navigation pattern.
-        static int s_simTab = 1;   // 0 = Explorer, 1 = Simulation Manager
-        if (st.revealSimManager) { s_simTab = 1; st.revealSimManager = false; }
+        if (st.revealSimManager) { st.simSidebarTab = 1; st.revealSimManager = false; }
         const float ebtn = 30.0f * S, eglyph = 18.0f * S, egap = 6.0f * S, erowPad = 6.0f * S;
         const float erailRowH = erowPad + ebtn + erowPad;
         const ImVec2 ePaneOrigin  = ImGui::GetCursorScreenPos();
@@ -683,20 +737,20 @@ void drawLeftPane(AppState& st,
         ImGui::PopStyleVar();
         ImGui::SetCursorPosY(erowPad);
         ImGui::SetCursorPosX(0.0f);
-        if (drawManagerTabButton("simE", "body_folder", "E", "Explorer", s_simTab == 0, false,
+        if (drawManagerTabButton("simE", "body_folder", "E", "Explorer", st.simSidebarTab == 0, false,
                                  surf, lpHalo, ebtn, eglyph, /*useTreeGlyph=*/false))
-            s_simTab = 0;
+            st.simSidebarTab = 0;
         ImGui::SameLine(0, egap);
-        if (drawManagerTabButton("simM", "history", "S", "Simulation Manager", s_simTab == 1, false,
+        if (drawManagerTabButton("simM", "history", "S", "Simulation Manager", st.simSidebarTab == 1, false,
                                  surf, lpHalo, ebtn, eglyph, /*useTreeGlyph=*/true))
-            s_simTab = 1;
+            st.simSidebarTab = 1;
         ImGui::EndChild();
         {
             const float railW = 2.0f * ebtn + egap;
             const float hdrX = ePaneOrigin.x + railW + egap;
             const float hdrW = ePaneInnerW - railW - egap;
-            const char* hdrTitle = s_simTab == 0 ? "Explorer" : "Simulation Manager";
-            const char* hdrIcon  = s_simTab == 0 ? "body_folder" : "ai_panel";
+            const char* hdrTitle = st.simSidebarTab == 0 ? "Explorer" : "Simulation Manager";
+            const char* hdrIcon  = st.simSidebarTab == 0 ? "body_folder" : "ai_panel";
             const ImVec2 saveLocal = ImGui::GetCursorPos();
             ImGui::SetCursorScreenPos(ImVec2(hdrX, ePaneOrigin.y + erowPad + 2.0f * S));
             ui::fmPaneHeaderChip(st, hdrTitle, hdrIcon, hdrX + hdrW * 0.5f);
@@ -714,7 +768,7 @@ void drawLeftPane(AppState& st,
                             ImVec2(ebodyPad, ImGui::GetStyle().WindowPadding.y));
         const float eBodyTopY = ImGui::GetCursorScreenPos().y;
         ImGui::BeginChild("##sim_body", ImVec2(0, -8.0f * S), ImGuiChildFlags_AlwaysUseWindowPadding);
-        if (s_simTab == 0) {
+        if (st.simSidebarTab == 0) {
             drawFileExplorerBody(st);
         } else {
             // Same body inset as the Explorer tab — the FM convention is the shared ebodyPad
@@ -851,23 +905,10 @@ void drawLeftPane(AppState& st,
         return;
     }
 
-    // [workspace-tabs seam] Electronics workspace: the ECAD "PCB Manager" / "Schematic Manager" body
-    // (ecad/ecad_panel.cpp::drawEcadManagerBody), same pattern as Simulate/Manufacture above — one
-    // workspace-appropriate tree, no Explorer/FeatureManager/Configurations tabs. Hosting it INSIDE
-    // this SAME pinned column (rather than a separate embedded child inside the ECAD dock window,
-    // which is what app.cpp used to do) is what keeps the column's geometry byte-identical to the
-    // Model tab's FeatureManager column — publishOverlayColumnEdge(0, ...) above already ran this
-    // frame, so the floating doc-tab strip (doc_tabs.cpp) anchors at the SAME screen X switching
-    // between Model and Electronics (previously it fell back to the band's far-left edge, since
-    // Electronics never called drawLeftPane and the published edge is frame-stamped stale by one
-    // frame — see doc_tabs.cpp's overlayColumnEdge(0) consumer).
+    // Electronics shares the pinned left column between Explorer and the KiCad project manager.
     if (st.activeWorkspace == AppState::Workspace::Electronics) {
-        // Electronics gets its own icon-tab rail (Explorer + PCB Manager) across the column top —
-        // same geometry + drawManagerTabButton chrome as the Model FeatureManager rail (those tab
-        // buttons were previously missing here). No Configurations tab. PCB Manager uses the
-        // Feature Manager tree glyph (useTreeGlyph=true); Explorer uses the folder icon and hosts the
-        // workspace file browser. Selection is a local static (no AppState churn) — a pure UI toggle.
-        static int s_ecadTab = 1;   // 0 = Explorer, 1 = PCB Manager
+        // Keep the same icon-tab chrome and independent selection as the other workspace rails.
+        static int s_ecadTab = 1;   // 0 = Explorer, 1 = Project Manager
         const float ebtn = 30.0f * S, eglyph = 18.0f * S, egap = 6.0f * S, erowPad = 6.0f * S;
         const float erailRowH = erowPad + ebtn + erowPad;
         const ImVec2 ePaneOrigin = ImGui::GetCursorScreenPos();
@@ -886,7 +927,7 @@ void drawLeftPane(AppState& st,
                                  surf, lpHalo, ebtn, eglyph, /*useTreeGlyph=*/false))
             s_ecadTab = 0;
         ImGui::SameLine(0, egap);
-        if (drawManagerTabButton("ecadM", "history", "P", "PCB Manager", s_ecadTab == 1, false,
+        if (drawManagerTabButton("ecadM", "history", "P", "Project Manager", s_ecadTab == 1, false,
                                  surf, lpHalo, ebtn, eglyph, /*useTreeGlyph=*/true))
             s_ecadTab = 1;
         ImGui::EndChild();
@@ -915,10 +956,7 @@ void drawLeftPane(AppState& st,
                          ui::Palette::toU32(pal.glassBorder), 1.0f * S);
         }
 
-        // Body. Transparent ChildBg so the inner BeginChild regions (layers/nets tree, results strip)
-        // show the column glass instead of ImGui's opaque default — that fill was the flat "white bar"
-        // behind Layers/Nets. Explorer reuses the workspace file browser under its own header chip;
-        // PCB Manager draws its own header chip internally.
+        // Explorer and the project hub share the translucent pinned-column body.
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
         const float ebodyPad = 12.0f * S;
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
@@ -999,7 +1037,7 @@ void drawLeftPane(AppState& st,
     static const TabDef kTabs[] = {
         { kLeftPaneExplorer,        "body_folder", "E", "Explorer" },
         { kLeftPaneFeatureManager,  "history",     "F", "Feature Manager" },
-        { kLeftPaneGraph,           "mesh",        "G", "Graph" },
+        { kLeftPaneChanges,         "git",         "C", "Changes" },
     };
 
     const float btn = 30.0f * S;
@@ -1027,41 +1065,21 @@ void drawLeftPane(AppState& st,
                               (t.id == kLeftPaneFeatureManager && st.leftPaneTab == kLeftPaneSimulation);
         // PM form now lives in the FeatureManager tab, so the attention dot rides that tab.
         const bool attention = (t.id == kLeftPaneFeatureManager && pmActive);
+        const int changes = t.id == kLeftPaneChanges ? fileChangesCount(st) : 0;
         char idBuf[16];
         std::snprintf(idBuf, sizeof(idBuf), "%d", t.id);
         if (i == 0) ImGui::SetCursorPosX(0.0f);
         else        ImGui::SameLine(0, gap);
-        if (drawManagerTabButton(idBuf, t.icon, t.fallback, t.tip, selected, attention,
-                                 surf, lpHalo, btn, glyph,
-                                 t.id == kLeftPaneFeatureManager)) {
-            if (t.id == kLeftPaneGraph) {
-                // Jump to the PLM Graph workspace (full-page). Do not leave the
-                // left strip parked on an empty Graph body.
-                st.activeWorkspace = AppState::Workspace::PLM;
-                ui::g_plmHub.page = ui::PlmPage::Graph;
-                std::string focus;
-                if (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()) {
-                    const auto& tab = st.docTabs[st.activeTab];
-                    if (!tab.path.empty()) {
-                        std::filesystem::path fp(tab.path);
-                        focus = fp.stem().string();
-                        if (focus.empty()) focus = fp.filename().string();
-                    } else if (!tab.title.empty()) {
-                        focus = tab.title;
-                    }
-                }
-                if (!focus.empty()) {
-                    if (ui::plmGraphAvailable()) ui::plmGraphFocus(focus);
-                }
-                st.leftPaneTab = kLeftPaneFeatureManager;
-            } else {
-                st.leftPaneTab = t.id;
-                // Opening the Simulation manager reveals + fronts the Simulation ribbon toolbar so the
-                // study tools are at hand the moment the user is in the simulation workspace.
-                if (t.id == kLeftPaneSimulation) {
-                    st.showSimulationTools = true;
-                    st.ribbonTab = AppState::RT_Simulation;
-                }
+        char tipBuf[64];
+        if (changes > 0)
+            std::snprintf(tipBuf, sizeof(tipBuf), "Changes (%d not checkpointed)", changes);
+        if (drawManagerTabButton(idBuf, t.icon, t.fallback, changes > 0 ? tipBuf : t.tip, selected,
+                                 attention, surf, lpHalo, btn, glyph,
+                                 t.id == kLeftPaneFeatureManager, changes)) {
+            st.leftPaneTab = t.id;
+            if (t.id == kLeftPaneSimulation) {
+                st.showSimulationTools = true;
+                st.ribbonTab = AppState::RT_Simulation;
             }
         }
     }
@@ -1095,8 +1113,8 @@ void drawLeftPane(AppState& st,
             // either control when the pane is narrow.
             const char* paneTitle = "Feature Manager";
             if (st.leftPaneTab == kLeftPaneExplorer)             paneTitle = "Explorer";
+            else if (st.leftPaneTab == kLeftPaneChanges)        paneTitle = "Changes";
             else if (st.leftPaneTab == kLeftPaneConfigurations) paneTitle = "Configurations";
-            else if (st.leftPaneTab == kLeftPaneGraph)           paneTitle = "Graph";
             const float titleLeftX = paneOrigin.x + railW + gap;
             const float collapseLeftX = lpPaneRect.Max.x - chevSz - 8.0f * S;
             const float titleRightX = collapseLeftX - 8.0f * S;
@@ -1154,6 +1172,27 @@ void drawLeftPane(AppState& st,
                           ImGuiWindowFlags_NoScrollbar);
         const bool bodyIndented = s_bodyScrolled;
         if (bodyIndented) ImGui::Indent(sbSize);   // balance the right-side scrollbar gutter
+        // Tab switch (a click, or Explorer -> FeatureManager on open): the new body slides in
+        // from the side of its tab and fades up over kBase. Only while it runs does it cost
+        // anything: one indent plus an alpha pass over this frame's body vertices.
+        static int s_shownTab = -1;
+        static double s_switchT0 = -1.0;
+        static float s_switchDir = 1.0f;
+        const int bodyTab = st.leftPaneTab == kLeftPaneSimulation ? kLeftPaneFeatureManager
+                                                                  : st.leftPaneTab;
+        if (s_shownTab >= 0 && bodyTab != s_shownTab && !st.shot) {
+            s_switchT0 = ImGui::GetTime();
+            s_switchDir = bodyTab > s_shownTab ? 1.0f : -1.0f;
+        }
+        s_shownTab = bodyTab;
+        float switchK = 1.0f;
+        if (s_switchT0 >= 0.0) {
+            const float t = (float)(ImGui::GetTime() - s_switchT0) / ui::anim::kBase;
+            if (t >= 1.0f) s_switchT0 = -1.0;
+            else { switchK = ui::anim::easeOut(t); ui::anim::requestFrames(); }
+        }
+        const float slide = (1.0f - switchK) * 18.0f * S * s_switchDir;
+        if (slide != 0.0f) ImGui::Indent(slide);
         // Title moved up into the tab-button row; the tree/body starts straight below the top
         // divider under the buttons (no centered header chip, no extra separator here).
         switch (st.leftPaneTab) {
@@ -1161,6 +1200,10 @@ void drawLeftPane(AppState& st,
             case kLeftPaneExplorer:
                 // Wave 3: the workspace file browser (file_explorer.cpp).
                 drawFileExplorerBody(st);
+                break;
+
+            case kLeftPaneChanges:
+                drawChangesPaneBody(st);
                 break;
 
             case kLeftPaneConfigurations:
@@ -1174,10 +1217,6 @@ void drawLeftPane(AppState& st,
             case 5:  // retired PLM rail tab; preserve older in-memory selections
                 st.leftPaneTab = kLeftPaneExplorer;
                 drawFileExplorerBody(st);
-                break;
-            case kLeftPaneGraph:
-                // Should not stick — click handler jumps to PLM Graph workspace.
-                st.leftPaneTab = kLeftPaneFeatureManager;
                 break;
 
             case kLeftPaneSimulation:   // legacy programmatic target — render the same unified body
@@ -1205,6 +1244,8 @@ void drawLeftPane(AppState& st,
         // reaches its row; otherwise the triad anchors at the far-left, underneath the column.
         const float bodyContentH = ImGui::GetCursorPosY();   // child-local content extent
         if (bodyIndented) ImGui::Unindent(sbSize);
+        if (slide != 0.0f) ImGui::Unindent(slide);
+        if (switchK < 1.0f) fadeWindowTree(ImGui::GetCurrentWindow(), switchK);
         // Custom pill-on-track scrollbar (replaces the suppressed default bar) — same style as the
         // doc-tab file strip. No-op unless the body overflows.
         ui::drawWindowPillScrollbarV(surf);

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -54,17 +55,12 @@ struct CamBackplot {
     std::vector<float> rapidT0, cutT0, leadT0, plungeT0, arcT0;
     std::vector<float> rapidT, cutT, leadT, plungeT, arcT;
     std::vector<float> rapidDir, cutDir, leadDir, plungeDir, arcDir;
+    // Changes on every clear/rebuild, even when vector storage and element counts are unchanged.
+    uint64_t generation = 1;
     double totalTime = 0;
     float minx = 0, miny = 0, minz = 0, maxx = 0, maxy = 0, maxz = 0;
     bool empty() const { return cut.empty() && rapid.empty() && lead.empty() && plunge.empty() && arc.empty(); }
-    void clear() {
-        rapid.clear(); cut.clear(); lead.clear(); plunge.clear(); arc.clear();
-        rapidT0.clear(); cutT0.clear(); leadT0.clear(); plungeT0.clear(); arcT0.clear();
-        rapidT.clear(); cutT.clear(); leadT.clear(); plungeT.clear(); arcT.clear();
-        rapidDir.clear(); cutDir.clear(); leadDir.clear(); plungeDir.clear(); arcDir.clear();
-        totalTime = 0;
-        minx = miny = minz = maxx = maxy = maxz = 0;
-    }
+    void clear();
 };
 
 class CamMirror {

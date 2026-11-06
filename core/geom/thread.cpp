@@ -1,33 +1,45 @@
 #include "geom/thread.h"
 
-#include "geom/booleans.h"
 #include "geom/curves.h"
 #include "geom/features.h"  // sweep_profile
 
 #include <algorithm>
 #include <cmath>
-#include <cstdio>
-#include <cstdlib>
+#include <exception>
+#include <limits>
 #include <utility>
 #include <vector>
 
 #include <BRepAdaptor_CompCurve.hxx>
+#include <BRepAdaptor_Surface.hxx>
+#include <BRep_Tool.hxx>
+#include <BOPAlgo_Alerts.hxx>
+#include <BRepAlgoAPI_Common.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
 #include <BRepAlgoAPI_Fuse.hxx>
 #include <BRepBndLib.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <Bnd_Box.hxx>
+#include <BRepBuilderAPI_Copy.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakePolygon.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepCheck_Analyzer.hxx>
 #include <BRepGProp.hxx>
 #include <GProp_GProps.hxx>
-#include <ShapeFix_Shape.hxx>
+#include <Message_ListOfAlert.hxx>
+#include <Message_Report.hxx>
+#include <Precision.hxx>
+#include <ShapeExtend_Status.hxx>
+#include <ShapeUpgrade_ShapeDivideClosed.hxx>
 #include <Standard_Failure.hxx>
 #include <TopExp_Explorer.hxx>
+#include <TopTools_ListIteratorOfListOfShape.hxx>
+#include <TopTools_ListOfShape.hxx>
 #include <TopoDS.hxx>
+#include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
+#include <TopoDS_Vertex.hxx>
 #include <TopoDS_Wire.hxx>
 #include <gp_Ax1.hxx>
 #include <gp_Ax2.hxx>
@@ -142,61 +154,6 @@ TopoDS_Face build_profile_face(const gp_Pnt& origin, const gp_Dir& radial,
     return mkf.Face();
 }
 
-// Diagnostic trace, gated on $CHUDWARE_THREAD_DEBUG (dev-only; silent in production).
-inline void tt(const char* msg, double a = 0, double b = 0) {
-    static const bool on = std::getenv("CHUDWARE_THREAD_DEBUG") != nullptr;
-    if (on) std::fprintf(stderr, "[thread] %s a=%.4f b=%.4f\n", msg, a, b);
-}
-
-// Helical booleans are OCCT's most fragile: a many-turn coil in near-tangent contact
-// with the shaft skin routinely makes a plain BRepAlgoAPI_Cut/Fuse return IsDone()==false
-// (an empty result) even though both operands are valid solids. A FUZZY value (a tolerance
-// that lets the BOP treat near-coincident faces as coincident) fixes this. We run the
-// boolean with an increasing fuzzy ladder and take the first result that is a valid solid
-// whose volume moved the right way. Returns a null shape if every attempt fails.
-double solid_volume(const TopoDS_Shape& s);  // fwd — defined just below
-
-TopoDS_Shape helical_bool(const TopoDS_Shape& body, const TopoDS_Shape& tool, bool raised,
-                          double base_len, double vol_before) {
-    // 0 = exact; then ~1e-4..2e-2 of the feature size — enough to bridge the hairline
-    // helical contact without smearing real geometry. We accept the FIRST result that is a
-    // valid solid AND whose volume actually moved the right way: a fuzzy BOP can return a
-    // valid-but-UNCHANGED body when it silently drops the intersection, so requiring the
-    // volume to move forces escalation to a larger fuzzy value instead of a no-op success.
-    const double fuzz[] = {0.0, base_len * 5e-4, base_len * 5e-3};
-    // The move must be a MEANINGFUL fraction of the tool volume, not a rounding wobble.
-    // A fuzzy BOP on a fine, many-turn coil can silently drop the intersection and hand
-    // back a valid-but-essentially-UNCHANGED body; volume noise (~1e-3 on a big solid)
-    // then sneaks past a 1e-6 gate, so the ladder accepts a no-op instead of escalating.
-    // Requiring |Δvol| > 2% of the tool volume rejects that no-op and forces a larger
-    // fuzzy value (which does engage) — while any genuine thread moves far more than 2%.
-    const double min_move = std::max(1e-4, solid_volume(tool) * 0.02);
-    for (double f : fuzz) {
-        try {
-            TopoDS_Shape r;
-            if (raised) {
-                BRepAlgoAPI_Fuse op(body, tool);
-                op.SetRunParallel(Standard_True);   // OCCT BOP is single-threaded by default
-                if (f > 0.0) op.SetFuzzyValue(f);
-                op.Build();
-                if (op.IsDone()) r = op.Shape();
-            } else {
-                BRepAlgoAPI_Cut op(body, tool);
-                op.SetRunParallel(Standard_True);
-                if (f > 0.0) op.SetFuzzyValue(f);
-                op.Build();
-                if (op.IsDone()) r = op.Shape();
-            }
-            if (r.IsNull() || !BRepCheck_Analyzer(r).IsValid()) continue;
-            const double v = solid_volume(r);
-            const bool moved = raised ? (v > vol_before + min_move)
-                                      : (v < vol_before - min_move);
-            if (moved) { tt("helical_bool ok at fuzzy", f, v); return r; }
-        } catch (const Standard_Failure&) { /* try the next fuzzy value */ }
-    }
-    return TopoDS_Shape();
-}
-
 double solid_volume(const TopoDS_Shape& s) {
     if (s.IsNull()) return 0.0;
     GProp_GProps g;
@@ -204,9 +161,145 @@ double solid_volume(const TopoDS_Shape& s) {
     return g.Mass();
 }
 
-// Axial coordinate of a point measured along `dir` from `origin` (a signed distance).
-inline double axial_of(const gp_Pnt& p, const gp_Pnt& origin, const gp_Dir& dir) {
-    return gp_Vec(origin, p).Dot(gp_Vec(dir));
+int solid_count(const TopoDS_Shape& s) {
+    int count = 0;
+    for (TopExp_Explorer ex(s, TopAbs_SOLID); ex.More(); ex.Next()) ++count;
+    return count;
+}
+
+template <typename Operation>
+void build_thread_boolean(Operation& op, const TopoDS_Shape& body,
+                          const TopTools_ListOfShape& tools, double fuzzy) {
+    TopTools_ListOfShape args;
+    args.Append(body);
+    op.SetArguments(args);
+    op.SetTools(tools);
+    op.SetNonDestructive(Standard_True);
+    op.SetRunParallel(Standard_True);
+    if (fuzzy > 0.0) op.SetFuzzyValue(fuzzy);
+    op.Build();
+}
+
+template <typename Operation>
+TopoDS_Shape thread_boolean(const TopoDS_Shape& body, const TopTools_ListOfShape& tools,
+                            double fuzzy) {
+    Operation op;
+    build_thread_boolean(op, body, tools, fuzzy);
+    // OCCT can report IsDone and a BRep-valid but incomplete result together
+    // with self-intersection / unused-face warnings. Such a result is not safe
+    // evidence for a completed cut, fuse, trim, or coverage check.
+    return op.IsDone() && !op.HasErrors() && !op.HasWarnings()
+               ? op.Shape() : TopoDS_Shape();
+}
+
+enum class ResidualStatus { Clear, PeriodicSeamWarning, Failed };
+
+template <typename Operation>
+ResidualStatus thread_residual(const TopoDS_Shape& body, const TopTools_ListOfShape& tools) {
+    Operation op;
+    build_thread_boolean(op, body, tools, 0.0);
+    if (!op.IsDone() || op.HasErrors()) return ResidualStatus::Failed;
+    const TopoDS_Shape residual = op.Shape();
+    if (residual.IsNull() || !BRepCheck_Analyzer(residual).IsValid() ||
+        TopExp_Explorer(residual, TopAbs_SOLID).More())
+        return ResidualStatus::Failed;
+    if (!op.HasWarnings()) return ResidualStatus::Clear;
+
+    // This warning alone can arise from an unclassified internal edge of a
+    // periodic seam. It is NOT accepted as proof: it only permits the exact
+    // closed-face division below, followed by a fresh warning-free residual.
+    const Message_ListOfAlert& alerts = op.GetReport()->GetAlerts(Message_Warning);
+    if (alerts.IsEmpty()) return ResidualStatus::Failed;
+    for (Message_ListOfAlert::Iterator it(alerts); it.More(); it.Next()) {
+        if (it.Value().IsNull() ||
+            !it.Value()->IsKind(STANDARD_TYPE(BOPAlgo_AlertFaceBuilderUnusedEdges)))
+            return ResidualStatus::Failed;
+    }
+    return ResidualStatus::PeriodicSeamWarning;
+}
+
+bool has_closed_periodic_face(const TopoDS_Shape& shape) {
+    for (TopExp_Explorer fs(shape, TopAbs_FACE); fs.More(); fs.Next()) {
+        const TopoDS_Face face = TopoDS::Face(fs.Current());
+        const BRepAdaptor_Surface surface(face, Standard_False);
+        if (!surface.IsUPeriodic() && !surface.IsVPeriodic()) continue;
+        for (TopExp_Explorer es(face, TopAbs_EDGE); es.More(); es.Next())
+            if (BRep_Tool::IsClosed(TopoDS::Edge(es.Current()), face)) return true;
+    }
+    return false;
+}
+
+double max_shape_tolerance(const TopoDS_Shape& shape) {
+    double result = Precision::Confusion();
+    for (TopExp_Explorer fs(shape, TopAbs_FACE); fs.More(); fs.Next())
+        result = std::max(result, BRep_Tool::Tolerance(TopoDS::Face(fs.Current())));
+    for (TopExp_Explorer es(shape, TopAbs_EDGE); es.More(); es.Next())
+        result = std::max(result, BRep_Tool::Tolerance(TopoDS::Edge(es.Current())));
+    for (TopExp_Explorer vs(shape, TopAbs_VERTEX); vs.More(); vs.Next())
+        result = std::max(result, BRep_Tool::Tolerance(TopoDS::Vertex(vs.Current())));
+    return result;
+}
+
+// Divide periodic faces on a deep copy solely for the coverage proof. OCCT's
+// non-segmenting mode creates trimmed patches of the same underlying surfaces;
+// it must neither increase topology tolerances nor change the returned body.
+TopoDS_Shape split_periodic_faces_for_proof(const TopoDS_Shape& candidate) {
+    if (!has_closed_periodic_face(candidate)) return TopoDS_Shape();
+    const double tolerance = max_shape_tolerance(candidate);
+    const double before = solid_volume(candidate);
+    BRepBuilderAPI_Copy copy(candidate, Standard_True, Standard_False);
+    if (!copy.IsDone() || copy.Shape().IsNull()) return TopoDS_Shape();
+    ShapeUpgrade_ShapeDivideClosed divide(copy.Shape());
+    divide.SetNbSplitPoints(1);
+    divide.SetSurfaceSegmentMode(Standard_False);
+    divide.SetMaxTolerance(tolerance);
+    if (!divide.Perform() || divide.Status(ShapeExtend_FAIL) ||
+        !divide.Status(ShapeExtend_DONE2))
+        return TopoDS_Shape();
+    TopoDS_Shape split = divide.Result();
+    if (split.IsNull() || solid_count(split) != solid_count(candidate) ||
+        !BRepCheck_Analyzer(split).IsValid())
+        return TopoDS_Shape();
+    const double tolerance_slack =
+        std::numeric_limits<double>::epsilon() * std::max(1.0, tolerance);
+    const double after = solid_volume(split);
+    if (max_shape_tolerance(split) > tolerance + tolerance_slack ||
+        !std::isfinite(before) || !std::isfinite(after) ||
+        std::abs(after - before) > std::max(1e-9, std::abs(before) * 1e-6))
+        return TopoDS_Shape();
+    return split;
+}
+
+// A volume change alone does not prove that every start and axial section was
+// applied. For cuts each tool's intersection with the result must have no
+// solid; for ridges each tool must be contained in the result. A warned
+// residual is never accepted. A known seam-only warning permits one isolated
+// closed-face division, after which the affected and remaining checks must all
+// be warning-free on that equivalent copy.
+bool tools_fully_applied(const TopoDS_Shape& candidate, const TopTools_ListOfShape& tools,
+                         bool raised) {
+    auto check = [&](const TopoDS_Shape& subject, const TopoDS_Shape& tool) {
+        TopTools_ListOfShape operand;
+        if (raised) {
+            operand.Append(subject);
+            return thread_residual<BRepAlgoAPI_Cut>(tool, operand);
+        }
+        operand.Append(tool);
+        return thread_residual<BRepAlgoAPI_Common>(subject, operand);
+    };
+    TopoDS_Shape subject = candidate;
+    bool divided = false;
+    for (TopTools_ListIteratorOfListOfShape it(tools); it.More(); it.Next()) {
+        ResidualStatus status = check(subject, it.Value());
+        if (status == ResidualStatus::PeriodicSeamWarning && !divided) {
+            subject = split_periodic_faces_for_proof(candidate);
+            if (subject.IsNull()) return false;
+            divided = true;
+            status = check(subject, it.Value());
+        }
+        if (status != ResidualStatus::Clear) return false;
+    }
+    return true;
 }
 
 // The body's axial extent [lo, hi] along the thread axis (signed distances from
@@ -215,18 +308,20 @@ inline double axial_of(const gp_Pnt& p, const gp_Pnt& origin, const gp_Dir& dir)
 // caller has bounded via `length`) is trimmed back to the solid it actually threads.
 std::pair<double, double> body_axial_extent(const TopoDS_Shape& body,
                                             const gp_Pnt& axis_loc, const gp_Dir& axis_dir) {
+    // A world-space AABB projected onto an oblique axis can greatly overstate
+    // the run. Measure the bounds in the thread frame instead. A rigid
+    // transformation with copy=false only relocates the shape, preserving the
+    // cached input. Ignore mesh deflection so bounds do not depend on prior
+    // tessellation.
+    gp_Trsf to_axis;
+    to_axis.SetTransformation(gp_Ax3(axis_loc, axis_dir));
+    const TopoDS_Shape local = BRepBuilderAPI_Transform(body, to_axis, false).Shape();
     Bnd_Box bb;
-    BRepBndLib::Add(body, bb);
+    BRepBndLib::AddOptimal(local, bb, Standard_False, Standard_False);
     if (bb.IsVoid()) return {0.0, 0.0};
     double xm, ym, zm, xM, yM, zM;
     bb.Get(xm, ym, zm, xM, yM, zM);
-    double lo = 1e300, hi = -1e300;
-    for (int i = 0; i < 8; ++i) {
-        gp_Pnt c((i & 1) ? xM : xm, (i & 2) ? yM : ym, (i & 4) ? zM : zm);
-        const double a = axial_of(c, axis_loc, axis_dir);
-        lo = std::min(lo, a); hi = std::max(hi, a);
-    }
-    return {lo, hi};
+    return {zm, zM};
 }
 
 // TRIM the overextended coil to a clean axial SLAB [z_lo, z_hi] measured along the
@@ -250,7 +345,9 @@ TopoDS_Shape trim_coil_to_band(const TopoDS_Shape& coil, const gp_Pnt& axis_loc,
         TopoDS_Shape slab =
             BRepPrimAPI_MakeBox(boxframe, 2.0 * half, 2.0 * half, z_hi - z_lo).Shape();
         if (slab.IsNull()) return TopoDS_Shape();
-        return common(coil, slab);
+        TopTools_ListOfShape tools;
+        tools.Append(slab);
+        return thread_boolean<BRepAlgoAPI_Common>(coil, tools, 0.0);
     } catch (const Standard_Failure&) {
         return TopoDS_Shape();
     }
@@ -263,19 +360,20 @@ ThreadResult cut_thread(const TopoDS_Shape& body, const gp_Pnt& axis_loc_in,
                         bool internal, bool raised, double turns_cap, ThreadForm form) {
     gp_Pnt axis_loc = axis_loc_in;
     ThreadResult res;
-    res.shape = body;  // default: hand back the body UNCHANGED (the fall-back)
-    if (body.IsNull()) {
-        res.warning = "thread: empty body";
-        return res;  // ok stays false — a truly unusable input
-    }
-    res.ok = true;  // we always at least return the body; ok=true means "feature ran"
+    res.shape = body;  // retained for recovery only; ok remains false on failure
+    auto fail = [&](const std::string& reason) {
+        res.fell_back = true;
+        res.warning = reason;
+        return res;
+    };
+    if (body.IsNull()) return fail("thread: empty body");
 
     try {
-        if (!(pitch > 1e-6) || !(major_dia > 1e-6) || !(length > 1e-6) ||
-            !(cyl_radius > 1e-6)) {
-            res.fell_back = true;
-            res.warning = "thread: degenerate size (pitch/major/length/radius must be > 0)";
-            return res;
+        if (!std::isfinite(pitch) || !std::isfinite(major_dia) ||
+            !std::isfinite(length) || !std::isfinite(cyl_radius) ||
+            !std::isfinite(turns_cap) || !(pitch > 1e-6) || !(major_dia > 1e-6) ||
+            !(length > 1e-6) || !(cyl_radius > 1e-6)) {
+            return fail("thread: pitch, major diameter, length and radius must be finite and positive");
         }
         if (starts < 1) starts = 1;
 
@@ -294,194 +392,206 @@ ThreadResult cut_thread(const TopoDS_Shape& body, const gp_Pnt& axis_loc_in,
         const double form_depth = (form == ThreadForm::V60) ? v_depth : 0.5 * pitch;
         const double cut_depth = std::max(form_depth, pitch * 0.10);
 
-        // LEAD-IN / RUN-OUT: a real thread must run OFF the ends — the first and last
-        // turns are partial, ramping in from beyond the end plane rather than appearing
-        // abruptly at full depth. So we start the helix ONE LEAD before the requested run
-        // and extend ONE LEAD past it, then anchor the sweep below `axis_loc`. For a CUT
-        // the overhang is harmlessly clipped by the body's end faces (giving a clean
-        // thread start that runs off the shaft); for a RAISED ridge it forms the natural
-        // partial run-out threads. Without this the thread cannot actually be started.
-        // LEAD-IN / RUN-OUT: a real thread must run OFF both ends so it can actually be
-        // started — the helix runs PAST each end edge by at least one pitch (>= one full
-        // lead for a multi-start), SYMMETRICALLY at both ends. The overhang past the sharp
-        // rim gives the incomplete first/last threads a nut engages on. The swept groove
-        // that crosses a 90° end rim can leave a helical knife-edge that trips OCCT's
-        // validity check; we heal the cut (ShapeFix) below and, only if that still fails,
-        // fall back — so the thread runs off the ends as asked whenever the kernel allows.
+        // Bound the requested run to the body's actual axial extent *before*
+        // determining the work limit. An over-long request can still cover the
+        // entire body within the cap; truncating a longer helix to the cap and
+        // calling that partial geometry a success would lose requested threads.
+        const auto body_extent = body_axial_extent(body, axis_loc_in, axis_dir);
+        const double run_lo = std::max(0.0, body_extent.first);
+        const double run_hi = std::min(length, body_extent.second);
+        if (!(run_hi > run_lo + 1e-6))
+            return fail("thread: requested run does not intersect the body");
+        const double run_length = run_hi - run_lo;
         const double lead = pitch * static_cast<double>(starts);
-        const double ext = std::max(pitch, lead);   // >= 1 pitch of run-past, each end
-        double turns = length / lead + 2.0 * (ext / lead) + 0.5;  // run-past both ends
-        // Cap turns: a very high turn count (fine pitch on a long/large shaft) is where the
-        // helical boolean gets both pathologically slow AND crash-prone. Bound it so the
-        // op stays responsive and degrades gracefully rather than hanging or faulting.
+        const double ext = lead;  // one complete lead beyond each end
+        const double required_turns = run_length / lead + 2.0;
         const double cap = (turns_cap > 0.0) ? turns_cap : 24.0;
-        if (turns > cap) turns = cap;
-        const double helix_height = std::min(length + 2.0 * ext, turns * lead);
-        // Drop the anchor one `ext` below the requested start so the helix begins below the
-        // start edge; the symmetric top overhang comes from the extra 2*ext of height.
-        {
-            gp_Vec back(axis_dir);
-            axis_loc = axis_loc.Translated(back.Multiplied(-ext));
+        if (!std::isfinite(required_turns) || required_turns > cap) {
+            return fail("thread: complete run requires " + std::to_string(required_turns) +
+                        " turns including end extensions, exceeding the cap of " +
+                        std::to_string(cap));
         }
+        if (!std::isfinite(run_length + 2.0 * ext))
+            return fail("thread: helical run is too large");
+        axis_loc = axis_loc.Translated(gp_Vec(axis_dir).Multiplied(run_lo - ext));
 
-        // The local-frame helix winds about +Z from (pitch_radius, 0, 0). Lift it onto
-        // the target cylinder's axis frame: +Z -> axis_dir, origin -> axis_loc, with an
-        // arbitrary in-plane X. Lefthand flips the winding sense.
-        gp_Ax3 frame(axis_loc, axis_dir);              // builds an orthonormal X,Y from axis_dir
+        // A single very long swept B-spline can make OCCT's cylinder/helix BOP
+        // self-intersect. Build bounded eight-turn sections instead. Each
+        // boundary is a whole lead, so the start phase (including handedness
+        // and multi-start offsets) is identical on both sides of the boundary.
+        // Trim each overextended sweep to its own band and submit all bands to
+        // one boolean, preserving the complete requested run.
+        constexpr double kTurnsPerSection = 8.0;
+        constexpr int kMaxSections = 128;
+        double section_ratio = (run_length / lead) / kTurnsPerSection;
+        const double nearest = std::round(section_ratio);
+        if (nearest >= 1.0 &&
+            std::abs(section_ratio - nearest) <=
+                8.0 * std::numeric_limits<double>::epsilon() * std::max(1.0, section_ratio))
+            section_ratio = nearest;
+        const double section_count_value = std::ceil(section_ratio);
+        if (!std::isfinite(section_count_value) || section_count_value < 1.0 ||
+            section_count_value > static_cast<double>(kMaxSections) / starts)
+            return fail("thread: complete run exceeds the helical section work limit");
+        const int section_count = static_cast<int>(section_count_value);
+        const double section_span = section_count == 1 ? run_length : kTurnsPerSection * lead;
+        const gp_Ax3 frame(axis_loc, axis_dir);
         const gp_Dir fx = frame.XDirection();
         const gp_Dir fy = frame.YDirection();
         const gp_Dir fz = frame.Direction();
-        gp_Trsf lift;
-        lift.SetValues(fx.X(), fy.X(), fz.X(), axis_loc.X(),
-                       fx.Y(), fy.Y(), fz.Y(), axis_loc.Y(),
-                       fx.Z(), fy.Z(), fz.Z(), axis_loc.Z());
-
-        // The thread profile sits at the helix START (angle 0): a point on the cylinder
-        // SKIN (axis_loc + cyl_radius·fx, where fx is the OUTWARD radial direction), in the
-        // plane spanned by the groove direction and the axial direction (fz). The profile's
-        // +r is its OUTER MOUTH lip, -r its ROOT (see iso_profile_pts):
-        //   EXTERNAL (shaft): the root cuts INWARD (toward the axis), the mouth lip sits
-        //     just OUTSIDE the skin -> +r = OUTWARD = +fx.
-        //   INTERNAL (bore):  the root cuts OUTWARD (into the wall), the mouth lip sits just
-        //     INSIDE the bore (into the hole void) -> +r = INWARD = -fx.
-        const gp_Vec vfx(fx);
-        gp_Pnt skin(axis_loc.X() + vfx.X() * cyl_radius,
-                    axis_loc.Y() + vfx.Y() * cyl_radius,
-                    axis_loc.Z() + vfx.Z() * cyl_radius);
+        const gp_Vec vfx(fx), vaxis(axis_dir);
         const gp_Dir groove_dir = internal ? gp_Dir(-vfx.X(), -vfx.Y(), -vfx.Z()) : fx;
-
-        // One coil per start, each phase-rotated by 360/starts about the axis. Fuse the
-        // start coils into one tool, then CUT the tool out of the body.
-        TopoDS_Shape tool;
         const double phase_step = 360.0 / static_cast<double>(starts);
-        for (int s = 0; s < starts; ++s) {
-            // make_helix builds at the cyl_radius (so the swept groove pierces the skin),
-            // local +Z, height = helix_height. We sweep the profile (anchored at the skin)
-            // along it; OCCT's CorrectedFrenet keeps the profile pierced and ⟂ the path.
-            const double start_angle = phase_step * static_cast<double>(s);
-            TopoDS_Wire hl = make_helix(lead, helix_height, cyl_radius,
-                                        /*cone_angle*/ 0.0, start_angle, lefthand);
-            if (hl.IsNull()) { tt("helix null"); res.fell_back = true; break; }
-            TopoDS_Wire spine = TopoDS::Wire(
-                BRepBuilderAPI_Transform(hl, lift, true).Shape());
-            if (spine.IsNull()) { tt("spine null"); res.fell_back = true; break; }
+        const double half = 2.0 * (cyl_radius + pitch + cut_depth);
+        TopTools_ListOfShape tools;
+        double vol_tool = 0.0;
 
-            // The profile for THIS start sits where the helix start lands: rotate the skin
-            // point + groove/axial dirs by start_angle about the axis (the local helix was
-            // rotated the same amount). Build the profile in world space at that pose.
-            gp_Trsf rot;
-            rot.SetRotation(gp_Ax1(axis_loc, axis_dir), start_angle * kPi / 180.0);
-            gp_Pnt p_skin = skin.Transformed(rot);
-            gp_Dir p_groove = groove_dir.Transformed(rot);
+        for (int section = 0; section < section_count; ++section) {
+            const double section_lo = section * section_span;
+            const double section_hi = section + 1 == section_count
+                                        ? run_length : (section + 1) * section_span;
+            const double section_length = section_hi - section_lo;
+            const gp_Pnt anchor = axis_loc.Translated(vaxis.Multiplied(section_lo));
+            gp_Trsf lift;
+            lift.SetValues(fx.X(), fy.X(), fz.X(), anchor.X(),
+                           fx.Y(), fy.Y(), fz.Y(), anchor.Y(),
+                           fx.Z(), fy.Z(), fz.Z(), anchor.Z());
+            const gp_Pnt skin = anchor.Translated(vfx.Multiplied(cyl_radius));
 
-            // The profile plane must be NORMAL to the helix at its start — a helix tangent
-            // is tilted off the pure axial direction by the lead angle α = atan(lead/2πR),
-            // so building the profile in the (radial, axis) plane skews the swept groove
-            // (badly for a coarse/steep or multi-start thread). Read the ACTUAL tangent at
-            // the spine's first point and span the profile by (radial, tangent×radial):
-            // radial is already ⟂ the helix tangent, so this plane is exactly ⟂ the path.
-            gp_Dir prof_axial = fz;  // fallback: pure axial (shallow-thread approximation)
-            try {
+            for (int s = 0; s < starts; ++s) {
+                const double start_angle = phase_step * static_cast<double>(s);
+                TopoDS_Wire hl = make_helix(lead, section_length + 2.0 * ext, cyl_radius,
+                                            /*cone_angle*/ 0.0, start_angle, lefthand);
+                if (hl.IsNull()) return fail("thread: could not construct the helix");
+                TopoDS_Wire spine = TopoDS::Wire(
+                    BRepBuilderAPI_Transform(hl, lift, true).Shape());
+                if (spine.IsNull()) return fail("thread: could not transform the helix");
+
+                gp_Trsf rot;
+                rot.SetRotation(gp_Ax1(anchor, axis_dir), start_angle * kPi / 180.0);
+                const gp_Pnt p_skin = skin.Transformed(rot);
+                const gp_Dir p_groove = groove_dir.Transformed(rot);
                 BRepAdaptor_CompCurve cc(spine);
-                gp_Pnt sp; gp_Vec tan;
+                gp_Pnt sp;
+                gp_Vec tan;
                 cc.D1(cc.FirstParameter(), sp, tan);
-                if (tan.Magnitude() > 1e-9) {
-                    gp_Dir tdir(tan);
-                    gp_Vec pax = gp_Vec(tdir).Crossed(gp_Vec(p_groove));  // ⟂ tangent & radial
-                    if (pax.Magnitude() > 1e-9) prof_axial = gp_Dir(pax);
-                }
-            } catch (const Standard_Failure&) { /* keep the axial fallback */ }
+                if (tan.Magnitude() <= 1e-9)
+                    return fail("thread: helix has a degenerate start tangent");
+                const gp_Vec pax = gp_Vec(gp_Dir(tan)).Crossed(gp_Vec(p_groove));
+                if (pax.Magnitude() <= 1e-9)
+                    return fail("thread: could not orient the thread profile");
+                const gp_Dir prof_axial(pax);
+                const TopoDS_Face prof = build_profile_face(
+                    p_skin, p_groove, prof_axial, pitch, cut_depth, raised, form);
+                if (prof.IsNull()) return fail("thread: could not construct the thread profile");
 
-            TopoDS_Face prof = build_profile_face(p_skin, p_groove, prof_axial, pitch, cut_depth, raised, form);
-            if (prof.IsNull()) { tt("profile null"); res.fell_back = true; break; }
-
-            // orientation 1 = TRUE FRENET. A helix's Frenet normal is EXACTLY radial-inward
-            // everywhere (r'' points straight at the axis), so a Frenet sweep keeps the profile
-            // facing the axis — rotating one turn per turn WITH the radial, never inverting.
-            // CorrectedFrenet (0) strips out precisely that torsion-driven rotation, leaving the
-            // section fixed while the real radial sweeps 360°/turn past it -> the profile goes
-            // "fully inverted at some points" (the reported bug). The start pose built above
-            // (radial, tangent×radial) already spans the Frenet section plane, so law + start agree.
-            TopoDS_Shape coil = sweep_profile(prof, spine, /*orientation=Frenet*/ 1);
-            tt("coil vol", solid_volume(coil));
-            tt("coil valid?", coil.IsNull() ? -1 : (BRepCheck_Analyzer(coil).IsValid() ? 1 : 0));
-            if (coil.IsNull() || solid_volume(coil) <= 1e-9) { tt("coil empty"); res.fell_back = true; break; }
-            tool = tool.IsNull() ? coil : fuse(tool, coil);
-            if (tool.IsNull()) { tt("fuse null"); res.fell_back = true; break; }
+                // True Frenet keeps the profile radial along the helical spine.
+                const TopoDS_Shape coil = sweep_profile(prof, spine, /*Frenet*/ 1);
+                if (coil.IsNull() || !TopExp_Explorer(coil, TopAbs_SOLID).More() ||
+                    !BRepCheck_Analyzer(coil).IsValid())
+                    return fail("thread: helical profile sweep did not produce a valid solid");
+                TopoDS_Shape band = trim_coil_to_band(
+                    coil, anchor, fx, fy, fz, half, ext, ext + section_length);
+                if (band.IsNull() || !TopExp_Explorer(band, TopAbs_SOLID).More() ||
+                    !BRepCheck_Analyzer(band).IsValid())
+                    return fail("thread: trimming the helical tool did not produce a valid solid");
+                const double section_volume = solid_volume(band);
+                if (!std::isfinite(section_volume) || section_volume <= 1e-9)
+                    return fail("thread: trimmed helical tool is empty");
+                vol_tool += section_volume;
+                tools.Append(band);
+            }
         }
-        if (res.fell_back || tool.IsNull()) {
-            res.fell_back = true;
-            res.warning = "thread: real geometry failed (OCCT) — reduce length/pitch or "
-                          "use mode:cosmetic; left the body unthreaded";
-            res.shape = body;
-            return res;
-        }
-
-        // TRIM THE OVEREXTENDED COIL TO THE REQUESTED RUN, BEFORE the boolean. The coil
-        // runs `ext` past each end (robust BOP + clean lead-in); we now flush-cut it to a
-        // slab [z_lo, z_hi] along the axis so the thread starts exactly at the selected
-        // face and stops exactly at the run end (a shoulder / bolt head the caller bounds
-        // via `length`). Measured from `axis_loc` (the dropped anchor), the requested
-        // start sits at +ext and the run ends at +ext+length. We also CLAMP that band to
-        // the body's own axial extent so a `length` past the material can't leave threads
-        // floating in air. Trimming first is what makes the raised ridge finish flush and
-        // kills the end-rim knife-edge that trips the un-trimmed cut on steep leads.
-        {
-            const auto ext_lohi = body_axial_extent(body, axis_loc, axis_dir);
-            double z_lo = std::max(ext, ext_lohi.first);
-            double z_hi = std::min(ext + length, ext_lohi.second);
-            const double half = 2.0 * (cyl_radius + pitch + cut_depth);
-            TopoDS_Shape trimmed = trim_coil_to_band(tool, axis_loc, fx, fy, fz, half, z_lo, z_hi);
-            tt("trim band z_lo/z_hi", z_lo, z_hi);
-            tt("trimmed vol", solid_volume(trimmed));
-            // Only accept the trim if it left a real solid; if the intersection came back
-            // empty/invalid, fall through to the untrimmed tool (the body's own end faces
-            // still bound a CUT) rather than losing the whole thread.
-            if (!trimmed.IsNull() && solid_volume(trimmed) > 1e-9 &&
-                BRepCheck_Analyzer(trimmed).IsValid())
-                tool = trimmed;
-            else
-                tt("trim rejected — using untrimmed tool", 0, 0);
-        }
-
         const double vol_before = solid_volume(body);
-        // RAISED threads FUSE the helical ridge on (material UP); CUT threads subtract the
-        // groove (material DOWN). helical_bool runs a fuzzy-tolerance ladder so the fragile
-        // many-turn helical BOP survives instead of returning an empty shape.
-        // helical_bool already guarantees a BRep-valid result whose volume moved the right
-        // way (or a null shape). No post-heal step — ShapeFix on a degenerate fine-pitch
-        // coil was a crash source, and the fastener-scope cases don't need it.
-        TopoDS_Shape opres = helical_bool(body, tool, raised, major_dia, vol_before);
-        const bool vol_ok = raised ? (solid_volume(opres) > vol_before + 1e-9)
-                                   : (solid_volume(opres) < vol_before - 1e-9);
-        tt("boolean result: before/after vol", vol_before, solid_volume(opres));
-        tt("boolean valid?", opres.IsNull() ? -1 : (BRepCheck_Analyzer(opres).IsValid() ? 1 : 0), vol_ok ? 1 : 0);
-        if (opres.IsNull() || solid_volume(opres) <= 1e-9 ||
-            !BRepCheck_Analyzer(opres).IsValid() || !vol_ok) {
-            // Empty / invalid / no-material-changed -> graceful fall-back to the plain body.
-            res.fell_back = true;
-            res.warning = raised
-                ? "thread: real geometry failed (OCCT) — the helical ridge did not fuse to "
-                  "a valid solid; reduce length/pitch or use mode:cosmetic; body unthreaded"
-                : "thread: real geometry failed (OCCT) — the helical cut did not produce a "
-                  "valid solid; reduce length/pitch or use mode:cosmetic; body unthreaded";
-            res.shape = body;
+        const int solids_before = solid_count(body);
+        if (!std::isfinite(vol_before) || vol_before <= 1e-9 || solids_before == 0)
+            return fail("thread: input body is not a nonempty solid");
+        if (!std::isfinite(vol_tool) || vol_tool <= 1e-9)
+            return fail("thread: trimmed helical tool is empty");
+
+        // First try an exact, deferred, non-destructive BOP. On some OCCT builds
+        // intersecting a valid helix with a cylinder yields an empty compound
+        // even though IsDone and BRepCheck both report success. Only on an
+        // unsuccessful/invalid result, use the existing bounded fuzzy values.
+        // The smallest ISO crest is pitch/8; limiting fuzzy tolerance to 1/16 of
+        // that feature prevents a large diameter or fine pitch from merging it.
+        const double fuzzy_limit = pitch / 128.0;
+        const double fuzz[] = {0.0, std::min(major_dia * 5e-4, fuzzy_limit),
+                               std::min(major_dia * 5e-3, fuzzy_limit)};
+        // Keep the existing meaningful-change guard: a small volume-integration
+        // wobble on an unchanged body is not evidence of a real groove or ridge.
+        const double min_move = std::max(1e-4, vol_tool * 0.02);
+        const double max_move = vol_tool + std::max(1e-6, vol_tool * 1e-6);
+        std::string reason = "thread: helical boolean did not produce a valid, material-changing solid";
+        double previous = -1.0;
+        for (const double f : fuzz) {
+            if (f == previous) continue;
+            previous = f;
+            TopoDS_Shape candidate;
+            try {
+                candidate = raised ? thread_boolean<BRepAlgoAPI_Fuse>(body, tools, f)
+                                   : thread_boolean<BRepAlgoAPI_Cut>(body, tools, f);
+            } catch (const Standard_Failure& e) {
+                const char* message = e.GetMessageString();
+                reason = message && *message ? std::string("thread: OCCT boolean: ") + message
+                                             : "thread: OCCT helical boolean failed";
+                continue;
+            }
+            if (candidate.IsNull()) {
+                reason = "thread: helical boolean failed or reported unsafe kernel warnings";
+                continue;
+            }
+            const int solids_after = solid_count(candidate);
+            if (solids_after == 0) {
+                reason = "thread: helical boolean produced no solid";
+                continue;
+            }
+            if (raised && solids_after > solids_before) {
+                reason = "thread: helical ridge was not attached to the body";
+                continue;
+            }
+            if (!BRepCheck_Analyzer(candidate).IsValid()) {
+                reason = "thread: helical boolean produced an invalid solid";
+                continue;
+            }
+            const double after = solid_volume(candidate);
+            const double moved = raised ? after - vol_before : vol_before - after;
+            if (!std::isfinite(after) || after <= 1e-9) {
+                reason = "thread: helical boolean produced an empty or non-finite volume";
+                continue;
+            }
+            if (moved <= min_move) {
+                reason = raised ? "thread: helical ridge did not add material"
+                                : "thread: helical cut did not remove material";
+                continue;
+            }
+            // A boolean cannot add or remove more material than the tool contains.
+            if (moved > max_move) {
+                reason = "thread: helical boolean changed more material than the tool";
+                continue;
+            }
+            try {
+                if (!tools_fully_applied(candidate, tools, raised)) {
+                    reason = "thread: helical boolean could not verify every thread section";
+                    continue;
+                }
+            } catch (const Standard_Failure&) {
+                reason = "thread: could not verify every thread section";
+                continue;
+            }
+            res.shape = candidate;
+            res.ok = true;
             return res;
         }
-        res.shape = opres;
-        res.fell_back = false;
-        return res;
-    } catch (const Standard_Failure&) {
-        res.fell_back = true;
-        res.warning = "thread: real geometry failed (OCCT exception) — reduce length/pitch "
-                      "or use mode:cosmetic; left the body unthreaded";
-        res.shape = body;
-        return res;
+        return fail(reason);
+    } catch (const Standard_Failure& e) {
+        const char* message = e.GetMessageString();
+        return fail(message && *message ? std::string("thread: OCCT exception: ") + message
+                                       : "thread: OCCT exception during helical construction");
+    } catch (const std::exception& e) {
+        return fail(std::string("thread: helical construction failed: ") + e.what());
     } catch (...) {
-        res.fell_back = true;
-        res.warning = "thread: real geometry failed — left the body unthreaded";
-        res.shape = body;
-        return res;
+        return fail("thread: unknown error during helical construction");
     }
 }
 

@@ -25,16 +25,19 @@ Skills are folders: `<root>/<name>/SKILL.md` with YAML frontmatter + markdown bo
 
 ```yaml
 ---
-name: my-skill          # [a-z0-9][a-z0-9_-]*
-description: One line  # shown in the always-on catalog (~1 line/skill)
-inject: manual          # or auto
+name: my-skill
+description: One line
+inject: manual
 triggers:
   keywords: [optional, phrases]
   tools: [optional_tool_names]
   phases: [optional_phase_names]
-roles: []               # optional allowlist
+roles: []
 ---
 ```
+
+Names match `[a-z0-9][a-z0-9_-]*`; the description appears in the catalog.
+`inject` can be `manual` or `auto`, and `roles` is an optional allowlist.
 
 ## Body rules
 
@@ -52,8 +55,8 @@ roles: []               # optional allowlist
 3. Confirm `cad_skill("my-skill")` returns the body and the catalog includes the metadata.
 4. For auto skills: fire a matching prompt, then repeat it in the same session.
    Confirm the body injects once, not on every match. Only the Python
-   `reset_session` hook clears the injected set; Chudcode owns online compaction,
-   which does not reset this set.
+   `reset_session` hook clears the injected set; the online OMP runtime owns
+   compaction, which does not reset this set.
 
 ## Checklist
 

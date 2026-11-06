@@ -90,7 +90,9 @@ def _make_pulley_record(profile_id: str, label: str, pitch_mm: float, tooth_form
     return {
         "part_id":      part_id,
         "domain":       _DOMAIN,
-        "title":        f"{title} {text}",
+        "title":        f"{profile_id.replace('HTD', 'HTD ')} Timing Pulley {teeth}T, {bore_mm:g} mm Bore, {widths_txt} mm Belt Width",
+        "family":       f"{profile_id.replace('HTD', 'HTD ')} Timing Pulley",
+        "aliases":      [f"{title} {text}"],
         "standard":     profile_id,
         "designation":  designation,
         "params":       params,
@@ -137,7 +139,9 @@ def _make_belt_record(profile_id: str, label: str, pitch_mm: float, tooth_form: 
     return {
         "part_id":      part_id,
         "domain":       _DOMAIN,
-        "title":        f"{title} {text}",
+        "title":        f"{profile_id.replace('HTD', 'HTD ')} Timing Belt {length_mm:g} mm × {belt_width_mm:g} mm ({teeth}T)",
+        "family":       f"{profile_id.replace('HTD', 'HTD ')} Timing Belt",
+        "aliases":      [f"{title} {text}"],
         "standard":     profile_id,
         "designation":  designation,
         "params":       params,
@@ -175,7 +179,8 @@ class BeltsPulleysAdapter:
         if not norm:
             return recs
         return [r for r in recs
-                if norm in r["title"].lower() or norm in r["designation"].lower()]
+                if norm in r["title"].lower() or norm in r["designation"].lower()
+                or any(norm in alias.lower() for alias in r["aliases"])]
 
     def get(self, part_id: str) -> dict | None:
         for rec in self.iter_records():

@@ -17,8 +17,9 @@
 //
 // Flow: ribbon cmd -> openForCommand() opens the form with defaults -> user edits ->
 //   live preview (debounced ~250 ms): add (first preview) or edit_feature -> viewport refresh.
-//   Cancel -> single doc_revert call (C37-F checkpoint/revert) replaces the old N-undo loop.
-//   OK -> leave committed + tree refresh. Edit path -> openForEdit() populates from params/refs.
+//   Cancel reverts the opening checkpoint only while this session owns its revisions.
+//   OK waits for the latest accepted, final-quality rebuild before closing.
+//   Edit path -> openForEdit() populates from params/refs.
 //
 // C37-F additions: checkpoint/revert cancel, keyboard policy, form polish, defensive fixes.
 #pragma once
@@ -26,12 +27,15 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
 struct AppState;
+
+namespace core { class AsyncRpc; }
 
 namespace ui {
 
@@ -66,11 +70,9 @@ struct PMFieldDef {
     double dimDefault = 0.0;    // canonical mm default (also the Int default, truncated)
     const char* unitLabel = nullptr;   // override the "[mm]" suffix (e.g. "[deg]"; "" = none)
     // Numeric range/step metadata (canonical mm/deg). dimMax > dimMin => BOUNDED field, rendered
-    // as a slider (angles, draft, k-factor); otherwise a drag clamped below at dimMin (default 0;
-    // offsets that may reverse direction lower it — see pm_forms Signed()). dimStep 0 picks a
-    // kind default (1 mm length — 1/16 in in IPS — 1 deg angle, 0.05 unit-less) used by the
-    // CTRL+mouse-wheel step. Ranges/clamps apply to widget edits only; the "=" text-entry path
-    // stays unclamped (engine validation is the backstop, same as before).
+    // as a slider; otherwise a drag clamped below at dimMin. Slider endpoints are interaction
+    // limits, not general geometry feasibility bounds. Text values use documented engine
+    // constraints, with the engine validating other feature-specific limits.
     double dimMin  = 0.0;
     double dimMax  = 0.0;       // <= dimMin => unbounded above
     double dimStep = 0.0;       // 0 = kind default
@@ -89,25 +91,19 @@ struct PMFieldDef {
     const char* comboLabels  = nullptr;  // "Boss|Cut" — display labels; null = use comboOptions
     bool segmented = false;              // render a 2-option combo as a segmented pill pair
 
-    // Text (free-form string param, e.g. pattern instances-to-skip "2:1, 3:0")
+    // Text (free-form string param, e.g. the optional thread turns cap)
     const char* placeholder = nullptr;   // greyed hint shown when the field is empty
 
     // Check
     bool checkDefault = false;
 
-    // Conditional enable: when enableKey is non-null, this field is enabled only when the
-    // sibling Combo named enableKey has its selected value in the pipe-separated enableVals
-    // list (e.g. enableVals="blind|mid_plane"). A null enableKey means always enabled.
+    // When enableKey is non-null, a sibling combo or checkbox must match enableVals. Hidden
+    // fields are omitted on add and deleted from edit patches, but retain their local values.
     // comingSoon=true renders the field greyed/disabled with a "(coming soon)" tooltip even
     // when the enable condition would otherwise pass — for discoverability of future params.
     const char* enableKey  = nullptr;
     const char* enableVals = nullptr;   // pipe-separated allowed values; empty = all
     bool comingSoon = false;
-    // When true, this field is OMITTED from the emitted op while its enable condition is false
-    // (instead of the default "emit anyway; engine ignores"). Needed when a present-but-default
-    // value would change engine behaviour — e.g. hole.diameter must be ABSENT for the ISO
-    // `standard` table to drive the diameter; emitting a default would override the table.
-    bool omitWhenDisabled = false;
 };
 
 // A complete feature form: type + display title + ordered fields.
@@ -142,10 +138,18 @@ struct PMField {
 
     // Dim: editable text buffer + parsed canonical value + expr binding.
     std::vector<char> dimBuf{std::vector<char>(64, 0)};
-    double dimValue = 0.0;       // canonical mm (when not an expr)
+    double dimValue = 0.0;       // resolved/effective canonical value, when known
+    double dimExprValue = 0.0;   // authored numeric fallback, not the effective correction
     std::string dimExpr;         // non-empty => bound to this expression
+    bool dimExprRawString = false; // preserve an authored bare string expression
+    bool dimValueKnown = true;   // false when an authored string has no resolved result yet
     std::string dimError;        // inline validation error (empty = ok)
     bool dimTextEntry = false;   // "=" toggle: unit-math / "=expr" text entry instead of the widget
+    bool dimTextDirty = false;   // text not yet parsed, including while the widget has focus
+    bool dimTextEditing = false; // active on the last draw (protect the buffer on unit changes)
+    bool dimNumericEditing = false; // ImGui temporary scalar text input
+    bool dimSyncPending = false; // accepted correction awaits an active editor's blur
+    bool dimInputIps = false;    // unit system when an uncommitted text edit began
 
     // SelectorWell
     std::vector<PMSelEntry> picks;
@@ -154,6 +158,8 @@ struct PMField {
 
     // Combo / DatumRef
     int comboIndex = 0;
+    std::string comboUnsupported;  // existing value not offered by this form; never silently remap
+    std::vector<std::string> comboLabels; // split once for this form, released with fields_
 
     // Check
     bool checkValue = false;
@@ -221,6 +227,11 @@ void pmDrawFormHeader(const char* icon, const char* title, const char* descripti
 class PropertyManager {
 public:
     bool active() const { return active_ || guestActive_; }
+    bool acceptPending() const { return acceptRequested_ || acceptPending_; }
+    bool previewPending() const { return previewInFlight_ || dirty_; }
+    const std::string& previewError() const { return previewError_; }
+    const std::string& previewWarning() const { return previewWarning_; }
+    std::weak_ptr<int> editSessionLifetime() const { return rpcLifetime_; }
 
 
     // ---- guest form (assembly tools hosted in the left PM column) -----------------------------
@@ -362,6 +373,10 @@ public:
     // face behind them — the "fillet can't find edges on a revolve" fix.
     bool activeWellPrefersEdge() const;
 
+    // True when the active selector well accepts vertex picks. An edge-preferring well that does
+    // not keeps vertices out of the viewport pick, so a click near an edge's end is that edge.
+    bool activeWellWantsVertex() const;
+
     // Route a datum-AXIS feature reference into the active axis-accepting well (called by the
     // viewport axis picker). `fid` is the datum-axis feature id; `label` is the chip text (the
     // datum's name). Reserved axis.x/y/z + user features store {"kind":"datum","feature":fid};
@@ -431,10 +446,11 @@ public:
     // For interactive use prefer the OK/Cancel header buttons.
     void closeIfActive() { if (active_) close(); }
 
-    // C43: public cancel — revert every preview batch to the open-time checkpoint and close.
-    // Used by the ribbon dispatcher when a sketch command must displace an open form
-    // (mutual exclusion: a PM and the plane-pick overlay must never coexist).
-    bool cancelEdits(AppState& st); // Cancel: undo every preview batch
+    // Cancel previews when the session still owns every revision since its checkpoint;
+    // otherwise keep the current document rather than reverting another writer's changes.
+    bool cancelEdits(AppState& st);
+    // Automatic hold-expiry rollback must not wait on the engine from an event callback.
+    void cancelEditsAsync(AppState& st);
 
     // C48: id of the IN-FLIGHT create-mode preview feature ("" when none / edit mode).
     // The sketch ghost renderer exempts this feature's sketch consumption so the profile
@@ -445,15 +461,17 @@ public:
     }
 
 private:
+    friend struct PropertyManagerTestAccess;
     void close();
-    bool closeForAgentLock(AppState& st);
     void commit(AppState& st);     // OK
     void buildOpFeature(nlohmann::json& feature) const;   // assemble {type,name,params,refs}
     bool applyPreview(AppState& st);  // add (first) or edit_feature; debounced
+    // Reject stale form state and reload the target before accepting another user edit.
+    bool formSourceCurrent(AppState& st);
     nlohmann::json buildAiAssistPayload(AppState& st) const;
     void requestAiAssist(AppState& st);
     void applyAiAssistResult(AppState& st, const nlohmann::json& result, int requestSeq);
-    void loadFromTree(AppState& st, const nlohmann::json& feature);  // edit-path populate
+    void loadFromTree(const nlohmann::json& feature);  // edit-path populate
     PMField* activeWell();
     // After a single-ref well gets a pick, hand focus to the next empty visible selector well
     // (SolidWorks "pick A then B" flow) so multi-reference tools don't make the user click each
@@ -463,11 +481,13 @@ private:
     PMField* profileWell();
     const PMField* profileWell() const;
 
-    // Active document-unit display state. Set from AppState.ips() at open; re-synced each draw so a
-    // live MMGS<->IPS toggle reformats every open Dim field's DISPLAY (the canonical mm dimValue is
-    // untouched). reformatDimDisplays() rewrites each non-expr dim buffer from its dimValue.
+    // A unit change reformats committed lengths; invalid or uncommitted text keeps its buffer
+    // and the unit context in which editing began.
     bool ips_ = false;
     void reformatDimDisplays();
+    bool flushDimText();
+    void hydrateFilletEvidence(const nlohmann::json& evidence);
+    void hydrateFilletFromMirror(AppState& st);
 
     bool active_ = false;
     bool editMode_ = false;        // true = reopened on an existing feature (no add op)
@@ -476,43 +496,47 @@ private:
     std::string title_;
     std::string targetId_;         // feature id once it exists (add returns it; edit knows it)
     std::vector<PMField> fields_;
+    bool legacyFillet_ = false;     // preserve an untyped fillet until an explicit mode choice
+    bool legacyFilletModeKnown_ = false; // displayed mode reflects authoritative geometry status
 
-    int previewBatches_ = 0;       // preview ops applied (fallback undo count if checkpoint failed)
+    int previewBatches_ = 0;       // preview undo groups applied
     bool previewUndoGroupStarted_ = false;  // true after the first undo snapshot for this PM
     bool dirty_ = false;           // a field changed since last preview
+    bool acceptRequested_ = false; // chrome/Enter, processed after the fields have been drawn
+    bool acceptPending_ = false;   // waiting for the latest accepted final-quality apply
     double lastEditTime_ = 0.0;    // ImGui::GetTime() of the last field change (debounce)
     bool firstPreviewDone_ = false;
     bool previewInFlight_ = false; // async applyOps in flight (serialize first add_feature)
+    int formSourceRevision_ = -1;  // revision from which the cached full form was populated
+    bool freshEditRequired_ = false;
 
-    // C37-F: checkpoint id taken at open (before any preview). Empty = checkpoint failed at open
-    // (fallback: undo loop). revert(checkpointId_) is the single cancel call.
+    // The checkpoint is safe to restore only while all subsequent revisions are our previews.
     std::string checkpointId_;
+    int cancelRevision_ = -1;
+    bool cancelSafe_ = false;
 
-    // Phase 4 (shared engine daemon): while this form previews, the daemon holds the doc for
-    // exclusive edit (edit_hold at open — foreign clients get retriable busy_preview) and the hold
-    // is released in close() (both OK and Cancel funnel there). The daemon auto-refreshes the hold
-    // on every preview op; tick() additionally re-holds at most once/second while the form is
-    // active so an idle-but-open form outlives brief pauses. If the hold is REJECTED busy at open
-    // (another client mid-edit), the form still opens with a warning toast — non-blocking, CAS +
-    // the other side's hold guard actual conflicts (documented Phase 4 choice). Empty = no hold
-    // (legacy mode / hold rejected).
+    // Hold/checkpoint traffic is queued on the GUI RPC lane, never waited on while drawing.
+    // Previews wait for the checkpoint; open-time busy_preview still warns without refusing
+    // the human's form. A rejected hold is not refreshed or released.
+    void takeOpenHold(AppState& st);
+    core::AsyncRpc* holdRpc_ = nullptr;
+    uint64_t editSessionGeneration_ = 0;
+    std::shared_ptr<int> rpcLifetime_;
+    bool checkpointInFlight_ = false, holdInFlight_ = false;
+    bool cancelPending_ = false, cancelInFlight_ = false;
     std::string holdDocId_;
-    std::string sessionDocId_;   // retained even when edit_hold is unavailable
-    double lastHoldTime_ = 0.0;   // ImGui::GetTime() of the last edit_hold call
+    std::string sessionDocId_;
+    double lastHoldTime_ = 0.0;
 
     // C37-F: true when the first field in the form has received SetKeyboardFocusHere.
     bool focusedOnOpen_ = false;
 
     // C37-F: inline preview-error message shown in the PM body (cleared on next successful preview).
     std::string previewError_;
-    // Non-fatal note from the last successful preview (e.g. fillet rounded a subset of the selected
-    // edges) — surfaced in the PM body in amber so the user can lower the size before committing.
+    // Warning from the latest successful preview, including authoritative fillet adjustment.
     std::string previewWarning_;
 
-    // True only during the final commit apply. Blend features (fillet/chamfer) preview with the
-    // feature SUPPRESSED so the viewport shows + picks the UN-rounded base body — edge picks are then
-    // captured against stable base topology (no fillet blend/trim edges to corrupt them), making
-    // select/unselect reliable. On commit the feature is un-suppressed so the rounds actually apply.
+    // True while assembling/submitting a final-quality operation (Thread drops its proxy flag).
     bool committing_ = false;
 
     // C37-F: true when we need to set keyboard focus on the first editable field next frame.

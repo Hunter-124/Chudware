@@ -285,8 +285,14 @@ def _check_params_sane(ops: list[dict]) -> list[dict]:
         params = feat.get("params") or {}
         fname = feat.get("name", feat.get("type", "feature"))
 
-        # Positive dimension checks.
+        # Positive dimension checks. A fillet radius is exempt: the engine clamps an
+        # out-of-range radius (non-positive included) to the nearest valid value and
+        # reports data.fillet.requested/effective, so flagging it here would call a
+        # working request a failure.
+        is_fillet = feat.get("type") == "fillet"
         for pname, pval in params.items():
+            if is_fillet and pname == "radius":
+                continue
             v = pval.get("value") if isinstance(pval, dict) else pval
             if isinstance(v, (int, float)) and v <= 0 and pname in (
                 "radius", "length", "width", "height", "depth", "diameter", "thickness"

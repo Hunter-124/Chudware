@@ -222,7 +222,7 @@ def test_fs_read_large_json_pages_parse_after_join(tmp_path, monkeypatch, pretty
     """c250: a raw read of a one-line 100+ KB result.json came back as one string cut
     mid-JSON by the host-tool result cap, and json.loads failed. A page now fits the
     cap as JSON, says it is a page, and byte_offset pages rejoin to the exact file."""
-    from services.agent.chudcode_tools import _RESULT_TEXT_BYTES, host_tool_result
+    from services.agent.omp_tools import _RESULT_TEXT_BYTES, host_tool_result
 
     monkeypatch.setenv("CHUDWARE_FS_ROOT", str(tmp_path))
     t = _tools()
@@ -647,7 +647,7 @@ def _observe_file_reads(monkeypatch, *, append_after_first_read=False):
 
 def test_fs_read_large_line_uses_bounded_reads_and_exact_byte_pages(tmp_path, monkeypatch):
     from services.mcp import fs_tools
-    from services.agent.chudcode_tools import _RESULT_TEXT_BYTES, host_tool_result
+    from services.agent.omp_tools import _RESULT_TEXT_BYTES, host_tool_result
 
     monkeypatch.setenv("CHUDWARE_FS_ROOT", str(tmp_path))
     path = tmp_path / "wide.txt"

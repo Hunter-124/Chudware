@@ -86,7 +86,9 @@ def _make_coupler_record(type_id: str, type_label: str, keywords: str,
     return {
         "part_id":      part_id,
         "domain":       _DOMAIN,
-        "title":        f"{title} {text}",
+        "title":        title,
+        "family":       type_label.title(),
+        "aliases":      [f"{title} {text}"],
         "standard":     "coupler",
         "designation":  designation,
         "params":       params,
@@ -126,7 +128,9 @@ def _make_collar_record(type_id: str, type_label: str, keywords: str,
     return {
         "part_id":      part_id,
         "domain":       _DOMAIN,
-        "title":        f"{title} {text}",
+        "title":        title,
+        "family":       type_label.title(),
+        "aliases":      [f"{title} {text}"],
         "standard":     "collar",
         "designation":  designation,
         "params":       params,
@@ -161,7 +165,8 @@ class ShaftCouplingsAdapter:
         if not norm:
             return recs
         return [r for r in recs
-                if norm in r["title"].lower() or norm in r["designation"].lower()]
+                if norm in r["title"].lower() or norm in r["designation"].lower()
+                or any(norm in alias.lower() for alias in r["aliases"])]
 
     def get(self, part_id: str) -> dict | None:
         for rec in self.iter_records():

@@ -3,11 +3,9 @@
 // updateConfigJson (serialized, locked read-modify-write of the shared config.json).
 #include "ai_prefs.h"
 
-#include <fstream>
-
 #include <nlohmann/json.hpp>
 
-#include "core/app_state.h"   // configPath()
+#include "core/app_state.h"   // pending-aware shared config access
 
 namespace ui {
 namespace {
@@ -15,17 +13,13 @@ namespace {
 int loadAgentInt(const char* key, int def, int lo, int hi) {
     int v = def;
     try {
-        std::ifstream in(configPath());
-        if (in) {
-            nlohmann::json j;
-            in >> j;
-            if (j.is_object()) {
-                auto agent = j.value("agent", nlohmann::json::object());
-                if (agent.is_object() && agent.contains(key) && agent[key].is_number_integer())
-                    v = agent[key].get<int>();
-                else if (agent.is_object() && agent.contains(key) && agent[key].is_boolean())
-                    v = agent[key].get<bool>() ? 1 : 0;
-            }
+        const nlohmann::json j = readConfigJson();
+        if (j.is_object()) {
+            auto agent = j.value("agent", nlohmann::json::object());
+            if (agent.is_object() && agent.contains(key) && agent[key].is_number_integer())
+                v = agent[key].get<int>();
+            else if (agent.is_object() && agent.contains(key) && agent[key].is_boolean())
+                v = agent[key].get<bool>() ? 1 : 0;
         }
     } catch (...) {}
     if (v < lo) v = lo;

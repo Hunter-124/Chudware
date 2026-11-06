@@ -558,18 +558,18 @@ void drawBrowserPanel(AppState& st) {
                      " is taking too long to load — check your connection, then Retry or Skip.");
     }
 
-    // ---- top bar (30dp): title/step, back-fwd-reload, editable URL, chip, actions -------
-    // Every item is vertically centered in the bar by setting its Y from its own
-    // height (text, small buttons and the URL input have different heights), so the
-    // row reads as one clean, centered strip instead of a ragged baseline.
-    const float barH = 30.0f * sc;
+    // At narrow widths, keep navigation and actions on separate rows.
+    const float rowH = 30.0f * sc;
+    const bool narrowBar = ImGui::GetContentRegionAvail().x < 720.0f * sc;
+    const float barH = rowH * (narrowBar ? 3.0f : 1.0f);
     ImGui::BeginChild("##wiz_bar", ImVec2(0, barH), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     {
         const float availW = ImGui::GetContentRegionAvail().x;
         const float fh = ImGui::GetFrameHeight();       // URL input height
         const float th = ImGui::GetTextLineHeight();     // text / small-button height
-        auto vcenter   = [&](float h) { ImGui::SetCursorPosY((barH - h) * 0.5f); };
+        float rowY = 0.0f;
+        auto vcenter = [&](float h) { ImGui::SetCursorPosY(rowY + (rowH - h) * 0.5f); };
         auto bsz       = [&](const char* t) {
             return ImGui::CalcTextSize(t).x + ImGui::GetStyle().FramePadding.x * 2.0f;
         };
@@ -629,7 +629,8 @@ void drawBrowserPanel(AppState& st) {
 
             // URL field flexes into the gap before the right cluster.
             ImGui::SameLine(0.0f, 8.0f * sc);
-            const float urlW = availW - ImGui::GetCursorPosX() - rightW - 8.0f * sc;
+            const float urlW = availW - ImGui::GetCursorPosX() -
+                               (narrowBar ? 0.0f : rightW) - 8.0f * sc;
             if (urlW > 60.0f * sc) {
                 if (!w.urlEditing)   // mirror the live URL while the user isn't typing
                     std::snprintf(w.urlBuf, sizeof(w.urlBuf), "%s", w.web->url().c_str());
@@ -649,7 +650,8 @@ void drawBrowserPanel(AppState& st) {
             const std::string& u = w.web->url();
             if (!u.empty()) {
                 ImGui::SameLine(0.0f, 10.0f * sc);
-                const float urlW = availW - ImGui::GetCursorPosX() - rightW - 8.0f * sc;
+                const float urlW = availW - ImGui::GetCursorPosX() -
+                                   (narrowBar ? 0.0f : rightW) - 8.0f * sc;
                 if (urlW > 30.0f * sc) {
                     vcenter(th);
                     const ImVec2 p = ImGui::GetCursorScreenPos();
@@ -661,9 +663,14 @@ void drawBrowserPanel(AppState& st) {
             }
         }
 
-        // Right cluster: login chip + action buttons, right-aligned.
-        ImGui::SameLine();
-        ImGui::SetCursorPosX(availW - rightW);
+        // Keep the confirmation controls accessible rather than clipping them at small widths.
+        if (narrowBar) {
+            rowY = rowH;
+            ImGui::SetCursorPosX(0.0f);
+        } else {
+            ImGui::SameLine();
+            ImGui::SetCursorPosX(std::max(0.0f, availW - rightW));
+        }
         if (showChip) {
             vcenter(th + 4.0f * sc);
             loginStateChip(w.web->loginState());
@@ -680,6 +687,10 @@ void drawBrowserPanel(AppState& st) {
             if (ImGui::SmallButton("I'm signed in") && !w.actionPending)
                 wizardNext(st, /*skip=*/false, /*assertLoggedIn=*/true);
             ImGui::SameLine(0.0f, 4.0f * sc);
+        }
+        if (narrowBar) {
+            rowY = rowH * 2.0f;
+            ImGui::SetCursorPosX(0.0f);
         }
         if (showRetry) {
             vcenter(th);

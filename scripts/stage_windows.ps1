@@ -53,9 +53,9 @@ try {
 
     $req = Join-Path $Root "requirements.txt"
     if (-not (Test-Path -LiteralPath $req -PathType Leaf)) { throw "runtime declarations missing: $req" }
-    $chudcodeLock = "vendor/chudcode/CHUDCODE_ARTIFACT.lock"
-    if (-not (Test-Path -LiteralPath (Join-Path $Root $chudcodeLock) -PathType Leaf)) {
-        throw "Chudcode artifact lock missing: $(Join-Path $Root $chudcodeLock)"
+    $ompLock = "vendor/omp/OMP_ARTIFACT.lock"
+    if (-not (Test-Path -LiteralPath (Join-Path $Root $ompLock) -PathType Leaf)) {
+        throw "OMP artifact lock missing: $(Join-Path $Root $ompLock)"
     }
     $wheelLock = "vendor/python/RUNTIME_WHEELS.lock"
     $wheelhouse = Join-Path $Root "wheelhouse"
@@ -65,7 +65,7 @@ try {
         throw "a reviewed runtime needs both $wheelLock and wheelhouse\; found only one"
     }
     $reviewedRuntime = $hasWheelLock -and $hasWheelhouse
-    $identities = @($chudcodeLock)
+    $identities = @($ompLock)
     if ($reviewedRuntime) { $identities += $wheelLock }
     $servicesSrc = Join-Path $Root "services"
     if (-not (Test-Path -LiteralPath $servicesSrc -PathType Container)) { throw "runtime services missing: $servicesSrc" }

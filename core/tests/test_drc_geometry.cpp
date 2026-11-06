@@ -2,7 +2,7 @@
 // Pure JSON, OCCT-free; links chudware_ecad only.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "ecad/drc.h"
-#include "ecad/fabformats.h"
+#include "ecad/dfm.h"
 #include "ecad/schema.h"
 #include "ecad/session.h"
 #include "ecad/zonefill.h"
@@ -160,17 +160,8 @@ TEST_CASE("malformed pad positions fail validation and geometry refuses them saf
     ecad_close(created["doc_id"].get<std::string>());
 }
 
-TEST_CASE("Gerber export defaults absent or malformed stackup to two copper layers") {
-    json b = board();
-    b.erase("stackup");
-    const auto missing = fab::write_gerbers(b);
-    CHECK(missing.count("F.Cu") == 1);
-    CHECK(missing.count("B.Cu") == 1);
-    b["stackup"] = nullptr;
-    CHECK(fab::write_gerbers(b) == missing);
-}
 
-TEST_CASE("final zone fill survives response compilation, session state and Gerber export") {
+TEST_CASE("final zone fill survives response compilation and session state") {
     const json created = ecad_new("pcb", "Fine fill");
     const std::string id = created["doc_id"].get<std::string>();
     json b = ecad_session_doc(id);
@@ -187,11 +178,6 @@ TEST_CASE("final zone fill survives response compilation, session state and Gerb
     const json filled = ecad_fill_zones(id, nullptr, placed["revision"].get<long>());
     CHECK(filled["tree"]["zones"][0]["filled_polys"] == expected);
     CHECK(ecad_session_doc(id)["zones"][0]["filled_polys"] == expected);
-    const json exported = ecad_export(json{{"doc_id", id}, {"kind", "gerber"}});
-    CHECK(exported["files"]["F.Cu"] ==
-          fab::write_gerber_layer(filled["tree"], "F.Cu"));
-    CHECK(exported["files"]["F.Cu"] !=
-          fab::write_gerber_layer(fill_zones(b, 0.25), "F.Cu"));
     ecad_close(id);
 }
 
@@ -704,4 +690,45 @@ TEST_CASE("the first nets entry for a name defines its net class") {
                                   {"p2", json::array({5.0, 0.0})}});
 
     CHECK(!has_rule(run_drc(b), "track_width"));
+}
+
+TEST_CASE("KiCad pad layer sets resolve in validation, DRC, ratsnest, and DFM") {
+    json b = board();
+    b["stackup"]["copper_layers"] = 4;
+    json front = pad("p1", "A", 0, 0, 1.0);
+    front["layers"] = json::array({"*.Cu", "*.Mask", "*.Paste", "*.SilkS"});
+    json back = pad("p2", "A", 10, 0, 1.0);
+    back["layers"] = json::array({"B.Cu", "B.Mask"});
+    add_pad(b, front, "fp1");
+    add_pad(b, back, "fp2");
+    CHECK(schema::validate_board(b).empty());
+    const auto all = schema::pad_copper_layers(front, 4);
+    CHECK((all == std::set<std::string>{"F.Cu", "In1.Cu", "In2.Cu", "B.Cu"}));
+    CHECK(schema::pad_has_layer(front, "F.Mask"));
+    CHECK(schema::pad_has_layer(front, "B.Mask"));
+    CHECK(schema::pad_has_layer(front, "F.SilkS"));
+    json outer = front;
+    outer["layers"] = json::array({"F&B.Cu", "*.Mask"});
+    CHECK((schema::pad_copper_layers(outer, 4) == std::set<std::string>{"F.Cu", "B.Cu"}));
+    CHECK_FALSE(schema::pad_has_layer(outer, "In1.Cu"));
+
+    b["tracks"].push_back(json{{"id", "t1"}, {"net", "A"}, {"layer", "B.Cu"},
+                                {"width", 0.25}, {"kind", "segment"},
+                                {"p1", {0, 0}}, {"p2", {10, 0}}});
+    CHECK(ratsnest(b).empty());
+    b["footprints"][0]["pads"][0]["layers"] = json::array({"F.Cu", "F.Mask"});
+    CHECK(ratsnest(b).size() == 1);
+    b["footprints"][0]["pads"][0]["layers"] = front["layers"];
+
+    json expanded = b;
+    expanded["footprints"][0]["pads"][0]["layers"] =
+        json::array({"F.Cu", "In1.Cu", "In2.Cu", "B.Cu", "F.Mask", "B.Mask",
+                     "F.Paste", "B.Paste", "F.SilkS", "B.SilkS"});
+    CHECK(copper_shapes(b)[0].layers == copper_shapes(expanded)[0].layers);
+    CHECK(run_dfm(b) == run_dfm(expanded));
+    const json z = zone("z1", "GND", -2, -2, 12, 2);
+    CHECK(fill_zone(b, z, 0.5) == fill_zone(expanded, z, 0.5));
+
+    b["footprints"][0]["pads"][0]["layers"] = json::array({"*.NotALayer"});
+    CHECK_FALSE(schema::validate_board(b).empty());
 }

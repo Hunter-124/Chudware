@@ -76,6 +76,20 @@ def _locked(root: Path):
         yield
 
 
+@contextmanager
+def gpu_slot(root: Path):
+    """Share the supervisor's cross-process GPU slot with scan missions."""
+    if fcntl is None:
+        raise OSError("Local Gaussian jobs require Linux process supervision")
+    root.parent.mkdir(parents=True, exist_ok=True)
+    with (root.parent / ".gaussian_gpu.lock").open("a") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream, fcntl.LOCK_UN)
+
+
 def _identity(pid: int) -> dict:
     try:
         fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
@@ -201,7 +215,7 @@ def start(session_id: str, mode: str = "environment", live: bool = False,
         if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations < 1:
             return _error("iterations_must_be_positive")
         if video_path:
-            video_path = str(Path(video_path).expanduser().resolve())
+            video_path = str(_rc.cell_path(video_path))
             if not Path(video_path).is_file():
                 return _error("video_not_found")
         mission = common._find_session_run(session_id)
@@ -340,6 +354,7 @@ def crop(session_id: str, bounds) -> dict:
                        artifact_revision=int(rec.get("artifact_revision", 0)) + 1,
                        updated_at=time.time())
             _atomic(root / "splat_job.json", rec)
+            _persist_shared_output(root, rec, rec, rec["splat_path"])
             return {**_public(rec), "ok": True}
     except (OSError, ValueError, KeyError) as exc:
         return _error("not_found" if isinstance(exc, KeyError) else str(exc))
@@ -365,9 +380,89 @@ def _images(root: Path) -> list[str]:
             if p.is_file() and p.suffix.lower() in extensions]
 
 
+def _persist_shared_output(root: Path, rec: dict, payload: dict, artifact: str | None) -> None:
+    """Publish the training dataset and cloud together, in their actual SfM gauge."""
+    from services.mcp import reveng_common as common
+    sid = rec["session_id"]
+    session = common._load_session(sid, merge_gaussian=False)
+    if session is None:
+        return
+    dataset_dir = payload.get("dataset_dir")
+    sparse_dir = payload.get("sparse_dir")
+    images_dir = payload.get("images_dir")
+    if not all((dataset_dir, sparse_dir, images_dir)):
+        return
+    if not all(Path(p).is_dir() for p in (dataset_dir, sparse_dir, images_dir)):
+        return
+    old = session.get("sfm_dataset") or {}
+    changed = old.get("dataset_dir") != dataset_dir
+    if changed:
+        batch = _read(Path(payload.get("batch_image_map_path") or ""))
+        source_paths = []
+        for value in batch.values():
+            path = Path(value)
+            source_paths.append(str((root / path if not path.is_absolute() else path).resolve()))
+        if not source_paths:
+            # Training from the already-persisted shared dataset keeps its signature.
+            if old.get("dataset_dir") != dataset_dir:
+                return
+            source_paths = old.get("source_images") or []
+        current_order = _images(root)
+        selected = set(source_paths)
+        source_paths = [path for path in current_order if path in selected]
+        if set(source_paths) != selected:
+            return
+        mapping = {}
+        for key, value in (payload.get("image_name_map") or {}).items():
+            p = Path(value)
+            mapping[key] = str((root / p if not p.is_absolute() else p).resolve())
+        common._invalidate_downstream(session)
+        session.pop("recon_transform", None)
+        session.pop("axis_alignment", None)
+        session["scale"] = {"method": None, "mm_per_unit": None,
+                            "residual_pct": None, "confirmed": False}
+        session.setdefault("stages", {})["scale"] = "pending"
+        for key in ("mesh_path", "raw_mesh_path", "mesh_units", "mesh_transform_applied",
+                    "splat_path", "raw_splat_path", "splat_dataset_dir"):
+            session.setdefault("artifacts", {}).pop(key, None)
+        session.pop("imported_splat", None)
+        session["sfm_dataset"] = {
+            "dataset_dir": dataset_dir, "sparse_dir": sparse_dir, "images_dir": images_dir,
+            "image_name_map": mapping, "image_name_map_path": payload.get("image_name_map_path"),
+            "source_images": source_paths, "source_signature": common._source_signature(source_paths),
+            "registered": payload.get("registered", 0),
+        }
+        session.setdefault("artifacts", {})["sparse_dir"] = sparse_dir
+        session["artifacts"]["images"] = len(current_order)
+        session.setdefault("stages", {})["capture"] = "done" if current_order else "idle"
+        extraction = payload.get("video_extraction") or {}
+        rows = {row["path"]: row for row in session.get("source_images", []) if row.get("path")}
+        for frame in extraction.get("frames", []):
+            if frame.get("path"):
+                rows[frame["path"]] = dict(frame, kind="video", blur_score=frame.get("sharpness"))
+        if rows:
+            session["source_images"] = list(rows.values())
+    if artifact and (changed or artifact != (session.get("artifacts") or {}).get("raw_splat_path")):
+        session.setdefault("artifacts", {}).update(
+            raw_splat_path=artifact, splat_path=artifact, splat_dataset_dir=dataset_dir,
+            splat_units="reconstruction", splat_transform_applied=False)
+        if (session.get("recon_transform") or {}).get("confirmed"):
+            try:
+                common._materialize_metric_splat(session)
+            except Exception as exc:
+                session.setdefault("warnings", []).append(f"splat transform failed: {exc}")
+        changed = True
+    if changed:
+        common._save_session(session)
+
+
+
+
 def _publish(root: Path, run_id: str, payload: dict, finalizing: bool) -> dict | None:
     # Pipeline only exposes complete, immutable artifacts. Never accept a missing file.
-    allowed = ("pct", "msg", "frames", "registered", "iteration", "total_iterations", "sparse_dir")
+    allowed = ("pct", "msg", "frames", "registered", "iteration", "total_iterations",
+               "dataset_dir", "sparse_dir", "images_dir", "image_name_map",
+               "image_name_map_path", "batch_image_map_path")
     changes = {key: payload[key] for key in allowed if key in payload}
     stage = payload.get("stage", "sparse")
     changes["stage"] = stage
@@ -393,8 +488,11 @@ def _publish(root: Path, run_id: str, payload: dict, finalizing: bool) -> dict |
             changes["source_splat_path"] = payload.get("source_splat_path") or artifact
             if payload.get("bounds") is not None:
                 changes["bounds"] = payload["bounds"]
+        else:
+            artifact = None
         rec.update(changes, updated_at=time.time())
         _atomic(root / "splat_job.json", rec)
+        _persist_shared_output(root, rec, {**rec, **payload}, artifact)
         return rec
 
 
@@ -422,15 +520,15 @@ def _supervise(root: Path, run_id: str) -> None:
             paths = _images(root)
             finalizing = bool(rec.get("finish_requested"))
             video = rec.get("video_path", "") if video_pending else ""
-            ready = bool(video) or len(paths) >= 6
+            ready = bool(video) or len(paths) >= 3
             fresh = len(set(paths) - seen) >= 3
             if not ready or (not finalizing and seen and not fresh):
                 if finalizing and not ready:
                     _update(root, run_id, ok=False, status="failed", stage="failed",
-                            reason="insufficient_frames", error="At least six accepted images are required", frames=len(paths))
+                            reason="insufficient_frames", error="At least three accepted images are required", frames=len(paths))
                     break
                 _update(root, run_id, status="watching" if seen else "waiting", stage="capture",
-                        frames=len(paths), msg="Waiting for three new accepted images" if seen else "Waiting for at least six accepted images")
+                        frames=len(paths), msg="Waiting for three new accepted images" if seen else "Waiting for at least three accepted images")
                 time.sleep(0.4)
                 continue
             if gpu is None:
@@ -448,9 +546,16 @@ def _supervise(root: Path, run_id: str) -> None:
             work = Path(rec["work_dir"]) / f"batch_{batch:04d}"
             work.mkdir(parents=True)
             steps = rec["iterations"] if finalizing else min(rec["iterations"], 250)
+            # Each export writes the full cloud; about 50 previews per pass is enough for the UI.
             request = dict(session_id=rec["session_id"], session_dir=str(root), work_dir=str(work),
-                           images=paths, video_path=video, iterations=steps, export_every=min(steps, 100),
+                           images=paths, video_path=video, iterations=steps,
+                           export_every=min(steps, max(100, steps // 50)),
                            mode=rec["mode"], crop_bounds=rec.get("crop_bounds"))
+            from services.mcp import reveng_common as common
+            session = common._load_session(rec["session_id"], merge_gaussian=False) or {}
+            dataset = session.get("sfm_dataset") or {}
+            if not video and common._dataset_matches(dataset, paths):
+                request["dataset_dir"] = dataset["dataset_dir"]
             _atomic(work / "request.json", request)
             _update(root, run_id, status="finalizing" if finalizing else "sparse", stage="sparse",
                     frames=len(paths), iteration=0, total_iterations=steps, pct=0,

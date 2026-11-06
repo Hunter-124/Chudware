@@ -79,4 +79,4 @@ def test_applerubber_no_results_block_is_honest(applerubber_mod, monkeypatch):
     session, applerubber = applerubber_mod
     monkeypatch.setattr(session, "browser_fetch",
                         lambda url, s: {"ok": True, "content": "<html>homepage</html>"})
-    assert applerubber.ADAPTER.search("o-ring") == []
+    assert applerubber.ADAPTER.search("o-ring")[0]["reason"] == "parse_failed"

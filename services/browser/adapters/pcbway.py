@@ -1,101 +1,105 @@
-"""services/browser/adapters/pcbway.py — PCBWay source adapter.
+"""Search PCBWay Community projects; project listings are not product SKUs.
 
-PCBWay is a PCB fab + parts source, same shape as jlcpcb.py: no CAD file for
-a parts-library hit, only a STRUCTURED price/stock record for ECAD BOM
-matching, copied with provenance. Quote/order flows gate behind a
-per-order terms click-through; this adapter never accepts that on the
-user's behalf and surfaces :func:`terms_confirmation_required` instead.
-
-Live-verified 2026-08-07 against PCBWay Community's current
-``/project/projectsearch?q=...&t=1`` route and ``info-title`` result links.
-Quote/order terms remain an explicit user-confirmation boundary.
+The adapter links to projects but does not acquire their design files or accept
+quote/order terms on the user's behalf.
 """
 from __future__ import annotations
 
+import html
 import re
 
-from .. import session as _session
-from . import is_login_wall, login_required, provenance_envelope, register, terms_confirmation_required
+from .. import challenge, session as _session
+from . import (abs_url, fail, is_login_wall, login_required, make_hit, quote_query,
+               register, source_failure)
+from ._retail import RetailAdapter, _challenge, _strip_tags, card_image, visible_text
 
 SITE = "pcbway"
 BASE_URL = "https://www.pcbway.com"
 SEARCH_URL_TMPL = BASE_URL + "/project/projectsearch?q={query}&t=1"
-LICENSE_NOTE = (
-    "PCBWay parts/fab data (price, stock) is copied with provenance (source "
-    "URL + fetch timestamp) for the user's own BOM/sourcing decision, never "
-    "redistributed in bulk and never LLM-generated. Quote/order terms "
-    "click-throughs are never auto-accepted. See contracts/license_debt.md."
-)
 
-_LOGIN_WALL_MARKERS = ('Sign In', 'id="login-email"', 'class="login-panel"')
+_LOGIN_WALL_MARKERS = ('id="login-email"', 'class="login-panel"')
+_CHALLENGE_MARKERS = ("Access Denied", "Pardon Our Interruption", "Just a moment")
 _TERMS_MARKERS = ('Accept the terms', 'class="order-terms"', 'agree to the Terms')
 _RESULT_RE = re.compile(
-    r'<a\b(?=[^>]*class="[^"]*info-title[^"]*")'
-    r'(?=[^>]*href="(?P<href>/project/shareproject/[^"?#]+)(?:[?#][^"]*)?")[^>]*>'
-    r'(?P<title>.*?)</a>',
-    re.IGNORECASE | re.DOTALL,
-)
-_PRICE_RE = re.compile(r'<span[^>]*class="[^"]*price[^"]*"[^>]*>\$(?P<price>[0-9,.]+)</span>', re.IGNORECASE)
-_STOCK_RE = re.compile(r'<span[^>]*class="[^"]*stock[^"]*"[^>]*>(?P<stock>[0-9,]+)\s*(?:in stock)?</span>',
-                       re.IGNORECASE)
-
-
-def _strip_tags(text: str) -> str:
-    return re.sub(r"<[^>]+>", "", text).strip()
+    r'''<a\b(?=[^>]*class=["'][^"']*\binfo-title\b[^"']*["'])'''
+    r'''(?=[^>]*href=["'](?P<href>/project/shareproject/[^"'?#]+)(?:[?#][^"']*)?["'])[^>]*>'''
+    r'''(?P<title>.*?)</a>''', re.IGNORECASE | re.DOTALL)
+_ROW_START_RE = re.compile(r'''<div\b[^>]*class=["'][^"']*\bresult-row\b[^"']*["'][^>]*>''',
+                           re.IGNORECASE)
+_GRAPHIC_RE = re.compile(
+    r'''<a\b(?=[^>]*class=["'][^"']*\binfo-graphic\b[^"']*["'])'''
+    r'''(?=[^>]*href=["'](?P<href>[^"']+)["'])[^>]*>(?P<graphic>.*?)</a>''',
+    re.IGNORECASE | re.DOTALL)
+_BACKGROUND_RE = re.compile(r'''background-image\s*:\s*url\(\s*["']?([^"')\s]+)''', re.IGNORECASE)
+_NO_RESULTS_RE = re.compile(r'\b(?:no results(?: found)?|no projects found|0 results)\b', re.IGNORECASE)
 
 
 class PcbwayAdapter:
     key = SITE
+    hosts = ("pcbway.com",)
+    result_kinds = ("project",)
+    cad_acquisition = False
+    login_required = False
+    api = False
 
     def search(self, query: str) -> list[dict]:
-        url = SEARCH_URL_TMPL.format(query=query.replace(" ", "+"))
-        result = _session.browser_fetch(url, SITE)
-        if not result.get("ok"):
-            return [result]
-        content = result.get("content", "")
-        if is_login_wall(content, _LOGIN_WALL_MARKERS):
-            return [login_required(SITE, url)]
-        hits = []
-        for m in _RESULT_RE.finditer(content):
-            title = _strip_tags(m.group("title"))
-            if not title:
-                continue
-            hits.append({
-                "title": title,
-                "url": BASE_URL + m.group("href"),
-                "site": SITE,
-                "price": None,
-                "stock": None,
-            })
+        url = SEARCH_URL_TMPL.format(query=quote_query(query))
+        response = _session.browser_fetch(url, SITE)
+        if not response.get("ok"):
+            return [source_failure(SITE, "search", response, url=url)]
+        content = response.get("content", "")
+        page_url = response.get("final_url") or url
+        if challenge.classify_challenge(content, page_url) == "captcha" or is_login_wall(content, _CHALLENGE_MARKERS):
+            return [_challenge(SITE, "search", page_url, content)]
+        if RetailAdapter._redirected_to_login(url, page_url) or (
+                is_login_wall(content, _LOGIN_WALL_MARKERS) and not _RESULT_RE.search(content)):
+            return [source_failure(SITE, "search", login_required(SITE, page_url), url=page_url)]
+
+        rows = list(_ROW_START_RE.finditer(content))
+        blocks = [content[row.start():rows[i + 1].start() if i + 1 < len(rows) else len(content)]
+                  for i, row in enumerate(rows)] if rows else [content]
+        hits, seen = [], set()
+        for block in blocks:
+            for match in _RESULT_RE.finditer(block):
+                project_url = abs_url(response.get("final_url") or url, html.unescape(match.group("href")))
+                title = html.unescape(_strip_tags(match.group("title"))).strip()
+                if not title or not project_url or project_url in seen:
+                    continue
+                seen.add(project_url)
+                thumbnail = None
+                for graphic in _GRAPHIC_RE.finditer(block):
+                    graphic_url = abs_url(project_url, html.unescape(graphic.group("href")).split("?", 1)[0])
+                    if graphic_url != project_url:
+                        continue
+                    image = _BACKGROUND_RE.search(graphic.group("graphic"))
+                    if image:
+                        thumbnail = abs_url(project_url, html.unescape(image.group(1)))
+                    else:
+                        thumbnail = card_image(graphic.group("graphic"), project_url)
+                    break
+                hits.append(make_hit(SITE, title=title, url=project_url, kind="project", thumbnail=thumbnail))
+        if not hits and not _NO_RESULTS_RE.search(visible_text(content)):
+            return [fail(SITE, "search", "parse_failed", "No recognizable PCBWay projects were rendered.", url=url)]
         return hits
 
     def acquire(self, result: dict) -> dict:
         url = result.get("url", "")
         if not url:
-            return {"ok": False, "reason": "bad_result", "hint": "result has no 'url'"}
-
+            return fail(SITE, "acquire", "not_found", "Result has no project URL.")
         page = _session.browser_fetch(url, SITE)
         if not page.get("ok"):
-            return page
+            return source_failure(SITE, "acquire", page, url=url)
         content = page.get("content", "")
-        if is_login_wall(content, _LOGIN_WALL_MARKERS):
-            return login_required(SITE, url)
+        page_url = page.get("final_url") or url
+        if challenge.classify_challenge(content, page_url) == "captcha" or is_login_wall(content, _CHALLENGE_MARKERS):
+            return _challenge(SITE, "acquire", page_url, content)
+        if RetailAdapter._redirected_to_login(url, page_url) or is_login_wall(content, _LOGIN_WALL_MARKERS):
+            return source_failure(SITE, "acquire", login_required(SITE, page_url), url=page_url)
         if is_login_wall(content, _TERMS_MARKERS):
-            return terms_confirmation_required(
-                SITE, url, "PCBWay requires accepting the order/quote terms for this item")
-
-        price_match = _PRICE_RE.search(content)
-        stock_match = _STOCK_RE.search(content)
-
-        return provenance_envelope(
-            source_url=url,
-            session_profile_used=page.get("session_profile_used", SITE),
-            license_note=LICENSE_NOTE,
-            artifact_path=None,
-            title=result.get("title", ""),
-            price=("$" + price_match.group("price")) if price_match else result.get("price"),
-            stock=stock_match.group("stock") if stock_match else result.get("stock"),
-        )
+            return fail(SITE, "acquire", "terms_required", "PCBWay requires accepting terms.", url=url,
+                        ask_user="Review and accept the terms on PCBWay before continuing.")
+        return fail(SITE, "acquire", "unsupported",
+                    "Project-file acquisition is not supported by this adapter.", url=url)
 
 
 ADAPTER = register(PcbwayAdapter())

@@ -37,7 +37,7 @@ const std::set<std::string>& pin_types() {
 const std::set<std::string>& tech_layers() {
     static const std::set<std::string> s{"F.SilkS", "B.SilkS", "F.Mask", "B.Mask", "F.Paste",
                                          "B.Paste", "F.Fab", "B.Fab", "F.CrtYd", "B.CrtYd",
-                                         "Edge.Cuts", "Cmts.User", "Dwgs.User"};
+                                         "F.Adhes", "B.Adhes", "Edge.Cuts", "Cmts.User", "Dwgs.User"};
     return s;
 }
 const std::set<std::string>& pad_shapes() {
@@ -169,6 +169,48 @@ std::set<std::string> valid_layers(int copper_layers) {
     return s;
 }
 
+bool layer_spec_matches(std::string_view spec, std::string_view layer) {
+    if (spec == layer) return true;
+    const bool wildcard = spec.size() > 2 && spec.substr(0, 2) == "*.";
+    const bool both_outer = spec.size() > 4 && spec.substr(0, 4) == "F&B.";
+    if (!wildcard && !both_outer) return false;
+    const std::string_view suffix = spec.substr(wildcard ? 2 : 4);
+    if (layer.size() > 2 && (layer.substr(0, 2) == "F." || layer.substr(0, 2) == "B."))
+        return layer.substr(2) == suffix;
+    if (!wildcard || suffix != "Cu" || layer.size() < 6 ||
+        layer.substr(0, 2) != "In" || layer.substr(layer.size() - 3) != ".Cu")
+        return false;
+    for (char c : layer.substr(2, layer.size() - 5))
+        if (c < '0' || c > '9') return false;
+    return true;
+}
+
+bool pad_has_layer(const json& pad, std::string_view layer) {
+    if (!pad.is_object() || !pad.contains("layers") || !pad["layers"].is_array()) return false;
+    for (const json& spec : pad["layers"])
+        if (spec.is_string() && layer_spec_matches(spec.get_ref<const std::string&>(), layer))
+            return true;
+    return false;
+}
+
+std::set<std::string> pad_copper_layers(const json& pad, int copper_layers) {
+    const auto copper = copper_layer_ids(copper_layers);
+    const std::string type = pad.value("type", std::string("smd"));
+    bool explicit_set = false;
+    if (pad.contains("layers") && pad["layers"].is_array())
+        for (const json& spec : pad["layers"])
+            if (spec.is_string() && (spec == "*.Cu" || spec == "F&B.Cu"))
+                explicit_set = true;
+    // Preserve the native model's through-hole convention for legacy explicit
+    // front/back layer lists. KiCad layer sets explicitly distinguish outer-only.
+    if (!explicit_set && (type == "tht" || type == "np_tht" || type == "connector"))
+        return {copper.begin(), copper.end()};
+    std::set<std::string> result;
+    for (const auto& layer : copper)
+        if (pad_has_layer(pad, layer)) result.insert(layer);
+    return result;
+}
+
 // ----------------------------------------------------------------- geometry
 namespace {
 bool is_xy(const json& v) {
@@ -209,8 +251,10 @@ std::pair<double, double> pin_world(const json& symbol, const json& pin) {
     double tx = px + length * std::cos(a), ty = py + length * std::sin(a);
     double sang = symbol.contains("angle") && symbol["angle"].is_number() ? symbol["angle"].get<double>()
                                                                           : 0.0;
-    std::string mir = symbol.value("mirror", std::string("none"));
-    return local_to_world(tx, ty, require_pos(symbol, "symbol"), sang, mir);
+    // KiCad names the axis of reflection, rather than the coordinate negated.
+    const std::string mir = symbol.value("mirror", std::string("none"));
+    return local_to_world(tx, ty, require_pos(symbol, "symbol"), sang,
+                          mir == "x" ? "y" : mir == "y" ? "x" : mir);
 }
 
 std::pair<double, double> pad_world(const json& footprint, const json& pad) {
@@ -759,10 +803,15 @@ std::vector<std::string> validate_board(const json& doc) {
                     if ((ptype == "tht" || ptype == "np_tht") && !has_drill)
                         errs.push_back(ploc + ": " + ptype + " pad requires a drill");
                     if (pad.contains("layers") && pad["layers"].is_array())
-                        for (const json& lyr : pad["layers"])
-                            if (lyr.is_string() && !layers_ok.count(lyr.get<std::string>()))
-                                errs.push_back(ploc + ".layers: '" + lyr.get<std::string>() +
-                                               "' not in stackup");
+                        for (const json& lyr : pad["layers"]) {
+                            if (!lyr.is_string()) continue;
+                            const std::string& spec = lyr.get_ref<const std::string&>();
+                            bool valid = layers_ok.count(spec) != 0;
+                            if (!valid) for (const auto& concrete : layers_ok)
+                                if (layer_spec_matches(spec, concrete)) { valid = true; break; }
+                            if (!valid)
+                                errs.push_back(ploc + ".layers: '" + spec + "' not in stackup");
+                        }
                     check_net(pad.contains("net") ? pad["net"] : json(nullptr), ploc + ".net");
                     ++k;
                 }

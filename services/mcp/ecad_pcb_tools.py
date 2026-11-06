@@ -17,6 +17,7 @@ from .ecad_common import (
     _autosave_all_open_ecad,
     _budget_timeout_err,
     _compile_of,
+    _default_ecad_path,
     _default_out_dir,
     _default_outline_shapes,
     _dumps,
@@ -36,29 +37,6 @@ from .ecad_common import (
     netlist_mod,
 )
 
-# Gerber filename extensions per layer id (Protel/KiCad fab-house standard) — the C++
-# ecad_export RPC returns {layer_id: content}; the file naming mirrors
-# engine.ecad.fab.gerber._LAYER_EXT so exported filenames are unchanged.
-_GERBER_LAYER_EXT: dict[str, str] = {
-    "F.Cu": ".GTL", "B.Cu": ".GBL",
-    "F.SilkS": ".GTO", "B.SilkS": ".GBO",
-    "F.Mask": ".GTS", "B.Mask": ".GBS",
-    "F.Paste": ".GTP", "B.Paste": ".GBP",
-    "Edge.Cuts": ".GM1",
-    "F.Fab": ".GM2", "B.Fab": ".GM3",
-    "F.CrtYd": ".GM4", "B.CrtYd": ".GM5",
-}
-
-
-def _gerber_ext(layer_id: str) -> str:
-    if layer_id in _GERBER_LAYER_EXT:
-        return _GERBER_LAYER_EXT[layer_id]
-    import re
-    m = re.match(r"^In(\d+)\.Cu$", layer_id)
-    if m:
-        return f".G{int(m.group(1)) + 1}"
-    return f".G_{layer_id.replace('.', '_')}"
-
 
 def _resolve_out_path(path: str) -> str:
     """Canonicalize a caller-supplied output path/dir: expanduser + abspath, mirroring
@@ -73,29 +51,13 @@ def _file_sizes(paths: dict) -> tuple[dict, int]:
     sizes = {k: (os.path.getsize(p) if os.path.exists(p) else 0) for k, p in paths.items()}
     return sizes, sum(sizes.values())
 
-
-def _write_fab_files(session, kind: str, out_dir: str) -> dict[str, str]:
-    """C++ ecad_export (gerber/drill) -> files on disk; returns {layer_id|pth/npth -> path},
-    mirroring engine.ecad.fab.write_gerbers / write_drill."""
-    resp = _rpc("ecad_export", {"kind": kind, "doc_id": session.doc_id})
-    contents = resp.get("files") or {}
-    board_name = (session.doc.get("name", "board") or "board").replace(" ", "_")
-    os.makedirs(out_dir, exist_ok=True)
-    out: dict[str, str] = {}
-    for key, content in contents.items():
-        fn = (f"{board_name}{_gerber_ext(key)}" if kind == "gerber"
-              else f"{board_name}-{key.upper()}.drl")
-        p = os.path.join(out_dir, fn)
-        with open(p, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(content)
-        out[key] = p
-    return out
+def _fab_out_dir(session) -> str:
+    """Fabrication artifacts belong beside the KiCad project."""
+    board_path = session.path or _default_ecad_path(
+        "pcb", str(session.doc.get("name") or "board"))
+    return os.path.join(os.path.dirname(board_path), "fab")
 
 
-def _fab_text(session, kind: str, file_key: str) -> str:
-    """C++ ecad_export single-text kinds (bom/cpl) -> the text payload."""
-    resp = _rpc("ecad_export", {"kind": kind, "doc_id": session.doc_id})
-    return (resp.get("files") or {}).get(file_key, "")
 
 
 def _board_bbox(doc: dict) -> tuple[float, float, float, float]:
@@ -240,29 +202,51 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
-    def ecad_new_pcb(name: str = "Board1") -> str:
-        """Start a NEW PCB (board) document and make it the active one.
+    def ecad_new_pcb(name: str = "Board1", path: str = "") -> str:
+        """Create a KiCad PCB and make it the active board.
 
-        Returns the doc id + stackup summary. A fresh board has a 2-layer copper stackup, a
-        default net class, and a GND net but no footprints or outline yet. Use ecad_find_part to
-        discover footprint fpids, place them, route, then ecad_run_drc.
+        By default the board is created in a named project under the active working
+        directory, with a numeric suffix if that board already exists. An existing
+        explicit .kicad_pcb path must be opened with ecad_open instead.
         """
-        s = ecad_session.new_session("pcb", name)
+        try:
+            s = ecad_session.new_session("pcb", name, path or None, unique=True)
+        except OpError as e:
+            return _err(e.message, code=e.code, detail=e.detail,
+                        hint=("Use ecad_open to open the existing file, or choose a different path."
+                              if e.code == "already_exists" else "Choose a writable KiCad PCB path."))
+        except ValueError as e:
+            return _err(str(e), code="invalid_path", hint="Choose a valid KiCad PCB path.")
         _ECAD["current_pcb"] = s.doc_id
         _ECAD["current"] = s.doc_id
         n_cu = s.doc.get("stackup", {}).get("copper_layers", 2)
         return _dumps({
             "ok": True, "doc_id": s.doc_id, "kind": "pcb", "name": name,
-            "revision": s.revision, "copper_layers": n_cu, "footprints": 0,
+            "path": s.path, "revision": s.revision, "copper_layers": n_cu, "footprints": 0,
             "nets": [n.get("name") for n in s.doc.get("nets", [])],
             "warnings": [],
-            "hint": f"Empty {n_cu}-layer board. Place footprints (ecad_find_part finds fpids), "
-                    "route tracks, then ecad_run_drc to check spacing.",
+            "hint": f"Empty {n_cu}-layer board. Find and place KiCad footprints, then route "
+                    "tracks and run ecad_run_drc.",
             "next_actions": [
-                "ecad_find_part('0603')  # discover footprint fpids",
+                "ecad_find_footprint('0603')  # discover footprint fpids",
                 "ecad_run_drc()  # at any time, see clearance/width violations",
             ],
         })
+
+    @mcp.tool()
+    def ecad_find_footprint(query: str = "", limit: int = 30) -> str:
+        """Search installed KiCad footprint libraries by name or description."""
+        try:
+            result = _rpc("ecad_footprints", {"query": query, "limit": limit})
+            result.update({
+                "warnings": [],
+                "hint": f"Found {result.get('count', 0)} KiCad footprint(s).",
+                "next_actions": ["Use an fpid when placing a footprint on the board."],
+            })
+            return _dumps(result)
+        except OpError as e:
+            return _err(e.message, code=e.code, detail=e.detail,
+                        hint="Install KiCad or check its footprint library tables.")
 
 
 
@@ -270,35 +254,45 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def ecad_run_drc(doc_id: str = "") -> str:
-        """Run the Design Rule Check on the active board and return a summary with the worst
-        offenders (clearance, track width, via size, annular ring, edge clearance, etc.).
+        """Run KiCad's authoritative design-rule check on the active board.
 
-        DRC is advisory. The grouped ``by_rule`` view + the readable lines tell you which physical
-        spacing/size rule each track/pad/via breaks so you can widen, move, or re-space it.
+        Returns structured violations with KiCad item UUIDs, coordinates and counts,
+        including unconnected items and schematic parity where applicable.
         """
         try:
             session = _get_pcb(doc_id or None)
         except OpError as e:
             return _err(e.message, hint="Open a board first.",
                         next_actions=["ecad_new_pcb('myboard')"])
-        doc = session.doc
-        res = _compile_of(session).get("drc", [])  # C++ compile runs engine.ecad.drc
-        violations = res if isinstance(res, list) else res.get("violations", [])
-        summary = _erc_summary(violations)
-        lines = _erc_lines(violations)
+        try:
+            result = _rpc("ecad_kicad_check", {"doc_id": session.doc_id})
+        except OpError as e:
+            return _err(e.message, code=e.code, detail=e.detail,
+                        hint="KiCad DRC did not complete; check the KiCad installation and board.")
+        violations = result.get("violations") or []
+        all_findings = violations + (result.get("unconnected") or []) + (result.get("parity") or [])
+        formatted = [
+            {**v, "rule": v.get("type", "?"), "message": v.get("description", "")}
+            for v in all_findings if isinstance(v, dict)
+        ]
+        summary = _erc_summary(formatted)
+        counts = result.get("counts") or {}
+        errors = counts.get("error", summary["errors"])
+        warnings = counts.get("warning", summary["warnings"])
+        lines = _erc_lines(formatted)
         worst = lines[:5]
-        verdict = (f"{summary['errors']} error(s), {summary['warnings']} warning(s)."
+        verdict = (f"{errors} error(s), {warnings} warning(s)."
                    + (" worst: " + " | ".join(worst) if worst else " Clean board."))
         return _dumps({
-            "ok": True, "doc_id": session.doc_id, "revision": session.revision,
-            "errors": summary["errors"], "warnings": summary["warnings"],
-            "verdict": verdict,
-            "violations": lines, "by_rule": summary["groups"],
-            "warnings": [],
+            **result, "ok": True, "doc_id": session.doc_id, "revision": session.revision,
+            "drc_passed": bool(result.get("ok")),
+            "errors": errors, "warnings": warnings,
+            "verdict": verdict, "violations": violations, "violation_lines": lines,
+            "by_rule": summary["groups"],
             "hint": verdict,
             "next_actions": (
                 ["Address the worst DRC offenders above (widen tracks / increase spacing / "
-                 "move parts), then re-run ecad_run_drc()."] if violations else
+                 "move parts), then re-run ecad_run_drc()."] if errors or warnings else
                 ["ecad_export('gerber')  # board passes DRC — generate fab outputs"]
             ),
         })
@@ -503,8 +497,8 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
         # The Lee/A* router over a fine grid is one of the heaviest ECAD ops — budget-guard so an
         # overrun never times out the transport and kills the server (Gap (b)).
         _autosave_all_open_ecad()
-        status, resp = _run_with_budget(lambda: _rpc(
-            "ecad_autoroute", {"doc_id": session.doc_id, "opts": opts}))
+        status, resp = _run_with_budget(lambda: ecad_session.mutate_rpc(
+            session, "ecad_autoroute", {"opts": opts}))
         if status == "timeout":
             return _budget_timeout_err(
                 "autoroute",
@@ -516,7 +510,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
             e = resp  # on 'error', _run_with_budget returns the raised exception
             if isinstance(e, OpError):
                 return _err(f"autoroute failed: {e.message}", hint=e.message,
-                            next_actions=["ecad_status()"], detail=getattr(e, "detail", {}))
+                            next_actions=["ecad_status()"], code=e.code, detail=e.detail)
             raise e
         report = resp.get("report", {})
         routed = report.get("routed", [])
@@ -648,9 +642,9 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                         board_changed=False)
 
         try:
-            resp = _rpc("ecad_route_diff_pair",
-                        {"doc_id": session.doc_id, "net_p": pair[0], "net_n": pair[1],
-                         "opts": route_opts or {}})
+            resp = ecad_session.mutate_rpc(session, "ecad_route_diff_pair",
+                                           {"net_p": pair[0], "net_n": pair[1],
+                                            "opts": route_opts or {}})
         except OpError as e:
             return _err(f"differential-pair route failed: {e.message}",
                         hint="Check that both names exactly match board nets with unrouted "
@@ -658,7 +652,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                         next_actions=["ecad_status()  # inspect board nets and ratsnest",
                                       f"ecad_route_diff_pair({pair[0]!r}, {pair[1]!r}, "
                                       "opts={'pitch': 0.15})"],
-                        detail=getattr(e, "detail", {}), board_changed=False)
+                        code=e.code, detail=e.detail)
 
         report = resp.get("report") or {}
         routed = bool(report.get("routed", False))
@@ -868,8 +862,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
             _apply(session, ops)
         except OpError as e:
             return _err(f"manual route failed: {e.message}", hint=e.message,
-                        next_actions=["ecad_status()"], detail=getattr(e, "detail", {}),
-                        board_changed=False)
+                        next_actions=["ecad_status()"], code=e.code, detail=e.detail)
 
         doc = session.doc
         new_tracks = [t for t in doc.get("tracks", []) or []
@@ -982,7 +975,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                                      "polygon": polygon}])
         except OpError as e:
             return _err(f"could not add zone on {net!r}/{layer}: {e.message}", hint=e.message,
-                        next_actions=["ecad_status()"], detail=getattr(e, "detail", {}))
+                        next_actions=["ecad_status()"], code=e.code, detail=e.detail)
         zones = session.doc.get("zones", [])
         payload = {
             "ok": True, "doc_id": session.doc_id, "revision": session.revision,
@@ -1024,7 +1017,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
         # kills the server (Gap (b); this was the make_board trigger in adb46f62).
         _autosave_all_open_ecad()
         status, resp = _run_with_budget(
-            lambda: _rpc("ecad_fill_zones", {"doc_id": session.doc_id}))
+            lambda: ecad_session.mutate_rpc(session, "ecad_fill_zones", {}))
         if status == "timeout":
             return _budget_timeout_err(
                 "zone fill",
@@ -1035,7 +1028,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
             e = resp
             if isinstance(e, OpError):
                 return _err(f"zone fill failed: {e.message}", hint=e.message,
-                            next_actions=["ecad_status()"], detail=getattr(e, "detail", {}))
+                            next_actions=["ecad_status()"], code=e.code, detail=e.detail)
             raise e
         summary = resp.get("fill_summary", {})
         filled = summary.get("zones_filled", 0)
@@ -1058,16 +1051,15 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
     # ---------------------------------------------------------------- export
 
     @mcp.tool()
-    def ecad_export(kind: str, path: str = "", doc_id: str = "") -> str:
-        """Export a fabrication output from the active board.
+    def ecad_export(kind: str, path: str = "", doc_id: str = "",
+                    opts: Optional[Union[dict, str]] = None) -> str:
+        """Export KiCad fabrication and visualization outputs from the active board.
 
-        ``kind`` is one of: 'gerber' (copper/mask/silk layer set), 'drill' (Excellon PTH/NPTH),
-        'bom' (CSV bill of materials), 'placement' (pick-and-place CSV), or 'constraints'
-        (FPGA pin-constraint files from the design netlist: native XDC for Xilinx / LPF for
-        Lattice + a neutral CSV pinout per FPGA — the board is the source of truth for the
-        HDL flow; see ecad_fpga_check). ``path`` is the output directory (gerber/drill/
-        constraints) or file (bom/placement); defaults under the Chudware cache. Returns the
-        written path(s).
+        Kinds: gerber, drill, cpl, bom, step, odb, ipc2581, svg, pdf, render.
+        Outputs default to the KiCad project's fab directory. Pass a directory for
+        gerber, drill or svg, or a file or directory for the remaining kinds. Optional
+        opts are passed to KiCad's export RPC. The additional constraints kind
+        exports FPGA constraints from the schematic.
         """
         kind = (kind or "").lower()
         if kind == "constraints":
@@ -1121,179 +1113,158 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
         except OpError as e:
             return _err(e.message, hint="Export needs an open board.",
                         next_actions=["ecad_new_pcb('myboard')"])
-        doc = session.doc
-        out_dir = _resolve_out_path(path) if path else str(_default_out_dir(doc.get("name", "board")))
+        extensions = {
+            "cpl": ".csv", "bom": ".csv", "step": ".step", "odb": ".zip",
+            "ipc2581": ".xml", "pdf": ".pdf", "render": ".png",
+        }
+        directory_kinds = {"gerber", "drill", "svg"}
+        if kind not in directory_kinds and kind not in extensions:
+            return _err(f"unknown export kind {kind!r}",
+                        hint="Use gerber, drill, cpl, bom, step, odb, ipc2581, svg, pdf, "
+                             "render, or constraints.",
+                        next_actions=["ecad_export('gerber')"])
         try:
-            if kind == "gerber":
-                files = _write_fab_files(session, "gerber", out_dir)
-                file_sizes, total_bytes = _file_sizes(files)
-                result = {"kind": "gerber", "dir": out_dir, "files": files,
-                          "file_bytes": file_sizes, "total_bytes": total_bytes,
-                          "layer_count": len(files)}
-            elif kind == "drill":
-                files = _write_fab_files(session, "drill", out_dir)
-                file_sizes, total_bytes = _file_sizes(files)
-                result = {"kind": "drill", "dir": out_dir, "files": files,
-                          "file_bytes": file_sizes, "total_bytes": total_bytes,
-                          "layer_count": len(files)}
-            elif kind == "bom":
-                text = _fab_text(session, "bom", "bom")
-                fp = _resolve_out_path(path) if path else os.path.join(out_dir, "bom.csv")
-                os.makedirs(os.path.dirname(fp) or ".", exist_ok=True)
-                with open(fp, "w", encoding="utf-8") as fh:
-                    fh.write(text)
-                # M5: text.count("\n") includes the header line; subtract 1 to report
-                # only DATA rows (the meaningful count for a 5-component board = 5, not 6).
-                result = {"kind": "bom", "path": fp,
-                          "rows": max(0, text.count("\n") - 1),
-                          "bytes": os.path.getsize(fp) if os.path.exists(fp) else 0}
-            elif kind == "placement":
-                text = _fab_text(session, "cpl", "cpl")
-                fp = _resolve_out_path(path) if path else os.path.join(out_dir, "placement.csv")
-                os.makedirs(os.path.dirname(fp) or ".", exist_ok=True)
-                with open(fp, "w", encoding="utf-8") as fh:
-                    fh.write(text)
-                # M5: same header-line subtraction for placement CSV
-                result = {"kind": "placement", "path": fp,
-                          "rows": max(0, text.count("\n") - 1),
-                          "bytes": os.path.getsize(fp) if os.path.exists(fp) else 0}
+            export_opts = require_mapping(opts, "opts") if opts is not None else {}
+        except ValueError as e:
+            return _err(str(e), hint="Pass opts as an object of KiCad export options.")
+        fab_dir = _fab_out_dir(session)
+        stem = os.path.splitext(os.path.basename(session.path or "board.kicad_pcb"))[0]
+        destination = (_resolve_out_path(path) if path else
+                       fab_dir if kind in directory_kinds else
+                       os.path.join(fab_dir, stem + "-" + kind + extensions[kind]))
+        try:
+            if kind in directory_kinds:
+                os.makedirs(destination, exist_ok=True)
             else:
-                return _err(f"unknown export kind {kind!r}",
-                            hint="Use 'gerber', 'drill', 'bom', 'placement', or "
-                                 "'constraints' (FPGA XDC/LPF/CSV).",
-                            next_actions=["ecad_export('gerber')"])
-        except Exception as e:  # noqa: BLE001
-            return _err(f"export {kind} failed: {type(e).__name__}: {e}",
-                        hint="Check ecad_run_drc() and that the board has footprints/copper.")
+                os.makedirs(os.path.dirname(destination) or ".", exist_ok=True)
+            result = _rpc("ecad_export", {
+                "kind": kind, "doc_id": session.doc_id, "path": destination, "opts": export_opts,
+            })
+        except OpError as e:
+            return _err(f"export {kind} failed: {e.message}", code=e.code, detail=e.detail,
+                        hint="Check the KiCad installation and the board's fabrication setup.")
+        except OSError as e:
+            return _err(f"export {kind} failed: {e}",
+                        hint="Choose a writable output path.")
+        paths = result.get("paths") or []
+        file_sizes, total_bytes = _file_sizes({p: p for p in paths})
+        exists = bool(paths) and all(os.path.isfile(p) for p in paths)
+        out_dir = destination if os.path.isdir(destination) else os.path.dirname(destination)
         _ECAD["out_dir"] = out_dir
-        written_path = result.get("path") or result.get("dir")
-        exists = (os.path.exists(result["path"]) if "path" in result
-                  else bool(result.get("files")) and all(
-                      os.path.exists(p) for p in result["files"].values()))
-        size_note = (f"{result['bytes']} byte(s)" if "bytes" in result else
-                     f"{result.get('layer_count', 0)} file(s), {result.get('total_bytes', 0)} byte(s) total")
-        result.update({"ok": exists, "exists": exists, "doc_id": session.doc_id, "warnings": [],
-                       "hint": f"Wrote {kind} to {written_path} ({size_note}), confirmed on disk.",
-                       "next_actions": ["ecad_export('drill')  # the other fab outputs",
-                                        "ecad_export('bom')"]})
+        result.update({
+            "ok": exists, "exists": exists, "doc_id": session.doc_id,
+            "warnings": list(result.get("warnings") or []),
+            "dir": out_dir, "file_bytes": file_sizes, "total_bytes": total_bytes,
+            "hint": (f"KiCad wrote {len(paths)} {kind} file(s) to {destination}."
+                     if exists else f"KiCad reported no written {kind} files at {destination}."),
+            "next_actions": ["ecad_export('drill')", "ecad_export('bom')"],
+        })
+        if len(paths) == 1:
+            result["path"] = paths[0]
+            result["bytes"] = file_sizes[paths[0]]
         return _dumps(result)
 
 
 
     @mcp.tool()
     def ecad_to_3d(path: str = "", doc_id: str = "") -> str:
-        """Export a 3D model (STEP) of the active board + the aicad.boardphys/1 sidecar.
+        """Export a KiCad STEP with component models and a board-physics sidecar.
 
-        Calls ``engine.ecad.threed.board_to_step``: assembles the board substrate and a
-        component BODY for every on-board footprint (real model_3d STEP > library package
-        box/cylinder from the eng metadata > pad-extent proxy box) and writes a STEP file.
-        Also writes ``<step>.boardphys.json`` — the machine-readable ``aicad.boardphys/1``
-        sidecar mapping each component solid to its power/thermal metadata (power_w typ/max,
-        theta_ja/jc, Tj/Ta limits, supply rails) with board power totals. Missing metadata is
-        honest ``null``, never 0 (contracts/ecad/boardphys.md). Downstream consumers (thermal
-        handoff, PDN, power budget, host-board rules) read the sidecar.
-
-        Returns the STEP path, sidecar path, volume summary + power totals, and a hint telling
-        the user to open the STEP as an import feature in the Chudware app so they can design an
-        enclosure around the board.
-
-        Falls back to a clean, actionable error (never raises) when the board has no outline or
-        when there is no active PCB session.
+        KiCad's STEP export is imported into a new CAD part. The sidecar retains
+        component power and thermal metadata, but does not claim unverified STEP
+        solid labels or proxy geometry. By default the STEP is written beside the
+        bound KiCad board.
         """
         try:
             session = _get_pcb(doc_id or None)
         except OpError as e:
-            return _err(e.message, hint="3D export needs an open board.",
+            return _err(e.message, code=e.code, detail=e.detail,
+                        hint="3D export needs an open board.",
                         next_actions=["ecad_new_pcb('myboard')"])
         doc = session.doc
-
-        # Build the output path (default: Chudware cache dir named after the board).
-        out_path = (_resolve_out_path(path) if path
-                    else str(_default_out_dir(doc.get("name", "board")) / "board.step"))
-
-        # The FIRST ecad_to_3d call cold-imports OCP/build123d (OpenCASCADE Python bindings) — that
-        # import alone can take 10-30 s in a freshly-warmed server, which on its own overruns the
-        # client transport timeout and gets the server KILLED before any STEP is written. Every
-        # OTHER heavy ECAD tool (simulate/make_board/autoroute/fill/dfm) is budget-guarded; this one
-        # was not. Run the import + geometry build on the bounded worker and autosave first, so an
-        # overrun returns a clean "still running" message instead of a -32001 server kill.
+        out_path = _resolve_out_path(path) if path else ""
         _autosave_all_open_ecad()
 
         def _build():
-            from services.ecad.threed import board_to_step  # STAYS: no C++ counterpart; lazy import (OCP/build123d)
-            return board_to_step(doc, out_path)
+            from services.ecad.threed import boardphys_for_kicad_step
 
-        bstatus, bval = _run_with_budget(_build)
-        if bstatus == "timeout":
+            if out_path:
+                os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+            result = _rpc("ecad_to_3d", {
+                "doc_id": session.doc_id, "opts": {"path": out_path} if out_path else {},
+            })
+            step_path = result.get("step_path")
+            if not step_path:
+                raise OpError("engine_error", "KiCad STEP export returned no output path")
+            exists = os.path.isfile(step_path)
+            warnings = list(result.get("warnings") or [])
+            sidecar_path = None
+            boardphys = None
+            if exists:
+                try:
+                    boardphys = boardphys_for_kicad_step(doc, step_path)
+                    source_path = os.path.realpath(session.path) if session.path else None
+                    if source_path:
+                        boardphys["board"]["source_path"] = source_path
+                    sidecar_path = step_path + ".boardphys.json"
+                    # Keep PDN heating when this board already has a sidecar.
+                    pdn_path = os.path.join(
+                        str(_default_out_dir(doc.get("name", "board"))), "pdn.boardphys.json")
+                    previous = (_ECAD.get("boardphys_paths") or {}).get(session.doc_id)
+                    default_sidecar = (os.path.splitext(session.path)[0] + ".step.boardphys.json"
+                                       if session.path else None)
+                    for old_path in filter(None, (sidecar_path, previous, default_sidecar, pdn_path)):
+                        try:
+                            with open(old_path, encoding="utf-8") as fh:
+                                old = json.load(fh)
+                        except (OSError, ValueError):
+                            continue
+                        old_board = old.get("board") if isinstance(old, dict) else None
+                        old_source = old_board.get("source_path") if isinstance(old_board, dict) else None
+                        if old_source:
+                            same_board = (isinstance(old_source, str) and bool(source_path)
+                                          and os.path.realpath(old_source) == source_path)
+                        else:
+                            same_board = (bool(doc.get("id")) and isinstance(old_board, dict)
+                                          and old_board.get("id") == doc["id"])
+                        if (same_board and old.get("schema") == "aicad.boardphys/1"
+                                and old.get("pdn")):
+                            boardphys["pdn"] = old["pdn"]
+                            break
+                    with open(sidecar_path, "w", encoding="utf-8") as fh:
+                        json.dump(boardphys, fh, indent=1)
+                    _ECAD.setdefault("boardphys_paths", {})[session.doc_id] = sidecar_path
+                except Exception as e:  # noqa: BLE001 — do not hide a successful STEP export
+                    warnings.append(f"boardphys sidecar write failed: {e}")
+                    sidecar_path = None
+            _ECAD["out_dir"] = os.path.dirname(step_path)
+            return {
+                "ok": exists, "doc_id": session.doc_id, "kind": "step",
+                "part_doc_id": result.get("part_doc_id"),
+                "step_path": step_path, "exists": exists,
+                "bytes": os.path.getsize(step_path) if exists else 0,
+                "boardphys_path": sidecar_path,
+                "boardphys_bytes": os.path.getsize(sidecar_path) if sidecar_path else 0,
+                "power": (boardphys or {}).get("totals"),
+                "warnings": warnings,
+                "hint": (f"KiCad exported the board and available component models to {step_path}."
+                         if exists else f"KiCad did not write a STEP at {step_path}."),
+                "next_actions": ["Use the imported part to design the enclosure."],
+            }
+
+        status, result = _run_with_budget(_build)
+        if status == "timeout":
             return _budget_timeout_err(
                 "3D STEP export",
-                simplify="The 3D exporter is still loading/building (the first call cold-loads the "
-                         "OCP/build123d CAD kernel). Retry ecad_to_3d() — the kernel is warm now — "
-                         "or use ecad_export('gerber') for fab output.",
-                next_actions=["ecad_to_3d()  # retry; the CAD kernel is now loaded",
-                              "ecad_export('gerber')"],
-                doc_id=session.doc_id)
-        if bstatus == "error":
-            e = bval
-            if isinstance(e, ImportError):
-                return _err(f"3D exporter unavailable (ImportError: {e})",
-                            hint="engine.ecad.threed could not be imported — "
-                                 "OCP/build123d may not be installed in this environment. "
-                                 "Use ecad_export('gerber') for fab output.",
-                            next_actions=["ecad_export('gerber')", "ecad_export('drill')"],
-                            available=False)
-            return _err(f"3D export failed: {type(e).__name__}: {e}",
-                        hint="Check that the board has a closed Edge.Cuts outline "
-                             "(pcb_set_outline op, closed=True). "
-                             "An empty outline or open chain raises BoardGeometryError.",
-                        next_actions=["ecad_run_drc()  # confirms outline is present",
-                                      "ecad_status()"])
-        result = bval
-
-        step_path = result.get("step_path", out_path)
-        summary   = result.get("summary", {})
-        _ECAD["out_dir"] = os.path.dirname(step_path)
-        # Persist the aicad.boardphys/1 sidecar next to the STEP.
-        boardphys = result.get("boardphys")
-        sidecar_path = None
-        sidecar_warnings: list = []
-        if boardphys:
-            sidecar_path = step_path + ".boardphys.json"
-            try:
-                with open(sidecar_path, "w", encoding="utf-8") as fh:
-                    json.dump(boardphys, fh, indent=1)
-            except Exception as e:  # noqa: BLE001 — sidecar failure must not void the STEP
-                sidecar_warnings.append(f"boardphys sidecar write failed: {e}")
-                sidecar_path = None
-        totals = (boardphys or {}).get("totals") or {}
-        step_exists = os.path.exists(step_path)
-        step_bytes = os.path.getsize(step_path) if step_exists else 0
-        sidecar_bytes = (os.path.getsize(sidecar_path)
-                         if sidecar_path and os.path.exists(sidecar_path) else 0)
-        return _dumps({
-            "ok": step_exists, "doc_id": session.doc_id, "kind": "step",
-            "step_path": step_path, "exists": step_exists, "bytes": step_bytes,
-            "boardphys_path": sidecar_path, "boardphys_bytes": sidecar_bytes,
-            "power": totals or None,
-            "board_volume_mm3": summary.get("board_volume", 0.0),
-            "n_components": summary.get("n_components", 0),
-            "n_proxies": summary.get("n_proxies", 0),
-            "summary": summary,
-            "warnings": (list(summary.get("warnings", [])) + sidecar_warnings
-                        + ([] if step_exists else [f"STEP write did not land at {step_path}"])),
-            "hint": (f"Wrote STEP to {step_path} ({step_bytes} bytes, confirmed on disk; "
-                     f"board volume {summary.get('board_volume', 0):.1f} mm³, "
-                     f"{summary.get('n_components', 0)} component body/bodies)"
-                     + (f" + boardphys sidecar {sidecar_path} ({sidecar_bytes} bytes, "
-                        "power/thermal map)."
-                        if sidecar_path else ".")
-                     + " Open this STEP in the CAD app as an import feature to design "
-                       "the enclosure."),
-            "next_actions": [
-                f"# In the CAD app: File > Import > {step_path}",
-                "# Or drag the STEP onto the 3D canvas to start the enclosure design.",
-            ],
-        })
+                simplify="KiCad is still exporting the board; retrieve the background job.",
+                next_actions=["ecad_status()"], doc_id=session.doc_id)
+        if status == "error":
+            if isinstance(result, OpError):
+                return _err(f"3D export failed: {result.message}", code=result.code,
+                            detail=result.detail, hint="Check KiCad and the board outline.")
+            return _err(f"3D export failed: {type(result).__name__}: {result}",
+                        hint="Check the output path and the board's closed Edge.Cuts outline.")
+        return _dumps(result)
 
 
 
@@ -1355,6 +1326,9 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
             new_doc = _copy.deepcopy(session.doc)
             res = si_mod.set_net_class(new_doc, str(name), params or {}, nets or [])
             ecad_session.swap_doc(session, new_doc)
+        except OpError as e:
+            return _err(f"set_net_class failed: {e.message}", code=e.code, detail=e.detail,
+                        hint="Resolve the board save conflict and retry.")
         except Exception as e:  # noqa: BLE001
             return _err(f"set_net_class failed: {e}", hint="Inspect with ecad_status().")
         return _dumps({
@@ -1480,7 +1454,11 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                 wired = stackup_mod.apply_solution(new_doc, sol, net_map=net_map or None)
                 ecad_session.swap_doc(session, new_doc)
                 applied = True
-            except (ValueError, OpError) as e:
+            except OpError as e:
+                return _err(f"solved OK but could not apply to the board: {e.message}",
+                            code=e.code, detail=e.detail,
+                            hint="Resolve the board save conflict and retry.")
+            except ValueError as e:
                 return _err(f"solved OK but could not apply to the board: {e}",
                             hint="The solve result is valid; fix the net_map / board and retry.",
                             next_actions=["ecad_status()"])
@@ -1520,8 +1498,8 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
     # ---------------------------------------------------------------- one-shot board flow
 
     @mcp.tool()
-    def ecad_make_board(pcb_name: str = "Board1", doc_id: str = "",
-                        hostcheck: bool = False) -> str:
+    def ecad_make_board(pcb_name: str = "", doc_id: str = "",
+                        hostcheck: bool = False, pcb_path: str = "") -> str:
         """ONE-SHOT board flow: from the active schematic, run sync -> autoroute -> fill zones ->
         DRC and report every step's outcome, remaining issues, and what to do next.
 
@@ -1541,6 +1519,10 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
         ``doc_id`` selects WHICH schematic to build the board from (defaults to the active
         schematic). Pass it when you have several schematics open and want a board from a specific
         one (Bug E5: this argument was previously ignored).
+
+        By default, the new PCB is a sibling of the bound schematic. If that board
+        already exists, open it and run ecad_update_from_sch instead. Pass pcb_name
+        or pcb_path to create a separate board.
 
         Finishes with a hint: "call ecad_to_3d to bring the board into the CAD app for a housing".
         """
@@ -1574,7 +1556,16 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
 
         # ---- 1. new board (instant — kept OUTSIDE the budget so a timeout below can still report
         # the created board's id + partial steps for recovery) ----
-        pcb_sess = ecad_session.new_session("pcb", pcb_name)
+        try:
+            from services.mcp.board_flow import _resolve_pcb
+            pcb_sess = _resolve_pcb({"pcb_name": pcb_name, "pcb_path": pcb_path}, sch_sess)
+        except OpError as e:
+            return _err(e.message, code=e.code, detail=e.detail,
+                        hint=e.message, next_actions=["ecad_open(path)",
+                                                     "ecad_update_from_sch()"])
+        except ValueError as e:
+            return _err(str(e), code="invalid_path", hint="Choose a valid KiCad board name.")
+        pcb_name = pcb_name or str(pcb_sess.doc.get("name") or "Board1")
         _ECAD["current_pcb"] = pcb_sess.doc_id
         _ECAD["current"] = pcb_sess.doc_id
         _step("new_pcb", {"ok": True}, f"board '{pcb_name}' created ({pcb_sess.doc_id})")
@@ -1598,16 +1589,13 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                 sync_ok = True
                 _step("update_from_sch", {"ok": True},
                       f"{len(added)} footprint(s) placed, {len(ratsnest)} airwire(s) to route")
-            except OpError as e:
-                _step("update_from_sch", {"ok": False}, f"FAILED: {e.message}")
-                added = []; ratsnest = []
+            except OpError:
+                raise
 
             # ---- 3. autoroute ----
             ar_ok = False
             try:
-                ar_resp = _rpc("ecad_autoroute",
-                               {"doc_id": pcb_sess.doc_id, "opts": {}})
-                pcb_sess._update(ar_resp)  # keep pcb_sess current after the RPC mutation
+                ar_resp = ecad_session.mutate_rpc(pcb_sess, "ecad_autoroute", {"opts": {}})
                 ar_rep = ar_resp.get("report", {})
                 routed = ar_rep.get("routed", [])
                 failed = ar_rep.get("failed", [])
@@ -1615,9 +1603,8 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                 _step("autoroute", {"ok": True},
                       f"routed {len(routed)} net(s), {len(failed)} failed"
                       + (f": {failed[:4]}" if failed else ""))
-            except OpError as e:
-                _step("autoroute", {"ok": False}, f"FAILED: {e.message}")
-                routed = []; failed = []
+            except OpError:
+                raise
 
             # M4: compute the true routed-net count = multi-pad nets with NO remaining airwires.
             # The autorouter's ``routed`` list only includes nets that HAD airwires and the
@@ -1664,6 +1651,8 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                 else:
                     outline_ok = True
                     _step("set_outline", {"ok": True}, "outline already present — kept")
+            except OpError:
+                raise
             except Exception as e:  # noqa: BLE001
                 _step("set_outline", {"ok": False}, f"FAILED: {type(e).__name__}: {e}")
 
@@ -1690,27 +1679,35 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                     poly_pts = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
                     _apply(pcb_sess, [{"op": "pcb_add_zone", "net": "GND", "layer": "F.Cu",
                                        "polygon": poly_pts}])
-                fill_resp = _rpc("ecad_fill_zones", {"doc_id": pcb_sess.doc_id})
+                fill_resp = ecad_session.mutate_rpc(pcb_sess, "ecad_fill_zones", {})
                 fs = fill_resp.get("fill_summary", {})
                 fill_ok = True
                 _step("fill_zones", {"ok": True},
                       f"{fs.get('zones_filled', 0)} zone(s) filled, {fs.get('copper_area_mm2', 0):.1f} mm^2")
+            except OpError:
+                raise
             except Exception as e:  # noqa: BLE001
                 _step("fill_zones", {"ok": False}, f"FAILED: {type(e).__name__}: {e}")
 
             # ---- 5. DRC ----
-            drc_errors = 0; drc_warnings = 0; drc_lines: list[str] = []
+            drc_errors = None; drc_warnings = None; drc_lines: list[str] = []
             try:
-                violations = _compile_of(pcb_sess).get("drc", [])
-                if isinstance(violations, dict):
-                    violations = violations.get("violations", [])
-                drc_sum = _erc_summary(violations)
-                drc_errors = drc_sum["errors"]
-                drc_warnings = drc_sum["warnings"]
-                drc_lines = _erc_lines(violations)[:6]
+                check = _rpc("ecad_kicad_check", {"doc_id": pcb_sess.doc_id})
+                violations = ((check.get("violations") or []) + (check.get("unconnected") or [])
+                              + (check.get("parity") or []))
+                formatted = [
+                    {**v, "rule": v.get("type", "?"), "message": v.get("description", "")}
+                    for v in violations if isinstance(v, dict)
+                ]
+                drc_sum = _erc_summary(formatted)
+                counts = check.get("counts") or {}
+                drc_errors = counts.get("error", drc_sum["errors"])
+                drc_warnings = counts.get("warning", drc_sum["warnings"])
+                drc_lines = _erc_lines(formatted)[:6]
                 _step("drc", {"ok": drc_errors == 0},
                       f"{drc_errors} error(s), {drc_warnings} warning(s)")
             except Exception as e:  # noqa: BLE001
+                drc_lines = [f"KiCad DRC unavailable: {e}"]
                 _step("drc", {"ok": False}, f"DRC unavailable: {e}")
 
             # ---- 6. host-board rule pack (opt-in) ----
@@ -1734,15 +1731,18 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
             reading = "\n".join(summary_lines)
             hint = (f"Board flow {'complete' if all_ok else 'partial'}: "
                     + "; ".join(f"{s['step']}={'OK' if s['ok'] else 'FAIL'}" for s in steps)
-                    + f". DRC: {drc_errors} error(s). "
-                    "Next: call ecad_to_3d() to bring the board into the CAD app for a housing.")
+                    + (f". DRC: {drc_errors} error(s). " if drc_errors is not None
+                       else ". KiCad DRC unavailable. ")
+                    + "Next: call ecad_to_3d() to bring the board into the CAD app for a housing.")
 
             next_actions: list[str] = []
             if failed:
                 next_actions.append(
                     f"{len(failed)} net(s) not routed ({', '.join(map(str, failed[:4]))}). "
                     "Try ecad_autoroute(pitch=0.15) or move parts to give the router more room.")
-            if drc_errors:
+            if drc_errors is None:
+                next_actions.append("ecad_run_drc()  # KiCad DRC did not complete")
+            elif drc_errors:
                 next_actions.append(f"ecad_run_drc()  # {drc_errors} DRC error(s) to fix")
             if hostcheck and hb_errors:
                 next_actions.append(
@@ -1754,6 +1754,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
 
             return _dumps({
                 "ok": all_ok, "doc_id": pcb_sess.doc_id,
+                "path": pcb_sess.path,
                 "sch_doc_id": sch_id, "pcb_name": pcb_name,
                 "steps": steps, "reading": reading,
                 "footprints_placed": len(added),
@@ -1785,6 +1786,10 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                 doc_id=pcb_sess.doc_id,
                 steps_completed=[s["step"] for s in steps])
         if status == "error":
+            if isinstance(out, OpError):
+                return _err(out.message, code=out.code, detail=out.detail,
+                            doc_id=pcb_sess.doc_id, path=pcb_sess.path,
+                            hint="The board flow stopped; resolve the reported conflict.")
             raise out
         return out
 
@@ -1801,7 +1806,8 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                              outline_margin: float = 0.0,
                              outline_area_scale: float = 0.0,
                              outline: Optional[Union[list, str]] = None,
-                             force_outline: bool = False) -> str:
+                             force_outline: bool = False, pcb_name: str = "",
+                             pcb_path: str = "") -> str:
         """ONE-CALL schematic -> preliminary PCB: sync footprints, place (connectivity-aware),
         autoroute, then (by default) optimize traces (arc corners / teardrops / impedance).
 
@@ -1813,6 +1819,10 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
         Residual DRC violations are listed honestly in ``residual_drc`` (never hidden). Use
         ``optimize=False`` to skip the post-route polish pass. ``doc_id`` is accepted as an
         alias for ``sch_doc_id`` (same meaning as on other ecad tools).
+
+        The default board is created beside the bound schematic in the same KiCad
+        project. An existing board is never overwritten; open it and use
+        ecad_update_from_sch, or pass pcb_name / pcb_path for a separate board.
 
         mega-27 outline room knobs (optional; defaults keep prior AUTO-OUTLINE behaviour)::
 
@@ -1856,7 +1866,8 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
         flow_opts: dict = {
             "optimize": bool(optimize),
             "seed": 0,
-            "pcb_name": "Board1",
+            "pcb_name": pcb_name,
+            "pcb_path": pcb_path,
         }
         # SILENT-DISCARD guard: board_size/outline used to be checked with a bare
         # `isinstance(x, list)` — a stringified "[100, 80]"/python-repr value quietly
@@ -1888,6 +1899,18 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                         hint="Pass outline=[[x,y], ...] (>=3 points).")
         if force_outline:
             flow_opts["force_outline"] = True
+        try:
+            pcb = _bf._resolve_pcb(flow_opts, sch_sess)
+        except OpError as e:
+            return _err(e.message, code=e.code, detail=e.detail,
+                        hint=e.message, next_actions=["ecad_open(path)",
+                                                     "ecad_update_from_sch()"])
+        except ValueError as e:
+            return _err(str(e), code="invalid_path", hint="Choose a valid KiCad board name.")
+        _ECAD["current_pcb"] = pcb.doc_id
+        _ECAD["current"] = pcb.doc_id
+        flow_opts["pcb_session"] = pcb
+
 
         def _flow() -> dict:
             return _bf.board_from_schematic(sch_sess, flow_opts)
@@ -1905,6 +1928,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                     "ecad_autoroute(pitch=0.3)",
                     "ecad_optimize_traces()",
                 ],
+                doc_id=pcb.doc_id,
             )
         if status == "error":
             e = result
@@ -1912,7 +1936,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
                 return _err(f"board_from_schematic failed: {e.message}",
                             hint=e.message,
                             next_actions=["ecad_status()"],
-                            detail=getattr(e, "detail", {}))
+                            code=e.code, detail=e.detail, doc_id=pcb.doc_id, path=pcb.path)
             raise e
 
         board_id = result.get("board_doc_id")
@@ -1963,6 +1987,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
             "ok": bool(result.get("ok", True)),
             "doc_id": board_id,
             "board_doc_id": board_id,
+            "path": result.get("path"),
             "sch_doc_id": result.get("sch_doc_id") or sch_id,
             "revision": result.get("revision"),
             "placed": placed,
@@ -2032,7 +2057,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
             result = _bf.autoplace_board(session, {"seed": 0})
         except OpError as e:
             return _err(f"ecad_autoplace failed: {e.message}", hint=e.message,
-                        next_actions=["ecad_status()"], detail=getattr(e, "detail", {}))
+                        next_actions=["ecad_status()"], code=e.code, detail=e.detail)
 
         rep = result.get("report") or {}
         residual = result.get("residual_drc") or []
@@ -2128,7 +2153,7 @@ def register_ecad_pcb_tools(mcp: FastMCP) -> None:
             result = _bf.optimize_board_traces(session, opt_opts)
         except OpError as e:
             return _err(f"ecad_optimize_traces failed: {e.message}", hint=e.message,
-                        next_actions=["ecad_status()"], detail=getattr(e, "detail", {}))
+                        next_actions=["ecad_status()"], code=e.code, detail=e.detail)
 
         residual = result.get("residual_drc") or []
         n_err = int(result.get("drc_errors") or

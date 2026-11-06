@@ -1,7 +1,7 @@
 // SDF icon derivation + CPU re-raster cache (Liquid Glass v2 host port, H3 contract).
 // Ported verbatim from ui/imgui/src/theme/icons_sdf.cpp. Built once at atlas load from the
 // already-decoded atlas RGBA (monochrome-safe glyphs only); rendered by re-rasterizing each
-// (name, roundedPx, halo) combo into a dynamic RGBA cache atlas on first use, then reusing the
+// (name, quantizedPx, halo) combo into a bounded RGBA cache atlas on first use, then reusing the
 // cached quad thereafter. All GL on the calling (GUI) thread.
 #include "icons_sdf.h"
 
@@ -10,11 +10,13 @@
 #include "imgui_internal.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -28,10 +30,31 @@ constexpr int   kSdfAtlasW = 512;   // fixed shelf-pack width for the static (bu
 struct SdfGlyph { int x, y, w, h; };
 
 std::unordered_map<std::string, int> gNameToId;
+std::unordered_map<std::string_view, int> gNameViews;
 std::vector<SdfGlyph> gGlyphs;
 std::vector<uint8_t>  gSdfCpu;      // R8, gSdfW*gSdfH — kept resident for CPU re-raster sampling
 int    gSdfW = 0, gSdfH = 0;
 GLuint gSdfTex = 0;
+struct ResolvedName {
+    const char* pointer = nullptr;
+    std::string_view name;
+    int id = -1;
+};
+std::array<ResolvedName, 512> gResolvedNames;
+
+int resolveName(const char* name) {
+    if (!name) return -1;
+    if (gNameViews.empty() && !gNameToId.empty())
+        for (const auto& entry : gNameToId) gNameViews.emplace(entry.first, entry.second);
+    auto& cached = gResolvedNames[(reinterpret_cast<uintptr_t>(name) >> 3) % gResolvedNames.size()];
+    if (cached.pointer != name || cached.name != name) {
+        cached.pointer = name;
+        const auto it = gNameViews.find(name);
+        cached.name = it == gNameViews.end() ? std::string_view{} : it->first;
+        cached.id = it == gNameViews.end() ? -1 : it->second;
+    }
+    return cached.id;
+}
 
 // ---- 8SSEDT: two-pass, 8-neighbor signed sequential Euclidean distance transform ----------------
 struct Pt { int dx, dy; };
@@ -117,69 +140,43 @@ void encodeSdf(const uint8_t* mask, int w, int h, uint8_t* dst, int dstW, int ds
     }
 }
 
-// ---- CPU re-raster cache: dynamic, shelf-packed RGBA atlas --------------------------------------
+// ---- CPU re-raster cache: fixed-size, LRU-evicted RGBA atlas ------------------------------------
 enum class Variant : uint8_t { Glyph = 0, Halo = 1 };
-struct CacheEntry { float u0, v0, u1, v1; };
+struct CacheEntry {
+    float u0, v0, u1, v1;
+    int slot, frame;
+    GLuint texture;
+    size_t bytes = 0;
+};
 
-constexpr int kCacheAtlasW  = 1024;
-constexpr int kCacheAtlasH0 = 256;
-
+// Fixed slots keep queued ImDrawList UVs valid: only slots unused this frame can be evicted.
+constexpr int kCacheAtlasW = 2048;
+constexpr int kCacheSlot = 128;
+constexpr int kCacheColumns = kCacheAtlasW / kCacheSlot;
+constexpr int kCacheEntries = kCacheColumns * kCacheColumns;
 std::unordered_map<uint64_t, CacheEntry> gCache;
-std::vector<uint8_t> gCacheCpu;   // RGBA staging buffer, gCacheW*gCacheH*4 (source of truth for regrow)
-int    gCacheW = 0, gCacheH = 0;
-int    gCacheCursorX = 0, gCacheShelfY = 0, gCacheShelfH = 0;
+// Unusually large icons retain SDF tint/halo instead of switching to the raster fallback.
+std::unordered_map<uint64_t, CacheEntry> gLargeCache;
+size_t gLargeCacheBytes = 0;
+constexpr size_t kLargeCacheBudget = 32u * 1024u * 1024u;
+constexpr size_t kLargeCacheEntries = 16;
 GLuint gCacheTex = 0;
 
 inline uint64_t cacheKey(int id, int px, Variant v) {
     return ((uint64_t)(uint32_t)id << 24) | ((uint64_t)(uint16_t)px << 8) | (uint64_t)(uint8_t)v;
 }
 
-void uploadFullCacheTexture() {
-    if (gCacheTex) { glDeleteTextures(1, &gCacheTex); gCacheTex = 0; }
+void ensureCacheAtlas() {
+    if (gCacheTex) return;
     glGenTextures(1, &gCacheTex);
     glBindTexture(GL_TEXTURE_2D, gCacheTex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, gCacheW, gCacheH, 0, GL_RGBA, GL_UNSIGNED_BYTE,
-                 gCacheCpu.empty() ? nullptr : gCacheCpu.data());
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, kCacheAtlasW, kCacheAtlasW, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     glBindTexture(GL_TEXTURE_2D, 0);
-}
-
-void ensureCacheAtlas() {
-    if (gCacheTex) return;
-    gCacheW = kCacheAtlasW;
-    gCacheH = kCacheAtlasH0;
-    gCacheCpu.assign((size_t)gCacheW * gCacheH * 4, 0);
-    uploadFullCacheTexture();
-}
-
-void growCacheAtlas(int neededH) {
-    int newH = gCacheH > 0 ? gCacheH : kCacheAtlasH0;
-    while (newH < neededH) newH *= 2;
-    std::vector<uint8_t> grown((size_t)gCacheW * newH * 4, 0);
-    if (!gCacheCpu.empty()) std::memcpy(grown.data(), gCacheCpu.data(), gCacheCpu.size());
-    gCacheCpu.swap(grown);
-    gCacheH = newH;
-    uploadFullCacheTexture();
-}
-
-// Shelf-allocates a (w,h) rect in the dynamic cache atlas, growing (recreating the GL texture) if
-// the current shelf row is full or the atlas has run out of vertical room. Bounded in practice:
-// names x ~6 rounded sizes x 2 variants (contract §3) — never evicted.
-void allocCacheRect(int w, int h, int& outX, int& outY) {
-    ensureCacheAtlas();
-    if (gCacheCursorX + w > gCacheW) {
-        gCacheCursorX = 0;
-        gCacheShelfY += gCacheShelfH;
-        gCacheShelfH = 0;
-    }
-    if (gCacheShelfY + h > gCacheH) growCacheAtlas(gCacheShelfY + h);
-    outX = gCacheCursorX;
-    outY = gCacheShelfY;
-    gCacheCursorX += w;
-    gCacheShelfH = std::max(gCacheShelfH, h);
 }
 
 // Bilinear-samples the packed SDF atlas at normalized (u,v) within glyph `g` (matches the
@@ -210,11 +207,45 @@ inline float smoothstepAA(float e0, float e1, float x) {
 // Rasterizes glyph `id` at `sizePx` square for `variant` into the dynamic RGBA cache atlas (white
 // texel, alpha=coverage — tinted at draw time via the existing AddImage vertex-color mechanism);
 // builds + uploads it on first use, returns the cached UV rect thereafter.
-const CacheEntry& rasterize(int id, int sizePx, Variant variant) {
+const CacheEntry* rasterize(int id, int sizePx, Variant variant) {
     const uint64_t key = cacheKey(id, sizePx, variant);
-    const auto it = gCache.find(key);
-    if (it != gCache.end()) return it->second;
-
+    const int frame = ImGui::GetFrameCount();
+    const bool large = sizePx > kCacheSlot;
+    auto& cache = large ? gLargeCache : gCache;
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        it->second.frame = frame;
+        return &it->second;
+    }
+    int slot = (int)gCache.size();
+    const size_t bytes = (size_t)sizePx * sizePx * 4;
+    if (large) {
+        if (bytes > kLargeCacheBudget) return nullptr;
+        while (gLargeCache.size() >= kLargeCacheEntries ||
+               gLargeCacheBytes + bytes > kLargeCacheBudget) {
+            auto oldest = gLargeCache.end();
+            for (auto entry = gLargeCache.begin(); entry != gLargeCache.end(); ++entry)
+                if (entry->second.frame < frame &&
+                    (oldest == gLargeCache.end() || entry->second.frame < oldest->second.frame))
+                    oldest = entry;
+            if (oldest == gLargeCache.end()) return nullptr;
+            gLargeCacheBytes -= oldest->second.bytes;
+            glDeleteTextures(1, &oldest->second.texture);
+            gLargeCache.erase(oldest);
+        }
+    } else {
+        if (slot == kCacheEntries) {
+            auto oldest = gCache.end();
+            for (auto entry = gCache.begin(); entry != gCache.end(); ++entry)
+                if (entry->second.frame < frame &&
+                    (oldest == gCache.end() || entry->second.frame < oldest->second.frame))
+                    oldest = entry;
+            if (oldest == gCache.end()) return nullptr;
+            slot = oldest->second.slot;
+            gCache.erase(oldest);
+        }
+        ensureCacheAtlas();
+    }
     const SdfGlyph& g = gGlyphs[(size_t)id];
     const int px = std::max(1, sizePx);
 
@@ -253,20 +284,27 @@ const CacheEntry& rasterize(int id, int sizePx, Variant variant) {
         }
     }
 
-    int ax = 0, ay = 0;
-    allocCacheRect(px, px, ax, ay);
+    if (large) {
+        GLuint texture = 0;
+        glGenTextures(1, &texture);
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, px, px, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+        glBindTexture(GL_TEXTURE_2D, 0);
+        gLargeCacheBytes += bytes;
+        return &gLargeCache.emplace(key, CacheEntry{0, 0, 1, 1, -1, frame, texture, bytes}).first->second;
+    }
+    const int ax = (slot % kCacheColumns) * kCacheSlot;
+    const int ay = (slot / kCacheColumns) * kCacheSlot;
     glBindTexture(GL_TEXTURE_2D, gCacheTex);
     glTexSubImage2D(GL_TEXTURE_2D, 0, ax, ay, px, px, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
     glBindTexture(GL_TEXTURE_2D, 0);
-    // Mirror into the CPU staging buffer too — it is the source copied forward on the next regrow.
-    for (int y = 0; y < px; ++y) {
-        std::memcpy(&gCacheCpu[((size_t)(ay + y) * gCacheW + ax) * 4], &pixels[(size_t)y * px * 4],
-                    (size_t)px * 4);
-    }
-
-    const CacheEntry entry{(float)ax / (float)gCacheW, (float)ay / (float)gCacheH,
-                            (float)(ax + px) / (float)gCacheW, (float)(ay + px) / (float)gCacheH};
-    return gCache.emplace(key, entry).first->second;
+    const float inv = 1.0f / kCacheAtlasW;
+    const CacheEntry entry{ax * inv, ay * inv, (ax + px) * inv, (ay + px) * inv, slot, frame, gCacheTex};
+    return &gCache.emplace(key, entry).first->second;
 }
 
 }  // namespace
@@ -276,6 +314,7 @@ void build(const unsigned char* rgba, int atlasW, int atlasH,
            const std::unordered_set<std::string>& rasterOnly) {
     if (gSdfTex || !gGlyphs.empty()) return;  // idempotent — ui::loadIcons() also guards this
     if (!rgba || atlasW <= 0 || atlasH <= 0) return;
+    for (auto& entry : gResolvedNames) entry = {};
 
     struct Candidate { std::string name; int w, h; std::vector<uint8_t> mask; };
 
@@ -382,40 +421,43 @@ void build(const unsigned char* rgba, int atlasW, int atlasH,
 void shutdown() {
     if (gSdfTex) { glDeleteTextures(1, &gSdfTex); gSdfTex = 0; }
     if (gCacheTex) { glDeleteTextures(1, &gCacheTex); gCacheTex = 0; }
+    for (auto& entry : gLargeCache) glDeleteTextures(1, &entry.second.texture);
+    gLargeCache.clear();
+    gLargeCacheBytes = 0;
     gGlyphs.clear();
     gNameToId.clear();
+    gNameViews.clear();
     gSdfCpu.clear();
     gSdfW = gSdfH = 0;
     gCache.clear();
-    gCacheCpu.clear();
-    gCacheW = gCacheH = 0;
-    gCacheCursorX = gCacheShelfY = gCacheShelfH = 0;
+    for (auto& entry : gResolvedNames) entry = {};
 }
 
 bool has(const char* name) {
-    return name && gNameToId.find(name) != gNameToId.end();
+    return resolveName(name) >= 0;
 }
 
 bool draw(ImDrawList* dl, const char* name, ImVec2 c, float size, ImU32 col, ImU32 haloCol) {
     if (!dl || !name) return false;
-    const auto it = gNameToId.find(name);
-    if (it == gNameToId.end()) return false;
-
-    const int id = it->second;
-    const int px = std::max(1, (int)(size + 0.5f));
+    const int id = resolveName(name);
+    if (id < 0 || !std::isfinite(size) || size <= 0.0f || size > 2048.0f) return false;
+    // Two-pixel buckets avoid a fresh raster for each step of an animated size.
+    const int px = std::max(2, (int)std::round(size * 0.5f) * 2);
     const float r = size * 0.5f;
     const ImVec2 mn(c.x - r, c.y - r), mx(c.x + r, c.y + r);
 
-    // Re-fetch gCacheTex per AddImage call (not hoisted): rasterize() may grow/recreate the cache
-    // texture in between the halo and glyph passes below.
+    const CacheEntry* halo = nullptr;
     if ((haloCol & IM_COL32_A_MASK) != 0) {
-        const CacheEntry& halo = rasterize(id, px, Variant::Halo);
-        dl->AddImage((ImTextureID)(intptr_t)gCacheTex, mn, mx,
-                     ImVec2(halo.u0, halo.v0), ImVec2(halo.u1, halo.v1), haloCol);
+        halo = rasterize(id, px, Variant::Halo);
+        if (!halo) return false;
     }
-    const CacheEntry& glyph = rasterize(id, px, Variant::Glyph);
-    dl->AddImage((ImTextureID)(intptr_t)gCacheTex, mn, mx,
-                 ImVec2(glyph.u0, glyph.v0), ImVec2(glyph.u1, glyph.v1), col);
+    const CacheEntry* glyph = rasterize(id, px, Variant::Glyph);
+    if (!glyph) return false;
+    if (halo)
+        dl->AddImage((ImTextureID)(intptr_t)halo->texture, mn, mx,
+                     ImVec2(halo->u0, halo->v0), ImVec2(halo->u1, halo->v1), haloCol);
+    dl->AddImage((ImTextureID)(intptr_t)glyph->texture, mn, mx,
+                 ImVec2(glyph->u0, glyph->v0), ImVec2(glyph->u1, glyph->v1), col);
     return true;
 }
 

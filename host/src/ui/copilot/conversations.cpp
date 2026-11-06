@@ -7,12 +7,13 @@
 #include "copilot_internal.h"
 #include "ui/clipboard_image.h"
 #include "ui/copilot/inline_image_refs.h"
+#include "ui/copilot/activity_settlement.h"
 
 #include "ui/ai/agent_dag.h"  // ui::agentDagToJson / agentDagFromJson — persist the live
                               // agent-execution DAG with the active session's artifacts.
 
 #include "conv_ids.h"  // session-id allocation (GL-free TU, unit-tested in host/tests)
-#include "ui/chudcode_session_actions.h"  // per-conversation Chudcode session link (GL-free TU)
+#include "ui/omp_session_actions.h"  // per-conversation Omp session link (GL-free TU)
 #include "core/jobs.h"
 #include "core/fs_backend.h"
 #include <algorithm>
@@ -318,12 +319,12 @@ static nlohmann::json& residentPromptDrafts() {
     }();
     return root;
 }
-static void persistPromptDrafts(AppState& st, bool immediate) {
+static void persistPromptDrafts(AppState& st) {
     chat_persistence::Snapshot snapshot;
-    snapshot.files[promptDraftsPath()] =
-        std::make_shared<const std::string>(residentPromptDrafts().dump(1));
+    snapshot.serialized[promptDraftsPath()] = [drafts = residentPromptDrafts()] {
+        return std::make_shared<const std::string>(drafts.dump());
+    };
     chatWriter().submit(std::move(snapshot));
-    if (immediate && !chatWriter().flush()) markChatHistoryDirty();
     reportChatSaveFailure(st);
 }
 #endif
@@ -333,9 +334,9 @@ void savePromptDraft(AppState& st, bool force) {
     static std::string lastKey;
     static double lastWrite = -1e9;
     const std::string key = promptDraftKey(st);
-    const nlohmann::json draft = promptDraftObject(st);
     const double now = ImGui::GetTime();
     if (!force && key == lastKey && now - lastWrite < 0.40) return;
+    const nlohmann::json draft = promptDraftObject(st);
     auto& root = residentPromptDrafts();
     bool changed = false;
     if (promptDraftIsEmpty(draft)) changed = root.erase(key) != 0;
@@ -346,8 +347,7 @@ void savePromptDraft(AppState& st, bool force) {
     }
     lastKey = key;
     lastWrite = now;
-    if (changed) persistPromptDrafts(st, force);
-    else if (force && !chatWriter().flush()) markChatHistoryDirty();
+    if (changed) persistPromptDrafts(st);
     reportChatSaveFailure(st);
 #else
     // Per-key debounce so switching conversations never confuses last-write state.
@@ -355,12 +355,10 @@ void savePromptDraft(AppState& st, bool force) {
     static std::string s_lastSaved;
     static double s_lastWrite = -1e9;
     const std::string key = promptDraftKey(st);
-    const std::string cur = promptDraftFingerprint(st);
     const double now = ImGui::GetTime();
-    if (!force) {
-        if (key == s_lastKey && cur == s_lastSaved) return;
-        if (key == s_lastKey && (now - s_lastWrite) < 0.40) return;
-    }
+    if (!force && key == s_lastKey && now - s_lastWrite < 0.40) return;
+    const std::string cur = promptDraftFingerprint(st);
+    if (!force && key == s_lastKey && cur == s_lastSaved) return;
     s_lastKey = key;
     s_lastSaved = cur;
     s_lastWrite = now;
@@ -394,7 +392,7 @@ void savePromptDraft(AppState& st, bool force) {
 
 void clearPromptDraft(AppState& st) {
 #ifndef __EMSCRIPTEN__
-    if (residentPromptDrafts().erase(promptDraftKey(st))) persistPromptDrafts(st, true);
+    if (residentPromptDrafts().erase(promptDraftKey(st))) persistPromptDrafts(st);
 #else
     try {
         namespace fs = std::filesystem;
@@ -411,6 +409,41 @@ void clearPromptDraft(AppState& st) {
         atomicWriteFileDurable(path, root.dump(1));
         // Reset debounce fingerprint so a subsequent empty composer doesn't rewrite.
     } catch (...) {
+    }
+#endif
+}
+
+void restoreUnsentForConversation(AppState& st, const std::string& convId,
+                                  const std::string& docKey, const std::string& text) {
+    if (text.empty() || !conversationMsgs(st, convId)) return;
+    if (convId == st.activeConvId()) {
+        composerRestoreUnsent(st, text);
+        return;
+    }
+    const std::string key = (docKey.empty() ? convDocKey(st) : docKey) + "/" + convId;
+    auto restore = [&](nlohmann::json& root) {
+        if (!root.is_object()) root = nlohmann::json::object();
+        auto& draft = root[key];
+        if (draft.is_string()) {
+            if (!draft.get_ref<const std::string&>().empty()) return false;
+            draft = nlohmann::json::object();
+        }
+        if (!draft.is_object()) draft = nlohmann::json::object();
+        if (!draft.value("text", std::string()).empty()) return false;
+        draft["text"] = text;
+        return true;
+    };
+#ifndef __EMSCRIPTEN__
+    if (restore(residentPromptDrafts())) persistPromptDrafts(st);
+#else
+    try {
+        nlohmann::json root = nlohmann::json::object();
+        std::ifstream in(promptDraftsPath());
+        if (in) in >> root;
+        if (restore(root) && !atomicWriteFileDurable(promptDraftsPath(), root.dump(1)))
+            st.addLog("[chat] draft save failed");
+    } catch (...) {
+        st.addLog("[chat] draft save failed");
     }
 #endif
 }
@@ -494,6 +527,14 @@ std::string convProjectKey(std::string_view rawDir) {
 #endif
 }
 
+const std::string& convProjectKey(const Conversation& conversation) {
+    if (conversation.projectKeySource != conversation.projectDir) {
+        conversation.projectKeySource = conversation.projectDir;
+        conversation.projectKeyCache = convProjectKey(std::string_view(conversation.projectDir));
+    }
+    return conversation.projectKeyCache;
+}
+
 // The project folder chat belongs to: the selected working directory (Explorer root), and
 // nothing else. An open document — even one saved outside that folder — never changes it.
 // A turn launch restamps a session to the workspace it actually ran in.
@@ -501,11 +542,11 @@ std::string convProjectDir(AppState& st) {
     return st.workspaceDir;
 }
 
-// Legacy fallback #1: the Chudcode session JSONL records the run's cwd on its session line
+// Legacy fallback #1: the Omp session JSONL records the run's cwd on its session line
 // (line 2). Bounded read — a fixed head of the file, and only COMPLETE lines inside it are
 // parsed, so a multi-megabyte entry line can never be pulled into memory. A missing or
 // damaged file is simply no answer.
-static std::string chudcodeSessionCwd(const std::string& sessionFile) {
+static std::string ompSessionCwd(const std::string& sessionFile) {
     if (sessionFile.empty()) return std::string();
     std::ifstream in(sessionFile, std::ios::binary);
     if (!in) return std::string();
@@ -531,11 +572,11 @@ static std::string chudcodeSessionCwd(const std::string& sessionFile) {
     return std::string();
 }
 
-// Companion to chudcodeSessionCwd: the same session line carries the Chudcode session id
+// Companion to ompSessionCwd: the same session line carries the Omp session id
 // ({"type":"session","version":3,"id":…,"cwd":…}). Same bounded-head discipline — only
 // COMPLETE lines inside a fixed head are parsed, so a huge entry line is never read in.
-// Empty means "not a Chudcode session file" (our own .raw.jsonl logs answer empty too).
-static std::string chudcodeSessionIdOf(const std::string& sessionFile) {
+// Empty means "not a Omp session file" (our own .raw.jsonl logs answer empty too).
+static std::string ompSessionIdOf(const std::string& sessionFile) {
     if (sessionFile.empty()) return std::string();
     std::ifstream in(sessionFile, std::ios::binary);
     if (!in) return std::string();
@@ -630,7 +671,7 @@ static std::string s_followKey;
 static bool sessionOwnedByProject(const AppState& st, const std::string& id,
                                   const std::string& key) {
     for (const Conversation& c : st.conversations)
-        if (c.id == id) return convProjectKey(c.projectDir) == key;
+        if (c.id == id) return convProjectKey(c) == key;
     return false;
 }
 
@@ -639,7 +680,7 @@ static bool sessionOwnedByProject(const AppState& st, const std::string& id,
 void bindActiveConversationProject(AppState& st, const std::string& workspace) {
     if (st.activeConv < 0 || st.activeConv >= (int)st.conversations.size()) return;
     Conversation& active = st.conversations[st.activeConv];
-    const std::string previous = convProjectKey(active.projectDir);
+    const std::string previous = convProjectKey(active);
     if (previous == convProjectKey(workspace)) return;
     const auto old = s_activeByProject.find(previous);
     if (old != s_activeByProject.end() && old->second == active.id)
@@ -757,7 +798,9 @@ static std::string sessionTitleFromPrompt(const std::string& prompt) {
         if (!marker) { typed += line; typed += ' '; }
         pos = nl + 1;
     }
-    return clipTitle(collapseWhitespace(typed), 40);
+    // "[Image #N]" markers are references, not words: they would spend the title's length budget
+    // and read as raw placeholders in the Sessions list.
+    return clipTitle(collapseWhitespace(ui::copilot::stripInlineImageMarkers(typed)), 40);
 }
 
 // Returns true when the title changed. Does not mark history dirty: persistChatHistory calls
@@ -843,6 +886,9 @@ static nlohmann::json planStateToJson(const PlanState& ps) {
 // ---- append-only, uncapped chat archive --------------------------------------------------
 // <id>.json above remains the bounded fast-reload representation. This JSONL sibling is the
 // recovery/archive representation: compact records, no caps, no wholesale rewrites.
+// Streaming rows checkpoint at most once per second. Thinking checkpoints grow geometrically
+// to avoid quadratic archive size; their complete final content is still queued before the
+// terminal session snapshot. Sequence assignment and all I/O are writer-only.
 static nlohmann::json rawActivityToJson(const ActivityItem& a) {
     return {
         {"stage", a.stage},
@@ -877,39 +923,6 @@ static nlohmann::json rawPlanToJson(const PlanInfo& plan) {
     };
 }
 
-static nlohmann::json rawClarifyToJson(const ClarifyState& clarify) {
-    nlohmann::json questions = nlohmann::json::array();
-    for (const auto& q : clarify.questions) {
-        size_t answerLen = 0;
-        while (answerLen < q.answer.size() && q.answer[answerLen] != '\0') ++answerLen;
-        nlohmann::json options = nlohmann::json::array();
-        for (const auto& option : q.options)
-            options.push_back({{"value", option.first}, {"label", option.second}});
-        questions.push_back({
-            {"key", q.key},
-            {"ask", q.ask},
-            {"unit", q.unit},
-            {"suggested", q.suggested},
-            {"answer", std::string(q.answer.data(), answerLen)},
-            {"kind", q.kind},
-            {"multi", q.multi},
-            {"options", std::move(options)},
-            {"targets", q.targets},
-            {"selectedValues", q.selectedValues},
-            {"selectedKind", q.selectedKind},
-            {"pickArmed", q.pickArmed},
-        });
-    }
-    return {
-        {"awaiting", clarify.awaiting},
-        {"active", clarify.active},
-        {"request", clarify.request},
-        {"questions", std::move(questions)},
-        {"assumptions", clarify.assumptions},
-        {"geometryPickQ", clarify.geometryPickQ},
-    };
-}
-
 static nlohmann::json rawMessageToJson(const ChatMsg& m) {
     return {
         {"fromUser", m.fromUser},
@@ -917,6 +930,7 @@ static nlohmann::json rawMessageToJson(const ChatMsg& m) {
         {"text", m.text},
         {"imagePaths", m.imagePaths},
         {"running", m.running},
+        {"compactionRun", m.compactionRun},
         {"model", m.model},
         {"errKind", m.errKind},
         {"errorHuman", m.errorHuman},
@@ -927,7 +941,6 @@ static nlohmann::json rawMessageToJson(const ChatMsg& m) {
         {"planState", planStateToJson(m.planState)},
         {"planStatePresent", m.planState.present},
         {"curMissionTask", m.curMissionTask},
-        {"clarify", rawClarifyToJson(m.clarify)},
         {"asks", [&] {
              nlohmann::json asks = nlohmann::json::array();
              for (const auto& b : m.asks) asks.push_back(askBatchToJson(b));
@@ -946,12 +959,39 @@ static nlohmann::json rawMessageToJson(const ChatMsg& m) {
     };
 }
 
-static std::mutex s_chatRawFileMutex;
-static std::unordered_map<std::string, long long> s_chatRawNextSeq;
-static std::mutex s_chatRawOwnerMutex;
-static std::unordered_map<const ChatMsg*, std::string> s_chatRawOwners;
-static std::unordered_map<std::string, std::vector<std::string>> s_chatRawMessageSnapshots;
+static std::unordered_map<const ChatMsg*, std::pair<std::string, size_t>> s_chatRawOwners;
+static std::unordered_map<std::string, std::vector<std::shared_ptr<const ChatMsg>>> s_chatRawMessageSnapshots;
+struct RawRowStamp {
+    uint64_t stamp = 0;
+    double written = -1e9;
+    size_t detailBytes = 0;
+};
+using RawMessageKey = std::pair<double, size_t>;  // legacy messages may share ts=0
+static std::map<std::string, std::map<RawMessageKey, std::vector<RawRowStamp>>> s_chatRawRows;
+static thread_local std::vector<uint64_t> s_chatRawStampScratch;
 
+static uint64_t activityStamp(const ActivityItem& a, bool appendOnly = false) {
+    uint64_t h = 1469598103934665603ULL;
+    auto mix = [&](uint64_t n) { h = (h ^ n) * 1099511628211ULL; };
+    for (const auto* s : {&a.stage, &a.title, &a.reason, &a.status})
+        mix(std::hash<std::string>{}(*s));
+    mix(a.detail.size());
+    if (!appendOnly) mix(std::hash<std::string>{}(a.detail));
+    mix(a.durationMs); mix(a.tokensIn); mix(a.tokensOut); mix(a.opsCount);
+    mix(a.expanded); mix(a.missionHeader); mix(a.rowKind); mix(a.ctxTokens);
+    mix(a.streaming); mix(a.userToggled);
+    return h;
+}
+
+// Preserve the existing full-row journal format while bounding the total bytes written for
+// an append-only thinking block to a geometric series. The ordinary session snapshot remains
+// the more frequent crash-recovery checkpoint.
+static bool deferRawThinkingCheckpoint(const ActivityItem& row, const RawRowStamp& prior) {
+    if (row.stage != "thought:stream" || !row.streaming || prior.written <= 0.0)
+        return false;
+    const size_t size = row.detail.size();
+    return size <= prior.detailBytes || size - prior.detailBytes < std::max(size_t(1), prior.detailBytes);
+}
 // Recover from the last valid compact line rather than a process-local counter. A torn final
 // write is skipped and the preceding valid seq wins, so relaunch never restarts from 1.
 static long long chatRawNextSeqFromDisk(const std::string& path) {
@@ -1011,85 +1051,77 @@ static bool chatRawNeedsSeparator(const std::string& path) {
     return last != '\n';
 }
 
-static bool appendChatRawBytes(const std::string& path, const std::string& bytes) {
-#if defined(_WIN32)
-    const int fd = ::_open(path.c_str(), _O_WRONLY | _O_CREAT | _O_APPEND | _O_BINARY,
-                           _S_IREAD | _S_IWRITE);
-    if (fd < 0) return false;
-    size_t offset = 0;
-    while (offset < bytes.size()) {
-        const unsigned int want =
-            (unsigned int)std::min<size_t>(bytes.size() - offset, 0x7fffffffU);
-        const int wrote = ::_write(fd, bytes.data() + offset, want);
-        if (wrote <= 0) {
-            ::_close(fd);
-            return false;
+struct RawArchiveFile {
+    std::FILE* file = nullptr;
+    long long nextSeq = 1;
+    bool empty = true, separator = false;
+    uint64_t used = 0;
+    ~RawArchiveFile() { if (file) std::fclose(file); }
+};
+
+// Writer-thread-only handles: bounded across many opened/deleted sessions.
+static void writeChatRawRecord(const std::string& path, const std::string& conversationId,
+                                const std::string& kind, const std::string& payloadKey,
+                                const nlohmann::json& payload, double ts) {
+    thread_local std::map<std::string, std::unique_ptr<RawArchiveFile>> files;
+    thread_local uint64_t use = 0;
+    auto it = files.find(path);
+    if (it == files.end()) {
+        if (files.size() >= 32) {
+            auto oldest = std::min_element(files.begin(), files.end(), [](const auto& a, const auto& b) {
+                return a.second->used < b.second->used;
+            });
+            files.erase(oldest);
         }
-        offset += (size_t)wrote;
+        auto state = std::make_unique<RawArchiveFile>();
+        std::error_code ec;
+        std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+        if (ec) return;
+        state->nextSeq = chatRawNextSeqFromDisk(path);
+        state->separator = chatRawNeedsSeparator(path);
+        state->file = std::fopen(path.c_str(), "ab");
+        if (!state->file) return;
+        std::fseek(state->file, 0, SEEK_END);
+        state->empty = std::ftell(state->file) == 0;
+        it = files.emplace(path, std::move(state)).first;
     }
-    ::_close(fd);
-    return true;
-#elif defined(__EMSCRIPTEN__)
-    std::ofstream out(path, std::ios::binary | std::ios::app);
-    if (!out) return false;
-    out.write(bytes.data(), (std::streamsize)bytes.size());
-    return (bool)out;
-#else
-    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
-    if (fd < 0) return false;
-    size_t offset = 0;
-    while (offset < bytes.size()) {
-        const ssize_t wrote = ::write(fd, bytes.data() + offset, bytes.size() - offset);
-        if (wrote <= 0) {
-            ::close(fd);
-            return false;
-        }
-        offset += (size_t)wrote;
+    auto& state = *it->second;
+    state.used = ++use;
+    std::string encoded;
+    if (state.separator) encoded.push_back('\n');
+    if (state.empty) {
+        encoded += nlohmann::json({{"kind", "header"}, {"schema", "chudware.chat.raw/1"},
+                                  {"conversation_id", conversationId}, {"created_ts", ts}}).dump();
+        encoded.push_back('\n');
     }
-    ::close(fd);
-    return true;
-#endif
+    encoded += nlohmann::json({{"ts", ts}, {"seq", state.nextSeq}, {"kind", kind},
+                               {payloadKey, payload}}).dump();
+    encoded.push_back('\n');
+    const bool ok = std::fwrite(encoded.data(), 1, encoded.size(), state.file) == encoded.size() &&
+                    std::fflush(state.file) == 0;
+    if (!ok) { files.erase(it); return; }
+    state.empty = false;
+    state.separator = false;
+    ++state.nextSeq;
 }
 
 static void appendChatRawRecord(const std::string& conversationId, const char* kind,
-                                const char* payloadKey, const nlohmann::json& payload) noexcept {
+                                const char* payloadKey, std::function<nlohmann::json()> payload) noexcept {
     if (conversationId.empty()) return;
     try {
-        std::lock_guard<std::mutex> lock(s_chatRawFileMutex);
-        namespace fs = std::filesystem;
-        std::error_code ec;
-        fs::create_directories(chatSessionsDir(), ec);
-        if (ec) return;
-        const std::string path = chatRawLogPath(conversationId);
-        const bool empty = !fs::exists(path, ec) || (!ec && fs::file_size(path, ec) == 0);
-        if (ec) return;
-        auto [it, inserted] = s_chatRawNextSeq.emplace(path, 1);
-        if (inserted) it->second = chatRawNextSeqFromDisk(path);
-        const long long seq = it->second;
-        std::string encoded;
-        if (!empty && chatRawNeedsSeparator(path)) encoded.push_back('\n');
-        if (empty) {
-            const nlohmann::json header = {
-                {"kind", "header"},
-                {"schema", "chudware.chat.raw/1"},
-                {"conversation_id", conversationId},
-                {"created_ts", chatNowEpoch()},
-            };
-            encoded += header.dump();
-            encoded.push_back('\n');
-        }
-        nlohmann::json record = {
-            {"ts", chatNowEpoch()},
-            {"seq", seq},
-            {"kind", kind},
-            {payloadKey, payload},
+        const auto path = chatRawLogPath(conversationId);
+        const double ts = chatNowEpoch();
+        auto append = [path, conversationId, kind = std::string(kind),
+                       payloadKey = std::string(payloadKey), payload = std::move(payload), ts] {
+            try { writeChatRawRecord(path, conversationId, kind, payloadKey, payload(), ts); }
+            catch (...) {}  // The recovery archive remains best-effort.
         };
-        encoded += record.dump();
-        encoded.push_back('\n');
-        if (appendChatRawBytes(path, encoded)) ++it->second;
-    } catch (...) {
-        // The raw archive is strictly best-effort; chat operation success never depends on it.
-    }
+#ifndef __EMSCRIPTEN__
+        chatWriter().append(std::move(append));
+#else
+        append();
+#endif
+    } catch (...) {}
 }
 
 static std::string activeConversationId(const AppState& st) {
@@ -1101,9 +1133,31 @@ static void bindChatRawOwners(const std::string& conversationId,
                               const std::vector<ChatMsg>& messages) noexcept {
     if (conversationId.empty()) return;
     try {
-        std::lock_guard<std::mutex> lock(s_chatRawOwnerMutex);
-        for (const auto& message : messages) s_chatRawOwners[&message] = conversationId;
+        for (auto it = s_chatRawOwners.begin(); it != s_chatRawOwners.end();) {
+            if (it->second.first == conversationId) it = s_chatRawOwners.erase(it);
+            else ++it;
+        }
+        for (size_t i = 0; i < messages.size(); ++i)
+            s_chatRawOwners[&messages[i]] = {conversationId, i};
     } catch (...) {
+    }
+}
+
+static void archiveChatRows(const std::string& conversationId, const ChatMsg& message,
+                            size_t messageIndex, bool final = false) {
+    auto& rows = s_chatRawRows[conversationId][{message.ts, messageIndex}];
+    rows.resize(message.activity.size());
+    const double now = chatNowEpoch();
+    for (size_t i = 0; i < message.activity.size(); ++i) {
+        const auto& row = message.activity[i];
+        auto& prior = rows[i];
+        if (!final && row.streaming && now - prior.written < 1.0) continue;
+        if (!final && deferRawThinkingCheckpoint(row, prior)) continue;
+        const uint64_t stamp = activityStamp(row);
+        if (prior.written > 0.0 && prior.stamp == stamp) continue;
+        appendChatRawRecord(conversationId, "activity", "row",
+                            [row] { return rawActivityToJson(row); });
+        prior = {stamp, now, row.detail.size()};
     }
 }
 
@@ -1112,111 +1166,251 @@ void appendChatRawMessage(AppState& st, const ChatMsg& message) noexcept {
         const std::string conversationId = activeConversationId(st);
         if (conversationId.empty()) return;
         bindChatRawOwners(conversationId, st.chat);
-        const nlohmann::json payload = rawMessageToJson(message);
-        const std::string snapshot = payload.dump();
-        appendChatRawRecord(conversationId, "message", "message", payload);
-        size_t index = st.chat.size();
+        auto source = std::make_shared<const ChatMsg>(message);
+        appendChatRawRecord(conversationId, "message", "message",
+                            [source] { return rawMessageToJson(*source); });
         for (size_t i = 0; i < st.chat.size(); ++i) {
-            if (&st.chat[i] == &message) {
-                index = i;
-                break;
-            }
+            if (&st.chat[i] != &message) continue;
+            auto& snapshots = s_chatRawMessageSnapshots[conversationId];
+            if (snapshots.size() <= i) snapshots.resize(i + 1);
+            snapshots[i] = std::move(source);
+            break;
         }
-        if (index == st.chat.size()) return;
-        std::lock_guard<std::mutex> lock(s_chatRawOwnerMutex);
-        auto& snapshots = s_chatRawMessageSnapshots[conversationId];
-        if (snapshots.size() <= index) snapshots.resize(index + 1);
-        snapshots[index] = snapshot;
-    } catch (...) {
-        // Message insertion must remain successful even when raw serialization fails.
-    }
+    } catch (...) {}
 }
 
 static void archiveChangedChatMessages(const std::string& conversationId,
                                        const std::vector<ChatMsg>& messages,
-                                       const std::vector<chat_persistence::MessageSnapshot>& previous) noexcept {
+                                       const std::vector<std::shared_ptr<chat_persistence::MessageSnapshot>>& current) noexcept {
     try {
         bindChatRawOwners(conversationId, messages);
-        for (size_t i = 0; i < messages.size(); ++i) {
-            if (i < previous.size() &&
-                chat_persistence::sameMessage(previous[i].source, messages[i], false)) continue;
-            const nlohmann::json payload = rawMessageToJson(messages[i]);
-            const std::string snapshot = payload.dump();
-            bool changed = false;
-            {
-                std::lock_guard<std::mutex> lock(s_chatRawOwnerMutex);
-                auto& snapshots = s_chatRawMessageSnapshots[conversationId];
-                if (snapshots.size() <= i) snapshots.resize(i + 1);
-                changed = snapshots[i] != snapshot;
-                if (changed) snapshots[i] = snapshot;
-            }
-            if (changed) appendChatRawRecord(conversationId, "message", "message", payload);
+        auto& snapshots = s_chatRawMessageSnapshots[conversationId];
+        snapshots.resize(messages.size());
+        std::set<RawMessageKey> liveTimes;
+        for (size_t i = 0; i < messages.size(); ++i) liveTimes.emplace(messages[i].ts, i);
+        auto& rowCache = s_chatRawRows[conversationId];
+        for (auto it = rowCache.begin(); it != rowCache.end();) {
+            if (!liveTimes.count(it->first)) it = rowCache.erase(it);
+            else ++it;
         }
-    } catch (...) {
-        // The bounded session snapshot must still proceed when the archive cannot.
-    }
+        for (size_t i = 0; i < messages.size(); ++i) {
+            const auto& m = messages[i];
+            archiveChatRows(conversationId, m, i, !m.running);
+            if (snapshots[i] && chat_persistence::sameMessage(*snapshots[i], m, false)) continue;
+            std::shared_ptr<const ChatMsg> source(current[i], &current[i]->source);
+            appendChatRawRecord(conversationId, "message", "message",
+                                [source] { return rawMessageToJson(*source); });
+            snapshots[i] = std::move(source);
+        }
+    } catch (...) {}
 }
 
 static void seedChatRawSnapshots(const std::string& conversationId,
                                  const std::vector<ChatMsg>& messages) noexcept {
     try {
         bindChatRawOwners(conversationId, messages);
-        std::lock_guard<std::mutex> lock(s_chatRawOwnerMutex);
         auto& snapshots = s_chatRawMessageSnapshots[conversationId];
         snapshots.clear();
-        snapshots.reserve(messages.size());
         for (const auto& message : messages)
-            snapshots.push_back(rawMessageToJson(message).dump());
-    } catch (...) {
-    }
+            snapshots.push_back(std::make_shared<const ChatMsg>(message));
+    } catch (...) {}
 }
 
-ChatRawActivityCapture::ChatRawActivityCapture(ChatMsg& message) noexcept : message_(message) {
+ChatRawActivityCapture::ChatRawActivityCapture(ChatMsg& message, bool appendOnly) noexcept
+    : message_(message), appendOnly_(appendOnly) {
+    ++message_.revision;
     try {
-        {
-            std::lock_guard<std::mutex> lock(s_chatRawOwnerMutex);
-            const auto it = s_chatRawOwners.find(&message_);
-            if (it == s_chatRawOwners.end()) return;
-            conversationId_ = it->second;
+        before_.swap(s_chatRawStampScratch);
+        before_.clear();
+        const auto owner = s_chatRawOwners.find(&message_);
+        if (owner != s_chatRawOwners.end()) {
+            conversationId_ = owner->second.first;
+            messageIndex_ = owner->second.second;
         }
         before_.reserve(message_.activity.size());
-        for (const auto& row : message_.activity)
-            before_.push_back(rawActivityToJson(row).dump());
-    } catch (...) {
-        conversationId_.clear();
-        before_.clear();
-    }
+        for (const auto& row : message_.activity) before_.push_back(activityStamp(row, appendOnly_));
+    } catch (...) { before_.clear(); }
 }
 
 ChatRawActivityCapture::~ChatRawActivityCapture() {
-    if (conversationId_.empty()) return;
+    chatLogMessageChanged(message_);
     try {
-        std::unordered_map<std::string, int> unchanged;
-        unchanged.reserve(before_.size());
-        for (const auto& snapshot : before_) ++unchanged[snapshot];
-        for (const auto& row : message_.activity) {
-            const nlohmann::json payload = rawActivityToJson(row);
-            const std::string snapshot = payload.dump();
-            auto it = unchanged.find(snapshot);
-            if (it != unchanged.end() && it->second > 0) {
-                --it->second;
-                continue;
-            }
-            appendChatRawRecord(conversationId_, "activity", "row", payload);
+        const double now = chatNowEpoch();
+        auto* rows = conversationId_.empty() ? nullptr
+            : &s_chatRawRows[conversationId_][{message_.ts, messageIndex_}];
+        if (rows) rows->resize(message_.activity.size());
+        for (size_t i = 0; i < message_.activity.size(); ++i) {
+            auto& row = message_.activity[i];
+            if (i < before_.size() && before_[i] == activityStamp(row, appendOnly_)) continue;
+            ++row.revision;
+            message_.uiActivityDirtyFrom = std::min(message_.uiActivityDirtyFrom, i);
+            if (!rows) continue;
+            auto& prior = (*rows)[i];
+            if (row.streaming && now - prior.written < 1.0) continue;
+            if (deferRawThinkingCheckpoint(row, prior)) continue;
+            const uint64_t stamp = activityStamp(row);
+            if (prior.written > 0.0 && prior.stamp == stamp) continue;
+            appendChatRawRecord(conversationId_, "activity", "row",
+                                [row] { return rawActivityToJson(row); });
+            prior = {stamp, now, row.detail.size()};
         }
-    } catch (...) {
-        // Activity folding must remain successful even when serialization or append fails.
+    } catch (...) {}
+    if (before_.capacity() <= 65536) {
+        before_.clear();
+        before_.swap(s_chatRawStampScratch);
     }
 }
 
+
+static nlohmann::json serializeChatMessage(const ChatMsg& m) {
+            std::string body = m.text;
+            if (body.empty() && !m.fromUser && !m.compactionRun && !m.activity.empty() && !m.steerSplit) {
+                // Design/build turns put their result in the activity timeline, not
+                // m.text — persist a concise summary so the turn survives reload
+                // instead of vanishing (the whole session used to disappear).
+                int steps = 0;
+                std::string lastReason;
+                for (const auto& a : m.activity) {
+                    if (a.rowKind == 0 && !a.missionHeader) ++steps;
+                    if (!a.reason.empty()) lastReason = a.reason;
+                }
+                body = !lastReason.empty()
+                           ? lastReason
+                           : ("(design run \xc2\xb7 " + std::to_string(steps) + " steps)");
+            }
+            // Keep turns that only carry a plan (no text body) so the task list survives reload.
+            // Also ALWAYS keep a still-running turn even when it has nothing yet: dropping it
+            // left a user prompt with no reply bubble after a mid-run crash, and the restore
+            // path below needs the row to stamp the "interrupted" marker on.
+            // NEVER skip a message here: AI-VC checkpoints anchor on the chat message ORDINAL
+            // (msg_idx), so dropping any row shifts every later checkpoint's anchor one
+            // position up after a reload — an agent rollback to `msg:<idx>` would silently
+            // restore the wrong state. Persist an explicit placeholder instead (marked "empty"
+            // so the load path can render a subdued note), keeping save/load a
+            // position-preserving bijection across restarts.
+            const bool emptyTurn = body.empty() && !m.planState.present && !m.running &&
+                                   !m.steerSplit && m.contextRefs.empty() && m.imagePaths.empty() &&
+                                   m.asks.empty();
+            nlohmann::json entry = {{"u", m.fromUser}, {"t", body}, {"e", m.errKind}};
+            if (m.compactionRun) entry["compact"] = true;
+            if (emptyTurn) entry["empty"] = true;
+            if (m.steerSplit) entry["split"] = true;
+            if (m.fromUser && m.steerState != STEER_NONE) {
+                entry["steer"] = m.steerState;
+                if (!m.steerId.empty()) entry["sid"] = m.steerId;
+            }
+            // In-flight marker: this turn was still streaming when the snapshot was taken. On
+            // reload it means the app died (or was killed) mid-run — see parseChatSessionJson.
+            if (!m.fromUser && m.running) entry["run"] = true;
+            if (m.ts > 0.0) entry["ts"] = m.ts;   // send/receive time for the in-bubble age label
+            if (!m.fromUser && m.cacheReadTok > 0) {
+                entry["cache_tok"] = m.cacheReadTok;          // peak single completion (shown)
+                entry["cache_tot"] = m.cacheReadTotTok;       // turn sum (tooltip)
+                entry["cache_n"]   = m.cacheReadCalls;
+            }
+            if (!m.fromUser && !m.model.empty()) entry["m"] = m.model;
+            if (m.copilotMode >= 0) entry["cm"] = m.copilotMode;
+            // The context chips a user message carried, so they still draw after a reload.
+            if (m.fromUser && !m.contextRefs.empty())
+                entry["ctx"] = core::contextRefsToJson(m.contextRefs);
+            // Exact sent-image paths: the bubble renders these, never a basename guess.
+            if (m.fromUser && !m.imagePaths.empty()) entry["images"] = m.imagePaths;
+            // Error card fields — the humanized headline and the raw failure text (capped like
+            // an activity detail). Without these a reloaded error turn loses its guidance.
+            if (!m.errorHuman.empty()) entry["eh"] = m.errorHuman;
+            if (!m.errorFull.empty())
+                entry["ef"] = m.errorFull.size() > 8000u
+                                  ? m.errorFull.substr(0, 7999) + "\xe2\x80\xa6"
+                                  : m.errorFull;
+            if (m.planState.present) entry["plan_state"] = planStateToJson(m.planState);
+            // ask_user question batches: what was asked and how it was resolved.
+            if (!m.asks.empty()) {
+                nlohmann::json asks = nlohmann::json::array();
+                for (const auto& b : m.asks) asks.push_back(askBatchToJson(b));
+                entry["asks"] = std::move(asks);
+            }
+            // Persist activity timeline (capped) so thoughts/tools survive reload.
+            if (!m.fromUser && !m.activity.empty()) {
+                nlohmann::json act = nlohmann::json::array();
+                const int nAct = (int)m.activity.size();
+                // Keep all thought/tool/plan/question rows, inter-agent messages and usage lines
+                // (rk 1/2/3/7/18/20/21) + last N stage rows so mid-turn kill/restart still has
+                // planning, tools and the agents' conversation visible.
+                std::vector<int> keepIdx;
+                keepIdx.reserve((size_t)nAct);
+                int stagesKept = 0;
+                const int kMaxStages = 80;
+                for (int ai = nAct - 1; ai >= 0; --ai) {
+                    const auto& a = m.activity[(size_t)ai];
+                    const bool priority = (a.rowKind == 2 || a.rowKind == 3 || a.rowKind == 7 ||
+                                           a.rowKind == 1 || a.rowKind == 18 || a.rowKind == 20 ||
+                                           a.rowKind == 21 || a.stage == "__stop_meta__");
+                    if (priority) {
+                        keepIdx.push_back(ai);
+                    } else if (stagesKept < kMaxStages) {
+                        keepIdx.push_back(ai);
+                        ++stagesKept;
+                    }
+                }
+                std::sort(keepIdx.begin(), keepIdx.end());
+                for (int ai : keepIdx) {
+                    const auto& a = m.activity[(size_t)ai];
+                    nlohmann::json row = {
+                        {"rk", a.rowKind},
+                        {"stage", a.stage},
+                        {"title", a.title},
+                        {"status", a.status},
+                        {"reason", a.reason},
+                    };
+                    std::string det = a.detail;
+                    const bool isOps = (a.stage == "stream:out" && a.opsCount > 0) ||
+                                       (a.title.find("Building ops") != std::string::npos);
+                    const size_t cap = isOps ? 2000u : 8000u;
+                    // Tool fields are bounded at ingest; keep their caption/artifact trailers
+                    // intact so restored evidence stays on its originating timeline row.
+                    if (a.rowKind != 3 && det.size() > cap)
+                        det = det.substr(0, cap - 1) + "\xe2\x80\xa6";
+                    if (!det.empty()) row["detail"] = det;
+                    if (a.eventTs > 0.0) row["ts"] = a.eventTs;
+                    act.push_back(std::move(row));
+                }
+                if (!act.empty()) entry["activity"] = std::move(act);
+            }
+            // Persist tool-call artifact paths so Artifacts panel + reopen keep file links.
+            if (!m.fromUser && !m.activity.empty()) {
+                nlohmann::json arts = nlohmann::json::array();
+                std::set<std::string> seen;
+                for (const auto& a : m.activity) {
+                    if (a.detail.find("\x1e" "ART\x1e") == std::string::npos) continue;
+                    const size_t sep = a.detail.find("\x1e" "ART\x1e");
+                    std::string blob = a.detail.substr(sep);
+                    size_t nl = blob.find('\n');
+                    if (nl != std::string::npos) blob = blob.substr(nl + 1);
+                    std::istringstream iss(blob);
+                    std::string line;
+                    while (std::getline(iss, line)) {
+                        if (line.empty()) continue;
+                        size_t tab = line.find('\t');
+                        std::string kindA = tab == std::string::npos ? "file" : line.substr(0, tab);
+                        std::string path  = tab == std::string::npos ? line : line.substr(tab + 1);
+                        if (path.empty() || !seen.insert(path).second) continue;
+                        arts.push_back({{"kind", kindA}, {"path", path},
+                                        {"tool", a.title.empty() ? a.stage : a.title}});
+                        if (arts.size() >= 32) break;
+                    }
+                    if (arts.size() >= 32) break;
+                }
+                if (!arts.empty()) entry["artifacts"] = std::move(arts);
+            }
+    return entry;
+}
 
 // Defined near the lifecycle functions below.
 static bool conversationIsFresh(const AppState& st, int idx);
 
-// Reuse exact immutable session snapshots; only changed messages are serialized. Desktop
-// debounce submits to the ordered durable writer, while explicit callers retain a barrier.
+// Immutable message fragments are encoded once by the ordered writer, then concatenated.
 static std::map<std::string, chat_persistence::SessionSnapshot> s_sessionSnapshots;
-static void snapshotChatHistory(AppState& st, bool immediate) {
+static void snapshotChatHistory(AppState& st) {
 #ifndef __EMSCRIPTEN__
     chat_persistence::Snapshot snapshot;
     snapshot.history = true;
@@ -1224,7 +1418,6 @@ static void snapshotChatHistory(AppState& st, bool immediate) {
     snapshot.indexPath = chatSessionsIndexPath();
     snapshot.owned = s_pruneableSessionStems;
 #else
-    (void)immediate;
     namespace fs = std::filesystem;
     std::error_code dirEc;
     fs::create_directories(chatSessionsDir(), dirEc);
@@ -1272,7 +1465,7 @@ static void snapshotChatHistory(AppState& st, bool immediate) {
             writtenIds.insert(st.conversations[i].id);
             st.addLog("[chat] duplicate session id '" + clashed + "' re-keyed to '" +
                       st.conversations[i].id + "' (transcript kept)");
-            chudcodeSessionLinkRekey(clashed, st.conversations[i].id);
+            ompSessionLinkRekey(clashed, st.conversations[i].id);
         }
         if (i == st.activeConv) activeId = st.conversations[i].id;
         auto& cached = s_sessionSnapshots[st.conversations[i].id];
@@ -1287,248 +1480,84 @@ static void snapshotChatHistory(AppState& st, bool immediate) {
         if (!st.conversations[i].projectDir.empty())
             convObj["project"] = st.conversations[i].projectDir;
         if (st.conversations[i].archived) convObj["archived"] = true;
-        // Chudcode runtime link (id/file/health) — metadata only, never a second transcript.
-        chudcodeLinkPersist(st.conversations[i].id, convObj);
+        // Omp runtime link (id/file/health) — metadata only, never a second transcript.
+        ompLinkPersist(st.conversations[i].id, convObj);
 #ifdef __EMSCRIPTEN__
         const auto cellSession = cellAgentSessionHandle(st.conversations[i].id);
         if (!cellSession.empty()) convObj["cell_session_id"] = cellSession;
         const auto cellProvider = cellAgentSessionProvider(st.conversations[i].id);
         if (!cellProvider.empty()) convObj["cell_session_provider"] = cellProvider;
 #endif
-        // Every session owns its agent-execution DAG (the live store is conversation-keyed) —
-        // save each one as a session artifact so the workflow trace survives a reopen.
-        nlohmann::json dag = ui::agentDagToJson(st.conversations[i].id);
-        if (dag.is_object() && dag.contains("nodes") && !dag["nodes"].empty())
-            convObj["agent_dag"] = std::move(dag);
+        const auto dagRevision = ui::agentDagRevision(st.conversations[i].id);
+        if (!cached.dag || cached.dagRevision != dagRevision) {
+            cached.dagRevision = dagRevision;
+            cached.dag = std::make_shared<chat_persistence::JsonFragment>();
+            cached.dag->encode = ui::agentDagSnapshot(st.conversations[i].id);
+        }
         const int lct = (i == st.activeConv) ? st.lastContextTokens
                                              : st.conversations[i].lastContextTokens;
-        if (lct > 0) convObj["last_context_tokens"] = lct;
+        if (lct != 0) convObj["last_context_tokens"] = lct;
+        const int window = (i == st.activeConv) ? st.lastContextWindow
+                                                : st.conversations[i].lastContextWindow;
+        const auto& windowSource = (i == st.activeConv) ? st.lastContextWindowSource
+                                                        : st.conversations[i].lastContextWindowSource;
+        if (window > 0) {
+            convObj["last_context_window"] = window;
+            if (!windowSource.empty()) convObj["last_context_window_source"] = windowSource;
+        }
         const auto& qp = (i == st.activeConv) ? st.queuedPrompts
                                               : st.conversations[i].queuedPrompts;
         if (!qp.empty()) convObj["queued_prompts"] = qp;
         const auto& qd = (i == st.activeConv) ? st.queuedPromptDrafts
                                               : st.conversations[i].queuedPromptDrafts;
         if (!qd.empty()) convObj["queued_prompt_drafts"] = qd;
-        if (!st.conversations[i].branches.empty()) {
-            convObj["branches"] = nlohmann::json::array();
-            for (const auto& b : st.conversations[i].branches)
-                convObj["branches"].push_back({{"id", b.id}, {"label", b.label},
-                                              {"when", b.when}, {"from", b.fromMsgIdx}});
+        auto& snapshots = cached.messages;
+        snapshots.resize(liveMsgs.size());
+        for (size_t mi = 0; mi < liveMsgs.size(); ++mi) {
+            const auto& m = liveMsgs[mi];
+            if (snapshots[mi] && snapshots[mi]->source.revision == m.revision &&
+                chat_persistence::sameMessage(snapshots[mi]->source, m)) continue;
+            snapshots[mi] = std::make_shared<chat_persistence::MessageSnapshot>(m);
         }
-        auto unchanged = [&](const std::vector<ChatMsg>& msgs, const std::string& key) {
-            const auto old = cached.messages.find(key);
-            if (old == cached.messages.end() || old->second.size() != msgs.size()) return false;
-            for (size_t mi = 0; mi < msgs.size(); ++mi)
-                if (!chat_persistence::sameMessage(old->second[mi].source, msgs[mi])) return false;
-            return true;
+        archiveChangedChatMessages(st.conversations[i].id, liveMsgs, snapshots);
+        auto encode = [metadata = std::move(convObj), messages = cached.messages, dag = cached.dag,
+                       encoded = std::make_shared<std::shared_ptr<const std::string>>()] {
+            if (*encoded) return *encoded;
+            auto array = [](const auto& rows) {
+                std::string wire = "[";
+                bool first = true;
+                for (const auto& row : rows) {
+                    if (!row->bytes)
+                        row->bytes = std::make_shared<const std::string>(serializeChatMessage(row->source).dump());
+                    if (!first) wire += ',';
+                    first = false;
+                    wire += *row->bytes;
+                }
+                wire += ']';
+                return wire;
+            };
+            std::string wire = metadata.dump();
+            wire.pop_back();
+            wire += ",\"msgs\":" + array(messages);
+            if (!dag->bytes) {
+                const auto value = dag->encode();
+                dag->bytes = std::make_shared<const std::string>(
+                    value.is_object() && value.contains("nodes") && !value["nodes"].empty()
+                        ? value.dump() : std::string());
+            }
+            if (!dag->bytes->empty()) wire += ",\"agent_dag\":" + *dag->bytes;
+            wire += '}';
+            *encoded = std::make_shared<const std::string>(std::move(wire));
+            return *encoded;
         };
-        bool same = cached.bytes && cached.metadata == convObj && unchanged(liveMsgs, "");
-        for (const auto& b : st.conversations[i].branches)
-            if (same && !unchanged(b.msgs, b.id)) same = false;
-        if (same) {
 #ifdef __EMSCRIPTEN__
-            sessions.push_back(cached.wire);
-            if (!cached.durable) {
-                cached.durable = atomicWriteFileDurable(chatSessionFilePath(st.conversations[i].id),
-                                                        *cached.bytes);
-                if (!cached.durable) markChatHistoryDirty();
-                else s_pruneableSessionStems.insert(chatSessionFileStem(st.conversations[i].id));
-            }
-#else
-            snapshot.files[chatSessionFilePath(st.conversations[i].id)] = cached.bytes;
-            snapshot.keep.insert(chatSessionFileStem(st.conversations[i].id));
-#endif
-            order.push_back(st.conversations[i].id);
-            continue;
-        }
-        cached.metadata = convObj;
-        // One serializer, used for the live transcript AND for any revert branches parked
-        // on this session — a branch is real conversation history and must round-trip
-        // through exactly the same shape, not a lossy summary of it.
-        auto serializeMsgs = [&](const std::vector<ChatMsg>& msgs, const std::string& key) {
-        auto& previous = cached.messages[key];
-        nlohmann::json jm = nlohmann::json::array();
-        for (size_t mi = 0; mi < msgs.size(); ++mi) {
-            const auto& m = msgs[mi];
-            if (mi < previous.size() && chat_persistence::sameMessage(previous[mi].source, m)) {
-                jm.push_back(previous[mi].wire);
-                continue;
-            }
-            std::string body = m.text;
-            if (body.empty() && !m.fromUser && !m.activity.empty() && !m.steerSplit) {
-                // Design/build turns put their result in the activity timeline, not
-                // m.text — persist a concise summary so the turn survives reload
-                // instead of vanishing (the whole session used to disappear).
-                int steps = 0;
-                std::string lastReason;
-                for (const auto& a : m.activity) {
-                    if (a.rowKind == 0 && !a.missionHeader) ++steps;
-                    if (!a.reason.empty()) lastReason = a.reason;
-                }
-                body = !lastReason.empty()
-                           ? lastReason
-                           : ("(design run \xc2\xb7 " + std::to_string(steps) + " steps)");
-            }
-            // Keep turns that only carry a plan (no text body) so the task list survives reload.
-            // Also ALWAYS keep a still-running turn even when it has nothing yet: dropping it
-            // left a user prompt with no reply bubble after a mid-run crash, and the restore
-            // path below needs the row to stamp the "interrupted" marker on.
-            // NEVER skip a message here: AI-VC checkpoints anchor on the chat message ORDINAL
-            // (msg_idx), so dropping any row shifts every later checkpoint's anchor one
-            // position up after a reload — a revert would silently rewind to the wrong
-            // message. Persist an explicit placeholder instead (marked "empty" so the load
-            // path can render a subdued note), keeping save/load a position-preserving
-            // bijection across restarts.
-            const bool emptyTurn = body.empty() && !m.planState.present && !m.running &&
-                                   !m.steerSplit && m.contextRefs.empty() && m.imagePaths.empty() &&
-                                   m.asks.empty();
-            nlohmann::json entry = {{"u", m.fromUser}, {"t", body}, {"e", m.errKind}};
-            if (emptyTurn) entry["empty"] = true;
-            if (m.steerSplit) entry["split"] = true;
-            if (m.fromUser && m.steerState != STEER_NONE) {
-                entry["steer"] = m.steerState;
-                if (!m.steerId.empty()) entry["sid"] = m.steerId;
-            }
-            // In-flight marker: this turn was still streaming when the snapshot was taken. On
-            // reload it means the app died (or was killed) mid-run — see parseChatSessionJson.
-            if (!m.fromUser && m.running) entry["run"] = true;
-            if (m.ts > 0.0) entry["ts"] = m.ts;   // send/receive time for the in-bubble age label
-            if (!m.fromUser && m.cacheReadTok > 0) {
-                entry["cache_tok"] = m.cacheReadTok;          // peak single completion (shown)
-                entry["cache_tot"] = m.cacheReadTotTok;       // turn sum (tooltip)
-                entry["cache_n"]   = m.cacheReadCalls;
-            }
-            if (!m.fromUser && !m.model.empty()) entry["m"] = m.model;
-            if (m.copilotMode >= 0) entry["cm"] = m.copilotMode;
-            // The context chips a user message carried, so they still draw after a reload.
-            if (m.fromUser && !m.contextRefs.empty())
-                entry["ctx"] = core::contextRefsToJson(m.contextRefs);
-            // Exact sent-image paths: the bubble renders these, never a basename guess.
-            if (m.fromUser && !m.imagePaths.empty()) entry["images"] = m.imagePaths;
-            // Error card fields — the humanized headline and the raw failure text (capped like
-            // an activity detail). Without these a reloaded error turn loses its guidance.
-            if (!m.errorHuman.empty()) entry["eh"] = m.errorHuman;
-            if (!m.errorFull.empty())
-                entry["ef"] = m.errorFull.size() > 8000u
-                                  ? m.errorFull.substr(0, 7999) + "\xe2\x80\xa6"
-                                  : m.errorFull;
-            if (m.planState.present) entry["plan_state"] = planStateToJson(m.planState);
-            // ask_user question batches: what was asked and how it was resolved.
-            if (!m.asks.empty()) {
-                nlohmann::json asks = nlohmann::json::array();
-                for (const auto& b : m.asks) asks.push_back(askBatchToJson(b));
-                entry["asks"] = std::move(asks);
-            }
-            // Persist activity timeline (capped) so thoughts/tools survive reload.
-            if (!m.fromUser && !m.activity.empty()) {
-                nlohmann::json act = nlohmann::json::array();
-                const int nAct = (int)m.activity.size();
-                // Keep all thought/tool/plan/question rows (rk 1/2/3/18/20) + last N stage rows so
-                // mid-turn kill/restart still has planning + tools visible.
-                std::vector<int> keepIdx;
-                keepIdx.reserve((size_t)nAct);
-                int stagesKept = 0;
-                const int kMaxStages = 80;
-                for (int ai = nAct - 1; ai >= 0; --ai) {
-                    const auto& a = m.activity[(size_t)ai];
-                    const bool priority = (a.rowKind == 2 || a.rowKind == 3 ||
-                                           a.rowKind == 1 || a.rowKind == 18 || a.rowKind == 20 ||
-                                           a.stage == "__stop_meta__");
-                    if (priority) {
-                        keepIdx.push_back(ai);
-                    } else if (stagesKept < kMaxStages) {
-                        keepIdx.push_back(ai);
-                        ++stagesKept;
-                    }
-                }
-                std::sort(keepIdx.begin(), keepIdx.end());
-                for (int ai : keepIdx) {
-                    const auto& a = m.activity[(size_t)ai];
-                    nlohmann::json row = {
-                        {"rk", a.rowKind},
-                        {"stage", a.stage},
-                        {"title", a.title},
-                        {"status", a.status},
-                        {"reason", a.reason},
-                    };
-                    std::string det = a.detail;
-                    const bool isOps = (a.stage == "stream:out" && a.opsCount > 0) ||
-                                       (a.title.find("Building ops") != std::string::npos);
-                    const size_t cap = isOps ? 2000u : 8000u;
-                    // Tool fields are bounded at ingest; keep their caption/artifact trailers
-                    // intact so restored evidence stays on its originating timeline row.
-                    if (a.rowKind != 3 && det.size() > cap)
-                        det = det.substr(0, cap - 1) + "\xe2\x80\xa6";
-                    if (!det.empty()) row["detail"] = det;
-                    act.push_back(std::move(row));
-                }
-                if (!act.empty()) entry["activity"] = std::move(act);
-            }
-            // Persist tool-call artifact paths so Artifacts panel + reopen keep file links.
-            if (!m.fromUser && !m.activity.empty()) {
-                nlohmann::json arts = nlohmann::json::array();
-                std::set<std::string> seen;
-                for (const auto& a : m.activity) {
-                    if (a.detail.find("\x1e" "ART\x1e") == std::string::npos) continue;
-                    const size_t sep = a.detail.find("\x1e" "ART\x1e");
-                    std::string blob = a.detail.substr(sep);
-                    size_t nl = blob.find('\n');
-                    if (nl != std::string::npos) blob = blob.substr(nl + 1);
-                    std::istringstream iss(blob);
-                    std::string line;
-                    while (std::getline(iss, line)) {
-                        if (line.empty()) continue;
-                        size_t tab = line.find('\t');
-                        std::string kindA = tab == std::string::npos ? "file" : line.substr(0, tab);
-                        std::string path  = tab == std::string::npos ? line : line.substr(tab + 1);
-                        if (path.empty() || !seen.insert(path).second) continue;
-                        arts.push_back({{"kind", kindA}, {"path", path},
-                                        {"tool", a.title.empty() ? a.stage : a.title}});
-                        if (arts.size() >= 32) break;
-                    }
-                    if (arts.size() >= 32) break;
-                }
-                if (!arts.empty()) entry["artifacts"] = std::move(arts);
-            }
-            chat_persistence::MessageSnapshot saved{m, entry};
-            if (mi < previous.size()) previous[mi] = std::move(saved);
-            else previous.push_back(std::move(saved));
-            jm.push_back(std::move(entry));
-        }
-        previous.resize(msgs.size());
-        return jm;
-        };
-        // Archive the uncapped in-memory state before serializeMsgs applies the bounded
-        // <id>.json representation. This also records terminal message mutations (full error,
-        // final prose, plan/step state) after the creation record.
-        archiveChangedChatMessages(st.conversations[i].id, liveMsgs, cached.messages[""]);
-        convObj["msgs"] = serializeMsgs(liveMsgs, "");
-        // Revert branches: tails a rollback moved aside. Persisted so a revert stays
-        // undoable after a restart.
-        if (!st.conversations[i].branches.empty()) {
-            nlohmann::json jb = nlohmann::json::array();
-            for (const auto& b : st.conversations[i].branches)
-                jb.push_back({{"id", b.id}, {"label", b.label}, {"when", b.when},
-                              {"from", b.fromMsgIdx}, {"msgs", serializeMsgs(b.msgs, b.id)}});
-            convObj["branches"] = std::move(jb);
-        }
-        for (auto it = cached.messages.begin(); it != cached.messages.end();) {
-            const bool keep = it->first.empty() ||
-                std::any_of(st.conversations[i].branches.begin(), st.conversations[i].branches.end(),
-                            [&](const ChatBranch& b) { return b.id == it->first; });
-            if (keep) ++it;
-            else it = cached.messages.erase(it);
-        }
-        cached.wire = std::move(convObj);
-        cached.bytes = std::make_shared<const std::string>(cached.wire.dump(1));
-#ifdef __EMSCRIPTEN__
-        sessions.push_back(cached.wire);
-        cached.durable = atomicWriteFileDurable(chatSessionFilePath(st.conversations[i].id),
-                                              *cached.bytes);
-        if (!cached.durable) markChatHistoryDirty();
+        const auto bytes = encode();
+        sessions.push_back(nlohmann::json::parse(*bytes));
+        if (!atomicWriteFileDurable(chatSessionFilePath(st.conversations[i].id), *bytes))
+            markChatHistoryDirty();
         else s_pruneableSessionStems.insert(chatSessionFileStem(st.conversations[i].id));
 #else
-        snapshot.files[chatSessionFilePath(st.conversations[i].id)] = cached.bytes;
+        snapshot.serialized[chatSessionFilePath(st.conversations[i].id)] = std::move(encode);
         snapshot.keep.insert(chatSessionFileStem(st.conversations[i].id));
 #endif
         order.push_back(st.conversations[i].id);
@@ -1538,7 +1567,7 @@ static void snapshotChatHistory(AppState& st, bool immediate) {
     // active session is remembered under its OWN stored project, never the current root's:
     // it may be another project's session the user opened explicitly.
     if (!activeId.empty()) {
-        const std::string ownKey = convProjectKey(st.conversations[st.activeConv].projectDir);
+        const std::string& ownKey = convProjectKey(st.conversations[st.activeConv]);
         if (!ownKey.empty()) s_activeByProject[ownKey] = activeId;
     }
     nlohmann::json activeByProject = nlohmann::json::object();
@@ -1551,13 +1580,14 @@ static void snapshotChatHistory(AppState& st, bool immediate) {
                             {"order", order},
                             {"session_seq", s_sessionSeq}};
 #ifndef __EMSCRIPTEN__
-    snapshot.files[snapshot.indexPath] = std::make_shared<const std::string>(index.dump(1));
+    snapshot.serialized[snapshot.indexPath] = [index = std::move(index)] {
+        return std::make_shared<const std::string>(index.dump());
+    };
     for (auto it = s_pruneableSessionStems.begin(); it != s_pruneableSessionStems.end();) {
         if (!snapshot.keep.count(*it)) it = s_pruneableSessionStems.erase(it);
         else ++it;
     }
     chatWriter().submit(std::move(snapshot));
-    if (immediate && !chatWriter().flush()) markChatHistoryDirty();
     reportChatSaveFailure(st);
 #else
     try {
@@ -1593,14 +1623,7 @@ static void snapshotChatHistory(AppState& st, bool immediate) {
                 fs::remove_all(chatSubagentsDirPath(stem), rawEc);
                 rawEc.clear();
                 fs::remove(chatRawLogPath(stem), rawEc);
-                {
-                    std::lock_guard<std::mutex> lock(s_chatRawFileMutex);
-                    s_chatRawNextSeq.erase(chatRawLogPath(stem));
-                }
-                {
-                    std::lock_guard<std::mutex> lock(s_chatRawOwnerMutex);
-                    s_chatRawMessageSnapshots.erase(stem);
-                }
+                s_chatRawMessageSnapshots.erase(stem);
                 s_pruneableSessionStems.erase(stem);
             }
         }
@@ -1616,18 +1639,26 @@ static void snapshotChatHistory(AppState& st, bool immediate) {
     }
 #endif
     for (auto it = s_sessionSnapshots.begin(); it != s_sessionSnapshots.end();) {
-        if (!writtenIds.count(it->first)) it = s_sessionSnapshots.erase(it);
+        if (!writtenIds.count(it->first)) {
+            s_chatRawMessageSnapshots.erase(it->first);
+            s_chatRawRows.erase(it->first);
+            for (auto owner = s_chatRawOwners.begin(); owner != s_chatRawOwners.end();) {
+                if (owner->second.first == it->first) owner = s_chatRawOwners.erase(owner);
+                else ++owner;
+            }
+            it = s_sessionSnapshots.erase(it);
+        }
         else ++it;
     }
 }
 
 void persistChatHistory(AppState& st) {
-    snapshotChatHistory(st, true);
+    snapshotChatHistory(st);
 }
 
 void flushChatPersistence(AppState& st) {
     savePromptDraft(st, true);
-    snapshotChatHistory(st, true);
+    snapshotChatHistory(st);
 #ifndef __EMSCRIPTEN__
     if (!chatWriter().flush()) markChatHistoryDirty();
     reportChatSaveFailure(st);
@@ -1651,7 +1682,7 @@ void maybePersistChatHistoryDebounced(AppState& st, bool force) {
         return;
     s_chatHistoryDirty.store(false, std::memory_order_relaxed);
     s_chatHistoryLastPersist = now;
-    snapshotChatHistory(st, force);
+    snapshotChatHistory(st);
 }
 
 // A transcript restored from disk or forked into a new session owns no live stream. Keep
@@ -1690,7 +1721,7 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
         c.docLink = docLink;
         c.archived = jc.value("archived", false);
         // Project scope. Legacy sessions (written before the field existed) recover one
-        // below, once, after the transcript and the Chudcode link are known.
+        // below, once, after the transcript and the Omp link are known.
         c.projectDir = jc.value("project", std::string());
 #ifdef __EMSCRIPTEN__
         std::string relativeProject, projectError;
@@ -1701,8 +1732,7 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
         // This session's own saved execution trace, straight into its conversation-keyed store
         // (no active/parked special case — switching sessions just reads the other tree).
         if (jc.contains("agent_dag")) ui::agentDagFromJson(c.id, jc["agent_dag"]);
-        // One parser, used for the live transcript AND for revert branches — a branch is
-        // real history and must come back in exactly the same shape it went out in.
+        bool interruptedCompaction = false;
         auto parseMsgs = [&](const nlohmann::json& arr) {
         std::vector<ChatMsg> out;
         for (const auto& m : arr) {
@@ -1710,6 +1740,7 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
             cm.fromUser = m.value("u", false);
             cm.text = m.value("t", std::string());
             cm.errKind = m.value("e", 0);
+            cm.compactionRun = !cm.fromUser && m.value("compact", false);
             if (!cm.fromUser) cm.model = m.value("m", std::string());
             // Legacy per-message mode ints (Swarm/Edit/EngFirm) fold onto the Agent|Plan|Ask
             // enum; -1 stays -1 (absent = no badge).
@@ -1736,10 +1767,12 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
                     ActivityItem a;
                     a.rowKind = row.value("rk", 0);
                     a.stage = row.value("stage", std::string());
+                    if (a.isRetiredCorporateRow()) continue;
                     a.title = row.value("title", std::string());
                     a.status = row.value("status", std::string());
                     a.reason = row.value("reason", std::string());
                     a.detail = row.value("detail", std::string());
+                    a.eventTs = row.value("ts", 0.0);
                     cm.activity.push_back(std::move(a));
                 }
             }
@@ -1772,13 +1805,29 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
             // so a "run":true marker here can ONLY be a leftover from a run that died with a
             // PREVIOUS process — never a live navigation, which now keeps a running conversation
             // resident (parked, still streaming) instead of reloading it from disk over itself.
+            if (!cm.fromUser && !cm.compactionRun &&
+                (cm.text.rfind("Context compacted", 0) == 0 ||
+                 cm.text.rfind("Couldn't compact this conversation:", 0) == 0 ||
+                 cm.text.rfind("Compaction stopped.", 0) == 0 ||
+                 cm.text.rfind("Compaction skipped;", 0) == 0)) {
+                cm.compactionRun = std::any_of(cm.activity.begin(), cm.activity.end(),
+                    [](const ActivityItem& a) {
+                        return a.rowKind == 17 && a.stage.rfind("subrun:compaction:", 0) == 0;
+                    });
+            }
             if (!cm.fromUser && m.value("run", false)) {
-                cm.resultPartial = true;
-                const char* note = "(Interrupted \xe2\x80\x94 the app was closed while this run "
-                                   "was still in progress. Nothing after this point was saved.)";
-                if (cm.text.empty()) cm.text = note;
-                else if (cm.text.find("Interrupted \xe2\x80\x94") == std::string::npos)
-                    cm.text += std::string("\n\n") + note;
+                if (cm.compactionRun) {
+                    interruptedCompaction = true;
+                    cm.text = "Context compaction interrupted; its result is unknown.";
+                    for (auto& a : cm.activity) ui::settleUnfinishedCompaction(a, "interrupted");
+                } else {
+                    cm.resultPartial = true;
+                    const char* note = "(Interrupted \xe2\x80\x94 the app was closed while this run "
+                                       "was still in progress. Nothing after this point was saved.)";
+                    if (cm.text.empty()) cm.text = note;
+                    else if (cm.text.find("Interrupted \xe2\x80\x94") == std::string::npos)
+                        cm.text += std::string("\n\n") + note;
+                }
             }
             cm.steerSplit = !cm.fromUser && m.value("split", false);
             if (cm.fromUser) {
@@ -1797,8 +1846,9 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
                     if (p.is_string() && !p.get_ref<const std::string&>().empty())
                         cm.imagePaths.push_back(p.get<std::string>());
             }
-            // A batch saved while still open comes back Expired: a restart drops every live run
-            // (sessions are only parsed from disk when not already resident — see above).
+            // A batch saved while still open asks again with the user's draft; its run is gone,
+            // so Submit hands the answers on as the next message (sessions are only parsed from
+            // disk when not already resident — see above).
             if (m.contains("asks") && m["asks"].is_array())
                 for (const auto& jb : m["asks"])
                     if (jb.is_object()) cm.asks.push_back(askBatchFromJson(jb));
@@ -1815,21 +1865,10 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
         return out;
         };
         c.msgs = parseMsgs(jc.value("msgs", nlohmann::json::array()));
-        // Revert branches: tails a rollback moved aside, so a revert stays undoable after
-        // a restart. Absent on sessions written before branches existed.
-        if (jc.contains("branches") && jc["branches"].is_array()) {
-            for (const auto& jb : jc["branches"]) {
-                if (!jb.is_object()) continue;
-                ChatBranch b;
-                b.id = jb.value("id", std::string());
-                b.label = jb.value("label", std::string());
-                b.when = jb.value("when", 0.0);
-                b.fromMsgIdx = jb.value("from", -1);
-                b.msgs = parseMsgs(jb.value("msgs", nlohmann::json::array()));
-                if (!b.msgs.empty()) c.branches.push_back(std::move(b));
-            }
-        }
-        c.lastContextTokens = jc.value("last_context_tokens", 0);
+        const bool interruptedLiveCompaction = interruptedCompaction;
+        c.lastContextTokens = interruptedLiveCompaction ? -1 : jc.value("last_context_tokens", 0);
+        c.lastContextWindow = std::max(0, jc.value("last_context_window", 0));
+        c.lastContextWindowSource = jc.value("last_context_window_source", std::string());
         if (jc.contains("queued_prompts") && jc["queued_prompts"].is_array()) {
             for (const auto& q : jc["queued_prompts"])
                 if (q.is_string()) c.queuedPrompts.push_back(q.get<std::string>());
@@ -1841,27 +1880,25 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
         c.queuedPromptDrafts.resize(c.queuedPrompts.size(), nlohmann::json::object());
         // Fresh sessions are never kept (same rule as persist) — drop legacy empty entries
         // left on disk by older builds instead of resurrecting them.
-        // A session reverted all the way back still holds its branches — that is user
-        // history, and dropping it here would make the revert unrecoverable.
         // A session the user named is kept even when empty: the name is content they chose.
-        if (c.msgs.empty() && c.queuedPrompts.empty() && c.branches.empty() && !titleUser)
+        if (c.msgs.empty() && c.queuedPrompts.empty() && !titleUser)
             return false;
         if (titleUser) s_userTitled.insert(c.id);
         s_sessionSeq = std::max(s_sessionSeq, sessionTitleOrdinal(c.title));
-        // Chudcode runtime link (id/file/health): restore into the conversation-keyed
+        // Omp runtime link (id/file/health): restore into the conversation-keyed
         // registry only for sessions that are actually kept.
-        chudcodeLinkRestore(c.id, jc);
+        ompLinkRestore(c.id, jc);
 #ifndef __EMSCRIPTEN__
         // Legacy project-scope recovery — ONCE, at load time, in priority order:
-        //   1) the Chudcode session JSONL's own `cwd` (exactly where that run worked), then
+        //   1) the Omp session JSONL's own `cwd` (exactly where that run worked), then
         //   2) the old artifact heuristic against the CURRENT project root (a session that
         //      produced a file under this project belongs to it).
         // Neither answers -> projectDir stays empty: listed only under Sessions' "Unassigned".
         // The next persist writes whatever was recovered, so this runs at most once per
         // session for the life of the store.
         if (c.projectDir.empty()) {
-            if (const ChudcodeSessionLink* link = chudcodeSessionLink(c.id))
-                c.projectDir = chudcodeSessionCwd(link->sessionFile);
+            if (const OmpSessionLink* link = ompSessionLink(c.id))
+                c.projectDir = ompSessionCwd(link->sessionFile);
             if (c.projectDir.empty()) {
                 const std::string current = convProjectDir(st);
                 const std::filesystem::path root = lexicalPath(current);
@@ -1876,15 +1913,15 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
     return true;
 }
 
-// ---- headless Chudcode session adoption --------------------------------------------------
+// ---- headless Omp session adoption --------------------------------------------------
 // A mission launched WITHOUT the GUI (services/worker_main.py agent_admin_turn with
-// sessions_dir=<Documents>/Chudware/Sessions) writes only Chudcode's own
+// sessions_dir=<Documents>/Chudware/Sessions) writes only Omp's own
 // "<timestamp>_<uuid>.jsonl" into that folder — no <id>.json transcript at all, so the
 // orphan sweep above never saw it and the run was unreachable from the Sessions list.
 // Replay its VISIBLE transcript into a real conversation instead, linked to the session
-// file so the GUI can resume it (chudcode_session_file).
+// file so the GUI can resume it (omp_session_file).
 //
-// Chudcode session JSONL (version 3) entry types, one JSON object per line:
+// Omp session JSONL (version 3) entry types, one JSON object per line:
 //   {"type":"session","version":3,"id":…,"cwd":…}   session identity + the run's project cwd
 //   {"type":"message","message":{"role":"user"|"assistant"|"toolResult","content":[…]}}
 //        content parts are {"type":"text","text":…} | {"type":"thinking",…} |
@@ -1893,7 +1930,7 @@ static bool parseChatSessionJson(AppState& st, const nlohmann::json& jc,
 //    "credential_pin"|"custom"|"custom_message"}   lifecycle / tool-execution / system records
 // Only user+assistant "text" parts are replayed. thinking, toolCall, toolResult and every
 // lifecycle record stay in the file — which is exactly what the leading note tells the user.
-static bool adoptChudcodeSessionJsonl(AppState& st, const std::filesystem::path& file,
+static bool adoptOmpSessionJsonl(AppState& st, const std::filesystem::path& file,
                                       const std::string& sessionId) {
     static constexpr size_t kMaxReplayBytes = 2u * 1024u * 1024u;
     static constexpr int    kMaxEntries = 400;
@@ -1965,11 +2002,10 @@ static bool adoptChudcodeSessionJsonl(AppState& st, const std::filesystem::path&
     c.msgs.push_back(std::move(note));
     for (ChatMsg& m : msgs) c.msgs.push_back(std::move(m));
 
-    ChudcodeSessionLink link;
+    OmpSessionLink link;
     link.sessionId = sessionId;
     link.sessionFile = file.string();
-    link.health = "healthy";
-    chudcodeSessionLinkSet(c.id, std::move(link));
+    ompSessionLinkSet(c.id, std::move(link));
     st.conversations.push_back(std::move(c));
     return true;
 }
@@ -1994,17 +2030,22 @@ void loadChatHistory(AppState& st) {
     chatWriter().forgetDurable();
 #endif
     s_sessionSnapshots.clear();
+    s_chatRawMessageSnapshots.clear();
+    s_chatRawRows.clear();
+    s_chatRawOwners.clear();
     // Park + drop everything resident — this runs before any session work has happened
     // (or from the WASM merge, which accepts a rebuild).
     parkActiveConversation(st);
     st.chat.clear();
     st.lastContextTokens = 0;
+    st.lastContextWindow = 0;
+    st.lastContextWindowSource.clear();
     st.queuedPrompts.clear();
     st.queuedPromptDrafts.clear();
     st.conversations.clear();
     st.activeConv = -1;
-    // The Chudcode link registry mirrors the resident set — rebuild it with the store.
-    chudcodeSessionLinksClear();
+    // The Omp link registry mirrors the resident set — rebuild it with the store.
+    ompSessionLinksClear();
 #ifdef __EMSCRIPTEN__
     clearCellAgentSessionHandles();
 #endif
@@ -2123,8 +2164,8 @@ void loadChatHistory(AppState& st) {
         }
     }
 #ifndef __EMSCRIPTEN__
-    // Headless-mission sweep: Chudcode session JSONLs in the Sessions dir that NO resident
-    // conversation links to (see adoptChudcodeSessionJsonl). Runs after the legacy import so
+    // Headless-mission sweep: Omp session JSONLs in the Sessions dir that NO resident
+    // conversation links to (see adoptOmpSessionJsonl). Runs after the legacy import so
     // adopting one can never suppress that migration. Bounded and never throwing: oversized
     // files are skipped, a parse failure just means "no answer".
     {
@@ -2132,7 +2173,7 @@ void loadChatHistory(AppState& st) {
         static constexpr std::uintmax_t kMaxJsonlBytes = 64ull * 1024ull * 1024ull;
         std::set<std::string> linkedIds, linkedFiles;
         for (const auto& c : st.conversations) {
-            const ChudcodeSessionLink* link = chudcodeSessionLink(c.id);
+            const OmpSessionLink* link = ompSessionLink(c.id);
             if (!link) continue;
             if (!link->sessionId.empty()) linkedIds.insert(link->sessionId);
             if (!link->sessionFile.empty())
@@ -2149,9 +2190,9 @@ void loadChatHistory(AppState& st) {
             const std::uintmax_t bytes = de.file_size(ec);
             if (ec || bytes == 0 || bytes > kMaxJsonlBytes) { ec.clear(); continue; }
             if (linkedFiles.count(comparablePath(lexicalPath(de.path().string())))) continue;
-            const std::string sessionId = chudcodeSessionIdOf(de.path().string());
+            const std::string sessionId = ompSessionIdOf(de.path().string());
             if (sessionId.empty() || linkedIds.count(sessionId)) continue;
-            if (adoptChudcodeSessionJsonl(st, de.path(), sessionId)) {
+            if (adoptOmpSessionJsonl(st, de.path(), sessionId)) {
                 noteLoaded();
                 linkedIds.insert(sessionId);
                 recoveredOrphan = true;   // needs its own <id>.json + an index entry
@@ -2356,22 +2397,26 @@ static void wasmApplySharedChatPending(AppState& st) {
 // Relink sweep: when a document gains a saved file path, any session LINKED to it via
 // doc:<id> has its link rewritten to file:<path> — resident sessions and the v2 store's
 // "doc" fields. Links are metadata: nothing moves, nothing merges, and a session whose
-// document is never saved simply keeps its doc:<id> link. Gated on a per-frame
-// docId/path signature so the disk scan only runs on change.
+// document is never saved simply keeps its doc:<id> link. Compare the existing tab strings
+// first; only allocate the lookup when a document's saved identity actually changes.
 static void relinkSavedDocSessions(AppState& st) {
-    std::unordered_map<std::string, std::string> savedDocs;
-    std::string sig;
-    for (const auto& t : st.docTabs) {
-        if (t.docId.empty() || t.path.empty()) continue;
-        savedDocs[t.docId] = t.path;
-        sig += t.docId;
-        sig += '=';
-        sig += t.path;
-        sig += ';';
+    static std::vector<std::pair<std::string, std::string>> prior;
+    static size_t sessionCount = 0;
+    bool changed = prior.size() != st.docTabs.size() || sessionCount != st.conversations.size();
+    if (!changed) {
+        for (size_t i = 0; i < prior.size(); ++i) {
+            const auto& tab = st.docTabs[i];
+            if (prior[i].first != tab.docId || prior[i].second != tab.path) { changed = true; break; }
+        }
     }
-    static std::string s_relinkSig;
-    if (sig == s_relinkSig) return;
-    s_relinkSig = sig;
+    if (!changed) return;
+    sessionCount = st.conversations.size();
+    prior.clear();
+    std::unordered_map<std::string, std::string> savedDocs;
+    for (const auto& tab : st.docTabs) {
+        prior.emplace_back(tab.docId, tab.path);
+        if (!tab.docId.empty() && !tab.path.empty()) savedDocs[tab.docId] = tab.path;
+    }
     if (savedDocs.empty()) return;
 
     // 1) Resident sessions: rewrite the link only.
@@ -2389,62 +2434,15 @@ static void relinkSavedDocSessions(AppState& st) {
     if (relinked) markChatHistoryDirty();
 }
 
-// ---- Chudcode session recovery: service latch + post-turn metadata/health capture ----------
+// ---- Omp session recovery service latch ----------
 // One latch for the whole surface: flipped false on the first unknown-method response so an
 // older worker (slice not deployed) disables every recovery control instead of retrying
 // forever. Shared with the Sessions panel via copilot_internal.h.
-bool& chudcodeSessionServiceAvailable() {
+bool& ompSessionServiceAvailable() {
     static bool s_available = true;
     return s_available;
 }
 
-// When the ACTIVE conversation's turn finishes, capture the Chudcode runtime metadata
-// (chudcode_session_id / chudcode_session_file) and a health verdict with ONE read-only
-// doctor dry-run, then stamp them into the conversation's persisted link. This is what makes
-// resume-after-restart work without the user ever opening the Sessions panel: the resume key
-// reaches disk as soon as a turn has run. Never fires for background (parked) runs — their
-// link updates the next time they are viewed and finish a turn.
-static void pollChudcodeSessionHealth(AppState& st) {
-    if (!chudcodeSessionServiceAvailable()) return;
-    static bool s_inFlight = false;
-    static std::string s_runningConv;   // active conv observed running (transition source)
-    const std::string convId = activeConversationId(st);
-    if (activeConversationRunning(st)) {
-        s_runningConv = convId;
-        return;
-    }
-    // Only the run we watched START on this same conversation counts as "finished" here —
-    // switching from a running session to an idle one must not diagnose the idle one.
-    if (s_inFlight || s_runningConv.empty() || s_runningConv != convId) return;
-    s_runningConv.clear();
-    const ChudcodeSessionLink* link = chudcodeSessionLink(convId);
-    if (!link || !link->runtimeLive) return;   // no service-side runtime to describe
-    s_inFlight = true;
-    st.rpc.call(kChudcodeRepairSessionMethod,
-                chudcodeRepairSessionParams(convId, /*repair=*/false),
-                [&st, convId](const core::RpcResult& r) {
-        s_inFlight = false;
-        if (chudcodeSessionRpcAbsent(r.ok, r.err, r.result)) {
-            chudcodeSessionServiceAvailable() = false;
-            return;
-        }
-        if (!r.ok) return;   // transport hiccup — next finished turn retries
-        if (chudcodeSessionNotLive(r.result)) {
-            chudcodeSessionLinkEnsure(convId).runtimeLive = false;
-            return;
-        }
-        ChudcodeDoctorSummary summary;
-        if (!parseChudcodeDoctorSummary(r.result, summary)) return;
-        // An edit transaction of this conversation owns its link (it adopts the rewind branch
-        // at commit); a dry-run of the session being rewound must not stamp the old file back.
-        if (editStageHoldsConversation(convId)) return;
-        applyChudcodeDoctor(chudcodeSessionLinkEnsure(convId), summary);
-#ifdef __EMSCRIPTEN__
-        chudcodeSessionLinkSet(convId, chudcodeSessionLinkEnsure(convId));
-#endif
-        markChatHistoryDirty();   // resume key + health reach disk on the debounced flush
-    }, 30000);
-}
 
 
 // Newest non-archived session stored under `key`, never index `skip`; -1 when there is none.
@@ -2452,7 +2450,7 @@ static void pollChudcodeSessionHealth(AppState& st) {
 static int latestProjectConversation(const AppState& st, const std::string& key, int skip) {
     for (int i = (int)st.conversations.size() - 1; i >= 0; --i) {
         const Conversation& c = st.conversations[i];
-        if (i != skip && !c.archived && convProjectKey(c.projectDir) == key) return i;
+        if (i != skip && !c.archived && convProjectKey(c) == key) return i;
     }
     return -1;
 }
@@ -2467,7 +2465,9 @@ static int latestProjectConversation(const AppState& st, const std::string& key,
 // project in Sessions, or opening one of its sessions explicitly, is not a root change.
 static void followProjectActiveConversation(AppState& st) {
     const std::string dir = convProjectDir(st);
-    const std::string key = convProjectKey(dir);
+    static std::string keySource, cachedKey;
+    if (keySource != dir) { keySource = dir; cachedKey = convProjectKey(dir); }
+    const std::string& key = cachedKey;
     if (s_followReconciled && key == s_followKey) return;
     const bool switched = s_followReconciled;   // false: first observation after a (re)load
     s_followReconciled = true;
@@ -2528,7 +2528,7 @@ void syncChatToDoc(AppState& st) {
     // UI thread, for both active and parked chats, so restart resumes the cell.
     for (const auto& conversation : st.conversations) {
         const auto handle = cellAgentSessionHandle(conversation.id);
-        auto& link = chudcodeSessionLinkEnsure(conversation.id);
+        auto& link = ompSessionLinkEnsure(conversation.id);
         if (!handle.empty() && handle != link.sessionId) {
             link.sessionId = handle;
             link.sessionFile.clear();
@@ -2536,7 +2536,6 @@ void syncChatToDoc(AppState& st) {
         }
     }
 #endif
-    pollChudcodeSessionHealth(st);
 }
 
 static void clearComposerState(AppState& st) {
@@ -2567,14 +2566,24 @@ static bool conversationIsFresh(const AppState& st, int idx) {
     return msgs.empty() && queued.empty() && !st.convRunning(c.id) && !s_userTitled.count(c.id);
 }
 
+static void clearConversationViewState(AppState& st) {
+    st.status = "Ready.";
+    st.statusKind = 0;
+    st.livePhase.clear();
+    st.agentV2Status.clear();
+}
+
 // Drop the ACTIVE conversation when it is still fresh (see above), fixing up activeConv.
 // Returns true when it erased — callers then skip parking (there was nothing to park).
 static bool discardActiveConversationIfFresh(AppState& st) {
     if (!conversationIsFresh(st, st.activeConv)) return false;
     st.chat.clear();
     st.lastContextTokens = 0;
+    st.lastContextWindow = 0;
+    st.lastContextWindowSource.clear();
     st.queuedPrompts.clear();
     st.queuedPromptDrafts.clear();
+    clearConversationViewState(st);
     st.conversations.erase(st.conversations.begin() + st.activeConv);
     st.activeConv = -1;  // callers set the new active index right after
     return true;
@@ -2582,21 +2591,26 @@ static bool discardActiveConversationIfFresh(AppState& st) {
 
 void parkActiveConversation(AppState& st) {
     if (st.activeConv < 0 || st.activeConv >= (int)st.conversations.size()) return;
-    // A merely staged edit dies with the view (its composer text restored while this is still
-    // the viewed conversation, so the draft saved below is the pre-edit one); an in-flight or
-    // committed edit transaction continues for ITS conversation by id.
-    editStageBeforeConversationPark(st);
     // Keep in-progress prompt + chips for this session on disk before parking.
     savePromptDraft(st, /*force=*/true);
     Conversation& c = st.conversations[st.activeConv];
     c.msgs = std::move(st.chat);
     c.lastContextTokens = st.lastContextTokens;
+    c.lastContextWindow = st.lastContextWindow;
+    c.lastContextWindowSource = std::move(st.lastContextWindowSource);
+    c.viewStatus = std::move(st.status);
+    c.viewStatusKind = st.statusKind;
+    c.viewLivePhase = std::move(st.livePhase);
+    c.viewAgentV2Status = std::move(st.agentV2Status);
     c.queuedPrompts = std::move(st.queuedPrompts);
     c.queuedPromptDrafts = std::move(st.queuedPromptDrafts);
     st.chat.clear();
     st.lastContextTokens = 0;
+    st.lastContextWindow = 0;
+    st.lastContextWindowSource.clear();
     st.queuedPrompts.clear();
     st.queuedPromptDrafts.clear();
+    clearConversationViewState(st);
 }
 
 static void restoreActiveConversation(AppState& st) {
@@ -2604,6 +2618,12 @@ static void restoreActiveConversation(AppState& st) {
     Conversation& c = st.conversations[st.activeConv];
     st.chat = std::move(c.msgs);
     st.lastContextTokens = c.lastContextTokens;
+    st.lastContextWindow = c.lastContextWindow;
+    st.lastContextWindowSource = std::move(c.lastContextWindowSource);
+    st.status = std::move(c.viewStatus);
+    st.statusKind = c.viewStatusKind;
+    st.livePhase = std::move(c.viewLivePhase);
+    st.agentV2Status = std::move(c.viewAgentV2Status);
     st.queuedPrompts = std::move(c.queuedPrompts);
     st.queuedPromptDrafts = std::move(c.queuedPromptDrafts);
     c.msgs.clear();
@@ -2616,17 +2636,37 @@ static void restoreActiveConversation(AppState& st) {
 
 // True if the CURRENTLY VIEWED conversation's own turn is active — resolved from its JobState
 // (st.runs) for job-based runs, plus a fallback scan of st.chat's own trailing message for
-// one-shot RPC turns (agent_ask_v2 / agent_simulate_v1) that never touch a JobState at all.
+// one-shot RPC turns (agent_simulate_v1) that never touch a JobState at all.
 // Never an ambient scan of an unrelated conversation, so a background run never makes the
 // viewed (idle) conversation look busy.
 bool activeConversationRunning(AppState& st) {
     if (st.activeConv < 0 || st.activeConv >= (int)st.conversations.size()) return false;
     if (st.convRunning(st.conversations[st.activeConv].id)) return true;
-    if (!st.chat.empty()) {
-        const ChatMsg& b = st.chat.back();
+    // Pending steers trail the live turn without being part of it.
+    if (const size_t tail = pendingSteerTail(st.chat); tail > 0) {
+        const ChatMsg& b = st.chat[tail - 1];
         if (!b.fromUser && b.running) return true;
     }
     return false;
+}
+
+static void refreshCompactionStatusForConversation(AppState& st) {
+    const auto* run = st.runIfExists(st.activeConvId());
+    if (run && run->isCompaction && (run->running.load() || run->ready.load())) {
+        const bool stopping = run->stopRequested.load();
+        st.status = stopping ? "Stopping compaction..." : "Compacting context...";
+        st.livePhase = stopping ? "Stopping compaction\xe2\x80\xa6" : "Compacting context\xe2\x80\xa6";
+        st.statusKind = stopping ? 1 : 0;
+    } else {
+        // A parked maintenance request may have settled while this chat was hidden.
+        if (st.status == "Compacting context..." || st.status == "Stopping compaction...") {
+            st.status = "Ready.";
+            st.statusKind = 0;
+        }
+        if (st.livePhase == "Compacting context\xe2\x80\xa6" ||
+            st.livePhase == "Stopping compaction\xe2\x80\xa6")
+            st.livePhase.clear();
+    }
 }
 
 void newConversation(AppState& st) {
@@ -2653,6 +2693,7 @@ void newConversation(AppState& st) {
     st.showSessionsPicker = false;
     clearComposerState(st);
     clearPromptDraft(st);  // new empty session has no draft
+    refreshCompactionStatusForConversation(st);
     // No persist: a fresh session carries no state worth writing. It reaches disk with the
     // first real message via the dirty-flag path (maybePersistChatHistoryDebounced).
 }
@@ -2667,6 +2708,7 @@ void switchConversation(AppState& st, int idx) {
         --idx;  // erase shifted the target down
     st.activeConv = idx;
     restoreActiveConversation(st);  // restores chat + draft for target
+    refreshCompactionStatusForConversation(st);
     // The incoming log is a different document: without this the outgoing conversation's
     // scrolled-up state (and its stale scroll offset) carries over and new streaming replies
     // silently never scroll into view.
@@ -2684,8 +2726,11 @@ void closeConversation(AppState& st, int idx) {
         savePromptDraft(st, /*force=*/true);
         st.chat.clear();
         st.lastContextTokens = 0;
+        st.lastContextWindow = 0;
+        st.lastContextWindowSource.clear();
         st.queuedPrompts.clear();
         st.queuedPromptDrafts.clear();
+        clearConversationViewState(st);
         clearComposerState(st);
     }
     // Drop draft key for the closed conversation.
@@ -2704,7 +2749,7 @@ void closeConversation(AppState& st, int idx) {
                 removed = true;
             } else ++it;
         }
-        if (removed) persistPromptDrafts(st, true);
+        if (removed) persistPromptDrafts(st);
 #else
         try {
             namespace fs = std::filesystem;
@@ -2726,17 +2771,17 @@ void closeConversation(AppState& st, int idx) {
         }
 #endif
     }
-    // Hard delete disposes the Chudcode runtime too (idempotent, best-effort) and drops the
+    // Hard delete disposes the Omp runtime too (idempotent, best-effort) and drops the
     // link — unlike archive and unlike "Close runtime", which both keep it. The persisted
-    // Chudcode session file is the service's own store; deleting a Chudware conversation
+    // Omp session file is the service's own store; deleting a Chudware conversation
     // never reaches into it.
     {
         const std::string closedId = st.conversations[idx].id;
-        const ChudcodeSessionLink* link = chudcodeSessionLink(closedId);
-        if (link && link->runtimeLive && chudcodeSessionServiceAvailable())
-            st.rpc.call(kChudcodeCloseSessionMethod, chudcodeCloseSessionParams(closedId),
+        const OmpSessionLink* link = ompSessionLink(closedId);
+        if (link && link->runtimeLive && ompSessionServiceAvailable())
+            st.rpc.call(kOmpCloseSessionMethod, ompCloseSessionParams(closedId),
                         [](const core::RpcResult&) {}, 15000);
-        chudcodeSessionLinkErase(closedId);
+        ompSessionLinkErase(closedId);
     }
     st.conversations.erase(st.conversations.begin() + idx);
     if (!closingActive) {
@@ -2756,6 +2801,7 @@ void closeConversation(AppState& st, int idx) {
         st.activeConv = target;
     }
     restoreActiveConversation(st);
+    refreshCompactionStatusForConversation(st);
     persistChatHistory(st);
 }
 

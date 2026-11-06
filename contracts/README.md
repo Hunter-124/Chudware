@@ -14,6 +14,21 @@ contract itself. A new module ships its contract in the same change that introdu
 Machine-readable files (`*.json`) are checked by the audits and tests that consume them, so
 update the producer, the consumers, and the contract together.
 
+Document ops v2.1, worker RPC contract revision 2.1, and event contract v2.1
+append the document persistence amendments. The worker wire protocol major remains
+2; a contract revision is not itself a handshake protocol-major bump. Earlier
+frozen text remains historical where an amendment explicitly supersedes it.
+
+ECAD contract revision v2 supersedes conflicting v1 persistence, KiCad import, library
+lookup and fabrication-output declarations: KiCad files are the document of record and
+KiCad runs out of process. The in-memory `aicad.sch/1` and `aicad.pcb/1` identifiers
+and worker protocol major remain unchanged. Web parity revision 2 and worker RPC
+contract revision 2.2 record the corresponding routing and desktop-launch boundary.
+Board physics contract revision 2 documents the KiCad STEP sidecar's unknown
+geometry fields and retained `aicad.boardphys/1` identifier.
+PLM contract revision 3 documents KiCad file tracking and ECAD diff sections;
+the manifest's `aicad.plm/1` schema identifier remains unchanged.
+
 Schema ids keep the historical `aicad.` prefix for data compatibility.
 
 ## Current seams
@@ -24,20 +39,18 @@ Schema ids keep the historical `aicad.` prefix for data compatibility.
   (`worker_client`, `engine_backend`, `cpp_core`) and `services/ipc/`.
 - **Python services** (`services/**`) serve the remaining registered method families. hostd
   forwards engine-unknown methods to the Python worker `services/worker_main.py`
-  (`core/hostd/worker_bridge.cpp`; see `web_parity.md`), split into agent and general lanes as
-  `worker_rpc.md` specifies.
+  (`core/hostd/worker_bridge.cpp`; see `web_parity.md`), split into agent, service and general
+  lanes as `worker_rpc.md` specifies.
 - **No Python engine.** The former Python `engine/` oracle and `engine_oracle/` packages no
   longer exist; producer paths under `engine/…` or `engine_oracle/…` in older contract prose
   are historical, and the implementations now live in `core/` and `services/`.
-- **Online agent runtime:** `agent_admin_turn` (`worker_rpc.md`) runs in
-  `services/agent/worker_rpc.py`, which drives the [Chudcode](https://github.com/Hunter-124/chudcode)
-  runtime through its RPC protocol (`services/agent/chudcode_host.py`, binary pinned by
-  `vendor/chudcode/CHUDCODE_ARTIFACT.lock`, license row in `licenses.md`). The Chudcode
-  protocol is external and is not a contract in this directory; online provider execution,
-  sessions, memory, compaction, and speech-to-text belong to that runtime. References to the
-  former bun OMP bridge (`vendor/omp/…`) in older contract prose are superseded. Native C++
-  providers (`providers.md`) remain for the explicit offline fallback. Boundary notes:
-  [docs/dev/chudcode-integration.md](../docs/dev/chudcode-integration.md).
+- **Online agent runtime:** `agent_admin_turn` (`worker_rpc.md`) uses the official
+  [Oh My Pi](https://github.com/can1357/oh-my-pi) runtime through `omp_rpc` and
+  `services/agent/omp_host.py`, pinned by `vendor/omp/OMP_ARTIFACT.lock`. The
+  external protocol is not a contract in this directory; OMP owns online provider
+  execution, sessions, memory and compaction. Native C++ providers (`providers.md`)
+  remain for the explicit offline fallback. Boundary notes:
+  [docs/dev/omp-integration.md](../docs/dev/omp-integration.md).
 - **UI:** the sole GUI is `host/` (desktop and WASM, see `web_parity.md`).
 
 ## Inventory
@@ -47,11 +60,16 @@ Core document, wire, and event seams:
 - `worker_rpc.md` — flat C ABI / worker RPC wire format and method catalogue.
 - `doc_ops.md` — document op vocabulary, envelope, transactionality, errors.
 - `doc_schema.md` — document tree schema (entities, handles, constraints).
+- `model_history.md` — advisory history rules, reference-safe cleanup eligibility and atomic simplification.
 - `selectors.md` — selector normative algorithm (weights, thresholds, tiebreak).
 - `mesh_format.md` — AICM v1 mesh byte-level format.
-- `stepplus.md` — STEP+ persistence format (required entries, load order, save).
+- `shape_build_worker.md` — private POSIX fillet exec boundary, named validation policies,
+  verified helper discovery, descriptor transport, deadlines and native bundle requirements.
+- `stepplus.md` — STEP+ persistence format (required entries, load order, save);
+  latest amendment: [§25, real Thread cache epoch](stepplus.md#25-real-thread-geometry-cache-epoch).
 - `events.md` — async event payloads (`sim_progress`, etc.).
-- `feature_params.md` — per-feature-type param/field tables (property-panel form order).
+- `feature_params.md` — per-feature-type param/field tables (property-panel form order);
+  latest amendment: [v4, real Thread acceptance](feature_params.md#real-thread-acceptance-v4-append-only).
 - `sketch3d_gui_contract.md` — 3D sketch (`sketch3d`) GUI/RPC surface, v1.
 - `web_parity.md` — web/desktop parity split (`aicad.webparity/1`): which methods hostd serves
   from `libchudware` versus the Python worker fallback.
@@ -62,7 +80,7 @@ Core document, wire, and event seams:
 Agent layer:
 
 - `advisor.md` — advisory layer: design ledger (`aicad.ledger/1`), roles, triggers,
-  councils, tiers, effort presets, cognition ladder (`aicad.ladder/1`).
+  tiers, effort presets, cognition ladder (`aicad.ladder/1`).
 - `design_pipeline.md` — guided design-thinking pipeline (`aicad.designpipe/1`): the
   six-stage IO schemas (`feature`/`geometry_spec`/`linkage`/`build_node`), the ledger event
   kinds it adds to `aicad.ledger/1`, the stage-gate definitions, the effort/auto-mode hooks,
@@ -71,8 +89,7 @@ Agent layer:
 - `agent_events.md` + `agent_events.json` — agent event kinds (`aicad.agent_events/2`); the JSON
   is the machine-readable kind list checked by `scripts/agent_events_audit.py`.
 - `copilot_modes.md` + `copilot_modes.json` — copilot mode tool gating
-  (`aicad.copilot_modes/1`); the JSON is read by `services/agent/copilot_mode_tools.py` and
-  `core/agent/copilot_modes.cpp`.
+  (`aicad.copilot_modes/1`); the JSON is read by `services/agent/copilot_mode_tools.py`.
 - `interaction.md` — `ask_user` question/answer envelope (`aicad.interaction/1`).
 - `providers.md` — provider and session layer, v1.
 - `skills.md` — copilot skills, v1.
@@ -86,6 +103,8 @@ Agent layer:
 
 Domain seams:
 
+- `harness.md` — document-persisted wiring harness study (`aicad.harness/1`), routing,
+  electrical tools and source limitations.
 - `reveng.md` — Reverse Engineering workspace (`aicad.reveng_session/1`, MCP tools, DAG
   templates).
 - `sim_handoff.md` — cross-sim handoff and verify envelopes (`aicad.simhandoff/1`): study

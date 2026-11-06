@@ -182,7 +182,7 @@ class TestClassAAdvertisedToolsBind:
         "ledger_get", "ledger_note", "ask_user", "dag_plan", "dag_status",
         "buildgraph_plan", "buildgraph_status", "describe_project",
         "describe_part", "part_search", "part_place", "fit_calc",
-        "council_convene", "dag_replan",
+        "dag_replan",
     ])
     def test_advertised_tool_binds_outside_a_mission(self, name):
         assert at._bind_tool(name) is not None, (

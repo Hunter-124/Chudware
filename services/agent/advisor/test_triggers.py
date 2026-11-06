@@ -196,6 +196,14 @@ def test_tool_name_trigger_fires_only_relevant_pack():
     assert "part_sourcing" in trigger_ids, trigger_ids
     assert "bearing_seat" not in trigger_ids, trigger_ids
 
+def test_stress_tools_trigger_stress_context():
+    for name in ("run_fea_static", "find_stress_risers"):
+        items, events = triggers.match_triggers(
+            output_text="", tool_names=[name], cooldown_state=_fresh_state(),
+        )
+        assert any(event["trigger_id"] == "stress_concentration" for event in events)
+        assert items
+
 
 # ---------------------------------------------------------------------------
 # 6. Event trigger fires

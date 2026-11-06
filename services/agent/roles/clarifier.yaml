@@ -2,7 +2,6 @@ schema: aicad.role/1
 id: clarifier
 goal: Resolve blocking ambiguities and unconfirmed assumptions with ONE batch of at most four typed, defaulted questions.
 stage_scope: [intake, spec]
-playbook_default: null
 tool_allowlist:
   - tool: ask_user
   - tool: ledger_get

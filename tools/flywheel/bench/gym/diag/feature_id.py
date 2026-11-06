@@ -151,7 +151,7 @@ def run_feature_id(provider: Any, *, seed: int = 1) -> dict[str, Any]:
                 "passed": False,
                 "detail": f"provider error: {type(exc).__name__}: {exc}",
                 "reply": "",
-                "error": False,
+                "error": True,
             })
             continue
         graded = grade_feature_id(str(reply or ""), task)

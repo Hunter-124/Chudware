@@ -187,7 +187,7 @@ void SimManager::restoreModelMesh(AppState &st) {
     if (st.bindCachedDocMesh(*session, err))
       return;
   }
-  st.rpc.call("doc_activate", {{"doc_id", docId}},
+  st.rpc.call("doc_activate", {{"doc_id", docId}, {"origin", "system"}},
               [this, &st, docId, revision, generation](const core::RpcResult &r) {
     if (generation != modelRestoreGeneration_ || !simOriginActive(st, this, docId) ||
         st.docMirror.revision() != revision || resultShown_)
@@ -197,11 +197,8 @@ void SimManager::restoreModelMesh(AppState &st) {
                 simJsonText(r.result, "message", "error", r.err));
       return;
     }
-    const bool previous = st.suppressTabDirty;
-    st.suppressTabDirty = true;
     std::string aicm, err;
     const bool adopted = st.docMirror.adoptActivateResponse(docId, r.result, aicm, err);
-    st.suppressTabDirty = previous;
     if (adopted && !aicm.empty())
       st.loadDocMeshAsync(aicm);
     else

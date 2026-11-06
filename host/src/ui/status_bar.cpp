@@ -10,6 +10,7 @@
 #include "metrics.h"
 #include "model_registry.h"
 #include "status_bar.h"
+#include "anim.h"
 #include "copilot/copilot.h"  // bridgeModelMetaForCad — the model's display name
 
 #include "../core/app_state.h"
@@ -74,15 +75,20 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
               : ImVec4(pal.statusOk[0], pal.statusOk[1], pal.statusOk[2], 1);
     ImVec2 dp0 = ImGui::GetCursorScreenPos();
     float dr = ImGui::GetFontSize() * 0.24f;
-    if (busy)  // pulse while a job runs
+    if (busy) {  // pulse while a job runs
+        anim::requestFramesAt(30.0f);
         sc.w = 0.45f + 0.55f * (0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 5.0f));
+    }
     ImGui::GetWindowDrawList()->AddCircleFilled(
         ImVec2(dp0.x + dr + 1, dp0.y + ImGui::GetTextLineHeight() * 0.55f), dr,
         ImGui::ColorConvertFloat4ToU32(sc));
     sc.w = 1.0f;
     ImGui::Dummy(ImVec2(dr * 2 + ui::metrics::px(8), 0));
     ImGui::SameLine();
-    ImGui::TextColored(sc, "%s", st.status.c_str());
+    const std::string statusText = sbEllipsize(st.status, std::max(1.0f, vp->Size.x * 0.30f));
+    ImGui::TextColored(sc, "%s", statusText.c_str());
+    if (statusText != st.status && ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", st.status.c_str());
     // [workspace-tabs seam] Active workspace context right after the app state — the title-bar
     // tabs write st.activeWorkspace; this keeps the bottom-left readout in sync with them.
     {
@@ -93,112 +99,40 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
                                "|  %s", kWsName[wsIdx]);
         }
     }
-    // ---- LEFT loading / rebuild chip (ITEM 15) ----------------------------------------------
-    // Mirrors the simulation-progress glass pill (spinner + stage + detail). Sits LEFT of the
-    // PLM quick chip so it is never trapped under the left-pane PLM / Explorer / Feature Manager
-    // rail (the old viewport "Rebuilding..." HUD was). Covers startup/warmup and rebuild/solve.
-    {
-        std::string chip;
-        bool isStartup = false;
-        if (st.setupRunning.load() || st.workerBootPending || !st.startupPhase.empty()) {
-            isStartup = true;
-            if (st.setupRunning.load())
-                chip = "Setup  Provisioning runtime\xe2\x80\xa6";
-            else if (!st.startupPhase.empty())
-                chip = "Startup  " + st.startupPhase;
-            else
-                chip = "Startup  Starting engine\xe2\x80\xa6";
-        } else if (st.rebuildsInFlight > 0) {
-            // Prefer an explicit livePhase that names rebuild work; else derive progress from
-            // feature_status / tree feature count / ops-in-flight. Gated on rebuildsInFlight
-            // (same signal as the old viewport HUD) so agent/sim RPCs do not false-trigger it.
-            chip = "Rebuild  ";
-            bool named = false;
-            if (!st.livePhase.empty()) {
-                const std::string& lp = st.livePhase;
-                if (lp.rfind("Refresh", 0) == 0 || lp.rfind("Rebuilding", 0) == 0 ||
-                    lp.rfind("Solving", 0) == 0 || lp.find("rebuild") != std::string::npos ||
-                    lp.find("model") != std::string::npos) {
-                    chip += lp;
-                    named = true;
-                }
-            }
-            if (!named) {
-                int done = 0, total = 0;
-                const auto& fs = st.docMirror.featureStatus();
-                if (fs.is_array()) {
-                    total = (int)fs.size();
-                    for (const auto& e : fs) {
-                        if (!e.is_object()) continue;
-                        if (e.value("ok", true) &&
-                            (!e.contains("error") || e["error"].is_null() ||
-                             (e["error"].is_string() && e["error"].get<std::string>().empty())))
-                            ++done;
-                    }
-                }
-                if (total <= 0) {
-                    const auto& tr = st.docMirror.tree();
-                    if (tr.is_object() && tr.contains("features") && tr["features"].is_array())
-                        total = (int)tr["features"].size();
-                }
-                if (total > 0) {
-                    // During a live rebuild, feature_status may still reflect the prior compile.
-                    // Prefer ops-in-flight as the primary signal; use feature count as context.
-                    if (done >= total) {
-                        chip += "Rebuilding feature " + std::to_string(total) + "/" +
-                                std::to_string(total);
-                        if (st.rebuildsInFlight > 1)
-                            chip += "  (" + std::to_string(st.rebuildsInFlight) + " ops)";
-                        else
-                            chip += "\xe2\x80\xa6";
-                    } else {
-                        const int cur = (done + 1 < total) ? (done + 1) : total;
-                        chip += "Rebuilding feature " + std::to_string(cur) + "/" +
-                                std::to_string(total);
-                        if (st.rebuildsInFlight > 1)
-                            chip += "  (" + std::to_string(st.rebuildsInFlight) + " ops)";
-                    }
-                } else if (st.rebuildsInFlight > 1) {
-                    chip += "Rebuilding (" + std::to_string(st.rebuildsInFlight) +
-                            " ops)\xe2\x80\xa6";
-                } else {
-                    chip += "Rebuilding\xe2\x80\xa6";
-                }
-            }
+    // Opening already has its own elapsed-time status. Do not describe the same
+    // in-flight operation as a rebuild, or infer progress from the previous build.
+    const bool opening = st.status.rfind("Opening ", 0) == 0 ||
+                         st.status.rfind("Loading mesh for ", 0) == 0;
+    std::string work;
+    bool workIsStartup = false;
+    bool workUsesLivePhase = false;
+    if (st.setupRunning.load() || st.workerBootPending || !st.startupPhase.empty()) {
+        workIsStartup = true;
+        if (st.setupRunning.load()) work = "Provisioning runtime\xe2\x80\xa6";
+        else if (!st.startupPhase.empty()) work = st.startupPhase;
+        else work = "Starting engine\xe2\x80\xa6";
+    } else if (st.rebuildsInFlight > 0 && !opening) {
+        const std::string& lp = st.livePhase;
+        if (lp.rfind("Refresh", 0) == 0 || lp.rfind("Rebuilding", 0) == 0 ||
+            lp.rfind("Solving", 0) == 0 || lp.find("rebuild") != std::string::npos ||
+            lp.find("model") != std::string::npos) {
+            work = lp;
+            workUsesLivePhase = true;
+        } else {
+            work = "Rebuilding\xe2\x80\xa6";
+            if (st.rebuildsInFlight > 1)
+                work += " (" + std::to_string(st.rebuildsInFlight) + " operations)";
         }
-        if (!chip.empty()) {
-            ImGui::SameLine();
-            // The mark occupies its own square ahead of the text, so the pill has to pay for
-            // that width itself: the measured string no longer carries a spinner glyph.
-            const float box = ImGui::GetTextLineHeight();
-            const float gap = ImGui::GetStyle().ItemInnerSpacing.x;
-            ImVec2 tsz = ImGui::CalcTextSize(chip.c_str());
-            ImVec2 cp  = ImGui::GetCursorScreenPos();
-            const float px = 10.0f * dpiS, py = 2.5f * dpiS;
-            ui::glassBackground(ImGui::GetWindowDrawList(),
-                                ImVec2(cp.x - px * 0.5f, cp.y - py),
-                                ImVec2(cp.x + box + gap + tsz.x + px, cp.y + tsz.y + py),
-                                (tsz.y + py * 2.0f) * 0.5f / dpiS);
-            float pulse = 0.80f + 0.20f * std::sin(static_cast<float>(ImGui::GetTime()) * 3.0f);
-            const float* role = isStartup ? pal.statusWarn : pal.statusOk;
-            // One tint for mark and text so both breathe on the same beat; grouped so the hover
-            // target still spans the whole pill instead of only the text half of it.
-            ImGui::BeginGroup();
-            ui::busyLabel(chip.c_str(),
-                          ImGui::ColorConvertFloat4ToU32(
-                              ImVec4(role[0], role[1], role[2], pulse)));
-            ImGui::EndGroup();
-            if (ImGui::IsItemHovered()) {
-                if (isStartup)
-                    ImGui::SetTooltip(
-                        "Engine startup / warmup progress.\n"
-                        "The window is interactive; modeling tools unlock when Ready.");
-                else
-                    ImGui::SetTooltip(
-                        "Model rebuild / solve in flight.\n"
-                        "Viewport mesh may lag until this completes.");
-            }
-        }
+    }
+    if (!work.empty()) {
+        ImGui::SameLine();
+        const float* role = workIsStartup ? pal.statusWarn : pal.consoleDim;
+        const std::string shown = sbEllipsize(work, std::max(1.0f, vp->Size.x * 0.25f));
+        ImGui::TextColored(ImVec4(role[0], role[1], role[2], 1), "|  %s", shown.c_str());
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s\n%s", work.c_str(),
+                workIsStartup ? "Modeling tools unlock when the engine is ready."
+                              : "The viewport may lag until the operation completes.");
     }
     // Embedded PLM control: current item's revision/lifecycle + a checkpoint/release popover,
     // reachable from every workspace (no-op in the PLM workspace and without a project).
@@ -274,8 +208,6 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
             label = "Update available \xe2\x80\x94 " + update.version;
         else if (update.state == chudware::update::State::Staged)
             label = "Restart to update \xe2\x80\x94 " + update.version;
-        else if (update.state == chudware::update::State::Mandatory)
-            label = "Update required \xe2\x80\x94 " + update.version;
         else if (update.state == chudware::update::State::Downloading)
             label = "Downloading update \xe2\x80\x94 " + update.version;
         if (!label.empty()) {
@@ -297,7 +229,7 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
         }
     }
 #endif
-    if (busy && !st.livePhase.empty()) {
+    if (busy && !st.livePhase.empty() && !workUsesLivePhase) {
         ImGui::SameLine();
         // Live-phase progress chip on a frosted-glass pill so the running-job readout matches the
         // app-wide glass family (the dim text stays legible on glassBg in both themes).
@@ -321,7 +253,7 @@ void drawStatusBar(AppState& st, ImGuiViewport* vp, float statusH, bool busy,
     // stays quiet while it shows). Uses the same glass-background pill as the agent livePhase
     // chip above so the two styles are consistent. The text pulses slightly so it is obviously
     // alive even when stage is stuck on "Solving" for a long static analysis.
-    const bool simForce = std::getenv("CHUDWARE_SIMPROG") != nullptr;  // headless smoke: force the chip
+    static const bool simForce = std::getenv("CHUDWARE_SIMPROG") != nullptr;  // headless smoke: force the chip
     const bool simChip = (st.simClient && st.simClient->busy()) || simForce;
     if (simChip) {
         const bool live = st.simClient && st.simClient->busy();

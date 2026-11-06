@@ -67,20 +67,32 @@ def test_plm_open_zero_config(tmp_path, tools):
     assert res["project_id"].startswith("p")
     assert len(res["manifest"]["items"]) == 1
 
-def test_plm_checkpoint_defaults_to_resolved_project_root(tmp_path, tools, monkeypatch):
-    project = tmp_path / "project"
-    nested = project / "designs"
-    (project / ".chudware").mkdir(parents=True)
-    nested.mkdir()
-    (nested / "Bracket.step+").write_bytes(_container(_part()))
-    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(nested))
-    monkeypatch.delenv("CHUDWARE_FS_ROOT", raising=False)
+def test_plm_checkpoint_uses_request_workspace_without_widening(
+        tmp_path, tools, monkeypatch):
+    from services.agent.request_context import bind_roots
 
-    checkpoint = _j(tools["plm_checkpoint"](message="resolved checkpoint"))
-
-    assert checkpoint["ok"] is True
-    history = _j(tools["plm_history"](str(project)))
-    assert any(e["message"] == "resolved checkpoint" for e in history["entries"])
+    parent = tmp_path / "parent"
+    selected = parent / "selected"
+    other = tmp_path / "other"
+    process = tmp_path / "process"
+    (parent / ".chudware").mkdir(parents=True)
+    for folder in (selected, other, process):
+        folder.mkdir()
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(process))
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(process))
+    for folder, message in ((selected, "selected checkpoint"),
+                            (other, "other checkpoint")):
+        (folder / "Bracket.step+").write_bytes(_container(_part()))
+        with bind_roots(str(folder)):
+            checkpoint = _j(tools["plm_checkpoint"](message=message))
+        assert checkpoint["ok"], checkpoint
+        history = _j(tools["plm_history"](str(folder)))
+        assert any(e["message"] == message for e in history["entries"])
+        assert not any(e["message"] == (
+            "other checkpoint" if folder == selected else "selected checkpoint")
+            for e in history["entries"])
+    assert not (parent / ".aicadvault").exists()
+    assert not (process / ".aicadvault").exists()
 
 
 def test_plm_checkpoint_explicit_path_wins(tmp_path, tools, monkeypatch):
@@ -100,17 +112,51 @@ def test_plm_checkpoint_explicit_path_wins(tmp_path, tools, monkeypatch):
     assert any(e["message"] == "explicit checkpoint" for e in history["entries"])
 
 
-def test_plm_checkpoint_unresolved_root_names_resolution_mechanism(
-        tools, monkeypatch):
+def test_plm_checkpoint_without_workspace_does_not_use_cwd(
+        tmp_path, tools, monkeypatch):
     monkeypatch.delenv("CHUDWARE_PROJECT_DIR", raising=False)
     monkeypatch.delenv("CHUDWARE_FS_ROOT", raising=False)
+    monkeypatch.chdir(tmp_path)
 
     result = _j(tools["plm_checkpoint"]())
 
     assert result["ok"] is False
     assert result["reason"] == "project_root_unavailable"
-    assert "CHUDWARE_PROJECT_DIR" in result["hint"]
-    assert "project_context.resolve_project_root()" in result["hint"]
+    assert not (tmp_path / ".aicadvault").exists()
+
+
+def test_plm_relative_path_uses_workspace_not_cwd(tmp_path, tools, monkeypatch):
+    from services.agent.request_context import bind_roots
+
+    project = tmp_path / "project"
+    destination = project / "subproject"
+    worker = tmp_path / "worker"
+    destination.mkdir(parents=True)
+    worker.mkdir()
+    (destination / "Bracket.step+").write_bytes(_container(_part()))
+    monkeypatch.chdir(worker)
+
+    with bind_roots(str(project)):
+        result = _j(tools["plm_checkpoint"](
+            path="subproject", message="relative checkpoint"))
+
+    assert result["ok"], result
+    history = _j(tools["plm_history"](str(destination)))
+    assert any(e["message"] == "relative checkpoint" for e in history["entries"])
+    assert not (worker / "subproject").exists()
+
+
+def test_plm_invalid_workspace_does_not_fall_back(tmp_path, tools, monkeypatch):
+    from services.agent.request_context import bind_roots
+
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(tmp_path))
+    with bind_roots(str(tmp_path / "missing")):
+        result = _j(tools["plm_checkpoint"](message="must not be saved"))
+
+    assert result["ok"] is False
+    assert result["reason"] == "project_root_unavailable"
+    assert not (tmp_path / ".aicadvault").exists()
 
 
 def test_vault_backed_plm_family_exposes_optional_project_path():

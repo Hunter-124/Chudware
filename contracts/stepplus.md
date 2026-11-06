@@ -325,3 +325,192 @@ segments), expands composite rectangles/polygons/polylines with their relations,
 extended 2D relation set (junction tangency, normalized collinear/parallel residuals, no
 wrong-type residuals). Converted entities and solved sketch coordinates of older caches can
 differ, so they are a cache miss (`engine_key`) and rebuild through §17's write-back.
+
+## 21. Live assembly dependency freshness (additive)
+
+Recursive source fingerprints also govern an open assembly's exact geometry and
+saved-display replay, not only its initial open. A changed or missing saved
+descendant invalidates the retained assembly result even when the parent revision
+and intermediate assembly files are unchanged. Interference, measurements,
+tessellation, picking and tab activation refresh before consuming that result;
+unavailable source geometry remains an explicit failed/incomplete result.
+
+An unchanged dependency set reuses the result without re-solving mates. A save
+refreshes dependencies before capturing solved poses and regenerated build state.
+Unsaved edits in a separate source document do not change a file-backed assembly:
+the source must first be saved. Container entries, cache epochs, fingerprint
+identity and the authenticated-cache rules are unchanged.
+
+## 22. Rollback-prefix geometry cache epoch (2026-10-29)
+
+The current semantic key is `chudware-geomcache/18` plus the OCCT version. Epoch 18
+compiles only the prefix through `rollback_after`; older snapshots could hold the
+full history's geometry despite that marker. Older caches miss on `engine_key` and
+rebuild through §17's write-back, rather than reopening the wrong geometry.
+
+The full compile-result key also includes an active rollback marker, and prefix
+checkpoint reuse stops at that marker. `cache.ckpt` status records append an optional
+eighth boolean, `rolled_back`; readers treat its absence as false. Warm display/BREP
+hydration preserves this flag and does not count the uncompiled suffix as reused
+features. Clearing the bar restores full compilation; a valid saved prefix remains
+eligible for warm open.
+
+## 23. All-edge fillet geometry cache epoch (append-only)
+
+The native geometry key is `chudware-geomcache/20` plus the OCCT version;
+the container remains `aicad.step+/1`. Epoch 19 addressed cached nested-assembly
+placement. Epoch 20 additionally requires a verified fillet on every selected
+edge and records effective dimensions: older caches can contain a dropped-edge
+or no-op blend and cannot represent the current result. Caches with an older
+engine key are misses (`engine_key`), including display, B-rep and incremental
+build state; they must not be relabeled as epoch 20.
+
+A cold rebuild may correct literal dimensions or derive an expression-driven
+effective record in the live part tree. Cache-only build-state write-back
+preserves the original compressed `document.json` and unrelated authored
+entries under §17, and keys the cache to that source document. Its response
+contains the successful fillet status and built tree. On a matching warm reopen
+the engine restores only the compiler-authorized fillet corrections from the
+cached result into the source tree before matching checkpoints, rather than
+replacing the source with an arbitrary cached tree. The resulting tree,
+statuses, mesh, B-rep and checkpoint inputs describe the same build. The
+`feature.data.fillet_effective` record is derived and excluded from the
+feature compile-input chain; it is never used as a radius input.
+
+An explicit save writes the current tree to `document.json` and keys its cache
+to that saved tree. Eligible matching epoch-20 caches retain the warm-open,
+activation and checkpoint behavior of §9; missing, invalid, over-budget or
+mismatched entries follow the existing miss and rebuild rules. Cache
+provenance and unverified-cache background verification remain subject to §19.
+
+## 24. Failed part rebuilds and recovery
+
+This amendment supersedes the earlier load, persistence, checkpoint, write-back
+and verification rules in §§2, 4, 9, 17 and 19 where they address failed part
+rebuilds. It does not change the container version, cache format or engine epoch.
+
+`rebuild.ok` reports whether the requested part compile completed. For a rejected
+editing transaction its diagnostics describe `rejected_tree`, while `tree` and
+geometry remain the previously committed state. A failed live history retains
+`tree`, revision and feature statuses for diagnosis and repair, reports
+`cache_trust:"unverified"`, and sets `geometry_state:"incomplete"` when no complete
+display is available. Its tessellation, body list, owner map, exact-body queries,
+exports, mass and selector operations must not consume the failed compile's
+intermediate solids. Diagnostic-only direct compiler results can still contain those
+intermediates.
+
+When a complete earlier display is available, the response may instead expose it
+as `geometry_state:"last_good"` with a stale-geometry warning, even if the B-rep
+is unavailable; it is a display snapshot, not current geometry for measurement,
+export or selection. A
+failed background verification leaves the earlier display in this state, reports
+`cache_verification.completed:false` with the failed features, and never certifies
+or writes the failed solve. It restores the original source if unverified cached
+fillet corrections had been materialized. A successful fresh repair returns
+`geometry_state:"current"` and permits normal solved-state persistence.
+
+An automatic write-back requires a complete solved cache header and successful
+feature statuses; a prefix-only or failed result is refused without altering the
+archive. `doc_save` (including nonbinding recovery snapshots) refuses an incomplete
+part with `rebuild_failed` before changing the destination. Before saving an
+unverified warm part, it independently rebuilds the authored history in scratch;
+failure leaves the live tree, revision, dirty state, prior display and existing
+file unchanged. Thus the original `document.json`, `geometry.step`, full caches,
+checkpoints, provenance and unknown entries remain recoverable as originally
+saved, even if the newer solver cannot currently reconstruct the part.
+
+A drawing projection likewise refuses a failed part history instead of projecting
+its tool solids. This rule changes no cache format or engine epoch: successful
+matching caches remain eligible for zero-feature warm reopen.
+Warm-open rebuild counters and timings report current cache reuse, not the saved
+build's earlier execution counts or per-feature elapsed time.
+
+## 25. Real Thread geometry cache epoch
+
+The native geometry semantic key is `chudware-geomcache/21` plus the OCCT version
+([`core/doc/stepplus.cpp`](../core/doc/stepplus.cpp)); the container remains
+`aicad.step+/1`. Epoch 21 applies
+[feature parameters v4](feature_params.md#real-thread-acceptance-v4-append-only):
+a real cut or raised thread succeeds only with sound material-changing geometry
+across the requested run. Previously successful unthreaded fallbacks or shortened
+runs cannot be certified as satisfying that contract.
+
+Older engine keys MUST be treated as cache misses, not relabeled or reused as
+epoch 21: this applies to display, BREP, incremental checkpoints and assembly
+component reuse. Rebuild from the authoritative document under the existing
+failure and recovery rules in §24. Explicit cosmetic threads remain distinct
+from failed real threads; preview proxies are not final geometry.
+
+Eligible matching epoch-21 caches retain the ordinary warm save, open,
+activation and checkpoint behavior of §§9, 17 and 19, including the existing
+validation, provenance and verification rules. This amendment changes the
+geometry semantic epoch, not the container or cache entry formats.
+
+## 26. Embedded mesh references (additive)
+
+The container remains `aicad.step+/1`; this amendment adds authored members and
+does not change compiled geometry, the geometry cache epoch, or the existing
+build-state formats. A part's optional top-level `mesh_references` array contains
+the entities specified by [`worker_rpc.md`](worker_rpc.md#document-mesh-references-append-only).
+They are not features or bodies and do not contribute to `geometry.step`,
+booleans, body counts, mass, BOM, interference, or geometry exports.
+
+Each distinct entity `sha256` names one essential
+`mesh_references/<sha256>.bin` member. The SHA-256 digest is over the canonical
+**uncompressed** bytes: eight ASCII bytes `CHMR0001`, little-endian `uint32`
+vertex and triangle counts, then `3*N` little-endian IEEE-754 binary64 source
+coordinates and `3*M` little-endian `uint32` zero-based triangle indices.
+The member payload is eight ASCII bytes `CHMZ0001`, a little-endian `uint64`
+uncompressed byte length, and those canonical bytes compressed as a zlib
+stream. The ZIP member is STORED (the payload itself is already compressed).
+Identical canonical meshes share one member regardless of name or placement.
+
+The saved transform maps source coordinates to millimetres. `source_path` is
+retained for provenance and refresh, not used to restore the embedded mesh:
+source deletion or relocation MUST NOT force a re-import, solve or rebuild.
+An explicit save validates the embedded payloads, writes each referenced member
+once, and refuses rather than publishing a file with missing or corrupt data or
+required members exceeding archive admission limits. The reader bounds expansion
+and checks the digest before serving a mesh; a missing or invalid member is an
+error, not a fallback to the source. Unrelated forward-compatible members and
+cache-only build-state write-backs retain the preservation rules above.
+
+The 64 MiB per-blob and 192 MiB session-history limits, pagination, transforms,
+transactions and entity fields are specified in the worker RPC amendment.
+Payloads no longer referenced by the saved tree are omitted from that save while
+remaining available to the open session's undo, redo and checkpoints. Reference
+mutations do not invalidate a part's compiled shapes; a saved part with otherwise
+valid build state continues to reopen warm under §§9, 17, 19 and 24.
+
+## 27. Unverified component reuse (additive)
+
+Unverified component bodies, including assemblies containing unverified
+descendants, may be displayed while verification runs but are not retained as
+reusable process-wide component-cache results. Rebuilding or replacing a
+component's derived state can leave its authored document hash unchanged;
+subsequent exact-geometry hydration must not resurrect the old unverified body
+under that hash. Failed write-back does not authenticate the old cache.
+
+## 28. Nonblocking recovery snapshots and component writeback (additive)
+
+`doc_save(..., preserve_path=true)` captures the committed document, its
+revision and metadata revision, and its available build state under the document
+lock. Encoding, compression and file publication run after releasing that lock.
+Recovery snapshots do not refresh or rebuild assemblies. A part without a
+complete, verified current build is refused without replacing the prior
+snapshot; it is not rebuilt merely for autosave. A captured assembly display is
+included only when it still matches both captured live and disk sources;
+otherwise the authored assembly remains recoverable without a certified display
+cache. The result reports the captured `revision` and `metadata_revision`.
+
+The daemon skips unchanged revisions, publishes snapshots atomically, and cannot
+publish an older in-flight snapshot after a newer snapshot, discard or
+retirement. Recovery snapshots do not bind or mark the document clean.
+
+An assembly component cache miss still saves a successful build into the
+component's file as in §17, but serialization and writeback are deferred off
+the assembly document lock. Its build-state report may say
+`{written:false, reason:"scheduled"}` or `"already_scheduled"` while that work
+is pending. Pending writebacks keep the engine active and retain the same
+authored-hash and file-stamp guards; an intervening file save wins. A warm
+component-cache hit does not schedule a writeback.

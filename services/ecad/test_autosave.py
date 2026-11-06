@@ -3,10 +3,10 @@
 Covers services.ecad.autosave and its native-session facade hooks. Snapshots provide
 best-effort recovery after a server restart. These tests exercise:
   * autosave is DISABLED by default (unit tests / the engine never touch disk uninvited);
-  * once enabled, every mutating session op persists the doc to <doc_id>.json;
+  * once enabled, every mutating session op persists a session-namespaced snapshot;
   * a simulated server restart (new session id + cleared registry) RECOVERS the prior docs;
   * scope="recent" recovers only the most-recent prior session, "all" recovers everything;
-  * a deliberately closed session's autosave is removed (no resurrection).
+  * closing a session retains its snapshot unless a replacement is verified.
 
 Each test points CHUDWARE_ECAD_AUTOSAVE_DIR at a fresh temp dir so nothing touches %APPDATA%.
 Run:  python -m pytest services/ecad/test_autosave.py -q
@@ -18,9 +18,16 @@ import json
 import os
 import pathlib
 import tempfile
+import pytest
 
-from services.ecad import autosave, schema, session
+from services.ecad import autosave, session
 from services.ecad.library.starter import SYMBOLS
+
+
+@pytest.fixture(autouse=True)
+def _isolated_workspace(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
 
 
 # --------------------------------------------------------------------------- fixtures / helpers
@@ -43,7 +50,7 @@ def _files(d: str) -> list:
 def _seed_divider(name: str = "Divider") -> session.EcadSession:
     """A 1-resistor schematic session built through the public session/op layer."""
     s = session.new_session("sch", name)
-    for libid in ("Simulation_SPICE:V_source", "Device:R"):
+    for libid in ("Simulation_SPICE:VDC", "Device:R"):
         s.doc["lib_cache"][libid] = copy.deepcopy(SYMBOLS[libid])
     session.apply_ops(s, s.revision, [
         {"op": "sch_add_symbol", "libid": "Device:R", "pos": [0.0, 0.0],
@@ -58,7 +65,11 @@ def test_disabled_by_default() -> None:
     d = _fresh_dir()
     assert not autosave.is_enabled()
     s = session.new_session("sch", "Quiet")
-    session.apply_ops(s, s.revision, [])  # a no-op mutation still bumps revision
+    revision = s.revision
+    session.apply_ops(s, revision, [])
+    assert s.revision == revision
+    session.rebuild(s)
+    assert s.revision == revision
     assert _files(d) == [], "autosave wrote to disk while DISABLED"
 
 
@@ -66,16 +77,15 @@ def test_autosave_after_each_mutation() -> None:
     d = _fresh_dir()
     autosave.enable("SESS-A")
     s = _seed_divider()
-    f = pathlib.Path(d) / f"{s.doc_id}.json"
-    assert f.exists(), "no autosave file after a mutating op"
-    payload = json.loads(f.read_text(encoding="utf-8"))
+    f = autosave._STATE["snapshots"][s.doc_id]
+    assert f.exists(), "no KiCad autosave file after a mutating op"
+    payload = json.loads(pathlib.Path(str(f) + ".recovery.json").read_text(encoding="utf-8"))
     assert payload["doc_id"] == s.doc_id
     assert payload["kind"] == "sch"
     assert payload["session"] == "SESS-A"
     assert payload["revision"] == s.revision
-    assert any(sy.get("ref") == "R1" for sy in payload["doc"]["symbols"])
-    # the persisted doc is itself a valid ECAD document
-    assert schema.validate(payload["doc"]) == []
+    assert "(kicad_sch" in f.read_text(encoding="utf-8")
+    assert "R1" in f.read_text(encoding="utf-8")
 
 
 def test_recover_round_trip() -> None:
@@ -117,14 +127,14 @@ def test_recover_scope_recent_vs_all() -> None:
     assert {r["name"] for r in every} == {"Old", "New"}, every
 
 
-def test_close_removes_autosave() -> None:
+def test_close_preserves_autosave() -> None:
     d = _fresh_dir()
     autosave.enable("SESS-A")
     s = _seed_divider()
-    f = pathlib.Path(d) / f"{s.doc_id}.json"
+    f = autosave._STATE["snapshots"][s.doc_id]
     assert f.exists()
     assert session.close_session(s.doc_id) is True
-    assert not f.exists(), "closing a session must remove its autosave (no resurrection)"
+    assert f.exists(), "closing must not discard the only recovery copy"
 
 
 def test_board_round_trips_too() -> None:
@@ -136,3 +146,50 @@ def test_board_round_trips_too() -> None:
     session._REGISTRY.clear()
     recovered = autosave.recover_ecad_autosaved(scope="recent")
     assert any(r["kind"] == "pcb" and r["original_doc_id"] == bid for r in recovered), recovered
+
+
+def test_failed_migration_keeps_source(monkeypatch) -> None:
+    d = _fresh_dir()
+    autosave.enable("prior")
+    _seed_divider()
+    source = next(pathlib.Path(d).glob("*.json"))
+    autosave.enable("new")
+    session._REGISTRY.clear()
+    monkeypatch.setattr(autosave, "autosave_session", lambda _session: False)
+    assert autosave.recover_ecad_autosaved()
+    assert source.exists()
+
+
+def test_same_doc_id_is_namespaced_by_session() -> None:
+    _fresh_dir()
+    autosave.enable("first")
+    doc = _seed_divider()
+    first = autosave._STATE["snapshots"][doc.doc_id]
+    autosave.enable("second")
+    assert autosave.autosave_session(doc)
+    second = autosave._STATE["snapshots"][doc.doc_id]
+    assert first != second and first.exists() and second.exists()
+
+
+def test_kicad_recovery_preserves_original_binding_and_file() -> None:
+    from services.mcp.ecad_common import _rpc
+
+    directory = pathlib.Path(_fresh_dir())
+    original = directory / "original.kicad_sch"
+    snapshot = directory / "snapshot.kicad_sch"
+    first = session.new_session("sch", "Recovery", str(original))
+    session.apply_ops(first, first.revision, [
+        {"op": "sch_add_symbol", "libid": "Device:R", "pos": [0, 0],
+         "ref": "R1", "value": "10k"}])
+    before = original.read_bytes()
+    saved = _rpc("ecad_save", {"doc_id": first.doc_id, "path": str(snapshot),
+                                "recovery": {"path": str(original), "pid": 1,
+                                             "recovery_dir": str(directory)}})
+    assert saved["saved_revision"] == first.revision
+    metadata = json.loads(pathlib.Path(str(snapshot) + ".recovery.json").read_text())
+    assert metadata["human_dirty"] and metadata["path"] == str(original)
+    assert "R1" in snapshot.read_text()
+    assert original.read_bytes() == before
+    recovered = _rpc("ecad_open", {"path": str(snapshot)})
+    assert recovered["path"] == str(original)
+    assert any(symbol.get("ref") == "R1" for symbol in recovered["tree"]["symbols"])

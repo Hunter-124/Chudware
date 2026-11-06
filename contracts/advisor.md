@@ -1,7 +1,7 @@
 # contracts/advisor.md — Advisory Layer contracts (aicad.advisor/1.7)
 
 Frozen 2026-07-04; §10–§15 added same day (1.0 → 1.1), §16–§17 (1.1 → 1.2),
-§18–§21 org layer (1.2 → 1.3), §22 design cognition ladder (1.3 → 1.4),
+§18–§21 org layer (1.2 → 1.3; §18–§19 later removed), §22 design cognition ladder (1.3 → 1.4),
 §23 harness effort presets & user overrides (1.4 → 1.5),
 §12 delegation recursion + budget_meter + kill-switch (1.5 → 1.6, additive),
 §11 verdict `targeted_reentry` reroute field (1.6 → 1.7, additive). All bumps additive. Companion to
@@ -16,9 +16,8 @@ Frozen 2026-07-04; §10–§15 added same day (1.0 → 1.1), §16–§17 (1.1 �
   ("what's the best datum scheme here?"); like every delegation kind, it auto-approves
   at every depth, and its result lands as a ledger note.
 - §8 tier profiles gain `deliberation: full|standard|minimal`. INVERTED DIAL
-  (design decision, 2026-07-04): local tiers default `full` (tokens are free — councils,
-  ponders, trigger packs all on), frontier defaults `minimal` (tokens cost money;
-  councils only where risk warrants).
+  (design decision, 2026-07-04): local tiers default `full` (tokens are free —
+  ponders, trigger packs all on), frontier defaults `minimal` (tokens cost money).
 Additive changes bump the minor; breaking changes require a new
 major and a migration note here. All schemas are JSON; all lengths mm, angles deg,
 masses g (canonical units per the interaction contract's `normalize_dimension`).
@@ -34,7 +33,7 @@ intake | spec | layout | sketch | feature | part_verify | assembly | sim | cam |
   `services/agent/advisor/stages.py`); `stage_set(stage, reason)` overrides.
 - Each stage declares: `check_battery` (ordered list of read-only checks),
   `helper_tools` (names advertised in advisories), `exit_gate` (checks that must pass
-  before the orchestrator advances), `playbook_default`.
+  before the orchestrator advances).
 
 ## §2 Design ledger (`aicad.ledger/1`)
 
@@ -135,7 +134,6 @@ tool_allowlist:             # registry families or tool names; enforced via
 context_recipe:             # what gets assembled into each turn, with budgets
   ledger_tokens: 800
   describers: [{tool: describe_sketch, budget: 1200}]
-playbook_default: sketch_profile
 ledger_sections: {read: [brief, dimensions, decisions], write: [dimensions, decisions, questions]}
 handoff_schema:             # JSON schema the role must emit on completion
   type: object
@@ -146,9 +144,8 @@ escalation_policy: {max_attempts: 3, on_exhaust: ask_user}
 
 Handoff envelope (`aicad.handoff/1`): `{role, status: done|blocked|escalated, summary
 (<=120 words), outputs (schema above), ledger_writes: [event seqs], next_role_hint}`.
-Handoffs are validated against the schema at the harness layer (grammar-constrained
-for local tiers) and written to the ledger; the next role receives the envelope, not
-the chat.
+Handoffs are validated against the schema (`roles.validate_handoff`) and written to
+the ledger; the next role receives the envelope, not the chat.
 
 ## §5 Failure card (`aicad.failure/1`)
 
@@ -172,25 +169,10 @@ Rules: one candidate fix per attempt; the fixer must record `predicted_effect` b
 and measured `delta` after. `attempts` full ⇒ the harness (not the model) escalates.
 `regen_diagnose` output maps to `class: rebuild`.
 
-## §6 Playbook (`aicad.playbook/1`) — files `services/agent/playbooks/<id>.yaml`
+## §6 (removed)
 
-```yaml
-schema: aicad.playbook/1
-id: sketch_profile
-stage: sketch
-steps:
-  - id: datums
-    goal: identify functional surfaces and datum choice
-    helper_tools: [describe_part]
-    checklist: ["every mating surface named", "datum stated with reason"]
-    output: {type: object, required: [datum, functional_surfaces]}
-  - id: entities
-    ...
-exit_gate: [sketch_fully_constrained, profile_closed, no_conflicting_tags]
-```
-
-Enforcement per tier profile: `step_locked` (one step per turn, output validated),
-`checklist` (whole playbook as a checklist, single turn allowed), `off`.
+The `aicad.playbook/1` scaffold and `services/agent/playbooks/` were removed; no
+runtime loaded them. The section number is kept so cross-references to §7+ stay stable.
 
 ## §7 Calculator envelope (`aicad.calc/1`)
 
@@ -219,20 +201,21 @@ schema: aicad.tier/1
 profiles:
   local-24k:
     context_tokens: 24576
-    budgets: {system: 2500, ledger: 800, state: 1500, advisory: 600, tools: 2500, history: 8000, generation: 8000}
-    playbook_enforcement: step_locked
-    structured_output: gbnf
-    advisory_verbosity: full
-    max_tools_per_role: 14
-  local-48k: {..., playbook_enforcement: step_locked, structured_output: gbnf}
-  mid:       {..., playbook_enforcement: checklist, structured_output: json_mode}
-  frontier:  {..., playbook_enforcement: off, structured_output: free, advisory_verbosity: compact}
+    generation_headroom: 8000
+    budgets: {system: 2500, ledger: 800, state: 1500, advisory: 600, tools: 2500, history: 8000}
+    tool_schema_trim: true      # first-sentence tool descriptions
+    capability_profile: A       # A scaffold-hard | B soft gates | C freedom + HARD floors
+  local-48k: {..., tool_schema_trim: true, capability_profile: A}
+  mid:       {..., tool_schema_trim: false, capability_profile: B}
+  frontier:  {..., tool_schema_trim: false, capability_profile: C}
 ```
+
+Loader invariant: `sum(budgets) + generation_headroom <= context_tokens`.
 
 ## §9 Injection & precedence rules
 
 1. Assembly order per turn: role system prompt → ledger render → stage state →
-   ADVISORY block → playbook step (if step_locked) → history.
+   ADVISORY block → history.
 2. Advisories never overwrite user instructions; on conflict the advisory renderer
    prepends "user override active" and downgrades to `info`.
 3. `blocker` severity gates stage exit (orchestrator refuses advance), it does NOT
@@ -379,8 +362,9 @@ Rules:
      `delegation_agent_limit_warning` advisory event; spawn still proceeds.
   3. `budget_meter`: tree-wide token+agent tracking, always current in the artifact.
      Token exhaustion of any ancestor auto-revokes the subtree (unchanged).
-  4. `kill()` / `kill_delegation_tree` MCP tool: human kill-switch — revokes the whole
-     tree from root, sets `killed=True`, rejects all subsequent spawns.
+  4. `DelegationTree.kill()`: revokes the whole tree from root, sets `killed=True`,
+     rejects all subsequent spawns. Programmatic only — no MCP tool or UI control
+     calls it today (Stop cancels the run, not the tree).
 - `depth_cap` is emitted as the legacy constant `3` for backward compat with artifact
   readers (e.g. `agent_inspector_view.h`). New readers should use `soft_depth_limit`.
 - `budget_meter` is the **human-visible meter**: tokens spent/remaining + agents
@@ -547,98 +531,21 @@ edit and are ledger events; denied requests return with a reason the role can ac
 on. A role that has emitted a `blocked` replan_request stops working until ruled on
 — it never continues down the failed path.
 
-## §18 Organization runtime (`aicad.org/1`)
+## §18 (removed)
 
-Departments are instantiated per mission from the deliverable manifest: each
-deliverable cluster (a deliverable plus its depends_on satellites, e.g. part +
-its drawing + its cam_program) gets a department. The org chart is a ledger
-artifact and re-chartable mid-mission via replan scope=org.
+The organization runtime (`aicad.org/1`: per-cluster departments, channels,
+`interface_change` acks, `aicad.request/1` worker requests) was removed with
+`services/agent/org.py` and `services/mcp/org_tools.py`: its tools
+(`channel_send`, `request_raise`, `request_resolve`) could only fail in the online
+runtime and nothing built an org chart. The optional ORGANIZE phase and its
+department-manager role were also removed. Coordination uses ledger decisions,
+handoffs and `delegate`; the §21 derivation tree identifies affected consumers.
 
-```json
-{
-  "schema": "aicad.org/1",
-  "departments": [{
-    "id": "dept_bottom_shell",
-    "deliverables": ["DL1", "DL4"],
-    "manager": {"role": "department_manager", "delegation_node": "dg_..."},
-    "members": [{"role": "sketcher", "delegation_node": "dg_..."}],
-    "advisors": ["foreman", "overseer"],
-    "status": "forming|active|blocked|delivered|dissolved"
-  }],
-  "channels": [{
-    "id": "ch_shell_lid",
-    "between": ["dept_bottom_shell", "dept_lid"],
-    "created_from": "interface: lid_parting_plane (layout skeleton)",
-    "status": "open|closed"
-  }],
-  "chart_revision": 3
-}
-```
+## §19 (removed)
 
-Channel messages are ledger events:
-`{channel, from_dept, kind: info|question|decision|warning|interface_change,
-body <=120 words, refs (DIM/DL/AC/node ids), needs_ack}`. Rules: an
-`interface_change` message is MANDATORY before any department alters a
-dimension another department cites (the derivation tree §21 knows who cites
-it); unacked interface_changes block the sender's stage exit, not the send.
-Channels are created automatically from manifest dependencies + layout
-interfaces; departments may open more (ledger event, why required).
-
-Worker requests (`aicad.request/1`) — the raise-your-hand primitive:
-
-```json
-{
-  "schema": "aicad.request/1",
-  "id": "rq_...",
-  "from": "dg_...", "to": "manager|orchestrator|overseer",
-  "kind": "context|resource|information|communication|concern|escalation",
-  "body": "the bore spec cites DIM7 but the ledger shows it superseded",
-  "refs": {},
-  "resolution": {"by": null, "action": null, "ts": null},
-  "sla": "next_manager_turn"
-}
-```
-
-Rules: every request gets an explicit resolution (grant, deny-with-reason,
-escalate) — silent expiry is forbidden; unresolved `concern` requests older
-than one manager turn auto-surface in the overseer's next audit (accountability
-without human intervention). Managers report department status upward every N
-node completions (structured: done/next/blocked/requests-open) — reports are
-ledger events the orchestrator and transparency UI consume.
-
-## §19 Councils (`aicad.council/1`)
-
-A council is a structured, seat-based deliberation — the token-cheap way to get
-multi-angle judgment before committing. Not a chat: each seat produces a typed
-position, the chair synthesizes, dissents are RECORDED.
-
-```json
-{
-  "schema": "aicad.council/1",
-  "id": "cn_...",
-  "kind": "build_strategy|spec_review|failure_review|org_review|custom",
-  "topic": "how to build DL1 bottom-shell",
-  "seats": [{"persona": "manufacturing", "focus": "setup count, tool access, stock"},
-            {"persona": "tolerancing",  "focus": "datums, stackups, critical dims"},
-            {"persona": "fitment",      "focus": "interfaces, clearances, assembly order"},
-            {"persona": "simplicity",   "focus": "fewest features that satisfy the ACs"}],
-  "rounds": 2,
-  "inputs": {"ledger_refs": [], "buildgraph": null},
-  "positions": [{"seat": "manufacturing", "position": "", "risks": [], "must_haves": []}],
-  "synthesis": {"decision": "", "rationale": "", "rejected_alternatives": []},
-  "dissents": [{"seat": "", "dissent": "", "trigger_condition": "revisit if wall <2mm"}],
-  "chair": "department_manager"
-}
-```
-
-Rules: the BUILD-STRATEGY council is a Phase 3 exit requirement per part above
-trivial complexity (config: feature count threshold); its synthesis feeds the
-buildgraph planner and its must_haves become validator checks. Seats run as
-ponder delegations (same model, different persona prompt — cheap on local).
-Dissents carry trigger_conditions; the foreman watches them and re-raises the
-dissent as an advisory if the condition occurs (a recorded minority report with
-teeth). round 2 lets seats respond to each other's round-1 positions —
-"councils interact" without freeform chat. Council outputs are ledger events.
+Councils (`aicad.council/1`) and the `council_convene` tool were removed with
+`services/agent/councils.py`. Multi-angle review remains available through ponder
+delegations (§12) and the advisory/overseer audits (§3, §11).
 
 ## §20 Trigger-based context injection (`aicad.trigger/1`)
 
@@ -708,9 +615,9 @@ The guided multi-step thinking chain for turning a spec into a buildable plan.
 Each rung runs in a FRESH context (only the previous rung's typed artifact + a
 scoped ledger slice — never the full conversation), so a small model reasons
 about exactly ONE abstraction level at a time. Deterministic validators sit
-between rungs; councils critique at the marked checkpoints. Rung templates are
-authored playbooks (services/agent/playbooks/ladder_*.yaml — canonical, loaded
-verbatim); the design_thinker role executes them.
+between rungs. The design_thinker
+role executes one rung per fresh context (no authored rung-template files exist;
+the rung artifact shapes below are the contract).
 
 ```
 spec ─A→ function_map ─B→ geometry_plan ─C→ linkage_map ─D→ build_pathway ─compile→ buildgraph ─E→ execution
@@ -759,10 +666,8 @@ E. Execution: existing Phase 4 machinery. Workers receive the buildgraph node
    plus the SLICE of the ladder artifacts their node cites — never the whole
    ladder.
 
-Rules: rung outputs are grammar-constrained on local tiers; a validator bounce
-returns to the SAME rung with the finding (max 2 bounces, then council or
-escalate); the build-strategy council (§19) critiques rung D output before
-compilation — seats receive geometry_plan + build_pathway, not the chat. The
+Rules: rung outputs are validated against the rung schema; a validator bounce
+returns to the SAME rung with the finding (max 2 bounces, then escalate). The
 ladder is mandatory at deliberation=full (local), optional at minimal
 (frontier models may emit rung D directly — validators still run). Rungs may
 run as ponder delegations of one design_thinker or as separate delegations —
@@ -780,11 +685,11 @@ config.
   overrides (`overrides.all`, then `overrides.<tier>`) applied over a baseline
   DERIVED at load time from tiers.yaml and the shipped code constants (ladder
   MAX_BOUNCES, delegation soft_depth_limit/max_agents (1.6; was hard DEPTH_CAP),
-  councils seat budgets/threshold, failure attempt budgets, overseer trigger points,
+  failure attempt budgets, overseer trigger points,
   trigger packs). `standard` is the
   identity preset — the §8 1.3 INVERTED DIAL survives untouched.
 - Knob set (grouped for the GUI): Deliberation (`deliberation`, `ladder`,
-  `ladder_max_bounces`, `council`, `council_seats`, `council_feature_threshold`,
+  `ladder_max_bounces`,
   `ponder_round1_tokens`, `ponder_round2_tokens`), Parallelization
   (`delegation_depth`, `worker_fan_out` 0=uncapped, `multi_doc_parallel`),
   Safety nets (`preflight`, `overseer_cadence: every_trigger|stage_exit_only|
@@ -793,7 +698,7 @@ config.
   `context_pack_verbosity`).
 - User overrides: config.json `ai_effort: {level, mode: simple|advanced,
   overrides: {<tier>: {<knob>: value}}}`. Resolution precedence (ONE path,
-  `services/agent/effort.resolve_effort`, re-exported by tiers.py; mission
+  `services/agent/effort.resolve_effort`; mission
   pipeline, design gym and GUI all use it): shipped < preset.all < preset.<tier>
   < user override. Every resolved knob carries provenance
   (`shipped | preset:<level> | override`).
@@ -866,3 +771,18 @@ center-distance tolerance is not implicitly treated as a pitch-length
 tolerance. Callers must source the neutral-line offset and tolerance
 measurement conditions, evaluate actual mechanism positions, and bind
 native measurements through the existing `prefilled` provenance field.
+
+## Explicit MCP preflight input parity (additive)
+
+`preflight_ops(tool="add_features", ops=..., auto_define=true)` prepares the authored
+batch through the same operation normalization and reference resolution as MCP
+`add_features`. The optional `auto_define` flag defaults to true on both surfaces;
+callers opting out pass false to prediction and apply. The prepared candidate,
+including inserted sketch-definition operations and shifted placeholders, is what
+the native scratch rebuild predicts. `interpreted` reports normalization notes.
+Automatic preflight receives the already-prepared batch and does not prepare it twice.
+
+Prediction never creates or switches the live document. It requires an existing
+target and retains the read-only tree, revision, geometry, undo and compile-cache
+guarantees above. This adds an input flag and response notes; `aicad.preflight/1`
+and advisory fail/skip semantics are unchanged.

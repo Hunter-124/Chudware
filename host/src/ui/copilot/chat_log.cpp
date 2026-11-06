@@ -1,5 +1,5 @@
 // Copilot chat log: message-list rendering — the user block
-// (bubble + rewind/edit row), the provider log, the assistant turn (prose + activity timeline
+// (bubble + age row), the provider log, the assistant turn (prose + activity timeline
 // + cards), and the windowed log (height-cached spacer rows for off-screen turns) with
 // stick-to-bottom autoscroll. Card/timeline bodies live in cards.cpp / activity_timeline.cpp.
 
@@ -12,6 +12,7 @@
 #include "ui/ai/ai_prefs.h"
 
 #include <unordered_map>
+#include <array>
 
 namespace ui {
 
@@ -58,18 +59,29 @@ static std::string chatStampLabel(double ts) {
     return buf;
 }
 
-// Hover twin: how long ago, then the full date with seconds ("3m ago · Sep 27, 2026, 2:26:07 PM").
-static std::string chatTimeTooltip(double ts) {
-    std::tm tmv; if (!chatLocalTime(ts, tmv)) return std::string();
+std::string chatAgeLabel(double ts) {
+    if (ts <= 0.0) return std::string();
     const double age = chatNowEpoch() - ts;
     char rel[32];
     if (age < 45.0) std::snprintf(rel, sizeof(rel), "just now");
     else if (age < 3600.0) std::snprintf(rel, sizeof(rel), "%dm ago", std::max(1, (int)(age / 60.0)));
     else if (age < 86400.0) std::snprintf(rel, sizeof(rel), "%dh ago", (int)(age / 3600.0));
     else std::snprintf(rel, sizeof(rel), "%dd ago", (int)(age / 86400.0));
+    return rel;
+}
+
+std::string chatClockSeconds(double ts) {
+    std::tm tmv; if (!chatLocalTime(ts, tmv)) return std::string();
+    return chatClock(tmv, true);
+}
+
+// Hover twin: how long ago, then the full date with seconds ("3m ago · Sep 27, 2026, 2:26:07 PM").
+std::string chatTimeTooltip(double ts) {
+    std::tm tmv; if (!chatLocalTime(ts, tmv)) return std::string();
     char buf[96];
-    std::snprintf(buf, sizeof(buf), "%s \xc2\xb7 %s %d, %d, %s", rel, kChatMonths[tmv.tm_mon],
-                  tmv.tm_mday, tmv.tm_year + 1900, chatClock(tmv, true).c_str());
+    std::snprintf(buf, sizeof(buf), "%s \xc2\xb7 %s %d, %d, %s", chatAgeLabel(ts).c_str(),
+                  kChatMonths[tmv.tm_mon], tmv.tm_mday, tmv.tm_year + 1900,
+                  chatClock(tmv, true).c_str());
     return buf;
 }
 
@@ -314,11 +326,10 @@ static void drawSentContextChips(AppState& st, const ChatMsg& m) {
 
 // The user's message: a right-aligned, shrink-to-fit soft bubble tinted by the turn's mode
 // (Agent = accent, Plan = amber, Ask = neutral — the role the old outline carried), with no
-// author label and no hard outline: alignment and tint already say "you". The age and the
-// rewind/edit actions sit in a quiet meta row UNDER the bubble, right-aligned, so the bubble
-// holds only what was said.
+// author label and no hard outline: alignment and tint already say "you". The age sits in a
+// quiet meta row UNDER the bubble, right-aligned, so the bubble holds only what was said.
 void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
-                          float panelW, int msgIdx) {
+                          float panelW) {
     (void)fonts;
     const float sc = ui::uiScale;
     const ui::AdaptiveSurface& surf = chatSurf();
@@ -372,24 +383,11 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
     // A soft pill: the tint carries "you", so the same-hue edge stays a whisper, not an outline.
     const ImRect bubble = endTintBubble(gb, tint, surf.darkText ? 0.16f : 0.24f,
                                         surf.darkText ? 0.16f : 0.18f);
-    chatCopyContext(bubble, "##umsg_copy", m.text, m.text, selection);
+    chatCopyContext(bubble, "##umsg_copy", [&] { return m.text; }, {}, selection);
 
-    // ---- meta row under the bubble, right-aligned: [rewind] [edit]  age ----
-    const double now = ImGui::GetTime();
-    if (s_aiVc.confirmMsgIdx >= 0 && now > s_aiVc.confirmUntil) {
-        s_aiVc.confirmMsgIdx = -1;
-        s_aiVc.confirmKind = 0;
-    }
-    const bool pending = (s_aiVc.confirmMsgIdx == msgIdx && s_aiVc.confirmKind == 3);
-    const bool showBtns = s_aiVc.available && msgIdx >= 0 && !s_aiVc.busy;
-    // Checkpoint coverage decides whether this rewind rolls geometry back too — the
-    // tooltip (before) and the toast (after) must never imply a geometry restore when
-    // no checkpoint exists for this message.
-    const int cpState = showBtns ? aiVcMsgCheckpointState(st, msgIdx) : 2;
-    const float btnSz = ImGui::GetFrameHeight() * 0.72f;
+    // ---- meta row under the bubble, right-aligned: [delivery state]  age ----
     const float gap = 4.0f * sc;
     const float lineH = ImGui::GetTextLineHeight();
-    const float rowH = showBtns ? std::max(lineH, btnSz) : lineH;
     const std::string age = chatStampLabel(m.ts);
     const float ageW = age.empty() ? 0.0f : ImGui::CalcTextSize(age.c_str()).x;
     // A message sent mid-run says whether the agent has read it: always visible (not hover-
@@ -429,9 +427,7 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
         break;
     }
     const float steerW = steerLabel ? ImGui::CalcTextSize(steerLabel).x : 0.0f;
-    const float rowW = (steerLabel ? steerW + gap * 2.0f : 0.0f) +
-                       (showBtns ? btnSz * 2.0f + gap : 0.0f) +
-                       (showBtns && !age.empty() ? gap * 2.0f : 0.0f) + ageW;
+    const float rowW = (steerLabel ? steerW + gap * 2.0f : 0.0f) + ageW;
     if (rowW <= 0.0f) {
         ImGui::Dummy(ImVec2(0, ui::metrics::cpChatMsgGap()));
         return;
@@ -442,10 +438,9 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
     const ImVec2 rowMin(std::max(bubble.Max.x - ui::metrics::px(4.0f) - rowW,
                                  ImGui::GetWindowPos().x + rowX),
                         bubble.Max.y + ui::metrics::cpChatMetaGap());
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    // The row is quiet until the message is hovered (or a rewind is waiting on its confirm).
-    const bool rowHot = pending || ImGui::IsMouseHoveringRect(
-        bubble.Min, ImVec2(bubble.Max.x, rowMin.y + rowH), /*clip=*/false);
+    // The row is quiet until the message is hovered.
+    const bool rowHot = ImGui::IsMouseHoveringRect(
+        bubble.Min, ImVec2(bubble.Max.x, rowMin.y + lineH), /*clip=*/false);
     const float rowA = ui::anim::toward(ImGui::GetID("##umsg_meta_hot"), rowHot ? 1.0f : 0.0f,
                                         ui::anim::kFast);
     const ImVec4& inkIdle = surf.textTertiary;
@@ -456,82 +451,16 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
                      inkIdle.w * (0.70f + 0.30f * rowA));
     float x = rowMin.x;
     if (steerLabel) {
-        ImGui::SetCursorScreenPos(ImVec2(x, rowMin.y + (rowH - lineH) * 0.5f));
+        ImGui::SetCursorScreenPos(ImVec2(x, rowMin.y));
         ImGui::PushStyleColor(ImGuiCol_Text, steerInk);
         ImGui::TextUnformatted(steerLabel);
         ImGui::PopStyleColor();
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", steerTip);
         x += steerW + gap * 2.0f;
     }
-    if (showBtns) {
-        // Rewind glyph button
-        ImGui::SetCursorScreenPos(ImVec2(x, rowMin.y + (rowH - btnSz) * 0.5f));
-        {
-            const bool clicked = ImGui::InvisibleButton("##umsg_rw", ImVec2(btnSz, btnSz));
-            const ImVec2 bmn = ImGui::GetItemRectMin(), bmx = ImGui::GetItemRectMax();
-            if (pending || ImGui::IsItemHovered())
-                dl->AddRectFilled(bmn, bmx,
-                    ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textPrimary.x, surf.textPrimary.y,
-                                                          surf.textPrimary.z, pending ? 0.18f : 0.10f)),
-                    btnSz * 0.5f);   // round hover pad, like every other icon affordance
-            // Inset to match the pencil icon's 0.18 pad -- the raw glyph otherwise reads
-            // noticeably bigger/bolder than the pencil.
-            const float rp = btnSz * 0.18f;
-            drawDoubleRewindGlyph(dl, ImVec2(bmn.x + rp, bmn.y + rp),
-                                  ImVec2(bmx.x - rp, bmx.y - rp),
-                                  ImGui::ColorConvertFloat4ToU32(pending ? surf.textPrimary : ink));
-            if (clicked) {
-                if (!pending) {
-                    s_aiVc.confirmMsgIdx = msgIdx;
-                    s_aiVc.confirmKind = 3;
-                    s_aiVc.confirmUntil = now + 4.0;
-                } else {
-                    aiVcRequestRollback(st, "msg:" + std::to_string(msgIdx),
-                                        aiVcRewindToast(cpState));
-                }
-            }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", pending ? "Click again to confirm rewind."
-                                                : aiVcRewindTip(cpState));
-        }
-        x += btnSz + gap;
-        // Pencil edit — atlas icon (msg_edit) with filled-glyph fallback.
-        ImGui::SetCursorScreenPos(ImVec2(x, rowMin.y + (rowH - btnSz) * 0.5f));
-        {
-            const bool clicked = ImGui::InvisibleButton("##umsg_edit", ImVec2(btnSz, btnSz));
-            const ImVec2 bmn = ImGui::GetItemRectMin(), bmx = ImGui::GetItemRectMax();
-            if (ImGui::IsItemHovered())
-                dl->AddRectFilled(bmn, bmx,
-                    ImGui::ColorConvertFloat4ToU32(ImVec4(surf.textPrimary.x, surf.textPrimary.y,
-                                                          surf.textPrimary.z, 0.10f)),
-                    btnSz * 0.5f);
-            const ImU32 inkU = ImGui::ColorConvertFloat4ToU32(ink);
-            IconUV editIcon = ui::getIcon("msg_edit", 20);
-            if (editIcon.valid) {
-                const float pad = btnSz * 0.18f;
-                dl->AddImage(editIcon.texId,
-                             ImVec2(bmn.x + pad, bmn.y + pad),
-                             ImVec2(bmx.x - pad, bmx.y - pad),
-                             editIcon.uv0, editIcon.uv1,
-                             inkU);
-            } else {
-                drawPencilGlyph(dl, bmn, bmx, inkU);
-            }
-            if (clicked) beginEditStage(st, msgIdx);
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s",
-                    editStageInFlight()
-                        ? "An edit is being applied \xe2\x80\x94 wait for it to finish."
-                    : activeConversationRunning(st)
-                        ? "Stop the run and edit this message \xe2\x80\x94 Esc cancels the "
-                          "edit without changing the part."
-                        : "Edit this message \xe2\x80\x94 Esc cancels without changing the part.");
-        }
-        x += btnSz + gap * 2.0f;
-    }
     // Timestamp (hover = relative age + full date).
     if (!age.empty()) {
-        ImGui::SetCursorScreenPos(ImVec2(x, rowMin.y + (rowH - lineH) * 0.5f));
+        ImGui::SetCursorScreenPos(ImVec2(x, rowMin.y));
         ImGui::PushStyleColor(ImGuiCol_Text, ink);
         ImGui::TextUnformatted(age.c_str());
         ImGui::PopStyleColor();
@@ -541,7 +470,7 @@ void drawUserBlock(AppState& st, const ChatMsg& m, const ui::Fonts& fonts,
         }
     }
     // Leave the cursor at the row's left edge, one row down, whatever the row held.
-    ImGui::SetCursorPos(ImVec2(rowX, rowMin.y + rowH - ImGui::GetWindowPos().y +
+    ImGui::SetCursorPos(ImVec2(rowX, rowMin.y + lineH - ImGui::GetWindowPos().y +
                                          ImGui::GetScrollY()));
     ImGui::Dummy(ImVec2(1.0f, ui::metrics::cpChatMsgGap()));   // air before the next message
 }
@@ -597,14 +526,6 @@ static void drawProviderLog(ChatMsg& m, const ui::Fonts& fonts) {
     }
     if (!open) return;
 
-    // Build full copy text once.
-    std::string allCopy;
-    allCopy.reserve(calls.size() * 96);
-    for (const ActivityItem* a : calls) {
-        if (!allCopy.empty()) allCopy += "\n";
-        allCopy += !a->detail.empty() ? a->detail
-                 : (!a->title.empty() ? a->title + "  " + a->reason : a->reason);
-    }
 
     GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin, 8.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
@@ -649,28 +570,101 @@ static void drawProviderLog(ChatMsg& m, const ui::Fonts& fonts) {
     ImGui::EndChild();
     ImGui::PopStyleVar();   // ##provlog WindowPadding
     ImRect cardRect = endGlassBubble(gb);
-    chatCopyContext(cardRect, "##provlog_copy", allCopy);
+    chatCopyContext(cardRect, "##provlog_copy", [&] {
+        std::string text;
+        for (const ActivityItem* a : calls) {
+            if (!text.empty()) text += '\n';
+            text += !a->detail.empty() ? a->detail
+                  : (!a->title.empty() ? a->title + "  " + a->reason : a->reason);
+        }
+        return text;
+    });
 }
 
-static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts,
-                              int msgIdx = -1, int turnNum = 0, bool isLastTurn = false) {
+static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts) {
     const auto& pal = ui::palette;
     const ui::AdaptiveSurface& turnSurf = chatSurf();
     const float sc = ui::uiScale;
 
-    // The assistant reply is the largest patch of text the copilot did NOT author in C++:
-    // raw model prose, where an arrow renders as "?" (the atlas stops at U+2027) and a doc
-    // id the model quotes back reads as "doc-cpp00000039" instead of the part's name. Runs
-    // through the SAME gated sanitizer drawAgentTimeline applies to the prose rows, so the
-    // two stay byte-identical and timelineProseTail can tell them apart. Idempotent with a
-    // no-op fast path, and m.text is mutated in place, so the cost is paid once per message
-    // rather than per frame — the persisted transcript and Copy carry the cleaned text too.
-    ui::sanitizeAgentTextInPlace(st, m.text);
+    // Maintenance is a status, not an assistant answer. Its streamed sub-run and
+    // final receipt describe the same operation: render exactly one wrapped row,
+    // without answer metadata, copy controls, or a turn receipt.
+    if (m.compactionRun) {
+        const ActivityItem* row = nullptr;
+        for (auto it = m.activity.rbegin(); it != m.activity.rend(); ++it)
+            if (it->rowKind == 17 && it->stage.find("compaction:") != std::string::npos) {
+                row = &*it;
+                break;
+            }
+        const bool failed = !m.running &&
+            ((row && (row->status == "fail" || row->status == "failed" || row->status == "error")) ||
+             m.text.rfind("Couldn't", 0) == 0);
+        ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
+        if (m.running) {   // only the live mark: a finished row says its outcome in words
+            ui::kit::statusGlyphInline(ui::kit::Status::Running);
+            ImGui::SameLine(0, ui::metrics::U(1));
+        }
+        if (m.running) {
+            std::string text = m.liveStatus.rfind("Stopping compaction", 0) == 0
+                                   ? "Stopping compaction\xe2\x80\xa6"
+                               : row && row->status != "running"
+                                   ? "Finishing compaction\xe2\x80\xa6"
+                                   : "Compacting context\xe2\x80\xa6";
+            const double elapsed = m.ts > 0.0 ? chatNowEpoch() - m.ts : 0.0;
+            if (elapsed >= 3.0) text += "  \xc2\xb7  " + ui::kit::fmtDuration(elapsed);
+            chatShimmerText(text.c_str(), turnSurf.textTertiary, turnSurf.textPrimary,
+                            ui::anim::kBreathe);
+        } else {
+            const std::string& text = !m.text.empty() ? m.text
+                                       : row ? row->title : m.liveStatus;
+            ImGui::PushStyleColor(ImGuiCol_Text, failed ? semanticOnGlass(ui::palette.statusErr, turnSurf)
+                                                         : turnSurf.textPrimary);
+            ImGui::TextWrapped("%s", text.c_str());
+#ifdef IMGUI_ENABLE_TEST_ENGINE
+            ImGuiContext& g = *GImGui;
+            IMGUI_TEST_ENGINE_ITEM_INFO(0, text.c_str(), g.LastItemData.StatusFlags);
+#endif
+            ImGui::PopStyleColor();
+        }
+        return;
+    }
+
+    // Feed revisions gate the draw-time sanitizer; covered Unicode is never rebuilt each frame.
+    struct SanitizeStamp { uint64_t revision = ~uint64_t(0); size_t size = 0; double ts = 0;
+                           ImGuiID docs = 0; bool humanize = false; };
+    static std::unordered_map<ImGuiID, SanitizeStamp> stamps;
+    static int docsFrame = -1;
+    static ImGuiID docs = 0;
+    if (docsFrame != ImGui::GetFrameCount()) {
+        docsFrame = ImGui::GetFrameCount();
+        docs = 0;
+        for (const auto& tab : st.docTabs) {
+            docs = ImHashStr(tab.docId.c_str(), 0, docs);
+            const std::string title = tab.displayTitle();
+            docs = ImHashStr(title.c_str(), 0, docs);
+        }
+    }
+    const ImGuiID sanitizeId = ImGui::GetID("##sanitize_reply");
+    if (stamps.size() >= 256 && !stamps.count(sanitizeId)) stamps.clear();
+    SanitizeStamp& stamp = stamps[sanitizeId];
+    const bool humanize = ui::chatHumanizeDocIds();
+    if (stamp.revision != m.revision || stamp.size != m.text.size() || stamp.ts != m.ts ||
+        stamp.docs != docs || stamp.humanize != humanize) {
+        if (ui::agentTextMayChange(m.text)) {
+            std::string text = ui::sanitizeAgentText(st, m.text);
+            if (text != m.text) {
+                m.text = std::move(text);
+                ++m.revision;
+                chatLogMessageChanged(m);
+            }
+        }
+        stamp = {m.revision, m.text.size(), m.ts, docs, humanize};
+    }
 
     // Author label. Each card that CAN host it (prose / partial / error) draws the
     // model+age INSIDE itself as the top row (first card wins via metaDrawn).
-    // Activity-only turns and VC-restore turns keep the tight label row above the
-    // turn content with the age appended inline.
+    // Activity-only turns keep the tight label row above the turn content with the age
+    // appended inline.
     // Prefer the model stamped on the turn at run start; only fall back to the
     // live picker for an in-flight turn that somehow has no stamp. No model →
     // omit label (never bare "Assistant").
@@ -686,25 +680,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts,
     const bool partialCard = m.errKind == ERR_PARTIAL || m.resultPartial;
     const bool proseCard = !proseInline && !m.text.empty() && m.errKind == ERR_NONE &&
                            !partialCard;
-    // Geometry-mutating turns keep the checkpoint-backed Before/After restore; EVERY
-    // other finished turn still offers a chat-only rewind (msg:<idx>) so a revert is
-    // reachable at any point in the chat. turnNum > 0 already implies chatMsgMutatedDoc
-    // (turn numbers are only assigned to mutating turns in drawChatLogWindowed).
-    const bool vcMutated = msgIdx >= 0 && turnNum > 0 && chatMsgMutatedDoc(m);
-    const bool vcRestore = msgIdx >= 0 && !m.running && s_aiVc.available && !s_aiVc.busy &&
-                           !isLastTurn;   // the last turn IS the current state — nothing to restore to
-    // Drawn ONCE, INSIDE the turn's card as a bottom bar (same slot the user bubble's
-    // rewind/edit pair occupies) — never floating below the card, which read as a stray
-    // glyph detached from the box it restores. Turns with no card fall back to a bottom row.
-    bool restoreDrawn = false;
-    auto restoreBar = [&] {
-        if (!vcRestore || restoreDrawn) return;
-        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
-        drawAiVcTurnRestore(st, msgIdx, turnNum);
-        restoreDrawn = true;
-    };
-    const bool metaInCard = !vcMutated &&
-        (proseCard || m.errKind != ERR_NONE || partialCard);
+    const bool metaInCard = proseCard || m.errKind != ERR_NONE || partialCard;
     bool metaDrawn = false;
     const char* mid = nullptr;
     if (!m.model.empty()) mid = m.model.c_str();
@@ -740,10 +716,6 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts,
                 }
             }
         }
-        // The restore affordance used to live HERE, inline with the model name, where it
-        // read as part of the author label. It now draws as a bottom action row at the end
-        // of the turn (see the end of this function) so agent and user messages both offer
-        // revert in the same place.
         if (haveModel && !metaInCard)
             ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
         ImGui::PopStyleVar();
@@ -758,16 +730,17 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts,
     for (const auto& a : m.activity)
         if (a.rowKind == 18) { planInTimeline = true; break; }
     if (!planInTimeline && m.planState.present) {
-        drawPlanSection(m.planState, m.activity, fonts);
+        drawPlanSection(m, fonts);
     } else if (!planInTimeline && m.plan.present) {
         // Lazy normalize so a PlanInfo-only turn still lights the section.
         m.planState = planStateFromPlanInfo(m.plan);
-        drawPlanSection(m.planState, m.activity, fonts);
+        ++m.revision;
+        drawPlanSection(m, fonts);
     } else if (planInTimeline && m.planState.present && m.running) {
         // The full plan card lives inline at its arrival position (below). While the turn
         // runs, pin a one-line live progress summary at the TOP of the turn so step/part
         // progress stays visible even when the inline card has scrolled out of view.
-        const std::string prog = planProgressLine(m.planState, m.activity);
+        const std::string prog = planProgressLine(m);
         if (!prog.empty()) {
             const ui::AdaptiveSurface& surf = chatSurf();
             ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
@@ -779,13 +752,13 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts,
 
     // (2) Agent timeline — typed blocks in arrival order: thinking, tool cards, and the
     // model's prose exactly where it was spoken.
-    drawAgentTimeline(st, m, fonts, gShowThinking, isLastTurn);
+    drawAgentTimeline(st, m, fonts, gShowThinking);
 
     // What the timeline did NOT already show. For a streamed turn this is normally empty (or
     // a note appended after the fact, e.g. "(Stopped by you.)"); for a non-streaming provider
     // or a restored transcript it is the whole reply. Every card below renders THIS, never
     // m.text, or a streamed reply prints twice.
-    const std::string bodyText = proseInline ? ui::timelineProseTail(m) : m.text;
+    const std::string& bodyText = proseInline ? ui::timelineProseTail(m) : m.text;
 
     // (3) The reply as open prose — no card, no rim, flowing on the pane's glass at the
     // timeline's text column, exactly like the timeline's inline prose. Every other row kind
@@ -794,7 +767,6 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts,
     // copies selection or full text.
     if (proseCard ||
         (proseInline && !bodyText.empty() && m.errKind == ERR_NONE && !partialCard)) {
-        const std::string prose = stripMdMarks(bodyText);
         GlassBubble gb = beginOpenBubble(ImGui::GetContentRegionAvail().x);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
                             ImVec2(chatProseInsetX(), ui::metrics::cpChatCardPadY()));
@@ -802,7 +774,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts,
                           ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysAutoResize |
                               ImGuiChildFlags_AlwaysUseWindowPadding);
         // Author meta row INSIDE the card top (model left, age right) when it
-        // wasn't drawn above the turn (VC-restore turns keep the top row).
+        // wasn't drawn above the turn.
         if (metaInCard && !metaDrawn) {
             drawMsgMetaRow(fonts, modelLabel.empty() ? nullptr : modelLabel.c_str(),
                            turnSurf.textSecondary, m.ts, m.cacheReadTok,
@@ -810,8 +782,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts,
             metaDrawn = true;
             ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
         }
-        // Raw bodyText (not `prose`): the renderer needs the ``` fences intact to route code
-        // spans into the mono box. `prose` stays the copy payload, as before.
+        // Keep fences intact for code boxes; build the stripped copy payload only on demand.
         const ImGuiID textId = drawMdProse("##prose_sel", bodyText, chatSurf().textPrimary,
                                            fonts.mono);
         // Submitted before EndChild — see the comment on the user-bubble copy glyph in
@@ -819,20 +790,17 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts,
         {
             const ImVec2 wp = ImGui::GetWindowPos();
             const ImVec2 ws = ImGui::GetWindowSize();
-            chatHoverCopyGlyph(ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)), prose);
+            chatHoverCopyGlyph(ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)),
+                               [&] { return stripMdMarks(bodyText); });
         }
-        restoreBar();
         ImGui::EndChild();
         ImGui::PopStyleVar();  // ##prose WindowPadding
         ImRect proseRect = endOpenBubble(gb);
         const std::string sel = chatInputSelection(textId);
-        chatCopyContext(proseRect, "##prose_copy", prose, prose, sel);
+        chatCopyContext(proseRect, "##prose_copy", [&] { return stripMdMarks(bodyText); }, {}, sel);
         ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
     }
 
-
-    // (4) Pre-flight clarify gate: the model's build-critical questions, awaiting the user.
-    if (m.clarify.active) drawClarifyCard(st, m, fonts);
     // (4a) The online agent's ask_user questions — interactive while pending, a summary after.
     if (!m.asks.empty()) drawAskCards(st, m, fonts);
     // (4b) Plan-mode / mission plan_ready approve gate (Execute as Agent/Swarm/Eng.Firm).
@@ -905,7 +873,9 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts,
         // An empty tail (the timeline already drew the reply inline) leaves just the headline:
         // a "Partially complete" body under a "Partially complete" title read as a stutter.
         const std::string body = stripMdMarks(bodyText);
-        const std::string copyText = body.empty() ? std::string("Partially complete") : body;
+        const auto copyText = [&] {
+            return body.empty() ? std::string("Partially complete") : body;
+        };
         ImGui::Dummy(ImVec2(0, ui::metrics::cpChatRowGap()));
         GlassBubble gb = beginGlassBubble(ImGui::GetContentRegionAvail().x, ui::GlassLevel::Thin,
                                           ui::metrics::cpChatBubbleRadius() * 0.7f);
@@ -936,14 +906,13 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts,
             const ImVec2 ws = ImGui::GetWindowSize();
             chatHoverCopyGlyph(ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)), copyText);
         }
-        restoreBar();
         ImGui::EndChild();
         ImGui::PopStyleVar();   // ##partialcard WindowPadding
         // A partial outcome is a soft amber card (wash + same-hue hairline), not glass with a
         // heavy border: it informs, it does not alarm.
         ImRect cardRect = endTintBubble(gb, pal.statusWarn, 0.08f, 0.40f);
         const std::string sel = chatInputSelection(textId);
-        chatCopyContext(cardRect, "##partial_copy", copyText, copyText, sel);
+        chatCopyContext(cardRect, "##partial_copy", copyText, {}, sel);
     } else if (m.errKind != ERR_NONE) {
         std::string stopReason, errorDetail;
         for (const auto& a : m.activity) {
@@ -1058,7 +1027,7 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts,
                 metaDrawn = true;
                 ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
             }
-            // Headline: the short actionable sentence core/agent derived from this same
+            // Headline: the short actionable sentence the harness derived from this same
             // failure ("Provider not signed in. Open Settings > AI > Accounts."). The stop
             // fields below are supporting detail, not the lede.
             if (!m.errorHuman.empty()) {
@@ -1088,13 +1057,12 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts,
                 const ImVec2 ws = ImGui::GetWindowSize();
                 chatHoverCopyGlyph(ImRect(wp, ImVec2(wp.x + ws.x, wp.y + ws.y)), fullErr);
             }
-            restoreBar();
             ImGui::EndChild();
             ImGui::PopStyleVar();   // ##errcard WindowPadding
             // Same soft-card treatment as the partial outcome, in the error role.
             ImRect cardRect = endTintBubble(gb, pal.statusErr, 0.08f, 0.45f);
             const std::string sel = chatInputSelection(textId);
-            chatCopyContext(cardRect, "##err_copy", fullErr, fullErr, sel);
+            chatCopyContext(cardRect, "##err_copy", [&] { return fullErr; }, {}, sel);
         }
         } // has something to show
     }
@@ -1128,16 +1096,6 @@ static void drawAssistantTurn(AppState& st, ChatMsg& m, const ui::Fonts& fonts,
     // (9) Provider HTTP call log — always expanded on fail; collapsed toggle on success.
     if (!m.running)
         drawProviderLog(m, fonts);
-
-    // (10) Restore/rewind fallback — only for turns whose content drew NO card (bare
-    // activity/error streams with an empty body). Card-bearing turns already host the
-    // restore bar inside the card bottom via restoreBar() above, mirroring the user
-    // bubble's meta bar.
-    if (vcRestore && !restoreDrawn) {
-        ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuLabelGap()));
-        drawAiVcTurnRestore(st, msgIdx, turnNum);
-    }
-
 }
 
 
@@ -1151,96 +1109,205 @@ void chatDrawEmptyState() {
                         "plans, models and verifies it.");
 }
 
-// The outer message spacers must not hide a timeline's layout invalidation. Width alone is
-// insufficient when font scaling or the tool detail/grouping/render preferences change while
-// an older turn is offscreen. Keep this render-only state bounded and separate for each surface.
+namespace {
+struct LogChange { const ChatMsg* message = nullptr; double stamp = 0; uint64_t serial = 0; };
+std::array<LogChange, 512> s_logChanges{};
+uint64_t s_logSerial = 0;
+struct LogRow {
+    uint64_t revision = 0;
+    double stamp = 0;
+    size_t textSize = 0, errorHumanSize = 0, errorFullSize = 0;
+    int errKind = ERR_NONE;
+    bool running = false;
+    float height = 0;
+};
 struct ChatLogLayout {
-    ImGuiStyle style{};
-    ImFont* font = nullptr;
-    ImFont* mono = nullptr;
-    ImFont* medium = nullptr;
-    float size = -1.0f, monoSize = -1.0f, mediumSize = -1.0f;
-    int detail = -1;
-    bool thinking = false, renders = false, grouping = false, humanize = false;
+    ImGuiID signature = 0;
     std::string conversation;
+    const ChatMsg* data = nullptr;
+    std::vector<LogRow> rows;
+    std::vector<double> prefix{0};
+    std::vector<size_t> drawRows;
+    std::unordered_map<const ChatMsg*, size_t> indices;
+    std::set<size_t> dirty, interactive;
+    uint64_t serial = 0, history = 0;
+    int lastAssistant = -1;
 };
 
-static void invalidateChatLogLayout(AppState& st) {
+ImGuiID chatLogLayoutSignature(const AppState& st, float width) {
+    // Only geometry invalidates heights: adaptive ink and entrance alpha change every frame.
+    // Fingerprint in place, with no ImGuiStyle or conversation-string copy.
+    ImGuiID hash = 0;
+    auto add = [&](const auto& value) { hash = ImHashData(&value, sizeof(value), hash); };
+    const ImGuiStyle& style = ImGui::GetStyle();
+    add(style.WindowPadding); add(style.WindowBorderSize); add(style.WindowMinSize);
+    add(style.ChildBorderSize); add(style.PopupBorderSize);
+    add(style.FramePadding); add(style.FrameBorderSize);
+    add(style.ItemSpacing); add(style.ItemInnerSpacing); add(style.CellPadding);
+    add(style.TouchExtraPadding); add(style.IndentSpacing); add(style.ColumnsMinSpacing);
+    add(style.ScrollbarSize); add(style.GrabMinSize);
+    add(width); add(ui::uiScale);
+    const ImFont* font = ImGui::GetFont();
+    add(font); add(st.fonts.mono); add(st.fonts.medium);
+    const float size = ImGui::GetFontSize();
+    const float monoSize = st.fonts.mono ? st.fonts.mono->FontSize * st.fonts.mono->Scale : 0;
+    const float mediumSize = st.fonts.medium ? st.fonts.medium->FontSize * st.fonts.medium->Scale : 0;
+    add(size); add(monoSize); add(mediumSize);
+    const int detail = ui::chatToolDetail();
+    const bool thinking = gShowThinking, renders = ui::chatShowRenders(),
+               grouping = ui::chatGroupToolCalls(), humanize = ui::chatHumanizeDocIds();
+    add(detail); add(thinking); add(renders); add(grouping); add(humanize);
+    return hash;
+}
+
+ChatLogLayout& invalidateChatLogLayout(AppState& st, size_t shown, float width) {
     static std::unordered_map<ImGuiID, ChatLogLayout> layouts;
     const ImGuiID id = ImGui::GetID("##chat_log_layout");
-    if (layouts.find(id) == layouts.end() && layouts.size() >= 8) layouts.clear();
-    ChatLogLayout& old = layouts[id];
-    ChatLogLayout now;
-    now.style = ImGui::GetStyle();
-    now.font = ImGui::GetFont();
-    now.mono = st.fonts.mono;
-    now.medium = st.fonts.medium;
-    now.size = ImGui::GetFontSize();
-    now.monoSize = now.mono ? now.mono->FontSize * now.mono->Scale : 0.0f;
-    now.mediumSize = now.medium ? now.medium->FontSize * now.medium->Scale : 0.0f;
-    now.detail = ui::chatToolDetail();
-    now.thinking = gShowThinking;
-    now.renders = ui::chatShowRenders();
-    now.grouping = ui::chatGroupToolCalls();
-    now.humanize = ui::chatHumanizeDocIds();
-    now.conversation = st.activeConvId();
-    if (old.font != now.font || old.mono != now.mono || old.medium != now.medium ||
-        old.size != now.size || old.monoSize != now.monoSize || old.mediumSize != now.mediumSize ||
-        old.detail != now.detail || old.thinking != now.thinking || old.renders != now.renders ||
-        old.grouping != now.grouping || old.humanize != now.humanize ||
-        old.conversation != now.conversation ||
-        std::memcmp(&old.style, &now.style, sizeof(ImGuiStyle)) != 0) {
-        for (auto& message : st.chat) message.uiCachedH = -1.0f;
-        old = std::move(now);
+    if (!layouts.count(id) && layouts.size() >= 8) layouts.clear();
+    ChatLogLayout& cache = layouts[id];
+    static const std::string empty;
+    const std::string& conversation = st.activeConv >= 0 &&
+        st.activeConv < (int)st.conversations.size() ? st.conversations[st.activeConv].id : empty;
+    const ImGuiID signature = chatLogLayoutSignature(st, width);
+    const uint64_t history = s_chatHistoryRevision.load(std::memory_order_relaxed);
+    const bool moved = cache.data != st.chat.data();
+    const bool appended = shown > cache.rows.size() && !cache.rows.empty() &&
+        cache.rows.front().stamp == st.chat.front().ts &&
+        cache.rows.back().stamp == st.chat[cache.rows.size() - 1].ts;
+    const bool reset = cache.signature != signature || cache.conversation != conversation ||
+                       (moved && !appended) || shown < cache.rows.size();
+    if (reset) {
+        cache = ChatLogLayout{};
+        cache.signature = signature;
+        cache.conversation = conversation;
+        cache.data = st.chat.data();
     }
+    if (moved) {
+        cache.data = st.chat.data();
+        cache.indices.clear();
+        for (size_t i = 0; i < cache.rows.size(); ++i) cache.indices.emplace(&st.chat[i], i);
+    }
+    const size_t oldSize = cache.rows.size();
+    cache.rows.resize(shown);
+    cache.prefix.resize(shown + 1);
+    auto refresh = [&](size_t i) {
+        const ChatMsg& message = st.chat[i];
+        LogRow& row = cache.rows[i];
+        row.revision = message.revision;
+        row.stamp = message.ts;
+        row.running = message.running;
+        row.errKind = message.errKind;
+        row.textSize = message.text.size();
+        row.errorHumanSize = message.errorHuman.size();
+        row.errorFullSize = message.errorFull.size();
+        cache.dirty.insert(i);
+        const bool interactive = message.running ||
+            std::any_of(message.asks.begin(), message.asks.end(),
+                        [](const AskBatch& ask) { return askStatusOpen(ask.status); });
+        if (interactive) cache.interactive.insert(i);
+        else cache.interactive.erase(i);
+    };
+    for (size_t i = oldSize; i < shown; ++i) {
+        cache.indices.emplace(&st.chat[i], i);
+        refresh(i);
+        if (!st.chat[i].fromUser) cache.lastAssistant = (int)i;
+        cache.prefix[i + 1] = cache.prefix[i];
+    }
+    if (moved && !reset)
+        for (size_t i = 0; i < oldSize; ++i)
+            if (cache.rows[i].revision != st.chat[i].revision ||
+                cache.rows[i].stamp != st.chat[i].ts)
+                refresh(i);
+    const bool overflow = s_logSerial - cache.serial > s_logChanges.size();
+    const bool targeted = cache.serial != s_logSerial;
+    if (!reset && (overflow || (cache.history != history && !targeted))) {
+        // Non-feed edits and a surface that missed the bounded notification ring are uncommon;
+        // conservatively inspect revisions only on those mutations, never on ordinary frames.
+        for (size_t i = 0; i < shown; ++i)
+            if (overflow || cache.rows[i].revision != st.chat[i].revision ||
+                cache.rows[i].stamp != st.chat[i].ts || st.chat[i].uiCachedH < 0)
+                refresh(i);
+    } else if (!reset) {
+        for (uint64_t serial = cache.serial + 1; serial <= s_logSerial; ++serial) {
+            const LogChange& change = s_logChanges[serial % s_logChanges.size()];
+            auto found = cache.indices.find(change.message);
+            if (found != cache.indices.end() && st.chat[found->second].ts == change.stamp)
+                refresh(found->second);
+        }
+    }
+    // Final-result settlement can bypass feed notifications and history revisions. Inspect
+    // only live/interactive rows and the assistant tail, not the entire settled transcript.
+    auto refreshStateChange = [&](size_t i) {
+        const ChatMsg& message = st.chat[i];
+        const LogRow& row = cache.rows[i];
+        if (row.running != message.running || row.errKind != message.errKind ||
+            row.textSize != message.text.size() || row.errorHumanSize != message.errorHuman.size() ||
+            row.errorFullSize != message.errorFull.size())
+            refresh(i);
+    };
+    for (auto it = cache.interactive.begin(); it != cache.interactive.end();) {
+        const size_t i = *it++;
+        refreshStateChange(i);  // refresh may erase this row from the interactive set.
+    }
+    if (cache.lastAssistant >= 0)
+        refreshStateChange((size_t)cache.lastAssistant);
+    cache.serial = s_logSerial;
+    cache.history = history;
+    return cache;
+}
+}  // namespace
+
+void chatLogMessageChanged(const ChatMsg& message) noexcept {
+    const uint64_t serial = ++s_logSerial;
+    s_logChanges[serial % s_logChanges.size()] = {&message, message.ts, serial};
 }
 
 void drawChatLogWindowed(AppState& st) {
     ui::Fonts& fonts = st.fonts;
-    invalidateChatLogLayout(st);
-    drawAiVcRollbackConfirm(st);   // pre-rollback confirmation modal (warning ladder)
     const float logW    = ImGui::GetContentRegionAvail().x;
-    // A staged edit HIDES the tail it would replace — the messages stay in st.chat (and on
-    // disk) untouched until the edit commits; the hide is never applied to a running tail.
-    const int hideFrom = editStageHideFrom(st);
-    const size_t shown = hideFrom >= 0 && hideFrom < (int)st.chat.size() ? (size_t)hideFrom
-                                                                         : st.chat.size();
-    if (shown == 0) { chatDrawEmptyState(); return; }
+    // Steers the agent has not read yet trail the message vector; they belong to the pinned stack
+    // drawn after the rows, so the windowed rows stop where they begin.
+    const size_t shown = pendingSteerTail(st.chat);
+    if (shown == 0) {
+        chatDrawEmptyState();
+        drawPendingMessageStack(st, logW);
+        return;
+    }
     const float viewTop = ImGui::GetScrollY();
     const float viewBot = viewTop + ImGui::GetWindowSize().y;
-    const float slack   = ImGui::GetWindowSize().y;   // one extra viewport of buffer each side
-    // 1-based index of finished assistant turns that mutated the doc — matches AI-VC turn labels.
-    int mutTurn = 0;
-    // The LATEST assistant turn is the state the user is already at — offering a restore
-    // there is a no-op button. Find it once so drawAssistantTurn can suppress its bar.
-    int lastAssistantIdx = -1;
-    for (size_t k = 0; k < shown; ++k)
-        if (!st.chat[k].fromUser) lastAssistantIdx = (int)k;
-    for (size_t mi = 0; mi < shown; ++mi) {
+    const float slack = ImGui::GetWindowSize().y * 0.5f;
+    ChatLogLayout& cache = invalidateChatLogLayout(st, shown, logW);
+    const float origin = ImGui::GetCursorPosY();
+    const float spacing = ImGui::GetStyle().ItemSpacing.y;
+    auto& drawRows = cache.drawRows;
+    drawRows.assign(cache.dirty.begin(), cache.dirty.end());
+    auto addRow = [&](size_t i) {
+        const auto at = std::lower_bound(drawRows.begin(), drawRows.end(), i);
+        if (at == drawRows.end() || *at != i) drawRows.insert(at, i);
+    };
+    for (size_t i : cache.interactive) addRow(i);
+    double delta = 0;
+    auto addVisible = [&](size_t after) {
+        const double top = viewTop - slack - origin - delta;
+        const double bottom = viewBot + slack - origin - delta;
+        const auto firstIt = std::upper_bound(cache.prefix.begin(), cache.prefix.end(), top);
+        const size_t first = std::max(after, firstIt == cache.prefix.begin() ? size_t(0)
+            : (size_t)(firstIt - cache.prefix.begin() - 1));
+        const size_t last = std::min(shown, (size_t)(
+            std::upper_bound(cache.prefix.begin(), cache.prefix.end(), bottom) - cache.prefix.begin()));
+        for (size_t i = first; i < last; ++i) addRow(i);
+    };
+    addVisible(0);
+    auto spacer = [&](double height) {
+        if (height > 0)
+            ImGui::Dummy(ImVec2(logW, (float)std::max(0.0, height - spacing)));
+    };
+    size_t cursor = 0, heightsFrom = shown;
+    for (size_t drawIndex = 0; drawIndex < drawRows.size(); ++drawIndex) {
+        const size_t mi = drawRows[drawIndex];
         ChatMsg& m = st.chat[mi];
+        spacer(cache.prefix[mi] - cache.prefix[cursor]);
         ImGui::PushID((int)mi);
-        const float y = ImGui::GetCursorPosY();
-        const bool cacheValid = m.uiCachedH > 0.0f && std::fabs(m.uiCachedW - logW) < 0.5f;
-        // Auto-height bubbles must continue measuring even when their previous height clips the
-        // selectable text. Otherwise a newly hosted/restored row caches only padding and remains
-        // an empty bar. The bubble children use AlwaysAutoResize; the outer log still windows
-        // genuinely off-screen, already-measured turns here.
-        const bool interactive = m.running || m.clarify.active || m.clarify.awaiting ||
-                                 std::any_of(m.asks.begin(), m.asks.end(),
-                                             [](const AskBatch& b) { return askStatusOpen(b.status); }) ||
-                                 (s_aiVc.confirmMsgIdx == (int)mi);
-        // Pre-count mutating assistant turns even when the row is off-screen (stable turn nums).
-        int thisTurn = 0;
-        if (!m.fromUser && chatMsgMutatedDoc(m)) {
-            ++mutTurn;
-            thisTurn = mutTurn;
-        }
-        if (cacheValid && !interactive &&
-            (y + m.uiCachedH < viewTop - slack || y > viewBot + slack)) {
-            ImGui::Dummy(ImVec2(logW, m.uiCachedH));   // same-height spacer, zero draw cost
-            ImGui::PopID();
-            continue;
-        }
         // Entrance: a message that JUST arrived (its send/receive stamp is younger than kSlow)
         // fades in, so a new bubble eases into the log instead of popping. Alpha only — no
         // offset, so the layout never jumps and the render-windowing heights stay exact.
@@ -1257,9 +1324,9 @@ void drawChatLogWindowed(AppState& st) {
             ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * enter);
         ImGui::BeginGroup();
         if (m.fromUser) {
-            drawUserBlock(st, m, fonts, logW, (int)mi);
+            drawUserBlock(st, m, fonts, logW);
         } else {
-            drawAssistantTurn(st, m, fonts, (int)mi, thisTurn, (int)mi == lastAssistantIdx);
+            drawAssistantTurn(st, m, fonts);
             ImGui::Dummy(ImVec2(0, ui::metrics::cpChatMsgGap()));   // air before the next message
         }
         ImGui::EndGroup();
@@ -1278,8 +1345,23 @@ void drawChatLogWindowed(AppState& st) {
         // to the model label. Mode is still stamped on the message for other chrome.)
         m.uiCachedH = ImGui::GetItemRectSize().y;
         m.uiCachedW = logW;
+        const float height = m.uiCachedH + spacing;
+        const float difference = height - cache.rows[mi].height;
+        if (difference != 0) {
+            cache.rows[mi].height = height;
+            heightsFrom = std::min(heightsFrom, mi);
+            delta += difference;
+            addVisible(mi + 1);
+        }
+        cache.dirty.erase(mi);
+        cursor = mi + 1;
         ImGui::PopID();
     }
+    spacer(cache.prefix[shown] - cache.prefix[cursor]);
+    for (size_t i = heightsFrom; i < shown; ++i)
+        cache.prefix[i + 1] = cache.prefix[i] + cache.rows[i].height;
+    // Not yet read / not yet sent: the pinned stack closes the log, outside the windowed rows.
+    drawPendingMessageStack(st, logW);
     chatDrawCopyFlash();
 }
 

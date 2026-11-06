@@ -39,7 +39,7 @@ def open_docs(monkeypatch):
     monkeypatch.setattr(cad_common.cb, "call", _call)
     monkeypatch.setitem(cad_common._CUR, "doc_id", None)
     monkeypatch.setattr(cad_common, "_PROCESS_DOCS", set())
-    monkeypatch.setattr(cad_common, "_TOUCHED_DOCS", [])
+    monkeypatch.setattr(cad_common, "_TOUCHED_DOCS", {})
     return docs
 
 
@@ -91,6 +91,37 @@ def test_stale_engine_id_is_refused_with_a_reopen_path(open_docs):
     with pytest.raises(cad_common.DocRefError) as none_open:
         cad_common._doc("doc-cpp00000003")
     assert "import_part" in none_open.value.detail["hint"]
+
+
+@pytest.mark.parametrize("state", ["saved", "changed_file", "newer_edit", "recovery"])
+def test_missing_touched_part_only_names_a_proven_saved_path(
+        open_docs, monkeypatch, tmp_path, state):
+    path = tmp_path / "bracket's copy.step+"
+    path.write_text("saved")
+    did = "doc-cpp00000003"
+    row = {"doc_id": did, "path": str(path), "revision": 3, "metadata_revision": 1,
+           "saved_revision": 3, "saved_metadata_revision": 1, "dirty": False,
+           "file_stamp": cad_common._file_stamp(str(path))}
+    cad_common.note_touched_doc(did, row=row)
+    if state == "changed_file":
+        path.write_text("different file contents")
+    elif state == "newer_edit":
+        cad_common.note_touched_doc(did, row={**row, "dirty": True, "revision": 4})
+    monkeypatch.setattr(cad_common.cb, "active_daemon_mode", lambda: state == "recovery")
+    if state == "recovery":
+        engine_call = cad_common.cb.call
+        monkeypatch.setattr(cad_common.cb, "call", lambda method, args=None:
+                            {"entries": [{"doc_id": did, "same_session": True}]}
+                            if method == "recovery_list" else engine_call(method, args))
+
+    with pytest.raises(cad_common.DocRefError) as exc:
+        cad_common._doc(did)
+    hint = exc.value.detail["hint"]
+    if state == "saved":
+        assert f"import_part(path={str(path)!r}, resume=True)" in hint
+        assert str(path) in str(exc.value)
+    else:
+        assert str(path) not in hint
 
 
 def test_sole_open_part_is_adopted(open_docs):
@@ -226,7 +257,7 @@ def test_two_process_hijack_is_refused_then_own_part_resolves(open_docs, daemon_
     cad_common._CUR["doc_id"] = "doc-cpp00000001"
     cad_common.note_touched_doc("doc-cpp00000001")
     a_state = (cad_common._CUR["doc_id"], set(cad_common._PROCESS_DOCS),
-               list(cad_common._TOUCHED_DOCS))
+               {k: dict(v) for k, v in cad_common._TOUCHED_DOCS.items()})
 
     # --- process B: its own interpreter, so its own current part and claim set
     cad_common._CUR["doc_id"] = None
@@ -247,7 +278,8 @@ def test_two_process_hijack_is_refused_then_own_part_resolves(open_docs, daemon_
     cad_common._CUR["doc_id"] = a_state[0]
     cad_common._PROCESS_DOCS.clear()
     cad_common._PROCESS_DOCS.update(a_state[1])
-    cad_common._TOUCHED_DOCS[:] = a_state[2]
+    cad_common._TOUCHED_DOCS.clear()
+    cad_common._TOUCHED_DOCS.update(a_state[2])
     assert cad_common._doc(None) == "doc-cpp00000001"
 
 
@@ -364,6 +396,64 @@ def test_same_agent_name_in_separate_turns_has_separate_current_part(monkeypatch
         cad_common._CUR["doc_id"] = "first-part"
     with cad_common.agent_doc_context("Builder", scope="turn-two"):
         assert cad_common.current_doc_id() is None
+
+
+def test_nested_scope_and_background_job_do_not_redirect_parent(monkeypatch):
+    import threading
+
+    monkeypatch.setattr(cad_common._CUR, "_slots", {None: {"doc_id": None}})
+    entered, release, finished = (threading.Event() for _ in range(3))
+    seen = []
+    with cad_common.agent_doc_context("builder", scope="run"):
+        cad_common._CUR["doc_id"] = "parent"
+        with cad_common.doc_scope():
+            cad_common._CUR["doc_id"] = "nested"
+
+            def work():
+                entered.set()
+                assert release.wait(5)
+                seen.append(cad_common.current_doc_id())
+                finished.set()
+
+            cad_common._start_job("scope", work)
+            assert entered.wait(5)
+        cad_common._CUR["doc_id"] = "parent-new"
+        release.set()
+        assert finished.wait(5)
+        assert seen == ["nested"]
+        assert cad_common.current_doc_id() == "parent-new"
+
+
+def test_fresh_agent_cannot_adopt_peer_process_document(open_docs, monkeypatch):
+    monkeypatch.setattr(cad_common.cb, "active_daemon_mode", lambda: True)
+    open_docs.append({"doc_id": "doc-cpp00000001", "name": "peer", "origin_kind": "mcp"})
+    with cad_common.agent_doc_context("peer", scope="run"):
+        cad_common._CUR["doc_id"] = "doc-cpp00000001"
+        assert cad_common._doc(None) == "doc-cpp00000001"
+    with cad_common.agent_doc_context("other", scope="run"):
+        with pytest.raises(cad_common.DocRefError):
+            cad_common._doc(None)
+        assert cad_common._doc("doc-cpp00000001") == "doc-cpp00000001"
+
+
+def test_fresh_agent_cannot_adopt_peer_document_in_legacy_engine(open_docs, monkeypatch):
+    monkeypatch.setattr(cad_common.cb, "active_daemon_mode", lambda: False)
+    open_docs.append({"doc_id": "doc-cpp00000001", "name": "peer"})
+    with cad_common.agent_doc_context("peer", scope="run"):
+        cad_common._CUR["doc_id"] = "doc-cpp00000001"
+        assert cad_common._doc(None) == "doc-cpp00000001"
+    with cad_common.agent_doc_context("other", scope="run"):
+        with pytest.raises(cad_common.DocRefError):
+            cad_common._doc(None)
+
+
+def test_agent_closed_selection_does_not_redirect_to_gui_part(open_docs):
+    open_docs.append({"doc_id": "doc-cpp00000002", "name": "GUI", "origin_kind": "gui"})
+    with cad_common.agent_doc_context("builder", scope="run"):
+        cad_common._CUR["doc_id"] = "doc-cpp00000001"
+        with pytest.raises(cad_common.DocRefError) as error:
+            cad_common._doc(None)
+        assert error.value.code == "doc_not_found"
 
 
 def test_foreign_edit_notes_are_consumed_only_by_receiving_agent(monkeypatch):

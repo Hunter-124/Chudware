@@ -533,8 +533,6 @@ void SimManager::drawCustomMaterialPopup(AppState &st, Study &s) {
                          .withTip("Fatigue endurance limit. ~0.5 x Sut for steels; lower for "
                                   "aluminum and other non-ferrous alloys."));
   }
-  const bool locked = st.docLockedByAgent(st.docMirror.docId());
-  const std::string lockReason = locked ? st.agentLockReason(st.docMirror.docId()) : "";
   const char *reason = cmName_[0] == '\0' ? "Name the material."
                        : !(std::isfinite(cmE_) && cmE_ > 0.0f)
                            ? "Young's modulus must be greater than zero."
@@ -546,7 +544,6 @@ void SimManager::drawCustomMaterialPopup(AppState &st, Study &s) {
                            cmEnd_ >= 0.0f)
                            ? "Density and strengths cannot be negative."
                            : nullptr;
-  if (locked) reason = lockReason.c_str();
   if (reason)
     kit::inlineStatus(reason, kit::Tone::Warn);
   kit::gapRow();
@@ -557,25 +554,21 @@ void SimManager::drawCustomMaterialPopup(AppState &st, Study &s) {
   ImGui::SameLine(0.0f, gap);
   if (kit::primaryButton("Add material###cm_add", reason == nullptr, reason,
                          ImVec2(half, m::reBtnH()))) {
-    if (st.docLockedByAgent(st.docMirror.docId())) {
-      st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
-    } else {
-      Material mat;
-      mat.name = cmName_;
-      mat.E_mpa = cmE_;
-      mat.nu = cmNu_;
-      mat.density_g_cm3 = cmDensity_;
-      mat.yield_mpa = cmYield_;
-      mat.ultimate_mpa = cmUlt_;
-      mat.endurance_mpa = cmEnd_;
-      // The custom material becomes the part's active material (set_material) too.
-      const std::string key = addCustomMaterial(mat);
-      if (key.empty()) {
-        st.toast(ui::ToastLevel::Error, "Could not write the custom material library");
-      } else if (applyPartMaterial(st, s, key)) {
-        persist(st, s);
-        ImGui::CloseCurrentPopup();
-      }
+    Material mat;
+    mat.name = cmName_;
+    mat.E_mpa = cmE_;
+    mat.nu = cmNu_;
+    mat.density_g_cm3 = cmDensity_;
+    mat.yield_mpa = cmYield_;
+    mat.ultimate_mpa = cmUlt_;
+    mat.endurance_mpa = cmEnd_;
+    // The custom material becomes the part's active material (set_material) too.
+    const std::string key = addCustomMaterial(mat);
+    if (key.empty()) {
+      st.toast(ui::ToastLevel::Error, "Could not write the custom material library");
+    } else if (applyPartMaterial(st, s, key)) {
+      persist(st, s);
+      ImGui::CloseCurrentPopup();
     }
   }
   popCardText();
@@ -589,8 +582,6 @@ void SimManager::drawMaterialCombo(AppState &st, Study &s) {
   const bool nativeMaterial = s.definition.contains("material") &&
                               s.definition["material"].is_object();
 
-  const bool locked = st.docLockedByAgent(st.docMirror.docId());
-  const std::string lockReason = locked ? st.agentLockReason(st.docMirror.docId()) : "";
   // Combo labels, rebuilt only when the library changes (a custom material was added).
   static std::vector<std::string> names;
   static const void *namesFor = nullptr;
@@ -624,7 +615,6 @@ void SimManager::drawMaterialCombo(AppState &st, Study &s) {
                 .withRequired(!nativeMaterial)
                 .withHint(nativeMaterial ? "Native material" : "Select a material")
                 .withIssue(issue.empty() ? nullptr : issue.c_str(), kit::Tone::Warn)
-                .withDisabled(locked, lockReason.c_str())
                 .withTip("Stiffness, Poisson ratio, density and strengths for the solve. "
                          "Changing it updates the part's active material (FeatureManager "
                          "Material row and Mass Properties).")) &&
@@ -632,7 +622,7 @@ void SimManager::drawMaterialCombo(AppState &st, Study &s) {
       if (applyPartMaterial(st, s, mats[sel].key))
         persist(st, s);
     }
-    if (kit::secondaryButton("+ New material###newmat", !locked, lockReason.c_str())) {
+    if (kit::secondaryButton("+ New material###newmat")) {
       // Seed the editor from the current pick (or keep the last values) and open it.
       if (mi >= 0) {
         std::snprintf(cmName_, sizeof(cmName_), "%s (copy)", mats[mi].name.c_str());
@@ -2183,7 +2173,7 @@ void SimManager::drawForm(AppState &st, Study &s) {
     if (kit::actionFooter("run", a) == kit::FooterAction::Primary) {
       armedWell_ = -1;
       runPage_ = RunPageView{};
-      newStudy(st, StudyType::ThermalFea); // reallocates studies_: `s` is stale from here
+      handleCommand(st, "sim_new_thermal_fea"); // reallocates studies_: `s` is stale from here
     }
   } else {
     const std::string blocker = runBlocker(s);

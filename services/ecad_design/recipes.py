@@ -26,8 +26,8 @@ that share it. The orchestrator realizes a net by dropping a global LABEL on eac
 coordinate (and a power port for GND/supply rails) -- robust by-name nets that the netlist builder
 unions deterministically, exactly as KiCad does. No fragile autorouting.
 
-Pin references use the symbol's pin NUMBER as it appears in the starter library (Device:R -> "1"/"2";
-Simulation_SPICE:V_source -> "+"/"-"; OPAMP_dual -> "1"=IN-, "2"=IN+, "3"=OUT). These are validated
+Pin references use the symbol's pin NUMBER (Device:R and Simulation_SPICE:VDC -> "1"/"2";
+Simulation_SPICE:OPAMP -> "1"=IN+, "2"=IN-, "3"=V+, "4"=V-, "5"=OUT). These are validated
 against the resolved SymbolDef so a typo is caught before BUILD.
 
 All values are honest closed-form designs:
@@ -89,14 +89,14 @@ def voltage_divider(vin: float = 5.0, vout: float = 2.5) -> dict:
         "name": "voltage_divider",
         "request": f"a {_trim(vin)}V resistive divider with {_trim(vout)}V output",
         "components": [
-            {"ref": "V1", "libid": "Simulation_SPICE:V_source", "value": _trim(vin)},
+            {"ref": "V1", "libid": "Simulation_SPICE:VDC", "value": _trim(vin)},
             {"ref": "R1", "libid": "Device:R", "value": _fmt_ohms(r1)},
             {"ref": "R2", "libid": "Device:R", "value": _fmt_ohms(r2)},
         ],
         "nets": {
-            "IN":  [{"ref": "V1", "pin": "+"}, {"ref": "R1", "pin": "1"}],
+            "IN":  [{"ref": "V1", "pin": "1"}, {"ref": "R1", "pin": "1"}],
             "VMID": [{"ref": "R1", "pin": "2"}, {"ref": "R2", "pin": "1"}],
-            "GND": [{"ref": "V1", "pin": "-"}, {"ref": "R2", "pin": "2"}],
+            "GND": [{"ref": "V1", "pin": "2"}, {"ref": "R2", "pin": "2"}],
         },
         "study": {
             "analysis": "op",
@@ -120,15 +120,16 @@ def rc_lowpass(fc: float = 1000.0) -> dict:
         "name": "rc_lowpass",
         "request": f"an RC low-pass filter with a {_trim(fc)}Hz cutoff",
         "components": [
-            {"ref": "V1", "libid": "Simulation_SPICE:V_source", "value": "0",
-             "ac_mag": 1.0},
+            {"ref": "V1", "libid": "Simulation_SPICE:VSIN", "value": "VSIN",
+             "Sim.Device": "V", "Sim.Type": "SIN", "Sim.Pins": "1=+ 2=-",
+             "Sim.Params": "dc=0 ampl=1 f=1k ac=1"},
             {"ref": "R1", "libid": "Device:R", "value": _fmt_ohms(r)},
             {"ref": "C1", "libid": "Device:C", "value": _fmt_farads(c)},
         ],
         "nets": {
-            "IN":  [{"ref": "V1", "pin": "+"}, {"ref": "R1", "pin": "1"}],
+            "IN":  [{"ref": "V1", "pin": "1"}, {"ref": "R1", "pin": "1"}],
             "OUT": [{"ref": "R1", "pin": "2"}, {"ref": "C1", "pin": "1"}],
-            "GND": [{"ref": "V1", "pin": "-"}, {"ref": "C1", "pin": "2"}],
+            "GND": [{"ref": "V1", "pin": "2"}, {"ref": "C1", "pin": "2"}],
         },
         "study": {
             "analysis": "ac",
@@ -146,8 +147,8 @@ def rc_lowpass(fc: float = 1000.0) -> dict:
 def inverting_amp(gain: float = 10.0) -> dict:
     """An inverting op-amp: Vin -> Rin -> (-); Rf from (-) to OUT; (+) to GND. Vout = -gain*Vin.
 
-    Rin fixed at 1k, Rf = |gain| * Rin. Uses the dual op-amp symbol (its OPAMP sim subckt). The
-    op-amp pins are referenced by NUMBER: "1"=IN-, "2"=IN+, "3"=OUT (unit 1).
+    Rin is fixed at 1k and Rf = |gain| * Rin. The KiCad simulation op-amp has
+    its V+ and V- terminals explicitly powered from +12 V and -12 V sources.
     """
     gain = abs(float(gain))
     rin = 1000.0
@@ -158,17 +159,22 @@ def inverting_amp(gain: float = 10.0) -> dict:
         "name": "inverting_amp",
         "request": f"an inverting amplifier with a gain of {_trim(gain)}",
         "components": [
-            {"ref": "V1", "libid": "Simulation_SPICE:V_source", "value": _trim(vin)},
+            {"ref": "V1", "libid": "Simulation_SPICE:VDC", "value": _trim(vin)},
+            {"ref": "V2", "libid": "Simulation_SPICE:VDC", "value": "12"},
+            {"ref": "V3", "libid": "Simulation_SPICE:VDC", "value": "-12"},
             {"ref": "Rin", "libid": "Device:R", "value": _fmt_ohms(rin)},
             {"ref": "Rf", "libid": "Device:R", "value": _fmt_ohms(rf)},
-            {"ref": "U1", "libid": "Amplifier_Operational:OPAMP_dual", "value": "OPAMP"},
+            {"ref": "U1", "libid": "Simulation_SPICE:OPAMP", "value": "OPAMP"},
         ],
         "nets": {
-            "IN":  [{"ref": "V1", "pin": "+"}, {"ref": "Rin", "pin": "1"}],
+            "IN":  [{"ref": "V1", "pin": "1"}, {"ref": "Rin", "pin": "1"}],
             "INV": [{"ref": "Rin", "pin": "2"}, {"ref": "Rf", "pin": "1"},
-                    {"ref": "U1", "pin": "1"}],          # op-amp IN- (pin number 1)
-            "OUT": [{"ref": "Rf", "pin": "2"}, {"ref": "U1", "pin": "3"}],  # op-amp OUT
-            "GND": [{"ref": "V1", "pin": "-"}, {"ref": "U1", "pin": "2"}],  # op-amp IN+ to GND
+                    {"ref": "U1", "pin": "2"}],          # op-amp IN-
+            "OUT": [{"ref": "Rf", "pin": "2"}, {"ref": "U1", "pin": "5"}],
+            "GND": [{"ref": "V1", "pin": "2"}, {"ref": "U1", "pin": "1"},
+                    {"ref": "V2", "pin": "2"}, {"ref": "V3", "pin": "2"}],
+            "VCC": [{"ref": "V2", "pin": "1"}, {"ref": "U1", "pin": "3"}],
+            "VEE": [{"ref": "V3", "pin": "1"}, {"ref": "U1", "pin": "4"}],
         },
         "study": {
             "analysis": "op",
@@ -207,15 +213,17 @@ def led_driver(vsupply: float = 3.3, vf: float = LED_MODEL_VF, current: float = 
         "name": "led_driver",
         "request": f"a {_trim(vsupply)}V LED driver (series current-limit resistor)",
         "components": [
-            {"ref": "V1", "libid": "Simulation_SPICE:V_source", "value": _trim(vsupply)},
+            {"ref": "V1", "libid": "Simulation_SPICE:VDC", "value": _trim(vsupply)},
             {"ref": "R1", "libid": "Device:R", "value": _fmt_ohms(r)},
-            {"ref": "D1", "libid": "Device:LED", "value": "LED"},
+            {"ref": "D1", "libid": "Device:LED", "value": "LED",
+             "Sim.Device": "D", "Sim.Pins": "1=K 2=A",
+             "Sim.Params": "is=2.3e-19 n=2 rs=2"},
         ],
         "nets": {
             # V1+ -> VCC -> R1.1 ; R1.2 -> LED anode ; LED cathode -> GND ; V1- -> GND.
-            "VCC":   [{"ref": "V1", "pin": "+"}, {"ref": "R1", "pin": "1"}],
-            "LED_A": [{"ref": "R1", "pin": "2"}, {"ref": "D1", "pin": "A"}],
-            "GND":   [{"ref": "D1", "pin": "K"}, {"ref": "V1", "pin": "-"}],
+            "VCC":   [{"ref": "V1", "pin": "1"}, {"ref": "R1", "pin": "1"}],
+            "LED_A": [{"ref": "R1", "pin": "2"}, {"ref": "D1", "pin": "2"}],
+            "GND":   [{"ref": "D1", "pin": "1"}, {"ref": "V1", "pin": "2"}],
         },
         "study": {
             "analysis": "op",
@@ -237,6 +245,8 @@ def rc_555_astable(freq: float = 1.0) -> dict:
     expectation is RECORDED (oscillator period) but the behavioural 555 subckt may or may not
     free-run in this MNA engine, so the orchestrator reports the discrepancy rather than looping.
     """
+    from services.sim.subckt import _NE555_SUBCKT
+
     freq = float(freq)
     c = 1e-6
     # f = 1.44 / ((Ra + 2 Rb) * C); pick Ra = Rb = R, so f = 1.44 / (3 R C).
@@ -246,15 +256,18 @@ def rc_555_astable(freq: float = 1.0) -> dict:
         "name": "rc_555_astable",
         "request": f"a 555 astable oscillator at about {_trim(freq)}Hz",
         "components": [
-            {"ref": "V1", "libid": "Simulation_SPICE:V_source", "value": "5"},
-            {"ref": "U1", "libid": "Timer:NE555", "value": "NE555"},
+            {"ref": "V1", "libid": "Simulation_SPICE:VDC", "value": "5"},
+            {"ref": "U1", "libid": "Timer:NE555D", "value": "NE555D",
+             "Sim.Device": "SPICE", "Sim.Params": 'type="X" model="NE555" lib=""',
+             "Sim.Pins": "1=1 2=2 3=3 4=4 5=5 6=6 7=7 8=8"},
             {"ref": "Ra", "libid": "Device:R", "value": _fmt_ohms(r)},
             {"ref": "Rb", "libid": "Device:R", "value": _fmt_ohms(r)},
             {"ref": "C1", "libid": "Device:C", "value": _fmt_farads(c)},
+            {"ref": "C2", "libid": "Device:C", "value": "10n"},
         ],
         "nets": {
             # VCC rail: V1+, 555 VCC (pin 8) and RST (pin 4) tied high, Ra top.
-            "VCC": [{"ref": "V1", "pin": "+"}, {"ref": "U1", "pin": "8"},
+            "VCC": [{"ref": "V1", "pin": "1"}, {"ref": "U1", "pin": "8"},
                     {"ref": "U1", "pin": "4"}, {"ref": "Ra", "pin": "1"}],
             # Ra -> Rb junction = DISCHARGE (pin 7).
             "DISCH": [{"ref": "Ra", "pin": "2"}, {"ref": "Rb", "pin": "1"},
@@ -262,10 +275,12 @@ def rc_555_astable(freq: float = 1.0) -> dict:
             # Rb -> C top = THRESHOLD (pin 6) tied to TRIGGER (pin 2).
             "THR": [{"ref": "Rb", "pin": "2"}, {"ref": "C1", "pin": "1"},
                     {"ref": "U1", "pin": "6"}, {"ref": "U1", "pin": "2"}],
+            "CTRL": [{"ref": "U1", "pin": "5"}, {"ref": "C2", "pin": "1"}],
             "OUT": [{"ref": "U1", "pin": "3"}],
-            "GND": [{"ref": "V1", "pin": "-"}, {"ref": "U1", "pin": "1"},
-                    {"ref": "C1", "pin": "2"}],
+            "GND": [{"ref": "V1", "pin": "2"}, {"ref": "U1", "pin": "1"},
+                    {"ref": "C1", "pin": "2"}, {"ref": "C2", "pin": "2"}],
         },
+        "spice_directives": _NE555_SUBCKT + ".model Dclamp D(IS=1e-9 N=1 RS=10)\n",
         "study": {
             "analysis": "tran",
             "params": {"tstep": period / 200.0, "tstop": period * 3.0, "uic": True},

@@ -9,7 +9,7 @@
 2. `ecad_run_erc` — fix every error before board creation.
 3. `board_from_schematic` → place footprints → `ecad_autoroute` or manual route →
    `ecad_fill_zones` → `ecad_run_drc`.
-4. Impedance-critical nets: `ecad_set_net_class` + `check_impedance` before routing-density decisions.
+4. Impedance-critical nets: `ecad_set_net_class` + `ecad_check_impedance` before routing-density decisions.
 5. Schematic+place alone is NOT done — board + DRC evidence required (or blocked handoff).
 
 ## Integrity

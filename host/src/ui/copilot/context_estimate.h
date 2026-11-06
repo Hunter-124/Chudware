@@ -22,6 +22,8 @@
 // counting rules — the part that is easy to get subtly wrong — under test.
 #pragma once
 
+#include <algorithm>
+#include <climits>
 #include <string>
 #include <vector>
 
@@ -54,5 +56,61 @@ ContextEstimate estimateEntries(const std::vector<TranscriptEntry>& entries);
 // Rough token count for one UTF-8 string. Public so the meter can price the draft prompt sitting
 // in the composer before it is sent. Empty input yields 0; the result is never negative.
 int estimateTokens(const std::string& text);
+
+// The shared per-conversation meter stores unanchored OMP estimates as negative
+// values, -1 for unknown, 0 for a fresh session, and INT_MIN for measured zero.
+// Keep zero distinct from "estimate the visible transcript".
+inline int storedContextEstimate(int tokens) {
+    return -(std::min(std::max(tokens, 0), INT_MAX - 2) + 2);
+}
+
+inline int storedContextMeasurement(int tokens) {
+    return tokens == 0 ? INT_MIN : tokens;
+}
+
+template <typename Conversation>
+void storeConversationContext(int& visible, std::vector<Conversation>& conversations,
+                              bool isViewed, const std::string& owner, int value) {
+    if (isViewed) {
+        visible = value;
+        return;
+    }
+    for (auto& conversation : conversations)
+        if (conversation.id == owner) {
+            conversation.lastContextTokens = value;
+            return;
+        }
+}
+
+template <typename Conversation>
+void storeConversationContextPeak(int& visible, std::vector<Conversation>& conversations,
+                                  bool isViewed, const std::string& owner, int value) {
+    if (isViewed) {
+        visible = std::max(visible, value);
+        return;
+    }
+    for (auto& conversation : conversations)
+        if (conversation.id == owner) {
+            conversation.lastContextTokens = std::max(conversation.lastContextTokens, value);
+            return;
+        }
+}
+
+template <typename Conversation>
+void storeConversationWindow(int& visible, std::string& visibleSource,
+                             std::vector<Conversation>& conversations, bool isViewed,
+                             const std::string& owner, int window, const std::string& source) {
+    if (isViewed) {
+        visible = window;
+        visibleSource = source;
+        return;
+    }
+    for (auto& conversation : conversations)
+        if (conversation.id == owner) {
+            conversation.lastContextWindow = window;
+            conversation.lastContextWindowSource = source;
+            return;
+        }
+}
 
 }  // namespace ui

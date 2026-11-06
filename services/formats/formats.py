@@ -67,6 +67,7 @@ _EXT_TO_FORMAT: dict[str, str] = {
     ".sldasm": "sldasm",
     ".x_t": "x_t",
     ".x_b": "x_b",
+    ".scad": "scad",
 }
 
 
@@ -225,7 +226,7 @@ def export_document(
     if fmt == "3dm":
         return _export_3dm(session_bodies, path)
 
-    if fmt in ("dxf", "dwg"):
+    if fmt in ("dxf", "dwg", "scad"):
         raise ValueError(
             f"this Python helper does not write {fmt.upper()}. {fmt.upper()} export runs in the "
             f"native engine: the export_file RPC with format '{fmt}' (MCP export_part "
@@ -282,6 +283,9 @@ def import_path(
     elif fmt == "dwg":
         from services.formats.formats_dwg import import_dwg
         return import_dwg(path)
+    elif fmt == "scad":
+        raise ValueError("SCAD source projects import through the native import_file RPC "
+                         "(MCP import_part), not the Python shape helper.")
     elif fmt in ("sldprt", "sldasm"):
         from services.formats.formats_solidworks import import_solidworks
         return import_solidworks(path)

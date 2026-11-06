@@ -808,3 +808,22 @@ TEST_CASE("B14 invalid picks and null or empty shapes still return null") {
     }
     CHECK(chudware::doc::make_pick_selector(box, "unknown", 1, std::nullopt).is_null());
 }
+
+TEST_CASE("ownerless rebind is bounded and reports movement") {
+    const json original = vtx_selector(0, 0, 0, std::string("f1"));
+    const std::vector<TopoInfo> far = {vtx(0, 30, 0, 0, 0, std::string("f2"))};
+    CHECK_FALSE(resolve(original, far, 100.0).index.has_value());
+
+    const std::vector<TopoInfo> moved = {vtx(0, 1, 0, 0, 0, std::string("f2"))};
+    chudware::doc::RebindScope scope;
+    const auto result = resolve(original, moved, 100.0);
+    REQUIRE(result.index.has_value());
+    CHECK(result.owner_fallback);
+    CHECK(result.moved_mm == doctest::Approx(1.0));
+    const auto notes = scope.take();
+    REQUIRE(notes.size() == 1);
+    CHECK(notes[0].owner == std::optional<std::string>("f1"));
+    CHECK(notes[0].moved_mm == doctest::Approx(1.0));
+    CHECK(notes[0].best_score == doctest::Approx(result.score));
+    CHECK(std::isinf(notes[0].margin));
+}

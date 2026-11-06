@@ -3,13 +3,26 @@
 `chudware-hostd` (sources: `core/hostd/`, transport: `services/ipc/`) is a small
 binary that owns one shared `libchudware` engine instance per instance key. In daemon
 mode the GUI and MCP sessions for that key attach as IPC clients instead of loading
-their own copy of the engine. It exists to kill the orphaned-engine /
-autosave-timer-leak bug class and to make agent edits appear in the GUI viewport
-live (no `.step+` file handoff).
+their own copy of the engine. It exists to eliminate orphaned-engine /
+autosave-timer-leak bugs and share live documents and edits without a `.step+`
+file handoff. Sharing a document does not automatically open it in the viewport.
 
 The daemon itself does NOT link the engine — it dlopens `libchudware` exactly the
 way the GUI's in-process path does (`services/worker/cpp_core.cpp`), so
 `CHUDWARE_LIBCHUDWARE` / dist resolution behaves identically.
+
+## Live documents and presentation
+
+The registry shares live engine documents independently of GUI tabs. The GUI admits
+GUI-origin documents, intentional user opens and recovery, and documents marked
+`presented=true` in the registry or delivered by `doc.presented`. Agent-created
+documents otherwise stay hidden. `show_in_app` explicitly requests `doc_present`:
+it marks only the live document and does not save it. Legacy publication requires
+explicit opt-in and updates only presented documents.
+
+Opening a native file already backed by a live document reuses that document,
+preserving its selection and subsequent updates. A dismissed tab stays dismissed
+rather than reopening on ordinary registry or change events.
 
 ## Lifecycle
 
@@ -44,7 +57,8 @@ way the GUI's in-process path does (`services/worker/cpp_core.cpp`), so
 - **Bounded explicit drains.** `daemon_drain` / `--stop` use
   `CHUDWARE_HOSTD_DRAIN_GRACE_S` (default **20 s**); tray Quit uses **5 s**.
   At the deadline stragglers are disconnected. Stale-binary self-drain is soft:
-  it refuses new connections but lets active sessions finish.
+  it refuses independent newcomers but lets active sessions finish, including
+  fresh tool sockets from verified existing agent workers on supported Linux kernels.
 - **Doc GC is separate.** Unattached docs have a **90 s** base grace; agent/MCP
   origins have a **1800 s** floor. That grace keeps finished mission parts openable
   while the GUI exists, but does not pin the daemon through shutdown.
@@ -53,6 +67,14 @@ way the GUI's in-process path does (`services/worker/cpp_core.cpp`), so
   document-scoped and unknown methods retain the primary socket. Side-connection EOF/timeouts
   do not invalidate the primary connection. Background sockets do not receive the unconditional
   `gui` pin; recent/in-flight RPCs still count as work under the ordinary non-GUI rules.
+  `omp_login` (one minutes-long browser OAuth flow) is on that list too, and the GUI issues it
+  from its own async queue.
+- **Worker lanes.** Agent turns run on pool workers (`agent` primary, `agent-turn` extras),
+  PLM/parts/printers on the `general` worker, and the session-free provider/model discovery,
+  sign-in/out and key, `ai_roles_*`, `subscription_*` and `skills_*` calls on a dedicated
+  `service` worker (`WorkerBridge::isServiceMethod`), so they answer live while a turn holds
+  its worker. While an interactive `omp_login` holds the service worker, its other calls fail
+  fast with `worker_lane_busy` (sign-in in progress). Cell actors keep their per-actor lanes.
 - **CLI**:
   - `chudware-hostd --foreground` — run serving in the current terminal (dev).
   - `chudware-hostd --status` — JSON status of the running instance (`state`,
@@ -86,8 +108,7 @@ with the private control-pipe implementation.
 
 `ipc_transport_windows` in core CTest exercises real native idle/pre-submit
 cancellation, simultaneous blocked reads/writes, duplex traffic, partial frames,
-EOF and the 64 MiB boundary. Performance measurements are recorded separately in
-the native Windows evidence archive; VM measurements are not GPU/UI benchmarks.
+EOF and the 64 MiB boundary.
 
 ## Windows worker lanes
 
@@ -119,19 +140,17 @@ that terminator. Archive readers use wide filenames and close before replacement
 API paths remain UTF-8, including Unicode save/overwrite/relocation and mixed separators;
 unrelated NTFS names are compared as native code units, not narrowed through the ANSI code page.
 Cache provenance keys and save stages use explicit TokenUser ownership with the protected
-user/SYSTEM ACL, including elevated launches. The native runtime smoke checks verified
-checkpoint hydration with zero feature execution and no pending verification rebuild,
-then a tail edit reusing earlier checkpoints.
+user/SYSTEM ACL, including elevated launches.
 
 ## Environment variables
 
 | Variable | Meaning |
 |---|---|
 | `CHUDWARE_ENGINE_DAEMON` | Unset/`1` = default daemon routing; `0` = explicit in-process opt-out. Desktop GUI startup can also fall back if daemon connection fails, but never on a `daemon_draining` refusal. |
-| `CHUDWARE_HOSTD_BIN` | Explicit daemon binary to spawn. Developer MCP discovery tries `CHUDWARE_DIST`, then Linux full/slim build trees (Windows: `core/build/bin`); packaged C++ clients resolve the manifest-owned binary. Pin this explicitly in portable examples. |
-| `CHUDWARE_INSTANCE_KEY` | 12-hex instance key override. Unset → hash of the realpath of the resolved hostd binary (Windows: lowercased path). Same key = same daemon; different keys coexist. |
-| `CHUDWARE_HOSTD_SOCKET` | Explicit socket path override (Linux). |
-| `CHUDWARE_HOSTD_PIPE` | Explicit pipe name override (Windows; `CHUDWARE_HOSTD_SOCKET` also accepted). |
+| `CHUDWARE_HOSTD_BIN` | Explicit daemon binary to spawn for native developer builds and Python MCP discovery; packaged native clients resolve the manifest-owned binary instead. Developer MCP discovery tries `CHUDWARE_DIST`, then Linux full/slim build trees (Windows: `core/build/bin`). |
+| `CHUDWARE_INSTANCE_KEY` | Explicit key override for native developer builds. Otherwise the default is a 16-hex FNV-1a hash of the resolved hostd binary path (Windows: lowercased full path). Python MCP discovery honors the override independently of the native build type. |
+| `CHUDWARE_HOSTD_SOCKET` | Explicit socket path override (Linux native developer builds; also honored by Python MCP discovery). |
+| `CHUDWARE_HOSTD_PIPE` | Explicit pipe name override (Windows native developer builds; `CHUDWARE_HOSTD_SOCKET` also accepted). Python MCP discovery honors both. |
 | `CHUDWARE_HOSTD_LINGER_SECS` | Idle-exit linger, default 120. Tests/smokes use small values (5). |
 | `CHUDWARE_HOSTD_STALECHECK_S` | Stale-binary self-drain check interval, default 60. Tests use 1. |
 | `CHUDWARE_HOSTD_GUI_EXIT_GRACE_S` | Idle grace after the last GUI detaches, default 10 s. |
@@ -160,33 +179,17 @@ AppImage, whose mount is read-only.
 
 ## Instance keys: dev vs installed vs AppImage
 
-The key is what keeps independent installs from cross-talking:
+The key separates daemon instances by hostd binary path. Native developer builds
+honor the key and endpoint overrides above; native release builds ignore them.
+Python MCP discovery honors those environment variables regardless of the native
+build type, so overriding them when connecting to a release daemon can select a
+different endpoint.
 
-- **Dev tree**: key = hash of the realpath of the built hostd binary
-  (`core/build-occt-linux/bin/chudware-hostd`). Rebuilds keep the same path/key.
-- **Installed (Windows)**: key = hash of
-  `%LOCALAPPDATA%\Programs\Chudware\chudware-hostd.exe` (pinned via
-  `CHUDWARE_HOSTD_BIN` in the registered MCP server env — see
-  `services/installer/register_mcp.py --hostd-bin`).
-- **AppImage**: the squashfs mount point is **randomized per launch**, so
-  hashing the resolved binary path would mint a new daemon every run. AppRun
-  therefore exports `CHUDWARE_INSTANCE_KEY = sha256($APPIMAGE)[0:12]` — the stable
-  path of the AppImage *file* — plus `CHUDWARE_HOSTD_BIN` at the bundled binary.
-  Two different AppImage versions have different `$APPIMAGE` paths → different
-  keys → they coexist safely.
-- **MCP with an AppImage install**: register the MCP server env with the same
-  `CHUDWARE_INSTANCE_KEY` (hash of your AppImage path) so agent sessions attach to
-  the GUI's daemon. Note the bundled hostd binary only exists while the
-  AppImage is mounted, so headless MCP sessions cannot *spawn* it — start the
-  GUI (or any AppImage invocation) first, then MCP sessions attach to the
-  running daemon. Example server env block:
-
-  ```json
-  "env": {
-    "CHUDWARE_ENGINE_DAEMON": "1",
-    "CHUDWARE_INSTANCE_KEY": "<first 12 hex of sha256 of the AppImage path>"
-  }
-  ```
+AppRun exports a key derived from the AppImage file path and points
+`CHUDWARE_HOSTD_BIN` at the bundled binary. Native release discovery ignores that
+key and derives its own from the hostd binary path, while Python MCP discovery honors
+the exported key. The export therefore does not establish a common release-build
+GUI/MCP rendezvous.
 
 ## Recovery semantics (id_remap)
 
@@ -194,15 +197,26 @@ Recovery is **crash-only**, not automatic document reopening. A hard-killed
 daemon leaves a session autosave directory; on restart its eligible snapshots
 are registered in the orphan recovery tier. They wait for explicit
 `recovery_list` → `recovery_open`. Only that open mints a fresh doc id and records
-the old→new mapping returned by `hello.id_remap`. Undo/redo stacks are not persisted;
-recoverable geometry is limited to the last successful snapshot, not a guaranteed
-one-interval loss bound if saving was disabled or failed.
+the old→new mapping returned by `hello.id_remap`. The recovered doc opens **dirty**
+(it is unsaved work again) and is snapshotted into the current session before its
+orphan artifact is deleted, so a second crash right after Recover cannot lose it.
+Undo/redo stacks are not persisted; recoverable geometry is limited to the last
+successful snapshot, not a guaranteed one-interval loss bound if saving was disabled
+or failed.
 
-Clean shutdown (idle-exit, drain, SIGTERM) removes the current session's autosaves.
-Explicit discard purges that doc's artifacts. While the daemon is serving, GC retires
-eligible abandoned unsaved docs to the orphan tier before closing them; already-saved
-clean docs, empty/internal docs and pristine reproducible imports do not create recovery
-rows. These behaviours live in `core/hostd/autosave.*` and `doc_registry.*`.
+Deliberate shutdown (idle-exit, `daemon_drain`/`--stop`, tray Quit) removes the current
+session's autosaves. Termination from outside — SIGTERM/SIGINT (session logout, OS
+shutdown, a GPU-reset cleanup), Windows console close/logoff — is not the user dropping
+their work: hostd takes a final snapshot of the dirty docs and keeps the session dir, so
+they are offered for recovery like a crash. Explicit discard purges that doc's artifacts.
+While the daemon is serving, GC retires eligible abandoned unsaved docs to the orphan tier
+before closing them; already-saved clean docs, empty/internal docs and pristine
+reproducible imports do not create recovery rows. These behaviours live in
+`core/hostd/autosave.*` and `doc_registry.*`.
+
+The GUI's "Recover unsaved parts?" prompt names every entry and, on Recover, reopens them
+one `recovery_open {id}` at a time on its async lane: the window stays live and each tab
+opens (marked unsaved, user-owned) when its doc is ready.
 
 Durable mission delivery is a different boundary:
 `services/mcp/cad_common.py::save_touched_docs()` saves eligible agent-authored docs to
@@ -212,7 +226,7 @@ Durable mission delivery is a different boundary:
 empty/discarded docs and pristine reproducible imports, and reports persistence errors.
 Do not substitute daemon shutdown or crash recovery for that save.
 
-For an isolated Linux development run, from the repository root:
+For an isolated Linux developer-build run, from the repository root:
 
 ```bash
 export CHUDWARE_HOSTD_BIN="$PWD/core/build-occt-linux/bin/chudware-hostd"
@@ -236,32 +250,48 @@ when a live daemon socket for the same install exists ("mode divergence" —
 two engines would be two sources of truth). Do not mix modes when shared live
 documents are required.
 
-## Version staleness (drain-replace)
+## Version staleness (soft cutover)
 
 The daemon and engine embed a build-time git-describe id
 (`chudware-hostd --version`, `chudware_build_id()`; `hello` carries `git_rev` and
 `engine_build_id`). Two mechanisms detect stale binaries:
 
-- **Client-side drain-replace**: on connect, clients compare `hello.git_rev`
+- **Client-side warning**: on connect, clients compare `hello.git_rev`
   (the RUNNING daemon) against the build id of the hostd binary ON DISK
-  (`--version` output, cached per binary mtime — one subprocess per rebuild per
-  client process). Mismatch → the client sends `daemon_drain` (refused while a
-  mission is active — the client warns and stays on the old daemon), waits for
-  the old pid to exit, then respawns/reconnects the new build.
-- **Daemon-side self-drain backstop**: the accept loop stats its own binary and
+  (`--version` output, cached per binary mtime). A mismatch warns but does not send
+  `daemon_drain`, stop another GUI, or replay work. A connection does not have authority
+  to discard unsaved documents merely because a newer binary exists.
+- **Daemon-side soft drain**: the accept loop stats its own binary and
   the loaded `libchudware` every `CHUDWARE_HOSTD_STALECHECK_S` (default 60 s); an
   mtime change starts a soft drain (`beginDrain(0, "stale_binary", path)`). Existing
-  clients finish on the old engine, and the daemon exits when no client pins it.
+  sessions finish on the old engine; supervised children also keep it alive.
+  It exits when no client, call or supervised child pins it.
   Deploys must still be temp-file + RENAME (never `cp` over a live .so).
 
 ### New connects to a draining daemon
 
-Every drain refuses new clients by name: `stale_binary` (soft, above),
+Drains refuse independent newcomers by name: `stale_binary` (soft, above),
 `stop_requested` (`daemon_drain` / `--stop`) and `quit` (tray Quit) — see
 `Server::admitWhileDraining` / `drainRefusal` in `core/hostd/server.cpp`.
 
-- An operator `control` client (`chudware-hostd --status` / `--stop`) is admitted. It
-  reports the drain, or `--stop` turns a soft drain into a hard stop.
+- An operator `control` client (`chudware-hostd --status` / `--stop`) is admitted only
+  to ping, status and drain operations. It cannot read or edit documents. `--stop`
+  turns a soft drain into a hard stop.
+- Desktop soft drains freeze the daemon-owned agent worker generations and session
+  owners present at drain start. Fresh MCP sockets from those workers can continue
+  on the same engine. Busy owners use the existing single-flight queue rather than
+  migrating the conversation to a different worker.
+- Continuity requires Linux `SO_PEERPIDFD` support (kernel 6.5+) and a live,
+  OS-authenticated peer matching that frozen ownership. A declared PID or writer group
+  is not proof. Other platforms, older kernels, denied peer proof, ended generations
+  and ownership transfers already underway fail closed. Tenant-cell actor sockets
+  have no continuity exception. Explicit hard stops revoke soft-drain eligibility.
+- An open GUI keeps its own lanes. On a desktop soft `stale_binary` drain, a fresh
+  `gui` or `gui-background` hello is admitted when its live, OS-authenticated peer
+  process already holds a `gui` connection to this daemon: the side sockets that carry
+  agent answers, steering, Stop and background queries. That process already pins the drain,
+  so this never extends it. The same `SO_PEERPIDFD` requirement applies; other
+  platforms fail closed, and a GUI process with no live connection stays refused.
 - Any other client gets a `{"event":"daemon.draining","reason":…}` line, then an error
   reply to its `hello`, then a clean close. The error object:
   `{code:"daemon_draining", reason, daemon_pid, clients, active_clients, children,
@@ -295,9 +325,8 @@ Every drain refuses new clients by name: `stale_binary` (soft, above),
   `CloseApplications=yes` enables Restart Manager. Separately, the developer
   `install.ps1` drains known install-directory daemons with `--stop --force`,
   then uses image-path-scoped `taskkill`; MCP registration pins `CHUDWARE_HOSTD_BIN`.
-  The isolated native Windows developer checks are recorded in the remediation
-  evidence ledger. They do not qualify the installed payload, Restart Manager or
-  upgrade/uninstall behavior; use the manual checklist in `PACKAGING_WINDOWS.md`.
+  Use the manual checklist in `PACKAGING_WINDOWS.md` for installed payload,
+  Restart Manager and upgrade/uninstall behavior.
 - **Upgrades**: the developer installer has an explicit daemon stop path; the packaged
   installer uses Restart Manager. The Windows checklist must establish the runtime
   behaviour before claiming safe replacement of a running daemon.
@@ -390,4 +419,6 @@ mesh result: it is the only statement of which mesher source the engine actually
   still needs an isolated runtime smoke for end-to-end durable-file proof.
 - Native watchdog policy: CTest **`engine_watchdog`**
   (`core/hostd/test_engine_watchdog.cpp`), not a `test_hostd` CTest target.
+- Run the isolated `platform` and `agent` suites with `scripts/testbox.py --suite platform,agent`;
+  see [Running tests](../../CONTRIBUTING.md#running-tests).
 - Windows validation: `PACKAGING_WINDOWS.md`.

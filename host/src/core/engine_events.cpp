@@ -1,6 +1,7 @@
 #include "engine_events.h"
 
 #include <chrono>
+#include <algorithm>
 #include <climits>
 #include <cstdint>
 #include <cstdio>
@@ -15,12 +16,17 @@
 #include <nlohmann/json.hpp>
 
 #include "app_state.h"
+#include "cpp_core.h"
 #include "tess_catchup.h"
+#include "frame_stats.h"
 #include "engine_backend.h"      // services/worker (include dir)
 #include "ipc_client.h"          // services/ipc (include dir)
 #include "../renderer.h"
 #include "../render/aicm_loader.h"
+#include "../ui/feature_tree.h"
+#include "../ui/feature_tree_nested.h"
 #include "../ui/property_manager.h"
+#include "../ui/anim.h"
 #include "../ui/reveng/reveng_internal.h"  // RevEngEvent / feedRevEngEvent / RevEngState
 #include "../ui/manufacture/mfg_mirror.h"
 #include "../ui/sketch_mode.h"
@@ -32,8 +38,7 @@ namespace core {
 using nlohmann::json;
 
 namespace {
-// Bounded synchronous calls made by the GL thread. EngineClient closes the
-// connection on timeout; the next frame's maintainConnection restores it.
+// Primary metadata round trips run on AsyncRpc's FIFO, never on the GL thread.
 constexpr int kMetadataCallTimeoutMs = 5000;
 constexpr int kAttachCallTimeoutMs = 10000;
 
@@ -45,13 +50,12 @@ bool userMidEdit(AppState& st) {
            (st.propertyManager && st.propertyManager->active());
 }
 
-// Agent edit lock (AppState::docLockedByAgent): stamp a revision written by any client other
-// than a GUI seat. Empty source_kind (older daemons) is not treated as an agent.
-void stampForeignWrite(AppState& st, int idx, const json& d) {
-    const std::string kind = d.value("source_kind", std::string());
-    if (idx < 0 || kind.empty() || kind == "gui") return;
-    st.docTabs[idx].lastForeignWriteAt = std::chrono::steady_clock::now();
+bool tabMidEdit(const AppState::DocTab& tab) {
+    return tab.session &&
+           ((tab.session->sketch && tab.session->sketch->active()) ||
+            (tab.session->pm && tab.session->pm->active()));
 }
+
 
 int tabIndexForDoc(AppState& st, const std::string& docId) {
     for (int i = 0; i < (int)st.docTabs.size(); ++i)
@@ -59,34 +63,10 @@ int tabIndexForDoc(AppState& st, const std::string& docId) {
     return -1;
 }
 
-// Only a never-edited, never-saved empty CAD tab is disposable as a viewport
-// placeholder. Dirty alone is insufficient: saving or undoing an edit clears it.
-// A new part's mirror tree is initially {}, so revision zero is the authority
-// for that case; an assembly already has its empty tree on creation.
-bool activeOwnDocIsPristine(AppState& st) {
-    if (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size() ||
-        userMidEdit(st)) return false;
-    const AppState::DocTab& t = st.docTabs[st.activeTab];
-    if (t.kind != AppState::DocTab::TabKind::Part &&
-        t.kind != AppState::DocTab::TabKind::Assembly) return false;
-    if (t.aiHandoff || t.userAdopted || t.dirty || !t.path.empty() ||
-        t.docId.empty() || st.docMirror.docId() != t.docId ||
-        st.docMirror.revision() != 0) return false;
-    const json& tree = st.docMirror.tree();
-    if (!tree.is_null() && !tree.is_object()) return false;
-    for (const char* key : {"features", "components", "bodies"}) {
-        const auto it = tree.find(key);
-        if (it != tree.end() && (!it->is_array() || !it->empty())) return false;
-    }
-    return !st.renderer || st.renderer->bodyCount() == 0;
-}
-
+// Automatic presentation never changes a user's current selection, including an
+// empty tab. A deliberate open/switch is the only way to replace that view.
 bool canFocusMirror(AppState& st, bool firstMirror) {
-    if (activeOwnDocIsPristine(st)) return true;
-    if (!firstMirror) return false;
-    if (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size()) return true;
-    const AppState::DocTab& t = st.docTabs[st.activeTab];
-    return t.aiHandoff && !t.userAdopted;
+    return firstMirror && (st.activeTab < 0 || st.activeTab >= (int)st.docTabs.size());
 }
 
 std::string docLabel(AppState& st, const std::string& docId) {
@@ -108,7 +88,6 @@ static constexpr double kAgentEditPulseTimeoutS = 5.0;
 
 void agentEditPulseTimeoutTick(AppState& st) {
     const auto now = std::chrono::steady_clock::now();
-    if (!st.anyRunActive()) st.runsIdleAt = now;  // agent-lock run epoch (docLockedByAgent)
     for (AppState::DocTab& t : st.docTabs) {
         if (!t.aiPulse) continue;
         if (std::chrono::duration<double>(now - t.lastAgentEditAt).count() >
@@ -144,6 +123,8 @@ std::chrono::steady_clock::time_point lastBootstrapFailureToast{};
 // otherwise leave the GUI permanently deaf to doc events (frozen live previews).
 // A generation bump re-arms bootstrap so we re-subscribe + re-mirror open docs.
 uint64_t bootstrapGen = 0;
+int bootstrapStep = 0;
+bool bootstrapInFlight = false;
 
 // Reconnect-brake (crash-loop guard): ring of recent reconnect timestamps, pruned to the
 // trailing 60s window on every reconnect event. >=3 reconnects in that window means the
@@ -179,14 +160,132 @@ bool noteReconnectAndCheckBrake() {
     return crashLoopBraked;
 }
 
-// doc_ids with a doc.opened seen but not yet revealed as a tab (deferred while
-// the user is mid-edit, exactly like the poller's `pending`), each mapped to the
-// display name its event carried (empty when it carried none), and the latest
-// unapplied doc.changed payload per doc.
+// Explicitly presented or GUI-origin documents awaiting a safe reveal, and
+// the latest unapplied change for an admitted document.
 std::map<std::string, std::string> pendingOpen;
 std::map<std::string, json> pendingChanged;
-// Viewport catch-up after tess-less revisions of the ACTIVE doc (see tess_catchup.h).
+
+void rememberChanged(const std::string& docId, const json& data) {
+    const auto it = pendingChanged.find(docId);
+    if (it == pendingChanged.end() ||
+        data.value("revision", -1L) >= it->second.value("revision", -1L))
+        pendingChanged[docId] = data;
+}
+std::map<std::string, bool> pendingHumanDirty;
+std::map<std::string, long> dirtyEventRevision;
+std::map<std::string, long> dirtyEventMetadataRevision;
+std::map<std::string, long> reattachPending;
+std::set<std::string> reattachInFlight;
+std::chrono::steady_clock::time_point lastReattachTry{};
+std::map<std::string, int> userOpensInFlight;
+// Presentations already in the event queue admit subsequent revisions even
+// before the budgeted dispatcher has handled the presentation itself.
+std::set<std::string> queuedPresentations;
+std::set<std::string> pendingExpiredHolds;
+std::map<std::string, uint64_t> attachInFlight;
+std::set<std::string> attachedPendingReveal;
+uint64_t nextAttach = 0;
+std::set<std::string> compatResyncInFlight;
+struct PendingClose {
+    std::string docId, title;
+    bool detachOnly;
+    uint64_t generation;
+};
+std::deque<PendingClose> pendingClose;
+bool closeInFlight = false;
+std::deque<json> pendingEvents;
+std::map<std::string, json*> latestChanged;
+int attachesThisFrame = 0;
+
+// The in-process engine has the same cache-refresh sink as hostd, but no socket
+// event stream. Never touch AppState from the engine/verification thread.
+struct InProcessRefreshQueue {
+    std::mutex mutex;
+    std::deque<json> events;
+    bool enabled = false;
+    bool installed = false;
+    bool attempted = false;
+};
+
+InProcessRefreshQueue& inProcessRefreshQueue() {
+    // Verification callbacks may already have captured the sink at teardown.
+    static auto* queue = new InProcessRefreshQueue;
+    return *queue;
+}
+
+void inProcessRefresh(const char* docId, const char* responseJson, void*) {
+    if (!docId || !*docId || !responseJson) return;
+    try {
+        json data = json::parse(responseJson, nullptr, false);
+        if (!data.is_object()) return;
+        data["doc_id"] = docId;
+        data["source_kind"] = "system";
+        data["method"] = "assembly_source_refresh";
+        if (data.contains("tess") && data["tess"].is_object() &&
+            data["tess"].contains("aicm_path"))
+            data["aicm_path"] = data["tess"]["aicm_path"];
+        auto& queue = inProcessRefreshQueue();
+        {
+            std::lock_guard<std::mutex> lock(queue.mutex);
+            if (!queue.enabled) return;
+            queue.events.push_back({{"event", "doc.changed"}, {"data", std::move(data)}});
+        }
+        ui::anim::wakeLoop();
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[engine] cache refresh enqueue failed: %s\n", e.what());
+    } catch (...) {
+        std::fprintf(stderr, "[engine] cache refresh enqueue failed\n");
+    }
+}
+
+bool closePending(const std::string& docId) {
+    for (const auto& close : pendingClose)
+        if (close.docId == docId) return true;
+    return false;
+}
+struct RecoveredInfo {
+    bool humanDirty;
+    int revision;
+    std::string path;
+    bool diskConflict;
+    json observedStamp;
+};
+std::map<std::string, RecoveredInfo> recoveredDocs;
+// Obligations cover active and parked tabs until the matching mesh commits.
 TessCatchup tessCatchup;
+
+void applyDirtyMetadata(AppState& st, const std::string& docId, const json& data) {
+    if (!data.contains("human_dirty") || !data["human_dirty"].is_boolean()) return;
+    const long revision = data.value("revision", -1L);
+    const long metadataRevision = data.value("metadata_revision", -1L);
+    const auto seen = dirtyEventRevision.find(docId);
+    const auto seenMeta = dirtyEventMetadataRevision.find(docId);
+    if (seen != dirtyEventRevision.end() &&
+        (revision < seen->second ||
+         (revision == seen->second && metadataRevision >= 0 &&
+          seenMeta != dirtyEventMetadataRevision.end() && metadataRevision < seenMeta->second)))
+        return;
+    dirtyEventRevision[docId] = revision;
+    if (metadataRevision >= 0) dirtyEventMetadataRevision[docId] = metadataRevision;
+    const bool humanDirty = data["human_dirty"].get<bool>();
+    const int idx = tabIndexForDoc(st, docId);
+    if (idx < 0) {
+        if (pendingOpen.count(docId) || userOpensInFlight.count(docId))
+            pendingHumanDirty[docId] = humanDirty;
+    } else if (humanDirty) {
+        auto& tab = st.docTabs[idx];
+        const int metaRevision = data.value("metadata_revision", -1);
+        if ((!tab.dirty || data.value("source_kind", std::string()) == "gui") &&
+            metaRevision > tab.lastHumanMetadataRevision) {
+            tab.lastHumanMetadataRevision = metaRevision;
+            ++tab.humanEditGeneration;
+        }
+        st.applyHumanDirty(docId, true);
+    } else if (data.value("saved_metadata_revision", -1) >=
+               st.docTabs[idx].lastHumanMetadataRevision) {
+        st.markSaved(docId, data.value("saved_revision", -1), {});
+    }
+}
 
 // Display name out of a doc.opened / doc.changed payload. doc.opened carries it
 // flat (hostd DocRegistry::sniffName); doc.changed pushes the whole document as
@@ -201,14 +300,26 @@ std::string eventDocName(const json& d) {
     return {};
 }
 
-// Open a read-only mirror tab for a doc another client minted. The first
-// mirror may take focus when no user document is on screen; an agent-minted
-// document may also replace an untouched empty CAD tab. Any user content
-// keeps its viewport, and background reveals retain the aiPulse glow.
+// Open an admitted document as a read-only mirror without disrupting user content.
 bool openMirrorTab(AppState& st, const std::string& docId, const std::string& name = {}) {
     if (docId.rfind("doc-cpp", 0) != 0) return true;  // parts/assemblies only
-    if (tabIndexForDoc(st, docId) >= 0) {        // already visible (ours or a prior mirror)
+    if (userOpensInFlight.count(docId)) {
+        if (!name.empty() || !pendingOpen.count(docId)) pendingOpen[docId] = name;
+        return true;
+    }
+    if (const int existing = tabIndexForDoc(st, docId); existing >= 0) {
+        const auto recovered = recoveredDocs.find(docId);
+        if (recovered != recoveredDocs.end()) {
+            if (!recovered->second.path.empty()) st.docTabs[existing].path = recovered->second.path;
+            if (recovered->second.humanDirty) st.markHumanEdit(docId, recovered->second.revision);
+            if (recovered->second.humanDirty && recovered->second.diskConflict) {
+                st.docTabs[existing].diskConflict = true;
+                st.docTabs[existing].diskConflictStamp = recovered->second.observedStamp;
+            }
+            recoveredDocs.erase(recovered);
+        }
         pendingOpen.erase(docId);  // a deferred reveal is satisfied — don't retry every frame
+        attachedPendingReveal.erase(docId);
         return true;
     }
     // The user closed this mirror by hand. The agent keeps building (hostd degraded
@@ -216,6 +327,9 @@ bool openMirrorTab(AppState& st, const std::string& docId, const std::string& na
     // close look broken. Stay closed until the user opens it again from Artifacts.
     if (st.dismissedMirrorDocs.count(docId)) {
         pendingOpen.erase(docId);
+        attachedPendingReveal.erase(docId);
+        pendingHumanDirty.erase(docId);
+        pendingChanged.erase(docId);
         return true;
     }
     if (userMidEdit(st)) {                       // defer the reveal, never disrupt
@@ -225,24 +339,40 @@ bool openMirrorTab(AppState& st, const std::string& docId, const std::string& na
     }
     auto* c = engine::client();
     if (!c) return false;
-    json r;
-    std::string e;
-    // Viewer semantics: attach read-only. The user's first edit attempt on this
-    // tab auto-upgrades to rw (engine_backend.cpp read_only retry) — no new UI.
-    if (!c->call("attach_doc", json{{"doc_id", docId}, {"mode", "ro"}}, r, e,
-                 kAttachCallTimeoutMs)) {
-        st.addLog("[daemon] attach_doc failed for " + docId + ": " + e);
-        if (r.is_null()) {
-            // Transport failure (including timeout): no view was confirmed. Retry
-            // after reconnect instead of inventing a live mirror tab.
-            if (pendingOpen.emplace(docId, name).second)
-                st.toast(ui::ToastLevel::Warn, "Couldn't attach live document — retrying");
-            return false;
-        }
-        st.toast(ui::ToastLevel::Warn, "Couldn't attach live document: " + e);
-        pendingOpen.erase(docId);
-        return true;  // RPC refusal: retrying this doc would only spam the daemon
+    if (!name.empty() || !pendingOpen.count(docId)) pendingOpen[docId] = name;
+    if (closePending(docId) || attachInFlight.count(docId)) return false;
+    if (!attachedPendingReveal.count(docId)) {
+        if (attachesThisFrame >= 2) { ui::anim::requestFrames(); return false; }
+        ++attachesThisFrame;
+        const uint64_t generation = c->reconnectGeneration();
+        const uint64_t request = ++nextAttach;
+        attachInFlight[docId] = request;
+        st.rpc.callPrimary("attach_doc", json{{"doc_id", docId}, {"mode", "ro"}},
+                           [&st, docId, generation, request](const RpcResult& r) {
+            const auto inFlight = attachInFlight.find(docId);
+            if (inFlight == attachInFlight.end() || inFlight->second != request) return;
+            attachInFlight.erase(inFlight);
+            auto* client = engine::client();
+            if (!client || client->reconnectGeneration() != generation ||
+                !pendingOpen.count(docId) || closePending(docId)) return;
+            if (!r.ok) {
+                st.addLog("[daemon] attach_doc failed for " + docId + ": " + r.err);
+                if (r.result.is_null())
+                    st.toast(ui::ToastLevel::Warn, "Couldn't attach live document — retrying");
+                else {
+                    st.toast(ui::ToastLevel::Warn, "Couldn't attach live document: " + r.err);
+                    pendingOpen.erase(docId);
+                }
+                return;
+            }
+            if (tabIndexForDoc(st, docId) >= 0) { pendingOpen.erase(docId); return; }
+            attachedPendingReveal.insert(docId);
+            lastMirrorRetry = {};
+            ui::anim::requestFrames();
+        }, kAttachCallTimeoutMs);
+        return false;
     }
+    attachedPendingReveal.erase(docId);
 
     bool anyMirror = false;
     for (const auto& t : st.docTabs)
@@ -260,7 +390,7 @@ bool openMirrorTab(AppState& st, const std::string& docId, const std::string& na
     // appears immediately with the placeholder title; the callback (a later frame's
     // drain) fills the real name in. Tolerate failure.
     if (name.empty())
-        st.rpc.call("doc_tree", json{{"doc_id", docId}},
+        st.rpc.callPrimary("doc_tree", json{{"doc_id", docId}},
                     [&st, docId](const core::RpcResult& r) {
                         if (!r.ok || !r.result.is_object()) return;
                         std::string nm;
@@ -294,8 +424,23 @@ bool openMirrorTab(AppState& st, const std::string& docId, const std::string& na
     }
     if (owner && !ambiguousOwner) t.projectDir = owner->projectDir;
     t.aiHandoff = true;
+    auto recovered = recoveredDocs.find(docId);
+    if (recovered != recoveredDocs.end()) t.path = recovered->second.path;
     t.handoffDocId = docId;
     st.docTabs.push_back(std::move(t));
+    if (recovered != recoveredDocs.end()) {
+        if (recovered->second.humanDirty)
+            st.markHumanEdit(docId, recovered->second.revision);
+        if (recovered->second.humanDirty && recovered->second.diskConflict) {
+            st.docTabs.back().diskConflict = true;
+            st.docTabs.back().diskConflictStamp = recovered->second.observedStamp;
+        }
+        recoveredDocs.erase(recovered);
+        pendingHumanDirty.erase(docId);
+    } else if (auto dirty = pendingHumanDirty.find(docId); dirty != pendingHumanDirty.end()) {
+        st.applyHumanDirty(docId, dirty->second);
+        pendingHumanDirty.erase(dirty);
+    }
     const int idx = (int)st.docTabs.size() - 1;
     // Give the mirror its DocSession NOW, not on first switch-in. The background doc.changed
     // branch below parks the daemon's pushed snapshot + aicm_path on tab.session and prewarms
@@ -329,8 +474,7 @@ bool openMirrorTab(AppState& st, const std::string& docId, const std::string& na
             if (i >= 0 && i != st.activeTab &&
                 canFocusMirror(st, !anyMirror)) st.switchToTab(i);
         });
-        st.toast(ui::ToastLevel::Info,
-                 "Live view of the AI's part — it updates as it builds");
+        st.toast(ui::ToastLevel::Info, "Presented part — live updates are enabled");
     } else {
         st.docTabs[idx].aiPulse = true;  // background reveal; switch-in activates
         st.docTabs[idx].lastAgentEditAt = std::chrono::steady_clock::now();
@@ -348,89 +492,118 @@ bool openMirrorTab(AppState& st, const std::string& docId, const std::string& na
 }
 
 void applyChangedActive(AppState& st, const std::string& docId, const json& d);
+void handleEvent(AppState& st, json evt);
 
-// The active view just applied a revision that carried no tessellation. Ask the daemon for
-// the current mesh (doc_activate: the warm read-cache answer, no recompile; an assembly's
-// AICM is its cached component meshes re-posed) and draw it when it still matches the tree
-// on screen. Async on st.rpc — never on the GL thread — and single-flight per doc, so a pose
-// sweep costs at most one outstanding request.
-void fetchActiveTess(AppState& st, const std::string& docId) {
-    st.rpc.call("doc_activate", json{{"doc_id", docId}}, [&st, docId](const core::RpcResult& r) {
+bool hasUsableTessellation(const json& data) {
+    if (!data.is_object() || data.contains("mesh_error")) return false;
+    const auto tess = data.find("tess");
+    if (tess != data.end() && (!tess->is_object() || tess->contains("mesh_error")))
+        return false;
+    const json* path = nullptr;
+    if (auto p = data.find("aicm_path"); p != data.end()) path = &*p;
+    else if (tess != data.end()) {
+        auto p = tess->find("aicm_path");
+        if (p != tess->end()) path = &*p;
+    }
+    if (!path || !path->is_string()) return false;
+    if (!path->get_ref<const std::string&>().empty()) return true;
+    return tess != data.end() && tess->contains("bodies") &&
+           (*tess)["bodies"].is_array() && (*tess)["bodies"].empty();
+}
+
+// Fetch a complete current tree and tessellation; the obligation survives failures,
+// tab switches and editing until the corresponding mesh actually commits.
+void fetchTess(AppState& st, const std::string& docId) {
+    st.rpc.call("doc_activate", json{{"doc_id", docId}, {"origin", "system"}},
+                [&st, docId](const core::RpcResult& r) {
+        if (!tessCatchup.pending(docId)) return;
         const json& res = r.result;
-        // A tree is required: without one applyChangedActive would fall back to a SYNC resync.
         const bool usable = r.ok && res.is_object() && !res.contains("code") &&
-                            res.contains("revision") && res["revision"].is_number_integer() &&
-                            res.contains("tree") && res["tree"].is_object() &&
-                            res.contains("tess") && res["tess"].is_object() &&
-                            !res["tess"].value("aicm_path", std::string()).empty();
-        const long rev = usable ? res["revision"].get<long>() : -1;
-        const int idx = tabIndexForDoc(st, docId);
-        // A deferred push for this doc (pendingChanged) is newer than anything drawn now.
-        const bool viewing = idx >= 0 && idx == st.activeTab && st.docMirror.docId() == docId &&
-                             !userMidEdit(st) && !pendingChanged.count(docId);
-        switch (tessCatchup.onFetched(docId, usable, rev, viewing,
-                                      (long)st.docMirror.revision())) {
-        case TessCatchup::Outcome::Commit: {
-            // Same shape as a doc.changed push (doc_snapshot serves that shape verbatim too).
-            json d = res;
-            d["doc_id"] = docId;
-            d["aicm_path"] = res["tess"]["aicm_path"];
-            applyChangedActive(st, docId, d);
-            break;
+            res.contains("revision") && res["revision"].is_number_integer() &&
+            res["revision"].get<long>() >= tessCatchup.wanted(docId) &&
+            res.contains("tree") && res["tree"].is_object() &&
+            res.contains("tess") && res["tess"].is_object() &&
+            res["tess"].contains("aicm_path") && hasUsableTessellation(res);
+        tessCatchup.fetched(docId, usable);
+        if (!usable) {
+            st.addLog("[daemon] viewport mesh catch-up failed for " + docId + ": " +
+                      (r.ok && res.is_object() ? res.value("message", std::string("mesh unavailable"))
+                                               : r.err));
+            ui::anim::requestFrames();
+            return;
         }
-        case TessCatchup::Outcome::Refetch:
-            fetchActiveTess(st, docId);
-            break;
-        case TessCatchup::Outcome::Drop:
-            if (!r.ok || (res.is_object() && res.contains("code")))
-                st.addLog("[daemon] viewport mesh catch-up failed for " + docId + ": " +
-                          (r.ok ? res.value("message", std::string()) : r.err));
-            break;
-        }
+        json data = res;
+        data["doc_id"] = docId;
+        data["aicm_path"] = res["tess"]["aicm_path"];
+        handleEvent(st, {{"event", "doc.changed"}, {"data", std::move(data)}});
     });
+}
+
+void tickTess(AppState& st) {
+    for (const auto& tab : st.docTabs) {
+        if (tab.docId.empty() || reattachPending.count(tab.docId) ||
+            reattachInFlight.count(tab.docId) || tabMidEdit(tab) ||
+            (tab.docId == st.docMirror.docId() && tab.docId ==
+                 (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size()
+                      ? st.docTabs[st.activeTab].docId : std::string()) && userMidEdit(st)) ||
+            pendingChanged.count(tab.docId)) continue;
+        if (tessCatchup.beginFetch(tab.docId)) fetchTess(st, tab.docId);
+    }
+    if (!tessCatchup.empty()) ui::anim::requestFrames();
 }
 
 // Apply a pushed foreign revision to the active live view without a blocking worker round-trip.
 // The event carries the immutable tree/owner map and AICM path; disk parse runs on the mesh loader.
 void applyChangedActive(AppState& st, const std::string& docId, const json& d) {
     const int idx = tabIndexForDoc(st, docId);
-    if (idx != st.activeTab) return;
+    if (idx < 0 || idx != st.activeTab ||
+        (st.docMirror.docId() == docId &&
+         d.value("revision", -1L) < (long)st.docMirror.revision())) return;
     AppState::DocTab& t = st.docTabs[idx];
-    if (st.renderer) st.renderer->discardCachedMeshes(docId);
-    t.meshCacheInvalidated = true;
-
     DocMirrorSnapshot snapshot;
-    const bool havePushedSnapshot = pushedSnapshot(docId, d, snapshot);
-    const bool mirror = t.aiHandoff;
-    if (mirror) st.suppressTabDirty = true;
-    if (havePushedSnapshot) {
-        st.docMirror.restoreSnapshot(snapshot);
-    } else {
-        // Compatibility with an older daemon that emitted only revision+aicm_path.
-        st.docMirror.resync(st.worker);
-        snapshot = st.docMirror.snapshot();
-    }
-    if (mirror) st.suppressTabDirty = false;
-
-    // A revision published without a tessellation (asm_add_component / asm_mate and the
-    // animation pose writers call doc_apply_ops with with_tess:false) carries NO aicm_path
-    // key; an empty document carries an EMPTY one. Only the latter means "nothing to draw".
-    // For the former keep the displayed mesh (unloading blanked the viewport after every
-    // agent mate), drop the tab's cached mesh so a switch-in never binds a mesh older than
-    // its tree, and fetch the current tessellation: waiting for the next mesh-bearing
-    // revision left an assembly's components unmoved for a whole mate/sweep stretch.
-    if (!d.contains("aicm_path")) {
-        if (t.session) {
-            t.session->cachedAicmPath.clear();
-            t.session->cachedRevision = -1;
-            t.session->cachedMirror = {};
-            t.session->cachedDocMesh.reset();
+    if (!pushedSnapshot(docId, d, snapshot)) {
+        // Old daemons push only revision/path. Fetch a complete current response
+        // off-thread rather than resyncing through the primary mutex on GL.
+        pendingChanged[docId] = d;
+        if (compatResyncInFlight.insert(docId).second) {
+            st.rpc.call("doc_activate", json{{"doc_id", docId}, {"origin", "system"}},
+                        [&st, docId](const RpcResult& r) {
+                compatResyncInFlight.erase(docId);
+                if (!r.ok || !r.result.is_object() || !r.result.contains("tree")) return;
+                const auto pending = pendingChanged.find(docId);
+                if (pending == pendingChanged.end() || userMidEdit(st) ||
+                    st.docMirror.docId() != docId) return;
+                const long revision = r.result.value("revision", -1L);
+                if (revision < pending->second.value("revision", -1L) ||
+                    revision < (long)st.docMirror.revision()) return;
+                json current = r.result;
+                current["doc_id"] = docId;
+                if (current.contains("tess") && current["tess"].is_object() &&
+                    current["tess"].contains("aicm_path") &&
+                    !current["tess"].contains("mesh_error"))
+                    current["aicm_path"] = current["tess"]["aicm_path"];
+                applyChangedActive(st, docId, current);
+            });
         }
-        pendingChanged.erase(docId);
-        if (tessCatchup.wantMesh(docId, (long)snapshot.revision)) fetchActiveTess(st, docId);
         return;
     }
-    tessCatchup.satisfied(docId);
+    if (st.renderer) st.renderer->discardCachedMeshes(docId);
+    t.meshCacheInvalidated = true;
+    if (t.session) t.session->opsCatchupUncertain = false;
+    st.docMirror.restoreSnapshot(snapshot);
+    st.syncActiveTabTitle();
+
+    tessCatchup.require(docId, snapshot.revision);
+    if (!hasUsableTessellation(d)) {
+        if (t.session) {
+            t.session->cachedAicmPath.clear();
+            t.session->cachedRevision = snapshot.revision;
+            t.session->cachedMirror = snapshot;
+        }
+        pendingChanged.erase(docId);
+        ui::anim::requestFrames();
+        return;
+    }
     const std::string aicm = d.value("aicm_path", std::string());
     if (t.session) {
         t.session->cachedAicmPath = aicm;
@@ -439,12 +612,16 @@ void applyChangedActive(AppState& st, const std::string& docId, const json& d) {
         t.session->cachedDocMesh.reset();
     }
     if (!aicm.empty()) {
-        st.loadDocMeshAsync(aicm);
+        tessCatchup.loading(docId, st.docMirror.revision());
+        st.loadDocMeshAsync(aicm, false, true, true, true);
     } else {
         st.unloadDocMesh();
         if (st.renderer) st.renderer->setActiveMeshIdentity(docId, st.docMirror.revision());
         if (t.session) t.session->cachedDocMesh = std::make_shared<render::DocMesh>();
         t.meshCacheInvalidated = false;
+        st.committedMeshDocId = docId;
+        st.committedMeshRevision = st.docMirror.revision();
+        tessCatchup.finished(docId, st.docMirror.revision(), true);
     }
     pendingChanged.erase(docId);
 }
@@ -455,71 +632,58 @@ void applyChangedActive(AppState& st, const std::string& docId, const json& d) {
 // edit already landed, undoing would destroy it: skip the undo, close the form,
 // and resync instead (plan: "verify revision parentage before undo").
 void handleOwnHoldExpired(AppState& st, const std::string& docId) {
-    if (!st.propertyManager || !st.propertyManager->active()) return;
-    if (st.docMirror.docId() != docId) return;
-    auto* c = engine::client();
-    long engRev = -1;
-    if (c) {
-        json tr;
-        std::string te;
-        if (!c->call("doc_tree", json{{"doc_id", docId}}, tr, te,
-                     kMetadataCallTimeoutMs)) {
-            st.addLog("[daemon] doc_tree revision check failed for " + docId + ": " + te);
-            st.propertyManager->closeIfActive();  // cannot safely undo an unverified revision
+    if (!st.propertyManager || !st.propertyManager->active() ||
+        st.docMirror.docId() != docId || !pendingExpiredHolds.insert(docId).second) return;
+    auto* manager = st.propertyManager;
+    const auto lifetime = manager->editSessionLifetime();
+    st.rpc.callPrimary("doc_tree", json{{"doc_id", docId}},
+                       [&st, docId, manager, lifetime](const RpcResult& r) {
+        pendingExpiredHolds.erase(docId);
+        if (lifetime.expired() || st.propertyManager != manager || !manager->active() ||
+            st.docMirror.docId() != docId) return;
+        if (!r.ok) {
+            st.addLog("[daemon] doc_tree revision check failed for " + docId + ": " + r.err);
+            manager->closeIfActive();
             st.toast(ui::ToastLevel::Warn,
                      "Edit hold expired — revision unavailable; edit form closed without undo");
             return;
         }
-        if (tr.is_object() && tr.contains("revision") && tr["revision"].is_number())
-            engRev = tr["revision"].get<long>();
-    }
-    if (engRev >= 0 && engRev == (long)st.docMirror.revision()) {
-        st.propertyManager->cancelEdits(st);
-        st.toast(ui::ToastLevel::Warn, "Edit hold expired — preview cancelled");
-    } else {
-        st.propertyManager->closeIfActive();
-        std::string aicm, err;
-        if (st.docMirror.activate(st.worker, docId, aicm, err) && !aicm.empty()) {
-            std::string le;
-            st.loadDocMesh(aicm, le);
+        const long revision = r.result.value("revision", -1L);
+        if (revision >= 0 && revision == (long)st.docMirror.revision()) {
+            manager->cancelEditsAsync(st);
+            st.toast(ui::ToastLevel::Warn, "Edit hold expired — preview cancelled");
+        } else {
+            manager->closeIfActive();
+            st.rpc.call("doc_activate", json{{"doc_id", docId}, {"origin", "system"}},
+                        [&st, docId](const RpcResult& active) {
+                if (!active.ok || st.docMirror.docId() != docId) return;
+                std::string aicm, err;
+                if (st.docMirror.adoptActivateResponse(docId, active.result, aicm, err) &&
+                    !aicm.empty()) st.loadDocMeshAsync(aicm);
+            });
+            st.toast(ui::ToastLevel::Warn,
+                     "Edit hold expired and the document moved — preview dropped, view resynced");
         }
-        st.toast(ui::ToastLevel::Warn,
-                 "Edit hold expired and the document moved — preview dropped, view resynced");
-    }
+    }, kMetadataCallTimeoutMs);
 }
 
-// Daemon mode multiplexes EVERY run this client owns onto ONE `agent.event` push channel
-// (hostd's sendAgentEvent is per-client, not per-run), so a streamed event is meaningless
-// without its run_id. Resolve the JobState that owns it:
-//   1. exact match against a run that already knows its run_id;
-//   2. else bind the SOLE freshly-launched run still awaiting its first event, stamping the
-//      id onto it so every later event takes path 1;
-//   3. else nullptr — zero candidates, or ambiguity we must not guess through: dropping the
-//      event is strictly better than cross-contaminating a concurrent conversation.
+// Only an exact run id can identify an event on the daemon event connection.
+// Online handles are installed before dispatch; native jobs stream on their own callback.
 JobState* runForEvent(AppState& st, const std::string& runId) {
     if (runId.empty()) return nullptr;
-    JobState* unbound = nullptr;
-    int unboundCount = 0;
     for (auto& kv : st.runs) {
         JobState* run = kv.second.get();
         if (!run) continue;
         std::lock_guard<std::mutex> jlk(run->mtx);
         if (run->runId == runId) return run;
-        if (run->running.load() && run->runId.empty()) { unbound = run; ++unboundCount; }
     }
-    if (unboundCount != 1) return nullptr;  // nobody to bind, or ambiguous — drop
-    std::lock_guard<std::mutex> jlk(unbound->mtx);
-    // The launcher may have stamped a runId between our scan and this lock; if it did and it
-    // isn't ours, this event belongs to a run we haven't seen yet.
-    if (!unbound->runId.empty()) return unbound->runId == runId ? unbound : nullptr;
-    unbound->runId = runId;
-    return unbound;
+    return nullptr;
 }
 
-void handleEvent(AppState& st, const json& evt) {
+void handleEvent(AppState& st, json evt) {
     const std::string name = evt.value("event", std::string());
-    const json& d = evt.contains("data") && evt["data"].is_object() ? evt["data"]
-                                                                    : json::object();
+    static const json empty = json::object();
+    const json& d = evt.contains("data") && evt["data"].is_object() ? evt["data"] : empty;
     const std::string docId = d.value("doc_id", std::string());
     // Manufacturing is a dedicated hostd lane, but its events arrive through
     // the same per-frame daemon drain. Feed the read-only GUI mirror and keep
@@ -536,12 +700,17 @@ void handleEvent(AppState& st, const json& evt) {
     // timeline LIVE (thinking bursts, tool-call rows, assistant_delta, stage rows) instead of
     // a frozen "Thinking…" placeholder until the batched result.
     if (name == "agent.event") {
+#ifdef __EMSCRIPTEN__
+        // Cells broadcast each event to all of an actor's sockets. The owning
+        // turn's dedicated callback already consumes it with a strict run-id
+        // check; enqueuing the primary socket's copy would render it twice.
+        return;
+#endif
         JobState* job = runForEvent(st, d.value("run_id", std::string()));
         if (!job) return;  // unknown or ambiguous run — never guess a target conversation
         AgentEvent e;
         const std::string origKind = d.value("kind", std::string());
         e.kind = "orch_" + origKind;
-        e.text = d.dump();
         const std::string stage = d.value("stage", std::string());
         const std::string role = d.value("role", std::string());
         if (origKind == "stage_started") {
@@ -600,6 +769,7 @@ void handleEvent(AppState& st, const json& evt) {
             else if (!purpose.empty()) e.notes = purpose;
             else e.notes = "Sub-run";
         }
+        e.data = std::make_shared<const json>(std::move(evt["data"]));
         {
             std::lock_guard<std::mutex> lk(job->evMtx);
             job->events.push_back(std::move(e));
@@ -608,22 +778,37 @@ void handleEvent(AppState& st, const json& evt) {
     }
 
     if (name == "doc.opened") {
-        if (!docId.empty()) openMirrorTab(st, docId, eventDocName(d));
-        stampForeignWrite(st, tabIndexForDoc(st, docId), d);
+        if (!docId.empty() && d.value("origin_kind", std::string()) == "gui") {
+            openMirrorTab(st, docId, eventDocName(d));
+        }
         return;
     }
-    if (name == "doc.changed") {
+    if (name == "doc.presented") {
+        queuedPresentations.erase(docId);
+        if (!docId.empty()) openMirrorTab(st, docId, eventDocName(d));
+        return;
+    }
+    if (name == "doc.disk_conflict") {
+        const int idx = tabIndexForDoc(st, docId);
+        if (idx >= 0) {
+            st.docTabs[idx].diskConflict = true;
+            st.docTabs[idx].overwriteDiskConflict = false;
+            st.docTabs[idx].diskConflictStamp = d.value("observed_stamp", json());
+            st.docTabs[idx].conflictPath.clear();
+        }
+        return;
+    }
+    if (name == "doc.changed" || name == "doc.changed.notice" || name == "doc.cache_refreshed") {
         if (docId.empty()) return;
         int idx = tabIndexForDoc(st, docId);
-        if (idx < 0) {  // changed before we ever saw it (subscribe race): reveal it
-            openMirrorTab(st, docId, eventDocName(d));
-            idx = tabIndexForDoc(st, docId);
-        }
-        if (idx < 0) {  // reveal deferred (mid-edit) — remember the change
-            pendingChanged[docId] = d;
+        // A hidden or dismissed working document must not retain snapshots,
+        // produce toasts, or trigger an attach/tessellation.
+        if (idx < 0 && ((!pendingOpen.count(docId) && !userOpensInFlight.count(docId)) ||
+                        st.dismissedMirrorDocs.count(docId)))
             return;
-        }
-        stampForeignWrite(st, idx, d);
+        applyDirtyMetadata(st, docId, d);
+        if (idx >= 0 && !st.docTabs[idx].path.empty())
+            ui::invalidateFeatureTreeNestedDocument(st.docTabs[idx].path);
         // Multi-user authorship: toast when another seat edited this doc.
         // Local single-seat GUIs leave user empty — no toast.
         if (d.contains("user") && d["user"].is_object()) {
@@ -644,27 +829,68 @@ void handleEvent(AppState& st, const json& evt) {
                 }
             }
             // A remote edit reintroduces history (their undo stack); un-grey local buttons.
-            st.docTabs[idx].historyCleared = false;
+            if (idx >= 0) st.docTabs[idx].historyCleared = false;
         }
+        if (name == "doc.changed.notice") {
+            const std::string method = d.value("method", std::string());
+            const auto meta = dirtyEventMetadataRevision.find(docId);
+            const long noticeMeta = d.value("metadata_revision", -1L);
+            const bool current = meta == dirtyEventMetadataRevision.end() || noticeMeta < 0 ||
+                                 noticeMeta >= meta->second;
+            if (idx >= 0 && current && (method == "doc_set_name" || method == "doc_set_meta")) {
+                if (method == "doc_set_name" && d.contains("name") && d["name"].is_string()) {
+                    st.docTabs[idx].title = d["name"].get<std::string>();
+                    if (st.docTabs[idx].aiHandoff) st.docTabs[idx].handoffName = st.docTabs[idx].title;
+                }
+                tessCatchup.require(docId, d.value("revision", 0L));
+            }
+            return;
+        }
+        if (idx < 0) {
+            rememberChanged(docId, d);
+            return;
+        }
+        const auto deferred = pendingChanged.find(docId);
+        if (deferred != pendingChanged.end() &&
+            d.value("revision", -1L) < deferred->second.value("revision", -1L)) return;
         if (idx != st.activeTab) {
             AppState::DocTab& tab = st.docTabs[idx];
+            if (tab.session && d.value("revision", -1L) < tab.session->cachedRevision) return;
             tab.aiPulse = true;  // background activity remains visible in the tab strip
             tab.lastAgentEditAt = std::chrono::steady_clock::now();
+            // A parked sketch/PM is still an in-progress edit. Keep its old mirror and
+            // mesh until the user returns and finishes, just as for an active edit.
+            if (tabMidEdit(tab)) {
+                rememberChanged(docId, d);
+                return;
+            }
             tab.meshCacheInvalidated = true;
             if (st.renderer) st.renderer->discardCachedMeshes(docId);
             DocMirrorSnapshot snapshot;
             const std::string aicm = d.value("aicm_path", std::string());
-            if (tab.session && pushedSnapshot(docId, d, snapshot) && !aicm.empty()) {
-                tab.session->cachedAicmPath = aicm;
-                tab.session->cachedRevision = snapshot.revision;
+            if (tab.session && pushedSnapshot(docId, d, snapshot)) {
+                const int revision = snapshot.revision;
+                tessCatchup.require(docId, revision);
+                tab.session->cachedRevision = revision;
+                tab.session->opsCatchupUncertain = false;
                 tab.session->cachedMirror = std::move(snapshot);
-                tab.session->cachedDocMesh.reset();
-                st.cacheBackgroundDocMeshAsync(docId, tab.session->cachedRevision, aicm);
-            } else if (tab.session) {
-                tab.session->cachedAicmPath.clear();
-                tab.session->cachedRevision = -1;
-                tab.session->cachedMirror = {};
-                tab.session->cachedDocMesh.reset();
+                if (!hasUsableTessellation(d)) {
+                    tab.session->cachedAicmPath.clear();
+                } else if (aicm.empty()) {
+                    tab.session->cachedAicmPath.clear();
+                    tab.session->cachedDocMesh = std::make_shared<render::DocMesh>();
+                    tab.meshCacheInvalidated = false;
+                    tessCatchup.finished(docId, revision, true);
+                } else {
+                    tab.session->cachedAicmPath = aicm;
+                    tessCatchup.loading(docId, revision);
+                    st.cacheBackgroundDocMeshAsync(docId, revision, aicm);
+                }
+                if (deferred != pendingChanged.end() &&
+                    deferred->second.value("revision", -1L) <= revision)
+                    pendingChanged.erase(deferred);
+            } else {
+                tessCatchup.require(docId, d.value("revision", 0L));
             }
             return;
         }
@@ -676,36 +902,48 @@ void handleEvent(AppState& st, const json& evt) {
         // dirty marker, and from then on every later revision was parked until the user saved
         // (2026-09-25, a 2 h steering rework on the user's open assembly showed nothing).
         if (userMidEdit(st)) {
-            pendingChanged[docId] = d;  // defer, retry when safe (poller semantics)
+            rememberChanged(docId, d);
             st.docTabs[idx].aiPulse = true;
             st.docTabs[idx].lastAgentEditAt = std::chrono::steady_clock::now();
-            st.docTabs[idx].meshCacheInvalidated = true;
-            if (st.renderer) st.renderer->discardCachedMeshes(docId);
             return;
         }
         applyChangedActive(st, docId, d);
         return;
     }
     if (name == "doc.studies_changed") {
-        // An agent persisted a study (run_fea_* results, a simulate_motion sweep) — a revision
-        // with no tree, so doc.changed never carries it. Re-pull that document's study list on
-        // its next Simulation-tree draw. GUI-sourced edits already live in the local mirror.
-        if (docId.empty() || d.value("source_kind", std::string()) == "gui") return;
+        if (docId.empty()) return;
         const int idx = tabIndexForDoc(st, docId);
-        if (idx >= 0 && st.docTabs[idx].session && st.docTabs[idx].session->sim)
+        if (idx < 0) return;
+        applyDirtyMetadata(st, docId, d);
+        if (st.docTabs[idx].session && st.docTabs[idx].session->sim)
             st.docTabs[idx].session->sim->markStudiesStale();
+        tessCatchup.require(docId, d.value("revision", 0L));
         return;
     }
     if (name == "doc.closed") {
         const std::string reason = d.value("reason", std::string());
         const int idx = tabIndexForDoc(st, docId);
+        // Last-writer-detached is a custody notice; the document remains live.
+        if (reason == "last_writer_detached") {
+            if (idx >= 0) {
+                st.docTabs[idx].aiPulse = false;
+                st.docTabs[idx].agentDone = true;
+            }
+            return;
+        }
         pendingOpen.erase(docId);
         pendingChanged.erase(docId);
+        pendingHumanDirty.erase(docId);
+        dirtyEventRevision.erase(docId);
+        dirtyEventMetadataRevision.erase(docId);
+        reattachPending.erase(docId);
+        reattachInFlight.erase(docId);
+        tessCatchup.forget(docId);
+        attachInFlight.erase(docId);
+        attachedPendingReveal.erase(docId);
+        pendingExpiredHolds.erase(docId);
+        queuedPresentations.erase(docId);
         if (idx < 0) return;
-        // The writer detached: an agent that is no longer running cannot be mid-edit. A run
-        // still live elsewhere keeps the lock (another sub-agent may still write this doc).
-        if (!st.anyRunActive())
-            st.docTabs[idx].lastForeignWriteAt = std::chrono::steady_clock::time_point{};
         if (!st.docTabs[idx].aiHandoff || st.docTabs[idx].userAdopted) {
             // A tab the user opened themselves, or an AI mirror the user ADOPTED by editing:
             // it's user-owned now. Never auto-close it — the user decides its fate (and the
@@ -713,22 +951,6 @@ void handleEvent(AppState& st, const json& evt) {
             st.docTabs[idx].aiPulse = false;
             st.docTabs[idx].agentDone = true;
             st.addLog("[daemon] doc.closed for user-owned tab " + docId + " (reason " + reason + ")");
-            return;
-        }
-        if (reason == "last_writer_detached") {
-            // NOT a close. hostd emits this the moment the last read-write ATTACH drops, and the
-            // general lane spawns a fresh `python -m services.worker_main` per turn, so it fires at
-            // the END OF EVERY TURN — the doc is still live and still returned by doc_list right
-            // after. So keep the tab: it is the user's ONLY handle on the part the agent just built
-            // (the viewport view, and the aiHandoff flag every agent-document surface keys off —
-            // Artifacts "Agent Documents", the AI-tab Documents view, Active Work). Destroying it
-            // here is what made the finished part vanish from the tab strip and those panels fall
-            // back to the user's own documents. Mark the agent idle and leave the tab standing;
-            // only a real close/gc/discard (below) removes it.
-            st.docTabs[idx].aiPulse = false;
-            st.docTabs[idx].agentDone = true;
-            st.addLog("[daemon] last writer detached from AI mirror " + docId +
-                      " — keeping the tab (doc is still live daemon-side)");
             return;
         }
         st.closeDocTab(idx);  // closed/gc/discarded/daemon — the doc is gone; drop the mirror
@@ -751,6 +973,7 @@ void handleEvent(AppState& st, const json& evt) {
             handleOwnHoldExpired(st, docId);
             return;
         }
+        if (tabIndexForDoc(st, docId) < 0) return;
         if (state == "held")
             st.toast(ui::ToastLevel::Info, "An " + holder + " client is editing " +
                                                docLabel(st, docId) + " — edits are briefly locked");
@@ -776,90 +999,91 @@ void reportBootstrapTransportFailure(AppState& st, const std::string& detail) {
     }
 }
 
-bool checkOrphanRecovery(AppState& st, chudware_ipc::EngineClient& c) {
-    json rl;
-    std::string e;
-    if (!c.call("recovery_list", json::object(), rl, e, kMetadataCallTimeoutMs)) {
-        if (!c.connected()) {
-            reportBootstrapTransportFailure(st, "recovery_list transport failure: " + e);
-            return false;  // reconnect dropped the subscription; bootstrap anew
+void tryBootstrap(AppState& st, chudware_ipc::EngineClient& c) {
+    if (bootstrapInFlight) return;
+    bootstrapInFlight = true;
+    const uint64_t generation = c.reconnectGeneration();
+    const int step = bootstrapStep;
+    const char* method = step == 0 ? "subscribe" : step == 1 ? "doc_list" : "recovery_list";
+    st.rpc.callPrimary(method, step == 0 ? json{{"doc_ids", "*"}} : json::object(),
+                       [&st, generation, step](const RpcResult& r) {
+        auto* client = engine::client();
+        if (!client || generation != bootstrapGen ||
+            generation != client->reconnectGeneration()) return;
+        bootstrapInFlight = false;
+        if (!r.ok && !client->connected()) {
+            reportBootstrapTransportFailure(st, "bootstrap transport failure: " + r.err);
+            bootstrapStep = 0;
+            return;
         }
-        st.addLog("[daemon] recovery_list unavailable: " + e);
-        return true;  // older daemons do not support orphan recovery
-    }
-    if (!rl.is_object() || !rl.contains("entries") || !rl["entries"].is_array()) return true;
-    const int n = (int)rl["entries"].size();
-    if (n <= 0) return true;
-    st.addLog("[daemon] " + std::to_string(n) +
-              " retired doc(s) from a previous session awaiting recovery");
-    st.recoveryPromptCount = n;
-    return true;
-}
-
-bool tryBootstrap(AppState& st, chudware_ipc::EngineClient& c) {
-    json r;
-    std::string e;
-    if (!c.call("subscribe", json{{"doc_ids", "*"}}, r, e,
-                kMetadataCallTimeoutMs)) {
-        if (!c.connected()) reportBootstrapTransportFailure(st, "subscribe failed: " + e);
-        else st.addLog("[daemon] subscribe failed: " + e);
-        return false;
-    }
-    // Docs already open in the shared engine (an agent working before the GUI
-    // attached): mirror them. "loading" here just means no docs yet — retry.
-    json dl;
-    if (!c.call("doc_list", json::object(), dl, e, kMetadataCallTimeoutMs)) {
-        if (dl.is_object() && dl.value("code", std::string()) == "loading") return false;
-        if (!c.connected()) {
-            reportBootstrapTransportFailure(st, "doc_list failed: " + e);
-            return false;  // never reconcile tabs against an unconfirmed list
-        }
-        st.addLog("[daemon] doc_list failed: " + e);
-        return checkOrphanRecovery(st, c);  // subscribed; list unavailable, no reconciliation
-    }
-    if (dl.is_object() && dl.contains("docs") && dl["docs"].is_array()) {
-        std::set<std::string> liveIds;
-        for (const auto& doc : dl["docs"]) {
-            const std::string id =
-                doc.is_object() ? doc.value("doc_id", std::string()) : std::string();
-            if (!id.empty()) {
-                liveIds.insert(id);
-                if (!openMirrorTab(st, id, eventDocName(doc))) return false;
-                // origin_kind (daemon-annotated): a doc minted by a GUI client is user-owned,
-                // so if we mirrored it after (re)connecting, mark it adopted — it must be
-                // quit-warned and never auto-closed. Unknown/mcp/agent origin stays AI-owned.
-                const std::string origin =
-                    doc.is_object() ? doc.value("origin_kind", std::string()) : std::string();
-                if (origin == "gui") {
+        if (step == 0) {
+            if (!r.ok) { st.addLog("[daemon] subscribe failed: " + r.err); return; }
+            bootstrapStep = 1;
+        } else if (step == 1) {
+            if (!r.ok && r.result.is_object() &&
+                r.result.value("code", std::string()) == "loading") return;
+            if (!r.ok || !r.result.is_object() || !r.result.contains("docs") ||
+                !r.result["docs"].is_array()) {
+                st.addLog("[daemon] doc_list failed: " + r.err);
+                return;
+            }
+            const json& list = r.result;
+            if (r.ok && list.is_object() && list.contains("docs") && list["docs"].is_array()) {
+                std::set<std::string> liveIds;
+                for (const auto& doc : list["docs"]) {
+                    const std::string id = doc.is_object() ? doc.value("doc_id", std::string())
+                                                          : std::string();
+                    if (id.empty()) continue;
+                    liveIds.insert(id);
+                    const bool guiOrigin = doc.value("origin_kind", std::string()) == "gui";
+                    if (tabIndexForDoc(st, id) < 0 &&
+                        (guiOrigin || doc.value("presented", false)) &&
+                        !st.dismissedMirrorDocs.count(id))
+                        pendingOpen[id] = eventDocName(doc);
                     const int ti = tabIndexForDoc(st, id);
-                    if (ti >= 0 && st.docTabs[ti].aiHandoff) st.docTabs[ti].userAdopted = true;
+                    applyDirtyMetadata(st, id, doc);
+                    if (ti >= 0) reattachPending[id] = doc.value("revision", 0L);
+                }
+                st.addLog("[daemon] bootstrap: " + std::to_string(liveIds.size()) +
+                          " live doc(s), admitted documents queued for mirroring");
+                // Reconcile one stale mirror at a time through the budgeted event queue.
+                for (const auto& tab : st.docTabs) {
+                    if (!tab.aiHandoff || tab.userAdopted || tab.docId.empty() ||
+                        liveIds.count(tab.docId) || tab.dirty ||
+                        (tab.docId == st.docMirror.docId() && userMidEdit(st))) continue;
+                    latestChanged.clear();
+                    pendingEvents.push_back({{"event", "doc.closed"},
+                        {"data", {{"doc_id", tab.docId}, {"reason", "daemon"}}}});
                 }
             }
+            bootstrapStep = 2;
+        } else {
+#ifndef __EMSCRIPTEN__
+            if (!r.ok || !r.result.is_object() || !r.result.contains("entries") ||
+                !r.result["entries"].is_array()) {
+                st.addLog("[daemon] recovery_list unavailable; retrying: " + r.err);
+                return;
+            }
+#endif
+            if (r.ok && r.result.is_object() && r.result.contains("entries") &&
+                r.result["entries"].is_array() && !r.result["entries"].empty()) {
+                st.recoveryPrompt.clear();
+                for (const auto& e : r.result["entries"]) {
+                    if (!e.is_object() || !e.value("human_dirty", false)) continue;
+                    const std::string id = e.value("id", std::string());
+                    if (!id.empty()) st.recoveryPrompt.push_back(
+                        {id, e.value("name", id), true, e.value("revision", -1),
+                         e.value("path", std::string())});
+                }
+                st.addLog("[daemon] " + std::to_string(st.recoveryPrompt.size()) +
+                          " retired doc(s) from a previous session awaiting recovery");
+            }
+            bootstrapped = true;
+            st.daemonEverConnected = true;
         }
-        // Breadcrumb for the "parts didn't show up" report: live docs mirror as
-        // tabs immediately; anything not here but flagged by checkOrphanRecovery
-        // below was already retired to the orphan tier (agent session ended >GC
-        // grace ago) and needs the recovery prompt.
-        st.addLog("[daemon] bootstrap: " + std::to_string(liveIds.size()) +
-                  " live doc(s) mirrored");
-        // Reconnect reconciliation: after a drain-replace we re-mirror the NEW
-        // daemon's docs above, but mirror tabs for docs that were open in the OLD
-        // daemon and are gone now would linger forever (no doc.closed arrives — a
-        // different daemon). doc_list is authoritative, so drop any daemon-mirror
-        // tab whose doc_id it no longer lists. Guards mirror the doc.closed
-        // handler: only our own aiHandoff mirrors, never a user tab, never one
-        // with unsaved edits, and never disrupt an active mid-edit. If we drop one
-        // wrongly (transient list), a later doc.opened / re-bootstrap re-mirrors it.
-        for (int i = (int)st.docTabs.size() - 1; i >= 0; --i) {
-            const auto& t = st.docTabs[i];
-            if (!t.aiHandoff || t.docId.empty() || liveIds.count(t.docId)) continue;
-            if (t.dirty || (i == st.activeTab && userMidEdit(st))) continue;
-            st.addLog("[daemon] dropping stale mirror tab " + t.docId +
-                      " (absent from daemon after reconnect)");
-            st.closeDocTab(i);
-        }
-    }
-    return checkOrphanRecovery(st, c);
+        lastBootstrapTry = {};
+        ui::anim::requestFrames();
+    }, step == 2 ? kLongEngineCallTimeoutMs : kMetadataCallTimeoutMs);
 }
 
 // ---------------------------------------------------------------------------
@@ -1137,7 +1361,135 @@ std::string drainNotice(const json& refusal) {
                           : notice;
 }
 
+void applyDeferredChange(AppState& st) {
+    for (auto it = pendingChanged.begin(); it != pendingChanged.end(); ++it) {
+        const int idx = tabIndexForDoc(st, it->first);
+        if (idx < 0 || tabMidEdit(st.docTabs[idx]) ||
+            (idx == st.activeTab && userMidEdit(st))) continue;
+        json data = std::move(it->second);
+        pendingChanged.erase(it);
+        handleEvent(st, {{"event", "doc.changed"}, {"data", std::move(data)}});
+        return;
+    }
+}
+
 }  // namespace
+
+void requireDocMesh(const std::string& docId, int revision) {
+    tessCatchup.require(docId, revision);
+    ui::anim::requestFrames();
+}
+
+void meshCatchupStarted(const std::string& docId, int revision) {
+    tessCatchup.require(docId, revision);
+    tessCatchup.loading(docId, revision);
+}
+
+void forgetDocMesh(const std::string& docId) {
+    tessCatchup.forget(docId);
+}
+
+void meshCatchupFinished(const std::string& docId, int revision, bool success) {
+    if (docId.empty() || revision < 0) return;
+    tessCatchup.finished(docId, revision, success);
+    if (!success) ui::anim::requestFrames();
+}
+
+void reloadDiskConflict(AppState& st, const std::string& docId) {
+    const int idx = tabIndexForDoc(st, docId);
+    if (idx < 0 || !st.docTabs[idx].diskConflict) return;
+    if (st.hasPendingHumanMutations(docId) || tabMidEdit(st.docTabs[idx]) ||
+        (idx == st.activeTab && userMidEdit(st))) {
+        st.toast(ui::ToastLevel::Info, "Finish the current edit before reloading.");
+        return;
+    }
+    const std::string legacyPath = st.docTabs[idx].conflictPath;
+    if (!legacyPath.empty()) {
+        ui::reloadLegacyHandoffConflict(st, docId, legacyPath);
+        return;
+    }
+    st.beginHumanMutation(docId);
+    st.rpc.callPrimary("doc_reload", {{"doc_id", docId}, {"origin", "system"}},
+        [&st, docId](const RpcResult& r) {
+            st.endHumanMutation(docId);
+            const int tab = tabIndexForDoc(st, docId);
+            if (tab < 0) return;
+            if (!r.ok || !r.result.is_object() || r.result.contains("code")) {
+                st.toast(ui::ToastLevel::Error, "Reload failed: " +
+                         (r.ok && r.result.is_object()
+                              ? r.result.value("message", std::string("engine error")) : r.err));
+                return;
+            }
+            st.docTabs[tab].diskConflict = false;
+            st.docTabs[tab].overwriteDiskConflict = false;
+            st.docTabs[tab].diskConflictStamp = nullptr;
+            st.markSaved(docId, r.result.value("revision", -1), {});
+            json data = r.result;
+            data["doc_id"] = docId;
+            data["method"] = "doc_reload";
+            if (data.contains("tess") && data["tess"].is_object() &&
+                data["tess"].contains("aicm_path") && !data["tess"].contains("mesh_error"))
+                data["aicm_path"] = data["tess"]["aicm_path"];
+            handleEvent(st, {{"event", "doc.changed"}, {"data", std::move(data)}});
+        }, kLongEngineCallTimeoutMs);
+}
+
+void beginUserDocOpen(AppState& st, const std::string& docId) {
+    ++userOpensInFlight[docId];
+    st.dismissedMirrorDocs.erase(docId);
+    pendingOpen.erase(docId);
+    attachInFlight.erase(docId);
+    attachedPendingReveal.erase(docId);
+    // A close not yet sent is superseded by the user's deliberate reopen.
+    for (auto it = pendingClose.begin(); it != pendingClose.end();) {
+        if (it->docId == docId && !(closeInFlight && it == pendingClose.begin()))
+            it = pendingClose.erase(it);
+        else ++it;
+    }
+}
+
+void endUserDocOpen(AppState& st, const std::string& docId) {
+    auto it = userOpensInFlight.find(docId);
+    if (it == userOpensInFlight.end() || --it->second != 0) return;
+    userOpensInFlight.erase(it);
+    if (tabIndexForDoc(st, docId) >= 0) pendingOpen.erase(docId);
+    auto pending = pendingChanged.find(docId);
+    if (pending == pendingChanged.end()) return;
+    json data = std::move(pending->second);
+    pendingChanged.erase(pending);
+    if (tabIndexForDoc(st, docId) >= 0)
+        handleEvent(st, {{"event", "doc.changed"}, {"data", std::move(data)}});
+}
+
+void queueMirrorClose(AppState& st, const std::string& docId,
+                      const std::string& title, bool detachOnly) {
+    if (docId.empty()) return;
+    // Suppress even presentations arriving while the detach/discard RPC is queued.
+    // A deliberate reopen clears this immediately and must not be undone by its reply.
+    st.dismissedMirrorDocs[docId] = title;
+    auto* c = engine::client();
+    pendingClose.push_back({docId, title, detachOnly, c ? c->reconnectGeneration() : 0});
+    pendingOpen.erase(docId);
+    pendingChanged.erase(docId);
+    attachInFlight.erase(docId);
+    attachedPendingReveal.erase(docId);
+    ui::anim::requestFrames();
+    queuedPresentations.erase(docId);
+}
+
+void shutdownEngineEvents() {
+    auto& queue = inProcessRefreshQueue();
+    const bool installed = queue.installed;
+    {
+        std::lock_guard<std::mutex> lock(queue.mutex);
+        queue.enabled = false;
+        queue.events.clear();
+    }
+    if (installed) cpp_core().setCacheRefreshSink(nullptr, nullptr);
+    queue.installed = false;
+    queue.attempted = false;
+    pendingChanged.clear();
+}
 
 void watchRevEngReconstruct(const std::string& runId) {
     revengWatch = RevEngWatch{};
@@ -1150,6 +1502,8 @@ void watchRevEngReconstruct(const std::string& runId) {
 }
 
 void engineEventsTick(AppState& st) {
+    attachesThisFrame = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
     // Pulse timeout runs in BOTH daemon and legacy mode — the legacy .step handoff poller
     // (feature_tree.cpp pollAiCadHandoff) stamps the same pulse — so it sits ahead of the
     // daemon-only gate below, at the very top of the frame.
@@ -1157,7 +1511,42 @@ void engineEventsTick(AppState& st) {
     // The reveng journal tail is a LOCAL FILE read, not a daemon push, so it runs in both
     // daemon and legacy in-process mode — ahead of the daemon-only gate below.
     revengReconstructTick();
-    if (!engine::daemonMode()) return;
+    framestats::Scope connectTiming("engine_connect");
+    if (!engine::daemonMode()) {
+        connectTiming.stop();
+        auto& queue = inProcessRefreshQueue();
+        if (st.workerStarted && !queue.attempted) {
+            queue.attempted = true;
+            {
+                std::lock_guard<std::mutex> lock(queue.mutex);
+                queue.enabled = true;
+            }
+            queue.installed = cpp_core().setCacheRefreshSink(&inProcessRefresh, nullptr);
+            if (!queue.installed) {
+                std::lock_guard<std::mutex> lock(queue.mutex);
+                queue.enabled = false;
+                st.addLog("[engine] in-process cache refresh sink unavailable");
+            }
+        }
+        while (std::chrono::steady_clock::now() < deadline) {
+            json event;
+            {
+                std::lock_guard<std::mutex> lock(queue.mutex);
+                if (queue.events.empty()) break;
+                event = std::move(queue.events.front());
+                queue.events.pop_front();
+            }
+            handleEvent(st, std::move(event));
+        }
+        applyDeferredChange(st);
+        tickTess(st);
+        {
+            std::lock_guard<std::mutex> lock(queue.mutex);
+            if (!queue.events.empty()) ui::anim::requestFrames();
+        }
+        return;
+    }
+    connectTiming.stop();
 #ifdef __EMSCRIPTEN__
     // Let a few ASYNCIFY UI frames settle before the first gateway connect (deep call stack).
     static int s_wasmWarmup = 0;
@@ -1186,7 +1575,9 @@ void engineEventsTick(AppState& st) {
     // H2: proactive reconnect with backoff when the socket is dead (daemon crash,
     // hostd --stop, transient EOF). Without this the GUI only reconnects on the
     // next RPC and otherwise looks empty (no tabs, no status).
+    framestats::Scope connectionTiming("engine_connection");
     const engine::DaemonConnState conn = engine::maintainConnection();
+    connectionTiming.stop();
     if (conn == engine::DaemonConnState::Unreachable) {
         // A draining hostd refuses this client by name: the chip shows why until it exits.
         const json refusal = engine::daemonRefusal();
@@ -1211,13 +1602,13 @@ void engineEventsTick(AppState& st) {
         return;
     }
     st.daemonDrainNotice.clear();
-    if (st.daemonUnreachable) {
+    if (st.daemonUnreachable && c->reconnectGeneration() != bootstrapGen) {
         const bool braked = noteReconnectAndCheckBrake();
-        // Force bootstrap re-arm even if reconnectGeneration already advanced mid-call: the
-        // unreachable window may have missed the gen edge. Re-arm regardless of the brake —
-        // we still want a fresh doc list / subscriptions; the brake only holds back the
-        // auto-focus doc_activate inside openMirrorTab.
+        // Re-arm once per connection, including while the crash-loop brake
+        // keeps its sticky notice visible. Resetting every tick would restart
+        // the asynchronous subscription/list/recovery chain before it advanced.
         bootstrapped = false;
+        bootstrapStep = 0;
         lastBootstrapTry = {};
         if (!braked) {
             st.daemonUnreachable = false;
@@ -1238,57 +1629,170 @@ void engineEventsTick(AppState& st) {
     if (gen != bootstrapGen) {
         bootstrapGen = gen;
         bootstrapped = false;
+        bootstrapStep = 0;
+        bootstrapInFlight = false;
+        pendingEvents.clear();
+        latestChanged.clear();
+        queuedPresentations.clear();
+        attachInFlight.clear();
+        attachedPendingReveal.clear();
+        reattachPending.clear();
+        reattachInFlight.clear();
+        dirtyEventRevision.clear();
+        dirtyEventMetadataRevision.clear();
         lastBootstrapTry = {};  // retry immediately, don't wait out the backoff
     }
 
-    if (!bootstrapped) {
+    if (!bootstrapped && !bootstrapInFlight) {
         const auto now = std::chrono::steady_clock::now();
         if (now - lastBootstrapTry >= std::chrono::milliseconds(500)) {
             lastBootstrapTry = now;
-            const uint64_t before = c->reconnectGeneration();
-            const bool ok = tryBootstrap(st, *c);
-            // A timed-out call invalidates its socket. Any inline reconnect
-            // during bootstrap also loses the earlier subscription.
-            bootstrapped = ok && c->connected() &&
-                           before == c->reconnectGeneration();
-            if (bootstrapped) st.daemonEverConnected = true;
+            tryBootstrap(st, *c);
         }
     }
 
-    for (const json& evt : c->drainEvents()) handleEvent(st, evt);
+    // Primary identity matters: finish deferred closes before reattaching that doc.
+    if (!pendingClose.empty() && !closeInFlight &&
+        std::chrono::steady_clock::now() < deadline) {
+        const PendingClose close = pendingClose.front();
+        if (close.detachOnly && close.generation != gen) {
+            pendingClose.pop_front();  // the old connection's attachment is already gone
+        } else {
+            closeInFlight = true;
+            const std::string method = close.detachOnly ? "detach_doc" : "doc_discard";
+            st.rpc.callPrimary(method, {{"doc_id", close.docId}},
+                               [&st, close, method](const RpcResult& r) {
+                if (r.ok && r.result.is_object() && r.result.value("detached", false)) {
+                    // Dismissal was recorded at close time; a user reopen may have
+                    // cleared it since the request was sent.
+                    if (r.result.contains("note"))
+                        st.addLog("[tabs] " + close.docId + ": " +
+                                  r.result.value("note", std::string("detached")));
+                } else if (!r.ok) {
+                    st.addLog("[tabs] " + method + " failed for " + close.docId + ": " + r.err);
+                    st.toast(ui::ToastLevel::Warn,
+                             "Document close not confirmed — check Agent Documents");
+                }
+                pendingClose.pop_front();
+                closeInFlight = false;
+                ui::anim::requestFrames();
+            }, kAttachCallTimeoutMs);
+        }
+    }
+    // Subscribe first, then reattach every already-visible tab and replay a
+    // fresh full revision. The attach precedes the fetch on the primary lane.
+    if (bootstrapStep >= 2 && pendingClose.empty() &&
+        std::chrono::steady_clock::now() - lastReattachTry >= std::chrono::milliseconds(500)) {
+        for (auto it = reattachPending.begin(); it != reattachPending.end();) {
+            if (tabIndexForDoc(st, it->first) < 0) it = reattachPending.erase(it);
+            else ++it;
+        }
+        int sent = 0;
+        for (const auto& [id, revision] : reattachPending) {
+            if (sent >= 2) break;
+            const int idx = tabIndexForDoc(st, id);
+            if (idx < 0 || reattachInFlight.count(id)) continue;
+            const auto& tab = st.docTabs[idx];
+            const std::string mode = tab.aiHandoff && !tab.userAdopted ? "ro" : "rw";
+            reattachInFlight.insert(id);
+            ++sent;
+            st.rpc.callPrimary("attach_doc", {{"doc_id", id}, {"mode", mode}},
+                [&st, id, revision, gen](const RpcResult& r) {
+                    auto* client = engine::client();
+                    if (!client || client->reconnectGeneration() != gen) return;
+                    reattachInFlight.erase(id);
+                    if (!r.ok || !r.result.is_object() || r.result.contains("code")) {
+                        st.addLog("[daemon] reattach failed for " + id + ": " + r.err);
+                    } else {
+                        applyDirtyMetadata(st, id, r.result);
+                        reattachPending.erase(id);
+                        if (tabIndexForDoc(st, id) >= 0)
+                            tessCatchup.require(id, std::max(0L, r.result.value("revision", revision)));
+                    }
+                    ui::anim::requestFrames();
+                }, kAttachCallTimeoutMs);
+        }
+        lastReattachTry = std::chrono::steady_clock::now();
+    }
 
-    // Deferred work queued while the user was mid-edit / away: apply when safe.
+    // Superseded revisions keep notices in place; lifecycle pushes are barriers.
+    const double remaining = std::chrono::duration<double, std::milli>(
+        deadline - std::chrono::steady_clock::now()).count();
+    if (remaining > 0) {
+        for (json& event : c->drainEvents(std::min(1.0, remaining))) {
+            const std::string name = event.value("event", std::string());
+            if (name == "doc.opened" || name == "doc.closed" || name == "doc.presented")
+                latestChanged.clear();
+            if (name == "doc.presented" && event.contains("data") && event["data"].is_object()) {
+                const std::string id = event["data"].value("doc_id", std::string());
+                if (!id.empty() && !st.dismissedMirrorDocs.count(id)) queuedPresentations.insert(id);
+            }
+            if ((name == "doc.changed" || name == "doc.cache_refreshed") &&
+                event.contains("data") && event["data"].is_object()) {
+                const std::string id = event["data"].value("doc_id", std::string());
+                if (tabIndexForDoc(st, id) < 0 && !pendingOpen.count(id) &&
+                    !queuedPresentations.count(id) && !userOpensInFlight.count(id)) continue;
+                if (!id.empty()) {
+                    const auto old = latestChanged.find(id);
+                    if (old != latestChanged.end()) {
+                        const long prior = (*old->second)["data"].value("revision", -1L);
+                        if (event["data"].value("revision", -1L) < prior) {
+                            event["event"] = "doc.changed.notice";
+                            pendingEvents.push_back(std::move(event));
+                            continue;
+                        }
+                        (*old->second)["event"] = "doc.changed.notice";
+                    }
+                    pendingEvents.push_back(std::move(event));
+                    latestChanged[id] = &pendingEvents.back();
+                    continue;
+                }
+            }
+            pendingEvents.push_back(std::move(event));
+        }
+    }
+    while (!pendingEvents.empty() && std::chrono::steady_clock::now() < deadline) {
+        json event = std::move(pendingEvents.front());
+        const std::string eventName = event.value("event", std::string());
+        if ((eventName == "doc.changed" || eventName == "doc.cache_refreshed") &&
+            event.contains("data") && event["data"].is_object()) {
+            const auto it = latestChanged.find(event["data"].value("doc_id", std::string()));
+            if (it != latestChanged.end() && it->second == &pendingEvents.front())
+                latestChanged.erase(it);
+        }
+        pendingEvents.pop_front();
+        handleEvent(st, std::move(event));
+    }
     if (bootstrapped && c->connected() && !pendingOpen.empty() && !userMidEdit(st) &&
         std::chrono::steady_clock::now() - lastMirrorRetry >= std::chrono::milliseconds(500)) {
-        lastMirrorRetry = std::chrono::steady_clock::now();
-        const std::map<std::string, std::string> retry = pendingOpen;
-        for (const auto& [id, nm] : retry)
-            if (!openMirrorTab(st, id, nm) && !c->connected()) break;
-    }
-    if (!pendingChanged.empty() && !userMidEdit(st)) {
-        // Only the ACTIVE tab applies immediately; background ones stay pulsed
-        // (their next switch-in rebuild picks the change up for free).
-        const std::string activeId =
-            (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size())
-                ? st.docTabs[st.activeTab].docId
-                : std::string();
-        auto it = pendingChanged.find(activeId);
-        if (it != pendingChanged.end()) {
-            const json d = it->second;
-            applyChangedActive(st, activeId, d);
+        auto it = pendingOpen.begin();
+        while (it != pendingOpen.end() && attachesThisFrame < 2 &&
+               std::chrono::steady_clock::now() < deadline) {
+            const std::string id = it->first, name = it->second;
+            ++it;  // openMirrorTab erases its own entry on success
+            if (!openMirrorTab(st, id, name)) break;
         }
+        lastMirrorRetry = attachesThisFrame >= 2 ? std::chrono::steady_clock::time_point{}
+                                                : std::chrono::steady_clock::now();
     }
+    if (std::chrono::steady_clock::now() < deadline) applyDeferredChange(st);
+    tickTess(st);
+    if (!pendingEvents.empty() || c->hasPendingEvents() || !pendingClose.empty() ||
+        !pendingExpiredHolds.empty() || !reattachPending.empty() ||
+        (!pendingOpen.empty() && !userMidEdit(st)))
+        ui::anim::requestFrames();
 }
 
-void mirrorRecoveredDocs(AppState& st, const std::vector<std::string>& docIds) {
+void mirrorRecoveredDocs(AppState& st, const std::vector<std::string>& docIds,
+                         bool humanDirty, int revision, const std::string& path, bool diskConflict,
+                         const json& observedStamp) {
     if (!engine::daemonMode() || !engine::client()) return;
-    // openMirrorTab is the same path bootstrap's doc_list uses for live docs:
-    // it dedups against already-open tabs, attaches ro, and focuses the first
-    // reveal. Recovered docs are minted with a fresh doc_id, so none are open yet.
-    // recovery_open hands back ids only, so these take openMirrorTab's name-less
-    // path: placeholder title now, async doc_tree backfill on a later frame.
-    for (const auto& id : docIds)
-        if (!id.empty()) openMirrorTab(st, id);
+    for (const auto& id : docIds) {
+        if (id.empty()) continue;
+        if (humanDirty || !path.empty())
+            recoveredDocs[id] = {humanDirty, revision, path, diskConflict, observedStamp};
+        openMirrorTab(st, id);
+    }
 }
 
 void primeMirrorFromSnapshot(AppState& st, const std::string& docId,
@@ -1312,28 +1816,16 @@ void primeMirrorFromSnapshot(AppState& st, const std::string& docId,
                         if (then) then(false);
                         return;
                     }
-                    // doc_snapshot returns the VERBATIM doc.changed payload, so both the
-                    // active and the background branch below are the same code the live
-                    // event path already runs — this is a replay of the push we missed,
-                    // not a second way of loading a document.
-                    if (idx == st.activeTab) {
-                        applyChangedActive(st, docId, r.result);
-                        if (then) then(true);
-                        return;
-                    }
-                    AppState::DocTab& tab = st.docTabs[idx];
-                    DocMirrorSnapshot snapshot;
-                    const std::string aicm = r.result.value("aicm_path", std::string());
-                    if (!tab.session || !pushedSnapshot(docId, r.result, snapshot) ||
-                        aicm.empty()) {
+                    const auto pending = pendingChanged.find(docId);
+                    if (pending != pendingChanged.end() &&
+                        r.result.value("revision", -1L) < pending->second.value("revision", -1L)) {
                         if (then) then(false);
                         return;
                     }
-                    tab.session->cachedAicmPath = aicm;
-                    tab.session->cachedRevision = snapshot.revision;
-                    tab.session->cachedMirror = std::move(snapshot);
-                    tab.session->cachedDocMesh.reset();
-                    st.cacheBackgroundDocMeshAsync(docId, tab.session->cachedRevision, aicm);
+                    // Replay through the same active/parked and mesh-obligation path.
+                    json data = r.result;
+                    data["doc_id"] = docId;
+                    handleEvent(st, {{"event", "doc.changed"}, {"data", std::move(data)}});
                     if (then) then(true);
                 }, 15000);
 }

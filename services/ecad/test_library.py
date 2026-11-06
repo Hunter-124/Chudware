@@ -255,10 +255,12 @@ def test_resolve_lookups() -> None:
     # Starter symbols
     for libid in ["Device:R", "Device:C", "Device:L", "Device:D",
                   "Device:LED", "Device:Q_NPN", "Device:NMOS",
-                  "Amplifier_Operational:OPAMP_dual", "Timer:NE555",
+                  "Amplifier_Operational:LM358", "Simulation_SPICE:OPAMP",
+                  "Timer:NE555P", "Timer:NE555D",
                   "Connector:Conn_2", "Connector:Header_1x4",
                   "power:GND", "power:VCC", "power:+5V",
-                  "Simulation_SPICE:V_source", "Simulation_SPICE:I_source"]:
+                  "Simulation_SPICE:VDC", "Simulation_SPICE:VSIN",
+                  "Simulation_SPICE:VPULSE", "Simulation_SPICE:I_source"]:
         sym = library.resolve(libid)
         if sym is None:
             _fail(f"resolve({libid!r}) returned None")
@@ -304,10 +306,12 @@ def test_sim_mappings() -> None:
         "Device:C": "C",
         "Device:L": "L",
         "Device:D": "D",
-        "Simulation_SPICE:V_source": "V",
+        "Simulation_SPICE:VDC": "V",
+        "Simulation_SPICE:VSIN": "V",
+        "Simulation_SPICE:VPULSE": "V",
         "Simulation_SPICE:I_source": "I",
-        "Amplifier_Operational:OPAMP_dual": "OPAMP",
-        "Timer:NE555": "SUBCKT",
+        "Timer:NE555P": "SUBCKT",
+        "Timer:NE555D": "SUBCKT",
     }
     for libid, expected_model in required_sim.items():
         sym = SYMBOLS.get(libid)
@@ -316,6 +320,22 @@ def test_sim_mappings() -> None:
         assert sim is not None, f"{libid} missing sim mapping"
         assert sim.get("model") == expected_model, \
             f"{libid}: sim model {sim.get('model')!r} != {expected_model!r}"
+    for libid in ("Timer:NE555P", "Timer:NE555D"):
+        sim = SYMBOLS[libid]["sim"]
+        assert sim["subckt"] == "NE555", f"{libid}: {sim}"
+        assert sim["pin_order"] == [str(n) for n in range(1, 9)], f"{libid}: {sim}"
+
+    # The physical dual op-amp cannot be represented by a single ideal model:
+    # that would silently omit its second amplifier. Use KiCad's simulation
+    # symbol and its explicit five-terminal subcircuit mapping instead.
+    assert "sim" not in SYMBOLS["Amplifier_Operational:LM358"]
+    ideal = SYMBOLS["Simulation_SPICE:OPAMP"]
+    assert "sim" not in ideal
+    fields = ideal["fields"]
+    assert fields["Sim.Device"] == "SUBCKT"
+    assert fields["Sim.Library"].endswith("/Simulation_SPICE.sp")
+    assert fields["Sim.Name"] == "kicad_builtin_opamp"
+    assert fields["Sim.Pins"] == "1=in+ 2=in- 3=vcc 4=vee 5=out"
     _ok(f"{len(required_sim)} sim mappings verified")
 
 
@@ -335,12 +355,11 @@ def test_pin_types() -> None:
         assert t == {"passive"}, f"{libid} pins should all be passive, got {t}"
     _ok("R/C/L pins all passive")
 
-    # Op-amp
-    opamp_types = _types("Amplifier_Operational:OPAMP_dual")
-    assert "input" in opamp_types
-    assert "output" in opamp_types
-    assert "power_in" in opamp_types
-    _ok("OPAMP_dual has input/output/power_in pins")
+    # Physical and simulated op-amps both expose input, output and supply pins.
+    for libid in ("Amplifier_Operational:LM358", "Simulation_SPICE:OPAMP"):
+        opamp_types = _types(libid)
+        assert opamp_types == {"input", "output", "power_in"}, f"{libid}: {opamp_types}"
+    _ok("physical and simulated op-amps have input/output/power_in pins")
 
     # Power symbols
     for libid in ["power:GND", "power:VCC", "power:+5V"]:
@@ -348,32 +367,42 @@ def test_pin_types() -> None:
         assert "power_out" in t, f"{libid} should have power_out pin"
     _ok("power symbols have power_out pins")
 
-    # V_source / I_source
-    for libid in ["Simulation_SPICE:V_source", "Simulation_SPICE:I_source"]:
-        t = _types(libid)
-        assert "power_out" in t, f"{libid} should have power_out pins"
-    _ok("V_source/I_source have power_out pins")
+    # KiCad voltage-source terminals are passive, numbered pins; current source
+    # remains the separate starter-only source model.
+    for libid in ("Simulation_SPICE:VDC", "Simulation_SPICE:VSIN",
+                  "Simulation_SPICE:VPULSE"):
+        assert _types(libid) == {"passive"}, f"{libid}: {_types(libid)}"
+        sym = SYMBOLS[libid]
+        assert [p["number"] for p in sym["pins"]] == ["1", "2"]
+        assert sym["sim"]["pin_order"] == ["1", "2"]
+        assert sym["fields"]["Sim.Device"] == "V"
+        assert sym["fields"]["Sim.Pins"] == "1=+ 2=-"
+    assert "power_out" in _types("Simulation_SPICE:I_source")
+    _ok("KiCad voltage sources have passive numbered pins and Sim.Pins mapping")
 
-    # NE555 has power_in
-    ne_types = _types("Timer:NE555")
-    assert "power_in" in ne_types, "NE555 should have power_in pin"
-    assert "output" in ne_types, "NE555 should have output pin"
-    _ok("NE555 has power_in and output pins")
+    # Both physical 555 packages retain the KiCad electrical pin types.
+    for libid in ("Timer:NE555P", "Timer:NE555D"):
+        ne_types = _types(libid)
+        assert {"power_in", "output"} <= ne_types, f"{libid}: {ne_types}"
+    _ok("NE555P and NE555D have power_in and output pins")
 
 
-# ─── 8. multi-unit OPAMP_dual unit validation ────────────────────────────────
+# ─── 8. multi-unit LM358 unit validation ────────────────────────────────────
 
 def test_multiunit_symbol() -> None:
-    print("\n[8] multi-unit symbol (OPAMP_dual)")
-    from services.ecad.schema import new_schematic, validate_schematic
+    print("\n[8] multi-unit symbol (LM358)")
+    from services.ecad.schema import iter_placed_pins, new_schematic, validate_schematic
     from services.ecad.library.starter import SYMBOLS
 
-    libid = "Amplifier_Operational:OPAMP_dual"
+    libid = "Amplifier_Operational:LM358"
     sdef = SYMBOLS[libid]
-    assert sdef["units_count"] == 3, f"units_count: {sdef['units_count']}"
+    expected_units = {1: {"1", "2", "3"}, 2: {"5", "6", "7"}, 3: {"4", "8"}}
+    assert sdef["units_count"] == len(expected_units), f"units_count: {sdef['units_count']}"
 
-    # Each unit 1 and 2 should validate individually
-    for unit in (1, 2):
+    for unit, expected_pins in expected_units.items():
+        unit_pins = [p["number"] for p in sdef["pins"] if p.get("unit", 1) == unit]
+        assert len(unit_pins) == len(expected_pins) and set(unit_pins) == expected_pins, \
+            f"unit {unit}: {unit_pins}"
         sch = new_schematic("opamp_test")
         sch["lib_cache"][libid] = sdef
         sch["symbols"].append({
@@ -381,7 +410,7 @@ def test_multiunit_symbol() -> None:
             "libid": libid,
             "sheet": "sh1",
             "ref": "U?",
-            "value": "OPAMP",
+            "value": "LM358",
             "footprint": "",
             "pos": [0.0, 0.0],
             "angle": 0.0,
@@ -393,7 +422,12 @@ def test_multiunit_symbol() -> None:
         })
         errs = validate_schematic(sch)
         assert not errs, f"unit {unit} validation failed: {errs}"
-    _ok("OPAMP_dual unit 1 and 2 each validate")
+        placed = list(iter_placed_pins(sch))
+        assert len(placed) == len(expected_pins)
+        assert {pin["number"] for _, pin, _ in placed} == expected_pins
+        assert len({pos for _, _, pos in placed}) == len(expected_pins), \
+            f"unit {unit}: overlapping pin endpoints: {placed}"
+    _ok("LM358 units 1, 2 and 3 validate and expose only their physical pins")
 
 # ─── 9. pin numbers ⊆ default footprint pads ─────────────────────────────────
 
@@ -412,6 +446,8 @@ def test_default_footprints_pin_subset_of_pads() -> None:
         assert not missing, (
             f"{libid} → {fpid}: pin numbers {sorted(missing)} not in pads {sorted(pad_nums)}"
         )
+    assert _DEFAULT_FOOTPRINTS["Timer:NE555P"].startswith("Package_DIP:DIP-8")
+    assert _DEFAULT_FOOTPRINTS["Timer:NE555D"].startswith("Package_SO:SOIC-8")
     _ok(f"{len(_DEFAULT_FOOTPRINTS)} default footprint mappings: pins ⊆ pads")
 
 
@@ -421,26 +457,109 @@ def test_lm358_datasheet_pinout() -> None:
     print("\n[10] LM358 DIP-8/SOIC-8 datasheet pinout")
     from services.ecad.library.starter import SYMBOLS
 
-    # TI SLOS068 public pin map (clean-room).
+    # TI SLOS068 DIP-8/SOIC-8 map, with KiCad LM358 pin names and units.
+    # Outputs are unnamed on the KiCad symbol; their type identifies them.
     golden = {
-        "1": "OUT1",
-        "2": "IN1-",
-        "3": "IN1+",
-        "4": "V-",
-        "5": "IN2+",
-        "6": "IN2-",
-        "7": "OUT2",
-        "8": "V+",
+        "1": ("", "output", 1),     # OUT1
+        "2": ("-", "input", 1),     # IN1-
+        "3": ("+", "input", 1),     # IN1+
+        "4": ("V-", "power_in", 3),
+        "5": ("+", "input", 2),     # IN2+
+        "6": ("-", "input", 2),     # IN2-
+        "7": ("", "output", 2),     # OUT2
+        "8": ("V+", "power_in", 3),
     }
     sdef = SYMBOLS["Amplifier_Operational:LM358"]
-    got = {str(p["number"]): str(p["name"]) for p in sdef["pins"]}
+    pins = sdef["pins"]
+    got = {p["number"]: (p["name"], p["type"], p["unit"]) for p in pins}
+    assert len(pins) == len(golden), f"LM358 has duplicate or extra pins: {pins}"
     assert got == golden, f"LM358 pinout {got} != golden {golden}"
-    # OPAMP_dual remains abstract multi-unit (not a package claim).
-    dual = SYMBOLS["Amplifier_Operational:OPAMP_dual"]
-    assert dual["units_count"] == 3
-    assert "not a package pinout" in dual["description"].lower() or \
-           "abstract" in dual["description"].lower()
-    _ok("LM358 pinout golden; OPAMP_dual stays abstract multi-unit")
+    _ok("LM358 physical pinout, electrical types and unit memberships match KiCad")
+
+
+def test_ne555_datasheet_pinout() -> None:
+    print("\n[10b] NE555 DIP-8/SOIC-8 datasheet pinout")
+    from services.ecad.library.starter import SYMBOLS
+    from services.ecad.schema import iter_placed_pins, new_schematic
+
+    # KiCad's supply pins belong to common unit 0 and appear on unit 1.
+    golden = {
+        "1": ("GND", "power_in", 0),
+        "2": ("TRIG", "input", 1),
+        "3": ("OUT", "output", 1),
+        "4": ("~{RST}", "input", 1),
+        "5": ("CONT", "passive", 1),
+        "6": ("THRES", "input", 1),
+        "7": ("DISCH", "input", 1),
+        "8": ("VCC", "power_in", 0),
+    }
+    for libid in ("Timer:NE555P", "Timer:NE555D"):
+        sdef = SYMBOLS[libid]
+        assert sdef["units_count"] == 1, f"{libid}: {sdef['units_count']}"
+        pins = sdef["pins"]
+        got = {p["number"]: (p["name"], p["type"], p["unit"]) for p in pins}
+        assert len(pins) == len(golden), f"{libid} has duplicate or extra pins: {pins}"
+        assert got == golden, f"{libid} pinout {got} != golden {golden}"
+        sch = new_schematic("timer_test")
+        sch["lib_cache"][libid] = sdef
+        sch["symbols"].append({"libid": libid, "unit": 1, "pos": [0.0, 0.0]})
+        placed = list(iter_placed_pins(sch))
+        assert len(placed) == len(golden)
+        assert {pin["number"] for _, pin, _ in placed} == set(golden)
+        assert len({pos for _, _, pos in placed}) == len(golden), \
+            f"{libid}: overlapping pin endpoints: {placed}"
+    _ok("NE555P and NE555D physical pins, types and common supplies match KiCad")
+
+
+def test_sim_opamp_pinout() -> None:
+    print("\n[10c] KiCad simulation op-amp pinout")
+    from services.ecad.library.starter import SYMBOLS
+
+    golden = {
+        "1": ("+", "input", 1),
+        "2": ("-", "input", 1),
+        "3": ("V+", "power_in", 1),
+        "4": ("V-", "power_in", 1),
+        "5": ("", "output", 1),  # OUT
+    }
+    sdef = SYMBOLS["Simulation_SPICE:OPAMP"]
+    assert sdef["units_count"] == 1
+    pins = sdef["pins"]
+    got = {p["number"]: (p["name"], p["type"], p["unit"]) for p in pins}
+    assert len(pins) == len(golden), f"simulation op-amp has duplicate or extra pins: {pins}"
+    assert got == golden, f"simulation op-amp pinout {got} != golden {golden}"
+    _ok("simulation op-amp five-terminal pinout and electrical types match KiCad")
+
+
+def test_physical_part_engineering_metadata() -> None:
+    print("\n[10d] physical timer and op-amp engineering metadata")
+    from services.ecad.library.starter import SYMBOLS
+
+    timer_rail = {
+        "name": "VCC", "voltage_v_min": 4.5, "voltage_v_nom": 5.0,
+        "voltage_v_max": 16.0, "current_a_active": 0.003, "current_a_sleep": None,
+    }
+    opamp_rail = {
+        "name": "V+", "voltage_v_min": 3.0, "voltage_v_nom": 5.0,
+        "voltage_v_max": 32.0, "current_a_active": 0.0007, "current_a_sleep": None,
+    }
+    expectations = (
+        ("Timer:NE555P", {"typ": 0.015, "max": 0.225},
+         {"tj_max": 150.0, "ta_max": 70.0}, timer_rail, "SLFS022"),
+        ("Timer:NE555D", {"typ": 0.015, "max": 0.225},
+         {"tj_max": 150.0, "ta_max": 70.0}, timer_rail, "SLFS022"),
+        ("Amplifier_Operational:LM358", {"typ": 0.0035, "max": 0.0384},
+         {"tj_max": 150.0, "ta_max": 85.0}, opamp_rail, "SLOS068"),
+    )
+    for libid, power, limits, rail, datasheet in expectations:
+        eng = SYMBOLS[libid]["eng"]
+        assert eng["power_w"] == power, f"{libid}: {eng}"
+        assert eng["limits_c"] == limits, f"{libid}: {eng}"
+        assert eng["supply"] == {
+            "rails": [rail], "voltage_domains": [rail["name"]], "sequencing": [],
+        }, f"{libid}: {eng}"
+        assert any(datasheet in source for source in eng["sources"]), f"{libid}: {eng}"
+    _ok("physical part power, limits, rails and datasheet provenance preserved")
 
 
 # ─── 11. BJT/MOSFET SOT-23 numeric pin numbers ───────────────────────────────
@@ -475,6 +594,41 @@ def test_board_essentials_search() -> None:
         _ok(f"search({q!r}) → {len(hits)} hit(s)")
 
 
+def test_python_recipe_model_fields_export_to_kicad_spice(tmp_path) -> None:
+    """Fallback recipes retain editable KiCad models and yield real SPICE netlists."""
+    import shutil
+    import pytest
+    from services.ecad_design import orchestrator, recipes
+    from services.mcp.ecad_common import _rpc, ecad_session, netlist_mod
+
+    if not shutil.which("kicad-cli"):
+        pytest.skip("KiCad CLI is required for SPICE export")
+    for name, design in (("filter", recipes.rc_lowpass()),
+                         ("timer", recipes.rc_555_astable())):
+        target = tmp_path / f"{name}.kicad_sch"
+        session = ecad_session.new_session("sch", name, str(target))
+        result = orchestrator.build_design(session, design)
+        assert not result["missing_pins"], result
+        components = {c["ref"]: c for c in netlist_mod.build_netlist(session.doc)["components"]}
+        if name == "filter":
+            assert components["V1"]["fields"]["Sim.Type"] == "SIN"
+            assert "sim" not in components["V1"]
+        else:
+            assert components["U1"]["fields"]["Sim.Device"] == "SPICE"
+            assert any(".subckt NE555" in text.get("text", "")
+                       for text in session.doc.get("texts", []))
+        assert target.is_file() and ecad_session.close_session(session.doc_id)
+        reopened = ecad_session.open_path(str(target))
+        exported = _rpc("ecad_export", {"doc_id": reopened.doc_id, "kind": "spice"})
+        spice = exported["files"][0]["content"]
+        if name == "filter":
+            assert "sin(" in spice.lower() and "ac 1" in spice.lower(), spice
+        else:
+            assert ".subckt NE555" in spice and ".model Dclamp" in spice, spice
+            assert any(line.startswith("XU1 ") and line.rstrip().endswith(" NE555")
+                       for line in spice.splitlines()), spice
+
+
 
 # ─── main ─────────────────────────────────────────────────────────────────────
 
@@ -495,6 +649,9 @@ def main() -> None:
         test_multiunit_symbol,
         test_default_footprints_pin_subset_of_pads,
         test_lm358_datasheet_pinout,
+        test_ne555_datasheet_pinout,
+        test_sim_opamp_pinout,
+        test_physical_part_engineering_metadata,
         test_bjt_mosfet_sot23_pin_numbers,
         test_board_essentials_search,
     ]

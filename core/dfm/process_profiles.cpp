@@ -105,11 +105,11 @@ struct Profile {
     std::string process;
     std::string material_name;
     std::string density_lookup;  // registry alias for the default density
-    double density_fallback;
-    double min_wall_mm;
-    double min_feature_mm;
-    double hole_comp_mm;
-    double tolerance_band_mm;
+    json density_fallback;
+    json min_wall_mm;
+    json min_feature_mm;
+    json hole_comp_mm;
+    json tolerance_band_mm;
     json fit_classes_mm;  // {"slip","location","press","free"} values double|null
     json draft;           // {"required","min_deg"}
     json overhang;        // {"max_deg","max_bridge_mm"} int|null
@@ -156,6 +156,35 @@ const std::vector<Profile>& profiles() {
          {{"required", true}, {"min_deg", 1.0}},
          {{"max_deg", nullptr}, {"max_bridge_mm", nullptr}},
          {{"strategy", "molded"}, {"printed_ok_min", nullptr}}},
+        // Manufacturing Network, Sand Casting Designers & Buyers Guide,
+        // process norms: light-alloy wall 3 mm and draft 1 degree.
+        {"cast", "Light alloy (sand casting)", "", nullptr,
+         3.0, nullptr, nullptr, nullptr,
+         {{"slip", nullptr}, {"location", nullptr}, {"press", nullptr}, {"free", nullptr}},
+         {{"required", true}, {"min_deg", 1.0}},
+         {{"max_deg", nullptr}, {"max_bridge_mm", nullptr}},
+         {{"strategy", nullptr}, {"printed_ok_min", nullptr}}},
+        // Formlabs Form 4 Design Guide, Grey Resin, 50 micron layers.
+        {"sla", "Grey resin", "", nullptr,
+         0.2, nullptr, nullptr, nullptr,
+         {{"slip", nullptr}, {"location", nullptr}, {"press", nullptr}, {"free", nullptr}},
+         {{"required", false}, {"min_deg", nullptr}},
+         {{"max_deg", nullptr}, {"max_bridge_mm", nullptr}},
+         {{"strategy", nullptr}, {"printed_ok_min", nullptr}}},
+        // Formlabs Fuse 1 design specifications, Nylon 12, vertical walls.
+        {"sls", "Nylon 12", "", nullptr,
+         0.6, nullptr, nullptr, nullptr,
+         {{"slip", nullptr}, {"location", nullptr}, {"press", nullptr}, {"free", nullptr}},
+         {{"required", false}, {"min_deg", nullptr}},
+         {{"max_deg", nullptr}, {"max_bridge_mm", nullptr}},
+         {{"strategy", nullptr}, {"printed_ok_min", nullptr}}},
+        // Tempus 3D HP Multi Jet Fusion guide, unsupported wall.
+        {"mjf", "Nylon", "", nullptr,
+         0.5, nullptr, nullptr, nullptr,
+         {{"slip", nullptr}, {"location", nullptr}, {"press", nullptr}, {"free", nullptr}},
+         {{"required", false}, {"min_deg", nullptr}},
+         {{"max_deg", nullptr}, {"max_bridge_mm", nullptr}},
+         {{"strategy", nullptr}, {"printed_ok_min", nullptr}}},
     };
     return k;
 }
@@ -165,6 +194,125 @@ const Profile* find_profile(const std::string& key) {
         if (p.process == key) return &p;
     return nullptr;
 }
+// Each rule is installed with its published scope and provenance. Missing rules
+// are deliberately absent rather than manufacturing a process-independent limit.
+void add_rules(const std::string& process, json& params) {
+    json rules = json::object();
+    json sources = json::object();
+    const auto add = [&](const char* key, json value, const char* source) {
+        rules[key] = std::move(value);
+        sources[key] = source;
+    };
+    if (process == "cnc_mill" || process == "lathe") {
+        // machining_reference.json, drilled-hole-depth-capability, 5:1 row:
+        // conventional twist-drill planning guidance, not a standard limit.
+        add("hole_max_depth_to_dia_standard", 5.0, "machining_reference.json drilled-hole-depth-capability, 5:1 row: conventional twist-drill planning guidance, pilot and peck as needed; not a standard guarantee");
+        // AIVON Hole Design Guidelines for CNC Machining, hole spacing and
+        // edge distance: below 1.5 hole diameters risks breakout/burrs.
+        // https://www.aivon.com/blog/cnc-design/hole-design-guidelines-for-cnc-machining/
+        add("hole_to_edge_diameter_factor", 1.5,
+            "AIVON Hole Design Guidelines for CNC Machining, hole spacing and edge distance: 1.5 hole diameters as a production planning screen; source does not specify datum, conservatively interpreted as edge ligament");
+    }
+    if (process == "cnc_mill") {
+        // machining_reference.json, internal-corner-radius-cutter: D/2
+        // geometric minimum; recommended 0.55D = 1.1 cutter radii.
+        add("internal_corner_radius_tool_ratio_min", 1.0, "machining_reference.json internal-corner-radius-cutter: geometric minimum D/2, one cutter radius");
+        add("internal_corner_radius_tool_ratio_recommended", 1.1, "machining_reference.json internal-corner-radius-cutter: recommended finish clearance starts at 0.55D, 1.1 cutter radii; planning guidance");
+    }
+    if (process == "fdm") {
+        // Prusa Knowledge Base, Extrusion Multiplier Calibration: 0.4 mm
+        // nozzle, 0.45 mm line width and 0.1-0.2 mm layers; Layers and
+        // Perimeters: Prusa profiles use at least two perimeters.
+        add("nozzle_mm", 0.4, "Prusa Extrusion Multiplier Calibration, standard 0.4 mm nozzle profiles, mm");
+        add("line_width_mm", 0.45, "Prusa Extrusion Multiplier Calibration, 0.4 mm nozzle profiles: extrusion width, mm");
+        add("layer_height_mm", 0.2, "Prusa Extrusion Multiplier Calibration, 0.4 mm nozzle profiles: example layer height, mm");
+        add("perimeters", 2, "Prusa Layers and Perimeters, Perimeters: minimum outlines in original Prusa profiles");
+        // Formlabs, Minimum Wall Thickness for 3D Printing, process table:
+        // free-standing FDM vertical wire diameter.
+        add("min_pin_mm", 3.0, "Formlabs Minimum Wall Thickness for 3D Printing, process table: FDM vertical wire diameter, mm");
+        // MeshRA, Chamfer vs Fillet for 3D Printing: recommended starting
+        // heuristic for an internal radius is the adjacent wall thickness.
+        add("internal_corner_radius_wall_ratio", 1.0, "MeshRA Chamfer vs Fillet for 3D Printing: recommended starting heuristic, internal radius >= adjacent wall thickness");
+    } else if (process == "sheet_metal") {
+        // Protolabs Sheet Metal Fabrication Design Guidelines, material
+        // thickness range and common features (flange >= 4t, holes/slots >= t).
+        add("min_thickness_mm", 0.609, "Protolabs Sheet Metal Fabrication Design Guidelines, material thickness range: minimum gauge, mm");
+        add("max_thickness_mm", 6.35, "Protolabs Sheet Metal Fabrication Design Guidelines, material thickness range: maximum gauge, mm");
+        add("min_flange_length_thickness_factor", 4.0, "Protolabs Sheet Metal Fabrication Design Guidelines, common features: flange length >= 4t");
+        add("min_hole_dia_thickness_factor", 1.0, "Protolabs Sheet Metal Fabrication Design Guidelines, common features: hole diameter >= t");
+        add("min_slot_width_thickness_factor", 1.0, "Protolabs Sheet Metal Fabrication Design Guidelines, common features: slot width >= t");
+        // MJM Manufacturing Sheet Metal DFM Guide, sections 03-04:
+        // hole edge to part edge >= 2t; hole to bend >= 2.5t + r;
+        // bend relief width >= t.
+        add("hole_to_bend_thickness_factor", 2.5, "MJM Sheet Metal DFM Guide, section 04: hole edge to bend >= 2.5t + r");
+        add("hole_to_edge_thickness_factor", 2.0, "MJM Sheet Metal DFM Guide, section 04: hole edge to part edge >= 2t");
+        add("relief_width_min_thickness_factor", 1.0, "MJM Sheet Metal DFM Guide, section 03: relief width >= t");
+        // Protolabs, How and When to Add Bend Reliefs, 90-degree bends:
+        // relief depth = material thickness + inside bend radius.
+        add("relief_depth_over_bend_radius_extra", 0.0, "Protolabs How and When to Add Bend Reliefs, 90-degree bend: depth >= t + r + 0 mm");
+        // Fabcon Sheet Metal DFM, Bend Radius Recommendations by Material:
+        // 5052-H32 1t-1.5t and 6061-T6 3t across grain are starting points,
+        // not a guarantee for grain direction, gauge or the actual press brake.
+        // https://fabcon.com/articles/sheet-metal-fabrication/sheet-metal-design-dfm-guide/
+        add("min_bend_radius_per_thickness",
+            {{"aluminum_6061_t6", 3.0}, {"alu_6061", 3.0},
+             {"aluminum_6061_t6_plate_unwelded_min240", 3.0}, {"5052-h32", 1.0}},
+            "Fabcon Sheet Metal DFM, Bend Radius Recommendations by Material: 6061-T6 3t and 5052-H32 1t across grain starting points; confirm gauge, grain and tooling");
+    } else if (process == "injection") {
+        // Protolabs Injection Molding Wall Thickness Guidelines: ABS range
+        // 0.045-0.140 in, boss/rib 40-60% of wall, draft 1 degree/inch.
+        add("wall_min_mm", 1.143, "Protolabs Injection Molding Wall Thickness Guidelines, ABS chart: 0.045 in minimum wall, mm");
+        add("wall_max_mm", 3.556, "Protolabs Injection Molding Wall Thickness Guidelines, ABS chart: 0.140 in maximum wall, mm");
+        add("rib_thickness_ratio_max", 0.6, "Protolabs Injection Molding Wall Thickness Guidelines, ribs and gussets: maximum 60% of nominal wall");
+        add("boss_wall_ratio_max", 0.6, "Protolabs Injection Molding Wall Thickness Guidelines, bosses: maximum 60% of surrounding wall");
+        add("draft_min_deg_per_mm_depth", 1.0 / 25.4, "Protolabs Injection Molding Wall Thickness Guidelines: 1 degree per inch of cavity depth, deg/mm");
+        // Evok Polymers, Injection Molding Wall Thickness, Maintain Uniform
+        // Wall Thickness: amorphous ABS, PC, PS +/-25%; semi-crystalline
+        // nylon, PP, PBT +/-15%. https://evokpoly.com/feeds/blog/injection-molding-wall-thickness
+        add("wall_uniformity_deviation_by_material",
+            {{"abs", 0.25}, {"polycarbonate", 0.25}, {"polystyrene", 0.25},
+             {"nylon", 0.15}, {"polypropylene", 0.15}, {"pbt", 0.15}},
+            "Evok Polymers Injection Molding Wall Thickness, Maintain Uniform Wall Thickness: +/-25% amorphous, +/-15% semi-crystalline; material-specific design guidance");
+        // Same source, Use Gradual Transitions: minimum corner radius 0.5t.
+        add("internal_corner_radius_wall_ratio", 0.5,
+            "Evok Polymers Injection Molding Wall Thickness, Use Gradual Transitions: corner radius >= 0.5 wall thickness");
+        // Protolabs Draft Angle Guidelines for Injection Molding: 1-2 degrees
+        // works well in most situations; confirm against specific geometry.
+        sources["draft.min_deg"] = "Protolabs Draft Angle Guidelines for Injection Molding: 1-2 degrees works well in most situations";
+    } else if (process == "cast") {
+        // Manufacturing Network, Sand Casting Designers & Buyers Guide,
+        // process norms and Radii: light-alloy walls and internal radius/wall.
+        add("wall_min_mm", 3.0, "Manufacturing Network Sand Casting Designers & Buyers Guide, process norms: light alloy minimum wall, mm");
+        add("internal_corner_radius_wall_ratio", 1.0, "Manufacturing Network Sand Casting Designers & Buyers Guide, Radii: typical internal radius >= wall thickness");
+        // Manufacturing Network Sand Casting Designers & Buyers Guide,
+        // Draft Angles: 1 degree is possible, typical 2 degrees.
+        sources["draft.min_deg"] = "Manufacturing Network Sand Casting Designers & Buyers Guide, Draft Angles: 1 degree is possible";
+    } else if (process == "sla") {
+        // Formlabs Form 4 Design Guide, Grey Resin at 50 microns, feature sections.
+        add("min_wall_mm_supported", 0.2, "Formlabs Form 4 Design Guide, supported walls: Grey Resin minimum, mm");
+        add("min_wall_mm_unsupported", 0.2, "Formlabs Form 4 Design Guide, unsupported walls: Grey Resin minimum, mm");
+        add("min_pin_mm", 0.3, "Formlabs Form 4 Design Guide, vertical wire: minimum diameter for a 7 mm tall wire, mm");
+        add("min_hole_mm", 0.5, "Formlabs Form 4 Design Guide, minimum hole diameter, mm");
+        add("drain_hole_min_mm", 0.75, "Formlabs Form 4 Design Guide, minimum resin drain hole diameter, mm");
+    } else if (process == "sls") {
+        // Formlabs Fuse 1 Design Specifications, Nylon 12; conservative
+        // vertical-wall guideline also applies to horizontal walls.
+        add("min_wall_mm_supported", 0.6, "Formlabs Fuse 1 Design Specifications, supported vertical walls, Nylon 12, mm");
+        add("min_wall_mm_unsupported", 0.6, "Formlabs Fuse 1 Design Specifications, unsupported vertical walls, Nylon 12, mm");
+        add("min_pin_mm", 0.8, "Formlabs Fuse 1 Design Specifications, pin/wire diameter, Nylon 12, mm");
+        add("min_hole_mm", 1.0, "Formlabs Fuse 1 Design Specifications, minimum hole diameter, Nylon 12, mm");
+        add("drain_hole_min_mm", 3.5, "Formlabs Fuse 1 Design Specifications, minimum powder drain hole diameter, at least two holes, mm");
+    } else if (process == "mjf") {
+        // Tempus 3D, How to Design for HP Multi Jet Fusion, Design Essentials.
+        add("min_wall_mm_supported", 0.4, "Tempus 3D HP Multi Jet Fusion Design Guide, supported wall thickness, mm");
+        add("min_wall_mm_unsupported", 0.5, "Tempus 3D HP Multi Jet Fusion Design Guide, unsupported wall thickness, mm");
+        add("min_pin_mm", 0.9, "Tempus 3D HP Multi Jet Fusion Design Guide, unsupported wire diameter, mm");
+        add("drain_hole_min_mm", 4.0, "Tempus 3D HP Multi Jet Fusion Design Guide, single powder escape hole diameter, mm");
+    }
+    params["rules"] = std::move(rules);
+    params["rule_sources"] = std::move(sources);
+}
+
 
 // ---------------------------------------------------------------- resolver data
 
@@ -310,6 +458,16 @@ std::string spec_text(const json& request_or_spec) {
 }
 
 std::string explicit_process(const std::string& text) {
+    // Check specific processes before generic "print" and "mold" substrings.
+    static const std::vector<std::pair<std::regex, const char*>> specific = {
+        {std::regex(R"(\b(sla|stereolithography)\b)"), "sla"},
+        {std::regex(R"(\b(sls|selective laser sintering)\b)"), "sls"},
+        {std::regex(R"(\b(mjf|multi[ -]jet fusion)\b)"), "mjf"},
+        {std::regex(R"(\b(cast|casting|sand[ -]cast)\b)"), "cast"},
+        {std::regex(R"(\bwater[ -]?jet\b)"), "waterjet"},
+    };
+    for (const auto& [pattern, process] : specific)
+        if (std::regex_search(text, pattern)) return process;
     for (const auto& [kw, proc] : explicit_keywords())
         if (text.find(kw) != std::string::npos) return proc;
     return "";
@@ -467,6 +625,7 @@ json get_profile(const std::string& process, const json* overrides) {
         {"overhang", p->overhang},
         {"thread", p->thread},
     };
+    add_rules(key, params);
     if (overrides && overrides->is_object() && !overrides->empty()) {
         const auto hc = overrides->find("hole_comp");
         if (hc != overrides->end() && !hc->is_null() && hc->is_number())
@@ -475,8 +634,9 @@ json get_profile(const std::string& process, const json* overrides) {
         if (xy != overrides->end() && !xy->is_null() && xy->is_number()) {
             const double v = xy->get<double>();
             params["xy_comp_mm"] = v;
-            params["tolerance_band_mm"] =
-                pyround(params["tolerance_band_mm"].get<double>() + v, 4);
+            if (params["tolerance_band_mm"].is_number())
+                params["tolerance_band_mm"] =
+                    pyround(params["tolerance_band_mm"].get<double>() + v, 4);
         }
         std::vector<std::string> unknown;
         for (auto it = overrides->begin(); it != overrides->end(); ++it)
@@ -492,7 +652,9 @@ json get_profile(const std::string& process, const json* overrides) {
         {"process", p->process},
         {"material",
          {{"name", p->material_name},
-          {"density_g_cm3", reg_density(p->density_lookup, p->density_fallback)}}},
+          {"density_g_cm3", p->density_fallback.is_number()
+                                ? json(reg_density(p->density_lookup, p->density_fallback.get<double>()))
+                                : json(nullptr)}}},
         {"params", std::move(params)},
     };
 }
@@ -513,9 +675,12 @@ double fit_clearance(const std::string& process, const std::string& fit_class) {
         throw DfmError("Unknown fit class " + repr_s(fit_class) +
                        ". Known: " + repr_list(known) + ".");
     }
-    if (it->is_null())
+    if (it->is_null()) {
+        const std::string detail = (key == "sheet_metal" || key == "laser")
+            ? " (it is a flat/sheet process; holes are cut to size)." : ".";
         throw DfmError("Process " + repr_s(key) + " has no diametral " + repr_s(fc) +
-                       " fit class (it is a flat/sheet process; holes are cut to size).");
+                       " fit class" + detail);
+    }
     return it->get<double>();
 }
 
@@ -524,7 +689,8 @@ json modeled_dim(double nominal_mm, const std::string& fit_class, const std::str
     const std::string key = strip(lower(process));
     const double clr = fit_clearance(key, fit_class);
     const Profile* p = find_profile(key);
-    const double hole_comp = is_hole ? p->hole_comp_mm : 0.0;
+    const double hole_comp = is_hole && p->hole_comp_mm.is_number()
+                                 ? p->hole_comp_mm.get<double>() : 0.0;
     const double nominal = nominal_mm;
     const double modeled = nominal + clr + hole_comp;
     const std::string fc = strip(lower(fit_class));
@@ -550,6 +716,9 @@ json resolve_process(const json& request_or_spec, const json& material,
 
     // ---- 1. explicit process keyword short-circuits everything -------------------
     const std::string explicit_proc = explicit_process(text);
+    if (explicit_proc == "waterjet")
+        throw DfmError("Unknown process 'waterjet'. Known processes: " +
+                       repr_list(known_processes()) + ".");
     if (!explicit_proc.empty()) {
         if (explicit_proc == "fdm" && is_metal) {
             const json clar = {
@@ -686,10 +855,10 @@ std::string process_block_text(const json& profile) {
     };
     double mw, mf;
     if (num_or_null("min_wall_mm", mw)) {
-        mf = 0.0;
-        num_or_null("min_feature_mm", mf);
-        lines.push_back("  - Min wall " + py_g(mw) + " mm; smallest feature " + py_g(mf) +
-                        " mm. Walls thinner than this warp or fail to form.");
+        std::string wall = "  - Min wall " + py_g(mw) + " mm";
+        if (num_or_null("min_feature_mm", mf))
+            wall += "; smallest feature " + py_g(mf) + " mm";
+        lines.push_back(wall + ". Walls thinner than this warp or fail to form.");
     }
 
     const json fits =

@@ -26,6 +26,7 @@
 
 #include "../core/app_state.h"
 #include "../core/cpp_core.h"  // core::cpp_core() — the prof_* RPC seam
+#include "../core/frame_stats.h"
 #include "../ui_theme.h"
 
 namespace ui {
@@ -319,6 +320,54 @@ void drawFlatTable(const char* id, const json& arr, const char* valKey, const ch
     }
 }
 
+void drawFrameTiming(const core::framestats::Snapshot& frames) {
+    ImGui::Text("Work p50 %.2f ms  |  p99 %.2f ms", frames.work_ms.p50, frames.work_ms.p99);
+    if (frames.idle) {
+        ImGui::SameLine(0, M::px(12));
+        ImGui::TextDisabled("IDLE THROTTLE");
+    }
+    ImGui::TextDisabled("Last %zu frames. GUI wall time, not GPU elapsed time.",
+                        frames.window_frame_count);
+    const float plotMax = std::max(8.0f, static_cast<float>(frames.work_ms.max) * 1.1f);
+    ImGui::PlotLines("##prof_frame_work", frames.work_history_ms.data(),
+                     static_cast<int>(frames.work_count), 0, "Work (ms)", 0.0f, plotMax,
+                     ImVec2(ImGui::GetContentRegionAvail().x, M::px(64)));
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Frame work = wall time minus event wait and swap blocking.");
+
+    if (ImGui::CollapsingHeader("Frame sections (exclusive wall time)",
+                                ImGuiTreeNodeFlags_DefaultOpen)) {
+        const ImGuiTableFlags flags = ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg |
+                                      ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp;
+        if (ImGui::BeginTable("##prof_frame_sections", 4, flags,
+                              ImVec2(0, tableHeight(frames.section_count)))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("Section", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("p50 ms", ImGuiTableColumnFlags_WidthFixed, M::px(70));
+            ImGui::TableSetupColumn("p99 ms", ImGuiTableColumnFlags_WidthFixed, M::px(70));
+            ImGui::TableSetupColumn("Max ms", ImGuiTableColumnFlags_WidthFixed, M::px(70));
+            ImGui::TableHeadersRow();
+            for (std::size_t i = 0; i < frames.section_count; ++i) {
+                const auto& section = frames.sections[i];
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(section.name);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Exclusive per-frame totals across %zu frames that entered "
+                                       "this section. Nested time is excluded.",
+                                       section.frame_count);
+                ImGui::TableSetColumnIndex(1);
+                ImGui::Text("%.3f", section.ms.p50);
+                ImGui::TableSetColumnIndex(2);
+                ImGui::Text("%.3f", section.ms.p99);
+                ImGui::TableSetColumnIndex(3);
+                ImGui::Text("%.3f", section.ms.max);
+            }
+            ImGui::EndTable();
+        }
+    }
+}
+
 // ----------------------------------------------------------------- RPC helper
 // Dispatch a prof_* RPC into the core; toast + return false if the core didn't handle it
 // (library not loaded / unknown method) so the UI degrades gracefully.
@@ -347,6 +396,7 @@ bool s_haveReport = false;
 void drawProfilerWindow(AppState& st) {
     if (!st.showProfilerWindow) return;
     const auto& pal = ui::palette;
+    const auto& frames = core::framestats::snapshot();
 
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(
@@ -406,23 +456,29 @@ void drawProfilerWindow(AppState& st) {
             ImGui::Dummy(ImVec2(0, c1.y - c0.y));
         }
 
-        // Live GUI frame rate (ImGui Framerate) — labeled so Evaluate > Performance
-        // always shows FPS while this window is open (H-B1 joint verify).
+        // Count actual presentations over one wall-clock second, independently
+        // of ImGui's averaged frame rate or the sampling-profiler tick rate.
         {
-            const float fps = ImGui::GetIO().Framerate;
+            const double fps = frames.presented_fps;
             ImGui::SameLine(0, M::px(12));
             ImGui::PushStyleColor(ImGuiCol_Text, surf.textSecondary);
-            ImGui::TextUnformatted("FPS");
+            ImGui::TextUnformatted("Presented FPS");
             ImGui::PopStyleColor();
             ImGui::SameLine(0, M::px(6));
-            pushText(fps >= 45.f ? pal.statusOk : (fps >= 25.f ? pal.statusWarn : pal.statusErr));
-            ImGui::Text("%.1f", fps);
+            pushText(frames.idle ? pal.textDim :
+                     (fps >= 45.0 ? pal.statusOk : (fps >= 25.0 ? pal.statusWarn : pal.statusErr)));
+            ImGui::Text("%.0f", fps);
             ImGui::PopStyleColor();
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip(
-                    "GUI frames per second (ImGui). Not the sampling-profiler tick rate.");
+                    "Actual presentations in the preceding second (1 ms resolution).\n"
+                    "Idle throttle intentionally lowers FPS; work timing excludes wait and swap.");
         }
 
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+        drawFrameTiming(frames);
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::Spacing();
@@ -563,7 +619,7 @@ void drawProfilerWindow(AppState& st) {
     // window is open so drag/rebuild interactivity is visible without hunting
     // the window header (H-B1). Glass-styled chip to match the rest of the HUD.
     if (st.showProfilerWindow) {
-        const float fps = ImGui::GetIO().Framerate;
+        const double fps = frames.presented_fps;
         const ImVec2 pad(M::px(12), M::px(12));
         // Anchor the chip inside the frame-authoritative overlay band (ribbon bottom ->
         // status-bar top), NOT the raw viewport: mvp->WorkPos.y is the title-bar bottom, so the
@@ -589,11 +645,16 @@ void drawProfilerWindow(AppState& st) {
                 ui::panelId("host_profiler_fps_overlay"), orect, ui::GlassGroup::Hud);
             ui::glassPanel(ImGui::GetWindowDrawList(), orect, ui::GlassLevel::Thin, 8.0f, osurf);
             ImGui::PushStyleColor(ImGuiCol_Text, osurf.textSecondary);
-            ImGui::TextUnformatted("FPS");
+            ImGui::TextUnformatted("Presented FPS");
             ImGui::PopStyleColor();
             ImGui::SameLine(0, M::px(6));
-            pushText(fps >= 45.f ? pal.statusOk : (fps >= 25.f ? pal.statusWarn : pal.statusErr));
-            ImGui::Text("%.1f", fps);
+            pushText(frames.idle ? pal.textDim :
+                     (fps >= 45.0 ? pal.statusOk : (fps >= 25.0 ? pal.statusWarn : pal.statusErr)));
+            ImGui::Text("%.0f", fps);
+            ImGui::PopStyleColor();
+            ImGui::PushStyleColor(ImGuiCol_Text, osurf.textSecondary);
+            ImGui::Text("Work p50/p99 %.2f / %.2f ms", frames.work_ms.p50, frames.work_ms.p99);
+            if (frames.idle) ImGui::TextUnformatted("IDLE THROTTLE");
             ImGui::PopStyleColor();
         }
         ImGui::End();

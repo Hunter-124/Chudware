@@ -12,6 +12,8 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -171,6 +173,63 @@ size_t draw_count(const json& ann) {
            d.value("dashed", json::array()).size() + d.value("thick", json::array()).size() +
            d.value("chain", json::array()).size() + d.value("chain_thick", json::array()).size();
 }
+
+const json* view_by_id(const json& full, const std::string& id) {
+    for (const json& sheet : full.at("sheets"))
+        for (const json& view : sheet.at("views"))
+            if (view.value("view_id", std::string()) == id) return &view;
+    return nullptr;
+}
+
+bool polygon_contains(const json& poly, const std::array<double, 2>& p) {
+    bool inside = false;
+    for (std::size_t i = 0, j = poly.size() - 1; i < poly.size(); j = i++) {
+        const double ax = poly[i][0].get<double>(), ay = poly[i][1].get<double>();
+        const double bx = poly[j][0].get<double>(), by = poly[j][1].get<double>();
+        if ((ay > p[1]) != (by > p[1]) &&
+            p[0] < ax + (p[1] - ay) * (bx - ax) / (by - ay))
+            inside = !inside;
+    }
+    return inside;
+}
+
+bool section_contains(const json& view, std::array<double, 2> p) {
+    for (const json& poly : view.at("section_faces"))
+        if (poly.size() >= 3 && polygon_contains(poly, p)) return true;
+    return false;
+}
+
+// The box is inset slightly by the caller, so touching a material/cavity boundary
+// does not count as drawing into the empty interior.
+bool segment_hits_box(const json& segment, double xmin, double ymin, double xmax, double ymax) {
+    double first = 0.0, last = 1.0;
+    const double lo[] = {xmin, ymin}, hi[] = {xmax, ymax};
+    for (int axis = 0; axis < 2; ++axis) {
+        const double start = segment[0][axis].get<double>();
+        const double delta = segment[1][axis].get<double>() - start;
+        if (std::fabs(delta) < 1e-12) {
+            if (start <= lo[axis] || start >= hi[axis]) return false;
+            continue;
+        }
+        double a = (lo[axis] - start) / delta, b = (hi[axis] - start) / delta;
+        if (a > b) std::swap(a, b);
+        first = std::max(first, a);
+        last = std::min(last, b);
+    }
+    return first < last;
+}
+
+double distance_to_segment(const json& segment, std::array<double, 2> point) {
+    const double ax = segment[0][0].get<double>(), ay = segment[0][1].get<double>();
+    const double dx = segment[1][0].get<double>() - ax;
+    const double dy = segment[1][1].get<double>() - ay;
+    const double length2 = dx * dx + dy * dy;
+    const double t = length2 > 0.0
+                         ? std::clamp(((point[0] - ax) * dx + (point[1] - ay) * dy) / length2,
+                                      0.0, 1.0)
+                         : 0.0;
+    return std::hypot(ax + t * dx - point[0], ay + t * dy - point[1]);
+}
 }  // namespace
 
 TEST_CASE("GD&T annotations compile to draw primitives + export") {
@@ -296,6 +355,180 @@ TEST_CASE("Half section keeps more + draws the division boundary (D11)") {
     CHECK(half_sec["view"].value("section_faces", json::array()).size() > 0);
     CHECK(half_vis > full_vis);  // more remaining geometry + the new division boundary line
     doc::drawing_close(did);
+}
+
+TEST_CASE("Sections of a shelled open enclosure hatch only the wall material") {
+    const std::string src = doc::doc_new("part", "OpenEnclosure").at("doc_id");
+    const json built = doc::doc_apply_ops(src, -1, json::array({
+        json{{"op", "add_feature"}, {"feature", {
+            {"type", "box"}, {"name", "Enclosure"},
+            {"params", {{"length", dimv(80)}, {"width", dimv(60)}, {"height", dimv(30)}}}}}},
+        json{{"op", "add_feature"}, {"feature", {
+            {"type", "shell"}, {"name", "Open top"},
+            {"params", {{"thickness", dimv(2)}, {"outward", false}}},
+            {"refs", {{"remove", {{"of", "face"}, {"side", "top"}}}}}}}},
+    }), false);
+    for (const json& status : built.at("rebuild").at("feature_status"))
+        REQUIRE_MESSAGE(status.value("ok", false), status.dump());
+
+    const std::string did = doc::drawing_new(json::object(), json::object(),
+                                              "Enclosure sections", src).at("doc_id");
+    const std::string parent =
+        doc::drawing_add_view(did, "base", "front", "s1", 1.0,
+                              json::array({100.0, 150.0}), false).at("view_id");
+    struct Section {
+        std::array<double, 3> normal;
+        std::array<double, 2> position;
+        double half_width, half_height, cavity_bottom, cavity_top;
+        bool ring;
+        std::string id;
+    };
+    std::array<Section, 4> sections = {{
+        {{1, 0, 0}, {220, 180}, 30, 15, -13, 15, false, {}},
+        {{-1, 0, 0}, {350, 180}, 30, 15, -13, 15, false, {}},
+        {{0, 1, 0}, {220, 90}, 40, 15, -13, 15, false, {}},
+        {{0, 0, 1}, {100, 90}, 30, 40, -38, 38, true, {}},
+    }};
+    constexpr double scale = 1.25;
+    for (auto& section : sections) {
+        // Section A-A follows the reported front-view cutting line; reverse it as
+        // well, and exercise the other sections through explicit world planes.
+        const bool parent_line = section.normal[0] != 0.0;
+        const json plane = parent_line ? json(nullptr)
+                                       : json{{"normal", section.normal}, {"point", {0, 0, 0}}};
+        const json cut_line = parent_line
+                                  ? (section.normal[0] > 0.0
+                                         ? json::array({json::array({100.0, 130.0}),
+                                                        json::array({100.0, 170.0})})
+                                         : json::array({json::array({100.0, 170.0}),
+                                                        json::array({100.0, 130.0})}))
+                                  : json(nullptr);
+        const json opts = section.ring
+                              ? json{{"hatch_style", {{"pattern", "cross"}, {"angle_deg", 45.0},
+                                                      {"spacing_mm", 3.0}}}}
+                              : json::object();
+        section.id = doc::drawing_add_section(did, parent, plane, cut_line, nullptr, scale,
+                                               section.position, "s1", false, opts).at("view_id");
+    }
+    const json full = doc::drawing_get(did);
+    for (const auto& section : sections) {
+        CAPTURE(section.normal);
+        const json* view = view_by_id(full, section.id);
+        REQUIRE(view != nullptr);
+        REQUIRE(view->at("error").is_null());
+        REQUIRE(view->at("section_faces").size() == 1);
+        const json& polygon = view->at("section_faces")[0];
+        REQUIRE(polygon.size() >= 4);
+        CHECK(polygon.front() == polygon.back());
+        const auto point = [&](double x, double y) {
+            return std::array<double, 2>{section.position[0] + scale * x,
+                                         section.position[1] + scale * y};
+        };
+        CHECK_FALSE(section_contains(*view, point(0, 0)));
+        CHECK_FALSE(section_contains(*view, point(0, 5)));
+        CHECK(section_contains(*view, point(-section.half_width + 1, 0)));
+        CHECK(section_contains(*view, point(section.half_width - 1, 0)));
+        CHECK(section_contains(*view, point(0, -section.half_height + 1)));
+        if (section.ring)
+            CHECK(section_contains(*view, point(0, section.half_height - 1)));
+
+        // Check entire hatch segments, not just endpoints: none may cross the cavity.
+        const json& hatch = view->at("hatch");
+        REQUIRE_FALSE(hatch.empty());
+        bool left = false, right = false, bottom = false, top = false;
+        for (const json& segment : hatch) {
+            REQUIRE(segment.size() == 2);
+            constexpr double inset = 0.01;
+            CHECK_FALSE(segment_hits_box(
+                segment, point(-section.half_width + 2 + inset, 0)[0],
+                point(0, section.cavity_bottom + inset)[1],
+                point(section.half_width - 2 - inset, 0)[0],
+                point(0, section.cavity_top - inset)[1]));
+            const double x = ((segment[0][0].get<double>() + segment[1][0].get<double>()) * 0.5 -
+                              section.position[0]) / scale;
+            const double y = ((segment[0][1].get<double>() + segment[1][1].get<double>()) * 0.5 -
+                              section.position[1]) / scale;
+            left = left || x < -section.half_width + 2;
+            right = right || x > section.half_width - 2;
+            bottom = bottom || y < -section.half_height + 2;
+            top = top || y > section.half_height - 2;
+        }
+        CHECK(left);
+        CHECK(right);
+        CHECK(bottom);
+        if (section.ring) CHECK(top);
+    }
+    CHECK(doc::drawing_close(did));
+    CHECK(doc::doc_close(src));
+}
+
+TEST_CASE("Section face holes remain empty through curved and multiple inner wires") {
+    const std::string src = doc::doc_new("part", "SectionHoles").at("doc_id");
+    const json built = doc::doc_apply_ops(src, -1, json::array({
+        json{{"op", "add_feature"}, {"feature", {
+            {"type", "box"}, {"name", "Plate"},
+            {"params", {{"length", dimv(60)}, {"width", dimv(40)}, {"height", dimv(10)}}}}}},
+        json{{"op", "add_feature"}, {"feature", {
+            {"type", "hole"}, {"name", "Two through holes"},
+            {"params", {{"style", "simple"}, {"standard", "custom"}, {"diameter", dimv(10)},
+                        {"end", "through_all"}, {"positions", {{0, -10}, {0, 10}}}}},
+            {"refs", {{"face", {{"of", "face"}, {"side", "top"}}}}}}}},
+    }), false);
+    for (const json& status : built.at("rebuild").at("feature_status"))
+        REQUIRE_MESSAGE(status.value("ok", false), status.dump());
+    const json cylinders = doc::doc_query(src, json{{"of", "face"}, {"surf", "cylinder"}});
+    REQUIRE(cylinders.at("matches").size() == 2);
+    std::array<std::array<double, 2>, 2> centers;
+    for (std::size_t i = 0; i < centers.size(); ++i) {
+        const json& centroid = cylinders.at("matches")[i].at("centroid");
+        // For a +Z section, sheet +x is world -Y and sheet +y is world +X.
+        centers[i] = {200.0 - centroid[1].get<double>(), 100.0 + centroid[0].get<double>()};
+    }
+    REQUIRE(std::hypot(centers[0][0] - centers[1][0],
+                       centers[0][1] - centers[1][1]) > 10.0);
+    const std::string did = doc::drawing_new(json::object(), json::object(),
+                                              "Two hole section", src).at("doc_id");
+    const std::string parent =
+        doc::drawing_add_view(did, "base", "front", "s1", 1.0,
+                              json::array({100.0, 150.0}), false).at("view_id");
+    const json plane = {{"normal", {0, 0, 1}}, {"point", {0, 0, 0}}};
+    const std::string section =
+        doc::drawing_add_section(did, parent, plane, nullptr, "A", 1.0,
+                                 json::array({200.0, 100.0}), "s1", false,
+                                 json{{"hatch_style", {{"pattern", "cross"}, {"angle_deg", 0.0},
+                                                       {"spacing_mm", 2.0}}}}).at("view_id");
+    const json full = doc::drawing_get(did);
+    const json* view = view_by_id(full, section);
+    REQUIRE(view != nullptr);
+    REQUIRE(view->at("error").is_null());
+    REQUIRE(view->at("section_faces").size() == 1);
+    CHECK(section_contains(*view, {200, 100}));
+    for (const auto& center : centers)
+        CHECK_FALSE(section_contains(*view, center));
+    const json& hatch = view->at("hatch");
+    REQUIRE_FALSE(hatch.empty());
+    for (const json& segment : hatch) {
+        REQUIRE(segment.size() == 2);
+        // Curved boundaries are approximated to 0.05 mm in sheet space.
+        for (const auto& center : centers)
+            CHECK(distance_to_segment(segment, center) >= 4.90);
+    }
+    CHECK(doc::drawing_close(did));
+    CHECK(doc::doc_close(src));
+}
+
+TEST_CASE("Hatch lines through polygon vertices count the crossing once") {
+    const json polygon = {{0, 0}, {10, 0}, {10, 3}, {10, 10}, {0, 10}, {0, 3}};
+    const json hatch = doc::compile_hatch(polygon, json{{"angle_deg", 0}, {"spacing_mm", 2}});
+    bool found = false;
+    for (const json& segment : hatch.at("segments")) {
+        if (std::fabs(segment[0][1].get<double>() - 3.0) > 1e-9) continue;
+        CHECK(segment[1][1].get<double>() == doctest::Approx(3.0));
+        CHECK(segment[0][0].get<double>() == doctest::Approx(0.0));
+        CHECK(segment[1][0].get<double>() == doctest::Approx(10.0));
+        found = true;
+    }
+    CHECK(found);
 }
 
 // D6: a round face's projected extent must come from the EXACT circle, not the tessellated
@@ -558,7 +791,7 @@ TEST_CASE("Counterbore + countersink + tapped callouts use the stacked form (D4)
 
     json csk = doc::drawing_add_callout(did, vid, "hole", pick,
                                         json{{"hole_type", "countersink"},
-                                             {"cbore_dia", 20.0}, {"csk_angle", 82.0}});
+                                             {"csk_dia", 20.0}, {"csk_angle", 82.0}});
     std::string ck = csk.at("annotation").value("text", std::string());
     CHECK(ck.find("\xE2\x8C\xB5") != std::string::npos);  // ⌵ countersink symbol present
     CHECK(ck.find("\xC2\xB0") != std::string::npos);       // ° angle present
@@ -569,6 +802,14 @@ TEST_CASE("Counterbore + countersink + tapped callouts use the stacked form (D4)
     std::string tt = tap.at("annotation").value("text", std::string());
     CHECK(tt.find("M10x1.5") != std::string::npos);        // thread spec present
     CHECK(tt.find("\xE2\x86\xA7") != std::string::npos);  // ↧ depth symbol present
+
+    json simple = doc::drawing_add_callout(did, vid, "hole", pick,
+                                           json{{"hole_type", "simple"}, {"depth", 5.0}});
+    json ann = simple.at("annotation");
+    CHECK(ann.at("text").get<std::string>() == "⌀10 ↧ 5");
+    json patched = doc::drawing_set_annotation(did, vid, ann.at("id").get<std::string>(),
+                                                json{{"count", 4}});
+    CHECK(patched.at("annotation").at("text").get<std::string>() == "4× ⌀10 ↧ 5");
     doc::drawing_close(did);
 }
 
@@ -1404,9 +1645,6 @@ TEST_CASE("Drawing units inherit source, switch numeric text, and preserve overr
     doc::drawing_add_dim(did, vid, "linear_dim",
                          json::array({130.0, 170.0}), json::array({155.4, 170.0}),
                          nullptr, nullptr, json::array({145.0, 155.0}), "REF");
-    doc::drawing_add_chamfer_dimension(
-        did, vid, json{{"a", json::array({140.0, 170.0})},
-                       {"length", 25.4}, {"angle", 45.0}});
     doc::drawing_add_ordinate_dimensions(
         did, vid, json{{"origin", json::array({100.0, 170.0})},
                        {"points", json::array({json::array({125.4, 170.0})})}});
@@ -1416,14 +1654,10 @@ TEST_CASE("Drawing units inherit source, switch numeric text, and preserve overr
     CHECK(metric["drawing"]["tree"]["units"]["system"] == "MMGS");
     CHECK(metric["drawing"]["sheets"][0]["views"][0]["annotations"][0]["text"] == "25.4");
     CHECK(metric["drawing"]["sheets"][0]["views"][0]["annotations"][1]["text"] == "REF");
-    CHECK(metric["drawing"]["sheets"][0]["views"][0]["annotations"][2]["text"] ==
-          "25.4 \xC3\x97 45\xC2\xB0");
-    CHECK(metric["drawing"]["sheets"][0]["views"][0]["annotations"][3]["text"] == "25.4");
+    CHECK(metric["drawing"]["sheets"][0]["views"][0]["annotations"][2]["text"] == "25.4");
     json imperial = doc::drawing_set_units(did, "IPS");
     CHECK(imperial["drawing"]["sheets"][0]["views"][0]["annotations"][0]["text"] == "1 in");
-    CHECK(imperial["drawing"]["sheets"][0]["views"][0]["annotations"][2]["text"] ==
-          "1 \xC3\x97 45\xC2\xB0");
-    CHECK(imperial["drawing"]["sheets"][0]["views"][0]["annotations"][3]["text"] == "1 in");
+    CHECK(imperial["drawing"]["sheets"][0]["views"][0]["annotations"][2]["text"] == "1 in");
     CHECK_THROWS_AS(doc::drawing_set_units(did, "UNKNOWN"), doc::OpError);
     doc::drawing_close(did);
     const json made = doc::drawing_make(

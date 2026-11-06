@@ -15,11 +15,19 @@ from __future__ import annotations
 
 import json
 import math
+from pathlib import Path
+
+import pytest
 
 from services.mcp.ecad_reliability import (
     STEINBERG_CITATION, band_split, deflection_3sigma_mm, detect_mount_holes,
     position_factor, register_ecad_reliability_tools, steinberg_c, steinberg_screen)
 from services.mcp.ecad_tools import register_ecad_tools
+
+
+@pytest.fixture(autouse=True)
+def _isolated_ecad_workspace(monkeypatch, tmp_path):
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(tmp_path))
 
 
 class _StubMCP:
@@ -56,7 +64,8 @@ def _demo_board(tools: dict, name: str = "vibe_demo", heavy: bool = False,
     from services.mcp.ecad_common import ecad_session
     from services.mcp.ecad_tools import _ECAD
 
-    _call(tools, "ecad_new_pcb", name=name)
+    created = _call(tools, "ecad_new_pcb", name=name)
+    assert created["ok"] and Path(created["path"]).is_file(), created
     doc_id = _ECAD["current_pcb"]
     doc = ecad_session.get_session(doc_id).doc
     pts = [(0, 0), (40, 0), (40, 30), (0, 30)]
@@ -235,6 +244,124 @@ def test_invalid_inputs_and_exact_limit() -> None:
         result = _call(tools, "ecad_vibe_check", **kwargs)
         assert result["ok"] is False and result.get("error"), (kwargs, result)
     print("  [invalid_inputs_and_exact_limit] PASS")
+
+
+def test_analysis_tools_use_reopened_kicad_board_and_boardphys(tmp_path, monkeypatch):
+    """Thermal, airflow, and vibration consume the same persisted KiCad metadata."""
+    from services.mcp import core_bridge as cb, ecad_tools
+    from services.mcp.ecad_common import ecad_session
+    from services.mcp.ecad_thermal import (register_ecad_airflow_tools,
+                                            register_ecad_thermal_tools)
+
+    if not cb.available():
+        pytest.skip("libchudware not available")
+    pytest.importorskip("build123d")
+    path = tmp_path / "analysis.kicad_pcb"
+    session = ecad_session.new_session("pcb", "analysis", path=str(path))
+    board = session.doc
+    pts = [(0, 0), (40, 0), (40, 30), (0, 30)]
+    board["outline"] = {"closed": True, "shapes": [
+        {"type": "line", "p1": list(pts[i]), "p2": list(pts[(i + 1) % 4])}
+        for i in range(4)]}
+    board["footprints"].append({
+        "id": "fp1", "ref": "U1", "value": "regulator",
+        "fpid": "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm",
+        "pos": [20, 15], "angle": 0, "side": "top", "attr": "smd", "graphics": [],
+        "pads": [{"id": "p1", "number": "1", "pin": "1", "pos": [0, 0],
+                  "angle": 0, "shape": "rect", "size": [1, 1], "type": "smd",
+                  "layers": ["F.Cu"], "net": None}],
+        "eng_overrides": {"power_w": {"typ": 2.0},
+                          "package": {"shape": "box", "l_mm": 6.0,
+                                      "w_mm": 5.0, "h_mm": 2.0}},
+    })
+    ecad_session.swap_doc(session, board)
+    ecad_session.close_session(session.doc_id)
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setattr(ecad_tools, "_default_out_dir", lambda _name: cache)
+
+    stub = _StubMCP()
+    register_ecad_thermal_tools(stub)
+    register_ecad_airflow_tools(stub)
+    register_ecad_reliability_tools(stub)
+    thermal = _call(stub.tools, "ecad_thermal_handoff", doc_id=str(path),
+                    path=str(tmp_path / "thermal.step"), dry_run=True)
+    assert thermal["ok"] and thermal["coverage"]["n_heat_sources"] == 1, thermal
+
+    board_id = ecad_session.get_session(thermal["doc_id"]).doc["id"]
+
+    def pdn_sidecar(power, *, source_path=None, identity=board_id):
+        board = {"id": identity, "name": "analysis"}
+        if source_path is not None:
+            board["source_path"] = str(source_path)
+        return {"schema": "aicad.boardphys/1", "board": board,
+                "pdn": {"nets": [{"i2r_map": {
+                    "columns": ["layer", "x_mm", "y_mm", "p_w"],
+                    "cell_size_mm": 1.0, "total_w": power,
+                    "cells": [["F.Cu", 10.0, 10.0, power]], "vias": []}}]}}
+
+    sibling_sidecar = path.with_suffix(".step.boardphys.json")
+    sibling_sidecar.write_text(json.dumps(pdn_sidecar(
+        0.5, source_path=path, identity="previous-session")), encoding="utf-8")
+    cache_sidecar = cache / "pdn.boardphys.json"
+    cache_sidecar.write_text(json.dumps(pdn_sidecar(0.25)), encoding="utf-8")
+
+    explicit = tmp_path / "custom.step.boardphys.json"
+    explicit.write_text(json.dumps(pdn_sidecar(
+        0.75, source_path=path, identity="previous-session")), encoding="utf-8")
+    mapped = dict(ecad_tools._ECAD.get("boardphys_paths") or {})
+    mapped[thermal["doc_id"]] = str(explicit)
+    monkeypatch.setitem(ecad_tools._ECAD, "boardphys_paths", mapped)
+    mapped_i2r = _call(stub.tools, "ecad_thermal_handoff", doc_id=str(path),
+                       path=str(tmp_path / "thermal.step"), dry_run=True,
+                       include_trace_heating=True)
+    assert mapped_i2r["ok"] and mapped_i2r["trace_heating"]["total_w"] == 0.75, mapped_i2r
+    assert mapped_i2r["trace_heating"]["included"], mapped_i2r
+
+    # A mismatched bound path must not reuse another board's mapped sidecar,
+    # even if its old document id happens to match.
+    explicit.write_text(json.dumps(pdn_sidecar(
+        1.0, source_path=tmp_path / "other.kicad_pcb")), encoding="utf-8")
+    with_i2r = _call(stub.tools, "ecad_thermal_handoff", doc_id=str(path),
+                     path=str(tmp_path / "thermal.step"), dry_run=True,
+                     include_trace_heating=True)
+    assert with_i2r["ok"] and with_i2r["trace_heating"]["total_w"] == 0.5, with_i2r
+    assert with_i2r["trace_heating"]["included"], with_i2r
+    sibling_sidecar.unlink()
+    cached_i2r = _call(stub.tools, "ecad_thermal_handoff", doc_id=str(path),
+                       path=str(tmp_path / "thermal.step"), dry_run=True,
+                       include_trace_heating=True)
+    assert cached_i2r["ok"] and cached_i2r["trace_heating"]["total_w"] == 0.25, cached_i2r
+    assert cached_i2r["trace_heating"]["included"], cached_i2r
+
+    cache_sidecar.write_text(json.dumps(pdn_sidecar(
+        1.5, identity="other-board")), encoding="utf-8")
+    stale = _call(stub.tools, "ecad_thermal_handoff", doc_id=str(path),
+                  path=str(tmp_path / "thermal.step"), dry_run=True,
+                  include_trace_heating=True)
+    assert stale["ok"] and not stale["trace_heating"]["included"], stale
+    assert any("no PDN I2R map found" in warning for warning in stale["warnings"]), stale
+
+    airflow = _call(stub.tools, "ecad_airflow_handoff", doc_id=str(path),
+                    path=str(tmp_path / "airflow"), dry_run=True)
+    assert airflow["ok"] and airflow["skipped"], airflow
+    assert {solid["name"]: solid["power_w"] for solid in airflow["solids"]}["c_U1"] == 2.0
+    vibe = _call(stub.tools, "ecad_vibe_check", doc_id=str(path),
+                 path=str(tmp_path / "vibe.step"), dry_run=True,
+                 mount_holes=[[3, 3], [37, 3], [37, 27], [3, 27]])
+    assert vibe["ok"] and not vibe["solved"], vibe
+    masses = {component["ref"]: component
+              for component in vibe["mass_model"]["component_masses"]}
+    assert masses["U1"]["mass_g"] > 0, masses
+    ecad_session.close_session(thermal["doc_id"])
+
+    schematic = ecad_session.new_session("sch", "wrong-kind",
+                                         path=str(tmp_path / "wrong-kind.kicad_sch"))
+    for tool in ("ecad_thermal_handoff", "ecad_airflow_handoff", "ecad_vibe_check"):
+        result = _call(stub.tools, tool, doc_id=schematic.path, dry_run=True)
+        assert result["ok"] is False and result["code"] == "wrong_kind", result
+    ecad_session.close_session(schematic.doc_id)
 
 
 # --------------------------------------------------------------------------- tool legs

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -39,6 +40,29 @@ inline std::vector<InlineImageRef> inlineImageRefs(std::string_view text,
         pos = end > pos ? end : pos + prefix.size();
     }
     return refs;
+}
+
+// One-line surfaces (session titles) have no image roster to resolve numbers against: drop every
+// "[Image #N]" marker whatever N is, then collapse the blanks the markers leave behind.
+inline std::string stripInlineImageMarkers(std::string_view text) {
+    std::string stripped;
+    stripped.reserve(text.size());
+    std::size_t cursor = 0;
+    for (const InlineImageRef& ref : inlineImageRefs(text, std::numeric_limits<std::size_t>::max())) {
+        stripped.append(text.substr(cursor, ref.begin - cursor));
+        stripped += ' ';
+        cursor = ref.end;
+    }
+    stripped.append(text.substr(cursor));
+    std::string out;
+    out.reserve(stripped.size());
+    for (const char ch : stripped) {
+        const bool blank = ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r';
+        if (!blank) out += ch;
+        else if (!out.empty() && out.back() != ' ') out += ' ';
+    }
+    if (!out.empty() && out.back() == ' ') out.pop_back();
+    return out;
 }
 
 }  // namespace ui::copilot

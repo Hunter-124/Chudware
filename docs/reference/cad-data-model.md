@@ -77,14 +77,10 @@ DXF reference).
 
 **Relevance to this repo's DXF importer:** the production importer in
 `core/doc/formats.cpp` is a hand-written ASCII DXF tag parser (no ezdxf, no
-third-party DXF library). It reads the `ENTITIES` section, honours `$INSUNITS`, and
-converts a subset of this entity catalog — LINE, CIRCLE, ARC, LWPOLYLINE/POLYLINE
-(bulge → true arc), SPLINE and ELLIPSE — into OCCT edges, then planar faces (closed
-wires) or reference wires (open). INSERT, TEXT/MTEXT, DIMENSION, HATCH, POINT and 3D
-mesh entities are skipped and counted, not converted. The Python helper
-`services/formats/formats_dxf.py` (ezdxf, MIT) is the parity oracle and additionally
-explodes INSERT block references; production does not. See `cad-file-formats.md` §2
-for the format-level summary and `README.md` for planned format work.
+third-party DXF library). It honours `$INSUNITS`, expands INSERT blocks and converts
+supported curves, 3D mesh entities and ACIS solids. The Python helper
+`services/formats/formats_dxf.py` (ezdxf, MIT) is the parity oracle. See
+`cad-file-formats.md` §2 for the format-level summary.
 
 ## Geometry (Ge) — the math layer
 

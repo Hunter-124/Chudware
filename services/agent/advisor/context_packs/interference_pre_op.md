@@ -11,6 +11,10 @@
   shrink along that axis to resolve the clash with minimum geometry change.
 - `clearances` in the kernel return shows gap distances to monitor tight-fit pairs.
 - `check_interference` is a read-only call — safe to run before and after a placement.
+- Also use `interface_check` for alignment and `assembly_dof` for remaining motion.
+  Additional evidence may come from `mate_fit_check`, `fastener_check`,
+  `tool_access_check`, `disassembly_check` and `bom_consistency_check`. Inspect
+  each check's scope, assumptions and `not_evaluated`; missing evidence is not a pass.
 
 **Common resolutions (advisor will specify):**
 - Move the interfering body along the named axis by at least the stated depth.

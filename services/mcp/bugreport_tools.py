@@ -21,21 +21,11 @@ def register_bugreport_tools(mcp) -> None:
     @mcp.tool()
     def submit_bug_report(title: str, summary: str, context: str = "",
                           severity: str = "bug") -> dict:
-        """File a bug report for the user when something is broken on OUR side.
+        """Report a suspected Chudware bug, not an ordinary correctable call error.
 
-        USE THIS when a tool errors in a way that looks like a Chudware bug,
-        not your mistake — e.g. a call that matches the documented schema
-        still fails validation, "unexpected keyword argument" for a documented
-        kwarg, an "unknown method" RPC, or a crash. Do NOT use it for ordinary
-        retry-and-fix errors whose message already teaches you the correction.
-
-        ``title``: short name for the broken thing (e.g. "add_features rejects
-        sketch entity type 'polyline'"). ``summary``: what you tried, what
-        happened (exact error), what you expected. ``context``: optional extra
-        notes. The markdown report (in the user's
-        Documents/Chudware/Bug-Reports/ folder) automatically embeds the
-        recent tool failures captured this session — summarize them, do not
-        paste raw payloads.
+        Give a short title and summary of what happened versus what was expected,
+        plus optional context and severity. The report automatically includes
+        recent session tool failures; summarize rather than paste raw payloads.
         """
         try:
             from services.agent.config import bug_reports_enabled  # noqa: PLC0415

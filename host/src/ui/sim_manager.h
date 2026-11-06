@@ -38,6 +38,8 @@ struct RpcResult;
 }
 
 namespace ui {
+struct CommandContext;
+
 
 // One Simulate workspace hosts EVERY study kind. Flow/Thermal are the OpenFOAM/LBM
 // CFD family; ThermalFea is the core conduction solver (sim_run_thermal, steady +
@@ -313,6 +315,9 @@ struct Study {
     int topoStatusKind = 0;         // 0 info, 1 warn, 2 error
     nlohmann::json topoRunsView = nlohmann::json::array();
     std::string topoRunsCheckKey;   // inputs of the last artifact check ("" = never checked)
+    uint64_t topoRunsSourceGeneration = std::numeric_limits<uint64_t>::max();
+    uint64_t topoRunsMirrorGeneration = std::numeric_limits<uint64_t>::max();
+    long topoRunsRevision = -1;
     std::string topoFieldLabel, topoFieldUnit;  // legend of the displayed overlay field
     double topoFieldFromSI = 1.0;
 };
@@ -362,17 +367,26 @@ public:
     // ---- ribbon Simulation-tab commands (sim_new_static/modal/flow, sim_fixture, sim_load_*,
     //      sim_mesh, sim_run, sim_results, sim_material). Returns true if consumed. ----
     bool handleCommand(AppState& st, const std::string& cmdId);
+    // Copy cached study and solver facts for the active document; never starts a probe.
+    void populateCommandContext(CommandContext& context) const;
+
 
     // Drain the SimClient progress + completion on the main thread (only consumes a job this
     // document owns). Loads the result overlay + turns on the colormap/legend when a study finishes.
     void tick(AppState& st);
 
-    // Pull this document's studies from the engine (sim_study_list) into the local mirror. Called
-    // on tab activation / first draw and after each mutation.
+    // Queue this document's studies (sim_study_list) into the local mirror; completion is
+    // delivered by the RPC drain.
     void refresh(AppState& st);
-    // Another client (an agent's run_fea_* / simulate_motion) added or edited a study: re-pull
-    // the list on the next tree draw. Driven by hostd's doc.studies_changed event.
-    void markStudiesStale() { lastRevision_ = -1; listErrorDocId_.clear(); }
+    // Save/close only: finish accepted study edits before writing or detaching the document.
+    // False retains dirty state when the latest edit failed; its normal callback reports why.
+    bool flushPendingEdits(AppState& st, const std::string& docId);
+    // Another client changed a study; the next active-document tick refreshes the list.
+    void markStudiesStale() {
+        lastRevision_ = -1;
+        listErrorDocId_.clear();
+        ++parameterSourceGeneration_;
+    }
     // Drop the local result overlay state (called when leaving the tab / deleting a study).
     void clearResultOverlay(AppState& st);
     // Reconcile the viewport with the current view: the result overlay (FEA mesh, colormap, deformed)
@@ -626,9 +640,26 @@ private:
     void clearMeshPreview();
 
     // engine mutation
-    void newStudy(AppState& st, StudyType t);
+    void requestNewStudy(AppState& st, StudyType t);
+    void ensureStudyList(AppState& st);
     void persist(AppState& st, Study& s);          // sim_study_edit for one study
     void persist(AppState& st, const std::string& docId, Study& s);
+    void refreshNow(AppState& st); // one-shot commands that need the returned list immediately
+    void receiveStudyList(AppState& st, const core::RpcResult& result,
+                          const std::string& docId, long revision);
+    bool refreshInFlight_ = false;
+    std::string refreshDocId_;
+    std::string creationDocId_;
+    uint64_t studyPresentationGeneration_ = 0;
+    nlohmann::json deferredCreationList_;
+    std::string deferredCreationDocId_;
+    long deferredCreationRevision_ = -1;
+    uint64_t deferredCreationGeneration_ = 0;
+    std::shared_ptr<int> rpcLifetime_ = std::make_shared<int>(0);
+    // Latest accepted generation per document/study; successful completions erase only themselves.
+    std::map<std::pair<std::string, std::string>, uint64_t> unsavedStudyEdits_;
+    std::map<std::pair<std::string, std::string>, uint64_t> pendingStudyEdits_;
+    uint64_t pendingStudySequence_ = 0;
     void deleteStudy(AppState& st, int i);
     static nlohmann::json studyToJson(const Study& s);
     static nlohmann::json typedStudyJson(const Study& s);
@@ -681,6 +712,7 @@ private:
     // Hydraulic circuit panel; its hydraulic_circuit records are kept out of studies_ the same way.
     HydraulicPanel hydraulic_;
     std::vector<Study> studies_;
+    uint32_t studyTypesPresent_ = 0; // rebuilt with the study list, not scanned per frame
     int sel_ = -1;                  // selected study index (-1 = none)
     SimNode node_ = SimNode::Study; // selected sub-node of sel_
     int loadIdx_ = -1;              // which load is selected when node_==Load
@@ -746,8 +778,7 @@ private:
     std::string motionDiscardStudyId_; // Motion study whose pending result Cancel discarded
 
     // EM (electromagnetics) gating: 0 = not probed yet, 1 = em_* backend available, -1 = missing.
-    // Probed ONCE asynchronously (st.rpc) when the Simulate workspace first becomes active; the
-    // result also drives ui::setRibbonDisabledPrefix("sim_em_", ...) for the honest disabled state.
+    // Probed once asynchronously when the Simulate workspace first becomes active.
     int  emStatus_ = 0;
     bool emProbeInflight_ = false;
     nlohmann::json emStatusResult_;   // cached em_status payload (solvers/defaults/note) for the panel
@@ -827,6 +858,11 @@ private:
     int  capsStatus_ = 0;             // 0 = not probed, 1 = loaded, -1 = probe failed
     bool capsInflight_ = false;
     nlohmann::json caps_;             // cached sim_caps payload
+    bool thermalCfdCapabilityKnown_ = false;
+    bool thermalCfdCapabilityAvailable_ = false;
+    bool thermalCfdAwaitingIdle_ = false;
+    // Probe only on an activation or once after an observed running job finishes.
+    bool refreshThermalCfdCapability(AppState& st);
     void probeCaps(AppState& st);
     // fw_status probe for the Emulation study kind (canEmulate + guidance banner).
     int  fwStatus_ = 0;               // 0 = not probed, 1 = loaded, -1 = failed
@@ -1009,11 +1045,12 @@ private:
     // Run gate shared by the panel button, ribbon sim_run and scenarios: capability matrix,
     // method/physics support, scalar settings and boundary/material validation.
     bool topologyReady(AppState& st, const Study& s, std::string& blocker) const;
-    std::string topoSetupKeyNow_;                  // setupKey() of the selected study (tick-sampled)
+    std::string topoSetupKeyNow_;                  // refreshed only after an edit/list generation
     std::string topoSetupKeyStudy_;
-    double topoSetupKeyTime_ = -1.0;
+    uint64_t topoSetupKeyGeneration_ = std::numeric_limits<uint64_t>::max();
     std::string topoAutoShowKey_;                  // run auto-shown on entering Results
     long topoGeomRevision_ = -1;
+    uint64_t topoGeomMutationGeneration_ = std::numeric_limits<uint64_t>::max();
     std::string topoGeomDocId_, topoGeomKey_;
     // Run identity carried from prep to completion (the reservation serializes runs).
     struct TopoRunMeta {
@@ -1031,9 +1068,8 @@ private:
 
     std::string lastDocId_;         // doc id the mirror was last refreshed for (re-pull on change)
     long lastRevision_ = -1;        // engine revision at last refresh
-    // Last failed sim_study_list, fenced by (doc, revision): the tree draw does not re-issue the
-    // (synchronous) list every frame after a failure — it shows the error with Retry and re-pulls
-    // on a new revision, a studies_changed event (markStudiesStale) or the Retry click.
+    // Last failed sim_study_list, fenced by (doc, revision): the tree shows the error with
+    // Retry and re-pulls asynchronously on a new revision or a studies_changed event.
     std::string listErrorDocId_;
     long listErrorRevision_ = -1;
     std::string listError_;

@@ -8,6 +8,10 @@ ones and reject the blurred ones — that is the whole contract of this module.
 """
 from __future__ import annotations
 
+import json
+import shutil
+import subprocess
+import weakref
 from pathlib import Path
 
 import pytest
@@ -62,7 +66,8 @@ def synthetic_video(tmp_path):
     if not vw.isOpened():  # fall back to a widely-available codec
         fourcc = cv2.VideoWriter_fourcc(*"MJPG")
         vw = cv2.VideoWriter(str(path), fourcc, fps, (w, h))
-    assert vw.isOpened(), "no usable VideoWriter codec on this box"
+    if not vw.isOpened():
+        pytest.skip("no usable OpenCV VideoWriter codec")
     n_sharp = n_blur = 0
     for i in range(n):
         blurred = (i % 2 == 1)
@@ -110,6 +115,30 @@ def test_max_frames_cap_keeps_sharpest(synthetic_video, tmp_path):
     assert idxs == sorted(idxs)
 
 
+def test_default_floor_is_relative_to_the_clip(tmp_path):
+    """Phone video scores far below the absolute floor; only clip-relative smear is culled."""
+    cv2 = pytest.importorskip("cv2")
+    np = pytest.importorskip("numpy")
+    path = tmp_path / "soft.avi"
+    vw = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"FFV1"), 10, (160, 120))
+    if not vw.isOpened():
+        pytest.skip("no lossless OpenCV VideoWriter codec")
+    for i in range(20):
+        frame = _make_frame(cv2, np, 160, 120, False, i % 2) // 6 + 100
+        frame = cv2.GaussianBlur(frame, (31, 31) if i >= 15 else (5, 5), 0)
+        vw.write(frame)
+    vw.release()
+
+    absolute = F.extract_frames(str(path), str(tmp_path / "absolute"), max_frames=4,
+                                blur_threshold=F.DEFAULT_BLUR_THRESHOLD)
+    assert absolute.kept == 0  # precondition: every frame is "blurry" in absolute terms
+    res = F.extract_frames(str(path), str(tmp_path / "relative"), max_frames=4)
+    assert [min(3, frame.frame_index // 5) for frame in res.frames] == [0, 1, 2]
+    assert res.rejected_blurry == 5
+    manifest = json.loads(Path(res.manifest_path).read_text(encoding="utf-8"))
+    assert 0 < manifest["blur_threshold"] < F.DEFAULT_BLUR_THRESHOLD
+    assert all(frame.sharpness >= manifest["blur_threshold"] for frame in res.frames)
+    assert len(list((tmp_path / "relative").glob("clip_*_frame_*.jpg"))) == 3
 
 
 def test_clip_identity_retains_two_clips_and_repeat_import(synthetic_video, tmp_path):
@@ -119,7 +148,8 @@ def test_clip_identity_retains_two_clips_and_repeat_import(synthetic_video, tmp_
     second_path = tmp_path / "second.avi"
     writer = cv2.VideoWriter(str(second_path), cv2.VideoWriter_fourcc(*"FFV1"),
                              10, (160, 120))
-    assert writer.isOpened()
+    if not writer.isOpened():
+        pytest.skip("FFV1 encoder unavailable")
     for idx in range(20):
         image = _make_frame(cv2, np, 160, 120, False, idx)
         image[0:16, 0:16] = (0, 0, 255)
@@ -217,7 +247,216 @@ def test_known_length_decode_failure_is_not_silent_cull(monkeypatch, synthetic_v
             self.capture.release()
 
     monkeypatch.setattr(cv2, "VideoCapture", BrokenCapture)
+    # Exercise the fail-closed path, not the separately tested ffmpeg fallback.
+    monkeypatch.setattr(F, "_probe_timestamps", lambda *args: None)
     output = tmp_path / "broken"
     result = F.extract_frames_safe(str(path), str(output))
     assert result["ok"] is False
     assert not list(output.glob("*.jpg"))
+
+
+def _ffmpeg_clip(tmp_path, extension, codec, *, frames=None):
+    cv2 = pytest.importorskip("cv2")
+    np = pytest.importorskip("numpy")
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg or not shutil.which("ffprobe"):
+        pytest.skip("ffmpeg and ffprobe are optional")
+    if frames is None:
+        frames = [_make_frame(cv2, np, 160, 120, False, i % 2) for i in range(24)]
+    path = tmp_path / f"source.{extension}"
+    proc = subprocess.run(
+        [ffmpeg, "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24",
+         "-s", "160x120", "-r", "10", "-i", "pipe:0", "-an", "-c:v", codec,
+         "-threads", "1", str(path)],
+        input=b"".join(frame.tobytes() for frame in frames), capture_output=True,
+    )
+    if proc.returncode:
+        pytest.skip(f"{codec} encoder or {extension} muxer unavailable: "
+                    + proc.stderr.decode("utf-8", "replace")[:200])
+    return path
+
+
+@pytest.mark.parametrize(("extension", "codec"), [
+    ("mp4", "mpeg4"), ("mov", "mpeg4"), ("webm", "libvpx"), ("mkv", "ffv1"),
+])
+def test_supported_video_containers_have_temporal_coverage_and_manifest(tmp_path, extension, codec):
+    path = _ffmpeg_clip(tmp_path, extension, codec)
+    result = F.extract_frames(str(path), str(tmp_path / "frames"),
+                              max_frames=4, sample_cap=16)
+    assert result.sampled <= 16
+    assert result.kept == 4
+    duration = F.probe_video(str(path))["duration_s"]
+    assert [min(3, int(frame.time_s * 4 / duration)) for frame in result.frames] == [0, 1, 2, 3]
+    manifest = json.loads(Path(result.manifest_path).read_text(encoding="utf-8"))
+    assert manifest["version"] == 1
+    assert manifest["frames"] == result.to_dict()["frames"]
+    for record in manifest["frames"]:
+        assert record["source_path"] == str(path.resolve())
+        assert record["clip_id"] == result.clip_id
+        assert record["orientation_degrees_clockwise"] == 0
+        assert Path(record["path"]).is_file()
+
+
+def test_selects_sharpest_candidate_in_each_time_bin(tmp_path):
+    cv2 = pytest.importorskip("cv2")
+    np = pytest.importorskip("numpy")
+    images = []
+    for idx in range(24):
+        image = _make_frame(cv2, np, 160, 120, False, idx % 2)
+        if idx % 3:
+            image = cv2.GaussianBlur(image, (5 if idx % 3 == 1 else 9,) * 2, 0)
+        images.append(image)
+    video = _ffmpeg_clip(tmp_path, "mp4", "mpeg4", frames=images)
+    all_frames = F.extract_frames(str(video), str(tmp_path / "all"), max_frames=24,
+                                  sample_cap=24, blur_threshold=0)
+    selected = F.extract_frames(str(video), str(tmp_path / "best"), max_frames=4,
+                                sample_cap=24, blur_threshold=0)
+    duration = F.probe_video(str(video))["duration_s"]
+    assert selected.kept == 4
+    for frame in selected.frames:
+        slot = min(3, int(frame.time_s * 4 / duration))
+        candidates = [row for row in all_frames.frames
+                      if min(3, int(row.time_s * 4 / duration)) == slot]
+        assert frame.sharpness == max(row.sharpness for row in candidates)
+
+
+def test_full_resolution_candidate_images_do_not_accumulate(tmp_path, monkeypatch):
+    video = _ffmpeg_clip(tmp_path, "mp4", "mpeg4")
+    references = []
+    peak_live = 0
+    original = F.blur_score
+
+    def checked_score(frame):
+        nonlocal peak_live
+        references.append(weakref.ref(frame))
+        peak_live = max(peak_live, sum(ref() is not None for ref in references))
+        return original(frame)
+
+    monkeypatch.setattr(F, "blur_score", checked_score)
+    result = F.extract_frames(str(video), str(tmp_path / "bounded"), max_frames=12,
+                              sample_cap=24, blur_threshold=0)
+    assert result.sampled == 24 and result.kept == 12
+    assert peak_live <= 2
+
+
+def test_ffmpeg_fallback_when_opencv_cannot_open(tmp_path, monkeypatch):
+    cv2 = pytest.importorskip("cv2")
+    path = _ffmpeg_clip(tmp_path, "mp4", "mpeg4")
+
+    class ClosedCapture:
+        def isOpened(self):
+            return False
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(cv2, "VideoCapture", lambda _: ClosedCapture())
+    result = F.extract_frames(str(path), str(tmp_path / "fallback"), max_frames=4,
+                              sample_cap=16)
+    assert result.kept == 4
+    assert any("used ffmpeg subprocess" in warning for warning in result.warnings)
+    assert all(Path(frame.path).stat().st_size > 0 for frame in result.frames)
+
+
+def test_ffmpeg_fallback_without_reported_duration_or_count(tmp_path, monkeypatch):
+    cv2 = pytest.importorskip("cv2")
+    path = _ffmpeg_clip(tmp_path, "mkv", "ffv1")
+    real_probe = F.probe_video
+
+    class ClosedCapture:
+        def isOpened(self):
+            return False
+
+        def release(self):
+            pass
+
+    def no_length(path, **kwargs):
+        metadata = real_probe(path, **kwargs)
+        metadata.pop("duration_s", None)
+        metadata.pop("nb_frames", None)
+        return metadata
+
+    monkeypatch.setattr(cv2, "VideoCapture", lambda _: ClosedCapture())
+    monkeypatch.setattr(F, "probe_video", no_length)
+    result = F.extract_frames(str(path), str(tmp_path / "no-length"), max_frames=4,
+                              sample_cap=16)
+    assert result.count_known and result.total_frames == 24
+    assert result.kept == 4
+    assert result.frames[0].time_s < 0.6
+    assert result.frames[-1].time_s > 1.8
+
+
+def test_rotation_metadata_applied_once_for_both_decoders(tmp_path, monkeypatch):
+    cv2 = pytest.importorskip("cv2")
+    np = pytest.importorskip("numpy")
+    frame = _make_frame(cv2, np, 160, 120, False, 0)
+    frame[:40, :50] = (0, 0, 255)
+    source = _ffmpeg_clip(tmp_path, "mp4", "mpeg4", frames=[frame] * 12)
+    rotated = tmp_path / "rotated.mov"
+    proc = subprocess.run(
+        [shutil.which("ffmpeg"), "-v", "error", "-y", "-i", str(source), "-c", "copy",
+         "-metadata:s:v:0", "rotate=90", str(rotated)], capture_output=True)
+    if proc.returncode or not F.probe_video(str(rotated)).get("orientation_degrees_clockwise"):
+        pytest.skip("ffmpeg could not write rotation metadata")
+    reference = subprocess.run(
+        [shutil.which("ffmpeg"), "-v", "error", "-i", str(rotated), "-frames:v", "1",
+         "-f", "image2pipe", "-vcodec", "png", "pipe:1"],
+        capture_output=True)
+    if reference.returncode:
+        pytest.skip("ffmpeg PNG encoder unavailable")
+    expected = cv2.imdecode(np.frombuffer(reference.stdout, dtype=np.uint8), cv2.IMREAD_COLOR)
+    normal = F.extract_frames(str(rotated), str(tmp_path / "rot-normal"), max_frames=3)
+
+    class ClosedCapture:
+        def isOpened(self):
+            return False
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(cv2, "VideoCapture", lambda _: ClosedCapture())
+    fallback = F.extract_frames(str(rotated), str(tmp_path / "rot-fallback"), max_frames=3)
+    assert normal.kept and fallback.kept
+    for result in (normal, fallback):
+        actual = cv2.imread(result.frames[0].path)
+        assert actual.shape == expected.shape
+        assert actual.shape[0] > actual.shape[1]
+        assert np.abs(actual.astype("int16") - expected.astype("int16")).mean() < 15
+        assert result.frames[0].orientation_degrees_clockwise in (90, 270)
+
+
+def test_variable_frame_rate_uses_display_timestamps(tmp_path):
+    cv2 = pytest.importorskip("cv2")
+    np = pytest.importorskip("numpy")
+    ffmpeg, ffprobe = shutil.which("ffmpeg"), shutil.which("ffprobe")
+    if not ffmpeg or not ffprobe:
+        pytest.skip("ffmpeg and ffprobe are optional")
+    concat = []
+    for i, duration in enumerate((0.2, 0.8, 0.3, 1.0)):
+        image = tmp_path / f"vfr{i}.png"
+        cv2.imwrite(str(image), _make_frame(cv2, np, 160, 120, False, i))
+        concat.extend([f"file '{image.as_posix()}'", f"duration {duration}"])
+    concat.append(f"file '{image.as_posix()}'")
+    listing = tmp_path / "concat.txt"
+    listing.write_text("\n".join(concat) + "\n", encoding="utf-8")
+    video = tmp_path / "variable.mp4"
+    encoded = subprocess.run(
+        [ffmpeg, "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", str(listing),
+         "-vsync", "vfr", "-c:v", "mpeg4", "-threads", "1", str(video)], capture_output=True)
+    if encoded.returncode:
+        pytest.skip("VFR MPEG-4 encoder unavailable")
+    raw = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_frames",
+         "-show_entries", "frame=best_effort_timestamp_time", "-of", "json", str(video)],
+        capture_output=True, check=True)
+    timestamps = [float(frame["best_effort_timestamp_time"])
+                  for frame in json.loads(raw.stdout)["frames"]]
+    assert len(set(round(b - a, 2) for a, b in zip(timestamps, timestamps[1:]))) > 1
+    result = F.extract_frames(str(video), str(tmp_path / "vfr"), max_frames=4,
+                              sample_cap=20, blur_threshold=0)
+    assert result.kept >= 3
+    for frame in result.frames:
+        assert frame.time_s == pytest.approx(timestamps[frame.frame_index] - timestamps[0], abs=1e-5)
+        expected = _make_frame(cv2, np, 160, 120, False, min(frame.frame_index, 3))
+        actual = cv2.imread(frame.path)
+        assert np.abs(actual.astype("int16") - expected.astype("int16")).mean() < 15

@@ -302,6 +302,45 @@ def test_ecad_moved_footprint_moves_its_pads_too(tmp_path):
     assert (res["added"], res["removed"]) == (4, 4)
 
 
+def test_kicad_three_point_arcs_show_curvature_changes(tmp_path):
+    a = {"schema": "aicad.pcb/1",
+         "outline": {"shapes": [{"type": "arc", "p1": [0, 0], "mid": [5, 5], "p2": [10, 0]}]},
+         "tracks": [{"kind": "arc", "p1": [0, 0], "mid": [5, 5], "p2": [10, 0],
+                     "width": 0.25, "layer": "F.Cu"}]}
+    b = {"schema": "aicad.pcb/1",
+         "outline": {"shapes": [{"type": "arc", "p1": [0, 0], "mid": [5, -5], "p2": [10, 0]}]},
+         "tracks": [{"kind": "arc", "p1": [0, 0], "mid": [5, -5], "p2": [10, 0],
+                     "width": 0.25, "layer": "F.Cu"}]}
+    res = visual_diff.ecad_diff_image(a, b, str(tmp_path / "arcs.png"))
+    assert res is not None and (res["added"], res["removed"]) == (2, 2)
+
+
+def test_kicad_rectangle_and_circle_outlines_render(tmp_path):
+    a = {"schema": "aicad.pcb/1", "outline": {"shapes": [
+        {"type": "rect", "p1": [0, 0], "p2": [20, 10]},
+        {"type": "circle", "center": [5, 5], "radius": 2},
+    ]}}
+    b = {"schema": "aicad.pcb/1", "outline": {"shapes": [
+        {"type": "rect", "p1": [0, 0], "p2": [25, 10]},
+        {"type": "circle", "center": [5, 5], "radius": 2},
+    ]}}
+    res = visual_diff.ecad_diff_image(a, b, str(tmp_path / "outline.png"))
+    assert res is not None and (res["added"], res["removed"], res["unchanged"]) == (1, 1, 1)
+
+
+def test_schematic_wires_symbols_and_labels_render(tmp_path):
+    a = {"schema": "aicad.sch/1",
+         "wires": [{"pts": [[0, 0], [10, 0]]}],
+         "labels": [{"pos": [0, 0], "text": "GND"}],
+         "symbols": [{"pos": [10, 0], "ref": "R1", "value": "10k", "libid": "Device:R"}],
+         "lib_cache": {"Device:R": {"graphics": [{"kind": "rect", "pts": [[-1, -1], [1, 1]]}],
+                                     "pins": [{"pos": [-2, 0], "angle": 0, "length": 1, "unit": 1}]}}}
+    b = {**a, "wires": [{"pts": [[0, 0], [12, 0]]}]}
+    res = visual_diff.ecad_diff_image(a, b, str(tmp_path / "schematic.png"))
+    assert res is not None and (res["added"], res["removed"]) == (1, 1)
+    assert res["unchanged"] >= 5
+
+
 def test_ecad_missing_sections_contribute_no_strokes(tmp_path):
     """A schematic-shaped doc with no board geometry has nothing to draw; against a
     board it is a pure removal."""

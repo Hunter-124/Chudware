@@ -2,10 +2,11 @@
 //
 // An assembly document (``aicad.asm/1``) is rebuilt very differently from a part:
 //
-//   1. Component loading — each non-suppressed component's ``source.path`` is opened
-//      (cached per resolved path + exact size/mtime and recursive dependency identity).
-//      Native child assemblies resolve recursively and retain local placements
-//      (provisional if unsolved). Bare neutral/mesh files use formats.cpp. Local
+//   1. Component loading — each non-suppressed component's ``source.path`` resolves
+//      to a live committed snapshot or disk, cached by native document hash or file
+//      stamp and recursive dependency identity. Native child assemblies resolve
+//      recursively and retain local placements (provisional if unsolved). Bare
+//      neutral/mesh files use formats.cpp. Local
 //      topology descriptions are computed only when mate references require them.
 //      Embedded-only sources are unsupported and produce explicit component errors.
 //
@@ -27,6 +28,7 @@
 #pragma once
 
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -98,6 +100,9 @@ struct AsmMateRefGeom {
 // The result of compiling an assembly (mirror of assembly.py::AssemblyResult).
 struct AssemblyResult {
     std::vector<AsmBodyOut> bodies;
+    // Retain the cached loads used by this live result, including topology and
+    // source documents, even when other assemblies exceed the global LRU limit.
+    std::vector<std::shared_ptr<const void>> component_cache_pins;
     std::vector<AsmComponentStatus> component_status;
     std::vector<AsmMateStatus> mate_status;
     std::vector<FeatureStatus> feature_status;  // authored assembly patterns, not components/mates
@@ -114,6 +119,43 @@ struct AssemblyResult {
     std::map<std::string, std::vector<AsmMateRefGeom>> mate_geometry;
 };
 
+// Immutable committed state of a path-backed open document. Assembly loads never
+// acquire another document's mutex: sessions publish these snapshots on unlock.
+struct AssemblyLiveSource {
+    std::shared_ptr<const nlohmann::json> document;
+    std::shared_ptr<const CompileResult> part;
+    std::string doc_hash;
+    std::string source_doc_id;
+    long revision = -1;
+    nlohmann::json base_file_stamp;
+    bool unsaved = false;
+    bool unverified = false;
+};
+std::shared_ptr<const AssemblyLiveSource> assembly_live_source(const std::string& canonical_path);
+using AssemblyLiveSources = std::map<std::string, std::shared_ptr<const AssemblyLiveSource>>;
+std::shared_ptr<const AssemblyLiveSources> assembly_live_sources();
+
+// Freeze the source set for one complete assembly compile, including prefetch
+// workers. Its fingerprint and geometry then always describe the same snapshots.
+class AssemblySourceScope {
+public:
+    AssemblySourceScope();
+    explicit AssemblySourceScope(std::shared_ptr<const AssemblyLiveSources> sources);
+    ~AssemblySourceScope();
+    AssemblySourceScope(const AssemblySourceScope&) = delete;
+    AssemblySourceScope& operator=(const AssemblySourceScope&) = delete;
+    static std::shared_ptr<const AssemblyLiveSources> current();
+private:
+    std::shared_ptr<const AssemblyLiveSources> previous_;
+};
+
+// In-memory source identities use live documents (including nested assemblies),
+// while the persisted fingerprint API below always describes files on disk.
+nlohmann::json asm_live_component_fingerprints(const nlohmann::json& doc,
+                                               const std::string& base_dir);
+bool asm_live_fingerprints_match(const nlohmann::json& doc, const std::string& base_dir,
+                                 const nlohmann::json& fingerprints);
+
 // Compile an assembly doc: load components, resolve mate refs, solve mates, place bodies.
 // `base_dir` resolves relative source paths; `warm` (optional) speeds + stabilises the
 // solve across re-solves. `drag` (optional) threads a soft-target through the solver.
@@ -127,15 +169,15 @@ AssemblyResult compile_assembly(const nlohmann::json& doc,
 // native .step+ rows carry their document's stepplus_doc_hash).
 // Written into persisted-geometry cache headers so doc_open detects child appearance
 // and geometry changes even when the containing assembly file has not changed.
-// Missing files fingerprint as size/mtime 0; repeated/cyclic sources are traversed once.
+// Missing files fingerprint as size/mtime 0; components without a file source retain
+// an empty-path row. Repeated/cyclic sources are traversed once.
 // Only source JSON is read; display meshes, BREP, studies and attachments are skipped.
 nlohmann::json asm_component_fingerprints(const nlohmann::json& doc,
                                           const std::string& base_dir);
 
-// True iff asm_component_fingerprints(doc, base_dir) matches fp row for row (order-
-// sensitive — component order is part of the identity): same path, and the same
-// size+mtime or, for a rewritten native file, the same doc_hash (a build-state
-// write-back keeps the document). Any parse mismatch returns false (cache miss).
+// True iff disk fingerprints match fp row for row (order-sensitive): same path,
+// and matching document hashes when both rows carry one, else matching size+mtime.
+// A build-state rewrite keeps the document hash. Parse mismatches are cache misses.
 bool asm_fingerprints_match(const nlohmann::json& doc, const std::string& base_dir,
                             const nlohmann::json& fp);
 
@@ -154,6 +196,14 @@ CompileResult compile_component_with_build_state(const std::string& path,
 // factor (port of assembly.py::explode_offsets).
 std::map<std::string, Eigen::Vector3d> explode_offsets(const nlohmann::json& doc, double factor);
 
+// Automatic explode vectors (mm, the factor-1 offset) for an assembly without authored
+// ``explode`` steps. The largest component stays put; every other component leaves the
+// smallest bigger component its box sits in (its parent) through the cheapest exit — its
+// mate insertion axis when it has one, else a world axis cleared against the parent's
+// face boxes — and rides along with that parent. Siblings stack so exploded parts never
+// land inside each other. Components that stay put are omitted.
+std::map<std::string, Eigen::Vector3d> auto_explode_vectors(const AssemblyResult& r);
+
 // World-place a component body: apply the solved 16-float transform (+ optional explode
 // offset) to its local shape. Port of assembly.py::placed_world_shape.
 TopoDS_Shape placed_world_shape(const AsmBodyOut& body,
@@ -167,9 +217,9 @@ gp_Trsf placed_world_trsf(const AsmBodyOut& body,
 
 // The feature — an id in the picked component's OWN part document — that owns face/edge
 // `topo_id` of `body.shape_local` (the TopExp numbering doc_resolve_pick uses). The part is
-// compiled once with owner attribution (cached by file stamp); the pick is matched to the
-// compiled body by index AND verified by area/length + centroid, falling back to a unique
-// geometric match. A pattern instance ("<cid>#k") resolves through its seed component.
+// compiled once with owner attribution (cached by live/disk source identity); the pick
+// is matched to the compiled body by index AND verified by area/length + centroid, falling
+// back to a unique geometric match. A pattern instance ("<cid>#k") resolves through its seed component.
 // "" when the component is not a native part (neutral import, nested assembly), `kind` is not
 // face|edge, or no confident match exists.
 std::string component_pick_owner(const nlohmann::json& asm_doc, const std::string& base_dir,

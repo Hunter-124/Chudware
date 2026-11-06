@@ -17,6 +17,7 @@
 #include "../core/app_state.h"
 #include "../ui_theme.h"
 #include "layout.h"  // ui::overlayBand — anchor below the REAL ribbon bottom, not a guessed inset
+#include "anim.h"
 
 namespace ui {
 
@@ -232,6 +233,8 @@ void drawToasts(AppState& st) {
         if (alpha < 0.0f) alpha = 0.0f;
         if (alpha > 1.0f) alpha = 1.0f;
         if (hovered && alpha > 0.0f) alpha = 1.0f;
+        if (!hovered && life > 0.0f && life < 0.6f)
+            anim::requestFramesAt(30.0f);
 
         auto withA = [&](const float c[4], float mul) {
             float v[4] = {c[0], c[1], c[2], c[3] * mul * alpha};

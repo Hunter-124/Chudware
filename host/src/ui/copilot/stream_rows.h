@@ -27,7 +27,7 @@ struct StreamRowState {
 };
 
 // True when a delta payload is real content, and therefore a visible timeline boundary.
-// Both delta coalescers (services/agent/agent_turn.py and core/agent/run.cpp) flush the
+// The delta coalescer (services/agent/agent_turn.py) flushes the
 // active channel before switching, which can emit an empty or whitespace-only delta —
 // treating that as a boundary splits ONE reasoning stream into several boxes.
 bool streamTextVisible(const std::string& text);

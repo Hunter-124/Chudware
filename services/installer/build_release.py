@@ -128,7 +128,7 @@ def stage_compiled_payload(
     hostd_bin: Path,
     worker_bin: Path,
     mcp_bin: Path,
-    chud_bin: Path | None,
+    omp_bin: Path | None,
     uninstall_helper_bin: Path,
 ) -> None:
     """Stage the complete CMake-produced GUI runtime plus protected sidecars."""
@@ -162,16 +162,18 @@ def stage_compiled_payload(
     _copy_required(hostd_bin, dst / "chudware-hostd.exe", "host daemon")
     _copy_required(worker_bin, dst / "chudware-worker.exe", "worker")
     _copy_required(mcp_bin, dst / "chudware-mcp.exe", "MCP server")
-    if chud_bin is None:
-        raise RuntimeError("required compiled Chudcode artifact not found")
-    from scripts import pin_chudcode
+    if omp_bin is None:
+        raise RuntimeError("required compiled OMP artifact not found")
+    from scripts import pin_omp
 
     try:
-        pin_chudcode.stage_binary(chud_bin, dst / "chud.exe", "windows-x86_64")
-        pin_chudcode.stage_notices(dst)
-    except pin_chudcode.ArtifactLockError as exc:
-        raise RuntimeError(f"invalid Chudcode release artifact: {exc}") from exc
-    shutil.copy2(pin_chudcode.DEFAULT_LOCK, dst / "CHUDCODE_ARTIFACT.lock")
+        pin_omp.stage_binary(omp_bin, dst / "omp.exe", "windows-x86_64")
+        pin_omp.stage_notices(dst)
+    except pin_omp.ArtifactLockError as exc:
+        raise RuntimeError(f"invalid OMP release artifact: {exc}") from exc
+    shutil.copy2(pin_omp.DEFAULT_LOCK, dst / "OMP_ARTIFACT.lock")
+    _copy_required(REPO / "services" / "agent" / "omp_extension.ts",
+                   dst / "omp_extension.ts", "trusted OMP extension")
     _copy_required(
         uninstall_helper_bin, dst / "chudware-uninstall-helper.exe", "uninstall helper"
     )
@@ -193,7 +195,7 @@ def build(
     hostd_bin: Path | None,
     worker_bin: Path | None,
     mcp_bin: Path | None,
-    chud_bin: Path | None,
+    omp_bin: Path | None,
     uninstall_helper_bin: Path | None,
     platform: str = "windows",
     arch: str = "x86_64",
@@ -232,7 +234,7 @@ def build(
         worker_bin=worker_bin,
         uninstall_helper_bin=uninstall_helper_bin,
         mcp_bin=mcp_bin,
-        chud_bin=chud_bin,
+        omp_bin=omp_bin,
     )
     shutil.copy2(REPO / "services" / "installer" / "install.ps1", dst / "install.ps1")
 
@@ -566,10 +568,10 @@ def main(argv: list[str]) -> int:
         else None,
     )
     ap.add_argument(
-        "--chud-bin",
+        "--omp-bin",
         type=Path,
-        default=Path(os.environ["CHUDWARE_CHUD_BIN"])
-        if os.environ.get("CHUDWARE_CHUD_BIN")
+        default=Path(os.environ["CHUDWARE_OMP_BIN"])
+        if os.environ.get("CHUDWARE_OMP_BIN")
         else None,
     )
     args = ap.parse_args(argv)
@@ -609,7 +611,7 @@ def main(argv: list[str]) -> int:
                 hostd_bin=args.hostd_bin,
                 worker_bin=args.worker_bin,
                 mcp_bin=args.mcp_bin,
-                chud_bin=args.chud_bin,
+                omp_bin=args.omp_bin,
                 uninstall_helper_bin=args.uninstall_helper_bin,
             )
             res["version"] = version

@@ -3,16 +3,18 @@
 When the agent worker jails a run to a user's project folder it sets
 CHUDWARE_PROJECT_SAVE_DIR; new_part and the successful add_features path then refresh the
 doc's chosen native destination (or assign <dir>/<safe_stem>.step+ to a fresh document).
-Unset configuration changes nothing. Ordinary save failures are best-effort, but engine
-connection loss propagates. These run WITHOUT an engine: core_bridge.call is faked.
+Unset configuration requires an established native path; persistence failures are reported
+separately from applied edits. These run WITHOUT an engine: core_bridge.call is faked.
 
 Run:  python3 -m pytest services/mcp/test_project_save.py -q -p no:randomly
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import sys
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
@@ -21,6 +23,8 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from services.mcp import cad_common as C  # noqa: E402
+from services.agent.request_context import bind_roots  # noqa: E402
+from services.mcp import cad_asm_tools as A  # noqa: E402
 from services.mcp import cad_doc_tools as M  # noqa: E402
 
 _DOC = "doc-cpp00000001"
@@ -35,8 +39,10 @@ class _FakeEngine:
         self.native_sources: dict = {}
         self.source_edited: dict = {}
         self.origins: dict = {}  # doc_id -> hostd origin_kind ("gui" = the user opened it)
+        self.human_dirty: dict = {}
         self.saves: list = []
         self.exports: list = []
+        self.components: dict = {}
 
     def call(self, method, params=None):
         p = params or {}
@@ -48,8 +54,13 @@ class _FakeEngine:
                               "path": self.paths.get(d),
                               "native_source_path": self.native_sources.get(d),
                               "native_source_edited": self.source_edited.get(d, False),
-                              "origin_kind": self.origins.get(d, "mcp")}
+                              "origin_kind": self.origins.get(d, "mcp"),
+                              "human_dirty": self.human_dirty.get(d, False)}
                              for d, n in self.names.items()]}
+        if method == "doc_tree":
+            path = self.paths.get(p["doc_id"])
+            return {"tree": {"components": self.components.get(p["doc_id"], [])},
+                    "component_source_base": str(Path(path).parent) if path else None}
         if method == "asm_world_bodies":
             return {"bodies": [{"name": "Block"}]}
         if method == "doc_save":
@@ -68,6 +79,12 @@ class _FakeEngine:
         if method == "doc_checkpoint":
             return {"checkpoint": "ck1"}
         if method == "doc_apply_ops":
+            for op in p.get("ops", []):
+                if op.get("op") == "asm_insert_component":
+                    components = self.components.setdefault(p["doc_id"], [])
+                    component = dict(op, id=f"k{len(components) + 1}")
+                    components.append(component)
+                    return {"id_map": {"$0": component["id"]}}
             return {"rebuild": {"feature_status": [{"id": "f1", "ok": True}]},
                     "tess": {"bodies": [{}]}, "revision": 1, "volume": 100.0,
                     "id_map": {}}
@@ -108,6 +125,7 @@ def test_unset_env_writes_nothing_and_payload_is_unchanged(engine, monkeypatch, 
     assert r["ok"] is True and r["doc_id"] == _DOC and r["name"] == "widget"
     assert "revision" in r
     assert "saved_path" not in r
+    assert r["persist_error"]["code"] == "no_project_save_dir"
     assert engine.saves == []
     assert not list(tmp_path.glob("*.step+"))
 
@@ -177,10 +195,9 @@ def test_add_features_refreshes_the_saved_file(engine, monkeypatch, tmp_path):
     assert r["doc_id"] and "revision" in r and "features" in r
 
 
-def test_add_features_never_writes_the_file_of_a_doc_the_user_opened(engine, monkeypatch,
-                                                                      tmp_path):
-    """c259: per-batch saves rewrote the user's open base.step+ with every intermediate
-    (including a kernel-broken cut) and cleared its dirty flag."""
+def test_add_features_saves_the_file_of_a_clean_user_opened_doc(engine, monkeypatch,
+                                                                  tmp_path):
+    """Agent edits to a user-opened document are persisted to its bound native file."""
     monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
     _new_part("base")
     user_file = tmp_path / "parts" / "base.step+"
@@ -194,9 +211,26 @@ def test_add_features_never_writes_the_file_of_a_doc_the_user_opened(engine, mon
                                           "params": {"length": 40, "width": 30,
                                                      "height": 20}}}]))
     assert r["ok"] is True, r
-    assert r.get("saved_path") is None
-    assert [p for p in engine.saves if "autosave" not in p] == []
-    assert user_file.read_text() == "user's saved design"
+    assert r["saved_path"] == str(user_file)
+    assert engine.saves == [str(user_file)]
+    assert user_file.read_text() == "STEP+ fake payload"
+
+
+def test_add_features_does_not_save_human_dirty_work(engine, monkeypatch, tmp_path):
+    monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
+    _new_part("base")
+    user_file = tmp_path / "base.step+"
+    user_file.write_text("saved human design")
+    engine.origins[_DOC] = "gui"
+    engine.human_dirty[_DOC] = True
+    engine.saves.clear()
+    result = json.loads(_tool("add_features")(doc_id=_DOC, ops=[
+        {"op": "add_feature", "feature": {"type": "box", "name": "Block",
+                                          "params": {"length": 40}}}]))
+    assert result["ok"] is True
+    assert result["persist_error"]["code"] == "human_dirty"
+    assert engine.saves == []
+    assert user_file.read_text() == "saved human design"
 
 
 def test_add_features_unset_env_has_no_saved_path(engine, monkeypatch):
@@ -207,20 +241,22 @@ def test_add_features_unset_env_has_no_saved_path(engine, monkeypatch):
                                           "params": {"length": 40}}}]))
     assert r["ok"] is True, r
     assert "saved_path" not in r
+    assert r["persist_error"]["code"] == "no_project_save_dir"
     project_saves = [p for p in engine.saves if "autosave" not in p]
     assert project_saves == []
 
 
-def test_unwritable_dir_never_fails_the_tool(engine, monkeypatch, tmp_path):
+def test_unwritable_dir_reports_persist_error_without_undoing_creation(engine, monkeypatch, tmp_path):
     blocked = tmp_path / "not_a_dir"
     blocked.write_text("I am a file")  # mkdir(exist_ok=True) on a file -> failure path
     monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(blocked))
     r = _new_part("widget")
     assert r["ok"] is True
     assert "saved_path" not in r
+    assert r["persist_error"]["code"] == "save_failed"
 
 
-def test_project_save_never_raises_on_engine_failure(engine, monkeypatch, tmp_path):
+def test_project_save_propagates_engine_failure_and_tool_reports_it(engine, monkeypatch, tmp_path):
     monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
 
     def boom(method, params=None):
@@ -229,9 +265,47 @@ def test_project_save_never_raises_on_engine_failure(engine, monkeypatch, tmp_pa
         return engine.call(method, params)
 
     monkeypatch.setattr(C.cb, "call", boom)
-    assert C._project_save(_DOC, "widget") is None
+    engine.names[_DOC] = "widget"
+    with pytest.raises(RuntimeError, match="disk on fire"):
+        C._project_save(_DOC, "widget")
+    engine.names.clear()
     r = _new_part("widget")
     assert r["ok"] is True and "saved_path" not in r
+    assert r["persist_error"]["message"] == "disk on fire"
+
+
+def test_concurrent_first_saves_keep_one_path_and_do_not_block_other_docs(
+        engine, monkeypatch, tmp_path):
+    import threading
+
+    monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
+    other = "doc-cpp00000002"
+    engine.names.update({_DOC: "widget", other: "other"})
+    first_wrote = threading.Event()
+    release_first = threading.Event()
+    original = engine.call
+
+    def blocked_save(method, params=None):
+        p = params or {}
+        if method == "doc_save" and p.get("doc_id") == _DOC and not first_wrote.is_set():
+            Path(p["path"]).write_text("first save")
+            first_wrote.set()
+            assert release_first.wait(5)
+        return original(method, params)
+
+    monkeypatch.setattr(C.cb, "call", blocked_save)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        first = pool.submit(C._project_save, _DOC)
+        assert first_wrote.wait(5)
+        second = pool.submit(C._project_save, _DOC)
+        independent = pool.submit(C._project_save, other)
+        try:
+            assert independent.result(timeout=5) == str(tmp_path / "other.step+")
+        finally:
+            release_first.set()
+        assert first.result(timeout=5) == str(tmp_path / "widget.step+")
+        assert second.result(timeout=5) == str(tmp_path / "widget.step+")
+    assert not (tmp_path / "widget_2.step+").exists()
 
 
 def test_stem_falls_back_to_doc_id(engine, monkeypatch, tmp_path):
@@ -317,11 +391,8 @@ def test_metadata_failure_never_guesses_a_new_destination(
         return engine.call(method, params)
 
     monkeypatch.setattr(C.cb, "call", unavailable)
-    if code == "engine_connection_lost":
-        with pytest.raises(MetadataFailure):
-            C._project_save(_DOC, "supplied name")
-    else:
-        assert C._project_save(_DOC, "supplied name") is None
+    with pytest.raises(MetadataFailure):
+        C._project_save(_DOC, "supplied name")
     assert engine.saves == []
 
 
@@ -369,7 +440,7 @@ def test_study_only_native_import_needs_a_separate_or_explicit_destination(
 
 
 @pytest.mark.parametrize("save_mode", ["automatic", "bare"])
-def test_authored_native_import_preserves_source_save_behavior(
+def test_authored_native_import_gets_new_deliverable(
         engine, monkeypatch, tmp_path, save_mode):
     monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path / "project"))
     source = tmp_path / "arm.step+"
@@ -385,9 +456,9 @@ def test_authored_native_import_preserves_source_save_behavior(
         assert saved["ok"] is True, saved
         written = saved["path"]
 
-    assert written == str(source)
-    assert source.read_text() == "STEP+ fake payload"
-    assert not (tmp_path / "project").exists()
+    assert written == str(tmp_path / "project" / "arm.step+")
+    assert source.read_text() == "original source assembly"
+    assert Path(written).read_text() == "STEP+ fake payload"
 
 
 def test_persist_study_keeps_the_native_reassigned_identity(monkeypatch):
@@ -592,3 +663,210 @@ def test_sanitizer_canonicalizes_workspace_and_ordinary_output_symlinks(
 
     assert C.resolve_agent_path("base.step+", "path") == str(project / "base.step+")
     assert C._sanitize_output_path("output/base.step+") == str(destination / "base.step+")
+
+
+def test_concurrent_workspace_component_inputs_and_outputs_are_isolated(
+        engine, monkeypatch, tmp_path):
+    repository = tmp_path / "repository"
+    (repository / ".git").mkdir(parents=True)
+    (repository / ".plm").mkdir()
+    (repository / "parts").mkdir()
+    decoy = repository / "parts" / "bracket.step+"
+    decoy.write_text("cwd and marked ancestor decoy")
+    projects = [repository / "selected workspace", tmp_path / "other workspace"]
+    docs = ["doc-workspace-a", "doc-workspace-b"]
+    for project, doc in zip(projects, docs):
+        (project / "parts").mkdir(parents=True)
+        (project / "parts" / "bracket.step+").write_text(doc)
+        (project / "output").mkdir()
+        (project / "assemblies" / "parts").mkdir(parents=True)
+        (project / "assemblies" / "parts" / "bracket.step+").write_text("assembly decoy")
+        engine.names[doc] = doc
+        engine.paths[doc] = str(project / "assemblies" / "fixture.step+")
+    monkeypatch.chdir(repository)
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(repository))
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(repository))
+    add_component = _tool("asm_add_component")
+    save = _tool("save_part")
+    barrier = Barrier(2)
+
+    def turn(index):
+        project, doc = projects[index], docs[index]
+        with bind_roots(str(project)):
+            barrier.wait(timeout=10)
+            assert C.resolve_agent_path("parts/bracket.step+", "path") == str(
+                project / "parts" / "bracket.step+")
+            inserted = json.loads(add_component(doc_id=doc, path="parts/bracket.step+"))
+            assert inserted["ok"] is True, inserted
+            saved = json.loads(save(doc_id=doc, path="output/result.step+"))
+            assert saved["ok"] is True, saved
+            return saved["path"]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        destinations = list(pool.map(turn, range(2)))
+
+    assert destinations == [str(project / "output" / "result.step+") for project in projects]
+    for project, doc in zip(projects, docs):
+        assert [component["source"]["path"] for component in engine.components[doc]] == [
+            str(project / "parts" / "bracket.step+")]
+        assert (project / "output" / "result.step+").is_file()
+    assert not (repository / "output").exists()
+    assert decoy.read_text() == "cwd and marked ancestor decoy"
+    assert C.resolve_agent_path("parts/bracket.step+", "path") == str(decoy)
+
+
+def test_component_input_miss_does_not_use_ancestor_cwd_or_assembly_decoys(
+        engine, monkeypatch, tmp_path):
+    repository = tmp_path / "repository"
+    (repository / ".git").mkdir(parents=True)
+    (repository / ".plm").mkdir()
+    project = repository / "selected workspace"
+    assembly_dir = project / "assemblies"
+    ambient = tmp_path / "ambient"
+    for base in (repository, assembly_dir, ambient):
+        (base / "parts").mkdir(parents=True)
+        (base / "parts" / "bracket.step+").write_text("wrong component")
+    engine.names[_DOC] = "fixture"
+    engine.paths[_DOC] = str(assembly_dir / "fixture.step+")
+    monkeypatch.chdir(repository)
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(ambient))
+    monkeypatch.setenv("CHUDWARE_FS_ROOT", str(ambient))
+
+    with bind_roots(str(project)):
+        result = json.loads(_tool("asm_add_component")(
+            doc_id=_DOC, path="parts/bracket.step+"))
+
+    assert result["ok"] is False, result
+    assert result["tried"] == [str(project / "parts" / "bracket.step+")]
+    assert engine.components == {}
+
+
+@pytest.mark.parametrize("root_state", ["unset", "missing", "file"])
+def test_component_input_requires_valid_workspace_but_accepts_absolute_paths(
+        engine, monkeypatch, tmp_path, root_state):
+    from contextlib import nullcontext
+
+    worker = tmp_path / "repository"
+    worker.mkdir()
+    source = worker / "bracket.step+"
+    source.write_text("cwd and assembly decoy")
+    engine.names[_DOC] = "fixture"
+    engine.paths[_DOC] = str(worker / "fixture.step+")
+    monkeypatch.chdir(worker)
+    monkeypatch.delenv("CHUDWARE_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("CHUDWARE_FS_ROOT", raising=False)
+    context = nullcontext()
+    if root_state != "unset":
+        configured = tmp_path / "unavailable-project"
+        if root_state == "file":
+            configured.write_text("not a directory")
+        # An invalid scoped root may not fall back to an existing ambient root.
+        monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(worker))
+        monkeypatch.setenv("CHUDWARE_FS_ROOT", str(worker))
+        context = bind_roots(str(configured))
+
+    with context:
+        refused = json.loads(_tool("asm_add_component")(doc_id=_DOC, path=source.name))
+        assert refused["ok"] is False, refused
+        assert "ABSOLUTE" in refused["error"]
+        assert engine.components == {}
+        inserted = json.loads(_tool("asm_add_component")(doc_id=_DOC, path=str(source)))
+
+    assert inserted["ok"] is True, inserted
+    assert engine.components[_DOC][0]["source"]["path"] == str(source)
+
+
+def test_stored_component_sources_keep_assembly_relative_semantics(
+        engine, tmp_path):
+    assembly_dir = tmp_path / "saved project" / "assemblies"
+    assembly_dir.mkdir(parents=True)
+    engine.names[_DOC] = "fixture"
+    engine.paths[_DOC] = str(assembly_dir / "fixture.step+")
+    selected = tmp_path / "different selected workspace"
+    selected.mkdir()
+
+    with bind_roots(str(selected)):
+        assert A._component_source_path("parts/bracket.step+", _DOC) == str(
+            assembly_dir / "parts" / "bracket.step+")
+        assert A._component_source_path("../parts/bracket.step+", _DOC) == str(
+            assembly_dir.parent / "parts" / "bracket.step+")
+        absolute = str(tmp_path / "external.step+")
+        assert A._component_source_path(absolute, _DOC) == absolute
+
+
+def test_bound_native_file_wins_without_project_dir(engine, monkeypatch, tmp_path):
+    monkeypatch.delenv("CHUDWARE_PROJECT_SAVE_DIR", raising=False)
+    destination = tmp_path / "user.step+"
+    destination.write_text("original")
+    engine.names[_DOC] = "user"
+    engine.paths[_DOC] = str(destination)
+    result = json.loads(_tool("save_part")(doc_id=_DOC))
+    assert result["ok"]
+    assert result["path"] == str(destination)
+    assert engine.saves == [str(destination)]
+
+
+def test_bound_path_refusal_is_reported_even_if_file_exists(engine, monkeypatch, tmp_path):
+    monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
+    destination = tmp_path / "bound.step+"
+    destination.write_text("other document")
+    engine.names[_DOC] = "part"
+    engine.paths[_DOC] = str(destination)
+    original_call = engine.call
+
+    def refuse(method, params=None):
+        if method == "doc_save":
+            return {"ok": False, "code": "path_bound_to_other_doc",
+                    "other_doc_id": "other"}
+        return original_call(method, params)
+
+    monkeypatch.setattr(C.cb, "call", refuse)
+    out = {"ok": True}
+    C.persist_result(_DOC, out)
+    assert out["persist_error"]["code"] == "path_bound_to_other_doc"
+    assert out["persist_error"]["detail"]["other_doc_id"] == "other"
+    assert "saved_path" not in out
+    assert destination.read_text() == "other document"
+
+
+def test_close_accepts_hostd_confirmed_automatic_save(engine, monkeypatch, tmp_path):
+    destination = tmp_path / "part.step+"
+    destination.write_text("saved")
+    engine.names[_DOC] = "part"
+    engine.paths[_DOC] = str(destination)
+    original_call = engine.call
+
+    def saved_engine(method, params=None):
+        result = original_call(method, params)
+        if method == "doc_list":
+            result["docs"][0].update(revision=4, saved_revision=4, dirty=False,
+                                     human_dirty=False)
+        return result
+
+    monkeypatch.setattr(C.cb, "call", saved_engine)
+    closed = json.loads(_tool("close_part")(doc_id=_DOC))
+    assert closed["ok"] is True
+    assert engine.saves == []
+
+
+def test_flat_export_does_not_mark_editable_document_saved(engine, monkeypatch, tmp_path):
+    engine.names[_DOC] = "part"
+    original_call = engine.call
+
+    def dirty_engine(method, params=None):
+        result = original_call(method, params)
+        if method == "doc_list":
+            result["docs"][0].update(revision=4, saved_revision=0, dirty=True,
+                                     human_dirty=False)
+        return result
+
+    monkeypatch.setattr(C.cb, "call", dirty_engine)
+    monkeypatch.setattr(C, "_project_save",
+                        lambda *args: (_ for _ in ()).throw(OSError("disk full")))
+    exported = json.loads(_tool("export_part")(fmt="step", doc_id=_DOC,
+                                                path=str(tmp_path / "flat.step")))
+    assert exported["ok"]
+    closed = json.loads(_tool("close_part")(doc_id=_DOC))
+    assert closed["ok"] is False
+    assert closed["code"] == "unsaved_changes"
+    assert closed["persist_error"]["message"] == "disk full"

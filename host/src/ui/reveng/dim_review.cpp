@@ -284,7 +284,7 @@ const char* methodTip(const DimRow& r) {
                                              "starting point, not a caliper reading.";
     if (r.method == "guessed")        return "Nobody measured this. contracts/reveng.md section 0\n"
                                              "forbids a guessed value on a fit-critical dimension.";
-    return "Provenance reported by list_reveng_dims.";
+    return "Source of this value as reported by list_reveng_dims.";
 }
 
 std::string rowValueText(const DimRow& r) {
@@ -1198,7 +1198,7 @@ void drawDimReviewPanel(AppState& st) {
         kit::GapControl();
         if (kit::SecondaryButton("Ingest a datasheet", true, nullptr)) {
             S().stage      = Stage::Source;
-            S().sourceMode = SourceMode::Datasheet;
+            S().sourceMode = SourceMode::Reference;
         }
         for (const std::string& n : d.notes) {
             kit::GapControl();

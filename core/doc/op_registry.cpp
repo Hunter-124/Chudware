@@ -18,7 +18,9 @@ namespace {
 const char* const kDocOpKinds[] = {
     "add_feature",
     "edit_feature",
+    "scad_convert",
     "delete_feature",
+    "simplify_history",
     "reorder_feature",
     "set_suppressed",
     "set_folder",
@@ -59,6 +61,9 @@ const char* const kDocOpKinds[] = {
     "paste_feature",
     "paste_feature_as_derived",
     "sketch_paste_entities",
+    "sketch3d_add_entities",
+    "sketch3d_add_constraints",
+    "sketch3d_add_external_ref",
 };
 
 std::string lower(std::string s) {

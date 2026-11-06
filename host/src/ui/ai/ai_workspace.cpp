@@ -281,8 +281,8 @@ static void drawOptionsView(AppState& st, bool busy) {
 
     // Shared with Settings -> AI -> Harness: the exact same widgets/fields, one source of
     // truth. Covers plan/subagent/advisor preference, role adoption, proactive advisor,
-    // company auto-route, vision, offline mode, show-thoughts, project memory, redaction,
-    // refine-pass cap, max subagent nesting, memory budget, Eng. Firm budget.
+    // vision, offline mode, show-thoughts, project memory, redaction,
+    // refine-pass cap, max subagent nesting, memory budget.
     sectionHeader("Workflow");
     if (ui::drawHarnessSessionKnobs(st, S)) saveSettings(st.settings);
     ImGui::Dummy(ImVec2(0, ui::metrics::cpMenuSectionGap()));

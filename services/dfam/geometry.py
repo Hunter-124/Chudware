@@ -6,8 +6,8 @@ Peels are centre-sampled Z crossings, sorted by XY cell then height; a half-open
 projected-edge rule avoids double counting tessellation seams. Coincident sheets
 share one public hit/provenance, while private signed multiplicity preserves
 union winding for overlapping solids. Voxels are centre occupancy (not surface
-coverage), with at least one full air cell around every side. Raster/ray pair
-workspaces are capped; neither routine constructs a triangle-by-ray matrix.
+coverage), with at least one full air cell around every side. Raster workspaces
+are capped without constructing a triangle-by-sample matrix.
 """
 from __future__ import annotations
 
@@ -268,6 +268,8 @@ def surface_samples(geom: BuildGeometry, max_samples: int = 20000) -> tuple[np.n
     When the budget permits, every nondegenerate triangle receives its centroid;
     remaining samples follow largest-remainder area allocation. Below that budget
     systematic area bins carry their exact bin area, without mesh-size bias.
+    Points and outward normals are in the build frame; these query samples are
+    independent of the native inscribed-sphere blocker's refinement spacing.
     """
     if int(max_samples) != max_samples or max_samples < 1:
         raise ValueError("max_samples must be a positive integer")
@@ -297,145 +299,3 @@ def surface_samples(geom: BuildGeometry, max_samples: int = 20000) -> tuple[np.n
     bary[local == 0] = 1 / 3
     points = np.einsum("ij,ijk->ik", bary, geom.triangles[tri])
     return points, geom.normals[tri], tri, weights
-
-
-class RayCaster:
-    """Uniform hashed grid + batched DDA and Moller--Trumbore intersections.
-
-    Grid references are limited to max(three million, triangle count) by increasing
-    the requested pitch when necessary. Cast returns the nearest positive-distance hit, with
-    lowest triangle id resolving coincident edges/sheets within 1e-6 mm. Directions
-    are normalized so max_distance and returned distances are always mm.
-    """
-    def __init__(self, geom: BuildGeometry, cell: float) -> None:
-        if not math.isfinite(cell) or cell <= 0:
-            raise ValueError("cell must be positive and finite")
-        self.geom = geom
-        self.origin = geom.bounds[0].copy()
-        extent = geom.bounds[1] - self.origin
-        minimum = geom.triangles.min(axis=1)
-        maximum = geom.triangles.max(axis=1)
-        # Keep virtual flattened grid ids within int64 even for tiny pitches.
-        self.cell = max(float(cell), float(np.max(extent)) / (2 ** 20 - 1))
-        while True:
-            self.shape = np.maximum(1, np.floor(extent / self.cell).astype(np.int64) + 1)
-            lower = np.floor((minimum - self.origin) / self.cell).astype(np.int64)
-            upper = np.minimum(np.floor((maximum - self.origin) / self.cell).astype(np.int64), self.shape - 1)
-            references = sum(map(int, np.prod(upper - lower + 1, axis=1, dtype=np.int64)))
-            if references <= max(3000000, len(geom.triangles)):
-                break
-            self.cell *= max(1.25, (references / 3000000) ** (1 / 3))
-        items, cells = [], []
-        for item, flat in _box_pairs(lower, upper, self.shape):
-            items.append(item)
-            cells.append(flat)
-        cells, items = np.concatenate(cells), np.concatenate(items)
-        order = np.argsort(cells, kind="stable")
-        cells = cells[order]
-        self.items = items[order]
-        self.keys, self.starts, self.counts = np.unique(cells, return_index=True, return_counts=True)
-        self.v0 = geom.triangles[:, 0]
-        self.e1 = geom.triangles[:, 1] - self.v0
-        self.e2 = geom.triangles[:, 2] - self.v0
-        self.det_scale = np.linalg.norm(self.e1, axis=1) * np.linalg.norm(self.e2, axis=1)
-
-    def _intersections(self, ray, tri, origins, directions, limits, opposing):
-        d = directions[ray]
-        p = np.cross(d, self.e2[tri])
-        det = np.einsum("ij,ij->i", self.e1[tri], p)
-        good = np.abs(det) > 1e-12 * self.det_scale[tri]
-        inverse = np.divide(1., det, out=np.zeros_like(det), where=good)
-        delta = origins[ray] - self.v0[tri]
-        u = np.einsum("ij,ij->i", delta, p) * inverse
-        q = np.cross(delta, self.e1[tri])
-        v = np.einsum("ij,ij->i", d, q) * inverse
-        distance = np.einsum("ij,ij->i", self.e2[tri], q) * inverse
-        good &= (u >= -1e-10) & (v >= -1e-10) & (u + v <= 1 + 1e-10)
-        good &= (distance > 1e-9) & (distance <= limits[ray] + 1e-9)
-        if opposing is not None:
-            good &= np.einsum("ij,ij->i", self.geom.normals[tri], opposing[ray]) < 0
-        return ray[good], tri[good], distance[good]
-
-    def cast(self, origins: ArrayLike, directions: ArrayLike, max_distance: float | np.ndarray, *,
-             opposing_normals: ArrayLike | None = None) -> tuple[np.ndarray, np.ndarray]:
-        origins, directions = np.asarray(origins, dtype=float), np.asarray(directions, dtype=float)
-        if origins.ndim != 2 or origins.shape[1:] != (3,) or directions.shape != origins.shape:
-            raise ValueError("origins and directions must be matching (N,3) arrays")
-        lengths = np.linalg.norm(directions, axis=1)
-        if not np.isfinite(origins).all() or not np.isfinite(directions).all() or np.any(lengths < 1e-15):
-            raise ValueError("rays must be finite with nonzero directions")
-        directions = directions / lengths[:, None]
-        limits = np.broadcast_to(np.asarray(max_distance, dtype=float), (len(origins),))
-        if np.any(np.isnan(limits)) or np.any(limits < 0):
-            raise ValueError("max_distance must be nonnegative")
-        opposing = None if opposing_normals is None else np.asarray(opposing_normals, dtype=float)
-        if opposing is not None and (opposing.shape != origins.shape or not np.isfinite(opposing).all()):
-            raise ValueError("opposing_normals must be a finite (N,3) array")
-        distances = np.full(len(origins), np.inf)
-        triangles = np.full(len(origins), -1, dtype=np.int64)
-        inverse = np.divide(1., directions, out=np.full_like(directions, np.inf), where=directions != 0)
-        lower, upper = self.geom.bounds
-        moving = directions != 0
-        near = np.minimum(np.where(moving, (lower - origins) * np.where(moving, inverse, 0), -np.inf),
-                          np.where(moving, (upper - origins) * np.where(moving, inverse, 0), np.inf))
-        far = np.maximum(np.where(moving, (lower - origins) * np.where(moving, inverse, 0), -np.inf),
-                         np.where(moving, (upper - origins) * np.where(moving, inverse, 0), np.inf))
-        outside = np.any(~moving & ((origins < lower) | (origins > upper)), axis=1)
-        entry = np.maximum(0., np.max(near, axis=1))
-        exit_ = np.minimum(limits, np.min(far, axis=1))
-        active = np.flatnonzero(~outside & (entry <= exit_))
-        if not len(active):
-            return distances, triangles
-        position = origins + directions * entry[:, None]
-        coordinate = np.clip(np.floor((position - self.origin) / self.cell).astype(np.int64), 0, self.shape - 1)
-        step = np.sign(directions).astype(np.int64)
-        boundary = self.origin + (coordinate + (step > 0)) * self.cell
-        next_t = np.divide(boundary - origins, directions, out=np.full_like(origins, np.inf), where=moving)
-        delta_t = self.cell * np.abs(inverse)
-        while len(active):
-            c = coordinate[active]
-            flat = (c[:, 0] * self.shape[1] + c[:, 1]) * self.shape[2] + c[:, 2]
-            key = np.searchsorted(self.keys, flat)
-            found = key < len(self.keys)
-            found[found] &= self.keys[key[found]] == flat[found]
-            rays = active[found]
-            key = key[found]
-            counts = self.counts[key]
-            ends = np.cumsum(counts)
-            starts = ends - counts
-            total = int(ends[-1]) if len(ends) else 0
-            for begin in range(0, total, _PAIR_LIMIT):
-                offsets = np.arange(begin, min(total, begin + _PAIR_LIMIT))
-                item = np.searchsorted(ends, offsets, side="right")
-                ray = rays[item]
-                tri = self.items[self.starts[key[item]] + offsets - starts[item]]
-                ray, tri, distance = self._intersections(ray, tri, origins, directions, limits, opposing)
-                if not len(ray):
-                    continue
-                order = np.lexsort((tri, distance, ray))
-                ray, tri, distance = ray[order], tri[order], distance[order]
-                first = np.r_[True, ray[1:] != ray[:-1]]
-                group_starts = np.flatnonzero(first)
-                group_lengths = np.diff(np.r_[group_starts, len(ray)])
-                minimum = np.repeat(distance[first], group_lengths)
-                eligible = distance <= minimum + _HIT_EPS
-                chosen = np.minimum.reduceat(np.where(eligible, tri, len(self.v0)), group_starts)
-                chosen_by_pair = np.repeat(chosen, group_lengths)
-                positions = np.minimum.reduceat(
-                    np.where(eligible & (tri == chosen_by_pair), np.arange(len(ray)), len(ray)),
-                    group_starts)
-                ray, tri, distance = ray[first], chosen, distance[positions]
-                better = (distance < distances[ray] - _HIT_EPS) | ((np.abs(distance - distances[ray]) <= _HIT_EPS) & ((triangles[ray] < 0) | (tri < triangles[ray])))
-                distances[ray[better]], triangles[ray[better]] = distance[better], tri[better]
-            next_entry = np.min(next_t[active], axis=1)
-            continuing = next_entry <= np.minimum(exit_[active], distances[active] + _HIT_EPS)
-            active = active[continuing]
-            next_entry = next_entry[continuing]
-            if not len(active):
-                break
-            axes = next_t[active] <= next_entry[:, None] + 1e-12
-            coordinate[active] += axes * step[active]
-            next_t[active] += np.where(axes, delta_t[active], 0)
-            valid = np.all((coordinate[active] >= 0) & (coordinate[active] < self.shape), axis=1)
-            active = active[valid]
-        return distances, triangles

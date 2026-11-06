@@ -1,0 +1,520 @@
+{
+  "version": 1,
+  "suites": {
+    "geom": "B-rep kernel: features, booleans, fillets, sweeps, surfacing, selectors, picks, document model",
+    "sketch": "2D/3D sketches, constraint solver, drag, sketch-on-face, conversions",
+    "drawing": "Drawings, views, dimensions, GD&T, tolerance stacks",
+    "assembly": "Mates, interference, component insertion, motion and mechanisms",
+    "mesh_fea": "Meshing, tet10, FEA (static, contact, plastic, buckling, modal, fatigue, thermal, structural)",
+    "sim": "CFD/LBM, simulation cache and studies, hydraulics, piping, industrial",
+    "topopt": "Topology optimization",
+    "cam_mfg": "CAM, machines, GRBL, 3D printing, manufacturing lanes, DFM, digital twin",
+    "ecad": "Schematics, PCB, KiCad, SPICE, autorouting, DRC, firmware, buses and transports",
+    "formats": "Import/export and file formats: STEP, DWG/DXF, ACIS/SAT, STL/PLY, SCAD, SolidWorks parity",
+    "render": "Renderer and viewport: OpenGL/splat rendering, camera, tessellation, view metrics, render diffs, screenshot scenarios",
+    "agent": "Copilot, agent runtime, OMP host, MCP server, roles and missions",
+    "parts": "Parts library, standard parts, sourcing, PLM",
+    "platform": "Utilities, IPC, hostd, worker, updater/security, CEF, external open, platform parity",
+    "gui": "GUI shell (host/): ribbon, panels, widgets, theme, property manager, clipboard",
+    "infra": "Build, gate, packaging, installer, scripts and tooling"
+  },
+  "core": {
+    "geom": [
+      "document",
+      "edge_analysis",
+      "fit",
+      "geom_aicm",
+      "geometry_analysis",
+      "hole",
+      "mesh_reference",
+      "mirror",
+      "occt_smoke",
+      "op_registry",
+      "ops",
+      "pattern",
+      "picks",
+      "profile_extrude",
+      "selectors",
+      "surf_replace_face_heal",
+      "surfacing",
+      "sweep",
+      "wall_thickness"
+    ],
+    "sketch": [
+      "drag",
+      "freecad_parity",
+      "nsolve",
+      "plane",
+      "polygon",
+      "profile_arc",
+      "rectangle",
+      "sixaxis_regressions",
+      "sketch",
+      "sketch3d",
+      "sketch3d_doc",
+      "sketch_autoconstrain",
+      "sketch_convert",
+      "sketch_define",
+      "sketch_drag_rpc",
+      "sketch_on_face",
+      "sketch_trim"
+    ],
+    "drawing": [
+      "drawing_gdt",
+      "drawing_provenance",
+      "tolerance"
+    ],
+    "assembly": [
+      "assembly_clearance",
+      "insert_component",
+      "interference",
+      "mate",
+      "mate_corpus",
+      "motion_dynamics",
+      "simulate_motion"
+    ],
+    "mesh_fea": [
+      "fatigue",
+      "fea_buckling",
+      "fea_contact",
+      "fea_plastic",
+      "fea_prepare",
+      "mesh",
+      "mesh_mechanism",
+      "mesh_quality",
+      "mesh_sector",
+      "mesher_advanced",
+      "modal",
+      "overlay_surface",
+      "structural",
+      "tet10",
+      "tet10_thin_wall",
+      "thermal"
+    ],
+    "sim": [
+      "hydraulic",
+      "industrial",
+      "piping",
+      "sim",
+      "sim_cache",
+      "studies"
+    ],
+    "topopt": [
+      "topopt_cht",
+      "topopt_elastic",
+      "topopt_flow",
+      "topopt_model",
+      "topopt_optimizer",
+      "topopt_run",
+      "topopt_spectral",
+      "topopt_surface",
+      "topopt_thermal",
+      "topopt_thermomechanical"
+    ],
+    "cam_mfg": [
+      "cam",
+      "cam_processes",
+      "dfm",
+      "test_device_lane",
+      "test_grbl_protocol",
+      "test_mfg_authorization",
+      "test_mfg_foundation",
+      "test_mfg_lane",
+      "test_print_model",
+      "test_twin"
+    ],
+    "ecad": [
+      "autoroute",
+      "drc_geometry",
+      "firmware",
+      "kicad_cli",
+      "harness_route",
+      "kicad_import",
+      "kicad_libs",
+      "kicad_roundtrip",
+      "sch_engine",
+      "spice_netlist",
+      "spice_sweep",
+      "test_transport_net",
+      "test_transport_serial"
+    ],
+    "formats": [
+      "acis_read",
+      "acis_write",
+      "dwg_native",
+      "dwg_write",
+      "dxf_r2000",
+      "export_assembly",
+      "formats_registry",
+      "import_roundtrip",
+      "scad",
+      "scad_integration",
+      "scad_process",
+      "scad_process_macos",
+      "scad_process_windows",
+      "scad_projection",
+      "solidworks_bounds",
+      "test_ply_bounds",
+      "test_sat_bounds",
+      "test_stl_bounds"
+    ],
+    "render": [
+      "appearance",
+      "render_camera",
+      "render_diff",
+      "render_view",
+      "view_metrics"
+    ],
+    "agent": [
+      "agent",
+      "agent_auth"
+    ],
+    "parts": [
+      "materials",
+      "mechanical",
+      "parts",
+      "parts_geometry",
+      "parts_place",
+      "sourcing"
+    ],
+    "platform": [
+      "aicm",
+      "engine_watchdog",
+      "expr",
+      "governor",
+      "hostd_cell_ownership",
+      "hostd_worker_bridge_windows",
+      "ipc_transport_windows",
+      "platform_parity",
+      "probe",
+      "prof",
+      "prof_phases",
+      "prof_tree",
+      "sha256",
+      "thread_pool"
+    ],
+    "infra": []
+  },
+  "core_targets": {
+    "hostd_worker_bridge_windows": [
+      "test_hostd_worker_bridge_win"
+    ],
+    "ipc_transport_windows": [
+      "test_ipc_transport_win"
+    ],
+    "probe": [
+      "chudware_probe"
+    ]
+  },
+  "host": {
+    "sketch": [
+      "test_sketch_consumers"
+    ],
+    "topopt": [
+      "test_sim_topology"
+    ],
+    "cam_mfg": [
+      "test_cam_mirror"
+    ],
+    "render": [
+      "test_aicm_bounds",
+      "test_mesh_reference_data",
+      "test_re_points",
+      "test_ref_datum_geom",
+      "test_splat_renderer",
+      "test_tess_catchup"
+    ],
+    "agent": [
+      "test_active_work_feed",
+      "test_agent_job_routing",
+      "test_agent_text",
+      "test_ask_answers",
+      "test_context_estimate",
+      "test_context_ref",
+      "test_conv_ids",
+      "test_inline_image_refs",
+      "test_magic_keywords",
+      "test_model_registry",
+      "test_omp_descriptors",
+      "test_omp_session_actions",
+      "test_stream_rows",
+      "test_switch_hold",
+      "test_tool_phrase",
+      "test_usage_rings"
+    ],
+    "parts": [
+      "test_graph_thumbnail"
+    ],
+    "platform": [
+      "test_async_rpc",
+      "test_camera_backend",
+      "test_cef_spool_reaper",
+      "test_cef_trace_bounds",
+      "test_cef_trace_disabled",
+      "test_cef_trace_explicit_opt_in",
+      "test_external_open",
+      "test_security",
+      "test_updater",
+      "test_updater_https",
+      "test_worker_control",
+      "test_worker_long_run"
+    ],
+    "gui": [
+      "test_clipboard_image",
+      "test_command_capability",
+      "test_property_manager",
+      "test_spell_check",
+      "test_text_wrap"
+    ]
+  },
+  "host_targets": {
+    "test_cef_trace_disabled": [
+      "test_cef_trace_bounds"
+    ],
+    "test_cef_trace_explicit_opt_in": [
+      "test_cef_trace_bounds"
+    ],
+    "test_updater_https": [
+      "test_updater"
+    ]
+  },
+  "pytest": {
+    "geom": [
+      "services/agent/test_geometry_helpers.py",
+      "services/agent/test_regen_card.py",
+      "services/agent/test_regen_diagnosis.py",
+      "services/mcp/test_add_features_shape.py",
+      "services/mcp/test_cad_tools.py",
+      "services/mcp/test_eval_tool_dialect.py",
+      "services/mcp/test_face_attribution.py",
+      "services/mcp/test_geom_health.py",
+      "services/mcp/test_geom_query_guard.py",
+      "services/mcp/test_graph_tools.py",
+      "services/mcp/test_gsl_tools.py",
+      "services/mcp/test_incremental_rebuild.py",
+      "services/mcp/test_material_resolve.py",
+      "services/mcp/test_mesh_reference_tools.py",
+      "services/mcp/test_modeling_connection_loss.py",
+      "services/mcp/test_modeling_repertoire.py",
+      "services/mcp/test_new_part_dedup.py",
+      "services/mcp/test_recon_hints.py",
+      "services/mcp/test_recon_tools.py",
+      "services/mcp/test_regen_tools.py",
+      "services/mcp/test_reveng_alignment_state.py",
+      "services/mcp/test_reveng_contract.py",
+      "services/mcp/test_reveng_coverage_preview.py",
+      "services/mcp/test_reveng_e2e_datasheet.py",
+      "services/mcp/test_reveng_e2e_scan.py",
+      "services/mcp/test_reveng_make_part.py",
+      "services/mcp/test_reveng_parts_roundtrip.py",
+      "services/mcp/test_reveng_pipeline_agent.py",
+      "services/mcp/test_reveng_rebuild_integrity.py",
+      "services/mcp/test_reveng_reference.py",
+      "services/mcp/test_reveng_research_ingest.py",
+      "services/mcp/test_reveng_splat_tools.py",
+      "services/mcp/test_reveng_tools.py",
+      "services/mcp/test_reveng_video_gauge.py",
+      "services/mcp/test_stress_tools.py",
+      "services/reveng",
+      "services/test_kernel_exec_aliases.py",
+      "services/vision",
+      "tools/gsl_gnn",
+      "tools/reveng",
+      "tools/test_profile_modeling.py"
+    ],
+    "sketch": [
+      "services/agent/advisor/test_sketch_quality.py",
+      "services/agent/test_cheatsheet_examples.py",
+      "services/agent/test_guardrail_datums.py",
+      "services/agent/test_guardrails_sketch_quality.py",
+      "services/mcp/test_sketch3d_tools.py",
+      "services/mcp/test_sketch_auto_define_engine.py",
+      "services/mcp/test_sketch_design_intent.py",
+      "services/verify"
+    ],
+    "drawing": [
+      "services/mcp/test_cad_drawing_tools.py",
+      "services/mcp/test_dimension_scheme.py",
+      "services/mcp/test_research_fit_dialect.py",
+      "services/mcp/test_tolerance_tools.py",
+      "services/research/test_fits.py"
+    ],
+    "assembly": [
+      "services/agent/advisor/test_diagnostic_advisors.py",
+      "services/mcp/test_asm_motion_regressions.py",
+      "services/mcp/test_assembly_dogfood.py",
+      "services/mcp/test_cad_motion_tools.py",
+      "services/mcp/test_catalog_bom_dogfood.py",
+      "services/mcp/test_interface_check.py",
+      "services/mcp/test_layout_plan.py"
+    ],
+    "mesh_fea": [
+      "services/agent/advisor/test_sim_advisor.py",
+      "services/agent/advisor/test_sim_advisor_cli.py",
+      "services/mcp/test_asm_fea_static.py",
+      "services/mcp/test_cad_sim_tools.py",
+      "services/mcp/test_fea_advanced.py",
+      "services/mcp/test_fea_ccx_advanced.py",
+      "services/mcp/test_fea_contact_live.py",
+      "services/mcp/test_fea_hot_spots.py",
+      "services/mcp/test_fea_live_bridge.py",
+      "services/mcp/test_fea_modal_freq.py",
+      "services/mcp/test_fea_static_suite.py",
+      "services/mcp/test_fea_thermal_live.py",
+      "services/mcp/test_mesh_size_delivery.py",
+      "services/mcp/test_vibration_tool.py",
+      "services/sim/test_thermal_transient.py",
+      "services/sim/test_thermal_transient_anchors.py",
+      "services/sim/test_vibration.py",
+      "services/structural"
+    ],
+    "sim": [
+      "services/civil",
+      "services/mcp/test_cfd_lbm_live.py",
+      "services/mcp/test_civil_hydro_tools.py",
+      "services/mcp/test_civil_link_tools.py",
+      "services/mcp/test_civil_tools.py",
+      "services/mcp/test_hydraulic_design_tools.py",
+      "services/mcp/test_hydraulic_handoff.py",
+      "services/mcp/test_multiphysics_misc.py",
+      "services/mcp/test_piping_design_tools.py",
+      "services/mcp/test_prof_phases_bridge.py",
+      "services/mcp/test_sim_evidence_packet.py",
+      "services/mcp/test_simhandoff.py",
+      "services/piping",
+      "services/sim",
+      "services/test_compiled_sim_jobs.py"
+    ],
+    "topopt": [
+      "services/mcp/test_topology_tools.py"
+    ],
+    "cam_mfg": [
+      "services/agent/test_manufacture_family_default_off.py",
+      "services/dfam",
+      "services/manufacturing",
+      "services/mcp/test_cam_audit.py",
+      "services/mcp/test_cam_setup_sheet_enrichment.py",
+      "services/mcp/test_cam_tools.py",
+      "services/mcp/test_dfm_reinforce.py",
+      "services/mcp/test_dfm_rows_additive.py",
+      "services/mcp/test_dfm_rows_machining.py",
+      "services/mcp/test_dfm_rows_molding.py",
+      "services/mcp/test_dfm_rows_sheetmetal.py",
+      "services/mcp/test_dfm_sheetmetal_native.py",
+      "services/mcp/test_mfg_plan_tools.py",
+      "services/mcp/test_mfg_tools.py",
+      "services/mcp/test_print_placement.py",
+      "services/mcp/test_print_tools.py",
+      "services/mcp/test_wall_thickness_study.py",
+      "services/research/test_machining.py",
+      "services/research/test_machining_reference.py"
+    ],
+    "ecad": [
+      "services/ecad",
+      "services/harness/test_defaults.py",
+      "services/harness/test_formboard.py",
+      "services/mcp/test_antenna_tools.py",
+      "services/mcp/test_ascii2d.py",
+      "services/mcp/test_board_flow.py",
+      "services/mcp/test_ecad_hardening.py",
+      "services/mcp/test_ecad_packs.py",
+      "services/mcp/test_ecad_part_id_dialect.py",
+      "services/mcp/test_ecad_pcb_tools.py",
+      "services/mcp/test_ecad_qa_tools.py",
+      "services/mcp/test_ecad_reliability.py",
+      "services/mcp/test_ecad_sim_e2e.py",
+      "services/mcp/test_ecad_tools.py",
+      "services/mcp/test_em_tools.py",
+      "services/mcp/test_firmware_tools.py",
+      "services/mcp/test_harness_bus_electrical.py",
+      "services/mcp/test_harness_chassis_ratings.py",
+      "services/mcp/test_harness_electrical.py",
+      "services/mcp/test_harness_insulation.py",
+      "services/mcp/test_harness_thermal.py",
+      "services/mcp/test_harness_tools.py",
+      "services/mcp/test_heatsink_context.py",
+      "services/mcp/test_power_budget.py",
+      "services/plm/test_ecad_diff.py",
+      "services/sim/em",
+      "services/sim/test_ngspice_backend.py",
+      "services/sim/test_spice_security.py"
+    ],
+    "formats": [
+      "services/browser/test_cad_validate.py",
+      "services/deliverables",
+      "services/formats",
+      "services/mcp/test_cad_exchange_paths.py",
+      "services/mcp/test_exchange_integrity.py",
+      "services/mcp/test_fetch_cad_model.py",
+      "services/mcp/test_native_read_wait_job.py",
+      "services/mcp/test_office_oxide.py",
+      "services/mcp/test_office_tools.py",
+      "services/mcp/test_sw_feature_import.py",
+      "services/sim/test_aicm.py"
+    ],
+    "render": [
+      "services/mcp/test_animation_tools.py",
+      "services/mcp/test_cad_render_tools_bc.py",
+      "services/mcp/test_closeup_camera.py",
+      "services/mcp/test_inspect_tools.py",
+      "services/mcp/test_render_artifacts.py",
+      "services/mcp/test_shot_planner.py",
+      "services/viewpoint"
+    ],
+    "agent": [
+      "services/agent",
+      "services/browser",
+      "services/dag",
+      "services/intake",
+      "services/mcp",
+      "services/requirements",
+      "services/research"
+    ],
+    "parts": [
+      "services/agent/test_box_mirror.py",
+      "services/agent/test_plm_bridge.py",
+      "services/agent/test_sourcing_subagent.py",
+      "services/browser/adapters",
+      "services/mcp/test_doc_canonical.py",
+      "services/mcp/test_model_card.py",
+      "services/mcp/test_parts_tool_dialect.py",
+      "services/mcp/test_parts_tools_v2.py",
+      "services/mcp/test_plm_tools.py",
+      "services/parts",
+      "services/plm"
+    ],
+    "platform": [
+      "services/mcp/test_autosave_recovery.py",
+      "services/mcp/test_daemon_bridge.py",
+      "services/mcp/test_hostd_cell.py",
+      "services/mcp/test_hostd_cell_policy.py",
+      "services/mcp/test_hostd_cell_workers.py",
+      "services/mcp/test_hostd_edgecases.py",
+      "services/mcp/test_hostd_privacy.py",
+      "services/mcp/test_hostd_registry.py",
+      "services/mcp/test_hostd_supervision.py",
+      "services/mcp/test_hostd_worker_bridge.py",
+      "services/mcp/test_live_preview.py",
+      "services/mcp/test_multiuser_undo.py",
+      "services/mcp/test_show_in_app.py",
+      "services/net",
+      "services/test_aicm_handoff.py",
+      "services/test_paths_alias.py",
+      "services/test_worker_activity.py",
+      "services/test_worker_stream.py",
+      "web"
+    ],
+    "gui": [
+      "assets",
+      "scripts/test_gui_lint.py",
+      "scripts/test_verify_ui_shared.py"
+    ],
+    "infra": [
+      "benchmarks/artifact_validity",
+      "packaging",
+      "scripts",
+      "services/installer",
+      "tools"
+    ]
+  }
+}

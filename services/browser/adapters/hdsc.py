@@ -1,25 +1,15 @@
 """services/browser/adapters/hdsc.py — HDSC (Huada Semiconductor) source adapter (Parts Library V2).
 
-Huada Semiconductor (hdsc.com.cn) is a Chinese MCU vendor — the HC32 Cortex-M
-family. The site is CN-hosted and can be slow.
-
-Live-verified 2026-07-10: the old ``/search?q=`` guess 404'd. The site's only
-English search surface is a single "Post" tab — ``/en/search?type=post&search=<q>``
-(HTTP 200, server-rendered). It indexes NEWS/ARTICLE posts, not a product
-catalog (the EN site has no product-search tab; datasheets live under a separate
-product-center browse). Results are ``cc-postslist--item`` cards: a
-``cc-postslist--title`` block wraps ``<a class="fn-th" href="…/en/<id>.html"
-title="…">`` and a sibling ``cc-postslist--date`` carries the publish date. This
-adapter overrides :meth:`parse_search` to read that markup and emit
-``kind="post"`` hits honestly (title from the anchor's ``title`` attribute — the
-inner text carries ``<em>`` search-highlight spans). Note some post titles are
-Chinese even on the EN index. Open catalog — no login.
+The English search indexes news/article posts, not a product catalog. Hits are
+reference pages, with the post date when available. Search does not establish
+that a post has a corresponding purchasable part or product image.
 """
 from __future__ import annotations
 
+import html
 import re
 
-from . import register
+from . import abs_url, make_hit, register
 from ._retail import RetailAdapter, _strip_tags
 
 SITE = "hdsc"
@@ -33,57 +23,63 @@ LICENSE_NOTE = (
     "the manufacturer's datasheet saved for the user. See contracts/license_debt.md."
 )
 
-_LOGIN_WALL_MARKERS = ("Sign In", "Log In", "登录", 'id="login"')
+_LOGIN_WALL_MARKERS: tuple[str, ...] = ()
 _CHALLENGE_MARKERS = ("Access Denied", "Reference #", "Pardon Our Interruption")
 
-# One HDSC post-search result: a ``cc-postslist--title`` block wrapping the post
-# anchor. Prefer the ``title`` attribute (clean) over the inner text (``<em>``
-# highlight spans). The publish date follows in a ``cc-postslist--date`` span.
-_TITLE_RE = re.compile(
-    r'<div class="cc-postslist--title\s*">\s*'
-    r'<a\b[^>]*\bclass="fn-th\s*"[^>]*\bhref="(?P<href>[^"]+)"[^>]*'
-    r'\btitle="(?P<title>[^"]*)"',
+_CARD_RE = re.compile(
+    r"""<li\b(?=[^>]*\bclass=["'][^"']*\bcc-postslist--item\b[^"']*["'])[^>]*>(.*?)</li>""",
     re.IGNORECASE | re.DOTALL)
+_TITLE_RE = re.compile(
+    r"""<a\b(?=[^>]*\bclass=["'][^"']*\bfn-th\b[^"']*["'])(?P<attrs>[^>]*)>"""
+    r"(?P<text>.*?)</a>", re.IGNORECASE | re.DOTALL)
 _DATE_RE = re.compile(
-    r'<div class="cc-postslist--date\s*">\s*<span class="date">\s*'
-    r'(?P<date>[^<]+?)\s*</span>', re.IGNORECASE | re.DOTALL)
+    r"""<span\b[^>]*\bclass=["'][^"']*\bdate\b[^"']*["'][^>]*>\s*(?P<date>[^<]+?)\s*</span>""",
+    re.IGNORECASE | re.DOTALL)
+_EMPTY_RE = re.compile(
+    r"""<p\b[^>]*\bclass=["'][^"']*\bcc-postslist--empty\b[^"']*["'][^>]*>"""
+    r"\s*No data\s*</p>", re.IGNORECASE)
+
+
+def _attribute(tag: str, name: str) -> str:
+    match = re.search(r"(?<![\w-])" + re.escape(name) + r"""\s*=\s*(["'])(.*?)\1""",
+                      tag, re.IGNORECASE | re.DOTALL)
+    return html.unescape(match.group(2)).strip() if match else ""
 
 
 class HdscAdapter(RetailAdapter):
     key = SITE
+    hosts = ("hdsc.com.cn",)
+    result_kinds = ("page",)
+    cad_acquisition = False
+    login_required = False
+    api = False
     base_url = BASE_URL
     search_url_tmpl = SEARCH_URL_TMPL
     license_note = LICENSE_NOTE
     login_wall_markers = _LOGIN_WALL_MARKERS
     challenge_markers = _CHALLENGE_MARKERS
 
+    def is_no_results(self, content: str) -> bool:
+        return bool(_EMPTY_RE.search(content)) or super().is_no_results(content)
+
     def parse_search(self, content: str) -> list[dict]:
-        """HDSC's EN search indexes news/article POSTS (no product SKU/price).
-        Parse each ``cc-postslist--title`` anchor + its publish date."""
         hits: list[dict] = []
         seen: set[str] = set()
-        cards = list(_TITLE_RE.finditer(content))
-        for i, m in enumerate(cards):
-            href = m.group("href")
-            url = href if href.startswith("http") else BASE_URL + href
-            if url in seen:
+        for card in _CARD_RE.finditer(content):
+            match = _TITLE_RE.search(card.group(1))
+            if not match:
+                continue
+            attrs = match.group("attrs")
+            url = abs_url(self.base_url + "/", _attribute(attrs, "href"))
+            title = _attribute(attrs, "title") or html.unescape(_strip_tags(match.group("text")))
+            if not url or not title or url in seen:
                 continue
             seen.add(url)
-            title = _strip_tags(m.group("title"))
-            if not title:
-                continue
-            hit = {
-                "ok": True,
-                "title": title,
-                "url": url,
-                "site": SITE,
-                "kind": "post",
-            }
-            end = cards[i + 1].start() if i + 1 < len(cards) else len(content)
-            date_m = _DATE_RE.search(content, m.end(), end)
-            if date_m:
-                hit["date"] = date_m.group("date").strip()
-            hits.append(hit)
+            date = _DATE_RE.search(card.group(1))
+            extra = {"ok": True}
+            if date:
+                extra["date"] = date.group("date").strip()
+            hits.append(make_hit(SITE, title=title, url=url, kind="page", extra=extra))
         return hits
 
 

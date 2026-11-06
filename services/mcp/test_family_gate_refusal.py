@@ -251,6 +251,10 @@ class TestBrokenPolicyFailsClosed(unittest.TestCase):
 
     def test_write_lease_check_error_refuses_the_mutation_but_not_reads(self):
         with unittest.mock.patch(
+            "services.agent.workspace.write_guard_active", return_value=True,
+        ), unittest.mock.patch(
+            "services.mcp.tool_registry._lease_doc_id", return_value="d1",
+        ), unittest.mock.patch(
             "services.agent.workspace.check_write_lease",
             side_effect=RuntimeError("lease registry gone"),
         ) as lease:

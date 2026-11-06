@@ -18,7 +18,9 @@ config.json
 .DS_Store
 .idea/
 .cache/
-.omp/
+# Local OMP state stays private; project skills (.omp/skills) are shared.
+.omp/*
+!.omp/skills/
 imgui.ini
 
 # C++ build trees (host/build-linux, core/build-linux, core/build-occt-linux, ...)

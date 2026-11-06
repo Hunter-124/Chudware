@@ -13,7 +13,7 @@ several in one cycle (real hardware) to find the best local-model config:
   python3 -m tools.flywheel.bench.gym.cli run --real \\
       --tiers local-24k,local-24k-gemma3-qat,local-24k-gemma4-e4b
 
-Paid tiers carry provider/model identifiers into Chudcode. Chudcode owns the
+Paid tiers carry provider/model identifiers into OMP. OMP owns the
 OpenRouter/xAI transport and authenticated account selection; the gym never
 constructs a Python cloud adapter. Example:
 
@@ -24,9 +24,6 @@ Diagnostic suites (leaderboard axes — never folded into primary pass rate):
 
   python3 -m tools.flywheel.bench.gym.cli diag --tiers xai:grok-4-5
   python -m tools.flywheel.bench.gym.leaderboard build
-
-No synthetic "council" tier exists: council composition remains CAD role
-orchestration, not a provider transport or benchmark tier.
 
 The ``run`` command executes the matrix, writes the per-cycle markdown+JSON report under
 ``reports/``, then runs the ASSESS-ADJUST-RERUN step: it applies the in-scope
@@ -39,7 +36,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -52,30 +48,12 @@ from .runner import (
 )
 
 
-def _apply_council_threshold_dial(new_threshold: int) -> dict:
-    """The one dial we can adjust AND measure deterministically here: the build-strategy
-    council feature threshold (env-config, no prompt change). Returns the change record."""
-    old = os.environ.get("CHUDWARE_COUNCIL_FEATURE_THRESHOLD", "5")
-    os.environ["CHUDWARE_COUNCIL_FEATURE_THRESHOLD"] = str(new_threshold)
-    return {
-        "knob": "CHUDWARE_COUNCIL_FEATURE_THRESHOLD",
-        "from": old,
-        "to": str(new_threshold),
-        "change": f"lower council feature threshold {old} -> {new_threshold} "
-        "(more parts get the four-seat review before build)",
-    }
-
-
 def adjust_and_rerun(cycle_result, *, challenge_ids, tiers) -> tuple[list[dict], dict]:
     """Assess-adjust-rerun: apply in-scope dials, re-run, measure deltas honestly.
 
-    Two dial classes:
-      * grind_threshold (gym-owned, deterministic): tightening it from 3->2 re-classifies
-        the SAME ledgers, so its effect on the taxonomy IS measurable in mock mode — a
-        real, honest structural delta.
-      * council feature threshold (config env): applied and recorded; its effect on
-        BUILD-phase behaviour needs a real model in the loop, so its pass-rate delta is
-        documented as pending-provision (mock replay does not react to it).
+    The dial is gym-owned and deterministic: grind_threshold tightening from 3->2
+    re-classifies the SAME ledgers, so its effect on the taxonomy IS measurable in
+    mock mode — a real, honest structural delta.
     """
     cells = [c.to_dict() for c in cycle_result.cells]
     base_tax = report_mod._taxonomy_counts(cells)["counts"]
@@ -117,16 +95,6 @@ def adjust_and_rerun(cycle_result, *, challenge_ids, tiers) -> tuple[list[dict],
         "The +delta is C3/seed3's 2-attempt n_verify_DL1 node, which fires grind "
         "only once the threshold drops to 2: the assess-adjust-rerun loop actually "
         "reclassifying a cell.",
-    }
-
-    # 2) council feature threshold 5 -> 3 (config env applied; behavioural delta pending).
-    ch = _apply_council_threshold_dial(3)
-    applied.append(ch)
-    deltas["council_threshold_5_to_3"] = {
-        "measurable": False,
-        "note": "applied to an in-process os.environ var ONLY (evaporates at process "
-        "exit; persists to no config file) — pass-rate delta needs a real model "
-        "in BUILD (mock replay does not convene councils) — pending-provision",
     }
     return applied, deltas
 
@@ -247,7 +215,7 @@ def main(argv=None) -> int:
     r.add_argument(
         "--real",
         action="store_true",
-        help="REAL execution: execute_dag=True through Chudcode, or an "
+        help="REAL execution: execute_dag=True through OMP, or an "
         "explicit offline local provider, when the probe reports "
         "real-runnable.",
     )

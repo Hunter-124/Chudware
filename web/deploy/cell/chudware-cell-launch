@@ -42,7 +42,7 @@ def launch(cell_id):
     env = {**BASE_ENV, "CHUDWARE_CELL_ID": cell_id, "HOME": "/state/home", "XDG_DATA_HOME": "/state/data",
            "XDG_CONFIG_HOME": "/state/config", "XDG_CACHE_HOME": "/state/cache",
            "XDG_RUNTIME_DIR": "/state/run", "CHUDWARE_WORKER_PYTHON": "/opt/chudware/venv/bin/python3",
-           "CHUDWARE_CHUDCODE_BIN": "/opt/chudware/bin/chud"}
+           "CHUDWARE_OMP_BIN": "/opt/chudware/bin/omp"}
     # Initialize through the quota-verified state descriptor, not a fresh path
     # lookup beneath a gateway-writable parent. New directories inherit the
     # kernel project quota; saved CAD remains on the durable workspace mount.

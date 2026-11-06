@@ -1,7 +1,5 @@
 # Manufacturing Overhaul Decision Brief
 
-Research snapshot: 2026-08-08.
-
 ## Product decisions
 
 These are the execution baseline for the manufacturing overhaul.
@@ -13,7 +11,6 @@ These are the execution baseline for the manufacturing overhaul.
 - Slicer: maintained PrusaSlicer sidecar fork pinned to upstream tags with a small patch queue and complete AGPL corresponding-source compliance.
 - Printer adapters: Moonraker first, OctoPrint second, capability-probed PrusaLink third, direct Marlin later.
 - Predictive model: Forecast-to-Compress Manufacturing Latent Dynamics Perceptron. Reuse reviewed permissive encoders/detectors; train temporal prediction, fusion, uncertainty, event selection, and compression heads on owned/licensed data.
-- Additional manufacturing implementation now: probing and quality. Other modes receive extensible capability schemas only unless later selected.
 - Edge: cross-platform Windows/Linux local gateway with durable state and safety arbitration; cloud/mobile is an optional authenticated relay.
 - Media: short rolling buffers with event-centric evidence clips and structured telemetry, not continuous recording by default.
 

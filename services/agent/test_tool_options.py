@@ -1,4 +1,4 @@
-"""Tests for agent.tool_options + design_recipe + tool_hints."""
+"""Tests for agent.tool_options + design_recipe."""
 from __future__ import annotations
 
 import threading
@@ -377,7 +377,7 @@ class TestDispatchOptions(unittest.TestCase):
                 include_category_menu=False)
         self.assertIn("Per-turn limit: at most 3", text)
 
-    def test_error_hint_appended(self):
+    def test_tool_failure_propagates(self):
         from services.agent import agent_turn as at
 
         def boom(**kwargs):
@@ -397,7 +397,7 @@ class TestDispatchOptions(unittest.TestCase):
         ):
             with self.assertRaises(ValueError) as cm:
                 at._dispatch_tool("cam_generate", {})
-        self.assertIn("Hint:", str(cm.exception))
+        self.assertEqual(str(cm.exception), "bad args")
 
 
 class TestTimedToolRecovery(unittest.TestCase):
@@ -448,7 +448,7 @@ class TestTimedToolRecovery(unittest.TestCase):
         return work, entered, release, executions
 
     def binding(self, handler, context=None, **kwargs):
-        from services.agent.chudcode_tools import HostToolBinding
+        from services.agent.omp_tools import HostToolBinding
 
         if context is None:
             context = {
@@ -461,7 +461,7 @@ class TestTimedToolRecovery(unittest.TestCase):
         )
 
     def call(self, binding, args=None, *, agent_id=None, cancel=None):
-        from services.agent.chudcode_tools import dispatch_host_tool
+        from services.agent.omp_tools import dispatch_host_tool
 
         return dispatch_host_tool(
             binding, args or {}, None, cancel, agent_id=agent_id,
@@ -1027,14 +1027,6 @@ class TestDesignRecipe(unittest.TestCase):
             {"schema": "wrong/1", "id": "bad", "title": "Bad",
              "summary": "Wrong schema", "steps": [{"tool": "x"}]},
             fallback_id="bad"))
-
-
-class TestHints(unittest.TestCase):
-    def test_hint_for_known(self):
-        from services.agent.tool_hints import hint_for
-
-        self.assertIsNotNone(hint_for("cam_generate"))
-        self.assertIsNone(hint_for("no_such_tool_zzz"))
 
 
 if __name__ == "__main__":

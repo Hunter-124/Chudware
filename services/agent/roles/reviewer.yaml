@@ -2,7 +2,6 @@ schema: aicad.role/1
 id: reviewer
 goal: Prove or refute, with named tool runs, that the deliverable meets every acceptance criterion - and report exactly what was and was not checked.
 stage_scope: [part_verify, assembly, deliver]
-playbook_default: null
 tool_allowlist:
   - tool: ledger_get
   - tool: ledger_note

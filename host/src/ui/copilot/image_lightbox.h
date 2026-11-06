@@ -1,7 +1,15 @@
 #pragma once
 #include <string>
+#include "imgui.h"
 struct AppState;
 namespace ui {
+namespace copilot {
+// Call once at load time, before interactive work can exhaust the browser pthread pool.
+// Image requests never create a worker lazily.
+void initImageLoader();
+// Background decode + bounded GL-thread LRU. Pending images return 0 and schedule another frame.
+ImTextureID asyncImageTexture(const std::string& path, int maxEdge, int* outW, int* outH);
+}
 // Draw a square thumbnail of `path` at `sizePx`, falling back to a generic
 // glyph/box when the image cannot be loaded. Returns true when CLICKED.
 bool attachmentThumbnail(const std::string& path, float sizePx);

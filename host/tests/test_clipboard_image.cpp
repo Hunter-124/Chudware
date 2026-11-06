@@ -23,6 +23,7 @@
 //   ✓ a negative seq is clamped instead of rendering "paste--001.png"
 
 #include "ui/clipboard_image.h"
+#include "ui/copilot/video_attachment.h"
 #include "tests/environment_test_support.h"
 
 #include <cstdio>
@@ -106,6 +107,30 @@ static void test_is_image_attachment() {
     CHECK(!ui::isImageAttachment("png"));
     // A directory component ending in .png does not make the file an image.
     CHECK(!ui::isImageAttachment("/tmp/shots.png/readme"));
+}
+
+static void test_video_attachment(const fs::path& tmp) {
+    using ui::copilot::isVideoAttachment;
+    for (const char* name : {"part.MP4", "part.mov", "part.webm", "part.MKV", "part.avi"})
+        CHECK(isVideoAttachment(name));
+    CHECK(!isVideoAttachment("part.mp4.txt"));
+    CHECK(!isVideoAttachment("/tmp/movie.mp4/notes"));
+    CHECK(!isVideoAttachment("image.png"));
+
+    const fs::path opaque = tmp / "capture";
+    auto put = [&](const char* bytes, size_t size) {
+        std::ofstream out(opaque, std::ios::binary | std::ios::trunc);
+        out.write(bytes, static_cast<std::streamsize>(size));
+    };
+    const char mp4[] = "\0\0\0\x18" "ftypisom" "\0\0\0\0";
+    put(mp4, sizeof(mp4) - 1);
+    CHECK(isVideoAttachment(opaque.string()));
+    const char matroska[] = "\x1a\x45\xdf\xa3" "\0\0\0\0\0\0\0\0\0\0\0\0";
+    put(matroska, sizeof(matroska) - 1);
+    CHECK(isVideoAttachment(opaque.string()));
+    const char heif[] = "\0\0\0\x18" "ftypheic" "\0\0\0\0";
+    put(heif, sizeof(heif) - 1);
+    CHECK(!isVideoAttachment(opaque.string()));
 }
 
 static void test_image_mime_for_path() {
@@ -204,6 +229,7 @@ int main() {
     chudware::test::setEnvironment("APPDATA", tmp.string().c_str());
 
     test_is_image_attachment();
+    test_video_attachment(tmp);
     test_image_mime_for_path();
     test_pasted_path_shape();
     test_pasted_path_sanitises_date_stamp();

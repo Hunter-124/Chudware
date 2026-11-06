@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 
 from .base import Provider, ProviderUnreachable
 
-DEFAULT_MODEL = "gpt-4o"
+DEFAULT_MODEL = "gpt-6-sol"
 
 
 def _normalize_base_url(base_url: str | None) -> str | None:

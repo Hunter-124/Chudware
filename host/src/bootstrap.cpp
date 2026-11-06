@@ -215,7 +215,7 @@ bool installedVenvFresh() {
   Payload pl;
   if (!findPayload(pl) || pl.wheelhouse.empty() ||
       !fileExists(pl.srcDir + "\\vendor\\python\\RUNTIME_WHEELS.lock") ||
-      !fileExists(pl.srcDir + "\\vendor\\chudcode\\CHUDCODE_ARTIFACT.lock"))
+      !fileExists(pl.srcDir + "\\vendor\\omp\\OMP_ARTIFACT.lock"))
     return false;
   const std::string py = runtimePython();
   const std::string venv = std::filesystem::path(py).parent_path().parent_path().string();
@@ -244,7 +244,7 @@ bool provisionRuntime(bool force, std::string &log) {
   }
   if (pl.wheelhouse.empty() ||
       !fileExists(pl.srcDir + "\\vendor\\python\\RUNTIME_WHEELS.lock") ||
-      !fileExists(pl.srcDir + "\\vendor\\chudcode\\CHUDCODE_ARTIFACT.lock")) {
+      !fileExists(pl.srcDir + "\\vendor\\omp\\OMP_ARTIFACT.lock")) {
     log = "no reviewed runtime wheelhouse (wheelhouse\\ + vendor\\python\\RUNTIME_WHEELS.lock) "
           "to provision from. For a source checkout, create a venv with "
           "`py -3.13 -m venv .venv-mcp` and `.venv-mcp\\Scripts\\python -m pip install -r "
@@ -343,9 +343,8 @@ bool runtimeReady() {
   return installedVenvFresh();
 }
 
-// Developer builds point libchudware at authored prompt files. Packaged builds
-// use the compiled protected-assets table and must never discover built-ins from
-// an environment variable or install-directory filesystem.
+// Developer builds point the service at authored prompt files. Packaged services use
+// compiled Python protected assets instead of discovering built-ins from this path.
 void ensurePromptsDir() {
 #ifdef CHUDWARE_DEVELOPER_BUILD
   if (!env_or("CHUDWARE_PROMPTS_DIR", "").empty())
@@ -576,7 +575,7 @@ bool provisionRuntime(bool force, std::string &log) {
   }
   if (pl.wheelhouse.empty() ||
       !fileExists((fs::path(pl.srcDir) / "vendor/python/RUNTIME_WHEELS.lock").string()) ||
-      !fileExists((fs::path(pl.srcDir) / "vendor/chudcode/CHUDCODE_ARTIFACT.lock").string())) {
+      !fileExists((fs::path(pl.srcDir) / "vendor/omp/OMP_ARTIFACT.lock").string())) {
     log = "no reviewed runtime wheelhouse (wheelhouse/ + vendor/python/RUNTIME_WHEELS.lock) "
           "to provision from. For a source checkout, run scripts/provision_venv.sh and set "
           "CHUDWARE_PYTHON to .venv-mcp/bin/python.";
@@ -670,7 +669,7 @@ bool runtimeReady() {
   Payload pl;
   if (!findPayload(pl) || pl.wheelhouse.empty() ||
       !fileExists((fs::path(pl.srcDir) / "vendor/python/RUNTIME_WHEELS.lock").string()) ||
-      !fileExists((fs::path(pl.srcDir) / "vendor/chudcode/CHUDCODE_ARTIFACT.lock").string()))
+      !fileExists((fs::path(pl.srcDir) / "vendor/omp/OMP_ARTIFACT.lock").string()))
     return false;
   const std::string base = resolveBasePython();
   if (base.empty())

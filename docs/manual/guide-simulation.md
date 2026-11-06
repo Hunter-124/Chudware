@@ -15,7 +15,12 @@ run_fea_static(fixtures, loads, material) — linear static stress.
   material : "steel" | "aluminum" | "titanium" | "stainless" | "brass" | "abs" | "pla"
              (or an explicit dict with E_mpa / nu / density_g_cm3 / yield_mpa).
   Returns max von-Mises stress (MPa), max displacement (mm), and the min factor of safety
-  (yield / max stress). FoS > 1 means it holds; design to a target margin.
+  (yield / max stress). FoS above one is a result for the modeled load case and
+  material under the solver's assumptions; assess the required margin, convergence
+  and other failure modes before claiming adequacy.
+  Static/contact mesh fill-guard refusal: use a smaller mesh_size_mm and, if necessary,
+  lower min_size_mm (MCP sizes are millimetres; CLI -h values are metres). A retry may
+  still be under-resolved; examine mesh quality and perform convergence checks.
 
 run_fea_modal(fixtures, material, n_modes) — natural frequencies (Hz) of the held part.
 
@@ -123,6 +128,15 @@ Heavy solves: run_cfd_flow / run_fea_* accept background=True (run_cfd_accurate 
 background) → return a job_id immediately; poll get_job(job_id) for the result. This keeps a long
 solve from tripping the transport timeout (which would otherwise drop the session). After a
 restart, recover_parts() reloads auto-saved docs.
+get_job/wait_job status="done" means execution finished, NOT success. A completed
+result with ok:false also sets the polling reply's ok:false; error/code/reason/detail
+are exposed at the top level and the complete result remains under result.
+add_features can also hand off automatically with status="running", auto_backgrounded:true
+and job_id. That reply is acceptance, not completed geometry. The edit-part checked
+helper joins it and checks the completed result; without the helper, wait for the job
+and inspect its result before reading features, changes or id_map.
+Load _truncated.full_result before counting all features/frames
+or asserting that a requested collision/clearance pair is absent.
 
 CROSS-SIM HANDOFF (aicad.simhandoff/1 — contracts/sim_handoff.md):
   When one physics domain feeds another (1D piping → 3D CFD, hydraulic → piping /

@@ -68,7 +68,7 @@ class StructuralSectionsAdapter:
     def search(self, query: str, *,
                domain: str | None = None,
                filters: dict | None = None) -> list[dict]:
-        """Substring search over title + designation (fallback — index is primary)."""
+        """Substring search over identity and aliases (index is primary)."""
         if domain and domain != "section":
             return []
         norm = query.strip().lower()
@@ -79,7 +79,8 @@ class StructuralSectionsAdapter:
             title = (rec.get("title") or "").lower()
             designation = (rec.get("designation") or "").lower()
             standard = (rec.get("standard") or "").lower()
-            if norm in title or norm in designation or norm in standard:
+            if (norm in title or norm in designation or norm in standard
+                    or any(norm in alias.lower() for alias in rec["aliases"])):
                 results.append(rec)
         return results
 
@@ -118,11 +119,13 @@ def _make_aisc_record(name: str, props: dict) -> dict:
     # name is e.g. "W8X31" — normalise to "W8x31" for designation display
     designation = name.replace("X", "x")
     # Determine section type from name prefix for title
-    prefix = name[0] if name else "?"
+    prefix = next((p for p in ("HSS", "HP") if name.startswith(p)),
+                  name[0] if name else "?")
     section_types = {"W": "Wide Flange", "S": "S-Shape", "C": "Channel",
                      "L": "Angle", "HSS": "HSS", "HP": "HP Pile", "M": "Misc"}
     stype = section_types.get(prefix, "Section")
-    title = f"AISC {stype} {designation} structural section"
+    family = f"AISC {stype}"
+    title = f"{family} {designation.replace('x', '×')}"
 
     params: dict = {"nominal_size": designation, "standard": "AISC360"}
     # Carry native keys verbatim (A, d, bf, tf, tw, Ix, Sx, Zx, Iy, Sy, Zy, J, Cw)
@@ -134,6 +137,9 @@ def _make_aisc_record(name: str, props: dict) -> dict:
         "part_id":      f"section:AISC360:{designation}",
         "domain":       "section",
         "title":        title,
+        "family":       family,
+        "aliases":      [f"AISC {stype} {designation} structural section",
+                         "structural section"],
         "standard":     "AISC360",
         "designation":  designation,
         "params":       params,
@@ -156,7 +162,7 @@ def _make_aisc_record(name: str, props: dict) -> dict:
 def _make_lumber_record(nominal: str, props: dict) -> dict:
     """Build a PartRecord for a dressed lumber size."""
     designation = nominal  # e.g. "2x4"
-    title = f"Dressed lumber {designation} S4S structural section"
+    title = f"S4S Dressed Lumber {designation.replace('x', '×')}"
 
     params: dict = {"nominal_size": designation, "standard": "NDS"}
     # Carry native keys verbatim
@@ -167,6 +173,9 @@ def _make_lumber_record(nominal: str, props: dict) -> dict:
         "part_id":      f"section:NDS:{designation}",
         "domain":       "section",
         "title":        title,
+        "family":       "S4S Dressed Lumber",
+        "aliases":      [f"Dressed lumber {designation} S4S structural section",
+                         "structural section"],
         "standard":     "NDS",
         "designation":  designation,
         "params":       params,

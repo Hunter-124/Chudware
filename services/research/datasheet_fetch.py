@@ -27,12 +27,9 @@ from .common import HIGH, MEDIUM, envelope, fail, is_offline, now_ts
 _MAX_MD = 200_000  # cap markdown to protect the model window (matches fetch_page §3)
 
 #: Browser-fallback refusal reasons that must reach the model VERBATIM instead of
-#: being flattened into the generic ``network`` degradation. ``cooldown_active``
-#: means the site's 429/403 backoff is armed for longer than this tool's whole
-#: 180 s harness budget (``tool_guidance/research.py``), so it is not a transient
-#: fetch error the model should retry — it is a wall it must route around, and the
-#: refusal already carries ``retry_after_s`` and the remedy.
-_ACTIONABLE_BROWSER_REASONS = frozenset({"cooldown_active"})
+#: being flattened into the generic ``network`` degradation. ``rate_limited``
+#: includes the site's cooldown or HTTP 429 and carries ``retry_after_s``.
+_ACTIONABLE_BROWSER_REASONS = frozenset({"rate_limited"})
 
 
 def _load_extractor():
@@ -76,9 +73,7 @@ def _try_browser_fallback(
 
     Returns ``(data, session_profile_used, refusal)``. ``refusal`` carries the browser's
     own §6 envelope when it declined for a reason the model must ACT on rather than see
-    flattened into ``network`` — today that is ``cooldown_active``: the site's 429/403
-    backoff outlasts this tool's 180 s budget, so "could not fetch: HTTP 403" would be a
-    lie and burying it behind ``raise_for_status`` costs the caller its whole turn.
+    flattened into ``network`` — notably ``rate_limited`` and its retry delay.
     """
     try:
         from services.browser import profiles as _profiles
@@ -114,7 +109,7 @@ def _read_bytes(source: str) -> tuple[Optional[bytes], Optional[dict], Optional[
     browser fallback served the bytes (additive; ``None`` for the plain-fetch and local-file
     paths). When the fallback refuses with an actionable
     reason (:data:`_ACTIONABLE_BROWSER_REASONS`) that envelope IS the degradation returned,
-    so ``cooldown_active`` + ``retry_after_s`` survive to the tool boundary instead of being
+    so ``rate_limited`` + ``retry_after_s`` survive to the tool boundary instead of being
     replaced by ``raise_for_status``'s "HTTP 403" a line later.
     """
     s = str(source).strip()

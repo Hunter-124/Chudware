@@ -17,7 +17,7 @@ from services.agent.tiers import (
     profile_tier_for,
 )
 from tools.flywheel.bench.gym.runner import (
-    _ChudcodeCompletionProvider,
+    _OmpCompletionProvider,
     _tier_execution,
 )
 from tools.flywheel.bench.gym.diag.tool_validity import (
@@ -73,7 +73,7 @@ class TestOpenRouterTier:
         assert profile_tier_for("local-24k") == "local-24k"
         assert profile_tier_for("mid") == "mid"
 
-    def test_openrouter_tier_routes_identifiers_to_chudcode(self, monkeypatch):
+    def test_openrouter_tier_routes_identifiers_to_omp(self, monkeypatch):
         monkeypatch.delenv("CHUDWARE_PROVIDER", raising=False)
 
         route = _tier_execution("openrouter:anthropic/claude-opus-4")
@@ -121,7 +121,7 @@ class TestXaiTier:
         assert profile_tier_for("xai:grok-4.5") == "frontier"
         assert profile_tier_for("xai:grok-4-5") == "frontier"
 
-    def test_xai_tier_routes_identifiers_to_chudcode(self, monkeypatch):
+    def test_xai_tier_routes_identifiers_to_omp(self, monkeypatch):
         monkeypatch.delenv("CHUDWARE_PROVIDER", raising=False)
 
         route = _tier_execution("xai:grok-4-5")
@@ -130,8 +130,8 @@ class TestXaiTier:
         assert route["provider"] is None
         assert route["settings"] == {"provider": "xai", "model": "grok-4-5"}
 
-    def test_online_completion_adapter_uses_shared_chudcode_host(self, monkeypatch):
-        from services.agent import chudcode_host
+    def test_online_completion_adapter_uses_shared_omp_host(self, monkeypatch):
+        from services.agent import omp_host
 
         class Host:
             def __init__(self):
@@ -141,14 +141,15 @@ class TestXaiTier:
             def run_turn(self, params, emit):
                 self.turns.append(dict(params))
                 emit({"type": "assistant_delta", "text": "ignored"})
-                return {"ok": True, "result": "diagnostic answer"}
+                return {"ok": True, "terminal": {"type": "session_settled"},
+                        "result": "diagnostic answer"}
 
             def close_session(self, session_id):
                 self.closed.append(session_id)
 
         host = Host()
-        monkeypatch.setattr(chudcode_host, "get_default_chudcode_host", lambda: host)
-        provider = _ChudcodeCompletionProvider({"provider": "xai", "model": "grok-4-5"})
+        monkeypatch.setattr(omp_host, "get_default_omp_host", lambda: host)
+        provider = _OmpCompletionProvider({"provider": "xai", "model": "grok-4-5"})
 
         reply = provider.complete(
             "Return JSON only.",
@@ -167,6 +168,48 @@ class TestXaiTier:
         }
         assert host.turns[0]["max_tokens"] == 321
         assert host.closed == [host.turns[0]["session_id"]]
+
+    @pytest.mark.parametrize("result, message", [
+        ({"ok": False, "stop_reason": "provider_error", "reason": "provider rejected request"},
+         "provider rejected request"),
+        ({"ok": True, "result": "partial"}, "did not settle"),
+        ({"ok": True, "terminal": {"type": "session_settled"}, "result": ""},
+         "returned no text"),
+    ])
+    def test_online_completion_reports_failure(self, monkeypatch, result, message):
+        from services.agent import omp_host
+
+        class Host:
+            def run_turn(self, params, emit):
+                return result
+
+            def close_session(self, session_id):
+                pass
+
+        monkeypatch.setattr(omp_host, "get_default_omp_host", Host)
+        with pytest.raises(RuntimeError, match=message):
+            _OmpCompletionProvider({}).complete("system", [{"role": "user", "content": "hi"}])
+
+    @pytest.mark.parametrize("module, runner", [
+        ("feature_id", "run_feature_id"),
+        ("tool_validity", "run_tool_validity"),
+        ("vc_hygiene", "run_vc_hygiene"),
+        ("vision_fix", "run_vision_fix"),
+    ])
+    def test_provider_failure_is_excluded_from_diagnostic_score(self, module, runner):
+        import importlib
+
+        class Provider:
+            supports_vision = True
+
+            def complete(self, *args, **kwargs):
+                raise RuntimeError("provider rejected request")
+
+        result = getattr(importlib.import_module(
+            f"tools.flywheel.bench.gym.diag.{module}"), runner)(Provider())
+        assert result["score"] is None
+        assert result["n_errors"] == result["n_tasks"] > 0
+        assert "provider rejected request" in result["errors"]["first_detail"]
 
     def test_model_id_for_tier_xai(self):
         m = model_id_for_tier("xai:grok-4-5")

@@ -29,15 +29,20 @@
 #include <BRep_Builder.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>  // I1/I3: circle wires for the loft test
 #include <BRepBuilderAPI_MakeWire.hxx>
+#include <BRepBuilderAPI_Transform.hxx>
+#include <BRepCheck_Analyzer.hxx>
 #include <BRepGProp.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>  // near: flange bolt holes
 #include <GProp_GProps.hxx>
 #include <TopoDS_Compound.hxx>
 #include <TopoDS_Wire.hxx>
+#include <gp_Ax1.hxx>
 #include <gp_Ax2.hxx>
 #include <gp_Circ.hxx>
 #include <gp_Dir.hxx>
+#include <gp_Trsf.hxx>
 #include <gp_Pnt.hxx>
+#include <gp_Vec.hxx>
 
 #include "doc/document.h"
 #include "doc/picks.h"
@@ -256,6 +261,106 @@ TEST_CASE("fillet by edge selector: 4 vertical picks -> rounded corners survive"
     CHECK((hi[2] - lo[2]) == doctest::Approx(D).epsilon(1e-4));
 }
 
+TEST_CASE("fillet unions overlapping queries and selectors without duplicate edges") {
+    const double W = 40.0, H = 30.0, D = 20.0, R = 5.0;
+    const json selectors = vertical_edge_selectors(W, H, D);
+    REQUIRE(selectors.size() == 4);
+    const json query{{"of", "edge"}, {"parallel", "z"}};
+    auto build = [&](const json& edges) {
+        json doc{{"features", json::array({
+            sketch_feature("s1", "top", rect_entities(0, 0, W, H)),
+            json{{"id", "x1"}, {"type", "extrude"}, {"profile", "s1"}, {"depth", D}},
+            json{{"id", "f1"}, {"type", "fillet"}, {"body", "x1"}, {"radius", R},
+                 {"edges", edges}}
+        })}};
+        return compile_document(doc, json::object());
+    };
+    const CompileResult reference = build(query);
+    const CompileResult overlap = build(json::array({query, query, selectors[0]}));
+    REQUIRE(reference.ok);
+    REQUIRE(overlap.ok);
+    REQUIRE(overlap.body_count == 1);
+    const json& report = overlap.statuses.back().data.at("fillet");
+    CHECK(report.at("selected_edges") == 4);
+    CHECK(report.at("covered_edges") == 4);
+    CHECK(report.at("adjustment") == "none");
+    CHECK(overlap.volume == doctest::Approx(reference.volume).epsilon(1e-8));
+    const render::DocMesh mesh = parse(overlap);
+    REQUIRE(mesh.bodies.size() == 1);
+    CHECK(count_surf(mesh.bodies[0], 1) >= 4);
+    json repeated = selectors;
+    repeated.push_back(selectors[0]);
+    const CompileResult explicit_overlap = build(repeated);
+    REQUIRE(explicit_overlap.ok);
+    CHECK(explicit_overlap.statuses.back().data.at("fillet").at("selected_edges") == 4);
+    CHECK(explicit_overlap.statuses.back().data.at("fillet").at("covered_edges") == 4);
+    CHECK(explicit_overlap.volume == doctest::Approx(reference.volume).epsilon(1e-8));
+}
+
+TEST_CASE("one dangling or empty selection rejects the entire fillet") {
+    const double W = 40.0, H = 30.0, D = 20.0;
+    const json selectors = vertical_edge_selectors(W, H, D);
+    REQUIRE(selectors.size() == 4);
+    const json far{{"kind", "edge"}, {"centroid", {1000.0, 1000.0, 1000.0}}};
+    json edges;
+    SUBCASE("resolved selector and dangling selector") {
+        edges = json::array({selectors[0], far});
+    }
+    SUBCASE("resolved query and dangling selector") {
+        edges = json::array({json{{"of", "edge"}, {"parallel", "z"}}, far});
+    }
+    SUBCASE("resolved query and unmatched query") {
+        edges = json::array({json{{"of", "edge"}, {"parallel", "z"}},
+                             json{{"of", "edge"}, {"surf", "round"}}});
+    }
+    json doc{{"features", json::array({
+        sketch_feature("s1", "top", rect_entities(0, 0, W, H)),
+        json{{"id", "x1"}, {"type", "extrude"}, {"profile", "s1"}, {"depth", D}},
+        json{{"id", "f1"}, {"type", "fillet"}, {"body", "x1"}, {"radius", 2.0},
+             {"edges", edges}}
+    })}};
+    const CompileResult rejected = compile_document(doc, json::object());
+    CHECK_FALSE(rejected.ok);
+    CHECK_FALSE(rejected.statuses.back().ok);
+    CHECK_FALSE(rejected.statuses.back().error.empty());
+    CHECK(rejected.statuses.back().data.is_null());
+    REQUIRE(rejected.body_count == 1);
+    REQUIRE(rejected.shapes.size() == 1);
+    CHECK(BRepCheck_Analyzer(rejected.shapes.front()).IsValid());
+    GProp_GProps exact;
+    BRepGProp::VolumeProperties(rejected.shapes.front(), exact);
+    CHECK(exact.Mass() == doctest::Approx(W * H * D).epsilon(1e-8));
+    CHECK(rejected.volume == doctest::Approx(W * H * D).epsilon(1e-8));
+    const render::DocMesh mesh = parse(rejected);
+    REQUIRE(mesh.bodies.size() == 1);
+    CHECK(count_surf(mesh.bodies[0], 1) == 0);
+}
+
+TEST_CASE("an explicitly selected cylindrical seam rejects the entire fillet") {
+    const double R = 10.0, H = 20.0;
+    const json seam{{"of", "edge"}, {"surf", "line"}, {"parallel", "z"}};
+    const json rim{{"of", "edge"}, {"surf", "circle"}, {"side", "+z"}};
+    const json doc{{"features", json::array({
+        json{{"id", "c"}, {"type", "cylinder"}, {"radius", R}, {"height", H}},
+        json{{"id", "f"}, {"type", "fillet"}, {"radius", 1.0},
+             {"edges", json::array({rim, seam})}}
+    })}};
+    const CompileResult result = compile_document(doc, json::object());
+    CHECK_FALSE(result.ok);
+    REQUIRE(result.statuses.size() == 2);
+    CHECK_FALSE(result.statuses.back().ok);
+    CHECK_FALSE(result.statuses.back().error.empty());
+    CHECK(result.statuses.back().data.is_null());
+    REQUIRE(result.body_count == 1);
+    REQUIRE(result.shapes.size() == 1);
+    CHECK(BRepCheck_Analyzer(result.shapes.front()).IsValid());
+    GProp_GProps exact;
+    // CompileResult::volume follows the display triangulation; evaluate the
+    // surviving B-rep when comparing against the analytical cylinder.
+    BRepGProp::VolumeProperties(result.shapes.front(), exact);
+    CHECK(exact.Mass() == doctest::Approx(3.141592653589793 * R * R * H).epsilon(1e-8));
+}
+
 // (b) DANGLING SELECTOR (happy path). The same sketch+extrude, but the fillet carries a
 //     SINGLE edge selector whose centroid sits far outside the body ([1000,1000,1000]).
 //     No unique body edge lies within tolerance of it, so the selector dangles: the
@@ -288,14 +393,14 @@ TEST_CASE("dangling edge selector: fillet errors, extrude body survives as a box
     CHECK_FALSE(r.ok);  // the dangling fillet is a contained error
     REQUIRE(r.statuses.size() == 3);
 
-    // Locate the fillet feature's status: !ok with a non-empty error mentioning dangling.
+    // Locate the fillet feature's failed status.
     bool found_fillet = false;
     for (const auto& s : r.statuses) {
         if (s.id == "f1") {
             found_fillet = true;
             CHECK_FALSE(s.ok);
             CHECK_FALSE(s.error.empty());
-            CHECK(s.error.find("dangling") != std::string::npos);
+            CHECK(s.data.is_null());
         }
     }
     CHECK(found_fillet);
@@ -681,13 +786,12 @@ TEST_CASE("C5 inner/outer: picks bore (concave) not small-radius convex fillet")
 
     // Step 2: fillet the 4 vertical corner edges with R=2 < BORE_R (adds 4 convex quarter-
     // cylinders of R=2). dir=Z selects only the vertical (parallel-to-Z) straight edges.
-    TopoDS_Shape filleted = geom::fillet_edges(
+    const auto fillet = geom::fillet_edges(
         body, FILLET_R, std::optional<Eigen::Vector3d>(Eigen::Vector3d(0.0, 0.0, 1.0))
     );
-    // If filleting fails for any reason, fall back to the unfilleted body (bore-only path
-    // below still exercises concavity via the C5 fallback).
-    const bool has_fillets = !filleted.IsNull();
-    const TopoDS_Shape& test_body = has_fillets ? filleted : body;
+    REQUIRE_MESSAGE(fillet.failure == geom::FilletFailure::none, fillet.reason);
+    REQUIRE_FALSE(fillet.shape.IsNull());
+    const TopoDS_Shape& test_body = fillet.shape;
 
     auto q = [&](json query) { return resolve_geom_query(test_body, query); };
     auto fa = [](const QueryPicks& p, size_t i) {
@@ -696,7 +800,7 @@ TEST_CASE("C5 inner/outer: picks bore (concave) not small-radius convex fillet")
 
     const double bore_area = 2.0 * 3.14159265358979 * BORE_R * H;  // ~628mm²
 
-    if (has_fillets) {
+    {
         // At least 5 cylindrical faces: 1 bore (concave) + 4 quarter-corner fillets (convex).
         QueryPicks all_round = q(json{{"of", "face"}, {"surf", "round"}});
         REQUIRE(all_round.faces.size() >= 2);
@@ -1200,4 +1304,104 @@ TEST_CASE("geom query near: ranks by distance to the geometry, ties to the neare
         flange, json{{"of", "face"}, {"near", holes.selectors.at(px)["centroid"]}, {"count", 1}});
     REQUIRE(back.faces.size() == 1);
     CHECK(back.selectors.at(0)["sid"] == holes.selectors.at(px)["sid"]);
+}
+
+TEST_CASE("fastener geometry reports trimmed world-space bore and seat evidence") {
+    using chudware::doc::add_fastener_geometry;
+    using chudware::doc::resolve_geom_query;
+    auto cylinder = [](double radius, double z, double height) {
+        return BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(10, 10, z), gp_Dir(0, 0, 1)),
+                                        radius, height).Shape();
+    };
+    auto rows = [&](const TopoDS_Shape& shape, const char* surf) {
+        auto picks = resolve_geom_query(shape, json{{"of", "face"}, {"surf", surf}});
+        REQUIRE(picks.error.empty());
+        add_fastener_geometry(shape, picks);
+        return picks.selectors;
+    };
+    const TopoDS_Shape block = geom::make_box(20, 20, 20);
+    SUBCASE("through hole") {
+        const TopoDS_Shape shape = geom::cut(block, cylinder(2, -1, 22));
+        REQUIRE_FALSE(shape.IsNull());
+        const auto found = rows(shape, "cylinder");
+        REQUIRE(found.size() == 1);
+        const auto& c = found[0]["cylinder"];
+        CHECK(c["kind"] == "bore");
+        CHECK(c["complete_cylinder"] == true);
+        CHECK(c["radius"].get<double>() == doctest::Approx(2));
+        CHECK(c["axial_start"][2].get<double>() == doctest::Approx(0));
+        CHECK(c["axial_end"][2].get<double>() == doctest::Approx(20));
+        for (const auto& end : c["ends"]) {
+            CHECK(end["classification"] == "open_to_exterior");
+            CHECK(end["adjacency_complete"] == true);
+            REQUIRE(end["adjacent_faces"].size() == 1);
+            CHECK(end["adjacent_faces"][0]["type"] == "plane");
+        }
+    }
+    SUBCASE("blind hole") {
+        const TopoDS_Shape shape = geom::cut(block, cylinder(2, 8, 13));
+        REQUIRE_FALSE(shape.IsNull());
+        const auto found = rows(shape, "cylinder");
+        REQUIRE(found.size() == 1);
+        const auto& c = found[0]["cylinder"];
+        CHECK(c["axial_start"][2].get<double>() == doctest::Approx(8));
+        CHECK(c["axial_end"][2].get<double>() == doctest::Approx(20));
+        CHECK(c["ends"][0]["classification"] == "closed_bottom");
+        CHECK(c["ends"][0]["adjacency_complete"] == true);
+        CHECK(c["ends"][1]["classification"] == "open_to_exterior");
+    }
+    SUBCASE("counterbore and finite annular shoulder") {
+        const TopoDS_Shape shape = geom::cut(geom::cut(block, cylinder(2, -1, 22)),
+                                             cylinder(4, 15, 6));
+        REQUIRE_FALSE(shape.IsNull());
+        const auto found = rows(shape, "cylinder");
+        REQUIRE(found.size() == 2);
+        for (const auto& row : found) {
+            const auto& c = row["cylinder"];
+            CHECK(c["complete_cylinder"] == true);
+            const int shoulder = c["radius"].get<double>() < 3 ? 1 : 0;
+            CHECK(c["ends"][shoulder]["classification"] == "coaxial_transition");
+        }
+        const auto planes = rows(shape, "plane");
+        bool saw_ring = false;
+        for (const auto& row : planes) {
+            const auto& ring = row["bearing_annulus"];
+            if (!ring.is_object()) continue;
+            saw_ring = true;
+            CHECK(ring["inner_radius"].get<double>() == doctest::Approx(2));
+            CHECK(ring["outer_radius"].get<double>() == doctest::Approx(4));
+            CHECK(ring["center"][2].get<double>() == doctest::Approx(15));
+            CHECK(ring["adjacency_complete"] == true);
+        }
+        CHECK(saw_ring);
+    }
+    SUBCASE("partial cylinder is explicitly incomplete but has exact extent") {
+        const TopoDS_Shape shape =
+            BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(0, 0, 4), gp_Dir(0, 0, 1)),
+                                     3, 9, M_PI).Shape();
+        const auto found = rows(shape, "cylinder");
+        REQUIRE(found.size() == 1);
+        const auto& c = found[0]["cylinder"];
+        CHECK(c["complete_cylinder"] == false);
+        CHECK(c["status"] == "partial_cylinder");
+        CHECK(c["axial_start"][2].get<double>() == doctest::Approx(4));
+        CHECK(c["axial_end"][2].get<double>() == doctest::Approx(13));
+        CHECK(c["ends"][0]["classification"] == "unknown");
+    }
+    SUBCASE("rotated and translated cylinder") {
+        gp_Trsf pose;
+        pose.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(0, 1, 0)), M_PI / 2);
+        pose.SetTranslationPart(gp_Vec(50, 5, 7));
+        const TopoDS_Shape shape = BRepBuilderAPI_Transform(cylinder(3, 0, 12), pose, true).Shape();
+        const auto found = rows(shape, "cylinder");
+        REQUIRE(found.size() == 1);
+        const auto& c = found[0]["cylinder"];
+        CHECK(c["kind"] == "boss");
+        CHECK(c["complete_cylinder"] == true);
+        CHECK(c["axis"][0].get<double>() == doctest::Approx(1));
+        CHECK(c["axial_start"][0].get<double>() == doctest::Approx(50));
+        CHECK(c["axial_end"][0].get<double>() == doctest::Approx(62));
+        CHECK(c["axial_start"][1].get<double>() == doctest::Approx(15));
+        CHECK(c["axial_start"][2].get<double>() == doctest::Approx(-3));
+    }
 }

@@ -169,6 +169,71 @@ def test_interface_check_world_placed_assembly(tmp_path, dx):
             _call("close_part", {"doc_id": assembly})
         _call("close_part", {"doc_id": plate})
 
+def test_servo_clearance_and_mated_contact_faces(tmp_path):
+    """Coaxial clearance and grommet bores are not offset holes or side-face gaps."""
+    parts = []
+    assembly = None
+    try:
+        for diameter in (3.4, 4.8):
+            doc = _fresh_doc("servo_mount")
+            parts.append(doc)
+            result, _ = _call("add_features", {"doc_id": doc, "ops": [
+                cb.feat("box", "Plate", {"length": cb.dim(60), "width": cb.dim(40),
+                                         "height": cb.dim(10)}),
+                cb.feat("bolt_circle", "Holes", {"diameter": diameter, "count": 4, "pcd": 30},
+                        {"face": {"of": "face", "side": "top"}}),
+            ]})
+            assert result["ok"], result
+            path = str(tmp_path / f"mount_{diameter}.step+")
+            result, _ = _call("save_part", {"doc_id": doc, "path": path})
+            assert result["ok"], result
+        result, _ = _call("new_assembly", {"name": f"servo_mount_{next(_STACK_SEQ)}"})
+        assembly = result["doc_id"]
+        for diameter, placement in ((3.4, [0, 0, 0]), (4.8, [0, 0, 10])):
+            result, _ = _call("asm_add_component", {"doc_id": assembly,
+                              "path": str(tmp_path / f"mount_{diameter}.step+"), "at": placement})
+            assert result["ok"], result
+        result, _ = _call("asm_mate", {"doc_id": assembly, "mate_type": "lock",
+                           "a": {"component": "k1", "query": "top"},
+                           "b": {"component": "k2", "query": "bottom"}})
+        assert result["ok"] and result["converged"], result
+        for fastener, verdict, status in (("M3", "clear", "pass"),
+                                          ("M5", "insufficient", "fail"),
+                                          (None, "unverified", "pass")):
+            result, _ = _call("interface_check", {"doc_id": assembly, "fastener": fastener})
+            assert result["ok"] and result["status"] == status, result
+            checks = result["pairs"][0]["checks"]
+            holes = checks["hole_pattern"]
+            assert len(holes["matched"]) == 4 and not holes["misaligned"], holes
+            assert all(h["pos_delta_mm"] == 0 and h["diameter_fit"] == "different"
+                       and h["clearance_verdict"] == verdict for h in holes["matched"]), holes
+            contact = checks["contact_plane"]
+            assert contact["status"] == "pass" and contact["gap_mm"] == pytest.approx(0), contact
+            assert contact["reference_source"].startswith("mate:"), contact
+            assert not any("0.00 mm toward" in f.get("fix", "") for f in result["findings"])
+    finally:
+        if assembly:
+            _call("close_part", {"doc_id": assembly})
+        for doc in parts:
+            _call("close_part", {"doc_id": doc})
+
+
+def test_contact_requires_references_and_accepts_explicit_faces():
+    doc = _build_stack(dx=0.0)
+    result, _ = _call("interface_check", {"doc_id": doc, "components": ["f2", "f3"]})
+    contact = result["pairs"][0]["checks"]["contact_plane"]
+    assert contact["status"] == "skip", contact
+    faces = []
+    for body_id, component, side in ((1, "f2", "top"), (2, "f3", "bottom")):
+        matches = cb.call("doc_query", {"doc_id": doc,
+                          "query": {"of": "face", "side": side, "body_id": body_id}})["matches"]
+        faces.append({"component": component, "sid": matches[0]["sid"]})
+    result, _ = _call("interface_check", {"doc_id": doc, "components": ["f2", "f3"],
+                                          "contact_faces": faces})
+    contact = result["pairs"][0]["checks"]["contact_plane"]
+    assert contact["status"] == "pass" and contact["reference_source"] == "explicit", contact
+    assert contact["gap_mm"] == pytest.approx(0), contact
+
 
 # --- the worked regression: misaligned flagged, corrected passes -------------------------------
 def test_interface_check_misaligned_bracket_plate_is_flagged():

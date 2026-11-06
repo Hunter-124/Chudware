@@ -216,10 +216,23 @@ std::string foldToAtlasGlyphs(const std::string& text) {
 
 bool agentTextMayChange(const std::string& text) {
     const size_t n = text.size();
-    for (size_t i = 0; i < n; ++i) {
+    for (size_t i = 0; i < n;) {
         const unsigned char c = (unsigned char)text[i];
-        if (c >= 0x80) return true;              // the only bytes foldToAtlasGlyphs rewrites
-        if (c == 'd' && hasDocPrefix(text, i)) return true;
+        if (c >= 0x80) {
+            unsigned cp = 0;
+            if (!decodeUtf8(text, i, cp) || !atlasCovers(cp)) return true;
+            continue;
+        }
+        if (c == 'd' && hasDocPrefix(text, i)) {
+            size_t end = i + 7;
+            while (end < n && isHexDigit(text[end])) ++end;
+            if (end > i + 7 && (i == 0 || !isTokenChar(text[i - 1])) &&
+                (end == n || !isTokenChar(text[end])) &&
+                !(i >= 2 && text[i - 1] == '(' && text[i - 2] == ' ' &&
+                  end < n && text[end] == ')'))
+                return true;
+        }
+        ++i;
     }
     return false;
 }

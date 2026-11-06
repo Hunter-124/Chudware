@@ -8,7 +8,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <set>
 #include <string>
@@ -27,6 +29,7 @@
 #include "layout.h"  // drawConfigurationsBody fallback
 
 #include "../core/app_state.h"
+#include "../core/engine_events.h"
 #ifdef __EMSCRIPTEN__
 #include "../core/jobs.h"
 #endif
@@ -47,9 +50,11 @@
 #include "widgets/interwebz.h"  // Skills/Rules two-column editors
 #include "ui/provider_logos.h"  // ui::drawProviderLogo/providerBrandColor (Providers list badges)
 #include "provider_usage.h"  // ui::UsageAccount/UsageWindow + THE subscription_* poller
-#include "chudcode_descriptors.h"  // ui::parseChudcode* — Chudcode worker payload parsing
+#include "omp_descriptors.h"  // ui::parseOmp* — Omp worker payload parsing
+#include "omp_session_actions.h"
 #include "metrics.h"  // ui::metrics::px/stroke — DPI-scaled Settings gutter + usage rings
 #include "tesseract.h"  // ui::drawTesseract + TesseractAnim — Appearance > Brand mark picker
+#include "anim.h"
 #include "../ui_theme.h"  // ui::busyLabel — the one inline "working" indicator
 #include "widgets/kit.h"  // ui::kit::sectionHeader — the one accent-caption treatment
 #include "ai/rules_authoring.h"  // ui::drawRulesAuthoringPopup (Settings → AI → Rules → New rule…)
@@ -57,7 +62,7 @@
 
 
 // ---- C22b prompt editor state ----
-// Per-role editor buffer and metadata, lazily loaded from get_prompts_v2.
+// Per-role editor buffer and metadata, lazily loaded from list_editable_prompts.
 namespace {
 struct PromptRecord {
     std::string role;
@@ -67,11 +72,27 @@ struct PromptRecord {
     // 16 KB buffer (matches the card spec)
     std::vector<char> buf{std::vector<char>(16 * 1024, 0)};
     int builtinLen = 0;  // length of the built-in text (for diff indicator)
+    bool   dirty = false;      // edited since the last override write (debounced autosave pending)
+    double lastEdit = 0.0;     // ImGui::GetTime() of the last keystroke
 };
 static std::vector<PromptRecord> s_promptRecs;
 static bool s_promptsLoaded = false;
 static bool s_promptsLoading = false;
 static int  s_selectedRole  = 0;
+static bool s_promptSystemSelected = false;
+static std::string s_pendingPromptSelection;
+
+static void selectPendingPrompt() {
+    if (s_pendingPromptSelection.empty() || !s_promptsLoaded) return;
+    for (int i = 0; i < (int)s_promptRecs.size(); ++i) {
+        if (s_promptRecs[i].role == s_pendingPromptSelection) {
+            s_selectedRole = i;
+            s_promptSystemSelected = false;
+            break;
+        }
+    }
+    s_pendingPromptSelection.clear();
+}
 
 static std::string s_promptsError;
 static void applyPromptCatalog(const nlohmann::json& result) {
@@ -86,11 +107,19 @@ static void applyPromptCatalog(const nlohmann::json& result) {
         s_promptsLoaded = false;
         return;
     }
+    const bool selectedSystem = s_promptSystemSelected;
+    const std::string selectedRole = s_selectedRole >= 0 && s_selectedRole < (int)s_promptRecs.size()
+        ? s_promptRecs[s_selectedRole].role : std::string();
     const nlohmann::json* recs = &result;
     if (result.is_object() && result.contains("prompts") && result["prompts"].is_array())
         recs = &result["prompts"];
     s_promptRecs.clear();
-    if (!recs->is_array()) { s_promptsLoaded = true; return; }
+    if (!recs->is_array()) {
+        s_selectedRole = 0;
+        s_promptsLoaded = true;
+        selectPendingPrompt();
+        return;
+    }
     for (auto& r : *recs) {
         if (!r.is_object()) continue;
         PromptRecord pr;
@@ -108,52 +137,89 @@ static void applyPromptCatalog(const nlohmann::json& result) {
     // Stable alpha order for power-user scanning
     std::sort(s_promptRecs.begin(), s_promptRecs.end(),
               [](const PromptRecord& a, const PromptRecord& b) { return a.role < b.role; });
+    s_selectedRole = selectedSystem ? (int)s_promptRecs.size() : 0;
+    if (!selectedRole.empty()) {
+        for (int i = 0; i < (int)s_promptRecs.size(); ++i) {
+            if (s_promptRecs[i].role == selectedRole) {
+                s_selectedRole = i;
+                break;
+            }
+        }
+    }
     s_promptsLoaded = true;
+    selectPendingPrompt();
+}
+
+static std::string s_promptSaveError;
+// Writes the role's override file (creating its directory — the worker only reports the path).
+// A failure is returned, never swallowed: the caller keeps the record dirty and shows `err`.
+static bool savePromptOverride(PromptRecord& pr, std::string& err) {
+    if (pr.overridePath.empty()) {
+        err = "no override path for role " + pr.role;
+        return false;
+    }
+    std::error_code ec;
+    const std::filesystem::path path(pr.overridePath);
+    if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path(), ec);
+    std::ofstream f(path, std::ios::out | std::ios::trunc);
+    if (!f.is_open()) {
+        err = "cannot write " + pr.overridePath;
+        return false;
+    }
+    f << pr.buf.data();
+    f.flush();
+    if (!f) {
+        err = "write failed: " + pr.overridePath;
+        return false;
+    }
+    pr.overridden = true;
+    return true;
+}
+// Per-role prompt editor autosave: an edit marks its record dirty and a 1 s debounce writes the
+// override file; force-flushed on close, before the catalog is reloaded and at app exit.
+static void flushPromptEdits(bool force) {
+    for (auto& pr : s_promptRecs) {
+        if (!pr.dirty) continue;
+        if (!force && ImGui::GetTime() - pr.lastEdit < 1.0) continue;
+        std::string err;
+        if (savePromptOverride(pr, err)) {
+            pr.dirty = false;
+            s_promptSaveError.clear();
+        } else {
+            // Not retried every frame (the forced flush runs each frame while the modal is
+            // closed): the error stays visible and the next keystroke tries again.
+            pr.dirty = false;
+            s_promptSaveError = err;
+        }
+    }
 }
 
 static void loadPrompts(AppState& st) {
     if (s_promptsLoading) return;
-    // Prefer list_editable_prompts (YAML mission roles + core .md, with overrides).
-    // Fall back to get_prompts_v2 (C++ core kRoles catalog) when the worker is old.
+    flushPromptEdits(/*force=*/true);  // a catalog rebuild must not discard pending edits
+    // list_editable_prompts is the only catalog source (YAML mission roles with overrides).
     s_promptsLoading = true;
     s_promptsError.clear();
     st.rpc.call("list_editable_prompts", nlohmann::json::object(),
-                [&st](const core::RpcResult& first) {
-        if (first.ok) {
-            s_promptsLoading = false;
-            applyPromptCatalog(first.result);
+                [&st](const core::RpcResult& r) {
+        s_promptsLoading = false;
+        if (!r.ok) {
+            s_promptsError = r.err.empty() ? "prompt catalog unavailable" : r.err;
+            st.addLog("[err] prompts catalog: " + s_promptsError);
+            s_promptsLoaded = false;
             return;
         }
-        // Match the synchronous path: only a transport failure falls back to the legacy RPC.
-        st.rpc.call("get_prompts_v2", nlohmann::json::object(),
-                    [&st](const core::RpcResult& fallback) {
-            s_promptsLoading = false;
-            if (!fallback.ok) {
-                s_promptsError = fallback.err.empty()
-                    ? "prompt catalog unavailable" : fallback.err;
-                st.addLog("[err] prompts catalog: " + s_promptsError);
-                s_promptsLoaded = false;
-                return;
-            }
-            applyPromptCatalog(fallback.result);
-        }, 20000);
+        applyPromptCatalog(r.result);
     }, 20000);
 }
 
 
-static void savePromptOverride(PromptRecord& pr) {
-    // Write the buffer contents to the override file
-    std::ofstream f(pr.overridePath, std::ios::out | std::ios::trunc);
-    if (f.is_open()) {
-        f << pr.buf.data();
-        pr.overridden = true;
-    }
-}
 
 static void resetPromptOverride(PromptRecord& pr, AppState& st) {
     // Delete the override file
     std::remove(pr.overridePath.c_str());
     pr.overridden = false;
+    pr.dirty = false;  // the override is being deleted, not saved
     // Reload built-in text from the worker
     s_promptsLoaded = false;
     loadPrompts(st);
@@ -174,6 +240,14 @@ static void flushSystemPromptOverride(AppState& st, bool force) {
     if (!force && ImGui::GetTime() - s_spOverrideLastEdit < 1.0) return;
     commitSystemPromptOverride(st);
 }
+// Every free-text editor on Settings > AI > Prompts autosaves through this: called each frame
+// from drawSettingsModal (a tab switch cannot strand an edit), forced on close and at app exit.
+static void flushPromptEditors(AppState& st, bool force) {
+    flushSystemPromptOverride(st, force);
+    flushPromptEdits(force);
+}
+// Skills + Rules editors (RPC-backed autosave); defined with those editors below.
+static void flushSkillRuleEdits(AppState& st, bool force);
 struct BoxMirrorUiState {
     bool statusInFlight = false;
     bool statusRefreshPending = false;
@@ -214,6 +288,8 @@ static void requestBoxStatus(AppState& st) {
         s_boxMirrorUi.accountStatus = "Not connected: worker unavailable";
         return;
     }
+    // The worker reads Box settings from disk, not the GUI's pending config overlay.
+    flushConfigWrites();
     s_boxMirrorUi.statusInFlight = true;
     st.rpc.call("box_status", nlohmann::json{{"live", true}},
                 [&st](const core::RpcResult& r) {
@@ -266,6 +342,7 @@ static void requestBoxStatus(AppState& st) {
 
 static void beginBoxOAuthLogin(AppState& st) {
     if (s_boxMirrorUi.connectInFlight || !st.workerStarted) return;
+    flushConfigWrites();
     s_boxMirrorUi.connectInFlight = true;
     s_boxMirrorUi.actionStatus = "Starting Box sign-in\xe2\x80\xa6";
     st.rpc.call("box_oauth_login", nlohmann::json::object(),
@@ -303,6 +380,7 @@ static void beginBoxOAuthLogin(AppState& st) {
 
 static void beginBoxSync(AppState& st, const std::string& projectRoot) {
     if (s_boxMirrorUi.syncInFlight || !st.workerStarted || projectRoot.empty()) return;
+    flushConfigWrites();
     s_boxMirrorUi.syncInFlight = true;
     s_boxMirrorUi.actionStatus = "Syncing project to Box\xe2\x80\xa6";
     st.rpc.call("box_sync", nlohmann::json{{"path", projectRoot}},
@@ -445,9 +523,12 @@ static bool settingsPopupRowSelectable(
     ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, ImVec2(0.0f, 0.5f));
     const bool clicked = ImGui::Selectable(label, selected, ImGuiSelectableFlags_None,
-                                           ImVec2(rowWidth, height));
+                                           ImVec2(rowWidth, height > 0.0f ? height :
+                                                            ImGui::GetFrameHeight()));
     const bool hovered = ImGui::IsItemHovered();
+    ImGui::PopStyleVar();
     ImGui::PopStyleColor(3);
 
     if (selected || hovered) {
@@ -458,6 +539,11 @@ static bool settingsPopupRowSelectable(
             ImGui::GetColorU32(ImVec4(ui::palette.accent[0], ui::palette.accent[1],
                                      ui::palette.accent[2], 0.30f)),
             style.PopupRounding, cornerRound);
+    }
+    if (hovered && label[0] != '#' && ImGui::CalcTextSize(label).x > rowWidth) {
+        const ImGuiLastItemData rowItem = GImGui->LastItemData;
+        ui::kit::tooltip(label);
+        GImGui->LastItemData = rowItem;
     }
     return clicked;
 }
@@ -495,12 +581,11 @@ static bool settingsChildRowSelectable(const char* label, bool selected, float c
 // frame is drawn clear and without its stock arrow button, then the rounded control face, the
 // elided preview and a vector chevron are painted on the parent draw list — the same look as
 // kit::fieldEnum / kit::fieldCombo, which cannot host custom popup content. The face spans the
-// caller's item width; the popup is pinned (min == max, so a row sized from the popup interior
-// can never feed its auto-fit) at least face-wide and wide enough for `widestLabel`, but never
-// past the work area's right edge.
+// caller's item width. Pin the popup width to avoid auto-fit feedback, bound its height, and let
+// ImGui place it on either side of the face when there isn't enough room on the right.
 static bool settingsBeginPopupRowCombo(
     const char* id, const char* preview, float widestLabel,
-    ImGuiComboFlags flags = ImGuiComboFlags_None) {
+    ImGuiComboFlags flags = ImGuiComboFlags_None, float minPopupWidth = 0.0f) {
     const ImGuiStyle& style = ImGui::GetStyle();
     const float h = ImGui::GetFrameHeight();
     const float w = ImMax(ImGui::CalcItemWidth(), h * 3.0f);
@@ -512,11 +597,19 @@ static bool settingsBeginPopupRowCombo(
     const ImU32 fill = ImGui::GetColorU32(hovered ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg);
     const ImU32 fillOpen = ImGui::GetColorU32(ImGuiCol_FrameBgActive);
 
-    const ImGuiViewport* vp = ImGui::GetMainViewport();
-    const float room = ImMax(vp->WorkPos.x + vp->WorkSize.x - p0.x, w);
-    const float popupW = ImMin(ImMax(w, widestLabel + 2.0f * style.FramePadding.x), room);
+    const ImGuiViewport* vp = ImGui::GetWindowViewport();
+    const float room = ImMax(w, vp->WorkSize.x - 2.0f * style.DisplaySafeAreaPadding.x);
+    const float popupW = ImMin(ImMax(ImMax(w, minPopupWidth),
+                                     widestLabel + 2.0f * style.FramePadding.x +
+                                         style.ScrollbarSize), room);
+    // A width constraint replaces ImGui's usual combo height constraint entirely. Reapply a
+    // viewport-bounded limit so long catalogs scroll instead of covering the whole display.
+    const float popupH = ImMin(h * 13.0f, ImMax(h,
+        vp->WorkSize.y - 2.0f * style.DisplaySafeAreaPadding.y));
     ImGui::SetNextItemWidth(w);
-    ImGui::SetNextWindowSizeConstraints(ImVec2(popupW, 0.0f), ImVec2(popupW, FLT_MAX));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(popupW, 0.0f), ImVec2(popupW, popupH));
+    // A translucent popup makes underlying table rows read as overlapping popup content.
+    ImGui::SetNextWindowBgAlpha(1.0f);
     const ImVec4 clear(ui::palette.frameBg[0], ui::palette.frameBg[1], ui::palette.frameBg[2],
                        0.0f);
     ImGui::PushStyleColor(ImGuiCol_FrameBg, clear);
@@ -527,7 +620,15 @@ static bool settingsBeginPopupRowCombo(
     ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, ui::metrics::stroke(1.0f));
     // Nonzero popup padding is dead space the edge-to-edge row wash cannot paint over.
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    const ImGuiID comboId = ImGui::GetID(id);
     const bool open = ImGui::BeginCombo(id, "", flags | ImGuiComboFlags_NoArrowButton);
+    // BeginCombo does not publish an ItemInfo label of its own. Keep the real closed
+    // control observable to the GUI scenario without replacing its pointer target.
+    if (!open && ImGui::GetItemID() == comboId) {
+        ImGuiContext& g = *GImGui;
+        IMGUI_TEST_ENGINE_ITEM_INFO(comboId, id, g.LastItemData.StatusFlags);
+        IMGUI_TEST_ENGINE_ITEM_INFO(comboId, preview, g.LastItemData.StatusFlags);
+    }
     // Border/padding are consumed when the popup window begins. Row spacing is read live by the
     // popup content and the row wash rounds its corners with PopupRounding, so those two stay
     // pushed until settingsEndPopupRowCombo.
@@ -1230,27 +1331,27 @@ static void drawSubscriptionAccounts(AppState& st, float sc) {
     }
 }
 
-// ---- Chudcode provider manager (Settings → Providers) -------------------------------
-// Two-pane sign-in manager driven by the persistent Chudcode worker service
-// (chudcode_provider_list / chudcode_auth_state / chudcode_validate_key|set_key|remove_key|
-// logout / chudcode_login). The UI holds no auth truth: it renders the latest sanitized
+// ---- Omp provider manager (Settings → Providers) -------------------------------
+// Two-pane sign-in manager driven by the persistent Omp worker service
+// (omp_provider_list / omp_auth_state / omp_set_key / omp_remove_key /
+// logout / omp_login). The UI holds no auth truth: it renders the latest sanitized
 // descriptor snapshot and re-polls on open and on a short TTL.
 // Field-for-field the sanitized descriptor the worker emits — parsing lives in
-// chudcode_descriptors.cpp so host/tests can exercise the REAL rules.
-using OmpProviderRow = ui::ChudcodeProviderDesc;
+// omp_descriptors.cpp so host/tests can exercise the REAL rules.
+using OmpProviderRow = ui::OmpProviderDesc;
 struct OmpAccountRow {
-    int credentialId = 0;
+    int credentialId = -1;
     std::string accountId;
     std::string email;
     std::string orgName;
 };
 // A credential the service itself has taken out of service (revoked token, refresh that came
-// back invalid_grant, key the provider now rejects). chudcode_auth_state reports these per
-// provider in `disabled[]`; `id` is the credential rowid and is what chudcode_remove_key
+// back invalid_grant, key the provider now rejects). omp_auth_state reports these per
+// provider in `disabled[]`; `id` is the credential rowid and is what omp_remove_key
 // wants as its `accountId`, so the panel can actually clear the dead row instead of only
 // re-polling it.
 struct OmpDisabledRow {
-    std::string id;            // credential rowid, verbatim (chudcode_remove_key accountId)
+    std::string id;            // credential rowid, verbatim (omp_remove_key accountId)
     std::string cause;         // service's reason text — the only honest thing to show the user
     std::string type;          // api_key | oauth
     std::string email;         // may be absent/null
@@ -1266,7 +1367,7 @@ struct OmpProvDetail {
     std::vector<std::string> usageNotes;
     std::vector<OmpDisabledRow> disabled;
 };
-// One-call Chudcode OAuth login: chudcode_login {providerId} runs the whole flow on the
+// One-call Omp OAuth login: omp_login {providerId} runs the whole flow on the
 // worker. Progress arrives as STREAMED events (open_url / extension_ui_request) delivered
 // through AsyncRpc's event channel on the GL thread; the terminal Done carries the final
 // sanitized login state. There is no handle, no poll, and no manual code-paste method —
@@ -1299,9 +1400,13 @@ struct OmpProvUi {
     std::vector<OmpProviderRow> rows;
     std::string selectedId;
     std::string lastError;
-    // Set when the ONE bulk chudcode_provider_list call failed outright. rows/detail are the
+    // Set when the ONE bulk omp_provider_list call failed outright. rows/detail are the
     // last known state (or empty on a cold first poll) — never "this account has no providers".
     bool listFailed = false;
+    // The last omp_provider_list answer was "a running agent turn holds the service lane": a
+    // wait, not a failure. rows stay as they were — or are the previous session's saved list.
+    bool listDeferred = false;
+    bool rowsFromSaved = false;
     // A response that arrived but carried entries this UI could not read: the readable rows are
     // live, and this names how many were dropped instead of silently shrinking the list.
     std::string listPartial;
@@ -1310,6 +1415,8 @@ struct OmpProvUi {
     std::string detailRequestFor;
     bool detailInFlight = false;
     double lastDetailPoll = -1e9;
+    // Why the selected provider's usage/accounts are not freshly loaded ("" = nothing to say).
+    std::string detailNote;
     // API-key flow (per selected provider)
     char keyBuf[256] = "";
     std::string keyFor;
@@ -1357,6 +1464,7 @@ static void selectOmpProvider(const std::string& provider) {
     s_omp.selectedId = provider;
     ++s_omp.selectionGeneration;
     s_omp.detail = OmpProvDetail{};
+    s_omp.detailNote.clear();
     s_omp.detailFor = provider;
     s_omp.detailRequestFor.clear();
     s_omp.detailInFlight = false;
@@ -1404,29 +1512,6 @@ static void openOmpProviderModal() {
     s_omp.lastDetailPoll = -1e9;
 }
 
-static bool ompRpcAbsent(const core::RpcResult& r) {
-    if (!r.ok) {
-        const std::string& e = r.err;
-        if (e.find("unknown") != std::string::npos || e.find("not found") != std::string::npos ||
-            e.find("not_found") != std::string::npos || e.find("method") != std::string::npos)
-            return true;
-        return false;
-    }
-    if (!r.result.is_object()) return false;
-    if (r.result.contains("code")) {
-        const std::string c = r.result.value("code", std::string());
-        if (c == "unknown_method" || c == "method_not_found" || c == "not_implemented")
-            return true;
-    }
-    if (!r.result.value("ok", true)) {
-        const std::string reason = r.result.value("reason", std::string());
-        if (reason == "unknown_method" || reason == "method_not_found" ||
-            reason == "not_implemented")
-            return true;
-    }
-    return false;
-}
-
 // Claude stack + Kimi first (design brief), then providers that need attention, then the rest
 // of the signed-in ones, then everything else alpha. "error"/"disabled" outrank a healthy
 // sign-in on purpose: a revoked credential is the one row in this list with an action waiting
@@ -1440,6 +1525,55 @@ static int ompProviderRank(const OmpProviderRow& r) {
     return 5;
 }
 
+// providers[] -> rows in display order. An entry this UI cannot key (not an object / no id) is
+// dropped from the list — that used to happen silently, i.e. one bad provider entry made a
+// provider vanish with no trace — so the count comes back for the caller to report; the
+// readable rows stay fully live.
+static std::vector<OmpProviderRow> parseOmpProviderRows(const nlohmann::json& arr,
+                                                        int& unreadable) {
+    std::vector<OmpProviderRow> rows;
+    rows.reserve(arr.size());
+    unreadable = 0;
+    for (const auto& p : arr) {
+        OmpProviderRow row;
+        if (!ui::parseOmpProviderDesc(p, row)) {
+            ++unreadable;
+            continue;
+        }
+        rows.push_back(std::move(row));
+    }
+    std::stable_sort(rows.begin(), rows.end(),
+                     [](const OmpProviderRow& a, const OmpProviderRow& b) {
+        const int ra = ompProviderRank(a), rb = ompProviderRank(b);
+        if (ra != rb) return ra < rb;
+        return a.label < b.label;
+    });
+    return rows;
+}
+
+static void installOmpProviderRows(std::vector<OmpProviderRow> rows) {
+    bool selectedStillExists = false;
+    for (const auto& row : rows)
+        if (row.id == s_omp.selectedId) selectedStillExists = true;
+    s_omp.rows = std::move(rows);
+    if (!selectedStillExists && !s_omp.rows.empty())
+        selectOmpProvider(s_omp.rows.front().id);
+}
+
+// Nothing was read live (a running turn holds the service lane, or the read failed before any
+// list ever loaded): the previous session's saved provider list stands in, labelled as such, so
+// the panel is not blank. It never replaces rows that were read live this session.
+static void showSavedOmpProviderRows() {
+    if (!s_omp.rows.empty()) return;
+    const nlohmann::json saved = nlohmann::json::parse(ui::savedProviderListJson(), nullptr, false);
+    if (!saved.is_array()) return;
+    int unreadable = 0;
+    std::vector<OmpProviderRow> rows = parseOmpProviderRows(saved, unreadable);
+    if (rows.empty()) return;
+    installOmpProviderRows(std::move(rows));
+    s_omp.rowsFromSaved = true;
+}
+
 static void pollOmpProviderList(AppState& st, bool force) {
     if (!s_omp.providerViewActive || (s_omp.listInFlight && !force)) return;
     const double now = ImGui::GetTime();
@@ -1450,99 +1584,104 @@ static void pollOmpProviderList(AppState& st, bool force) {
     const uint64_t viewGeneration = s_omp.viewGeneration;
     const uint64_t requestGeneration = nextOmpRequestGeneration();
     s_omp.listRequestGeneration = requestGeneration;
-    st.rpc.call("chudcode_provider_list", nlohmann::json::object(),
+    st.rpc.call("omp_provider_list", nlohmann::json::object(),
                 [&st, modalGeneration, viewGeneration,
                  requestGeneration](const core::RpcResult& r) {
         if (!ompViewCallbackCurrent(modalGeneration, viewGeneration) ||
             s_omp.listRequestGeneration != requestGeneration)
             return;
         s_omp.listInFlight = false;
-        if (core::workerLaneBusy(r)) {
-            // An agent turn is running; keep the last rows and say when they refresh.
-            s_omp.lastError = "Provider status refreshes when the current agent turn finishes.";
+        // The cadence is measured from this answer, not from dispatch: a read that outlasts the
+        // interval must not be asked again back to back.
+        s_omp.lastListPoll = ImGui::GetTime();
+        s_omp.listDeferred = core::workerLaneBusy(r);
+        if (s_omp.listDeferred) {
+            // hostd refuses every other call on a lane held by a running agent turn — or, for
+            // the service worker, by an interactive sign-in — at once: a wait, not a failed
+            // read. Keep the rows (the previous session's saved list when nothing was read
+            // yet) and say when they refresh.
+            const char* until = core::workerLaneBusyBySignIn(r) ? "the sign-in finishes"
+                                                                 : "the current run finishes";
+            s_omp.listFailed = false;
+            showSavedOmpProviderRows();
+            s_omp.lastError = s_omp.rowsFromSaved
+                ? std::string("Showing the providers from your last session. Their status "
+                              "refreshes when ") + until + "."
+                : std::string("Provider status refreshes when ") + until + ".";
             return;
         }
-        if (ompRpcAbsent(r)) {
+        if (core::workerMethodAbsent(r)) {
             s_omp.available = false;
-            s_omp.lastError = "Agent provider service unavailable in this runtime.";
+            s_omp.lastError = "Provider sign-in is not available in this runtime.";
             s_omp.listPartial.clear();
             return;
         }
         s_omp.available = true;
         // Wholesale failure of the single bulk RPC: there is no per-provider data in the
-        // response to salvage, so the only honest degrade is to say the CALL failed, keep
-        // whatever rows we last read (marked as last-known) and never let the panel imply the
-        // user has no providers. rows/detail are deliberately left untouched below.
-        auto listCallFailed = [](std::string why) {
-            if (why.empty()) why = "no reason reported";
+        // response to salvage, so the only honest degrade is to say the read failed, keep
+        // whatever rows we last had (marked as last-known) and never let the panel imply the
+        // user has no providers. The technical cause goes to the log, not onto the panel.
+        auto listCallFailed = [&st, &r]() {
+            std::string why = !r.ok ? r.err : std::string();
+            if (why.empty())
+                for (const char* key : {"reason", "error", "message"}) {
+                    why = optionalJsonString(r.result, key);
+                    if (!why.empty()) break;
+                }
+            st.addLog("[providers] the provider list could not be read: " +
+                      (why.empty() ? std::string("no reason reported") : why));
             s_omp.listFailed = true;
             s_omp.listPartial.clear();
-            s_omp.lastError =
-                "Could not read the provider list from the agent service (" + why +
-                "). This is a failed service call, not an empty provider set" +
-                (s_omp.rows.empty() ? "." : " \xe2\x80\x94 the providers below are the last "
-                                            "state this panel successfully read.");
+            showSavedOmpProviderRows();
+            s_omp.lastError = s_omp.rows.empty()
+                ? "Providers could not be loaded. It will try again automatically, or press "
+                  "Retry."
+                : (s_omp.rowsFromSaved
+                       ? "Providers could not be refreshed; showing the list from your last "
+                         "session. It will try again automatically, or press Retry."
+                       : "Providers could not be refreshed; showing the last list that loaded. "
+                         "It will try again automatically, or press Retry.");
         };
-        if (!r.ok || !r.result.is_object()) {
-            listCallFailed(r.err);
-            return;
-        }
-        if (!optionalJsonBool(r.result, "ok", true)) {
-            listCallFailed(optionalJsonString(r.result, "error"));
+        if (!r.ok || !r.result.is_object() || r.result.contains("code") ||
+            !optionalJsonBool(r.result, "ok", true)) {
+            listCallFailed();
             return;
         }
         const auto* arr = optionalJsonArr(r.result, "providers");
         if (!arr) {
-            listCallFailed("response carried no providers array");
+            listCallFailed();
             return;
         }
 
-        std::vector<OmpProviderRow> rows;
-        rows.reserve(arr->size());
-        // An entry this UI cannot key (not an object / no id) is dropped from the list — that
-        // used to happen silently, i.e. one bad provider entry made a provider vanish with no
-        // trace. Count them and report the count instead; the readable rows stay fully live.
         int unreadable = 0;
-        for (const auto& p : *arr) {
-            OmpProviderRow row;
-            if (!ui::parseChudcodeProviderDesc(p, row)) {
-                ++unreadable;
-                continue;
-            }
-            rows.push_back(std::move(row));
-        }
-        std::stable_sort(rows.begin(), rows.end(),
-                         [](const OmpProviderRow& a, const OmpProviderRow& b) {
-            const int ra = ompProviderRank(a), rb = ompProviderRank(b);
-            if (ra != rb) return ra < rb;
-            return a.label < b.label;
-        });
-
-        bool selectedStillExists = false;
-        for (const auto& row : rows)
-            if (row.id == s_omp.selectedId) selectedStillExists = true;
-        s_omp.rows = std::move(rows);
+        installOmpProviderRows(parseOmpProviderRows(*arr, unreadable));
+        s_omp.rowsFromSaved = false;
         s_omp.listFailed = false;
         s_omp.lastError.clear();
         s_omp.listPartial =
             unreadable == 0
                 ? std::string()
                 : (std::to_string(unreadable) +
-                   (unreadable == 1 ? " provider entry in the service response could not be read"
-                                    : " provider entries in the service response could not be read") +
-                   " and is not listed below; every provider shown is current.");
-        // Sole writer of the signed-in bridge set, and it gates whether the copilot model
-        // picker offers this provider at all. Only a USABLE credential counts
-        // (chudcodeProviderUsable — whitelist, never "anything but signed_out"): a provider
-        // whose only credential is revoked reports state:"error" and every request against it
-        // is guaranteed to fail, while one that still holds a working credential alongside a
-        // dead one reports key_set/oauth_connected and carries the dead row in disabled[].
-        st.signedInBridgeProviders.clear();
+                   (unreadable == 1 ? " provider entry in the response could not be read"
+                                    : " provider entries in the response could not be read") +
+                   " and is not listed below.");
+        const std::string refreshError = optionalJsonString(r.result, "refreshError");
+        if (!refreshError.empty()) {
+            if (!s_omp.listPartial.empty()) s_omp.listPartial += " ";
+            s_omp.listPartial += "Some provider information could not be refreshed; "
+                                 "previously confirmed availability is retained.";
+        }
+        // Only a complete read is worth keeping for the next launch.
+        if (refreshError.empty() && unreadable == 0) ui::saveProviderListJson(arr->dump());
+        // A failed per-provider auth lookup is unknown, not a sign-out. Retain a previously
+        // confirmed ID only when it still appears in the returned list; never admit a new
+        // unknown provider, or keep an explicitly unavailable or removed provider.
+        std::set<std::string> available;
         for (const auto& row : s_omp.rows)
-            if (ui::chudcodeProviderUsable(row.state))
-                st.signedInBridgeProviders.insert(row.id);
-        if (!selectedStillExists && !s_omp.rows.empty())
-            selectOmpProvider(s_omp.rows.front().id);
+            if (ui::ompProviderAvailableAfterRefresh(
+                    row, st.signedInBridgeProviders.count(row.id) != 0))
+                available.insert(row.id);
+        st.signedInBridgeProviders = std::move(available);
     });
 }
 
@@ -1550,8 +1689,11 @@ static void fetchOmpProviderDetail(AppState& st, const std::string& id, bool for
     if (!s_omp.providerViewActive || !s_omp.available || id.empty()) return;
     if (s_omp.detailInFlight && s_omp.detailRequestFor == id && !force) return;
     const double now = ImGui::GetTime();
-    if (!force && s_omp.detailFor == id && s_omp.detail.loaded &&
-        (now - s_omp.lastDetailPoll) < 60.0)
+    // A loaded detail is re-read every 60 s; one that has not loaded (the read failed, or a
+    // running turn holds the service lane) is retried every 3 s — never every frame, which kept
+    // the single async RPC lane saturated with doomed calls.
+    const double interval = s_omp.detailFor == id && s_omp.detail.loaded ? 60.0 : 3.0;
+    if (!force && s_omp.detailFor == id && (now - s_omp.lastDetailPoll) < interval)
         return;
     s_omp.lastDetailPoll = now;
     s_omp.detailInFlight = true;
@@ -1562,8 +1704,8 @@ static void fetchOmpProviderDetail(AppState& st, const std::string& id, bool for
     const uint64_t selectionGeneration = s_omp.selectionGeneration;
     const uint64_t requestGeneration = nextOmpRequestGeneration();
     s_omp.detailRequestGeneration = requestGeneration;
-    st.rpc.call("chudcode_auth_state", nlohmann::json{{"providerId", id}},
-                [id, modalGeneration, viewGeneration, selectionGeneration,
+    st.rpc.call("omp_auth_state", nlohmann::json{{"providerId", id}},
+                [&st, id, modalGeneration, viewGeneration, selectionGeneration,
                  requestGeneration](const core::RpcResult& r) {
         if (!ompSelectionCallbackCurrent(modalGeneration, viewGeneration,
                                          selectionGeneration, id) ||
@@ -1571,13 +1713,27 @@ static void fetchOmpProviderDetail(AppState& st, const std::string& id, bool for
             s_omp.detailRequestFor != id)
             return;
         s_omp.detailInFlight = false;
-        if (ompRpcAbsent(r)) {
+        s_omp.lastDetailPoll = ImGui::GetTime();   // retry gate runs from this answer
+        if (core::workerLaneBusy(r)) {
+            // A running agent turn holds the service lane. That is NOT a successful read: its
+            // envelope carries no `ok`, and treating it as one wiped the accounts, usage and
+            // disabled-credential rows of a signed-in provider. Keep what was last read.
+            s_omp.detailNote = "Usage and accounts refresh when the current run finishes.";
+            return;
+        }
+        if (core::workerMethodAbsent(r)) {
             s_omp.available = false;
             return;
         }
         s_omp.available = true;
-        if (!r.ok || !r.result.is_object() || !optionalJsonBool(r.result, "ok", true))
-            return;   // soft fail — keep the last detail for this exact provider
+        if (!r.ok || !r.result.is_object() || r.result.contains("code") ||
+            !optionalJsonBool(r.result, "ok", false)) {
+            // Soft fail — keep the last detail for this exact provider and try again shortly.
+            s_omp.detailNote = "Usage and accounts could not be loaded. It will try again "
+                               "automatically.";
+            return;
+        }
+        s_omp.detailNote.clear();
 
         OmpProvDetail d;
         d.loaded = true;
@@ -1593,7 +1749,7 @@ static void fetchOmpProviderDetail(AppState& st, const std::string& id, bool for
                 if (!x.is_object()) continue;
                 OmpDisabledRow dr;
                 dr.id = optionalJsonStamp(x, "id");
-                // No rowid = nothing chudcode_remove_key could address.
+                // No rowid = nothing omp_remove_key could address.
                 if (dr.id.empty()) continue;
                 dr.cause = optionalJsonString(x, "cause");
                 dr.type = optionalJsonString(x, "type");
@@ -1640,6 +1796,28 @@ static void fetchOmpProviderDetail(AppState& st, const std::string& id, bool for
             }
         }
         s_omp.detail = std::move(d);
+        st.rpc.call("omp_logout_accounts", nlohmann::json{{"providerId", id}},
+                    [id, modalGeneration, viewGeneration, selectionGeneration,
+                     requestGeneration](const core::RpcResult& accounts) {
+            if (!ompSelectionCallbackCurrent(modalGeneration, viewGeneration,
+                                             selectionGeneration, id) ||
+                s_omp.detailRequestGeneration != requestGeneration ||
+                !accounts.ok || !accounts.result.is_object() ||
+                !optionalJsonBool(accounts.result, "ok", false)) return;
+            const auto* rows = optionalJsonArr(accounts.result, "accounts");
+            if (!rows) return;
+            std::vector<OmpAccountRow> result;
+            for (const auto& row : *rows) {
+                if (!row.is_object()) continue;
+                OmpAccountRow account;
+                account.credentialId = optionalJsonInt(row, "credentialId", -1);
+                if (account.credentialId < 0) continue;
+                account.accountId = optionalJsonString(row, "label");
+                account.orgName = optionalJsonString(row, "detail");
+                result.push_back(std::move(account));
+            }
+            s_omp.detail.accounts = std::move(result);
+        }, 15000);
     }, 15000);   // auth_state may fetch usage reports upstream (bounded worker-side)
 }
 
@@ -1679,7 +1857,7 @@ static void failOmpOAuth(OmpOAuthFlow& f, std::string error) {
     f.error = error.empty() ? "Sign-in failed" : std::move(error);
 }
 
-// One streamed chudcode_login call runs the whole OAuth flow on the Chudcode worker: the
+// One streamed omp_login call runs the whole OAuth flow on the Omp worker: the
 // worker opens/settles the provider flow itself and streams open_url / instruction events
 // while this call is in flight; the terminal result is the final sanitized login state.
 // There is no handle to poll and no manual code RPC — the loopback/device exchange is
@@ -1698,14 +1876,22 @@ static void beginOmpOAuth(AppState& st, const std::string& provider,
     const uint64_t generation = f.generation;
     const uint64_t requestGeneration = nextOmpRequestGeneration();
     f.beginRequest = requestGeneration;
-    st.rpc.call(
-        "chudcode_login", nlohmann::json{{"providerId", provider}},
+    // Its own queue (st.authRpc): the flow is one call that outlasts the user's browser step,
+    // and on the shared FIFO it stalled every provider poll and document call behind it.
+    st.authRpc.call(
+        "omp_login", nlohmann::json{{"providerId", provider}},
         [&st, provider, modalGeneration, generation,
          requestGeneration](const core::RpcResult& r) {
             if (!ompOAuthCallbackCurrent(modalGeneration, generation, provider) ||
                 s_omp.oauth.beginRequest != requestGeneration)
                 return;   // superseded/cancelled — the late result is simply dropped
             OmpOAuthFlow& f = s_omp.oauth;
+            if (core::workerLaneBusy(r)) {
+                // A running agent turn holds the service lane: say when sign-in comes back
+                // instead of the generic failure.
+                failOmpOAuth(f, "Sign-in is available when the current run finishes.");
+                return;
+            }
             if (!r.ok || !r.result.is_object() ||
                 !optionalJsonBool(r.result, "ok", false)) {
                 std::string error = !r.ok ? r.err : optionalJsonString(r.result, "error");
@@ -1720,9 +1906,9 @@ static void beginOmpOAuth(AppState& st, const std::string& provider,
             // state (or an explicit connected marker) is success; anything else is the
             // provider's refusal, reported verbatim.
             const std::string state = optionalJsonString(r.result, "state");
-            const bool connected = ui::chudcodeProviderUsable(state) ||
+            const bool connected = ui::ompProviderUsable(state) ||
                                    optionalJsonBool(r.result, "connected", false) ||
-                                   optionalJsonBool(r.result, "credential_saved", false);
+                                   optionalJsonBool(r.result, "authenticated", false);
             if (connected) {
                 f.status = "connected";
                 f.credentialSaved = true;
@@ -1740,8 +1926,8 @@ static void beginOmpOAuth(AppState& st, const std::string& provider,
             if (!ompOAuthCallbackCurrent(modalGeneration, generation, provider) ||
                 s_omp.oauth.beginRequest != requestGeneration)
                 return;
-            ui::ChudcodeLoginEvent e;
-            if (!ui::parseChudcodeLoginEvent(ev, e)) return;
+            ui::OmpLoginEvent e;
+            if (!ui::parseOmpLoginEvent(ev, e)) return;
             OmpOAuthFlow& f = s_omp.oauth;
             if (e.kind == "open_url") {
                 f.url = e.url;
@@ -1787,7 +1973,7 @@ static void closeOmpProviderModal(AppState& st) {
 }
 
 static const float* ompStateColor(const std::string& state) {
-    if (state == "oauth_connected" || state == "key_set") return ui::palette.statusOk;
+    if (state == "oauth_connected" || state == "key_set" || state == "configured") return ui::palette.statusOk;
     if (state == "error") return ui::palette.statusErr;
     return ui::palette.textDim;   // signed_out / disabled / unknown
 }
@@ -1796,6 +1982,7 @@ static const char* ompStateLabel(const OmpProviderRow& r) {
     if (r.state == "oauth_connected") return "OAuth connected";
     if (r.state == "key_set")
         return r.origin == "env" ? "key set (env)" : "API key set";
+    if (r.state == "configured") return "configured";
     if (r.state == "error") return "error";
     if (r.state == "disabled") return "disabled";
     if (r.keyless) return "keyless";
@@ -1846,9 +2033,9 @@ static bool modelMatches(const ui::BridgeModelMeta& m, const std::string& needle
            toLowerAscii(m.id).find(needleLower) != std::string::npos;
 }
 
-// Remove ONE credential row from the Chudcode service (accountId = its rowid, as reported by
+// Remove ONE credential row from the Omp service (accountId = its rowid, as reported by
 // accounts[].credentialId or disabled[].id), or every credential for the provider when
-// accountId is empty. A disabled row is removable through the exact same chudcode_remove_key
+// accountId is empty. A disabled row is removable through the exact same omp_remove_key
 // call as a live key, so no extra method is involved.
 static void removeOmpCredential(AppState& st, const std::string& provider,
                                 const std::string& account) {
@@ -1859,7 +2046,7 @@ static void removeOmpCredential(AppState& st, const std::string& provider,
     const uint64_t selectionGeneration = s_omp.selectionGeneration;
     const uint64_t requestGeneration = nextOmpRequestGeneration();
     s_omp.keyRequestGeneration = requestGeneration;
-    st.rpc.call("chudcode_remove_key", std::move(params),
+    st.rpc.call("omp_remove_key", std::move(params),
                 [&st, provider, modalGeneration, viewGeneration, selectionGeneration,
                  requestGeneration](const core::RpcResult& r) {
         if (!ompSelectionCallbackCurrent(modalGeneration, viewGeneration,
@@ -1867,11 +2054,16 @@ static void removeOmpCredential(AppState& st, const std::string& provider,
             s_omp.keyRequestGeneration != requestGeneration ||
             s_omp.keyFor != provider)
             return;
-        if (!r.ok || !r.result.is_object() || !optionalJsonBool(r.result, "ok", true)) {
+        if (core::workerLaneBusy(r)) {
+            // A running agent turn holds the service lane: the credential was NOT removed, and
+            // the envelope carries no `ok` (reading that as success hid the refusal).
+            s_omp.lastError = "Removing a credential is available when the current run finishes.";
+        } else if (!r.ok || !r.result.is_object() || r.result.contains("code") ||
+                   !optionalJsonBool(r.result, "ok", false)) {
             std::string why = !r.ok ? r.err : optionalJsonString(r.result, "error");
             if (why.empty()) why = optionalJsonString(r.result, "reason");
             s_omp.lastError =
-                why.empty() ? "The agent service refused to remove that credential." : why;
+                why.empty() ? "The credential could not be removed. Try again." : why;
         } else {
             s_omp.lastError.clear();
         }
@@ -1893,16 +2085,16 @@ static std::string ompDisabledWhen(double ms) {
     return buf;
 }
 
-// What the provider list shows when it has no rows to paint. The wide pane used to claim "No
-// providers reported by the bridge" even when the bulk read had simply failed — i.e. it told
-// the user they own no providers to describe a transport failure. Both panes share this now.
+// What the provider list shows when it has no rows to paint. It must never describe a failed or
+// deferred read as "you have no providers", and a filter that matches nothing is not a load.
+// Both panes share this.
 static const char* ompEmptyListMessage() {
-    if (s_omp.listInFlight) return "Loading providers\xe2\x80\xa6";
     if (!s_omp.rows.empty()) return "No providers match your search.";
+    if (s_omp.listInFlight) return "Loading providers\xe2\x80\xa6";
+    if (s_omp.listDeferred) return "Providers appear when the current run finishes.";
     if (s_omp.listFailed)
-        return "The provider list could not be read \xe2\x80\x94 the call to the auth bridge "
-               "failed (reason above). This does NOT mean you have no providers.";
-    return "No providers reported by the bridge.";
+        return "Providers could not be loaded. It will try again automatically, or press Retry.";
+    return "No providers are available.";
 }
 
 static void drawOmpProviderDetail(AppState& st, float sc) {
@@ -1973,6 +2165,9 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
             ImGui::SetTooltip("Hide this provider's models from the copilot picker. "
                               "Credentials are kept — re-enable restores.");
     }
+    // Why usage and accounts are not freshly loaded (a run holds the service lane, or the read
+    // failed and is being retried) — said plainly instead of leaving the sections quietly empty.
+    if (!s_omp.detailNote.empty() && s_omp.detailFor == prov.id) dimText(s_omp.detailNote.c_str());
 
     // Inline "Sign in…" primary button — sits on the status line of whichever state branch
     // is active instead of eating its own row below it.
@@ -2058,28 +2253,7 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
             ImGui::SameLine(0, 12.0f * sc);
             if (ImGui::SmallButton("Add account")) beginOmpOAuth(st, prov.id);
         }
-        ImGui::SameLine(0, 6.0f * sc);
-        if (ImGui::SmallButton("Sign out")) {
-            const std::string provider = prov.id;
-            const uint64_t modalGeneration = s_omp.modalGeneration;
-            const uint64_t viewGeneration = s_omp.viewGeneration;
-            const uint64_t selectionGeneration = s_omp.selectionGeneration;
-            st.rpc.call("chudcode_logout",
-                        nlohmann::json{{"providerId", provider}},
-                        [&st, provider, modalGeneration, viewGeneration,
-                         selectionGeneration](const core::RpcResult& r) {
-                if (!ompSelectionCallbackCurrent(modalGeneration, viewGeneration,
-                                                 selectionGeneration, provider))
-                    return;
-                if (!r.ok || !r.result.is_object() ||
-                    !optionalJsonBool(r.result, "ok", true)) {
-                    s_omp.lastError = !r.ok ? r.err : optionalJsonString(r.result, "error");
-                } else {
-                    s_omp.lastError.clear();
-                }
-                refreshOmpProvider(st);
-            });
-        }
+        // Logout is credential-specific. Never guess an account id from a provider id.
         if (detailReady) {
             // One line per account: email + org, each ellipsized to the space it actually
             // has — the old layout let "email  org" run past the card edge and clip mid-word.
@@ -2101,6 +2275,30 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
                         ellipsizeToFit(ac.orgName, ImGui::GetContentRegionAvail().x).c_str());
                     ImGui::PopStyleColor();
                 }
+                if (ac.credentialId >= 0) {
+                    ImGui::SameLine(0, 6.0f * sc);
+                    if (ImGui::SmallButton("Sign out")) {
+                        const std::string provider = prov.id;
+                        const uint64_t modalGeneration = s_omp.modalGeneration;
+                        const uint64_t viewGeneration = s_omp.viewGeneration;
+                        const uint64_t selectionGeneration = s_omp.selectionGeneration;
+                        st.rpc.call("omp_logout",
+                            nlohmann::json{{"providerId", provider}, {"credentialId", ac.credentialId}},
+                            [&st, provider, modalGeneration, viewGeneration,
+                             selectionGeneration](const core::RpcResult& r) {
+                                if (!ompSelectionCallbackCurrent(modalGeneration, viewGeneration,
+                                                                 selectionGeneration, provider)) return;
+                                if (core::workerLaneBusy(r))
+                                    s_omp.lastError = "Signing out is available when the current "
+                                                      "run finishes.";
+                                else if (!r.ok || !r.result.is_object() ||
+                                    !optionalJsonBool(r.result, "ok", false))
+                                    s_omp.lastError = !r.ok ? r.err : optionalJsonString(r.result, "reason");
+                                else s_omp.lastError.clear();
+                                refreshOmpProvider(st);
+                            });
+                    }
+                }
                 ImGui::PopID();
             }
         }
@@ -2116,12 +2314,44 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
             ImGui::SetTooltip("Remove the stored key from the auth bridge. "
                               "Paste a new key below to replace it.");
         signInSameLine();   // key_set providers that also support OAuth keep the entry point
-    } else if (prov.keyless) {
-        dimText("No credential needed — this provider serves models without a key.");
+    } else if (state == "configured") {
+        ompStatusDotText("Credential configured", pal.statusOk, /*filled=*/true);
         signInSameLine();
     } else {
         ompStatusDotText("signed out", pal.textDim, /*filled=*/false);
         signInSameLine();
+    }
+    if ((state == "signed_out" || prov.keyless) && prov.modelsAvailable > 0) {
+        dimText(prov.keyless ? "This provider can serve models without a credential."
+                             : "Credential-free access is not confirmed for this provider.");
+        bool enabled = false;
+        try {
+            const auto config = readConfigJson();
+            const auto agent = config.value("agent", nlohmann::json::object());
+            const auto allowed = agent.value("keyless_providers", nlohmann::json::array());
+            if (allowed.is_array())
+                for (const auto& id : allowed)
+                    if (id.is_string() && id.get<std::string>() == prov.id) enabled = true;
+        } catch (...) {}
+        if (ui::kit::checkbox("keyless_opt_in", "Allow without a stored credential", &enabled)) {
+            const std::string provider = prov.id;
+            const bool saved = updateConfigJson([&](nlohmann::json& config) {
+                auto& agent = config["agent"];
+                if (!agent.is_object()) agent = nlohmann::json::object();
+                auto& allowed = agent["keyless_providers"];
+                if (!allowed.is_array()) allowed = nlohmann::json::array();
+                nlohmann::json next = nlohmann::json::array();
+                for (const auto& id : allowed)
+                    if (!id.is_string() || id.get<std::string>() != provider) next.push_back(id);
+                if (enabled) next.push_back(provider);
+                allowed = std::move(next);
+            });
+            // The provider list is computed by the worker from config.json on disk, so the write
+            // must land before it is re-queried; a failed write is reported, not shown as saved.
+            if (!saved || !flushConfigWrites())
+                s_omp.lastError = "Could not save the credential-free access setting.";
+            refreshOmpProvider(st);
+        }
     }
 
     const bool flowVisible = flow.provider == prov.id &&
@@ -2182,8 +2412,10 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
         }
     }
 
-    // API-key block: validation is mandatory and persistence happens only after success.
-    if (prov.hasApiKey) {
+    // Store the key through the runtime; storage does not imply provider validation.
+    if (prov.hasApiKey || ImGui::CollapsingHeader("Add API key (provider support unconfirmed)")) {
+        if (!prov.hasApiKey)
+            dimText("A saved key does not establish that this provider accepts API-key authentication.");
         ImGui::Dummy(ImVec2(0, 4.0f * sc));
         if (s_omp.keyFor != prov.id) {
             s_omp.keyFor = prov.id;
@@ -2198,7 +2430,7 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
                                  sizeof(s_omp.keyBuf), ImGuiInputTextFlags_Password);
         const bool haveInput = s_omp.keyBuf[0] != 0;
         if (s_omp.keyBusy) ImGui::BeginDisabled();
-        if (ImGui::SmallButton("Validate \x26 add") && haveInput && !s_omp.keyBusy) {
+        if (ImGui::SmallButton("Add key") && haveInput && !s_omp.keyBusy) {
             s_omp.keyBusy = true;
             s_omp.keyStatus.clear();
             const std::string provider = prov.id;
@@ -2208,53 +2440,31 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
             const uint64_t selectionGeneration = s_omp.selectionGeneration;
             const uint64_t requestGeneration = nextOmpRequestGeneration();
             s_omp.keyRequestGeneration = requestGeneration;
-            st.rpc.call("chudcode_validate_key",
+            st.rpc.call("omp_set_key",
                         nlohmann::json{{"providerId", provider}, {"apiKey", key}},
-                        [&st, provider, key, modalGeneration, viewGeneration,
-                         selectionGeneration, requestGeneration](const core::RpcResult& r) {
+                        [&st, provider, modalGeneration, viewGeneration,
+                         selectionGeneration, requestGeneration](const core::RpcResult& sr) {
                 if (!ompSelectionCallbackCurrent(modalGeneration, viewGeneration,
                                                  selectionGeneration, provider) ||
                     s_omp.keyRequestGeneration != requestGeneration ||
-                    s_omp.keyFor != provider)
-                    return;
-                const bool ok = r.ok && r.result.is_object() &&
-                                optionalJsonBool(r.result, "ok", false);
-                if (!ok) {
-                    s_omp.keyBusy = false;
+                    s_omp.keyFor != provider) return;
+                s_omp.keyBusy = false;
+                if (core::workerLaneBusy(sr)) {
                     s_omp.keyStatusErr = true;
-                    s_omp.keyStatus =
-                        !r.ok ? (r.err.empty() ? "validation failed" : r.err)
-                              : optionalJsonString(r.result, "error");
-                    if (s_omp.keyStatus.empty())
-                        s_omp.keyStatus = optionalJsonString(r.result, "detail");
-                    if (s_omp.keyStatus.empty()) s_omp.keyStatus = "key rejected";
+                    s_omp.keyStatus = "Saving a key is available when the current run finishes.";
                     return;
                 }
-                st.rpc.call("chudcode_set_key",
-                            nlohmann::json{{"providerId", provider}, {"apiKey", key}},
-                            [&st, provider, modalGeneration, viewGeneration,
-                             selectionGeneration,
-                             requestGeneration](const core::RpcResult& sr) {
-                    if (!ompSelectionCallbackCurrent(modalGeneration, viewGeneration,
-                                                     selectionGeneration, provider) ||
-                        s_omp.keyRequestGeneration != requestGeneration ||
-                        s_omp.keyFor != provider)
-                        return;
-                    s_omp.keyBusy = false;
-                    if (!sr.ok || !sr.result.is_object() ||
-                        !optionalJsonBool(sr.result, "ok", true)) {
-                        s_omp.keyStatusErr = true;
-                        s_omp.keyStatus = !sr.ok ? sr.err
-                                                 : optionalJsonString(sr.result, "error");
-                        if (s_omp.keyStatus.empty() && sr.result.is_object())
-                            s_omp.keyStatus = optionalJsonString(sr.result, "detail");
-                        return;
-                    }
-                    s_omp.keyStatusErr = false;
-                    s_omp.keyStatus = "key saved";
-                    s_omp.keyBuf[0] = 0;
-                    refreshOmpProvider(st);
-                });
+                if (!sr.ok || !sr.result.is_object() ||
+                    !optionalJsonBool(sr.result, "ok", false)) {
+                    s_omp.keyStatusErr = true;
+                    s_omp.keyStatus = !sr.ok ? sr.err : optionalJsonString(sr.result, "error");
+                    if (s_omp.keyStatus.empty()) s_omp.keyStatus = "Could not save key.";
+                    return;
+                }
+                s_omp.keyStatusErr = false;
+                s_omp.keyStatus = "Key saved; provider access is verified when used.";
+                s_omp.keyBuf[0] = 0;
+                refreshOmpProvider(st);
             }, 20000);
         }
         if (s_omp.keyBusy) ImGui::EndDisabled();
@@ -2315,7 +2525,7 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
     {
         int count = 0;
         for (const auto& m : ui::bridgeModelCatalog())
-            if (m.provider == prov.id) ++count;
+            if (m.provider == prov.id && !ui::isLegacyGenerationModel(m.id)) ++count;
         char modelsTitle[64];
         std::snprintf(modelsTitle, sizeof(modelsTitle), "Models (%d)",
                       count > 0 ? count : prov.modelsAvailable);
@@ -2325,7 +2535,11 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
         if (count > 0) {
             if (ImGui::SmallButton("Select all")) {
                 for (const auto& m : ui::bridgeModelCatalog())
-                    if (m.provider == prov.id) st.settings.hiddenModels.erase(m.id);
+                    if (m.provider == prov.id && !ui::isLegacyGenerationModel(m.id)) {
+                        const std::string identity = m.provider + "/" + m.id;
+                        st.settings.hiddenModels.erase(identity);
+                        st.settings.shownLegacyHiddenModels.insert(identity);
+                    }
                 saveSettings(st.settings);
             }
             if (ImGui::IsItemHovered())
@@ -2334,7 +2548,11 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
             ImGui::SameLine(0, 6.0f * sc);
             if (ImGui::SmallButton("Clear")) {
                 for (const auto& m : ui::bridgeModelCatalog())
-                    if (m.provider == prov.id) st.settings.hiddenModels.insert(m.id);
+                    if (m.provider == prov.id && !ui::isLegacyGenerationModel(m.id)) {
+                        const std::string identity = m.provider + "/" + m.id;
+                        st.settings.hiddenModels.insert(identity);
+                        st.settings.shownLegacyHiddenModels.erase(identity);
+                    }
                 saveSettings(st.settings);
             }
             if (ImGui::IsItemHovered())
@@ -2348,9 +2566,14 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
         const std::string modelNeedle = toLowerAscii(s_modelSearchBuf);
 
         if (count == 0) {
-            dimText(s_omp.available
-                        ? "Catalog loading \xe2\x80\x94 or no bundled models for this provider."
-                        : "Catalog unavailable.");
+            // Say which of the four things is true instead of one "loading — or none" line.
+            dimText(!s_omp.available ? "Catalog unavailable." :
+                    !ui::bridgeModelCatalog().empty() ? "No current models for this provider." :
+                    ui::modelPickerDeferred() ? "Models appear when the current run finishes." :
+                    ui::modelPickerLoading() ? "Loading models\xe2\x80\xa6" :
+                    ui::modelPickerError() ? "Models could not be loaded. Use Retry model discovery "
+                                             "in the model picker." :
+                    "No models available for this provider.");
         }
         // Wide panes lay the checkbox rows out in two columns — a 26-model catalog stops
         // being one long single-file list. Column flow is index-based: a float fit-test on
@@ -2369,11 +2592,19 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
         // item (that reads the NEXT line's start, which silently corrupts cell math).
         auto drawModelRow = [&](const ui::BridgeModelMeta& m) {
             const float x0 = ImGui::GetCursorPosX();
-            bool hidden = st.settings.hiddenModels.count(m.id) != 0;
+            const std::string identity = m.provider + "/" + m.id;
+            bool hidden = st.settings.hiddenModels.count(identity) ||
+                (st.settings.hiddenModels.count(m.id) &&
+                 !st.settings.shownLegacyHiddenModels.count(identity));
             bool shown = !hidden;
             if (ui::kit::checkbox("show", "", &shown)) {
-                if (shown) st.settings.hiddenModels.erase(m.id);
-                else st.settings.hiddenModels.insert(m.id);
+                if (shown) {
+                    st.settings.hiddenModels.erase(identity);
+                    st.settings.shownLegacyHiddenModels.insert(identity);
+                } else {
+                    st.settings.hiddenModels.insert(identity);
+                    st.settings.shownLegacyHiddenModels.erase(identity);
+                }
                 saveSettings(st.settings);
             }
             if (ImGui::IsItemHovered())
@@ -2418,7 +2649,7 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
         std::vector<const ui::BridgeModelMeta*> deprecatedMatches;
         int matchCount = 0;
         for (const auto& m : ui::bridgeModelCatalog()) {
-            if (m.provider != prov.id) continue;
+            if (m.provider != prov.id || ui::isLegacyGenerationModel(m.id)) continue;
             if (!modelMatches(m, modelNeedle)) continue;
             ++matchCount;
             if (m.deprecated) { deprecatedMatches.push_back(&m); continue; }
@@ -2447,6 +2678,139 @@ static void drawOmpProviderDetail(AppState& st, float sc) {
     ImGui::PopID();
 }
 
+// Legacy credentials move only on explicit request, one acknowledged provider at a time.
+// Values stay private to the request and are never placed in descriptors or status text.
+struct LegacyKeyMove {
+    std::string provider;
+    std::string field;
+    std::string value;
+    std::string topField;
+};
+static std::vector<LegacyKeyMove> s_legacyKeyMoves;
+static size_t s_legacyKeyIndex = 0;
+static bool s_legacyKeyBusy = false;
+static std::string s_legacyKeyStatus;
+
+static std::vector<LegacyKeyMove> legacyKeyMoves() {
+    static const std::pair<const char*, const char*> mappings[] = {
+        {"anthropic", "anthropic"}, {"openai", "openai"}, {"gemini", "google"},
+        {"xai", "xai"}, {"moonshot", "moonshot"}};
+    std::vector<LegacyKeyMove> result;
+    const auto config = readConfigJson();
+    if (!config.is_object()) return result;
+    const auto keys = config.value("keys", nlohmann::json::object());
+    if (keys.is_object()) {
+        for (const auto& mapping : mappings) {
+            const auto it = keys.find(mapping.first);
+            if (it != keys.end() && it->is_string() && !it->get_ref<const std::string&>().empty())
+                result.push_back({mapping.second, mapping.first, it->get<std::string>(), ""});
+        }
+    }
+    const std::string topField = config.contains("legacy_api_key") ? "legacy_api_key" : "api_key";
+    const auto top = config.find(topField);
+    const std::string oldProvider = config.value("legacy_api_key_provider",
+                                                config.value("provider", std::string()));
+    const auto endpoint = config.value("openai", nlohmann::json::object());
+    const bool localTop = oldProvider == "openai" &&
+        !config.contains("legacy_api_key_provider") && endpoint.is_object() &&
+        ui::baseUrlIsLoopback(endpoint.value("base_url", std::string()).c_str());
+    if (!localTop && top != config.end() && top->is_string() && !top->get_ref<const std::string&>().empty()) {
+        for (const auto& mapping : mappings) {
+            if (oldProvider != mapping.first) continue;
+            const std::string value = top->get<std::string>();
+            auto existing = std::find_if(result.begin(), result.end(), [&](const LegacyKeyMove& row) {
+                return row.provider == mapping.second;
+            });
+            if (existing == result.end()) result.push_back({mapping.second, "", value, topField});
+            else if (existing->value == value) existing->topField = topField;
+            else result.erase(existing); // conflicting legacy keys require manual resolution
+            break;
+        }
+    }
+    return result;
+}
+
+static void moveNextLegacyKey(AppState& st) {
+    if (s_legacyKeyIndex >= s_legacyKeyMoves.size()) {
+        s_legacyKeyBusy = false;
+        s_legacyKeyMoves.clear();
+        return;
+    }
+    const LegacyKeyMove entry = s_legacyKeyMoves[s_legacyKeyIndex];
+    st.rpc.call(ui::kOmpSetKeyMethod,
+                nlohmann::json{{"providerId", entry.provider}, {"apiKey", entry.value}},
+                [&st, entry](const core::RpcResult& reply) {
+        bool moved = reply.ok && ui::ompKeySaveAccepted(reply.result, entry.provider);
+        if (moved) {
+            moved = updateConfigJson([&](nlohmann::json& config) {
+                if (!entry.field.empty() && config.contains("keys") && config["keys"].is_object() &&
+                    config["keys"].value(entry.field, std::string()) == entry.value)
+                    config["keys"].erase(entry.field);
+                if (!entry.topField.empty() && config.value(entry.topField, std::string()) == entry.value) {
+                    config.erase(entry.topField);
+                    config.erase("legacy_api_key_provider");
+                }
+            });
+            if (moved) moved = flushConfigWrites();
+            if (moved) {
+                auto clearMatching = [&](char* key) {
+                    if (entry.value == key) key[0] = 0;
+                };
+                if (entry.provider == "anthropic") clearMatching(st.settings.anthropicKey);
+                else if (entry.provider == "openai") clearMatching(st.settings.openaiKey);
+                else if (entry.provider == "google") clearMatching(st.settings.geminiKey);
+                else if (entry.provider == "xai") clearMatching(st.settings.xaiKey);
+                else if (entry.provider == "moonshot") clearMatching(st.settings.moonshotKey);
+                if (entry.topField == "api_key" && st.settings.provider != ui::PROV_LOCAL &&
+                    st.settings.provider != ui::PROV_LLAMACPP) clearMatching(st.settings.apiKey);
+            }
+        }
+        if (!s_legacyKeyStatus.empty()) s_legacyKeyStatus += "\n";
+        s_legacyKeyStatus += entry.provider + (moved ? ": key moved." :
+                                              ": could not move key; it remains saved for retry.");
+        s_legacyKeyMoves[s_legacyKeyIndex].value.clear();
+        ++s_legacyKeyIndex;
+        moveNextLegacyKey(st);
+    }, 20000);
+}
+
+static bool hasLegacyKeys() {
+    const auto config = readConfigJson();
+    if (!config.is_object()) return false;
+    const auto keys = config.value("keys", nlohmann::json::object());
+    if (keys.is_object())
+        for (auto it = keys.begin(); it != keys.end(); ++it)
+            if (it.value().is_string() && !it.value().get_ref<const std::string&>().empty())
+                return true;
+    if (config.contains("legacy_api_key") && config["legacy_api_key"].is_string() &&
+        !config["legacy_api_key"].get_ref<const std::string&>().empty()) return true;
+    const auto top = config.find("api_key");
+    if (top == config.end() || !top->is_string() || top->get_ref<const std::string&>().empty())
+        return false;
+    const auto endpoint = config.value("openai", nlohmann::json::object());
+    return config.contains("legacy_api_key_provider") ||
+           config.value("provider", std::string()) != "openai" || !endpoint.is_object() ||
+           !ui::baseUrlIsLoopback(endpoint.value("base_url", std::string()));
+}
+
+static void drawLegacyKeyMigration(AppState& st) {
+    const auto candidates = s_legacyKeyBusy ? std::vector<LegacyKeyMove>{} : legacyKeyMoves();
+    if (!s_legacyKeyBusy && !hasLegacyKeys() && s_legacyKeyStatus.empty()) return;
+    const bool disabled = s_legacyKeyBusy || candidates.empty();
+    if (disabled) ImGui::BeginDisabled();
+    if (ImGui::Button("Move saved API keys to OMP") && !candidates.empty()) {
+        s_legacyKeyMoves = candidates;
+        s_legacyKeyIndex = 0;
+        s_legacyKeyBusy = true;
+        s_legacyKeyStatus.clear();
+        moveNextLegacyKey(st);
+    }
+    if (disabled) ImGui::EndDisabled();
+    if (!s_legacyKeyBusy && candidates.empty() && hasLegacyKeys())
+        dimText("Some saved keys need manual account setup; ambiguous providers are not moved.");
+    if (!s_legacyKeyStatus.empty()) dimText(s_legacyKeyStatus.c_str());
+}
+
 // Two-pane provider manager: left = provider list with sign-in state, right = detail
 // (Sign-in / Usage / Models). Footer = per-session cost strip. Single-column fallback under
 // 640*sc: the list collapses to a combo (design §3.1).
@@ -2454,13 +2818,14 @@ static void drawOmpProviderManager(AppState& st) {
     const float sc = ui::uiScale;
     const auto& pal = ui::palette;
     if (const char* why = ui::webGapReason("account_signin")) {
-        // The browser build has no provider credential path: the polls below drive chudcode_*
+        // The browser build has no provider credential path: the polls below drive omp_*
         // auth RPCs against the shared engine's own credential store.
         settingsGlassSectionBegin("##web_providers", "Providers");
         dimText(why);
         settingsGlassSectionEnd();
         return;
     }
+    drawLegacyKeyMigration(st);
     enterOmpProviderView();
     pollOmpProviderList(st, false);
     ui::refreshBridgeModelCatalog(st, false);
@@ -2484,8 +2849,7 @@ static void drawOmpProviderManager(AppState& st) {
 
     if (!s_omp.available) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.statusWarn));
-        ImGui::TextWrapped("Provider sign-in bridge unavailable in this runtime \xe2\x80\x94 "
-                           "retrying while legacy provider settings remain below.");
+        ImGui::TextWrapped("Provider sign-in is unavailable. Reconnect the runtime to retry.");
         ImGui::PopStyleColor();
         return;
     }
@@ -2493,6 +2857,9 @@ static void drawOmpProviderManager(AppState& st) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(pal.statusWarn));
         ImGui::TextWrapped("%s", s_omp.lastError.c_str());
         ImGui::PopStyleColor();
+        // A real failure (not a wait for a running turn) gets an explicit way to retry now.
+        if (s_omp.listFailed && !s_omp.listInFlight && ImGui::SmallButton("Retry##prov_list"))
+            refreshOmpProvider(st);
     }
     if (!s_omp.listPartial.empty()) {
         // A successful read that lost some entries: the list below is still live, so this is a
@@ -2676,7 +3043,7 @@ static void drawOmpProviderManager(AppState& st) {
     ImGui::EndChild();
     ImGui::PopStyleVar();
 
-    // Footer: per-session cost strip (chudcode_session_stats; hides itself when unavailable).
+    // Footer: per-session cost strip (omp_session_stats; hides itself when unavailable).
     ui::drawSessionCostStrip(st);
 }
 
@@ -2726,34 +3093,52 @@ static BenchCategoriesUi s_cats;
 // Tri-state assignment. Default follows whatever provider+model the chat composer is set
 // to (wire form {"mode":"default"} — the resolver sees no provider and falls through to
 // the ambient session model). Auto ranks across enabled providers. Fixed pins one.
-enum class RoleMode { Default, Auto, Fixed };
-static constexpr const char* kRoleModeDefaultLabel = "Default (chat model)";
-static constexpr const char* kRoleModeAutoLabel = "Auto (best available)";
+enum class RoleMode { Default, Auto, Fixed, Tier, LegacyWorker, Size };
+static constexpr const char* kRoleModeDefaultLabel = "Use chat model";
+static constexpr const char* kRoleModeAutoLabel = "Previous ranked Auto needs a new assignment";
 
 // Wire entry → mode: explicit mode wins, else a provider/model pin, else Auto.
 static RoleMode roleModeFromWire(const std::string& mode, const std::string& provider,
                                  const std::string& model) {
+    if (mode == "tier") return RoleMode::Tier;
+    if (mode == "size") return RoleMode::Size;
     if (mode == "default") return RoleMode::Default;
     if (mode == "auto") return RoleMode::Auto;
     if (!provider.empty() || !model.empty()) return RoleMode::Fixed;
-    return RoleMode::Auto;
+    return RoleMode::Default;
 }
 
 struct RoleAssign {
-    RoleMode mode = RoleMode::Auto;
+    RoleMode mode = RoleMode::Default;
     std::string provider;
     std::string model;
     // Per-role reasoning effort: "auto" | "low" | "medium" | "high" (default auto).
     std::string thinking = "auto";
+    // Size-mode override: the tier it dispatches through ("small" | "medium" | "large").
+    std::string size;
 };
 struct ModelRolesUi {
+    RoleAssign chat;
+    std::set<std::string> activeOverrides;
+    bool legacyMissionWorkerFallback = false;
+    // Per-role overrides apply only while this is on; off = every role dispatches via its tier.
+    bool advancedOverrides = false;
+    std::set<std::string> legacyMissionFallbackExclusions;
     std::map<std::string, RoleAssign> roles;
+    std::map<std::string, RoleAssign> sizes;
+    std::map<std::string, std::string> roleSizes;
+    std::string assignmentMode = "simple";
     bool rolesLoaded = false;
     bool rolesRpcMissing = false;
     bool rolesPollInFlight = false;
+    bool rolesPollSuperseded = false;
+    // The last ai_roles_get/ai_roles_set answer was "a running agent turn holds the service
+    // lane": a wait. The loaded assignments stay; nothing was read or saved meanwhile.
+    bool rolesDeferred = false;
     double lastRolesPoll = -1e9;
     std::string lastError;
     bool rolesSaveInFlight = false;
+    nlohmann::json pendingPatch;
 };
 static ModelRolesUi s_roles;
 
@@ -2858,16 +3243,12 @@ static void pollBenchStatus(AppState& st, bool force, ui::leaderboard::Board* lb
         s_bench.pollInFlight = false;
         if (!r.ok || !r.result.is_object()) return;
         const bool was = s_bench.running;
-        s_bench.running = r.result.value("running", false);
-        s_bench.stage = r.result.value("stage", std::string("idle"));
-        s_bench.lastError = r.result.value("last_error", std::string());
+        s_bench.running = optionalJsonBool(r.result, "running", false);
+        s_bench.stage = optionalJsonString(r.result, "stage");
+        if (s_bench.stage.empty()) s_bench.stage = "idle";
+        s_bench.lastError = optionalJsonString(r.result, "last_error");
         if (s_bench.lastError == "null") s_bench.lastError.clear();
-        // nlohmann may return empty for null; also accept null type.
-        if (r.result.contains("last_error") && r.result["last_error"].is_null())
-            s_bench.lastError.clear();
-        s_bench.lastResultPath = r.result.value("last_result_path", std::string());
-        if (r.result.contains("last_result_path") && r.result["last_result_path"].is_null())
-            s_bench.lastResultPath.clear();
+        s_bench.lastResultPath = optionalJsonString(r.result, "last_result_path");
         // Transition running → done: auto-refresh leaderboard + categories.
         if (was && !s_bench.running) {
             if (lbRefresh) *lbRefresh = ui::leaderboard::load();
@@ -2935,137 +3316,79 @@ static void pollBenchCategories(AppState& st, bool force) {
     });
 }
 
-// Wire provider name used by role/ranking RPCs. PROV_CLOUDCOMPAT is a single slot hosting
-// services discriminated by base_url, so the preset selects its real provider id exactly as
-// composer.cpp::agentProviderOverride does.
-static const char* roleProviderWire(int prov, const std::string& model = {}) {
-    if (prov == ui::PROV_CLOUDCOMPAT) {
-        for (const auto& p : ui::cloudPresets())
-            if (p.id == model) return ui::cloudServiceWireName(ui::cloudServiceKey(p.baseUrl));
-        return "openai";  // unknown/custom base_url — generic OpenAI-compatible transport
-    }
-    switch (prov) {
-        case ui::PROV_ANTHROPIC:   return "anthropic";
-        case ui::PROV_OPENAI:      return "openai";
-        case ui::PROV_LOCAL:       return "local";
-        case ui::PROV_LLAMACPP:    return "llamacpp";
-        case ui::PROV_GEMINI:      return "gemini";
-        case ui::PROV_XAI:         return "xai";
-        case ui::PROV_CURSOR:      return "cursor";
-        case ui::PROV_KIMISUB:     return "kimi-code";  // bridge id; "kimi-sub" has no resolver
-        default: return "local";
-    }
+
+// Candidate provider IDs accepted by the worker's redaction policy. The worker also verifies
+// the configured endpoint is loopback before saving; a generic HTTP probe cannot establish this.
+static bool providerMayBeLoopback(const std::string& provider) {
+    return provider == "llamacpp" || provider == "llama.cpp" || provider == "llama-cpp" ||
+           provider == "lmstudio" || provider == "ollama" || provider == "vllm";
 }
 
-static int roleProviderFromWire(const std::string& w) {
-    if (w == "anthropic") return ui::PROV_ANTHROPIC;
-    if (w == "openai") return ui::PROV_OPENAI;
-    if (w == "local") return ui::PROV_LOCAL;
-    if (w == "llamacpp") return ui::PROV_LLAMACPP;
-    if (w == "gemini") return ui::PROV_GEMINI;
-    if (w == "openrouter" || w == "cloud" || w == "cloudcompat" || w == "moonshot" ||
-        w == "deepseek" || w == "alibaba-coding-plan" || w == "amazon-bedrock" || w == "azure" ||
-        w == "google-antigravity" || w == "aimlapi" || w == "openai-codex")
-        return ui::PROV_CLOUDCOMPAT;
-    if (w == "xai" || w == "xai-sub") return ui::PROV_XAI;
-    if (w == "cursor" || w == "cursor-sub") return ui::PROV_CURSOR;
-    if (w == "kimi-code" || w == "kimi-sub") return ui::PROV_KIMISUB;  // kimi-sub: legacy config
-    return -1;
-}
-
-static bool providerIsLoopback(int prov) {
-    return prov == ui::PROV_LOCAL || prov == ui::PROV_LLAMACPP;
-}
-
-// Flat picker entry for role model dropdowns.
+// Preserve the exact OMP provider ID, even when multiple providers share a display slot.
 struct RolePickEntry {
     RoleMode mode = RoleMode::Fixed;
-    int provider = ui::PROV_LOCAL;
+    std::string wire;
     std::string model;
-    std::string label;  // display
+    std::string label;
 };
 
-// includeAuto=false for surfaces with no ranked-auto engine (Eng. Firm): those get
-// exactly the Default row plus the concrete models.
-static std::vector<RolePickEntry> buildRolePickList(AppState& st, bool localOnly,
-                                                    bool includeAuto = true) {
-    std::vector<RolePickEntry> out;
-    out.push_back(RolePickEntry{RoleMode::Default, 0, "", kRoleModeDefaultLabel});
-    if (includeAuto)
-        out.push_back(RolePickEntry{RoleMode::Auto, 0, "", kRoleModeAutoLabel});
-    // Keep the pick list aligned with the composer dropdown: only providers the user can
-    // actually run (API key present, subscription signed in, or local endpoint up).
-    ui::refreshModelAvailability(st, false);
-    auto add = [&](int prov, const std::string& model, const std::string& label) {
-        if (localOnly && !providerIsLoopback(prov)) return;
-        if (!ui::providerUsable(st, prov)) return;
-        RolePickEntry e;
-        e.mode = RoleMode::Fixed;
-        e.provider = prov;
-        e.model = model;
-        e.label = label;
-        out.push_back(std::move(e));
+static bool rolePickMatches(const RolePickEntry& pick, const char* filter) {
+    if (!filter[0]) return true;
+    const char* end = filter + std::strlen(filter);
+    const auto contains = [filter, end](const std::string& text) {
+        return std::search(text.begin(), text.end(), filter, end, [](char a, char b) {
+            return std::tolower(static_cast<unsigned char>(a)) ==
+                   std::tolower(static_cast<unsigned char>(b));
+        }) != text.end();
     };
-    // Cloud catalog (Gemini / Anthropic / OpenAI / xAI / Cursor / Kimi Code), in built-in
-    // provider order — but each provider's rows come from its LIVE agent_list_models probe when
-    // one succeeded (ui::providerPickerModels), so a model released after this build is
-    // role-assignable without a catalog edit. The static catalog is the per-provider fallback.
-    std::set<int> emittedProv;
-    for (const auto& b : ui::builtinModels()) {
-        if (!emittedProv.insert(b.provider).second) continue;
-        for (const auto& m : ui::providerPickerModels(st, b.provider)) {
-            char buf[256];
-            std::snprintf(buf, sizeof(buf), "%s \xc2\xb7 %s",
-                          ui::providerLabel(m.provider), m.label.c_str());
-            add(m.provider, m.id, buf);
+    return contains(pick.label) || contains(pick.model);
+}
+
+// Cache the built rows, not a copy of the runtime catalog on every settings frame.
+static const std::vector<RolePickEntry>& buildRolePickList(AppState& st, bool localOnly,
+                                                            bool includeAuto = true) {
+    ui::refreshBridgeModelCatalog(st, false);
+    ui::refreshSignedInProviders(st, false);
+    const auto& catalog = ui::bridgeModelCatalog();
+    size_t signature = 0;
+    auto mix = [&](size_t n) {
+        signature ^= n + size_t(0x9e3779b9) + (signature << 6) + (signature >> 2);
+    };
+    auto text = [&](const std::string& s) { mix(std::hash<std::string>{}(s)); };
+    for (const auto& m : catalog) {
+        text(m.provider); text(m.id); text(m.name); mix(m.deprecated);
+    }
+    for (const auto& p : st.signedInBridgeProviders) text(p);
+    for (const auto& p : st.settings.disabledProviders) text(p);
+    for (const auto& m : st.settings.hiddenModels) text(m);
+    for (const auto& m : st.settings.shownLegacyHiddenModels) text(m);
+    mix(ui::modelPickerLoading()); mix(ui::modelPickerError()); mix(ui::modelPickerDeferred());
+    struct Cache { size_t signature = 0; bool valid = false; std::vector<RolePickEntry> rows; };
+    static Cache caches[2][2];
+    Cache& cache = caches[localOnly ? 1 : 0][includeAuto ? 1 : 0];
+    if (cache.valid && cache.signature == signature) return cache.rows;
+    cache.signature = signature;
+    cache.valid = true;
+    auto& out = cache.rows;
+    out.clear();
+    if (!localOnly) {
+        // A per-role override (includeAuto) picks a tier or a concrete model; following the chat
+        // model is no override at all, so only the tier lists (chat, sizes) offer it.
+        if (includeAuto) {
+            out.push_back({RoleMode::Tier, "", "", "Use tier assignment"});
+            out.push_back({RoleMode::Size, "", "small", "Small tier"});
+            out.push_back({RoleMode::Size, "", "medium", "Medium tier"});
+            out.push_back({RoleMode::Size, "", "large", "Large tier"});
+        } else {
+            out.push_back({RoleMode::Default, "", "", kRoleModeDefaultLabel});
         }
     }
-    // Cloud presets: OpenRouter/Alibaba/DeepSeek need cloud key (local or host-shared);
-    // Moonshot needs moonshot key (local or host-shared).
-    for (const auto& p : ui::cloudPresets()) {
-        const char* svc = ui::cloudServiceKey(p.baseUrl);
-        if (std::strcmp(svc, "moonshot") == 0) {
-            if (!ui::moonshotKeyPresent(st)) continue;
-        } else if (!ui::cloudCompatKeyPresent(st)) {
-            continue;
-        }
-        add(ui::PROV_CLOUDCOMPAT, p.id, p.label);
-    }
-    // Local presets + live-probed local models — only when local is actually in play:
-    // redaction/local-only picker, active provider is local, a local probe succeeded, or
-    // Offline/ITAR mode. Cloud-only users with no local server see no Local rows.
-    const bool includeLocal =
-        localOnly ||
-        st.settings.offlineMode ||
-        providerIsLoopback(st.settings.provider) ||
-        st.providerModels[ui::PROV_LOCAL].ok ||
-        st.providerModels[ui::PROV_LLAMACPP].ok;
-    if (includeLocal) {
-        for (const auto& p : ui::localPresets()) {
-            // Presets still require a usable local endpoint (or offline intent).
-            if (!ui::providerUsable(st, ui::PROV_LOCAL) && !st.settings.offlineMode &&
-                !providerIsLoopback(st.settings.provider))
-                break;
-            char buf[256];
-            std::snprintf(buf, sizeof(buf), "Local \xc2\xb7 %s", p.label.c_str());
-            add(ui::PROV_LOCAL, p.id, buf);
-        }
-        const ProviderModels& lpm = st.providerModels[ui::PROV_LOCAL];
-        if (lpm.ok) {
-            for (const auto& id : lpm.models) {
-                char buf[256];
-                std::snprintf(buf, sizeof(buf), "Local \xc2\xb7 %s", id.c_str());
-                add(ui::PROV_LOCAL, id, buf);
-            }
-        }
-        const ProviderModels& lcpp = st.providerModels[ui::PROV_LLAMACPP];
-        if (lcpp.ok) {
-            for (const auto& id : lcpp.models) {
-                char buf[256];
-                std::snprintf(buf, sizeof(buf), "llama.cpp \xc2\xb7 %s", id.c_str());
-                add(ui::PROV_LLAMACPP, id, buf);
-            }
-        }
+    // A legacy HTTP probe shares its rows across provider slots and supplies no OMP identity.
+    // Only the runtime catalog can provide a real provider/model pair for an online assignment.
+    for (const auto& m : catalog) {
+        if (!ui::bridgePickerModelUsable(st, m) ||
+            (localOnly && !providerMayBeLoopback(m.provider))) continue;
+        out.push_back({RoleMode::Fixed, m.provider, m.id, m.provider + " \xc2\xb7 " + m.name});
     }
     return out;
 }
@@ -3074,123 +3397,185 @@ static void ensureDefaultRoles() {
     for (int i = 0; i < kRoleCount; ++i) {
         if (s_roles.roles.find(kRoleKeys[i]) == s_roles.roles.end()) {
             RoleAssign a;
-            a.mode = RoleMode::Auto;
+            a.mode = RoleMode::Default;
             s_roles.roles[kRoleKeys[i]] = a;
         }
     }
 }
 
+static const char* kSizeKeys[] = {"small", "medium", "large"};
+
+static RoleAssign roleAssignFromJson(const nlohmann::json& value, RoleMode fallback) {
+    RoleAssign a;
+    a.mode = fallback;
+    if (value.is_string()) {
+        a.mode = value.get<std::string>() == "default" ? RoleMode::Default : RoleMode::Auto;
+    } else if (value.is_object()) {
+        a.provider = optionalJsonString(value, "provider");
+        a.model = optionalJsonString(value, "model");
+        a.size = optionalJsonString(value, "size");
+        const std::string mode = optionalJsonString(value, "mode");
+        if (!mode.empty() || !a.provider.empty() || !a.model.empty())
+            a.mode = roleModeFromWire(mode, a.provider, a.model);
+        a.thinking = optionalJsonString(value, "thinking");
+        if (a.thinking.empty()) a.thinking = "auto";
+    }
+    return a;
+}
+
+static void applyModelRolesReply(const nlohmann::json& result) {
+    const auto chat = result.find("chat_assignment");
+    s_roles.chat = chat == result.end() ? RoleAssign{} : roleAssignFromJson(*chat, RoleMode::Default);
+    s_roles.activeOverrides.clear();
+    const auto active = result.find("active_role_overrides");
+    if (active != result.end() && active->is_array())
+        for (const auto& role : *active)
+            if (role.is_string()) s_roles.activeOverrides.insert(role.get<std::string>());
+    s_roles.legacyMissionWorkerFallback =
+        optionalJsonBool(result, "legacy_mission_worker_fallback", false);
+    s_roles.legacyMissionFallbackExclusions.clear();
+    const auto exclusions = result.find("legacy_mission_worker_fallback_exclusions");
+    if (exclusions != result.end() && exclusions->is_array())
+        for (const auto& role : *exclusions)
+            if (role.is_string()) s_roles.legacyMissionFallbackExclusions.insert(role.get<std::string>());
+    s_roles.assignmentMode = result.value("assignment_mode", std::string("simple"));
+    s_roles.advancedOverrides = optionalJsonBool(result, "advanced_overrides", false);
+    auto roles = optionalJsonObj(result, "roles");
+    s_roles.roles.clear();
+    for (const char* key : kRoleKeys) {
+        auto it = roles.find(key);
+        s_roles.roles[key] = it == roles.end() ? RoleAssign{} :
+            roleAssignFromJson(*it, RoleMode::Default);
+    }
+    auto sizes = optionalJsonObj(result, "model_sizes");
+    s_roles.sizes.clear();
+    for (const char* key : kSizeKeys) {
+        auto it = sizes.find(key);
+        RoleAssign a;
+        a.mode = RoleMode::Default;
+        if (it != sizes.end()) a = roleAssignFromJson(*it, RoleMode::Default);
+        s_roles.sizes[key] = std::move(a);
+    }
+    s_roles.roleSizes.clear();
+    auto roleSizes = optionalJsonObj(result, "role_sizes");
+    for (auto it = roleSizes.begin(); it != roleSizes.end(); ++it)
+        if (it.value().is_string()) s_roles.roleSizes[it.key()] = it.value().get<std::string>();
+}
+
 static void pollModelRoles(AppState& st, bool force) {
     const double now = ImGui::GetTime();
-    if (!force && s_roles.rolesLoaded && (now - s_roles.lastRolesPoll) < 5.0) return;
+    // A read that has not landed yet normally retries at once; while a running turn defers it
+    // (rolesLoaded stays false), that would be one refused call per frame.
+    if (!force && (s_roles.rolesLoaded || s_roles.rolesDeferred) &&
+        (now - s_roles.lastRolesPoll) < 5.0)
+        return;
     if (s_roles.rolesPollInFlight || s_roles.rolesSaveInFlight) return;
     s_roles.lastRolesPoll = now;
     s_roles.rolesPollInFlight = true;
-    st.rpc.call("ai_roles_get", nlohmann::json::object(),
-                [](const core::RpcResult& r) {
+    s_roles.rolesPollSuperseded = false;
+    st.rpc.call("ai_roles_get", nlohmann::json::object(), [&st](const core::RpcResult& r) {
         s_roles.rolesPollInFlight = false;
-        if (!r.ok) {
+        // A write started after this read; its snapshot must not replace the save
+        // result (or the last confirmed state if the save fails).
+        if (s_roles.rolesPollSuperseded) return;
+        // A running agent turn holds hostd's agent lane (ai_roles_* are served from it) and
+        // every other call on it is refused at once. That is neither an empty read nor a
+        // missing service: its envelope carries no `ok`, and reading that as success replaced
+        // the loaded assignments with defaults every 5 s for as long as the run lasted. Keep
+        // what was confirmed and ask again at the normal cadence.
+        s_roles.rolesDeferred = core::workerLaneBusy(r);
+        if (s_roles.rolesDeferred) return;
+        if (!r.ok || !r.result.is_object() || r.result.contains("code") ||
+            !optionalJsonBool(r.result, "ok", false)) {
+            // The technical cause goes to the log; the panel says what the user can expect.
+            st.addLog("[models] model assignments could not be read: " +
+                      (!r.ok ? r.err : optionalJsonString(r.result, "reason")));
             s_roles.rolesRpcMissing = true;
-            ensureDefaultRoles();
-            s_roles.rolesLoaded = true;
-            return;
-        }
-        if (!r.result.is_object()) {
-            s_roles.rolesRpcMissing = true;
+            if (s_roles.pendingPatch.is_null())
+                s_roles.lastError =
+                    "Model assignments could not be loaded. It will try again automatically.";
             ensureDefaultRoles();
             s_roles.rolesLoaded = true;
             return;
         }
         s_roles.rolesRpcMissing = false;
-        auto roles = optionalJsonObj(r.result, "roles");
-        if (!roles.is_object()) roles = nlohmann::json::object();
-        s_roles.roles.clear();
-        for (int i = 0; i < kRoleCount; ++i) {
-            RoleAssign a;
-            a.mode = RoleMode::Auto;
-            a.thinking = "auto";
-            auto it = roles.find(kRoleKeys[i]);
-            if (it != roles.end()) {
-                if (it->is_string()) {
-                    // A bare string never pins a model (the resolver requires an object
-                    // with a provider), so anything but "default" means Auto.
-                    a.mode = (it->get<std::string>() == "default") ? RoleMode::Default
-                                                                   : RoleMode::Auto;
-                } else if (it->is_object()) {
-                    a.provider = optionalJsonString(*it, "provider");
-                    a.model = optionalJsonString(*it, "model");
-                    // mode=default → chat model, mode=auto → ranked pick, provider/model
-                    // → fixed pin, nothing recognized → Auto.
-                    a.mode = roleModeFromWire(optionalJsonString(*it, "mode"),
-                                              a.provider, a.model);
-                    // thinking: auto|low|medium|high (default auto).
-                    std::string th = optionalJsonString(*it, "thinking");
-                    if (th.empty()) th = "auto";
-                    if (th != "low" && th != "medium" && th != "high" && th != "auto")
-                        th = "auto";
-                    a.thinking = th;
-                }
-            }
-            s_roles.roles[kRoleKeys[i]] = std::move(a);
-        }
+        if (s_roles.pendingPatch.is_null()) s_roles.lastError.clear();
+        applyModelRolesReply(r.result);
         s_roles.rolesLoaded = true;
     });
 }
 
-static void setRoleAssign(AppState& st, const char* roleKey, const RoleAssign& a) {
-    if (s_roles.rolesRpcMissing) return;
-    s_roles.roles[roleKey] = a;
-    nlohmann::json p;
-    nlohmann::json roles = nlohmann::json::object();
-    // Always object form so thinking can ride alongside model auto/fixed.
+static nlohmann::json roleAssignToJson(const RoleAssign& a, bool thinking) {
     nlohmann::json entry = nlohmann::json::object();
-    if (a.mode == RoleMode::Default) {
-        entry["mode"] = "default";  // no provider → resolver falls through to chat model
-    } else if (a.mode == RoleMode::Auto) {
-        entry["mode"] = "auto";
-    } else {
+    if (a.mode == RoleMode::Tier) entry["mode"] = "tier";
+    else if (a.mode == RoleMode::Default) entry["mode"] = "default";
+    else if (a.mode == RoleMode::Size) { entry["mode"] = "size"; entry["size"] = a.size; }
+    else if (a.mode == RoleMode::Auto) entry["mode"] = "auto";
+    else {
+        entry["mode"] = "fixed";
         entry["provider"] = a.provider;
         entry["model"] = a.model;
     }
-    std::string th = a.thinking.empty() ? "auto" : a.thinking;
-    if (th != "low" && th != "medium" && th != "high" && th != "auto") th = "auto";
-    entry["thinking"] = th;
-    roles[roleKey] = std::move(entry);
-    p["roles"] = roles;
+    if (thinking) entry["thinking"] = a.thinking.empty() ? "auto" : a.thinking;
+    return entry;
+}
+
+static void sendPendingModelRoles(AppState& st) {
+    if (s_roles.pendingPatch.is_null() || s_roles.rolesSaveInFlight) return;
+    if (s_roles.rolesPollInFlight) s_roles.rolesPollSuperseded = true;
     s_roles.rolesSaveInFlight = true;
-    st.rpc.call("ai_roles_set", p, [](const core::RpcResult& r) {
+    s_roles.lastError.clear();
+    st.rpc.call("ai_roles_set", s_roles.pendingPatch, [](const core::RpcResult& r) {
         s_roles.rolesSaveInFlight = false;
-        if (!r.ok) {
-            s_roles.lastError = r.err.empty() ? "ai_roles_set failed" : r.err;
+        if (core::workerLaneBusy(r)) {
+            // The change was NOT saved: the draft stays, with Retry / Discard.
+            s_roles.rolesDeferred = true;
+            s_roles.lastError =
+                "Saving model assignments is available when the current run finishes.";
             return;
         }
-        // Prefer server echo when present.
-        if (r.result.is_object() && r.result.contains("roles") && r.result["roles"].is_object()) {
-            const auto& roles = r.result["roles"];
-            for (int i = 0; i < kRoleCount; ++i) {
-                auto it = roles.find(kRoleKeys[i]);
-                if (it == roles.end()) continue;
-                RoleAssign a;
-                a.thinking = "auto";
-                if (it->is_string()) {
-                    a.mode = (it->get<std::string>() == "default") ? RoleMode::Default
-                                                                   : RoleMode::Auto;
-                } else if (it->is_object()) {
-                    a.provider = optionalJsonString(*it, "provider");
-                    a.model = optionalJsonString(*it, "model");
-                    a.mode = roleModeFromWire(optionalJsonString(*it, "mode"),
-                                              a.provider, a.model);
-                    std::string th = optionalJsonString(*it, "thinking");
-                    if (th.empty()) th = "auto";
-                    if (th != "low" && th != "medium" && th != "high" && th != "auto")
-                        th = "auto";
-                    a.thinking = th;
-                }
-                s_roles.roles[kRoleKeys[i]] = a;
-            }
+        if (!r.ok || !r.result.is_object() || r.result.contains("code") ||
+            !optionalJsonBool(r.result, "ok", false)) {
+            s_roles.lastError = !r.ok ? (r.err.empty() ? "Could not save model assignments." : r.err)
+                : r.result.is_object() ? r.result.value("reason", std::string("Could not save model assignments."))
+                                       : "Invalid model assignment response.";
+            return;
         }
+        if (!r.result.contains("assignment_mode") || !r.result.contains("model_sizes") ||
+            !r.result.contains("roles")) {
+            s_roles.lastError = "The worker did not confirm the saved model assignments.";
+            return;
+        }
+        applyModelRolesReply(r.result);
+        s_roles.pendingPatch = nullptr;
+        s_roles.rolesRpcMissing = false;
+        s_roles.lastError.clear();
         s_roles.lastRolesPoll = ImGui::GetTime();
     });
+}
+
+static void saveModelRoles(AppState& st, const nlohmann::json& params) {
+    if (s_roles.rolesRpcMissing || !s_roles.rolesLoaded || !s_roles.pendingPatch.is_null() ||
+        s_roles.rolesSaveInFlight) return;
+    s_roles.pendingPatch = params;
+    sendPendingModelRoles(st);
+}
+
+static RoleAssign modelRolesDraft(const char* field, const char* key, const RoleAssign& confirmed) {
+    const auto& patch = s_roles.pendingPatch;
+    if (!patch.is_object()) return confirmed;
+    auto group = patch.find(field);
+    if (group == patch.end() || !group->is_object()) return confirmed;
+    auto entry = group->find(key);
+    return entry == group->end() ? confirmed : roleAssignFromJson(*entry, confirmed.mode);
+}
+
+static void setRoleAssign(AppState& st, const char* roleKey, const RoleAssign& a) {
+    saveModelRoles(st, {{"roles", {{roleKey, roleAssignToJson(a, true)}}}});
+}
+
+static void setSizeAssign(AppState& st, const char* sizeKey, const RoleAssign& a) {
+    saveModelRoles(st, {{"model_sizes", {{sizeKey, roleAssignToJson(a, true)}}}});
 }
 
 static void drawPassRateBar(float rate, float width, float height) {
@@ -3438,29 +3823,513 @@ static void drawBenchRunner(AppState& st, float sc, ui::leaderboard::Board& lb,
         lbLast = -1e9;
 }
 
-static void drawModelRolesSection(AppState& st, float sc) {
-    pollModelRoles(st, /*force=*/false);
-    ensureDefaultRoles();
+static void settingsAuditLastText(const char* text) {
+    ImGuiContext& g = *GImGui;
+    IMGUI_TEST_ENGINE_ITEM_INFO(0, text, g.LastItemData.StatusFlags);
+}
 
-    dimText("Per-role model + thinking effort. Default follows the model chosen in the chat "
-            "composer; Auto picks the best available within enabled providers; or pin a "
-            "specific model. Thinking Auto lets the classifier (Default role) or dispatcher "
-            "(subagents) choose. Redaction is hard-locked to local (loopback) providers.");
+static void settingsAuditedDimText(const char* text) {
+    dimText(text);
+    settingsAuditLastText(text);
+}
 
+// Keep search and status outside the scrolling list, including when only one row is available.
+// The list is as tall as its rows (at least 3, at most kPickerMaxRows) and scrolls inside the
+// popover beyond that, so a long catalog never turns the picker into a page-long drop-down.
+static constexpr int kPickerMaxRows = 10;
+static void settingsBeginModelResults(float contentHeight) {
+    const float rowH = ImGui::GetFrameHeight();
+    const ImGuiViewport* vp = ImGui::GetWindowViewport();
+    // Reserve room for search, wrapped status, and the retry/navigation buttons even at HiDPI.
+    const int maxRows = std::max(1, std::min(kPickerMaxRows, static_cast<int>(
+        (vp->WorkSize.y - 2.0f * ImGui::GetStyle().DisplaySafeAreaPadding.y) / rowH) - 6));
+    const float height = ImClamp(contentHeight, static_cast<float>(std::min(3, maxRows)) * rowH,
+                                 static_cast<float>(maxRows) * rowH);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
+    ImGui::BeginChild("##model_results", ImVec2(0.0f, height),
+                      ImGuiChildFlags_NavFlattened);
+}
+
+static void settingsEndModelResults() {
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+}
+
+static void settingsModelPickerStatus(AppState& st, const std::vector<RolePickEntry>& picks,
+                                      int visibleCount, bool localOnly) {
+    const bool loading = ui::modelPickerLoading();
+    const bool error = ui::modelPickerError();
+    const bool deferred = ui::modelPickerDeferred();
+    if (loading) settingsAuditedDimText("Loading provider models...");
+    if (error) {
+        settingsAuditedDimText("Some provider information could not be refreshed. "
+                               "Previously confirmed models may still be shown.");
+        if (ImGui::SmallButton("Retry model discovery")) {
+            ui::refreshBridgeModelCatalog(st, true);
+            ui::refreshSignedInProviders(st, true);
+        }
+    }
+    const bool haveModel = std::any_of(picks.begin(), picks.end(),
+        [](const RolePickEntry& pick) { return pick.mode == RoleMode::Fixed; });
+    // A running turn keeps the live read waiting: not an error, and not "you have no models".
+    if (deferred)
+        settingsAuditedDimText(haveModel
+            ? "Showing models from your last session. They refresh when the current run finishes."
+            : "Models appear when the current run finishes.");
+    else if (!loading && !error && !haveModel)
+        settingsAuditedDimText(localOnly ? "No available local models. Configure a local provider."
+                                        : "No available models. Sign in or configure a provider.");
+    else if (visibleCount == 0)
+        settingsAuditedDimText("No models match your filter.");
+    if ((!haveModel || error) && ImGui::SmallButton("Manage providers")) {
+        ImGui::CloseCurrentPopup();
+        st.openSettings = true;
+        st.openSettingsTab = SettingsProviders;
+    }
+}
+
+// The one model picker behind every model choice on the AI settings pages (chat model, size
+// tiers, per-role overrides, Copilot Quick settings): a kit-faced control opening a compact
+// popover — filter on top, a bounded scrolling list (tier / special choices first, then models
+// grouped under small provider headers) with the current choice highlighted, status and
+// recovery actions underneath. `width` < 0 fills the line.
+static void drawAssignmentPicker(AppState& st, const char* key, const RoleAssign& a,
+                                 const std::vector<RolePickEntry>& picks, bool isRedaction,
+                                 bool isSize, bool ro, bool isChat = false, float width = -1.0f) {
+    // Preserve unavailable and historical selections without selecting another row.
+    int sel = -1;
+    for (int pi = 0; pi < (int)picks.size(); ++pi) {
+        if (a.mode == RoleMode::Fixed) {
+            if (picks[pi].mode == RoleMode::Fixed && picks[pi].model == a.model &&
+                picks[pi].wire == a.provider) {
+                sel = pi;
+                break;
+            }
+        } else if (picks[pi].mode == a.mode &&
+                   (a.mode != RoleMode::Size || picks[pi].model == a.size)) {
+            sel = pi;
+        }
+    }
+
+    // Preview label. An unmatched pin still shows its raw wire value.
+    std::string preview;
+    if (a.mode == RoleMode::LegacyWorker) {
+        preview = "Mission: legacy worker fallback";
+    } else if (a.mode == RoleMode::Tier) {
+        preview = "Use tier assignment";
+    } else if (a.mode == RoleMode::Size) {
+        preview = sel >= 0 ? picks[sel].label : "Unknown tier";
+    } else if (a.mode == RoleMode::Default) {
+        preview = isRedaction ? "Choose a local model" :
+                  isChat ? "Runtime default" : kRoleModeDefaultLabel;
+    } else if (a.mode == RoleMode::Auto) {
+        preview = kRoleModeAutoLabel;
+    } else if (sel >= 0) {
+        preview = picks[sel].label;
+    } else {
+        // A pin the policy hides (Claude < 5.1 / GPT < 6) still shows as the current
+        // selection; it is just no longer offered in the list.
+        preview = a.provider + " \xc2\xb7 " + a.model +
+                  (ui::isLegacyGenerationModel(a.model) ? " (older model, not offered)"
+                                                        : " (unavailable)");
+    }
+
+    if (ro) ImGui::BeginDisabled();
+    ImGui::SetNextItemWidth(width);
+    float widestPick = 0.0f;
+    for (const auto& pick : picks)
+        widestPick = ImMax(widestPick, ImGui::CalcTextSize(pick.label.c_str()).x);
+    if (settingsBeginPopupRowCombo("##role_pick", preview.c_str(), widestPick,
+                                   ImGuiComboFlags_HeightLarge, 280.0f * ui::uiScale)) {
+        // Type-to-filter — list is already filtered to keyed/signed-in providers.
+        static char s_roleFilt[64] = "";
+        if (ImGui::IsWindowAppearing()) {
+            s_roleFilt[0] = 0;
+            ImGui::SetKeyboardFocusHere();
+        }
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputTextWithHint("##role_filt", "Type to filter...",
+                                 s_roleFilt, sizeof(s_roleFilt));
+
+        // Visible rows: specials first (no header), then concrete models grouped by provider in
+        // the catalog's own order.
+        struct Group { std::string wire; std::vector<int> rows; };
+        std::vector<int> specials;
+        std::vector<Group> groups;
+        for (int pi = 0; pi < (int)picks.size(); ++pi) {
+            if (!rolePickMatches(picks[pi], s_roleFilt)) continue;
+            if (picks[pi].mode != RoleMode::Fixed) {
+                specials.push_back(pi);
+                continue;
+            }
+            auto group = std::find_if(groups.begin(), groups.end(),
+                [&](const Group& g) { return g.wire == picks[pi].wire; });
+            if (group == groups.end()) {
+                groups.push_back({picks[pi].wire, {}});
+                group = groups.end() - 1;
+            }
+            group->rows.push_back(pi);
+        }
+        // Providers read alphabetically so a group is findable at a glance; models keep the
+        // catalog's order inside their group.
+        std::stable_sort(groups.begin(), groups.end(),
+                         [](const Group& l, const Group& r) { return l.wire < r.wire; });
+        int visibleCount = static_cast<int>(specials.size());
+        for (const auto& group : groups) visibleCount += static_cast<int>(group.rows.size());
+        const float rowH = ImGui::GetFrameHeight();
+        const float headH = ImGui::GetTextLineHeight() + ui::metrics::px(8.0f);
+        const int firstRow = !specials.empty() ? specials.front()
+                           : !groups.empty() ? groups.front().rows.front() : -1;
+        const int lastRow = !groups.empty() ? groups.back().rows.back()
+                          : !specials.empty() ? specials.back() : -1;
+
+        auto drawRow = [&](int pi, bool grouped) {
+            ImGui::PushID(pi);
+            const bool selected = (pi == sel);
+            ImDrawFlags corners = ImDrawFlags_RoundCornersNone;
+            if (pi == firstRow) corners |= ImDrawFlags_RoundCornersTop;
+            if (pi == lastRow) corners |= ImDrawFlags_RoundCornersBottom;
+            const std::string fullLabel = isChat && picks[pi].mode == RoleMode::Default
+                ? std::string("Runtime default") : picks[pi].label;
+            // Under a provider header the row shows the model name only; the observable label
+            // stays the full "provider · model".
+            std::string shown = fullLabel;
+            if (grouped && fullLabel.compare(0, picks[pi].wire.size(), picks[pi].wire) == 0) {
+                const size_t sep = fullLabel.find(" \xc2\xb7 ");
+                if (sep != std::string::npos) shown = fullLabel.substr(sep + 4);
+            }
+            const bool clicked = settingsPopupRowSelectable(shown.c_str(), selected, 0.0f, corners);
+            // Open on the current choice even when it sits deep in a long catalog.
+            if (selected && ImGui::IsWindowAppearing()) ImGui::SetScrollHereY(0.5f);
+            {
+                ImGuiContext& g = *GImGui;
+                IMGUI_TEST_ENGINE_ITEM_INFO(ImGui::GetItemID(), fullLabel.c_str(),
+                    g.LastItemData.StatusFlags | ImGuiItemStatusFlags_Checkable |
+                    (selected ? ImGuiItemStatusFlags_Checked : 0));
+            }
+            if (clicked) {
+                RoleAssign next = a;  // preserve thinking
+                next.mode = picks[pi].mode;
+                next.provider.clear();
+                next.model.clear();
+                next.size.clear();
+                if (picks[pi].mode == RoleMode::Fixed) {
+                    next.provider = picks[pi].wire;
+                    next.model = picks[pi].model;
+                } else if (picks[pi].mode == RoleMode::Size) {
+                    next.size = picks[pi].model;
+                }
+                if (isRedaction && next.mode == RoleMode::Fixed &&
+                           !providerMayBeLoopback(picks[pi].wire)) {
+                    s_roles.lastError =
+                        "Redaction role refuses non-loopback providers.";
+                } else {
+                    s_roles.lastError.clear();
+                    if (isChat) saveModelRoles(st, {{"chat_assignment", roleAssignToJson(next, false)}});
+                    else if (isSize) setSizeAssign(st, key, next);
+                    else setRoleAssign(st, key, next);
+                }
+                // Selectable's implicit popup close only applies to popup windows, not
+                // the scrolling child that owns these rows.
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::PopID();
+        };
+
+        settingsBeginModelResults(static_cast<float>(visibleCount) * rowH +
+                                  static_cast<float>(groups.size()) * headH);
+        for (int pi : specials) drawRow(pi, false);
+        for (const auto& group : groups) {
+            const ImVec2 p = ImGui::GetCursorScreenPos();
+            ImGui::Dummy(ImVec2(ImGui::GetContentRegionAvail().x, headH));
+            ImGui::GetWindowDrawList()->AddText(
+                ImVec2(p.x + ImGui::GetStyle().FramePadding.x,
+                       p.y + headH - ImGui::GetTextLineHeight() - ui::metrics::px(2.0f)),
+                ui::Palette::toU32(ui::palette.textDim), group.wire.c_str());
+            for (int pi : group.rows) drawRow(pi, true);
+        }
+        settingsEndModelResults();
+        settingsModelPickerStatus(st, picks, visibleCount, isRedaction);
+        settingsEndPopupRowCombo();
+    }
+    if (ro) ImGui::EndDisabled();
+    // A split row (explicit width) has no room for the wrapped note; the combo's tooltip carries
+    // the full text there.
+    if (width < 0.0f && ((a.mode == RoleMode::Fixed && sel < 0) || a.mode == RoleMode::Auto ||
+        ImGui::CalcTextSize(preview.c_str()).x > ImGui::GetContentRegionAvail().x)) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.textDim));
+        ImGui::TextWrapped("%s", preview.c_str());
+        settingsAuditLastText(preview.c_str());
+        ImGui::PopStyleColor();
+    }
+}
+
+// Select only levels reported for this exact model. Missing metadata is not an empty ladder.
+// `autoLabel` names the unset choice ("Runtime default" per role, "Auto" per tier); `width` < 0
+// fills the line.
+static bool drawThinkingChoice(const char* id, const std::string& provider,
+                               const std::string& model, std::string& effort,
+                               const char* autoLabel = "Runtime default", float width = -1.0f) {
+    const auto* meta = ui::bridgeModelMeta(provider, model);
+    const bool known = meta && meta->reasoningEffortsKnown;
+    const bool isDefault = effort.empty() || effort == "auto";
+    const bool supported = known && std::find(meta->reasoningEfforts.begin(),
+                                              meta->reasoningEfforts.end(), effort)
+                                      != meta->reasoningEfforts.end();
+    std::string preview = isDefault ? autoLabel : effort;
+    if (!isDefault && !supported) preview += known ? " (unsupported)" : " (unknown)";
+    bool changed = false;
+    ImGui::SetNextItemWidth(width);
+    if (settingsBeginPopupRowCombo(id, preview.c_str(), 140.0f * ui::uiScale,
+                                   ImGuiComboFlags_HeightLarge)) {
+        if (settingsPopupRowSelectable(autoLabel, isDefault)) {
+            effort = "auto";
+            changed = true;
+        }
+        if (isDefault) ImGui::SetItemDefaultFocus();
+        if (known) {
+            for (const auto& level : meta->reasoningEfforts) {
+                const bool selected = effort == level;
+                if (settingsPopupRowSelectable(level.c_str(), selected)) {
+                    effort = level;
+                    changed = true;
+                }
+                if (selected) ImGui::SetItemDefaultFocus();
+            }
+        } else {
+            dimText("Thinking capabilities unavailable for this model.");
+        }
+        settingsEndPopupRowCombo();
+    }
+    if (!isDefault && !supported) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
+        ImGui::TextWrapped("%s", preview.c_str());
+        settingsAuditLastText(preview.c_str());
+        ImGui::PopStyleColor();
+    }
+    return changed;
+}
+
+// Read-only notice, last save error, and the unsaved/saving draft with its Retry/Discard actions.
+// Shared by every surface that edits model assignments (Settings → AI → Models and Copilot Quick
+// settings), so the draft/ack/retry machinery has one face. Returns true when the pickers must
+// be read-only: no confirmed state yet, RPC missing, or a draft still awaiting its ack.
+static bool drawModelRolesStatus(AppState& st) {
+    if (s_roles.rolesDeferred)
+        dimText(s_roles.rolesLoaded ? "Model assignments refresh when the current run finishes."
+                                    : "Model assignments load when the current run finishes.");
     if (s_roles.rolesRpcMissing) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
-        ImGui::TextWrapped("ai_roles_* RPC not available \xe2\x80\x94 showing defaults (read-only).");
+        ImGui::TextWrapped("Model assignments are unavailable (read-only).");
         ImGui::PopStyleColor();
     }
     if (!s_roles.lastError.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusErr));
         ImGui::TextWrapped("%s", s_roles.lastError.c_str());
+        {
+            ImGuiContext& g = *GImGui;
+            IMGUI_TEST_ENGINE_ITEM_INFO(0, s_roles.lastError.c_str(), g.LastItemData.StatusFlags);
+        }
         ImGui::PopStyleColor();
     }
+    const bool hasDraft = !s_roles.pendingPatch.is_null();
+    if (hasDraft) {
+        const char* status = s_roles.rolesSaveInFlight ? "Saving model assignment..." :
+                             "Unsaved model assignment. Retry or discard this change.";
+        dimText(status);
+        {
+            ImGuiContext& g = *GImGui;
+            IMGUI_TEST_ENGINE_ITEM_INFO(0, status, g.LastItemData.StatusFlags);
+        }
+        if (!s_roles.rolesSaveInFlight) {
+            if (ImGui::Button("Retry save")) sendPendingModelRoles(st);
+            ImGui::SameLine();
+            if (ImGui::Button("Discard change")) {
+                s_roles.pendingPatch = nullptr;
+                s_roles.lastError.clear();
+                s_roles.lastRolesPoll = -1e9;
+            }
+        }
+    }
+    return s_roles.rolesRpcMissing || !s_roles.rolesLoaded || hasDraft ||
+           s_roles.rolesSaveInFlight;
+}
 
-    // Build picker once per frame (cheap; catalogs are small).
-    const auto allPicks = buildRolePickList(st, /*localOnly=*/false);
-    const auto localPicks = buildRolePickList(st, /*localOnly=*/true);
+static const char* kSizeLabels[] = {"Small", "Medium", "Large"};
+
+// Roles currently resolving to one size tier: a short "A, B, C +n" form and the full list.
+static void modelSizeUsage(const char* key, std::string& usage, std::string& fullUsage) {
+    int count = 0;
+    for (int r = 0; r < kRoleCount; ++r) {
+        auto it = s_roles.roleSizes.find(kRoleKeys[r]);
+        if (it == s_roles.roleSizes.end() || it->second != key) continue;
+        if (!fullUsage.empty()) fullUsage += ", ";
+        fullUsage += kRoleLabels[r];
+        if (count++ < 3) {
+            if (!usage.empty()) usage += ", ";
+            usage += kRoleLabels[r];
+        }
+    }
+    if (count > 3) usage += " +" + std::to_string(count - 3);
+}
+
+// One size tier's confirmed assignment, or the in-flight draft over it.
+static RoleAssign shownSizeAssign(const char* key) {
+    RoleAssign fallback;
+    fallback.mode = RoleMode::Default;
+    auto it = s_roles.sizes.find(key);
+    return modelRolesDraft("model_sizes", key, it == s_roles.sizes.end() ? fallback : it->second);
+}
+
+// One size tier's model picker over the shared confirmed/draft assignment. An explicit `width`
+// places it inside a split row (see drawAssignmentPicker).
+static void drawModelSizePicker(AppState& st, const char* key, bool ro,
+                                const std::vector<RolePickEntry>& picks, float width = -1.0f) {
+    drawAssignmentPicker(st, key, shownSizeAssign(key), picks, false, true, ro, false, width);
+}
+
+// The model whose reasoning ladder a tier's effort picker offers: the tier's pinned model, or,
+// while it follows the chat model, the chat assignment's pin. Unknown when neither is pinned.
+static void tierEffortModel(const RoleAssign& shown, std::string& provider, std::string& model) {
+    const RoleAssign* pinned = shown.mode == RoleMode::Fixed ? &shown
+        : shown.mode == RoleMode::Default && s_roles.chat.mode == RoleMode::Fixed ? &s_roles.chat
+        : nullptr;
+    if (!pinned) return;
+    provider = pinned->provider;
+    model = pinned->model;
+}
+
+// One size tier's thinking effort: Auto (the dispatching agent chooses per task) or a level the
+// tier's model supports. Persisted on the tier's `model_sizes` entry.
+static void drawModelSizeThinking(AppState& st, const char* key, bool ro, float width = -1.0f) {
+    const RoleAssign shown = shownSizeAssign(key);
+    std::string provider, model;
+    tierEffortModel(shown, provider, model);
+    RoleAssign next = shown;
+    if (ro) ImGui::BeginDisabled();
+    if (drawThinkingChoice("##size_think", provider, model, next.thinking, "Auto", width))
+        setSizeAssign(st, key, next);
+    if (ro) ImGui::EndDisabled();
+}
+
+// Settings layout: Size / usage | Model | Thinking table.
+static void drawModelSizeTable(AppState& st, bool ro) {
+    const auto& picks = buildRolePickList(st, /*localOnly=*/false, /*includeAuto=*/false);
+    if (!ImGui::BeginTable("##model_sizes", 3,
+                           ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |
+                               ImGuiTableFlags_SizingStretchProp)) return;
+    ImGui::TableSetupColumn("Size / usage", ImGuiTableColumnFlags_WidthStretch, 1.4f);
+    ImGui::TableSetupColumn("Model", ImGuiTableColumnFlags_WidthStretch, 2.4f);
+    ImGui::TableSetupColumn("Thinking", ImGuiTableColumnFlags_WidthFixed,
+                            110.0f * ui::uiScale);
+    ImGui::TableHeadersRow();
+    for (int i = 0; i < 3; ++i) {
+        const char* key = kSizeKeys[i];
+        ImGui::PushID(key);
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(kSizeLabels[i]);
+        settingsAuditLastText(kSizeLabels[i]);
+        std::string usage, fullUsage;
+        modelSizeUsage(key, usage, fullUsage);
+        if (!usage.empty()) {
+            dimText(usage.c_str());
+            if (usage != fullUsage && ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", fullUsage.c_str());
+        }
+        ImGui::TableNextColumn();
+        drawModelSizePicker(st, key, ro, picks);
+        ImGui::TableNextColumn();
+        drawModelSizeThinking(st, key, ro);
+        ImGui::PopID();
+    }
+    ImGui::EndTable();
+}
+
+// Copilot Quick settings layout: caption left in the caller's shared column, model picker and
+// thinking effort right; the controls drop under the caption (and the effort under the model)
+// when the remainder is too narrow. The roles using a tier ride on the caption's tooltip.
+// `captionInk` (0 = current text ink) tints the caption.
+static void drawModelSizeRows(AppState& st, bool ro, float captionColumn, ImU32 captionInk) {
+    const auto& picks = buildRolePickList(st, /*localOnly=*/false, /*includeAuto=*/false);
+    for (int i = 0; i < 3; ++i) {
+        const char* key = kSizeKeys[i];
+        ImGui::PushID(key);
+        const float x0 = ImGui::GetCursorScreenPos().x;
+        const float avail = ImGui::GetContentRegionAvail().x;
+        const float gap = ui::kit::padX();
+        const float col = ImMin(captionColumn, avail * 0.45f);
+        const float frameH = ImGui::GetFrameHeight();
+        const bool sideBySide = avail - col - gap >= frameH * 7.0f;
+        ImGui::AlignTextToFramePadding();
+        if (captionInk) ImGui::PushStyleColor(ImGuiCol_Text, captionInk);
+        ImGui::TextUnformatted(kSizeLabels[i]);
+        if (captionInk) ImGui::PopStyleColor();
+        settingsAuditLastText(kSizeLabels[i]);
+        std::string usage, fullUsage;
+        modelSizeUsage(key, usage, fullUsage);
+        if (!fullUsage.empty() && ImGui::IsItemHovered())
+            ui::kit::tooltip(("Used by: " + fullUsage).c_str());
+        float regionW = avail;
+        if (sideBySide) {
+            ImGui::SameLine(0.0f, 0.0f);
+            ImGui::SetCursorScreenPos(ImVec2(x0 + col + gap, ImGui::GetCursorScreenPos().y));
+            regionW = avail - col - gap;
+        }
+        const float thinkW = ImClamp(regionW * 0.36f, 76.0f * ui::uiScale, 120.0f * ui::uiScale);
+        const float modelW = regionW - thinkW - gap;
+        if (modelW >= frameH * 6.0f) {
+            drawModelSizePicker(st, key, ro, picks, modelW);
+            ImGui::SameLine(0.0f, gap);
+            drawModelSizeThinking(st, key, ro, thinkW);
+        } else {
+            drawModelSizePicker(st, key, ro, picks);
+            drawModelSizeThinking(st, key, ro);
+        }
+        ImGui::PopID();
+    }
+}
+
+static void drawModelRolesSection(AppState& st, float sc) {
+    pollModelRoles(st, /*force=*/false);
+    ensureDefaultRoles();
+
+    dimText("Choose three model sizes for the team, each with its thinking effort, or turn on "
+            "per-role overrides below. Unassigned sizes follow the chat model. "
+            "Redaction remains local and is configured in Advanced overrides.");
+
+    const bool ro = drawModelRolesStatus(st);
+    const bool hasDraft = !s_roles.pendingPatch.is_null();
+    ImGui::TextUnformatted("Chat model");
+    settingsAuditLastText("Chat model");
+    RoleAssign chat = s_roles.chat;
+    if (hasDraft && s_roles.pendingPatch.contains("chat_assignment"))
+        chat = roleAssignFromJson(s_roles.pendingPatch["chat_assignment"], chat.mode);
+    const auto& chatPicks = buildRolePickList(st, false, false);
+    ImGui::PushID("chat_assignment");
+    drawAssignmentPicker(st, "chat", chat, chatPicks, false, false, ro, true);
+    ImGui::PopID();
+    drawModelSizeTable(st, ro);
+    if (!ImGui::CollapsingHeader("Advanced overrides")) return;
+    // Explicit opt-in. Off: every role dispatches through its tier above, and any saved
+    // overrides below are kept but ignored.
+    bool overridesOn = s_roles.advancedOverrides;
+    if (hasDraft && s_roles.pendingPatch.contains("advanced_overrides") &&
+        s_roles.pendingPatch["advanced_overrides"].is_boolean())
+        overridesOn = s_roles.pendingPatch["advanced_overrides"].get<bool>();
+    bool overridesToggle = overridesOn;
+    if (ui::kit::checkbox("adv_overrides_on", "Use per-role overrides", &overridesToggle,
+                          "Off: every role uses its tier (Small, Medium or Large). On: the "
+                          "overrides below apply to their roles.", !ro))
+        saveModelRoles(st, {{"advanced_overrides", overridesToggle}});
+    dimText(!overridesOn
+        ? "Off: every role uses its tier. Saved overrides below are kept but ignored."
+        : s_roles.legacyMissionWorkerFallback
+        ? "Legacy missions may use the worker override where shown; choose a tier to change it."
+        : "Overrides apply only to the selected role; other roles use their tier.");
+
+    const auto& allPicks = buildRolePickList(st, /*localOnly=*/false);
+    const auto& localPicks = buildRolePickList(st, /*localOnly=*/true);
 
     if (ImGui::BeginTable("##model_roles", 3,
                           ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |
@@ -3473,8 +4342,18 @@ static void drawModelRolesSection(AppState& st, float sc) {
         for (int i = 0; i < kRoleCount; ++i) {
             const char* key = kRoleKeys[i];
             const bool isRedaction = (std::strcmp(key, "redaction") == 0);
-            RoleAssign& a = s_roles.roles[key];
+            RoleAssign a = modelRolesDraft("roles", key, s_roles.roles[key]);
+            if (!isRedaction && !s_roles.activeOverrides.count(key) &&
+                !(hasDraft && s_roles.pendingPatch.contains("roles") &&
+                  s_roles.pendingPatch["roles"].contains(key)))
+                a.mode = overridesOn && s_roles.legacyMissionWorkerFallback &&
+                         !s_roles.legacyMissionFallbackExclusions.count(key)
+                             ? RoleMode::LegacyWorker : RoleMode::Tier;
+            // Following the chat model is no override: such a saved entry dispatches by tier.
+            if (!isRedaction && a.mode == RoleMode::Default) a.mode = RoleMode::Tier;
             const auto& picks = isRedaction ? localPicks : allPicks;
+            // Redaction is local-only policy, not a tier override, so the switch never gates it.
+            const bool rowRo = ro || (!overridesOn && !isRedaction);
 
             ImGui::TableNextRow();
             ImGui::PushID(key);
@@ -3534,136 +4413,20 @@ static void drawModelRolesSection(AppState& st, float sc) {
             }
 
             ImGui::TableNextColumn();
-            // Selection index: row 0 = Default, row 1 = Auto, the rest concrete models.
-            // sel < 0 means a pinned model that is not in the current pick list.
-            int sel = (a.mode == RoleMode::Default) ? 0 : 1;
-            if (a.mode == RoleMode::Fixed) {
-                sel = -1;
-                const int wantProv = roleProviderFromWire(a.provider);
-                for (int pi = 0; pi < (int)picks.size(); ++pi) {
-                    if (picks[pi].mode != RoleMode::Fixed) continue;
-                    if (picks[pi].model == a.model &&
-                        (wantProv < 0 || picks[pi].provider == wantProv ||
-                         roleProviderWire(picks[pi].provider, picks[pi].model) == a.provider)) {
-                        sel = pi;
-                        break;
-                    }
-                }
-            }
+            drawAssignmentPicker(st, key, a, picks, isRedaction, false, rowRo);
 
-            // Preview label. An unmatched pin still shows its raw wire value.
-            std::string preview;
-            if (a.mode == RoleMode::Default) {
-                preview = kRoleModeDefaultLabel;
-            } else if (a.mode == RoleMode::Auto) {
-                preview = kRoleModeAutoLabel;
-            } else if (sel >= 0) {
-                preview = picks[sel].label;
-            } else {
-                preview = a.provider + " \xc2\xb7 " + a.model;
-                if (preview == " \xc2\xb7 ") preview = a.model.empty() ? kRoleModeAutoLabel
-                                                                       : a.model;
-            }
-
-            const bool ro = s_roles.rolesRpcMissing || s_roles.rolesSaveInFlight;
-            if (ro) ImGui::BeginDisabled();
-            ImGui::SetNextItemWidth(-1);
-            float widestPick = 0.0f;
-            for (const auto& pick : picks)
-                widestPick = ImMax(widestPick, ImGui::CalcTextSize(pick.label.c_str()).x);
-            if (settingsBeginPopupRowCombo("##role_pick", preview.c_str(), widestPick,
-                                           ImGuiComboFlags_HeightLarge)) {
-                // Type-to-filter — list is already filtered to keyed/signed-in providers.
-                static char s_roleFilt[64] = "";
-                if (ImGui::IsWindowAppearing()) {
-                    s_roleFilt[0] = 0;
-                    ImGui::SetKeyboardFocusHere();
-                }
-                ImGui::SetNextItemWidth(-1);
-                ImGui::InputTextWithHint("##role_filt", "Type to filter...",
-                                         s_roleFilt, sizeof(s_roleFilt));
-                auto lc = [](std::string s) {
-                    for (char& c : s) c = (char)std::tolower((unsigned char)c);
-                    return s;
-                };
-                const std::string fq = lc(s_roleFilt);
-                auto visible = [&](int pi) {
-                    if (fq.empty()) return true;
-                    const std::string hay = lc(picks[pi].label + " " + picks[pi].model);
-                    return hay.find(fq) != std::string::npos;
-                };
-                int firstVisible = -1;
-                int lastVisible = -1;
-                for (int pi = 0; pi < (int)picks.size(); ++pi) {
-                    if (!visible(pi)) continue;
-                    if (firstVisible < 0) firstVisible = pi;
-                    lastVisible = pi;
-                }
-                for (int pi = 0; pi < (int)picks.size(); ++pi) {
-                    if (!visible(pi)) continue;
-                    const bool selected = (pi == sel);
-                    ImDrawFlags corners = ImDrawFlags_RoundCornersNone;
-                    if (pi == firstVisible) corners |= ImDrawFlags_RoundCornersTop;
-                    if (pi == lastVisible) corners |= ImDrawFlags_RoundCornersBottom;
-                    if (settingsPopupRowSelectable(picks[pi].label.c_str(), selected,
-                                                   0.0f, corners)) {
-                        RoleAssign next = a;  // preserve thinking
-                        next.mode = picks[pi].mode;
-                        if (picks[pi].mode == RoleMode::Fixed) {
-                            next.provider = roleProviderWire(picks[pi].provider, picks[pi].model);
-                            next.model = picks[pi].model;
-                        } else {
-                            next.provider.clear();
-                            next.model.clear();
-                        }
-                        // Hard-enforce redaction local-only client-side too. Default is
-                        // refused as well: the chat model is usually a cloud provider.
-                        if (isRedaction && next.mode == RoleMode::Default) {
-                            s_roles.lastError =
-                                "Redaction role cannot follow the chat model \xe2\x80\x94 "
-                                "pick Auto or a loopback model.";
-                        } else if (isRedaction && next.mode == RoleMode::Fixed &&
-                                   !providerIsLoopback(picks[pi].provider)) {
-                            s_roles.lastError =
-                                "Redaction role refuses non-loopback providers.";
-                        } else {
-                            s_roles.lastError.clear();
-                            setRoleAssign(st, key, next);
-                        }
-                    }
-                    if (selected) ImGui::SetItemDefaultFocus();
-                }
-                settingsEndPopupRowCombo();
-            }
-            if (ro) ImGui::EndDisabled();
-
-            // Runtime clamps each override to the chosen model's catalog ladder.
             ImGui::TableNextColumn();
-            static const char* kThinkLabels[] = {"Auto", "Low", "Medium", "High", "Xhigh", "Max"};
-            static const char* kThinkValues[] = {"auto", "low", "medium", "high", "xhigh", "max"};
-            int thinkSel = 0;
-            for (int ti = 0; ti < 6; ++ti) {
-                if (a.thinking == kThinkValues[ti]) { thinkSel = ti; break; }
-            }
-            if (ro) ImGui::BeginDisabled();
-            ImGui::SetNextItemWidth(-1);
-            if (settingsPopupRowCombo("##role_think", &thinkSel, kThinkLabels, 6)) {
-                RoleAssign next = a;
-                next.thinking = kThinkValues[thinkSel];
+            // Effort follows the override's model; a tier reference uses that tier's model, and
+            // a role on its tier takes the tier's effort (set above), so it has none of its own.
+            std::string effortProvider = a.provider, effortModel = a.model;
+            if (a.mode == RoleMode::Size)
+                tierEffortModel(shownSizeAssign(a.size.c_str()), effortProvider, effortModel);
+            const bool hasEffort = a.mode == RoleMode::Fixed || a.mode == RoleMode::Size;
+            if (rowRo || !hasEffort) ImGui::BeginDisabled();
+            RoleAssign next = a;
+            if (drawThinkingChoice("##role_think", effortProvider, effortModel, next.thinking))
                 setRoleAssign(st, key, next);
-            }
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-                if (std::strcmp(key, "default") == 0) {
-                    ImGui::SetTooltip(
-                        "Auto: chat classifier assigns effort per prompt.\n"
-                        "Low through Max: force that level when the model supports it.");
-                } else {
-                    ImGui::SetTooltip(
-                        "Auto: dispatcher assigns effort by task complexity.\n"
-                        "Low through Max: force that level when the model supports it.");
-                }
-            }
-            if (ro) ImGui::EndDisabled();
+            if (rowRo || !hasEffort) ImGui::EndDisabled();
 
             // Redaction ITAR note lives on the Role [local] badge tooltip — never
             // TextWrapped inside the fixed-width Thinking column (that blew out the row).
@@ -3698,281 +4461,6 @@ static void drawHarnessOrganizationSection(AppState& st, float sc);
 bool        drawHarnessSessionKnobs(AppState& st, float sc);
 static void drawMemoryLearningSection(AppState& st, float sc);
 
-// ---- Eng. Firm model assignments (config.json eng_firm.models) ----------------
-// Top-level roles + 8 disciplines. Two states only — there is no ranked-auto engine here:
-// Default writes {"mode":"default"} (empty provider ⇒ the resolver falls through to the
-// ambient chat model), otherwise a pinned provider+model. Merge-overlay load/save never
-// clobbers unrelated keys.
-struct EngFirmAssign {
-    bool isDefault = true;
-    std::string provider;
-    std::string model;
-    std::string thinking = "medium";  // low|medium|high (default state omits thinking key)
-};
-struct EngFirmModelsUi {
-    std::map<std::string, EngFirmAssign> top;   // mission_planner|advisor|lead|subcontractor
-    std::map<std::string, EngFirmAssign> disc;  // 8 discipline keys
-    bool loaded = false;
-};
-static EngFirmModelsUi s_efModels;
-
-static const char* kEfTopKeys[] = {
-    "mission_planner", "advisor", "lead", "subcontractor"};
-static const char* kEfTopLabels[] = {
-    "Mission planner", "Advisor", "Lead (prime contractor)", "Subcontractor (default)"};
-static constexpr int kEfTopCount = 4;
-
-static const char* kEfDiscKeys[] = {
-    "mechanical", "electrical", "structural", "thermal",
-    "manufacturing", "drafting", "sourcing", "generalist"};
-static const char* kEfDiscLabels[] = {
-    "Mechanical", "Electrical", "Structural", "Thermal",
-    "Manufacturing", "Drafting", "Sourcing", "Generalist"};
-static constexpr int kEfDiscCount = 8;
-
-static EngFirmAssign parseEngFirmAssign(const nlohmann::json& j) {
-    EngFirmAssign a;
-    if (!j.is_object()) return a;
-    a.provider = j.value("provider", std::string());
-    a.model = j.value("model", std::string());
-    std::string th = j.value("thinking", std::string());
-    if (th != "low" && th != "medium" && th != "high") th = "medium";
-    a.thinking = th.empty() ? "medium" : th;
-    // Explicit {"mode":"default"} and the legacy empty provider+model form both mean
-    // "follow the chat model".
-    a.isDefault = j.value("mode", std::string()) == "default" ||
-                  (a.provider.empty() && a.model.empty());
-    return a;
-}
-
-static void loadEngFirmModelsUi() {
-    s_efModels.top.clear();
-    s_efModels.disc.clear();
-    for (int i = 0; i < kEfTopCount; ++i) s_efModels.top[kEfTopKeys[i]] = EngFirmAssign{};
-    for (int i = 0; i < kEfDiscCount; ++i) s_efModels.disc[kEfDiscKeys[i]] = EngFirmAssign{};
-    try {
-        std::ifstream in(configPath());
-        if (in) {
-            nlohmann::json j;
-            in >> j;
-            if (j.is_object() && j.contains("eng_firm") && j["eng_firm"].is_object()) {
-                const auto& ef = j["eng_firm"];
-                if (ef.contains("models") && ef["models"].is_object()) {
-                    const auto& m = ef["models"];
-                    for (int i = 0; i < kEfTopCount; ++i) {
-                        if (m.contains(kEfTopKeys[i]))
-                            s_efModels.top[kEfTopKeys[i]] = parseEngFirmAssign(m[kEfTopKeys[i]]);
-                    }
-                    if (m.contains("disciplines") && m["disciplines"].is_object()) {
-                        const auto& d = m["disciplines"];
-                        for (int i = 0; i < kEfDiscCount; ++i) {
-                            if (d.contains(kEfDiscKeys[i]))
-                                s_efModels.disc[kEfDiscKeys[i]] =
-                                    parseEngFirmAssign(d[kEfDiscKeys[i]]);
-                        }
-                    }
-                }
-            }
-        }
-    } catch (...) {}
-    s_efModels.loaded = true;
-}
-
-static void saveEngFirmModelsUi() {
-    updateConfigJson([&](nlohmann::json& j) {
-        if (!j.contains("eng_firm") || !j["eng_firm"].is_object())
-            j["eng_firm"] = nlohmann::json::object();
-        nlohmann::json models = nlohmann::json::object();
-        // Preserve unknown sibling keys under eng_firm.models (and disciplines).
-        if (j["eng_firm"].contains("models") && j["eng_firm"]["models"].is_object())
-            models = j["eng_firm"]["models"];
-
-        auto writeEntry = [](nlohmann::json& parent, const char* key, const EngFirmAssign& a) {
-            if (a.isDefault || a.model.empty()) {
-                // Explicit default state — the row stays in config.json instead of
-                // silently vanishing. Empty provider ⇒ ambient chat model.
-                nlohmann::json e = nlohmann::json::object();
-                e["mode"] = "default";
-                parent[key] = std::move(e);
-                return;
-            }
-            nlohmann::json e = nlohmann::json::object();
-            e["provider"] = a.provider;
-            e["model"] = a.model;
-            if (a.thinking == "low" || a.thinking == "medium" || a.thinking == "high")
-                e["thinking"] = a.thinking;
-            parent[key] = std::move(e);
-        };
-
-        for (int i = 0; i < kEfTopCount; ++i)
-            writeEntry(models, kEfTopKeys[i], s_efModels.top[kEfTopKeys[i]]);
-
-        nlohmann::json discs = nlohmann::json::object();
-        if (models.contains("disciplines") && models["disciplines"].is_object())
-            discs = models["disciplines"];
-        for (int i = 0; i < kEfDiscCount; ++i)
-            writeEntry(discs, kEfDiscKeys[i], s_efModels.disc[kEfDiscKeys[i]]);
-        if (discs.empty())
-            models.erase("disciplines");
-        else
-            models["disciplines"] = std::move(discs);
-
-        if (models.empty())
-            j["eng_firm"].erase("models");
-        else
-            j["eng_firm"]["models"] = std::move(models);
-        if (j["eng_firm"].empty())
-            j.erase("eng_firm");
-    });
-}
-
-static void drawEngFirmAssignRow(AppState& st, const char* id, const char* label,
-                                 EngFirmAssign& a, const std::vector<RolePickEntry>& picks,
-                                 float sc) {
-    (void)sc;
-    ImGui::TableNextRow();
-    ImGui::PushID(id);
-
-    ImGui::TableNextColumn();
-    ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted(label);
-
-    ImGui::TableNextColumn();
-    int sel = 0;  // row 0 = Default (chat model); the rest are concrete models
-    if (!a.isDefault) {
-        sel = -1;
-        const int wantProv = roleProviderFromWire(a.provider);
-        for (int pi = 0; pi < (int)picks.size(); ++pi) {
-            if (picks[pi].mode != RoleMode::Fixed) continue;
-            if (picks[pi].model == a.model &&
-                (wantProv < 0 || picks[pi].provider == wantProv ||
-                 roleProviderWire(picks[pi].provider, picks[pi].model) == a.provider)) {
-                sel = pi;
-                break;
-            }
-        }
-    }
-    std::string preview;
-    if (a.isDefault) {
-        preview = kRoleModeDefaultLabel;
-    } else if (sel >= 0) {
-        preview = picks[sel].label;
-    } else {
-        preview = a.provider + " \xc2\xb7 " + a.model;
-        if (preview == " \xc2\xb7 ")
-            preview = a.model.empty() ? kRoleModeDefaultLabel : a.model;
-    }
-    ImGui::SetNextItemWidth(-1);
-    float widestPick = 0.0f;
-    for (const auto& pick : picks)
-        widestPick = ImMax(widestPick, ImGui::CalcTextSize(pick.label.c_str()).x);
-    if (settingsBeginPopupRowCombo("##ef_pick", preview.c_str(), widestPick,
-                                   ImGuiComboFlags_HeightLarge)) {
-        static char s_efFilt[64] = "";
-        if (ImGui::IsWindowAppearing()) {
-            s_efFilt[0] = 0;
-            ImGui::SetKeyboardFocusHere();
-        }
-        ImGui::SetNextItemWidth(-1);
-        ImGui::InputTextWithHint("##ef_filt", "Type to filter...",
-                                 s_efFilt, sizeof(s_efFilt));
-        auto lc = [](std::string s) {
-            for (char& c : s) c = (char)std::tolower((unsigned char)c);
-            return s;
-        };
-        const std::string fq = lc(s_efFilt);
-        auto visible = [&](int pi) {
-            if (fq.empty()) return true;
-            const std::string hay = lc(picks[pi].label + " " + picks[pi].model);
-            return hay.find(fq) != std::string::npos;
-        };
-        int firstVisible = -1;
-        int lastVisible = -1;
-        for (int pi = 0; pi < (int)picks.size(); ++pi) {
-            if (!visible(pi)) continue;
-            if (firstVisible < 0) firstVisible = pi;
-            lastVisible = pi;
-        }
-        for (int pi = 0; pi < (int)picks.size(); ++pi) {
-            if (!visible(pi)) continue;
-            const bool selected = (pi == sel);
-            ImDrawFlags corners = ImDrawFlags_RoundCornersNone;
-            if (pi == firstVisible) corners |= ImDrawFlags_RoundCornersTop;
-            if (pi == lastVisible) corners |= ImDrawFlags_RoundCornersBottom;
-            if (settingsPopupRowSelectable(picks[pi].label.c_str(), selected,
-                                           0.0f, corners)) {
-                if (picks[pi].mode == RoleMode::Fixed) {
-                    a.isDefault = false;
-                    a.provider = roleProviderWire(picks[pi].provider, picks[pi].model);
-                    a.model = picks[pi].model;
-                    if (a.thinking != "low" && a.thinking != "medium" && a.thinking != "high")
-                        a.thinking = "medium";
-                } else {
-                    a.isDefault = true;
-                    a.provider.clear();
-                    a.model.clear();
-                }
-                saveEngFirmModelsUi();
-            }
-            if (selected) ImGui::SetItemDefaultFocus();
-        }
-        settingsEndPopupRowCombo();
-    }
-
-    ImGui::TableNextColumn();
-    static const char* kThinkLabels[] = {"Low", "Medium", "High"};
-    static const char* kThinkValues[] = {"low", "medium", "high"};
-    int thinkSel = 1;  // medium default
-    for (int ti = 0; ti < 3; ++ti) {
-        if (a.thinking == kThinkValues[ti]) { thinkSel = ti; break; }
-    }
-    if (a.isDefault) ImGui::BeginDisabled();
-    ImGui::SetNextItemWidth(-1);
-    if (settingsPopupRowCombo("##ef_think", &thinkSel, kThinkLabels, 3)) {
-        a.thinking = kThinkValues[thinkSel];
-        saveEngFirmModelsUi();
-    }
-    if (a.isDefault) ImGui::EndDisabled();
-
-    ImGui::PopID();
-}
-
-static void drawEngFirmModelAssignments(AppState& st, float sc) {
-    if (!s_efModels.loaded) loadEngFirmModelsUi();
-
-    dimText("Default (chat model) rows follow whatever model the chat composer is set to "
-            "\xe2\x80\x94 there is no ranked auto-pick here. Eng. Firm runs resolve: "
-            "discipline -> lead/subcontractor -> chat model.");
-
-    const auto picks = buildRolePickList(st, /*localOnly=*/false, /*includeAuto=*/false);
-
-    if (ImGui::BeginTable("##ef_models", 3,
-                          ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |
-                              ImGuiTableFlags_SizingStretchProp)) {
-        ImGui::TableSetupColumn("Role", ImGuiTableColumnFlags_WidthStretch, 1.2f);
-        ImGui::TableSetupColumn("Model", ImGuiTableColumnFlags_WidthStretch, 2.4f);
-        ImGui::TableSetupColumn("Thinking", ImGuiTableColumnFlags_WidthFixed, 110.0f * sc);
-        ImGui::TableHeadersRow();
-
-        for (int i = 0; i < kEfTopCount; ++i)
-            drawEngFirmAssignRow(st, kEfTopKeys[i], kEfTopLabels[i],
-                                s_efModels.top[kEfTopKeys[i]], picks, sc);
-
-        // Lightweight separator label row for disciplines.
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn();
-        ImGui::AlignTextToFramePadding();
-        dimText("Disciplines");
-        ImGui::TableNextColumn();
-        ImGui::TableNextColumn();
-
-        for (int i = 0; i < kEfDiscCount; ++i)
-            drawEngFirmAssignRow(st, kEfDiscKeys[i], kEfDiscLabels[i],
-                                s_efModels.disc[kEfDiscKeys[i]], picks, sc);
-
-        ImGui::EndTable();
-    }
-}
 
 static void drawHarnessOrganizationSection(AppState& st, float sc) {
     // Mode chips in 2 columns (3 on wide panes): active mode accented, others secondary.
@@ -4012,8 +4500,8 @@ static void drawHarnessOrganizationSection(AppState& st, float sc) {
 }
 
 // Settings → AI → Harness: full mirror of copilot Quick settings + extras that
-// only live in the modal (role adoption, company auto-route, Eng. Firm budget,
-// privacy). Laid out in a 2-column grid to save vertical space.
+// only live in the modal (role adoption, privacy).
+// Laid out in a 2-column grid to save vertical space.
 bool drawHarnessSessionKnobs(AppState& st, float sc) {
     Settings& settings = st.settings;
     bool changed = false;
@@ -4101,8 +4589,7 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
                           ImGuiTableFlags_SizingStretchSame |
                           ImGuiTableFlags_NoPadOuterX)) {
         // Orchestration-topology flags: all ADVANCED. Each one changes how work is routed
-        // (advisor injects, company departments) and both ship off/lean, which is the
-        // correct normal configuration.
+        // (advisor injects) and ships off/lean, which is the correct normal configuration.
         if (adv) {
             ImGui::TableNextColumn();
             if (ui::kit::checkbox("h_proactive", "Proactive advisor", &settings.proactiveAdvisor))
@@ -4111,14 +4598,6 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
                        "Cheap deterministic notes by default; at most one short "
                        "advisor-model call on severe streaks (encourage/require). "
                        "Off = no proactive injects (pull request_advice still works).");
-            ImGui::TableNextColumn();
-            if (ui::kit::checkbox("h_company", "Company structure auto-route",
-                                  &settings.corporateMode))
-                changed = true;
-            helpMarker("Applies to the explicit offline modeling fallback only: when on, a "
-                       "complex cross-discipline request may route as company (director + "
-                       "departments) there. Default off. The online agent turn organizes its "
-                       "own work regardless of this flag.");
         }
 
         ImGui::TableNextColumn();
@@ -4133,7 +4612,8 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
 
         ImGui::TableNextColumn();
         ui::kit::checkbox("h_thoughts", "Show assistant thoughts", &ui::assistantThoughtsVisible(),
-                          "Show the AI's reasoning steps inline in the conversation.");
+                          "Show the AI's reasoning steps inline in the conversation "
+                          "(this session only).");
 
         ImGui::TableNextColumn();
         {
@@ -4268,9 +4748,9 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
                           ImGuiTableFlags_NoPadOuterX)) {
         ImGui::TableNextColumn();
         {
-            static int s_toolCallBudget = -1;
-            if (s_toolCallBudget < 0)
-                s_toolCallBudget = ui::loadSubagentToolCallBudget();
+            // Shared cache (ui::loadSubagentToolCallBudget): refreshed by its saver, so a change
+            // made anywhere shows here on the next frame instead of after a restart.
+            const int toolCallBudget = ui::loadSubagentToolCallBudget();
             settingsLabelLead("Subagent tool-call budget",
                               "A delegated subagent gets a soft warning to converge at this "
                               "many tool calls. Leave empty (Auto) to derive it from the "
@@ -4278,8 +4758,8 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
                               "Saved to config.json agent.subagent_tool_call_budget.",
                               harnessLeftColW);
             // 0 = automatic: shown as an empty field with an "Auto" hint, never as a zero.
-            bool manual = s_toolCallBudget > 0;
-            int budget = manual ? s_toolCallBudget : 16;
+            bool manual = toolCallBudget > 0;
+            int budget = manual ? toolCallBudget : 16;
             if (ui::kit::fieldInt("h_subagent_calls", "", &budget,
                                   ui::kit::FieldOpts()
                                       .withPresent(&manual)
@@ -4287,15 +4767,14 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
                                       .withRange(1, 64)
                                       .withTip("Tool calls before a subagent is told to "
                                                "converge (1-64). Empty = Auto."))) {
-                s_toolCallBudget = manual ? budget : 0;
-                ui::saveSubagentToolCallBudget(s_toolCallBudget);
+                ui::saveSubagentToolCallBudget(manual ? budget : 0);
             }
         }
 
         ImGui::TableNextColumn();
         {
-            static int s_maxDepth = -1;
-            if (s_maxDepth < 0) s_maxDepth = ui::loadMaxSubagentDepth();
+            // Shared cache (ui::loadMaxSubagentDepth) — Quick settings reads the same one.
+            const int maxDepth = ui::loadMaxSubagentDepth();
             settingsLabelLead("Max subagent nesting",
                               "Nesting levels of subagent-spawning-subagent (not concurrency). "
                               "Root chat = depth 0. Saved to config.json "
@@ -4308,37 +4787,13 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
                 "Two nested levels below the main chat.",
                 "Three nested levels below the main chat.",
                 "Four nested levels below the main chat."};
-            int depth = ImClamp(s_maxDepth, 0, 4);
+            int depth = ImClamp(maxDepth, 0, 4);
             if (ui::kit::segmented("##h_depth", kDepthLabels, 5, &depth,
                                    ImGui::GetContentRegionAvail().x, kDepthTips)) {
-                s_maxDepth = depth;
                 ui::saveMaxSubagentDepth(depth);
             }
         }
 
-        ImGui::TableNextColumn();
-        {
-            static const char* kMemoryBackends[] = {"off", "sharpshooter", "mnemo"};
-            static const char* kMemoryLabels[] = {"Off", "Decisions", "Full recall"};
-            int cur = 1;
-            for (int i = 0; i < 3; ++i)
-                if (settings.memoryBackend == kMemoryBackends[i]) cur = i;
-            settingsLabelLead(
-                "Project memory",
-                "What the agent remembers between conversations, kept separately for each "
-                "project folder; other projects never see it.\n"
-                "Decisions: a short curated list of the design decisions and preferences "
-                "you established, given to the agent every turn.\n"
-                "Full recall: searchable memory of this project's past conversations.\n"
-                "Applies to new conversations.",
-                harnessLeftColW);
-            ImGui::SetNextItemWidth(-1.0f);
-            if (settingsPopupRowCombo("##h_memory", &cur, kMemoryLabels, 3)) {
-                settings.memoryBackend = kMemoryBackends[cur];
-                settings.memoryEnabled = cur != 0;
-                changed = true;
-            }
-        }
 
         ImGui::EndTable();
     }
@@ -4350,8 +4805,9 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
 // Settings -> AI -> Roles: the command-model / vision-model split (Seek-CAD style). Moved here
 // from the retired Experimental tab — it IS a model-role assignment, so it belongs beside the
 // other per-role pickers rather than in a separate tab.
-static void drawVisionRoutingSection(AppState& st, float sc) {
+static bool drawVisionRoutingSection(AppState& st, float sc) {
     Settings& settings = st.settings;
+    bool changed = false;  // caller saves (every control here edits Settings::exp*)
 
     // Command model = the active main provider/model (emits + parses the CAD ops). Chosen in
     // Settings -> Providers / the composer's model chip; shown read-only so both routes are
@@ -4362,8 +4818,9 @@ static void drawVisionRoutingSection(AppState& st, float sc) {
                "emits/parses the CAD operations. Pick it in Settings -> Providers or the "
                "composer's model chip. Shown here so you can see both routes side by side.");
     {
-        const char* provLabel =
-            ui::providerLabelForEndpoint(settings.provider, settings.baseUrl);
+        const char* provLabel = settings.ompProvider.empty()
+            ? ui::providerLabelForEndpoint(settings.provider, settings.baseUrl)
+            : settings.ompProvider.c_str();
         char cm[600];
         std::snprintf(cm, sizeof(cm), "   %s  \xc2\xb7  %s", provLabel,
                       settings.model[0] ? settings.model : "(default)");
@@ -4374,15 +4831,16 @@ static void drawVisionRoutingSection(AppState& st, float sc) {
     }
 
     ImGui::Dummy(ImVec2(0, 6 * sc));
-    ui::kit::checkbox("vis_route", "Route vision & spatial reasoning through a separate model",
-                      &settings.expVisionReview);
+    if (ui::kit::checkbox("vis_route", "Route vision & spatial reasoning through a separate model",
+                          &settings.expVisionReview))
+        changed = true;
     helpMarker("When on, a vision model judges the rendered viewport during the review/fix "
                "stages (spatial awareness), while the command model above plans and emits ops "
                "— the Seek-CAD split. It can be local (ITAR-safe) or a cloud vision model. "
                "When off, the command model handles vision too (if it supports images). "
                "Refused under Offline mode if cloud.");
     dimText("Command model emits ops; this vision model sees the screenshot and drives fixes.");
-    if (!settings.expVisionReview) return;
+    if (!settings.expVisionReview) return changed;
 
     ImGui::Dummy(ImVec2(0, 2 * sc));
     // Vision-capable presets: cloud (Qwen-VL / Kimi) + local.
@@ -4420,9 +4878,10 @@ static void drawVisionRoutingSection(AppState& st, float sc) {
         }
         std::memset(settings.expVisionKey, 0, sizeof(settings.expVisionKey));
         std::strncpy(settings.expVisionKey, src, sizeof(settings.expVisionKey) - 1);
+        changed = true;
     }
     // Model id + endpoint side by side. Credential entry is intentionally absent: provider
-    // credentials are managed by Chudcode under Settings -> Providers.
+    // credentials are managed by Omp under Settings -> Providers.
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(4.0f * sc, 1.5f * sc));
     if (ImGui::BeginTable("##expvis_fields", 2,
                           ImGuiTableFlags_SizingStretchSame |
@@ -4432,13 +4891,17 @@ static void drawVisionRoutingSection(AppState& st, float sc) {
         ImGui::TextUnformatted("Model id");
         ImGui::SameLine();
         ImGui::SetNextItemWidth(-1);
-        ImGui::InputText("##expvismodel", settings.expVisionModel, sizeof(settings.expVisionModel));
+        if (ImGui::InputText("##expvismodel", settings.expVisionModel,
+                             sizeof(settings.expVisionModel)))
+            changed = true;
         ImGui::TableNextColumn();
         ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted("Endpoint (base URL)");
         ImGui::SameLine();
         ImGui::SetNextItemWidth(-1);
-        ImGui::InputText("##expvisbase", settings.expVisionBaseUrl, sizeof(settings.expVisionBaseUrl));
+        if (ImGui::InputText("##expvisbase", settings.expVisionBaseUrl,
+                             sizeof(settings.expVisionBaseUrl)))
+            changed = true;
         ImGui::EndTable();
     }
     ImGui::PopStyleVar();  // CellPadding
@@ -4447,11 +4910,11 @@ static void drawVisionRoutingSection(AppState& st, float sc) {
         dimText("Local loopback endpoint — no API key required.");
     } else {
         ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusWarn));
-        ImGui::TextWrapped("Cloud credentials are managed under Settings \xe2\x86\x92 Providers "
-                           "and saved only after validation. This override no longer accepts an "
-                           "unvalidated key.");
+        ImGui::TextWrapped("Cloud credentials are managed under Settings \xe2\x86\x92 Providers. "
+                           "This override does not accept a key.");
         ImGui::PopStyleColor();
     }
+    return changed;
 }
 
 // ---- agent.* memory/learning knobs (config.json) -----------------------------
@@ -4460,32 +4923,20 @@ static void drawVisionRoutingSection(AppState& st, float sc) {
 static std::string loadAgentConfigString(const char* key, const char* fallback) {
     std::string v = fallback;
     try {
-        std::ifstream in(configPath());
-        if (in) {
-            nlohmann::json j;
-            in >> j;
-            if (j.is_object()) {
-                auto agent = j.value("agent", nlohmann::json::object());
-                if (agent.is_object() && agent.contains(key) && agent[key].is_string())
-                    v = agent[key].get<std::string>();
-            }
-        }
+        const nlohmann::json j = readConfigJson();
+        auto agent = j.value("agent", nlohmann::json::object());
+        if (agent.is_object() && agent.contains(key) && agent[key].is_string())
+            v = agent[key].get<std::string>();
     } catch (...) {}
     return v;
 }
 static bool loadAgentConfigBool(const char* key, bool fallback) {
     bool v = fallback;
     try {
-        std::ifstream in(configPath());
-        if (in) {
-            nlohmann::json j;
-            in >> j;
-            if (j.is_object()) {
-                auto agent = j.value("agent", nlohmann::json::object());
-                if (agent.is_object() && agent.contains(key) && agent[key].is_boolean())
-                    v = agent[key].get<bool>();
-            }
-        }
+        const nlohmann::json j = readConfigJson();
+        auto agent = j.value("agent", nlohmann::json::object());
+        if (agent.is_object() && agent.contains(key) && agent[key].is_boolean())
+            v = agent[key].get<bool>();
     } catch (...) {}
     return v;
 }
@@ -4502,17 +4953,11 @@ static void saveAgentConfigValue(const char* key, const nlohmann::json& value) {
 static bool loadAgentConfigNestedBool(const char* obj, const char* key, bool fallback) {
     bool v = fallback;
     try {
-        std::ifstream in(configPath());
-        if (in) {
-            nlohmann::json j;
-            in >> j;
-            if (j.is_object()) {
-                auto agent = j.value("agent", nlohmann::json::object());
-                if (agent.is_object() && agent.contains(obj) && agent[obj].is_object() &&
-                    agent[obj].contains(key) && agent[obj][key].is_boolean())
-                    v = agent[obj][key].get<bool>();
-            }
-        }
+        const nlohmann::json j = readConfigJson();
+        auto agent = j.value("agent", nlohmann::json::object());
+        if (agent.is_object() && agent.contains(obj) && agent[obj].is_object() &&
+            agent[obj].contains(key) && agent[obj][key].is_boolean())
+            v = agent[obj][key].get<bool>();
     } catch (...) {}
     return v;
 }
@@ -4531,201 +4976,148 @@ static void saveAgentConfigNestedBool(const char* obj, const char* key, bool val
 // config.json agent.* via the recipe above; visibility knobs persist via ui/ai/ai_prefs.
 static void drawMemoryLearningSection(AppState& st, float sc) {
 
-    static bool s_loaded = false;
-    // Unified compaction control maps only to agent.compaction_strategy.
-    // 0 Automatic | 1 Off | 2 Snapcompact | 3 Shake | 4 Summary
-    static int s_compMode = 0;
-    static bool s_supersedeReads = true;  // agent.compaction.supersede_reads
-    static bool s_dropUseless = true;     // agent.compaction.drop_useless
-    static bool s_learn = true;       // agent.memory_learn
-    static bool s_autolearn = false;  // agent.autolearn_enabled
-    static bool s_autoContinue = false; // agent.autolearn_auto_continue
-    if (!s_loaded) {
-        s_loaded = true;
-        {
-            const std::string cs = loadAgentConfigString("compaction_strategy", "auto");
-            if (cs == "off")
-                s_compMode = 1;
-            else if (cs == "snapcompact")
-                s_compMode = 2;
-            else if (cs == "shake")
-                s_compMode = 3;
-            else if (cs == "summary")
-                s_compMode = 4;
-            else
-                s_compMode = 0;
-        }
-        s_supersedeReads = loadAgentConfigNestedBool("compaction", "supersede_reads", true);
-        s_dropUseless = loadAgentConfigNestedBool("compaction", "drop_useless", true);
-        s_learn = loadAgentConfigBool("memory_learn", true);
+    static bool loaded = false;
+    static std::string strategy;
+    static bool compactionApplying = false;
+    static std::string compactionStatus;
+    static std::string compactionEffective;
+    static bool s_autolearn = false;
+    static bool s_autoContinue = false;
+    if (!loaded) {
+        loaded = true;
+        strategy = loadAgentConfigString("compaction_strategy", "auto");
         s_autolearn = loadAgentConfigBool("autolearn_enabled", false);
         s_autoContinue = loadAgentConfigBool("autolearn_auto_continue", false);
     }
-
-
-    // ---- Basic mode ----
-    // Project memory and its token budget already live in the persisted Session knobs
-    // grid above. Keep a single control for each in both Basic and Advanced modes.
-    if (!st.settings.showAdvanced) {
-        if (ui::kit::checkbox("mem_learn", "Remember decisions & notes", &s_learn))
-            saveAgentConfigValue("memory_learn", s_learn);
-        helpMarker("Learning switch: when on, the agent writes decisions and notes it "
-                   "judges worth keeping into project memory (agent.memory_learn, "
-                   "default on). Recall still works when off; nothing new is learned.");
-        bool follow = ui::aiFollowActiveSession();
-        if (ui::kit::checkbox("mem_follow", ui::aiPrefCopy::kFollowLabel, &follow))
-            ui::setAiFollowActiveSession(follow);
-        helpMarker(ui::aiPrefCopy::kFollowHelp);
-        return;
-    }
-    static const char* kCompModes[] = {
-        "Automatic",
-        "Off",
-        "Snapcompact",
-        "Shake",
-        "Summary",
-    };
-
-    auto saveCompMode = [&](int mode) {
-        const char* strategy = "auto";
-        switch (mode) {
-        case 1: strategy = "off"; break;
-        case 2: strategy = "snapcompact"; break;
-        case 3: strategy = "shake"; break;
-        case 4: strategy = "summary"; break;
-        default: strategy = "auto"; break;
-        }
-        saveAgentConfigValue("compaction_strategy", strategy);
-    };
-
-    // Compaction and Verbosity sit in the left column of two stacked tables; one shared label
-    // column keeps both combos on the same left edge.
-    const float memLabelColW = ImMax(settingsLabelLeadWidth("Compaction", true),
-                                     settingsLabelLeadWidth(ui::aiPrefCopy::kDetailLabel, true));
-    if (ImGui::BeginTable("##memory_learning", 2,
-                          ImGuiTableFlags_SizingStretchSame |
-                          ImGuiTableFlags_NoPadOuterX)) {
-        ImGui::TableNextColumn();
-        {
-            settingsLabelLead("Compaction",
-                              "How the agent service compacts a chat when its context window "
-                              "fills. Automatic = the agent service's own method order. "
-                              "Off = never compact automatically (a full context fails the "
-                              "turn). Snapcompact = archive history as images (image-capable "
-                              "models only; others do not compact). Shake = drop recoverable "
-                              "heavy tool output, no model call. Summary = the model writes "
-                              "a summary that replaces older history. Only the chosen method "
-                              "runs; if it cannot free enough room nothing else is tried. "
-                              "Applies to each chat from its next turn. Writes "
-                              "agent.compaction_strategy.",
-                              memLabelColW);
-            ImGui::SetNextItemWidth(-1.0f);
-            if (settingsPopupRowCombo("##comp_mode", &s_compMode, kCompModes, 5))
-                saveCompMode(s_compMode);
-        }
-
-        ImGui::TableNextColumn();
-        if (ui::kit::checkbox("mem_learn", "Remember decisions & notes", &s_learn))
-            saveAgentConfigValue("memory_learn", s_learn);
-        helpMarker("Learning switch: when on, the agent writes decisions and notes it "
-                   "judges worth keeping into project memory (agent.memory_learn, "
-                   "default on). Recall still works when off; nothing new is learned.");
-
-        ImGui::TableNextColumn();
-        if (ui::kit::checkbox("mem_supersede", "Supersede stale reads", &s_supersedeReads))
-            saveAgentConfigNestedBool("compaction", "supersede_reads", s_supersedeReads);
-        helpMarker("When the agent reads the same file again, the older read result is "
-                   "pruned from the context every turn (cache-aware). Applies to each "
-                   "chat from its next turn (agent.compaction.supersede_reads, default on).");
-        ImGui::TableNextColumn();
-        if (ui::kit::checkbox("mem_drop_useless", "Drop useless turns", &s_dropUseless))
-            saveAgentConfigNestedBool("compaction", "drop_useless", s_dropUseless);
-        helpMarker("Tool results that carried nothing (no matches, timed-out waits) are "
-                   "pruned from the context once the agent has seen them (cache-aware). "
-                   "Applies to each chat from its next turn "
-                   "(agent.compaction.drop_useless, default on).");
-        ImGui::EndTable();
-    }
-
-    // ---- Active-session controls (Chudcode) ------------------------------------------
-    // Real per-session switches on the persistent Chudcode host — not config keys. They
-    // apply to the ACTIVE chat session immediately (chudcode_set_auto_compaction /
-    // chudcode_set_auto_retry) and read honestly: with no active session there is nothing
-    // to switch, so the rows disable instead of pretending.
-    settingsSectionHeader("Active agent session");
-    {
-        static std::string s_sessFor;       // session the cached toggle values belong to
-        static bool s_sessAutoCompaction = true;   // Chudcode defaults both on
-        static bool s_sessAutoRetry = true;
-        static bool s_sessInFlight = false;
-        static std::string s_sessStatus;
-        static bool s_sessStatusErr = false;
-#ifdef __EMSCRIPTEN__
-        const std::string sess = cellAgentSessionHandle(st.activeConvId());
-#else
-        const std::string sess = st.activeConvId();
-#endif
-        if (sess != s_sessFor) {
-            s_sessFor = sess;
-            s_sessAutoCompaction = true;
-            s_sessAutoRetry = true;
-            s_sessStatus.clear();
-            s_sessStatusErr = false;
-        }
-        if (sess.empty()) {
-            dimText("No active chat session \xe2\x80\x94 open the copilot to switch "
-                    "auto-compaction / auto-retry for a session.");
-        } else {
-            auto applySessionFlag = [&st, sess](const char* method, bool enabled,
-                                                bool* uiFlag, bool previous) {
-                s_sessInFlight = true;
-                s_sessStatus.clear();
-                st.rpc.call(method,
-                            nlohmann::json{{"session_id", sess}, {"enabled", enabled}},
-                            [sess, uiFlag, previous](const core::RpcResult& r) {
-                    s_sessInFlight = false;
-                    if (s_sessFor != sess) return;   // session switched mid-flight
-                    const bool ok = r.ok && r.result.is_object() &&
-                                    optionalJsonBool(r.result, "ok", false);
-                    if (!ok) {
-                        *uiFlag = previous;   // the switch did not happen — say so
-                        s_sessStatusErr = true;
-                        s_sessStatus = !r.ok ? r.err : optionalJsonString(r.result, "error");
-                        if (s_sessStatus.empty())
-                            s_sessStatus = optionalJsonString(r.result, "reason");
-                        if (s_sessStatus.empty())
-                            s_sessStatus = "The agent service refused the change.";
-                        return;
-                    }
-                    s_sessStatusErr = false;
-                    s_sessStatus = "applied";
-                });
-            };
-            if (s_sessInFlight) ImGui::BeginDisabled();
-            if (ui::kit::checkbox("sess_autocompact", "Auto-compaction", &s_sessAutoCompaction))
-                applySessionFlag("chudcode_set_auto_compaction", s_sessAutoCompaction,
-                                 &s_sessAutoCompaction, !s_sessAutoCompaction);
-            helpMarker("Switches automatic compaction on or off for the active chat session "
-                       "now, overriding the Compaction setting above for this session. The "
-                       "Compaction setting still chooses the method (with Off or Automatic, "
-                       "the agent service's own method order).");
-            ImGui::SameLine(0, 16.0f * sc);
-            if (ui::kit::checkbox("sess_autoretry", "Auto-retry", &s_sessAutoRetry))
-                applySessionFlag("chudcode_set_auto_retry", s_sessAutoRetry,
-                                 &s_sessAutoRetry, !s_sessAutoRetry);
-            helpMarker("The agent service retries transient provider failures (rate limits, "
-                       "disconnects) inside the turn. Applies to the active chat "
-                       "session now.");
-            if (s_sessInFlight) ImGui::EndDisabled();
-            if (!s_sessStatus.empty()) {
-                ImGui::SameLine(0, 10.0f * sc);
-                ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(
-                    s_sessStatusErr ? ui::palette.statusErr : ui::palette.textDim));
-                ImGui::TextUnformatted(s_sessStatus.c_str());
-                ImGui::PopStyleColor();
+    static const char* backends[] = {"off", "sharpshooter", "mnemopi", "local", "hindsight"};
+    static const char* backendLabels[] = {"Off", "Decisions", "Full recall", "Local", "Hindsight"};
+    int backend = -1;
+    for (int i = 0; i < 5; ++i)
+        if (st.settings.memoryBackend == backends[i]) backend = i;
+    ImGui::TextUnformatted("Project memory");
+    settingsAuditLastText("Project memory");
+    const char* memoryPreview = backend >= 0 ? backendLabels[backend] : st.settings.memoryBackend.c_str();
+    if (settingsBeginPopupRowCombo("##memory_backend", memoryPreview, 220.0f * sc,
+                                   ImGuiComboFlags_HeightLarge)) {
+        for (int i = 0; i < 5; ++i) {
+            if (settingsPopupRowSelectable(backendLabels[i], backend == i)) {
+                st.settings.memoryBackend = backends[i];
+                st.settings.memoryEnabled = i != 0;
+                saveSettings(st.settings);
             }
         }
+        settingsEndPopupRowCombo();
     }
+    dimText("Memory is scoped to the project. Backends may require additional setup.");
+
+    static const char* modes[] = {"auto", "off", "snapcompact", "shake", "summary"};
+    static const char* labels[] = {"Automatic", "Off", "Snapcompact", "Shake", "Summary"};
+    int selected = -1;
+    for (int i = 0; i < 5; ++i) if (strategy == modes[i]) selected = i;
+    ImGui::TextUnformatted("Compaction (next turn)");
+    settingsAuditLastText("Compaction (next turn)");
+    const std::string preview = selected < 0 ? strategy + " (unsupported)" : labels[selected];
+    const bool compactionDisabled = compactionApplying;
+    if (compactionDisabled) ImGui::BeginDisabled();
+    if (settingsBeginPopupRowCombo("##comp_mode", preview.c_str(), 220.0f * sc,
+                                   ImGuiComboFlags_HeightLarge)) {
+        for (int i = 0; i < 5; ++i) {
+            if (settingsPopupRowSelectable(labels[i], selected == i)) {
+                const std::string next = modes[i];
+                const bool saved = updateConfigJson([&](nlohmann::json& config) {
+                    if (!config.contains("agent") || !config["agent"].is_object())
+                        config["agent"] = nlohmann::json::object();
+                    config["agent"]["compaction_strategy"] = next;
+                });
+                if (!saved || !flushConfigWrites()) {
+                    compactionStatus = "Could not save compaction policy; retry the selection.";
+                } else {
+                    strategy = next;
+                    compactionEffective.clear();
+                    const char* shot = std::getenv("CHUDWARE_SHOT");
+                    const bool fixture = st.shot && shot && std::strcmp(shot, "model_settings") == 0;
+                    if (fixture) {
+                        // The isolated visual fixture has no runtime sessions to mutate.
+                        compactionStatus = "Policy saved for future sessions; no live application reported.";
+                    } else {
+                        compactionApplying = true;
+                        compactionStatus = "Applying compaction policy...";
+                        st.rpc.call("omp_apply_compaction_policy", nlohmann::json{{"strategy", next}},
+                                [](const core::RpcResult& r) {
+                        compactionApplying = false;
+                        if (!r.ok || !r.result.is_object() ||
+                            !optionalJsonBool(r.result, "ok", false)) {
+                            compactionStatus = "Policy saved, but live application failed; retry or use a new session.";
+                            return;
+                        }
+                        const auto* sessions = optionalJsonArr(r.result, "sessions");
+                        if (!sessions || sessions->empty()) {
+                            compactionStatus = "Policy saved for future sessions; no live application reported.";
+                            return;
+                        }
+                        std::string sharedOrder;
+                        bool sameOrder = true;
+                        for (const auto& session : *sessions) {
+                            if (!session.is_object() || !optionalJsonBool(session, "ok", false)) {
+                                compactionStatus = "Policy saved, but at least one session did not apply it.";
+                                return;
+                            }
+                            const auto effective = session.find("effective");
+                            if (effective == session.end() || !effective->is_object()) {
+                                sameOrder = false;
+                                continue;
+                            }
+                            const auto compaction = effective->find("compaction");
+                            if (compaction == effective->end() || !compaction->is_object()) {
+                                sameOrder = false;
+                                continue;
+                            }
+                            const auto order = compaction->find("methodOrder");
+                            if (order == compaction->end() || !order->is_array()) {
+                                sameOrder = false;
+                                continue;
+                            }
+                            std::string value;
+                            for (const auto& method : *order) {
+                                if (!method.is_string()) { sameOrder = false; break; }
+                                if (!value.empty()) value += ", ";
+                                value += method.get<std::string>();
+                            }
+                            if (value.empty()) { sameOrder = false; continue; }
+                            if (sharedOrder.empty()) sharedOrder = value;
+                            else if (sharedOrder != value) sameOrder = false;
+                        }
+                        if (sameOrder && !sharedOrder.empty())
+                            compactionEffective = "Reported effective order: " + sharedOrder;
+                        compactionStatus = "Policy saved and acknowledged by the reported sessions.";
+                    }, 30000);
+                    }
+                }
+            }
+        }
+        settingsEndPopupRowCombo();
+    }
+    if (compactionDisabled) ImGui::EndDisabled();
+    if (!compactionStatus.empty()) settingsAuditedDimText(compactionStatus.c_str());
+    if (strategy == "auto")
+        dimText(compactionEffective.empty() ? "Effective runtime order is not yet available."
+                                            : compactionEffective.c_str());
+    if (strategy == "snapcompact") {
+        const std::string provider = !st.settings.composerFollowRoles ? st.settings.ompProvider : s_roles.chat.provider;
+        const std::string model = !st.settings.composerFollowRoles ? st.settings.model : s_roles.chat.model;
+        const auto* meta = ui::bridgeModelMeta(provider, model);
+        if (meta && meta->visionKnown && !meta->vision)
+            settingsAuditedDimText("Unavailable for this model: image input required. The selection is preserved.");
+        else if (!meta || !meta->visionKnown)
+            settingsAuditedDimText("Snapcompact requires image input; model capability is unknown.");
+    }
+    settingsSectionHeader("Active agent session");
+    const auto* link = ui::ompSessionLink(st.activeConvId());
+    if (!link || !link->runtimeLive)
+        settingsAuditedDimText("No live agent session. Session controls are unavailable.");
+    else
+        settingsAuditedDimText("Current session compaction and retry state unavailable.");
+    if (!st.settings.showAdvanced) return;
 
     // ---- Auto-Learn (experimental) ----
     settingsSectionHeader("Auto-Learn (experimental)");
@@ -4766,7 +5158,7 @@ static void drawMemoryLearningSection(AppState& st, float sc) {
             // process) so a change made in AI > Options shows here immediately.
             int verbosity = ui::aiUiVerbosity();
             settingsLabelLead(ui::aiPrefCopy::kDetailLabel, ui::aiPrefCopy::kDetailHelp,
-                              memLabelColW);
+                              settingsLabelLeadWidth(ui::aiPrefCopy::kDetailLabel, true));
             ImGui::SetNextItemWidth(-1.0f);
             if (settingsPopupRowCombo("##ws_verbosity", &verbosity,
                                       ui::aiPrefCopy::kDetailLevels, 3))
@@ -4812,6 +5204,11 @@ struct OvSkillsUi {
     std::vector<char> body{std::vector<char>(65536, 0)};
     bool bodyDirty = false;
     bool creating = false;
+    bool bodyTruncated = false;    // source exceeded the editor buffer: never write it back
+    uint64_t bodyReq = 0;          // newest skills_get request; older replies are dropped
+    uint64_t editSeq = 0;          // bumped by every body edit (guards stale save acks)
+    uint64_t autosaveSeq = 0;      // editSeq an autosave last tried: failed text waits for a new edit
+    double   lastEdit = 0.0;       // ImGui::GetTime() of the last body edit
     char newName[96] = {};
 };
 static OvSkillsUi s_ovSkills;
@@ -4904,13 +5301,18 @@ static void ovPollSkills(AppState& st, bool force) {
     });
 }
 static void ovLoadSkillBody(AppState& st, const std::string& name) {
-    if (name.empty() || s_ovSkills.bodyInFlight) return;
+    if (name.empty()) return;
+    // Latest selection wins: a superseded reply is dropped by its request id instead of the new
+    // selection being ignored while an older one loads.
+    const uint64_t req = ++s_ovSkills.bodyReq;
     s_ovSkills.bodyInFlight = true;
-    s_ovSkills.bodyName = name;
+    s_ovSkills.bodyName.clear();  // the buffer belongs to no skill until its body arrives
     s_ovSkills.bodyDirty = false;
+    s_ovSkills.bodyTruncated = false;
     std::fill(s_ovSkills.body.begin(), s_ovSkills.body.end(), 0);
     st.rpc.call("skills_get", nlohmann::json{{"name", name}},
-                [name](const core::RpcResult& r) {
+                [name, req](const core::RpcResult& r) {
+        if (req != s_ovSkills.bodyReq) return;  // superseded by a newer selection
         s_ovSkills.bodyInFlight = false;
         if (ovSkillsAbsent(r)) {
             s_ovSkills.rpcMissing = true;
@@ -4920,26 +5322,36 @@ static void ovLoadSkillBody(AppState& st, const std::string& name) {
             s_ovSkills.lastError = r.err.empty()
                 ? r.result.value("reason", std::string("skills_get failed"))
                 : r.err;
+            if (s_ovSkills.selected == name) s_ovSkills.selected.clear();  // no blank editor to save over it
             return;
         }
         if (s_ovSkills.selected != name) return;  // selection moved on
         std::string body = r.result.value("body", std::string());
         std::fill(s_ovSkills.body.begin(), s_ovSkills.body.end(), 0);
-        if (body.size() >= s_ovSkills.body.size())
+        s_ovSkills.bodyTruncated = body.size() >= s_ovSkills.body.size();
+        if (s_ovSkills.bodyTruncated)
             body.resize(s_ovSkills.body.size() - 1);
         std::memcpy(s_ovSkills.body.data(), body.data(), body.size());
         s_ovSkills.bodyName = name;
         s_ovSkills.bodyDirty = false;
-        s_ovSkills.lastError.clear();
+        s_ovSkills.lastError = s_ovSkills.bodyTruncated
+            ? std::string("This skill is larger than the editor buffer; it is shown truncated "
+                          "and will not be saved from here.")
+            : std::string();
     });
 }
 static void ovSaveSkill(AppState& st) {
-    if (s_ovSkills.selected.empty() || s_ovSkills.saveInFlight) return;
+    // Only the selected skill's fully loaded body may be written: a buffer that is still loading,
+    // failed to load or was truncated would overwrite the real skill with blank/partial text.
+    if (s_ovSkills.selected.empty() || s_ovSkills.saveInFlight || s_ovSkills.bodyInFlight ||
+        s_ovSkills.bodyName != s_ovSkills.selected || s_ovSkills.bodyTruncated)
+        return;
     s_ovSkills.saveInFlight = true;
+    const uint64_t editSeq = s_ovSkills.editSeq;
     nlohmann::json p;
     p["name"] = s_ovSkills.selected;
     p["body"] = std::string(s_ovSkills.body.data());
-    st.rpc.call("skills_save", p, [](const core::RpcResult& r) {
+    st.rpc.call("skills_save", p, [editSeq](const core::RpcResult& r) {
         s_ovSkills.saveInFlight = false;
         if (ovSkillsAbsent(r)) {
             s_ovSkills.rpcMissing = true;
@@ -4951,7 +5363,8 @@ static void ovSaveSkill(AppState& st) {
                 : r.err;
             return;
         }
-        s_ovSkills.bodyDirty = false;
+        // Keystrokes made while this save was in flight stay pending.
+        if (editSeq == s_ovSkills.editSeq) s_ovSkills.bodyDirty = false;
         s_ovSkills.lastError.clear();
         s_ovSkills.loaded = false;  // refresh list (source may flip to user)
         s_ovSkills.lastList = -1e9;
@@ -4976,6 +5389,23 @@ static void ovDeleteSkill(AppState& st, const std::string& name) {
         s_ovSkills.loaded = false;
         s_ovSkills.lastList = -1e9;
     });
+}
+
+// Skill editor autosave (an existing skill only — creating one stays an explicit Create): a body
+// edit is committed once typing pauses, and forced before the selection changes or the modal
+// closes, so no edit is ever silently discarded.
+static void flushSkillEdits(AppState& st, bool force) {
+    OvSkillsUi& s = s_ovSkills;
+    if (!s.bodyDirty || s.creating || s.rpcMissing || s.selected.empty()) return;
+    if (s.bodyInFlight || s.saveInFlight || s.bodyName != s.selected || s.bodyTruncated) return;
+    // `force` (selection change / close) skips only the typing pause. Each edit is attempted once:
+    // forcing every frame while the modal is closed would re-send a refused text forever.
+    if (!force && ImGui::GetTime() - s.lastEdit < 1.5) return;
+    if (s.autosaveSeq == s.editSeq) return;  // this exact text was already tried
+    s.autosaveSeq = s.editSeq;
+    // The worker refuses a blank skill; wait for text instead of erroring on every pause.
+    if (std::strspn(s.body.data(), " \t\r\n") == std::strlen(s.body.data())) return;
+    ovSaveSkill(st);
 }
 
 // ---- Rules: context-injection triggers (Settings → AI → Rules). Wire names stay triggers_*. ----
@@ -5062,8 +5492,20 @@ struct OvTriggersUi {
     nlohmann::json prerunCalcs = nlohmann::json::array();  // preserved from get/list
     bool creating = false;
     char newId[96] = {};
+    std::string bodyId;           // rule the editor buffers belong to ("" while loading / failed)
+    uint64_t bodyReq = 0;         // newest triggers_get request; older replies are dropped
+    uint64_t editSeq = 0;         // bumped by every edit (guards stale save acks)
+    uint64_t autosaveSeq = 0;     // editSeq an autosave last tried: refused text waits for a new edit
+    double   lastEdit = 0.0;      // ImGui::GetTime() of the last edit (-1e9 = commit on the next frame)
 };
 static OvTriggersUi s_ovTrig;
+// Every editor field funnels through here so the debounced autosave (flushTriggerEdits) sees it.
+// `immediate` (checkbox) skips the typing pause.
+static void ovTrigEdited(bool immediate = false) {
+    s_ovTrig.bodyDirty = true;
+    ++s_ovTrig.editSeq;
+    s_ovTrig.lastEdit = immediate ? -1e9 : ImGui::GetTime();
+}
 // Guided rule/skill/context authoring popup (opened by "New rule…" in the Rules tab).
 static bool s_rulesAuthorOpen = false;
 
@@ -5184,12 +5626,16 @@ static void ovPollTriggers(AppState& st, bool force) {
     });
 }
 static void ovLoadTriggerBody(AppState& st, const std::string& id) {
-    if (id.empty() || s_ovTrig.bodyInFlight) return;
+    if (id.empty()) return;
+    // Latest selection wins (see ovLoadSkillBody): a superseded reply is dropped by request id.
+    const uint64_t req = ++s_ovTrig.bodyReq;
     s_ovTrig.bodyInFlight = true;
+    s_ovTrig.bodyId.clear();  // the buffers belong to no rule until its body arrives
     s_ovTrig.bodyDirty = false;
     s_ovTrig.packDirty = false;
     st.rpc.call("triggers_get", nlohmann::json{{"id", id}},
-                [id](const core::RpcResult& r) {
+                [id, req](const core::RpcResult& r) {
+        if (req != s_ovTrig.bodyReq) return;  // superseded by a newer selection
         s_ovTrig.bodyInFlight = false;
         if (ovTriggersAbsent(r)) {
             s_ovTrig.rpcMissing = true;
@@ -5199,6 +5645,7 @@ static void ovLoadTriggerBody(AppState& st, const std::string& id) {
             s_ovTrig.lastError = r.err.empty()
                 ? r.result.value("reason", std::string("triggers_get failed"))
                 : r.err;
+            if (s_ovTrig.selected == id) s_ovTrig.selected.clear();  // no stale-field editor to save
             return;
         }
         if (s_ovTrig.selected != id) return;
@@ -5241,12 +5688,18 @@ static void ovLoadTriggerBody(AppState& st, const std::string& id) {
             s_ovTrig.packBody);
         s_ovTrig.bodyDirty = false;
         s_ovTrig.packDirty = false;
+        s_ovTrig.bodyId = id;
         s_ovTrig.lastError.clear();
     });
 }
 static void ovSaveTrigger(AppState& st) {
-    if (s_ovTrig.selected.empty() || s_ovTrig.saveInFlight) return;
+    // Never write buffers that do not hold the selected rule's loaded body (still loading, or its
+    // load failed): that would graft the previous rule's fields onto this id.
+    if (s_ovTrig.selected.empty() || s_ovTrig.saveInFlight || s_ovTrig.bodyInFlight ||
+        s_ovTrig.bodyId != s_ovTrig.selected)
+        return;
     s_ovTrig.saveInFlight = true;
+    const uint64_t editSeq = s_ovTrig.editSeq;
     nlohmann::json p;
     p["id"] = s_ovTrig.selected;
     p["enabled"] = s_ovTrig.enabled;
@@ -5280,7 +5733,7 @@ static void ovSaveTrigger(AppState& st) {
         p["pack_body"] = s_ovTrig.packBodySrc.save(s_ovTrig.packBody.data());
         p["pack_name"] = s_ovTrig.packNameSrc.save(s_ovTrig.packName);
     }
-    st.rpc.call("triggers_save", p, [](const core::RpcResult& r) {
+    st.rpc.call("triggers_save", p, [editSeq](const core::RpcResult& r) {
         s_ovTrig.saveInFlight = false;
         if (ovTriggersAbsent(r)) {
             s_ovTrig.rpcMissing = true;
@@ -5292,12 +5745,39 @@ static void ovSaveTrigger(AppState& st) {
                 : r.err;
             return;
         }
-        s_ovTrig.bodyDirty = false;
-        s_ovTrig.packDirty = false;
-        s_ovTrig.lastError.clear();
         s_ovTrig.loaded = false;
         s_ovTrig.lastList = -1e9;
+        // The rule saved but its context pack may not have: surface that, and keep the pack
+        // edit pending instead of reporting a clean save.
+        if (r.result.is_object() && !r.result.value("pack_ok", true)) {
+            s_ovTrig.lastError = r.result.value("pack_reason", std::string("pack save failed"));
+            return;
+        }
+        // Keystrokes made while this save was in flight stay pending.
+        if (editSeq == s_ovTrig.editSeq) {
+            s_ovTrig.bodyDirty = false;
+            s_ovTrig.packDirty = false;
+        }
+        s_ovTrig.lastError.clear();
     });
+}
+// Rule editor autosave — same contract as flushSkillEdits: existing rules only (a new rule stays
+// an explicit Create because it must be named first).
+static void flushTriggerEdits(AppState& st, bool force) {
+    OvTriggersUi& t = s_ovTrig;
+    if (!t.bodyDirty || t.creating || t.rpcMissing || t.selected.empty()) return;
+    if (t.bodyInFlight || t.saveInFlight || t.bodyId != t.selected) return;
+    if (!force && ImGui::GetTime() - t.lastEdit < 1.5) return;
+    if (t.autosaveSeq == t.editSeq) return;  // this exact text was already tried
+    t.autosaveSeq = t.editSeq;
+    ovSaveTrigger(st);
+}
+// Debounced autosave of the Skills + Rules editors (RPC-backed): called every frame from
+// drawSettingsModal and forced on close / before the selection changes / by
+// flushSettingsModalRpcEdits at app exit (while the RPC layer is still up).
+static void flushSkillRuleEdits(AppState& st, bool force) {
+    flushSkillEdits(st, force);
+    flushTriggerEdits(st, force);
 }
 static void ovDeleteTriggerOverride(AppState& st, const std::string& id) {
     if (id.empty()) return;
@@ -5353,6 +5833,9 @@ static void drawSettingsSkillsTab(AppState& st, float S) {
         ImGui::PopStyleColor();
         ImGui::Dummy(ImVec2(0, 2.0f * S));
         if (ui::kit::secondaryButton("New skill", true, nullptr, ImVec2(-1, 0))) {
+            flushSkillEdits(st, /*force=*/true);
+            ++s_ovSkills.bodyReq;  // drop any skill body still loading
+            s_ovSkills.bodyInFlight = false;
             s_ovSkills.creating = true;
             s_ovSkills.selected.clear();
             std::fill(s_ovSkills.body.begin(), s_ovSkills.body.end(), 0);
@@ -5387,6 +5870,7 @@ static void drawSettingsSkillsTab(AppState& st, float S) {
                 const std::string rowLabel =
                     ui::foldToAtlasGlyphs(sk.name) + "##skill_catalog_row";
                 if (settingsChildRowSelectable(rowLabel.c_str(), sel, bodyH, &textPos, &bodyW)) {
+                    flushSkillEdits(st, /*force=*/true);  // never drop the previous skill's edits
                     s_ovSkills.creating = false;
                     s_ovSkills.selected = sk.name;
                     ovLoadSkillBody(st, sk.name);
@@ -5464,15 +5948,20 @@ static void drawSettingsSkillsTab(AppState& st, float S) {
                     ImGui::GetContentRegionAvail().y - 56.0f * S);
                 if (st.fonts.mono) ImGui::PushFont(st.fonts.mono);
                 if (ImGui::InputTextMultiline("##set_skillbody", s_ovSkills.body.data(),
-                                              s_ovSkills.body.size(), ImVec2(-1, edH)))
+                                              s_ovSkills.body.size(), ImVec2(-1, edH))) {
                     s_ovSkills.bodyDirty = true;
+                    ++s_ovSkills.editSeq;
+                    s_ovSkills.lastEdit = ImGui::GetTime();
+                }
                 if (st.fonts.mono) ImGui::PopFont();
             }
 
-            const bool busySave = s_ovSkills.saveInFlight;
-            if (ui::kit::primaryButton(s_ovSkills.creating ? "Create##set_sksave" : "Save##set_sksave",
-                                       !busySave, "Saving\xe2\x80\xa6", ImVec2(-1, 0))) {
-                if (s_ovSkills.creating) {
+            // Existing skills autosave (flushSkillEdits); only a NEW skill needs an explicit
+            // Create because it must be named first.
+            if (s_ovSkills.creating) {
+                const bool busySave = s_ovSkills.saveInFlight;
+                if (ui::kit::primaryButton("Create##set_sksave", !busySave, "Saving\xe2\x80\xa6",
+                                           ImVec2(-1, 0))) {
                     // Normalize name from field; rewrite frontmatter name if needed.
                     std::string name = s_ovSkills.newName;
                     // strip spaces
@@ -5480,9 +5969,8 @@ static void drawSettingsSkillsTab(AppState& st, float S) {
                         [](unsigned char c) { return std::isspace(c); }), name.end());
                     if (name.empty()) name = "my-skill";
                     s_ovSkills.selected = name;
+                    s_ovSkills.bodyName = name;  // the buffer IS this skill's body
                     s_ovSkills.creating = false;
-                    ovSaveSkill(st);
-                } else {
                     ovSaveSkill(st);
                 }
             }
@@ -5777,6 +6265,7 @@ static void drawSettingsContextTab(AppState& st, float S) {
                 const std::string label = ovTriggerLabel(tr);
                 const std::string rowLabel = label + "##rule_catalog_row";
                 if (settingsChildRowSelectable(rowLabel.c_str(), sel, bodyH, &textPos, &bodyW)) {
+                    flushTriggerEdits(st, /*force=*/true);  // never drop the previous rule's edits
                     s_ovTrig.creating = false;
                     s_ovTrig.selected = tr.id;
                     ovLoadTriggerBody(st, tr.id);
@@ -5860,13 +6349,13 @@ static void drawSettingsContextTab(AppState& st, float S) {
                 if (ui::kit::checkbox("trig_enabled", "Enabled", &s_ovTrig.enabled,
                                       "Off = never inject this pack (user override of "
                                       "shipped)."))
-                    s_ovTrig.bodyDirty = true;
+                    ovTrigEdited(/*immediate=*/true);
 
                 ImGui::TextUnformatted("Purpose");
                 ImGui::SetNextItemWidth(-1);
                 if (ImGui::InputText("##set_purpose", s_ovTrig.purpose,
                                      sizeof(s_ovTrig.purpose)))
-                    s_ovTrig.bodyDirty = true;
+                    ovTrigEdited();
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip(
                         "Why this pack exists — what important considerations it "
@@ -5877,13 +6366,13 @@ static void drawSettingsContextTab(AppState& st, float S) {
                 if (ImGui::InputTextMultiline("##set_kws", s_ovTrig.keywords,
                         sizeof(s_ovTrig.keywords),
                         ImVec2(-1, 56.0f * S)))
-                    s_ovTrig.bodyDirty = true;
+                    ovTrigEdited();
 
                 ImGui::TextUnformatted("Tools (names that fire this)");
                 ImGui::SetNextItemWidth(-1);
                 if (ImGui::InputText("##set_tools", s_ovTrig.tools,
                                      sizeof(s_ovTrig.tools)))
-                    s_ovTrig.bodyDirty = true;
+                    ovTrigEdited();
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip(
                         "Comma or newline separated tool names, e.g. part_place, fit_calc.");
@@ -5892,31 +6381,31 @@ static void drawSettingsContextTab(AppState& st, float S) {
                 ImGui::SetNextItemWidth(-1);
                 if (ImGui::InputText("##set_events", s_ovTrig.events,
                                      sizeof(s_ovTrig.events)))
-                    s_ovTrig.bodyDirty = true;
+                    ovTrigEdited();
 
                 ImGui::TextUnformatted("Context pack name");
                 ImGui::SetNextItemWidth(-1);
                 if (ImGui::InputText("##set_packname", s_ovTrig.packName,
                                      sizeof(s_ovTrig.packName)))
-                    s_ovTrig.bodyDirty = true;
+                    ovTrigEdited();
 
                 ImGui::TextUnformatted("Exemplar (short worked example)");
                 ImGui::SetNextItemWidth(-1);
                 if (ImGui::InputText("##set_exemplar", s_ovTrig.exemplar,
                                      sizeof(s_ovTrig.exemplar)))
-                    s_ovTrig.bodyDirty = true;
+                    ovTrigEdited();
 
                 {
                     ui::kit::FieldGroup limits("trig_limits", "Cooldown (turns)");
                     if (ui::kit::fieldInt("trig_budget", "Token budget", &s_ovTrig.budgetTokens,
                                           ui::kit::FieldOpts().withRange(50, 2000).withTip(
                                               "Most tokens this pack may add to one turn.")))
-                        s_ovTrig.bodyDirty = true;
+                        ovTrigEdited();
                     if (ui::kit::fieldInt("trig_cooldown", "Cooldown (turns)",
                                           &s_ovTrig.cooldownTurns,
                                           ui::kit::FieldOpts().withRange(0, 32).withTip(
                                               "Turns to wait before this rule may fire again.")))
-                        s_ovTrig.bodyDirty = true;
+                        ovTrigEdited();
                 }
 
                 ImGui::TextUnformatted("Pack body (markdown injected into context)");
@@ -5926,16 +6415,18 @@ static void drawSettingsContextTab(AppState& st, float S) {
                 if (ImGui::InputTextMultiline("##set_packbody",
                         s_ovTrig.packBody.data(), s_ovTrig.packBody.size(),
                         ImVec2(-1, edH))) {
-                    s_ovTrig.bodyDirty = true;
+                    ovTrigEdited();
                     s_ovTrig.packDirty = true;
                 }
                 if (st.fonts.mono) ImGui::PopFont();
             }
 
-            const bool busySave = s_ovTrig.saveInFlight;
-            if (ui::kit::primaryButton(s_ovTrig.creating ? "Create##set_trsave" : "Save##set_trsave",
-                                       !busySave, "Saving\xe2\x80\xa6", ImVec2(-1, 0))) {
-                if (s_ovTrig.creating) {
+            // Existing rules autosave (flushTriggerEdits); only a NEW rule needs an explicit
+            // Create because it must be named first.
+            if (s_ovTrig.creating) {
+                const bool busySave = s_ovTrig.saveInFlight;
+                if (ui::kit::primaryButton("Create##set_trsave", !busySave, "Saving\xe2\x80\xa6",
+                                           ImVec2(-1, 0))) {
                     std::string name = s_ovTrig.newId;
                     name.erase(std::remove_if(name.begin(), name.end(),
                         [](unsigned char c) {
@@ -5943,15 +6434,16 @@ static void drawSettingsContextTab(AppState& st, float S) {
                         }), name.end());
                     if (name.empty()) name = "my_trigger";
                     s_ovTrig.selected = name;
+                    s_ovTrig.bodyId = name;  // the buffers ARE this rule's body
                     s_ovTrig.creating = false;
                     ovSaveTrigger(st);
-                } else {
-                    ovSaveTrigger(st);
                 }
+            } else {
+                dimText(s_ovTrig.bodyDirty
+                            ? "Saving changes\xe2\x80\xa6"
+                            : "Autosaved. Edits write a user override (shipped triggers.yaml is "
+                              "never rewritten).");
             }
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(
-                    "Writes a user override (shipped triggers.yaml is never rewritten).");
 
             if (!s_ovTrig.creating && !s_ovTrig.selected.empty()) {
                 bool isOverrideOrUser = false;
@@ -5984,8 +6476,7 @@ static void drawSettingsContextTab(AppState& st, float S) {
 }  // namespace (skills/context editors)
 
 // ---- kSettingsEntries: unified command search table (command_search.cpp) ----
-// Tab indices: 0=Appearance 1=General 2=AI 3=Providers. Benchmarks / Prompts / Agent /
-// Experimental were absorbed by AI, so every one of their rows targets tab 2.
+// Routes distinguish AI sections, so a search hit never inherits the last visited section.
 // One entry per prominent field/section; labels mirror the modal's visible text.
 const SettingsEntry kSettingsEntries[] = {
     // Appearance (tab 0)
@@ -6015,25 +6506,23 @@ const SettingsEntry kSettingsEntries[] = {
     { "Performance profiler",     "General",      1 },
     { "Profiler",                 "General",      1 },
     // AI (tab 2) — harness (session knobs), roles, tools+maintenance
-    { "Session knobs",            "AI",           2 },
-    { "Harness",                  "AI",           2 },
-    { "Tools",                    "AI",           2 },
-    { "Dev Preview",              "AI",           2 },
-    { "Prompt assembly",          "AI",           2 },
-    { "Auto-Learn",               "AI",           2 },
-    { "Compaction",               "AI",           2 },
-    { "Tool families",            "AI",           2 },
-    { "Bug reports",              "AI",           2 },
-    { "Send bug reports",         "AI",           2 },
-    { "Sketch 2D",                "AI",           2 },
-    { "Model 3D",                 "AI",           2 },
-    { "Model roles",              "AI",           2 },
-    { "Hidden models",            "AI",           2 },
-    { "Harness organization",     "AI",           2 },
-    { "Copilot mode",             "AI",           2 },
-    { "Mode defaults",            "AI",           2 },
-    { "Eng. Firm",                "AI",           2 },
-    { "Eng. Firm model assignments", "AI",        2 },
+    { "Session knobs",            "AI", SettingsAiHarness },
+    { "Harness",                  "AI", SettingsAiHarness },
+    { "Tools",                    "AI", SettingsAiTools },
+    { "Dev Preview",              "AI", SettingsAiDevPreview },
+    { "Prompt assembly",          "AI", SettingsAiDevPreview },
+    { "Auto-Learn",               "AI", SettingsAiHarness },
+    { "Compaction",               "AI", SettingsAiHarness },
+    { "Tool families",            "AI", SettingsAiTools },
+    { "Bug reports",              "AI", SettingsAiTools },
+    { "Send bug reports",         "AI", SettingsAiTools },
+    { "Sketch 2D",                "AI", SettingsAiRoles },
+    { "Model 3D",                 "AI", SettingsAiRoles },
+    { "Model roles",              "AI", SettingsAiRoles },
+    { "Hidden models",            "Providers", SettingsProviders },
+    { "Harness organization",     "AI", SettingsAiHarness },
+    { "Copilot mode",             "AI", SettingsAiHarness },
+    { "Mode defaults",            "AI", SettingsAiHarness },
     // Providers (tab 3) — provider/model, keys, Moonshot, accounts
     { "AI provider",              "Providers",    3 },
     { "Provider & Model",         "Providers",    3 },
@@ -6066,59 +6555,56 @@ const SettingsEntry kSettingsEntries[] = {
     { "Thinking effort",          "Providers",    3 },
     { "Max response tokens",      "Providers",    3 },
     { "Model context window",     "Providers",    3 },
-    // Benchmarks (tab 4)
-    { "Benchmarks",               "AI",    2 },
-    { "Agent benchmark",          "AI",    2 },
-    { "Artifact validity",        "AI",    2 },
-    { "Show legacy results",      "AI",    2 },
-    { "Model leaderboard",        "AI",    2 },
-    { "Run benchmark",            "AI",    2 },
-    { "Benchmark",                "AI",    2 },
-    { "Benchmark categories",     "AI",    2 },
-    { "Category run",             "AI",    2 },
-    // Prompts (tab 5)
-    { "Prompts",                  "AI",           2 },
-    { "Role prompts",             "AI",           2 },
-    { "Agent prompts",            "AI",       2 },
-    { "Prompt editor",            "AI",       2 },
-    { "System prompt",            "AI",       2 },
-    { "System prompt override",   "AI",       2 },
-    { "Skills",                   "AI",       2 },
-    { "Skill editor",             "AI",       2 },
-    { "Rules",                    "AI",       2 },
-    { "Rule triggers",            "AI",       2 },
-    { "Context injection",        "AI",       2 },
-    { "Triggers",                 "AI",       2 },
+    // AI: Benchmarks, Prompts, Skills, Rules
+    { "Benchmarks",               "AI", SettingsAiBenchmarks },
+    { "Agent benchmark",          "AI", SettingsAiBenchmarks },
+    { "Artifact validity",        "AI", SettingsAiBenchmarks },
+    { "Show legacy results",      "AI", SettingsAiBenchmarks },
+    { "Model leaderboard",        "AI", SettingsAiBenchmarks },
+    { "Run benchmark",            "AI", SettingsAiBenchmarks },
+    { "Benchmark",                "AI", SettingsAiBenchmarks },
+    { "Benchmark categories",     "AI", SettingsAiBenchmarks },
+    { "Category run",             "AI", SettingsAiBenchmarks },
+    { "Prompts",                  "AI", SettingsAiPrompts },
+    { "Role prompts",             "AI", SettingsAiPrompts },
+    { "Agent prompts",            "AI", SettingsAiPrompts },
+    { "Prompt editor",            "AI", SettingsAiPrompts },
+    { "System prompt",            "AI", SettingsAiPrompts },
+    { "System prompt override",   "AI", SettingsAiPrompts },
+    { "Skills",                   "AI", SettingsAiSkills },
+    { "Skill editor",             "AI", SettingsAiSkills },
+    { "Rules",                    "AI", SettingsAiRules },
+    { "Rule triggers",            "AI", SettingsAiRules },
+    { "Context injection",        "AI", SettingsAiRules },
+    { "Triggers",                 "AI", SettingsAiRules },
     // Run behavior (lives on AI tab; was Agent tab 6)
-    { "Plan preference",          "AI",           2 },
-    { "Plan before building",     "AI",           2 },
-    { "Plan mode",                "AI",           2 },
-    { "Subagent preference",      "AI",           2 },
-    { "Task list preference",     "AI",           2 },
-    { "Role adoption",            "AI",           2 },
-    { "Advisor preference",       "AI",           2 },
-    { "Proactive advisor",        "AI",           2 },
-    { "Project memory",           "AI",           2 },
-    { "Memory budget",            "AI",           2 },
-    { "Subagent tool-call budget", "AI",           2 },
-    { "Tool call budget",          "AI",           2 },
-    { "Subagent convergence warning", "AI",        2 },
-    { "Eng. Firm budget",         "AI",           2 },
-    { "Company budget",           "AI",           2 },
-    { "Run behavior",             "AI",           2 },
-    { "Maintenance",              "AI",           2 },
-    { "Max subagent nesting",     "AI",           2 },
-    // Vision routing + parametric sequence (absorbed from the retired Experimental tab)
-    { "Vision review model",      "AI",           2 },
-    { "Vision routing",           "AI",           2 },
-    { "Vision & spatial routing", "AI",           2 },
-    { "Spatial model",            "AI",           2 },
-    { "Seek-CAD split",           "AI",           2 },
-    { "Parametric sequence mode", "AI",           2 },
-    { "CAD sequence mode",        "AI",           2 },
-    { "Feature sequence",         "AI",           2 },
-    { "Monolithic solid",         "AI",           2 },
-    { "Experimental",             "AI",           2 },
+    { "Plan preference",          "AI", SettingsAiHarness },
+    { "Plan before building",     "AI", SettingsAiHarness },
+    { "Plan mode",                "AI", SettingsAiHarness },
+    { "Subagent preference",      "AI", SettingsAiHarness },
+    { "Task list preference",     "AI", SettingsAiHarness },
+    { "Role adoption",            "AI", SettingsAiHarness },
+    { "Advisor preference",       "AI", SettingsAiHarness },
+    { "Proactive advisor",        "AI", SettingsAiHarness },
+    { "Project memory",           "AI", SettingsAiHarness },
+    { "Memory budget",            "AI", SettingsAiHarness },
+    { "Subagent tool-call budget", "AI", SettingsAiHarness },
+    { "Tool call budget",         "AI", SettingsAiHarness },
+    { "Subagent convergence warning", "AI", SettingsAiHarness },
+    { "Run behavior",             "AI", SettingsAiHarness },
+    { "Maintenance",              "AI", SettingsAiTools },
+    { "Max subagent nesting",     "AI", SettingsAiHarness },
+    // Vision routing is in Roles; parametric sequence is in Harness.
+    { "Vision review model",      "AI", SettingsAiRoles },
+    { "Vision routing",           "AI", SettingsAiRoles },
+    { "Vision & spatial routing", "AI", SettingsAiRoles },
+    { "Spatial model",            "AI", SettingsAiRoles },
+    { "Seek-CAD split",           "AI", SettingsAiRoles },
+    { "Parametric sequence mode", "AI", SettingsAiHarness },
+    { "CAD sequence mode",        "AI", SettingsAiHarness },
+    { "Feature sequence",         "AI", SettingsAiHarness },
+    { "Monolithic solid",         "AI", SettingsAiHarness },
+    { "Experimental",             "AI", SettingsAiHarness },
 };
 const int kSettingsEntryCount =
     (int)(sizeof(kSettingsEntries) / sizeof(kSettingsEntries[0]));
@@ -6168,7 +6654,7 @@ static_assert(sizeof(kAiSubAdvanced) / sizeof(kAiSubAdvanced[0]) == 8,
 static void drawRuntimeMaintenanceSection(AppState& st, float sc) {
     settingsGlassSectionBegin("##ai_maintenance", "Maintenance");
     dimText("Repair the local CAD engine runtime.");
-    const bool canSetup = !st.setupRunning.load() && !st.anyRunActive();
+    const bool canSetup = !st.workerBootPending && !st.setupRunning.load() && !st.anyRunActive();
     if (!canSetup) ImGui::BeginDisabled();
     if (ui::kit::secondaryButton("Repair / install runtime", true, nullptr, ImVec2(220.0f * sc, 0)))
         st.startSetup(true);
@@ -6194,12 +6680,42 @@ bool drawHarnessSessionKnobs(AppState& st, float sc) {
     return ::drawHarnessSessionKnobs(st, sc);
 }
 
+void flushSettingsModalEdits(AppState& st) {
+    flushPromptEditors(st, /*force=*/true);
+}
+
+void flushSettingsModalRpcEdits(AppState& st) {
+    if (!st.workerStarted) return;
+    // Skills / Rules edits still inside their typing pause go out now...
+    flushSkillRuleEdits(st, /*force=*/true);
+    // ...and so does a model-assignment draft that never got an ack (the in-flight call is
+    // already on the wire; a draft left behind by a failed/deferred save is re-sent once).
+    if (!s_roles.pendingPatch.is_null() && !s_roles.rolesSaveInFlight && s_roles.rolesLoaded &&
+        !s_roles.rolesRpcMissing)
+        sendPendingModelRoles(st);
+    // Wait (bounded) for those calls to be acknowledged: AsyncRpc::shutdown() aborts the one
+    // in flight, which would lose the edit.
+    if (s_ovSkills.saveInFlight || s_ovTrig.saveInFlight || s_roles.rolesSaveInFlight)
+        st.rpc.drainUntilIdle(5000);
+}
+
+void drawQuickModelSizes(AppState& st, float captionColumn, unsigned int captionInk) {
+    // The same poll/draft/ack/retry state and pickers as Settings → AI → Models; only the row
+    // layout differs. Nothing to read or save until the agent service answers.
+    const bool serviceReady = st.workerStarted && !st.workerBootPending && st.startupPhase.empty();
+    if (serviceReady) pollModelRoles(st, /*force=*/false);
+    ensureDefaultRoles();
+    const bool ro = drawModelRolesStatus(st) || !serviceReady;
+    if (!serviceReady) kit::dimText("Available once the agent service is ready.");
+    drawModelSizeRows(st, ro, captionColumn, captionInk);
+}
+
 void beginExternalProviderSignIn(AppState& st, const std::string& provider) {
     ::beginOmpOAuth(st, provider, /*externalOwner=*/true);
 }
 
 ExternalProviderSignInStatus pollExternalProviderSignIn(AppState& st) {
-    (void)st;   // one-call chudcode_login: progress arrives via streamed events, no poll RPC
+    (void)st;   // one-call omp_login: progress arrives via streamed events, no poll RPC
     const OmpOAuthFlow& f = s_omp.oauth;
     ExternalProviderSignInStatus out;
     out.active = f.active;
@@ -6216,6 +6732,10 @@ ExternalProviderSignInStatus pollExternalProviderSignIn(AppState& st) {
 
 void drawSettingsModal(AppState& st, bool busy) {
     Settings& settings = st.settings;
+    // Debounced autosave of the Prompts-page editors runs here, not inside the Prompts page, so
+    // switching tabs (or the page being scrolled off) cannot strand a pending edit.
+    flushPromptEditors(st, /*force=*/false);
+    flushSkillRuleEdits(st, /*force=*/false);
 
     // ---------- Settings window ----------
     static bool s_settingsOpen = false;
@@ -6229,6 +6749,14 @@ void drawSettingsModal(AppState& st, bool busy) {
         st.openSettings = false;
     }
     if (st.openSettingsTab >= 0 && !s_settingsOpen) { opening = true; s_settingsOpen = true; }
+    // The main viewport does not enable ImGui keyboard navigation globally. Enable it while
+    // Settings is open so combo rows and their search fields can be reached by keyboard too,
+    // without changing navigation behavior in the rest of the application.
+    static bool s_settingsEnabledKeyboardNav = false;
+    if (opening && !(ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard)) {
+        ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+        s_settingsEnabledKeyboardNav = true;
+    }
     // Workspace-folder edit buffer (General tab), reseeded from Settings on every open.
     static std::vector<char> s_wsBuf(512, 0);
     // Box.com mirror edit buffers (General tab), also reseeded on every open so Cancel-less
@@ -6238,6 +6766,38 @@ void drawSettingsModal(AppState& st, bool busy) {
     static std::vector<char> s_boxClientIdBuf(512, 0);
     static std::vector<char> s_boxClientSecretBuf(1024, 0);
     static int s_boxAuthMethod = 0;
+    // General-page text fields autosave when their edit ends (Enter / focus lost), when the page
+    // changes, or when the modal closes. They count as dirty only after the user typed in them,
+    // so a stale buffer can never overwrite a workspace folder changed elsewhere (opening a project).
+    static bool s_wsDirty = false;
+    static bool s_boxDirty = false;
+    auto commitWorkspaceDir = [&]() {
+        s_wsDirty = false;
+        std::string chosen = s_wsBuf.data();
+#ifdef __EMSCRIPTEN__
+        // Never persist the literal '/workspace' stub — resolve the real root.
+        if (chosen == "/workspace") chosen.clear();
+#endif
+        settings.workspaceDir = chosen;
+        st.workspaceDir = chosen;  // empty: ensureWorkspaceDir re-resolves the default root
+        saveSettings(settings);
+        st.addLog("[ok] workspace folder set: " +
+                  (chosen.empty() ? std::string("(default)") : chosen));
+    };
+    auto commitBoxSettings = [&](bool refreshStatus) {
+        s_boxDirty = false;
+        settings.boxFolderId =
+            s_boxFolderBuf[0] ? std::string(s_boxFolderBuf.data()) : std::string("0");
+        settings.boxAuthMethod = s_boxAuthMethod == 1 ? "oauth" : "developer_token";
+        settings.boxDeveloperToken = s_boxDeveloperTokenBuf.data();
+        settings.boxClientId = s_boxClientIdBuf.data();
+        settings.boxClientSecret = s_boxClientSecretBuf.data();
+        saveSettings(settings);
+        if (refreshStatus) {
+            s_boxMirrorUi.actionStatus = "Box settings saved";
+            requestBoxStatus(st);
+        }
+    };
     if (opening) {
         openOmpProviderModal();
         std::fill(s_wsBuf.begin(), s_wsBuf.end(), 0);
@@ -6251,13 +6811,13 @@ void drawSettingsModal(AppState& st, bool busy) {
         seedBoxBuffer(s_boxClientIdBuf, settings.boxClientId);
         seedBoxBuffer(s_boxClientSecretBuf, settings.boxClientSecret);
         s_boxAuthMethod = settings.boxAuthMethod == "oauth" ? 1 : 0;
+        s_wsDirty = false;
+        s_boxDirty = false;
         s_boxMirrorUi.actionStatus.clear();
         requestBoxStatus(st);
         // Make sure the glass engine reflects the persisted config before the Appearance
         // preview draws (idempotent — app startup wiring may already have pushed it).
         ui::setGlassConfig(settings.glassCfg);
-        // Re-read eng_firm.models so the assignments grid matches disk on every open.
-        s_efModels.loaded = false;
     }
     float sc = ui::uiScale;
     ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -6328,24 +6888,26 @@ void drawSettingsModal(AppState& st, bool busy) {
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, ui::metrics::px(8.0f)));
         bool settingsBegun = ImGui::Begin("Settings", &s_settingsOpen,
                          ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoDocking);
+        // The native title-bar X has no built-in ItemInfo label; expose its real hitbox to
+        // pointer-driven UI scenarios after Begin has submitted the window decorations.
+        {
+            ImGuiContext& g = *GImGui;
+            IMGUI_TEST_ENGINE_ITEM_INFO(ImGui::GetCurrentWindow()->GetID("#CLOSE"),
+                                        "##settings_close", 0);
+        }
         // Decorations render inside Begin, so the chrome vars pop immediately after it —
         // widgets inside keep their normal frame borders.
         ImGui::PopStyleVar(3);    // FrameBorderSize, WindowBorderSize, WindowRounding
         ImGui::PopStyleColor(4);  // Border / TitleBg / TitleBgActive / TitleBgCollapsed
         // All placement is resolved above, before Begin paints the window decorations.
         if (settingsBegun) {
-        // C22b: if a pending prompt role was requested, load prompts and jump to the Prompts tab.
+        // Keep a role deep link until its asynchronous catalog has arrived.
         bool jumpToPrompts = false;
-        if (!st.pendingPromptRole.empty() && st.workerStarted) {
-            if (!s_promptsLoaded) loadPrompts(st);
-            // Select the matching role in the list
-            for (int i = 0; i < (int)s_promptRecs.size(); ++i) {
-                if (s_promptRecs[i].role == st.pendingPromptRole) {
-                    s_selectedRole = i;
-                    break;
-                }
-            }
+        if (!st.pendingPromptRole.empty()) {
+            s_pendingPromptSelection = std::move(st.pendingPromptRole);
             st.pendingPromptRole.clear();
+            selectPendingPrompt();
+            if (!s_promptsLoaded && st.workerStarted) loadPrompts(st);
             jumpToPrompts = true;
         }
         // Which AI sub-tab a jump should land on (-1 = leave the last one selected). Declared
@@ -6364,12 +6926,17 @@ void drawSettingsModal(AppState& st, bool busy) {
         // Experimental(7 — its two knobs now live on Roles and Harness). This MUST run before
         // the tab bar: when it sat after, a legacy index selected nothing on the frame it
         // arrived and the jump was silently dropped.
-        if (jumpToTab >= 4) {
+        const bool explicitAiSection =
+            jumpToTab >= SettingsAiHarness && jumpToTab <= SettingsAiDevPreview;
+        if (explicitAiSection) {
+            s_aiSubJump = jumpToTab - SettingsAiHarness;
+            jumpToTab = SettingsAI;
+        } else if (jumpToTab >= 4 && jumpToTab <= 7) {
             if (jumpToTab == 4) s_aiSubJump = 5;       // Benchmarks
             else if (jumpToTab == 5) s_aiSubJump = 2;  // Prompts
-            else if (jumpToTab == 6) s_aiSubJump = 4;   // Rules (/rule in the composer)
+            else if (jumpToTab == 6) s_aiSubJump = 4;  // Rules (/rule in the composer)
             else if (jumpToTab == 7) s_aiSubJump = 1;  // Experimental -> Roles
-            jumpToTab = 2;
+            jumpToTab = SettingsAI;
         }
         if (jumpToPrompts) {
             s_aiSubJump = 2;
@@ -6384,8 +6951,8 @@ void drawSettingsModal(AppState& st, bool busy) {
         // never hide a capability: every programmatic route into one turns disclosure on.
         if (s_aiSubJump >= 0) {
             s_aiSubSel = s_aiSubJump;
-            if (s_aiSubJump < 8 && kAiSubAdvanced[s_aiSubJump] &&
-                !st.settings.showAdvanced) {
+            if (!st.settings.showAdvanced &&
+                (explicitAiSection || (s_aiSubJump < 8 && kAiSubAdvanced[s_aiSubJump]))) {
                 st.settings.showAdvanced = true;
                 saveSettings(st.settings);
             }
@@ -6402,6 +6969,11 @@ void drawSettingsModal(AppState& st, bool busy) {
         // opens; a resolved jump drives it directly so it lands the same frame.
         static int s_settingsPage = 0;
         if (jumpToTab >= 0 && jumpToTab <= 3) s_settingsPage = jumpToTab;
+        // Leaving General commits its typed fields (their deactivation may not have been drawn).
+        if (s_settingsPage != SettingsGeneral) {
+            if (s_wsDirty) commitWorkspaceDir();
+            if (s_boxDirty) commitBoxSettings(/*refreshStatus=*/false);
+        }
 
         // AI sub-section visibility, resolved BEFORE the nav rail: on wide dialogs the AI
         // sections are listed in the rail under "AI" (one navigation column, not a rail
@@ -6470,9 +7042,9 @@ void drawSettingsModal(AppState& st, bool busy) {
                                 ImVec2(ui::metrics::px(8.0f), ui::metrics::px(4.0f)));
             ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
                                 ImVec2(ui::metrics::px(6.0f), ui::metrics::px(2.0f)));
+            // Short overlay bands must still let users reach every row and Advanced.
             ImGui::BeginChild("##settings_nav", ImVec2(railW, 0),
-                              ImGuiChildFlags_AlwaysUseWindowPadding,
-                              ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+                              ImGuiChildFlags_AlwaysUseWindowPadding);
             // Rounded kit rows: frosted selection pill, animated hover wash, icon in accent
             // while selected — the same row every selected list in the app uses.
             ui::kit::pushDensity(ui::kit::Density::Compact);
@@ -6629,6 +7201,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                         std::snprintf(cid, sizeof(cid), "##brandanim%d", i);
                         const ImVec2 mn = ImGui::GetCursorScreenPos();
                         ImGui::InvisibleButton(cid, ImVec2(cardW, cardH));
+                        if (ImGui::IsItemVisible()) ui::anim::requestFramesAt(30.0f);
                         const bool sel = (settings.brandAnim == i);
                         if (ImGui::IsItemClicked()) {
                             settings.brandAnim = i;
@@ -6875,40 +7448,8 @@ void drawSettingsModal(AppState& st, bool busy) {
                 if (ui::kit::segmented("##display_quality", kDisplayQualityLabels, 3, &dqSel)) {
                     settings.displayQuality = kDisplayQualityValues[dqSel];
                     saveSettings(settings);
-                    if (st.workerStarted) {
-                        for (const auto& tab : st.docTabs) {
-                            if (tab.docId.empty()) continue;
-                            if (tab.kind != AppState::DocTab::TabKind::Part &&
-                                tab.kind != AppState::DocTab::TabKind::Assembly)
-                                continue;
-                            const bool active =
-                                (st.activeTab >= 0 && st.activeTab < (int)st.docTabs.size() &&
-                                 st.docTabs[st.activeTab].docId == tab.docId);
-                            st.rpc.call("doc_set_display_quality",
-                                        nlohmann::json{{"doc_id", tab.docId},
-                                                       {"quality", settings.displayQuality}},
-                                        [&st, active](const core::RpcResult& r) {
-                                            if (!r.ok) {
-                                                st.addLog("[err] display quality: " + r.err);
-                                                return;
-                                            }
-                                            // Only the visible doc's mesh is loaded in the
-                                            // viewport; the others re-mesh on their next
-                                            // activation.
-                                            if (!active) return;
-                                            std::string aicm;
-                                            if (r.result.is_object() &&
-                                                r.result.contains("tess") &&
-                                                r.result["tess"].is_object())
-                                                aicm = r.result["tess"].value("aicm_path",
-                                                                              std::string());
-                                            if (!aicm.empty()) {
-                                                std::string le;
-                                                st.loadDocMesh(aicm, le);
-                                            }
-                                        }, /*timeoutMs=*/120000);
-                        }
-                    }
+                    // AppState::syncDisplayQuality() pushes it to every open doc next frame; the
+                    // same path restores the saved tier for docs opened after a restart.
                     st.addLog(std::string("[display] quality set to ") + settings.displayQuality);
                 }
                 dimText("Display-only mesh smoothness; lengths display/parse in the chosen units "
@@ -6950,36 +7491,21 @@ void drawSettingsModal(AppState& st, bool busy) {
                         s_wsDefaultWeb.empty() ? std::string("(server default)")
                                                : ("(default: " + s_wsDefaultWeb + ")");
                     helpMarker(s_wsHelpWeb.c_str());
-                    ImGui::SetNextItemWidth(-210.0f * sc);
-                    ImGui::InputTextWithHint("##wsdir", s_wsHintWeb.c_str(),
-                                             s_wsBuf.data(), s_wsBuf.size());
+                    ImGui::SetNextItemWidth(-100.0f * sc);
+                    if (ImGui::InputTextWithHint("##wsdir", s_wsHintWeb.c_str(),
+                                                 s_wsBuf.data(), s_wsBuf.size()))
+                        s_wsDirty = true;
+                    if (ImGui::IsItemDeactivatedAfterEdit()) commitWorkspaceDir();
                     ImGui::SameLine();
                     if (ui::kit::secondaryButton("Browse\xe2\x80\xa6", true, nullptr, ImVec2(90.0f * sc, 0))) {
                         std::string chosen = openFolderDialog();
                         if (!chosen.empty() && chosen != "/workspace") {
                             std::fill(s_wsBuf.begin(), s_wsBuf.end(), 0);
                             std::strncpy(s_wsBuf.data(), chosen.c_str(), s_wsBuf.size() - 1);
+                            commitWorkspaceDir();  // picking a folder is the commit
                         }
                     }
-                    ImGui::SameLine();
-                    if (ui::kit::primaryButton("Apply", true, nullptr, ImVec2(100.0f * sc, 0))) {
-                        std::string chosen = s_wsBuf.data();
-                        // Never persist the literal '/workspace' stub — resolve real root.
-                        if (chosen.empty() || chosen == "/workspace") {
-                            chosen.clear();
-                            settings.workspaceDir.clear();
-                            st.workspaceDir.clear();
-                            // ensureWorkspaceDir will re-resolve via fsBackend().defaultRoot().
-                        } else {
-                            settings.workspaceDir = chosen;
-                            st.workspaceDir = chosen;
-                        }
-                        saveSettings(settings);
-                        st.addLog("[ok] workspace folder set: " +
-                                  (settings.workspaceDir.empty() ? std::string("(default)")
-                                                                 : settings.workspaceDir));
-                    }
-                    dimText("Root of the File Explorer on the server workspace (saved on Apply).");
+                    dimText("Root of the File Explorer on the server workspace (saved automatically).");
                 }
 #else
                 // Truthful default label: defaultWorkspaceDir() applies the alias rule
@@ -6987,25 +7513,16 @@ void drawSettingsModal(AppState& st, bool busy) {
                 static const std::string s_wsDefault = defaultWorkspaceDir();
                 static const std::string s_wsHelp =
                     "The File Explorer's root folder and the default save location. "
-                    "Leave empty to use " + s_wsDefault + ". Applied and saved with the "
-                    "Apply button.";
+                    "Leave empty to use " + s_wsDefault + ". Saved automatically when you "
+                    "press Enter or leave the field.";
                 static const std::string s_wsHint = "(default: " + s_wsDefault + ")";
                 helpMarker(s_wsHelp.c_str());
-                ImGui::SetNextItemWidth(-110.0f * sc);
-                ImGui::InputTextWithHint("##wsdir", s_wsHint.c_str(),
-                                         s_wsBuf.data(), s_wsBuf.size());
-                ImGui::SameLine();
-                if (ui::kit::primaryButton("Apply", true, nullptr, ImVec2(100.0f * sc, 0))) {
-                    settings.workspaceDir = s_wsBuf.data();
-                    saveSettings(settings);
-                    // Re-resolve the live root: empty falls back to Documents/Chudware inside
-                    // the Explorer's ensureWorkspaceDir.
-                    st.workspaceDir = settings.workspaceDir;
-                    st.addLog("[ok] workspace folder set: " +
-                              (settings.workspaceDir.empty() ? std::string("(default)")
-                                                             : settings.workspaceDir));
-                }
-                dimText("Root of the File Explorer and default save location (saved on Apply).");
+                ImGui::SetNextItemWidth(-1.0f);
+                if (ImGui::InputTextWithHint("##wsdir", s_wsHint.c_str(),
+                                             s_wsBuf.data(), s_wsBuf.size()))
+                    s_wsDirty = true;
+                if (ImGui::IsItemDeactivatedAfterEdit()) commitWorkspaceDir();
+                dimText("Root of the File Explorer and default save location (saved automatically).");
 #endif
                 settingsGlassSectionEnd();
 
@@ -7021,44 +7538,41 @@ void drawSettingsModal(AppState& st, bool busy) {
                                               settingsLabelLeadWidth("Client secret", false));
                 settingsLabelLead("Folder ID", nullptr, boxLabelW);
                 ImGui::SetNextItemWidth(-1.0f);
-                ImGui::InputTextWithHint("##box_folder_id", "Box folder id (0 = All Files)",
-                                         s_boxFolderBuf.data(), s_boxFolderBuf.size());
+                if (ImGui::InputTextWithHint("##box_folder_id", "Box folder id (0 = All Files)",
+                                             s_boxFolderBuf.data(), s_boxFolderBuf.size()))
+                    s_boxDirty = true;
+                if (ImGui::IsItemDeactivatedAfterEdit()) commitBoxSettings(true);
 
                 settingsLabelLead("Auth method", nullptr, boxLabelW);
                 static const char* kBoxAuthLabels[] = {"Developer token", "OAuth"};
-                ui::kit::segmented("##box_auth_method", kBoxAuthLabels, 2, &s_boxAuthMethod);
+                if (ui::kit::segmented("##box_auth_method", kBoxAuthLabels, 2, &s_boxAuthMethod))
+                    commitBoxSettings(true);  // the method gates "Connect Box account": apply at once
 
                 settingsLabelLead("Developer token", nullptr, boxLabelW);
                 ImGui::SetNextItemWidth(-1.0f);
-                ImGui::InputTextWithHint("##box_developer_token", "Box developer token",
-                                         s_boxDeveloperTokenBuf.data(),
-                                         s_boxDeveloperTokenBuf.size(),
-                                         ImGuiInputTextFlags_Password);
+                if (ImGui::InputTextWithHint("##box_developer_token", "Box developer token",
+                                             s_boxDeveloperTokenBuf.data(),
+                                             s_boxDeveloperTokenBuf.size(),
+                                             ImGuiInputTextFlags_Password))
+                    s_boxDirty = true;
+                if (ImGui::IsItemDeactivatedAfterEdit()) commitBoxSettings(true);
 
                 settingsLabelLead("Client ID", nullptr, boxLabelW);
                 ImGui::SetNextItemWidth(-1.0f);
-                ImGui::InputTextWithHint("##box_client_id", "Box OAuth client ID",
-                                         s_boxClientIdBuf.data(), s_boxClientIdBuf.size());
+                if (ImGui::InputTextWithHint("##box_client_id", "Box OAuth client ID",
+                                             s_boxClientIdBuf.data(), s_boxClientIdBuf.size()))
+                    s_boxDirty = true;
+                if (ImGui::IsItemDeactivatedAfterEdit()) commitBoxSettings(true);
 
                 settingsLabelLead("Client secret", nullptr, boxLabelW);
                 ImGui::SetNextItemWidth(-1.0f);
-                ImGui::InputTextWithHint("##box_client_secret", "Box OAuth client secret",
-                                         s_boxClientSecretBuf.data(),
-                                         s_boxClientSecretBuf.size(),
-                                         ImGuiInputTextFlags_Password);
+                if (ImGui::InputTextWithHint("##box_client_secret", "Box OAuth client secret",
+                                             s_boxClientSecretBuf.data(),
+                                             s_boxClientSecretBuf.size(),
+                                             ImGuiInputTextFlags_Password))
+                    s_boxDirty = true;
+                if (ImGui::IsItemDeactivatedAfterEdit()) commitBoxSettings(true);
 
-                if (ui::kit::primaryButton("Apply##box", true, nullptr, ImVec2(100.0f * sc, 0))) {
-                    settings.boxFolderId =
-                        s_boxFolderBuf[0] ? std::string(s_boxFolderBuf.data()) : std::string("0");
-                    settings.boxAuthMethod =
-                        s_boxAuthMethod == 1 ? "oauth" : "developer_token";
-                    settings.boxDeveloperToken = s_boxDeveloperTokenBuf.data();
-                    settings.boxClientId = s_boxClientIdBuf.data();
-                    settings.boxClientSecret = s_boxClientSecretBuf.data();
-                    saveSettings(settings);
-                    s_boxMirrorUi.actionStatus = "Box settings applied";
-                    requestBoxStatus(st);
-                }
 
                 const bool oauthLoginDisabled =
                     settings.boxAuthMethod != "oauth" ||
@@ -7071,7 +7585,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                 ImGui::EndDisabled();
                 if (settings.boxAuthMethod != "oauth" &&
                     ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                    ImGui::SetTooltip("Select the oauth auth method and Apply first");
+                    ImGui::SetTooltip("Select the OAuth auth method first");
 
                 ImGui::SameLine();
                 const bool syncDisabled =
@@ -7102,14 +7616,13 @@ void drawSettingsModal(AppState& st, bool busy) {
                 if (core::cpp_core().available()) {
                     ImGui::TextUnformatted("Active engine: C++ core (libchudware)");
                     helpMarker("The in-process C++ core is the only modeling engine — documents, "
-                               "sketching, FEA/CFD, CAM, ECAD, firmware, sourcing and the AI agent "
-                               "all run on it. Services-side Python handles orchestration surfaces "
-                               "(parts catalog, reverse engineering, vendor sign-in, missions).");
+                               "sketching, FEA/CFD, CAM, ECAD, firmware and sourcing all run on "
+                               "it. Services-side Python handles orchestration surfaces (agent "
+                               "runs, parts catalog, reverse engineering, vendor sign-in, missions).");
                     dimText(("C++ core: libchudware loaded (ABI " +
                              core::cpp_core().abiVersion() + ")").c_str());
                     ImGui::BulletText("Modeling / documents / sketch: C++ core");
                     ImGui::BulletText("Simulation (FEA + CFD) / CAM / ECAD / firmware: C++ core");
-                    ImGui::BulletText("AI agent (copilot runs): C++ core");
                 } else {
                     ImGui::TextUnformatted("Active engine: UNAVAILABLE (libchudware not loaded)");
                     // The path to name here is per-platform: the build tree carries the
@@ -7198,11 +7711,14 @@ void drawSettingsModal(AppState& st, bool busy) {
                     // Harness is first: full quick-settings mirror + mode grid.
                     // (Behavior was absorbed here so knobs aren't duplicated.)
                     if (s_aiSubSel == 0) {
+                        settingsGlassSectionBegin("##ai_basic_models", "Models");
+                        drawModelRolesSection(st, sc);
+                        settingsGlassSectionEnd();
                         // Session knobs lead (most-used); the mode grid sits at the bottom
                         // of the page — it is a read-mostly orientation card.
                         settingsGlassSectionBegin("##ai_harness_session", "Session knobs");
                         dimText("Same knobs as Copilot -> Quick settings, plus modal-only "
-                                "options (role adoption, company auto-route, Eng. Firm budget).");
+                                "options such as role adoption.");
                         ImGui::Dummy(ImVec2(0, 4.0f * sc));
                         if (drawHarnessSessionKnobs(st, sc))
                             saveSettings(st.settings);
@@ -7237,29 +7753,13 @@ void drawSettingsModal(AppState& st, bool busy) {
                         drawModelRolesSection(st, sc);
                         settingsGlassSectionEnd();
 
-                        // Vision/spatial routing and the Eng. Firm per-role model matrix are
-                        // both power routing surfaces: the defaults resolve a working model
-                        // for every role, and getting these wrong is worse than not touching
-                        // them. Model roles above stays visible in Basic because choosing
-                        // "which model does my CAD work" is an everyday decision.
+                        // Vision and spatial routing are advanced overrides; the shared model
+                        // roles above remain available in Basic.
                         if (st.settings.showAdvanced) {
                             settingsGlassSectionBegin("##ai_vision_routing",
                                                       "Vision & spatial routing");
-                            drawVisionRoutingSection(st, sc);
+                            if (drawVisionRoutingSection(st, sc)) saveSettings(st.settings);
                             settingsGlassSectionEnd();
-                            ImGui::Dummy(ImVec2(0, 8.0f * sc));
-                            {
-                                static bool s_efOpen = false;
-                                ImGui::SetNextItemOpen(s_efOpen, ImGuiCond_Once);
-                                if (ImGui::CollapsingHeader("Eng. Firm model assignments")) {
-                                    s_efOpen = true;
-                                    settingsGlassSectionBegin("##ai_eng_firm", "Eng. Firm");
-                                    drawEngFirmModelAssignments(st, sc);
-                                    settingsGlassSectionEnd();
-                                } else {
-                                    s_efOpen = false;
-                                }
-                            }
                         }
                     }
 
@@ -7286,13 +7786,11 @@ void drawSettingsModal(AppState& st, bool busy) {
                                 ? "Start the worker to load role prompts"
                                 : "Prompt catalog is loading");
                         if (!s_promptsError.empty()) {
-                            ImGui::SameLine();
                             ImGui::PushStyleColor(ImGuiCol_Text, ui::Palette::toU32(ui::palette.statusErr));
-                            ImGui::TextUnformatted(s_promptsError.c_str());
+                            ImGui::TextWrapped("%s", s_promptsError.c_str());
                             ImGui::PopStyleColor();
                         } else if (!s_promptsLoaded) {
-                            ImGui::SameLine();
-                            dimText(s_promptsLoading
+                            ImGui::TextWrapped("%s", s_promptsLoading
                                 ? "Loading\xe2\x80\xa6"
                                 : "Worker not ready \xe2\x80\x94 start runtime to edit prompts.");
                         } else {
@@ -7308,18 +7806,45 @@ void drawSettingsModal(AppState& st, bool busy) {
                         }
 
                         const int sysIdx = (int)s_promptRecs.size();
-                        const float listW = 168.0f * sc;
+                        const bool compactPrompts =
+                            ImGui::GetContentRegionAvail().x < ui::metrics::px(450.0f);
+                        if (compactPrompts) {
+                            const char* preview = s_selectedRole < sysIdx && s_selectedRole >= 0
+                                ? s_promptRecs[s_selectedRole].role.c_str() : "system (override)";
+                            float widest = ImGui::CalcTextSize("system (override)").x;
+                            for (const auto& pr : s_promptRecs)
+                                widest = ImMax(widest, ImGui::CalcTextSize(pr.role.c_str()).x);
+                            ImGui::SetNextItemWidth(-1);
+                            if (settingsBeginPopupRowCombo("##prompt_role_pick", preview, widest)) {
+                                for (int i = 0; i < sysIdx; ++i) {
+                                    ImGui::PushID(i);
+                                    if (settingsPopupRowSelectable(s_promptRecs[i].role.c_str(),
+                                                                  s_selectedRole == i)) {
+                                        s_selectedRole = i;
+                                        s_promptSystemSelected = false;
+                                        s_pendingPromptSelection.clear();
+                                    }
+                                    ImGui::PopID();
+                                }
+                                if (settingsPopupRowSelectable("system (override)",
+                                                               s_selectedRole == sysIdx)) {
+                                    s_selectedRole = sysIdx;
+                                    s_promptSystemSelected = true;
+                                    s_pendingPromptSelection.clear();
+                                }
+                                settingsEndPopupRowCombo();
+                            }
+                        }
                         // Fill remaining viewport — single scrollbar inside list/editor only.
                         const float promptsH = ImMax(220.0f * sc,
                             ImGui::GetContentRegionAvail().y - 4.0f * sc);
-
+                        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                            ImVec2(ui::metrics::px(10.0f), ui::metrics::px(8.0f)));
+                        if (!compactPrompts) {
                         ImGui::PushStyleColor(ImGuiCol_ChildBg,
                             ImVec4(ui::palette.panelBg[0], ui::palette.panelBg[1],
                                    ui::palette.panelBg[2], 1));
-                        // List and editor are one split view: same border, same inner padding.
-                        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                            ImVec2(ui::metrics::px(10.0f), ui::metrics::px(8.0f)));
-                        ImGui::BeginChild("##rolelist", ImVec2(listW, promptsH),
+                        ImGui::BeginChild("##rolelist", ImVec2(168.0f * sc, promptsH),
                                           ImGuiChildFlags_Borders);
                         if (s_promptRecs.empty() && s_promptsLoaded) {
                             dimText("No role prompts returned.");
@@ -7329,8 +7854,11 @@ void drawSettingsModal(AppState& st, bool busy) {
                             auto& pr = s_promptRecs[i];
                             std::string lbl = pr.role;
                             if (pr.overridden) lbl += " *";
-                            if (settingsChildRowSelectable(lbl.c_str(), sel))
+                            if (settingsChildRowSelectable(lbl.c_str(), sel)) {
                                 s_selectedRole = i;
+                                s_promptSystemSelected = false;
+                                s_pendingPromptSelection.clear();
+                            }
                             if (sel) ImGui::SetItemDefaultFocus();
                             if (ImGui::IsItemHovered())
                                 ImGui::SetTooltip("%s%s", pr.role.c_str(),
@@ -7340,8 +7868,11 @@ void drawSettingsModal(AppState& st, bool busy) {
                         {
                             std::string syslbl = "system (override)";
                             if (st.spBuf[0] != 0) syslbl += " *";
-                            if (settingsChildRowSelectable(syslbl.c_str(), s_selectedRole >= sysIdx))
+                            if (settingsChildRowSelectable(syslbl.c_str(), s_selectedRole >= sysIdx)) {
                                 s_selectedRole = sysIdx;
+                                s_promptSystemSelected = true;
+                                s_pendingPromptSelection.clear();
+                            }
                             if (s_selectedRole >= sysIdx) ImGui::SetItemDefaultFocus();
                             if (ImGui::IsItemHovered())
                                 ImGui::SetTooltip("Override the agent system prompt (advanced)");
@@ -7350,6 +7881,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                         ImGui::PopStyleColor();  // ChildBg (list only — editor stays transparent)
 
                         ImGui::SameLine();
+                        }
 
                         ImGui::BeginChild("##roleeditor", ImVec2(0, promptsH),
                                           ImGuiChildFlags_Borders);
@@ -7368,7 +7900,6 @@ void drawSettingsModal(AppState& st, bool busy) {
                                 s_spOverrideLastEdit = ImGui::GetTime();
                             }
                             ImGui::PopFont();
-                            flushSystemPromptOverride(st, /*force=*/false);
                             if (ui::kit::secondaryButton("Clear (use built-in)")) {
                                 std::fill(st.spBuf.begin(), st.spBuf.end(), 0);
                                 commitSystemPromptOverride(st);  // empty = built-in, persist now
@@ -7394,19 +7925,18 @@ void drawSettingsModal(AppState& st, bool busy) {
                                 dimText(delta > 0 ? "(differs from built-in: longer)"
                                                   : "(differs from built-in: shorter)");
                             }
+                            dimText("Autosaves as you type.");
                             ImGui::PushFont(st.fonts.mono);
                             float edH = ImGui::GetContentRegionAvail().y - 38.0f * sc;
                             if (edH < 100.0f * sc) edH = 100.0f * sc;
-                            ImGui::InputTextMultiline("##prompted", pr.buf.data(), pr.buf.size(),
-                                                      ImVec2(-1, edH));
+                            if (ImGui::InputTextMultiline("##prompted", pr.buf.data(), pr.buf.size(),
+                                                          ImVec2(-1, edH))) {
+                                pr.dirty = true;
+                                pr.lastEdit = ImGui::GetTime();
+                            }
                             ImGui::PopFont();
                             const char* noFetch = "Prompts are unavailable until the engine is connected.";
-                            if (ui::kit::primaryButton("Save", canFetch, noFetch,
-                                                       ImVec2(80.0f * sc, 28.0f * sc))) {
-                                savePromptOverride(pr);
-                                st.addLog("[ok] prompt saved: " + pr.role);
-                            }
-                            ImGui::SameLine();
+                            // No Save button: the edit above autosaves (flushPromptEdits).
                             if (ui::kit::secondaryButton("Reset to built-in", canFetch, noFetch,
                                                          ImVec2(140.0f * sc, 28.0f * sc))) {
                                 resetPromptOverride(pr, st);
@@ -7414,6 +7944,10 @@ void drawSettingsModal(AppState& st, bool busy) {
                             }
                             if (ImGui::IsItemHovered())
                                 ImGui::SetTooltip("Delete override and restore shipped prompt");
+                            if (!s_promptSaveError.empty()) {
+                                ImGui::SameLine();
+                                ImGui::TextColored(settingsErrInk(), "%s", s_promptSaveError.c_str());
+                            }
                         } else {
                             dimText("Select a role on the left to edit its prompt.");
                         }
@@ -7507,7 +8041,7 @@ void drawSettingsModal(AppState& st, bool busy) {
 
                         settingsGlassSectionBegin("##ai_tools_global", "Global tool limits");
                         dimText("Defaults applied to every tool call. A per-tool Options override "
-                                "(nonzero) always wins. Saved under config.json agent.*.");
+                                "(nonzero) always wins. Autosaved under config.json agent.*.");
                         static int s_globalTimeout = 0;
                         static int s_globalMaxCalls = 0;
                         static int s_globalSupervision = 4;
@@ -7525,9 +8059,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                                 s_globalLast = nowGl;
                                 s_globalLoaded = true;
                                 try {
-                                    std::ifstream in(configPath());
-                                    nlohmann::json j = nlohmann::json::object();
-                                    if (in) { in >> j; }
+                                    const nlohmann::json j = readConfigJson();
                                     auto ag = j.value("agent", nlohmann::json::object());
                                     s_globalTimeout = ag.value("tool_timeout_s_default", 0);
                                     s_globalMaxCalls = ag.value("tool_max_calls_default", 0);
@@ -7593,32 +8125,29 @@ void drawSettingsModal(AppState& st, bool busy) {
                                 s_globalDirty = true;
                         }
                         if (s_globalDirty) {
-                            ImGui::Dummy(ImVec2(0, 4.0f * sc));
-                            if (!s_globalErr.empty())
-                                ImGui::TextColored(settingsErrInk(), "%s", s_globalErr.c_str());
-                            if (ui::kit::primaryButton("Save global limits", true, nullptr,
-                                                       ImVec2(180.0f * sc, 0))) {
-                                if (updateConfigJson([&](nlohmann::json& j) {
-                                        if (!j.contains("agent") || !j["agent"].is_object())
-                                            j["agent"] = nlohmann::json::object();
-                                        j["agent"]["tool_timeout_s_default"] =
-                                            std::max(0, s_globalTimeout);
-                                        j["agent"]["tool_max_calls_default"] =
-                                            std::max(0, s_globalMaxCalls);
-                                        j["agent"]["supervision_interval_calls"] =
-                                            std::max(0, s_globalSupervision);
-                                        j["agent"]["tool_loop_guard_enabled"] = s_loopGuardEnabled;
-                                        j["agent"]["tool_loop_guard_threshold"] =
-                                            std::max(1, s_loopGuardThreshold);
-                                    })) {
-                                    s_globalDirty = false;
-                                    s_globalErr.clear();
-                                    s_globalLast = -1e9;
-                                } else {
-                                    s_globalErr = "Failed to save global tool limits.";
-                                }
+                            // Autosave: commit the edit on the frame it happened (the writer
+                            // coalesces keystrokes). A rejected patch stays dirty and retries.
+                            if (updateConfigJson([&](nlohmann::json& j) {
+                                    if (!j.contains("agent") || !j["agent"].is_object())
+                                        j["agent"] = nlohmann::json::object();
+                                    j["agent"]["tool_timeout_s_default"] =
+                                        std::max(0, s_globalTimeout);
+                                    j["agent"]["tool_max_calls_default"] =
+                                        std::max(0, s_globalMaxCalls);
+                                    j["agent"]["supervision_interval_calls"] =
+                                        std::max(0, s_globalSupervision);
+                                    j["agent"]["tool_loop_guard_enabled"] = s_loopGuardEnabled;
+                                    j["agent"]["tool_loop_guard_threshold"] =
+                                        std::max(1, s_loopGuardThreshold);
+                                })) {
+                                s_globalDirty = false;
+                                s_globalErr.clear();
+                            } else {
+                                s_globalErr = "Failed to save global tool limits.";
                             }
                         }
+                        if (!s_globalErr.empty())
+                            ImGui::TextColored(settingsErrInk(), "%s", s_globalErr.c_str());
                         settingsGlassSectionEnd();
 
                         settingsGlassSectionBegin("##ai_tools_roles", "Default tools by role");
@@ -7853,9 +8382,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                             s_roleToolsLast = nowTf;
                             seedDefaultRoleTools();
                             try {
-                                std::ifstream in(configPath());
-                                nlohmann::json j = nlohmann::json::object();
-                                if (in) { in >> j; }
+                                const nlohmann::json j = readConfigJson();
                                 auto ag = j.value("agent", nlohmann::json::object());
                                 auto rt = ag.value("role_tools", nlohmann::json::object());
                                 if (rt.is_object()) {
@@ -7969,123 +8496,63 @@ void drawSettingsModal(AppState& st, bool busy) {
                             }
                         }
 
-                        // ---- Chudcode built-in capabilities (browser / computer) --------
-                        // These tools execute inside the Chudcode service, not the CAD tool
-                        // registry: there is no second execution backend here and Chudware's
-                        // CEF stays the embedded/vendor browser. The rows render exactly the
-                        // sanitized names/load modes chudcode_tool_state reports for the
-                        // ACTIVE session, and say plainly when that state is unavailable
-                        // instead of implying capability.
+                        settingsSectionHeader("Agent service built-ins");
                         {
-                            static std::vector<ui::ChudcodeToolRow> s_ccTools;
-                            static bool s_ccLoaded = false;
-                            static bool s_ccInFlight = false;
-                            static bool s_ccUnavailable = false;
-                            static std::string s_ccError;
-                            static std::string s_ccFor;
-                            static double s_ccAt = -1e9;
+                            static std::vector<ui::OmpToolRow> tools;
+                            static std::string forSession;
+                            static bool loaded = false, inFlight = false, failed = false;
+                            static double lastPoll = -1e9;
+                            const std::string conv = st.activeConvId();
+                            const auto* link = ui::ompSessionLink(conv);
+                            const bool live = link && link->runtimeLive;
+                            if (forSession != conv) {
+                                forSession = conv;
+                                loaded = false;
+                                failed = false;
+                                lastPoll = -1e9;
+                                tools.clear();
+                            }
+                            const double now = ImGui::GetTime();
+                            if (live && !inFlight && now - lastPoll > (loaded ? 60.0 : 15.0)) {
+                                lastPoll = now;
+                                inFlight = true;
 #ifdef __EMSCRIPTEN__
-                            const std::string ccSess = cellAgentSessionHandle(st.activeConvId());
+                                const std::string session = cellAgentSessionHandle(conv);
 #else
-                            const std::string ccSess = st.activeConvId();
+                                const std::string session = conv;
 #endif
-                            if (ccSess != s_ccFor) {
-                                s_ccFor = ccSess;
-                                s_ccLoaded = false;
-                                s_ccUnavailable = false;
-                                s_ccError.clear();
-                                s_ccAt = -1e9;
-                            }
-                            const double ccNow = ImGui::GetTime();
-                            if (!ccSess.empty() && st.workerStarted && !s_ccInFlight &&
-                                (ccNow - s_ccAt) > (s_ccLoaded ? 60.0 : 15.0)) {
-                                s_ccAt = ccNow;
-                                s_ccInFlight = true;
-                                st.rpc.call("chudcode_tool_state",
-                                            nlohmann::json{{"session_id", ccSess}},
-                                            [ccSess](const core::RpcResult& r) {
-                                    s_ccInFlight = false;
-                                    if (s_ccFor != ccSess) return;
-                                    if (ompRpcAbsent(r)) {
-                                        s_ccUnavailable = true;
-                                        s_ccError = "Agent tool state is not served by "
-                                                    "this runtime.";
-                                        return;
-                                    }
-                                    std::vector<ui::ChudcodeToolRow> rows;
-                                    if (!r.ok ||
-                                        !ui::parseChudcodeToolState(r.result, rows)) {
-                                        // Soft fail: keep the last good rows; only report
-                                        // when we never had any.
-                                        if (!s_ccLoaded) {
-                                            s_ccError = !r.ok
-                                                ? (r.err.empty() ? "tool state call failed"
-                                                                 : r.err)
-                                                : optionalJsonString(r.result, "error");
-                                            if (s_ccError.empty())
-                                                s_ccError = optionalJsonString(r.result,
-                                                                               "reason");
-                                            if (s_ccError.empty())
-                                                s_ccError = "tool state call failed";
+                                st.rpc.call("omp_tool_state", nlohmann::json{{"session_id", session}},
+                                    [conv](const core::RpcResult& r) {
+                                        inFlight = false;
+                                        if (forSession != conv) return;
+                                        std::vector<ui::OmpToolRow> rows;
+                                        failed = !r.ok || !ui::parseOmpToolState(r.result, rows);
+                                        if (!failed) {
+                                            tools = std::move(rows);
+                                            loaded = true;
                                         }
-                                        return;
-                                    }
-                                    s_ccUnavailable = false;
-                                    s_ccError.clear();
-                                    s_ccTools = std::move(rows);
-                                    s_ccLoaded = true;
-                                }, 15000);
+                                    }, 15000);
                             }
-                            settingsSectionHeader("Agent service built-ins");
-                            dimText("Run inside the agent service alongside the CAD "
-                                    "tools \xe2\x80\x94 browser/computer sessions live "
-                                    "there, not in Chudware's embedded CEF.");
-                            if (ccSess.empty()) {
-                                dimText("No active chat session \xe2\x80\x94 built-in "
-                                        "tool state appears once a copilot session "
-                                        "exists.");
-                            } else if (s_ccLoaded) {
-                                for (const auto& t : s_ccTools) {
-                                    ImGui::PushID(t.name.c_str());
-                                    const bool hi = t.name.find("browser") !=
-                                                        std::string::npos ||
-                                                    t.name.find("computer") !=
-                                                        std::string::npos;
-                                    ompStatusDotText(t.name.c_str(),
-                                                     t.available ? ui::palette.statusOk
-                                                                 : ui::palette.textDim,
-                                                     /*filled=*/t.available,
-                                                     hi ? ui::palette.text
-                                                        : ui::palette.textDim);
-                                    if (!t.loadMode.empty()) {
-                                        ImGui::SameLine(0, 8.0f * sc);
-                                        ImGui::PushStyleColor(ImGuiCol_Text,
-                                            ui::Palette::toU32(ui::palette.textDim));
-                                        ImGui::TextUnformatted(t.loadMode.c_str());
-                                        ImGui::PopStyleColor();
-                                    }
-                                    if (!t.available) {
-                                        ImGui::SameLine(0, 8.0f * sc);
-                                        ImGui::PushStyleColor(ImGuiCol_Text,
-                                            ui::Palette::toU32(ui::palette.textDim));
-                                        ImGui::TextUnformatted("unavailable");
-                                        ImGui::PopStyleColor();
-                                    }
-                                    if (!t.description.empty() &&
-                                        ImGui::IsItemHovered())
-                                        ImGui::SetTooltip("%s", t.description.c_str());
-                                    ImGui::PopID();
+                            if (!live) dimText("No live agent session.");
+                            else if (failed) dimText("Built-in tool state could not be refreshed.");
+                            else if (!loaded) dimText("Reading built-in tool state...");
+                            else if (tools.empty()) dimText("The runtime reported no tools.");
+                            else for (const auto& tool : tools) {
+                                ImGui::PushID(tool.name.c_str());
+                                ompStatusDotText(tool.name.c_str(),
+                                    tool.availabilityKnown && tool.available ? ui::palette.statusOk
+                                                                            : ui::palette.textDim,
+                                    tool.availabilityKnown && tool.available);
+                                if (!tool.availabilityKnown) {
+                                    ImGui::SameLine();
+                                    dimText("availability unknown");
+                                } else if (!tool.available) {
+                                    ImGui::SameLine();
+                                    dimText("unavailable");
                                 }
-                                if (s_ccTools.empty())
-                                    dimText("The service reported no built-in tools for "
-                                            "this session.");
-                            } else if (!s_ccError.empty() || s_ccUnavailable) {
-                                ImGui::PushStyleColor(ImGuiCol_Text,
-                                    ui::Palette::toU32(ui::palette.statusWarn));
-                                ImGui::TextWrapped("%s", s_ccError.c_str());
-                                ImGui::PopStyleColor();
-                            } else {
-                                dimText("Reading built-in tool state\xe2\x80\xa6");
+                                if (!tool.description.empty() && ImGui::IsItemHovered())
+                                    ImGui::SetTooltip("%s", tool.description.c_str());
+                                ImGui::PopID();
                             }
                         }
 
@@ -8416,6 +8883,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                                             p["trim"] = (s_toolSchemaTrim[tn] != 0);
                                         const std::string localPreview = makeLocalPreview();
                                         s_previewFetching = true;
+                                        flushConfigWrites();
                                         st.rpc.call("ai_tool_preview", std::move(p),
                                                     [localPreview](const core::RpcResult& r) {
                                             s_previewFetching = false;
@@ -8485,14 +8953,18 @@ void drawSettingsModal(AppState& st, bool busy) {
                             ImGui::TreePop();
                         }
 
+                        // Autosave. Every edit above flags its half (role families / per-tool
+                        // options) dirty; the commit happens on that same frame so a sub-tab
+                        // switch or close cannot strand it. Each half writes only its own keys:
+                        // a tool-option edit must not also materialise role_tools /
+                        // tool_families from the in-memory defaults.
                         if (s_roleToolsDirty || s_toolOptDirty) {
-                            ImGui::Dummy(ImVec2(0, 6.0f * sc));
-                            if (!s_toolOptErr.empty()) {
-                                ImGui::TextColored(settingsErrInk(), "%s", s_toolOptErr.c_str());
-                            }
-                            if (ui::kit::primaryButton("Save role tools & options", true, nullptr,
-                                                       ImVec2(240.0f * sc, 0))) {
-                                nlohmann::json rt = nlohmann::json::object();
+                            bool saveRoles = s_roleToolsDirty;
+                            bool saveOpts = s_toolOptDirty;
+                            nlohmann::json rt = nlohmann::json::object();
+                            nlohmann::json tf = nlohmann::json::object();
+                            nlohmann::json to = nlohmann::json::object();
+                            if (saveRoles) {
                                 for (const auto& kv : s_roleTools) {
                                     nlohmann::json arr = nlohmann::json::array();
                                     for (const auto& fam : kv.second) arr.push_back(fam);
@@ -8501,14 +8973,14 @@ void drawSettingsModal(AppState& st, bool busy) {
 
                                 // Derive tool_families as the union of all role assignments
                                 // so legacy kill-switches / MCP external clients stay coherent.
-                                nlohmann::json tf = nlohmann::json::object();
                                 std::set<std::string> unionFams;
                                 for (const auto& kv : s_roleTools)
                                     for (const auto& fam : kv.second) unionFams.insert(fam);
                                 for (int i = 0; i < kToolFamilyCount; ++i)
                                     tf[kToolFamilies[i]] = unionFams.count(kToolFamilies[i]) > 0;
-
-                                nlohmann::json to = nlohmann::json::object();
+                            }
+                            s_toolOptErr.clear();
+                            if (saveOpts) {
                                 std::set<std::string> names;
                                 for (const auto& kv : s_toolEnabled) names.insert(kv.first);
                                 for (const auto& kv : s_toolTimeout) names.insert(kv.first);
@@ -8517,7 +8989,6 @@ void drawSettingsModal(AppState& st, bool busy) {
                                 for (const auto& kv : s_toolNote) names.insert(kv.first);
                                 for (const auto& kv : s_toolDescOverride) names.insert(kv.first);
                                 for (const auto& kv : s_toolSchemaTrim) names.insert(kv.first);
-                                s_toolOptErr.clear();
                                 for (const auto& tn : names) {
                                     nlohmann::json e = nlohmann::json::object();
                                     bool en = s_toolEnabled.count(tn) ? s_toolEnabled[tn] : true;
@@ -8532,7 +9003,8 @@ void drawSettingsModal(AppState& st, bool busy) {
                                             if (parsed.is_object() && !parsed.empty())
                                                 e["param_defaults"] = parsed;
                                         } catch (...) {
-                                            s_toolOptErr = "Invalid JSON in param_defaults for " + tn;
+                                            s_toolOptErr = "Invalid JSON in param_defaults for " + tn +
+                                                           " \xe2\x80\x94 tool options are not saved until it is fixed.";
                                             break;
                                         }
                                     }
@@ -8546,35 +9018,50 @@ void drawSettingsModal(AppState& st, bool busy) {
                                         e["schema_trim"] = (s_toolSchemaTrim[tn] != 0);
                                     if (!e.empty()) to[tn] = e;
                                 }
-                                if (s_toolOptErr.empty()) {
-                                    updateConfigJson([&](nlohmann::json& j) {
-                                        if (!j.contains("agent") || !j["agent"].is_object())
-                                            j["agent"] = nlohmann::json::object();
+                                // Half-typed JSON must not wipe the stored options: they wait
+                                // (still dirty) until it parses; the role half saves regardless.
+                                if (!s_toolOptErr.empty()) saveOpts = false;
+                            }
+                            if (saveRoles || saveOpts) {
+                                const bool ok = updateConfigJson([&](nlohmann::json& j) {
+                                    if (!j.contains("agent") || !j["agent"].is_object())
+                                        j["agent"] = nlohmann::json::object();
+                                    if (saveRoles) {
                                         j["agent"]["role_tools"] = rt;
-                                        j["agent"]["tool_families"] = tf;
-                                        j["agent"]["tool_options"] = to;
-                                    });
-                                    s_roleToolsDirty = false;
-                                    s_toolOptDirty = false;
-                                    s_roleToolsLast = -1e9;
+                                        // Merge, never replace: tool_families also carries keys
+                                        // this page has no control for (e.g. manufacture, org).
+                                        auto& fams = j["agent"]["tool_families"];
+                                        if (!fams.is_object()) fams = nlohmann::json::object();
+                                        for (auto it = tf.begin(); it != tf.end(); ++it)
+                                            fams[it.key()] = it.value();
+                                    }
+                                    if (saveOpts) j["agent"]["tool_options"] = to;
+                                });
+                                if (ok) {
+                                    if (saveRoles) s_roleToolsDirty = false;
+                                    if (saveOpts) s_toolOptDirty = false;
+                                } else {
+                                    s_toolOptErr = "Failed to save tool settings; retrying.";
                                 }
                             }
-                            ImGui::SameLine();
-                            if (ui::kit::secondaryButton("Reset role defaults", true, nullptr, ImVec2(160.0f * sc, 0))) {
-                                seedDefaultRoleTools();
-                                s_roleToolsDirty = true;
-                            }
-                            ImGui::SameLine();
-                            if (ui::kit::secondaryButton("Reset tool options", true, nullptr, ImVec2(150.0f * sc, 0))) {
-                                s_toolEnabled.clear();
-                                s_toolTimeout.clear();
-                                s_toolMaxCalls.clear();
-                                s_toolDefaults.clear();
-                                s_toolNote.clear();
-                                s_toolDescOverride.clear();
-                                s_toolSchemaTrim.clear();
-                                s_toolOptDirty = true;
-                            }
+                        }
+                        ImGui::Dummy(ImVec2(0, 6.0f * sc));
+                        if (!s_toolOptErr.empty())
+                            ImGui::TextColored(settingsErrInk(), "%s", s_toolOptErr.c_str());
+                        if (ui::kit::secondaryButton("Reset role defaults", true, nullptr, ImVec2(160.0f * sc, 0))) {
+                            seedDefaultRoleTools();
+                            s_roleToolsDirty = true;  // autosaved next frame
+                        }
+                        ImGui::SameLine();
+                        if (ui::kit::secondaryButton("Reset tool options", true, nullptr, ImVec2(150.0f * sc, 0))) {
+                            s_toolEnabled.clear();
+                            s_toolTimeout.clear();
+                            s_toolMaxCalls.clear();
+                            s_toolDefaults.clear();
+                            s_toolNote.clear();
+                            s_toolDescOverride.clear();
+                            s_toolSchemaTrim.clear();
+                            s_toolOptDirty = true;  // autosaved next frame
                         }
                         settingsGlassSectionEnd();
 
@@ -8633,6 +9120,7 @@ void drawSettingsModal(AppState& st, bool busy) {
                                 return;
                             }
                             const bool includeTools = s_includeTools;
+                            flushConfigWrites();
                             st.rpc.call("ai_prompt_preview",
                                         nlohmann::json{{"include_tools", includeTools}},
                                         [includeTools](const core::RpcResult& r) {
@@ -8778,48 +9266,10 @@ void drawSettingsModal(AppState& st, bool busy) {
             if (s_settingsPage == 3) {
                 providerTabDrawn = true;
                 settingsTabBodyBegin("##tab_providers");
-                dimText("API providers, sign-in, and model routing. Credentials are stored by "
-                        "the auth bridge \xe2\x80\x94 never written to config.json.");
-                // Generation knobs (reasoning effort / max response tokens / model context
-                // window) sit ABOVE the provider manager on purpose: drawOmpProviderManager's
-                // two-pane child is sized -footerH, i.e. it eats the whole remaining tab
-                // height, so anything emitted after it starts below the fold. This card is the
-                // ONLY Settings-modal home for these three controls, and the command-search
-                // "Reasoning effort" entry lands on this tab, so it must be visible on open.
-                settingsGlassSectionBegin("##prov_generation", "Generation");
-                if (ui::drawAiSettingsSection(st, busy, ui::AiSettingsSection::Generation))
-                    saveSettings(st.settings);
-                settingsGlassSectionEnd();
+                dimText("Provider sign-in and model availability. New credentials are stored "
+                        "by the runtime; availability does not verify provider access.");
+                // Online model limits and thinking are derived from OMP capabilities.
                 drawOmpProviderManager(st);
-                settingsGlassSectionBegin("##prov_freeai", "Free AI (FreeLLMAPI)");
-                if (ui::drawFreeAiProviderCard(st)) saveSettings(st.settings);
-                settingsGlassSectionEnd();
-                if (!s_omp.available) {
-                    // Degrade path: the chudcode_* worker methods are absent in the current
-                    // runtime — keep the legacy sections while the manager periodically
-                    // re-probes for a reopened or reconnected bridge.
-                    settingsGlassSectionBegin("##prov_provider", "Provider \x26 Model");
-                    if (ui::drawAiSettingsSection(st, busy,
-                                                  ui::AiSettingsSection::ProviderModel))
-                        saveSettings(st.settings);
-                    settingsGlassSectionEnd();
-
-                    settingsGlassSectionBegin("##prov_moonshot", "Moonshot (Kimi)");
-                    ImGui::PushStyleColor(ImGuiCol_Text,
-                                          ui::Palette::toU32(ui::palette.statusWarn));
-                    ImGui::TextWrapped("The validated provider service is temporarily unavailable. "
-                                       "Reconnect the engine before adding a Moonshot key; "
-                                       "Chudware will not save an unvalidated credential.");
-                    ImGui::PopStyleColor();
-                    if (ImGui::SmallButton("Where do I get a Moonshot key?"))
-                        ui::openExternalHttpUrl(
-                            "https://platform.moonshot.ai/console/api-keys");
-                    settingsGlassSectionEnd();
-
-                    settingsGlassSectionBegin("##prov_accounts", "Accounts");
-                    drawSubscriptionAccounts(st, sc);
-                    settingsGlassSectionEnd();
-                }
 
                 settingsTabBodyEnd();
             }
@@ -8836,7 +9286,14 @@ void drawSettingsModal(AppState& st, bool busy) {
 
     // Modal closed (X) with the system-prompt debounce still pending: force-commit it.
     if (!s_settingsOpen) {
-        flushSystemPromptOverride(st, /*force=*/true);
+        if (s_settingsEnabledKeyboardNav) {
+            ImGui::GetIO().ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
+            s_settingsEnabledKeyboardNav = false;
+        }
+        flushPromptEditors(st, /*force=*/true);
+        flushSkillRuleEdits(st, /*force=*/true);
+        if (s_wsDirty) commitWorkspaceDir();
+        if (s_boxDirty) commitBoxSettings(/*refreshStatus=*/false);
         if (s_omp.modalOpen) closeOmpProviderModal(st);
     }
 
@@ -8869,8 +9326,7 @@ void drawSettingsModal(AppState& st, bool busy) {
             const auto update = chudware::update::globalUpdater().snapshot();
             if (update.state == chudware::update::State::Available ||
                 update.state == chudware::update::State::ManualDownload ||
-                update.state == chudware::update::State::Staged ||
-                update.state == chudware::update::State::Mandatory) {
+                update.state == chudware::update::State::Staged) {
                 const std::string updateLine =
                     update.state == chudware::update::State::Staged
                         ? "Update " + update.version + " is verified; restart to install"

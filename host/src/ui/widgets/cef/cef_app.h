@@ -29,7 +29,8 @@ int execute_subprocess(int argc, char** argv);
 // reports false so the sign-in wizard falls back to desktop login. Safe to call
 // once; also the lazy-init entry — first CefWebView::open() calls this
 // if main() did not (default). Force early init with CHUDWARE_CEF_EARLY=1.
-bool initialize();
+// persistent_global is for the daemon's private cache root, not the GUI.
+bool initialize(bool persistent_global = false);
 
 // True after a successful initialize(). CefWebView::processReady() forwards this.
 // Note: after lazy-init, processReady() is false until the first web surface opens.
@@ -40,17 +41,19 @@ bool initialized();
 // fall back to desktop/native login instead of crashing on re-init.
 bool init_failed();
 
-// Call once per GLFW frame. While any browser is alive (see note_browser_*),
-// pumps CefDoMessageLoopWork() EVERY frame — the external-pump deadline model
-// under-pumps OSR during creation/load and leaves the panel stuck on "Loading"
-// (the --cef-shot path works precisely because it pumps continuously). When no
-// browser is open it falls back to pumping only on CEF's scheduled deadline so
-// the idle app doesn't busy-spin. No-op until initialize(). Returns true if it
-// pumped this call.
+// Call once per GLFW frame. Pumps only when CEF's deadline has arrived, except
+// while CreateBrowser is in flight (continuous pumping avoids stuck "Loading").
+// No-op until initialize(). Returns true if it pumped this call.
 bool pump_if_due();
 
-// Live off-screen browser refcount, bumped from CefWebView's OnAfterCreated /
-// OnBeforeClose. Drives pump_if_due's every-frame vs on-deadline choice.
+// Bound the GUI loop's idle wait: -1 means no work pending, 0 means pump now,
+// otherwise the number of milliseconds until the next scheduled pump.
+int msUntilDue();
+
+// GUI installs anim::wakeLoop; standalone CEF helper leaves this unset.
+void setWakeCallback(void (*wake)());
+
+// Live off-screen browser bookkeeping, bumped by OnAfterCreated / OnBeforeClose.
 void note_browser_opened();
 void note_browser_closed();
 

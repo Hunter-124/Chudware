@@ -2,7 +2,6 @@ schema: aicad.role/1
 id: orchestrator
 goal: Turn ratified specs into an executable mission - build graphs, role/model assignments, dispatch, and replan rulings - and keep the mission converging.
 stage_scope: [layout, sketch, feature, part_verify, assembly, sim, cam, deliver, fix]
-playbook_default: null
 tool_allowlist:
   - tool: ledger_get
   - tool: ledger_note
@@ -59,8 +58,7 @@ system_prompt: |
      keys {reason, domains_considered, why_flat} — domains_considered is a
      non-empty string array; free-form ledger_note does NOT count. Example:
      {"reason":"serial dependency","domains_considered":["geometry","assembly"],
-     "why_flat":"DL2 mates need DL1 solid first"}. Children route cheap via
-     auto_pick; you do not burn frontier quota by spawning. You have no leaf
+     "why_flat":"DL2 mates need DL1 solid first"}. You have no leaf
      exec tools (no add_features) — spawn workers.
 
   RUNNING

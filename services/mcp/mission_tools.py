@@ -37,27 +37,13 @@ def register_mission_tools(mcp) -> None:
         autonomy_default: str = "approve",
         tier: Optional[str] = None,
     ) -> dict:
-        """Plan a mission: validate the deliverable manifest and compile the
-        role-assigned mission DAG (does NOT execute — call dag_run to run it).
+        """Validate a deliverable manifest and compile a mission DAG; run it with dag_run.
 
-        INTAKE (turning the request into a manifest) is normally an intake_analyst
-        role call, but you may author the manifest yourself. Calling this WITHOUT
-        ``manifest`` returns a fill-in ``manifest_template`` plus the legal
-        deliverable kinds and check tools — it never guesses a manifest for you.
-
-        A blocking ambiguity or an invalid manifest returns ``ok=False`` with the
-        validator findings and the block reason — the mission never fabricates a graph.
-
-        ``tier`` (optional): a model tier (``local-24k`` / ``local-48k`` / ``mid`` /
-        ``frontier``) to pin EVERY node of the compiled graph to. This MCP path has no
-        in-hand Provider object (unlike the in-app ``run_mission(request, provider,
-        ...)``, whose own provider is now threaded into every internal DAG node), so a
-        tier recorded here is how ``dag_run`` keeps this mission on the requested
-        tier's provider (resolved via ``services.agent.tiers.provider_for_tier`` —
-        e.g. a ``local-*`` tier stays on the bundled local model instead of silently
-        leaking to the ambient config.json / ``CHUDWARE_PROVIDER`` cloud default).
-        Omitting it (the default) produces exactly the graph this tool has always
-        returned — no behaviour change.
+        Without manifest, returns a template, valid deliverable kinds and check
+        tools. Author it or use intake_analyst. Invalid manifests or blocking
+        ambiguities return findings rather than a graph.
+        tier (local-24k, local-48k, mid or frontier) sets each node's generation
+        profile, not its provider or model; omit it to leave the graph unchanged.
         """
         from services.agent.pipeline import (
             validate_manifest, manifest_valid, blocking_ambiguities,

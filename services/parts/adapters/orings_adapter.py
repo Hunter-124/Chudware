@@ -13,8 +13,9 @@ Parker's "Series 2-XXX" O-ring size table — e.g. Parker/AS568 "2-014" ==
 AS568 dash "-014", ID .489" / CS .070"). These are public engineering facts
 (dimensions of a standard part), not copyrighted table text.
 
-No rewrite of any existing surface — this is a new, self-contained local
-catalog, following the same generation pattern as bolts_adapter.py.
+Every material variant references the same editable native O-ring geometry.
+The CAD model uses the exact nominal inch-table dimensions, converted to mm;
+tolerances, elastomer properties and deformation are not represented.
 """
 from __future__ import annotations
 
@@ -153,20 +154,18 @@ def _make_record(dash: int, id_in: float, cs_in: float, material: tuple) -> dict
     code, label, synonyms, durometer, temp_range = material
     dash_str = f"{dash:03d}"
     od_in = round(id_in + 2 * cs_in, 4)
-    title = (
-        f"AS568-{dash_str} O-Ring {id_in:.3f}\" ID x {cs_in:.3f}\" CS {label} "
-        f"o-ring oring seal 2-{dash_str} -{dash_str} AS568-{dash_str} AS-568 "
-        f"AS568B dash {dash_str} {synonyms}"
-    )
+    title = f'AS568-{dash_str} O-Ring {id_in:.3f}" ID x {cs_in:.3f}" CS, {label}'
     params = {
         "standard": "AS568B",
         "dash_number": dash_str,
         "id_in": id_in,
         "cs_in": cs_in,
         "od_in": od_in,
-        "id_mm": round(id_in * 25.4, 2),
-        "cs_mm": round(cs_in * 25.4, 2),
-        "od_mm": round(od_in * 25.4, 2),
+        # Convert the nominal inch table directly; do not quantize CAD dimensions
+        # to the two-decimal millimetre display precision.
+        "id_mm": id_in * 25.4,
+        "cs_mm": cs_in * 25.4,
+        "od_mm": od_in * 25.4,
         "material": code,
         "material_label": label,
         "durometer": durometer,
@@ -176,10 +175,16 @@ def _make_record(dash: int, id_in: float, cs_in: float, material: tuple) -> dict
         "part_id": f"seal:AS568-{dash_str}:{code}",
         "domain": _DOMAIN,
         "title": title,
+        "family": "AS568 O-Ring",
+        "aliases": [
+            f"o-ring oring seal 2-{dash_str} -{dash_str} AS568-{dash_str} AS-568 AS568B dash {dash_str}",
+            synonyms,
+        ],
         "standard": "AS568B",
         "designation": f"-{dash_str}",
         "params": params,
-        "geometry_ref": None,
+        "geometry_ref": {"kind": "core_family", "family": "oring_as568",
+                         "size": f"AS568-{dash_str}"},
         "sourcing": [],
         "provenance": (
             "SAE AS568B standard O-ring dash-number dimensional table (ID/CS "
@@ -208,7 +213,8 @@ class OringsAdapter:
         recs = list(self.iter_records())
         if not norm:
             return recs
-        return [r for r in recs if norm in r["title"].lower()]
+        return [r for r in recs
+                if norm in " ".join([r["title"], *r["aliases"]]).lower()]
 
     def get(self, part_id: str) -> dict | None:
         if not part_id or not part_id.startswith("seal:AS568-"):

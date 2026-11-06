@@ -6,7 +6,9 @@ from collections.abc import Mapping
 import hashlib
 import json
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote
+
+from ..print_safety import validate_print_filename
 
 from .base import PrinterAdapter, _MISSING, nested, number_or_missing, percent_fraction, string_or_missing
 from .http_client import HttpClient, HttpResponse
@@ -184,8 +186,10 @@ class PrusaLinkAdapter(PrinterAdapter):
         self._require_authorization(authorization_token)
         self._require_operation("start")
         path = remote_artifact.get("remote_path")
-        if not isinstance(path, str) or not path.startswith("/api/v1/files/"):
+        if (not isinstance(path, str) or not path.startswith("/api/v1/files/")
+                or any(char in path for char in ("?", "#", "\\"))):
             raise ProtocolError("PrusaLink start requires a staged remote_path")
+        validate_print_filename(unquote(path).rsplit("/", 1)[-1])
         response = self.http.request("POST", path, body=b"", expected=(200, 204))
         return self._command_result("start", {"status": response.status})
 

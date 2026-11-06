@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # packaging/linux/build_appimage.sh — assemble a self-contained AppImage for the Chudware
 # host GUI (binary named chudware).
-# Protected Python services and the compiled Chudcode RPC binary are adjacent sidecars.
+# Protected Python services and the compiled OMP RPC binary are adjacent sidecars.
 # The AppImage contains no repository-source runtime or provisioning wheelhouse.
 # Requires production builds and generated protected assets:
 #   python3 packaging/embed_protected_assets.py --source-root . \
@@ -20,7 +20,7 @@
 #   --hostd-bin FILE    explicit production host daemon (required for prepare)
 #   --libchudware-bin FILE  explicit production engine library (required unless demo mode)
 #   --protected-assets-dir DIR  generated protected tables (required for prepare)
-#   --chud-bin FILE     verified pinned Chudcode release binary (or CHUDWARE_CHUD_BIN)
+#   --omp-bin FILE     verified pinned OMP release binary (or CHUDWARE_OMP_BIN)
 #   --prepare-signing   stage immutable AppDir, write canonical manifest/preimage, then exit
 #   --key-id ID         release key id recorded in the prepared manifest
 #   --finalize-signing SIG  verify/embed detached signature and archive the retained AppDir
@@ -53,7 +53,7 @@ PROTECTED_ASSETS_OUT=""
 BIN=""
 HOSTD=""
 LIBCHUDWARE=""
-CHUD_BIN="${CHUDWARE_CHUD_BIN:-}"
+OMP_BIN="${CHUDWARE_OMP_BIN:-}"
 APPIMAGETOOL_VERSION="1.9.1"
 APPIMAGETOOL_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
 
@@ -63,7 +63,7 @@ while [ $# -gt 0 ]; do
         --host-bin) BIN="$2"; shift 2 ;;
         --hostd-bin) HOSTD="$2"; shift 2 ;;
         --libchudware-bin) LIBCHUDWARE="$2"; shift 2 ;;
-        --chud-bin) CHUD_BIN="$2"; shift 2 ;;
+        --omp-bin) OMP_BIN="$2"; shift 2 ;;
         --protected-assets-dir) PROTECTED_ASSETS_OUT="$2"; shift 2 ;;
         --with-libchudware) WITH_LIBCHUDWARE=1; shift ;;   # legacy no-op (now the default)
         --no-libchudware) WITH_LIBCHUDWARE=0; shift ;;
@@ -79,7 +79,7 @@ done
 [ -n "$MODE" ] || { echo "error: --prepare-signing or --finalize-signing is required" >&2; exit 2; }
 if [ "$MODE" = prepare ]; then
     [ -n "$KEY_ID" ] || { echo "error: --key-id is required with --prepare-signing" >&2; exit 2; }
-    [ -n "$CHUD_BIN" ] || { echo "error: --chud-bin or CHUDWARE_CHUD_BIN is required" >&2; exit 2; }
+    [ -n "$OMP_BIN" ] || { echo "error: --omp-bin or CHUDWARE_OMP_BIN is required" >&2; exit 2; }
 else
     [ -f "$FINALIZE_SIGNATURE" ] && [ -s "$FINALIZE_SIGNATURE" ] || {
         echo "error: --finalize-signing must name a detached signature" >&2; exit 2;
@@ -114,18 +114,18 @@ require_production_cache() {
     }
 }
 
-stage_chudcode() {
+stage_omp() {
     local destination="$1"
-    [ -n "$CHUD_BIN" ] || {
-        echo "error: --chud-bin or CHUDWARE_CHUD_BIN is required" >&2
+    [ -n "$OMP_BIN" ] || {
+        echo "error: --omp-bin or CHUDWARE_OMP_BIN is required" >&2
         exit 1
     }
-    release_python "$REPO/scripts/pin_chudcode.py" stage \
-        --target linux-x86_64 --input "$CHUD_BIN" --output "$destination"
-    release_python "$REPO/scripts/pin_chudcode.py" stage-notices \
+    release_python "$REPO/scripts/pin_omp.py" stage \
+        --target linux-x86_64 --input "$OMP_BIN" --output "$destination"
+    release_python "$REPO/scripts/pin_omp.py" stage-notices \
         --output-dir "$(dirname "$destination")"
-    cp "$REPO/vendor/chudcode/CHUDCODE_ARTIFACT.lock" \
-        "$(dirname "$destination")/CHUDCODE_ARTIFACT.lock"
+    cp "$REPO/vendor/omp/OMP_ARTIFACT.lock" \
+        "$(dirname "$destination")/OMP_ARTIFACT.lock"
 }
 
 generate_protected_assets() {
@@ -134,10 +134,6 @@ generate_protected_assets() {
         --source-root "$REPO" --output-dir "$PROTECTED_ASSETS_OUT"
     [ -f "$PROTECTED_ASSETS_OUT/python/chudware_protected_assets.py" ] || {
         echo "error: protected Python asset table was not generated" >&2
-        exit 1
-    }
-    [ -f "$PROTECTED_ASSETS_OUT/include/chudware/protected_assets.generated.h" ] || {
-        echo "error: protected C++ asset table was not generated" >&2
         exit 1
     }
 }
@@ -254,7 +250,7 @@ build_python_sidecar() {
     # for background simulation jobs (services/sim/jobs.py), and the topology tool/study
     # modules back those jobs; forcing them fails the build if any is missing.
     local -a includes=("--include-module=chudware_protected_assets" "--include-module=services.$module"
-                       "--include-package=chudcode_rpc"
+                       "--include-package=omp_rpc"
                        "--include-package=pycolmap"
                        "--include-module=services.sim.job_worker"
                        "--include-module=services.sim.topology"
@@ -288,7 +284,7 @@ build_python_sidecar() {
 audit_production_payload() {
     local root="$1" bad
     bad="$(find "$root" \( -type l -o -type f \( \
-        -name '*.py' -o -name '*.pyc' -o -name '*.pyo' -o -name '*.ts' -o -name '*.tsx' \
+        -name '*.py' -o -name '*.pyc' -o -name '*.pyo' -o \( -name '*.ts' ! -path "$root/usr/bin/omp_extension.ts" \) -o -name '*.tsx' \
         -o -name '*.js' -o -name '*.jsx' -o -name '*.map' -o -name '*.pdb' \
         -o -name 'test_*' -o -name '*_test.*' \) -o -type d \( \
         -name '__pycache__' -o -name 'node_modules' -o -name '.git' -o -name '.github' \
@@ -454,9 +450,16 @@ if [ "$WITH_LIBCHUDWARE" = "1" ]; then
         echo "error: --libchudware-bin is required unless --no-libchudware is used" >&2
         exit 1
     }
+    LIBDIR="$(dirname "$LIBCHUDWARE")"
+    SHAPE_WORKER="$LIBDIR/chudware-shape-build-worker"
+    [ -f "$SHAPE_WORKER" ] && [ -x "$SHAPE_WORKER" ] || {
+        echo "error: selected engine requires executable shape build worker: $SHAPE_WORKER" >&2
+        exit 1
+    }
+    cp "$SHAPE_WORKER" "$APPDIR/usr/lib/chudware-shape-build-worker"
+    chmod +x "$APPDIR/usr/lib/chudware-shape-build-worker"
     cp "$LIBCHUDWARE" "$APPDIR/usr/lib/libchudware.so"
         # Optional lib3mf runtime lives beside the engine and must ride along when present.
-        LIBDIR="$(dirname "$LIBCHUDWARE")"
         if [ -f "$LIBDIR/lib3mf.so" ]; then
             cp "$LIBDIR/lib3mf.so" "$APPDIR/usr/lib/lib3mf.so"
         fi
@@ -473,8 +476,8 @@ if [ "$WITH_LIBCHUDWARE" = "1" ]; then
         # cannot open a document on a machine without OCCT 7.9 installed (verified: the
         # libTK* deps resolve to /lib64 on the build host but are "not found" in a clean
         # fedora:rawhide container). ldd emits the FULL flattened transitive closure, so
-        # seeding with libchudware.so, its optional siblings, and chudware-hostd captures
-        # OCCT and everything OCCT itself pulls. We copy
+        # seeding with libchudware.so, the shape worker, optional siblings, and chudware-hostd
+        # captures OCCT and everything OCCT itself pulls. We copy
         # every resolved dep whose basename is NOT on the AppImage excludelist — glibc,
         # libstdc++/libgcc_s, the GL/X11 graphics-driver stack, and freetype/fontconfig/
         # harfbuzz stay host-provided (they interoperate with the host's fonts/drivers).
@@ -524,7 +527,7 @@ if [ "$WITH_LIBCHUDWARE" = "1" ]; then
             for e in "${LOCAL_EXCL[@]}"; do case "$base" in "$e"*) return 0 ;; esac; done
             return 1
         }
-        SEEDS=("$LIBCHUDWARE")
+        SEEDS=("$LIBCHUDWARE" "$SHAPE_WORKER")
         for s in "$APPDIR/usr/lib/libnglib.so" "$APPDIR/usr/lib/libngcore.so" \
                  "$APPDIR/usr/lib/lib3mf.so" "$APPDIR/usr/bin/chudware-hostd"; do
             [ -e "$s" ] && SEEDS+=("$s")
@@ -577,7 +580,7 @@ except BaseException as e:
         fi
 fi
 
-# Protected Python services and Chudcode are compiled sidecars. Packaged builds never
+# Protected Python services and OMP are compiled sidecars. Packaged builds never
 # provision from repository source and never fall back to source entrypoints.
 [ -f "$REPO/services/compiled_entry.py" ] || {
     echo "error: services/compiled_entry.py is required for release sidecars" >&2
@@ -586,7 +589,9 @@ fi
 generate_protected_assets
 build_python_sidecar worker_main "$APPDIR/usr/bin/chudware-worker"
 build_python_sidecar mcp.server "$APPDIR/usr/bin/chudware-mcp"
-stage_chudcode "$APPDIR/usr/bin/chud"
+stage_omp "$APPDIR/usr/bin/omp"
+cp "$REPO/services/agent/omp_extension.ts" "$APPDIR/usr/bin/omp_extension.ts"
+cp "$REPO/services/agent/prompts/omp_cad_system.md" "$APPDIR/usr/bin/omp_cad_system.md"
 
 
 cp "$REPO/LICENSE" "$APPDIR/LICENSE"
@@ -596,8 +601,8 @@ Chudware AppImage
 =================
 
 Chudware is free software released under the MIT License (see LICENSE); bundled
-third-party components are listed in THIRD_PARTY_NOTICES.md and, for the Chudcode
-agent runtime, usr/bin/CHUDCODE-NOTICE. Release payload ownership and integrity are
+third-party components are listed in THIRD_PARTY_NOTICES.md and, for the OMP
+agent runtime, usr/bin/OMP-LICENSE. Release payload ownership and integrity are
 recorded by the top-level payload-manifest.v1.json and payload-manifest.v1.sig files.
 
 Source code: https://github.com/Hunter-124/Chudware
@@ -622,8 +627,8 @@ fi
 if [ -x "$HERE/usr/bin/chudware-hostd" ] && [ -z "${CHUDWARE_HOSTD_BIN:-}" ]; then
     export CHUDWARE_HOSTD_BIN="$HERE/usr/bin/chudware-hostd"
 fi
-if [ -x "$HERE/usr/bin/chud" ] && [ -z "${CHUDWARE_CHUDCODE_BIN:-}" ]; then
-    export CHUDWARE_CHUDCODE_BIN="$HERE/usr/bin/chud"
+if [ -x "$HERE/usr/bin/omp" ] && [ -z "${CHUDWARE_OMP_BIN:-}" ]; then
+    export CHUDWARE_OMP_BIN="$HERE/usr/bin/omp"
 fi
 if [ -z "${CHUDWARE_INSTANCE_KEY:-}" ]; then
     export CHUDWARE_INSTANCE_KEY="$(printf %s "${APPIMAGE:-$HERE}" | sha256sum | cut -c1-12)"

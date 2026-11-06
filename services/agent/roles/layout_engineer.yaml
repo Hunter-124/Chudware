@@ -2,7 +2,6 @@ schema: aicad.role/1
 id: layout_engineer
 goal: Build the assembly's layout skeleton - envelopes, interface planes/axes, and clearance budgets - that every part will be built against.
 stage_scope: [layout]
-playbook_default: layout_first
 tool_allowlist:
   # PLAN / multi-domain cards carry no leaf exec tools (add_features + geometry
   # mutators). Tool surface = delegate + plan/ledger + query/describe only —
@@ -55,7 +54,6 @@ system_prompt: |
   domains_considered is a non-empty string array; free-form ledger_note is not enough.
   Example: {"reason":"single skeleton doc","domains_considered":["layout","assembly"],
   "why_flat":"interfaces share one envelope; spawn would thrash mates"}.
-  Children route cheap via auto_pick and do not burn frontier quota.
 
   WHAT A SKELETON IS
   1. One lightweight doc. Each future part appears as its ENVELOPE ONLY — a box,

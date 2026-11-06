@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import base64
+import io
 import json
+import zipfile
 
 import pytest
 
@@ -42,6 +45,119 @@ def test_upload_into_subdirectory_and_download(client, workspace):
     assert "b.step" in download.headers["content-disposition"]
     listing = client.get("/workspace/list", params={"dir": "parts"}).json()
     assert listing["dirs"] == [{"name": "brackets", "path": "parts/brackets"}]
+
+
+def _scad_source(dependencies, code='cube(1);'):
+    params = {"source": code, "files": [
+        {"path": name, "data_b64": base64.b64encode(data).decode("ascii")}
+        for name, data in dependencies.items()
+    ]}
+    encoded = base64.b64encode(json.dumps({"params": params, "env": {}}).encode("utf-8"))
+    return b"// CHUDWARE_SCAD_PROJECT_V1 " + encoded + b"\n" + code.encode("utf-8")
+
+
+def test_scad_export_download_preserves_nested_and_reused_dependencies(client, workspace, tmp_path):
+    root = workspace / "exports with spaces"
+    (root / "lib" / "子").mkdir(parents=True)
+    files = {"lib/子/shape.scad": b'module shape(){surface(file="image space.dat");}',
+             "lib/子/image space.dat": b"0 1\n1 0\n"}
+    source = _scad_source(files, "include <lib/子/shape.scad>\nshape();")
+    (root / "main ü.scad").write_bytes(source)
+    for name, data in files.items():
+        (root / name).write_bytes(data)
+    (root / "unrelated.scad").write_bytes(b"must not be included")
+    path = "exports with spaces/main ü.scad"
+    response = client.post("/workspace/scad-export", json={
+        "path": path,
+        "exported_files": [path, "exports with spaces/lib/子/shape.scad"],
+        "reused_files": ["exports with spaces/lib/子/image space.dat"],
+    })
+    assert response.status_code == 200
+    assert "attachment" in response.headers["content-disposition"]
+    with zipfile.ZipFile(io.BytesIO(response.content)) as bundle:
+        assert set(bundle.namelist()) == {"main ü.scad", *files}
+        assert bundle.read("main ü.scad") == source
+        for name, data in files.items():
+            assert bundle.read(name) == data
+        extracted = tmp_path / "extracted"
+        bundle.extractall(extracted)
+    assert (extracted / "lib/子/shape.scad").read_bytes() == files["lib/子/shape.scad"]
+    assert (extracted / "lib/子/image space.dat").read_bytes() == files["lib/子/image space.dat"]
+
+
+def test_scad_export_single_source_and_incomplete_manifest(client, workspace):
+    (workspace / "single.scad").write_bytes(_scad_source({}))
+    valid = {"path": "single.scad", "exported_files": ["single.scad"], "reused_files": []}
+    response = client.post("/workspace/scad-export", json=valid)
+    assert response.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(response.content)) as bundle:
+        assert bundle.namelist() == ["single.scad"]
+    assert client.post("/workspace/scad-export", json={
+        "path": "single.scad", "exported_files": ["single.scad"]
+    }).status_code == 400
+    assert client.post("/workspace/scad-export", json={
+        **valid, "exported_files": []
+    }).status_code == 400
+    (workspace / "single.scad").write_bytes(_scad_source({"dep.scad": b"cube(1);"}))
+    assert client.post("/workspace/scad-export", json=valid).status_code == 400
+    (workspace / "dep.scad").write_bytes(b"cube(1);")
+    assert client.post("/workspace/scad-export", json={
+        **valid, "reused_files": ["dep.scad", "missing.scad"]
+    }).status_code == 404
+    (workspace / "single.scad").write_bytes(b"cube(1);")
+    assert client.post("/workspace/scad-export", json=valid).status_code == 400
+
+
+def test_scad_export_refuses_unsafe_manifest_and_symlinks(client, workspace, tmp_path):
+    root = workspace / "export"
+    root.mkdir()
+    secret = tmp_path / "secret"
+    secret.write_bytes(b"secret")
+    (root / "main.scad").write_bytes(_scad_source({"lib/dep.scad": b"secret"}))
+    (root / "lib").symlink_to(tmp_path, target_is_directory=True)
+    request = {"path": "export/main.scad", "exported_files": ["export/main.scad"],
+               "reused_files": ["export/lib/dep.scad"]}
+    assert client.post("/workspace/scad-export", json=request).status_code == 403
+    (root / "lib").unlink()
+    (root / "lib").mkdir()
+    (root / "lib" / "dep.scad").symlink_to(secret)
+    assert client.post("/workspace/scad-export", json=request).status_code == 403
+    (root / "main.scad").unlink()
+    (root / "main.scad").symlink_to(secret)
+    assert client.post("/workspace/scad-export", json=request).status_code == 403
+    for bad in ("../secret", "/etc/passwd", "export/../secret", "other/file",
+                "export/C:/file", "export/a\\file"):
+        response = client.post("/workspace/scad-export", json={
+            **request, "reused_files": [bad]
+        })
+        assert response.status_code == 400
+    assert secret.read_bytes() == b"secret"
+
+
+def test_scad_export_refuses_collisions_changes_and_limits(client, workspace, monkeypatch):
+    (workspace / "part.scad").write_bytes(_scad_source({"dep.scad": b"expected"}))
+    (workspace / "dep.scad").write_bytes(b"changed!")
+    body = {"path": "part.scad", "exported_files": ["part.scad"],
+            "reused_files": ["dep.scad"]}
+    assert client.post("/workspace/scad-export", json=body).status_code == 409
+    assert client.post("/workspace/scad-export", json={
+        **body, "reused_files": ["dep.scad", "DEP.scad"]
+    }).status_code == 400
+    assert client.post("/workspace/scad-export", json={
+        **body, "reused_files": ["Lib/a.scad", "lib/b.scad"]
+    }).status_code == 400
+    assert client.post("/workspace/scad-export", json={
+        **body, "reused_files": ["dep.scad"] * 129
+    }).status_code == 400
+    monkeypatch.setattr(settings, "max_upload_bytes", 32)
+    assert client.post("/workspace/scad-export", json=body).status_code in (403, 413)
+
+
+def test_scad_export_refuses_cross_origin(client):
+    response = client.post("/workspace/scad-export", json={
+        "path": "a.scad", "exported_files": ["a.scad"], "reused_files": []
+    }, headers={"Origin": "https://attacker.example"})
+    assert response.status_code == 403
 
 
 def test_upload_replaces_existing_file_atomically(client, workspace):

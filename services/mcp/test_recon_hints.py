@@ -602,9 +602,13 @@ def test_stl_scan_reaches_a_parametric_tree_within_tolerance_of_ground_truth(tmp
     editable extrude + bore whose dimensions are checked against the block this test built.
     """
     from services.vision.segment_fit import segment_fit
+    from services.vision.recon_transform import ReconTransform
 
     path = _gt_block_stl(tmp_path)
-    fits = segment_fit(path, session_id="re_gt")
+    transform = ReconTransform.identity()
+    transform.source = "cad_export_mm"
+    transform.confirmed = True
+    fits = segment_fit(path, session_id="re_gt", recon_transform=transform)
     assert fits.get("ok"), fits
 
     res, _ = _call("reverse_engineer", {"source": path, "hints": fits})

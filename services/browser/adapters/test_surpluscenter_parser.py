@@ -187,7 +187,19 @@ def test_surpluscenter_search_parses_bigcommerce_cards(surpluscenter_mod, monkey
     assert first["title"] == "Viking Pump Houdaille FV 638 Hydraulic Gear Pump"
     assert first["url"] == "https://surpluscenter.com/viking-houdaille-hyd-gear-pump-fv-638/"
     assert first["sku"] == "13906"
-    assert first["price"] == "$79.95"
+    assert first["price"] == 79.95 and first["currency"] == "USD"
+    assert first["kind"] == "product" and first["stock"] == 5
+    assert "/products/13906/119678/" in first["thumbnail"]
+    assert "/products/687/107295/" in hits[1]["thumbnail"]
+
+
+def test_surpluscenter_encoded_query_and_parse_failure(surpluscenter_mod, monkeypatch):
+    session, module = surpluscenter_mod
+    urls = []
+    monkeypatch.setattr(session, "browser_fetch", lambda url, site: (
+        urls.append(url) or {"ok": True, "content": "<html>unknown layout</html>"}))
+    assert module.ADAPTER.search("pump & valve/#")[0]["reason"] == "parse_failed"
+    assert "pump+%26+valve%2F%23" in urls[0]
 
 
 def test_surpluscenter_search_url_is_bigcommerce_endpoint():

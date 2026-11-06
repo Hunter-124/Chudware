@@ -12,9 +12,13 @@ import json
 import math
 import os
 import re
+import stat
 import shutil
 import tempfile
 import time
+import threading
+from contextvars import ContextVar
+from weakref import WeakValueDictionary
 from collections.abc import MutableMapping
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
@@ -24,19 +28,29 @@ from mcp.server.fastmcp import FastMCP, Image
 
 from . import core_bridge as cb
 from . import simhandoff as sh
+from . import _envelopes
 from .core_bridge import CoreError
 
 # Current parts are agent-scoped for host calls, process-scoped for standalone MCP.
 # Keep the mapping surface used by the tool families; all imported _CUR references
 # resolve the slot at access time, including open/recovery helpers.
+_SCOPED_PART: ContextVar[object] = ContextVar("cad_scoped_part", default=None)
+
 class _CurrentPart(MutableMapping):
     def __init__(self):
         self._slots = {None: {"doc_id": None}}
 
-    def _slot(self):
+    def _key(self):
         owner = owner_key()
         agent = cb.CURRENT_AGENT.get()
-        return self._slots.setdefault((owner, agent) if owner is not None else agent, {"doc_id": None})
+        return (owner, agent) if owner is not None else agent
+
+    def _slot(self):
+        key = self._key()
+        scoped = _SCOPED_PART.get()
+        if scoped is not None and scoped[0] == key:
+            return scoped[1]
+        return self._slots.setdefault(key, {"doc_id": None})
 
     def __getitem__(self, key):
         return self._slot()[key]
@@ -52,6 +66,15 @@ class _CurrentPart(MutableMapping):
 
     def __len__(self):
         return len(self._slot())
+
+    def release_scope(self, scope) -> None:
+        """Drop every slot opened by agents running under `scope` (a finished run's id)."""
+        owner = owner_key()
+        for key in list(self._slots):
+            agent = (key[1] if owner is not None and isinstance(key, tuple) and key[0] == owner
+                     else key)
+            if isinstance(agent, tuple) and agent and agent[0] == scope:
+                self._slots.pop(key, None)
 
 
 _CUR: MutableMapping = _CurrentPart()
@@ -81,11 +104,39 @@ def doc_scope():
     current part is restored on the way out. Without this a sub-agent's last
     new_part() would silently redirect its parent's next edit into a document
     the parent never asked for."""
-    saved = _CUR["doc_id"]
+    token = _SCOPED_PART.set((_CUR._key(), dict(_CUR._slot())))
     try:
         yield
     finally:
-        _CUR["doc_id"] = saved
+        _SCOPED_PART.reset(token)
+
+
+def release_agent_run_state(run_id) -> None:
+    """Release transient agent slots without consuming the terminal persistence sweep."""
+    if run_id is not None:
+        _CUR.release_scope(run_id)
+        cb.release_run_state(run_id)
+
+
+def release_run_state(run_id) -> None:
+    """Forget what a FINISHED run left in this process: its agents' current-part slots, its
+    touched-document records, and the bridge's per-agent buffers.
+
+    Called by the turn's terminal sweep AFTER save_touched_docs (which needs those records).
+    Idempotent. Housekeeping only: it never touches a document."""
+    if run_id is None:
+        return
+    release_agent_run_state(run_id)
+    owner = owner_key()
+    with _TOUCHED_LOCK:
+        for key in [k for k in _TOUCHED_DOCS if k[0] == owner and k[1] == run_id]:
+            del _TOUCHED_DOCS[key]
+    try:
+        open_ids = {str(e["doc_id"]) for e in (cb.call("doc_list", {}) or {}).get("docs", [])
+                    if isinstance(e, dict) and e.get("doc_id")}
+    except Exception:  # noqa: BLE001 — the internal-document marks simply wait for the next turn
+        open_ids = None
+    cb.release_run_state(run_id, open_ids)
 
 
 # Cross-PROCESS document ownership. `_CUR` and `doc_scope()` only ever separate work inside ONE
@@ -112,17 +163,6 @@ def claim_process_doc(doc_id: Optional[str]) -> None:
 # an old handle the agent passes still resolves to the recovered document instead of erroring.
 _DOC_ALIASES: dict = {}
 
-# GSL Stage 1a — last-known solid volume per doc, so add_features can report a volume DELTA
-# (material added / removed / unchanged) in its write-diff confirmation. Best-effort cache.
-_LAST_VOLUME: dict = {}
-
-# Save discipline (user-vs-AI ownership): the engine revision this doc was last DELIVERED at
-# (save_part / export_part to a file). Native saves also happen automatically via
-# _project_save, so a clean engine `dirty` flag alone is not proof of explicit delivery.
-# Revision IS reliable: it's monotonic and bumped
-# only by mutating ops (never by a save), so `current_revision > _LAST_DELIVER_REV[doc]` means
-# "edited since the last real save". close_part uses it to nudge the agent to save its work.
-_LAST_DELIVER_REV: dict = {}
 
 # Placement provenance (assembly-merge discipline). A component dropped at an `at`/`rotate`
 # pose is only as good as the measurement it came from: the failed merge session placed a
@@ -131,11 +171,11 @@ _LAST_DELIVER_REV: dict = {}
 # "origin", "at_revision": <engine revision when it was placed>}. This travels inside the
 # .step+ document; a mate always supersedes a starting-pose transform.
 
-# The engine revision at which each doc was last interference-checked (check_interference).
-# Compared against the doc's CURRENT revision — monotonic, bumped only by mutating ops — so
-# "placed by transform and nothing verified it since the last mutation" is decidable without
-# any extra engine state.
-_LAST_INTERFERENCE_REV: dict = {}
+# The doc-meta key under which check_interference records the engine revision it last
+# verified. It lives in the document (like placement_sources), not in a process-global dict:
+# it survives save/reopen, and a doc id the engine later re-issues to a different part can
+# never inherit it.
+_INTERFERENCE_META_KEY = "interference_check"
 
 
 def pose_to_transform16(at: Optional[list], axis: Optional[list],
@@ -180,12 +220,10 @@ def note_placement_source(doc_id: Optional[str], component: Optional[str],
     """Record HOW a component was positioned ("transform" = a raw pose, "mate" = solved)."""
     if not doc_id or not component:
         return
-    rec = _placement_sources(str(doc_id))
-    prev = rec.get(str(component))
-    if isinstance(prev, dict) and prev.get("placement_source") == "mate" and source != "mate":
-        return  # a mate owns the pose; a later starting-pose transform does not un-verify it
-    rec[str(component)] = {"placement_source": source, "at_revision": _doc_revision(str(doc_id))}
-    cb.call("doc_set_meta", {"doc_id": str(doc_id), "key": "placement_sources", "value": rec})
+    cb.call("doc_set_meta", {
+        "doc_id": str(doc_id), "key": "placement_sources", "member": str(component),
+        "value": {"placement_source": source, "at_revision": _doc_revision(str(doc_id))},
+        **({"preserve": {"placement_source": "mate"}} if source != "mate" else {})})
 
 
 def placement_source_of(doc_id: Optional[str], component: Optional[str]) -> Optional[str]:
@@ -197,12 +235,34 @@ def placement_source_of(doc_id: Optional[str], component: Optional[str]) -> Opti
 
 
 def note_interference_check(doc_id: Optional[str]) -> None:
-    """Record that check_interference ran on this doc at its current revision."""
+    """Record, in the document, that check_interference ran at its current revision.
+
+    Only a document with transform-placed components has a `placement_unverified` warning to
+    clear, so only such a document is written (a check on any other document stays read-only).
+    A transport outage propagates; any other engine refusal leaves the record unwritten, which
+    keeps the warning standing — the safe direction."""
     if not doc_id:
         return
-    rev = _doc_revision(str(doc_id))
-    if rev is not None:
-        _LAST_INTERFERENCE_REV[str(doc_id)] = rev
+    did = str(doc_id)
+    if not any(isinstance(rec, dict) and rec.get("placement_source") == "transform"
+               for rec in _placement_sources(did).values()):
+        return
+    rev = _doc_revision(did)
+    if rev is None:
+        return
+    try:
+        cb.call("doc_set_meta", {"doc_id": did, "key": _INTERFERENCE_META_KEY,
+                                 "value": {"at_revision": rev}})
+    except Exception as exc:  # noqa: BLE001
+        _reraise_transport(exc)
+
+
+def _interference_checked_at(doc_id: str) -> Optional[int]:
+    """The engine revision check_interference last verified on this document, if recorded."""
+    value = cb.call("doc_get_meta", {"doc_id": doc_id,
+                                     "key": _INTERFERENCE_META_KEY}).get("value")
+    rev = value.get("at_revision") if isinstance(value, dict) else None
+    return rev if type(rev) is int else None
 
 
 def placement_warnings(doc_id: Optional[str]) -> list:
@@ -224,28 +284,49 @@ def placement_warnings(doc_id: Optional[str]) -> list:
     # something: a single-body part has nothing to be off-frame from.
     try:
         bodies = cb.call("asm_world_bodies", {"doc_id": did}).get("bodies") or []
-    except Exception:  # noqa: BLE001 — never let a warning probe break a delivery
+    except Exception as exc:  # noqa: BLE001 — a warning probe never breaks a delivery ...
+        _reraise_transport(exc)  # ... but a lost engine is an outage, not "no bodies"
         bodies = []
     if len(bodies) < 2:
         return []
     cur = _doc_revision(did)
-    checked = _LAST_INTERFERENCE_REV.get(did)
-    if checked is not None and cur is not None and checked >= cur:
+    # Equality, not ">=": the revision counter restarts when a document is reopened, so a
+    # record from an earlier life of this document must never count as verifying this one.
+    if cur is not None and _interference_checked_at(did) == cur:
         return []
     return [f"placement_unverified: {len(by_transform)} component(s) placed by transform "
             f"with no check_interference since last mutation"]
 
 
-def _doc_revision(doc_id: str) -> Optional[int]:
-    """Current engine revision for a doc via the cheap doc_list (no geometry compute)."""
-    try:
-        for e in cb.call("doc_list", {}).get("docs", []):
-            if isinstance(e, dict) and e.get("doc_id") == doc_id:
-                r = e.get("revision")
-                return int(r) if r is not None else None
-    except Exception:  # noqa: BLE001
-        pass
+# An engine transport outage is not "not found", "empty" or "nothing to do". The best-effort
+# `except Exception` blocks that degrade a failed read into an empty answer call this first, so
+# a lost or draining engine reaches the caller as itself.
+_TRANSPORT_ERROR_CODES = frozenset({"engine_connection_lost", "daemon_draining"})
+
+
+def _reraise_transport(exc: BaseException) -> None:
+    """Re-raise `exc` when it is an engine transport outage; return for any other error."""
+    if getattr(exc, "code", None) in _TRANSPORT_ERROR_CODES:
+        raise exc
+
+
+def _doc_row(doc_id: str) -> Optional[dict]:
+    """The engine's doc_list row for `doc_id` — a cheap listing, no geometry compute."""
+    for e in (cb.call("doc_list", {}) or {}).get("docs", []):
+        if isinstance(e, dict) and e.get("doc_id") == doc_id:
+            return e
     return None
+
+
+def _doc_revision(doc_id: str) -> Optional[int]:
+    """Current engine revision for a doc, or None when the engine cannot say."""
+    try:
+        row = _doc_row(doc_id)
+    except Exception as exc:  # noqa: BLE001
+        _reraise_transport(exc)
+        return None
+    r = (row or {}).get("revision")
+    return int(r) if isinstance(r, (int, float)) and not isinstance(r, bool) else None
 
 
 # --------------------------------------------------------------------------- helpers
@@ -357,8 +438,9 @@ def _face_hist(doc_id: str) -> dict:
     try:
         res = cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "face"}})
     except Exception as exc:  # noqa: BLE001
-        if getattr(exc, "code", None) == "engine_connection_lost":
-            raise
+        _reraise_transport(exc)
+        return {}
+    if not isinstance(res, dict) or not isinstance(res.get("matches"), list):
         return {}
     hist: dict = {"total": 0, "surf": {}, "bore": 0, "boss": 0}
     for m in res.get("matches", []):
@@ -383,77 +465,87 @@ _NEGLIGIBLE_VOLUME_FRACTION = 1e-7
 
 
 def _write_diff(before: dict, after: dict, vol_before, vol_after, *,
-                warnings: Sequence = (), bbox: Optional[dict] = None) -> dict:
-    """GSL Stage 1a (W2) — compose a SEMANTIC confirmation of what an op actually did, so the
-    return is no longer a bare ok:true + a volume number the model must diff itself. Reports the
-    net face change (by shape, and how many are bores/holes), the volume delta with its sign,
-    the part's overall size, and any per-feature warning the ENGINE raised; a no-op (a
-    cut/boolean that missed the body, a feature that altered nothing) reads as an explicit
-    'no geometry change' warning instead of looking successful.
+                warnings: Sequence = (), bbox: Optional[dict] = None,
+                edit_context: Optional[dict] = None, exact: bool = False) -> dict:
+    """Describe observed topology and volume changes without inventing a baseline.
 
-    `warnings` are the engine's own `feature_status[].warning` strings for the batch. They used
-    to travel ONLY in the `features[]` rows, one entry among a column of nulls, while this
-    summary — the line the ops cheatsheet tells the model to read — printed a generic guess
-    ("a cut/boolean may have missed") even when the engine had already named the exact cause
-    (measured live 2026-07-30: "fillet 1e-08 below tolerance; no material removed"). The
-    engine's reason always beats our guess, so it travels in the summary too.
-
-    `bbox` is a doc_bbox reply. Its `size` answers "is my part the right size" — the question
-    that otherwise costs a separate measure_part round trip (1060 chars measured) — for ~32
-    chars. It catches the class where every delta looks healthy but the part is not: a boss
-    sketched at [200,200] fuses fine ("added 6 face(s); volume 48000->49000 (+1000)") and
-    silently makes a 60 mm part 240 mm wide."""
-    before = before or {}
-    after = after or {}
-    dface = after.get("total", 0) - before.get("total", 0)
-    dbore = after.get("bore", 0) - before.get("bore", 0)
+    `exact` says the two volumes are the engine's exact B-rep volumes (`exact.volume_mm3`
+    in the ops reply); otherwise they are the display-tessellation figures and are labelled
+    as approximate.
+    """
+    vol_word = "volume" if exact else "approximate display volume"
+    have_faces = bool(before) and bool(after)
+    dface = after["total"] - before["total"] if have_faces else None
+    dbore = (after["bore"] - before["bore"]
+             if have_faces and "bore" in before and "bore" in after else None)
     surf_delta = {}
-    for sname in set(before.get("surf", {})) | set(after.get("surf", {})):
-        d = after.get("surf", {}).get(sname, 0) - before.get("surf", {}).get(sname, 0)
-        if d:
-            surf_delta[sname] = d
+    if have_faces and "surf" in before and "surf" in after:
+        for sname in set(before.get("surf", {})) | set(after.get("surf", {})):
+            d = after.get("surf", {}).get(sname, 0) - before.get("surf", {}).get(sname, 0)
+            if d:
+                surf_delta[sname] = d
     parts = []
-    if dface > 0:
+    if dface is not None and dface > 0:
         descr = ", ".join(f"+{d} {s}" for s, d in sorted(surf_delta.items()) if d > 0)
-        seg = f"added {dface} face(s)" + (f" ({descr})" if descr else "")
-        if dbore > 0:
-            seg += f"; {dbore} new bore/hole(s)"
-        parts.append(seg)
-    elif dface < 0:
+        parts.append(f"added {dface} face(s)" + (f" ({descr})" if descr else ""))
+    elif dface is not None and dface < 0:
         parts.append(f"removed {-dface} face(s)")
+    if dbore:
+        parts.append(f"bore faces {dbore:+d} (face count, not physical hole count)")
+
     dv = None
     if isinstance(vol_after, (int, float)):
         if isinstance(vol_before, (int, float)):
             dv = vol_after - vol_before
             floor = max(1e-6, _NEGLIGIBLE_VOLUME_FRACTION * abs(vol_after))
             if abs(dv) >= floor:
-                parts.append(f"volume {vol_before:.1f}->{vol_after:.1f} mm^3 "
+                parts.append(f"{vol_word} {vol_before:.1f}->{vol_after:.1f} mm^3 "
                              f"({'+' if dv >= 0 else ''}{dv:.1f})")
             elif dv:
-                # Real but negligible: never print "48000.0->48000.0 (-0.0)" and call it a change.
                 parts.append(
-                    f"volume effectively UNCHANGED ({vol_after:.1f} mm^3, delta {dv:+.3g} mm^3 "
-                    f"= {abs(dv) / max(abs(vol_after), 1e-9):.1g} of the body) - too small to be "
-                    f"real material; re-check the size you asked for")
-        elif vol_before is None and abs(vol_after) >= 1e-6:
-            dv = float(vol_after)
-            parts.append(f"volume now {vol_after:.1f} mm^3")
+                    f"{vol_word} effectively UNCHANGED ({vol_after:.1f} mm^3, "
+                    f"delta {dv:+.3g} mm^3 = {abs(dv) / max(abs(vol_after), 1e-9):.1g} "
+                    "of the body) - below the "
+                    + ("reporting threshold; this may be a small real change or numerical "
+                       "round-off. Use measure_part to investigate" if exact else
+                       "display-difference threshold; it may be tessellation noise or a "
+                       "small real change. Use measure_part to investigate"))
+        else:
+            parts.append(f"{vol_word} now {vol_after:.1f} mm^3 "
+                         "(pre-edit volume unavailable)")
+
     wtexts = [t for t in (str(w).strip() for w in (warnings or ())) if t]
     if parts:
         summary = "; ".join(parts)
+    elif not have_faces or dv is None:
+        summary = ("body geometry comparison unavailable"
+                   + ("; a sketch/mate edit may not change body geometry" if edit_context
+                      else ""))
+    elif edit_context:
+        summary = (f"no net face-count or {vol_word} change for this sketch/mate edit; "
+                   "this can be expected when no dependent geometry changes")
     elif wtexts:
-        summary = ("no geometry change - " + "; ".join(wtexts) +
+        summary = (f"no net face-count or {vol_word} change - " + "; ".join(wtexts) +
                    ". Re-check the placement/size against the request.")
-        wtexts = []  # the engine's reason IS the summary here; don't say it twice
+        wtexts = []
     else:
-        summary = ("no geometry change - no faces added/removed and volume unchanged; the op "
-                   "did not alter the body (a cut/boolean may have missed, or a boss/edit was a "
-                   "no-op). Re-check the placement/size against the request.")
+        summary = (f"no net face-count or {vol_word} change; a cut/boolean may have "
+                   "missed, or the change may preserve these statistics. Inspect the geometry.")
     if wtexts:
         summary = "ENGINE WARNING: " + "; ".join(wtexts) + " -- " + summary
-    out = {"summary": summary, "faces_delta": dface, "bores_delta": dbore}
+    out = {"summary": summary, "faces_delta": dface, "bore_faces_delta": dbore,
+           "volume_basis": (("brep_exact" if exact else "approximate_display_tessellation")
+                            if isinstance(vol_after, (int, float)) else "unavailable")}
     if dv is not None:
         out["volume_delta_mm3"] = round(dv, 4)
+    if edit_context:
+        out["edit_context"] = edit_context
+        context_text = ", ".join(edit_context.get("operations") or [])
+        for sketch in edit_context.get("sketches") or []:
+            consumer = ("feeds a feature" if sketch.get("feeds_feature")
+                        else "has no current feature consumer")
+            context_text += f"; sketch {sketch['id']} {consumer} (usage: {sketch['usage']})"
+        out["summary"] = out["summary"].rstrip(". ") + "; edit context: " + context_text
     size = (bbox or {}).get("size")
     if (isinstance(size, (list, tuple)) and len(size) == 3
             and all(isinstance(v, (int, float)) for v in size)):
@@ -558,6 +650,24 @@ def _docs_named(docs: list, value: str) -> list:
         return exact
     folded = v.casefold()
     return [e for e in docs if (e.get("name") or "").strip().casefold() == folded]
+
+
+def _part_has_mesh_references(doc_id: str) -> bool:
+    """Read part-only references without sending the part RPC to another document kind."""
+    if _FOREIGN_HANDLE_RE.match(doc_id):
+        return False  # Drawings and other foreign documents use separate registries.
+    for entry in (cb.call("doc_list", {}) or {}).get("docs", []):
+        if not isinstance(entry, dict) or entry.get("doc_id") != doc_id:
+            continue
+        kind = entry.get("kind")
+        if kind == "assembly":
+            return False
+        if kind == "part":
+            return bool((cb.call("doc_mesh_ref_list", {"doc_id": doc_id}) or {}).get("refs"))
+        raise CoreError(f"Cannot determine document kind for {doc_id}.",
+                        code="document_kind_unknown", detail={"doc_id": doc_id, "kind": kind})
+    raise CoreError(f"Document {doc_id} is no longer open.", code="doc_not_found",
+                    detail={"doc_id": doc_id})
 
 
 def _project_dir() -> str:
@@ -684,7 +794,8 @@ def _docs_in_version_series(docs: list, name: str, kind: str = "part") -> list:
             continue
         if n.casefold() != folded and _version_series_base(n).casefold() != folded:
             continue
-        if not ((e.get("feature_count") or 0) or (e.get("component_count") or 0)):
+        if not ((e.get("feature_count") or 0) or (e.get("component_count") or 0)
+                or e.get("empty") is False):
             continue
         out.append(e)
     return out
@@ -735,30 +846,18 @@ _AI_ORIGIN_KINDS = ("mcp", "agent")
 def _sole_doc_is_adoptable(entry: dict) -> bool:
     """May an omitted doc_id silently adopt `entry`, the only document open engine-wide?
 
-    Yes when there is no shared engine to steal from, when the doc is already ours, or when it
-    is not an AI client's private working part:
-
-      * legacy (non-daemon) mode — `doc_list` is THIS process's own in-process engine, so every
-        document it can see is ours by construction. There is no second client; adopt.
-      * a doc this process created / opened / recovered / was handed explicitly. `_doc()`
-        reconciles `_PROCESS_DOCS` against the open documents on every call, so this is a
-        claim on a doc that is still THERE — not a stale id the engine's per-daemon counter
-        later handed to somebody else. Covers a sub-agent's part after `doc_scope()` put
-        `_CUR` back, and our own part after a `close_part` of a different doc cleared it.
-        (`_TOUCHED_DOCS` is deliberately NOT consulted: `note_touched_doc` feeds
-        `_PROCESS_DOCS` too, while the terminal save sweep keeps touched history until a
-        successful close explicitly evicts the document.)
-      * `origin_kind` "gui" (the human's own part in the viewport), "test", "unknown", or absent
-        — acting on the part the user is actually looking at is the whole point of the adopt.
-
-    No when the sole open document was minted by an AI client and we hold no claim on it: that
-    is another swarm member's part. From the engine's global view it looks exactly like our own
-    would, purely because we have not made one yet — which is precisely the first tool call of
-    a fresh cowork swarm member, the most common moment in a multi-agent session.
+    Standalone MCP may adopt its own sole document, or a human's GUI document.
+    Agent slots are independent even within one process: a process-level claim
+    does not select a peer's AI document for a fresh agent.
     """
+    # A process claim belongs to the process, not to every concurrent agent in it.
+    # An agent with no selection must explicitly name another agent's AI document.
+    agent = cb.CURRENT_AGENT.get() is not None
+    if agent and (entry.get("origin_kind") or "") in _AI_ORIGIN_KINDS:
+        return False
     try:
         if not cb.active_daemon_mode():
-            return True
+            return not (agent and entry.get("doc_id") in _PROCESS_DOCS)
     except Exception:  # noqa: BLE001 — mode unknown: fall through to the origin test
         pass
     if entry.get("doc_id") in _PROCESS_DOCS:
@@ -791,14 +890,15 @@ def _doc(doc_id: Optional[str]) -> str:
     # the part sits right there in the viewport. Always ask the engine what is actually open and
     # reconcile against it. The same listing is what resolves an imperfect supplied handle and
     # what every teaching error below quotes back.
+    list_error = ""
     try:
         docs = [e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
                 if isinstance(e, dict) and e.get("doc_id")]
         listed = True
+        cb.remember_resolution_rows(docs)
     except Exception as exc:  # noqa: BLE001
-        if getattr(exc, "code", None) == "engine_connection_lost":
-            raise
-        docs, listed = [], False
+        _reraise_transport(exc)
+        docs, listed, list_error = [], False, f"{type(exc).__name__}: {exc}"
 
     def _ambiguous(candidates: Optional[list] = None,
                    supplied: Optional[str] = None) -> DocRefError:
@@ -891,6 +991,13 @@ def _doc(doc_id: Optional[str]) -> str:
             # one of the ids above" there invites editing whichever part IS open; the way back
             # to the part the caller meant is to reopen it (2026-09-28: a resumed turn's
             # render_part(doc_id="doc-cpp00000003") after an app restart).
+            saved_path = _known_touched_saved_path(raw)
+            if saved_path:
+                raise _doc_error(
+                    f"no such document {raw!r}: its saved native file is {saved_path!r}.",
+                    docs, code="doc_not_found",
+                    hint=f"Reopen it with import_part(path={saved_path!r}, resume=True) "
+                         "and use the returned doc_id.")
             raise _doc_error(
                 f"no such document {raw!r}: no open document has that id.",
                 docs, code="doc_not_found",
@@ -922,6 +1029,12 @@ def _doc(doc_id: Optional[str]) -> str:
         _PROCESS_DOCS.intersection_update(live)
     d = _resolve_alias(_CUR["doc_id"]) if _CUR["doc_id"] else None
     if d and listed and d not in live:
+        if cb.CURRENT_AGENT.get() is not None:
+            _CUR["doc_id"] = None
+            raise _doc_error(
+                f"The current document {d!r} is no longer open.",
+                docs, code="doc_not_found",
+                hint="Reopen the document you meant or explicitly select another open document.")
         # Our part is gone — closed in the app, or reaped by doc-GC. Holding the dead
         # handle only defers the failure to a confusing "no such document"; drop it and
         # resolve from what is actually open.
@@ -951,7 +1064,7 @@ def _doc(doc_id: Optional[str]) -> str:
     if not listed:
         raise _doc_error(
             "No current part, and the engine's document list is unavailable "
-            "(doc_list failed), so nothing can be resolved for you.",
+            f"(doc_list failed: {list_error}), so nothing can be resolved for you.",
             docs, code="no_current_part",
             hint='pass doc_id= explicitly, or call new_part(name="…") first.')
     # Zero documents open is NOT "you forgot to pass doc_id" — there is nothing to
@@ -963,20 +1076,106 @@ def _doc(doc_id: Optional[str]) -> str:
         hint='call new_part(name="…") first; it returns the doc_id to pass.')
 
 
-def _dumps(obj: Any) -> str:
-    out = json.dumps(obj, indent=2)
-    # Foreign-edit surfacing (daemon mode only — legacy has no shared docs): the
-    # daemon flagged that ANOTHER client (the human in the GUI, another agent)
-    # edited a doc we touched since our last call. Append a note so the model
-    # re-checks before overwriting. Additive: legacy mode never buffers any.
+# A foreign edit (another client — the human in the GUI, another agent — changed a document
+# this agent touched since its last call) rides in the reply as a JSON key, never as prose
+# after the JSON: trailing text breaks every json.loads of a tool reply (error paths, wait_job,
+# the sketch guard). Daemon mode only; the legacy engine has no shared documents.
+_FOREIGN_EDITS_HINT = ("another client edited these parts since your last call — re-check "
+                       "their current state before overwriting")
+
+# A reply longer than this many characters is saved whole under <CACHE>/results and replaced
+# by an envelope that keeps every small field. The host trims what the model sees (46 KB) and
+# spills its own full copy; this bounds what a standalone MCP client or an eval cell is handed,
+# which has no such layer.
+_RESULT_MAX_CHARS = int(os.environ.get("CHUDWARE_MCP_MAX_RESULT_BYTES") or 1_000_000)
+_RESULT_INLINE_CHARS = 2_000  # a top-level field up to this size stays inline when trimming
+
+
+def _foreign_edit_rows() -> list:
+    """Drain this agent's pending foreign-edit records as JSON rows."""
     try:
-        for fe in cb.consume_foreign_edits():
-            out += ("\nnote: {src} edited part {doc} since your last call (rev {rev}, "
-                    "via {m}) — re-check its current state before overwriting.").format(
-                src=fe.get("source_kind") or "another client",
-                doc=fe.get("doc_id"), rev=fe.get("revision"), m=fe.get("method"))
-    except Exception:  # noqa: BLE001
-        pass
+        pending = cb.consume_foreign_edits()
+    except Exception:  # noqa: BLE001 — surfacing is advisory
+        return []
+    return [{"source": fe.get("source_kind") or "another client", "doc_id": fe.get("doc_id"),
+             "revision": fe.get("revision"), "via": fe.get("method")}
+            for fe in pending if isinstance(fe, dict)]
+
+
+def _describe_omitted(value: Any) -> str:
+    if isinstance(value, list):
+        return f"list of {len(value)} items"
+    if isinstance(value, dict):
+        return f"object with {len(value)} keys"
+    if isinstance(value, str):
+        return f"string of {len(value)} chars"
+    return type(value).__name__
+
+
+def _spill_result(text: str) -> Optional[str]:
+    """Save an over-size reply under <CACHE>/results/<date>/; None when it cannot be written."""
+    try:
+        from services import paths as _paths  # noqa: PLC0415
+        from services.agent import request_context as tenancy
+        if tenancy.in_cell():
+            root = tenancy.actor_state_root() / "cache" / "results"
+        else:
+            root = Path(_paths.CACHE) / "results"
+            if _prune_due("results"):
+                _prune_cache_subdir("results", 2, 200)
+        day = root / time.strftime("%Y-%m-%d")
+        day.mkdir(parents=True, exist_ok=True)
+        path = day / f"result-{os.urandom(4).hex()}.json"
+        path.write_text(text, encoding="utf-8")
+        return str(path.resolve())
+    except OSError:
+        return None
+
+
+def _bounded_payload(obj: Any, text: str) -> str:
+    """The envelope standing in for an over-size reply: every small top-level field stays,
+    every large one is described, and the complete reply is on disk at `result_path`."""
+    path = _spill_result(text)
+    kept: dict = {}
+    omitted: dict = {}
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if (not isinstance(value, (list, dict, str))
+                    or len(json.dumps(value)) <= _RESULT_INLINE_CHARS):
+                kept[key] = value
+            else:
+                omitted[key] = _describe_omitted(value)
+    else:
+        omitted["result"] = _describe_omitted(obj)
+    envelope = {
+        **kept, "truncated": True, "result_chars": len(text), "result_path": path,
+        "omitted": omitted,
+        "truncation_hint": (
+            "the reply exceeded the size cap and is replaced by this summary; "
+            + ("read result_path for the complete JSON, or " if path else
+               "the complete reply could not be saved, so ")
+            + "ask for less: get_part(summary=True or feature_ids=[...], limit=, cursor=) "
+              "and list_parts(limit=, cursor=) page their results"),
+    }
+    result = json.dumps(envelope, indent=2)
+    if len(result) <= _RESULT_MAX_CHARS:
+        return result
+    # Many individually small fields can themselves exceed the cap. Preserve the
+    # success/failure signal and the handle, rather than returning another oversized reply.
+    compact = {"truncated": True, "result_chars": len(text), "result_path": path}
+    if isinstance(obj, dict) and isinstance(obj.get("ok"), bool):
+        compact["ok"] = obj["ok"]
+    return json.dumps(compact)
+
+
+def _dumps(obj: Any) -> str:
+    if isinstance(obj, dict) and "foreign_edits" not in obj:
+        edits = _foreign_edit_rows()
+        if edits:
+            obj = {**obj, "foreign_edits": edits, "foreign_edits_hint": _FOREIGN_EDITS_HINT}
+    out = _envelopes.dumps(obj)
+    if len(out) > _RESULT_MAX_CHARS:
+        return _bounded_payload(_envelopes.stamp_engine(obj), out)
     return out
 
 
@@ -987,10 +1186,8 @@ def _teach_undo_denied(e: "CoreError") -> str:
     added") is not a checkpoint problem at all: it is an OP inside the
     modelling batch. The policy is unchanged — this only teaches the way out.
     """
-    out = {
-        "ok": False,
-        "error": str(e),
-        "code": e.code,
+    out = _envelopes.error_payload(str(e), code=e.code, detail=e.detail)
+    out.update({
         "hint": (
             "undo/redo is refused for agent sessions by daemon policy "
             "(multi-writer safety) and there is no way to enable it from "
@@ -1027,9 +1224,7 @@ def _teach_undo_denied(e: "CoreError") -> str:
                 'doc_revert(doc_id, checkpoint=id) — engine-internal, '
                 'already run automatically before destructive ops',
         },
-    }
-    if e.detail is not None:
-        out["detail"] = e.detail
+    })
     return _dumps(out)
 
 
@@ -1038,13 +1233,8 @@ def _err(e: Exception) -> str:
     if isinstance(e, CoreError):
         if e.code == "undo_denied":
             return _teach_undo_denied(e)
-        out = {"ok": False, "error": str(e)}
-        if e.code:
-            out["code"] = e.code
-        if e.detail is not None:
-            out["detail"] = e.detail
-        return _dumps(out)
-    return _dumps({"ok": False, "error": str(e)})
+        return _dumps(_envelopes.error_payload(str(e), code=e.code or "", detail=e.detail))
+    return _dumps(_envelopes.error_payload(str(e)))
 
 
 def _tmp(suffix: str) -> str:
@@ -1053,7 +1243,20 @@ def _tmp(suffix: str) -> str:
     return path
 
 
-_RENDER_PRUNE_DONE = False
+# A long-lived worker renders for days: each cache directory is re-pruned at most this often,
+# not just once at the process's first write.
+_CACHE_PRUNE_INTERVAL_S = 3600.0
+_CACHE_PRUNED_AT: dict = {}   # cache subdirectory -> time.monotonic() of its last prune
+
+
+def _prune_due(subdir: str) -> bool:
+    """True — and the interval re-armed — when `subdir` has not been pruned recently."""
+    now = time.monotonic()
+    last = _CACHE_PRUNED_AT.get(subdir)
+    if last is not None and now - last < _CACHE_PRUNE_INTERVAL_S:
+        return False
+    _CACHE_PRUNED_AT[subdir] = now
+    return True
 
 
 def render_output_path(stem: str = "render", suffix: str = ".png") -> str:
@@ -1078,12 +1281,10 @@ def render_output_path(stem: str = "render", suffix: str = ".png") -> str:
     safe = re.sub(r"[^A-Za-z0-9._-]+", "-", str(stem or ""))
     safe = re.sub(r"-{2,}", "-", safe).strip("-.")[:60].strip("-.") or "render"
     day = Path(_paths.CACHE) / "renders" / time.strftime("%Y-%m-%d")
-    global _RENDER_PRUNE_DONE
-    if not _RENDER_PRUNE_DONE:
+    if _prune_due("renders"):
         # Prune before creating today's directory.  prune_render_cache() removes empty day
         # directories; creating the directory first let the first render path in a process
         # point into a directory the prune had just deleted.
-        _RENDER_PRUNE_DONE = True
         prune_render_cache()
     day.mkdir(parents=True, exist_ok=True)
     return os.path.abspath(str(day / f"{safe}-{os.urandom(4).hex()}{suffix}"))
@@ -1096,10 +1297,15 @@ def prune_render_cache(max_age_days: int = 7, max_files: int = 2000) -> int:
     oldest survivors go until it fits. Empty day directories are removed afterwards. This
     NEVER raises: a permission error or a racing unlink must not be able to break a render.
     """
+    return _prune_cache_subdir("renders", max_age_days, max_files)
+
+
+def _prune_cache_subdir(subdir: str, max_age_days: int, max_files: int) -> int:
+    """prune_render_cache for any ``<CACHE>/<subdir>``; returns how many files were deleted."""
     removed = 0
     try:
         from services import paths as _paths  # noqa: PLC0415
-        root = Path(_paths.CACHE) / "renders"
+        root = Path(_paths.CACHE) / subdir
         if not root.is_dir():
             return 0
         keep: list = []
@@ -1140,7 +1346,7 @@ def prune_render_cache(max_age_days: int = 7, max_files: int = 2000) -> int:
 
 def _captioned_render(png: str, doc_id: str, views: list,
                       annotations: Optional[dict] = None,
-                      extra: str = "") -> Union[Image, list]:
+                      extra: str = "", caption: str | None = None) -> Union[Image, list]:
     """A2/render-caption wiring: pair a render PNG with a one-paragraph deterministic text
     caption (services.mcp.gsl_tools._scene_caption) so a non-vision model reading the tool
     transcript gets SOME signal from a render it cannot see. `mcp` 1.28.1 flattens a list
@@ -1151,7 +1357,8 @@ def _captioned_render(png: str, doc_id: str, views: list,
     annotations: the `info` dict from _annotate_render. When present its self-sufficient block
     (bbox + scale, features in frame, highlights and their reserved colours, the side-palette
     colour key, and what this camera CANNOT see plus the tool to call for it) is appended, so
-    the caption alone fully describes the image. `extra` is appended after that."""
+    the caption alone fully describes the image. `extra` is appended after that. `caption`
+    supplies a study's own measured summary instead of inferring faces from named views."""
     tail = ""
     if annotations:
         try:
@@ -1163,6 +1370,8 @@ def _captioned_render(png: str, doc_id: str, views: list,
             tail = ""
     if extra:
         tail = (tail + " " + extra).strip() if tail else extra.strip()
+    if caption is not None:
+        return [Image(path=png), (caption + " " + tail).strip() if tail else caption]
     try:
         from services.mcp.gsl_tools import _scene_caption
         caption = _scene_caption(doc_id, views)
@@ -1193,9 +1402,10 @@ def _sanitize_output_path(path: str) -> str:
 def resolve_agent_path(path: str, arg: str) -> str:
     """Return the absolute path of an agent-supplied file or directory path.
 
-    A relative path is project-root relative: CHUDWARE_PROJECT_DIR, then
-    CHUDWARE_FS_ROOT. An explicit root is authoritative and canonicalized without
-    widening to a marked ancestor. Absolute paths and ``~`` need no project root.
+    A relative path is project-root relative: the request-scoped CHUDWARE_PROJECT_DIR,
+    then CHUDWARE_FS_ROOT (environment values for standalone MCP clients). An explicit
+    root is authoritative and never widened to a marked ancestor. Absolute paths and
+    ``~`` need no project root.
     This function does not apply a jail; the caller keeps its own containment policy.
 
     When no project root is known (a headless external MCP client), a relative path is
@@ -1208,7 +1418,7 @@ def resolve_agent_path(path: str, arg: str) -> str:
     if os.path.isabs(expanded):
         return os.path.normpath(expanded)
     for key in ("CHUDWARE_PROJECT_DIR", "CHUDWARE_FS_ROOT"):
-        start = os.environ.get(key, "").strip()
+        start = root_value(key).strip()
         if not start:
             continue
         root = Path(start).expanduser().resolve()
@@ -1297,13 +1507,13 @@ def archive_before_write(
     }
 
 
-# --- live viewport handoff -------------------------------------------------------------
-# The MCP runs in its OWN process with its own engine, so the running desktop app can't see
-# its doc sessions. To make the AI's part visible in the app's viewport, we publish it as a
-# native .step+ doc plus a tiny live.json {rev, step} into <appdata>/<app>/handoff/; the GUI
-# polls that control file each frame (ui::pollAiCadHandoff) and opens/refreshes one tab from it.
-# <app> follows the app-dir alias rule (Chudware, or the legacy Chudware dir when it already
-# exists), matching platform::appdataRoot() so publisher and reader agree.
+# --- live viewport handoff (LEGACY in-process engine only) ------------------------------
+# Daemon mode (the default) shares ONE engine with the GUI, so none of this runs and hostd owns
+# presentation. With CHUDWARE_ENGINE_DAEMON=0 — or after a startup fallback — the MCP runs its
+# OWN engine and the desktop app cannot see its documents. A part the agent explicitly presents
+# (show_in_app) is then published as a native .step+ plus a tiny control file under
+# <appdata>/Chudware/handoff/, which the GUI polls each frame (ui::pollAiCadHandoff) to
+# open/refresh one tab per presented part.
 _PUB: dict = {"rev": None, "docs": {}, "active": None}
 
 
@@ -1335,10 +1545,7 @@ def _handoff_dir() -> Path:
             # Match platform/paths_linux.cpp appdataDir() — the old tempdir fallback put
             # the handoff where the GUI never looked on Linux.
             base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    new_root = Path(base) / "Chudware"
-    legacy_root = Path(base) / "Chudware"
-    root = legacy_root if (not new_root.exists() and legacy_root.exists()) else new_root
-    d = root / "handoff"
+    d = Path(base) / "Chudware" / "handoff"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -1349,14 +1556,12 @@ def _handoff_key(doc_id: str) -> str:
 
 
 def _handoff_doc_name(doc_id: str) -> str:
-    """Best-effort human name for a doc so the mirror tab reads sensibly. Never raises."""
+    """Human name for a doc so the mirror tab reads sensibly; "" when the engine cannot say."""
     try:
-        for e in (cb.call("doc_list", {}) or {}).get("docs", []):
-            if isinstance(e, dict) and e.get("doc_id") == doc_id:
-                return e.get("name") or ""
-    except Exception:  # noqa: BLE001
-        pass
-    return ""
+        return (_doc_row(doc_id) or {}).get("name") or ""
+    except Exception as exc:  # noqa: BLE001
+        _reraise_transport(exc)
+        return ""
 
 
 def _prune_closed_docs() -> None:
@@ -1378,29 +1583,9 @@ def _prune_closed_docs() -> None:
         _PUB["active"] = next(reversed(_PUB["docs"]), None) if _PUB["docs"] else None
 
 
-def _supersede_same_name(doc_id: str, name: str) -> None:
-    """Close abandoned earlier incarnations of the SAME part.
-
-    When an agent re-creates a part it already had open (a fresh `doc_id` under the same name —
-    e.g. it rebuilt `CC-201_Rim` from scratch instead of editing), the old doc stays live in the
-    engine forever: it keeps its own mirror tab (the doubled-tab bug) AND pins its OCCT bodies in
-    memory. Here we close any OTHER doc WE published under the same non-empty name, provided it is
-    neither the just-published doc nor the active one. Scoped to `_PUB["docs"]` so we only ever
-    close ids this process itself put on screen — never another agent's part or a doc we never
-    owned. Best-effort: a close failure must never break publishing."""
-    if not name:
-        return  # unknown name — treat every such doc as distinct (never collapse blindly)
-    stale = [did for did, v in _PUB["docs"].items()
-             if did != doc_id and did != _PUB.get("active") and v.get("name") == name]
-    for did in stale:
-        try:
-            cb.call("doc_close", {"doc_id": did})
-        except Exception:  # noqa: BLE001
-            pass  # already gone / engine declined — drop it from the mirror set regardless
-        _PUB["docs"].pop(did, None)
 
 
-def _write_handoff_control(d: Path, active: Optional[str]) -> None:
+def _write_handoff_control(d: Path, active: Optional[str]) -> bool:
     """Emit BOTH control files, atomically:
 
       • live.json  (LEGACY {rev, step, doc_id}) — points at `active`. The OLD single-tab host
@@ -1413,36 +1598,13 @@ def _write_handoff_control(d: Path, active: Optional[str]) -> None:
     docs = _PUB["docs"]
     entries = [{"doc_id": did, "step": v["step"], "rev": v["rev"], "name": v.get("name", "")}
                for did, v in docs.items()]
-    # Collapse duplicate same-name entries (newest rev wins) so a re-created part shows exactly ONE
-    # mirror tab. Belt-and-suspenders behind _supersede_same_name: catches dupes that weren't
-    # engine-closable (e.g. name was blank when first published, filled in later). Blank names are
-    # NOT collapsed — an unknown name is treated as a distinct doc. The GUI closes any tab whose
-    # doc_id stops being advertised here, so dropping stale entries retires their tabs automatically.
-    by_name: dict = {}
-    collapsed = []
-    for e in entries:
-        nm = e["name"]
-        if not nm:
-            collapsed.append(e)
-            continue
-        prev = by_name.get(nm)
-        if prev is None or e["rev"] > prev["rev"]:
-            by_name[nm] = e
-    collapsed.extend(by_name.values())
-    entries = collapsed
-    # Keep `active` pointing at a surviving entry (remap to the newest same-name doc if the active
-    # doc_id was collapsed away, so the app still focuses the right part).
-    advertised = {e["doc_id"] for e in entries}
-    if active is not None and active not in advertised:
-        act_name = docs.get(active, {}).get("name", "")
-        active = by_name.get(act_name, {}).get("doc_id", active) if act_name else active
     # Compound the advertised keys with our session id. The host uses doc_id as its per-tab key;
     # engine doc_ids reset per process, so without this two swarm members would both advertise
     # "doc-cpp00000001" and the host would fuse their tabs. The agent never reads these back, so an
     # opaque compound key is safe. Ops still use the bare engine doc_id (this is display-only).
     cid = lambda did: f"{_SESSION_ID}-{did}"
     frag_entries = [{"doc_id": cid(e["doc_id"]), "step": e["step"],
-                     "rev": e["rev"], "name": e["name"]} for e in entries]
+                     "rev": e["rev"], "name": e["name"], "presented": True} for e in entries]
     frag_active = cid(active) if active else None
     # Write OUR OWN fragment (uniquely named → zero cross-process write contention). The single
     # docs.json the host reads is then rebuilt by merging every LIVE fragment, so concurrent
@@ -1452,10 +1614,10 @@ def _write_handoff_control(d: Path, active: Optional[str]) -> None:
     tmp = d / f"docs-{_SESSION_ID}.json.tmp"
     tmp.write_text(json.dumps(frag))
     os.replace(tmp, d / f"docs-{_SESSION_ID}.json")
-    _merge_handoff_fragments(d)
+    return _merge_handoff_fragments(d)
 
 
-def _merge_handoff_fragments(d: Path) -> None:
+def _merge_handoff_fragments(d: Path) -> bool:
     """Rebuild docs.json (and legacy live.json) by unioning every LIVE `docs-<session>.json`
     fragment. Idempotent over the fragment set — concurrent mergers converge because they see the
     same files — so no lock is needed; a transient partial merge self-heals on the next publish.
@@ -1474,10 +1636,10 @@ def _merge_handoff_fragments(d: Path) -> None:
                 continue
             pid = int(m.get("pid", 0) or 0)
             updated = float(m.get("updated_at", 0.0) or 0.0)
-            alive = _pid_alive(pid) and (now - updated) <= _HANDOFF_FRAG_TTL_S
+            alive = _handoff_owner_alive(pid) and (now - updated) <= _HANDOFF_FRAG_TTL_S
             if not alive:
                 # Owner is gone — retire its fragment (and mirror files) so its tabs close.
-                if pid and not _pid_alive(pid):
+                if pid and not _handoff_owner_alive(pid):
                     try:
                         fp.unlink(missing_ok=True)
                         for step in d.glob(f"live-{m.get('session','')}-*.step+"):
@@ -1486,7 +1648,8 @@ def _merge_handoff_fragments(d: Path) -> None:
                         pass
                 continue
             live_sessions.add(str(m.get("session", "")))
-            merged.extend(m.get("docs", []))
+            merged.extend(e for e in m.get("docs", [])
+                          if isinstance(e, dict) and e.get("presented") is True)
             top_rev = max(top_rev, int(m.get("rev", 0) or 0))
             if m.get("active") and updated > active_at:
                 active, active_at = m.get("active"), updated
@@ -1511,6 +1674,8 @@ def _merge_handoff_fragments(d: Path) -> None:
                     pass
         except OSError:
             pass
+        if active not in {e.get("doc_id") for e in merged}:
+            active = merged[-1].get("doc_id") if merged else None
         payload = {"rev": top_rev, "active": active, "docs": merged}
         tmp = d / "docs.json.tmp"
         tmp.write_text(json.dumps(payload))
@@ -1519,10 +1684,14 @@ def _merge_handoff_fragments(d: Path) -> None:
         act = next((e for e in merged if e["doc_id"] == active), None) or (merged[-1] if merged else None)
         if act is not None:
             tmp = d / "live.json.tmp"
-            tmp.write_text(json.dumps({"rev": top_rev, "step": act["step"], "doc_id": act["doc_id"]}))
+            tmp.write_text(json.dumps({"rev": top_rev, "step": act["step"],
+                                       "doc_id": act["doc_id"], "presented": True}))
             os.replace(tmp, d / "live.json")
+        else:
+            (d / "live.json").unlink(missing_ok=True)
+        return True
     except Exception:  # noqa: BLE001 — publishing is best-effort; never break an op on mirror IO
-        pass
+        return False
 
 
 # Publish throttling: every publish serializes the FULL doc to a .step+ (50-200ms on a
@@ -1537,39 +1706,24 @@ _PUBLISH_MIN_INTERVAL_S: float = float(os.environ.get("CHUDWARE_PUBLISH_MIN_INTE
 _PUB_THROTTLE: dict = {}  # doc_id -> {"revision": int|None, "t": float, "timer": Timer|None, "last": dict|None}
 
 
-def _engine_doc_revision(doc_id: str) -> Optional[int]:
-    """The engine's monotonic revision for `doc_id` (cheap metadata call), or None."""
-    try:
-        for e in (cb.call("doc_list", {}) or {}).get("docs", []):
-            if isinstance(e, dict) and e.get("doc_id") == doc_id:
-                rev = e.get("revision")
-                return int(rev) if isinstance(rev, (int, float)) else None
-    except Exception:  # noqa: BLE001
-        pass
-    return None
-
-
-def _publish_current(doc_id: str, _deferred: bool = False) -> Optional[dict]:
-    """Publish `doc_id` to the handoff dir so the open app shows it. Best-effort; never raises.
-
-    Each open doc is saved to its OWN live-<key>.step+, and the control files list every open
-    doc — so when an AI agent (built-in or an MCP-driven cowork swarm) opens several parts, the
-    desktop app keeps a tab open for each instead of overwriting a single live view.
-
-    Daemon mode (the default since the Phase-8 flip): the GUI shares the daemon's
-    docs live and IGNORES handoff files, so writing them would only burn a full
-    doc serialization per op batch and leave a stale second source of truth —
-    skip entirely. The legacy path (explicit CHUDWARE_ENGINE_DAEMON=0, or daemon
-    transport fallback) keeps publishing; the whole publisher is deleted in N+1.
-    """
-    if cb.active_daemon_mode():
+def _publish_current(doc_id: str, _deferred: bool = False,
+                     _present: bool = False) -> Optional[dict]:
+    """Publish an explicitly presented document to the legacy handoff, best-effort."""
+    if cb.active_daemon_mode() or (not _present and doc_id not in _PUB["docs"]):
         return None
+    initial = _present and doc_id not in _PUB["docs"]
     try:
+        # An empty document has no geometry to show. Do not opt it in until the
+        # initial handoff can actually be produced; subsequent edits stay private.
+        if initial:
+            bounds = cb.call("doc_bbox", {"doc_id": doc_id})
+            if not isinstance(bounds, dict) or bounds.get("_is_error") or bounds.get("ok") is False:
+                return None
         import threading as _t
 
         st = _PUB_THROTTLE.setdefault(
             doc_id, {"revision": None, "t": 0.0, "timer": None, "last": None})
-        engine_rev = _engine_doc_revision(doc_id)
+        engine_rev = _doc_revision(doc_id)
         # Revision-skip: nothing changed since the last publish of this doc — the mirror
         # file and control entry are already current. (Never skips a doc we've not yet
         # published this process: st["revision"] starts as None.)
@@ -1597,7 +1751,10 @@ def _publish_current(doc_id: str, _deferred: bool = False) -> Optional[dict]:
         # servers both holding doc-cpp00000001 would otherwise write the SAME live-doc-cpp00000001
         # .step+ and clobber each other's mirror. _SESSION_ID makes every process's files disjoint.
         step = d / f"live-{_SESSION_ID}-{key}.step+"
-        cb.call("doc_save", {"doc_id": doc_id, "path": str(step), "preserve_path": True})
+        saved = cb.call("doc_save", {"doc_id": doc_id, "path": str(step), "preserve_path": True})
+        if not isinstance(saved, dict) or saved.get("_is_error") or saved.get("ok") is False:
+            st["t"] = 0.0
+            return None
         if _PUB["rev"] is None:
             # Seed from any existing control file so the rev keeps rising across MCP restarts.
             try:
@@ -1612,13 +1769,23 @@ def _publish_current(doc_id: str, _deferred: bool = False) -> Optional[dict]:
         _PUB["docs"][doc_id] = {"rev": _PUB["rev"], "step": str(step), "name": name}
         _PUB["active"] = doc_id
         _prune_closed_docs()   # evict superseded/closed doc_ids so a part never mirrors twice
-        _supersede_same_name(doc_id, name)  # close abandoned older docs of the same part name
-        _write_handoff_control(d, doc_id)
-        out = {"shown_in_app": True, "rev": _PUB["rev"], "open_docs": len(_PUB["docs"])}
+        if not _write_handoff_control(d, doc_id):
+            raise OSError("handoff control publication failed")
+        out = {"presentation_requested": True, "rev": _PUB["rev"], "open_docs": len(_PUB["docs"])}
         st["revision"] = engine_rev
         st["last"] = out
         return out
     except Exception:
+        if initial:
+            _PUB["docs"].pop(doc_id, None)
+            _PUB["active"] = next(reversed(_PUB["docs"]), None) if _PUB["docs"] else None
+            if "d" in locals():
+                try:
+                    _write_handoff_control(d, _PUB["active"])
+                except Exception:  # noqa: BLE001
+                    pass
+        if doc_id in _PUB_THROTTLE:
+            _PUB_THROTTLE[doc_id]["t"] = 0.0
         return None
 
 
@@ -1664,8 +1831,8 @@ def quiesce_publishes(timeout_s: float = 5.0) -> None:
     """Cancel every armed trailing publish and wait out the ones already running.
 
     Burst-coalescing arms a daemon Timer per doc (`chudware-publish-<doc_id>`) whose body
-    is a WHOLE publish: a full `doc_save` of the document plus the `doc_list`/`doc_close`
-    calls behind `_handoff_doc_name`, `_prune_closed_docs` and `_supersede_same_name`. The
+    is a WHOLE publish: a full `doc_save` plus the `doc_list` calls behind
+    `_handoff_doc_name` and `_prune_closed_docs`. The
     only cancel in the code is `_unpublish`'s, which covers one doc on `close_part` — so
     otherwise a trailing publish outlives whatever asked for it and keeps issuing engine
     calls on its own thread, minutes later if the bridge is busy.
@@ -1715,8 +1882,10 @@ _HANDOFF_PID = os.getpid()
 _HANDOFF_FRAG_TTL_S = float(os.environ.get("CHUDWARE_HANDOFF_TTL_S", "1800") or 1800)
 
 
-def _pid_alive(pid: int) -> bool:
-    """True if `pid` is alive. Inaccessible owners are assumed alive."""
+def _handoff_owner_alive(pid: int) -> bool:
+    """True if the handoff owner `pid` is alive. An unknown or inaccessible owner counts as
+    alive (its fragment then ages out by the mtime TTL). Deliberately not
+    daemon_bridge._pid_alive, which probes OUR OWN child and calls such a pid dead."""
     if not pid or pid < 0:
         return True  # unknown owner (legacy fragment) — don't evict on liveness grounds
     if os.name == "nt":
@@ -1767,8 +1936,6 @@ def _cleanup_handoff_fragment() -> None:
         _merge_handoff_fragments(d)
     except Exception:  # noqa: BLE001
         pass
-# Autosaves older than this are pruned at startup so the directory can't grow forever.
-_AUTOSAVE_MAX_AGE_DAYS = float(os.environ.get("CHUDWARE_AUTOSAVE_MAX_AGE_DAYS", "7") or 7)
 
 
 def _autosave_dir() -> Path:
@@ -1797,31 +1964,6 @@ def _autosave_dir() -> Path:
     return d
 
 
-#: Autosave COUNT cap. The age-based prune below was the only bound, and it never
-#: fires in practice: the worker is forked PER TURN (core/agent/run.cpp), so every
-#: turn gets a fresh _SESSION_ID and writes a brand-new session-prefixed snapshot for
-#: every doc it touches — all of them younger than the age cutoff. One day of use
-#: left 39,162 files / 3.6 GB under mcp_autosave, 19,581 distinct stems in seven
-#: hours. These are crash-recovery snapshots, not user deliverables (those go to the
-#: project folder via _project_save), so the directory is also bounded by count.
-_AUTOSAVE_MAX_FILES = int(os.environ.get("CHUDWARE_AUTOSAVE_MAX_FILES") or 2000)
-
-#: Autosave SESSION retention. The count cap above kept the pile at exactly its cap but
-#: could not bound how many distinct SESSIONS it spanned: 2,000 surviving snapshots on
-#: this workstation were spread over 512 sessions, and the single largest session held
-#: 270 docs. That is what makes recovery a footgun (see _RECOVER_MAX_DOCS). The count
-#: cap now evicts whole sessions oldest-first, and never touches the newest
-#: _AUTOSAVE_KEEP_SESSIONS of them nor this process's own.
-#:
-#: WHY WHOLE SESSIONS: an autosave snapshot IS potentially-unsaved user work — there is
-#: no dirty/clean flag in the sidecar, so we cannot tell debris from a part the user
-#: never saved. The only honest safety rule is therefore structural: a session is either
-#: kept ENTIRELY or dropped ENTIRELY, so a retained session is always fully recoverable
-#: and a prune can never leave one half-restorable. The old per-doc_id protection was
-#: actively unsafe here: doc_ids ("doc-cpp00000001") are engine-allocated and RESET per
-#: process, so "keep the newest snapshot of each doc_id" happily deleted session A's
-#: part because session B happened to reuse the same id for a different one.
-_AUTOSAVE_KEEP_SESSIONS = int(os.environ.get("CHUDWARE_AUTOSAVE_KEEP_SESSIONS") or 12)
 
 #: How many docs a single recovery call may reopen. recover_autosaved used to open EVERY
 #: snapshot in the recovered scope: measured on this workstation's real pile that is 270
@@ -1844,28 +1986,21 @@ _RECOVERED: list = []
 _RECOVER_SKIPPED = 0
 
 
-def _autosave(doc_id: Optional[str], name: Optional[str] = None) -> None:
-    """Persist a doc to a recoverable .step+ (plus a sidecar tagging the session) so a
-    server restart — e.g. after a client timeout killed it — can reload THIS session's
-    work instead of dropping every open document. Best-effort; never raises.
+def _autosave(doc_id: Optional[str], name: Optional[str] = None) -> bool:
+    """Write a standalone recovery snapshot; report whether it was committed.
 
-    NO-OP IN DAEMON MODE: chudware-hostd owns the one recovery scheduler and orphan
-    tier there. Keep the guard at this single write, not just aggregate entry points,
-    so direct tool callers cannot create a competing recovery authority. Standalone
-    snapshots use preserve_path so they never rebind the document's deliverable/base
-    directory or clear its dirty flag."""
-    if not doc_id or cb._daemon_mode():
-        return
+    Daemon mode has its own recovery scheduler. Snapshot saves preserve the bound
+    destination and dirty state, and never count as native delivery.
+    """
+    if not doc_id or cb.active_daemon_mode():
+        return False
     try:
         # Resolve the doc's real name from the engine when the caller didn't pass one, so
         # the sidecar (and therefore recover_parts) never reports an empty name (Bug N-6).
         if not name:
             try:
-                for d in (cb.call("doc_list", {}) or {}).get("docs", []):
-                    if isinstance(d, dict) and d.get("doc_id") == doc_id:
-                        name = d.get("name") or ""
-                        break
-            except Exception:  # noqa: BLE001
+                name = (_doc_row(doc_id) or {}).get("name") or ""
+            except Exception:  # noqa: BLE001 — the name is cosmetic; the snapshot still saves
                 pass
         # Session-prefix the filename: doc_ids are engine-allocated per-process ("doc-cpp0000000N")
         # and RESET across processes, so two concurrent MCP servers both holding doc-cpp00000001
@@ -1874,13 +2009,17 @@ def _autosave(doc_id: Optional[str], name: Optional[str] = None) -> None:
         # sidecar so recovery can still restore the agent's original handle via _DOC_ALIASES.
         stem = f"{_SESSION_ID}-{doc_id}"
         path = _autosave_dir() / f"{stem}.step+"
-        cb.call("doc_save", {"doc_id": doc_id, "path": str(path), "preserve_path": True})
+        saved = cb.call("doc_save", {"doc_id": doc_id, "path": str(path),
+                                     "preserve_path": True})
+        if saved.get("ok") is False or not path.is_file():
+            return False
         meta = {"session": _SESSION_ID, "doc_id": doc_id, "name": name or "",
-                "saved_at": time.time()}
+                "saved_at": time.time(), "revision": saved.get("revision"),
+                "metadata_revision": saved.get("metadata_revision")}
         (_autosave_dir() / f"{stem}.json").write_text(json.dumps(meta))
-        _prune_autosaves()  # once per process, after our own snapshot is safely down
+        return True
     except Exception:  # noqa: BLE001
-        pass
+        return False
 
 
 def _project_save_stem(name: Optional[str], doc_id: str) -> str:
@@ -1910,6 +2049,10 @@ def _project_save_stem(name: Optional[str], doc_id: str) -> str:
 # stale duplicate the harness itself created. Live 2026-09-24: five `<Stem>.step+` copies
 # were left in the user's project root beside the real files the agent saved under CAD/.
 _HARNESS_SAVED_PATHS: dict = {}
+
+# Serialize first-path selection and save only for callers of the same document.
+_PROJECT_SAVE_LOCKS_GUARD = threading.Lock()
+_PROJECT_SAVE_LOCKS = WeakValueDictionary()
 
 
 def note_harness_saved_path(doc_id: Optional[str], path: Optional[str]) -> None:
@@ -1952,10 +2095,8 @@ def _new_project_deliverable_path(root: str, name: Optional[str], doc_id: str,
 
 
 def _native_deliverable_path(entry: dict) -> Optional[str]:
-    """Use an established file or authored native edit, never study-only provenance."""
+    """Only an established bound file authorizes an automatic in-place save."""
     current = entry.get("path")
-    if not current and entry.get("native_source_edited") is True:
-        current = entry.get("native_source_path")
     if (isinstance(current, str) and current.lower().endswith(".step+")
             and not _is_recovery_path(current)):
         return current
@@ -1973,28 +2114,26 @@ def _default_deliverable_path(doc_id: str, suffix: str) -> str:
     historical temp-file fallback.
 
     An editable document already backed by a real ``.step+`` saves IN PLACE.
-    Detached imports retain source-save behavior after design edits, but study-only
-    scratch gets its own unused filename; provenance alone never authorizes overwrite.
+    Detached imports receive an unused project filename; provenance never authorizes
+    overwriting the source, including after design edits.
     """
     root = root_value("CHUDWARE_PROJECT_SAVE_DIR")
-    if not root:
+    if suffix != ".step+" and not root:
         return _tmp(suffix)
-
-    name = None
-    entry = {}
-    open_docs = []
-    try:
-        open_docs = (cb.call("doc_list", {}) or {}).get("docs", [])
-        entry = next((e for e in open_docs
-                      if isinstance(e, dict) and e.get("doc_id") == doc_id), {})
-        name = entry.get("name")
-    except Exception:  # noqa: BLE001 — the doc_id remains a stable filename fallback
-        pass
+    open_docs = (cb.call("doc_list", {}) or {}).get("docs", [])
+    entry = next((e for e in open_docs
+                  if isinstance(e, dict) and e.get("doc_id") == doc_id), None)
+    if entry is None and suffix == ".step+":
+        raise CoreError(f"Document {doc_id} is no longer open", code="document_not_found")
+    name = (entry or {}).get("name")
     if suffix == ".step+":
         current = _native_deliverable_path(entry)
         if current:
             return current
-        return _new_project_deliverable_path(root, name, doc_id, suffix, open_docs)
+        return (_new_project_deliverable_path(root, name, doc_id, suffix, open_docs)
+                if root else _tmp(suffix))
+    if not root:
+        return _tmp(suffix)
     directory = Path(os.path.abspath(os.path.expanduser(root)))
     directory.mkdir(parents=True, exist_ok=True)
     return str(directory / f"{_project_save_stem(name, doc_id)}{suffix}")
@@ -2021,105 +2160,270 @@ def _project_save(doc_id: Optional[str], name: Optional[str] = None) -> Optional
     An established native destination owns the assembly's relative-source base directory;
     automatic saves must not relocate it to <CHUDWARE_PROJECT_SAVE_DIR>/<safe_stem>.step+.
     Only new/detached documents and recovery snapshots receive that default destination.
-    A document the user opened (hostd origin_kind "gui") is never written here: the agent
-    edits it live in the user's tab, and only an explicit save (the user's, or the agent's
-    save_part) writes the user's file. hostd's autosave snapshots it meanwhile.
-    Unset project configuration remains a no-op. Save errors are best-effort, except
-    engine connection loss: callers must not claim durable success."""
+    Human-dirty documents are never committed by an automatic save. Errors are
+    raised so callers can report an applied mutation separately from persistence.
+    """
     if not doc_id:
         return None
-    try:
-        root = root_value("CHUDWARE_PROJECT_SAVE_DIR")
-        if not root:
-            return None
-        # Always inspect live metadata, even when a caller supplied the name. A failed
-        # lookup must fail the best-effort save, not guess a path and move the document.
-        open_docs = (cb.call("doc_list", {}) or {}).get("docs", [])
-        entry = next((e for e in open_docs
-                      if isinstance(e, dict) and e.get("doc_id") == doc_id), {})
-        if entry.get("origin_kind") == "gui":
-            # c259: every add_features batch rewrote the user's open base.step+ (cache.*
-            # included) and cleared its dirty flag, so a broken intermediate state became
-            # the file on disk with no unsaved marker and no hostd crash snapshot.
-            return None
-        # Non-study authored edits preserve source-save behavior, but another GUI
-        # document owns its file. Preserve our work separately instead of replacing it.
-        current = _native_deliverable_path(entry)
-        chosen_by_harness = False
-        if current and user_doc_open_at(open_docs, current, doc_id) is None:
-            path = Path(current)
-        else:
-            path = Path(_new_project_deliverable_path(
-                root, name or entry.get("name"), doc_id, ".step+", open_docs))
-            chosen_by_harness = True
-        r = cb.call("doc_save", {"doc_id": doc_id, "path": str(path)})
-        written = r.get("path", str(path)) if isinstance(r, dict) else str(path)
-        if not os.path.exists(written):
-            return None
-        if chosen_by_harness:
-            note_harness_saved_path(doc_id, written)
-        try:  # optional Box cloud mirror — spools the project only; uploads drain later
-            from services.plm import box_mirror
-            box_mirror.notify_saved_path(written)
-        except Exception:  # noqa: BLE001 — a mirror must never fail a save
-            pass
-        return written
-    except Exception as exc:  # noqa: BLE001
-        if getattr(exc, "code", None) == "engine_connection_lost":
-            raise
+    with _PROJECT_SAVE_LOCKS_GUARD:
+        lock = _PROJECT_SAVE_LOCKS.setdefault(doc_id, threading.Lock())
+    with lock:
+        return _project_save_locked(doc_id, name)
+
+
+def _project_save_locked(doc_id: Optional[str], name: Optional[str]) -> Optional[str]:
+    if not doc_id:
         return None
+    root = root_value("CHUDWARE_PROJECT_SAVE_DIR")
+    open_docs = (cb.call("doc_list", {}) or {}).get("docs", [])
+    entry = next((e for e in open_docs
+                  if isinstance(e, dict) and e.get("doc_id") == doc_id), None)
+    if entry is None:
+        raise CoreError(f"Document {doc_id} is no longer open", code="document_not_found")
+    if entry.get("human_dirty"):
+        raise CoreError("Document contains unsaved human edits", code="human_dirty",
+                        detail={"doc_id": doc_id})
+    current = _native_deliverable_path(entry)
+    chosen_by_harness = False
+    if current:
+        path = Path(current)
+    elif root:
+        path = Path(_new_project_deliverable_path(
+            root, name or entry.get("name"), doc_id, ".step+", open_docs))
+        chosen_by_harness = True
+    else:
+        raise CoreError("No native destination or project save directory",
+                        code="no_project_save_dir", detail={"doc_id": doc_id})
+    r = cb.call("doc_save", {"doc_id": doc_id, "path": str(path),
+                              "if_no_human_dirty": True})
+    if r.get("ok") is False:
+        raise CoreError(str(r.get("message") or r.get("error") or "doc_save refused"),
+                        code=str(r.get("code") or "save_failed"), detail=r)
+    written = r.get("path", str(path))
+    if not os.path.isfile(written):
+        raise CoreError(f"doc_save did not write {written}", code="save_failed")
+    if chosen_by_harness:
+        note_harness_saved_path(doc_id, written)
+    _note_session_saved(doc_id, written)
+    try:
+        from services.plm import box_mirror
+        box_mirror.notify_saved_path(written)
+    except Exception:  # noqa: BLE001 — a mirror must never fail a save
+        pass
+    return written
 
 
-# ---------------------------------------------------------------------------
-# Terminal save sweep — nothing the agent built is left "potentially lost".
-# ---------------------------------------------------------------------------
-# hostd retires an abandoned doc to the crash-recovery ORPHAN tier when
-# `path.empty() || dirty || isAutosavePath(path)` (core/hostd/server.cpp::gcCloseDoc), and
-# everything in that tier is offered back through the GUI's "Recover unsaved parts?"
-# prompt. Nothing closes the documents a run built — services/agent/loop.py's
-# `_terminal_autosave_close_docs` was removed and the C++ mission path only
-# doc_saves the one doc a DAG node is on — so every agent doc without a real backing file
-# eventually became a "part potentially lost" row. Measured on the reporting user's
-# machine 2026-08-05: eight retired in the same second at the 30-min agent GC grace
-# (`CHUDWARE_DOC_GC_AGENT_GRACE_S`), then all eight opened as tabs when he accepted.
-#
-# The fix is to SAVE, not to close. Closing would fan out doc.closed and destroy the GUI
-# mirror tab the user browses after a run — the whole reason agent-origin docs get the
-# long GC floor in the first place. A doc saved to a real project file is simply closed
-# when its grace expires, with nothing left behind to "recover".
-_TOUCHED_DOCS: list = []
+def _note_session_saved(doc_id: str, path: str) -> None:
+    try:
+        from services.plm.ai_vc import note_session_saved
+        note_session_saved(doc_id, path)
+    except Exception:  # noqa: BLE001 — checkpoint bookkeeping must not undo a save
+        pass
 
 
-def note_touched_doc(doc_id: Optional[str]) -> None:
-    """Record a doc this process created or resumed, for the terminal sweep.
-
-    A list, not a set: order is the order the run built them, which is the order the
-    sweep reports and the order a human reads. Successful close evicts the document.
-    """
-    claim_process_doc(doc_id)   # creating/resuming a doc is also a cross-process claim on it
-    if doc_id and doc_id not in _TOUCHED_DOCS:
-        _TOUCHED_DOCS.append(doc_id)
-
-
-# doc_id -> the doc's path when this process discarded it with close_part(discard=True) but
-# hostd kept it alive (detached: an agent run or another client still holds it). The
-# terminal sweep must honour the discard instead of saving the dropped state over the file
-# (live 2026-09-24: the stale "Wheel End" doc the agent discarded was swept over the
-# rebuilt Wheel End it had just saved to the same path). Keyed with the path because doc
-# ids are reused across engine restarts.
-_DISCARDED_DOCS: dict = {}
+def persist_result(doc_id: str, out: dict, name: Optional[str] = None) -> None:
+    """Annotate an already-applied mutation with its independent persistence outcome."""
+    try:
+        written = _project_save(doc_id, name)
+        if not written:
+            raise CoreError("doc_save wrote nothing", code="save_failed")
+        out["saved_path"] = written
+        out["persisted"] = True
+    except Exception as exc:  # noqa: BLE001
+        out["persisted"] = False
+        out["persist_error"] = {
+            "code": getattr(exc, "code", None) or "save_failed",
+            "message": str(exc),
+            "detail": getattr(exc, "detail", None),
+        }
 
 
-def note_discarded_doc(doc_id: Optional[str]) -> None:
+# Records are keyed by trusted owner, turn, and canonical workspace. A sequence
+# protects a newer mutation from being removed by an older in-flight save.
+_TOUCHED_DOCS: dict = {}
+_TOUCHED_LOCK = threading.Lock()
+_TOUCHED_SEQUENCE = 0
+
+
+def _touch_scope(run_id=None) -> tuple:
+    agent = cb.CURRENT_AGENT.get()
+    turn = run_id if run_id is not None else (agent[0] if isinstance(agent, tuple) else None)
+    workspace = root_value("CHUDWARE_PROJECT_DIR") or root_value("CHUDWARE_FS_ROOT")
+    save_root = root_value("CHUDWARE_PROJECT_SAVE_DIR")
+    def canonical(path):
+        return os.path.realpath(os.path.expanduser(path)) if path else ""
+    return owner_key(), turn, canonical(workspace), canonical(save_root)
+
+
+def _file_stamp(path: str) -> Optional[dict]:
+    try:
+        st = os.stat(path)
+        if stat.S_ISREG(st.st_mode):
+            return {"size": st.st_size, "mtime_ns": st.st_mtime_ns, "ino": st.st_ino}
+    except OSError:
+        pass
+    return None
+
+
+def _covers_touch(record: dict, revision, metadata_revision) -> bool:
+    return (type(record.get("revision")) is int and record["revision"] >= 0 and
+            type(record.get("metadata_revision")) is int and record["metadata_revision"] >= 0 and
+            type(revision) is int and type(metadata_revision) is int and
+            revision >= record["revision"] and metadata_revision >= record["metadata_revision"])
+
+
+def note_touched_doc(doc_id: Optional[str], *, row: Optional[dict] = None) -> None:
+    """Record the touched revision and native binding from the existing engine listing."""
+    global _TOUCHED_SEQUENCE
     if not doc_id:
         return
-    path = None
+    claim_process_doc(doc_id)
+    row = row if isinstance(row, dict) else {}
+    native_path = row.get("path")
+    saved_at_touch = None
     try:
-        path = next((e.get("path") for e in (cb.call("doc_list", {}) or {}).get("docs", [])
-                     if isinstance(e, dict) and e.get("doc_id") == doc_id), None)
-    except Exception:  # noqa: BLE001 — an unknown path still records the discard intent
+        stamp = row.get("file_stamp")
+        if (not row.get("dirty") and isinstance(native_path, str) and
+                native_path.lower().endswith(".step+") and not _is_recovery_path(native_path) and
+                isinstance(stamp, dict) and _file_stamp(native_path) == stamp):
+            saved_at_touch = {"path": native_path, "revision": row.get("saved_revision"),
+                              "metadata_revision": row.get("saved_metadata_revision"),
+                              "file_stamp": stamp}
+    except OSError:
         pass
-    _DISCARDED_DOCS[doc_id] = path
+    scope = _touch_scope()
+    with _TOUCHED_LOCK:
+        _TOUCHED_SEQUENCE += 1
+        records = _TOUCHED_DOCS.setdefault(scope, {})
+        prior = records.get(str(doc_id), {})
+        revisions = {}
+        stale = False
+        for key in ("revision", "metadata_revision"):
+            current, previous = row.get(key), prior.get(key)
+            if type(current) is int and type(previous) is int:
+                stale = stale or current < previous
+                revisions[key] = max(current, previous)
+            else:
+                revisions[key] = current
+        record = {
+            "sequence": _TOUCHED_SEQUENCE,
+            "name": (prior.get("name") if stale else row.get("name")) or prior.get("name"),
+            "path": (prior.get("path") if stale else row.get("path")) or prior.get("path"),
+            **revisions,
+        }
+        saved = (saved_at_touch if saved_at_touch and
+                 _covers_touch(record, saved_at_touch.get("revision"),
+                               saved_at_touch.get("metadata_revision")) else prior.get("saved"))
+        if saved and _covers_touch(record, saved.get("revision"), saved.get("metadata_revision")):
+            record["saved"] = saved
+        records[str(doc_id)] = record
+
+
+def note_document_saved(doc_id: str, result: dict) -> None:
+    """Remember a verified save receipt without confusing another document's file."""
+    revision = result.get("saved_revision")
+    metadata_revision = result.get("metadata_revision")
+    path = result.get("path")
+    if (type(revision) is not int or type(metadata_revision) is not int or
+            not isinstance(path, str) or not path.lower().endswith(".step+")):
+        return
+    scope = _touch_scope()
+    with _TOUCHED_LOCK:
+        relevant = any(key[0] == scope[0] and key[2:] == scope[2:] and doc_id in docs
+                       for key, docs in _TOUCHED_DOCS.items())
+    if not relevant:
+        return
+    try:
+        row = cb._document_row(doc_id)
+        if (not row or not isinstance(row.get("path"), str) or
+                os.path.realpath(row["path"]) != os.path.realpath(path) or
+                row.get("saved_revision", -1) < revision or
+                row.get("saved_metadata_revision", -1) < metadata_revision or
+                _is_recovery_path(path)):
+            return
+        stamp = row.get("file_stamp")
+        if not isinstance(stamp, dict) or _file_stamp(path) != stamp:
+            return
+    except (OSError, TypeError, ValueError):
+        return
+    saved = {"path": path, "revision": revision, "metadata_revision": metadata_revision,
+             "file_stamp": stamp}
+    with _TOUCHED_LOCK:
+        for key, docs in _TOUCHED_DOCS.items():
+            if key[0] != scope[0] or key[2:] != scope[2:]:
+                continue
+            record = docs.get(doc_id)
+            if record and _covers_touch(record, revision, metadata_revision):
+                docs[doc_id] = {**record, "path": path, "saved": saved}
+
+
+def _known_touched_saved_path(doc_id: str) -> Optional[str]:
+    """Return a known current deliverable, never an older path over recovery work."""
+    with _TOUCHED_LOCK:
+        record = _TOUCHED_DOCS.get(_touch_scope(), {}).get(doc_id) or {}
+        saved = record.get("saved") or {}
+    path = saved.get("path")
+    if (not path or not _covers_touch(record, saved.get("revision"),
+                                      saved.get("metadata_revision")) or
+            _file_stamp(path) != saved.get("file_stamp")):
+        return None
+    try:
+        if cb.active_daemon_mode():
+            listing = cb.call("recovery_list", {}) or {}
+            entries = listing.get("entries")
+            if not isinstance(entries, list) or any(
+                    isinstance(entry, dict) and entry.get("doc_id") == doc_id and
+                    entry.get("same_session") is True for entry in entries):
+                return None
+    except Exception:  # noqa: BLE001 — unknown recovery state must not hide newer work
+        return None
+    return path
+
+
+def forget_touched_doc(doc_id: str, run_id=None) -> None:
+    with _TOUCHED_LOCK:
+        records = _TOUCHED_DOCS.get(_touch_scope(run_id), {})
+        records.pop(doc_id, None)
+
+
+def rollback_hidden_features(tree: Any) -> list[str]:
+    """Return IDs strictly after an active rollback bar, in history order."""
+    if not isinstance(tree, dict) or not isinstance(tree.get("rollback_after"), str):
+        return []
+    features = tree.get("features")
+    if not isinstance(features, list):
+        return []
+    ids = [str(f.get("id")) for f in features if isinstance(f, dict) and f.get("id")]
+    after = tree["rollback_after"]
+    if after == "start":
+        return ids
+    return ids[ids.index(after) + 1:] if after in ids else []
+
+
+def touched_rollback_warnings(run_id=None) -> list[dict]:
+    """Report unbuilt suffixes of this turn's touched documents without saving them."""
+    with _TOUCHED_LOCK:
+        docs = list(_TOUCHED_DOCS.get(_touch_scope(run_id), {}))
+    warnings = []
+    for did in docs:
+        try:
+            tree = (cb.call("doc_tree", {"doc_id": did}) or {}).get("tree") or {}
+            hidden = rollback_hidden_features(tree)
+            if not hidden:
+                continue
+            after = tree["rollback_after"]
+            warnings.append({
+                "doc_id": did, "after": after, "hidden_features": hidden,
+                "warning": (f"WARNING: {did} is rolled back after {after}; unbuilt features: "
+                            f"{', '.join(hidden)}. Repair them and roll to the end before "
+                            "presenting the part as complete."),
+            })
+        except Exception as exc:  # noqa: BLE001
+            warnings.append({"doc_id": did, "warning": (
+                f"WARNING: could not inspect {did} for an active rollback: {exc}")})
+    return warnings
+
+
 
 
 def user_doc_open_at(open_docs: list, path: str, doc_id: Optional[str]) -> Optional[dict]:
@@ -2127,9 +2431,7 @@ def user_doc_open_at(open_docs: list, path: str, doc_id: Optional[str]) -> Optio
     origin_kind "gui") and whose file is `path` — or None.
 
     save_part refuses to write another document over that file: the user's tab would keep
-    the old model (none of ITS revisions changed, so nothing reaches the viewport) and a
-    later save of the tab would put the old model back over the new file. A user doc the
-    agent close_part(discard=True)-ed (hostd degraded the close to a detach) is not held.
+    the old model, and a later save would put that old model back over the new file.
     """
     if not path:
         return None
@@ -2140,8 +2442,6 @@ def user_doc_open_at(open_docs: list, path: str, doc_id: Optional[str]) -> Optio
         did, p = e.get("doc_id"), e.get("path")
         if not did or did == doc_id or not isinstance(p, str) or not p:
             continue
-        if did in _DISCARDED_DOCS and _DISCARDED_DOCS[did] == p:
-            continue
         if os.path.realpath(p) == want:
             return e
     return None
@@ -2149,134 +2449,157 @@ def user_doc_open_at(open_docs: list, path: str, doc_id: Optional[str]) -> Optio
 
 
 def _needs_project_save(entry: dict) -> bool:
-    """True when this doc holds content that is NOT yet in a real user file.
-
-    Mirrors hostd's own retire test (`gcCloseDoc`): no path, unsaved edits, or a path
-    that is only a crash-recovery autosave. A doc with no features, components or
-    studies is skipped — hostd purges those instead of retiring them, so saving one
-    would create a file for nothing. The engine's `empty` flag counts geometry only,
-    so a study-only document (a hydraulic circuit, piping network, vessel or duct
-    sizing) reads `empty` yet carries the user's whole design: it is saved.
-    """
-    if not ((entry.get("feature_count") or 0) or (entry.get("component_count") or 0)):
-        try:
-            studies = (cb.call("sim_study_list", {"doc_id": entry.get("doc_id")})
-                       or {}).get("studies")
-        except Exception:  # noqa: BLE001 — an unreadable study list reads as none
-            studies = None
-        if not studies:
-            return False
-    elif entry.get("empty"):
-        return False
+    """A touched doc needs saving until its native file reflects its current state."""
     path = entry.get("path") or ""
-    if not isinstance(path, str) or not path.strip():
+    if not isinstance(path, str) or not path.strip() or not path.lower().endswith(".step+"):
+        return True
+    if not os.path.isfile(path):
         return True
     if entry.get("dirty"):
+        return True
+    rev, saved = entry.get("revision"), entry.get("saved_revision")
+    if type(rev) is int and type(saved) is int and rev > saved:
         return True
     try:
         return _is_recovery_path(path)
     except OSError:
-        return False
+        return True
 
 
-def _reproducible_import_sources(entry: dict) -> Optional[list]:
-    """Source files that rebuild this doc exactly, or None when it holds authored work.
-
-    The engine lists native source paths for unchanged detached opens, and neutral
-    source paths while every feature remains an unmodified import. Any authored
-    change empties it. Such a doc is scratch — an agent's body-roster probe import — and
-    writing it into the project root duplicated a source file the user already has
-    (2026-09-24, `_frame624_2026-09-07.step+`). hostd applies the same test and simply
-    closes it at GC instead of retiring it to the recovery tier (hostd/autosave.cpp
-    docListRowIsReproducible). A missing source leaves it authored-equivalent: saved.
-    """
-    sources = entry.get("reproducible_from")
-    if not isinstance(sources, list) or not sources:
-        return None
-    for src in sources:
-        if not (isinstance(src, str) and os.path.isabs(src) and os.path.isfile(src)):
-            return None
-        if entry.get("native_source_path") == src and _is_recovery_path(src):
-            return None  # a recovered snapshot still needs a real project deliverable
-    return list(sources)
 
 
-def save_touched_docs() -> dict:
-    """Save every doc this run built that has no real user file yet. Never raises.
-
-    Scope is deliberately narrow: docs this process created/resumed (`_TOUCHED_DOCS`)
-    plus open agent/mcp docs with no writer outside this worker's writer group. An
-    untouched doc held by another writer may belong to another workspace. A doc whose
-    `origin_kind` is `gui` is the USER's own and is never touched, however unsaved it
-    looks — that is exactly the work the recovery prompt exists to protect.
-
-    A missing `CHUDWARE_PROJECT_SAVE_DIR` is benign only when there is no authored
-    agent document waiting to be delivered. If a touched document needs a real user
-    file, `persistence_failure` identifies the affected documents so the turn cannot
-    honestly report durable success.
-    """
-    out: dict = {
-        "saved": [],
-        "skipped": [],
-        "errors": [],
-        "persistence_failure": None,
-    }
-    try:
-        rows = [e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
-                if isinstance(e, dict) and e.get("doc_id")]
-    except Exception as exc:  # noqa: BLE001 — a terminal sweep never fails a turn
-        out["errors"].append(f"doc_list: {type(exc).__name__}: {exc}")
+def save_touched_docs(run_id=None) -> dict:
+    """Persist only mutations belonging to this turn and workspace."""
+    out: dict = {"saved": [], "skipped": [], "skipped_human_edits": [],
+                 "errors": [], "warnings": [], "persistence_failure": None}
+    scope = _touch_scope(run_id)
+    with _TOUCHED_LOCK:
+        touched = dict(_TOUCHED_DOCS.get(scope, {}))
+    if not touched:
         return out
+    try:
+        rows = {e["doc_id"]: e for e in (cb.call("doc_list", {}) or {}).get("docs", [])
+                if isinstance(e, dict) and e.get("doc_id")}
+    except Exception as exc:  # noqa: BLE001
+        out["warnings"].append({
+            "reason": "doc_list_unavailable",
+            "error": f"{type(exc).__name__}: {exc}",
+            "documents": [{"doc_id": did, "path": record.get("path")}
+                          for did, record in touched.items()],
+        })
+        return out
+    recovery = None
 
-    pending: list[dict] = []
-    for e in rows:
-        did = e["doc_id"]
-        origin = e.get("origin_kind")
-        ours = did in _TOUCHED_DOCS or (
-            origin in ("mcp", "agent") and not e.get("other_writer")
-        )
-        if not ours or origin == "gui":
+    def retire(did):
+        with _TOUCHED_LOCK:
+            records = _TOUCHED_DOCS.get(scope, {})
+            if records.get(did, {}).get("sequence") == touched[did]["sequence"]:
+                records.pop(did, None)
+            if not records:
+                _TOUCHED_DOCS.pop(scope, None)
+
+    def resolve_missing(did):
+        nonlocal recovery
+        if recovery is None:
+            recovery = []
+            try:
+                if cb.active_daemon_mode():
+                    result = cb.call("recovery_list", {}) or {}
+                    recovery = [entry for entry in result.get("entries", [])
+                                if isinstance(entry, dict) and entry.get("same_session") is True]
+            except Exception:  # noqa: BLE001 — unknown is never proof of persistence
+                pass
+        with _TOUCHED_LOCK:
+            record = _TOUCHED_DOCS.get(scope, {}).get(did) or touched[did]
+        item = {"doc_id": did, "name": record.get("name")}
+        saved = record.get("saved") or {}
+        path = saved.get("path") or record.get("path")
+        candidates = [entry for entry in recovery if entry.get("doc_id") == did]
+        current = next((entry for entry in candidates if entry.get("id") and
+                        _covers_touch(record, entry.get("revision"),
+                                      entry.get("metadata_revision"))), None)
+        if current:
+            item.update(reason="preserved_in_recovery", recovery_id=current["id"],
+                        recovery_hint="Recover unsaved parts, or call recover_parts(all=True).")
+            if path:
+                item["path"] = path
+            out["skipped"].append(item)
+            retire(did)
+            return
+        replacement = None
+        if isinstance(path, str) and path.lower().endswith(".step+"):
+            want = os.path.realpath(path)
+            replacement = next((other for other in rows.values()
+                if isinstance(other.get("path"), str) and
+                os.path.realpath(other["path"]) == want), None)
+        if saved and _covers_touch(record, saved.get("revision"), saved.get("metadata_revision")):
+            stamp = _file_stamp(saved["path"])
+            if stamp and stamp == saved.get("file_stamp"):
+                if replacement and replacement.get("file_stamp") != stamp:
+                    replacement = None
+                item.update(path=saved["path"],
+                            reason="reopened" if replacement else "already_saved")
+                if replacement:
+                    item["open_doc_id"] = replacement["doc_id"]
+                out["skipped"].append(item)
+                retire(did)
+                return
+        item.update(reason="missing_unverified",
+                    recovery_hint="Check Recover unsaved parts or call recover_parts(all=True).")
+        if path:
+            item["path"] = path
+        if candidates and candidates[0].get("id"):
+            item["older_recovery_id"] = candidates[0]["id"]
+        out["warnings"].append(item)
+
+    for did in touched:
+        e = rows.get(did)
+        if e is None:
+            resolve_missing(did)
             continue
-        if did in _DISCARDED_DOCS and _DISCARDED_DOCS[did] == e.get("path"):
-            out["skipped"].append({"doc_id": did, "name": e.get("name"),
-                                   "reason": "discarded"})
+        item = {"doc_id": did, "name": e.get("name")}
+        if e.get("human_dirty"):
+            out["skipped_human_edits"].append(item)
             continue
         if not _needs_project_save(e):
-            out["skipped"].append({"doc_id": did, "name": e.get("name"),
-                                   "reason": "already_saved"})
+            out["skipped"].append({**item, "reason": "already_saved"})
+            retire(did)
             continue
-        sources = _reproducible_import_sources(e)
-        if sources:
-            out["skipped"].append({"doc_id": did, "name": e.get("name"),
-                                   "reason": "reproducible_import",
-                                   "source_paths": sources})
-            continue
-        pending.append(e)
-
-    if not root_value("CHUDWARE_PROJECT_SAVE_DIR"):
-        if pending:
-            out["persistence_failure"] = {
-                "reason": "no_project_save_dir",
-                "docs": [
-                    {"doc_id": e["doc_id"], "name": e.get("name")}
-                    for e in pending
-                ],
-            }
-        else:
-            out["skipped"].append({"reason": "no_project_save_dir"})
-        return out
-
-    for e in pending:
-        did = e["doc_id"]
         try:
             written = _project_save(did, e.get("name"))
+            if not written:
+                raise CoreError("doc_save wrote nothing", code="save_failed")
+            out["saved"].append({**item, "path": written})
+            retire(did)
         except Exception as exc:  # noqa: BLE001
-            out["errors"].append(f"{did}: {type(exc).__name__}: {exc}")
-            continue
-        if written:
-            out["saved"].append({"doc_id": did, "name": e.get("name"), "path": written})
-        else:
-            out["errors"].append(f"{did}: doc_save wrote nothing")
+            if getattr(exc, "code", None) == "human_dirty":
+                out["skipped_human_edits"].append(item)
+            else:
+                code = getattr(exc, "code", None) or "save_failed"
+                if code in ("document_not_found", "doc_not_found", "not_found"):
+                    try:
+                        rows = {row["doc_id"]: row for row in
+                                (cb.call("doc_list", {}) or {}).get("docs", [])
+                                if isinstance(row, dict) and row.get("doc_id")}
+                    except Exception:  # noqa: BLE001
+                        pass
+                    else:
+                        if did not in rows:
+                            recovery = None  # the retirement may have just published a snapshot
+                            resolve_missing(did)
+                            continue
+                location = e.get("path")
+                suffix = f" (last native path: {location})" if location else ""
+                out["errors"].append(f"{did}: {code}: {exc}{suffix}")
+                if code == "no_project_save_dir":
+                    failure = out["persistence_failure"]
+                    if failure is None:
+                        failure = out["persistence_failure"] = {
+                            "reason": code, "docs": []}
+                    failure["docs"].append(item)
+    if out["skipped_human_edits"]:
+        out["persistence_failure"] = {
+            "reason": "skipped_human_edits", "docs": out["skipped_human_edits"]}
     try:
         # Optional Box cloud mirror — STARTED, never awaited. This used to drain
         # synchronously with a 90 s budget because "the agent worker is a fresh fork per
@@ -2295,6 +2618,44 @@ def save_touched_docs() -> dict:
     return out
 
 
+def persistence_warning(persistence: dict) -> tuple[list[str], str]:
+    """Describe unsaved or unverified work without changing the turn outcome."""
+    warnings = [str(item) for item in (persistence.get("errors") or [])]
+    for item in persistence.get("warnings") or []:
+        if not isinstance(item, dict):
+            warnings.append(str(item))
+            continue
+        if item.get("reason") == "doc_list_unavailable":
+            docs = item.get("documents") or []
+            names = ", ".join(
+                f"{doc.get('doc_id')} ({doc['path']})" if doc.get("path") else str(doc.get("doc_id"))
+                for doc in docs if isinstance(doc, dict))
+            warnings.append(f"could not check document persistence: {item.get('error', 'unavailable')}" +
+                            (f"; affected: {names}" if names else ""))
+            continue
+        doc = str(item.get("doc_id") or "document")
+        description = f"{doc}: the latest edits could not be verified after the document closed"
+        if item.get("path"):
+            description += f" (last native path: {item['path']})"
+        if item.get("older_recovery_id"):
+            description += f"; an older recovery snapshot is available ({item['older_recovery_id']})"
+        warnings.append(description)
+    failure = persistence.get("persistence_failure")
+    if failure:
+        reason = failure.get("reason") if isinstance(failure, dict) else failure
+        if reason and not any(str(reason) in warning for warning in warnings):
+            docs = failure.get("docs", []) if isinstance(failure, dict) else []
+            names = ", ".join(str(item.get("name") or item.get("doc_id"))
+                              for item in docs if isinstance(item, dict))
+            warnings.append(str(reason) + (f": {names}" if names else ""))
+    if not warnings:
+        return [], ""
+    notice = ("\n\n**Save warning:** " + "; ".join(warnings) +
+              ". Work may still be open; check the project files and Recover unsaved parts "
+              "or call `recover_parts(all=True)` for available snapshots.")
+    return warnings, notice
+
+
 # doc_id -> engine revision at the doc's last autosave. Each autosave serializes the
 # full doc to disk; skipping unchanged docs turns the idle 60s sweep into a no-op.
 _AUTOSAVE_LAST_REV: dict = {}
@@ -2304,11 +2665,11 @@ def _autosave_all_open() -> None:
     """Autosave every open document THAT CHANGED since its last autosave (the engine's
     monotonic per-doc revision is the change signal; docs without one are always saved).
     Called on the periodic timer and before a heavy solve so a transport timeout that
-    kills the server can never lose an unrelated open part (Bug R-1).
+    kills the server can never lose an unrelated open part.
 
-    No-op in daemon mode — see _autosave, which owns that decision. Returning early here as
-    well only skips a doc_list the sweep would waste."""
-    if cb._daemon_mode():
+    LEGACY in-process engine only: in daemon mode (the default) hostd's autosave scheduler owns
+    crash protection and this returns at once — see _autosave, which owns that decision."""
+    if cb.active_daemon_mode():
         return
     try:
         docs = (cb.call("doc_list", {}) or {}).get("docs", [])
@@ -2320,11 +2681,10 @@ def _autosave_all_open() -> None:
         if not did:
             continue
         seen.add(did)
-        rev = d.get("revision") if isinstance(d, dict) else None
-        if isinstance(rev, (int, float)) and _AUTOSAVE_LAST_REV.get(did) == rev:
-            continue  # unchanged since last autosave — skip the full serialize
-        _autosave(did, d.get("name") if isinstance(d, dict) else None)
-        if isinstance(rev, (int, float)):
+        rev = (d.get("revision"), d.get("metadata_revision"))
+        if rev[0] is not None and _AUTOSAVE_LAST_REV.get(did) == rev:
+            continue
+        if _autosave(did, d.get("name")) and rev[0] is not None:
             _AUTOSAVE_LAST_REV[did] = rev
     # Forget closed docs so a re-created doc_id (engine ids reset/reuse) is never skipped.
     for gone in [k for k in _AUTOSAVE_LAST_REV if k not in seen]:
@@ -2394,7 +2754,7 @@ def start_periodic_autosave(interval_s: float | None = None) -> None:
     """
     import threading as _t
 
-    if cb._daemon_mode():
+    if cb.active_daemon_mode():
         # Daemon mode (the default): chudware-hostd runs THE one autosave scheduler (core/hostd/
         # autosave.cpp). Arming a per-process Timer chain here would recreate the
         # exact thread-leak class the shared daemon exists to kill.
@@ -2407,7 +2767,6 @@ def start_periodic_autosave(interval_s: float | None = None) -> None:
         return
     _AUTOSAVE_GEN[0] += 1
     gen = _AUTOSAVE_GEN[0]
-    _seed_autosave_revisions()
     timer = _t.Timer(_AUTOSAVE_INTERVAL_S, _tick_autosave, args=(gen,))
     timer.daemon = True
     timer.name = "chudware-autosave"
@@ -2415,19 +2774,6 @@ def start_periodic_autosave(interval_s: float | None = None) -> None:
     timer.start()
 
 
-def _seed_autosave_revisions() -> None:
-    """Baseline every currently-open doc's engine revision so the FIRST sweep skips
-    docs nobody has touched since the timer was armed (e.g. just-recovered docs whose
-    bytes are already on disk). Docs opened later still get one baseline autosave."""
-    try:
-        docs = (cb.call("doc_list", {}) or {}).get("docs", [])
-    except Exception:  # noqa: BLE001 — seeding is an optimization, never fatal
-        return
-    for d in docs:
-        did = d.get("doc_id") if isinstance(d, dict) else None
-        rev = d.get("revision") if isinstance(d, dict) else None
-        if did and isinstance(rev, (int, float)) and did not in _AUTOSAVE_LAST_REV:
-            _AUTOSAVE_LAST_REV[did] = rev
 
 
 def stop_periodic_autosave() -> None:
@@ -2448,107 +2794,10 @@ def autosave_p95_ms() -> float | None:
     return s[int(len(s) * 0.95)] * 1000.0
 
 
-def _autosave_session_key(step_path: Path) -> str:
-    """The session a snapshot belongs to, from its FILENAME (`{session}-{doc_id}.step+`).
-
-    Filename, not sidecar, deliberately: the count cap runs on every autosave, and reading
-    2,000 sidecar JSONs per snapshot to learn something the name already encodes is pure
-    I/O. Session ids are uuid4 hex (never contain "-"), so everything up to the FIRST "-"
-    is the session and the rest is the doc_id. A legacy untagged snapshot ("doc-cpp…")
-    yields "doc"; that groups all of them into one pseudo-session, which is exactly the
-    whole-or-nothing unit the retention rule wants for them too.
-
-    Matching on the prefix rather than a 12-hex pattern also keeps the rule honest for any
-    _SESSION_ID a caller injects: a key that failed to parse would silently drop this
-    process's own-session protection."""
-    return step_path.name[:-6].split("-", 1)[0]
 
 
-def _autosave_prune_plan(entries: list[tuple[float, Path]], cap: int,
-                         keep_sessions: int, own_session: str) -> list[Path]:
-    """Which snapshots the COUNT cap may delete: whole sessions, oldest first.
-
-    `entries` is [(mtime, path)]. Sessions rank by their NEWEST snapshot. Never
-    prunable: `own_session` (live crash-recovery data for the running process) and the
-    newest `keep_sessions` sessions. Sessions are then dropped WHOLE, oldest first, until
-    the surviving count is within `cap` — and if no whole prunable session is left, the
-    cap simply goes unmet. The invariant outranks the cap: a session that survives a
-    prune is always fully recoverable, so no part is ever silently half-restored.
-    """
-    by_session: dict[str, list[Path]] = {}
-    newest: dict[str, float] = {}
-    for mt, p in entries:
-        key = _autosave_session_key(p)
-        by_session.setdefault(key, []).append(p)
-        if mt > newest.get(key, -1.0):
-            newest[key] = mt
-    ranked = sorted(by_session, key=lambda k: newest[k], reverse=True)  # newest session first
-    protected = set(ranked[:max(0, keep_sessions)]) | {own_session}
-    doomed: list[Path] = []
-    surviving = len(entries)
-    for key in reversed(ranked):  # oldest session first
-        if surviving <= cap:
-            break
-        if key in protected:
-            continue
-        doomed.extend(by_session[key])
-        surviving -= len(by_session[key])
-    return doomed
 
 
-def _prune_autosaves(max_age_days: float = _AUTOSAVE_MAX_AGE_DAYS,
-                     max_files: int = 0, keep_sessions: int = 0) -> int:
-    """Delete autosave .step+ / sidecars older than max_age_days (by mtime).
-
-    *max_files* (0 = use _AUTOSAVE_MAX_FILES) additionally caps how many snapshots may
-    remain. The age rule alone never bounded anything in practice — the worker forks per
-    turn, so every snapshot on disk is young — which is how the directory reached 39k
-    files in one day.
-
-    The count cap evicts WHOLE SESSIONS, oldest first, keeping the newest
-    *keep_sessions* (0 = _AUTOSAVE_KEEP_SESSIONS) plus this process's own. A snapshot is
-    potentially-unsaved user work and nothing on disk says otherwise, so the cap's safety
-    rule is structural rather than a guess: a session survives entirely or not at all, and
-    the cap yields to that invariant rather than shaving a session down.
-
-    CAVEAT, stated rather than papered over: the AGE prune is still per-file, so a session
-    straddling the cutoff loses only its stale snapshots. That is the pre-existing,
-    documented contract (CHUDWARE_AUTOSAVE_MAX_AGE_DAYS, default 7) — work nobody saved in
-    a week is deliberately not kept forever. Only the count cap, which deletes YOUNG files,
-    is session-granular. Returns the number of snapshots deleted.
-    """
-    n = 0
-    cutoff = time.time() - max_age_days * 86400.0
-    try:
-        entries: list[tuple[float, Path]] = []
-        for p in _autosave_dir().glob("*.step+"):
-            try:
-                mt = p.stat().st_mtime
-            except OSError:
-                continue
-            if mt < cutoff:
-                try:
-                    p.unlink(missing_ok=True)
-                    p.with_suffix(".json").unlink(missing_ok=True)
-                    n += 1
-                except OSError:
-                    pass
-                continue
-            entries.append((mt, p))
-        cap = max_files or _AUTOSAVE_MAX_FILES
-        if cap > 0 and len(entries) > cap:
-            for p in _autosave_prune_plan(entries, cap,
-                                          keep_sessions or _AUTOSAVE_KEEP_SESSIONS,
-                                          _SESSION_ID):
-                try:
-                    p.unlink(missing_ok=True)
-                    p.with_suffix(".json").unlink(missing_ok=True)
-                    n += 1
-                except OSError:
-                    continue
-    except Exception:  # noqa: BLE001
-        pass
-    return n
 
 
 def _autosave_session_of(step_path: Path) -> tuple[Optional[str], float, str, str]:
@@ -2575,7 +2824,8 @@ def _recover_via_daemon() -> list:
     autosaves itself (core/hostd/autosave.cpp) — we just consume the daemon's
     {old_id: new_id} rebind map into _DOC_ALIASES instead of re-opening files.
     Waits briefly for the daemon's recovery pass (it runs right after the engine
-    loads), then re-hellos to fetch the final id_remap. Best-effort; never raises."""
+    loads), then re-hellos to fetch the final id_remap. Best-effort; never raises. The remap
+    carries no ordering, so NO recovered document is made current here."""
     out: list = []
     try:
         from . import daemon_bridge
@@ -2600,23 +2850,18 @@ def _recover_via_daemon() -> list:
                 _DOC_ALIASES[old] = new
             out.append({"path": None, "doc_id": new, "name": names.get(new, ""),
                         "original_doc_id": old})
-            _CUR["doc_id"] = new
     except Exception:  # noqa: BLE001
         pass
     return out
 
 
 def _recover_orphans_via_daemon(limit: int = 0) -> list:
-    """Open the daemon's orphan-tier docs (retired by clean shutdown / doc-GC —
-    never auto-opened; see core/hostd/autosave.h). Only called from the explicit
-    recover_parts tool, never at startup.
+    """Open retained daemon recovery entries explicitly, newest first.
 
-    Opens at most `limit` (0 = _RECOVER_MAX_DOCS) entries, NEWEST FIRST, one
-    recovery_open{"id":…} per entry rather than the old single recovery_open{"all":true}:
-    the tier holds up to CHUDWARE_ORPHAN_KEEP (50) crash survivors and reopening every
-    one of them left the engine unable to say which was "the part". `_RECOVER_SKIPPED`
-    records what was left in the tier — nothing is discarded, the next call reaches it.
-    Best-effort; never raises."""
+    The tier retains unconsumed work without an age/count cap. Reopening it all
+    can flood the engine, so `_RECOVER_SKIPPED` reports entries left for a
+    subsequent call with a larger limit. Best-effort; never raises.
+    """
     global _RECOVER_SKIPPED
     out: list = []
     try:
@@ -2628,23 +2873,30 @@ def _recover_orphans_via_daemon(limit: int = 0) -> list:
             return out
         # recoveryList() documents newest-first; sort defensively so the bound is
         # deterministic even if that ever changes.
-        entries.sort(key=lambda e: e.get("mtime_ms") or 0, reverse=True)
+        entries.sort(key=lambda e: e.get("captured_at") or 0, reverse=True)
         cap = limit or _RECOVER_MAX_DOCS
         chosen = entries[:cap] if cap > 0 else entries
         _RECOVER_SKIPPED += max(0, len(entries) - len(chosen))
+        newest_opened: list = []   # documents opened from the newest entry
         for meta in chosen:
             opened = (c.call("recovery_open", {"id": meta["id"]}) or {}).get("opened") or []
             for o in opened:
                 if not isinstance(o, dict):
                     continue
                 new_id = o.get("doc_id") or ""
-                old_id = meta.get("doc_id") or ""
+                old_id = o.get("original_doc_id") or ""
                 if old_id and new_id and old_id != new_id:
                     _DOC_ALIASES[old_id] = new_id
                 out.append({"path": meta.get("path"), "doc_id": new_id,
                             "name": meta.get("name", ""), "original_doc_id": old_id})
-                if new_id:
-                    _CUR["doc_id"] = new_id
+                if new_id and meta is chosen[0]:
+                    newest_opened.append(new_id)
+        # Adopt one only when it is unambiguously the newest capture: a single document from
+        # the newest entry, whose timestamp no other entry shares. Otherwise none is current.
+        newest_at = chosen[0].get("captured_at") or 0
+        if (len(newest_opened) == 1 and newest_at > 0
+                and [e.get("captured_at") or 0 for e in entries].count(newest_at) == 1):
+            _CUR["doc_id"] = newest_opened[0]
     except Exception:  # noqa: BLE001
         pass
     return out
@@ -2662,22 +2914,17 @@ def recover_autosaved(scope: str = "recent", include_orphaned: bool = False,
     deep history of crash recoveries; auto-opening all of it would flood the engine).
     limit: the most docs this call may reopen (0 = _RECOVER_MAX_DOCS), NEWEST FIRST.
     The rest stay on disk and are counted in `recover_skipped()`; a second call with a
-    bigger limit reaches them. Unbounded recovery is the autosave-debris footgun: on a
-    real pile scope="recent" opened 270 docs and scope="all" 1,803, after which no
-    doc-scoped call could resolve "the part". The bound applies to the STARTUP call in
-    server.py too, deliberately: silently auto-opening a 270-doc session is the same
-    flood, just without anyone asking for it. Prunes stale autosaves first.
+    bigger limit reaches them. The bound also applies to startup recovery, avoiding
+    a flood of similarly named open documents.
 
-    Daemon mode: recovery lives in the orphan tier — a crashed daemon's autosaves and
-    any crash-abandoned doc (GC-retired) are REGISTERED there, never auto-opened. A
-    clean app quit sends doc_discard, so the tier holds only genuine crash survivors.
-    recover_parts opens them DELIBERATELY; startup recovers nothing here (the hello
-    id_remap fallback is empty on a current daemon)."""
+    Daemon mode: hostd owns recovery. AI-only snapshots may be restored to their
+    original paths when safe; remaining orphan entries can be opened explicitly.
+    """
     global _RECOVER_SKIPPED
     _RECOVERED.clear()
     _RECOVER_SKIPPED = 0
     cap = limit or _RECOVER_MAX_DOCS
-    if cb._daemon_mode():
+    if cb.active_daemon_mode():
         out = _recover_via_daemon()  # [] on a current daemon (no auto-open)
         if include_orphaned:
             seen = {r.get("original_doc_id") for r in out}
@@ -2691,7 +2938,6 @@ def recover_autosaved(scope: str = "recent", include_orphaned: bool = False,
                         out.append(r)
         _RECOVERED.extend(out)
         return out
-    _prune_autosaves()
     out: list = []
     try:
         files = sorted(_autosave_dir().glob("*.step+"))
@@ -2742,9 +2988,6 @@ def recover_autosaved(scope: str = "recent", include_orphaned: bool = False,
                 if original and original != did:
                     _DOC_ALIASES[original] = did
                 _CUR["doc_id"] = did
-                vol = r.get("volume")
-                if isinstance(vol, (int, float)):
-                    _LAST_VOLUME[did] = vol
         except Exception:  # noqa: BLE001
             continue
     out.reverse()  # report newest first, matching the order they were chosen in
@@ -2835,24 +3078,80 @@ def _evict_old_jobs() -> None:
         del _JOBS[jid]
 
 
-def _start_job(kind: str, fn, progress: Optional[dict] = None) -> str:
+# Jobs on ONE document apply strictly in start order: document id -> (job id, Event set when
+# that job ends) for the NEWEST job on it. A later job waits for its predecessor's Event before
+# it touches the engine, so two quick add_features batches can never interleave.
+# Hostd independently serializes all mutating RPCs under its per-document lock, including
+# mutations issued by other tools and clients.
+_DOC_JOB_TAILS: dict = {}
+
+
+def _capture_turn_lease() -> Optional[tuple]:
+    """(connection pool, cancellation) of the turn call this thread is serving, or None.
+
+    Captured on the CALLER's thread: the socket lease is thread-local, so a job thread that
+    did not re-enter it would run on a standalone socket that a Stop never reaches."""
+    if not cb.active_daemon_mode():
+        return None
+    from . import daemon_bridge  # noqa: PLC0415 — zero cost on the legacy engine path
+    return daemon_bridge.current_turn_lease()
+
+
+def _lease_cancelled(lease: Optional[tuple]) -> bool:
+    """True once the user cancelled the tool call that owns `lease`."""
+    return bool(lease and getattr(lease[1], "cancelled", False))
+
+
+def _start_job(kind: str, fn, progress: Optional[dict] = None, *,
+               doc_id: Optional[str] = None) -> str:
+    """Run `fn` on a worker thread under the calling turn's connection lease.
+
+    `doc_id` queues the job behind any earlier job on the same document (first in, first
+    applied). A job ALWAYS ends "done" or "error": a BaseException is recorded as an error
+    too, so a poller never waits on a job whose thread died."""
     jid = "job-" + _uuid.uuid4().hex[:12]
+    lease = _capture_turn_lease()
+    finished = _threading.Event()
     with _JOB_LOCK:
         _evict_old_jobs()  # prune stale completed jobs so dict stays bounded
+        previous = _DOC_JOB_TAILS.get(doc_id) if doc_id else None
+        if doc_id:
+            _DOC_JOB_TAILS[doc_id] = (jid, finished)
         _JOBS[jid] = {"status": "running", "kind": kind, "result": None, "error": None,
                       "progress": progress if progress is not None else {},
-                      "started_at": time.time(), "done_at": None}
+                      "started_at": time.time(), "done_at": None,
+                      "queued_behind": previous[0] if previous else None}
+
+    def _retire_tail() -> None:
+        finished.set()
+        with _JOB_LOCK:
+            if doc_id and _DOC_JOB_TAILS.get(doc_id, (None,))[0] == jid:
+                del _DOC_JOB_TAILS[doc_id]
 
     def _run() -> None:
         try:
-            res = fn()
+            if previous is not None:
+                previous[1].wait()
+            if _lease_cancelled(lease):
+                raise CoreError("cancelled before execution", code="job_cancelled")
+            if lease is not None:
+                from .daemon_bridge import turn_connection_scope  # noqa: PLC0415
+                with turn_connection_scope(*lease):
+                    res = fn()
+            else:
+                res = fn()
             with _JOB_LOCK:
                 _JOBS[jid].update(status="done", result=res, done_at=time.time())
-        except Exception as e:  # noqa: BLE001
+        except BaseException as e:  # noqa: BLE001 — see the docstring: never stay "running"
             with _JOB_LOCK:
-                _JOBS[jid].update(status="error", error=str(e), done_at=time.time())
+                _JOBS[jid].update(
+                    status="error", done_at=time.time(),
+                    error=(str(e) if isinstance(e, Exception) else
+                           f"{type(e).__name__}: {e}" if str(e) else type(e).__name__))
                 if isinstance(e, CoreError):
                     _JOBS[jid].update(code=e.code, detail=e.detail)
+        finally:
+            _retire_tail()
 
     # Daemon thread: a long OpenFOAM/FEA solve must never block server (or test) shutdown.
     from services.worker_activity import start_background_thread
@@ -2860,6 +3159,9 @@ def _start_job(kind: str, fn, progress: Optional[dict] = None) -> str:
     try:
         start_background_thread(_run, name=f"chudware-job-{kind}")
     except BaseException:
+        if previous is not None:
+            previous[1].wait()
+        _retire_tail()
         with _JOB_LOCK:
             _JOBS.pop(jid, None)
         raise
@@ -2873,21 +3175,27 @@ _SYNC_SOLVE_BUDGET_S = float(os.environ.get("CHUDWARE_MCP_SYNC_BUDGET_S", "45") 
 
 
 def _solve_sync_or_handoff(kind: str, fn, progress: Optional[dict] = None,
-                           budget_s: float = _SYNC_SOLVE_BUDGET_S) -> dict:
-    """Run heavy work on the owning process's thread with a bounded inline reply wait.
+                           budget_s: float = _SYNC_SOLVE_BUDGET_S, *,
+                           doc_id: Optional[str] = None) -> dict:
+    """Run heavy work on a worker thread with a bounded inline reply wait.
 
-    Always runs on a worker thread (via _start_job). For a synchronous request we poll
-    the job up to `budget_s`; if it finishes we return the result inline (small solves
-    behave exactly as before). If it overruns, we LEAVE it running and return the job_id
-    for polling with get_job(). This does not make the work durable or cancellable.
+    Always runs on a worker thread (via _start_job), under this turn's connection lease. For a
+    synchronous request we poll the job up to `budget_s`; if it finishes we return the result
+    inline (small solves behave exactly as before). If it overruns, we LEAVE it running and
+    return the job_id for polling with get_job(). The job stops with the turn (Stop aborts its
+    socket) but is not restart-durable. `doc_id` applies jobs on one document in start order.
+    A cancelled call returns at once with cancelled:true; work already sent to the engine may
+    still have been applied, so the document must be read before retrying.
     """
-    jid = _start_job(kind, fn, progress)
-    deadline = time.time() + max(1.0, budget_s)
+    jid = _start_job(kind, fn, progress, doc_id=doc_id)
+    lease = _capture_turn_lease()
+    deadline = time.monotonic() + max(1.0, budget_s)
     # Adaptive poll: start fine (10 ms) so a fast op — the common modeling case now that
     # add_features routes through here — returns almost immediately, then back off to 100 ms so a
     # multi-second solve doesn't spin. Heavy-op handoff at `budget_s` is unaffected.
     interval = 0.01
-    while time.time() < deadline:
+    snap: dict = {}
+    while time.monotonic() < deadline:
         with _JOB_LOCK:
             snap = dict(_JOBS.get(jid, {}))
         st = snap.get("status")
@@ -2896,13 +3204,23 @@ def _solve_sync_or_handoff(kind: str, fn, progress: Optional[dict] = None,
         if st == "error":
             return {"ok": False, "error": snap.get("error", "solve failed"),
                     **{key: snap[key] for key in ("code", "detail") if key in snap}}
+        if _lease_cancelled(lease):
+            return {"ok": False, "status": "cancelled", "cancelled": True, "job_id": jid,
+                    "note": ("the call was cancelled; work already sent to the engine may still "
+                             "have been applied — read the document before retrying. "
+                             f"get_job('{jid}') reports how the job ended.")}
         time.sleep(interval)
         if interval < 0.1:
             interval = min(0.1, interval * 1.5)
-    return {"ok": True, "job_id": jid, "status": "running", "auto_backgrounded": True,
-            "note": (f"solve still running after {budget_s:.0f}s — continued in the BACKGROUND "
-                     f"to keep the tool reply responsive. This process-local job is not "
-                     f"restart-durable or cancellable. Poll get_job('{jid}').")}
+    out = {"ok": True, "job_id": jid, "status": "running", "auto_backgrounded": True,
+           "note": (f"solve still running after {budget_s:.0f}s — continued in the BACKGROUND "
+                    f"to keep the tool reply responsive. It stops with this turn but is not "
+                    f"restart-durable. Poll get_job('{jid}').")}
+    if snap.get("queued_behind"):
+        out["queued_behind"] = snap["queued_behind"]
+        out["note"] += (f" It is queued behind {snap['queued_behind']} on the same document "
+                        "and applies after it.")
+    return out
 
 
 # --- durable (out-of-process) sim jobs ---------------------------------------------------
@@ -3298,7 +3616,8 @@ def _material_registry_record(name: str) -> Optional[dict]:
     """Read a full registry record without inventing properties when the bridge is absent."""
     try:
         rec = cb.call("material_get", {"name": name}).get("result")
-    except Exception:  # noqa: BLE001 — no engine / RPC unavailable: not a resolution
+    except Exception as exc:  # noqa: BLE001 — no engine / RPC unavailable: not a resolution
+        _reraise_transport(exc)  # ... but a lost or draining engine is an outage, not a miss
         return None
     return rec if isinstance(rec, dict) else None
 
@@ -3848,10 +4167,9 @@ def _as_face_query(q: Union[str, dict]) -> dict:
 
 
 # --------------------------------------------------------------------------- close-up inspection
-# doc_render_view / doc_render_png only accept a WHOLE-PART camera direction (no bbox/eye
-# override). Close-up inspection therefore: (1) resolve the target, (2) pick a face-normal
-# (or fit) view dir, (3) render the whole part from that dir, (4) CROP the PNG to the
-# projected target bbox + margin and upscale. Caption is honest about the crop fallback.
+# Close-up inspection: (1) resolve the target, (2) pick a face-normal (or fit) view direction,
+# (3) have the engine render a FOCUSED frame of the target (see "focused close-ups" below), and
+# (4) overlay through the frame the engine echoes. The whole-part render only gives context.
 _RENDER_W = 512
 _RENDER_H = 400
 _RENDER_FIT = 0.85  # matches core/doc/session.cpp render_view_to_rgb
@@ -4030,12 +4348,14 @@ def _target_feature_roster(doc_id: str) -> tuple:
     """(features, owner_map) from doc_tree: the feature roster the tree lists ([{id,name,type}])
     and describe_part's feature->topology join table.
 
-    Never raises — an unreachable tree degrades to an empty roster so target resolution can still
-    report what it tried instead of masking the real error with an RPC failure.
+    Degrades to an empty roster when the engine refuses the tree read, so target resolution can
+    still report what it tried instead of masking the real error with an RPC failure. A
+    transport outage is not such a refusal and propagates.
     """
     try:
         tree = cb.call("doc_tree", {"doc_id": doc_id}) or {}
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        _reraise_transport(exc)
         return [], {}
     feats = [f for f in (((tree.get("tree") or {}).get("features")) or [])
              if isinstance(f, dict)]
@@ -4071,21 +4391,21 @@ def _features_named(feats: list, text) -> list:
 
 
 def _sid_match(doc_id: str, sid: str) -> Optional[dict]:
-    """The live doc_query match carrying this stable sid, or None.
-
-    The sid's first letter IS its kind (F face / E edge / V vertex — stable_sid), so only that
-    roster is scanned. Vertices aren't queryable, so a V sid never matches.
-    """
+    """Find a revision-scoped face or edge SID, refusing collisions."""
     want = str(sid).strip().lower()
+    found = []
     for of in {"f": ("face",), "e": ("edge",)}.get(want[:1], ("face", "edge")):
         try:
             res = cb.call("doc_query", {"doc_id": doc_id, "query": {"of": of}}) or {}
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            _reraise_transport(exc)
             continue
-        for m in res.get("matches") or []:
-            if str(m.get("sid") or "").lower() == want:
-                return m
-    return None
+        found.extend(m for m in res.get("matches") or []
+                     if isinstance(m, dict) and str(m.get("sid") or "").lower() == want)
+    if len(found) > 1:
+        raise ValueError(f"SID {sid!r} matches {len(found)} subshapes in this revision; "
+                         "use a geometry query with body and location to disambiguate.")
+    return found[0] if found else None
 
 
 def _resolve_feature_ref(doc_id: str, ref, feats: Optional[list] = None,
@@ -4139,11 +4459,10 @@ def _resolve_feature_ref(doc_id: str, ref, feats: Optional[list] = None,
 # boss owns the plate's 8582 mm^2 top; a 25 mm spout owns a bucket's 309048 mm^2 outer wall).
 # A caller that frames, tints or narrates "the boss" then lights up the entire part.
 #
-# The kernel's real provenance (CompileResult::tool_recs, the pre-boolean tool solid per
-# feature) never leaves C++: doc_query's per-face `owner_feature` is hardcoded null
-# (core/doc/picks.cpp), and eval_feature_overlap only reports pairwise common VOLUME between
-# tool solids, never per-face membership. So ownership is reconstructed here from the two
-# things Python CAN see, cheapest first:
+# The kernel's pre-boolean tool solids (CompileResult::tool_recs) never leave C++;
+# doc_query reports the owner_map attribution, but eval_feature_overlap only reports
+# pairwise common VOLUME between tool solids, never per-face membership. Refine the
+# owner_map join using the two things Python CAN see, cheapest first:
 #
 #   1. TOOL SCALE, from the AUTHORED params — no RPC. A feature's tool cannot create a face
 #      larger than its own cross-section: an r25 spout did not author an r165 wall, an r18
@@ -4307,11 +4626,27 @@ def _face_world_points(doc_id: str, match: dict) -> list:
     cut footprint."""
     try:
         fp = cb.call("doc_face_points", {"doc_id": doc_id, "selector": match}) or {}
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        _reraise_transport(exc)
         return []
     return [(float(p[0]), float(p[1]), float(p[2]))
             for p in (fp.get("points") or [])
             if isinstance(p, (list, tuple)) and len(p) >= 3]
+
+
+def _activate_tess(doc_id: str) -> tuple:
+    """(tessellation handle, doc_activate reply) for the document's CURRENT revision.
+
+    The AICM handle carries the revision, so it keys every per-revision cache here. doc_activate
+    serves the engine's warm compile (a JSON serialize); doc_rebuild would recompile and
+    re-tessellate the whole part just to hand back the same token. ("", {}) when the engine
+    has nothing to show; a transport outage propagates."""
+    try:
+        rb = cb.call("doc_activate", {"doc_id": doc_id}) or {}
+    except Exception as exc:  # noqa: BLE001
+        _reraise_transport(exc)
+        return "", {}
+    return ((rb.get("tess") or {}).get("aicm_path")) or "", rb
 
 
 _FACE_CLOUD_CACHE: dict = {}      # doc_id -> (revision token, {sid: [(x,y,z), ...]})
@@ -4324,12 +4659,8 @@ def _face_cloud_memo(doc_id: str) -> dict:
     attribution asks for several. The engine's tessellation handle carries the revision — the
     same invalidation trick _doc_mesh uses — so an edit empties this by itself and a describe/
     inspect/render burst over one unchanged model pays for each face exactly once."""
-    try:
-        rb = cb.call("doc_rebuild", {"doc_id": doc_id}) or {}
-        token = ((rb.get("tess") or {}).get("aicm_path")) or None
-    except Exception:  # noqa: BLE001
-        token = None
-    if token is None:
+    token, _ = _activate_tess(doc_id)
+    if not token:
         return {}                 # no revision to key on — never serve a stale cloud
     cached = _FACE_CLOUD_CACHE.get(doc_id)
     if cached and cached[0] == token:
@@ -4517,7 +4848,8 @@ def _face_attribution(doc_id: str, feats: Optional[list] = None,
         try:
             faces = (cb.call("doc_query", {"doc_id": doc_id, "query": {"of": "face"}})
                      or {}).get("matches") or []
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            _reraise_transport(exc)
             faces = []
 
     last_body = 0
@@ -4893,131 +5225,6 @@ def _camera_dir_for_target(matches: list, view: Optional[Union[str, dict]] = Non
     raise ValueError(f"Unsupported view spec {view!r}")
 
 
-def _part_render_frame(part_bbox: dict, view_dir: tuple,
-                       W: int = _RENDER_W, H: int = _RENDER_H) -> dict:
-    """Reproduce the orthographic projection frame of core render_view_to_rgb.
-
-    Returns {center, r, u, d, scale, cu, cv, W, H} so world points can be mapped to
-    screen pixels the same way the C++ software rasterizer does (fit scale 0.85).
-    """
-    c = _v3(part_bbox.get("center"))
-    d = _vnorm(view_dir)
-    up_ref = (0.0, 1.0, 0.0) if abs(d[2]) > 0.985 else (0.0, 0.0, 1.0)
-    r = _vnorm(_vcross(up_ref, d))
-    u = _vcross(d, r)  # already unit if r,d unit + orthogonal
-    u = _vnorm(u)
-
-    # Project the 8 corners of the part bbox to find screen extents (same as C++ mesh walk
-    # for axis-aligned bounds — exact for the bbox, slightly conservative for the mesh).
-    mn = _v3(part_bbox.get("min"))
-    mx = _v3(part_bbox.get("max"))
-    corners = [(x, y, z)
-               for x in (mn[0], mx[0])
-               for y in (mn[1], mx[1])
-               for z in (mn[2], mx[2])]
-    us, vs = [], []
-    for p in corners:
-        dp = _vsub(p, c)
-        us.append(_vdot(dp, r))
-        vs.append(_vdot(dp, u))
-    minu, maxu = min(us), max(us)
-    minv, maxv = min(vs), max(vs)
-    scale = _RENDER_FIT * min(W / max(maxu - minu, 1e-6), H / max(maxv - minv, 1e-6))
-    cu = 0.5 * (minu + maxu)
-    cv = 0.5 * (minv + maxv)
-    return {"center": c, "r": r, "u": u, "d": d, "scale": scale,
-            "cu": cu, "cv": cv, "W": W, "H": H}
-
-
-def _world_to_screen(pt, frame: dict) -> tuple:
-    dp = _vsub(_v3(pt), frame["center"])
-    pu = _vdot(dp, frame["r"])
-    pv = _vdot(dp, frame["u"])
-    sx = (pu - frame["cu"]) * frame["scale"] + frame["W"] / 2.0
-    sy = frame["H"] / 2.0 - (pv - frame["cv"]) * frame["scale"]
-    return (sx, sy)
-
-
-def _crop_rect_for_target(part_bbox: dict, target_bbox: dict, view_dir: tuple,
-                          margin: float = 0.15, zoom_factor: float = 1.0,
-                          W: int = _RENDER_W, H: int = _RENDER_H) -> dict:
-    """Pixel crop rectangle that frames the target's projected bbox.
-
-    margin: fractional padding of the projected target size (0.15 = 15% on each side).
-    zoom_factor: >1 tightens the crop (more zoom), <1 loosens. Clamped to keep a usable window.
-    Returns {x0,y0,x1,y1, method:"crop"} in pixel coords (inclusive-exclusive style for PIL).
-    """
-    frame = _part_render_frame(part_bbox, view_dir, W, H)
-    tmin = _v3(target_bbox.get("min"))
-    tmax = _v3(target_bbox.get("max"))
-    corners = [(x, y, z)
-               for x in (tmin[0], tmax[0])
-               for y in (tmin[1], tmax[1])
-               for z in (tmin[2], tmax[2])]
-    sxs, sys_ = [], []
-    for p in corners:
-        sx, sy = _world_to_screen(p, frame)
-        sxs.append(sx); sys_.append(sy)
-    minx, maxx = min(sxs), max(sxs)
-    miny, maxy = min(sys_), max(sys_)
-    # Ensure a minimum projected size so thin edges still crop to something visible.
-    if maxx - minx < 4:
-        mid = 0.5 * (minx + maxx); minx, maxx = mid - 2, mid + 2
-    if maxy - miny < 4:
-        mid = 0.5 * (miny + maxy); miny, maxy = mid - 2, mid + 2
-
-    zf = max(float(zoom_factor), 0.25)
-    # zoom_factor>1 → shrink the window around the target center.
-    cx, cy = 0.5 * (minx + maxx), 0.5 * (miny + maxy)
-    half_w = 0.5 * (maxx - minx) / zf
-    half_h = 0.5 * (maxy - miny) / zf
-    minx, maxx = cx - half_w, cx + half_w
-    miny, maxy = cy - half_h, cy + half_h
-
-    pad_x = max((maxx - minx) * float(margin), 4.0)
-    pad_y = max((maxy - miny) * float(margin), 4.0)
-    x0 = int(math.floor(minx - pad_x))
-    y0 = int(math.floor(miny - pad_y))
-    x1 = int(math.ceil(maxx + pad_x))
-    y1 = int(math.ceil(maxy + pad_y))
-    # Clamp to image; if the target projected off-frame, fall back to a center window.
-    x0 = max(0, min(x0, W - 1))
-    y0 = max(0, min(y0, H - 1))
-    x1 = max(x0 + 1, min(x1, W))
-    y1 = max(y0 + 1, min(y1, H))
-    # Keep a usable minimum crop so upscale has something to work with.
-    min_side = 32
-    if (x1 - x0) < min_side:
-        mid = (x0 + x1) // 2
-        x0 = max(0, mid - min_side // 2)
-        x1 = min(W, x0 + min_side)
-    if (y1 - y0) < min_side:
-        mid = (y0 + y1) // 2
-        y0 = max(0, mid - min_side // 2)
-        y1 = min(H, y0 + min_side)
-    return {"x0": x0, "y0": y0, "x1": x1, "y1": y1,
-            "method": "crop", "W": W, "H": H,
-            "view_dir": list(view_dir)}
-
-
-def _crop_png_to_rect(src_png: str, rect: dict, out_png: Optional[str] = None,
-                      out_size: tuple = (_RENDER_W, _RENDER_H)) -> str:
-    """Crop src_png to rect and upscale to out_size. Returns the output path."""
-    from PIL import Image as PILImage  # noqa: PLC0415
-    out_png = out_png or _tmp(".png")
-    with PILImage.open(src_png) as im:
-        im = im.convert("RGB")
-        crop = im.crop((rect["x0"], rect["y0"], rect["x1"], rect["y1"]))
-        # NEAREST keeps the software-rasterizer's hard edges readable; BICUBIC softens labels.
-        try:
-            resample = PILImage.Resampling.BICUBIC
-        except AttributeError:  # pragma: no cover — older Pillow
-            resample = PILImage.BICUBIC
-        crop = crop.resize(out_size, resample)
-        crop.save(out_png, format="PNG")
-    return out_png
-
-
 def _measure_match(doc_id: str, match: dict) -> dict:
     """Best-effort intrinsic measure of one match (area/length/radius)."""
     out = {
@@ -5073,12 +5280,7 @@ def _inspect_caption(doc_id: str, resolved: dict, target_bbox: dict, view_dir: t
             bit += ")"
         dim_bits.append(bit)
 
-    method_note = (
-        "Close-up via whole-part render + projected-bbox CROP/upscale "
-        "(doc_render_view has no bbox/eye camera override)."
-        if method == "crop" else
-        f"Render method: {method}."
-    )
+    method_note = f"Render method: {method}."
     parts = [
         f"Close-up of {resolved.get('label')!r} "
         f"({n_matches} subshape{'s' if n_matches != 1 else ''}).",
@@ -5118,33 +5320,6 @@ def _orbit_view_dirs(base_dir: tuple, n: int = 4) -> list:
         ang = (2.0 * math.pi * i) / n
         out.append(_rot(base, axis, ang) if i else base)
     return out
-
-
-def _tile_pngs(png_paths: list, out_png: str, labels: Optional[list] = None) -> str:
-    """Tile PNGs into a contact-sheet-like grid (2 columns)."""
-    from PIL import Image as PILImage, ImageDraw, ImageFont  # noqa: PLC0415
-    if not png_paths:
-        raise ValueError("no tiles to compose")
-    imgs = [PILImage.open(p).convert("RGB") for p in png_paths]
-    try:
-        tw, th = imgs[0].size
-        cols = 2 if len(imgs) > 1 else 1
-        rows = (len(imgs) + cols - 1) // cols
-        sheet = PILImage.new("RGB", (tw * cols, th * rows), (245, 245, 245))
-        draw = ImageDraw.Draw(sheet)
-        for i, im in enumerate(imgs):
-            r, c = divmod(i, cols)
-            sheet.paste(im.resize((tw, th)), (c * tw, r * th))
-            if labels and i < len(labels):
-                draw.text((c * tw + 6, r * th + 4), str(labels[i]), fill=(20, 20, 20))
-        sheet.save(out_png, format="PNG")
-        return out_png
-    finally:
-        for im in imgs:
-            try:
-                im.close()
-            except Exception:  # noqa: BLE001
-                pass
 
 
 def _tile_pngs_grid(png_paths: list, out_png: str, labels: Optional[list] = None,
@@ -5218,16 +5393,6 @@ _EMPHASIS_GLOW = (255, 255, 80)  # outline/glow around emphasized faces
 _CONTEXT_DESAT = 0.32            # 0 = full grey, 1 = original colour
 
 
-def _stable_color_for_key(key: str, palette: tuple = _EMPHASIS_PALETTE) -> tuple:
-    """Deterministic palette index from a stable string key (sid / feature id)."""
-    if not key:
-        return palette[0]
-    h = 0
-    for ch in str(key):
-        h = (h * 131 + ord(ch)) & 0xFFFFFFFF
-    return palette[h % len(palette)]
-
-
 def _match_color_key(match: dict, index: int = 0) -> str:
     return str(match.get("sid") or match.get("owner_feature")
                or match.get("kind") or f"m{index}")
@@ -5281,26 +5446,6 @@ def _build_emphasis_palette(matches: list, mode: str = "emphasis") -> dict:
         "context_desat": _CONTEXT_DESAT,
         "glow_rgb": list(_EMPHASIS_GLOW),
     }
-
-
-def _desaturate_rgb(r: int, g: int, b: int, amount: float = _CONTEXT_DESAT) -> tuple:
-    """Blend toward luminance; amount is how much ORIGINAL colour remains (0..1)."""
-    amount = max(0.0, min(1.0, float(amount)))
-    lum = int(0.299 * r + 0.587 * g + 0.114 * b)
-    return (
-        int(lum * (1.0 - amount) + r * amount),
-        int(lum * (1.0 - amount) + g * amount),
-        int(lum * (1.0 - amount) + b * amount),
-    )
-
-
-def _emphasis_shade(rgb: tuple, lum: float) -> tuple:
-    """The emphasis colour modulated by a pixel's own luminance.
-
-    A flat fill turns a bore into a sticker; keeping the shading means the emphasized face
-    still reads as curved/tilted geometry while unmistakably carrying the target colour."""
-    k = 0.45 + 0.85 * max(0.0, min(1.0, float(lum)))
-    return tuple(int(max(0, min(255, round(c * k)))) for c in rgb)
 
 
 # --------------------------------------------------------------------------- mesh-accurate render annotation
@@ -5383,11 +5528,7 @@ def _doc_mesh(doc_id: str) -> Optional[dict]:
         import numpy as np  # noqa: PLC0415
     except Exception:  # noqa: BLE001
         return None
-    try:
-        rb = cb.call("doc_rebuild", {"doc_id": doc_id}) or {}
-    except Exception:  # noqa: BLE001
-        return None
-    handle = ((rb.get("tess") or {}).get("aicm_path")) or ""
+    handle, rb = _activate_tess(doc_id)
     if not handle:
         return None
     cached = _MESH_CACHE.get(doc_id)
@@ -5484,7 +5625,7 @@ def _mesh_render_frame(mesh: dict, view_dir: tuple,
                        W: int = _RENDER_W, H: int = _RENDER_H) -> dict:
     """The EXACT orthographic frame core render_view_to_rgb builds for this mesh.
 
-    Same key set as _part_render_frame (so _world_to_screen works unchanged), but the
+    Same key set as the frame the engine echoes (_frame_from_rpc), but the
     extents come from the projected MESH vertices, like the C++ does — not from the
     slightly-inflated doc_bbox, which would put the overlay a pixel or two off."""
     import numpy as np  # noqa: PLC0415
@@ -5506,8 +5647,7 @@ def _mesh_render_frame(mesh: dict, view_dir: tuple,
 
 def _screen_xyz(pts, frame: dict):
     """Bulk world -> (sx, sy, depth) through `frame`. depth is dot(p-centre, view_dir):
-    LARGER is nearer the camera, matching the C++ z-buffer test. `scale_y` (only set by
-    _crop_frame) lets the same code project into a cropped-and-rescaled image. A
+    LARGER is nearer the camera, matching the C++ z-buffer test. A
     perspective frame (engine camera_pose.v1) projects through the pinhole instead, with
     reciprocal depth — still larger-is-nearer, and NaN/-1e30 for points behind the near
     plane (cad_viewpoint.perspective_project)."""
@@ -5516,28 +5656,9 @@ def _screen_xyz(pts, frame: dict):
         return _vp.perspective_project(pts, frame)
     import numpy as np  # noqa: PLC0415
     p = np.asarray(pts, dtype=np.float64).reshape(-1, 3) - np.asarray(frame["center"])
-    sy_scale = frame.get("scale_y", frame["scale"])
     su = (p @ np.asarray(frame["r"]) - frame["cu"]) * frame["scale"] + frame["W"] / 2.0
-    sv = frame["H"] / 2.0 - (p @ np.asarray(frame["u"]) - frame["cv"]) * sy_scale
+    sv = frame["H"] / 2.0 - (p @ np.asarray(frame["u"]) - frame["cv"]) * frame["scale"]
     return np.stack([su, sv, p @ np.asarray(frame["d"])], axis=-1)
-
-
-def _crop_frame(frame: dict, rect: dict, out_size: tuple = (_RENDER_W, _RENDER_H)) -> dict:
-    """The projection frame of an image that _crop_png_to_rect produced from `frame`.
-
-    The crop is a pure 2D affine on screen space (translate by the rect origin, then scale
-    each axis independently to out_size), so folding it back into the frame keeps the overlay
-    pixel-exact on the CROPPED image instead of drawing 1-px edges that the upscale would
-    smear into 8-px bands."""
-    w2, h2 = int(out_size[0]), int(out_size[1])
-    sx = w2 / max(rect["x1"] - rect["x0"], 1)
-    sy = h2 / max(rect["y1"] - rect["y0"], 1)
-    scale_x = frame["scale"] * sx
-    scale_y = frame["scale"] * sy
-    return dict(frame,
-                scale=scale_x, scale_y=scale_y, W=w2, H=h2,
-                cu=frame["cu"] + ((frame["W"] / 2.0 - rect["x0"]) * sx - w2 / 2.0) / scale_x,
-                cv=frame["cv"] + ((frame["H"] / 2.0 - rect["y0"]) * sy - h2 / 2.0) / scale_y)
 
 
 # --------------------------------------------------------------------------- focused close-ups
@@ -5554,7 +5675,7 @@ _CLOSEUP_MARGIN = 0.35              # padding around the target AABB: enough con
 def _frame_from_rpc(resp: Optional[dict]) -> Optional[dict]:
     """The projection doc_render_view actually used, as the frame dict _screen_xyz consumes.
 
-    Re-deriving the camera in Python (_part_render_frame / _mesh_render_frame) is a guess that
+    Re-deriving the camera in Python (_mesh_render_frame) is a guess that
     is a pixel or two off on a whole-part render and completely wrong on a focused one. The
     engine echoes `frame`; prefer it whenever it is there. `clip_depth` comes with it so an
     overlay can apply the SAME near-clip — without it, the material the engine cut away still
@@ -5620,7 +5741,8 @@ def _render_view_png(doc_id: str, view_dir, out_png: str, *,
                      annotate: bool = True,
                      background: Optional[Sequence] = None,
                      camera: Optional[dict] = None,
-                     section: Optional[dict] = None) -> tuple:
+                     section: Optional[dict] = None,
+                     thickness: dict | None = None) -> tuple:
     """One engine render along `view_dir`, optionally FRAMED on a world AABB.
 
     `focus` is a bbox dict ({"min","max"} — what _target_bbox returns). With it the engine fits
@@ -5639,6 +5761,10 @@ def _render_view_png(doc_id: str, view_dir, out_png: str, *,
     `view.section`): the half-space dot(p - point, normal) <= 0 is kept, its cut face is
     capped and hatched, and the removed half is drawn as a ghost with its edges. The returned
     frame carries the plane so every overlay clips the tessellation the same way.
+
+    `thickness` selects the native inscribed-sphere heat map ({min_wall_mm, resolution?}):
+    red at/below the process minimum, blue at/above three times it. It composes with focus,
+    exact cameras and ghosted sections without changing the document's display state.
 
     Returns (png_path, frame, resp). `frame` is the engine's own projection record — pass it
     straight to _annotate_render so the overlay lands on the right pixels. Raises ValueError
@@ -5659,6 +5785,8 @@ def _render_view_png(doc_id: str, view_dir, out_png: str, *,
         plane = {"point": [float(x) for x in _v3(section["point"])],
                  "normal": [float(x) for x in _vnorm(section["normal"])]}
         view["section"] = dict(plane, ghost=True, hatch=True)
+    if thickness is not None:
+        view["thickness"] = dict(thickness)
     params = {"doc_id": doc_id, "out_path": out_png, "view": view,
               "annotate": bool(annotate)}
     bg = render_background(background)
@@ -6456,11 +6584,7 @@ def _doc_topo_maps(doc_id: str) -> dict:
     sid -> topo lookups. Cached per revision the way _doc_mesh is (the tessellation handle
     carries it): one planner grid asks for these maps once per tile, and the doc_query pair
     costs ~40 ms on a dense part. Callers must treat the result as read-only."""
-    try:
-        handle = ((cb.call("doc_rebuild", {"doc_id": doc_id}) or {}).get("tess")
-                  or {}).get("aicm_path") or ""
-    except Exception:  # noqa: BLE001 — no revision to key on: never serve a stale map
-        handle = ""
+    handle, _ = _activate_tess(doc_id)   # "" = no revision to key on: never serve a stale map
     cached = _TOPO_CACHE.get(doc_id)
     if handle and cached and cached[0] == handle:
         return cached[1]
@@ -6470,7 +6594,8 @@ def _doc_topo_maps(doc_id: str) -> dict:
         try:
             ms = (cb.call("doc_query", {"doc_id": doc_id, "query": {"of": of}})
                   or {}).get("matches") or []
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            _reraise_transport(exc)
             ms = []
             complete = False
         out[of] = ms
@@ -7096,12 +7221,6 @@ def _target_is_internal(matches: list, part_bbox: dict) -> bool:
     for m in matches:
         if (m.get("concavity") or "").lower() in ("bore", "concave", "hole"):
             return True
-        surf = (m.get("surf") or "").lower()
-        if surf in ("cylinder", "cone") and m.get("kind") == "face":
-            # Cylindrical face alone isn't enough, but a bore-tagged cylinder is.
-            if m.get("radius") is not None and m.get("area_or_len"):
-                # Prefer explicit concavity; already handled above.
-                pass
     # Geometry containment: target bbox fully inside part bbox with a surface margin.
     try:
         tmin = [1e30, 1e30, 1e30]
@@ -7131,37 +7250,6 @@ def _target_is_internal(matches: list, part_bbox: dict) -> bool:
         return False
 
 
-def _auto_section_for_target(doc_id: str, matches: list, target_bbox: dict) -> dict:
-    """Pick a section plane through the target and return eval_section_props + plane name.
-
-    Reuses the existing eval_section_props machinery (inspect_section). Plane is the
-    axis-aligned datum whose normal is closest to the dominant target extent (so the cut
-    opens the largest face of the target AABB).
-    """
-    size = _v3(target_bbox.get("size"), default=(1, 1, 1))
-    # Largest target extent axis → cut with a plane NORMAL to a perpendicular principal axis.
-    # Prefer the plane whose normal aligns with the SMALLEST target size (cuts across the
-    # feature's thin dimension) so internals open up.
-    axes = [("right", 0), ("front", 1), ("top", 2)]  # plane name → axis index of its normal
-    # Smallest size axis is the normal of the cutting plane.
-    si = min(range(3), key=lambda i: size[i] if size[i] > 1e-9 else 1e9)
-    plane = axes[si][0]
-    # Override: if matches have a clear normal, cut perpendicular to it.
-    for m in matches or []:
-        n = m.get("normal") or m.get("axis")
-        if isinstance(n, (list, tuple)) and len(n) >= 3:
-            an = [abs(float(n[0])), abs(float(n[1])), abs(float(n[2]))]
-            si = max(range(3), key=lambda i: an[i])
-            plane = axes[si][0]
-            break
-    try:
-        res = cb.call("eval_section_props", {"doc_id": doc_id, "plane": plane}) or {}
-    except Exception as e:  # noqa: BLE001
-        return {"plane": plane, "ok": False, "error": str(e)}
-    area = res.get("area_mm2", 0.0)
-    summary = (f"auto-section plane '{plane}' area={area:.4g} mm²"
-               if area else f"auto-section plane '{plane}' produced empty cut")
-    return {"plane": plane, "ok": True, "summary": summary, **res}
 
 
 def _describe_part_excerpt(doc_id: str, max_chars: int = 900) -> str:
@@ -7558,7 +7646,7 @@ def _merge_face_sets(faces: list) -> dict:
     return {"facesets": [dict(face) for face in faces]}
 
 
-def _persist_study(doc_id: str, record: dict) -> Optional[str]:
+def _persist_study(doc_id: str, record: dict, *, raise_errors: bool = False) -> Optional[str]:
     """Record a SOLVED simulation study (setup + RESULTS) into the document's `studies`
     array so it round-trips inside the native .step+ (save_part). Without this the FEA/CFD
     numbers were only ever returned to the caller and lost on save — the file claimed to
@@ -7567,8 +7655,11 @@ def _persist_study(doc_id: str, record: dict) -> Optional[str]:
     RESULTS, NOT the resolved point clouds, so the entry stays small and re-runnable.
 
     Re-running a study of the same `type` REPLACES the prior one (keyed by type+name) so
-    repeated solves don't pile up duplicates. Best-effort: a persistence failure never
-    breaks the solve that already succeeded — the numbers are still returned to the caller.
+    repeated solves don't pile up duplicates. Best-effort by default: a persistence failure
+    never breaks the solve that already succeeded — the numbers are still returned to the
+    caller (None means "not saved"). A transport outage is the exception: it always
+    propagates, because a dead engine is not a skipped save. `raise_errors=True` propagates
+    EVERY failure, for callers (simulate_motion) that must report a study that did not persist.
     """
     try:
         rid = record.get("id")
@@ -7589,46 +7680,81 @@ def _persist_study(doc_id: str, record: dict) -> Optional[str]:
             return rid
         res = cb.call("sim_study_add", {"doc_id": doc_id, "study": record})
         return res.get("study_id") if isinstance(res, dict) else None
-    except Exception:  # noqa: BLE001 — persistence is best-effort, never fail the solve
+    except Exception as exc:  # noqa: BLE001
+        if raise_errors:
+            raise
+        _reraise_transport(exc)
         return None
 
 
 # --------------------------------------------------- thermal helpers
 
-# Typical thermal conductivity (W/m·K) by material family — used by run_fea_thermal
-# when neither the caller nor the material dict supplies one. Engineering nominals
-# (clean-room, standard handbook values), only for the box-proxy conduction estimate.
-_DEFAULT_CONDUCTIVITY_WMK: dict = {
-    "steel": 50.0, "stainless": 16.0, "aluminum": 205.0, "titanium": 22.0,
-    "brass": 109.0, "abs": 0.17, "pla": 0.13,
-}
+# Typical thermal properties by material FAMILY — (family word, conductivity W/(m·K), specific
+# heat J/(kg·K)) — the last resort when the materials registry carries no value for a material.
+# Engineering nominals (handbook values). The family word must be a WHOLE word of the material's
+# name and the longest word wins, so "stainless steel" is stainless (16), never steel (50).
+_THERMAL_FAMILY_DEFAULTS = tuple(sorted(
+    (("stainless", 16.0, 500.0), ("aluminum", 205.0, 900.0), ("aluminium", 205.0, 900.0),
+     ("titanium", 22.0, 520.0), ("steel", 50.0, 490.0), ("brass", 109.0, 380.0),
+     ("abs", 0.17, 1400.0), ("pla", 0.13, 1800.0)),
+    key=lambda row: -len(row[0])))
 
 
+def _positive_number(value: Any) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value > 0)
+
+
+def material_thermal_props(name: Any) -> tuple:
+    """(props, assumptions) — thermal conductivity and specific heat for a material NAME.
+
+    `props` holds "conductivity_w_mk" and "cp_j_kgk", each only when it could be resolved. A
+    value comes from the materials registry record (material_get) when the record has one,
+    otherwise from the family default table; every family default is listed in `assumptions`
+    as {property, value, source: "family default", family} so the reply can say it was ASSUMED.
+    A property with neither source is absent — never a silent mild-steel number."""
+    label = str(name or "")
+    rec = _material_registry_record(label) if label.strip() else None
+    basis = rec.get("property_basis") if isinstance(rec, dict) else None
+    basis = basis if isinstance(basis, dict) else {}
+    registry = {"conductivity_w_mk": basis.get("thermal_conductivity_w_m_k"),
+                "cp_j_kgk": basis.get("specific_heat_j_kg_k")}
+    words = set(re.findall(r"[a-z0-9]+", _material_norm(label)))
+    family = next((row for row in _THERMAL_FAMILY_DEFAULTS if row[0] in words), None)
+    props: dict = {}
+    assumptions: list = []
+    for prop, column in (("conductivity_w_mk", 1), ("cp_j_kgk", 2)):
+        if _positive_number(registry[prop]):
+            props[prop] = float(registry[prop])
+        elif family is not None:
+            props[prop] = family[column]
+            assumptions.append({"property": prop, "value": family[column],
+                                "source": "family default", "family": family[0]})
+    return props, assumptions
+
+
+def _thermal_prop_or_refuse(mat: dict, material_arg: Any, prop: str, label: str) -> float:
+    name = str(mat.get("name") or material_arg or "")
+    props, _assumed = material_thermal_props(name)
+    if prop not in props:
+        raise ValueError(
+            f"No {label} is known for material {name!r}: the materials registry has none and "
+            f"no family default applies. Pass it explicitly (a material dict carrying "
+            f"{'conductivity_w_mk' if prop == 'conductivity_w_mk' else 'cp_j_kgk'}).")
+    return props[prop]
+
+
+# Callers that only need the number. They drop the `assumptions` list material_thermal_props
+# returns — switch each to material_thermal_props itself and delete these two.
 def _default_conductivity(mat: dict, material_arg: Any) -> float:
-    """Best-effort thermal conductivity (W/m·K) for thermal studies."""
-    name = str(mat.get("name", material_arg) or "").lower()
-    for key, val in _DEFAULT_CONDUCTIVITY_WMK.items():
-        if key in name:
-            return val
-    return 50.0  # mild-steel default
-
-
-# Typical specific heat (J/(kg·K)) by material family — used by the TRANSIENT thermal
-# path when neither the caller nor the material dict supplies cp. Same
-# engineering-nominal spirit as the conductivity table above.
-_DEFAULT_SPECIFIC_HEAT_JKGK: dict = {
-    "steel": 490.0, "stainless": 500.0, "aluminum": 900.0, "titanium": 520.0,
-    "brass": 380.0, "abs": 1400.0, "pla": 1800.0,
-}
+    """Thermal conductivity (W/m·K) for a thermal study; refuses when it cannot be known."""
+    return _thermal_prop_or_refuse(mat, material_arg, "conductivity_w_mk",
+                                   "thermal conductivity")
 
 
 def _default_specific_heat(mat: dict, material_arg: Any) -> float:
-    """Best-effort specific heat (J/kg·K) for the transient thermal solve."""
-    name = str(mat.get("name", material_arg) or "").lower()
-    for key, val in _DEFAULT_SPECIFIC_HEAT_JKGK.items():
-        if key in name:
-            return val
-    return 490.0  # mild-steel default
+    """Specific heat (J/kg·K) for the transient thermal solve; refuses when it cannot be known."""
+    return _thermal_prop_or_refuse(mat, material_arg, "cp_j_kgk", "specific heat")
 
 
 def _first_temperature(faces: list, label: str) -> float:
@@ -7680,6 +7806,7 @@ GEOM_QUERY_READBACK_KEYS = frozenset({
     "sid", "centroid", "normal", "axis", "radius", "area_or_len", "concavity",
     "hint_index", "owner_feature", "body", "topo", "axis_point",
     "major_radius", "minor_radius", "torus_axis", "torus_center",
+    "cylinder", "bearing_annulus", "geometry_error",
 })
 
 GEOM_QUERY_VOCAB_HELP = (

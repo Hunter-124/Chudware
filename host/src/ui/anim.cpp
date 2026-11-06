@@ -1,6 +1,13 @@
 #include "anim.h"
 
+#define GLFW_INCLUDE_NONE
+#include <GLFW/glfw3.h>
+
+#include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <limits>
+#include <mutex>
 #include <unordered_map>
 
 namespace ui {
@@ -12,13 +19,19 @@ namespace {
 // GUI thread only, and "somebody wants the next frame" is not a count.
 bool g_wantFrames = false;
 
-// Per-id tween store. Keyed by ImGuiID so callers hold no state. Entries are tiny and the
-// working set is bounded by the number of animated widgets actually on screen; nothing here
-// grows without bound in practice because ids are derived from stable widget labels, not from
-// per-frame data. forget() exists for the rare id that genuinely retires.
+using Clock = std::chrono::steady_clock;
+Clock::time_point g_frameStart = Clock::now();
+Clock::time_point g_ambientDeadline = Clock::time_point::max();
+double g_ambientInterval = std::numeric_limits<double>::infinity();
+
+std::mutex g_wakeMutex;
+bool g_wakeEnabled = false;
+
+// IDs from closed documents/messages must not accumulate indefinitely.
 struct Tween {
     float value = 0.0f;
     bool  seeded = false;
+    int lastTouched = 0;
 };
 std::unordered_map<ImGuiID, Tween>& tweens() {
     static std::unordered_map<ImGuiID, Tween> t;
@@ -26,6 +39,24 @@ std::unordered_map<ImGuiID, Tween>& tweens() {
 }
 
 inline float clamp01(float t) { return t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t); }
+void retireTweens() {
+    static int lastSweep = 0;
+    const int frame = ImGui::GetFrameCount();
+    auto& t = tweens();
+    if (frame < lastSweep) {
+        t.clear();
+    } else if (frame - lastSweep < 120) {
+        return;
+    }
+    lastSweep = frame;
+    for (auto it = t.begin(); it != t.end();) {
+        if (frame - it->second.lastTouched > 600)
+            it = t.erase(it);
+        else
+            ++it;
+    }
+}
+
 
 // Settled threshold. Below this the tween snaps to target and stops requesting frames — without
 // it an exponential settle never mathematically arrives and the app would never idle again.
@@ -66,10 +97,46 @@ float easeSpring(float t) {
 
 void requestFrames() { g_wantFrames = true; }
 
+void requestFramesAt(float hz) {
+    if (!(hz > 0.0f) || !std::isfinite(hz)) return;
+    g_ambientInterval = std::min(g_ambientInterval, 1.0 / static_cast<double>(hz));
+}
+
+void setLoopWakeEnabled(bool enabled) {
+    std::lock_guard<std::mutex> lk(g_wakeMutex);
+    g_wakeEnabled = enabled;
+}
+
+void wakeLoop() {
+    std::lock_guard<std::mutex> lk(g_wakeMutex);
+    if (g_wakeEnabled) glfwPostEmptyEvent();
+}
+
 bool consumeFrameRequest() {
+    retireTweens();
     const bool w = g_wantFrames;
     g_wantFrames = false;
     return w;
+}
+
+double consumeAmbientWait(double maxWaitSeconds) {
+    if (std::isfinite(g_ambientInterval)) {
+        const auto next = g_frameStart + std::chrono::duration_cast<Clock::duration>(
+            std::chrono::duration<double>(g_ambientInterval));
+        g_ambientDeadline = std::min(g_ambientDeadline, next);
+    } else {
+        g_ambientDeadline = Clock::time_point::max();
+    }
+    g_ambientInterval = std::numeric_limits<double>::infinity();
+    if (g_ambientDeadline == Clock::time_point::max()) return maxWaitSeconds;
+    const double remaining = std::chrono::duration<double>(g_ambientDeadline - Clock::now()).count();
+    return std::clamp(remaining, 0.0, maxWaitSeconds);
+}
+
+void beginFrame() {
+    g_frameStart = Clock::now();
+    if (g_ambientDeadline <= g_frameStart)
+        g_ambientDeadline = Clock::time_point::max();
 }
 
 float dt() {
@@ -80,6 +147,7 @@ float dt() {
 
 float toward(ImGuiID id, float target, float seconds) {
     Tween& tw = tweens()[id];
+    tw.lastTouched = ImGui::GetFrameCount();
     if (!tw.seeded) {
         // First sight of this id: adopt the target instantly. Animating from 0 would make every
         // freshly-scrolled-in row visibly slide, which reads as jank, not polish.
@@ -106,13 +174,14 @@ float toward(ImGuiID id, float target, float seconds) {
 float peek(ImGuiID id, float fallback) {
     auto& t = tweens();
     auto it = t.find(id);
+    if (it != t.end()) it->second.lastTouched = ImGui::GetFrameCount();
     return it == t.end() ? fallback : it->second.value;
 }
 
 void forget(ImGuiID id) { tweens().erase(id); }
 
 float pulse(float periodSec) {
-    requestFrames();
+    requestFramesAt(30.0f);
     if (!(periodSec > 0.0f)) return 0.0f;
     const double t = ImGui::GetTime();
     const float  u = static_cast<float>(std::fmod(t, static_cast<double>(periodSec))) / periodSec;
@@ -122,7 +191,7 @@ float pulse(float periodSec) {
 }
 
 float phase(float periodSec) {
-    requestFrames();
+    requestFramesAt(30.0f);
     if (!(periodSec > 0.0f)) return 0.0f;
     const double t = ImGui::GetTime();
     return static_cast<float>(std::fmod(t, static_cast<double>(periodSec))) / periodSec;

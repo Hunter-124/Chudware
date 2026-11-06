@@ -29,15 +29,16 @@ if str(REPO) not in sys.path:
 
 from scripts import prepare_runtime_wheels as preparation
 from services.installer.wheelhouse import (
-    CHUDCODE_REPOSITORY, WheelhouseError, _archive_files, _archive_members, _bytes, _copy_wheel,
+    OMP_REPOSITORY, WheelhouseError, _archive_files, _archive_members, _bytes, _copy_wheel,
     _keys, _packaging, _sha, _source_identity, install_command, local_path,
     verify_installed_runtime, verify_venv_interpreter,
 )
 
 BUILD_SCHEMA = "chudware-sdk-build-review-v1"
 MAX_SOURCE_BYTES = 64 * 1024 * 1024
+MAX_COMPRESSED_SOURCE_BYTES = 256 * 1024 * 1024
 MAX_PROCESS_OUTPUT = 2 * 1024 * 1024
-SDK_FILENAME = "chudcode_rpc-0.3.1-py3-none-any.whl"
+SDK_FILENAME = "omp_rpc-0.1.0-py3-none-any.whl"
 BACKEND_FILENAME = "setuptools-83.0.0-py3-none-any.whl"
 
 
@@ -46,7 +47,7 @@ def _manifest(args, context):
     if not _sha(args.review_sha256) or hashlib.sha256(raw).hexdigest() != args.review_sha256:
         raise WheelhouseError("SDK build review differs from externally supplied reviewed digest")
     value = preparation._document(raw)
-    _keys(value, {"schema", "approval", "source_archive_sha256", "source_subdirectory", "chudcode_source",
+    _keys(value, {"schema", "approval", "source_archive_sha256", "source_subdirectory", "omp_source",
                   "native_lock_sha256", "base_python", "backend_wheel", "target", "source_date_epoch"}, "SDK build review")
     if value["schema"] != BUILD_SCHEMA:
         raise WheelhouseError("invalid SDK build review schema")
@@ -59,13 +60,13 @@ def _manifest(args, context):
     for field in ("source_archive_sha256", "native_lock_sha256"):
         if not _sha(value[field]):
             raise WheelhouseError(f"invalid reviewed SDK {field}")
-    if value["source_subdirectory"] != "python/chudcode-rpc":
-        raise WheelhouseError("SDK source must be the exact exported python/chudcode-rpc subtree")
-    source = value["chudcode_source"]
+    if value["source_subdirectory"] != "sdk/python/omp-rpc":
+        raise WheelhouseError("SDK source must be the exact exported sdk/python/omp-rpc subtree")
+    source = value["omp_source"]
     _keys(source, {"repository", "repository_commit"}, "SDK immutable source")
     _source_identity({"kind": "vcs", **source}, True, source)
-    if source["repository"] != CHUDCODE_REPOSITORY:
-        raise WheelhouseError(f"SDK build source must be the Chudcode repository {CHUDCODE_REPOSITORY}")
+    if source["repository"] != OMP_REPOSITORY:
+        raise WheelhouseError(f"SDK build source must be the OMP repository {OMP_REPOSITORY}")
     base = value["base_python"]
     _keys(base, {"executable_sha256", "version", "identity_reference"}, "SDK build base")
     reference = base["identity_reference"]
@@ -95,19 +96,29 @@ def _manifest(args, context):
 def _source_archive(archive_bytes: bytes, destination: Path, epoch: int) -> Path:
     """Extract bounded regular source files only, with normalized build timestamps."""
     import io
-    with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:") as archive:
+    with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as archive:
         seen = set()
         expanded = 0
+        root = "oh-my-pi-413d278a87a69b453efabf8d1fedb9940385e8c6/"
+        subtree = "sdk/python/omp-rpc"
         for member in archive:
-            expanded += member.size
-            if len(seen) >= 4096 or expanded > MAX_SOURCE_BYTES:
-                raise WheelhouseError("SDK source export exceeds file/expanded byte bounds")
-            name = member.name.rstrip("/")
+            full_name = member.name.rstrip("/")
+            parts = full_name.split("/")
+            if (not full_name or "\\" in full_name or ":" in full_name
+                    or any(part in ("", ".", "..") for part in parts)):
+                raise WheelhouseError("SDK source archive contains an unsafe path")
+            if not full_name.startswith(root):
+                if full_name != root[:-1]:
+                    raise WheelhouseError("SDK source archive has an unexpected root")
+                continue
+            name = full_name[len(root):]
+            if name != subtree and not name.startswith(subtree + "/"):
+                continue
             parts = name.split("/")
-            if (not name or name in seen or "\\" in name or ":" in name
-                    or any(part in ("", ".", "..") for part in parts)
-                    or not (name == "python" or name == "python/chudcode-rpc" or name.startswith("python/chudcode-rpc/"))
-                    or not (member.isdir() or member.isreg()) or member.size < 0 or member.size > 4 * 1024 * 1024):
+            expanded += member.size
+            if (len(seen) >= 4096 or expanded > MAX_SOURCE_BYTES or name in seen
+                    or not (member.isdir() or member.isreg()) or member.size < 0
+                    or member.size > 4 * 1024 * 1024):
                 raise WheelhouseError("SDK source export contains duplicate/unsafe/nonregular members")
             seen.add(name)
             target = destination.joinpath(*parts)
@@ -125,14 +136,14 @@ def _source_archive(archive_bytes: bytes, destination: Path, epoch: int) -> Path
                 preparation._write(target, content)
                 target.chmod(0o644)
                 os.utime(target, (epoch, epoch))
-    source = destination / "python/chudcode-rpc"
+    source = destination / "sdk/python/omp-rpc"
     project = tomllib.loads(_bytes(source / "pyproject.toml").decode("utf-8"))
     build = project.get("build-system", {})
     if (build != {"requires": ["setuptools>=77.0.3"], "build-backend": "setuptools.build_meta"}
-            or project.get("project", {}).get("name") != "chudcode-rpc"
-            or project.get("project", {}).get("version") != "0.3.1"
+            or project.get("project", {}).get("name") != "omp-rpc"
+            or project.get("project", {}).get("version") != "0.1.0"
             or project.get("project", {}).get("dynamic")):
-        raise WheelhouseError("exported SDK declarations differ from the reviewed static 0.3.1 setuptools project")
+        raise WheelhouseError("exported SDK declarations differ from the reviewed static 0.1.0 setuptools project")
     if (source / "setup.py").exists() or (source / "setup.cfg").exists():
         raise WheelhouseError("SDK build refuses undeclared executable/alternate setup configuration")
     return source
@@ -216,13 +227,13 @@ def _run(command, cwd: Path, environment: dict, timeout: int):
 def build_sdk(args) -> dict:
     context = preparation.target_context()
     manifest, review_bytes = _manifest(args, context)
-    archive_bytes = _bytes(args.source_archive, MAX_SOURCE_BYTES)
+    archive_bytes = _bytes(args.source_archive, MAX_COMPRESSED_SOURCE_BYTES)
     if hashlib.sha256(archive_bytes).hexdigest() != manifest["source_archive_sha256"]:
         raise WheelhouseError("SDK source export hash differs from explicit operator review")
-    native_bytes = _bytes(args.chudcode_lock)
+    native_bytes = _bytes(args.omp_lock)
     native = preparation._document(native_bytes)
     if (hashlib.sha256(native_bytes).hexdigest() != manifest["native_lock_sha256"]
-            or manifest["chudcode_source"] != {key: native.get(key) for key in manifest["chudcode_source"]}):
+            or manifest["omp_source"] != {key: native.get(key) for key in manifest["omp_source"]}):
         raise WheelhouseError("SDK reviewed source/native lock identity mismatch")
     output = preparation._output(args.output)
     backend_input = local_path(args.wheel_directory) / BACKEND_FILENAME
@@ -257,19 +268,19 @@ def build_sdk(args) -> dict:
         )
         _run([str(python), "-I", "-S", "-c", bootstrap, str(venv), str(wheels)], source, environment, args.timeout_seconds)
         if {path.name for path in wheels.iterdir()} != {SDK_FILENAME}:
-            raise WheelhouseError("SDK backend did not produce the exact expected 0.3.1 pure wheel")
+            raise WheelhouseError("SDK backend did not produce the exact expected 0.1.0 pure wheel")
         wheel = wheels / SDK_FILENAME
         with zipfile.ZipFile(wheel) as archive:
             _archive_members(archive, SDK_FILENAME)
             _archive_files(archive, "true", SDK_FILENAME)
-            metadata = BytesParser().parsebytes(archive.read("chudcode_rpc-0.3.1.dist-info/METADATA"))
-            if metadata.get_all("Name", []) != ["chudcode-rpc"] or metadata.get_all("Version", []) != ["0.3.1"]:
+            metadata = BytesParser().parsebytes(archive.read("omp_rpc-0.1.0.dist-info/METADATA"))
+            if metadata.get_all("Name", []) != ["omp-rpc"] or metadata.get_all("Version", []) != ["0.1.0"]:
                 raise WheelhouseError("built SDK wheel metadata differs from the pinned project")
         result = {"schema": "chudware-sdk-build-result-v1", "status": "unapproved-built-candidate",
                   "build_review_sha256": args.review_sha256, "source_archive_sha256": manifest["source_archive_sha256"],
-                  "chudcode_source": manifest["chudcode_source"], "base_python": manifest["base_python"],
+                  "omp_source": manifest["omp_source"], "base_python": manifest["base_python"],
                   "backend_wheel": manifest["backend_wheel"], "source_date_epoch": manifest["source_date_epoch"],
-                  "wheel": {"filename": SDK_FILENAME, "name": "chudcode-rpc", "version": "0.3.1", "sha256": preparation._digest(wheel)},
+                  "wheel": {"filename": SDK_FILENAME, "name": "omp-rpc", "version": "0.1.0", "sha256": preparation._digest(wheel)},
                   "approval": "build input operator assertion only; produced wheel is not approved for runtime installation"}
         staged = Path(tempfile.mkdtemp(prefix=".sdk-build-publication-", dir=output.parent))
         try:
@@ -292,7 +303,7 @@ def add_parser(subparsers):
     parser.add_argument("--review-sha256", required=True)
     parser.add_argument("--source-archive", type=Path, required=True)
     parser.add_argument("--wheel-directory", type=Path, required=True, help="offline reviewed setuptools==83.0.0 wheel directory")
-    parser.add_argument("--chudcode-lock", type=Path, default=REPO / "vendor/chudcode/CHUDCODE_ARTIFACT.lock")
+    parser.add_argument("--omp-lock", type=Path, default=REPO / "vendor/omp/OMP_ARTIFACT.lock")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--timeout-seconds", type=int, default=300, help="explicit per-subprocess operator build timeout")
 

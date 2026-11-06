@@ -57,8 +57,12 @@ bool parse_number(std::string_view w, Tok& out) {
     const char* b = w.data();
     const char* e = b + w.size();
     double d = 0.0;
+#ifdef __APPLE__
+    if (!chudware::device::parseFiniteDouble(w, d)) return false;
+#else
     auto r = std::from_chars(b, e, d);
     if (r.ec != std::errc() || r.ptr != e) return false;
+#endif
     out.k = TK::Num;
     out.d = d;
     std::int64_t iv = 0;

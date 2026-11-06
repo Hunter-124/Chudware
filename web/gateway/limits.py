@@ -30,6 +30,7 @@ except ImportError:  # uvicorn app:app from the package directory
 # Wire-byte ceilings apply before FastAPI parses JSON or multipart data.
 SMALL_REQUEST_BYTES = 64 * 1024
 WORKSPACE_CHAT_BYTES = 5 * 1024 * 1024
+SCAD_EXPORT_REQUEST_BYTES = 512 * 1024
 
 
 def request_body_cap(path: str) -> int:
@@ -37,6 +38,8 @@ def request_body_cap(path: str) -> int:
         return settings.max_upload_bytes
     if path == "/workspace/chat":
         return WORKSPACE_CHAT_BYTES
+    if path == "/workspace/scad-export":
+        return SCAD_EXPORT_REQUEST_BYTES
     return SMALL_REQUEST_BYTES
 
 

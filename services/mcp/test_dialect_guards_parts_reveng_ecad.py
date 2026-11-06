@@ -24,6 +24,8 @@ def _bind(tool: str):
 
 
 def _as_dict(out):
+    if isinstance(out, list) and out and isinstance(out[-1], str):
+        out = out[-1]
     return out if isinstance(out, dict) else json.loads(out)
 
 
@@ -38,7 +40,9 @@ def _skip_if_no_bridge(exc: Exception):
 # Cheap, engine-optional docs the live-tool tests build on.
 
 @pytest.fixture
-def pcb_doc_id():
+def pcb_doc_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
     new_pcb = _bind("ecad_new_pcb")
     try:
         out = _as_dict(new_pcb(name="dialect_test_board"))
@@ -49,7 +53,9 @@ def pcb_doc_id():
 
 
 @pytest.fixture
-def sch_doc_id():
+def sch_doc_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
     new_sch = _bind("ecad_new_schematic")
     try:
         out = _as_dict(new_sch(name="dialect_test_sch"))
@@ -75,7 +81,8 @@ def test_part_search_facets_accepts_python_repr_string():
     JSON" error even though it IS the dict it looks like. _parse_json_dict now
     tries coerce_json_or_repr first."""
     search = _bind("part_search")
-    out = _as_dict(search(query="tube", facets="{'od_mm': 25.4}"))
+    out = _as_dict(search(query="tube", facets="{'od_mm': 25.4}",
+                          include_live=False, previews=False))
     assert isinstance(out, dict)
     # Must not be rejected as "not valid JSON" — coercion must have succeeded
     # (whatever happens downstream depends on the taxonomy/index being seeded).
@@ -278,9 +285,9 @@ def test_reveng_set_scale_params_accepts_python_repr_dict(reveng_session_id):
     """Positive case: a python-repr params dict must now be READ correctly."""
     set_scale = _bind("reveng_set_scale")
     out = _as_dict(set_scale(session_id=reveng_session_id, method="known_dim",
-                             params="{'value_mm': 25.4, 'source': 'caliper'}"))
+                             params="{'value_mm': 25.4, 'recon_length': 2.0, 'source': 'caliper'}"))
     assert out.get("ok") is True, out
-    assert out["scale"]["mm_per_unit"] == 25.4
+    assert out["scale"]["mm_per_unit"] == 12.7
     assert out["scale"]["detail"]["source"] == "caliper"
 
 

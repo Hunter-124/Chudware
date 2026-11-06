@@ -308,6 +308,103 @@ class TestEcadKicadAdapter:
             records = list(adapter.iter_records())
         assert len(records) > 0  # starter still yields
 
+    def test_native_search_and_offline_lookup_use_kicad_records(self, monkeypatch):
+        from services.mcp import core_bridge
+        from services.parts.adapters.ecad_kicad_adapter import EcadKicadAdapter
+        from services.parts.hub import PartsHub
+
+        monkeypatch.setenv("CHUDWARE_PARTS_INDEX_CACHE", "off")
+        calls = []
+        symbol = {"libid": "RF_Module:ESP32-WROOM-32", "name": "ESP32-WROOM-32",
+                  "description": "Wi-Fi and Bluetooth module", "pin_count": 38,
+                  "footprint": "RF_Module:ESP32-WROOM-32"}
+        footprint = {"fpid": "Resistor_SMD:R_0603_1608Metric",
+                     "description": "0603 resistor", "pad_count": 2}
+
+        def rpc(method, params):
+            calls.append((method, dict(params)))
+            if method == "ecad_symbols":
+                hits = [symbol] if "esp32" in params["query"].lower() else []
+                return {"ok": True, "symbols": hits, "count": len(hits)}
+            if method == "ecad_footprints":
+                hits = [footprint] if "0603" in params["query"].lower() else []
+                return {"ok": True, "footprints": hits, "count": len(hits)}
+            raise AssertionError(method)
+
+        monkeypatch.setattr(core_bridge, "call", rpc)
+        hub = PartsHub()
+        hub.register(EcadKicadAdapter())
+        symbols = hub.search("ESP32-WROOM-32", domain="ecad", limit=10,
+                             filters={"doc_id": "sch-1"}, include_live=False)
+        assert symbols[0]["part_id"] == "ecad:RF_Module:ESP32-WROOM-32"
+        assert symbols[0]["params"]["pin_count"] == 38
+        assert symbols[0]["geometry_ref"]["footprint"] == "RF_Module:ESP32-WROOM-32"
+        assert any(method == "ecad_symbols" and params.get("doc_id") == "sch-1"
+                   for method, params in calls)
+        fp = hub.search("R_0603_1608Metric", domain="ecad", limit=10, include_live=False)[0]
+        assert fp["part_id"] == "ecad:Resistor_SMD:R_0603_1608Metric"
+        assert fp["params"]["pad_count"] == 2
+        assert fp["geometry_ref"]["footprint"] == footprint["fpid"]
+        assert hub.get(fp["part_id"], include_live=False)["params"]["pad_count"] == 2
+        assert hub.get(symbols[0]["part_id"], include_live=False)["params"]["pin_count"] == 38
+
+    def test_native_exact_id_wins_over_starter_alias(self, monkeypatch):
+        from services.mcp import core_bridge
+        from services.parts.adapters.ecad_kicad_adapter import EcadKicadAdapter
+
+        def rpc(method, params):
+            if method == "ecad_symbols":
+                return {"ok": True, "symbols": [
+                    {"libid": "Device:R_Small", "name": "R_Small",
+                     "pin_count": 2, "default_footprint": "", "description": "Resistor"}]}
+            return {"ok": True, "footprints": []}
+
+        monkeypatch.setattr(core_bridge, "call", rpc)
+        rec = EcadKicadAdapter().get("ecad:device:r_small", doc_id="sch-1")
+        assert rec["part_id"] == "ecad:Device:R_Small"
+        assert rec["geometry_ref"]["libid"] == "Device:R_Small"
+        assert "pin_remap" not in rec
+
+    def test_same_id_symbol_and_footprint_keep_both_geometries(self, monkeypatch):
+        from services.mcp import core_bridge
+        from services.parts.adapters.ecad_kicad_adapter import EcadKicadAdapter
+
+        def rpc(method, _params):
+            if method == "ecad_symbols":
+                return {"ok": True, "symbols": [
+                    {"libid": "RF_Module:ESP32-WROOM-32", "pin_count": 38,
+                     "footprint": "Other:Default"}]}
+            return {"ok": True, "footprints": [
+                {"fpid": "RF_Module:ESP32-WROOM-32", "pad_count": 39}]}
+
+        monkeypatch.setattr(core_bridge, "call", rpc)
+        record = EcadKicadAdapter().get("ecad:RF_Module:ESP32-WROOM-32")
+        assert record["geometry_ref"]["libid"] == "RF_Module:ESP32-WROOM-32"
+        assert record["geometry_ref"]["footprint"] == "Other:Default"
+        assert record["geometry_ref"]["board_footprint"] == "RF_Module:ESP32-WROOM-32"
+        assert record["params"]["pin_count"] == 38
+        assert record["params"]["pad_count"] == 39
+
+    def test_explicit_project_search_does_not_hide_bridge_failure(self, monkeypatch):
+        import pytest
+        from services.mcp import core_bridge
+        from services.parts.adapters.ecad_kicad_adapter import EcadKicadAdapter
+        from services.parts.hub import PartsHub
+
+        monkeypatch.setenv("CHUDWARE_PARTS_INDEX_CACHE", "off")
+
+        def unavailable(_method, _params):
+            raise core_bridge.CoreError("unknown project document", code="unknown_doc")
+
+        monkeypatch.setattr(core_bridge, "call", unavailable)
+        hub = PartsHub()
+        hub.register(EcadKicadAdapter())
+        with pytest.raises(core_bridge.CoreError, match="unknown project document"):
+            hub.search("resistor", domain="ecad", filters={"doc_id": "missing"},
+                       include_live=False)
+        with pytest.raises(core_bridge.CoreError, match="unknown project document"):
+            EcadKicadAdapter().get("ecad:Device:R", doc_id="missing")
+
 
 # ---------------------------------------------------------------------------
 # Cross-domain federation tests
@@ -321,29 +418,29 @@ class TestFederation:
         domains = ["fastener", "bearing", "mech_family", "section", "fitting",
                    "hydraulic", "ecad"]
         for domain in domains:
-            results = hub.search("", domain=domain, limit=5)
+            results = hub.search("", domain=domain, limit=5, include_live=False)
             assert len(results) >= 0  # some domains may have 0 if data absent
             # At minimum no exception raised
 
     def test_fastener_domain_has_records(self):
         hub = _make_hub()
-        results = hub.search("M8", domain="fastener")
+        results = hub.search("M8", domain="fastener", include_live=False)
         assert len(results) > 0
 
     def test_section_domain_has_records(self):
         hub = _make_hub()
         # "wide flange" is in every W-section title; "W8x31" matches exactly
-        results = hub.search("wide flange", domain="section")
+        results = hub.search("wide flange", domain="section", include_live=False)
         assert len(results) > 0
 
     def test_hydraulic_domain_has_records(self):
         hub = _make_hub()
-        results = hub.search("pump", domain="hydraulic")
+        results = hub.search("pump", domain="hydraulic", include_live=False)
         assert len(results) > 0
 
     def test_ecad_domain_has_records(self):
         hub = _make_hub()
-        results = hub.search("resistor", domain="ecad")
+        results = hub.search("resistor", domain="ecad", include_live=False)
         assert len(results) > 0
 
     def test_cross_domain_m3_query(self):
@@ -354,7 +451,7 @@ class TestFederation:
         Both must be present in the top-20 unfiltered results.
         """
         hub = _make_hub()
-        results = hub.search("M3", limit=20)
+        results = hub.search("M3", limit=20, include_live=False)
         domains = {r["domain"] for r in results}
         assert "fastener" in domains, (
             f"Expected fastener domain in M3 results; got domains: {domains}"
@@ -381,7 +478,7 @@ class TestFederation:
     def test_cross_domain_m3_ecad_is_mounting_hole(self):
         """The ecad hit for 'M3' must be the mounting hole footprint."""
         hub = _make_hub()
-        results = hub.search("M3", limit=20)
+        results = hub.search("M3", limit=20, include_live=False)
         ecad_hits = [r for r in results if r["domain"] == "ecad"]
         assert len(ecad_hits) >= 1
         ecad_titles = " ".join(r["title"] for r in ecad_hits).lower()
@@ -393,10 +490,10 @@ class TestFederation:
         """Regression: hub.search still returns fastener/bearing results (core baseline)."""
         hub = _make_hub()
         # fastener
-        r = hub.search("M8 socket head")
+        r = hub.search("M8 socket head", include_live=False)
         assert any(rec["domain"] == "fastener" for rec in r), "core fastener baseline broken"
         # bearing
-        r2 = hub.search("6205 bearing")
+        r2 = hub.search("6205 bearing", include_live=False)
         assert any(rec["domain"] == "bearing" for rec in r2), "core bearing baseline broken"
 
 
@@ -420,7 +517,7 @@ class TestPartsToolsMCP:
         register_parts_tools(_StubMCP())
         fn = results_holder.get("part_search")
         assert fn is not None
-        out = json.loads(fn("M3"))
+        out = json.loads(fn("M3", include_live=False, previews=False))
         assert out["ok"] is True
         assert "results" in out
         assert "has_live" in out
@@ -437,7 +534,7 @@ class TestPartsToolsMCP:
                 return decorator
         register_parts_tools(_StubMCP())
         fn = results_holder["part_search"]
-        out = json.loads(fn("M3"))
+        out = json.loads(fn("M3", include_live=False, previews=False))
         assert out["ok"] is True
         domains = {r["domain"] for r in out["results"]}
         assert "fastener" in domains
@@ -455,7 +552,7 @@ class TestPartsToolsMCP:
                 return decorator
         register_parts_tools(_StubMCP())
         fn = results_holder["part_search"]
-        out = json.loads(fn("pump", "hydraulic"))
+        out = json.loads(fn("pump", "hydraulic", include_live=False, previews=False))
         assert out["ok"] is True
         assert all(r["domain"] == "hydraulic" for r in out["results"])
 
@@ -473,10 +570,10 @@ class TestPartsToolsMCP:
         register_parts_tools(_StubMCP())
         search_fn = results_holder["part_search"]
         get_fn = results_holder["part_get"]
-        out = json.loads(search_fn("W8", "section"))
+        out = json.loads(search_fn("W8", "section", include_live=False, previews=False))
         if out["results"]:
             pid = out["results"][0]["part_id"]
-            get_out = json.loads(get_fn(pid))
+            get_out = json.loads(get_fn(pid, include_live=False))
             assert get_out["ok"] is True
             assert get_out["part"]["domain"] == "section"
 
@@ -492,6 +589,6 @@ class TestPartsToolsMCP:
                 return decorator
         register_parts_tools(_StubMCP())
         fn = results_holder["part_search"]
-        out = json.loads(fn("M3", "nonexistent_domain"))
+        out = json.loads(fn("M3", "nonexistent_domain", include_live=False))
         assert out["ok"] is True
         assert out["results"] == []

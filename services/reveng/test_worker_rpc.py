@@ -24,6 +24,13 @@ def reveng_dir(tmp_path, monkeypatch):
     d = tmp_path / "reveng"
     d.mkdir()
     monkeypatch.setenv("CHUDWARE_REVENG_DIR", str(d))
+    from services.mcp import reveng_session_tools
+    monkeypatch.setattr(reveng_session_tools, "_find_reference_models",
+                        lambda query, **kwargs: {
+                            "ok": True, "query": query, "candidates": [],
+                        })
+    monkeypatch.setattr(reveng_session_tools, "_research_ingest",
+                        lambda **kwargs: {"ok": True, "candidate_dims": []})
     return d
 
 
@@ -55,11 +62,16 @@ def test_start_session_then_list_and_get(reveng_dir):
     assert got["ok"] and got["session"]["session_id"] == sid
 
 
-def test_start_session_with_research_seed_populates_lane(reveng_dir):
-    # A part number seed routes through the research/datasheet lane (RE-29).
+def test_start_session_with_research_seed_populates_lane(reveng_dir, monkeypatch):
+    from services.mcp import reveng_session_tools as session_tools
+
+    search = lambda query, **kwargs: {"ok": True, "query": query, "candidates": []}
+    ingest = lambda **kwargs: {"ok": True, "candidate_dims": []}
+    monkeypatch.setattr(session_tools, "_find_reference_models", search)
+    monkeypatch.setattr(session_tools, "_research_ingest", ingest)
     r = _call("reveng_start_session", {"research": "SKF 6205"})
     assert r["ok"]
-    assert "research_result" in r  # the datasheet/web lane was invoked
+    assert r["research_result"]["ok"]
 
 
 def test_add_images_delivers_photos(reveng_dir, tmp_path):
@@ -156,12 +168,12 @@ def _media_harvest(monkeypatch, images, documents):
 
 def _writing_download(cooldown_after: int | None = None, calls: list | None = None):
     """browser_download stub: writes real images, and after ``cooldown_after``
-    successful calls starts answering with the cooldown_active refusal."""
+    successful calls starts answering with a rate_limited refusal."""
     def _download(url, site, dest, **_k):
         if calls is not None:
             calls.append(url)
         if cooldown_after is not None and len(calls or []) > cooldown_after:
-            return {"ok": False, "reason": "cooldown_active", "retry_after_s": 612.0,
+            return {"ok": False, "reason": "rate_limited", "retry_after_s": 612.0,
                     "policy_refusal": True, "executed": False, "hint": "cooling down"}
         dest.parent.mkdir(parents=True, exist_ok=True)
         if dest.suffix == ".pdf":
@@ -174,7 +186,7 @@ def _writing_download(cooldown_after: int | None = None, calls: list | None = No
 
 def test_harvest_keeps_partial_results_when_the_site_starts_cooling_down(
         reveng_dir, monkeypatch):
-    """Item #3 is refused with cooldown_active: the call still SUCCEEDS with the two
+    """Item #3 is refused with rate_limited: the call still SUCCEEDS with the two
     images it got, reports how many were skipped and why, and never touches the
     remaining same-site URLs (documents included)."""
     from services.browser import session as bsession
@@ -195,7 +207,7 @@ def test_harvest_keeps_partial_results_when_the_site_starts_cooling_down(
     assert r["documents_ingested"] == 0
     # 3 remaining images (c,d,e) + the 1 document, none of them attempted after the refusal
     assert r["media_skipped"] == 4
-    assert r["media_skipped_reason"] == "cooldown_active"
+    assert r["media_skipped_reason"] == "rate_limited"
     assert r["retry_after_s"] == 612.0
     assert len(calls) == 3, calls                     # stopped AT the refusal, not after
     assert "ds.pdf" not in " ".join(calls)
@@ -301,3 +313,20 @@ def test_capture_sessions_share_the_recon_tools_registry(monkeypatch):
     # …and the honest failure for a port nobody started.
     gone = _call("stop_capture_session", {"port": 8888})
     assert gone["ok"] is False and "no capture session" in gone["reason"]
+
+
+@pytest.mark.parametrize("extra, expected", [
+    ("", "points"),
+    ("element face 1\nproperty list uchar int vertex_indices\n", "mesh"),
+    ("property float opacity\n" +
+     "".join(f"property float scale_{i}\n" for i in range(3)) +
+     "".join(f"property float rot_{i}\n" for i in range(4)) +
+     "".join(f"property float f_dc_{i}\n" for i in range(3)), "gaussian"),
+])
+def test_worker_classifies_ply_by_server_header(tmp_path, extra, expected):
+    path = tmp_path / "source.ply"
+    path.write_text("ply\nformat ascii 1.0\nelement vertex 1\n"
+                    "property float x\nproperty float y\nproperty float z\n" +
+                    extra + "end_header\n")
+    result = _call("reveng_import_splat", {"classify_ply": str(path)})
+    assert result == {"ok": True, "kind": expected}

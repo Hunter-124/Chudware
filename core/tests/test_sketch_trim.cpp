@@ -400,3 +400,557 @@ TEST_CASE("geom: offset inside a circle cannot exceed its radius") {
     REQUIRE(valid.size() == 1);
     CHECK(valid[0].at("radius").get<double>() == doctest::Approx(3.0));
 }
+
+TEST_CASE("op: offset connects a line chain to its source with driving distance") {
+    std::string fid;
+    const std::string doc = make_sketch("ParametricOffset",
+        json::array({line("e1", 0, 0, 10, 0), line("e2", 10, 0, 10, 10)}),
+        json::array({{{"id", "c1"}, {"type", "fix"}, {"refs", {"e1"}}},
+                     {{"id", "c2"}, {"type", "fix"}, {"refs", {"e2"}}}}), fid);
+    const json result = doc_apply_ops(doc, -1, json::array({
+        {{"op", "sketch_offset"}, {"sketch", fid}, {"entities", {"e1", "e2"}},
+         {"distance", {{"value", 3.0}, {"expr", "1+2"}}}, {"side", {5, 5}}}
+    }), false);
+    const json params = feature_of(result.at("tree"), fid).at("params");
+    int parallel = 0, driven = 0, equal = 0;
+    std::string master;
+    for (const auto& c : params.at("constraints")) {
+        parallel += c.at("type") == "parallel";
+        equal += c.at("type") == "equal";
+        if (c.at("type") == "distance" && c.at("value").at("expr") == "1+2") {
+            ++driven;
+            master = c.at("id").get<std::string>();
+        }
+    }
+    CHECK(parallel == 2);
+    CHECK(driven == 1);
+    CHECK(equal == 1);
+    REQUIRE_FALSE(master.empty());
+    doc_apply_ops(doc, -1, json::array({
+        {{"op", "sketch_set_dim"}, {"sketch", fid}, {"id", master}, {"value", 4}}
+    }), false);
+    const json overview = doc_sketch_overview(doc, fid);
+    const auto* first = find_ent(overview, result.at("id_map").at("$0").get<std::string>());
+    const auto* second = find_ent(overview, result.at("id_map").at("$0#1").get<std::string>());
+    REQUIRE(first != nullptr);
+    REQUIRE(second != nullptr);
+    CHECK(first->at("p1")[1].get<double>() == doctest::Approx(4.0).epsilon(1e-6));
+    CHECK(second->at("p1")[0].get<double>() == doctest::Approx(6.0).epsilon(1e-6));
+    const json health = chudware::doc::doc_sketch_health(doc, fid);
+    CHECK_MESSAGE(health.at("skipped_constraints").empty(), health.dump());
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("op: linear pattern retains expression spacing and source relations") {
+    std::string fid;
+    const std::string doc = make_sketch("ParametricLinearPattern",
+        json::array({line("e1", 0, 0, 2, 0)}),
+        json::array({{{"id", "c1"}, {"type", "fix"}, {"refs", {"e1"}}}}), fid);
+    const json result = doc_apply_ops(doc, -1, json::array({
+        {{"op", "sketch_pattern_entities"}, {"sketch", fid}, {"entities", {"e1"}},
+         {"mode", "linear"}, {"dir", {1, 0}}, {"count", 3},
+         {"spacing", {{"value", 5.0}, {"expr", "2+3"}}}}
+    }), false);
+    const json params = feature_of(result.at("tree"), fid).at("params");
+    const auto* first = find_ent(params, result.at("id_map").at("$0").get<std::string>());
+    const auto* second = find_ent(params, result.at("id_map").at("$0#1").get<std::string>());
+    REQUIRE(first != nullptr);
+    REQUIRE(second != nullptr);
+    CHECK(first->at("p1")[0].get<double>() == doctest::Approx(5.0));
+    CHECK(second->at("p1")[0].get<double>() == doctest::Approx(10.0));
+    int dims = 0, equal = 0;
+    std::string master;
+    for (const auto& c : params.at("constraints")) {
+        if (c.at("type") == "distance" && c.at("value").at("expr") == "2+3") {
+            ++dims;
+            master = c.at("id").get<std::string>();
+        }
+        if (c.at("type") == "equal") ++equal;
+    }
+    CHECK(dims == 1);
+    CHECK(equal == 3);
+    REQUIRE_FALSE(master.empty());
+    doc_apply_ops(doc, -1, json::array({
+        {{"op", "sketch_set_dim"}, {"sketch", fid}, {"id", master}, {"value", 7}}
+    }), false);
+    const json overview = doc_sketch_overview(doc, fid);
+    const auto* moved_first = find_ent(overview, result.at("id_map").at("$0").get<std::string>());
+    const auto* moved_second = find_ent(overview, result.at("id_map").at("$0#1").get<std::string>());
+    REQUIRE(moved_first != nullptr);
+    REQUIRE(moved_second != nullptr);
+    CHECK(moved_first->at("p1")[0].get<double>() == doctest::Approx(7.0).epsilon(1e-6));
+    CHECK(moved_second->at("p1")[0].get<double>() == doctest::Approx(14.0).epsilon(1e-6));
+    const json health = chudware::doc::doc_sketch_health(doc, fid);
+    CHECK_MESSAGE(health.at("skipped_constraints").empty(), health.dump());
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("op: circular full turn defaults to equal spacing instead of stacking") {
+    std::string fid;
+    const json circle{{"id", "e1"}, {"type", "circle"}, {"center", {5, 0}},
+                      {"radius", 1}, {"construction", false}};
+    const std::string doc = make_sketch("ParametricCircularPattern", json::array({circle}),
+                                         json::array(), fid);
+    const json result = doc_apply_ops(doc, -1, json::array({
+        {{"op", "sketch_pattern_entities"}, {"sketch", fid}, {"entities", {"e1"}},
+         {"mode", "circular"}, {"center", {0, 0}}, {"count", 4},
+         {"angle", {{"value", 360.0}, {"expr", "360"}}}}
+    }), false);
+    const json params = feature_of(result.at("tree"), fid).at("params");
+    const auto* first = find_ent(params, result.at("id_map").at("$0").get<std::string>());
+    REQUIRE(first != nullptr);
+    CHECK(first->at("center")[0].get<double>() == doctest::Approx(0.0).epsilon(1e-7));
+    CHECK(first->at("center")[1].get<double>() == doctest::Approx(5.0));
+    int angular = 0;
+    for (const auto& c : params.at("constraints"))
+        if (c.at("type") == "rotate_point" && c.at("value").at("expr") == "(360)/4") ++angular;
+    CHECK(angular == 3);
+    const json health = chudware::doc::doc_sketch_health(doc, fid);
+    CHECK_MESSAGE(health.at("skipped_constraints").empty(), health.dump());
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("op: circular pattern master angle updates every linked copy") {
+    std::string fid;
+    const json circle{{"id", "e1"}, {"type", "circle"}, {"center", {5, 0}},
+                      {"radius", 1}, {"construction", false}};
+    const json fixed{{"id", "c1"}, {"type", "fix"}, {"refs", {"e1"}}};
+    const std::string doc = make_sketch("PatternMaster", json::array({circle}), json::array({fixed}), fid);
+    const json result = doc_apply_ops(doc, -1, json::array({
+        {{"op", "sketch_pattern_entities"}, {"sketch", fid}, {"entities", {"e1"}},
+         {"mode", "circular"}, {"center", {0, 0}}, {"count", 4}, {"angle", 90}}
+    }), false);
+    const json params = feature_of(result.at("tree"), fid).at("params");
+    std::string master, follower;
+    for (const json& c : params.at("constraints")) {
+        if (c.at("type") != "rotate_point") continue;
+        if (c.contains("angle_ref")) follower = c.at("id").get<std::string>();
+        else master = c.at("id").get<std::string>();
+    }
+    REQUIRE_FALSE(master.empty());
+    REQUIRE_FALSE(follower.empty());
+    const json rejected_probe = chudware::doc::doc_sketch_probe(
+        doc, fid, json{{"set_dim", {{"id", follower}, {"value", 30}}}});
+    CHECK_FALSE(rejected_probe.at("ok").get<bool>());
+    const json master_probe = chudware::doc::doc_sketch_probe(
+        doc, fid, json{{"set_dim", {{"id", master}, {"value", 60}}}});
+    CHECK(master_probe.at("ok").get<bool>());
+    CHECK_MESSAGE(master_probe.at("skipped").empty(), master_probe.dump());
+    const json delete_probe = chudware::doc::doc_sketch_probe(
+        doc, fid, json{{"delete_constraint", {{"id", master}}}});
+    CHECK(delete_probe.at("ok").get<bool>());
+    CHECK(delete_probe.at("deleted_constraints").size() == 3);
+    CHECK_THROWS_AS(doc_apply_ops(doc, -1, json::array({
+        {{"op", "sketch_set_dim"}, {"sketch", fid}, {"id", follower}, {"value", 30}}
+    }), false), chudware::doc::OpError);
+    const json updated = doc_apply_ops(doc, -1, json::array({
+        {{"op", "sketch_set_dim"}, {"sketch", fid}, {"id", master}, {"value", 60}}
+    }), false);
+    const json updated_params = feature_of(updated.at("tree"), fid).at("params");
+    for (const json& c : updated_params.at("constraints"))
+        if (c.value("angle_ref", std::string()) == master) CHECK(c.at("value").at("value") == 60);
+    const json overview = doc_sketch_overview(doc, fid);
+    const auto* last = find_ent(overview, result.at("id_map").at("$0#2").get<std::string>());
+    REQUIRE_MESSAGE(last != nullptr, overview.dump());
+    CHECK(last->at("center")[0].get<double>() == doctest::Approx(-5.0).epsilon(1e-6));
+    CHECK(last->at("center")[1].get<double>() == doctest::Approx(0.0).epsilon(1e-6));
+    const json health = chudware::doc::doc_sketch_health(doc, fid);
+    CHECK(health.at("angle_links").size() == 2);
+    CHECK_MESSAGE(health.at("skipped_constraints").empty(), health.dump());
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("op: circular pattern rejects coincident copies") {
+    bool centered = false;
+    SUBCASE("full turn per step") {}
+    SUBCASE("circle at center") { centered = true; }
+    std::string fid;
+    const json circle{{"id", "e1"}, {"type", "circle"}, {"center", {centered ? 0 : 5, 0}},
+                      {"radius", 1}, {"construction", false}};
+    const std::string doc = make_sketch("OverlappingPattern", json::array({circle}),
+                                         json::array(), fid);
+    const json op{{"op", "sketch_pattern_entities"}, {"sketch", fid}, {"entities", {"e1"}},
+                  {"mode", "circular"}, {"center", {0, 0}}, {"count", 4},
+                  {"angle", centered ? 90 : 360}, {"equal_spacing", false}};
+    CHECK_THROWS_AS(doc_apply_ops(doc, -1, json::array({op}), false), chudware::doc::OpError);
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("op: explicit sketch constraint retains authored expression") {
+    std::string fid;
+    const std::string doc = make_sketch("ExpressionDimensions",
+        json::array({line("e1", 0, 0, 10, 0), line("e2", 10, 0, 10, 10)}),
+        json::array(), fid);
+    const json result = doc_apply_ops(doc, -1, json::array({
+        {{"op", "sketch_add_constraint"}, {"sketch", fid},
+         {"constraint", {{"type", "length"}, {"refs", {"e1"}},
+                         {"value", {{"value", 10.0}, {"expr", "5+5"}}}}}}
+    }), false);
+    bool found = false;
+    const json params = feature_of(result.at("tree"), fid).at("params");
+    for (const auto& c : params.at("constraints"))
+        if (c.at("type") == "length") found = c.at("value").at("expr") == "5+5";
+    CHECK(found);
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("op: fillet and chamfer keep dimensional expressions") {
+    bool fillet = true;
+    SUBCASE("fillet") {}
+    SUBCASE("chamfer") { fillet = false; }
+    std::string fid;
+    const std::string doc = make_sketch("ExpressionCorner",
+        json::array({line("e1", 0, 0, 10, 0), line("e2", 10, 0, 10, 10)}),
+        json::array(), fid);
+    json op{{"op", fillet ? "sketch_fillet" : "sketch_chamfer"}, {"sketch", fid},
+            {"e1", "e1"}, {"e2", "e2"}};
+    op[fillet ? "radius" : "distance"] = {{"value", 1.0}, {"expr", "0.5+0.5"}};
+    const json result = doc_apply_ops(doc, -1, json::array({op}), false);
+    int dims = 0;
+    const json params = feature_of(result.at("tree"), fid).at("params");
+    for (const auto& c : params.at("constraints"))
+        if (c.contains("value") && c.at("value").at("expr") == "0.5+0.5") ++dims;
+    CHECK(dims == (fillet ? 1 : 2));
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("op: move and rotate retain expressions on copies and in-place transforms") {
+    bool rotate = false, copy_flag = true;
+    SUBCASE("move copy") {}
+    SUBCASE("rotate copy") { rotate = true; }
+    SUBCASE("move in place") { copy_flag = false; }
+    SUBCASE("rotate in place") { rotate = true; copy_flag = false; }
+    std::string fid;
+    const json circle{{"id", "e1"}, {"type", "circle"}, {"center", {5, 0}},
+                      {"radius", 1}, {"construction", false}};
+    const std::string doc = make_sketch("ExpressionTransform", json::array({circle}),
+                                         json::array(), fid);
+    json op{{"op", rotate ? "sketch_rotate" : "sketch_move"}, {"sketch", fid},
+            {"entities", {"e1"}}, {"copy", copy_flag}};
+    if (rotate) {
+        op["cx"] = 0; op["cy"] = 0;
+        op["angle"] = {{"value", 90.0}, {"expr", "45+45"}};
+    } else {
+        op["dx"] = {{"value", 2.0}, {"expr", "1+1"}}; op["dy"] = 0;
+    }
+    const json result = doc_apply_ops(doc, -1, json::array({op}), false);
+    const json params = feature_of(result.at("tree"), fid).at("params");
+    bool found = false;
+    for (const auto& c : params.at("constraints"))
+        if (c.contains("value") && c.at("value").at("expr").is_string() &&
+            c.at("value").at("expr").get<std::string>().find(rotate ? "45+45" : "1+1") != std::string::npos)
+            found = true;
+    CHECK(found);
+    const auto* copy = find_ent(params, result.at("id_map").at("$0").get<std::string>());
+    REQUIRE(copy != nullptr);
+    CHECK(copy->at("center")[0].get<double>() == doctest::Approx(rotate ? 0.0 : 7.0).epsilon(1e-7));
+    CHECK(copy->at("center")[1].get<double>() == doctest::Approx(rotate ? 5.0 : 0.0).epsilon(1e-7));
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("op: pattern spacing re-solves when a driving global changes") {
+    std::string fid;
+    const json circle{{"id", "e1"}, {"type", "circle"}, {"center", {0, 0}},
+                      {"radius", 1}, {"construction", false}};
+    const json fixed{{"id", "c1"}, {"type", "fix"}, {"refs", {"e1"}}};
+    const std::string doc = make_sketch("PatternGlobal", json::array({circle}),
+                                         json::array({fixed}), fid);
+    doc_apply_ops(doc, -1, json::array({{{"op", "eq_set"}, {"name", "Pitch"}, {"expr", "5"}}}), false);
+    const json result = doc_apply_ops(doc, -1, json::array({
+        {{"op", "sketch_pattern_entities"}, {"sketch", fid}, {"entities", {"e1"}},
+         {"mode", "linear"}, {"dir", {1, 0}}, {"count", 2},
+         {"spacing", {{"value", 5.0}, {"expr", "Pitch"}}}}
+    }), false);
+    const std::string copy = result.at("id_map").at("$0");
+    doc_apply_ops(doc, -1, json::array({{{"op", "eq_set"}, {"name", "Pitch"}, {"expr", "8"}}}), false);
+    const json overview = doc_sketch_overview(doc, fid);
+    const auto* entity = find_ent(overview, copy);
+    REQUIRE_MESSAGE(entity != nullptr, overview.dump());
+    CHECK(entity->at("center")[0].get<double>() == doctest::Approx(8.0).epsilon(1e-6));
+    CHECK(entity->at("center")[1].get<double>() == doctest::Approx(0.0).epsilon(1e-6));
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("op: fillet reports its clamped numeric radius") {
+    double requested = 15.0;
+    SUBCASE("upper bound") {}
+    SUBCASE("lower bound") { requested = 0.0; }
+    std::string fid;
+    const std::string doc = make_sketch("ClampedFillet",
+        json::array({line("e1", 0, 0, 10, 0), line("e2", 10, 0, 10, 10)}),
+        json::array(), fid);
+    const json result = doc_apply_ops(doc, -1, json::array({
+        {{"op", "sketch_fillet"}, {"sketch", fid}, {"e1", "e1"}, {"e2", "e2"},
+         {"radius", requested}}
+    }), false);
+    REQUIRE(result.contains("op_reports"));
+    bool found = false;
+    for (const auto& report : result.at("op_reports")) {
+        if (report.value("op", std::string()) != "sketch_fillet") continue;
+        CHECK(report.at("requested_radius") == requested);
+        const double applied = report.at("applied_radius").get<double>();
+        CHECK(applied > 0.0);
+        if (requested > 0) CHECK(applied < requested);
+        found = true;
+    }
+    CHECK(found);
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("op: fillet clamps a driving expression without discarding it") {
+    std::string fid;
+    const std::string doc = make_sketch("ExpressionClampedFillet",
+        json::array({line("e1", 0, 0, 10, 0), line("e2", 10, 0, 10, 10)}),
+        json::array(), fid);
+    const json op{{"op", "sketch_fillet"}, {"sketch", fid}, {"e1", "e1"}, {"e2", "e2"},
+                  {"radius", {{"value", 15.0}, {"expr", "10+5"}}}};
+    const json result = doc_apply_ops(doc, -1, json::array({op}), false);
+    REQUIRE(result.contains("op_reports"));
+    const json& report = result.at("op_reports").front();
+    CHECK(report.at("requested_radius") == 15.0);
+    CHECK(report.at("applied_radius").get<double>() < 15.0);
+    CHECK(report.at("bounds_basis") == "corner geometry at operation time");
+    const json params = feature_of(result.at("tree"), fid).at("params");
+    bool found = false;
+    for (const json& c : params.at("constraints"))
+        if (c.at("type") == "radius" && c.at("value").at("expr").is_string())
+            found = c.at("value").at("expr").get<std::string>().find("min(max((10+5),1e-6),") == 0;
+    CHECK(found);
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("op: centered circle rotation follows subsequent source movement") {
+    std::string fid;
+    const json circle{{"id", "e1"}, {"type", "circle"}, {"center", {0, 0}},
+                      {"radius", 1}, {"construction", false}};
+    const std::string doc = make_sketch("CenteredRotate", json::array({circle}), json::array(), fid);
+    const json rotated = doc_apply_ops(doc, -1, json::array({
+        {{"op", "sketch_rotate"}, {"sketch", fid}, {"entities", {"e1"}}, {"copy", true},
+         {"cx", 0}, {"cy", 0}, {"angle", {{"value", 90}, {"expr", "45+45"}}}}
+    }), false);
+    const std::string copy = rotated.at("id_map").at("$0");
+    doc_apply_ops(doc, -1, json::array({
+        {{"op", "sketch_move"}, {"sketch", fid}, {"entities", {"e1"}}, {"dx", 2}, {"dy", 0}}
+    }), false);
+    const json overview = doc_sketch_overview(doc, fid);
+    const auto* entity = find_ent(overview, copy);
+    REQUIRE_MESSAGE(entity != nullptr, overview.dump());
+    CHECK(entity->at("center")[0].get<double>() == doctest::Approx(0.0).epsilon(1e-6));
+    CHECK(entity->at("center")[1].get<double>() == doctest::Approx(2.0).epsilon(1e-6));
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("op: rotation expression remains driving across the angle branch") {
+    std::string fid;
+    const json circle{{"id", "e1"}, {"type", "circle"}, {"center", {5, 0}},
+                      {"radius", 1}, {"construction", false}};
+    const json fixed{{"id", "c1"}, {"type", "fix"}, {"refs", {"e1"}}};
+    const std::string doc = make_sketch("RotationGlobal", json::array({circle}), json::array({fixed}), fid);
+    doc_apply_ops(doc, -1, json::array({{{"op", "eq_set"}, {"name", "Turn"}, {"expr", "90"}}}), false);
+    const json rotated = doc_apply_ops(doc, -1, json::array({
+        {{"op", "sketch_rotate"}, {"sketch", fid}, {"entities", {"e1"}}, {"copy", true},
+         {"cx", 0}, {"cy", 0}, {"angle", {{"value", 90}, {"expr", "Turn"}}}}
+    }), false);
+    const std::string copy = rotated.at("id_map").at("$0");
+    doc_apply_ops(doc, -1, json::array({{{"op", "eq_set"}, {"name", "Turn"}, {"expr", "270"}}}), false);
+    const json overview = doc_sketch_overview(doc, fid);
+    const auto* entity = find_ent(overview, copy);
+    REQUIRE_MESSAGE(entity != nullptr, overview.dump());
+    CHECK(entity->at("center")[0].get<double>() == doctest::Approx(0.0).epsilon(1e-6));
+    CHECK(entity->at("center")[1].get<double>() == doctest::Approx(-5.0).epsilon(1e-6));
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("sketch validates linked angle masters") {
+    const std::string doc = doc_new("part", "InvalidAngleLink").at("doc_id");
+    json master{{"id", "c1"}, {"type", "rotate_point"}, {"refs", {"e1", "e2", "e3"}},
+                {"value", {{"value", 90}, {"expr", nullptr}}}};
+    json follower{{"id", "c2"}, {"type", "rotate_point"}, {"refs", {"e1", "e2", "e3"}},
+                  {"value", {{"value", 90}, {"expr", nullptr}}}, {"angle_ref", "c1"}};
+    SUBCASE("missing master") { follower["angle_ref"] = "c9"; }
+    SUBCASE("self reference") { follower["angle_ref"] = "c2"; }
+    SUBCASE("wrong master type") {
+        master = {{"id", "c1"}, {"type", "coincident"}, {"refs", {"e1", "e2"}}};
+    }
+    SUBCASE("cycle") { master["angle_ref"] = "c2"; }
+    SUBCASE("different mirrored value") { follower["value"]["value"] = 45; }
+    SUBCASE("driven master") { master["driven"] = true; }
+    const json feature{{"type", "sketch"},
+        {"params", {{"entities", json::array({point("e1", 0, 0), point("e2", 1, 0), point("e3", 0, 0)})},
+                    {"constraints", json::array({master, follower})}}},
+        {"refs", {{"plane", "plane.top"}}}};
+    CHECK_THROWS_AS(doc_apply_ops(doc, -1, json::array({{{"op", "add_feature"}, {"feature", feature}}}),
+                                  false), chudware::doc::OpError);
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("op: pasted linked rotations reference the pasted master") {
+    bool include_master = true;
+    SUBCASE("master and follower included") {}
+    SUBCASE("master omitted") { include_master = false; }
+    std::string fid;
+    const json fixed{{"id", "c1"}, {"type", "fix"}, {"refs", {"e9"}}};
+    const std::string doc = make_sketch("PasteRotationLinks",
+        json::array({point("e9", 20, 20)}), json::array({fixed}), fid);
+    const json value{{"value", 90}, {"expr", nullptr}};
+    json bundle{{"entities", json::array({point("e1", 1, 0), point("e2", 0, 1),
+                                                 point("e3", 0, 0), point("e4", 0, 1)})},
+                      {"constraints", json::array({
+                          {{"id", "c10"}, {"type", "rotate_point"}, {"refs", {"e1", "e2", "e3"}},
+                           {"value", value}},
+                          {{"id", "c11"}, {"type", "rotate_point"}, {"refs", {"e1", "e4", "e3"}},
+                           {"value", value}, {"angle_ref", "c10"}}
+                      })}};
+    if (!include_master) bundle["constraints"].erase(bundle["constraints"].begin());
+    const json result = doc_apply_ops(doc, -1, json::array({
+        {{"op", "sketch_paste_entities"}, {"sketch", fid}, {"entities_bundle", bundle},
+         {"offset_x", 10}, {"offset_y", 0}}
+    }), false);
+    const json params = feature_of(result.at("tree"), fid).at("params");
+    std::string master, linked;
+    for (const auto& c : params.at("constraints")) {
+        if (c.at("type") != "rotate_point") continue;
+        if (c.contains("angle_ref")) linked = c.at("angle_ref").get<std::string>();
+        else master = c.at("id").get<std::string>();
+    }
+    if (include_master) {
+        CHECK_FALSE(master.empty());
+        CHECK(linked == master);
+        CHECK(linked != "c10");
+    } else {
+        CHECK(master.empty());
+        CHECK(linked.empty());
+    }
+    CHECK(chudware::doc::doc_sketch_health(doc, fid).at("skipped_constraints").empty());
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("op: editing move distance keeps copied line rigid") {
+    std::string fid;
+    const json fixed{{"id", "c1"}, {"type", "fix"}, {"refs", {"e1"}}};
+    const std::string doc = make_sketch("LinkedMove", json::array({line("e1", 0, 0, 2, 0)}),
+                                         json::array({fixed}), fid);
+    const json result = doc_apply_ops(doc, -1, json::array({
+        {{"op", "sketch_move"}, {"sketch", fid}, {"entities", {"e1"}}, {"copy", true},
+         {"dx", 5}, {"dy", 0}}
+    }), false);
+    const json params = feature_of(result.at("tree"), fid).at("params");
+    std::string master;
+    int dimensions = 0, equal = 0;
+    for (const json& c : params.at("constraints")) {
+        if (c.at("type") == "signed_distance") {
+            ++dimensions;
+            if (c.at("axis") == "h") master = c.at("id").get<std::string>();
+        }
+        if (c.at("type") == "equal_offset") ++equal;
+    }
+    REQUIRE(dimensions == 2);
+    CHECK(equal == 2);
+    REQUIRE_FALSE(master.empty());
+    doc_apply_ops(doc, -1, json::array({
+        {{"op", "sketch_set_dim"}, {"sketch", fid}, {"id", master}, {"value", 7}}
+    }), false);
+    const json overview = doc_sketch_overview(doc, fid);
+    const auto* copy = find_ent(overview, result.at("id_map").at("$0").get<std::string>());
+    REQUIRE_MESSAGE(copy != nullptr, overview.dump());
+    CHECK(copy->at("p1")[0].get<double>() == doctest::Approx(7.0).epsilon(1e-6));
+    CHECK(copy->at("p2")[0].get<double>() == doctest::Approx(9.0).epsilon(1e-6));
+    CHECK(copy->at("p1")[1].get<double>() == doctest::Approx(0.0).epsilon(1e-6));
+    CHECK(copy->at("p2")[1].get<double>() == doctest::Approx(0.0).epsilon(1e-6));
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("op: move expression passes through zero and reverses without shear") {
+    std::string fid;
+    const json fixed{{"id", "c1"}, {"type", "fix"}, {"refs", {"e1"}}};
+    const std::string doc = make_sketch("SignedMove", json::array({line("e1", 0, 0, 2, 0)}),
+                                         json::array({fixed}), fid);
+    doc_apply_ops(doc, -1, json::array({{{"op", "eq_set"}, {"name", "Shift"}, {"expr", "0"}}}), false);
+    const json result = doc_apply_ops(doc, -1, json::array({
+        {{"op", "sketch_move"}, {"sketch", fid}, {"entities", {"e1"}}, {"copy", true},
+         {"dx", {{"value", 0}, {"expr", "Shift"}}}, {"dy", 0}}
+    }), false);
+    const std::string id = result.at("id_map").at("$0");
+    for (const auto& [expression, expected] :
+         std::vector<std::pair<std::string, double>>{{"-3", -3}, {"4", 4}}) {
+        const json update = doc_apply_ops(doc, -1, json::array({
+            {{"op", "eq_set"}, {"name", "Shift"}, {"expr", expression}}
+        }), false);
+        REQUIRE_MESSAGE(!update.contains("rejected_tree"), update.dump());
+        const json overview = doc_sketch_overview(doc, fid);
+        REQUIRE_MESSAGE(!overview.at("solve_rejected").get<bool>(), overview.dump());
+        const auto* copy = find_ent(overview, id);
+        REQUIRE_MESSAGE(copy != nullptr, overview.dump());
+        CHECK(copy->at("p1")[0].get<double>() == doctest::Approx(expected).epsilon(1e-6));
+        CHECK(copy->at("p2")[0].get<double>() == doctest::Approx(expected + 2).epsilon(1e-6));
+    }
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("op: in-place circle transforms preserve editable radius") {
+    bool rotate = false;
+    SUBCASE("move") {}
+    SUBCASE("rotate") { rotate = true; }
+    std::string fid;
+    const json circle{{"id", "e1"}, {"type", "circle"}, {"center", {5, 0}},
+                      {"radius", 1}, {"construction", false}};
+    const json radius{{"id", "c1"}, {"type", "radius"}, {"refs", {"e1"}},
+                      {"value", {{"value", 1}, {"expr", nullptr}}}};
+    const std::string doc = make_sketch("EditableCircleTransform", json::array({circle}),
+                                         json::array({radius}), fid);
+    json op{{"op", rotate ? "sketch_rotate" : "sketch_move"}, {"sketch", fid},
+            {"entities", {"e1"}}};
+    if (rotate) { op["cx"] = 0; op["cy"] = 0; op["angle"] = 90; }
+    else { op["dx"] = 2; op["dy"] = 0; }
+    doc_apply_ops(doc, -1, json::array({op}), false);
+    doc_apply_ops(doc, -1, json::array({
+        {{"op", "sketch_set_dim"}, {"sketch", fid}, {"id", "c1"}, {"value", 2}}
+    }), false);
+    const json overview = doc_sketch_overview(doc, fid);
+    const auto* result = find_ent(overview, "e1");
+    REQUIRE_MESSAGE(result != nullptr, overview.dump());
+    CHECK(result->at("radius").get<double>() == doctest::Approx(2.0).epsilon(1e-7));
+    CHECK(result->at("center")[0].get<double>() == doctest::Approx(rotate ? 0.0 : 7.0).epsilon(1e-6));
+    CHECK(result->at("center")[1].get<double>() == doctest::Approx(rotate ? 5.0 : 0.0).epsilon(1e-6));
+    CHECK(chudware::doc::doc_sketch_health(doc, fid).at("skipped_constraints").empty());
+    chudware::doc::doc_close(doc);
+}
+
+TEST_CASE("op: in-place line and arc transforms retain editable size dimensions") {
+    bool rotate = false, curved = false;
+    SUBCASE("move line") {}
+    SUBCASE("rotate line") { rotate = true; }
+    SUBCASE("move arc") { curved = true; }
+    SUBCASE("rotate arc") { rotate = true; curved = true; }
+    std::string fid;
+    const json entity = curved ? arc("e1", 5, 0, 1, 0, 90, true) : line("e1", 5, 0, 7, 0);
+    const json size{{"id", "c1"}, {"type", curved ? "radius" : "length"}, {"refs", {"e1"}},
+                    {"value", {{"value", curved ? 1 : 2}, {"expr", nullptr}}}};
+    const std::string doc = make_sketch("EditableTransformSize", json::array({entity}),
+                                         json::array({size}), fid);
+    json op{{"op", rotate ? "sketch_rotate" : "sketch_move"}, {"sketch", fid},
+            {"entities", {"e1"}}};
+    if (rotate) { op["cx"] = 0; op["cy"] = 0; op["angle"] = 90; }
+    else { op["dx"] = 2; op["dy"] = 0; }
+    doc_apply_ops(doc, -1, json::array({op}), false);
+    doc_apply_ops(doc, -1, json::array({
+        {{"op", "sketch_set_dim"}, {"sketch", fid}, {"id", "c1"}, {"value", curved ? 2 : 4}}
+    }), false);
+    const json overview = doc_sketch_overview(doc, fid);
+    const auto* result = find_ent(overview, "e1");
+    REQUIRE_MESSAGE(result != nullptr, overview.dump());
+    if (curved) {
+        CHECK(result->at("radius").get<double>() == doctest::Approx(2.0).epsilon(1e-6));
+        CHECK(result->at("center")[0].get<double>() == doctest::Approx(rotate ? 0.0 : 7.0).epsilon(1e-6));
+        CHECK(result->at("center")[1].get<double>() == doctest::Approx(rotate ? 5.0 : 0.0).epsilon(1e-6));
+    } else {
+        const json& a = result->at("p1");
+        const json& b = result->at("p2");
+        CHECK(std::hypot(a[0].get<double>() - b[0].get<double>(),
+                         a[1].get<double>() - b[1].get<double>()) == doctest::Approx(4.0).epsilon(1e-6));
+        CHECK(a[0].get<double>() == doctest::Approx(rotate ? 0.0 : 7.0).epsilon(1e-6));
+        CHECK(a[1].get<double>() == doctest::Approx(rotate ? 5.0 : 0.0).epsilon(1e-6));
+    }
+    CHECK(chudware::doc::doc_sketch_health(doc, fid).at("skipped_constraints").empty());
+    chudware::doc::doc_close(doc);
+}

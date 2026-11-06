@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 
@@ -18,9 +19,14 @@
 #include <unistd.h>
 #endif
 
+#if defined(__linux__) && defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
 #include "../../services/worker/cpp_core.h"
 #include "../../services/ipc/ipc_private.h"
 #include "../util/sha256.h"
+#include "file_watch.h"
 #include "hostd_log.h"
 #include "mfg_lane.h"
 #include "worker_bridge.h"
@@ -34,6 +40,27 @@ namespace {
 std::mutex cacheSinkMutex;
 Server* cacheSinkServer = nullptr;
 
+// A worker manifest must never disclose paths outside the workspace. Resolve
+// symlinks as well as lexical traversal before returning browser-usable paths.
+bool workspaceManifestPath(const std::string& raw, const std::string& work,
+                           std::string& relative) {
+    if (raw.empty() || raw.find('\0') != std::string::npos) return false;
+    std::filesystem::path root(work), path(raw);
+    if (path.is_absolute() && (path == "/work" || raw.rfind("/work/", 0) == 0))
+        path = root / path.lexically_relative("/work");
+    else if (!path.is_absolute())
+        path = root / path;
+    std::error_code ec;
+    path = std::filesystem::weakly_canonical(path, ec);
+    if (ec) return false;
+    auto part = path.begin();
+    for (auto base = root.begin(); base != root.end(); ++base, ++part)
+        if (part == path.end() || *part != *base) return false;
+    const auto rel = path.lexically_relative(root);
+    relative = rel.empty() ? "." : rel.generic_string();
+    return true;
+}
+
 void workspaceRelativePaths(json& value, const std::string& work) {
     if (value.is_array()) {
         for (auto& entry : value) workspaceRelativePaths(entry, work);
@@ -44,14 +71,44 @@ void workspaceRelativePaths(json& value, const std::string& work) {
             "image_path", "save_path", "model_path", "artifact_path", "out_path",
             "step_path", "stl_path", "brep_path", "gcode_path", "progress_path"
         };
-        for (auto& field : value.items()) {
-            auto& entry = field.value();
-            if (entry.is_string() && std::find(std::begin(keys), std::end(keys), field.key()) != std::end(keys)) {
+        for (auto it = value.begin(); it != value.end();) {
+            // Runtime journals and directories are actor-private, not workspace
+            // paths or browser resume handles. Never disclose them in replies or
+            // streamed events, including nested payloads.
+            const auto& key = it.key();
+            if (key == "omp_session_file" || key == "omp_session_dir" ||
+                key == "session_file" || key == "sessionFile" ||
+                key == "session_dir" || key == "sessionDir") {
+                it = value.erase(it);
+                continue;
+            }
+            auto& entry = it.value();
+            if (key == "exported_files" || key == "reused_files") {
+                json safe = json::array();
+                if (entry.is_array()) {
+                    for (const auto& item : entry) {
+                        std::string relative;
+                        if (item.is_string() &&
+                            workspaceManifestPath(item.get_ref<const std::string&>(), work, relative))
+                            safe.push_back(std::move(relative));
+                    }
+                }
+                entry = std::move(safe);
+                ++it;
+                continue;
+            }
+            if (entry.is_string() && std::find(std::begin(keys), std::end(keys), key) != std::end(keys)) {
                 const std::string& path = entry.get_ref<const std::string&>();
-                if (path == work) entry = ".";
-                else if (path.size() > work.size() && path.compare(0, work.size(), work) == 0 &&
-                         path[work.size()] == '/') entry = path.substr(work.size() + 1);
+                if (!path.empty()) {
+                    std::string relative;
+                    if (!workspaceManifestPath(path, work, relative)) {
+                        it = value.erase(it);
+                        continue;
+                    }
+                    entry = std::move(relative);
+                }
             } else workspaceRelativePaths(entry, work);
+            ++it;
         }
     }
 }
@@ -134,8 +191,9 @@ static long long engineWatchdogLongMs() {
     return ms;
 }
 
-Server::Server(chudware_ipc::IpcListener listener, std::string buildId)
-    : listener_(std::move(listener)), buildId_(std::move(buildId)) {
+Server::Server(chudware_ipc::IpcListener listener, std::string buildId, std::string daemonStartId)
+    : listener_(std::move(listener)), buildId_(std::move(buildId)),
+      daemonStartId_(std::move(daemonStartId)) {
     registry_.setEventSender(
         [this](int clientId, const std::string& line) { sendEventTo(clientId, line); });
     children_.setBroadcast([this](const std::string& line) {
@@ -391,9 +449,6 @@ void Server::retireActorGeneration(const std::string& actor, long long revokedTh
         json result;
         std::string err;
         const json stop{{"_cell_ctx", owner}, {"_cell_revoke_through", revokedThrough}};
-        json agentStop = stop;
-        agentStop["run_id"] = "";
-        core::cpp_core().call("agent_cancel", agentStop, result, err);
         json simStop = stop;
         simStop["job_id"] = "";
         core::cpp_core().call("sim_cancel", simStop, result, err);
@@ -422,10 +477,11 @@ bool Server::cellAdmit(ClientConn& c, const std::string& method, json& params, j
     // Canonical path confinement supplements the namespace boundary, including symlinks.
     static const std::vector<std::string> pathKeys = {
         "path", "file_path", "folder_path", "output_path", "input_path", "source_path",
-        "target_path", "workspace_dir", "project_dir", "session_file", "chudcode_session_file",
+        "target_path", "workspace_dir", "project_dir", "session_file", "omp_session_file",
+        "omp_session_dir",
         "aicm_path", "brep_path", "stl_path", "step_path", "image_path", "save_path",
         "model_path", "artifact_path", "working_dir", "cwd", "directory", "root",
-        "out_path", "progress_path", "prompts_dir", "output_dir", "input_dir"
+        "out_path", "dest", "progress_path", "prompts_dir", "output_dir", "input_dir"
     };
     const auto under = [](const std::filesystem::path& p, const std::filesystem::path& root) {
         auto a = p.begin();
@@ -589,18 +645,12 @@ void Server::sendEventTo(int clientId, const std::string& line) {
     } else sendConnectionEvent(*c, line);
 }
 
-// Live callback contexts. They live on the dispatch stack for the duration of the synchronous
-// engine call; both C sinks are thread-local and cleared before these objects leave scope.
+// Live callback context. It lives on the dispatch stack for the duration of the synchronous
+// engine call; the C sink is thread-local and cleared before this object leaves scope.
 namespace {
 // renewWatchdog: each streamed progress event restarts the call's long-tier watchdog clock,
 // turning that wall-clock ceiling into a silence bound for a solve that reports progress.
 struct StreamCtx { hostd::Server* srv; int clientId; bool renewWatchdog = false; };
-struct DocPublishCtx {
-    hostd::Server* srv;
-    int clientId;
-    std::string userId;
-    std::string userDisplay;
-};
 }
 
 void Server::sendAgentEvent(int clientId, const char* eventJson) {
@@ -655,27 +705,6 @@ void Server::streamThunk(const char* eventJson, void* ud) {
     ctx->srv->sendAgentEvent(ctx->clientId, eventJson);
 }
 
-void Server::docPublishThunk(const char* method, const char* paramsJson,
-                             const char* resultJson, void* ud) {
-    auto* ctx = static_cast<DocPublishCtx*>(ud);
-    if (!ctx || !ctx->srv || !method || !paramsJson || !resultJson) return;
-    try {
-        json params = json::parse(paramsJson);
-        json result = json::parse(resultJson);
-        // The nested operation is an AI writer even when the outer agent_run RPC arrived on the
-        // GUI connection. fanoutToSource=true is essential: that GUI is the viewer waiting to
-        // open/update the mirror tab, while the real client id still owns the registry attach.
-        ctx->srv->registry_.postCall(ctx->clientId, "agent", ctx->userId, ctx->userDisplay,
-                                     method, params, result, /*fanoutToSource=*/true);
-    } catch (const std::exception& e) {
-        log().line("agent doc publication failed method=%s: %s", method, e.what());
-    } catch (...) {
-        // Publication is transparency, not the commit. A malformed optional callback payload
-        // must not convert already-committed modeling work into an agent failure.
-        log().line("agent doc publication failed method=%s: unknown error", method);
-    }
-}
-
 std::string Server::detachSocketForFlockRelease() {
     // Close the listen fd so new connects fail, but leave the sock file for
     // SingleInstance to unlink when it drops the flock.
@@ -719,23 +748,18 @@ Server::~Server() {
 
 void Server::touch() { status_.lastActivityMs = monoMs(); }
 
-// Stale-binary self-drain backstop (Phase 8; plan Design A "Version &
-// staleness"). Deploys are temp+RENAME (never cp over a live .so — SIGBUS), so
-// an mtime change on the hostd binary or the loaded libchudware means a NEW file
-// sits at that path: drain so existing clients finish, while new connects get the
-// named `daemon_draining` refusal (admitWhileDraining). The instance key is the
-// hostd path, so no successor can bind beside this daemon: the new build starts
-// when the last pinning client leaves (or Chudware restarts). Installers calling
-// --stop are the primary path; this covers dev rebuilds.
-void Server::staleBinaryTick() {
+// A replaced hostd or engine starts a soft drain. Existing sessions finish on
+// the old engine; only their already-owned agent workers may open the fresh MCP
+// sockets needed by later turns. Independent clients wait for the next daemon.
+void Server::staleBinaryTick(bool initial) {
     static const long long intervalMs = [] {
         if (const char* s = std::getenv("CHUDWARE_HOSTD_STALECHECK_S"); s && *s)
             return (long long)std::max(1, std::atoi(s)) * 1000;
         return 60000LL;
     }();
     const long long now = monoMs();
-    if (now - lastStaleCheckMs_ < intervalMs) return;
-    lastStaleCheckMs_ = now;
+    if (!initial && now - lastStaleCheckMs_ < intervalMs) return;
+    if (!initial) lastStaleCheckMs_ = now;
     namespace fs = std::filesystem;
     const std::string paths[] = {selfBinary_, core::cpp_core().loadedPath()};
     for (const std::string& p : paths) {
@@ -757,13 +781,18 @@ void Server::staleBinaryTick() {
 }
 
 void Server::beginDrain(int deadlineSecs, std::string reason, std::string changedPath) {
-    {
-        std::lock_guard<std::mutex> lk(drainMtx_);
-        drainReason_ = std::move(reason);
-        if (!changedPath.empty()) drainChangedPath_ = std::move(changedPath);
-    }
-    status_.draining = true;
+    std::lock_guard<std::mutex> lk(drainMtx_);
+    // A late stale check must never downgrade an explicit stop or refresh the
+    // eligibility snapshot after the drain has already begun.
+    if (deadlineSecs <= 0 && status_.draining.load()) return;
+    if (deadlineSecs <= 0 && reason == "stale_binary" && !cell_)
+        drainAgentPeers_ = WorkerBridge::snapshotAgentPeers();
+    else
+        drainAgentPeers_.clear();
+    drainReason_ = std::move(reason);
+    if (!changedPath.empty()) drainChangedPath_ = std::move(changedPath);
     drainDeadlineMs_ = deadlineSecs > 0 ? monoMs() + (long long)deadlineSecs * 1000 : 0;
+    status_.draining = true;
 }
 
 std::string Server::drainReason() const {
@@ -793,7 +822,7 @@ json Server::drainRefusal() {
         r["changed_path"] = changedPath;
         r["message"] = "The engine changed on disk (" + file +
                        "). This daemon runs the old engine and is draining. Open sessions "
-                       "continue on the old engine. New clients cannot connect until " +
+                       "continue on the old engine. New independent clients cannot connect until " +
                        std::to_string(active) + " active session(s) end.";
         r["hint"] = "Restart Chudware to load the new engine. Or wait until the open sessions "
                     "end, then connect again. Do not start a separate in-process engine: it "
@@ -808,7 +837,8 @@ json Server::drainRefusal() {
     return r;
 }
 
-bool Server::admitWhileDraining(chudware_ipc::IpcConn& conn, std::string& firstLine) {
+bool Server::admitWhileDraining(chudware_ipc::IpcConn& conn, std::string& firstLine,
+                                bool allowControl) {
     // Every client sends hello as soon as it connects, so a short bound is enough. It
     // also bounds how long one silent connect can hold the accept loop.
     std::string line;
@@ -833,9 +863,34 @@ bool Server::admitWhileDraining(chudware_ipc::IpcConn& conn, std::string& firstL
     // An operator control client (`chudware-hostd --status` / `--stop`) is admitted: it
     // reports the drain, or turns a soft drain into a hard stop. It holds no document, and
     // it disconnects at once, so it never extends the drain.
-    if (method == "hello" && kind == "control") {
+    if (allowControl && method == "hello" && kind == "control") {
         firstLine = std::move(line);
         return true;
+    }
+    const bool guiLane = kind == "gui" || kind == "gui-background";
+    if (!cell_ && method == "hello" && (kind == "mcp" || guiLane)) {
+        const long peerPid = conn.peerPid();
+        bool admit = false;
+        {
+            std::lock_guard<std::mutex> lk(drainMtx_);
+            admit = drainReason_ == "stale_binary" && drainDeadlineMs_.load() == 0 &&
+                    (guiLane || WorkerBridge::ownsAgentPeer(drainAgentPeers_, peerPid));
+        }
+        // A GUI opens side connections (agent answer/steer/cancel, background queries)
+        // beside its primary one. They belong to an open session, not an independent
+        // client: the app's own `gui` connection already pins this drain.
+        if (admit && guiLane) {
+            admit = false;
+            if (peerPid > 0) {
+                std::lock_guard<std::mutex> lk(clientsMtx_);
+                for (const auto& [id, client] : clients_)
+                    if (client->guiPeerPid.load() == peerPid) { admit = true; break; }
+            }
+        }
+        if (admit) {
+            firstLine = std::move(line);
+            return true;
+        }
     }
     json refusal = drainRefusal();
     log().line("draining (%s): refused new %s client (%s)",
@@ -952,16 +1007,8 @@ void Server::disconnectAllClients() {
     for (const auto& c : live) c->conn.shutdown();
 }
 
-// The doc-GC grace no longer pins the daemon. It used to: idleExpired() refused to exit while
-// any doc was still counting down, so that a clean exit's autosave purge could not destroy work
-// the grace was protecting. But that check is only ever REACHED when nothing is attached and no
-// client is pinning — i.e. exactly when nobody can open the doc the grace is holding open — and
-// with the agent floor at 30 min it kept the daemon (and its tray icon) alive for half an hour
-// after the user closed the app. The floor's real job is app-runtime: keep a just-finished
-// mission's part openable from the GUI while the GUI exists. A doc whose grace expires while
-// the daemon is serving is still retired by tick() exactly as before; a clean exit still
-// discards, which is the documented crash-only-recovery rule
-// (autosave.h, test_hostd_registry.py::test_clean_shutdown_discards_docs).
+// The GC grace does not pin an idle daemon: shutdown snapshots and migrates
+// every outstanding dirty document before the process exits.
 
 bool Server::idleExpired(int lingerSecs) {
     // After the last GUI detached, only an ACTIVE non-GUI client or in-flight work justifies
@@ -984,7 +1031,10 @@ void Server::acceptClient(chudware_ipc::IpcConn conn, bool gateway, const std::s
                           bool operatorListener) {
     if (!conn.valid()) return;
     std::string firstLine;
-    if (status_.draining && !(cell_ && !gateway) && !admitWhileDraining(conn, firstLine)) return;
+    // Cell actor sockets are not operator channels. In particular, claiming
+    // "control" on one must not bypass a hard or stale-binary drain.
+    if (status_.draining &&
+        !admitWhileDraining(conn, firstLine, !cell_ || gateway)) return;
     auto c = std::make_shared<ClientConn>();
     c->gateway = gateway;
     c->operatorListener = operatorListener;
@@ -1028,6 +1078,28 @@ void Server::acceptClient(chudware_ipc::IpcConn conn, bool gateway, const std::s
 
 void Server::run(int lingerSecs) {
     children_.start();
+    auto fileWatch = std::make_unique<FileWatch>(
+        [this]() -> json {
+            if (status_.engineState.load() != 1) return nullptr;
+            json rows;
+            std::string error;
+            if (!core::cpp_core().call("doc_list", json::object(), rows, error)) return nullptr;
+            registry_.annotateDocList(rows, -1);
+            return rows;
+        },
+        [this](const std::string& id, const std::string& path, const json& stamp) {
+            ClientConn system;
+            system.id = -1;
+            system.kind = "system";
+            bool error = false;
+            const json result = dispatch(system, "doc_reload",
+                json{{"doc_id", id}, {"origin", "system"}, {"_watch_path", path},
+                     {"_watch_stamp", stamp}}, error);
+            if (error) return FileWatch::Outcome::Retry;
+            if (result.value("_watch_conflict", false)) return FileWatch::Outcome::Conflict;
+            if (result.value("_watch_reloaded", false)) return FileWatch::Outcome::Reloaded;
+            return FileWatch::Outcome::Retry;
+        });
     // Either tier being enabled is reason enough to run the thread: the ceilings are tuned
     // independently, so disabling the interactive one must not silently disable the long one.
     if (engineWatchdogMs_ > 0 || engineWatchdogLongMs() > 0)
@@ -1045,9 +1117,8 @@ void Server::run(int lingerSecs) {
             for (const auto& [actor, listener] : listeners)
                 acceptClient(listener->accept(0), false, actor);
         }
-        // Expire stale edit-holds + emit doc.lease_change; docs whose GC grace
-        // expired with no attached client are retired + closed here so dead
-        // sessions can never pile zombie docs into the shared engine.
+        // Expire stale edit-holds; retire documents only after their attachment
+        // and live-run holds have ended and the orphan grace has elapsed.
         for (const std::string& id : registry_.tick()) gcCloseDoc(id);
         staleBinaryTick();  // mtime watch on hostd binary + libchudware (self-drain)
         if (cell_) {
@@ -1066,7 +1137,8 @@ void Server::run(int lingerSecs) {
             // silent socket was allowed to veto its own shutdown forever.
             const long long deadline = drainDeadlineMs_.load();
             const bool expired = deadline > 0 && monoMs() >= deadline;
-            const bool noWork = pinningClients(guiExitGraceSecs_) == 0 && status_.inflight == 0;
+            const bool noWork = pinningClients(guiExitGraceSecs_) == 0 &&
+                                status_.inflight == 0 && children_.aliveCount() == 0;
             bool safeCell = !cell_;
             if (cell_ && noWork && monoMs() - lastCellProbeMs_ >= 1000) {
                 lastCellProbeMs_ = monoMs();
@@ -1094,108 +1166,96 @@ void Server::run(int lingerSecs) {
             break;
         }
     }
+    // Stop accepting requests and cancel worker turns before waiting for client
+    // threads: a turn can otherwise hold a thread indefinitely. Keep sockets
+    // open until their in-flight replies have been delivered.
+    stopping_ = true;
+    WorkerBridge::shutdownIfCreated();
+    while (status_.inflight.load() > 0 || controlRepliesPending_.load() > 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    disconnectAllClients();
+    fileWatch.reset();
     // Every exit path (drain / idle / SIGTERM via stop()): stop the children
     // (TERM -> 5 s grace -> KILL) BEFORE main runs the final autosave, so the
     // saved state postdates the last agent edit. Daemon SIGKILL is covered by
     // each child's PDEATHSIG.
     children_.shutdown();
+    std::vector<std::shared_ptr<ClientConn>> live;
+    std::vector<std::thread> threads;
+    {
+        std::lock_guard<std::mutex> lk(clientsMtx_);
+        for (auto& [id, client] : clients_) {
+            live.push_back(client);
+            if (client->thread.joinable()) threads.push_back(std::move(client->thread));
+        }
+    }
+    for (auto& thread : threads) thread.join();
+    for (auto& client : live) client->conn.close();
 }
 
-bool Server::gcCloseDoc(const std::string& docId, const char* reason) {
+bool Server::gcCloseDoc(const std::string& docId, const char* reason, int clientId,
+                        const std::string& clientKind, const char* method) {
     if (status_.engineState.load() != 1) return false;
-    // TOCTOU guard: tick() decided this doc was abandoned under the registry
-    // lock, then released it before we got here. A client may have re-attached
-    // in that window (GUI re-list -> attach_doc, or an implicit rw touch); closing
-    // it now would yank a live doc out from under that client. Re-check under the
-    // lock and bail if it's no longer abandoned.
-    if (!registry_.isReapable(docId)) return false;
-    // Explicit discard (reason "discarded", from doc_discard) = the app dropped
-    // this part deliberately -> PURGE. doc-GC (reason "gc") = every client vanished
-    // WITHOUT discarding -> a crash: RETIRE to the orphan tier so the work stays
-    // recoverable, then close to free memory. A clean doc already safe in a real
-    // user file is just closed.
-    //
-    // An INTERNAL doc is purged either way: it is the agent preflight advisor's
-    // throwaway shadow clone (DocRegistry::isInternal), never user work. The agent
-    // closes it itself in the normal case; when its worker dies mid-run doc-GC is
-    // the only thing left to clean up, and retiring it instead put `<part>_pf`
-    // clones in the "Recover?" prompt — a user accepted four of them and got a tab
-    // strip of half-built shadow copies of their real part.
-    const bool discard = std::string_view(reason) == "discarded" || registry_.isInternal(docId);
-    json result;
-    std::string err;
-    json docs;
-    const bool listed = core::cpp_core().call("doc_list", json::object(), docs, err) &&
-                        docs.is_object() && docs.contains("docs") && docs["docs"].is_array();
-    bool found = false;
-    if (listed) {
-        for (const auto& d : docs["docs"]) {
-            if (d.is_object() && d.value("doc_id", std::string()) == docId) {
-                found = true;
-                if (cell_ && !discard && (d.value("dirty", false) || d.value("busy", false)))
-                    return false;
-                break;
-            }
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        std::uint64_t token = 0;
+        if (!registry_.reapToken(docId, token)) return false;
+        json docs;
+        std::string err;
+        if (!core::cpp_core().call("doc_list", json::object(), docs, err) ||
+            !docs.is_object() || !docs.contains("docs") || !docs["docs"].is_array())
+            return false;
+        json row;
+        for (const auto& d : docs["docs"])
+            if (d.is_object() && d.value("doc_id", std::string()) == docId) { row = d; break; }
+        if (!row.is_object()) {
+            if (!registry_.closeAbandoned(docId, token, reason, [] { return true; })) return false;
+            log().line("doc removal: doc=%s client=%d kind=%s method=%s reason=%s dirty=unknown preservation=absent",
+                       docId.c_str(), clientId, clientKind.c_str(), method, reason);
+            return true;
         }
-    }
-    if (listed && !found) {
-        // Recheck abandonment after the engine lookup: an attach may have arrived
-        // while doc_list ran. There is no engine doc to retire or close.
-        if (!registry_.reapUnderLock(docId, [] {})) return false;
-        registry_.onDaemonClosedDoc(docId, reason);
-        log().line("doc-gc: removed absent doc %s from registry", docId.c_str());
-        return true;
-    }
-    if (!discard && autosave_) {
-        // A failed listing is not evidence that the document is absent.
-        std::string name = docId;
-        bool needRetire = true;
-        if (listed) {
-            for (const auto& d : docs["docs"]) {
+        const bool internal = registry_.isInternal(docId);
+        const bool dirty = row.value("dirty", false) || registry_.humanDirty(docId);
+        if (cell_ && !internal && (dirty || row.value("busy", false))) return false;
+        const std::string path = row.contains("path") && row["path"].is_string()
+                                   ? row["path"].get<std::string>() : std::string();
+        long revision = row.value("revision", -1L);
+        long metadataRevision = row.value("metadata_revision", -1L);
+        // A clean new blank needs no artifact; any authored revision without a
+        // durable destination (including imported/metadata-only work) does.
+        const bool undelivered = path.empty() && (revision > 0 || metadataRevision > 0);
+        const bool needRetire = !internal && (dirty || undelivered ||
+                                (autosave_ && autosave_->isAutosavePath(path)));
+        if (needRetire && (!autosave_ || !autosave_->retireDoc(
+                              docId, row.value("name", docId), revision, metadataRevision)))
+            return false;
+        bool changed = false;
+        const bool closed = registry_.closeAbandoned(docId, token, reason, [&] {
+            json current;
+            if (!core::cpp_core().call("doc_list", json::object(), current, err) ||
+                !current.is_object() || !current.contains("docs") || !current["docs"].is_array())
+                return false;
+            bool matches = false;
+            for (const auto& d : current["docs"]) {
                 if (!d.is_object() || d.value("doc_id", std::string()) != docId) continue;
-                name = d.value("name", docId);
-                const std::string path = d.contains("path") && d["path"].is_string()
-                                             ? d["path"].get<std::string>()
-                                             : std::string();
-                // Blank/default docs (no features) are never recovery-worthy —
-                // close them without writing an orphan artifact.
-                if (d.value("empty", false)) {
-                    needRetire = false;
-                } else {
-                    needRetire = path.empty() || d.value("dirty", false) ||
-                                 autosave_->isAutosavePath(path);
-                }
+                matches = d.value("revision", -1L) == revision &&
+                          d.value("metadata_revision", -1L) == metadataRevision;
                 break;
             }
+            if (!matches) { changed = true; return false; }
+            json result;
+            return core::cpp_core().call("doc_close", json{{"doc_id", docId}}, result, err);
+        });
+        if (closed) {
+            if (autosave_) autosave_->onDocClosed(docId);
+            log().line("doc removal: doc=%s client=%d kind=%s method=%s reason=%s dirty=%s preservation=%s",
+                       docId.c_str(), clientId, clientKind.c_str(), method, reason,
+                       dirty ? "true" : "false",
+                       needRetire ? "recovery" : internal ? "internal" : "clean");
+            return true;
         }
-        if (needRetire && !autosave_->retireDoc(docId, name)) {
-            log().line("doc-gc: keeping %s open (retire failed)", docId.c_str());
-            return false;  // never close a doc we could not preserve
-        }
+        if (!changed) return false;  // a new attachment or a failed close
     }
-    // WHY: the isReapable() check above (and doc_list + retireDoc I/O just
-    // above, both unlocked) can go stale — a client's attach_doc / implicit-attach
-    // (Server::dispatch -> DocRegistry::preCall) races in during that gap and starts a
-    // legitimate op on a doc this function is about to destroy. reapUnderLock() re-verifies
-    // abandonment AND dispatches doc_close in the SAME registry-mutex hold as that attach
-    // path, so the two can never interleave: whichever gets the lock first wins outright.
-    bool closed = false;
-    const bool ranClose = registry_.reapUnderLock(docId, [&] {
-        closed = core::cpp_core().call("doc_close", json{{"doc_id", docId}}, result, err);
-        if (!closed)
-            log().line("doc-gc: doc_close(%s) failed: %s", docId.c_str(), err.c_str());
-    });
-    if (!ranClose) {
-        log().line("doc-gc: aborting close of %s — a client (re)attached since the last "
-                   "reapable check", docId.c_str());
-        return false;
-    }
-    if (!closed) return false;  // engine declined (e.g. a cross-doc op still holds it) — leave it open
-    if (discard && autosave_) autosave_->onDocClosed(docId);  // deliberately dropped -> purge
-    registry_.onDaemonClosedDoc(docId, reason);
-    log().line("doc-gc: %s doc %s (reason %s)", discard ? "discarded" : "retired",
-               docId.c_str(), reason);
-    return true;
+    return false;
 }
 
 // RAII tally for Status::inflight. A bare ++/-- pair around dispatch() leaks the counter when
@@ -1207,6 +1267,35 @@ struct InflightTally {
     explicit InflightTally(std::atomic<int>& c) : n(c) { ++n; }
     ~InflightTally() { --n; }
 };
+
+// Large CAD operations leave substantial freed OCCT/JSON allocations in glibc
+// arenas. Return free pages after the reply's temporary objects are destroyed;
+// allocated geometry, history and caches are untouched. Limit this to calls
+// that can build or release document geometry.
+struct DocumentArenaTrim {
+    bool active;
+    explicit DocumentArenaTrim(const std::string& method)
+        : active(method == "doc_apply_ops" || method == "doc_open" ||
+                 method == "doc_rebuild" || method == "doc_undo" ||
+                 method == "doc_redo" || method == "doc_revert" ||
+                 method == "doc_save" || method == "doc_close") {}
+    ~DocumentArenaTrim() {
+#if defined(__linux__) && defined(__GLIBC__)
+        if (active) malloc_trim(0);
+#endif
+    }
+};
+
+namespace {
+struct RequestCancellation {
+    ClientConn& client;
+    bool abandoned = false;
+    static int check(void* opaque) {
+        auto& self = *static_cast<RequestCancellation*>(opaque);
+        return self.abandoned = self.abandoned || self.client.conn.peerDisconnected();
+    }
+};
+}
 }  // namespace
 
 void Server::clientLoop(std::shared_ptr<ClientConn> c, std::string firstLine) {
@@ -1219,6 +1308,10 @@ void Server::clientLoop(std::shared_ptr<ClientConn> c, std::string firstLine) {
         bool pending = !line.empty();  // a request admitWhileDraining already read
         while (!stopping_ && (pending || c->conn.readLine(line, -1))) {
             pending = false;
+            if (c->conn.peerDisconnected()) {
+                log().line("client #%d: dropped abandoned queued request", c->id);
+                break;
+            }
             json msg = json::parse(line, nullptr, false);
             if (msg.is_discarded()) continue;
             // The envelope is client-supplied too: msg.value("id", -1) throws on a string id
@@ -1229,6 +1322,7 @@ void Server::clientLoop(std::shared_ptr<ClientConn> c, std::string firstLine) {
             const std::string method = msg.contains("method") && msg["method"].is_string()
                                            ? msg["method"].get<std::string>()
                                            : std::string();
+            DocumentArenaTrim arenaTrim(method);
             const bool operatorRequest = c->controlOnly ||
                 (cell_ && c->gateway && method == "hello" && msg.contains("params") &&
                  msg["params"].is_object() && msg["params"].contains("client") &&
@@ -1260,6 +1354,11 @@ void Server::clientLoop(std::shared_ptr<ClientConn> c, std::string firstLine) {
                                {"message", "dispatch threw a non-standard exception"}};
                 log().line("client #%d: '%s' threw a non-standard exception — rejected that "
                            "request", c->id, method.c_str());
+            }
+            if (c->conn.peerDisconnected()) {
+                log().line("client #%d: dropped abandoned '%s' request or reply", c->id,
+                           method.c_str());
+                break;
             }
             if (!c->controlOnly) touch();
             c->lastRpcMs = monoMs();  // this connection is doing work — see pinningClients
@@ -1322,29 +1421,51 @@ void Server::clientLoop(std::shared_ptr<ClientConn> c, std::string firstLine) {
 json Server::dispatch(ClientConn& c, const std::string& method, const json& rawParams,
                       bool& isError) {
     json params = rawParams;
+    const bool internalWatcher = c.id == -1 && method == "doc_reload";
+    if (!internalWatcher) {
+        params.erase("_watch_path");
+        params.erase("_watch_stamp");
+    }
     params.erase("_cell_ctx");
     params.erase("ctx");
     params.erase("_cell_revoke_through");
     params.erase("control_delegate");
+    // Only hostd may assign a turn's document-lifetime scope to its worker.
+    params.erase("_hostd_doc_scope");
     const char* stateNames[] = {"loading", "ready", "failed"};
+    if (!cell_ && c.controlOnly && method != "ping" &&
+        method != "daemon_status" && method != "daemon_drain") {
+        isError = true;
+        return json{{"code", "control_only"}, {"message", "daemon control connection only"}};
+    }
     if (method == "hello") {
         if (cell_) {
             json result = cellHello(c, params, isError);
             if (isError) return result;
             c.kind = c.controlOnly ? "control" : c.gateway ? "gui" : "agent";
+            if (c.kind == "agent")
+                registry_.joinAgentRun(c.id, params.value("agent_run_scope", std::string()),
+                                       c.actorKey);
             if (c.kind == "gui") guiDetached_ = false;
             json hello{{"proto", 1}, {"abi", core::cpp_core().abiVersion()},
                        {"git_rev", buildId_}, {"engine_build_id", core::cpp_core().buildId()},
+                       {"daemon_pid", selfPid()}, {"daemon_start_id", daemonStartId_},
                        {"state", stateNames[status_.engineState.load()]},
                        {"cell", true}, {"id_remap", json::object()}, {"recovery_pending", 0}};
             if (c.operatorControl) { hello["operator"] = true; hello["cell_id"] = cellId_; }
             return hello;
         }
         c.kind = params.value("client", "unknown");
+        if (c.kind == "control") c.controlOnly = true;
         c.pid = params.value("pid", 0L);
         c.writerGroup = params.value("writer_group", std::string());
         registry_.setWriterGroup(c.id, c.writerGroup);
-        if (c.kind == "gui") guiDetached_ = false;  // GUI (re)attached: full linger again
+        if (c.kind == "mcp" || c.kind == "agent")
+            registry_.joinAgentRun(c.id, params.value("agent_run_scope", std::string()), {});
+        if (c.kind == "gui") {
+            guiDetached_ = false;  // GUI (re)attached: full linger again
+            c.guiPeerPid = c.conn.peerPid();
+        }
         // Two distinct identities. AUTHORITY (manufacturing leases, undo policy)
         // always re-derives the authenticated local peer credential at the call
         // site — `hello.user` is never accepted as an identity assertion. But doc
@@ -1368,15 +1489,16 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& rawP
                     // chudware_build_id export — clients tolerate absence.
                     {"engine_build_id", core::cpp_core().buildId()},
                     {"daemon_pid", selfPid()},
+                    {"daemon_start_id", daemonStartId_},
                     {"state", stateNames[status_.engineState.load()]},
                     // Autosave-recovery rebind map (empty until recovery ran;
                     // daemon_status.recovery tells clients when to re-hello).
                     {"id_remap", autosave_ ? autosave_->idRemap() : json::object()},
-                    // Retired docs awaiting an explicit recovery_open/discard —
-                    // the GUI prompts the user when this is non-zero.
-                    {"recovery_pending", autosave_ ? autosave_->orphanCount() : 0}};
+                    // The final count is available after migration; do not block hello.
+                    {"recovery_pending", autosave_ && autosave_->recoveryDone()
+                                             ? autosave_->orphanCount() : 0}};
     }
-    if (cell_) {
+    if (cell_ && !internalWatcher) {
         if (c.operatorControl) return cellOperator(c, method, params, isError);
         if (method == "principal_revoke" || method == "principal_update")
             return changePrincipal(c, method, params, isError);
@@ -1410,10 +1532,7 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& rawP
     }
     // TEST-ONLY (env-gated; neither name is ever a real client RPC): register an
     // in-flight engine call and sleep, to exercise the watchdog end-to-end.
-    // "agent_test_stall" registers under an agent_* name so agentWorkInFlight() —
-    // and therefore the agent-owned-doc close protection — can be exercised
-    // headlessly without spending a real provider completion. Returns ok if the
-    // ceiling exceeds the sleep; otherwise the watchdog restarts the daemon mid-sleep.
+    // "agent_test_stall" is also classified as an agent RPC by the watchdog.
     if (const char* sm = std::getenv("CHUDWARE_HOSTD_TEST_STALL_MS");
         sm && *sm && (method == "__hostd_test_stall" || method == "agent_test_stall")) {
         beginInflight(c.id, method);
@@ -1425,7 +1544,7 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& rawP
         json st{{"state", stateNames[status_.engineState.load()]},
                 {"clients", status_.clients.load()},
                 {"inflight", status_.inflight.load()},
-                // Engine-only (agent_run / heavy doc ops) — tray / Stop UX use this.
+                // Engine-only (agent turns / heavy doc ops) — tray / Stop UX use this.
                 {"engine_inflight", engineInflightCount()},
                 {"draining", status_.draining.load()},
                 {"git_rev", buildId_},
@@ -1433,7 +1552,9 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& rawP
                 {"recovery", !autosave_                  ? "off"
                              : autosave_->recoveryDone() ? "done"
                                                          : "pending"},
-                {"recovery_pending", autosave_ ? autosave_->orphanCount() : 0},
+                {"recovery_pending", autosave_ && autosave_->recoveryDone()
+                                         ? autosave_->orphanCount() : 0},
+                {"daemon_pid", selfPid()}, {"daemon_start_id", daemonStartId_},
                 {"pid", selfPid()}};
         children_.statusInto(st);  // children count + mission ids
         // A draining daemon says why, and what a new client gets (the same text as the
@@ -1490,22 +1611,37 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& rawP
         return push;
     }
 
-    // Orphan-tier recovery (docs retired by clean shutdown / doc-GC — never
-    // auto-opened; the user or agent decides).
+    // List only after migration and automatic AI restoration have completed.
     if (method == "recovery_list") {
         if (!autosave_) return json{{"entries", json::array()}};
-        return autosave_->recoveryList();
+        autosave_->waitForRecovery();
+        json list = autosave_->recoveryList(params.value("scope", std::string()));
+        if (list.contains("error")) {
+            isError = true;
+            return json{{"code", "recovery_unavailable"}, {"message", "recovery storage unavailable"}};
+        }
+        return list;
     }
     if (method == "recovery_discard") {
-        if (!autosave_) return json{{"discarded", 0}};
-        const bool all = params.value("all", false);
-        const std::string id = params.value("id", std::string());
-        if (!all && id.empty()) {
+        if (!params.contains("ids") || !params["ids"].is_array() || params.contains("all")) {
             isError = true;
-            return json{{"code", "invalid_params"},
-                        {"message", "pass {\"id\": ...} or {\"all\": true}"}};
+            return json{{"code", "invalid_params"}, {"message", "pass {\"ids\": [...]}"}};
         }
-        return json{{"discarded", autosave_->discardOrphans(all ? "" : id)}};
+        for (const auto& id : params["ids"]) {
+            if (!id.is_string() || id.get_ref<const std::string&>().empty()) {
+                isError = true;
+                return json{{"code", "invalid_params"}, {"message", "ids must be nonempty strings"}};
+            }
+        }
+        if (!autosave_) return json{{"discarded", 0}};
+        autosave_->waitForRecovery();
+        if (!autosave_->recoveryAvailable()) {
+            isError = true;
+            return json{{"code", "recovery_unavailable"}, {"message", "recovery storage unavailable"}};
+        }
+        int count = 0;
+        for (const auto& id : params["ids"]) count += autosave_->discardOrphans(id.get<std::string>());
+        return json{{"discarded", count}};
     }
     if (method == "recovery_open") {
         if (status_.engineState.load() != 1) {
@@ -1513,9 +1649,18 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& rawP
             return json{{"code", "loading"}, {"message", "engine is still loading; retry"}};
         }
         if (!autosave_) return json{{"opened", json::array()}};
+        autosave_->waitForRecovery();
+        if (!autosave_->recoveryAvailable()) {
+            isError = true;
+            return json{{"code", "recovery_unavailable"}, {"message", "recovery storage unavailable"}};
+        }
         std::vector<std::string> ids;
         if (params.value("all", false)) {
             const json list = autosave_->recoveryList();
+            if (!list.contains("entries")) {
+                isError = true;
+                return json{{"code", "recovery_unavailable"}, {"message", "recovery storage unavailable"}};
+            }
             for (const auto& e : list["entries"]) ids.push_back(e.value("id", std::string()));
         } else if (params.contains("id") && params["id"].is_string()) {
             ids.push_back(params["id"].get<std::string>());
@@ -1527,101 +1672,77 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& rawP
         }
         json opened = json::array();
         for (const std::string& id : ids) {
-            const std::string path = autosave_->orphanPath(id);
-            if (path.empty()) continue;
-            json result;
-            std::string err;
-            // detach_path: the orphan artifact is deleted right after this open, so
-            // the doc must forget it (and re-unique its name vs already-open docs).
-            json p2 = json{{"path", path}, {"detach_path", true}};
-            if (!core::cpp_core().call("doc_open", p2, result, err)) {
-                log().line("recovery_open: doc_open(%s) failed: %s", path.c_str(),
-                           err.c_str());
-                continue;
-            }
-            // Route through the registry so the caller attaches rw and every
-            // mirror gets doc.opened — same envelope as a client doc_open.
-            registry_.postCall(c.id, c.kind, c.userId, c.userDisplay, "doc_open", p2, result);
-            const std::string newId = result.value("doc_id", std::string());
-            // The original id (pre-crash) lives in the entry meta: record the
-            // rebind so a reconnecting client's hello resolves its old handle, and
-            // hand it back so callers (recover_parts) can alias without a re-hello.
-            const std::string origId = autosave_->orphanMeta(id).value("doc_id", std::string());
-            autosave_->noteRecoveredRemap(origId, newId);
-            autosave_->discardOrphans(id);  // consumed — it lives in the engine now
-            opened.push_back(json{{"id", id},
-                                  {"doc_id", newId},
-                                  {"original_doc_id", origId}});
+            autosave_->recoverOrphan(id, [&](const std::string& path, const json& meta) {
+                json result;
+                std::string err;
+                json p2{{"path", path}, {"detach_path", true}, {"recovered", true}};
+                bool diskConflict = false;
+                json observedStamp = nullptr;
+                if (meta.contains("path") && meta["path"].is_string() &&
+                    !meta["path"].get_ref<const std::string&>().empty()) {
+                    p2["recovery_original_path"] = meta["path"];
+                    p2["recovery_base_stamp"] = meta.value("file_stamp", json());
+                    const json base = meta.value("file_stamp", json());
+                    observedStamp = FileWatch::stamp(meta["path"].get<std::string>());
+                    diskConflict = !base.is_object() || observedStamp != base;
+                }
+                if (!core::cpp_core().call("doc_open", p2, result, err) ||
+                    (result.contains("ok") && result["ok"].is_boolean() && !result["ok"].get<bool>())) {
+                    log().line("recovery_open: doc_open(%s) failed: %s", path.c_str(), err.c_str());
+                    return false;
+                }
+                if (p2.contains("recovery_original_path")) {
+                    observedStamp = FileWatch::stamp(p2["recovery_original_path"].get<std::string>());
+                    diskConflict = diskConflict || observedStamp != p2["recovery_base_stamp"];
+                }
+                const std::string newId = result.value("doc_id", std::string());
+                if (newId.empty()) return false;
+                auto recoveryGuard = registry_.lockMutation(newId);
+                autosave_->rememberRecoveredSource(newId, meta, id,
+                                                  result.value("revision", -1L),
+                                                  result.value("metadata_revision", -1L));
+                registry_.postCall(c.id, c.kind, c.userId, c.userDisplay, "doc_open", p2, result);
+                const std::string origId = meta.contains("doc_id") && meta["doc_id"].is_string()
+                                             ? meta["doc_id"].get<std::string>() : std::string();
+                const std::string origin = meta.contains("origin_kind") && meta["origin_kind"].is_string()
+                                             ? meta["origin_kind"].get<std::string>() : "unknown";
+                const bool humanDirty = !meta.contains("human_dirty") || !meta["human_dirty"].is_boolean()
+                                         || meta["human_dirty"].get<bool>();
+                registry_.restoreRecoveryState(newId, origin, humanDirty,
+                                               result.value("revision", 0L), -1);
+                autosave_->noteRecoveredRemap(origId, newId);
+                opened.push_back(json{{"id", id}, {"doc_id", newId},
+                                      {"original_doc_id", origId}, {"origin_kind", origin},
+                                      {"human_dirty", humanDirty}, {"disk_conflict", diskConflict},
+                                      {"observed_stamp", observedStamp}});
+                if (autosave_->snapshotNow(newId)) return true;
+                log().line("recovery_open: kept orphan %s (session snapshot of %s failed)",
+                           id.c_str(), newId.c_str());
+                return false;
+            });
         }
         return json{{"opened", opened}};
     }
 
-    // A user closing a viewport tab must never destroy work an agent run is still
-    // doing. Attachment alone can't decide that: the live general lane spawns a
-    // FRESH `python -m services.worker_main` per turn, so between turns the doc has
-    // NO attached client even though the run owns it — a reapability check in that
-    // window purged the part and killed the session (live 2026-07-28). Ownership
-    // (origin_kind agent|mcp) plus "an agent_* RPC is on the wire" is the real
-    // signal, and it is what both close paths below consult.
-    const bool agentOwnedLive = [&] {
-        if (method != "doc_close" && method != "doc_discard") return false;
-        const std::string docId = params.value("doc_id", std::string());
-        if (docId.empty()) return false;
-        return registry_.isAgentOrigin(docId) && agentWorkInFlight();
-    }();
-
-    // Explicit user discard: the caller (GUI closing a tab) drops its attach and,
-    // if no other client still holds the doc, we close it WITHOUT retiring it to
-    // the orphan tier — a deliberately-closed part must not resurface on the next
-    // launch. If an agent is still building it (another attach remains, or a run
-    // owns it), this is a plain detach: the doc lives on for that writer. Contrast
-    // doc-GC, which retires abandoned docs for recovery.
-    if (method == "doc_discard") {
+    // Closing a view never destroys another client's attachment or lease.
+    // Both close forms preserve dirty authored work before the last owner leaves.
+    if (method == "doc_close" || method == "doc_discard") {
         const std::string docId = params.value("doc_id", std::string());
         if (docId.empty()) {
             isError = true;
             return json{{"code", "invalid_params"}, {"message", "doc_id required"}};
         }
+        const bool blocked = registry_.closeBlockedBy(docId, c.id);
         json det;
         bool de = false;
         registry_.handleMethod(c.id, c.kind, "detach_doc", params, det, de);
-        // isReapable == no client still attached: the writer (agent) is gone, so
-        // this close is safe and the doc was truly abandoned.
-        const bool discarded = !agentOwnedLive && registry_.isReapable(docId) &&
-                               gcCloseDoc(docId, "discarded");
-        json out{{"ok", true}, {"discarded", discarded}};
-        if (agentOwnedLive) {
-            out["detached"] = true;
-            out["note"] = "an agent run still owns this doc; detached instead of "
-                          "discarding (its work continues in the background)";
-            log().line("doc_discard %s refused: agent run still owns it — detached",
-                       docId.c_str());
-        }
+        const bool closed = !blocked && gcCloseDoc(docId,
+                            method == "doc_discard" ? "discarded" : "closed",
+                            c.id, c.kind, method.c_str());
+        json out{{"ok", true}, {"detached", !closed}};
+        if (method == "doc_discard") out["discarded"] = closed;
+        if (!closed) out["note"] = "document remains open for another client, an active agent run, or recovery";
         return out;
-    }
-
-    // Co-edit protection: a plain doc_close destroys the doc for EVERY client.
-    // When another client still holds an rw attach (e.g. the user adopted an AI
-    // doc and is editing it, or an agent is still building a doc the user closed),
-    // or an agent run owns the doc between turns, degrade the close to a detach so
-    // one client can't yank the doc out from under another. {"force": true} closes
-    // anyway — that is the deliberate escape hatch, not the default.
-    if (method == "doc_close" && !params.value("force", false)) {
-        const std::string docId = params.value("doc_id", std::string());
-        if (!docId.empty() && (agentOwnedLive || registry_.hasOtherRwWriter(docId, c.id))) {
-            json det;
-            bool de = false;
-            registry_.handleMethod(c.id, c.kind, "detach_doc", params, det, de);
-            return json{{"ok", true},
-                        {"detached", true},
-                        {"note", agentOwnedLive
-                                     ? "an agent run still owns this doc; detached "
-                                       "instead of closing (its work continues in "
-                                       "the background)"
-                                     : "another client is editing this doc; detached "
-                                       "instead of closing (pass force:true to close "
-                                       "anyway)"}};
-        }
     }
 
     // Agent child supervision (agent_spawn/agent_stop/agent_list) — daemon
@@ -1642,10 +1763,10 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& rawP
 
     // An online worker turn occupies its stdio channel for the full run. Route
     // matching cancel/steer/answer through the worker's authenticated side
-    // channel first; when no such worker run is active, cancel/steer preserve
-    // the core control path. agent_answer has no engine (or worker-lane)
-    // implementation — a question only lives inside an active worker run — so an
-    // unmatched answer ends here and never queues behind a busy agent lane.
+    // channel first. The engine has no run registry: a question or run only
+    // lives inside an active worker run, so an unmatched control call ends here
+    // with its "no active agent run" reply and never queues behind a busy agent
+    // lane.
     if (method == "agent_cancel" || method == "agent_steer" || method == "agent_answer") {
         json controlResult;
         std::string controlErr;
@@ -1698,6 +1819,49 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& rawP
                         {"answered", false},
                         {"reason", "no active agent run for this question"}};
         }
+        if (method == "agent_steer")
+            return json{{"ok", true}, {"steered", false}, {"reason", "no active agent run"}};
+        return json{{"ok", true}, {"cancelled", false}, {"reason", "no active agent run"}};
+    }
+
+    if (method == "omp_apply_compaction_policy") {
+        const auto invalid = [] {
+            return json{{"ok", false}, {"reason", "invalid compaction policy"}};
+        };
+        if (!params.is_object()) return invalid();
+        json arguments = params;
+        arguments.erase("_cell_ctx");
+        for (const auto& item : arguments.items())
+            if (item.key() != "strategy" && item.key() != "compaction") return invalid();
+        const auto strategy = arguments.find("strategy");
+        if (strategy == arguments.end()) {
+            if (cell_ || !arguments.empty()) return invalid();
+        } else {
+            if (!strategy->is_string()) return invalid();
+            const auto& value = strategy->get_ref<const std::string&>();
+            if (value != "auto" && value != "off" && value != "snapcompact" &&
+                value != "shake" && value != "summary") return invalid();
+        }
+        const auto options = arguments.find("compaction");
+        if (options != arguments.end()) {
+            if (!options->is_object()) return invalid();
+            for (const auto& item : options->items()) {
+                if (item.key() == "supersede_reads" || item.key() == "drop_useless") {
+                    if (!item.value().is_boolean()) return invalid();
+                } else if (item.key() == "keep_recent_tokens") {
+                    const auto& number = item.value();
+                    if (!number.is_number_integer()) return invalid();
+                    if (number.is_number_unsigned()) {
+                        if (number.get<std::uint64_t>() > 9007199254740991ULL) return invalid();
+                    } else {
+                        const auto n = number.get<std::int64_t>();
+                        if (n < 0 || n > 9007199254740991LL) return invalid();
+                    }
+                } else return invalid();
+            }
+        }
+        return WorkerBridge::applyCompactionPolicy(
+            arguments, cell_ ? params.at("_cell_ctx") : json::object());
     }
 
     // Engine passthrough.
@@ -1710,13 +1874,63 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& rawP
         isError = true;
         return json{{"code", "engine_failed"}, {"message", status_.engineErr}};
     }
+    if (autosave_) autosave_->waitForRecovery();
 
-    // Registry policy gate: ro-attach rejection, edit-hold busy_preview, overlap
-    // CAS (base_revision injection when >1 writer), agent undo gating. May mutate
-    // the params copy.
+    const std::string guardedDoc = params.value("doc_id", std::string());
+    std::optional<DocRegistry::MutationGuard> mutationGuard;
+    if (!guardedDoc.empty() && DocRegistry::requiresMutationLock(method))
+        mutationGuard.emplace(registry_.lockMutation(guardedDoc));
+    if (method == "doc_save" && params.value("if_no_human_dirty", false) &&
+        registry_.humanDirty(guardedDoc)) {
+        isError = true;
+        return json{{"code", "human_dirty"}, {"message", "document has unsaved human edits"}};
+    }
+    if (internalWatcher) {
+        const std::string path = params.value("_watch_path", std::string());
+        const json expected = params.value("_watch_stamp", json(nullptr));
+        json rows;
+        std::string error;
+        if (path.empty() || !expected.is_object() || FileWatch::stamp(path) != expected ||
+            !core::cpp_core().call("doc_list", json::object(), rows, error) ||
+            !rows.is_object() || !rows.contains("docs") || !rows["docs"].is_array())
+            return json::object();
+        json matched;
+        for (const auto& row : rows["docs"]) {
+            if (!row.is_object() || row.value("doc_id", std::string()) != guardedDoc) continue;
+            if (row.value("busy", false) || !row.contains("path") || !row["path"].is_string() ||
+                row["path"] != path || !row.contains("file_stamp") || !row["file_stamp"].is_object())
+                return json::object();
+            if (row["file_stamp"] != expected) matched = row;
+            break;
+        }
+        if (!matched.is_object() || FileWatch::stamp(path) != expected) return json::object();
+        if (registry_.humanDirty(guardedDoc)) {
+            registry_.notifyDiskConflict(guardedDoc, path, expected);
+            return json{{"_watch_conflict", true}};
+        }
+        const long revision = matched.value("revision", -1L);
+        const long metadataRevision = matched.value("metadata_revision", -1L);
+        if (revision < 0 || metadataRevision < 0) return json::object();
+        if (matched.value("dirty", false)) {
+            long captured = -1, capturedMetadata = -1;
+            if (!autosave_ || !autosave_->retireDoc(guardedDoc,
+                    matched.value("name", guardedDoc), captured, capturedMetadata) ||
+                captured != revision || capturedMetadata != metadataRevision) {
+                return json::object();
+            }
+        }
+        if (FileWatch::stamp(path) != expected) return json::object();
+        // Engine checks these under its document lock immediately before replacement.
+        params["expected_revision"] = revision;
+        params["expected_metadata_revision"] = metadataRevision;
+    }
+
+    // Registry policy gate: read-only attaches, edit holds and agent undo.
     json p = params;
+    p.erase("_watch_path");
+    p.erase("_watch_stamp");
     std::string attachWarning;
-    {
+    if (!internalWatcher) {
         json policyErr;
         if (!registry_.preCall(c.id, c.kind, c.userId, c.userDisplay, method, p, policyErr,
                               attachWarning, cell_ && cellPolicy_.at(method).at("right") == "read")) {
@@ -1724,51 +1938,67 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& rawP
             return policyErr;
         }
     }
+    if (!internalWatcher && c.conn.peerDisconnected()) {
+        isError = true;
+        return json{{"code", "abandoned"}, {"message", "client disconnected"}};
+    }
 
     json result;
     std::string err;
+    const bool agentRun = method == "agent_admin_turn";
+    const std::string docScope = agentRun
+        ? daemonStartId_ + ":" + std::to_string(++nextAgentRunScope_) : std::string();
+    if (agentRun)
+        registry_.startAgentRun(docScope, c.id, c.actorKey,
+                                p.value("doc_id", std::string()));
     beginInflight(c.id, method);
     struct InflightGuard {
         Server& server;
         int clientId;
         std::string runId;
+        std::string docScope;
         ~InflightGuard() {
             server.endInflight(clientId);
+            if (!docScope.empty()) server.registry_.endAgentRun(docScope);
             if (server.cell_ && !runId.empty()) {
                 std::lock_guard<std::mutex> lock(server.cellMtx_);
                 server.runOwners_.erase(runId);
             }
         }
     } inflightGuard{*this, c.id, cell_ && method == "agent_admin_turn"
-                                   ? p.value("run_id", std::string()) : std::string()};
-    // Live streaming (transparency): agent events go back to the requesting client while nested
-    // document commits enter the shared registry and fan out to every subscribed GUI. Both
-    // thread-local sinks fire synchronously on this dispatch thread and are cleared by RAII.
+                                   ? p.value("run_id", std::string()) : std::string(), docScope};
+    // Live streaming (transparency): an online turn's worker events go back to the requesting
+    // client (see workerEvent below); nested document commits enter the shared registry through
+    // the worker's own doc calls and fan out to every subscribed GUI.
     const bool agentStream = method.rfind("agent_", 0) == 0 ||
-                             method.rfind("chudcode_", 0) == 0 ||
+                             method.rfind("omp_", 0) == 0 ||
                              method == "session_btw" || method == "session_handoff";
     // The native topology solve streams its sim.progress phases and per-iteration metrics to
     // the requester only, over the same push frame. It runs on the caller's own connection
     // thread, so sim_cancel and every other control call reach the engine on other
     // connections while it streams. Only this one simulation method is armed: the other sim_*
-    // routes keep their non-streaming replies.
+    // routes keep their non-streaming replies. The engine emits no other events; the thread-local
+    // sink fires synchronously on this dispatch thread and is cleared by RAII.
     const bool topologyStream = method == "sim_run_topology";
     const bool streamThis = agentStream || topologyStream;
-    const bool publishDocsThis = method.rfind("agent_", 0) == 0;
+    // The context is declared before the guard so it outlives its destructor on every exit.
     StreamCtx sctx{this, c.id, topologyStream};
-    DocPublishCtx dctx{this, c.id, c.userId, c.userDisplay};
-    // Contexts are declared before the guard so they outlive its destructor on every exit.
     struct SinkGuard {
         bool eventsOn;
-        bool docsOn;
         ~SinkGuard() {
-            if (docsOn) core::cpp_core().setDocPublishSink(nullptr, nullptr);
             if (eventsOn) core::cpp_core().setEventSink(nullptr, nullptr);
         }
-    } sinkGuard{streamThis, publishDocsThis};
-    if (streamThis) core::cpp_core().setEventSink(&Server::streamThunk, &sctx);
-    if (publishDocsThis)
-        core::cpp_core().setDocPublishSink(&Server::docPublishThunk, &dctx);
+    } sinkGuard{topologyStream};
+    if (topologyStream) core::cpp_core().setEventSink(&Server::streamThunk, &sctx);
+    RequestCancellation cancellation{c};
+    struct CancelGuard {
+        ~CancelGuard() { core::cpp_core().setRequestCancel(nullptr, nullptr); }
+    } cancelGuard;
+    if (!internalWatcher) core::cpp_core().setRequestCancel(&RequestCancellation::check, &cancellation);
+    // The connection kind, not a client-supplied document origin, identifies who
+    // is making this mutation. A document can be shared by GUI and agent clients.
+    if (method == "doc_apply_ops")
+        p["_mutation_origin"] = c.kind;
     const bool engineOk = core::cpp_core().call(method, p, result, err);
     if (!engineOk) {
         // Engine-unknown only: forward to the lazily-spawned Python worker
@@ -1823,7 +2053,8 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& rawP
             // WorkerBridge::readLine), sized past that budget so the worker's structured
             // "turn_budget" reply always arrives first. A turn without a budget has no
             // wall-clock stop (-1): it ends on its reply, Stop over the control lane,
-            // worker death or bridge stop. Everything else keeps the ordinary 120 s bound.
+            // worker death or bridge stop. Everything else keeps the ordinary 120 s bound
+            // (omp_login: see below).
             int workerTimeoutMs = 120000;
             if (method == "agent_admin_turn") {
                 workerTimeoutMs = -1;
@@ -1833,12 +2064,49 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& rawP
                     const double ms = (t->get<double>() + 60.0) * 1000.0;
                     workerTimeoutMs = ms >= 2147483647.0 ? 2147483647 : (int)ms;
                 }
+            } else if (method == "omp_login") {
+                // One call carries the whole browser OAuth flow and streams nothing while the
+                // user is away; the GUI's own bound (300 s) must end it, not this idle bound.
+                workerTimeoutMs = 330000;
             }
             json workerParams = p;
             workerParams.erase("_cell_ctx");
+            if (method == "agent_admin_turn") workerParams["_hostd_doc_scope"] = docScope;
             if (cell_ && method == "agent_admin_turn") {
                 std::lock_guard<std::mutex> lock(cellMtx_);
                 runOwners_[p.value("run_id", std::string())] = p.at("_cell_ctx").at("actor_key").get<std::string>();
+            }
+            // A desktop turn streams only to its requester. Once that connection is gone (the
+            // GUI crashed or quit mid-run) the run keeps its conversation's worker slot while
+            // nobody can see its events or answer its ask_user, and the reopened chat's next
+            // turn queued behind it with no end (2026-11-04: "thinking" forever after a crash).
+            // Its journal already holds the finished work, so the new turn stops it and
+            // resumes from there.
+            const bool trackTurn = !cell_ && method == "agent_admin_turn";
+            const auto stringParam = [&p](const char* key) {
+                const auto it = p.find(key);
+                return it != p.end() && it->is_string() ? it->get<std::string>() : std::string();
+            };
+            const std::string turnRun = trackTurn ? stringParam("run_id") : std::string();
+            const std::string turnSession = trackTurn ? stringParam("session_id") : std::string();
+            if (!turnSession.empty()) supersedeOrphanedTurns(turnSession);
+            struct LiveTurnGuard {
+                Server& server;
+                std::string run;
+                ~LiveTurnGuard() {
+                    if (run.empty()) return;
+                    std::lock_guard<std::mutex> lock(server.liveTurnsMtx_);
+                    server.liveTurns_.erase(run);
+                }
+            } liveTurnGuard{*this, std::string()};
+            if (!turnRun.empty() && !turnSession.empty()) {
+                json credentials = json::object();
+                for (const char* key : {"byok_key", "byok_provider", "byok_tenant"})
+                    if (const auto it = p.find(key); it != p.end()) credentials[key] = *it;
+                std::lock_guard<std::mutex> lock(liveTurnsMtx_);
+                if (liveTurns_.try_emplace(turnRun, LiveTurn{turnSession, &c, std::move(credentials)})
+                        .second)
+                    liveTurnGuard.run = turnRun;
             }
             const bool workerOk =
                 WorkerBridge::dispatch(method, workerParams, wresult, werr,
@@ -1877,21 +2145,23 @@ json Server::dispatch(ClientConn& c, const std::string& method, const json& rawP
         if (!e.contains("code")) e["code"] = "engine_error";
         return e;
     }
-    rememberCellHandles(c, p, result);
-    // Live-streamed above (streamThis) -> the batched result["events"] copy is now redundant.
-    // Drop it so a streaming client (which renders the live agent.event push) never double-
-    // renders the run. (Same-build deploy: every client understands the push.)
-    // The topology result has no batched copy; its payload is left untouched.
-    if (agentStream && core::cpp_core().hasEventSink() && result.is_object()) result.erase("events");
+    if ((method == "doc_save" || method == "doc_reload") && result.is_object() && result.contains("ok") &&
+        result["ok"].is_boolean() && !result["ok"].get<bool>()) return result;
+    if (!internalWatcher) rememberCellHandles(c, p, result);
     // Revision sniff, minted-doc implicit attach, event fanout, _foreign_edits.
     registry_.postCall(c.id, c.kind, c.userId, c.userDisplay, method, p, result);
+    if (internalWatcher && result.is_object()) result["_watch_reloaded"] = true;
     // Stamp origin_kind onto each doc_list entry so a GUI that connected after a
     // doc was minted can recover user-vs-AI ownership on bootstrap.
     if (method == "doc_list") registry_.annotateDocList(result, c.id);
-    // Closed means closed: an explicit doc_close deletes the doc's autosave
-    // artifacts so it can never resurrect on the next daemon start.
-    if (method == "doc_close" && autosave_)
-        autosave_->onDocClosed(p.value("doc_id", std::string()));
+    // Reconcile only snapshots covered by the exact successfully saved revision.
+    if (method == "doc_save" && autosave_ && !p.value("preserve_path", false)) {
+        const std::string savedPath = result.value("path", std::string());
+        if (!savedPath.empty() && !autosave_->isAutosavePath(savedPath))
+            autosave_->onDocSaved(p.value("doc_id", std::string()),
+                                  result.value("saved_revision", -1L),
+                                  result.value("metadata_revision", -1L));
+    }
     // Human (gui) save clears that doc's undo/redo history (session stacks +
     // disk journal) and fans out doc.history_cleared so other GUIs grey undo.
     // Agent/mcp saves deliberately keep history so AI rollback paths still work.
@@ -1919,24 +2189,31 @@ void Server::endInflight(int clientId) {
     inflight_.erase(clientId);
 }
 
+void Server::supersedeOrphanedTurns(const std::string& sessionId) {
+    std::vector<std::pair<std::string, json>> orphans;
+    {
+        std::lock_guard<std::mutex> lock(liveTurnsMtx_);
+        for (const auto& [run, turn] : liveTurns_)
+            if (turn.sessionId == sessionId && turn.requester->conn.peerDisconnected())
+                orphans.emplace_back(run, turn.credentials);
+    }
+    for (auto& [run, control] : orphans) {
+        control["run_id"] = run;
+        bool matched = false;
+        json result;
+        std::string err;
+        const bool ok = WorkerBridge::controlActiveRun("cancel", control, matched, result, err);
+        log().line("agent: stopping run %s of session %s, its requester disconnected (%s)",
+                   run.c_str(), sessionId.c_str(),
+                   ok ? "cancel sent" : err.empty() ? "no active worker run" : err.c_str());
+    }
+}
+
 int Server::engineInflightCount() const {
     std::lock_guard<std::mutex> lk(inflightMtx_);
     return (int)inflight_.size();
 }
 
-// True while ANY client has an agent RPC on the wire (agent_run / agent_run_v2 /
-// agent_admin_turn / agent_step …). The doc a run is building must survive the
-// user closing its viewport tab: the live general lane spawns a FRESH
-// `python -m services.worker_main` per turn, so between turns no client holds an
-// attach and a naive reapability check would happily purge live work.
-bool Server::agentWorkInFlight() const {
-    std::lock_guard<std::mutex> lk(inflightMtx_);
-    for (const auto& [cid, call] : inflight_) {
-        (void)cid;
-        if (call.method.rfind("agent_", 0) == 0) return true;
-    }
-    return false;
-}
 
 // Background watchdog bounds engine calls that cannot be interrupted in-process.
 // Agent turns end on their caller's optional budget, Stop, or worker death, not this tier.

@@ -1,4 +1,4 @@
-// core/sim/sim_cancel.cpp — see sim_cancel.h. Mirrors core/agent/machine.cpp's registry.
+// core/sim/sim_cancel.cpp — see sim_cancel.h.
 #include "sim/sim_cancel.h"
 
 #include <algorithm>

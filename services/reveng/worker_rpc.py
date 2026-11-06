@@ -33,8 +33,11 @@ to services/reveng/.)
 """
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
@@ -73,11 +76,14 @@ def _tool_manager() -> Any:
     if _TOOL_MANAGER is None:
         from mcp.server.fastmcp import FastMCP
 
-        from services.mcp.recon_tools import register_photo_recon_tools
+        from services.mcp.recon_tools import register_photo_recon_tools, register_recon_tools
         from services.mcp.reveng_tools import register_reveng_tools
+        from services.mcp.reveng_splat_tools import register_reveng_splat_tools
 
         mcp = FastMCP("_reveng_worker_rpc")
         register_reveng_tools(mcp)
+        register_reveng_splat_tools(mcp)
+        register_recon_tools(mcp)
         # start_capture_session / stop_capture_session live with the recon tools and
         # keep their session registry in that module — registering them here is what
         # gives the GUI and the agent ONE capture-session registry.
@@ -112,10 +118,111 @@ def _envelope(raw: Any, method: str) -> dict:
     if raw.get("ok", True):
         raw.setdefault("ok", True)
         return raw
+    if raw.get("error") == "not_found":
+        from services.agent.request_context import in_cell
+        if in_cell():
+            return {"ok": False, "error": "not_found", "reason": "not_found",
+                    "code": "not_found"}
     out = dict(raw)
     out.setdefault("reason", str(out.get("error") or f"{method} failed"))
     out.setdefault("hint", "")
     return out
+
+_ARTIFACT_MAX_BYTES = 2 * 1024 * 1024 * 1024
+
+
+def _artifact_ref(session_id: str, path: str, kind: str) -> dict | None:
+    """Publish an actor-scoped, opaque reference to a file in an owned session."""
+    from services.mcp.reveng_common import _load_session, _reveng_dir, _session_path
+
+    if not path or not _load_session(session_id, merge_gaussian=False):
+        return None
+    root = _reveng_dir().resolve()
+    session = _session_path(session_id).resolve()
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = session / candidate
+    candidate = candidate.resolve()
+    if session not in candidate.parents:
+        return None
+    info = candidate.stat()
+    if not candidate.is_file() or not 0 < info.st_size <= _ARTIFACT_MAX_BYTES:
+        return None
+    relative = candidate.relative_to(root).as_posix()
+    signature = f"{relative}\0{info.st_size}\0{info.st_mtime_ns}\0{kind}"
+    token = hashlib.sha256(signature.encode()).hexdigest()
+    refs = root / "artifact_refs"
+    refs.mkdir(mode=0o700, parents=True, exist_ok=True)
+    grant = refs / token
+    if not grant.exists():
+        fd, tmp = tempfile.mkstemp(prefix=".ref-", dir=refs)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump({"path": relative, "size": info.st_size,
+                           "mtime_ns": info.st_mtime_ns, "kind": kind}, stream)
+            os.replace(tmp, grant)
+        finally:
+            Path(tmp).unlink(missing_ok=True)
+    return {"id": token, "size": info.st_size, "kind": kind}
+
+
+def _add_artifact_refs(method: str, result: dict, params: dict) -> dict:
+    """Attach references without replacing native paths used by desktop clients."""
+    from services.agent import request_context
+
+    if not request_context.in_cell() or not result.get("ok"):
+        return result
+    session = result.get("session")
+    session = session if isinstance(session, dict) else {}
+    sid = result.get("session_id") or session.get("session_id") or params.get("session_id")
+    if not isinstance(sid, str) or not sid:
+        return result
+    artifacts = session.get("artifacts") if isinstance(session.get("artifacts"), dict) else {}
+    gaussian = session.get("gaussian") if isinstance(session.get("gaussian"), dict) else {}
+    refs = {}
+
+    def add(name: str, path: Any, kind: str) -> None:
+        if isinstance(path, str) and path:
+            try:
+                ref = _artifact_ref(sid, path, kind)
+                if ref:
+                    refs[name] = ref
+            except (OSError, ValueError, KeyError):
+                # A concurrent rebuild can remove or replace an artifact. The
+                # next status/detail request will publish its replacement.
+                pass
+
+    add("splat", artifacts.get("splat_path") or result.get("gaussian_ply")
+        or result.get("splat_path") or gaussian.get("splat_path"), "gaussian_ply")
+    add("gaussian_splat", gaussian.get("splat_path"), "gaussian_ply")
+    add("mesh_preview", result.get("mesh_preview_path"), "binary_stl")
+    mesh = artifacts.get("mesh_path") or result.get("mesh_path")
+    if isinstance(mesh, str):
+        suffix = Path(mesh).suffix.lower()
+        kinds = {".ply": "mesh_ply", ".stl": "mesh_stl", ".obj": "mesh_obj"}
+        if suffix in kinds:
+            add("mesh", mesh, kinds[suffix])
+    add("sparse_points", result.get("sparse_points_path"), "sparse_points")
+    sparse = artifacts.get("sparse_dir")
+    if isinstance(sparse, str) and sparse:
+        for filename in ("points3D.bin", "points3D.txt"):
+            add("sparse_points", str(Path(sparse) / filename), "sparse_points")
+            if "sparse_points" in refs:
+                break
+    if refs:
+        result["artifact_refs"] = refs
+    return result
+
+
+def _classify_ply(path: Any) -> dict:
+    """Inspect a workspace PLY header in the worker, not the WASM filesystem."""
+    from services.formats.splat_io import detect_ply_kind
+    from services.mcp.reveng_splat_tools import _input_path
+
+    if not isinstance(path, str) or Path(path).suffix.lower() != ".ply":
+        return _fail("invalid_ply_path")
+    source = _input_path(path)
+    return {"ok": True, "kind": detect_ply_kind(source)}
 
 
 def _call_tool(method: str, params: dict) -> dict:
@@ -137,11 +244,18 @@ def _call_tool(method: str, params: dict) -> dict:
         return _fail(f"tool_not_registered: {method}",
                      "the reveng MCP tool families did not register this tool")
     supplied = dict(params or {})
+    if method == "reveng_convert_splat" and "session_id" in supplied and "path" not in supplied:
+        # A session handle is not a filesystem path; hostd canonicalizes path
+        # arguments under /work before they reach this worker.
+        supplied["path"] = supplied.pop("session_id")
+    if method == "reveng_add_video" and "path" not in supplied and "video_path" in supplied:
+        supplied["path"] = supplied["video_path"]
     sig = inspect.signature(fn)
     named = [p for p in sig.parameters.values()
              if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
                            inspect.Parameter.KEYWORD_ONLY)]
-    if request_context.in_cell() and any(p.name == "session_id" for p in named):
+    if request_context.in_cell() and any(
+            p.name == "session_id" and p.default is inspect.Parameter.empty for p in named):
         from services.mcp.reveng_common import _load_session
         if "session_id" not in supplied:
             _load_session(None, merge_gaussian=False)
@@ -168,6 +282,10 @@ def _bridge(method: str, **pinned: Any) -> Callable[[dict, Callable], dict]:
             merged = dict(params or {})
             for key, value in pinned.items():
                 merged.setdefault(key, value)
+            if method == "reveng_import_splat" and "classify_ply" in merged:
+                from services.agent.request_context import control_delegate
+                control_delegate(method)
+                return _classify_ply(merged["classify_ply"])
             result = _call_tool(method, merged)
             from services.agent.request_context import control_delegate
             delegate = control_delegate("cancel" if method == "reveng_cancel_splat" else method)
@@ -185,7 +303,7 @@ def _bridge(method: str, **pinned: Any) -> Callable[[dict, Callable], dict]:
                 return {"ok": True, "session_id": merged["session_id"],
                         "status": result.get("status", "cancelled"),
                         "reason": "manager_stop", "control_delegate": delegate}
-            return result
+            return _add_artifact_refs(method, result, merged)
         except Exception as exc:  # noqa: BLE001
             return _wrap_exc(exc)
 
@@ -202,15 +320,21 @@ _BRIDGED_TOOLS: tuple[str, ...] = (
     "get_reveng_session",
     "get_reveng_coverage",
     "get_reveng_deviation",
+    "reveng_sparse_preview",
     "list_reveng_dims",
     "describe_reveng_result",
     "reveng_status",
+    "reveng_install_tools",
     # ── §8.2 WRITE — ingest + calibration (reveng_session_tools) ─────────────
     "reveng_start_session",
+    "reveng_find_models",
+    "reveng_use_model",
     "reveng_add_images",
     "reveng_add_video",
     "reveng_ingest_datasheet",
     "reveng_set_scale",
+    "reveng_confirm_scale",
+    "reveng_align_axes",
     "reveng_print_scale_mat",
     # ── §8.2 WRITE — reconstruction + modelling (reveng_build_tools) ─────────
     "reveng_reconstruct",
@@ -219,6 +343,9 @@ _BRIDGED_TOOLS: tuple[str, ...] = (
     "reveng_finish_splat",
     "reveng_cancel_splat",
     "reveng_crop_splat",
+    "reveng_import_splat",
+    "reveng_convert_splat",
+    "reveng_splat_to_mesh",
     # Mission gates. reveng_reconstruct returns a run_id immediately and the mission
     # suspends at its scale-confirm / dimension-confirm gates; without these two the
     # GUI's Reconstruct button dead-ends at the first pause.
@@ -228,6 +355,7 @@ _BRIDGED_TOOLS: tuple[str, ...] = (
     "reveng_fit_primitives",
     "reveng_build_parametric",
     "reveng_attach_result",
+    "reveng_attach_reference",
     "reveng_research_source",
     "reveng_make_part_from_library",
     # ── §8.3 EXTERNAL — import/export (reveng_build_tools) ───────────────────
@@ -241,9 +369,12 @@ _BRIDGED_TOOLS: tuple[str, ...] = (
 # Transport-specific defaults. The RE tab adds the collected photos to the session
 # itself (via reveng_add_images), so the GUI must NOT trigger photogrammetry on
 # stop — whereas an agent calling the MCP tool directly still gets the historical
-# run_reconstruction=True. Same implementation, same registry, one pinned default.
+# run_reconstruction=True. The CAD-library search takes a minute or more and worker
+# stdio is serialized, so the GUI runs it in the background and polls the session.
+# Same implementation, same registry, one pinned default each.
 _PINNED_ARGS: dict[str, dict] = {
     "stop_capture_session": {"run_reconstruction": False},
+    "reveng_find_models": {"wait": False},
 }
 
 
@@ -279,10 +410,9 @@ def _site_of(url_or_part_id: str) -> str:
 _MAX_HARVEST_ITEMS = 24
 
 #: Browser refusals that mean "stop asking THIS site" rather than "that one URL
-#: failed". ``cooldown_active`` is the site's own 429/403 backoff, which is
-#: per-site and persisted, so every remaining same-site URL would be refused too —
-#: continuing just burns the tool budget one pointless call at a time.
-_SITE_STOP_REASONS = frozenset({"cooldown_active"})
+#: failed". ``rate_limited`` represents the site's own backoff or HTTP 429, so
+#: continuing to ask the same site wastes the tool budget.
+_SITE_STOP_REASONS = frozenset({"rate_limited"})
 
 
 def _download_into(url: str, site: str, dest_dir: Path) -> tuple[Path | None, dict | None]:
@@ -404,6 +534,7 @@ def _reveng_start_from_product(params: dict, _emit: Callable) -> dict:
             seed_bits.append(source_url)
         started = _call_tool("reveng_start_session", {
             "name": p.get("title") or None,
+            "project_dir": p.get("project_dir"),
             "research": " ".join(seed_bits) if seed_bits else None,
         })
         if not started.get("ok"):

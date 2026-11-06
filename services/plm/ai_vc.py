@@ -19,10 +19,9 @@ Contract (AI-VC) v1 + v2 (prompt/tool granularity):
     for tool checkpoints. Storage encoding is ``storage_kind: full|delta``.
   * Rollback: ``to`` accepts checkpoint id | ``turn:N`` | ``-N`` | ``msg:<idx>``
     | ``call:<turn>:<i>``. Response includes ``chat_truncate_to`` (msg_idx).
-  * Backing-file provenance: when the doc is saved to a file, each checkpoint
-    also records ``file:{path, sha256, mtime, size}`` (additive — older records
-    lack it). ``plm_rollback_check`` previews a rollback non-destructively and
-    re-hashes the file to detect modifications made outside the session.
+  * Backing-file provenance: checkpoints record ``file:{path, sha256, mtime, size}``.
+    Rollback compares the selected checkpoint separately from the latest known
+    session-authored save; without a session save external authorship is unknown.
   * Rollback surface: ``plm_rollback`` / ``plm_timeline`` / ``plm_rollback_check``
     (MCP + worker RPC).
 
@@ -34,6 +33,8 @@ Config (``config.json`` key ``plm.ai_vc``)::
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 import hashlib
 import json
 import os
@@ -106,6 +107,8 @@ _SESSION_TURN: dict[str, Any] = {
     "msg_idx": None,
     "doc_id": None,
 }
+_SESSION_SAVED: dict[tuple[str, str, str], dict[str, Any]] = {}
+_SAVE_SESSION: ContextVar[str | None] = ContextVar("ai_vc_save_session", default=None)
 
 
 def set_session_context(*, session_id: str | None = None,
@@ -242,6 +245,31 @@ def file_fingerprint(path: str | os.PathLike | None) -> dict[str, Any] | None:
         return rec
     except OSError:
         return None
+
+@contextmanager
+def bind_save_session(session_id: str | None):
+    """Bind an explicitly identified agent session to saves in this execution context."""
+    token = _SAVE_SESSION.set(str(session_id) if session_id else None)
+    try:
+        yield
+    finally:
+        _SAVE_SESSION.reset(token)
+
+
+def note_session_saved(doc_id: str, path: str, session_id: str | None = None) -> None:
+    """Record a successful save only when its session identity is known."""
+    session = session_id or _SAVE_SESSION.get()
+    if not session or not doc_id or not path:
+        return
+    fingerprint = file_fingerprint(path)
+    if fingerprint:
+        _SESSION_SAVED[(str(session), str(doc_id), os.path.realpath(path))] = fingerprint
+
+
+def _fingerprints_differ(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    if left.get("authored_sha256") and right.get("authored_sha256"):
+        return left["authored_sha256"] != right["authored_sha256"]
+    return left["sha256"] != right["sha256"]
 
 
 def _doc_backing_path(doc_id: str,
@@ -649,8 +677,8 @@ class AiVcStore:
         recorded separately as ``storage_kind`` (``full`` | ``delta``).
         *doc_file* (optional) is the document's backing file — a path (hashed
         here) or a precomputed :func:`file_fingerprint` dict — recorded as
-        ``rec[\"file\"]`` so a later rollback can detect modifications made
-        outside this session. Additive: older records simply lack the key.
+        ``rec[\"file\"]`` so rollback can compare it with the selected checkpoint.
+        Additive: older records simply lack the key.
 
         Memory: holds at most one full snapshot in RAM for the delta base.
         """
@@ -1029,15 +1057,13 @@ class AiVcStore:
         *,
         file_path: str | None = None,
         chat_size: int | None = None,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
         """Non-destructive preview of :meth:`rollback` — the warning ladder data.
 
-        Returns what reverting to *to* would discard (checkpoints / turns /
-        chat messages), whether geometry rolls back, and whether the document's
-        backing file was modified outside this session (hash comparison against
-        the checkpoint's recorded ``file`` block; *file_path* is the caller's
-        fallback when the record predates file provenance). Raises the same
-        ``KeyError``/``ValueError`` as :meth:`resolve_target`.
+        Returns what reverting to *to* would discard and compares the backing
+        file with both the target checkpoint and the latest known session save.
+        External modification is unknown when no session-authored save is known.
         """
         rec = self.resolve_target(doc_id, to)
         chain = self.read_chain(doc_id)
@@ -1065,22 +1091,16 @@ class AiVcStore:
         recorded_mtime = (frec or {}).get("mtime")
         path = (frec or {}).get("path") or file_path or None
         cur = file_fingerprint(path) if path else None
-        recorded_authored = (frec or {}).get("authored_sha256")
-        if recorded_sha and cur and cur.get("sha256"):
-            # Containers recorded with an authored hash compare authored members only:
-            # a rewrite of derived build state (open-time cache refresh) is no edit.
-            if recorded_authored and cur.get("authored_sha256"):
-                externally_modified: bool | None = cur["authored_sha256"] != recorded_authored
-            else:
-                externally_modified = cur["sha256"] != recorded_sha
-            provenance_known = True
-        elif recorded_sha:
-            # File unreadable/absent now — cannot verify, say so honestly.
-            externally_modified = None
-            provenance_known = True
-        else:
-            externally_modified = None
-            provenance_known = False
+        changed_since_checkpoint = (
+            _fingerprints_differ(frec, cur) if recorded_sha and cur and cur.get("sha256")
+            else None)
+        session = session_id or _SAVE_SESSION.get()
+        last_saved = (_SESSION_SAVED.get((str(session), str(doc_id), os.path.realpath(path)))
+                      if session and path else None)
+        externally_modified = (
+            _fingerprints_differ(last_saved, cur)
+            if last_saved and cur and cur.get("sha256") else None)
+        provenance_known = bool(recorded_sha)
         return {
             "ok": True,
             "doc_id": doc_id,
@@ -1101,6 +1121,7 @@ class AiVcStore:
                 "current_sha256": (cur or {}).get("sha256"),
                 "current_mtime": (cur or {}).get("mtime"),
                 "provenance_known": provenance_known,
+                "changed_since_checkpoint": changed_since_checkpoint,
                 "externally_modified": externally_modified,
             },
         }
@@ -1721,7 +1742,8 @@ def plm_timeline(doc_id: str | None = None, *,
 def plm_rollback_check(doc_id: str | None = None, to: str = "",
                        *, store: AiVcStore | None = None,
                        file_path: str | None = None,
-                       chat_size: int | None = None) -> dict[str, Any]:
+                       chat_size: int | None = None,
+                       session_id: str | None = None) -> dict[str, Any]:
     """Non-destructive preview of :func:`plm_rollback` for the confirm dialog.
 
     Same target resolution; returns the warning-ladder payload (discard counts,
@@ -1748,7 +1770,7 @@ def plm_rollback_check(doc_id: str | None = None, to: str = "",
                 "hint": "no document to roll back"}
     try:
         return st.rollback_preflight(doc_id, to, file_path=file_path,
-                                     chat_size=chat_size)
+                                     chat_size=chat_size, session_id=session_id)
     except KeyError as e:
         return {"ok": False, "reason": "not_found", "hint": str(e)}
     except Exception as e:  # noqa: BLE001

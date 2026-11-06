@@ -6,9 +6,12 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <BRepAlgoAPI_Fuse.hxx>
@@ -30,6 +33,26 @@ namespace doc = chudware::doc;
 namespace {
 fs::path tmp(const std::string& name) {
     return fs::temp_directory_path() / ("chudware_asmins_" + name);
+}
+
+void close_session_when_idle(const std::string& id) {
+    if (id.empty()) return;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    for (;;) {
+        try {
+            CHECK_MESSAGE(doc::doc_close(id), "failed to close ", id);
+            return;
+        } catch (const doc::OpError& error) {
+            if (error.code != "doc_busy" || std::chrono::steady_clock::now() >= deadline) {
+                CHECK_MESSAGE(false, "failed to close ", id, ": ", error.what());
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        } catch (const std::exception& error) {
+            CHECK_MESSAGE(false, "failed to close ", id, ": ", error.what());
+            return;
+        }
+    }
 }
 
 // 16-value row-major identity with a translation on X.
@@ -152,6 +175,549 @@ TEST_CASE("asm_insert_component places a component into the assembly tree") {
 
     fs::remove(part_step);
     fs::remove(part2);
+}
+
+TEST_CASE("missing component paths retain other geometry and usable assembly history") {
+    const fs::path part = tmp("missing_source_part.brep");
+    const fs::path saved = tmp("missing_source_assembly.step+");
+    struct Cleanup {
+        fs::path part, saved;
+        std::vector<std::string> ids;
+        ~Cleanup() {
+            for (const auto& id : ids) {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+                for (;;) {
+                    try {
+                        CHECK_MESSAGE(doc::doc_close(id), "failed to close ", id);
+                        break;
+                    } catch (const doc::OpError& e) {
+                        if (e.code != "doc_busy" || std::chrono::steady_clock::now() >= deadline) {
+                            CHECK_MESSAGE(false, "failed to close ", id, ": ", e.what());
+                            break;
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    } catch (const std::exception& e) {
+                        CHECK_MESSAGE(false, "failed to close ", id, ": ", e.what());
+                        break;
+                    }
+                }
+            }
+            std::error_code ec;
+            fs::remove(part, ec);
+            fs::remove(saved, ec);
+        }
+    } cleanup{part, saved, {}};
+    const auto write_box = [&] {
+        doc::export_bodies({BRepPrimAPI_MakeBox(10.0, 10.0, 10.0).Shape()},
+                           part.string(), "brep");
+    };
+    write_box();
+    json invalid_source;
+    SUBCASE("empty file path") { invalid_source = {{"path", ""}}; }
+    SUBCASE("unsupported embedded component") { invalid_source = {{"embedded", "part-id"}}; }
+
+    const std::string did = doc::doc_new("assembly", "missing_source_test").at("doc_id");
+    cleanup.ids.push_back(did);
+    const json valid = doc::doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", part.string()}}}, {"fixed", true}}
+    }), false);
+    const json inserted = doc::doc_apply_ops(did, valid.at("revision").get<long>(), json::array({
+        {{"op", "asm_insert_component"}, {"source", invalid_source}}
+    }), false);
+    CHECK(inserted.at("revision").get<long>() == valid.at("revision").get<long>() + 1);
+    CHECK(inserted.at("tree").at("components")[1].at("source") == invalid_source);
+    const auto check_partial = [&](const json& response) {
+        const auto& rebuild = response.at("rebuild");
+        CHECK(rebuild.at("converged") == false);
+        const auto& components = rebuild.at("components");
+        REQUIRE(components.size() == 2);
+        CHECK(components[0].at("ok") == true);
+        CHECK(components[1].at("ok") == false);
+        CHECK(components[1].at("error").get<std::string>().find("no source.path") !=
+              std::string::npos);
+        CHECK(doc::doc_tessellate_bodies(did).size() == 1);
+    };
+    check_partial(inserted);
+    const auto fingerprints = doc::asm_component_fingerprints(inserted.at("tree"), {});
+    REQUIRE(fingerprints.size() == 2);
+    CHECK(fingerprints[1].at("path") == "");
+    CHECK(doc::asm_fingerprints_match(inserted.at("tree"), {}, fingerprints));
+    check_partial(doc::doc_activate(did));
+    check_partial(doc::doc_rebuild(did));
+
+    const json undone = doc::doc_undo(did);
+    CHECK(undone.at("tree").at("components").size() == 1);
+    CHECK(undone.at("rebuild").at("converged") == true);
+    CHECK(doc::doc_tessellate_bodies(did).size() == 1);
+    check_partial(doc::doc_redo(did));
+
+    // An invalid sibling must not mask changes to a real file dependency.
+    REQUIRE(fs::remove(part));
+    CHECK_FALSE(doc::asm_fingerprints_match(inserted.at("tree"), {}, fingerprints));
+    const json missing = doc::doc_activate(did);
+    REQUIRE(missing.at("rebuild").at("components").size() == 2);
+    CHECK(missing.at("rebuild").at("components")[0].at("ok") == false);
+    CHECK(missing.at("rebuild").at("components")[1].at("ok") == false);
+    CHECK(doc::doc_tessellate_bodies(did).empty());
+    write_box();
+    check_partial(doc::doc_activate(did));
+
+    doc::doc_save(did, saved.string());
+    const json opened = doc::doc_open(saved.string());
+    const std::string reopened = opened.at("doc_id");
+    cleanup.ids.push_back(reopened);
+    CHECK(opened.at("cache_hit") == false);
+    CHECK(opened.at("cache_trust") == "verified");
+    CHECK(opened.at("cache_verification_pending") == false);
+    REQUIRE(opened.at("rebuild").at("components").size() == 2);
+    CHECK(opened.at("rebuild").at("converged") == false);
+    CHECK(opened.at("rebuild").at("components")[0].at("ok") == true);
+    CHECK(opened.at("rebuild").at("components")[1].at("ok") == false);
+    CHECK(doc::doc_tessellate_bodies(reopened).size() == 1);
+    const json activated = doc::doc_activate(reopened);
+    CHECK(activated.at("rebuild").at("converged") == false);
+    CHECK(activated.at("cache_verification_pending") == false);
+}
+
+TEST_CASE("nested assembly fingerprints retain missing source rows and real dependencies") {
+    const fs::path part = tmp("nested_missing_source_part.brep");
+    const fs::path child = tmp("nested_missing_source_child.step+");
+    struct Cleanup {
+        fs::path part, child;
+        ~Cleanup() {
+            std::error_code ec;
+            fs::remove(part, ec);
+            fs::remove(child, ec);
+        }
+    } cleanup{part, child};
+    doc::export_bodies({BRepPrimAPI_MakeBox(10.0, 10.0, 10.0).Shape()},
+                       part.string(), "brep");
+    json invalid_source;
+    SUBCASE("empty path") { invalid_source = {{"path", ""}}; }
+    SUBCASE("embedded source") { invalid_source = {{"embedded", "part-id"}}; }
+    const json nested{{"schema", "aicad.asm/1"}, {"components", json::array({
+        {{"id", "valid"}, {"fixed", true}, {"source", {{"path", part.string()}}}},
+        {{"id", "invalid"}, {"source", invalid_source}}
+    })}};
+    doc::stepplus_save(nested, child.string(), {});
+    const json root{{"schema", "aicad.asm/1"}, {"components", json::array({
+        {{"id", "nested"}, {"fixed", true}, {"source", {{"path", child.string()}}}}
+    })}};
+    const json fingerprints = doc::asm_component_fingerprints(root, {});
+    REQUIRE(fingerprints.size() == 3);
+    CHECK(fingerprints[2].at("path") == "");
+    CHECK(doc::asm_fingerprints_match(root, {}, fingerprints));
+    const auto built = doc::compile_assembly(root);
+    REQUIRE(built.component_status.size() == 1);
+    CHECK_FALSE(built.component_status[0].ok);
+    REQUIRE(built.component_status[0].error.has_value());
+    CHECK(built.component_status[0].error->find("no source.path") != std::string::npos);
+    CHECK_FALSE(built.converged);
+    CHECK(built.bodies.size() == 1);
+    REQUIRE(fs::remove(part));
+    CHECK_FALSE(doc::asm_fingerprints_match(root, {}, fingerprints));
+    const auto missing = doc::compile_assembly(root);
+    CHECK_FALSE(missing.converged);
+    CHECK(missing.bodies.empty());
+}
+
+TEST_CASE("assembly edit and delete operations require string IDs atomically") {
+    const fs::path pa = tmp("id_validation_a.step");
+    const fs::path pb = tmp("id_validation_b.step");
+    const TwoComp asm_ = two_component_assembly(pa, pb, "id_validation");
+    struct Cleanup {
+        std::string id;
+        fs::path a, b;
+        ~Cleanup() {
+            doc::doc_close(id);
+            std::error_code ec;
+            fs::remove(a, ec);
+            fs::remove(b, ec);
+        }
+    } cleanup{asm_.doc_id, pa, pb};
+
+    const json refs = json::array({
+        {{"component", asm_.cid_a},
+         {"selector", {{"kind", "face"}, {"centroid", {5.0, 5.0, 10.0}}}}},
+        {{"component", asm_.cid_b},
+         {"selector", {{"kind", "face"}, {"centroid", {45.0, 5.0, 10.0}}}}},
+    });
+    const json added = doc::doc_apply_ops(asm_.doc_id, -1, json::array({
+        {{"op", "asm_add_mate"}, {"mate", {
+            {"type", "distance"}, {"value", {{"value", 30.0}, {"expr", nullptr}}},
+            {"align", "aligned"}, {"refs", refs}}}}
+    }), false);
+    const std::string mid = added.at("id_map").at("$0").get<std::string>();
+    const json before = doc::doc_tree(asm_.doc_id);
+    const json component = before.at("tree").at("components").at(1);
+    const json mate = before.at("tree").at("mates").at(0);
+    const long revision = before.at("revision").get<long>();
+
+    for (const std::string operation : {"asm_edit_component", "asm_delete_component",
+                                        "asm_edit_mate", "asm_delete_mate"}) {
+        const bool is_component = operation.find("component") != std::string::npos;
+        const char* kind = is_component ? "component" : "mate";
+        const json object_id = is_component ? component : mate;
+        const std::vector<json> invalid_ids = {object_id, nullptr, 7, json::array({"k1"}), ""};
+        std::vector<json> invalid_ops;
+        for (const json& id : invalid_ids)
+            invalid_ops.push_back({{"op", operation}, {"id", id}});
+        invalid_ops.push_back({{"op", operation}});
+        invalid_ops.push_back({{"op", operation}, {kind, is_component ? asm_.cid_b : mid}});
+
+        for (const json& bad : invalid_ops) {
+            INFO(operation, " ", bad.dump());
+            try {
+                doc::doc_apply_ops(asm_.doc_id, revision, json::array({
+                    {{"op", "asm_edit_component"}, {"id", asm_.cid_b}, {"name", "temporary"}},
+                    bad
+                }), false);
+                FAIL("malformed assembly operation ID was accepted");
+            } catch (const doc::OpError& error) {
+                CHECK(error.code == "invalid_op");
+                CHECK(error.detail.at("index") == 1);
+                CHECK(error.detail.at("reason") == "bad_id");
+                const std::string message = error.what();
+                CHECK(message.find(operation) != std::string::npos);
+                CHECK(message.find("'id'") != std::string::npos);
+                CHECK(message.find(kind) != std::string::npos);
+                CHECK(message.find("string") != std::string::npos);
+            }
+            CHECK(doc::doc_tree(asm_.doc_id) == before);
+        }
+    }
+
+    const json edited = doc::doc_apply_ops(asm_.doc_id, revision, json::array({
+        {{"op", "asm_edit_component"}, {"id", asm_.cid_b}, {"name", "renamed"}},
+        {{"op", "asm_edit_mate"}, {"id", mid}, {"suppressed", true}}
+    }), false);
+    CHECK(edited.at("tree").at("components").at(1).at("name") == "renamed");
+    CHECK(edited.at("tree").at("mates").at(0).at("suppressed") == true);
+    const json deleted = doc::doc_apply_ops(asm_.doc_id, edited.at("revision").get<long>(),
+        json::array({
+            {{"op", "asm_delete_mate"}, {"id", mid}},
+            {{"op", "asm_delete_component"}, {"id", asm_.cid_b}}
+        }), false);
+    CHECK(deleted.at("tree").at("mates").empty());
+    REQUIRE(deleted.at("tree").at("components").size() == 1);
+    CHECK(deleted.at("tree").at("components").at(0).at("id") == asm_.cid_a);
+}
+
+TEST_CASE("asm_add_mate refuses an unknown mate type and lists the supported ones atomically") {
+    const std::string did = doc::doc_new("assembly", "unknown_mate_type").at("doc_id");
+    struct Cleanup {
+        std::string id;
+        ~Cleanup() { doc::doc_close(id); }
+    } cleanup{did};
+    const json before = doc::doc_tree(did);
+    const long revision = before.at("revision").get<long>();
+
+    for (const json& bad_type : {json("weld"), json(7), json()}) {
+        json mate = {{"refs", json::array()}};
+        if (!bad_type.is_null()) mate["type"] = bad_type;
+        INFO(mate.dump());
+        try {
+            doc::doc_apply_ops(did, revision, json::array({
+                {{"op", "asm_add_mate"}, {"mate", mate}}
+            }), false);
+            FAIL("an unknown mate type was accepted");
+        } catch (const doc::OpError& error) {
+            CHECK(error.code == "invalid_op");
+            CHECK(error.detail.at("index") == 0);
+            const auto types = error.detail.at("mate_types").get<std::vector<std::string>>();
+            for (const std::string supported : {"gear", "hinge", "symmetric", "cam_follower"})
+                CHECK(std::find(types.begin(), types.end(), supported) != types.end());
+        }
+        CHECK(doc::doc_tree(did) == before);
+    }
+}
+
+TEST_CASE("asm_edit_mate replaces refs, rebinds frames and persists the solved mate") {
+    const fs::path pa = tmp("edit_mate_refs_a.step");
+    const fs::path pb = tmp("edit_mate_refs_b.step");
+    const fs::path saved = tmp("edit_mate_refs.step+");
+    const TwoComp asm_ = two_component_assembly(pa, pb, "edit_mate_refs");
+    struct Cleanup {
+        std::string id, reopened;
+        fs::path a, b, saved;
+        ~Cleanup() {
+            close_session_when_idle(reopened);
+            close_session_when_idle(id);
+            std::error_code ec;
+            fs::remove(a, ec);
+            fs::remove(b, ec);
+            fs::remove(saved, ec);
+        }
+    } cleanup{asm_.doc_id, "", pa, pb, saved};
+
+    const json inserted = doc::doc_apply_ops(asm_.doc_id, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", pb.string()}}},
+         {"transform", pose_tx(10.0)}}
+    }), false);
+    const std::string cid_c = inserted.at("id_map").at("$0").get<std::string>();
+    doc::doc_apply_ops(asm_.doc_id, -1, json::array({
+        {{"op", "eq_set"}, {"name", "mate_gap"}, {"expr", "30"}}
+    }), false);
+    json refs = json::array({
+        {{"component", asm_.cid_a},
+         {"selector", {{"kind", "face"}, {"centroid", {5.0, 5.0, 10.0}}}}},
+        {{"component", asm_.cid_b},
+         {"selector", {{"kind", "face"}, {"centroid", {45.0, 5.0, 10.0}}}}},
+    });
+    const json added = doc::doc_apply_ops(asm_.doc_id, -1, json::array({
+        {{"op", "asm_add_mate"}, {"mate", {
+            {"type", "distance"}, {"value", {{"value", 30.0}, {"expr", "mate_gap"}}},
+            {"refs", refs}}}}
+    }), false);
+    const std::string mid = added.at("id_map").at("$0").get<std::string>();
+    REQUIRE(added.at("rebuild").at("converged") == true);
+    const json before = doc::doc_tree(asm_.doc_id);
+    const json prior_b_pose = before.at("tree").at("components").at(1).at("transform");
+    REQUIRE(before.at("tree").at("mates").at(0).at("reference_frames").at(asm_.cid_b) !=
+            prior_b_pose);
+
+    // Replacing a face on the SAME component must refresh its frame too.
+    json bottom_refs = refs;
+    bottom_refs[1]["selector"]["centroid"] = {45.0, 5.0, 0.0};
+    const json edited = doc::doc_apply_ops(asm_.doc_id, before.at("revision").get<long>(),
+        json::array({{{"op", "asm_edit_mate"}, {"id", mid}, {"refs", bottom_refs}}}), false);
+    const json& edited_mate = edited.at("tree").at("mates").at(0);
+    CHECK(edited_mate.at("refs") == bottom_refs);
+    CHECK(edited_mate.at("value").at("expr") == "mate_gap");
+    CHECK(edited_mate.at("reference_frames").at(asm_.cid_b) == prior_b_pose);
+    CHECK(edited.at("rebuild").at("converged") == true);
+    CHECK(edited.at("rebuild").at("mates").at(0).at("status") == "ok");
+    const json& new_b_pose = edited.at("tree").at("components").at(1).at("transform");
+    bool moved = false;
+    for (std::size_t i = 0; i < 16; ++i)
+        if (std::abs(new_b_pose[i].get<double>() - prior_b_pose[i].get<double>()) > 1e-5)
+            moved = true;
+    CHECK(moved);
+
+    // A valid replacement can be authored while suppressed, and is resolved
+    // and rebound before the later unsuppress triggers the actual solve.
+    const json suppressed = doc::doc_apply_ops(asm_.doc_id, -1, json::array({
+        {{"op", "asm_edit_mate"}, {"id", mid}, {"refs", refs}, {"suppressed", true}}
+    }), false);
+    CHECK(suppressed.at("tree").at("mates").at(0).at("refs") == refs);
+    CHECK(suppressed.at("tree").at("mates").at(0).at("reference_frames").at(asm_.cid_b) ==
+          new_b_pose);
+    CHECK(suppressed.at("rebuild").at("mates").at(0).at("status") == "suppressed");
+    const json enabled = doc::doc_apply_ops(asm_.doc_id, -1, json::array({
+        {{"op", "asm_edit_mate"}, {"id", mid}, {"suppressed", false}}
+    }), false);
+    CHECK(enabled.at("rebuild").at("converged") == true);
+    CHECK(enabled.at("rebuild").at("mates").at(0).at("status") == "ok");
+
+    // Changing owner removes the old component's frame and binds the new one.
+    bottom_refs[1]["component"] = cid_c;
+    const json c_pose = enabled.at("tree").at("components").at(2).at("transform");
+    const json replaced = doc::doc_apply_ops(asm_.doc_id, -1, json::array({
+        {{"op", "asm_edit_mate"}, {"id", mid}, {"refs", bottom_refs}}
+    }), false);
+    const json& replaced_mate = replaced.at("tree").at("mates").at(0);
+    CHECK(replaced_mate.at("refs") == bottom_refs);
+    const json& frames = replaced_mate.at("reference_frames");
+    CHECK(frames.size() == 2);
+    CHECK_FALSE(frames.contains(asm_.cid_b));
+    CHECK(frames.at(cid_c) == c_pose);
+    CHECK(replaced.at("rebuild").at("converged") == true);
+    CHECK(replaced.at("rebuild").at("mates").at(0).at("status") == "ok");
+
+    doc::doc_save(asm_.doc_id, saved.string());
+    const json reopened = doc::doc_open(saved.string());
+    cleanup.reopened = reopened.at("doc_id").get<std::string>();
+    const json rebuilt = doc::doc_rebuild(cleanup.reopened);
+    CHECK(rebuilt.at("tree").at("mates").at(0).at("refs") == bottom_refs);
+    CHECK(rebuilt.at("tree").at("mates").at(0).at("reference_frames") == frames);
+    CHECK(rebuilt.at("rebuild").at("converged") == true);
+    CHECK(rebuilt.at("rebuild").at("mates").at(0).at("status") == "ok");
+}
+
+TEST_CASE("asm_edit_mate rejects invalid refs and unsupported keys atomically") {
+    const fs::path pa = tmp("invalid_mate_refs_a.step");
+    const fs::path pb = tmp("invalid_mate_refs_b.step");
+    const TwoComp asm_ = two_component_assembly(pa, pb, "invalid_mate_refs");
+    struct Cleanup {
+        std::string id;
+        fs::path a, b;
+        ~Cleanup() {
+            close_session_when_idle(id);
+            std::error_code ec;
+            fs::remove(a, ec);
+            fs::remove(b, ec);
+        }
+    } cleanup{asm_.doc_id, pa, pb};
+    const json refs = json::array({
+        {{"component", asm_.cid_a},
+         {"selector", {{"kind", "face"}, {"centroid", {5.0, 5.0, 10.0}}}}},
+        {{"component", asm_.cid_b},
+         {"selector", {{"kind", "face"}, {"centroid", {45.0, 5.0, 10.0}}}}},
+    });
+    const json added = doc::doc_apply_ops(asm_.doc_id, -1, json::array({
+        {{"op", "asm_add_mate"}, {"mate", {
+            {"type", "distance"}, {"value", {{"value", 30.0}, {"expr", nullptr}}},
+            {"refs", refs}}}}
+    }), false);
+    const std::string mid = added.at("id_map").at("$0").get<std::string>();
+    const json before = doc::doc_tree(asm_.doc_id);
+    const long revision = before.at("revision").get<long>();
+
+    std::vector<json> invalid_refs = {
+        nullptr, "not a list", json::object(), json::array(),
+        json::array({refs[0]}), json::array({nullptr, refs[1]})
+    };
+    json bad = refs;
+    bad[1]["component"] = "k9999";
+    invalid_refs.push_back(bad);
+    bad = refs;
+    bad[1]["component"] = 7;
+    invalid_refs.push_back(bad);
+    bad = refs;
+    bad[1].erase("selector");
+    bad[1]["query"] = {{"kind", "face"}};
+    invalid_refs.push_back(bad);
+    bad = refs;
+    bad[1]["selector"] = {{"kind", "face"}};
+    invalid_refs.push_back(bad);
+    bad = refs;
+    bad[1]["selector"]["centroid"] = {1e9, 1e9, 1e9};
+    invalid_refs.push_back(bad);
+    bad = refs;
+    bad[1]["selector"] = {{"kind", "body"}, {"owner_feature", "f1"}};
+    invalid_refs.push_back(bad);
+
+    for (const json& invalid : invalid_refs) {
+        INFO(invalid.dump());
+        try {
+            doc::doc_apply_ops(asm_.doc_id, revision, json::array({
+                {{"op", "asm_edit_component"}, {"id", asm_.cid_b}, {"name", "temporary"}},
+                {{"op", "asm_edit_mate"}, {"id", mid}, {"refs", invalid},
+                 {"value", {{"value", 60.0}}}, {"suppressed", true}}
+            }), false);
+            FAIL("invalid replacement refs were accepted");
+        } catch (const doc::OpError& error) {
+            CHECK(error.code == "invalid_op");
+            CHECK(error.detail.at("index") == 1);
+            CHECK(std::string(error.what()).find("asm_edit_mate") != std::string::npos);
+        }
+        CHECK(doc::doc_tree(asm_.doc_id) == before);
+    }
+
+    const json unsupported = {{"refz", refs}, {"type", "lock"},
+                              {"reference_frames", json::object()}, {"unexpected", nullptr}};
+    for (auto it = unsupported.begin(); it != unsupported.end(); ++it) {
+        INFO(it.key());
+        json operation = {{"op", "asm_edit_mate"}, {"id", mid}, {"refs", refs}};
+        operation[it.key()] = it.value();
+        try {
+            doc::doc_apply_ops(asm_.doc_id, revision, json::array({operation}), false);
+            FAIL("unsupported mate edit key was accepted");
+        } catch (const doc::OpError& error) {
+            CHECK(error.code == "invalid_op");
+            CHECK(error.detail.at("index") == 0);
+            CHECK(error.detail.at("key") == it.key());
+            CHECK(std::string(error.what()).find(it.key()) != std::string::npos);
+        }
+        CHECK(doc::doc_tree(asm_.doc_id) == before);
+    }
+
+    // Active mates cannot resolve a suppressed component. A suppressed mate
+    // can still be staged against that component after probing its geometry.
+    const json disabled = doc::doc_apply_ops(asm_.doc_id, revision, json::array({
+        {{"op", "asm_edit_component"}, {"id", asm_.cid_b}, {"suppressed", true}}
+    }), false);
+    const json before_inactive = doc::doc_tree(asm_.doc_id);
+    try {
+        doc::doc_apply_ops(asm_.doc_id, disabled.at("revision").get<long>(), json::array({
+            {{"op", "asm_edit_mate"}, {"id", mid}, {"refs", refs}}
+        }), false);
+        FAIL("active mate accepted a reference to a suppressed component");
+    } catch (const doc::OpError& error) {
+        CHECK(error.code == "invalid_op");
+        CHECK(std::string(error.what()).find("refs[1]") != std::string::npos);
+    }
+    CHECK(doc::doc_tree(asm_.doc_id) == before_inactive);
+    const json staged = doc::doc_apply_ops(asm_.doc_id, disabled.at("revision").get<long>(),
+        json::array({{{"op", "asm_edit_mate"}, {"id", mid}, {"refs", refs},
+                      {"suppressed", true}}}), false);
+    CHECK(staged.at("tree").at("mates").at(0).at("refs") == refs);
+    CHECK(staged.at("rebuild").at("mates").at(0).at("status") == "suppressed");
+
+    // Optional refs beyond the first pair also have to resolve.
+    json angle_refs = refs;
+    angle_refs.push_back(refs[0]);
+    const json angle = doc::doc_apply_ops(asm_.doc_id, -1, json::array({
+        {{"op", "asm_add_mate"}, {"mate", {
+            {"type", "angle"}, {"value", {{"value", 0.0}, {"expr", nullptr}}},
+            {"refs", angle_refs}, {"suppressed", true}}}}
+    }), false);
+    const std::string angle_id = angle.at("id_map").at("$0").get<std::string>();
+    const json before_extra = doc::doc_tree(asm_.doc_id);
+    angle_refs[2]["selector"]["centroid"] = {1e9, 1e9, 1e9};
+    try {
+        doc::doc_apply_ops(asm_.doc_id, before_extra.at("revision").get<long>(), json::array({
+            {{"op", "asm_edit_mate"}, {"id", angle_id}, {"refs", angle_refs}}
+        }), false);
+        FAIL("dangling third mate ref was accepted");
+    } catch (const doc::OpError& error) {
+        CHECK(error.code == "invalid_op");
+        CHECK(error.detail.at("dangling_refs") == json::array({"refs[2]"}));
+        CHECK(std::string(error.what()).find("refs[2]") != std::string::npos);
+    }
+    CHECK(doc::doc_tree(asm_.doc_id) == before_extra);
+}
+
+TEST_CASE("asm_edit_mate resolves relative sources and an earlier same-batch component") {
+    const fs::path dir = tmp("mate_ref_project");
+    const fs::path part = dir / "mate_ref_box.step";
+    fs::create_directories(dir);
+    doc::export_bodies({BRepPrimAPI_MakeBox(10.0, 10.0, 10.0).Shape()},
+                       part.string(), "step");
+    const std::string did = doc::doc_new("assembly", "relative_mate_refs", false, dir.string())
+                                .at("doc_id").get<std::string>();
+    struct Cleanup {
+        std::string id;
+        fs::path part, dir;
+        ~Cleanup() {
+            close_session_when_idle(id);
+            std::error_code ec;
+            fs::remove(part, ec);
+            fs::remove(dir, ec);
+        }
+    } cleanup{did, part, dir};
+
+    const json inserted = doc::doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", part.filename().string()}}}},
+        {{"op", "asm_insert_component"}, {"source", {{"path", part.filename().string()}}}}
+    }), false);
+    const std::string a = inserted.at("id_map").at("$0").get<std::string>();
+    const std::string b = inserted.at("id_map").at("$1").get<std::string>();
+    CHECK(a == "k1");
+    CHECK(b == "k2");
+    const json top = {{"kind", "face"}, {"centroid", {5.0, 5.0, 10.0}}};
+    const json bottom = {{"kind", "face"}, {"centroid", {5.0, 5.0, 0.0}}};
+    const json added = doc::doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_add_mate"}, {"mate", {
+            {"type", "distance"}, {"value", {{"value", 30.0}, {"expr", nullptr}}},
+            {"refs", json::array({{{"component", a}, {"selector", top}},
+                                  {{"component", b}, {"selector", top}}})}}}}
+    }), false);
+    const std::string mid = added.at("id_map").at("$0").get<std::string>();
+    const json replacement = json::array({
+        {{"component", a}, {"selector", top}},
+        {{"component", "k3"}, {"selector", bottom}}
+    });
+    const json edited = doc::doc_apply_ops(did, -1, json::array({
+        {{"op", "asm_insert_component"}, {"source", {{"path", part.filename().string()}}},
+         {"transform", pose_tx(20.0)}},
+        {{"op", "asm_edit_mate"}, {"id", mid}, {"refs", replacement}}
+    }), false);
+    CHECK(edited.at("id_map").at("$0") == "k3");
+    CHECK(edited.at("tree").at("mates").at(0).at("refs") == replacement);
+    CHECK(edited.at("tree").at("mates").at(0).at("reference_frames").at("k3") == pose_tx(20.0));
+    CHECK(edited.at("rebuild").at("converged") == true);
+    CHECK(edited.at("rebuild").at("mates").at(0).at("status") == "ok");
 }
 
 // Re-posing an EXISTING component must stick. Every doc_apply_ops on an assembly runs

@@ -21,15 +21,17 @@ using nlohmann::json;
 // Thrown with the exact message of the Python oracle's ValueError.
 struct DfmError : std::runtime_error { using std::runtime_error::runtime_error; };
 
-// Public list of every known process id, in the oracle's PROFILES order:
-// fdm, cnc_mill, lathe, sheet_metal, laser, injection.
+// Process ids in stable order: fdm, cnc_mill, lathe, sheet_metal, laser,
+// injection, cast (sand), sla, sls, mjf. Waterjet is not yet profiled.
 std::vector<std::string> known_processes();
 
 // get_profile(process, overrides=null): a fresh copy of the doc-resident
-// ProcessProfile {"process","material","params"}. Overrides: "hole_comp" replaces
-// params.hole_comp_mm; "xy_comp" is recorded as params.xy_comp_mm and added onto
-// tolerance_band_mm (rounded half-even to 4); unknown keys are stashed under
-// params._extra_overrides. Throws DfmError on an unknown process.
+// ProcessProfile {"process","material","params"}. Sourced rules and their
+// provenance are in params.rules and params.rule_sources; unavailable values
+// are omitted from rules or null in legacy fields. Overrides: "hole_comp"
+// replaces params.hole_comp_mm; "xy_comp" is recorded as params.xy_comp_mm
+// and added to a known tolerance band (rounded half-even to 4). Unknown keys
+// are stashed under params._extra_overrides. Throws DfmError on unknown process.
 json get_profile(const std::string& process, const json* overrides = nullptr);
 
 // fit_clearance(process, fit_class): the diametral clearance (mm) to add for one fit

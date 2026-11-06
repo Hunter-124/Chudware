@@ -22,11 +22,16 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 import pytest
 
 from services.mcp.ecad_tools import register_ecad_tools
+
+@pytest.fixture(autouse=True)
+def _isolated_project(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(tmp_path))
 
 
 # --------------------------------------------------------------------------- stub mcp
@@ -79,11 +84,9 @@ def _build_divider_schematic(tools: dict, name: str = "bf_div",
                              sch_id: str | None = None) -> str:
     """Footprinted resistive divider (always works with starter library).
 
-    Layout (pin tips must land on power/label positions)::
+    Layout (pin tips are resolved from the installed symbol definitions)::
 
-        V1 at (0, 0):  + tip ~(0, 5.08),  - tip ~(0, -5.08)
-        R1 at (20, 5): pin1 tip ~(14.92, 5), pin2 tip ~(25.08, 5)
-        R2 at (40, 5): pin1 tip ~(34.92, 5), pin2 tip ~(45.08, 5)
+        V1 at (0, 0); R1 at (20, 5); R2 at (40, 5)
 
     Nets: +5V = V1.+ — R1.1; MID = R1.2 — R2.1; GND = R2.2 (power port).
     """
@@ -95,13 +98,13 @@ def _build_divider_schematic(tools: dict, name: str = "bf_div",
         sch_id = r.get("doc_id") or _ECAD.get("current_sch")
         assert sch_id, f"failed to create schematic: {r}"
 
-    v1 = _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:V_source",
+    v1 = _call(tools, "ecad_place_symbol", libid="Simulation_SPICE:VDC",
                x=0, y=0, value="5", ref="V1", doc_id=sch_id)
     r1 = _call(tools, "ecad_place_symbol", libid="Device:R", x=20, y=5,
-               value="10k", ref="R1", footprint="Resistor_SMD:R_0603",
+               value="10k", ref="R1", footprint="Resistor_SMD:R_0603_1608Metric",
                doc_id=sch_id)
     r2 = _call(tools, "ecad_place_symbol", libid="Device:R", x=40, y=5,
-               value="10k", ref="R2", footprint="Resistor_SMD:R_0603",
+               value="10k", ref="R2", footprint="Resistor_SMD:R_0603_1608Metric",
                doc_id=sch_id)
     assert r1.get("ok") and r2.get("ok"), f"place failed: v1={v1} r1={r1} r2={r2}"
 
@@ -112,14 +115,21 @@ def _build_divider_schematic(tools: dict, name: str = "bf_div",
         sy = by_ref.get(ref)
         if sy is not None and not sy.get("footprint"):
             ops.append({"op": "sch_edit_symbol", "id": sy["id"],
-                        "footprint": "Resistor_SMD:R_0603"})
-    # Exact pin-tip power/labels (matches test_ecad_tools._build_footprinted_divider).
+                        "footprint": "Resistor_SMD:R_0603_1608Metric"})
+    from services.mcp.ecad_common import schema
+
+    def pin_pos(ref, number):
+        sym = by_ref[ref]
+        pins = s.doc["lib_cache"][sym["libid"]]["pins"]
+        pin = next(p for p in pins if str(p["number"]) == str(number))
+        return list(schema.pin_world(sym, pin))
+
     ops.extend([
-        {"op": "sch_add_power", "net": "+5V", "pos": [0.0, 5.08]},
-        {"op": "sch_add_power", "net": "+5V", "pos": [14.92, 5.0]},
-        {"op": "sch_add_label", "text": "MID", "pos": [25.08, 5.0], "scope": "local"},
-        {"op": "sch_add_label", "text": "MID", "pos": [34.92, 5.0], "scope": "local"},
-        {"op": "sch_add_power", "net": "GND", "pos": [45.08, 5.0]},
+        {"op": "sch_add_power", "net": "+5V", "pos": pin_pos("V1", 1)},
+        {"op": "sch_add_power", "net": "+5V", "pos": pin_pos("R1", 1)},
+        {"op": "sch_add_label", "text": "MID", "pos": pin_pos("R1", 2), "scope": "local"},
+        {"op": "sch_add_label", "text": "MID", "pos": pin_pos("R2", 1), "scope": "local"},
+        {"op": "sch_add_power", "net": "GND", "pos": pin_pos("R2", 2)},
     ])
     ecad_session.apply_ops(s, s.revision, ops)
     return sch_id
@@ -139,6 +149,7 @@ def test_tools_registered() -> None:
 def test_board_from_schematic_places_and_routes() -> None:
     """(a) board_from_schematic -> placed footprints + routed tracks (or residual nets)."""
     from services.mcp.ecad_common import ecad_session
+    from services.mcp import core_bridge
     from services.mcp.ecad_tools import _ECAD
 
     tools = _tools()
@@ -155,6 +166,21 @@ def test_board_from_schematic_places_and_routes() -> None:
     pcb = ecad_session.get_session(board_id)
     n_fp = len(pcb.doc.get("footprints") or [])
     n_tracks = len(pcb.doc.get("tracks") or [])
+    board_path = Path(r["path"])
+    assert board_path == Path(ecad_session.get_session(sch_id).path).with_suffix(".kicad_pcb")
+    reopened = core_bridge.call("ecad_open", {"path": r["path"]})
+    try:
+        assert len(reopened["tree"].get("footprints") or []) == n_fp
+        assert len(reopened["tree"].get("tracks") or []) == n_tracks
+    finally:
+        core_bridge.call("ecad_close", {"doc_id": reopened["doc_id"]})
+    before = board_path.read_bytes()
+    for tool, params in (("board_from_schematic", {"sch_doc_id": sch_id}),
+                         ("ecad_make_board", {"doc_id": sch_id})):
+        blocked = _call(tools, tool, **params)
+        assert not blocked["ok"] and blocked["code"] == "already_exists", blocked
+        assert str(board_path) in blocked["error"] and "ecad_update_from_sch" in blocked["hint"]
+        assert board_path.read_bytes() == before
     assert n_fp >= 2, f"expected >=2 footprints, got {n_fp}"
     # Either tracks exist OR residual nets are named honestly.
     failed = r.get("failed_nets") or []
@@ -238,6 +264,8 @@ def test_determinism_two_runs() -> None:
     t0 = time.perf_counter()
     r1 = bf.board_from_schematic(sch, {"optimize": True, "seed": 0, "pcb_name": "det1"})
     r2 = bf.board_from_schematic(sch, {"optimize": True, "seed": 0, "pcb_name": "det2"})
+    assert Path(r1["path"]).name == "det1.kicad_pcb" and Path(r1["path"]).parent.name == "det1"
+    assert Path(r2["path"]).name == "det2.kicad_pcb" and Path(r2["path"]).parent.name == "det2"
     dt = (time.perf_counter() - t0) * 1000.0
 
     assert r1.get("placement") == r2.get("placement"), \
@@ -359,7 +387,7 @@ def test_a_symbol_sync_cannot_place_is_named_never_silently_dropped() -> None:
 
     # A real starter symbol that is a PHYSICAL part yet carries no default footprint —
     # exactly the shape that used to vanish. (The starter library has three such:
-    # Device:Switch, Device:Zener and FPGA:iCE40UP5K-SG48. Simulation_SPICE:V_source and
+    # Device:Switch, Device:Zener and FPGA:iCE40UP5K-SG48. Simulation_SPICE:VDC and
     # I_source are also footprint-less but are legitimately sim-only, so they must NOT be
     # reported — the divider above carries V1 and this test would trip on it otherwise.)
     ghost = _call(tools, "ecad_place_symbol", libid="Device:Switch", x=60, y=5,

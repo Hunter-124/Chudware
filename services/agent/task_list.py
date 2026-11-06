@@ -2,14 +2,10 @@
 
 Why this module exists: the copilot's Task-list panel
 (``host/src/ui/copilot/panel.cpp`` ``showTaskList``, fed by
-``AppState::ChatMsg::planState``) is driven by ``kind:"plan_state"`` events, and
-those were emitted ONLY from C++ (``core/agent/machine.cpp``, the ``run.cpp``
-mission loop).  Since the 2026-07 routing overhaul the ``general_agent`` turn is
-the universal ONLINE entry — it never enters either C++ loop — so the panel read
-"No task list yet" on every normal request.  This module is the Python-side
-producer: ``core/agent/run.cpp`` relays any worker payload carrying a ``"kind"``
-key verbatim onto the run's event stream, so a ``plan_state`` emitted here lands
-in the existing GUI panel with no C++ change.
+``AppState::ChatMsg::planState``) is driven by ``kind:"plan_state"`` events.  The
+``general_agent`` turn is the universal ONLINE entry, so this module is the producer:
+hostd relays any worker payload carrying a ``"kind"`` key verbatim onto the run's
+event stream, so a ``plan_state`` emitted here lands in the GUI panel.
 
 Payload contract: ``contracts/agent_events.md`` §plan_state.  The host upserts
 items BY ID across events, so ids MUST be stable across revisions — a caller that

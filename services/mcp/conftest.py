@@ -83,12 +83,12 @@ def _hermetic_config():
 
 @pytest.fixture(autouse=True)
 def _no_helper_model_process(monkeypatch, tmp_path):
-    """Empty config does not disable chud autodetection: refuse model processes.
+    """Empty config does not disable OMP autodetection: refuse model processes.
 
     Limit the pin to MCP tests so mixed agent/MCP runs cannot poison other suites'
     process-free host doubles. Runtime tests explicitly inject their client factory.
     """
-    monkeypatch.setenv("CHUDWARE_CHUDCODE_BIN", str(tmp_path / "no-model-runtime"))
+    monkeypatch.setenv("CHUDWARE_OMP_BIN", str(tmp_path / "no-model-runtime"))
 
 
 
@@ -117,7 +117,7 @@ def _private_engine_daemon(_hermetic_config):
         # The private daemon and any workers it spawns inherit the same refusal.
         # Restore the parent environment once spawned; each MCP test pins its own.
         with pytest.MonkeyPatch.context() as env:
-            env.setenv("CHUDWARE_CHUDCODE_BIN",
+            env.setenv("CHUDWARE_OMP_BIN",
                        str(_hermetic_config.parent / "no-model-runtime"))
             isolated = stack.enter_context(private_hostd.private_daemon())
         if not isolated and not os.environ.get("CHUDWARE_HOSTD_SOCKET") \
@@ -132,6 +132,28 @@ def _private_engine_daemon(_hermetic_config):
                 "(single shared document pool — expect order-dependent failures).",
                 allow_module_level=True)
         yield isolated
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _engine_op_vocabulary(_private_engine_daemon):
+    """Load the engine's op / feature-type vocabulary (doc_list_ops) once, from THIS
+    suite's engine, before any test can monkeypatch the bridge.
+
+    The dialect normalizers read that vocabulary and there is deliberately no Python copy
+    of it (services/mcp/op_vocab.py). Depending on `_private_engine_daemon` keeps the
+    call off the user's daemon. When no engine can be reached the cache is left empty and
+    a test that needs the vocabulary fails with op_vocab's own "engine unavailable"
+    message rather than answering from a stale list.
+    """
+    from services.mcp import op_vocab
+
+    try:
+        op_vocab.refresh()
+    except op_vocab.OpVocabUnavailable:
+        pass
+    yield
+    op_vocab._CACHE = None
+
 
 
 @pytest.fixture(autouse=True)
@@ -179,14 +201,8 @@ def pytest_runtest_teardown(item, nextitem):
     daemon to die: the pool is a process global inside ``libchudware``, shared with
     every suite that runs after this one.
 
-    ``cad_common.save_touched_docs()`` — the terminal sweep every linear role turn
-    runs — claims any open doc whose ``origin_kind`` is ``mcp``/``agent`` OR that is
-    listed in the module-global ``cad_common._TOUCHED_DOCS``. So an unsaved part left
-    behind here makes a LATER, unrelated turn report ``no_project_save_dir`` and come
-    back ``success=False, stop_reason="persistence_failed"`` with its handoff rewritten
-    to ``partial``. Measured with ``pytest -q services/mcp/test_cad_tools.py
-    services/agent/test_harness_integrity.py``: two green-in-isolation tests fail, and
-    the full combined run turns eight red across four ``services/agent`` files.
+    Terminal saves are turn/workspace-scoped, but leftover in-process documents can
+    still affect later tests' document selection and duplicate-name decisions.
 
     Same defect class, same remedy as
     ``services/agent/test_arg_reconciliation.py::_discard_documents_minted_by_this_file``

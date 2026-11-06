@@ -101,7 +101,7 @@ def _stock_record(mat: tuple, shape_std: str, size_key: str, size_title: str,
     code, label, density, mat_syn, standard = mat
     designation = f"{code}:{shape_std}:{size_key}"
     part_id = f"section:{shape_std}:{code}:{size_key}"
-    title = f"{size_title} {mat_syn} {synonyms}"
+    title = size_title.replace("round bar / rod", "round bar")
     params: dict = dict(dims)
     params.update({
         "material": code,
@@ -114,6 +114,8 @@ def _stock_record(mat: tuple, shape_std: str, size_key: str, size_title: str,
         "part_id": part_id,
         "domain": _DOMAIN,
         "title": title,
+        "family": dims["shape"].replace("_", " ").title(),
+        "aliases": [size_title, mat_syn, synonyms],
         "standard": standard,
         "designation": designation,
         "params": params,
@@ -248,7 +250,8 @@ class RawStockAdapter:
         recs = list(self.iter_records())
         if not norm:
             return recs
-        return [r for r in recs if norm in r["title"].lower()]
+        return [r for r in recs
+                if norm in " ".join([r["title"], *r["aliases"]]).lower()]
 
     def get(self, part_id: str) -> dict | None:
         for rec in self.iter_records():

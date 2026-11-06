@@ -11,11 +11,12 @@ import json
 import random
 
 import pytest
+from services.agent import regen_verify as RV
 
 from tools.flywheel.bench.benches import regen_fix as RF
 from tools.flywheel.bench.corpus import regen_corpus as RC
 
-_OPENER, _COMPARE = RF._make_live_verifier()
+_OPENER, _COMPARE = RV.make_live_verifier()
 pytestmark = pytest.mark.skipif(_OPENER is None,
                                 reason="C++ core not available (set CHUDWARE_LIBCHUDWARE)")
 
@@ -28,7 +29,8 @@ def _good():
 
 def test_opener_rebuilds_a_good_doc():
     res = _OPENER(_good())
-    assert res["rebuilt"] is True and res["doc_id"]
+    assert res["rebuilt"] is True and res["doc_id"], res
+    _OPENER.close(res["doc_id"])
 
 
 def test_opener_reports_rebuild_failure_with_detail():
@@ -39,9 +41,15 @@ def test_opener_reports_rebuild_failure_with_detail():
 
 
 def test_compare_good_vs_good_is_100():
-    a = _OPENER(_good())["doc_id"]
-    b = _OPENER(_good())["doc_id"]
-    assert _COMPARE(a, b) >= RF.LIVE_MATCH_THRESHOLD
+    a = _OPENER(_good())
+    b = _OPENER(_good())
+    try:
+        assert a["rebuilt"] and b["rebuilt"], (a, b)
+        assert _COMPARE(a["doc_id"], b["doc_id"]) >= RV.LIVE_MATCH_THRESHOLD
+    finally:
+        for result in (a, b):
+            if result["doc_id"]:
+                _OPENER.close(result["doc_id"])
 
 
 # ---- the authoritative binary verifier --------------------------------------
@@ -53,7 +61,7 @@ def test_perfect_fix_passes_live():
         copy.deepcopy(good), claimed=True, intent_dims={},
         good_document=good, opener=_OPENER, compare_fn=_COMPARE)
     assert detail["mode"] == "live"
-    assert score == 1.0 and passed
+    assert score == 1.0 and passed, detail
 
 
 def test_rebuildable_but_geometry_changed_scores_zero():
@@ -64,14 +72,18 @@ def test_rebuildable_but_geometry_changed_scores_zero():
     # bump a design global -> still rebuilds, but the part is geometrically different from good
     for g in drifted["tree"]["equations"]["globals"]:
         if g["name"] == "W":
-            g["expr"] = str(float(g["expr"]) + 40)
+            # Keep the stored edge selector close enough to rebind under the
+            # engine's owner-unverified tolerance, while still changing volume.
+            g["expr"] = str(float(g["expr"]) + 5)
     # it must actually still rebuild (otherwise the test proves nothing about the AND-clause)
-    assert _OPENER(drifted)["rebuilt"] is True
+    opened = _OPENER(drifted)
+    assert opened["rebuilt"] is True, opened
+    _OPENER.close(opened["doc_id"])
     score, passed, detail = RF.verify_fix(
         drifted, claimed=True, intent_dims={},
         good_document=good, opener=_OPENER, compare_fn=_COMPARE)
     assert detail["mode"] == "live"
-    assert detail["match_pct"] is not None and detail["match_pct"] < RF.LIVE_MATCH_THRESHOLD
+    assert detail["match_pct"] is not None and detail["match_pct"] < RV.LIVE_MATCH_THRESHOLD
     assert score == 0.0 and not passed
 
 

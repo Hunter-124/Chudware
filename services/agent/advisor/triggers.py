@@ -112,7 +112,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
                 {"calc": "fit_calc", "inputs_from": "literal",
                  "input_map": {"nominal": None, "fit": "H7/p6"}},
             ],
-            "exemplar": "H7/p6 on dia 20: min interference 0.017 mm, max 0.042 mm (ISO 286, fit_calc)",
+            "exemplar": "H7/p6 on dia 20: min interference 0.001 mm, max 0.035 mm (ISO 286, fit_calc)",
         },
         "budget_tokens": 250,
         "cooldown_turns": 8,
@@ -148,7 +148,7 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "inject": {
             "context_pack": "thin_wall",
             "prerun_calcs": [],
-            "exemplar": "FDM: min wall 1.2 mm; SLA: 0.6 mm; CNC: depends on tool; source: wall_thickness.py",
+            "exemplar": "Run wall_thickness() AND dfm_check; fix or justify every RED region before export/slicing. Use the bound process/FDM profile minimum.",
         },
         "budget_tokens": 200,
         "cooldown_turns": 6,
@@ -244,7 +244,9 @@ _BUILTIN_TRIGGERS: list[dict] = [
                 r"\bassemble\b", r"\bcheck interference\b", r"\boverlap\b",
                 r"\b(?:place|mount|mate)\b(?:\s+\w+){0,3}\s+\b(?:part|component|body|board|assembly)\b",
             ],
-            "tools": ["part_place", "solve_mates", "check_interference"],
+            "tools": ["part_place", "solve_mates", "check_interference", "interface_check",
+                      "assembly_dof", "fastener_check", "tool_access_check",
+                      "disassembly_check", "mate_fit_check", "bom_consistency_check"],
             "events": ["assembly_body_added"],
         },
         "inject": {
@@ -266,15 +268,16 @@ _BUILTIN_TRIGGERS: list[dict] = [
                 r"\bdesign for manufacturability\b", r"\b3D print(?:er|ing|ed)?\b",
                 r"\bCNC machin(?:e|ed|ing)\b", r"\binjection mold(?:ed|ing)?\b",
             ],
-            "tools": ["set_process", "dfm_check", "wall_thickness", "resolve_process"],
+            "tools": ["set_process", "dfm_check", "wall_thickness", "resolve_process",
+                      "dfm_reinforce", "add_features", "edit_feature"],
             "events": [],
         },
         "inject": {
             "context_pack": "dfm_pre_op",
             "prerun_calcs": [],
             "exemplar": (
-                "Run dfm_check before export; wall < process minimum and missing draft "
-                "are blockers (advisor names delta + fix)"
+                "At additive milestones after edits, run dfm_check and dfm_reinforce; "
+                "inspect verified fixes and rerun after changes."
             ),
         },
         "budget_tokens": 200,
@@ -397,6 +400,22 @@ _BUILTIN_TRIGGERS: list[dict] = [
         "cooldown_turns": 8,
     },
     {
+        "id": "stress_concentration",
+        "match": {
+            "keywords": [r"\bstress (?:riser|concentration)", r"\bsharp (?:corner|edge)",
+                         r"\bnotch sensitivity\b"],
+            "tools": ["run_fea_static", "find_stress_risers"],
+            "events": [],
+        },
+        "inject": {
+            "context_pack": "stress_concentration",
+            "prerun_calcs": [],
+            "exemplar": "Locate the concentration, inspect the load path and compare local mesh refinement before claiming strength.",
+        },
+        "budget_tokens": 300,
+        "cooldown_turns": 8,
+    },
+    {
         "id": "ecad_design",
         "match": {
             "keywords": [
@@ -415,6 +434,27 @@ _BUILTIN_TRIGGERS: list[dict] = [
             "context_pack": "ecad_design",
             "prerun_calcs": [],
             "exemplar": "Schematic -> ERC -> board_from_schematic -> DRC; nets before SPICE (ecad_design pack)",
+        },
+        "budget_tokens": 250,
+        "cooldown_turns": 8,
+    },
+    {
+        "id": "harness_design",
+        "match": {
+            "keywords": [r"\bwir(?:e|ing) harness\b", r"\bwire loom\b", r"\bformboard\b"],
+            "tools": [
+                "harness_new", "harness_add_connector", "harness_add_wire", "harness_connect",
+                "harness_from_netlist", "harness_route", "harness_check", "harness_build_geometry",
+                "harness_report", "harness_formboard", "harness_get", "harness_edit",
+                "harness_electrical_check", "harness_bus_check", "harness_cable_model",
+                "harness_to_bus_links",
+            ],
+            "events": [],
+        },
+        "inject": {
+            "context_pack": "harness_design",
+            "prerun_calcs": [],
+            "exemplar": "Define connectivity and placements, route, check, then produce harness deliverables.",
         },
         "budget_tokens": 250,
         "cooldown_turns": 8,
@@ -558,7 +598,9 @@ _RULE_METADATA: dict[str, tuple[str, str]] = {
     "molded_draft": ("Mold draft", "Surface draft-angle requirements for molded geometry."),
     "drawing_standards": ("Drawing standards", "Guide measured views, dimensions, annotations, and drawing export."),
     "sim_setup": ("Simulation setup", "Require sourced materials, explicit loads, constraints, and result checks."),
+    "stress_concentration": ("Stress concentration", "Locate weak sections and assess local mesh convergence and fatigue."),
     "ecad_design": ("ECAD design", "Guide schematic, board, ERC, DRC, and electrical verification flow."),
+    "harness_design": ("Wire harness design", "Guide connectivity, routing, electrical checks and deliverables."),
     "cam_setup": ("CAM setup", "Guide stock, toolpaths, simulation, and postprocessing."),
     "part_sourcing": ("Part sourcing", "Prefer verified catalog parts and supplier data over hand-modeled hardware."),
     "reveng_flow": ("Reverse engineering", "Guide scan or reference geometry into verified parametric reconstruction."),

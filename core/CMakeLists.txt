@@ -31,20 +31,6 @@ if(CHUDWARE_DEVELOPER_BUILD)
   add_compile_definitions(CHUDWARE_DEVELOPER_BUILD=1)
 endif()
 
-set(CHUDWARE_PROTECTED_ASSETS_DIR "" CACHE PATH
-  "Generated protected-assets root required when CHUDWARE_DEVELOPER_BUILD=OFF")
-if(NOT CHUDWARE_DEVELOPER_BUILD)
-  if(NOT CHUDWARE_PROTECTED_ASSETS_DIR)
-    set(CHUDWARE_PROTECTED_ASSETS_DIR
-      "${CMAKE_BINARY_DIR}/generated/protected-assets")
-  endif()
-  if(NOT EXISTS "${CHUDWARE_PROTECTED_ASSETS_DIR}/include/chudware/protected_assets.generated.h")
-    message(FATAL_ERROR
-      "Production builds require packaging/embed_protected_assets.py output at "
-      "${CHUDWARE_PROTECTED_ASSETS_DIR}")
-  endif()
-endif()
-
 
 # Build all static libs position-independent so they can be linked into the libchudware
 # SHARED library on ELF platforms (Linux/macOS): GCC/Clang reject non-PIC .o in a .so
@@ -52,6 +38,8 @@ endif()
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 if(MSVC)
   add_compile_options(/utf-8 /MP)
+  # JSON-heavy document persistence exceeds the normal COFF section count.
+  set_source_files_properties(doc/session.cpp PROPERTIES COMPILE_OPTIONS /bigobj)
 endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -116,13 +104,13 @@ endif()
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/PinnedGitSource.cmake")
 
 # --- Eigen (header-only linear algebra; replaces numpy/scipy.linalg) ---------
-set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
-set(EIGEN_BUILD_DOC OFF CACHE BOOL "" FORCE)
-set(EIGEN_BUILD_PKGCONFIG OFF CACHE BOOL "" FORCE)
 # Primary tag identity: https://gitlab.com/api/v4/projects/libeigen%2Feigen/repository/tags/3.4.0
 chudware_populate_pinned_git(eigen https://gitlab.com/libeigen/eigen.git
   3147391d946bb4b6c68edd901f2add6ac1f31f8c)
-add_subdirectory("${eigen_SOURCE_DIR}" "${eigen_BINARY_DIR}" EXCLUDE_FROM_ALL)
+# Consume only the headers; upstream also configures unused BLAS/LAPACK and Fortran.
+add_library(eigen INTERFACE)
+target_include_directories(eigen INTERFACE "${eigen_SOURCE_DIR}")
+add_library(Eigen3::Eigen ALIAS eigen)
 
 # --- nlohmann/json (fixture / sketch dict parsing; same lib the host uses) ----
 set(JSON_BuildTests OFF CACHE INTERNAL "")
@@ -224,6 +212,7 @@ target_link_libraries(chudware_geom PUBLIC Eigen3::Eigen)
 # platform_paths / parent_death: the one spelling per OS of "where am I", "is that
 # pid alive", and "bind this child's life to mine" — see util/platform_paths.h.
 add_library(chudware_util STATIC
+  doc/native_policy.cpp
   util/expr.cpp
   util/aicm_handoff.cpp
   util/resource_governor.cpp
@@ -373,10 +362,7 @@ set_property(TARGET chudware_cam PROPERTY
   MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
 # --- libchudware ecad (ECAD document model: schema + ops + session) -------------
-# Ported from the retired Python engine's ECAD schema/ops/session. OCCT-free — the
-# ECAD doc/ops layer is pure JSON (like chudware_sim) — so it builds in the
-# standalone config and stays fast + isolated. Netlist/ERC/DRC/autoroute/Gerber/
-# 3D are DEFERRED to later waves.
+# KiCad file handling, agent operations and headless CLI bridge; OCCT-free.
 add_library(chudware_ecad STATIC
   ecad/schema.cpp
   ecad/ops.cpp
@@ -388,15 +374,16 @@ add_library(chudware_ecad STATIC
   ecad/dfm.cpp
   ecad/impedance.cpp
   ecad/zonefill.cpp
-  ecad/fabformats.cpp
   ecad/library.cpp
   ecad/recipes.cpp
   ecad/symlib.cpp
-  ecad/schexport.cpp
-  ecad/schplot.cpp
   ecad/sync.cpp
   ecad/container.cpp
   ecad/kicad.cpp
+  ecad/kicad_write.cpp
+  ecad/kicad_libs.cpp
+  ecad/kicad_cli.cpp
+  util/subprocess.cpp
   ecad/session.cpp)
 target_include_directories(chudware_ecad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # chudware_miniz is the ZIP read/write lib (shared with the .step+ container) — the
@@ -405,6 +392,9 @@ target_include_directories(chudware_ecad PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # (session.cpp) drives (schematic netlist -> SPICE circuit -> run). chudware_sim is
 # pure-JSON and does NOT depend on chudware_ecad, so this introduces no cycle.
 target_link_libraries(chudware_ecad PUBLIC nlohmann_json::nlohmann_json chudware_miniz chudware_sim)
+if(WIN32)
+  target_link_libraries(chudware_ecad PUBLIC advapi32)
+endif()
 
 # mega-28 E28: autorouter min-clearance (pad/track spacing) — pure JSON, OCCT-free.
 add_executable(test_autoroute tests/test_autoroute.cpp)
@@ -490,10 +480,30 @@ set_target_properties(test_kicad_import PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME kicad_import COMMAND test_kicad_import)
 
+add_executable(test_kicad_roundtrip tests/test_kicad_roundtrip.cpp)
+target_include_directories(test_kicad_roundtrip PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_kicad_roundtrip PRIVATE chudware_ecad)
+set_target_properties(test_kicad_roundtrip PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME kicad_roundtrip COMMAND test_kicad_roundtrip)
+
+add_executable(test_kicad_libs tests/test_kicad_libs.cpp)
+target_include_directories(test_kicad_libs PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_kicad_libs PRIVATE chudware_ecad)
+set_target_properties(test_kicad_libs PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME kicad_libs COMMAND test_kicad_libs)
+
+add_executable(test_kicad_cli tests/test_kicad_cli.cpp)
+target_include_directories(test_kicad_cli PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_kicad_cli PRIVATE chudware_ecad)
+set_target_properties(test_kicad_cli PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME kicad_cli COMMAND test_kicad_cli)
+
 # Schematic engine contract tests — sheet-scoped connectivity, segment attachment,
 # label scoping, buses, multi-unit grouping, the corrected ERC drive/power/no-connect
-# semantics, the native symbol library, the completed op vocabulary, the schematic
-# export kinds (netlist/bom/spice/kicad/svg/pdf), foreign-source save safety,
+# semantics, the native symbol library, the op vocabulary, KiCad save safety,
 # ecad_design's recipe compiler, resolve_pick and describe. Each case pins a defect
 # that shipped before the 2026-08 overhaul; see the header of the file.
 add_executable(test_sch_engine tests/test_sch_engine.cpp)
@@ -780,40 +790,20 @@ target_include_directories(chudware_aicm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # --- libchudware agent (LLM provider layer; WinHTTP TLS, OCCT-free) -------------
 # P51: C++ port of services/agent/providers/*.py — the request builders + response parsers
 # for Anthropic / OpenAI-compatible / llama.cpp / mock providers, plus a native
-# WinHTTP POST (no libcurl/OpenSSL). Top-level (NOT inside if(CHUDWARE_WITH_OCCT)) so
-# it builds in both configs. Dynamic CRT to match chudware_miniz / the DLL heap.
+# WinHTTP POST (no libcurl/OpenSSL), subscription-auth refresh, provider resolution
+# (offline/ITAR guard), and the in-app Ask / PropertyManager-assist single-call helpers.
+# Top-level (NOT inside if(CHUDWARE_WITH_OCCT)) so it builds in both configs. Dynamic
+# CRT to match chudware_miniz / the DLL heap.
 add_library(chudware_agent STATIC
   agent/http.cpp
   agent/auth.cpp
   agent/providers.cpp
   agent/paths.cpp
   agent/config.cpp
-  agent/copilot_modes.cpp
-  agent/ops_emit.cpp
-  agent/events.cpp
-  agent/roles.cpp
-  agent/state.cpp
-  agent/machine.cpp
-  agent/run.cpp
-  agent/run_stop.cpp
-  agent/micro.cpp
   agent/ask.cpp
-  agent/clarify.cpp
-  agent/complexity.cpp
-  agent/domain.cpp
-  agent/firm_bid.cpp
-  agent/firm_team.cpp
-  agent/iface_plan.cpp
   agent/pm_assist.cpp)
 target_include_directories(chudware_agent PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-if(NOT CHUDWARE_DEVELOPER_BUILD)
-  target_include_directories(chudware_agent PRIVATE
-    "${CHUDWARE_PROTECTED_ASSETS_DIR}/include")
-endif()
-
-# chudware_util: platform_paths (executablePath) + parent_death (fork/exec child
-# hardening) for run.cpp's worker spawn.
-target_link_libraries(chudware_agent PUBLIC nlohmann_json::nlohmann_json chudware_util)
+target_link_libraries(chudware_agent PUBLIC nlohmann_json::nlohmann_json)
 if(WIN32)
   target_link_libraries(chudware_agent PUBLIC winhttp bcrypt)
 else()
@@ -824,15 +814,15 @@ endif()
 set_property(TARGET chudware_agent PROPERTY
   MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
+# Provider request builders/parsers, provider resolution and redaction (agent/providers.cpp,
+# agent/config.cpp). OCCT-free, links chudware_agent.
 add_executable(test_agent
   tests/test_agent.cpp)
 target_include_directories(test_agent PRIVATE ${doctest_SOURCE_DIR})
 target_link_libraries(test_agent PRIVATE chudware_agent)
 set_target_properties(test_agent PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-# test_agent loads role prompts from the repo-relative services/agent/prompts/ — run it from
-# the repo root (core/..) so the lookup resolves regardless of where ctest is invoked.
-add_test(NAME agent COMMAND test_agent WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+add_test(NAME agent COMMAND test_agent)
 
 # subscription-auth store + pre-run refresh (agent/auth.cpp). OCCT-free, links
 # chudware_agent; all cases run against a scratch XDG config dir with a fake HTTP seam.
@@ -843,63 +833,6 @@ target_link_libraries(test_agent_auth PRIVATE chudware_agent)
 set_target_properties(test_agent_auth PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME agent_auth COMMAND test_agent_auth)
-
-# err_sig identical-failure detector (agent/machine.cpp). OCCT-free, links chudware_agent.
-add_executable(test_machine
-  tests/test_machine.cpp)
-target_include_directories(test_machine PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_machine PRIVATE chudware_agent)
-set_target_properties(test_machine PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-add_test(NAME machine COMMAND test_machine)
-
-# complexity router (agent/complexity.cpp). OCCT-free, links chudware_agent.
-add_executable(test_complexity
-  tests/test_complexity.cpp)
-target_include_directories(test_complexity PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_complexity PRIVATE chudware_agent)
-set_target_properties(test_complexity PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-add_test(NAME complexity COMMAND test_complexity)
-
-# Copilot mode tool-gating contract (agent/copilot_modes.cpp ←
-# contracts/copilot_modes.json). OCCT-free, links chudware_agent. Runs from the
-# repo root (like test_agent) so the repo-relative contracts/ fallback resolves.
-add_executable(test_copilot_modes
-  tests/test_copilot_modes.cpp)
-target_include_directories(test_copilot_modes PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_copilot_modes PRIVATE chudware_agent)
-set_target_properties(test_copilot_modes PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-add_test(NAME copilot_modes COMMAND test_copilot_modes
-  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
-
-# domain classifier + tool-class registry (agent/domain.cpp). OCCT-free.
-add_executable(test_domain
-  tests/test_domain.cpp)
-target_include_directories(test_domain PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_domain PRIVATE chudware_agent)
-set_target_properties(test_domain PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-add_test(NAME domain COMMAND test_domain)
-
-# firm bid estimator + roster (agent/firm_bid.cpp). OCCT-free.
-add_executable(test_firm_bid
-  tests/test_firm_bid.cpp)
-target_include_directories(test_firm_bid PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_firm_bid PRIVATE chudware_agent)
-set_target_properties(test_firm_bid PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-add_test(NAME firm_bid COMMAND test_firm_bid)
-
-# firm team assembly + specialist roles (agent/firm_team.cpp). OCCT-free.
-add_executable(test_firm_team
-  tests/test_firm_team.cpp)
-target_include_directories(test_firm_team PRIVATE ${doctest_SOURCE_DIR})
-target_link_libraries(test_firm_team PRIVATE chudware_agent)
-set_target_properties(test_firm_team PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-add_test(NAME firm_team COMMAND test_firm_team)
 
 # --- host AICM loader for core round-trip tests --------------------------------
 # The GUI's own reader (host/src/render/aicm_loader.cpp, the one host/CMakeLists.txt
@@ -936,10 +869,12 @@ add_test(NAME aicm COMMAND test_aicm)
 add_library(chudware_parts STATIC
   parts/catalog.cpp
   parts/generate.cpp
+  parts/fitting_geometry.cpp
+  parts/section_geometry.cpp
   parts/place.cpp)
 target_include_directories(chudware_parts PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(chudware_parts PUBLIC
-  nlohmann_json::nlohmann_json chudware_ecad chudware_hydraulic)
+  nlohmann_json::nlohmann_json chudware_ecad chudware_hydraulic chudware_structural)
 
 add_executable(test_parts tests/test_parts.cpp)
 target_include_directories(test_parts PRIVATE ${doctest_SOURCE_DIR})
@@ -954,6 +889,13 @@ target_link_libraries(test_parts_place PRIVATE chudware_parts)
 set_target_properties(test_parts_place PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME parts_place COMMAND test_parts_place)
+
+add_executable(test_parts_geometry tests/test_parts_geometry.cpp)
+target_include_directories(test_parts_geometry PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_parts_geometry PRIVATE chudware_parts)
+set_target_properties(test_parts_geometry PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME parts_geometry COMMAND test_parts_geometry)
 
 # --- libchudware sourcing (BOM roll-up / cost model / spec-match / providers) -------
 # C++ port of the retired Python {bom,cost_model,spec_sheet_matcher,parts_providers,
@@ -1081,7 +1023,7 @@ add_library(chudware_piping STATIC
   piping/spec.cpp
   piping/vessel.cpp)
 target_include_directories(chudware_piping PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(chudware_piping PUBLIC nlohmann_json::nlohmann_json)
+target_link_libraries(chudware_piping PUBLIC nlohmann_json::nlohmann_json chudware_util)
 if(MSVC)
   # MSVC only defines M_PI et al. in <cmath> when _USE_MATH_DEFINES is set.
   target_compile_definitions(chudware_piping PUBLIC _USE_MATH_DEFINES)
@@ -1101,6 +1043,21 @@ target_link_libraries(chudware_hydraulic PUBLIC chudware_piping nlohmann_json::n
 if(MSVC)
   target_compile_definitions(chudware_hydraulic PUBLIC _USE_MATH_DEFINES)
 endif()
+
+add_library(chudware_harness STATIC
+  harness/geometry.cpp
+  harness/obstacles.cpp
+  harness/route.cpp
+  harness/path_check.cpp)
+target_include_directories(chudware_harness PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(chudware_harness PUBLIC nlohmann_json::nlohmann_json)
+
+add_executable(test_harness_route tests/test_harness_route.cpp)
+target_include_directories(test_harness_route PRIVATE ${doctest_SOURCE_DIR})
+target_link_libraries(test_harness_route PRIVATE chudware_harness)
+set_target_properties(test_harness_route PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_test(NAME harness_route COMMAND test_harness_route)
 
 add_executable(test_piping tests/test_piping.cpp)
 target_include_directories(test_piping PRIVATE ${doctest_SOURCE_DIR})
@@ -1266,6 +1223,8 @@ if(CHUDWARE_WITH_OCCT)
   add_library(chudware_geom_occt STATIC
     geom/tessellate.cpp
     geom/geometry_analysis.cpp
+    geom/assembly_clearance.cpp
+    geom/edge_analysis.cpp
     geom/features.cpp
     geom/profile.cpp
     geom/profile3d.cpp
@@ -1276,6 +1235,7 @@ if(CHUDWARE_WITH_OCCT)
     geom/shell_sections.cpp
     geom/transform.cpp
     geom/fit.cpp
+    geom/wall_thickness.cpp
     geom/hole.cpp
     geom/sheetmetal.cpp
     geom/weldment.cpp
@@ -1283,7 +1243,6 @@ if(CHUDWARE_WITH_OCCT)
     geom/curves.cpp
     geom/thread.cpp
     geom/text.cpp
-    geom/ecad_3d.cpp
     doc/drawing.cpp
     sim/overlay.cpp
     geom/aicm.cpp)
@@ -1299,8 +1258,8 @@ if(CHUDWARE_WITH_OCCT)
     chudware_geom
     chudware_prof   # per-phase sim timers (sim/overlay.cpp overlay_* studies)
     chudware_util   # aicm_handoff publish for sim/overlay AICM
-    chudware_ecad   # ecad/schema.h pad_world + ecad/ops.h OpError for geom/ecad_3d.cpp
     nlohmann_json::nlohmann_json
+    ${CMAKE_DL_LIBS}
     TKernel TKMath TKG2d TKG3d TKGeomBase TKGeomAlgo
     TKBRep TKTopAlgo TKPrim TKMesh TKShHealing TKBO TKFillet
     # TKHLR: hidden-line removal (HLRBRep_Algo / HLRBRep_HLRToShape) for the 2D
@@ -1685,6 +1644,9 @@ if(CHUDWARE_WITH_OCCT)
   # chudware_sketch (solve_sketch), and chudware_util (the expr evaluator for expr dims).
   add_library(chudware_doc STATIC
     doc/document.cpp
+    doc/scad.cpp
+    doc/scad_projection.cpp
+    util/scad_process.cpp
     doc/selectors.cpp
     doc/picks.cpp
     doc/session.cpp
@@ -1709,6 +1671,13 @@ if(CHUDWARE_WITH_OCCT)
     doc/export2d.cpp
     doc/drawing_session.cpp
     cam/extract.cpp)
+  if(WIN32)
+    target_sources(chudware_doc PRIVATE util/scad_process_windows.cpp)
+    target_compile_definitions(chudware_doc PRIVATE _WIN32_WINNT=0x0A00)
+    target_link_libraries(chudware_doc PUBLIC userenv advapi32 bcrypt ole32)
+  elseif(APPLE)
+    target_sources(chudware_doc PRIVATE util/scad_process_macos.cpp)
+  endif()
   target_include_directories(chudware_doc PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${OpenCASCADE_INCLUDE_DIR})
@@ -1752,6 +1721,18 @@ if(CHUDWARE_WITH_OCCT)
     endif()
   endif()
 
+  if(UNIX)
+    add_executable(chudware-shape-build-worker util/shape_build_worker.cpp)
+    target_link_libraries(chudware-shape-build-worker PRIVATE chudware_doc)
+    set_target_properties(chudware-shape-build-worker PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    if(APPLE)
+      target_link_options(chudware-shape-build-worker PRIVATE -Wl,-dead_strip)
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      target_link_options(chudware-shape-build-worker PRIVATE -Wl,--gc-sections)
+    endif()
+  endif()
+
   # Verification: compile a document -> write_aicm -> the GUI's render::parseAicm, with
   # the parametric-rebuild case (same doc, two envs -> two solids). Same wiring as
   # test_ops; chudware_doc carries the OCCT toolkits transitively via chudware_geom_occt.
@@ -1769,6 +1750,39 @@ if(CHUDWARE_WITH_OCCT)
   # Same OCCT DLL PATH prepend so the test can load TKernel et al.
   set_tests_properties(document PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
+  # Document-native mesh references remain separate from the modeled solids.
+  add_executable(test_mesh_reference tests/test_mesh_reference.cpp)
+  target_include_directories(test_mesh_reference PRIVATE
+    ${doctest_SOURCE_DIR}
+    ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_mesh_reference PRIVATE chudware_doc)
+  set_target_properties(test_mesh_reference PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME mesh_reference COMMAND test_mesh_reference)
+  set_tests_properties(mesh_reference PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
+  set(_scad_tests scad scad_process scad_projection scad_integration)
+  if(WIN32)
+    list(APPEND _scad_tests scad_process_windows)
+  elseif(APPLE)
+    list(APPEND _scad_tests scad_process_macos)
+  endif()
+  foreach(_scad_test IN LISTS _scad_tests)
+    add_executable(test_${_scad_test} tests/test_${_scad_test}.cpp)
+    target_include_directories(test_${_scad_test} PRIVATE
+      ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
+    target_link_libraries(test_${_scad_test} PRIVATE
+      chudware_doc chudware_geom_occt chudware_sketch chudware_geom)
+    set_target_properties(test_${_scad_test} PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    add_test(NAME ${_scad_test} COMMAND test_${_scad_test})
+    set_tests_properties(${_scad_test} PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+  endforeach()
+  if(WIN32)
+    target_compile_definitions(test_scad_process_windows PRIVATE _WIN32_WINNT=0x0A00)
+    target_link_libraries(test_scad_process_windows PRIVATE ws2_32 shell32)
+  endif()
+
   add_executable(test_geometry_analysis tests/test_geometry_analysis.cpp)
   target_include_directories(test_geometry_analysis PRIVATE
     ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
@@ -1777,6 +1791,26 @@ if(CHUDWARE_WITH_OCCT)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_test(NAME geometry_analysis COMMAND test_geometry_analysis)
   set_tests_properties(geometry_analysis PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
+  add_executable(test_assembly_clearance tests/test_assembly_clearance.cpp)
+  target_include_directories(test_assembly_clearance PRIVATE
+    ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_assembly_clearance PRIVATE chudware_geom_occt)
+  set_target_properties(test_assembly_clearance PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME assembly_clearance COMMAND test_assembly_clearance)
+  set_tests_properties(assembly_clearance PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
+  # --- geom/edge_analysis.cpp: exact signed dihedral + concave blend faces (eval_edge_analysis).
+  # Pure geometry on synthetic L-brackets / boss-on-plate parts with exact answers.
+  add_executable(test_edge_analysis tests/test_edge_analysis.cpp)
+  target_include_directories(test_edge_analysis PRIVATE
+    ${doctest_SOURCE_DIR} ${OpenCASCADE_INCLUDE_DIR})
+  target_link_libraries(test_edge_analysis PRIVATE chudware_geom_occt)
+  set_target_properties(test_edge_analysis PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME edge_analysis COMMAND test_edge_analysis)
+  set_tests_properties(edge_analysis PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
   # --- Op vocabulary registry lockstep (mega-8 OpVocab) -----------------------
   # Fails if someone adds an apply_one handler without updating op_registry, or
@@ -1969,17 +2003,6 @@ if(CHUDWARE_WITH_OCCT)
   set_tests_properties(render_camera PROPERTIES
     ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
-  add_executable(test_agent_mode_fast_paths tests/test_agent_mode_fast_paths.cpp)
-  target_include_directories(test_agent_mode_fast_paths PRIVATE ${doctest_SOURCE_DIR})
-  target_link_libraries(test_agent_mode_fast_paths PRIVATE
-    chudware nlohmann_json::nlohmann_json)
-  set_target_properties(test_agent_mode_fast_paths PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-  add_test(NAME agent_mode_fast_paths COMMAND test_agent_mode_fast_paths)
-  set_tests_properties(agent_mode_fast_paths PROPERTIES
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.."
-    ENVIRONMENT_MODIFICATION "${_occt_envmod}")
-
   # --- ViewNet view metrics (doc_view_metrics) + doc_render_view section ---------------
   # Drives the C ABI on a holed box: facing/back faces, true visible area vs the analytic face
   # areas, principal-view normal entropy, edge silhouettes, section caps, and byte-identical
@@ -2134,6 +2157,19 @@ if(CHUDWARE_WITH_OCCT)
   # Same OCCT DLL PATH prepend so the test can load TKernel et al.
   set_tests_properties(fit PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
 
+  # --- geom/wall_thickness.cpp: inscribed-sphere wall thickness (eval_thickness /
+  # mesh_wall_thickness). Pure geometry on synthetic boxes with exact answers; links
+  # chudware_geom_occt because that is the library wall_thickness.cpp is compiled into.
+  add_executable(test_wall_thickness
+    tests/test_wall_thickness.cpp)
+  target_include_directories(test_wall_thickness PRIVATE
+    ${doctest_SOURCE_DIR})
+  target_link_libraries(test_wall_thickness PRIVATE chudware_geom_occt chudware_util)
+  set_target_properties(test_wall_thickness PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_test(NAME wall_thickness COMMAND test_wall_thickness)
+  set_tests_properties(wall_thickness PROPERTIES ENVIRONMENT_MODIFICATION "${_occt_envmod}")
+
   # --- B5: ctest coverage for eval_interference's B4 params (include_coincident /
   # min_clearance_mm), doc_eval_feature_overlap (B2 intra-part tool-solid overlap: boss_
   # swallowed/cut_overlap/dead_features), and doc_eval_compare (C1 shape-vs-shape match_pct
@@ -2280,8 +2316,18 @@ if(CHUDWARE_WITH_OCCT)
   target_include_directories(chudware PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
   target_include_directories(chudware PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/hostd_gen)
   add_dependencies(chudware chudware_version_info)
+  if(TARGET chudware-shape-build-worker)
+    add_dependencies(chudware chudware-shape-build-worker)
+  endif()
   target_compile_definitions(chudware PRIVATE CHUDWARE_BUILD_DLL)
   target_link_libraries(chudware PRIVATE chudware_doc chudware_sim chudware_ecad chudware_cam chudware_agent chudware_parts chudware_sourcing chudware_firmware chudware_structural chudware_prof chudware_tolerance chudware_mechanical chudware_materials chudware_dfm chudware_piping chudware_hydraulic)
+  target_link_libraries(chudware PRIVATE chudware_harness)
+  if(CHUDWARE_WITH_OCCT)
+    target_link_libraries(test_parts_place PRIVATE chudware)
+    target_compile_definitions(test_parts_place PRIVATE CHUDWARE_PARTS_NATIVE_TESTS)
+    target_link_libraries(test_parts_geometry PRIVATE chudware)
+    target_compile_definitions(test_parts_geometry PRIVATE CHUDWARE_PARTS_NATIVE_TESTS)
+  endif()
   if(CHUDWARE_WITH_POLYMESH)
     target_link_libraries(chudware PRIVATE chudware_mesh)
     target_compile_definitions(chudware PRIVATE CHUDWARE_WITH_POLYMESH)
@@ -2356,6 +2402,7 @@ if(CHUDWARE_WITH_OCCT)
     hostd/child_supervisor.cpp        # POSIX: fork/PDEATHSIG/execvpe
     hostd/child_supervisor_win.cpp    # Windows: Job Objects, KILL_ON_JOB_CLOSE
     hostd/doc_registry.cpp
+    hostd/file_watch.cpp
     hostd/autosave.cpp
     hostd/hostd_log.cpp
     # hostd/mfg_lane.cpp is compiled into chudware_manufacturing, not here, so the daemon
@@ -2412,7 +2459,8 @@ if(CHUDWARE_WITH_OCCT)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
   add_dependencies(chudware-hostd chudware)  # engine staged before the daemon can serve it
 
-  # Offline cell-ownership regressions over the real DocRegistry, native run/sim controls.
+  # Offline cell-ownership regressions over the real DocRegistry and native C ABI.
+  # Keep internal C++ simulation checks in test_sim, not across the shared-library boundary.
   if(NOT WIN32)
     add_executable(test_hostd_cell_ownership
       ${CMAKE_CURRENT_SOURCE_DIR}/../host/tests/test_hostd_cell_ownership.cpp
@@ -2421,7 +2469,7 @@ if(CHUDWARE_WITH_OCCT)
     target_include_directories(test_hostd_cell_ownership PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR} ${CHUDWARE_GENERATED_INCLUDE_DIR})
     target_link_libraries(test_hostd_cell_ownership PRIVATE
-      chudware chudware_sim chudware_agent Threads::Threads nlohmann_json::nlohmann_json)
+      chudware Threads::Threads nlohmann_json::nlohmann_json)
     set_target_properties(test_hostd_cell_ownership PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
     add_test(NAME hostd_cell_ownership COMMAND test_hostd_cell_ownership)
@@ -2460,7 +2508,7 @@ if(CHUDWARE_WITH_OCCT)
 endif()
 
 # hostd engine-call watchdog policy (hostd/engine_watchdog.h, header-only): which calls
-# the short/long wall-clock ceilings may end, and that agent_*/chudcode_* turns are never
+# the short/long wall-clock ceilings may end, and that agent_*/omp_* turns are never
 # capped. OCCT-free, so it runs in every config; doctest checks stay active under NDEBUG.
 add_executable(test_engine_watchdog hostd/test_engine_watchdog.cpp)
 target_include_directories(test_engine_watchdog PRIVATE ${doctest_SOURCE_DIR})
@@ -2865,3 +2913,25 @@ if(CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
     endif()
   endforeach()
 endif()
+
+# Static document consumers need the same geometry runtime as the shared engine.
+# The worker links chudware_doc, so the dependency belongs on consumers, not that archive.
+if(TARGET chudware-shape-build-worker)
+  get_property(_shape_runtime_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+  foreach(_target IN LISTS _shape_runtime_targets)
+    if(_target STREQUAL "chudware-shape-build-worker")
+      continue()
+    endif()
+    get_target_property(_type "${_target}" TYPE)
+    if(_type STREQUAL "EXECUTABLE")
+      get_target_property(_links "${_target}" LINK_LIBRARIES)
+      if(_target STREQUAL "test_ops" OR "chudware_doc" IN_LIST _links)
+        add_dependencies("${_target}" chudware-shape-build-worker)
+      endif()
+    endif()
+  endforeach()
+endif()
+
+# Label registered tests and expose suite-specific build targets.
+include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/ChudwareTestSuites.cmake)
+chudware_apply_test_suites(core)

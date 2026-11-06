@@ -1,13 +1,7 @@
 # Read-Only Industrial Monitoring Architecture
 
-Owner: `MonitoringArchitecture`. Design-only. Status: implementation-ready.
-**Amended 2026-08-08** to close the architecture plan review's findings C4 and C8 and to adopt the late
-Gateway corrections; the amendment is itemized in §15 and every citation now uses the stable rule ids of §0.
-
-Inputs read: `services/mcp/daemon_bridge.py`, `services/mcp/tool_registry.py`, `host/src/ui/status_bar.cpp`,
-`contracts/events.md`, `contracts/worker_rpc.md`, the manufacturing-breadth research,
-`00_decisions.md`, `01_definition_of_done.md`; for the amendment, the architecture plan review and
-`10_gateway.md` as read-only evidence.
+Design proposal. See the [as-built map](README.md#as-built-map) for implemented and
+unbuilt components.
 
 Path/naming ruling applied (project-wide, plus `GatewayDesignRecovery` corrections): production GUI additions live
 only under `host/src/ui/manufacture/**` — no `ui/mfg`, no new canvas; cross-domain services live under
@@ -55,8 +49,8 @@ column is traceability only — if Gateway renames a token, this table is the si
 | `MFG-FAM-2` | one shared MCP family id `"manufacture"` across all ten domains | §17 |
 | `MFG-FAM-1` | the family default-off mechanism in `services/agent/config.py` is gateway-owned and lands in W1.1 | §17 / W1.1 |
 | `MFG-SECT-1` | Gateway allocates one `contracts/worker_rpc.md` section per domain; **monitoring gets §8**, gateway keeps §7 | §2 allocation |
-| `MFG-SUB-1` | the `contracts/events.md` §5 subscription-lane amendment is gateway-owned (W4.1) | §15 |
-| `MFG-OBS-1` | the `observer` client kind is gateway-owned (W4.1) | §7 |
+| `MFG-SUB-1` | the `contracts/events.md` §5.1 subscription-lane amendment covers gateway subscriptions | §15 |
+| `MFG-OBS-1` | the `observer` client kind is defined in `contracts/worker_rpc.md` and `contracts/events.md` | §7 |
 ---
 
 ## 1. Posture and one-sentence claim
@@ -449,7 +443,7 @@ Integrator-owned append (one line, not applied by this lane):
 | `host/src/ui/manufacture/monitor_state.h` | `MonitorMirror`: sources, devices, items, last `FreshValue` per item, condition ring, replay flag, `aggregate` counters. **Written only by the authoritative `mfg.monitor.*` event drain** |
 | `host/src/ui/manufacture/monitor_panel.h/.cpp` | `ui::drawMonitorPanel(AppState&)` — read-only: source list, device tree, item table (value / state / age / ttl / seq / `quality_src`), condition log, `SourceSchema` column, raw-extension inspector popover, replay banner |
 | `host/src/ui/status_bar.h` | **proposed** monitor-status seam; the Parts Library token currently reads its owned queue directly |
-| `host/src/ui/status_bar.cpp` | fill the currently-empty `Workspace::Manufacture` arm of the `wsTok` switch (`status_bar.cpp:347-364`) and add the warn tint branch (`status_bar.cpp:384-392`) |
+| `host/src/ui/status_bar.cpp` | propose a `Workspace::Manufacture` branch in the `wsTok` switch and a warn tint branch |
 
 `host/src/ui/cam/**` is untouched; no new canvas or panel host is created — the monitor panel docks in the existing
 Manufacture workspace surface.
@@ -518,15 +512,10 @@ so a future classifier change cannot silently promote a monitor tool.
 `describe_monitor_source` returns `MonitorSourceCapability` verbatim, including the all-`unsupported` action
 levels, so a model cannot infer a command path from a monitoring result.
 
-The `"manufacture"` family is **OFF by default** in `agent.tool_families` until commissioning, so `enable_tools`
-cannot silently self-add any manufacturing surface; per-tool granularity stays available through the existing
-`get_tool_options` toggles. `tool_registry.deny_reason` already refuses a disabled family before any risk check
-runs, so a disabled family is a hard stop rather than a risk downgrade. **This lane relies on that property; it
-does not implement it.** The default-off mechanism in `services/agent/config.py` is gateway-owned and lands in
-W1.1 (`MFG-FAM-1`), ahead of this lane's MCP wave, because an unlisted family defaults **on** — so registering
-into `"manufacture"` before that edit exists would ship the surface enabled. This lane's W2 therefore has
-`MFG-FAM-1` as a hard predecessor, and `test_capability_truth.py` asserts the family reads disabled in a default
-config so the dependency fails loudly rather than silently.
+The `"manufacture"` family is off by default in `services/agent/config.py` and requires
+explicit `agent.tool_families.manufacture = true`, even when a role lists it. Per-tool
+granularity remains available through `get_tool_options`; `tool_registry.deny_reason`
+refuses a disabled family before the risk check.
 
 **Motion/safety tool classes: absence, not denial.** This lane contributes **zero** motion-class tools and zero
 entries to `_SAFETY_TOOLS` (which stays deliberately empty). There is no monitor tool for approve, resume, jog,
@@ -676,24 +665,21 @@ filesystem path — a model must not be able to make the gateway read an arbitra
 `aggregate` is on the event on purpose: it is what the status-bar token renders, so the token consumes authoritative
 gateway-computed counters instead of deriving them host-side.
 
-### 6.3 Required rule amendment — long-lived subscription lane (`MFG-SUB-1`, gateway-owned)
+### 6.3 Long-lived subscription lanes (`MFG-SUB-1`)
 
-`contracts/events.md` §5 currently forbids emitting events after the final response line. A monitoring stream
-contradicts that on the request lane. The amendment is **Gateway's to own and land in W4.1** (`MFG-SUB-1`) — its
-own `mfg_device_subscribe` and `mfg_event_subscribe` depend on the same rule, so a monitoring-authored version
-would be a second claimant on one contract file. Shape required: a *subscription lane* whose events carry a
-`stream_id` issued by `mfg_monitor_stream_open`, remain valid until `mfg_monitor_stream_close` or a lane-epoch
-change, and are seq-stamped at journal append. This lane does not apply the amendment and does not need to be its
-author; it needs it to exist before W2 ships streaming. Absent it, wave 2 ships **poll-only** via
-`mfg_monitor_observe` with the panel polling — a real degradation, stated rather than papered over.
+`contracts/events.md` §5.1 permits post-response events for accepted `mfg_device_subscribe`
+and `mfg_event_subscribe` calls. A monitoring stream based on `mfg_monitor_stream_open` is
+a proposal, not an existing exception in that contract. It requires a contract amendment
+before events may outlive the accepting response. The proposed events carry a `stream_id`,
+remain valid until `mfg_monitor_stream_close` or a lane-epoch change, and are seq-stamped
+at journal append. Without that amendment, the proposed monitor surface must use
+request-scoped events or a polling path such as the proposed `mfg_monitor_observe`.
 
-### 6.4 Required enum append — `observer` client kind (`MFG-OBS-1`, gateway-owned)
+### 6.4 Read-only `observer` client kind (`MFG-OBS-1`)
 
-`contracts/worker_rpc.md` §5.1 lists `gui|mcp|agent|test|control`; `observer` is appended by **Gateway in W4.1**,
-not by this lane, because the gateway's own lease model and its observer-cannot-reach-a-write-dispatch-path
-property depend on the same enum. The decision brief requires observers to be read-only and
-capability-negotiated; the connection kind is where that becomes enforceable rather than aspirational (layer 5),
-and layer 5's dispatch-filter test is this lane's acceptance check on Gateway's append.
+`contracts/worker_rpc.md` §7 and `contracts/events.md` §5.1 define `observer` as read-only:
+it cannot reach a write dispatch path, own a command lease, or issue run or approval
+mutations. Proposed monitoring subscriptions must preserve these boundaries.
 
 ---
 
@@ -989,60 +975,16 @@ never a substitute. Missing evidence **fails**; it is never `not_applicable`.
 
 ---
 
-## 12. Waves
 
-| wave | scope | proof | non-negotiable exit |
-|---|---|---|---|
-| **W1** | `model`, `identity`, `seqmap`, `quality`, `units`, `readonly_guard`, `replay`, `evidence`; fixture manifest + all synthetic and twin-trace fixtures; `test_model/seqmap/quality/units/readonly_surface/replay_determinism/capability_truth` | no network at all | frozen method set and forbidden symbol/param tables exist and their negative cases fail; determinism hashes green; `src` enum is exactly the five contract values |
-| **W2** | MTConnect: `request_plan`, `xml_decode`, `probe_model`, `adapter`, the daemon-hosted `http_adapter` `IReadTransport`, `service.py` (six methods), `mfg_monitor_tools.py`, `manufacture/monitor_state.h`, `manufacture/monitor_panel.*`, status-bar seam + Manufacture token + warn tint, MTConnect fixtures, stage E1 | replay-driven panel render + poll-path smoke | XXE/oversize/gap/unavailable fixtures all refuse or go `unknown`; panel never paints blank for unknown; token derives solely from drained events; the Python package provably constructs no socket and never writes `src`; the transport implements `IReadTransport` and holds no command lease |
-| **W3** | OPC UA: `collector_opcua/**`, the `opcua_read` `IReadTransport`, `collector_bridge`, `profiles/**`, `profile_registry`, security, OPC UA NDJSON fixtures, `scripts/mfg_monitor_readonly_gate.sh`, stage E2 | `nm -uC` over the built collector | zero forbidden symbols; `policy_none_remote`, `cert_rejected`, `user_access_denied` all ⇒ `refused` |
-| **W4** | invalidation + epoch reconciliation end to end through `mfg_event_append`/`mfg_result_invalidate`, all **five** durable result kinds including `monitor_capability` and its `derived_from` re-derivation, `mfg_tier0_register` with a clean `totality.missing`, guard-liveness negatives, waiver-rate visibility, capability↔stage binding, `read_only_proof` wiring | invalidation fixtures + Tier-0 registration round-trip + the §2.3 capability falsification test | falsify clears and supersede retains, both scoped to `seq <= at_seq` using gateway-stamped seq; a `monitor_source_state` row never survives a lane epoch as `ok` and never retains `last_ok`; revoking certificate trust drops `monitor` from `verified` to `assumed` in the same closure that marks the source `unknown`; every guard demonstrably passes for one input and fails for another |
+## 13. Evidence and subscription boundaries
 
-Every wave: `scripts/gate.sh` green, the as-built map in `docs/manufacturing/README.md` and the relevant developer docs updated in
-the same green commit (DoD v4 §20).
-
-Three exits added by this amendment pass, one per closed finding, because a correction nobody tests is a
-correction that comes back:
-
-- **W1** additionally proves provenance and TTL semantics: every manifest fixture and a real-HTTP loopback agent
-  publish `src=="simulated"` (`MFG-SRC-2`); no `monitor_observation`/`monitor_condition` is ever published with
-  `ttl_ms is None and state == "ok"`; every `monitor_capability`/`monitor_sequence_gap` is published with
-  `ttl_ms is None` and is never `stale` (§3.5, `MFG-FRESH-3`).
-- **W2** additionally requires `MFG-FAM-1` (gateway's `services/agent/config.py` default-off edit) to have landed,
-  asserted by a test that reads the family as disabled in a default config, and asserts
-  `scripts/mfg_monitor_readonly_gate.sh` contains no `CHUDWARE_*_BIN` discovery block (`MFG-SKIP-1`).
-- **W3/W4** additionally assert that a normal `scripts/gate.sh` run reports **zero** monitoring SKIPs with the
-  stage servers absent, and that the affected level reads `assumed` with `missing_level` named instead (§11.2).
-
----
-
-## 13. Dependencies on peers
-
-| peer | needed from them |
-|---|---|
-| `GatewayDesignRecovery` | the `IReadTransport` split in `core/device/transport.h` plus the `http_adapter` and new `opcua_read` `TransportKind` slots (§2.1) — without them monitoring is capped at `declared`; `mfg_event_append` (with `derived_from[]`) / `mfg_result_invalidate` (transitive closure) / `mfg_tier0_register` plus the gateway-owned `services/manufacturing/rpc/journal_client.py`; **registration of the five durable result kinds in §2.2/§2.3** — the four telemetry kinds with both policy columns and the `retain_as_last_ok` flag (set on observation and condition, prohibited on source_state), plus `monitor_capability` per §24.11 — else appends are refused `mfg_unregistered_result_kind` or `mfg_capability_requires_durable_kind`; durable `seq` stamping and `src`/`admission` computation; lane-epoch reconciliation; the `FreshValue<T>` publisher; `CapabilityTruth`/`CapabilityReport` in `core/device/capability.h`; the Tier-0 row type in `core/manufacturing/tier0.h` and the totality check; gateway RPC dispatch registration; the `events.md` §5 subscription-lane amendment (§6.3); the `observer` client-kind append (§6.4) |
-| `TwinDesignRecovery` | recorded twin-trace artifact format; Twin emits no `ObservationRecord` and this lane wraps traces as its own `simulated` source (§9.3) |
-| `TurningArchitecture`, `CuttingProcessArchitecture`, `RobotArchitecture`, `PnpArchitecture` | consume `FreshValue<ObservationRecord>` and `MonitorSourceCapability` read-only; do **not** re-map MTConnect/OPC UA independently; treat `evidence_eligible=false` as context only. Note the §2.1.1 refinement: a **probed** observation is now Stage-1 admissible for the subject it directly measures, but it never corroborates a sibling from the same source/config epoch and never substitutes for a fingerprint-bound `ControllerSnapshot` — do not widen it past its own measured subject |
-| Integrator | the two contract appends, `add_subdirectory(services/manufacturing/monitor/collector_opcua)`, and the `scripts/gate.sh` invocation line |
-
-Additionally owed by `GatewayDesignRecovery`, all of it gateway-owned text this lane only cites: the stable
-rule-id register (gateway §25, 39 ids), whose `MFG-FRESH-3` and `MFG-SKIP-1` rows carry the durable-row wrapping
-clause and the zero-SKIP/exclusion rule this lane depends on; the
-`contracts/worker_rpc.md` section allocation that gives this lane **§8** (`MFG-SECT-1`); the
-`contracts/events.md` §5 subscription-lane amendment (`MFG-SUB-1`) and the `observer` client kind (`MFG-OBS-1`),
-both in W4.1; the family default-off mechanism in `services/agent/config.py` in W1.1 (`MFG-FAM-1`), a hard
-predecessor of this lane's W2; and the `endpoint_is_physical` input to `src` derivation (`MFG-SRC-1`/`MFG-SRC-2`)
-with the fixture-manifest virtual/emulated/recorded/loopback flag it reads, without which this lane's `origin`
-field has nothing to feed.
-
-One phrasing correction for consumers reading the table above: the row for the four CAM/PnP/robot peers still
-says a monitor observation "never corroborates a sibling from the same source/config epoch". Read it as §2.1.1
-limit 1 (`MFG-CORROB-1`): same **subject and config epoch** is required of a corroborator, and **different source
-and lane** is what independence means. Same source ⇒ not a corroborator; different epoch ⇒ not a corroborator
-either.
-
-If the subscription-lane amendment is declined, W2 degrades to poll-only via `mfg_monitor_observe` and
-`mfg.monitor.*` events are emitted only within one request's lifetime.
+The proposed monitoring surface depends on the gateway's durable-result registration,
+invalidation, sequencing and freshness rules, and on the default-off `manufacture` family.
+The gateway computes `src` and admission from the transport and whether the endpoint is
+physical. A monitor observation may be admitted at Stage 1 only for the subject it directly
+measures; it never substitutes for a fingerprint-bound device snapshot. A corroborator
+must be independently fresh, bound to the same subject and config epoch, and come from a
+different source and lane (`MFG-CORROB-1`). Monitoring subscriptions must follow §6.3–§6.4.
 
 ---
 
@@ -1079,29 +1021,3 @@ If the subscription-lane amendment is declined, W2 degrades to poll-only via `mf
     hardware-free stage can raise a level to `verified` or satisfy a Stage-1 gate.
 13. **No new normal-gate SKIP, and no gate-resident sidecar discovery variable** (`MFG-SKIP-1`, §4.6, §11.2).
 
----
-
-## 15. Review closure (architecture plan review)
-
-Every row below is a reconciliation of statements already in the accepted corpus. No product scope changed: all
-six read-only monitoring surfaces, both protocols, all four waves, all five durable kinds and the four E-stages
-remain exactly as accepted.
-
-| finding | required correction | applied where | what changed in this document |
-|---|---|---|---|
-| **C4** — §11.2 still said E1/E2 are gate-skippable | read "excluded from `gate.sh` behind `scripts/qualify_monitor_e{1,2}.sh`; absence pins the level at `assumed` with the missing level named — not a SKIP", matching §4.6 | §11.2, §4.6, §11.3 row `monitor_stage_e1_passed`, non-goal 13 | the skippable sentence is **withdrawn** and replaced by exclusion + capability pin; §4.6's `CHUDWARE_MTCONNECT_AGENT_BIN` fallback is withdrawn too, since a gate-resident discovery variable is a sixth DoD-1 SKIP; a contract test greps the gate script for one |
-| **C8** — capability rows FreshValue-wrapped by three domains, never-wrapped by PnP | one ruling: a durable authored row is journaled **and** published wrapped, `ttl_ms:null` + `state:"ok"` for rows that do not decay | §3.5 (rewritten), §2.3, §11.1 preamble | durable rows are explicitly published wrapped; the two meanings of `ttl_ms:null` are separated by kind class in a table, with `MFG-FRESH-3` proposed as their own rule id and two contract tests — one per fail direction — pinning them |
-| Gateway late correction — no gate SKIPs, optional qualifications only | zero new `gate.sh` SKIPs batch-wide | §4.6, §11.2, non-goal 13 | already zero; the two remaining SKIP-shaped hedges (E1/E2 "skippable", the sidecar env-var idiom) are removed, so no reading of this document yields a SKIP |
-| Gateway `MFG-MONCOND-1` — `monitor_condition` is `falsify + retain_as_last_ok`, not `reestablish` | adopt the relabel | §2.2 table row | the row now cites `MFG-MONCOND-1` and names `reestablish` as the withdrawn label with the fail-open it would license, so the old label cannot be reinstated as a "simplification" |
-| Gateway `MFG-CAPKIND-1/2/3` — every UI-painted `CapabilityReport` needs a registered capability kind | register `monitor_capability` | §2.2 (fifth kind), §2.3 | registration is stated as **accepted for W1.1**, not proposed; `MFG-KIND-2`'s `mfg_unregistered_result_kind` and `MFG-CAPKIND-3`'s `mfg_capability_requires_durable_kind` are both named as the enforcement points |
-| Gateway `MFG-SRC-1/2` (review B5) — provenance from `(transport_kind, endpoint_is_physical)` | virtual/replay endpoints always `simulated`; physical read-only transports produce probed evidence only for the directly measured subject | §2.1, §2.1.1 limit 5, §3.1 `src`/`origin`/`evidence_eligible`, §11.1, §11.2, §11.3, non-goal 12 | `origin` becomes the authoritative physicality input feeding gateway `src` derivation (one mechanism, not two); the E-stage table is corrected so E1/E2 loopback servers support at most `monitor: declared` and `verified` requires E3 on a physical machine; the §11.1 example moves to E3 |
-| Gateway `MFG-CORROB-1` (review B2) — binding vs independence are separate axes | corroborator: same subject and config epoch, independently fresh, different source/lane | §2.1.1 limit 1, §11.1, §13 note, non-goal 6 | the old "same source **or** config epoch" phrasing (which made corroboration unreachable) is replaced by the two-axis rule in all four places this lane stated it |
-| Gateway `MFG-ADMIT-1/2` (review B1) — two named admission classes | monitor rows are `probed_evidence`; never `procedural_fact` | §2.1.1, §2.2 | the admission class is named and attributed to gateway computation; `MFG-ADMIT-2` is recorded as vacuous here because this lane emits no procedural facts |
-| Gateway `MFG-FAM-1/2` (review B11/B12) — shared family, gateway-owned default-off | family `"manufacture"`; the `services/agent/config.py` mechanism is gateway-owned in W1.1 | §4.4, §12 W2 exit, §13 | this lane records that it **relies on** the mechanism rather than providing it, makes `MFG-FAM-1` a hard predecessor of its MCP wave, and adds a default-config assertion so the dependency fails loudly |
-| Gateway `MFG-SECT-1`/`MFG-SUB-1`/`MFG-OBS-1` (review B13) — contract ownership | one `worker_rpc.md` section per domain; the events §5 lane rule and `observer` kind are gateway-owned | §6.1, §6.2, §6.3, §6.4, §13 | the "proposed new §7" claim (which collided with gateway's §7) becomes the allocated **§8**; the two rule amendments are reassigned to Gateway W4.1 with this lane's tests as the acceptance checks |
-| **C10** — cross-reference drift on the load-bearing §24 rules | normalize citations; key contract tests on stable rule ids | new §0 + every citation in the document | every gateway cross-reference is now a stable rule id; the only section numbers left in this document are §0's traceability column, so a gateway renumbering cannot invalidate an assertion here |
-
-Every id cited here is final in gateway §25 — `MFG-FRESH-3` and `MFG-SKIP-1` were raised by this lane during the
-amendment and adopted verbatim, `MFG-FRESH-3` as a row separate from `MFG-FRESH-2` and `MFG-SKIP-1` with the
-"asserting test that `gate.sh` never invokes the qualification script" clause this document implements in §4.6
-and §11.2. If a token is ever renamed, §0 is the only place in this document that changes.

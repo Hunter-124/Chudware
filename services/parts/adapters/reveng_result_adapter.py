@@ -8,7 +8,7 @@ directory.  This adapter scans all session directories under
 through the existing ``_place_import_file`` placer.
 
 The adapter is *live-only* (``iter_records`` raises ``NotImplementedError``).
-It is registered on first attach via ``engine_oracle.parts_hub.register_provider``
+It is registered on first attach via the parts-hub provider registry
 (idempotent — the registry deduplicates by ``provider_id``).
 """
 from __future__ import annotations
@@ -18,11 +18,15 @@ import os
 from pathlib import Path
 from typing import Iterator
 
+from services.agent import request_context
+
 PROVIDER_ID = "reveng_results"
 SIDECAR_NAME = "reveng_result.json"
 
 
 def _reveng_dir() -> Path:
+    if request_context.in_cell():
+        return request_context.actor_state_root() / "reveng"
     base = os.environ.get("CHUDWARE_REVENG_DIR")
     if base:
         return Path(base).expanduser()
@@ -45,21 +49,37 @@ def _sidecar_to_record(sidecar: dict) -> dict | None:
     session_id = sidecar.get("session_id", "")
     if not part_ref:
         return None
-    # geometry_ref: prefer doc_id (parametric result) then mesh_path (mesh body)
-    file_path = doc_id or mesh_path
-    gref: dict = {"kind": "import_file", "path": file_path} if file_path else {}
+    # A live doc_id is provenance, not a filename. New attachments carry an
+    # explicit file reference; only old mesh-only sidecars can use their mesh.
+    gref = sidecar.get("geometry_ref")
+    if ("geometry_ref" not in sidecar and not doc_id and not sidecar.get("step_path")
+            and isinstance(mesh_path, str) and mesh_path):
+        gref = {"kind": "import_file", "path": mesh_path}
+    if not isinstance(gref, dict) or gref.get("kind") != "import_file":
+        gref = {}
+    else:
+        path = gref.get("path")
+        if not isinstance(path, str) or not path:
+            gref = {}
+        elif request_context.in_cell() and (
+                Path(path).is_absolute() or ".." in Path(path).parts or
+                "\\" in path or ":" in path):
+            gref = {}
     return {
         "part_id": part_ref,
         "domain": "reveng",
         "provider_id": PROVIDER_ID,
         "name": sidecar.get("name", part_ref),
+        "title": str(sidecar.get("name") or part_ref),
+        "family": str(sidecar.get("family") or ""),
         "description": f"Reverse-engineered model from session {session_id}",
         "geometry_ref": gref,
         "metadata": {
             "session_id": session_id,
             "mesh_path": mesh_path,
             "doc_id": doc_id,
-            "model_present": bool(file_path),
+            "geometry_source": sidecar.get("geometry_source"),
+            "model_present": bool(gref),
         },
         "source": "reveng",
     }

@@ -1,21 +1,25 @@
 // AsyncRpc (C39) implementation — see async_rpc.h.
 #include "async_rpc.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <string_view>
 
 #include "../worker_client.h"
 
 namespace {
-bool blocksInteraction(std::string_view method) {
-    // Exact global discovery/status methods only. Never infer safety from a
-    // "get"/"list" prefix: document reads and every unknown method stay blocking.
+bool blocksInteraction(std::string_view method, const nlohmann::json& params) {
+    // Exact background methods only. Never infer safety from a "get"/"list" prefix:
+    // all other document reads and every unknown method stay blocking.
+    (void)params;
     static constexpr std::string_view metadata[] = {
         "fw_projects", "agent_list_models", "subscription_accounts",
-        "subscription_status", "subscription_usage", "chudcode_auth_state",
-        "chudcode_models_list", "ai_prompt_baseline", "skills_list",
-        "chudcode_stt_status", "em_status", "sim_caps", "fw_status",
-        "topology_capabilities"
+        "subscription_status", "subscription_usage", "omp_auth_state",
+        "omp_models_list", "ai_prompt_baseline", "skills_list",
+        "em_status", "sim_caps", "fw_status",
+        "topology_capabilities", "omp_provider_list", "plm_timeline",
+        "bench_status", "bench_categories", "doc_mesh_ref_list", "doc_mesh_ref_mesh",
+        "ecad_tree", "ecad_kicad_status"
     };
     for (const auto name : metadata)
         if (method == name) return false;
@@ -31,10 +35,72 @@ void AsyncRpc::call(std::string method, nlohmann::json params, Done done, int ti
 
 void AsyncRpc::call(std::string method, nlohmann::json params, Done done, Event onEvent,
                     int timeoutMs) {
-    const bool blocking = blocksInteraction(method);
+    callImpl(std::move(method), std::move(params), std::move(done), std::move(onEvent),
+             timeoutMs, {});
+}
+
+void AsyncRpc::callPrimary(std::string method, nlohmann::json params, Done done,
+                          int timeoutMs) {
+    callImpl(std::move(method), std::move(params), std::move(done), Event{},
+             timeoutMs, {}, true);
+}
+
+void AsyncRpc::callCoalesced(std::string method, nlohmann::json params, Done done,
+                             std::string key, int timeoutMs, int debounceMs) {
+    callImpl(std::move(method), std::move(params), std::move(done), Event{},
+             timeoutMs, std::move(key), false, debounceMs);
+}
+
+void AsyncRpc::flushCoalesced(const std::string& method, const std::string& key) {
+    if (key.empty()) return;
+    const auto matches = [&](const Pending& p) {
+        return p.method == method && p.coalesceKey == key;
+    };
+    {
+        std::unique_lock<std::mutex> lk(mtx_);
+        for (auto& p : queue_)
+            if (matches(*p)) p->readyAt = {};
+        cv_.notify_all();
+        cv_.wait(lk, [&]() {
+            return quit_.load() ||
+                   ((!inFlight_ || !matches(*inFlight_)) &&
+                    std::none_of(queue_.begin(), queue_.end(),
+                                 [&](const auto& p) { return matches(*p); }));
+        });
+    }
+    drain();
+}
+
+bool AsyncRpc::drainUntilIdle(int maxWaitMs) {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(maxWaitMs < 0 ? 0 : maxWaitMs);
+    for (;;) {
+        drain();
+        if (pending_.load() <= 0) return true;
+        std::unique_lock<std::mutex> lk(mtx_);
+        if (quit_.load()) return false;
+        // A finishing call pushes to doneQ_ and notifies cv_ under mtx_, so checking the queues
+        // under the same lock cannot miss a completion that raced with the drain above.
+        if (!cv_.wait_until(lk, deadline, [&]() {
+                return quit_.load() || !doneQ_.empty() || !eventQ_.empty();
+            }))
+            return false;  // timed out with work still pending
+        if (quit_.load()) return false;
+    }
+}
+
+void AsyncRpc::callImpl(std::string method, nlohmann::json params, Done done, Event onEvent,
+                        int timeoutMs, std::string coalesceKey, bool primary, int debounceMs) {
+    const bool blocking = blocksInteraction(method, params);
     auto p = std::make_unique<Pending>();
     p->blocksInteraction = blocking;
+    p->primary = primary;
     p->method = std::move(method);
+    p->coalesceKey = std::move(coalesceKey);
+    if (!p->coalesceKey.empty() || debounceMs > 0)
+        p->firstQueued = std::chrono::steady_clock::now();
+    if (debounceMs > 0)
+        p->readyAt = p->firstQueued + std::chrono::milliseconds(debounceMs);
     // `rpc.call("m", {}, cb)` looks like "no arguments" but nlohmann parses a bare `{}` as
     // NULL, not an empty object — and a null lands on the wire as `"params": null`. hostd's
     // `msg.value("params", json::object())` then returns the stored null (value() only
@@ -50,6 +116,21 @@ void AsyncRpc::call(std::string method, nlohmann::json params, Done done, Event 
     {
         std::lock_guard<std::mutex> lk(mtx_);
         if (quit_) return;  // shutting down — drop silently (callbacks must not run after)
+        if (!p->coalesceKey.empty()) {
+            for (auto& queued : queue_) {
+                if (queued->method == p->method && queued->coalesceKey == p->coalesceKey) {
+                    p->firstQueued = queued->firstQueued;
+                    if (debounceMs > 0)
+                        p->readyAt = std::min(p->readyAt, p->firstQueued +
+                            std::chrono::milliseconds(debounceMs) * 2);
+                    if (queued->blocksInteraction != p->blocksInteraction)
+                        interactionPending_.fetch_add(p->blocksInteraction ? 1 : -1);
+                    queued = std::move(p);
+                    cv_.notify_one();
+                    return;
+                }
+            }
+        }
         queue_.push_back(std::move(p));
         pending_.fetch_add(1);
         if (blocking) interactionPending_.fetch_add(1);
@@ -69,9 +150,17 @@ void AsyncRpc::threadMain() {
             std::unique_lock<std::mutex> lk(mtx_);
             cv_.wait(lk, [this]() { return quit_ || !queue_.empty(); });
             if (quit_) return;
+            const auto readyAt = queue_.front()->readyAt;
+            if (readyAt != std::chrono::steady_clock::time_point{} &&
+                readyAt > std::chrono::steady_clock::now()) {
+                cv_.wait_until(lk, readyAt);
+                continue;  // replacement, shutdown, or spurious wake: re-read the FIFO head
+            }
             p = std::move(queue_.front());
             queue_.pop_front();
+            inFlight_ = p.get();
         }
+        if (quit_.load()) return;  // shutdown may have begun immediately after the pop
         // The blocking round-trip happens here, off the GL thread. The errorSink (if any)
         // fires on THIS thread inside call() — it must stay thread-safe (it posts a toast,
         // and AppState::toast locks). Streamed event frames are queued under mtx_ and
@@ -80,18 +169,33 @@ void AsyncRpc::threadMain() {
         if (p->onEvent) {
             Pending* raw = p.get();   // alive until drained; events only fire mid-call
             ev = [this, raw](const nlohmann::json& data) {
-                std::lock_guard<std::mutex> lk(mtx_);
-                if (quit_) return;
-                eventQ_.emplace_back(raw->onEvent, data);
+                {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    if (quit_) return;
+                    eventQ_.emplace_back(raw->onEvent, data);
+                }
+                notifyReady();
             };
         }
-        p->res.ok = worker_.call(p->method, p->params, p->res.result, p->res.err, p->timeoutMs,
-                                 ev);
+        if (p->primary) {
+            if (quit_.load()) return;
+            if (const auto call = primaryCall_.load())
+                p->res.ok = call(p->method, p->params, p->res.result, p->res.err,
+                                 p->timeoutMs, quit_);
+            else
+                p->res.err = "primary engine connection is unavailable";
+        } else {
+            p->res.ok = worker_.call(p->method, p->params, p->res.result, p->res.err, p->timeoutMs,
+                                     ev);
+        }
         {
             std::lock_guard<std::mutex> lk(mtx_);
+            inFlight_ = nullptr;
             if (quit_) return;  // result no longer wanted; pending_ is moot past shutdown
             doneQ_.push_back(std::move(p));
         }
+        cv_.notify_all();
+        notifyReady();
     }
 }
 

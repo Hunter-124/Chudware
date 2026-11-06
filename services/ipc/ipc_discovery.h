@@ -8,6 +8,7 @@
 // The key is 16 hex chars of FNV-1a 64. It is namespacing, not authentication;
 // the owner-private runtime/state directory or pipe ACL supplies isolation.
 
+#include <atomic>
 #include <string>
 
 namespace chudware_ipc {
@@ -72,6 +73,7 @@ private:
 // Spawn `argv` fully detached (double-fork + setsid, fds to /dev/null) so the
 // daemon outlives the spawning client. Returns false + err on failure. This is
 // the replacement for the weak std::system() spawn in host/src/bootstrap.cpp.
-bool spawnDetached(const std::string& exe, const std::string& arg, std::string& err);
+bool spawnDetached(const std::string& exe, const std::string& arg, std::string& err,
+                   const std::atomic<bool>* cancelled = nullptr);
 
 }  // namespace chudware_ipc

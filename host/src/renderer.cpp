@@ -1,6 +1,7 @@
 #include "renderer.h"
 
 #include "gl_compat.h"
+#include "core/frame_stats.h"
 #ifdef CHUDWARE_GLES3
 // GLES3 lacks polygon-offset-line (desktop-only); map to fill offset.
 #ifndef GL_POLYGON_OFFSET_LINE
@@ -30,14 +31,16 @@ layout(location=0) in vec3 aPos;
 layout(location=1) in vec3 aNormal;
 layout(location=2) in float aScalar;   // C19: per-vertex scalar (NaN = no data)
 uniform mat4 uMVP;
+uniform vec3 uOffset;                  // per-body view offset (exploded view); 0 otherwise
 out vec3 vN;
 out vec3 vPos;
 out float vScalar;
 void main(){
+    vec3 p = aPos + uOffset;
     vN = aNormal;
-    vPos = aPos;
+    vPos = p;
     vScalar = aScalar;
-    gl_Position = uMVP * vec4(aPos, 1.0);
+    gl_Position = uMVP * vec4(p, 1.0);
 })";
 
 // Studio three-point lighting: warm key, cool fill, rim from behind, plus a hemisphere
@@ -55,6 +58,7 @@ uniform vec3 uCamPos;
 uniform vec3 uColor;      // sRGB part color
 uniform int  uUseScalar;  // C19: 1 = sample the LUT by the per-vertex scalar
 uniform float uScalarMin, uScalarMax;
+uniform int uScalarReversed;
 uniform sampler2D uLut;   // 256x1 jet ramp
 uniform int   uClipCount;              // C28-C: 0 = off; 1..3 active planes
 uniform vec3  uClipN[3];               // plane normals
@@ -126,6 +130,7 @@ void main(){
             srgbColor = vec3(0.62, 0.64, 0.66);
         } else {
             float t = clamp((vScalar - uScalarMin) / max(uScalarMax - uScalarMin, 1e-9), 0.0, 1.0);
+            if (uScalarReversed == 1) t = 1.0 - t;
             srgbColor = texture(uLut, vec2(t, 0.5)).rgb;
         }
     }
@@ -219,9 +224,10 @@ void main(){
 const char* kResolveFrag = R"(#version 330 core
 uniform sampler2D uSrc;
 uniform int uSS;
+uniform ivec2 uDstSize;
 out vec4 frag;
 void main(){
-    ivec2 dst = ivec2(gl_FragCoord.xy);
+    ivec2 dst = min(ivec2(gl_FragCoord.xy), uDstSize - ivec2(1));
     ivec2 base = dst * uSS;
     vec4 acc = vec4(0.0);
     for (int y = 0; y < uSS; ++y)
@@ -232,12 +238,10 @@ void main(){
 
 const char* kDownsampleFrag = R"(#version 330 core
 uniform sampler2D uSrc;
-uniform vec2 uInvDstSize;
+uniform vec2 uScale, uUvMin, uUvMax;
 out vec4 frag;
 void main(){
-    // Fragment coordinates already address destination pixel centers. Normalize by the
-    // destination size so a quarter-resolution backdrop covers the WHOLE source image.
-    vec2 uv = gl_FragCoord.xy * uInvDstSize;
+    vec2 uv = clamp(gl_FragCoord.xy * uScale, uUvMin, uUvMax);
     frag = texture(uSrc, uv);
 })";
 
@@ -245,15 +249,19 @@ const char* kKawaseFrag = R"(#version 330 core
 uniform sampler2D uSrc;
 uniform vec2 uTexel;
 uniform float uOffset;
+uniform vec2 uUvMax;
 out vec4 frag;
+vec4 sampleActive(vec2 uv) {
+    return texture(uSrc, clamp(uv, uTexel * 0.5, uUvMax));
+}
 void main(){
-    vec2 uv = gl_FragCoord.xy * uTexel;
+    vec2 uv = min(gl_FragCoord.xy * uTexel, uUvMax);
     vec2 d = uTexel * 0.5 * uOffset;
-    vec4 c = texture(uSrc, uv);
-    c += texture(uSrc, uv + vec2( d.x,  d.y));
-    c += texture(uSrc, uv + vec2(-d.x,  d.y));
-    c += texture(uSrc, uv + vec2( d.x, -d.y));
-    c += texture(uSrc, uv + vec2(-d.x, -d.y));
+    vec4 c = sampleActive(uv);
+    c += sampleActive(uv + vec2( d.x,  d.y));
+    c += sampleActive(uv + vec2(-d.x,  d.y));
+    c += sampleActive(uv + vec2( d.x, -d.y));
+    c += sampleActive(uv + vec2(-d.x, -d.y));
     frag = c * 0.2;
 })";
 
@@ -280,8 +288,9 @@ void main(){
 const char* kEdgeVert = R"(#version 330 core
 layout(location=0) in vec3 aPos;
 uniform mat4 uMVP;
+uniform vec3 uOffset;
 out vec3 vPos;
-void main(){ vPos = aPos; gl_Position = uMVP * vec4(aPos, 1.0); })";
+void main(){ vPos = aPos + uOffset; gl_Position = uMVP * vec4(vPos, 1.0); })";
 
 const char* kEdgeFrag = R"(#version 330 core
 in vec3 vPos;
@@ -294,6 +303,16 @@ void main(){
     for (int ci = 0; ci < uClipCount; ++ci)
         if (dot(vPos, uClipN[ci]) > uClipOff[ci]) discard;
     frag = vec4(uColor, 1.0);
+})";
+
+const char* kDepthFrag = R"(#version 330 core
+in vec3 vPos;
+uniform int uClipCount;
+uniform vec3 uClipN[3];
+uniform float uClipOff[3];
+void main(){
+    for (int ci = 0; ci < uClipCount; ++ci)
+        if (dot(vPos, uClipN[ci]) > uClipOff[ci]) discard;
 })";
 
 // Reference-plane shader: a flat RGBA quad (uColor carries alpha for translucency).
@@ -382,6 +401,69 @@ void eyeForView(const std::string& v, float& yaw, float& pitch) {
 // border verts (a line loop). Draw ranges are plane*kPlaneQuadVerts + {0, 6}.
 constexpr int kPlaneQuadVerts = 10;
 
+// Bounded content keys avoid retaining CPU copies merely to recognize no-op mesh uploads.
+struct MeshContentKey {
+    std::array<uint64_t, 2> value{{0x243f6a8885a308d3ULL, 0x13198a2e03707344ULL}};
+    void word(uint64_t n) {
+        value[0] ^= n + 0x9e3779b97f4a7c15ULL + (value[0] << 6) + (value[0] >> 2);
+        value[0] *= 0xbf58476d1ce4e5b9ULL;
+        value[1] ^= n;
+        value[1] = ((value[1] << 27) | (value[1] >> 37)) * 0x94d049bb133111ebULL;
+    }
+    void bytes(const void* data, size_t size) {
+        word(size);
+        const auto* p = static_cast<const unsigned char*>(data);
+        while (size >= sizeof(uint64_t)) {
+            uint64_t n;
+            std::memcpy(&n, p, sizeof(n));
+            word(n);
+            p += sizeof(n); size -= sizeof(n);
+        }
+        if (size) {
+            uint64_t n = 0;
+            std::memcpy(&n, p, size);
+            word(n);
+        }
+    }
+    template<class T> void scalar(const T& n) { bytes(&n, sizeof(n)); }
+    template<class T> void vector(const std::vector<T>& v) { bytes(v.data(), v.size() * sizeof(T)); }
+    void vec(const Vec3& v) { scalar(v.x); scalar(v.y); scalar(v.z); }
+    void geometry(const Mesh& m) {
+        vector(m.positions); vector(m.normals); vector(m.indices);
+    }
+};
+
+std::array<uint64_t, 2> partContentKey(const std::vector<Renderer::PartMesh>& parts,
+                                      const float defaultColor[3], bool frozen) {
+    MeshContentKey key;
+    key.word(parts.size());
+    key.scalar(frozen);
+    for (const auto& p : parts) {
+        key.geometry(p.mesh);
+        key.vector(p.mesh.edgeLines);
+        key.vec(p.mesh.bbMin); key.vec(p.mesh.bbMax);
+        key.scalar(p.body_id);
+        key.word(p.faces.size());
+        for (const auto& f : p.faces) {
+            key.scalar(f.face_id); key.scalar(f.first_tri); key.scalar(f.tri_count);
+        }
+        key.scalar(p.useDefaultColor);
+        key.bytes(p.useDefaultColor ? defaultColor : p.color, sizeof(p.color));
+        key.scalar(p.metallic); key.scalar(p.roughness);
+        key.word(p.appearance_regions.size());
+        for (const auto& r : p.appearance_regions) {
+            key.scalar(r.first_face); key.scalar(r.face_count);
+            key.bytes(r.color, sizeof(r.color));
+            key.scalar(r.metallic); key.scalar(r.roughness);
+        }
+        key.vector(p.scalar);
+        key.scalar(p.scalarMin); key.scalar(p.scalarMax);
+        key.vector(p.disp);
+    }
+    return key.value;
+}
+
+
 // The GL-free datum builder reports primitive modes as raw numbers so it needs no GL header;
 // a drift between those and the real enums is a compile error, not garbled geometry.
 static_assert(render::kModeLines == GL_LINES, "datum batch mode must match GL_LINES");
@@ -395,11 +477,20 @@ Renderer::~Renderer() {
     meshCache_.clear();
     meshCacheOrder_.clear();
     clearGhost();   // free the component-edit ghost buffers if one is active at teardown
+    freeSubVector(auxSubs_);
+    for (auto& entry : referenceGpu_) {
+        auto& g = entry.second;
+        if (g.vao) glDeleteVertexArrays(1, &g.vao);
+        if (g.positions) glDeleteBuffers(1, &g.positions);
+        if (g.normals) glDeleteBuffers(1, &g.normals);
+        if (g.indices) glDeleteBuffers(1, &g.indices);
+    }
     if (fbo_) glDeleteFramebuffers(1, &fbo_);
     if (colorTex_) glDeleteTextures(1, &colorTex_);
     if (depthRbo_) glDeleteRenderbuffers(1, &depthRbo_);
 #ifdef CHUDWARE_GLES3
     if (colorRbo_) glDeleteRenderbuffers(1, &colorRbo_);
+    if (msaaResolveFbo_) glDeleteFramebuffers(1, &msaaResolveFbo_);
 #endif
     if (resolveFbo_) glDeleteFramebuffers(1, &resolveFbo_);
     if (resolvedTex_) glDeleteTextures(1, &resolvedTex_);
@@ -409,6 +500,7 @@ Renderer::~Renderer() {
     if (thumbDepth_) glDeleteRenderbuffers(1, &thumbDepth_);
     if (prog_) glDeleteProgram(prog_);
     if (edgeProg_) glDeleteProgram(edgeProg_);
+    if (depthProg_) glDeleteProgram(depthProg_);
     if (bgProg_) glDeleteProgram(bgProg_);
     if (resolveProg_) glDeleteProgram(resolveProg_);
     if (downsampleProg_) glDeleteProgram(downsampleProg_);
@@ -462,36 +554,85 @@ void Renderer::buildLut() {
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
+uint64_t Renderer::contentEpoch() const {
+    render::RefDatumPalette pal;
+    for (int i = 0; i < 4; ++i) {
+        pal.axisX[i] = ui::palette.axisX[i];
+        pal.axisY[i] = ui::palette.axisY[i];
+        pal.axisZ[i] = ui::palette.axisZ[i];
+        pal.accent[i] = ui::palette.accent[i];
+    }
+    if (!epochPaletteValid_ || epochPalette_ != pal) {
+        epochPalette_ = pal;
+        epochPaletteValid_ = true;
+        ++contentEpoch_;
+    }
+    return contentEpoch_;
+}
+
+bool Renderer::reuseLastFrame() {
+    if (!completeFrame_ || resolvedDirty_ || drawnEpoch_ != contentEpoch() ||
+        cam_.vpWidth != w_ || cam_.vpHeight != h_ ||
+        (backdropEnabled_ && backdropDirty_))
+        return false;
+    reusedFrame_ = true;
+    return true;
+}
+
+// Target passes restore framebuffer/viewport/VAO and fixed-function state, not program/textures.
+void Renderer::restoreIdleGlState() const {
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, sw_, sh_);
+    glBindVertexArray(0);
+    glEnable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_CULL_FACE);
+}
+
 void Renderer::setBackground(float tr, float tg, float tb, float br, float bg, float bb) {
-    bgTop_[0] = tr; bgTop_[1] = tg; bgTop_[2] = tb;
-    bgBot_[0] = br; bgBot_[1] = bg; bgBot_[2] = bb;
-    // 2-stop convenience: synthesize a mid stop halfway between top and bottom.
-    for (int i = 0; i < 3; ++i) bgMid_[i] = 0.5f * (bgTop_[i] + bgBot_[i]);
+    const float top[3] = {tr, tg, tb}, bot[3] = {br, bg, bb};
+    float mid[3];
+    for (int i = 0; i < 3; ++i) mid[i] = 0.5f * (top[i] + bot[i]);
+    setBackground3(top, mid, bot);
 }
 
 void Renderer::setBackground3(const float top[3], const float mid[3], const float bot[3]) {
-    for (int i = 0; i < 3; ++i) { bgTop_[i] = top[i]; bgMid_[i] = mid[i]; bgBot_[i] = bot[i]; }
+    for (int i = 0; i < 3; ++i) {
+        updateContent(bgTop_[i], top[i]);
+        updateContent(bgMid_[i], mid[i]);
+        updateContent(bgBot_[i], bot[i]);
+    }
 }
 
 void Renderer::setEdgeStyle(float r, float g, float b, float widthPx) {
-    edgeColor_[0] = r; edgeColor_[1] = g; edgeColor_[2] = b;
-    edgeWidthPx_ = widthPx;
+    updateContent(edgeColor_[0], r); updateContent(edgeColor_[1], g);
+    updateContent(edgeColor_[2], b); updateContent(edgeWidthPx_, widthPx);
 }
 
 void Renderer::setDefaultPartColor(float r, float g, float b) {
-    defaultPart_[0] = r; defaultPart_[1] = g; defaultPart_[2] = b;
+    updateContent(defaultPart_[0], r); updateContent(defaultPart_[1], g);
+    updateContent(defaultPart_[2], b);
 }
 
 void Renderer::setGroundShadow(float r, float g, float b, float maxAlpha) {
-    groundShadow_[0] = r; groundShadow_[1] = g; groundShadow_[2] = b; groundShadow_[3] = maxAlpha;
+    updateContent(groundShadow_[0], r); updateContent(groundShadow_[1], g);
+    updateContent(groundShadow_[2], b); updateContent(groundShadow_[3], maxAlpha);
 }
 
 bool Renderer::init(int width, int height, std::string& err) {
+#ifdef __EMSCRIPTEN__
     w_ = width; h_ = height;
+#else
+    // Bucketed post-process textures must be non-power-of-two as real desktop
+    // viewports are: some drivers compile separate sampler variants at first draw.
+    w_ = 257; h_ = 257;
+#endif
     initQualityPolicy();  // sets rw_/rh_/sw_/sh_ + msaaRequest_/blurPasses_ for the step
 
     prog_ = linkProgram(kVert, kFrag);
     edgeProg_ = linkProgram(kEdgeVert, kEdgeFrag);
+    depthProg_ = linkProgram(kEdgeVert, kDepthFrag);
     bgProg_ = linkProgram(kBgVert, kBgFrag);
     resolveProg_ = linkProgram(kResolveVert, kResolveFrag);
     downsampleProg_ = linkProgram(kResolveVert, kDownsampleFrag);
@@ -502,6 +643,8 @@ bool Renderer::init(int width, int height, std::string& err) {
     int ok = 0;
     glGetProgramiv(prog_, GL_LINK_STATUS, &ok);
     if (!ok) { err = "program link failed"; return false; }
+    glGetProgramiv(depthProg_, GL_LINK_STATUS, &ok);
+    if (!ok) { err = "depth program link failed"; return false; }
     glGetProgramiv(resolveProg_, GL_LINK_STATUS, &ok);
     if (!ok) { err = "resolve program link failed"; return false; }
     glGetProgramiv(downsampleProg_, GL_LINK_STATUS, &ok);
@@ -560,7 +703,40 @@ bool Renderer::init(int width, int height, std::string& err) {
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glEnable(GL_DEPTH_TEST);
+#ifndef __EMSCRIPTEN__
+    warmPrograms();
+    resize(width, height);
+#endif
     return true;
+}
+
+void Renderer::warmPrograms() {
+    // Exercise the production paths (including their blend/depth/vertex formats).
+    // No warm-up pixels, geometry, camera or luminance sample reaches the UI.
+    std::vector<PartMesh> parts(1);
+    auto& mesh = parts.front().mesh;
+    mesh.positions = {-1, -1, 0, 1, -1, 0, 0, 1, 0};
+    mesh.normals = {0, 0, 1, 0, 0, 1, 0, 0, 1};
+    mesh.indices = {0, 1, 2};
+    mesh.edgeLines = {-1, -1, 0, 1, -1, 0};
+    mesh.bbMin = Vec3(-1, -1, 0);
+    mesh.bbMax = Vec3(1, 1, 0);
+    setMeshes(std::move(parts));
+    showPlane_[0] = showPlane_[1] = showPlane_[2] = true;
+    renderOrbit(45.0f, 25.0f, 1.0f);
+    resolveColorTexture();
+    updateBackdropBlur();
+    glFinish();  // startup only: finish any deferred compilation before presentation
+    freeSubs();
+    center_ = Vec3(0, 0, 0);
+    radius_ = 0.0f;
+    showPlane_[0] = showPlane_[1] = showPlane_[2] = false;
+    cam_ = CameraXform{};
+    cameraInitialized_ = false;
+    completeFrame_ = reusedFrame_ = false;
+    resolvedDirty_ = backdropDirty_ = false;
+    drawnEpoch_ = 0;
+    restoreIdleGlState();
 }
 
 // Resolve every uniform location once, right after the programs link. The draw paths then read
@@ -577,6 +753,7 @@ void Renderer::cacheUniformLocations() {
     uFace_.useScalar  = glGetUniformLocation(prog_, "uUseScalar");
     uFace_.scalarMin  = glGetUniformLocation(prog_, "uScalarMin");
     uFace_.scalarMax  = glGetUniformLocation(prog_, "uScalarMax");
+    uFace_.scalarReversed = glGetUniformLocation(prog_, "uScalarReversed");
     uFace_.metallic   = glGetUniformLocation(prog_, "uMetallic");
     uFace_.roughness  = glGetUniformLocation(prog_, "uRoughness");
     uFace_.lut        = glGetUniformLocation(prog_, "uLut");
@@ -587,12 +764,19 @@ void Renderer::cacheUniformLocations() {
     uFace_.zebra      = glGetUniformLocation(prog_, "uZebra");
     uFace_.zebraFreq  = glGetUniformLocation(prog_, "uZebraFreq");
     uFace_.alpha      = glGetUniformLocation(prog_, "uAlpha");
+    uFace_.offset     = glGetUniformLocation(prog_, "uOffset");
 
     uEdge_.mvp        = glGetUniformLocation(edgeProg_, "uMVP");
     uEdge_.color      = glGetUniformLocation(edgeProg_, "uColor");
     uEdge_.clipCount  = glGetUniformLocation(edgeProg_, "uClipCount");
     uEdge_.clipN      = glGetUniformLocation(edgeProg_, "uClipN");
     uEdge_.clipOff    = glGetUniformLocation(edgeProg_, "uClipOff");
+    uEdge_.offset     = glGetUniformLocation(edgeProg_, "uOffset");
+    uDepth_.mvp       = glGetUniformLocation(depthProg_, "uMVP");
+    uDepth_.clipCount = glGetUniformLocation(depthProg_, "uClipCount");
+    uDepth_.clipN     = glGetUniformLocation(depthProg_, "uClipN");
+    uDepth_.clipOff   = glGetUniformLocation(depthProg_, "uClipOff");
+    uDepth_.offset    = glGetUniformLocation(depthProg_, "uOffset");
 
     uBg_.top          = glGetUniformLocation(bgProg_, "uTop");
     uBg_.mid          = glGetUniformLocation(bgProg_, "uMid");
@@ -616,13 +800,17 @@ void Renderer::cacheUniformLocations() {
 
     uResolve_.src     = glGetUniformLocation(resolveProg_, "uSrc");
     uResolve_.ss      = glGetUniformLocation(resolveProg_, "uSS");
+    uResolve_.dstSize = glGetUniformLocation(resolveProg_, "uDstSize");
 
     uDown_.src        = glGetUniformLocation(downsampleProg_, "uSrc");
-    uDown_.invDstSize = glGetUniformLocation(downsampleProg_, "uInvDstSize");
+    uDown_.scale      = glGetUniformLocation(downsampleProg_, "uScale");
+    uDown_.uvMin      = glGetUniformLocation(downsampleProg_, "uUvMin");
+    uDown_.uvMax      = glGetUniformLocation(downsampleProg_, "uUvMax");
 
     uKawase_.src      = glGetUniformLocation(kawaseProg_, "uSrc");
     uKawase_.texel    = glGetUniformLocation(kawaseProg_, "uTexel");
     uKawase_.offset   = glGetUniformLocation(kawaseProg_, "uOffset");
+    uKawase_.uvMax    = glGetUniformLocation(kawaseProg_, "uUvMax");
 }
 
 // ---- Adaptive quality ladder ----
@@ -712,15 +900,14 @@ void Renderer::setQualityStep(QualityStep s) {
     const int prevMsaa = msaaRequest_;
     qualityStep_ = s;
     applyQualityStep();
+    ++contentEpoch_;
     if (qualityLog_)
         std::fprintf(stderr, "[quality] step %s -> %s (ema %.2f ms, scale %.2f, msaa %d, blur %d)\n",
                      from, qualityStepName(), frameMsEma_, renderScale_, msaaRequest_,
                      blurPasses_);
     // Realloc render targets only when the MSAA count or render scale actually changed.
     if (renderScale_ != prevScale || msaaRequest_ != prevMsaa) {
-        rw_ = std::max(1, (int)std::lround(w_ * renderScale_));
-        rh_ = std::max(1, (int)std::lround(h_ * renderScale_));
-        sw_ = rw_ * SS; sh_ = rh_ * SS;
+        updateTargetSize();
         allocTargets();
     }
 }
@@ -761,7 +948,40 @@ void Renderer::noteFrame(float dtMs) {
     }
 }
 
+void Renderer::updateTargetSize() {
+    if (maxTargetSize_ == 0) {
+        GLint tex = 0, rbo = 0;
+        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &tex);
+        glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &rbo);
+        maxTargetSize_ = std::max(SS, std::min(tex, rbo));
+    }
+    const int limit = maxTargetSize_ / SS;
+    const double wantedW = std::max(1.0, std::round(double(w_) * renderScale_));
+    const double wantedH = std::max(1.0, std::round(double(h_) * renderScale_));
+    const double scale = std::min(1.0, double(limit) / std::max(wantedW, wantedH));
+    rw_ = std::max(1, int(wantedW * scale));
+    rh_ = std::max(1, int(wantedH * scale));
+    sw_ = rw_ * SS; sh_ = rh_ * SS;
+}
+
 void Renderer::allocTargets() {
+    updateTargetSize();
+    const int limit = maxTargetSize_ / SS;
+    const auto bucket = [limit](int n) { return std::min(limit, ((n + 127) / 128) * 128); };
+    // init() precedes the viewport's real chrome/layout and uses provisional dimensions.
+    // Do not retain that provisional allocation when the first real viewport is smaller.
+    const int capacityW = std::max(drawnEpoch_ ? targetW_ : 0, bucket(rw_));
+    const int capacityH = std::max(drawnEpoch_ ? targetH_ : 0, bucket(rh_));
+    const bool resizeResolve = capacityW != targetW_ || capacityH != targetH_;
+    if (!resizeResolve && sceneW_ == sw_ && sceneH_ == sh_ &&
+        allocatedMsaaRequest_ == msaaRequest_) return;
+    targetW_ = capacityW; targetH_ = capacityH;
+    allocatedMsaaRequest_ = msaaRequest_;
+    // Supersampled attachments are rendered and cleared every full frame. Keep them
+    // exact-sized: padding multiplies tile/clear work by SS*SS, unlike cached output.
+    sceneW_ = sw_; sceneH_ = sh_;
+    const int storageW = sceneW_, storageH = sceneH_;
+    completeFrame_ = false;
     if (!fbo_) glGenFramebuffers(1, &fbo_);
     if (!colorTex_) glGenTextures(1, &colorTex_);
     if (!depthRbo_) glGenRenderbuffers(1, &depthRbo_);
@@ -771,13 +991,15 @@ void Renderer::allocTargets() {
     if (!colorRbo_) glGenRenderbuffers(1, &colorRbo_);
 #endif
 
-    // Final-size resolve target (ImGui samples this). Always a single-sample texture.
-    glBindTexture(GL_TEXTURE_2D, resolvedTex_);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, rw_, rh_, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    // Bucketed resolve storage; presentation UVs cover only the active rw_ x rh_ subrect.
+    if (resizeResolve) {
+        glBindTexture(GL_TEXTURE_2D, resolvedTex_);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, targetW_, targetH_, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
 
 #ifdef CHUDWARE_GLES3
     // WebGL2: prefer a multisampled offscreen FBO at presentation size (SS=1). Samples come
@@ -792,9 +1014,9 @@ void Renderer::allocTargets() {
     msaaSamples_ = 0;
     if (msaaRequest_ > 1 && samples > 1) {
         glBindRenderbuffer(GL_RENDERBUFFER, colorRbo_);
-        glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_RGBA8, rw_, rh_);
+        glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_RGBA8, storageW, storageH);
         glBindRenderbuffer(GL_RENDERBUFFER, depthRbo_);
-        glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_DEPTH24_STENCIL8, rw_, rh_);
+        glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_DEPTH24_STENCIL8, storageW, storageH);
 
         glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
         glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, colorRbo_);
@@ -802,24 +1024,29 @@ void Renderer::allocTargets() {
                                   depthRbo_);
         if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
             msaaSamples_ = samples;
-            // Keep colorTex_ as a 1x1 placeholder so resolve's null-check stays simple;
-            // MSAA resolve uses glBlitFramebuffer, not the texture sample path.
+            // Resolve MSAA with identical bounds into a single-sample staging texture.
+            // The regular resolve shader then copies its active crop and clamp border.
+            if (!msaaResolveFbo_) glGenFramebuffers(1, &msaaResolveFbo_);
             glBindTexture(GL_TEXTURE_2D, colorTex_);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, storageW, storageH, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glBindFramebuffer(GL_FRAMEBUFFER, msaaResolveFbo_);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                                   colorTex_, 0);
         }
     }
     if (msaaSamples_ <= 0) {
         // Single-sample fallback (no MSAA available / incomplete FBO).
         glBindTexture(GL_TEXTURE_2D, colorTex_);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, sw_, sh_, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, storageW, storageH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glBindRenderbuffer(GL_RENDERBUFFER, depthRbo_);
-        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, sw_, sh_);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, storageW, storageH);
         glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTex_, 0);
         glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER,
@@ -827,7 +1054,7 @@ void Renderer::allocTargets() {
     }
 #else
     glBindTexture(GL_TEXTURE_2D, colorTex_);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, sw_, sh_, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, storageW, storageH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -835,7 +1062,7 @@ void Renderer::allocTargets() {
 
     // W3-I: packed depth+stencil so the section cap can be stencil-masked.
     glBindRenderbuffer(GL_RENDERBUFFER, depthRbo_);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, sw_, sh_);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, storageW, storageH);
 
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTex_, 0);
@@ -845,19 +1072,16 @@ void Renderer::allocTargets() {
     glBindFramebuffer(GL_FRAMEBUFFER, resolveFbo_);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, resolvedTex_, 0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    resolvedDirty_ = true;
-    backdropDirty_ = true;
-    blurW_ = blurH_ = 0;
     // Existing grids/fences describe the old render targets, even if GL reuses their names.
     lumaSrcFbo_ = 0;
 }
 
 void Renderer::resize(int width, int height) {
     if (width == w_ && height == h_) return;
+    core::framestats::Scope timing("viewport_targets");
     w_ = width; h_ = height;
-    rw_ = std::max(1, (int)std::lround(w_ * renderScale_));
-    rh_ = std::max(1, (int)std::lround(h_ * renderScale_));
-    sw_ = rw_ * SS; sh_ = rh_ * SS;
+    ++contentEpoch_;
+    completeFrame_ = false;
     allocTargets();
 }
 
@@ -876,6 +1100,41 @@ void Renderer::freeSubVector(std::vector<Sub>& subs) {
 
 void Renderer::freeSubs() {
     freeSubVector(subs_);
+    meshesKeyValid_ = false;
+}
+
+void Renderer::activeMeshesReplaced() {
+    ++meshGeneration_;
+    if (!bodyOffsets_.empty()) { bodyOffsets_.clear(); ++contentEpoch_; }
+}
+
+void Renderer::setBodyOffsets(std::unordered_map<uint32_t, Vec3> offsets) {
+    for (auto it = offsets.begin(); it != offsets.end();) {
+        const Vec3& v = it->second;
+        if (std::fabs(v.x) + std::fabs(v.y) + std::fabs(v.z) < 1e-6f) it = offsets.erase(it);
+        else ++it;
+    }
+    if (offsets.size() == bodyOffsets_.size()) {
+        bool same = true;
+        for (const auto& [id, v] : offsets) {
+            const auto old = bodyOffsets_.find(id);
+            if (old == bodyOffsets_.end() || old->second.x != v.x || old->second.y != v.y ||
+                old->second.z != v.z) { same = false; break; }
+        }
+        if (same) return;
+    }
+    bodyOffsets_ = std::move(offsets);
+    ++contentEpoch_;
+}
+
+bool Renderer::applyBodyOffset(int loc, const Sub& s) const {
+    const auto it = bodyOffsets_.find(s.body_id);
+    if (it == bodyOffsets_.end()) {
+        glUniform3f(loc, 0.0f, 0.0f, 0.0f);
+        return false;
+    }
+    glUniform3f(loc, it->second.x, it->second.y, it->second.z);
+    return true;
 }
 
 void Renderer::meshCacheTouch(const std::string& key) {
@@ -911,6 +1170,8 @@ void Renderer::setActiveMeshIdentity(const std::string& docId, int revision) {
 }
 
 void Renderer::parkActiveMeshes() {
+    activeMeshesReplaced();
+    if (!subs_.empty()) { ++contentEpoch_; ++meshesRevision_; }
     if (activeMeshDocId_.empty() || activeMeshRevision_ < 0) {
         freeSubs();
         return;
@@ -922,7 +1183,8 @@ void Renderer::parkActiveMeshes() {
         freeSubVector(old->second.subs);
         meshCache_.erase(old);
     }
-    meshCache_.emplace(activeKey, CachedMesh{std::move(subs_), center_, radius_});
+    meshCache_.emplace(activeKey, CachedMesh{std::move(subs_), center_, radius_, meshesKey_});
+    meshesKeyValid_ = false;
     meshCacheTouch(activeKey);
     meshCacheEvictIfNeeded();
     activeMeshDocId_.clear();
@@ -931,6 +1193,17 @@ void Renderer::parkActiveMeshes() {
 
 void Renderer::cacheMeshes(const std::string& docId, int revision,
                            const std::vector<PartMesh>& parts) {
+    cacheMeshesImpl(docId, revision, parts, nullptr);
+}
+
+void Renderer::cacheMeshes(const std::string& docId, int revision,
+                           std::vector<PartMesh>&& parts) {
+    cacheMeshesImpl(docId, revision, parts, &parts);
+}
+
+void Renderer::cacheMeshesImpl(const std::string& docId, int revision,
+                               const std::vector<PartMesh>& parts,
+                               std::vector<PartMesh>* movable) {
     if (docId.empty() || revision < 0) return;
     if (activeMeshDocId_ == docId && activeMeshRevision_ == revision) return;
 
@@ -942,18 +1215,27 @@ void Renderer::cacheMeshes(const std::string& docId, int revision,
     const std::string visibleDocId = activeMeshDocId_;
     const int visibleRevision = activeMeshRevision_;
     const bool wasFrozen = framingFrozen_;
+    const uint64_t visibleEpoch = contentEpoch_;
+    const unsigned int visibleMeshRevision = meshesRevision_;
+    const auto visibleKey = meshesKey_;
+    const bool visibleKeyValid = meshesKeyValid_;
+    meshesKeyValid_ = false;
     subs_.clear();
     activeMeshDocId_.clear();
     activeMeshRevision_ = -1;
     framingFrozen_ = false;
-    setMeshes(parts);
-    CachedMesh uploaded{std::move(subs_), center_, radius_};
+    uploadMeshes(parts, movable);
+    CachedMesh uploaded{std::move(subs_), center_, radius_, meshesKey_};
     subs_ = std::move(visibleSubs);
     center_ = visibleCenter;
     radius_ = visibleRadius;
     activeMeshDocId_ = visibleDocId;
     activeMeshRevision_ = visibleRevision;
     framingFrozen_ = wasFrozen;
+    contentEpoch_ = visibleEpoch;
+    meshesRevision_ = visibleMeshRevision;
+    meshesKey_ = visibleKey;
+    meshesKeyValid_ = visibleKeyValid;
 
     discardCachedMeshes(docId);
     const std::string key = docId + '\x1f' + std::to_string(revision);
@@ -974,11 +1256,15 @@ bool Renderer::bindCachedMeshes(const std::string& docId, int revision) {
     subs_ = std::move(target->second.subs);
     center_ = target->second.center;
     radius_ = target->second.radius;
+    meshesKey_ = target->second.key;
+    meshesKeyValid_ = true;
     meshCache_.erase(target);
     meshCacheOrder_.remove(targetKey);
     activeMeshDocId_ = docId;
     activeMeshRevision_ = revision;
     ++meshesRevision_;
+    for (auto& s : subs_) refreshPreviewRuns(s);
+    ++contentEpoch_;
     return true;
 }
 
@@ -1001,91 +1287,216 @@ void Renderer::discardCachedMeshes(const std::string& docId) {
 // already on the GPU in subs_. The subsequent setMeshes(component) → freeSubs() only frees subs_,
 // so the ghost survives the switch. Any prior ghost is freed first.
 void Renderer::captureCurrentAsGhost() {
+    activeMeshesReplaced();
     clearGhost();
     ghostSubs_ = std::move(subs_);   // move GL handles; no reupload
     subs_.clear();                   // moved-from vector -> explicit empty (defensive)
+    meshesKeyValid_ = false;
     activeMeshDocId_.clear();        // ghost is intentionally not a switch-cache entry
     activeMeshRevision_ = -1;
     showGhost_ = true;
     ++meshesRevision_;
+    ++contentEpoch_;
 }
 
 // Free the ghost buffers and stop drawing the ghost (exit component edit / renderer teardown).
 void Renderer::clearGhost() {
-    for (auto& s : ghostSubs_) {
-        if (s.vao) glDeleteVertexArrays(1, &s.vao);
-        if (s.vboPos) glDeleteBuffers(1, &s.vboPos);
-        if (s.vboNrm) glDeleteBuffers(1, &s.vboNrm);
-        if (s.ebo) glDeleteBuffers(1, &s.ebo);
-        if (s.edgeVao) glDeleteVertexArrays(1, &s.edgeVao);
-        if (s.vboEdge) glDeleteBuffers(1, &s.vboEdge);
-        if (s.vboScalar) glDeleteBuffers(1, &s.vboScalar);
-    }
-    ghostSubs_.clear();
+    const bool changed = showGhost_ || !ghostSubs_.empty();
+    freeSubVector(ghostSubs_);
     showGhost_ = false;
     ghostXform_ = Mat4{};   // back to identity (no ghost shift) until the next component-edit sets one
-    ++meshesRevision_;
+    if (changed) { ++meshesRevision_; ++contentEpoch_; }
 }
 
 // CAM remnant-stock aux mesh: translucent body drawn with the ghost-style alpha pass.
 // Owned by the CAM viewport playhead — uploaded per sim frame index, cleared when the
 // Manufacture workspace deactivates. Identity model matrix (CAM coords are world/WCS).
 void Renderer::setAuxMesh(const Mesh& m, float alpha) {
-    clearAuxMesh();
-    if (m.empty()) return;
-    auxAlpha_ = (alpha < 0.0f) ? 0.0f : (alpha > 1.0f ? 1.0f : alpha);
-    Sub s;
-    glGenVertexArrays(1, &s.vao);
-    glGenBuffers(1, &s.vboPos);
-    glGenBuffers(1, &s.vboNrm);
-    glGenBuffers(1, &s.ebo);
+    if (m.empty()) { clearAuxMesh(); return; }
+    MeshContentKey fingerprint;
+    fingerprint.geometry(m);
+    if (auxMeshKeyValid_ && auxMeshKey_ == fingerprint.value) {
+        updateContent(auxAlpha_, std::clamp(alpha, 0.0f, 1.0f));
+        updateContent(showAux_, true);
+        return;
+    }
+    auxMeshKey_ = fingerprint.value;
+    auxMeshKeyValid_ = true;
+    auxAlpha_ = std::clamp(alpha, 0.0f, 1.0f);
+    if (auxSubs_.empty()) {
+        auxSubs_.emplace_back();
+        auto& s = auxSubs_.back();
+        glGenVertexArrays(1, &s.vao);
+        glGenBuffers(1, &s.vboPos);
+        glGenBuffers(1, &s.vboNrm);
+        glGenBuffers(1, &s.ebo);
+        glBindVertexArray(s.vao);
+        glBindBuffer(GL_ARRAY_BUFFER, s.vboPos);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+        glBindBuffer(GL_ARRAY_BUFFER, s.vboNrm);
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+        glDisableVertexAttribArray(2);
+    }
+    auto& s = auxSubs_.front();
     glBindVertexArray(s.vao);
-    glBindBuffer(GL_ARRAY_BUFFER, s.vboPos);
-    glBufferData(GL_ARRAY_BUFFER, m.positions.size() * sizeof(float), m.positions.data(),
-                 GL_STATIC_DRAW);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
-    glBindBuffer(GL_ARRAY_BUFFER, s.vboNrm);
-    glBufferData(GL_ARRAY_BUFFER, m.normals.size() * sizeof(float), m.normals.data(),
-                 GL_STATIC_DRAW);
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
-    // complete the VAO with a NaN scalar buffer like the main upload (shader ignores it)
-    glGenBuffers(1, &s.vboScalar);
-    glBindBuffer(GL_ARRAY_BUFFER, s.vboScalar);
-    std::vector<float> nans(m.positions.size() / 3, std::numeric_limits<float>::quiet_NaN());
-    glBufferData(GL_ARRAY_BUFFER, nans.size() * sizeof(float), nans.data(), GL_STATIC_DRAW);
-    glEnableVertexAttribArray(2);
-    glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, sizeof(float), (void*)0);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s.ebo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, m.indices.size() * sizeof(unsigned int),
-                 m.indices.data(), GL_STATIC_DRAW);
+    glVertexAttrib1f(2, std::numeric_limits<float>::quiet_NaN());
+    const auto upload = [](GLenum target, GLuint buffer, size_t bytes, const void* data) {
+        glBindBuffer(target, buffer);
+        glBufferData(target, static_cast<GLsizeiptr>(bytes), nullptr, GL_STREAM_DRAW);
+        if (bytes) glBufferSubData(target, 0, static_cast<GLsizeiptr>(bytes), data);
+    };
+    upload(GL_ARRAY_BUFFER, s.vboPos, m.positions.size() * sizeof(float), m.positions.data());
+    upload(GL_ARRAY_BUFFER, s.vboNrm, m.normals.size() * sizeof(float), m.normals.data());
+    upload(GL_ELEMENT_ARRAY_BUFFER, s.ebo, m.indices.size() * sizeof(unsigned int), m.indices.data());
     glBindVertexArray(0);
     s.idxCount = static_cast<int>(m.indices.size());
-    auxSubs_.push_back(std::move(s));
     showAux_ = true;
+    ++contentEpoch_;
 }
 
 void Renderer::clearAuxMesh() {
-    for (auto& s : auxSubs_) {
-        if (s.vao) glDeleteVertexArrays(1, &s.vao);
-        if (s.vboPos) glDeleteBuffers(1, &s.vboPos);
-        if (s.vboNrm) glDeleteBuffers(1, &s.vboNrm);
-        if (s.ebo) glDeleteBuffers(1, &s.ebo);
-        if (s.edgeVao) glDeleteVertexArrays(1, &s.edgeVao);
-        if (s.vboEdge) glDeleteBuffers(1, &s.vboEdge);
-        if (s.vboScalar) glDeleteBuffers(1, &s.vboScalar);
+    // Keep the one stock VAO/buffer set for the next playhead update.
+    updateContent(showAux_, false);
+}
+
+void Renderer::setMeshReferences(std::vector<MeshReference> refs) {
+    const auto equal = [](const MeshReference& a, const MeshReference& b) {
+        return a.id == b.id && a.key == b.key && a.mesh == b.mesh &&
+               a.color == b.color && a.opacity == b.opacity && a.visible == b.visible &&
+               a.hasBounds == b.hasBounds && a.bboxMin == b.bboxMin && a.bboxMax == b.bboxMax;
+    };
+    if (meshReferences_.size() == refs.size() &&
+        std::equal(meshReferences_.begin(), meshReferences_.end(), refs.begin(), equal))
+        return;
+
+    std::unordered_set<std::string> used;
+    for (const auto& ref : refs) {
+        if (!ref.mesh || ref.mesh->empty() || ref.key.empty()) continue;
+        used.insert(ref.key);
+        if (referenceGpu_.find(ref.key) != referenceGpu_.end()) continue;
+        const Mesh& m = *ref.mesh;
+        if (m.normals.size() != m.positions.size() ||
+            m.indices.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
+            continue;
+        auto& g = referenceGpu_[ref.key];
+        glGenVertexArrays(1, &g.vao);
+        glGenBuffers(1, &g.positions);
+        glGenBuffers(1, &g.normals);
+        glGenBuffers(1, &g.indices);
+        glBindVertexArray(g.vao);
+        glBindBuffer(GL_ARRAY_BUFFER, g.positions);
+        glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(m.positions.size() * sizeof(float)),
+                     m.positions.data(), GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
+        glBindBuffer(GL_ARRAY_BUFFER, g.normals);
+        glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(m.normals.size() * sizeof(float)),
+                     m.normals.data(), GL_STATIC_DRAW);
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
+        glDisableVertexAttribArray(2);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.indices);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                     static_cast<GLsizeiptr>(m.indices.size() * sizeof(uint32_t)),
+                     m.indices.data(), GL_STATIC_DRAW);
+        g.count = static_cast<int>(m.indices.size());
     }
-    auxSubs_.clear();
-    showAux_ = false;
+    glBindVertexArray(0);
+    for (auto it = referenceGpu_.begin(); it != referenceGpu_.end();) {
+        if (used.count(it->first)) { ++it; continue; }
+        auto& g = it->second;
+        glDeleteVertexArrays(1, &g.vao);
+        glDeleteBuffers(1, &g.positions);
+        glDeleteBuffers(1, &g.normals);
+        glDeleteBuffers(1, &g.indices);
+        it = referenceGpu_.erase(it);
+    }
+    meshReferences_ = std::move(refs);
+    ++contentEpoch_;
+}
+
+void Renderer::drawMeshReferences(const Mat4& mvp, const Vec3& eye, const Vec3& keyDir,
+                                  const Vec3& fillDir, const Vec3& rimDir) {
+    if (referenceGpu_.empty()) return;
+    glUseProgram(prog_);
+    glUniformMatrix4fv(uFace_.mvp, 1, GL_FALSE, mvp.m);
+    glUniform3f(uFace_.keyDir, keyDir.x, keyDir.y, keyDir.z);
+    glUniform3f(uFace_.fillDir, fillDir.x, fillDir.y, fillDir.z);
+    glUniform3f(uFace_.rimDir, rimDir.x, rimDir.y, rimDir.z);
+    glUniform3f(uFace_.camPos, eye.x, eye.y, eye.z);
+    glUniform1i(uFace_.useScalar, 0);
+    glUniform1i(uFace_.clipCount, section_.count);
+    if (section_.count > 0) {
+        glUniform3fv(uFace_.clipN, section_.count, section_.normals[0]);
+        glUniform1fv(uFace_.clipOff, section_.count, section_.offsets);
+    }
+    glUniform1f(uFace_.realView, realView_ ? 1.0f : 0.0f);
+    glUniform1i(uFace_.zebra, 0);
+    glUniform1f(uFace_.metallic, 0.0f);
+    glUniform1f(uFace_.roughness, 0.7f);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);  // coincident scan faces still overlay the opaque part
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(1.0f, 1.0f);
+    glVertexAttrib1f(2, std::numeric_limits<float>::quiet_NaN());
+    for (const auto& ref : meshReferences_) {
+        if (!ref.visible || ref.opacity <= 0.0f) continue;
+        auto it = referenceGpu_.find(ref.key);
+        if (it == referenceGpu_.end()) continue;
+        glUniform1f(uFace_.alpha, std::clamp(ref.opacity, 0.0f, 1.0f));
+        glUniform3fv(uFace_.color, 1, ref.color.data());
+        glBindVertexArray(it->second.vao);
+        glDrawElements(GL_TRIANGLES, it->second.count, GL_UNSIGNED_INT, nullptr);
+    }
+    glBindVertexArray(0);
+    glDisable(GL_POLYGON_OFFSET_FILL);
+    glDepthMask(GL_TRUE);
+    glDepthFunc(GL_LESS);
+    glDisable(GL_BLEND);
 }
 
 void Renderer::setPreviewIsolation(const std::vector<uint64_t>& editFaceKeys, float alpha) {
+    if (alpha >= 1.0f || editFaceKeys.empty()) { clearPreviewIsolation(); return; }
+    alpha = std::max(0.0f, alpha);
+    if (previewKeys_ == editFaceKeys) {
+        updateContent(previewAlpha_, alpha);
+        return;
+    }
+    std::unordered_set<uint64_t> faces(editFaceKeys.begin(), editFaceKeys.end());
+    previewKeys_ = editFaceKeys;
+    updateContent(previewAlpha_, alpha);
+    if (previewFaces_ == faces) return;
+    previewFaces_ = std::move(faces);
+    ++contentEpoch_;
+    for (auto& s : subs_) refreshPreviewRuns(s);
+}
+
+void Renderer::clearPreviewIsolation() {
+    updateContent(previewAlpha_, 1.0f);
+    if (previewFaces_.empty()) return;
     previewFaces_.clear();
-    if (alpha >= 1.0f || editFaceKeys.empty()) { previewAlpha_ = 1.0f; return; }
-    previewAlpha_ = alpha < 0.0f ? 0.0f : alpha;
-    previewFaces_.reserve(editFaceKeys.size());
-    for (uint64_t k : editFaceKeys) previewFaces_.insert(k);
+    previewKeys_.clear();
+    ++contentEpoch_;
+    for (auto& s : subs_) refreshPreviewRuns(s);
+}
+
+void Renderer::refreshPreviewRuns(Sub& s) {
+    s.previewRuns[0].clear();
+    s.previewRuns[1].clear();
+    if (previewFaces_.empty()) return;
+    const uint64_t hi = uint64_t(s.body_id) << 32;
+    for (const auto& f : s.faces) {
+        auto& runs = s.previewRuns[previewFaces_.count(hi | f.face_id) ? 1 : 0];
+        if (!runs.empty() && runs.back().first_tri + runs.back().tri_count == f.first_tri)
+            runs.back().tri_count += f.tri_count;
+        else
+            runs.push_back(f);
+    }
 }
 
 // Re-upload a Sub's positions (and edge lines) as base + deformScale_ * disp. No-op if the body
@@ -1110,13 +1521,17 @@ void Renderer::uploadDeformed(Sub& s) {
 }
 
 void Renderer::setDeformScale(float sc) {
-    deformScale_ = sc;
+    if (!updateContent(deformScale_, sc)) return;
     for (auto& s : subs_) uploadDeformed(s);
 }
 
 bool Renderer::scalarRange(float& vmin, float& vmax) const {
     for (const auto& s : subs_) {
-        if (s.hasScalar) { vmin = s.scalarMin; vmax = s.scalarMax; return true; }
+        if (s.hasScalar) {
+            vmin = scalarDisplay_.fixedRange ? scalarDisplay_.min : s.scalarMin;
+            vmax = scalarDisplay_.fixedRange ? scalarDisplay_.max : s.scalarMax;
+            return true;
+        }
     }
     return false;
 }
@@ -1127,13 +1542,16 @@ void Renderer::setBodyVisible(size_t index, bool visible) {
     if (index >= subs_.size() || subs_[index].visible == visible) return;
     subs_[index].visible = visible;
     ++meshesRevision_;
+    ++contentEpoch_;
 }
 
 void Renderer::setMesh(const Mesh& m) {
     PartMesh p;
     p.mesh = m;
     p.useDefaultColor = true;  // a single STL body carries no baked colour -> theme default part colour
-    setMeshes({p});
+    std::vector<PartMesh> parts;
+    parts.push_back(std::move(p));
+    setMeshes(std::move(parts));
 }
 
 void Renderer::drawSubFaces(const Sub& s, uint32_t firstTri, uint32_t triCount, int editing) {
@@ -1146,27 +1564,18 @@ void Renderer::drawSubFaces(const Sub& s, uint32_t firstTri, uint32_t triCount, 
         if (editing != 1) draw(firstTri, triCount);
         return;
     }
-    const uint64_t hi = uint64_t(s.body_id) << 32;
+    const auto& runs = s.previewRuns[editing != 0 ? 1 : 0];
     const uint64_t endTri = uint64_t(firstTri) + triCount;
-    uint32_t runFirst = 0, runCount = 0;
-    auto face = std::lower_bound(s.faces.begin(), s.faces.end(), firstTri,
+    auto run = std::lower_bound(runs.begin(), runs.end(), firstTri,
         [](const FaceSpan& f, uint32_t first) {
             return uint64_t(f.first_tri) + f.tri_count <= first;
         });
-    for (; face != s.faces.end() && face->first_tri < endTri; ++face) {
-        if ((previewFaces_.count(hi | face->face_id) != 0) != (editing != 0)) continue;
-        const uint32_t first = std::max(firstTri, face->first_tri);
+    for (; run != runs.end() && run->first_tri < endTri; ++run) {
+        const uint32_t first = std::max(firstTri, run->first_tri);
         const uint32_t end = static_cast<uint32_t>(
-            std::min(endTri, uint64_t(face->first_tri) + face->tri_count));
-        if (end <= first) continue;
-        if (runCount && runFirst + runCount != first) {
-            draw(runFirst, runCount);
-            runCount = 0;
-        }
-        if (!runCount) runFirst = first;
-        runCount += end - first;
+            std::min(endTri, uint64_t(run->first_tri) + run->tri_count));
+        if (end > first) draw(first, end - first);
     }
-    draw(runFirst, runCount);
 }
 
 void Renderer::drawSubMaterials(const Sub& s, bool isolate) {
@@ -1186,14 +1595,35 @@ void Renderer::drawSubMaterials(const Sub& s, bool isolate) {
 }
 
 void Renderer::setMeshes(const std::vector<PartMesh>& parts) {
+    activeMeshesReplaced();
+    uploadMeshes(parts);
+}
+
+void Renderer::setMeshes(std::vector<PartMesh>&& parts) {
+    activeMeshesReplaced();
+    uploadMeshes(parts, &parts);
+}
+
+void Renderer::uploadMeshes(const std::vector<PartMesh>& parts, std::vector<PartMesh>* movable) {
+    const auto key = partContentKey(parts, defaultPart_, framingFrozen_);
+    if (meshesKeyValid_ && meshesKey_ == key) {
+        bool changed = false;
+        for (auto& s : subs_) changed |= updateContent(s.visible, true);
+        if (changed) ++meshesRevision_;
+        return;
+    }
     freeSubs();
+    meshesKey_ = key;
+    meshesKeyValid_ = true;
     // setMeshes is a content change/rebuild, not a tab bind. The caller marks the new immutable
     // doc+revision identity after the upload succeeds.
     activeMeshDocId_.clear();
     activeMeshRevision_ = -1;
     Vec3 bbMin, bbMax;
     bool first = true;
-    for (const auto& part : parts) {
+    subs_.reserve(parts.size());
+    for (size_t partIndex = 0; partIndex < parts.size(); ++partIndex) {
+        const auto& part = parts[partIndex];
         const Mesh& m = part.mesh;
         if (m.empty()) continue;
         Sub s;
@@ -1211,7 +1641,8 @@ void Renderer::setMeshes(const std::vector<PartMesh>& parts) {
         // Per-feature preview isolation: keep the body id + face triangle-runs (sorted by first_tri
         // so adjacent same-class faces can be merged into one draw range during the split pass).
         s.body_id = part.body_id;
-        s.faces = part.faces;
+        if (movable) s.faces = std::move((*movable)[partIndex].faces);
+        else s.faces = part.faces;
         std::sort(s.faces.begin(), s.faces.end(),
                   [](const FaceSpan& a, const FaceSpan& b) { return a.first_tri < b.first_tri; });
         if (!part.appearance_regions.empty()) {
@@ -1272,10 +1703,6 @@ void Renderer::setMeshes(const std::vector<PartMesh>& parts) {
                 s.materials.clear();
             }
         }
-        // C19: keep CPU copies so the deform slider can re-upload displaced positions.
-        s.basePos = m.positions;
-        s.baseEdge = m.edgeLines;
-        s.disp = part.disp;  // 3*n or empty
 
         glGenVertexArrays(1, &s.vao);
         glGenBuffers(1, &s.vboPos);
@@ -1293,25 +1720,22 @@ void Renderer::setMeshes(const std::vector<PartMesh>& parts) {
         glEnableVertexAttribArray(1);
         glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
 
-        // C19: per-vertex scalar attribute (location 2). Always bound so the VAO is complete; a
-        // body without a field uploads a NaN-filled buffer (shader renders neutral). When colormap
-        // mode is off the shader ignores it entirely.
-        glGenBuffers(1, &s.vboScalar);
-        glBindBuffer(GL_ARRAY_BUFFER, s.vboScalar);
-        size_t nverts = m.positions.size() / 3;
+        // A missing scalar is a constant NaN, not an allocated per-vertex buffer.
+        const size_t nverts = m.positions.size() / 3;
         if (!part.scalar.empty() && part.scalar.size() == nverts) {
+            glGenBuffers(1, &s.vboScalar);
+            glBindBuffer(GL_ARRAY_BUFFER, s.vboScalar);
             glBufferData(GL_ARRAY_BUFFER, part.scalar.size() * sizeof(float), part.scalar.data(),
                          GL_STATIC_DRAW);
+            glEnableVertexAttribArray(2);
+            glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, sizeof(float), (void*)0);
             s.hasScalar = true;
             s.scalarMin = part.scalarMin;
             s.scalarMax = part.scalarMax;
         } else {
-            std::vector<float> nans(nverts, std::numeric_limits<float>::quiet_NaN());
-            glBufferData(GL_ARRAY_BUFFER, nans.size() * sizeof(float), nans.data(), GL_STATIC_DRAW);
-            s.hasScalar = false;
+            glDisableVertexAttribArray(2);
+            glVertexAttrib1f(2, std::numeric_limits<float>::quiet_NaN());
         }
-        glEnableVertexAttribArray(2);
-        glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, sizeof(float), (void*)0);
 
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s.ebo);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, m.indices.size() * sizeof(unsigned int),
@@ -1331,6 +1755,19 @@ void Renderer::setMeshes(const std::vector<PartMesh>& parts) {
 
         s.idxCount = static_cast<int>(m.indices.size());
         s.edgeVerts = static_cast<int>(m.edgeLines.size() / 3);
+        if (!part.disp.empty()) {
+            if (movable) {
+                auto& source = (*movable)[partIndex];
+                s.basePos = std::move(source.mesh.positions);
+                s.baseEdge = std::move(source.mesh.edgeLines);
+                s.disp = std::move(source.disp);
+            } else {
+                s.basePos = m.positions;
+                s.baseEdge = m.edgeLines;
+                s.disp = part.disp;
+            }
+        }
+        refreshPreviewRuns(s);
         subs_.push_back(std::move(s));
 
         if (first) { bbMin = m.bbMin; bbMax = m.bbMax; first = false; }
@@ -1366,6 +1803,7 @@ void Renderer::setMeshes(const std::vector<PartMesh>& parts) {
 
     // C27-D: invalidate the View Selector thumbnail cache — the meshes changed.
     ++meshesRevision_;
+    ++contentEpoch_;
 }
 
 void Renderer::setAuxSceneBounds(const float lo[3], const float hi[3]) {
@@ -1375,13 +1813,24 @@ void Renderer::setAuxSceneBounds(const float lo[3], const float hi[3]) {
         auxSceneLo_ = Vec3(lo[0], lo[1], lo[2]);
         auxSceneHi_ = Vec3(hi[0], hi[1], hi[2]);
         auxSceneRadius_ = -1.0f;
+        ++contentEpoch_;
     }
     hasAuxSceneBounds_ = true;
 }
 
 float Renderer::effectiveSceneRadius() const {
-    const float baseRadius = std::max(radius_ > 0.0f ? radius_ : kEmptySceneRadius,
-                                     auxSceneRadiusFloor_);
+    float baseRadius = std::max(radius_ > 0.0f ? radius_ : kEmptySceneRadius,
+                                auxSceneRadiusFloor_);
+    for (const auto& ref : meshReferences_) {
+        if (!ref.visible || ref.opacity <= 0.0f || !ref.hasBounds) continue;
+        const float dx = std::max(std::fabs(ref.bboxMin[0] - center_.x),
+                                  std::fabs(ref.bboxMax[0] - center_.x));
+        const float dy = std::max(std::fabs(ref.bboxMin[1] - center_.y),
+                                  std::fabs(ref.bboxMax[1] - center_.y));
+        const float dz = std::max(std::fabs(ref.bboxMin[2] - center_.z),
+                                  std::fabs(ref.bboxMax[2] - center_.z));
+        baseRadius = std::max(baseRadius, std::sqrt(dx * dx + dy * dy + dz * dz));
+    }
     if (!hasAuxSceneBounds_) return baseRadius;
     if (auxSceneRadius_ < 0.0f || auxRadiusCenter_.x != center_.x ||
         auxRadiusCenter_.y != center_.y || auxRadiusCenter_.z != center_.z) {
@@ -1405,11 +1854,24 @@ float Renderer::effectiveSceneRadius() const {
 static constexpr float kEmptySceneRadius = Renderer::kEmptySceneRadius;
 
 void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
-    beginGpuTimer(sceneTimer_);
+    reusedFrame_ = false;
+    drawnEpoch_ = contentEpoch();
+    if (gpuTimersEnabled_) beginGpuTimer(sceneTimer_);
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
     glViewport(0, 0, sw_, sh_);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_TRUE);
+    glStencilMask(0xFF);
+    glDepthFunc(GL_LESS);
+    // Full attachment clears preserve the driver's fast-clear path; the background
+    // overwrites every color pixel, so no previous-frame contents need preserving.
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 
+    core::framestats::Scope backgroundTiming("viewport_background");
     // gradient studio background (fullscreen triangle, depth-independent)
     glDisable(GL_DEPTH_TEST);
     glUseProgram(bgProg_);
@@ -1420,6 +1882,7 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glBindVertexArray(0);
     glEnable(GL_DEPTH_TEST);
+    backgroundTiming.stop();
 
     // C25: an EMPTY document still has a camera, datum planes, and overlay anchors (the
     // SolidWorks "new part" starting state) — only the geometry passes need meshes (their
@@ -1537,49 +2000,60 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
                       ds == DisplayStyle::HiddenLinesVisible);
     const bool drawEdges = (ds != DisplayStyle::Shaded);
 
-    glUseProgram(prog_);
-    glUniformMatrix4fv(uFace_.mvp, 1, GL_FALSE, mvp.m);
-    glUniform3f(uFace_.keyDir, keyDir.x, keyDir.y, keyDir.z);
-    glUniform3f(uFace_.fillDir, fillDir.x, fillDir.y, fillDir.z);
-    glUniform3f(uFace_.rimDir, rimDir.x, rimDir.y, rimDir.z);
-    glUniform3f(uFace_.camPos, eye.x, eye.y, eye.z);
     const int colorLoc = uFace_.color;
     const int useScalarLoc = uFace_.useScalar;
     const int sminLoc = uFace_.scalarMin;
     const int smaxLoc = uFace_.scalarMax;
-    const int metallicLoc = uFace_.metallic;    // C32-A RealView material
+    const int metallicLoc = uFace_.metallic;
     const int roughnessLoc = uFace_.roughness;
-    // Bind the colormap LUT to texture unit 0.
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, lutTex_);
-    glUniform1i(uFace_.lut, 0);
-    // C28-C: multi-plane section clip (faces). Push all active planes as arrays.
-    {
-        int cnt = section_.count;
-        glUniform1i(uFace_.clipCount, cnt);
-        if (cnt > 0) {
-            glUniform3fv(uFace_.clipN,   cnt, section_.normals[0]);
-            glUniform1fv(uFace_.clipOff, cnt, section_.offsets);
-        }
-    }
-    glUniform1f(uFace_.realView, realView_ ? 1.0f : 0.0f);  // C30-C
-    glUniform1i(uFace_.zebra, zebra_ ? 1 : 0);              // Zebra stripes
-    glUniform1f(uFace_.zebraFreq, zebraFreq_);
     const int alphaLoc = uFace_.alpha;
+    if (!hlr) {
+        glUseProgram(prog_);
+        glUniformMatrix4fv(uFace_.mvp, 1, GL_FALSE, mvp.m);
+        glUniform3f(uFace_.keyDir, keyDir.x, keyDir.y, keyDir.z);
+        glUniform3f(uFace_.fillDir, fillDir.x, fillDir.y, fillDir.z);
+        glUniform3f(uFace_.rimDir, rimDir.x, rimDir.y, rimDir.z);
+        glUniform3f(uFace_.camPos, eye.x, eye.y, eye.z);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, lutTex_);
+        glUniform1i(uFace_.lut, 0);
+        glUniform1i(uFace_.clipCount, section_.count);
+        if (section_.count > 0) {
+            glUniform3fv(uFace_.clipN, section_.count, section_.normals[0]);
+            glUniform1fv(uFace_.clipOff, section_.count, section_.offsets);
+        }
+        glUniform1f(uFace_.realView, realView_ ? 1.0f : 0.0f);
+        glUniform1i(uFace_.zebra, zebra_ ? 1 : 0);
+        glUniform1f(uFace_.zebraFreq, zebraFreq_);
+    }
     // Per-feature edit-preview isolation: when a feature is being previewed (previewAlpha_ < 1 with a
     // non-empty owned-face set) ONLY that feature's faces draw translucent, in a second pass over the
     // opaque model. HLR forces everything opaque (its faces only write depth, no color).
     const bool isolate = (previewAlpha_ < 0.999f) && !previewFaces_.empty() && !hlr;
+    const bool mateGhost = mateGhosting();
+    const auto isMateGhost = [&](uint32_t id) {
+        return mateGhost && id != 0 &&
+               std::find(mateGhostBodies_.begin(), mateGhostBodies_.end(), id) != mateGhostBodies_.end();
+    };
 
 
     // Solids, pushed back a touch so the feature edges win the depth test on top of them.
     // In HLR styles the faces are painted in the background color so they only occlude (depth) —
     // the classic hidden-line look. (Wireframe skips faces entirely.)
     if (drawFaces) {
+        core::framestats::Scope timing("viewport_faces");
         glEnable(GL_POLYGON_OFFSET_FILL);
         glPolygonOffset(1.0f, 1.0f);
-        if (hlr) glUniform1i(useScalarLoc, 0);
-        if (hlr) glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+        if (hlr) {
+            glUseProgram(depthProg_);
+            glUniformMatrix4fv(uDepth_.mvp, 1, GL_FALSE, mvp.m);
+            glUniform1i(uDepth_.clipCount, section_.count);
+            if (section_.count > 0) {
+                glUniform3fv(uDepth_.clipN, section_.count, section_.normals[0]);
+                glUniform1fv(uDepth_.clipOff, section_.count, section_.offsets);
+            }
+            glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+        }
 
         // Pass 1 — (semi-)opaque: every body's faces, minus the edited feature's when isolating.
         // bodyAlpha_ < 1 (Mass Properties) draws the whole part translucent so COM/I/J markers show.
@@ -1589,16 +2063,31 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             glDepthMask(GL_FALSE);
             glUniform1f(alphaLoc, bodyAlpha_);
-        } else {
+        } else if (!hlr) {
             glUniform1f(alphaLoc, 1.0f);
         }
+        bool scalarConstantValid = false;
+        const bool offsetBodies = !bodyOffsets_.empty();
+        const int faceOffsetLoc = hlr ? uDepth_.offset : uFace_.offset;
+        bool faceShifted = false;
         for (const auto& s : subs_) {
             if (!s.visible) continue;   // Solid Bodies: hidden body draws nothing
+            if (isMateGhost(s.body_id)) continue;
+            if (offsetBodies) faceShifted |= applyBodyOffset(faceOffsetLoc, s);
+            if (hlr) {
+                glBindVertexArray(s.vao);
+                glDrawElements(GL_TRIANGLES, s.idxCount, GL_UNSIGNED_INT, nullptr);
+                continue;
+            }
+            if (!s.hasScalar && !scalarConstantValid)
+                glVertexAttrib1f(2, std::numeric_limits<float>::quiet_NaN());
+            scalarConstantValid = !s.hasScalar;
             bool useScalar = !hlr && colormap_ && s.hasScalar;
             glUniform1i(useScalarLoc, useScalar ? 1 : 0);
             if (useScalar) {
-                glUniform1f(sminLoc, s.scalarMin);
-                glUniform1f(smaxLoc, s.scalarMax);
+                glUniform1f(sminLoc, scalarDisplay_.fixedRange ? scalarDisplay_.min : s.scalarMin);
+                glUniform1f(smaxLoc, scalarDisplay_.fixedRange ? scalarDisplay_.max : s.scalarMax);
+                glUniform1i(uFace_.scalarReversed, scalarDisplay_.reversed ? 1 : 0);
             }
             glBindVertexArray(s.vao);
             if (!hlr && !useScalar) {
@@ -1610,6 +2099,7 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
                 drawSubFaces(s, 0, static_cast<uint32_t>(s.idxCount / 3), isolate ? 0 : -1);
             }
         }
+        if (faceShifted) glUniform3f(faceOffsetLoc, 0.0f, 0.0f, 0.0f);
         if (bodyGhost) {
             glUniform1f(alphaLoc, 1.0f);
             glDepthMask(GL_TRUE);
@@ -1633,11 +2123,35 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
             glUniform3f(colorLoc, tint[0], tint[1], tint[2]);
             glUniform1f(metallicLoc, 0.0f);                // matte dielectric for a clean tint
             glUniform1f(roughnessLoc, 0.5f);
+            bool isolateShifted = false;
             for (const auto& s : subs_) {
                 if (!s.visible || s.faces.empty()) continue;
+                if (offsetBodies) isolateShifted |= applyBodyOffset(uFace_.offset, s);
                 glBindVertexArray(s.vao);
                 drawSubFaces(s, 0, static_cast<uint32_t>(s.idxCount / 3), 1);
             }
+            if (isolateShifted) glUniform3f(uFace_.offset, 0.0f, 0.0f, 0.0f);
+            glUniform1f(alphaLoc, 1.0f);
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
+        }
+
+        // Mate references are transparent context, not occluders. Keep their own materials and
+        // test against opaque bodies, but do not write depth so a component behind remains visible.
+        if (mateGhost) {
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_FALSE);
+            glUniform1i(useScalarLoc, 0);
+            glUniform1f(alphaLoc, 0.40f);
+            bool mateShifted = false;
+            for (const auto& s : subs_) {
+                if (!s.visible || !isMateGhost(s.body_id)) continue;
+                if (offsetBodies) mateShifted |= applyBodyOffset(uFace_.offset, s);
+                glBindVertexArray(s.vao);
+                drawSubMaterials(s);
+            }
+            if (mateShifted) glUniform3f(uFace_.offset, 0.0f, 0.0f, 0.0f);
             glUniform1f(alphaLoc, 1.0f);
             glDepthMask(GL_TRUE);
             glDisable(GL_BLEND);
@@ -1713,6 +2227,7 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
     }
 
     if (drawEdges) {
+        core::framestats::Scope timing("viewport_edges");
         glUseProgram(edgeProg_);
         glUniformMatrix4fv(uEdge_.mvp, 1, GL_FALSE, mvp.m);
         const int eColorLoc = uEdge_.color;
@@ -1727,12 +2242,15 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
         }
         glLineWidth(edgeWidthPx_ * (float)SS);  // screen-space width after downsample
 
+        const bool offsetEdges = !bodyOffsets_.empty();
+        bool edgeShifted = false;
         // HiddenLinesVisible: first draw occluded edges dim (depth GL_GREATER), then visible edges.
         if (ds == DisplayStyle::HiddenLinesVisible) {
             glDepthFunc(GL_GREATER);
             glUniform3f(eColorLoc, 0.62f, 0.65f, 0.70f);  // dim grey for hidden edges
             for (const auto& s : subs_) {
                 if (!s.visible || s.edgeVerts <= 0) continue;
+                if (offsetEdges) edgeShifted |= applyBodyOffset(uEdge_.offset, s);
                 glBindVertexArray(s.edgeVao);
                 glDrawArrays(GL_LINES, 0, s.edgeVerts);
             }
@@ -1742,29 +2260,31 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
         glUniform3fv(eColorLoc, 1, edgeColor_);
         for (const auto& s : subs_) {
             if (!s.visible || s.edgeVerts <= 0) continue;
+            if (offsetEdges) edgeShifted |= applyBodyOffset(uEdge_.offset, s);
             glBindVertexArray(s.edgeVao);
             glDrawArrays(GL_LINES, 0, s.edgeVerts);
         }
+        if (edgeShifted) glUniform3f(uEdge_.offset, 0.0f, 0.0f, 0.0f);
         glBindVertexArray(0);
     }
+
+    // Reference scans are visual only: never feed these buffers to the ID pass.
+    drawMeshReferences(mvp, eye, keyDir, fillDir, rimDir);
 
     // ---- reference overlays (translucent; depthMask off so they never occlude solids) ----
     // Origin planes first, then non-axis datums, then axes LAST. Planes write no depth, so
     // draw order alone decides compositing: axes must land ON TOP of translucent plane fills
     // or they wash out to near-invisible grey under the quads. Axes still depth-test against
     // solid faces (depthMask stays off so they never occlude the mesh).
+    core::framestats::Scope datumTiming("viewport_datums");
     drawReferencePlanes(mvp);
+    refreshDatumBatch();
     drawRefDatums(mvp, /*axesOnly=*/false);
     {
         // Datum axes stay inside the viewport's clear rect when one is set (setDatumAxisClip):
         // the image runs under the glass columns and crisp dashed axes would cross pane text.
-        // Caller scissor state is saved and restored exactly.
         const bool axisClip = datumAxisClip_ && sw_ > 0 && sh_ > 0;
-        GLint prevBox[4] = {0, 0, 0, 0};
-        GLboolean prevScissor = GL_FALSE;
         if (axisClip) {
-            prevScissor = glIsEnabled(GL_SCISSOR_TEST);
-            glGetIntegerv(GL_SCISSOR_BOX, prevBox);
             const float* c = datumAxisClipUV_;
             const int x0 = (int)std::floor(c[0] * (float)sw_);
             const int x1 = (int)std::ceil(c[2] * (float)sw_);
@@ -1774,22 +2294,22 @@ void Renderer::drawCurrent(float yawDeg, float pitchDeg, float zoom) {
             glScissor(x0, y0, std::max(0, x1 - x0), std::max(0, y1 - y0));
         }
         drawRefDatums(mvp, /*axesOnly=*/true);
-        if (axisClip) {
-            glScissor(prevBox[0], prevBox[1], prevBox[2], prevBox[3]);
-            if (!prevScissor) glDisable(GL_SCISSOR_TEST);
-        }
+        if (axisClip) glDisable(GL_SCISSOR_TEST);
     }
+    datumTiming.stop();
 
-    endGpuTimer(sceneTimer_, sceneMs_, sceneTimingValid_);
+    if (gpuTimersEnabled_) endGpuTimer(sceneTimer_, sceneMs_, sceneTimingValid_);
+    // The scene already leaves depth on, blending/culling off, and VAO 0.
+    glDisable(GL_SCISSOR_TEST);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    completeFrame_ = true;
     resolvedDirty_ = true;
     backdropDirty_ = true;
 }
 
-// C27-D: render the current meshes from a candidate orientation into a small dedicated FBO and
-// return its color-texture id (for the View Selector hover preview). No supersampling, no ground
-// shadow / section / datum planes — just the lit solids + feature edges over a solid light bg, so
-// the candidate view reads at a glance. Cheap: a (yaw,pitch,meshes-revision) cache skips the
+// Render the current meshes from a candidate orientation into a small dedicated FBO and return
+// its color-texture id. No supersampling, ground shadow, section, or datum planes — just the lit
+// solids and feature edges. A (yaw,pitch,meshes-revision) cache skips the
 // re-render when nothing changed. CRITICALLY restores every GL state the main pass depends on:
 // the bound framebuffer (0), the full-window viewport is re-set by the next drawCurrent() (which
 // always binds fbo_ + sets glViewport), but we still leave GL in a clean, predictable state here.
@@ -1831,7 +2351,7 @@ unsigned int Renderer::renderThumbnail(float yawDeg, float pitchDeg, int px, boo
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LESS);
     if (transparentBg) glClearColor(0.0f, 0.0f, 0.0f, 0.0f);  // transparent icon tile
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glClear(GL_DEPTH_BUFFER_BIT | (transparentBg ? GL_COLOR_BUFFER_BIT : 0));
 
     if (transparentBg) {
         // Icon pipeline: no studio fill — leave the tile transparent so the lit part
@@ -1956,6 +2476,7 @@ std::vector<unsigned char> Renderer::readThumbnailRGBA(int px) const {
 // Drawn with alpha blending, depth-tested but not depth-writing (it sits under the geometry).
 void Renderer::drawGroundShadow(const Mat4& mvp, const Vec3& eye, const Vec3& up) {
     if (subs_.empty() || groundShadow_[3] <= 0.0f) return;
+    core::framestats::Scope timing("viewport_shadow");
     // Solid Bodies: the blob is one aggregate (not per-mesh) — drop it only when EVERYTHING is
     // hidden, so an empty-looking viewport doesn't keep a floating shadow.
     bool anyVisible = false;
@@ -2010,26 +2531,31 @@ void Renderer::drawGroundShadow(const Mat4& mvp, const Vec3& eye, const Vec3& up
 }
 
 void Renderer::setPlaneColors(const float fill[4], const float outline[4]) {
-    for (int i = 0; i < 4; ++i) { planeFill_[i] = fill[i]; planeOutline_[i] = outline[i]; }
+    for (int i = 0; i < 4; ++i) {
+        updateContent(planeFill_[i], fill[i]);
+        updateContent(planeOutline_[i], outline[i]);
+    }
 }
 
 void Renderer::setPlanes(const bool show[3], int emphasized) {
-    showPlane_[0] = show[0]; showPlane_[1] = show[1]; showPlane_[2] = show[2];
-    planeEmphasis_ = emphasized;
+    for (int i = 0; i < 3; ++i) updateContent(showPlane_[i], show[i]);
+    updateContent(planeEmphasis_, emphasized);
 }
 
 void Renderer::setSectionPlanes(const float n[][3], const float off[], int count,
                                 const float capRgb[3], bool showCap) {
     count = count < 1 ? 1 : (count > kMaxSectionPlanes ? kMaxSectionPlanes : count);
-    section_.count = count;
-    section_.showCap = showCap;
+    updateContent(section_.count, count);
+    updateContent(section_.showCap, showCap);
     for (int i = 0; i < count; ++i) {
         Vec3 nv = normalize(Vec3(n[i][0], n[i][1], n[i][2]));
-        section_.normals[i][0] = nv.x; section_.normals[i][1] = nv.y; section_.normals[i][2] = nv.z;
-        section_.offsets[i] = off[i];
+        updateContent(section_.normals[i][0], nv.x);
+        updateContent(section_.normals[i][1], nv.y);
+        updateContent(section_.normals[i][2], nv.z);
+        updateContent(section_.offsets[i], off[i]);
     }
-    if (capRgb) { section_.capRgb[0] = capRgb[0]; section_.capRgb[1] = capRgb[1];
-                  section_.capRgb[2] = capRgb[2]; }
+    if (capRgb)
+        for (int i = 0; i < 3; ++i) updateContent(section_.capRgb[i], capRgb[i]);
 }
 
 int Renderer::sectionClip(float normals[3][3], float offsets[3]) const {
@@ -2163,6 +2689,24 @@ float Renderer::refAxisHalfLength(const std::string& id) const {
     return render::refAxisHalfLength(id, effectiveSceneRadius() * 1.25f);
 }
 
+void Renderer::setRefDatums(std::vector<RefDatum> datums) {
+    const auto vecEqual = [](const Vec3& a, const Vec3& b) {
+        return a.x == b.x && a.y == b.y && a.z == b.z;
+    };
+    const auto equal = [&](const RefDatum& a, const RefDatum& b) {
+        return a.kind == b.kind && a.id == b.id && a.name == b.name &&
+            vecEqual(a.origin, b.origin) && vecEqual(a.dir, b.dir) &&
+            vecEqual(a.xdir, b.xdir) && vecEqual(a.ydir, b.ydir) &&
+            a.points.size() == b.points.size() &&
+            std::equal(a.points.begin(), a.points.end(), b.points.begin(), vecEqual);
+    };
+    if (refDatums_.size() == datums.size() &&
+        std::equal(refDatums_.begin(), refDatums_.end(), datums.begin(), equal)) return;
+    refDatums_ = std::move(datums);
+    ++datumsRevision_;
+    ++contentEpoch_;
+}
+
 // Rebuild + re-upload the batched datum geometry when any input changed. Inputs are the datum set
 // (revision), the FeatureManager-hidden ids, the selected / PM-edited datum, the scene half-extent
 // e, and the palette axis/accent roles — everything the build reads. The camera is NOT an input, so
@@ -2176,9 +2720,8 @@ void Renderer::refreshDatumBatch() {
         pal.axisZ[i] = ui::palette.axisZ[i];
         pal.accent[i] = ui::palette.accent[i];
     }
-    if (datumBatchValid_ && datumBatchRevision_ == datumsRevision_ && datumBatchExtent_ == e &&
-        datumBatchSelected_ == selectedDatumId_ && datumBatchEditing_ == editingDatumId_ &&
-        datumBatchPalette_ == pal && datumBatchHidden_ == hiddenDatums_)
+    if (datumBatchValid_ && datumBatchRevision_ == datumsRevision_ &&
+        datumBatchExtent_ == e && datumBatchPalette_ == pal)
         return;
 
     render::buildRefDatumBatch(refDatums_, hiddenDatums_, selectedDatumId_, editingDatumId_, e, pal,
@@ -2198,9 +2741,6 @@ void Renderer::refreshDatumBatch() {
     }
     datumBatchRevision_ = datumsRevision_;
     datumBatchExtent_ = e;
-    datumBatchSelected_ = selectedDatumId_;
-    datumBatchEditing_ = editingDatumId_;
-    datumBatchHidden_ = hiddenDatums_;
     datumBatchPalette_ = pal;
     datumBatchValid_ = true;
 }
@@ -2208,9 +2748,9 @@ void Renderer::refreshDatumBatch() {
 void Renderer::setDatumAxisClip(float u0, float v0, float u1, float v1) {
     u0 = std::clamp(u0, 0.0f, 1.0f); u1 = std::clamp(u1, u0, 1.0f);
     v0 = std::clamp(v0, 0.0f, 1.0f); v1 = std::clamp(v1, v0, 1.0f);
-    datumAxisClipUV_[0] = u0; datumAxisClipUV_[1] = v0;
-    datumAxisClipUV_[2] = u1; datumAxisClipUV_[3] = v1;
-    datumAxisClip_ = true;
+    updateContent(datumAxisClipUV_[0], u0); updateContent(datumAxisClipUV_[1], v0);
+    updateContent(datumAxisClipUV_[2], u1); updateContent(datumAxisClipUV_[3], v1);
+    updateContent(datumAxisClip_, true);
 }
 
 // Feature reference geometry: datum axes (lines), planes (quads), points (markers), and coordinate
@@ -2230,7 +2770,6 @@ void Renderer::setDatumAxisClip(float u0, float v0, float u1, float v1) {
 // dash, per cone triangle, per octahedron face — every frame.
 void Renderer::drawRefDatums(const Mat4& mvp, bool axesOnly) {
     if (refDatums_.empty() || planeProg_ == 0) return;
-    refreshDatumBatch();
     const std::vector<render::RefDatumDraw>& cmds =
         axesOnly ? datumBatch_.axis : datumBatch_.nonAxis;
     if (cmds.empty()) return;
@@ -2287,18 +2826,20 @@ void Renderer::drawSectionCap(const Mat4& mvp, int planeIdx) {
     glStencilOpSeparate(GL_FRONT, GL_KEEP, GL_KEEP, GL_INCR_WRAP);
     glStencilOpSeparate(GL_BACK,  GL_KEEP, GL_KEEP, GL_DECR_WRAP);
 
-    // Reuse the face program — all active clip planes already set from drawCurrent.
-    glUseProgram(prog_);
-    glUniformMatrix4fv(uFace_.mvp, 1, GL_FALSE, mvp.m);
-    glUniform1i(uFace_.clipCount, section_.count);
-    glUniform3fv(uFace_.clipN,   section_.count, section_.normals[0]);
-    glUniform1fv(uFace_.clipOff, section_.count, section_.offsets);
-    glUniform1i(uFace_.useScalar, 0);
+    glUseProgram(depthProg_);
+    glUniformMatrix4fv(uDepth_.mvp, 1, GL_FALSE, mvp.m);
+    glUniform1i(uDepth_.clipCount, section_.count);
+    glUniform3fv(uDepth_.clipN, section_.count, section_.normals[0]);
+    glUniform1fv(uDepth_.clipOff, section_.count, section_.offsets);
+    const bool offsetBodies = !bodyOffsets_.empty();
+    bool shifted = false;
     for (const auto& s : subs_) {
         if (!s.visible) continue;   // hidden body never marks the cap stencil
+        if (offsetBodies) shifted |= applyBodyOffset(uDepth_.offset, s);
         glBindVertexArray(s.vao);
         glDrawElements(GL_TRIANGLES, s.idxCount, GL_UNSIGNED_INT, 0);
     }
+    if (shifted) glUniform3f(uDepth_.offset, 0.0f, 0.0f, 0.0f);
     glBindVertexArray(0);
 
     // ---- pass B: paint the cap quad where stencil != 0 ----
@@ -2344,96 +2885,91 @@ void Renderer::drawSectionCap(const Mat4& mvp, int planeIdx) {
 }
 
 void Renderer::beginOverlay() {
+    reusedFrame_ = false;
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
     glViewport(0, 0, sw_, sh_);
+    // Overlay scopes own any narrower clip and return to this baseline.
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_SCISSOR_TEST);
 }
 
-void Renderer::endOverlay() {
+void Renderer::endOverlay(bool drew) {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    resolvedDirty_ = true;
-    backdropDirty_ = true;
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_CULL_FACE);
+    if (drew) {
+        resolvedDirty_ = true;
+        backdropDirty_ = true;
+    }
 }
 
 void Renderer::renderView(const std::string& view) {
     float yaw, pitch;
     eyeForView(view, yaw, pitch);
-    pan_ = Vec3();  // named views look at the model center
+    updateCamera(yaw, pitch, 1.0f, Vec3());
     drawCurrent(yaw, pitch, 1.0f);
 }
 
 void Renderer::renderOrbit(float yawDeg, float pitchDeg, float zoom) {
-    pan_ = Vec3();
+    updateCamera(yawDeg, pitchDeg, zoom, Vec3());
     drawCurrent(yawDeg, pitchDeg, zoom);
 }
 
 void Renderer::renderOrbit(float yawDeg, float pitchDeg, float zoom, const float pan[3]) {
-    pan_ = pan ? Vec3(pan[0], pan[1], pan[2]) : Vec3();
+    updateCamera(yawDeg, pitchDeg, zoom, pan ? Vec3(pan[0], pan[1], pan[2]) : Vec3());
     drawCurrent(yawDeg, pitchDeg, zoom);
 }
 
+void Renderer::updateCamera(float yaw, float pitch, float zoom, const Vec3& pan) {
+    if (!cameraInitialized_) { cameraInitialized_ = true; ++contentEpoch_; }
+    updateContent(cameraYaw_, yaw);
+    updateContent(cameraPitch_, pitch);
+    updateContent(cameraZoom_, zoom);
+    updateContent(pan_.x, pan.x);
+    updateContent(pan_.y, pan.y);
+    updateContent(pan_.z, pan.z);
+}
+
 void Renderer::resolveColorTexture() const {
-    if (!resolvedDirty_ || !resolveFbo_ || !resolvedTex_) return;
-#ifdef CHUDWARE_GLES3
-    // Multisampled path: resolve via blit (WebGL2 requires NEAREST for MSAA resolve).
-    if (msaaSamples_ > 0) {
-        GLint prevFbo = 0;
-        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo_);
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, resolveFbo_);
-        glBlitFramebuffer(0, 0, rw_, rh_, 0, 0, rw_, rh_, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-        glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
-        resolvedDirty_ = false;
-        backdropDirty_ = true;
-        return;
-    }
-    // Single-sample fallback (SS==1): 1:1 box filter via resolveProg_.
-#endif
-    if (!colorTex_ || !resolveProg_) return;
-
-    GLint prevFbo = 0, prevViewport[4] = {0, 0, 0, 0}, prevProgram = 0;
-    GLint prevActiveTex = 0, prevTex0 = 0;
-    GLboolean prevDepthTest = glIsEnabled(GL_DEPTH_TEST);
-    GLboolean prevBlend = glIsEnabled(GL_BLEND);
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
-    glGetIntegerv(GL_VIEWPORT, prevViewport);
-    glGetIntegerv(GL_CURRENT_PROGRAM, &prevProgram);
-    glGetIntegerv(GL_ACTIVE_TEXTURE, &prevActiveTex);
-    glActiveTexture(GL_TEXTURE0);
-    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex0);
-
-    glBindFramebuffer(GL_FRAMEBUFFER, resolveFbo_);
-    glViewport(0, 0, rw_, rh_);
-    glDisable(GL_DEPTH_TEST);
+    if (!resolvedDirty_ || !resolveFbo_ || !resolvedTex_ || !colorTex_ || !resolveProg_) return;
+    core::framestats::Scope timing("viewport_resolve");
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_CULL_FACE);
     glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+#ifdef CHUDWARE_GLES3
+    if (msaaSamples_ > 0) {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo_);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, msaaResolveFbo_);
+        glBlitFramebuffer(0, 0, rw_, rh_, 0, 0, rw_, rh_, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    }
+#endif
+    glBindFramebuffer(GL_FRAMEBUFFER, resolveFbo_);
+    // Fuse the one-pixel clamp border into this draw, rather than self-copying the texture.
+    glViewport(0, 0, rw_ + (rw_ < targetW_), rh_ + (rh_ < targetH_));
     glUseProgram(resolveProg_);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, colorTex_);
     glUniform1i(uResolve_.src, 0);
     glUniform1i(uResolve_.ss, SS);
+    glUniform2i(uResolve_.dstSize, rw_, rh_);
     glBindVertexArray(bgVao_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
-    glBindVertexArray(0);
-
-    glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
-    glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
-    glUseProgram((GLuint)prevProgram);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, (GLuint)prevTex0);
-    glActiveTexture((GLenum)prevActiveTex);
-    if (prevDepthTest) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
-    if (prevBlend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
-
+    restoreIdleGlState();
     resolvedDirty_ = false;
     backdropDirty_ = true;
 }
 
 void Renderer::updateBackdropBlur() const {
     if (!backdropDirty_ || !resolvedTex_ || !downsampleProg_ || !kawaseProg_) return;
-    const int bw = std::max(1, rw_ / 4);
-    const int bh = std::max(1, rh_ / 4);
-    if (bw != blurW_ || bh != blurH_) {
-        blurW_ = bw;
-        blurH_ = bh;
+    core::framestats::Scope timing("viewport_blur");
+    blurW_ = std::max(1, rw_ / 4);
+    blurH_ = std::max(1, rh_ / 4);
+    const int bw = std::max(1, targetW_ / 4);
+    const int bh = std::max(1, targetH_ / 4);
+    if (bw > blurTargetW_ || bh > blurTargetH_) {
+        blurTargetW_ = std::max(bw, blurTargetW_);
+        blurTargetH_ = std::max(bh, blurTargetH_);
         auto allocTex = [](unsigned int& tex, int tw, int th) {
             if (!tex) glGenTextures(1, &tex);
             glBindTexture(GL_TEXTURE_2D, tex);
@@ -2449,25 +2985,17 @@ void Renderer::updateBackdropBlur() const {
             glBindFramebuffer(GL_FRAMEBUFFER, fbo);
             glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
         };
-        allocTex(blurDownTex_, bw, bh);
+        allocTex(blurDownTex_, blurTargetW_, blurTargetH_);
         allocFbo(blurDownFbo_, blurDownTex_);
-        allocTex(blurPingTex_[0], bw, bh);
+        allocTex(blurPingTex_[0], blurTargetW_, blurTargetH_);
         allocFbo(blurPingFbo_[0], blurPingTex_[0]);
-        allocTex(blurPingTex_[1], bw, bh);
+        allocTex(blurPingTex_[1], blurTargetW_, blurTargetH_);
         allocFbo(blurPingFbo_[1], blurPingTex_[1]);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
 
-    GLint prevFbo = 0, prevViewport[4] = {0, 0, 0, 0}, prevProgram = 0;
-    GLint prevActiveTex = 0, prevTex0 = 0;
-    GLboolean prevDepthTest = glIsEnabled(GL_DEPTH_TEST);
-    GLboolean prevBlend = glIsEnabled(GL_BLEND);
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
-    glGetIntegerv(GL_VIEWPORT, prevViewport);
-    glGetIntegerv(GL_CURRENT_PROGRAM, &prevProgram);
-    glGetIntegerv(GL_ACTIVE_TEXTURE, &prevActiveTex);
-    glActiveTexture(GL_TEXTURE0);
-    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex0);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_CULL_FACE);
 
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_BLEND);
@@ -2480,7 +3008,10 @@ void Renderer::updateBackdropBlur() const {
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, resolvedTex_);
     glUniform1i(uDown_.src, 0);
-    glUniform2f(uDown_.invDstSize, 1.0f / (float)blurW_, 1.0f / (float)blurH_);
+    glUniform2f(uDown_.scale, float(rw_) / (float(targetW_) * blurW_),
+                             float(rh_) / (float(targetH_) * blurH_));
+    glUniform2f(uDown_.uvMin, 0.5f / targetW_, 0.5f / targetH_);
+    glUniform2f(uDown_.uvMax, (rw_ - 0.5f) / targetW_, (rh_ - 0.5f) / targetH_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
     unsigned int srcTex = blurDownTex_;
@@ -2488,39 +3019,38 @@ void Renderer::updateBackdropBlur() const {
         unsigned int dstFbo = blurPingFbo_[pass & 1];
         unsigned int dstTex = blurPingTex_[pass & 1];
         glBindFramebuffer(GL_FRAMEBUFFER, dstFbo);
-        glViewport(0, 0, blurW_, blurH_);
+        const bool last = pass == blurPasses_ - 1;
+        glViewport(0, 0, blurW_ + (last && blurW_ < blurTargetW_),
+                         blurH_ + (last && blurH_ < blurTargetH_));
         glUseProgram(kawaseProg_);
         glBindTexture(GL_TEXTURE_2D, srcTex);
         glUniform1i(uKawase_.src, 0);
-        glUniform2f(uKawase_.texel, 1.0f / (float)blurW_, 1.0f / (float)blurH_);
+        glUniform2f(uKawase_.texel, 1.0f / blurTargetW_, 1.0f / blurTargetH_);
         glUniform1f(uKawase_.offset, 1.0f + (float)pass);
+        glUniform2f(uKawase_.uvMax, (blurW_ - 0.5f) / blurTargetW_,
+                                   (blurH_ - 0.5f) / blurTargetH_);
         glDrawArrays(GL_TRIANGLES, 0, 3);
         srcTex = dstTex;
     }
 
-    glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
-    glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
-    glUseProgram((GLuint)prevProgram);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, (GLuint)prevTex0);
-    glActiveTexture((GLenum)prevActiveTex);
-    glBindVertexArray(0);
-    if (prevDepthTest) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
-    if (prevBlend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+    restoreIdleGlState();
 
     backdropDirty_ = false;
 }
 
 ViewportBackdrop Renderer::backdrop() const {
-    resolveColorTexture();
-    if (backdropEnabled_) {
-        beginGpuTimer(blurTimer_);
+    if (!reusedFrame_) resolveColorTexture();
+    if (backdropEnabled_ && !reusedFrame_ && backdropDirty_) {
+        if (gpuTimersEnabled_) beginGpuTimer(blurTimer_);
         updateBackdropBlur();
-        endGpuTimer(blurTimer_, blurMs_, blurTimingValid_);
+        if (gpuTimersEnabled_) endGpuTimer(blurTimer_, blurMs_, blurTimingValid_);
 
-        beginGpuTimer(lumaTimer_);
+        if (gpuTimersEnabled_) beginGpuTimer(lumaTimer_);
         issueLumaReadback();
-        endGpuTimer(lumaTimer_, lumaMs_, lumaTimingValid_);
+        if (gpuTimersEnabled_) endGpuTimer(lumaTimer_, lumaMs_, lumaTimingValid_);
+    } else {
+        // Consume already-issued reads without issuing new GPU work on a reused frame.
+        pollLumaPbos();
     }
     ViewportBackdrop bd;
     if (!backdropEnabled_ || blurW_ <= 0 || blurH_ <= 0) return bd;
@@ -2530,9 +3060,15 @@ ViewportBackdrop Renderer::backdrop() const {
     bd.textureId = static_cast<std::uintptr_t>(tex);
     bd.uvMin[0] = 0.f;
     bd.uvMin[1] = 0.f;
-    bd.uvMax[0] = 1.f;
-    bd.uvMax[1] = 1.f;
+    bd.uvMax[0] = float(blurW_) / blurTargetW_;
+    bd.uvMax[1] = float(blurH_) / blurTargetH_;
     return bd;
+}
+
+bool Renderer::backdropReadbackPending() const {
+    for (int i = 0; i < kLumaPboCount; ++i)
+        if (lumaPboPending_[i] && lumaFence_[i]) return true;
+    return false;
 }
 
 // F1: pure CPU box-average of the cached async luminance grid (see reduceLumaPbo()). ZERO GL
@@ -2659,19 +3195,20 @@ GlassTimings Renderer::glassTimings() const {
     t.sceneMs = sceneMs_;
     t.blurMs = blurMs_;
     t.lumaMs = lumaMs_;
-    t.valid = sceneTimingValid_ && blurTimingValid_ && lumaTimingValid_;
+    t.valid = gpuTimersEnabled_ && sceneTimingValid_ && blurTimingValid_ && lumaTimingValid_;
     return t;
 }
 
 void Renderer::setBackdropEnabled(bool on) {
     if (on && !backdropEnabled_) lumaSrcFbo_ = 0;  // refresh after a hidden/drawing workspace
-    backdropEnabled_ = on;
+    updateContent(backdropEnabled_, on);
 }
 
 // A9/A12: source selection + cadence for the async luminance readback. Called once per
 // backdrop() frame while enabled; backdrop() brackets this with the luma GPU timer.
 void Renderer::issueLumaReadback() const {
     if (!backdropEnabled_) return;  // disabled means no readback at all.
+    core::framestats::Scope timing("viewport_luma");
 
     // Select the source before polling: old-generation fences must never publish into a
     // resized viewport or a different quality step's blur output.
@@ -2703,31 +3240,22 @@ void Renderer::issueLumaReadback() const {
             }
             lumaPboPending_[i] = false;
         }
-        lumaEverRead_ = false;
         lumaSrcFbo_ = srcFbo;
     }
     pollLumaPbos();
     issueLumaPboRead(srcFbo, srcW, srcH);
-    // A replacement canvas invalidates contrast history. Do not publish a new pale native
-    // backdrop while its only contrast information is still "unknown" (palette-white ink).
-    // Establish its first grid from the actual rendered source; every subsequent read stays
-    // asynchronous. A resize/source transition needs the same one-time bootstrap.
-    if (!lumaEverRead_) pollLumaPbos(/*bootstrap=*/true);
+    // Resize/source transitions keep the published grid until an async replacement is ready.
 }
 
-// A11: issues one glReadPixels into the next PBO ring slot + a fence. Detects a source-size
-// change (blur resize, or a switch between the blur/fallback sources) and re-specs every slot's
-// storage before issuing, dropping any outstanding fences from the old generation WITHOUT mapping
-// them first (their data no longer matches the new dimensions).
+// Issue into the PBO ring; dimensions change each read's row stride, not the grow-only capacity.
 void Renderer::issueLumaPboRead(unsigned int srcFbo, int srcW, int srcH) const {
 #ifdef __EMSCRIPTEN__
     // WebGL2 cannot map a PBO for readback. Read the active blur output into CPU scratch;
     // unavailable/failed reads must never be reduced as black pixels or a previous image.
     if (srcW <= 0 || srcH <= 0) return;
-    // A synchronous glReadPixels forces a GPU pipeline flush (measurable jank on weak iGPUs),
-    // so throttle unchanged-source reads. A resize/quality/source transition invalidates
-    // lumaEverRead_ above and MUST refresh immediately instead of reusing the old grid.
-    if (lumaEverRead_ && (++lumaWebCounter_ % 32) != 0) return;
+    // WebGL's synchronous fallback stays throttled except when the source size changes.
+    const bool sizeChanged = srcW != lumaSrcW_ || srcH != lumaSrcH_;
+    if (lumaEverRead_ && !sizeChanged && (++lumaWebCounter_ % 32) != 0) return;
     lumaSrcW_ = srcW;
     lumaSrcH_ = srcH;
     const size_t need = (size_t)srcW * (size_t)srcH * 4;
@@ -2773,7 +3301,10 @@ void Renderer::issueLumaPboRead(unsigned int srcFbo, int srcW, int srcH) const {
     lumaW_ = gw; lumaH_ = gh; lumaEverRead_ = true;
     return;
 #endif
-    if (srcW != lumaSrcW_ || srcH != lumaSrcH_) {
+    const size_t needed = size_t(srcW) * size_t(srcH) * 4;
+    const bool grow = needed > lumaPboCapacity_;
+    if (grow) lumaPboCapacity_ = ((needed + 65535) / 65536) * 65536;
+    if (grow || srcW != lumaSrcW_ || srcH != lumaSrcH_) {
         for (int i = 0; i < kLumaPboCount; ++i) {
             if (lumaFence_[i]) {
                 glDeleteSync(static_cast<GLsync>(lumaFence_[i]));
@@ -2781,9 +3312,10 @@ void Renderer::issueLumaPboRead(unsigned int srcFbo, int srcW, int srcH) const {
             }
             lumaPboPending_[i] = false;
             if (!lumaPbo_[i]) glGenBuffers(1, &lumaPbo_[i]);
-            glBindBuffer(GL_PIXEL_PACK_BUFFER, lumaPbo_[i]);
-            glBufferData(GL_PIXEL_PACK_BUFFER, (size_t)srcW * (size_t)srcH * 4, nullptr,
-                         GL_STREAM_READ);
+            if (grow) {
+                glBindBuffer(GL_PIXEL_PACK_BUFFER, lumaPbo_[i]);
+                glBufferData(GL_PIXEL_PACK_BUFFER, lumaPboCapacity_, nullptr, GL_STREAM_READ);
+            }
             lumaPboW_[i] = srcW;
             lumaPboH_[i] = srcH;
         }
@@ -2814,17 +3346,14 @@ void Renderer::issueLumaPboRead(unsigned int srcFbo, int srcW, int srcH) const {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
-// Poll every ring slot without blocking in steady state. A new source's first grid waits once
-// so resumed native geometry and its glass contrast are published as the same actual image.
-void Renderer::pollLumaPbos(bool bootstrap) const {
+// Every poll is nonblocking, including the first frame and live resize.
+void Renderer::pollLumaPbos() const {
     // Oldest first: numeric slot order can publish an older frame after a newer one
     // when the ring wraps and several fences become ready together.
     for (int n = 0; n < kLumaPboCount; ++n) {
         const int i = (lumaPboNext_ + n) % kLumaPboCount;
         if (!lumaPboPending_[i] || !lumaFence_[i]) continue;
-        const GLenum res = glClientWaitSync(static_cast<GLsync>(lumaFence_[i]),
-                                            bootstrap ? GL_SYNC_FLUSH_COMMANDS_BIT : 0,
-                                            bootstrap ? GL_TIMEOUT_IGNORED : 0);
+        const GLenum res = glClientWaitSync(static_cast<GLsync>(lumaFence_[i]), 0, 0);
         if (res == GL_ALREADY_SIGNALED || res == GL_CONDITION_SATISFIED) {
             glDeleteSync(static_cast<GLsync>(lumaFence_[i]));
             lumaFence_[i] = nullptr;

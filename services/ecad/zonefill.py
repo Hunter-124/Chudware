@@ -44,19 +44,17 @@ copper-to-obstacle gap is at least ``clearance - res/2`` and at most ``clearance
 ``resolution`` → finer fidelity at quadratic cost. This is intentionally a fab-preview-grade fill,
 not an analytic polygon offset.
 
-filled_polys convention (matches fab/gerber.py G36 emission)
-============================================================
+filled_polys convention
+=======================
 ``zone["filled_polys"]`` is a flat ``list`` of *simple* polygons, each ``[[x, y], ...]`` (no
-explicit hole arrays, no nesting). ``fab/gerber.py`` emits **one G36/G37 solid region per polygon**
-with no clear-polarity, so every polygon we emit is filled solid. Therefore:
+explicit hole arrays, no nesting). Every polygon represents a filled solid region. Therefore:
 
   * Disjoint copper islands are separate polygons.
   * A hole *inside* a copper island (a fully-enclosed clearance void) is folded into that island's
     single polygon via a zero-width keyhole bridge: the ring runs out to the hole, around it in the
     opposite sense, and back along the same seam. Filled solid, the seam closes on itself and the
-    hole reads as bare laminate — exactly how KiCad serialises pours-with-holes for solid-fill
-    Gerber. We therefore never emit a separate "hole" polygon that the gerber writer would wrongly
-    flood with copper.
+    hole reads as bare laminate. We therefore never emit a separate "hole" polygon that would
+    be interpreted as a filled region.
 
 Public API
 ----------

@@ -1,9 +1,7 @@
 # Simulation Credibility and External Accreditation Program
 
-**Status:** Proposed program; internal implementation is incomplete and no external approval has been obtained  
-**Program owner:** Simulation Assurance Lead  
-**Quality owner:** Quality Management Lead (role not yet staffed)  
-**Effective date:** 2026-08-24
+**Status:** Internal evidence is not yet accepted for S1 under this program; no external
+accreditation or certification has been obtained.
 
 ## 1. Boundary of the program
 
@@ -56,19 +54,16 @@ customer result.
 
 ## 3. Code-complete work versus accepted evidence
 
-A merged implementation proves only that code exists. It does not prove a numerical result.
-The following states are tracked independently:
+A merged implementation proves only that code exists; it does not prove a numerical result.
+S1 requires current, revision-bound benchmark evidence accepted under this program, including
+unexplained failures and unexpected skips resolved rather than hidden in an aggregate percentage.
+External accreditation requires a separate decision from the relevant independent body.
 
-| Deliverable | Code state | Evidence state at program issue | Completion rule |
-|---|---|---|---|
-| Registry and claim guard | Implemented in source | No production evidence registry is supplied; therefore S0 by default | Focused contract tests pass and a release owner approves the registry location/retention policy |
-| General V&V harness | Existing | Existing reports include visible failures/skips; they are not promoted by this document | Current full run records exact sources/revisions and has zero unexplained FAIL or unexpected SKIP |
-| PolyMesh/Polyhedral-FEA family | Harness cases implemented | Not executed or registered by this document | Both clean-room cases execute on the shipped binary, identify the binary hash and the pinned Polyhedral-FEA fork revision, and meet their declared tolerances |
-| External QMS/accreditation | No qualifying repository implementation | Not started | Written external scope and decision from the relevant independent body |
-
-The known FEA uniform-pressure failure remains a failure/xfail until its root cause is fixed and
-the unchanged reference passes. It must not be removed, converted to a skip, or hidden in an
-aggregate percentage.
+The native FEA uniform-pressure defect caused by unoriented fan normals has been fixed by orienting
+them outward against the element centroid. The pressure/force consistency regression in
+`services/mcp/test_fea_static_suite.py` retains a dynamic xfail as a tripwire for recurrence;
+`benchmarks/simsuite/fea_static_cases.py` retains the native-pressure benchmark. The fix and
+tripwire alone do not constitute S1 acceptance.
 
 ## 4. Simulation-family evidence matrix
 
@@ -94,20 +89,16 @@ PolyMesh is a mesher path into Chudware's supported tet4/tet10 solver contract. 
 fork lineage do not mean that Chudware executed a VEM or general polyhedral-element
 solve. The benchmark report must state both the solver source and the exact linked-binary hash.
 
-## 5. Measurable internal gates and milestones
+## 5. Internal evidence gates
 
-Dates are targets, not completion statements. A gate closes only when its evidence ids are in
-the registry and the evidence-review record names the approver.
-
-| Gate | Measure | Owner | Target milestone | Current state |
-|---|---|---|---|---|
-| I0 — Registry integrity | 100% of tier derivations revision-bound; corrupt/expired/invalidated registries yield S0; forbidden claim-label fixtures rejected | Simulation Platform Owner | 2026-09-04 | Implementation present; acceptance run pending |
-| I1 — Inventory | 100% of released simulation entry points mapped to exactly one family owner and S0-S3 state | Simulation Assurance Lead | 2026-09-11 | Not started |
-| I2 — Reproducible S1 | Full harness records solver source/hash, reference id, units, tolerance, seed/environment; zero unexplained FAIL and zero unexpected SKIP on two clean machines | V&V Harness Owner | 2026-09-25 | Not achieved; known FEA pressure failure remains open |
-| I3 — Cross-solver S2 | At least two geometrically/materially distinct cases per family; independent revision captured; differences within predeclared bounds; dependency chain registered | Each Family Owner | 2026-10-23 | Not started |
-| I4 — Sensitivity/uncertainty | Mesh/time-step/order study has at least three levels; observed convergence and numerical uncertainty recorded for every scalar claim | Numerical Methods Owner | 2026-11-13 | Not started |
-| I5 — Field S3 pilot | At least one predeclared dataset per candidate family; sensor calibration, uncertainty, exclusions, and residual metrics reviewed independently | Test Engineering Owner | 2026-12-18 | Not started |
-| I6 — Release control | 100% of solver/model changes invalidate affected evidence before release; quarterly expiry review has no overdue active record | Release Quality Owner | First review 2027-01-08, then quarterly | Not started |
+A gate closes only when its evidence ids are in the registry and the evidence-review record
+names the approver. Evidence must identify the solver source and binary hash, reference,
+units, tolerances, seed and environment, with no unexplained failure or unexpected skip.
+Cross-solver claims require at least two geometrically and materially distinct cases per family,
+an independent solver revision and predeclared comparison bounds. Mesh, time-step or order
+studies require at least three levels, with convergence and numerical uncertainty recorded.
+Field correlation requires a predeclared dataset, calibration, uncertainty, exclusions and
+independent review. Solver or model changes invalidate affected evidence.
 
 Recommended quantitative pass criteria are defined before observing results. At minimum: no
 NaN/inf, conservation residual within the family limit, all declared tolerance checks pass,
@@ -121,13 +112,6 @@ The [ISO 9000 family overview](https://www.iso.org/standards/popular/iso-9000-fa
 primary orientation source. Selection of ISO 9001 and any sector-specific extension must follow
 market/scope analysis and licensed review, not assumptions in code.
 
-| Milestone | Objective and measurable exit | Owner | Target | State |
-|---|---|---|---|---|
-| Q0 — Scope decision | Approved product/site/legal-entity scope; target markets and excluded uses listed; applicable QMS scheme chosen | Executive Sponsor + Quality Lead | 2026-09-18 | Not started |
-| Q1 — Independent gap assessment | Contracted qualified assessor; 100% of applicable clauses mapped to owner/evidence/gap; remediation plan approved | Quality Lead | 2026-10-16 | Not started |
-| Q2 — Controlled QMS | Document control, design control, risk, supplier control, training, nonconformance, CAPA, internal audit, and management review procedures operating with named owners | Process Owners | 2027-01-29 | Not started |
-| Q3 — Record period | At least one complete internal-audit and management-review cycle; CAPAs have effectiveness checks; training records current | Quality Lead | 2027-04-30 | Not started |
-| Q4 — External audit readiness | Independent readiness review finds no unresolved major gap; audit scope and body contract approved | Executive Sponsor + Quality Lead | 2027-05-28 | Not started |
 
 Sector schemes such as aerospace or medical-device QMS are separate scope decisions. They are
 not inherited from a generic quality program and are not implied here.
@@ -139,14 +123,6 @@ explains that the standard concerns testing and calibration laboratory competenc
 accredited result may support a field-correlation evidence record only when the measurement is
 inside that laboratory's current scope; it does not approve the application or solver.
 
-| Milestone | Objective and measurable exit | Owner | Target | State |
-|---|---|---|---|---|
-| E0 — Claims/scope counsel | Written advice identifies intended claims, jurisdictions, schemes, prohibited interim language, and evidence-retention duties | Legal/Compliance Owner | 2026-09-25 | Not started |
-| E1 — Body shortlist | At least three candidate bodies/laboratories assessed for recognized scope, competence, conflicts, geography, schedule, and cost | Quality Lead + Procurement | 2026-10-30 | Not started |
-| E2 — Pre-application meeting | Written minutes confirm proposed product/QMS/lab scope, required records, exclusions, and whether the desired claim is available | Executive Sponsor | 2026-11-20 | Not started |
-| E3 — Witness plan | Signed test plan fixes samples, revisions, uncertainty, acceptance criteria, chain of custody, retest rules, and report ownership | Test Engineering + External Body | 2027-02-26 | Not started |
-| E4 — Assessment | All findings logged; zero open major nonconformities before any external-status claim | Quality Lead | Date set by contracted body | Not scheduled |
-| E5 — Ongoing surveillance | Scope/status checked before every public claim; surveillance dates and corrective actions tracked; expired scope removes the claim immediately | Quality Lead | Only after a written grant | Not applicable yet |
 
 NAFEMS publishes [code-verification and vendor-benchmark information](https://www.nafems.org/publications/code-verification/)
 that may inform benchmark selection without bundling proprietary publications. NAFEMS PSE is an

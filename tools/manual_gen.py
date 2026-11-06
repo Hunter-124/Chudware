@@ -6,12 +6,13 @@ Composes ``docs/manual/*.md`` (and, on request, a rendered ``user_manual`` PDF/D
 prose:
 
 - ``scripts/feature_surface_audit.ribbon_rows`` — every ribbon command (id/label/tab/group),
-  so the "Commands Reference" section covers 100% of the UI surface.
+  used for the Commands Reference inventory headings.
 - ``services.mcp.cad_tools.cad_guide_text`` — the agent's own modeling-guide prose: the
   ``overview`` topic becomes ``overview.md``; every topic in ``GUIDE_TOPICS`` becomes
   ``guide-<topic>.md``. Per-command, its per-feature cheatsheets (``fillet``, ``chamfer``,
   ``shell``, ...) are used when one exists for a ribbon command's id.
-- ``contracts/*.md`` — a one-line-per-contract summary (filename + its first ``# `` heading).
+- Top-level ``contracts/*.md`` — a one-line-per-file inventory (filename + first ``# `` heading).
+  Nested files and machine-readable contracts are excluded.
 
 Provenance rule (no fabrication): a ribbon command gets a real description ONLY when
 ``cad_guide_text(command_id)`` resolves to actual cheatsheet prose (checked by absence of the
@@ -169,7 +170,8 @@ def build_markdown(data: dict) -> dict[str, str]:
 
     # ---- index.md ----
     lines = ["# Chudware User Manual", "", "Auto-generated from the ribbon command inventory, the",
-             "in-app modeling guide, and the frozen contract set — see `tools/manual_gen.py`.",
+             "in-app modeling guide, and the top-level `contracts/*.md` inventory — see `tools/manual_gen.py`.",
+             "Nested files and machine-readable contracts are excluded.",
              "", "## Contents", "", "- [Overview](overview.md)", "- [Commands Reference](commands.md)"]
     for topic in GUIDE_TOPICS:
         lines.append(f"- [Guide: {topic.capitalize()}](guide-{topic}.md)")
@@ -211,7 +213,7 @@ def build_markdown(data: dict) -> dict[str, str]:
 
     # ---- contracts.md ----
     lines = ["# Contracts Summary", "",
-             f"{len(contracts)} frozen contracts under `contracts/`:", ""]
+             f"{len(contracts)} top-level `contracts/*.md` files; nested files and machine-readable contracts are excluded:", ""]
     for c in contracts:
         heading = c["heading"] or "(no heading found)"
         lines.append(f"- `{c['filename']}` — {heading}")
@@ -276,7 +278,8 @@ def build_report_spec(data: dict, fmt: str = "pdf") -> dict:
         {"type": "title", "body": [
             "Chudware User Manual",
             "Auto-generated from the ribbon command inventory, the in-app modeling guide, "
-            "and the frozen contract set.",
+            "and the top-level contracts/*.md inventory. Nested files and machine-readable "
+            "contracts are excluded.",
         ]},
         {"type": "section", "heading": "Overview",
          "body": [ln for ln in guide[OVERVIEW_TOPIC].splitlines() if ln.strip()]},
@@ -290,8 +293,9 @@ def build_report_spec(data: dict, fmt: str = "pdf") -> dict:
         outline.append({"type": "section", "heading": f"Guide: {topic.capitalize()}",
                          "body": [ln for ln in guide[topic].splitlines() if ln.strip()]})
 
-    contracts_body = [f"{c['filename']} — {c['heading'] or '(no heading found)'}"
-                       for c in contracts]
+    contracts_body = ["Top-level contracts/*.md inventory; nested files and machine-readable "
+                      "contracts are excluded."] + [
+        f"{c['filename']} — {c['heading'] or '(no heading found)'}" for c in contracts]
     outline.append({"type": "section", "heading": "Contracts Summary", "body": contracts_body})
 
     return {

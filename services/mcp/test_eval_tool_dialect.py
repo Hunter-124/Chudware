@@ -505,12 +505,21 @@ def test_undiagnosable_no_bodies_says_so_instead_of_guessing(empty, monkeypatch)
 def test_datum_plane_axis_pairs_are_accepted(part):
     """"XY"/"xz" died on `plane 'xy' is not a reserved planar datum`."""
     top = _call("check_symmetry", plane="XY", doc_id=part)
-    assert top["ok"] is True and top["plane"] == "top"
+    canonical = _call("check_symmetry", plane="top", doc_id=part)
+    assert top["ok"] is True and canonical["ok"] is True
+    assert top["symmetric"] == canonical["symmetric"]
+    assert top["deviation_mm3"] == pytest.approx(canonical["deviation_mm3"])
     assert "reserved datum plane 'top'" in _notes(top)
 
     sec = _call("inspect_section", section="xz", doc_id=part)
     assert sec["ok"] is True and sec["plane"] == "front"
     assert "read as plane=" in _notes(sec)
+
+def test_section_target_center_is_refused(part):
+    out = _call("inspect_section", doc_id=part, plane="right", target_center=[0, 0, 10])
+    assert out["ok"] is False
+    assert "target_center" in out["error"]
+    assert "origin" in out["error"] and "normal" in out["error"]
 
 
 def test_an_unreadable_plane_lists_the_three_legal_ones(part):
@@ -578,7 +587,7 @@ def test_measure_part_density_aliases(part):
 ])
 def test_measure_part_whole_part_thickness_aliases_share_wall_result(part, key, value):
     """The live `kind="thickness"` payload is the whole-part probe, never a face/edge measure."""
-    canonical = _call("wall_thickness", doc_id=part)
+    canonical = _call("wall_thickness", doc_id=part, image=False)
     routed = _call("measure_part", doc_id=part, **{key: value})
 
     # The canonical path retains the pre-alias envelope/order exactly; only the alias gets a
@@ -609,7 +618,7 @@ def test_a_genuinely_unknown_kwarg_still_names_what_does_exist(part):
     out = _call("check_symmetry", wobble=3, doc_id=part)
     assert out["ok"] is False
     assert "unknown argument(s) wobble=3" in out["error"]
-    assert "it takes plane= and doc_id=." in out["error"]
+    assert "it takes plane=, offset=, origin=, normal=, body= and doc_id=." in out["error"]
 
 
 # --------------------------------------------------------------------------
@@ -1065,3 +1074,175 @@ def test_measure_still_renders_through_the_mcp_path(part):
     said = _mcp_text("measure", {"selectors": ["top"], "doc_id": part})
     assert "unknown argument" not in said, said[:400]
     assert "Error" not in said, said[:400]
+
+
+def _history_completed(result):
+    if result.get("status") != "running":
+        return result
+    job = _call("wait_job", job_id=result["job_id"], timeout_s=120, poll_s=0.5)
+    if job.get("status") == "error":
+        return job
+    assert job.get("status") == "done", job
+    return job["result"]
+
+
+@pytest.fixture
+def history_part(monkeypatch):
+    from services.mcp import core_bridge as cb
+
+    monkeypatch.delenv("CHUDWARE_PROJECT_SAVE_DIR", raising=False)
+    doc = cb.call("doc_new", {"name": "mcp_history"})["doc_id"]
+    try:
+        built = cb.call("doc_apply_ops", {"doc_id": doc, "ops": [
+            {"op": "add_feature", "feature": {"type": "box", "name": "Block",
+             "params": {"length": 20, "width": 15, "height": 10}}},
+            {"op": "add_feature", "feature": {"type": "plane", "name": "Unused datum",
+             "params": {"method": "point_normal", "origin": [0, 0, 5], "normal": [0, 0, 1]}}},
+        ]})
+        assert "rejected_tree" not in built, built
+        assert all(row["ok"] for row in built["rebuild"]["feature_status"]), built
+        yield doc, built["id_map"]["$1"]
+    finally:
+        cb.call("doc_close", {"doc_id": doc})
+
+
+def test_history_preview_apply_refine_and_project_save(history_part, monkeypatch, tmp_path):
+    from pathlib import Path
+    from mcp.server.fastmcp import FastMCP
+    from services.mcp.cad_doc_tools import register_cad_doc_tools
+    from services.mcp import core_bridge as cb
+
+    doc, datum = history_part
+    monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
+    before = cb.call("doc_tree", {"doc_id": doc})
+    volume = cb.call("eval_mass", {"doc_id": doc})["volume_mm3"]
+    report = _call("check_model_history", doc_id=doc)
+    assert report["ok"] and report["complete"]
+    assert report["revision"] == before["revision"]
+    assert any(datum in fix["feature_ids"] for fix in report["safe_fixes"])
+    mcp_report = json.loads(_text(asyncio.run(
+        _fastmcp_tools().get_tool("check_model_history").run({"doc_id": doc}))))
+    assert mcp_report["revision"] == report["revision"]
+    assert mcp_report["safe_fixes"] == report["safe_fixes"]
+    default_preview = _call("simplify_part", doc_id=doc)
+    assert default_preview["status"] == "preview" and default_preview["applied"] is False
+    assert default_preview["proposed_ops"] == [
+        {"op": "simplify_history", "features": [datum]}]
+    preview = _call("simplify_part", doc_id=doc, refine=True)
+    assert preview["ok"] and preview["status"] == "preview" and preview["applied"] is False
+    assert preview["base_revision"] == before["revision"]
+    assert preview["proposed_ops"] == [
+        {"op": "simplify_history", "features": [datum]},
+        {"op": "add_feature", "feature": {"type": "refine", "name": "Refine", "params": {}}},
+    ]
+    mcp = FastMCP("history-preview-test")
+    register_cad_doc_tools(mcp)
+    mcp_preview = json.loads(_text(asyncio.run(
+        mcp._tool_manager.get_tool("simplify_part").run({"doc_id": doc, "refine": True}))))
+    assert mcp_preview["proposed_ops"] == preview["proposed_ops"]
+    assert mcp_preview["applied"] is False
+    assert cb.call("doc_tree", {"doc_id": doc}) == before
+    assert not list(tmp_path.glob("*.step+"))
+
+    applied = _history_completed(_call("simplify_part", doc_id=doc, apply=True, refine=True))
+    assert applied["ok"] and applied["applied"] and applied["status"] == "applied", applied
+    assert applied["base_revision"] == before["revision"]
+    assert applied["revision"] == before["revision"] + 1
+    assert applied["applied_ops"] == preview["proposed_ops"]
+    after = cb.call("doc_tree", {"doc_id": doc})
+    features = after["tree"]["features"]
+    assert datum not in [feature["id"] for feature in features]
+    refine = next(feature for feature in features if feature["type"] == "refine")
+    status = next(row for row in applied["rebuild"]["feature_status"] if row["id"] == refine["id"])
+    assert status["ok"] and status["data"]["attempted"] is True
+    assert status["data"]["changed"] is False
+    assert cb.call("eval_mass", {"doc_id": doc})["volume_mm3"] == pytest.approx(volume)
+    path = Path(applied["saved_path"])
+    assert path.is_file()
+    saved = path.read_bytes()
+    reopened = cb.call("doc_open", {"path": str(path)})["doc_id"]
+    try:
+        reloaded = cb.call("doc_tree", {"doc_id": reopened})["tree"]["features"]
+        assert datum not in [feature["id"] for feature in reloaded]
+        assert any(feature["type"] == "refine" for feature in reloaded)
+    finally:
+        if reopened != doc:
+            cb.call("doc_close", {"doc_id": reopened})
+
+    no_change_before = cb.call("doc_tree", {"doc_id": doc})
+    no_change = _history_completed(_call("simplify_part", doc_id=doc, apply=True))
+    assert no_change["ok"] and no_change["status"] == "no_changes"
+    assert no_change["applied"] is False
+    assert cb.call("doc_tree", {"doc_id": doc}) == no_change_before
+    assert path.read_bytes() == saved
+
+
+def test_saved_history_reports_external_reference_blocker(history_part, tmp_path):
+    from services.mcp import core_bridge as cb
+
+    doc, datum = history_part
+    path = tmp_path / "public.step+"
+    cb.call("doc_save", {"doc_id": doc, "path": str(path)})
+    before = cb.call("doc_tree", {"doc_id": doc})
+    contents = path.read_bytes()
+    preview = _call("simplify_part", doc_id=doc)
+    assert preview["ok"] and preview["proposed_ops"] == []
+    assert any(datum in item.get("feature_ids", []) and item.get("reason")
+               for item in preview["blockers"] if isinstance(item, dict))
+    no_change = _history_completed(_call("simplify_part", doc_id=doc, apply=True))
+    assert no_change["ok"] and no_change["status"] == "no_changes"
+    assert no_change["applied"] is False
+    assert cb.call("doc_tree", {"doc_id": doc}) == before
+    assert path.read_bytes() == contents
+
+
+def test_history_apply_preserves_native_stale_revision(history_part, monkeypatch):
+    from services.mcp import core_bridge as cb
+
+    doc, datum = history_part
+    before = cb.call("doc_tree", {"doc_id": doc})
+    original_call = cb.call
+    raced = []
+
+    def concurrent_edit(method, params=None):
+        result = original_call(method, params)
+        if method == "eval_model_history" and params.get("doc_id") == doc and not raced:
+            edit = original_call("doc_apply_ops", {"doc_id": doc, "ops": [{
+                "op": "add_feature", "feature": {"type": "plane", "name": "Concurrent",
+                "params": {"method": "point_normal", "origin": [0, 0, 7], "normal": [0, 0, 1]}}}]})
+            assert "rejected_tree" not in edit
+            raced.append(edit["revision"])
+        return result
+
+    monkeypatch.setattr(cb, "call", concurrent_edit)
+    result = _history_completed(_call("simplify_part", doc_id=doc, apply=True))
+    assert result["ok"] is False and result["code"] == "stale_revision", result
+    after = original_call("doc_tree", {"doc_id": doc})
+    assert raced == [before["revision"] + 1] and after["revision"] == raced[0]
+    assert datum in [feature["id"] for feature in after["tree"]["features"]]
+    assert any(feature["name"] == "Concurrent" for feature in after["tree"]["features"])
+
+
+def test_failed_refine_rolls_back_cleanup_in_same_batch(monkeypatch, tmp_path):
+    from services.mcp import core_bridge as cb
+
+    monkeypatch.delenv("CHUDWARE_PROJECT_SAVE_DIR", raising=False)
+    doc = cb.call("doc_new", {"name": "history_refine_failure"})["doc_id"]
+    try:
+        built = cb.call("doc_apply_ops", {"doc_id": doc, "ops": [{
+            "op": "add_feature", "feature": {"type": "plane", "name": "Unused",
+            "params": {"method": "point_normal", "origin": [0, 0, 1], "normal": [0, 0, 1]}}}]})
+        assert "rejected_tree" not in built
+        datum = built["id_map"]["$0"]
+        before = cb.call("doc_tree", {"doc_id": doc})
+        monkeypatch.setenv("CHUDWARE_PROJECT_SAVE_DIR", str(tmp_path))
+        preview = _call("simplify_part", doc_id=doc, refine=True)
+        assert preview["proposed_ops"][0] == {"op": "simplify_history", "features": [datum]}
+        rejected = _history_completed(_call("simplify_part", doc_id=doc, apply=True, refine=True))
+        assert rejected["ok"] is False and rejected["applied"] is False, rejected
+        assert rejected["status"] == "rejected" and rejected["failed_features"]
+        assert "refine" in rejected["error"].lower()
+        assert cb.call("doc_tree", {"doc_id": doc}) == before
+        assert not list(tmp_path.glob("*.step+"))
+    finally:
+        cb.call("doc_close", {"doc_id": doc})

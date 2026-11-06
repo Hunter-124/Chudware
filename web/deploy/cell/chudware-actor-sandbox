@@ -38,12 +38,12 @@ def actor_argv(actor, access, command):
     args += ["--ro-bind", "/proc/self/fd/" + str(sockfd), "/run/egress.sock"]
     env = {**BASE_ENV, **actor_environment(),
            "CHUDWARE_ACTOR_HEX": actor, "CHUDWARE_ACTOR_STATE": "/actor", "CHUDWARE_ACTOR_SANDBOX": "1",
-           "CHUDWARE_CHUDCODE_BIN": "/opt/chudware/bin/chud",
+           "CHUDWARE_OMP_BIN": "/opt/chudware/bin/omp",
            "CHUDWARE_WORKER_PYTHON": "/opt/chudware/venv/bin/python3",
            "HOME": "/actor/home", "XDG_DATA_HOME": "/actor/data", "XDG_CONFIG_HOME": "/actor/config",
            "XDG_CACHE_HOME": "/actor/cache", "XDG_RUNTIME_DIR": "/actor/run",
            "CHUDWARE_HOSTD_SOCKET": "/actor/run/hostd.sock"}
-    # Scoped Chudcode state may be a private temporary subtree of the actor.
+    # Scoped OMP state may be a private temporary subtree of the actor.
     for key in ("PI_CODING_AGENT_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"):
         if key.startswith("XDG_") and os.environ.get("CHUDWARE_ACTOR_SANDBOX") != "1":
             continue  # Cell-supervisor state is never an actor-state override.

@@ -72,7 +72,7 @@ def _server_call(tool: str, arguments: dict) -> dict:
 
 
 @pytest.fixture(autouse=True)
-def _discard_documents_minted_by_this_file():
+def _discard_documents_minted_by_this_file(tmp_path, monkeypatch):
     """Discard every engine document a test in this file mints.
 
     These tests drive the REAL MCP ToolManager, so several of them mint live
@@ -87,24 +87,41 @@ def _discard_documents_minted_by_this_file():
     invisible whenever either file ran alone, which is exactly why it survived.
     Same defect class as the documented `test_cheatsheet_examples` leak.
 
-    Restoring `_TOUCHED_DOCS` is as load-bearing as closing the doc: it is a
-    module-level list and `save_touched_docs` reads it directly, so an entry
-    left behind fails a later turn even after the document itself is gone.
+    Restore the per-turn touched registry as well as closing the minted documents.
     """
+    monkeypatch.setenv("CHUDWARE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
     from services.mcp import cad_common as _cc
-    before = list(getattr(_cc, "_TOUCHED_DOCS", []))
+    before = {scope: dict(docs) for scope, docs in _cc._TOUCHED_DOCS.items()}
     try:
         yield
     finally:
         touched = getattr(_cc, "_TOUCHED_DOCS", None)
         if touched is None:
             return
-        for doc_id in [d for d in touched if d not in before]:
+        previous_ids = {did for docs in before.values() for did in docs}
+        created = {did for docs in touched.values() for did in docs} - previous_ids
+        for doc_id in created:
             try:
                 _server_call("close_part", {"doc_id": doc_id, "discard": True})
             except Exception:  # noqa: BLE001 — cleanup never fails a test
                 pass
-        touched[:] = before
+        touched.clear()
+        touched.update(before)
+
+
+@pytest.mark.parametrize("save,discard", [(False, True), (True, False)])
+def test_close_save_synonym_inverts_for_agent(save, discard):
+    kwargs, _notes, err = _agent_reconcile("close_part", doc_id="d", save=save)
+    assert err is None and kwargs == {"doc_id": "d", "discard": discard}
+    _, _, err = _agent_reconcile("close_part", doc_id="d", save=save, discard=discard)
+    assert err is not None
+
+
+def test_close_save_false_synonym_through_mcp():
+    doc = _server_call("new_part", {"name": "close_save_synonym"})["doc_id"]
+    result = _server_call("close_part", {"doc_id": doc, "save": False})
+    assert result["ok"], result
 
 
 # --------------------------------------------------------------------- anti-drift: one table

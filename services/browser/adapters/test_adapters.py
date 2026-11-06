@@ -267,7 +267,8 @@ def test_grabcad_search_propagates_fetch_failure(adapter_mods, monkeypatch):
                         lambda url, site: {"ok": False, "reason": "no_profile", "hint": "x"})
 
     hits = grabcad.ADAPTER.search("widget")
-    assert hits == [{"ok": False, "reason": "no_profile", "hint": "x"}]
+    assert hits[0]["ok"] is False and hits[0]["reason"] == "no_profile"
+    assert hits[0]["site"] == "grabcad" and hits[0]["op"] == "search"
 
 
 def test_grabcad_acquire_downloads_and_returns_provenance(adapter_mods, monkeypatch, tmp_path):
@@ -278,7 +279,7 @@ def test_grabcad_acquire_downloads_and_returns_provenance(adapter_mods, monkeypa
 
     def fake_download(url, site, dest):
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(b"STEP-FILE-BYTES")
+        dest.write_bytes(b"ISO-10303-21;\nHEADER;\nENDSEC;\nEND-ISO-10303-21;\n")
         return {"ok": True, "dest": str(dest), "session_profile_used": "grabcad"}
 
     monkeypatch.setattr(session, "browser_fetch", fake_fetch)
@@ -290,7 +291,8 @@ def test_grabcad_acquire_downloads_and_returns_provenance(adapter_mods, monkeypa
     assert result["source_url"] == "https://grabcad.com/library/widget-abc"
     assert result["session_profile_used"] == "grabcad"
     assert "license_note" in result and result["license_note"]
-    assert result["artifact_path"].endswith("widget-abc.step")
+    assert result["artifact_kind"] == "cad" and result["format"] == "step"
+    assert result["artifact_path"].endswith(".step")
 
 
 def test_grabcad_acquire_login_wall_on_detail_page(adapter_mods, monkeypatch):
@@ -310,14 +312,14 @@ def test_grabcad_acquire_no_download_link(adapter_mods, monkeypatch):
 
     result = grabcad.ADAPTER.acquire({"url": "https://grabcad.com/library/widget-abc"})
     assert result["ok"] is False
-    assert result["reason"] == "no_download_link"
+    assert result["reason"] == "unsupported"
 
 
 def test_grabcad_acquire_rejects_missing_url(adapter_mods):
     _adapters_pkg, grabcad, _traceparts, _session, _amazon, _mcmaster, _jlcpcb, _pcbway = adapter_mods
     result = grabcad.ADAPTER.acquire({"title": "no url here"})
     assert result["ok"] is False
-    assert result["reason"] == "bad_result"
+    assert result["reason"] == "not_found"
 
 
 # --- TraceParts ---------------------------------------------------------------------
@@ -330,7 +332,7 @@ def test_traceparts_acquire_surfaces_terms_confirmation(adapter_mods, monkeypatc
     result = traceparts.ADAPTER.acquire({"url": "https://www.traceparts.com/en/product/x"})
 
     assert result["ok"] is False
-    assert result["reason"] == "terms_confirmation_required"
+    assert result["reason"] == "terms_required"
     assert result["ask_user"]["kind"] == "approval"
 
 
@@ -365,7 +367,7 @@ def test_amazon_search_parses_result_cards(adapter_mods, monkeypatch):
     assert hits[0]["url"] == "https://www.amazon.com/dp/B00WIDGET1"
     assert hits[0]["site"] == "amazon"
     assert hits[0]["asin"] == "B00WIDGET1"
-    assert hits[0]["price"] == "$12.99"
+    assert hits[0]["price"] == 12.99
 
 
 def test_amazon_search_login_wall_surfaces_ask_user(adapter_mods, monkeypatch):
@@ -386,7 +388,11 @@ def test_amazon_search_propagates_fetch_failure(adapter_mods, monkeypatch):
                         lambda url, site: {"ok": False, "reason": "no_profile", "hint": "x"})
 
     hits = amazon.ADAPTER.search("widget")
-    assert hits == [{"ok": False, "reason": "no_profile", "hint": "x"}]
+    assert len(hits) == 1
+    assert hits[0]["ok"] is False
+    assert hits[0]["reason"] == "no_profile"
+    assert hits[0]["hint"] == "x"
+    assert hits[0]["site"] == "amazon" and hits[0]["op"] == "search"
 
 
 def test_amazon_acquire_returns_price_record_no_artifact(adapter_mods, monkeypatch):
@@ -425,14 +431,14 @@ def test_amazon_acquire_rejects_missing_url(adapter_mods):
 
 
 def test_amazon_acquire_hits_bot_challenge_never_bypasses(adapter_mods, monkeypatch):
-    """A CAPTCHA/bot-challenge page must degrade to login_required, never be solved."""
+    """A CAPTCHA challenge is reported and never solved."""
     _adapters_pkg, _grabcad, _traceparts, session, amazon, _mcmaster, _jlcpcb, _pcbway = adapter_mods
     monkeypatch.setattr(session, "browser_fetch",
                         lambda url, site: {"ok": True, "content": AMAZON_CHALLENGE_HTML})
 
     result = amazon.ADAPTER.acquire({"url": "https://www.amazon.com/dp/B00WIDGET1"})
     assert result["ok"] is False
-    assert result["reason"] == "login_required"
+    assert result["reason"] == "captcha"
 
 
 # --- McMaster-Carr ------------------------------------------------------------------
@@ -489,10 +495,10 @@ def test_mcmaster_search_login_wall_surfaces_ask_user(adapter_mods, monkeypatch)
 def test_mcmaster_search_propagates_fetch_failure(adapter_mods, monkeypatch):
     _adapters_pkg, _grabcad, _traceparts, session, _amazon, mcmaster, _jlcpcb, _pcbway = adapter_mods
     monkeypatch.setattr(session, "browser_fetch",
-                        lambda url, site: {"ok": False, "reason": "no_profile", "hint": "x"})
+                        lambda url, site: {"ok": False, "reason": "transport_failed", "hint": "x"})
 
     hits = mcmaster.ADAPTER.search("screw")
-    assert hits == [{"ok": False, "reason": "no_profile", "hint": "x"}]
+    assert hits[0]["reason"] == "transport_failed" and hits[0]["site"] == "mcmaster"
 
 
 def test_mcmaster_acquire_downloads_and_returns_provenance_with_sku(adapter_mods, monkeypatch):
@@ -503,7 +509,7 @@ def test_mcmaster_acquire_downloads_and_returns_provenance_with_sku(adapter_mods
 
     def fake_download(url, site, dest, **kw):
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(b"STEP-FILE-BYTES")
+        dest.write_bytes(b"ISO-10303-21;\nHEADER;\nENDSEC;\nEND-ISO-10303-21;")
         return {"ok": True, "dest": str(dest), "session_profile_used": "mcmaster"}
 
     monkeypatch.setattr(session, "browser_interact", fake_interact)
@@ -521,7 +527,8 @@ def test_mcmaster_acquire_downloads_and_returns_provenance_with_sku(adapter_mods
     # The settled DOM the capture already returned carries the price — the envelope
     # must not throw that commercial identity away (siblings jlcpcb/pcbway/lcsc all
     # populate it, and parts_provider surfaces it downstream).
-    assert result["price"] == "$8.32"
+    assert (result["price"], result["currency"]) == (8.32, "USD")
+    assert (result["artifact_kind"], result["format"]) == ("cad", "step")
 
 
 def test_mcmaster_acquire_login_wall(adapter_mods, monkeypatch):
@@ -542,7 +549,7 @@ def test_mcmaster_acquire_rejects_missing_url(adapter_mods):
     _adapters_pkg, _grabcad, _traceparts, _session, _amazon, mcmaster, _jlcpcb, _pcbway = adapter_mods
     result = mcmaster.ADAPTER.acquire({"title": "no url here"})
     assert result["ok"] is False
-    assert result["reason"] == "bad_result"
+    assert result["reason"] == "unsupported"
 
 
 def test_mcmaster_acquire_surfaces_terms_confirmation(adapter_mods, monkeypatch):
@@ -556,7 +563,7 @@ def test_mcmaster_acquire_surfaces_terms_confirmation(adapter_mods, monkeypatch)
     assert result["ok"] is False
     # A licence click-through is NOT "no_download_link": it is an approval the user
     # must give, so it must be reported as one.
-    assert result["reason"] == "terms_confirmation_required"
+    assert result["reason"] == "terms_required"
     assert result["ask_user"]["kind"] == "approval"
 
 
@@ -569,7 +576,7 @@ def test_mcmaster_acquire_terms_wall_on_the_family_page(adapter_mods, monkeypatc
 
     result = mcmaster.ADAPTER.acquire({
         "url": "https://www.mcmaster.com/products/socket-head-screws/steel~~/"})
-    assert result["reason"] == "terms_confirmation_required"
+    assert result["reason"] == "terms_required"
 
 
 def test_mcmaster_never_auto_accepts_terms(adapter_mods, monkeypatch):
@@ -591,7 +598,7 @@ def test_mcmaster_never_auto_accepts_terms(adapter_mods, monkeypatch):
 
     out = mcmaster.ADAPTER.acquire({"url": "https://www.mcmaster.com/91290A115/"})
     assert called["download"] is False
-    assert out["reason"] == "terms_confirmation_required"
+    assert out["reason"] == "terms_required"
 
 
 # --- JLCPCB -------------------------------------------------------------------------
@@ -607,9 +614,9 @@ def test_jlcpcb_search_parses_result_cards(adapter_mods, monkeypatch):
     assert "STM32F103C8T6" in hits[0]["title"]
     assert hits[0]["url"] == "https://jlcpcb.com/partdetail/Basic_C123456"
     assert hits[0]["site"] == "jlcpcb"
-    assert hits[0]["lcsc"] == "C123456"
-    assert hits[0]["price"] == "$1.23"
-    assert hits[0]["stock"] == "4,500"
+    assert hits[0]["sku"] == "C123456"
+    assert (hits[0]["price"], hits[0]["currency"], hits[0]["stock"]) == (1.23, "USD", 4500)
+    assert hits[0]["kind"] == "product"
 
 
 def test_jlcpcb_search_login_wall_surfaces_ask_user(adapter_mods, monkeypatch):
@@ -630,23 +637,18 @@ def test_jlcpcb_search_propagates_fetch_failure(adapter_mods, monkeypatch):
                         lambda url, site: {"ok": False, "reason": "no_profile", "hint": "x"})
 
     hits = jlcpcb.ADAPTER.search("stm32")
-    assert hits == [{"ok": False, "reason": "no_profile", "hint": "x"}]
+    assert hits[0]["reason"] == "no_profile" and hits[0]["site"] == "jlcpcb"
 
 
-def test_jlcpcb_acquire_returns_structured_record(adapter_mods, monkeypatch):
+def test_jlcpcb_acquire_reports_unsupported(adapter_mods, monkeypatch):
     _adapters_pkg, _grabcad, _traceparts, session, _amazon, _mcmaster, jlcpcb, _pcbway = adapter_mods
     monkeypatch.setattr(session, "browser_fetch",
                         lambda url, site: {"ok": True, "content": JLCPCB_DETAIL_HTML})
 
     result = jlcpcb.ADAPTER.acquire({"url": "https://jlcpcb.com/partdetail/Basic_C123456"})
 
-    assert result["ok"] is True
-    assert result["source_url"] == "https://jlcpcb.com/partdetail/Basic_C123456"
-    assert "license_note" in result and result["license_note"]
+    assert result["ok"] is False and result["reason"] == "unsupported"
     assert result.get("artifact_path") is None
-    assert result["lcsc"] == "C123456"
-    assert result["price"] == "$1.23"
-    assert result["stock"] == "4,500"
 
 
 def test_jlcpcb_acquire_login_wall(adapter_mods, monkeypatch):
@@ -663,7 +665,7 @@ def test_jlcpcb_acquire_rejects_missing_url(adapter_mods):
     _adapters_pkg, _grabcad, _traceparts, _session, _amazon, _mcmaster, jlcpcb, _pcbway = adapter_mods
     result = jlcpcb.ADAPTER.acquire({"title": "no url here"})
     assert result["ok"] is False
-    assert result["reason"] == "bad_result"
+    assert result["reason"] == "not_found"
 
 
 def test_jlcpcb_acquire_surfaces_terms_confirmation(adapter_mods, monkeypatch):
@@ -674,8 +676,8 @@ def test_jlcpcb_acquire_surfaces_terms_confirmation(adapter_mods, monkeypatch):
     result = jlcpcb.ADAPTER.acquire({"url": "https://jlcpcb.com/partdetail/Basic_C123456"})
 
     assert result["ok"] is False
-    assert result["reason"] == "terms_confirmation_required"
-    assert result["ask_user"]["kind"] == "approval"
+    assert result["reason"] == "terms_required"
+    assert result["ask_user"]
 
 
 def test_jlcpcb_never_auto_accepts_terms(adapter_mods, monkeypatch):
@@ -685,7 +687,7 @@ def test_jlcpcb_never_auto_accepts_terms(adapter_mods, monkeypatch):
                         lambda url, site: {"ok": True, "content": JLCPCB_TERMS_HTML})
 
     result = jlcpcb.ADAPTER.acquire({"url": "https://jlcpcb.com/partdetail/Basic_C123456"})
-    assert result["reason"] == "terms_confirmation_required"
+    assert result["reason"] == "terms_required"
     assert result.get("artifact_path") is None
 
 
@@ -702,6 +704,7 @@ def test_pcbway_search_parses_result_cards(adapter_mods, monkeypatch):
     assert hits[0]["title"] == "Widget Abc"
     assert hits[0]["url"] == "https://www.pcbway.com/project/shareproject/Widget_Abc.html"
     assert hits[0]["site"] == "pcbway"
+    assert hits[0]["kind"] == "project"
     assert hits[0]["price"] is None
     assert hits[0]["stock"] is None
 
@@ -724,22 +727,18 @@ def test_pcbway_search_propagates_fetch_failure(adapter_mods, monkeypatch):
                         lambda url, site: {"ok": False, "reason": "no_profile", "hint": "x"})
 
     hits = pcbway.ADAPTER.search("widget")
-    assert hits == [{"ok": False, "reason": "no_profile", "hint": "x"}]
+    assert hits[0]["reason"] == "no_profile" and hits[0]["site"] == "pcbway"
 
 
-def test_pcbway_acquire_returns_structured_record(adapter_mods, monkeypatch):
+def test_pcbway_acquire_reports_unsupported(adapter_mods, monkeypatch):
     _adapters_pkg, _grabcad, _traceparts, session, _amazon, _mcmaster, _jlcpcb, pcbway = adapter_mods
     monkeypatch.setattr(session, "browser_fetch",
                         lambda url, site: {"ok": True, "content": PCBWAY_DETAIL_HTML})
 
     result = pcbway.ADAPTER.acquire({"url": "https://www.pcbway.com/project/shopindex/Widget_Abc.html"})
 
-    assert result["ok"] is True
-    assert result["source_url"] == "https://www.pcbway.com/project/shopindex/Widget_Abc.html"
-    assert "license_note" in result and result["license_note"]
+    assert result["ok"] is False and result["reason"] == "unsupported"
     assert result.get("artifact_path") is None
-    assert result["price"] == "$3.50"
-    assert result["stock"] == "200"
 
 
 def test_pcbway_acquire_login_wall(adapter_mods, monkeypatch):
@@ -756,7 +755,7 @@ def test_pcbway_acquire_rejects_missing_url(adapter_mods):
     _adapters_pkg, _grabcad, _traceparts, _session, _amazon, _mcmaster, _jlcpcb, pcbway = adapter_mods
     result = pcbway.ADAPTER.acquire({"title": "no url here"})
     assert result["ok"] is False
-    assert result["reason"] == "bad_result"
+    assert result["reason"] == "not_found"
 
 
 def test_pcbway_acquire_surfaces_terms_confirmation(adapter_mods, monkeypatch):
@@ -767,8 +766,8 @@ def test_pcbway_acquire_surfaces_terms_confirmation(adapter_mods, monkeypatch):
     result = pcbway.ADAPTER.acquire({"url": "https://www.pcbway.com/project/shopindex/Widget_Abc.html"})
 
     assert result["ok"] is False
-    assert result["reason"] == "terms_confirmation_required"
-    assert result["ask_user"]["kind"] == "approval"
+    assert result["reason"] == "terms_required"
+    assert result["ask_user"]
 
 
 def test_pcbway_never_auto_accepts_terms(adapter_mods, monkeypatch):
@@ -778,5 +777,72 @@ def test_pcbway_never_auto_accepts_terms(adapter_mods, monkeypatch):
                         lambda url, site: {"ok": True, "content": PCBWAY_TERMS_HTML})
 
     result = pcbway.ADAPTER.acquire({"url": "https://www.pcbway.com/project/shopindex/Widget_Abc.html"})
-    assert result["reason"] == "terms_confirmation_required"
+    assert result["reason"] == "terms_required"
     assert result.get("artifact_path") is None
+
+
+def test_normalized_hit_failure_and_urls():
+    from services.browser import adapters
+    hit = adapters.make_hit("vendor", title="Bearing", url="https://example.com/p/1",
+                            sku="S1", mpn="M1", manufacturer="Maker", price=2.5,
+                            currency="EUR", stock=0, material="steel", thumbnail="/bearing.jpg",
+                            model_formats=["step"], model_available=False, license="CC0")
+    assert hit["thumbnail"] == "https://example.com/bearing.jpg"
+    assert hit["model"] == {"available": False, "formats": ["step"]}
+    assert hit["price"] == 2.5 and hit["stock"] == 0 and hit["mpn"] == "M1"
+    assert adapters.make_hit("v", title="x", url="https://x.test", thumbnail="/favicon.ico")["thumbnail"] is None
+    assert adapters.abs_url("https://example.com/a", "javascript:alert(1)") is None
+    assert adapters.quote_query("M3 & M4") == "M3+%26+M4"
+    error = adapters.fail("vendor", "search", "rate_limited", "try later",
+                          url="https://example.com", status=429, retry_after_s=5)
+    assert error == {"ok": False, "site": "vendor", "op": "search", "reason": "rate_limited",
+                     "hint": "try later", "url": "https://example.com", "status": 429,
+                     "retry_after_s": 5, "ask_user": None}
+
+
+def test_registry_rejects_distinct_owner_and_describes_registered_adapters():
+    from services.browser import adapters, health
+
+    class Source:
+        key = "test-registry-owner"
+
+    class Other:
+        key = "test-registry-owner"
+
+    try:
+        adapters.register(Source())
+        adapters.register(Source())  # same identity, as on module reload
+        with pytest.raises(ValueError):
+            adapters.register(Other())
+    finally:
+        adapters._REGISTRY.pop("test-registry-owner", None)
+    registered = {adapter.key for adapter in adapters.all_adapters()}
+    assert adapters._LOGIN_WIZARD_SITES <= registered
+    assert adapters._DISTRIBUTOR_ONLY_SITES <= registered
+    assert set(health.CANARY_QUERIES) <= registered
+    for adapter in adapters.all_adapters():
+        assert isinstance(adapter.hosts, tuple) and adapter.hosts
+        assert isinstance(adapter.result_kinds, tuple) and adapter.result_kinds
+        assert set(adapter.result_kinds) <= set(adapters.HIT_KINDS)
+        assert isinstance(adapter.cad_acquisition, bool)
+        assert isinstance(adapter.login_required, bool)
+        assert isinstance(adapter.api, bool)
+
+
+def test_failed_public_redownload_preserves_existing_file(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from services.browser.adapters import download_public_cad
+    from services.net import safe_http
+
+    destination = tmp_path / "model.step"
+    original = b"ISO-10303-21;\nHEADER;\nENDSEC;\n"
+    destination.write_bytes(original)
+
+    def download(url, dest, **kwargs):
+        dest.write_bytes(b"<html>login</html>")
+        return SimpleNamespace(status_code=200, url=url, bytes_written=18)
+
+    monkeypatch.setattr(safe_http, "download", download)
+    out = download_public_cad("https://example.com/model.step", destination)
+    assert out["ok"] is False
+    assert destination.read_bytes() == original

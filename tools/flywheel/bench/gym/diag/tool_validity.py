@@ -186,7 +186,7 @@ def run_tool_validity(provider: Any, *, seed: int = 1) -> dict[str, Any]:
                 "schema_valid": False,
                 "detail": f"provider error: {type(exc).__name__}: {exc}",
                 "reply": "",
-                "error": False,
+                "error": True,
             })
             continue
         graded = grade_tool_validity(str(reply or ""), task)

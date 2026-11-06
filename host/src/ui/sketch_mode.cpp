@@ -66,9 +66,23 @@ nlohmann::json modelPickReference(AppState& st, const render::PickHit& hit, std:
 // with a centripetal Catmull-Rom so the viewport shows the ACTUAL curve. (style_spline is
 // a by-poles curve whose points are control poles — keep showing its control polygon, the
 // SolidWorks convention.) Returns UV points (same space as the input through-points).
-inline std::vector<ImVec2> catmullRomUV(const std::vector<ImVec2>& p, int perSeg = 16) {
+inline const std::vector<ImVec2>& catmullRomUV(const SketchEntity& e) {
+    const auto& p = e.pts;
     if (p.size() < 3) return p;  // 2 points = a straight line already
-    std::vector<ImVec2> out;
+    constexpr int perSeg = 16;
+    uint64_t hash = 14695981039346656037ull;
+    for (const auto& point : p)
+        for (float value : {point.x, point.y}) {
+            uint32_t bits;
+            std::memcpy(&bits, &value, sizeof(bits));
+            hash = (hash ^ bits) * 1099511628211ull;
+        }
+    if (e.splineHash == hash && e.splineControls.size() == p.size() &&
+        std::equal(p.begin(), p.end(), e.splineControls.begin(),
+                   [](const ImVec2& a, const ImVec2& b) { return a.x == b.x && a.y == b.y; }))
+        return e.splineSamples;
+    auto& out = e.splineSamples;
+    out.clear();
     out.reserve((p.size() - 1) * perSeg + 1);
     auto at = [&](int i) -> ImVec2 {
         return p[(size_t)std::min(std::max(i, 0), (int)p.size() - 1)];
@@ -88,6 +102,8 @@ inline std::vector<ImVec2> catmullRomUV(const std::vector<ImVec2>& p, int perSeg
         }
     }
     out.push_back(p.back());
+    e.splineControls = p;
+    e.splineHash = hash;
     return out;
 }
 
@@ -462,8 +478,10 @@ void SketchMode::screenToUV(const ImVec2& s, float& u, float& v) const {
 bool SketchMode::callSketch(AppState& st, const char* method, const nlohmann::json& extra,
                             nlohmann::json& result) {
     if (!st.docMirror.hasDoc() || !st.workerStarted) return false;
+    if (active_ && !docId_.empty() && st.docMirror.docId() != docId_) return false;
     nlohmann::json params = extra;
     params["doc_id"] = st.docMirror.docId();
+    if (active_ && sketchSessionId_ != 0) params["session_id"] = sketchSessionId_;
     params["sketch"] = fid_;
     std::string err;
     if (!st.worker.call(method, params, result, err)) {
@@ -475,7 +493,41 @@ bool SketchMode::callSketch(AppState& st, const char* method, const nlohmann::js
                   result.value("message", std::string("?")));
         return false;
     }
+    if (active_ && result.contains("revision") && result["revision"].is_number_integer())
+        sketchRevision_ = result["revision"].get<long>();
     return true;
+}
+
+core::OpsResponse SketchMode::applySketchOps(AppState& st, const nlohmann::json& ops, bool coalesce) {
+    if (active_ && st.docMirror.docId() != docId_) {
+        cancelRevision_ = -1;
+        core::OpsResponse result;
+        result.error_message = "The active document changed.";
+        return result;
+    }
+    const long before = st.docMirror.revision();
+    if (active_ && before != cancelRevision_)
+        cancelRevision_ = -1;
+    auto result = st.docMirror.applyOps(st.worker, ops, coalesce);
+    if (active_ && cancelRevision_ >= 0) {
+        const bool unchanged = !result.ok && result.rejected && result.unchanged &&
+                               result.revision == before && st.docMirror.revision() == before;
+        if (st.docMirror.docId() != docId_ || cancelRevision_ != before)
+            cancelRevision_ = -1;
+        else if (result.ok && result.revision >= before && result.revision <= before + 1 &&
+                 st.docMirror.revision() == result.revision)
+            cancelRevision_ = result.revision;
+        else if (!unchanged)
+            cancelRevision_ = -1;
+    }
+    if (result.ok && result.auto_rollback.is_object()) {
+        const std::string msg = result.warning.empty()
+            ? "Downstream features failed; history was rolled back for repair."
+            : result.warning;
+        st.addLog("[sketch] " + msg);
+        st.toast(ui::ToastLevel::Warn, msg);
+    }
+    return result;
 }
 
 // C50f: read-only over-define pre-flight. Wraps the sketch_probe RPC. Returns true and fills the
@@ -552,7 +604,7 @@ static void parseEntities(const nlohmann::json& res, std::vector<SketchEntity>& 
             se.end = e.value("a1", 0.0f);
             se.ccw = true;
         }
-        out.push_back(se);
+        out.push_back(std::move(se));
     }
 }
 
@@ -648,6 +700,7 @@ void SketchMode::applyConstraints(const nlohmann::json& res) {
         if (c.contains("value") && c["value"].is_number()) { sc.hasValue = true; sc.value = c["value"].get<double>(); }
         if (c.contains("expr") && c["expr"].is_string()) { sc.hasExpr = true; sc.expr = c["expr"].get<std::string>(); }
         sc.driven = c.value("driven", false);
+        sc.automatic = c.value("auto", false);
         if (c.contains("placement") && c["placement"].is_array() && c["placement"].size() == 2) {
             sc.hasPlacement = true;
             sc.placement[0] = c["placement"][0].get<float>();
@@ -923,7 +976,7 @@ void SketchMode::commitPasteEntities(AppState& st, float offsetX, float offsetY)
         {"offset_x", offsetX},
         {"offset_y", offsetY},
     };
-    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    auto r = applySketchOps(st, nlohmann::json::array({op}));
     pastePlacing_ = false;
     pasteBundle_ = nlohmann::json();
     if (!r.ok) { st.toast(ui::ToastLevel::Error, "Paste: " + r.error_message); return; }
@@ -980,7 +1033,19 @@ void SketchMode::commitDrag(AppState& st) {
     dragPending_ = false;
     dragInFlight_ = false;
     nlohmann::json res;
-    if (!callSketch(st, "sketch_drag_commit", nlohmann::json::object(), res)) return;
+    const long expected = sketchRevision_;
+    if (expected < 0 || sketchSessionId_ == 0 ||
+        !callSketch(st, "sketch_drag_commit", {{"expect_revision", expected}}, res)) {
+        cancelRevision_ = -1;
+        st.toast(ui::ToastLevel::Warn, "Sketch changed during the drag; the drag was not committed.");
+        resyncMirror(st);
+        resolve(st);
+        return;
+    }
+    if (cancelRevision_ == expected)
+        cancelRevision_ = sketchRevision_;
+    else
+        cancelRevision_ = -1;
     if (res.contains("tess") && res["tess"].is_object()) {
         std::string aicm = res["tess"].value("aicm_path", std::string());
         if (!aicm.empty()) { std::string le; st.loadDocMesh(aicm, le); }
@@ -996,7 +1061,7 @@ void SketchMode::addEntity(AppState& st, const nlohmann::json& entity,
     if (!constraints.is_null() && constraints.is_array() && !constraints.empty())
         op["constraints"] = constraints;
     nlohmann::json ops = nlohmann::json::array({op});
-    auto r = st.docMirror.applyOps(st.worker, ops);
+    auto r = applySketchOps(st, ops);
     if (!r.ok) {
         st.addLog("[sketch] add_entity failed: " + r.error_message);
         st.toast(ui::ToastLevel::Warn, r.error_message);
@@ -1043,7 +1108,7 @@ std::string SketchMode::emitConstructionEntity(AppState& st, const nlohmann::jso
                                                const nlohmann::json& constraints) {
     nlohmann::json op = {{"op", "sketch_add_entity"}, {"sketch", fid_}, {"entity", entity}};
     if (constraints.is_array() && !constraints.empty()) op["constraints"] = constraints;
-    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}), /*coalesce=*/true);
+    auto r = applySketchOps(st, nlohmann::json::array({op}), /*coalesce=*/true);
     if (!r.ok) { st.addLog("[sketch] construction entity failed: " + r.error_message); return {}; }
     if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
     return (r.id_map.is_object() && r.id_map.contains("$0"))
@@ -1052,14 +1117,14 @@ std::string SketchMode::emitConstructionEntity(AppState& st, const nlohmann::jso
 
 void SketchMode::emitConstructionConstraint(AppState& st, const nlohmann::json& constraint) {
     nlohmann::json op = {{"op", "sketch_add_constraint"}, {"sketch", fid_}, {"constraint", constraint}};
-    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}), /*coalesce=*/true);
+    auto r = applySketchOps(st, nlohmann::json::array({op}), /*coalesce=*/true);
     if (!r.ok) { st.addLog("[sketch] construction constraint failed: " + r.error_message); return; }
     if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
 }
 
 void SketchMode::applyRelationOps(AppState& st, const nlohmann::json& ops,
                                   const std::string& label) {
-    auto r = st.docMirror.applyOps(st.worker, ops);
+    auto r = applySketchOps(st, ops);
     if (!r.ok) {
         st.toast(ui::ToastLevel::Warn, label + ": " + r.error_message);
         return;
@@ -1111,7 +1176,7 @@ void SketchMode::fullyDefine(AppState& st) {
     for (const auto& h : selIds_)
         if (const auto* e = entById(skBaseId(h))) entities.insert(e->id);
     if (!entities.empty()) op["entities"] = entities;
-    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    auto r = applySketchOps(st, nlohmann::json::array({op}));
     if (!r.ok) {
         st.toast(ui::ToastLevel::Warn, "Fully Define Sketch: " + r.error_message);
         return;
@@ -1147,6 +1212,7 @@ void SketchMode::drawRelationList(AppState& st, const ImVec2& lo, const ImVec2& 
                         c.type == "angle" ? fmtAng(value) : fmtLen(value);
             if (c.type != "angle") row.value += g_skIps ? " in" : " mm";
         }
+        if (c.automatic) row.label += " (auto)";
         if (std::find(redundant_.begin(), redundant_.end(), c.id) != redundant_.end())
             row.state = RelationRow::State::Redundant;
         if (std::find(conflicting_.begin(), conflicting_.end(), c.id) != conflicting_.end())
@@ -1194,25 +1260,39 @@ void SketchMode::beginRelations(AppState& st) {
 }
 
 void SketchMode::refreshRelationModelRefs(AppState& st) {
+    auto& key = relModelInputScratch_;
+    key.clear();
+    auto token = [&](const std::string& text) {
+        key += std::to_string(text.size());
+        key += ':';
+        key += text;
+    };
+    token(st.docMirror.docId());
+    token(fid_);
+    token(std::to_string(st.docMirror.revision()));
+    token(std::to_string(st.docMirror.mutationGen()));
+    for (const auto& h : relIds_)
+        if (h.rfind("axis.", 0) == 0 && sketchAxisHandle(h, frame_).empty())
+            token(h);
+    key += '|';
+    for (const auto& item : st.selection.items()) {
+        const char* name = modelPickKind(item.hit.kind);
+        if (!name) continue;
+        token(name);
+        token(item.selector);
+    }
+    if (key == relModelKey_) return;
+    relModelKey_ = key;
     nlohmann::json refs = nlohmann::json::array();
     for (const auto& h : relIds_)
         if (h.rfind("axis.", 0) == 0 && sketchAxisHandle(h, frame_).empty())
             refs.push_back({{"datum", h}});
-    bool pending = false;
     for (const auto& item : st.selection.items()) {
-        const auto kind = item.hit.kind;
-        const char* name = kind == render::PickKind::Vertex ? "vertex" :
-                           kind == render::PickKind::Edge ? "edge" :
-                           kind == render::PickKind::Face ? "face" : nullptr;
-        if (!name) continue;
-        if (item.selector.empty()) { pending = true; continue; }
+        const char* name = modelPickKind(item.hit.kind);
+        if (!name || item.selector.empty()) continue;
         auto selector = nlohmann::json::parse(item.selector, nullptr, false);
-        if (selector.is_object()) refs.push_back({{"kind", name}, {"selector", selector}});
+        if (selector.is_object()) refs.push_back({{"kind", name}, {"selector", std::move(selector)}});
     }
-    const std::string key = std::to_string(st.docMirror.revision()) + ":" + refs.dump() +
-                            (pending ? ":pending" : "");
-    if (key == relModelKey_) return;
-    relModelKey_ = key;
     relModelRefs_.clear();
     for (const auto& ref : refs) {
         RelationModelRef model;
@@ -1531,7 +1611,7 @@ std::string SketchMode::addProjectedDimRef(AppState& st, const nlohmann::json& r
         nlohmann::json op = {{"op", "sketch_add_entity"}, {"sketch", fid_}, {"entity", ent},
             {"constraints", nlohmann::json::array(
                 {{{"type", "fix"}, {"refs", nlohmann::json::array({"$self"})}}})}};
-        auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+        auto r = applySketchOps(st, nlohmann::json::array({op}));
         if (!r.ok) { st.addLog("[sketch] project ref failed: " + r.error_message); return std::string(); }
         eid = (r.id_map.is_object() && r.id_map.contains("$0"))
             ? r.id_map["$0"].get<std::string>() : std::string();
@@ -1636,7 +1716,7 @@ std::vector<std::string> SketchMode::addQuadLoop(AppState& st, const ImVec2 corn
                        {"constraints", dcs}});
     }
     const int beforeRevision = st.docMirror.revision();
-    auto r = st.docMirror.applyOps(st.worker, ops);
+    auto r = applySketchOps(st, ops);
     if (compoundBatchFailed(st, r, beforeRevision, "Rectangle")) return {};
     if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
     resolve(st);
@@ -1691,7 +1771,7 @@ std::vector<std::string> SketchMode::addPolyLoop(AppState& st, const std::vector
                                            {"refs", {ref(i) + ".p1", circleRef}}}}});
     }
     const int beforeRevision = st.docMirror.revision();
-    auto r = st.docMirror.applyOps(st.worker, ops);
+    auto r = applySketchOps(st, ops);
     if (compoundBatchFailed(st, r, beforeRevision, "Polygon")) return {};
     if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
     resolve(st);
@@ -1748,7 +1828,7 @@ void SketchMode::addDecomposedSlot(AppState& st, const ImVec2& p1, const ImVec2&
     for (const auto& c : endCs) con(c);
 
     const int beforeRevision = st.docMirror.revision();
-    auto r = st.docMirror.applyOps(st.worker, ops);
+    auto r = applySketchOps(st, ops);
     if (compoundBatchFailed(st, r, beforeRevision, "Slot")) return;
     if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
     resolve(st);
@@ -1765,14 +1845,12 @@ bool SketchMode::cameraLock(float& yaw, float& pitch) const {
 }
 
 bool SketchMode::enterForFeature(AppState& st, const std::string& sketchFid) {
-    if (st.activeDocLockedByAgent()) {
-        st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
-        return false;
-    }
     if (sketchFid.empty()) return false;
     fid_ = sketchFid;
     nlohmann::json res;
     if (!callSketch(st, "sketch_enter", nlohmann::json::object(), res)) { fid_.clear(); return false; }
+    sketchSessionId_ = res.value("session_id", uint64_t{0});
+    sketchRevision_ = res.value("revision", -1L);
     applyEnterResult(res);
     active_ = true;
     docId_ = st.docMirror.docId();
@@ -1802,11 +1880,15 @@ bool SketchMode::enterForFeature(AppState& st, const std::string& sketchFid) {
     // C37-D: snapshot the doc so the confirmation-corner ✗ (cancel) can revert the whole session.
     // Best-effort: if the worker lacks doc_checkpoint the corner falls back to a plain exit.
     cancelCheckpoint_.clear();
+    cancelRevision_ = -1;
     if (st.docMirror.hasDoc() && st.workerStarted) {
         nlohmann::json cres, cp = {{"doc_id", st.docMirror.docId()}};
         std::string cerr;
-        if (st.worker.call("doc_checkpoint", cp, cres, cerr) && cres.contains("checkpoint"))
+        if (st.worker.call("doc_checkpoint", cp, cres, cerr) && cres.contains("checkpoint")) {
             cancelCheckpoint_ = cres.value("checkpoint", std::string());
+            cancelRevision_ = cres.value("revision", -1L);
+            if (cancelRevision_ != st.docMirror.revision()) cancelRevision_ = -1;
+        }
     }
     st.addLog("[sketch] entered " + fid_ + "  (dof=" + std::to_string(dof_) + ")");
     return true;
@@ -1814,10 +1896,6 @@ bool SketchMode::enterForFeature(AppState& st, const std::string& sketchFid) {
 
 // C37-D: create a sketch on an explicit plane ref and enter it. Returns the new feature id.
 std::string SketchMode::createSketchOnPlane(AppState& st, const nlohmann::json& planeRef) {
-    if (st.activeDocLockedByAgent()) {
-        st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
-        return {};
-    }
     if (!st.docMirror.hasDoc()) {
         std::string err;
         if (!st.docMirror.newPart(st.worker, err)) { st.addLog("[sketch] newPart failed: " + err); return {}; }
@@ -1829,7 +1907,7 @@ std::string SketchMode::createSketchOnPlane(AppState& st, const nlohmann::json& 
             {"refs", {{"plane", planeRef}}},
             {"params", {{"entities", nlohmann::json::array()},
                         {"constraints", nlohmann::json::array()}}}}}}});
-    auto r = st.docMirror.applyOps(st.worker, ops);
+    auto r = applySketchOps(st, ops);
     if (!r.ok) { st.addLog("[sketch] create sketch failed: " + r.error_message); return {}; }
     std::string newFid = (r.id_map.is_object() && r.id_map.contains("$0"))
                        ? r.id_map["$0"].get<std::string>() : std::string();
@@ -1840,10 +1918,6 @@ std::string SketchMode::createSketchOnPlane(AppState& st, const nlohmann::json& 
 }
 
 void SketchMode::beginPlaneEdit(AppState& st, const std::string& sketchFid) {
-    if (st.activeDocLockedByAgent()) {
-        st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
-        return;
-    }
     if (sketchFid.empty()) return;
     // The plane-pick overlay can't share the screen with an open sketcher — leave any active sketch
     // first (keep its entities), then arm the reparent pick.
@@ -1858,8 +1932,7 @@ void SketchMode::beginPlaneEdit(AppState& st, const std::string& sketchFid) {
 }
 
 std::string SketchMode::consumePlanePick(AppState& st, const nlohmann::json& planeRef) {
-    if (st.activeDocLockedByAgent()) {
-        st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
+    if (!docId_.empty() && st.docMirror.docId() != docId_) {
         planePicking_ = false;
         planeEditFid_.clear();
         st.sketchPlanePickActive = false;
@@ -1879,7 +1952,7 @@ std::string SketchMode::consumePlanePick(AppState& st, const nlohmann::json& pla
     planeEditFid_.clear();
     nlohmann::json ops = nlohmann::json::array({
         {{"op", "edit_feature"}, {"id", fid}, {"refs", {{"plane", planeRef}}}}});
-    auto r = st.docMirror.applyOps(st.worker, ops);
+    auto r = applySketchOps(st, ops);
     if (!r.ok) {
         st.addLog("[sketch] reparent plane failed: " + r.error_message);
         st.toast(ui::ToastLevel::Warn, "Couldn't move the sketch to that plane");
@@ -1897,10 +1970,6 @@ std::string SketchMode::consumePlanePick(AppState& st, const nlohmann::json& pla
 }
 
 bool SketchMode::enterNewOnSelection(AppState& st) {
-    if (st.activeDocLockedByAgent()) {
-        st.toast(ui::ToastLevel::Warn, st.agentLockReason(st.docMirror.docId()));
-        return false;
-    }
     // C38 (S2): a double-fire of the ribbon "New Sketch" (sketch_new) while a sketch is already
     // entered would start a plane-pick over the live sketch and leave a zombie state. Refuse to
     // re-enter when already active — the user must exit the current sketch first.
@@ -1958,8 +2027,26 @@ bool SketchMode::enterNewOnSelection(AppState& st) {
 void SketchMode::exitSketch(AppState& st, bool keep) {
     if (!active_) return;
     cancelTool();
+    ++dragGen_;
+    dragPending_ = dragInFlight_ = false;
     nlohmann::json res;
-    callSketch(st, "sketch_exit", nlohmann::json::object(), res);
+    const long expected = sketchRevision_;
+    const bool exited = expected >= 0 && sketchSessionId_ != 0 &&
+        callSketch(st, "sketch_exit", {{"expect_revision", expected}}, res);
+    if (exited && cancelRevision_ == expected) {
+        cancelRevision_ = res.value("revision", -1L);
+    } else {
+        cancelRevision_ = -1;
+        if (sketchSessionId_ != 0 && st.workerStarted) {
+            nlohmann::json discard;
+            std::string err;
+            st.worker.call("sketch_exit", {{"doc_id", docId_}, {"sketch", fid_},
+                                          {"session_id", sketchSessionId_},
+                                          {"discard_active", true}}, discard, err);
+        }
+        if (!exited)
+            st.toast(ui::ToastLevel::Warn, "Sketch changed during editing; current changes were kept.");
+    }
     if (res.contains("tess") && res["tess"].is_object()) {
         std::string aicm = res["tess"].value("aicm_path", std::string());
         if (!aicm.empty()) { std::string le; st.loadDocMesh(aicm, le); }
@@ -1968,13 +2055,14 @@ void SketchMode::exitSketch(AppState& st, bool keep) {
     resyncMirror(st);
     // Empty-sketch cleanup: Finish removes empty sketches; Cancel removes only a new empty sketch.
     // If dependents exist, keep the feature and warn rather than cascading their deletion.
-    if (!st.docLockedByAgent(docId_) && ents_.empty() && (keep || isNewEmpty_)) {
+    if (st.docMirror.docId() == docId_ && cancelRevision_ >= 0 &&
+        st.docMirror.revision() == cancelRevision_ && ents_.empty() && (keep || isNewEmpty_)) {
         std::vector<std::string> deps;
         collectSketchDependents(st, fid_, deps);
         if (deps.empty()) {
             nlohmann::json ops = nlohmann::json::array({
                 {{"op", "delete_feature"}, {"id", fid_}, {"cascade", true}}});
-            st.docMirror.applyOps(st.worker, ops);
+            applySketchOps(st, ops);
         } else {
             st.toast(ui::ToastLevel::Warn,
                      emptyProfileToast(deps, featureDisplayName(st, fid_)));
@@ -1986,9 +2074,15 @@ void SketchMode::exitSketch(AppState& st, bool keep) {
     fid_.clear();
     docId_.clear();
     ents_.clear();
+    std::vector<ImVec2>().swap(boundaryScratch_);
+    std::vector<ImVec2>().swap(projectedScratch_);
+    std::string().swap(relModelInputScratch_);
     cons_.clear();              // C37-D
     autoPlace_.clear(); projRefs_.clear();         // C37-D
     cancelCheckpoint_.clear();  // C37-D
+    cancelRevision_ = -1;
+    sketchSessionId_ = 0;
+    sketchRevision_ = -1;
     status_.clear();
     dof_ = 0;
     // C38 (S2): unconditionally clear any plane-pick state so a stale pick flag can't survive an
@@ -2008,28 +2102,34 @@ void SketchMode::exitSketch(AppState& st, bool keep) {
 // that directly instead of a second rebuild, then mirror the exit-path teardown.
 void SketchMode::cancelSketch(AppState& st) {
     if (!active_) return;
-    if (st.docLockedByAgent(docId_)) {
+    cancelTool();
+    ++dragGen_;
+    dragPending_ = dragInFlight_ = false;
+    if (cancelCheckpoint_.empty() || cancelRevision_ < 0 || !st.docMirror.hasDoc() ||
+        !st.workerStarted || st.docMirror.docId() != docId_ ||
+        st.docMirror.revision() != cancelRevision_ ||
+        sketchSessionId_ == 0) {
+        st.toast(ui::ToastLevel::Warn, "Sketch changed during editing; current changes were kept.");
         exitSketch(st, /*keep=*/true);
         return;
     }
-    cancelTool();
-    if (cancelCheckpoint_.empty() || !st.docMirror.hasDoc() || !st.workerStarted) {
-        // No checkpoint available — fall back to a plain exit (deletes an empty new sketch).
-        exitSketch(st, /*keep=*/false);
+    // Release only this editor's transient solve state; cancellation must not
+    // persist solved coordinates before the guarded checkpoint restore.
+    nlohmann::json exitRes;
+    if (!callSketch(st, "sketch_exit", {{"discard_active", true}}, exitRes) ||
+        !exitRes.value("discarded", false)) {
+        cancelRevision_ = -1;
+        st.toast(ui::ToastLevel::Warn, "Sketch changed during editing; current changes were kept.");
+        exitSketch(st, /*keep=*/true);
         return;
     }
-    // C38 (S6): exit the worker's active sketch BEFORE reverting. doc_revert rewinds the document but
-    // leaves the worker's active_sketch dangling, so the next sketch_enter errors with "already in
-    // sketch". sketch_exit clears it; we ignore its tess payload because the revert below rebuilds.
-    {
-        nlohmann::json exitRes;
-        callSketch(st, "sketch_exit", nlohmann::json::object(), exitRes);
-    }
-    nlohmann::json res, params = {{"doc_id", st.docMirror.docId()}, {"checkpoint", cancelCheckpoint_}};
+    nlohmann::json res, params = {{"doc_id", docId_}, {"checkpoint", cancelCheckpoint_},
+                                  {"expect_revision", cancelRevision_}};
     std::string err;
     bool ok = st.worker.call("doc_revert", params, res, err) && !res.contains("code");
     if (!ok) {
-        st.toast(ui::ToastLevel::Warn, "Sketch cancel: revert failed — exited without revert");
+        cancelRevision_ = -1;
+        st.toast(ui::ToastLevel::Warn, "Sketch cancel: document changed or revert failed; changes were kept");
         exitSketch(st, /*keep=*/true);
         return;
     }
@@ -2042,10 +2142,10 @@ void SketchMode::cancelSketch(AppState& st) {
     // The checkpoint was taken right after a NEW sketch's (empty) feature was created, so the
     // revert above leaves that empty feature sitting in the tree — delete it too (matches the
     // plain-exit path's empty-new-sketch cleanup).
-    if (isNewEmpty_) {
+    if (isNewEmpty_ && res.value("revision", -1L) == st.docMirror.revision()) {
         nlohmann::json ops = nlohmann::json::array({
             {{"op", "delete_feature"}, {"id", fid_}, {"cascade", true}}});
-        auto dr = st.docMirror.applyOps(st.worker, ops);
+        auto dr = applySketchOps(st, ops);
         if (dr.ok && !dr.aicm_path.empty()) { std::string le; st.loadDocMesh(dr.aicm_path, le); }
     }
     st.addLog("[sketch] cancelled " + fid_ + " (reverted to entry checkpoint)");
@@ -2056,9 +2156,15 @@ void SketchMode::cancelSketch(AppState& st) {
     fid_.clear();
     docId_.clear();
     ents_.clear();
+    std::vector<ImVec2>().swap(boundaryScratch_);
+    std::vector<ImVec2>().swap(projectedScratch_);
+    std::string().swap(relModelInputScratch_);
     cons_.clear();
     autoPlace_.clear(); projRefs_.clear();
     cancelCheckpoint_.clear();
+    cancelRevision_ = -1;
+    sketchSessionId_ = 0;
+    sketchRevision_ = -1;
     status_.clear();
     dof_ = 0;
     // C38 (S2): same unconditional plane-pick clear as exitSketch.
@@ -2199,7 +2305,7 @@ bool SketchMode::onRibbonCommand(AppState& st, const std::string& cmdId) {
             st.toast(ui::ToastLevel::Info, "Construction: select sketch entities first");
             return true;
         }
-        auto r = st.docMirror.applyOps(st.worker, ops);
+        auto r = applySketchOps(st, ops);
         if (!r.ok) st.toast(ui::ToastLevel::Error, "Construction: " + r.error_message);
         else {
             if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
@@ -2600,7 +2706,7 @@ void SketchMode::addAirfoil(AppState& st, const std::vector<std::array<double, 2
     bool first = true;
     auto add = [&](const nlohmann::json& entity) -> std::string {
         nlohmann::json op = {{"op", "sketch_add_entity"}, {"sketch", fid_}, {"entity", entity}};
-        auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}), /*coalesce=*/!first);
+        auto r = applySketchOps(st, nlohmann::json::array({op}), /*coalesce=*/!first);
         first = false;
         if (!r.ok) { st.addLog("[sketch] airfoil part failed: " + r.error_message); return std::string(); }
         if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
@@ -2623,7 +2729,7 @@ void SketchMode::addAirfoil(AppState& st, const std::vector<std::array<double, 2
 
     auto con = [&](const nlohmann::json& c) {
         nlohmann::json op = {{"op", "sketch_add_constraint"}, {"sketch", fid_}, {"constraint", c}};
-        st.docMirror.applyOps(st.worker, nlohmann::json::array({op}), /*coalesce=*/true);
+        applySketchOps(st, nlohmann::json::array({op}), /*coalesce=*/true);
     };
     const std::string uLE = up + ".p0";
     const std::string uTE = up + ".p" + std::to_string(upper.size() - 1);
@@ -2651,7 +2757,7 @@ void SketchMode::applyCornerOp(AppState& st, const std::string& line2) {
                          {"sketch", fid_}, {"e1", corner1Id_}, {"e2", line2}};
     if (fillet) op["radius"]   = skFilletRadius_;
     else        op["distance"] = skChamferDist_;
-    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    auto r = applySketchOps(st, nlohmann::json::array({op}));
     if (!r.ok) {
         // Engine refused (bad corner / unsupported entity): surface the message, keep tool armed.
         std::string msg = r.error_message.empty()
@@ -2674,7 +2780,7 @@ void SketchMode::applyMirrorOp(AppState& st, const std::string& lineId) {
     for (const auto& id : mpSel_) eids.push_back(id);
     nlohmann::json op = {{"op", "sketch_mirror_entities"}, {"sketch", fid_},
                          {"entities", eids}, {"line", lineId}};
-    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    auto r = applySketchOps(st, nlohmann::json::array({op}));
     if (!r.ok) {
         std::string msg = r.error_message.empty() ? std::string("Mirror failed") : r.error_message;
         st.addLog("[sketch] mirror failed: " + msg);
@@ -2701,7 +2807,7 @@ void SketchMode::applyPatternOp(AppState& st, bool circular) {
         op["dir"] = nlohmann::json::array({patternDirU_, patternDirV_});
         op["spacing"] = patternSpacing_;
     }
-    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    auto r = applySketchOps(st, nlohmann::json::array({op}));
     if (!r.ok) {
         std::string msg = r.error_message.empty() ? std::string("Pattern failed") : r.error_message;
         st.addLog("[sketch] pattern failed: " + msg);
@@ -2718,7 +2824,7 @@ void SketchMode::applyConvertRefs(AppState& st, const nlohmann::json& refs) {
     if (!refs.is_array() || refs.empty()) return;
     nlohmann::json op = {{"op", "sketch_convert"}, {"sketch", fid_},
                          {"refs", refs}, {"associative", true}};
-    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    auto r = applySketchOps(st, nlohmann::json::array({op}));
     if (!r.ok) {
         std::string msg = r.error_message.empty() ? std::string("Convert failed") : r.error_message;
         st.addLog("[sketch] convert failed: " + msg);
@@ -2735,7 +2841,7 @@ void SketchMode::applyMoveOp(AppState& st, float dx, float dy, bool copy) {
     for (const auto& id : mpSel_) eids.push_back(id);
     nlohmann::json op = {{"op", "sketch_move"}, {"sketch", fid_},
                          {"entities", eids}, {"dx", dx}, {"dy", dy}, {"copy", copy}};
-    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    auto r = applySketchOps(st, nlohmann::json::array({op}));
     if (!r.ok) {
         std::string msg = r.error_message.empty() ? std::string("Move failed") : r.error_message;
         st.addLog("[sketch] move failed: " + msg);
@@ -2791,7 +2897,7 @@ void SketchMode::applyRotateOp(AppState& st, float cx, float cy, float angleDeg,
     for (const auto& id : mpSel_) eids.push_back(id);
     nlohmann::json op = {{"op", "sketch_rotate"}, {"sketch", fid_}, {"entities", eids},
                          {"cx", cx}, {"cy", cy}, {"angle", angleDeg}, {"copy", copy}};
-    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    auto r = applySketchOps(st, nlohmann::json::array({op}));
     if (!r.ok) {
         std::string msg = r.error_message.empty() ? std::string("Rotate failed") : r.error_message;
         st.addLog("[sketch] rotate failed: " + msg);
@@ -3197,7 +3303,7 @@ int SketchMode::hitTestEntity(const ImVec2& s, float maxPx) const {
                 float px = a.x + t * vx, py = a.y + t * vy;
                 return (px - s.x) * (px - s.x) + (py - s.y) * (py - s.y);
             };
-            std::vector<ImVec2> uv; bool cl; entityBoundaryUV(e, uv, cl);
+            auto& uv = boundaryScratch_; bool cl; entityBoundaryUV(e, uv, cl);
             for (size_t k = 1; k < uv.size(); ++k)
                 d2 = std::fmin(d2, segD2(uvToScreen(uv[k-1].x, uv[k-1].y), uvToScreen(uv[k].x, uv[k].y)));
             if (e.type == "slot")   // straight centerline spine
@@ -3624,10 +3730,10 @@ int SketchMode::regionContaining(const std::string& entId) const {
 
 // Stroke an entity's outline on top of the geometry (hover pre-highlight / loop preview).
 void SketchMode::strokeEntityOutline(ImDrawList* dl, const SketchEntity& e, ImU32 c, float th) const {
-    std::vector<ImVec2> uv; bool closed; entityBoundaryUV(e, uv, closed);
+    auto& uv = boundaryScratch_; bool closed; entityBoundaryUV(e, uv, closed);
     if (uv.empty()) return;
     if (uv.size() == 1) { dl->AddCircle(uvToScreen(uv[0].x, uv[0].y), 5.0f * ui::uiScale, c, 0, th); return; }
-    std::vector<ImVec2> sp; sp.reserve(uv.size());
+    auto& sp = projectedScratch_; sp.clear(); sp.reserve(uv.size());
     for (const auto& p : uv) sp.push_back(uvToScreen(p.x, p.y));
     for (size_t i = 1; i < sp.size(); ++i) dl->AddLine(sp[i - 1], sp[i], c, th);
     if (closed) dl->AddLine(sp.back(), sp.front(), c, th);
@@ -3715,24 +3821,24 @@ void SketchMode::queueSketchDrag(AppState& st, nlohmann::json extra) {
 
 void SketchMode::kickSketchDragAsync(AppState& st) {
     if (dragInFlight_ || !dragPending_) return;
-    if (!st.docMirror.hasDoc() || !st.workerStarted || fid_.empty()) return;
+    if (!st.docMirror.hasDoc() || st.docMirror.docId() != docId_ || !st.workerStarted ||
+        fid_.empty() || sketchSessionId_ == 0) return;
     dragPending_ = false;
     dragInFlight_ = true;
     const int gen = ++dragGen_;
     nlohmann::json params = dragPendingExtra_;
     params["doc_id"] = st.docMirror.docId();
     params["sketch"] = fid_;
+    params["session_id"] = sketchSessionId_;
     st.rpc.call("sketch_drag", std::move(params),
                 [this, &st, gen](const core::RpcResult& r) {
-                    // Always clear in-flight so a superseded drag can re-kick if still pending.
+                    if (gen != dragGen_) return;
                     dragInFlight_ = false;
-                    if (gen != dragGen_) {
-                        // Bumped by cancel/exit — drop; re-kick only if still pending for a live drag.
-                        if (dragPending_ && (dragging_ || groupDragging_)) kickSketchDragAsync(st);
-                        return;
-                    }
-                    if (r.ok && r.result.is_object() && !r.result.contains("code"))
+                    if (r.ok && r.result.is_object() && !r.result.contains("code")) {
+                        sketchRevision_ = r.result.value("revision", -1L);
+                        if (sketchRevision_ != cancelRevision_) cancelRevision_ = -1;
                         applyEnterResult(r.result);
+                    }
                     else if (!r.ok)
                         st.addLog(std::string("[sketch] sketch_drag transport error: ") + r.err);
                     // Next sample (or the one that arrived while this was in flight).
@@ -4125,7 +4231,7 @@ void SketchMode::applyDragSnapRelations(AppState& st, bool groupDrag) {
     nlohmann::json ops = nlohmann::json::array();
     for (const auto& c : cs)
         ops.push_back({{"op", "sketch_add_constraint"}, {"sketch", fid_}, {"constraint", c}});
-    auto r = st.docMirror.applyOps(st.worker, ops);
+    auto r = applySketchOps(st, ops);
     if (!r.ok) { st.addLog("[sketch] drag-snap relation failed: " + r.error_message); return; }
     if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
     resolve(st);
@@ -4957,7 +5063,7 @@ void SketchMode::dimOpenModify(const ImVec2& at) {
 // tear down the Modify box. Used by the dimCommit edit path and by "Apply anyway" on the edit
 // over-define modal.
 void SketchMode::applyDimEditOp(AppState& st, const nlohmann::json& op) {
-    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+    auto r = applySketchOps(st, nlohmann::json::array({op}));
     if (!r.ok) { st.toast(ui::ToastLevel::Error, "Dimension: " + r.error_message); dimError_ = r.error_message; return; }
     if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
     resolve(st);
@@ -5042,7 +5148,7 @@ void SketchMode::overDefCommit(AppState& st, bool driven) {
     if (driven) con["driven"] = true;
     nlohmann::json ops = nlohmann::json::array({
         {{"op", "sketch_add_constraint"}, {"sketch", fid_}, {"constraint", con}}});
-    auto r = st.docMirror.applyOps(st.worker, ops);
+    auto r = applySketchOps(st, ops);
     if (!r.ok) {
         // Over-define protection: surface the engine error, never silently drop.
         st.toast(ui::ToastLevel::Error, "Dimension: " + r.error_message);
@@ -5193,13 +5299,22 @@ void SketchMode::inSketchRedo(AppState& st) {
 // Shared post-undo/redo refresh: resync the mirror, re-solve the active sketch, or close cleanly
 // if the sketch feature itself was undone/redone away.
 void SketchMode::afterSketchHistory(AppState& st) {
+    cancelRevision_ = -1;
     resyncMirror(st);
     // Does the sketch still exist? Re-solving an absent sketch returns an error envelope.
     nlohmann::json res;
     if (!callSketch(st, "sketch_solve", nlohmann::json::object(), res)) {
         st.toast(ui::ToastLevel::Info, "Sketch removed by undo — closing");
-        // The sketch feature is gone; drop out cleanly without re-exiting the worker sketch.
-        active_ = false; isNewEmpty_ = false; fid_.clear();
+        // The feature may no longer exist; discard only this editor's transient session.
+        if (sketchSessionId_ != 0 && st.workerStarted) {
+            nlohmann::json discard;
+            std::string err;
+            st.worker.call("sketch_exit", {{"doc_id", docId_}, {"sketch", fid_},
+                                          {"session_id", sketchSessionId_},
+                                          {"discard_active", true}}, discard, err);
+        }
+        active_ = false; isNewEmpty_ = false; fid_.clear(); docId_.clear();
+        sketchSessionId_ = 0; sketchRevision_ = -1;
         ents_.clear(); cons_.clear(); autoPlace_.clear(); projRefs_.clear(); cancelCheckpoint_.clear();
         status_.clear(); dof_ = 0;
         conflicting_.clear(); redundant_.clear(); solveRejected_ = false;   // C50f
@@ -5418,7 +5533,7 @@ void SketchMode::drawGhosts(AppState& st, const ImVec2& imgMin, const ImVec2& im
                 // C42/M-1: a "spline" ghosts its SMOOTH curve (Catmull-Rom through-points) so it
                 // doesn't read as sharp-cornered; a "style_spline" ghosts its control polygon.
                 const std::vector<ImVec2>& gp =
-                    (e.type == "spline") ? catmullRomUV(e.pts) : e.pts;
+                    (e.type == "spline") ? catmullRomUV(e) : e.pts;
                 for (size_t i = 1; i < gp.size(); ++i) {
                     ImVec2 a, b;
                     if (uv2s(gp[i - 1].x, gp[i - 1].y, a) && uv2s(gp[i].x, gp[i].y, b))
@@ -6573,20 +6688,6 @@ bool SketchMode::sketchOrbitCenter(Vec3& world) const {
 
 void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, const ImVec2& imgMax,
                              int vw, int vh, bool imgHovered) {
-    if ((active_ || planePicking_) && st.docLockedByAgent(
-            docId_.empty() ? st.docMirror.docId() : docId_)) {
-        std::string part = "part";
-        const std::string did = docId_.empty() ? st.docMirror.docId() : docId_;
-        for (const auto& tab : st.docTabs)
-            if (tab.docId == did) { part = tab.title; break; }
-        if (active_) exitSketch(st, /*keep=*/true);
-        planePicking_ = false;
-        planeEditFid_.clear();
-        st.sketchPlanePickActive = false;
-        st.toast(ui::ToastLevel::Info,
-                 "Agent started editing " + part + " — your sketch was kept and closed");
-        return;
-    }
     if (!st.renderer) return;
     // GUI-picking overhaul: default to "hot" (blocks the viewport's model-pick fallback) any time a
     // drawing/edit tool owns the cursor (tool_ != None) or before the idle-hover pass below runs;
@@ -7099,7 +7200,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     for (const auto& ref : c.refs)
                         if (const auto* e = entById(skBaseId(ref)); e && e->externalPierce)
                             type = "pierce";
-                relationBadges_.push_back({c.id, std::move(type), pos, anchor});
+                relationBadges_.push_back({c.id, std::move(type), pos, anchor, c.automatic});
             };
             for (const auto& c : cons_) {
                 if (c.isDimensional() || c.refs.empty()) continue;
@@ -7152,11 +7253,13 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             dl->AddRect(c0, c1, flagged ? problem : (hot ? relSelBorder : relBorder),
                         3.5f * ui::uiScale, 0, ((flagged || hot) ? 1.8f : 1.2f) * ui::uiScale);
             drawRelationGlyph(dl, gp, bs, b.type.c_str(),
-                              flagged ? problem : (hot ? relSelInk : relInk));
+                              flagged ? problem : hot ? relSelInk :
+                              b.automatic ? col(pal.sketchInk, 0.6f) : relInk);
             relHits_.push_back({b.cid, c0, c1});
             if (imgHovered && io.MousePos.x >= c0.x && io.MousePos.x <= c1.x &&
                 io.MousePos.y >= c0.y && io.MousePos.y <= c1.y)
-                ImGui::SetTooltip("%s%s%s", b.type.c_str(), skipped != skipped_.end() ? ": " : "",
+                ImGui::SetTooltip("%s%s%s%s", b.type.c_str(), b.automatic ? " (auto, soft)" : "",
+                                  skipped != skipped_.end() ? ": " : "",
                                   skipped != skipped_.end() ? skipped->second.c_str() : "");
         }
     }
@@ -7178,19 +7281,17 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
     // addSeg accumulates points into a local vector so the polyline dash phase is continuous.
     // DPI-scaled marker sizes shared by the entity loop (endpoint/center dots, point crosses).
     const float dotR = 3.0f * ui::uiScale, ctrR = 2.5f * ui::uiScale;
+    auto& pts = projectedScratch_;
     for (const auto& e0 : ents_) {
-        // A STALE external-ref entity draws DASHED (warning styling) — reuse the
-        // construction dash path on a per-draw copy so every entity-type branch below
-        // inherits it without touching the stored construction flag.
-        SketchEntity e = e0;
-        if (e.externalStale) e.construction = true;
+        const auto& e = e0;
+        const bool construction = e.construction || e.externalStale;
         // C41 (T2): selected entities render in the (canvas-darkened) accent, slightly thicker.
         bool sel = !selIds_.empty() && isSelected(e.id);
         ImU32 cc = sel ? canvasAccent() : statusCol(e);
         float th = ((e0.construction ? 1.0f : 2.0f) + (sel ? 1.0f : 0.0f)) * ui::uiScale;
         // Helper: stroke a polyline; uses dashed rendering for construction entities.
         auto strokePoly = [&](const std::vector<ImVec2>& pts) {
-            if (e.construction) {
+            if (construction) {
                 drawDashedPolyline(dl, pts, cc, th, kConDash, kConGap);
             } else {
                 for (size_t i = 1; i < pts.size(); ++i)
@@ -7199,7 +7300,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         };
         if (e.type == "line") {
             ImVec2 a = uvToScreen(e.p1[0], e.p1[1]), b = uvToScreen(e.p2[0], e.p2[1]);
-            if (e.construction) {
+            if (construction) {
                 drawDashedLine(dl, a, b, cc, th, kConDash, kConGap);
             } else {
                 dl->AddLine(a, b, cc, th);
@@ -7212,7 +7313,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             ImVec2 sc0 = uvToScreen(e.center[0], e.center[1]);
             ImVec2 sr0 = uvToScreen(e.center[0] + e.radius, e.center[1]);
             int seg = circleSegs(std::hypot(sr0.x - sc0.x, sr0.y - sc0.y));
-            std::vector<ImVec2> pts; pts.reserve(seg + 1);
+            pts.clear(); pts.reserve(seg + 1);
             for (int i = 0; i <= seg; ++i) {
                 float a = i / (float)seg * 6.2831853f;
                 pts.push_back(uvToScreen(e.center[0] + e.radius * std::cos(a),
@@ -7229,7 +7330,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             float sweepFrac = (a1 - a0) / 360.0f;
             int seg = std::max(12, (int)(circleSegs(std::hypot(sr0.x - sc0.x, sr0.y - sc0.y)) *
                                          sweepFrac));
-            std::vector<ImVec2> pts; pts.reserve(seg + 1);
+            pts.clear(); pts.reserve(seg + 1);
             for (int i = 0; i <= seg; ++i) {
                 float a = (a0 + (a1 - a0) * (i / (float)seg)) * 3.14159265f / 180.0f;
                 pts.push_back(uvToScreen(e.center[0] + e.radius * std::cos(a),
@@ -7252,8 +7353,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             float axis1 = std::atan2(e.p1[1] - e.p2[1], e.p1[0] - e.p2[0]);  // outward at p1
             float axis2 = std::atan2(e.p2[1] - e.p1[1], e.p2[0] - e.p1[0]);  // outward at p2
             // Sample a half-circle arc (180 deg centered on `axis`) around end `c`.
-            auto halfArc = [&](const float* c, float axis) {
-                std::vector<ImVec2> pts; pts.reserve(25);
+            auto halfArc = [&](const float* c, float axis) -> const std::vector<ImVec2>& {
+                pts.clear(); pts.reserve(25);
                 for (int i = 0; i <= 24; ++i) {
                     float ang = axis - 1.5707963f + 3.14159265f * (i / 24.0f);
                     pts.push_back(uvToScreen(c[0] + hw * std::cos(ang), c[1] + hw * std::sin(ang)));
@@ -7261,7 +7362,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 return pts;
             };
             ImVec2 a = uvToScreen(e.p1[0], e.p1[1]), b = uvToScreen(e.p2[0], e.p2[1]);
-            if (e.construction) {
+            if (construction) {
                 drawDashedLine(dl, s1a, s1b, cc, th, kConDash, kConGap);
                 drawDashedLine(dl, s2a, s2b, cc, th, kConDash, kConGap);
                 drawDashedPolyline(dl, halfArc(e.p1, axis1), cc, th, kConDash, kConGap);
@@ -7286,8 +7387,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             const float D2R = 3.14159265f / 180.0f;
             float hw = e.width * 0.5f;
             float a0 = e.start, a1 = e.end; if (a1 < a0) a1 += 360.0f;
-            auto arcPts = [&](float rad, int seg) {
-                std::vector<ImVec2> pts; pts.reserve(seg + 1);
+            auto arcPts = [&](float rad, int seg) -> const std::vector<ImVec2>& {
+                pts.clear(); pts.reserve(seg + 1);
                 for (int i = 0; i <= seg; ++i) {
                     float a = (a0 + (a1 - a0) * (i / (float)seg)) * D2R;
                     pts.push_back(uvToScreen(e.center[0] + rad * std::cos(a),
@@ -7295,12 +7396,12 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 }
                 return pts;
             };
-            auto capPts = [&](float aDeg) {
+            auto capPts = [&](float aDeg) -> const std::vector<ImVec2>& {
                 float sa = aDeg * D2R;
                 float sx = e.center[0] + e.radius * std::cos(sa);
                 float sy = e.center[1] + e.radius * std::sin(sa);
                 int seg = 24;
-                std::vector<ImVec2> pts; pts.reserve(seg + 1);
+                pts.clear(); pts.reserve(seg + 1);
                 for (int i = 0; i <= seg; ++i) {
                     float t = (aDeg - 90.0f + 180.0f * (i / (float)seg)) * D2R;
                     pts.push_back(uvToScreen(sx + hw * std::cos(t), sy + hw * std::sin(t)));
@@ -7323,7 +7424,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             const float D2R = 3.14159265f / 180.0f;
             float ca = std::cos(e.rot * D2R), sa = std::sin(e.rot * D2R);
             int seg = 64;
-            std::vector<ImVec2> pts; pts.reserve(seg + 1);
+            pts.clear(); pts.reserve(seg + 1);
             for (int i = 0; i <= seg; ++i) {
                 float a = i / (float)seg * 6.2831853f;
                 float lx = e.rx * std::cos(a), ly = e.ry * std::sin(a);
@@ -7338,8 +7439,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             // A "style_spline" is a by-poles curve — keep showing its control polygon (the
             // SolidWorks convention) plus its pole markers.
             const std::vector<ImVec2>& src =
-                (e.type == "spline") ? catmullRomUV(e.pts) : e.pts;
-            std::vector<ImVec2> pts; pts.reserve(src.size());
+                (e.type == "spline") ? catmullRomUV(e) : e.pts;
+            pts.clear(); pts.reserve(src.size());
             for (const auto& q : src) pts.push_back(uvToScreen(q.x, q.y));
             strokePoly(pts);
             for (const auto& q : e.pts) dl->AddCircleFilled(uvToScreen(q.x, q.y), ctrR, cc);
@@ -7420,9 +7521,10 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             }
             bool conflict = isConflict(c.id);
             const bool skipped = skipped_.find(c.id) != skipped_.end();
-            ImU32 lc = conflict ? dimErrCol : skipped ? col(pal.statusWarn) : dimLineCol;
+            ImU32 lc = conflict ? dimErrCol : skipped ? col(pal.statusWarn) :
+                       c.automatic ? col(pal.sketchDimLine, 0.5f) : dimLineCol;
             ImU32 tc = conflict ? dimErrCol : skipped ? col(pal.statusWarn) :
-                       (c.driven ? dimDrivenCol : dimTextCol);
+                       (c.driven || c.automatic ? dimDrivenCol : dimTextCol);
             DimHit hit; hit.cid = c.id;
             drawDimension(dl, c, lc, tc, false, pu, pv, &hit);
             drawn.push_back({&c, pu, pv, conflict, hit});
@@ -7522,7 +7624,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 // Persist the new placement via sketch_set_dim {placement}.
                 nlohmann::json op = {{"op", "sketch_set_dim"}, {"sketch", fid_}, {"id", dimDragCid_},
                     {"placement", nlohmann::json::array({dimDragPlace_.x, dimDragPlace_.y})}};
-                auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+                auto r = applySketchOps(st, nlohmann::json::array({op}));
                 if (!r.ok) st.toast(ui::ToastLevel::Warn, "Move dimension: " + r.error_message);
                 else { autoPlace_[dimDragCid_] = dimDragPlace_;
                        if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
@@ -7571,7 +7673,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 ops.push_back({{"op", "sketch_delete_constraint"}, {"sketch", fid_}, {"id", cid}});
             // Empty ops (only virtual refs selected) — just clear selection, no RPC.
             if (!ops.empty()) {
-                auto r = st.docMirror.applyOps(st.worker, ops);
+                auto r = applySketchOps(st, ops);
                 if (!r.ok) st.toast(ui::ToastLevel::Error, "Delete: " + r.error_message);
                 else {
                     if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
@@ -7593,7 +7695,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         // Delete key removes the hovered dim.
         if (!relationsOwnKeyboard && !dimHoverCid_.empty() && ImGui::IsKeyPressed(ImGuiKey_Delete)) {
             nlohmann::json op = {{"op", "sketch_delete_constraint"}, {"sketch", fid_}, {"id", dimHoverCid_}};
-            auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+            auto r = applySketchOps(st, nlohmann::json::array({op}));
             if (!r.ok) st.toast(ui::ToastLevel::Error, "Delete dimension: " + r.error_message);
             else { if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
                    autoPlace_.erase(dimHoverCid_); resolve(st); }
@@ -8050,9 +8152,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         }
         // (Handle/entity/loop/relation hover highlight is drawn by the C51 pre-highlight above.)
 
-        // C37-D: right-click with no tool active -> small context menu (gestures are off in-sketch,
-        // so the RMB is free; consume it before anything else can).
-        if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right) && !dimPopupOpen_)
+        // Right-click with no tool active opens the sketch context menu.
+        if (imgHovered && rightClickReleased() && !dimPopupOpen_)
             ImGui::OpenPopup("##SketchCtx");
     }
     ui::pushContextMenuStyle();
@@ -8098,7 +8199,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 for (const auto& cid : selRelIds_)
                     ops.push_back({{"op", "sketch_delete_constraint"}, {"sketch", fid_}, {"id", cid}});
                 if (!ops.empty()) {
-                    auto r = st.docMirror.applyOps(st.worker, ops);
+                    auto r = applySketchOps(st, ops);
                     if (!r.ok) st.toast(ui::ToastLevel::Error, "Delete: " + r.error_message);
                     else {
                         if (!r.aicm_path.empty()) { std::string le; st.loadDocMesh(r.aicm_path, le); }
@@ -8122,9 +8223,15 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         if (ImGui::MenuItem("Fully Define Sketch")) fullyDefine(st);
         if (ImGui::MenuItem("Display/Delete Relations", nullptr, relationsPanel_.open))
             relationsPanel_.open = !relationsPanel_.open;
-        if (ImGui::MenuItem("Grid", nullptr, showGrid_)) showGrid_ = !showGrid_;
+        if (ImGui::MenuItem("Grid", nullptr, showGrid_)) {
+            showGrid_ = !showGrid_;
+            st.settings.sketchShowGrid = showGrid_;  // new documents start from the last choice
+            saveSettings(st.settings);
+        }
         if (ImGui::MenuItem("Automatic Relations", nullptr, autoAlignRelations_)) {
             autoAlignRelations_ = !autoAlignRelations_;
+            st.settings.sketchAutoRelations = autoAlignRelations_;
+            saveSettings(st.settings);
             st.toast(ui::ToastLevel::Info, autoAlignRelations_
                      ? "Automatic relations: On (snapped alignments add vertical/horizontal relations)"
                      : "Automatic relations: Off (alignment guides stay positional)");
@@ -8200,7 +8307,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 nlohmann::json op = {{"op", "sketch_trim"}, {"sketch", fid_},
                     {"entity", e.id}, {"point", nlohmann::json::array({mu, mv})},
                     {"keep_construction", trimKeepConstruction_}};
-                auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+                auto r = applySketchOps(st, nlohmann::json::array({op}));
                 if (!r.ok) {
                     st.addLog("[sketch] trim failed: " + r.error_message);
                     st.toast(ui::ToastLevel::Warn, r.error_message);
@@ -8265,7 +8372,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 } else {
                     nlohmann::json op = {{"op", "sketch_extend"}, {"sketch", fid_},
                         {"entity", e.id}, {"end", whichEnd}};
-                    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+                    auto r = applySketchOps(st, nlohmann::json::array({op}));
                     if (!r.ok) {
                         st.addLog("[sketch] extend failed: " + r.error_message);
                         st.toast(ui::ToastLevel::Warn, r.error_message);
@@ -8342,7 +8449,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                     nlohmann::json op = {{"op", "sketch_offset"}, {"sketch", fid_},
                         {"entities", eids}, {"distance", offsetDist_},
                         {"side", nlohmann::json::array({mu, mv})}};
-                    auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+                    auto r = applySketchOps(st, nlohmann::json::array({op}));
                     if (!r.ok) {
                         st.addLog("[sketch] offset failed: " + r.error_message);
                         st.toast(ui::ToastLevel::Warn, r.error_message);
@@ -9545,7 +9652,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
                 // Apply directly so we can capture the new line id for the next chain segment.
                 nlohmann::json op = {{"op", "sketch_add_entity"}, {"sketch", fid_},
                                      {"entity", ent}, {"constraints", cs}};
-                auto r = st.docMirror.applyOps(st.worker, nlohmann::json::array({op}));
+                auto r = applySketchOps(st, nlohmann::json::array({op}));
                 std::string newId;
                 if (!r.ok) {
                     st.toast(ui::ToastLevel::Error,
@@ -9963,7 +10070,7 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             if (!io.WantTextInput && toolUV_.size() >= 2 &&
                 (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)))
                 finish = true;
-            if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+            if (imgHovered && rightClickReleased()) {
                 if (toolUV_.size() >= 2) finish = true;
                 else { toolUV_.clear(); toolSnaps_.clear(); }
             }
@@ -9983,10 +10090,9 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
         }
         // C37-D: right-click ends the current chain/segment but keeps the tool armed (SW muscle
         // memory: the Line tool drops its in-progress points and waits for a fresh first point).
-        // mouse_gestures is disabled in-sketch (viewport_panel), so the RMB is free here; consume it.
         // C42: Spline / Style Spline own their RMB (finish/drop, handled above).
         if (tool_ != SketchTool::Spline && tool_ != SketchTool::StyleSpline && imgHovered &&
-            ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+            rightClickReleased()) {
             toolUV_.clear(); toolSnaps_.clear(); chainPrevId_.clear();
         }
         // ESC ends the tool.
@@ -10152,8 +10258,8 @@ void SketchMode::drawOverlay(AppState& st, ImGuiIO& io, const ImVec2& imgMin, co
             if (!dimPicks_.empty()) { dimPicks_.clear(); dimHasPending_ = false; dimPending_ = nullptr; }
             else cancelTool();
         }
-        // Right-click also clears the pick buffer (consume it; gestures off in-sketch).
-        if (imgHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+        // Right-click also clears the pick buffer.
+        if (imgHovered && rightClickReleased()) {
             dimPicks_.clear(); dimHasPending_ = false; dimPending_ = nullptr;
         }
     } else if (st.hover.valid()) {

@@ -141,3 +141,10 @@ uncreatable and undeletable through the ops vocabulary. These close that hole.
 `sch_add_sheet {parent?, name?, size?}`, `sch_add_sheet_symbol {child, pos, pins?, sheet?}` and
 `sch_add_sheet_pin {id, name, pos, shape?}` shipped in v1's registry but were never listed here.
 They are part of the frozen vocabulary.
+
+## KiCad import — contract revision v2
+
+The earlier `sch_import_kicad` import-as-foreign-format description is superseded:
+KiCad schematic files are the document of record and normal project/file access uses
+`ecad_open` / `ecad_save`. The MCP import/export tools follow those open/save semantics;
+the in-house canvas is a read-only preview, not an op-submitting editor.

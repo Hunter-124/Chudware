@@ -1,6 +1,7 @@
 #include "geom/text.h"
 
 #include "geom/booleans.h"  // geom::fuse / geom::cut (IsDone-checked, empty on fail)
+#include "util/platform_paths.h"  // developerSourceRoot: the checkout's shared assets/fonts
 
 #include <algorithm>
 #include <cctype>
@@ -8,6 +9,14 @@
 #include <cstdlib>
 #include <filesystem>
 #include <vector>
+
+#ifndef _WIN32
+#include <dlfcn.h>  // dladdr: locate the loaded libchudware module
+#include <cstdint>
+#include <cstdlib>
+#include <fstream>
+#include <string>
+#endif
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -226,6 +235,56 @@ TextResult emboss_text(const TopoDS_Shape& body, const gp_Pnt& face_origin,
     }
 }
 
+namespace {
+
+// Absolute directory of the module this code is linked into (libchudware.{dll,so,dylib}, or
+// the executable when the engine is linked statically, e.g. unit tests). Empty when unknown.
+std::filesystem::path loaded_module_dir() {
+    namespace fs = std::filesystem;
+#ifdef _WIN32
+    HMODULE self = nullptr;
+    if (::GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                             reinterpret_cast<LPCSTR>(&loaded_module_dir), &self) &&
+        self) {
+        char buf[MAX_PATH] = {0};
+        DWORD n = ::GetModuleFileNameA(self, buf, MAX_PATH);
+        if (n > 0 && n < MAX_PATH) return fs::path(buf).parent_path();
+    }
+    return {};
+#else
+    Dl_info info;
+    if (!::dladdr(reinterpret_cast<void*>(&loaded_module_dir), &info) || !info.dli_fname)
+        return {};
+    fs::path module(info.dli_fname);
+#  if defined(__linux__)
+    // The packaged engine is dlopen'd through /proc/self/fd/N and N is closed afterwards, so
+    // dladdr reports that stale spelling; the memory map still names the real library.
+    if (module.string().rfind("/proc/self/fd/", 0) == 0) {
+        module.clear();
+        const auto address = reinterpret_cast<std::uintptr_t>(&loaded_module_dir);
+        std::ifstream maps("/proc/self/maps");
+        std::string line;
+        while (std::getline(maps, line)) {
+            char* end = nullptr;
+            const std::uintptr_t first = std::strtoull(line.c_str(), &end, 16);
+            if (!end || *end != '-') continue;
+            const std::uintptr_t last = std::strtoull(end + 1, &end, 16);
+            if (address < first || address >= last) continue;
+            const std::size_t slash = line.find('/');
+            if (slash != std::string::npos) module = line.substr(slash);
+            break;
+        }
+    }
+#  endif
+    // dladdr names the main executable by its exec string, which may be relative.
+    if (module.empty() || !module.is_absolute()) return {};
+    return module.parent_path();
+#endif
+}
+
+}  // namespace
+
 std::string resolve_font_path(const std::string& req) {
     namespace fs = std::filesystem;
     std::error_code ec;
@@ -248,26 +307,43 @@ std::string resolve_font_path(const std::string& req) {
     else if (low.find("medium") != std::string::npos)
         file = "Rubik-Medium.ttf";
 
-    // 3. Candidate assets/fonts directories, most-specific first.
+    // 3. Candidate assets/fonts directories, most-specific first:
+    //    explicit dist dir -> install-relative -> source checkout -> (below) system fonts.
     std::vector<fs::path> dirs;
-#ifdef _WIN32
-    {
-        HMODULE self = nullptr;
-        if (::GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                     GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                 reinterpret_cast<LPCSTR>(&resolve_font_path), &self) &&
-            self) {
-            char buf[MAX_PATH] = {0};
-            DWORD n = ::GetModuleFileNameA(self, buf, MAX_PATH);
-            if (n > 0 && n < MAX_PATH)
-                dirs.push_back(fs::path(buf).parent_path() / "assets" / "fonts");
-        }
-    }
-#endif
     if (const char* d = std::getenv("CHUDWARE_DIST"))
         dirs.push_back(fs::path(d) / "assets" / "fonts");
+
+    // Install-relative. Each shipped layout is reached from the engine's directory and from the
+    // executable's (a worker/daemon/test binary may host the engine):
+    //   Windows          <dir>/assets/fonts                       (engine beside the exe)
+    //   AppImage, .deb,  <root>/usr/lib/libchudware.so -> <root>/usr/bin/assets/fonts
+    //   .rpm (/opt/chudware)   (packaging/linux/build_appimage.sh:412,465)
+    //   macOS bundle     Contents/Frameworks/libchudware.dylib -> Contents/MacOS/assets/fonts
+    //                    (packaging/macos/build_app.sh:393,412)
+    // and <dir>/assets/fonts when the engine sits beside the assets (usr/bin, Contents/MacOS).
+    std::vector<fs::path> bases;
+    bases.push_back(loaded_module_dir());
+    {
+        const std::string exe = ::chudware::platform::executablePath();
+        if (!exe.empty()) bases.push_back(fs::u8path(exe).parent_path());
+    }
+    std::vector<fs::path> seen;
+    for (const fs::path& base : bases) {
+        if (base.empty() || std::find(seen.begin(), seen.end(), base) != seen.end()) continue;
+        seen.push_back(base);
+        dirs.push_back(base / "assets" / "fonts");
+        dirs.push_back(base.parent_path() / "bin" / "assets" / "fonts");
+        dirs.push_back(base.parent_path() / "MacOS" / "assets" / "fonts");
+    }
+
     dirs.push_back(fs::path("dist") / "Chudware" / "assets" / "fonts");  // repo-root run
-    dirs.push_back(fs::path("host") / "assets" / "fonts");             // dev tree
+    // Developer checkout (engine run from a build tree, e.g. ctest with cwd = the build dir):
+    // the shared repo-root assets/ (moved out of host/ by the T-G11 de-dup). Anchored on the
+    // executable / working directory's checkout, so it resolves wherever the build tree lives.
+    // Without it a tree run uses whatever system font the scan hits first; on an image with
+    // only variable fonts (Cantarell/Noto VF) every mark came out as "detached bodies".
+    const fs::path source_root = ::chudware::platform::developerSourceRoot();
+    if (!source_root.empty()) dirs.push_back(source_root / "assets" / "fonts");
 
     for (const fs::path& d : dirs) {
         fs::path c = d / file;

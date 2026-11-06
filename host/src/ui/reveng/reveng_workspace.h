@@ -1,10 +1,10 @@
 // Reverse Engineering workspace: full-viewport body for the "Reverse Eng" title-bar tab.
 // Honest scan -> mesh -> AI -> parametric pipeline shell (contracts/reveng.md).
 //
-// RE-40 layout: a session rail on the left (rich cards, filter, New-session card), the stage
-// STEPPER pinned at the TOP of the centre column above the active stage body, and a
-// Details / Capabilities / Provenance properties column on the right. Both side columns
-// collapse to a header strip + chevron.
+// Layout: a session rail on the left (sessions of the current working folder only, filter,
+// New-session card), the intake selector (Scan / From reference) and stage STEPPER pinned at the
+// TOP of the centre column above the active stage body, and a Session summary column on the
+// right. Both side columns collapse to a header strip + chevron.
 #pragma once
 
 #include <string>
@@ -20,6 +20,13 @@ namespace ui {
 void drawRevEngWorkspace(AppState& st);
 
 namespace reveng {
+// The working folder (top-left selector) RE sessions belong to, sent as `project_dir` to every
+// call that lists or creates sessions. Empty in the browser build, whose worker is already
+// scoped to the signed-in workspace.
+std::string revengProjectDir(AppState& st);
+// Route a recognized video or Gaussian input from File/Open, the explorer, or a drop.
+// Splat conversion and session creation are asynchronous.
+void openSourceFile(AppState& st, const std::string& path);
 // Gaussian-only reconstruction does not require CAD scale or produce a mesh.
 // These async actions are shared by imported sources and live camera capture. Finish/cancel
 // retain per-run intent through a pending start; finish also waits for accepted-image ingest.

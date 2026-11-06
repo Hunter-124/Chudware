@@ -30,7 +30,7 @@ one UPDATE, not 100.
 
 Environment:
 
-- ``CHUDWARE_PAGE_CACHE=0``       — kill switch; nothing is read, written, or created.
+- ``CHUDWARE_PAGE_CACHE=0``       — skip reads/writes; invalidation still purges old entries.
 - ``CHUDWARE_PAGE_CACHE_TTL_S``   — entry lifetime in seconds (default 6 h).
 - ``CHUDWARE_PAGE_CACHE_MAX_MB``  — total on-disk budget in MiB (default 512).
 
@@ -75,6 +75,8 @@ CREATE TABLE IF NOT EXISTS pages (
     site       TEXT,
     url        TEXT,
     status     INT,
+    final_url  TEXT,
+    session_profile_used TEXT,
     fetched_ts REAL,
     last_used  REAL,
     bytes      INT,
@@ -93,6 +95,7 @@ _last_flush = 0.0
 _last_evict = 0.0
 _hits = 0
 _misses = 0
+_generation = 0
 
 
 # --- configuration -------------------------------------------------------------
@@ -152,6 +155,10 @@ def _connect() -> sqlite3.Connection | None:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.executescript(_SCHEMA)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(pages)")}
+        for column in ("final_url", "session_profile_used"):
+            if column not in columns:
+                conn.execute(f"ALTER TABLE pages ADD COLUMN {column} TEXT")
         conn.commit()
     except Exception:  # noqa: BLE001 — unwritable dir / corrupt db / locked file
         return None
@@ -246,6 +253,12 @@ def _flush_locked(*, force: bool = False) -> None:
 
 # --- public API ----------------------------------------------------------------
 
+def generation() -> int:
+    """Snapshot cache invalidations before starting a network fetch."""
+    with _lock:
+        return _generation
+
+
 def get(url: str, site: str, *, max_age_s: float | None = None) -> dict | None:
     """Return the cached ``browser_fetch`` payload for ``(site, url)``, or None.
 
@@ -267,7 +280,8 @@ def get(url: str, site: str, *, max_age_s: float | None = None) -> dict | None:
                 return None
             try:
                 row = conn.execute(
-                    "SELECT status, fetched_ts, blob_path FROM pages WHERE key=?",
+                    "SELECT status, fetched_ts, blob_path, final_url, session_profile_used "
+                    "FROM pages WHERE key=?",
                     (key,)).fetchone()
             except Exception:  # noqa: BLE001 — corrupt/locked index → behave as empty
                 _close_locked()
@@ -276,7 +290,7 @@ def get(url: str, site: str, *, max_age_s: float | None = None) -> dict | None:
             if row is None:
                 _misses += 1
                 return None
-            status, fetched_ts, blob_rel = row
+            status, fetched_ts, blob_rel, final_url, session_profile_used = row
             fetched_ts = float(fetched_ts or 0.0)
             now = time.time()
             age = now - fetched_ts
@@ -292,31 +306,38 @@ def get(url: str, site: str, *, max_age_s: float | None = None) -> dict | None:
                 _delete_locked(conn, [(key, blob_rel)])
                 _misses += 1
                 return None
+            from . import challenge
+            final_url = final_url or url
+            if (challenge.classify_challenge(content, final_url)
+                    or challenge.is_login_page(content, final_url)
+                    or challenge.is_error_page(content)):
+                _delete_locked(conn, [(key, blob_rel)])
+                _misses += 1
+                return None
             _dirty[key] = now
             _flush_locked()
             _hits += 1
     except Exception:  # noqa: BLE001 — belt and braces; a cache never fails a fetch
         return None
-    from .profiles import slug  # lazy: profiles imports paths/json, keep get cheap
-    return {"ok": True, "url": url, "status": status, "content": content,
-            "fetched_ts": _iso(fetched_ts), "session_profile_used": slug(site),
+    return {"ok": True, "url": url, "final_url": final_url, "status": status, "content": content,
+            "fetched_ts": _iso(fetched_ts), "session_profile_used": session_profile_used,
             "cached": True, "age_s": round(max(age, 0.0), 3)}
 
 
-def put(url: str, site: str, payload: dict) -> None:
+def put(url: str, site: str, payload: dict, *, expected_generation: int | None = None) -> None:
     """Store a SUCCESSFUL ``browser_fetch`` payload. No-op for anything else.
 
-    Failures, challenge/interstitial pages and HTTP>=400 responses are never
-    cached: they all arrive as ``ok: False`` §6 envelopes from
-    :mod:`services.browser.session` (which classifies them before we see them),
-    and the status guard below is the second line of defence. Oversized bodies
-    are skipped rather than allowed to dominate the budget. Runs the LRU sweep at
-    most once a minute, on this (write) path only.
+    Failures, incomplete loads, HTTP errors, login pages and challenge/error
+    interstitials are rejected even when a backend reports HTTP 200. Oversized
+    bodies are skipped.
+    A generation snapshot prevents a fetch racing a login/logout purge from
+    repopulating the cache with stale content.
+    The LRU sweep runs at most once a minute on this write path.
     """
     if not enabled():
         return
     try:
-        if not isinstance(payload, dict) or not payload.get("ok"):
+        if not isinstance(payload, dict) or not payload.get("ok") or payload.get("partial_load"):
             return
         content = payload.get("content") or ""
         if not isinstance(content, str) or not content.strip():
@@ -324,12 +345,20 @@ def put(url: str, site: str, payload: dict) -> None:
         status = payload.get("status")
         if isinstance(status, (int, float)) and int(status) >= 400:
             return
+        from . import challenge
+        final_url = payload.get("final_url") or url
+        if (challenge.classify_challenge(content, final_url)
+                or challenge.is_login_page(content, final_url)
+                or challenge.is_error_page(content)):
+            return
         raw = content.encode("utf-8", "replace")
         if len(raw) > _MAX_ENTRY_BYTES:
             return
         key = key_for(url, site)
         rel = _blob_rel(key)
         with _lock:
+            if expected_generation is not None and expected_generation != _generation:
+                return
             conn = _connect()
             if conn is None:
                 return
@@ -352,11 +381,12 @@ def put(url: str, site: str, payload: dict) -> None:
             try:
                 conn.execute(
                     "INSERT OR REPLACE INTO pages"
-                    " (key, site, url, status, fetched_ts, last_used, bytes, blob_path)"
-                    " VALUES (?,?,?,?,?,?,?,?)",
+                    " (key, site, url, status, fetched_ts, last_used, bytes, blob_path,"
+                    " final_url, session_profile_used) VALUES (?,?,?,?,?,?,?,?,?,?)",
                     (key, str(site), str(url),
                      int(status) if isinstance(status, (int, float)) else None,
-                     _epoch(payload.get("fetched_ts")), now, int(size), rel))
+                     _epoch(payload.get("fetched_ts")), now, int(size), rel,
+                     str(final_url), payload.get("session_profile_used")))
                 conn.commit()
             except Exception:  # noqa: BLE001
                 _close_locked()
@@ -394,10 +424,13 @@ def stats() -> dict:
 
 def purge(site: str | None = None) -> int:
     """Drop every entry (or every entry for ``site``). Returns rows removed."""
-    if not enabled():
-        return 0
+    global _generation
     try:
         with _lock:
+            _generation += 1
+            # A disabled cache may be re-enabled later; still invalidate old entries.
+            if not enabled() and not (cache_dir() / "index.sqlite").exists():
+                return 0
             _dirty.clear()
             conn = _connect()
             if conn is None:

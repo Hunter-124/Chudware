@@ -1,4 +1,4 @@
-# Contract: Document Ops — v1.1
+# Contract: Document Ops — v1.2 (v2 amendments below)
 
 > The closed vocabulary of document mutations. The GUI submits these; **the M9 AI modeler emits
 > exactly these as its tool calls.** Design once, freeze here. Changes require a version bump.
@@ -7,6 +7,12 @@
 > insert semantics; `sketch_set_dim` extended to update any subset of `value`/`expr`/`placement`/
 > `driven`; dimensional `distance` gains an optional `axis` and a point-line ref form; dimensional
 > constraints gain an optional `placement` annotation anchor. No existing field changed shape.
+>
+> **v1.2:** additive — `simplify_history` provides conservative, explicitly requested history
+> cleanup through `doc_apply_ops`. Existing op meanings are unchanged.
+>
+> **v2.1 amendment:** hostd document-scoped human-edit attribution and persistence barriers
+> are specified below. The operation vocabulary is unchanged.
 
 ## 1. Envelope
 
@@ -73,6 +79,7 @@ Ops that create objects may be referenced by later ops **in the same batch** as 
 | `add_feature` | `feature` (full envelope, no `id`), `before` (feature id \| null=append) | placeholder-eligible. With `before=null` AND the rollback bar (§ doc `rollback_after`) NOT at the end, the new feature is inserted **immediately after the bar** and the bar moves to sit after it (SolidWorks behavior); otherwise it appends |
 | `edit_feature` | `id`, `params` (patch), `refs` (patch) | patch = present keys replace; `null` deletes an optional key |
 | `delete_feature` | `id`, `cascade:bool=false` | without cascade, fails `dependency_exists` if referenced |
+| `simplify_history` | `features:[feature id…]?` | remove only currently proven-safe candidates; omitted selects all eligible, empty selects none. See below |
 | `reorder_feature` | `id`, `before` (feature id \| null=end) | dependency-validated |
 | `set_suppressed` | `id`, `value:bool` | |
 | `rename` | `id`, `name` | |
@@ -82,6 +89,30 @@ Ops that create objects may be referenced by later ops **in the same batch** as 
 | `set_rollback` | `after: feature id \| null` | move the rollback bar (SolidWorks). `after` = the feature the bar sits AFTER (that feature + its prefix compile; everything after is **rolled back** — see worker_rpc §rebuild `rolled_back`). `null` = bar at the end (compile everything). Validates the feature exists (`invalid_op` otherwise). Undo-able. Tree exposes `rollback_after`; delete/reorder keep it valid (deleting the bar feature moves the bar to the previous surviving feature, or `null`) |
 | `eq_set` | `name`, `expr` | create-or-update; re-validates dependents |
 | `eq_delete` | `name` | fails `eq_in_use` if referenced |
+
+**History cleanup (`simplify_history`):**
+
+`eval_model_history({doc_id})` is a read-only preview of the document-history rules. Its revision,
+findings, safe fixes and limitations are not a geometric or engineering certification. To apply
+cleanup, submit `simplify_history` in a normal `doc_apply_ops` batch with the preview revision as
+`base_revision`. The native engine reanalyzes eligibility under the document lock; a stale base
+revision is rejected rather than applying an outdated preview. No separate mutation endpoint is
+provided.
+
+The proof is conservative: candidates are active unreferenced datum features (plane, axis, point,
+or coordinate system), or literal exactly-zero in-place transforms that are neither referenced
+internally nor externally observable as final output. Internal, metadata, configuration and live
+consumer references are guarded; saved/public documents are blocked when persisted external
+consumers cannot be established. Suppressed, configuration-driven or rolled-back features and
+other uncertain cases are not automatically removed. In particular, face ownership and equal volume
+do not prove that a feature is unused. Findings not proven safe remain advisory.
+
+An explicit `features` list must consist entirely of currently eligible feature IDs; an unknown or
+ineligible ID rejects the entire batch as `invalid_op`, without changing state. Omission requests all
+currently eligible candidates; an empty list requests none. If cleanup makes no change, it does not
+by itself dirty the document, increment the revision, or add an undo entry. Otherwise cleanup obeys
+the same atomic batch and whole-batch undo/redo rules as other document operations; other operations
+in the batch retain their normal effects.
 
 ### Sketch (sketch = feature id of a sketch; placeholder-eligible)
 
@@ -100,9 +131,23 @@ Ops that create objects may be referenced by later ops **in the same batch** as 
 
 **`angle`** is between **two line entity ids** (bare, no sub-handle); the measured angle is reported in `[0, 180)` degrees.
 
+**`rotate_point`** is a signed angular driving constraint with refs
+`[source_point, target_point, pivot_point]` and `value:{value,expr}` in degrees. It enforces
+`target = pivot + R(value) * (source - pivot)`, including when the source is at the pivot.
+The measured value is the signed principal angle in degrees; it is unavailable when either
+point is at the pivot, where geometric angle is undefined.
+An optional `angle_ref` on a follower names an independent explicit driving `rotate_point`
+constraint in the same sketch. Its stored value mirrors the master; edit the master with
+`sketch_set_dim` (follower value/expression/driven edits are rejected). Deleting a master
+cascades to its followers, and the op report lists all removed ids. Overview constraints
+expose `angle_ref`; `sketch_health.angle_links` lists the links.
+
 Geometry helpers (defined now; implemented M2 — same envelope, expand to entity edits server-side):
 `sketch_trim {sketch, entity, at:[x,y]}` · `sketch_extend {sketch, entity, end}` ·
 `sketch_offset {sketch, entities:[ids], distance, side}`
+`sketch_offset` accepts an ordered connected line/arc chain, or one circle, a positive distance
+(number or `{value,expr}`) and a side point `[u,v]`. The resulting spans retain driving distance
+and parallel or concentric relations; unsupported or unjoinable offsets fail the batch.
 
 **Sketch mirror / pattern / convert (C53 — reflect / array / project the selection):**
 
@@ -116,16 +161,17 @@ Geometry helpers (defined now; implemented M2 — same envelope, expand to entit
   copies, then adds relations that keep each pair mirrored: per endpoint-pair `symmetric` (refs
   `[orig.handle, copy.handle, line]`) — `p1`/`p2` for a line, `center` for a circle, `center`/`start`/
   `end` for an arc — plus an `equal` (radius) for circles/arcs. Arc copies flip orientation (`ccw`).
-- **`sketch_pattern_entities`** (`mode:"linear"`) takes `dir:[dx,dy]` (normalized internally), integer
-  `count>=2`, numeric `spacing`; (`mode:"circular"`) takes `center:[x,y]`, integer `count>=2`, numeric
-  `angle`, optional `equal_spacing:bool`. `equal_spacing:true` shares `angle` equally across the ring
-  (`step = angle/count`, e.g. `360` → full ring); otherwise `angle` is the step BETWEEN consecutive
-  instances. It appends `count-1` PLAIN copies (no per-instance relations — a SolidWorks geometry
-  pattern); under-defined like fresh geometry.
+- **`sketch_pattern_entities`** (`mode:"linear"`) takes `dir:[dx,dy]`, `count>=2` and a positive
+  `spacing`; circular mode takes `center:[x,y]`, `count>=2`, `angle` and optional `equal_spacing`.
+  Count includes the source. With `equal_spacing:true`, the angular step is `angle/count`; otherwise
+  it is `angle` per step. An omitted flag defaults to equal spacing for a 360-degree sweep. Cases
+  that would stack copies, including a circle centered on the pattern center, are rejected.
+  Copies retain parametric spacing and source relations; dimensional inputs accept numbers or
+  `{value,expr}`.
 - **`sketch_convert`** projects each Ref onto the sketch plane via the same math as `sketch_project_ref`
   (planes/planar faces → intersection line; linear edge → line or point; circular edge with axis ∥
-  the sketch normal → circle) and appends it as a real sketch entity pinned with a whole-entity `fix`
-  relation (reference geometry tracks the model).
+  the sketch normal → circle) and appends it as construction geometry by default, pinned with a
+  whole-entity `fix` relation. Set `construction:false` to include the projection in profiles.
 
 All three record the FIRST new entity under `$<index>` and any further new entities under
 `$<index>#1`, `$<index>#2`, … (the flat id_map scheme `sketch_offset`/`sketch_trim` use). Supported
@@ -145,7 +191,7 @@ change (§2).
 > (axis need not be parallel to the sketch normal); an edge (near-)perpendicular to the plane
 > collapses to a `point`; unclassifiable curves fall back to a sampled 24-seg polyline. A
 > **datum** Ref keeps the intersection-line semantics (a plane has no boundary). New optional
-> fields: `construction:bool` (default `false` — real, extrudable geometry, as above) and
+> fields: `construction:bool` (default `true`; set `false` for real, extrudable geometry) and
 > `fix:bool` (default `true` — the whole-entity `fix` pin, as above). Projection is ONE-SHOT:
 > converted entities do not update when the source model changes (associative update is a filed
 > follow-up). `sketch_project_ref` (the read-only preview RPC) is unchanged; the richer
@@ -192,13 +238,16 @@ change (§2).
 |---|---|
 | `sketch_move` | `sketch`, `entities:[id…]` (line/circle/arc), `dx`, `dy` (numeric delta), `copy:bool=false` |
 
-- **`copy:false`** (default) moves the selection **IN PLACE**: each entity's own geometry shifts by
-  `(dx, dy)` and its relations ride along — no new entities, the entity count is unchanged. The first
-  moved entity id is recorded under `$<index>`.
-- **`copy:true`** leaves the originals untouched and **appends one translated copy of each** selected
-  entity (a plain-geometry copy, no per-instance relations — like a 2-instance pattern minus the
-  original), so the entity count of the selection doubles. The first copy is recorded under
-  `$<index>`, the rest under `$<index>#1`, `$<index>#2`, … (the flat id_map scheme).
+- **`copy:false`** moves the selection in place and keeps its entity ids; construction
+  references anchor each source entity's pose while leaving line length and circle/arc radius
+  editable. Their individual pose anchors can still conflict with edits that move joints between
+  selected entities or change a line/arc's source orientation or arc sweep.
+- **`copy:true`** appends a copy linked to the original by driving offsets. The first copy is
+  recorded under `$<index>`, the rest under `$<index>#1`, `$<index>#2`, … .
+  `sketch_rotate` similarly accepts `cx`, `cy`, `angle` and `copy`, and links its results by
+  parametric angular relations. Numeric inputs may be `{value,expr}`.
+  Each move axis has one signed driving dimension shared by all selected handles. Zero and
+  sign changes are supported without changing the direction branch.
 
 Supported entity types are **line, circle, arc**; any other selected type raises `unsupported_entity`.
 An empty `entities`, an unknown `sketch`, a non-numeric `dx`/`dy`, or a non-bool `copy` raise
@@ -208,26 +257,25 @@ An empty `entities`, an unknown `sketch`, a non-numeric `dx`/`dy`, or a non-bool
 
 | op | fields |
 |---|---|
-| `sketch_fillet` | `sketch`, `e1`, `e2` (the two segment ids sharing/near a corner), `radius` (>0) |
+| `sketch_fillet` | `sketch`, `e1`, `e2` (the two segment ids sharing/near a corner), `radius` |
 | `sketch_chamfer` | `sketch`, `e1`, `e2`, `distance` (>0 setback along e1), `distance2?` (>0 setback along e2; defaults to `distance` for an equal-leg bevel) |
 
 Both trim `e1` and `e2` back to the corner setback points and insert the connecting geometry,
 recording its new entity id under the op placeholder `$<index>`:
-- **`sketch_fillet`** inserts a tangent **arc** of `radius` and adds: `coincident` (arc.start ↔ the
-  trimmed e1 corner end), `coincident` (arc.end ↔ the trimmed e2 corner end), `tangent(arc, e1)`,
-  `tangent(arc, e2)`. (On an orthogonal corner the two tangents are geometrically implied by the
-  coincident joins, so the solver may flag one as *redundant* — benign, mirrors SolidWorks.)
-- **`sketch_chamfer`** inserts a connecting **line** and adds: `coincident` (line.p1 ↔ trimmed e1
-  end), `coincident` (line.p2 ↔ trimmed e2 end).
+- **`sketch_fillet`** inserts a tangent arc, joined to both trimmed lines, and a driving radius.
+  Out-of-range numeric and expression radii are clamped and reported in `op_reports` as
+  `requested_radius` and `applied_radius`. A clamped expression is retained inside `min`/`max`
+  with bounds computed from the corner at operation time; the report exposes those snapshot
+  bounds. Later geometry changes can invalidate the frozen upper bound. In-range expressions
+  remain unchanged.
+- **`sketch_chamfer`** inserts a connecting line and coincident joins, plus a construction
+  intersection point and driving setback dimensions for both legs.
 
 Both first **drop the original coincident** that joined the two corner endpoints (the sharp corner
 is gone) so the new geometry is not pulled back together at solve time.
 
-**Supported:** line–line corners only. A non-line `e1`/`e2` raises `unsupported_entity` (the solver
-has no line↔arc / arc↔arc tangent yet — doc_schema.md §3.3). Degenerate input — parallel segments,
-no shared corner, or a `radius`/setback too large to fit between the corner and the segments' far
-ends — raises `fillet_failed` / `chamfer_failed` with NO mutation (the whole op-batch is rejected
-atomically, §2). Non-positive `radius`/`distance`, missing/identical `e1`/`e2` raise `invalid_op`.
+**Supported:** line–line corners only. Non-line inputs, unsolvable constraints and degenerate
+corners reject the entire batch. Chamfer setbacks must be positive and fit on the source lines.
 
 ### Assembly
 
@@ -254,6 +302,9 @@ append through the same rollback-bar-aware path as `add_feature`.
 | `paste_feature` | `bundle`, `target_doc_id?` | re-ids the bundle and appends it; refs resolved against THIS doc (the batch's target — `target_doc_id` is accepted for host-API symmetry and ignored). Root's new id → `id_map["$<index>"]`; every pasted feature enumerated `id_map["$<index>#k"]` (dependency-first). |
 | `paste_feature_as_derived` | `bundle`, `source_doc_id?` | like `paste_feature` + stamps `derived_from:{doc_id,doc_name,feature,source_feature,group}` on each pasted feature (`source_feature` = the live source id the placeholder was bundled from; `group` = a shared id over the whole pasted closure). The paste itself is still a **one-time** resolve; the live re-pull is `refresh_derived` (Wave 4C, below). `source_doc_id` overrides the bundle's `source_doc_id` when the bundle carries none (the host stamps the live **source session doc_id** here so a later refresh can find it). |
 | `sketch_paste_entities` | `sketch`, `entities_bundle:{entities:[…], constraints:[…]}`, `offset_x`, `offset_y` | deep-copies the entities shifted by `(offset_x, offset_y)` with fresh `e<N>` ids. Constraints internal to the pasted set are kept (handles re-pointed); constraints referencing any entity OUTSIDE the set (or the origin/model) are **dropped**. First new id → `$<index>`, rest → `$<index>#k`. |
+| `sketch3d_add_entities` | `sketch`, `entities:[{type, p/p1/p2/pm/points, construction?, id?}, …]` | **atomic append** to a `sketch3d` feature inside the engine (no read-modify-write). `e<N>` minted per sketch for entities without an `id`; first id → `$<index>`, rest → `$<index>#k`. Malformed element / duplicate id → `invalid_op` naming `entities[i]`. See `sketch3d_gui_contract.md` §4.1b. |
+| `sketch3d_add_constraints` | `sketch`, `constraints:[{type, refs, value?, axis?/dir?/plane?, …}, …]` | atomic append of constraints to a `sketch3d`. `c<N>` minted per sketch; numeric `value` stored as `{value, expr:null}`; `$<i>` / `$<i>.p2` refs name entities minted earlier in the batch. Ids → `$<index>`, `$<index>#k`. |
+| `sketch3d_add_external_ref` | `sketch`, `ref:{source:{kind:"vertex", selector}}` | atomic append of a model-vertex external reference to a `sketch3d`. `x<N>` minted doc-wide (usable as a point handle); resolved by the batch's external-ref pass. Id → `$<index>`. |
 
 **Bundle format (`aicad.feature_bundle/1`):**
 
@@ -411,6 +462,11 @@ Default tier: **`fine`**, overridable process-wide by `CHUDWARE_DISPLAY_QUALITY=
 
 Changing the tier invalidates the document's compile cache and its per-body mesh cache, so every
 body re-meshes at the new deflections. The RPC is `doc_set_display_quality` (worker_rpc §19).
+
+The desktop GUI persists its choice (Settings → General → Display quality, `display_quality` in
+config.json) and re-applies it with `doc_set_display_quality` (`origin: "system"`) to every
+part/assembly doc that is not at that tier — on restart and for docs opened afterwards — so the
+saved tier is not lost to the engine's `fine` default. A saved `fine` pushes nothing.
 
 ## 8. `asm_edit_component` transform semantics (append-only, 2026-09-04)
 
@@ -645,6 +701,23 @@ It does not compile the assembly as an empty part or return local source
 coordinates. An out-of-range body refuses; it never falls back to querying
 the whole assembly. Unscoped queries retain whole-document behavior.
 This allows `interface_check` to compare real placed component faces.
+
+The read-only `doc_query` option `fastener_geometry:true` adds finite B-rep
+evidence to face matches without changing selector identity. Use `body_id` to
+scope match and adjacent-face `topo` IDs to one world-placed body; use `count`
+or `index` to bound the returned matches. `cylinder` contains the world
+`axis_point`, unit `axis`, `radius`, `kind`, ordered axis points `axial_start`
+and `axial_end`, `complete_cylinder`, `status`, and two corresponding `ends`.
+End records report adjacent face `sid`/`topo`/`type`, `adjacency_complete`, and
+`classification` (`open_to_exterior`, `closed_bottom`, `coaxial_transition`,
+or `unknown`). Only proven full or simple partial circular trims receive
+extents; unsupported trims have null extents and completeness. Opening
+classification is conservative and requires an extreme body plane, not just
+an unobstructed axis. A planar face's `bearing_annulus` is populated only for
+an exactly bounded concentric two-circle annulus; it contains world `center`,
+oriented `normal`, `inner_radius`, `outer_radius`, `adjacent_faces`, and
+`adjacency_complete`. Null and unknown mean evidence is unavailable, not
+that the feature is absent.
 
 ## 22. Selected-face visual finishes (2026-09-12)
 
@@ -903,3 +976,186 @@ nothing. It throws only for a bad sketch ref; callers read the DOF from `sketch_
 reports relations/dimensions added and the resulting DOF; `check_sketch` reports `pinned_only`
 (DOF 0 reached through `fix` pins with no driving dimension) and never calls such a sketch fully
 defined.
+
+## 32. Soft sketch auto-definition v1.2 (append-only, 2026-10-26)
+
+Additive amendment to §4/§31: constraints minted by `sketch_fully_define` carry `auto:true`
+(doc_schema "Soft sketch auto-constraints v1.1"). Existing untagged constraints stay explicit.
+Explicit constraints added through `sketch_add_constraint`, inline `sketch_add_entity`
+constraints, or other sketch mutation ops supersede soft auto constraints. The engine solves
+all explicit intent first, then re-admits prior auto constraints in their original order,
+keeping their ids only while the solve converges without conflicts or redundancy. It removes
+rejected auto constraints, permits geometry to move to satisfy the explicit intent, and
+fully-defines any remaining freedom with new `auto:true` constraints. The op layer mints ids;
+the caller's explicit constraint still maps to the ordinary `$i` id-map slot.
+
+Explicit-vs-explicit conflicts retain normal over-definition reporting; the engine never
+drops explicit intent to accommodate another constraint. `sketch_set_dim` value/expression
+edits promote the edited constraint to explicit and settle other auto constraints by the same
+rule. Placement-only edits do not promote; deletion remains ordinary deletion without refill.
+`sketch_probe` applies these same rules to its read-only copy, so GUI preflight does not report
+over-definition solely because the new intent supersedes an auto constraint.
+
+
+## 33. Assembly diagnostic rank and MCP pose ownership (append-only)
+
+Native mate residual DOF is the free variable count minus the accepted constraint
+rank already used to classify mates. A second rank estimate with a different
+scale-dependent cutoff must not add fictitious freedoms to an offset rigid lock
+chain. Explicit angle-drive mobility remains additive in the existing mechanism
+`dof` readback; `residual_dof` remains the prescribed-pose nullity. This diagnostic
+change does not relax convergence tolerances, make unresolved mates successful,
+or alter the numerical pose solve.
+
+The MCP `add_features` pose guard evaluates ownership after the planned batch's
+mate/component state transitions. Deleting or suppressing every live mate and
+moving the freed component can be one atomic batch. A final active mate still owns
+a floating component's pose, including a mate added or re-enabled by the batch.
+Native invalid-id, dependency and rollback rules remain authoritative.
+
+## 34. Native relocation direct-reference availability (append-only)
+
+After a relocation batch finishes, the native result reports
+`direct_reference_availability:{required_count,missing_count,unknown_count,scope}` for
+required filesystem references inventoried in documents whose copies have status `written`
+(including a copy written before a subsequent source-stamp failure). `scope` is
+`direct_references_in_written_files`. Each filesystem `dependency_rewrites` row retains
+`exists`, sampled at source inventory, and adds `destination_exists`, sampled after the
+batch completes. If the destination check fails, `destination_exists` is null and
+`destination_check_error` gives the error; it counts as unknown, not missing.
+References are counted individually, not deduplicated by pathname. Optional embedded-import
+provenance and documentary metadata do not contribute to required counts.
+
+This is a point-in-time check of direct references, not a transitive dependency-closure,
+geometry, or portability validation. A target published by another entry in this batch is
+available; a mapping alone does not make a later-batch target available. Missing or unknown
+required references produce `direct_reference_warning`, but do not change native copy
+success, trigger implicit copying or deletion, or bypass preflight guards. If preflight
+fails before a batch is processed, the availability summary is absent, not a closure claim.
+The MCP bounded reply includes these counts, a warning when applicable, and up to five
+missing-reference previews with source existence and destination; the full native result
+is retained in the guarded artifact. Report-write failure preserves the native outcome
+and these diagnostics in the reply.
+
+## 35. Assembly source-refresh revisions and bulk sketch constraints (append-only)
+
+Refreshing a referenced part commits a revision when already-published assembly geometry,
+solved poses, or reference bindings change. The assembly becomes dirty, its pre-refresh
+authored state enters undo, and redo is cleared. Initial hydration and unchanged repeated
+reads do not increment the revision. Undo restores authored state, not external source
+files; referenced geometry still follows the current source.
+
+Activation, rebuilding, geometry/assembly queries, rendering, analysis and saving may
+refresh sources. Guarded apply/solve operations refresh before checking the supplied
+revision, so a guard from before a source change is stale even if no explicit assembly
+edit occurred.
+
+After document locks are released, hostd publishes the advancing snapshot to every
+attached subscriber as `doc.changed`, with `source_client:-1`, `source_kind:"system"` and
+`method:"assembly_source_refresh"`; it has no user or actor attribution. Equal-revision
+cache verification retains the original writer's attribution.
+
+Replacing a sketch's constraints through `edit_feature` applies the same soft
+auto-constraint rules as individual constraint operations: an explicit dimensional
+constraint may replace an automatically supplied dimension without treating that soft
+dimension as a conflicting user requirement. Unrelated relations remain intact.
+
+## 36. OpenSCAD source and managed conversion (append-only)
+
+A `scad` feature holds `params.source` (the exact OpenSCAD source), `files`
+(portable relative `path` and `data_b64` dependency pairs), `parameters` (typed
+overrides), `parameter_schema` (entries with `name`, `kind`, optional `label`),
+and `mm_per_source_unit` (finite positive, default 1). Kinds are `length`,
+`number`, `integer`, `angle`, `boolean`, and `string`. Length overrides use
+canonical mm, angles degrees. Simple literal discovery does not infer that every
+number is a length or evaluate arbitrary source expressions. Complex code-owned
+expressions remain in source. Source and controls edit the same feature.
+
+`scad_status` reports availability of the external OpenSCAD executable and
+confinement; `scad_inspect({params})` discovers controls without a render.
+Actual rendering supports OpenSCAD syntax, including modules, include/use,
+loops, booleans and extrusions, with only staged dependencies available. Rendering
+is isolated and has no unsandboxed fallback. Resulting geometry is faceted, not
+analytic native geometry or recovered arbitrary feature history.
+
+The revision-guarded document operation
+`{op:"scad_convert", direction:"to_code"|"to_native", mm_per_source_unit?:number}`
+is also exposed as MCP `scad_convert`. `to_code` projects only supported native
+graphs: box, cylinder, sphere, cone, explicit boolean and rigid transform, subject
+to supported options and reported blockers. Managed metadata preserves the original
+graph and parameter mapping. `to_native` only restores an intact managed projection;
+changed source, dependencies, mapping or incompatible equations are refused rather
+than restoring stale history. Parameter edits within the supported mapping can be
+restored. Arbitrary imported SCAD has no native graph to recover. Conversion and
+other edits use the normal atomic operation/compile transaction: failure leaves the
+previous revision and model intact.
+
+Native `.step+` save retains source, dependencies, controls and the successful build
+cache. `.scad` export retains effective overrides and scale with portable sidecars;
+browser export can deliver source and sidecars as a ZIP. See the format reference
+for installation and platform confinement prerequisites.
+
+## 37. Rollback-prefix execution and agent readback (2026-10-29, additive)
+
+The native compiler enforces §4's rollback bar in geometry, tessellation, ownership
+and compile caches. Suffix features remain in the document with
+`rebuild.feature_status[].rolled_back:true` and `ok:true`: they were not compiled,
+not successfully built. Clearing `after` restores the complete history. Implicit
+`add_feature` insertion advances the bar; an explicit string `before` remains
+authoritative. Deleting the bar feature moves it to the previous surviving feature
+or clears it when none remains.
+
+MCP `add_features` preserves `rolled_back` in each returned feature status.
+`get_part(summary=True)` and selected-feature reads retain an active
+`tree.rollback_after`, even when the selected records do not include the bar feature.
+This feature-level flag is distinct from a failed batch's top-level `rolled_back`,
+which reports whether the rejected mutation was reverted.
+
+## 38. Document Ops v2 — native part compile transactions (append-only)
+
+This is the **v2 semantic contract** for native part `doc_apply_ops`; the wire
+protocol and document schema strings do not change. It supersedes §2.3 and the
+statement in §5 that rebuild failures are not errors **for this operation**.
+Those v1 statements remain above as historical text. Assembly operations and
+explicit `doc_rebuild` have their own rebuild paths; this amendment does not
+assert that they have the same rejection envelope.
+
+The worker validates the batch and compiles its candidate part before committing.
+If the candidate does not compile, the whole batch is rejected: the previous
+document tree, revision, dirty state, displayed geometry and undo/redo history
+remain in effect. This includes failures of a fillet or of a downstream feature.
+Validation errors retain their structured op error envelope; a compile rejection
+is instead returned in-band in the otherwise transport-successful response:
+
+- `rejected_tree` is the candidate definition for diagnosis, **not** the live
+  document; `rebuild.feature_status` describes that candidate and contains the
+  failure. A client must check `rejected_tree`, not infer acceptance from
+  transport success or replace its live statuses with candidate statuses.
+- `tree` and `revision` are the restored live state, `id_map` is empty, and
+  `owner_map`, `datums`, `volume` and, when requested, `tess` describe the
+  restored geometry. `with_tess:false` still omits the response mesh.
+- The `rolled_back` field mentioned in §37 is on an MCP `add_features` failure
+  result and reports whether that batch was reverted. It is not a required
+  top-level field of the raw worker response. It is distinct from each
+  `feature_status[].rolled_back` rollback-bar flag.
+
+On acceptance, any verified fillet correction of literal radius parameters and
+the requested edit commit together under the existing batch/coalescing undo
+rules; rejection commits neither. Expression-driven radius intent is retained,
+with any necessary effective value kept as derived state rather than substituted
+for the expression. The returned tree and structured `data.fillet` status are
+described in [doc_schema.md](doc_schema.md) and
+[worker_rpc.md](worker_rpc.md); callers must not derive the numeric correction
+by parsing warning text.
+
+## Persistence attribution amendment — v2.1
+
+On hostd, an advancing GUI mutation is human work unless its request params carry
+`"origin":"system"`. The tag identifies system-initiated work on a GUI connection; it
+does not change an op's geometry or transaction semantics. Metadata-only name and meta
+changes advance a separate `metadata_revision` and participate in human-dirty tracking.
+The registry maintains saved and last-human revisions in both dimensions; a binding save
+clears human dirty only when it covers the last human changes. `doc_reload` resets that
+state. The document creator's `origin_kind` is not a substitute for this attribution.
+See the hostd persistence amendment in [worker_rpc.md](worker_rpc.md) for wire fields,
+save refusal and recovery semantics.

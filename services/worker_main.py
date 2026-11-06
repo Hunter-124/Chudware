@@ -7,7 +7,7 @@ what remains here are the services-side orchestration surfaces that legitimately
 Python:
 
   run_model (build123d script execution — needs an interpreter by nature),
-  editable prompts, the persistent Chudcode agent host and its private control lane,
+  editable prompts, the persistent Omp agent host and its private control lane,
   vendor-parts registry, deliverables, parts hub FTS, agent GUI seams, reveng,
   dag steering, subagent RPC, PLM vault, EM (on hold), multi-physics seam,
   manufacturing printer adapters.
@@ -67,7 +67,7 @@ def _run_model(params: dict, _emit_event: EmitFn) -> dict:
 
 
 def _list_editable_prompts(_params: dict, _emit_event=None):
-    """Settings → AI → Prompts: YAML mission roles + core .md prompts (merged)."""
+    """Settings → AI → Prompts: YAML mission role prompts and their overrides."""
     try:
         from services.agent.roles import list_editable_prompts
 
@@ -213,22 +213,20 @@ def _warm_prompt_cache() -> None:
         log.debug("prompt cache warm skipped: %s", exc)
 
 
-def _warm_chudcode_service() -> None:
-    """Spawn the shared Chudcode service process on a background thread.
+def _warm_omp_service() -> None:
+    """Warm the shared OMP catalog/auth service off the worker request lane.
 
-    Every transient command (provider list, auth state, model catalog, memory)
-    runs on one long-lived `chud --mode rpc` process; spawning it costs ~1.1 s,
-    which otherwise lands on the GUI's first provider query after connect.
+    Project memory uses separately scoped runtimes.
     """
     def run() -> None:
         try:
-            from services.agent.chudcode_host import get_default_chudcode_host
+            from services.agent.omp_host import get_default_omp_host
 
-            get_default_chudcode_host().warm_service()
+            get_default_omp_host().warm_service()
         except Exception as exc:  # noqa: BLE001
-            log.debug("chudcode service warm skipped: %s", exc)
+            log.debug("omp service warm skipped: %s", exc)
 
-    threading.Thread(target=run, name="chudcode-service-warm", daemon=True).start()
+    threading.Thread(target=run, name="omp-service-warm", daemon=True).start()
 
 
 def _drain_box_mirror_on_exit() -> None:
@@ -247,10 +245,10 @@ def _drain_box_mirror_on_exit() -> None:
         log.debug("box mirror exit drain skipped: %s", exc)
 
 
-def _invoke_chudcode_control(action: str, params: dict) -> dict:
-    from services.agent.worker_rpc import chudcode_control
+def _invoke_omp_control(action: str, params: dict) -> dict:
+    from services.agent.worker_rpc import omp_control
 
-    return chudcode_control(action, params)
+    return omp_control(action, params, private=True)
 
 
 def dispatch_request(req: dict, emit_event: EmitFn) -> object:
@@ -269,13 +267,13 @@ def dispatch_request(req: dict, emit_event: EmitFn) -> object:
         return _METHODS[method](params, emit_event)
 
 
-def _shutdown_chudcode() -> None:
+def _shutdown_omp() -> None:
     try:
-        from services.agent.worker_rpc import chudcode_shutdown
+        from services.agent.worker_rpc import omp_shutdown
 
-        chudcode_shutdown()
+        omp_shutdown()
     except Exception as exc:  # noqa: BLE001 — shutdown is best-effort
-        log.error("Chudcode shutdown failed: %s", type(exc).__name__)
+        log.error("Omp shutdown failed: %s", type(exc).__name__)
 
 
 def _shutdown_bench() -> None:
@@ -299,8 +297,11 @@ def _reconcile_bench() -> None:
 def serve() -> None:
     # Hostd gives each worker one process-local role. Unflagged desktop,
     # standalone and compiled launches retain the original full lifecycle.
+    # "service" answers the session-free provider/auth/assignment/subscription/skills calls
+    # while the agent lane is held by a turn: no turns, no control endpoint, no bench, no
+    # prompt-cache warm — only the shared OMP auth/catalog service process.
     lane = os.environ.get("CHUDWARE_HOSTD_WORKER_LANE", "")
-    if lane not in ("", "agent", "agent-turn", "general"):
+    if lane not in ("", "agent", "agent-turn", "general", "service"):
         raise ValueError("invalid hostd worker lane")
     agent_services = lane != "general"
     bench_services = lane in ("", "agent") and not in_cell()
@@ -308,10 +309,10 @@ def serve() -> None:
         from services.agent.request_context import process_owner_key
         process_owner_key()
     global _CONTROL_SERVER
-    if agent_services:
-        from services.agent.chudcode_control import ControlServer
+    if agent_services and lane != "service":
+        from services.agent.omp_control import ControlServer
 
-        control = ControlServer(_invoke_chudcode_control, paths.RUNTIME).start()
+        control = ControlServer(_invoke_omp_control, paths.RUNTIME).start()
     else:
         control = None
     _CONTROL_SERVER = control
@@ -338,7 +339,7 @@ def serve() -> None:
             finally:
                 try:
                     if agent_services:
-                        _shutdown_chudcode()
+                        _shutdown_omp()
                 finally:
                     _drain_box_mirror_on_exit()
 
@@ -361,9 +362,12 @@ def serve() -> None:
         if agent_services:
             if bench_services:
                 _reconcile_bench()
-            _warm_prompt_cache()
-            if lane != "agent-turn" and not in_cell():
-                _warm_chudcode_service()
+            if lane != "service":
+                _warm_prompt_cache()
+            # Only the process that answers the OMP auth/catalog calls needs the shared service
+            # process: hostd sends those to "service", so turn workers never touch it.
+            if lane in ("", "service") and not in_cell():
+                _warm_omp_service()
         for line in sys.stdin:
             line = line.strip()
             if not line:

@@ -28,25 +28,37 @@
 #include <BRepBndLib.hxx>
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepBuilderAPI_MakeVertex.hxx>
+#include <BRepBuilderAPI_Transform.hxx>
 #include <BRepExtrema_DistShapeShape.hxx>
 #include <BRepAdaptor_Surface.hxx>
 #include <BRepGProp.hxx>
+#include <BRepClass_FaceClassifier.hxx>
+#include <BRepClass3d_SolidClassifier.hxx>
+#include <BRep_Tool.hxx>
 #include <GProp_GProps.hxx>
 #include <GeomAbs_CurveType.hxx>
 #include <GeomAbs_SurfaceType.hxx>
 #include <Standard_Failure.hxx>
 #include <TopAbs_ShapeEnum.hxx>
 #include <TopExp.hxx>
+#include <TopExp_Explorer.hxx>
+#include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
+#include <TopTools_ListIteratorOfListOfShape.hxx>
 #include <TopTools_IndexedMapOfShape.hxx>
 #include <TopoDS_Vertex.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
 #include <gp_Ax1.hxx>
+#include <gp_Ax3.hxx>
 #include <gp_Cone.hxx>
+#include <gp_Circ.hxx>
 #include <gp_Cylinder.hxx>
 #include <gp_Dir.hxx>
+#include <gp_Lin.hxx>
+#include <gp_Pln.hxx>
 #include <gp_Pnt.hxx>
+#include <gp_Trsf.hxx>
 #include <gp_Vec.hxx>
 
 namespace chudware::doc {
@@ -58,18 +70,19 @@ namespace chudware::doc {
 constexpr double kResolveMapTolFrac = 1e-3;
 
 namespace {
-// Keep these three sets byte-for-byte aligned with services/mcp/cad_common.py's
-// GEOM_QUERY_NARROWING_KEYS / DOMAIN_KEYS / READBACK_KEYS. Direct core_bridge calls bypass
-// that Python guard, so this is the authoritative engine-side boundary vocabulary.
+// Keep these sets aligned with services/mcp/cad_common.py's vocabulary, except
+// doc_query-only `within` and `fastener_geometry`. Direct core_bridge calls bypass
+// the Python guard, so this is the authoritative engine-side boundary vocabulary.
 static const std::set<std::string> kQueryNarrowingKeys = {
     "side", "surf", "parallel", "perpendicular", "pick", "near", "index",
-    "count", "body_id",
+    "count", "body_id", "within", "fastener_geometry",
 };
 static const std::set<std::string> kQueryDomainKeys = {"of", "kind"};
 static const std::set<std::string> kQueryReadbackKeys = {
     "sid", "centroid", "normal", "axis", "radius", "area_or_len", "concavity",
     "hint_index", "owner_feature", "body", "topo", "axis_point",
-    "major_radius", "minor_radius", "torus_axis", "torus_center",
+    "major_radius", "minor_radius", "torus_axis", "torus_center", "cylinder",
+    "bearing_annulus", "geometry_error",
 };
 
 
@@ -248,16 +261,26 @@ std::optional<int> resolve_with_hint_fallback(const nlohmann::json& sel,
                          std::tie(b.first, b.second->hint_index);
               });
 
-    if (scored.empty() || !(scored[0].first < 0.35)) return std::nullopt;
+    const double limit = rr.owner_fallback ? kOwnerlessAccept : 0.35;
+    if (scored.empty() || !(scored[0].first < limit)) return std::nullopt;
 
-    // If hint_index is unspecified or matches the best after sort, take the best;
-    // otherwise prefer the candidate whose hint_index matches; else the overall best.
-    const TopoInfo* best_cand = scored[0].second;
-    if (!s_hint.has_value() || best_cand->hint_index == *s_hint)
-        return best_cand->index;
-    for (const auto& sc : scored)
-        if (sc.second->hint_index == *s_hint) return sc.second->index;
-    return best_cand->index;
+    // A hint can disambiguate only candidates in the best score's ambiguity band, never
+    // override the acceptance limit or silently select a distant element.
+    const TopoInfo* chosen = scored[0].second;
+    double chosen_score = scored[0].first;
+    if (s_hint.has_value() && chosen->hint_index != *s_hint)
+        for (const auto& sc : scored)
+            if (sc.second->hint_index == *s_hint && sc.first < limit &&
+                sc.first - scored[0].first <= 0.05) {
+                chosen = sc.second;
+                chosen_score = sc.first;
+                break;
+            }
+    record_rebind(sel, *chosen, chosen_score,
+                  scored.size() > 1 ? scored[1].first
+                                    : std::numeric_limits<double>::infinity(),
+                  rr.owner_fallback);
+    return chosen->index;
 }
 
 // --------------------------------------------------------------------- resolve_edge_picks
@@ -319,24 +342,38 @@ EdgePicks resolve_edge_picks(const TopoDS_Shape& shape, const nlohmann::json& se
         std::optional<int> s_hint;
         if (sel.contains("hint_index") && !sel.at("hint_index").is_null())
             s_hint = sel.at("hint_index").get<int>();
-        int best = -1; double best_score = 1e30; bool best_hint = false;
+        int best = -1; double best_score = 1e30, second_score = 1e30; bool best_hint = false;
         for (int i = 0; i < N; ++i) {
             if (used[i]) continue;
             double sc = score_candidate(sel, infos[i], diag);
             bool hint = s_hint.has_value() && infos[i].hint_index == *s_hint;
             if (sc < best_score - 1e-9 ||
                 (std::abs(sc - best_score) <= 1e-9 && hint && !best_hint)) {
+                second_score = std::min(second_score, best_score);
                 best = i; best_score = sc; best_hint = hint;
+            } else {
+                second_score = std::min(second_score, sc);
             }
         }
         if (best < 0) { reason[s] = "no unused edge remains"; continue; }
-        if (best_score >= kAccept) {
-            reason[s] = "best score " + fmt4g(best_score) + " >= 0.35 (no close edge)";
+        // unique_edge_info has no owner attribution; an owner-scoped stored pick must not
+        // silently fall back to the normal cross-owner score threshold.
+        const bool owner_unverified = sel.contains("owner_feature") &&
+                                      sel["owner_feature"].is_string();
+        const double limit = owner_unverified ? kOwnerlessAccept : kAccept;
+        if (best_score >= limit) {
+            reason[s] = "best score " + fmt4g(best_score) +
+                        (owner_unverified ? " >= 0.05 (owner not confirmed)" :
+                                            " >= 0.35 (no close edge)");
             continue;
         }
         used[best] = 1;
         resolved[s] = TopoDS::Edge(uniq(best + 1));
         ok[s] = 1;
+        record_rebind(sel, infos[best], best_score,
+                      second_score >= 1e30 ? std::numeric_limits<double>::infinity()
+                                           : second_score,
+                      owner_unverified);
     }
 
     // Assemble in ORIGINAL selector order.
@@ -499,6 +536,7 @@ struct QCand {
     // Concavity flag for cylindrical faces (C5): geometry-based (outward normal vs radial),
     // not raw Orientation() — see cylinder_face_concave(). nullopt for non-cylinders.
     std::optional<bool> concave;  // true=bore/inner, false=boss/outer, nullopt=N/A
+    std::string sid;  // make_selector's sid for this element (collision accounting)
 };
 
 // ASCII-lowercase a copy of `raw` (the query vocabulary is case-insensitive so a model
@@ -780,7 +818,8 @@ std::string unknown_query_keys_error(const std::string& where,
     }
     out += ". A key the engine does not know narrows NOTHING and therefore silently matched "
            "every candidate. Real narrowing keys are side, surf, parallel, perpendicular, "
-           "pick, near, index, count, body_id. For curved-style intent, use 'surf': "
+           "pick, near, index, count, body_id (doc_query alone also takes within). For "
+           "curved-style intent, use 'surf': "
            "'curved'/'round' means any non-planar face, and 'cylindrical', 'conical', "
            "'spherical', or 'toroidal' select a specific curved type (exact 'cylinder', "
            "'cone', 'sphere', and 'torus' also work).";
@@ -793,8 +832,13 @@ bool is_geom_query(const nlohmann::json& v) {
     return v.is_object() && (v.value("kind", std::string()) == "query" || v.contains("of"));
 }
 
-QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q) {
+QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q,
+                              const std::set<int>* admitted, bool collect_shared_sids) {
     QueryPicks out;
+    if (q.contains("fastener_geometry") && !collect_shared_sids) {
+        out.error = "fastener_geometry is only available through doc_query";
+        return out;
+    }
     // `of` DEFAULTS TO "face". A live model called query_geometry with {"side":"+x"} and hit
     // the dead end `'of' must be "edge" or "face" (got '')` — nothing in that message says
     // the fix is to add of:"face". Faces are what a query overwhelmingly means (side / surf /
@@ -821,6 +865,12 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
     const TopAbs_ShapeEnum kind = want_face ? TopAbs_FACE : TopAbs_EDGE;
     const double diag = bbox_diag(shape);
     const double tol = std::max(diag * 1e-3, 1e-6);
+    if (q.contains("within") && !admitted) {
+        out.error = "geom query: 'within' restricts a query to the elements of a document and "
+                    "is only available through doc_query / query_geometry(owner=…)";
+        return out;
+    }
+    std::map<std::string, int> sid_count;  // every element of this kind, admitted or not
 
     // 1) enumerate UNIQUE sub-shapes + fingerprint each.
     // I3 — body bbox center, the outward-direction origin for sphere/torus/bspline faces.
@@ -910,6 +960,17 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
                                           body_center);
             } catch (const Standard_Failure&) { c.rep_dir = std::nullopt; }
         }
+        if (collect_shared_sids) {
+            TopoInfo sid_info;  // exactly the fields make_selector's sid hashes
+            sid_info.kind = of;
+            sid_info.surf = c.surf;
+            sid_info.centroid = c.centroid;
+            sid_info.radius = c.radius;
+            sid_info.concave = c.concave;
+            c.sid = selector_sid(sid_info);
+            ++sid_count[c.sid];
+        }
+        if (admitted && !admitted->count(c.index)) continue;
         cands.push_back(std::move(c));
     }
 
@@ -1204,8 +1265,15 @@ QueryPicks resolve_geom_query(const TopoDS_Shape& shape, const nlohmann::json& q
         ti.axis_point = c->axis_point;
         ti.torus = c->torus;
         out.selectors.push_back(make_selector(ti));
+        if (collect_shared_sids) {
+            const auto shared = sid_count.find(c->sid);
+            if (shared != sid_count.end() && shared->second > 1)
+                out.shared_sids[c->sid] = shared->second;
+        }
     }
     return out;
 }
+
+#include "doc/picks_fastener.inc"
 
 }  // namespace chudware::doc

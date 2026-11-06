@@ -32,3 +32,12 @@ Config: `plm.ai_vc: {keep_last: 0 (= keep all in session), full_every: 8, enable
   `"call:<turn>:<i>"` (state before that tool call). Rollback also returns `chat_truncate_to`
   (msg_idx) so the chat UI can rewind the transcript consistently.
 - Silent invariant unchanged: never prompt the user about agent-authored file handling.
+
+## v2.1 — chat rollback UI removed (append-only, 2026-11-04)
+- The Copilot chat transcript no longer offers rewind/restore controls (user-bubble rewind, the
+  per-turn Before/After bar, per-tool-call rewind) and no longer edits earlier messages. The
+  producer shapes above are unchanged.
+- The host's remaining restore surface is the AI workspace checkpoint strip. It restores by
+  checkpoint id through `plm_rollback` and treats the result as geometry only: the host does
+  not act on `chat_truncate_to` and never truncates or parks chat messages. The
+  `plm_rollback_check` preflight remains available to MCP agents; the host no longer calls it.

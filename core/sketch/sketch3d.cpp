@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <limits>
 #include <cmath>
+#include <cstdio>
 #include <set>
 #include <stdexcept>
 
@@ -1270,6 +1271,7 @@ Sketch3DSolution solve_sketch3d(const json& sketch, const json& env,
     sol.dof = analysis.dof;
     sol.redundant = analysis.redundant_tags;
     sol.conflicting = analysis.conflicting_tags;
+    sol.dependency_partners = analysis.dependency_partners;
 
     sol.entities = extract_entities(res.x, entities_list, var_map, env);
     MatrixXd J = sys.real_jacobian(res.x);
@@ -1285,6 +1287,62 @@ Sketch3DSolution solve_sketch3d(const json& sketch, const json& env,
 
 Sketch3DSolution solve_sketch3d(const json& sketch, const json& env) {
     return solve_sketch3d(sketch, env, std::nullopt);
+}
+
+namespace {
+
+// "c3 (distance 40)": id, type and, for a dimension, its driving value.
+std::string describe_constraint3(const std::map<std::string, json>& by_id, const std::string& id) {
+    const auto it = by_id.find(id);
+    if (it == by_id.end()) return id + " (?)";
+    std::string label = it->second.value("type", std::string("?"));
+    const json& v = it->second.contains("value") ? it->second["value"] : json();
+    const json& n = v.is_object() && v.contains("value") ? v["value"] : v;
+    if (n.is_number()) {
+        char buf[32];
+        std::snprintf(buf, sizeof buf, "%.4g", n.get<double>());
+        label += std::string(" ") + buf;
+    }
+    return id + " (" + label + ")";
+}
+
+}  // namespace
+
+std::string nonconvergence_reason(const json& sketch, const Sketch3DSolution& sol) {
+    std::map<std::string, json> by_id;
+    const json constraints = sketch.value("constraints", json::array());
+    if (constraints.is_array())
+        for (const json& c : constraints)
+            if (c.is_object() && c.contains("id") && c["id"].is_string())
+                by_id[c["id"].get<std::string>()] = c;
+
+    std::string msg = "sketch3d did not converge: the constraints conflict.";
+    if (!sol.conflicting.empty()) {
+        msg += " Conflicting constraints: ";
+        for (std::size_t i = 0; i < sol.conflicting.size(); ++i) {
+            const std::string& id = sol.conflicting[i];
+            if (i) msg += "; ";
+            msg += describe_constraint3(by_id, id);
+            for (const auto& entry : sol.dependency_partners) {
+                if (entry.first != id || entry.second.empty()) continue;
+                msg += " conflicts with ";
+                for (std::size_t k = 0; k < entry.second.size(); ++k)
+                    msg += std::string(k ? ", " : "") + describe_constraint3(by_id, entry.second[k]);
+                break;
+            }
+        }
+        msg += ".";
+    } else {
+        msg += " The solver found no position that satisfies all constraints."
+               " Run check_sketch3d to find the constraints that disagree.";
+    }
+    if (!sol.skipped.empty()) {
+        msg += " Skipped (unusable, not solved):";
+        for (std::size_t i = 0; i < sol.skipped.size(); ++i)
+            msg += std::string(i ? "; " : " ") + sol.skipped[i].first + " (" + sol.skipped[i].second + ")";
+        msg += ".";
+    }
+    return msg;
 }
 
 std::vector<FreeVar3> free_variables3(const json& sketch, const json& env) {

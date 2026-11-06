@@ -45,10 +45,8 @@ def build_fix_preview(corrupted_document: dict, diagnosis: Diagnosis, *,
                       verifier_detail: Optional[dict] = None) -> dict:
     """Build the fix-preview card payload for ``diagnosis`` over ``corrupted_document``.
 
-    ``verifier_score``/``verifier_detail`` come from the binary verifier
-    (tools.flywheel.bench.benches.regen_fix.verify_fix, or the live agent flow): score 1.0 iff
-    the fix rebuilds AND unaffected geometry compares ≈100%. Shown so the user accepts an
-    already-verified fix, and carried onto the action event.
+    ``verifier_score``/``verifier_detail`` come from the live verifier: 1.0 requires
+    both rebuild and geometry comparison; None means not verified.
     """
     # The primary, always-available preview: a plain-English change list derived from the
     # editable fix ops (R1 parity — the user sees exactly which doc-ops will apply).

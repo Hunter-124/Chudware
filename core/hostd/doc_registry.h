@@ -12,10 +12,8 @@
 //     {"code":"read_only"}; desktop unattached clients implicitly attach rw.
 //     Cell viewers are pinned ro by trusted principal, including mint-time and
 //     manual attaches; mutations fail forbidden_right. Holds yield busy_preview.
-//   * Overlap CAS (preCall): when a doc has >1 distinct rw writer, inject the
-//     writer's last_seen_rev as base_revision into doc_apply_ops/doc_undo/
-//     doc_redo so the engine's existing stale_revision CAS fires on races.
-//     Single-writer docs are byte-identical passthrough.
+//   * Writers serialize per document. Explicit caller-supplied revision guards
+//     remain engine-enforced; the registry does not invent stale CAS guards.
 //   * Revision sniff + event fanout (postCall): mutating responses already
 //     carry top-level "revision" (ops_response, core/doc/session.cpp) plus
 //     tess.aicm_path / rebuild.feature_status; when a doc's revision advances
@@ -37,11 +35,14 @@
 // broad agent_/sim_ prefixes never confer cell read privileges.
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -70,9 +71,8 @@ public:
     bool handleMethod(int clientId, const std::string& kind, const std::string& method,
                       const nlohmann::json& params, nlohmann::json& result, bool& isError);
 
-    // Policy gate before an engine passthrough. May MUTATE params (base_revision
-    // injection). Returns false with err filled ({"code","message",...}) when the
-    // call must be rejected (read_only / busy_preview / undo_denied).
+    // Policy gate before an engine passthrough. Returns false with err filled
+    // ({"code","message",...}) when the call must be rejected.
     // `userId`/`userDisplay` are the connection's optional multi-user identity
     // (from hello params.user); empty when unset. `warning` (when set) is appended
     // to the successful result by the caller — the implicit-attach "doc has
@@ -101,17 +101,28 @@ public:
     // other_writer reports rw attachments outside the caller's writer group.
     void annotateDocList(nlohmann::json& result, int clientId);
 
-    // True if a client OTHER than `clientId` currently holds an rw attach on
-    // `docId`. Server uses this to degrade a doc_close into a plain detach so one
-    // client can't destroy a doc another client is still editing.
-    bool hasOtherRwWriter(const std::string& docId, int clientId);
+    bool humanDirty(const std::string& docId) const;
+    int savedRevision(const std::string& docId) const;
+    bool closeBlockedBy(const std::string& docId, int requester) const;
+    void restoreRecoveryState(const std::string& docId, const std::string& originKind,
+                              bool humanDirty, long revision, long savedRevision);
 
-    // True when this doc was MINTED by an agent/mcp client. Ownership, not
-    // attachment: an agent's per-turn worker process comes and goes, so between
-    // turns nobody is attached even though a run still owns the work. The server
-    // uses this (with agentWorkInFlight) to refuse to purge a doc the user closed
-    // from their viewport while the agent is still building it.
-    bool isAgentOrigin(const std::string& docId);
+    // Serialize document writes and guarded saves through their postCall bookkeeping.
+    struct MutationGuard {
+        std::shared_ptr<std::recursive_mutex> mutex;
+        std::unique_lock<std::recursive_mutex> lock;
+    };
+    MutationGuard lockMutation(const std::string& docId);
+    static bool requiresMutationLock(const std::string& method);
+    void notifyDiskConflict(const std::string& docId, const std::string& path,
+                            const nlohmann::json& fileStamp);
+
+    // A turn owns every non-internal document it opens or touches, independently
+    // of the lifetime or access mode of any individual tool connection.
+    void startAgentRun(const std::string& scope, int clientId,
+                       const std::string& actorKey, const std::string& docId);
+    void joinAgentRun(int clientId, const std::string& scope, const std::string& actorKey);
+    void endAgentRun(const std::string& scope);
 
     // True when this doc was minted with {"internal":true} (see DocState::internal) —
     // the agent preflight advisor's throwaway shadow clone. Beyond suppressing fanout,
@@ -127,46 +138,24 @@ public:
     // tab for a doc another client is mid-write on without queueing behind it.
     nlohmann::json lastPushFor(const std::string& docId);
 
-    // Background verification refreshes an existing revision without inventing a
-    // writer or attachment. Raced revisions/internal docs are ignored; recipients
-    // must be both attached and subscribed, including the original source.
+    // Cache verification refreshes the snapshot without changing the revision.
+    // Derived assembly revisions are published as system writes.
     void publishCacheRefresh(const std::string& docId, const nlohmann::json& response);
 
-    // Client disconnected: drop its attachments/holds/subscriptions and notify
-    // remaining subscribers (doc.lease_change). Docs left with NO attached
-    // client start the doc-GC grace countdown (CHUDWARE_DOC_GC_GRACE_S, default
-    // 90 s; CHUDWARE_DOC_GC=0 disables) — swept by tick(). Agent/mcp-origin docs
-    // use CHUDWARE_DOC_GC_AGENT_GRACE_S (default 1800 s) so a just-finished
-    // mission's parts stay openable from the GUI after the agent detaches.
+    // Disconnect drops connection-local attachments, edit-holds and subscriptions.
+    // Run-owned documents remain held until their owning turns end; only then
+    // does their ordinary (or agent-origin) orphan grace countdown start.
     void onDisconnect(int clientId, const std::string& kind);
 
-    // Periodic housekeeping from the accept loop (~every 500 ms): expire stale
-    // edit-holds (doc.lease_change) and return doc ids whose GC grace expired
-    // with still no attached client. The Server retires + closes those.
+    // Periodic housekeeping: expire stale edit-holds and return documents whose
+    // GC grace expired with neither an attached client nor a live agent run.
     std::vector<std::string> tick();
 
-    // A doc the daemon itself closed (GC): drop registry state + fan out
-    // doc.closed with the given reason so mirrors drop their tabs.
-    void onDaemonClosedDoc(const std::string& docId, const std::string& reason);
-
-    // Re-check, under the registry lock, that a doc tick() flagged as expired is
-    // STILL abandoned (no client attached) right before the Server retires+closes
-    // it. tick() releases mtx_ before the Server acts, so a client can re-attach
-    // (re-list -> attach_doc / implicit rw) in that window — closing it out from
-    // under the client would be silent data loss. Returns false if the doc gained
-    // an attachment or already vanished; the Server then aborts the GC close.
-    bool isReapable(const std::string& docId);
-
-    // Re-check reapability AND dispatch `closeFn` atomically under mtx_ — the SAME lock
-    // attach_doc/detach_doc/preCall's implicit-attach all take. WHY: isReapable() alone only
-    // proves the doc was abandoned at the instant it ran; the retire-tier I/O between that
-    // check and the actual engine doc_close call (doc_list + retireDoc, both unlocked) gives
-    // a racing client's attach a window to land right before the doc is torn down. Holding
-    // mtx_ across the recheck AND closeFn closes that window: a concurrent attach either
-    // lands first (recheck sees it, closeFn never runs) or blocks until closeFn returns.
-    // Returns false (closeFn NOT invoked) if the doc gained an attachment or already vanished.
-    // closeFn MUST NOT call back into DocRegistry — mtx_ is non-recursive.
-    bool reapUnderLock(const std::string& docId, const std::function<void()>& closeFn);
+    // Reap only an unchanged abandonment generation. closeFn executes under
+    // the attachment lock and must not call back into the registry.
+    bool reapToken(const std::string& docId, std::uint64_t& token) const;
+    bool closeAbandoned(const std::string& docId, std::uint64_t token,
+                        const std::string& reason, const std::function<bool()>& closeFn);
 
     // True while `clientId` still holds at least one attachment. A connection with no
     // attachments, no in-flight call and no recent traffic is a PARKED connection, not
@@ -190,8 +179,27 @@ private:
     };
     struct DocState {
         std::map<int, Attach> attach;  // client_id -> mode/last-seen
+        std::set<std::string> agentRuns;  // live turn scopes, independent of sockets
+        // A tool socket can leave while its turn is still editing this document.
+        std::string deferredLastWriterKind;
         Hold hold;
         long revision = -1;  // last revision the daemon observed for this doc
+        long publishedRevision = -1;
+        long savedRevision = -1;
+        long lastHumanRevision = -1;
+        long metadataRevision = -1;
+        long publishedMetadataRevision = -1;
+        long savedMetadataRevision = -1;
+        long lastHumanMetadataRevision = -1;
+        bool humanDirty = false;
+        void refreshHumanDirty() {
+            humanDirty = lastHumanRevision > savedRevision ||
+                         lastHumanMetadataRevision > savedMetadataRevision;
+        }
+        std::uint64_t attachmentGeneration = 0;
+        // A write can finish before the minting call returns. Its event waits until
+        // origin/internal status is known, so a private mint cannot leak.
+        std::vector<std::pair<nlohmann::json, int>> pendingChanges;
         int lastWriterClient = -1;
         // Preserve group attribution even after the source connection disconnects.
         std::string lastWriterGroup;
@@ -206,16 +214,18 @@ private:
         // Kind of the client that minted this doc (gui|mcp|agent|test). Immutable
         // once set — the origin of ownership (user vs AI). Empty = unknown.
         std::string originKind;
+        // Explicit presentation is independent of editing, attachment and persistence.
+        bool presented = false;
+        std::string name;
         // Internal doc: minted with {"internal":true} and deliberately invisible on
         // the wire — the registry NEVER fans out doc.opened/doc.changed/doc.closed
         // (nor lease_change/history_cleared) for it. WHY: the agent preflight advisor
         // mints a shadow clone of the live part inside a single add_features call and
         // closes it a few RPCs later; mirroring that clone made the GUI open a
-        // throwaway part tab for every operation the AI performed. Registration,
-        // attach/rw counting and doc-GC are unaffected — only the fanout is skipped.
+        // throwaway part tab for every operation the AI performed. Internal
+        // clones do not take a run hold, so their normal cleanup still works.
         bool internal = false;
-        // Doc-GC: when > 0, no client is attached and the doc closes once this
-        // deadline passes without a new attach (zombie-doc prevention).
+        // Doc-GC deadline, armed only when no client or live run holds the doc.
         long long orphanDeadlineMs = 0;
         // The last doc.changed payload fanned out for this doc (tree + aicm_path +
         // owner_map + datums + feature_status). Served verbatim by doc_snapshot.
@@ -248,10 +258,10 @@ private:
     // back to its placeholder + async doc_tree backfill).
     static std::string sniffName(const nlohmann::json& result);
     int holdSecs() const;
-    // Start/refresh the GC countdown when `d` has no attachments; clear it when
-    // it does. Agent/mcp-origin docs get a longer grace (CHUDWARE_DOC_GC_AGENT_GRACE_S).
-    // No-op when doc-GC is disabled.
+    // Start the GC countdown only after all attachments and run holds leave.
+    // Agent/mcp-origin docs get a longer grace; a disabled GC is a no-op.
     static void updateOrphanDeadlineLocked(DocState& d);
+    void rememberAgentRunLocked(DocState& d, int clientId);
     int rwCountLocked(const DocState& d) const;
     const std::string& writerGroupLocked(int clientId) const;
     bool sameWriterLocked(int a, int b) const;
@@ -266,9 +276,15 @@ private:
     void expireHoldLocked(const std::string& docId, DocState& d,
                           std::vector<PendingEvent>& out);
 
-    std::mutex mtx_;
+    mutable std::mutex mtx_;
+    std::mutex mutationMtx_;
+    std::map<std::string, std::weak_ptr<std::recursive_mutex>> mutationLocks_;
     std::map<std::string, DocState> docs_;
+    // Late postCall responses must not recreate a document closed in the meantime.
+    std::set<std::string> closedIds_;
     std::map<int, std::string> writerGroups_;
+    std::map<std::string, std::string> agentRuns_;  // scope -> authenticated actor
+    std::map<int, std::vector<std::string>> clientAgentRuns_;  // socket -> nested scopes
     struct CellPrincipal {
         std::string actorKey;
         bool readOnly = false;

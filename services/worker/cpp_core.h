@@ -10,6 +10,7 @@
 // unconditional: the C++ core is the only engine backend.
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <cstdint>
@@ -26,14 +27,14 @@ public:
     // Logs the winner once to stderr: "[cpp_core] loaded libchudware ... path=...".
     // Safe to call repeatedly; only loads once.
     bool ensureLoaded(std::string& err);
-    bool available() const { return loaded_; }
-    std::string abiVersion() const { return abi_; }
+    bool available() const { return loaded_.load(std::memory_order_acquire); }
+    std::string abiVersion() const { return available() ? abi_ : std::string(); }
     // git-describe build id of the loaded engine ("" until loaded, or when the
     // .so predates the chudware_build_id export — callers tolerate absence).
-    std::string buildId() const { return build_id_; }
+    std::string buildId() const { return available() ? build_id_ : std::string(); }
     // Absolute path of the loaded library ("" until loaded). The hostd stale-
     // binary self-drain stats this file for mtime changes.
-    std::string loadedPath() const { return path_; }
+    std::string loadedPath() const { return available() ? path_ : std::string(); }
 
     // Dispatch a call into the C++ core. Returns true iff the core HANDLED the
     // method (chudware_call returned 0); `result` then holds its result object. On
@@ -43,21 +44,15 @@ public:
     bool call(const std::string& method, const nlohmann::json& params,
               nlohmann::json& result, std::string& err);
 
-    // Live event streaming (transparency): register a THREAD-LOCAL callback the core invokes
-    // with each agent-run event's JSON (UTF-8) as it is emitted. Call with cb=nullptr to clear.
+    // Live event streaming: register a THREAD-LOCAL callback the core invokes with each
+    // simulation progress event's JSON (UTF-8) as it is emitted. Call with cb=nullptr to clear.
     // No-op if the loaded engine predates the chudware_set_event_sink export. Set on the SAME
-    // thread that then calls call() for an agent_* method.
+    // thread that then calls call() for the streaming method.
     void setEventSink(void (*cb)(const char* event_json, void* ud), void* ud);
+    void setRequestCancel(int (*check)(void*), void* user);
     // True iff the loaded engine exports chudware_set_event_sink (live streaming supported).
     // Callers use this to decide whether live events will fire (else fall back to batched).
     bool hasEventSink();
-
-    // Live document publication for direct doc calls nested inside an opaque agent RPC. Optional
-    // export, thread-local, and scoped exactly like setEventSink.
-    void setDocPublishSink(
-        void (*cb)(const char* method, const char* params_json, const char* result_json, void* ud),
-        void* ud);
-    bool hasDocPublishSink();
 
     // Optional process-wide publication from asynchronous persisted-cache verification.
     // Missing export means unsupported; the caller can retain the immediate warm snapshot.
@@ -67,11 +62,14 @@ public:
     // Dedicated optional lifecycle export. Missing/busy capability is unknown.
     bool activity(std::uint64_t counts[3]);
 
+    // Teardown only: caller has stopped submitting engine work.
+    bool drainBackgroundTasks();
+
 
 private:
     std::mutex mtx_;
     bool tried_ = false;
-    bool loaded_ = false;
+    std::atomic<bool> loaded_{false};  // release-publishes immutable metadata and exports
     std::string abi_;
     std::string build_id_;
     std::string path_;
@@ -80,11 +78,11 @@ private:
     void (*free_)(char*) = nullptr;
     const char* (*abi_fn_)(void) = nullptr;
     void (*set_event_sink_)(void (*)(const char*, void*), void*) = nullptr;  // optional export
-    void (*set_doc_publish_sink_)(
-        void (*)(const char*, const char*, const char*, void*), void*) = nullptr;
+    void (*set_request_cancel_)(int (*)(void*), void*) = nullptr;
     void (*set_cache_refresh_sink_)(
         void (*)(const char*, const char*, void*), void*) = nullptr;
     int (*activity_)(std::uint64_t*) = nullptr;
+    int (*drain_background_tasks_)() = nullptr;
 };
 
 // Process-wide singleton. The diagnostic seam is dev-only and gated behind an env

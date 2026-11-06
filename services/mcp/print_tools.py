@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
+from services.manufacturing.print_safety import atomic_print_output, validate_output_path
 
 from services.mcp import core_bridge as cb
 from services.mcp.cad_common import (
@@ -49,6 +50,7 @@ from services.mcp.cad_common import (
     _err,
     _project_save_stem,
     _sanitize_output_path,
+    resolve_agent_path,
 )
 from services.mcp.tool_registry import context_doc_unless
 
@@ -100,7 +102,7 @@ def _doc_name(doc_id: str) -> str:
 
 
 def _resolve_input_path(path: str) -> Path:
-    resolved = Path(os.path.abspath(os.path.expanduser(path)))
+    resolved = Path(resolve_agent_path(path, "path"))
     if not resolved.is_file():
         raise ValueError(f"mesh file not found: {resolved}")
     if resolved.suffix.lower() not in _MESH_SUFFIXES:
@@ -163,6 +165,15 @@ def print_params(*, process: str = "fdm", resolved=None, dfm: Optional[dict] = N
     min_wall = _num(dfm.get("min_wall_mm"))
     if min_wall:
         kw["min_wall_mm"] = min_wall
+    rules = dfm.get("rules") if isinstance(dfm.get("rules"), dict) else {}
+    for key, field in (("nozzle_mm", "nozzle_mm"), ("line_width_mm", "line_width_mm"),
+                       ("layer_height_mm", "layer_height_mm"), ("min_hole_mm", "min_hole_mm")):
+        value = _num(rules.get(key))
+        if value is not None and value > 0:
+            kw[field] = value
+    perimeters = _num(rules.get("perimeters"))
+    if perimeters is not None and perimeters >= 1 and perimeters.is_integer():
+        kw["walls"] = int(perimeters)
     overhang = dfm.get("overhang") if isinstance(dfm.get("overhang"), dict) else {}
     if _num(overhang.get("max_deg")) is not None:
         kw["overhang_max_deg"] = _num(overhang.get("max_deg"))
@@ -314,7 +325,7 @@ def _write_binary_stl(path: Path, vertices, triangles) -> None:
     record = np.zeros(len(tri), dtype=[("n", "<f4", 3), ("v", "<f4", (3, 3)), ("a", "<u2")])
     record["n"] = normals
     record["v"] = tri
-    with open(path, "wb") as handle:
+    with atomic_print_output(path) as handle:
         handle.write(b"chudware slice_part".ljust(80, b"\0"))
         handle.write(np.uint32(len(tri)).tobytes())
         handle.write(record.tobytes())
@@ -327,7 +338,7 @@ def _slice_mesh_arrays(source: dict, work_dir: Path, raw_name: str = "model_fram
     if source["kind"] == "file":
         mesh = load_mesh_file(Path(source["path"]))
         return mesh.vertices, mesh.triangles
-    raw = work_dir / raw_name
+    raw = validate_output_path(work_dir / raw_name)
     cb.call("export_file", {"doc_id": source["doc_id"], "path": str(raw), "format": "stl",
                             "lin_deflection": _SLICE_LIN_DEFLECTION_MM,
                             "ang_deflection": _SLICE_ANG_DEFLECTION_RAD})
@@ -775,8 +786,10 @@ def register_print_tools(mcp: FastMCP) -> None:
         preserve_faces: face sids (cosmetic/sealing/precision surfaces) that must not touch
         supports or the bed. strength_dir: [x,y,z] main load direction in the MODEL frame — it
         is kept in the layer plane (layer lines are the weak axis). printer: bed size for the fit
-        check. Returns ranked rows {build_dir, yaw_deg, score, metrics, why}; pass the winner's
-        build_dir to slice_part(build_dir=...) or let slice_part(orientation="auto") pick it."""
+        check. path accepts a mesh file; relative paths use the selected workspace, not the
+        server cwd. Without a workspace, pass an absolute path. Returns ranked rows
+        {build_dir, yaw_deg, score, metrics, why}; pass the winner's build_dir to
+        slice_part(build_dir=...) or let slice_part(orientation="auto") pick it."""
         try:
             from services.dfam import optimize_orientation  # noqa: PLC0415
 
@@ -827,6 +840,8 @@ def register_print_tools(mcp: FastMCP) -> None:
         (unless its build_dir_source is "assumed").
 
         Target: doc_id (open part; default current) or path (.stl/.3mf/.obj/.ply).
+        Relative path and parts[*].path inputs use the selected workspace, not the server cwd;
+        without a workspace, pass absolute paths.
         printer (required): the user's printer as free text, resolved against the installed
           vendor presets ("ender 3", "prusa mk4", "voron 2.4 350") — ask the user when you
           do not know it; never assume one. material: PLA|PETG|ABS|ASA|TPU|… (vendor filament
@@ -855,19 +870,26 @@ def register_print_tools(mcp: FastMCP) -> None:
           becomes the printer's extruder_clearance_radius (Ender-3: 55 mm) plus brims, the
           print order is ascending height, and at most ONE object may be taller than
           extruder_clearance_height (Ender-3: 25 mm) — it prints last. A plate that cannot
-          meet that is refused naming the objects (split the plate or print layer by layer);
-          gcode_check.sequential_clearance then proves from the toolpath that no move runs
-          the hotend or gantry into a finished object.
+          meet that is refused naming the objects (split the plate or print layer by layer).
+          The sequential_clearance check proves from the toolpath that no move runs the
+          hotend or gantry into a finished object; warnings/failures appear in
+          gcode_check.issues.
+
+        Output symlink/hardlink aliases are refused before writing; auxiliary files and
+        external slicer exports use atomic .part staging, never firmware-image filenames.
 
         Writes <output_dir>/<name>.gcode (+ .3mf project for review in PrusaSlicer, + a
         .print.json manifest) — default <project>/print/<printer>/. Returns printer/presets,
-        orientation (with alternatives), effective settings, slicer stats (time, grams,
-        layers, support share), printability issues (dfm-style rows) and gcode_check
-        (verify_gcode); a plate also returns plate.objects (print order, position, height)
-        and per-part orientation/printability. print_ready is true only when the G-code
-        verification passes, the printability analysis has no failure and, when export_3mf
-        is on (default), the review 3MF proves PrusaSlicer did not repair the input mesh
-        (slicer_mesh_repairs; a missing or malformed record is not ready either). A mesh
+        orientation (with alternatives), effective settings and slicer stats (time, grams,
+        layers, support share). printability and gcode_check are objects, each with status
+        and an issues list of {check, status, note, fix?} rows for failures, warnings and
+        not_evaluated checks; they are not lists themselves. For all G-code check rows and
+        details, call verify_gcode on gcode_path. A plate also returns plate.objects (print
+        order, position, height) and per-part orientation/printability. print_ready is true
+        only when G-code verification passes, the printability analysis has no failure and,
+        when export_3mf is on (default), the review 3MF proves PrusaSlicer did not repair
+        the input mesh (slicer_mesh_repairs; a missing or malformed record is not ready
+        either). A mesh
         whose float32 STL would merge distinct vertices or flatten a triangle is refused
         before slicing (reason slicer_mesh_precision_loss, with model-frame coordinates). Report
         print_ready=false honestly and fix the design (dfm_check lists the faces) or
@@ -972,7 +994,10 @@ def register_print_tools(mcp: FastMCP) -> None:
                 stem = _project_save_stem(name or first["label"],
                                           first["source"].get("doc_id") or first["label"])
             out_dir = _output_dir(output_dir, stem, _slug(printer_name))
-            work_dir = out_dir / f".{stem}.slice"
+            work_dir = validate_output_path(out_dir / f".{stem}.slice")
+            gcode_path = validate_output_path(out_dir / f"{stem}.gcode")
+            project = validate_output_path(out_dir / f"{stem}.3mf") if export_3mf else None
+            manifest_path = validate_output_path(out_dir / f"{stem}.print.json")
             work_dir.mkdir(parents=True, exist_ok=True)
             config = {**resolved.config, **settings}
             plan = None
@@ -999,8 +1024,6 @@ def register_print_tools(mcp: FastMCP) -> None:
             except SlicerMeshRefusal as refusal:
                 return _dumps({**refusal.to_dict(), "printer": printer_name})
 
-            gcode_path = out_dir / f"{stem}.gcode"
-            project = out_dir / f"{stem}.3mf" if export_3mf else None
             run = ps.slice_mesh(install, mesh_paths=mesh_paths, config=config,
                                 output_gcode=gcode_path, work_dir=work_dir,
                                 center_xy=center_xy, copies=instance_copies,
@@ -1101,8 +1124,8 @@ def register_print_tools(mcp: FastMCP) -> None:
                 "slicer_warnings": run.warnings, "slicer_mesh_repairs": repairs,
                 "print_ready": print_ready,
             }
-            manifest_path = out_dir / f"{stem}.print.json"
-            manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            with atomic_print_output(manifest_path) as handle:
+                handle.write(json.dumps(manifest, indent=2).encode("utf-8"))
             next_steps = []
             if printability_fail:
                 next_steps.append("fix the failing printability rows in CAD (dfm_check lists "
@@ -1186,6 +1209,9 @@ def register_print_tools(mcp: FastMCP) -> None:
                      detail: bool = False) -> str:
         """Deterministically check a G-code file before it goes to a printer.
 
+        Firmware/EEPROM/media-write commands, firmware filenames and uninspectable binary
+        payloads fail as unsafe_print_file, before geometry analysis.
+
         Checks: motion inside the printer's bed polygon and height (printer resolves through
         the vendor presets), homing before motion, no extrusion before the hotend is at
         temperature, temperatures inside the material window and equal to the requested
@@ -1196,7 +1222,15 @@ def register_print_tools(mcp: FastMCP) -> None:
         mid-air plastic that turns into spaghetti. For "Complete individual objects" files
         (complete_objects=1), sequential_clearance checks every move after an object is
         finished against it: hotend inside extruder_clearance_radius or gantry below its top
-        fails. Returns {ok, status, checks:[...], stats}."""
+        fails. Relative path inputs use the selected workspace, not the server cwd; without
+        a workspace, pass an absolute path.
+
+        Returns {ok, status, checks, stats, path, printer, content}: checks is a LIST of
+        {check, status, ok, note, metrics, limits, regions, fix} objects; stats is an object.
+        ok=false with status="fail" and checks means validation failed, not that the call
+        succeeded safely. Input/access errors instead return {ok:false, error}. This differs
+        from slice_part's gcode_check object, whose issues list contains only fail, warn and
+        not_evaluated rows."""
         try:
             resolved = None
             if printer:
@@ -1207,7 +1241,7 @@ def register_print_tools(mcp: FastMCP) -> None:
                 if best is None:
                     return _dumps({"ok": False, "reason": "printer_not_found", "query": printer})
                 resolved = catalog.resolve(best["name"])
-            file_path = Path(os.path.abspath(os.path.expanduser(path)))
+            file_path = Path(resolve_agent_path(path, "path"))
             if not file_path.is_file():
                 raise ValueError(f"G-code file not found: {file_path}")
             result = _verify(file_path, resolved, material=material, nozzle_c=nozzle_temp_c,
@@ -1226,8 +1260,9 @@ def register_print_tools(mcp: FastMCP) -> None:
         """Read-only inventory of printer media (USB stick / SD card): every file, which G-code is selectable.
 
         Changes nothing. Call it FIRST, before any delivery, and again to read back what a
-        publish left. root: the mounted media root (e.g. /run/media/<user>/<LABEL>); it must
-        already exist — a missing mount is reported, never created. Walks the whole real file
+        publish left. root: the mounted media root (e.g. /run/media/<user>/<LABEL>); relative
+        roots use the selected workspace, not the server cwd. It must already exist — a
+        missing mount is reported, never created. Walks the whole real file
         tree without following symlinks and returns rows {path (relative to root), size,
         sha256, printable (.gcode/.gco/.g/.bgcode, any case), managed status current |
         superseded | modified}, duplicate groups, the managed revision per project,
@@ -1235,11 +1270,15 @@ def register_print_tools(mcp: FastMCP) -> None:
         offset/limit page the rows (total, truncated). Compare the printable rows against the
         complete job set you intend to deliver: the printer shows names only, no timestamps, so
         a stale or duplicate G-code is indistinguishable from the current one on its screen.
+        Possible root-level firmware images raise firmware_files_present warnings and block
+        publishing; some printers auto-flash them at boot. Inventory never removes them.
         Never decide which file is current from mtime. Pass inventory_token unchanged to
         publish_print_media."""
         try:
             from services.manufacturing.print_media import inventory_print_media  # noqa: PLC0415
 
+            if isinstance(root, str) and root.strip():
+                root = resolve_agent_path(root, "root")
             return _dumps(inventory_print_media(root, offset=offset, limit=limit))
         except Exception as e:  # noqa: BLE001
             return _err(e)
@@ -1258,6 +1297,9 @@ def register_print_tools(mcp: FastMCP) -> None:
         printing or reading it (ejected/detached, or the printer idle); default False refuses.
         expected_inventory: the inventory_token from print_media_inventory on this root; any
         change since then refuses, so inventory, compare, then publish.
+        Only UTF-8 text .gcode/.gco/.g jobs are accepted. Firmware/EEPROM/media-write
+        commands and uninspectable binary files are refused even with user_override.
+        Possible firmware images at the root block publishing without removing those files.
 
         project: the canonical project identifier used to track and replace its complete set.
         layout: root (default) writes raw print files directly at the drive root; project
@@ -1266,7 +1308,11 @@ def register_print_tools(mcp: FastMCP) -> None:
         jobs: the COMPLETE desired set for the project, one {part_id, manifest_path,
           gcode_path?, user_override?} per part: part_id a stable identifier (same part, same
           id across revisions), manifest_path the slice_part .print.json, gcode_path only
-          when the saved G-code moved since slicing. The G-code sha256 must equal the
+          when the saved G-code moved since slicing. Relative root, manifest_path and explicit
+          gcode_path inputs use the selected workspace, not the server cwd; without a
+          workspace, pass absolute paths. Relative G-code paths stored inside a manifest remain
+          relative to that manifest. retire_paths remain relative to the media root.
+          The G-code sha256 must equal the
           manifest's gcode_sha256 — nothing is resliced or relaxed. Each job needs
           print_ready true, unless the user explicitly told you to put that file on the media
           anyway: then pass user_override with their instruction (quoted), and the job
@@ -1295,6 +1341,19 @@ def register_print_tools(mcp: FastMCP) -> None:
                 publish_print_media as publish,
             )
 
+            if isinstance(root, str) and root.strip():
+                root = resolve_agent_path(root, "root")
+            if isinstance(jobs, list):
+                resolved_jobs = []
+                for index, job in enumerate(jobs):
+                    if isinstance(job, dict):
+                        job = dict(job)
+                        for key in ("manifest_path", "gcode_path"):
+                            value = job.get(key)
+                            if isinstance(value, str) and value.strip():
+                                job[key] = resolve_agent_path(value, f"jobs[{index}].{key}")
+                    resolved_jobs.append(job)
+                jobs = resolved_jobs
             return _dumps(publish(root, project, jobs, expected_inventory,
                                   media_idle=media_idle, retire_paths=retire_paths,
                                   layout=layout))

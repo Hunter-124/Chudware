@@ -345,12 +345,6 @@ def run_auto_verify(dispatch: Callable[[str, dict], Any],
 # WI-3 — Plan format
 # ---------------------------------------------------------------------------
 
-PLAN_FORMAT_TO_ENFORCEMENT = {
-    "rigid_template": "step_locked",
-    "structured_fields": "checklist",
-    "freeform": "off",
-}
-
 # A rigid plan: feature-tree skeleton with required dim slots.
 RIGID_PLAN_TEMPLATE = f"""\
 {RIGID_PLAN_MARKER}
@@ -395,14 +389,6 @@ RIGID_REQUIRED_SLOTS: tuple[str, ...] = (
 STRUCTURED_REQUIRED_SLOTS: tuple[str, ...] = (
     "datums", "build_order", "risks",
 )
-
-
-def playbook_enforcement_for(profile: Any) -> str:
-    """Map plan_format dial → existing playbook_enforcement enum."""
-    if profile is None or is_frontier(profile):
-        return "off"
-    fmt = str(getattr(profile, "plan_format", "freeform") or "freeform")
-    return PLAN_FORMAT_TO_ENFORCEMENT.get(fmt, "off")
 
 
 def plan_prompt_for(profile: Any, base_prompt: str = "") -> str:
@@ -587,7 +573,6 @@ def pre_dispatch_aggressive_checkpoint(
     actor: str = "scaffolds",
     cfg: dict | None = None,
     checkpoint_fn: Callable[..., Any] | None = None,
-    vault_bound: bool = False,
 ) -> Optional[str]:
     """WI-6 A: checkpoint before fillet/pattern/boolean/hole.
 
@@ -609,7 +594,7 @@ def pre_dispatch_aggressive_checkpoint(
             return None  # HARD path owns this call
         verdict = _gr.checkpoint_verdict(
             tool, args, ledger=ledger, actor=actor, cfg=cfg,
-            checkpoint_fn=checkpoint_fn, vault_bound=vault_bound,
+            checkpoint_fn=checkpoint_fn,
         )
         emit_capability_dial(
             ledger, "auto_checkpoint", "aggressive", forced=True, actor=actor,
@@ -869,7 +854,6 @@ def pre_dispatch_scaffolds(
     actor: str = "scaffolds",
     cfg: dict | None = None,
     checkpoint_fn: Callable[..., Any] | None = None,
-    vault_bound: bool = False,
     effective_allow_set: set[str] | frozenset[str] | None = None,
 ) -> Optional[str]:
     """Run A/B scaffold pre-dispatch gates. First block wins. C → always None."""
@@ -883,7 +867,7 @@ def pre_dispatch_scaffolds(
         return msg
     msg = pre_dispatch_aggressive_checkpoint(
         tool, args, profile=profile, ledger=ledger, actor=actor, cfg=cfg,
-        checkpoint_fn=checkpoint_fn, vault_bound=vault_bound,
+        checkpoint_fn=checkpoint_fn,
     )
     if msg:
         return msg

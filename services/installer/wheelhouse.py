@@ -31,9 +31,14 @@ MAX_WHEEL_BYTES = 1024 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 2 * MAX_WHEEL_BYTES
 MAX_METADATA_BYTES = 1024 * 1024
 MAX_IDENTITY_BYTES = 4 * 1024 * 1024
-# The public repository the chudcode-rpc SDK wheel is built from (python/chudcode-rpc),
-# at the commit vendor/chudcode/CHUDCODE_ARTIFACT.lock pins for the native runtime.
-CHUDCODE_REPOSITORY = "https://github.com/Hunter-124/chudcode.git"
+# Upstream source identity retained by offline review manifests, not an install URL.
+# The SDK source archive below carries the same commit as the locked native runtime.
+OMP_REPOSITORY = "https://github.com/can1357/oh-my-pi.git"
+OMP_SOURCE_ARCHIVE = (
+    "https://codeload.github.com/can1357/oh-my-pi/tar.gz/{repository_commit}"
+    "#sha256=56cddfedb6784a4fdd4e43070fee29bfc4c04351f378a32f9fca0c9a3c8596d4"
+    "&subdirectory=sdk/python/omp-rpc"
+)
 
 
 def local_path(path: Path) -> Path:
@@ -127,12 +132,12 @@ def _source_identity(value: dict, sdk: bool, native_source: dict) -> None:
             raise WheelhouseError("wheel source requires an immutable repository commit")
         url = value["repository"]
         if sdk and {key: value[key] for key in native_source} != native_source:
-            raise WheelhouseError("chudcode-rpc wheel source differs from the reviewed Chudcode commit")
+            raise WheelhouseError("omp-rpc wheel source differs from the reviewed OMP commit")
     elif not sdk and value.get("kind") == "archive":
         _keys(value, {"kind", "url"}, "wheel source")
         url = value["url"]
     else:
-        raise WheelhouseError("chudcode-rpc requires reviewed immutable VCS provenance; "
+        raise WheelhouseError("omp-rpc requires reviewed immutable VCS provenance; "
                               "other wheels need a reviewed VCS or archive source")
     from urllib.parse import urlsplit
     if not isinstance(url, str) or len(url) > 2048 or any(ord(char) < 33 for char in url):
@@ -265,9 +270,8 @@ def target_key(environment: dict) -> str:
     return f"{environment['sys_platform']}-{machine}-cp{environment['python_version'].replace('.', '')}"
 
 
-def _declarations(path: Path, environment: dict, chudcode_source: dict) -> list:
+def _declarations(path: Path, environment: dict, native_source: dict) -> list:
     _, requirements, utils, _, _, _ = _packaging()
-    pinned_sdk = f"git+{chudcode_source['repository']}@{chudcode_source['repository_commit']}"
     result = []
     for raw in _bytes(path).decode("utf-8").splitlines():
         # pip's comment rule: '#' starts a comment only at line start or after
@@ -280,12 +284,16 @@ def _declarations(path: Path, environment: dict, chudcode_source: dict) -> list:
         except ValueError as exc:
             raise WheelhouseError(f"invalid runtime requirement: {line}") from exc
         if req.url:
-            # Developers build the SDK from this direct reference; the reviewed
-            # chudcode-rpc wheel from the same commit satisfies it here.
-            if (utils.canonicalize_name(req.name) != "chudcode-rpc"
-                    or req.url.split("#", 1)[0] != pinned_sdk):
+            # Offline installs substitute the reviewed wheel only for this exact
+            # SDK archive, including its hash and subdirectory. The release and
+            # commit must also match the separately trusted native runtime lock.
+            if (utils.canonicalize_name(req.name) != "omp-rpc"
+                    or native_source.get("version") != "18.13.3"
+                    or native_source.get("repository_commit") != "413d278a87a69b453efabf8d1fedb9940385e8c6"
+                    or req.url != OMP_SOURCE_ARCHIVE.format(**native_source)):
                 raise WheelhouseError("runtime declarations cannot supply unreviewed direct URLs")
-            req = requirements.Requirement("chudcode-rpc" + (f"; {req.marker}" if req.marker else ""))
+            extras = f"[{','.join(sorted(req.extras))}]" if req.extras else ""
+            req = requirements.Requirement("omp-rpc" + extras + (f"; {req.marker}" if req.marker else ""))
         if not req.marker or req.marker.evaluate(environment):
             result.append(req)
     return result
@@ -293,7 +301,7 @@ def _declarations(path: Path, environment: dict, chudcode_source: dict) -> list:
 
 @contextmanager
 def verified_wheelhouse(wheelhouse: Path, requirements: Path, lock_path: Path,
-                        chudcode_lock: Path, environment: dict | None = None,
+                        omp_lock: Path, environment: dict | None = None,
                         supported_tags: set[str] | None = None,
                         additional_requirements: Path | list[Path] | None = None):
     """Yield a hash-locked requirements snapshot after checking the full closure.
@@ -308,7 +316,7 @@ def verified_wheelhouse(wheelhouse: Path, requirements: Path, lock_path: Path,
     supported_tags = supported_tags if supported_tags is not None else {str(tag) for tag in tags.sys_tags()}
     if environment["platform_python_implementation"] != "CPython":
         raise WheelhouseError("runtime wheel locks require CPython")
-    _keys(lock, {"schema", "requirements_sha256", "chudcode_source", "targets"}, "runtime lock")
+    _keys(lock, {"schema", "requirements_sha256", "omp_source", "targets"}, "runtime lock")
     if lock["schema"] != "chudware-runtime-wheels-v1" or not _sha(lock["requirements_sha256"]):
         raise WheelhouseError("invalid runtime lock schema/requirements digest")
     if _digest(requirements) != lock["requirements_sha256"]:
@@ -316,14 +324,14 @@ def verified_wheelhouse(wheelhouse: Path, requirements: Path, lock_path: Path,
     additional = ([] if additional_requirements is None else
                   [additional_requirements] if isinstance(additional_requirements, (str, Path)) else
                   list(additional_requirements))
-    source = lock["chudcode_source"]
-    _keys(source, {"repository", "repository_commit"}, "Chudcode source")
-    native = _json(chudcode_lock)
+    source = lock["omp_source"]
+    _keys(source, {"repository", "repository_commit"}, "OMP source")
+    native = _json(omp_lock)
     if source != {key: native.get(key) for key in source}:
-        raise WheelhouseError("chudcode-rpc wheel source differs from the reviewed Chudcode commit")
-    if (source["repository"] != CHUDCODE_REPOSITORY
-            or not re.fullmatch(r"[0-9a-f]{40}", str(source["repository_commit"]))):
-        raise WheelhouseError("chudcode-rpc wheel lacks immutable source provenance")
+        raise WheelhouseError("omp-rpc wheel source differs from the reviewed OMP commit")
+    if (source["repository"] != OMP_REPOSITORY
+            or source["repository_commit"] != "413d278a87a69b453efabf8d1fedb9940385e8c6"):
+        raise WheelhouseError("omp-rpc wheel lacks immutable source provenance")
     key = target_key(environment)
     if not isinstance(lock["targets"], dict) or key not in lock["targets"]:
         raise WheelhouseError(f"reviewed complete runtime wheel set unavailable for {key}")
@@ -416,11 +424,11 @@ def verified_wheelhouse(wheelhouse: Path, requirements: Path, lock_path: Path,
                 dependencies.append(dependency)
             installed[canonical] = (version, dependencies)
             lines.append(f"{copied.as_uri()} --hash=sha256:{digest}\n")
-        if installed.get("chudcode-rpc", (None,))[0] != "0.3.1":
-            raise WheelhouseError("reviewed chudcode-rpc==0.3.1 wheel is required")
-        pending = _declarations(requirements, environment, source)
+        if installed.get("omp-rpc", (None,))[0] != "0.1.0":
+            raise WheelhouseError("reviewed omp-rpc==0.1.0 wheel is required")
+        pending = _declarations(requirements, environment, native)
         for path in additional:
-            pending.extend(_declarations(Path(path), environment, source))
+            pending.extend(_declarations(Path(path), environment, native))
         # Even additional reviewed wheels must have a complete dependency closure.
         pending.extend(req_parser.Requirement(f"{name}=={value[0]}") for name, value in installed.items())
         visited = set()

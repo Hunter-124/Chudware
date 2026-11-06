@@ -1,7 +1,6 @@
 """Mega-8 RoleSurface regressions (FitGecko).
 
 Covers mega-7 TOP-5 items owned by RoleSurface:
-  1. Capability separation — PLAN cards lose leaf exec tools (add_features).
   2. Typed-refusal soft gate — free-form ledger_note does NOT satisfy;
      valid {reason, domains_considered, why_flat} does; delegate call does.
   3. Cheap-leaf one-shot envelope — validates, falls back, increments leaf_miss.
@@ -18,53 +17,6 @@ what it actually asserts.
 from __future__ import annotations
 
 import pytest
-
-
-# ---------------------------------------------------------------------------
-# 1. Capability separation (advisor Q2 primary)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "role_id",
-    ["orchestrator", "layout_engineer", "department_manager"],
-)
-def test_plan_roles_have_no_add_features(role_id):
-    """PLAN / multi-domain coordinator cards must not expose leaf exec tools."""
-    from services.agent.roles import load_role
-
-    card = load_role(role_id)
-    tools = card.concrete_tools
-    assert "add_features" not in tools, (role_id, tools)
-    assert "new_part" not in tools, (role_id, tools)
-    assert "preflight_ops" not in tools, (role_id, tools)
-    # Still able to coordinate.
-    assert "delegate" in tools, (role_id, tools)
-    assert "ledger_note" in tools or "ledger_get" in tools, (role_id, tools)
-
-
-def test_leaf_worker_feature_modeler_keeps_exec_tools():
-    """Leaf/worker BUILD role keeps geometry mutators."""
-    from services.agent.roles import load_role
-
-    card = load_role("feature_modeler")
-    tools = card.concrete_tools
-    assert "add_features" in tools
-    assert "new_part" in tools
-    assert "delegate" in tools
-
-
-def test_plan_role_tools_slot_resolves_without_add_features():
-    """Acceptance: PLAN role card resolves WITHOUT add_features in tools_slot."""
-    from services.agent.roles import load_role
-
-    for rid in ("orchestrator", "layout_engineer"):
-        card = load_role(rid)
-        assert "add_features" not in card.concrete_tools
-        # tools_slot would render concrete_tools; assert the source of truth.
-        names = [t.tool for t in card.tool_allowlist if t.tool]
-        assert "add_features" not in names
-        assert "delegate" in names
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +120,7 @@ def test_multi_domain_request_includes_typed_refusal_scaffold():
         {
             "role": "layout_engineer",
             "task_class": "assembly",
-            "request": "Build the layout skeleton for the rocket plane.",
+            "request": "Build the layout skeleton for the robot arm.",
         },
         {
             "role_id": "layout_engineer",
@@ -432,7 +384,7 @@ def test_leaf_envelope_salvages_truncated_ops_json():
     from services.agent.role_models import parse_leaf_envelope_text
 
     blob = """{
-  "goal": "Design a model rocket plane with flight computer",
+  "goal": "Design a robot arm with controller board",
   "ops": [
     {
       "type": "fit_calc",
@@ -440,7 +392,7 @@ def test_leaf_envelope_salvages_truncated_ops_json():
 """
     env, errs = parse_leaf_envelope_text(blob)
     assert env is not None, errs
-    assert env["goal"].startswith("Design a model rocket")
+    assert env["goal"].startswith("Design a robot arm")
     assert env.get("no_op") is True
     assert env.get("reason")
 
@@ -452,7 +404,7 @@ def test_leaf_envelope_salvages_truncated_ops_json():
 
 
 def test_reviewer_leaf_runs_through_chudcode_with_verification_tools(monkeypatch):
-    from services.agent import chudcode_roles
+    from services.agent import omp_roles
     from services.dag import node_runner as nr
 
     calls = []
@@ -468,7 +420,7 @@ def test_reviewer_leaf_runs_through_chudcode_with_verification_tools(monkeypatch
             "tool_calls": 1,
         }
 
-    monkeypatch.setattr(chudcode_roles, "run_role_turn", role_turn)
+    monkeypatch.setattr(omp_roles, "run_role_turn", role_turn)
     monkeypatch.setattr(nr, "_ADVISOR_ENABLED", False)
     node = {
         "id": "n_verify_DL1",
@@ -497,7 +449,7 @@ def test_reviewer_leaf_runs_through_chudcode_with_verification_tools(monkeypatch
 
 
 def test_leaf_chudcode_failure_uses_shared_dag_retry_contract(monkeypatch):
-    from services.agent import chudcode_roles
+    from services.agent import omp_roles
     from services.agent import role_models as rm
     from services.dag import node_runner as nr
 
@@ -512,7 +464,7 @@ def test_leaf_chudcode_failure_uses_shared_dag_retry_contract(monkeypatch):
             "result": {"retryable": True, "error": "transient local model failure"},
         }
 
-    monkeypatch.setattr(chudcode_roles, "run_role_turn", role_turn)
+    monkeypatch.setattr(omp_roles, "run_role_turn", role_turn)
     monkeypatch.setattr(nr, "_ADVISOR_ENABLED", False)
     node = {
         "id": "n_intake",
@@ -558,7 +510,7 @@ def test_openai_provider_accepts_string_content():
 
 
 def test_leaf_request_is_forwarded_to_chudcode_role_seam(monkeypatch):
-    from services.agent import chudcode_roles
+    from services.agent import omp_roles
     from services.dag import node_runner as nr
 
     seen = {}
@@ -571,7 +523,7 @@ def test_leaf_request_is_forwarded_to_chudcode_role_seam(monkeypatch):
             "result": "leaf complete",
         }
 
-    monkeypatch.setattr(chudcode_roles, "run_role_turn", role_turn)
+    monkeypatch.setattr(omp_roles, "run_role_turn", role_turn)
     result = nr._default_agent_fn(
         "do leaf",
         {

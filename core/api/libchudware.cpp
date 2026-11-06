@@ -16,12 +16,14 @@
 // {"error":...} payload so a bug in the C++ core can never crash the host.
 
 #include "api/libchudware.h"
+#include "doc/request_cancel.h"
 
 #include "util/aicm_handoff.h"
 #include "version_info.h"  // CMake-configured CHUDWARE_HOSTD_BUILD_ID (shared with chudware-hostd)
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <atomic>
 #include <cctype>
 #include <cstdint>
@@ -51,32 +53,26 @@ extern "C" void randombytes(unsigned char*, unsigned long long);
 #define NOMINMAX          // <windows.h>'s min/max macros clobber std::min/std::max (used below); no-op on Linux
 #include <windows.h>
 #include <excpt.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 
 #include "agent/ask.h"
-#include "agent/clarify.h"
 #include "agent/config.h"
-#include "agent/copilot_modes.h"
-#include "agent/events.h"
-#include "agent/machine.h"
-#include "agent/micro.h"
 #include "agent/pm_assist.h"
-#include "agent/paths.h"
-#include "agent/ops_emit.h"
 #include "agent/providers.h"
 #include "agent/http.h"
-#include "agent/roles.h"
 #include "sim/flow_run.h"
-#include "agent/mission.h"
-#include "agent/run.h"
-#include "agent/state.h"
 #include "doc/document.h"
 #include "doc/export2d.h"
 #include "doc/drawing_session.h"
 #include "doc/session.h"
+#include "doc/native_policy.h"
 #include "doc/stepplus.h"
 #include "doc/formats.h"
 #include "doc/validate.h"
+#include "doc/scad.h"
 #include "doc/op_registry.h"
 #include "ecad/op_registry.h"
 #include "parts/parts.h"
@@ -86,11 +82,13 @@ extern "C" void randombytes(unsigned char*, unsigned long long);
 #include "ecad/recipes.h"
 #include "ecad/schema.h"
 #include "ecad/session.h"
+#include "ecad/kicad_cli.h"
 #include "ecad/symlib.h"
+#include "ecad/kicad_libs.h"
+#include "ecad/library.h"
 #include "cam/session.h"
 #include "cam/extract.h"
 #include "geom/aicm.h"
-#include "geom/ecad_3d.h"
 #include "parts/parts.h"
 #include "prof/phases.h"
 #include "prof/sampler.h"
@@ -113,6 +111,8 @@ extern "C" void randombytes(unsigned char*, unsigned long long);
 #include "piping/piping.h"
 #include "piping/fluid_properties.h"
 #include "piping/solve.h"
+#include "harness/route.h"
+#include "harness/path_check.h"
 #include "sim/fea_modal.h"
 #include "sim/fea_static.h"
 #include "sim/lbm.h"
@@ -184,105 +184,6 @@ int emit_error(const std::string& msg, char** out_json) {
     return emit(json{{"error", msg}}, out_json, 1);
 }
 
-struct NativeRunOwner {
-    std::string workspace;
-    std::string actor;
-    std::int64_t epoch = 0;
-    bool active = true;
-};
-std::mutex nativeRunOwnersMutex;
-std::map<std::string, NativeRunOwner> nativeRunOwners;
-std::map<std::string, std::map<std::string, std::int64_t>> nativeRevokeThrough;
-
-bool safeRunComponent(const std::string& id) {
-    if (id.empty() || id.size() > 192 || id == "." || id == "..") return false;
-    return std::all_of(id.begin(), id.end(), [](unsigned char c) {
-        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-               (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
-    });
-}
-
-bool nativeRunOwned(const std::string& id, bool allowManager) {
-    const auto* principal = chudware::sim::current_cell_principal();
-    if (!principal) return true;
-    std::lock_guard<std::mutex> lk(nativeRunOwnersMutex);
-    for (const auto& [root, owner] : nativeRunOwners) {
-        if (id != root && !(id.size() > root.size() &&
-            id.compare(0, root.size(), root) == 0 && id[root.size()] == '-')) continue;
-        return owner.workspace == principal->workspaceKey &&
-            (owner.actor == principal->actorKey || (allowManager && principal->manager));
-    }
-    return false;
-}
-
-class NativeRunOwnerScope {
-public:
-    NativeRunOwnerScope(const std::string& method, json& params) {
-        const auto* principal = chudware::sim::current_cell_principal();
-        if (!principal || (method != "agent_run" && method != "agent_run_design" &&
-            method != "agent_run_micro" && method != "agent_mission_v1")) return;
-        std::lock_guard<std::mutex> lk(nativeRunOwnersMutex);
-        auto workspace = nativeRevokeThrough.find(principal->workspaceKey);
-        if (workspace != nativeRevokeThrough.end()) {
-            auto actor = workspace->second.find(principal->actorKey);
-            if (actor != workspace->second.end() && principal->epoch <= actor->second)
-                throw chudware::sim::CellRevokedError();
-        }
-        // Tenant IDs are opaque server-minted handles, never caller-selected paths.
-        unsigned char bytes[16];
-        randombytes(bytes, sizeof(bytes));
-        static constexpr char hex[] = "0123456789abcdef";
-        id_ = "run-";
-        for (unsigned char b : bytes) {
-            id_.push_back(hex[b >> 4]);
-            id_.push_back(hex[b & 15]);
-        }
-        if (!params.contains("options") || !params["options"].is_object())
-            params["options"] = json::object();
-        params["options"]["run_id"] = id_;
-        // Register the actual shared control under the ownership lock. A revoke
-        // before run_design/run_mission starts flips the flag they later adopt.
-        chudware::agent::RunControl control;
-        chudware::agent::register_run_control(id_, control);
-        try {
-            nativeRunOwners.emplace(id_, NativeRunOwner{
-                principal->workspaceKey, principal->actorKey, principal->epoch});
-        } catch (...) {
-            chudware::agent::unregister_run_control(id_);
-            throw;
-        }
-    }
-    ~NativeRunOwnerScope() {
-        if (id_.empty()) return;
-        std::lock_guard<std::mutex> lk(nativeRunOwnersMutex);
-        chudware::agent::unregister_run_control(id_);
-        nativeRunOwners.at(id_).active = false;
-    }
-private:
-    std::string id_;
-};
-
-json cancelOwnNativeRuns(std::optional<std::int64_t> revokeThrough = std::nullopt) {
-    const auto& principal = *chudware::sim::current_cell_principal();
-    std::vector<std::string> ids;
-    {
-        std::lock_guard<std::mutex> lk(nativeRunOwnersMutex);
-        if (revokeThrough) {
-            auto& actors = nativeRevokeThrough[principal.workspaceKey];
-            auto [it, inserted] = actors.emplace(principal.actorKey, *revokeThrough);
-            if (!inserted) it->second = std::max(it->second, *revokeThrough);
-        }
-        for (const auto& [id, owner] : nativeRunOwners)
-            if (owner.active && owner.workspace == principal.workspaceKey &&
-                owner.actor == principal.actorKey &&
-                (!revokeThrough || owner.epoch <= *revokeThrough)) ids.push_back(id);
-    }
-    int count = 0;
-    for (const auto& id : ids)
-        if (chudware::agent::cancel_run(id).value("cancelled", false)) ++count;
-    return json{{"ok", true}, {"cancelled", count != 0}, {"count", count}};
-}
-
 
 // --- sampling-profiler scoping ------------------------------------------------------
 // The profiler samples only the thread that is registered as the "work thread" (see
@@ -295,13 +196,13 @@ bool prof_is_modeling_method(const std::string& m) {
     // INTERACTIVE read paths (open a doc, resolve a viewport pick, expand a face into its edges,
     // push-pull-probe a face) also do real kernel work — they were the slow paths reported when
     // clicking a surface / opening a big assembly — so sample them too by default.
-    static const std::array<const char*, 23> kModeling = {{
+    static const std::array<const char*, 24> kModeling = {{
         "doc_compile_cpp", "doc_apply_ops", "doc_dry_run_ops", "doc_rebuild", "doc_activate",
         "doc_solve_mates", "doc_tree", "doc_new", "doc_checkpoint", "doc_undo",
         "doc_redo", "doc_render_png", "doc_render_view", "doc_render_contact_sheet",
         "doc_render_diff", "doc_view_metrics",
         "doc_export", "doc_import", "asm_world_bodies",
-        "doc_open", "doc_resolve_pick", "doc_face_edges", "doc_push_pull"}};
+        "doc_open", "doc_reload", "doc_resolve_pick", "doc_face_edges", "doc_push_pull"}};
     for (const char* k : kModeling)
         if (m == k) return true;
     return false;
@@ -445,6 +346,8 @@ int handle_compile(const json& params, char** out_json) {
             {"ok", s.ok},
             {"error", s.error},
             {"warning", s.warning},
+            {"data", s.data},
+            {"rolled_back", s.rolled_back},
         });
     }
 
@@ -531,22 +434,6 @@ static nlohmann::json apply_model_overrides(nlohmann::json desc, const nlohmann:
     return desc;
 }
 
-// Native top-level execution must derive safety from the actual provider identity and endpoint,
-// never from a caller-supplied offline_safe=true assertion. Experimental review calls obey the
-// same rule so a local command model cannot smuggle a cloud review stage into the fallback.
-bool native_provider_offline_safe(const json& provider) {
-    if (!provider.is_object()) return false;
-    json probe = provider;
-    probe.erase("offline_safe");
-    if (!chudware::agent::provider_offline_safe(probe)) return false;
-    auto review = provider.find("review_provider");
-    if (review == provider.end() || review->is_null()) return true;
-    if (!review->is_object()) return false;
-    json review_probe = *review;
-    review_probe.erase("offline_safe");
-    return chudware::agent::provider_offline_safe(review_probe);
-}
-
 // P54b host-ergonomics: resolve the assist provider from the ambient config.json when
 // the caller did not pass one (the host sends bare {question|params, doc_id}). Returns
 // the descriptor to feed make_assist_provider. On a config-provider refusal/resolution
@@ -569,10 +456,9 @@ nlohmann::json resolve_assist_provider(const nlohmann::json& params) {
     return apply_model_overrides(std::move(desc), params);
 }
 
-// Wind-tunnel CFD on a live doc. Extracted from the agent_simulate_v1 handler so the
-// mission orchestrator (run_mission, a simulate_flow task) can call the SAME flow-sim
-// path the host's CFD quick-path uses. No LLM (the flow condition is regex-parsed from
-// `request`), so it works fully offline. `doc_id` may be a part OR an assembly doc —
+// Wind-tunnel CFD on a live doc (the agent_simulate_v1 handler body). No LLM (the flow
+// condition is regex-parsed from `request`), so it works fully offline. `doc_id` may be a
+// part OR an assembly doc —
 // doc_tessellate_bodies resolves world-placed component geometry for assemblies.
 // Returns {ok, answer, drag_n, lift_n, cd, frontal_area_mm2, reynolds, velocity_ms,
 // aoa_deg} on success, or {ok:false, answer} when there is no geometry / the sim fails.
@@ -621,8 +507,8 @@ nlohmann::json run_flow_sim(const std::string& doc_id, const std::string& reques
     // owns; the core can't run it. So on an explicit solver:"openfoam" (the host chat sets it
     // when the user asks for an "accurate"/OpenFOAM run AND the worker reports OpenFOAM
     // available), we export a watertight STL and return a hand-off the host fulfills via
-    // sim_run_flow(solver:openfoam). Missions pass empty params, so they always take the LBM
-    // path below (the core mission can't reach the worker). Falls back to LBM on export failure.
+    // sim_run_flow(solver:openfoam). Without that param the LBM path below always runs.
+    // Falls back to LBM on export failure.
     if (params.value("solver", std::string()) == "openfoam") {
         try {
             std::filesystem::path p = std::filesystem::temp_directory_path() /
@@ -677,49 +563,23 @@ CHUDWARE_API const char* chudware_abi_version(void) { return "1"; }
 CHUDWARE_API const char* chudware_build_id(void) { return CHUDWARE_HOSTD_BUILD_ID; }
 
 CHUDWARE_API void chudware_free(char* s) { std::free(s); }
+// Optional host hook, scoped to a single call on this thread.
+CHUDWARE_API void chudware_set_request_cancel(int (*check)(void*), void* user) {
+    chudware::doc::request_cancel = {check, user, false};
+}
 
 
-// Live event streaming: one thread-local C hook for agent events and simulation phases.
-// Armed on the dispatch/solver thread before chudware_call; cleared immediately after.
+
+// Live event streaming: one thread-local C hook for simulation phases (sim.progress).
+// Armed on the solver thread before chudware_call; cleared immediately after.
 CHUDWARE_API void chudware_set_event_sink(void (*cb)(const char* event_json, void* ud), void* ud) {
     try {
         chudware::sim::set_progress_sink(cb, ud);
-        if (cb) {
-            chudware::agent::set_stream_event_sink([cb, ud](const nlohmann::json& ev) {
-                const std::string s = ev.dump();
-                cb(s.c_str(), ud);
-            });
-        } else {
-            chudware::agent::set_stream_event_sink({});
-        }
     } catch (...) {
         // A void C setter cannot report allocation failures across the ABI.
     }
 }
 
-// Direct document calls inside run.cpp do not re-enter hostd's outer RPC dispatcher. Bridge them
-// to a second thread-local callback so the daemon can feed each completed call through the same
-// DocRegistry::postCall path as a socket-level doc_new/doc_apply_ops. Publication happens only
-// after the document operation returns, so no per-document engine mutex is held here.
-CHUDWARE_API void chudware_set_doc_publish_sink(
-    void (*cb)(const char* method, const char* params_json, const char* result_json, void* ud),
-    void* ud) {
-    try {
-        if (cb) {
-            chudware::agent::set_doc_publish_sink(
-                [cb, ud](const std::string& method, const nlohmann::json& params,
-                         const nlohmann::json& result) {
-                    const std::string p = params.dump();
-                    const std::string r = result.dump();
-                    cb(method.c_str(), p.c_str(), r.c_str(), ud);
-                });
-        } else {
-            chudware::agent::set_doc_publish_sink({});
-        }
-    } catch (...) {
-        // A void C setter cannot report allocation failures across the ABI.
-    }
-}
 
 CHUDWARE_API void chudware_set_cache_refresh_sink(
     void (*cb)(const char* doc_id, const char* response_json, void* ud), void* ud) {
@@ -744,6 +604,15 @@ CHUDWARE_API int chudware_activity(uint64_t counts[3]) {
         counts[1] = chudware::prof::active() ? 1 : 0;
         return complete ? 0 : 1;
     } catch (...) { return 1; }
+}
+
+CHUDWARE_API int chudware_drain_background_tasks(void) {
+    try {
+        chudware::doc::drain_background_tasks();
+        return 0;
+    } catch (...) {
+        return 1;
+    }
 }
 
 // ---- CAM program recipe (deterministic, request-aware, no LLM) ------------------
@@ -1074,9 +943,41 @@ static json cam_extract_from_doc(const std::string& part_doc_id, const json& par
 // up in chudware_call.
 // Factored body of the parts_make dispatch — shared by the `parts_make` branch and
 // the PlaceSeams::parts_make injection (core/parts/place). rc mirrors the old emit codes.
+// Mechanical part pose: extrinsic X, then Y, then Z rotations in degrees,
+// followed by a translation in millimetres. Mirrors sequential transform features.
+static std::array<double, 3> part_pose_vector(const json& params, const char* key) {
+    std::array<double, 3> out{0, 0, 0};
+    if (!params.contains(key)) return out;
+    const json& v = params[key];
+    if (!v.is_array() || v.size() != 3)
+        throw std::invalid_argument(std::string(key) + " must be an array of three finite numbers");
+    for (std::size_t i = 0; i < 3; ++i) {
+        if (!v[i].is_number() || !std::isfinite(v[i].get<double>()))
+            throw std::invalid_argument(std::string(key) + " must be an array of three finite numbers");
+        out[i] = v[i].get<double>();
+    }
+    return out;
+}
+
+static std::array<double, 3> part_rotate(std::array<double, 3> v,
+                                        const std::array<double, 3>& angles) {
+    constexpr double rad = 3.14159265358979323846 / 180.0;
+    for (int i = 0; i < 3; ++i) {
+        const double c = std::cos(angles[i] * rad), s = std::sin(angles[i] * rad);
+        const int a = (i + 1) % 3, b = (i + 2) % 3;
+        const double x = v[a], y = v[b];
+        v[a] = c * x - s * y;
+        v[b] = s * x + c * y;
+    }
+    return v;
+}
+
 static json parts_make_impl(const json& params, int& rc) {
     rc = 0;
+    std::string created_doc;
     try {
+        const auto pos = part_pose_vector(params, "pos");
+        const auto rotation = part_pose_vector(params, "rotation");
         const std::string family = params.value("family", std::string());
         const std::string size = params.value("size", std::string());
         double length = 0.0;
@@ -1089,11 +990,45 @@ static json parts_make_impl(const json& params, int& rc) {
         const std::string nm = params.value("name", pb.name);
         json nresp = chudware::doc::doc_new("part", nm);
         const std::string doc_id = nresp.value("doc_id", std::string());
+        created_doc = doc_id;
         if (doc_id.empty()) {
             rc = 1;
             return json{{"ok", false}, {"error", "parts_make: doc_new failed"}};
         }
         json aresp = chudware::doc::doc_apply_ops(doc_id, 0, pb.ops, false);
+        if (aresp.contains("rejected_tree"))
+            throw std::runtime_error("parts_make: generated feature rebuild failed");
+        const json local_bbox = chudware::doc::doc_bbox(doc_id);
+        const auto& local_min = local_bbox.at("min");
+        const auto& local_max = local_bbox.at("max");
+        std::array<double, 3> base = {
+            (local_min[0].get<double>() + local_max[0].get<double>()) / 2.0,
+            (local_min[1].get<double>() + local_max[1].get<double>()) / 2.0,
+            local_min[2].get<double>()};
+        json transforms = json::array();
+        for (int i = 0; i < 3; ++i) {
+            if (rotation[i] == 0.0) continue;
+            std::array<double, 3> axis{0, 0, 0};
+            axis[i] = 1;
+            transforms.push_back({{"op", "add_feature"},
+                {"feature", {{"type", "transform"}, {"name", std::string("Part orientation ") + "XYZ"[i]},
+                             {"params", {{"rotate", {{"axis", axis}, {"angle", rotation[i]}}}}}}}});
+        }
+        if (pos[0] != 0.0 || pos[1] != 0.0 || pos[2] != 0.0)
+            transforms.push_back({{"op", "add_feature"},
+                {"feature", {{"type", "transform"}, {"name", "Part position"},
+                             {"params", {{"translate", pos}}}}}});
+        if (!transforms.empty())
+            aresp = chudware::doc::doc_apply_ops(doc_id, aresp.value("revision", 0L),
+                                                  transforms, false);
+        if (aresp.contains("rejected_tree"))
+            throw std::runtime_error("parts_make: placement transform rebuild failed");
+        // Keep catalog identity and dimensions with the editable source document so
+        // assembly checks can recover them after save/reopen, without guessing from names.
+        chudware::doc::doc_set_meta(doc_id, "standard_part", pb.meta);
+        base = part_rotate(base, rotation);
+        for (int i = 0; i < 3; ++i) base[i] += pos[i];
+        const auto axis = part_rotate({0, 0, 1}, rotation);
         json out;
         out["ok"] = true;
         out["doc_id"] = doc_id;
@@ -1103,18 +1038,21 @@ static json parts_make_impl(const json& params, int& rc) {
         try {
             json bb = chudware::doc::doc_bbox(doc_id);
             out["bbox"] = bb;
-            const auto& mn = bb["min"]; const auto& mx = bb["max"];
-            out["datum"] = {
-                {"base_center", {(mn[0].get<double>() + mx[0].get<double>()) / 2.0,
-                                 (mn[1].get<double>() + mx[1].get<double>()) / 2.0,
-                                 mn[2].get<double>()}},
-                {"axis", {0, 0, 1}},
-                {"note", "base seats at z=0, axis +Z; translate base_center to the seat point"}};
-            // Unlike coaxial hardware, a servo's output axis is offset toward
-            // one end of its case. Keep the existing seating datum intact.
+            out["datum"] = {{"base_center", base}, {"axis", axis},
+                            {"note", "Local seating datum transformed by the part pose"}};
             if (pb.meta.contains("output_axis")) {
-                out["datum"]["output_axis"] = pb.meta["output_axis"];
-                out["output_axis"] = pb.meta["output_axis"];
+                json output_axis = pb.meta["output_axis"];
+                if (output_axis.contains("origin") && output_axis["origin"].is_array() &&
+                    output_axis["origin"].size() == 3) {
+                    auto origin = part_rotate(output_axis["origin"].get<std::array<double, 3>>(), rotation);
+                    for (int i = 0; i < 3; ++i) origin[i] += pos[i];
+                    output_axis["origin"] = origin;
+                }
+                if (output_axis.contains("axis") && output_axis["axis"].is_array() &&
+                    output_axis["axis"].size() == 3)
+                    output_axis["axis"] = part_rotate(output_axis["axis"].get<std::array<double, 3>>(), rotation);
+                out["datum"]["output_axis"] = output_axis;
+                out["output_axis"] = output_axis;
             }
         } catch (...) {
         }
@@ -1130,6 +1068,7 @@ static json parts_make_impl(const json& params, int& rc) {
         }
         return out;
     } catch (const std::exception& e) {
+        if (!created_doc.empty()) chudware::doc::doc_close(created_doc);
         rc = 1;
         return json{{"ok", false}, {"error", e.what()}};
     }
@@ -1141,14 +1080,95 @@ static json parts_make_impl(const json& params, int& rc) {
 // parts+doc, and HTTP via the agent transport (8s cap; providers fail closed
 // without credentials). The LLM dims lane stays empty (spec_sheet_match degrades
 // per contract).
+static std::filesystem::path reserve_spec_model_path() {
+    namespace fs = std::filesystem;
+    const std::string root = chudware::doc::native_policy::setting(false);
+    const fs::path directory = root.empty() ? fs::temp_directory_path()
+                                            : fs::weakly_canonical(fs::u8path(root));
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        std::uint64_t nonce;
+        randombytes(reinterpret_cast<unsigned char*>(&nonce), sizeof(nonce));
+        const fs::path path = directory /
+            ("chudware-spec-model-" + std::to_string(nonce) + ".step");
+#ifdef _WIN32
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                                  FILE_ATTRIBUTE_TEMPORARY, nullptr);
+        if (file != INVALID_HANDLE_VALUE) {
+            CloseHandle(file);
+            return path;
+        }
+#else
+        const int fd = ::open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
+        if (fd >= 0) {
+            ::close(fd);
+            return path;
+        }
+#endif
+    }
+    throw std::runtime_error("cannot reserve generated model output");
+}
+
 static chudware::sourcing::Seams build_sourcing_seams() {
     using chudware::sourcing::HttpResult;
     using chudware::sourcing::Seams;
     Seams s;
     s.load_assembly = [](const std::string& doc_path) -> json {
-        json opened = chudware::doc::doc_open(doc_path);
-        if (!opened.is_object() || !opened.contains("doc_id")) return json();
-        return chudware::doc::doc_tree(opened["doc_id"].get<std::string>());
+        namespace fs = std::filesystem;
+        const std::string existing = chudware::doc::doc_find_open_by_path(doc_path);
+        json tree;
+        std::string opened_id;
+        if (!existing.empty()) {
+            tree = chudware::doc::doc_tree(existing);
+        } else {
+            json opened = chudware::doc::doc_open(doc_path);
+            if (!opened.is_object() || !opened.contains("doc_id")) return json();
+            opened_id = opened["doc_id"].get<std::string>();
+            try {
+                tree = chudware::doc::doc_tree(opened_id);
+                chudware::doc::doc_close(opened_id);
+            } catch (...) {
+                chudware::doc::doc_close(opened_id);
+                throw;
+            }
+        }
+        if (!tree.contains("tree") || !tree["tree"].is_object()) return tree;
+        auto& node = tree["tree"];
+        if (!node.contains("components") || !node["components"].is_array()) return tree;
+        const std::string base = tree.value("component_source_base", json()).is_string()
+                                     ? tree["component_source_base"].get<std::string>()
+                                     : fs::absolute(fs::u8path(doc_path)).parent_path().string();
+        for (auto& component : node["components"]) {
+            if (!component.is_object()) continue;
+            component.erase("catalog_metadata");
+            if (!component.contains("source") || !component["source"].is_object()) continue;
+            const json path_value = component["source"].value("path", json());
+            if (!path_value.is_string() || path_value.get_ref<const std::string&>().empty()) continue;
+            const std::string path = path_value.get<std::string>();
+            const fs::path source_path = fs::u8path(path);
+            std::string ext = source_path.extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (ext != ".step+" && ext != ".stepplus") continue;
+            try {
+                const std::string resolved = chudware::doc::native_policy::rooted()
+                    ? chudware::doc::native_policy::resolve_reference(path, base)
+                    : (source_path.is_absolute() ? source_path : fs::u8path(base) / source_path)
+                          .lexically_normal().string();
+                json metadata;
+                const std::string live = chudware::doc::doc_find_open_by_path(resolved);
+                if (!live.empty()) {
+                    metadata = chudware::doc::doc_get_meta(live, "parts_catalog").value("value", json());
+                } else {
+                    const json source = chudware::doc::stepplus_read_document(resolved);
+                    const json meta = source.value("meta", json());
+                    if (meta.is_object()) metadata = meta.value("parts_catalog", json());
+                }
+                if (metadata.is_object()) component["catalog_metadata"] = std::move(metadata);
+            } catch (const std::exception&) {
+                // An unreadable source cannot supply catalog identity.
+            }
+        }
+        return tree;
     };
     s.load_board = [](const std::string& path) -> json {
         try {
@@ -1180,12 +1200,21 @@ static chudware::sourcing::Seams build_sourcing_seams() {
             auto pb = chudware::parts::build(family, size, length_mm, json::object());
             json created = chudware::doc::doc_new("part", pb.name);
             const std::string doc_id = created["doc_id"].get<std::string>();
+            struct CloseDoc {
+                std::string id;
+                ~CloseDoc() { try { chudware::doc::doc_close(id); } catch (...) {} }
+            } close{doc_id};
             chudware::doc::doc_apply_ops(doc_id, created.value("revision", 0L), pb.ops, false);
-            namespace fs = std::filesystem;
-            const fs::path dir = fs::temp_directory_path() / "chudware_spec_models";
-            fs::create_directories(dir);
-            json saved = chudware::doc::doc_export_step(doc_id, (dir / (family + "_" + size + ".step")).string());
-            return saved.value("path", std::string());
+            const auto output = reserve_spec_model_path();
+            try {
+                json saved = chudware::doc::doc_export_step(
+                    doc_id, chudware::doc::native_policy::path_utf8(output));
+                return saved.value("path", std::string());
+            } catch (...) {
+                std::error_code ec;
+                std::filesystem::remove(output, ec);
+                throw;
+            }
         } catch (...) {
             return std::string();
         }
@@ -1236,20 +1265,13 @@ static int chudware_call_inner(const char* method, const char* params_json, char
         return emit_error(std::string("invalid params JSON: ") + e.what(), out_json);
     }
 
-    // Host-version-robust aliases: accept the host's in-app agent RPC names (agent_run_v2
-    // / agent_ask_v2 / get_prompts_v2 / agent_pm_assist_v1) directly. The host normally
-    // pre-translates these in worker_client, but a stale host binary (or any direct
-    // caller) would otherwise hit "unknown method: agent_run_v2". We mirror that
-    // translation here so the core is self-sufficient. Param shapes already match the
-    // target handlers (request/doc_id, question/doc_id) except pm_assist, which wraps.
-    if (m == "agent_run_v2") {
-        m = "agent_run";
-    } else if (m == "agent_ask_v2") {
+    // Host-version-robust aliases: accept the host's in-app assist RPC names (agent_ask_v2 /
+    // agent_pm_assist_v1) directly. The host normally pre-translates these in worker_client,
+    // but a stale host binary (or any direct caller) would otherwise hit "unknown method".
+    // We mirror that translation here so the core is self-sufficient. The ask params already
+    // match the target handler (question/doc_id); pm_assist wraps.
+    if (m == "agent_ask_v2") {
         m = "agent_answer_question";
-    } else if (m == "agent_clarify_v1") {
-        m = "agent_clarify";
-    } else if (m == "get_prompts_v2") {
-        m = "agent_get_prompts_v2";
     } else if (m == "agent_pm_assist_v1") {
         if (params.is_object() && !params.contains("params")) {
             json wrapped = json::object();
@@ -1295,20 +1317,10 @@ static int chudware_call_inner(const char* method, const char* params_json, char
         chudware::sim::CellRequestScope cellScope(cellPrincipal ? &*cellPrincipal :
             chudware::sim::current_cell_principal());
         std::optional<std::int64_t> revokeThrough;
-        if (chudware::sim::current_cell_principal() &&
-            (m == "agent_cancel" || m == "sim_cancel") &&
+        if (chudware::sim::current_cell_principal() && m == "sim_cancel" &&
             params.contains("_cell_revoke_through"))
             revokeThrough = params["_cell_revoke_through"].get<std::int64_t>();
         params.erase("_cell_revoke_through");
-        NativeRunOwnerScope nativeRunScope(m, params);
-        if (m == "agent_run_event" || m == "agent_run_events_batch" ||
-            m == "agent_run_events_read" || m == "agent_steer" ||
-            (m == "agent_cancel" && !jstr(params, "run_id").empty())) {
-            const std::string id = jstr(params, "run_id");
-            if (!safeRunComponent(id) || !nativeRunOwned(id, m == "agent_cancel"))
-                return emit(json{{"code", "not_found"}, {"message", "run not found"}},
-                            out_json, 1);
-        }
         if (m == "ping") {
             return emit(json{{"ok", true},
                              {"abi", chudware_abi_version()},
@@ -1408,156 +1420,6 @@ static int chudware_call_inner(const char* method, const char* params_json, char
         }
         if (m == "doc_compile_cpp") {
             return handle_compile(params, out_json);
-        }
-        // --- P51: agent/LLM provider layer diagnostics (no live network) -------
-        // These let the Python parity gate inspect request construction + response
-        // parsing of the C++ provider port WITHOUT a live POST.
-        if (m == "agent_build_request") {
-            // {provider, model?, system?, messages, max_tokens?, base_url?} ->
-            // {url, headers, body}. Pure (no network). headers as an object.
-            std::string provider = params.value("provider", std::string());
-            std::string system = params.value("system", std::string());
-            int max_tokens = params.value("max_tokens", 8000);
-            json messages = params.contains("messages") ? params["messages"] : json::array();
-            chudware::agent::BuiltRequest req;
-            if (provider == "anthropic") {
-                std::string model = params.value("model",
-                                                 std::string(chudware::agent::kAnthropicDefaultModel));
-                std::string effort = params.value("reasoning_effort", std::string());
-                req = chudware::agent::anthropic_build_request(model, system, messages, max_tokens,
-                                                           effort);
-            } else if (provider == "openai" || provider == "llamacpp") {
-                std::string def = provider == "llamacpp" ? std::string("local-gguf")
-                                                         : std::string(chudware::agent::kOpenAIDefaultModel);
-                std::string model = params.value("model", def);
-                std::string base_url = params.value("base_url", std::string());
-                req = chudware::agent::openai_build_request(model, system, messages, max_tokens,
-                                                         base_url);
-            } else if (provider == "gemini") {
-                std::string model = params.value("model",
-                                                 std::string(chudware::agent::kGeminiDefaultModel));
-                std::string effort = params.value("reasoning_effort", std::string());
-                req = chudware::agent::gemini_build_request(model, system, messages, max_tokens, effort);
-            } else {
-                return emit_error("agent_build_request: unknown provider: " + provider, out_json);
-            }
-            json headers = json::object();
-            for (const auto& h : req.headers) headers[h.first] = h.second;
-            return emit(json{{"url", req.url}, {"headers", headers}, {"body", req.body_json}},
-                        out_json, 0);
-        }
-        if (m == "agent_parse_response") {
-            // {provider, response} -> {text, thinking?}.
-            std::string provider = params.value("provider", std::string());
-            json resp = params.contains("response") ? params["response"] : json::object();
-            if (provider == "anthropic") {
-                chudware::agent::ParsedReply pr = chudware::agent::anthropic_parse_response(resp);
-                return emit(json{{"text", pr.text}, {"thinking", pr.thinking}}, out_json, 0);
-            }
-            if (provider == "openai" || provider == "llamacpp") {
-                chudware::agent::ParsedReply pr = chudware::agent::openai_parse_response(resp);
-                return emit(json{{"text", pr.text}}, out_json, 0);
-            }
-            if (provider == "gemini") {
-                chudware::agent::ParsedReply pr = chudware::agent::gemini_parse_response(resp);
-                return emit(json{{"text", pr.text}, {"thinking", pr.thinking}}, out_json, 0);
-            }
-            return emit_error("agent_parse_response: unknown provider: " + provider, out_json);
-        }
-        if (m == "agent_b64_file") {
-            // {path} -> {b64}. base64.standard_b64encode of the file bytes.
-            std::string path = params.value("path", std::string());
-            std::string b64 = chudware::agent::base64_encode(chudware::agent::read_file_bytes(path));
-            return emit(json{{"b64", b64}}, out_json, 0);
-        }
-        if (m == "agent_normalize_base_url") {
-            // {base_url} -> {base_url} (the normalized form). Pure helper probe.
-            std::string base_url = params.value("base_url", std::string());
-            return emit(json{{"base_url", chudware::agent::openai_normalize_base_url(base_url)}},
-                        out_json, 0);
-        }
-        if (m == "agent_complete") {
-            // {provider, cfg?, system?, messages?, max_tokens?} -> {text, thinking, error, usage}.
-            // For provider:"mock" this is fully offline (scripted replies in cfg.replies).
-            // For anthropic/openai/llamacpp it performs a LIVE http_post (the gate only
-            // drives this when an API key is present).
-            std::string provider = params.value("provider", std::string());
-            json cfg = params.contains("cfg") ? params["cfg"] : json::object();
-            std::string system = params.value("system", std::string());
-            json messages = params.contains("messages") ? params["messages"] : json::array();
-            int max_tokens = params.value("max_tokens", 8000);
-            chudware::agent::CompleteResult cr =
-                chudware::agent::complete(provider, cfg, system, messages, max_tokens);
-            return emit(json{{"text", cr.text},
-                             {"thinking", cr.thinking},
-                             {"error", cr.error},
-                             {"http_status", cr.http_status},
-                             {"latency_ms", cr.latency_ms},
-                             {"attempt", cr.attempt},
-                             {"endpoint", cr.endpoint},
-                             {"model", cr.model},
-                             {"request_id", cr.request_id},
-                             {"error_excerpt", cr.error_excerpt},
-                             {"usage", cr.usage}},
-                        out_json, 0);
-        }
-        if (m == "agent_role_of") {
-            // {system} -> {role}. RoleScriptedProvider role sniffer probe.
-            std::string system = params.value("system", std::string());
-            return emit(json{{"role", chudware::agent::RoleScriptedProvider::role_of(system)}},
-                        out_json, 0);
-        }
-        // --- P52: agent SUPPORT layer diagnostics (paths/config/ops/events/roles) ---
-        // All PURE string/file-IO ports, gated byte-for-byte vs the Python oracle.
-        if (m == "agent_extract_ops") {
-            // {reply} -> {ops|null, error|null}.
-            std::string reply = params.value("reply", std::string());
-            chudware::agent::OpsResult r = chudware::agent::extract_ops(reply);
-            return emit(json{{"ops", r.ops ? *r.ops : json(nullptr)},
-                             {"error", r.error ? json(*r.error) : json(nullptr)}},
-                        out_json, 0);
-        }
-        if (m == "agent_extract_revert") {
-            std::string reply = params.value("reply", std::string());
-            return emit(json{{"revert", chudware::agent::extract_revert(reply)}}, out_json, 0);
-        }
-        if (m == "agent_extract_script") {
-            std::string reply = params.value("reply", std::string());
-            auto s = chudware::agent::extract_script(reply);
-            return emit(json{{"script", s ? json(*s) : json(nullptr)}}, out_json, 0);
-        }
-        if (m == "agent_first_balanced") {
-            // {text, open, close} -> {span|null}.
-            std::string text = params.value("text", std::string());
-            std::string open = params.value("open", std::string("["));
-            std::string close = params.value("close", std::string("]"));
-            auto s = chudware::agent::first_balanced(text, open.empty() ? '[' : open[0],
-                                                  close.empty() ? ']' : close[0]);
-            return emit(json{{"span", s ? json(*s) : json(nullptr)}}, out_json, 0);
-        }
-        if (m == "agent_script_escape_op") {
-            std::string code = params.value("code", std::string());
-            std::string name = params.value("name", std::string("Script"));
-            return emit(chudware::agent::script_escape_op(code, name), out_json, 0);
-        }
-        if (m == "agent_offline_safe") {
-            json provider = params.contains("provider") ? params["provider"] : json::object();
-            return emit(json{{"safe", chudware::agent::provider_offline_safe(provider)}},
-                        out_json, 0);
-        }
-        if (m == "agent_host_is_loopback") {
-            std::string base_url = params.value("base_url", std::string());
-            return emit(json{{"loopback", chudware::agent::host_is_loopback(base_url)}},
-                        out_json, 0);
-        }
-        if (m == "agent_resolve_provider") {
-            // {name?, cfg, env:{...}} -> resolved descriptor or {error}.
-            std::optional<std::string> name;
-            if (params.contains("name") && params["name"].is_string())
-                name = params["name"].get<std::string>();
-            json cfg = params.contains("cfg") ? params["cfg"] : json::object();
-            json env = params.contains("env") ? params["env"] : json::object();
-            return emit(chudware::agent::resolve_provider(name, cfg, env), out_json, 0);
         }
         if (m == "agent_list_models") {
             // {provider, base_url?, api_key?} -> {ok, models:[id...], model_rows?[{id,...}], error?}.
@@ -1814,7 +1676,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             if (provider == "anthropic") {
                 // Pure native probe: use Anthropic's published list endpoint when the caller
                 // supplied a raw API key. Without one, retain a static picker fallback but mark
-                // the provider unavailable; subscription/OAuth discovery belongs to Chudcode.
+                // the provider unavailable; subscription/OAuth discovery belongs to OMP.
                 auto str_of = [](const json& o, const char* k) -> std::string {
                     if (!o.is_object()) return {};
                     auto it = o.find(k);
@@ -1848,11 +1710,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                     static const std::pair<const char*, const char*> kStatic[] = {
                         {"claude-opus-5-5", "Claude Opus 5.5"},
                         {"claude-sonnet-5-5", "Claude Sonnet 5.5"},
-                        {"claude-opus-5", "Claude Opus 5"},
-                        {"claude-sonnet-5", "Claude Sonnet 5"},
-                        {"claude-fable-5", "Claude Fable 5"},
-                        {"claude-mythos-5", "Claude Mythos 5"},
-                        {"claude-haiku-4-5", "Claude Haiku 4.5"}};
+                        {"claude-haiku-5-5", "Claude Haiku 5.5"}};
                     for (const auto& sm : kStatic) {
                         json meta = heuristic_meta(sm.first);
                         meta["label"] = sm.second;
@@ -1873,739 +1731,8 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                              {"error", "unknown provider"}},
                         out_json, 0);
         }
-        if (m == "agent_cap_raw") {
-            std::string text = params.value("text", std::string());
-            return emit(json{{"capped", chudware::agent::cap_raw(text)}}, out_json, 0);
-        }
-        if (m == "agent_run_event") {
-            // {run_id, kind, data} -> the emitted event (also persisted to jsonl).
-            std::string run_id = params.value("run_id", std::string());
-            std::string kind = params.value("kind", std::string());
-            json data = params.contains("data") ? params["data"] : json::object();
-            chudware::agent::RunEvents ev(run_id);
-            // NOTE: a fresh RunEvents truncates events.jsonl on construct. The gate
-            // drives a multi-event run via agent_run_events_batch (below) instead.
-            return emit(ev.emit(kind, data), out_json, 0);
-        }
-        if (m == "agent_run_events_batch") {
-            // {run_id, events:[{kind, data}]} -> [emitted events]. One RunEvents
-            // (one truncate), then emit each — the realistic multi-event sequence.
-            std::string run_id = params.value("run_id", std::string());
-            chudware::agent::RunEvents ev(run_id);
-            json out = json::array();
-            if (params.contains("events") && params["events"].is_array())
-                for (const auto& e : params["events"]) {
-                    std::string kind = e.value("kind", std::string());
-                    json data = e.contains("data") ? e["data"] : json::object();
-                    out.push_back(ev.emit(kind, data));
-                }
-            return emit(std::move(out), out_json, 0);
-        }
-        if (m == "agent_run_events_read") {
-            // {run_id} -> [parsed events] read back from events.jsonl.
-            std::string run_id = params.value("run_id", std::string());
-            std::filesystem::path p =
-                chudware::agent::paths_cache() / "runs" / run_id / "events.jsonl";
-            json out = json::array();
-            std::ifstream fh(p, std::ios::binary);
-            std::string line;
-            while (std::getline(fh, line)) {
-                if (!line.empty() && line.back() == '\r') line.pop_back();
-                if (line.empty()) continue;
-                out.push_back(json::parse(line));
-            }
-            return emit(std::move(out), out_json, 0);
-        }
-        if (m == "agent_load_prompt") {
-            std::string role = params.value("role", std::string());
-            std::string pd = params.value("prompts_dir", std::string());
-            auto pr = chudware::agent::load_prompt(role, pd);
-            return emit(json{{"text", pr.first}, {"source", pr.second}}, out_json, 0);
-        }
-        if (m == "agent_prompt_hash") {
-            std::string text = params.value("text", std::string());
-            return emit(json{{"hash", chudware::agent::prompt_hash(text)}}, out_json, 0);
-        }
-        if (m == "agent_get_prompts_v2") {
-            std::string pd = params.value("prompts_dir", std::string());
-            return emit(chudware::agent::get_prompts_v2(pd), out_json, 0);
-        }
-        if (m == "agent_load_cheatsheet") {
-            std::string ft = params.value("feature_type", std::string());
-            std::string pd = params.value("prompts_dir", std::string());
-            return emit(json{{"text", chudware::agent::load_cheatsheet(ft, pd)}}, out_json, 0);
-        }
-        // --- P53a: orchestrator state machine + state/context (agent/orchestrator) ---
-        if (m == "agent_est_tokens") {
-            std::string text = params.value("text", std::string());
-            return emit(json{{"n", chudware::agent::est_tokens(text)}}, out_json, 0);
-        }
-        if (m == "agent_err_sig") {
-            std::string err = params.value("err", std::string());
-            return emit(json{{"sig", chudware::agent::err_sig(err)}}, out_json, 0);
-        }
-        if (m == "agent_digest_tree") {
-            // Re-parse from the RAW request text as ordered_json so object key
-            // iteration preserves insertion order (matching Python dict order).
-            using ojson = nlohmann::ordered_json;
-            ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
-            ojson tree = op.contains("tree") ? op["tree"] : ojson::object();
-            return emit(json{{"digest", chudware::agent::digest_tree(tree)}}, out_json, 0);
-        }
-        if (m == "agent_digest_params") {
-            using ojson = nlohmann::ordered_json;
-            ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
-            ojson p = op.contains("params") ? op["params"] : ojson::object();
-            return emit(json{{"s", chudware::agent::digest_params(p)}}, out_json, 0);
-        }
-        if (m == "agent_looks_like_edit") {
-            std::string req = params.value("request", std::string());
-            return emit(json{{"edit", chudware::agent::looks_like_edit(req)}}, out_json, 0);
-        }
-        if (m == "agent_feature_status_errors") {
-            using ojson = nlohmann::ordered_json;
-            ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
-            ojson fs = op.contains("feature_status") ? op["feature_status"] : ojson::array();
-            return emit(json{{"errors", chudware::agent::feature_status_errors(fs)}}, out_json, 0);
-        }
-        if (m == "agent_build_context") {
-            // {state:{...}, role, prompts_dir?} -> {system, body, context_chars,
-            // context_tokens_est}. Re-parse as ordered_json for spec/plan/memory.
-            using ojson = nlohmann::ordered_json;
-            ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
-            ojson st = op.contains("state") ? op["state"] : ojson::object();
-            std::string role = op.value("role", std::string());
-            std::string pd = op.value("prompts_dir", std::string());
-            chudware::agent::DesignState ds;
-            ds.request = st.value("request", std::string());
-            ds.doc_id = st.value("doc_id", std::string());
-            ds.revision = st.value("revision", 0);
-            ds.spec = st.contains("spec") ? st["spec"] : ojson(nullptr);
-            ds.plan = st.contains("plan") ? st["plan"] : ojson(nullptr);
-            ds.tree_digest = st.value("tree_digest", std::string());
-            if (st.contains("last_errors") && st["last_errors"].is_array())
-                for (const auto& e : st["last_errors"]) ds.last_errors.push_back(e.get<std::string>());
-            if (st.contains("last_issues") && st["last_issues"].is_array())
-                for (const auto& e : st["last_issues"]) ds.last_issues.push_back(e.get<std::string>());
-            ds.memory = (st.contains("memory") && st["memory"].is_object()) ? st["memory"]
-                                                                            : ojson::object();
-            ds.current_step = st.value("current_step", std::string());
-            chudware::agent::BuiltContext bc = chudware::agent::build_context(ds, role, pd);
-            return emit(json{{"system", bc.system},
-                             {"body", bc.body},
-                             {"context_chars", bc.context_chars},
-                             {"context_tokens_est", bc.context_tokens_est}},
-                        out_json, 0);
-        }
-        if (m == "agent_run_machine") {
-            // SCRIPTED machine drive: {script:{intake:[...],...}, plan_steps:[...],
-            // budgets?:{}, cancel_after?:int} -> {status, stop_reason, events:[...]}.
-            json script = params.contains("script") ? params["script"] : json::object();
-            json plan_steps_j = params.contains("plan_steps") ? params["plan_steps"] : json::array();
-            json budgets = params.contains("budgets") ? params["budgets"] : json::object();
-            bool has_cancel = params.contains("cancel_after") &&
-                              params["cancel_after"].is_number_integer();
-            int cancel_after = has_cancel ? params["cancel_after"].get<int>() : -1;
-
-            // Per-stage queues of scripted outcomes (popped in call order).
-            auto build_queue = [&](const char* stage) {
-                std::vector<chudware::agent::StageOutcome> q;
-                if (script.contains(stage) && script[stage].is_array())
-                    for (const auto& o : script[stage]) {
-                        chudware::agent::StageOutcome so;
-                        so.verdict = o.value("verdict", std::string("pass"));
-                        so.reason = o.value("reason", std::string());
-                        if (o.contains("error") && !o["error"].is_null()) {
-                            so.has_error = true;
-                            so.error = o["error"].get<std::string>();
-                        }
-                        so.done = o.value("done", false);
-                        so.raw = o.value("raw", std::string());
-                        so.parsed_ok = o.value("parsed_ok", true);
-                        if (o.contains("parse_error") && !o["parse_error"].is_null()) {
-                            so.has_parse_error = true;
-                            so.parse_error = o["parse_error"].get<std::string>();
-                        }
-                        if (o.contains("ops_count") && !o["ops_count"].is_null()) {
-                            so.has_ops_count = true;
-                            so.ops_count = o["ops_count"].get<int>();
-                        }
-                        so.duration_ms = o.value("duration_ms", 0);
-                        so.no_progress = o.value("no_progress", false);
-                        q.push_back(so);
-                    }
-                return q;
-            };
-
-            auto intake_q = std::make_shared<std::vector<chudware::agent::StageOutcome>>(
-                build_queue("intake"));
-            auto plan_q =
-                std::make_shared<std::vector<chudware::agent::StageOutcome>>(build_queue("plan"));
-            auto model_q =
-                std::make_shared<std::vector<chudware::agent::StageOutcome>>(build_queue("model"));
-            auto review_q =
-                std::make_shared<std::vector<chudware::agent::StageOutcome>>(build_queue("review"));
-            auto fix_q =
-                std::make_shared<std::vector<chudware::agent::StageOutcome>>(build_queue("fix"));
-            auto memory_q =
-                std::make_shared<std::vector<chudware::agent::StageOutcome>>(build_queue("memory"));
-
-            // Invocation counter for cancel_after (counts action calls = agent calls).
-            auto invoked = std::make_shared<int>(0);
-
-            auto make_action = [&](std::shared_ptr<std::vector<chudware::agent::StageOutcome>> q) {
-                auto cursor = std::make_shared<size_t>(0);
-                return [q, cursor, invoked](chudware::agent::DesignState& s,
-                                            int) -> chudware::agent::StageOutcome {
-                    (*invoked)++;
-                    chudware::agent::StageOutcome o;
-                    if (*cursor < q->size()) {
-                        o = (*q)[*cursor];
-                        (*cursor)++;
-                    } else if (!q->empty()) {
-                        o = q->back();  // repeat last (defensive; scripts should supply enough)
-                    } else {
-                        o.verdict = "pass";
-                    }
-                    s.last_no_progress = o.no_progress;
-                    return o;
-                };
-            };
-
-            chudware::agent::StageActions actions;
-            actions.intake = make_action(intake_q);
-            actions.plan = make_action(plan_q);
-            actions.model = make_action(model_q);
-            actions.review = make_action(review_q);
-            actions.fix = make_action(fix_q);
-            actions.memory = make_action(memory_q);
-            std::vector<std::string> steps;
-            if (plan_steps_j.is_array())
-                for (const auto& s : plan_steps_j) steps.push_back(s.get<std::string>());
-            actions.plan_steps = [steps](chudware::agent::DesignState&) { return steps; };
-
-            chudware::agent::RunControl control;
-            if (has_cancel) {
-                control.cancelled = [invoked, cancel_after] {
-                    return *invoked >= cancel_after;
-                };
-            }
-
-            // RunEvents to a temp run dir AND capture every emitted event.
-            std::string run_id = "gate-" + std::to_string(std::time(nullptr)) + "-" +
-                                 std::to_string(reinterpret_cast<uintptr_t>(&actions));
-            // Capture wrapper: subclass-free — we read back the jsonl after the run,
-            // but to capture WITHOUT volatile run_id we just collect emitted events.
-            chudware::agent::RunEvents events(run_id);
-            // Drive the machine, then read the persisted events back (the source of
-            // truth; identical to what emit() returned).
-            chudware::agent::DesignState ds;
-            ds.request = params.value("request", std::string("test request"));
-            json result = chudware::agent::run_machine(ds, actions, events, budgets, control);
-
-            // Read back captured events from the jsonl.
-            json captured = json::array();
-            {
-                std::filesystem::path p = events.dir() / "events.jsonl";
-                std::ifstream fh(p, std::ios::binary);
-                std::string line;
-                while (std::getline(fh, line)) {
-                    if (!line.empty() && line.back() == '\r') line.pop_back();
-                    if (line.empty()) continue;
-                    captured.push_back(json::parse(line));
-                }
-            }
-            result["events"] = captured;
-            return emit(std::move(result), out_json, 0);
-        }
-        if (m == "agent_cancel") {
-            // Best-effort stop at the next stage boundary / in-flight HTTP xfer.
-            // {run_id} -> {ok, cancelled:bool}. Empty/missing run_id cancels ALL live
-            // runs so Stop still works when run_started has not landed yet.
-            const std::string run_id = jstr(params, "run_id");
-            if (run_id.empty() && chudware::sim::current_cell_principal())
-                return emit(cancelOwnNativeRuns(revokeThrough), out_json, 0);
-            if (run_id.empty())
-                return emit(chudware::agent::cancel_all_runs(), out_json, 0);
-            return emit(chudware::agent::cancel_run(run_id), out_json, 0);
-        }
-        if (m == "agent_steer") {
-            // Mid-run steering: {run_id, text} -> {ok, steered:bool}. The run folds queued
-            // steering into the request at its next stage/attempt boundary (cooperative —
-            // never interrupts an in-flight provider call). Unknown/finished => steered:false.
-            const std::string run_id = jstr(params, "run_id");
-            const std::string text = jstr(params, "text");
-            return emit(chudware::agent::steer_run(run_id, text), out_json, 0);
-        }
-        if (m == "agent_run") {
-            // Native fallback entry: {request, doc_id, options?, provider?}. It is intentionally
-            // limited to deterministic offline-safe providers. Online execution belongs to
-            // agent_admin_turn/Chudcode; this path retains local modeling and no-network
-            // drawing/CAM fast paths.
-            std::string request = jstr(params, "request");
-            std::string doc_id = jstr(params, "doc_id");
-            json options = params.contains("options") ? params["options"] : json::object();
-            // Copilot mode overhaul: host stamps options.{mode, plan_only, approved_plan,
-            // execute_as, corporate_force, scope, advisor}. Normalize defaults here so
-            // run_design / run_assembly_design / run_micro_design always see a consistent
-            // shape. Absent mode = legacy byte-identical behavior.
-            if (!options.is_object()) options = json::object();
-            // Composer attachments (pasted images / attached files) ride the payload
-            // TOP-LEVEL — services/worker/worker_client.cpp forwards them alongside
-            // provider/model/reasoning_effort, not inside `options`. run_design only ever
-            // receives `options`, so without this relay the array is dropped right here and
-            // a pasted screenshot never reaches the vision model. An attachments key already
-            // inside `options` wins (an explicit nesting by a newer host is not overwritten).
-            if (!options.contains("attachments") && params.contains("attachments") &&
-                params["attachments"].is_array() && !params["attachments"].empty())
-                options["attachments"] = params["attachments"];
-            if (!options.contains("advisor")) options["advisor"] = true;  // default ON
-            // Normalize explicit modes once, before either deterministic mutating shortcut.
-            // Keep absent mode absent for the legacy modeling path.
-            std::string mode;
-            if (options.contains("mode")) {
-                const auto modes = chudware::agent::CopilotModes::load();
-                if (!modes)
-                    return emit(json{{"ok", false}, {"status", "failed"},
-                                     {"stop_reason", "mode_policy_unavailable"},
-                                     {"error", "Copilot mode policy is unavailable."}}, out_json, 0);
-                mode = chudware::agent::copilot_normalize_mode(*modes, jstr(options, "mode"));
-                options["mode"] = mode;
-            }
-            const bool approved_plan_attached =
-                options.contains("approved_plan") && !options["approved_plan"].is_null() &&
-                !(options["approved_plan"].is_string() &&
-                  options["approved_plan"].get_ref<const std::string&>().empty());
-            // Plan implies plan_only unless an explicit approved plan resumes execution.
-            if (mode == "plan" && !options.value("plan_only", false) &&
-                !approved_plan_attached) {
-                options["plan_only"] = true;
-            }
-            // swarm mode implies corporate_force for the Python mission path.
-            if (mode == "swarm" &&
-                !options.value("corporate_force", false))
-                options["corporate_force"] = true;
-            const bool read_only = mode == "ask" || mode == "plan" ||
-                                   options.value("plan_only", false);
-
-            // Resolve and reject before any fast path so an online provider can never be
-            // accepted by native agent_run, even when the request itself is deterministic.
-            json provider;
-            const bool explicit_provider = params.contains("provider") &&
-                                           params["provider"].is_object() &&
-                                           !params["provider"].empty();
-            json cfg = chudware::agent::load_config();
-            json native_cfg = cfg;
-            native_cfg["offline_mode"] = true;
-            if (explicit_provider) {
-                provider = params["provider"];
-            } else {
-                std::optional<std::string> pname;
-                if (params.contains("provider") && params["provider"].is_string() &&
-                    !params["provider"].get<std::string>().empty())
-                    pname = params["provider"].get<std::string>();
-                json resolved = apply_model_overrides(
-                    chudware::agent::resolve_provider(pname, native_cfg, json::object()), params);
-                if (resolved.is_object() && resolved.contains("error")) {
-                    const std::string detail =
-                        jstr(resolved, "error", "provider resolution failed");
-                    const std::string error =
-                        "Native agent_run could not resolve an offline-safe local provider: " +
-                        detail + ". Use agent_admin_turn (agent service) for online providers.";
-                    return emit(json{{"ok", false},
-                                     {"status", "failed"},
-                                     {"stop_reason", "provider_error"},
-                                     {"error_detail", error},
-                                     {"error", error}},
-                                out_json, 0);
-                }
-                provider =
-                    chudware::agent::apply_experimental(resolved, native_cfg, json::object());
-            }
-            if (!native_provider_offline_safe(provider)) {
-                const std::string error =
-                    "Native agent_run supports only deterministic offline-safe local providers; "
-                    "use agent_admin_turn (agent service) for online providers.";
-                return emit(json{{"ok", false},
-                                 {"status", "failed"},
-                                 {"stop_reason", "provider_error"},
-                                 {"error_detail", error},
-                                 {"error", error}},
-                            out_json, 0);
-            }
-
-            // Ask never enters the modeling drivers, even with a stale approved_plan.
-            // Reuse the native question implementation with a read-only tree snapshot;
-            // assist hydration would rebuild the document to obtain feature statuses.
-            if (mode == "ask") {
-                using ojson = nlohmann::ordered_json;
-                ojson doc = nullptr;
-                long revision = 0;
-                if (!doc_id.empty()) {
-                    const json tree = chudware::doc::doc_tree(doc_id);
-                    doc = tree.at("tree");
-                    revision = tree.value("revision", 0L);
-                }
-                auto complete = chudware::agent::make_assist_provider(provider);
-                const std::string answer = chudware::agent::answer_question(
-                    request, doc, doc_id, revision, ojson::array(),
-                    [&](const std::string& system, const std::string& body) {
-                        std::string error;
-                        return complete(system, body, &error);
-                    });
-                return emit(json{{"status", "done"}, {"stop_reason", "ask"},
-                                 {"run_id", options.value("run_id", std::string("ask"))},
-                                 {"doc_id", doc_id}, {"revision", revision}, {"mode", mode},
-                                 {"answer", answer}, {"engaged", "ask"},
-                                 {"events", json::array()}}, out_json, 0);
-            }
-
-            // ---- W17 drawing-intent fast-path ----
-            // "make a drawing / blueprint of this part" doesn't need the modeler: build the 2D
-            // sheet directly from the current part (deterministic standard views + auto-dims +
-            // hole callouts + title block). No provider call -> works offline + shines on small
-            // local models. Only fires when the active doc already has geometry to project;
-            // otherwise we fall through to normal modeling (e.g. "draw a bracket" on an empty doc).
-            {
-                std::string lc;
-                lc.reserve(request.size());
-                for (char c : request) lc += (char)std::tolower((unsigned char)c);
-                bool wants_drawing = lc.find("blueprint") != std::string::npos ||
-                                     lc.find("drafting") != std::string::npos ||
-                                     lc.find("drawing") != std::string::npos;
-                if (!read_only && !approved_plan_attached && wants_drawing && !doc_id.empty()) {
-                    json t = chudware::doc::doc_tree(doc_id);
-                    bool has_geom = t.is_object() && t.contains("tree") && t["tree"].is_object() &&
-                                    t["tree"].contains("features") && t["tree"]["features"].is_array() &&
-                                    !t["tree"]["features"].empty();
-                    if (has_geom) {
-                        std::string part_name = t["tree"].value("name", std::string());
-                        json spec = {{"views", json::array({"front", "top", "right", "iso"})},
-                                     {"model_items", true}, {"hole_callouts", true}};
-                        if (!part_name.empty()) spec["title"] = json{{"title", part_name}};
-                        json dr;
-                        try {
-                            dr = chudware::doc::drawing_make(doc_id, spec);
-                        } catch (const chudware::doc::OpError& oe) {
-                            return emit(json{{"ok", false}, {"error", oe.what()}}, out_json, 0);
-                        }
-                        json events = json::array();
-                        events.push_back(json{{"kind", "run_started"}, {"request", request},
-                                              {"doc_id", doc_id}});
-                        events.push_back(json{{"kind", "run_finished"}, {"status", "done"},
-                                              {"stop_reason", "drawing"}});
-                        return emit(json{
-                                        {"status", "done"}, {"stop_reason", "drawing"},
-                                        {"run_id", options.value("run_id", std::string("drawing"))},
-                                        {"revision", t.value("revision", 0)}, {"doc_id", doc_id},
-                                        {"created_drawing", true},
-                                        {"drawing_doc_id", dr.value("doc_id", std::string())},
-                                        {"drawing_name", part_name.empty()
-                                                             ? std::string("Drawing")
-                                                             : part_name + " - Drawing"},
-                                        {"source_doc_id", doc_id}, {"events", events},
-                                        {"engaged", "drawing"}},
-                                    out_json, 0);
-                    }
-                }
-            }
-
-            // ---- CAM-intent fast-path ----
-            // "generate toolpaths / post G-code / make a CNC program for this part" builds a
-            // complete machining job from the current part deterministically (no provider) —
-            // the manufacturing analogue of the drawing fast-path. Fires when the request is
-            // clearly CAM-oriented (tight keyword set so it never grabs a modeling request),
-            // or when the host set options.cam from the Manufacture workspace, AND the active
-            // doc already has geometry. Otherwise falls through to normal modeling (so "model a
-            // CNC fixture" on an empty doc still builds a part).
-            {
-                bool wants_cam = options.value("cam", false) ||
-                                 options.value("workspace", std::string()) == "cam";
-                std::string lc;
-                lc.reserve(request.size());
-                for (char c : request) lc += (char)std::tolower((unsigned char)c);
-                auto has = [&](const char* w) { return lc.find(w) != std::string::npos; };
-                const bool cam_words =
-                    has("toolpath") || has("g-code") || has("gcode") || has("g code") ||
-                    has("cnc") || has("post-process") || has("post process") ||
-                    has("nc program") || has("machining program") || has("cam program") ||
-                    has("cam job") || (has("machine") && has("part") && has("this"));
-                // options.cam (Manufacture workspace) lowers the bar — but still requires a
-                // manufacturing NOUN, so a modeling request typed there (e.g. "generate a
-                // fillet") falls through to the modeler instead of being read as a CAM build.
-                const bool cam_noun =
-                    has("program") || has("toolpath") || has("g-code") || has("gcode") ||
-                    has("g code") || has("cnc") || has("post") || has("machining") ||
-                    has("mill") || has("router") || has("lathe") || has("nc ");
-                if (!read_only && !approved_plan_attached &&
-                    (cam_words || (wants_cam && cam_noun)) && !doc_id.empty()) {
-                    json t = chudware::doc::doc_tree(doc_id);
-                    bool has_geom = t.is_object() && t.contains("tree") && t["tree"].is_object() &&
-                                    t["tree"].contains("features") &&
-                                    t["tree"]["features"].is_array() &&
-                                    !t["tree"]["features"].empty();
-                    if (has_geom) {
-                        json copts = options;
-                        copts["request"] = request;
-                        json prog = cam_program_from_part(doc_id, copts);
-                        json events = json::array();
-                        events.push_back(json{{"kind", "run_started"}, {"request", request},
-                                              {"doc_id", doc_id}});
-                        if (prog.value("ok", false)) {
-                            const int opc = prog.value("op_count", 0);
-                            const int lc2 = prog.value("line_count", 0);
-                            const std::string dlt = prog.value("dialect", std::string("grbl"));
-                            const std::string opsCsv = prog.value("ops_summary", std::string());
-                            std::string note =
-                                "Built a CAM job from the part: " + std::to_string(opc) +
-                                " operation(s)" + (opsCsv.empty() ? "" : " (" + opsCsv + ")") +
-                                ", posted " + std::to_string(lc2) + " lines of " + dlt +
-                                " G-code to " + prog.value("gcode_path", std::string()) +
-                                ". Open the Manufacture workspace to refine tools, setups, and operations.";
-                            events.push_back(json{{"kind", "run_note"}, {"text", note}});
-                            events.push_back(json{{"kind", "run_finished"},
-                                                  {"status", "done"}, {"stop_reason", "cam"}});
-                            json res = {{"status", "done"}, {"stop_reason", "cam"},
-                                        {"run_id", options.value("run_id", std::string("cam"))},
-                                        {"doc_id", doc_id}, {"created_cam", true},
-                                        {"cam_doc_id", prog.value("cam_doc_id", std::string())},
-                                        {"op_count", opc}, {"line_count", lc2}, {"dialect", dlt},
-                                        {"gcode", prog.value("gcode", std::string())},
-                                        {"gcode_path", prog.value("gcode_path", std::string())},
-                                        {"summary", note}, {"events", events}, {"engaged", "cam"}};
-                            if (prog.contains("sim")) res["sim"] = prog["sim"];
-                            if (prog.contains("warnings")) res["warnings"] = prog["warnings"];
-                            return emit(std::move(res), out_json, 0);
-                        }
-                        const std::string err = prog.value("error", std::string("CAM build failed"));
-                        events.push_back(json{{"kind", "run_finished"},
-                                              {"status", "error"}, {"stop_reason", "cam"}});
-                        return emit(json{{"status", "error"}, {"stop_reason", "cam"},
-                                         {"error", err}, {"doc_id", doc_id},
-                                         {"events", events}, {"engaged", "cam"}},
-                                    out_json, 0);
-                    }
-                }
-            }
-
-
-            // ---- micro vs design ----
-            // should_engage reads provider.{name,base_url,context_tokens} + cfg
-            // .{micro_mode,context_tokens}. The resolved descriptor carries name/
-            // base_url; cfg is the ambient config.json (so micro_mode is honored).
-            // Read-only plans and explicit approval resumes use run_design, never micro
-            // or deterministic shortcuts, so planning and approved-plan semantics hold.
-            bool force_design_path = read_only || approved_plan_attached;
-            bool micro = !force_design_path && chudware::agent::should_engage(provider, cfg);
-
-            auto captured = std::make_shared<json>(json::array());
-            json result;
-            if (micro) {
-                chudware::agent::EmitFnMicro cb = [captured](const json& ev) {
-                    captured->push_back(ev);
-                };
-                result = chudware::agent::run_micro_design(request, doc_id, provider, cb, options);
-            } else if (force_design_path) {
-                // Skip assembly multi-part driver for plan_only / approved_plan so we get
-                // exactly one plan_ready (or one execute) instead of per-part side effects.
-                chudware::agent::EmitFn cb = [captured](const json& ev) { captured->push_back(ev); };
-                result = chudware::agent::run_design(request, doc_id, provider, cb, options);
-            } else {
-                chudware::agent::EmitFn cb = [captured](const json& ev) { captured->push_back(ev); };
-                // run_assembly_design plans first: a true multi-part assembly builds each part in
-                // its own doc + assembles; a single part delegates to run_design unchanged.
-                result = chudware::agent::run_assembly_design(request, doc_id, provider, cb, options);
-            }
-            result["events"] = *captured;
-            result["engaged"] = micro ? "micro" : "design";  // diagnostic: which profile ran
-            return emit(std::move(result), out_json, 0);
-        }
-        if (m == "agent_mission_v1") {
-            // TOP-LEVEL orchestration: {request, doc_id, options?, provider?} -> decompose the
-            // request into an ordered task list (design/assembly/simulate_flow/report/...), run
-            // them threading the working doc forward, and return a verdict. This is the entry
-            // that lets ONE message express a whole workflow ("model X, then CFD it and prove
-            // it's good") instead of the old one-capability-per-message routing. Provider is
-            // resolved exactly like agent_run; the flow-sim capability is wired to run_flow_sim
-            // (the same path agent_simulate_v1 uses), so design->CFD chains in one run.
-            std::string request = jstr(params, "request");
-            std::string doc_id = jstr(params, "doc_id");
-            json options = params.contains("options") ? params["options"] : json::object();
-
-            json provider;
-            const bool explicit_provider = params.contains("provider") &&
-                                           params["provider"].is_object() &&
-                                           !params["provider"].empty();
-            json cfg = chudware::agent::load_config();
-            json native_cfg = cfg;
-            native_cfg["offline_mode"] = true;
-            if (explicit_provider) {
-                provider = params["provider"];
-            } else {
-                // O1: honor a provider NAME string + model/effort overrides (GUI picker).
-                std::optional<std::string> pname;
-                if (params.contains("provider") && params["provider"].is_string() &&
-                    !params["provider"].get<std::string>().empty())
-                    pname = params["provider"].get<std::string>();
-                json resolved = apply_model_overrides(
-                    chudware::agent::resolve_provider(pname, native_cfg, json::object()), params);
-                if (resolved.is_object() && resolved.contains("error")) {
-                    const std::string detail =
-                        jstr(resolved, "error", "provider resolution failed");
-                    const std::string error =
-                        "Native agent_mission_v1 could not resolve an offline-safe local "
-                        "provider: " + detail +
-                        ". Use agent_admin_turn (agent service) for online providers.";
-                    return emit(json{{"ok", false},
-                                     {"status", "failed"},
-                                     {"stop_reason", "provider_error"},
-                                     {"error_detail", error},
-                                     {"error", error}},
-                                out_json, 0);
-                }
-                provider =
-                    chudware::agent::apply_experimental(resolved, native_cfg, json::object());
-            }
-            if (!native_provider_offline_safe(provider)) {
-                const std::string error =
-                    "Native agent_mission_v1 supports only deterministic offline-safe local "
-                    "providers; use agent_admin_turn (agent service) for online providers.";
-                return emit(json{{"ok", false},
-                                 {"status", "failed"},
-                                 {"stop_reason", "provider_error"},
-                                 {"error_detail", error},
-                                 {"error", error}},
-                            out_json, 0);
-            }
-
-            auto captured = std::make_shared<json>(json::array());
-            chudware::agent::EmitFn cb = [captured](const json& ev) { captured->push_back(ev); };
-            chudware::agent::SimFn sim = [](const std::string& sim_doc, const std::string& sim_req,
-                                         const json& sim_params) -> json {
-                return run_flow_sim(sim_doc, sim_req, sim_params);
-            };
-            json result = chudware::agent::run_mission(request, doc_id, provider, cb, sim, options);
-            result["events"] = *captured;
-            result["engaged"] = "mission";
-            return emit(std::move(result), out_json, 0);
-        }
-        if (m == "agent_run_design") {
-            // LIVE end-to-end run: {request, doc_id, provider:{...}, options?} ->
-            // {run_id, status, stop_reason, revision, doc_id, events:[...]}. The
-            // provider descriptor is the resolved {name,model,api_key,...} OR the
-            // role-scripted mock {name:"mock", replies:{by_role}} for the gate.
-            std::string request = jstr(params, "request");
-            std::string doc_id = jstr(params, "doc_id");
-            json provider = params.contains("provider") ? params["provider"] : json::object();
-            json options = params.contains("options") ? params["options"] : json::object();
-            // Capture every emitted event (like agent_run_machine returns `events`).
-            auto captured = std::make_shared<json>(json::array());
-            chudware::agent::EmitFn cb = [captured](const json& ev) { captured->push_back(ev); };
-            json result = chudware::agent::run_design(request, doc_id, provider, cb, options);
-            result["events"] = *captured;
-            return emit(std::move(result), out_json, 0);
-        }
-        if (m == "agent_run_micro") {
-            // MICRO-ORCHESTRATION run: {request, doc_id, provider:{...}, options?} ->
-            // {run_id, status, stop_reason, revision, doc_id, events:[...]}. Parallels
-            // agent_run_design (P54a).
-            std::string request = jstr(params, "request");
-            std::string doc_id = jstr(params, "doc_id");
-            json provider = params.contains("provider") ? params["provider"] : json::object();
-            json options = params.contains("options") ? params["options"] : json::object();
-            auto captured = std::make_shared<json>(json::array());
-            chudware::agent::EmitFnMicro cb = [captured](const json& ev) {
-                captured->push_back(ev);
-            };
-            json result =
-                chudware::agent::run_micro_design(request, doc_id, provider, cb, options);
-            result["events"] = *captured;
-            return emit(std::move(result), out_json, 0);
-        }
-        if (m == "agent_should_engage") {
-            // Pure: {provider:{name,base_url?,context_tokens?}, cfg:{micro_mode?,
-            // context_tokens?}} -> {engage:bool}.
-            json provider = params.contains("provider") ? params["provider"] : json::object();
-            json cfg = params.contains("cfg") ? params["cfg"] : json::object();
-            return emit(json{{"engage", chudware::agent::should_engage(provider, cfg)}}, out_json, 0);
-        }
-        if (m == "agent_micro_normalize_steps") {
-            // Pure: {raw:[...]} -> {steps:[{type,desc,params}, ...]}.
-            chudware::agent::ojson raw = params.contains("raw")
-                                          ? chudware::agent::ojson::parse(params["raw"].dump())
-                                          : chudware::agent::ojson(nullptr);
-            std::vector<chudware::agent::Step> steps = chudware::agent::normalize_steps(raw);
-            json out = json::array();
-            for (const auto& s : steps)
-                out.push_back(json{{"type", s.type}, {"desc", s.desc},
-                                   {"params", json::parse(s.params.dump())}});
-            return emit(json{{"steps", out}}, out_json, 0);
-        }
-        if (m == "agent_micro_summarize_doc") {
-            // Pure: {tree, volume?} -> {summary}. volume present => "volume=N" head.
-            chudware::agent::ojson tree =
-                params.contains("tree") ? chudware::agent::ojson::parse(params["tree"].dump())
-                                        : chudware::agent::ojson::object();
-            std::optional<double> vol;
-            if (params.contains("volume") && params["volume"].is_number())
-                vol = params["volume"].get<double>();
-            return emit(json{{"summary", chudware::agent::summarize_doc(tree, vol)}}, out_json, 0);
-        }
-        if (m == "agent_micro_verify_step") {
-            // Pure: {step:{type,desc,params}, tree, feature_status, vol_before?, vol_after?}
-            // -> {verified, notes}.
-            chudware::agent::Step step;
-            if (params.contains("step") && params["step"].is_object()) {
-                const json& sp = params["step"];
-                step.type = sp.value("type", std::string());
-                step.desc = sp.value("desc", std::string());
-                if (sp.contains("params") && sp["params"].is_object())
-                    step.params = chudware::agent::ojson::parse(sp["params"].dump());
-            }
-            chudware::agent::ojson tree =
-                params.contains("tree") ? chudware::agent::ojson::parse(params["tree"].dump())
-                                        : chudware::agent::ojson::object();
-            chudware::agent::ojson fs =
-                params.contains("feature_status")
-                    ? chudware::agent::ojson::parse(params["feature_status"].dump())
-                    : chudware::agent::ojson::array();
-            std::optional<double> vb, va;
-            if (params.contains("vol_before") && params["vol_before"].is_number())
-                vb = params["vol_before"].get<double>();
-            if (params.contains("vol_after") && params["vol_after"].is_number())
-                va = params["vol_after"].get<double>();
-            chudware::agent::VerifyResult vr = chudware::agent::verify_step(step, tree, fs, vb, va);
-            return emit(json{{"verified", vr.verified}, {"notes", vr.notes}}, out_json, 0);
-        }
-        // --- P54b: in-app LLM assists (services/agent/ask.py + services/agent/pm_assist.py) ---
-        // All re-parse params_json as ordered_json so doc/form_schema/current
-        // key order survives end-to-end (matching Python dict insertion order).
-        if (m == "agent_build_doc_context") {
-            using ojson = nlohmann::ordered_json;
-            ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
-            ojson doc = op.contains("doc") ? op["doc"] : ojson(nullptr);
-            std::string doc_id = op.value("doc_id", std::string("?"));
-            long rev = op.contains("revision") && op["revision"].is_number()
-                           ? op["revision"].get<long>()
-                           : 0;
-            ojson fs = op.contains("feature_status") ? op["feature_status"] : ojson::array();
-            return emit(json{{"text", chudware::agent::build_doc_context(doc, doc_id, rev, fs)}},
-                        out_json, 0);
-        }
-        if (m == "agent_build_ask_prompt") {
-            using ojson = nlohmann::ordered_json;
-            ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
-            std::string question = op.value("question", std::string());
-            ojson doc = op.contains("doc") ? op["doc"] : ojson(nullptr);
-            std::string doc_id = op.value("doc_id", std::string("?"));
-            long rev = op.contains("revision") && op["revision"].is_number()
-                           ? op["revision"].get<long>()
-                           : 0;
-            ojson fs = op.contains("feature_status") ? op["feature_status"] : ojson::array();
-            chudware::agent::AskPrompt ap =
-                chudware::agent::build_ask_prompt(question, doc, doc_id, rev, fs);
-            return emit(json{{"system", ap.system}, {"body", ap.body}}, out_json, 0);
-        }
+        // In-app LLM assists (agent/ask.cpp + agent/pm_assist.cpp). They re-parse params_json
+        // as ordered_json so doc/form_schema/current key order survives end-to-end.
         if (m == "agent_answer_question") {
             using ojson = nlohmann::ordered_json;
             ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
@@ -2635,88 +1762,6 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                     return provider(sys, body, &err);  // ask path ignores err
                 });
             return emit(json{{"answer", answer}}, out_json, 0);
-        }
-        if (m == "agent_clarify") {
-            // Pre-flight clarify gate: one provider call returns the build-critical
-            // questions (or ready=true) for the host's Design/Edit submit path. Mirrors
-            // agent_answer_question's provider/context resolution exactly.
-            using ojson = nlohmann::ordered_json;
-            ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
-            // Accept both {request} (Design submit) and {question} (defensive alias).
-            std::string request = jstr(op, "request");
-            if (request.empty()) request = jstr(op, "question");
-            std::string doc_id = jstr(op, "doc_id", "?");
-            // Hydrate doc/revision/feature_status from the live C++ session when present
-            // (Edit mode); for Design-new no doc exists yet and `doc` stays null.
-            hydrate_assist_from_session(op, doc_id);
-            ojson doc = op.contains("doc") ? op["doc"] : ojson(nullptr);
-            long rev = op.contains("revision") && op["revision"].is_number()
-                           ? op["revision"].get<long>()
-                           : 0;
-            ojson fs = op.contains("feature_status") ? op["feature_status"] : ojson::array();
-            // Provider: explicit descriptor (gate mock) OR resolved from config.json. On an
-            // offline/unavailable refusal, return ready=true so the build proceeds (the host
-            // also treats any clarify failure as "skip clarify").
-            json prov = resolve_assist_provider(params);
-            if (prov.is_object() && prov.contains("error")) {
-                return emit(json{{"ready", true},
-                                 {"questions", json::array()},
-                                 {"assumptions", json::array()}},
-                            out_json, 0);
-            }
-            auto provider = chudware::agent::make_assist_provider(prov);
-            chudware::agent::ojson result = chudware::agent::clarify(
-                request, doc, doc_id, rev, fs,
-                [&](const std::string& sys, const std::string& body) {
-                    std::string err;
-                    return provider(sys, body, &err);  // clarify treats an error as empty reply
-                });
-            return emit(json::parse(result.dump()), out_json, 0);
-        }
-        if (m == "agent_pm_extract_json") {
-            std::string reply = params.value("reply", std::string());
-            chudware::agent::ojson plan = chudware::agent::pm_extract_json(reply);
-            return emit(json{{"plan", json::parse(plan.dump())}}, out_json, 0);
-        }
-        if (m == "agent_pm_coerce") {
-            using ojson = nlohmann::ordered_json;
-            ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
-            ojson field = op.contains("field") ? op["field"] : ojson::object();
-            ojson value = op.contains("value") ? op["value"] : ojson(nullptr);
-            ojson v = chudware::agent::pm_coerce_patch_value(field, value);
-            return emit(json{{"value", json::parse(v.dump())}}, out_json, 0);
-        }
-        if (m == "agent_pm_validate_plan") {
-            using ojson = nlohmann::ordered_json;
-            ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
-            ojson plan = op.contains("plan") ? op["plan"] : ojson::object();
-            ojson fs = op.contains("form_schema") ? op["form_schema"] : ojson::object();
-            ojson cur = op.contains("current") ? op["current"] : ojson::object();
-            ojson v = chudware::agent::pm_validate_plan(plan, fs, cur);
-            return emit(json{{"validated", json::parse(v.dump())}}, out_json, 0);
-        }
-        if (m == "agent_pm_heuristic_plan") {
-            using ojson = nlohmann::ordered_json;
-            ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
-            ojson fs = op.contains("form_schema") ? op["form_schema"] : ojson::object();
-            ojson cur = op.contains("current") ? op["current"] : ojson::object();
-            std::string intent = op.value("intent", std::string());
-            ojson v = chudware::agent::pm_heuristic_plan(fs, cur, intent);
-            return emit(json{{"plan", json::parse(v.dump())}}, out_json, 0);
-        }
-        if (m == "agent_pm_build_prompt") {
-            using ojson = nlohmann::ordered_json;
-            ojson op = ojson::parse(params_json && params_json[0] ? params_json : "{}");
-            ojson prm = op.contains("params") ? op["params"] : ojson::object();
-            ojson doc = op.contains("doc") ? op["doc"] : ojson(nullptr);
-            std::string doc_id = op.value("doc_id", std::string("?"));
-            long rev = op.contains("revision") && op["revision"].is_number()
-                           ? op["revision"].get<long>()
-                           : 0;
-            ojson fs = op.contains("feature_status") ? op["feature_status"] : ojson::array();
-            chudware::agent::PmAssistPrompt pp =
-                chudware::agent::build_pm_assist_prompt(prm, doc, doc_id, rev, fs);
-            return emit(json{{"system", pp.system}, {"body", pp.body}}, out_json, 0);
         }
         if (m == "agent_pm_assist") {
             using ojson = nlohmann::ordered_json;
@@ -3246,21 +2291,29 @@ static int chudware_call_inner(const char* method, const char* params_json, char
         // return carrying the {code,message,detail} envelope (so the host can treat
         // it as a structured error / fall back to Python).
         try {
+            if (m == "scad_status")
+                return emit(chudware::doc::scad::capability(), out_json, 0);
+            if (m == "scad_inspect")
+                return emit(chudware::doc::scad::inspect(
+                                params.value("params", json::object())), out_json, 0);
             if (m == "doc_new")
                 return emit(chudware::doc::doc_new(params.value("kind", std::string("part")),
                                                 params.value("name", std::string()),
                                                 params.value("resume_if_open", false),
                                                 params.value("project_dir", std::string())),
                             out_json, 0);
-            if (m == "doc_apply_ops")
+            if (m == "doc_apply_ops") {
+                const std::string origin = params.value("_mutation_origin", std::string("agent"));
                 return emit(chudware::doc::doc_apply_ops(
                                 params.value("doc_id", std::string()),
                                 params.contains("base_revision") && params["base_revision"].is_number()
                                     ? params["base_revision"].get<long>() : -1,
                                 params.contains("ops") ? params["ops"] : json::array(),
                                 params.value("coalesce", false),
-                                params.value("with_tess", true)),
+                                params.value("with_tess", true),
+                                origin == "agent" || origin == "mcp"),
                             out_json, 0);
+            }
             if (m == "doc_dry_run_ops")
                 return emit(chudware::doc::doc_dry_run_ops(
                                 params.value("doc_id", std::string()),
@@ -3276,6 +2329,21 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                             out_json, 0);
             if (m == "doc_tree")
                 return emit(chudware::doc::doc_tree(params.value("doc_id", std::string())), out_json, 0);
+            if (m == "doc_mesh_ref_add")
+                return emit(chudware::doc::doc_mesh_ref_add(
+                                params.value("doc_id", std::string()), params), out_json, 0);
+            if (m == "doc_mesh_ref_list")
+                return emit(chudware::doc::doc_mesh_ref_list(
+                                params.value("doc_id", std::string())), out_json, 0);
+            if (m == "doc_mesh_ref_update")
+                return emit(chudware::doc::doc_mesh_ref_update(
+                                params.value("doc_id", std::string()), params), out_json, 0);
+            if (m == "doc_mesh_ref_remove")
+                return emit(chudware::doc::doc_mesh_ref_remove(
+                                params.value("doc_id", std::string()), params), out_json, 0);
+            if (m == "doc_mesh_ref_mesh")
+                return emit(chudware::doc::doc_mesh_ref_mesh(
+                                params.value("doc_id", std::string()), params), out_json, 0);
             if (m == "doc_rebuild")
                 return emit(chudware::doc::doc_rebuild(params.value("doc_id", std::string())), out_json, 0);
             if (m == "doc_activate")
@@ -3283,7 +2351,9 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             if (m == "doc_solve_mates")
                 return emit(chudware::doc::doc_solve_mates(
                                 params.value("doc_id", std::string()),
-                                params.contains("drag") ? params["drag"] : json(nullptr)),
+                                params.contains("drag") ? params["drag"] : json(nullptr),
+                                params.contains("expect_revision") && params["expect_revision"].is_number_integer()
+                                    ? params["expect_revision"].get<long>() : -1),
                             out_json, 0);
             if (m == "doc_set_explode_state")
                 return emit(chudware::doc::doc_set_explode_state(
@@ -3297,11 +2367,33 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                 params.value("doc_id", std::string()),
                                 params.value("quality", std::string("fine"))),
                             out_json, 0);
+            if (m == "asm_source_status")
+                return emit(chudware::doc::doc_asm_source_status(
+                                params.value("doc_id", std::string())), out_json, 0);
             if (m == "asm_world_bodies")
                 return emit(chudware::doc::doc_asm_world_bodies(
                                 params.value("doc_id", std::string()),
-                                params.value("explode", false)),
+                                params.value("explode", false),
+                                params.value("include_mate_axes", false)),
                             out_json, 0);
+            if (m == "asm_bom_components") {
+                const int cursor = params.value("cursor", 0);
+                const int limit = params.value("limit", 100);
+                if (cursor < 0 || limit < 1 || limit > 500)
+                    throw chudware::doc::OpError(
+                        "invalid_op", "cursor must be nonnegative and limit must be between 1 and 500");
+                const json rows = chudware::doc::doc_asm_bom_components(
+                    params.value("doc_id", std::string()));
+                json page = json::array();
+                const int size = static_cast<int>(rows.size());
+                for (int i = cursor; i < size && i - cursor < limit; ++i)
+                    page.push_back(rows[i]);
+                const int next = cursor >= size ? size : cursor + std::min(limit, size - cursor);
+                return emit(json{{"ok", true}, {"components", std::move(page)},
+                                 {"truncated", next < size},
+                                 {"next_cursor", next < size ? json(next) : json(nullptr)}},
+                            out_json, 0);
+            }
             if (m == "doc_close")
                 return emit(json{{"closed", chudware::doc::doc_close(params.value("doc_id", std::string()))}},
                             out_json, 0);
@@ -3315,9 +2407,15 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 for (const auto& k : chudware::doc::doc_op_kinds()) ops.push_back(k);
                 json ftypes = json::array();
                 for (const auto& t : chudware::doc::feature_type_names()) ftypes.push_back(t);
+                // Per-type param vocabulary the op path enforces (validate.cpp
+                // FEATURE_PARAM_KEYS). A feature type absent here takes open params.
+                json fparams = json::object();
+                for (const auto& [type, keys] : chudware::doc::feature_param_keys())
+                    fparams[type] = keys;
                 return emit(json{
                     {"ok", true},                    {"ops", ops},
                     {"feature_types", ftypes},
+                    {"params", fparams},
                     {"example_add_feature", json{
                         {"op", "add_feature"},
                         {"feature", {
@@ -3406,12 +2504,25 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             if (m == "doc_save")
                 return emit(chudware::doc::doc_save(params.value("doc_id", std::string()),
                                                  params.value("path", std::string()),
-                                                 params.value("preserve_path", false)),
+                                                 params.value("preserve_path", false),
+                                                 params.value("force", false),
+                                                 params.value("overwrite_changed", false),
+                                                 params.value("expected_disk_stamp", json(nullptr))),
                             out_json, 0);
             if (m == "doc_open")
                 return emit(chudware::doc::doc_open(params.value("path", std::string()),
                                                  params.value("as_solid", false),
-                                                 params.value("detach_path", false)),
+                                                 params.value("detach_path", false),
+                                                 params.value("recovered", false),
+                                                 params.value("reuse_open", false),
+                                                 params.value("recovery_original_path", std::string()),
+                                                 params.value("recovery_base_stamp", json(nullptr))),
+                            out_json, 0);
+            if (m == "doc_reload")
+                return emit(chudware::doc::doc_reload(
+                                params.value("doc_id", std::string()),
+                                params.value("expected_revision", -1L),
+                                params.value("expected_metadata_revision", -1L)),
                             out_json, 0);
             if (m == "doc_resolve_pick")
                 return emit(chudware::doc::doc_resolve_pick(
@@ -3433,7 +2544,9 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                 params.value("topo_id", 0),
                                 params.contains("distance") && params["distance"].is_number()
                                     ? params["distance"].get<double>() : 0.0,
-                                params.value("commit", false)),
+                                params.value("commit", false),
+                                params.contains("expect_revision") && params["expect_revision"].is_number_integer()
+                                    ? params["expect_revision"].get<long>() : -1),
                             out_json, 0);
             if (m == "doc_export_step")
                 return emit(chudware::doc::doc_export_step(
@@ -3613,8 +2726,8 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 return emit(std::move(r), out_json, 0);
             }
             if (m == "sim_cancel") {
-                // Cancel a registered sim job (core/sim/sim_cancel.cpp — same
-                // registry semantics as agent cancel: idempotent, miss = cancelled:false).
+                // Cancel a registered sim job (core/sim/sim_cancel.cpp — idempotent,
+                // miss = cancelled:false).
                 json result = chudware::sim::sim_cancel(params.value("job_id", std::string()),
                                                       revokeThrough);
                 const int rc = result.value("ok", true) ? 0 : 1;
@@ -3623,8 +2736,7 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             if (m == "agent_simulate_v1") {
                 // "AI runs CFD": {doc_id, request} (+ optional explicit velocity/aoa/fluid) ->
                 // parse a flow condition from natural language, run the wind tunnel, return forces
-                // + a human summary. No LLM needed (regex parse), so it works fully offline. The
-                // body lives in run_flow_sim so the mission orchestrator shares the exact path.
+                // + a human summary. No LLM needed (regex parse), so it works fully offline.
                 return emit(run_flow_sim(params.value("doc_id", std::string()),
                                          params.value("request", std::string()), params),
                             out_json, 0);
@@ -3648,7 +2760,9 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 return emit(chudware::doc::doc_set_meta(
                                 params.value("doc_id", std::string()),
                                 params.value("key", std::string()),
-                                params.contains("value") ? params["value"] : json(nullptr)),
+                                params.contains("value") ? params["value"] : json(nullptr),
+                                params.value("member", std::string()),
+                                params.contains("preserve") ? params["preserve"] : json(nullptr)),
                             out_json, 0);
             if (m == "doc_get_meta")
                 return emit(chudware::doc::doc_get_meta(
@@ -3670,7 +2784,8 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             if (m == "sketch_solve")
                 return emit(chudware::doc::doc_sketch_solve(
                                 params.value("doc_id", std::string()),
-                                params.value("sketch", std::string())),
+                                params.value("sketch", std::string()),
+                                params.value("session_id", std::uint64_t{0})),
                             out_json, 0);
             if (m == "doc_sketch_overview")
                 return emit(chudware::doc::doc_sketch_overview(
@@ -3688,17 +2803,25 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                 params.value("sketch", std::string()),
                                 params.value("handle", std::string()),
                                 params.contains("xy") ? params["xy"] : json(nullptr),
-                                params.contains("targets") ? params["targets"] : json(nullptr)),
+                                params.contains("targets") ? params["targets"] : json(nullptr),
+                                params.value("session_id", std::uint64_t{0})),
                             out_json, 0);
             if (m == "sketch_drag_commit")
                 return emit(chudware::doc::doc_sketch_drag_commit(
                                 params.value("doc_id", std::string()),
-                                params.value("sketch", std::string())),
+                                params.value("sketch", std::string()),
+                                params.contains("expect_revision") && params["expect_revision"].is_number_integer()
+                                    ? params["expect_revision"].get<long>() : -1,
+                                params.value("session_id", std::uint64_t{0})),
                             out_json, 0);
             if (m == "sketch_exit")
                 return emit(chudware::doc::doc_sketch_exit(
                                 params.value("doc_id", std::string()),
-                                params.value("sketch", std::string())),
+                                params.value("sketch", std::string()),
+                                params.contains("expect_revision") && params["expect_revision"].is_number_integer()
+                                    ? params["expect_revision"].get<long>() : -1,
+                                params.value("session_id", std::uint64_t{0}),
+                                params.value("discard_active", false)),
                             out_json, 0);
             if (m == "sketch_probe")
                 return emit(chudware::doc::doc_sketch_probe(
@@ -3793,6 +2916,13 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 return emit(chudware::doc::doc_eval_geometry_analysis(
                                 params.value("doc_id", std::string()), params),
                             out_json, 0);
+            if (m == "eval_sheet_metal_bends")
+                return emit(chudware::doc::doc_eval_sheet_metal_bends(
+                                params.value("doc_id", std::string())), out_json, 0);
+            if (m == "eval_edge_analysis")
+                return emit(chudware::doc::doc_eval_edge_analysis(
+                                params.value("doc_id", std::string()), params),
+                            out_json, 0);
             if (m == "eval_solid_health")
                 return emit(chudware::doc::doc_eval_solid_health(
                                 params.value("doc_id", std::string()),
@@ -3817,12 +2947,28 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                     ? params["body"].get<int>() : 0,
                                 params.contains("plane") ? params["plane"] : json(nullptr)),
                             out_json, 0);
+            if (m == "eval_assembly_dof")
+                return emit(chudware::doc::doc_eval_assembly_dof(
+                                params.value("doc_id", std::string()), params),
+                            out_json, 0);
             if (m == "eval_interference")
                 return emit(chudware::doc::doc_eval_interference(
                                 params.value("doc_id", std::string()), params),
                             out_json, 0);
+            if (m == "eval_removal_clearance")
+                return emit(chudware::doc::doc_eval_removal_clearance(
+                                params.value("doc_id", std::string()), params),
+                            out_json, 0);
+            if (m == "eval_envelope_clearance")
+                return emit(chudware::doc::doc_eval_envelope_clearance(
+                                params.value("doc_id", std::string()), params),
+                            out_json, 0);
             if (m == "eval_feature_overlap")
                 return emit(chudware::doc::doc_eval_feature_overlap(
+                                params.value("doc_id", std::string()), params),
+                            out_json, 0);
+            if (m == "eval_model_history")
+                return emit(chudware::doc::doc_eval_model_history(
                                 params.value("doc_id", std::string()), params),
                             out_json, 0);
             if (m == "eval_feature_attachment")
@@ -3862,12 +3008,35 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                     ? params["body"].get<int>() : 0,
                                 params.value("kind", std::string("mean"))),
                             out_json, 0);
-            if (m == "eval_thickness")
+            if (m == "eval_thickness") {
+                const auto mm = [&](const char* key) {
+                    const auto it = params.find(key);
+                    return it != params.end() && it->is_number() ? it->get<double>() : 0.0;
+                };
                 return emit(chudware::doc::doc_eval_thickness(
                                 params.value("doc_id", std::string()),
                                 params.contains("body") && params["body"].is_number()
-                                    ? params["body"].get<int>() : 0),
+                                    ? params["body"].get<int>() : 0,
+                                mm("resolution"), mm("min_wall_mm")),
                             out_json, 0);
+            }
+            if (m == "eval_local_thickness")
+                return emit(chudware::doc::doc_eval_local_thickness(
+                                params.value("doc_id", std::string()), params), out_json, 0);
+            if (m == "harness_route" || m == "harness_path_check") {
+                const std::string id = params.value("doc_id", std::string());
+                if (id.empty())
+                    return emit(json{{"ok", false}, {"code", "bad_args"},
+                                     {"error", "doc_id must identify an open document"}},
+                                out_json, 0);
+                const auto scene = chudware::doc::doc_harness_scene(id);
+                return emit(m == "harness_route"
+                                ? chudware::harness::harness_route(params, scene)
+                                : chudware::harness::harness_path_check(params, scene),
+                            out_json, 0);
+            }
+            if (m == "mesh_wall_thickness")
+                return emit(chudware::doc::doc_mesh_wall_thickness(params), out_json, 0);
             if (m == "export_file")
                 return emit(chudware::doc::doc_export_file(
                                 params.value("doc_id", std::string()),
@@ -4059,7 +3228,8 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                 params.value("doc_id", std::string()),
                                 params.value("view_id", std::string()),
                                 params.value("type", std::string("linear_dim")),
-                                opt("a"), opt("b"), opt("c"), opt("d"), opt("pos"), opt("text")),
+                                opt("a"), opt("b"), opt("c"), opt("d"), opt("pos"), opt("text"),
+                                opt("source_refs")),
                             out_json, 0);
             if (m == "drawing_add_chamfer_dimension" ||
                 m == "drawing_add_ordinate_dimensions") {
@@ -4067,7 +3237,8 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                 ? params["spec"] : json::object();
                 for (const char* key : {"a", "pos", "length", "distance", "angle",
                                         "angle_deg", "count", "text", "precision",
-                                        "prefix", "suffix", "origin", "axis", "points"})
+                                        "prefix", "suffix", "origin", "axis", "points",
+                                        "feature_ref", "edge_sid"})
                     if (params.contains(key)) spec[key] = params[key];
                 const std::string did = params.value("doc_id", std::string());
                 const std::string vid = params.value("view_id", std::string());
@@ -4254,7 +3425,12 @@ static int chudware_call_inner(const char* method, const char* params_json, char
         try {
             if (m == "ecad_new")
                 return emit(chudware::ecad::ecad_new(params.value("kind", std::string("sch")),
-                                                  params.value("name", std::string())),
+                                                  params.value("name", std::string()),
+                                                  params.value("path", std::string())),
+                            out_json, 0);
+            if (m == "ecad_new_project")
+                return emit(chudware::ecad::ecad_new_project(params.value("dir", std::string()),
+                                                          params.value("name", std::string())),
                             out_json, 0);
             if (m == "ecad_apply_ops")
                 return emit(chudware::ecad::ecad_apply_ops(
@@ -4276,6 +3452,10 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 return emit(chudware::ecad::ecad_redo(params.value("doc_id", std::string())), out_json, 0);
             if (m == "ecad_tree")
                 return emit(chudware::ecad::ecad_tree(params.value("doc_id", std::string())), out_json, 0);
+            if (m == "ecad_reload")
+                return emit(chudware::ecad::ecad_reload(params.value("doc_id", std::string()),
+                                                     params.value("discard", false)),
+                            out_json, 0);
             if (m == "ecad_rebuild")
                 return emit(chudware::ecad::ecad_rebuild(params.value("doc_id", std::string())), out_json, 0);
             if (m == "ecad_swap_doc")
@@ -4308,21 +3488,60 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 return emit(chudware::ecad::ecad_design(params.value("request", std::string()),
                                                         params.value("name", std::string())),
                             out_json, 0);
-            if (m == "ecad_symbols") {
+            if (m == "ecad_symbols" || m == "ecad_footprints" || m == "ecad_kicad_libraries") {
+                const std::string doc_id = params.value("doc_id", std::string());
+                std::string project_dir;
+                if (!doc_id.empty()) {
+                    const json tree = chudware::ecad::ecad_tree(doc_id);
+                    const std::string path = tree.value("path", std::string());
+                    if (!path.empty()) project_dir = std::filesystem::path(path).parent_path().string();
+                }
+                chudware::ecad::kicad_libs::set_project_dir(project_dir);
+                if (m == "ecad_kicad_libraries")
+                    return emit(chudware::ecad::kicad_libs::libraries(), out_json, 0);
                 const std::string q = params.value("query", std::string());
                 const int limit = params.contains("limit") && params["limit"].is_number()
-                                      ? params["limit"].get<int>()
-                                      : 20;
-                if (q.empty()) {
-                    json cat = chudware::ecad::symlib::symbol_catalog();
-                    if (limit > 0 && cat.is_array() && (int)cat.size() > limit)
-                        cat.erase(cat.begin() + limit, cat.end());
-                    return emit(json{{"ok", true}, {"symbols", cat},
-                                    {"count", (int)cat.size()},
-                                    {"total", (int)chudware::ecad::symlib::symbol_libids().size()}},
-                                out_json, 0);
+                                      ? params["limit"].get<int>() : 20;
+                const bool resolve = params.value("resolve", false) && !q.empty();
+                if (m == "ecad_symbols") {
+                    if (resolve) {
+                        const json def = chudware::ecad::symlib::resolve_symbol(q);
+                        json symbols = json::array();
+                        if (def.is_object())
+                            symbols.push_back({{"libid", q}, {"name", def.value("name", std::string())},
+                                {"description", def.value("description", std::string())},
+                                {"keywords", def.value("keywords", json::array())},
+                                {"prefix", def.value("prefix", std::string())},
+                                {"pin_count", def.value("pins", json::array()).size()},
+                                {"default_footprint", def.value("default_footprint", std::string())},
+                                {"power", def.value("power", false)}, {"score", 500}, {"definition", def}});
+                        return emit(json{{"ok", true}, {"count", symbols.size()}, {"symbols", symbols}},
+                                    out_json, 0);
+                    }
+                    if (q.empty()) {
+                        json cat = chudware::ecad::symlib::symbol_catalog();
+                        const auto total = cat.size();
+                        if (limit > 0 && cat.size() > static_cast<std::size_t>(limit))
+                            cat.erase(cat.begin() + limit, cat.end());
+                        return emit(json{{"ok", true}, {"symbols", cat}, {"count", cat.size()},
+                                         {"total", total}}, out_json, 0);
+                    }
+                    return emit(chudware::ecad::symlib::search_symbols(q, limit), out_json, 0);
                 }
-                return emit(chudware::ecad::symlib::search_symbols(q, limit), out_json, 0);
+                json footprints;
+                if (resolve) {
+                    const json def = chudware::ecad::library::resolve_footprint(q);
+                    footprints = json::array();
+                    if (def.is_object())
+                        footprints.push_back({{"fpid", q},
+                            {"description", def.value("description", std::string())},
+                            {"pad_count", def.value("pads", json::array()).size()},
+                            {"definition", def}});
+                } else {
+                    footprints = chudware::ecad::library::search_footprints(q, limit);
+                }
+                return emit(json{{"ok", true}, {"footprints", footprints}, {"count", footprints.size()}},
+                            out_json, 0);
             }
             if (m == "ecad_load_symbol_library")
                 return emit(chudware::ecad::symlib::load_kicad_sym_file(
@@ -4385,59 +3604,27 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                                                        sim_params, params.value("job_id", std::string())),
                             out_json, 0);
             }
+            if (m == "ecad_kicad_status")
+                return emit(chudware::ecad::ecad_kicad_status(), out_json, 0);
+            if (m == "ecad_kicad_check")
+                return emit(chudware::ecad::ecad_kicad_check(params.value("doc_id", std::string())),
+                            out_json, 0);
             if (m == "ecad_to_3d") {
-                json opts = params.contains("opts") ? params["opts"] : json(nullptr);
-                if (params.contains("board") && params["board"].is_object())
-                    // Stateless inline-board path (parity harness): build the OCCT board
-                    // model (substrate extrude + drill cuts + analytic component proxies)
-                    // and return the geometry summary + exact BRep volume stats. Mirrors
-                    // engine.ecad.threed.board_to_step's summary; no STEP file is written.
-                    return emit(chudware::ecad::board_to_3d(params["board"], opts), out_json, 0);
-                // Doc-id session path (the host's form): fetch the open board doc, build
-                // the model, WRITE the STEP at `path`, and return {step_path, summary, ...}
-                // exactly like engine.ecad.threed.board_to_step.
-                json board = chudware::ecad::ecad_session_doc(params.value("doc_id", std::string()));
-                if (!chudware::ecad::schema::is_board(board))
-                    return emit(chudware::ecad::OpError("invalid_op",
-                                                     "ecad_to_3d requires a pcb document",
-                                                     json{{"reason", "wrong doc kind"}})
-                                    .envelope(),
-                                out_json, 3);
-                json to3d = chudware::ecad::board_to_3d_step(board, opts,
-                                                          params.value("path", std::string()));
-                // Mint (or append to `into_doc_id`) the CAD part document that carries the
-                // board as an `import` feature, and return its id. fab_outputs.md §5 always
-                // promised this; until now the RPC only wrote the STEP and every caller had
-                // to re-do the mint+import client-side, which meant a re-export spawned a
-                // second anonymous tab instead of updating the first.
-                //
-                // doc_import_file already IS the "mint-or-append, return doc_id" primitive
-                // (`into` empty -> new part session; otherwise append to that session), so
-                // this is a call, not a new capability. No publish sink is needed: ecad_to_3d
-                // is a top-level method, so DocRegistry::postCall's generic response-doc_id
-                // sniff registers the new doc exactly as it does for parts_make.
-                const std::string step_path = to3d.value("step_path", std::string());
-                if (!step_path.empty()) {
-                    try {
-                        json imported = chudware::doc::doc_import_file(
-                            step_path, params.value("into_doc_id", std::string()),
-                            /*as_solid=*/false, "step");
-                        const std::string part_doc_id = imported.value("doc_id", std::string());
-                        to3d["part_doc_id"] = part_doc_id;
-                        to3d["doc_id"] = part_doc_id;  // DocRegistry mint sniff
-                    } catch (const std::exception& ie) {
-                        // The STEP is already on disk and valid — a bad/closed `into_doc_id`
-                        // must degrade to "exported but not opened", never erase a successful
-                        // export. doc_import_file throws chudware::doc::OpError, a different
-                        // type than the chudware::ecad::OpError this branch's enclosing catch
-                        // handles, so it must be caught locally or it would surface as a flat
-                        // rc=1 "threw" envelope.
-                        to3d["part_doc_id"] = nullptr;
-                        to3d["warnings"].push_back(std::string("board exported to ") + step_path +
-                                                   " but opening it as a part failed: " + ie.what());
-                    }
+                const json opts = params.value("opts", json::object());
+                json result = chudware::ecad::ecad_kicad_step(
+                    params.value("doc_id", std::string()), opts,
+                    params.value("path", std::string()));
+                const std::string step_path = result.at("step_path").get<std::string>();
+                try {
+                    const json imported = chudware::doc::doc_import_file(
+                        step_path, params.value("into_doc_id", std::string()),
+                        /*as_solid=*/false, "step");
+                    result["part_doc_id"] = imported.at("doc_id");
+                    result["doc_id"] = imported.at("doc_id");
+                } catch (const chudware::doc::OpError& error) {
+                    return emit(error.envelope(), out_json, 3);
                 }
-                return emit(std::move(to3d), out_json, 0);
+                return emit(std::move(result), out_json, 0);
             }
             if (m == "ecad_impedance")
                 return emit(chudware::ecad::ecad_impedance(params), out_json, 0);
@@ -4445,22 +3632,36 @@ static int chudware_call_inner(const char* method, const char* params_json, char
                 return emit(chudware::ecad::ecad_export(params), out_json, 0);
             if (m == "ecad_save")
                 return emit(chudware::ecad::ecad_save(params.value("doc_id", std::string()),
-                                                   params.value("path", std::string())),
+                                                   params.value("path", std::string()),
+                                                   params.value("recovery", json(nullptr))),
                             out_json, 0);
             if (m == "ecad_open")
                 return emit(chudware::ecad::ecad_open(params.value("path", std::string())), out_json, 0);
+            if (m == "ecad_open_project")
+                return emit(chudware::ecad::ecad_open_project(params.value("path", std::string())),
+                            out_json, 0);
             if (m == "ecad_update_from_sch") {
                 // Stateless inline path (parity harness): {board, sch_netlist, prune?,
                 // place_origin?} -> sync's {mutated_board, report}. Else the stateful
                 // path over two open sessions.
                 json place = params.contains("place_origin") ? params["place_origin"] : json(nullptr);
-                if (params.contains("board") && params["board"].is_object())
+                if (params.contains("board") && params["board"].is_object()) {
+                    const std::string board_id = params.value("board_doc_id", std::string());
+                    std::string project_dir;
+                    if (!board_id.empty()) {
+                        const json tree = chudware::ecad::ecad_tree(board_id);
+                        const std::string path = tree.value("path", std::string());
+                        if (!path.empty())
+                            project_dir = std::filesystem::path(path).parent_path().string();
+                    }
+                    chudware::ecad::kicad_libs::set_project_dir(project_dir);
                     return emit(chudware::ecad::ecad_update_from_sch_inline(
                                     params["board"],
                                     params.contains("sch_netlist") ? params["sch_netlist"]
                                                                     : json::object(),
                                     params.value("prune", false), place),
                                 out_json, 0);
+                }
                 return emit(chudware::ecad::ecad_update_from_sch(
                                 params.value("board_doc_id", std::string()),
                                 params.value("sch_doc_id", std::string()),
@@ -4574,7 +3775,114 @@ static int chudware_call_inner(const char* method, const char* params_json, char
             ps.get_record = [](const std::string&) -> json { return json(); };
             ps.parts_make = [](const json& p) -> json { int rc = 0; return parts_make_impl(p, rc); };
             ps.import_file = [](const std::string& path, bool as_solid) -> json {
-                return chudware::doc::doc_import_file(path, std::string(), as_solid, std::string());
+                const std::string reference = chudware::doc::native_policy::authored_reference(path);
+                const std::string resolved = chudware::doc::native_policy::resolve_reference(reference);
+                std::error_code ec;
+                if (!std::filesystem::is_regular_file(std::filesystem::u8path(resolved), ec))
+                    throw std::runtime_error("file not found: " + path);
+                std::string ext = std::filesystem::u8path(path).extension().string();
+                std::transform(ext.begin(), ext.end(), ext.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                json r;
+                if (ext == ".step+") {
+                    // A library document must never retain its cache object as a save target.
+                    r = chudware::doc::doc_open(resolved, as_solid, true);
+                } else {
+                    r = chudware::doc::doc_import_file(resolved, std::string(), as_solid, std::string());
+                }
+                const auto rebuild = r.find("rebuild");
+                const bool failed_rebuild = rebuild != r.end() && rebuild->is_object() &&
+                                            !rebuild->value("ok", true);
+                const auto geometry = r.find("geometry_state");
+                const bool incomplete_geometry = geometry != r.end() && geometry->is_string() &&
+                    (geometry->get_ref<const std::string&>() == "incomplete" ||
+                     geometry->get_ref<const std::string&>() == "last_good");
+                const auto rejected = r.find("rejected_tree");
+                if (failed_rebuild || incomplete_geometry ||
+                    (rejected != r.end() && !rejected->is_null())) {
+                    std::string reason = "imported feature rebuild failed";
+                    if (rebuild != r.end() && rebuild->is_object()) {
+                        const auto statuses = rebuild->find("feature_status");
+                        if (statuses != rebuild->end() && statuses->is_array()) {
+                            for (const auto& status : *statuses) {
+                                if (!status.is_object() || status.value("ok", true)) continue;
+                                reason += ": " + status.value("id", std::string());
+                                const auto error = status.find("error");
+                                if (error != status.end() && error->is_string())
+                                    reason += ": " + error->get_ref<const std::string&>();
+                                break;
+                            }
+                        }
+                    }
+                    // Both import lanes mint a new session; never leave a failed
+                    // library source open or treat its last-good display as a part.
+                    const std::string id = r.value("doc_id", std::string());
+                    if (!id.empty()) chudware::doc::doc_close(id);
+                    throw std::runtime_error(reason);
+                }
+                if (r.contains("tess") && r["tess"].contains("bodies") &&
+                    r["tess"]["bodies"].is_array())
+                    r["body_count"] = r["tess"]["bodies"].size();
+                return r;
+            };
+            ps.set_catalog_meta = [](const std::string& doc_id, const json& metadata) {
+                json stamped = metadata;
+                const json previous = chudware::doc::doc_get_meta(doc_id, "parts_catalog");
+                if (previous.contains("value") && !previous["value"].is_null())
+                    stamped["source_catalog"] = previous["value"];
+                chudware::doc::doc_set_meta(doc_id, "parts_catalog", stamped);
+            };
+            ps.pose_import = [](const std::string& doc_id, const json& imported,
+                                const json& params) -> json {
+                try {
+                    const auto pos = part_pose_vector(params, "pos");
+                    const auto rotation = part_pose_vector(params, "rotation");
+                    const json world = chudware::doc::doc_asm_world_bodies(doc_id, false);
+                    if (!world.value("multibody_part", false))
+                        throw std::runtime_error("imported assembly pose is not supported as a part placement");
+                    const json& bodies = world.at("bodies");
+                    if (!bodies.is_array() || bodies.empty())
+                        throw std::runtime_error("import contains no bodies");
+                    const std::size_t count = bodies.size();
+                    const json local = chudware::doc::doc_bbox(doc_id);
+                    const auto& mn = local.at("min");
+                    const auto& mx = local.at("max");
+                    std::array<double, 3> base = {
+                        (mn[0].get<double>() + mx[0].get<double>()) / 2.0,
+                        (mn[1].get<double>() + mx[1].get<double>()) / 2.0,
+                        mn[2].get<double>()};
+                    json ops = json::array();
+                    for (std::size_t k = 0; k < count; ++k) {
+                        const std::string body = bodies[k].at("name").get<std::string>();
+                        for (int i = 0; i < 3; ++i) {
+                            if (rotation[i] == 0.0) continue;
+                            std::array<double, 3> axis{0, 0, 0};
+                            axis[i] = 1;
+                            ops.push_back({{"op", "add_feature"},
+                                {"feature", {{"type", "transform"}, {"name", "Body " + std::to_string(k + 1) + " orientation " + "XYZ"[i]},
+                                    {"params", {{"body", body},
+                                        {"rotate", {{"axis", axis}, {"angle", rotation[i]}}}}}}}});
+                        }
+                        if (pos[0] != 0.0 || pos[1] != 0.0 || pos[2] != 0.0)
+                            ops.push_back({{"op", "add_feature"},
+                                {"feature", {{"type", "transform"}, {"name", "Body " + std::to_string(k + 1) + " position"},
+                                    {"params", {{"body", body}, {"translate", pos}}}}}});
+                    }
+                    if (!ops.empty()) {
+                        const json applied = chudware::doc::doc_apply_ops(
+                            doc_id, imported.value("revision", 0L), ops, false);
+                        if (applied.contains("rejected_tree"))
+                            throw std::runtime_error("imported body placement transform rebuild failed");
+                    }
+                    base = part_rotate(base, rotation);
+                    for (int i = 0; i < 3; ++i) base[i] += pos[i];
+                    return {{"body_count", count}, {"bbox", chudware::doc::doc_bbox(doc_id)},
+                            {"datum", {{"base_center", base}, {"axis", part_rotate({0, 0, 1}, rotation)},
+                                       {"note", "Bounding-box reference transformed by the part pose; not a manufacturer datum"}}}};
+                } catch (...) {
+                    chudware::doc::doc_close(doc_id);
+                    throw;
+                }
             };
             ps.build_model = [](const json& match) -> std::string {
                 return build_sourcing_seams().build_model(match);

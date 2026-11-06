@@ -116,7 +116,7 @@ _RULES: tuple[tuple[str, str, str, str], ...] = (
      "Amplifier_Operational:LM358", "dual operational amplifier",
      "LM358 DIP-8/SOIC-8 dual-opamp pinout. Single or quad opamps differ."),
     (r"(\b555\b|ne555|timer\s*ic|astable|monostable)",
-     "Timer:NE555", "555 timer", "NE555 8-pin pinout."),
+     "Timer:NE555P", "555 timer", "NE555 8-pin pinout."),
 
     # -- Discretes. --
     (r"(n-?channel|\bnmos\b|n-?mosfet|ao34[0-9]{2}|si2302|irlml|bss138|2n7002|"

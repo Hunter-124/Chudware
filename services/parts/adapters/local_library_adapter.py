@@ -1,6 +1,6 @@
 """CatalogProvider for the watched local parts library (vendor_parts index).
 
-Federates STEP/STEP+/IGES/BREP files registered via
+Federates STEP/STEP+/IGES/BREP/STL/SCAD files registered via
 ``services.parts.parts_library.scan_library_folder`` /
 ``services.parts.vendor_parts.register_local_cad`` into the PartsHub FTS index
 so ``part_search`` finds them by title/part-number and ``part_place`` imports
@@ -8,8 +8,7 @@ them as editable docs via ``geometry_ref.kind = "import_file"``.
 
 Indexable (``iter_records`` yields every registered CAD file that still exists
 on disk). Removal/replace of a file drops it from the next rebuild; callers that
-mutate the vendor_parts index should call
-``engine_oracle.parts_hub.rebuild_index()`` afterwards.
+mutate the vendor_parts index should call ``services.parts.rebuild_index()`` afterwards.
 """
 from __future__ import annotations
 
@@ -27,17 +26,21 @@ class LocalLibraryAdapter:
                domain: str | None = None,
                filters: dict | None = None) -> list[dict]:
         """Direct search fallback (index is the primary path)."""
-        if domain and domain not in (self.domain, "catalog", "library"):
-            return []
+        # Manifest records retain their original domain.
         norm = (query or "").strip().lower()
         if not norm:
-            return list(self.iter_records())
+            return [rec for rec in self.iter_records()
+                    if not domain or rec.get("domain") == domain]
         hits: list[dict] = []
         for rec in self.iter_records():
+            if domain and rec.get("domain") != domain:
+                continue
             hay = " ".join([
                 str(rec.get("title", "")),
                 str(rec.get("designation", "")),
                 str(rec.get("standard", "")),
+                str(rec.get("description", "")),
+                " ".join(str(v) for v in rec.get("aliases") or []),
                 " ".join(str(v) for v in (rec.get("params") or {}).values()),
             ]).lower()
             if norm in hay:
@@ -45,7 +48,7 @@ class LocalLibraryAdapter:
         return hits
 
     def get(self, part_id: str) -> dict | None:
-        if not part_id or not str(part_id).startswith("library:"):
+        if not part_id:
             return None
         for rec in self.iter_records():
             if rec.get("part_id") == part_id:
@@ -75,6 +78,16 @@ def _vendor_row_to_record(row: dict) -> dict | None:
     """Map a vendor_parts index row onto a PartRecord (import_file geometry)."""
     if not isinstance(row, dict):
         return None
+    stored = row.get("part_record")
+    if isinstance(stored, dict):
+        rec = dict(stored)
+        artifact = rec.get("artifact")
+        if artifact:
+            # The resolver re-verifies this file before returning it for placement.
+            path = str(row.get("cad_path") or "")
+            rec["geometry_ref"] = ({"kind": "import_file", "path": path}
+                                   if path and Path(path).is_file() else None)
+        return rec
     cad_path = str(row.get("cad_path") or "").strip()
     if not cad_path:
         return None
@@ -93,10 +106,13 @@ def _vendor_row_to_record(row: dict) -> dict | None:
 
     params = dict(row.get("specs") or {})
     if row.get("unit_price") is not None:
-        params.setdefault("price_usd", row["unit_price"])
+        params.setdefault("price", row["unit_price"])
+        if str(row.get("currency") or "").upper() == "USD":
+            params.setdefault("price_usd", row["unit_price"])
     if row.get("currency"):
         params.setdefault("currency", row["currency"])
-    params.setdefault("supplier", supplier)
+    if supplier.lower() != "library":
+        params.setdefault("supplier", supplier)
     params.setdefault("part_number", part_number)
     if row.get("product_url"):
         params.setdefault("product_url", row["product_url"])
@@ -108,16 +124,24 @@ def _vendor_row_to_record(row: dict) -> dict | None:
         src_row: dict = {"vendor": supplier}
         if row.get("unit_price") is not None:
             src_row["price"] = row["unit_price"]
-            src_row["currency"] = row.get("currency") or "USD"
+            src_row["currency"] = row.get("currency") or ""
         if row.get("stock") is not None:
             src_row["stock"] = row["stock"]
         sourcing.append(src_row)
 
-    title = f"{supplier} {part_number} {description}".strip()
+    label = description.strip()
+    if not label or "\n" in label or len(label) > 100:
+        title = part_number
+    elif part_number.casefold() in label.casefold():
+        title = label
+    else:
+        title = f"{label} ({part_number})"
     return {
         "part_id": part_id,
         "domain": "library",
         "title": title,
+        "family": str(row.get("family") or params.get("family") or ""),
+        "description": description,
         "standard": supplier,
         "designation": part_number,
         "params": params,

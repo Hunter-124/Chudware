@@ -201,3 +201,23 @@ appropriately-licensed open-source library — see `building-format-support.md`)
 never from a proprietary binary. See `docs/reference/README.md` for how this
 survey maps onto the production format matrix (`format_registry` in
 `core/doc/formats.cpp`).
+
+## OpenSCAD source and native documents
+
+Chudware can open and export `.scad` source projects. Rendering uses a separately
+installed OpenSCAD executable out of process with required confinement, not a
+subset parser; `scad_status` reports the detected executable and isolation.
+Linux requires bubblewrap; Windows and macOS have native confinement implementations.
+Installation and a working platform sandbox are prerequisites; there is no unconfined fallback.
+OpenSCAD is GPL-licensed and is not linked or bundled; see `contracts/licenses.md`.
+
+The native `scad` feature preserves source and explicitly captured relative
+sidecars for real modules, include/use and loops. Typed controls distinguish
+canonical-mm lengths from untyped numbers; `mm_per_source_unit` supplies the
+positive source-to-mm scale. Saving `.step+` retains the feature and successful
+build cache for reopening. Export writes executable source with effective overrides
+and sidecars; browser export can package the project in a ZIP. Rendered geometry is
+faceted. Arbitrary SCAD does not reconstruct native feature history: only supported
+managed native projections can round-trip their preserved graph, and changed source
+or unsupported options are refused. Conversion and rebuild failure roll back the
+transaction. See `contracts/doc_ops.md` §36 and `cad_guide('scad')`.

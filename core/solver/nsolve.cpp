@@ -723,7 +723,45 @@ Analysis System::analyze(const Eigen::VectorXd& x, double tol) {
     std::vector<int> redundant = interactive_ ? dependent_rows_colpiv(J, rank, tol)
                                               : dependent_rows(J, rank, tol);
 
+    // Which constraints does each dependent row duplicate or contradict? Express the row in
+    // the basis of independent rows (unique, since that basis has full row rank); the basis
+    // rows with a non-zero coefficient are its fundamental circuit. One QR serves every
+    // dependent row. Exact path only: the interactive path runs in hot trial loops.
+    std::vector<std::pair<std::string, std::vector<std::string>>> dependency_partners;
+    if (!interactive_ && rank > 0 && !redundant.empty()) {
+        std::vector<char> dependent(static_cast<size_t>(m_total), 0);
+        for (int ri : redundant) dependent[static_cast<size_t>(ri)] = 1;
+        std::vector<int> basis;
+        for (int k = 0; k < m_total; ++k)
+            if (!dependent[static_cast<size_t>(k)]) basis.push_back(k);
+        if (!basis.empty()) {
+            Eigen::MatrixXd basis_t(n, static_cast<int>(basis.size()));
+            for (size_t c = 0; c < basis.size(); ++c)
+                basis_t.col(static_cast<int>(c)) = J.row(basis[c]).transpose();
+            Eigen::ColPivHouseholderQR<Eigen::MatrixXd> qr(basis_t);
+            for (int ri : redundant) {
+                const std::string& tag = row_tag[ri];
+                const Eigen::VectorXd coef = qr.solve(J.row(ri).transpose());
+                const double scale = coef.size() ? coef.cwiseAbs().maxCoeff() : 0.0;
+                auto entry = std::find_if(dependency_partners.begin(), dependency_partners.end(),
+                    [&](const auto& p) { return p.first == tag; });
+                if (entry == dependency_partners.end()) {
+                    dependency_partners.emplace_back(tag, std::vector<std::string>{});
+                    entry = dependency_partners.end() - 1;
+                }
+                for (size_t c = 0; c < basis.size(); ++c) {
+                    if (std::abs(coef(static_cast<int>(c))) <= 1e-7 * std::max(1.0, scale)) continue;
+                    const std::string& other = row_tag[basis[c]];
+                    if (other != tag &&
+                        std::find(entry->second.begin(), entry->second.end(), other) == entry->second.end())
+                        entry->second.push_back(other);
+                }
+            }
+        }
+    }
+
     std::vector<std::string> redundant_tags, conflicting_tags;
+    std::vector<std::pair<std::string, int>> partial_tags;
     std::vector<std::string> seen_r, seen_c;
     auto seen = [](const std::vector<std::string>& v, const std::string& s) {
         return std::find(v.begin(), v.end(), s) != v.end();
@@ -736,13 +774,25 @@ Analysis System::analyze(const Eigen::VectorXd& x, double tol) {
                 conflicting_tags.push_back(tag);
                 seen_c.push_back(tag);
             }
-        } else {
-            if (!seen(seen_r, tag)) {
-                redundant_tags.push_back(tag);
-                seen_r.push_back(tag);
-            }
+        } else if (!seen(seen_r, tag)) {
+            // A dependent row is not necessarily a redundant relation: a multi-row
+            // constraint can contribute independent rows as well. Remove every row
+            // carrying the tag and compare the rank of the whole remaining system.
+            int kept = 0;
+            for (const auto& t : row_tag) if (t != tag) ++kept;
+            Eigen::MatrixXd without(kept, n);
+            int dst = 0;
+            for (int k = 0; k < m_total; ++k)
+                if (row_tag[k] != tag) without.row(dst++) = J.row(k);
+            const int lost = rank - numeric_rank(without, tol);
+            if (lost == 0) redundant_tags.push_back(tag);
+            else if (lost > 0 && lost < m_total - kept) partial_tags.emplace_back(tag, lost);
+            seen_r.push_back(tag);
         }
     }
+    if (!conflicting_tags.empty())
+        partial_tags.erase(std::remove_if(partial_tags.begin(), partial_tags.end(),
+            [&](const auto& p) { return seen(conflicting_tags, p.first); }), partial_tags.end());
     // A tag flagged as both is a conflict; drop it from warn.
     if (!conflicting_tags.empty()) {
         std::vector<std::string> filtered;
@@ -754,7 +804,9 @@ Analysis System::analyze(const Eigen::VectorXd& x, double tol) {
     Analysis a;
     a.dof = dof;
     a.redundant_tags = std::move(redundant_tags);
+    a.partial_tags = std::move(partial_tags);
     a.conflicting_tags = std::move(conflicting_tags);
+    a.dependency_partners = std::move(dependency_partners);
     a.well_posed = a.conflicting_tags.empty();
     a.rank = rank;
     a.n_vars = n;

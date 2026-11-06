@@ -1,9 +1,8 @@
-// core/parts/place.cpp — C++ port of engine_oracle/parts_hub/place.py.
-// See place.h for the routing table and the PlacementResult contract. The
-// parity bar is the oracle's envelopes byte-for-byte (modulo volatile
-// ids/timestamps); error strings are copied verbatim from place.py.
+// core/parts/place.cpp — standard-part placement and schema routing.
+// See place.h for the routing table and the PlacementResult contract.
 #include "parts/place.h"
 
+#include <cmath>
 #include <filesystem>
 #include <random>
 #include <set>
@@ -11,6 +10,7 @@
 #include <vector>
 
 #include "ecad/ops.h"
+#include "parts/fitting_geometry.h"
 #include "hydraulic/schema.h"
 #include "piping/pyutil.h"
 #include "piping/schema.h"
@@ -108,12 +108,13 @@ json place_core_family(const json& gref, const json& params, const PlaceSeams& s
             return err_env(domain, r.value("error", std::string("parts_make failed")),
                            "Verify the family/size pair with list_standard_parts.");
         const json doc_id = get(r, "doc_id");
-        return ok_env(domain, doc_id, doc_id,
-                      {{"family", family},
+        json detail = {{"family", family},
                        {"size", size},
                        {"name", get(r, "name")},
                        {"bbox", get(r, "bbox")},
-                       {"datum", get(r, "datum")}});
+                       {"datum", get(r, "datum")}};
+        if (r.contains("meta")) detail["meta"] = r["meta"];
+        return ok_env(domain, doc_id, doc_id, detail);
     } catch (const std::exception& e) {
         return err_env(domain, std::string("parts_make RPC failed: ") + e.what(),
                        "Ensure the native core is available (CHUDWARE_LIBCHUDWARE).");
@@ -125,14 +126,23 @@ json place_core_family(const json& gref, const json& params, const PlaceSeams& s
 json place_import_file(const json& gref, const json& /*doc*/, const json& params,
                        const PlaceSeams& seams) {
     const std::string domain = "import_file";
+    for (const char* key : {"pos", "rotation"}) {
+        if (!params.is_object() || !params.contains(key)) continue;
+        const json& v = params[key];
+        if (!v.is_array() || v.size() != 3)
+            return err_env(domain, std::string(key) + " must be an array of three finite numbers.");
+        for (const auto& x : v)
+            if (!x.is_number() || !std::isfinite(x.get<double>()))
+                return err_env(domain, std::string(key) + " must be an array of three finite numbers.");
+    }
+    const bool has_pose = params.is_object() &&
+                          (params.contains("pos") || params.contains("rotation"));
+    if (has_pose && !seams.pose_import)
+        return err_env(domain, "Imported model pose seam unavailable.");
     const std::string path = get_str(gref, "path");
     if (path.empty())
         return err_env(domain, "geometry_ref missing 'path'",
                        "Fetch the PartRecord via part_get to confirm geometry_ref fields.");
-    std::error_code ec;
-    if (!std::filesystem::is_regular_file(path, ec))
-        return err_env(domain, "file not found: " + path,
-                       "The browser-acquired file may have been moved or cleaned up.");
     try {
         if (!seams.import_file) throw std::runtime_error("native core seam unavailable");
         const bool as_solid = params.is_object() && truthy(get(params, "as_solid"));
@@ -141,10 +151,16 @@ json place_import_file(const json& gref, const json& /*doc*/, const json& params
         if (!truthy(doc_id))
             return err_env(domain, "import_file RPC returned no doc_id",
                            "The core may have rejected the file format.");
-        return ok_env(domain, doc_id, doc_id,
-                      {{"imported_from", path},
+        json detail = {{"imported_from", path},
                        {"body_count", get(r, "body_count")},
-                       {"hint", kReverseEngineerHint}});
+                       {"hint", kReverseEngineerHint}};
+        if (has_pose) {
+            const json posed = seams.pose_import(doc_id.get<std::string>(), r, params);
+            if (posed.contains("bbox")) detail["bbox"] = posed["bbox"];
+            if (posed.contains("datum")) detail["datum"] = posed["datum"];
+            if (posed.contains("body_count")) detail["body_count"] = posed["body_count"];
+        }
+        return ok_env(domain, doc_id, doc_id, detail);
     } catch (const std::exception& e) {
         return err_env(domain, std::string("import_file RPC failed: ") + e.what(),
                        "Ensure the native core is available (CHUDWARE_LIBCHUDWARE).");
@@ -280,29 +296,66 @@ json place_symbol_footprint(const json& gref, const json& doc_context, const jso
     }
 }
 
-// section_profile: append a StructuralElement dict to an aicad.structure/1 doc.
-json place_section_profile(const json& gref, const json& doc_context, const json& params) {
+// A section can be added to a structural model or built as a standalone part.
+json place_section_profile(const json& gref, const json& doc_context, const json& params,
+                           const PlaceSeams& seams) {
     const std::string domain = "section_profile";
     const std::string standard = get_str(gref, "standard");
     const std::string designation = get_str(gref, "designation");
     if (designation.empty())
         return err_env(domain, "geometry_ref missing 'designation'",
                        "Fetch the PartRecord via part_get to confirm geometry_ref fields.");
+    if (doc_context.is_null()) {
+        if (standard.empty())
+            return err_env(domain, "geometry_ref missing 'standard'",
+                           "Fetch the PartRecord via part_get to confirm the section standard.");
+        if (params.contains("length_mm") &&
+            (!params["length_mm"].is_number() ||
+             !std::isfinite(params["length_mm"].get<double>()) ||
+             params["length_mm"].get<double>() <= 0.0))
+            return err_env(domain, "length_mm must be a positive finite number.");
+        json make_params = json::object();
+        for (const char* key : {"length_mm", "pos", "rotation"})
+            if (params.contains(key)) make_params[key] = params[key];
+        json out = place_core_family({{"family", "structural_section"},
+                                      {"size", standard + ":" + designation}}, make_params, seams);
+        out["domain"] = domain;
+        return out;
+    }
     if (!doc_context.is_object() ||
         doc_context.value("schema", std::string()) != "aicad.structure/1")
         return err_env(domain,
-                       "No structural doc provided. Pass a doc with schema='aicad.structure/1'.",
-                       "Create one with new_structure(), then call part_place with it.");
+                       "Expected a structural doc with schema='aicad.structure/1'.",
+                       "Omit doc to create a standalone mechanical part.");
     try {
         const json p = params.is_object() ? params : json::object();
         const std::string element_id =
             truthy(get(p, "id")) ? get(p, "id").get<std::string>() : uuid_hex12();
         const std::string kind = p.value("kind", std::string("beam"));
         const double length_mm = p.contains("length_mm") ? to_f(p["length_mm"]) : 1000.0;
-        const std::string material = p.value("material", std::string("steel"));
-        // section_name encodes standard + designation, e.g. "AISC:W8x31".
-        const std::string section_name =
-            standard.empty() ? designation : standard + ":" + designation;
+        const std::string material = p.value("material", std::string(standard == "NDS" ? "lumber" : "steel"));
+        std::string section_name = standard.empty() ? designation : standard + ":" + designation;
+        const std::string shape = get_str(p, "shape");
+        if (shape == "round_bar" || shape == "hex_bar" || shape == "flat_bar" ||
+            shape == "plate" || shape == "sheet" || shape == "round_tube") {
+            if (get_str(p, "material").empty())
+                throw std::invalid_argument("raw stock requires an explicit material");
+            auto dimension = [&](const char* key) {
+                const json v = get(p, key);
+                if (!v.is_number() || !std::isfinite(v.get<double>()) || v.get<double>() <= 0)
+                    throw std::invalid_argument(std::string("raw stock requires positive ") + key);
+                return v.get<double>();
+            };
+            auto number = [](double v) { return json(v).dump(); };
+            if (shape == "round_bar") section_name = "ROUND " + number(dimension("diameter_mm"));
+            else if (shape == "hex_bar") section_name = "HEX " + number(dimension("across_flats_mm"));
+            else if (shape == "round_tube") {
+                const double od = dimension("od_mm"), wall = dimension("wall_mm");
+                if (2 * wall >= od) throw std::invalid_argument("raw stock wall must be less than half the outside diameter");
+                section_name = "CHS " + number(od) + "x" + number(wall);
+            } else section_name = "RECT " + number(dimension("width_mm")) + "x" +
+                                       number(dimension("thickness_mm"));
+        }
         static const std::set<std::string> kKinds = {"beam", "column", "post", "joist"};
         const std::string element_type = kKinds.count(kind) ? kind : "beam";
         // StructuralElement.to_dict() (engine_oracle/structural/elements.py),
@@ -332,31 +385,55 @@ json place_section_profile(const json& gref, const json& doc_context, const json
     }
 }
 
-// fitting_id: append a fitting to an aicad.piping/1 doc (editable schema op).
-json place_fitting_id(const json& gref, const json& doc_context, const json& params) {
+// A fitting can be added to a piping model or built as a standalone part.
+json place_fitting_id(const json& gref, const json& doc_context, const json& params,
+                      const PlaceSeams& seams) {
     const std::string domain = "fitting_id";
     const std::string fitting_id_val = get_str(gref, "fitting_id");
     if (fitting_id_val.empty())
         return err_env(domain, "geometry_ref missing 'fitting_id'",
                        "Fetch the PartRecord via part_get to confirm geometry_ref fields.");
-    const std::string schema = doc_context.is_object()
-                                   ? doc_context.value("schema", std::string())
-                                   : std::string();
-    if (schema.rfind("aicad.piping", 0) != 0)
-        return err_env(domain,
-                       "No piping doc provided. Pass a doc with schema='aicad.piping/1'.",
-                       "Create one with piping tools, then call part_place with that doc.");
     try {
         const json p = params.is_object() ? params : json::object();
+        const json identity = fitting_catalog_identity(fitting_id_val);
+        const std::string ft_type = identity.at("type").get<std::string>();
+        const double nps = identity.at("nps").get<double>();
+        for (const char* key : {"type", "nps", "nps2", "flange_class"}) {
+            if (p.contains(key) && !p[key].is_null() &&
+                (!identity.contains(key) || p[key] != identity[key]))
+                return err_env(domain, std::string(key) + " conflicts with fitting catalog identity " +
+                                       fitting_id_val + ".");
+        }
+        if (doc_context.is_null()) {
+            json make_params = json::object();
+            for (const char* key : {"pos", "rotation"})
+                if (p.contains(key)) make_params[key] = p[key];
+            if (p.contains("schedule"))
+                make_params["options"] = {{"schedule", p["schedule"]}};
+            json out = place_core_family({{"family", "piping_fitting"}, {"size", fitting_id_val}},
+                                         make_params, seams);
+            out["domain"] = domain;
+            if (out.value("ok", false)) out["detail"]["catalog_id"] = fitting_id_val;
+            return out;
+        }
+        const std::string schema = doc_context.is_object()
+                                       ? doc_context.value("schema", std::string())
+                                       : std::string();
+        if (schema.rfind("aicad.piping", 0) != 0)
+            return err_env(domain, "Expected a piping doc with schema='aicad.piping/1'.",
+                           "Omit doc to create a standalone mechanical part.");
         ojson odoc = to_ojson(doc_context);
         const std::string ft_id = truthy(get(p, "id")) ? get(p, "id").get<std::string>()
                                                        : piping::next_id(odoc, "ft");
-        const std::string ft_type = p.value("type", std::string("elbow"));
-        const double nps = p.contains("nps") ? to_f(p["nps"]) : 1.0;
         ojson origin = ojson::array({0.0, 0.0, 0.0});
         if (p.contains("origin") && p["origin"].is_array()) origin = to_ojson(p["origin"]);
         ojson fitting = piping::new_fitting(ft_id, ft_type, nps, origin);
-        // Copy any extra catalog fields from the fitting record.
+        fitting["catalog_ref"] = fitting_id_val;
+        if (identity.contains("nps2")) fitting["nps2"] = to_ojson(identity["nps2"]);
+        if (identity.contains("flange_class"))
+            fitting["params"]["flange_class"] = to_ojson(identity["flange_class"]);
+        for (const auto& key : piping::fitting_param_keys(ft_type))
+            if (p.contains(key) && !p[key].is_null()) fitting["params"][key] = to_ojson(p[key]);
         for (const char* k : {"standard", "schedule", "material_spec"})
             if (truthy(get(p, k))) fitting[k] = to_ojson(p[k]);
         if (!odoc.contains("fittings") || !odoc["fittings"].is_array())
@@ -369,8 +446,8 @@ json place_fitting_id(const json& gref, const json& doc_context, const json& par
         out["doc"] = from_ojson(odoc);
         return out;
     } catch (const std::exception& e) {
-        return err_env(domain, std::string("add piping fitting failed: ") + e.what(),
-                       "Ensure engine_oracle.piping.schema is importable.");
+        return err_env(domain, std::string("cannot place fitting: ") + e.what(),
+                       "Check the catalog fitting type, NPS and class or reducer size.");
     }
 }
 
@@ -394,7 +471,16 @@ json place_fmu_component(const json& gref, const json& doc_context, const json& 
         ojson odoc = to_ojson(doc_context);
         const std::string comp_id = truthy(get(p, "id")) ? get(p, "id").get<std::string>()
                                                          : hydraulic::next_id(odoc, "c");
-        const std::string comp_type = p.value("type", std::string("pump"));
+        // Catalog identity is authoritative; a type override must agree.
+        const std::string comp_type = component_id_val.substr(0, component_id_val.find(':'));
+        if (!hydraulic::is_component_type(comp_type))
+            return err_env(domain, "Unknown hydraulic component type in catalog id: " +
+                                   component_id_val + ".");
+        for (const char* key : {"type", "component_type"}) {
+            if (p.contains(key) && !p[key].is_null() && p[key] != comp_type)
+                return err_env(domain, "Hydraulic component type conflicts with catalog id: " +
+                                       component_id_val + ".");
+        }
         const double x = p.contains("x") ? to_f(p["x"]) : 0.0;
         const double y = p.contains("y") ? to_f(p["y"]) : 0.0;
         const std::string name = p.value("name", std::string());
@@ -429,8 +515,8 @@ json route(const std::string& kind, const json& gref, const json& doc, const jso
     if (kind == "core_family") return place_core_family(gref, params, seams);
     if (kind == "generate_model") return place_generate_model(gref, doc, params, seams);
     if (kind == "symbol_footprint") return place_symbol_footprint(gref, doc, params);
-    if (kind == "section_profile") return place_section_profile(gref, doc, params);
-    if (kind == "fitting_id") return place_fitting_id(gref, doc, params);
+    if (kind == "section_profile") return place_section_profile(gref, doc, params, seams);
+    if (kind == "fitting_id") return place_fitting_id(gref, doc, params, seams);
     if (kind == "fmu_component") return place_fmu_component(gref, doc, params);
     if (kind == "import_file") return place_import_file(gref, doc, params, seams);
     known = false;
@@ -444,7 +530,7 @@ json part_place(const json& params, const PlaceSeams& seams) {
         return err_env("unknown", "part_place: missing 'part_id'",
                        "Use part_search to discover valid part_ids.");
     const json doc = get(params, "doc");
-    const json place_params = get(params, "params");
+    const json explicit_params = get(params, "params");
 
     // 1. Retrieve the PartRecord (pre-fetched `record` wins; else the seam).
     json record = get(params, "record");
@@ -510,12 +596,60 @@ json part_place(const json& params, const PlaceSeams& seams) {
                            " has no geometry_ref — cannot place.",
                        "This part has no known instantiation recipe.");
     const std::string kind = get_str(gref, "kind");
+    json place_params = get(record, "params").is_object() ? record["params"] : json::object();
+    if (explicit_params.is_object())
+        for (auto it = explicit_params.begin(); it != explicit_params.end(); ++it)
+            place_params[it.key()] = it.value();
+    const bool mechanical = kind == "core_family" || kind == "generate_model" ||
+                            kind == "import_file" ||
+                            ((kind == "section_profile" || kind == "fitting_id") && doc.is_null());
+    if (mechanical) {
+        if (!doc.is_null())
+            return err_env(kind, "Existing target documents are not supported for mechanical part placement.");
+        for (const char* key : {"doc_id", "document_id", "target_doc", "target_doc_id",
+                                "target_document", "target_document_id", "assembly_id"})
+            if ((params.contains(key) && !params[key].is_null()) ||
+                (explicit_params.is_object() && explicit_params.contains(key) &&
+                 !explicit_params[key].is_null()))
+                return err_env(kind, "Existing target documents are not supported for mechanical part placement.");
+        for (const char* key : {"pos", "rotation"}) {
+            if (!place_params.contains(key)) continue;
+            const json& v = place_params[key];
+            if (!v.is_array() || v.size() != 3)
+                return err_env(kind, std::string(key) + " must be an array of three finite numbers.");
+            for (const auto& x : v)
+                if (!x.is_number() || !std::isfinite(x.get<double>()))
+                    return err_env(kind, std::string(key) + " must be an array of three finite numbers.");
+        }
+    }
     bool known = false;
     json result = route(kind, gref, doc, place_params, seams, known);
     if (!known)
         return err_env(record.value("domain", std::string("unknown")),
                        "Unknown geometry_ref kind " + pyutil::py_repr_str(kind) + ".",
                        std::string("Supported kinds: ") + kSupportedKinds);
+    if (mechanical && result.value("ok", false)) {
+        if (!seams.set_catalog_meta)
+            return err_env(kind, "Catalog metadata persistence seam unavailable.");
+        try {
+            json metadata = {{"part_record", record}};
+            if (kind == "core_family" || kind == "section_profile" || kind == "fitting_id") {
+                metadata["geometry_quality"] = "nominal_generated_envelope";
+                metadata["omissions"] = json::array({"certified dimensions, tolerances, material and mechanical properties"});
+                if (get_str(gref, "family") == "shcs") {
+                    metadata["omissions"].push_back("threads");
+                    metadata["omissions"].push_back("socket broach point and corner radii");
+                }
+                result["detail"]["geometry_quality"] = metadata["geometry_quality"];
+                result["detail"]["omissions"] = metadata["omissions"];
+                if (result["detail"].contains("meta"))
+                    metadata["generated"] = result["detail"]["meta"];
+            }
+            seams.set_catalog_meta(result["doc_id"].get<std::string>(), metadata);
+        } catch (const std::exception& e) {
+            return err_env(kind, std::string("Catalog metadata persistence failed: ") + e.what());
+        }
+    }
 
     // 4. Invariant: a successful placement MUST be editable (defensive guard).
     if (result.value("ok", false) && !result.value("editable", false)) {

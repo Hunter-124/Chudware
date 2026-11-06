@@ -45,6 +45,10 @@ struct HitLayout {
 // WndProc sits on top of ImGui's. `layout` must outlive the window (read on the UI thread).
 void install(GLFWwindow* win, HitLayout* layout);
 
+// Callback-maintained window state; no platform/server query on the frame path.
+bool maximized(GLFWwindow* win);
+bool iconified(GLFWwindow* win);
+
 // Per-frame chrome update. No-op on Windows (the WndProc drives drag/resize at the OS
 // level); on Linux/X11 it delegates each grab to the window manager so native snap and
 // maximized tear-off work. Other non-Windows backends retain the manual drag/resize fallback

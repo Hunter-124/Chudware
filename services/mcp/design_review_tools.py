@@ -284,8 +284,7 @@ def _call_direct_check(check_name: str, doc_id: Optional[str]) -> dict[str, Any]
         if doc_id:
             kwargs["doc_id"] = doc_id
 
-        def default_pred(r: dict) -> bool:
-            return bool(r.get("ok", False)) and len(r.get("overlaps", [])) == 0
+        default_pred = _feature_overlap_passed
 
     elif check_name == "dfm":
         module_key = "intake"
@@ -318,6 +317,13 @@ def _call_direct_check(check_name: str, doc_id: Optional[str]) -> dict[str, Any]
         return {"status": "unavailable", "reason": f"backend unavailable: {exc}"}
 
     return _invoke_tool(check_name, tool_fn, kwargs, default_pred)
+
+
+def _feature_overlap_passed(r: dict) -> bool:
+    """A complete, empty tool-space report is the only unflagged overlap check."""
+    return (r.get("ok") is True and r.get("complete") is True
+            and isinstance(r.get("pairs"), list) and not r["pairs"]
+            and isinstance(r.get("dead_features"), list) and not r["dead_features"])
 
 
 def _interface_check_passed(r: dict) -> bool:
@@ -356,8 +362,7 @@ def _call_with_override(
         except Exception:
             default_pred = lambda r: bool(r.get("ok", True))  # noqa: E731
     elif check_name == "feature_overlap":
-        def default_pred(r: dict) -> bool:
-            return bool(r.get("ok", False)) and len(r.get("overlaps", [])) == 0
+        default_pred = _feature_overlap_passed
     elif check_name == "dfm":
         def default_pred(r: dict) -> bool:  # type: ignore[misc]
             return bool(r.get("ok", False)) and int(r.get("violations", 1)) == 0
@@ -391,8 +396,17 @@ def _invoke_tool(
     else:
         return {"status": "error", "reason": f"unexpected return type: {type(raw).__name__}", "passed": False}
 
-    if not result.get("ok", True):
-        tool_err = result.get("reason") or result.get("error") or "tool_error"
+    # A complete overlap report can have ok:false solely for the legacy
+    # boss_swallowed tool-inclusion classification, not a failed RPC.
+    overlap_finding = (check_name == "feature_overlap"
+                       and result.get("complete") is True
+                       and result.get("basis") == "pre_boolean_tool_intersection"
+                       and isinstance(result.get("pairs"), list)
+                       and isinstance(result.get("dead_features"), list))
+    if not result.get("ok", True) and not overlap_finding:
+        tool_err = result.get("reason") or result.get("error") or result.get("summary") or "tool_error"
+        if check_name == "feature_overlap":
+            tool_err += " — " + _feature_overlap_detail(result)
         return {"status": "error", "reason": tool_err, "passed": False, "result": result}
 
     try:
@@ -413,7 +427,7 @@ _CHECK_LABELS: dict[str, str] = {
     "interface_check": "Interface alignment (holes/coaxiality/contact/fastener)",
     "erc":             "ERC (electrical rule check)",
     "drc":             "DRC (design rule check)",
-    "feature_overlap": "Feature overlap (own-part collision)",
+    "feature_overlap": "Feature tool overlap (raw tool-space diagnostic)",
     "dfm":             "DFM (design for manufacturing)",
     "firmware":        "Firmware simulation assertions",
     "dc_ratio":        "Structural DC-ratio",
@@ -444,6 +458,7 @@ def _narrate(
 
     pass_count = 0
     fail_count = 0
+    advisory_count = 0
     skip_count = 0
     unavail_count = 0
     caveats: list[str] = []
@@ -477,6 +492,12 @@ def _narrate(
                 detail = _check_detail_pass(check_name, result)
                 lines.append(f"  ✓ {label}: PASS{(' — ' + detail) if detail else ''}")
                 pass_count += 1
+            elif check_name == "feature_overlap":
+                detail = _check_detail_fail(check_name, result)
+                lines.append(f"  ! {label}: ADVISORY — {detail}")
+                caveats.append("Inspect geometry and feature history; tool-space findings "
+                               "do not establish a material or editability defect.")
+                advisory_count += 1
             else:
                 detail = _check_detail_fail(check_name, result)
                 lines.append(f"  ✗ {label}: FAIL{(' — ' + detail) if detail else ''}")
@@ -507,20 +528,23 @@ def _narrate(
 
     # Overall verdict
     lines.append("")
-    checked = pass_count + fail_count
+    checked = pass_count + fail_count + advisory_count
     if checked == 0:
         overall = "NO CHECKS RAN"
-    elif fail_count == 0 and unavail_count == 0:
+    elif fail_count == 0 and unavail_count == 0 and advisory_count == 0:
         overall = "PASS"
     elif fail_count > 0:
         overall = "FAIL"
-    else:
+    elif unavail_count:
         overall = "PARTIAL (some backends unavailable)"
+    else:
+        overall = "PARTIAL (feature tool findings require inspection)"
 
     lines.append(f"Overall: {overall}")
+    advisory_text = f"{advisory_count} advisory, " if advisory_count else ""
     lines.append(
         f"  {pass_count} passed, {fail_count} failed, "
-        f"{skip_count} skipped, {unavail_count} unavailable  "
+        f"{advisory_text}{skip_count} skipped, {unavail_count} unavailable  "
         f"(elapsed: {elapsed_ms / 1000:.1f}s)"
     )
 
@@ -539,6 +563,24 @@ def _narrate(
     )
 
     return "\n".join(lines)
+
+
+def _feature_overlap_detail(result: dict) -> str:
+    pairs = result.get("pairs")
+    dead = result.get("dead_features")
+    pair_count = str(len(pairs)) if isinstance(pairs, list) else "unavailable"
+    dead_count = str(len(dead)) if isinstance(dead, list) else "unavailable"
+    completeness = "complete" if result.get("complete") is True else "incomplete"
+    if result.get("complete") is not True:
+        unavailable = result.get("unavailable_features")
+        failed = result.get("failed_pairs")
+        unavailable_count = str(len(unavailable)) if isinstance(unavailable, list) else "unavailable"
+        failed_count = str(len(failed)) if isinstance(failed, list) else "unavailable"
+        completeness += (f", {unavailable_count} unavailable feature(s), "
+                         f"{failed_count} failed pair check(s)")
+    return (f"{pair_count} pre-boolean tool intersection pair(s), {dead_count} feature(s) "
+            f"without surviving owned faces; {completeness}; tool intersections do not "
+            "measure material removal  (source: check_feature_overlap)")
 
 
 def _check_detail_pass(check_name: str, result: dict) -> str:
@@ -582,8 +624,7 @@ def _check_detail_pass(check_name: str, result: dict) -> str:
             return f"unit_cost=${float(cost):.2f}  (source: bom_price)"
         return "(source: bom_price)"
     if check_name == "feature_overlap":
-        n = len(result.get("overlaps", []))
-        return f"0 overlapping features  (source: check_feature_overlap)"
+        return _feature_overlap_detail(result)
     if check_name == "dfm":
         v = result.get("violations", 0)
         return f"{v} DFM violation(s)  (source: dfm_check)"
@@ -644,8 +685,7 @@ def _check_detail_fail(check_name: str, result: dict) -> str:
             return f"unit_cost=${float(cost):.2f}  (source: bom_price)"
         return "cost resolution failed  (source: bom_price)"
     if check_name == "feature_overlap":
-        items = result.get("overlaps", [])
-        return f"{len(items)} overlap(s) detected  (source: check_feature_overlap)"
+        return _feature_overlap_detail(result)
     if check_name == "dfm":
         v = result.get("violations", "?")
         return f"{v} DFM violation(s)  (source: dfm_check)"

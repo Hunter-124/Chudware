@@ -1,9 +1,8 @@
 """Turn decoding, the fixed mandatory denominator, and ERROR-vs-FAIL classification.
 
-The decoding fixture pairs a REAL run_mission event log (trimmed from
-scratch/mission-sessions/smoke6axis4.events.jsonl) with a ``--result-json`` record in the
-current ``agent_admin_turn`` response shape (services/agent/worker_rpc.py: ``turn.result``
-is terminal TEXT; usage/persistence ride on the response). No engine needed here.
+The recorded event log and session are historical evidence from a real run. The
+result fixture migrates its session binding field names to the OMP contract; it
+does not represent an OMP execution. No engine is needed here.
 """
 from __future__ import annotations
 
@@ -39,7 +38,7 @@ def test_recorded_current_format_reply_decodes_as_completed():
     assert "deliverable.step+" in t.text  # terminal text, not a dict
     assert t.usage["total_tokens"] == 56339
     assert t.persistence["errors"] == []
-    assert t.chudcode_session_file.endswith(".jsonl")
+    assert t.omp_session_file.endswith(".jsonl")
 
 
 def test_recorded_event_log_digest():
@@ -109,7 +108,7 @@ def test_recorded_session_usage_and_price(tmp_path):
                 r["response"]["turn"].update(cancelled=True, stop_reason="cancelled")),
      Status.ERROR, "cancelled"),
     (lambda r: r["response"]["turn"].update(terminal=None),
-     Status.ERROR, "terminal"),
+     Status.ERROR, "settlement"),
     (lambda r: r.update(verdict="no_output", provider_error="401 unauthorized"),
      Status.ERROR, "no assistant output"),
     (lambda r: r.update(verdict="no_output"), Status.FAIL, "no assistant output"),

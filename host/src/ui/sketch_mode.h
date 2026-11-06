@@ -13,6 +13,7 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -26,6 +27,7 @@
 struct AppState;
 class Renderer;
 struct Vec3;   // ../math.h — only used by-reference in signatures here (full def in the .cpp)
+namespace core { struct OpsResponse; }
 
 namespace ui {
 
@@ -85,6 +87,7 @@ struct SketchConstraint {
     bool hasExpr = false;
     std::string expr;
     bool driven = false;
+    bool automatic = false;           // soft auto-definition, superseded by explicit intent
     bool hasPlacement = false;
     float placement[2] = {0, 0};      // [u,v] annotation anchor (sketch coords)
     bool hasMeasured = false;
@@ -116,12 +119,22 @@ struct SketchEntity {
     float width = 0;                        // slot/arc_slot
     float rx = 0, ry = 0, rot = 0;          // ellipse (rot in degrees)
     std::vector<ImVec2> pts;                // spline solved through-points
+    // Curve cache lives with the entity; source equality guards hash collisions.
+    mutable uint64_t splineHash = 0;
+    mutable std::vector<ImVec2> splineControls, splineSamples;
 };
 
 class SketchMode {
 public:
     bool active() const { return active_; }
     const std::string& sketchId() const { return fid_; }
+    // Global sketch defaults (Settings::sketchShowGrid / sketchAutoRelations). Applied once when a
+    // document's SketchMode is created; from then on each document keeps its own live value, and a
+    // toggle in the sketch context menu writes the new default back to Settings.
+    void applyPreferences(bool showGrid, bool autoAlignRelations) {
+        showGrid_ = showGrid;
+        autoAlignRelations_ = autoAlignRelations;
+    }
 
     // Enter/exit. enterForFeature opens an existing sketch feature (tree "Edit Sketch");
     // enterNewOnSelection creates a new sketch on the selected planar face/datum (or plane.top)
@@ -285,6 +298,18 @@ public:
     // offset = (click - copy-origin), keeping the pasted set's internal relations. Esc cancels the
     // placement. All are no-ops without an active sketch / selection / matching clipboard.
     bool sketchHasSelection() const;          // at least one entity selected (Ctrl+C is meaningful)
+    // Selection eligible for immediate entity operations; virtual refs are not entities.
+    bool hasEditableSelection() const {
+        if (!active_) return false;
+        for (const auto& selected : selIds_) {
+            const auto end = selected.find('.');
+            const auto length = end == std::string::npos ? selected.size() : end;
+            for (const auto& entity : ents_)
+                if (entity.id.size() == length && selected.compare(0, length, entity.id) == 0)
+                    return true;
+        }
+        return false;
+    }
     bool sketchCopySelection(AppState& st);   // selection -> st.clipboard (entities bundle)
     bool sketchPasteBegin(AppState& st);      // arm paste-placement from a SketchEntities clipboard
     // Datum plane (0=front 1=top 2=right) clicked in the tree while Smart Dimension is armed:
@@ -295,6 +320,7 @@ private:
     // ---- worker round-trips ----
     bool callSketch(AppState& st, const char* method, const nlohmann::json& extra,
                     nlohmann::json& result);
+    core::OpsResponse applySketchOps(AppState& st, const nlohmann::json& ops, bool coalesce = false);
     // C50f: read-only over-define pre-flight (sketch_probe RPC). `action` is the exact action
     // object from worker_rpc.md §2 ({"add_constraint":{…}} / {"set_dim":{…}} / {"delete_constraint":{…}}).
     // On success fills `would_over_define` (+ conflicting/redundant of the probe) and returns true;
@@ -500,6 +526,7 @@ private:
     std::unordered_map<std::string, size_t> entIndex_;
     size_t entitiesRevision_ = 0;
     nlohmann::json entitiesSnapshot_;
+    mutable std::vector<ImVec2> boundaryScratch_, projectedScratch_;
     bool regionsDirty_ = true;
     std::vector<SketchConstraint> cons_;   // C37-D: every constraint (drives dim annotations)
     // C37-D: locally-remembered placements for dims whose engine placement is null, so a freshly
@@ -508,6 +535,9 @@ private:
 
     // C37-D: cancel checkpoint taken at sketch entry; doc_revert on the confirmation-corner ✗.
     std::string cancelCheckpoint_;
+    long cancelRevision_ = -1;
+    uint64_t sketchSessionId_ = 0;
+    long sketchRevision_ = -1;
 
     // C37-D: plane-pick (SolidWorks "select a plane to start") state. Driven by drawOverlay while
     // st.sketchPlanePickActive; -1 = no origin-plane hovered, else 0/1/2 = front/top/right.
@@ -604,6 +634,7 @@ private:
     };
     std::vector<RelationModelRef> relModelRefs_;
     std::string relModelKey_;
+    std::string relModelInputScratch_;
     void beginRelations(AppState& st);
     void refreshRelationModelRefs(AppState& st);
     void drawAddRelations(AppState& st, bool& escHandled);
@@ -744,6 +775,7 @@ private:
     struct RelationBadge {
         std::string cid, type;
         ImVec2 pos, anchor;
+        bool automatic = false;
     };
     std::vector<RelationBadge> relationBadges_;
     size_t badgesRevision_ = size_t(-1);

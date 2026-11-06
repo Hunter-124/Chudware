@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 from services import worker_activity as activity
-from services.agent import chudcode_host as hosts
+from services.agent import omp_host as hosts
 from services.agent import request_context as rc
 
 
@@ -58,16 +58,17 @@ class SdkState:
         self._state_lock = threading.Lock()
         self._event_condition = threading.Condition()
         self._pending = {}
+        self._request_id = 0
         self._pending_prompt_ids = set()
         self._pending_host_tool_calls = {}
         self._pending_host_uri_requests = {}
         self.state = {"isStreaming": False, "isCompacting": False,
                       "hasPendingAsyncWork": False, "isSettled": True,
                       "queuedMessageCount": 0}
-        self.stt = {"state": "idle", "available": True}
         self.gate = None
         self.entered = threading.Event()
         self.calls = []
+        self.listeners = []
         self.closed = 0
         self._chudware_activity_owner = None
         if process is not None:
@@ -76,6 +77,21 @@ class SdkState:
             self._chudware_activity_sdk_argv = tuple(process.args)
             self._chudware_activity_sandboxed = False
 
+    def _next_request_id(self):
+        with self._state_lock:
+            self._request_id += 1
+            return f"req_{self._request_id}"
+
+    def _request_with_id(self, method, request_id, payload):
+        assert method == "get_state" and payload == {}
+        with self._state_lock:
+            self._pending[request_id] = SimpleNamespace(command=method)
+        try:
+            return self._request(method)
+        finally:
+            with self._state_lock:
+                self._pending.pop(request_id, None)
+
     def _request(self, method):
         self.calls.append(method)
         if self.gate is not None:
@@ -83,21 +99,26 @@ class SdkState:
             self.gate.wait(3)
         if method == "get_state":
             return dict(self.state)
-        if method == "stt_status":
-            if isinstance(self.stt, Exception):
-                raise self.stt
-            return dict(self.stt)
         raise AssertionError("unexpected SDK command")
+
+    def on_notification(self, listener):
+        self.listeners.append(listener)
+        return lambda: self.listeners.remove(listener)
+
+    def notify(self, event):
+        for listener in tuple(self.listeners):
+            listener(event)
 
     def stop(self):
         self.closed += 1
 
 
 def install_host(monkeypatch, client):
-    host = hosts.ChudcodeSessionHost(client_factory=lambda **kw: client)
+    hosts._install_sdk_activity_listener(client)
+    host = hosts.OmpSessionHost(client_factory=lambda **kw: client)
     host._sessions["persistent"] = hosts._Session(
         session_id="persistent", client=client, resume_file=None, workspace_dir=None)
-    monkeypatch.setattr(hosts, "_DEFAULT_CHUDCODE_HOST", host)
+    monkeypatch.setattr(hosts, "_DEFAULT_OMP_HOST", host)
     monkeypatch.setattr(activity, "_REGISTRIES", (hosts.__name__,))
     return host
 
@@ -112,8 +133,8 @@ def test_true_idle_does_not_start_or_import_subsystems(isolated, tmp_path):
 
     isolated.setattr(activity, "_REGISTRIES", (
         hosts.__name__, embed.__name__, live_client.__name__, jobs.__name__))
-    isolated.setattr(hosts, "_DEFAULT_CHUDCODE_HOST", None)
-    isolated.setattr(hosts, "get_default_chudcode_host", forbidden)
+    isolated.setattr(hosts, "_DEFAULT_OMP_HOST", None)
+    isolated.setattr(hosts, "get_default_omp_host", forbidden)
     isolated.setattr(embed, "_MANAGER", None)
     isolated.setattr(embed, "get_manager", forbidden)
     isolated.setattr(live_client, "_MANAGER", None)
@@ -131,7 +152,7 @@ def test_idle_persistent_sdk_session_is_not_a_job(isolated):
     client = SdkState()
     install_host(isolated, client)
     assert activity.snapshot() == {"ok": True, "active": 0, "by_kind": {}, "complete": True}
-    assert client.calls == ["get_state", "stt_status"]
+    assert client.calls == ["get_state"]
     assert client.closed == 0
 
 
@@ -164,32 +185,118 @@ def test_absent_raw_sdk_state_is_unknown_not_typed_false_default(isolated, field
     assert client.closed == 0
 
 
-def test_stt_and_pending_cancel_remain_active_until_real_completion(isolated):
+def test_dictation_and_pending_cancel_remain_active_until_real_completion(isolated):
     client = SdkState()
     install_host(isolated, client)
-    for state in ("recording", "transcribing"):
-        client.stt["state"] = state
+    # The current protocol reports dictation via notifications, not stt_status.
+    # A start request also remains work while its recording preflight is pending.
+    client._pending["capture-start"] = SimpleNamespace(command="dictation_start")
+    assert activity.snapshot()["by_kind"]["sdk_pending_calls"] == 1
+    for state in ("starting", "recording", "transcribing"):
+        client.notify({"type": "dictation_state", "captureId": "capture", "state": state})
         assert activity.snapshot()["by_kind"]["sdk_stt"] == 1
-    client.stt["state"] = "idle"
+    client._pending.clear()
+    client.notify({"type": "dictation_transcript", "captureId": "capture", "text": "partial"})
+    assert activity.snapshot()["by_kind"]["sdk_stt"] == 1
     cancel = threading.Event()
     cancel.set()
     client._pending_host_tool_calls["cancelled-but-live"] = SimpleNamespace(cancel_event=cancel)
     assert activity.snapshot()["by_kind"]["sdk_pending_calls"] == 1
+    client.notify({"type": "dictation_end", "captureId": "capture", "text": "partial"})
+    assert activity.snapshot()["by_kind"] == {"sdk_pending_calls": 1}
     client._pending_host_tool_calls.clear()
     assert activity.snapshot()["active"] == 0
+    assert set(client.calls) == {"get_state"}
+
+
+def test_pending_prompt_and_cancelled_uri_count_until_they_settle(isolated):
+    client = SdkState()
+    install_host(isolated, client)
+    client._pending_prompt_ids.add("accepted-prompt")
+    cancelled = threading.Event()
+    cancelled.set()
+    client._pending_host_uri_requests["uri"] = SimpleNamespace(cancel_event=cancelled)
+    assert activity.snapshot()["by_kind"] == {"sdk_pending_calls": 2}
+    client._pending_prompt_ids.remove("accepted-prompt")
+    assert activity.snapshot()["by_kind"] == {"sdk_pending_calls": 1}
+    client._pending_host_uri_requests.clear()
+    assert activity.snapshot()["active"] == 0
+
+
+def test_dictation_events_are_observed_before_sdk_start_returns(isolated):
+    class EarlySdk(SdkState):
+        def start(self):
+            self.notify(SimpleNamespace(
+                type="dictation_state", capture_id="capture", state="starting"))
+
+    client = EarlySdk()
+    hosts._start_client(client)
+    install_host(isolated, client)
+    assert len(client.listeners) == 1
+    assert activity.snapshot()["by_kind"] == {"sdk_stt": 1}
+    client.notify(SimpleNamespace(
+        type="dictation_transcript", capture_id="capture", text="partial"))
+    assert activity.snapshot()["by_kind"] == {"sdk_stt": 1}
+    client.notify(SimpleNamespace(type="dictation_end", capture_id="capture", text="final"))
+    assert activity.snapshot()["active"] == 0
+    assert set(client.calls) == {"get_state"}
+
+
+def test_malformed_dictation_terminal_cannot_claim_idle(isolated):
+    client = SdkState()
+    install_host(isolated, client)
+    client.notify({"type": "dictation_state", "captureId": "capture", "state": "recording"})
+    # The SDK wraps frames that fail typed decoding as unknown notifications.
+    client.notify(SimpleNamespace(
+        type="unknown", payload={"type": "dictation_end", "captureId": "capture", "text": 7},
+        parse_error="invalid transcript",
+    ))
+    result = activity.snapshot()
+    assert not result["complete"]
+    assert result["reason"] == "sdk_unattested"
+    assert result["by_kind"] == {"sdk_stt": 1}
+    client.notify({"type": "dictation_end", "captureId": "capture", "text": "final"})
+    assert not activity.snapshot()["complete"]
+
+
+def test_missing_dictation_observer_preserves_known_runtime_work(isolated):
+    client = SdkState()
+    client.on_notification = None
+    client.state["hasPendingAsyncWork"] = True
+    install_host(isolated, client)
+    result = activity.snapshot()
+    assert not result["complete"]
+    assert result["reason"] == "sdk_unattested"
+    assert result["by_kind"] == {"sdk_runtime": 1}
 
 
 def test_partial_sdk_evidence_keeps_known_background_count(isolated):
     client = SdkState()
     client.state["hasPendingAsyncWork"] = True
-    client.stt = RuntimeError("private transport detail must not escape")
+    client.state.pop("isSettled")
     install_host(isolated, client)
     result = activity.snapshot()
     assert not result["ok"] and not result["complete"]
     assert result["by_kind"]["sdk_runtime"] == 1
     assert result["active"] == 1
     assert result["reason"] == "sdk_unattested"
+    assert client.closed == 0
+
+
+def test_sdk_transport_failure_preserves_pending_work_without_leaking_details(isolated):
+    client = SdkState()
+    client._pending_host_uri_requests["live"] = SimpleNamespace(cancel_event=threading.Event())
+    def failed_request(method):
+        client.calls.append(method)
+        raise RuntimeError("private transport detail")
+    client._request = failed_request
+    install_host(isolated, client)
+    result = activity.snapshot()
+    assert not result["complete"]
+    assert result["reason"] == "sdk_unattested"
+    assert result["by_kind"] == {"sdk_pending_calls": 1}
     assert "private" not in str(result)
+    assert client.calls == ["get_state"]
 
 
 def test_sdk_census_timeout_is_single_flight_and_does_not_close_client(isolated):
@@ -215,13 +322,16 @@ def test_sdk_census_timeout_is_single_flight_and_does_not_close_client(isolated)
 
 
 def test_real_queued_active_question_wait_and_pending_cancel_are_counted(isolated):
-    from services.agent.test_chudcode_host import FakeClient, FakeFactory
+    from services.agent.test_omp_host import FakeBridge, FakeClient, FakeFactory
 
     factory = FakeFactory(block=True)
     client = FakeClient(factory)
     factory.clients.append(client)
+    client._omp_bridge = FakeBridge(None, lambda *_args: None)
+    client._omp_bridge.client = client
     sdk = SdkState()
-    client._request = sdk._request
+    client._next_request_id = sdk._next_request_id
+    client._request_with_id = sdk._request_with_id
     for name in ("_state_lock", "_event_condition", "_pending", "_pending_prompt_ids",
                  "_pending_host_tool_calls", "_pending_host_uri_requests"):
         setattr(client, name, getattr(sdk, name))
@@ -263,7 +373,7 @@ def test_real_queued_active_question_wait_and_pending_cancel_are_counted(isolate
         assert activity.snapshot()["by_kind"]["agent_runs"] == 1
         session.turn_lock.release()
         reserved_lock = False
-        assert client.prompted.wait(1)
+        assert client.prompted.wait(1), output.get("turn")
         assert activity.snapshot()["by_kind"]["agent_runs"] == 1
         questions = host._runs["turn"].questions
         assert questions is not None
@@ -444,7 +554,6 @@ def test_superseded_or_evicted_parts_search_threads_remain_counted(isolated):
     from services.parts import gui_rpc as parts
     isolated.setattr(parts, "_live_jobs", {})
     isolated.setattr(parts, "_live_threads", {})
-    isolated.setattr(parts, "_thumb_futures", {})
     isolated.setattr(parts, "_login_threads", {})
     isolated.setattr(parts, "_health_thread", None)
     isolated.setattr(parts, "_LIVE_JOB_CAP", 1)
@@ -469,35 +578,37 @@ def test_superseded_or_evicted_parts_search_threads_remain_counted(isolated):
 
 
 def test_running_thumbnail_after_batch_timeout_is_not_lost(isolated):
-    from services.parts import gui_rpc as parts
+    from services.parts import gui_rpc as parts, thumbs
     isolated.setattr(parts, "_live_jobs", {})
     isolated.setattr(parts, "_live_threads", {})
-    isolated.setattr(parts, "_thumb_futures", {})
+    isolated.setattr(thumbs, "_futures", {})
     isolated.setattr(parts, "_login_threads", {})
     isolated.setattr(parts, "_health_thread", None)
-    isolated.setattr(parts, "_thumb_cached", lambda item: None)
-    isolated.setattr(parts, "_thumb_batch_budget_s", lambda: 0.02)
+    isolated.setattr(thumbs, "batch_budget_s", lambda: 0.02)
+    isolated.setattr(thumbs, "_network_allowed", lambda: False)
     finish = threading.Event()
     entered = threading.Event()
-    def thumbnail(*args):
+    def thumbnail(item_id, *args):
         entered.set()
         finish.wait(3)
-        return {"ok": True, "image_b64": ""}
-    isolated.setattr(parts, "_thumb_produce", thumbnail)
-    executor_type = parts.ThreadPoolExecutor
+        return thumbs._result(item_id, reason="no_preview")
+    isolated.setattr(thumbs, "_resolve_one", thumbnail)
+    executor_type = thumbs.ThreadPoolExecutor
     class StartingExecutor(executor_type):
         def submit(self, *args, **kwargs):
             future = super().submit(*args, **kwargs)
             assert entered.wait(2)
             return future
-    isolated.setattr(parts, "ThreadPoolExecutor", StartingExecutor)
+    isolated.setattr(thumbs, "ThreadPoolExecutor", StartingExecutor)
     try:
         response = parts._parts_thumbnails({"items": [{"item_id": "part"}]}, lambda e: None)
         assert response["images"][0]["reason"] == "timeout"
         assert parts.worker_activity()["by_kind"]["parts_thumbnails"] == 1
     finally:
         finish.set()
-        for future in tuple(parts._thumb_futures):
+        with thumbs._futures_lock:
+            futures = list(thumbs._futures)
+        for future in futures:
             future.result(timeout=2)
     assert parts.worker_activity()["by_kind"]["parts_thumbnails"] == 0
 
@@ -571,7 +682,7 @@ def test_scrape_reservations_and_cancel_pending_work_remain_owned(isolated):
         assert queue.worker_activity()["by_kind"] == {"scrape_jobs": 0}
 
 
-def test_actual_scrape_executor_is_idle_only_after_job_publication(isolated):
+def test_actual_scrape_executor_is_idle_only_after_job_publication(isolated, tmp_path):
     from services.browser import adapters, queue
     isolated.setattr(activity, "_REGISTRIES", (queue.__name__,))
     isolated.setattr(queue, "_jobs", [])
@@ -612,6 +723,10 @@ def test_actual_scrape_executor_is_idle_only_after_job_publication(isolated):
             failures.append(exc)
 
     isolated.setattr(queue, "_worker_loop", owned_worker)
+    artifact = tmp_path / "completed.step"
+    artifact.write_text("ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\nENDSEC;\n"
+                        "END-ISO-10303-21;\n")
+
 
     class Adapter:
         def search(self, query):
@@ -621,7 +736,8 @@ def test_actual_scrape_executor_is_idle_only_after_job_publication(isolated):
             return [{"ok": True}]
 
         def acquire(self, hit):
-            return {"ok": True, "artifact_path": "completed.step+"}
+            return {"ok": True, "artifact_path": str(artifact),
+                    "artifact_kind": "cad", "format": "step"}
 
     isolated.setattr(adapters, "get_adapter", lambda site: Adapter())
     run_job = queue._run_job
@@ -763,27 +879,27 @@ def test_background_registry_lock_contention_returns_unknown_without_blocking(is
             census.join(1)
 
 
-def test_sdk_partial_state_is_retained_while_stt_query_is_still_pending(isolated):
+def test_sdk_partial_evidence_includes_late_events_during_blocked_state_query(isolated):
     client = SdkState()
-    client.state["hasPendingAsyncWork"] = True
-    original_request = client._request
-    finish = threading.Event()
-    entered = threading.Event()
-    def request(method):
-        if method == "stt_status":
-            entered.set()
-            finish.wait(3)
-        return original_request(method)
-    client._request = request
+    client.gate = threading.Event()
     host = install_host(isolated, client)
     try:
         result = activity.snapshot()
-        assert entered.is_set()
-        assert not result["complete"] and result["active"] == 1
-        assert result["by_kind"] == {"sdk_runtime": 1}
+        assert client.entered.is_set()
+        assert not result["complete"] and result["active"] == 0
+        # These arrive after the single-flight get_state started. The census's
+        # own pending request must not be counted as user work.
+        client.notify({"type": "dictation_state", "captureId": "capture", "state": "starting"})
+        client.notify({"type": "dictation_transcript", "captureId": "capture", "text": "partial"})
+        with client._state_lock:
+            client._pending["capture-start"] = SimpleNamespace(command="dictation_start")
+        result = activity.snapshot()
+        assert not result["complete"] and result["active"] == 2
+        assert result["by_kind"] == {"sdk_pending_calls": 1, "sdk_stt": 1}
+        assert client.calls == ["get_state"]
         assert client.closed == 0
     finally:
-        finish.set()
+        client.gate.set()
         for probe in tuple(host._activity_probes.values()):
             assert probe.done.wait(2)
 

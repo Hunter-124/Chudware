@@ -90,12 +90,12 @@ class TestOringsAdapter:
         assert codes == {"nbr", "fkm", "silicone", "epdm"}
 
     def test_designations_findable_by_common_forms(self):
-        """The -014 record's title must contain every common way a user types
-        this dash number: '2-014' (Parker/industry prefix), '-014', 'AS568-014'."""
+        """Common dash-number forms remain available to search."""
         rec = self.adapter.get("seal:AS568-014:nbr")
-        title = rec["title"].lower()
+        searchable = " ".join([rec["title"], *rec["aliases"]]).lower()
         for needle in ("2-014", "-014", "as568-014", "o-ring", "oring"):
-            assert needle in title, f"{needle!r} missing from title {title!r}"
+            assert needle in searchable
+            assert rec in self.adapter.search(needle)
 
 
 # ---------------------------------------------------------------------------
@@ -191,9 +191,10 @@ class TestExtrusionAdapter:
         assert rec is not None
         assert rec["params"]["width_mm"] == 20
         assert rec["params"]["height_mm"] == 20
-        title = rec["title"].lower()
+        searchable = " ".join([rec["title"], *rec["aliases"]]).lower()
         for needle in ("2020", "t-slot", "8020", "80/20", "aluminum"):
-            assert needle in title
+            assert needle in searchable
+            assert rec in self.adapter.search(needle)
 
     def test_moment_of_inertia_present_and_positive(self):
         for rec in self.adapter.iter_records():

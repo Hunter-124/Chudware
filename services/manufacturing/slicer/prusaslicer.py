@@ -13,11 +13,14 @@ import platform
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from ..print_safety import (UnsafePrintFile, atomic_print_output, validate_output_path,
+                            validate_print_bytes, validate_print_filename)
 from .contract import SliceRefusal
 from .sidecar import _communicate_bounded, _ProcessLimitError
 from .vendor_bundle import _META, write_ini
@@ -161,10 +164,16 @@ def discover(environ=None) -> SlicerInstall | SliceRefusal:
 
 def run_cli(install: SlicerInstall, args: list[str], *, work_dir: Path,
             grant_dirs: list[Path], timeout_s=600) -> CliOutcome:
-    work_dir = Path(work_dir).resolve()
-    work_dir.mkdir(parents=True, exist_ok=True)
-    datadir = work_dir / 'datadir'
-    datadir.mkdir(exist_ok=True)
+    try:
+        work_dir = validate_output_path(work_dir)
+        datadir = validate_output_path(work_dir / 'datadir')
+        if os.name == 'nt':
+            stdout_log = validate_output_path(work_dir / 'stdout.log')
+            stderr_log = validate_output_path(work_dir / 'stderr.log')
+        work_dir.mkdir(parents=True, exist_ok=True)
+        datadir.mkdir(exist_ok=True)
+    except (OSError, ValueError) as exc:
+        return CliOutcome(False, -1, '', str(exc), [], [])
     prefix = list(install.argv_prefix)
     if install.kind == 'flatpak':
         grants = sorted({str(Path(p).resolve()) for p in [work_dir, *grant_dirs]})
@@ -175,7 +184,7 @@ def run_cli(install: SlicerInstall, args: list[str], *, work_dir: Path,
         if os.name == 'nt':
             # Windows anonymous pipes cannot be selected by DefaultSelector.
             # Capture to files to avoid unbounded in-memory communicate buffers.
-            with (work_dir / 'stdout.log').open('wb') as out, (work_dir / 'stderr.log').open('wb') as err:
+            with atomic_print_output(stdout_log) as out, atomic_print_output(stderr_log) as err:
                 process = subprocess.Popen(cmd, stdout=out, stderr=err, cwd=work_dir, env=_env(),
                                            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
                 deadline = time.monotonic() + timeout_s
@@ -193,8 +202,8 @@ def run_cli(install: SlicerInstall, args: list[str], *, work_dir: Path,
                     time.sleep(0.05)
                 if out.tell() > 8 * 1024 * 1024 or err.tell() > 8 * 1024 * 1024:
                     return CliOutcome(False, -1, '', 'slicer_output_limit', [], cmd)
-            stdout = (work_dir / 'stdout.log').read_bytes()
-            stderr = (work_dir / 'stderr.log').read_bytes()
+            stdout = stdout_log.read_bytes()
+            stderr = stderr_log.read_bytes()
         else:
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                        cwd=work_dir, env=_env(), start_new_session=True)
@@ -259,13 +268,36 @@ def slice_mesh(install: SlicerInstall, *, mesh_paths: list[Path], config: dict[s
     coordinates it was written with (plates laid out by ``plate.plan_plate``). With
     ``complete_objects = 1`` PrusaSlicer prints the objects in argument order."""
     started = time.monotonic()
-    work_dir = Path(work_dir).resolve()
-    output_gcode = Path(output_gcode).resolve()
     mesh_paths = [Path(p).resolve() for p in mesh_paths]
-    config_path = work_dir / 'config.ini'
     def refused(code, message):
         return SliceRun(False, None, None, None, [], [], '', '', time.monotonic() - started,
                         SliceRefusal(code, message))
+    try:
+        work_dir = validate_output_path(work_dir)
+        output_gcode = Path(output_gcode)
+        validate_print_filename(output_gcode.name)
+        output_gcode = validate_output_path(output_gcode)
+        config_path = validate_output_path(work_dir / 'config.ini')
+        validate_output_path(work_dir / 'datadir')
+        if export_3mf is not None:
+            if Path(export_3mf).suffix.lower() != '.3mf':
+                raise UnsafePrintFile('The review project must use a .3mf filename, never a firmware filename.')
+            export_3mf = validate_output_path(export_3mf)
+        for path in (output_gcode, config_path, export_3mf):
+            if path is not None and path.is_dir():
+                raise UnsafePrintFile(f'Output path is a directory: {path}')
+        if os.name == 'nt':
+            validate_output_path(work_dir / 'stdout.log')
+            validate_output_path(work_dir / 'stderr.log')
+        for key, value in config.items():
+            if key.endswith('_gcode'):
+                validate_print_bytes(str(value).replace(r'\n', '\n').replace(r'\r', '\r').encode('utf-8'))
+    except (UnsafePrintFile, OSError) as exc:
+        return refused('unsafe_print_file', str(exc))
+    if str(config.get('post_process', '')).strip().strip('"').strip():
+        return refused('unsafe_post_process',
+                       'Print slicing cannot run post-processing scripts that can write or load firmware. '
+                       'Remove post_process from the preset or overrides.')
     if not mesh_paths or copies < 1 or int(copies) != copies:
         return refused('invalid_slice_input', 'Provide mesh paths and a positive integer copies count.')
     if any(not p.is_file() for p in mesh_paths):
@@ -286,6 +318,8 @@ def slice_mesh(install: SlicerInstall, *, mesh_paths: list[Path], config: dict[s
     try:
         # Force text G-code: verification cannot read the binary container.
         write_ini({**config, 'binary_gcode': '0'}, config_path)
+    except UnsafePrintFile as exc:
+        return refused('unsafe_print_file', str(exc))
     except ValueError as exc:
         return refused('invalid_config', str(exc))
     transforms = ['--ensure-on-bed']
@@ -304,24 +338,42 @@ def slice_mesh(install: SlicerInstall, *, mesh_paths: list[Path], config: dict[s
         transforms += ['--duplicate', str(copies)]
     common = ['--load', str(config_path), '--threads', '2', '--loglevel', '2', *transforms]
     grants = [p.parent for p in mesh_paths] + [output_gcode.parent]
-    outcome = run_cli(install, [*common, '--export-gcode', '--output', str(output_gcode),
-                                *(str(p) for p in mesh_paths)], work_dir=work_dir,
-                      grant_dirs=grants, timeout_s=timeout_s)
-    project = None
-    warnings = outcome.warnings.copy()
-    if outcome.ok and output_gcode.is_file() and export_3mf is not None:
-        project = Path(export_3mf).resolve()
-        project.parent.mkdir(parents=True, exist_ok=True)
-        remaining = max(0.01, timeout_s - (time.monotonic() - started))
-        second = run_cli(install, [*common, '--export-3mf', '--output', str(project),
-                                  *(str(p) for p in mesh_paths)], work_dir=work_dir,
-                         grant_dirs=[*grants, project.parent], timeout_s=remaining)
-        warnings.extend(second.warnings)
-        if not second.ok or not project.is_file():
-            return SliceRun(False, output_gcode, None, config_path, second.cmd, warnings,
-                            second.stdout_tail, second.stderr_tail, time.monotonic() - started,
-                            SliceRefusal('project_export_failed', 'PrusaSlicer did not export the review project.', detail=second.stderr_tail))
-    ok = outcome.ok and output_gcode.is_file() and output_gcode.stat().st_size > 0
+
+    def export(target, action, deadline):
+        # The slicer must never open the caller's final path for writing. A
+        # private same-filesystem directory also protects the staged pathname.
+        target = validate_output_path(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='.chudware-slice-', dir=target.parent) as staging:
+            staged = Path(staging) / 'output.part'
+            outcome = run_cli(install, [*common, action, '--output', str(staged),
+                                        *(str(p) for p in mesh_paths)], work_dir=work_dir,
+                              grant_dirs=[*grants, target.parent], timeout_s=deadline)
+            if not outcome.ok or not staged.exists():
+                return outcome, False
+            validate_output_path(staged)
+            if not staged.is_file() or (action == '--export-gcode' and staged.stat().st_size == 0):
+                return outcome, False
+            validate_output_path(target)
+            os.replace(staged, target)
+            return outcome, True
+
+    try:
+        outcome, produced = export(output_gcode, '--export-gcode', timeout_s)
+        project = None
+        warnings = outcome.warnings.copy()
+        if produced and export_3mf is not None:
+            remaining = max(0.01, timeout_s - (time.monotonic() - started))
+            second, exported = export(export_3mf, '--export-3mf', remaining)
+            warnings.extend(second.warnings)
+            if not exported:
+                return SliceRun(False, output_gcode, None, config_path, second.cmd, warnings,
+                                second.stdout_tail, second.stderr_tail, time.monotonic() - started,
+                                SliceRefusal('project_export_failed', 'PrusaSlicer did not export the review project.', detail=second.stderr_tail))
+            project = export_3mf
+    except (UnsafePrintFile, OSError) as exc:
+        return refused('unsafe_print_file', str(exc))
+    ok = produced
     return SliceRun(ok, output_gcode if ok else None, project, config_path, outcome.cmd,
                     list(dict.fromkeys(warnings)), outcome.stdout_tail, outcome.stderr_tail,
                     round(time.monotonic() - started, 3), None if ok else

@@ -13,9 +13,13 @@
 
 #include "../ui_theme.h"  // ui::activeTheme, ui::Theme
 
+#include <array>
+#include <charconv>
+#include <string_view>
 #include <cmath>
 #include <cstdio>
 #include <string>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -43,6 +47,14 @@ struct AtlasState {
     GLuint texPlaceholder = 0;
 
     std::unordered_map<std::string, Cell> cells;  // key = "name@32" or "name@20"
+    std::unordered_map<std::string_view, const Cell*> cellViews;
+    struct Resolved {
+        const char* pointer = nullptr;
+        int size = 0;
+        std::string_view name;
+        const Cell* cell = nullptr;
+    };
+    std::array<Resolved, 512> resolved;
     bool loaded = false;
 
     // --- accent retint state (recolorIconAtlas) -----------------------------
@@ -72,7 +84,7 @@ struct AtlasState {
 };
 
 static AtlasState gAtlas;
-static std::unordered_set<std::string> gWarnedMissing;
+static std::set<std::string, std::less<>> gWarnedMissing;
 
 // ---------------------------------------------------------------------------
 
@@ -297,6 +309,8 @@ void freeIcons() {
     if (gAtlas.texLight)       { glDeleteTextures(1, &gAtlas.texLight);       gAtlas.texLight = 0; }
     if (gAtlas.texPlaceholder) { glDeleteTextures(1, &gAtlas.texPlaceholder); gAtlas.texPlaceholder = 0; }
     gAtlas.cells.clear();
+    gAtlas.cellViews.clear();
+    for (auto& entry : gAtlas.resolved) entry = {};
     gAtlas.pristineDark.clear();
     gAtlas.pristineLight.clear();
     gAtlas.scratch.clear();
@@ -340,21 +354,35 @@ IconUV getIcon(const char* name, int size) {
     }
 
     name = resolveIconAlias(name);
-
-    // Key = "name@32" or "name@20"
-    char key[128];
-    std::snprintf(key, sizeof(key), "%s@%d", name, size);
-
-    auto it = gAtlas.cells.find(key);
-    if (it == gAtlas.cells.end()) {
-        // Try the other size as a fallback before giving up.
-        int altSize = (size == kIconCellLarge) ? kIconCellSmall : kIconCellLarge;
-        char altKey[128];
-        std::snprintf(altKey, sizeof(altKey), "%s@%d", name, altSize);
-        it = gAtlas.cells.find(altKey);
+    auto& resolved = gAtlas.resolved[
+        ((reinterpret_cast<uintptr_t>(name) >> 3) ^ static_cast<unsigned>(size)) %
+        gAtlas.resolved.size()];
+    if (resolved.pointer != name || resolved.size != size || resolved.name != name) {
+        resolved.pointer = name;
+        resolved.size = size;
+        resolved.name = {};
+        resolved.cell = nullptr;
+        if (gAtlas.cellViews.empty()) {
+            for (const auto& item : gAtlas.cells)
+                gAtlas.cellViews.emplace(item.first, &item.second);
+        }
+        const size_t len = std::strlen(name);
+        char key[128];
+        auto lookup = [&](int px) -> const Cell* {
+            if (len + 12 >= sizeof(key)) return nullptr;
+            std::memcpy(key, name, len);
+            key[len] = '@';
+            auto end = std::to_chars(key + len + 1, key + sizeof(key), px).ptr;
+            auto it = gAtlas.cellViews.find(std::string_view(key, end - key));
+            if (it != gAtlas.cellViews.end()) resolved.name = it->first.substr(0, len);
+            return it == gAtlas.cellViews.end() ? nullptr : it->second;
+        };
+        resolved.cell = lookup(size);
+        if (!resolved.cell)
+            resolved.cell = lookup(size == kIconCellLarge ? kIconCellSmall : kIconCellLarge);
     }
 
-    if (it == gAtlas.cells.end()) {
+    if (!resolved.cell) {
 #ifdef __EMSCRIPTEN__
         // NOT a subset: host/CMakeLists.txt --preload-file's the very same
         // assets/icons/atlas.json + atlas_{dark,light}.png the desktop reads off
@@ -371,7 +399,7 @@ IconUV getIcon(const char* name, int size) {
         // volume — a missing name is hit every frame by every ribbon draw and
         // would flood devtools during boot; it still falls through to procedural
         // TbIcon art via valid=false, exactly as on desktop.
-        gWarnedMissing.insert(name);
+        if (gWarnedMissing.find(name) == gWarnedMissing.end()) gWarnedMissing.insert(name);
 #else
         if (gWarnedMissing.find(name) == gWarnedMissing.end()) {
             std::fprintf(stderr, "[icons] unknown icon: '%s' (size %d)\n", name, size);
@@ -385,7 +413,7 @@ IconUV getIcon(const char* name, int size) {
         return out;
     }
 
-    const Cell& c = it->second;
+    const Cell& c = *resolved.cell;
     out.uv0  = {c.u0, c.v0};
     out.uv1  = {c.u1, c.v1};
     out.valid = true;

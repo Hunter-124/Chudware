@@ -15,6 +15,7 @@
 #include <memory>
 #include <random>
 #include <stdexcept>
+#include <sstream>
 #include <tuple>
 #include <utility>
 #include <array>
@@ -1504,9 +1505,22 @@ std::set<std::string> failing_groups(const std::vector<Builders>& builders,
     return out;
 }
 
-void classify_mates(std::vector<Builders>& builders, const VectorXd& x, double tol,
-                    std::vector<std::string>& redundant,
-                    std::vector<std::string>& conflicting) {
+// One accepted constraint block: the variable columns of a mate-connected group and the
+// stacked Jacobian rows of every mate that gained rank in it (rank-free mates, redundant or
+// conflicting, are left out: they cannot change the null space).
+struct NullBlock {
+    std::vector<int> columns;  // sorted global variable indices
+    MatrixXd rows;
+    int rank = 0;
+};
+
+// Return the same accepted constraint rank used to classify redundant/conflicting mates.
+// When `blocks` is given it receives the final constraint blocks, whose rows' null space is
+// the free motion the rank leaves over.
+int classify_mates(std::vector<Builders>& builders, const VectorXd& x, double tol,
+                   std::vector<std::string>& redundant,
+                   std::vector<std::string>& conflicting,
+                   std::vector<NullBlock>* blocks = nullptr) {
     const double rtol = std::max(1e-6, 1e3 * tol);
     const double rank_tol = std::max(1e-9, tol);
     struct Group {
@@ -1519,6 +1533,7 @@ void classify_mates(std::vector<Builders>& builders, const VectorXd& x, double t
     std::vector<int> owner(x.size(), -1);
     std::vector<int> local_column(x.size(), -1);
     for (auto& b : builders) {
+        if (b.builder->idx_size() == 0) continue;
         const std::vector<int>& idx = b.builder->idx();
         // sub-vector x[idx]
         VectorXd xsub(idx.size());
@@ -1589,6 +1604,319 @@ void classify_mates(std::vector<Builders>& builders, const VectorXd& x, double t
             group.rank = new_rank;
             for (int column : group.columns) owner[column] = accepted;
         }
+    }
+    int rank = 0;
+    for (Group& group : groups) {
+        rank += group.rank;
+        if (blocks && !group.columns.empty())
+            blocks->push_back({std::move(group.columns), std::move(group.rows), group.rank});
+    }
+    return rank;
+}
+
+// --------------------------------------------------------------------------- free motion
+//
+// The accepted mate Jacobian J (rows: constraints, columns: each free component's
+// [tx,ty,tz, wx,wy,wz]) has a null space of dimension `dof`. A null vector is a first-order
+// motion that keeps every mate satisfied. Per component it is converted to a world-frame
+// twist: R(w+dw) = exp([Jl(w) dw]x) R(w), so the angular velocity is omega = Jl(w) dw, and
+// the velocity the component gives the world origin (a point rigidly attached to it) is
+// v0 = dt - omega x t.
+
+// Null vectors are unit norm in the solver's mixed (mm, rad) variables and orthonormal, so
+// one component's six rows of the basis have singular values in [0, 1]: the weight the free
+// motion puts on that component. Below this it is noise (a component rigidly tied to
+// ground has exactly zero).
+constexpr double kFreeMotionWeightTol = 1e-6;
+// A unit null twist whose angular part is below this is a pure translation. (A rotation
+// about an axis ~1e8 mm away is indistinguishable from one.)
+constexpr double kFreeRotationTol = 1e-8;
+// A helical pitch below this (mm per radian) is a pure rotation.
+constexpr double kPitchTol = 1e-6;
+
+// Orthonormal basis of the right null space of a block (columns past its accepted rank).
+MatrixXd block_null_basis(const NullBlock& blk) {
+    const int cols = static_cast<int>(blk.columns.size());
+    const int nullity = cols - blk.rank;
+    if (nullity <= 0) return MatrixXd::Zero(cols, 0);
+    MatrixXd V;
+    if (std::min(blk.rows.rows(), blk.rows.cols()) >= 64 && blk.rows.allFinite()) {
+        Eigen::BDCSVD<MatrixXd> svd(blk.rows, Eigen::ComputeFullV);
+        V = svd.matrixV();
+    } else {
+        Eigen::JacobiSVD<MatrixXd> svd(blk.rows, Eigen::ComputeFullV);
+        V = svd.matrixV();
+    }
+    return V.rightCols(nullity);
+}
+
+struct MotionSpace {
+    std::vector<Vector3d> translations;
+    std::vector<FreeRotation> rotations;
+};
+
+// An orthonormal basis of the subspace spanned by the orthonormal columns of B (3 x k),
+// independent of the SVD's arbitrary pick: a full space gives the world axes, a plane
+// starts from the world axis lying most inside it, a line is signed canonically.
+MatrixXd canonical_basis(const MatrixXd& B) {
+    const int k = static_cast<int>(B.cols());
+    if (k >= 3) return Matrix3d::Identity();
+    if (k <= 0) return B;
+    if (k == 1) return canonical_sign(Vector3d(B.col(0)));
+    const Matrix3d P = B * B.transpose();
+    int best = 0;
+    for (int i = 1; i < 3; ++i)
+        if (P.col(i).norm() > P.col(best).norm()) best = i;
+    const Vector3d u1 = Vector3d(P.col(best)).normalized();
+    const Vector3d n = Vector3d(B.col(0)).cross(Vector3d(B.col(1))).normalized();
+    MatrixXd out(3, 2);
+    out.col(0) = u1;
+    out.col(1) = canonical_sign(Vector3d(n.cross(u1)));
+    return out;
+}
+
+// Split a space of independent twists S (6 x d, columns (v0, omega) at the world origin)
+// into its pure translations (omega = 0) and a lift of its rotations. A rotation direction
+// u_i (a canonical basis of the omega image) lifts to the unique twist of S with omega =
+// u_i and v0 orthogonal to the translations, so a pin that also slides reports a pure
+// rotation about the pin line.
+MotionSpace decompose_twists(const MatrixXd& S) {
+    MotionSpace out;
+    const int d = static_cast<int>(S.cols());
+    if (d == 0) return out;
+    Eigen::JacobiSVD<MatrixXd> svd(MatrixXd(S.bottomRows(3)),
+                                   Eigen::ComputeFullU | Eigen::ComputeFullV);
+    const VectorXd& sv = svd.singularValues();
+    int r = 0;
+    for (int i = 0; i < sv.size(); ++i)
+        if (sv(i) > kFreeRotationTol) ++r;
+    const int t = d - r;
+    if (t > 0) {
+        MatrixXd tv(3, t);
+        for (int j = 0; j < t; ++j)
+            tv.col(j) = (S * svd.matrixV().col(r + j)).head(3);
+        Eigen::HouseholderQR<MatrixXd> qr(tv);
+        const MatrixXd q = qr.householderQ() * MatrixXd::Identity(3, t);
+        const MatrixXd basis = canonical_basis(q);
+        for (int j = 0; j < t; ++j) out.translations.push_back(Vector3d(basis.col(j)));
+    }
+    if (r == 0) return out;
+    const MatrixXd Ur = svd.matrixU().leftCols(r);
+    const MatrixXd Vr = svd.matrixV().leftCols(r);
+    const VectorXd inv = sv.head(r).cwiseInverse();
+    const MatrixXd dirs = canonical_basis(Ur);
+    for (int i = 0; i < r; ++i) {
+        // Coefficients c with Omega c = dirs.col(i), orthogonal to the translation kernel.
+        const VectorXd c = Vr * (inv.asDiagonal() * (Ur.transpose() * dirs.col(i)));
+        const VectorXd twist = S * c;
+        Vector3d v0 = twist.head(3);
+        const Vector3d w = twist.tail(3);  // == dirs.col(i), unit length
+        for (const Vector3d& e : out.translations) v0 -= v0.dot(e) * e;
+        const double w2 = w.squaredNorm();
+        FreeRotation fr;
+        fr.axis = w / std::sqrt(w2);
+        fr.point = w.cross(v0) / w2;
+        fr.pitch_mm_per_rad = w.dot(v0) / w2;
+        if (std::abs(fr.pitch_mm_per_rad) < kPitchTol) fr.pitch_mm_per_rad = 0.0;
+        out.rotations.push_back(fr);
+    }
+    return out;
+}
+
+std::string motion_kind(const MotionSpace& sp) {
+    const int t = static_cast<int>(sp.translations.size());
+    const int r = static_cast<int>(sp.rotations.size());
+    if (t + r == 0) return "fixed";
+    if (t == 3 && r == 3) return "free";
+    if (r == 0) return t == 1 ? "prismatic" : (t == 2 ? "translation_plane" : "translation_only");
+    if (t == 0 && r == 1)
+        return sp.rotations[0].pitch_mm_per_rad == 0.0 ? "revolute" : "helical";
+    if (t == 1 && r == 1) {
+        return sp.translations[0].cross(sp.rotations[0].axis).norm() < 1e-6 ? "cylindrical"
+                                                                           : "other";
+    }
+    if (t == 2 && r == 1) {
+        const Vector3d& a = sp.rotations[0].axis;
+        return std::abs(a.dot(sp.translations[0])) < 1e-6 &&
+                       std::abs(a.dot(sp.translations[1])) < 1e-6
+                   ? "planar" : "other";
+    }
+    if (t == 0 && r == 3) {
+        // Spherical iff the lifted twists are v0 = -omega x c, i.e. v0(omega) = A omega
+        // with A skew-symmetric.
+        Matrix3d W, V0;
+        for (int i = 0; i < 3; ++i) {
+            const Vector3d& a = sp.rotations[i].axis;
+            // Rebuild the (omega, v0) pair this axis was lifted from: omega = axis, and
+            // v0 = -axis x point + pitch * axis.
+            W.col(i) = a;
+            V0.col(i) = -a.cross(sp.rotations[i].point) + sp.rotations[i].pitch_mm_per_rad * a;
+        }
+        if (std::abs(W.determinant()) < 1e-6) return "other";
+        const Matrix3d A = V0 * W.inverse();
+        return (A + A.transpose()).norm() < 1e-6 * std::max(1.0, A.norm()) ? "spherical"
+                                                                         : "other";
+    }
+    return "other";
+}
+
+// One component's free motion from its six rows of the block null basis (6 x nullity).
+ComponentFreeMotion component_motion(const CompFrame& f, const VectorXd& x,
+                                     const MatrixXd& Nc) {
+    ComponentFreeMotion m;
+    m.component = f.id;
+    if (Nc.cols() == 0) {
+        m.kind = "fixed";
+        return m;
+    }
+    Eigen::JacobiSVD<MatrixXd> svd(Nc, Eigen::ComputeThinU);
+    int d = 0;
+    for (int i = 0; i < svd.singularValues().size(); ++i)
+        if (svd.singularValues()(i) > kFreeMotionWeightTol) ++d;
+    if (d == 0) {
+        m.kind = "fixed";
+        return m;
+    }
+    const Vector3d t(x(f.t_idx[0]), x(f.t_idx[1]), x(f.t_idx[2]));
+    const Vector3d w(x(f.w_idx[0]), x(f.w_idx[1]), x(f.w_idx[2]));
+    const Matrix3d Jl = left_jacobian(w);
+    MatrixXd S(6, d);
+    for (int i = 0; i < d; ++i) {
+        const Vector3d dt = svd.matrixU().col(i).head(3);
+        const Vector3d omega = Jl * Vector3d(svd.matrixU().col(i).tail(3));
+        S.col(i).head(3) = dt - omega.cross(t);
+        S.col(i).tail(3) = omega;
+    }
+    MotionSpace sp = decompose_twists(S);
+    // When the component can translate freely in every direction (or in the plane normal
+    // to a rotation axis), where that axis passes is not a constraint: translation moves
+    // it. Report such an axis through the component's own origin, as a pure rotation.
+    const auto freely_placed = [&](const FreeRotation& r) {
+        if (sp.translations.size() == 3) return true;
+        if (sp.translations.size() != 2) return false;
+        return std::abs(r.axis.dot(sp.translations[0])) < 1e-6 &&
+               std::abs(r.axis.dot(sp.translations[1])) < 1e-6;
+    };
+    for (FreeRotation& r : sp.rotations) {
+        if (!freely_placed(r)) continue;
+        r.point = t - t.dot(r.axis) * r.axis;
+        r.pitch_mm_per_rad = 0.0;
+    }
+    m.translations = std::move(sp.translations);
+    m.rotations = std::move(sp.rotations);
+    m.free_dof = static_cast<int>(m.translations.size() + m.rotations.size());
+    m.kind = motion_kind({m.translations, m.rotations});
+    return m;
+}
+
+// Per-component free motion and mate-connected groups of a solved configuration `x`.
+void fill_free_motion(const std::map<std::string, CompFrame>& frames,
+                      const std::vector<std::string>& frame_order,
+                      const std::vector<Builders>& builders,
+                      const std::vector<NullBlock>& blocks, const VectorXd& x,
+                      MateSolveResult& out) {
+    const int n = static_cast<int>(frame_order.size());
+    std::map<std::string, int> index;
+    for (int i = 0; i < n; ++i) index[frame_order[i]] = i;
+
+    // global variable index -> (component index, coordinate 0..5 = tx,ty,tz,wx,wy,wz)
+    std::map<int, std::pair<int, int>> var_owner;
+    for (int i = 0; i < n; ++i) {
+        const CompFrame& f = frames.at(frame_order[i]);
+        if (f.fixed) continue;
+        for (int k = 0; k < 3; ++k) {
+            var_owner[f.t_idx[k]] = {i, k};
+            var_owner[f.w_idx[k]] = {i, 3 + k};
+        }
+    }
+
+    // Connectivity through every built mate (a redundant mate still ties two bodies).
+    std::vector<int> parent(n);
+    for (int i = 0; i < n; ++i) parent[i] = i;
+    std::function<int(int)> find = [&](int a) {
+        while (parent[a] != a) a = parent[a] = parent[parent[a]];
+        return a;
+    };
+    std::vector<bool> mated(n, false);
+    for (const Builders& b : builders) {
+        const auto a = index.find(b.cid_a), c = index.find(b.cid_b);
+        if (a == index.end() || c == index.end()) continue;
+        mated[a->second] = mated[c->second] = true;
+        const int ra = find(a->second), rc = find(c->second);
+        if (ra != rc) parent[ra] = rc;
+    }
+
+    std::vector<ComponentFreeMotion> motion(n);
+    std::vector<bool> decided(n, false);
+    std::vector<int> group_rank(n, 0);  // by group root: summed rank of its blocks
+    for (const NullBlock& blk : blocks) {
+        const MatrixXd N = block_null_basis(blk);
+        std::map<int, std::array<int, 6>> rows_of;  // component index -> row in N per coord
+        for (size_t j = 0; j < blk.columns.size(); ++j) {
+            const auto owner = var_owner.find(blk.columns[j]);
+            if (owner == var_owner.end()) continue;
+            auto it = rows_of.emplace(owner->second.first, std::array<int, 6>{-1, -1, -1, -1, -1, -1})
+                          .first;
+            it->second[owner->second.second] = static_cast<int>(j);
+        }
+        for (const auto& [ci, rows] : rows_of) {
+            MatrixXd Nc(6, N.cols());
+            for (int k = 0; k < 6; ++k) Nc.row(k) = N.row(rows[k]);
+            motion[ci] = component_motion(frames.at(frame_order[ci]), x, Nc);
+            decided[ci] = true;
+        }
+        if (!rows_of.empty()) group_rank[find(rows_of.begin()->first)] += blk.rank;
+    }
+
+    for (int i = 0; i < n; ++i) {
+        const CompFrame& f = frames.at(frame_order[i]);
+        ComponentFreeMotion& m = motion[i];
+        if (!decided[i]) {
+            m = ComponentFreeMotion{};
+            m.component = f.id;
+            if (f.fixed) {
+                m.kind = "grounded";
+            } else {
+                // No accepted mate constrains it: all six freedoms, rotations about the
+                // world axes through the component's own origin.
+                const Vector3d t(x(f.t_idx[0]), x(f.t_idx[1]), x(f.t_idx[2]));
+                for (int k = 0; k < 3; ++k) {
+                    const Vector3d e = Vector3d::Unit(k);
+                    m.translations.push_back(e);
+                    FreeRotation fr;
+                    fr.axis = e;
+                    fr.point = t - t.dot(e) * e;
+                    m.rotations.push_back(fr);
+                }
+                m.free_dof = 6;
+                m.kind = "free";
+            }
+        } else if (f.fixed) {
+            m.kind = "grounded";
+        }
+        m.component = f.id;
+        m.grounded = f.fixed;
+        m.mated = mated[i];
+        out.free_motion.push_back(std::move(m));
+    }
+
+    std::map<int, MateGroup> by_root;
+    for (int i = 0; i < n; ++i) {
+        MateGroup& g = by_root[find(i)];
+        g.components.push_back(frame_order[i]);
+        const CompFrame& f = frames.at(frame_order[i]);
+        if (f.fixed) g.grounded = true;
+        else g.dof += 6;
+    }
+    for (const Builders& b : builders) {
+        const auto a = index.find(b.cid_a);
+        if (a != index.end()) by_root[find(a->second)].mates.push_back(b.mid);
+    }
+    for (auto& [root, g] : by_root) {
+        if (g.components.size() < 2) continue;
+        g.dof -= group_rank[root];
+        g.relative_dof = g.grounded ? g.dof : std::max(0, g.dof - 6);
+        out.groups.push_back(std::move(g));
     }
 }
 
@@ -1677,7 +2005,7 @@ MateSolveResult solve_mates(const json& components, const json& mates,
                             const std::optional<WarmMap>& warm_opt,
                             const std::optional<Drag>& drag_opt,
                             double tol, int max_iter,
-                            std::optional<double> time_budget_ms) {
+                            std::optional<double> time_budget_ms, bool free_motion) {
     WarmMap warm = warm_opt.value_or(WarmMap{});
     System system;
     std::map<std::string, CompFrame> frames;
@@ -1710,6 +2038,11 @@ MateSolveResult solve_mates(const json& components, const json& mates,
             t = t_auth;
             w = w_auth;
         }
+        // Warm starts can accumulate whole turns. The exponential-map Jacobian loses
+        // two rotational directions at 2*pi, although that pose is just identity.
+        // Reparameterize the same rotation in the nonsingular principal chart.
+        if (!fixed && w.norm() > kPi)
+            w = mat_to_rotvec_impl(rodrigues_impl(w));
         CompFrame frame;
         frame.id = cid;
         frame.t0 = t;
@@ -1799,12 +2132,10 @@ MateSolveResult solve_mates(const json& components, const json& mates,
             mate_records.push_back({mid, "unresolved"});
             continue;
         }
-        if (bptr->idx_size() == 0) {
-            mate_records.push_back({mid, ""});
-            continue;
+        if (bptr->idx_size() != 0) {
+            system.add_residual(rfunc, bptr->idx(), jfunc, mid, 1.0);
+            active_tags.push_back(mid);
         }
-        system.add_residual(rfunc, bptr->idx(), jfunc, mid, 1.0);
-        active_tags.push_back(mid);
         Builders br;
         br.mid = mid;
         br.builder = bptr.get();
@@ -1926,6 +2257,18 @@ MateSolveResult solve_mates(const json& components, const json& mates,
             }
         }
     }
+    // LM can itself finish on another turn of the exponential map. Classify and
+    // persist the equivalent principal rotation so rank describes physical motion,
+    // not a coordinate singularity left by the previous solve.
+    for (const auto& cid : frame_order) {
+        const CompFrame& frame = frames[cid];
+        if (frame.fixed) continue;
+        Vector3d w(x(frame.w_idx[0]), x(frame.w_idx[1]), x(frame.w_idx[2]));
+        if (w.norm() > kPi) {
+            w = mat_to_rotvec_impl(rodrigues_impl(w));
+            for (int k = 0; k < 3; ++k) x(frame.w_idx[k]) = w[k];
+        }
+    }
 
     MateSolveResult out;
     for (auto& cid : frame_order) {
@@ -1945,11 +2288,15 @@ MateSolveResult solve_mates(const json& components, const json& mates,
         out.params[cid] = {t, w};
     }
 
+    std::vector<NullBlock> null_blocks;
     std::vector<std::string> redundant, conflicting;
     int dof = system.n_vars();
     if (system.n_vars() > 0 && !active_tags.empty()) {
-        dof = system.degrees_of_freedom(x);
-        classify_mates(builders, x, eff_tol, redundant, conflicting);
+        // A separate relative QR cutoff on the mixed mm/radian Jacobian discarded
+        // weak pivots of offset rigid chains and invented free motion. Reuse the
+        // classifier's accepted rank, without another global Jacobian/factorization.
+        dof -= classify_mates(builders, x, eff_tol, redundant, conflicting,
+                              free_motion ? &null_blocks : nullptr);
     }
 
     auto in_set = [](const std::vector<std::string>& s, const std::string& v) {
@@ -1960,6 +2307,19 @@ MateSolveResult solve_mates(const json& components, const json& mates,
     int n_fixed = 0;
     for (auto& kv : frames) if (kv.second.fixed) ++n_fixed;
 
+    // Satisfaction is independent of Jacobian rank. An independent mate can
+    // still be unsatisfied when the network does not converge.
+    std::map<std::string, double> residual_by_mate;
+    for (const Builders& b : builders) {
+        MateResidual mr;
+        mr.mate_id = b.mid;
+        mr.type = b.type;
+        mate_residual_at(b, x, mr.max_abs, mr.norm);
+        residual_by_mate[b.mid] = mr.max_abs;
+        max_res = std::max(max_res, mr.max_abs);
+        if (!std::isfinite(mr.max_abs) || mr.max_abs > eff_tol) res_converged = false;
+        out.residuals.push_back(std::move(mr));
+    }
     for (auto& rec : mate_records) {
         const std::string& mid = rec.first;
         const std::string& forced = rec.second;
@@ -1970,26 +2330,28 @@ MateSolveResult solve_mates(const json& components, const json& mates,
                 break;
             }
         }
+        const auto residual = residual_by_mate.find(mid);
+        const bool unsatisfied = residual != residual_by_mate.end() &&
+            (!std::isfinite(residual->second) || residual->second > eff_tol);
         std::string status;
         if (!forced.empty()) status = forced;
         else if (in_set(conflicting, mid)) status = "conflicting";
+        else if (unsatisfied) status = "unsatisfied";
         else if (in_set(redundant, mid)) status = "redundant";
         else status = "ok";
         if (status == "unresolved") res_converged = false;
-        // Every "unresolved" record above stores its reason.
-        out.mate_status.push_back({mid, mtype, status,
-            status == "unresolved" ? unresolved_reasons[mid] : std::string()});
+        std::string reason;
+        if (status == "unresolved") reason = unresolved_reasons[mid];
+        else if (unsatisfied) {
+            std::ostringstream message;
+            message << "residual " << residual->second << " exceeds tolerance " << eff_tol
+                    << " (mm for positional rows, dimensionless for direction rows, "
+                       "radians for angle rows)";
+            reason = message.str();
+        }
+        out.mate_status.push_back({mid, mtype, status, reason});
     }
 
-    // Per-mate residual report, worst first. This is the diagnosis a caller needs when
-    // `converged` is false: which mate is not satisfied, and by how much.
-    for (const Builders& b : builders) {
-        MateResidual mr;
-        mr.mate_id = b.mid;
-        mr.type = b.type;
-        mate_residual_at(b, x, mr.max_abs, mr.norm);
-        out.residuals.push_back(std::move(mr));
-    }
     std::stable_sort(out.residuals.begin(), out.residuals.end(),
                      [](const MateResidual& a, const MateResidual& b) {
                          return a.max_abs > b.max_abs;
@@ -2002,6 +2364,7 @@ MateSolveResult solve_mates(const json& components, const json& mates,
     out.max_residual = max_res;
     out.tolerance = eff_tol;
     out.summary = dof_summary(dof, out.over_defined, n_comp, n_fixed);
+    if (free_motion) fill_free_motion(frames, frame_order, builders, null_blocks, x, out);
     return out;
 }
 
@@ -2028,6 +2391,29 @@ MateGeom parse_geom(const json& g) {
 }
 
 }  // namespace
+
+json free_motion_to_json(const MateSolveResult& result) {
+    const auto vec = [](const Vector3d& v) { return json::array({v[0], v[1], v[2]}); };
+    json components = json::array();
+    for (const ComponentFreeMotion& m : result.free_motion) {
+        json translations = json::array();
+        for (const Vector3d& t : m.translations) translations.push_back(vec(t));
+        json rotations = json::array();
+        for (const FreeRotation& r : m.rotations)
+            rotations.push_back({{"axis", vec(r.axis)}, {"point", vec(r.point)},
+                                 {"pitch_mm_per_rad", r.pitch_mm_per_rad}});
+        components.push_back({{"component", m.component}, {"grounded", m.grounded},
+                              {"mated", m.mated}, {"free_dof", m.free_dof}, {"kind", m.kind},
+                              {"translations", std::move(translations)},
+                              {"rotations", std::move(rotations)}});
+    }
+    json groups = json::array();
+    for (const MateGroup& g : result.groups)
+        groups.push_back({{"components", g.components}, {"mates", g.mates},
+                          {"grounded", g.grounded}, {"dof", g.dof},
+                          {"relative_dof", g.relative_dof}});
+    return {{"components", std::move(components)}, {"groups", std::move(groups)}};
+}
 
 json solve_mates_json(const json& input) {
     json components = input.value("components", json::array());
@@ -2072,7 +2458,9 @@ json solve_mates_json(const json& input) {
     if (input.contains("time_budget_ms") && input["time_budget_ms"].is_number())
         tbm = input["time_budget_ms"].get<double>();
 
-    MateSolveResult res = solve_mates(components, mates, geom, warm, drag, tol, max_iter, tbm);
+    const bool want_free_motion = input.value("free_motion", false);
+    MateSolveResult res = solve_mates(components, mates, geom, warm, drag, tol, max_iter, tbm,
+                                      want_free_motion);
 
     json out;
     json transforms = json::object();
@@ -2107,6 +2495,7 @@ json solve_mates_json(const json& input) {
     out["max_residual"] = res.max_residual;
     out["over_defined"] = res.over_defined;
     out["summary"] = res.summary;
+    if (want_free_motion) out["free_motion"] = free_motion_to_json(res);
     return out;
 }
 

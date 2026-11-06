@@ -387,3 +387,214 @@ TEST_CASE("sketch3d external vertex ref: resolves, grounds a coincident constrai
 
     chudware::doc::doc_close(doc_id);
 }
+
+// ---- atomic sketch3d appends / skipped constraints / named conflicts ----------
+
+namespace {
+
+json find_feature3(const json& tree, const std::string& fid) {
+    for (const auto& f : tree.at("features"))
+        if (f.value("id", std::string()) == fid) return f;
+    return json(nullptr);
+}
+
+std::vector<std::string> ids_of(const json& list) {
+    std::vector<std::string> out;
+    for (const auto& e : list) out.push_back(e.at("id").get<std::string>());
+    return out;
+}
+
+// What a refused (thrown) op batch said; empty when it applied.
+std::string refusal(const std::string& doc_id, const json& op) {
+    try {
+        chudware::doc::doc_apply_ops(doc_id, -1, json::array({op}), false);
+    } catch (const chudware::doc::OpError& e) {
+        return e.what();
+    }
+    return std::string();
+}
+
+bool contains(const std::string& hay, const std::string& needle) {
+    return hay.find(needle) != std::string::npos;
+}
+
+}  // namespace
+
+// Two writers prepare batches off the SAME prior tree (only e1 / c1 exist). The ops carry
+// deltas, not the whole list, so applying A then B keeps both — the read-modify-write
+// edit_feature the tools used before dropped whichever landed first.
+TEST_CASE("sketch3d atomic append ops compose and mint ids against the live tree") {
+    using chudware::doc::doc_apply_ops;
+    json nr = chudware::doc::doc_new("part", "sketch3d-atomic-ops");
+    const std::string doc_id = nr["doc_id"].get<std::string>();
+    json sk3 = json{{"type", "sketch3d"},
+                    {"params", json{{"entities", json::array({line3("e1", {0, 0, 0}, {10, 0, 0})})},
+                                    {"constraints", json::array({rel("c1", "fix", {"e1.p1"})})}}}};
+    json r0 = doc_apply_ops(doc_id, -1, json::array({json{{"op", "add_feature"}, {"feature", sk3}}}),
+                            false);
+    const std::string fid = r0["id_map"]["$0"].get<std::string>();
+    REQUIRE(!fid.empty());
+
+    json line_a = json{{"type", "line"}, {"p1", {0, 10, 0}}, {"p2", {10, 10, 0}}};
+    json line_b = json{{"type", "line"}, {"p1", {0, 20, 0}}, {"p2", {10, 20, 0}}};
+    const json batch_a = json::array({json{{"op", "sketch3d_add_entities"}, {"sketch", fid},
+                                           {"entities", json::array({line_a})}}});
+    const json batch_b = json::array({
+        json{{"op", "sketch3d_add_entities"}, {"sketch", fid},
+             {"entities", json::array({line_b})}},
+        json{{"op", "sketch3d_add_constraints"}, {"sketch", fid},
+             {"constraints", json::array({
+                 json{{"type", "length"}, {"refs", json::array({"$0"})}, {"value", 10}},
+                 json{{"type", "coincident"}, {"refs", json::array({"$0.p1", "e1.p2"})}}})}}});
+
+    json ra = doc_apply_ops(doc_id, -1, batch_a, false);
+    json rb = doc_apply_ops(doc_id, -1, batch_b, false);
+    CHECK(ra["id_map"]["$0"] == "e2");
+    CHECK(rb["id_map"]["$0"] == "e3");   // minted against the tree that already holds A's e2
+    CHECK(rb["id_map"]["$1"] == "c2");
+    CHECK(rb["id_map"]["$1#1"] == "c3");
+    for (const auto& s : rb["rebuild"]["feature_status"])
+        CHECK_MESSAGE(s["ok"].get<bool>(), s.dump());
+
+    const json params = find_feature3(rb.at("tree"), fid).at("params");
+    CHECK(ids_of(params["entities"]) == std::vector<std::string>{"e1", "e2", "e3"});
+    CHECK(ids_of(params["constraints"]) == std::vector<std::string>{"c1", "c2", "c3"});
+    CHECK(params["constraints"][1]["refs"] == json::array({"e3"}));
+    CHECK(params["constraints"][1]["value"] == json{{"value", 10}, {"expr", nullptr}});
+    CHECK(params["constraints"][2]["refs"] == json::array({"e3.p1", "e1.p2"}));
+
+    // A malformed payload is refused by name and leaves the sketch untouched.
+    auto ent_op = [&](const json& ents) {
+        return json{{"op", "sketch3d_add_entities"}, {"sketch", fid}, {"entities", ents}};
+    };
+    auto con_op = [&](const json& cons) {
+        return json{{"op", "sketch3d_add_constraints"}, {"sketch", fid}, {"constraints", cons}};
+    };
+    CHECK(contains(refusal(doc_id, ent_op(json::array({7}))),
+                   "sketch3d_add_entities: entities[0] must be an object"));
+    CHECK(contains(refusal(doc_id, ent_op(json::array())), "non-empty list"));
+    CHECK(contains(refusal(doc_id, ent_op(json::array({json{{"id", "e1"}, {"type", "point"},
+                                                              {"p", {1, 2, 3}}}}))),
+                   "'e1' already exists"));
+    CHECK(contains(refusal(doc_id, con_op(json::array({json{{"type", "bogus"}, {"refs", {"e1"}}}}))),
+                   "is not a sketch3d constraint type"));
+    CHECK(contains(refusal(doc_id, con_op(json::array({json{{"type", "fix"},
+                                                            {"refs", json::array({"$7"})}}}))),
+                   "placeholder '$7'"));
+    CHECK(contains(refusal(doc_id, json{{"op", "sketch3d_add_entities"}, {"sketch", "f999"},
+                                        {"entities", json::array({line_a})}}),
+                   "no feature 'f999'"));
+    json after = chudware::doc::doc_sketch3d_health(doc_id, fid);
+    CHECK(ids_of(after["entities"]) == std::vector<std::string>{"e1", "e2", "e3"});
+
+    chudware::doc::doc_close(doc_id);
+}
+
+TEST_CASE("sketch3d_add_external_ref mints doc-unique x<N> ids and the batch resolves them") {
+    using chudware::doc::doc_apply_ops;
+    json nr = chudware::doc::doc_new("part", "sketch3d-atomic-xref");
+    const std::string doc_id = nr["doc_id"].get<std::string>();
+    auto dimv = [](double v) { return json{{"value", v}, {"expr", nullptr}}; };
+    json add_box = json{{"op", "add_feature"}, {"feature", {{"type", "box"}, {"name", "Blk"},
+        {"params", {{"length", dimv(20)}, {"width", dimv(20)}, {"height", dimv(20)}}}}}};
+    json add_sk = json{{"op", "add_feature"}, {"feature", {{"type", "sketch3d"}, {"name", "S"},
+        {"params", {{"entities", json::array({line3("e1", {0, 0, 0}, {5, 5, 5})})},
+                    {"constraints", json::array()}}}}}};
+    json r1 = doc_apply_ops(doc_id, -1, json::array({add_box, add_sk}), false);
+    const std::string fid = r1["id_map"]["$1"].get<std::string>();
+
+    json selector;
+    for (int tid = 1; tid <= 64 && selector.is_null(); ++tid) {
+        json pick;
+        try { pick = chudware::doc::doc_resolve_pick(doc_id, 1, "vertex", tid); } catch (...) { break; }
+        if (pick.contains("selector") && pick["selector"].contains("centroid"))
+            selector = pick["selector"];
+    }
+    REQUIRE_FALSE(selector.is_null());
+    json ref = json{{"source", {{"kind", "vertex"}, {"selector", selector}}}};
+    auto ref_op = [&] {
+        return json{{"op", "sketch3d_add_external_ref"}, {"sketch", fid}, {"ref", ref}};
+    };
+    json r2 = doc_apply_ops(doc_id, -1, json::array({ref_op(), ref_op()}), false);
+    CHECK(r2["id_map"]["$0"] == "x1");
+    CHECK(r2["id_map"]["$1"] == "x2");
+    json r3 = doc_apply_ops(doc_id, -1, json::array({ref_op()}), false);
+    CHECK(r3["id_map"]["$0"] == "x3");
+    const json refs = find_feature3(r3.at("tree"), fid).at("params").at("external_refs");
+    REQUIRE(refs.size() == 3);
+    for (const auto& xr : refs) {
+        CHECK_FALSE(xr.value("stale", true));      // the batch's external-ref pass resolved it
+        CHECK(xr.at("last_point").size() == 3);
+    }
+    CHECK(contains(refusal(doc_id, json{{"op", "sketch3d_add_external_ref"}, {"sketch", fid},
+                                        {"ref", {{"source", {{"selector", selector}}}}}}),
+                   "ref.source must be an object with a string 'kind'"));
+    chudware::doc::doc_close(doc_id);
+}
+
+TEST_CASE("sketch3d_health surfaces skipped constraints; a conflict is refused with a named reason") {
+    using chudware::doc::doc_apply_ops;
+    json nr = chudware::doc::doc_new("part", "sketch3d-skipped-conflict");
+    const std::string doc_id = nr["doc_id"].get<std::string>();
+
+    // along_axis with a zero direction passes the schema but the solver cannot use it.
+    json skipped_c = rel("c2", "along_axis", {"e1"});
+    skipped_c["dir"] = json::array({0, 0, 0});
+    json sk_a = json{{"type", "sketch3d"}, {"name", "A"},
+                     {"params", json{{"entities", json::array({line3("e1", {0, 0, 0}, {10, 0, 0})})},
+                                     {"constraints", json::array({rel("c1", "fix", {"e1.p1"}),
+                                                                  skipped_c})}}}};
+    json ra = doc_apply_ops(doc_id, -1, json::array({json{{"op", "add_feature"}, {"feature", sk_a}}}),
+                            false);
+    const std::string fid_a = ra["id_map"]["$0"].get<std::string>();
+    json ha = chudware::doc::doc_sketch3d_health(doc_id, fid_a);
+    CHECK(ha["converged"].get<bool>());
+    REQUIRE(ha["skipped_constraints"].size() == 1);
+    CHECK(ha["skipped_constraints"][0]["id"] == "c2");
+    CHECK(ha["skipped_constraints"][0]["type"] == "along_axis");
+    CHECK_FALSE(ha["skipped_constraints"][0]["reason"].get<std::string>().empty());
+    CHECK_FALSE(ha.contains("nonconvergence_reason"));
+
+    // Two pinned points 10 apart. Adding a 50 mm distance between them is unsatisfiable:
+    // the batch is refused and the compile error names the conflicting constraint, its value
+    // and the ones it contradicts.
+    json pt = json{{"id", "e1"}, {"type", "point"}, {"construction", false}, {"p", {0, 0, 0}}};
+    json pt2 = json{{"id", "e2"}, {"type", "point"}, {"construction", false}, {"p", {10, 0, 0}}};
+    json pinned = json::array({rel("c1", "fix", {"e1"}), rel("c2", "fix", {"e2"})});
+    json sk_b = json{{"type", "sketch3d"}, {"name", "B"},
+                     {"params", json{{"entities", json::array({pt, pt2})}, {"constraints", pinned}}}};
+    json rb = doc_apply_ops(doc_id, -1, json::array({json{{"op", "add_feature"}, {"feature", sk_b}}}),
+                            false);
+    const std::string fid_b = rb["id_map"]["$0"].get<std::string>();
+    json distance = json{{"type", "distance"}, {"refs", json::array({"e1.p", "e2.p"})},
+                         {"value", json{{"value", 50}, {"expr", nullptr}}}};
+    json conflict = json{{"op", "sketch3d_add_constraints"}, {"sketch", fid_b},
+                         {"constraints", json::array({distance})}};
+    json rr = doc_apply_ops(doc_id, -1, json::array({conflict}), false);
+    REQUIRE(rr.contains("rejected_tree"));
+    std::string errors;
+    for (const auto& row : rr["rebuild"]["feature_status"])
+        if (row.contains("error") && row["error"].is_string())
+            errors += row["error"].get<std::string>() + "\n";
+    MESSAGE(errors);
+    CHECK(contains(errors, "Conflicting constraints: c3 (distance 50) conflicts with"));
+    CHECK(chudware::doc::doc_sketch3d_health(doc_id, fid_b)["converged"].get<bool>());  // refused
+
+    // A suppressed sketch3d is not compiled, so a conflicting one can persist (older files).
+    // sketch3d_health still reports the failed solve with the same named reason.
+    json sk_c = sk_b;
+    sk_c["name"] = "C";
+    sk_c["suppressed"] = true;
+    sk_c["params"]["constraints"].push_back(dim("c3", "distance", {"e1.p", "e2.p"}, 50));
+    json rc = doc_apply_ops(doc_id, -1, json::array({json{{"op", "add_feature"}, {"feature", sk_c}}}),
+                            false);
+    const std::string fid_c = rc["id_map"]["$0"].get<std::string>();
+    json hc = chudware::doc::doc_sketch3d_health(doc_id, fid_c);
+    CHECK_FALSE(hc["converged"].get<bool>());
+    CHECK(hc["status"] == "over");
+    CHECK(contains(hc["nonconvergence_reason"].get<std::string>(),
+                   "Conflicting constraints: c3 (distance 50) conflicts with"));
+    REQUIRE(hc["conflicts_with"].contains("c3"));
+    CHECK(hc["conflicts_with"]["c3"].size() >= 1);
+    chudware::doc::doc_close(doc_id);
+}

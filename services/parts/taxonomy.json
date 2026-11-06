@@ -1542,6 +1542,8 @@
    "sites": [
     "lcsc",
     "digikey",
+    "mouser",
+    "nexar",
     "snapeda",
     "jlcpcb",
     "amazon",
@@ -2973,6 +2975,13 @@
       "mcmaster",
       "misumi"
      ],
+     "general_model_sites": [
+      "grabcad",
+      "traceparts",
+      "3dcontentcentral",
+      "printables",
+      "makerworld"
+     ],
      "children": [
       {
        "id": "vendors.cad_models.grabcad",
@@ -3024,6 +3033,8 @@
      "sites": [
       "lcsc",
       "digikey",
+      "mouser",
+      "nexar",
       "snapeda",
       "jlcpcb",
       "pcbway"
@@ -3043,6 +3054,22 @@
        "icon": "vendor_globe",
        "sites": [
         "digikey"
+       ]
+      },
+      {
+       "id": "vendors.electronics.mouser",
+       "label": "Mouser",
+       "icon": "vendor_globe",
+       "sites": [
+        "mouser"
+       ]
+      },
+      {
+       "id": "vendors.electronics.nexar",
+       "label": "Nexar (Octopart)",
+       "icon": "vendor_globe",
+       "sites": [
+        "nexar"
        ]
       },
       {

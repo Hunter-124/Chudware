@@ -6,11 +6,14 @@ decoded bytes are independently bounded; timeouts are idle, not run lifetimes.
 """
 from __future__ import annotations
 
+import hashlib
 import http.client
 import ipaddress
 import json
+import os
 import socket
 import ssl
+import tempfile
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +27,10 @@ class OutboundPolicyError(ValueError):
 
 class ResponseTooLarge(ValueError):
     pass
+
+class IntegrityError(ValueError):
+    pass
+
 
 
 class HTTPStatusError(RuntimeError):
@@ -172,7 +179,7 @@ class Response:
             raise HTTPStatusError(self)
 
 
-def _body(response, output, max_bytes, max_wire_bytes):
+def _body(response, output, max_bytes, max_wire_bytes, digest=None):
     declared = response.getheader("Content-Length")
     if declared is not None:
         try:
@@ -202,6 +209,8 @@ def _body(response, output, max_bytes, max_wire_bytes):
         if decoded > max_bytes or (decoder and decoder.unconsumed_tail):
             raise ResponseTooLarge("decoded response exceeds byte budget")
         output.write(data)
+        if digest is not None:
+            digest.update(data)
     if declared is not None and wire != length:
         raise OutboundPolicyError("truncated response")
     if decoder and (not decoder.eof or decoder.unused_data):
@@ -214,8 +223,18 @@ def request(url: str, *, method="GET", headers: Mapping[str, str] | None = None,
             max_wire_bytes: int | None = None, idle_timeout=15.0, max_redirects=10,
             schemes=("http", "https"), destination: Path | None = None,
             headers_for_url: Callable[[str], Mapping[str, str]] | None = None,
-            before_hop: Callable[[int, str], None] | None = None) -> Response:
+            before_hop: Callable[[int, str], None] | None = None,
+            expected_sha256: str | None = None, expected_size: int | None = None) -> Response:
     import io
+    if expected_sha256 is not None:
+        if (not isinstance(expected_sha256, str) or len(expected_sha256) != 64
+                or any(c not in "0123456789abcdefABCDEF" for c in expected_sha256)):
+            raise ValueError("expected_sha256 must be a 64-character hexadecimal digest")
+        expected_sha256 = expected_sha256.lower()
+    if expected_size is not None and (type(expected_size) is not int or expected_size < 0):
+        raise ValueError("expected_size must be a nonnegative integer")
+    if destination is None and (expected_sha256 is not None or expected_size is not None):
+        raise ValueError("integrity expectations require a destination")
     if max_bytes <= 0 or idle_timeout <= 0:
         raise ValueError("positive byte and idle budgets required")
     max_wire_bytes = max_bytes if max_wire_bytes is None else max_wire_bytes
@@ -258,12 +277,22 @@ def request(url: str, *, method="GET", headers: Mapping[str, str] | None = None,
                 response.content = output.getvalue()
             elif raw.status < 400:
                 destination.parent.mkdir(parents=True, exist_ok=True)
+                staging = None
                 try:
-                    with destination.open("wb") as output:
-                        response.bytes_written = _body(raw, output, max_bytes, max_wire_bytes)
-                except BaseException:
-                    destination.unlink(missing_ok=True)
-                    raise
+                    digest = hashlib.sha256() if expected_sha256 is not None else None
+                    with tempfile.NamedTemporaryFile(
+                            mode="wb", dir=destination.parent, prefix=".safe-http-",
+                            suffix=".tmp", delete=False) as output:
+                        staging = Path(output.name)
+                        response.bytes_written = _body(raw, output, max_bytes, max_wire_bytes, digest)
+                    if expected_size is not None and response.bytes_written != expected_size:
+                        raise IntegrityError("download size mismatch")
+                    if digest is not None and digest.hexdigest() != expected_sha256:
+                        raise IntegrityError("download SHA-256 mismatch")
+                    os.replace(staging, destination)
+                finally:
+                    if staging is not None:
+                        staging.unlink(missing_ok=True)
             else:
                 # Error bodies are bounded too; never write one over an artifact.
                 output = io.BytesIO()
@@ -282,8 +311,10 @@ def get(url: str, **kwargs) -> Response:
     return request(url, **kwargs)
 
 
-def download(url: str, destination: Path, **kwargs) -> Response:
-    return request(url, destination=Path(destination), **kwargs)
+def download(url: str, destination: Path, *, expected_sha256: str | None = None,
+             expected_size: int | None = None, **kwargs) -> Response:
+    return request(url, destination=Path(destination), expected_sha256=expected_sha256,
+                   expected_size=expected_size, **kwargs)
 
 
 def safe_download_path(directory: Path, url: str, *, default="download.bin",

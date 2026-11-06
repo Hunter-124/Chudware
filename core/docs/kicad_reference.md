@@ -15,6 +15,10 @@ reference material only. Chudware is MIT-licensed; the governing dependency poli
 > Independent of license, `libs/kimath` is entangled with wxWidgets and KiCad-wide headers,
 > so its primitives are as quick to reimplement as to extract. KiCad has **no parametric
 > constraint solver**; Chudware's `nsolve`/sketch solver has no KiCad analog.
+>
+> KiCad 10 is also the integrated electronics editor: the user-installed `kicad`,
+> `eeschema`, `pcbnew` and `kicad-cli` run as separate processes. No KiCad source
+> is linked, copied or bundled; libraries are used from the user's installation.
 
 ## 1. License table
 

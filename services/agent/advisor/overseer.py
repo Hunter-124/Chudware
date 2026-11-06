@@ -49,7 +49,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from services.agent.chudcode_roles import run_role_turn
+from services.agent.omp_roles import run_role_turn
 
 
 AUDIT_SCHEMA = "aicad.audit/1"
@@ -684,7 +684,7 @@ class AuditResult:
 
 class Overseer:
     """Trigger-driven auditor with per-run debounce and persisted blocker state.
-    Online audits are one-shot Chudcode role turns. Direct provider injection is
+    Online audits are one-shot OMP role turns. Direct provider injection is
     treated as an explicit offline test/local request unless ``offline=False`` is
     supplied; provider objects are never used by the online path.
     """
@@ -917,7 +917,7 @@ class Overseer:
                 audit={}, advisory=_empty_advisory(scope), error=str(exc)
             )
 
-        # Prefer authoritative Chudcode usage when the audit omitted its count.
+        # Prefer authoritative OMP usage when the audit omitted its count.
         if not audit["tokens"]:
             audit["tokens"] = int(turn.get("tokens_used") or 0)
         if not audit["tokens"]:

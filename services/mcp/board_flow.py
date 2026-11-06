@@ -21,6 +21,7 @@ result in the standard compact ``ok/hint/next_actions`` envelope.
 """
 from __future__ import annotations
 
+import os
 from typing import Any, Optional, Union
 
 # session/schema/drc/sync/autoroute are C++-dispatched — consumed here via the
@@ -31,9 +32,11 @@ from services.ecad import trace_opt as trace_opt_mod  # STAYS: no C++ counterpar
 
 from services.mcp.ecad_common import (
     OpError,
+    _default_ecad_path,
     _compile_of,
     _rpc,
     _update_from_sch,
+    _unique_ecad_path,
     ecad_session,
     schema,
 )
@@ -75,8 +78,21 @@ def _resolve_sch(sch_session_or_doc: Any) -> ecad_session.EcadSession:
         )
     return s
 
+def _new_board_session(name: str, path: str = "", *, generated: bool = False) -> ecad_session.EcadSession:
+    target = (_unique_ecad_path("pcb", name) if generated
+              else _default_ecad_path("pcb", name, path))
+    if os.path.exists(target):
+        raise OpError(
+            "already_exists",
+            f"KiCad board already exists: {target}. Open it with ecad_open and use "
+            "ecad_update_from_sch, or specify a different pcb_name or pcb_path.",
+            {"path": target},
+        )
+    return ecad_session.new_session("pcb", name, path=target)
 
-def _resolve_pcb(opts: dict) -> ecad_session.EcadSession:
+
+
+def _resolve_pcb(opts: dict, sch=None) -> ecad_session.EcadSession:
     """Create a fresh PCB or reuse ``opts['pcb_doc_id']`` / ``opts['pcb_session']``."""
     pcb_sess = opts.get("pcb_session")
     if isinstance(pcb_sess, ecad_session.EcadSession):
@@ -94,30 +110,35 @@ def _resolve_pcb(opts: dict) -> ecad_session.EcadSession:
                           {"reason": "wrong doc kind", "doc_id": pcb_doc_id})
         return s
 
-    name = str(opts.get("pcb_name") or opts.get("name") or "Board1")
-    return ecad_session.new_session("pcb", name)
+    path = str(opts.get("pcb_path") or opts.get("path") or "")
+    name = str(opts.get("pcb_name") or opts.get("name") or "")
+    if path:
+        return _new_board_session(name or os.path.splitext(os.path.basename(path))[0], path)
+    if name:
+        return _new_board_session(name)
+    if sch is not None and sch.path:
+        stem = os.path.splitext(sch.path)[0]
+        return _new_board_session(os.path.basename(stem), stem + ".kicad_pcb")
+    return _new_board_session("Board1", generated=True)
 
 
 def _drc_residuals(session) -> list[dict]:
-    """Compact residual DRC violations (errors first). Never suppress.
-
-    Takes the board SESSION: the C++ session compile runs engine.ecad.drc on
-    every apply/tree, so the residual read is one ecad_tree RPC."""
+    """Compact KiCad DRC violations (errors first), reporting check failures."""
     try:
-        viols = _compile_of(session).get("drc") or []
-    except Exception as exc:  # noqa: BLE001 — DRC is advisory; surface failure honestly
+        result = _rpc("ecad_kicad_check", {"doc_id": session.doc_id})
+        viols = ((result.get("violations") or []) + (result.get("unconnected") or [])
+                 + (result.get("parity") or []))
+    except Exception as exc:  # noqa: BLE001 — report failed checks, never claim a clean board
         return [{"rule": "drc_unavailable", "severity": "error",
                  "message": f"{type(exc).__name__}: {exc}", "items": []}]
-    if isinstance(viols, dict):
-        viols = viols.get("violations", []) or []
     out: list[dict] = []
     for v in viols:
         if not isinstance(v, dict):
             continue
         out.append({
-            "rule": v.get("rule", "?"),
+            "rule": v.get("type", "?"),
             "severity": v.get("severity", "warning"),
-            "message": v.get("message", ""),
+            "message": v.get("description", ""),
             "items": list(v.get("items") or [])[:6],
         })
     # Errors first, then stable by rule/message for determinism.
@@ -256,6 +277,8 @@ def _ensure_outline(
                 })
                 report["outline_area_mm2"] = round(outline_area, 2)
                 report["outline_size_mm"] = [round(x1 - x0, 1), round(y1 - y0, 1)]
+            except OpError:
+                raise
             except Exception as e:  # noqa: BLE001
                 report["steps"].append({
                     "step": "set_outline", "ok": False,
@@ -323,6 +346,8 @@ def _ensure_outline(
         report["outline_area_mm2"] = round(outline_area, 2)
         report["component_bbox_area_mm2"] = round(parts_area, 2)
         report["outline_size_mm"] = [round(x1 - x0, 1), round(y1 - y0, 1)]
+    except OpError:
+        raise
     except Exception as e:  # noqa: BLE001
         report["steps"].append({"step": "set_outline", "ok": False,
                                 "error": f"{type(e).__name__}: {e}"})
@@ -350,7 +375,8 @@ def board_from_schematic(
             optimize: bool = True          # run E2 optimize_traces after autoroute
             pcb_doc_id / board_doc_id: str # reuse an open board instead of creating one
             pcb_session: EcadSession       # same, as a live session
-            pcb_name: str = "Board1"       # name for a freshly created board
+            pcb_name: str                  # create a separate named KiCad project
+            pcb_path: str                  # create a board at an explicit path
             place_opts: dict               # forwarded to place_board
             route_opts: dict               # forwarded to _ecad_autoroute
             optimize_opts / targets: dict  # forwarded to optimize_traces
@@ -375,7 +401,7 @@ def board_from_schematic(
     do_optimize = bool(opts.get("optimize", True))
 
     sch = _resolve_sch(sch_session_or_doc)
-    pcb = _resolve_pcb(opts)
+    pcb = _resolve_pcb(opts, sch)
 
     report: dict[str, Any] = {
         "seed": seed,
@@ -423,23 +449,8 @@ def board_from_schematic(
         })
         for w in sync_resp.get("warnings") or []:
             warnings.append(str(w))
-    except OpError as e:
-        report["steps"].append({"step": "update_from_sch", "ok": False,
-                                "error": e.message})
-        residual = _drc_residuals(pcb)
-        return {
-            "ok": False,
-            "board_doc_id": pcb.doc_id,
-            "sch_doc_id": sch.doc_id,
-            "placed": 0,
-            "routed": 0,
-            "residual_drc": residual,
-            "report": report,
-            "error": e.message,
-            "warnings": warnings,
-            "placement": _placement_snapshot(pcb.doc),
-            "routing": _routing_snapshot(pcb.doc),
-        }
+    except OpError:
+        raise
 
     # ---- 2. connectivity-aware placement (E1) ------------------------------
     place_opts = dict(opts.get("place_opts") or {})
@@ -461,6 +472,8 @@ def board_from_schematic(
                 area_scale=float(opts.get("outline_area_scale", 1.0) or 1.0),
                 force=bool(opts.get("force_outline", False)),
             )
+        except OpError:
+            raise
         except Exception as e:  # noqa: BLE001
             warnings.append(f"pre_outline failed: {type(e).__name__}: {e}")
     try:
@@ -489,9 +502,8 @@ def board_from_schematic(
         if place_rep.get("ratsnest_len_mm") is not None and report["ratsnest_before"] == 0:
             # Keep airwire COUNT from sync; length is supplemental.
             report["place"]["ratsnest_len_mm"] = place_rep.get("ratsnest_len_mm")
-    except OpError as e:
-        report["steps"].append({"step": "place_board", "ok": False, "error": e.message})
-        warnings.append(f"place_board failed: {e.message}")
+    except OpError:
+        raise
     except Exception as e:  # noqa: BLE001
         report["steps"].append({
             "step": "place_board", "ok": False,
@@ -526,9 +538,7 @@ def board_from_schematic(
     routed_nets: list = []
     failed_nets: list = []
     try:
-        ar_resp = _rpc("ecad_autoroute",
-                       {"doc_id": pcb.doc_id, "opts": route_opts})
-        pcb._update(ar_resp)  # keep pcb.doc/revision current after the RPC mutation
+        ar_resp = ecad_session.mutate_rpc(pcb, "ecad_autoroute", {"opts": route_opts})
         ar_rep = dict(ar_resp.get("report") or {})
         report["route"] = ar_rep
         routed_nets = list(ar_rep.get("routed") or [])
@@ -548,9 +558,8 @@ def board_from_schematic(
         })
         for w in ar_resp.get("warnings") or []:
             warnings.append(str(w))
-    except OpError as e:
-        report["steps"].append({"step": "autoroute", "ok": False, "error": e.message})
-        warnings.append(f"autoroute failed: {e.message}")
+    except OpError:
+        raise
     except Exception as e:  # noqa: BLE001
         report["steps"].append({
             "step": "autoroute", "ok": False,
@@ -595,6 +604,8 @@ def board_from_schematic(
                 "teardrops": report["teardrops"],
                 "nets_tuned": report["nets_tuned"],
             })
+        except OpError:
+            raise
         except Exception as e:  # noqa: BLE001
             report["steps"].append({
                 "step": "optimize_traces", "ok": False,
@@ -634,6 +645,7 @@ def board_from_schematic(
     return {
         "ok": steps_ok,
         "board_doc_id": pcb.doc_id,
+        "path": pcb.path,
         "sch_doc_id": sch.doc_id,
         "revision": pcb.revision,
         "placed": n_placed,

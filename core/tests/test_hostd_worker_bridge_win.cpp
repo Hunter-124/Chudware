@@ -384,7 +384,8 @@ void standardCase() {
     auto census = Bridge::activity();
     require(census.busy == 0 && census.background == 0 && census.unknown == 0,
             "unused bridges are not idle");
-    require(!Bridge::agentCreated_ && !Bridge::generalCreated_, "activity eagerly created worker lanes");
+    require(!Bridge::agentCreated_ && !Bridge::generalCreated_ && !Bridge::serviceCreated_,
+            "activity eagerly created worker lanes");
     Json refused; std::string error;
     require(!Bridge::dispatch("plm_fixture", {}, refused, error, 1000, {}, {{"cell", true}}) &&
             refused.value("code", "") == "cell_refused", "Windows cell was not explicitly refused");
@@ -404,10 +405,19 @@ void standardCase() {
                 "concurrent chats do not have independent agent-turn workers");
         census = Bridge::activity();
         require(census.busy == 2 && census.unknown == 0, "active turn census is not authoritative");
+        // Session-free service calls have a worker of their own: served at once while every
+        // turn holds its worker, and never by one of the turn workers.
         const auto before = Clock::now();
-        require(!Bridge::dispatch("subscription_status", {}, refused, error, 5000, {}) &&
+        const auto served = rpc("subscription_status");
+        require(served["lane"] == "service" && served["pid"] != firstInfo["pid"] &&
+                served["pid"] != secondInfo["pid"] && served["pid"] != general["pid"] &&
+                Clock::now() - before < std::chrono::seconds(2),
+                "service call waited behind an agent turn");
+        // A method that still belongs to the agent lane fails fast: proof the lane is held.
+        const auto beforeBusy = Clock::now();
+        require(!Bridge::dispatch("dag_status", {}, refused, error, 5000, {}) &&
                 refused.value("code", "") == "worker_lane_busy" &&
-                Clock::now() - before < std::chrono::seconds(1), "busy stdio call did not fail fast");
+                Clock::now() - beforeBusy < std::chrono::seconds(1), "busy stdio call did not fail fast");
         require(rpc("plm_fixture")["pid"] == general["pid"], "turn blocked/replaced general lane");
         for (const auto* failure : {"closed", "malformed", "refused", "oversized", "timeout"}) {
             first.control("steer", {{"text", "not delivered"}, {"_fail", failure}}, false);
@@ -493,6 +503,8 @@ void standardCase() {
         ending.thread.join(); require(ending.ok, "cooperative shutdown lost turn terminal");
     }
     require(!Bridge::dispatch("plm_fixture", {}, refused, error, 1000, {}), "shutdown respawned worker");
+    require(!Bridge::dispatch("subscription_status", {}, refused, error, 1000, {}),
+            "shutdown respawned service worker");
 }
 void forcedCase() {
     initialize();

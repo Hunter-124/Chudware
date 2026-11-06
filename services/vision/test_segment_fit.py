@@ -30,6 +30,14 @@ import numpy as np
 import pytest
 
 from ..vision import segment_fit
+from ..vision.recon_transform import ReconTransform
+
+
+def _known_mm():
+    transform = ReconTransform.identity()
+    transform.source = "test_known_mm"
+    transform.confirmed = True
+    return transform
 
 
 def test_envelope_backend_absent(monkeypatch):
@@ -71,6 +79,7 @@ def test_box_cylinder_fit(tmp_path):
     out = segment_fit.segment_fit(
         mesh_path=mesh_path,
         session_id="re_fit",
+        recon_transform=_known_mm(),
         n_samples=40000,
         plane_thresh_mm=0.2,
         cyl_thresh_mm=0.2,
@@ -136,7 +145,8 @@ def _fit(mesh, tmp_path, name, **kwargs):
     kwargs.setdefault("n_samples", 40000)
     kwargs.setdefault("plane_thresh_mm", 0.2)
     kwargs.setdefault("cyl_thresh_mm", 0.2)
-    out = segment_fit.segment_fit(mesh_path=path, session_id=f"re_{name}", **kwargs)
+    out = segment_fit.segment_fit(mesh_path=path, session_id=f"re_{name}",
+                                  recon_transform=_known_mm(), **kwargs)
     assert out["ok"] is True, out
     return out
 
@@ -340,7 +350,8 @@ def test_points_only_reports_missing_sections(tmp_path):
     pts, _normals = segment_fit._load_points(path, 30000)
 
     out = segment_fit.segment_fit(
-        points=pts, session_id="re_pts", plane_thresh_mm=0.2, cyl_thresh_mm=0.2
+        points=pts, session_id="re_pts", plane_thresh_mm=0.2, cyl_thresh_mm=0.2,
+        recon_transform=_known_mm(),
     )
     assert out["ok"] is True
     assert out["sections"] == []
@@ -374,7 +385,8 @@ def test_a_vertices_only_ply_file_loads_as_a_cloud(tmp_path):
     assert handle["faces"] is None  # a cloud has none; only sectioning needs them
 
     out = segment_fit.segment_fit(mesh_path=str(path), session_id="re_cloud",
-                                  plane_thresh_mm=0.2, cyl_thresh_mm=0.2)
+                                  plane_thresh_mm=0.2, cyl_thresh_mm=0.2,
+                                  recon_transform=_known_mm())
     assert out["ok"] is True, out
     cyls = _of_kind(out, "cylinder")
     assert cyls, out
@@ -448,3 +460,156 @@ def test_fits_are_reproducible(tmp_path):
     first = _fit(mesh, tmp_path, "determinism", n_samples=12000)
     second = _fit(mesh, tmp_path, "determinism", n_samples=12000)
     assert json.dumps(first, sort_keys=True) == json.dumps(second, sort_keys=True)
+
+
+def _rotated_metric_transform():
+    a, b = 0.47, -0.38
+    rz = np.array([[math.cos(a), -math.sin(a), 0],
+                   [math.sin(a), math.cos(a), 0], [0, 0, 1]])
+    rx = np.array([[1, 0, 0], [0, math.cos(b), -math.sin(b)],
+                   [0, math.sin(b), math.cos(b)]])
+    return ReconTransform(2.5, (rz @ rx).tolist(), [12.0, -7.0, 3.0],
+                          source="test_calibration", residual_mm=0.04, confirmed=True)
+
+
+def _raw_points(metric, transform):
+    return ((metric - np.asarray(transform.translation_mm)) @ np.asarray(transform.rotation)
+            / transform.mm_per_unit)
+
+
+def _require_point_fitter():
+    pytest.importorskip("open3d")
+    pytest.importorskip("scipy")
+
+
+def test_unconfirmed_units_are_refused_unless_explicitly_approximate(monkeypatch):
+    monkeypatch.setattr(segment_fit, "_backend_available", lambda: True)
+    points = [[0, 0, 0], [1, 0, 0], [0, 1, 0]]
+    for transform in (None, ReconTransform.identity()):
+        refused = segment_fit.segment_fit(points=points, recon_transform=transform)
+        assert refused["ok"] is False
+        assert refused["reason"] == "scale_unconfirmed"
+        assert "reveng_set_scale" in refused["hint"]
+        assert "approximate=True" in refused["hint"]
+    result = segment_fit.segment_fit(points=points, approximate=True, n_sections=0,
+                                     max_planes=0, max_cylinders=0,
+                                     max_cones=0, max_spheres=0)
+    assert result["ok"] and result["approximate"]
+    assert result["units"] == "reconstruction_units"
+    estimated = ReconTransform.identity()
+    estimated.mm_per_unit = 3.0
+    estimated.source = "unconfirmed_estimate"
+    exploratory = segment_fit.segment_fit(
+        points=points, recon_transform=estimated.to_json(), approximate=True, n_sections=0,
+        max_planes=0, max_cylinders=0, max_cones=0, max_spheres=0)
+    assert exploratory["ok"] and exploratory["approximate"] and exploratory["units"] == "mm"
+    assert exploratory["recon_transform"]["source"] == "unconfirmed_estimate"
+    surface_approx = segment_fit.segment_fit(
+        points=points, recon_transform=_known_mm(), approximate=True, n_sections=0,
+        max_planes=0, max_cylinders=0, max_cones=0, max_spheres=0)
+    assert surface_approx["ok"] and surface_approx["approximate"]
+    bad = segment_fit.segment_fit(points=points, approximate=True, transform_applied=True)
+    assert bad["reason"] == "invalid_recon_transform"
+
+
+def test_metric_transform_recovers_cylinder_from_unoriented_points():
+    _require_point_fitter()
+    angles = np.linspace(0, 2 * math.pi, 48, endpoint=False)
+    heights = np.linspace(-8.0, 8.0, 30)
+    theta, z = np.meshgrid(angles, heights)
+    metric = np.column_stack(((10 + 5 * np.cos(theta)).ravel(),
+                              (2 + 5 * np.sin(theta)).ravel(), z.ravel()))
+    transform = _rotated_metric_transform()
+    out = segment_fit.segment_fit(
+        points=_raw_points(metric, transform), recon_transform=transform,
+        max_planes=0, max_cylinders=1, max_cones=0, max_spheres=0,
+        cyl_thresh_mm=0.3, n_sections=0,
+    )
+    assert out["ok"] and out["units"] == "mm" and not out["approximate"]
+    cyl = max(_of_kind(out, "cylinder"), key=lambda fit: fit["inliers"])
+    assert cyl["params_mm"]["radius"] == pytest.approx(5.0, abs=0.2)
+    assert cyl["params_mm"]["height"] == pytest.approx(16.0, abs=0.4)
+    assert abs(cyl["params_mm"]["axis"][2]) > 0.99
+    assert cyl["role"] == "unknown"  # point-cloud normals have no reliable sign
+    assert cyl["residual_mm"] < 0.3
+    assert cyl["uncertainty"]["calibration_residual_mm"] == 0.04
+    assert cyl["uncertainty"]["inlier_standard_error"] >= 0
+    assert "estimated_unoriented" in {note["reason"] for note in out["notes"]}
+
+
+def test_metric_transform_recovers_box_plane_dimensions():
+    _require_point_fitter()
+    dims = np.array([40.0, 24.0, 12.0])
+    faces = []
+    for axis in range(3):
+        other = [i for i in range(3) if i != axis]
+        u, v = np.meshgrid(np.linspace(-dims[other[0]] / 2, dims[other[0]] / 2, 22),
+                           np.linspace(-dims[other[1]] / 2, dims[other[1]] / 2, 22))
+        for side in (-1, 1):
+            face = np.zeros((u.size, 3))
+            face[:, axis] = side * dims[axis] / 2
+            face[:, other[0]], face[:, other[1]] = u.ravel(), v.ravel()
+            faces.append(face)
+    metric = np.concatenate(faces)
+    transform = _rotated_metric_transform()
+    out = segment_fit.segment_fit(
+        points=_raw_points(metric, transform), recon_transform=transform.to_json(),
+        max_planes=6, max_cylinders=0, max_cones=0, max_spheres=0,
+        plane_thresh_mm=0.05, n_sections=0,
+    )
+    assert out["ok"], out
+    planes = _of_kind(out, "plane")
+    for axis, dimension in enumerate(dims):
+        stations = [fit["params_mm"]["origin"][axis] for fit in planes
+                    if abs(fit["params_mm"]["normal"][axis]) > 0.99]
+        assert len(stations) >= 2
+        assert max(stations) - min(stations) == pytest.approx(dimension, abs=0.1)
+    assert all(fit["residual_mm"] < 0.05 and "uncertainty" in fit for fit in planes)
+
+
+def test_transformed_mesh_sections_and_already_applied_flag(tmp_path):
+    _require_point_fitter()
+    trimesh = pytest.importorskip("trimesh")
+    raw = trimesh.creation.box(extents=[2.0, 4.0, 6.0])
+    path = tmp_path / "raw_box.ply"
+    raw.export(path)
+    rotation = [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+    transform = ReconTransform(3.0, rotation, [10.0, -4.0, 1.0],
+                               source="test_calibration", confirmed=True)
+    kwargs = dict(max_planes=0, max_cylinders=0, max_cones=0, max_spheres=0,
+                  n_sections=3, section_axis="z", recon_transform=transform)
+    out = segment_fit.segment_fit(mesh_path=str(path), **kwargs)
+    assert out["ok"] and len(out["sections"]) == 3
+    assert all(s["area_mm2"] == pytest.approx(72.0, abs=1e-4) for s in out["sections"])
+
+    matrix = np.eye(4)
+    matrix[:3, :3] = 3.0 * np.asarray(rotation)
+    matrix[:3, 3] = transform.translation_mm
+    raw.apply_transform(matrix)
+    applied_path = tmp_path / "metric_box.ply"
+    raw.export(applied_path)
+    applied = segment_fit.segment_fit(mesh_path=str(applied_path),
+                                      transform_applied=True, **kwargs)
+    assert applied["ok"] and applied["transform_applied_to_input"]
+    assert [s["area_mm2"] for s in applied["sections"]] == pytest.approx(
+        [s["area_mm2"] for s in out["sections"]], abs=1e-4)
+
+
+def test_open3d_only_point_file_estimates_unoriented_normals(tmp_path, monkeypatch):
+    pytest.importorskip("open3d")
+    monkeypatch.setattr(segment_fit, "HAVE_TRIMESH", False)
+    monkeypatch.setattr(segment_fit, "HAVE_SCIPY", False)
+    points = np.array([[x, y, 0.0] for x in range(6) for y in range(6)], dtype=float)
+    path = tmp_path / "points.ply"
+    with path.open("w", encoding="ascii") as file:
+        file.write(f"ply\nformat ascii 1.0\nelement vertex {len(points)}\n"
+                   "property float x\nproperty float y\nproperty float z\nend_header\n")
+        for x, y, z in points:
+            file.write(f"{x} {y} {z}\n")
+    out = segment_fit.segment_fit(mesh_path=str(path), recon_transform=_known_mm(),
+                                  max_planes=0, max_cylinders=0, max_cones=0,
+                                  max_spheres=0, n_sections=1)
+    assert out["ok"], out
+    notes = {(note["stage"], note["reason"]) for note in out["notes"]}
+    assert ("normals", "estimated_unoriented") in notes
+    assert ("sections", "no_faces") in notes

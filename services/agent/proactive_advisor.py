@@ -23,7 +23,7 @@ import re
 import time
 from typing import Any, Callable
 
-from services.agent.chudcode_roles import run_role_turn
+from services.agent.omp_roles import run_role_turn
 
 _log = logging.getLogger("chudware.proactive_advisor")
 
@@ -278,9 +278,7 @@ def _try_llm_advice(
         effort = resolve_role_thinking(
             "advisor",
             cfg,
-            task_class="analysis",
             dispatch_effort=clamp_subagent_effort(ambient_effort),
-            rank=getattr(assignment, "rank", None),
         )
     except Exception as exc:  # noqa: BLE001
         _log.debug("proactive advisor role resolution failed: %s", exc)
@@ -331,7 +329,7 @@ def _try_llm_advice(
         role_options["offline"] = True
         if source_options.get("offline_provider") is not None:
             role_options["offline_provider"] = source_options["offline_provider"]
-    for key in ("workspace_dir", "project_dir", "chudcode_session_dir"):
+    for key in ("workspace_dir", "project_dir", "omp_session_dir"):
         if source_options.get(key) is not None:
             role_options[key] = source_options[key]
 
@@ -349,7 +347,7 @@ def _try_llm_advice(
             close_session=True,
         )
     except Exception as exc:  # noqa: BLE001
-        _log.debug("proactive advisor Chudcode turn failed: %s", exc)
+        _log.debug("proactive advisor OMP turn failed: %s", exc)
         return ""
     if not isinstance(turn, dict) or not turn.get("success") or turn.get("cancelled"):
         return ""
